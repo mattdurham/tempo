@@ -17464,7 +17464,9 @@ func (c *EC2) DescribeLaunchTemplateVersionsRequest(input *DescribeLaunchTemplat
 // DescribeLaunchTemplateVersions API operation for Amazon Elastic Compute Cloud.
 //
 // Describes one or more versions of a specified launch template. You can describe
-// all versions, individual versions, or a range of versions.
+// all versions, individual versions, or a range of versions. You can also describe
+// all the latest versions or all the default versions of all the launch templates
+// in your account.
 //
 // Returns awserr.Error for service API and SDK errors. Use runtime type assertions
 // with awserr.Error's Code and Message methods to get detailed information about
@@ -28649,6 +28651,12 @@ func (c *EC2) GetLaunchTemplateDataRequest(input *GetLaunchTemplateDataInput) (r
 // Retrieves the configuration data of the specified instance. You can use this
 // data to create a launch template.
 //
+// This action calls on other describe actions to get instance information.
+// Depending on your instance configuration, you may need to allow the following
+// actions in your IAM policy: DescribeSpotInstanceRequests, DescribeInstanceCreditSpecifications,
+// DescribeVolumes, DescribeInstanceAttribute, and DescribeElasticGpus. Or,
+// you can allow describe* depending on your instance requirements.
+//
 // Returns awserr.Error for service API and SDK errors. Use runtime type assertions
 // with awserr.Error's Code and Message methods to get detailed information about
 // the error.
@@ -34085,7 +34093,7 @@ func (c *EC2) RegisterImageRequest(input *RegisterImageInput) (req *request.Requ
 //
 // Registers an AMI. When you're creating an AMI, this is the final step you
 // must complete before you can launch an instance from the AMI. For more information
-// about creating AMIs, see Creating Your Own AMIs (https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/creating-an-ami.html)
+// about creating AMIs, see Creating your own AMIs (https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/creating-an-ami.html)
 // in the Amazon Elastic Compute Cloud User Guide.
 //
 // For Amazon EBS-backed instances, CreateImage creates and registers the AMI
@@ -34093,12 +34101,12 @@ func (c *EC2) RegisterImageRequest(input *RegisterImageInput) (req *request.Requ
 //
 // You can also use RegisterImage to create an Amazon EBS-backed Linux AMI from
 // a snapshot of a root device volume. You specify the snapshot using the block
-// device mapping. For more information, see Launching a Linux Instance from
-// a Backup (https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instance-launch-snapshot.html)
+// device mapping. For more information, see Launching a Linux instance from
+// a backup (https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instance-launch-snapshot.html)
 // in the Amazon Elastic Compute Cloud User Guide.
 //
-// You can't register an image where a secondary (non-root) snapshot has AWS
-// Marketplace product codes.
+// If any snapshots have AWS Marketplace product codes, they are copied to the
+// new AMI.
 //
 // Windows and some Linux distributions, such as Red Hat Enterprise Linux (RHEL)
 // and SUSE Linux Enterprise Server (SLES), use the EC2 billing product code
@@ -34119,7 +34127,7 @@ func (c *EC2) RegisterImageRequest(input *RegisterImageInput) (req *request.Requ
 // a Reserved Instance without the matching billing product code, the Reserved
 // Instance will not be applied to the On-Demand Instance. For information about
 // how to obtain the platform details and billing information of an AMI, see
-// Obtaining Billing Information (https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ami-billing-info.html)
+// Obtaining billing information (https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ami-billing-info.html)
 // in the Amazon Elastic Compute Cloud User Guide.
 //
 // If needed, you can deregister an AMI at any time. Any modifications you make
@@ -38824,9 +38832,11 @@ type AllocateAddressInput struct {
 	// address from the address pool.
 	CustomerOwnedIpv4Pool *string `type:"string"`
 
-	// Set to vpc to allocate the address for use with instances in a VPC.
+	// Indicates whether the Elastic IP address is for use with instances in a VPC
+	// or instances in EC2-Classic.
 	//
-	// Default: The address is for use with instances in EC2-Classic.
+	// Default: If the Region supports EC2-Classic, the default is standard. Otherwise,
+	// the default is vpc.
 	Domain *string `type:"string" enum:"DomainType"`
 
 	// Checks whether you have the required permissions for the action, without
@@ -38915,8 +38925,8 @@ type AllocateAddressOutput struct {
 	// The ID of the customer-owned address pool.
 	CustomerOwnedIpv4Pool *string `locationName:"customerOwnedIpv4Pool" type:"string"`
 
-	// Indicates whether this Elastic IP address is for use with instances in EC2-Classic
-	// (standard) or instances in a VPC (vpc).
+	// Indicates whether the Elastic IP address is for use with instances in a VPC
+	// (vpc) or instances in EC2-Classic (standard).
 	Domain *string `locationName:"domain" type:"string" enum:"DomainType"`
 
 	// The location from which the IP address is advertised.
@@ -40994,11 +41004,13 @@ type AuthorizeClientVpnIngressInput struct {
 	_ struct{} `type:"structure"`
 
 	// The ID of the group to grant access to, for example, the Active Directory
-	// group or identity provider (IdP) group.
+	// group or identity provider (IdP) group. Required if AuthorizeAllGroups is
+	// false or not specified.
 	AccessGroupId *string `type:"string"`
 
-	// Indicates whether to grant access to all clients. Use true to grant all clients
-	// who successfully establish a VPN connection access to the network.
+	// Indicates whether to grant access to all clients. Specify true to grant all
+	// clients who successfully establish a VPN connection access to the network.
+	// Must be set to true if AccessGroupId is not specified.
 	AuthorizeAllGroups *bool `type:"boolean"`
 
 	// Unique, case-sensitive identifier that you provide to ensure the idempotency
@@ -44230,6 +44242,9 @@ type CoipPool struct {
 	// The ID of the local gateway route table.
 	LocalGatewayRouteTableId *string `locationName:"localGatewayRouteTableId" type:"string"`
 
+	// The ARN of the address pool.
+	PoolArn *string `locationName:"poolArn" min:"1" type:"string"`
+
 	// The address ranges of the address pool.
 	PoolCidrs []*string `locationName:"poolCidrSet" locationNameList:"item" type:"list"`
 
@@ -44253,6 +44268,12 @@ func (s CoipPool) GoString() string {
 // SetLocalGatewayRouteTableId sets the LocalGatewayRouteTableId field's value.
 func (s *CoipPool) SetLocalGatewayRouteTableId(v string) *CoipPool {
 	s.LocalGatewayRouteTableId = &v
+	return s
+}
+
+// SetPoolArn sets the PoolArn field's value.
+func (s *CoipPool) SetPoolArn(v string) *CoipPool {
+	s.PoolArn = &v
 	return s
 }
 
@@ -44376,7 +44397,8 @@ func (s *ConfirmProductInstanceOutput) SetReturn(v bool) *ConfirmProductInstance
 type ConnectionLogOptions struct {
 	_ struct{} `type:"structure"`
 
-	// The name of the CloudWatch Logs log group.
+	// The name of the CloudWatch Logs log group. Required if connection logging
+	// is enabled.
 	CloudwatchLogGroup *string `type:"string"`
 
 	// The name of the CloudWatch Logs log stream to which the connection data is
@@ -48998,6 +49020,9 @@ type CreateRouteTableInput struct {
 	// it is UnauthorizedOperation.
 	DryRun *bool `locationName:"dryRun" type:"boolean"`
 
+	// The tags to assign to the route table.
+	TagSpecifications []*TagSpecification `locationName:"TagSpecification" locationNameList:"item" type:"list"`
+
 	// The ID of the VPC.
 	//
 	// VpcId is a required field
@@ -49030,6 +49055,12 @@ func (s *CreateRouteTableInput) Validate() error {
 // SetDryRun sets the DryRun field's value.
 func (s *CreateRouteTableInput) SetDryRun(v bool) *CreateRouteTableInput {
 	s.DryRun = &v
+	return s
+}
+
+// SetTagSpecifications sets the TagSpecifications field's value.
+func (s *CreateRouteTableInput) SetTagSpecifications(v []*TagSpecification) *CreateRouteTableInput {
+	s.TagSpecifications = v
 	return s
 }
 
@@ -51733,6 +51764,9 @@ type CreateVpcPeeringConnectionInput struct {
 	// You must specify this parameter in the request.
 	PeerVpcId *string `locationName:"peerVpcId" type:"string"`
 
+	// The tags to assign to the peering connection.
+	TagSpecifications []*TagSpecification `locationName:"TagSpecification" locationNameList:"item" type:"list"`
+
 	// The ID of the requester VPC. You must specify this parameter in the request.
 	VpcId *string `locationName:"vpcId" type:"string"`
 }
@@ -51768,6 +51802,12 @@ func (s *CreateVpcPeeringConnectionInput) SetPeerRegion(v string) *CreateVpcPeer
 // SetPeerVpcId sets the PeerVpcId field's value.
 func (s *CreateVpcPeeringConnectionInput) SetPeerVpcId(v string) *CreateVpcPeeringConnectionInput {
 	s.PeerVpcId = &v
+	return s
+}
+
+// SetTagSpecifications sets the TagSpecifications field's value.
+func (s *CreateVpcPeeringConnectionInput) SetTagSpecifications(v []*TagSpecification) *CreateVpcPeeringConnectionInput {
+	s.TagSpecifications = v
 	return s
 }
 
@@ -52082,12 +52122,12 @@ func (s *CreateVpnGatewayOutput) SetVpnGateway(v *VpnGateway) *CreateVpnGatewayO
 	return s
 }
 
-// Describes the credit option for CPU usage of a T2 or T3 instance.
+// Describes the credit option for CPU usage of a T2, T3, or T3a instance.
 type CreditSpecification struct {
 	_ struct{} `type:"structure"`
 
-	// The credit option for CPU usage of a T2 or T3 instance. Valid values are
-	// standard and unlimited.
+	// The credit option for CPU usage of a T2, T3, or T3a instance. Valid values
+	// are standard and unlimited.
 	CpuCredits *string `locationName:"cpuCredits" type:"string"`
 }
 
@@ -52107,12 +52147,12 @@ func (s *CreditSpecification) SetCpuCredits(v string) *CreditSpecification {
 	return s
 }
 
-// The credit option for CPU usage of a T2 or T3 instance.
+// The credit option for CPU usage of a T2, T3, or T3a instance.
 type CreditSpecificationRequest struct {
 	_ struct{} `type:"structure"`
 
-	// The credit option for CPU usage of a T2 or T3 instance. Valid values are
-	// standard and unlimited.
+	// The credit option for CPU usage of a T2, T3, or T3a instance. Valid values
+	// are standard and unlimited.
 	//
 	// CpuCredits is a required field
 	CpuCredits *string `type:"string" required:"true"`
@@ -56628,6 +56668,9 @@ type DescribeAvailabilityZonesInput struct {
 	//
 	//    * opt-in-status - The opt in status (opted-in, and not-opted-in | opt-in-not-required).
 	//
+	//    * The ID of the zone that handles some of the Local Zone control plane
+	//    operations, such as API calls.
+	//
 	//    * region-name - The name of the Region for the Zone (for example, us-east-1).
 	//
 	//    * state - The state of the Availability Zone or Local Zone (available
@@ -56636,8 +56679,12 @@ type DescribeAvailabilityZonesInput struct {
 	//    * zone-id - The ID of the Availability Zone (for example, use1-az1) or
 	//    the Local Zone (for example, use usw2-lax1-az1).
 	//
+	//    * zone-type - The type of zone, for example, local-zone.
+	//
 	//    * zone-name - The name of the Availability Zone (for example, us-east-1a)
 	//    or the Local Zone (for example, use us-west-2-lax-1a).
+	//
+	//    * zone-type - The type of zone, for example, local-zone.
 	Filters []*Filter `locationName:"Filter" locationNameList:"Filter" type:"list"`
 
 	// The IDs of the Zones.
@@ -60474,11 +60521,13 @@ type DescribeImagesInput struct {
 	//
 	//    * name - The name of the AMI (provided during image creation).
 	//
-	//    * owner-alias - String value from an Amazon-maintained list (amazon |
-	//    aws-marketplace | microsoft) of snapshot owners. Not to be confused with
-	//    the user-configured AWS account alias, which is set from the IAM console.
+	//    * owner-alias - The owner alias, from an Amazon-maintained list (amazon
+	//    | aws-marketplace). This is not the user-configured AWS account alias
+	//    set using the IAM console. We recommend that you use the related parameter
+	//    instead of this filter.
 	//
-	//    * owner-id - The AWS account ID of the image owner.
+	//    * owner-id - The AWS account ID of the owner. We recommend that you use
+	//    the related parameter instead of this filter.
 	//
 	//    * platform - The platform. To only list Windows-based AMIs, use windows.
 	//
@@ -60520,10 +60569,10 @@ type DescribeImagesInput struct {
 	// Default: Describes all images available to you.
 	ImageIds []*string `locationName:"ImageId" locationNameList:"ImageId" type:"list"`
 
-	// Filters the images by the owner. Specify an AWS account ID, self (owner is
-	// the sender of the request), or an AWS owner alias (valid values are amazon
-	// | aws-marketplace | microsoft). Omitting this option returns all images for
-	// which you have launch permissions, regardless of ownership.
+	// Scopes the results to images with the specified owners. You can specify a
+	// combination of AWS account IDs, self, amazon, and aws-marketplace. If you
+	// omit this parameter, the results include all images for which you have launch
+	// permissions, regardless of ownership.
 	Owners []*string `locationName:"Owner" locationNameList:"Owner" type:"list"`
 }
 
@@ -62367,12 +62416,16 @@ type DescribeLaunchTemplateVersionsInput struct {
 	//    * ram-disk-id - The RAM disk ID.
 	Filters []*Filter `locationName:"Filter" locationNameList:"Filter" type:"list"`
 
-	// The ID of the launch template. You must specify either the launch template
-	// ID or launch template name in the request.
+	// The ID of the launch template. To describe one or more versions of a specified
+	// launch template, you must specify either the launch template ID or the launch
+	// template name in the request. To describe all the latest or default launch
+	// template versions in your account, you must omit this parameter.
 	LaunchTemplateId *string `type:"string"`
 
-	// The name of the launch template. You must specify either the launch template
-	// ID or launch template name in the request.
+	// The name of the launch template. To describe one or more versions of a specified
+	// launch template, you must specify either the launch template ID or the launch
+	// template name in the request. To describe all the latest or default launch
+	// template versions in your account, you must omit this parameter.
 	LaunchTemplateName *string `min:"3" type:"string"`
 
 	// The maximum number of results to return in a single call. To retrieve the
@@ -62389,7 +62442,18 @@ type DescribeLaunchTemplateVersionsInput struct {
 	// The token to request the next page of results.
 	NextToken *string `type:"string"`
 
-	// One or more versions of the launch template.
+	// One or more versions of the launch template. Valid values depend on whether
+	// you are describing a specified launch template (by ID or name) or all launch
+	// templates in your account.
+	//
+	// To describe one or more versions of a specified launch template, valid values
+	// are $Latest, $Default, and numbers.
+	//
+	// To describe all launch templates in your account that are defined as the
+	// latest version, the valid value is $Latest. To describe all launch templates
+	// in your account that are defined as the default version, the valid value
+	// is $Default. You can specify $Latest and $Default in the same call. You cannot
+	// specify numbers.
 	Versions []*string `locationName:"LaunchTemplateVersion" locationNameList:"item" type:"list"`
 }
 
@@ -65434,8 +65498,6 @@ type DescribeRouteTablesInput struct {
 	//    * tag-key - The key of a tag assigned to the resource. Use this filter
 	//    to find all resources assigned a tag with a specific key, regardless of
 	//    the tag value.
-	//
-	//    * transit-gateway-id - The ID of a transit gateway.
 	//
 	//    * vpc-id - The ID of the VPC for the route table.
 	Filters []*Filter `locationName:"Filter" locationNameList:"Filter" type:"list"`
@@ -97195,8 +97257,8 @@ type RequestLaunchTemplateData struct {
 	// in the Amazon Elastic Compute Cloud User Guide.
 	CpuOptions *LaunchTemplateCpuOptionsRequest `type:"structure"`
 
-	// The credit option for CPU usage of the instance. Valid for T2 or T3 instances
-	// only.
+	// The credit option for CPU usage of the instance. Valid for T2, T3, or T3a
+	// instances only.
 	CreditSpecification *CreditSpecificationRequest `type:"structure"`
 
 	// If you set this parameter to true, you can't terminate the instance using
@@ -106068,8 +106130,8 @@ type TagSpecification struct {
 	// | dhcp-options | export-image-task | export-instance-task | fleet | fpga-image
 	// | host-reservation | import-image-task | import-snapshot-task | instance
 	// | internet-gateway | ipv4pool-ec2 | ipv6pool-ec2 | key-pair | launch-template
-	// | placement-group | prefix-list | launch-template | natgateway | network-acl
-	// | security-group | spot-fleet-request | snapshot | subnet | traffic-mirror-filter
+	// | placement-group | prefix-list | natgateway | network-acl | security-group
+	// | spot-fleet-request | spot-instances-request | snapshot | subnet | traffic-mirror-filter
 	// | traffic-mirror-session | traffic-mirror-target | transit-gateway | transit-gateway-attachment
 	// | transit-gateway-route-table | volume |vpc | vpc-endpoint (for interface
 	// and gateway endpoints) | vpc-endpoint-service (for AWS PrivateLink) | vpc-flow-log.
@@ -108183,28 +108245,28 @@ type TransitGatewayRequestOptions struct {
 
 	// A private Autonomous System Number (ASN) for the Amazon side of a BGP session.
 	// The range is 64512 to 65534 for 16-bit ASNs and 4200000000 to 4294967294
-	// for 32-bit ASNs.
+	// for 32-bit ASNs. The default is 64512.
 	AmazonSideAsn *int64 `type:"long"`
 
-	// Enable or disable automatic acceptance of attachment requests. The default
-	// is disable.
+	// Enable or disable automatic acceptance of attachment requests. Disabled by
+	// default.
 	AutoAcceptSharedAttachments *string `type:"string" enum:"AutoAcceptSharedAttachmentsValue"`
 
 	// Enable or disable automatic association with the default association route
-	// table. The default is enable.
+	// table. Enabled by default.
 	DefaultRouteTableAssociation *string `type:"string" enum:"DefaultRouteTableAssociationValue"`
 
 	// Enable or disable automatic propagation of routes to the default propagation
-	// route table. The default is enable.
+	// route table. Enabled by default.
 	DefaultRouteTablePropagation *string `type:"string" enum:"DefaultRouteTablePropagationValue"`
 
-	// Enable or disable DNS support.
+	// Enable or disable DNS support. Enabled by default.
 	DnsSupport *string `type:"string" enum:"DnsSupportValue"`
 
 	// Indicates whether multicast is enabled on the transit gateway
 	MulticastSupport *string `type:"string" enum:"MulticastSupportValue"`
 
-	// Enable or disable Equal Cost Multipath Protocol support.
+	// Enable or disable Equal Cost Multipath Protocol support. Enabled by default.
 	VpnEcmpSupport *string `type:"string" enum:"VpnEcmpSupportValue"`
 }
 
