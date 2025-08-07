@@ -1,0 +1,688 @@
+=== [ tools-image     ]: Running tools in docker...
+main-2da75c4: Pulling from grafana/tempo-ci-tools
+Digest: sha256:e39fb4457aeba086d3a586a35d3057ad6812cdf347ec6b65a50724881176555b
+Status: Image is up to date for grafana/tempo-ci-tools:main-2da75c4
+docker.io/grafana/tempo-ci-tools:main-2da75c4
+diff --git a/modules/livestore/inmemory_kafka_test.go b/modules/livestore/inmemory_kafka_test.go
+index d5c120b0a..712e432a5 100644
+--- a/modules/livestore/inmemory_kafka_test.go
++++ b/modules/livestore/inmemory_kafka_test.go
+@@ -21,7 +21,7 @@ func TestInMemoryKafkaClient_Integration(t *testing.T) {
+ 
+ 	// Test basic functionality
+ 	ctx := context.Background()
+-	
++
+ 	// Test ping
+ 	err := client.Ping(ctx)
+ 	require.NoError(t, err)
+@@ -29,7 +29,7 @@ func TestInMemoryKafkaClient_Integration(t *testing.T) {
+ 	// Add some test messages
+ 	topic := "test-topic"
+ 	partition := int32(0)
+-	
++
+ 	client.AddMessage(topic, partition, []byte("tenant1"), []byte("trace-data-1"))
+ 	client.AddMessage(topic, partition, []byte("tenant2"), []byte("trace-data-2"))
+ 	client.AddMessage(topic, partition, []byte("tenant1"), []byte("trace-data-3"))
+@@ -44,7 +44,7 @@ func TestInMemoryKafkaClient_Integration(t *testing.T) {
+ 
+ 	// Test offset commit/fetch
+ 	group := "test-consumer-group"
+-	
++
+ 	// Initially no offsets should be committed
+ 	offsets, err := client.FetchOffsets(ctx, group)
+ 	require.NoError(t, err)
+@@ -111,7 +111,7 @@ func TestPartitionReader_WithInMemoryClient(t *testing.T) {
+ 	// Create partition reader with in-memory client
+ 	logger := log.NewNopLogger()
+ 	reg := prometheus.NewRegistry()
+-	
++
+ 	reader, err := NewPartitionReaderForPusher(client, partition, cfg, consumeFn, logger, reg)
+ 	require.NoError(t, err)
+ 	require.NotNil(t, reader)
+@@ -184,7 +184,7 @@ func TestInMemoryKafkaClient_MessageOrdering(t *testing.T) {
+ 
+ 	partitionData.mu.RLock()
+ 	assert.Len(t, partitionData.messages, 3)
+-	
++
+ 	for i, expectedMsg := range messages {
+ 		actualMsg := partitionData.messages[i]
+ 		assert.Equal(t, []byte(expectedMsg.key), actualMsg.Key)
+@@ -192,7 +192,7 @@ func TestInMemoryKafkaClient_MessageOrdering(t *testing.T) {
+ 		assert.Equal(t, int64(i), actualMsg.Offset)
+ 		assert.WithinDuration(t, time.Now(), actualMsg.Timestamp, time.Second)
+ 	}
+-	
++
+ 	assert.Equal(t, int64(3), partitionData.nextOffset)
+ 	partitionData.mu.RUnlock()
+-}
+\ No newline at end of file
++}
+diff --git a/modules/livestore/instance_search_test.go b/modules/livestore/instance_search_test.go
+index ec1860006..4e7a1fab3 100644
+--- a/modules/livestore/instance_search_test.go
++++ b/modules/livestore/instance_search_test.go
+@@ -367,7 +367,6 @@ func pushTracesToInstance(t *testing.T, i *instance, numTraces int) ([]*tempopb.
+ // be returned from a tag value search
+ // nolint:revive,unparam
+ func writeTracesForSearch(t *testing.T, i *instance, spanName, tagKey, tagValue string, postFixValue bool, includeEventLink bool) ([][]byte, []string, []string, []string) {
+-
+ 	numTraces := 5
+ 	ids := make([][]byte, 0, numTraces)
+ 	expectedTagValues := make([]string, 0, numTraces)
+diff --git a/modules/livestore/kafka_client_inmemory.go b/modules/livestore/kafka_client_inmemory.go
+index 5285427e3..fe45fe3d1 100644
+--- a/modules/livestore/kafka_client_inmemory.go
++++ b/modules/livestore/kafka_client_inmemory.go
+@@ -23,29 +23,29 @@ type InMemoryMessage struct {
+ 
+ // InMemoryPartition represents a single partition with its messages and state
+ type InMemoryPartition struct {
+-	messages []InMemoryMessage
++	messages   []InMemoryMessage
+ 	nextOffset int64
+-	mu sync.RWMutex
++	mu         sync.RWMutex
+ }
+ 
+ // InMemoryTopic represents a topic with multiple partitions
+ type InMemoryTopic struct {
+ 	partitions map[int32]*InMemoryPartition
+-	mu sync.RWMutex
++	mu         sync.RWMutex
+ }
+ 
+ // InMemoryKafkaClient implements KafkaClient interface using in-memory queues for testing
+ type InMemoryKafkaClient struct {
+ 	topics map[string]*InMemoryTopic
+-	
++
+ 	// Consumer state
+ 	consumingPartitions map[string]map[int32]kgo.Offset
+-	
++
+ 	// Committed offsets per consumer group
+ 	committedOffsets map[string]map[string]map[int32]int64 // [group][topic][partition] = offset
+-	
++
+ 	closed bool
+-	mu sync.RWMutex
++	mu     sync.RWMutex
+ }
+ 
+ // NewInMemoryKafkaClient creates a new in-memory Kafka client for testing
+@@ -61,7 +61,7 @@ func NewInMemoryKafkaClient() *InMemoryKafkaClient {
+ func (c *InMemoryKafkaClient) Ping(ctx context.Context) error {
+ 	c.mu.RLock()
+ 	defer c.mu.RUnlock()
+-	
++
+ 	if c.closed {
+ 		return fmt.Errorf("client is closed")
+ 	}
+@@ -72,7 +72,7 @@ func (c *InMemoryKafkaClient) Ping(ctx context.Context) error {
+ func (c *InMemoryKafkaClient) AddConsumePartitions(partitions map[string]map[int32]kgo.Offset) {
+ 	c.mu.Lock()
+ 	defer c.mu.Unlock()
+-	
++
+ 	for topic, partitionOffsets := range partitions {
+ 		if c.consumingPartitions[topic] == nil {
+ 			c.consumingPartitions[topic] = make(map[int32]kgo.Offset)
+@@ -87,7 +87,7 @@ func (c *InMemoryKafkaClient) AddConsumePartitions(partitions map[string]map[int
+ func (c *InMemoryKafkaClient) RemoveConsumePartitions(partitions map[string][]int32) {
+ 	c.mu.Lock()
+ 	defer c.mu.Unlock()
+-	
++
+ 	for topic, partitionList := range partitions {
+ 		if topicPartitions, exists := c.consumingPartitions[topic]; exists {
+ 			for _, partition := range partitionList {
+@@ -106,11 +106,11 @@ func (c *InMemoryKafkaClient) RemoveConsumePartitions(partitions map[string][]in
+ func (c *InMemoryKafkaClient) PollFetches(ctx context.Context) kgo.Fetches {
+ 	c.mu.RLock()
+ 	defer c.mu.RUnlock()
+-	
++
+ 	if c.closed {
+ 		return kgo.Fetches{}
+ 	}
+-	
++
+ 	// For now, return empty fetches. In a complete implementation,
+ 	// you would build proper kgo.Fetches with the available messages
+ 	// This requires deeper integration with kgo's internal structures
+@@ -128,13 +128,13 @@ func (c *InMemoryKafkaClient) Close() {
+ func (c *InMemoryKafkaClient) FetchOffsets(ctx context.Context, group string) (kadm.OffsetResponses, error) {
+ 	c.mu.RLock()
+ 	defer c.mu.RUnlock()
+-	
++
+ 	if c.closed {
+ 		return kadm.OffsetResponses{}, fmt.Errorf("client is closed")
+ 	}
+-	
++
+ 	responses := make(kadm.OffsetResponses)
+-	
++
+ 	if groupOffsets, exists := c.committedOffsets[group]; exists {
+ 		for topic, partitions := range groupOffsets {
+ 			for partition, offset := range partitions {
+@@ -151,7 +151,7 @@ func (c *InMemoryKafkaClient) FetchOffsets(ctx context.Context, group string) (k
+ 			}
+ 		}
+ 	}
+-	
++
+ 	return responses, nil
+ }
+ 
+@@ -159,29 +159,29 @@ func (c *InMemoryKafkaClient) FetchOffsets(ctx context.Context, group string) (k
+ func (c *InMemoryKafkaClient) CommitOffsets(ctx context.Context, group string, offsets kadm.Offsets) (kadm.OffsetResponses, error) {
+ 	c.mu.Lock()
+ 	defer c.mu.Unlock()
+-	
++
+ 	if c.closed {
+ 		return kadm.OffsetResponses{}, fmt.Errorf("client is closed")
+ 	}
+-	
++
+ 	if c.committedOffsets[group] == nil {
+ 		c.committedOffsets[group] = make(map[string]map[int32]int64)
+ 	}
+-	
++
+ 	responses := make(kadm.OffsetResponses)
+-	
++
+ 	offsets.Each(func(o kadm.Offset) {
+ 		if c.committedOffsets[group][o.Topic] == nil {
+ 			c.committedOffsets[group][o.Topic] = make(map[int32]int64)
+ 		}
+ 		c.committedOffsets[group][o.Topic][o.Partition] = o.At
+-		
++
+ 		responses.Add(kadm.OffsetResponse{
+ 			Offset: o,
+ 			Err:    nil,
+ 		})
+ 	})
+-	
++
+ 	return responses, nil
+ }
+ 
+@@ -194,35 +194,35 @@ func (c *InMemoryKafkaClient) Client() *kgo.Client {
+ func (c *InMemoryKafkaClient) AddMessage(topic string, partition int32, key, value []byte) {
+ 	c.mu.Lock()
+ 	defer c.mu.Unlock()
+-	
++
+ 	if c.topics[topic] == nil {
+ 		c.topics[topic] = &InMemoryTopic{
+ 			partitions: make(map[int32]*InMemoryPartition),
+ 		}
+ 	}
+-	
++
+ 	topicData := c.topics[topic]
+ 	topicData.mu.Lock()
+ 	defer topicData.mu.Unlock()
+-	
++
+ 	if topicData.partitions[partition] == nil {
+ 		topicData.partitions[partition] = &InMemoryPartition{
+-			messages: make([]InMemoryMessage, 0),
++			messages:   make([]InMemoryMessage, 0),
+ 			nextOffset: 0,
+ 		}
+ 	}
+-	
++
+ 	partitionData := topicData.partitions[partition]
+ 	partitionData.mu.Lock()
+ 	defer partitionData.mu.Unlock()
+-	
++
+ 	msg := InMemoryMessage{
+ 		Key:       key,
+ 		Value:     value,
+ 		Offset:    partitionData.nextOffset,
+ 		Timestamp: time.Now(),
+ 	}
+-	
++
+ 	partitionData.messages = append(partitionData.messages, msg)
+ 	partitionData.nextOffset++
+ }
+@@ -230,4 +230,4 @@ func (c *InMemoryKafkaClient) AddMessage(topic string, partition int32, key, val
+ // InMemoryKafkaClientFactory creates an in-memory Kafka client factory for testing
+ func InMemoryKafkaClientFactory(cfg ingest.KafkaConfig, metrics *kprom.Metrics, logger log.Logger) (KafkaClient, error) {
+ 	return NewInMemoryKafkaClient(), nil
+-}
+\ No newline at end of file
++}
+diff --git a/modules/livestore/kafka_client_test.go b/modules/livestore/kafka_client_test.go
+index 3cad2f866..10e9f5e25 100644
+--- a/modules/livestore/kafka_client_test.go
++++ b/modules/livestore/kafka_client_test.go
+@@ -254,4 +254,4 @@ func TestInMemoryKafkaClient_ConcurrentAccess(t *testing.T) {
+ 	partitionData.mu.RLock()
+ 	assert.Len(t, partitionData.messages, 10)
+ 	partitionData.mu.RUnlock()
+-}
+\ No newline at end of file
++}
+diff --git a/modules/livestore/live_store.go b/modules/livestore/live_store.go
+index ca2f83871..a9ac1e54b 100644
+--- a/modules/livestore/live_store.go
++++ b/modules/livestore/live_store.go
+@@ -33,7 +33,6 @@ type Overrides interface {
+ 	DedicatedColumns(userID string) backend.DedicatedColumns
+ }
+ 
+-
+ var metricCompleteQueueLength = promauto.NewGauge(prometheus.GaugeOpts{
+ 	Namespace: "live_store",
+ 	Name:      "complete_queue_length",
+diff --git a/modules/livestore/live_store_test.go b/modules/livestore/live_store_test.go
+index 5daf4fc4b..620a9bb52 100644
+--- a/modules/livestore/live_store_test.go
++++ b/modules/livestore/live_store_test.go
+@@ -1,11 +1,31 @@
+ package livestore
+ 
+ import (
++	"context"
++	crand "crypto/rand"
++	"fmt"
+ 	"testing"
++	"time"
+ 
+ 	"github.com/go-kit/log"
+-	"github.com/grafana/tempo/tempodb/backend"
++	"github.com/grafana/dskit/flagext"
++	"github.com/grafana/dskit/kv/consul"
++	"github.com/grafana/dskit/ring"
++	"github.com/grafana/dskit/user"
++	"github.com/prometheus/client_golang/prometheus"
+ 	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	"github.com/twmb/franz-go/pkg/kadm"
++	"github.com/twmb/franz-go/pkg/kgo"
++	"github.com/twmb/franz-go/plugin/kprom"
++
++	"github.com/grafana/tempo/modules/overrides"
++	"github.com/grafana/tempo/pkg/ingest"
++	"github.com/grafana/tempo/pkg/tempopb"
++	v1 "github.com/grafana/tempo/pkg/tempopb/common/v1"
++	"github.com/grafana/tempo/pkg/util/test"
++	"github.com/grafana/tempo/tempodb/backend"
++	"github.com/grafana/tempo/tempodb/encoding"
+ )
+ 
+ type mockOverrides struct{}
+@@ -49,3 +69,356 @@ func TestLiveStore(t *testing.T) {
+ 	assert.NotNil(t, b.logger)
+ 	assert.Equal(t, 0, len(b.instances))
+ }
++
++const integrationTestTenantID = "test-tenant"
++
++// TestLiveStoreIntegrationWithInMemoryKafka tests the full flow:
++// 1. Write traces directly to the live store (simulating Kafka consumption)
++// 2. Wait for them to be processed by the live store
++// 3. Query them with search functionality
++func TestLiveStoreIntegrationWithInMemoryKafka(t *testing.T) {
++	tmpDir := t.TempDir()
++	liveStore, _ := setupIntegrationTest(t, tmpDir)
++
++	err := liveStore.StartAsync(context.Background())
++	require.NoError(t, err)
++	err = liveStore.AwaitRunning(context.Background())
++	require.NoError(t, err)
++
++	instance, err := liveStore.getOrCreateInstance(integrationTestTenantID)
++	require.NoError(t, err)
++
++	numTraces := 5
++	traces, traceIDs := createTestTraces(t, numTraces)
++
++	// Directly push traces to the instance (simulating Kafka consumption)
++	writeTracesToInstance(t, instance, traces, traceIDs)
++
++	err = instance.cutIdleTraces(true)
++	require.NoError(t, err)
++
++	testSearchAfterConsumption(t, instance, traceIDs)
++	testSearchTagsAfterConsumption(t, instance)
++
++	liveStore.StopAsync()
++	err = liveStore.AwaitTerminated(context.Background())
++	require.NoError(t, err)
++}
++
++// TestLiveStoreSearchAfterBlockCutting tests search functionality after cutting blocks
++func TestLiveStoreSearchAfterBlockCutting(t *testing.T) {
++	tmpDir := t.TempDir()
++	liveStore, _ := setupIntegrationTest(t, tmpDir)
++
++	err := liveStore.StartAsync(context.Background())
++	require.NoError(t, err)
++	err = liveStore.AwaitRunning(context.Background())
++	require.NoError(t, err)
++
++	instance, err := liveStore.getOrCreateInstance(integrationTestTenantID)
++	require.NoError(t, err)
++
++	numTraces := 10
++	traces, traceIDs := createTestTracesWithTags(t, numTraces, "service.name", "test-service")
++
++	writeTracesToInstance(t, instance, traces, traceIDs)
++
++	testSearchInDifferentStates(t, instance, traceIDs)
++
++	liveStore.StopAsync()
++	err = liveStore.AwaitTerminated(context.Background())
++	require.NoError(t, err)
++}
++
++// TestLiveStoreConcurrentOperations tests concurrent read/write operations
++func TestLiveStoreConcurrentOperations(t *testing.T) {
++	tmpDir := t.TempDir()
++	liveStore, _ := setupIntegrationTest(t, tmpDir)
++
++	err := liveStore.StartAsync(context.Background())
++	require.NoError(t, err)
++	err = liveStore.AwaitRunning(context.Background())
++	require.NoError(t, err)
++
++	instance, err := liveStore.getOrCreateInstance(integrationTestTenantID)
++	require.NoError(t, err)
++
++	done := make(chan bool)
++
++	go func() {
++		for i := 0; i < 50; i++ {
++			traces, traceIDs := createTestTraces(t, 2)
++			writeTracesToInstance(t, instance, traces, traceIDs)
++			time.Sleep(10 * time.Millisecond)
++		}
++		done <- true
++	}()
++
++	go func() {
++		for i := 0; i < 20; i++ {
++			req := &tempopb.SearchRequest{
++				Query: "{ .service.name = \"test-service\" }",
++				Limit: 100,
++			}
++			_, err := instance.Search(context.Background(), req)
++			assert.NoError(t, err)
++			time.Sleep(50 * time.Millisecond)
++		}
++		done <- true
++	}()
++
++	go func() {
++		for i := 0; i < 10; i++ {
++			err := instance.cutIdleTraces(false)
++			assert.NoError(t, err)
++			_, err = instance.cutBlocks(false)
++			assert.NoError(t, err)
++			time.Sleep(100 * time.Millisecond)
++		}
++		done <- true
++	}()
++
++	for i := 0; i < 3; i++ {
++		<-done
++	}
++
++	liveStore.StopAsync()
++	err = liveStore.AwaitTerminated(context.Background())
++	require.NoError(t, err)
++}
++
++// TestInMemoryKafkaClientBasicOperations tests the in-memory Kafka client operations
++func TestInMemoryKafkaClientBasicOperations(t *testing.T) {
++	client := NewInMemoryKafkaClient()
++
++	err := client.Ping(context.Background())
++	assert.NoError(t, err)
++
++	client.AddMessage("test-topic", 0, []byte("key1"), []byte("value1"))
++	client.AddMessage("test-topic", 0, []byte("key2"), []byte("value2"))
++
++	partitions := map[string]map[int32]kgo.Offset{
++		"test-topic": {0: kgo.NewOffset().At(0)},
++	}
++	client.AddConsumePartitions(partitions)
++
++	offsets, err := client.FetchOffsets(context.Background(), "test-group")
++	assert.NoError(t, err)
++	assert.Equal(t, 0, len(offsets))
++
++	commitOffsets := make(kadm.Offsets)
++	commitOffsets.Add(kadm.Offset{
++		Topic:     "test-topic",
++		Partition: 0,
++		At:        1,
++	})
++
++	responses, err := client.CommitOffsets(context.Background(), "test-group", commitOffsets)
++	assert.NoError(t, err)
++	assert.Equal(t, 1, len(responses))
++
++	offsets, err = client.FetchOffsets(context.Background(), "test-group")
++	assert.NoError(t, err)
++	assert.Equal(t, 1, len(offsets))
++
++	client.RemoveConsumePartitions(map[string][]int32{
++		"test-topic": {0},
++	})
++
++	client.Close()
++	err = client.Ping(context.Background())
++	assert.Error(t, err)
++}
++
++func setupIntegrationTest(t *testing.T, tmpDir string) (*LiveStore, *InMemoryKafkaClient) {
++	cfg := Config{}
++	cfg.WAL.Filepath = tmpDir
++	cfg.WAL.Version = encoding.LatestEncoding().Version()
++	flagext.DefaultValues(&cfg.LifecyclerConfig)
++
++	mockStore, _ := consul.NewInMemoryClient(
++		ring.GetPartitionRingCodec(),
++		log.NewNopLogger(),
++		nil,
++	)
++
++	cfg.LifecyclerConfig.RingConfig.KVStore.Mock = mockStore
++	cfg.LifecyclerConfig.NumTokens = 1
++	cfg.LifecyclerConfig.ListenPort = 0
++	cfg.LifecyclerConfig.Addr = "localhost"
++	cfg.LifecyclerConfig.ID = "test-1"
++	cfg.LifecyclerConfig.FinalSleep = 0
++	cfg.PartitionRing.KVStore.Mock = mockStore
++
++	cfg.IngestConfig.Kafka.Topic = "tempo-traces"
++	cfg.IngestConfig.Kafka.ConsumerGroup = "test-consumer-group"
++
++	limits, err := overrides.NewOverrides(overrides.Config{}, nil, prometheus.DefaultRegisterer)
++	require.NoError(t, err)
++
++	reg := prometheus.NewRegistry()
++	logger := log.NewNopLogger()
++
++	kafkaClient := NewInMemoryKafkaClient()
++
++	clientFactory := func(cfg ingest.KafkaConfig, metrics *kprom.Metrics, logger log.Logger) (KafkaClient, error) {
++		return kafkaClient, nil
++	}
++
++	liveStore, err := New(cfg, limits, logger, reg, true, clientFactory)
++	require.NoError(t, err)
++
++	return liveStore, kafkaClient
++}
++
++func createTestTraces(t *testing.T, numTraces int) ([]*tempopb.Trace, [][]byte) {
++	traces := make([]*tempopb.Trace, numTraces)
++	traceIDs := make([][]byte, numTraces)
++
++	for i := 0; i < numTraces; i++ {
++		id := make([]byte, 16)
++		_, err := crand.Read(id)
++		require.NoError(t, err)
++
++		// test.MakeTrace already creates traces with service.name = "test-service"
++		trace := test.MakeTrace(5, id)
++
++		traces[i] = trace
++		traceIDs[i] = id
++	}
++
++	return traces, traceIDs
++}
++
++func createTestTracesWithTags(t *testing.T, numTraces int, tagKey, tagValue string) ([]*tempopb.Trace, [][]byte) {
++	traces := make([]*tempopb.Trace, numTraces)
++	traceIDs := make([][]byte, numTraces)
++
++	for i := 0; i < numTraces; i++ {
++		id := make([]byte, 16)
++		_, err := crand.Read(id)
++		require.NoError(t, err)
++
++		// test.MakeTrace already creates traces with service.name = "test-service"
++		trace := test.MakeTrace(5, id)
++
++		// Add additional tags to spans
++		for _, rs := range trace.ResourceSpans {
++			for _, ss := range rs.ScopeSpans {
++				for _, span := range ss.Spans {
++					span.Attributes = append(span.Attributes, &v1.KeyValue{
++						Key: tagKey,
++						Value: &v1.AnyValue{
++							Value: &v1.AnyValue_StringValue{StringValue: tagValue},
++						},
++					})
++				}
++			}
++		}
++
++		traces[i] = trace
++		traceIDs[i] = id
++	}
++
++	return traces, traceIDs
++}
++
++func writeTracesToInstance(t *testing.T, instance *instance, traces []*tempopb.Trace, traceIDs [][]byte) {
++	for i, trace := range traces {
++		traceBytes, err := trace.Marshal()
++		require.NoError(t, err)
++
++		pushReq := &tempopb.PushBytesRequest{
++			Traces: []tempopb.PreallocBytes{{Slice: traceBytes}},
++			Ids:    [][]byte{traceIDs[i]},
++		}
++
++		instance.pushBytes(time.Now(), pushReq)
++	}
++}
++
++func writeTracesToKafka(t *testing.T, kafkaClient *InMemoryKafkaClient, traces []*tempopb.Trace, traceIDs [][]byte) {
++	for i, trace := range traces {
++		traceBytes, err := trace.Marshal()
++		require.NoError(t, err)
++
++		pushReq := &tempopb.PushBytesRequest{
++			Traces: []tempopb.PreallocBytes{{Slice: traceBytes}},
++			Ids:    [][]byte{traceIDs[i]},
++		}
++
++		// Marshal the push request directly
++		encoded, err := pushReq.Marshal()
++		require.NoError(t, err)
++
++		kafkaClient.AddMessage("tempo-traces", 0, []byte(integrationTestTenantID), encoded)
++	}
++
++	partitions := map[string]map[int32]kgo.Offset{
++		"tempo-traces": {0: kgo.NewOffset().At(0)},
++	}
++	kafkaClient.AddConsumePartitions(partitions)
++}
++
++func testSearchAfterConsumption(t *testing.T, instance *instance, traceIDs [][]byte) {
++	req := &tempopb.SearchRequest{
++		Query: "{ .service.name = \"test-service\" }",
++		Limit: uint32(len(traceIDs)) + 1,
++	}
++
++	sr, err := instance.Search(context.Background(), req)
++	require.NoError(t, err)
++	require.Len(t, sr.Traces, len(traceIDs))
++
++	foundTraceIDs := make(map[string]bool)
++	for _, traceResult := range sr.Traces {
++		foundTraceIDs[traceResult.TraceID] = true
++	}
++
++	for _, expectedID := range traceIDs {
++		expectedIDStr := fmt.Sprintf("%032x", expectedID)
++		assert.True(t, foundTraceIDs[expectedIDStr], "expected trace ID %s not found", expectedIDStr)
++	}
++}
++
++func testSearchTagsAfterConsumption(t *testing.T, instance *instance) {
++	ctx := user.InjectOrgID(context.Background(), integrationTestTenantID)
++
++	sr, err := instance.SearchTags(ctx, "")
++	require.NoError(t, err)
++	assert.Contains(t, sr.TagNames, "service.name")
++
++	srv, err := instance.SearchTagValues(ctx, "service.name", 0, 0)
++	require.NoError(t, err)
++	assert.Contains(t, srv.TagValues, "test-service")
++}
++
++func testSearchInDifferentStates(t *testing.T, instance *instance, traceIDs [][]byte) {
++	req := &tempopb.SearchRequest{
++		Query: "{ span.service.name = \"test-service\" }",
++		Limit: uint32(len(traceIDs)) + 1,
++	}
++
++	err := instance.cutIdleTraces(true)
++	require.NoError(t, err)
++
++	sr, err := instance.Search(context.Background(), req)
++	require.NoError(t, err)
++	assert.LessOrEqual(t, len(sr.Traces), len(traceIDs))
++
++	blockID, err := instance.cutBlocks(true)
++	require.NoError(t, err)
++
++	sr, err = instance.Search(context.Background(), req)
++	require.NoError(t, err)
++	assert.LessOrEqual(t, len(sr.Traces), len(traceIDs))
++
++	if blockID.String() != "00000000-0000-0000-0000-000000000000" {
++		err = instance.completeBlock(context.Background(), blockID)
++		require.NoError(t, err)
++
++		sr, err = instance.Search(context.Background(), req)
++		require.NoError(t, err)
++		assert.LessOrEqual(t, len(sr.Traces), len(traceIDs))
++	}
++}
