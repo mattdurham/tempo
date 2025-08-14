@@ -20,6 +20,8 @@ services:
       - ./tempo-distributed.yaml:/etc/tempo.yaml
     ports:
       - "3200"   # tempo
+    depends_on:
+      - minio
 # Uncomment the following lines to enable tracing
 #    environment:
 #      - OTEL_EXPORTER_OTLP_ENDPOINT=http://alloy:4318
@@ -32,6 +34,8 @@ services:
       - ./tempo-distributed.yaml:/etc/tempo.yaml
     ports:
       - "3200"   # tempo
+    depends_on:
+      - minio
 # Uncomment the following lines to enable tracing
 #    environment:
 #      - OTEL_EXPORTER_OTLP_ENDPOINT=http://alloy:4318
@@ -44,6 +48,8 @@ services:
       - ./tempo-distributed.yaml:/etc/tempo.yaml
     ports:
       - "3200"   # tempo
+    depends_on:
+      - minio
 # Uncomment the following lines to enable tracing
 #    environment:
 #      - OTEL_EXPORTER_OTLP_ENDPOINT=http://alloy:4318
@@ -68,6 +74,8 @@ services:
       - ./tempo-distributed.yaml:/etc/tempo.yaml
     ports:
       - "3200"   # tempo
+    depends_on:
+      - minio
 # Uncomment the following lines to enable tracing
 #    environment:
 #      - OTEL_EXPORTER_OTLP_ENDPOINT=http://alloy:4318

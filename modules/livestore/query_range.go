@@ -35,9 +35,9 @@ func (i *instance) QueryRange(ctx context.Context, req *tempopb.QueryRangeReques
 	i.blocksMtx.RLock()
 	defer i.blocksMtx.RUnlock()
 
-	cutoff := time.Now().Add(-i.Cfg.CompleteBlockTimeout).Add(-timeBuffer)
+	cutoff := time.Now().Add(-i.cfg.CompleteBlockTimeout).Add(-timeBuffer)
 	if req.Start < uint64(cutoff.UnixNano()) {
-		return fmt.Errorf("time range must be within last %v", i.Cfg.CompleteBlockTimeout)
+		return fmt.Errorf("time range must be within last %v", i.cfg.CompleteBlockTimeout)
 	}
 
 	expr, err := traceql.Parse(req.Query)
@@ -47,12 +47,12 @@ func (i *instance) QueryRange(ctx context.Context, req *tempopb.QueryRangeReques
 
 	unsafe := i.overrides.UnsafeQueryHints(i.tenantID)
 
-	timeOverlapCutoff := i.Cfg.Metrics.TimeOverlapCutoff
+	timeOverlapCutoff := i.cfg.Metrics.TimeOverlapCutoff
 	if v, ok := expr.Hints.GetFloat(traceql.HintTimeOverlapCutoff, unsafe); ok && v >= 0 && v <= 1.0 {
 		timeOverlapCutoff = v
 	}
 
-	concurrency := i.Cfg.Metrics.ConcurrentBlocks
+	concurrency := i.cfg.Metrics.ConcurrentBlocks
 	if v, ok := expr.Hints.GetInt(traceql.HintConcurrentBlocks, unsafe); ok && v > 0 && v < 100 {
 		concurrency = uint(v)
 	}

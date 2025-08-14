@@ -27,6 +27,9 @@ import (
 
 const (
 	liveStoreServiceName = "live-store"
+	// LivestoreRingKey is the key under which we store the partitions ring used by the "ingest storage".
+	PartitionName = "live-store-partitions"
+	RingKeyName   = "live-store-partitions"
 )
 
 type Overrides interface {

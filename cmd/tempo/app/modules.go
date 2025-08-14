@@ -67,6 +67,7 @@ const (
 
 	// rings
 	IngesterRing          string = "ring"
+	LivestoreRing         string = "livestore-ring"
 	SecondaryIngesterRing string = "secondary-ring"
 	MetricsGeneratorRing  string = "metrics-generator-ring"
 	PartitionRing         string = "partition-ring"
@@ -93,6 +94,7 @@ const (
 	ringIngester          string = "ingester"
 	ringMetricsGenerator  string = "metrics-generator"
 	ringSecondaryIngester string = "secondary-ingester"
+	ringLivestore         string = "live-store"
 )
 
 func (t *App) initServer() (services.Service, error) {
@@ -161,6 +163,9 @@ func (t *App) initIngesterRing() (services.Service, error) {
 	return t.initReadRing(t.cfg.Ingester.LifecyclerConfig.RingConfig, ringIngester, t.cfg.Ingester.OverrideRingKey)
 }
 
+func (t *App) initLivestoreRing() (services.Service, error) {
+	return t.initReadRing(t.cfg.LiveStore.LifecyclerConfig.RingConfig, ringLivestore, "")
+}
 func (t *App) initGeneratorRing() (services.Service, error) {
 	return t.initReadRing(t.cfg.Generator.Ring.ToRingConfig(), ringMetricsGenerator, t.cfg.Generator.OverrideRingKey)
 }
@@ -199,11 +204,18 @@ func (t *App) initPartitionRing() (services.Service, error) {
 		return nil, fmt.Errorf("creating KV store for ingester partitions ring watcher: %w", err)
 	}
 
-	t.partitionRingWatcher = ring.NewPartitionRingWatcher(ingester.PartitionRingName, ingester.PartitionRingKey, kvClient, util_log.Logger, prometheus.WrapRegistererWithPrefix("tempo_", prometheus.DefaultRegisterer))
-	t.partitionRing = ring.NewPartitionInstanceRing(t.partitionRingWatcher, t.readRings[ringIngester], t.cfg.Ingester.LifecyclerConfig.RingConfig.HeartbeatTimeout)
+	if t.cfg.Querier.QueryMode == "live-store" {
+		t.partitionRingWatcher = ring.NewPartitionRingWatcher(livestore.PartitionName, livestore.RingKeyName, kvClient, util_log.Logger, prometheus.WrapRegistererWithPrefix("tempo_", prometheus.DefaultRegisterer))
+		t.partitionRing = ring.NewPartitionInstanceRing(t.partitionRingWatcher, t.readRings[ringLivestore], t.cfg.LiveStore.LifecyclerConfig.RingConfig.HeartbeatTimeout)
+		// Expose a web page to view the partitions ring state.
+		t.Server.HTTPRouter().Path("/partition-ring").Methods("GET", "POST").Handler(ring.NewPartitionRingPageHandler(t.partitionRingWatcher, ring.NewPartitionRingEditor(livestore.RingKeyName, kvClient)))
 
-	// Expose a web page to view the partitions ring state.
-	t.Server.HTTPRouter().Path("/partition-ring").Methods("GET", "POST").Handler(ring.NewPartitionRingPageHandler(t.partitionRingWatcher, ring.NewPartitionRingEditor(ingester.PartitionRingKey, kvClient)))
+	} else {
+		t.partitionRingWatcher = ring.NewPartitionRingWatcher(ingester.PartitionRingName, ingester.PartitionRingKey, kvClient, util_log.Logger, prometheus.WrapRegistererWithPrefix("tempo_", prometheus.DefaultRegisterer))
+		t.partitionRing = ring.NewPartitionInstanceRing(t.partitionRingWatcher, t.readRings[ringIngester], t.cfg.Ingester.LifecyclerConfig.RingConfig.HeartbeatTimeout)
+		// Expose a web page to view the partitions ring state.
+		t.Server.HTTPRouter().Path("/partition-ring").Methods("GET", "POST").Handler(ring.NewPartitionRingPageHandler(t.partitionRingWatcher, ring.NewPartitionRingEditor(ingester.PartitionRingKey, kvClient)))
+	}
 
 	return t.partitionRingWatcher, nil
 }
@@ -432,9 +444,22 @@ func (t *App) initQuerier() (services.Service, error) {
 		t.store.EnablePolling(context.Background(), nil, false)
 	}
 
-	ingesterRings := []ring.ReadRing{t.readRings[ringIngester]}
-	if ring := t.readRings[ringSecondaryIngester]; ring != nil {
-		ingesterRings = append(ingesterRings, ring)
+	var ingesterRings []ring.ReadRing
+
+	// Choose rings based on query mode
+	if t.cfg.Querier.QueryMode == "live-store" {
+		// Use livestore ring when configured for livestore mode
+		if livestoreRing := t.readRings[ringLivestore]; livestoreRing != nil {
+			ingesterRings = []ring.ReadRing{livestoreRing}
+		} else {
+			return nil, fmt.Errorf("live-store ring not available but querier is configured to use livestore mode")
+		}
+	} else {
+		// Default to ingester rings
+		ingesterRings = []ring.ReadRing{t.readRings[ringIngester]}
+		if ring := t.readRings[ringSecondaryIngester]; ring != nil {
+			ingesterRings = append(ingesterRings, ring)
+		}
 	}
 
 	querier, err := querier.New(
@@ -792,6 +817,7 @@ func (t *App) setupModuleManager() error {
 	mm.RegisterModule(UsageReport, t.initUsageReport)
 	mm.RegisterModule(CacheProvider, t.initCacheProvider, modules.UserInvisibleModule)
 	mm.RegisterModule(IngesterRing, t.initIngesterRing, modules.UserInvisibleModule)
+	mm.RegisterModule(LivestoreRing, t.initLivestoreRing, modules.UserInvisibleModule)
 	mm.RegisterModule(MetricsGeneratorRing, t.initGeneratorRing, modules.UserInvisibleModule)
 	mm.RegisterModule(GeneratorRingWatcher, t.initGeneratorRingWatcher, modules.UserInvisibleModule)
 	mm.RegisterModule(SecondaryIngesterRing, t.initSecondaryIngesterRing, modules.UserInvisibleModule)
@@ -837,7 +863,7 @@ func (t *App) setupModuleManager() error {
 		Ingester:                      {Common, Store, MemberlistKV, PartitionRing},
 		MetricsGenerator:              {Common, OptionalStore, MemberlistKV, PartitionRing},
 		MetricsGeneratorNoLocalBlocks: {Common, GeneratorRingWatcher},
-		Querier:                       {Common, Store, IngesterRing, MetricsGeneratorRing, SecondaryIngesterRing},
+		Querier:                       {Common, Store, IngesterRing, LivestoreRing, MetricsGeneratorRing, SecondaryIngesterRing},
 		Compactor:                     {Common, Store, MemberlistKV},
 		BlockBuilder:                  {Common, Store, MemberlistKV, PartitionRing},
 		BackendScheduler:              {Common, Store},
@@ -845,7 +871,7 @@ func (t *App) setupModuleManager() error {
 		LiveStore:                     {Common, MemberlistKV, PartitionRing},
 
 		// composite targets
-		SingleBinary:         {Compactor, QueryFrontend, Querier, Ingester, Distributor, MetricsGenerator, BlockBuilder},
+		SingleBinary:         {Compactor, QueryFrontend, Querier, Ingester, Distributor, MetricsGenerator, BlockBuilder, LiveStore},
 		ScalableSingleBinary: {SingleBinary},
 	}
 

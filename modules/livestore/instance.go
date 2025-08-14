@@ -26,7 +26,7 @@ type instance struct {
 	logger   log.Logger
 
 	// Configuration
-	Cfg Config
+	cfg Config
 
 	// WAL and encoding
 	wal  *wal.WAL
@@ -59,7 +59,7 @@ func newInstance(instanceID string, cfg Config, wal *wal.WAL, overrides Override
 	i := &instance{
 		tenantID:       instanceID,
 		logger:         log.With(logger, "tenant", instanceID),
-		Cfg:            cfg,
+		cfg:            cfg,
 		wal:            wal,
 		walR:           backend.NewReader(wal.LocalBackend()),
 		walW:           backend.NewWriter(wal.LocalBackend()),
@@ -82,7 +82,7 @@ func newInstance(instanceID string, cfg Config, wal *wal.WAL, overrides Override
 
 // getEffectiveConfig returns the configuration with per-tenant overrides applied
 func (i *instance) getEffectiveConfig() Config {
-	cfg := i.Cfg
+	cfg := i.cfg
 
 	// Apply per-tenant overrides
 	if timeout := i.overrides.LiveStoreCompleteBlockTimeout(i.tenantID); timeout > 0 {

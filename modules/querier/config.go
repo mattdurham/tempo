@@ -2,6 +2,7 @@ package querier
 
 import (
 	"flag"
+	"fmt"
 	"time"
 
 	"github.com/grafana/dskit/backoff"
@@ -23,6 +24,10 @@ type Config struct {
 	ShuffleShardingIngestersLookbackPeriod time.Duration `yaml:"shuffle_sharding_ingesters_lookback_period"`
 	QueryRelevantIngesters                 bool          `yaml:"query_relevant_ingesters"`
 	SecondaryIngesterRing                  string        `yaml:"secondary_ingester_ring,omitempty"`
+	
+	// QueryMode controls whether to query ingesters or livestores for live data
+	// Valid values: "ingester", "livestore"
+	QueryMode string `yaml:"query_mode,omitempty"`
 }
 
 type SearchConfig struct {
@@ -71,6 +76,16 @@ func (cfg *Config) RegisterFlagsAndApplyDefaults(prefix string, f *flag.FlagSet)
 		DNSLookupPeriod: 10 * time.Second,
 	}
 	cfg.ShuffleShardingIngestersLookbackPeriod = 1 * time.Hour
+	cfg.QueryMode = "ingester" // default to ingester for backward compatibility
 
 	f.StringVar(&cfg.Worker.FrontendAddress, prefix+".frontend-address", "", "Address of query frontend service, in host:port format.")
+	f.StringVar(&cfg.QueryMode, prefix+".query-mode", cfg.QueryMode, "Mode for querying live data. Valid values: 'ingester', 'livestore'.")
+}
+
+// Validate validates the config.
+func (cfg *Config) Validate() error {
+	if cfg.QueryMode != "ingester" && cfg.QueryMode != "livestore" {
+		return fmt.Errorf("invalid query_mode '%s', must be 'ingester' or 'livestore'", cfg.QueryMode)
+	}
+	return nil
 }
