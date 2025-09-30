@@ -2,6 +2,7 @@ package livestore
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/grafana/tempo/modules/overrides"
 	"github.com/grafana/tempo/pkg/flushqueues"
 	"github.com/grafana/tempo/pkg/ingest"
+	"github.com/grafana/tempo/pkg/livetraces"
 	"github.com/grafana/tempo/pkg/tempopb"
 	"github.com/grafana/tempo/tempodb/wal"
 	"github.com/prometheus/client_golang/prometheus"
@@ -355,8 +357,23 @@ func (s *LiveStore) consume(ctx context.Context, rs recordIter, now time.Time) (
 		}
 
 		// Push data to tenant instance
-		inst.pushBytes(ctx, record.Timestamp, pushReq)
-
+		for j := range pushReq.Ids {
+			reason := inst.pushBytes(ctx, record.Timestamp, pushReq.Ids[j], pushReq.Traces[j].Slice)
+			// Push to live traces with tenant-specific limits
+			if len(reason) > 0 {
+				var reason string
+				switch {
+				case errors.Is(err, livetraces.ErrMaxLiveTracesExceeded):
+					reason = overrides.ReasonLiveTracesExceeded
+				case errors.Is(err, livetraces.ErrMaxTraceSizeExceeded):
+					reason = overrides.ReasonTraceTooLarge
+				default:
+					reason = overrides.ReasonUnknown
+				}
+				level.Debug(s.logger).Log("msg", "dropped spans due to limits", "tenant", inst.tenantID, "reason", reason)
+				continue
+			}
+		}
 		metricRecordsProcessed.WithLabelValues(tenant).Inc()
 		recordCount++
 		lastRecord = record

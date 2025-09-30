@@ -3,7 +3,7 @@ package livestore
 import (
 	"bytes"
 	"context"
-	"errors"
+	"encoding/hex"
 	"sort"
 	"sync"
 	"time"
@@ -18,6 +18,7 @@ import (
 	"github.com/grafana/tempo/pkg/tempopb"
 	v1 "github.com/grafana/tempo/pkg/tempopb/trace/v1"
 	"github.com/grafana/tempo/pkg/tracesizes"
+	"github.com/grafana/tempo/pkg/util"
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/encoding"
 	"github.com/grafana/tempo/tempodb/encoding/common"
@@ -80,6 +81,7 @@ var (
 type instance struct {
 	tenantID string
 	logger   log.Logger
+	limiter  ingester.Limiter
 
 	// Configuration
 	Cfg Config
@@ -97,7 +99,7 @@ type instance struct {
 
 	// Live traces
 	liveTracesMtx sync.Mutex
-	liveTraces    *livetraces.LiveTraces[*v1.ResourceSpans]
+	liveTraces    map[uint64]*liveTrace
 	traceSizes    *tracesizes.Tracker
 
 	// Metrics
@@ -119,7 +121,7 @@ func newInstance(instanceID string, cfg Config, wal *wal.WAL, overrides override
 		enc:                enc,
 		walBlocks:          map[uuid.UUID]common.WALBlock{},
 		completeBlocks:     map[uuid.UUID]*ingester.LocalBlock{},
-		liveTraces:         livetraces.New[*v1.ResourceSpans](func(rs *v1.ResourceSpans) uint64 { return uint64(rs.Size()) }, cfg.MaxTraceLive, cfg.MaxTraceIdle, instanceID),
+		liveTraces:         map[uint64]*liveTrace{},
 		traceSizes:         tracesizes.New(),
 		overrides:          overrides,
 		tracesCreatedTotal: metricTracesCreatedTotal.WithLabelValues(instanceID),
@@ -139,7 +141,10 @@ func (i *instance) backpressure(ctx context.Context) bool {
 	if i.Cfg.MaxLiveTracesBytes > 0 {
 		// Check live traces
 		i.liveTracesMtx.Lock()
-		sz := i.liveTraces.Size()
+		var sz uint64
+		for _, t := range i.liveTraces {
+			sz += t.Size()
+		}
 		i.liveTracesMtx.Unlock()
 
 		if sz >= i.Cfg.MaxLiveTracesBytes {
@@ -177,75 +182,53 @@ func (i *instance) backpressure(ctx context.Context) bool {
 	return false
 }
 
-func (i *instance) pushBytes(ctx context.Context, ts time.Time, req *tempopb.PushBytesRequest) {
-	if len(req.Traces) != len(req.Ids) {
-		level.Error(i.logger).Log("msg", "mismatched traces and ids length", "IDs", len(req.Ids), "traces", len(req.Traces))
-		return
-	}
-
+func (i *instance) pushBytes(ctx context.Context, ts time.Time, id, traceBytes []byte) string {
 	// Wait for room in pipeline if needed
 	for i.backpressure(ctx) {
 	}
 
-	if err := ctx.Err(); err != nil {
-		level.Error(i.logger).Log("msg", "failed to push bytes to instance", "err", err)
-		return
+	err := i.limiter.AssertMaxTracesPerUser(i.tenantID, len(i.liveTraces))
+	if err != nil {
+		return overrides.ReasonLiveTracesExceeded
 	}
 
-	// Check tenant limits
-	maxBytes := i.overrides.MaxBytesPerTrace(i.tenantID)
-	maxLiveTraces := i.overrides.MaxLocalTracesPerUser(i.tenantID)
+	maxBytes := i.limiter.Limits().MaxBytesPerTrace(i.tenantID)
+	reqSize := len(traceBytes)
 
-	// For each pre-marshalled trace, we need to unmarshal it and push to live traces
-	for j, traceBytes := range req.Traces {
-		traceID := req.Ids[j]
-		// measure received bytes as sum of slice lengths
-		// type byte is guaranteed to be 1 byte in size
-		// ref: https://golang.org/ref/spec#Size_and_alignment_guarantees
-		i.bytesReceivedTotal.WithLabelValues(i.tenantID, traceDataType).Add(float64(len(traceBytes.Slice)))
-
-		// Unmarshal the trace
-		trace := &tempopb.Trace{}
-		if err := trace.Unmarshal(traceBytes.Slice); err != nil {
-			level.Error(i.logger).Log("msg", "failed to unmarshal trace", "err", err)
-			continue
+	if maxBytes > 0 {
+		allowResult := i.traceSizes.Allow(id, reqSize, maxBytes)
+		if !allowResult.IsAllowed {
+			i.logger.Log("msg", overrides.ErrorPrefixTraceTooLarge, "max", maxBytes, "reqSize", reqSize, "totalSize", allowResult.CurrentTotalSize, "trace", hex.EncodeToString(id))
+			return overrides.ReasonTraceTooLarge
 		}
-
-		i.liveTracesMtx.Lock()
-		// Push each batch in the trace to live traces
-		for _, batch := range trace.ResourceSpans {
-			if len(batch.ScopeSpans) == 0 || len(batch.ScopeSpans[0].Spans) == 0 {
-				continue
-			}
-
-			// Push to live traces with tenant-specific limits
-			if err := i.liveTraces.PushWithTimestampAndLimits(ts, traceID, batch, uint64(maxLiveTraces), uint64(maxBytes)); err != nil {
-				var reason string
-				switch {
-				case errors.Is(err, livetraces.ErrMaxLiveTracesExceeded):
-					reason = overrides.ReasonLiveTracesExceeded
-				case errors.Is(err, livetraces.ErrMaxTraceSizeExceeded):
-					reason = overrides.ReasonTraceTooLarge
-				default:
-					reason = overrides.ReasonUnknown
-				}
-				level.Debug(i.logger).Log("msg", "dropped spans due to limits", "tenant", i.tenantID, "reason", reason)
-				overrides.RecordDiscardedSpans(countSpans(trace), reason, i.tenantID)
-				continue
-			}
-		}
-		i.liveTracesMtx.Unlock()
 	}
+
+	// measure received bytes as sum of slice lengths
+	// type byte is guaranteed to be 1 byte in size
+	// ref: https://golang.org/ref/spec#Size_and_alignment_guarantees
+	i.bytesReceivedTotal.WithLabelValues(i.tenantID, traceDataType).Add(float64(len(traceBytes)))
+
+	i.liveTracesMtx.Lock()
+	tkn := util.HashForTraceID(id)
+	lt := i.getOrCreateTrace(id, tkn)
+	lt.batches = append(lt.batches, traceBytes)
+	i.liveTracesMtx.Unlock()
+	return ""
 }
 
-func countSpans(trace *tempopb.Trace) int {
-	count := 0
-	for _, b := range trace.ResourceSpans {
-		for _, ss := range b.ScopeSpans {
-			count += len(ss.Spans)
-		}
+// getOrCreateTrace will return a new trace object for the given request
+//
+//	It must be called under the i.tracesMtx lock
+func (i *instance) getOrCreateTrace(traceID []byte, fp uint64) *liveTrace {
+	trace, ok := i.liveTraces[fp]
+	if ok {
+		return trace
 	}
-	return count
+
+	trace = newTrace(traceID)
+	i.liveTraces[fp] = trace
+
+	return trace
 }
 
 func (i *instance) cutIdleTraces(immediate bool) error {
@@ -254,7 +237,7 @@ func (i *instance) cutIdleTraces(immediate bool) error {
 	metricLiveTraces.WithLabelValues(i.tenantID).Set(float64(i.liveTraces.Len()))
 	metricLiveTraceBytes.WithLabelValues(i.tenantID).Set(float64(i.liveTraces.Size()))
 
-	tracesToCut := i.liveTraces.CutIdle(time.Now(), immediate)
+	tracesToCut := i.tracesToCut(time.Now(), i.Cfg.MaxTraceIdle, i.Cfg.MaxTraceLive, immediate)
 	i.liveTracesMtx.Unlock()
 
 	if len(tracesToCut) == 0 {
@@ -264,13 +247,15 @@ func (i *instance) cutIdleTraces(immediate bool) error {
 	sort.Slice(tracesToCut, func(i, j int) bool {
 		return bytes.Compare(tracesToCut[i].ID, tracesToCut[j].ID) == -1
 	})
+
 	// Collect the trace IDs that will be flushed
 	for _, t := range tracesToCut {
-		err := i.writeHeadBlock(t.ID, t)
+		err := i.writeHeadBlock(t.traceID, t)
 		if err != nil {
 			return err
 		}
 
+		tempopb.ReuseByteSlices(t.batches)
 		i.tracesCreatedTotal.Inc()
 	}
 
@@ -287,7 +272,37 @@ func (i *instance) cutIdleTraces(immediate bool) error {
 	return nil
 }
 
-func (i *instance) writeHeadBlock(id []byte, liveTrace *livetraces.LiveTrace[*v1.ResourceSpans]) error {
+func (i *instance) tracesToCut(now time.Time, idleCutoff time.Duration, liveCutoff time.Duration, immediate bool) []*liveTrace {
+	i.liveTracesMtx.Lock()
+	defer i.liveTracesMtx.Unlock()
+
+	// Set this before cutting to give a more accurate number.
+	metricLiveTraces.WithLabelValues(i.tenantID).Set(float64(len(i.liveTraces)))
+	var sz uint64
+	for _, t := range i.liveTraces {
+		sz += t.Size()
+	}
+	metricLiveTraceBytes.WithLabelValues(i.tenantID).Set(float64(sz))
+
+	idleCutoffTime := now.Add(-idleCutoff)
+	liveCutoffTime := now.Add(-liveCutoff)
+	tracesToCut := make([]*liveTrace, 0, len(i.liveTraces))
+
+	for key, trace := range i.liveTraces {
+		if idleCutoffTime.After(trace.lastAppend) ||
+			liveCutoffTime.After(trace.createdAt) ||
+			immediate {
+
+			tracesToCut = append(tracesToCut, trace)
+
+			// decrease live trace bytes
+			delete(i.liveTraces, key)
+		}
+	}
+	return tracesToCut
+}
+
+func (i *instance) writeHeadBlock(id []byte, liveTrace *liveTrace) error {
 	i.blocksMtx.Lock()
 	defer i.blocksMtx.Unlock()
 
@@ -297,45 +312,22 @@ func (i *instance) writeHeadBlock(id []byte, liveTrace *livetraces.LiveTrace[*v1
 			return err
 		}
 	}
+	
+	// sort batches before cutting to reduce combinations during compaction
+		sortByteSlices(liveTrace.batches)
 
-	tr := &tempopb.Trace{
-		ResourceSpans: liveTrace.Batches,
-	}
-
-	// Get trace timestamp bounds
-	var start, end uint64
-	for _, batch := range tr.ResourceSpans {
-		for _, ss := range batch.ScopeSpans {
-			for _, s := range ss.Spans {
-				if start == 0 || s.StartTimeUnixNano < start {
-					start = s.StartTimeUnixNano
-				}
-				if s.EndTimeUnixNano > end {
-					end = s.EndTimeUnixNano
-				}
-			}
+		out, err := segmentDecoder.ToObject(t.batches)
+		if err != nil {
+			return err
 		}
+
+	i.tracesCreatedTotal.Inc()
+	err := i.headBlock.Append(id, b, liveTrace.start, liveTrace.end, true)
+	if err != nil {
+		return err
 	}
 
-	// Convert from unix nanos to unix seconds
-	startSeconds := uint32(start / uint64(time.Second))
-	endSeconds := uint32(end / uint64(time.Second))
-
-	// constrain start/end with ingestion slack calculated off of liveTrace.createdAt and lastAppend
-	// createdAt and lastAppend are set via the record.Timestamp from kafka so they are "time.Now()" for the
-	// ingestion of this trace
-	slackDuration := i.Cfg.WAL.IngestionSlack
-	minStart := uint32(liveTrace.CreatedAt.Add(-slackDuration).Unix())
-	maxEnd := uint32(liveTrace.LastAppend.Add(slackDuration).Unix())
-
-	if startSeconds < minStart {
-		startSeconds = minStart
-	}
-	if endSeconds > maxEnd {
-		endSeconds = maxEnd
-	}
-
-	return i.headBlock.AppendTrace(id, tr, startSeconds, endSeconds, false)
+	return nil
 }
 
 func (i *instance) resetHeadBlock() error {
