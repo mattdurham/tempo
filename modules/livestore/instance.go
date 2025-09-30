@@ -13,10 +13,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/grafana/tempo/modules/ingester"
 	"github.com/grafana/tempo/modules/overrides"
-	"github.com/grafana/tempo/pkg/livetraces"
 	"github.com/grafana/tempo/pkg/model"
 	"github.com/grafana/tempo/pkg/tempopb"
-	v1 "github.com/grafana/tempo/pkg/tempopb/trace/v1"
 	"github.com/grafana/tempo/pkg/tracesizes"
 	"github.com/grafana/tempo/pkg/util"
 	"github.com/grafana/tempo/tempodb/backend"
@@ -234,8 +232,12 @@ func (i *instance) getOrCreateTrace(traceID []byte, fp uint64) *liveTrace {
 func (i *instance) cutIdleTraces(immediate bool) error {
 	i.liveTracesMtx.Lock()
 	// Set metrics before cutting (similar to ingester)
-	metricLiveTraces.WithLabelValues(i.tenantID).Set(float64(i.liveTraces.Len()))
-	metricLiveTraceBytes.WithLabelValues(i.tenantID).Set(float64(i.liveTraces.Size()))
+	metricLiveTraces.WithLabelValues(i.tenantID).Set(float64(len(i.liveTraces)))
+	var sz uint64
+	for _, t := range i.liveTraces {
+		sz += t.Size()
+	}
+	metricLiveTraceBytes.WithLabelValues(i.tenantID).Set(float64(sz))
 
 	tracesToCut := i.tracesToCut(time.Now(), i.Cfg.MaxTraceIdle, i.Cfg.MaxTraceLive, immediate)
 	i.liveTracesMtx.Unlock()
@@ -245,7 +247,7 @@ func (i *instance) cutIdleTraces(immediate bool) error {
 	}
 	// Sort by ID
 	sort.Slice(tracesToCut, func(i, j int) bool {
-		return bytes.Compare(tracesToCut[i].ID, tracesToCut[j].ID) == -1
+		return bytes.Compare(tracesToCut[i].traceID, tracesToCut[j].traceID) == -1
 	})
 
 	// Collect the trace IDs that will be flushed
@@ -312,17 +314,17 @@ func (i *instance) writeHeadBlock(id []byte, liveTrace *liveTrace) error {
 			return err
 		}
 	}
-	
-	// sort batches before cutting to reduce combinations during compaction
-		sortByteSlices(liveTrace.batches)
 
-		out, err := segmentDecoder.ToObject(t.batches)
-		if err != nil {
-			return err
-		}
+	segmentDecoder := model.MustNewSegmentDecoder(model.CurrentEncoding)
+	// sort batches before cutting to reduce combinations during compaction
+	sortByteSlices(liveTrace.batches)
+	out, err := segmentDecoder.ToObject(liveTrace.batches)
+	if err != nil {
+		return err
+	}
 
 	i.tracesCreatedTotal.Inc()
-	err := i.headBlock.Append(id, b, liveTrace.start, liveTrace.end, true)
+	err = i.headBlock.Append(id, out, liveTrace.start, liveTrace.end, true)
 	if err != nil {
 		return err
 	}
@@ -489,4 +491,14 @@ func (i *instance) deleteOldBlocks() error {
 	}
 
 	return nil
+}
+
+// sortByteSlices sorts a []byte
+func sortByteSlices(buffs [][]byte) {
+	sort.Slice(buffs, func(i, j int) bool {
+		traceI := buffs[i]
+		traceJ := buffs[j]
+
+		return bytes.Compare(traceI, traceJ) == -1
+	})
 }

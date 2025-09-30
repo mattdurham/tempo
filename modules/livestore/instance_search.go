@@ -26,6 +26,7 @@ import (
 	"github.com/grafana/tempo/pkg/boundedwaitgroup"
 	"github.com/grafana/tempo/pkg/collector"
 	tempo_io "github.com/grafana/tempo/pkg/io"
+	"github.com/grafana/tempo/pkg/model"
 	"github.com/grafana/tempo/pkg/model/trace"
 	"github.com/grafana/tempo/pkg/tempopb"
 	"github.com/grafana/tempo/pkg/traceql"
@@ -591,9 +592,15 @@ func (i *instance) FindByTraceID(ctx context.Context, traceID []byte, allowParti
 
 	// Check live traces first
 	i.liveTracesMtx.Lock()
-	if liveTrace, ok := i.liveTraces.Traces[util.HashForTraceID(traceID)]; ok {
-		tempTrace := &tempopb.Trace{}
-		tempTrace.ResourceSpans = liveTrace.Batches
+	if liveTrace, ok := i.liveTraces[util.HashForTraceID(traceID)]; ok {
+		completeTrace, err := model.MustNewSegmentDecoder(model.CurrentEncoding).PrepareForRead(liveTrace.batches)
+		for _, b := range liveTrace.batches {
+			metrics.InspectedBytes += uint64(len(b))
+		}
+		if err != nil {
+			i.liveTracesMtx.Unlock()
+			return nil, fmt.Errorf("unable to unmarshal liveTrace: %w", err)
+		}
 		// Previously there was some logic here to add inspected bytes in the ingester. But its hard to do with the different
 		// live traces format and feels inaccurate.
 		_, err := combiner.Consume(tempTrace)
