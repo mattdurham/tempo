@@ -178,3 +178,111 @@ func (i *testIterator) Next(ctx context.Context) (common.ID, *tempopb.Trace, err
 }
 
 func (i *testIterator) Close() {}
+
+// TestBackendBlockFindTraceByID tests FindTraceByID with end-to-end trace reconstruction
+func TestBackendBlockFindTraceByID(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Set up backend storage
+	rawReader, rawWriter, _, err := local.New(&local.Config{Path: tmpDir})
+	if err != nil {
+		t.Fatalf("failed to create local backend: %v", err)
+	}
+
+	reader := backend.NewReader(rawReader)
+	writer := backend.NewWriter(rawWriter)
+
+	// Create test trace with known ID
+	traceIDBytes := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+	trace := &tempopb.Trace{
+		ResourceSpans: []*tempotrace.ResourceSpans{
+			{
+				ScopeSpans: []*tempotrace.ScopeSpans{
+					{
+						Spans: []*tempotrace.Span{
+							{
+								TraceId:           traceIDBytes,
+								SpanId:            []byte{1, 2, 3, 4, 5, 6, 7, 8},
+								Name:              "test-span",
+								StartTimeUnixNano: uint64(time.Now().UnixNano()),
+								EndTimeUnixNano:   uint64(time.Now().Add(time.Second).UnixNano()),
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	// Create iterator
+	iter := &testIterator{
+		traces: []struct {
+			id    common.ID
+			trace *tempopb.Trace
+		}{
+			{
+				id:    common.ID(traceIDBytes),
+				trace: trace,
+			},
+		},
+	}
+
+	// Create block metadata
+	meta := backend.NewBlockMeta("test-tenant", uuid.New(), VersionString)
+
+	// Configure block
+	cfg := &common.BlockConfig{
+		RowGroupSizeBytes: 10000,
+	}
+
+	// Create blockpack block
+	ctx := context.Background()
+	resultMeta, err := CreateBlock(ctx, cfg, meta, iter, reader, writer)
+	if err != nil {
+		t.Fatalf("failed to create block: %v", err)
+	}
+
+	// Now open as backend block
+	backendBlock := newBackendBlock(resultMeta, reader)
+
+	// Try to find the trace by ID
+	response, err := backendBlock.FindTraceByID(ctx, common.ID(traceIDBytes), common.SearchOptions{})
+	if err != nil {
+		t.Fatalf("FindTraceByID failed: %v", err)
+	}
+
+	// Verify we got a trace back
+	if response == nil || response.Trace == nil {
+		t.Fatalf("expected trace to be found, got nil")
+	}
+
+	// Verify trace has correct structure
+	if len(response.Trace.ResourceSpans) == 0 {
+		t.Fatalf("expected at least one ResourceSpan")
+	}
+	if len(response.Trace.ResourceSpans[0].ScopeSpans) == 0 {
+		t.Fatalf("expected at least one ScopeSpan")
+	}
+	if len(response.Trace.ResourceSpans[0].ScopeSpans[0].Spans) == 0 {
+		t.Fatalf("expected at least one Span")
+	}
+
+	// Verify span details
+	foundSpan := response.Trace.ResourceSpans[0].ScopeSpans[0].Spans[0]
+	if foundSpan.Name != "test-span" {
+		t.Errorf("expected span name 'test-span', got '%s'", foundSpan.Name)
+	}
+	if string(foundSpan.TraceId) != string(traceIDBytes) {
+		t.Errorf("expected trace ID to match")
+	}
+
+	// Try to find a non-existent trace
+	nonExistentID := common.ID([]byte{99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99})
+	response2, err := backendBlock.FindTraceByID(ctx, nonExistentID, common.SearchOptions{})
+	if err != nil {
+		t.Fatalf("FindTraceByID failed for non-existent trace: %v", err)
+	}
+	if response2 != nil {
+		t.Errorf("expected nil response for non-existent trace, got %v", response2)
+	}
+}
