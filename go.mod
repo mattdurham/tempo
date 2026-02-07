@@ -13,6 +13,7 @@ require (
 	github.com/dustin/go-humanize v1.0.1
 	github.com/facette/natsort v0.0.0-20181210072756-2cd4dd1e2dcb
 	github.com/go-kit/log v0.2.1
+	github.com/mattdurham/blockpack v0.0.0
 	github.com/go-logfmt/logfmt v0.6.1
 	github.com/go-redis/redis/v8 v8.11.5
 	github.com/go-test/deep v1.1.1
@@ -442,3 +443,6 @@ replace (
 // - https://github.com/hashicorp/memberlist/pull/260
 // - https://github.com/grafana/memberlist/pull/3
 replace github.com/hashicorp/memberlist => github.com/grafana/memberlist v0.3.1-0.20251024160842-5cd332c2849a
+
+// Replace blockpack with local development version
+replace github.com/mattdurham/blockpack => /home/matt/source/blockpack
