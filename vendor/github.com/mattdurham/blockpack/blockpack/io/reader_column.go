@@ -13,6 +13,7 @@ var (
 	zstdDecoder = mustNewZstdDecoder()
 )
 
+// BOT: is this safe for concurrent access?
 func mustNewZstdDecoder() *zstd.Decoder {
 	decoder, err := zstd.NewReader(nil)
 	if err != nil {
@@ -148,7 +149,9 @@ func validateColumnEncoding(name string, typ ColumnType, flags columnEncodingFla
 	return nil
 }
 
+// BOT: these decodes are ripe to move to their own folder.
 func decodeDeltaUint64Column(name string, rd *sliceReader, statsData []byte, col *Column, a *arena.Arena) (*Column, error) {
+	// BOT: added comment in slice reader, but this would be great if it was rd.readSpanCount(), and the same for below.
 	spanCount, err := rd.readUint32()
 	if err != nil {
 		return nil, fmt.Errorf("column %s: %w", name, err)

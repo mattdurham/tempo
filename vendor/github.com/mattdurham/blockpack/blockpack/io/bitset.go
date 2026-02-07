@@ -6,6 +6,8 @@ import (
 	"fmt"
 )
 
+// BOT: Is this duplicated in encodings? Should we move it to a common package? Maybe we should have a bitset type that encapsulates this logic instead of raw byte slices?
+
 func setBit(bits []byte, idx int) {
 	byteIdx := idx / 8
 	bit := uint(idx % 8)

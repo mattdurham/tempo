@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/grafana/tempo/pkg/tempopb"
 	tempotrace "github.com/grafana/tempo/pkg/tempopb/trace/v1"
+	"github.com/grafana/tempo/pkg/traceql"
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/backend/local"
 	"github.com/grafana/tempo/tempodb/encoding/common"
@@ -284,5 +285,158 @@ func TestBackendBlockFindTraceByID(t *testing.T) {
 	}
 	if response2 != nil {
 		t.Errorf("expected nil response for non-existent trace, got %v", response2)
+	}
+}
+
+// TestSearchTags tests SearchTags functionality
+func TestSearchTags(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Set up backend storage
+	rawReader, rawWriter, _, err := local.New(&local.Config{Path: tmpDir})
+	if err != nil {
+		t.Fatalf("failed to create local backend: %v", err)
+	}
+
+	reader := backend.NewReader(rawReader)
+	writer := backend.NewWriter(rawWriter)
+
+	// Create test trace with span
+	traceIDBytes := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+	trace := &tempopb.Trace{
+		ResourceSpans: []*tempotrace.ResourceSpans{
+			{
+				ScopeSpans: []*tempotrace.ScopeSpans{
+					{
+						Spans: []*tempotrace.Span{
+							{
+								TraceId:           traceIDBytes,
+								SpanId:            []byte{1, 2, 3, 4, 5, 6, 7, 8},
+								Name:              "test-span",
+								StartTimeUnixNano: uint64(time.Now().UnixNano()),
+								EndTimeUnixNano:   uint64(time.Now().Add(time.Second).UnixNano()),
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	// Create block
+	iter := &testIterator{
+		traces: []struct {
+			id    common.ID
+			trace *tempopb.Trace
+		}{
+			{id: common.ID(traceIDBytes), trace: trace},
+		},
+	}
+
+	meta := backend.NewBlockMeta("test-tenant", uuid.New(), VersionString)
+	cfg := &common.BlockConfig{RowGroupSizeBytes: 10000}
+	ctx := context.Background()
+
+	resultMeta, err := CreateBlock(ctx, cfg, meta, iter, reader, writer)
+	if err != nil {
+		t.Fatalf("failed to create block: %v", err)
+	}
+
+	// Open as backend block
+	backendBlock := newBackendBlock(resultMeta, reader)
+
+	// Search for tags
+	foundTags := make(map[string]bool)
+	callback := func(tag string, scope traceql.AttributeScope) {
+		foundTags[tag] = true
+	}
+
+	metricsCallback := func(bytesRead uint64) {}
+
+	err = backendBlock.SearchTags(ctx, traceql.AttributeScopeNone, callback, metricsCallback, common.SearchOptions{})
+	if err != nil {
+		t.Fatalf("SearchTags failed: %v", err)
+	}
+
+	// We should find at least some column names
+	if len(foundTags) == 0 {
+		t.Error("expected to find at least one tag, got none")
+	}
+}
+
+// TestSearchTagValues tests SearchTagValues functionality
+func TestSearchTagValues(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Set up backend storage
+	rawReader, rawWriter, _, err := local.New(&local.Config{Path: tmpDir})
+	if err != nil {
+		t.Fatalf("failed to create local backend: %v", err)
+	}
+
+	reader := backend.NewReader(rawReader)
+	writer := backend.NewWriter(rawWriter)
+
+	// Create test trace with span name
+	traceIDBytes := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+	trace := &tempopb.Trace{
+		ResourceSpans: []*tempotrace.ResourceSpans{
+			{
+				ScopeSpans: []*tempotrace.ScopeSpans{
+					{
+						Spans: []*tempotrace.Span{
+							{
+								TraceId:           traceIDBytes,
+								SpanId:            []byte{1, 2, 3, 4, 5, 6, 7, 8},
+								Name:              "test-span",
+								StartTimeUnixNano: uint64(time.Now().UnixNano()),
+								EndTimeUnixNano:   uint64(time.Now().Add(time.Second).UnixNano()),
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	// Create block
+	iter := &testIterator{
+		traces: []struct {
+			id    common.ID
+			trace *tempopb.Trace
+		}{
+			{id: common.ID(traceIDBytes), trace: trace},
+		},
+	}
+
+	meta := backend.NewBlockMeta("test-tenant", uuid.New(), VersionString)
+	cfg := &common.BlockConfig{RowGroupSizeBytes: 10000}
+	ctx := context.Background()
+
+	resultMeta, err := CreateBlock(ctx, cfg, meta, iter, reader, writer)
+	if err != nil {
+		t.Fatalf("failed to create block: %v", err)
+	}
+
+	// Open as backend block
+	backendBlock := newBackendBlock(resultMeta, reader)
+
+	// Search for tag values of span name
+	foundValues := make(map[string]bool)
+	callback := func(value string) bool {
+		foundValues[value] = true
+		return false // Continue
+	}
+
+	metricsCallback := func(bytesRead uint64) {}
+
+	err = backendBlock.SearchTagValues(ctx, "name", callback, metricsCallback, common.SearchOptions{})
+	if err != nil {
+		t.Fatalf("SearchTagValues failed: %v", err)
+	}
+
+	// Should find "test-span"
+	if !foundValues["test-span"] {
+		t.Errorf("expected to find 'test-span' in tag values, found: %v", foundValues)
 	}
 }

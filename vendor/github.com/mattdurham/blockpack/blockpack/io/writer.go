@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"hash/crc32"
+	"math"
 	"os"
 	"sort"
 	"strings"
@@ -23,8 +24,9 @@ import (
 
 // MetricStreamDef defines a metric stream to compute during ingestion
 type MetricStreamDef struct {
-	StreamID      string
-	Query         string
+	StreamID string
+	Query    string
+	// BOT: THIS SHOULD NOT BE TIED TO a query spec, but likely a vm spec so it can be shared between traceql and sql
 	Spec          *sql.QuerySpec
 	StepSizeNanos int64
 }
@@ -168,6 +170,7 @@ func NewWriterWithConfig(config WriterConfig) *Writer {
 
 	// Always initialize stats collector to automatically track all columns (v11 format)
 	// TrackedAttributes config is deprecated - all columns are now tracked automatically
+	// BOT: if deprecrated, remove it
 	if len(config.TrackedAttributes) > 0 {
 		// Warn about deprecated configuration
 		fmt.Fprintf(os.Stderr, "Warning: WriterConfig.TrackedAttributes is deprecated and ignored. All columns are now tracked automatically in v11 format.\n")
@@ -177,6 +180,7 @@ func NewWriterWithConfig(config WriterConfig) *Writer {
 	return w
 }
 
+// BOT: What does this do?
 func normalizeLayerSpans(layerSpans []int) []int {
 	if len(layerSpans) == 0 {
 		return nil
@@ -196,6 +200,8 @@ func normalizeLayerSpans(layerSpans []int) []int {
 	return out
 }
 
+// BOT: Consider moving metric stream to its own file.
+//
 // AddMetricStream adds a metric stream definition to the writer.
 // The writer will compute aggregates for this stream during span ingestion.
 // Returns the stream ID for later reference.
@@ -608,7 +614,22 @@ func (w *Writer) updateAggregate(bucket *vm.AggBucket, span *tracev1.Span, agg s
 		}
 
 	case "HISTOGRAM":
-		// Histogram requires bucketing - track min/max for now
+		// Track histogram using DDSketch (same as quantiles)
+		if bucket.Quantiles == nil {
+			bucket.Quantiles = make(map[string]*vm.QuantileSketch)
+		}
+
+		// Get or create sketch for this field
+		sketch, exists := bucket.Quantiles[agg.Field]
+		if !exists {
+			sketch = vm.NewQuantileSketch(0.01) // 1% accuracy
+			bucket.Quantiles[agg.Field] = sketch
+		}
+
+		// Add value to sketch
+		sketch.Add(fieldValue)
+
+		// Also track min/max for range queries
 		if bucket.Count == 1 {
 			bucket.Min = fieldValue
 			bucket.Max = fieldValue
@@ -2358,23 +2379,23 @@ type BinaryAggValue struct {
 	Value float64 // All numeric values as float64
 }
 
-// Aggregate value type constants for binary encoding
+// Aggregate value type constants for binary encoding (exported for parser)
 const (
-	aggTypeCount uint8 = 1
-	aggTypeSum   uint8 = 2
-	aggTypeMin   uint8 = 3
-	aggTypeMax   uint8 = 4
-	aggTypeP50   uint8 = 5
-	aggTypeP95   uint8 = 6
-	aggTypeP99   uint8 = 7
+	AggtypeCount uint8 = 1
+	AggtypeSum   uint8 = 2
+	AggtypeMin   uint8 = 3
+	AggtypeMax   uint8 = 4
+	AggtypeP50   uint8 = 5
+	AggtypeP95   uint8 = 6
+	AggtypeP99   uint8 = 7
 )
 
-// Value type constants for binary encoding of group key values
+// Value type constants for binary encoding of group key values (exported for parser)
 const (
-	valueTypeString  uint8 = 0
-	valueTypeInt64   uint8 = 1
-	valueTypeFloat64 uint8 = 2
-	valueTypeBool    uint8 = 3
+	ValueTypeString  uint8 = 0
+	ValueTypeInt64   uint8 = 1
+	ValueTypeFloat64 uint8 = 2
+	ValueTypeBool    uint8 = 3
 )
 
 // Compression constants for per-stream compression
@@ -2497,8 +2518,16 @@ func buildGroupKeyIndex(buckets []*TimeBucket) *GroupKeyIndex {
 // writeGroupKeyValue writes a single group key value to the buffer in binary format.
 func writeGroupKeyValue(buf *bytes.Buffer, val vm.Value) error {
 	switch v := val.Data.(type) {
+	case nil:
+		// Handle nil values (missing fields) as empty strings
+		if err := binary.Write(buf, binary.LittleEndian, ValueTypeString); err != nil {
+			return err
+		}
+		if err := binary.Write(buf, binary.LittleEndian, uint16(0)); err != nil {
+			return err
+		}
 	case string:
-		if err := binary.Write(buf, binary.LittleEndian, valueTypeString); err != nil {
+		if err := binary.Write(buf, binary.LittleEndian, ValueTypeString); err != nil {
 			return err
 		}
 		if err := binary.Write(buf, binary.LittleEndian, uint16(len(v))); err != nil {
@@ -2508,21 +2537,21 @@ func writeGroupKeyValue(buf *bytes.Buffer, val vm.Value) error {
 			return err
 		}
 	case int64:
-		if err := binary.Write(buf, binary.LittleEndian, valueTypeInt64); err != nil {
+		if err := binary.Write(buf, binary.LittleEndian, ValueTypeInt64); err != nil {
 			return err
 		}
 		if err := binary.Write(buf, binary.LittleEndian, v); err != nil {
 			return err
 		}
 	case float64:
-		if err := binary.Write(buf, binary.LittleEndian, valueTypeFloat64); err != nil {
+		if err := binary.Write(buf, binary.LittleEndian, ValueTypeFloat64); err != nil {
 			return err
 		}
 		if err := binary.Write(buf, binary.LittleEndian, v); err != nil {
 			return err
 		}
 	case bool:
-		if err := binary.Write(buf, binary.LittleEndian, valueTypeBool); err != nil {
+		if err := binary.Write(buf, binary.LittleEndian, ValueTypeBool); err != nil {
 			return err
 		}
 		var boolByte uint8
@@ -2561,20 +2590,20 @@ func getAggregateValues(bucket *vm.AggBucket, aggFunc string, field string, quan
 
 	switch aggFunc {
 	case "COUNT", "RATE":
-		values = append(values, BinaryAggValue{Type: aggTypeCount, Value: float64(bucket.Count)})
+		values = append(values, BinaryAggValue{Type: AggtypeCount, Value: float64(bucket.Count)})
 
 	case "AVG":
-		values = append(values, BinaryAggValue{Type: aggTypeSum, Value: bucket.Sum})
-		values = append(values, BinaryAggValue{Type: aggTypeCount, Value: float64(bucket.Count)})
+		values = append(values, BinaryAggValue{Type: AggtypeSum, Value: bucket.Sum})
+		values = append(values, BinaryAggValue{Type: AggtypeCount, Value: float64(bucket.Count)})
 
 	case "SUM":
-		values = append(values, BinaryAggValue{Type: aggTypeSum, Value: bucket.Sum})
+		values = append(values, BinaryAggValue{Type: AggtypeSum, Value: bucket.Sum})
 
 	case "MIN":
-		values = append(values, BinaryAggValue{Type: aggTypeMin, Value: bucket.Min})
+		values = append(values, BinaryAggValue{Type: AggtypeMin, Value: bucket.Min})
 
 	case "MAX":
-		values = append(values, BinaryAggValue{Type: aggTypeMax, Value: bucket.Max})
+		values = append(values, BinaryAggValue{Type: AggtypeMax, Value: bucket.Max})
 
 	case "QUANTILE":
 		// Extract quantile value from sketch
@@ -2588,30 +2617,38 @@ func getAggregateValues(bucket *vm.AggBucket, aggFunc string, field string, quan
 		// Write the quantile value with the appropriate type
 		switch quantile {
 		case 0.50:
-			values = append(values, BinaryAggValue{Type: aggTypeP50, Value: quantileValue})
+			values = append(values, BinaryAggValue{Type: AggtypeP50, Value: quantileValue})
 		case 0.95:
-			values = append(values, BinaryAggValue{Type: aggTypeP95, Value: quantileValue})
+			values = append(values, BinaryAggValue{Type: AggtypeP95, Value: quantileValue})
 		case 0.99:
-			values = append(values, BinaryAggValue{Type: aggTypeP99, Value: quantileValue})
+			values = append(values, BinaryAggValue{Type: AggtypeP99, Value: quantileValue})
 		}
 
 	case "HISTOGRAM":
-		// HISTOGRAM stores all quantiles
-		values = append(values, BinaryAggValue{Type: aggTypeP50, Value: 0})
-		values = append(values, BinaryAggValue{Type: aggTypeP95, Value: 0})
-		values = append(values, BinaryAggValue{Type: aggTypeP99, Value: 0})
+		// HISTOGRAM stores all quantiles - extract from sketch
+		var p50, p95, p99 float64
+		if bucket.Quantiles != nil {
+			if sketch, exists := bucket.Quantiles[field]; exists && sketch != nil {
+				p50 = sketch.Quantile(0.50)
+				p95 = sketch.Quantile(0.95)
+				p99 = sketch.Quantile(0.99)
+			}
+		}
+		values = append(values, BinaryAggValue{Type: AggtypeP50, Value: p50})
+		values = append(values, BinaryAggValue{Type: AggtypeP95, Value: p95})
+		values = append(values, BinaryAggValue{Type: AggtypeP99, Value: p99})
 
 	case "STDDEV":
 		// STDDEV stores Sum and Count
-		values = append(values, BinaryAggValue{Type: aggTypeSum, Value: bucket.Sum})
-		values = append(values, BinaryAggValue{Type: aggTypeCount, Value: float64(bucket.Count)})
+		values = append(values, BinaryAggValue{Type: AggtypeSum, Value: bucket.Sum})
+		values = append(values, BinaryAggValue{Type: AggtypeCount, Value: float64(bucket.Count)})
 
 	default:
 		// Unknown function - store all fields for safety
-		values = append(values, BinaryAggValue{Type: aggTypeCount, Value: float64(bucket.Count)})
-		values = append(values, BinaryAggValue{Type: aggTypeSum, Value: bucket.Sum})
-		values = append(values, BinaryAggValue{Type: aggTypeMin, Value: bucket.Min})
-		values = append(values, BinaryAggValue{Type: aggTypeMax, Value: bucket.Max})
+		values = append(values, BinaryAggValue{Type: AggtypeCount, Value: float64(bucket.Count)})
+		values = append(values, BinaryAggValue{Type: AggtypeSum, Value: bucket.Sum})
+		values = append(values, BinaryAggValue{Type: AggtypeMin, Value: bucket.Min})
+		values = append(values, BinaryAggValue{Type: AggtypeMax, Value: bucket.Max})
 	}
 
 	return values
@@ -2647,7 +2684,15 @@ func writeBinaryAggregates(buf *bytes.Buffer, buckets []*TimeBucket, groupKeyIdx
 	}
 
 	// Write step size in milliseconds (4 bytes is enough for up to 49 days)
-	stepMillis := uint32(stepSizeNanos / 1_000_000)
+	// Validate step size before conversion
+	if stepSizeNanos < 1_000_000 {
+		return fmt.Errorf("step size must be at least 1ms, got %dns", stepSizeNanos)
+	}
+	stepMillisInt64 := stepSizeNanos / 1_000_000
+	if stepMillisInt64 > math.MaxUint32 || stepMillisInt64 < 0 {
+		return fmt.Errorf("step size %dns out of valid range for uint32 milliseconds", stepSizeNanos)
+	}
+	stepMillis := uint32(stepMillisInt64)
 	if err := binary.Write(buf, binary.LittleEndian, stepMillis); err != nil {
 		return err
 	}

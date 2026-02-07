@@ -5,6 +5,8 @@ import (
 	"github.com/mattdurham/blockpack/internal/arena"
 )
 
+// BOT: What does this do? Why do we need it? Why not just import the types package directly where needed?
+
 type Column = types.Column
 type ColumnStats = types.ColumnStats
 type ColumnStatsWithType = types.ColumnStatsWithType

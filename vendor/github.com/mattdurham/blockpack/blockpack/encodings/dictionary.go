@@ -23,6 +23,7 @@ func BuildStringDictionary(
 	_ = binary.Write(&dictBuf, binary.LittleEndian, uint32(len(dictVals)))
 	for _, val := range dictVals {
 		_ = binary.Write(&dictBuf, binary.LittleEndian, uint32(len(val)))
+		// BOT: Can we use unsafe here to avoid the allocation?
 		if _, err := dictBuf.Write([]byte(val)); err != nil {
 			return err
 		}
@@ -93,6 +94,7 @@ func BuildStringDictionary(
 }
 
 // BuildInt64Dictionary encodes an int64 column using dictionary encoding.
+// BOT: Are there commonalities here that would be shared between these two build functions?
 func BuildInt64Dictionary(
 	buf *bytes.Buffer,
 	spanCount, presentCount int,

@@ -5,6 +5,7 @@ import (
 	commonv1 "go.opentelemetry.io/proto/otlp/common/v1"
 )
 
+// BOT: Why do we need these forwarding functions instead of just importing the types package directly where needed? Are we trying to avoid exposing the full types package to users of this package?
 // DecodeArray forwards array decoding to the core types package.
 func DecodeArray(data []byte) ([]ArrayValue, error) {
 	return types.DecodeArray(data)
