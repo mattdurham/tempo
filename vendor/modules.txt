@@ -1080,11 +1080,13 @@ github.com/mattdurham/blockpack/blockpack/types
 github.com/mattdurham/blockpack/internal/arena
 github.com/mattdurham/blockpack/internal/arena/slice
 github.com/mattdurham/blockpack/internal/debug
+github.com/mattdurham/blockpack/internal/otlpconvert
 github.com/mattdurham/blockpack/internal/quantile
 github.com/mattdurham/blockpack/internal/xflag
 github.com/mattdurham/blockpack/internal/xsync
 github.com/mattdurham/blockpack/internal/xunsafe
 github.com/mattdurham/blockpack/internal/xunsafe/layout
+github.com/mattdurham/blockpack/parquet-util
 github.com/mattdurham/blockpack/sql
 github.com/mattdurham/blockpack/traceql
 github.com/mattdurham/blockpack/vm
