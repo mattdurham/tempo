@@ -31,13 +31,13 @@ func (e Encoding) NewCompactor(opts common.CompactionOptions) common.Compactor {
 // CreateBlock creates a new blockpack block from an iterator
 func (e Encoding) CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.BlockMeta,
 	i common.Iterator, r backend.Reader, to backend.Writer) (*backend.BlockMeta, error) {
-	return nil, fmt.Errorf("not implemented")
+	return CreateBlock(ctx, cfg, meta, i, r, to)
 }
 
 // CreateWALBlock creates a new WAL block for writing
 func (e Encoding) CreateWALBlock(meta *backend.BlockMeta, filepath, dataEncoding string,
 	ingestionSlack time.Duration) (common.WALBlock, error) {
-	return nil, fmt.Errorf("not implemented")
+	return createWALBlock(meta, filepath, ingestionSlack)
 }
 
 // OpenWALBlock opens an existing WAL block
