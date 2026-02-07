@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"sync"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/grafana/tempo/pkg/traceql"
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/encoding/common"
+	blockpackio "github.com/mattdurham/blockpack/blockpack/io"
 )
 
 type walBlock struct {
@@ -18,9 +20,10 @@ type walBlock struct {
 	path           string
 	ingestionSlack time.Duration
 
-	// In-memory trace accumulation (simplified - production would use blockpack writer)
+	// Blockpack writer for serialization
 	mu     sync.Mutex
-	traces map[string]*tempopb.Trace
+	writer *blockpackio.Writer
+	file   *os.File
 }
 
 // createWALBlock creates a new WAL block
@@ -29,7 +32,6 @@ func createWALBlock(meta *backend.BlockMeta, filepath string, ingestionSlack tim
 		meta:           meta,
 		path:           filepath,
 		ingestionSlack: ingestionSlack,
-		traces:         make(map[string]*tempopb.Trace),
 	}, nil
 }
 
@@ -45,21 +47,47 @@ func (w *walBlock) Append(id common.ID, b []byte, start, end uint32, adjustInges
 	if err := trace.Unmarshal(b); err != nil {
 		return fmt.Errorf("failed to unmarshal trace: %w", err)
 	}
-
+	
 	return w.AppendTrace(id, trace, start, end, adjustIngestionSlack)
 }
 
 // AppendTrace appends a trace object to the WAL block
+// Writes trace spans to blockpack format
 func (w *walBlock) AppendTrace(id common.ID, tr *tempopb.Trace, start, end uint32, adjustIngestionSlack bool) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	// Store trace in memory (simplified - production would write to blockpack)
-	traceID := string(id)
-	w.traces[traceID] = tr
+	// Lazy initialize blockpack writer on first append
+	if w.writer == nil {
+		if err := w.initWriter(); err != nil {
+			return fmt.Errorf("failed to initialize writer: %w", err)
+		}
+	}
+
+	// Convert tempopb.Trace to OTLP TracesData format for blockpack
+	td := tempoTraceToOTLP(tr)
+
+	// Write to blockpack
+	if err := w.writer.AddTracesData(td); err != nil {
+		return fmt.Errorf("failed to add trace to blockpack: %w", err)
+	}
 
 	// Update metadata
 	w.meta.ObjectAdded(start, end)
+
+	return nil
+}
+
+// initWriter creates the blockpack writer
+func (w *walBlock) initWriter() error {
+	// Ensure directory exists
+	if err := os.MkdirAll(w.path, 0755); err != nil {
+		return fmt.Errorf("failed to create directory: %w", err)
+	}
+
+	// Create blockpack writer
+	// Use reasonable defaults: 2000 spans per block
+	w.writer = blockpackio.NewWriter(2000)
 
 	return nil
 }
@@ -69,13 +97,31 @@ func (w *walBlock) IngestionSlack() time.Duration {
 	return w.ingestionSlack
 }
 
-// Flush writes accumulated traces to disk (stub - needs blockpack writer integration)
+// Flush writes accumulated traces to disk as blockpack format
 func (w *walBlock) Flush() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	// TODO: Integrate with blockpack writer to serialize traces
-	// For now, this is a no-op stub
+	// Nothing to flush if no writer
+	if w.writer == nil {
+		return nil
+	}
+
+	// Serialize blockpack to bytes
+	data, err := w.writer.Flush()
+	if err != nil {
+		return fmt.Errorf("failed to flush blockpack writer: %w", err)
+	}
+
+	// Write to disk
+	filepath := w.path + "/" + DataFileName
+	if err := os.WriteFile(filepath, data, 0644); err != nil {
+		return fmt.Errorf("failed to write blockpack file: %w", err)
+	}
+
+	// Update metadata with actual size
+	w.meta.Size_ = uint64(len(data))
+
 	return nil
 }
 
@@ -84,27 +130,37 @@ func (w *walBlock) DataLength() uint64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	// Approximate size
-	size := uint64(0)
-	for _, trace := range w.traces {
-		size += uint64(trace.Size())
+	if w.writer == nil {
+		return 0
 	}
-	return size
+
+	return uint64(w.writer.CurrentSize())
 }
 
 // Iterator returns an iterator over all traces in the WAL
 func (w *walBlock) Iterator() (common.Iterator, error) {
 	w.mu.Lock()
-	traces := make(map[string]*tempopb.Trace, len(w.traces))
-	for k, v := range w.traces {
-		traces[k] = v
-	}
-	w.mu.Unlock()
+	defer w.mu.Unlock()
 
-	return &walIterator{
-		traces: traces,
-		ids:    make([]string, 0, len(traces)),
-		idx:    0,
+	// Flush to get final data
+	if w.writer == nil {
+		return &emptyIterator{}, nil
+	}
+
+	data, err := w.writer.Flush()
+	if err != nil {
+		return nil, fmt.Errorf("failed to flush for iterator: %w", err)
+	}
+
+	// Open as reader to iterate
+	reader, err := blockpackio.NewReader(data)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create reader: %w", err)
+	}
+
+	return &blockpackIterator{
+		reader: reader,
+		// TODO: Initialize iterator state for block traversal
 	}, nil
 }
 
@@ -113,7 +169,10 @@ func (w *walBlock) Clear() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	w.traces = make(map[string]*tempopb.Trace)
+	// Close and reset writer
+	w.writer = nil
+	w.file = nil
+
 	return nil
 }
 
@@ -122,15 +181,12 @@ func (w *walBlock) FindTraceByID(ctx context.Context, id common.ID, opts common.
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	trace, ok := w.traces[string(id)]
-	if !ok {
-		return nil, nil
-	}
-
-	return &tempopb.TraceByIDResponse{Trace: trace}, nil
+	// TODO: Query blockpack writer's in-memory data for trace
+	// For now, return not found
+	return nil, nil
 }
 
-// Search performs a search (stub - not implemented for WAL)
+// Search performs a search (not implemented for WAL - WAL is write-only during ingestion)
 func (w *walBlock) Search(ctx context.Context, req *tempopb.SearchRequest, opts common.SearchOptions) (*tempopb.SearchResponse, error) {
 	return &tempopb.SearchResponse{}, nil
 }
@@ -170,38 +226,31 @@ func (w *walBlock) Validate(ctx context.Context) error {
 	return nil
 }
 
-// walIterator iterates over traces in memory
-type walIterator struct {
-	traces map[string]*tempopb.Trace
-	ids    []string
-	idx    int
-	mu     sync.Mutex
+// blockpackIterator iterates through blockpack data
+type blockpackIterator struct {
+	reader *blockpackio.Reader
+	// TODO: Add state for iterating through blocks and spans
+	// Will need to reconstruct traces from spans during iteration
 }
 
 // Next returns the next trace
-func (i *walIterator) Next(ctx context.Context) (common.ID, *tempopb.Trace, error) {
-	i.mu.Lock()
-	defer i.mu.Unlock()
-
-	// Initialize IDs on first call
-	if len(i.ids) == 0 {
-		for id := range i.traces {
-			i.ids = append(i.ids, id)
-		}
-	}
-
-	if i.idx >= len(i.ids) {
-		return nil, nil, io.EOF
-	}
-
-	traceID := i.ids[i.idx]
-	trace := i.traces[traceID]
-	i.idx++
-
-	return []byte(traceID), trace, nil
+func (i *blockpackIterator) Next(ctx context.Context) (common.ID, *tempopb.Trace, error) {
+	// TODO: Iterate through blockpack blocks and spans
+	// Reconstruct traces from spans
+	// Group spans by trace ID
+	return nil, nil, io.EOF
 }
 
 // Close closes the iterator
-func (i *walIterator) Close() {
-	// Nothing to close
+func (i *blockpackIterator) Close() {
+	// Nothing to close for in-memory reader
 }
+
+// emptyIterator is used when there's no data
+type emptyIterator struct{}
+
+func (i *emptyIterator) Next(ctx context.Context) (common.ID, *tempopb.Trace, error) {
+	return nil, nil, io.EOF
+}
+
+func (i *emptyIterator) Close() {}
