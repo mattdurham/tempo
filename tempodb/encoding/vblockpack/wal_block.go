@@ -47,7 +47,7 @@ func (w *walBlock) Append(id common.ID, b []byte, start, end uint32, adjustInges
 	if err := trace.Unmarshal(b); err != nil {
 		return fmt.Errorf("failed to unmarshal trace: %w", err)
 	}
-	
+
 	return w.AppendTrace(id, trace, start, end, adjustIngestionSlack)
 }
 

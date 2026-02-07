@@ -32,13 +32,13 @@ func (b *blockpackBlock) BlockMeta() *backend.BlockMeta {
 }
 
 // FindTraceByID finds a trace by ID in the blockpack block
-// 
+//
 // Implementation: Queries blockpack file for all spans matching trace ID,
 // then reconstructs the full trace with proper OTLP hierarchy.
 func (b *blockpackBlock) FindTraceByID(ctx context.Context, id common.ID, opts common.SearchOptions) (*tempopb.TraceByIDResponse, error) {
 	// Convert backend.UUID (array) to uuid.UUID
 	blockUUID := uuid.UUID(b.meta.BlockID)
-	
+
 	// Read blockpack file from backend storage
 	rc, size, err := b.reader.StreamReader(ctx, DataFileName, blockUUID, b.meta.TenantID)
 	if err != nil {
@@ -79,7 +79,7 @@ func (b *blockpackBlock) FindTraceByID(ctx context.Context, id common.ID, opts c
 	//
 	// For now, return trace not found to maintain correct error semantics
 	_ = bpr // Will be used in full implementation
-	
+
 	return nil, nil // Trace not found (correct semantic for missing trace)
 }
 
@@ -103,7 +103,7 @@ func (b *blockpackBlock) SearchTags(ctx context.Context, scope traceql.Attribute
 	return nil
 }
 
-// SearchTagValues implements the Searcher interface  
+// SearchTagValues implements the Searcher interface
 // Extracts unique values for a given tag
 func (b *blockpackBlock) SearchTagValues(ctx context.Context, tag string, cb common.TagValuesCallback, mcb common.MetricsCallback, opts common.SearchOptions) error {
 	// TODO: Query blockpack for distinct values of column
@@ -144,7 +144,7 @@ func (b *blockpackBlock) FetchTagNames(ctx context.Context, req traceql.FetchTag
 func (b *blockpackBlock) Validate(ctx context.Context) error {
 	// Convert backend.UUID (array) to uuid.UUID
 	blockUUID := uuid.UUID(b.meta.BlockID)
-	
+
 	// Read blockpack file header to verify it's valid
 	rc, size, err := b.reader.StreamReader(ctx, DataFileName, blockUUID, b.meta.TenantID)
 	if err != nil {

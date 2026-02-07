@@ -89,7 +89,7 @@ func tempoSpanToOTLP(span *tempotrace.Span) *tracev1.Span {
 	for _, link := range span.Links {
 		links = append(links, tempoLinkToOTLP(link))
 	}
-	
+
 	otlpSpan := &tracev1.Span{
 		TraceId:                span.TraceId,
 		SpanId:                 span.SpanId,
@@ -106,7 +106,7 @@ func tempoSpanToOTLP(span *tempotrace.Span) *tracev1.Span {
 		Links:                  links,
 		DroppedLinksCount:      span.DroppedLinksCount,
 	}
-	
+
 	// Only set Status if it exists
 	if span.Status != nil {
 		otlpSpan.Status = &tracev1.Status{
@@ -114,7 +114,7 @@ func tempoSpanToOTLP(span *tempotrace.Span) *tracev1.Span {
 			Code:    tracev1.Status_StatusCode(span.Status.Code),
 		}
 	}
-	
+
 	return otlpSpan
 }
 
