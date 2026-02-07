@@ -115,16 +115,97 @@ func (b *blockpackBlock) Search(ctx context.Context, req *tempopb.SearchRequest,
 // SearchTags implements the Searcher interface
 // Extracts unique tag names from blockpack metadata
 func (b *blockpackBlock) SearchTags(ctx context.Context, scope traceql.AttributeScope, cb common.TagsCallback, mcb common.MetricsCallback, opts common.SearchOptions) error {
-	// TODO: Read blockpack column names and convert to tags
-	// Blockpack tracks all column names in metadata
+	// Read blockpack file
+	blockUUID := uuid.UUID(b.meta.BlockID)
+	rc, size, err := b.reader.StreamReader(ctx, DataFileName, blockUUID, b.meta.TenantID)
+	if err != nil {
+		return fmt.Errorf("failed to open blockpack file: %w", err)
+	}
+	defer rc.Close()
+
+	data := make([]byte, size)
+	_, err = io.ReadFull(rc, data)
+	if err != nil {
+		return fmt.Errorf("failed to read blockpack file: %w", err)
+	}
+
+	// Open blockpack reader
+	bpr, err := blockpackio.NewReader(data)
+	if err != nil {
+		return fmt.Errorf("failed to create blockpack reader: %w", err)
+	}
+
+	// Collect unique column names from first block
+	tags := make(map[string]struct{})
+	block, err := bpr.GetBlock(0) // Get first block
+	if err != nil {
+		return fmt.Errorf("failed to read first block: %w", err)
+	}
+
+	// Extract column names and filter by scope
+	for colName := range block.Columns() {
+		tag := columnNameToTag(colName, scope)
+		if tag != "" {
+			tags[tag] = struct{}{}
+		}
+	}
+
+	// Call callback for each tag
+	for tag := range tags {
+		cb(tag, scope)
+	}
+
 	return nil
 }
 
 // SearchTagValues implements the Searcher interface
 // Extracts unique values for a given tag
 func (b *blockpackBlock) SearchTagValues(ctx context.Context, tag string, cb common.TagValuesCallback, mcb common.MetricsCallback, opts common.SearchOptions) error {
-	// TODO: Query blockpack for distinct values of column
-	// May use dedicated index if available
+	// Read blockpack file
+	blockUUID := uuid.UUID(b.meta.BlockID)
+	rc, size, err := b.reader.StreamReader(ctx, DataFileName, blockUUID, b.meta.TenantID)
+	if err != nil {
+		return fmt.Errorf("failed to open blockpack file: %w", err)
+	}
+	defer rc.Close()
+
+	data := make([]byte, size)
+	_, err = io.ReadFull(rc, data)
+	if err != nil {
+		return fmt.Errorf("failed to read blockpack file: %w", err)
+	}
+
+	// Build SQL query for distinct values
+	// Tag names like "service.name" become column names like "resource.service.name"
+	colName := tagToColumnName(tag)
+	query := fmt.Sprintf(`SELECT DISTINCT "%s" FROM spans`, colName)
+
+	// Compile and execute query
+	program, err := sql.CompileTraceQLOrSQL(query)
+	if err != nil {
+		return fmt.Errorf("failed to compile query: %w", err)
+	}
+
+	storage := &memoryStorage{data: data}
+	exec := executor.NewBlockpackExecutor(storage)
+
+	result, err := exec.ExecuteQuery("", program, nil, executor.QueryOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to execute query: %w", err)
+	}
+
+	// Extract unique values and call callback
+	seen := make(map[string]struct{})
+	for _, match := range result.Matches {
+		if val, ok := match.Fields.GetField(colName); ok {
+			valStr := fmt.Sprintf("%v", val)
+			if _, exists := seen[valStr]; !exists {
+				seen[valStr] = struct{}{}
+				cb(valStr)
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -384,4 +465,66 @@ func reconstructTrace(traceID common.ID, matches []executor.BlockpackSpanMatch) 
 	return &tempopb.Trace{
 		ResourceSpans: resourceSpans,
 	}, nil
+}
+
+// columnNameToTag converts a blockpack column name to a tag name based on scope
+// Returns empty string if the column doesn't match the requested scope
+func columnNameToTag(colName string, scope traceql.AttributeScope) string {
+	// Blockpack column naming:
+	// - span.* for span attributes
+	// - resource.* for resource attributes
+	// - span:* for intrinsic span fields
+	// - trace:* for trace fields
+	// - scope.* for scope attributes
+
+	switch scope {
+	case traceql.AttributeScopeSpan:
+		if len(colName) > 5 && colName[:5] == "span." {
+			return colName[5:] // Remove "span." prefix
+		}
+		// Also include intrinsic span fields
+		if len(colName) > 5 && colName[:5] == "span:" {
+			return colName // Keep full name for intrinsics
+		}
+	case traceql.AttributeScopeResource:
+		if len(colName) > 9 && colName[:9] == "resource." {
+			return colName[9:] // Remove "resource." prefix
+		}
+	case traceql.AttributeScopeNone:
+		// Return all attributes
+		if len(colName) > 5 && (colName[:5] == "span." || colName[:5] == "span:") {
+			return colName
+		}
+		if len(colName) > 9 && colName[:9] == "resource." {
+			return colName
+		}
+		if len(colName) > 6 && colName[:6] == "scope." {
+			return colName
+		}
+	}
+
+	return ""
+}
+
+// tagToColumnName converts a tag name back to a blockpack column name
+// e.g., "service.name" -> "resource.service.name"
+func tagToColumnName(tag string) string {
+	// Common resource attributes
+	if tag == "service.name" || tag == "service.namespace" || tag == "deployment.environment" {
+		return "resource." + tag
+	}
+	
+	// If it already has a prefix, return as-is
+	if len(tag) > 5 && (tag[:5] == "span." || tag[:5] == "span:") {
+		return tag
+	}
+	if len(tag) > 9 && tag[:9] == "resource." {
+		return tag
+	}
+	if len(tag) > 6 && tag[:6] == "scope." {
+		return tag
+	}
+	
+	// Default to span attribute
+	return "span." + tag
 }
