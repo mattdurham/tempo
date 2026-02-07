@@ -20,7 +20,7 @@ func (e Encoding) Version() string {
 
 // OpenBlock opens an existing blockpack block for reading
 func (e Encoding) OpenBlock(meta *backend.BlockMeta, r backend.Reader) (common.BackendBlock, error) {
-	return nil, fmt.Errorf("not implemented")
+	return newBackendBlock(meta, r), nil
 }
 
 // NewCompactor creates a new compactor for blockpack blocks
