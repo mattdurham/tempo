@@ -15,6 +15,8 @@ import (
 	aslice "github.com/mattdurham/blockpack/internal/arena/slice"
 )
 
+// BOT: Can we separate reader and writer into their own folders?
+
 // Block holds decoded columns and metadata for a single block.
 type Block struct {
 	spanCount int
@@ -58,8 +60,9 @@ type CloseableReaderProvider interface {
 // Reader exposes blockpack data for predicate evaluation across blocks.
 // Blocks are parsed lazily on first access for better performance on selective queries.
 type Reader struct {
-	name                  string                           // File name/path for cache keys
-	cache                 ByteCache                        // Optional byte cache for I/O operations
+	name  string    // File name/path for cache keys
+	cache ByteCache // Optional byte cache for I/O operations
+	// BOT: remove data
 	data                  []byte                           // Raw file data (optional)
 	provider              ReaderProvider                   // Data provider
 	dataSize              int64                            // Total data size
@@ -94,12 +97,14 @@ type fileFooter struct {
 	metricStreamLen    uint64 // v9: length of metric stream blocks
 }
 
+// BOT: Get rid of this.
 // NewReader parses blockpack data (v5 format) from an in-memory buffer.
 func NewReader(data []byte) (*Reader, error) {
 	return NewReaderFromProvider(&byteSliceProvider{data: data})
 }
 
 // NewReaderFromProvider parses blockpack data (v5 format) from a provider.
+// BOT: Get rid of this.
 func NewReaderFromProvider(provider ReaderProvider) (*Reader, error) {
 	return NewReaderWithCache("", provider, nil)
 }
@@ -108,6 +113,7 @@ func NewReaderFromProvider(provider ReaderProvider) (*Reader, error) {
 // The name parameter is used for cache keys and must uniquely identify the file.
 // If name is empty, caching will be disabled even if a cache is provided.
 // The cache parameter is optional (pass nil for no caching).
+// We should NOT have a separate byte cache, instead use a layered reader provider.
 func NewReaderWithCache(name string, provider ReaderProvider, cache ByteCache) (*Reader, error) {
 	dataSize, err := provider.Size()
 	if err != nil {
@@ -119,6 +125,7 @@ func NewReaderWithCache(name string, provider ReaderProvider, cache ByteCache) (
 		return nil, fmt.Errorf("data too small for footer")
 	}
 
+	// BOT: Why is this uncached?
 	footerBytes, err := readProviderRangeUncached(provider, dataSize-int64(footerSize), int(footerSize))
 	if err != nil {
 		return nil, err
@@ -146,6 +153,7 @@ func NewReaderWithCache(name string, provider ReaderProvider, cache ByteCache) (
 		return nil, fmt.Errorf("metadata crc mismatch")
 	}
 
+	// Can we make this lazier? And only access when the querier needs it?
 	entries, dedicatedIndexOffsets, traceBlockIndex, err := parseV5MetadataLazy(metadata, footer.version)
 	if err != nil {
 		return nil, err
@@ -170,12 +178,14 @@ func NewReaderWithCache(name string, provider ReaderProvider, cache ByteCache) (
 		totalSpans:            total,
 		traceBlockIndex:       traceBlockIndex,
 	}
+	// BOT: NEVER USE THIS, always assume object storage.
 	if sliceProvider, ok := provider.(*byteSliceProvider); ok {
 		reader.data = sliceProvider.data
 	}
 	return reader, nil
 }
 
+// BOT: Providers should be in there own package under blockpack.
 type byteSliceProvider struct {
 	data []byte
 }
@@ -1444,7 +1454,8 @@ func parseBlockColumnsReuse(data []byte, want map[string]struct{}, reusable *Blo
 		offset += nameLen
 		typ := ColumnType(data[offset])
 		offset++
-		// BOT: whats going on here?
+		// Read column metadata: data location (offset + length) and stats location
+		// This allows columns to be stored non-contiguously in the file for better compression
 		dataOffset := binary.LittleEndian.Uint64(data[offset : offset+8])
 		offset += 8
 		dataLen := binary.LittleEndian.Uint64(data[offset : offset+8])
@@ -1515,83 +1526,13 @@ func parseBlockColumnsReuse(data []byte, want map[string]struct{}, reusable *Blo
 	}
 
 	// Parse span-level columns
-	maxDataEnd := 0
-	// BOT: can this be its own function?
-	for _, meta := range spanMetas {
-		end := meta.dataOffset + meta.dataLen
-		if meta.dataOffset < 0 || end > len(data) {
-			return nil, fmt.Errorf("column %s data out of bounds", meta.name)
-		}
-		if end > maxDataEnd {
-			maxDataEnd = end
-		}
-		statsEnd := meta.statsOffset + meta.statsLen
-		if meta.statsOffset < 0 || statsEnd > len(data) {
-			return nil, fmt.Errorf("column %s stats out of bounds", meta.name)
-		}
-		colData := data[meta.dataOffset:end]
-		statsData := data[meta.statsOffset:statsEnd]
-
-		// Try to reuse existing column allocation
-		var reusableCol *Column
-		if existingColumns != nil {
-			reusableCol = existingColumns[meta.name]
-		}
-
-		col, err := parseColumnReuse(meta.name, meta.typ, spanCount, colData, statsData, reusableCol, queryArena)
-		if err != nil {
-			return nil, err
-		}
-		columns[meta.name] = col
+	maxDataEnd, err := parseSpanColumns(spanMetas, data, spanCount, existingColumns, queryArena, columns)
+	if err != nil {
+		return nil, err
 	}
-	// BOT: can this be its own function?
 	// Parse trace table and expand trace-level columns
-	if len(traceMetas) > 0 {
-		// Find trace table data (after all span column data)
-		if maxDataEnd+traceTableLen > len(data) {
-			return nil, fmt.Errorf("trace table out of bounds")
-		}
-		traceTableData := data[maxDataEnd : maxDataEnd+traceTableLen]
-
-		// Parse trace table
-		traceTable, err := parseTraceTable(traceTableData, traceCount)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse trace table: %w", err)
-		}
-
-		// Get trace.index column to map spans to traces
-		traceIndexCol, ok := columns["trace.index"]
-		if !ok {
-			return nil, fmt.Errorf("block missing trace.index column")
-		}
-
-		// Expand trace-level columns to span-level using trace.index
-		for _, meta := range traceMetas {
-			traceCol, ok := traceTable[meta.name]
-			if !ok {
-				continue
-			}
-			// Load stats for trace-level column
-			statsEnd := meta.statsOffset + meta.statsLen
-			if meta.statsOffset < 0 || statsEnd > len(data) {
-				return nil, fmt.Errorf("trace column %s stats out of bounds", meta.name)
-			}
-			statsData := data[meta.statsOffset:statsEnd]
-			stats, err := parseColumnStats(meta.typ, statsData)
-			if err != nil {
-				return nil, fmt.Errorf("trace column %s stats: %w", meta.name, err)
-			}
-
-			spanCol := &Column{
-				Name:  meta.name,
-				Type:  meta.typ,
-				Stats: stats,
-			}
-			if err := expandTraceColumn(spanCol, traceCol, traceIndexCol, spanCount); err != nil {
-				return nil, fmt.Errorf("failed to expand trace column %s: %w", meta.name, err)
-			}
-			columns[meta.name] = spanCol
-		}
+	if err := parseTraceColumns(traceMetas, data, maxDataEnd, traceTableLen, traceCount, spanCount, columns); err != nil {
+		return nil, err
 	}
 
 	return block, nil
@@ -1973,7 +1914,96 @@ func readSizedBytes(data []byte, offset int) ([]byte, int, error) {
 	return val, offset + l, nil
 }
 
+// parseTraceColumns parses trace-level columns from the trace table and expands them to span-level.
+func parseTraceColumns(traceMetas []columnMeta, data []byte, maxDataEnd, traceTableLen, traceCount, spanCount int, columns map[string]*Column) error {
+	if len(traceMetas) == 0 {
+		return nil
+	}
+
+	// Find trace table data (after all span column data)
+	if maxDataEnd+traceTableLen > len(data) {
+		return fmt.Errorf("trace table out of bounds")
+	}
+	traceTableData := data[maxDataEnd : maxDataEnd+traceTableLen]
+
+	// Parse trace table
+	traceTable, err := parseTraceTable(traceTableData, traceCount)
+	if err != nil {
+		return fmt.Errorf("failed to parse trace table: %w", err)
+	}
+
+	// Get trace.index column to map spans to traces
+	traceIndexCol, ok := columns["trace.index"]
+	if !ok {
+		return fmt.Errorf("block missing trace.index column")
+	}
+
+	// Expand trace-level columns to span-level using trace.index
+	for _, meta := range traceMetas {
+		traceCol, ok := traceTable[meta.name]
+		if !ok {
+			continue
+		}
+		// Load stats for trace-level column
+		statsEnd := meta.statsOffset + meta.statsLen
+		if meta.statsOffset < 0 || statsEnd > len(data) {
+			return fmt.Errorf("trace column %s stats out of bounds", meta.name)
+		}
+		statsData := data[meta.statsOffset:statsEnd]
+		stats, err := parseColumnStats(meta.typ, statsData)
+		if err != nil {
+			return fmt.Errorf("trace column %s stats: %w", meta.name, err)
+		}
+
+		spanCol := &Column{
+			Name:  meta.name,
+			Type:  meta.typ,
+			Stats: stats,
+		}
+		if err := expandTraceColumn(spanCol, traceCol, traceIndexCol, spanCount); err != nil {
+			return fmt.Errorf("failed to expand trace column %s: %w", meta.name, err)
+		}
+		columns[meta.name] = spanCol
+	}
+	return nil
+}
+
+// parseSpanColumns parses span-level columns from metadata and populates the columns map.
+// Returns the maximum data end offset needed for trace table parsing.
+func parseSpanColumns(spanMetas []columnMeta, data []byte, spanCount int, existingColumns map[string]*Column, queryArena *arena.Arena, columns map[string]*Column) (int, error) {
+	maxDataEnd := 0
+	for _, meta := range spanMetas {
+		end := meta.dataOffset + meta.dataLen
+		if meta.dataOffset < 0 || end > len(data) {
+			return 0, fmt.Errorf("column %s data out of bounds", meta.name)
+		}
+		if end > maxDataEnd {
+			maxDataEnd = end
+		}
+		statsEnd := meta.statsOffset + meta.statsLen
+		if meta.statsOffset < 0 || statsEnd > len(data) {
+			return 0, fmt.Errorf("column %s stats out of bounds", meta.name)
+		}
+		colData := data[meta.dataOffset:end]
+		statsData := data[meta.statsOffset:statsEnd]
+
+		// Try to reuse existing column allocation
+		var reusableCol *Column
+		if existingColumns != nil {
+			reusableCol = existingColumns[meta.name]
+		}
+
+		col, err := parseColumnReuse(meta.name, meta.typ, spanCount, colData, statsData, reusableCol, queryArena)
+		if err != nil {
+			return 0, err
+		}
+		columns[meta.name] = col
+	}
+	return maxDataEnd, nil
+}
+
 // BOT: Move this to own file
+// BOT: Can slice reader implement more..friendly names wrappers?
 type sliceReader struct {
 	data   []byte
 	offset int

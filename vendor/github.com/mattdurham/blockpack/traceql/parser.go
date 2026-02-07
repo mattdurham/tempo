@@ -10,6 +10,7 @@ import (
 // ParseTraceQL parses a TraceQL query and returns an AST
 // Supports basic filter syntax: { <expression> }
 // Also supports metrics queries: { filter } | aggregate() by (fields)
+// Also supports structural queries: { expr } OP { expr } where OP is >>, >, ~, <<, <, !~
 func ParseTraceQL(query string) (interface{}, error) {
 	query = strings.TrimSpace(query)
 
@@ -21,6 +22,11 @@ func ParseTraceQL(query string) (interface{}, error) {
 	// Check if this is a metrics query (has pipe operator outside braces)
 	if hasPipeOutsideBraces(query) {
 		return parseMetricsQuery(query)
+	}
+
+	// Check if this is a structural query (has structural operator outside braces)
+	if hasStructuralOperator(query) {
+		return parseStructuralQuery(query)
 	}
 
 	// Otherwise parse as filter expression
@@ -55,6 +61,180 @@ func hasPipeOutsideBraces(query string) bool {
 		}
 	}
 	return false
+}
+
+// hasStructuralOperator checks if the query has a structural operator outside of braces
+// Structural operators: >>, >, ~, <<, <, !~
+// Note: > and < are also comparison operators, so we need to be careful
+// We only consider them structural if they appear between { } blocks
+func hasStructuralOperator(query string) bool {
+	braceDepth := 0
+	parenDepth := 0
+	i := 0
+	for i < len(query) {
+		ch := query[i]
+		if ch == '{' {
+			braceDepth++
+		} else if ch == '}' {
+			braceDepth--
+		} else if ch == '(' {
+			parenDepth++
+		} else if ch == ')' {
+			parenDepth--
+		} else if braceDepth == 0 && parenDepth == 0 {
+			// We're outside braces and parens, check for structural operators
+			// Check for two-character operators first
+			if i+1 < len(query) {
+				twoChar := query[i : i+2]
+				if twoChar == ">>" || twoChar == "<<" || twoChar == "!~" {
+					return true
+				}
+			}
+			// Check for single-character structural operators
+			// These are only structural if they appear between two { } blocks
+			if (ch == '>' || ch == '<' || ch == '~') && i > 0 {
+				// Look back to see if there's a } before this
+				j := i - 1
+				for j >= 0 && (query[j] == ' ' || query[j] == '\t' || query[j] == '\n') {
+					j--
+				}
+				if j >= 0 && query[j] == '}' {
+					// Look ahead to see if there's a { after this
+					k := i + 1
+					// Skip the second character if it's part of a two-char operator
+					if ch == '>' && k < len(query) && query[k] == '>' {
+						k++
+					} else if ch == '<' && k < len(query) && query[k] == '<' {
+						k++
+					} else if ch == '!' && k < len(query) && query[k] == '~' {
+						k++
+					}
+					for k < len(query) && (query[k] == ' ' || query[k] == '\t' || query[k] == '\n') {
+						k++
+					}
+					if k < len(query) && query[k] == '{' {
+						return true
+					}
+				}
+			}
+		}
+		i++
+	}
+	return false
+}
+
+// findStructuralOperator finds the position of a structural operator outside of braces
+// Returns the position and the operator string, or -1 and "" if not found
+func findStructuralOperator(query string) (int, string) {
+	braceDepth := 0
+	parenDepth := 0
+	i := 0
+	for i < len(query) {
+		ch := query[i]
+		if ch == '{' {
+			braceDepth++
+		} else if ch == '}' {
+			braceDepth--
+		} else if ch == '(' {
+			parenDepth++
+		} else if ch == ')' {
+			parenDepth--
+		} else if braceDepth == 0 && parenDepth == 0 {
+			// Check for two-character operators first
+			if i+1 < len(query) {
+				twoChar := query[i : i+2]
+				if twoChar == ">>" || twoChar == "<<" || twoChar == "!~" {
+					return i, twoChar
+				}
+			}
+			// Check for single-character operators between { } blocks
+			if (ch == '>' || ch == '<' || ch == '~') && i > 0 {
+				// Look back for }
+				j := i - 1
+				for j >= 0 && (query[j] == ' ' || query[j] == '\t' || query[j] == '\n') {
+					j--
+				}
+				if j >= 0 && query[j] == '}' {
+					// Look ahead for {
+					k := i + 1
+					for k < len(query) && (query[k] == ' ' || query[k] == '\t' || query[k] == '\n') {
+						k++
+					}
+					if k < len(query) && query[k] == '{' {
+						return i, string(ch)
+					}
+				}
+			}
+		}
+		i++
+	}
+	return -1, ""
+}
+
+// parseStructuralQuery parses a structural query: { expr } OP { expr }
+func parseStructuralQuery(query string) (*StructuralQuery, error) {
+	// Find the structural operator
+	opPos, opStr := findStructuralOperator(query)
+	if opPos == -1 {
+		return nil, fmt.Errorf("structural query must have format: { expr } OP { expr }")
+	}
+
+	// Split into left and right parts
+	leftPart := strings.TrimSpace(query[:opPos])
+	rightPart := strings.TrimSpace(query[opPos+len(opStr):])
+
+	// Parse left filter expression
+	left, err := parseFilterExpression(leftPart)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse left expression: %w", err)
+	}
+
+	// Parse right filter expression (might itself be a structural query)
+	// We need to check if the right part is also a structural query
+	rightExpr, err := ParseTraceQL(rightPart)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse right expression: %w", err)
+	}
+
+	// Convert the right expression to a FilterExpression
+	var right *FilterExpression
+	switch r := rightExpr.(type) {
+	case *FilterExpression:
+		right = r
+	case *StructuralQuery:
+		// If the right side is also a structural query, we need to wrap it
+		// For now, return an error as we need to handle operator precedence properly
+		return nil, fmt.Errorf("nested structural queries require parentheses for clarity")
+	case nil:
+		right = nil
+	default:
+		return nil, fmt.Errorf("unexpected right expression type: %T", rightExpr)
+	}
+
+	// Map operator string to StructuralOp
+	var op StructuralOp
+	switch opStr {
+	case ">>":
+		op = OpDescendant
+	case ">":
+		op = OpChild
+	case "~":
+		op = OpSibling
+	case "<<":
+		op = OpAncestor
+	case "<":
+		op = OpParent
+	case "!~":
+		op = OpNotSibling
+	default:
+		return nil, fmt.Errorf("unknown structural operator: %s", opStr)
+	}
+
+	return &StructuralQuery{
+		Left:  left,
+		Op:    op,
+		Right: right,
+	}, nil
 }
 
 // parseFilterExpression parses a TraceQL filter expression
@@ -332,6 +512,21 @@ type MetricsQuery struct {
 	Pipeline *PipelineStage    // The pipeline part: | aggregate() by (...)
 }
 
+// StructuralQuery represents a TraceQL structural query: { expr } OP { expr }
+// Examples: { .parent } >> { .child }, { true } ~ { false }
+type StructuralQuery struct {
+	Left  *FilterExpression // The left filter expression
+	Op    StructuralOp      // The structural operator (>>, >, ~, <<, <, !~)
+	Right *FilterExpression // The right filter expression
+}
+
+// Validate checks if the structural query is well-formed
+func (sq *StructuralQuery) Validate() error {
+	// Note: It's valid to have both sides be nil (e.g., {} >> {} is valid)
+	// It's also valid to have one side be nil (e.g., {} >> { .foo } is valid)
+	return nil
+}
+
 // PipelineStage represents a pipeline operation
 type PipelineStage struct {
 	Aggregate AggregateFunc // The aggregate function
@@ -374,6 +569,18 @@ const (
 	OpNotRegex                 // !~
 )
 
+// StructuralOp represents structural query operators
+type StructuralOp int
+
+const (
+	OpDescendant StructuralOp = iota // >>
+	OpChild                          // >
+	OpSibling                        // ~
+	OpAncestor                       // <<
+	OpParent                         // <
+	OpNotSibling                     // !~
+)
+
 func (op BinaryOp) String() string {
 	switch op {
 	case OpAnd:
@@ -395,6 +602,25 @@ func (op BinaryOp) String() string {
 	case OpRegex:
 		return "=~"
 	case OpNotRegex:
+		return "!~"
+	default:
+		return "UNKNOWN"
+	}
+}
+
+func (op StructuralOp) String() string {
+	switch op {
+	case OpDescendant:
+		return ">>"
+	case OpChild:
+		return ">"
+	case OpSibling:
+		return "~"
+	case OpAncestor:
+		return "<<"
+	case OpParent:
+		return "<"
+	case OpNotSibling:
 		return "!~"
 	default:
 		return "UNKNOWN"
@@ -532,14 +758,19 @@ func (p *parser) parseComparison() (Expr, error) {
 	} else if p.matchOperator("<") {
 		op = OpLt
 	} else {
-		// No comparison operator - field reference alone means "field is not nil"
-		// Example: { .foo } means { .foo != nil }
+		// No comparison operator
+		// For field references, treat as "field is not nil": { .foo } means { .foo != nil }
+		// For literals, just return the literal as-is: { true } is valid
 		if field, ok := left.(*FieldExpr); ok {
 			return &BinaryExpr{
 				Left:  field,
 				Op:    OpNeq,
 				Right: &LiteralExpr{Type: LitNil},
 			}, nil
+		}
+		// Allow standalone literals (e.g., { true }, { false }, { "string" })
+		if _, ok := left.(*LiteralExpr); ok {
+			return left, nil
 		}
 		return nil, fmt.Errorf("expected comparison operator at position %d", p.pos)
 	}

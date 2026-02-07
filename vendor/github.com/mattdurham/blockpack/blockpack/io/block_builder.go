@@ -22,7 +22,8 @@ type blockBuilder struct {
 	maxTrace [16]byte
 
 	columnBloom ColumnNameBloom
-	dedicated   map[string]map[string]struct{}
+	// BOT: Are these ever read?
+	dedicated map[string]map[string]struct{}
 
 	// Trace-level deduplication
 	traces      []*traceEntry    // List of unique traces in this block

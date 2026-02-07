@@ -5,6 +5,9 @@ import (
 	"encoding/binary"
 )
 
+// BOT: Should we separate the components of a block into there own folders?
+// For example, we could have a "blockindex" package that defines the block index structures and serialization logic, and then the main "io" package would just use it. This would help keep the code organized as we add more components like bloom filters, column indexes, etc.
+//
 // ColumnIndexEntry stores offset and length for a single column within a block.
 // Offsets are relative to the block start (blockIndexEntry.Offset).
 type ColumnIndexEntry struct {
@@ -41,6 +44,7 @@ func blockIndexSerializedSize() int {
 }
 
 func blockIndexSerializedSizeForVersion(version uint8) int {
+	// BOT: What are these magic numbers?
 	base := 8 + 8 + 4 + 8 + 8 + 16 + 16 + (columnNameBloomBits / 8)
 	if version >= versionV11 {
 		base += 1
@@ -62,6 +66,7 @@ func (e *blockIndexEntry) write(buf *bytes.Buffer, version uint8) error {
 	_, _ = buf.Write(e.ColumnNameBloom[:])
 
 	// Write value statistics for v10 format
+	// BOT: We dont care about the version for backwards compat.
 	if version >= versionV10 {
 		if err := writeValueStats(buf, e.ValueStats); err != nil {
 			return err

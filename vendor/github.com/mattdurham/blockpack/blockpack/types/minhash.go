@@ -11,6 +11,7 @@ import (
 // OTELSemanticFields lists string fields used for span similarity clustering.
 // These fields are based on OpenTelemetry semantic conventions and are used
 // to compute MinHash signatures for grouping similar spans together.
+// BOT: Are these instrinsics or do they come from otel like this?
 var OTELSemanticFields = []string{
 	"span.service.name",
 	"span.http.method",

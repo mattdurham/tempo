@@ -14,6 +14,7 @@ type VM struct {
 	program  *Program
 	stack    []Value
 	sp       int // Stack pointer
+	pc       int // Program counter (current instruction index)
 	ctx      *spanContext
 	provider AttributeProvider
 	err      error
@@ -197,9 +198,9 @@ func (vm *VM) Execute(span *tracev1.Span, resource *resourcev1.Resource) (bool, 
 
 	// Simple loop executing instruction closures
 	// Each closure returns the next instruction index
-	pc := 0
-	for pc < len(vm.program.Instructions) {
-		pc = vm.program.Instructions[pc](vm)
+	vm.pc = 0
+	for vm.pc < len(vm.program.Instructions) {
+		vm.pc = vm.program.Instructions[vm.pc](vm)
 		if vm.err != nil {
 			return false, vm.err
 		}
@@ -224,9 +225,9 @@ func (vm *VM) ExecuteWithProvider(provider AttributeProvider) (bool, error) {
 		vm.groupByVals = vm.groupByVals[:0]
 	}
 
-	pc := 0
-	for pc < len(vm.program.Instructions) {
-		pc = vm.program.Instructions[pc](vm)
+	vm.pc = 0
+	for vm.pc < len(vm.program.Instructions) {
+		vm.pc = vm.program.Instructions[vm.pc](vm)
 		if vm.err != nil {
 			vm.provider = nil
 			return false, vm.err
@@ -254,9 +255,9 @@ func (vm *VM) ExecuteAggregation(span *tracev1.Span, resource *resourcev1.Resour
 	}
 
 	// Execute instruction closures
-	pc := 0
-	for pc < len(vm.program.Instructions) {
-		pc = vm.program.Instructions[pc](vm)
+	vm.pc = 0
+	for vm.pc < len(vm.program.Instructions) {
+		vm.pc = vm.program.Instructions[vm.pc](vm)
 		if vm.err != nil {
 			return vm.err
 		}
@@ -283,6 +284,34 @@ func (vm *VM) pop() Value {
 	}
 	vm.sp--
 	return vm.stack[vm.sp]
+}
+
+func (vm *VM) push(val Value) {
+	if vm.sp >= len(vm.stack) {
+		vm.stack = append(vm.stack, val)
+		vm.sp++
+	} else {
+		vm.stack[vm.sp] = val
+		vm.sp++
+	}
+}
+
+func (vm *VM) loadAttribute(attrIdx int) Value {
+	if attrIdx < 0 || attrIdx >= len(vm.program.Attributes) {
+		return Value{Type: TypeNil, Data: nil}
+	}
+
+	attrName := vm.program.Attributes[attrIdx]
+
+	// Use provider if available (blockpack execution)
+	if vm.provider != nil {
+		return vm.provider.GetAttribute(attrName)
+	}
+
+	// OTLP execution path not yet implemented
+	// Programs compiled by CompileTraceQLFilter() MUST be executed with an AttributeProvider
+	// (e.g., via blockpack ColumnDataProvider). Direct OTLP span execution is not supported.
+	panic(fmt.Sprintf("attribute lookup without provider: %s (OTLP execution path not implemented - use ColumnPredicate with blockpack provider)", attrName))
 }
 
 // spanContext holds the context for attribute lookups.

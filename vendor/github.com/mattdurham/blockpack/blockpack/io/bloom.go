@@ -2,6 +2,7 @@ package ondiskio
 
 import "hash/fnv"
 
+// BOT: Can these be on the ColumnNameBloomFilter?
 func addToColumnNameBloom(bloom *ColumnNameBloom, name string) {
 	h1 := fnv.New32a()
 	_, _ = h1.Write([]byte(name)) // hash.Write never errors

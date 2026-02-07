@@ -56,6 +56,7 @@ func ExtractAttributes(span *tracev1.Span, resourceAttrs []*commonv1.KeyValue) m
 	}
 
 	// Span intrinsics
+	// BOT: Shouldnt we store this as span:name? Intrinsics are always : same for kind below.
 	attrs["span.name"] = span.GetName()
 	// Note: span.kind is int, convert to string for consistency
 	if kind := span.GetKind(); kind != 0 {
@@ -119,6 +120,7 @@ func extractOTELTokensFromSpan(span *tracev1.Span, resourceAttrs []*commonv1.Key
 			}
 		case strings.HasPrefix(field, "span."):
 			key := strings.TrimPrefix(field, "span.")
+			// BOT: Why does this use span.GetAttributes? Shouldnt we be using the unified attributes map we built in ExtractAttributes? That way we can support resource attributes as well if they are included in the OTELSemanticFields list.
 			if val := spanStringAttrValue(span.GetAttributes(), key); val != "" {
 				tokens = append(tokens, buildTokenString(arena, field, val))
 			}

@@ -12,6 +12,7 @@ import (
 // TraceQL syntax: { <filter-expression> }
 // Example: { name = "hello" && duration > 100s }
 // Does NOT support metrics queries - use CompileTraceQLMetricsOrSQL for that
+// Does NOT support structural queries - use CompileTraceQLStructural for that
 func CompileTraceQL(query string) (*vm.Program, error) {
 	// Parse TraceQL to AST
 	result, err := traceql.ParseTraceQL(query)
@@ -22,6 +23,11 @@ func CompileTraceQL(query string) (*vm.Program, error) {
 	// Check if this is a metrics query - not supported by this function
 	if _, isMetrics := result.(*traceql.MetricsQuery); isMetrics {
 		return nil, fmt.Errorf("metrics queries not supported by CompileTraceQL, use CompileTraceQLMetricsOrSQL")
+	}
+
+	// Check if this is a structural query - not supported by this function
+	if _, isStructural := result.(*traceql.StructuralQuery); isStructural {
+		return nil, fmt.Errorf("structural queries not supported by CompileTraceQL, use CompileTraceQLStructural")
 	}
 
 	// Type assert to FilterExpression
@@ -273,4 +279,32 @@ func compileSQL(query string, startTime, endTime int64) (*vm.Program, *QuerySpec
 
 	// Not an aggregate query - return program only
 	return program, nil, nil
+}
+
+// CompileTraceQLStructural compiles a TraceQL structural query string to a StructuralQueryPlan.
+// Structural query syntax: { filter1 } <op> { filter2 }
+// Operators: >> (descendant), > (child), ~ (sibling), << (ancestor), < (parent), !~ (not sibling)
+// Example: { .root = true } >> { .leaf = true }
+//
+// Returns a StructuralQueryPlan that can be executed with executor.ExecuteStructuralQuery()
+func CompileTraceQLStructural(query string) (*StructuralQueryPlan, error) {
+	// Parse TraceQL to AST
+	result, err := traceql.ParseTraceQL(query)
+	if err != nil {
+		return nil, fmt.Errorf("TraceQL parse error: %w", err)
+	}
+
+	// Type assert to StructuralQuery
+	structuralQuery, ok := result.(*traceql.StructuralQuery)
+	if !ok {
+		return nil, fmt.Errorf("expected StructuralQuery, got %T (use CompileTraceQL for filter queries, CompileTraceQLMetricsOrSQL for metrics)", result)
+	}
+
+	// Compile using existing structural compiler
+	plan, err := CompileStructuralQuery(structuralQuery)
+	if err != nil {
+		return nil, fmt.Errorf("failed to compile structural query: %w", err)
+	}
+
+	return plan, nil
 }

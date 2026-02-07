@@ -20,6 +20,7 @@ import (
 
 // ChooseIndexWidth returns the minimum byte width needed to store dictionary indexes.
 // Returns 1, 2, or 4 bytes based on dictionary size.
+// BOT: Can we make the return a const with friendly names, and reuse them everywhere?
 func ChooseIndexWidth(dictLen int) uint8 {
 	if dictLen <= 0xFF {
 		return 1
@@ -45,6 +46,7 @@ func WriteFixedWidth(buf *bytes.Buffer, val uint32, width uint8) error {
 }
 
 // CountPresentBits counts the number of set bits in the first 'rows' bits of the bitmap.
+// BOT: Why do we need this?
 func CountPresentBits(bits []byte, rows int) int {
 	count := 0
 	for i := 0; i < rows; i++ {
@@ -57,6 +59,7 @@ func CountPresentBits(bits []byte, rows int) int {
 
 // isBitSet checks if the bit at position idx is set in the bitmap.
 func isBitSet(bits []byte, idx int) bool {
+	// BOT: Can we add a comment here?
 	byteIdx := idx / 8
 	bitIdx := idx % 8
 	return bits[byteIdx]&(1<<bitIdx) != 0
@@ -70,6 +73,7 @@ func EncodePresenceRLE(bits []byte, rows int) []byte {
 	var buf bytes.Buffer
 	runCount := uint32(0)
 	last := false
+	// BOT: Why are doing two loops?
 	for i := 0; i < rows; i++ {
 		val := isBitSet(bits, i)
 		if i == 0 || val != last {
@@ -199,6 +203,7 @@ func ChooseBytesEncodingKind(spanCount, presentCount int, useSparse bool, presen
 	return encodingKindDictionary, nil
 }
 
+// BOT: Why are we degining these as constants here instead of in the parent package? Are they only used here?
 // Encoding kind constants (must match parent package ondisk.types.go)
 const (
 	encodingKindDictionary            uint8 = 1  // Dictionary + indexes (default)
