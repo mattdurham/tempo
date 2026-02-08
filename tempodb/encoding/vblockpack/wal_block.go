@@ -12,7 +12,7 @@ import (
 	"github.com/grafana/tempo/pkg/traceql"
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/encoding/common"
-	blockpackio "github.com/mattdurham/blockpack/blockpack/io"
+	"github.com/mattdurham/blockpack"
 )
 
 type walBlock struct {
@@ -22,7 +22,7 @@ type walBlock struct {
 
 	// Blockpack writer for serialization
 	mu     sync.Mutex
-	writer *blockpackio.Writer
+	writer *blockpack.Writer
 	file   *os.File
 }
 
@@ -87,7 +87,7 @@ func (w *walBlock) initWriter() error {
 
 	// Create blockpack writer
 	// Use reasonable defaults: 2000 spans per block
-	w.writer = blockpackio.NewWriter(2000)
+	w.writer = blockpack.NewWriter(2000)
 
 	return nil
 }
@@ -153,7 +153,8 @@ func (w *walBlock) Iterator() (common.Iterator, error) {
 	}
 
 	// Open as reader to iterate
-	reader, err := blockpackio.NewReader(data)
+	provider := &bytesReaderProvider{data: data}
+	reader, err := blockpack.NewReaderFromProvider(provider)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create reader: %w", err)
 	}
@@ -228,7 +229,7 @@ func (w *walBlock) Validate(ctx context.Context) error {
 
 // blockpackIterator iterates through blockpack data
 type blockpackIterator struct {
-	reader *blockpackio.Reader
+	reader *blockpack.Reader
 	// TODO: Add state for iterating through blocks and spans
 	// Will need to reconstruct traces from spans during iteration
 }

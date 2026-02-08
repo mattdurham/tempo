@@ -1,0 +1,87 @@
+goos: linux
+goarch: amd64
+pkg: github.com/mattdurham/prune/benchmark
+cpu: 13th Gen Intel(R) Core(TM) i7-13700K
+BenchmarkAggregationQueries/count-by-service-24         	       3	 411090621 ns/op	  62756750 bytes_read	        38.00 groups	    669886 total_spans	752636282 B/op	 2288347 allocs/op
+--- BENCH: BenchmarkAggregationQueries/count-by-service-24
+    aggregation_bench_test.go:362: ✓ Validation passed: 38 groups, 669886 total spans
+    aggregation_bench_test.go:362: ✓ Validation passed: 38 groups, 669886 total spans
+BenchmarkAggregationQueries/count-by-http-method-24     	       3	 415056797 ns/op	  62756750 bytes_read	         3.000 groups	    669886 total_spans	748827362 B/op	 2284477 allocs/op
+--- BENCH: BenchmarkAggregationQueries/count-by-http-method-24
+    aggregation_bench_test.go:362: ✓ Validation passed: 3 groups, 669886 total spans
+    aggregation_bench_test.go:362: ✓ Validation passed: 3 groups, 669886 total spans
+BenchmarkAggregationQueries/count-by-kind-24            	       3	 414802666 ns/op	  62756750 bytes_read	         5.000 groups	    669886 total_spans	746733469 B/op	 2282062 allocs/op
+--- BENCH: BenchmarkAggregationQueries/count-by-kind-24
+    aggregation_bench_test.go:362: ✓ Validation passed: 5 groups, 669886 total spans
+    aggregation_bench_test.go:362: ✓ Validation passed: 5 groups, 669886 total spans
+BenchmarkAggregationQueries/count-by-status-24          	       3	 412344034 ns/op	  62756750 bytes_read	         3.000 groups	    669886 total_spans	746764002 B/op	 2282077 allocs/op
+--- BENCH: BenchmarkAggregationQueries/count-by-status-24
+    aggregation_bench_test.go:362: ✓ Validation passed: 3 groups, 669886 total spans
+    aggregation_bench_test.go:362: ✓ Validation passed: 3 groups, 669886 total spans
+BenchmarkAggregationQueries/count-by-rpc-system-24      	       3	 408990479 ns/op	  62756750 bytes_read	         3.000 groups	    669886 total_spans	748448610 B/op	 2283932 allocs/op
+--- BENCH: BenchmarkAggregationQueries/count-by-rpc-system-24
+    aggregation_bench_test.go:362: ✓ Validation passed: 3 groups, 669886 total spans
+    aggregation_bench_test.go:362: ✓ Validation passed: 3 groups, 669886 total spans
+BenchmarkAggregationQueries/count-by-service-slow-requests-24         	       3	  46518926 ns/op	  17116970 bytes_read	        14.00 groups	     10561 total_spans	127824594 B/op	  324540 allocs/op
+BenchmarkAggregationQueries/count-by-service-fast-requests-24         	       3	 394708981 ns/op	  58126996 bytes_read	        38.00 groups	    555293 total_spans	685881906 B/op	 2043321 allocs/op
+BenchmarkAggregationQueries/count-by-service-errors-24                	       3	   9927029 ns/op	   6242498 bytes_read	        10.00 groups	        33.00 total_spans	29036864 B/op	   71377 allocs/op
+BenchmarkAggregationQueries/count-by-method-client-spans-24           	       3	 189637458 ns/op	  26665445 bytes_read	         3.000 groups	    243020 total_spans	331521618 B/op	  913455 allocs/op
+BenchmarkAggregationQueries/avg-duration-by-service-24                	       3	 426878343 ns/op	  62756750 bytes_read	        38.00 groups	         0 total_spans	752657109 B/op	 2288362 allocs/op
+BenchmarkAggregationQueries/min-max-duration-by-service-24            	       3	 434682032 ns/op	  62756750 bytes_read	        38.00 groups	         0 total_spans	752664538 B/op	 2288365 allocs/op
+BenchmarkAggregationQueries/duration-stats-by-service-24              	       3	 434727531 ns/op	  62756750 bytes_read	        38.00 groups	   1339772 total_spans	752670181 B/op	 2288364 allocs/op
+BenchmarkAggregationQueries/avg-duration-by-http-method-24            	       3	 424387217 ns/op	  62756750 bytes_read	         3.000 groups	         0 total_spans	748861272 B/op	 2284505 allocs/op
+BenchmarkAggregationQueries/avg-duration-by-kind-24                   	       3	 426314652 ns/op	  62756750 bytes_read	         5.000 groups	         0 total_spans	746770733 B/op	 2282088 allocs/op
+BenchmarkAggregationQueries/p95-duration-by-service-24                	       3	 452858888 ns/op	  62756750 bytes_read	        38.00 groups	         0 total_spans	753510973 B/op	 2289118 allocs/op
+BenchmarkAggregationQueries/p99-duration-by-service-24                	       3	 443788330 ns/op	  62756750 bytes_read	        38.00 groups	         0 total_spans	753518629 B/op	 2289109 allocs/op
+BenchmarkAggregationQueries/p50-p95-p99-by-service-24                 	       3	 508109569 ns/op	  62756750 bytes_read	        38.00 groups	         0 total_spans	753541400 B/op	 2289131 allocs/op
+BenchmarkAggregationQueries/p95-duration-by-http-method-24            	       3	 458986762 ns/op	  62756750 bytes_read	         3.000 groups	         0 total_spans	749027837 B/op	 2284589 allocs/op
+BenchmarkAggregationQueries/count-by-service-and-method-24            	       3	 453826118 ns/op	  62756750 bytes_read	        50.00 groups	    669886 total_spans	776965034 B/op	 2960725 allocs/op
+BenchmarkAggregationQueries/count-by-service-and-kind-24              	       3	 445251902 ns/op	  62756750 bytes_read	        73.00 groups	    669886 total_spans	774310066 B/op	 2958386 allocs/op
+BenchmarkAggregationQueries/avg-duration-by-service-and-method-24     	       3	 463232590 ns/op	  62756750 bytes_read	        50.00 groups	         0 total_spans	776964058 B/op	 2960726 allocs/op
+BenchmarkAggregationQueries/stats-by-service-and-status-24            	       3	 452477542 ns/op	  62756750 bytes_read	        56.00 groups	   1339772 total_spans	774298189 B/op	 2958319 allocs/op
+BenchmarkAggregationQueries/global-count-24                           	       3	 406728884 ns/op	  62756750 bytes_read	         1.000 groups	    669886 total_spans	736062816 B/op	 1612191 allocs/op
+BenchmarkAggregationQueries/global-avg-duration-24                    	       3	 413333503 ns/op	  62756750 bytes_read	         1.000 groups	         0 total_spans	736046730 B/op	 1612187 allocs/op
+BenchmarkAggregationQueries/global-all-stats-24                       	       3	 423625089 ns/op	  62756750 bytes_read	         1.000 groups	   1339772 total_spans	736039482 B/op	 1612190 allocs/op
+BenchmarkAggregationQueries/global-p95-p99-24                         	       3	 464936879 ns/op	  62756750 bytes_read	         1.000 groups	         0 total_spans	736139304 B/op	 1612222 allocs/op
+BenchmarkAggregationQueries/stats-slow-requests-by-service-24         	       3	 130268082 ns/op	  27692484 bytes_read	        19.00 groups	     79048 total_spans	301418322 B/op	  679590 allocs/op
+BenchmarkAggregationQueries/stats-http-errors-by-service-24           	       3	   2817332 ns/op	   4823439 bytes_read	         2.000 groups	         6.000 total_spans	10747154 B/op	   29295 allocs/op
+BenchmarkAggregationQueries/stats-grpc-by-service-24                  	       3	 148505041 ns/op	  19325431 bytes_read	        23.00 groups	    345856 total_spans	258643008 B/op	  631747 allocs/op
+BenchmarkAggregationQueries/rate-by-service-24                        	       3	 424019309 ns/op	  62756750 bytes_read	        38.00 groups	         0 total_spans	752689666 B/op	 2288383 allocs/op
+BenchmarkAggregationQueries/rate-by-service-errors-24                 	       3	   9221150 ns/op	   6242498 bytes_read	        10.00 groups	         0 total_spans	29030106 B/op	   71374 allocs/op
+BenchmarkAggregationQueries/rate-by-http-method-24                    	       3	 431018662 ns/op	  62756750 bytes_read	         3.000 groups	         0 total_spans	748880154 B/op	 2284519 allocs/op
+BenchmarkAggregationQueries/rate-global-24                            	       3	 403112775 ns/op	  62756750 bytes_read	         1.000 groups	         0 total_spans	736055962 B/op	 1612193 allocs/op
+BenchmarkAggregationQueriesByCategory/simple-count/count-by-service-24         	       3	 420461498 ns/op	752664072 B/op	 2288377 allocs/op
+BenchmarkAggregationQueriesByCategory/simple-count/count-by-http-method-24     	       3	 431926878 ns/op	748889765 B/op	 2284523 allocs/op
+BenchmarkAggregationQueriesByCategory/simple-count/count-by-kind-24            	       3	 425372212 ns/op	746793717 B/op	 2282103 allocs/op
+BenchmarkAggregationQueriesByCategory/simple-count/count-by-status-24          	       3	 425259280 ns/op	746769040 B/op	 2282089 allocs/op
+BenchmarkAggregationQueriesByCategory/simple-count/count-by-rpc-system-24      	       3	 425140042 ns/op	748497696 B/op	 2283972 allocs/op
+BenchmarkAggregationQueriesByCategory/filtered-count/count-by-service-slow-requests-24         	       3	  49706082 ns/op	127799898 B/op	  324523 allocs/op
+BenchmarkAggregationQueriesByCategory/filtered-count/count-by-service-fast-requests-24         	       3	 397943350 ns/op	685499442 B/op	 2043267 allocs/op
+BenchmarkAggregationQueriesByCategory/filtered-count/count-by-service-errors-24                	       3	   9991428 ns/op	29030096 B/op	   71374 allocs/op
+BenchmarkAggregationQueriesByCategory/filtered-count/count-by-method-client-spans-24           	       3	 187399310 ns/op	331571768 B/op	  913475 allocs/op
+BenchmarkAggregationQueriesByCategory/multi-group/count-by-service-and-method-24               	       3	 453587046 ns/op	776979184 B/op	 2960731 allocs/op
+BenchmarkAggregationQueriesByCategory/multi-group/count-by-service-and-kind-24                 	       3	 452246823 ns/op	774329056 B/op	 2958418 allocs/op
+BenchmarkAggregationQueriesByCategory/multi-group/avg-duration-by-service-and-method-24        	       3	 455465562 ns/op	776960448 B/op	 2960718 allocs/op
+BenchmarkAggregationQueriesByCategory/multi-group/stats-by-service-and-status-24               	       3	 458042895 ns/op	774323397 B/op	 2958347 allocs/op
+BenchmarkAggregationQueriesByCategory/global/global-count-24                                   	       3	 405774924 ns/op	736068645 B/op	 1612197 allocs/op
+BenchmarkAggregationQueriesByCategory/global/global-avg-duration-24                            	       3	 416333243 ns/op	736077600 B/op	 1612200 allocs/op
+BenchmarkAggregationQueriesByCategory/global/global-all-stats-24                               	       3	 430188187 ns/op	736064832 B/op	 1612194 allocs/op
+BenchmarkAggregationQueriesByCategory/global/global-p95-p99-24                                 	       3	 461964204 ns/op	736164989 B/op	 1612234 allocs/op
+BenchmarkAggregationQueriesByCategory/rate/rate-by-service-24                                  	       3	 422030144 ns/op	752674109 B/op	 2288378 allocs/op
+BenchmarkAggregationQueriesByCategory/rate/rate-by-service-errors-24                           	       3	  12131984 ns/op	29030096 B/op	   71374 allocs/op
+BenchmarkAggregationQueriesByCategory/rate/rate-by-http-method-24                              	       3	 429257654 ns/op	748863653 B/op	 2284511 allocs/op
+BenchmarkAggregationQueriesByCategory/rate/rate-global-24                                      	       3	 407556759 ns/op	736064576 B/op	 1612203 allocs/op
+BenchmarkAggregationQueriesByCategory/duration-stats/avg-duration-by-service-24                	       3	 431480934 ns/op	752697709 B/op	 2288389 allocs/op
+BenchmarkAggregationQueriesByCategory/duration-stats/min-max-duration-by-service-24            	       3	 434872075 ns/op	752684525 B/op	 2288378 allocs/op
+BenchmarkAggregationQueriesByCategory/duration-stats/duration-stats-by-service-24              	       3	 444234109 ns/op	752677933 B/op	 2288377 allocs/op
+BenchmarkAggregationQueriesByCategory/duration-stats/avg-duration-by-http-method-24            	       3	 435289302 ns/op	748894080 B/op	 2284530 allocs/op
+BenchmarkAggregationQueriesByCategory/duration-stats/avg-duration-by-kind-24                   	       3	 436932009 ns/op	746777589 B/op	 2282099 allocs/op
+BenchmarkAggregationQueriesByCategory/quantile/p95-duration-by-service-24                      	       3	 451702881 ns/op	753525248 B/op	 2289132 allocs/op
+BenchmarkAggregationQueriesByCategory/quantile/p99-duration-by-service-24                      	       3	 453118972 ns/op	753536784 B/op	 2289126 allocs/op
+BenchmarkAggregationQueriesByCategory/quantile/p50-p95-p99-by-service-24                       	       3	 510206915 ns/op	753558432 B/op	 2289139 allocs/op
+BenchmarkAggregationQueriesByCategory/quantile/p95-duration-by-http-method-24                  	       3	 460714561 ns/op	748985397 B/op	 2284573 allocs/op
+BenchmarkAggregationQueriesByCategory/complex/stats-slow-requests-by-service-24                	       3	 131234026 ns/op	301371472 B/op	  679584 allocs/op
+BenchmarkAggregationQueriesByCategory/complex/stats-http-errors-by-service-24                  	       3	   3307901 ns/op	10734584 B/op	   29286 allocs/op
+BenchmarkAggregationQueriesByCategory/complex/stats-grpc-by-service-24                         	       3	 149700192 ns/op	258618616 B/op	  631755 allocs/op
+PASS
+ok  	github.com/mattdurham/prune/benchmark	106.806s

@@ -15,11 +15,51 @@ import (
 	"github.com/grafana/tempo/pkg/traceql"
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/encoding/common"
-	blockpackio "github.com/mattdurham/blockpack/blockpack/io"
-	"github.com/mattdurham/blockpack/executor"
-	blockpacktraceql "github.com/mattdurham/blockpack/traceql"
-	"github.com/mattdurham/blockpack/vm"
+	"github.com/mattdurham/blockpack"
 )
+
+// tempoStorage adapts Tempo's backend.Reader to blockpack.Storage interface
+type tempoStorage struct {
+	reader   backend.Reader
+	tenantID string
+	blockID  uuid.UUID
+}
+
+func (s *tempoStorage) Size(path string) (int64, error) {
+	// Path is ignored - we always read from our specific block
+	// Use StreamReader to get size, then close immediately
+	rc, size, err := s.reader.StreamReader(context.Background(), DataFileName, s.blockID, s.tenantID)
+	if err != nil {
+		return 0, err
+	}
+	rc.Close()
+	return size, nil
+}
+
+func (s *tempoStorage) ReadAt(path string, p []byte, off int64) (int, error) {
+	// Path is ignored - we always read from our specific block
+	// Validate offset
+	if off < 0 {
+		return 0, fmt.Errorf("negative offset: %d", off)
+	}
+
+	// Use ReadRange for efficient partial reads
+	err := s.reader.ReadRange(context.Background(), DataFileName, s.blockID, s.tenantID, uint64(off), p, nil)
+	if err != nil {
+		// Check if this is an EOF condition
+		if off >= 0 {
+			// Get size to check if offset is beyond file
+			size, sizeErr := s.Size(path)
+			if sizeErr == nil && off >= size {
+				return 0, io.EOF
+			}
+		}
+		return 0, err
+	}
+
+	// ReadRange fills the entire buffer or returns an error
+	return len(p), nil
+}
 
 type blockpackBlock struct {
 	meta   *backend.BlockMeta
@@ -47,42 +87,20 @@ func (b *blockpackBlock) FindTraceByID(ctx context.Context, id common.ID, _ comm
 	// Convert trace ID to hex string for query
 	traceIDHex := hex.EncodeToString(id)
 
-	// Convert backend.UUID (array) to uuid.UUID
-	blockUUID := uuid.UUID(b.meta.BlockID)
-
-	// Read blockpack file from backend storage
-	rc, size, err := b.reader.StreamReader(ctx, DataFileName, blockUUID, b.meta.TenantID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open blockpack file: %w", err)
-	}
-	defer rc.Close()
-
-	// Read all data into memory
-	data := make([]byte, size)
-	n, err := io.ReadFull(rc, data)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read blockpack file: %w", err)
-	}
-	if int64(n) != size {
-		return nil, fmt.Errorf("incomplete read: %d != %d", n, size)
-	}
-
 	// Build TraceQL query to find all spans for this trace
 	// Use explicit column name with colon notation (passes through normalization)
 	query := fmt.Sprintf(`{ trace:id = "%s" }`, traceIDHex)
 
-	// Compile TraceQL directly to VM program (bypasses SQL)
-	program, err := compileTraceQLQuery(query)
-	if err != nil {
-		return nil, fmt.Errorf("failed to compile TraceQL query: %w", err)
+	// Create storage adapter for blockpack query
+	blockUUID := uuid.UUID(b.meta.BlockID)
+	storage := &tempoStorage{
+		reader:   b.reader,
+		tenantID: b.meta.TenantID,
+		blockID:  blockUUID,
 	}
 
-	// Create blockpack executor with in-memory storage
-	storage := &memoryStorage{data: data}
-	exec := executor.NewBlockpackExecutor(storage)
-
-	// Execute query
-	result, err := exec.ExecuteQuery("", program, nil, executor.QueryOptions{})
+	// Execute TraceQL query using public API
+	result, err := blockpack.ExecuteTraceQL(DataFileName, query, storage, blockpack.QueryOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to execute query: %w", err)
 	}
@@ -107,33 +125,19 @@ func (b *blockpackBlock) FindTraceByID(ctx context.Context, id common.ID, _ comm
 // Uses blockpack's query engine for tag/duration filtering
 func (b *blockpackBlock) Search(ctx context.Context, req *tempopb.SearchRequest,
 	_ common.SearchOptions) (*tempopb.SearchResponse, error) {
-	// Read blockpack file
-	blockUUID := uuid.UUID(b.meta.BlockID)
-	rc, size, err := b.reader.StreamReader(ctx, DataFileName, blockUUID, b.meta.TenantID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open blockpack file: %w", err)
-	}
-	defer rc.Close()
-
-	data := make([]byte, size)
-	_, err = io.ReadFull(rc, data)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read blockpack file: %w", err)
-	}
-
-	// Build SQL query from SearchRequest
+	// Build TraceQL query from SearchRequest
 	query := buildSearchQuery(req)
 
-	// Compile TraceQL directly to VM program
-	program, err := compileTraceQLQuery(query)
-	if err != nil {
-		return nil, fmt.Errorf("failed to compile TraceQL query: %w", err)
+	// Create storage adapter for blockpack query
+	blockUUID := uuid.UUID(b.meta.BlockID)
+	storage := &tempoStorage{
+		reader:   b.reader,
+		tenantID: b.meta.TenantID,
+		blockID:  blockUUID,
 	}
 
-	storage := &memoryStorage{data: data}
-	exec := executor.NewBlockpackExecutor(storage)
-
-	result, err := exec.ExecuteQuery("", program, nil, executor.QueryOptions{
+	// Execute TraceQL query using public API
+	result, err := blockpack.ExecuteTraceQL(DataFileName, query, storage, blockpack.QueryOptions{
 		Limit: int(req.Limit),
 	})
 	if err != nil {
@@ -141,7 +145,7 @@ func (b *blockpackBlock) Search(ctx context.Context, req *tempopb.SearchRequest,
 	}
 
 	// Group matches by trace ID
-	traceMatches := make(map[string][]executor.BlockpackSpanMatch)
+	traceMatches := make(map[string][]blockpack.SpanMatch)
 	for _, match := range result.Matches {
 		traceMatches[match.TraceID] = append(traceMatches[match.TraceID], match)
 	}
@@ -175,8 +179,9 @@ func (b *blockpackBlock) SearchTags(ctx context.Context, scope traceql.Attribute
 		return fmt.Errorf("failed to read blockpack file: %w", err)
 	}
 
-	// Open blockpack reader
-	bpr, err := blockpackio.NewReader(data)
+	// Create blockpack reader from bytes using public API
+	provider := &bytesReaderProvider{data: data}
+	bpr, err := blockpack.NewReaderFromProvider(provider)
 	if err != nil {
 		return fmt.Errorf("failed to create blockpack reader: %w", err)
 	}
@@ -207,35 +212,21 @@ func (b *blockpackBlock) SearchTags(ctx context.Context, scope traceql.Attribute
 // SearchTagValues implements the Searcher interface
 // Extracts unique values for a given tag
 func (b *blockpackBlock) SearchTagValues(ctx context.Context, tag string, cb common.TagValuesCallback, _ common.MetricsCallback, _ common.SearchOptions) error {
-	// Read blockpack file
-	blockUUID := uuid.UUID(b.meta.BlockID)
-	rc, size, err := b.reader.StreamReader(ctx, DataFileName, blockUUID, b.meta.TenantID)
-	if err != nil {
-		return fmt.Errorf("failed to open blockpack file: %w", err)
-	}
-	defer rc.Close()
-
-	data := make([]byte, size)
-	_, err = io.ReadFull(rc, data)
-	if err != nil {
-		return fmt.Errorf("failed to read blockpack file: %w", err)
-	}
-
 	// Use empty TraceQL query to match all spans, then extract tag values
 	// Tag names like "service.name" become column names like "resource.service.name"
 	colName := tagToColumnName(tag)
-	query := ""
+	query := "{}" // Match all spans
 
-	// Compile and execute query
-	program, err := compileTraceQLQuery(query)
-	if err != nil {
-		return fmt.Errorf("failed to compile query: %w", err)
+	// Create storage adapter for blockpack query
+	blockUUID := uuid.UUID(b.meta.BlockID)
+	storage := &tempoStorage{
+		reader:   b.reader,
+		tenantID: b.meta.TenantID,
+		blockID:  blockUUID,
 	}
 
-	storage := &memoryStorage{data: data}
-	exec := executor.NewBlockpackExecutor(storage)
-
-	result, err := exec.ExecuteQuery("", program, nil, executor.QueryOptions{})
+	// Execute TraceQL query using public API
+	result, err := blockpack.ExecuteTraceQL(DataFileName, query, storage, blockpack.QueryOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to execute query: %w", err)
 	}
@@ -257,35 +248,21 @@ func (b *blockpackBlock) SearchTagValues(ctx context.Context, tag string, cb com
 
 // SearchTagValuesV2 implements the Searcher interface
 func (b *blockpackBlock) SearchTagValuesV2(ctx context.Context, tag traceql.Attribute, cb common.TagValuesCallbackV2, _ common.MetricsCallback, _ common.SearchOptions) error {
-	// Read blockpack file
-	blockUUID := uuid.UUID(b.meta.BlockID)
-	rc, size, err := b.reader.StreamReader(ctx, DataFileName, blockUUID, b.meta.TenantID)
-	if err != nil {
-		return fmt.Errorf("failed to open blockpack file: %w", err)
-	}
-	defer rc.Close()
-
-	data := make([]byte, size)
-	_, err = io.ReadFull(rc, data)
-	if err != nil {
-		return fmt.Errorf("failed to read blockpack file: %w", err)
-	}
-
 	// Convert traceql.Attribute to column name
 	colName := tagToColumnName(tag.Name)
-	// Use empty TraceQL query to match all spans (no braces needed for empty)
-	query := ""
+	// Use match-all TraceQL query
+	query := "{}"
 
-	// Compile and execute query
-	program, err := compileTraceQLQuery(query)
-	if err != nil {
-		return fmt.Errorf("failed to compile query: %w", err)
+	// Create storage adapter for blockpack query
+	blockUUID := uuid.UUID(b.meta.BlockID)
+	storage := &tempoStorage{
+		reader:   b.reader,
+		tenantID: b.meta.TenantID,
+		blockID:  blockUUID,
 	}
 
-	storage := &memoryStorage{data: data}
-	exec := executor.NewBlockpackExecutor(storage)
-
-	result, err := exec.ExecuteQuery("", program, nil, executor.QueryOptions{})
+	// Execute TraceQL query using public API
+	result, err := blockpack.ExecuteTraceQL(DataFileName, query, storage, blockpack.QueryOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to execute query: %w", err)
 	}
@@ -321,34 +298,20 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 
 // FetchTagValues implements the Searcher interface
 func (b *blockpackBlock) FetchTagValues(ctx context.Context, req traceql.FetchTagValuesRequest, cb traceql.FetchTagValuesCallback, mcb common.MetricsCallback, opts common.SearchOptions) error {
-	// Read blockpack file
-	blockUUID := uuid.UUID(b.meta.BlockID)
-	rc, size, err := b.reader.StreamReader(ctx, DataFileName, blockUUID, b.meta.TenantID)
-	if err != nil {
-		return fmt.Errorf("failed to open blockpack file: %w", err)
-	}
-	defer rc.Close()
-
-	data := make([]byte, size)
-	_, err = io.ReadFull(rc, data)
-	if err != nil {
-		return fmt.Errorf("failed to read blockpack file: %w", err)
-	}
-
 	// Build TraceQL query from conditions
 	// If no conditions, match all spans
 	query := conditionsToTraceQL(req.Conditions, true) // Use AND for multiple conditions
 
-	// Execute query
-	program, err := compileTraceQLQuery(query)
-	if err != nil {
-		return fmt.Errorf("failed to compile query: %w", err)
+	// Create storage adapter for blockpack query
+	blockUUID := uuid.UUID(b.meta.BlockID)
+	storage := &tempoStorage{
+		reader:   b.reader,
+		tenantID: b.meta.TenantID,
+		blockID:  blockUUID,
 	}
 
-	storage := &memoryStorage{data: data}
-	exec := executor.NewBlockpackExecutor(storage)
-
-	result, err := exec.ExecuteQuery("", program, nil, executor.QueryOptions{})
+	// Execute TraceQL query using public API
+	result, err := blockpack.ExecuteTraceQL(DataFileName, query, storage, blockpack.QueryOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to execute query: %w", err)
 	}
@@ -379,32 +342,20 @@ func (b *blockpackBlock) FetchTagValues(ctx context.Context, req traceql.FetchTa
 
 // FetchTagNames implements the Searcher interface
 func (b *blockpackBlock) FetchTagNames(ctx context.Context, req traceql.FetchTagsRequest, cb traceql.FetchTagsCallback, mcb common.MetricsCallback, opts common.SearchOptions) error {
-	// Read blockpack file
+	// Create storage adapter for blockpack query
 	blockUUID := uuid.UUID(b.meta.BlockID)
-	rc, size, err := b.reader.StreamReader(ctx, DataFileName, blockUUID, b.meta.TenantID)
-	if err != nil {
-		return fmt.Errorf("failed to open blockpack file: %w", err)
-	}
-	defer rc.Close()
-
-	data := make([]byte, size)
-	_, err = io.ReadFull(rc, data)
-	if err != nil {
-		return fmt.Errorf("failed to read blockpack file: %w", err)
+	storage := &tempoStorage{
+		reader:   b.reader,
+		tenantID: b.meta.TenantID,
+		blockID:  blockUUID,
 	}
 
 	// If conditions are specified, execute query to filter spans first
 	if len(req.Conditions) > 0 {
 		query := conditionsToTraceQL(req.Conditions, true)
-		program, err := compileTraceQLQuery(query)
-		if err != nil {
-			return fmt.Errorf("failed to compile query: %w", err)
-		}
 
-		storage := &memoryStorage{data: data}
-		exec := executor.NewBlockpackExecutor(storage)
-
-		result, err := exec.ExecuteQuery("", program, nil, executor.QueryOptions{})
+		// Execute TraceQL query using public API
+		result, err := blockpack.ExecuteTraceQL(DataFileName, query, storage, blockpack.QueryOptions{})
 		if err != nil {
 			return fmt.Errorf("failed to execute query: %w", err)
 		}
@@ -427,7 +378,21 @@ func (b *blockpackBlock) FetchTagNames(ctx context.Context, req traceql.FetchTag
 		}
 	} else {
 		// No conditions - get all column names from block schema
-		bpr, err := blockpackio.NewReader(data)
+		// Read blockpack file to access schema
+		rc, size, err := b.reader.StreamReader(ctx, DataFileName, blockUUID, b.meta.TenantID)
+		if err != nil {
+			return fmt.Errorf("failed to open blockpack file: %w", err)
+		}
+		defer rc.Close()
+
+		data := make([]byte, size)
+		_, err = io.ReadFull(rc, data)
+		if err != nil {
+			return fmt.Errorf("failed to read blockpack file: %w", err)
+		}
+
+		provider := &bytesReaderProvider{data: data}
+		bpr, err := blockpack.NewReaderFromProvider(provider)
 		if err != nil {
 			return fmt.Errorf("failed to create blockpack reader: %w", err)
 		}
@@ -472,41 +437,13 @@ func (b *blockpackBlock) Validate(ctx context.Context) error {
 	}
 
 	// Attempt to open as blockpack - this validates the file format
-	_, err = blockpackio.NewReader(data)
+	provider := &bytesReaderProvider{data: data}
+	_, err = blockpack.NewReaderFromProvider(provider)
 	if err != nil {
 		return fmt.Errorf("invalid blockpack file: %w", err)
 	}
 
 	return nil
-}
-
-// compileTraceQLQuery compiles a TraceQL query string directly to VM program
-// Uses the new direct TraceQL → VM compiler, bypassing SQL entirely
-func compileTraceQLQuery(query string) (*vm.Program, error) {
-	// Parse TraceQL to AST
-	result, err := blockpacktraceql.ParseTraceQL(query)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse TraceQL: %w", err)
-	}
-
-	// Handle filter expression (can be nil for match-all)
-	var filter *blockpacktraceql.FilterExpression
-	if result != nil {
-		var ok bool
-		filter, ok = result.(*blockpacktraceql.FilterExpression)
-		if !ok {
-			return nil, fmt.Errorf("expected FilterExpression, got %T", result)
-		}
-	}
-
-	// Compile directly to VM program (bypasses SQL)
-	// CompileTraceQLFilter handles nil filter as match-all
-	program, err := vm.CompileTraceQLFilter(filter)
-	if err != nil {
-		return nil, fmt.Errorf("failed to compile TraceQL to VM: %w", err)
-	}
-
-	return program, nil
 }
 
 // conditionsToTraceQL converts traceql.Condition objects to a TraceQL query string
@@ -648,21 +585,7 @@ func staticToTraceQLValue(s traceql.Static) string {
 	return ""
 }
 
-// memoryStorage implements executor.FileStorage and executor.ProviderStorage
-// for in-memory blockpack data
-type memoryStorage struct {
-	data []byte
-}
-
-func (m *memoryStorage) Get(_ string) ([]byte, error) {
-	return m.data, nil
-}
-
-func (m *memoryStorage) GetProvider(_ string) (blockpackio.ReaderProvider, error) {
-	return &bytesReaderProvider{data: m.data}, nil
-}
-
-// bytesReaderProvider implements blockpackio.ReaderProvider for in-memory data
+// bytesReaderProvider implements blockpack.ReaderProvider for in-memory data
 type bytesReaderProvider struct {
 	data []byte
 }
@@ -684,7 +607,7 @@ func (p *bytesReaderProvider) ReadAt(b []byte, off int64) (int, error) {
 
 // reconstructTrace rebuilds a tempopb.Trace from blockpack span matches
 // Groups spans by resource and scope to create proper OTLP hierarchy
-func reconstructTrace(traceID common.ID, matches []executor.BlockpackSpanMatch) (*tempopb.Trace, error) {
+func reconstructTrace(traceID common.ID, matches []blockpack.SpanMatch) (*tempopb.Trace, error) {
 	// Group spans by resource, then by scope
 	type spanWithAttrs struct {
 		span          *tempotrace.Span
@@ -1013,7 +936,7 @@ func buildSearchQuery(req *tempopb.SearchRequest) string {
 }
 
 // buildTraceMetadata creates trace search metadata from span matches
-func buildTraceMetadata(traceID string, spans []executor.BlockpackSpanMatch) *tempopb.TraceSearchMetadata {
+func buildTraceMetadata(traceID string, spans []blockpack.SpanMatch) *tempopb.TraceSearchMetadata {
 	metadata := &tempopb.TraceSearchMetadata{
 		TraceID: traceID,
 	}
@@ -1047,7 +970,7 @@ func buildTraceMetadata(traceID string, spans []executor.BlockpackSpanMatch) *te
 
 // convertToSpansets converts BlockpackSpanMatch to traceql spansets
 // Note: This would be used if Fetch were fully implemented
-// func convertToSpansets(matches []executor.BlockpackSpanMatch) traceql.SpansetIterator {
+// func convertToSpansets(matches []blockpack.SpanMatch) traceql.SpansetIterator {
 //	// Would need to implement a SpansetIterator that returns *Spanset from matches
 //	// This is complex and requires building full Span implementations
 // }

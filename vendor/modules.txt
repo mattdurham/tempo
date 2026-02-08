@@ -1074,21 +1074,22 @@ github.com/mark3labs/mcp-go/server
 github.com/mark3labs/mcp-go/util
 # github.com/mattdurham/blockpack v0.0.0-00010101000000-000000000000 => /home/matt/source/blockpack
 ## explicit; go 1.25.1
-github.com/mattdurham/blockpack/blockpack/encodings
-github.com/mattdurham/blockpack/blockpack/io
-github.com/mattdurham/blockpack/blockpack/types
-github.com/mattdurham/blockpack/executor
+github.com/mattdurham/blockpack
 github.com/mattdurham/blockpack/internal/arena
 github.com/mattdurham/blockpack/internal/arena/slice
+github.com/mattdurham/blockpack/internal/blockio
 github.com/mattdurham/blockpack/internal/debug
+github.com/mattdurham/blockpack/internal/encodings
+github.com/mattdurham/blockpack/internal/executor
 github.com/mattdurham/blockpack/internal/quantile
+github.com/mattdurham/blockpack/internal/sql
+github.com/mattdurham/blockpack/internal/traceqlparser
+github.com/mattdurham/blockpack/internal/types
+github.com/mattdurham/blockpack/internal/vm
 github.com/mattdurham/blockpack/internal/xflag
 github.com/mattdurham/blockpack/internal/xsync
 github.com/mattdurham/blockpack/internal/xunsafe
 github.com/mattdurham/blockpack/internal/xunsafe/layout
-github.com/mattdurham/blockpack/sql
-github.com/mattdurham/blockpack/traceql
-github.com/mattdurham/blockpack/vm
 # github.com/mattn/go-colorable v0.1.14
 ## explicit; go 1.18
 github.com/mattn/go-colorable
