@@ -2,8 +2,8 @@ package blockio
 
 import (
 	"bytes"
-	"github.com/klauspost/compress/zstd"
 	"fmt"
+	"github.com/klauspost/compress/zstd"
 
 	"github.com/mattdurham/blockpack/internal/encodings"
 )

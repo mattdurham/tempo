@@ -2,8 +2,8 @@ package encodings
 
 import (
 	"bytes"
-	"github.com/klauspost/compress/zstd"
 	"encoding/binary"
+	"github.com/klauspost/compress/zstd"
 )
 
 // BuildBytesDictionaryDelta encodes a bytes column using dictionary encoding with delta-compressed indices.

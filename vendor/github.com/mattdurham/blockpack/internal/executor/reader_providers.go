@@ -3,6 +3,8 @@ package executor
 import (
 	"io"
 	"os"
+
+	blockpackio "github.com/mattdurham/blockpack/internal/blockio"
 )
 
 type bytesReaderProvider struct {
@@ -15,7 +17,7 @@ func (p *bytesReaderProvider) Size() (int64, error) {
 
 // ReadAt simulates object storage behavior by always copying data.
 // Does NOT implement Slice to force realistic IO operations for benchmarks.
-func (p *bytesReaderProvider) ReadAt(b []byte, off int64) (int, error) {
+func (p *bytesReaderProvider) ReadAt(b []byte, off int64, dataType blockpackio.DataType) (int, error) {
 	if off < 0 || off >= int64(len(p.data)) {
 		return 0, io.EOF
 	}
@@ -37,7 +39,7 @@ func (p *fileReaderProvider) Size() (int64, error) {
 
 // ReadAt reads from the underlying file.
 // Does NOT implement Slice to force realistic IO operations for benchmarks.
-func (p *fileReaderProvider) ReadAt(b []byte, off int64) (int, error) {
+func (p *fileReaderProvider) ReadAt(b []byte, off int64, dataType blockpackio.DataType) (int, error) {
 	return p.file.ReadAt(b, off)
 }
 

@@ -2,9 +2,9 @@ package encodings
 
 import (
 	"bytes"
-	"github.com/klauspost/compress/zstd"
 	"encoding/binary"
 	"fmt"
+	"github.com/klauspost/compress/zstd"
 )
 
 // BuildDeltaUint64 encodes a uint64 column using block-relative encoding.

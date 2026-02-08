@@ -119,7 +119,7 @@ func (d *DetailedTrackingReader) Size() (int64, error) {
 	return d.underlying.Size()
 }
 
-func (d *DetailedTrackingReader) ReadAt(p []byte, off int64) (int, error) {
+func (d *DetailedTrackingReader) ReadAt(p []byte, off int64, dataType DataType) (int, error) {
 	start := time.Now()
 
 	// Simulate latency
@@ -127,7 +127,7 @@ func (d *DetailedTrackingReader) ReadAt(p []byte, off int64) (int, error) {
 		time.Sleep(time.Duration(latency))
 	}
 
-	n, err := d.underlying.ReadAt(p, off)
+	n, err := d.underlying.ReadAt(p, off, dataType)
 
 	duration := time.Since(start)
 

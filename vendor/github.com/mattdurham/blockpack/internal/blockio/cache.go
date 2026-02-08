@@ -1,8 +1,10 @@
 package blockio
 
-// BOT: I would prefer this and the other storage provider interfaces to be in a separate package from the core types and encoding logic. This way we can have multiple implementations (e.g. in-memory, on-disk, cloud storage) without coupling them to the core data structures. We can also avoid exposing internal types and encoding details to users of the storage layer.
-//
 // ByteCache provides an interface for caching byte slices read from storage.
+// NOTE: This interface is now superseded by the layered provider pattern
+// (CachingReaderProvider, DataAwareCachingProvider, MemcacheReaderProvider).
+// The new pattern provides better composability and separation of concerns.
+// This interface is kept for backward compatibility with existing code.
 // Implementations must be thread-safe for concurrent access.
 type ByteCache interface {
 	// Get retrieves cached data for the given key.

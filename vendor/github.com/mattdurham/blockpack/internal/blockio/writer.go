@@ -23,7 +23,6 @@ import (
 	tracev1 "go.opentelemetry.io/proto/otlp/trace/v1"
 )
 
-
 // MetricStreamDef defines a metric stream to compute during ingestion
 type MetricStreamDef struct {
 	StreamID string
@@ -72,9 +71,9 @@ type WriterConfig struct {
 // and may result in panics or corrupted data, especially when using metric streams.
 // blockReference holds lightweight metadata for a block in streaming mode
 type blockReference struct {
-	offset int64            // File offset where block data starts
-	length int64            // Length of serialized block data
-	meta   blockIndexEntry  // Block metadata (bloom, timestamps, etc)
+	offset int64           // File offset where block data starts
+	length int64           // Length of serialized block data
+	meta   blockIndexEntry // Block metadata (bloom, timestamps, etc)
 }
 
 type Writer struct {
@@ -83,9 +82,9 @@ type Writer struct {
 	blocks        []*blockBuilder
 	current       *blockBuilder
 	// Streaming mode fields
-	output      io.WriteSeeker      // Output stream for immediate writes
-	blockRefs   []*blockReference   // Lightweight block references (streaming mode)
-	currentPos  int64               // Current write position in output stream
+	output     io.WriteSeeker    // Output stream for immediate writes
+	blockRefs  []*blockReference // Lightweight block references (streaming mode)
+	currentPos int64             // Current write position in output stream
 	// Reusable zstd encoder (128 MB, reused for all blocks to avoid pool accumulation)
 	zstdEncoder *zstd.Encoder
 	// dedicated column index: column -> encoded value -> set of block IDs

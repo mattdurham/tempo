@@ -2,8 +2,8 @@ package encodings
 
 import (
 	"bytes"
-	"github.com/klauspost/compress/zstd"
 	"encoding/binary"
+	"github.com/klauspost/compress/zstd"
 )
 
 // BuildXORBytes encodes a bytes column using XOR encoding.
