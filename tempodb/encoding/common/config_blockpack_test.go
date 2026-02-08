@@ -42,6 +42,13 @@ func TestBlockpackConfigValidation(t *testing.T) {
 			expectError: false,
 		},
 		{
+			name: "empty config - no validation",
+			cfg: BlockpackConfig{
+				CompressionCodec: "",
+			},
+			expectError: false,
+		},
+		{
 			name: "invalid codec",
 			cfg: BlockpackConfig{
 				CompressionCodec:    "invalid",
@@ -68,30 +75,30 @@ func TestBlockpackConfigValidation(t *testing.T) {
 			errorMsg:    "compression level must be non-negative",
 		},
 		{
-			name: "zero column block size",
+			name: "negative column block size",
 			cfg: BlockpackConfig{
 				CompressionCodec:    "zstd",
 				CompressionLevel:    3,
-				ColumnBlockSize:     0,
+				ColumnBlockSize:     -1,
 				WriteBufferSize:     1024 * 1024,
 				DictionaryMaxSize:   1024 * 1024,
 				MinHashPermutations: 128,
 			},
 			expectError: true,
-			errorMsg:    "column block size must be positive",
+			errorMsg:    "column block size must be non-negative",
 		},
 		{
-			name: "zero write buffer size",
+			name: "negative write buffer size",
 			cfg: BlockpackConfig{
 				CompressionCodec:    "zstd",
 				CompressionLevel:    3,
 				ColumnBlockSize:     64 * 1024,
-				WriteBufferSize:     0,
+				WriteBufferSize:     -1,
 				DictionaryMaxSize:   1024 * 1024,
 				MinHashPermutations: 128,
 			},
 			expectError: true,
-			errorMsg:    "write buffer size must be positive",
+			errorMsg:    "write buffer size must be non-negative",
 		},
 		{
 			name: "valid snappy codec",

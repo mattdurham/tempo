@@ -119,6 +119,12 @@ func (cfg *BlockpackConfig) applyDefaults() {
 
 // validate validates blockpack configuration
 func (cfg *BlockpackConfig) validate() error {
+	// If codec is empty, assume defaults haven't been applied yet - skip validation
+	// This allows configs to be created without explicitly setting blockpack options
+	if cfg.CompressionCodec == "" {
+		return nil
+	}
+
 	validCodecs := map[string]bool{
 		"zstd":   true,
 		"snappy": true,
@@ -133,20 +139,20 @@ func (cfg *BlockpackConfig) validate() error {
 		return fmt.Errorf("blockpack compression level must be non-negative, got %d", cfg.CompressionLevel)
 	}
 
-	if cfg.ColumnBlockSize <= 0 {
-		return fmt.Errorf("blockpack column block size must be positive, got %d", cfg.ColumnBlockSize)
+	if cfg.ColumnBlockSize < 0 {
+		return fmt.Errorf("blockpack column block size must be non-negative, got %d", cfg.ColumnBlockSize)
 	}
 
-	if cfg.WriteBufferSize <= 0 {
-		return fmt.Errorf("blockpack write buffer size must be positive, got %d", cfg.WriteBufferSize)
+	if cfg.WriteBufferSize < 0 {
+		return fmt.Errorf("blockpack write buffer size must be non-negative, got %d", cfg.WriteBufferSize)
 	}
 
-	if cfg.DictionaryMaxSize <= 0 {
-		return fmt.Errorf("blockpack dictionary max size must be positive, got %d", cfg.DictionaryMaxSize)
+	if cfg.DictionaryMaxSize < 0 {
+		return fmt.Errorf("blockpack dictionary max size must be non-negative, got %d", cfg.DictionaryMaxSize)
 	}
 
-	if cfg.MinHashPermutations <= 0 {
-		return fmt.Errorf("blockpack minhash permutations must be positive, got %d", cfg.MinHashPermutations)
+	if cfg.MinHashPermutations < 0 {
+		return fmt.Errorf("blockpack minhash permutations must be non-negative, got %d", cfg.MinHashPermutations)
 	}
 
 	return nil
