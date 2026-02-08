@@ -1072,7 +1072,7 @@ github.com/mark3labs/mcp-go/client/transport
 github.com/mark3labs/mcp-go/mcp
 github.com/mark3labs/mcp-go/server
 github.com/mark3labs/mcp-go/util
-# github.com/mattdurham/blockpack v0.0.0 => /home/matt/source/blockpack
+# github.com/mattdurham/blockpack v0.0.0-00010101000000-000000000000 => /home/matt/source/blockpack
 ## explicit; go 1.25.1
 github.com/mattdurham/blockpack/blockpack/encodings
 github.com/mattdurham/blockpack/blockpack/io
