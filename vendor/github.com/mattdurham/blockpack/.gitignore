@@ -1,0 +1,59 @@
+# Test data files
+cmd/temposerver/testdata/*.blockpack
+*.pb
+*.blockpack
+*.analysis.md
+traces.parquet/
+traces-prefix.*
+traces/
+*.bloom
+dev/null/
+real_world_comparison/*.parquet/
+
+# Benchmark artifacts
+benchmark/unified.txt
+benchmark/cost_analysis.txt
+
+# Binaries (at root level)
+/temposerver
+/formatbenchmark
+/convert-pb
+/otlpconvert
+/analyze
+/benchmark-cost-analysis
+/generate_unified_report
+/ingest-sorted
+
+# Binaries in cmd subdirectories (exclude main.go)
+cmd/*/[a-z]*
+!cmd/*/main.go
+!cmd/*/README.md
+!cmd/*/*.go
+/generate-report
+
+# Go build artifacts
+*.test
+*.out
+bin/
+
+# Bot reports and working documents
+bot/
+bots/
+
+# Profiling files
+*.prof
+*.pprof
+cpu.prof
+mem.prof
+block.prof
+mutex.prof
+goroutine.prof
+heap.prof
+traces.blockpack.all
+traces.blockpack.old
+
+# Additional binaries and test data
+/measure_actual_distribution
+/trace_plan
+traces.blockpack.v*
+traces.parquet

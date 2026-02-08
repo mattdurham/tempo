@@ -8,7 +8,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/encoding/common"
-	blockpackio "github.com/mattdurham/blockpack/blockpack/io"
+	"github.com/mattdurham/blockpack"
 )
 
 // CreateBlock creates a new blockpack block from an iterator
@@ -30,7 +30,7 @@ func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.Blo
 		}
 	}
 
-	writer := blockpackio.NewWriter(maxSpans)
+	writer := blockpack.NewWriter(maxSpans)
 
 	// Iterate through all traces and add to blockpack
 	traceCount := 0

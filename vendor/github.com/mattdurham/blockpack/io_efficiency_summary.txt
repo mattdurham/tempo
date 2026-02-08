@@ -1,0 +1,57 @@
+===========================================
+I/O EFFICIENCY ANALYSIS - Object Storage Chattiness
+===========================================
+
+Higher bytes/io = MORE EFFICIENT (fewer, larger reads - better for object storage)
+Lower bytes/io = LESS EFFICIENT (many small reads - expensive for object storage)
+
+TOP 10 MOST EFFICIENT QUERIES (Best for Object Storage):
+---------------------------------------------------------
+1. database-operations:          4,700,462 bytes/io  (  2 I/O ops) ⭐⭐⭐
+2. shipping-service-operations:  1,916,621 bytes/io  (  5 I/O ops) ⭐⭐⭐
+3. http-errors:                  1,237,102 bytes/io  (  8 I/O ops) ⭐⭐⭐
+4. payment-operations:             903,138 bytes/io  ( 11 I/O ops) ⭐⭐
+5. redis-operations:               451,596 bytes/io  ( 23 I/O ops) ⭐⭐
+6. checkout-operations:            416,617 bytes/io  ( 26 I/O ops) ⭐⭐
+7. slow-frontend-requests:         337,655 bytes/io  ( 31 I/O ops) ⭐
+8. ad-service-operations:          286,057 bytes/io  ( 41 I/O ops) ⭐
+9. post-requests:                  234,733 bytes/io  ( 56 I/O ops) ⭐
+10. currency-service-spans:        213,321 bytes/io  ( 56 I/O ops) ⭐
+
+TOP 10 LEAST EFFICIENT QUERIES (Concerning for Object Storage):
+---------------------------------------------------------------
+1. platinum_us_west:                8,460 bytes/io  (2,415 I/O ops) ⚠️⚠️⚠️
+2. gold_us_west:                   20,387 bytes/io  (2,929 I/O ops) ⚠️⚠️
+3. us_west_region:                 31,363 bytes/io  (2,348 I/O ops) ⚠️⚠️
+4. filter_shop_namespace:          31,344 bytes/io  (1,694 I/O ops) ⚠️⚠️
+5. filter_by_http_status_200:      32,883 bytes/io  (1,517 I/O ops) ⚠️
+6. gold_customers:                 32,538 bytes/io  (1,757 I/O ops) ⚠️
+7. regex_article_operations:       34,036 bytes/io  (1,133 I/O ops) ⚠️
+8. filter_by_service_shop:         34,887 bytes/io  (1,037 I/O ops) ⚠️
+9. filter_by_http_method_post:     39,801 bytes/io  (  674 I/O ops) ⚠️
+10. filter_authenticate_operation: 39,509 bytes/io  (  752 I/O ops) ⚠️
+
+FORMAT COMPARISON HIGHLIGHTS:
+-----------------------------
+full_scan:              85,686 bytes/io  (  784 I/O ops)
+filter_billing_service: 114,984 bytes/io (   98 I/O ops) - Very efficient!
+filter_payment_operation: 114,981 bytes/io (   98 I/O ops) - Very efficient!
+
+KEY FINDINGS:
+-------------
+1. Simple equality filters (billing, payment) are extremely efficient: ~115KB per I/O
+2. Region-based filters have high I/O chattiness: 8-31KB per I/O with 1,500-3,000 ops
+3. Service-based queries vary widely: 2 ops (database) to 2,929 ops (gold_us_west)
+4. Regex and namespace filters tend to be chatty: 31-34KB per I/O
+
+RECOMMENDATIONS:
+----------------
+⚠️  HIGH PRIORITY: Investigate platinum_us_west and gold_us_west queries
+    - These make 2,400-2,900 I/O operations with only 8-20KB per operation
+    - Potential optimization: Better block pruning or larger read buffering
+
+✅ GOOD PATTERNS: Simple attribute filters (billing, payment, database operations)
+    - These achieve excellent I/O efficiency with very few operations
+
+📊 BASELINE: Full scan does 784 operations at ~86KB per operation
+    - Use this as reference for comparing query efficiency

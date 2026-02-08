@@ -1,0 +1,53 @@
+version: '3.8'
+
+services:
+  temposerver:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: temposerver
+    ports:
+      - "3200:3200"
+    volumes:
+      - ./cmd/temposerver/testdata:/testdata:ro
+    command: ["--data-dir=/testdata", "--port=3200"]
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3200/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    networks:
+      - tempo-network
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_AUTH_DISABLE_LOGIN_FORM=true
+      # Disable features that might use gRPC
+      - GF_FEATURE_TOGGLES_ENABLE=
+      # Set log level for debugging (optional)
+      - GF_LOG_LEVEL=info
+      # Force HTTP/1.1 for backend requests
+      - GF_DATABASE_MAX_IDLE_CONN=2
+      - GF_DATABASE_MAX_OPEN_CONN=0
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+    depends_on:
+      temposerver:
+        condition: service_healthy
+    networks:
+      - tempo-network
+
+volumes:
+  grafana-data:
+
+networks:
+  tempo-network:
+    driver: bridge
