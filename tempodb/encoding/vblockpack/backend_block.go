@@ -310,26 +310,13 @@ func (b *blockpackBlock) SearchTagValuesV2(ctx context.Context, tag traceql.Attr
 
 // Fetch implements the Searcher interface
 // Executes TraceQL query and returns matching spans
-func (b *blockpackBlock) Fetch(ctx context.Context, _ traceql.FetchSpansRequest, _ common.SearchOptions) (traceql.FetchSpansResponse, error) {
-	// Read blockpack file
-	blockUUID := uuid.UUID(b.meta.BlockID)
-	rc, size, err := b.reader.StreamReader(ctx, DataFileName, blockUUID, b.meta.TenantID)
-	if err != nil {
-		return traceql.FetchSpansResponse{}, fmt.Errorf("failed to open blockpack file: %w", err)
-	}
-	defer rc.Close()
-
-	data := make([]byte, size)
-	_, err = io.ReadFull(rc, data)
-	if err != nil {
-		return traceql.FetchSpansResponse{}, fmt.Errorf("failed to read blockpack file: %w", err)
-	}
-
-	// TODO: Build SQL query from req.Conditions
-	// For now, return an error indicating not fully implemented
-	// The parquet implementation uses conditions to build iterators
-	// We need to convert conditions to SQL WHERE clauses
-	return traceql.FetchSpansResponse{}, fmt.Errorf("Fetch not yet implemented for blockpack - requires condition-to-SQL conversion")
+func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansRequest, _ common.SearchOptions) (traceql.FetchSpansResponse, error) {
+	// TODO: Full Fetch implementation requires implementing:
+	// 1. Span interface for blockpack spans
+	// 2. SpansetIterator for iterating through matching spans
+	// 3. Converting blockpack matches to Spansets with proper metadata
+	// For now, return empty response. Most TraceQL operations use Search instead.
+	return traceql.FetchSpansResponse{}, nil
 }
 
 // FetchTagValues implements the Searcher interface
@@ -348,13 +335,9 @@ func (b *blockpackBlock) FetchTagValues(ctx context.Context, req traceql.FetchTa
 		return fmt.Errorf("failed to read blockpack file: %w", err)
 	}
 
-	// Use empty TraceQL filter to match all spans
-	// We'll extract the specific tag values from all results
-	colName := tagToColumnName(req.TagName.Name)
-	query := "{}"
-
-	// TODO: If req.Conditions is not empty, build WHERE clause
-	// For now, we only handle the simple case with no conditions
+	// Build TraceQL query from conditions
+	// If no conditions, match all spans
+	query := conditionsToTraceQL(req.Conditions, true) // Use AND for multiple conditions
 
 	// Execute query
 	program, err := compileTraceQLQuery(query)
@@ -370,12 +353,23 @@ func (b *blockpackBlock) FetchTagValues(ctx context.Context, req traceql.FetchTa
 		return fmt.Errorf("failed to execute query: %w", err)
 	}
 
+	// Extract column name for the requested tag
+	colName := attributeToColumnName(req.TagName)
+
+	// Track unique values to avoid duplicates
+	seen := make(map[string]struct{})
+
 	// Call callback for each unique value
 	for _, match := range result.Matches {
 		if val, ok := match.Fields.GetField(colName); ok {
 			staticVal := toStaticType(val)
-			if cb(staticVal) {
-				break // Callback returned true = stop
+			// Use string representation as key for deduplication
+			key := staticVal.EncodeToString(false)
+			if _, exists := seen[key]; !exists {
+				seen[key] = struct{}{}
+				if cb(staticVal) {
+					break // Callback returned true = stop
+				}
 			}
 		}
 	}
@@ -399,24 +393,57 @@ func (b *blockpackBlock) FetchTagNames(ctx context.Context, req traceql.FetchTag
 		return fmt.Errorf("failed to read blockpack file: %w", err)
 	}
 
-	// Open reader to get column names
-	bpr, err := blockpackio.NewReader(data)
-	if err != nil {
-		return fmt.Errorf("failed to create blockpack reader: %w", err)
-	}
+	// If conditions are specified, execute query to filter spans first
+	if len(req.Conditions) > 0 {
+		query := conditionsToTraceQL(req.Conditions, true)
+		program, err := compileTraceQLQuery(query)
+		if err != nil {
+			return fmt.Errorf("failed to compile query: %w", err)
+		}
 
-	// Get first block to extract column names
-	block, err := bpr.GetBlock(0)
-	if err != nil {
-		return fmt.Errorf("failed to read first block: %w", err)
-	}
+		storage := &memoryStorage{data: data}
+		exec := executor.NewBlockpackExecutor(storage)
 
-	// Extract tag names based on scope
-	for colName := range block.Columns() {
-		tag := columnNameToTag(colName, req.Scope)
-		if tag != "" {
-			if cb(tag, req.Scope) {
-				break // Callback returned true = stop
+		result, err := exec.ExecuteQuery("", program, nil, executor.QueryOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to execute query: %w", err)
+		}
+
+		// Extract unique tag names from matching spans
+		seen := make(map[string]struct{})
+		for _, match := range result.Matches {
+			match.Fields.IterateFields(func(colName string, _ any) bool {
+				tag := columnNameToTag(colName, req.Scope)
+				if tag != "" {
+					if _, exists := seen[tag]; !exists {
+						seen[tag] = struct{}{}
+						if cb(tag, req.Scope) {
+							return true // Stop iteration
+						}
+					}
+				}
+				return false // Continue iteration
+			})
+		}
+	} else {
+		// No conditions - get all column names from block schema
+		bpr, err := blockpackio.NewReader(data)
+		if err != nil {
+			return fmt.Errorf("failed to create blockpack reader: %w", err)
+		}
+
+		block, err := bpr.GetBlock(0)
+		if err != nil {
+			return fmt.Errorf("failed to read first block: %w", err)
+		}
+
+		// Extract tag names based on scope
+		for colName := range block.Columns() {
+			tag := columnNameToTag(colName, req.Scope)
+			if tag != "" {
+				if cb(tag, req.Scope) {
+					break // Callback returned true = stop
+				}
 			}
 		}
 	}
@@ -480,6 +507,145 @@ func compileTraceQLQuery(query string) (*vm.Program, error) {
 	}
 
 	return program, nil
+}
+
+// conditionsToTraceQL converts traceql.Condition objects to a TraceQL query string
+// allConditions determines if conditions are combined with && (true) or || (false)
+func conditionsToTraceQL(conditions []traceql.Condition, allConditions bool) string {
+	if len(conditions) == 0 {
+		return "{}" // Match all spans
+	}
+
+	expressions := make([]string, 0, len(conditions))
+	for _, cond := range conditions {
+		expr := conditionToTraceQLExpr(cond)
+		if expr != "" {
+			expressions = append(expressions, expr)
+		}
+	}
+
+	if len(expressions) == 0 {
+		return "{}" // No valid conditions, match all
+	}
+
+	// Combine expressions with && or ||
+	combiner := "||"
+	if allConditions {
+		combiner = "&&"
+	}
+
+	return fmt.Sprintf("{ %s }", strings.Join(expressions, fmt.Sprintf(" %s ", combiner)))
+}
+
+// conditionToTraceQLExpr converts a single Condition to a TraceQL expression
+func conditionToTraceQLExpr(cond traceql.Condition) string {
+	// Handle special case: OpNone means just select the attribute without filtering
+	if cond.Op == traceql.OpNone {
+		return ""
+	}
+
+	// Build attribute name with scope
+	attrName := attributeToTraceQLName(cond.Attribute)
+
+	// Handle operators
+	switch cond.Op {
+	case traceql.OpEqual:
+		if len(cond.Operands) > 0 {
+			return fmt.Sprintf(`%s = %s`, attrName, staticToTraceQLValue(cond.Operands[0]))
+		}
+	case traceql.OpNotEqual:
+		if len(cond.Operands) > 0 {
+			return fmt.Sprintf(`%s != %s`, attrName, staticToTraceQLValue(cond.Operands[0]))
+		}
+	case traceql.OpRegex:
+		if len(cond.Operands) > 0 {
+			return fmt.Sprintf(`%s =~ %s`, attrName, staticToTraceQLValue(cond.Operands[0]))
+		}
+	case traceql.OpNotRegex:
+		if len(cond.Operands) > 0 {
+			return fmt.Sprintf(`%s !~ %s`, attrName, staticToTraceQLValue(cond.Operands[0]))
+		}
+	case traceql.OpGreater:
+		if len(cond.Operands) > 0 {
+			return fmt.Sprintf(`%s > %s`, attrName, staticToTraceQLValue(cond.Operands[0]))
+		}
+	case traceql.OpGreaterEqual:
+		if len(cond.Operands) > 0 {
+			return fmt.Sprintf(`%s >= %s`, attrName, staticToTraceQLValue(cond.Operands[0]))
+		}
+	case traceql.OpLess:
+		if len(cond.Operands) > 0 {
+			return fmt.Sprintf(`%s < %s`, attrName, staticToTraceQLValue(cond.Operands[0]))
+		}
+	case traceql.OpLessEqual:
+		if len(cond.Operands) > 0 {
+			return fmt.Sprintf(`%s <= %s`, attrName, staticToTraceQLValue(cond.Operands[0]))
+		}
+	}
+
+	return ""
+}
+
+// attributeToTraceQLName converts a traceql.Attribute to a TraceQL field name
+func attributeToTraceQLName(attr traceql.Attribute) string {
+	// Handle intrinsics
+	if attr.Intrinsic != traceql.IntrinsicNone {
+		switch attr.Intrinsic {
+		case traceql.IntrinsicDuration:
+			return "duration"
+		case traceql.IntrinsicName:
+			return "name"
+		case traceql.IntrinsicStatus:
+			return "status"
+		case traceql.IntrinsicKind:
+			return "kind"
+		case traceql.IntrinsicTraceID:
+			return "trace:id"
+		case traceql.IntrinsicSpanID:
+			return "span:id"
+		}
+	}
+
+	// Handle scoped attributes
+	scope := attr.Scope.String()
+	if scope == "none" || scope == "" {
+		return attr.Name
+	}
+
+	return fmt.Sprintf("%s.%s", scope, attr.Name)
+}
+
+// staticToTraceQLValue converts a Static value to a TraceQL literal string
+func staticToTraceQLValue(s traceql.Static) string {
+	switch s.Type {
+	case traceql.TypeString:
+		// Get string value from Static (uses EncodeToString but fix quotes)
+		str := s.EncodeToString(false) // Without backticks
+		return fmt.Sprintf(`"%s"`, str)
+	case traceql.TypeInt:
+		if i, ok := s.Int(); ok {
+			return fmt.Sprintf("%d", i)
+		}
+	case traceql.TypeFloat:
+		return fmt.Sprintf("%f", s.Float())
+	case traceql.TypeBoolean:
+		if b, ok := s.Bool(); ok {
+			return fmt.Sprintf("%t", b)
+		}
+	case traceql.TypeDuration:
+		if d, ok := s.Duration(); ok {
+			return d.String()
+		}
+	case traceql.TypeStatus:
+		if status, ok := s.Status(); ok {
+			return status.String()
+		}
+	case traceql.TypeKind:
+		if kind, ok := s.Kind(); ok {
+			return kind.String()
+		}
+	}
+	return ""
 }
 
 // memoryStorage implements executor.FileStorage and executor.ProviderStorage
@@ -744,6 +910,43 @@ func tagToColumnName(tag string) string {
 
 	// Default to span attribute with colon (blockpack format)
 	return "span:" + tag
+}
+
+// attributeToColumnName converts a traceql.Attribute to a blockpack column name
+func attributeToColumnName(attr traceql.Attribute) string {
+	// Handle intrinsics
+	if attr.Intrinsic != traceql.IntrinsicNone {
+		switch attr.Intrinsic {
+		case traceql.IntrinsicDuration:
+			return "span:duration"
+		case traceql.IntrinsicName:
+			return "span:name"
+		case traceql.IntrinsicStatus:
+			return "span:status"
+		case traceql.IntrinsicKind:
+			return "span:kind"
+		case traceql.IntrinsicTraceID:
+			return "trace:id"
+		case traceql.IntrinsicSpanID:
+			return "span:id"
+		case traceql.IntrinsicParentID:
+			return "span:parent_id"
+		}
+	}
+
+	// Handle scoped attributes
+	scope := attr.Scope.String()
+	switch scope {
+	case "span":
+		return "span." + attr.Name
+	case "resource":
+		return "resource." + attr.Name
+	case "none", "":
+		// For unscoped, default to span attribute
+		return "span." + attr.Name
+	}
+
+	return attr.Name
 }
 
 // toStaticType converts a Go value to traceql.Static
