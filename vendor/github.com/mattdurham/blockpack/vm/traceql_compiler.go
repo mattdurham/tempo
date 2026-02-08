@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"encoding/hex"
 	"fmt"
 	"strings"
 
@@ -91,6 +92,13 @@ func normalizeAttributePath(scope, name string) string {
 		return "span:start"
 	case "end", "span.end":
 		return "span:end"
+	// Handle trace-level intrinsics
+	case "trace.id":
+		return "trace:id"
+	case "span.id":
+		return "span:id"
+	case "span.parent_id":
+		return "span:parent_id"
 	}
 
 	// Handle well-known resource attributes
@@ -211,8 +219,24 @@ func (c *traceqlCompiler) compileComparison(expr *traceql.BinaryExpr) error {
 
 	// Normalize attribute path using canonical mapping
 	fullAttrName := normalizeAttributePath(fieldExpr.Scope, fieldExpr.Name)
+
+	// Special handling for hex bytes attributes (trace:id, span:id)
+	// Decode hex strings to bytes for proper comparison
+	decodedLiteral := literalExpr
+	if isHexBytesAttribute(fullAttrName) && literalExpr.Type == traceql.LitString {
+		if hexStr, ok := literalExpr.Value.(string); ok {
+			if decoded, err := hex.DecodeString(hexStr); err == nil {
+				// Create new literal with decoded bytes
+				decodedLiteral = &traceql.LiteralExpr{
+					Value: decoded,
+					Type:  traceql.LitString, // Keep as string type but with bytes value
+				}
+			}
+		}
+	}
+
 	attrIdx := c.addAttribute(fullAttrName)
-	constIdx := c.addConstantFromLiteral(literalExpr)
+	constIdx := c.addConstantFromLiteral(decodedLiteral)
 	operator := expr.Op
 
 	c.emit(func(vm *VM) int {
@@ -254,17 +278,29 @@ func (c *traceqlCompiler) compileLiteralExpr(lit *traceql.LiteralExpr) error {
 // addConstantFromLiteral adds a constant from a TraceQL LiteralExpr, preserving semantic type information.
 // This is critical for correct comparisons (e.g., duration > 100ms).
 func (c *traceqlCompiler) addConstantFromLiteral(lit *traceql.LiteralExpr) int {
-	if idx, exists := c.constMap[lit.Value]; exists {
+	// Create a hashable key for the constants map
+	// For []byte values, convert to string for map key
+	mapKey := lit.Value
+	if bytes, ok := lit.Value.([]byte); ok {
+		mapKey = string(bytes)
+	}
+
+	if idx, exists := c.constMap[mapKey]; exists {
 		return idx
 	}
 
 	idx := len(c.program.Constants)
-	c.constMap[lit.Value] = idx
+	c.constMap[mapKey] = idx
 
 	var vmValue Value
 	switch lit.Type {
 	case traceql.LitString:
-		vmValue = Value{Type: TypeString, Data: lit.Value.(string)}
+		// Check if value is []byte (from hex decoding)
+		if bytes, ok := lit.Value.([]byte); ok {
+			vmValue = Value{Type: TypeBytes, Data: bytes}
+		} else {
+			vmValue = Value{Type: TypeString, Data: lit.Value.(string)}
+		}
 	case traceql.LitInt:
 		vmValue = Value{Type: TypeInt, Data: lit.Value.(int64)}
 	case traceql.LitFloat:
@@ -532,20 +568,21 @@ func (c *traceqlCompiler) compileColumnPredicateComparison(expr *traceql.BinaryE
 		return nil, fmt.Errorf("comparison right side must be literal, got %T", expr.Right)
 	}
 
-	// Expand shorthand
-	scope := fieldExpr.Scope
-	if scope == "" {
-		scope = "span"
-	}
-
-	var attrName string
-	if strings.HasPrefix(fieldExpr.Name, ":") {
-		attrName = scope + fieldExpr.Name
-	} else {
-		attrName = scope + "." + fieldExpr.Name
-	}
+	// Normalize attribute name using canonical mapping
+	attrName := normalizeAttributePath(fieldExpr.Scope, fieldExpr.Name)
 
 	value := literalExpr.Value
+
+	// Special handling for hex bytes attributes (trace:id, span:id)
+	// Decode hex strings to bytes for proper comparison
+	if isHexBytesAttribute(attrName) {
+		if hexStr, ok := value.(string); ok {
+			if decoded, err := hex.DecodeString(hexStr); err == nil {
+				value = decoded
+			}
+		}
+	}
+
 	operator := expr.Op
 
 	// Generate appropriate column scan
@@ -577,4 +614,14 @@ func (c *traceqlCompiler) compileColumnPredicateComparison(expr *traceql.BinaryE
 			return nil, fmt.Errorf("unsupported operator: %s", operator.String())
 		}
 	}, nil
+}
+
+// isHexBytesAttribute checks if an attribute stores hex-encoded bytes (trace:id, span:id)
+func isHexBytesAttribute(path string) bool {
+	switch path {
+	case "trace:id", "span:id", "span:parent_id":
+		return true
+	default:
+		return false
+	}
 }

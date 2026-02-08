@@ -17,7 +17,8 @@ import (
 	"github.com/grafana/tempo/tempodb/encoding/common"
 	blockpackio "github.com/mattdurham/blockpack/blockpack/io"
 	"github.com/mattdurham/blockpack/executor"
-	"github.com/mattdurham/blockpack/sql"
+	blockpacktraceql "github.com/mattdurham/blockpack/traceql"
+	"github.com/mattdurham/blockpack/vm"
 )
 
 type blockpackBlock struct {
@@ -66,13 +67,14 @@ func (b *blockpackBlock) FindTraceByID(ctx context.Context, id common.ID, _ comm
 		return nil, fmt.Errorf("incomplete read: %d != %d", n, size)
 	}
 
-	// Build SQL query to find all spans for this trace
-	query := fmt.Sprintf(`SELECT * FROM spans WHERE "trace:id" = '%s'`, traceIDHex)
+	// Build TraceQL query to find all spans for this trace
+	// Use explicit column name with colon notation (passes through normalization)
+	query := fmt.Sprintf(`{ trace:id = "%s" }`, traceIDHex)
 
-	// Compile query
-	program, err := sql.CompileTraceQLOrSQL(query)
+	// Compile TraceQL directly to VM program (bypasses SQL)
+	program, err := compileTraceQLQuery(query)
 	if err != nil {
-		return nil, fmt.Errorf("failed to compile query: %w", err)
+		return nil, fmt.Errorf("failed to compile TraceQL query: %w", err)
 	}
 
 	// Create blockpack executor with in-memory storage
@@ -122,10 +124,10 @@ func (b *blockpackBlock) Search(ctx context.Context, req *tempopb.SearchRequest,
 	// Build SQL query from SearchRequest
 	query := buildSearchQuery(req)
 
-	// Compile and execute
-	program, err := sql.CompileTraceQLOrSQL(query)
+	// Compile TraceQL directly to VM program
+	program, err := compileTraceQLQuery(query)
 	if err != nil {
-		return nil, fmt.Errorf("failed to compile query: %w", err)
+		return nil, fmt.Errorf("failed to compile TraceQL query: %w", err)
 	}
 
 	storage := &memoryStorage{data: data}
@@ -219,13 +221,13 @@ func (b *blockpackBlock) SearchTagValues(ctx context.Context, tag string, cb com
 		return fmt.Errorf("failed to read blockpack file: %w", err)
 	}
 
-	// Build SQL query - use SELECT * since blockpack only supports SELECT * queries
+	// Use empty TraceQL query to match all spans, then extract tag values
 	// Tag names like "service.name" become column names like "resource.service.name"
 	colName := tagToColumnName(tag)
-	query := "SELECT * FROM spans"
+	query := ""
 
 	// Compile and execute query
-	program, err := sql.CompileTraceQLOrSQL(query)
+	program, err := compileTraceQLQuery(query)
 	if err != nil {
 		return fmt.Errorf("failed to compile query: %w", err)
 	}
@@ -271,11 +273,11 @@ func (b *blockpackBlock) SearchTagValuesV2(ctx context.Context, tag traceql.Attr
 
 	// Convert traceql.Attribute to column name
 	colName := tagToColumnName(tag.Name)
-	// Use SELECT * since blockpack only supports SELECT * queries
-	query := "SELECT * FROM spans"
+	// Use empty TraceQL query to match all spans (no braces needed for empty)
+	query := ""
 
 	// Compile and execute query
-	program, err := sql.CompileTraceQLOrSQL(query)
+	program, err := compileTraceQLQuery(query)
 	if err != nil {
 		return fmt.Errorf("failed to compile query: %w", err)
 	}
@@ -346,15 +348,16 @@ func (b *blockpackBlock) FetchTagValues(ctx context.Context, req traceql.FetchTa
 		return fmt.Errorf("failed to read blockpack file: %w", err)
 	}
 
-	// Build query for distinct tag values
+	// Use empty TraceQL filter to match all spans
+	// We'll extract the specific tag values from all results
 	colName := tagToColumnName(req.TagName.Name)
-	query := fmt.Sprintf(`SELECT DISTINCT "%s" FROM spans`, colName)
+	query := "{}"
 
 	// TODO: If req.Conditions is not empty, build WHERE clause
 	// For now, we only handle the simple case with no conditions
 
 	// Execute query
-	program, err := sql.CompileTraceQLOrSQL(query)
+	program, err := compileTraceQLQuery(query)
 	if err != nil {
 		return fmt.Errorf("failed to compile query: %w", err)
 	}
@@ -448,6 +451,35 @@ func (b *blockpackBlock) Validate(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// compileTraceQLQuery compiles a TraceQL query string directly to VM program
+// Uses the new direct TraceQL → VM compiler, bypassing SQL entirely
+func compileTraceQLQuery(query string) (*vm.Program, error) {
+	// Parse TraceQL to AST
+	result, err := blockpacktraceql.ParseTraceQL(query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse TraceQL: %w", err)
+	}
+
+	// Handle filter expression (can be nil for match-all)
+	var filter *blockpacktraceql.FilterExpression
+	if result != nil {
+		var ok bool
+		filter, ok = result.(*blockpacktraceql.FilterExpression)
+		if !ok {
+			return nil, fmt.Errorf("expected FilterExpression, got %T", result)
+		}
+	}
+
+	// Compile directly to VM program (bypasses SQL)
+	// CompileTraceQLFilter handles nil filter as match-all
+	program, err := vm.CompileTraceQLFilter(filter)
+	if err != nil {
+		return nil, fmt.Errorf("failed to compile TraceQL to VM: %w", err)
+	}
+
+	return program, nil
 }
 
 // memoryStorage implements executor.FileStorage and executor.ProviderStorage
@@ -734,33 +766,47 @@ func toStaticType(val interface{}) traceql.Static {
 	}
 }
 
-// buildSearchQuery converts a SearchRequest to SQL
+// columnNameToTraceQLAttr converts a blockpack column name to TraceQL attribute format
+// e.g., "span:name" -> "name", "resource.service.name" -> "resource.service.name"
+func columnNameToTraceQLAttr(tag string) string {
+	// If already a column name with colon, convert to TraceQL format
+	if strings.HasPrefix(tag, "span:") {
+		return strings.TrimPrefix(tag, "span:")
+	}
+	if strings.HasPrefix(tag, "resource.") {
+		return tag // Keep resource attributes as-is
+	}
+	// Otherwise assume it's already in TraceQL format
+	return tag
+}
+
+// buildSearchQuery converts a SearchRequest to TraceQL
 func buildSearchQuery(req *tempopb.SearchRequest) string {
 	conditions := make([]string, 0)
 
 	// Add tag filters
 	for key, value := range req.Tags {
-		colName := tagToColumnName(key)
-		conditions = append(conditions, fmt.Sprintf(`"%s" LIKE '%%%s%%'`, colName, value))
+		// TraceQL uses dot notation for attributes
+		// Convert column name format to TraceQL attribute format
+		attr := columnNameToTraceQLAttr(key)
+		// TraceQL string comparison uses =~ for regex/contains
+		conditions = append(conditions, fmt.Sprintf(`%s =~ ".*%s.*"`, attr, value))
 	}
 
 	// Add duration filters
 	if req.MinDurationMs > 0 {
-		minNanos := uint64(req.MinDurationMs) * 1000000
-		conditions = append(conditions, fmt.Sprintf(`("span:end" - "span:start") >= %d`, minNanos))
+		conditions = append(conditions, fmt.Sprintf(`duration >= %dms`, req.MinDurationMs))
 	}
 	if req.MaxDurationMs > 0 {
-		maxNanos := uint64(req.MaxDurationMs) * 1000000
-		conditions = append(conditions, fmt.Sprintf(`("span:end" - "span:start") <= %d`, maxNanos))
+		conditions = append(conditions, fmt.Sprintf(`duration <= %dms`, req.MaxDurationMs))
 	}
 
-	// Build final query
-	query := "SELECT * FROM spans"
-	if len(conditions) > 0 {
-		query += " WHERE " + strings.Join(conditions, " AND ")
+	// Build final TraceQL query
+	if len(conditions) == 0 {
+		return "" // Empty query matches all spans
 	}
 
-	return query
+	return fmt.Sprintf("{ %s }", strings.Join(conditions, " && "))
 }
 
 // buildTraceMetadata creates trace search metadata from span matches
