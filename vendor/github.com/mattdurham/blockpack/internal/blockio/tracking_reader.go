@@ -38,13 +38,13 @@ func (t *TrackingReaderProvider) Size() (int64, error) {
 	return t.underlying.Size()
 }
 
-func (t *TrackingReaderProvider) ReadAt(p []byte, off int64) (int, error) {
+func (t *TrackingReaderProvider) ReadAt(p []byte, off int64, dataType DataType) (int, error) {
 	// Simulate object storage latency (e.g., S3 first-byte latency)
 	if latency := atomic.LoadInt64(&t.latency); latency > 0 {
 		time.Sleep(time.Duration(latency))
 	}
 
-	n, err := t.underlying.ReadAt(p, off)
+	n, err := t.underlying.ReadAt(p, off, dataType)
 	// Track I/O operation count regardless of bytes read
 	// This is important for object storage where each operation has latency/cost
 	atomic.AddInt64(&t.ioOperations, 1)

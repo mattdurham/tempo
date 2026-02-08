@@ -2,8 +2,8 @@ package blockio
 
 import (
 	"bytes"
-	"github.com/klauspost/compress/zstd"
 	"fmt"
+	"github.com/klauspost/compress/zstd"
 
 	"github.com/mattdurham/blockpack/internal/encodings"
 )
@@ -28,7 +28,7 @@ func (cb *columnBuilder) buildUint64Data(buf *bytes.Buffer, spanCount, presentCo
 	// Analyze whether delta encoding would be beneficial using pre-computed min/max from stats
 	if shouldUseDeltaEncoding(cb.uintValues, cb.present, spanCount, cb.stats.uintMin, cb.stats.uintMax) {
 		return encodings.BuildDeltaUint64(
-		encoder,
+			encoder,
 			buf,
 			spanCount,
 			presenceRLE,

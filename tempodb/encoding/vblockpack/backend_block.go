@@ -36,8 +36,9 @@ func (s *tempoStorage) Size(path string) (int64, error) {
 	return size, nil
 }
 
-func (s *tempoStorage) ReadAt(path string, p []byte, off int64) (int, error) {
+func (s *tempoStorage) ReadAt(path string, p []byte, off int64, dataType blockpack.DataType) (int, error) {
 	// Path is ignored - we always read from our specific block
+	// dataType is a hint for caching optimization - we ignore it for now
 	// Validate offset
 	if off < 0 {
 		return 0, fmt.Errorf("negative offset: %d", off)
@@ -594,7 +595,8 @@ func (p *bytesReaderProvider) Size() (int64, error) {
 	return int64(len(p.data)), nil
 }
 
-func (p *bytesReaderProvider) ReadAt(b []byte, off int64) (int, error) {
+func (p *bytesReaderProvider) ReadAt(b []byte, off int64, dataType blockpack.DataType) (int, error) {
+	// dataType is a hint for caching optimization - we ignore it for in-memory data
 	if off < 0 || off >= int64(len(p.data)) {
 		return 0, io.EOF
 	}

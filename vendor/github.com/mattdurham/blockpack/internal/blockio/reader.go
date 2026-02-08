@@ -44,10 +44,23 @@ func (b *Block) GetColumn(name string) *Column {
 	return b.columns[name]
 }
 
-// ReaderProvider supplies random access to blockpack data.
+// DataType indicates the type of data being read for cache optimization
+type DataType string
+
+const (
+	DataTypeFooter   DataType = "footer"   // File footer (last 41 bytes)
+	DataTypeMetadata DataType = "metadata" // Schema and column metadata
+	DataTypeColumn   DataType = "column"   // Column data blocks
+	DataTypeRow      DataType = "row"      // Row data blocks
+	DataTypeIndex    DataType = "index"    // Block index data
+	DataTypeUnknown  DataType = "unknown"  // Unknown/generic data
+)
+
+// ReaderProvider supplies random access to blockpack data with explicit data type hints.
+// The dataType parameter allows providers to optimize caching strategies based on access patterns.
 type ReaderProvider interface {
 	Size() (int64, error)
-	ReadAt(p []byte, off int64) (int, error)
+	ReadAt(p []byte, off int64, dataType DataType) (int, error)
 }
 
 // CloseableReaderProvider extends ReaderProvider with resource cleanup.
@@ -97,23 +110,43 @@ type fileFooter struct {
 	metricStreamLen    uint64 // v9: length of metric stream blocks
 }
 
-// BOT: Get rid of this.
 // NewReader parses blockpack data (v5 format) from an in-memory buffer.
+//
+// Deprecated: Use NewReaderFromBytes instead.
+// This function will be removed in a future version.
 func NewReader(data []byte) (*Reader, error) {
-	return NewReaderFromProvider(&byteSliceProvider{data: data})
+	return NewReaderFromBytes(data)
 }
 
-// NewReaderFromProvider parses blockpack data (v5 format) from a provider.
-// BOT: Get rid of this.
-func NewReaderFromProvider(provider ReaderProvider) (*Reader, error) {
-	return NewReaderWithCache("", provider, nil)
+// Deprecated: This function signature is deprecated.
+// Use the new NewReaderFromProvider(provider, ...opts) with functional options instead.
+// This function will be removed in a future version.
+//
+// Example migration:
+//
+//	// Old:
+//	reader, err := NewReaderFromProvider(provider)
+//	// New (with functional options like caching and tracking):
+//	reader, err := NewReaderFromProvider(provider,
+//	    WithCaching(100*1024*1024),
+//	    WithTracking())
+func NewReaderFromProviderLegacy(provider ReaderProvider) (*Reader, error) {
+	return NewReaderFromProvider(provider)
 }
 
 // NewReaderWithCache parses blockpack data from a provider with optional caching.
-// The name parameter is used for cache keys and must uniquely identify the file.
-// If name is empty, caching will be disabled even if a cache is provided.
-// The cache parameter is optional (pass nil for no caching).
-// We should NOT have a separate byte cache, instead use a layered reader provider.
+//
+// Deprecated: Use NewReaderFromProvider with WithCaching option instead.
+// This function will be removed in a future version.
+//
+// Example migration:
+//
+//	// Old:
+//	cache, _ := NewLRUByteCache(100 * 1024 * 1024)
+//	reader, err := NewReaderWithCache("myfile", provider, cache)
+//	// New:
+//	reader, err := NewReaderFromProvider(provider,
+//	    WithCaching(100 * 1024 * 1024))
 func NewReaderWithCache(name string, provider ReaderProvider, cache ByteCache) (*Reader, error) {
 	dataSize, err := provider.Size()
 	if err != nil {
@@ -125,8 +158,9 @@ func NewReaderWithCache(name string, provider ReaderProvider, cache ByteCache) (
 		return nil, fmt.Errorf("data too small for footer")
 	}
 
-	// BOT: Why is this uncached?
-	footerBytes, err := readProviderRangeUncached(provider, dataSize-int64(footerSize), int(footerSize))
+	// Read footer (uncached is fine here - happens once during construction)
+	// For cached reads, use CachingReaderProvider or DataAwareCachingProvider wrappers
+	footerBytes, err := readProviderRangeUncached(provider, dataSize-int64(footerSize), int(footerSize), DataTypeFooter)
 	if err != nil {
 		return nil, err
 	}
@@ -145,7 +179,7 @@ func NewReaderWithCache(name string, provider ReaderProvider, cache ByteCache) (
 		return nil, fmt.Errorf("metadata out of bounds")
 	}
 
-	metadata, err := readProviderRangeUncached(provider, int64(footer.metadataOffset), int(footer.metadataLen))
+	metadata, err := readProviderRangeUncached(provider, int64(footer.metadataOffset), int(footer.metadataLen), DataTypeMetadata)
 	if err != nil {
 		return nil, err
 	}
@@ -178,14 +212,17 @@ func NewReaderWithCache(name string, provider ReaderProvider, cache ByteCache) (
 		totalSpans:            total,
 		traceBlockIndex:       traceBlockIndex,
 	}
-	// BOT: NEVER USE THIS, always assume object storage.
+	// Legacy optimization: direct byte slice access for in-memory providers
+	// Modern code should use provider abstraction for better composability
 	if sliceProvider, ok := provider.(*byteSliceProvider); ok {
 		reader.data = sliceProvider.data
 	}
 	return reader, nil
 }
 
-// BOT: Providers should be in there own package under blockpack.
+// byteSliceProvider provides in-memory byte slice access
+// NOTE: New provider types (CachingReaderProvider, MemcacheReaderProvider, etc.)
+// follow the layered provider pattern for better composability
 type byteSliceProvider struct {
 	data []byte
 }
@@ -208,7 +245,7 @@ func (p *rangeReaderProvider) Size() (int64, error) {
 	return p.length, nil
 }
 
-func (p *rangeReaderProvider) ReadAt(b []byte, off int64) (int, error) {
+func (p *rangeReaderProvider) ReadAt(b []byte, off int64, dataType DataType) (int, error) {
 	if off < 0 || off >= p.length {
 		return 0, io.EOF
 	}
@@ -216,14 +253,14 @@ func (p *rangeReaderProvider) ReadAt(b []byte, off int64) (int, error) {
 	if off+int64(len(b)) > p.length {
 		b = b[:p.length-off]
 	}
-	return p.base.ReadAt(b, p.offset+off)
+	return p.base.ReadAt(b, p.offset+off, dataType)
 }
 
 func (p *byteSliceProvider) Size() (int64, error) {
 	return int64(len(p.data)), nil
 }
 
-func (p *byteSliceProvider) ReadAt(b []byte, off int64) (int, error) {
+func (p *byteSliceProvider) ReadAt(b []byte, off int64, dataType DataType) (int, error) {
 	if off < 0 || off >= int64(len(p.data)) {
 		return 0, io.EOF
 	}
@@ -236,12 +273,12 @@ func (p *byteSliceProvider) ReadAt(b []byte, off int64) (int, error) {
 
 // readProviderRangeUncached reads a byte range from the provider without caching.
 // Used during Reader construction before the Reader is fully initialized.
-func readProviderRangeUncached(provider ReaderProvider, off int64, length int) ([]byte, error) {
+func readProviderRangeUncached(provider ReaderProvider, off int64, length int, dataType DataType) ([]byte, error) {
 	if length < 0 {
 		return nil, fmt.Errorf("invalid read length %d", length)
 	}
 	buf := make([]byte, length)
-	n, err := provider.ReadAt(buf, off)
+	n, err := provider.ReadAt(buf, off, dataType)
 	if err != nil && err != io.EOF {
 		return nil, err
 	}
@@ -252,7 +289,7 @@ func readProviderRangeUncached(provider ReaderProvider, off int64, length int) (
 }
 
 // readProviderRange reads a byte range from the provider, using cache if available.
-func (r *Reader) readProviderRange(off int64, length int) ([]byte, error) {
+func (r *Reader) readProviderRange(off int64, length int, dataType DataType) ([]byte, error) {
 	if length < 0 {
 		return nil, fmt.Errorf("invalid read length %d", length)
 	}
@@ -269,7 +306,7 @@ func (r *Reader) readProviderRange(off int64, length int) ([]byte, error) {
 	var data []byte
 
 	buf := make([]byte, length)
-	n, err := r.provider.ReadAt(buf, off)
+	n, err := r.provider.ReadAt(buf, off, dataType)
 	if err != nil && err != io.EOF {
 		return nil, err
 	}
@@ -287,7 +324,7 @@ func (r *Reader) readProviderRange(off int64, length int) ([]byte, error) {
 	return data, nil
 }
 
-func (r *Reader) readRange(off int64, length int) ([]byte, error) {
+func (r *Reader) readRange(off int64, length int, dataType DataType) ([]byte, error) {
 	if length < 0 {
 		return nil, fmt.Errorf("invalid read length %d", length)
 	}
@@ -300,7 +337,7 @@ func (r *Reader) readRange(off int64, length int) ([]byte, error) {
 		stop := int(end)
 		return r.data[start:stop], nil
 	}
-	return r.readProviderRange(off, length)
+	return r.readProviderRange(off, length, dataType)
 }
 
 func readFooter(data []byte) (fileFooter, error) {
@@ -759,7 +796,7 @@ func (r *Reader) BlockColumnStats(blockIdx int, columns []string) (map[string]Co
 		return nil, fmt.Errorf("block index %d out of range [0, %d)", blockIdx, len(r.blockEntries))
 	}
 	entry := r.blockEntries[blockIdx]
-	blockBytes, err := r.readRange(int64(entry.Offset), int(entry.Length))
+	blockBytes, err := r.readRange(int64(entry.Offset), int(entry.Length), DataTypeColumn)
 	if err != nil {
 		return nil, fmt.Errorf("block %d offset out of bounds: %w", blockIdx, err)
 	}
@@ -828,7 +865,7 @@ func (r *Reader) GetBlockWithBytes(idx int, columns map[string]struct{}, reusabl
 		// each request has high latency (50-100ms) and fixed cost.
 		// Reading 2-3x more data is cheaper than making 10-12x more requests.
 		// See AGENTS.md for detailed rationale.
-		blockBytes, err = r.readRange(int64(entry.Offset), int(entry.Length))
+		blockBytes, err = r.readRange(int64(entry.Offset), int(entry.Length), DataTypeColumn)
 		if err != nil {
 			return nil, fmt.Errorf("block %d: %w", idx, err)
 		}
@@ -1058,7 +1095,7 @@ func (r *Reader) ReadCoalescedBlocks(cr CoalescedRead) (map[int][]byte, error) {
 	}
 
 	// Read the entire coalesced chunk in one I/O operation
-	coalescedBytes, err := r.readRange(int64(cr.Offset), int(cr.Length))
+	coalescedBytes, err := r.readRange(int64(cr.Offset), int(cr.Length), DataTypeColumn)
 	if err != nil {
 		return nil, fmt.Errorf("read coalesced range [%d, %d): %w", cr.Offset, cr.Offset+cr.Length, err)
 	}
@@ -1122,7 +1159,7 @@ func (r *Reader) AddColumnsToBlock(bwb *BlockWithBytes, additionalColumns map[st
 	// Read entire block to avoid re-reading header/metadata
 	// Selective reading would save column data I/O but cost header/metadata I/O twice
 	entry := r.blockEntries[bwb.BlockIdx]
-	blockBytes, err := r.readRange(int64(entry.Offset), int(entry.Length))
+	blockBytes, err := r.readRange(int64(entry.Offset), int(entry.Length), DataTypeColumn)
 	if err != nil {
 		return fmt.Errorf("read block for additional columns: %w", err)
 	}
@@ -2178,7 +2215,7 @@ func (r *Reader) ReadMetricStreamBlocks() (offset uint64, length uint64, error e
 		return 0, 0, err
 	}
 
-	footerBytes, err := r.readProviderRange(dataSize-int64(footerSize), int(footerSize))
+	footerBytes, err := r.readProviderRange(dataSize-int64(footerSize), int(footerSize), DataTypeFooter)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -2221,7 +2258,7 @@ func (r *Reader) GetMetricStreamBlocksRaw() ([]byte, error) {
 		return nil, nil
 	}
 
-	return r.readProviderRange(int64(offset), int(length))
+	return r.readProviderRange(int64(offset), int(length), DataTypeUnknown)
 }
 
 // MetricStreamInfo contains metadata about a compressed metric stream

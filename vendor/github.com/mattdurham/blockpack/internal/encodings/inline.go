@@ -2,8 +2,8 @@ package encodings
 
 import (
 	"bytes"
-	"github.com/klauspost/compress/zstd"
 	"encoding/binary"
+	"github.com/klauspost/compress/zstd"
 )
 
 // BuildBytesInline encodes a bytes column using inline encoding.

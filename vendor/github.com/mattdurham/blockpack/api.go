@@ -39,11 +39,24 @@ type Block = blockio.Block
 // Column represents a decoded column.
 type Column = blockio.Column
 
+// DataType represents the type of data being read for caching optimization.
+type DataType = blockio.DataType
+
+// DataType constants for read optimization hints
+const (
+	DataTypeFooter   = blockio.DataTypeFooter
+	DataTypeMetadata = blockio.DataTypeMetadata
+	DataTypeColumn   = blockio.DataTypeColumn
+	DataTypeRow      = blockio.DataTypeRow
+	DataTypeIndex    = blockio.DataTypeIndex
+	DataTypeUnknown  = blockio.DataTypeUnknown
+)
+
 // ReaderProvider supplies random access to blockpack data.
 // Implementations can use files, memory, cloud storage, etc.
 type ReaderProvider interface {
 	Size() (int64, error)
-	ReadAt(p []byte, off int64) (int, error)
+	ReadAt(p []byte, off int64, dataType DataType) (int, error)
 }
 
 // CloseableReaderProvider extends ReaderProvider with resource cleanup.
@@ -132,6 +145,11 @@ type Storage interface {
 
 	// ReadAt reads len(p) bytes from the object at path starting at offset off.
 	//
+	// The dataType parameter provides a hint about the type of data being read
+	// (footer, metadata, column, row, index, or unknown). Storage implementations
+	// can use this hint to optimize caching strategies, TTLs, or read-ahead behavior.
+	// Simple implementations that don't perform caching can ignore this parameter.
+	//
 	// Implementations MUST follow io.ReaderAt semantics for correct interoperability:
 	//   - off must be non-negative. Return an error (e.g., os.ErrInvalid) if off < 0.
 	//   - If off >= Size(path), ReadAt must return (0, io.EOF).
@@ -140,7 +158,7 @@ type Storage interface {
 	//   - ReadAt may return (len(p), nil) only when the buffer is completely filled.
 	//
 	// It returns the number of bytes read and any error encountered.
-	ReadAt(path string, p []byte, off int64) (int, error)
+	ReadAt(path string, p []byte, off int64, dataType DataType) (int, error)
 }
 
 // storageAdapter adapts our Storage interface to the internal executor's FileStorage interface.
@@ -167,7 +185,7 @@ func (a *storageAdapter) Get(path string) ([]byte, error) {
 	}
 
 	data := make([]byte, int(size))
-	n, err := a.storage.ReadAt(path, data, 0)
+	n, err := a.storage.ReadAt(path, data, 0, DataTypeUnknown)
 	if err != nil {
 		// Allow io.EOF only if we read the full buffer. Any other error,
 		// or io.EOF with a short read, indicates a size mismatch or truncation.
@@ -209,8 +227,8 @@ func (p *storageReaderProvider) Size() (int64, error) {
 	return p.storage.Size(p.path)
 }
 
-func (p *storageReaderProvider) ReadAt(buf []byte, off int64) (int, error) {
-	return p.storage.ReadAt(p.path, buf, off)
+func (p *storageReaderProvider) ReadAt(buf []byte, off int64, dataType DataType) (int, error) {
+	return p.storage.ReadAt(p.path, buf, off, dataType)
 }
 
 // NewFileStorage creates a new filesystem-based storage that implements the Storage interface.
@@ -245,7 +263,7 @@ func (w *folderStorageWrapper) Size(path string) (int64, error) {
 	return provider.Size()
 }
 
-func (w *folderStorageWrapper) ReadAt(path string, p []byte, off int64) (int, error) {
+func (w *folderStorageWrapper) ReadAt(path string, p []byte, off int64, dataType DataType) (int, error) {
 	provider, err := w.fs.GetProvider(path)
 	if err != nil {
 		return 0, err
@@ -256,5 +274,5 @@ func (w *folderStorageWrapper) ReadAt(path string, p []byte, off int64) (int, er
 			_ = closeable.Close() // Ignore close error in defer
 		}()
 	}
-	return provider.ReadAt(p, off)
+	return provider.ReadAt(p, off, dataType)
 }
