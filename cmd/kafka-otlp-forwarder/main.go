@@ -40,7 +40,7 @@ func runTestMode(cfg *kafkaotlpforwarder.ConsumerConfig, logger log.Logger) {
 	}
 	defer consumer.Close()
 
-	level.Info(logger).Log("msg", "connected to Kafka, polling for one record...")
+	level.Info(logger).Log("msg", "connected to Kafka, polling for one record (timeout: 30s)...")
 
 	// Poll for records with timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
