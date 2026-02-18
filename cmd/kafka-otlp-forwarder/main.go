@@ -135,7 +135,7 @@ func main() {
 	flag.Var(&endpoints, "endpoint", "OTLP gRPC endpoint (repeatable for multiple targets)")
 	flag.StringVar(&errorMode, "error-mode", "fail-fast", "Error handling: fail-fast, best-effort, all-or-nothing")
 	flag.DurationVar(&batchWaitTimeout, "batch-wait-timeout", 30*time.Second, "Max time to wait for batch completion")
-	flag.IntVar(&metricsPort, "metrics-port", 9090, "Port to expose Prometheus metrics")
+	flag.IntVar(&metricsPort, "metrics-port", 10001, "Port to expose Prometheus metrics")
 	flag.BoolVar(&testMode, "test", false, "Test mode: connect to Kafka, read one record, and exit without forwarding")
 
 	flag.Parse()
