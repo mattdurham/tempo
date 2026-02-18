@@ -30,7 +30,7 @@ func (a *arrayFlags) Set(value string) error {
 }
 
 func runTestMode(cfg *kafkaotlpforwarder.ConsumerConfig, logger log.Logger) {
-	level.Info(logger).Log("msg", "running in test mode", "brokers", cfg.Brokers, "topic", cfg.Topic)
+	level.Info(logger).Log("msg", "running in test mode", "brokers", fmt.Sprintf("%v", cfg.Brokers), "topic", cfg.Topic)
 
 	// Create consumer
 	consumer, err := kafkaotlpforwarder.NewConsumer(cfg)
