@@ -29,6 +29,92 @@ func (a *arrayFlags) Set(value string) error {
 	return nil
 }
 
+func runTestMode(cfg *kafkaotlpforwarder.ConsumerConfig, logger log.Logger) {
+	level.Info(logger).Log("msg", "running in test mode", "brokers", cfg.Brokers, "topic", cfg.Topic)
+
+	// Create consumer
+	consumer, err := kafkaotlpforwarder.NewConsumer(cfg)
+	if err != nil {
+		level.Error(logger).Log("msg", "failed to create consumer", "err", err)
+		os.Exit(1)
+	}
+	defer consumer.Close()
+
+	level.Info(logger).Log("msg", "connected to Kafka, polling for one record...")
+
+	// Poll for records with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	fetches := consumer.Poll(ctx)
+	if fetches.IsClientClosed() {
+		level.Error(logger).Log("msg", "kafka client closed")
+		os.Exit(1)
+	}
+
+	if err := fetches.Err(); err != nil {
+		level.Error(logger).Log("msg", "fetch error", "err", err)
+		os.Exit(1)
+	}
+
+	if fetches.Empty() {
+		level.Info(logger).Log("msg", "no records available (topic may be empty or at end)")
+		level.Info(logger).Log("msg", "test successful: connected to Kafka successfully")
+		return
+	}
+
+	// Process first record only
+	recordCount := 0
+	var firstRecord []byte
+	var firstPartition int32
+	var firstOffset int64
+
+	for iter := fetches.RecordIter(); !iter.Done() && recordCount < 1; {
+		rec := iter.Next()
+		firstRecord = rec.Value
+		firstPartition = rec.Partition
+		firstOffset = rec.Offset
+		recordCount++
+	}
+
+	if recordCount == 0 {
+		level.Info(logger).Log("msg", "no records in fetch")
+		level.Info(logger).Log("msg", "test successful: connected to Kafka successfully")
+		return
+	}
+
+	level.Info(logger).Log(
+		"msg", "successfully read record",
+		"partition", firstPartition,
+		"offset", firstOffset,
+		"size_bytes", len(firstRecord),
+	)
+
+	// Try to decode as tempopb.PushBytesRequest
+	tracesData, err := kafkaotlpforwarder.DecodePushBytesRequest(firstRecord)
+	if err != nil {
+		level.Warn(logger).Log("msg", "failed to decode as PushBytesRequest", "err", err)
+		level.Info(logger).Log("msg", "test successful: connected and read data, but format validation failed")
+		os.Exit(1)
+	}
+
+	level.Info(logger).Log(
+		"msg", "successfully decoded and converted to OTLP",
+		"resource_spans_count", len(tracesData.ResourceSpans),
+	)
+
+	// Count total spans
+	totalSpans := 0
+	for _, rs := range tracesData.ResourceSpans {
+		for _, ss := range rs.ScopeSpans {
+			totalSpans += len(ss.Spans)
+		}
+	}
+
+	level.Info(logger).Log("msg", "record contains traces", "total_spans", totalSpans)
+	level.Info(logger).Log("msg", "✓ test successful: Kafka connectivity and data format validated")
+}
+
 func main() {
 	var (
 		kafkaBrokers     string
@@ -39,6 +125,7 @@ func main() {
 		errorMode        string
 		batchWaitTimeout time.Duration
 		metricsPort      int
+		testMode         bool
 	)
 
 	flag.StringVar(&kafkaBrokers, "kafka-brokers", "localhost:9092", "Comma-separated Kafka broker addresses")
@@ -49,11 +136,12 @@ func main() {
 	flag.StringVar(&errorMode, "error-mode", "fail-fast", "Error handling: fail-fast, best-effort, all-or-nothing")
 	flag.DurationVar(&batchWaitTimeout, "batch-wait-timeout", 30*time.Second, "Max time to wait for batch completion")
 	flag.IntVar(&metricsPort, "metrics-port", 9090, "Port to expose Prometheus metrics")
+	flag.BoolVar(&testMode, "test", false, "Test mode: connect to Kafka, read one record, and exit without forwarding")
 
 	flag.Parse()
 
-	// Validate required flags
-	if len(endpoints) == 0 {
+	// Validate required flags (skip endpoint validation in test mode)
+	if !testMode && len(endpoints) == 0 {
 		fmt.Fprintf(os.Stderr, "Error: at least one --endpoint must be specified\n")
 		flag.Usage()
 		os.Exit(1)
@@ -100,6 +188,12 @@ func main() {
 		FromBeginning: fromBeginning,
 	}
 	consumerCfg.SetBrokersFromString(kafkaBrokers)
+
+	// Test mode: connect, read one record, and exit
+	if testMode {
+		runTestMode(consumerCfg, logger)
+		return
+	}
 
 	// Create forwarder config
 	cfg := &kafkaotlpforwarder.ForwarderConfig{
