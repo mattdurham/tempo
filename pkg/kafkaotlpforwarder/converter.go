@@ -7,6 +7,17 @@ import (
 	v1_trace "github.com/grafana/tempo/pkg/tempopb/trace/v1"
 )
 
+// DecodePushBytesRequest decodes raw bytes as PushBytesRequest and converts to OTLP.
+// This is a convenience function for test/validation purposes.
+func DecodePushBytesRequest(data []byte) (*v1_trace.TracesData, error) {
+	var req tempopb.PushBytesRequest
+	if err := req.Unmarshal(data); err != nil {
+		return nil, fmt.Errorf("unmarshal PushBytesRequest: %w", err)
+	}
+
+	return ConvertToOTLP(&req)
+}
+
 // ConvertToOTLP converts a tempopb.PushBytesRequest to OTLP TracesData format.
 // The Trace.Slice field contains pre-encoded OTLP ResourceSpans that need to be
 // unmarshaled and aggregated.

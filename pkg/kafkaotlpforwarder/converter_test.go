@@ -133,3 +133,42 @@ func TestConvertToOTLP_NilRequest(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "nil")
 }
+
+func TestDecodePushBytesRequest(t *testing.T) {
+	// Create a valid ResourceSpans
+	resourceSpans := &v1_trace.ResourceSpans{
+		ScopeSpans: []*v1_trace.ScopeSpans{
+			{
+				Spans: []*v1_trace.Span{
+					{Name: "test-span"},
+				},
+			},
+		},
+	}
+
+	sliceData, err := resourceSpans.Marshal()
+	require.NoError(t, err)
+
+	// Create and marshal PushBytesRequest
+	req := &tempopb.PushBytesRequest{
+		Traces: []tempopb.PreallocBytes{
+			{Slice: sliceData},
+		},
+	}
+
+	data, err := req.Marshal()
+	require.NoError(t, err)
+
+	// Test helper function
+	tracesData, err := DecodePushBytesRequest(data)
+	require.NoError(t, err)
+	require.NotNil(t, tracesData)
+	require.Len(t, tracesData.ResourceSpans, 1)
+	require.Equal(t, "test-span", tracesData.ResourceSpans[0].ScopeSpans[0].Spans[0].Name)
+}
+
+func TestDecodePushBytesRequest_InvalidData(t *testing.T) {
+	_, err := DecodePushBytesRequest([]byte("invalid data"))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "unmarshal")
+}
