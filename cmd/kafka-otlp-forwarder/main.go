@@ -147,18 +147,19 @@ func runTestMode(cfg *kafkaotlpforwarder.ConsumerConfig, logger log.Logger) {
 
 func main() {
 	var (
-		kafkaBrokers       string
-		kafkaTopic         string
-		consumerGroup      string
-		fromBeginning      bool
-		endpoints          arrayFlags
-		errorMode          string
-		batchWaitTimeout   time.Duration
-		metricsPort        int
-		testMode           bool
-		kafkaUsername      string
-		kafkaPassword      string
-		kafkaSASLMechanism string
+		kafkaBrokers          string
+		kafkaTopic            string
+		consumerGroup         string
+		fromBeginning         bool
+		endpoints             arrayFlags
+		errorMode             string
+		batchWaitTimeout      time.Duration
+		metricsPort           int
+		testMode              bool
+		kafkaUsername         string
+		kafkaPassword         string
+		kafkaSASLMechanism    string
+		kafkaBrokerAddressMap string
 	)
 
 	flag.StringVar(&kafkaBrokers, "kafka-brokers", "localhost:9092", "Comma-separated Kafka broker addresses")
@@ -173,6 +174,7 @@ func main() {
 	flag.StringVar(&kafkaUsername, "kafka-username", "", "Kafka SASL username (optional)")
 	flag.StringVar(&kafkaPassword, "kafka-password", "", "Kafka SASL password (optional)")
 	flag.StringVar(&kafkaSASLMechanism, "kafka-sasl-mechanism", "PLAIN", "Kafka SASL mechanism: PLAIN, SCRAM-SHA-256, SCRAM-SHA-512")
+	flag.StringVar(&kafkaBrokerAddressMap, "kafka-broker-map", "", "Broker address mappings for port-forwarding: internal:port=external:port,...")
 
 	flag.Parse()
 
@@ -227,6 +229,15 @@ func main() {
 		SASLMechanism:  kafkaSASLMechanism,
 	}
 	consumerCfg.SetBrokersFromString(kafkaBrokers)
+
+	// Parse broker address mappings if provided
+	if kafkaBrokerAddressMap != "" {
+		if err := consumerCfg.SetBrokerAddressMapFromString(kafkaBrokerAddressMap); err != nil {
+			level.Error(logger).Log("msg", "invalid broker address mapping", "err", err)
+			os.Exit(1)
+		}
+		level.Info(logger).Log("msg", "broker address mapping configured", "mappings", len(consumerCfg.BrokerAddressMap))
+	}
 
 	// Test mode: connect, read one record, and exit
 	if testMode {
