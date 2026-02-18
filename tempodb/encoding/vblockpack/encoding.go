@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/encoding/common"
 )
@@ -25,7 +26,7 @@ func (e Encoding) OpenBlock(meta *backend.BlockMeta, r backend.Reader) (common.B
 
 // NewCompactor creates a new compactor for blockpack blocks
 func (e Encoding) NewCompactor(opts common.CompactionOptions) common.Compactor {
-	return nil
+	return NewCompactor(opts)
 }
 
 // CreateBlock creates a new blockpack block from an iterator
@@ -49,7 +50,24 @@ func (e Encoding) OpenWALBlock(filename, path string, ingestionSlack, additional
 // CopyBlock copies a block from one backend to another
 func (e Encoding) CopyBlock(ctx context.Context, meta *backend.BlockMeta, from backend.Reader,
 	to backend.Writer) error {
-	return fmt.Errorf("not implemented")
+	// Read the blockpack data file from source
+	blockID := uuid.UUID(meta.BlockID)
+	data, err := from.Read(ctx, DataFileName, blockID, meta.TenantID, nil)
+	if err != nil {
+		return fmt.Errorf("failed to read blockpack data: %w", err)
+	}
+
+	// Write to destination
+	if err := to.Write(ctx, DataFileName, blockID, meta.TenantID, data, nil); err != nil {
+		return fmt.Errorf("failed to write blockpack data: %w", err)
+	}
+
+	// Write block metadata
+	if err := to.WriteBlockMeta(ctx, meta); err != nil {
+		return fmt.Errorf("failed to write block metadata: %w", err)
+	}
+
+	return nil
 }
 
 // MigrateBlock migrates a block from another format to blockpack

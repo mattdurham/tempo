@@ -30,7 +30,10 @@ func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.Blo
 		}
 	}
 
-	writer := blockpack.NewWriter(maxSpans)
+	writer, err := blockpack.NewWriter(maxSpans)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create blockpack writer: %w", err)
+	}
 
 	// Iterate through all traces and add to blockpack
 	traceCount := 0
@@ -60,7 +63,6 @@ func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.Blo
 		traceCount++
 		_ = id // Trace ID is embedded in the trace data
 	}
-
 	// Flush blockpack writer to get serialized bytes
 	data, err := writer.Flush()
 	if err != nil {

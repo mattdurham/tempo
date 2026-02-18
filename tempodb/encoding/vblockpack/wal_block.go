@@ -87,7 +87,11 @@ func (w *walBlock) initWriter() error {
 
 	// Create blockpack writer
 	// Use reasonable defaults: 2000 spans per block
-	w.writer = blockpack.NewWriter(2000)
+	writer, err := blockpack.NewWriter(2000)
+	if err != nil {
+		return fmt.Errorf("failed to create blockpack writer: %w", err)
+	}
+	w.writer = writer
 
 	return nil
 }
