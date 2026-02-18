@@ -3,6 +3,7 @@ package kafkaotlpforwarder
 import (
 	"context"
 	"fmt"
+	"net"
 	"strings"
 	"time"
 
@@ -13,13 +14,14 @@ import (
 
 // ConsumerConfig holds Kafka consumer configuration.
 type ConsumerConfig struct {
-	Brokers       []string
-	Topic         string
-	ConsumerGroup string
-	FromBeginning bool
-	SASLUsername  string
-	SASLPassword  string
-	SASLMechanism string
+	Brokers            []string
+	Topic              string
+	ConsumerGroup      string
+	FromBeginning      bool
+	SASLUsername       string
+	SASLPassword       string
+	SASLMechanism      string
+	BrokerAddressMap   map[string]string // Map internal broker addresses to external (for port-forwarding)
 }
 
 // Validate checks if the consumer configuration is valid.
@@ -46,6 +48,31 @@ func (c *ConsumerConfig) SetBrokersFromString(brokers string) {
 			c.Brokers = append(c.Brokers, trimmed)
 		}
 	}
+}
+
+// SetBrokerAddressMapFromString parses broker address mappings.
+// Format: "internal1:port=external1:port,internal2:port=external2:port"
+// Example: "kafka-0.svc:9092=localhost:9092,kafka-1.svc:9092=localhost:9093"
+func (c *ConsumerConfig) SetBrokerAddressMapFromString(mappings string) error {
+	if mappings == "" {
+		return nil
+	}
+
+	c.BrokerAddressMap = make(map[string]string)
+	pairs := strings.Split(mappings, ",")
+	for _, pair := range pairs {
+		parts := strings.Split(strings.TrimSpace(pair), "=")
+		if len(parts) != 2 {
+			return fmt.Errorf("invalid mapping format: %s (expected internal:port=external:port)", pair)
+		}
+		internal := strings.TrimSpace(parts[0])
+		external := strings.TrimSpace(parts[1])
+		if internal == "" || external == "" {
+			return fmt.Errorf("empty address in mapping: %s", pair)
+		}
+		c.BrokerAddressMap[internal] = external
+	}
+	return nil
 }
 
 // Consumer wraps a franz-go Kafka consumer.
@@ -98,6 +125,26 @@ func NewConsumer(cfg *ConsumerConfig) (*Consumer, error) {
 			return nil, fmt.Errorf("invalid SASL mechanism: %w", err)
 		}
 		opts = append(opts, saslOpt)
+	}
+
+	// Add broker address override for port-forwarding scenarios
+	if len(cfg.BrokerAddressMap) > 0 {
+		dialer := &net.Dialer{Timeout: 10 * time.Second}
+		opts = append(opts, kgo.Dialer(func(ctx context.Context, network, address string) (net.Conn, error) {
+			// Check if we have an override for this address
+			if override, ok := cfg.BrokerAddressMap[address]; ok {
+				address = override
+			} else {
+				// Try without port (check just the host part)
+				host, _, err := net.SplitHostPort(address)
+				if err == nil {
+					if override, ok := cfg.BrokerAddressMap[host]; ok {
+						address = override
+					}
+				}
+			}
+			return dialer.DialContext(ctx, network, address)
+		}))
 	}
 
 	client, err := kgo.NewClient(opts...)
