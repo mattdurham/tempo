@@ -117,15 +117,18 @@ func runTestMode(cfg *kafkaotlpforwarder.ConsumerConfig, logger log.Logger) {
 
 func main() {
 	var (
-		kafkaBrokers     string
-		kafkaTopic       string
-		consumerGroup    string
-		fromBeginning    bool
-		endpoints        arrayFlags
-		errorMode        string
-		batchWaitTimeout time.Duration
-		metricsPort      int
-		testMode         bool
+		kafkaBrokers       string
+		kafkaTopic         string
+		consumerGroup      string
+		fromBeginning      bool
+		endpoints          arrayFlags
+		errorMode          string
+		batchWaitTimeout   time.Duration
+		metricsPort        int
+		testMode           bool
+		kafkaUsername      string
+		kafkaPassword      string
+		kafkaSASLMechanism string
 	)
 
 	flag.StringVar(&kafkaBrokers, "kafka-brokers", "localhost:9092", "Comma-separated Kafka broker addresses")
@@ -137,6 +140,9 @@ func main() {
 	flag.DurationVar(&batchWaitTimeout, "batch-wait-timeout", 30*time.Second, "Max time to wait for batch completion")
 	flag.IntVar(&metricsPort, "metrics-port", 10001, "Port to expose Prometheus metrics")
 	flag.BoolVar(&testMode, "test", false, "Test mode: connect to Kafka, read one record, and exit without forwarding")
+	flag.StringVar(&kafkaUsername, "kafka-username", "", "Kafka SASL username (optional)")
+	flag.StringVar(&kafkaPassword, "kafka-password", "", "Kafka SASL password (optional)")
+	flag.StringVar(&kafkaSASLMechanism, "kafka-sasl-mechanism", "PLAIN", "Kafka SASL mechanism: PLAIN, SCRAM-SHA-256, SCRAM-SHA-512")
 
 	flag.Parse()
 
@@ -183,9 +189,12 @@ func main() {
 
 	// Create consumer config
 	consumerCfg := &kafkaotlpforwarder.ConsumerConfig{
-		Topic:         kafkaTopic,
-		ConsumerGroup: consumerGroup,
-		FromBeginning: fromBeginning,
+		Topic:          kafkaTopic,
+		ConsumerGroup:  consumerGroup,
+		FromBeginning:  fromBeginning,
+		SASLUsername:   kafkaUsername,
+		SASLPassword:   kafkaPassword,
+		SASLMechanism:  kafkaSASLMechanism,
 	}
 	consumerCfg.SetBrokersFromString(kafkaBrokers)
 
