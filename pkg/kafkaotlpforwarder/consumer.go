@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/sasl/plain"
@@ -110,6 +111,26 @@ func parseSASLMechanism(mechanism, username, password string) (kgo.Opt, error) {
 	default:
 		return nil, fmt.Errorf("unsupported SASL mechanism: %s (supported: PLAIN, SCRAM-SHA-256, SCRAM-SHA-512)", mechanism)
 	}
+}
+
+// TestConnectivity verifies Kafka connectivity by forcing a metadata refresh.
+func (c *Consumer) TestConnectivity(ctx context.Context) error {
+	// Force metadata refresh to test connectivity
+	// This will return an error if auth fails or broker is unreachable
+	c.client.ForceMetadataRefresh()
+
+	// Do a quick poll to trigger actual connection
+	pollCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	fetches := c.client.PollFetches(pollCtx)
+
+	// Check for client errors
+	if err := fetches.Err(); err != nil {
+		return fmt.Errorf("connectivity test failed: %w", err)
+	}
+
+	return nil
 }
 
 // Close closes the Kafka consumer.

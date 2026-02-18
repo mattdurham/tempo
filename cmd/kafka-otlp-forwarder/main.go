@@ -41,7 +41,18 @@ func runTestMode(cfg *kafkaotlpforwarder.ConsumerConfig, logger log.Logger) {
 	}
 	defer consumer.Close()
 
-	level.Info(logger).Log("msg", "connected to Kafka, polling for one record (timeout: 30s)...")
+	level.Info(logger).Log("msg", "consumer created, testing connectivity...")
+
+	// Test connectivity by fetching metadata
+	metaCtx, metaCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer metaCancel()
+
+	if err := consumer.TestConnectivity(metaCtx); err != nil {
+		level.Error(logger).Log("msg", "connectivity test failed", "err", err)
+		os.Exit(1)
+	}
+
+	level.Info(logger).Log("msg", "connectivity verified, polling for one record (timeout: 30s)...")
 
 	// Poll for records with timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
