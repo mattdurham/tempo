@@ -1,0 +1,51 @@
+partition_ring_live_store: true
+
+server:
+  http_listen_port: 3201
+  log_level: info
+
+distributor:
+  ingester_write_path_enabled: false
+  kafka_write_path_enabled: true
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4319
+        http:
+          endpoint: 0.0.0.0:4320
+
+live_store:
+  max_trace_live: 5m
+  max_trace_idle: 30s
+  flush_check_period: 10s
+  max_block_duration: 5m
+  partition_ring:
+    kvstore:
+      store: inmemory
+
+ingest:
+  enabled: true
+  kafka:
+    address: kafka:9092
+    topic: tempo-ingest-blockpack
+
+block_builder:
+  consume_cycle_duration: 10s
+  assigned_partitions:
+    block-builder-0:
+      - 0
+
+storage:
+  trace:
+    backend: s3
+    s3:
+      bucket: tempo-blockpack
+      endpoint: minio:9000
+      access_key: minioadmin
+      secret_key: minioadmin
+      insecure: true
+    block:
+      version: vblockpack
+    wal:
+      path: /var/tempo/wal

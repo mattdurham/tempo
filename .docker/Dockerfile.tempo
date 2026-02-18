@@ -1,0 +1,40 @@
+FROM golang:1.25-alpine AS builder
+
+WORKDIR /workspace
+
+# Copy blockpack (must be in context)
+COPY blockpack ./blockpack
+
+# Copy blockpack-integration
+COPY tempo-mrd-worktrees/blockpack-integration ./blockpack-integration
+
+WORKDIR /workspace/blockpack-integration
+
+# Update go.mod to use relative path within Docker build
+RUN sed -i 's|replace github.com/mattdurham/blockpack => /home/matt/source/blockpack|replace github.com/mattdurham/blockpack => ../blockpack|' go.mod
+
+RUN go mod download
+
+# Build tempo with blockpack integration (use -mod=mod to ignore vendor inconsistencies)
+RUN CGO_ENABLED=0 go build -mod=mod -o tempo ./cmd/tempo
+
+FROM alpine:latest
+
+RUN apk --no-cache add ca-certificates && \
+    addgroup -g 10001 -S tempo && \
+    adduser -u 10001 -S tempo -G tempo && \
+    mkdir -p /var/tempo && \
+    chown -R tempo:tempo /var/tempo && \
+    chmod -R 0700 /var/tempo
+
+WORKDIR /app
+
+# Copy binary from builder
+COPY --from=builder /workspace/blockpack-integration/tempo /tempo
+
+USER tempo:tempo
+
+# Expose default ports
+EXPOSE 3200 3201 4317 4318 4319 4320
+
+ENTRYPOINT ["/tempo"]

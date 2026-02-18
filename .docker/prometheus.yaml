@@ -1,0 +1,12 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'tempo-parquet'
+    static_configs:
+      - targets: ['tempo-parquet:3200']
+
+  - job_name: 'tempo-blockpack'
+    static_configs:
+      - targets: ['tempo-blockpack:3201']
