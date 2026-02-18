@@ -65,6 +65,26 @@ func NewConsumer(cfg *ConsumerConfig) (*Consumer, error) {
 		kgo.ConsumerGroup(cfg.ConsumerGroup),
 		kgo.ConsumeTopics(cfg.Topic),
 		kgo.DisableAutoCommit(), // Manual offset commits for reliability
+
+		// Connection and timeout settings (matching Tempo's ingest setup)
+		kgo.ClientID("kafka-otlp-forwarder"),
+		kgo.DialTimeout(10 * time.Second),
+		kgo.RequestTimeoutOverhead(10 * time.Second),
+
+		// Metadata refresh settings (matching Tempo's setup)
+		kgo.MetadataMinAge(10 * time.Second),
+		kgo.MetadataMaxAge(10 * time.Second),
+
+		// Consumer group timeouts (matching Tempo's block-builder)
+		kgo.SessionTimeout(3 * time.Minute),
+		kgo.RebalanceTimeout(5 * time.Minute),
+
+		// Fetch configuration for better performance
+		kgo.FetchMinBytes(1),
+		kgo.FetchMaxBytes(100_000_000),          // 100MB
+		kgo.FetchMaxWait(5 * time.Second),
+		kgo.FetchMaxPartitionBytes(50_000_000),  // 50MB per partition
+		kgo.BrokerMaxReadBytes(200_000_000),     // 2x fetch max
 	}
 
 	if cfg.FromBeginning {
