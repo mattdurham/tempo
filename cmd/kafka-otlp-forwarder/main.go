@@ -14,6 +14,7 @@ import (
 	"github.com/go-kit/log/level"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/twmb/franz-go/pkg/kgo"
 
 	"github.com/grafana/tempo/pkg/kafkaotlpforwarder"
 )
@@ -46,7 +47,10 @@ func runTestMode(cfg *kafkaotlpforwarder.ConsumerConfig, logger log.Logger) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	level.Info(logger).Log("msg", "polling Kafka...")
 	fetches := consumer.Poll(ctx)
+	level.Info(logger).Log("msg", "poll completed", "num_topics", len(fetches))
+
 	if fetches.IsClientClosed() {
 		level.Error(logger).Log("msg", "kafka client closed")
 		os.Exit(1)
@@ -56,6 +60,21 @@ func runTestMode(cfg *kafkaotlpforwarder.ConsumerConfig, logger log.Logger) {
 		level.Error(logger).Log("msg", "fetch error", "err", err)
 		os.Exit(1)
 	}
+
+	// Log partition info
+	numPartitions := 0
+	numRecords := 0
+	fetches.EachPartition(func(p kgo.FetchTopicPartition) {
+		numPartitions++
+		numRecords += len(p.Records)
+		level.Info(logger).Log(
+			"msg", "received partition data",
+			"partition", p.Partition,
+			"high_watermark", p.HighWatermark,
+			"num_records", len(p.Records),
+		)
+	})
+	level.Info(logger).Log("msg", "poll summary", "num_partitions", numPartitions, "total_records", numRecords)
 
 	if fetches.Empty() {
 		level.Info(logger).Log("msg", "no records available (topic may be empty or at end)")
