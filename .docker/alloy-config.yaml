@@ -1,0 +1,67 @@
+logging {
+  level = "info"
+}
+
+prometheus.scrape "tempo_parquet" {
+  targets = [
+    {"__address__" = "tempo-parquet:3200"},
+  ]
+  scrape_interval = "15s"
+  scrape_timeout = "10s"
+  metrics_path = "/metrics"
+
+  forward_to = [prometheus.relabel.tempo_parquet.receiver]
+}
+
+prometheus.relabel "tempo_parquet" {
+  rule {
+    source_labels = ["__address__"]
+    target_label  = "instance"
+    replacement   = "tempo-parquet"
+  }
+
+  rule {
+    source_labels = ["__name__"]
+    regex         = "tempo_.*|process_.*|go_.*"
+    action        = "keep"
+  }
+
+  forward_to = [prometheus.remote_write.grafana_cloud.receiver]
+}
+
+prometheus.scrape "tempo_blockpack" {
+  targets = [
+    {"__address__" = "tempo-blockpack:3201"},
+  ]
+  scrape_interval = "15s"
+  scrape_timeout = "10s"
+  metrics_path = "/metrics"
+
+  forward_to = [prometheus.relabel.tempo_blockpack.receiver]
+}
+
+prometheus.relabel "tempo_blockpack" {
+  rule {
+    source_labels = ["__address__"]
+    target_label  = "instance"
+    replacement   = "tempo-blockpack"
+  }
+
+  rule {
+    source_labels = ["__name__"]
+    regex         = "tempo_.*|process_.*|go_.*"
+    action        = "keep"
+  }
+
+  forward_to = [prometheus.remote_write.grafana_cloud.receiver]
+}
+
+prometheus.remote_write "grafana_cloud" {
+  endpoint {
+    url = env("GRAFANA_PROM_URL")
+    basic_auth {
+      username = env("GRAFANA_PROM_USER")
+      password = env("GRAFANA_PROM_TOKEN")
+    }
+  }
+}

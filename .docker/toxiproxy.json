@@ -1,0 +1,8 @@
+[
+  {
+    "name": "s3proxy",
+    "listen": "0.0.0.0:9000",
+    "upstream": "s3proxy:8080",
+    "enabled": true
+  }
+]

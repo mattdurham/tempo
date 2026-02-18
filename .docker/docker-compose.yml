@@ -1,0 +1,165 @@
+services:
+  # MinIO for S3 storage
+  minio:
+    image: minio/minio:latest
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9001:9001"
+    command: server /data --console-address ':9001'
+    volumes:
+      - ./minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - tempo-network
+
+  # Kafka for Tempo ingest path
+  kafka:
+    image: apache/kafka:latest
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 1
+    ports:
+      - "9092:9092"
+    healthcheck:
+      test: ["CMD", "/opt/kafka/bin/kafka-broker-api-versions.sh", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+    networks:
+      - tempo-network
+
+  # Tempo with Parquet backend (built from blockpack-integration)
+  tempo-parquet:
+    build:
+      context: /home/matt/source
+      dockerfile: tempo-mrd-worktrees/blockpack-integration/.docker/Dockerfile.tempo
+    command:
+      - "-config.file=/etc/tempo.yaml"
+    depends_on:
+      minio:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    volumes:
+      - ./tempo-parquet.yaml:/etc/tempo.yaml
+      - tempo-parquet-data:/var/tempo
+    ports:
+      - "3200:3200"   # Tempo HTTP
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+    environment:
+      - GOGC=80
+    networks:
+      - tempo-network
+
+  # Tempo with Blockpack backend (built from blockpack-integration with vBlockpack support)
+  tempo-blockpack:
+    build:
+      context: /home/matt/source
+      dockerfile: tempo-mrd-worktrees/blockpack-integration/.docker/Dockerfile.tempo
+    command:
+      - "-config.file=/etc/tempo.yaml"
+    depends_on:
+      minio:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    volumes:
+      - ./tempo-blockpack.yaml:/etc/tempo.yaml
+      - tempo-blockpack-data:/var/tempo
+    ports:
+      - "3201:3201"   # Tempo HTTP
+      - "4319:4319"   # OTLP gRPC
+      - "4320:4320"   # OTLP HTTP
+    environment:
+      - GOGC=80
+    networks:
+      - tempo-network
+
+  # k6 load generator for Parquet Tempo
+  k6-parquet:
+    image: grafana/k6:latest
+    volumes:
+      - ./k6-script.js:/scripts/script.js
+    environment:
+      - TEMPO_ENDPOINT=http://tempo-parquet:4318
+      - TRACE_RATE=20
+      - VUS=2
+      - DURATION=300s
+    command: run /scripts/script.js
+    depends_on:
+      - tempo-parquet
+    networks:
+      - tempo-network
+
+  # k6 load generator for Blockpack Tempo
+  k6-blockpack:
+    image: grafana/k6:latest
+    volumes:
+      - ./k6-script.js:/scripts/script.js
+    environment:
+      - TEMPO_ENDPOINT=http://tempo-blockpack:4320
+      - TRACE_RATE=20
+      - VUS=2
+      - DURATION=300s
+    command: run /scripts/script.js
+    depends_on:
+      - tempo-blockpack
+    networks:
+      - tempo-network
+
+  # Prometheus for metrics
+  prometheus:
+    image: prom/prometheus:latest
+    command:
+      - --config.file=/etc/prometheus.yaml
+      - --web.enable-remote-write-receiver
+    volumes:
+      - ./prometheus.yaml:/etc/prometheus.yaml
+    ports:
+      - "9090:9090"
+    depends_on:
+      - tempo-parquet
+      - tempo-blockpack
+    networks:
+      - tempo-network
+
+  # Grafana for visualization
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_AUTH_DISABLE_LOGIN_FORM=true
+    volumes:
+      - ./grafana-datasources.yaml:/etc/grafana/provisioning/datasources/datasources.yaml
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - tempo-network
+
+networks:
+  tempo-network:
+    driver: bridge
+
+volumes:
+  tempo-parquet-data:
+  tempo-blockpack-data:
