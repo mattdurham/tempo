@@ -24,7 +24,7 @@ var (
 // Escape escapes a pointer to the heap.
 func Escape[P ~*E, E any](p P) P {
 	if alwaysFalse {
-		sink = unsafe.Pointer(p)
+		sink = unsafe.Pointer(p) //nolint:gosec
 	}
 	return p
 }

@@ -8,6 +8,13 @@ import (
 	"github.com/mattdurham/blockpack/internal/traceqlparser"
 )
 
+// Intrinsic field constants (duplicated to avoid import cycles)
+const (
+	intrinsicTraceID      = "trace:id"
+	intrinsicSpanID       = "span:id"
+	intrinsicSpanParentID = "span:parent_id"
+)
+
 // CompileTraceQLFilter compiles a TraceQL FilterExpression directly to a VM Program.
 // Generates BOTH ColumnPredicate (fast bulk scanning) and Instructions (flexibility).
 // This bypasses SQL entirely, allowing TraceQL to use its full expressiveness.
@@ -39,6 +46,9 @@ func CompileTraceQLFilter(filter *traceqlparser.FilterExpression) (*Program, err
 		return nil, fmt.Errorf("compile column predicate: %w", err)
 	}
 	compiler.program.ColumnPredicate = columnPredicate
+
+	// Extract predicates for block-level pruning and span hints
+	compiler.program.Predicates = extractTraceQLPredicates(filter.Expr)
 
 	return compiler.program, nil
 }
@@ -94,11 +104,11 @@ func normalizeAttributePath(scope, name string) string {
 		return "span:end"
 	// Handle trace-level intrinsics
 	case "trace.id":
-		return "trace:id"
+		return intrinsicTraceID
 	case "span.id":
-		return "span:id"
+		return intrinsicSpanID
 	case "span.parent_id":
-		return "span:parent_id"
+		return intrinsicSpanParentID
 	}
 
 	// Handle well-known resource attributes
@@ -167,7 +177,13 @@ func (c *traceqlCompiler) compileBinaryExpr(expr *traceqlparser.BinaryExpr) erro
 				vm.push(Value{Type: TypeBool, Data: false})
 				return vm.pc + 1
 			}
-			result := left.Data.(bool) && right.Data.(bool)
+			leftBool, okL := left.Data.(bool)
+			rightBool, okR := right.Data.(bool)
+			if !okL || !okR {
+				vm.push(Value{Type: TypeBool, Data: false})
+				return vm.pc + 1
+			}
+			result := leftBool && rightBool
 			vm.push(Value{Type: TypeBool, Data: result})
 			return vm.pc + 1
 		})
@@ -188,13 +204,26 @@ func (c *traceqlCompiler) compileBinaryExpr(expr *traceqlparser.BinaryExpr) erro
 				vm.push(Value{Type: TypeBool, Data: false})
 				return vm.pc + 1
 			}
-			result := left.Data.(bool) || right.Data.(bool)
+			leftBool, okL := left.Data.(bool)
+			rightBool, okR := right.Data.(bool)
+			if !okL || !okR {
+				vm.push(Value{Type: TypeBool, Data: false})
+				return vm.pc + 1
+			}
+			result := leftBool || rightBool
 			vm.push(Value{Type: TypeBool, Data: result})
 			return vm.pc + 1
 		})
 		return nil
 
-	case traceqlparser.OpEq, traceqlparser.OpNeq, traceqlparser.OpGt, traceqlparser.OpGte, traceqlparser.OpLt, traceqlparser.OpLte, traceqlparser.OpRegex, traceqlparser.OpNotRegex:
+	case traceqlparser.OpEq,
+		traceqlparser.OpNeq,
+		traceqlparser.OpGt,
+		traceqlparser.OpGte,
+		traceqlparser.OpLt,
+		traceqlparser.OpLte,
+		traceqlparser.OpRegex,
+		traceqlparser.OpNotRegex:
 		return c.compileComparison(expr)
 
 	default:
@@ -298,18 +327,26 @@ func (c *traceqlCompiler) addConstantFromLiteral(lit *traceqlparser.LiteralExpr)
 		// Check if value is []byte (from hex decoding)
 		if bytes, ok := lit.Value.([]byte); ok {
 			vmValue = Value{Type: TypeBytes, Data: bytes}
-		} else {
-			vmValue = Value{Type: TypeString, Data: lit.Value.(string)}
+		} else if str, ok := lit.Value.(string); ok {
+			vmValue = Value{Type: TypeString, Data: str}
 		}
 	case traceqlparser.LitInt:
-		vmValue = Value{Type: TypeInt, Data: lit.Value.(int64)}
+		if intVal, ok := lit.Value.(int64); ok {
+			vmValue = Value{Type: TypeInt, Data: intVal}
+		}
 	case traceqlparser.LitFloat:
-		vmValue = Value{Type: TypeFloat, Data: lit.Value.(float64)}
+		if floatVal, ok := lit.Value.(float64); ok {
+			vmValue = Value{Type: TypeFloat, Data: floatVal}
+		}
 	case traceqlparser.LitBool:
-		vmValue = Value{Type: TypeBool, Data: lit.Value.(bool)}
+		if boolVal, ok := lit.Value.(bool); ok {
+			vmValue = Value{Type: TypeBool, Data: boolVal}
+		}
 	case traceqlparser.LitDuration:
 		// Duration stored as int64 nanoseconds with TypeDuration semantic type
-		vmValue = Value{Type: TypeDuration, Data: lit.Value.(int64)}
+		if durVal, ok := lit.Value.(int64); ok {
+			vmValue = Value{Type: TypeDuration, Data: durVal}
+		}
 	default:
 		// LitStatus, LitKind, LitNil - treat as nil for now
 		vmValue = Value{Type: TypeNil, Data: nil}
@@ -410,13 +447,21 @@ func valuesEqual(left, right Value) bool {
 
 	switch left.Type {
 	case TypeString:
-		return left.Data.(string) == right.Data.(string)
+		leftStr, okL := left.Data.(string)
+		rightStr, okR := right.Data.(string)
+		return okL && okR && leftStr == rightStr
 	case TypeInt:
-		return left.Data.(int64) == right.Data.(int64)
+		leftInt, okL := left.Data.(int64)
+		rightInt, okR := right.Data.(int64)
+		return okL && okR && leftInt == rightInt
 	case TypeFloat:
-		return left.Data.(float64) == right.Data.(float64)
+		leftFloat, okL := left.Data.(float64)
+		rightFloat, okR := right.Data.(float64)
+		return okL && okR && leftFloat == rightFloat
 	case TypeBool:
-		return left.Data.(bool) == right.Data.(bool)
+		leftBool, okL := left.Data.(bool)
+		rightBool, okR := right.Data.(bool)
+		return okL && okR && leftBool == rightBool
 	default:
 		return false
 	}
@@ -437,15 +482,20 @@ func compareNumeric(left, right Value) int {
 func toFloat64(v Value) float64 {
 	switch v.Type {
 	case TypeInt:
-		return float64(v.Data.(int64))
+		if intVal, ok := v.Data.(int64); ok {
+			return float64(intVal)
+		}
 	case TypeFloat:
-		return v.Data.(float64)
+		if floatVal, ok := v.Data.(float64); ok {
+			return floatVal
+		}
 	case TypeDuration:
 		// Duration stored as int64 nanoseconds
-		return float64(v.Data.(int64))
-	default:
-		return 0
+		if durVal, ok := v.Data.(int64); ok {
+			return float64(durVal)
+		}
 	}
+	return 0
 }
 
 // compileColumnPredicate compiles a TraceQL expression to a ColumnPredicate closure.
@@ -488,12 +538,11 @@ func (c *traceqlCompiler) compileColumnPredicateExpr(expr traceqlparser.Expr) (C
 				return func(provider ColumnDataProvider) (RowSet, error) {
 					return provider.FullScan(), nil
 				}, nil
-			} else {
-				// false - match none
-				return func(provider ColumnDataProvider) (RowSet, error) {
-					return provider.Complement(provider.FullScan()), nil
-				}, nil
 			}
+			// false - match none
+			return func(provider ColumnDataProvider) (RowSet, error) {
+				return provider.Complement(provider.FullScan()), nil
+			}, nil
 		}
 		return nil, fmt.Errorf("unsupported literal in column predicate: %v", e.Value)
 	default:
@@ -547,7 +596,14 @@ func (c *traceqlCompiler) compileColumnPredicateBinary(expr *traceqlparser.Binar
 			return provider.Union(leftRows, rightRows), nil
 		}, nil
 
-	case traceqlparser.OpEq, traceqlparser.OpNeq, traceqlparser.OpGt, traceqlparser.OpGte, traceqlparser.OpLt, traceqlparser.OpLte, traceqlparser.OpRegex, traceqlparser.OpNotRegex:
+	case traceqlparser.OpEq,
+		traceqlparser.OpNeq,
+		traceqlparser.OpGt,
+		traceqlparser.OpGte,
+		traceqlparser.OpLt,
+		traceqlparser.OpLte,
+		traceqlparser.OpRegex,
+		traceqlparser.OpNotRegex:
 		// Comparison: compile to column scan
 		return c.compileColumnPredicateComparison(expr)
 
@@ -619,9 +675,325 @@ func (c *traceqlCompiler) compileColumnPredicateComparison(expr *traceqlparser.B
 // isHexBytesAttribute checks if an attribute stores hex-encoded bytes (trace:id, span:id)
 func isHexBytesAttribute(path string) bool {
 	switch path {
-	case "trace:id", "span:id", "span:parent_id":
+	case intrinsicTraceID, intrinsicSpanID, intrinsicSpanParentID:
 		return true
 	default:
 		return false
 	}
+}
+
+// computedFields are fields calculated at query time that do NOT exist as stored columns.
+// Extracting them into predicates causes false negatives (blocks rejected when they contain matching spans).
+var computedFields = map[string]bool{
+	"span.leaf":       true,
+	"span.root":       true,
+	"span.childCount": true,
+}
+
+// isComputedField checks if a column name represents a computed field
+func isComputedField(columnName string) bool {
+	return computedFields[columnName]
+}
+
+// isBuiltInField checks if a field is a built-in intrinsic field
+func isBuiltInField(attrPath string) bool {
+	switch attrPath {
+	case "span:name", "span:duration", "span:kind", "span:status", "span:status_message",
+		intrinsicTraceID, intrinsicSpanID, intrinsicSpanParentID, "span:start", "span:end":
+		return true
+	default:
+		return false
+	}
+}
+
+// extractTraceQLPredicates walks the TraceQL expression tree and extracts
+// QueryPredicates for block-level filtering. Returns populated predicates for
+// all stored-field operators (equality, range, regex).
+func extractTraceQLPredicates(expr traceqlparser.Expr) *QueryPredicates {
+	predicates := &QueryPredicates{
+		AttributeEquals:       make(map[string][]Value),
+		DedicatedColumns:      make(map[string][]Value),
+		UnscopedColumnNames:   make(map[string][]string),
+		DedicatedColumnsRegex: make(map[string]string),
+		AttributeRanges:       make(map[string]*RangePredicate),
+		DedicatedRanges:       make(map[string]*RangePredicate),
+	}
+	extractTraceQLPredicatesRecursive(expr, predicates)
+
+	// Return nil only if we extracted absolutely nothing
+	hasAnyPredicates := len(predicates.DedicatedColumns) > 0 ||
+		len(predicates.AttributeEquals) > 0 ||
+		len(predicates.DedicatedRanges) > 0 ||
+		len(predicates.AttributeRanges) > 0 ||
+		len(predicates.DedicatedColumnsRegex) > 0 ||
+		len(predicates.AttributesAccessed) > 0
+
+	if !hasAnyPredicates {
+		return nil
+	}
+
+	return predicates
+}
+
+// extractTraceQLPredicatesRecursive recursively walks the expression tree and extracts predicates.
+// Always returns true now - we extract what we can and skip what we can't.
+func extractTraceQLPredicatesRecursive(expr traceqlparser.Expr, predicates *QueryPredicates) bool {
+	switch e := expr.(type) {
+	case *traceqlparser.BinaryExpr:
+		switch e.Op {
+		case traceqlparser.OpAnd:
+			extractTraceQLPredicatesRecursive(e.Left, predicates)
+			extractTraceQLPredicatesRecursive(e.Right, predicates)
+			return true
+		case traceqlparser.OpOr:
+			predicates.HasOROperations = true
+			extractTraceQLPredicatesRecursive(e.Left, predicates)
+			extractTraceQLPredicatesRecursive(e.Right, predicates)
+			return true
+		case traceqlparser.OpEq:
+			return extractTraceQLEqualityPredicate(e, predicates)
+		case traceqlparser.OpNeq:
+			// Track attribute access for bloom filter but don't add to equality predicates
+			// (NOT EQUAL can't be used for positive block pruning)
+			return extractTraceQLNegationPredicate(e, predicates)
+		case traceqlparser.OpGt, traceqlparser.OpGte, traceqlparser.OpLt, traceqlparser.OpLte:
+			return extractTraceQLRangePredicate(e, predicates)
+		case traceqlparser.OpRegex:
+			return extractTraceQLRegexPredicate(e, predicates)
+		case traceqlparser.OpNotRegex:
+			// Track attribute access only (negative regex can't prune)
+			return extractTraceQLNegationPredicate(e, predicates)
+		default:
+			// Unrecognized operator - skip extraction but don't fail
+			return true
+		}
+	default:
+		// Unrecognized expression type - skip extraction but don't fail
+		return true
+	}
+}
+
+// extractTraceQLEqualityPredicate extracts equality predicates for all stored fields
+func extractTraceQLEqualityPredicate(expr *traceqlparser.BinaryExpr, predicates *QueryPredicates) bool {
+	field, ok := expr.Left.(*traceqlparser.FieldExpr)
+	if !ok {
+		return true // Skip but don't fail
+	}
+	lit, ok := expr.Right.(*traceqlparser.LiteralExpr)
+	if !ok {
+		return true // Skip but don't fail
+	}
+
+	columnName := normalizeAttributePath(field.Scope, field.Name)
+
+	// Skip computed fields - they don't exist as stored columns
+	if isComputedField(columnName) {
+		return true
+	}
+
+	// Convert literal to vm.Value
+	vmValue, ok := convertTraceQLLiteralToValue(lit)
+	if !ok {
+		return true // Skip unsupported literal types
+	}
+
+	// Special case for trace:id and span:id: decode hex string to bytes
+	if isHexBytesAttribute(columnName) {
+		if lit.Type == traceqlparser.LitString {
+			if hexStr, ok := lit.Value.(string); ok {
+				decoded, err := hex.DecodeString(hexStr)
+				if err == nil && len(decoded) == 16 {
+					vmValue = Value{Type: TypeBytes, Data: decoded}
+				}
+			}
+		}
+	}
+
+	// isDedicatedColumn always returns true (all columns get dedicated index treatment)
+	// Add to DedicatedColumns
+	predicates.DedicatedColumns[columnName] = append(
+		predicates.DedicatedColumns[columnName],
+		vmValue,
+	)
+
+	// For non-built-in fields (user attributes), also track in AttributesAccessed
+	// for bloom filter column name checking
+	if !isBuiltInField(columnName) {
+		if !contains(predicates.AttributesAccessed, columnName) {
+			predicates.AttributesAccessed = append(predicates.AttributesAccessed, columnName)
+		}
+	}
+
+	return true
+}
+
+// extractTraceQLNegationPredicate tracks attribute access for negation operators (!=, !~)
+// without adding predicates (negations can't be used for positive block pruning)
+func extractTraceQLNegationPredicate(expr *traceqlparser.BinaryExpr, predicates *QueryPredicates) bool {
+	field, ok := expr.Left.(*traceqlparser.FieldExpr)
+	if !ok {
+		return true
+	}
+
+	columnName := normalizeAttributePath(field.Scope, field.Name)
+
+	// Skip computed fields
+	if isComputedField(columnName) {
+		return true
+	}
+
+	// Track attribute access for bloom filter
+	if !isBuiltInField(columnName) {
+		if !contains(predicates.AttributesAccessed, columnName) {
+			predicates.AttributesAccessed = append(predicates.AttributesAccessed, columnName)
+		}
+	}
+
+	return true
+}
+
+// extractTraceQLRangePredicate extracts range predicates (>, >=, <, <=)
+func extractTraceQLRangePredicate(expr *traceqlparser.BinaryExpr, predicates *QueryPredicates) bool {
+	field, ok := expr.Left.(*traceqlparser.FieldExpr)
+	if !ok {
+		return true
+	}
+	lit, ok := expr.Right.(*traceqlparser.LiteralExpr)
+	if !ok {
+		return true
+	}
+
+	columnName := normalizeAttributePath(field.Scope, field.Name)
+
+	// Skip computed fields
+	if isComputedField(columnName) {
+		return true
+	}
+
+	// Convert literal to vm.Value
+	vmValue, ok := convertTraceQLLiteralToValue(lit)
+	if !ok {
+		return true
+	}
+
+	// Get or create range predicate for this column
+	// Since isDedicatedColumn always returns true, use DedicatedRanges
+	rangePred := predicates.DedicatedRanges[columnName]
+	if rangePred == nil {
+		rangePred = &RangePredicate{}
+		predicates.DedicatedRanges[columnName] = rangePred
+	}
+
+	// Update range bounds based on operator
+	switch expr.Op {
+	case traceqlparser.OpGt:
+		rangePred.MinValue = &vmValue
+		rangePred.MinInclusive = false
+	case traceqlparser.OpGte:
+		rangePred.MinValue = &vmValue
+		rangePred.MinInclusive = true
+	case traceqlparser.OpLt:
+		rangePred.MaxValue = &vmValue
+		rangePred.MaxInclusive = false
+	case traceqlparser.OpLte:
+		rangePred.MaxValue = &vmValue
+		rangePred.MaxInclusive = true
+	}
+
+	// Track attribute access for non-built-in fields
+	if !isBuiltInField(columnName) {
+		if !contains(predicates.AttributesAccessed, columnName) {
+			predicates.AttributesAccessed = append(predicates.AttributesAccessed, columnName)
+		}
+	}
+
+	return true
+}
+
+// extractTraceQLRegexPredicate extracts regex predicates
+func extractTraceQLRegexPredicate(expr *traceqlparser.BinaryExpr, predicates *QueryPredicates) bool {
+	field, ok := expr.Left.(*traceqlparser.FieldExpr)
+	if !ok {
+		return true
+	}
+	lit, ok := expr.Right.(*traceqlparser.LiteralExpr)
+	if !ok {
+		return true
+	}
+	if lit.Type != traceqlparser.LitString {
+		return true
+	}
+
+	columnName := normalizeAttributePath(field.Scope, field.Name)
+
+	// Skip computed fields
+	if isComputedField(columnName) {
+		return true
+	}
+
+	regexPattern, ok := lit.Value.(string)
+	if !ok {
+		return true
+	}
+
+	// Add to DedicatedColumnsRegex
+	predicates.DedicatedColumnsRegex[columnName] = regexPattern
+
+	// Track attribute access for non-built-in fields
+	if !isBuiltInField(columnName) {
+		if !contains(predicates.AttributesAccessed, columnName) {
+			predicates.AttributesAccessed = append(predicates.AttributesAccessed, columnName)
+		}
+	}
+
+	return true
+}
+
+// convertTraceQLLiteralToValue converts a TraceQL LiteralExpr to a vm.Value
+func convertTraceQLLiteralToValue(lit *traceqlparser.LiteralExpr) (Value, bool) {
+	switch lit.Type {
+	case traceqlparser.LitString:
+		if strVal, ok := lit.Value.(string); ok {
+			return Value{Type: TypeString, Data: strVal}, true
+		}
+	case traceqlparser.LitInt:
+		if intVal, ok := lit.Value.(int64); ok {
+			return Value{Type: TypeInt, Data: intVal}, true
+		}
+	case traceqlparser.LitFloat:
+		if floatVal, ok := lit.Value.(float64); ok {
+			return Value{Type: TypeFloat, Data: floatVal}, true
+		}
+	case traceqlparser.LitBool:
+		if boolVal, ok := lit.Value.(bool); ok {
+			return Value{Type: TypeBool, Data: boolVal}, true
+		}
+	case traceqlparser.LitDuration:
+		if durVal, ok := lit.Value.(int64); ok {
+			return Value{Type: TypeDuration, Data: durVal}, true
+		}
+	case traceqlparser.LitStatus:
+		// Convert status enum to canonical string
+		// Status enums map to "ok", "error", "unset"
+		if strVal, ok := lit.Value.(string); ok {
+			return Value{Type: TypeString, Data: strVal}, true
+		}
+	case traceqlparser.LitKind:
+		// Convert kind enum to canonical string
+		// Kind enums map to "internal", "server", "client", etc.
+		if strVal, ok := lit.Value.(string); ok {
+			return Value{Type: TypeString, Data: strVal}, true
+		}
+	}
+	return Value{}, false
+}
+
+// contains checks if a string slice contains a value
+func contains(slice []string, value string) bool {
+	for _, item := range slice {
+		if item == value {
+			return true
+		}
+	}
+	return false
 }

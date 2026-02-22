@@ -49,101 +49,112 @@ func (bcp *BlockColumnProvider) GetRowCount() int {
 
 // ScanEqual scans for rows where column equals value
 func (bcp *BlockColumnProvider) ScanEqual(column string, value interface{}) (vm.RowSet, error) {
-	result, err := bcp.scanner.ScanEqual(column, value)
-	if err != nil {
-		return nil, err
-	}
-	return columnMatchResultToRowSet(result), nil
+	rowSet := NewRowSet()
+	_, err := bcp.scanner.StreamScanEqual(column, value, func(rowIdx int) bool {
+		rowSet.Add(rowIdx)
+		return true
+	})
+	return rowSet, err
 }
 
 // ScanNotEqual scans for rows where column does not equal value
 func (bcp *BlockColumnProvider) ScanNotEqual(column string, value interface{}) (vm.RowSet, error) {
-	result, err := bcp.scanner.ScanNotEqual(column, value)
-	if err != nil {
-		return nil, err
-	}
-	return columnMatchResultToRowSet(result), nil
+	rowSet := NewRowSet()
+	_, err := bcp.scanner.StreamScanNotEqual(column, value, func(rowIdx int) bool {
+		rowSet.Add(rowIdx)
+		return true
+	})
+	return rowSet, err
 }
 
 // ScanLessThan scans for rows where column < value
 func (bcp *BlockColumnProvider) ScanLessThan(column string, value interface{}) (vm.RowSet, error) {
-	result, err := bcp.scanner.ScanLessThan(column, value)
-	if err != nil {
-		return nil, err
-	}
-	return columnMatchResultToRowSet(result), nil
+	rowSet := NewRowSet()
+	_, err := bcp.scanner.StreamScanLessThan(column, value, func(rowIdx int) bool {
+		rowSet.Add(rowIdx)
+		return true
+	})
+	return rowSet, err
 }
 
 // ScanLessThanOrEqual scans for rows where column <= value
 func (bcp *BlockColumnProvider) ScanLessThanOrEqual(column string, value interface{}) (vm.RowSet, error) {
-	result, err := bcp.scanner.ScanLessThanOrEqual(column, value)
-	if err != nil {
-		return nil, err
-	}
-	return columnMatchResultToRowSet(result), nil
+	rowSet := NewRowSet()
+	_, err := bcp.scanner.StreamScanLessThanOrEqual(column, value, func(rowIdx int) bool {
+		rowSet.Add(rowIdx)
+		return true
+	})
+	return rowSet, err
 }
 
 // ScanGreaterThan scans for rows where column > value
 func (bcp *BlockColumnProvider) ScanGreaterThan(column string, value interface{}) (vm.RowSet, error) {
-	result, err := bcp.scanner.ScanGreaterThan(column, value)
-	if err != nil {
-		return nil, err
-	}
-	return columnMatchResultToRowSet(result), nil
+	rowSet := NewRowSet()
+	_, err := bcp.scanner.StreamScanGreaterThan(column, value, func(rowIdx int) bool {
+		rowSet.Add(rowIdx)
+		return true
+	})
+	return rowSet, err
 }
 
 // ScanGreaterThanOrEqual scans for rows where column >= value
 func (bcp *BlockColumnProvider) ScanGreaterThanOrEqual(column string, value interface{}) (vm.RowSet, error) {
-	result, err := bcp.scanner.ScanGreaterThanOrEqual(column, value)
-	if err != nil {
-		return nil, err
-	}
-	return columnMatchResultToRowSet(result), nil
+	rowSet := NewRowSet()
+	_, err := bcp.scanner.StreamScanGreaterThanOrEqual(column, value, func(rowIdx int) bool {
+		rowSet.Add(rowIdx)
+		return true
+	})
+	return rowSet, err
 }
 
 // ScanIsNull scans for rows where column is NULL
 func (bcp *BlockColumnProvider) ScanIsNull(column string) (vm.RowSet, error) {
-	result, err := bcp.scanner.ScanIsNull(column)
-	if err != nil {
-		return nil, err
-	}
-	return columnMatchResultToRowSet(result), nil
+	rowSet := NewRowSet()
+	_, err := bcp.scanner.StreamScanIsNull(column, func(rowIdx int) bool {
+		rowSet.Add(rowIdx)
+		return true
+	})
+	return rowSet, err
 }
 
 // ScanIsNotNull scans for rows where column is NOT NULL
 func (bcp *BlockColumnProvider) ScanIsNotNull(column string) (vm.RowSet, error) {
-	result, err := bcp.scanner.ScanIsNotNull(column)
-	if err != nil {
-		return nil, err
-	}
-	return columnMatchResultToRowSet(result), nil
+	rowSet := NewRowSet()
+	_, err := bcp.scanner.StreamScanIsNotNull(column, func(rowIdx int) bool {
+		rowSet.Add(rowIdx)
+		return true
+	})
+	return rowSet, err
 }
 
 // ScanRegex scans for rows where column matches regex
 func (bcp *BlockColumnProvider) ScanRegex(column string, pattern string) (vm.RowSet, error) {
-	result, err := bcp.scanner.ScanRegex(column, pattern)
-	if err != nil {
-		return nil, err
-	}
-	return columnMatchResultToRowSet(result), nil
+	rowSet := NewRowSet()
+	_, err := bcp.scanner.StreamScanRegex(column, pattern, func(rowIdx int) bool {
+		rowSet.Add(rowIdx)
+		return true
+	})
+	return rowSet, err
 }
 
 // ScanRegexNotMatch scans for rows where column does not match regex
 func (bcp *BlockColumnProvider) ScanRegexNotMatch(column string, pattern string) (vm.RowSet, error) {
-	result, err := bcp.scanner.ScanRegexNotMatch(column, pattern)
-	if err != nil {
-		return nil, err
-	}
-	return columnMatchResultToRowSet(result), nil
+	rowSet := NewRowSet()
+	_, err := bcp.scanner.StreamScanRegexNotMatch(column, pattern, func(rowIdx int) bool {
+		rowSet.Add(rowIdx)
+		return true
+	})
+	return rowSet, err
 }
 
 // ScanContains scans for rows where column contains substring
 func (bcp *BlockColumnProvider) ScanContains(column string, substring string) (vm.RowSet, error) {
-	result, err := bcp.scanner.ScanContains(column, substring)
-	if err != nil {
-		return nil, err
-	}
-	return columnMatchResultToRowSet(result), nil
+	rowSet := NewRowSet()
+	_, err := bcp.scanner.StreamScanContains(column, substring, func(rowIdx int) bool {
+		rowSet.Add(rowIdx)
+		return true
+	})
+	return rowSet, err
 }
 
 // GetValue returns the value at a specific row index
@@ -175,7 +186,11 @@ func (bcp *BlockColumnProvider) GetValue(column string, rowIdx int) (interface{}
 	default:
 		// Range-bucketed types (ColumnTypeRangeInt64, ColumnTypeRangeUint64, ColumnTypeRangeDuration)
 		// do not support direct value retrieval. They are used for dedicated column indexing only.
-		return nil, false, fmt.Errorf("column %q with type %v does not support GetValue (range-bucketed columns require dedicated column access)", column, col.Type)
+		return nil, false, fmt.Errorf(
+			"column %q with type %v does not support GetValue (range-bucketed columns require dedicated column access)",
+			column,
+			col.Type,
+		)
 	}
 }
 
@@ -187,12 +202,22 @@ func (bcp *BlockColumnProvider) Union(a, b vm.RowSet) vm.RowSet {
 	aRowSet, ok := a.(*RowSet)
 	if !ok {
 		// This is a programmer error - wrong RowSet implementation was passed
-		panic(fmt.Sprintf("BlockColumnProvider.Union: expected *RowSet for parameter a, got %T - this indicates a bug in query execution", a))
+		panic(
+			fmt.Sprintf(
+				"BlockColumnProvider.Union: expected *RowSet for parameter a, got %T - this indicates a bug in query execution",
+				a,
+			),
+		)
 	}
 	bRowSet, ok := b.(*RowSet)
 	if !ok {
 		// This is a programmer error - wrong RowSet implementation was passed
-		panic(fmt.Sprintf("BlockColumnProvider.Union: expected *RowSet for parameter b, got %T - this indicates a bug in query execution", b))
+		panic(
+			fmt.Sprintf(
+				"BlockColumnProvider.Union: expected *RowSet for parameter b, got %T - this indicates a bug in query execution",
+				b,
+			),
+		)
 	}
 	return aRowSet.Union(bRowSet)
 }
@@ -202,11 +227,21 @@ func (bcp *BlockColumnProvider) Union(a, b vm.RowSet) vm.RowSet {
 func (bcp *BlockColumnProvider) Intersect(a, b vm.RowSet) vm.RowSet {
 	aRowSet, ok := a.(*RowSet)
 	if !ok {
-		panic(fmt.Sprintf("BlockColumnProvider.Intersect: expected *RowSet for parameter a, got %T - this indicates a bug in query execution", a))
+		panic(
+			fmt.Sprintf(
+				"BlockColumnProvider.Intersect: expected *RowSet for parameter a, got %T - this indicates a bug in query execution",
+				a,
+			),
+		)
 	}
 	bRowSet, ok := b.(*RowSet)
 	if !ok {
-		panic(fmt.Sprintf("BlockColumnProvider.Intersect: expected *RowSet for parameter b, got %T - this indicates a bug in query execution", b))
+		panic(
+			fmt.Sprintf(
+				"BlockColumnProvider.Intersect: expected *RowSet for parameter b, got %T - this indicates a bug in query execution",
+				b,
+			),
+		)
 	}
 	return aRowSet.Intersect(bRowSet)
 }
@@ -216,7 +251,12 @@ func (bcp *BlockColumnProvider) Intersect(a, b vm.RowSet) vm.RowSet {
 func (bcp *BlockColumnProvider) Complement(rs vm.RowSet) vm.RowSet {
 	rowSet, ok := rs.(*RowSet)
 	if !ok {
-		panic(fmt.Sprintf("BlockColumnProvider.Complement: expected *RowSet for parameter rs, got %T - this indicates a bug in query execution", rs))
+		panic(
+			fmt.Sprintf(
+				"BlockColumnProvider.Complement: expected *RowSet for parameter rs, got %T - this indicates a bug in query execution",
+				rs,
+			),
+		)
 	}
 	return rowSet.Complement(bcp.block.SpanCount())
 }
@@ -232,32 +272,56 @@ func (bcp *BlockColumnProvider) FullScan() vm.RowSet {
 
 // StreamScanEqual scans for rows where column equals value, calling callback for each match
 // This is optimized to avoid RowSet allocation by streaming directly from the scanner
-func (bcp *BlockColumnProvider) StreamScanEqual(column string, value interface{}, callback vm.RowCallback) (int, error) {
+func (bcp *BlockColumnProvider) StreamScanEqual(
+	column string,
+	value interface{},
+	callback vm.RowCallback,
+) (int, error) {
 	return bcp.scanner.StreamScanEqual(column, value, callback)
 }
 
 // StreamScanNotEqual scans for rows where column != value
-func (bcp *BlockColumnProvider) StreamScanNotEqual(column string, value interface{}, callback vm.RowCallback) (int, error) {
+func (bcp *BlockColumnProvider) StreamScanNotEqual(
+	column string,
+	value interface{},
+	callback vm.RowCallback,
+) (int, error) {
 	return bcp.scanner.StreamScanNotEqual(column, value, callback)
 }
 
 // StreamScanLessThan scans for rows where column < value
-func (bcp *BlockColumnProvider) StreamScanLessThan(column string, value interface{}, callback vm.RowCallback) (int, error) {
+func (bcp *BlockColumnProvider) StreamScanLessThan(
+	column string,
+	value interface{},
+	callback vm.RowCallback,
+) (int, error) {
 	return bcp.scanner.StreamScanLessThan(column, value, callback)
 }
 
 // StreamScanLessThanOrEqual scans for rows where column <= value
-func (bcp *BlockColumnProvider) StreamScanLessThanOrEqual(column string, value interface{}, callback vm.RowCallback) (int, error) {
+func (bcp *BlockColumnProvider) StreamScanLessThanOrEqual(
+	column string,
+	value interface{},
+	callback vm.RowCallback,
+) (int, error) {
 	return bcp.scanner.StreamScanLessThanOrEqual(column, value, callback)
 }
 
 // StreamScanGreaterThan scans for rows where column > value
-func (bcp *BlockColumnProvider) StreamScanGreaterThan(column string, value interface{}, callback vm.RowCallback) (int, error) {
+func (bcp *BlockColumnProvider) StreamScanGreaterThan(
+	column string,
+	value interface{},
+	callback vm.RowCallback,
+) (int, error) {
 	return bcp.scanner.StreamScanGreaterThan(column, value, callback)
 }
 
 // StreamScanGreaterThanOrEqual scans for rows where column >= value
-func (bcp *BlockColumnProvider) StreamScanGreaterThanOrEqual(column string, value interface{}, callback vm.RowCallback) (int, error) {
+func (bcp *BlockColumnProvider) StreamScanGreaterThanOrEqual(
+	column string,
+	value interface{},
+	callback vm.RowCallback,
+) (int, error) {
 	return bcp.scanner.StreamScanGreaterThanOrEqual(column, value, callback)
 }
 
@@ -277,12 +341,20 @@ func (bcp *BlockColumnProvider) StreamScanRegex(column string, pattern string, c
 }
 
 // StreamScanRegexNotMatch scans for rows where column does NOT match regex pattern
-func (bcp *BlockColumnProvider) StreamScanRegexNotMatch(column string, pattern string, callback vm.RowCallback) (int, error) {
+func (bcp *BlockColumnProvider) StreamScanRegexNotMatch(
+	column string,
+	pattern string,
+	callback vm.RowCallback,
+) (int, error) {
 	return bcp.scanner.StreamScanRegexNotMatch(column, pattern, callback)
 }
 
 // StreamScanContains scans for rows where column contains substring
-func (bcp *BlockColumnProvider) StreamScanContains(column string, substring string, callback vm.RowCallback) (int, error) {
+func (bcp *BlockColumnProvider) StreamScanContains(
+	column string,
+	substring string,
+	callback vm.RowCallback,
+) (int, error) {
 	return bcp.scanner.StreamScanContains(column, substring, callback)
 }
 
@@ -296,13 +368,4 @@ func (bcp *BlockColumnProvider) StreamFullScan(callback vm.RowCallback) (int, er
 		count++
 	}
 	return count, nil
-}
-
-// columnMatchResultToRowSet converts a ColumnMatchResult to a RowSet
-func columnMatchResultToRowSet(result *ColumnMatchResult) *RowSet {
-	rowSet := NewRowSet()
-	for rowIdx := range result.MatchedRows {
-		rowSet.Add(rowIdx)
-	}
-	return rowSet
 }

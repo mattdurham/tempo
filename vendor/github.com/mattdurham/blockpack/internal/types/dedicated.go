@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"sort"
 )
 
 // Note: Dedicated columns are now auto-detected at write time.
@@ -15,8 +16,8 @@ import (
 
 // DedicatedValueKey captures a typed value used for dedicated column lookups.
 type DedicatedValueKey struct {
-	typ  ColumnType
 	data []byte
+	typ  ColumnType
 }
 
 // Type returns the column type of the key.
@@ -44,7 +45,7 @@ func BytesValueKey(val []byte) DedicatedValueKey {
 // IntValueKey builds a dedicated key for int64 values.
 func IntValueKey(val int64) DedicatedValueKey {
 	var buf [8]byte
-	binary.LittleEndian.PutUint64(buf[:], uint64(val))
+	binary.LittleEndian.PutUint64(buf[:], uint64(val)) //nolint:gosec
 	return DedicatedValueKey{typ: ColumnTypeInt64, data: buf[:]}
 }
 
@@ -75,8 +76,30 @@ func BoolValueKey(val bool) DedicatedValueKey {
 // This is used when a range column falls back to storing raw values (< 100 unique values).
 func RangeInt64ValueKey(val int64, rangeType ColumnType) DedicatedValueKey {
 	var buf [8]byte
-	binary.LittleEndian.PutUint64(buf[:], uint64(val))
+	binary.LittleEndian.PutUint64(buf[:], uint64(val)) //nolint:gosec
 	return DedicatedValueKey{typ: rangeType, data: buf[:]}
+}
+
+// RangeFloat64ValueKey builds a dedicated key for range-bucketed float64 values.
+// This is used when a range column falls back to storing raw values (< 100 unique values).
+func RangeFloat64ValueKey(val float64, rangeType ColumnType) DedicatedValueKey {
+	var buf [8]byte
+	binary.LittleEndian.PutUint64(buf[:], math.Float64bits(val))
+	return DedicatedValueKey{typ: rangeType, data: buf[:]}
+}
+
+// RangeBytesValueKey builds a dedicated key for range-bucketed bytes values.
+// This is used when a range column falls back to storing raw values (< 100 unique values).
+func RangeBytesValueKey(val []byte, rangeType ColumnType) DedicatedValueKey {
+	cp := make([]byte, len(val))
+	copy(cp, val)
+	return DedicatedValueKey{typ: rangeType, data: cp}
+}
+
+// RangeStringValueKey builds a dedicated key for range-bucketed string values.
+// This is used when a range column falls back to storing raw values (< 100 unique values).
+func RangeStringValueKey(val string, rangeType ColumnType) DedicatedValueKey {
+	return DedicatedValueKey{typ: rangeType, data: []byte(val)}
 }
 
 func (k DedicatedValueKey) encode() string {
@@ -122,133 +145,18 @@ func RangeBucketValueKey(bucketID uint16, rangeType ColumnType) DedicatedValueKe
 
 // IsRangeColumnType returns true if the column type is a range-bucketed type
 func IsRangeColumnType(typ ColumnType) bool {
-	return typ == ColumnTypeRangeInt64 || typ == ColumnTypeRangeUint64 || typ == ColumnTypeRangeDuration
-}
-
-// CalculateBuckets computes bucket boundaries for a range of values
-// Returns bucket boundaries (length = numBuckets + 1)
-// Example: minVal=0, maxVal=1000, numBuckets=10 -> [0, 100, 200, ..., 900, 1000]
-func CalculateBuckets(minVal, maxVal int64, numBuckets int) []int64 {
-	if numBuckets <= 0 {
-		numBuckets = 1
-	}
-	if numBuckets > MaxRangeBuckets {
-		numBuckets = MaxRangeBuckets
-	}
-
-	buckets := make([]int64, numBuckets+1)
-	buckets[0] = minVal
-	buckets[numBuckets] = maxVal
-
-	if minVal == maxVal || numBuckets == 1 {
-		return buckets
-	}
-
-	// Use logarithmic distribution for better coverage of power-law data (like durations)
-	// Handle minVal=0 or minVal=1 cases by starting logarithmic scale from a minimum value
-	const minLogValue = 1.0 // Start log scale from 1 to avoid log(0)
-
-	logMin := math.Log(math.Max(minLogValue, float64(minVal)))
-	logMax := math.Log(math.Max(minLogValue+1, float64(maxVal)))
-
-	if logMax <= logMin {
-		// Fallback to linear if log range is invalid (shouldn't happen with guard above)
-		rangeSize := maxVal - minVal
-		bucketSize := rangeSize / int64(numBuckets)
-		for i := 1; i < numBuckets; i++ {
-			buckets[i] = minVal + int64(i)*bucketSize
-		}
-		return buckets
-	}
-
-	logStep := (logMax - logMin) / float64(numBuckets)
-
-	for i := 1; i < numBuckets; i++ {
-		logValue := logMin + float64(i)*logStep
-		boundary := int64(math.Exp(logValue))
-
-		// Ensure boundary is within [minVal, maxVal] range
-		if boundary < minVal {
-			boundary = minVal
-		}
-		if boundary > maxVal {
-			boundary = maxVal
-		}
-
-		// Ensure monotonic increase
-		if boundary <= buckets[i-1] {
-			boundary = buckets[i-1] + 1
-		}
-
-		buckets[i] = boundary
-	}
-
-	return buckets
-}
-
-// CalculateBucketsFromValues computes quantile-based bucket boundaries for equal distribution.
-// sortedValues must be pre-sorted in ascending order.
-// This creates buckets where each bucket contains approximately the same number of values.
-func CalculateBucketsFromValues(sortedValues []int64, numBuckets int) []int64 {
-	if len(sortedValues) == 0 {
-		return []int64{0}
-	}
-
-	if numBuckets <= 0 {
-		numBuckets = 1
-	}
-	if numBuckets > MaxRangeBuckets {
-		numBuckets = MaxRangeBuckets
-	}
-
-	minVal := sortedValues[0]
-	maxVal := sortedValues[len(sortedValues)-1]
-
-	buckets := make([]int64, numBuckets+1)
-	buckets[0] = minVal
-	buckets[numBuckets] = maxVal
-
-	if minVal == maxVal || numBuckets == 1 || len(sortedValues) == 1 {
-		return buckets
-	}
-
-	// Compute quantile boundaries for equal distribution
-	for i := 1; i < numBuckets; i++ {
-		// Calculate the index in sortedValues for this quantile
-		// Use float64 for precise percentile calculation
-		percentile := float64(i) / float64(numBuckets)
-		index := int(percentile * float64(len(sortedValues)))
-
-		// Ensure index is within bounds
-		if index >= len(sortedValues) {
-			index = len(sortedValues) - 1
-		}
-
-		boundary := sortedValues[index]
-
-		// Ensure monotonic increase (handle duplicate values)
-		if boundary <= buckets[i-1] {
-			// Find next distinct value
-			for index < len(sortedValues) && sortedValues[index] <= buckets[i-1] {
-				index++
-			}
-			if index < len(sortedValues) {
-				boundary = sortedValues[index]
-			} else {
-				// No more distinct values, use maxVal
-				boundary = maxVal
-			}
-		}
-
-		buckets[i] = boundary
-	}
-
-	return buckets
+	return typ == ColumnTypeRangeInt64 ||
+		typ == ColumnTypeRangeUint64 ||
+		typ == ColumnTypeRangeDuration ||
+		typ == ColumnTypeRangeFloat64 ||
+		typ == ColumnTypeRangeBytes ||
+		typ == ColumnTypeRangeString
 }
 
 // GetBucketID returns the bucket ID (0 to numBuckets-1) for a given value
 // Buckets are: [b[0], b[1]), [b[1], b[2]), ..., [b[n-1], b[n]]
 // Last bucket is inclusive on both ends
+// Uses binary search for O(log n) performance
 func GetBucketID(value int64, buckets []int64) uint16 {
 	if len(buckets) == 0 {
 		return 0
@@ -257,17 +165,17 @@ func GetBucketID(value int64, buckets []int64) uint16 {
 		return 0
 	}
 	if value >= buckets[len(buckets)-1] {
+		//nolint:gosec // Reviewed and acceptable
 		return uint16(len(buckets) - 2) // Last bucket
 	}
 
-	// Binary search for bucket
-	for i := 1; i < len(buckets); i++ {
-		if value < buckets[i] {
-			return uint16(i - 1)
-		}
-	}
+	// Binary search: find smallest index i where buckets[i] > value
+	i := sort.Search(len(buckets), func(j int) bool {
+		return buckets[j] > value
+	})
 
-	return uint16(len(buckets) - 2)
+	// value is in bucket [i-1, i), so return bucket ID i-1
+	return uint16(i - 1) //nolint:gosec // Reviewed and acceptable
 }
 
 // GetBucketsForRange returns bucket IDs that intersect with [minValue, maxValue]
@@ -285,9 +193,17 @@ func GetBucketsForRange(minValue, maxValue *int64, minInclusive, maxInclusive bo
 		bucketMax := buckets[bucketID+1]
 
 		// Check if this bucket intersects with the query range
-		intersects := rangeIntersectsBucket(minValue, maxValue, minInclusive, maxInclusive, bucketMin, bucketMax, bucketID == numBuckets-1)
+		intersects := rangeIntersectsBucket(
+			minValue,
+			maxValue,
+			minInclusive,
+			maxInclusive,
+			bucketMin,
+			bucketMax,
+			bucketID == numBuckets-1,
+		)
 		if intersects {
-			result = append(result, uint16(bucketID))
+			result = append(result, uint16(bucketID)) //nolint:gosec
 		}
 	}
 
@@ -295,7 +211,12 @@ func GetBucketsForRange(minValue, maxValue *int64, minInclusive, maxInclusive bo
 }
 
 // rangeIntersectsBucket checks if query range intersects with bucket range
-func rangeIntersectsBucket(queryMin, queryMax *int64, minInclusive, maxInclusive bool, bucketMin, bucketMax int64, isLastBucket bool) bool {
+func rangeIntersectsBucket(
+	queryMin, queryMax *int64,
+	minInclusive, maxInclusive bool,
+	bucketMin, bucketMax int64,
+	isLastBucket bool,
+) bool {
 	// Bucket range: [bucketMin, bucketMax) for all buckets except last
 	// Last bucket: [bucketMin, bucketMax] (inclusive on both ends)
 

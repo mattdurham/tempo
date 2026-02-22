@@ -3,6 +3,7 @@ package encodings
 import (
 	"bytes"
 	"encoding/binary"
+
 	"github.com/klauspost/compress/zstd"
 )
 
@@ -24,18 +25,18 @@ func BuildBytesInline(
 	}
 
 	_ = buf.WriteByte(encodingKind)
-	_ = binary.Write(buf, binary.LittleEndian, uint32(spanCount))
-	_ = binary.Write(buf, binary.LittleEndian, uint32(len(presenceRLE)))
+	_ = binary.Write(buf, binary.LittleEndian, uint32(spanCount))        //nolint:gosec
+	_ = binary.Write(buf, binary.LittleEndian, uint32(len(presenceRLE))) //nolint:gosec
 	_, _ = buf.Write(presenceRLE)
 
 	if useSparse {
-		_ = binary.Write(buf, binary.LittleEndian, uint32(presentCount))
+		_ = binary.Write(buf, binary.LittleEndian, uint32(presentCount)) //nolint:gosec
 		for i := 0; i < spanCount; i++ {
 			if !isBitSet(present, i) {
 				continue
 			}
 			val := dictVals[indexes[i]]
-			_ = binary.Write(buf, binary.LittleEndian, uint32(len(val)))
+			_ = binary.Write(buf, binary.LittleEndian, uint32(len(val))) //nolint:gosec
 			if len(val) > 0 {
 				_, _ = buf.Write(val)
 			}
@@ -47,7 +48,7 @@ func BuildBytesInline(
 				continue
 			}
 			val := dictVals[indexes[i]]
-			_ = binary.Write(buf, binary.LittleEndian, uint32(len(val)))
+			_ = binary.Write(buf, binary.LittleEndian, uint32(len(val))) //nolint:gosec
 			if len(val) > 0 {
 				_, _ = buf.Write(val)
 			}
@@ -78,14 +79,14 @@ func BuildBytesDictionary(
 
 	_ = buf.WriteByte(encodingKind)
 	_ = buf.WriteByte(width)
-	_ = binary.Write(buf, binary.LittleEndian, uint32(len(compressedDict)))
+	_ = binary.Write(buf, binary.LittleEndian, uint32(len(compressedDict))) //nolint:gosec
 	_, _ = buf.Write(compressedDict)
-	_ = binary.Write(buf, binary.LittleEndian, uint32(spanCount))
-	_ = binary.Write(buf, binary.LittleEndian, uint32(len(presenceRLE)))
+	_ = binary.Write(buf, binary.LittleEndian, uint32(spanCount))        //nolint:gosec
+	_ = binary.Write(buf, binary.LittleEndian, uint32(len(presenceRLE))) //nolint:gosec
 	_, _ = buf.Write(presenceRLE)
 
 	if useSparse {
-		_ = binary.Write(buf, binary.LittleEndian, uint32(presentCount))
+		_ = binary.Write(buf, binary.LittleEndian, uint32(presentCount)) //nolint:gosec
 		for i := 0; i < spanCount; i++ {
 			if isBitSet(present, i) {
 				_ = WriteFixedWidth(buf, indexes[i], width)

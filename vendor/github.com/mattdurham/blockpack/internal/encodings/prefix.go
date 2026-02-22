@@ -3,8 +3,9 @@ package encodings
 import (
 	"bytes"
 	"encoding/binary"
-	"github.com/klauspost/compress/zstd"
 	"strings"
+
+	"github.com/klauspost/compress/zstd"
 )
 
 // BuildPrefixBytes encodes a bytes column using prefix compression.
@@ -27,8 +28,8 @@ func BuildPrefixBytes(
 	}
 
 	_ = buf.WriteByte(encodingKind)
-	_ = binary.Write(buf, binary.LittleEndian, uint32(spanCount))
-	_ = binary.Write(buf, binary.LittleEndian, uint32(len(presenceRLE)))
+	_ = binary.Write(buf, binary.LittleEndian, uint32(spanCount))        //nolint:gosec
+	_ = binary.Write(buf, binary.LittleEndian, uint32(len(presenceRLE))) //nolint:gosec
 	_, _ = buf.Write(presenceRLE)
 
 	// Find common prefixes by analyzing all values
@@ -56,16 +57,16 @@ func BuildPrefixBytes(
 	prefixMap := make(map[string]uint32)
 	for prefix, count := range prefixCounts {
 		if count >= 2 {
-			prefixMap[prefix] = uint32(len(prefixList))
+			prefixMap[prefix] = uint32(len(prefixList)) //nolint:gosec
 			prefixList = append(prefixList, prefix)
 		}
 	}
 
 	// Encode prefix dictionary
 	var prefixDictBuf bytes.Buffer
-	_ = binary.Write(&prefixDictBuf, binary.LittleEndian, uint32(len(prefixList)))
+	_ = binary.Write(&prefixDictBuf, binary.LittleEndian, uint32(len(prefixList))) //nolint:gosec
 	for _, prefix := range prefixList {
-		_ = binary.Write(&prefixDictBuf, binary.LittleEndian, uint32(len(prefix)))
+		_ = binary.Write(&prefixDictBuf, binary.LittleEndian, uint32(len(prefix))) //nolint:gosec
 		_, _ = prefixDictBuf.Write([]byte(prefix))
 	}
 	compressedPrefixDict := CompressZstd(prefixDictBuf.Bytes(), encoder)
@@ -101,7 +102,7 @@ func BuildPrefixBytes(
 		} else {
 			suffix = value
 		}
-		_ = binary.Write(&suffixBuf, binary.LittleEndian, uint32(len(suffix)))
+		_ = binary.Write(&suffixBuf, binary.LittleEndian, uint32(len(suffix))) //nolint:gosec
 		_, _ = suffixBuf.Write([]byte(suffix))
 	}
 
@@ -109,9 +110,9 @@ func BuildPrefixBytes(
 	compressedSuffixes := CompressZstd(suffixBuf.Bytes(), encoder)
 
 	// Write compressed data
-	_ = binary.Write(buf, binary.LittleEndian, uint32(len(compressedPrefixDict)))
+	_ = binary.Write(buf, binary.LittleEndian, uint32(len(compressedPrefixDict))) //nolint:gosec
 	_, _ = buf.Write(compressedPrefixDict)
-	_ = binary.Write(buf, binary.LittleEndian, uint32(len(compressedSuffixes)))
+	_ = binary.Write(buf, binary.LittleEndian, uint32(len(compressedSuffixes))) //nolint:gosec
 	_, _ = buf.Write(compressedSuffixes)
 
 	return nil

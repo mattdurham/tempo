@@ -58,7 +58,7 @@ func (c *Column) BoolDict() (dict []uint8, indices []uint32) {
 
 // Float64Dict returns the float64 dictionary and index array for optimized scanning.
 func (c *Column) Float64Dict() (dict []float64, indices []uint32) {
-	if c.Type != ColumnTypeFloat64 {
+	if c.Type != ColumnTypeFloat64 && c.Type != ColumnTypeRangeFloat64 {
 		return nil, nil
 	}
 	return c.floatDict, c.floatIndexes
@@ -66,7 +66,7 @@ func (c *Column) Float64Dict() (dict []float64, indices []uint32) {
 
 // BytesDict returns the bytes dictionary and index array when using dictionary encoding.
 func (c *Column) BytesDict() (dict [][]byte, indices []uint32) {
-	if c.Type != ColumnTypeBytes || c.bytesInline != nil {
+	if (c.Type != ColumnTypeBytes && c.Type != ColumnTypeRangeBytes) || c.bytesInline != nil {
 		return nil, nil
 	}
 	return c.bytesDict, c.bytesIndexes
@@ -74,7 +74,7 @@ func (c *Column) BytesDict() (dict [][]byte, indices []uint32) {
 
 // BytesInline returns inline bytes values when using inline encoding.
 func (c *Column) BytesInline() [][]byte {
-	if c.Type != ColumnTypeBytes {
+	if c.Type != ColumnTypeBytes && c.Type != ColumnTypeRangeBytes {
 		return nil
 	}
 	return c.bytesInline
@@ -84,18 +84,21 @@ func (c *Column) BytesInline() [][]byte {
 func (c *Column) ReuseIndexSlice(rowCount uint32) []uint32 {
 	var existing []uint32
 	switch c.Type {
-	case ColumnTypeString:
+	case ColumnTypeString, ColumnTypeRangeString:
 		existing = c.stringValues
-	case ColumnTypeInt64:
+	case ColumnTypeInt64, ColumnTypeRangeInt64, ColumnTypeRangeDuration:
 		existing = c.intIndexes
-	case ColumnTypeUint64:
+	case ColumnTypeUint64, ColumnTypeRangeUint64:
 		existing = c.uintIndexes
 	case ColumnTypeBool:
 		existing = c.boolIndexes
-	case ColumnTypeFloat64:
+	case ColumnTypeFloat64, ColumnTypeRangeFloat64:
 		existing = c.floatIndexes
-	case ColumnTypeBytes:
+	case ColumnTypeBytes, ColumnTypeRangeBytes:
 		existing = c.bytesIndexes
+	default:
+		// For unknown types, create a new slice
+		return make([]uint32, rowCount)
 	}
 
 	if cap(existing) >= int(rowCount) {

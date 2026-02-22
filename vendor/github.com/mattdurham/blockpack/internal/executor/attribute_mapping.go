@@ -37,20 +37,20 @@ func attributePathToColumnNameUncached(attrPath string) string {
 	// Handle unscoped span intrinsics (for TraceQL compatibility)
 	// These are normalized to span: notation during compilation
 	switch attrPath {
-	case "name":
-		return "span:name"
-	case "kind":
-		return "span:kind"
-	case "status":
-		return "span:status"
-	case "status_message":
-		return "span:status_message"
-	case "duration":
-		return "span:duration"
-	case "start":
-		return "span:start"
-	case "end":
-		return "span:end"
+	case UnscopedName:
+		return IntrinsicSpanName
+	case UnscopedKind:
+		return IntrinsicSpanKind
+	case UnscopedStatus:
+		return IntrinsicSpanStatus
+	case UnscopedStatusMessage:
+		return IntrinsicSpanStatusMessage
+	case UnscopedDuration:
+		return IntrinsicSpanDuration
+	case UnscopedStart:
+		return IntrinsicSpanStart
+	case UnscopedEnd:
+		return IntrinsicSpanEnd
 	}
 
 	// Span-scoped paths with . are attributes (not intrinsics)
@@ -211,16 +211,16 @@ func getPossibleColumnNamesUncached(attrPath string) []string {
 func isTraceIntrinsic(attrPath string) bool {
 	switch attrPath {
 	// Span-level intrinsics (use colon notation)
-	case "trace:id",
-		"span:id",
-		"span:parent_id",
-		"span:name",
-		"span:status",
-		"span:kind",
-		"span:status_message",
-		"span:start",
-		"span:end",
-		"span:duration":
+	case IntrinsicTraceID,
+		IntrinsicSpanID,
+		IntrinsicSpanParentID,
+		IntrinsicSpanName,
+		IntrinsicSpanStatus,
+		IntrinsicSpanKind,
+		IntrinsicSpanStatusMessage,
+		IntrinsicSpanStart,
+		IntrinsicSpanEnd,
+		IntrinsicSpanDuration:
 		return true
 	// Event intrinsics (use colon notation)
 	case "event:name",

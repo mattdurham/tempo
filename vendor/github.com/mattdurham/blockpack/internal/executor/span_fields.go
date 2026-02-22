@@ -4,27 +4,27 @@ package executor
 // Intrinsic fields are stored as typed struct fields (no boxing during materialization).
 // Dynamic attributes are stored in a map (only for projected attributes from WHERE clause).
 type SpanFields struct {
+	// Dynamic attributes (projected from WHERE clause)
+	// This map is much smaller than the old map[string]any approach
+	// which stored ALL fields (intrinsics + attributes)
+	Attributes map[string]any
 	// Intrinsic fields (typed - no boxing!)
 	TraceID         string
 	SpanID          string
 	ParentSpanID    string
 	Name            string
-	StartTime       uint64
-	EndTime         uint64
-	Duration        uint64
-	Status          int64
-	Kind            int64
 	StatusMessage   string
 	ResourceService string
+
+	StartTime uint64
+	EndTime   uint64
+	Duration  uint64
+	Status    int64
+	Kind      int64
 
 	// Bitmask indicating which intrinsic fields are present
 	// This avoids needing pointer types which would allocate
 	HasFields uint16
-
-	// Dynamic attributes (projected from WHERE clause)
-	// This map is much smaller than the old map[string]any approach
-	// which stored ALL fields (intrinsics + attributes)
-	Attributes map[string]any
 }
 
 // Bitmask constants for intrinsic field presence
@@ -47,15 +47,15 @@ const (
 func (sf *SpanFields) GetField(name string) (any, bool) {
 	// Check intrinsic fields first (boxes on access, but only if accessed)
 	switch name {
-	case "trace:id":
+	case IntrinsicTraceID:
 		if sf.HasFields&HasTraceID != 0 {
 			return sf.TraceID, true
 		}
-	case "span:id":
+	case IntrinsicSpanID:
 		if sf.HasFields&HasSpanID != 0 {
 			return sf.SpanID, true
 		}
-	case "span:parent_id":
+	case IntrinsicSpanParentID:
 		if sf.HasFields&HasParentSpanID != 0 {
 			return sf.ParentSpanID, true
 		}
@@ -71,7 +71,7 @@ func (sf *SpanFields) GetField(name string) (any, bool) {
 		if sf.HasFields&HasEndTime != 0 {
 			return sf.EndTime, true
 		}
-	case "span:duration":
+	case IntrinsicSpanDuration:
 		if sf.HasFields&HasDuration != 0 {
 			return sf.Duration, true
 		}
@@ -108,17 +108,17 @@ func (sf *SpanFields) GetField(name string) (any, bool) {
 func (sf *SpanFields) IterateFields(fn func(name string, value any) bool) {
 	// Iterate intrinsic fields (boxes on iteration)
 	if sf.HasFields&HasTraceID != 0 {
-		if !fn("trace:id", sf.TraceID) {
+		if !fn(IntrinsicTraceID, sf.TraceID) {
 			return
 		}
 	}
 	if sf.HasFields&HasSpanID != 0 {
-		if !fn("span:id", sf.SpanID) {
+		if !fn(IntrinsicSpanID, sf.SpanID) {
 			return
 		}
 	}
 	if sf.HasFields&HasParentSpanID != 0 {
-		if !fn("span:parent_id", sf.ParentSpanID) {
+		if !fn(IntrinsicSpanParentID, sf.ParentSpanID) {
 			return
 		}
 	}
@@ -138,7 +138,7 @@ func (sf *SpanFields) IterateFields(fn func(name string, value any) bool) {
 		}
 	}
 	if sf.HasFields&HasDuration != 0 {
-		if !fn("span:duration", sf.Duration) {
+		if !fn(IntrinsicSpanDuration, sf.Duration) {
 			return
 		}
 	}

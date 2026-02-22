@@ -2,7 +2,7 @@ package ondisk
 
 // BoolValue returns the value at the given row if present.
 func (c *Column) BoolValue(idx int) (bool, bool) {
-	if c.Type != ColumnTypeBool || !c.isPresent(idx) || idx >= len(c.boolIndexes) {
+	if c == nil || c.Type != ColumnTypeBool || !c.isPresent(idx) || idx >= len(c.boolIndexes) {
 		return false, false
 	}
 	dictIdx := c.boolIndexes[idx]

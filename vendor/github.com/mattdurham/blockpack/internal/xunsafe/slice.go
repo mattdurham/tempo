@@ -23,20 +23,20 @@ import (
 
 // BoundsCheck emulates a bounds check on a slice with the given index and
 // length.
-func BoundsCheck(n, len int) {
-	dummy := unsafe.Slice(&struct{}{}, len&^math.MinInt)
+func BoundsCheck(n, length int) {
+	dummy := unsafe.Slice(&struct{}{}, length&^math.MinInt) //nolint:gosec
 	_ = dummy[n]
 }
 
 // Bytes converts a pointer into a slice of its contents.
 func Bytes[P ~*E, E any](p P) []byte {
 	size := layout.Size[E]()
-	return unsafe.Slice(Cast[byte](p), size)
+	return unsafe.Slice(Cast[byte](p), size) //nolint:gosec
 }
 
 // LoadSlice loads a slice without performing a bounds check.
 func LoadSlice[S ~[]E, E any, I Int](s S, n I) E {
-	return Load(unsafe.SliceData(s), n)
+	return Load(unsafe.SliceData(s), n) //nolint:gosec
 }
 
 // SliceToString converts a slice into a string, multiplying the slice length
@@ -46,7 +46,7 @@ func SliceToString[S ~[]E, E any](s S) string {
 	str := struct {
 		ptr *E
 		len int
-	}{unsafe.SliceData(s), len(s) * size}
+	}{unsafe.SliceData(s), len(s) * size} //nolint:gosec
 	return BitCast[string](str)
 }
 
@@ -54,5 +54,5 @@ func SliceToString[S ~[]E, E any](s S) string {
 // as appropriate.
 func StringToSlice[S ~[]E, E any](s string) S {
 	size := layout.Size[E]()
-	return unsafe.Slice(Cast[E](unsafe.StringData(s)), len(s)/size)
+	return unsafe.Slice(Cast[E](unsafe.StringData(s)), len(s)/size) //nolint:gosec
 }

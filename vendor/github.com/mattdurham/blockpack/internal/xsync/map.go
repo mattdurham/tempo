@@ -45,12 +45,12 @@ func (m *Map[K, V]) Store(k K, v V) {
 //
 // There is a possibility that make is called, but the return value is not
 // inserted.
-func (m *Map[K, V]) LoadOrStore(k K, make func() V) (actual V, loaded bool) {
+func (m *Map[K, V]) LoadOrStore(k K, makeFn func() V) (actual V, loaded bool) {
 	v, ok := m.Load(k)
 	if ok {
 		return v, true
 	}
-	w, ok := m.impl.LoadOrStore(k, make())
+	w, ok := m.impl.LoadOrStore(k, makeFn())
 	return w.(V), ok //nolint:errcheck
 }
 

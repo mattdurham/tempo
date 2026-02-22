@@ -1,12 +1,111 @@
-version: "2"
+# golangci-lint configuration for BlockPack
+# Comprehensive static analysis with strict enforcement
 
-run:
-  timeout: 5m
-  concurrency: 4
+version: "2"
 
 linters:
   enable:
-    - errcheck
-    - govet
-    - ineffassign
-    - misspell
+    # Correctness & Bugs
+    - errcheck        # Unchecked errors
+    - govet           # Suspicious constructs
+    - staticcheck     # Comprehensive static analysis (SA*, ST* checks)
+    - unused          # Unused code detection
+    - ineffassign     # Ineffective assignments
+    - bodyclose       # Unclosed HTTP response bodies
+    - rowserrcheck    # SQL rows.Err() checks
+    - sqlclosecheck   # SQL Close() checks
+    - nilerr          # Returning nil with non-nil error
+
+    # Security
+    - gosec           # Security vulnerabilities (G101-G602)
+
+    # Code Quality
+    - revive          # Configurable style checker (replaces golint)
+    - gocyclo         # Cyclomatic complexity (threshold: 40)
+    - dupl            # Duplicate code detection
+    - goconst         # Repeated string/number constants
+    - unconvert       # Unnecessary type conversions
+    - misspell        # Common typos in code/comments
+
+    # Performance
+    - prealloc        # Slice preallocation opportunities
+
+  settings:
+    errcheck:
+      check-type-assertions: false  # Type assertions often intentionally checked via Type field
+      check-blank: false  # Allow explicit error ignoring via _ = assignment
+
+    govet:
+      enable-all: true
+
+    gocyclo:
+      min-complexity: 40
+
+    dupl:
+      threshold: 200  # Increased to reduce noise from intentional type-specific code patterns
+
+    goconst:
+      min-len: 3
+      min-occurrences: 3
+
+    misspell:
+      locale: US
+
+    revive:
+      rules:
+        - name: blank-imports
+        - name: context-as-argument
+        - name: dot-imports
+        - name: error-return
+        - name: error-strings
+        - name: error-naming
+        - name: exported
+        - name: if-return
+        - name: increment-decrement
+        - name: var-naming
+        - name: var-declaration
+        - name: package-comments
+        - name: range
+        - name: receiver-naming
+        - name: time-naming
+        - name: unexported-return
+        - name: indent-error-flow
+        - name: errorf
+        - name: empty-block
+        - name: superfluous-else
+        - name: unreachable-code
+        - name: redefines-builtin-id
+
+    staticcheck:
+      checks: ["all"]
+
+    gosec:
+      excludes:
+        - G104  # Allow unhandled errors where errcheck is sufficient
+
+  exclusions:
+    # Exclude specific directories
+    paths:
+      - benchmark
+      - bots
+      - tempo_parquet_comparison
+      - real_world_comparison
+
+    # Exclude some linters from test files
+    rules:
+      - path: _test\.go
+        linters:
+          - dupl
+          - goconst
+
+      # Exclude G404 (weak random number generator) for tests - crypto/rand not needed for test data
+      - path: _test\.go
+        text: "G404:"
+        linters:
+          - gosec
+
+      # "shared" is an established package name in this codebase used for cross-package types
+      - path: internal/blockio/shared/
+        text: "avoid meaningless package names"
+        linters:
+          - revive

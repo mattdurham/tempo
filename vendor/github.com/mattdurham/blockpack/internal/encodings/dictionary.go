@@ -3,9 +3,47 @@ package encodings
 import (
 	"bytes"
 	"encoding/binary"
+	"math"
+	"unsafe"
 
 	"github.com/klauspost/compress/zstd"
 )
+
+// unsafeStringToBytes converts a string to []byte without allocation.
+// WARNING: This is only safe when the returned slice is used immediately
+// and not stored, as the string data is immutable.
+func unsafeStringToBytes(s string) []byte {
+	return unsafe.Slice(unsafe.StringData(s), len(s)) //nolint:gosec // Reviewed and acceptable
+}
+
+// writeUint32LE writes a uint32 in little-endian format without allocation.
+// Uses a stack-allocated buffer instead of binary.Write which allocates.
+func writeUint32LE(buf *bytes.Buffer, v uint32) {
+	var b [4]byte
+	binary.LittleEndian.PutUint32(b[:], v)
+	buf.Write(b[:])
+}
+
+// writeUint64LE writes a uint64 in little-endian format without allocation.
+func writeUint64LE(buf *bytes.Buffer, v uint64) {
+	var b [8]byte
+	binary.LittleEndian.PutUint64(b[:], v)
+	buf.Write(b[:])
+}
+
+// writeInt64LE writes an int64 in little-endian format without allocation.
+func writeInt64LE(buf *bytes.Buffer, v int64) {
+	var b [8]byte
+	binary.LittleEndian.PutUint64(b[:], uint64(v)) //nolint:gosec
+	buf.Write(b[:])
+}
+
+// writeFloat64LE writes a float64 in little-endian format without allocation.
+func writeFloat64LE(buf *bytes.Buffer, v float64) {
+	var b [8]byte
+	binary.LittleEndian.PutUint64(b[:], math.Float64bits(v))
+	buf.Write(b[:])
+}
 
 // BuildStringDictionary encodes a string column using dictionary encoding.
 // It compresses the dictionary with zstd using the provided encoder.
@@ -24,11 +62,17 @@ func BuildStringDictionary(
 
 	// Build and compress dictionary
 	var dictBuf bytes.Buffer
-	_ = binary.Write(&dictBuf, binary.LittleEndian, uint32(len(dictVals)))
+	// Use stack buffer to avoid binary.Write allocation
+	var lenBuf [4]byte
+	binary.LittleEndian.PutUint32(lenBuf[:], uint32(len(dictVals))) //nolint:gosec
+	dictBuf.Write(lenBuf[:])
+
 	for _, val := range dictVals {
-		_ = binary.Write(&dictBuf, binary.LittleEndian, uint32(len(val)))
-		// BOT: Can we use unsafe here to avoid the allocation?
-		if _, err := dictBuf.Write([]byte(val)); err != nil {
+		binary.LittleEndian.PutUint32(lenBuf[:], uint32(len(val))) //nolint:gosec
+		dictBuf.Write(lenBuf[:])
+		// Use unsafe conversion to avoid allocation when writing string to buffer
+		// Safe because we're immediately writing to buffer, not storing the reference
+		if _, err := dictBuf.Write(unsafeStringToBytes(val)); err != nil {
 			return err
 		}
 	}
@@ -46,12 +90,8 @@ func BuildStringDictionary(
 	// Try RLE encoding
 	var indexesToEncode []uint32
 	if useSparse {
-		indexesToEncode = make([]uint32, 0, presentCount)
-		for i := 0; i < spanCount; i++ {
-			if isBitSet(present, i) {
-				indexesToEncode = append(indexesToEncode, indexes[i])
-			}
-		}
+		// Use optimized word-level bitset scanning for sparse data
+		indexesToEncode = extractSetIndices(present, indexes, spanCount, presentCount)
 	} else {
 		indexesToEncode = indexes
 	}
@@ -71,19 +111,19 @@ func BuildStringDictionary(
 
 	_ = buf.WriteByte(encodingKind)
 	_ = buf.WriteByte(width)
-	_ = binary.Write(buf, binary.LittleEndian, uint32(len(compressedDict)))
+	writeUint32LE(buf, uint32(len(compressedDict))) //nolint:gosec
 	_, _ = buf.Write(compressedDict)
-	_ = binary.Write(buf, binary.LittleEndian, uint32(spanCount))
-	_ = binary.Write(buf, binary.LittleEndian, uint32(len(presenceRLE)))
+	writeUint32LE(buf, uint32(spanCount))        //nolint:gosec
+	writeUint32LE(buf, uint32(len(presenceRLE))) //nolint:gosec
 	_, _ = buf.Write(presenceRLE)
 
 	if useRLE {
 		// Write RLE-encoded indices
-		_ = binary.Write(buf, binary.LittleEndian, uint32(len(indexesToEncode)))
-		_ = binary.Write(buf, binary.LittleEndian, uint32(len(rleIndexes)))
+		writeUint32LE(buf, uint32(len(indexesToEncode))) //nolint:gosec
+		writeUint32LE(buf, uint32(len(rleIndexes)))      //nolint:gosec
 		_, _ = buf.Write(rleIndexes)
 	} else if useSparse {
-		_ = binary.Write(buf, binary.LittleEndian, uint32(presentCount))
+		writeUint32LE(buf, uint32(presentCount)) //nolint:gosec
 		for i := 0; i < spanCount; i++ {
 			if isBitSet(present, i) {
 				_ = WriteFixedWidth(buf, indexes[i], width)
@@ -99,6 +139,8 @@ func BuildStringDictionary(
 
 // BuildInt64Dictionary encodes an int64 column using dictionary encoding.
 // BOT: Are there commonalities here that would be shared between these two build functions?
+//
+//nolint:dupl // Similar to BuildStringDictionary but type-specific optimizations differ
 func BuildInt64Dictionary(
 	encoder *zstd.Encoder,
 	buf *bytes.Buffer,
@@ -113,9 +155,9 @@ func BuildInt64Dictionary(
 
 	// Build and compress dictionary
 	var dictBuf bytes.Buffer
-	_ = binary.Write(&dictBuf, binary.LittleEndian, uint32(len(dictVals)))
+	writeUint32LE(&dictBuf, uint32(len(dictVals))) //nolint:gosec
 	for _, v := range dictVals {
-		_ = binary.Write(&dictBuf, binary.LittleEndian, v)
+		writeInt64LE(&dictBuf, v)
 	}
 	compressedDict := CompressZstd(dictBuf.Bytes(), encoder)
 
@@ -131,12 +173,8 @@ func BuildInt64Dictionary(
 	// Try RLE encoding
 	var indexesToEncode []uint32
 	if useSparse {
-		indexesToEncode = make([]uint32, 0, presentCount)
-		for i := 0; i < spanCount; i++ {
-			if isBitSet(present, i) {
-				indexesToEncode = append(indexesToEncode, indexes[i])
-			}
-		}
+		// Use optimized word-level bitset scanning for sparse data
+		indexesToEncode = extractSetIndices(present, indexes, spanCount, presentCount)
 	} else {
 		indexesToEncode = indexes
 	}
@@ -156,19 +194,19 @@ func BuildInt64Dictionary(
 
 	_ = buf.WriteByte(encodingKind)
 	_ = buf.WriteByte(width)
-	_ = binary.Write(buf, binary.LittleEndian, uint32(len(compressedDict)))
+	writeUint32LE(buf, uint32(len(compressedDict))) //nolint:gosec
 	_, _ = buf.Write(compressedDict)
-	_ = binary.Write(buf, binary.LittleEndian, uint32(spanCount))
-	_ = binary.Write(buf, binary.LittleEndian, uint32(len(presenceRLE)))
+	writeUint32LE(buf, uint32(spanCount))        //nolint:gosec
+	writeUint32LE(buf, uint32(len(presenceRLE))) //nolint:gosec
 	_, _ = buf.Write(presenceRLE)
 
 	if useRLE {
 		// Write RLE-encoded indices
-		_ = binary.Write(buf, binary.LittleEndian, uint32(len(indexesToEncode)))
-		_ = binary.Write(buf, binary.LittleEndian, uint32(len(rleIndexes)))
+		writeUint32LE(buf, uint32(len(indexesToEncode))) //nolint:gosec
+		writeUint32LE(buf, uint32(len(rleIndexes)))      //nolint:gosec
 		_, _ = buf.Write(rleIndexes)
 	} else if useSparse {
-		_ = binary.Write(buf, binary.LittleEndian, uint32(presentCount))
+		writeUint32LE(buf, uint32(presentCount)) //nolint:gosec
 		for i := 0; i < spanCount; i++ {
 			if isBitSet(present, i) {
 				_ = WriteFixedWidth(buf, indexes[i], width)
@@ -183,6 +221,8 @@ func BuildInt64Dictionary(
 }
 
 // BuildUint64Dictionary encodes a uint64 column using dictionary encoding.
+//
+//nolint:dupl // Type-specific dictionary encoding; duplication is intentional for performance
 func BuildUint64Dictionary(
 	encoder *zstd.Encoder,
 	buf *bytes.Buffer,
@@ -197,9 +237,9 @@ func BuildUint64Dictionary(
 
 	// Build and compress dictionary
 	var dictBuf bytes.Buffer
-	_ = binary.Write(&dictBuf, binary.LittleEndian, uint32(len(dictVals)))
+	writeUint32LE(&dictBuf, uint32(len(dictVals))) //nolint:gosec
 	for _, v := range dictVals {
-		_ = binary.Write(&dictBuf, binary.LittleEndian, v)
+		writeUint64LE(&dictBuf, v)
 	}
 	compressedDict := CompressZstd(dictBuf.Bytes(), encoder)
 
@@ -215,12 +255,8 @@ func BuildUint64Dictionary(
 	// Try RLE encoding
 	var indexesToEncode []uint32
 	if useSparse {
-		indexesToEncode = make([]uint32, 0, presentCount)
-		for i := 0; i < spanCount; i++ {
-			if isBitSet(present, i) {
-				indexesToEncode = append(indexesToEncode, indexes[i])
-			}
-		}
+		// Use optimized word-level bitset scanning for sparse data
+		indexesToEncode = extractSetIndices(present, indexes, spanCount, presentCount)
 	} else {
 		indexesToEncode = indexes
 	}
@@ -240,19 +276,19 @@ func BuildUint64Dictionary(
 
 	_ = buf.WriteByte(encodingKind)
 	_ = buf.WriteByte(width)
-	_ = binary.Write(buf, binary.LittleEndian, uint32(len(compressedDict)))
+	writeUint32LE(buf, uint32(len(compressedDict))) //nolint:gosec
 	_, _ = buf.Write(compressedDict)
-	_ = binary.Write(buf, binary.LittleEndian, uint32(spanCount))
-	_ = binary.Write(buf, binary.LittleEndian, uint32(len(presenceRLE)))
+	writeUint32LE(buf, uint32(spanCount))        //nolint:gosec
+	writeUint32LE(buf, uint32(len(presenceRLE))) //nolint:gosec
 	_, _ = buf.Write(presenceRLE)
 
 	if useRLE {
 		// Write RLE-encoded indices
-		_ = binary.Write(buf, binary.LittleEndian, uint32(len(indexesToEncode)))
-		_ = binary.Write(buf, binary.LittleEndian, uint32(len(rleIndexes)))
+		writeUint32LE(buf, uint32(len(indexesToEncode))) //nolint:gosec
+		writeUint32LE(buf, uint32(len(rleIndexes)))      //nolint:gosec
 		_, _ = buf.Write(rleIndexes)
 	} else if useSparse {
-		_ = binary.Write(buf, binary.LittleEndian, uint32(presentCount))
+		writeUint32LE(buf, uint32(presentCount)) //nolint:gosec
 		for i := 0; i < spanCount; i++ {
 			if isBitSet(present, i) {
 				_ = WriteFixedWidth(buf, indexes[i], width)
@@ -281,7 +317,7 @@ func BuildBoolDictionary(
 
 	// Build and compress dictionary
 	var dictBuf bytes.Buffer
-	_ = binary.Write(&dictBuf, binary.LittleEndian, uint32(len(dictVals)))
+	writeUint32LE(&dictBuf, uint32(len(dictVals))) //nolint:gosec
 	for _, v := range dictVals {
 		_ = dictBuf.WriteByte(v)
 	}
@@ -299,12 +335,8 @@ func BuildBoolDictionary(
 	// Try RLE encoding
 	var indexesToEncode []uint32
 	if useSparse {
-		indexesToEncode = make([]uint32, 0, presentCount)
-		for i := 0; i < spanCount; i++ {
-			if isBitSet(present, i) {
-				indexesToEncode = append(indexesToEncode, indexes[i])
-			}
-		}
+		// Use optimized word-level bitset scanning for sparse data
+		indexesToEncode = extractSetIndices(present, indexes, spanCount, presentCount)
 	} else {
 		indexesToEncode = indexes
 	}
@@ -324,19 +356,19 @@ func BuildBoolDictionary(
 
 	_ = buf.WriteByte(encodingKind)
 	_ = buf.WriteByte(width)
-	_ = binary.Write(buf, binary.LittleEndian, uint32(len(compressedDict)))
+	writeUint32LE(buf, uint32(len(compressedDict))) //nolint:gosec
 	_, _ = buf.Write(compressedDict)
-	_ = binary.Write(buf, binary.LittleEndian, uint32(spanCount))
-	_ = binary.Write(buf, binary.LittleEndian, uint32(len(presenceRLE)))
+	writeUint32LE(buf, uint32(spanCount))        //nolint:gosec
+	writeUint32LE(buf, uint32(len(presenceRLE))) //nolint:gosec
 	_, _ = buf.Write(presenceRLE)
 
 	if useRLE {
 		// Write RLE-encoded indices
-		_ = binary.Write(buf, binary.LittleEndian, uint32(len(indexesToEncode)))
-		_ = binary.Write(buf, binary.LittleEndian, uint32(len(rleIndexes)))
+		writeUint32LE(buf, uint32(len(indexesToEncode))) //nolint:gosec
+		writeUint32LE(buf, uint32(len(rleIndexes)))      //nolint:gosec
 		_, _ = buf.Write(rleIndexes)
 	} else if useSparse {
-		_ = binary.Write(buf, binary.LittleEndian, uint32(presentCount))
+		writeUint32LE(buf, uint32(presentCount)) //nolint:gosec
 		for i := 0; i < spanCount; i++ {
 			if isBitSet(present, i) {
 				_ = WriteFixedWidth(buf, indexes[i], width)
@@ -351,6 +383,8 @@ func BuildBoolDictionary(
 }
 
 // BuildFloat64Dictionary encodes a float64 column using dictionary encoding.
+//
+//nolint:dupl // Type-specific dictionary encoding; duplication is intentional for performance
 func BuildFloat64Dictionary(
 	encoder *zstd.Encoder,
 	buf *bytes.Buffer,
@@ -365,9 +399,9 @@ func BuildFloat64Dictionary(
 
 	// Build and compress dictionary
 	var dictBuf bytes.Buffer
-	_ = binary.Write(&dictBuf, binary.LittleEndian, uint32(len(dictVals)))
+	writeUint32LE(&dictBuf, uint32(len(dictVals))) //nolint:gosec
 	for _, v := range dictVals {
-		_ = binary.Write(&dictBuf, binary.LittleEndian, v)
+		writeFloat64LE(&dictBuf, v)
 	}
 	compressedDict := CompressZstd(dictBuf.Bytes(), encoder)
 
@@ -383,12 +417,8 @@ func BuildFloat64Dictionary(
 	// Try RLE encoding
 	var indexesToEncode []uint32
 	if useSparse {
-		indexesToEncode = make([]uint32, 0, presentCount)
-		for i := 0; i < spanCount; i++ {
-			if isBitSet(present, i) {
-				indexesToEncode = append(indexesToEncode, indexes[i])
-			}
-		}
+		// Use optimized word-level bitset scanning for sparse data
+		indexesToEncode = extractSetIndices(present, indexes, spanCount, presentCount)
 	} else {
 		indexesToEncode = indexes
 	}
@@ -408,19 +438,19 @@ func BuildFloat64Dictionary(
 
 	_ = buf.WriteByte(encodingKind)
 	_ = buf.WriteByte(width)
-	_ = binary.Write(buf, binary.LittleEndian, uint32(len(compressedDict)))
+	writeUint32LE(buf, uint32(len(compressedDict))) //nolint:gosec
 	_, _ = buf.Write(compressedDict)
-	_ = binary.Write(buf, binary.LittleEndian, uint32(spanCount))
-	_ = binary.Write(buf, binary.LittleEndian, uint32(len(presenceRLE)))
+	writeUint32LE(buf, uint32(spanCount))        //nolint:gosec
+	writeUint32LE(buf, uint32(len(presenceRLE))) //nolint:gosec
 	_, _ = buf.Write(presenceRLE)
 
 	if useRLE {
 		// Write RLE-encoded indices
-		_ = binary.Write(buf, binary.LittleEndian, uint32(len(indexesToEncode)))
-		_ = binary.Write(buf, binary.LittleEndian, uint32(len(rleIndexes)))
+		writeUint32LE(buf, uint32(len(indexesToEncode))) //nolint:gosec
+		writeUint32LE(buf, uint32(len(rleIndexes)))      //nolint:gosec
 		_, _ = buf.Write(rleIndexes)
 	} else if useSparse {
-		_ = binary.Write(buf, binary.LittleEndian, uint32(presentCount))
+		writeUint32LE(buf, uint32(presentCount)) //nolint:gosec
 		for i := 0; i < spanCount; i++ {
 			if isBitSet(present, i) {
 				_ = WriteFixedWidth(buf, indexes[i], width)

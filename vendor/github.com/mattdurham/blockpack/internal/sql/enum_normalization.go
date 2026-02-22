@@ -1,3 +1,4 @@
+// Package sql provides SQL query compilation and execution capabilities for TraceQL.
 package sql
 
 import "strings"
@@ -25,12 +26,12 @@ func normalizeEnumComparisonValue(attrPath string, value interface{}) interface{
 
 func isStatusField(attrPath string) bool {
 	normalized := normalizeFieldName(attrPath)
-	return normalized == "span:status"
+	return normalized == IntrinsicSpanStatus
 }
 
 func isKindField(attrPath string) bool {
 	normalized := normalizeFieldName(attrPath)
-	return normalized == "span:kind"
+	return normalized == IntrinsicSpanKind
 }
 
 func statusEnumValue(value string) (int64, bool) {

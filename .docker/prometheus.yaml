@@ -10,3 +10,9 @@ scrape_configs:
   - job_name: 'tempo-blockpack'
     static_configs:
       - targets: ['tempo-blockpack:3201']
+
+remote_write:
+  - url: ${GRAFANA_PROM_URL}
+    basic_auth:
+      username: ${GRAFANA_PROM_USER}
+      password: ${GRAFANA_PROM_TOKEN}

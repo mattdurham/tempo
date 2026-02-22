@@ -12,8 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package unsafe provides a more convenient interface for performing unsafe
-// operations than Go's built-in package unsafe.
+// Package xunsafe provides a more convenient interface for performing unsafe operations.
 package xunsafe
 
 import (
@@ -33,7 +32,7 @@ type Int = layout.Int
 
 // BitCast performs an unsafe bitcast from one type to another.
 func BitCast[To, From any](v From) To {
-	return *(*To)(unsafe.Pointer(&v))
+	return *(*To)(unsafe.Pointer(&v)) //nolint:gosec
 }
 
 // Ping reminds the processor that *p should be loaded into the data cache.

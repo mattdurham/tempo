@@ -27,7 +27,7 @@ live_store:
 ingest:
   enabled: true
   kafka:
-    address: kafka-parquet:9092
+    address: kafka:9092
     topic: tempo-ingest
 
 block_builder:
@@ -41,7 +41,7 @@ storage:
     backend: s3
     s3:
       bucket: tempo-parquet
-      endpoint: toxiproxy-parquet:9000
+      endpoint: toxiproxy:9000
       access_key: minioadmin
       secret_key: minioadmin
       insecure: true
@@ -61,7 +61,7 @@ backend_scheduler:
       max_jobs_per_tenant: 1000
       min_input_blocks: 2
       max_input_blocks: 4
-      max_compaction_level: 0
+      max_compaction_level: 2
       compaction:
         block_retention: 48h
         compacted_block_retention: 1h
@@ -90,20 +90,7 @@ query_frontend:
   trace_by_id:
     duration_slo: 5s
 
-metrics_generator:
-  registry:
-    external_labels:
-      source: tempo-parquet
-      cluster: docker-compose
-  storage:
-    path: /var/tempo/generator/wal
-    remote_write:
-      - url: http://prometheus-parquet:9090/api/v1/write
-        send_exemplars: true
-  traces_storage:
-    path: /var/tempo/generator/traces
-
 overrides:
   defaults:
     metrics_generator:
-      processors: [service-graphs, span-metrics]
+      processors: []

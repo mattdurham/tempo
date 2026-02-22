@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+
 	"github.com/klauspost/compress/zstd"
 )
 
@@ -29,8 +30,8 @@ func BuildDeltaUint64(
 
 	// Write span count and presence
 	// binary.Write to bytes.Buffer never fails - it only panics on out-of-memory
-	_ = binary.Write(buf, binary.LittleEndian, uint32(spanCount))
-	_ = binary.Write(buf, binary.LittleEndian, uint32(len(presenceRLE)))
+	_ = binary.Write(buf, binary.LittleEndian, uint32(spanCount))        //nolint:gosec // Reviewed and acceptable
+	_ = binary.Write(buf, binary.LittleEndian, uint32(len(presenceRLE))) //nolint:gosec // Reviewed and acceptable
 	_, _ = buf.Write(presenceRLE)
 
 	// Find min and max values to determine base timestamp and required width
@@ -110,7 +111,7 @@ func BuildDeltaUint64(
 	// Compress offsets
 	compressedOffsets := CompressZstd(offsetBuf.Bytes(), encoder)
 	// binary.Write to bytes.Buffer never fails - it only panics on out-of-memory
-	_ = binary.Write(buf, binary.LittleEndian, uint32(len(compressedOffsets)))
+	_ = binary.Write(buf, binary.LittleEndian, uint32(len(compressedOffsets))) //nolint:gosec // Reviewed and acceptable
 	_, _ = buf.Write(compressedOffsets)
 
 	return nil

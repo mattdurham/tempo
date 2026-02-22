@@ -1,6 +1,7 @@
 package vblockpack
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -23,6 +24,7 @@ type walBlock struct {
 	// Blockpack writer for serialization
 	mu     sync.Mutex
 	writer *blockpack.Writer
+	buf    *bytes.Buffer
 	file   *os.File
 }
 
@@ -85,9 +87,8 @@ func (w *walBlock) initWriter() error {
 		return fmt.Errorf("failed to create directory: %w", err)
 	}
 
-	// Create blockpack writer
-	// Use reasonable defaults: 2000 spans per block
-	writer, err := blockpack.NewWriter(2000)
+	w.buf = new(bytes.Buffer)
+	writer, err := blockpack.NewWriter(w.buf, 2000)
 	if err != nil {
 		return fmt.Errorf("failed to create blockpack writer: %w", err)
 	}
@@ -111,11 +112,11 @@ func (w *walBlock) Flush() error {
 		return nil
 	}
 
-	// Serialize blockpack to bytes
-	data, err := w.writer.Flush()
-	if err != nil {
+	// Flush blockpack writer — data is written to w.buf
+	if _, err := w.writer.Flush(); err != nil {
 		return fmt.Errorf("failed to flush blockpack writer: %w", err)
 	}
+	data := w.buf.Bytes()
 
 	// Write to disk
 	filepath := w.path + "/" + DataFileName
@@ -176,6 +177,7 @@ func (w *walBlock) Clear() error {
 
 	// Close and reset writer
 	w.writer = nil
+	w.buf = nil
 	w.file = nil
 
 	return nil

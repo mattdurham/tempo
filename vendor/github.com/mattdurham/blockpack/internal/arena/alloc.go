@@ -29,7 +29,7 @@ import (
 
 func suggestSizeLog(bytes int) uint {
 	// Snap to the next power of two.
-	return max(6, uint(bits.Len(uint(bytes)-1)))
+	return max(6, uint(bits.Len(uint(bytes)-1))) //nolint:gosec
 }
 
 // SuggestSize suggests an allocation size by rounding up to a power of 2.
@@ -45,19 +45,19 @@ func SuggestSize(bytes int) int {
 func (a *Arena) allocChunk(size int) (*byte, int) {
 	log := suggestSizeLog(size)
 	n := 1 << log
-	if int(log) < len(a.blocks) {
+	if int(log) < len(a.blocks) { //nolint:gosec // Reviewed and acceptable
 		if a.blocks[log] == nil {
-			a.blocks[log] = AllocTraceable(n, unsafe.Pointer(a))
+			a.blocks[log] = AllocTraceable(n, unsafe.Pointer(a)) //nolint:gosec
 		}
 		return a.blocks[log], n
 	}
 
-	p := AllocTraceable(n, unsafe.Pointer(a))
+	p := AllocTraceable(n, unsafe.Pointer(a)) //nolint:gosec
 	if a.blocks == nil {
 		a.blocks = make([]*byte, 64)
 		if debug.Enabled {
 			addr := xunsafe.AddrOf(a)
-			runtime.SetFinalizer(unsafe.SliceData(a.blocks), func(**byte) {
+			runtime.SetFinalizer(unsafe.SliceData(a.blocks), func(**byte) { //nolint:gosec
 				debug.Log(nil, "arena collected", "addr: %v", addr)
 			})
 		}
@@ -89,7 +89,7 @@ func AllocTraceable(size int, ptr unsafe.Pointer) *byte {
 		// Power-of-two shapes avoid needing to take a trip through reflection.
 		// Calling reflect.New() on one of these types will immediately go to
 		// runtime.mallocgc(), as if by new().
-		shape = shapes[bits.TrailingZeros(uint(size))]
+		shape = shapes[bits.TrailingZeros(uint(size))] //nolint:gosec
 	} else {
 		shape = reflect.StructOf([]reflect.StructField{
 			{Name: "Data", Type: reflect.ArrayOf(size, reflect.TypeFor[byte]())},

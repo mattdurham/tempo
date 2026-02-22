@@ -2,6 +2,8 @@ package vm
 
 import (
 	"fmt"
+	"strconv"
+	"sync"
 	"time"
 
 	"github.com/mattdurham/blockpack/internal/quantile"
@@ -11,32 +13,33 @@ import (
 
 // VM is a stack-based virtual machine for executing TraceQL bytecode
 type VM struct {
-	program  *Program
-	stack    []Value
-	sp       int // Stack pointer
-	pc       int // Program counter (current instruction index)
-	ctx      *spanContext
 	provider AttributeProvider
 	err      error
 
-	// Aggregation state
-	aggMode     bool                  // true when in aggregation mode
+	program     *Program
+	ctx         *spanContext
 	aggState    map[string]*AggBucket // serialized group key -> bucket
-	groupByVals []Value               // current span's group-by values (ordered)
+	stack       []Value
+	groupByVals []Value // current span's group-by values (ordered)
+	sp          int     // Stack pointer
+	pc          int     // Program counter (current instruction index)
+
+	// Aggregation state
+	aggMode bool // true when in aggregation mode
 }
 
 // AggBucket holds aggregation state for a single group.
 // A JSON-friendly payload used to exist but was removed; this is the sole bucket struct.
 type AggBucket struct {
+	Quantiles  map[string]*quantile.QuantileSketch // field_name -> quantile sketch
+	Histograms map[string]*HistogramData           // field_name -> histogram data
 	GroupKey   GroupKey
 	Sum        float64
 	Count      int64
 	Rate       float64
 	Min        float64
 	Max        float64
-	Quantiles  map[string]*quantile.QuantileSketch // field_name -> quantile sketch
-	Histograms map[string]*HistogramData           // field_name -> histogram data
-	SumSq      float64                             // Sum of squares for stddev calculation
+	SumSq      float64 // Sum of squares for stddev calculation
 }
 
 // Merge combines another AggBucket into this one.
@@ -137,16 +140,138 @@ type GroupKey struct {
 	Values []Value // Ordered by GROUP BY fields in query
 }
 
+// serializeBufPool provides byte buffers for GroupKey serialization
+var serializeBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 0, 256)
+		return &b
+	},
+}
+
 // Serialize converts GroupKey to string for use as map key
+// Optimized to use sync.Pool and direct byte appending instead of fmt.Sprintf
 func (gk GroupKey) Serialize() string {
 	if len(gk.Values) == 0 {
 		return ""
 	}
-	parts := make([]string, len(gk.Values))
+
+	bufPtr := serializeBufPool.Get().(*[]byte)
+	buf := (*bufPtr)[:0]
+
 	for i, val := range gk.Values {
-		parts[i] = fmt.Sprintf("%v:%v", val.Type, val.Data)
+		if i > 0 {
+			buf = append(buf, ',')
+		}
+		buf = appendGroupValue(buf, val)
 	}
-	return fmt.Sprintf("%v", parts)
+
+	result := string(buf)
+
+	// Only return reasonably-sized buffers to pool to avoid memory bloat
+	// If capacity exceeds 4KB, replace with fresh buffer
+	if cap(buf) > 4096 {
+		buf = make([]byte, 0, 256)
+	}
+	*bufPtr = buf
+	serializeBufPool.Put(bufPtr)
+	return result
+}
+
+// appendGroupValue appends a Value to a byte buffer for serialization.
+// Optimized to avoid fmt.Sprintf allocations for all common types.
+func appendGroupValue(buf []byte, val Value) []byte {
+	// Append type
+	buf = strconv.AppendInt(buf, int64(val.Type), 10)
+	buf = append(buf, ':')
+
+	// Append data based on type with checked assertions
+	switch val.Type {
+	case TypeNil:
+		buf = append(buf, "nil"...)
+	case TypeBool:
+		if b, ok := val.Data.(bool); ok {
+			if b {
+				buf = append(buf, "true"...)
+			} else {
+				buf = append(buf, "false"...)
+			}
+		} else {
+			buf = append(buf, fmt.Sprintf("%v", val.Data)...)
+		}
+	case TypeInt:
+		// Support int, int32, int64 variants
+		switch v := val.Data.(type) {
+		case int64:
+			buf = strconv.AppendInt(buf, v, 10)
+		case int:
+			buf = strconv.AppendInt(buf, int64(v), 10)
+		case int32:
+			buf = strconv.AppendInt(buf, int64(v), 10)
+		default:
+			buf = append(buf, fmt.Sprintf("%v", val.Data)...)
+		}
+	case TypeFloat:
+		if f, ok := val.Data.(float64); ok {
+			buf = strconv.AppendFloat(buf, f, 'g', -1, 64)
+		} else {
+			buf = append(buf, fmt.Sprintf("%v", val.Data)...)
+		}
+	case TypeString:
+		if s, ok := val.Data.(string); ok {
+			// Use strconv.AppendQuote to properly escape strings and prevent collisions
+			buf = strconv.AppendQuote(buf, s)
+		} else {
+			buf = append(buf, fmt.Sprintf("%v", val.Data)...)
+		}
+	case TypeDuration:
+		// Support both int64 (nanoseconds) and time.Duration
+		switch v := val.Data.(type) {
+		case int64:
+			buf = strconv.AppendInt(buf, v, 10)
+			buf = append(buf, "ns"...)
+		case time.Duration:
+			buf = strconv.AppendInt(buf, int64(v), 10)
+			buf = append(buf, "ns"...)
+		default:
+			buf = append(buf, fmt.Sprintf("%v", val.Data)...)
+		}
+	case TypeBytes:
+		if bytes, ok := val.Data.([]byte); ok {
+			// Encode bytes as hex string
+			buf = append(buf, "0x"...)
+			const hexDigits = "0123456789abcdef"
+			for _, b := range bytes {
+				buf = append(buf, hexDigits[b>>4], hexDigits[b&0xf])
+			}
+		} else {
+			buf = append(buf, fmt.Sprintf("%v", val.Data)...)
+		}
+	case TypeArray:
+		if arr, ok := val.Data.([]Value); ok {
+			// Recursively serialize array elements
+			buf = append(buf, '[')
+			for i, elem := range arr {
+				if i > 0 {
+					buf = append(buf, ',')
+				}
+				buf = appendGroupValue(buf, elem)
+			}
+			buf = append(buf, ']')
+		} else {
+			buf = append(buf, fmt.Sprintf("%v", val.Data)...)
+		}
+	case TypeJSON:
+		// JSON values are rare in group keys but must be escaped to prevent collisions
+		// Use strconv.Quote to escape any delimiter characters
+		jsonStr := fmt.Sprintf("%v", val.Data)
+		buf = strconv.AppendQuote(buf, jsonStr)
+	default:
+		// Fallback to fmt for unknown types, with escaping to prevent collisions
+		fallbackStr := fmt.Sprintf("%v", val.Data)
+		buf = strconv.AppendQuote(buf, fallbackStr)
+	}
+
+	return buf
 }
 
 // QuantileSketch is a stub for quantile operations (not used in SQL path)
@@ -311,7 +436,12 @@ func (vm *VM) loadAttribute(attrIdx int) Value {
 	// OTLP execution path not yet implemented
 	// Programs compiled by CompileTraceQLFilter() MUST be executed with an AttributeProvider
 	// (e.g., via blockpack ColumnDataProvider). Direct OTLP span execution is not supported.
-	panic(fmt.Sprintf("attribute lookup without provider: %s (OTLP execution path not implemented - use ColumnPredicate with blockpack provider)", attrName))
+	panic(
+		fmt.Sprintf(
+			"attribute lookup without provider: %s (OTLP execution path not implemented - use ColumnPredicate with blockpack provider)",
+			attrName,
+		),
+	)
 }
 
 // spanContext holds the context for attribute lookups.

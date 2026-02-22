@@ -9,6 +9,12 @@ import (
 	blockpackio "github.com/mattdurham/blockpack/internal/blockio"
 )
 
+// Compile-time interface compliance checks
+var (
+	_ FileStorage     = (*FolderStorage)(nil)
+	_ ProviderStorage = (*FolderStorage)(nil)
+)
+
 // FolderStorage provides FileStorage interface for reading files from a directory.
 type FolderStorage struct {
 	baseDir string
@@ -58,11 +64,30 @@ func (s *FolderStorage) Get(path string) ([]byte, error) {
 		return nil, err
 	}
 
-	data, err := os.ReadFile(fullPath)
+	data, err := os.ReadFile(fullPath) //nolint:gosec
 	if err != nil {
 		return nil, fmt.Errorf("failed to read file %s: %w", fullPath, err)
 	}
 	return data, nil
+}
+
+// Put writes data to the given relative path within the base directory.
+// Creates parent directories as needed.
+func (s *FolderStorage) Put(path string, data []byte) error {
+	fullPath, err := s.safePath(path)
+	if err != nil {
+		return err
+	}
+
+	if err := os.MkdirAll(filepath.Dir(fullPath), 0o750); err != nil {
+		return fmt.Errorf("create parent directories for %s: %w", fullPath, err)
+	}
+
+	if err := os.WriteFile(fullPath, data, 0o600); err != nil { //nolint:gosec
+		return fmt.Errorf("write file %s: %w", fullPath, err)
+	}
+
+	return nil
 }
 
 // GetProvider returns a reader provider for the requested path.
@@ -72,7 +97,7 @@ func (s *FolderStorage) GetProvider(path string) (blockpackio.ReaderProvider, er
 		return nil, err
 	}
 
-	file, err := os.Open(fullPath)
+	file, err := os.Open(fullPath) //nolint:gosec
 	if err != nil {
 		return nil, fmt.Errorf("failed to open file %s: %w", fullPath, err)
 	}

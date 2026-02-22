@@ -2,188 +2,11 @@ package sql
 
 import (
 	"fmt"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/auxten/postgresql-parser/pkg/sql/sem/tree"
-	"github.com/mattdurham/blockpack/internal/vm"
 )
-
-// InferType determines the VM type from a SQL expression
-func InferType(expr tree.Expr) vm.ValueType {
-	switch e := expr.(type) {
-	case *tree.NumVal:
-		// Check if it's an integer or float
-		origString := e.OrigString()
-		if strings.Contains(origString, ".") || strings.ContainsAny(origString, "eE") {
-			return vm.TypeFloat
-		}
-		return vm.TypeInt
-
-	case *tree.StrVal:
-		return vm.TypeString
-
-	case *tree.DBool:
-		return vm.TypeBool
-
-	case *tree.DInterval:
-		return vm.TypeDuration
-
-	case *tree.CastExpr:
-		// Handle explicit casts
-		return inferTypeFromCast(e)
-
-	case *tree.UnaryExpr:
-		// Handle negative numbers
-		return InferType(e.Expr)
-
-	default:
-		return vm.TypeNil
-	}
-}
-
-// inferTypeFromCast infers type from explicit CAST expressions
-func inferTypeFromCast(cast *tree.CastExpr) vm.ValueType {
-	// Check the target type using SQLString() which returns PostgreSQL type names
-	sqlType := strings.ToLower(cast.Type.SQLString())
-
-	// Match PostgreSQL internal type names (INT8, FLOAT8, STRING, BOOL, INTERVAL)
-	// as well as SQL standard names for compatibility
-	switch sqlType {
-	case "int8", "int4", "int2", "int", "integer", "bigint", "smallint":
-		return vm.TypeInt
-
-	case "float8", "float4", "float", "double", "real", "numeric", "decimal":
-		return vm.TypeFloat
-
-	case "string", "text", "varchar", "char":
-		return vm.TypeString
-
-	case "bool", "boolean":
-		return vm.TypeBool
-
-	case "interval":
-		return vm.TypeDuration
-
-	default:
-		return vm.TypeNil
-	}
-}
-
-// ConvertLiteral converts a SQL literal expression to a VM Value
-func ConvertLiteral(expr tree.Expr) (vm.Value, error) {
-	typ := InferType(expr)
-
-	switch typ {
-	case vm.TypeInt:
-		val, err := extractInt(expr)
-		if err != nil {
-			return vm.Value{}, err
-		}
-		return vm.Value{Type: vm.TypeInt, Data: val}, nil
-
-	case vm.TypeFloat:
-		val, err := extractFloat(expr)
-		if err != nil {
-			return vm.Value{}, err
-		}
-		return vm.Value{Type: vm.TypeFloat, Data: val}, nil
-
-	case vm.TypeString:
-		val := extractString(expr)
-		return vm.Value{Type: vm.TypeString, Data: val}, nil
-
-	case vm.TypeBool:
-		val := extractBool(expr)
-		return vm.Value{Type: vm.TypeBool, Data: val}, nil
-
-	case vm.TypeDuration:
-		ns, err := ConvertInterval(expr)
-		if err != nil {
-			return vm.Value{}, err
-		}
-		return vm.Value{Type: vm.TypeDuration, Data: ns}, nil
-
-	default:
-		return vm.Value{}, fmt.Errorf("unsupported type: %T", expr)
-	}
-}
-
-// extractInt extracts an int64 from a SQL expression
-func extractInt(expr tree.Expr) (int64, error) {
-	switch e := expr.(type) {
-	case *tree.NumVal:
-		// Use NumVal's built-in AsInt64() which handles the negative flag
-		val, err := e.AsInt64()
-		if err != nil {
-			return 0, fmt.Errorf("failed to parse int: %w", err)
-		}
-		return val, nil
-
-	case *tree.UnaryExpr:
-		// Handle explicit negative numbers (though NumVal should handle this)
-		if e.Operator == tree.UnaryMinus {
-			val, err := extractInt(e.Expr)
-			if err != nil {
-				return 0, err
-			}
-			return -val, nil
-		}
-		return 0, fmt.Errorf("unsupported unary operator: %v", e.Operator)
-
-	default:
-		return 0, fmt.Errorf("cannot extract int from: %T", expr)
-	}
-}
-
-// extractFloat extracts a float64 from a SQL expression
-func extractFloat(expr tree.Expr) (float64, error) {
-	switch e := expr.(type) {
-	case *tree.NumVal:
-		// Use String() which includes the negative sign if present
-		strVal := e.String()
-		val, err := strconv.ParseFloat(strVal, 64)
-		if err != nil {
-			return 0, fmt.Errorf("failed to parse float: %w", err)
-		}
-		return val, nil
-
-	case *tree.UnaryExpr:
-		// Handle explicit negative numbers (though NumVal should handle this)
-		if e.Operator == tree.UnaryMinus {
-			val, err := extractFloat(e.Expr)
-			if err != nil {
-				return 0, err
-			}
-			return -val, nil
-		}
-		return 0, fmt.Errorf("unsupported unary operator: %v", e.Operator)
-
-	default:
-		return 0, fmt.Errorf("cannot extract float from: %T", expr)
-	}
-}
-
-// extractString extracts a string from a SQL expression
-func extractString(expr tree.Expr) string {
-	switch e := expr.(type) {
-	case *tree.StrVal:
-		return e.RawString()
-	case *tree.NumVal:
-		return e.OrigString()
-	default:
-		return fmt.Sprintf("%v", expr)
-	}
-}
-
-// extractBool extracts a boolean from a SQL expression
-func extractBool(expr tree.Expr) bool {
-	if b, ok := expr.(*tree.DBool); ok {
-		return bool(*b)
-	}
-	return false
-}
 
 // ConvertInterval converts a PostgreSQL INTERVAL expression to nanoseconds
 func ConvertInterval(expr tree.Expr) (int64, error) {
@@ -294,13 +117,14 @@ func isIntrinsicField(scope, field string) bool {
 	case "span":
 		return isSpanIntrinsic(field)
 	case "resource":
-		return field == "schema_url" || field == "dropped_attributes_count"
+		return field == "schema_url" || field == AttrDroppedAttributesCount
 	case "event":
-		return field == "name" || field == "time_since_start" || field == "dropped_attributes_count"
+		return field == UnscopedName || field == "time_since_start" || field == AttrDroppedAttributesCount
 	case "link":
-		return field == "trace_id" || field == "span_id" || field == "trace_state" || field == "dropped_attributes_count"
+		return field == "trace_id" || field == "span_id" || field == AttrTraceState ||
+			field == AttrDroppedAttributesCount
 	case "instrumentation":
-		return field == "name" || field == "version" || field == "dropped_attributes_count"
+		return field == UnscopedName || field == "version" || field == AttrDroppedAttributesCount
 	case "trace":
 		return field == "id"
 	default:
@@ -310,20 +134,20 @@ func isIntrinsicField(scope, field string) bool {
 
 func isSpanIntrinsic(field string) bool {
 	switch field {
-	case "id", "parent_id", "name", "kind", "status", "status_message", "trace_state",
+	case "id", "parent_id", UnscopedName, "kind", "status", "status_message", AttrTraceState,
 		"start", "end", "duration",
-		"dropped_attributes_count", "dropped_events_count", "dropped_links_count":
+		AttrDroppedAttributesCount, "dropped_events_count", "dropped_links_count":
 		return true
 	default:
 		return false
 	}
 }
 
-// isUnscopedIntrinsic checks if "name" or "duration" etc
+// isUnscopedIntrinsic checks if UnscopedName or "duration" etc
 // Note: We still accept unscoped shortcuts here for SQL parsing compatibility
 func isUnscopedIntrinsic(path string) bool {
 	switch path {
-	case "name", "duration", "kind", "status", "status_message",
+	case UnscopedName, "duration", "kind", "status", "status_message",
 		"start", "end":
 		return true
 	default:

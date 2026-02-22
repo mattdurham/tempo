@@ -4,9 +4,6 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
-// Compression level for encoders. Level 3 provides good balance of speed and compression.
-const compressionLevel = 3
-
 // CompressZstd compresses data using zstd with a provided encoder.
 // Uses compression level 3 for good balance of speed and compression.
 //
@@ -21,10 +18,4 @@ func CompressZstd(data []byte, encoder *zstd.Encoder) []byte {
 	encoder.Reset(nil)
 	compressed := encoder.EncodeAll(data, make([]byte, 0, len(data)))
 	return compressed
-}
-
-// NewEncoder creates a new zstd encoder with the standard compression level.
-// Each Writer should create ONE encoder and reuse it for all compressions.
-func NewEncoder() (*zstd.Encoder, error) {
-	return zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(compressionLevel)))
 }

@@ -312,19 +312,19 @@ func normalizeFieldNameForSQL(path string) string {
 
 	// Map unscoped intrinsics to blockpack's actual column names
 	switch path {
-	case "duration":
-		return "span:duration"
-	case "start", "start_time":
+	case UnscopedDuration:
+		return IntrinsicSpanDuration
+	case UnscopedStart, AttrStartTime:
 		return "span:start"
-	case "end", "end_time":
+	case UnscopedEnd, UnscopedEndTime:
 		return "span:end"
-	case "name":
+	case UnscopedName:
 		return "span:name"
-	case "kind":
+	case UnscopedKind:
 		return "span:kind"
-	case "status":
+	case UnscopedStatus:
 		return "span:status"
-	case "status_message":
+	case UnscopedStatusMessage:
 		return "span:status_message"
 	}
 

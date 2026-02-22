@@ -63,17 +63,17 @@ import (
 type Arena struct {
 	_ xunsafe.NoCopy
 
-	// Exported to allow for open-coding of Alloc() in some hot callsites,
-	// because Go won't inline it >_>
-	Next, End xunsafe.Addr[byte]
-	Cap       int // Always a power of 2.
-
 	// Blocks of memory allocated by this arena. Indexed by their size log 2.
 	blocks []*byte
 
 	// Data to keep around for the GC to mark whenever it marks an arena.
 	// Holding any pointer to the arena will keep anything here alive, too.
 	keep []unsafe.Pointer
+
+	// Exported to allow for open-coding of Alloc() in some hot callsites,
+	// because Go won't inline it >_>
+	Next, End xunsafe.Addr[byte]
+	Cap       int // Always a power of 2.
 }
 
 // Align is the alignment of all objects on the arena.
@@ -94,7 +94,7 @@ func New[T any](a *Arena, value T) *T {
 // KeepAlive ensures that v is not swept by the GC until all pointers into the
 // arena go away.
 func (a *Arena) KeepAlive(v any) {
-	a.keep = append(a.keep, unsafe.Pointer(xunsafe.AnyData(v)))
+	a.keep = append(a.keep, unsafe.Pointer(xunsafe.AnyData(v))) //nolint:gosec
 }
 
 // Alloc allocates memory with the given size.
@@ -183,6 +183,7 @@ func (a *Arena) Grow(size int) {
 	a.Log("grow", "%v:%v:%d\n", a.Next, a.End, a.Cap)
 }
 
+// Log logs an operation to the debug log if debugging is enabled.
 func (a *Arena) Log(op, format string, args ...any) {
 	debug.Log([]any{"%p %v:%v", a, a.Next, a.End}, op, format, args...)
 }

@@ -14,12 +14,17 @@
 package blockpack
 
 import (
+	"context"
 	"fmt"
 	"io"
 
+	"github.com/grafana/tempo/pkg/tempopb"
 	"github.com/mattdurham/blockpack/internal/blockio"
+	"github.com/mattdurham/blockpack/internal/blockio/compaction"
+	"github.com/mattdurham/blockpack/internal/blockio/reader"
 	"github.com/mattdurham/blockpack/internal/executor"
 	"github.com/mattdurham/blockpack/internal/sql"
+	"github.com/mattdurham/blockpack/internal/tempoapi"
 )
 
 // AGENT: Reader types - these provide access to blockpack data.
@@ -27,17 +32,17 @@ import (
 
 // Reader reads blockpack files and provides query execution.
 // This is a thin wrapper around internal implementation.
-type Reader = blockio.Reader
+type Reader = reader.Reader
 
 // Writer writes blockpack files from trace data.
 // This is a thin wrapper around internal implementation.
 type Writer = blockio.Writer
 
 // Block represents a decoded block of spans.
-type Block = blockio.Block
+type Block = reader.Block
 
 // Column represents a decoded column.
-type Column = blockio.Column
+type Column = reader.Column
 
 // DataType represents the type of data being read for caching optimization.
 type DataType = blockio.DataType
@@ -69,14 +74,34 @@ type CloseableReaderProvider interface {
 
 // NewReaderFromProvider creates a reader from a ReaderProvider.
 func NewReaderFromProvider(provider ReaderProvider) (*Reader, error) {
-	return blockio.NewReaderFromProvider(provider)
+	// Wrap the public ReaderProvider to match internal shared.ReaderProvider
+	wrappedProvider := &readerProviderAdapter{provider: provider}
+	return reader.NewReaderFromProvider(wrappedProvider)
+}
+
+// readerProviderAdapter adapts the public ReaderProvider interface to shared.ReaderProvider
+type readerProviderAdapter struct {
+	provider ReaderProvider
+}
+
+func (a *readerProviderAdapter) Size() (int64, error) {
+	return a.provider.Size()
+}
+
+func (a *readerProviderAdapter) ReadAt(p []byte, off int64, dataType reader.DataType) (int, error) {
+	// Convert DataType from reader to public API DataType
+	return a.provider.ReadAt(p, off, dataType)
 }
 
 // AGENT: Writer constructors - minimal set needed for creating writers.
 
-// NewWriter creates a new blockpack writer with the specified maximum spans per block.
-func NewWriter(maxSpansPerBlock int) *Writer {
-	return blockio.NewWriter(maxSpansPerBlock)
+// NewWriter creates a streaming blockpack writer that writes to the given output.
+// maxSpansPerBlock controls block granularity (0 uses the default of 2000).
+func NewWriter(output io.Writer, maxSpansPerBlock int) (*Writer, error) {
+	return blockio.NewWriterWithConfig(blockio.WriterConfig{
+		OutputStream:  output,
+		MaxBlockSpans: maxSpansPerBlock,
+	})
 }
 
 // AGENT: Query execution - this is the main public API for querying.
@@ -97,7 +122,19 @@ type SpanMatch = executor.BlockpackSpanMatch
 // The path parameter specifies the blockpack file to query.
 // For structural queries (using >>, >, ~, <<, <, !~ operators), use ExecuteTraceQLStructural.
 // For metrics queries, use ExecuteTraceQLMetrics.
-func ExecuteTraceQL(path string, traceqlQuery string, storage Storage, opts QueryOptions) (*QueryResult, error) {
+func ExecuteTraceQL(
+	path string,
+	traceqlQuery string,
+	storage Storage,
+	opts QueryOptions,
+) (result *QueryResult, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			result = nil
+			err = fmt.Errorf("internal error in ExecuteTraceQL: %v", r)
+		}
+	}()
+
 	// Compile TraceQL filter query to VM program
 	program, err := sql.CompileTraceQL(traceqlQuery)
 	if err != nil {
@@ -115,7 +152,14 @@ func ExecuteTraceQL(path string, traceqlQuery string, storage Storage, opts Quer
 // This is the primary SQL query interface.
 //
 // The path parameter specifies the blockpack file to query.
-func ExecuteSQL(path string, sqlQuery string, storage Storage, opts QueryOptions) (*QueryResult, error) {
+func ExecuteSQL(path string, sqlQuery string, storage Storage, opts QueryOptions) (result *QueryResult, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			result = nil
+			err = fmt.Errorf("internal error in ExecuteSQL: %v", r)
+		}
+	}()
+
 	// Parse SQL query
 	parsedSQL, err := sql.ParseSQL(sqlQuery)
 	if err != nil {
@@ -133,6 +177,116 @@ func ExecuteSQL(path string, sqlQuery string, storage Storage, opts QueryOptions
 
 	// Execute the query
 	return exec.ExecuteQuery(path, program, nil, opts)
+}
+
+// AGENT: Trace lookup API - provides indexed trace access for Tempo compatibility.
+
+// FindTraceByID looks up a trace by its hex-encoded ID using the trace block index.
+// Returns the complete OTLP Trace with spans grouped by resource and scope.
+// Returns nil if the trace is not found in the file.
+// Returns an error if the trace ID format is invalid or the file cannot be read.
+//
+// This function uses the trace block index for O(log N) lookup performance,
+// making it suitable for serving trace requests from Grafana or other clients.
+// The trace ID should be a 32-character hex string (16 bytes).
+//
+// The returned Trace follows the OpenTelemetry Protocol (OTLP) format with spans
+// properly grouped into ResourceSpans by (resource.service.name, scope.name, scope.version).
+func FindTraceByID(path string, traceIDHex string, storage Storage) (trace *tempopb.Trace, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			trace = nil
+			err = fmt.Errorf("internal error in FindTraceByID: %v", r)
+		}
+	}()
+
+	// Use storage adapter that implements the internal Storage interface
+	adapter := &storageAdapter{storage: storage}
+	return tempoapi.FindTraceByID(traceIDHex, path, adapter)
+}
+
+// AGENT: Tag discovery API - provides attribute name and value enumeration for Tempo/Grafana autocomplete.
+
+// SearchTags returns attribute names available in the blockpack file.
+// The scope parameter filters results:
+//   - "resource" or "Resource": only resource attributes (starting with "resource.")
+//   - "span" or "Span": only span attributes (starting with "span." or "span:")
+//   - "" (empty string): all attributes
+//
+// This function powers Grafana's attribute name autocomplete by extracting names from
+// the dedicated column index. The returned list is sorted and deduplicated.
+//
+// Attribute names follow blockpack's canonical naming conventions:
+//   - Resource attributes: resource.service.name, resource.cluster.name, etc.
+//   - Span intrinsics: span:name, span:id, span:status, span:duration, etc.
+//   - Span attributes: span.http.method, span.db.statement, etc.
+//   - Trace intrinsics: trace:id
+func SearchTags(path string, scope string, storage Storage) (tags []string, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			tags = nil
+			err = fmt.Errorf("internal error in SearchTags: %v", r)
+		}
+	}()
+
+	adapter := &storageAdapter{storage: storage}
+	return tempoapi.SearchTags(path, scope, adapter)
+}
+
+// SearchTagValues returns distinct values for the given attribute name.
+// Values are limited to 10,000 entries to prevent excessive memory usage
+// on high-cardinality attributes like trace IDs or request IDs.
+//
+// This function powers Grafana's attribute value autocomplete. It uses the dedicated
+// column index for fast O(1) lookup when available. The tag name is normalized
+// to canonical form before lookup:
+//   - "service.name" -> "resource.service.name"
+//   - "service_name" -> "resource.service.name"
+//
+// If the attribute has more than 10,000 distinct values, only the first 10,000
+// (sorted) are returned. If the attribute is not indexed or doesn't exist in the
+// file, an empty slice is returned (not an error).
+//
+// The returned values are sorted alphabetically.
+func SearchTagValues(path string, tag string, storage Storage) (tags []string, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			tags = nil
+			err = fmt.Errorf("internal error in SearchTagValues: %v", r)
+		}
+	}()
+
+	adapter := &storageAdapter{storage: storage}
+	return tempoapi.SearchTagValues(path, tag, adapter)
+}
+
+// BlockMeta contains metadata about a blockpack file for block selection.
+// Tempo uses this information to determine which files to query based on time range overlap.
+type BlockMeta = tempoapi.BlockMeta
+
+// GetBlockMeta returns metadata about a blockpack file including time range,
+// span count, and file size. This is used by Tempo for block selection
+// to determine which files to query based on time range overlap.
+//
+// The returned metadata includes:
+//   - MinStartNanos: Earliest span start time in the file (unix nanoseconds)
+//   - MaxStartNanos: Latest span start time in the file (unix nanoseconds)
+//   - TotalSpans: Total number of spans across all blocks
+//   - BlockCount: Number of blocks in the file
+//   - Size: File size in bytes
+//
+// This function reads only the file header and block index metadata (typically <1KB),
+// making it suitable for frequent calls during query planning.
+func GetBlockMeta(path string, storage Storage) (meta *BlockMeta, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			meta = nil
+			err = fmt.Errorf("internal error in GetBlockMeta: %v", r)
+		}
+	}()
+
+	adapter := &storageAdapter{storage: storage}
+	return tempoapi.GetBlockMeta(path, adapter)
 }
 
 // AGENT: Storage interfaces - minimal abstraction for storage backends.
@@ -159,6 +313,72 @@ type Storage interface {
 	//
 	// It returns the number of bytes read and any error encountered.
 	ReadAt(path string, p []byte, off int64, dataType DataType) (int, error)
+}
+
+// WritableStorage extends Storage with write capability.
+// Used by CompactBlocks to push compacted output files to a storage backend.
+type WritableStorage interface {
+	Storage
+	// Put writes data to the given path, creating or overwriting the file.
+	Put(path string, data []byte) error
+}
+
+// CompactionConfig configures the compaction operation.
+type CompactionConfig struct {
+	// StagingDir is a local directory used to stage compacted output files
+	// before they are pushed to outputStorage. Must be writable.
+	// If empty, os.TempDir() is used.
+	StagingDir string
+	// MaxOutputFileSize is the approximate maximum size in bytes of each output
+	// file. Size is estimated using the writer's internal heuristic (spans *
+	// 2048 bytes) rather than actual serialized bytes, so output files may
+	// exceed this value for spans with many attributes. A new output file is
+	// started when the estimate crosses this threshold while buffering spans.
+	// Zero means no size limit.
+	MaxOutputFileSize int64
+
+	// MaxSpansPerBlock controls how many spans are written per block in the
+	// output files. Defaults to 2000 if zero.
+	MaxSpansPerBlock int
+}
+
+// CompactBlocks merges and re-packs spans from the provided blockpack providers
+// into new output files, stages them locally, then copies to outputStorage.
+// Returns the relative paths of all output files written to outputStorage.
+//
+// If config.MaxOutputFileSize > 0, a new output file is started whenever the
+// writer's estimated size (spans * 2048 bytes) crosses that threshold. This
+// is an approximation — actual output file size may differ.
+//
+// The ctx parameter controls cancellation. CompactBlocks checks ctx.Err()
+// before processing each provider.
+func CompactBlocks(
+	ctx context.Context,
+	providers []ReaderProvider,
+	config CompactionConfig,
+	outputStorage WritableStorage,
+) (outputPaths []string, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			outputPaths = nil
+			err = fmt.Errorf("internal error in CompactBlocks: %v", r)
+		}
+	}()
+
+	if outputStorage == nil {
+		return nil, fmt.Errorf("outputStorage cannot be nil")
+	}
+
+	internalProviders := make([]blockio.ReaderProvider, len(providers))
+	for i, p := range providers {
+		internalProviders[i] = &readerProviderAdapter{provider: p}
+	}
+
+	return compaction.CompactBlocks(ctx, internalProviders, compaction.Config{
+		MaxOutputFileSize: config.MaxOutputFileSize,
+		MaxSpansPerBlock:  config.MaxSpansPerBlock,
+		StagingDir:        config.StagingDir,
+	}, outputStorage)
 }
 
 // storageAdapter adapts our Storage interface to the internal executor's FileStorage interface.
@@ -247,6 +467,11 @@ type folderStorageWrapper struct {
 // This avoids the overhead of opening/closing the file on every ReadAt/Size call.
 func (w *folderStorageWrapper) GetProvider(path string) (blockio.ReaderProvider, error) {
 	return w.fs.GetProvider(path)
+}
+
+// Put writes data to the given path within the storage's base directory.
+func (w *folderStorageWrapper) Put(path string, data []byte) error {
+	return w.fs.Put(path, data)
 }
 
 func (w *folderStorageWrapper) Size(path string) (int64, error) {

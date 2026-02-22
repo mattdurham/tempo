@@ -32,16 +32,48 @@ ingest:
 
 block_builder:
   consume_cycle_duration: 10s
+  block:
+    version: vblockpack
   assigned_partitions:
     block-builder-0:
       - 0
+
+backend_scheduler:
+  provider:
+    compaction:
+      measure_interval: 1m
+      min_cycle_interval: 30s
+      max_jobs_per_tenant: 1000
+      min_input_blocks: 2
+      max_input_blocks: 4
+      max_compaction_level: 2
+      compaction:
+        block_retention: 48h
+        compacted_block_retention: 1h
+        max_compaction_objects: 6000000
+        max_block_bytes: 107374182400
+        compaction_window: 1h
+        retention_concurrency: 10
+        max_time_per_tenant: 5m
+        compaction_cycle: 30s
+
+backend_worker:
+  compaction:
+    block_retention: 48h
+    compacted_block_retention: 1h
+    max_compaction_objects: 6000000
+    max_block_bytes: 107374182400
+    compaction_window: 1h
+    retention_concurrency: 10
+    max_time_per_tenant: 5m
+    compaction_cycle: 30s
 
 storage:
   trace:
     backend: s3
     s3:
       bucket: tempo-blockpack
-      endpoint: minio:9000
+      endpoint: toxiproxy:9000
       access_key: minioadmin
       secret_key: minioadmin
       insecure: true

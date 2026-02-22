@@ -3,6 +3,7 @@ package encodings
 import (
 	"bytes"
 	"encoding/binary"
+
 	"github.com/klauspost/compress/zstd"
 )
 
@@ -36,10 +37,10 @@ func BuildBytesDictionaryDelta(
 
 	_ = buf.WriteByte(encodingKind)
 	_ = buf.WriteByte(width)
-	_ = binary.Write(buf, binary.LittleEndian, uint32(len(compressedDict)))
+	_ = binary.Write(buf, binary.LittleEndian, uint32(len(compressedDict))) //nolint:gosec
 	_, _ = buf.Write(compressedDict)
-	_ = binary.Write(buf, binary.LittleEndian, uint32(spanCount))
-	_ = binary.Write(buf, binary.LittleEndian, uint32(len(presenceRLE)))
+	_ = binary.Write(buf, binary.LittleEndian, uint32(spanCount))        //nolint:gosec
+	_ = binary.Write(buf, binary.LittleEndian, uint32(len(presenceRLE))) //nolint:gosec
 	_, _ = buf.Write(presenceRLE)
 
 	// Delta-encode the indices
@@ -49,7 +50,7 @@ func BuildBytesDictionaryDelta(
 		prevIdx := int32(0)
 		for i := 0; i < spanCount; i++ {
 			if isBitSet(present, i) {
-				currIdx := int32(indexes[i])
+				currIdx := int32(indexes[i]) //nolint:gosec // Reviewed and acceptable
 				delta := currIdx - prevIdx
 				deltaIndexes = append(deltaIndexes, delta)
 				prevIdx = currIdx
@@ -59,7 +60,7 @@ func BuildBytesDictionaryDelta(
 		// Dense: encode all values (nulls have index 0)
 		prevIdx := int32(0)
 		for i := 0; i < spanCount; i++ {
-			currIdx := int32(indexes[i])
+			currIdx := int32(indexes[i]) //nolint:gosec // Reviewed and acceptable
 			delta := currIdx - prevIdx
 			deltaIndexes = append(deltaIndexes, delta)
 			prevIdx = currIdx
@@ -74,7 +75,7 @@ func BuildBytesDictionaryDelta(
 
 	// Compress with zstd (deltas compress very well - many zeros)
 	compressedDeltas := CompressZstd(deltaBuf.Bytes(), encoder)
-	_ = binary.Write(buf, binary.LittleEndian, uint32(len(compressedDeltas)))
+	_ = binary.Write(buf, binary.LittleEndian, uint32(len(compressedDeltas))) //nolint:gosec
 	_, _ = buf.Write(compressedDeltas)
 
 	return nil

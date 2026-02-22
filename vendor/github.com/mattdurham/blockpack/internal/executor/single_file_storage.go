@@ -6,6 +6,12 @@ import (
 	blockpackio "github.com/mattdurham/blockpack/internal/blockio"
 )
 
+// Compile-time interface compliance checks
+var (
+	_ FileStorage     = (*SingleFileStorage)(nil)
+	_ ProviderStorage = (*SingleFileStorage)(nil)
+)
+
 // SingleFileStorage provides FileStorage for a single file's bytes.
 // Useful for benchmarks or when you have the file data already loaded.
 type SingleFileStorage struct {

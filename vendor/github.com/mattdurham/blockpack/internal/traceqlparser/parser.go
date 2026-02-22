@@ -1,8 +1,8 @@
+// Package traceqlparser provides parsing and evaluation of TraceQL expressions.
 package traceqlparser
 
 import (
 	"fmt"
-	"regexp"
 	"strconv"
 	"strings"
 )
@@ -440,7 +440,10 @@ func parseAggregateFunc(input string) (AggregateFunc, error) {
 		// Split on comma
 		args := strings.Split(argsStr, ",")
 		if len(args) != 2 {
-			return AggregateFunc{}, fmt.Errorf("quantile_over_time() requires exactly 2 arguments (field, quantile), got %d", len(args))
+			return AggregateFunc{}, fmt.Errorf(
+				"quantile_over_time() requires exactly 2 arguments (field, quantile), got %d",
+				len(args),
+			)
 		}
 		field := strings.TrimSpace(args[0])
 		quantileStr := strings.TrimSpace(args[1])
@@ -516,8 +519,8 @@ type MetricsQuery struct {
 // Examples: { .parent } >> { .child }, { true } ~ { false }
 type StructuralQuery struct {
 	Left  *FilterExpression // The left filter expression
-	Op    StructuralOp      // The structural operator (>>, >, ~, <<, <, !~)
 	Right *FilterExpression // The right filter expression
+	Op    StructuralOp      // The structural operator (>>, >, ~, <<, <, !~)
 }
 
 // Validate checks if the structural query is well-formed
@@ -548,37 +551,54 @@ type Expr interface {
 // BinaryExpr represents binary operations (AND, OR, comparisons)
 type BinaryExpr struct {
 	Left  Expr
-	Op    BinaryOp
 	Right Expr
+	Op    BinaryOp
 }
 
 func (BinaryExpr) exprNode() {}
 
+// BinaryOp represents binary comparison operators.
 type BinaryOp int
 
 const (
-	OpAnd      BinaryOp = iota // &&
-	OpOr                       // ||
-	OpEq                       // =
-	OpNeq                      // !=
-	OpGt                       // >
-	OpGte                      // >=
-	OpLt                       // <
-	OpLte                      // <=
-	OpRegex                    // =~
-	OpNotRegex                 // !~
+	// OpAnd is the logical AND operator (&&).
+	OpAnd BinaryOp = iota
+	// OpOr is the logical OR operator (||).
+	OpOr
+	// OpEq is the equality operator (=).
+	OpEq
+	// OpNeq is the inequality operator (!=).
+	OpNeq
+	// OpGt is the greater than operator (>).
+	OpGt
+	// OpGte is the greater than or equal operator (>=).
+	OpGte
+	// OpLt is the less than operator (<).
+	OpLt
+	// OpLte is the less than or equal operator (<=).
+	OpLte
+	// OpRegex is the regex match operator (=~).
+	OpRegex
+	// OpNotRegex is the regex not match operator (!~).
+	OpNotRegex
 )
 
-// StructuralOp represents structural query operators
+// StructuralOp represents structural query operators.
 type StructuralOp int
 
 const (
-	OpDescendant StructuralOp = iota // >>
-	OpChild                          // >
-	OpSibling                        // ~
-	OpAncestor                       // <<
-	OpParent                         // <
-	OpNotSibling                     // !~
+	// OpDescendant is the descendant operator (>>).
+	OpDescendant StructuralOp = iota
+	// OpChild is the direct child operator (>).
+	OpChild
+	// OpSibling is the sibling operator (~).
+	OpSibling
+	// OpAncestor is the ancestor operator (<<).
+	OpAncestor
+	// OpParent is the direct parent operator (<).
+	OpParent
+	// OpNotSibling is the not sibling operator (!~).
+	OpNotSibling
 )
 
 func (op BinaryOp) String() string {
@@ -645,16 +665,25 @@ type LiteralExpr struct {
 
 func (LiteralExpr) exprNode() {}
 
+// LiteralType represents the type of a literal value.
 type LiteralType int
 
 const (
+	// LitString represents a string literal.
 	LitString LiteralType = iota
+	// LitInt represents an integer literal.
 	LitInt
+	// LitFloat represents a float literal.
 	LitFloat
+	// LitBool represents a boolean literal.
 	LitBool
+	// LitDuration represents a duration literal.
 	LitDuration
-	LitStatus // error, ok, unset
-	LitKind   // client, server, producer, consumer, internal, unspecified
+	// LitStatus represents a status literal (error, ok, unset).
+	LitStatus
+	// LitKind represents a kind literal (client, server, producer, consumer, internal, unspecified).
+	LitKind
+	// LitNil represents a nil literal.
 	LitNil
 )
 
@@ -916,6 +945,9 @@ func (p *parser) parseFieldPath(path string) (*FieldExpr, error) {
 	// Handle colon syntax for intrinsics (event:name, link:spanID, etc.)
 	if strings.Contains(path, ":") {
 		parts := strings.SplitN(path, ":", 2)
+		if len(parts) < 2 {
+			return nil, fmt.Errorf("invalid field path: %s", path)
+		}
 		return &FieldExpr{Scope: parts[0], Name: parts[1]}, nil
 	}
 
@@ -936,7 +968,10 @@ func (p *parser) parseFieldPath(path string) (*FieldExpr, error) {
 			"instrumentation": true, "trace": true,
 		}
 		if !validScopes[scope] {
-			return nil, fmt.Errorf("invalid scope: %s (must be span, resource, event, link, instrumentation, or trace)", scope)
+			return nil, fmt.Errorf(
+				"invalid scope: %s (must be span, resource, event, link, instrumentation, or trace)",
+				scope,
+			)
 		}
 		return &FieldExpr{Scope: scope, Name: name}, nil
 	}
@@ -1077,9 +1112,14 @@ func binaryExprToSQL(expr *BinaryExpr) (string, error) {
 		}
 
 		// Add parentheses around OR if it's part of an AND
+		// e.g., (a OR b) AND c should have parentheses around (a OR b)
 		// e.g., a AND (b OR c) should have parentheses around (b OR c)
 		if expr.Op == OpAnd {
-			// Check if right side is an OR expression
+			// Check if LEFT side is an OR expression (CRITICAL FIX!)
+			if leftBin, ok := expr.Left.(*BinaryExpr); ok && leftBin.Op == OpOr {
+				left = "(" + left + ")"
+			}
+			// Check if RIGHT side is an OR expression
 			if rightBin, ok := expr.Right.(*BinaryExpr); ok && rightBin.Op == OpOr {
 				right = "(" + right + ")"
 			}
@@ -1288,19 +1328,34 @@ func literalExprToSQL(lit *LiteralExpr) (string, error) {
 	switch lit.Type {
 	case LitString:
 		// ReplaceAll never returns error, safe to ignore
-		return fmt.Sprintf("'%s'", strings.ReplaceAll(lit.Value.(string), "'", "''")), nil
+		if str, ok := lit.Value.(string); ok {
+			return fmt.Sprintf("'%s'", strings.ReplaceAll(str, "'", "''")), nil
+		}
+		return "", fmt.Errorf("invalid string literal value")
 	case LitInt:
 		// Sprintf never returns error, safe to ignore
-		return fmt.Sprintf("%d", lit.Value.(int64)), nil
-	case LitFloat:
-		return fmt.Sprintf("%g", lit.Value.(float64)), nil
-	case LitBool:
-		if lit.Value.(bool) {
-			return "true", nil
+		if intVal, ok := lit.Value.(int64); ok {
+			return fmt.Sprintf("%d", intVal), nil
 		}
-		return "false", nil
+		return "", fmt.Errorf("invalid int literal value")
+	case LitFloat:
+		if floatVal, ok := lit.Value.(float64); ok {
+			return fmt.Sprintf("%g", floatVal), nil
+		}
+		return "", fmt.Errorf("invalid float literal value")
+	case LitBool:
+		if boolVal, ok := lit.Value.(bool); ok {
+			if boolVal {
+				return "true", nil
+			}
+			return "false", nil
+		}
+		return "", fmt.Errorf("invalid bool literal value")
 	case LitDuration:
-		nanos := lit.Value.(int64)
+		nanos, ok := lit.Value.(int64)
+		if !ok {
+			return "", fmt.Errorf("invalid duration literal value")
+		}
 		// Convert to PostgreSQL interval format
 		// Use the largest unit that divides evenly
 		if nanos%3600000000000 == 0 {
@@ -1313,9 +1368,8 @@ func literalExprToSQL(lit *LiteralExpr) (string, error) {
 			return fmt.Sprintf("INTERVAL '%dms'", nanos/1000000), nil
 		} else if nanos%1000 == 0 {
 			return fmt.Sprintf("INTERVAL '%dus'", nanos/1000), nil
-		} else {
-			return fmt.Sprintf("INTERVAL '%dns'", nanos), nil
 		}
+		return fmt.Sprintf("INTERVAL '%dns'", nanos), nil
 	case LitStatus:
 		// Map status names to numeric values
 		statusMap := map[string]int{
@@ -1323,7 +1377,11 @@ func literalExprToSQL(lit *LiteralExpr) (string, error) {
 			"ok":    1,
 			"error": 2,
 		}
-		return fmt.Sprintf("%d", statusMap[lit.Value.(string)]), nil
+		statusName, ok := lit.Value.(string)
+		if !ok {
+			return "", fmt.Errorf("invalid status literal value")
+		}
+		return fmt.Sprintf("%d", statusMap[statusName]), nil
 	case LitKind:
 		// Map kind names to numeric values
 		kindMap := map[string]int{
@@ -1334,7 +1392,11 @@ func literalExprToSQL(lit *LiteralExpr) (string, error) {
 			"producer":    4,
 			"consumer":    5,
 		}
-		return fmt.Sprintf("%d", kindMap[lit.Value.(string)]), nil
+		kindName, ok := lit.Value.(string)
+		if !ok {
+			return "", fmt.Errorf("invalid kind literal value")
+		}
+		return fmt.Sprintf("%d", kindMap[kindName]), nil
 	case LitNil:
 		return "NULL", nil
 	default:
@@ -1360,29 +1422,4 @@ func camelToSnake(s string) string {
 	snaked = strings.ReplaceAll(snaked, "trace_i_d", "trace_id")
 	snaked = strings.ReplaceAll(snaked, "parent_i_d", "parent_id")
 	return snaked
-}
-
-// ExpandUnscopedAttributes expands unscoped attribute references in a SQL WHERE clause
-// For example: "resource.foo" = 'bar' becomes ("resource.foo" = 'bar' OR "span.foo" = 'bar')
-func ExpandUnscopedAttributes(whereClause string) string {
-	// This is a heuristic approach - find patterns like "resource.attr" and expand them
-	// In practice, this should be done during AST generation, not string manipulation
-	// But for now this provides basic functionality
-
-	// Pattern: quoted resource. or span. attribute that's actually unscoped
-	re := regexp.MustCompile(`"resource\.([^"]+)"`)
-	matches := re.FindAllStringSubmatch(whereClause, -1)
-
-	for _, match := range matches {
-		attrName := match[1]
-		// Check if this should be expanded (heuristic: if not followed by AND/OR before next attribute)
-		// For now, just replace first occurrence
-		resourceField := fmt.Sprintf(`"resource.%s"`, attrName)
-		spanField := fmt.Sprintf(`"span.%s"`, attrName)
-		expanded := fmt.Sprintf(`(%s OR %s)`, resourceField, spanField)
-		whereClause = strings.Replace(whereClause, resourceField, expanded, 1)
-		break // Only expand first match for now
-	}
-
-	return whereClause
 }

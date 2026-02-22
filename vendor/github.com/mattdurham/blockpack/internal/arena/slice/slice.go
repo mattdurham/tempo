@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Package slice provides arena-based slice operations.
 package slice
 
 import (
@@ -34,8 +35,8 @@ type Slice[T any] struct {
 }
 
 // FromParts assembles a slice from its raw components.
-func FromParts[T any](ptr *T, len, cap uint32) Slice[T] {
-	return Slice[T]{ptr, len, cap}
+func FromParts[T any](ptr *T, length, capacity uint32) Slice[T] {
+	return Slice[T]{ptr, length, capacity}
 }
 
 // Addr converts this slice into an address slice.
@@ -54,11 +55,11 @@ func Of[T any](a *arena.Arena, values ...T) Slice[T] {
 
 // Make allocates a slice of the given length.
 func Make[T any](a *arena.Arena, n int) Slice[T] {
-	cap := sliceLayout[T](n)
+	cap := sliceLayout[T](n) //nolint:revive
 	p := xunsafe.Cast[T](a.Alloc(cap))
 
 	size := layout.Size[T]()
-	s := FromParts(p, uint32(n), uint32(cap/size))
+	s := FromParts(p, uint32(n), uint32(cap/size)) //nolint:gosec
 	return s
 }
 
@@ -79,7 +80,7 @@ func (s Slice[T]) SetLen(n int) Slice[T] {
 	}
 
 	debug.Log(nil, "set len", "%v->%d", s.Addr(), n)
-	s.len = uint32(n)
+	s.len = uint32(n) //nolint:gosec
 	return s
 }
 
@@ -108,14 +109,14 @@ func (s Slice[T]) Store(n int, v T) {
 //
 // The return value of this function must never escape outside of this module.
 func (s Slice[T]) Raw() []T {
-	return unsafe.Slice(s.Ptr(), s.cap)[:s.len]
+	return unsafe.Slice(s.Ptr(), s.cap)[:s.len] //nolint:gosec
 }
 
 // Rest returns the portion of s between the length and the capacity.
 //
 // The return value of this function must never escape outside of this module.
 func (s Slice[T]) Rest() []T {
-	return unsafe.Slice(xunsafe.Add(s.Ptr(), s.len), s.cap-s.len)
+	return unsafe.Slice(xunsafe.Add(s.Ptr(), s.len), s.cap-s.len) //nolint:gosec
 }
 
 // Append appends the given elements to a slice, reallocating on the given
@@ -129,7 +130,7 @@ func (s Slice[T]) Append(a *arena.Arena, elems ...T) Slice[T] {
 	}
 
 	copy(s.Rest(), elems)
-	s.len += uint32(len(elems))
+	s.len += uint32(len(elems)) //nolint:gosec
 	return s
 }
 
@@ -142,7 +143,7 @@ func (s Slice[T]) AppendOne(a *arena.Arena, elem T) Slice[T] {
 	}
 
 	xunsafe.Store(s.Ptr(), s.len, elem)
-	s.len += 1
+	s.len++
 	return s
 }
 
@@ -153,9 +154,9 @@ func (s Slice[T]) Grow(a *arena.Arena, n int) Slice[T] {
 	a.Log("grow", "%p[%d:%d], %d x %T", s.ptr, s.len, s.cap, n, z)
 
 	if s.ptr == nil {
-		cap := sliceLayout[T](n)
+		cap := sliceLayout[T](n) //nolint:revive
 		s.ptr = xunsafe.Cast[T](a.Alloc(cap))
-		s.cap = uint32(cap) / uint32(size)
+		s.cap = uint32(cap) / uint32(size) //nolint:gosec
 		return s
 	}
 
@@ -191,7 +192,7 @@ func (s Slice[T]) Grow(a *arena.Arena, n int) Slice[T] {
 	}
 
 	s.ptr = xunsafe.Cast[T](p)
-	s.cap = uint32(newSize) / uint32(size)
+	s.cap = uint32(newSize) / uint32(size) //nolint:gosec
 	return s
 }
 
@@ -244,11 +245,11 @@ type Untyped struct {
 // OffArena creates a new off-arena slice.
 //
 // When cast to a concrete type, this will clear.
-func OffArena[T any](ptr *T, len int) Untyped {
+func OffArena[T any](ptr *T, length int) Untyped {
 	return Untyped{
 		Ptr: ^xunsafe.Addr[byte](xunsafe.AddrOf(ptr)),
-		Len: uint32(len),
-		Cap: uint32(len),
+		Len: uint32(length), //nolint:gosec
+		Cap: uint32(length), //nolint:gosec
 	}
 }
 
