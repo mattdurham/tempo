@@ -1,6 +1,7 @@
 package vblockpack
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -30,7 +31,8 @@ func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.Blo
 		}
 	}
 
-	writer, err := blockpack.NewWriter(maxSpans)
+	var buf bytes.Buffer
+	writer, err := blockpack.NewWriter(&buf, maxSpans)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create blockpack writer: %w", err)
 	}
@@ -63,11 +65,11 @@ func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.Blo
 		traceCount++
 		_ = id // Trace ID is embedded in the trace data
 	}
-	// Flush blockpack writer to get serialized bytes
-	data, err := writer.Flush()
-	if err != nil {
+	// Flush blockpack writer — data is written to buf
+	if _, err := writer.Flush(); err != nil {
 		return nil, fmt.Errorf("failed to flush blockpack writer: %w", err)
 	}
+	data := buf.Bytes()
 
 	// Update metadata with actual stats
 	meta.TotalObjects = int64(traceCount)

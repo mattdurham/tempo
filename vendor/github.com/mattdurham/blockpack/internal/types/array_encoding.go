@@ -1,3 +1,4 @@
+// Package ondisk provides on-disk format types and encoding/decoding utilities for blockpack.
 package ondisk
 
 import (
@@ -9,24 +10,33 @@ import (
 	commonv1 "go.opentelemetry.io/proto/otlp/common/v1"
 )
 
+// ArrayValueType represents the type of an array element.
 type ArrayValueType byte
 
+// Array element type constants.
 const (
+	// ArrayTypeString is the string array element type.
 	ArrayTypeString ArrayValueType = iota
+	// ArrayTypeInt64 is the int64 array element type.
 	ArrayTypeInt64
+	// ArrayTypeFloat64 is the float64 array element type.
 	ArrayTypeFloat64
+	// ArrayTypeBool is the bool array element type.
 	ArrayTypeBool
+	// ArrayTypeBytes is the bytes array element type.
 	ArrayTypeBytes
+	// ArrayTypeDuration is the duration array element type.
 	ArrayTypeDuration
 )
 
+// ArrayValue represents a single value in an array.
 type ArrayValue struct {
-	Type  ArrayValueType
 	Str   string
+	Bytes []byte
 	Int   int64
 	Float float64
+	Type  ArrayValueType
 	Bool  bool
-	Bytes []byte
 }
 
 // encodeTypedValue encodes a single typed value to the buffer.
@@ -52,6 +62,7 @@ func encodeTypedValue(buf *bytes.Buffer, val ArrayValue) {
 	}
 }
 
+// EncodeArray encodes an array of values into a byte slice.
 func EncodeArray(values []ArrayValue) []byte {
 	if len(values) == 0 {
 		return nil
@@ -109,6 +120,7 @@ func decodeTypedValue(rd *bytes.Reader, valueType ArrayValueType) (ArrayValue, e
 	}
 }
 
+// DecodeArray decodes an array from bytes.
 func DecodeArray(data []byte) ([]ArrayValue, error) {
 	if len(data) == 0 {
 		return nil, nil
@@ -133,6 +145,7 @@ func DecodeArray(data []byte) ([]ArrayValue, error) {
 	return values, nil
 }
 
+// EncodeStringArray encodes a string array to bytes.
 func EncodeStringArray(values []string) []byte {
 	if len(values) == 0 {
 		return nil
@@ -144,6 +157,7 @@ func EncodeStringArray(values []string) []byte {
 	return EncodeArray(arr)
 }
 
+// EncodeDurationArray encodes a duration array to bytes.
 func EncodeDurationArray(values []int64) []byte {
 	if len(values) == 0 {
 		return nil
@@ -155,6 +169,7 @@ func EncodeDurationArray(values []int64) []byte {
 	return EncodeArray(arr)
 }
 
+// EncodeInt64Array encodes an int64 array to bytes.
 func EncodeInt64Array(values []int64) []byte {
 	if len(values) == 0 {
 		return nil
@@ -166,6 +181,7 @@ func EncodeInt64Array(values []int64) []byte {
 	return EncodeArray(arr)
 }
 
+// EncodeAnyValueArray encodes an array of OTEL AnyValue to bytes.
 func EncodeAnyValueArray(values []*commonv1.AnyValue) []byte {
 	if len(values) == 0 {
 		return nil
@@ -273,70 +289,4 @@ func EncodeKeyValueList(kvlist *commonv1.KeyValueList) []byte {
 		}
 	}
 	return buf.Bytes()
-}
-
-// DecodeKeyValueList decodes bytes back to a KeyValueList.
-// Returns the KeyValueList and any error encountered.
-func DecodeKeyValueList(data []byte) (*commonv1.KeyValueList, error) {
-	if len(data) == 0 {
-		return nil, nil
-	}
-	rd := bytes.NewReader(data)
-	count, err := binary.ReadUvarint(rd)
-	if err != nil {
-		return nil, fmt.Errorf("read kvlist count: %w", err)
-	}
-
-	kvlist := &commonv1.KeyValueList{
-		Values: make([]*commonv1.KeyValue, 0, count),
-	}
-
-	for i := uint64(0); i < count; i++ {
-		// Read key
-		keyBytes, err := readBytes(rd)
-		if err != nil {
-			return nil, fmt.Errorf("read key: %w", err)
-		}
-		key := string(keyBytes)
-
-		// Read value type
-		valType, err := rd.ReadByte()
-		if err != nil {
-			return nil, fmt.Errorf("read value type: %w", err)
-		}
-
-		kv := &commonv1.KeyValue{Key: key}
-
-		// NULL marker
-		if valType == 0xFF {
-			kvlist.Values = append(kvlist.Values, kv)
-			continue
-		}
-
-		// Decode using the canonical decoding function, then convert to AnyValue
-		val, err := decodeTypedValue(rd, ArrayValueType(valType))
-		if err != nil {
-			return nil, err
-		}
-
-		// Convert ArrayValue to AnyValue
-		switch val.Type {
-		case ArrayTypeString:
-			kv.Value = &commonv1.AnyValue{Value: &commonv1.AnyValue_StringValue{StringValue: val.Str}}
-		case ArrayTypeInt64:
-			kv.Value = &commonv1.AnyValue{Value: &commonv1.AnyValue_IntValue{IntValue: val.Int}}
-		case ArrayTypeFloat64:
-			kv.Value = &commonv1.AnyValue{Value: &commonv1.AnyValue_DoubleValue{DoubleValue: val.Float}}
-		case ArrayTypeBool:
-			kv.Value = &commonv1.AnyValue{Value: &commonv1.AnyValue_BoolValue{BoolValue: val.Bool}}
-		case ArrayTypeBytes:
-			kv.Value = &commonv1.AnyValue{Value: &commonv1.AnyValue_BytesValue{BytesValue: val.Bytes}}
-		default:
-			return nil, fmt.Errorf("unsupported value type %d", valType)
-		}
-
-		kvlist.Values = append(kvlist.Values, kv)
-	}
-
-	return kvlist, nil
 }

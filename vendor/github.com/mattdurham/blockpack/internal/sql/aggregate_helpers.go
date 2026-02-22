@@ -1,3 +1,4 @@
+// Package sql provides SQL query compilation and execution capabilities for TraceQL.
 package sql
 
 import "strconv"

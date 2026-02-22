@@ -14,17 +14,24 @@
 
 //go:build !debug
 
+// Package debug provides debugging utilities.
 package debug
 
+// Enabled indicates whether debugging is enabled.
 const Enabled = false
 
+// Log logs a debug message when debugging is enabled.
 func Log([]any, string, string, ...any) {}
-func Assert(bool, string, ...any)       {}
 
+// Assert asserts a condition and logs a message if it fails.
+func Assert(bool, string, ...any) {}
+
+// Value is a debug value wrapper.
 type Value[T any] struct {
 	_ struct{}
 }
 
+// Get retrieves the wrapped debug value.
 func (v *Value[T]) Get() *T {
 	panic("called Value.Get() when not in debug mode")
 }

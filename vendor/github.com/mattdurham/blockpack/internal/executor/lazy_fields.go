@@ -12,11 +12,21 @@ import (
 // This avoids allocating a map with all fields upfront.
 // Uses block indices instead of pointers to reduce memory usage - keeps only
 // one reference to blocks slice instead of thousands of references to individual blocks.
+//
+// Thread Safety: NOT safe for concurrent use. Each goroutine should create its own
+// LazySpanFields instance. The underlying blocks slice is immutable after creation,
+// so multiple LazySpanFields instances can safely reference the same blocks slice
+// concurrently, but each LazySpanFields instance must only be accessed from one
+// goroutine at a time.
+//
+// Memory Management: Call Release() after query results are serialized to allow
+// garbage collection of block references. The blocks slice reference keeps entire
+// blocks in memory even if only one field was accessed.
 type LazySpanFields struct {
+	matchedColumns map[string]any       // If set, only project these columns (for OR queries)
 	blocks         []*blockpackio.Block // Shared reference to blocks slice
 	blockIdx       int                  // Index into blocks slice
 	spanIdx        int                  // Row index within the block
-	matchedColumns map[string]any       // If set, only project these columns (for OR queries)
 }
 
 // NewLazySpanFields creates a new LazySpanFields instance for accessing span fields
@@ -118,13 +128,18 @@ func (lsf *LazySpanFields) GetField(name string) (any, bool) {
 		if v, ok := col.StringValue(lsf.spanIdx); ok {
 			return v, true
 		}
-	case blockpack.ColumnTypeInt64:
+	case blockpack.ColumnTypeInt64, blockpack.ColumnTypeRangeInt64:
 		if v, ok := col.Int64Value(lsf.spanIdx); ok {
 			return v, true
 		}
-	case blockpack.ColumnTypeUint64:
+	case blockpack.ColumnTypeUint64, blockpack.ColumnTypeRangeUint64:
 		if v, ok := col.Uint64Value(lsf.spanIdx); ok {
 			return v, true
+		}
+	case blockpack.ColumnTypeRangeDuration:
+		// RangeDuration is stored as uint64 (nanoseconds), but read as int64 for compatibility with VM
+		if v, ok := col.Uint64Value(lsf.spanIdx); ok {
+			return int64(v), true //nolint:gosec
 		}
 	case blockpack.ColumnTypeBool:
 		if v, ok := col.BoolValue(lsf.spanIdx); ok {
@@ -167,10 +182,17 @@ func (lsf *LazySpanFields) getColumnValueForIteration(col *blockpack.Column, nam
 	switch col.Type {
 	case blockpack.ColumnTypeString:
 		value, ok = col.StringValue(lsf.spanIdx)
-	case blockpack.ColumnTypeInt64:
+	case blockpack.ColumnTypeInt64, blockpack.ColumnTypeRangeInt64:
 		value, ok = col.Int64Value(lsf.spanIdx)
-	case blockpack.ColumnTypeUint64:
+	case blockpack.ColumnTypeUint64, blockpack.ColumnTypeRangeUint64:
 		value, ok = col.Uint64Value(lsf.spanIdx)
+	case blockpack.ColumnTypeRangeDuration:
+		// RangeDuration is stored as uint64 (nanoseconds), but read as int64 for compatibility with VM
+		var v uint64
+		v, ok = col.Uint64Value(lsf.spanIdx)
+		if ok {
+			value = int64(v) //nolint:gosec
+		}
 	case blockpack.ColumnTypeBool:
 		value, ok = col.BoolValue(lsf.spanIdx)
 	case blockpack.ColumnTypeFloat64:
@@ -195,6 +217,7 @@ func (lsf *LazySpanFields) getColumnValueForIteration(col *blockpack.Column, nam
 	return value, ok
 }
 
+// IterateFields iterates over all span fields and calls the provided callback for each field.
 func (lsf *LazySpanFields) IterateFields(fn func(name string, value any) bool) {
 	if lsf.blocks == nil || lsf.blockIdx < 0 || lsf.blockIdx >= len(lsf.blocks) {
 		return
@@ -261,6 +284,21 @@ func (lsf *LazySpanFields) IterateFields(fn func(name string, value any) bool) {
 			}
 		}
 	}
+}
+
+// Release clears references to allow garbage collection.
+// Call this after query results are serialized.
+//
+// Lifecycle: LazySpanFields instances hold references to the shared blocks slice,
+// which prevents garbage collection of block data. After query results are
+// fully serialized and sent to the client, call Release() to clear these references
+// and allow the garbage collector to reclaim memory.
+//
+// IMPORTANT: Do not access GetField or IterateFields after calling Release,
+// as they will return no data.
+func (lsf *LazySpanFields) Release() {
+	lsf.blocks = nil
+	lsf.matchedColumns = nil
 }
 
 // encodeID converts a byte slice ID to a hex string.

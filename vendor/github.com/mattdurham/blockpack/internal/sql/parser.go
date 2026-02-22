@@ -81,12 +81,8 @@ func ValidateSelectStatement(stmt *tree.Select) error {
 			return err
 		}
 	}
-	if hasCaseExprs || hasAggregates {
-		// CASE expression query or aggregation query - these are allowed
-		// No additional validation needed beyond the CASE expression validation above
-	} else {
-		// Regular filter query validation
-		// Validate: Must be SELECT *
+	// For regular filter queries (not CASE expressions or aggregates), validate SELECT *
+	if !hasCaseExprs && !hasAggregates {
 		if err := validateSelectStar(selectClause.Exprs); err != nil {
 			return err
 		}
@@ -158,7 +154,10 @@ func validateTable(tableExpr tree.TableExpr) error {
 	case "spans", "realm_files", "realm_metadata":
 		return nil
 	default:
-		return fmt.Errorf("only 'spans', 'realm_files', or 'realm_metadata' tables supported, got: %s", nameExpr.Table())
+		return fmt.Errorf(
+			"only 'spans', 'realm_files', or 'realm_metadata' tables supported, got: %s",
+			nameExpr.Table(),
+		)
 	}
 }
 
@@ -286,7 +285,7 @@ func extractCaseReturnType(caseExpr *tree.CaseExpr) (string, error) {
 			return "", fmt.Errorf("CASE branches must return consistent types: first branch returns %s but branch %d returns %s", firstConcreteType, i+1, thenType)
 		}
 		// Update firstConcreteType if we found a concrete type
-		if firstConcreteType == "unknown" && thenType != "unknown" {
+		if firstConcreteType == TypeUnknown && thenType != TypeUnknown {
 			firstConcreteType = thenType
 		}
 	}
@@ -297,29 +296,33 @@ func extractCaseReturnType(caseExpr *tree.CaseExpr) (string, error) {
 	}
 	elseType := getExprType(caseExpr.Else)
 	if !typesCompatible(elseType, firstConcreteType) {
-		return "", fmt.Errorf("CASE branches must return consistent types: THEN returns %s but ELSE returns %s", firstConcreteType, elseType)
+		return "", fmt.Errorf(
+			"CASE branches must return consistent types: THEN returns %s but ELSE returns %s",
+			firstConcreteType,
+			elseType,
+		)
 	}
 	// Update firstConcreteType if ELSE has a concrete type
-	if firstConcreteType == "unknown" && elseType != "unknown" {
+	if firstConcreteType == TypeUnknown && elseType != TypeUnknown {
 		firstConcreteType = elseType
 	}
 
 	return firstConcreteType, nil
 }
 
-// typesCompatible checks if two types are compatible (same type or one is "unknown")
+// typesCompatible checks if two types are compatible (same type or one is TypeUnknown)
 func typesCompatible(type1, type2 string) bool {
 	if type1 == type2 {
 		return true
 	}
-	// "unknown" is compatible with any type
-	if type1 == "unknown" || type2 == "unknown" {
+	// TypeUnknown is compatible with any type
+	if type1 == TypeUnknown || type2 == TypeUnknown {
 		return true
 	}
 	return false
 }
 
-// getExprType returns the type of an expression ("string", "int64", "float64", "bool", "unknown")
+// getExprType returns the type of an expression ("string", "int64", "float64", "bool", TypeUnknown)
 func getExprType(expr tree.Expr) string {
 	switch e := expr.(type) {
 	case *tree.StrVal:
@@ -337,7 +340,7 @@ func getExprType(expr tree.Expr) string {
 		typ, _ := extractCaseReturnType(e)
 		return typ
 	default:
-		return "unknown"
+		return TypeUnknown
 	}
 }
 
@@ -365,45 +368,6 @@ func validateCaseExpr(caseExpr *tree.CaseExpr) error {
 	}
 
 	return nil
-}
-
-// GetWhereExpr extracts the WHERE clause expression from a SELECT statement
-func GetWhereExpr(stmt *tree.Select) tree.Expr {
-	selectClause, ok := stmt.Select.(*tree.SelectClause)
-	if !ok {
-		return nil
-	}
-
-	if selectClause.Where == nil {
-		return nil
-	}
-
-	return selectClause.Where.Expr
-}
-
-// GetLimit extracts the LIMIT value from a SELECT statement
-// Returns -1 if no LIMIT is specified
-func GetLimit(stmt *tree.Select) int64 {
-	if stmt.Limit == nil {
-		return -1
-	}
-
-	if stmt.Limit.Count == nil {
-		return -1
-	}
-
-	// Extract the limit value
-	switch limit := stmt.Limit.Count.(type) {
-	case *tree.NumVal:
-		// Parse the numeric value
-		val, err := limit.AsInt64()
-		if err != nil {
-			return -1
-		}
-		return val
-	default:
-		return -1
-	}
 }
 
 // replaceColonsInIdentifiers replaces colons within quoted identifiers with a placeholder

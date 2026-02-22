@@ -5,8 +5,8 @@ import "strings"
 // MinHashCache memoizes MinHash signatures by token set.
 // It is not concurrency-safe; callers should provide external synchronization if needed.
 type MinHashCache struct {
-	maxEntries int
 	entries    map[string]MinHashSignature
+	maxEntries int
 	hits       int
 	misses     int
 }

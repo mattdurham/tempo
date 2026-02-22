@@ -8,13 +8,19 @@ import (
 
 // CompileTraceQLMetricsToSpec compiles a TraceQL metrics query to QuerySpec IR.
 // This allows semantic matching with SQL queries and routing to pre-computed metric streams.
-func CompileTraceQLMetricsToSpec(metricsQuery *traceqlparser.MetricsQuery, timeBucket TimeBucketSpec) (*QuerySpec, error) {
+func CompileTraceQLMetricsToSpec(
+	metricsQuery *traceqlparser.MetricsQuery,
+	timeBucket TimeBucketSpec,
+) (*QuerySpec, error) {
 	if metricsQuery == nil {
 		return nil, fmt.Errorf("metrics query cannot be nil")
 	}
 
 	spec := &QuerySpec{
-		Filter:        FilterSpec{AttributeEquals: make(map[string][]interface{}), AttributeRanges: make(map[string]*RangeSpec)},
+		Filter: FilterSpec{
+			AttributeEquals: make(map[string][]interface{}),
+			AttributeRanges: make(map[string]*RangeSpec),
+		},
 		TimeBucketing: timeBucket,
 	}
 
@@ -89,6 +95,7 @@ func extractPredicates(expr traceqlparser.Expr, spec *FilterSpec) error {
 
 		// Handle comparison operators
 		field, literal, err := extractTraceQLFieldAndLiteral(e)
+		//nolint:nilerr // Skip non-simple comparisons and continue processing
 		if err != nil {
 			// Not a simple field-literal comparison, skip
 			return nil
@@ -156,7 +163,9 @@ func normalizeTraceQLLiteral(fieldPath string, literal *traceqlparser.LiteralExp
 
 // extractTraceQLFieldAndLiteral extracts the field and literal from a TraceQL comparison expression.
 // Returns (field, literal, nil) if successful, or (nil, nil, error) if not a simple comparison.
-func extractTraceQLFieldAndLiteral(expr *traceqlparser.BinaryExpr) (*traceqlparser.FieldExpr, *traceqlparser.LiteralExpr, error) {
+func extractTraceQLFieldAndLiteral(
+	expr *traceqlparser.BinaryExpr,
+) (*traceqlparser.FieldExpr, *traceqlparser.LiteralExpr, error) {
 	// Check if left is field and right is literal
 	if field, ok := expr.Left.(*traceqlparser.FieldExpr); ok {
 		if literal, ok := expr.Right.(*traceqlparser.LiteralExpr); ok {
@@ -197,40 +206,40 @@ func compilePipelineToSpec(pipeline *traceqlparser.PipelineStage) (AggregateSpec
 	// Map TraceQL aggregate function to canonical form
 	switch pipeline.Aggregate.Name {
 	case "rate":
-		spec.Function = "RATE"
+		spec.Function = FuncNameRATE
 		spec.Field = ""
 
 	case "count_over_time":
-		spec.Function = "COUNT"
+		spec.Function = FuncNameCOUNT
 		spec.Field = ""
 
 	case "avg":
-		spec.Function = "AVG"
+		spec.Function = FuncNameAVG
 		spec.Field = pipeline.Aggregate.Field
 
 	case "min":
-		spec.Function = "MIN"
+		spec.Function = FuncNameMIN
 		spec.Field = pipeline.Aggregate.Field
 
 	case "max":
-		spec.Function = "MAX"
+		spec.Function = FuncNameMAX
 		spec.Field = pipeline.Aggregate.Field
 
 	case "sum":
-		spec.Function = "SUM"
+		spec.Function = FuncNameSUM
 		spec.Field = pipeline.Aggregate.Field
 
 	case "quantile_over_time":
-		spec.Function = "QUANTILE"
+		spec.Function = FuncNameQUANTILE
 		spec.Field = pipeline.Aggregate.Field
 		spec.Quantile = pipeline.Aggregate.Quantile
 
 	case "stddev":
-		spec.Function = "STDDEV"
+		spec.Function = FuncNameSTDDEV
 		spec.Field = pipeline.Aggregate.Field
 
 	case "histogram_over_time":
-		spec.Function = "HISTOGRAM"
+		spec.Function = FuncNameHISTOGRAM
 		spec.Field = pipeline.Aggregate.Field
 
 	default:
@@ -238,7 +247,7 @@ func compilePipelineToSpec(pipeline *traceqlparser.PipelineStage) (AggregateSpec
 	}
 
 	// Validate field is provided for functions that require it
-	if spec.Field == "" && spec.Function != "RATE" && spec.Function != "COUNT" {
+	if spec.Field == "" && spec.Function != FuncNameRATE && spec.Function != FuncNameCOUNT {
 		return AggregateSpec{}, fmt.Errorf("%s requires a field argument", pipeline.Aggregate.Name)
 	}
 

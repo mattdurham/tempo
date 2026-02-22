@@ -9,10 +9,14 @@ traces/
 *.bloom
 dev/null/
 real_world_comparison/*.parquet/
+.bob/state
 
 # Benchmark artifacts
 benchmark/unified.txt
 benchmark/cost_analysis.txt
+
+# Benchmark versioned results
+benchmark_results/
 
 # Binaries (at root level)
 /temposerver
@@ -57,3 +61,7 @@ traces.blockpack.old
 /trace_plan
 traces.blockpack.v*
 traces.parquet
+
+# Code quality reports
+violations.txt
+api

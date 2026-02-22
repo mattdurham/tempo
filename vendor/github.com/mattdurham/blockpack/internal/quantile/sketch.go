@@ -1,3 +1,4 @@
+// Package quantile provides quantile sketching algorithms.
 package quantile
 
 import (
@@ -16,16 +17,16 @@ import (
 // - Mergeable: Multiple sketches can be combined
 // - Relative accuracy: Error is proportional to the quantile value
 // - Bounded memory: Number of buckets is logarithmic in the data range
-type QuantileSketch struct {
+type QuantileSketch struct { //nolint:revive
+	// buckets maps bucket index to count
+	buckets map[int]int64
+
 	// gamma is the relative accuracy parameter (1 + alpha)
 	// Smaller gamma means higher accuracy but more buckets
 	gamma float64
 
 	// logGamma is the precomputed log(gamma) for efficiency
 	logGamma float64
-
-	// buckets maps bucket index to count
-	buckets map[int]int64
 
 	// count is the total number of values added
 	count int64
@@ -69,6 +70,9 @@ func NewQuantileSketch(accuracy float64) *QuantileSketch {
 
 // Add inserts a value into the sketch.
 func (s *QuantileSketch) Add(value float64) {
+	if s == nil {
+		return
+	}
 	s.count++
 
 	// Handle special cases
@@ -273,7 +277,7 @@ func (s *QuantileSketch) Serialize() ([]byte, error) {
 	}
 
 	// Write bucket count
-	bucketCount := uint32(len(s.buckets))
+	bucketCount := uint32(len(s.buckets)) //nolint:gosec
 	if err := binary.Write(&buf, binary.LittleEndian, bucketCount); err != nil {
 		return nil, fmt.Errorf("write bucketCount: %w", err)
 	}
@@ -289,7 +293,7 @@ func (s *QuantileSketch) Serialize() ([]byte, error) {
 	// Write each bucket in sorted order
 	for _, idx := range indices {
 		count := s.buckets[idx]
-		if err := binary.Write(&buf, binary.LittleEndian, int32(idx)); err != nil {
+		if err := binary.Write(&buf, binary.LittleEndian, int32(idx)); err != nil { //nolint:gosec // Reviewed and acceptable
 			return nil, fmt.Errorf("write bucket index: %w", err)
 		}
 		if err := binary.Write(&buf, binary.LittleEndian, count); err != nil {
@@ -298,64 +302,4 @@ func (s *QuantileSketch) Serialize() ([]byte, error) {
 	}
 
 	return buf.Bytes(), nil
-}
-
-// Deserialize decodes a sketch from bytes.
-func Deserialize(data []byte) (*QuantileSketch, error) {
-	buf := bytes.NewReader(data)
-
-	var gamma float64
-	if err := binary.Read(buf, binary.LittleEndian, &gamma); err != nil {
-		return nil, fmt.Errorf("read gamma: %w", err)
-	}
-
-	var count int64
-	if err := binary.Read(buf, binary.LittleEndian, &count); err != nil {
-		return nil, fmt.Errorf("read count: %w", err)
-	}
-
-	var min float64
-	if err := binary.Read(buf, binary.LittleEndian, &min); err != nil {
-		return nil, fmt.Errorf("read min: %w", err)
-	}
-
-	var max float64
-	if err := binary.Read(buf, binary.LittleEndian, &max); err != nil {
-		return nil, fmt.Errorf("read max: %w", err)
-	}
-
-	var zeroCount int64
-	if err := binary.Read(buf, binary.LittleEndian, &zeroCount); err != nil {
-		return nil, fmt.Errorf("read zeroCount: %w", err)
-	}
-
-	var bucketCount uint32
-	if err := binary.Read(buf, binary.LittleEndian, &bucketCount); err != nil {
-		return nil, fmt.Errorf("read bucketCount: %w", err)
-	}
-
-	buckets := make(map[int]int64, bucketCount)
-	for i := uint32(0); i < bucketCount; i++ {
-		var idx int32
-		if err := binary.Read(buf, binary.LittleEndian, &idx); err != nil {
-			return nil, fmt.Errorf("read bucket index: %w", err)
-		}
-
-		var bucketCnt int64
-		if err := binary.Read(buf, binary.LittleEndian, &bucketCnt); err != nil {
-			return nil, fmt.Errorf("read bucket count: %w", err)
-		}
-
-		buckets[int(idx)] = bucketCnt
-	}
-
-	return &QuantileSketch{
-		gamma:     gamma,
-		logGamma:  math.Log(gamma),
-		buckets:   buckets,
-		count:     count,
-		min:       min,
-		max:       max,
-		zeroCount: zeroCount,
-	}, nil
 }

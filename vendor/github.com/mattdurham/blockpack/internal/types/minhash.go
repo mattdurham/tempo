@@ -2,10 +2,8 @@ package ondisk
 
 import (
 	"encoding/binary"
-	"unsafe"
 
 	"github.com/cespare/xxhash/v2"
-	"github.com/mattdurham/blockpack/internal/arena"
 )
 
 // OTELSemanticFields lists string fields used for span similarity clustering.
@@ -66,6 +64,7 @@ func ComputeMinHash(tokens []string) MinHashSignature {
 
 	// Initialize with max values
 	for i := range sig {
+		//nolint:gosec
 		sig[i] = ^uint64(0)
 	}
 
@@ -84,7 +83,7 @@ func ComputeMinHash(tokens []string) MinHashSignature {
 		tokenBuf = append(tokenBuf, token...)
 
 		for i := 0; i < 128; i++ {
-			hashVal := hashTokenWithSeedReuseXXHash(h, tokenBuf, uint64(i))
+			hashVal := hashTokenWithSeedReuseXXHash(h, tokenBuf, uint64(i)) //nolint:gosec
 			if hashVal < sig[i] {
 				sig[i] = hashVal
 			}
@@ -125,41 +124,4 @@ func CompareMinHashSigs(a, b MinHashSignature) int {
 		}
 	}
 	return 0
-}
-
-// ExtractOTELTokens extracts key:value tokens from span attributes based on
-// OpenTelemetry semantic conventions. Only fields listed in OTELSemanticFields
-// are extracted. Returns "field:value" tokens in the fixed order of
-// OTELSemanticFields for deterministic MinHash computation.
-func ExtractOTELTokens(attributes map[string]string) []string {
-	return ExtractOTELTokensWithArena(attributes, nil)
-}
-
-// ExtractOTELTokensWithArena extracts key:value tokens from span attributes based on
-// OpenTelemetry semantic conventions, optionally allocating token strings on the arena.
-// The returned tokens should not outlive the provided arena.
-func ExtractOTELTokensWithArena(attributes map[string]string, a *arena.Arena) []string {
-	tokens := make([]string, 0, len(OTELSemanticFields))
-	for _, field := range OTELSemanticFields {
-		if val, ok := attributes[field]; ok && val != "" {
-			if a == nil {
-				tokens = append(tokens, field+":"+val)
-				continue
-			}
-			tokens = append(tokens, arenaTokenString(a, field, val))
-		}
-	}
-	return tokens
-}
-
-func arenaTokenString(a *arena.Arena, field, value string) string {
-	size := len(field) + 1 + len(value)
-	if size == 0 {
-		return ""
-	}
-	buf := unsafe.Slice((*byte)(unsafe.Pointer(a.Alloc(size))), size)
-	copy(buf, field)
-	buf[len(field)] = ':'
-	copy(buf[len(field)+1:], value)
-	return unsafe.String(&buf[0], size)
 }

@@ -1,3 +1,4 @@
+// Package vm provides virtual machine execution for query evaluation.
 package vm
 
 import (
@@ -13,21 +14,31 @@ type InstructionFunc func(vm *VM) int
 
 // Value represents a runtime value in the VM
 type Value struct {
-	Type ValueType
 	Data interface{} // int64, float64, string, bool, []byte, []Value, *JSONValue, or nil
+	Type ValueType
 }
 
+// ValueType represents the runtime type of a value in the VM.
 type ValueType byte
 
 const (
+	// TypeNil represents a nil value.
 	TypeNil ValueType = iota
+	// TypeInt represents an int64 value.
 	TypeInt
+	// TypeFloat represents a float64 value.
 	TypeFloat
+	// TypeString represents a string value.
 	TypeString
+	// TypeBool represents a boolean value.
 	TypeBool
+	// TypeDuration represents a duration value (int64 nanoseconds).
 	TypeDuration
+	// TypeBytes represents a byte slice value.
 	TypeBytes
+	// TypeArray represents an array value ([]Value).
 	TypeArray
+	// TypeJSON represents a JSON value.
 	TypeJSON
 )
 
@@ -65,15 +76,6 @@ type QueryPredicates struct {
 	// Attribute equality filters: attribute name -> values
 	AttributeEquals map[string][]Value
 
-	// Attributes accessed (for bloom filter checking)
-	AttributesAccessed []string
-
-	// Trace ID filters (if any)
-	TraceIDEquals [][16]byte
-
-	// Time range filters (already handled separately in QueryOptions)
-	HasTimeFilter bool
-
 	// Whether query accesses specific dedicated columns
 	DedicatedColumns map[string][]Value // column name -> values
 
@@ -91,6 +93,15 @@ type QueryPredicates struct {
 	// Range predicates on dedicated columns (e.g., span.http.status_code >= 400)
 	DedicatedRanges map[string]*RangePredicate
 
+	// Attributes accessed (for bloom filter checking)
+	AttributesAccessed []string
+
+	// Trace ID filters (if any)
+	TraceIDEquals [][16]byte
+
+	// Time range filters (already handled separately in QueryOptions)
+	HasTimeFilter bool
+
 	// Whether the query contains OR operations
 	// If true, AttributeEquals predicates cannot be safely used for block pruning
 	HasOROperations bool
@@ -98,14 +109,6 @@ type QueryPredicates struct {
 
 // Program represents a compiled TraceQL or SQL expression
 type Program struct {
-	// === VM Bytecode Execution (TraceQL) ===
-	Instructions  []InstructionFunc // Closure for each instruction
-	Constants     []Value           // Constant pool
-	Attributes    []string          // Attribute names for lookups
-	Regexes       []*RegexCache     // Compiled regexes for =~ and !~
-	JSONPaths     []*JSONPathCache  // Compiled JSONPath queries
-	OriginalQuery string            // Original TraceQL query (optional, for debugging)
-
 	// === Closure-based Execution (SQL) ===
 	// ColumnPredicate filters rows using bulk column scans (fast)
 	ColumnPredicate          ColumnPredicate          // Direct column-scan execution closure for WHERE clause
@@ -114,20 +117,37 @@ type Program struct {
 
 	// === Aggregation (SQL GROUP BY / aggregate functions) ===
 	AggregationPlan *AggregationPlan // Aggregation specification (nil if not an aggregate query)
+	OriginalQuery   string           // Original TraceQL query (optional, for debugging)
+
+	// === VM Bytecode Execution (TraceQL) ===
+	Instructions []InstructionFunc // Closure for each instruction
+	Constants    []Value           // Constant pool
+	Attributes   []string          // Attribute names for lookups
+	Regexes      []*RegexCache     // Compiled regexes for =~ and !~
+	JSONPaths    []*JSONPathCache  // Compiled JSONPath queries
 }
 
 // AggFunction represents the type of aggregation function
 type AggFunction int
 
 const (
+	// AggCount represents a count aggregation function.
 	AggCount AggFunction = iota
+	// AggSum represents a sum aggregation function.
 	AggSum
+	// AggAvg represents an average aggregation function.
 	AggAvg
+	// AggMin represents a minimum aggregation function.
 	AggMin
+	// AggMax represents a maximum aggregation function.
 	AggMax
+	// AggRate represents a rate aggregation function.
 	AggRate
+	// AggQuantile represents a quantile aggregation function.
 	AggQuantile
+	// AggHistogram represents a histogram aggregation function.
 	AggHistogram
+	// AggStddev represents a standard deviation aggregation function.
 	AggStddev
 )
 
@@ -159,10 +179,10 @@ func (a AggFunction) String() string {
 
 // AggSpec specifies a single aggregation operation
 type AggSpec struct {
-	Function AggFunction // The aggregation function to apply
 	Field    string      // Field name to aggregate (empty for COUNT(*))
-	Quantile float64     // Quantile value (0-1) for QUANTILE function
 	Alias    string      // Output column name (optional)
+	Function AggFunction // The aggregation function to apply
+	Quantile float64     // Quantile value (0-1) for QUANTILE function
 }
 
 // AggregationPlan describes how to perform aggregation on query results
@@ -173,14 +193,14 @@ type AggregationPlan struct {
 
 // RegexCache holds a compiled regex pattern
 type RegexCache struct {
-	Pattern string
 	Regex   *regexp.Regexp // Nil until lazily compiled
+	Pattern string
 }
 
 // JSONPathCache holds a compiled JSONPath query.
 type JSONPathCache struct {
-	Path     string
 	Compiled *jsonpath.Path // Nil until lazily compiled
+	Path     string
 }
 
 // SetOriginalQuery sets the original query string for debugging/display purposes

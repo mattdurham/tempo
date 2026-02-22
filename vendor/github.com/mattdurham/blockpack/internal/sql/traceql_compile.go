@@ -207,7 +207,10 @@ func CompileTraceQLMetricsOrSQL(query string, startTime, endTime int64) (*vm.Pro
 // 1. Compile to QuerySpec IR for semantic matching
 // 2. Translate to SQL for execution
 // 3. Compile SQL to VM Program
-func compileTraceQLMetrics(metricsQuery *traceqlparser.MetricsQuery, startTime, endTime int64) (*vm.Program, *QuerySpec, error) {
+func compileTraceQLMetrics(
+	metricsQuery *traceqlparser.MetricsQuery,
+	startTime, endTime int64,
+) (*vm.Program, *QuerySpec, error) {
 	// Step 1: Compile to QuerySpec for semantic matching
 	// For TraceQL metrics queries with _over_time functions, enable time bucketing
 	// Default step size: 60 seconds (standard for Tempo/Grafana)
@@ -269,6 +272,7 @@ func compileSQL(query string, startTime, endTime int64) (*vm.Program, *QuerySpec
 			EndTime:   endTime,
 		}
 		querySpec, err := CompileSQLToSpec(stmt, timeBucket)
+		//nolint:nilerr // Intentionally return program even if spec extraction fails
 		if err != nil {
 			// If QuerySpec extraction fails, still return the program
 			// (it can execute, just can't be matched to pre-computed metric streams)
@@ -297,7 +301,10 @@ func CompileTraceQLStructural(query string) (*StructuralQueryPlan, error) {
 	// Type assert to StructuralQuery
 	structuralQuery, ok := result.(*traceqlparser.StructuralQuery)
 	if !ok {
-		return nil, fmt.Errorf("expected StructuralQuery, got %T (use CompileTraceQL for filter queries, CompileTraceQLMetricsOrSQL for metrics)", result)
+		return nil, fmt.Errorf(
+			"expected StructuralQuery, got %T (use CompileTraceQL for filter queries, CompileTraceQLMetricsOrSQL for metrics)",
+			result,
+		)
 	}
 
 	// Compile using existing structural compiler

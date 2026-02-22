@@ -11,17 +11,17 @@ import (
 // AggregateStreamData contains parsed metric stream data
 type AggregateStreamData struct {
 	Query         string
+	GroupKeys     []vm.GroupKey
+	Buckets       []AggregateTimeBucket
 	StepSizeNanos int64
 	StartTime     int64
 	StepMillis    uint32
-	GroupKeys     []vm.GroupKey
-	Buckets       []AggregateTimeBucket
 }
 
 // AggregateTimeBucket represents aggregates for a single time bucket
 type AggregateTimeBucket struct {
-	Time   int64              // Bucket timestamp (nanoseconds)
 	Values [][]BinaryAggValue // Indexed by group key index
+	Time   int64              // Bucket timestamp (nanoseconds)
 }
 
 // ParseAggregateStream parses decompressed metric stream data.

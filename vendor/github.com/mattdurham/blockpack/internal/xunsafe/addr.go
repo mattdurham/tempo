@@ -38,13 +38,13 @@ type Addr[T any] intptr
 
 // AddrOf gets the address of a pointer.
 func AddrOf[P ~*E, E any](p P) Addr[E] {
-	return Addr[E](uintptr(unsafe.Pointer(p)))
+	return Addr[E](uintptr(unsafe.Pointer(p))) //nolint:gosec
 }
 
 // EndOf calculates the one-past-the-end address of s without creating an
 // intermediate one-past-the-end pointer.
 func EndOf[S ~[]E, E any](s S) Addr[E] {
-	return AddrOf(unsafe.SliceData(s)).Add(len(s))
+	return AddrOf(unsafe.SliceData(s)).Add(len(s)) //nolint:gosec
 }
 
 // AssertValid asserts that this address is a valid pointer.
@@ -52,7 +52,7 @@ func EndOf[S ~[]E, E any](s S) Addr[E] {
 //go:nosplit
 func (a Addr[T]) AssertValid() *T {
 	//nolint:govet // Intentional unsafe pointer arithmetic for performance-critical code
-	return (*T)(unsafe.Pointer(uintptr(a))) // Don't worry about it.
+	return (*T)(unsafe.Pointer(uintptr(a))) //nolint:gosec // Don't worry about it.
 }
 
 // Add adds the given offset to this address.
@@ -65,7 +65,7 @@ func (a Addr[T]) ByteAdd(n int) Addr[T] {
 	return a + Addr[T](n)
 }
 
-// Add adds the given offset to this address.
+// Sub computes the difference between two addresses.
 func (a Addr[T]) Sub(b Addr[T]) int {
 	return int(a-b) / layout.Size[T]()
 }
@@ -76,7 +76,7 @@ func (a Addr[T]) Padding(align int) int {
 	return layout.Padding(int(a), align)
 }
 
-// RoundUp rounds this address upwards to align, which must be a power of two.
+// RoundUpTo rounds this address upwards to align, which must be a power of two.
 func (a Addr[T]) RoundUpTo(align int) Addr[T] {
 	return Addr[T](layout.RoundUp(uintptr(a), uintptr(align)))
 }

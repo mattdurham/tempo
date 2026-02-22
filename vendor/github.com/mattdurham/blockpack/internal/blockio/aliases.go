@@ -1,26 +1,105 @@
+// Package blockio provides blockpack I/O operations and format handling.
 package blockio
 
 import (
-	"github.com/mattdurham/blockpack/internal/arena"
+	"github.com/mattdurham/blockpack/internal/blockio/shared"
 	types "github.com/mattdurham/blockpack/internal/types"
 )
 
-// BOT: What does this do? Why do we need it? Why not just import the types package directly where needed?
+// RangeBucketMetadata is an alias to shared.RangeBucketMetadata for backward compatibility
+type RangeBucketMetadata = shared.RangeBucketMetadata
 
+// Aliases for provider wrapper types moved to shared/
+
+// ByteCache is an alias for shared.ByteCache.
+type ByteCache = shared.ByteCache
+
+// LRUByteCache is an alias for shared.LRUByteCache.
+type LRUByteCache = shared.LRUByteCache
+
+// ShardedLRUByteCache is an alias for shared.ShardedLRUByteCache.
+type ShardedLRUByteCache = shared.ShardedLRUByteCache
+
+// CacheStats is an alias for shared.CacheStats.
+type CacheStats = shared.CacheStats
+
+// MemcacheClient is an alias for shared.MemcacheClient.
+type MemcacheClient = shared.MemcacheClient
+
+// TrackingReaderProvider is an alias for shared.TrackingReaderProvider.
+type TrackingReaderProvider = shared.TrackingReaderProvider
+
+// DefaultProvider is an alias for shared.DefaultProvider.
+type DefaultProvider = shared.DefaultProvider
+
+// DetailedTrackingReader is an alias for shared.DetailedTrackingReader.
+type DetailedTrackingReader = shared.DetailedTrackingReader
+
+// IOStats is an alias for shared.IOStats.
+type IOStats = shared.IOStats
+
+// CachingReaderProvider is an alias for shared.CachingReaderProvider.
+type CachingReaderProvider = shared.CachingReaderProvider
+
+// CachingProviderConfig is an alias for shared.CachingProviderConfig.
+type CachingProviderConfig = shared.CachingProviderConfig
+
+// MemcacheProviderConfig is an alias for shared.MemcacheProviderConfig.
+type MemcacheProviderConfig = shared.MemcacheProviderConfig
+
+// Re-export provider constructor functions
+var (
+	NewTrackingReaderProvider            = shared.NewTrackingReaderProvider
+	NewTrackingReaderProviderWithLatency = shared.NewTrackingReaderProviderWithLatency
+	NewDefaultProvider                   = shared.NewDefaultProvider
+	NewDefaultProviderWithLatency        = shared.NewDefaultProviderWithLatency
+	NewDetailedTrackingReader            = shared.NewDetailedTrackingReader
+	NewDetailedTrackingReaderWithLatency = shared.NewDetailedTrackingReaderWithLatency
+	NewCachingReaderProvider             = shared.NewCachingReaderProvider
+	NewDataAwareCachingProvider          = shared.NewDataAwareCachingProvider
+	NewMemcacheReaderProvider            = shared.NewMemcacheReaderProvider
+	NewLRUByteCache                      = shared.NewLRUByteCache
+	NewShardedLRUByteCache               = shared.NewShardedLRUByteCache
+	NewInMemoryMemcacheClient            = shared.NewInMemoryMemcacheClient
+)
+
+// Column is an alias for types.Column.
 type Column = types.Column
+
+// ColumnStats is an alias for types.ColumnStats.
 type ColumnStats = types.ColumnStats
+
+// ColumnStatsWithType is an alias for types.ColumnStatsWithType.
 type ColumnStatsWithType = types.ColumnStatsWithType
+
+// ColumnType is an alias for types.ColumnType.
 type ColumnType = types.ColumnType
+
+// DedicatedValueKey is an alias for types.DedicatedValueKey.
 type DedicatedValueKey = types.DedicatedValueKey
+
+// ColumnNameBloom is an alias for types.ColumnNameBloom.
 type ColumnNameBloom = types.ColumnNameBloom
+
+// ArrayValue is an alias for types.ArrayValue.
 type ArrayValue = types.ArrayValue
+
+// ArrayValueType is an alias for types.ArrayValueType.
 type ArrayValueType = types.ArrayValueType
+
+// MinHashSignature is an alias for types.MinHashSignature.
 type MinHashSignature = types.MinHashSignature
+
+// MinHashCache is an alias for types.MinHashCache.
 type MinHashCache = types.MinHashCache
+
+// MinHashCacheStats is an alias for types.MinHashCacheStats.
 type MinHashCacheStats = types.MinHashCacheStats
 
+// OTELSemanticFields is the exported semantic fields for OTEL.
 var OTELSemanticFields = types.OTELSemanticFields
 
+// ColumnType constants.
 const (
 	ColumnTypeString  = types.ColumnTypeString
 	ColumnTypeInt64   = types.ColumnTypeInt64
@@ -42,98 +121,7 @@ const (
 	ArrayTypeDuration = types.ArrayTypeDuration
 )
 
-// DecodeDedicatedKey parses an encoded key from index storage.
-func DecodeDedicatedKey(encoded string) (DedicatedValueKey, error) {
-	return types.DecodeDedicatedKey(encoded)
-}
-
-// StringValueKey builds a dedicated key for string values.
-func StringValueKey(val string) DedicatedValueKey {
-	return types.StringValueKey(val)
-}
-
-// BytesValueKey builds a dedicated key for byte slice values.
-func BytesValueKey(val []byte) DedicatedValueKey {
-	return types.BytesValueKey(val)
-}
-
-// IntValueKey builds a dedicated key for int64 values.
-func IntValueKey(val int64) DedicatedValueKey {
-	return types.IntValueKey(val)
-}
-
-// UintValueKey builds a dedicated key for uint64 values.
-func UintValueKey(val uint64) DedicatedValueKey {
-	return types.UintValueKey(val)
-}
-
-// FloatValueKey builds a dedicated key for float64 values.
-func FloatValueKey(val float64) DedicatedValueKey {
-	return types.FloatValueKey(val)
-}
-
-// BoolValueKey builds a dedicated key for boolean values.
-func BoolValueKey(val bool) DedicatedValueKey {
-	return types.BoolValueKey(val)
-}
-
-// ComputeMinHash computes a MinHash signature for a set of key:value tokens.
-func ComputeMinHash(tokens []string) MinHashSignature {
-	return types.ComputeMinHash(tokens)
-}
-
-// NewMinHashCache creates a MinHash cache with a maximum entry count.
-func NewMinHashCache(maxEntries int) *MinHashCache {
-	return types.NewMinHashCache(maxEntries)
-}
-
-// CompareMinHashSigs compares two MinHash signatures lexicographically.
-func CompareMinHashSigs(a, b MinHashSignature) int {
-	return types.CompareMinHashSigs(a, b)
-}
-
-// ExtractOTELTokens extracts key:value tokens from span attributes for MinHash.
-func ExtractOTELTokens(attributes map[string]string) []string {
-	return types.ExtractOTELTokens(attributes)
-}
-
-// ExtractOTELTokensWithArena extracts key:value tokens from span attributes for MinHash,
-// optionally allocating token strings on the arena.
-func ExtractOTELTokensWithArena(attributes map[string]string, a *arena.Arena) []string {
-	return types.ExtractOTELTokensWithArena(attributes, a)
-}
-
 // IsRangeColumnType reports whether the column type is range-bucketed.
 func IsRangeColumnType(typ ColumnType) bool {
 	return types.IsRangeColumnType(typ)
-}
-
-// RangeBucketValueKey creates a dedicated key for a range bucket ID.
-func RangeBucketValueKey(bucketID uint16, rangeType ColumnType) DedicatedValueKey {
-	return types.RangeBucketValueKey(bucketID, rangeType)
-}
-
-// CalculateBuckets computes bucket boundaries for a range of values.
-func CalculateBuckets(minVal, maxVal int64, numBuckets int) []int64 {
-	return types.CalculateBuckets(minVal, maxVal, numBuckets)
-}
-
-// CalculateBucketsFromValues computes quantile-based bucket boundaries for equal distribution.
-func CalculateBucketsFromValues(sortedValues []int64, numBuckets int) []int64 {
-	return types.CalculateBucketsFromValues(sortedValues, numBuckets)
-}
-
-// GetBucketID returns the bucket ID for a given value.
-func GetBucketID(value int64, buckets []int64) uint16 {
-	return types.GetBucketID(value, buckets)
-}
-
-// GetBucketsForRange returns bucket IDs that intersect with a value range.
-func GetBucketsForRange(minValue, maxValue *int64, minInclusive, maxInclusive bool, buckets []int64) []uint16 {
-	return types.GetBucketsForRange(minValue, maxValue, minInclusive, maxInclusive, buckets)
-}
-
-// RangeInt64ValueKey builds a dedicated key for range-bucketed int64 values.
-func RangeInt64ValueKey(val int64, rangeType ColumnType) DedicatedValueKey {
-	return types.RangeInt64ValueKey(val, rangeType)
 }

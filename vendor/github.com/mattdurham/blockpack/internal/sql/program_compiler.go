@@ -119,7 +119,7 @@ func convertToVMValue(val interface{}) vm.Value {
 		return vm.Value{Type: vm.TypeInt, Data: v}
 	case uint64:
 		// Convert uint64 to int64 for consistency (assuming values fit in int64 range)
-		return vm.Value{Type: vm.TypeInt, Data: int64(v)}
+		return vm.Value{Type: vm.TypeInt, Data: int64(v)} //nolint:gosec
 	case float64:
 		return vm.Value{Type: vm.TypeFloat, Data: v}
 	case string:
@@ -487,11 +487,11 @@ func compileComparisonToStreamingPredicate(cmp *tree.ComparisonExpr) (vm.Streami
 	if cmp.Right == tree.DNull {
 		op := cmp.Operator.String()
 		switch op {
-		case "IS DISTINCT FROM": // IS NOT NULL
+		case OpIsDistinctFrom: // IS NOT NULL
 			return func(provider vm.ColumnDataProvider, callback vm.RowCallback) (int, error) {
 				return provider.StreamScanIsNotNull(columnName, callback)
 			}, nil
-		case "IS NOT DISTINCT FROM": // IS NULL
+		case OpIsNotDistinctFrom: // IS NULL
 			return func(provider vm.ColumnDataProvider, callback vm.RowCallback) (int, error) {
 				return provider.StreamScanIsNull(columnName, callback)
 			}, nil
@@ -502,7 +502,7 @@ func compileComparisonToStreamingPredicate(cmp *tree.ComparisonExpr) (vm.Streami
 
 	// Handle LIKE operator
 	if cmp.Operator == tree.Like {
-		patternLiteral, err := extractStringLiteral(cmp.Right)
+		patternLiteral, err := extractStringLiteral(cmp.Right) //nolint:govet
 		if err != nil {
 			return nil, fmt.Errorf("LIKE pattern must be a string literal: %w", err)
 		}
@@ -514,7 +514,7 @@ func compileComparisonToStreamingPredicate(cmp *tree.ComparisonExpr) (vm.Streami
 
 	// Handle ILIKE operator
 	if cmp.Operator == tree.ILike {
-		patternLiteral, err := extractStringLiteral(cmp.Right)
+		patternLiteral, err := extractStringLiteral(cmp.Right) //nolint:govet
 		if err != nil {
 			return nil, fmt.Errorf("ILIKE pattern must be a string literal: %w", err)
 		}
@@ -539,7 +539,7 @@ func compileComparisonToStreamingPredicate(cmp *tree.ComparisonExpr) (vm.Streami
 		// Extract each value from the tuple
 		var values []interface{}
 		for _, expr := range tuple.Exprs {
-			value, err := extractComparisonValue(expr)
+			value, err := extractComparisonValue(expr) //nolint:govet
 			if err != nil {
 				return nil, fmt.Errorf("failed to extract IN value: %w", err)
 			}
@@ -555,7 +555,7 @@ func compileComparisonToStreamingPredicate(cmp *tree.ComparisonExpr) (vm.Streami
 				count := 0
 
 				for _, value := range values {
-					_, err := provider.StreamScanEqual(columnName, value, func(rowIdx int) bool {
+					_, err := provider.StreamScanEqual(columnName, value, func(rowIdx int) bool { //nolint:govet
 						if _, exists := seen[rowIdx]; !exists {
 							seen[rowIdx] = struct{}{}
 							if !callback(rowIdx) {
@@ -570,12 +570,12 @@ func compileComparisonToStreamingPredicate(cmp *tree.ComparisonExpr) (vm.Streami
 					}
 				}
 				return count, nil
-			} else {
+			} else { //nolint:revive
 				// For NOT IN: collect all matches, then complement
 				matches := make(map[int]struct{})
 
 				for _, value := range values {
-					_, err := provider.StreamScanEqual(columnName, value, func(rowIdx int) bool {
+					_, err := provider.StreamScanEqual(columnName, value, func(rowIdx int) bool { //nolint:govet
 						matches[rowIdx] = struct{}{}
 						return true
 					})
@@ -602,7 +602,7 @@ func compileComparisonToStreamingPredicate(cmp *tree.ComparisonExpr) (vm.Streami
 	// Handle regex operators
 	op := cmp.Operator.String()
 	if op == "~" || op == "!~" {
-		value, err := extractLiteralValue(cmp.Right)
+		value, err := extractLiteralValue(cmp.Right) //nolint:govet
 		if err != nil {
 			return nil, fmt.Errorf("regex pattern must be a literal: %w", err)
 		}
@@ -614,11 +614,11 @@ func compileComparisonToStreamingPredicate(cmp *tree.ComparisonExpr) (vm.Streami
 			return func(provider vm.ColumnDataProvider, callback vm.RowCallback) (int, error) {
 				return provider.StreamScanRegex(columnName, pattern, callback)
 			}, nil
-		} else { // "!~"
-			return func(provider vm.ColumnDataProvider, callback vm.RowCallback) (int, error) {
-				return provider.StreamScanRegexNotMatch(columnName, pattern, callback)
-			}, nil
 		}
+		// "!~"
+		return func(provider vm.ColumnDataProvider, callback vm.RowCallback) (int, error) {
+			return provider.StreamScanRegexNotMatch(columnName, pattern, callback)
+		}, nil
 	}
 
 	// Handle standard comparison operators (=, !=, <, <=, >, >=)
@@ -660,7 +660,10 @@ func compileComparisonToStreamingPredicate(cmp *tree.ComparisonExpr) (vm.Streami
 
 // compileUnscopedComparisonStreaming handles unscoped attributes (e.g., .foo) for streaming
 // These expand to: resource.foo OR span.foo
-func compileUnscopedComparisonStreaming(cmp *tree.ComparisonExpr, unscopedPath string) (vm.StreamingColumnPredicate, error) {
+func compileUnscopedComparisonStreaming(
+	cmp *tree.ComparisonExpr,
+	unscopedPath string,
+) (vm.StreamingColumnPredicate, error) {
 	// Create two comparison expressions: one for resource, one for span
 	resourcePath := "resource." + unscopedPath[1:] // Remove leading dot
 	spanPath := "span." + unscopedPath[1:]
@@ -731,7 +734,7 @@ func extractLiteralValue(expr tree.Expr) (interface{}, error) {
 // isHexBytesAttribute checks if an attribute path refers to a hex-encoded bytes field
 func isHexBytesAttribute(path string) bool {
 	switch path {
-	case "trace:id", "span:id":
+	case IntrinsicTraceID, IntrinsicSpanID:
 		return true
 	default:
 		return false
@@ -760,7 +763,8 @@ func compileComparisonToColumnPredicate(cmp *tree.ComparisonExpr) (vm.ColumnPred
 	}
 
 	// Handle LIKE/ILIKE/SIMILAR TO operators
-	if cmp.Operator == tree.Like || cmp.Operator == tree.ILike || cmp.Operator == tree.SimilarTo || cmp.Operator == tree.NotSimilarTo {
+	if cmp.Operator == tree.Like || cmp.Operator == tree.ILike || cmp.Operator == tree.SimilarTo ||
+		cmp.Operator == tree.NotSimilarTo {
 		return compilePatternComparison(cmp, columnName)
 	}
 
@@ -779,7 +783,7 @@ func compileComparisonToColumnPredicate(cmp *tree.ComparisonExpr) (vm.ColumnPred
 		// Extract each value from the tuple
 		var values []interface{}
 		for _, expr := range tuple.Exprs {
-			value, err := extractComparisonValue(expr)
+			value, err := extractComparisonValue(expr) //nolint:govet
 			if err != nil {
 				return nil, fmt.Errorf("failed to extract IN value: %w", err)
 			}
@@ -790,7 +794,7 @@ func compileComparisonToColumnPredicate(cmp *tree.ComparisonExpr) (vm.ColumnPred
 		// Return a predicate that scans for any of the values (OR logic)
 		return func(provider vm.ColumnDataProvider) (vm.RowSet, error) {
 			// Scan for first value
-			result, err := provider.ScanEqual(columnName, values[0])
+			result, err := provider.ScanEqual(columnName, values[0]) //nolint:govet
 			if err != nil {
 				return nil, err
 			}
@@ -815,7 +819,7 @@ func compileComparisonToColumnPredicate(cmp *tree.ComparisonExpr) (vm.ColumnPred
 
 	// Handle hex bytes attributes (trace:id, span:id) - decode hex string to bytes
 	if isHexBytesAttribute(attrPath) && (cmp.Operator == tree.EQ || cmp.Operator == tree.NE) {
-		hexStr, err := extractStringLiteral(cmp.Right)
+		hexStr, err := extractStringLiteral(cmp.Right) //nolint:govet
 		if err != nil {
 			return nil, fmt.Errorf("hex bytes attribute requires string literal: %w", err)
 		}
@@ -828,11 +832,11 @@ func compileComparisonToColumnPredicate(cmp *tree.ComparisonExpr) (vm.ColumnPred
 			return func(provider vm.ColumnDataProvider) (vm.RowSet, error) {
 				return provider.ScanEqual(columnName, decoded)
 			}, nil
-		} else { // tree.NE
-			return func(provider vm.ColumnDataProvider) (vm.RowSet, error) {
-				return provider.ScanNotEqual(columnName, decoded)
-			}, nil
 		}
+		// tree.NE
+		return func(provider vm.ColumnDataProvider) (vm.RowSet, error) {
+			return provider.ScanNotEqual(columnName, decoded)
+		}, nil
 	}
 
 	// Extract comparison value
@@ -844,6 +848,7 @@ func compileComparisonToColumnPredicate(cmp *tree.ComparisonExpr) (vm.ColumnPred
 
 	// Generate closure based on operator
 	op := cmp.Operator.String()
+	//nolint:dupl // Aggregation compilation; duplication is intentional for different aggregation types
 	switch op {
 	case "=":
 		return func(provider vm.ColumnDataProvider) (vm.RowSet, error) {
@@ -973,10 +978,10 @@ func isUnscopedAttribute(attrPath string) bool {
 	// Check if it's an intrinsic field (these are not unscoped)
 	// All intrinsics now use colon notation and have scope prefixes
 	switch attrPath {
-	case "name", "kind", "status", "status_message",
-		"duration", "start", "end", "start_time", "end_time",
-		"span:name", "span:duration", "span:kind", "span:status", "span:status_message",
-		"span:start", "span:end":
+	case UnscopedName, UnscopedKind, UnscopedStatus, UnscopedStatusMessage,
+		UnscopedDuration, UnscopedStart, UnscopedEnd, AttrStartTime, UnscopedEndTime,
+		IntrinsicSpanName, IntrinsicSpanDuration, IntrinsicSpanKind, IntrinsicSpanStatus, IntrinsicSpanStatusMessage,
+		IntrinsicSpanStart, IntrinsicSpanEnd:
 		return false
 	}
 
@@ -994,9 +999,19 @@ func compileUnscopedComparison(cmp *tree.ComparisonExpr, attrPath string) (vm.Co
 	// For other fields, use dot notation (span.attribute_name) which will be treated as attributes
 	var spanPath string
 	switch attrPath {
-	case "name", "kind", "status", "status_message", "start", "end", "duration",
-		"id", "parent_id", "trace_state",
-		"dropped_attributes_count", "dropped_events_count", "dropped_links_count":
+	case UnscopedName,
+		UnscopedKind,
+		UnscopedStatus,
+		UnscopedStatusMessage,
+		UnscopedStart,
+		UnscopedEnd,
+		UnscopedDuration,
+		"id",
+		UnscopedParentID,
+		AttrTraceState,
+		AttrDroppedAttributesCount,
+		AttrDroppedEventsCount,
+		AttrDroppedLinksCount:
 		spanPath = "span:" + attrPath
 	default:
 		spanPath = "span." + attrPath
@@ -1049,11 +1064,11 @@ func compileScopedComparison(cmp *tree.ComparisonExpr, scopedPath string) (vm.Co
 	if cmp.Right == tree.DNull {
 		op := cmp.Operator.String()
 		switch op {
-		case "IS DISTINCT FROM": // IS NOT NULL
+		case OpIsDistinctFrom: // IS NOT NULL
 			return func(provider vm.ColumnDataProvider) (vm.RowSet, error) {
 				return provider.ScanIsNotNull(columnName)
 			}, nil
-		case "IS NOT DISTINCT FROM": // IS NULL
+		case OpIsNotDistinctFrom: // IS NULL
 			return func(provider vm.ColumnDataProvider) (vm.RowSet, error) {
 				return provider.ScanIsNull(columnName)
 			}, nil
@@ -1145,9 +1160,11 @@ func compileScopedComparison(cmp *tree.ComparisonExpr, scopedPath string) (vm.Co
 
 	// Generate closure based on operator
 	op := cmp.Operator.String()
+	//nolint:dupl // Operator handling duplicated for different predicate types
 	switch op {
 	case "=":
 		return func(provider vm.ColumnDataProvider) (vm.RowSet, error) {
+			//nolint:dupl // Aggregation compilation; duplication is intentional for different aggregation types
 			return provider.ScanEqual(columnName, value)
 		}, nil
 	case "!=", "<>":
@@ -1269,51 +1286,26 @@ func attributePathToColumnName(attrPath string) string {
 
 	// Unscoped intrinsics
 	switch attrPath {
-	case "trace:id":
-		return "trace:id"
-	case "span:id":
-		return "span:id"
-	case "name":
-		return "span:name"
-	case "kind":
-		return "span:kind"
-	case "status":
-		return "span:status"
-	case "status_message":
-		return "span:status_message"
-	case "duration":
-		return "span:duration"
-	case "start", "start_time":
-		return "span:start"
-	case "end", "end_time":
-		return "span:end"
+	case IntrinsicTraceID:
+		return IntrinsicTraceID
+	case IntrinsicSpanID:
+		return IntrinsicSpanID
+	case UnscopedName:
+		return IntrinsicSpanName
+	case UnscopedKind:
+		return IntrinsicSpanKind
+	case UnscopedStatus:
+		return IntrinsicSpanStatus
+	case UnscopedStatusMessage:
+		return IntrinsicSpanStatusMessage
+	case UnscopedDuration:
+		return IntrinsicSpanDuration
+	case UnscopedStart, AttrStartTime:
+		return IntrinsicSpanStart
+	case UnscopedEnd, UnscopedEndTime:
+		return IntrinsicSpanEnd
 	default:
 		return attrPath
-	}
-}
-
-// isSpanIntrinsicPath checks if a span path refers to an intrinsic field
-// With : syntax, intrinsics use : and attributes use .
-// So "span:name" is intrinsic, "span.name" is attribute
-func isSpanIntrinsicPath(path string) bool {
-	// If contains :, it's explicitly an intrinsic
-	if strings.Contains(path, ":") {
-		return true
-	}
-
-	// If it has span. prefix (dot syntax), treat as attribute, not intrinsic
-	// Users must use span: (colon) to explicitly reference intrinsics
-	if strings.HasPrefix(path, "span.") {
-		return false
-	}
-
-	// For span intrinsic fields with colon notation
-	// These are always intrinsics
-	switch path {
-	case "span:start", "span:end", "span:duration":
-		return true
-	default:
-		return false
 	}
 }
 
@@ -1664,8 +1656,8 @@ func isDedicatedColumn(columnName string) bool {
 // isBuiltInField checks if a field is a built-in intrinsic field
 func isBuiltInField(attrPath string) bool {
 	switch attrPath {
-	case "span:name", "span:duration", "span:kind", "span:status", "span:status_message",
-		"trace:id", "span:id", "span:start", "span:end":
+	case IntrinsicSpanName, IntrinsicSpanDuration, IntrinsicSpanKind, IntrinsicSpanStatus, IntrinsicSpanStatusMessage,
+		IntrinsicTraceID, IntrinsicSpanID, IntrinsicSpanStart, IntrinsicSpanEnd:
 		return true
 	default:
 		return false
@@ -1702,7 +1694,7 @@ func hasAggInExpr(expr tree.Expr) bool {
 			return true
 		}
 		switch funcName {
-		case "COUNT", "SUM", "AVG", "MIN", "MAX", "RATE", "QUANTILE", "HISTOGRAM", "STDDEV":
+		case FuncNameCOUNT, FuncNameSUM, FuncNameAVG, FuncNameMIN, FuncNameMAX, FuncNameRATE, FuncNameQUANTILE, FuncNameHISTOGRAM, FuncNameSTDDEV:
 			return true
 		}
 		// Check arguments recursively
@@ -1861,7 +1853,7 @@ func validateSelectExpr(expr tree.Expr, groupBySet map[string]bool, hasGroupBy b
 			isAgg = true
 		} else {
 			switch funcName {
-			case "COUNT", "SUM", "AVG", "MIN", "MAX", "RATE", "QUANTILE", "HISTOGRAM", "STDDEV":
+			case FuncNameCOUNT, FuncNameSUM, FuncNameAVG, FuncNameMIN, FuncNameMAX, FuncNameRATE, FuncNameQUANTILE, FuncNameHISTOGRAM, FuncNameSTDDEV:
 				isAgg = true
 			}
 		}
@@ -1932,7 +1924,15 @@ func parseSelectExprForAgg(selectExpr tree.SelectExpr, plan *vm.AggregationPlan)
 			return nil
 		}
 		switch funcName {
-		case "COUNT", "SUM", "AVG", "MIN", "MAX", "RATE", "QUANTILE", "HISTOGRAM", "STDDEV":
+		case FuncNameCOUNT,
+			FuncNameSUM,
+			FuncNameAVG,
+			FuncNameMIN,
+			FuncNameMAX,
+			FuncNameRATE,
+			FuncNameQUANTILE,
+			FuncNameHISTOGRAM,
+			FuncNameSTDDEV:
 			// Parse the aggregate function
 			aggSpec, err := parseAggregateFunc(funcExpr)
 			if err != nil {
@@ -1969,23 +1969,23 @@ func parseAggregateFunc(funcExpr *tree.FuncExpr) (vm.AggSpec, error) {
 		spec.Quantile = quantile
 	} else {
 		switch funcName {
-		case "COUNT":
+		case FuncNameCOUNT:
 			spec.Function = vm.AggCount
-		case "SUM":
+		case FuncNameSUM:
 			spec.Function = vm.AggSum
-		case "AVG":
+		case FuncNameAVG:
 			spec.Function = vm.AggAvg
-		case "MIN":
+		case FuncNameMIN:
 			spec.Function = vm.AggMin
-		case "MAX":
+		case FuncNameMAX:
 			spec.Function = vm.AggMax
-		case "RATE":
+		case FuncNameRATE:
 			spec.Function = vm.AggRate
-		case "QUANTILE":
+		case FuncNameQUANTILE:
 			spec.Function = vm.AggQuantile
-		case "HISTOGRAM":
+		case FuncNameHISTOGRAM:
 			spec.Function = vm.AggHistogram
-		case "STDDEV":
+		case FuncNameSTDDEV:
 			spec.Function = vm.AggStddev
 		default:
 			return spec, fmt.Errorf("unsupported aggregate function: %s", funcName)
@@ -2001,7 +2001,7 @@ func parseAggregateFunc(funcExpr *tree.FuncExpr) (vm.AggSpec, error) {
 	}
 
 	// Check for COUNT(*) and RATE(*) special cases
-	if funcName == "COUNT" || funcName == "RATE" {
+	if funcName == FuncNameCOUNT || funcName == FuncNameRATE {
 		// Check if the argument is * (UnqualifiedStar)
 		if _, ok := funcExpr.Exprs[0].(tree.UnqualifiedStar); ok {
 			// COUNT(*) or RATE(*) - Field is empty
@@ -2018,7 +2018,7 @@ func parseAggregateFunc(funcExpr *tree.FuncExpr) (vm.AggSpec, error) {
 	spec.Field = attrPath
 
 	// Handle QUANTILE special case - second argument is the quantile value
-	if funcName == "QUANTILE" {
+	if funcName == FuncNameQUANTILE {
 		if len(funcExpr.Exprs) < 2 {
 			return spec, fmt.Errorf("QUANTILE requires two arguments: field and quantile value")
 		}
@@ -2047,12 +2047,12 @@ func parseAggregateFunc(funcExpr *tree.FuncExpr) (vm.AggSpec, error) {
 
 // generateDefaultAlias creates a default column name for an aggregate function
 func generateDefaultAlias(funcName, field string, quantile float64) string {
-	if funcName == "COUNT" && field == "" {
+	if funcName == FuncNameCOUNT && field == "" {
 		return "count"
 	}
 
-	if funcName == "RATE" && field == "" {
-		return "rate"
+	if funcName == FuncNameRATE && field == "" {
+		return AggregationRate
 	}
 
 	// Strip scope prefixes from field names for cleaner output (span:duration -> duration, span.http.method -> http.method)
@@ -2067,7 +2067,7 @@ func generateDefaultAlias(funcName, field string, quantile float64) string {
 		fieldName = strings.TrimPrefix(fieldName, "resource.")
 	}
 
-	if funcName == "QUANTILE" {
+	if funcName == FuncNameQUANTILE {
 		return fmt.Sprintf("quantile_%s_%g", fieldName, quantile)
 	}
 
@@ -2076,11 +2076,11 @@ func generateDefaultAlias(funcName, field string, quantile float64) string {
 		return fmt.Sprintf("p%d_%s", percent, fieldName)
 	}
 
-	if funcName == "HISTOGRAM" {
+	if funcName == FuncNameHISTOGRAM {
 		return fmt.Sprintf("histogram_%s", fieldName)
 	}
 
-	if funcName == "STDDEV" {
+	if funcName == FuncNameSTDDEV {
 		return fmt.Sprintf("stddev_%s", fieldName)
 	}
 

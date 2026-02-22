@@ -4,7 +4,7 @@
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-//      http://www.apache.org/licenses/LICENSE-2.0
+//	http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Package xflag provides flag parsing utilities.
 package xflag
 
 import (
@@ -41,7 +42,12 @@ func Func[T any](name, usage string, fn func(string) (T, error)) *T {
 // Panics if this flag is of the wrong type, or if the flag value is not a
 // [flag.Getter].
 func Lookup[T any](name string) T {
-	return flag.Lookup(name).Value.(flag.Getter).Get().(T) //nolint:errcheck
+	f := flag.Lookup(name)
+	if f == nil {
+		var zero T
+		return zero
+	}
+	return f.Value.(flag.Getter).Get().(T) //nolint:errcheck
 }
 
 // Parsed returns whether the given flag was parsed.

@@ -16,6 +16,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"math/bits"
 )
 
 // ChooseIndexWidth returns the minimum byte width needed to store dictionary indexes.
@@ -37,7 +38,7 @@ func WriteFixedWidth(buf *bytes.Buffer, val uint32, width uint8) error {
 	case 1:
 		return buf.WriteByte(byte(val))
 	case 2:
-		return binary.Write(buf, binary.LittleEndian, uint16(val))
+		return binary.Write(buf, binary.LittleEndian, uint16(val)) //nolint:gosec // Reviewed and acceptable
 	case 4:
 		return binary.Write(buf, binary.LittleEndian, val)
 	default:
@@ -65,41 +66,55 @@ func isBitSet(bits []byte, idx int) bool {
 	return bits[byteIdx]&(1<<bitIdx) != 0
 }
 
-// EncodePresenceRLE compresses presence bits into alternating runs of false/true values.
-// It is used by column encodings to avoid storing one bit per row when nulls are clustered.
-func EncodePresenceRLE(bits []byte, rows int) []byte {
-	const presenceRLEVersion = uint8(1)
+// extractSetIndices extracts indices where bits are set, optimized for sparse bitsets.
+// Uses word-level operations to skip empty regions efficiently.
+// For dense bitsets (>50% bits set), the naive loop may be faster due to reduced overhead.
+func extractSetIndices(present []byte, indexes []uint32, spanCount int, presentCount int) []uint32 {
+	result := make([]uint32, 0, presentCount)
 
-	var buf bytes.Buffer
-	runCount := uint32(0)
-	last := false
-	// BOT: Why are doing two loops?
-	for i := 0; i < rows; i++ {
-		val := isBitSet(bits, i)
-		if i == 0 || val != last {
-			runCount++
+	// Process 64 bits at a time for efficiency
+	wordCount := (spanCount + 63) / 64
+	for wordIdx := 0; wordIdx < wordCount; wordIdx++ {
+		byteOffset := wordIdx * 8
+		if byteOffset >= len(present) {
+			break
 		}
-		last = val
-	}
-	_ = buf.WriteByte(presenceRLEVersion)
-	_ = binary.Write(&buf, binary.LittleEndian, runCount)
 
-	currentVal := isBitSet(bits, 0)
-	currentLen := uint32(0)
-	for i := 0; i < rows; i++ {
-		val := isBitSet(bits, i)
-		if val == currentVal {
-			currentLen++
+		// Read 64-bit word (handle partial words at end)
+		var word uint64
+		remaining := len(present) - byteOffset
+		if remaining >= 8 {
+			word = binary.LittleEndian.Uint64(present[byteOffset : byteOffset+8])
+		} else {
+			// Partial word at end - construct from available bytes
+			for i := 0; i < remaining; i++ {
+				word |= uint64(present[byteOffset+i]) << (i * 8)
+			}
+		}
+
+		// Skip empty words (common in sparse data)
+		if word == 0 {
 			continue
 		}
-		_ = binary.Write(&buf, binary.LittleEndian, currentLen)
-		_ = buf.WriteByte(boolToByte(currentVal))
-		currentVal = val
-		currentLen = 1
+
+		// Process set bits in this word
+		baseIdx := wordIdx * 64
+		for word != 0 {
+			// Find position of lowest set bit
+			bitPos := bits.TrailingZeros64(word)
+			idx := baseIdx + bitPos
+
+			// Check bounds and append
+			if idx < spanCount {
+				result = append(result, indexes[idx])
+			}
+
+			// Clear the bit we just processed
+			word &^= 1 << bitPos
+		}
 	}
-	_ = binary.Write(&buf, binary.LittleEndian, currentLen)
-	_ = buf.WriteByte(boolToByte(currentVal))
-	return buf.Bytes()
+
+	return result
 }
 
 // EncodeIndexRLE compresses uint32 indexes into runs of the same value.
@@ -144,18 +159,19 @@ func EncodeIndexRLE(indexes []uint32) []byte {
 	return buf.Bytes()
 }
 
-// boolToByte converts a bool to a byte (0 or 1).
-func boolToByte(v bool) byte {
-	if v {
-		return 1
-	}
-	return 0
-}
-
 // ChooseBytesEncodingKind selects the best encoding (dictionary vs inline) for bytes columns.
 // It compares the compressed size of dictionary encoding vs inline encoding and returns
 // the encoding kind that produces the smallest output.
-func ChooseBytesEncodingKind(spanCount, presentCount int, useSparse bool, presenceRLE []byte, width uint8, compressedDict []byte, dictVals [][]byte, indexes []uint32, present []byte) (uint8, error) {
+func ChooseBytesEncodingKind(
+	spanCount, presentCount int,
+	useSparse bool,
+	presenceRLE []byte,
+	width uint8,
+	compressedDict []byte,
+	dictVals [][]byte,
+	indexes []uint32,
+	present []byte,
+) (uint8, error) {
 	// Inline bytes encoding stores each value with its length, so size scales with payload bytes.
 	// Dictionary encoding stores a compressed dictionary plus fixed-width indexes for each row.
 	inlineSize := 4 + 4 + len(presenceRLE)

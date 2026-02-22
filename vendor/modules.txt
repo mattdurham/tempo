@@ -1072,17 +1072,23 @@ github.com/mark3labs/mcp-go/client/transport
 github.com/mark3labs/mcp-go/mcp
 github.com/mark3labs/mcp-go/server
 github.com/mark3labs/mcp-go/util
-# github.com/mattdurham/blockpack v0.0.0-00010101000000-000000000000 => /home/matt/source/blockpack
+# github.com/mattdurham/blockpack v0.0.0-20260219155254-414f47287d07
 ## explicit; go 1.25.1
 github.com/mattdurham/blockpack
 github.com/mattdurham/blockpack/internal/arena
 github.com/mattdurham/blockpack/internal/arena/slice
 github.com/mattdurham/blockpack/internal/blockio
+github.com/mattdurham/blockpack/internal/blockio/compaction
+github.com/mattdurham/blockpack/internal/blockio/reader
+github.com/mattdurham/blockpack/internal/blockio/shared
+github.com/mattdurham/blockpack/internal/blockio/spanconv
+github.com/mattdurham/blockpack/internal/blockio/writer
 github.com/mattdurham/blockpack/internal/debug
 github.com/mattdurham/blockpack/internal/encodings
 github.com/mattdurham/blockpack/internal/executor
 github.com/mattdurham/blockpack/internal/quantile
 github.com/mattdurham/blockpack/internal/sql
+github.com/mattdurham/blockpack/internal/tempoapi
 github.com/mattdurham/blockpack/internal/traceqlparser
 github.com/mattdurham/blockpack/internal/types
 github.com/mattdurham/blockpack/internal/vm
@@ -2705,4 +2711,3 @@ k8s.io/utils/clock
 # k8s.io/api => k8s.io/api v0.35.0
 # k8s.io/client-go => k8s.io/client-go v0.35.0
 # github.com/hashicorp/memberlist => github.com/grafana/memberlist v0.3.1-0.20251024160842-5cd332c2849a
-# github.com/mattdurham/blockpack => /home/matt/source/blockpack

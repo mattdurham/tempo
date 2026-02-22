@@ -1,22 +1,54 @@
 services:
-  # MinIO for S3 storage
-  minio:
-    image: minio/minio:latest
+  # s3proxy - S3 API backed by filesystem
+  s3proxy:
+    image: andrewgaul/s3proxy:latest
+    user: "1000:1000"
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
-    ports:
-      - "9001:9001"
-    command: server /data --console-address ':9001'
+      S3PROXY_AUTHORIZATION: none
+      S3PROXY_ENDPOINT: http://0.0.0.0:8080
+      S3PROXY_IDENTITY: minioadmin
+      S3PROXY_CREDENTIAL: minioadmin
+      JCLOUDS_PROVIDER: filesystem
+      JCLOUDS_FILESYSTEM_BASEDIR: /data
     volumes:
-      - ./minio-data:/data
+      - ./s3-data:/data
+    networks:
+      - tempo-network
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      test: ["CMD", "curl", "-f", "http://localhost:8080"]
       interval: 10s
       timeout: 5s
       retries: 5
+
+  # Create S3 buckets in s3proxy
+  s3proxy-init:
+    image: curlimages/curl:latest
+    depends_on:
+      s3proxy:
+        condition: service_healthy
+    command: >
+      sh -c "
+      curl -s -X PUT http://s3proxy:8080/tempo-parquet;
+      curl -s -X PUT http://s3proxy:8080/tempo-blockpack;
+      echo done
+      "
     networks:
       - tempo-network
+
+  # Toxiproxy to simulate 20ms S3 latency
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:latest
+    ports:
+      - "8474:8474"  # API port
+      - "9000:9000"  # S3 proxy port
+    depends_on:
+      s3proxy:
+        condition: service_healthy
+    networks:
+      - tempo-network
+    command: -host=0.0.0.0 -config=/config/toxiproxy-blockpack.json
+    volumes:
+      - ./toxiproxy-blockpack.json:/config/toxiproxy-blockpack.json
 
   # Kafka for Tempo ingest path
   kafka:
@@ -47,13 +79,15 @@ services:
   # Tempo with Parquet backend (built from blockpack-integration)
   tempo-parquet:
     build:
-      context: /home/matt/source
-      dockerfile: tempo-mrd-worktrees/blockpack-integration/.docker/Dockerfile.tempo
+      context: ..
+      dockerfile: .docker/Dockerfile.tempo
     command:
       - "-config.file=/etc/tempo.yaml"
     depends_on:
-      minio:
-        condition: service_healthy
+      toxiproxy:
+        condition: service_started
+      s3proxy-init:
+        condition: service_completed_successfully
       kafka:
         condition: service_healthy
     volumes:
@@ -70,14 +104,17 @@ services:
 
   # Tempo with Blockpack backend (built from blockpack-integration with vBlockpack support)
   tempo-blockpack:
+    hostname: block-builder-0
     build:
-      context: /home/matt/source
-      dockerfile: tempo-mrd-worktrees/blockpack-integration/.docker/Dockerfile.tempo
+      context: ..
+      dockerfile: .docker/Dockerfile.tempo
     command:
       - "-config.file=/etc/tempo.yaml"
     depends_on:
-      minio:
-        condition: service_healthy
+      toxiproxy:
+        condition: service_started
+      s3proxy-init:
+        condition: service_completed_successfully
       kafka:
         condition: service_healthy
     volumes:
@@ -92,33 +129,33 @@ services:
     networks:
       - tempo-network
 
-  # k6 load generator for Parquet Tempo
-  k6-parquet:
-    image: grafana/k6:latest
-    volumes:
-      - ./k6-script.js:/scripts/script.js
-    environment:
-      - TEMPO_ENDPOINT=http://tempo-parquet:4318
-      - TRACE_RATE=20
-      - VUS=2
-      - DURATION=300s
-    command: run /scripts/script.js
+  # otel-loadgen for Parquet Tempo
+  otel-loadgen-parquet:
+    image: streamfold/otel-loadgen:latest
+    restart: unless-stopped
+    command:
+      - gen
+      - traces
+      - --otlp-endpoint=tempo-parquet:4317
+      - --workers=10
+      - --spans-per-resource=100
+      - --duration=24h
     depends_on:
       - tempo-parquet
     networks:
       - tempo-network
 
-  # k6 load generator for Blockpack Tempo
-  k6-blockpack:
-    image: grafana/k6:latest
-    volumes:
-      - ./k6-script.js:/scripts/script.js
-    environment:
-      - TEMPO_ENDPOINT=http://tempo-blockpack:4320
-      - TRACE_RATE=20
-      - VUS=2
-      - DURATION=300s
-    command: run /scripts/script.js
+  # otel-loadgen for Blockpack Tempo
+  otel-loadgen-blockpack:
+    image: streamfold/otel-loadgen:latest
+    restart: unless-stopped
+    command:
+      - gen
+      - traces
+      - --otlp-endpoint=tempo-blockpack:4319
+      - --workers=10
+      - --spans-per-resource=100
+      - --duration=24h
     depends_on:
       - tempo-blockpack
     networks:
@@ -130,6 +167,13 @@ services:
     command:
       - --config.file=/etc/prometheus.yaml
       - --web.enable-remote-write-receiver
+      - --enable-feature=expand-external-labels
+    env_file:
+      - .env
+    environment:
+      - GRAFANA_PROM_URL
+      - GRAFANA_PROM_USER
+      - GRAFANA_PROM_TOKEN
     volumes:
       - ./prometheus.yaml:/etc/prometheus.yaml
     ports:

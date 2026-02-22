@@ -228,17 +228,17 @@ func parseSQLAggregateFunc(agg *tree.FuncExpr) (AggregateSpec, error) {
 	}
 
 	switch funcName {
-	case "COUNT":
+	case FuncNameCOUNT:
 		return parseAggregateCount(agg, funcName)
-	case "RATE":
+	case FuncNameRATE:
 		return parseAggregateRate(agg, funcName)
-	case "AVG", "MIN", "MAX", "SUM", "STDDEV", "HISTOGRAM":
+	case FuncNameAVG, FuncNameMIN, FuncNameMAX, FuncNameSUM, FuncNameSTDDEV, FuncNameHISTOGRAM:
 		field, err := parseAggregateField(agg, funcName)
 		if err != nil {
 			return AggregateSpec{}, err
 		}
 		return AggregateSpec{Function: funcName, Field: field}, nil
-	case "QUANTILE":
+	case FuncNameQUANTILE:
 		return parseAggregateQuantile(agg)
 	default:
 		return AggregateSpec{}, fmt.Errorf("unsupported aggregate function: %s", funcName)
@@ -328,7 +328,7 @@ func findAggregateFunc(expr tree.Expr) (*tree.FuncExpr, bool) {
 			return e, true
 		}
 		switch funcName {
-		case "COUNT", "SUM", "AVG", "MIN", "MAX", "RATE", "QUANTILE", "STDDEV", "HISTOGRAM":
+		case FuncNameCOUNT, FuncNameSUM, FuncNameAVG, FuncNameMIN, FuncNameMAX, FuncNameRATE, FuncNameQUANTILE, FuncNameSTDDEV, FuncNameHISTOGRAM:
 			return e, true
 		}
 		// Not an aggregate, check arguments

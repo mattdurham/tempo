@@ -2,7 +2,7 @@ package ondisk
 
 // BytesValue returns a copy of the bytes at the given row if present.
 func (c *Column) BytesValue(idx int) ([]byte, bool) {
-	if c.Type != ColumnTypeBytes || !c.isPresent(idx) {
+	if c == nil || (c.Type != ColumnTypeBytes && c.Type != ColumnTypeRangeBytes) || !c.isPresent(idx) {
 		return nil, false
 	}
 	view, ok := c.BytesValueView(idx)
@@ -17,7 +17,7 @@ func (c *Column) BytesValue(idx int) ([]byte, bool) {
 // BytesValueView returns the raw dictionary-backed bytes without copying.
 // The returned slice must be treated as immutable.
 func (c *Column) BytesValueView(idx int) ([]byte, bool) {
-	if c.Type != ColumnTypeBytes || !c.isPresent(idx) {
+	if c == nil || (c.Type != ColumnTypeBytes && c.Type != ColumnTypeRangeBytes) || !c.isPresent(idx) {
 		return nil, false
 	}
 	if c.bytesInline != nil {

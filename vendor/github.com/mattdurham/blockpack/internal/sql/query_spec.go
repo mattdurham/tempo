@@ -18,7 +18,7 @@ type QuerySpec struct {
 type FilterSpec struct {
 	// AttributeEquals maps attribute paths to lists of acceptable values (OR semantics)
 	// e.g., "span.http.status_code" -> [200, 201, 204]
-	AttributeEquals map[string][]interface{}
+	AttributeEquals map[string][]any
 
 	// AttributeRanges maps attribute paths to range specifications
 	// e.g., "duration" -> {MinValue: 100000000, MaxValue: 500000000, MinInclusive: true, MaxInclusive: false}
@@ -30,10 +30,10 @@ type FilterSpec struct {
 
 // RangeSpec represents a range constraint on an attribute.
 type RangeSpec struct {
-	MinValue     interface{} // Minimum value (nil means unbounded)
-	MaxValue     interface{} // Maximum value (nil means unbounded)
-	MinInclusive bool        // Whether minimum is inclusive (>= vs >)
-	MaxInclusive bool        // Whether maximum is inclusive (<= vs <)
+	MinValue     any  // Minimum value (nil means unbounded)
+	MaxValue     any  // Maximum value (nil means unbounded)
+	MinInclusive bool // Whether minimum is inclusive (>= vs >)
+	MaxInclusive bool // Whether maximum is inclusive (<= vs <)
 }
 
 // AggregateSpec represents the aggregation function and grouping.
@@ -45,11 +45,11 @@ type AggregateSpec struct {
 	// Field is the attribute path to aggregate (empty for COUNT and RATE)
 	Field string
 
-	// Quantile is the quantile value (0-1) for QUANTILE function
-	Quantile float64
-
 	// GroupBy is the list of attribute paths to group by (sorted for canonicalization)
 	GroupBy []string
+
+	// Quantile is the quantile value (0-1) for QUANTILE function
+	Quantile float64
 }
 
 // TimeBucketSpec represents time bucketing configuration.
@@ -75,10 +75,15 @@ func (qs *QuerySpec) Normalize() {
 	sort.Strings(qs.Aggregate.GroupBy)
 
 	// Normalize filter attribute paths
-	normalizedEquals := make(map[string][]interface{})
+	normalizedEquals := make(map[string][]any)
 	for path, values := range qs.Filter.AttributeEquals {
 		normalizedPath := normalizeFieldName(path)
-		normalizedEquals[normalizedPath] = values
+		// Merge values if normalized path already exists
+		if existing, ok := normalizedEquals[normalizedPath]; ok {
+			normalizedEquals[normalizedPath] = append(existing, values...)
+		} else {
+			normalizedEquals[normalizedPath] = values
+		}
 	}
 	qs.Filter.AttributeEquals = normalizedEquals
 
@@ -107,29 +112,38 @@ func normalizeFieldName(path string) string {
 
 	// Map unscoped intrinsics to span-scoped colon form
 	switch path {
-	case "name":
-		return "span:name"
-	case "duration":
-		return "span:duration"
-	case "kind":
-		return "span:kind"
-	case "status":
-		return "span:status"
-	case "status_message":
-		return "span:status_message"
-	case "start", "start_time":
-		return "span:start"
-	case "end", "end_time":
-		return "span:end"
+	case UnscopedName:
+		return IntrinsicSpanName
+	case UnscopedDuration:
+		return IntrinsicSpanDuration
+	case UnscopedKind:
+		return IntrinsicSpanKind
+	case UnscopedStatus:
+		return IntrinsicSpanStatus
+	case UnscopedStatusMessage:
+		return IntrinsicSpanStatusMessage
+	case UnscopedStart, "start_time":
+		return IntrinsicSpanStart
+	case UnscopedEnd, UnscopedEndTime:
+		return IntrinsicSpanEnd
 	}
 
 	// Handle span.intrinsic (dot notation) - convert to span:intrinsic for known intrinsics
-	if strings.HasPrefix(path, "span.") {
-		fieldName := strings.TrimPrefix(path, "span.")
+	if fieldName, ok := strings.CutPrefix(path, "span."); ok {
 		switch fieldName {
-		case "name", "kind", "status", "status_message", "start", "end", "duration",
-			"id", "parent_id", "trace_state",
-			"dropped_attributes_count", "dropped_events_count", "dropped_links_count":
+		case UnscopedName,
+			UnscopedKind,
+			UnscopedStatus,
+			UnscopedStatusMessage,
+			UnscopedStart,
+			UnscopedEnd,
+			UnscopedDuration,
+			"id",
+			UnscopedParentID,
+			AttrTraceState,
+			AttrDroppedAttributesCount,
+			AttrDroppedEventsCount,
+			"dropped_links_count":
 			return "span:" + fieldName
 		}
 		// It's an attribute, keep dot notation
@@ -137,10 +151,9 @@ func normalizeFieldName(path string) string {
 	}
 
 	// Handle resource.intrinsic - convert to resource:intrinsic for known intrinsics
-	if strings.HasPrefix(path, "resource.") {
-		fieldName := strings.TrimPrefix(path, "resource.")
+	if fieldName, ok := strings.CutPrefix(path, "resource."); ok {
 		switch fieldName {
-		case "schema_url", "dropped_attributes_count":
+		case "schema_url", AttrDroppedAttributesCount:
 			return "resource:" + fieldName
 		}
 		// It's an attribute, keep dot notation
@@ -154,9 +167,9 @@ func normalizeFieldName(path string) string {
 // CompileSQLToSpec compiles a SQL SELECT statement to a QuerySpec.
 // This is the inverse of TraceQL compilation - SQL queries are compiled to the same
 // canonical QuerySpec representation for semantic matching.
-func CompileSQLToSpec(stmt interface{}, timeBucket TimeBucketSpec) (*QuerySpec, error) {
+func CompileSQLToSpec(stmt any, timeBucket TimeBucketSpec) (*QuerySpec, error) {
 	// Import the tree package for type assertions
-	// We need to work around Go's import cycle by accepting interface{} and asserting
+	// We need to work around Go's import cycle by accepting any and asserting
 	// We'll use the actual tree.Select type at runtime
 	return compileSQLToSpecInternal(stmt, timeBucket)
 }

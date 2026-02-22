@@ -3,6 +3,7 @@ package encodings
 import (
 	"bytes"
 	"encoding/binary"
+
 	"github.com/klauspost/compress/zstd"
 )
 
@@ -25,8 +26,8 @@ func BuildXORBytes(
 	}
 
 	_ = buf.WriteByte(encodingKind)
-	_ = binary.Write(buf, binary.LittleEndian, uint32(spanCount))
-	_ = binary.Write(buf, binary.LittleEndian, uint32(len(presenceRLE)))
+	_ = binary.Write(buf, binary.LittleEndian, uint32(spanCount))        //nolint:gosec
+	_ = binary.Write(buf, binary.LittleEndian, uint32(len(presenceRLE))) //nolint:gosec
 	_, _ = buf.Write(presenceRLE)
 
 	// Encode XOR deltas
@@ -41,7 +42,7 @@ func BuildXORBytes(
 		value := bytesValues[i]
 		if prevValue == nil {
 			// First value - store as-is
-			_ = binary.Write(&xorBuf, binary.LittleEndian, uint32(len(value)))
+			_ = binary.Write(&xorBuf, binary.LittleEndian, uint32(len(value))) //nolint:gosec
 			_, _ = xorBuf.Write(value)
 			prevValue = value
 		} else {
@@ -54,7 +55,7 @@ func BuildXORBytes(
 					xorResult[j] = value[j]
 				}
 			}
-			_ = binary.Write(&xorBuf, binary.LittleEndian, uint32(len(xorResult)))
+			_ = binary.Write(&xorBuf, binary.LittleEndian, uint32(len(xorResult))) //nolint:gosec
 			_, _ = xorBuf.Write(xorResult)
 			prevValue = value
 		}
@@ -62,7 +63,7 @@ func BuildXORBytes(
 
 	// Compress XOR-encoded data
 	compressedXOR := CompressZstd(xorBuf.Bytes(), encoder)
-	_ = binary.Write(buf, binary.LittleEndian, uint32(len(compressedXOR)))
+	_ = binary.Write(buf, binary.LittleEndian, uint32(len(compressedXOR))) //nolint:gosec
 	_, _ = buf.Write(compressedXOR)
 
 	return nil

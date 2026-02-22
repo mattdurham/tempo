@@ -27,6 +27,8 @@ import (
 var isDirectMap xsync.Map[reflect.Type, bool]
 
 // iface is the internal representation an a Go interface value.
+//
+//nolint:govet,betteralign // Field order must match Go's internal interface layout
 type iface struct {
 	itab uintptr
 	data *byte
@@ -50,7 +52,7 @@ func AnyBytes(v any) []byte {
 
 	p := AnyData(v)
 	if !IsDirectAny(v) {
-		return unsafe.Slice(p, reflect.TypeOf(v).Size())
+		return unsafe.Slice(p, reflect.TypeOf(v).Size()) //nolint:gosec
 	}
 
 	p2 := p // Work around https://github.com/golang/go/issues/74364

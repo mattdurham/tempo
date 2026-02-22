@@ -15,15 +15,6 @@ func NewRowSet() *RowSet {
 	}
 }
 
-// NewRowSetFromSlice creates a row set from a slice of row indices
-func NewRowSetFromSlice(rows []int) *RowSet {
-	rs := NewRowSet()
-	for _, row := range rows {
-		rs.Add(row)
-	}
-	return rs
-}
-
 // Add adds a row index to the set
 func (rs *RowSet) Add(rowIdx int) {
 	rs.indices[rowIdx] = struct{}{}
@@ -138,46 +129,4 @@ func (rs *RowSet) Clone() *RowSet {
 // Clear removes all rows from the set
 func (rs *RowSet) Clear() {
 	rs.indices = make(map[int]struct{})
-}
-
-// UnionMany returns the union of multiple row sets
-func UnionMany(sets ...*RowSet) *RowSet {
-	if len(sets) == 0 {
-		return NewRowSet()
-	}
-
-	result := sets[0].Clone()
-	for i := 1; i < len(sets); i++ {
-		for idx := range sets[i].indices {
-			result.Add(idx)
-		}
-	}
-
-	return result
-}
-
-// IntersectMany returns the intersection of multiple row sets
-func IntersectMany(sets ...*RowSet) *RowSet {
-	if len(sets) == 0 {
-		return NewRowSet()
-	}
-
-	if len(sets) == 1 {
-		return sets[0].Clone()
-	}
-
-	// Start with first set
-	result := sets[0].Clone()
-
-	// Intersect with remaining sets
-	for i := 1; i < len(sets); i++ {
-		result = result.Intersect(sets[i])
-
-		// Early termination if result becomes empty
-		if result.IsEmpty() {
-			return result
-		}
-	}
-
-	return result
 }

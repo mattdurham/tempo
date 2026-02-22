@@ -7,6 +7,12 @@ import (
 	blockpackio "github.com/mattdurham/blockpack/internal/blockio"
 )
 
+// Compile-time interface compliance checks
+var (
+	_ blockpackio.CloseableReaderProvider = (*fileReaderProvider)(nil)
+	_ blockpackio.ReaderProvider          = (*bytesReaderProvider)(nil)
+)
+
 type bytesReaderProvider struct {
 	data []byte
 }
