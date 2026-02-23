@@ -2,7 +2,6 @@ package vblockpack
 
 import (
 	"context"
-	"io"
 	"testing"
 	"time"
 
@@ -84,30 +83,21 @@ func TestRoundTrip_WriteAndReadBlock(t *testing.T) {
 
 	t.Log("Block opened successfully!")
 
-	// Try to iterate through the block to verify traces
-	blockIter, err := block.Iterator()
-	if err == nil {
-		defer blockIter.Close()
+	// Verify the trace can be read back using FindTraceByID
+	t.Log("Verifying trace can be retrieved by ID...")
+	response, err := block.FindTraceByID(ctx, traceID, common.SearchOptions{})
+	require.NoError(t, err)
+	require.NotNil(t, response, "expected to find trace by ID after roundtrip")
+	require.NotNil(t, response.Trace, "expected trace in response after roundtrip")
 
-		foundTraces := 0
-		for {
-			id, tr, err := blockIter.Next(ctx)
-			if err == io.EOF {
-				break
-			}
-			if err != nil {
-				t.Logf("Iterator error (may be expected if not fully implemented): %v", err)
-				break
-			}
-			if tr != nil {
-				foundTraces++
-				t.Logf("Found trace: %x", id)
-			}
-		}
-		t.Logf("Successfully iterated through block, found %d traces", foundTraces)
-	} else {
-		t.Logf("Iterator not yet implemented: %v", err)
-	}
+	// Verify the trace has the expected structure
+	require.Greater(t, len(response.Trace.ResourceSpans), 0, "expected at least one ResourceSpan")
+	require.Greater(t, len(response.Trace.ResourceSpans[0].ScopeSpans), 0, "expected at least one ScopeSpan")
+	require.Greater(t, len(response.Trace.ResourceSpans[0].ScopeSpans[0].Spans), 0, "expected at least one Span")
 
+	foundSpan := response.Trace.ResourceSpans[0].ScopeSpans[0].Spans[0]
+	require.Equal(t, "test-span", foundSpan.Name, "expected span name to match after roundtrip")
+
+	t.Logf("Roundtrip verified: found trace with span name '%s'", foundSpan.Name)
 	t.Log("Roundtrip test completed!")
 }
