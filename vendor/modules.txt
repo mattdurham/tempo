@@ -180,40 +180,6 @@ github.com/armon/go-metrics
 # github.com/asaskevich/govalidator v0.0.0-20230301143203-a9d515a09cc2
 ## explicit; go 1.13
 github.com/asaskevich/govalidator
-# github.com/auxten/postgresql-parser v1.0.1
-## explicit; go 1.15
-github.com/auxten/postgresql-parser/pkg/sql/lex
-github.com/auxten/postgresql-parser/pkg/sql/parser
-github.com/auxten/postgresql-parser/pkg/sql/pgwire/pgcode
-github.com/auxten/postgresql-parser/pkg/sql/pgwire/pgerror
-github.com/auxten/postgresql-parser/pkg/sql/privilege
-github.com/auxten/postgresql-parser/pkg/sql/sem/tree
-github.com/auxten/postgresql-parser/pkg/sql/sessiondata
-github.com/auxten/postgresql-parser/pkg/sql/types
-github.com/auxten/postgresql-parser/pkg/util
-github.com/auxten/postgresql-parser/pkg/util/arith
-github.com/auxten/postgresql-parser/pkg/util/bitarray
-github.com/auxten/postgresql-parser/pkg/util/duration
-github.com/auxten/postgresql-parser/pkg/util/encoding
-github.com/auxten/postgresql-parser/pkg/util/envutil
-github.com/auxten/postgresql-parser/pkg/util/errorutil/unimplemented
-github.com/auxten/postgresql-parser/pkg/util/hlc
-github.com/auxten/postgresql-parser/pkg/util/humanizeutil
-github.com/auxten/postgresql-parser/pkg/util/ipaddr
-github.com/auxten/postgresql-parser/pkg/util/json
-github.com/auxten/postgresql-parser/pkg/util/pretty
-github.com/auxten/postgresql-parser/pkg/util/protoutil
-github.com/auxten/postgresql-parser/pkg/util/randutil
-github.com/auxten/postgresql-parser/pkg/util/ring
-github.com/auxten/postgresql-parser/pkg/util/stacktrace
-github.com/auxten/postgresql-parser/pkg/util/stringencoding
-github.com/auxten/postgresql-parser/pkg/util/timeofday
-github.com/auxten/postgresql-parser/pkg/util/timetz
-github.com/auxten/postgresql-parser/pkg/util/timeutil
-github.com/auxten/postgresql-parser/pkg/util/timeutil/pgdate
-github.com/auxten/postgresql-parser/pkg/util/uint128
-github.com/auxten/postgresql-parser/pkg/util/unique
-github.com/auxten/postgresql-parser/pkg/util/uuid
 # github.com/aws/aws-msk-iam-sasl-signer-go v1.0.4
 ## explicit; go 1.21
 github.com/aws/aws-msk-iam-sasl-signer-go/signer
@@ -387,9 +353,6 @@ github.com/census-instrumentation/opencensus-proto/gen-go/agent/trace/v1
 github.com/census-instrumentation/opencensus-proto/gen-go/metrics/v1
 github.com/census-instrumentation/opencensus-proto/gen-go/resource/v1
 github.com/census-instrumentation/opencensus-proto/gen-go/trace/v1
-# github.com/certifi/gocertifi v0.0.0-20200922220541-2c3bb06c6054
-## explicit; go 1.12
-github.com/certifi/gocertifi
 # github.com/cespare/xxhash/v2 v2.3.0
 ## explicit; go 1.11
 github.com/cespare/xxhash/v2
@@ -420,39 +383,6 @@ github.com/cncf/xds/go/xds/data/orca/v3
 github.com/cncf/xds/go/xds/service/orca/v3
 github.com/cncf/xds/go/xds/type/matcher/v3
 github.com/cncf/xds/go/xds/type/v3
-# github.com/cockroachdb/apd v1.1.1-0.20181017181144-bced77f817b4
-## explicit
-github.com/cockroachdb/apd
-# github.com/cockroachdb/errors v1.8.2
-## explicit; go 1.13
-github.com/cockroachdb/errors
-github.com/cockroachdb/errors/assert
-github.com/cockroachdb/errors/barriers
-github.com/cockroachdb/errors/contexttags
-github.com/cockroachdb/errors/domains
-github.com/cockroachdb/errors/errbase
-github.com/cockroachdb/errors/errorspb
-github.com/cockroachdb/errors/errutil
-github.com/cockroachdb/errors/hintdetail
-github.com/cockroachdb/errors/issuelink
-github.com/cockroachdb/errors/markers
-github.com/cockroachdb/errors/report
-github.com/cockroachdb/errors/safedetails
-github.com/cockroachdb/errors/secondary
-github.com/cockroachdb/errors/stdstrings
-github.com/cockroachdb/errors/telemetrykeys
-github.com/cockroachdb/errors/withstack
-# github.com/cockroachdb/logtags v0.0.0-20190617123548-eb05cc24525f
-## explicit
-github.com/cockroachdb/logtags
-# github.com/cockroachdb/redact v1.0.8
-## explicit; go 1.14
-github.com/cockroachdb/redact
-github.com/cockroachdb/redact/internal
-github.com/cockroachdb/redact/internal/fmtsort
-# github.com/cockroachdb/sentry-go v0.6.1-cockroachdb.2
-## explicit; go 1.12
-github.com/cockroachdb/sentry-go
 # github.com/coreos/go-semver v0.3.0
 ## explicit
 github.com/coreos/go-semver/semver
@@ -596,9 +526,6 @@ github.com/foxboron/go-tpm-keyfiles/template
 ## explicit; go 1.17
 github.com/fsnotify/fsnotify
 github.com/fsnotify/fsnotify/internal
-# github.com/getsentry/raven-go v0.2.0
-## explicit
-github.com/getsentry/raven-go
 # github.com/go-ini/ini v1.67.0
 ## explicit
 github.com/go-ini/ini
@@ -720,14 +647,10 @@ github.com/golang-jwt/jwt/v5
 github.com/golang/groupcache/lru
 # github.com/golang/protobuf v1.5.4
 ## explicit; go 1.17
-github.com/golang/protobuf/descriptor
 github.com/golang/protobuf/jsonpb
 github.com/golang/protobuf/proto
-github.com/golang/protobuf/protoc-gen-go/descriptor
 github.com/golang/protobuf/ptypes/any
-github.com/golang/protobuf/ptypes/duration
 github.com/golang/protobuf/ptypes/empty
-github.com/golang/protobuf/ptypes/timestamp
 github.com/golang/protobuf/ptypes/wrappers
 # github.com/golang/snappy v1.0.0
 ## explicit
@@ -780,7 +703,7 @@ github.com/google/uuid
 ## explicit; go 1.24.0
 github.com/googleapis/enterprise-certificate-proxy/client
 github.com/googleapis/enterprise-certificate-proxy/client/util
-# github.com/googleapis/gax-go/v2 v2.16.0
+# github.com/googleapis/gax-go/v2 v2.17.0
 ## explicit; go 1.24.0
 github.com/googleapis/gax-go/v2
 github.com/googleapis/gax-go/v2/apierror
@@ -859,11 +782,6 @@ github.com/grafana/regexp/syntax
 # github.com/grpc-ecosystem/go-grpc-middleware v1.4.0
 ## explicit; go 1.14
 github.com/grpc-ecosystem/go-grpc-middleware
-# github.com/grpc-ecosystem/grpc-gateway v1.16.0
-## explicit; go 1.14
-github.com/grpc-ecosystem/grpc-gateway/internal
-github.com/grpc-ecosystem/grpc-gateway/runtime
-github.com/grpc-ecosystem/grpc-gateway/utilities
 # github.com/grpc-ecosystem/grpc-gateway/v2 v2.27.3
 ## explicit; go 1.24.0
 github.com/grpc-ecosystem/grpc-gateway/v2/internal/httprule
@@ -1006,7 +924,7 @@ github.com/julienschmidt/httprouter
 # github.com/kamstrup/intmap v0.5.2
 ## explicit; go 1.23
 github.com/kamstrup/intmap
-# github.com/klauspost/compress v1.18.3
+# github.com/klauspost/compress v1.18.4
 ## explicit; go 1.23
 github.com/klauspost/compress
 github.com/klauspost/compress/flate
@@ -1014,6 +932,7 @@ github.com/klauspost/compress/fse
 github.com/klauspost/compress/gzhttp
 github.com/klauspost/compress/gzhttp/writer
 github.com/klauspost/compress/gzhttp/writer/gzkp
+github.com/klauspost/compress/gzhttp/writer/zstdkp
 github.com/klauspost/compress/gzip
 github.com/klauspost/compress/huff0
 github.com/klauspost/compress/internal/cpuinfo
@@ -1038,21 +957,10 @@ github.com/knadh/koanf/providers/confmap
 # github.com/knadh/koanf/v2 v2.3.0
 ## explicit; go 1.23.0
 github.com/knadh/koanf/v2
-# github.com/kr/pretty v0.3.1
-## explicit; go 1.12
-github.com/kr/pretty
-# github.com/kr/text v0.2.0
-## explicit
-github.com/kr/text
 # github.com/kylelemons/godebug v1.1.0
 ## explicit; go 1.11
 github.com/kylelemons/godebug/diff
 github.com/kylelemons/godebug/pretty
-# github.com/lib/pq v1.10.9
-## explicit; go 1.13
-github.com/lib/pq
-github.com/lib/pq/oid
-github.com/lib/pq/scram
 # github.com/lufia/plan9stats v0.0.0-20240909124753-873cd0166683
 ## explicit; go 1.16
 github.com/lufia/plan9stats
@@ -1072,30 +980,6 @@ github.com/mark3labs/mcp-go/client/transport
 github.com/mark3labs/mcp-go/mcp
 github.com/mark3labs/mcp-go/server
 github.com/mark3labs/mcp-go/util
-# github.com/mattdurham/blockpack v0.0.0-20260219155254-414f47287d07
-## explicit; go 1.25.1
-github.com/mattdurham/blockpack
-github.com/mattdurham/blockpack/internal/arena
-github.com/mattdurham/blockpack/internal/arena/slice
-github.com/mattdurham/blockpack/internal/blockio
-github.com/mattdurham/blockpack/internal/blockio/compaction
-github.com/mattdurham/blockpack/internal/blockio/reader
-github.com/mattdurham/blockpack/internal/blockio/shared
-github.com/mattdurham/blockpack/internal/blockio/spanconv
-github.com/mattdurham/blockpack/internal/blockio/writer
-github.com/mattdurham/blockpack/internal/debug
-github.com/mattdurham/blockpack/internal/encodings
-github.com/mattdurham/blockpack/internal/executor
-github.com/mattdurham/blockpack/internal/quantile
-github.com/mattdurham/blockpack/internal/sql
-github.com/mattdurham/blockpack/internal/tempoapi
-github.com/mattdurham/blockpack/internal/traceqlparser
-github.com/mattdurham/blockpack/internal/types
-github.com/mattdurham/blockpack/internal/vm
-github.com/mattdurham/blockpack/internal/xflag
-github.com/mattdurham/blockpack/internal/xsync
-github.com/mattdurham/blockpack/internal/xunsafe
-github.com/mattdurham/blockpack/internal/xunsafe/layout
 # github.com/mattn/go-colorable v0.1.14
 ## explicit; go 1.18
 github.com/mattn/go-colorable
@@ -1105,6 +989,20 @@ github.com/mattn/go-isatty
 # github.com/mattn/go-runewidth v0.0.19
 ## explicit; go 1.20
 github.com/mattn/go-runewidth
+# github.com/maypok86/otter/v2 v2.3.0
+## explicit; go 1.24.0
+github.com/maypok86/otter/v2
+github.com/maypok86/otter/v2/internal/deque
+github.com/maypok86/otter/v2/internal/deque/queue
+github.com/maypok86/otter/v2/internal/expiration
+github.com/maypok86/otter/v2/internal/generated/node
+github.com/maypok86/otter/v2/internal/hashmap
+github.com/maypok86/otter/v2/internal/lossy
+github.com/maypok86/otter/v2/internal/xiter
+github.com/maypok86/otter/v2/internal/xmath
+github.com/maypok86/otter/v2/internal/xruntime
+github.com/maypok86/otter/v2/internal/xsync
+github.com/maypok86/otter/v2/stats
 # github.com/mdlayher/socket v0.4.1
 ## explicit; go 1.20
 github.com/mdlayher/socket
@@ -1523,9 +1421,6 @@ github.com/rcrowley/go-metrics
 # github.com/relvacode/iso8601 v1.7.0
 ## explicit; go 1.13
 github.com/relvacode/iso8601
-# github.com/rogpeppe/go-internal v1.14.1
-## explicit; go 1.23
-github.com/rogpeppe/go-internal/fmtsort
 # github.com/rs/cors v1.11.1
 ## explicit; go 1.13
 github.com/rs/cors
@@ -1553,9 +1448,6 @@ github.com/shirou/gopsutil/v4/internal/common
 github.com/shirou/gopsutil/v4/mem
 github.com/shirou/gopsutil/v4/net
 github.com/shirou/gopsutil/v4/process
-# github.com/sirupsen/logrus v1.9.3
-## explicit; go 1.13
-github.com/sirupsen/logrus
 # github.com/soheilhy/cmux v0.1.5
 ## explicit; go 1.11
 github.com/soheilhy/cmux
@@ -1615,16 +1507,6 @@ github.com/stretchr/testify/require
 # github.com/subosito/gotenv v1.6.0
 ## explicit; go 1.18
 github.com/subosito/gotenv
-# github.com/theory/jsonpath v0.10.2
-## explicit; go 1.23
-github.com/theory/jsonpath
-github.com/theory/jsonpath/parser
-github.com/theory/jsonpath/registry
-github.com/theory/jsonpath/spec
-# github.com/timandy/routine v1.1.6
-## explicit; go 1.18
-github.com/timandy/routine
-github.com/timandy/routine/g
 # github.com/tinylib/msgp v1.6.1
 ## explicit; go 1.24
 github.com/tinylib/msgp/msgp
@@ -2351,7 +2233,6 @@ golang.org/x/oauth2/jwt
 ## explicit; go 1.24.0
 golang.org/x/sync/errgroup
 golang.org/x/sync/semaphore
-golang.org/x/sync/syncmap
 # golang.org/x/sys v0.40.0
 ## explicit; go 1.24.0
 golang.org/x/sys/cpu
@@ -2363,7 +2244,6 @@ golang.org/x/sys/windows/svc/eventlog
 # golang.org/x/text v0.33.0
 ## explicit; go 1.24.0
 golang.org/x/text/cases
-golang.org/x/text/collate
 golang.org/x/text/encoding
 golang.org/x/text/encoding/charmap
 golang.org/x/text/encoding/htmlindex
@@ -2376,7 +2256,6 @@ golang.org/x/text/encoding/simplifiedchinese
 golang.org/x/text/encoding/traditionalchinese
 golang.org/x/text/encoding/unicode
 golang.org/x/text/internal
-golang.org/x/text/internal/colltab
 golang.org/x/text/internal/language
 golang.org/x/text/internal/language/compact
 golang.org/x/text/internal/tag
@@ -2439,7 +2318,7 @@ gonum.org/v1/gonum/lapack
 gonum.org/v1/gonum/lapack/gonum
 gonum.org/v1/gonum/lapack/lapack64
 gonum.org/v1/gonum/mat
-# google.golang.org/api v0.264.0
+# google.golang.org/api v0.265.0
 ## explicit; go 1.24.0
 google.golang.org/api/googleapi
 google.golang.org/api/googleapi/transport
@@ -2457,14 +2336,13 @@ google.golang.org/api/storage/v1
 google.golang.org/api/transport
 google.golang.org/api/transport/grpc
 google.golang.org/api/transport/http
-# google.golang.org/genproto v0.0.0-20251202230838-ff82c1b0f217
+# google.golang.org/genproto v0.0.0-20260128011058-8636f8732409
 ## explicit; go 1.24.0
 google.golang.org/genproto/googleapis/type/calendarperiod
 google.golang.org/genproto/googleapis/type/date
 google.golang.org/genproto/googleapis/type/expr
 google.golang.org/genproto/googleapis/type/timeofday
-google.golang.org/genproto/protobuf/field_mask
-# google.golang.org/genproto/googleapis/api v0.0.0-20251202230838-ff82c1b0f217
+# google.golang.org/genproto/googleapis/api v0.0.0-20260128011058-8636f8732409
 ## explicit; go 1.24.0
 google.golang.org/genproto/googleapis/api
 google.golang.org/genproto/googleapis/api/annotations
@@ -2474,7 +2352,7 @@ google.golang.org/genproto/googleapis/api/httpbody
 google.golang.org/genproto/googleapis/api/label
 google.golang.org/genproto/googleapis/api/metric
 google.golang.org/genproto/googleapis/api/monitoredres
-# google.golang.org/genproto/googleapis/rpc v0.0.0-20260122232226-8e98ce8d340d
+# google.golang.org/genproto/googleapis/rpc v0.0.0-20260128011058-8636f8732409
 ## explicit; go 1.24.0
 google.golang.org/genproto/googleapis/rpc/code
 google.golang.org/genproto/googleapis/rpc/errdetails
