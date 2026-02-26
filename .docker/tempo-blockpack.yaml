@@ -1,8 +1,15 @@
+multitenancy_enabled: false
+
 partition_ring_live_store: true
+
+querier:
+  query_live_store: true
 
 server:
   http_listen_port: 3201
   log_level: info
+  grpc_server_max_recv_msg_size: 104857600
+  grpc_server_max_send_msg_size: 104857600
 
 distributor:
   ingester_write_path_enabled: false
@@ -81,3 +88,11 @@ storage:
       version: vblockpack
     wal:
       path: /var/tempo/wal
+
+overrides:
+  defaults:
+    global:
+      max_bytes_per_trace: 104857600
+    ingestion:
+      rate_limit_bytes: 104857600
+      burst_size_bytes: 104857600

@@ -15,7 +15,7 @@ import (
 	"github.com/grafana/tempo/pkg/traceql"
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/encoding/common"
-	"github.com/mattdurham/blockpack"
+	"github.com/grafana/blockpack"
 )
 
 // tempoStorage adapts Tempo's backend.Reader to blockpack.Storage interface
@@ -101,18 +101,18 @@ func (b *blockpackBlock) FindTraceByID(ctx context.Context, id common.ID, _ comm
 	}
 
 	// Execute TraceQL query using public API
-	result, err := blockpack.ExecuteTraceQL(DataFileName, query, storage, blockpack.QueryOptions{})
+	matches, err := executeTraceQL(storage, query, blockpack.QueryOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to execute query: %w", err)
 	}
 
 	// No matching spans found
-	if len(result.Matches) == 0 {
+	if len(matches) == 0 {
 		return nil, nil // Trace not found
 	}
 
 	// Reconstruct trace from spans
-	trace, err := reconstructTrace(id, result.Matches)
+	trace, err := reconstructTrace(id, matches)
 	if err != nil {
 		return nil, fmt.Errorf("failed to reconstruct trace: %w", err)
 	}
@@ -138,7 +138,7 @@ func (b *blockpackBlock) Search(ctx context.Context, req *tempopb.SearchRequest,
 	}
 
 	// Execute TraceQL query using public API
-	result, err := blockpack.ExecuteTraceQL(DataFileName, query, storage, blockpack.QueryOptions{
+	matches, err := executeTraceQL(storage, query, blockpack.QueryOptions{
 		Limit: int(req.Limit),
 	})
 	if err != nil {
@@ -147,7 +147,7 @@ func (b *blockpackBlock) Search(ctx context.Context, req *tempopb.SearchRequest,
 
 	// Group matches by trace ID
 	traceMatches := make(map[string][]blockpack.SpanMatch)
-	for _, match := range result.Matches {
+	for _, match := range matches {
 		traceMatches[match.TraceID] = append(traceMatches[match.TraceID], match)
 	}
 
@@ -227,14 +227,14 @@ func (b *blockpackBlock) SearchTagValues(ctx context.Context, tag string, cb com
 	}
 
 	// Execute TraceQL query using public API
-	result, err := blockpack.ExecuteTraceQL(DataFileName, query, storage, blockpack.QueryOptions{})
+	matches, err := executeTraceQL(storage, query, blockpack.QueryOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to execute query: %w", err)
 	}
 
 	// Extract unique values and call callback (deduplicate in code)
 	seen := make(map[string]struct{})
-	for _, match := range result.Matches {
+	for _, match := range matches {
 		if val, ok := match.Fields.GetField(colName); ok {
 			valStr := fmt.Sprintf("%v", val)
 			if _, exists := seen[valStr]; !exists {
@@ -263,14 +263,14 @@ func (b *blockpackBlock) SearchTagValuesV2(ctx context.Context, tag traceql.Attr
 	}
 
 	// Execute TraceQL query using public API
-	result, err := blockpack.ExecuteTraceQL(DataFileName, query, storage, blockpack.QueryOptions{})
+	matches, err := executeTraceQL(storage, query, blockpack.QueryOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to execute query: %w", err)
 	}
 
 	// Extract unique values and call V2 callback (deduplicate in code)
 	seen := make(map[string]struct{})
-	for _, match := range result.Matches {
+	for _, match := range matches {
 		if val, ok := match.Fields.GetField(colName); ok {
 			// Convert to string for deduplication
 			valStr := fmt.Sprintf("%v", val)
@@ -312,7 +312,7 @@ func (b *blockpackBlock) FetchTagValues(ctx context.Context, req traceql.FetchTa
 	}
 
 	// Execute TraceQL query using public API
-	result, err := blockpack.ExecuteTraceQL(DataFileName, query, storage, blockpack.QueryOptions{})
+	matches, err := executeTraceQL(storage, query, blockpack.QueryOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to execute query: %w", err)
 	}
@@ -324,7 +324,7 @@ func (b *blockpackBlock) FetchTagValues(ctx context.Context, req traceql.FetchTa
 	seen := make(map[string]struct{})
 
 	// Call callback for each unique value
-	for _, match := range result.Matches {
+	for _, match := range matches {
 		if val, ok := match.Fields.GetField(colName); ok {
 			staticVal := toStaticType(val)
 			// Use string representation as key for deduplication
@@ -356,14 +356,14 @@ func (b *blockpackBlock) FetchTagNames(ctx context.Context, req traceql.FetchTag
 		query := conditionsToTraceQL(req.Conditions, true)
 
 		// Execute TraceQL query using public API
-		result, err := blockpack.ExecuteTraceQL(DataFileName, query, storage, blockpack.QueryOptions{})
+		matches, err := executeTraceQL(storage, query, blockpack.QueryOptions{})
 		if err != nil {
 			return fmt.Errorf("failed to execute query: %w", err)
 		}
 
 		// Extract unique tag names from matching spans
 		seen := make(map[string]struct{})
-		for _, match := range result.Matches {
+		for _, match := range matches {
 			match.Fields.IterateFields(func(colName string, _ any) bool {
 				tag := columnNameToTag(colName, req.Scope)
 				if tag != "" {
@@ -605,6 +605,39 @@ func (p *bytesReaderProvider) ReadAt(b []byte, off int64, dataType blockpack.Dat
 		return n, io.EOF
 	}
 	return n, nil
+}
+
+func (p *bytesReaderProvider) Delete() error { return nil }
+
+// storageReaderProvider adapts tempoStorage to blockpack.ReaderProvider for a single fixed file.
+type storageReaderProvider struct {
+	storage *tempoStorage
+}
+
+func (p *storageReaderProvider) Size() (int64, error) {
+	return p.storage.Size(DataFileName)
+}
+
+func (p *storageReaderProvider) ReadAt(buf []byte, off int64, dataType blockpack.DataType) (int, error) {
+	return p.storage.ReadAt(DataFileName, buf, off, dataType)
+}
+
+func (p *storageReaderProvider) Delete() error { return nil }
+
+// executeTraceQL creates a reader from storage and streams all matching spans into a slice.
+func executeTraceQL(storage *tempoStorage, query string, opts blockpack.QueryOptions) ([]blockpack.SpanMatch, error) {
+	r, err := blockpack.NewReaderFromProvider(&storageReaderProvider{storage: storage})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create blockpack reader: %w", err)
+	}
+	var matches []blockpack.SpanMatch
+	if err := blockpack.StreamTraceQL(r, query, opts, func(match *blockpack.SpanMatch) bool {
+		matches = append(matches, match.Clone())
+		return true
+	}); err != nil {
+		return nil, err
+	}
+	return matches, nil
 }
 
 // reconstructTrace rebuilds a tempopb.Trace from blockpack span matches

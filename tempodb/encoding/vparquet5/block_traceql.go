@@ -23,13 +23,16 @@ import (
 )
 
 var (
-	pqSpanPool            = parquetquery.NewResultPool(1)
-	pqSpansetPool         = parquetquery.NewResultPool(1)
-	pqTracePool           = parquetquery.NewResultPool(1)
-	pqAttrPool            = parquetquery.NewResultPool(1)
-	pqEventPool           = parquetquery.NewResultPool(1)
-	pqLinkPool            = parquetquery.NewResultPool(1)
-	pqInstrumentationPool = parquetquery.NewResultPool(1)
+	// Pool capacities are tuned to the typical number of entries collected at each level.
+	// Starting with sufficient capacity avoids makeslice calls when collectInternal
+	// appends column values into the IteratorResult.Entries slice.
+	pqSpanPool            = parquetquery.NewResultPool(16) // spans collect ~10-20 column values
+	pqSpansetPool         = parquetquery.NewResultPool(4)
+	pqTracePool           = parquetquery.NewResultPool(4)
+	pqAttrPool            = parquetquery.NewResultPool(4)  // key + value + type = ~4 entries
+	pqEventPool           = parquetquery.NewResultPool(4)
+	pqLinkPool            = parquetquery.NewResultPool(4)
+	pqInstrumentationPool = parquetquery.NewResultPool(4)
 
 	intervalMapper15Seconds   = traceql.NewIntervalMapper(roundingStart, roundingEnd, uint64(15*time.Second), false)
 	intervalMapper60Seconds   = traceql.NewIntervalMapper(roundingStart, roundingEnd, uint64(60*time.Second), false)
