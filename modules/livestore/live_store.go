@@ -21,6 +21,7 @@ import (
 	"github.com/grafana/tempo/pkg/tempopb"
 	"github.com/grafana/tempo/pkg/util/shutdownmarker"
 	"github.com/grafana/tempo/pkg/validation"
+	"github.com/grafana/tempo/tempodb/encoding"
 	"github.com/grafana/tempo/tempodb/wal"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -131,10 +132,11 @@ type LiveStore struct {
 	reader *PartitionReader
 
 	// Multi-tenant instances
-	instancesMtx sync.RWMutex
-	instances    map[string]*instance
-	wal          *wal.WAL
-	overrides    overrides.Interface
+	instancesMtx          sync.RWMutex
+	instances             map[string]*instance
+	wal                   *wal.WAL
+	completeBlockEncoding encoding.VersionedEncoding
+	overrides             overrides.Interface
 
 	// Background processing
 	ctx                 context.Context // context for the service. all background processes should exit if this is cancelled
@@ -148,19 +150,26 @@ type LiveStore struct {
 }
 
 func New(cfg Config, overridesService overrides.Interface, logger log.Logger, reg prometheus.Registerer, singlePartition bool) (*LiveStore, error) {
+	completeBlockEncoding, walEncoding, encErr := coalesceBlockVersions(&cfg)
+	if encErr != nil {
+		return nil, encErr
+	}
+	cfg.WAL.Version = walEncoding.Version()
+
 	ctx, cancel := context.WithCancel(context.Background())
 
 	s := &LiveStore{
-		cfg:             cfg,
-		logger:          logger,
-		reg:             reg,
-		decoder:         ingest.NewDecoder(),
-		ctx:             ctx,
-		cancel:          cancel,
-		instances:       make(map[string]*instance),
-		overrides:       overridesService,
-		completeQueues:  flushqueues.New[*completeOp](cfg.CompleteBlockConcurrency, metricCompleteQueueLength),
-		startupComplete: make(chan struct{}),
+		cfg:                   cfg,
+		logger:                logger,
+		reg:                   reg,
+		decoder:               ingest.NewDecoder(),
+		completeBlockEncoding: completeBlockEncoding,
+		ctx:                   ctx,
+		cancel:                cancel,
+		instances:             make(map[string]*instance),
+		overrides:             overridesService,
+		completeQueues:        flushqueues.New[*completeOp](cfg.CompleteBlockConcurrency, metricCompleteQueueLength),
+		startupComplete:       make(chan struct{}),
 	}
 
 	// Initialize ready state to starting
@@ -610,7 +619,7 @@ func (s *LiveStore) getOrCreateInstance(tenantID string) (*instance, error) {
 	}
 
 	// Create new instance
-	inst, err := newInstance(tenantID, s.cfg, s.wal, s.overrides, s.logger)
+	inst, err := newInstance(tenantID, s.cfg, s.wal, s.completeBlockEncoding, s.overrides, s.logger)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create instance for tenant %s: %w", tenantID, err)
 	}
@@ -750,7 +759,9 @@ func (s *LiveStore) PushSpans(_ context.Context, _ *tempopb.PushSpansRequest) (*
 
 // GetMetrics implements tempopb.MetricsGeneratorServer
 func (s *LiveStore) GetMetrics(_ context.Context, _ *tempopb.SpanMetricsRequest) (*tempopb.SpanMetricsResponse, error) {
-	return nil, fmt.Errorf("GetMetrics not implemented in livestore") // todo: this is metrics summary, are we allowed to remove this or do we need to continue to support?
+	// Keep this stub until r241 is fully rolled out. After that, we can remove
+	// GetMetrics here by switching LiveStore from MetricsGenerator to MetricsService.
+	return nil, fmt.Errorf("GetMetrics not implemented in livestore")
 }
 
 // QueryRange implements tempopb.MetricsGeneratorServer
