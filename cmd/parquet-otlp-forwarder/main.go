@@ -12,9 +12,11 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
+	"github.com/grafana/dskit/user"
 	"github.com/parquet-go/parquet-go"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 
@@ -37,18 +39,20 @@ func (a *arrayFlags) Set(value string) error {
 
 func main() {
 	var (
-		dir       string
-		endpoints arrayFlags
-		insecure  bool
-		certFile  string
-		batchSize int
+		dir           string
+		endpoints     arrayFlags
+		insecure      bool
+		certFile      string
+		maxBatchBytes int
+		orgID         string
 	)
 
 	flag.StringVar(&dir, "dir", "", "Directory containing Tempo block folders (<uuid>/data.parquet + meta.json)")
 	flag.Var(&endpoints, "endpoint", "OTLP gRPC endpoint (repeatable, e.g. localhost:4317)")
 	flag.BoolVar(&insecure, "insecure", false, "Disable TLS for OTLP gRPC connections")
 	flag.StringVar(&certFile, "cert-file", "", "TLS certificate file for OTLP gRPC connections")
-	flag.IntVar(&batchSize, "batch-size", 100, "Number of traces to send per OTLP export batch")
+	flag.IntVar(&maxBatchBytes, "max-batch-bytes", 3*1024*1024, "Max batch size in bytes before flushing (default 3MiB)")
+	flag.StringVar(&orgID, "org-id", "anonymous", "Org ID / tenant ID to send with requests (X-Scope-OrgID)")
 	flag.Parse()
 
 	logger := log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr))
@@ -67,6 +71,7 @@ func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	ctx = user.InjectOrgID(ctx, orgID)
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 	go func() {
@@ -116,7 +121,7 @@ func main() {
 		if ctx.Err() != nil {
 			break
 		}
-		n, batches, err := processBlock(ctx, b, fwd, batchSize, logger)
+		n, batches, err := processBlock(ctx, b, fwd, maxBatchBytes, logger)
 		totalTraces += n
 		totalBatches += batches
 		if err != nil {
@@ -172,15 +177,15 @@ func findDataFile(blockDir string) string {
 	return ""
 }
 
-func processBlock(ctx context.Context, b blockPaths, fwd *otlpgrpc.Forwarder, batchSize int, logger log.Logger) (int, int, error) {
+func processBlock(ctx context.Context, b blockPaths, fwd *otlpgrpc.Forwarder, maxBatchBytes int, logger log.Logger) (int, int, error) {
 	meta := readBlockMeta(b.metaPath, logger)
 
 	switch meta.Version {
 	case "vParquet4":
-		return processBlockV4(ctx, b, meta, fwd, batchSize, logger)
+		return processBlockV4(ctx, b, meta, fwd, maxBatchBytes, logger)
 	default:
 		// vParquet5 and anything unrecognised — fall through to v5
-		return processBlockV5(ctx, b, meta, fwd, batchSize, logger)
+		return processBlockV5(ctx, b, meta, fwd, maxBatchBytes, logger)
 	}
 }
 
@@ -197,7 +202,7 @@ func openParquetFile(path string) (*os.File, int64, error) {
 	return f, fi.Size(), nil
 }
 
-func processBlockV4(ctx context.Context, b blockPaths, meta *backend.BlockMeta, fwd *otlpgrpc.Forwarder, batchSize int, logger log.Logger) (int, int, error) {
+func processBlockV4(ctx context.Context, b blockPaths, meta *backend.BlockMeta, fwd *otlpgrpc.Forwarder, maxBatchBytes int, logger log.Logger) (int, int, error) {
 	f, size, err := openParquetFile(b.parquetPath)
 	if err != nil {
 		return 0, 0, err
@@ -216,56 +221,121 @@ func processBlockV4(ctx context.Context, b blockPaths, meta *backend.BlockMeta, 
 	defer r.Close()
 
 	unmarshaler := &ptrace.ProtoUnmarshaler{}
-	batch := make([]*vparquet4.Trace, 0, batchSize)
-	rowBuf := make([]*vparquet4.Trace, batchSize)
+	marshaler := ptrace.ProtoMarshaler{}
+	rowBuf := make([]*vparquet4.Trace, 64)
+	combined := ptrace.NewTraces()
+	combinedBytes := 0
 	totalTraces, totalBatches := 0, 0
+	lastProgress := time.Now()
+
+	flush := func() (int, error) {
+		if combined.SpanCount() == 0 {
+			return 0, nil
+		}
+		if err := fwd.ForwardTraces(ctx, combined); err != nil {
+			return 0, fmt.Errorf("forward traces: %w", err)
+		}
+		n := combined.ResourceSpans().Len()
+		combined = ptrace.NewTraces()
+		combinedBytes = 0
+		if time.Since(lastProgress) >= 5*time.Second {
+			level.Info(logger).Log("msg", "progress", "traces_sent", totalTraces+n, "batches_sent", totalBatches+1)
+			lastProgress = time.Now()
+		}
+		return n, nil
+	}
 
 	for {
 		if ctx.Err() != nil {
 			return totalTraces, totalBatches, ctx.Err()
 		}
 
-		n, err := r.Read(rowBuf)
+		n, readErr := r.Read(rowBuf)
 		for i := range n {
-			batch = append(batch, rowBuf[i])
+			tr := rowBuf[i]
 			rowBuf[i] = nil
+
+			pbTrace := vparquet4.ParquetTraceToTempopbTrace(meta, tr)
+			if pbTrace == nil || len(pbTrace.ResourceSpans) == 0 {
+				continue
+			}
+
+			traceBytes, err := pbTrace.Marshal()
+			if err != nil {
+				level.Warn(logger).Log("msg", "failed to marshal trace", "err", err)
+				continue
+			}
+
+			td, err := unmarshaler.UnmarshalTraces(traceBytes)
+			if err != nil {
+				level.Warn(logger).Log("msg", "failed to unmarshal trace as ptrace", "err", err)
+				continue
+			}
+
+			// Measure the actual OTLP wire size, not the tempopb size
+			otlpBytes, err := marshaler.MarshalTraces(td)
+			if err != nil {
+				level.Warn(logger).Log("msg", "failed to marshal trace as otlp", "err", err)
+				continue
+			}
+			traceOTLPSize := len(otlpBytes)
+
+			if traceOTLPSize > maxBatchBytes {
+				if combinedBytes > 0 {
+					sent, err := flush()
+					totalTraces += sent
+					if sent > 0 {
+						totalBatches++
+					}
+					if err != nil {
+						return totalTraces, totalBatches, err
+					}
+				}
+				sent, batches, err := splitAndSend(ctx, td, maxBatchBytes, fwd, marshaler, logger)
+				totalTraces += sent
+				totalBatches += batches
+				if err != nil {
+					return totalTraces, totalBatches, err
+				}
+				continue
+			}
+
+			if combinedBytes+traceOTLPSize > maxBatchBytes && combinedBytes > 0 {
+				sent, err := flush()
+				totalTraces += sent
+				if sent > 0 {
+					totalBatches++
+				}
+				if err != nil {
+					return totalTraces, totalBatches, err
+				}
+			}
+
+			td.ResourceSpans().MoveAndAppendTo(combined.ResourceSpans())
+			combinedBytes += traceOTLPSize
 		}
 
-		if len(batch) >= batchSize {
-			sent, err2 := sendBatchV4(ctx, batch, meta, fwd, unmarshaler, logger)
-			totalTraces += sent
-			if sent > 0 {
-				totalBatches++
-			}
-			batch = batch[:0]
-			if err2 != nil {
-				return totalTraces, totalBatches, err2
-			}
-		}
-
-		if errors.Is(err, io.EOF) {
+		if errors.Is(readErr, io.EOF) {
 			break
 		}
-		if err != nil {
-			return totalTraces, totalBatches, fmt.Errorf("read rows: %w", err)
+		if readErr != nil {
+			return totalTraces, totalBatches, fmt.Errorf("read rows: %w", readErr)
 		}
 	}
 
-	if len(batch) > 0 {
-		sent, err := sendBatchV4(ctx, batch, meta, fwd, unmarshaler, logger)
-		totalTraces += sent
-		if sent > 0 {
-			totalBatches++
-		}
-		if err != nil {
-			return totalTraces, totalBatches, err
-		}
+	sent, err := flush()
+	totalTraces += sent
+	if sent > 0 {
+		totalBatches++
+	}
+	if err != nil {
+		return totalTraces, totalBatches, err
 	}
 
 	return totalTraces, totalBatches, nil
 }
 
-func processBlockV5(ctx context.Context, b blockPaths, meta *backend.BlockMeta, fwd *otlpgrpc.Forwarder, batchSize int, logger log.Logger) (int, int, error) {
+func processBlockV5(ctx context.Context, b blockPaths, meta *backend.BlockMeta, fwd *otlpgrpc.Forwarder, maxBatchBytes int, logger log.Logger) (int, int, error) {
 	f, size, err := openParquetFile(b.parquetPath)
 	if err != nil {
 		return 0, 0, err
@@ -284,53 +354,191 @@ func processBlockV5(ctx context.Context, b blockPaths, meta *backend.BlockMeta, 
 	defer r.Close()
 
 	unmarshaler := &ptrace.ProtoUnmarshaler{}
-	batch := make([]*vparquet5.Trace, 0, batchSize)
-	rowBuf := make([]*vparquet5.Trace, batchSize)
+	marshaler := ptrace.ProtoMarshaler{}
+	rowBuf := make([]*vparquet5.Trace, 64)
+	combined := ptrace.NewTraces()
+	combinedBytes := 0
 	totalTraces, totalBatches := 0, 0
+	lastProgress := time.Now()
+
+	flush := func() (int, error) {
+		if combined.SpanCount() == 0 {
+			return 0, nil
+		}
+		if err := fwd.ForwardTraces(ctx, combined); err != nil {
+			return 0, fmt.Errorf("forward traces: %w", err)
+		}
+		n := combined.ResourceSpans().Len()
+		combined = ptrace.NewTraces()
+		combinedBytes = 0
+		if time.Since(lastProgress) >= 5*time.Second {
+			level.Info(logger).Log("msg", "progress", "traces_sent", totalTraces+n, "batches_sent", totalBatches+1)
+			lastProgress = time.Now()
+		}
+		return n, nil
+	}
 
 	for {
 		if ctx.Err() != nil {
 			return totalTraces, totalBatches, ctx.Err()
 		}
 
-		n, err := r.Read(rowBuf)
+		n, readErr := r.Read(rowBuf)
 		for i := range n {
-			batch = append(batch, rowBuf[i])
+			tr := rowBuf[i]
 			rowBuf[i] = nil
+
+			pbTrace := vparquet5.ParquetTraceToTempopbTrace(meta, tr)
+			if pbTrace == nil || len(pbTrace.ResourceSpans) == 0 {
+				continue
+			}
+
+			traceBytes, err := pbTrace.Marshal()
+			if err != nil {
+				level.Warn(logger).Log("msg", "failed to marshal trace", "err", err)
+				continue
+			}
+
+			td, err := unmarshaler.UnmarshalTraces(traceBytes)
+			if err != nil {
+				level.Warn(logger).Log("msg", "failed to unmarshal trace as ptrace", "err", err)
+				continue
+			}
+
+			// Measure the actual OTLP wire size, not the tempopb size
+			otlpBytes, err := marshaler.MarshalTraces(td)
+			if err != nil {
+				level.Warn(logger).Log("msg", "failed to marshal trace as otlp", "err", err)
+				continue
+			}
+			traceOTLPSize := len(otlpBytes)
+
+			if traceOTLPSize > maxBatchBytes {
+				if combinedBytes > 0 {
+					sent, err := flush()
+					totalTraces += sent
+					if sent > 0 {
+						totalBatches++
+					}
+					if err != nil {
+						return totalTraces, totalBatches, err
+					}
+				}
+				sent, batches, err := splitAndSend(ctx, td, maxBatchBytes, fwd, marshaler, logger)
+				totalTraces += sent
+				totalBatches += batches
+				if err != nil {
+					return totalTraces, totalBatches, err
+				}
+				continue
+			}
+
+			if combinedBytes+traceOTLPSize > maxBatchBytes && combinedBytes > 0 {
+				sent, err := flush()
+				totalTraces += sent
+				if sent > 0 {
+					totalBatches++
+				}
+				if err != nil {
+					return totalTraces, totalBatches, err
+				}
+			}
+
+			td.ResourceSpans().MoveAndAppendTo(combined.ResourceSpans())
+			combinedBytes += traceOTLPSize
 		}
 
-		if len(batch) >= batchSize {
-			sent, err2 := sendBatchV5(ctx, batch, meta, fwd, unmarshaler, logger)
-			totalTraces += sent
-			if sent > 0 {
-				totalBatches++
-			}
-			batch = batch[:0]
-			if err2 != nil {
-				return totalTraces, totalBatches, err2
-			}
-		}
-
-		if errors.Is(err, io.EOF) {
+		if errors.Is(readErr, io.EOF) {
 			break
 		}
-		if err != nil {
-			return totalTraces, totalBatches, fmt.Errorf("read rows: %w", err)
+		if readErr != nil {
+			return totalTraces, totalBatches, fmt.Errorf("read rows: %w", readErr)
 		}
 	}
 
-	if len(batch) > 0 {
-		sent, err := sendBatchV5(ctx, batch, meta, fwd, unmarshaler, logger)
-		totalTraces += sent
-		if sent > 0 {
-			totalBatches++
-		}
-		if err != nil {
-			return totalTraces, totalBatches, err
-		}
+	sent, err := flush()
+	totalTraces += sent
+	if sent > 0 {
+		totalBatches++
+	}
+	if err != nil {
+		return totalTraces, totalBatches, err
 	}
 
 	return totalTraces, totalBatches, nil
+}
+
+// splitAndSend splits a ptrace.Traces at the span level and sends each piece under maxBatchBytes.
+// Spans may be separated from their original trace — trace completeness is not guaranteed.
+func splitAndSend(ctx context.Context, td ptrace.Traces, maxBatchBytes int, fwd *otlpgrpc.Forwarder, marshaler ptrace.ProtoMarshaler, logger log.Logger) (int, int, error) {
+	current := ptrace.NewTraces()
+	currentBytes := 0
+	totalSent, totalBatches := 0, 0
+
+	flush := func() (int, error) {
+		if current.SpanCount() == 0 {
+			return 0, nil
+		}
+		if err := fwd.ForwardTraces(ctx, current); err != nil {
+			return 0, fmt.Errorf("forward traces: %w", err)
+		}
+		n := current.ResourceSpans().Len()
+		current = ptrace.NewTraces()
+		currentBytes = 0
+		return n, nil
+	}
+
+	rss := td.ResourceSpans()
+	for i := 0; i < rss.Len(); i++ {
+		rs := rss.At(i)
+		for j := 0; j < rs.ScopeSpans().Len(); j++ {
+			ss := rs.ScopeSpans().At(j)
+			for k := 0; k < ss.Spans().Len(); k++ {
+				single := ptrace.NewTraces()
+				newRS := single.ResourceSpans().AppendEmpty()
+				rs.Resource().CopyTo(newRS.Resource())
+				newRS.SetSchemaUrl(rs.SchemaUrl())
+				newSS := newRS.ScopeSpans().AppendEmpty()
+				ss.Scope().CopyTo(newSS.Scope())
+				newSS.SetSchemaUrl(ss.SchemaUrl())
+				ss.Spans().At(k).CopyTo(newSS.Spans().AppendEmpty())
+
+				spanBytes, err := marshaler.MarshalTraces(single)
+				if err != nil {
+					level.Warn(logger).Log("msg", "failed to measure span size", "err", err)
+					continue
+				}
+				spanSize := len(spanBytes)
+
+				if currentBytes+spanSize > maxBatchBytes && currentBytes > 0 {
+					sent, err := flush()
+					totalSent += sent
+					if sent > 0 {
+						totalBatches++
+					}
+					if err != nil {
+						return totalSent, totalBatches, err
+					}
+				}
+
+				newRS2 := current.ResourceSpans().AppendEmpty()
+				rs.Resource().CopyTo(newRS2.Resource())
+				newRS2.SetSchemaUrl(rs.SchemaUrl())
+				newSS2 := newRS2.ScopeSpans().AppendEmpty()
+				ss.Scope().CopyTo(newSS2.Scope())
+				newSS2.SetSchemaUrl(ss.SchemaUrl())
+				ss.Spans().At(k).CopyTo(newSS2.Spans().AppendEmpty())
+				currentBytes += spanSize
+			}
+		}
+	}
+
+	sent, err := flush()
+	totalSent += sent
+	if sent > 0 {
+		totalBatches++
+	}
+	return totalSent, totalBatches, err
 }
 
 func readBlockMeta(path string, logger log.Logger) *backend.BlockMeta {
@@ -345,88 +553,4 @@ func readBlockMeta(path string, logger log.Logger) *backend.BlockMeta {
 		return &backend.BlockMeta{}
 	}
 	return meta
-}
-
-func sendBatchV4(
-	ctx context.Context,
-	traces []*vparquet4.Trace,
-	meta *backend.BlockMeta,
-	fwd *otlpgrpc.Forwarder,
-	unmarshaler *ptrace.ProtoUnmarshaler,
-	logger log.Logger,
-) (int, error) {
-	combined := ptrace.NewTraces()
-
-	for _, tr := range traces {
-		pbTrace := vparquet4.ParquetTraceToTempopbTrace(meta, tr)
-		if pbTrace == nil || len(pbTrace.ResourceSpans) == 0 {
-			continue
-		}
-
-		b, err := pbTrace.Marshal()
-		if err != nil {
-			level.Warn(logger).Log("msg", "failed to marshal trace", "err", err)
-			continue
-		}
-
-		td, err := unmarshaler.UnmarshalTraces(b)
-		if err != nil {
-			level.Warn(logger).Log("msg", "failed to unmarshal trace as ptrace", "err", err)
-			continue
-		}
-
-		td.ResourceSpans().MoveAndAppendTo(combined.ResourceSpans())
-	}
-
-	if combined.SpanCount() == 0 {
-		return 0, nil
-	}
-
-	if err := fwd.ForwardTraces(ctx, combined); err != nil {
-		return 0, fmt.Errorf("forward traces: %w", err)
-	}
-
-	return combined.ResourceSpans().Len(), nil
-}
-
-func sendBatchV5(
-	ctx context.Context,
-	traces []*vparquet5.Trace,
-	meta *backend.BlockMeta,
-	fwd *otlpgrpc.Forwarder,
-	unmarshaler *ptrace.ProtoUnmarshaler,
-	logger log.Logger,
-) (int, error) {
-	combined := ptrace.NewTraces()
-
-	for _, tr := range traces {
-		pbTrace := vparquet5.ParquetTraceToTempopbTrace(meta, tr)
-		if pbTrace == nil || len(pbTrace.ResourceSpans) == 0 {
-			continue
-		}
-
-		b, err := pbTrace.Marshal()
-		if err != nil {
-			level.Warn(logger).Log("msg", "failed to marshal trace", "err", err)
-			continue
-		}
-
-		td, err := unmarshaler.UnmarshalTraces(b)
-		if err != nil {
-			level.Warn(logger).Log("msg", "failed to unmarshal trace as ptrace", "err", err)
-			continue
-		}
-
-		td.ResourceSpans().MoveAndAppendTo(combined.ResourceSpans())
-	}
-
-	if combined.SpanCount() == 0 {
-		return 0, nil
-	}
-
-	if err := fwd.ForwardTraces(ctx, combined); err != nil {
-		return 0, fmt.Errorf("forward traces: %w", err)
-	}
-
-	return combined.ResourceSpans().Len(), nil
 }

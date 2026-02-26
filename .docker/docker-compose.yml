@@ -99,6 +99,7 @@ services:
       - "4318:4318"   # OTLP HTTP
     environment:
       - GOGC=80
+      - GOMEMLIMIT=10GiB
     networks:
       - tempo-network
 
@@ -126,12 +127,14 @@ services:
       - "4320:4320"   # OTLP HTTP
     environment:
       - GOGC=80
+      - GOMEMLIMIT=10GiB
     networks:
       - tempo-network
 
   # otel-loadgen for Parquet Tempo
   otel-loadgen-parquet:
     image: streamfold/otel-loadgen:latest
+    profiles: [loadgen]
     restart: unless-stopped
     command:
       - gen
@@ -148,6 +151,7 @@ services:
   # otel-loadgen for Blockpack Tempo
   otel-loadgen-blockpack:
     image: streamfold/otel-loadgen:latest
+    profiles: [loadgen]
     restart: unless-stopped
     command:
       - gen

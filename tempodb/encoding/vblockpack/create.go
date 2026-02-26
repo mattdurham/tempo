@@ -9,7 +9,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/encoding/common"
-	"github.com/mattdurham/blockpack"
+	"github.com/grafana/blockpack"
 )
 
 // CreateBlock creates a new blockpack block from an iterator

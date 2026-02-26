@@ -411,7 +411,14 @@ func TestIncludeBlock(t *testing.T) {
 			e, err := tc.blockEnd.MarshalBinary()
 			require.NoError(t, err)
 
-			assert.Equal(t, tc.expected, includeBlock(tc.meta, tc.searchID, s, e, tc.start, tc.end, time.Time{}))
+			var startT, endT time.Time
+			if tc.start != 0 {
+				startT = time.Unix(tc.start, 0)
+			}
+			if tc.end != 0 {
+				endT = time.Unix(tc.end, 0)
+			}
+			assert.Equal(t, tc.expected, includeBlock(tc.meta, tc.searchID, s, e, startT, endT, time.Time{}))
 		})
 	}
 }
@@ -482,7 +489,15 @@ func TestIncludeCompactedBlock(t *testing.T) {
 			e, err := tc.blockEnd.MarshalBinary()
 			require.NoError(t, err)
 
-			assert.Equal(t, tc.expected, includeCompactedBlock(tc.meta, tc.searchID, s, e, blocklistPoll, tc.start, tc.end, time.Time{}))
+			lookback := time.Now().Add(-(2 * blocklistPoll))
+			var startT, endT time.Time
+			if tc.start != 0 {
+				startT = time.Unix(tc.start, 0)
+			}
+			if tc.end != 0 {
+				endT = time.Unix(tc.end, 0)
+			}
+			assert.Equal(t, tc.expected, includeCompactedBlock(tc.meta, tc.searchID, s, e, lookback, startT, endT, time.Time{}))
 		})
 	}
 }

@@ -13,7 +13,7 @@ import (
 	"github.com/grafana/tempo/pkg/traceql"
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/encoding/common"
-	"github.com/mattdurham/blockpack"
+	"github.com/grafana/blockpack"
 )
 
 type walBlock struct {
