@@ -709,6 +709,26 @@ github.com/googleapis/gax-go/v2/iterator
 # github.com/gorilla/mux v1.8.1
 ## explicit; go 1.20
 github.com/gorilla/mux
+# github.com/grafana/blockpack v0.0.0-20260226215222-5c75a55e63e5 => /home/mdurham/source/grafana-blockpack-worktrees/deleted-files
+## explicit; go 1.26.0
+github.com/grafana/blockpack
+github.com/grafana/blockpack/internal/arena
+github.com/grafana/blockpack/internal/debug
+github.com/grafana/blockpack/internal/modules/blockio
+github.com/grafana/blockpack/internal/modules/blockio/compaction
+github.com/grafana/blockpack/internal/modules/blockio/reader
+github.com/grafana/blockpack/internal/modules/blockio/shared
+github.com/grafana/blockpack/internal/modules/blockio/writer
+github.com/grafana/blockpack/internal/modules/executor
+github.com/grafana/blockpack/internal/modules/queryplanner
+github.com/grafana/blockpack/internal/otlpconvert
+github.com/grafana/blockpack/internal/quantile
+github.com/grafana/blockpack/internal/traceqlparser
+github.com/grafana/blockpack/internal/vm
+github.com/grafana/blockpack/internal/xflag
+github.com/grafana/blockpack/internal/xsync
+github.com/grafana/blockpack/internal/xunsafe
+github.com/grafana/blockpack/internal/xunsafe/layout
 # github.com/grafana/dskit v0.0.0-20251031165806-a6f15387939b
 ## explicit; go 1.24.0
 github.com/grafana/dskit/backoff
@@ -965,7 +985,7 @@ github.com/magefile/mage/sh
 github.com/mailru/easyjson/buffer
 github.com/mailru/easyjson/jlexer
 github.com/mailru/easyjson/jwriter
-# github.com/mark3labs/mcp-go v0.43.2
+# github.com/mark3labs/mcp-go v0.44.0
 ## explicit; go 1.23.0
 github.com/mark3labs/mcp-go/client
 github.com/mark3labs/mcp-go/client/transport
@@ -1485,6 +1505,16 @@ github.com/stretchr/testify/require
 # github.com/subosito/gotenv v1.6.0
 ## explicit; go 1.18
 github.com/subosito/gotenv
+# github.com/theory/jsonpath v0.10.2
+## explicit; go 1.23
+github.com/theory/jsonpath
+github.com/theory/jsonpath/parser
+github.com/theory/jsonpath/registry
+github.com/theory/jsonpath/spec
+# github.com/timandy/routine v1.1.6
+## explicit; go 1.18
+github.com/timandy/routine
+github.com/timandy/routine/g
 # github.com/tinylib/msgp v1.6.1
 ## explicit; go 1.24
 github.com/tinylib/msgp/msgp
@@ -2564,3 +2594,4 @@ k8s.io/utils/clock
 # k8s.io/api => k8s.io/api v0.35.1
 # k8s.io/client-go => k8s.io/client-go v0.35.1
 # github.com/hashicorp/memberlist => github.com/grafana/memberlist v0.3.1-0.20251024160842-5cd332c2849a
+# github.com/grafana/blockpack => /home/mdurham/source/grafana-blockpack-worktrees/deleted-files
