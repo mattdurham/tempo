@@ -165,6 +165,14 @@ func (s *tempoOutputStorage) Put(path string, data []byte) error {
 		return fmt.Errorf("write blockpack data: %w", err)
 	}
 
+	// Count unique traces by parsing the in-memory blockpack bytes. This avoids
+	// an extra backend round-trip and sets TotalObjects correctly so that the
+	// Tempo compaction scheduler can prioritise blocks by trace count.
+	var totalObjects int64
+	if r, err := blockpack.NewReaderFromProvider(&bytesReaderProvider{data: data}); err == nil {
+		totalObjects = int64(r.TraceCount())
+	}
+
 	meta := &backend.BlockMeta{
 		BlockID:           newID,
 		TenantID:          s.tenantID,
@@ -175,6 +183,7 @@ func (s *tempoOutputStorage) Put(path string, data []byte) error {
 		StartTime:         s.startTime,
 		EndTime:           s.endTime,
 		Size_:             uint64(len(data)),
+		TotalObjects:      totalObjects,
 	}
 
 	if err := s.writer.WriteBlockMeta(ctx, meta); err != nil {

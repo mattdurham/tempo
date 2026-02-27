@@ -80,11 +80,12 @@ require (
 	github.com/evanphx/json-patch v5.9.11+incompatible
 	github.com/golang/groupcache v0.0.0-20241129210726-2c02b8208cf8
 	github.com/googleapis/gax-go/v2 v2.17.0
+	github.com/grafana/blockpack v0.0.0-20260226215222-5c75a55e63e5
 	github.com/grafana/gomemcache v0.0.0-20251127154401-74f93547077b
 	github.com/grpc-ecosystem/go-grpc-middleware v1.4.0
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/jaegertracing/jaeger-idl v0.6.0
-	github.com/mark3labs/mcp-go v0.43.2
+	github.com/mark3labs/mcp-go v0.44.0
 	github.com/maypok86/otter/v2 v2.3.0
 	github.com/open-telemetry/opentelemetry-collector-contrib/exporter/zipkinexporter v0.146.0
 	github.com/open-telemetry/opentelemetry-collector-contrib/pkg/ottl v0.146.0
@@ -324,6 +325,8 @@ require (
 	github.com/spiffe/go-spiffe/v2 v2.6.0 // indirect
 	github.com/stretchr/objx v0.5.2 // indirect
 	github.com/subosito/gotenv v1.6.0 // indirect
+	github.com/theory/jsonpath v0.10.2 // indirect
+	github.com/timandy/routine v1.1.6 // indirect
 	github.com/tinylib/msgp v1.6.1 // indirect
 	github.com/tklauser/go-sysconf v0.3.16 // indirect
 	github.com/tklauser/numcpus v0.11.0 // indirect
@@ -438,3 +441,6 @@ replace (
 // - https://github.com/hashicorp/memberlist/pull/260
 // - https://github.com/grafana/memberlist/pull/3
 replace github.com/hashicorp/memberlist => github.com/grafana/memberlist v0.3.1-0.20251024160842-5cd332c2849a
+
+// Local development: use blockpack from deleted-files worktree.
+replace github.com/grafana/blockpack => /home/mdurham/source/grafana-blockpack-worktrees/deleted-files
