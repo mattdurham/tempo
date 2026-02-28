@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"math"
 	"sort"
 
 	tracev1 "go.opentelemetry.io/proto/otlp/trace/v1"
@@ -29,6 +30,10 @@ type pendingSpan struct {
 }
 
 // blockBuilder manages construction of a single block.
+// Rows are added one at a time via addRowFromProto, then finalized in one shot.
+// The mutable builder pattern (vs. a single BuildBlock([]rows) function) exists
+// because column builders must track running state (null-fill, bloom filter,
+// range values) that is simpler to maintain incrementally than in a batch pass.
 type blockBuilder struct {
 	// Cached intrinsic column builders for direct access without map lookup or
 	// interface dispatch. Pre-created in newBlockBuilder with pre-allocated
@@ -43,7 +48,7 @@ type blockBuilder struct {
 	colSpanDur   *uint64ColumnBuilder
 
 	columns   map[string]columnBuilder // column name → builder (all columns, for finalize)
-	traceRows map[[16]byte][]uint16    // trace_id → span row indices within this block
+	traceRows map[[16]byte][]uint16    // trace_id → span row indices; used by writer.go to build file-level trace index
 
 	// Column name caches: attribute key → full column name (e.g. "http.method" → "span.http.method").
 	// Populated lazily on first encounter within a block; eliminates per-span string concat allocs
@@ -52,8 +57,12 @@ type blockBuilder struct {
 	resourceColNames map[string]string
 	scopeColNames    map[string]string
 
-	rangeVals     []blockRangeValue // range index entries for this block
-	sparseColumns []columnBuilder   // non-intrinsic columns that may need null-filling
+	// colMinMax tracks the per-column minimum and maximum encoded key observed
+	// within this block. At block write time the writer records exactly two values
+	// per column into the file-level range index (vs. O(spans × attrs) previously).
+	// The map key is the column name; the value holds min/max encoded keys.
+	colMinMax     map[string]*blockColMinMax // column name → min/max for this block
+	sparseColumns []columnBuilder            // non-intrinsic columns that may need null-filling
 
 	spanCount int
 	// spanHint is the expected total span count for this block.
@@ -67,26 +76,66 @@ type blockBuilder struct {
 	maxTraceID [16]byte
 }
 
-type blockRangeValue struct {
+// blockColMinMax records the minimum and maximum encoded key seen for one column
+// within a single block. The key encoding matches encodeRangeKey (8-byte LE for
+// numeric types, raw string/bytes for string/bytes types).
+type blockColMinMax struct {
 	colName string
-	key     string // encoded value key
+	minKey  string // encoded minimum value key for this block
+	maxKey  string // encoded maximum value key for this block
 	colType shared.ColumnType
+}
+
+// builtBlock holds the outputs of buildBlock: the serialized payload and all
+// per-block statistics extracted from blockBuilder after finalization.
+// It is an intermediate value type used only inside buildAndWriteBlock.
+type builtBlock struct {
+	traceRows  map[[16]byte][]uint16
+	colMinMax  map[string]*blockColMinMax // per-column min/max for this block
+	payload    []byte
+	spanCount  int
+	minStart   uint64
+	maxStart   uint64
+	bloom      [32]byte
+	minTraceID [16]byte
+	maxTraceID [16]byte
+}
+
+// buildBlock constructs a single block from the given pending spans and returns
+// the serialized payload together with all per-block statistics.
+// It is a thin wrapper around the newBlockBuilder → addRowFromProto loop → finalize
+// pattern, keeping blockBuilder as an unexported implementation detail.
+func buildBlock(pending []pendingSpan, enc *zstdEncoder) (builtBlock, error) {
+	bb := newBlockBuilder(len(pending))
+	for rowIdx := range pending {
+		bb.addRowFromProto(&pending[rowIdx], rowIdx)
+	}
+	payload, err := bb.finalize(enc)
+	if err != nil {
+		return builtBlock{}, err
+	}
+	return builtBlock{
+		payload:    payload,
+		spanCount:  bb.spanCount,
+		minStart:   bb.minStart,
+		maxStart:   bb.maxStart,
+		minTraceID: bb.minTraceID,
+		maxTraceID: bb.maxTraceID,
+		bloom:      bb.bloom,
+		traceRows:  bb.traceRows,
+		colMinMax:  bb.colMinMax,
+	}, nil
 }
 
 // newBlockBuilder creates an empty block builder.
 // spanHint is the expected number of spans in this block; used to pre-allocate
 // value/present slices in the intrinsic column builders, eliminating growslice calls
 // during the per-span append loop.
-// rangeVals is preallocated to 4096 to reduce growslice calls during the per-span append loop.
 func newBlockBuilder(spanHint int) *blockBuilder {
-	// Estimate range index entries per span: ~7 fixed intrinsic columns +
-	// typical attribute count (20–30 span+resource+scope attrs) = ~30 entries/span.
-	// Over-estimating by a small factor eliminates all growslice events for b.rangeVals.
-	rangeValsCap := max(spanHint*32, 4096)
 	b := &blockBuilder{
 		columns:          make(map[string]columnBuilder, 32),
 		traceRows:        make(map[[16]byte][]uint16, 16),
-		rangeVals:        make([]blockRangeValue, 0, rangeValsCap),
+		colMinMax:        make(map[string]*blockColMinMax, 64),
 		sparseColumns:    make([]columnBuilder, 0, 32),
 		spanHint:         spanHint,
 		spanColNames:     make(map[string]string, 32),
@@ -241,32 +290,20 @@ func (b *blockBuilder) addRowFromProto(ps *pendingSpan, rowIdx int) {
 	spanIDPresent := len(span.SpanId) > 0
 	b.colSpanID.addBytes(span.SpanId, spanIDPresent)
 	if spanIDPresent {
-		b.rangeVals = append(b.rangeVals, blockRangeValue{
-			colName: "span:id",
-			key:     string(span.SpanId),
-			colType: shared.ColumnTypeBytes,
-		})
+		b.updateMinMax("span:id", shared.ColumnTypeBytes, string(span.SpanId))
 	}
 
 	// span:parent_id — may be absent; always written.
 	parentIDPresent := len(span.ParentSpanId) > 0
 	b.colParentID.addBytes(span.ParentSpanId, parentIDPresent)
 	if parentIDPresent {
-		b.rangeVals = append(b.rangeVals, blockRangeValue{
-			colName: "span:parent_id",
-			key:     string(span.ParentSpanId),
-			colType: shared.ColumnTypeBytes,
-		})
+		b.updateMinMax("span:parent_id", shared.ColumnTypeBytes, string(span.ParentSpanId))
 	}
 
 	// span:name — always present.
 	b.colSpanName.addString(span.Name, true)
 	if span.Name != "" {
-		b.rangeVals = append(b.rangeVals, blockRangeValue{
-			colName: "span:name",
-			key:     span.Name,
-			colType: shared.ColumnTypeString,
-		})
+		b.updateMinMax("span:name", shared.ColumnTypeString, span.Name)
 	}
 
 	// span:kind — always present.
@@ -275,11 +312,7 @@ func (b *blockBuilder) addRowFromProto(ps *pendingSpan, rowIdx int) {
 	{
 		var tmp [8]byte
 		binary.LittleEndian.PutUint64(tmp[:], uint64(spanKind)) //nolint:gosec // safe: reinterpreting int64 bits as uint64
-		b.rangeVals = append(b.rangeVals, blockRangeValue{
-			colName: "span:kind",
-			key:     string(tmp[:]),
-			colType: shared.ColumnTypeInt64,
-		})
+		b.updateMinMax("span:kind", shared.ColumnTypeInt64, string(tmp[:]))
 	}
 
 	// span:start — always present.
@@ -287,11 +320,7 @@ func (b *blockBuilder) addRowFromProto(ps *pendingSpan, rowIdx int) {
 	{
 		var tmp [8]byte
 		binary.LittleEndian.PutUint64(tmp[:], span.StartTimeUnixNano)
-		b.rangeVals = append(b.rangeVals, blockRangeValue{
-			colName: "span:start",
-			key:     string(tmp[:]),
-			colType: shared.ColumnTypeUint64,
-		})
+		b.updateMinMax("span:start", shared.ColumnTypeUint64, string(tmp[:]))
 	}
 
 	// span:end — always present.
@@ -299,11 +328,7 @@ func (b *blockBuilder) addRowFromProto(ps *pendingSpan, rowIdx int) {
 	{
 		var tmp [8]byte
 		binary.LittleEndian.PutUint64(tmp[:], span.EndTimeUnixNano)
-		b.rangeVals = append(b.rangeVals, blockRangeValue{
-			colName: "span:end",
-			key:     string(tmp[:]),
-			colType: shared.ColumnTypeUint64,
-		})
+		b.updateMinMax("span:end", shared.ColumnTypeUint64, string(tmp[:]))
 	}
 
 	// span:duration — always present.
@@ -315,11 +340,7 @@ func (b *blockBuilder) addRowFromProto(ps *pendingSpan, rowIdx int) {
 	{
 		var tmp [8]byte
 		binary.LittleEndian.PutUint64(tmp[:], dur)
-		b.rangeVals = append(b.rangeVals, blockRangeValue{
-			colName: "span:duration",
-			key:     string(tmp[:]),
-			colType: shared.ColumnTypeUint64,
-		})
+		b.updateMinMax("span:duration", shared.ColumnTypeUint64, string(tmp[:]))
 	}
 
 	// --- Conditional intrinsic columns ---
@@ -437,6 +458,71 @@ func (b *blockBuilder) internColName(key string, cache map[string]string, prefix
 	return name
 }
 
+// updateMinMax updates the per-block min/max for the named column.
+// key is the encoded range key (from encodeRangeKey). Called once per present value.
+// On first call for a column, min and max are both set to key.
+// On subsequent calls, min and max are updated using type-aware comparison.
+//
+// 8-byte LE encoding for int64/uint64/float64 does NOT preserve lexicographic ordering
+// (e.g. enc(256)="\x00\x01..." < enc(255)="\xff..." in string compare, but 256 > 255
+// numerically). Numeric types require decoded comparison to produce correct min/max;
+// the recorded encoded keys are then fed to the KLL sketch in addBlockRangeToColumn.
+// String/bytes columns use raw lexicographic comparison which is correct by definition.
+func (b *blockBuilder) updateMinMax(name string, typ shared.ColumnType, key string) {
+	if mm, ok := b.colMinMax[name]; ok {
+		if rangeKeyLess(typ, key, mm.minKey) {
+			mm.minKey = key
+		}
+		if rangeKeyLess(typ, mm.maxKey, key) {
+			mm.maxKey = key
+		}
+	} else {
+		b.colMinMax[name] = &blockColMinMax{
+			colName: name,
+			minKey:  key,
+			maxKey:  key,
+			colType: typ,
+		}
+	}
+}
+
+// rangeKeyLess returns true when encoded key a is strictly less than encoded key b,
+// using type-aware comparison. For numeric types (int64/uint64/float64), the 8-byte
+// LE encoding is decoded to its native type before comparison. For string/bytes the
+// comparison is raw lexicographic.
+func rangeKeyLess(typ shared.ColumnType, a, b string) bool {
+	switch typ {
+	case shared.ColumnTypeInt64, shared.ColumnTypeRangeInt64, shared.ColumnTypeRangeDuration:
+		if len(a) < 8 || len(b) < 8 {
+			return a < b
+		}
+		av := int64(binary.LittleEndian.Uint64([]byte(a))) //nolint:gosec // safe: reinterpreting uint64 bits as int64
+		bv := int64(binary.LittleEndian.Uint64([]byte(b))) //nolint:gosec // safe: reinterpreting uint64 bits as int64
+		return av < bv
+	case shared.ColumnTypeUint64, shared.ColumnTypeRangeUint64:
+		if len(a) < 8 || len(b) < 8 {
+			return a < b
+		}
+		return binary.LittleEndian.Uint64([]byte(a)) < binary.LittleEndian.Uint64([]byte(b))
+	case shared.ColumnTypeFloat64, shared.ColumnTypeRangeFloat64:
+		if len(a) < 8 || len(b) < 8 {
+			return a < b
+		}
+		av := math.Float64frombits(binary.LittleEndian.Uint64([]byte(a)))
+		bv := math.Float64frombits(binary.LittleEndian.Uint64([]byte(b)))
+		// NaN sorts after all real values: NaN < x is false, x < NaN is true.
+		if math.IsNaN(av) {
+			return false
+		}
+		if math.IsNaN(bv) {
+			return true
+		}
+		return av < bv
+	default: // String, Bytes, Bool: lexicographic is correct
+		return a < b
+	}
+}
+
 // addPresent writes a present (non-null) attribute value to the named column
 // and feeds the range index. Promoted from a closure inside addRow to eliminate
 // the per-span closure heap allocation (~24 bytes per span at scale).
@@ -462,19 +548,14 @@ func (b *blockBuilder) addPresent(name string, typ shared.ColumnType, val shared
 	//           Bool (no Range* equivalent; cardinality is always ≤2)
 	if name != traceIDColumnName && typ != shared.ColumnTypeBool {
 		if key := encodeRangeKey(typ, val); key != "" {
-			b.rangeVals = append(b.rangeVals, blockRangeValue{
-				colName: name,
-				key:     key,
-				colType: typ,
-			})
+			b.updateMinMax(name, typ, key)
 		}
 	}
 }
 
-// finalize encodes all columns, writes the block payload, and returns:
-// - the serialized block bytes (header + column metadata + stats + data + trace table)
-// - per-column byte offsets/lengths for the column index
-func (b *blockBuilder) finalize(enc *zstdEncoder) ([]byte, columnIndexBlock, error) {
+// finalize encodes all columns and returns the serialized block bytes
+// (header + column metadata + data).
+func (b *blockBuilder) finalize(enc *zstdEncoder) ([]byte, error) {
 	// Collect and sort column names lexicographically.
 	colNames := make([]string, 0, len(b.columns))
 	for name := range b.columns {
@@ -484,12 +565,11 @@ func (b *blockBuilder) finalize(enc *zstdEncoder) ([]byte, columnIndexBlock, err
 
 	colCount := len(colNames)
 
-	// Build column data and stats blobs.
+	// Build column data blobs.
 	type colBlob struct {
-		name      string
-		dataBlob  []byte
-		statsBlob []byte
-		typ       shared.ColumnType
+		name     string
+		dataBlob []byte
+		typ      shared.ColumnType
 	}
 	blobs := make([]colBlob, 0, colCount)
 
@@ -497,26 +577,20 @@ func (b *blockBuilder) finalize(enc *zstdEncoder) ([]byte, columnIndexBlock, err
 		cb := b.columns[name]
 		data, err := cb.buildData(enc)
 		if err != nil {
-			return nil, columnIndexBlock{}, fmt.Errorf("finalize column %q: %w", name, err)
+			return nil, fmt.Errorf("finalize column %q: %w", name, err)
 		}
-		stats := cb.buildStats()
 		blobs = append(blobs, colBlob{
-			name:      name,
-			typ:       cb.colType(),
-			dataBlob:  data,
-			statsBlob: stats,
+			name:     name,
+			typ:      cb.colType(),
+			dataBlob: data,
 		})
 	}
-
-	// Build trace table bytes.
-	traceTableBytes := buildBlockTraceTable(b.traceRows)
 
 	// --- Compute layout ---
 	// Block header: 24 bytes
 	// Column metadata array: sum of (2 + len(name) + 1 + 8 + 8 + 8 + 8) per column
-	// Column stats section: immediately after metadata
-	// Column data section: immediately after stats
-	// Trace table: at the end
+	//   (stats_offset and stats_len are always 0 — column stats section removed)
+	// Column data section: immediately after metadata
 
 	headerSize := 24
 
@@ -527,19 +601,8 @@ func (b *blockBuilder) finalize(enc *zstdEncoder) ([]byte, columnIndexBlock, err
 		colMetaSize += 2 + len(bl.name) + 1 + 8 + 8 + 8 + 8
 	}
 
-	// Stats section start.
-	statsStart := headerSize + colMetaSize
-
-	// Compute per-column stats offsets and total stats size.
-	statsSizes := make([]int, colCount)
-	totalStatsSize := 0
-	for i, bl := range blobs {
-		statsSizes[i] = len(bl.statsBlob)
-		totalStatsSize += len(bl.statsBlob)
-	}
-
-	// Data section start.
-	dataStart := statsStart + totalStatsSize
+	// Data section starts immediately after column metadata (no stats section).
+	dataStart := headerSize + colMetaSize
 
 	// Compute per-column data offsets and total data size.
 	dataSizes := make([]int, colCount)
@@ -549,11 +612,8 @@ func (b *blockBuilder) finalize(enc *zstdEncoder) ([]byte, columnIndexBlock, err
 		totalDataSize += len(bl.dataBlob)
 	}
 
-	// Trace table starts after data.
-	traceTableStart := dataStart + totalDataSize
-
 	// Total block size.
-	totalSize := traceTableStart + len(traceTableBytes)
+	totalSize := dataStart + totalDataSize
 
 	// Allocate the output buffer.
 	payload := make([]byte, 0, totalSize)
@@ -569,21 +629,14 @@ func (b *blockBuilder) finalize(enc *zstdEncoder) ([]byte, columnIndexBlock, err
 	payload = appendUint32LE(payload, uint32(b.spanCount)) //nolint:gosec // safe: spanCount bounded by MaxBlockSpans (65535)
 	// column_count[4]
 	payload = appendUint32LE(payload, uint32(colCount)) //nolint:gosec // safe: column count bounded by MaxColumns
-	// trace_count[4]
-	payload = appendUint32LE(payload, uint32(len(b.traceRows))) //nolint:gosec // safe: trace count bounded by MaxTraceCount
-	// trace_table_len[4]
-	payload = appendUint32LE(payload, uint32(len(traceTableBytes))) //nolint:gosec // safe: trace table size bounded by block size
+	// reserved2[8] (formerly trace_count[4] + trace_table_len[4], now always zero)
+	payload = append(payload, 0, 0, 0, 0, 0, 0, 0, 0)
 
 	// --- Write column metadata array ---
-	// Track running offsets for stats and data.
-	curStatsOff := uint64(statsStart)
+	// Track running data offset.
 	curDataOff := uint64(dataStart)
 
-	colIdxEntries := make([]columnIndexEntry, 0, colCount)
-
 	for i, bl := range blobs {
-		statsOff := curStatsOff
-		statsLen := uint64(statsSizes[i])
 		dataOff := curDataOff
 		dataLen := uint64(dataSizes[i])
 
@@ -597,25 +650,12 @@ func (b *blockBuilder) finalize(enc *zstdEncoder) ([]byte, columnIndexBlock, err
 		payload = appendUint64LE(payload, dataOff)
 		// data_len[8 LE]
 		payload = appendUint64LE(payload, dataLen)
-		// stats_offset[8 LE]
-		payload = appendUint64LE(payload, statsOff)
-		// stats_len[8 LE]
-		payload = appendUint64LE(payload, statsLen)
+		// stats_offset[8 LE] — always 0 (column stats section removed)
+		payload = appendUint64LE(payload, 0)
+		// stats_len[8 LE] — always 0 (column stats section removed)
+		payload = appendUint64LE(payload, 0)
 
-		// Record column index entry (offsets relative to block start).
-		colIdxEntries = append(colIdxEntries, columnIndexEntry{
-			name:   bl.name,
-			offset: uint32(dataOff), //nolint:gosec // safe: block offsets are bounded by max block size (fits in uint32)
-			length: uint32(dataLen), //nolint:gosec // safe: column data length bounded by max block size (fits in uint32)
-		})
-
-		curStatsOff += statsLen
 		curDataOff += dataLen
-	}
-
-	// --- Write column stats section ---
-	for _, bl := range blobs {
-		payload = append(payload, bl.statsBlob...)
 	}
 
 	// --- Write column data section ---
@@ -623,38 +663,17 @@ func (b *blockBuilder) finalize(enc *zstdEncoder) ([]byte, columnIndexBlock, err
 		payload = append(payload, bl.dataBlob...)
 	}
 
-	// --- Write trace table ---
-	payload = append(payload, traceTableBytes...)
-
-	return payload, columnIndexBlock{entries: colIdxEntries}, nil
+	return payload, nil
 }
 
-// buildBlockTraceTable serializes the block-level trace table.
-// Format: trace_count × {trace_id[16] + span_count[2 LE] + span_indices[span_count × uint16 LE]}
-func buildBlockTraceTable(traceRows map[[16]byte][]uint16) []byte {
-	if len(traceRows) == 0 {
-		return nil
-	}
-
-	// Sort trace IDs for deterministic output.
-	traceIDs := make([][16]byte, 0, len(traceRows))
-	for tid := range traceRows {
-		traceIDs = append(traceIDs, tid)
-	}
-	sort.Slice(traceIDs, func(i, j int) bool {
-		return bytes.Compare(traceIDs[i][:], traceIDs[j][:]) < 0
-	})
-
-	var buf []byte
-	for _, tid := range traceIDs {
-		rows := traceRows[tid]
-		buf = append(buf, tid[:]...)
-		buf = append(buf, byte(len(rows)), byte(len(rows)>>8)) //nolint:gosec // safe: row count bounded by MaxBlockSpans (65535)
-		for _, r := range rows {
-			buf = append(buf, byte(r), byte(r>>8))
-		}
-	}
-	return buf
+// appendUint32LE appends a uint32 in little-endian byte order to buf.
+func appendUint32LE(buf []byte, v uint32) []byte {
+	return append(buf,
+		byte(v),     //nolint:gosec // safe: truncating uint32 bytes for LE encoding
+		byte(v>>8),  //nolint:gosec // safe: truncating uint32 bytes for LE encoding
+		byte(v>>16), //nolint:gosec // safe: truncating uint32 bytes for LE encoding
+		byte(v>>24), //nolint:gosec // safe: truncating uint32 bytes for LE encoding
+	)
 }
 
 // appendUint64LE appends a uint64 in little-endian byte order to buf.

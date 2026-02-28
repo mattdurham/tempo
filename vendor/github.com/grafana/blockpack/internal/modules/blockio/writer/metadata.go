@@ -12,17 +12,6 @@ import (
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
 )
 
-// columnIndexBlock is the per-block column offset table.
-type columnIndexBlock struct {
-	entries []columnIndexEntry
-}
-
-type columnIndexEntry struct {
-	name   string
-	offset uint32
-	length uint32
-}
-
 type traceBlockRef struct {
 	spanIndices []uint16
 	blockID     uint16
@@ -73,69 +62,9 @@ func writeBlockIndexSection(_ io.Writer, version uint8, metas []shared.BlockMeta
 
 		// column_name_bloom[32]
 		buf.Write(m.ColumnNameBloom[:])
-
-		// value_stats: stats_count[1] + entries
-		buf.WriteByte(byte(len(m.ValueStats))) //nolint:gosec // safe: ValueStats count <= 255 by spec
-		for _, vs := range m.ValueStats {
-			// name_len[2 LE] + name
-			nameBuf := [2]byte{byte(len(vs.Name)), byte(len(vs.Name) >> 8)} //nolint:gosec // safe: name len bounded by MaxNameLen (1024)
-			buf.Write(nameBuf[:])
-			buf.WriteString(vs.Name)
-			// stats_type[1]
-			buf.WriteByte(vs.StatsType)
-			// type-specific fields
-			switch vs.StatsType {
-			case 1: // String
-				writeStringStats(&buf, vs.StringMin, vs.StringMax)
-			case 2: // Int64
-				writeInt64Stats(&buf, vs.Int64Min, vs.Int64Max)
-			case 3: // Float64
-				writeFloat64Stats(&buf, vs.Float64Min, vs.Float64Max)
-			case 4: // Bool
-				writeBoolStats(&buf, vs.BoolMin, vs.BoolMax)
-			}
-		}
 	}
 
 	return buf.Bytes(), nil
-}
-
-func writeStringStats(buf *bytes.Buffer, minVal, maxVal string) {
-	var tmp [4]byte
-	binary.LittleEndian.PutUint32(tmp[:], uint32(len(minVal))) //nolint:gosec // safe: string length bounded by MaxStringLen
-	buf.Write(tmp[:])
-	buf.WriteString(minVal)
-	binary.LittleEndian.PutUint32(tmp[:], uint32(len(maxVal))) //nolint:gosec // safe: string length bounded by MaxStringLen
-	buf.Write(tmp[:])
-	buf.WriteString(maxVal)
-}
-
-func writeInt64Stats(buf *bytes.Buffer, minVal, maxVal int64) {
-	var tmp [8]byte
-	binary.LittleEndian.PutUint64(tmp[:], uint64(minVal)) //nolint:gosec // safe: serializing int64 bits
-	buf.Write(tmp[:])
-	binary.LittleEndian.PutUint64(tmp[:], uint64(maxVal)) //nolint:gosec // safe: serializing int64 bits
-	buf.Write(tmp[:])
-}
-
-func writeFloat64Stats(buf *bytes.Buffer, minVal, maxVal float64) {
-	var tmp [8]byte
-	binary.LittleEndian.PutUint64(tmp[:], math.Float64bits(minVal))
-	buf.Write(tmp[:])
-	binary.LittleEndian.PutUint64(tmp[:], math.Float64bits(maxVal))
-	buf.Write(tmp[:])
-}
-
-func writeBoolStats(buf *bytes.Buffer, minVal, maxVal bool) {
-	minB := byte(0)
-	if minVal {
-		minB = 1
-	}
-	maxB := byte(0)
-	if maxVal {
-		maxB = 1
-	}
-	buf.Write([]byte{minB, maxB})
 }
 
 // writeRangeIndexSection serializes the range column index.
@@ -144,9 +73,14 @@ func writeRangeIndexSection(_ io.Writer, rIdx rangeIndex) ([]byte, error) {
 	var buf bytes.Buffer
 
 	// Sort column names for deterministic output.
+	// Skip columns with no bucket entries (cd.values == nil): they carry no pruning
+	// information and must not be written — the reader would treat them as indexed
+	// with 0 entries, causing the query planner to incorrectly prune all blocks.
 	colNames := make([]string, 0, len(rIdx))
-	for name := range rIdx {
-		colNames = append(colNames, name)
+	for name, cd := range rIdx {
+		if len(cd.values) > 0 {
+			colNames = append(colNames, name)
+		}
 	}
 	sort.Strings(colNames)
 
@@ -272,34 +206,6 @@ func writeRangeValueKey(buf *bytes.Buffer, colType shared.ColumnType, key string
 		buf.WriteByte(byte(len(key))) //nolint:gosec // safe: range boundary key is 8 bytes, fits uint8
 		buf.WriteString(key)
 	}
-}
-
-// writeColumnIndexSection serializes the per-block column offset table.
-// Returns the serialized bytes.
-func writeColumnIndexSection(_ io.Writer, colIndexes []columnIndexBlock) ([]byte, error) {
-	var buf bytes.Buffer
-
-	var tmp4 [4]byte
-
-	for _, cib := range colIndexes {
-		// col_count[4 LE] (per SPECS §5.3 it's uint32)
-		binary.LittleEndian.PutUint32(tmp4[:], uint32(len(cib.entries))) //nolint:gosec // safe: column count bounded by MaxColumns
-		buf.Write(tmp4[:])
-
-		for _, entry := range cib.entries {
-			// name_len[2 LE] + name
-			buf.Write([]byte{byte(len(entry.name)), byte(len(entry.name) >> 8)}) //nolint:gosec // safe: col name len bounded by MaxNameLen (1024)
-			buf.WriteString(entry.name)
-			// col_offset[4 LE]
-			binary.LittleEndian.PutUint32(tmp4[:], entry.offset)
-			buf.Write(tmp4[:])
-			// col_length[4 LE]
-			binary.LittleEndian.PutUint32(tmp4[:], entry.length)
-			buf.Write(tmp4[:])
-		}
-	}
-
-	return buf.Bytes(), nil
 }
 
 // writeTraceBlockIndexSection serializes the trace block index.

@@ -24,7 +24,6 @@ const traceIDColumnName = "trace:id"
 
 const (
 	defaultMaxBlockSpans      = 2000
-	defaultBlockTargetBytes   = 512 * 1024
 	estimatedBytesPerSpan     = 2048
 	uuidSampleCount           = 8
 	rleCardinalityThreshold   = 3

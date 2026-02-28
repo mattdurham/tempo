@@ -5,22 +5,9 @@ package reader
 import (
 	"encoding/binary"
 	"fmt"
-	"math"
 
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
 )
-
-// columnIndexBlock holds the per-block column index entries.
-type columnIndexBlock struct {
-	entries []columnIndexEntry
-}
-
-// columnIndexEntry is one entry in the per-block column index.
-type columnIndexEntry struct {
-	name   string
-	offset uint32
-	length uint32
-}
 
 // traceBlockRef describes span indices for one trace in one block.
 type traceBlockRef struct {
@@ -105,7 +92,6 @@ func (r *Reader) readHeader() error {
 // parseV5MetadataLazy reads the metadata section and eagerly parses:
 //   - block index entries → r.blockMetas
 //   - range column index byte ranges → r.rangeOffsets (lazy)
-//   - column index → r.columnIndexes
 //   - trace block index → r.traceIndex
 func (r *Reader) parseV5MetadataLazy() error {
 	if r.metadataLen == 0 {
@@ -164,14 +150,13 @@ func (r *Reader) parseV5MetadataLazy() error {
 	pos += newPos
 	r.rangeOffsets = offsets
 
-	// Column index: block_count × ColumnIndexBlock.
-	colIdxs, newPos, err := parseColumnIndex(data[pos:], blockCount)
+	// Column index: block_count × col_count (always 0 in new files; skip without allocating).
+	newPos, err = skipColumnIndex(data[pos:], blockCount)
 	if err != nil {
 		return fmt.Errorf("parseMetadata: column_index: %w", err)
 	}
 
 	pos += newPos
-	r.columnIndexes = colIdxs
 
 	// Trace block index.
 	traceIdx, _, err := parseTraceBlockIndex(data[pos:])
@@ -242,105 +227,6 @@ func parseBlockIndexEntry(
 	copy(meta.ColumnNameBloom[:], data[pos:pos+32])
 	pos += 32
 
-	// value_stats: stats_count[1] + entries
-	if pos+1 > len(data) {
-		return meta, pos, fmt.Errorf("block_index entry: short for stats_count")
-	}
-
-	statsCount := int(data[pos])
-	pos++
-
-	meta.ValueStats = make([]shared.AttributeStatEntry, 0, statsCount)
-	for range statsCount {
-		if pos+2 > len(data) {
-			return meta, pos, fmt.Errorf("block_index entry: attr stat: short for name_len")
-		}
-
-		nameLen := int(binary.LittleEndian.Uint16(data[pos:]))
-		pos += 2
-		if pos+nameLen > len(data) {
-			return meta, pos, fmt.Errorf("block_index entry: attr stat: short for name")
-		}
-
-		name := string(data[pos : pos+nameLen])
-		pos += nameLen
-
-		if pos+1 > len(data) {
-			return meta, pos, fmt.Errorf("block_index entry: attr stat: short for stats_type")
-		}
-
-		statsType := data[pos]
-		pos++
-
-		var entry shared.AttributeStatEntry
-		entry.Name = name
-		entry.StatsType = statsType
-
-		switch statsType {
-		case 0: // None
-		case 1: // String
-			if pos+4 > len(data) {
-				return meta, pos, fmt.Errorf("block_index attr stat(string): short for min_len")
-			}
-
-			minLen := int(binary.LittleEndian.Uint32(data[pos:]))
-			pos += 4
-			if pos+minLen > len(data) {
-				return meta, pos, fmt.Errorf("block_index attr stat(string): short for min")
-			}
-
-			entry.StringMin = string(data[pos : pos+minLen])
-			pos += minLen
-
-			if pos+4 > len(data) {
-				return meta, pos, fmt.Errorf("block_index attr stat(string): short for max_len")
-			}
-
-			maxLen := int(binary.LittleEndian.Uint32(data[pos:]))
-			pos += 4
-			if pos+maxLen > len(data) {
-				return meta, pos, fmt.Errorf("block_index attr stat(string): short for max")
-			}
-
-			entry.StringMax = string(data[pos : pos+maxLen])
-			pos += maxLen
-
-		case 2: // Int64
-			if pos+16 > len(data) {
-				return meta, pos, fmt.Errorf("block_index attr stat(int64): short for min+max")
-			}
-
-			entry.Int64Min = int64(binary.LittleEndian.Uint64(data[pos:])) //nolint:gosec // safe: reinterpreting serialized int64 bits
-			pos += 8
-			entry.Int64Max = int64(binary.LittleEndian.Uint64(data[pos:])) //nolint:gosec // safe: reinterpreting serialized int64 bits
-			pos += 8
-
-		case 3: // Float64
-			if pos+16 > len(data) {
-				return meta, pos, fmt.Errorf("block_index attr stat(float64): short for min+max")
-			}
-
-			entry.Float64Min = math.Float64frombits(binary.LittleEndian.Uint64(data[pos:]))
-			pos += 8
-			entry.Float64Max = math.Float64frombits(binary.LittleEndian.Uint64(data[pos:]))
-			pos += 8
-
-		case 4: // Bool
-			if pos+2 > len(data) {
-				return meta, pos, fmt.Errorf("block_index attr stat(bool): short for min+max")
-			}
-
-			entry.BoolMin = data[pos] != 0
-			entry.BoolMax = data[pos+1] != 0
-			pos += 2
-
-		default:
-			return meta, pos, fmt.Errorf("block_index attr stat: unknown stats_type %d", statsType)
-		}
-
-		meta.ValueStats = append(meta.ValueStats, entry)
-	}
-
 	return meta, pos, nil
 }
 
@@ -362,54 +248,36 @@ func parseBlockIndex(data []byte, version uint8, blockCount int) ([]shared.Block
 	return metas, pos, nil
 }
 
-// parseColumnIndex parses block_count ColumnIndexBlock entries from data.
-func parseColumnIndex(data []byte, blockCount int) ([]columnIndexBlock, int, error) {
-	blocks := make([]columnIndexBlock, 0, blockCount)
+// skipColumnIndex advances pos past the column index section without allocating.
+// For new files, each block has col_count=0 (4 bytes per block).
+// For old files, it correctly skips any existing entries.
+func skipColumnIndex(data []byte, blockCount int) (int, error) {
 	pos := 0
 
 	for b := range blockCount {
 		if pos+4 > len(data) {
-			return nil, pos, fmt.Errorf("column_index block[%d]: short for col_count", b)
+			return pos, fmt.Errorf("column_index block[%d]: short for col_count", b)
 		}
 
 		colCount := int(binary.LittleEndian.Uint32(data[pos:]))
 		pos += 4
 
-		entries := make([]columnIndexEntry, 0, colCount)
 		for c := range colCount {
 			if pos+2 > len(data) {
-				return nil, pos, fmt.Errorf("column_index block[%d] col[%d]: short for name_len", b, c)
+				return pos, fmt.Errorf("column_index block[%d] col[%d]: short for name_len", b, c)
 			}
 
 			nameLen := int(binary.LittleEndian.Uint16(data[pos:]))
-			pos += 2
-			if pos+nameLen > len(data) {
-				return nil, pos, fmt.Errorf("column_index block[%d] col[%d]: short for name", b, c)
+			advance := 2 + nameLen + 8 // name_len[2] + name + offset[4] + length[4]
+			if advance < 0 || pos+advance > len(data) {
+				return pos, fmt.Errorf("column_index block[%d] col[%d]: short for name/offset/length", b, c)
 			}
 
-			name := string(data[pos : pos+nameLen])
-			pos += nameLen
-
-			if pos+8 > len(data) {
-				return nil, pos, fmt.Errorf("column_index block[%d] col[%d]: short for offset/length", b, c)
-			}
-
-			colOffset := binary.LittleEndian.Uint32(data[pos:])
-			pos += 4
-			colLength := binary.LittleEndian.Uint32(data[pos:])
-			pos += 4
-
-			entries = append(entries, columnIndexEntry{
-				name:   name,
-				offset: colOffset,
-				length: colLength,
-			})
+			pos += advance
 		}
-
-		blocks = append(blocks, columnIndexBlock{entries: entries})
 	}
 
-	return blocks, pos, nil
+	return pos, nil
 }
 
 // parseTraceBlockIndex parses the trace block index section.

@@ -81,6 +81,8 @@ services:
     build:
       context: ..
       dockerfile: .docker/Dockerfile.tempo
+      args:
+        BINARY_NAME: tempo-parquet
     command:
       - "-config.file=/etc/tempo.yaml"
     depends_on:
@@ -109,6 +111,8 @@ services:
     build:
       context: ..
       dockerfile: .docker/Dockerfile.tempo
+      args:
+        BINARY_NAME: tempo-blockpack
     command:
       - "-config.file=/etc/tempo.yaml"
     depends_on:
@@ -197,6 +201,8 @@ services:
       - GF_AUTH_DISABLE_LOGIN_FORM=true
     volumes:
       - ./grafana-datasources.yaml:/etc/grafana/provisioning/datasources/datasources.yaml
+      - ./grafana-dashboards.yaml:/etc/grafana/provisioning/dashboards/dashboards.yaml
+      - ./dashboards:/etc/grafana/provisioning/dashboards
     ports:
       - "3000:3000"
     depends_on:

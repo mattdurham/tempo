@@ -28,7 +28,6 @@ type Column struct {
 
 	// Presence bitset — MAY be arena-allocated.
 	Present []byte
-	Stats   shared.ColumnStats
 
 	// Total span count this column covers (including nulls).
 	SpanCount int

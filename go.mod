@@ -125,7 +125,7 @@ require (
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.40.0
 	go.opentelemetry.io/proto/otlp v1.9.0
 	go.yaml.in/yaml/v2 v2.4.3
-	golang.org/x/net v0.50.0
+	golang.org/x/net v0.51.0
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260209200024-4cfbd4190f57
 )
 
@@ -326,7 +326,6 @@ require (
 	github.com/stretchr/objx v0.5.2 // indirect
 	github.com/subosito/gotenv v1.6.0 // indirect
 	github.com/theory/jsonpath v0.10.2 // indirect
-	github.com/timandy/routine v1.1.6 // indirect
 	github.com/tinylib/msgp v1.6.1 // indirect
 	github.com/tklauser/go-sysconf v0.3.16 // indirect
 	github.com/tklauser/numcpus v0.11.0 // indirect
@@ -442,5 +441,5 @@ replace (
 // - https://github.com/grafana/memberlist/pull/3
 replace github.com/hashicorp/memberlist => github.com/grafana/memberlist v0.3.1-0.20251024160842-5cd332c2849a
 
-// Local development: use blockpack from deleted-files worktree.
-replace github.com/grafana/blockpack => /home/mdurham/source/grafana-blockpack-worktrees/deleted-files
+// Local development: use blockpack from local checkout.
+replace github.com/grafana/blockpack => /home/mdurham/source/grafana-blockpack

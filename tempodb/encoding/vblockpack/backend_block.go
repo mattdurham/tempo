@@ -80,46 +80,74 @@ func (b *blockpackBlock) BlockMeta() *backend.BlockMeta {
 	return b.meta
 }
 
-// FindTraceByID finds a trace by ID in the blockpack block
-//
-// Implementation: Queries blockpack file for all spans matching trace ID,
-// then reconstructs the full trace with proper OTLP hierarchy.
-func (b *blockpackBlock) FindTraceByID(ctx context.Context, id common.ID, _ common.SearchOptions) (*tempopb.TraceByIDResponse, error) {
-	// Convert trace ID to hex string for query
-	traceIDHex := hex.EncodeToString(id)
+// FindTraceByID finds a trace by ID using the trace block index for O(log N) lookup.
+func (b *blockpackBlock) FindTraceByID(_ context.Context, id common.ID, _ common.SearchOptions) (*tempopb.TraceByIDResponse, error) {
+	if len(id) != 16 {
+		return nil, fmt.Errorf("trace ID must be 16 bytes, got %d", len(id))
+	}
 
-	// Build TraceQL query to find all spans for this trace
-	// Use explicit column name with colon notation (passes through normalization)
-	query := fmt.Sprintf(`{ trace:id = "%s" }`, traceIDHex)
-
-	// Create storage adapter for blockpack query
 	blockUUID := uuid.UUID(b.meta.BlockID)
-	storage := &tempoStorage{
-		reader:   b.reader,
-		tenantID: b.meta.TenantID,
-		blockID:  blockUUID,
-	}
-
-	// Execute TraceQL query using public API
-	matches, err := executeTraceQL(storage, query, blockpack.QueryOptions{})
+	r, err := blockpack.NewReaderFromProvider(&storageReaderProvider{
+		storage: &tempoStorage{
+			reader:   b.reader,
+			tenantID: b.meta.TenantID,
+			blockID:  blockUUID,
+		},
+	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to execute query: %w", err)
+		return nil, fmt.Errorf("failed to create blockpack reader: %w", err)
 	}
 
-	// No matching spans found
+	var traceID16 [16]byte
+	copy(traceID16[:], id)
+
+	blockIndices := r.BlocksForTraceID(traceID16)
+	if len(blockIndices) == 0 {
+		return nil, nil
+	}
+
+	traceIDHex := hex.EncodeToString(id)
+	var matches []blockpack.SpanMatch
+
+	for _, blockIdx := range blockIndices {
+		bwb, err := r.GetBlockWithBytes(blockIdx, nil, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read block %d: %w", blockIdx, err)
+		}
+
+		spanIndices := r.GetTraceSpanIndices(traceID16, blockIdx)
+		if len(spanIndices) == 0 {
+			continue
+		}
+
+		spanIDCol := bwb.Block.GetColumn("span:id")
+		for _, rowIdx16 := range spanIndices {
+			rowIdx := int(rowIdx16)
+			spanIDHex := ""
+			if spanIDCol != nil {
+				if v, ok := spanIDCol.BytesValue(rowIdx); ok {
+					spanIDHex = hex.EncodeToString(v)
+				}
+			}
+			match := blockpack.SpanMatch{
+				Fields:  &rowFieldsProvider{block: bwb.Block, rowIdx: rowIdx},
+				TraceID: traceIDHex,
+				SpanID:  spanIDHex,
+			}
+			matches = append(matches, match.Clone())
+		}
+	}
+
 	if len(matches) == 0 {
-		return nil, nil // Trace not found
+		return nil, nil
 	}
 
-	// Reconstruct trace from spans
 	trace, err := reconstructTrace(id, matches)
 	if err != nil {
 		return nil, fmt.Errorf("failed to reconstruct trace: %w", err)
 	}
 
-	return &tempopb.TraceByIDResponse{
-		Trace: trace,
-	}, nil
+	return &tempopb.TraceByIDResponse{Trace: trace}, nil
 }
 
 // Search performs a search across the blockpack block
@@ -187,18 +215,18 @@ func (b *blockpackBlock) SearchTags(ctx context.Context, scope traceql.Attribute
 		return fmt.Errorf("failed to create blockpack reader: %w", err)
 	}
 
-	// Collect unique column names from first block
+	// Collect unique column names from all blocks
 	tags := make(map[string]struct{})
-	block, err := bpr.GetBlock(0) // Get first block
-	if err != nil {
-		return fmt.Errorf("failed to read first block: %w", err)
-	}
-
-	// Extract column names and filter by scope
-	for colName := range block.Columns() {
-		tag := columnNameToTag(colName, scope)
-		if tag != "" {
-			tags[tag] = struct{}{}
+	for i := 0; i < bpr.BlockCount(); i++ {
+		bwb, err := bpr.GetBlockWithBytes(i, nil, nil)
+		if err != nil {
+			return fmt.Errorf("failed to read block %d: %w", i, err)
+		}
+		for colName := range bwb.Block.Columns() {
+			tag := columnNameToTag(colName, scope)
+			if tag != "" {
+				tags[tag] = struct{}{}
+			}
 		}
 	}
 
@@ -398,17 +426,25 @@ func (b *blockpackBlock) FetchTagNames(ctx context.Context, req traceql.FetchTag
 			return fmt.Errorf("failed to create blockpack reader: %w", err)
 		}
 
-		block, err := bpr.GetBlock(0)
-		if err != nil {
-			return fmt.Errorf("failed to read first block: %w", err)
-		}
-
-		// Extract tag names based on scope
-		for colName := range block.Columns() {
-			tag := columnNameToTag(colName, req.Scope)
-			if tag != "" {
+		// Extract tag names from all blocks, deduplicated
+		seen := make(map[string]struct{})
+	outer:
+		for i := 0; i < bpr.BlockCount(); i++ {
+			bwb, err := bpr.GetBlockWithBytes(i, nil, nil)
+			if err != nil {
+				return fmt.Errorf("failed to read block %d: %w", i, err)
+			}
+			for colName := range bwb.Block.Columns() {
+				tag := columnNameToTag(colName, req.Scope)
+				if tag == "" {
+					continue
+				}
+				if _, exists := seen[tag]; exists {
+					continue
+				}
+				seen[tag] = struct{}{}
 				if cb(tag, req.Scope) {
-					break // Callback returned true = stop
+					break outer
 				}
 			}
 		}
@@ -608,6 +644,58 @@ func (p *bytesReaderProvider) ReadAt(b []byte, off int64, dataType blockpack.Dat
 }
 
 func (p *bytesReaderProvider) Delete() error { return nil }
+
+// rowFieldsProvider implements blockpack.SpanFieldsProvider for a single row within a Block.
+// It mirrors modulesSpanFieldsAdapter (internal to blockpack) but is safe to construct
+// from outside the package since it works via the exported Column accessors.
+type rowFieldsProvider struct {
+	block  *blockpack.Block
+	rowIdx int
+}
+
+func (p *rowFieldsProvider) GetField(name string) (any, bool) {
+	col := p.block.GetColumn(name)
+	if col == nil {
+		return nil, false
+	}
+	return columnValue(col, p.rowIdx)
+}
+
+func (p *rowFieldsProvider) IterateFields(fn func(name string, value any) bool) {
+	for name, col := range p.block.Columns() {
+		v, ok := columnValue(col, p.rowIdx)
+		if !ok {
+			continue
+		}
+		if !fn(name, v) {
+			return
+		}
+	}
+}
+
+// columnValue extracts the typed value from a blockpack column at rowIdx.
+// Each column has exactly one type populated, so we try each accessor in order.
+func columnValue(col *blockpack.Column, rowIdx int) (any, bool) {
+	if v, ok := col.BytesValue(rowIdx); ok {
+		return v, true
+	}
+	if v, ok := col.StringValue(rowIdx); ok {
+		return v, true
+	}
+	if v, ok := col.Uint64Value(rowIdx); ok {
+		return v, true
+	}
+	if v, ok := col.Int64Value(rowIdx); ok {
+		return v, true
+	}
+	if v, ok := col.Float64Value(rowIdx); ok {
+		return v, true
+	}
+	if v, ok := col.BoolValue(rowIdx); ok {
+		return v, true
+	}
+	return nil, false
+}
 
 // storageReaderProvider adapts tempoStorage to blockpack.ReaderProvider for a single fixed file.
 type storageReaderProvider struct {

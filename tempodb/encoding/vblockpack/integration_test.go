@@ -578,6 +578,44 @@ func TestEndToEndTraceFlow(t *testing.T) {
 	}
 }
 
+// TestWALBlockFlushIdempotent verifies that calling Flush() twice does not panic.
+// Regression test for: second Flush() panics on w.buf.Bytes() after w.buf was
+// set to nil by the first Flush(). Fixed by also setting w.writer = nil.
+func TestWALBlockFlushIdempotent(t *testing.T) {
+	tmpDir := t.TempDir()
+	meta := backend.NewBlockMeta("test-tenant", uuid.New(), VersionString)
+
+	block, err := createWALBlock(meta, tmpDir, time.Minute)
+	if err != nil {
+		t.Fatalf("createWALBlock: %v", err)
+	}
+
+	trace := &tempopb.Trace{
+		ResourceSpans: []*tempotrace.ResourceSpans{
+			{ScopeSpans: []*tempotrace.ScopeSpans{
+				{Spans: []*tempotrace.Span{{
+					TraceId: make([]byte, 16),
+					SpanId:  make([]byte, 8),
+					Name:    "test",
+				}}},
+			}},
+		},
+	}
+	if err := block.AppendTrace(make([]byte, 16), trace, 0, 1, false); err != nil {
+		t.Fatalf("AppendTrace: %v", err)
+	}
+
+	// First flush — should succeed and write file.
+	if err := block.Flush(); err != nil {
+		t.Fatalf("first Flush: %v", err)
+	}
+
+	// Second flush — must not panic and must return nil.
+	if err := block.Flush(); err != nil {
+		t.Fatalf("second Flush: %v", err)
+	}
+}
+
 // TestMultipleBlocksSearch tests search operations across multiple blocks
 func TestMultipleBlocksSearch(t *testing.T) {
 	tmpDir := t.TempDir()

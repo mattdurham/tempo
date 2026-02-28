@@ -785,7 +785,6 @@ type BlockMeta struct {
 	MinStartNanos uint64 // Earliest span start time (unix nanos)
 	MaxStartNanos uint64 // Latest span start time (unix nanos)
 	TotalSpans    int    // Total number of spans across all blocks
-	TotalTraces   int    // Total number of unique trace IDs in the file
 	BlockCount    int    // Number of blocks in the file
 	Size          int64  // File size in bytes
 }
@@ -843,7 +842,6 @@ func GetBlockMeta(path string, storage Storage) (meta *BlockMeta, err error) {
 		MinStartNanos: minStart,
 		MaxStartNanos: maxStart,
 		TotalSpans:    totalSpans,
-		TotalTraces:   r.TraceCount(),
 		BlockCount:    r.BlockCount(),
 		Size:          size,
 	}, nil
