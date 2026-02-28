@@ -29,7 +29,6 @@ const BlockKindLeaf BlockKind = 0
 
 // BlockMeta holds the parsed block index entry.
 type BlockMeta struct {
-	ValueStats      []AttributeStatEntry
 	Offset          uint64
 	Length          uint64
 	MinStart        uint64
@@ -39,37 +38,6 @@ type BlockMeta struct {
 	MinTraceID      [16]byte
 	MaxTraceID      [16]byte
 	Kind            BlockKind
-}
-
-// AttributeStatEntry is one per-attribute stat in a block index entry.
-type AttributeStatEntry struct {
-	Name       string
-	StringMin  string
-	StringMax  string
-	Int64Min   int64
-	Int64Max   int64
-	Float64Min float64
-	Float64Max float64
-	StatsType  uint8 // 0=None 1=String 2=Int64 3=Float64 4=Bool
-	BoolMin    bool
-	BoolMax    bool
-}
-
-// ColumnStats captures min/max for block pruning.
-type ColumnStats struct {
-	StringMin string
-	StringMax string
-	BytesMin  []byte
-	BytesMax  []byte
-	IntMin    int64
-	IntMax    int64
-	UintMin   uint64
-	UintMax   uint64
-	FloatMin  float64
-	FloatMax  float64
-	BoolMin   bool
-	BoolMax   bool
-	HasValues bool
 }
 
 // AttrValue is a typed attribute value.

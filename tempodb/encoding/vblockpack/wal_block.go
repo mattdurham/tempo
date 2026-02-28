@@ -3,6 +3,7 @@ package vblockpack
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -87,7 +88,8 @@ func (w *walBlock) initWriter() error {
 		return fmt.Errorf("failed to create directory: %w", err)
 	}
 
-	w.buf = new(bytes.Buffer)
+	// Pre-allocate 32 MiB to reduce buffer doubling during span ingestion.
+	w.buf = bytes.NewBuffer(make([]byte, 0, 32<<20))
 	writer, err := blockpack.NewWriter(w.buf, 2000)
 	if err != nil {
 		return fmt.Errorf("failed to create blockpack writer: %w", err)
@@ -119,13 +121,19 @@ func (w *walBlock) Flush() error {
 	data := w.buf.Bytes()
 
 	// Write to disk
-	filepath := w.path + "/" + DataFileName
-	if err := os.WriteFile(filepath, data, 0644); err != nil {
+	filePath := w.path + "/" + DataFileName
+	if err := os.WriteFile(filePath, data, 0644); err != nil {
 		return fmt.Errorf("failed to write blockpack file: %w", err)
 	}
 
 	// Update metadata with actual size
 	w.meta.Size_ = uint64(len(data))
+
+	// Release the in-memory buffer and writer — data is now on disk.
+	// Setting writer = nil means a subsequent Flush() call returns early
+	// at the w.writer == nil guard instead of panicking on w.buf.Bytes().
+	w.buf = nil
+	w.writer = nil
 
 	return nil
 }
@@ -147,27 +155,33 @@ func (w *walBlock) Iterator() (common.Iterator, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	// Flush to get final data
 	if w.writer == nil {
 		return &emptyIterator{}, nil
 	}
 
-	data, err := w.writer.Flush()
-	if err != nil {
-		return nil, fmt.Errorf("failed to flush for iterator: %w", err)
+	var data []byte
+
+	if w.buf != nil {
+		// Buffer still live — flush and read from it directly.
+		if _, err := w.writer.Flush(); err != nil {
+			return nil, fmt.Errorf("failed to flush for iterator: %w", err)
+		}
+		data = w.buf.Bytes()
+	} else {
+		// Buffer was released by Flush() — read the file from disk.
+		var err error
+		data, err = os.ReadFile(w.path + "/" + DataFileName)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read blockpack file for iterator: %w", err)
+		}
 	}
 
-	// Open as reader to iterate
-	provider := &bytesReaderProvider{data: data}
-	reader, err := blockpack.NewReaderFromProvider(provider)
+	reader, err := blockpack.NewReaderFromProvider(&bytesReaderProvider{data: data})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create reader: %w", err)
 	}
 
-	return &blockpackIterator{
-		reader: reader,
-		// TODO: Initialize iterator state for block traversal
-	}, nil
+	return newBlockpackIterator(reader)
 }
 
 // Clear clears the WAL block
@@ -233,25 +247,69 @@ func (w *walBlock) Validate(ctx context.Context) error {
 	return nil
 }
 
-// blockpackIterator iterates through blockpack data
+// blockpackTrace holds pre-collected spans for a single trace.
+type blockpackTrace struct {
+	id      common.ID
+	matches []blockpack.SpanMatch
+}
+
+// blockpackIterator iterates through blockpack data, yielding one trace per Next call.
 type blockpackIterator struct {
-	reader *blockpack.Reader
-	// TODO: Add state for iterating through blocks and spans
-	// Will need to reconstruct traces from spans during iteration
+	traces []blockpackTrace
+	idx    int
 }
 
-// Next returns the next trace
-func (i *blockpackIterator) Next(ctx context.Context) (common.ID, *tempopb.Trace, error) {
-	// TODO: Iterate through blockpack blocks and spans
-	// Reconstruct traces from spans
-	// Group spans by trace ID
-	return nil, nil, io.EOF
+// newBlockpackIterator eagerly loads all spans from reader, groups by trace ID,
+// and returns an iterator ready for sequential consumption.
+func newBlockpackIterator(reader *blockpack.Reader) (*blockpackIterator, error) {
+	byTrace := make(map[string][]blockpack.SpanMatch)
+	var traceOrder []string
+
+	err := blockpack.StreamTraceQL(reader, "{}", blockpack.QueryOptions{}, func(match *blockpack.SpanMatch) bool {
+		if _, exists := byTrace[match.TraceID]; !exists {
+			traceOrder = append(traceOrder, match.TraceID)
+		}
+		byTrace[match.TraceID] = append(byTrace[match.TraceID], match.Clone())
+		return true
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to stream spans: %w", err)
+	}
+
+	traces := make([]blockpackTrace, 0, len(byTrace))
+	for _, traceIDHex := range traceOrder {
+		traceIDBytes, decErr := hex.DecodeString(traceIDHex)
+		if decErr != nil || len(traceIDBytes) != 16 {
+			continue
+		}
+		traces = append(traces, blockpackTrace{
+			id:      common.ID(traceIDBytes),
+			matches: byTrace[traceIDHex],
+		})
+	}
+
+	return &blockpackIterator{traces: traces}, nil
 }
 
-// Close closes the iterator
-func (i *blockpackIterator) Close() {
-	// Nothing to close for in-memory reader
+// Next returns the next trace from the iterator.
+func (i *blockpackIterator) Next(_ context.Context) (common.ID, *tempopb.Trace, error) {
+	if i.idx >= len(i.traces) {
+		return nil, nil, io.EOF
+	}
+
+	t := i.traces[i.idx]
+	i.idx++
+
+	trace, err := reconstructTrace(t.id, t.matches)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to reconstruct trace: %w", err)
+	}
+
+	return t.id, trace, nil
 }
+
+// Close releases iterator resources.
+func (i *blockpackIterator) Close() {}
 
 // emptyIterator is used when there's no data
 type emptyIterator struct{}

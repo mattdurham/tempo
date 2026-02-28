@@ -264,8 +264,8 @@ has the corresponding field):
 
 ### New column type
 
-1. Add constant to `internal/types`.
-2. Add alias in `writer/types.go` and `reader/types.go`.
+1. Add constant to `shared/types.go`.
+2. Add any required aliases/usages in the writer and reader packages.
 3. Add `set*` method on Writer (`writer_span.go`).
 4. Add `columnBuilder` case in `writer/column_builder.go` (`newColumnBuilder` + `buildData`).
 5. Add matching decoder in `reader/column.go` (`decodeDictionaryColumn` switch).

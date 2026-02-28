@@ -24,8 +24,6 @@ The public API (`api.go`) is minimal and intentionally small — all implementat
 
 ## internal/ packages — modification rules
 
-**DO NOT edit `internal/arena/` under any circumstances.** It is a low-latency arena allocator with hand-tuned memory layouts and unsafe operations. Changes can silently corrupt memory or destroy performance characteristics.
-
 All other `internal/` packages may be edited as needed.
 
 ## Code Quality & Pre-Commit Checks (STRICT ENFORCEMENT)
@@ -134,12 +132,10 @@ Monitor these metrics when touching I/O code:
 | `internal/blockio/writer/` | Columnar write path; adaptive encodings per column type |
 | `internal/blockio/reader/` | Columnar read path; block cache; block index lookup |
 | `internal/blockio/shared/` | Shared provider interfaces, LRU/shard caches, RLE index |
-| `internal/encodings/` | Delta, dictionary, XOR, prefix, inline encodings |
 | `internal/executor/` | Query executor; block selection; predicate extraction |
 | `internal/vm/` | Stack-based bytecode VM; TraceQL/metrics compiler |
 | `internal/traceqlparser/` | TraceQL parser (filter + metrics queries) |
 | `internal/tempoapi/` | Tempo-compatible API: FindTraceByID, SearchTags, GetBlockMeta |
-| `internal/arena/` | Low-latency arena allocator for query-time allocations |
 | `internal/blockio/compaction/` | Multi-file compaction with size-bounded output |
 | `cmd/mcp-server/` | Project MCP server (architecture, requirements, precommit tools) |
 | `benchmark/` | Real-world and format comparison benchmarks |

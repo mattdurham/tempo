@@ -34,7 +34,12 @@ type Writer struct {
 	// decoding is deferred to addRowFromProto at flush time.
 	pending    []pendingSpan
 	blockMetas []shared.BlockMeta
-	colIndexes []columnIndexBlock
+
+	// pending holds lightweight sort records (~88 bytes each: sort keys + proto pointers).
+	// protoRoots holds the TracesData proto roots that keep the sub-objects (rs/ss/span)
+	// referenced by pending entries alive in the GC. Without protoRoots, the GC could
+	// collect the proto tree while pending still holds pointers into it.
+	// After flushBlocks() clears pending, protoRoots is also cleared to release memory.
 
 	// protoRoots anchors TracesData protos (and synthetic ResourceSpans for AddSpan)
 	// until flushBlocks() processes all pending spans referencing them.
@@ -47,10 +52,15 @@ type Writer struct {
 
 	cfg Config
 
+	// inUse is a concurrency guard: AddSpan, AddTracesData, and Flush each do
+	// CompareAndSwap(false, true) on entry and panic if the swap fails, detecting
+	// concurrent callers. The Writer is documented as NOT thread-safe (NOTES §9).
 	inUse atomic.Bool
 }
 
 // countingWriter wraps io.Writer and tracks total bytes written.
+// This is needed because io.Writer has no built-in byte count; Flush() returns
+// the total bytes written as its first return value.
 type countingWriter struct {
 	w     io.Writer
 	total int64
@@ -73,9 +83,6 @@ func NewWriterWithConfig(cfg Config) (*Writer, error) {
 	}
 	if cfg.MaxBlockSpans == 0 {
 		cfg.MaxBlockSpans = defaultMaxBlockSpans
-	}
-	if cfg.BlockTargetBytes == 0 {
-		cfg.BlockTargetBytes = defaultBlockTargetBytes
 	}
 	// Default auto-flush at 5× block size. Caps live proto memory to one batch of
 	// 5 blocks while preserving enough lookahead for MinHash sort quality.
@@ -151,6 +158,9 @@ func (w *Writer) AddSpan(
 }
 
 // AddTracesData buffers all spans from a TracesData message.
+// Use this when you already have a TracesData proto (e.g. from an OTLP pipeline) —
+// it avoids synthesizing a wrapper proto. Use AddSpan when building spans
+// individually or from non-proto sources (maps, structs).
 func (w *Writer) AddTracesData(td *tracev1.TracesData) error {
 	if td == nil {
 		return nil
@@ -226,17 +236,16 @@ func (w *Writer) Flush() (int64, error) {
 	// 2. Record metadata offset.
 	metadataOffset := uint64(w.out.total) //nolint:gosec // safe: total bytes written fits in int64 and int64 fits in uint64 for file offsets
 
-	// 3. Compute KLL boundaries from the already-built range index (two-pass).
-	rangeIdx := w.rangeIdx
-	rangeGKL := buildKLLFromRangeIndex(rangeIdx)
-	applyRangeBuckets(rangeIdx, &rangeGKL, defaultRangeBuckets)
+	// 3. Apply KLL bucket boundaries to the range index.
+	// KLL sketches were built incrementally in buildAndWriteBlock (one Add per
+	// block min and max), so no re-scan is needed here.
+	applyRangeBuckets(w.rangeIdx, defaultRangeBuckets)
 
 	// 4. Write metadata section.
 	metaBytes, err := buildMetadataSectionBytes(
 		shared.VersionV11,
 		w.blockMetas,
-		rangeIdx,
-		w.colIndexes,
+		w.rangeIdx,
 		w.traceIndex,
 	)
 	if err != nil {
@@ -271,7 +280,6 @@ func (w *Writer) Flush() (int64, error) {
 	// 8. Reset ALL state.
 	w.pending = w.pending[:0]
 	w.blockMetas = nil
-	w.colIndexes = nil
 	for k := range w.rangeIdx {
 		delete(w.rangeIdx, k)
 	}
@@ -294,7 +302,6 @@ func (w *Writer) writeEmptyFile() (int64, error) {
 		shared.VersionV11,
 		nil,
 		rIdx,
-		nil,
 		w.traceIndex,
 	)
 	if err != nil {
@@ -325,63 +332,49 @@ func (w *Writer) writeEmptyFile() (int64, error) {
 }
 
 // buildAndWriteBlock builds one block from pending[0:end], writes it to the output, and
-// records BlockMeta, columnIndexBlock, range index entries, and traceIndex refs.
+// records BlockMeta, range index entries, and traceIndex refs.
 func (w *Writer) buildAndWriteBlock(blockID int, pending []pendingSpan) error {
-	// Pass len(pending) so newBlockBuilder can pre-allocate intrinsic column builder
-	// value/present slices to the exact required capacity, eliminating growslice calls.
-	bb := newBlockBuilder(len(pending))
-
-	for rowIdx := range pending {
-		bb.addRowFromProto(&pending[rowIdx], rowIdx)
-	}
-
 	blockOffset := uint64(w.out.total) //nolint:gosec // safe: total bytes written fits in int64 and int64 fits in uint64 for file offsets
 
-	payload, colIdx, err := bb.finalize(w.enc)
+	built, err := buildBlock(pending, w.enc)
 	if err != nil {
 		return fmt.Errorf("writer: block %d finalize: %w", blockID, err)
 	}
 
-	if _, err = w.out.Write(payload); err != nil {
+	if _, err = w.out.Write(built.payload); err != nil {
 		return fmt.Errorf("writer: block %d write: %w", blockID, err)
 	}
 
 	// Record BlockMeta.
 	meta := shared.BlockMeta{
 		Offset:          blockOffset,
-		Length:          uint64(len(payload)),
+		Length:          uint64(len(built.payload)),
 		Kind:            shared.BlockKindLeaf,
-		SpanCount:       uint32(bb.spanCount), //nolint:gosec // safe: spanCount bounded by MaxBlockSpans (65535)
-		MinStart:        bb.minStart,
-		MaxStart:        bb.maxStart,
-		MinTraceID:      bb.minTraceID,
-		MaxTraceID:      bb.maxTraceID,
-		ColumnNameBloom: bb.bloom,
+		SpanCount:       uint32(built.spanCount), //nolint:gosec // safe: spanCount bounded by MaxBlockSpans (65535)
+		MinStart:        built.minStart,
+		MaxStart:        built.maxStart,
+		MinTraceID:      built.minTraceID,
+		MaxTraceID:      built.maxTraceID,
+		ColumnNameBloom: built.bloom,
 	}
 	w.blockMetas = append(w.blockMetas, meta)
-	w.colIndexes = append(w.colIndexes, colIdx)
 
-	// Update range index directly: O(n) map inserts, no sort needed.
+	// Update range index: one entry per column per block (O(columns_per_block)).
+	// Feed min and max into the column's KLL sketch and record the blockRange.
 	bid := uint32(blockID) //nolint:gosec // safe: blockID bounded by MaxBlocks (100_000), fits uint32
-	for _, dv := range bb.rangeVals {
-		cd, ok := w.rangeIdx[dv.colName]
+	for _, mm := range built.colMinMax {
+		cd, ok := w.rangeIdx[mm.colName]
 		if !ok {
-			cd = &rangeColumnData{
-				values:  make(map[string][]uint32),
-				colType: dv.colType,
-			}
-			w.rangeIdx[dv.colName] = cd
+			cd = newRangeColumnData(mm.colType)
+			w.rangeIdx[mm.colName] = cd
 		}
-		blockIDs := cd.values[dv.key]
-		if len(blockIDs) == 0 || blockIDs[len(blockIDs)-1] != bid {
-			cd.values[dv.key] = append(blockIDs, bid)
-		}
+		addBlockRangeToColumn(cd, mm, bid)
 	}
 
-	// Update the file-level trace index using bb.traceRows, which is already
+	// Update the file-level trace index using built.traceRows, which is already
 	// populated by addRowFromProto. This avoids the redundant blockTraceRows map that
 	// previously duplicated the same data.
-	for tid, rowIdxs := range bb.traceRows {
+	for tid, rowIdxs := range built.traceRows {
 		w.traceIndex[tid] = append(w.traceIndex[tid], traceBlockRef{
 			blockID:     uint16(blockID), //nolint:gosec // safe: blockID bounded by MaxBlocks (100_000) fits uint16 per block limit
 			spanIndices: rowIdxs,
@@ -392,7 +385,7 @@ func (w *Writer) buildAndWriteBlock(blockID int, pending []pendingSpan) error {
 }
 
 // flushBlocks sorts w.pending, writes all pending blocks to the output, and resets w.pending to empty.
-// Appends to w.blockMetas/colIndexes/traceIndex and updates w.rangeIdx incrementally.
+// Appends to w.blockMetas/traceIndex and updates w.rangeIdx incrementally.
 //
 // Called automatically by AddSpan/AddTracesData when len(w.pending) >= cfg.MaxBufferedSpans,
 // and called by Flush() to process any remaining buffered spans before writing metadata.
@@ -413,21 +406,7 @@ func (w *Writer) flushBlocks() error {
 
 	blockStart := 0
 	for blockStart < len(w.pending) {
-		blockEnd := blockStart
-		estimatedSize := int64(0)
-		blockRowCount := 0
-
-		for blockEnd < len(w.pending) {
-			if blockRowCount >= w.cfg.MaxBlockSpans {
-				break
-			}
-			if estimatedSize >= w.cfg.BlockTargetBytes && blockRowCount > 0 {
-				break
-			}
-			estimatedSize += estimatedBytesPerSpan
-			blockEnd++
-			blockRowCount++
-		}
+		blockEnd := min(blockStart+w.cfg.MaxBlockSpans, len(w.pending))
 
 		blockID := len(w.blockMetas) // globally sequential: blockMetas accumulates across calls
 		if err := w.buildAndWriteBlock(blockID, w.pending[blockStart:blockEnd]); err != nil {
@@ -442,7 +421,7 @@ func (w *Writer) flushBlocks() error {
 		blockStart = blockEnd
 	}
 
-	// Clear pending span buffer. blockMetas, colIndexes, traceIndex, rangeIdx
+	// Clear pending span buffer. blockMetas, traceIndex, rangeIdx
 	// accumulate across flushBlocks() calls and are consumed once at Flush().
 	clear(w.pending)
 	w.pending = w.pending[:0]
@@ -458,14 +437,14 @@ func (w *Writer) flushBlocks() error {
 }
 
 // buildMetadataSectionBytes serializes the metadata section to a byte slice.
-// The metadata section is the four sub-sections concatenated directly, with no
-// length prefixes between them. The reader parses them sequentially using the
-// counts embedded in each section header (block_count, range_count, etc.).
+// Sections are concatenated directly with no length prefixes; the reader parses
+// them sequentially using the counts embedded in each section header.
+// Column index section (§5.3) is written as block_count × uint32(0) for format
+// compatibility with existing readers; the per-column entry data is no longer written.
 func buildMetadataSectionBytes(
 	version uint8,
 	blockMetas []shared.BlockMeta,
 	rIdx rangeIndex,
-	colIndexes []columnIndexBlock,
 	traceIndex map[[16]byte][]traceBlockRef,
 ) ([]byte, error) {
 	blockIdxData, err := writeBlockIndexSection(nil, version, blockMetas)
@@ -478,21 +457,21 @@ func buildMetadataSectionBytes(
 		return nil, err
 	}
 
-	colIdxData, err := writeColumnIndexSection(nil, colIndexes)
-	if err != nil {
-		return nil, err
-	}
-
 	traceIdxData, err := writeTraceBlockIndexSection(nil, traceIndex)
 	if err != nil {
 		return nil, err
 	}
 
-	totalSize := len(blockIdxData) + len(dedIdxData) + len(colIdxData) + len(traceIdxData)
+	// Column index (§5.3): write block_count × col_count=0 for format compatibility.
+	// Per-column entry data is no longer written (dead data removed 2026-02-27).
+	colIdxSize := len(blockMetas) * 4
+	totalSize := len(blockIdxData) + len(dedIdxData) + colIdxSize + len(traceIdxData)
 	buf := make([]byte, 0, totalSize)
 	buf = append(buf, blockIdxData...)
 	buf = append(buf, dedIdxData...)
-	buf = append(buf, colIdxData...)
+	for range len(blockMetas) {
+		buf = append(buf, 0, 0, 0, 0) // col_count[4 LE] = 0
+	}
 	buf = append(buf, traceIdxData...)
 
 	return buf, nil

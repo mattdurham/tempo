@@ -10,7 +10,7 @@ byte positions within the file unless noted as relative to a block start.
 
 ```
 ╔══════════════════════════════════════════════════════════════════════════════════════╗
-║                        BLOCKPACK FILE FORMAT  (v11 / footer v3)                     ║
+║                        BLOCKPACK FILE FORMAT  (v11+ / footer v3)                    ║
 ╠══════════════════════════════════════════════════════════════════════════════════════╣
 ║  byte 0                                                                              ║
 ║  ┌────────────────────────────────────────────────────────────────────────────────┐ ║
@@ -18,17 +18,14 @@ byte positions within the file unless noted as relative to a block start.
 ║  │  ┌──────────────────────────────────────────────────────────────────────────┐  │ ║
 ║  │  │ BLOCK HEADER  (24 bytes)                                                  │  │ ║
 ║  │  │  magic[4]=0xC011FEA1 · version[1] · reserved[3]                          │  │ ║
-║  │  │  span_count[4] · col_count[4] · trace_count[4] · trace_table_len[4]      │  │ ║
+║  │  │  span_count[4] · col_count[4] · reserved2[8]                             │  │ ║
 ║  │  ├──────────────────────────────────────────────────────────────────────────┤  │ ║
 ║  │  │ COLUMN METADATA  (col_count × entry)                                      │  │ ║
 ║  │  │  name_len[2] · name · type[1]                                             │  │ ║
-║  │  │  data_offset[8] · data_len[8] · stats_offset[8] · stats_len[8]           │  │ ║
+║  │  │  data_offset[8] · data_len[8] · reserved[16] (stats_offset/len, always 0)│  │ ║
 ║  │  │  ↑ repeated col_count times, sorted by column name                        │  │ ║
 ║  │  ├──────────────────────────────────────────────────────────────────────────┤  │ ║
-║  │  │ COLUMN STATS  (one blob per column, same order as metadata)               │  │ ║
-║  │  │  has_values[1]  (if 1: type-specific min + max fields follow)             │  │ ║
-║  │  ├──────────────────────────────────────────────────────────────────────────┤  │ ║
-║  │  │ COLUMN DATA  (one encoded blob per span-level column)                     │  │ ║
+║  │  │ COLUMN DATA  (one encoded blob per column)                                │  │ ║
 ║  │  │  enc_version[1]=2 · encoding_kind[1]                                      │  │ ║
 ║  │  │                                                                            │  │ ║
 ║  │  │  kind 1/2   Dictionary    index_width[1] · dict_zstd[4+N]                │  │ ║
@@ -50,10 +47,6 @@ byte positions within the file unless noted as relative to a block start.
 ║  │  │                                                                            │  │ ║
 ║  │  │  presence_rle = rle_len[4] · rle_data  (bitset: bit i set = row i present)│  │ ║
 ║  │  │  odd kinds = dense · even kinds = sparse (only present rows stored)        │  │ ║
-║  │  ├──────────────────────────────────────────────────────────────────────────┤  │ ║
-║  │  │ TRACE TABLE  (only if trace_count > 0)                                    │  │ ║
-║  │  │  trace_count[4] · col_count[4]                                            │  │ ║
-║  │  │  per column: name_len[2] · name · type[1] · data_len[4] · data           │  │ ║
 ║  │  └──────────────────────────────────────────────────────────────────────────┘  │ ║
 ║  ├─ BLOCK 1 (same structure) ────────────────────────────────────────────────────┤ ║
 ║  ├─ ...                                                                            │ ║
@@ -76,7 +69,6 @@ byte positions within the file unless noted as relative to a block start.
 ║  │    span_count[4] · min_start[8] · max_start[8]                                 │ ║
 ║  │    min_trace_id[16] · max_trace_id[16]                                          │ ║
 ║  │    column_name_bloom[32]  (256-bit bloom of column names in this block)         │ ║
-║  │    value_stats  (variable: stats_count[1] + per-attr: name · type · min·max)   │ ║
 ║  │                                                                                 │ ║
 ║  │  ── RANGE INDEX ───────────────────────────────────────────────    │ ║
 ║  │  range_count[4]                                                             │ ║
@@ -87,11 +79,8 @@ byte positions within the file unless noted as relative to a block start.
 ║  │    value_count[4]                                                               │ ║
 ║  │    per value: value_key (type-encoded) · block_id_count[4] · block_ids[N×4]    │ ║
 ║  │                                                                                 │ ║
-║  │  ── COLUMN INDEX ─────────────────────────────────────────────────────────    │ ║
-║  │  per block:                                                                     │ ║
-║  │    col_count[4]                                                                 │ ║
-║  │    per column: name_len[2] · name · offset[4] · length[4]                      │ ║
-║  │    (offset and length are relative to block payload start)                      │ ║
+║  │  ── COLUMN INDEX (stub, always empty) ────────────────────────────────────    │ ║
+║  │  per block: col_count[4] = 0                                                    │ ║
 ║  │                                                                                 │ ║
 ║  │  ── TRACE BLOCK INDEX ────────────────────────────────────────────────────    │ ║
 ║  │  fmt_version[1]=0x01 · trace_count[4]                                           │ ║
@@ -198,7 +187,7 @@ A compliant writer MUST:
    populate the Block Index in the Metadata Section.
 3. After all blocks are written, append in order:
    - File Header
-   - Metadata Section (block index + range index + column index + trace block index)
+   - Metadata Section (block index + range index + column index stub + trace block index)
    - Compact Trace Index (if present)
    - Footer
 4. Never seek backwards. The output stream is treated as append-only.
@@ -251,10 +240,14 @@ Located at `metadata_offset`, length `metadata_len`. Contains:
 
 1. **Block Index** — one entry per block in write order
 2. **Range Index** — inverted index: value → block set
-3. **Column Index** — per-block per-column byte offsets (for selective read)
+3. **Column Index stub** — always empty (col_count=0 per block); retained for format compatibility
 4. **Trace Block Index** — trace ID → block + span row indices
 
 ### 5.1 Block Index
+
+**Writer:** always written (`writeBlockIndexSection` in `writer/metadata.go`).
+**Reader:** always parsed at open time (`parseBlockIndex` in `reader/parser.go`); stored as `r.blockMetas`.
+**Query use:** all fields are actively consumed — `Offset`/`Length` drive block I/O, `SpanCount` bounds row iteration, `MinStart`/`MaxStart` prune by time range, `MinTraceID`/`MaxTraceID` prune by trace ID, `ColumnNameBloom` prunes blocks missing a queried column, `Kind` is reserved for future block types.
 
 ```
 block_count    uint32 LE       // Number of blocks
@@ -273,9 +266,8 @@ block_count    uint32 LE       // Number of blocks
 | min_trace_id    | [16]byte      | 16    | Minimum trace ID (lexicographic) |
 | max_trace_id    | [16]byte      | 16    | Maximum trace ID (lexicographic) |
 | column_name_bloom | [32]byte    | 32    | 256-bit bloom filter of column names |
-| value_stats     | ValueStats    | var   | Per-attribute value statistics (see §5.1.1) |
 
-**Total fixed: 100 bytes + ValueStats.**
+**Total fixed: 100 bytes.**
 
 #### Block Index Entry (v11 addition)
 
@@ -285,33 +277,13 @@ After `length` and before `span_count`, a single `kind` byte is inserted:
 |--------|------|-------|-------------|
 | kind   | uint8 | 1     | Block entry kind: 0 = leaf (only value in use) |
 
-**v11 layout:** offset(8) + length(8) + kind(1) + span_count(4) + min_start(8) + max_start(8) + min_trace_id(16) + max_trace_id(16) + column_name_bloom(32) + value_stats(var).
-
-#### 5.1.1 ValueStats Wire Format
-
-ValueStats contains per-attribute statistics used for block pruning.
-
-```
-stats_count    uint8     // Number of attribute stat entries
-[stats_count × AttributeStatEntry]
-```
-
-Each `AttributeStatEntry`:
-```
-name_len       uint16 LE
-name           [name_len]byte
-stats_type     uint8            // 0=None, 1=String, 2=Int64, 3=Float64, 4=Bool
-[type-specific min/max fields]
-```
-
-Stats type payload:
-- **None (0):** no additional bytes
-- **String (1):** `min_len(4 LE uint32) + min_bytes + max_len(4 LE uint32) + max_bytes`
-- **Int64 (2):** `min(8 LE int64) + max(8 LE int64)`
-- **Float64 (3):** `min_bits(8 LE uint64) + max_bits(8 LE uint64)` (IEEE 754 bit representation)
-- **Bool (4):** `min(1 uint8) + max(1 uint8)`
+**v11 layout:** offset(8) + length(8) + kind(1) + span_count(4) + min_start(8) + max_start(8) + min_trace_id(16) + max_trace_id(16) + column_name_bloom(32).
 
 ### 5.2 Range Index
+
+**Writer:** always written (`writeRangeIndexSection` in `writer/metadata.go`).
+**Reader:** scanned lazily at open time (`scanRangeIndexOffsets` in `reader/parser.go`); only the byte range of each column entry is stored (`r.rangeOffsets`). Full parsing happens on demand per column per query.
+**Query use:** actively consumed — the executor calls `GetRangeIndex(colName)` to retrieve block IDs for a given attribute value range, enabling block pruning before any I/O.
 
 Immediately follows the block index.
 
@@ -409,10 +381,12 @@ numerically, for numeric types) **less than or equal to** the smallest value in 
 bucket. Violations break the binary search at query time: if the stored key is greater than
 the query value, the search will overshoot and return no results for that bucket.
 
-Writers MUST enforce this invariant when computing bucket keys from KLL boundaries. If
-`bounds[bid] > key` for any value being remapped (which can occur when KLL sampling is
-non-representative), the writer MUST clamp the stored key to `min(bounds[bid], key)` before
-writing.
+Writers MUST use `bounds[i]` (the KLL quantile boundary) as the bucket key for all types.
+For string/bytes types, the key is truncated to `RangeBucketKeyMaxLen` bytes. Using
+`bounds[i]` directly ensures that all blocks assigned to bucket `i` share the same key,
+which is required for the reader's binary search to find all blocks in that bucket.
+The lower-bound invariant is automatically satisfied because `bounds[i]` is always ≤ the
+smallest value mapped to bucket `i` by `findBucket*`.
 
 #### 5.2.3 Bucket Distribution Requirement
 
@@ -425,39 +399,20 @@ the matching bucket(s). If one bucket contains 99% of all block IDs, the range i
 provides no meaningful pruning for the 99% of queries that land in that bucket.
 
 **How to achieve this:** The KLL sketch used to compute bucket boundaries MUST see a
-representative, unbiased sample of the column's distinct values. The writer computes KLL
-boundaries from the deduped range index (§3 of NOTES.md §17) after all blocks are
-built, rather than from per-span samples during block construction. This ensures every
-distinct value is represented and the resulting quantiles divide the value space uniformly.
+representative sample of the column's value distribution. The writer feeds per-block min
+and max values into the KLL sketch incrementally during block building (see NOTES.md §3
+and §17). At Flush time, `applyRangeBuckets` calls `kll.Boundaries` to compute bucket
+boundaries, then assigns each block to all overlapping buckets via range-overlap. This
+ensures every block's value range is represented and the resulting quantiles divide the
+value space approximately uniformly.
 
-### 5.3 Column Index
+### 5.3 Trace Block Index
 
-Immediately follows the Range Index. Contains per-block per-column byte offsets.
+**Writer:** always written (`writeTraceBlockIndexSection` in `writer/metadata.go`).
+**Reader:** always parsed at open time (`parseTraceBlockIndex` in `reader/parser.go`); stored as `r.traceIndex`. Also duplicated in the Compact Trace Index (§6) for readers that avoid parsing the full metadata.
+**Query use:** actively consumed — `BlocksForTraceID(traceID)` looks up `r.traceIndex` (or the compact index) to find which blocks contain a given trace and which row indices to fetch. Used by `FindTraceByID`.
 
-```
-[block_count × ColumnIndexBlock]
-```
-
-Each `ColumnIndexBlock`:
-```
-column_count   uint32 LE
-[column_count × ColumnIndexEntry]
-```
-
-Each `ColumnIndexEntry`:
-```
-name_len       uint16 LE
-name           [name_len]byte
-col_offset     uint32 LE    // Byte offset relative to block start
-col_length     uint32 LE    // Byte length of column data within block
-```
-
-Offsets and lengths here are relative to the block payload start (not the file start).
-Both `col_offset + col_length` must be ≤ `blockIndexEntry.length`.
-
-### 5.4 Trace Block Index
-
-Immediately follows the Column Index.
+Immediately follows the column index stub.
 
 ```
 format_version uint8         // Must equal 0x01
@@ -531,17 +486,24 @@ Each block payload is a self-contained binary blob with its own header.
 
 ### 8.1 Block Header (24 bytes)
 
+**Writer:** written as the first 24 bytes of every block (`writer/writer_block.go`).
+**Reader:** parsed by `parseBlockHeader` in `reader/block_parser.go`; `span_count` and `col_count` are used on every block read.
+**Query use:** `span_count` sets the row iteration bound; `col_count` drives the column metadata loop. `magic` and `version` are validated. `reserved` and `reserved2` are skipped.
+
 | Field          | Type       | Bytes | Offset | Description |
 |----------------|-----------|-------|--------|-------------|
 | magic          | uint32 LE | 4     | 0      | Must equal 0xC011FEA1 |
 | version        | uint8     | 1     | 4      | Block version (10 or 11) |
 | reserved       | [3]byte   | 3     | 5      | Must be zero |
 | span_count     | uint32 LE | 4     | 8      | Number of spans in this block |
-| column_count   | uint32 LE | 4     | 12     | Total number of columns (span + trace) |
-| trace_count    | uint32 LE | 4     | 16     | Number of unique traces in this block |
-| trace_table_len| uint32 LE | 4     | 20     | Byte length of the trace table at end of block |
+| column_count   | uint32 LE | 4     | 12     | Number of columns in this block |
+| reserved2      | [8]byte   | 8     | 16     | Must be zero (formerly trace_count + trace_table_len, removed) |
 
 ### 8.2 Column Metadata Array
+
+**Writer:** written after the block header, one entry per column (`writer/writer_block.go`).
+**Reader:** parsed by `parseColumnMetadataArray` in `reader/block_parser.go`; `data_offset`, `data_len`, and `col_type` are used. `stats_offset` and `stats_len` are skipped (16 bytes, always 0).
+**Query use:** actively consumed — `data_offset`/`data_len` locate each column's encoded payload; `col_type` drives decoding.
 
 Immediately follows the block header. One entry per column, `column_count` entries total.
 
@@ -551,43 +513,20 @@ name_len     uint16 LE
 name         [name_len]byte
 col_type     uint8              // ColumnType (see §7)
 data_offset  uint64 LE          // Absolute byte offset of column data (within full block payload)
-data_len     uint64 LE          // Byte length of column data; 0 = trace-level column (no span data)
-stats_offset uint64 LE          // Absolute byte offset of column stats
-stats_len    uint64 LE          // Byte length of column stats
+data_len     uint64 LE          // Byte length of column data
+reserved     [16]byte           // stats_offset[8] + stats_len[8] — always 0; retained for compat
 ```
 
-**Trace-level columns** have `data_len = 0` and `data_offset = 0`. Their data lives in the
-Trace Table at the end of the block. All offsets are relative to the start of the block
-payload (offset 0 = first byte of block magic).
+All offsets are relative to the start of the block payload (offset 0 = first byte of
+block magic). Column metadata entries are written in lexicographic order by column name.
 
-Column metadata entries are written in lexicographic order by column name. Span-level
-columns come first; trace-level columns follow.
+### 8.3 Column Data Section
 
-### 8.3 Column Stats Section
+**Writer:** written after the Column Metadata Array, one encoded blob per column (`writer/writer_block.go`).
+**Reader:** decoded on demand via the encoding-specific decoder selected by `encoding_kind` (`reader/block_parser.go`).
+**Query use:** actively consumed — the VM evaluates predicates against decoded column values for every span row that passes block-level pruning.
 
-Immediately follows the Column Metadata Array. One stats blob per column in the same order
-as the metadata entries.
-
-#### Column Stats Wire Format
-
-```
-has_values   uint8    // 1 = stats present; 0 = no values in column (remaining bytes absent)
-```
-
-If `has_values == 1`, type-specific fields follow:
-
-| Column Type | Additional bytes |
-|---|---|
-| String | `min_len(4 LE uint32) + min_bytes + max_len(4 LE uint32) + max_bytes` |
-| Bytes  | `min_len(4 LE uint32) + min_bytes + max_len(4 LE uint32) + max_bytes` |
-| Int64  | `min(8 LE int64) + max(8 LE int64)` |
-| Uint64 | `min(8 LE uint64) + max(8 LE uint64)` |
-| Float64 | `min_bits(8 LE uint64) + max_bits(8 LE uint64)` (IEEE 754 bit representation) |
-| Bool   | `min(1 uint8) + max(1 uint8)` (0=false, 1=true) |
-
-### 8.4 Column Data Section
-
-Immediately follows the Column Stats Section. One data blob per span-level column (not
+Immediately follows the Column Metadata Array. One data blob per span-level column (not
 trace-level) in the same order as the metadata entries. The absolute offset and length of
 each blob are recorded in the corresponding `ColumnMetadataEntry`.
 
@@ -598,35 +537,11 @@ encoding_version  uint8    // Must equal 2
 encoding_kind     uint8    // See §9
 ```
 
-### 8.5 Trace Table (optional)
-
-Located at `max_data_end` to `max_data_end + trace_table_len`. Only present if
-`trace_count > 0`.
-
-```
-trace_count    uint32 LE
-column_count   uint32 LE
-[column_count × TraceTableColumnEntry]
-```
-
-Each `TraceTableColumnEntry`:
-```
-name_len    uint16 LE
-name        [name_len]byte
-col_type    uint8
-data_len    uint32 LE
-data        [data_len]byte     // Same column encoding format as span columns (§8.4)
-```
-
-Trace table columns have `trace_count` rows, not `span_count`. They are expanded to
-span-level at query time using the `trace.index` span column (a uint64 column mapping
-each span row to its trace index).
-
 ---
 
 ## 9. Column Encoding Kinds
 
-All encodings begin with the 2-byte Column Encoding Header (§8.4). The encoding_kind byte
+All encodings begin with the 2-byte Column Encoding Header (§8.3). The encoding_kind byte
 determines the remainder of the wire format.
 
 ### Encoding Kind Table

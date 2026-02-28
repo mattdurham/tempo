@@ -119,18 +119,17 @@ betteralign-fix:
 	@echo "==> Struct alignment fixed!"
 
 # Run deadcode check (exercises public APIs via cmd/deadcode first)
-# Excludes: internal/xunsafe (unsafe ops), internal/arena (memory management), internal/debug (build tags), benchmark (external utility package)
+# Excludes: internal/xunsafe (unsafe ops), internal/debug (build tags), benchmark (external utility package)
 # Also excludes: internal/tempoapi (SearchTags/SearchTagValues/GetBlockMeta removed from public API)
 # Also excludes: internal/blockio sub-packages (old format reader/writer; executor removed leaving query-path methods dead)
-# Also excludes: Range*ValueKey and GetBucketIDBytes from internal/types (only called by old blockio reader query path)
 deadcode:
 	@echo "==> Running deadcode analysis..."
 	@echo "    Building cmd/deadcode to anchor public APIs..."
 	@go build -o /dev/null ./cmd/deadcode
 	@echo "    Running deadcode tool..."
-	@output=$$(deadcode -test ./... | grep -v "internal/xunsafe\|internal/arena\|internal/debug\|benchmark/\|Writer.allocBytes\|internal/modules/blockio\|internal/tempoapi\|internal/blockio\|RangeInt64ValueKey\|RangeFloat64ValueKey\|RangeBytesValueKey\|RangeStringValueKey\|GetBucketIDBytes"); \
+	@output=$$(deadcode -test ./... | grep -v "internal/xunsafe\|internal/debug\|benchmark/\|Writer.allocBytes\|internal/modules/blockio\|internal/tempoapi\|internal/blockio"); \
 	if [ -n "$$output" ]; then \
-		echo "❌ Deadcode found (excluding internal/xunsafe, internal/arena, internal/debug, benchmark, internal/modules/blockio, internal/tempoapi, internal/blockio, old-blockio Range helpers):"; \
+		echo "❌ Deadcode found (excluding internal/xunsafe, internal/debug, benchmark, internal/modules/blockio, internal/tempoapi, internal/blockio):"; \
 		echo "$$output"; \
 		exit 1; \
 	fi
@@ -471,17 +470,13 @@ $(BENCH_OUTPUT):
 	@echo "Error: $(BENCH_OUTPUT) not found. Run 'make bench' first."
 	@exit 1
 
-# Serve benchmark reports via HTTP server
+# Serve benchmark reports via Go HTTP server
 serve-report:
 	@if [ ! -f $(BENCH_HTML) ]; then \
 		echo "Error: $(BENCH_HTML) not found. Run 'make bench-report' first."; \
 		exit 1; \
 	fi
-	@echo "==> Starting HTTP server on http://0.0.0.0:10001"
-	@echo "==> Unified report: http://0.0.0.0:10001/unified_report.html"
-	@echo "==> Blockpack analysis: http://0.0.0.0:10001/traces.blockpack.analysis.html"
-	@echo "==> Press Ctrl+C to stop"
-	@cd benchmark && python3 -m http.server 10001
+	@go run ./cmd/serve-report
 
 # Build cost analysis tool
 build-cost-tool:

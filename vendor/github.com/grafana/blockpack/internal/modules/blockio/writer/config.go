@@ -6,9 +6,8 @@ import "io"
 
 // Config holds configuration parameters for a blockpack writer instance.
 type Config struct {
-	OutputStream     io.Writer
-	MaxBlockSpans    int
-	BlockTargetBytes int64
+	OutputStream  io.Writer
+	MaxBlockSpans int
 	// MaxBufferedSpans is the maximum number of spans buffered before an automatic
 	// flush of completed blocks is performed. When len(w.pending) reaches this limit,
 	// spans are sorted, encoded into blocks, and written to the output stream; the

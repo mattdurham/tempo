@@ -48,25 +48,28 @@ all spans in memory until `Flush` is called. `CurrentSize()` estimates ~2 KB per
 ---
 
 ## 3. Incremental Range Index Construction
-*Added: 2026-02-10, updated: 2026-02-26*
+*Added: 2026-02-10, updated: 2026-02-27*
 
-**Decision:** Per-span range index values are appended to a per-block flat log
-(`b.rangeVals []blockRangeValue`) during block building. After all spans in a block are
-processed, `buildAndWriteBlock` consumes `b.rangeVals` and updates `w.rangeIdx` directly
-(O(n) map inserts, deduplicating consecutive identical block IDs).
+**Decision:** During block building, `blockBuilder` tracks only the per-column minimum and
+maximum encoded key observed within the block (`b.colMinMax map[string]*blockColMinMax`).
+After each block is written, `buildAndWriteBlock` calls `addBlockRangeToColumn` once per
+column, which feeds the min and max into the column's KLL sketch (embedded in
+`rangeColumnData`) and appends a `blockRange` entry recording the [min, max] interval.
 
-**Rationale:** Building the nested `rangeIndex` map directly on the per-span hot path caused
-millions of map allocations per ingest batch. The per-block log approach:
-1. Defers map work from the per-span loop to the post-block step (called once per 2000 spans).
-2. Allows pre-allocation of `b.rangeVals` to `spanHint * 32` capacity, eliminating growslice
-   during the per-span append loop.
-3. Avoids any sort: the deduplication check `blockIDs[last] != bid` is O(1) because block IDs
-   are written in strictly ascending order.
+**Rationale:** The previous approach appended one `blockRangeValue` per span per column
+(O(spans × columns) per block), requiring pre-allocation of `spanHint * 32` capacity to
+avoid growslice. The per-column min/max approach:
+1. Reduces per-block range index work from O(spans × columns) to O(columns) — a 100-2000x
+   reduction for typical blocks with 2000 spans and 30 attributes.
+2. Eliminates the large `rangeVals` slice (was up to `2000 * 32 * ~40 bytes ≈ 2.5 MB` per
+   block), reducing peak memory during block building.
+3. Eliminates `buildKLLFromRangeIndex` (the full re-scan pass at Flush time): KLL sketches
+   are built incrementally in `addBlockRangeToColumn` alongside the `blockRange` entries.
 
-**Implication:** The range index (`w.rangeIdx`) is populated incrementally as blocks are
-written. KLL sketches and bucket boundaries are computed from it at `Flush()` time via
-`buildKLLFromRangeIndex`, after which `applyRangeBuckets` remaps exact value keys to bucket
-lower-bound keys before serialization.
+**Implication:** The range index (`w.rangeIdx`) holds per-block [min, max] ranges and
+embedded KLL sketches. At `Flush()` time, `applyRangeBuckets` calls `kll.Boundaries` to
+get bucket boundaries, then iterates `cd.blocks` to assign each block to all overlapping
+buckets via `appendUniqueBlockID`. No full re-scan of the range index is needed.
 
 ---
 
@@ -89,9 +92,9 @@ section (§5.2 in SPECS) and used at query time to map a predicate value to a bu
 **Consequence:** Bucket boundaries are approximate — two nearby values may land in different
 buckets. This only affects pruning efficiency, never correctness.
 
-**Two-pass KLL construction (see §17):** KLL is built from the deduped range index keys at
-`Flush()` time via `buildKLLFromRangeIndex`, not from per-span values during block building.
-See §17 for the full rationale.
+**Incremental KLL construction (see §17):** KLL sketches are embedded in `rangeColumnData`
+and fed two samples per block (block min and max) in `addBlockRangeToColumn`. No separate
+full-scan pass at `Flush()` time is needed. See §17 for the full rationale.
 
 ---
 
@@ -320,11 +323,12 @@ optional attributes like `span.http.method`, `span.db.statement`, etc.
 
 ---
 
-## 17. Two-Pass KLL Construction for Range Buckets
-*Added: 2026-02-25, updated: 2026-02-26*
+## 17. Incremental KLL Construction for Range Buckets
+*Added: 2026-02-25, updated: 2026-02-27*
 
-**Decision:** KLL quantile sketches are built from the unique keys in the deduped range
-index (after all blocks are written), not from per-span values during block construction.
+**Decision:** KLL quantile sketches are built incrementally alongside block writing.
+The two-pass `buildKLLFromRangeIndex` approach has been replaced with per-block min/max
+accumulation (see §3).
 
 **History:** The original KLL implementation used `idx = count % maxSamples` (deterministic
 modulo cycling), which is not reservoir sampling — it is deterministic rotation. For sorted
@@ -334,35 +338,32 @@ alphabetically-last ~10% of values. This silently broke bucket boundaries: `rema
 stored lower bounds lexicographically greater than real values, breaking the binary search
 at query time and returning zero results for valid queries.
 
-**Current state:** The KLL implementation is now a correct multi-level compaction sketch
-(see §4). It handles sorted input correctly via random halving. The deterministic-modulo bug
-no longer exists.
+**Current state:** The KLL implementation is a correct multi-level compaction sketch (see
+§4). It handles sorted input correctly via random halving. The deterministic-modulo bug no
+longer exists.
 
-**Why the two-pass approach is still kept:**
-The range index is built from unique value keys (one entry per distinct value per column
-across all blocks). Feeding these to KLL weights each distinct value equally — a value that
-appears in every span does not dominate bucket boundaries more than a rare value. This is
-semantically correct for block pruning: bucket boundaries should divide the *value space*
-uniformly, not be skewed by span frequency. Per-span streaming would overweight high-frequency
-values and cluster boundaries around them.
+**Incremental approach (`addBlockRangeToColumn`):**
+1. For each block, `blockBuilder` computes the per-column min and max encoded key.
+2. `buildAndWriteBlock` calls `addBlockRangeToColumn` for each column, which:
+   a. Appends a `blockRange{minKey, maxKey, blockID}` entry to `cd.blocks`.
+   b. Feeds `minKey` and `maxKey` (decoded to typed values) into `cd.kll*`.
+3. At `Flush()`, `applyRangeBuckets` calls `kll.Boundaries` to get bucket boundaries and
+   iterates `cd.blocks` to assign blocks to all overlapping buckets via range-overlap.
 
-**Two-pass approach (`buildKLLFromRangeIndex`):**
-1. All blocks are written; `w.rangeIdx` accumulates unique value → block-ID mappings.
-2. At `Flush()`, `buildKLLFromRangeIndex(rangeIdx)` feeds each unique key once into the
-   per-column KLL sketch. Go map iteration is randomized, so there is no systematic ordering
-   bias regardless of how the index was populated.
-3. `applyRangeBuckets` finalizes boundaries and remaps exact value keys to bucket-range keys.
-
-**Safety net (`remapStringKeys` / `remapBytesKeys`):** A safety clamp ensures every stored
-bucket key is ≤ the actual value it covers: the lower bound is `min(bounds[bid], key)`
-before truncation. This prevents any regression from silently breaking the binary search
-invariant at query time.
+**Bucket key rule:** All `applyOverlap*` functions use `bounds[i]` (the KLL quantile
+boundary) as the bucket key. For string/bytes types, the key is truncated to
+`rangeBucketKeyMaxLen` (50 bytes). Using `bounds[i]` directly ensures consistent bucket
+keys across all blocks — a prior `min(bounds[i], br.minKey)` clamp was incorrect because
+blocks spanning multiple buckets would store their min key in higher buckets, creating
+phantom entries that broke the reader's binary search.
 
 **Bucket distribution invariant:** Range buckets MUST be approximately uniformly populated.
-With `defaultRangeBuckets = 1000`, each bucket should cover roughly 0.1% of the distinct
-value space. A single bucket covering 99% of block IDs provides no pruning benefit. This
-invariant is guaranteed by the equal-weight-per-distinct-value property of two-pass
-construction combined with the correct KLL compaction algorithm.
+With `defaultRangeBuckets = 1000`, each bucket should cover roughly 0.1% of the value
+space. The incremental approach feeds only two samples per block per column into the KLL
+sketch (block min and max). For datasets with many blocks, this provides adequate quantile
+estimation. For datasets with very few blocks, `Boundaries` may return fewer than 2 entries,
+in which case `applyOverlap*` returns early and the column has no bucket index (all blocks
+are returned for any predicate on that column — correct, conservative behavior).
 
 ---
 
@@ -529,3 +530,119 @@ to reduce `[]AttrKV` heap allocations in the `AddSpan` hot path. This optimisati
 reverted in §24 after arena pointer-lifetime bugs caused `found bad pointer in Go heap` GC
 crashes in production. `parseOTLPAttrs`, `convertAnyMap`, and `otlpValueToAttr` are now the
 single heap-allocating variants used by all code paths.
+
+---
+
+## 25. Column Index (§5.3) and Column Stats (§8.3) Removed
+*Added: 2026-02-27*
+
+**Decision:** Two format sections previously identified as unused have been removed:
+- **Column Index (§5.3):** `r.columnIndexes` was parsed at reader open time but never read
+  by any query execution path. Column offsets are always taken from `block.column_metadata`
+  (§8.2) during block parsing. Writer now writes `col_count=0` per block; reader skips the
+  section without allocating (`skipColumnIndex`).
+- **Column Stats Section (§8.3):** `Column.Stats` was populated on every block read but
+  never accessed by the executor, query planner, or any other caller. Stats fields
+  (`statsOffset`, `statsLen`) still occupy 16 reserved bytes in each `ColumnMetadataEntry`
+  (always zero) for format compatibility with existing files; the reader skips them.
+
+**Size impact:** Based on pre-removal benchmarks on real Tempo trace data:
+- Column Index: ~4.1% of total file size (~1.79 bytes/span across 29M spans).
+- Column Stats: negligible in new files (zero bytes); significant savings for old files
+  that had written stats.
+
+**Format compatibility:**
+- New files: column index section bytes `block_count × uint32(0)` are written for
+  structural compatibility with old readers that expect exactly this section to be present.
+- Old files (with non-zero stats): still readable — `parseColumnMetadataArray` skips the
+  16 reserved bytes regardless of their value; the stats data at the old offsets is simply
+  ignored.
+
+**Code removed:**
+- `writer/stats.go` — all stats types (`stringStats`, `int64Stats`, `uint64Stats`,
+  `float64Stats`, `boolStats`, `bytesStats`), all accumulate functions, all encode functions.
+- `writer/column_builder.go` — `buildStats() []byte` removed from the `columnBuilder`
+  interface.
+- `writer/metadata.go` — `columnIndexBlock`, `columnIndexEntry` types, `writeColumnIndexSection`.
+- `reader/parser.go` — `columnIndexBlock`, `columnIndexEntry` types, `parseColumnIndex`;
+  replaced with `skipColumnIndex`.
+- `reader/reader.go` — `columnIndexes []columnIndexBlock` field removed.
+- `reader/block_parser.go` — `parseColumnStats`, `parseColumnStatsSection` functions,
+  `statsOffset`/`statsLen` fields from `colMetaEntry`.
+- `reader/block.go` — `Stats shared.ColumnStats` field removed from `Column`.
+- `shared/types.go` — `ColumnStats` struct removed.
+
+**Encoding decision preserved:** `uint64ColumnBuilder.buildData` uses `shouldUseDeltaEncoding`
+to choose between delta and dictionary encoding based on value range and cardinality. This
+logic previously consumed `b.stats.min`/`b.stats.max` from the now-deleted `uint64Stats`
+struct; it now uses explicit `minVal`, `maxVal`, `hasVals` fields on the builder, preserving
+identical behaviour with no intermediate stats allocation.
+
+---
+
+## 26. Block Header Trace Table and Block Index Value Statistics Removed
+*Added: 2026-02-27*
+
+Two additional structures were removed from the format as part of the filesize reduction
+work on this branch:
+
+### Block Header: Trace Table (bytes 16–23 → reserved2)
+
+**What was removed:** Bytes 16–23 of the 24-byte block header formerly stored
+`trace_count[4]` + `trace_table_len[4]`, pointing to a per-block trace table appended
+after the column data. The trace table listed the set of trace IDs present in each block,
+supporting fast trace-to-block lookup at read time.
+
+**Why removed:** Trace-to-block lookup is handled by the Trace Block Index in the metadata
+section (§5.3), which was added in v8 and is the authoritative index used by all query
+paths. The per-block trace table duplicated this information at significant cost (~20% of
+total file size across real Tempo trace data).
+
+**Format compatibility:** Bytes 16–23 are now `reserved2`, always written as zero.
+Old readers that parsed the trace table will read `trace_table_len=0` and skip the section.
+New readers skip bytes 16–23 unconditionally.
+
+**Code removed:** `writer/writer_block.go` — trace table serialization loop removed;
+`reader/block_parser.go` — `blockHeader.reserved2` comment added; `reader/block.go` —
+trace table parsing removed.
+
+### Block Index: Value Statistics Section
+
+**What was removed:** Each block index entry previously appended a variable-length Value
+Statistics section after the 98-byte fixed header. This section stored per-attribute bloom
+filters (256 bits), min/max ranges, and approximate distinct-value counts for query-time
+block pruning and selectivity estimation.
+
+**Why removed:** The block index value statistics were not consumed by any active query
+execution path. Block-level pruning uses the min/max time ranges (MinStart/MaxStart), trace
+ID range (MinTraceID/MaxTraceID), and the column name bloom filter — all in the fixed
+header. The variable-length stats section imposed parse overhead on every file open.
+
+**Format compatibility:** Old readers that expected a variable-length stats section after
+the 98-byte header will now read zero bytes of stats (the section is simply absent). The
+`block_count` and per-block fixed-header fields are unchanged; readers that handle a
+zero-length stats section parse correctly.
+
+**Code removed:** `shared/types.go` — `BlockMeta.ValueStats` field removed;
+`writer/metadata.go` — `writeBlockIndexSection` no longer appends value stats payload;
+`reader/parser.go` — value stats parsing removed from `parseV5MetadataLazy`.
+
+---
+
+## 27. WithArena Removed — Dead Code Cleanup
+*Added: 2026-02-27*
+
+**Decision:** Remove `WithArena(a *arena.Arena) Option` and the `readerOptions.arena`
+field from `internal/modules/blockio/reader/options.go`.
+
+**Rationale:** The `readerOptions.arena` field was set by `WithArena` but was never
+read by any code path in the reader (`reader.go`, `block.go`, `block_parser.go`,
+`column.go`, `parser.go`). The option was accepted and silently discarded. Since
+`internal/arena/` has been deleted (see §24 for the GC-crash history), removing this
+dead import and dead code is required for the project to compile.
+
+**Consequence:** `WithArena` is no longer available. Since it was a no-op, callers
+receive a compile error but no change in runtime behaviour. As this is `internal/`
+code, there are no external callers. §10 (Arena Allocation in Reader) documents the
+original intent of the option; that design was never implemented and is now superseded.
+Future reader arena allocation, if desired, should use `internal/modules/arena/`.

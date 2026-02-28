@@ -132,20 +132,9 @@ func (r *Reader) layoutBlock(blockIdx int, meta shared.BlockMeta) ([]FileLayoutS
 		})
 	}
 
-	// Per-column stats and data.
+	// Per-column data.
 	for _, m := range metas {
 		colType := columnTypeName(m.colType)
-
-		if m.statsLen > 0 {
-			sections = append(sections, FileLayoutSection{
-				Section:        prefix + ".column[" + m.name + "].stats",
-				ColumnName:     m.name,
-				ColumnType:     colType,
-				Offset:         base + int64(m.statsOffset), //nolint:gosec
-				CompressedSize: int64(m.statsLen),           //nolint:gosec
-				BlockIndex:     blockIdx,
-			})
-		}
 
 		if m.dataLen > 0 {
 			start := int(m.dataOffset) //nolint:gosec
@@ -164,17 +153,6 @@ func (r *Reader) layoutBlock(blockIdx int, meta shared.BlockMeta) ([]FileLayoutS
 				BlockIndex:     blockIdx,
 			})
 		}
-	}
-
-	// Trace table: last traceTableLen bytes of the block (when traces are present).
-	if hdr.traceTableLen > 0 {
-		ttLen := int64(hdr.traceTableLen) //nolint:gosec
-		sections = append(sections, FileLayoutSection{
-			Section:        prefix + ".trace_table",
-			Offset:         base + int64(meta.Length) - ttLen, //nolint:gosec
-			CompressedSize: ttLen,
-			BlockIndex:     blockIdx,
-		})
 	}
 
 	return sections, nil
@@ -232,9 +210,9 @@ func (r *Reader) layoutMetadata() ([]FileLayoutSection, error) {
 	// Column index.
 	colIdxStart := pos
 
-	_, colConsumed, err := parseColumnIndex(data[pos:], blockCount)
+	colConsumed, err := skipColumnIndex(data[pos:], blockCount)
 	if err != nil {
-		return nil, fmt.Errorf("re-parse column_index: %w", err)
+		return nil, fmt.Errorf("skip column_index: %w", err)
 	}
 
 	pos += colConsumed

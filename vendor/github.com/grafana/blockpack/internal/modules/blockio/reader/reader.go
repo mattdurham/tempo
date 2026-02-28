@@ -37,7 +37,6 @@ type Reader struct {
 
 	// Parsed during NewReaderFromProvider.
 	blockMetas    []shared.BlockMeta
-	columnIndexes []columnIndexBlock
 	metadataBytes []byte
 
 	footerFields footerRaw
@@ -257,19 +256,6 @@ func (r *Reader) HasTraceIndex() bool {
 	return len(r.traceIndex) > 0
 }
 
-// TraceCount returns the number of unique trace IDs in the file.
-// For full readers this uses the main trace index (populated during init, no extra I/Os).
-// For lean readers (compact index only) this uses the compact trace index.
-func (r *Reader) TraceCount() int {
-	if len(r.traceIndex) > 0 {
-		return len(r.traceIndex)
-	}
-	if r.compactParsed != nil {
-		return len(r.compactParsed.traceIndex)
-	}
-	return 0
-}
-
 // TraceEntry is a single trace-block reference with span indices.
 type TraceEntry struct {
 	SpanIndices []uint16
@@ -318,12 +304,7 @@ func (r *Reader) AddColumnsToBlock(bwb *BlockWithBytes, addColumns map[string]st
 		return fmt.Errorf("AddColumnsToBlock: column metadata: %w", err)
 	}
 
-	stats, err := parseColumnStatsSection(bwb.RawBytes, metas, 0)
-	if err != nil {
-		return fmt.Errorf("AddColumnsToBlock: column stats: %w", err)
-	}
-
-	for i, m := range metas {
+	for _, m := range metas {
 		if _, want := addColumns[m.name]; !want {
 			continue
 		}
@@ -346,9 +327,8 @@ func (r *Reader) AddColumnsToBlock(bwb *BlockWithBytes, addColumns map[string]st
 		}
 
 		col := &Column{
-			Name:  m.name,
-			Type:  m.colType,
-			Stats: stats[i],
+			Name: m.name,
+			Type: m.colType,
 		}
 
 		decoded, err := readColumnEncoding(bwb.RawBytes[start:end], spanCount, m.colType)

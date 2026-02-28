@@ -55,8 +55,6 @@ type columnBuilder interface {
 	// buildData returns the wire-format column blob:
 	// enc_version[1]=2 + encoding_kind[1] + payload (per SPECS §8.4).
 	buildData(enc *zstdEncoder) ([]byte, error)
-	// buildStats returns the serialized stats blob (per SPECS §8.3).
-	buildStats() []byte
 }
 
 // newColumnBuilder creates the appropriate columnBuilder for the given column type and name.

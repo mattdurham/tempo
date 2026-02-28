@@ -1,16 +1,18 @@
 package writer
 
 // NOTE: Any changes to this file must be reflected in the corresponding specs.md or NOTES.md.
-
 import (
 	"bytes"
 	"cmp"
 	"slices"
 )
 
+// k=200 yields ~0.5% quantile error (O(1/k) per KLL'16 §4) with O(k·log n) memory.
+// Raising k improves accuracy at the cost of more retained items; lowering it
+// reduces memory at the cost of coarser boundaries.
 const (
-	kllDefaultK      = 200 // accuracy parameter for numeric/string sketches
-	kllBytesDefaultK = 200 // accuracy parameter for bytes sketches
+	kllDefaultK      = 200 // accuracy parameter for numeric/string sketches (~0.5% error)
+	kllBytesDefaultK = 200 // accuracy parameter for bytes sketches (~0.5% error)
 	kllMinCap        = 8   // minimum level capacity (M in the KLL'16 paper)
 )
 

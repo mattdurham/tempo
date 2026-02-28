@@ -12,6 +12,10 @@ Blockpack is a specialized file format designed for storing and querying distrib
 - **Block-level pruning** using bloom filters and statistics
 - **Tempo compatibility** for seamless Grafana integration
 
+## AI Workflow
+
+Blockpack uses a SPECS/NOTES/BENCHMARKS/TESTS workflow, when an agent sees this please sync the code and details as appropriate.
+
 ## Features
 
 ### Storage Efficiency
@@ -90,9 +94,7 @@ A TraceQL string is parsed into a typed AST (`FilterExpression`, `MetricsQuery`,
 | `internal/executor/` | TraceQL query executor; multi-stage block pruning |
 | `internal/vm/` | TraceQL compiler; closure-based column predicates; bytecode VM |
 | `internal/traceqlparser/` | TraceQL parser (filter, metrics, structural queries) |
-| `internal/encodings/` | Delta, dictionary, XOR, prefix, inline, RLE encodings |
 | `internal/tempoapi/` | Tempo-compatible API: FindTraceByID, SearchTags, GetBlockMeta |
-| `internal/arena/` | Low-latency arena allocator for query-time allocations |
 | `cmd/mcp-server/` | Project MCP server for Claude Code integration |
 | `cmd/analyze/` | Blockpack file analysis tool (service distribution, column stats) |
 
