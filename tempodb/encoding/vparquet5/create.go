@@ -189,6 +189,12 @@ func (b *streamingBlock) Add(tr *Trace, start, end uint32) error {
 }
 
 func (b *streamingBlock) AddRaw(id []byte, row parquet.Row, start, end uint32) error {
+	return b.addRawWithSize(id, row, start, end, estimateMarshalledSizeFromParquetRow(row))
+}
+
+// addRawWithSize is like AddRaw but accepts a pre-computed estimated parquet size to avoid
+// a redundant call to estimateMarshalledSizeFromParquetRow when the caller already computed it.
+func (b *streamingBlock) addRawWithSize(id []byte, row parquet.Row, start, end uint32, estimatedSize int) error {
 	_, err := b.pw.WriteRows([]parquet.Row{row})
 	if err != nil {
 		return err
@@ -198,7 +204,7 @@ func (b *streamingBlock) AddRaw(id []byte, row parquet.Row, start, end uint32) e
 	b.bloom.Add(id)
 	b.meta.ObjectAdded(start, end)
 	b.currentBufferedTraces++
-	b.currentBufferedBytes += estimateMarshalledSizeFromParquetRow(row)
+	b.currentBufferedBytes += estimatedSize
 
 	return nil
 }

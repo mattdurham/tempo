@@ -1,0 +1,33 @@
+FROM golang:1.26-alpine AS builder
+
+ARG BINARY_NAME=tempo
+
+WORKDIR /workspace
+
+# Copy the repo (blockpack is vendored at vendor/github.com/grafana/blockpack)
+COPY . .
+
+# Build tempo using vendor directory
+RUN CGO_ENABLED=0 go build -mod=vendor -o ${BINARY_NAME} ./cmd/tempo
+
+FROM alpine:latest
+
+ARG BINARY_NAME=tempo
+ENV BINARY_NAME=${BINARY_NAME}
+
+RUN apk --no-cache add ca-certificates && \
+    addgroup -g 10001 -S tempo && \
+    adduser -u 10001 -S tempo -G tempo && \
+    mkdir -p /var/tempo && \
+    chown -R tempo:tempo /var/tempo && \
+    chmod -R 0700 /var/tempo
+
+WORKDIR /app
+
+COPY --from=builder /workspace/${BINARY_NAME} /${BINARY_NAME}
+
+USER tempo:tempo
+
+EXPOSE 3200 3201 4317 4318 4319 4320
+
+ENTRYPOINT ["sh", "-c", "exec /${BINARY_NAME} \"$@\"", "--"]

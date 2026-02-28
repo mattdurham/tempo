@@ -149,6 +149,14 @@ var (
 
 var tracer = otel.Tracer("modules/distributor")
 
+// tracePool reuses tempopb.Trace allocations across PushTraces calls to reduce GC pressure.
+// The Unmarshal call for a typical trace allocates ~100s of ResourceSpans/ScopeSpans/Span/KeyValue
+// objects; reusing the top-level Trace (and therefore its ResourceSpans backing array) cuts
+// the steady-state allocation rate significantly.
+var tracePool = sync.Pool{
+	New: func() any { return &tempopb.Trace{} },
+}
+
 // rebatchedTrace is used to more cleanly pass the set of data
 type rebatchedTrace struct {
 	id        []byte
@@ -480,14 +488,20 @@ func (d *Distributor) PushTraces(ctx context.Context, traces ptrace.Traces) (*te
 	}
 
 	// tempopb.Trace is wire-compatible with ExportTraceServiceRequest
-	// used by ToOtlpProtoBytes
-	trace := tempopb.Trace{}
+	// used by ToOtlpProtoBytes.
+	// Reuse a pooled Trace object to avoid repeated allocations of the ResourceSpans
+	// backing array on every request. We reset the slice to zero length (preserving
+	// capacity) rather than calling Reset() which would discard the backing array.
+	trace := tracePool.Get().(*tempopb.Trace)
+	trace.ResourceSpans = trace.ResourceSpans[:0]
 	err = trace.Unmarshal(convert)
 	if err != nil {
+		tracePool.Put(trace)
 		return nil, err
 	}
 
 	batches := trace.ResourceSpans
+	defer tracePool.Put(trace)
 
 	logReceivedSpans(batches, &d.cfg.LogReceivedSpans, d.logger)
 	if d.cfg.MetricReceivedSpans.Enabled {

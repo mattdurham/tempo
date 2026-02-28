@@ -1,0 +1,98 @@
+multitenancy_enabled: false
+
+partition_ring_live_store: true
+
+querier:
+  query_live_store: true
+
+server:
+  http_listen_port: 3201
+  log_level: info
+  grpc_server_max_recv_msg_size: 104857600
+  grpc_server_max_send_msg_size: 104857600
+
+distributor:
+  ingester_write_path_enabled: false
+  kafka_write_path_enabled: true
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4319
+        http:
+          endpoint: 0.0.0.0:4320
+
+live_store:
+  max_trace_live: 5m
+  max_trace_idle: 30s
+  flush_check_period: 10s
+  max_block_duration: 5m
+  partition_ring:
+    kvstore:
+      store: inmemory
+
+ingest:
+  enabled: true
+  kafka:
+    address: kafka:9092
+    topic: tempo-ingest-blockpack
+
+block_builder:
+  consume_cycle_duration: 10s
+  block:
+    version: vblockpack
+  assigned_partitions:
+    block-builder-0:
+      - 0
+
+backend_scheduler:
+  provider:
+    compaction:
+      measure_interval: 1m
+      min_cycle_interval: 30s
+      max_jobs_per_tenant: 1000
+      min_input_blocks: 2
+      max_input_blocks: 4
+      max_compaction_level: 2
+      compaction:
+        block_retention: 48h
+        compacted_block_retention: 1h
+        max_compaction_objects: 6000000
+        max_block_bytes: 107374182400
+        compaction_window: 1h
+        retention_concurrency: 10
+        max_time_per_tenant: 5m
+        compaction_cycle: 30s
+
+backend_worker:
+  compaction:
+    block_retention: 48h
+    compacted_block_retention: 1h
+    max_compaction_objects: 6000000
+    max_block_bytes: 107374182400
+    compaction_window: 1h
+    retention_concurrency: 10
+    max_time_per_tenant: 5m
+    compaction_cycle: 30s
+
+storage:
+  trace:
+    backend: s3
+    s3:
+      bucket: tempo-blockpack
+      endpoint: toxiproxy:9000
+      access_key: minioadmin
+      secret_key: minioadmin
+      insecure: true
+    block:
+      version: vblockpack
+    wal:
+      path: /var/tempo/wal
+
+overrides:
+  defaults:
+    global:
+      max_bytes_per_trace: 104857600
+    ingestion:
+      rate_limit_bytes: 104857600
+      burst_size_bytes: 104857600

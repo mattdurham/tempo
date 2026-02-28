@@ -21,6 +21,8 @@
 /tempo-vulture
 /tempodb/encoding/benchmark_block
 private-key.key
+.docker/.env
+.docker/s3-data/
 integration/**/e2e_integration_test[0-9]*
 .tempo.yaml
 /tmp
