@@ -155,24 +155,29 @@ func (w *walBlock) Iterator() (common.Iterator, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	if w.writer == nil {
-		return &emptyIterator{}, nil
-	}
-
 	var data []byte
 
-	if w.buf != nil {
-		// Buffer still live — flush and read from it directly.
+	if w.writer != nil {
+		// Writer still active (Flush not yet called) — flush now and read from buffer.
 		if _, err := w.writer.Flush(); err != nil {
 			return nil, fmt.Errorf("failed to flush for iterator: %w", err)
 		}
 		data = w.buf.Bytes()
 	} else {
-		// Buffer was released by Flush() — read the file from disk.
+		// Flush() was already called — data is on disk. Read it back.
+		// tempodb.CompleteBlockWithBackend calls Flush() then Iterator(), so
+		// this is the normal path during WAL→backend promotion.
+		filePath := w.path + "/" + DataFileName
 		var err error
-		data, err = os.ReadFile(w.path + "/" + DataFileName)
+		data, err = os.ReadFile(filePath)
+		if os.IsNotExist(err) {
+			return &emptyIterator{}, nil
+		}
 		if err != nil {
 			return nil, fmt.Errorf("failed to read blockpack file for iterator: %w", err)
+		}
+		if len(data) == 0 {
+			return &emptyIterator{}, nil
 		}
 	}
 
