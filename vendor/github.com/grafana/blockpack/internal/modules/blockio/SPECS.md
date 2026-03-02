@@ -10,7 +10,7 @@ byte positions within the file unless noted as relative to a block start.
 
 ```
 ╔══════════════════════════════════════════════════════════════════════════════════════╗
-║                        BLOCKPACK FILE FORMAT  (v11+ / footer v3)                    ║
+║                       BLOCKPACK FILE FORMAT  (v11-v12 / footer v3)                  ║
 ╠══════════════════════════════════════════════════════════════════════════════════════╣
 ║  byte 0                                                                              ║
 ║  ┌────────────────────────────────────────────────────────────────────────────────┐ ║
@@ -61,6 +61,7 @@ byte positions within the file unless noted as relative to a block start.
 ║  metadata_offset  ◄── from file header                                              ║
 ║  ┌────────────────────────────────────────────────────────────────────────────────┐ ║
 ║  │ METADATA SECTION  (metadata_len bytes)                                         │ ║
+║  │  (V12: entire section is snappy-compressed; decompress before parsing)          │ ║
 ║  │                                                                                 │ ║
 ║  │  ── BLOCK INDEX ──────────────────────────────────────────────────────────    │ ║
 ║  │  block_count[4]                                                                 │ ║
@@ -117,6 +118,7 @@ CompactIndexMagic  = 0xC01DC1DE  // 4-byte compact trace index section magic
 
 VersionV10  uint8  = 10          // Block encoding version (current minimum)
 VersionV11  uint8  = 11          // Block encoding version (adds Kind byte to block index entry)
+VersionV12  uint8  = 12          // File version: metadata section is snappy-compressed
 
 FooterV3Version uint16 = 3       // Current footer (22 bytes)
 
@@ -139,7 +141,7 @@ ColumnNameBloomBytes = 32        // Bytes in the column name bloom filter
 | MaxStringLen         | 10,485,760  | Maximum string/bytes value length (10 MB) |
 | MaxBytesLen          | 10,485,760  | Maximum bytes value length (10 MB) |
 | MaxBlockSize         | 1,073,741,824 | Maximum uncompressed block size (1 GB) |
-| MaxMetadataSize      | 104,857,600 | Maximum metadata section size (100 MB) |
+| MaxMetadataSize      | 104,857,600 | Maximum metadata section size (100 MiB) |
 | MaxTraceCount        | 1,000,000   | Maximum unique traces per block |
 | MaxNameLen           | 1,024        | Maximum column/field name length |
 | MaxCompactSectionSize| 52,428,800  | Maximum compact trace index size (50 MB) |
@@ -228,7 +230,7 @@ Located at `header_offset` from the footer.
 | Field           | Type       | Bytes | Description |
 |-----------------|-----------|-------|-------------|
 | magic           | uint32 LE | 4     | Must equal 0xC011FEA1 |
-| version         | uint8     | 1     | File version (10 or 11) |
+| version         | uint8     | 1     | File version: 10, 11, or 12 (12 = metadata section is snappy-compressed) |
 | metadata_offset | uint64 LE | 8     | Absolute byte offset of the Metadata Section |
 | metadata_len    | uint64 LE | 8     | Byte length of the Metadata Section |
 
@@ -242,6 +244,21 @@ Located at `metadata_offset`, length `metadata_len`. Contains:
 2. **Range Index** — inverted index: value → block set
 3. **Column Index stub** — always empty (col_count=0 per block); retained for format compatibility
 4. **Trace Block Index** — trace ID → block + span row indices
+
+### 5.0 V12 Metadata Encoding
+
+For files with file header `version = 12`, the `metadata_len` bytes at `metadata_offset`
+are a snappy-compressed blob. Readers MUST decompress the blob with snappy before parsing
+the sub-sections below. After decompression, the decompressed byte slice is parsed
+identically to V10/V11 metadata.
+
+The `metadata_len` field in the file header stores the **compressed** byte length (the
+on-disk size). After decompression, readers MUST validate that the decoded length does not
+exceed `MaxMetadataSize` (100 MiB) to prevent decompression-bomb attacks.
+
+Block payloads, the compact trace index, and the footer are NOT compressed; they are
+unaffected by V12. Block index entries inside the metadata section use the V11 layout
+(with the `kind` byte) even in V12 files, since block encoding is unchanged.
 
 ### 5.1 Block Index
 

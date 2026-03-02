@@ -55,6 +55,13 @@ type columnBuilder interface {
 	// buildData returns the wire-format column blob:
 	// enc_version[1]=2 + encoding_kind[1] + payload (per SPECS §8.4).
 	buildData(enc *zstdEncoder) ([]byte, error)
+	// resetForReuse clears accumulated values (preserving slice capacity) so the
+	// builder can be reused for the next block without re-allocation.
+	resetForReuse(colName string)
+	// prepare extends value and present slices to exactly nRows with zero/false values.
+	// After prepare, rowCount() == nRows and all rows are null. Present rows are then
+	// set via indexed writes, eliminating append-based null-filling entirely.
+	prepare(nRows int)
 }
 
 // newColumnBuilder creates the appropriate columnBuilder for the given column type and name.

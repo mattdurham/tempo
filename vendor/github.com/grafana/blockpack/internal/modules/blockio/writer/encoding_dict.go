@@ -43,6 +43,7 @@ func encodeDictionaryKind(
 	// Build indexes and dict payload depending on column type.
 	var indexes []uint32
 	var dictPayload []byte
+	var dictSize int
 
 	switch colType {
 	case shared.ColumnTypeString, shared.ColumnTypeRangeString:
@@ -50,36 +51,52 @@ func encodeDictionaryKind(
 		entries, idx := buildStringDict(sv, present)
 		indexes = idx
 		dictPayload = encodeStringDictPayload(entries)
+		dictSize = len(entries)
 
 	case shared.ColumnTypeInt64, shared.ColumnTypeRangeInt64, shared.ColumnTypeRangeDuration:
 		iv, _ := values.([]int64)
 		entries, idx := buildInt64Dict(iv, present)
 		indexes = idx
 		dictPayload = encodeInt64DictPayload(entries)
+		dictSize = len(entries)
 
 	case shared.ColumnTypeUint64, shared.ColumnTypeRangeUint64:
 		uv, _ := values.([]uint64)
 		entries, idx := buildUint64Dict(uv, present)
 		indexes = idx
 		dictPayload = encodeUint64DictPayload(entries)
+		dictSize = len(entries)
 
 	case shared.ColumnTypeFloat64, shared.ColumnTypeRangeFloat64:
 		fv, _ := values.([]float64)
 		entries, idx := buildFloat64Dict(fv, present)
 		indexes = idx
 		dictPayload = encodeFloat64DictPayload(entries)
+		dictSize = len(entries)
 
 	case shared.ColumnTypeBool:
 		bv, _ := values.([]bool)
 		entries, idx := buildBoolDict(bv, present)
 		indexes = idx
 		dictPayload = encodeBoolDictPayload(entries)
+		dictSize = len(entries)
 
 	default: // ColumnTypeBytes, ColumnTypeRangeBytes
 		bv, _ := values.([][]byte)
 		entries, idx := buildBytesDict(bv, present)
 		indexes = idx
 		dictPayload = encodeBytesDictPayload(entries)
+		dictSize = len(entries)
+	}
+
+	// Auto-upgrade to RLE encoding when dictionary is small enough.
+	if dictSize <= rleCardinalityThreshold {
+		switch kind {
+		case KindDictionary:
+			kind = KindRLEIndexes
+		case KindSparseDictionary:
+			kind = KindSparseRLEIndexes
+		}
 	}
 
 	// Present rows are the indexes slice (one per present row for sparse, or all rows for dense).

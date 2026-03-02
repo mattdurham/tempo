@@ -872,3 +872,235 @@ skipped with a note that these fields are not yet captured as columns.
 
 **Gap:** If `event:name` or `link:trace_id` columns are absent, this test MUST use
 `t.Skip(...)` to mark the gap so it is visible in test output.
+
+---
+
+## 14. Metadata Compression Tests (V12)
+
+### RT-MC-01: V12 round-trip — compressed metadata
+
+**Scenario:** A V12 file (snappy-compressed metadata) is written and read back
+correctly; all block index, trace index, and range index data survive compression.
+
+**Setup:**
+- Writer produces a V12 file with `MaxBlockSpans=5` and 13 spans across 3 blocks.
+- Flush to an in-memory buffer.
+
+**Assertions:**
+- `reader.BlockCount()` == 3.
+- Total span indices in the trace block index == 13 (sum across all trace block entries).
+- `BlockMeta(0).MaxStart > BlockMeta(0).MinStart`.
+- No error opening the reader.
+
+**Implementation:** `TestRoundTrip_MetadataCompression` in `reader/reader_test.go`.
+
+---
+
+### RT-BC-01: V11 backward compatibility
+
+**Scenario:** A V11 file (uncompressed metadata) opens correctly with the updated
+reader that supports both V11 and V12.
+
+**Setup:**
+- Write a single-span file using the current writer (produces V11 or V12 depending
+  on the current writer version; this test validates the older format remains readable
+  by patching the file header version to V11 or by using a stored V11 fixture).
+- For simplicity: write with the writer and verify the reader opens successfully.
+
+**Assertions:**
+- `reader.BlockCount()` == 1.
+- `reader.BlockMeta(0)` is non-nil.
+- No error.
+
+**Implementation:** `TestBackwardCompat_V11Files` in `reader/reader_test.go`.
+
+---
+
+### RT-BG-01: Decompression bomb guard
+
+**Scenario:** A crafted V12 file with a snappy varint header claiming a decoded length
+exceeding `MaxMetadataSize` (100 MiB) is rejected before any allocation.
+
+**Setup:**
+- Write a valid V12 file with one span.
+- Replace the metadata blob with a crafted snappy payload whose varint header claims
+  `MaxMetadataSize + 1` bytes of decoded output.
+- Reconstruct the file with updated header/footer offsets.
+
+**Assertions:**
+- `reader.New` returns an error.
+- Error message contains `"snappy decoded size"`.
+
+**Implementation:** `TestDecompressionBombGuard` in `reader/reader_test.go`.
+
+---
+
+## 15. File Layout Analysis Tests
+
+These tests verify `Reader.FileLayout()`, which computes a byte-level map of every
+section in a blockpack file. The core invariant is:
+`sum(section.CompressedSize) == FileSize` — every byte must be accounted for.
+
+### LAY-01: Byte invariant — single block
+
+**Scenario:** A small file with one block passes the byte invariant.
+
+**Setup:**
+- Write 8 spans with varied attribute types (string, int64, float64, bool, bytes).
+- Flush and call `FileLayout()`.
+
+**Assertions:**
+- `sum(section.CompressedSize) == report.FileSize`.
+- Sections are sorted by `Offset` ascending.
+- Required sections present: `footer`, `file_header`, `metadata.block_index`, `block[0].header`.
+- All column data sections (suffix `.data`) have `Encoding` populated.
+- All column sections with `ColumnName != ""` have `ColumnType` populated.
+- JSON round-trip preserves `FileSize`, `BlockCount`, and section count.
+
+---
+
+### LAY-02: Byte invariant — empty file
+
+**Scenario:** A file with zero spans still passes the byte invariant.
+
+**Setup:**
+- Flush an empty writer and call `FileLayout()`.
+
+**Assertions:**
+- `BlockCount == 0`.
+- `sum(section.CompressedSize) == FileSize`.
+- Required sections present: `footer`, `file_header`, `metadata.block_index`.
+
+---
+
+### LAY-03: Byte invariant — multiple blocks
+
+**Scenario:** A multi-block file passes the byte invariant.
+
+**Setup:**
+- Write 9 spans with `MaxBlockSpans = 3` (produces 3 blocks).
+- Flush and call `FileLayout()`.
+
+**Assertions:**
+- `BlockCount == reader.BlockCount()`.
+- `sum(section.CompressedSize) == FileSize`.
+- Every block has a `block[N].header` section.
+
+---
+
+
+### LAY-04: Large-scale byte accounting with compressed and uncompressed sizes
+
+**Scenario:** Build 100 traces with 500 spans each (50,000 total) and verify complete
+byte accounting including both compressed and uncompressed sizes for column data.
+
+**Setup:**
+- Generate 100 traces × 500 spans with diverse, realistic attributes:
+  - 10 service names, 4 HTTP methods, 10 status codes, 5 span kinds.
+  - String, int64, float64, bool, and bytes attribute types.
+  - Multiple resource attributes per trace.
+- Write with `MaxBlockSpans = 2000` (default) → ~25 blocks.
+- Flush and call `FileLayout()`.
+
+**Assertions:**
+- **Byte invariant:** `sum(section.CompressedSize) == FileSize`.
+- **No overlaps:** Sections sorted by offset; `prev.Offset + prev.CompressedSize <= curr.Offset` for all adjacent pairs.
+- **Column data completeness:** Every column data section (suffix `.data`) has:
+  - `CompressedSize > 0`.
+  - `UncompressedSize > 0` (inflated wire size with all zstd chunks streamed to discard).
+  - `Encoding`, `ColumnType`, and `ColumnName` populated.
+- **Block structure:** Every block has `.header`, `.column_metadata`, and at least one `.column[...].data` section.
+- **Required metadata:** `footer`, `file_header`, `metadata.block_index`, `metadata.trace_index`, `metadata.column_index` all present.
+- **JSON round-trip:** `FileSize`, `BlockCount`, `FileVersion`, section count, and all `CompressedSize`/`UncompressedSize` values survive marshal/unmarshal.
+
+---
+
+## 16. Compaction Tests
+
+These tests live in `internal/modules/blockio/compaction/compaction_test.go` and validate
+the native columnar compaction path (NOTES.md §30). Compaction reads block columns directly
+without materializing OTLP proto objects.
+
+### CT-01: Native columns — multi-block round-trip
+
+**Scenario:** Write N blocks with known span data via the writer, compact them via
+`CompactBlocks`, read back the output, and verify all column values are preserved exactly.
+
+**Setup:**
+- Write 3 blocks × 5 spans each.
+- Each span has distinct: traceID, spanID, span name, start/end times, service name,
+  `span.http.method` (string attribute), and `resource.env` (resource attribute).
+- All span and resource attributes use string values.
+- Compact all 3 blocks with `MaxSpansPerBlock=100`.
+
+**Assertions:**
+- Exactly 1 output file is produced.
+- Total span count in output == 15 (3 × 5).
+- For every input span, the compacted output contains an entry with matching:
+  - `trace:id` (16 bytes)
+  - `span:name`
+  - `span:start`, `span:end`
+  - `resource.service.name`
+  - `span.http.method`
+  - `resource.env`
+
+**Implementation:** `TestCompactBlocks_NativeColumns` in `compaction/compaction_test.go`.
+
+---
+
+### CT-02: Deduplication across blocks
+
+**Scenario:** The same span appears in two separate input blocks. Compaction must emit
+it exactly once.
+
+**Setup:**
+- Write the same single span to two separate blockpack buffers.
+- Compact both buffers via `CompactBlocks`.
+
+**Assertions:**
+- Total span count across all output blocks == 1.
+
+**Implementation:** `TestCompactBlocks_NativeColumns_Dedup` in `compaction/compaction_test.go`.
+
+---
+
+## 17. End-to-End Parity Smoke Tests
+
+These tests live in `internal/parity/` and are run both as part of `make test` (via
+`$(PACKAGES)`) and as a dedicated step in the CI workflow (`go test ./internal/parity
+-run TestParitySmokeTest`). They serve as a CI-gated canary for field-coverage
+regressions — if a new OTLP field is added, extending PST-01 is required.
+
+### PST-01: Column parity — intrinsics and all attribute types
+
+**Scenario:** Write a single span with all intrinsic fields that are captured as columns
+and all five attribute value types (string, int64, float64, bool, bytes) for span,
+resource, and scope attribute namespaces. Read back via the blockpack reader and assert
+every column value matches the written input.
+
+**Setup:**
+- Create a span with all column-mapped intrinsic fields:
+  - `TraceId`, `SpanId`, `ParentSpanId`, `Name`, `Kind`, `StartTimeUnixNano`,
+    `EndTimeUnixNano`, `TraceState`, `Status.Code`, `Status.Message`.
+- Span attributes (all 5 types): `parity.str`, `parity.int`, `parity.float`,
+  `parity.bool`, `parity.bytes`.
+- Resource attributes (all 5 types): `service.name`, `res.int`, `res.float`,
+  `res.bool`, `res.bytes`.
+- Scope attributes (all 5 types): `version` (string), `weight` (int64), `ratio`
+  (float64), `enabled` (bool), `sig` (bytes).
+- Non-empty `resourceSchemaURL` and `scopeSchemaURL`.
+- Flush and open reader.
+
+**Assertions (intrinsic columns):**
+- `trace:id`, `span:id`, `span:parent_id`, `span:name`, `span:kind`, `span:start`,
+  `span:end`, `span:duration`, `span:status`, `span:status_message`, `trace:state`,
+  `resource:schema_url`, `scope:schema_url` — each returns the written value.
+
+**Assertions (attribute columns):**
+- All 5 span attribute types, all 5 resource attribute types, all 5 scope attribute
+  types round-trip with exact value equality.
+
+**Scope of assertions:**
+- Covers all intrinsic fields that are captured as block columns.
+- Assertions for `event:name` and `link:trace_id` are added once reader support for
+  those columns is implemented.

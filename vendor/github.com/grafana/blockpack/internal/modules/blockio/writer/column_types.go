@@ -14,6 +14,29 @@ type stringColumnBuilder struct {
 	present []bool
 }
 
+func (b *stringColumnBuilder) resetForReuse(colName string) {
+	clear(b.values)  // zero string headers so GC can collect string data
+	clear(b.present) // zero present flags so prepare can extend safely
+	b.values = b.values[:0]
+	b.present = b.present[:0]
+	b.colName = colName
+}
+
+func (b *stringColumnBuilder) prepare(nRows int) {
+	if cap(b.values) >= nRows {
+		b.values = b.values[:nRows]
+		clear(b.values) // zero string headers so GC can collect old data
+	} else {
+		b.values = make([]string, nRows)
+	}
+	if cap(b.present) >= nRows {
+		b.present = b.present[:nRows]
+		clear(b.present)
+	} else {
+		b.present = make([]bool, nRows)
+	}
+}
+
 func (b *stringColumnBuilder) addString(val string, present bool) {
 	b.values = append(b.values, val)
 	b.present = append(b.present, present)
@@ -78,26 +101,7 @@ func (b *stringColumnBuilder) buildData(enc *zstdEncoder) ([]byte, error) {
 	nullRatio := float64(b.nullCount()) / float64(nRows)
 	sparse := nullRatio > sparseNullRatioThreshold
 
-	// Compute cardinality from present values.
-	seen := make(map[string]struct{}, nRows)
-	for i, v := range b.values {
-		if b.present[i] {
-			seen[v] = struct{}{}
-		}
-	}
-	cardinality := len(seen)
-
-	if cardinality <= rleCardinalityThreshold {
-		if sparse {
-			return encodeDictionaryKind(
-				KindSparseRLEIndexes, shared.ColumnTypeString, b.values, b.present, nRows, enc,
-			)
-		}
-		return encodeDictionaryKind(
-			KindRLEIndexes, shared.ColumnTypeString, b.values, b.present, nRows, enc,
-		)
-	}
-
+	// encodeDictionaryKind auto-upgrades to RLE when dictionary size ≤ rleCardinalityThreshold.
 	if sparse {
 		return encodeDictionaryKind(
 			KindSparseDictionary, shared.ColumnTypeString, b.values, b.present, nRows, enc,
@@ -113,6 +117,26 @@ func (b *stringColumnBuilder) buildData(enc *zstdEncoder) ([]byte, error) {
 type int64ColumnBuilder struct {
 	values  []int64
 	present []bool
+}
+
+func (b *int64ColumnBuilder) resetForReuse(_ string) {
+	clear(b.present)
+	b.values = b.values[:0]
+	b.present = b.present[:0]
+}
+
+func (b *int64ColumnBuilder) prepare(nRows int) {
+	if cap(b.values) >= nRows {
+		b.values = b.values[:nRows]
+	} else {
+		b.values = make([]int64, nRows)
+	}
+	if cap(b.present) >= nRows {
+		b.present = b.present[:nRows]
+		clear(b.present)
+	} else {
+		b.present = make([]bool, nRows)
+	}
 }
 
 func (b *int64ColumnBuilder) addString(_ string, _ bool)   {}
@@ -149,25 +173,7 @@ func (b *int64ColumnBuilder) buildData(enc *zstdEncoder) ([]byte, error) {
 	}
 	sparse := nullRatio > sparseNullRatioThreshold
 
-	seen := make(map[int64]struct{}, nRows)
-	for i, v := range b.values {
-		if b.present[i] {
-			seen[v] = struct{}{}
-		}
-	}
-	cardinality := len(seen)
-
-	if cardinality <= rleCardinalityThreshold {
-		if sparse {
-			return encodeDictionaryKind(
-				KindSparseRLEIndexes, shared.ColumnTypeInt64, b.values, b.present, nRows, enc,
-			)
-		}
-		return encodeDictionaryKind(
-			KindRLEIndexes, shared.ColumnTypeInt64, b.values, b.present, nRows, enc,
-		)
-	}
-
+	// encodeDictionaryKind auto-upgrades to RLE when dictionary size ≤ rleCardinalityThreshold.
 	if sparse {
 		return encodeDictionaryKind(
 			KindSparseDictionary, shared.ColumnTypeInt64, b.values, b.present, nRows, enc,
@@ -189,11 +195,52 @@ type uint64ColumnBuilder struct {
 	hasVals bool
 }
 
+func (b *uint64ColumnBuilder) resetForReuse(colName string) {
+	clear(b.present)
+	b.values = b.values[:0]
+	b.present = b.present[:0]
+	b.colName = colName
+	b.minVal = 0
+	b.maxVal = 0
+	b.hasVals = false
+}
+
+func (b *uint64ColumnBuilder) prepare(nRows int) {
+	if cap(b.values) >= nRows {
+		b.values = b.values[:nRows]
+	} else {
+		b.values = make([]uint64, nRows)
+	}
+	if cap(b.present) >= nRows {
+		b.present = b.present[:nRows]
+		clear(b.present)
+	} else {
+		b.present = make([]bool, nRows)
+	}
+}
+
 func (b *uint64ColumnBuilder) addString(_ string, _ bool)   {}
 func (b *uint64ColumnBuilder) addInt64(_ int64, _ bool)     {}
 func (b *uint64ColumnBuilder) addFloat64(_ float64, _ bool) {}
 func (b *uint64ColumnBuilder) addBool(_ bool, _ bool)       {}
 func (b *uint64ColumnBuilder) addBytes(_ []byte, _ bool)    {}
+
+// trackMinMax updates the running min/max for delta encoding decisions.
+// Called from indexed writes where addUint64 (which appends) is not appropriate.
+func (b *uint64ColumnBuilder) trackMinMax(val uint64) {
+	if !b.hasVals {
+		b.minVal = val
+		b.maxVal = val
+		b.hasVals = true
+	} else {
+		if val < b.minVal {
+			b.minVal = val
+		}
+		if val > b.maxVal {
+			b.maxVal = val
+		}
+	}
+}
 
 func (b *uint64ColumnBuilder) addUint64(val uint64, present bool) {
 	b.values = append(b.values, val)
@@ -231,17 +278,14 @@ func (b *uint64ColumnBuilder) colType() shared.ColumnType { return shared.Column
 func (b *uint64ColumnBuilder) buildData(enc *zstdEncoder) ([]byte, error) {
 	nRows := len(b.values)
 
-	// Compute cardinality.
-	seen := make(map[uint64]struct{}, nRows)
-	for i, v := range b.values {
-		if b.present[i] {
-			seen[v] = struct{}{}
+	// Cheap cardinality estimate for delta encoding decision — no map allocation.
+	// shouldUseDeltaEncoding only needs to distinguish ≤2, ≤3, and >3, so we
+	// cap at 4 distinct values using a small fixed array.
+	if b.hasVals {
+		cardinality := cheapCardinalityUint64(b.values, b.present)
+		if shouldUseDeltaEncoding(b.minVal, b.maxVal, cardinality) {
+			return encodeDeltaUint64(b.values, b.present, nRows, enc)
 		}
-	}
-	cardinality := len(seen)
-
-	if b.hasVals && shouldUseDeltaEncoding(b.minVal, b.maxVal, cardinality) {
-		return encodeDeltaUint64(b.values, b.present, nRows, enc)
 	}
 
 	nullRatio := 0.0
@@ -250,17 +294,7 @@ func (b *uint64ColumnBuilder) buildData(enc *zstdEncoder) ([]byte, error) {
 	}
 	sparse := nullRatio > sparseNullRatioThreshold
 
-	if cardinality <= rleCardinalityThreshold {
-		if sparse {
-			return encodeDictionaryKind(
-				KindSparseRLEIndexes, shared.ColumnTypeUint64, b.values, b.present, nRows, enc,
-			)
-		}
-		return encodeDictionaryKind(
-			KindRLEIndexes, shared.ColumnTypeUint64, b.values, b.present, nRows, enc,
-		)
-	}
-
+	// encodeDictionaryKind auto-upgrades to RLE when dictionary size ≤ rleCardinalityThreshold.
 	if sparse {
 		return encodeDictionaryKind(
 			KindSparseDictionary, shared.ColumnTypeUint64, b.values, b.present, nRows, enc,
@@ -271,11 +305,58 @@ func (b *uint64ColumnBuilder) buildData(enc *zstdEncoder) ([]byte, error) {
 	)
 }
 
+// cheapCardinalityUint64 counts distinct present values up to a cap of 4.
+// This is enough for shouldUseDeltaEncoding which only checks >2 and >3.
+func cheapCardinalityUint64(values []uint64, present []bool) int {
+	var distinct [4]uint64
+	count := 0
+	for i, v := range values {
+		if !present[i] {
+			continue
+		}
+		found := false
+		for j := range count {
+			if distinct[j] == v {
+				found = true
+				break
+			}
+		}
+		if !found {
+			if count == 4 {
+				return 4
+			}
+			distinct[count] = v
+			count++
+		}
+	}
+	return count
+}
+
 // ---- float64ColumnBuilder ----
 
 type float64ColumnBuilder struct {
 	values  []float64
 	present []bool
+}
+
+func (b *float64ColumnBuilder) resetForReuse(_ string) {
+	clear(b.present)
+	b.values = b.values[:0]
+	b.present = b.present[:0]
+}
+
+func (b *float64ColumnBuilder) prepare(nRows int) {
+	if cap(b.values) >= nRows {
+		b.values = b.values[:nRows]
+	} else {
+		b.values = make([]float64, nRows)
+	}
+	if cap(b.present) >= nRows {
+		b.present = b.present[:nRows]
+		clear(b.present)
+	} else {
+		b.present = make([]bool, nRows)
+	}
 }
 
 func (b *float64ColumnBuilder) addString(_ string, _ bool) {}
@@ -312,25 +393,7 @@ func (b *float64ColumnBuilder) buildData(enc *zstdEncoder) ([]byte, error) {
 	}
 	sparse := nullRatio > sparseNullRatioThreshold
 
-	seen := make(map[float64]struct{}, nRows)
-	for i, v := range b.values {
-		if b.present[i] {
-			seen[v] = struct{}{}
-		}
-	}
-	cardinality := len(seen)
-
-	if cardinality <= rleCardinalityThreshold {
-		if sparse {
-			return encodeDictionaryKind(
-				KindSparseRLEIndexes, shared.ColumnTypeFloat64, b.values, b.present, nRows, enc,
-			)
-		}
-		return encodeDictionaryKind(
-			KindRLEIndexes, shared.ColumnTypeFloat64, b.values, b.present, nRows, enc,
-		)
-	}
-
+	// encodeDictionaryKind auto-upgrades to RLE when dictionary size ≤ rleCardinalityThreshold.
 	if sparse {
 		return encodeDictionaryKind(
 			KindSparseDictionary, shared.ColumnTypeFloat64, b.values, b.present, nRows, enc,
@@ -346,6 +409,26 @@ func (b *float64ColumnBuilder) buildData(enc *zstdEncoder) ([]byte, error) {
 type boolColumnBuilder struct {
 	values  []bool
 	present []bool
+}
+
+func (b *boolColumnBuilder) resetForReuse(_ string) {
+	clear(b.present)
+	b.values = b.values[:0]
+	b.present = b.present[:0]
+}
+
+func (b *boolColumnBuilder) prepare(nRows int) {
+	if cap(b.values) >= nRows {
+		b.values = b.values[:nRows]
+	} else {
+		b.values = make([]bool, nRows)
+	}
+	if cap(b.present) >= nRows {
+		b.present = b.present[:nRows]
+		clear(b.present)
+	} else {
+		b.present = make([]bool, nRows)
+	}
 }
 
 func (b *boolColumnBuilder) addString(_ string, _ bool)   {}
@@ -399,6 +482,29 @@ type bytesColumnBuilder struct {
 	colName string
 	values  [][]byte
 	present []bool
+}
+
+func (b *bytesColumnBuilder) resetForReuse(colName string) {
+	clear(b.values)  // zero []byte headers so GC can collect byte data
+	clear(b.present) // zero present flags so prepare can extend safely
+	b.values = b.values[:0]
+	b.present = b.present[:0]
+	b.colName = colName
+}
+
+func (b *bytesColumnBuilder) prepare(nRows int) {
+	if cap(b.values) >= nRows {
+		b.values = b.values[:nRows]
+		clear(b.values) // zero []byte headers so GC can collect old data
+	} else {
+		b.values = make([][]byte, nRows)
+	}
+	if cap(b.present) >= nRows {
+		b.present = b.present[:nRows]
+		clear(b.present)
+	} else {
+		b.present = make([]bool, nRows)
+	}
 }
 
 func (b *bytesColumnBuilder) addString(_ string, _ bool)   {}

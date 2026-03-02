@@ -278,6 +278,9 @@ Two version spaces exist and must not be confused:
 A single file uses the same block version throughout. The footer version is independent
 and may evolve independently.
 
+V12 (`VersionV12 = 12`) is a container-only version: block encoding is unchanged from
+V11, but the metadata section is snappy-compressed. See §28 for rationale.
+
 ---
 
 ## 15. Column Name Bloom Filter
@@ -646,3 +649,153 @@ receive a compile error but no change in runtime behaviour. As this is `internal
 code, there are no external callers. §10 (Arena Allocation in Reader) documents the
 original intent of the option; that design was never implemented and is now superseded.
 Future reader arena allocation, if desired, should use `internal/modules/arena/`.
+
+---
+
+## 28. Snappy Metadata Compression (V12)
+*Added: 2026-02-27*
+
+**Decision:** Compress the entire metadata section as a single snappy blob. Signal via
+file version V12 (file header `version = 12`). V10/V11 files remain fully readable.
+
+**Approach:** In `Flush()` and `writeEmptyFile()` (writer.go), call
+`snappy.Encode(nil, metaBytes)` immediately after `buildMetadataSectionBytes` returns.
+Write the compressed bytes and record `len(compressed)` as `metadataLen`. Pass
+`shared.VersionV12` to `writeFileHeader`.
+
+In `parseV5MetadataLazy()` (parser.go), when `r.fileVersion == shared.VersionV12`,
+call `snappy.DecodedLen(data)` to guard against decompression bombs, then
+`snappy.Decode(nil, data)` to recover the uncompressed metadata. The decompressed slice
+is assigned to `data` before `r.metadataBytes = data`, so the lazy range index offsets
+(absolute byte positions into `r.metadataBytes`) continue to work correctly.
+
+**Why snappy and not zstd:** Snappy's decompression speed (~1.5 GB/s) is the key
+property. Metadata is read once at reader open time; CPU overhead matters more than
+compression ratio. `github.com/golang/snappy v1.0.0` is already present in go.mod as
+an indirect dependency (pulled in by Tempo), so importing it costs zero version resolution.
+
+**Why V12 version bump and not a magic prefix:** The file version already gates feature
+detection at `readHeader`. Adding `VersionV12` requires one constant and one line in the
+version check. Old readers fail cleanly with "unsupported version 12". A magic prefix
+would require changes inside the metadata section body and adds ambiguity risk.
+
+**Why entire section and not sub-sections:** The lazy range index records byte offsets
+into the full decompressed `r.metadataBytes` slice. Compressing each sub-section
+independently would require parsing section boundaries twice (before and after
+decompression) and break the lazy offset strategy. A single decompression call preserves
+all existing parsing logic unchanged.
+
+**Block headers remain V11:** Block encoding is unchanged in V12. The `version` field in
+block headers describes the block payload format, not the file container format.
+`buildBlock` in `writer_block.go` hardcodes `shared.VersionV11` (line 625). V12 files
+contain V11 block payloads. `parseBlockIndexEntry` uses `version >= shared.VersionV11`
+to read the kind byte, covering both V11 and V12 file versions.
+
+**Decompression bomb guard:** `snappy.DecodedLen(data)` is checked against
+`MaxMetadataSize` (100 MiB) before allocating the decode buffer. This prevents a
+maliciously crafted small compressed blob from forcing a huge allocation.
+
+**go.mod change:** `github.com/golang/snappy` moves from `// indirect` to a direct
+dependency. Run `go mod tidy` after adding the import.
+
+**FileLayout impact:** The `FileLayout()` reader method reports the entire compressed
+metadata blob as a single `"metadata.compressed"` section for V12 files (with
+`CompressedSize = metadataLen` and `UncompressedSize = len(metadataBytes)`). Sub-section
+breakdown is not available at physical byte granularity when metadata is compressed.
+
+---
+
+## 30. Native Column Compaction Path — Zero OTLP Allocations
+*Added: 2026-02-28*
+
+**Decision:** Compaction reads raw column values directly into `pendingSpan` and flushes
+them via `addRowFromBlock`. No OTLP proto objects (`*tracev1.Span`, `*commonv1.KeyValue`,
+`*commonv1.AnyValue`) are created during the compaction hot path.
+
+**Background:** The original compaction path routed through full OTLP proto materialization:
+```
+Block columns → *tracev1.Span + map[string]any (spanFromRow)
+             → *KV + *AnyValue per attribute (anyToKV / columnAny)
+             → synthesizeResourceSpans (more proto wrappers)
+             → AddSpan → pendingSpan
+             → addRowFromBlock → Block columns
+```
+Profiling showed this generated ~85 billion unnecessary object allocations per ingest
+window (`compaction.spanFromRow` 14.5B, `compaction.columnAny` 24.6B, `compaction.anyToKV`
+12.9B, plus downstream proto allocs) — ~24% of total lifetime allocations and a primary
+driver of GC-induced CPU spikes.
+
+**Implementation:**
+
+1. **`pendingSpan` dual-path:** Two new fields were added to `pendingSpan` in
+   `writer_block.go`:
+   - `srcBlock *modules_reader.Block` — non-nil for the columnar path; nil for the proto path
+   - `srcRowIdx int` — source row index within `srcBlock`
+   When `srcBlock != nil`, `buildBlock` dispatches to `addRowFromBlock` instead of
+   `addRowFromProto`.
+
+2. **`addRowFromBlock` method on `blockBuilder`:** Iterates `srcBlock.Columns()`, reads
+   typed values, normalizes Range types to base types via `baseColumnType()` (Range types
+   are encoding metadata, not logical type differences), clones byte slices with
+   `slices.Clone` to avoid aliasing into block memory, and calls `addPresent` for all
+   columns. Special-cases `trace:id` and `span:start` to update `traceRows`, `minStart`,
+   `maxStart`, `minTraceID`, `maxTraceID`, `spanCount` — identical bookkeeping to
+   `addRowFromProto`.
+
+3. **`AddRow(block *reader.Block, rowIdx int) error` on `Writer`:** New public method that
+   builds a `pendingSpan` with `srcBlock`/`srcRowIdx` set, calls
+   `computeMinHashSigFromBlock`, and appends to `w.pending`. No `protoRoots` anchoring is
+   needed since the block is caller-owned.
+
+4. **`computeMinHashSigFromBlock` in `writer_sort.go`:** Hashes attribute key names (with
+   namespace prefix stripped: `span.` → 5 chars, `resource.` → 9 chars, `scope.` → 6 chars)
+   using the same FNV-1a min-heap logic as `computeMinHashSigFromProto`. Only present rows
+   are hashed (checked via `col.IsPresent(rowIdx)`).
+
+5. **Compaction rewrite:** `addSpanFromBlock` in `compaction.go` now uses `dedupeKey`
+   (reads `trace:id` + `span:id` directly from block columns to build the 24-byte dedup
+   key) and calls `AddRow`. Removed entirely: `spanFromRow`, `columnAny`, `anyToKV`,
+   `cloneBytes`, and all OTLP imports (`commonv1`, `tracev1`).
+
+**Type normalization:** `baseColumnType()` maps Range variants to their base type before
+calling `addPresent`. Range types are an encoding selection detail in the block metadata
+section (§5.2); the logical value type is the base type. This matches `addRowFromProto`,
+which only uses base types.
+
+**Correctness:** `TestCompactBlocks_NativeColumns` (15 spans across 3 blocks, all column
+types verified) and `TestCompactBlocks_NativeColumns_Dedup` (deduplication of identical
+spans across blocks) validate the native path end-to-end.
+
+---
+
+## 29. FileLayout UncompressedSize for Column Data Sections
+*Added: 2026-02-27*
+
+**Decision:** `FileLayout()` now populates `UncompressedSize` on column data sections by
+walking each encoding's wire format and streaming zstd chunks to `io.Discard` to measure
+their inflated size without materializing the full decompressed payload.
+
+**Definition:** `UncompressedSize` is the total byte count of the column data blob if all
+zstd-compressed sub-sections were replaced by their decompressed contents. Non-compressed
+parts (encoding headers, presence RLE, index arrays) contribute their on-disk size as-is.
+
+**Implementation:** `columnDataUncompressedSize(data []byte)` dispatches on the encoding
+kind byte to per-kind inflated-size functions (`inflatedDictKind`, `inflatedDeltaUint64`,
+`inflatedXORBytes`, `inflatedPrefixBytes`, `inflatedDeltaDict`). Each function uses
+`inflatedZstdChunk` to stream `len[4]+zstd_data[len]` chunks to `io.Discard` and count
+the decompressed bytes — no full output buffer is allocated.
+
+**Edge case:** For small dictionary columns (few unique values), zstd frame overhead
+(~13 bytes for magic, frame header, block header) can make the compressed output larger
+than the raw data. In this case `UncompressedSize < CompressedSize` is expected and
+correct — it accurately reflects that compression was counterproductive for that chunk.
+
+**Performance:** Since `FileLayout()` is an analysis/debugging tool, streaming to
+`io.Discard` is acceptable; the output is never materialized. For a 50,000-span file
+(~25 blocks, ~500 column data sections) the total analysis time is ~250ms.
+
+**Sections without UncompressedSize:** Structural sections (footer, file_header, block
+headers, column_metadata) and metadata sections (block_index, range_index, column_index,
+trace_index) do not set `UncompressedSize` — they are stored uncompressed on disk, so
+`CompressedSize` already represents the true size. The `omitempty` JSON tag ensures these
+sections omit the field in serialized output.

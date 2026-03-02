@@ -7,6 +7,7 @@ import (
 	"sort"
 
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
+	"github.com/grafana/blockpack/internal/modules/rw"
 )
 
 // blockExtent is an internal tuple used during coalescing.
@@ -98,13 +99,13 @@ func CoalesceBlocks(metas []shared.BlockMeta, blockOrder []int, cfg shared.Coale
 
 // ReadCoalescedBlocks executes the merged I/O requests.
 // Returns a map from block index to raw block bytes.
-func ReadCoalescedBlocks(provider shared.ReaderProvider, cr []shared.CoalescedRead) (map[int][]byte, error) {
+func ReadCoalescedBlocks(provider rw.ReaderProvider, cr []shared.CoalescedRead) (map[int][]byte, error) {
 	result := make(map[int][]byte)
 
 	for i := range cr {
 		c := &cr[i]
 		buf := make([]byte, c.Length)
-		n, err := provider.ReadAt(buf, c.Offset, shared.DataTypeBlock)
+		n, err := provider.ReadAt(buf, c.Offset, rw.DataTypeBlock)
 		if err != nil {
 			return nil, fmt.Errorf("coalesced read at offset %d length %d: %w", c.Offset, c.Length, err)
 		}

@@ -5,6 +5,9 @@ package writer
 import (
 	"bytes"
 	"slices"
+	"strings"
+
+	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
 )
 
 // sortPending sorts the pending span buffer by (service.name ASC, MinHashSig ASC, TraceID ASC).
@@ -104,6 +107,54 @@ func computeMinHashSigFromProto(ps *pendingSpan) {
 			if kv != nil {
 				addHash(kv.Key)
 			}
+		}
+	}
+}
+
+// computeMinHashSigFromBlock computes a compact MinHash signature for a pendingSpan
+// sourced from a columnar block. Uses the same FNV-1a min-heap logic as
+// computeMinHashSigFromProto, but iterates block column names instead of proto attributes.
+// Only attribute columns (span.*, resource.*, scope.*) are hashed — intrinsic columns
+// (trace:id, span:id, span:start, etc.) are not included, matching the proto path behavior.
+func computeMinHashSigFromBlock(ps *pendingSpan, block *modules_reader.Block) {
+	ps.minHashSig = [4]uint64{
+		^uint64(0), ^uint64(0), ^uint64(0), ^uint64(0),
+	}
+
+	addHash := func(name string) {
+		const (
+			offset = uint64(14695981039346656037)
+			prime  = uint64(1099511628211)
+		)
+		h := offset
+		for i := range len(name) {
+			h ^= uint64(name[i])
+			h *= prime
+		}
+		v := h
+		for i := range 4 {
+			if v < ps.minHashSig[i] {
+				for j := 3; j > i; j-- {
+					ps.minHashSig[j] = ps.minHashSig[j-1]
+				}
+				ps.minHashSig[i] = v
+				break
+			}
+		}
+	}
+
+	rowIdx := ps.srcRowIdx
+	for name, col := range block.Columns() {
+		if !col.IsPresent(rowIdx) {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(name, "span."):
+			addHash(name[5:])
+		case strings.HasPrefix(name, "resource."):
+			addHash(name[9:])
+		case strings.HasPrefix(name, "scope."):
+			addHash(name[6:])
 		}
 	}
 }
