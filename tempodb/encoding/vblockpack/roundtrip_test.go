@@ -2,6 +2,7 @@ package vblockpack
 
 import (
 	"context"
+	"io"
 	"testing"
 	"time"
 
@@ -13,6 +14,78 @@ import (
 	"github.com/grafana/tempo/tempodb/encoding/common"
 	"github.com/stretchr/testify/require"
 )
+
+// TestWALToBackend_Iterator verifies the WAL→backend promotion path:
+// AppendTrace → Flush() → Iterator() → CreateBlock → FindTraceByID.
+// This catches the bug where Iterator() returned empty after Flush() set writer=nil.
+func TestWALToBackend_Iterator(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+
+	walMeta := backend.NewBlockMeta("test-tenant", uuid.New(), VersionString)
+	wal, err := createWALBlock(walMeta, tmpDir, 0)
+	require.NoError(t, err)
+
+	// Write a trace into the WAL block.
+	now := uint64(time.Now().UnixNano())
+	tr := &tempopb.Trace{
+		ResourceSpans: []*tempotrace.ResourceSpans{{
+			ScopeSpans: []*tempotrace.ScopeSpans{{
+				Spans: []*tempotrace.Span{{
+					TraceId:           []byte{1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1},
+					SpanId:            []byte{1, 0, 0, 0, 0, 0, 0, 1},
+					Name:              "wal-span",
+					StartTimeUnixNano: now,
+					EndTimeUnixNano:   now + uint64(50*time.Millisecond),
+				}},
+			}},
+		}},
+	}
+	startSec := uint32(time.Now().Unix())
+	require.NoError(t, wal.AppendTrace(nil, tr, startSec, startSec+1, false))
+
+	// Flush — mirrors what tempodb.CompleteBlockWithBackend does before calling Iterator.
+	require.NoError(t, wal.Flush())
+
+	// Iterator must return the trace even after Flush() set writer=nil.
+	iter, err := wal.Iterator()
+	require.NoError(t, err)
+	defer iter.Close()
+
+	id, got, err := iter.Next(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, got, "iterator must return a trace after Flush+Iterator; got nil (empty block)")
+	require.NotNil(t, id)
+
+	_, eof, err := iter.Next(ctx)
+	require.ErrorIs(t, err, io.EOF)
+	require.Nil(t, eof)
+
+	// Also verify the full promotion path: CreateBlock → FindTraceByID.
+	rawR, rawW, _, err := local.New(&local.Config{Path: t.TempDir()})
+	require.NoError(t, err)
+	r := backend.NewReader(rawR)
+	w := backend.NewWriter(rawW)
+
+	wal2Meta := backend.NewBlockMeta("test-tenant", uuid.New(), VersionString)
+	wal2, err := createWALBlock(wal2Meta, t.TempDir(), 0)
+	require.NoError(t, err)
+	require.NoError(t, wal2.AppendTrace(nil, tr, startSec, startSec+1, false))
+	require.NoError(t, wal2.Flush())
+
+	iter2, err := wal2.Iterator()
+	require.NoError(t, err)
+
+	blockMeta, err := CreateBlock(ctx, &common.BlockConfig{}, wal2Meta, iter2, r, w)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), blockMeta.TotalObjects, "block must have 1 trace after WAL promotion")
+
+	block := newBackendBlock(blockMeta, r)
+	traceID := []byte{1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}
+	resp, err := block.FindTraceByID(ctx, traceID, common.SearchOptions{})
+	require.NoError(t, err)
+	require.NotNil(t, resp, "FindTraceByID must find the trace promoted from WAL")
+}
 
 func TestRoundTrip_WriteAndReadBlock(t *testing.T) {
 	t.Log("Testing write then read roundtrip")
