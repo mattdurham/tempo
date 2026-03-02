@@ -7,6 +7,7 @@ import (
 	"sort"
 
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
+	"github.com/grafana/blockpack/internal/modules/rw"
 )
 
 // footerRaw holds the raw footer fields while readFooter is executing.
@@ -24,7 +25,7 @@ type compactTraceIndex struct {
 
 // Reader reads and decodes a blockpack file.
 type Reader struct {
-	provider   shared.ReaderProvider
+	provider   rw.ReaderProvider
 	traceIndex map[[16]byte][]traceBlockRef
 
 	// Range index — lazy.
@@ -59,7 +60,7 @@ type Reader struct {
 
 // NewReaderFromProvider constructs a Reader by reading the footer, header,
 // and metadata section from provider.
-func NewReaderFromProvider(provider shared.ReaderProvider, opts ...Option) (*Reader, error) {
+func NewReaderFromProvider(provider rw.ReaderProvider, opts ...Option) (*Reader, error) {
 	size, err := provider.Size()
 	if err != nil {
 		return nil, fmt.Errorf("NewReaderFromProvider: Size: %w", err)
@@ -93,7 +94,7 @@ func NewReaderFromProvider(provider shared.ReaderProvider, opts ...Option) (*Rea
 // (22B) and the compact trace index section. This is the optimal path for
 // FindTraceByID workloads. Falls back to NewReaderFromProvider for files
 // without a compact trace index (compactLen == 0).
-func NewLeanReaderFromProvider(provider shared.ReaderProvider, opts ...Option) (*Reader, error) {
+func NewLeanReaderFromProvider(provider rw.ReaderProvider, opts ...Option) (*Reader, error) {
 	size, err := provider.Size()
 	if err != nil {
 		return nil, fmt.Errorf("NewLeanReaderFromProvider: Size: %w", err)
@@ -194,7 +195,7 @@ func (r *Reader) GetBlockWithBytes(
 		return nil, fmt.Errorf("GetBlockWithBytes: blockIdx %d out of range", blockIdx)
 	}
 
-	rawBytes, err := r.readRange(meta.Offset, meta.Length, shared.DataTypeBlock)
+	rawBytes, err := r.readRange(meta.Offset, meta.Length, rw.DataTypeBlock)
 	if err != nil {
 		return nil, fmt.Errorf("GetBlockWithBytes block %d: %w", blockIdx, err)
 	}
@@ -227,7 +228,7 @@ func (r *Reader) ReadBlockRaw(blockIdx int) ([]byte, error) {
 		return nil, fmt.Errorf("ReadBlockRaw: blockIdx %d out of range [0, %d)", blockIdx, len(r.blockMetas))
 	}
 	meta := r.blockMetas[blockIdx]
-	return r.readRange(meta.Offset, meta.Length, shared.DataTypeBlock)
+	return r.readRange(meta.Offset, meta.Length, rw.DataTypeBlock)
 }
 
 // ReadBlocks reads raw bytes for the given block indices using aggressive coalescing.

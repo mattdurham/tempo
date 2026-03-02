@@ -6,7 +6,10 @@ import (
 	"encoding/binary"
 	"fmt"
 
+	"github.com/golang/snappy"
+
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
+	"github.com/grafana/blockpack/internal/modules/rw"
 )
 
 // traceBlockRef describes span indices for one trace in one block.
@@ -31,7 +34,7 @@ func (r *Reader) readFooter() error {
 
 	buf := make([]byte, shared.FooterV3Size)
 	off := r.fileSize - int64(shared.FooterV3Size)
-	n, err := r.provider.ReadAt(buf, off, shared.DataTypeFooter)
+	n, err := r.provider.ReadAt(buf, off, rw.DataTypeFooter)
 	if err != nil {
 		return fmt.Errorf("readFooter: %w", err)
 	}
@@ -64,7 +67,7 @@ func (r *Reader) readFooter() error {
 func (r *Reader) readHeader() error {
 	const headerSize = 21
 	buf := make([]byte, headerSize)
-	n, err := r.provider.ReadAt(buf, int64(r.headerOffset), shared.DataTypeHeader) //nolint:gosec // safe: headerOffset is a file offset, fits in int64
+	n, err := r.provider.ReadAt(buf, int64(r.headerOffset), rw.DataTypeHeader) //nolint:gosec // safe: headerOffset is a file offset, fits in int64
 	if err != nil {
 		return fmt.Errorf("readHeader: %w", err)
 	}
@@ -79,7 +82,7 @@ func (r *Reader) readHeader() error {
 	}
 
 	version := buf[4] //nolint:gosec // safe: buf is headerSize (21) bytes, validated by short-read check above
-	if version != shared.VersionV10 && version != shared.VersionV11 {
+	if version != shared.VersionV10 && version != shared.VersionV11 && version != shared.VersionV12 {
 		return fmt.Errorf("readHeader: unsupported version %d", version)
 	}
 
@@ -102,9 +105,30 @@ func (r *Reader) parseV5MetadataLazy() error {
 		return fmt.Errorf("parseMetadata: metadata too large: %d bytes", r.metadataLen)
 	}
 
-	data, err := r.readRange(r.metadataOffset, r.metadataLen, shared.DataTypeMetadata)
+	data, err := r.readRange(r.metadataOffset, r.metadataLen, rw.DataTypeMetadata)
 	if err != nil {
 		return fmt.Errorf("parseMetadata: %w", err)
+	}
+
+	if r.fileVersion == shared.VersionV12 {
+		// Guard against decompression bombs before allocating the decode buffer.
+		decodedLen, lenErr := snappy.DecodedLen(data)
+		if lenErr != nil {
+			return fmt.Errorf("parseMetadata: snappy decoded length: %w", lenErr)
+		}
+		if uint64(decodedLen) > shared.MaxMetadataSize { //nolint:gosec // safe: decodedLen is non-negative
+			return fmt.Errorf(
+				"parseMetadata: snappy decoded size %d exceeds MaxMetadataSize %d",
+				decodedLen, shared.MaxMetadataSize,
+			)
+		}
+		// Note: snappy.Decode re-reads the length prefix internally; the pre-check above
+		// cannot be avoided with this API.
+		decoded, decErr := snappy.Decode(nil, data)
+		if decErr != nil {
+			return fmt.Errorf("parseMetadata: snappy decode: %w", decErr)
+		}
+		data = decoded
 	}
 
 	r.metadataBytes = data
@@ -187,8 +211,8 @@ func parseBlockIndexEntry(
 	meta.Length = binary.LittleEndian.Uint64(data[pos:])
 	pos += 8
 
-	// v11 adds kind[1] before span_count.
-	if version == shared.VersionV11 {
+	// v11+ adds kind[1] before span_count (V12 files also use V11 block layout).
+	if version >= shared.VersionV11 {
 		if pos+1 > len(data) {
 			return meta, pos, fmt.Errorf("block_index entry: short for kind")
 		}
@@ -574,7 +598,7 @@ func skipRangeValueEntry(data []byte, pos int, colType shared.ColumnType) (int, 
 }
 
 // readRange reads exactly length bytes at absolute byte offset.
-func (r *Reader) readRange(offset, length uint64, dt shared.DataType) ([]byte, error) {
+func (r *Reader) readRange(offset, length uint64, dt rw.DataType) ([]byte, error) {
 	if length == 0 {
 		return nil, nil
 	}

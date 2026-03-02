@@ -237,7 +237,7 @@ ci:
 		echo "   ❌ FAIL"; tail -30 /tmp/blockpack-ci.log | sed 's/^/   /'; FAIL=$$((FAIL + 1)); \
 	fi; \
 	echo "── [6/6] Parity smoke test"; \
-	if go test ./tempo_parquet_comparison -run TestParitySmokeTest -v > /tmp/blockpack-ci.log 2>&1; then \
+	if go test ./internal/parity -run TestParitySmokeTest -v > /tmp/blockpack-ci.log 2>&1; then \
 		echo "   ✅ PASS"; PASS=$$((PASS + 1)); \
 	else \
 		echo "   ❌ FAIL"; tail -20 /tmp/blockpack-ci.log | sed 's/^/   /'; FAIL=$$((FAIL + 1)); \

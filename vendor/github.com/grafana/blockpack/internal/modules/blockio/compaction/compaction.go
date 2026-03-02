@@ -7,13 +7,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
 	modules_blockio "github.com/grafana/blockpack/internal/modules/blockio"
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
-	modules_shared "github.com/grafana/blockpack/internal/modules/blockio/shared"
-	commonv1 "go.opentelemetry.io/proto/otlp/common/v1"
-	tracev1 "go.opentelemetry.io/proto/otlp/trace/v1"
+	modules_rw "github.com/grafana/blockpack/internal/modules/rw"
 )
 
 // Config configures the compaction operation.
@@ -59,7 +56,7 @@ type compactionState struct {
 // Returns relative paths of all output files written.
 func CompactBlocks(
 	ctx context.Context,
-	providers []modules_shared.ReaderProvider,
+	providers []modules_rw.ReaderProvider,
 	cfg Config,
 	outputStorage OutputStorage,
 ) ([]string, error) {
@@ -117,7 +114,7 @@ func CompactBlocks(
 }
 
 // processProvider feeds all spans from the given provider into the current writer.
-func (s *compactionState) processProvider(provider modules_shared.ReaderProvider) (retErr error) {
+func (s *compactionState) processProvider(provider modules_rw.ReaderProvider) (retErr error) {
 	if closer, ok := provider.(interface{ Close() error }); ok {
 		defer func() {
 			if cErr := closer.Close(); cErr != nil && retErr == nil {
@@ -158,28 +155,53 @@ func (s *compactionState) processBlock(block *modules_reader.Block) error {
 	return nil
 }
 
-// addSpanFromBlock reconstructs one span from block row rowIdx and adds it
-// to the current writer, flushing to a new file if the size limit is reached.
+// dedupeKey builds a 24-byte deduplication key from trace:id (16 bytes) and span:id (8 bytes).
+// Returns the key and true if both IDs are present and non-empty; false otherwise.
+func dedupeKey(block *modules_reader.Block, rowIdx int) ([24]byte, bool) {
+	var key [24]byte
+
+	traceCol := block.GetColumn("trace:id")
+	if traceCol == nil || !traceCol.IsPresent(rowIdx) {
+		return key, false
+	}
+	traceID, ok := traceCol.BytesValue(rowIdx)
+	if !ok || len(traceID) != 16 {
+		return key, false
+	}
+
+	spanCol := block.GetColumn("span:id")
+	if spanCol == nil || !spanCol.IsPresent(rowIdx) {
+		return key, false
+	}
+	spanID, ok := spanCol.BytesValue(rowIdx)
+	if !ok || len(spanID) != 8 {
+		return key, false
+	}
+
+	copy(key[0:16], traceID)
+	copy(key[16:24], spanID)
+	return key, true
+}
+
+// addSpanFromBlock adds one row from block at rowIdx to the current writer via the
+// native columnar path, deduplicating by (trace:id, span:id) and respecting the
+// output file size limit.
 func (s *compactionState) addSpanFromBlock(block *modules_reader.Block, rowIdx int) error {
 	if err := s.ensureWriter(); err != nil {
 		return fmt.Errorf("ensure writer: %w", err)
 	}
 
-	traceID, span, resAttrs, resSchemaURL, scopeAttrs, scopeSchemaURL := spanFromRow(block, rowIdx)
-	if len(traceID) == 0 || len(span.SpanId) == 0 {
-		return nil // skip rows without valid IDs
+	key, ok := dedupeKey(block, rowIdx)
+	if !ok {
+		return nil // skip rows without valid trace+span IDs
 	}
-
-	var key [24]byte
-	copy(key[0:16], traceID)
-	copy(key[16:24], span.SpanId)
 	if _, seen := s.seenSpans[key]; seen {
 		return nil
 	}
 	s.seenSpans[key] = struct{}{}
 
-	if err := s.current.w.AddSpan(traceID, span, resAttrs, resSchemaURL, scopeAttrs, scopeSchemaURL); err != nil {
-		return fmt.Errorf("add span: %w", err)
+	if err := s.current.w.AddRow(block, rowIdx); err != nil {
+		return fmt.Errorf("add row: %w", err)
 	}
 
 	s.current.spanCount++
@@ -237,161 +259,6 @@ func (s *compactionState) flushCurrentWriter() error {
 	s.stagedFiles = append(s.stagedFiles, stagedPath)
 	s.current = nil
 	return nil
-}
-
-// spanFromRow reconstructs span data from all columns at rowIdx.
-func spanFromRow(
-	block *modules_reader.Block,
-	rowIdx int,
-) (traceID []byte, span *tracev1.Span, resAttrs map[string]any, resSchemaURL string, scopeAttrs map[string]any, scopeSchemaURL string) {
-	span = &tracev1.Span{}
-	resAttrs = make(map[string]any)
-	scopeAttrs = make(map[string]any)
-
-	for name, col := range block.Columns() {
-		if !col.IsPresent(rowIdx) {
-			continue
-		}
-		switch name {
-		case "trace:id":
-			if v, ok := col.BytesValue(rowIdx); ok {
-				traceID = cloneBytes(v)
-			}
-		case "span:id":
-			if v, ok := col.BytesValue(rowIdx); ok {
-				span.SpanId = cloneBytes(v)
-			}
-		case "span:parent_id":
-			if v, ok := col.BytesValue(rowIdx); ok {
-				span.ParentSpanId = cloneBytes(v)
-			}
-		case "span:name":
-			if v, ok := col.StringValue(rowIdx); ok {
-				span.Name = v
-			}
-		case "span:kind":
-			if v, ok := col.Int64Value(rowIdx); ok {
-				span.Kind = tracev1.Span_SpanKind(v) //nolint:gosec
-			}
-		case "span:start":
-			if v, ok := col.Uint64Value(rowIdx); ok {
-				span.StartTimeUnixNano = v
-			}
-		case "span:end":
-			if v, ok := col.Uint64Value(rowIdx); ok {
-				span.EndTimeUnixNano = v
-			}
-		case "span:duration":
-			// computed from start/end; skip
-		case "span:status":
-			if v, ok := col.Int64Value(rowIdx); ok {
-				if span.Status == nil {
-					span.Status = &tracev1.Status{}
-				}
-				span.Status.Code = tracev1.Status_StatusCode(v) //nolint:gosec
-			}
-		case "span:status_message":
-			if v, ok := col.StringValue(rowIdx); ok {
-				if span.Status == nil {
-					span.Status = &tracev1.Status{}
-				}
-				span.Status.Message = v
-			}
-		case "trace:state":
-			if v, ok := col.StringValue(rowIdx); ok {
-				span.TraceState = v
-			}
-		case "resource:schema_url":
-			if v, ok := col.StringValue(rowIdx); ok {
-				resSchemaURL = v
-			}
-		case "scope:schema_url":
-			if v, ok := col.StringValue(rowIdx); ok {
-				scopeSchemaURL = v
-			}
-		default:
-			v := columnAny(col, rowIdx)
-			if v == nil {
-				continue
-			}
-			switch {
-			case strings.HasPrefix(name, "resource."):
-				resAttrs[name[len("resource."):]] = v
-			case strings.HasPrefix(name, "span."):
-				span.Attributes = append(span.Attributes, anyToKV(name[len("span."):], v))
-			case strings.HasPrefix(name, "scope."):
-				scopeAttrs[name[len("scope."):]] = v
-			}
-		}
-	}
-
-	return traceID, span, resAttrs, resSchemaURL, scopeAttrs, scopeSchemaURL
-}
-
-// columnAny returns the typed value from col at rowIdx as any, or nil if absent.
-func columnAny(col *modules_reader.Column, rowIdx int) any {
-	if col == nil || !col.IsPresent(rowIdx) {
-		return nil
-	}
-	switch col.Type {
-	case modules_shared.ColumnTypeString, modules_shared.ColumnTypeRangeString:
-		if v, ok := col.StringValue(rowIdx); ok {
-			return v
-		}
-	case modules_shared.ColumnTypeInt64, modules_shared.ColumnTypeRangeInt64, modules_shared.ColumnTypeRangeDuration:
-		if v, ok := col.Int64Value(rowIdx); ok {
-			return v
-		}
-	case modules_shared.ColumnTypeUint64, modules_shared.ColumnTypeRangeUint64:
-		if v, ok := col.Uint64Value(rowIdx); ok {
-			return v
-		}
-	case modules_shared.ColumnTypeFloat64, modules_shared.ColumnTypeRangeFloat64:
-		if v, ok := col.Float64Value(rowIdx); ok {
-			return v
-		}
-	case modules_shared.ColumnTypeBool:
-		if v, ok := col.BoolValue(rowIdx); ok {
-			return v
-		}
-	case modules_shared.ColumnTypeBytes, modules_shared.ColumnTypeRangeBytes:
-		if v, ok := col.BytesValue(rowIdx); ok {
-			return cloneBytes(v)
-		}
-	}
-	return nil
-}
-
-// anyToKV converts a (key, any) pair to an OTLP KeyValue.
-func anyToKV(key string, v any) *commonv1.KeyValue {
-	kv := &commonv1.KeyValue{Key: key}
-	switch val := v.(type) {
-	case string:
-		kv.Value = &commonv1.AnyValue{Value: &commonv1.AnyValue_StringValue{StringValue: val}}
-	case int64:
-		kv.Value = &commonv1.AnyValue{Value: &commonv1.AnyValue_IntValue{IntValue: val}}
-	case uint64:
-		kv.Value = &commonv1.AnyValue{Value: &commonv1.AnyValue_IntValue{IntValue: int64(val)}} //nolint:gosec
-	case float64:
-		kv.Value = &commonv1.AnyValue{Value: &commonv1.AnyValue_DoubleValue{DoubleValue: val}}
-	case bool:
-		kv.Value = &commonv1.AnyValue{Value: &commonv1.AnyValue_BoolValue{BoolValue: val}}
-	case []byte:
-		kv.Value = &commonv1.AnyValue{Value: &commonv1.AnyValue_BytesValue{BytesValue: val}}
-	default:
-		kv.Value = &commonv1.AnyValue{Value: &commonv1.AnyValue_StringValue{StringValue: fmt.Sprint(val)}}
-	}
-	return kv
-}
-
-// cloneBytes returns a copy of b to avoid aliasing into block memory.
-func cloneBytes(b []byte) []byte {
-	if b == nil {
-		return nil
-	}
-	out := make([]byte, len(b))
-	copy(out, b)
-	return out
 }
 
 // prepareStagingDir creates a unique subdirectory for staging compaction output.

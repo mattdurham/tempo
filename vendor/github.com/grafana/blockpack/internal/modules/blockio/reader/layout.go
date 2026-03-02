@@ -3,18 +3,42 @@ package reader
 // NOTE: Any changes to this file must be reflected in the corresponding specs.md or NOTES.md.
 
 import (
+	"bytes"
+	"encoding/binary"
 	"fmt"
+	"io"
 	"sort"
+	"sync"
+	"time"
+
+	"github.com/klauspost/compress/zstd"
 
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
 )
 
 // FileLayoutReport is the top-level result of AnalyzeFileLayout.
 type FileLayoutReport struct {
-	Sections    []FileLayoutSection `json:"sections"`
-	FileSize    int64               `json:"file_size"`
-	BlockCount  int                 `json:"block_count"`
-	FileVersion uint8               `json:"file_version"`
+	Sections        []FileLayoutSection `json:"sections"`
+	RangeIndex      []RangeIndexColumn  `json:"range_index,omitempty"`
+	BlockSpanCounts []uint32            `json:"block_span_counts,omitempty"`
+	FileSize        int64               `json:"file_size"`
+	TotalSpans      int64               `json:"total_spans"`
+	BlockCount      int                 `json:"block_count"`
+	FileVersion     uint8               `json:"file_version"`
+}
+
+// RangeIndexColumn describes the pruning index for one column.
+type RangeIndexColumn struct {
+	ColumnName string             `json:"column_name"`
+	ColumnType string             `json:"column_type"`
+	Buckets    []RangeIndexBucket `json:"buckets"`
+}
+
+// RangeIndexBucket is one entry in a column's range index: the lower boundary
+// of a value bucket and the set of block indexes that cover it.
+type RangeIndexBucket struct {
+	Start    string   `json:"start"`
+	BlockIDs []uint32 `json:"block_ids"`
 }
 
 // FileLayoutSection describes one contiguous byte range in a blockpack file.
@@ -27,6 +51,9 @@ type FileLayoutSection struct {
 	CompressedSize   int64  `json:"compressed_size"`
 	UncompressedSize int64  `json:"uncompressed_size,omitempty"`
 	BlockIndex       int    `json:"block_index,omitempty"`
+	// IsLogical is true for V12 metadata sub-sections whose Offset is relative to
+	// the start of the decompressed metadata buffer, not a physical file offset.
+	IsLogical bool `json:"is_logical,omitempty"`
 }
 
 // FileLayout computes a byte-level layout of the blockpack file, returning a report
@@ -85,12 +112,75 @@ func (r *Reader) FileLayout() (*FileLayoutReport, error) {
 		return sections[i].Offset < sections[j].Offset
 	})
 
+	rangeIndex := r.buildRangeIndex()
+
+	spanCounts := make([]uint32, len(r.blockMetas))
+	var totalSpans int64
+	for i, m := range r.blockMetas {
+		spanCounts[i] = m.SpanCount
+		totalSpans += int64(m.SpanCount) //nolint:gosec
+	}
+
 	return &FileLayoutReport{
-		FileSize:    r.fileSize,
-		FileVersion: r.fileVersion,
-		BlockCount:  len(r.blockMetas),
-		Sections:    sections,
+		FileSize:        r.fileSize,
+		FileVersion:     r.fileVersion,
+		BlockCount:      len(r.blockMetas),
+		TotalSpans:      totalSpans,
+		BlockSpanCounts: spanCounts,
+		Sections:        sections,
+		RangeIndex:      rangeIndex,
 	}, nil
+}
+
+// buildRangeIndex parses every column's range index and returns the result sorted by column name.
+func (r *Reader) buildRangeIndex() []RangeIndexColumn {
+	if len(r.rangeOffsets) == 0 {
+		return nil
+	}
+
+	cols := make([]RangeIndexColumn, 0, len(r.rangeOffsets))
+
+	for colName := range r.rangeOffsets {
+		if err := r.ensureRangeColumnParsed(colName); err != nil {
+			continue
+		}
+
+		idx := r.rangeParsed[colName]
+		col := RangeIndexColumn{
+			ColumnName: colName,
+			ColumnType: columnTypeName(idx.colType),
+			Buckets:    make([]RangeIndexBucket, 0, len(idx.entries)),
+		}
+
+		for _, entry := range idx.entries {
+			col.Buckets = append(col.Buckets, RangeIndexBucket{
+				Start:    formatRangeKey(idx.colType, entry.lower),
+				BlockIDs: entry.blockIDs,
+			})
+		}
+
+		cols = append(cols, col)
+	}
+
+	sort.Slice(cols, func(i, j int) bool { return cols[i].ColumnName < cols[j].ColumnName })
+
+	return cols
+}
+
+// formatRangeKey decodes an encoded lower-boundary key to a human-readable string.
+func formatRangeKey(colType shared.ColumnType, key string) string {
+	switch colType {
+	case shared.ColumnTypeRangeInt64:
+		return fmt.Sprintf("%d", decodeInt64Key(key))
+	case shared.ColumnTypeRangeDuration:
+		return time.Duration(decodeInt64Key(key)).String()
+	case shared.ColumnTypeRangeUint64:
+		return fmt.Sprintf("%d", decodeUint64Key(key))
+	case shared.ColumnTypeRangeFloat64:
+		return fmt.Sprintf("%g", decodeFloat64Key(key))
+	default: // RangeString, RangeBytes, plain types
+		return key
+	}
 }
 
 // layoutBlock returns FileLayoutSection entries for one block.
@@ -143,14 +233,24 @@ func (r *Reader) layoutBlock(blockIdx int, meta shared.BlockMeta) ([]FileLayoutS
 				encKind = encodingKindName(raw[start+1])
 			}
 
+			end := start + int(m.dataLen) //nolint:gosec
+			var uncompSize int64
+			if end <= len(raw) {
+				uncompSize, err = columnDataUncompressedSize(raw[start:end])
+				if err != nil {
+					return nil, fmt.Errorf("column %q uncompressed size: %w", m.name, err)
+				}
+			}
+
 			sections = append(sections, FileLayoutSection{
-				Section:        prefix + ".column[" + m.name + "].data",
-				ColumnName:     m.name,
-				ColumnType:     colType,
-				Encoding:       encKind,
-				Offset:         base + int64(m.dataOffset), //nolint:gosec
-				CompressedSize: int64(m.dataLen),           //nolint:gosec
-				BlockIndex:     blockIdx,
+				Section:          prefix + ".column[" + m.name + "].data",
+				ColumnName:       m.name,
+				ColumnType:       colType,
+				Encoding:         encKind,
+				Offset:           base + int64(m.dataOffset), //nolint:gosec
+				CompressedSize:   int64(m.dataLen),           //nolint:gosec
+				UncompressedSize: uncompSize,
+				BlockIndex:       blockIdx,
 			})
 		}
 	}
@@ -159,8 +259,16 @@ func (r *Reader) layoutBlock(blockIdx int, meta shared.BlockMeta) ([]FileLayoutS
 }
 
 // layoutMetadata returns FileLayoutSection entries for the metadata section.
-// The metadata.block_index section includes the 4-byte range_count prefix so that
-// every byte in r.metadataBytes is accounted for across the returned sections.
+//
+// For V10/V11 files (uncompressed metadata), the sub-sections directly reflect
+// physical byte ranges on disk and their CompressedSize values sum to r.metadataLen.
+//
+// For V12 files (snappy-compressed metadata), the on-disk bytes form a single
+// compressed blob. A single "metadata.compressed" section accounts for all
+// r.metadataLen compressed bytes (preserving the byte invariant) and reports
+// the uncompressed size via UncompressedSize. Sub-section breakdown is not
+// reported for V12 because physical byte offsets within the compressed blob
+// are not meaningful.
 func (r *Reader) layoutMetadata() ([]FileLayoutSection, error) {
 	data := r.metadataBytes
 	if len(data) < 8 {
@@ -168,6 +276,25 @@ func (r *Reader) layoutMetadata() ([]FileLayoutSection, error) {
 	}
 
 	base := int64(r.metadataOffset) //nolint:gosec
+
+	isV12 := r.fileVersion == shared.VersionV12
+
+	var sections []FileLayoutSection
+
+	// For V12, emit only the physical compressed blob: the metadata bytes form a
+	// single snappy-compressed blob on disk. Logical sub-section offsets within the
+	// decompressed buffer are not physical file offsets and cannot be included without
+	// breaking the byte invariant (sum(CompressedSize) == FileSize).
+	if isV12 {
+		sections = append(sections, FileLayoutSection{
+			Section:          "metadata.compressed",
+			Offset:           base,
+			CompressedSize:   int64(r.metadataLen),        //nolint:gosec // safe: metadataLen is a file length, fits int64
+			UncompressedSize: int64(len(r.metadataBytes)), //nolint:gosec // safe: len(slice) always fits int64
+		})
+		return sections, nil
+	}
+
 	blockCount := len(r.blockMetas)
 	pos := 4 // skip block_count[4]
 
@@ -180,12 +307,12 @@ func (r *Reader) layoutMetadata() ([]FileLayoutSection, error) {
 	pos += 4 // skip range_count[4]; include it in block_index section
 
 	blockIdxSize := int64(pos)
-	var sections []FileLayoutSection
 
 	sections = append(sections, FileLayoutSection{
 		Section:        "metadata.block_index",
 		Offset:         base,
 		CompressedSize: blockIdxSize,
+		IsLogical:      isV12,
 	})
 
 	// Range index: one section per column, using pre-parsed byte ranges.
@@ -202,6 +329,7 @@ func (r *Reader) layoutMetadata() ([]FileLayoutSection, error) {
 			ColumnType:     columnTypeName(dMeta.typ),
 			Offset:         base + int64(dMeta.offset), //nolint:gosec
 			CompressedSize: int64(dMeta.length),        //nolint:gosec
+			IsLogical:      isV12,
 		})
 	}
 
@@ -220,8 +348,9 @@ func (r *Reader) layoutMetadata() ([]FileLayoutSection, error) {
 	if colIdxSize := int64(pos - colIdxStart); colIdxSize > 0 {
 		sections = append(sections, FileLayoutSection{
 			Section:        "metadata.column_index",
-			Offset:         base + int64(colIdxStart),
+			Offset:         base + int64(colIdxStart), //nolint:gosec
 			CompressedSize: colIdxSize,
+			IsLogical:      isV12,
 		})
 	}
 
@@ -229,8 +358,9 @@ func (r *Reader) layoutMetadata() ([]FileLayoutSection, error) {
 	if traceIdxSize := int64(len(data) - pos); traceIdxSize > 0 {
 		sections = append(sections, FileLayoutSection{
 			Section:        "metadata.trace_index",
-			Offset:         base + int64(pos),
+			Offset:         base + int64(pos), //nolint:gosec
 			CompressedSize: traceIdxSize,
+			IsLogical:      isV12,
 		})
 	}
 
@@ -301,4 +431,303 @@ func encodingKindName(kind uint8) string {
 	default:
 		return fmt.Sprintf("Unknown(%d)", kind)
 	}
+}
+
+// columnDataUncompressedSize computes the total uncompressed size of a column data blob
+// by walking the encoding wire format, finding zstd-compressed chunks, decompressing them,
+// and returning the inflated size (all zstd chunks replaced by their decompressed contents).
+// For encodings without zstd (InlineBytes), returns the data length as-is.
+func columnDataUncompressedSize(data []byte) (int64, error) {
+	if len(data) < 2 {
+		return int64(len(data)), nil
+	}
+
+	kind := data[1]
+	body := data[2:] // skip enc_version[1] + kind[1]
+	overhead := int64(2)
+
+	var (
+		bodySize int64
+		err      error
+	)
+
+	switch kind {
+	case 1, 2: // Dictionary / SparseDictionary
+		bodySize, err = inflatedDictKind(body)
+
+	case 3, 4: // InlineBytes / SparseInlineBytes — no zstd compression
+		return int64(len(data)), nil
+
+	case 5: // DeltaUint64
+		bodySize, err = inflatedDeltaUint64(body)
+
+	case 6, 7: // RLEIndexes / SparseRLEIndexes
+		bodySize, err = inflatedRLEIndexes(body)
+
+	case 8, 9: // XORBytes / SparseXORBytes
+		bodySize, err = inflatedXORBytes(body)
+
+	case 10, 11: // PrefixBytes / SparsePrefixBytes
+		bodySize, err = inflatedPrefixBytes(body)
+
+	case 12, 13: // DeltaDictionary / SparseDeltaDictionary
+		bodySize, err = inflatedDeltaDict(body)
+
+	default:
+		return int64(len(data)), nil
+	}
+
+	if err != nil {
+		return 0, err
+	}
+
+	return overhead + bodySize, nil
+}
+
+// inflatedZstdChunk reads a len[4]+zstd_data[len] chunk at body[pos:], decompresses
+// to measure the uncompressed size, and returns (inflated_chunk_size, new_pos, error).
+// inflated_chunk_size = 4 (length prefix) + decompressed_size.
+func inflatedZstdChunk(body []byte, pos int) (int64, int, error) {
+	if pos+4 > len(body) {
+		return int64(len(body) - pos), len(body), nil
+	}
+
+	cLen := int(binary.LittleEndian.Uint32(body[pos:]))
+	pos += 4
+
+	if cLen == 0 {
+		// Zero-length chunk: only the 4-byte length prefix is present.
+		return 4, pos, nil
+	}
+	if pos+cLen > len(body) {
+		// Truncated chunk: clamp to remaining bytes so new_pos never exceeds len(body).
+		return int64(4 + max(len(body)-pos, 0)), len(body), nil
+	}
+
+	n, err := zstdStreamedSize(body[pos : pos+cLen])
+	if err != nil {
+		return 0, pos + cLen, fmt.Errorf("inflatedZstdChunk: %w", err)
+	}
+
+	return 4 + n, pos + cLen, nil
+}
+
+// layoutDecoderPool pools zstd decoders for the layout analysis path. A separate pool
+// from the hot-path decoder ensures FileLayout() does not interfere with concurrent
+// query decoding. Each pooled decoder is configured with concurrency=1 (single-goroutine
+// streaming) and is Reset per chunk rather than reallocated, matching the recommendation
+// in the zstd library docs for streaming-to-Discard size measurement.
+var layoutDecoderPool = &sync.Pool{
+	New: func() any {
+		dec, err := zstd.NewReader(nil, zstd.WithDecoderConcurrency(1))
+		if err != nil {
+			panic("layout: zstd.NewReader: " + err.Error())
+		}
+		return dec
+	},
+}
+
+// zstdStreamedSize decompresses compressed into io.Discard via a pooled decoder and
+// returns the number of output bytes without materializing the full payload. The decoder
+// is returned to the pool after use, avoiding per-chunk allocation overhead for large
+// files with many column chunks.
+func zstdStreamedSize(compressed []byte) (int64, error) {
+	dec := layoutDecoderPool.Get().(*zstd.Decoder)
+	defer layoutDecoderPool.Put(dec)
+	if err := dec.Reset(bytes.NewReader(compressed)); err != nil {
+		return 0, err
+	}
+	n, err := io.Copy(io.Discard, dec)
+	return n, err
+}
+
+// skipPresenceRLE skips a prl_len[4]+prl_data segment, returning (bytes_consumed, new_pos).
+func skipPresenceRLE(body []byte, pos int) (int64, int) {
+	if pos+4 > len(body) {
+		return int64(len(body) - pos), len(body)
+	}
+
+	prlLen := int(binary.LittleEndian.Uint32(body[pos:]))
+
+	newPos := pos + 4 + prlLen
+	if newPos > len(body) {
+		// Corrupt/too-large prlLen: clamp to end of body.
+		return int64(len(body) - pos), len(body)
+	}
+
+	return int64(4 + prlLen), newPos
+}
+
+// inflatedDictKind computes inflated size for encodings whose layout starts with a shared
+// dict chunk (kinds 1, 2, 6, 7: Dictionary, SparseDictionary, RLEIndexes, SparseRLEIndexes).
+// body starts after enc_version+kind.
+// Wire: index_width[1] + dict_len[4]+zstd(dict) + rest...
+func inflatedDictKind(body []byte) (int64, error) {
+	if len(body) < 1 {
+		return int64(len(body)), nil
+	}
+
+	total := int64(1) // index_width
+	pos := 1
+
+	// zstd dict chunk
+	chunkSize, newPos, err := inflatedZstdChunk(body, pos)
+	if err != nil {
+		return 0, err
+	}
+
+	total += chunkSize
+	// Remaining bytes (row_count, presence RLE, indexes) are not zstd-compressed.
+	total += int64(len(body) - newPos)
+
+	return total, nil
+}
+
+// inflatedRLEIndexes computes inflated size for RLEIndexes/SparseRLEIndexes kinds.
+// Same structure as dictKind: index_width[1] + dict_len[4]+zstd + rest...
+func inflatedRLEIndexes(body []byte) (int64, error) {
+	return inflatedDictKind(body)
+}
+
+// inflatedDeltaUint64 computes inflated size for DeltaUint64 kind.
+// Wire: span_count[4] + prl_len[4]+prl + base[8]+width[1] + [if width>0: len[4]+zstd]
+func inflatedDeltaUint64(body []byte) (int64, error) {
+	if len(body) < 4 {
+		return int64(len(body)), nil
+	}
+
+	total := int64(4) // span_count
+	pos := 4
+
+	// Skip presence RLE
+	prlSize, newPos := skipPresenceRLE(body, pos)
+	total += prlSize
+	pos = newPos
+
+	// base[8] + width[1]
+	if pos+9 > len(body) {
+		total += int64(len(body) - pos)
+		return total, nil
+	}
+
+	total += 9
+	width := body[pos+8]
+	pos += 9
+
+	if width > 0 {
+		chunkSize, newPos, err := inflatedZstdChunk(body, pos)
+		if err != nil {
+			return 0, err
+		}
+
+		total += chunkSize
+		total += int64(len(body) - newPos)
+	}
+
+	return total, nil
+}
+
+// inflatedXORBytes computes inflated size for XORBytes/SparseXORBytes kinds.
+// Wire: span_count[4] + prl_len[4]+prl + xor_len[4]+zstd(xor)
+func inflatedXORBytes(body []byte) (int64, error) {
+	if len(body) < 4 {
+		return int64(len(body)), nil
+	}
+
+	total := int64(4) // span_count
+	pos := 4
+
+	prlSize, newPos := skipPresenceRLE(body, pos)
+	total += prlSize
+	pos = newPos
+
+	chunkSize, newPos, err := inflatedZstdChunk(body, pos)
+	if err != nil {
+		return 0, err
+	}
+
+	total += chunkSize
+	total += int64(len(body) - newPos)
+
+	return total, nil
+}
+
+// inflatedPrefixBytes computes inflated size for PrefixBytes/SparsePrefixBytes kinds.
+// Wire: span_count[4] + prl_len[4]+prl + prefix_dict_len[4]+zstd1 + suffix_data_len[4]+zstd2
+func inflatedPrefixBytes(body []byte) (int64, error) {
+	if len(body) < 4 {
+		return int64(len(body)), nil
+	}
+
+	total := int64(4) // span_count
+	pos := 4
+
+	prlSize, newPos := skipPresenceRLE(body, pos)
+	total += prlSize
+	pos = newPos
+
+	// First zstd chunk: prefix dict
+	chunk1Size, newPos, err := inflatedZstdChunk(body, pos)
+	if err != nil {
+		return 0, err
+	}
+
+	total += chunk1Size
+	pos = newPos
+
+	// Second zstd chunk: suffix data
+	chunk2Size, newPos, err := inflatedZstdChunk(body, pos)
+	if err != nil {
+		return 0, err
+	}
+
+	total += chunk2Size
+	total += int64(len(body) - newPos)
+
+	return total, nil
+}
+
+// inflatedDeltaDict computes inflated size for DeltaDictionary/SparseDeltaDictionary kinds.
+// Wire: index_width[1] + dict_len[4]+zstd1 + row_count[4] + prl_len[4]+prl + delta_len[4]+zstd2
+func inflatedDeltaDict(body []byte) (int64, error) {
+	if len(body) < 1 {
+		return int64(len(body)), nil
+	}
+
+	total := int64(1) // index_width
+	pos := 1
+
+	// First zstd chunk: dict
+	chunk1Size, newPos, err := inflatedZstdChunk(body, pos)
+	if err != nil {
+		return 0, err
+	}
+
+	total += chunk1Size
+	pos = newPos
+
+	// row_count[4]
+	if pos+4 > len(body) {
+		total += int64(len(body) - pos)
+		return total, nil
+	}
+
+	total += 4
+	pos += 4
+
+	// presence RLE
+	prlSize, newPos := skipPresenceRLE(body, pos)
+	total += prlSize
+	pos = newPos
+
+	// Second zstd chunk: deltas
+	chunk2Size, newPos, err := inflatedZstdChunk(body, pos)
+	if err != nil {
+		return 0, err
+	}
+
+	total += chunk2Size
+	total += int64(len(body) - newPos)
+
+	return total, nil
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
+	"github.com/grafana/blockpack/internal/modules/rw"
 )
 
 // compactBlockEntry holds file location for one block as stored in the compact block table.
@@ -95,7 +96,7 @@ func (r *Reader) ensureCompactIndexParsed() error {
 		return fmt.Errorf("compact index: not present")
 	}
 
-	data, err := r.readRange(r.compactOffset, uint64(r.compactLen), shared.DataTypeCompact)
+	data, err := r.readRange(r.compactOffset, uint64(r.compactLen), rw.DataTypeCompact)
 	if err != nil {
 		return fmt.Errorf("compact index: read: %w", err)
 	}

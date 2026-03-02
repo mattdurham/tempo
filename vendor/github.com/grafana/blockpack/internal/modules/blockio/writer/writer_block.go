@@ -7,10 +7,12 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 
 	tracev1 "go.opentelemetry.io/proto/otlp/trace/v1"
 
+	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
 )
 
@@ -20,12 +22,18 @@ import (
 //
 // Size: ~88 bytes (4 pointer fields) vs shared.BufferedSpan ~344 bytes (13 pointer fields).
 // The proto fields are kept alive by w.protoRoots for the duration of the flush cycle.
+//
+// For the columnar compaction path: srcBlock and srcRowIdx are set instead of proto fields.
+// When srcBlock is non-nil, addRowFromBlock is used instead of addRowFromProto, avoiding
+// all OTLP proto allocations.
 type pendingSpan struct {
 	rs         *tracev1.ResourceSpans // proto pointer; kept alive by w.protoRoots
 	ss         *tracev1.ScopeSpans    // proto pointer; kept alive by w.protoRoots
 	span       *tracev1.Span          // proto pointer; kept alive by w.protoRoots
+	srcBlock   *modules_reader.Block  // non-nil for columnar path (compaction); nil for proto path
 	svcName    string                 // sort key (primary); zero-copy reference into proto
 	minHashSig [4]uint64              // sort key (secondary)
+	srcRowIdx  int                    // source row index within srcBlock
 	traceID    [16]byte               // sort key (tertiary)
 }
 
@@ -61,8 +69,13 @@ type blockBuilder struct {
 	// within this block. At block write time the writer records exactly two values
 	// per column into the file-level range index (vs. O(spans × attrs) previously).
 	// The map key is the column name; the value holds min/max encoded keys.
-	colMinMax     map[string]*blockColMinMax // column name → min/max for this block
-	sparseColumns []columnBuilder            // non-intrinsic columns that may need null-filling
+	colMinMax map[string]*blockColMinMax // column name → min/max for this block
+
+	// builderCache holds reset column builders from previous blocks, keyed by column name.
+	// On addColumn, a matching builder is popped from the cache and reused, avoiding
+	// fresh slice allocations. Most blocks share the same attribute columns, so the
+	// cache hit rate is high.
+	builderCache map[string]columnBuilder
 
 	spanCount int
 	// spanHint is the expected total span count for this block.
@@ -101,18 +114,104 @@ type builtBlock struct {
 	maxTraceID [16]byte
 }
 
+// reset clears the blockBuilder for reuse with the next block.
+// Intrinsic column builders are reset in place (preserving slice capacity).
+// Sparse (attribute) column builders are moved to builderCache for reuse by addColumn.
+// Column name caches (spanColNames, etc.) are preserved across blocks.
+func (b *blockBuilder) reset(spanHint int) {
+	b.spanHint = spanHint
+	b.spanCount = 0
+	b.minStart = 0
+	b.maxStart = 0
+	b.bloom = [32]byte{}
+	b.minTraceID = [16]byte{}
+	b.maxTraceID = [16]byte{}
+
+	// Reset intrinsic column builders in place — preserves backing slice capacity.
+	// Then prepare to full block size (all slots null; indexed writes flip present).
+	b.colTraceID.resetForReuse(traceIDColumnName)
+	b.colTraceID.prepare(spanHint)
+	b.colSpanID.resetForReuse("span:id")
+	b.colSpanID.prepare(spanHint)
+	b.colParentID.resetForReuse("span:parent_id")
+	b.colParentID.prepare(spanHint)
+	b.colSpanName.resetForReuse("span:name")
+	b.colSpanName.prepare(spanHint)
+	b.colSpanKind.resetForReuse("")
+	b.colSpanKind.prepare(spanHint)
+	b.colSpanStart.resetForReuse("span:start")
+	b.colSpanStart.prepare(spanHint)
+	b.colSpanEnd.resetForReuse("span:end")
+	b.colSpanEnd.prepare(spanHint)
+	b.colSpanDur.resetForReuse("span:duration")
+	b.colSpanDur.prepare(spanHint)
+
+	// Move non-intrinsic builders to cache for reuse.
+	for name, cb := range b.columns {
+		switch cb.(type) {
+		case *bytesColumnBuilder:
+			if cb == columnBuilder(b.colTraceID) || cb == columnBuilder(b.colSpanID) || cb == columnBuilder(b.colParentID) {
+				continue
+			}
+		case *stringColumnBuilder:
+			if cb == columnBuilder(b.colSpanName) {
+				continue
+			}
+		case *int64ColumnBuilder:
+			if cb == columnBuilder(b.colSpanKind) {
+				continue
+			}
+		case *uint64ColumnBuilder:
+			if cb == columnBuilder(b.colSpanStart) || cb == columnBuilder(b.colSpanEnd) || cb == columnBuilder(b.colSpanDur) {
+				continue
+			}
+		}
+		cb.resetForReuse(name)
+		b.builderCache[name] = cb
+		delete(b.columns, name)
+	}
+
+	// Clear traceRows map (keep allocated buckets).
+	for k := range b.traceRows {
+		delete(b.traceRows, k)
+	}
+
+	// Clear colMinMax map (keep allocated buckets).
+	for k := range b.colMinMax {
+		delete(b.colMinMax, k)
+	}
+
+	// Re-seed bloom filter for intrinsic columns.
+	for _, name := range []string{
+		traceIDColumnName, "span:id", "span:parent_id", "span:name",
+		"span:kind", "span:start", "span:end", "span:duration",
+	} {
+		shared.AddToBloom(b.bloom[:], name)
+	}
+}
+
 // buildBlock constructs a single block from the given pending spans and returns
 // the serialized payload together with all per-block statistics.
-// It is a thin wrapper around the newBlockBuilder → addRowFromProto loop → finalize
-// pattern, keeping blockBuilder as an unexported implementation detail.
-func buildBlock(pending []pendingSpan, enc *zstdEncoder) (builtBlock, error) {
-	bb := newBlockBuilder(len(pending))
+// If bb is non-nil it is reset and reused; otherwise a new blockBuilder is created.
+func buildBlock(
+	pending []pendingSpan, enc *zstdEncoder, bb *blockBuilder,
+) (builtBlock, *blockBuilder, error) {
+	if bb != nil {
+		bb.reset(len(pending))
+	} else {
+		bb = newBlockBuilder(len(pending))
+	}
 	for rowIdx := range pending {
-		bb.addRowFromProto(&pending[rowIdx], rowIdx)
+		ps := &pending[rowIdx]
+		if ps.srcBlock != nil {
+			bb.addRowFromBlock(ps.srcBlock, ps.srcRowIdx, rowIdx)
+		} else {
+			bb.addRowFromProto(ps, rowIdx)
+		}
 	}
 	payload, err := bb.finalize(enc)
 	if err != nil {
-		return builtBlock{}, err
+		return builtBlock{}, bb, err
 	}
 	return builtBlock{
 		payload:    payload,
@@ -124,7 +223,7 @@ func buildBlock(pending []pendingSpan, enc *zstdEncoder) (builtBlock, error) {
 		bloom:      bb.bloom,
 		traceRows:  bb.traceRows,
 		colMinMax:  bb.colMinMax,
-	}, nil
+	}, bb, nil
 }
 
 // newBlockBuilder creates an empty block builder.
@@ -136,57 +235,33 @@ func newBlockBuilder(spanHint int) *blockBuilder {
 		columns:          make(map[string]columnBuilder, 32),
 		traceRows:        make(map[[16]byte][]uint16, 16),
 		colMinMax:        make(map[string]*blockColMinMax, 64),
-		sparseColumns:    make([]columnBuilder, 0, 32),
+		builderCache:     make(map[string]columnBuilder, 32),
 		spanHint:         spanHint,
 		spanColNames:     make(map[string]string, 32),
 		resourceColNames: make(map[string]string, 16),
 		scopeColNames:    make(map[string]string, 8),
 	}
 
-	// Pre-create intrinsic column builders with pre-allocated value/present slices.
-	// Registering them in b.columns makes them visible to finalize().
-	// They are NOT added to b.sparseColumns because they are always written in addRow,
-	// so fillNullsForRow never needs to null-fill them.
+	// Pre-create intrinsic column builders and prepare them to full block size.
+	// All slots start as null (zero value + present=false); addRowFromProto sets
+	// present values by index, eliminating append-based null-filling.
 
-	b.colTraceID = &bytesColumnBuilder{
-		colName: traceIDColumnName,
-		values:  make([][]byte, 0, spanHint),
-		present: make([]bool, 0, spanHint),
-	}
-	b.colSpanID = &bytesColumnBuilder{
-		colName: "span:id",
-		values:  make([][]byte, 0, spanHint),
-		present: make([]bool, 0, spanHint),
-	}
-	b.colParentID = &bytesColumnBuilder{
-		colName: "span:parent_id",
-		values:  make([][]byte, 0, spanHint),
-		present: make([]bool, 0, spanHint),
-	}
-	b.colSpanName = &stringColumnBuilder{
-		colName: "span:name",
-		values:  make([]string, 0, spanHint),
-		present: make([]bool, 0, spanHint),
-	}
-	b.colSpanKind = &int64ColumnBuilder{
-		values:  make([]int64, 0, spanHint),
-		present: make([]bool, 0, spanHint),
-	}
-	b.colSpanStart = &uint64ColumnBuilder{
-		colName: "span:start",
-		values:  make([]uint64, 0, spanHint),
-		present: make([]bool, 0, spanHint),
-	}
-	b.colSpanEnd = &uint64ColumnBuilder{
-		colName: "span:end",
-		values:  make([]uint64, 0, spanHint),
-		present: make([]bool, 0, spanHint),
-	}
-	b.colSpanDur = &uint64ColumnBuilder{
-		colName: "span:duration",
-		values:  make([]uint64, 0, spanHint),
-		present: make([]bool, 0, spanHint),
-	}
+	b.colTraceID = &bytesColumnBuilder{colName: traceIDColumnName}
+	b.colTraceID.prepare(spanHint)
+	b.colSpanID = &bytesColumnBuilder{colName: "span:id"}
+	b.colSpanID.prepare(spanHint)
+	b.colParentID = &bytesColumnBuilder{colName: "span:parent_id"}
+	b.colParentID.prepare(spanHint)
+	b.colSpanName = &stringColumnBuilder{colName: "span:name"}
+	b.colSpanName.prepare(spanHint)
+	b.colSpanKind = &int64ColumnBuilder{}
+	b.colSpanKind.prepare(spanHint)
+	b.colSpanStart = &uint64ColumnBuilder{colName: "span:start"}
+	b.colSpanStart.prepare(spanHint)
+	b.colSpanEnd = &uint64ColumnBuilder{colName: "span:end"}
+	b.colSpanEnd.prepare(spanHint)
+	b.colSpanDur = &uint64ColumnBuilder{colName: "span:duration"}
+	b.colSpanDur.prepare(spanHint)
 
 	// Register in map so finalize() can collect them.
 	b.columns[traceIDColumnName] = b.colTraceID
@@ -210,68 +285,48 @@ func newBlockBuilder(spanHint int) *blockBuilder {
 }
 
 // addColumn ensures a column builder exists for the given name/type.
-// Returns the builder. Dynamic (non-intrinsic) columns are also tracked in
-// b.sparseColumns so that fillNullsForRow can iterate only columns that may
-// need null-filling, skipping the always-present intrinsic columns.
+// Returns the builder. If a matching builder exists in builderCache from a
+// previous block, it is reused; otherwise a new builder is allocated.
 func (b *blockBuilder) addColumn(name string, typ shared.ColumnType) columnBuilder {
 	if cb, ok := b.columns[name]; ok {
-		return cb
+		if cb.colType() == typ {
+			return cb
+		}
+		// Type conflict: same attribute key seen with different types within one block.
+		// Treat the conflicting value as absent (null) for this row rather than panic.
+		return nil
 	}
-	cb := newColumnBuilder(typ, name, max(b.spanHint-b.spanCount, 0))
-	// Backfill null rows for all spans written before this column first appeared.
-	// Without this, the column's row_count would be less than the block's spanCount,
-	// causing a "row_count != spanCount" parse error in the reader.
-	for range b.spanCount {
-		switch typ {
-		case shared.ColumnTypeString, shared.ColumnTypeRangeString:
-			cb.addString("", false)
-		case shared.ColumnTypeInt64, shared.ColumnTypeRangeInt64, shared.ColumnTypeRangeDuration:
-			cb.addInt64(0, false)
-		case shared.ColumnTypeUint64, shared.ColumnTypeRangeUint64:
-			cb.addUint64(0, false)
-		case shared.ColumnTypeFloat64, shared.ColumnTypeRangeFloat64:
-			cb.addFloat64(0, false)
-		case shared.ColumnTypeBool:
-			cb.addBool(false, false)
-		default:
-			cb.addBytes(nil, false)
+
+	// Try to reuse a cached builder from a previous block.
+	var cb columnBuilder
+	if cached, ok := b.builderCache[name]; ok {
+		// Always remove from cache; only reuse if the type matches.
+		delete(b.builderCache, name)
+		if cached.colType() == typ {
+			cb = cached
 		}
 	}
+	if cb == nil {
+		cb = newColumnBuilder(typ, name, 0)
+	}
+
+	// Pre-allocate to full block size — all slots start null.
+	// Present values are set by indexed writes in addPresent.
+	cb.prepare(b.spanHint)
 	b.columns[name] = cb
-	// Track in sparseColumns for efficient null-filling (intrinsics are excluded
-	// because they are always written in addRow).
-	b.sparseColumns = append(b.sparseColumns, cb)
 	// Update bloom filter.
 	shared.AddToBloom(b.bloom[:], name)
 	return cb
 }
 
-// fillNullsForRow adds a null row to all sparse (non-intrinsic) columns whose
-// rowCount is behind rowIdx. Called after all present values for a row have been
-// written; any column still at rowIdx hasn't been written this row and needs a
-// null entry.
-//
-// Iterates b.sparseColumns (non-intrinsic columns) rather than the full b.columns
-// map, avoiding overhead for the always-present intrinsic column builders.
-func (b *blockBuilder) fillNullsForRow(rowIdx int) {
-	for _, cb := range b.sparseColumns {
-		if cb.rowCount() <= rowIdx {
-			switch cb.colType() {
-			case shared.ColumnTypeString, shared.ColumnTypeRangeString:
-				cb.addString("", false)
-			case shared.ColumnTypeInt64, shared.ColumnTypeRangeInt64, shared.ColumnTypeRangeDuration:
-				cb.addInt64(0, false)
-			case shared.ColumnTypeUint64, shared.ColumnTypeRangeUint64:
-				cb.addUint64(0, false)
-			case shared.ColumnTypeFloat64, shared.ColumnTypeRangeFloat64:
-				cb.addFloat64(0, false)
-			case shared.ColumnTypeBool:
-				cb.addBool(false, false)
-			default:
-				cb.addBytes(nil, false)
-			}
-		}
+// copyBytes returns a copy of src. Returns nil for empty/nil input.
+func copyBytes(src []byte) []byte {
+	if len(src) == 0 {
+		return nil
 	}
+	cp := make([]byte, len(src))
+	copy(cp, src)
+	return cp
 }
 
 // addRowFromProto adds all column values for one span row from a pendingSpan.
@@ -281,34 +336,37 @@ func (b *blockBuilder) fillNullsForRow(rowIdx int) {
 func (b *blockBuilder) addRowFromProto(ps *pendingSpan, rowIdx int) {
 	span := ps.span
 
-	// --- Intrinsic columns (direct concrete-type calls, no map lookup or interface dispatch) ---
+	// --- Intrinsic columns (indexed writes into pre-allocated slices) ---
 
 	// trace:id — always present; excluded from the range index.
-	b.colTraceID.addBytes(span.TraceId, true)
+	b.colTraceID.values[rowIdx] = copyBytes(span.TraceId)
+	b.colTraceID.present[rowIdx] = true
 
-	// span:id — may be absent; always written (null or present) to keep rowCount consistent.
-	spanIDPresent := len(span.SpanId) > 0
-	b.colSpanID.addBytes(span.SpanId, spanIDPresent)
-	if spanIDPresent {
+	// span:id — may be absent.
+	if len(span.SpanId) > 0 {
+		b.colSpanID.values[rowIdx] = copyBytes(span.SpanId)
+		b.colSpanID.present[rowIdx] = true
 		b.updateMinMax("span:id", shared.ColumnTypeBytes, string(span.SpanId))
 	}
 
-	// span:parent_id — may be absent; always written.
-	parentIDPresent := len(span.ParentSpanId) > 0
-	b.colParentID.addBytes(span.ParentSpanId, parentIDPresent)
-	if parentIDPresent {
+	// span:parent_id — may be absent.
+	if len(span.ParentSpanId) > 0 {
+		b.colParentID.values[rowIdx] = copyBytes(span.ParentSpanId)
+		b.colParentID.present[rowIdx] = true
 		b.updateMinMax("span:parent_id", shared.ColumnTypeBytes, string(span.ParentSpanId))
 	}
 
 	// span:name — always present.
-	b.colSpanName.addString(span.Name, true)
+	b.colSpanName.values[rowIdx] = span.Name
+	b.colSpanName.present[rowIdx] = true
 	if span.Name != "" {
 		b.updateMinMax("span:name", shared.ColumnTypeString, span.Name)
 	}
 
 	// span:kind — always present.
 	spanKind := int64(span.Kind)
-	b.colSpanKind.addInt64(spanKind, true)
+	b.colSpanKind.values[rowIdx] = spanKind
+	b.colSpanKind.present[rowIdx] = true
 	{
 		var tmp [8]byte
 		binary.LittleEndian.PutUint64(tmp[:], uint64(spanKind)) //nolint:gosec // safe: reinterpreting int64 bits as uint64
@@ -316,7 +374,9 @@ func (b *blockBuilder) addRowFromProto(ps *pendingSpan, rowIdx int) {
 	}
 
 	// span:start — always present.
-	b.colSpanStart.addUint64(span.StartTimeUnixNano, true)
+	b.colSpanStart.values[rowIdx] = span.StartTimeUnixNano
+	b.colSpanStart.present[rowIdx] = true
+	b.colSpanStart.trackMinMax(span.StartTimeUnixNano)
 	{
 		var tmp [8]byte
 		binary.LittleEndian.PutUint64(tmp[:], span.StartTimeUnixNano)
@@ -324,7 +384,9 @@ func (b *blockBuilder) addRowFromProto(ps *pendingSpan, rowIdx int) {
 	}
 
 	// span:end — always present.
-	b.colSpanEnd.addUint64(span.EndTimeUnixNano, true)
+	b.colSpanEnd.values[rowIdx] = span.EndTimeUnixNano
+	b.colSpanEnd.present[rowIdx] = true
+	b.colSpanEnd.trackMinMax(span.EndTimeUnixNano)
 	{
 		var tmp [8]byte
 		binary.LittleEndian.PutUint64(tmp[:], span.EndTimeUnixNano)
@@ -336,7 +398,9 @@ func (b *blockBuilder) addRowFromProto(ps *pendingSpan, rowIdx int) {
 	if span.EndTimeUnixNano >= span.StartTimeUnixNano {
 		dur = span.EndTimeUnixNano - span.StartTimeUnixNano
 	}
-	b.colSpanDur.addUint64(dur, true)
+	b.colSpanDur.values[rowIdx] = dur
+	b.colSpanDur.present[rowIdx] = true
+	b.colSpanDur.trackMinMax(dur)
 	{
 		var tmp [8]byte
 		binary.LittleEndian.PutUint64(tmp[:], dur)
@@ -347,13 +411,13 @@ func (b *blockBuilder) addRowFromProto(ps *pendingSpan, rowIdx int) {
 
 	if span.Status != nil {
 		if span.Status.Code != 0 {
-			b.addPresent("span:status", shared.ColumnTypeInt64, shared.AttrValue{
+			b.addPresent(rowIdx, "span:status", shared.ColumnTypeInt64, shared.AttrValue{
 				Type: shared.ColumnTypeInt64,
 				Int:  int64(span.Status.Code),
 			})
 		}
 		if span.Status.Message != "" {
-			b.addPresent("span:status_message", shared.ColumnTypeString, shared.AttrValue{
+			b.addPresent(rowIdx, "span:status_message", shared.ColumnTypeString, shared.AttrValue{
 				Type: shared.ColumnTypeString,
 				Str:  span.Status.Message,
 			})
@@ -361,21 +425,21 @@ func (b *blockBuilder) addRowFromProto(ps *pendingSpan, rowIdx int) {
 	}
 
 	if span.TraceState != "" {
-		b.addPresent("trace:state", shared.ColumnTypeString, shared.AttrValue{
+		b.addPresent(rowIdx, "trace:state", shared.ColumnTypeString, shared.AttrValue{
 			Type: shared.ColumnTypeString,
 			Str:  span.TraceState,
 		})
 	}
 
 	if ps.rs != nil && ps.rs.SchemaUrl != "" {
-		b.addPresent("resource:schema_url", shared.ColumnTypeString, shared.AttrValue{
+		b.addPresent(rowIdx, "resource:schema_url", shared.ColumnTypeString, shared.AttrValue{
 			Type: shared.ColumnTypeString,
 			Str:  ps.rs.SchemaUrl,
 		})
 	}
 
 	if ps.ss != nil && ps.ss.SchemaUrl != "" {
-		b.addPresent("scope:schema_url", shared.ColumnTypeString, shared.AttrValue{
+		b.addPresent(rowIdx, "scope:schema_url", shared.ColumnTypeString, shared.AttrValue{
 			Type: shared.ColumnTypeString,
 			Str:  ps.ss.SchemaUrl,
 		})
@@ -388,7 +452,7 @@ func (b *blockBuilder) addRowFromProto(ps *pendingSpan, rowIdx int) {
 		}
 		name := b.internColName(kv.Key, b.spanColNames, "span.")
 		val := protoToAttrValue(kv.Value)
-		b.addPresent(name, val.Type, val)
+		b.addPresent(rowIdx, name, val.Type, val)
 	}
 
 	// --- Resource attributes ---
@@ -399,7 +463,7 @@ func (b *blockBuilder) addRowFromProto(ps *pendingSpan, rowIdx int) {
 			}
 			name := b.internColName(kv.Key, b.resourceColNames, "resource.")
 			val := protoToAttrValue(kv.Value)
-			b.addPresent(name, val.Type, val)
+			b.addPresent(rowIdx, name, val.Type, val)
 		}
 	}
 
@@ -411,12 +475,9 @@ func (b *blockBuilder) addRowFromProto(ps *pendingSpan, rowIdx int) {
 			}
 			name := b.internColName(kv.Key, b.scopeColNames, "scope.")
 			val := protoToAttrValue(kv.Value)
-			b.addPresent(name, val.Type, val)
+			b.addPresent(rowIdx, name, val.Type, val)
 		}
 	}
-
-	// Fill null values for columns that existed before this row but weren't written.
-	b.fillNullsForRow(rowIdx)
 
 	// Update min/max start time.
 	if b.spanCount == 0 {
@@ -441,6 +502,236 @@ func (b *blockBuilder) addRowFromProto(ps *pendingSpan, rowIdx int) {
 
 	// Track trace → row indices.
 	b.traceRows[ps.traceID] = append(b.traceRows[ps.traceID], uint16(rowIdx)) //nolint:gosec // safe: rowIdx bounded by MaxBlockSpans (65535)
+
+	b.spanCount++
+}
+
+// baseColumnType normalizes Range column types to their base logical type.
+// Range types are an encoding detail (they enable range-index optimized storage) but
+// are logically identical to their base types for value reads and addPresent dispatch.
+func baseColumnType(t shared.ColumnType) shared.ColumnType {
+	switch t {
+	case shared.ColumnTypeRangeString:
+		return shared.ColumnTypeString
+	case shared.ColumnTypeRangeInt64, shared.ColumnTypeRangeDuration:
+		return shared.ColumnTypeInt64
+	case shared.ColumnTypeRangeUint64:
+		return shared.ColumnTypeUint64
+	case shared.ColumnTypeRangeFloat64:
+		return shared.ColumnTypeFloat64
+	case shared.ColumnTypeRangeBytes:
+		return shared.ColumnTypeBytes
+	default:
+		return t
+	}
+}
+
+// readDynAttrValue reads a typed value from col at rowIdx for dynamic attribute columns.
+// Returns the AttrValue and true on success; false if the column value is absent or unreadable.
+func readDynAttrValue(col *modules_reader.Column, rowIdx int, baseType shared.ColumnType) (shared.AttrValue, bool) {
+	var val shared.AttrValue
+	val.Type = baseType
+	switch baseType {
+	case shared.ColumnTypeString:
+		v, ok := col.StringValue(rowIdx)
+		if !ok {
+			return val, false
+		}
+		val.Str = v
+	case shared.ColumnTypeInt64:
+		v, ok := col.Int64Value(rowIdx)
+		if !ok {
+			return val, false
+		}
+		val.Int = v
+	case shared.ColumnTypeUint64:
+		v, ok := col.Uint64Value(rowIdx)
+		if !ok {
+			return val, false
+		}
+		val.Uint = v
+	case shared.ColumnTypeFloat64:
+		v, ok := col.Float64Value(rowIdx)
+		if !ok {
+			return val, false
+		}
+		val.Float = v
+	case shared.ColumnTypeBool:
+		v, ok := col.BoolValue(rowIdx)
+		if !ok {
+			return val, false
+		}
+		val.Bool = v
+	default: // bytes
+		v, ok := col.BytesValue(rowIdx)
+		if !ok {
+			return val, false
+		}
+		val.Bytes = slices.Clone(v)
+	}
+	return val, true
+}
+
+// addRowFromBlock adds all column values for one row from a source Block.
+// This is the native columnar path used by the compaction writer — it bypasses
+// all OTLP proto objects, reading typed values directly from decoded columns and
+// writing them into the destination block via addPresent.
+func (b *blockBuilder) addRowFromBlock(srcBlock *modules_reader.Block, srcRowIdx int, dstRowIdx int) {
+	var traceID [16]byte
+	var spanStart, spanEnd uint64
+	traceIDFound := false
+	spanStartFound := false
+	spanEndFound := false
+	durationFound := false
+
+	for name, col := range srcBlock.Columns() {
+		if !col.IsPresent(srcRowIdx) {
+			continue
+		}
+
+		baseType := baseColumnType(col.Type)
+
+		switch name {
+		case traceIDColumnName:
+			if v, ok := col.BytesValue(srcRowIdx); ok && len(v) == 16 {
+				b.colTraceID.values[dstRowIdx] = slices.Clone(v)
+				b.colTraceID.present[dstRowIdx] = true
+				copy(traceID[:], v)
+				traceIDFound = true
+			}
+			continue
+
+		case "span:id":
+			if v, ok := col.BytesValue(srcRowIdx); ok && len(v) > 0 {
+				b.colSpanID.values[dstRowIdx] = slices.Clone(v)
+				b.colSpanID.present[dstRowIdx] = true
+				b.updateMinMax("span:id", shared.ColumnTypeBytes, string(v))
+			}
+			continue
+
+		case "span:parent_id":
+			if v, ok := col.BytesValue(srcRowIdx); ok && len(v) > 0 {
+				b.colParentID.values[dstRowIdx] = slices.Clone(v)
+				b.colParentID.present[dstRowIdx] = true
+				b.updateMinMax("span:parent_id", shared.ColumnTypeBytes, string(v))
+			}
+			continue
+
+		case "span:name":
+			if v, ok := col.StringValue(srcRowIdx); ok {
+				b.colSpanName.values[dstRowIdx] = v
+				b.colSpanName.present[dstRowIdx] = true
+				if v != "" {
+					b.updateMinMax("span:name", shared.ColumnTypeString, v)
+				}
+			}
+			continue
+
+		case "span:kind":
+			if v, ok := col.Int64Value(srcRowIdx); ok {
+				b.colSpanKind.values[dstRowIdx] = v
+				b.colSpanKind.present[dstRowIdx] = true
+				var tmp [8]byte
+				binary.LittleEndian.PutUint64(tmp[:], uint64(v)) //nolint:gosec // safe: reinterpreting int64 bits as uint64
+				b.updateMinMax("span:kind", shared.ColumnTypeInt64, string(tmp[:]))
+			}
+			continue
+
+		case "span:start":
+			if v, ok := col.Uint64Value(srcRowIdx); ok {
+				b.colSpanStart.values[dstRowIdx] = v
+				b.colSpanStart.present[dstRowIdx] = true
+				b.colSpanStart.trackMinMax(v)
+				var tmp [8]byte
+				binary.LittleEndian.PutUint64(tmp[:], v)
+				b.updateMinMax("span:start", shared.ColumnTypeUint64, string(tmp[:]))
+				spanStart = v
+				spanStartFound = true
+			}
+			continue
+
+		case "span:end":
+			if v, ok := col.Uint64Value(srcRowIdx); ok {
+				b.colSpanEnd.values[dstRowIdx] = v
+				b.colSpanEnd.present[dstRowIdx] = true
+				b.colSpanEnd.trackMinMax(v)
+				var tmp [8]byte
+				binary.LittleEndian.PutUint64(tmp[:], v)
+				b.updateMinMax("span:end", shared.ColumnTypeUint64, string(tmp[:]))
+				spanEnd = v
+				spanEndFound = true
+			}
+			continue
+
+		case "span:duration":
+			if v, ok := col.Uint64Value(srcRowIdx); ok {
+				b.colSpanDur.values[dstRowIdx] = v
+				b.colSpanDur.present[dstRowIdx] = true
+				b.colSpanDur.trackMinMax(v)
+				var tmp [8]byte
+				binary.LittleEndian.PutUint64(tmp[:], v)
+				b.updateMinMax("span:duration", shared.ColumnTypeUint64, string(tmp[:]))
+				durationFound = true
+			}
+			continue
+		}
+
+		// Dynamic attribute columns: read typed value and call addPresent.
+		val, ok := readDynAttrValue(col, srcRowIdx, baseType)
+		if !ok {
+			continue
+		}
+		b.addPresent(dstRowIdx, name, baseType, val)
+	}
+
+	// If the source block lacked span:duration (e.g. filtered decode or older format),
+	// derive it from start and end — matching the proto path which always computes duration.
+	// Guard against underflow: if end < start (clock skew / corrupt data), use 0.
+	if !durationFound && spanStartFound && spanEndFound {
+		var dur uint64
+		if spanEnd >= spanStart {
+			dur = spanEnd - spanStart
+		}
+		b.colSpanDur.values[dstRowIdx] = dur
+		b.colSpanDur.present[dstRowIdx] = true
+		b.colSpanDur.trackMinMax(dur)
+		var tmp [8]byte
+		binary.LittleEndian.PutUint64(tmp[:], dur)
+		b.updateMinMax("span:duration", shared.ColumnTypeUint64, string(tmp[:]))
+	}
+
+	// Update min/max start time and trace ID bookkeeping — same as tail of addRowFromProto.
+	if b.spanCount == 0 {
+		if spanStartFound {
+			b.minStart = spanStart
+			b.maxStart = spanStart
+		}
+		if traceIDFound {
+			b.minTraceID = traceID
+			b.maxTraceID = traceID
+		}
+	} else {
+		if spanStartFound {
+			if spanStart < b.minStart {
+				b.minStart = spanStart
+			}
+			if spanStart > b.maxStart {
+				b.maxStart = spanStart
+			}
+		}
+		if traceIDFound {
+			if bytes.Compare(traceID[:], b.minTraceID[:]) < 0 {
+				b.minTraceID = traceID
+			}
+			if bytes.Compare(traceID[:], b.maxTraceID[:]) > 0 {
+				b.maxTraceID = traceID
+			}
+		}
+	}
+
+	if traceIDFound {
+		b.traceRows[traceID] = append(b.traceRows[traceID], uint16(dstRowIdx)) //nolint:gosec // safe: dstRowIdx bounded by MaxBlockSpans (65535)
+	}
 
 	b.spanCount++
 }
@@ -524,23 +815,39 @@ func rangeKeyLess(typ shared.ColumnType, a, b string) bool {
 }
 
 // addPresent writes a present (non-null) attribute value to the named column
-// and feeds the range index. Promoted from a closure inside addRow to eliminate
-// the per-span closure heap allocation (~24 bytes per span at scale).
-func (b *blockBuilder) addPresent(name string, typ shared.ColumnType, val shared.AttrValue) {
+// at the given row index and feeds the range index. Uses direct indexed writes
+// into pre-allocated slices, avoiding append and null-filling entirely.
+func (b *blockBuilder) addPresent(rowIdx int, name string, typ shared.ColumnType, val shared.AttrValue) {
 	cb := b.addColumn(name, typ)
+	if cb == nil {
+		return // type conflict with an existing same-named column; skip this value
+	}
 	switch typ {
 	case shared.ColumnTypeString, shared.ColumnTypeRangeString:
-		cb.addString(val.Str, true)
+		scb := cb.(*stringColumnBuilder)
+		scb.values[rowIdx] = val.Str
+		scb.present[rowIdx] = true
 	case shared.ColumnTypeInt64, shared.ColumnTypeRangeInt64, shared.ColumnTypeRangeDuration:
-		cb.addInt64(val.Int, true)
+		icb := cb.(*int64ColumnBuilder)
+		icb.values[rowIdx] = val.Int
+		icb.present[rowIdx] = true
 	case shared.ColumnTypeUint64, shared.ColumnTypeRangeUint64:
-		cb.addUint64(val.Uint, true)
+		ucb := cb.(*uint64ColumnBuilder)
+		ucb.values[rowIdx] = val.Uint
+		ucb.present[rowIdx] = true
+		ucb.trackMinMax(val.Uint)
 	case shared.ColumnTypeFloat64, shared.ColumnTypeRangeFloat64:
-		cb.addFloat64(val.Float, true)
+		fcb := cb.(*float64ColumnBuilder)
+		fcb.values[rowIdx] = val.Float
+		fcb.present[rowIdx] = true
 	case shared.ColumnTypeBool:
-		cb.addBool(val.Bool, true)
+		bcb := cb.(*boolColumnBuilder)
+		bcb.values[rowIdx] = val.Bool
+		bcb.present[rowIdx] = true
 	default: // bytes / rangebytes
-		cb.addBytes(val.Bytes, true)
+		bcb := cb.(*bytesColumnBuilder)
+		bcb.values[rowIdx] = val.Bytes
+		bcb.present[rowIdx] = true
 	}
 
 	// Feed range column index.

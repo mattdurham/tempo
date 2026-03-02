@@ -9,6 +9,7 @@ const (
 
 	VersionV10 uint8 = 10
 	VersionV11 uint8 = 11
+	VersionV12 uint8 = 12 // metadata section is snappy-compressed
 
 	FooterV3Version uint16 = 3
 	FooterV3Size    uint   = 22

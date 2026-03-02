@@ -5,6 +5,7 @@ package executor
 import (
 	"encoding/binary"
 	"math"
+	"sort"
 
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
 	modules_shared "github.com/grafana/blockpack/internal/modules/blockio/shared"
@@ -64,10 +65,30 @@ func buildPredicates(r *modules_reader.Reader, program *vm.Program) []queryplann
 		})
 	}
 
-	// Bloom-only predicates for accessed columns not covered by range index.
+	// Unscoped attributes: a single bloom-OR predicate across resource and span columns.
+	// Range-index pruning is skipped because it requires exactly one column.
+	// Sort keys for deterministic predicate ordering across runs.
+	unscopedKeys := make([]string, 0, len(preds.UnscopedColumnNames))
+	for k := range preds.UnscopedColumnNames {
+		unscopedKeys = append(unscopedKeys, k)
+	}
+	sort.Strings(unscopedKeys)
+	for _, k := range unscopedKeys {
+		result = append(result, queryplanner.Predicate{Columns: preds.UnscopedColumnNames[k]})
+	}
+
+	// Bloom-only predicates for accessed columns not covered by range index or unscoped OR.
+	unscopedCols := make(map[string]bool)
+	for _, colNames := range preds.UnscopedColumnNames {
+		for _, c := range colNames {
+			unscopedCols[c] = true
+		}
+	}
 	for _, col := range preds.AttributesAccessed {
 		if _, isDedicated := preds.DedicatedColumns[col]; !isDedicated {
-			result = append(result, queryplanner.Predicate{Columns: []string{col}})
+			if !unscopedCols[col] {
+				result = append(result, queryplanner.Predicate{Columns: []string{col}})
+			}
 		}
 	}
 

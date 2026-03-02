@@ -5,14 +5,15 @@ package blockio
 import (
 	"github.com/grafana/blockpack/internal/modules/blockio/reader"
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
+	modules_rw "github.com/grafana/blockpack/internal/modules/rw"
 )
 
 // ReaderProvider is the storage backend interface.
 // All implementations must be safe for concurrent use.
-type ReaderProvider = shared.ReaderProvider
+type ReaderProvider = modules_rw.ReaderProvider
 
 // DataType is a hint passed to ReaderProvider.ReadAt for caching layers.
-type DataType = shared.DataType
+type DataType = modules_rw.DataType
 
 // BlockMeta holds the parsed block index entry.
 type BlockMeta = shared.BlockMeta
@@ -40,13 +41,13 @@ type Column = reader.Column
 
 // DefaultProvider is the standard provider composition:
 // outer range cache, inner tracking, innermost user storage.
-type DefaultProvider = reader.DefaultProvider
+type DefaultProvider = modules_rw.DefaultProvider
 
 // TrackingReaderProvider wraps a ReaderProvider and counts I/O calls and bytes.
-type TrackingReaderProvider = reader.TrackingReaderProvider
+type TrackingReaderProvider = modules_rw.TrackingReaderProvider
 
 // RangeCachingProvider wraps a ReaderProvider with sub-range caching.
-type RangeCachingProvider = reader.RangeCachingProvider
+type RangeCachingProvider = modules_rw.RangeCachingProvider
 
 // ReaderOption is a functional option for NewReaderFromProvider.
 type ReaderOption = reader.Option
@@ -58,7 +59,7 @@ func NewReaderFromProvider(provider ReaderProvider, opts ...ReaderOption) (*Read
 
 // NewDefaultProvider wraps a storage provider with tracking + range caching.
 func NewDefaultProvider(underlying ReaderProvider) *DefaultProvider {
-	return reader.NewDefaultProvider(underlying)
+	return modules_rw.NewDefaultProvider(underlying)
 }
 
 // CoalesceBlocks merges adjacent block reads per cfg.

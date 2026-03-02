@@ -27,6 +27,7 @@ import (
 	modules_shared "github.com/grafana/blockpack/internal/modules/blockio/shared"
 	modules_executor "github.com/grafana/blockpack/internal/modules/executor"
 	modules_queryplanner "github.com/grafana/blockpack/internal/modules/queryplanner"
+	modules_rw "github.com/grafana/blockpack/internal/modules/rw"
 	"github.com/grafana/blockpack/internal/otlpconvert"
 	"github.com/grafana/blockpack/internal/traceqlparser"
 	"github.com/grafana/blockpack/internal/vm"
@@ -50,16 +51,16 @@ type Block = modules_reader.Block
 type Column = modules_reader.Column
 
 // DataType represents the type of data being read for caching optimization.
-type DataType = modules_shared.DataType
+type DataType = modules_rw.DataType
 
 // DataType constants for read optimization hints.
 const (
-	DataTypeFooter   = modules_shared.DataTypeFooter
-	DataTypeHeader   = modules_shared.DataTypeHeader
-	DataTypeMetadata = modules_shared.DataTypeMetadata
-	DataTypeBlock    = modules_shared.DataTypeBlock
-	DataTypeIndex    = modules_shared.DataTypeIndex
-	DataTypeCompact  = modules_shared.DataTypeCompact
+	DataTypeFooter   = modules_rw.DataTypeFooter
+	DataTypeHeader   = modules_rw.DataTypeHeader
+	DataTypeMetadata = modules_rw.DataTypeMetadata
+	DataTypeBlock    = modules_rw.DataTypeBlock
+	DataTypeIndex    = modules_rw.DataTypeIndex
+	DataTypeCompact  = modules_rw.DataTypeCompact
 )
 
 // ReaderProvider supplies random access to blockpack data.
@@ -140,7 +141,7 @@ func GetTraceByID(r *Reader, traceIDHex string, fn SpanMatchCallback) error {
 	return nil
 }
 
-// readerProviderAdapter adapts the public ReaderProvider to modules_shared.ReaderProvider.
+// readerProviderAdapter adapts the public ReaderProvider to modules_rw.ReaderProvider.
 type readerProviderAdapter struct {
 	provider ReaderProvider
 }
@@ -149,7 +150,7 @@ func (a *readerProviderAdapter) Size() (int64, error) {
 	return a.provider.Size()
 }
 
-func (a *readerProviderAdapter) ReadAt(p []byte, off int64, dataType modules_shared.DataType) (int, error) {
+func (a *readerProviderAdapter) ReadAt(p []byte, off int64, dataType modules_rw.DataType) (int, error) {
 	return a.provider.ReadAt(p, off, dataType)
 }
 
@@ -222,13 +223,16 @@ func (m *materializedSpanFields) IterateFields(fn func(name string, value any) b
 // Return false to stop iteration early.
 type SpanMatchCallback func(match *SpanMatch) bool
 
-// StreamTraceQL executes a TraceQL filter query against a modules-format blockpack file
+// StreamTraceQL executes a TraceQL query against a modules-format blockpack file
 // and calls fn for each matching span.
 //
-// Only TraceQL filter expressions are supported (e.g., `{ span.http.method = "GET" }`).
-// Structural TraceQL (>>, >, ~, <<, <, !~) and metrics queries return an error.
+// Supported query types:
+//   - Filter expressions: `{ span.http.method = "GET" }`
+//   - Structural queries: `{ expr } OP { expr }` where OP is >>, >, ~, <<, <, !~
 //
-// match.Fields implements GetField(name) and IterateFields backed by the modules block.
+// For filter queries, match.Fields implements GetField(name) and IterateFields backed
+// by the modules block. For structural queries, match.Fields is nil — only match.TraceID
+// and match.SpanID are populated. Metrics queries return an error.
 // fn may return false to stop iteration early.
 func StreamTraceQL(r *Reader, traceqlQuery string, opts QueryOptions, fn SpanMatchCallback) (err error) {
 	defer func() {
@@ -897,7 +901,7 @@ type WritableStorage interface {
 	Delete(path string) error
 }
 
-// storageReaderProvider adapts a Storage + path to modules_shared.ReaderProvider.
+// storageReaderProvider adapts a Storage + path to modules_rw.ReaderProvider.
 type storageReaderProvider struct {
 	storage Storage
 	path    string
@@ -907,7 +911,7 @@ func (p *storageReaderProvider) Size() (int64, error) {
 	return p.storage.Size(p.path)
 }
 
-func (p *storageReaderProvider) ReadAt(buf []byte, off int64, dataType modules_shared.DataType) (int, error) {
+func (p *storageReaderProvider) ReadAt(buf []byte, off int64, dataType modules_rw.DataType) (int, error) {
 	return p.storage.ReadAt(p.path, buf, off, dataType)
 }
 
@@ -969,7 +973,7 @@ func CompactBlocks(
 	cfg CompactionConfig,
 	output WritableStorage,
 ) ([]string, error) {
-	converted := make([]modules_shared.ReaderProvider, len(providers))
+	converted := make([]modules_rw.ReaderProvider, len(providers))
 	for i, p := range providers {
 		converted[i] = p
 	}

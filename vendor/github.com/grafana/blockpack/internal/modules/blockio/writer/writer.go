@@ -7,8 +7,10 @@ import (
 	"io"
 	"sync/atomic"
 
+	"github.com/golang/snappy"
 	tracev1 "go.opentelemetry.io/proto/otlp/trace/v1"
 
+	"github.com/grafana/blockpack/internal/modules/blockio/reader"
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
 )
 
@@ -16,6 +18,10 @@ import (
 // NOT thread-safe — concurrent calls will panic (NOTES §9).
 type Writer struct {
 	enc *zstdEncoder
+
+	// bb is the reusable block builder. Lazily created on first buildAndWriteBlock,
+	// then reset and reused for subsequent blocks to eliminate per-block allocations.
+	bb *blockBuilder
 
 	// trace_id → list of {blockID, rowIdx} across all blocks
 	traceIndex map[[16]byte][]traceBlockRef
@@ -241,9 +247,9 @@ func (w *Writer) Flush() (int64, error) {
 	// block min and max), so no re-scan is needed here.
 	applyRangeBuckets(w.rangeIdx, defaultRangeBuckets)
 
-	// 4. Write metadata section.
+	// 4. Write metadata section (snappy-compressed, V12).
 	metaBytes, err := buildMetadataSectionBytes(
-		shared.VersionV11,
+		shared.VersionV11, // block index uses V11 entry layout; block encoding is unchanged
 		w.blockMetas,
 		w.rangeIdx,
 		w.traceIndex,
@@ -252,14 +258,15 @@ func (w *Writer) Flush() (int64, error) {
 		return w.out.total, fmt.Errorf("writer: build metadata: %w", err)
 	}
 
-	metadataLen := uint64(len(metaBytes))
-	if _, err = w.out.Write(metaBytes); err != nil {
+	compressedMeta := snappy.Encode(nil, metaBytes)
+	metadataLen := uint64(len(compressedMeta))
+	if _, err = w.out.Write(compressedMeta); err != nil {
 		return w.out.total, fmt.Errorf("writer: write metadata: %w", err)
 	}
 
 	// 5. Write file header.
 	headerOffset := uint64(w.out.total) //nolint:gosec // safe: total bytes written fits in int64 and int64 fits in uint64 for file offsets
-	if err = writeFileHeader(&w.out, shared.VersionV11, metadataOffset, metadataLen); err != nil {
+	if err = writeFileHeader(&w.out, shared.VersionV12, metadataOffset, metadataLen); err != nil {
 		return w.out.total, fmt.Errorf("writer: write file header: %w", err)
 	}
 
@@ -299,7 +306,7 @@ func (w *Writer) writeEmptyFile() (int64, error) {
 
 	rIdx := make(rangeIndex)
 	metaBytes, err := buildMetadataSectionBytes(
-		shared.VersionV11,
+		shared.VersionV11, // block index uses V11 entry layout; block encoding is unchanged
 		nil,
 		rIdx,
 		w.traceIndex,
@@ -308,13 +315,14 @@ func (w *Writer) writeEmptyFile() (int64, error) {
 		return w.out.total, err
 	}
 
-	metadataLen := uint64(len(metaBytes))
-	if _, err = w.out.Write(metaBytes); err != nil {
+	compressedMeta := snappy.Encode(nil, metaBytes)
+	metadataLen := uint64(len(compressedMeta))
+	if _, err = w.out.Write(compressedMeta); err != nil {
 		return w.out.total, err
 	}
 
 	headerOffset := uint64(w.out.total) //nolint:gosec // safe: total bytes written fits in int64 and int64 fits in uint64 for file offsets
-	if err = writeFileHeader(&w.out, shared.VersionV11, metadataOffset, metadataLen); err != nil {
+	if err = writeFileHeader(&w.out, shared.VersionV12, metadataOffset, metadataLen); err != nil {
 		return w.out.total, err
 	}
 
@@ -336,7 +344,8 @@ func (w *Writer) writeEmptyFile() (int64, error) {
 func (w *Writer) buildAndWriteBlock(blockID int, pending []pendingSpan) error {
 	blockOffset := uint64(w.out.total) //nolint:gosec // safe: total bytes written fits in int64 and int64 fits in uint64 for file offsets
 
-	built, err := buildBlock(pending, w.enc)
+	built, bb, err := buildBlock(pending, w.enc, w.bb)
+	w.bb = bb
 	if err != nil {
 		return fmt.Errorf("writer: block %d finalize: %w", blockID, err)
 	}
@@ -475,6 +484,83 @@ func buildMetadataSectionBytes(
 	buf = append(buf, traceIdxData...)
 
 	return buf, nil
+}
+
+// AddRow buffers one row from a decoded Block for the columnar compaction path.
+// This avoids all OTLP proto allocations — values are read directly from block columns
+// at flush time by addRowFromBlock. The caller owns the block; it must remain valid
+// until Flush() is called.
+// Panics if called concurrently (NOTES §9).
+func (w *Writer) AddRow(block *reader.Block, rowIdx int) error {
+	if block == nil {
+		return fmt.Errorf("writer: AddRow: block is nil")
+	}
+	if rowIdx < 0 || rowIdx >= block.SpanCount() {
+		return fmt.Errorf("writer: AddRow: rowIdx %d out of range [0, %d)", rowIdx, block.SpanCount())
+	}
+	// Validate required intrinsic columns before acquiring the lock.
+	traceCol := block.GetColumn("trace:id")
+	if traceCol == nil {
+		return fmt.Errorf("writer: AddRow: required column %q missing", "trace:id")
+	}
+	traceBytes, traceOK := traceCol.BytesValue(rowIdx)
+	if !traceOK || len(traceBytes) != 16 {
+		return fmt.Errorf("writer: AddRow: required column %q must have 16 bytes, got %d", "trace:id", len(traceBytes))
+	}
+	spanIDCol := block.GetColumn("span:id")
+	if spanIDCol == nil {
+		return fmt.Errorf("writer: AddRow: required column %q missing", "span:id")
+	}
+	spanIDBytes, spanIDOK := spanIDCol.BytesValue(rowIdx)
+	if !spanIDOK || len(spanIDBytes) != 8 {
+		return fmt.Errorf("writer: AddRow: required column %q must have 8 bytes, got %d", "span:id", len(spanIDBytes))
+	}
+	startCol := block.GetColumn("span:start")
+	if startCol == nil {
+		return fmt.Errorf("writer: AddRow: required column %q missing", "span:start")
+	}
+	if _, ok := startCol.Uint64Value(rowIdx); !ok {
+		return fmt.Errorf("writer: AddRow: required column %q must have uint64 value at row %d", "span:start", rowIdx)
+	}
+	endCol := block.GetColumn("span:end")
+	if endCol == nil {
+		return fmt.Errorf("writer: AddRow: required column %q missing", "span:end")
+	}
+	if _, ok := endCol.Uint64Value(rowIdx); !ok {
+		return fmt.Errorf("writer: AddRow: required column %q must have uint64 value at row %d", "span:end", rowIdx)
+	}
+
+	if !w.inUse.CompareAndSwap(false, true) {
+		panic("writer: concurrent use detected")
+	}
+	defer w.inUse.Store(false)
+
+	var tid [16]byte
+	copy(tid[:], traceBytes)
+
+	var svcName string
+	if col := block.GetColumn("resource.service.name"); col != nil {
+		if v, ok := col.StringValue(rowIdx); ok {
+			svcName = v
+		}
+	}
+
+	ps := pendingSpan{
+		traceID:   tid,
+		svcName:   svcName,
+		srcBlock:  block,
+		srcRowIdx: rowIdx,
+	}
+	computeMinHashSigFromBlock(&ps, block)
+	w.pending = append(w.pending, ps)
+
+	if w.cfg.MaxBufferedSpans > 0 && len(w.pending) >= w.cfg.MaxBufferedSpans {
+		if err := w.flushBlocks(); err != nil {
+			return fmt.Errorf("writer: auto-flush: %w", err)
+		}
+	}
+
+	return nil
 }
 
 // CurrentSize returns estimated buffered size in bytes.

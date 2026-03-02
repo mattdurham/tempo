@@ -833,10 +833,10 @@ func attributeToTraceQLName(attr traceql.Attribute) string {
 	// Handle scoped attributes
 	scope := attr.Scope.String()
 	if scope == "none" || scope == "" {
-		// Unscoped attributes (e.g. .http.method) — blockpack requires an explicit scope
-		// prefix in its TraceQL.  Default to span scope, which covers the common case.
-		// Resource unscoped matches are accepted at evaluation time via AttributeFor.
-		return "span." + attr.Name
+		// Unscoped attributes (e.g. .http.method, .service.name): emit with a leading dot.
+		// Blockpack's compiler expands these to Union(resource.X, span.X), matching both
+		// resource and span columns — consistent with TraceQL semantics.
+		return "." + attr.Name
 	}
 
 	return fmt.Sprintf("%s.%s", scope, attr.Name)
