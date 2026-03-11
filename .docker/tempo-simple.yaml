@@ -41,7 +41,7 @@ storage:
     backend: s3
     s3:
       bucket: tempo-blockpack
-      endpoint: toxiproxy:9000
+      endpoint: s3fs:8080
       access_key: minioadmin
       secret_key: minioadmin
       insecure: true
@@ -63,7 +63,7 @@ backend_scheduler:
       max_input_blocks: 4
       max_compaction_level: 0
       compaction:
-        block_retention: 48h
+        block_retention: 1440h
         compacted_block_retention: 1h
         max_compaction_objects: 6000000
         max_block_bytes: 107374182400
@@ -74,7 +74,7 @@ backend_scheduler:
 
 backend_worker:
   compaction:
-    block_retention: 48h
+    block_retention: 1440h
     compacted_block_retention: 1h
     max_compaction_objects: 6000000
     max_block_bytes: 107374182400
