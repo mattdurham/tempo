@@ -39,13 +39,15 @@ block_builder:
   partitions_per_instance: 1
   block:
     version: vParquet5
+  wal:
+    ingestion_time_range_slack: 876000h
 
 storage:
   trace:
     backend: s3
     s3:
       bucket: tempo-parquet
-      endpoint: toxiproxy:9000
+      endpoint: s3fs:8080
       access_key: minioadmin
       secret_key: minioadmin
       insecure: true
@@ -53,6 +55,8 @@ storage:
       version: vParquet5
     wal:
       path: /var/tempo/wal
+      ingestion_time_range_slack: 876000h
+    blocklist_poll_fallback: true
 
 querier:
   query_live_store: true
@@ -67,7 +71,7 @@ backend_scheduler:
       max_input_blocks: 4
       max_compaction_level: 2
       compaction:
-        block_retention: 48h
+        block_retention: 1440h
         compacted_block_retention: 1h
         max_compaction_objects: 6000000
         max_block_bytes: 107374182400
@@ -78,7 +82,7 @@ backend_scheduler:
 
 backend_worker:
   compaction:
-    block_retention: 48h
+    block_retention: 1440h
     compacted_block_retention: 1h
     max_compaction_objects: 6000000
     max_block_bytes: 107374182400
@@ -88,7 +92,11 @@ backend_worker:
     compaction_cycle: 30s
 
 query_frontend:
+  rf1_after: 1970-01-01T00:00:00Z
   search:
+    max_duration: 0s
+  metrics:
+    max_duration: 0s
     duration_slo: 5s
     throughput_bytes_slo: 1073741824
   trace_by_id:
