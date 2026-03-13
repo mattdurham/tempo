@@ -18,6 +18,7 @@ package queryplanner
 // NOTE: Any changes to this file must be reflected in the corresponding specs.md or NOTES.md.
 
 import (
+	"cmp"
 	"slices"
 
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
@@ -46,57 +47,179 @@ type BlockIndexer interface {
 	// (8-byte LE for numeric types, raw string for string/bytes).
 	// Returns nil (no error) when the value is below all stored lower boundaries.
 	BlocksForRange(col string, queryValue shared.RangeValueKey) ([]int, error)
+
+	// BlocksForRangeInterval returns block indices from all buckets whose lower
+	// boundary falls within [minKey, maxKey]. This is useful for case-insensitive
+	// prefix lookups where the query spans a range of lexicographic values
+	// (e.g., "DEBUG" to "debug"). Returns nil when no buckets overlap the interval.
+	BlocksForRangeInterval(col string, minKey, maxKey shared.RangeValueKey) ([]int, error)
+
+	// BlocksInTimeRange returns block indices whose timestamp window overlaps
+	// [minNano, maxNano] using the per-file TS index (O(log n) binary search).
+	// Returns nil when the TS index is absent (old files); callers must fall back
+	// to a full BlockMeta scan in that case.
+	// The returned slice is sorted in ascending blockID order.
+	BlocksInTimeRange(minNano, maxNano uint64) []int
+
+	// ColumnSketch returns bulk per-block sketch data for the named column.
+	// Returns nil when no sketch data is available (old files or column not sketched).
+	// The returned ColumnSketch has methods returning slices indexed by block number.
+	ColumnSketch(col string) ColumnSketch
 }
 
-// Predicate is a bloom-filter condition used for block-level pruning.
+// LogicalOp specifies the boolean operator used to combine a Predicate's children.
+type LogicalOp uint8
+
+const (
+	// LogicalAND (default) combines children via intersection:
+	// a block must satisfy ALL children to be kept.
+	LogicalAND LogicalOp = 0
+
+	// LogicalOR combines children via union:
+	// a block satisfying ANY child is kept.
+	LogicalOR LogicalOp = 1
+)
+
+// Predicate is a tree node for bloom-filter and range-index block pruning.
 //
-// Semantics:
-//   - Within one Predicate, Columns are combined with OR: a block survives if its
-//     bloom filter reports any of the columns as possibly present. A block is pruned
-//     only when the bloom filter reports all columns as definitely absent.
-//   - Multiple Predicates passed to Plan are combined with AND: a block must survive
-//     every predicate to appear in the plan.
+// A Predicate is either a leaf or a composite node:
 //
-// This lets callers express both AND and OR query structures:
+//   - Leaf (len(Children) == 0): Columns and Values describe a single bloom + range
+//     index condition. Columns are OR-combined for bloom (block survives if any column
+//     is possibly present). Values are OR-combined for range index lookup.
 //
-//	// AND query:  { A && B }  → two predicates, each with one column
+//   - Composite (len(Children) > 0): Op specifies how Children are combined.
+//     LogicalAND: block must satisfy ALL children (intersection).
+//     LogicalOR:  block must satisfy AT LEAST ONE child (union).
+//
+// The top-level []Predicate passed to Plan is AND-combined: a block must satisfy every
+// top-level predicate to survive.
+//
+// Examples:
+//
+//	// AND query { A && B }: two leaf predicates at the top level.
 //	[]Predicate{{Columns: ["A"]}, {Columns: ["B"]}}
 //
-//	// OR query:   { A || B }  → one predicate with both columns
-//	[]Predicate{{Columns: ["A", "B"]}}
+//	// OR query { A || B } same column: one leaf with both values.
+//	[]Predicate{{Columns: ["col"], Values: ["A", "B"]}}
 //
-//	// Mixed:  { A && (B || C) }  → two predicates
-//	[]Predicate{{Columns: ["A"]}, {Columns: ["B", "C"]}}
+//	// OR query { A || B } different columns: composite OR node.
+//	[]Predicate{{Op: LogicalOR, Children: []Predicate{
+//	    {Columns: ["A"]}, {Columns: ["B"]},
+//	}}}
+//
+//	// Mixed { A && (B || C) }: leaf A AND composite OR of B, C.
+//	[]Predicate{
+//	    {Columns: ["A"]},
+//	    {Op: LogicalOR, Children: []Predicate{
+//	        {Columns: ["B"]}, {Columns: ["C"]},
+//	    }},
+//	}
+//
+//	// Fully nested { (A || B) && (C || D) }: two composite OR nodes.
+//	[]Predicate{
+//	    {Op: LogicalOR, Children: []Predicate{{Columns: ["A"]}, {Columns: ["B"]}}},
+//	    {Op: LogicalOR, Children: []Predicate{{Columns: ["C"]}, {Columns: ["D"]}}},
+//	}
 type Predicate struct {
 	// Columns holds one or more column names combined with OR for bloom pruning.
-	// An empty slice is a no-op for the bloom stage.
+	// Used only in leaf nodes (len(Children) == 0). An empty slice is a no-op.
 	Columns []string
 
 	// Values holds wire-encoded query values for range index lookup.
-	// When non-empty and ColType is set, the planner intersects the bloom-surviving
-	// candidates with the union of BlocksForRange results for each value.
-	// An empty slice skips the range index stage.
+	// Used only in leaf nodes. When non-empty and Columns has exactly one entry,
+	// the planner unions BlocksForRange results for each value.
 	Values []string
 
-	// ColType is the ColumnType needed to interpret Values in the range index.
-	// 0 (ColumnTypeString) is valid but only meaningful when Values is non-empty.
-	// When Values is empty, ColType is ignored.
+	// Children makes this a composite node. When non-empty, Columns/Values/ColType/
+	// IntervalMatch are ignored and Op controls how the children's block sets combine.
+	Children []Predicate
+
+	// ColType is informational: callers use it when wire-encoding Values before passing
+	// them in. The planner does not inspect ColType internally — it calls RangeColumnType
+	// to determine the indexed type. Used only in leaf nodes when Values is non-empty.
 	ColType shared.ColumnType
+
+	// IntervalMatch changes how Values is interpreted for range-index pruning.
+	// When false (default), Values are individual point lookups unioned together.
+	// When true, Values must have exactly 2 elements: Values[0] is the min key and
+	// Values[1] is the max key. All buckets whose lower boundary falls within
+	// [min, max] are included.
+	IntervalMatch bool
+
+	// Op specifies how Children are combined. Ignored when len(Children) == 0.
+	// LogicalAND (default): block must satisfy all children.
+	// LogicalOR: block must satisfy at least one child.
+	Op LogicalOp
+}
+
+// TimeRange is an optional time window for block-level pruning.
+// A zero-value TimeRange (both fields 0) disables time-range pruning.
+type TimeRange struct {
+	MinNano uint64 // inclusive lower bound (Unix nanoseconds); 0 means no lower bound
+	MaxNano uint64 // inclusive upper bound (Unix nanoseconds); 0 means no upper bound
+}
+
+// Direction controls the order of blocks in Plan.SelectedBlocks.
+type Direction uint8
+
+const (
+	// Forward returns blocks in ascending blockID order (oldest-first for time-sorted files).
+	Forward Direction = 0
+	// Backward returns blocks in descending blockID order (newest-first for time-sorted files).
+	Backward Direction = 1
+)
+
+// PlanOptions are additional planning parameters that do not affect block selection
+// but do affect block ordering and the Limit hint stored in the plan.
+type PlanOptions struct {
+	// Direction controls block ordering in SelectedBlocks. Default (zero) is Forward.
+	Direction Direction
+	// Limit is an informational hint for the executor: stop after collecting this many
+	// results. 0 means no limit. Stored in Plan.Limit; the executor uses it for early
+	// termination when iterating SelectedBlocks in the plan's direction.
+	Limit int
 }
 
 // Plan is the output of a planning step: the block indices to read.
 type Plan struct {
+	// BlockScores holds the per-block selectivity score (freq/max(cardinality,1)).
+	// Higher scores mean more selective (fewer distinct values = more useful for pruning).
+	// Only populated when sketch data is available.
+	BlockScores map[int]float64
+
+	// Explain is an ASCII trace of how the predicate tree resolved to block sets.
+	// Always populated when predicates are present. Example:
+	//   (resource.service.name=[0,1,2] || span.service.name=nil) => [0,1,2]
+	//   AND resource.env=[1,2,3]
+	//   => [1,2]
+	Explain string
+
 	// SelectedBlocks is a sorted slice of block indices to fetch.
 	SelectedBlocks []int
 
 	// TotalBlocks is the total number of blocks in the file.
 	TotalBlocks int
 
-	// PrunedByBloom is the number of blocks eliminated by column name bloom filters.
-	PrunedByBloom int
-
 	// PrunedByIndex is the number of blocks eliminated by range index lookups.
 	PrunedByIndex int
+
+	// PrunedByTime is the number of blocks eliminated by time-range comparison.
+	PrunedByTime int
+
+	// PrunedByFuse is the number of blocks eliminated by BinaryFuse8 membership checks.
+	PrunedByFuse int
+
+	// PrunedByCMS is the number of blocks eliminated by Count-Min Sketch zero-estimate checks.
+	PrunedByCMS int
+
+	// Limit is the early-termination hint passed via PlanOptions.
+	// 0 means no limit (all selected blocks should be scanned).
+	Limit int
+
+	// Direction is the ordering applied to SelectedBlocks (Forward or Backward).
+	// Set by PlanWithOptions; always Forward when Plan() is called directly.
+	Direction Direction
 }
 
 // Planner selects candidate blocks for a query.
@@ -110,32 +233,112 @@ func NewPlanner(r BlockIndexer) *Planner {
 	return &Planner{r: r}
 }
 
-// Plan returns the set of block indices to read for the given predicates.
+// Plan returns the set of block indices to read for the given predicates and time range.
+//
+// Stage 0 (time-range): blocks whose time window does not overlap [timeRange.MinNano,
+// timeRange.MaxNano] are eliminated. A zero TimeRange skips this stage.
 //
 // Each predicate applies an OR bloom check across its Columns: a block is removed
 // if all of its columns are definitely absent. When Values is non-empty, a range
 // index lookup further narrows the candidates. Multiple predicates are ANDed:
 // a block must survive every predicate. With no predicates, all blocks are selected.
-func (p *Planner) Plan(predicates []Predicate) *Plan {
+func (p *Planner) Plan(predicates []Predicate, timeRange TimeRange) *Plan {
 	total := p.r.BlockCount()
 	plan := &Plan{TotalBlocks: total}
 
-	if total == 0 || len(predicates) == 0 {
-		plan.SelectedBlocks = allBlocks(total)
+	if total == 0 {
+		// plan.SelectedBlocks is nil by zero-value, matching SPECS §5.2.
 		return plan
 	}
 
-	candidates := allBlockSet(total)
+	candidates := allBlocks(total)
 
-	for _, pred := range predicates {
-		plan.PrunedByBloom += pruneByBloom(p.r, candidates, pred)
-		pruned, err := pruneByIndex(p.r, candidates, pred)
-		if err == nil {
-			plan.PrunedByIndex += pruned
+	// Stage 0: Time-range pruning (metadata-only, zero I/O).
+	// Fast path: use the per-file TS index (O(log n)) when available.
+	// Slow path: fall back to O(n) BlockMeta scan for files without a TS index.
+	if timeRange.MinNano > 0 || timeRange.MaxNano > 0 {
+		if timeBlocks := p.r.BlocksInTimeRange(timeRange.MinNano, timeRange.MaxNano); timeBlocks != nil {
+			// TS index present: intersect candidates with the time-range result.
+			// Build a keep set with the same word-count as candidates (same n).
+			keep := make(blockSet, len(candidates))
+			for _, bi := range timeBlocks {
+				keep.set(bi)
+			}
+			candidates.iter(func(blockIdx int) {
+				if !keep.test(blockIdx) {
+					candidates.clear(blockIdx)
+					plan.PrunedByTime++
+				}
+			})
+		} else {
+			// Old file without TS index: scan BlockMeta for each candidate.
+			// Blocks with MinStart==0 && MaxStart==0 have unknown timestamps
+			// (e.g. older trace files). Never prune these — they must match all ranges.
+			candidates.iter(func(blockIdx int) {
+				meta := p.r.BlockMeta(blockIdx)
+				if meta.MinStart == 0 && meta.MaxStart == 0 {
+					return
+				}
+				tooOld := timeRange.MaxNano > 0 && meta.MinStart > timeRange.MaxNano
+				tooNew := timeRange.MinNano > 0 && meta.MaxStart < timeRange.MinNano
+				if tooOld || tooNew {
+					candidates.clear(blockIdx)
+					plan.PrunedByTime++
+				}
+			})
 		}
 	}
 
-	plan.SelectedBlocks = setToSortedSlice(candidates)
+	// Snapshot time-surviving blocks for explain output.
+	var timeBlocks []int
+	if plan.PrunedByTime > 0 {
+		timeBlocks = make([]int, 0, candidates.count())
+		candidates.iter(func(b int) {
+			timeBlocks = append(timeBlocks, b)
+		})
+		slices.Sort(timeBlocks)
+	}
+
+	if len(predicates) == 0 {
+		plan.SelectedBlocks = setToSortedByServiceAndTime(candidates, p.r, nil)
+		explainPlan(p.r, predicates, plan, timeBlocks)
+		return plan
+	}
+
+	// Stage 1: Range index pruning — recursive tree evaluation, top-level predicates AND-combined.
+	pruned, err := pruneByIndexAll(p.r, candidates, predicates)
+	if err == nil {
+		plan.PrunedByIndex += pruned
+	}
+
+	// Stage 2: BinaryFuse8 membership pruning — hard exclusion at ~0.39% FPR.
+	// NOTE-015: Fuse runs before CMS to eliminate clearly absent values cheaply.
+	plan.PrunedByFuse += pruneByFuseAll(p.r, candidates, predicates)
+
+	// Stage 3: Count-Min Sketch zero-estimate pruning — CMS estimate == 0 is definitely absent.
+	// NOTE-013: CMS never under-counts, so zero is a safe hard prune.
+	plan.PrunedByCMS += pruneByCMSAll(p.r, candidates, predicates)
+
+	plan.SelectedBlocks = setToSortedByServiceAndTime(candidates, p.r, predicates)
+	explainPlan(p.r, predicates, plan, timeBlocks)
+	return plan
+}
+
+// PlanWithOptions is like Plan but accepts PlanOptions to control block ordering and
+// stores a Limit hint in the returned Plan.
+//
+// When opts.Direction == Backward, SelectedBlocks is reversed in-place (descending order).
+// The executor iterates SelectedBlocks sequentially; reversing here gives newest-first
+// block traversal at zero additional cost.
+func (p *Planner) PlanWithOptions(predicates []Predicate, timeRange TimeRange, opts PlanOptions) *Plan {
+	plan := p.Plan(predicates, timeRange)
+	plan.Direction = opts.Direction
+	plan.Limit = opts.Limit
+	if opts.Direction == Backward {
+		for i, j := 0, len(plan.SelectedBlocks)-1; i < j; i, j = i+1, j-1 {
+			plan.SelectedBlocks[i], plan.SelectedBlocks[j] = plan.SelectedBlocks[j], plan.SelectedBlocks[i]
+		}
+	}
 	return plan
 }
 
@@ -145,30 +348,79 @@ func (p *Planner) FetchBlocks(plan *Plan) (map[int][]byte, error) {
 	return p.r.ReadBlocks(plan.SelectedBlocks)
 }
 
-// allBlocks returns a sorted slice [0, n).
-func allBlocks(n int) []int {
-	out := make([]int, n)
-	for i := range n {
-		out[i] = i
+// setToSortedByServiceAndTime converts the candidate set to a slice sorted by:
+//  1. CMS frequency of queried span:name values (descending) — blocks densest in the
+//     queried span name come first, improving early termination for name-filtered queries.
+//  2. MinStart timestamp (ascending) — time ordering within each name group.
+//  3. Block index (ascending) — stable tiebreaker.
+//
+// When no span:name predicate is present, sorting is by MinStart then block index.
+func setToSortedByServiceAndTime(s blockSet, r BlockIndexer, predicates []Predicate) []int {
+	out := make([]int, 0, s.count())
+	s.iter(func(k int) { out = append(out, k) })
+
+	// Extract span:name values from predicates.
+	nameValues := extractColumnValues("span:name", predicates)
+
+	// Build per-block span:name CMS counts (sum across all queried values).
+	var nameCounts []uint32
+	if len(nameValues) > 0 {
+		cs := r.ColumnSketch("span:name")
+		if cs != nil {
+			total := r.BlockCount()
+			nameCounts = make([]uint32, total)
+			for _, val := range nameValues {
+				ests := cs.CMSEstimate(val)
+				for bi := range min(len(ests), total) {
+					nameCounts[bi] += ests[bi]
+				}
+			}
+		}
 	}
+
+	slices.SortFunc(out, func(a, b int) int {
+		// Primary: higher span:name count first (descending).
+		if len(nameCounts) > 0 {
+			ca, cb := uint32(0), uint32(0)
+			if a < len(nameCounts) {
+				ca = nameCounts[a]
+			}
+			if b < len(nameCounts) {
+				cb = nameCounts[b]
+			}
+			if n := cmp.Compare(cb, ca); n != 0 { // descending
+				return n
+			}
+		}
+		// Secondary: MinStart ascending.
+		ma := r.BlockMeta(a)
+		mb := r.BlockMeta(b)
+		if n := cmp.Compare(ma.MinStart, mb.MinStart); n != 0 {
+			return n
+		}
+		return cmp.Compare(a, b)
+	})
 	return out
 }
 
-// allBlockSet returns a set containing all block indices [0, n).
-func allBlockSet(n int) map[int]struct{} {
-	s := make(map[int]struct{}, n)
-	for i := range n {
-		s[i] = struct{}{}
+// extractColumnValues collects all equality-predicate values for the named column
+// from the predicate tree (leaf nodes only, non-interval).
+func extractColumnValues(column string, predicates []Predicate) []string {
+	var vals []string
+	for _, p := range predicates {
+		collectColumnValues(column, p, &vals)
 	}
-	return s
+	return vals
 }
 
-// setToSortedSlice converts the candidate set to a sorted slice.
-func setToSortedSlice(s map[int]struct{}) []int {
-	out := make([]int, 0, len(s))
-	for k := range s {
-		out = append(out, k)
+func collectColumnValues(column string, p Predicate, out *[]string) {
+	if len(p.Children) > 0 {
+		for _, child := range p.Children {
+			collectColumnValues(column, child, out)
+		}
+		return
 	}
-	slices.Sort(out)
-	return out
+	if len(p.Columns) == 1 && p.Columns[0] == column && !p.IntervalMatch {
+		*out = append(*out, p.Values...)
+	}
 }

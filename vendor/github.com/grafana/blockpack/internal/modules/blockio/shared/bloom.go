@@ -5,95 +5,56 @@ package shared
 
 import (
 	"encoding/binary"
-	"hash/fnv"
 )
 
-// BloomHash1 computes FNV-1a 32-bit hash of name, result % 256.
-func BloomHash1(name string) uint8 {
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(name))
-	return uint8(h.Sum32() % 256) //nolint:gosec // safe: result of % 256 always fits in uint8
-}
-
-// BloomHash2 computes MurmurHash3 32-bit hash of name, result % 256.
-// Pure-Go implementation to avoid unsafe pointer arithmetic in external packages.
-func BloomHash2(name string) uint8 {
-	return uint8(murmur32([]byte(name)) % 256) //nolint:gosec // safe: result of % 256 always fits in uint8
-}
-
-// murmur32 is a pure-Go MurmurHash3 32-bit implementation (seed=0).
-func murmur32(data []byte) uint32 {
-	const (
-		c1 = uint32(0xcc9e2d51)
-		c2 = uint32(0x1b873593)
-		r1 = 15
-		r2 = 13
-		m  = uint32(5)
-		n  = uint32(0xe6546b64)
-	)
-
-	h := uint32(0)
-	nblocks := len(data) / 4
-
-	for i := range nblocks {
-		k := binary.LittleEndian.Uint32(data[i*4:])
-		k *= c1
-		k = (k << r1) | (k >> (32 - r1))
-		k *= c2
-		h ^= k
-		h = (h << r2) | (h >> (32 - r2))
-		h = h*m + n
+// TraceIDBloomSize returns the byte size of the trace ID bloom filter for the given trace count.
+// Sized at TraceIDBloomBitsPerTrace bits per trace (≈0.8% FP with k=7), clamped to
+// [TraceIDBloomMinBytes, TraceIDBloomMaxBytes].
+func TraceIDBloomSize(traceCount int) int {
+	if traceCount <= 0 {
+		return TraceIDBloomMinBytes
 	}
-
-	tail := data[nblocks*4:]
-	var k1 uint32
-
-	switch len(tail) {
-	case 3:
-		k1 ^= uint32(tail[2]) << 16
-
-		fallthrough
-	case 2:
-		k1 ^= uint32(tail[1]) << 8
-
-		fallthrough
-	case 1:
-		k1 ^= uint32(tail[0])
-		k1 *= c1
-		k1 = (k1 << r1) | (k1 >> (32 - r1))
-		k1 *= c2
-		h ^= k1
+	bytes := (traceCount*TraceIDBloomBitsPerTrace + 7) / 8
+	if bytes < TraceIDBloomMinBytes {
+		return TraceIDBloomMinBytes
 	}
-
-	h ^= uint32(len(data)) //nolint:gosec // safe: bloom filter hashing
-	h ^= h >> 16
-	h *= 0x85ebca6b
-	h ^= h >> 13
-	h *= 0xc2b2ae35
-	h ^= h >> 16
-
-	return h
+	if bytes > TraceIDBloomMaxBytes {
+		return TraceIDBloomMaxBytes
+	}
+	return bytes
 }
 
-// SetBit sets bit pos in the bloom slice.
-// The slice must be at least ceil((pos+1)/8) bytes long.
-func SetBit(bloom []byte, pos uint8) {
-	bloom[pos/8] |= 1 << (pos % 8)
+// AddTraceIDToBloom adds a 16-byte trace ID to the bloom filter.
+// Uses Kirsch-Mitzenmacher double-hashing: h_i = (h1 + i*h2) mod m, with h1 and h2
+// derived directly from the trace ID bytes (which are already random UUIDs).
+// No-op for nil or empty bloom slices.
+func AddTraceIDToBloom(bloom []byte, traceID [16]byte) {
+	if len(bloom) == 0 {
+		return
+	}
+	m := uint64(len(bloom)) * 8
+	h1 := binary.LittleEndian.Uint64(traceID[0:8])
+	h2 := binary.LittleEndian.Uint64(traceID[8:16]) | 1 // force odd for good stride distribution
+	for i := range uint64(TraceIDBloomK) {
+		pos := (h1 + i*h2) % m
+		bloom[pos/8] |= 1 << (pos % 8) //nolint:gosec // safe: pos%8 is always 0..7, fits in uint
+	}
 }
 
-// IsBitSet tests whether bit pos is set in the bloom slice.
-// The slice must be at least ceil((pos+1)/8) bytes long.
-func IsBitSet(bloom []byte, pos uint8) bool {
-	return bloom[pos/8]&(1<<(pos%8)) != 0
-}
-
-// AddToBloom adds name to the bloom filter by setting both hash bits.
-func AddToBloom(bloom []byte, name string) {
-	SetBit(bloom, BloomHash1(name))
-	SetBit(bloom, BloomHash2(name))
-}
-
-// TestBloom returns false only if name is definitely absent from the filter.
-func TestBloom(bloom []byte, name string) bool {
-	return IsBitSet(bloom, BloomHash1(name)) && IsBitSet(bloom, BloomHash2(name))
+// TestTraceIDBloom returns false only if traceID is definitely absent from the filter.
+// Returns true for nil or empty bloom (vacuous — no false negatives for old files).
+func TestTraceIDBloom(bloom []byte, traceID [16]byte) bool {
+	if len(bloom) == 0 {
+		return true
+	}
+	m := uint64(len(bloom)) * 8
+	h1 := binary.LittleEndian.Uint64(traceID[0:8])
+	h2 := binary.LittleEndian.Uint64(traceID[8:16]) | 1
+	for i := range uint64(TraceIDBloomK) {
+		pos := (h1 + i*h2) % m
+		if bloom[pos/8]&(1<<(pos%8)) == 0 { //nolint:gosec // safe: pos%8 is always 0..7, fits in uint
+			return false
+		}
+	}
+	return true
 }

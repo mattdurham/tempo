@@ -81,6 +81,9 @@ func (c *Compactor) Compact(ctx context.Context, l log.Logger, r backend.Reader,
 		endTime:           maxBlockEnd,
 	}
 
+	// Initialize disk cache on first compaction (no-op if already initialized).
+	ConfigureFileCache(c.opts.BlockConfig.Blockpack.FileCachePath, c.opts.BlockConfig.Blockpack.FileCacheMaxBytes)
+
 	cfg := blockpack.CompactionConfig{
 		MaxSpansPerBlock: maxSpansFromConfig(&c.opts.BlockConfig),
 	}
@@ -165,16 +168,12 @@ func (s *tempoOutputStorage) Put(path string, data []byte) error {
 		return fmt.Errorf("write blockpack data: %w", err)
 	}
 
-	// Count total spans by parsing the in-memory blockpack bytes. This avoids
-	// an extra backend round-trip and sets TotalObjects so that the Tempo
-	// compaction scheduler can prioritise blocks.
+	// Parse the in-memory blockpack bytes to extract trace count and actual span
+	// time range. TotalObjects must be trace count (not span count) to be consistent
+	// with create.go and Tempo's compaction priority logic.
+	// StartTime/EndTime are set from actual span timestamps so Tempo's block selector
+	// can skip this block for queries outside its time range.
 	var totalObjects int64
-	if r, err := blockpack.NewReaderFromProvider(&bytesReaderProvider{data: data}); err == nil {
-		for i := range r.BlockCount() {
-			totalObjects += int64(r.BlockMeta(i).SpanCount)
-		}
-	}
-
 	meta := &backend.BlockMeta{
 		BlockID:           newID,
 		TenantID:          s.tenantID,
@@ -184,8 +183,17 @@ func (s *tempoOutputStorage) Put(path string, data []byte) error {
 		DedicatedColumns:  s.dedicatedColumns,
 		StartTime:         s.startTime,
 		EndTime:           s.endTime,
-		Size_:             uint64(len(data)),
-		TotalObjects:      totalObjects,
+		Size_:        uint64(len(data)),
+		TotalObjects: totalObjects,
+		// TotalRecords is set by setBlockTimeRange to the internal block count,
+		// allowing the frontend sharder to split this file into sub-file jobs.
+		// Must be >= 1 or the sharder skips the block.
+		TotalRecords: 1, // default; overwritten by setBlockTimeRange below
+	}
+	if r, err := blockpack.NewReaderFromProvider(&bytesReaderProvider{data: data}); err == nil {
+		totalObjects = int64(r.TraceCount())
+		meta.TotalObjects = totalObjects
+		setBlockTimeRange(meta, data)
 	}
 
 	if err := s.writer.WriteBlockMeta(ctx, meta); err != nil {
@@ -211,16 +219,21 @@ func (s *tempoOutputStorage) Delete(path string) error {
 	return nil
 }
 
+const (
+	minSpansPerBlock = 100
+	maxSpansPerBlock = 10000
+)
+
 func maxSpansFromConfig(cfg *common.BlockConfig) int {
-	if cfg.RowGroupSizeBytes <= 0 {
-		return 0 // blockpack will use its default of 2000
+	if cfg.RowGroupSizeBytes == 0 {
+		return 0
 	}
-	n := cfg.RowGroupSizeBytes / 1024 // ~1KB per span estimate
-	if n < 100 {
-		return 100
+	n := cfg.RowGroupSizeBytes / 1024
+	if n < minSpansPerBlock {
+		n = minSpansPerBlock
 	}
-	if n > 10000 {
-		return 10000
+	if n > maxSpansPerBlock {
+		n = maxSpansPerBlock
 	}
 	return n
 }

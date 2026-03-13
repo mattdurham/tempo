@@ -49,12 +49,9 @@ type TrackingReaderProvider = modules_rw.TrackingReaderProvider
 // RangeCachingProvider wraps a ReaderProvider with sub-range caching.
 type RangeCachingProvider = modules_rw.RangeCachingProvider
 
-// ReaderOption is a functional option for NewReaderFromProvider.
-type ReaderOption = reader.Option
-
 // NewReaderFromProvider constructs a Reader from any storage backend.
-func NewReaderFromProvider(provider ReaderProvider, opts ...ReaderOption) (*Reader, error) {
-	return reader.NewReaderFromProvider(provider, opts...)
+func NewReaderFromProvider(provider ReaderProvider) (*Reader, error) {
+	return reader.NewReaderFromProvider(provider)
 }
 
 // NewDefaultProvider wraps a storage provider with tracking + range caching.

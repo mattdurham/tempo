@@ -16,6 +16,7 @@ All benchmarks pre-build the reader outside the timed loop.
 ---
 
 ## BENCH-EX-01: BenchmarkExecute_MatchAll
+*Status: not yet implemented*
 
 Measures end-to-end Execute cost for `{}` against an in-memory file.
 
@@ -40,6 +41,7 @@ b.ReportMetric(float64(b.N*len(result.Matches))/elapsed.Seconds(), "matches/sec"
 ---
 
 ## BENCH-EX-02: BenchmarkExecute_ServiceFilter
+*Status: not yet implemented*
 
 Measures Execute cost for a service-name equality filter that selects ~10% of spans.
 
@@ -56,6 +58,7 @@ b.ReportMetric(float64(result.BytesRead)/float64(b.N), "bytes_read/op")
 ---
 
 ## BENCH-EX-03: BenchmarkExecute_Limit
+*Status: not yet implemented*
 
 Measures the early-exit benefit of `Options.Limit` for large result sets.
 

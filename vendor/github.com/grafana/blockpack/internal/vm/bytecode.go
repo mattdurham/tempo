@@ -3,8 +3,6 @@ package vm
 
 import (
 	"regexp"
-
-	"github.com/theory/jsonpath"
 )
 
 // InstructionFunc is a closure that executes a single bytecode instruction
@@ -13,7 +11,7 @@ type InstructionFunc func(vm *VM) int
 
 // Value represents a runtime value in the VM
 type Value struct {
-	Data interface{} // int64, float64, string, bool, []byte, []Value, *JSONValue, or nil
+	Data interface{} // int64, float64, string, bool, []byte, []Value, or nil
 	Type ValueType
 }
 
@@ -35,18 +33,7 @@ const (
 	TypeDuration
 	// TypeBytes represents a byte slice value.
 	TypeBytes
-	// TypeArray represents an array value ([]Value).
-	TypeArray
-	// TypeJSON represents a JSON value.
-	TypeJSON
 )
-
-// UnscopedColumnPrefix prefixes predicate keys that represent an unscoped attribute
-// expanded into multiple scoped columns.
-const UnscopedColumnPrefix = "__unscoped__:"
-
-// JSONPathNoCache signals that a JSONPath should be parsed at runtime.
-const JSONPathNoCache = ^uint16(0)
 
 // ColumnPredicate is a compiled query closure that executes against blockpack data.
 // This is the core of the closure-based execution model - the SQL/TraceQL compiler
@@ -61,49 +48,45 @@ type RowCallback func(rowIdx int) bool
 // Returns number of matches and any error
 type StreamingColumnPredicate func(provider ColumnDataProvider, callback RowCallback) (int, error)
 
-// RangePredicate represents a range constraint on a column (e.g., >= 400, < 500)
-type RangePredicate struct {
-	MinValue     *Value // nil = no lower bound
-	MaxValue     *Value // nil = no upper bound
-	MinInclusive bool   // true for >=, false for >
-	MaxInclusive bool   // true for <=, false for <
+// RangeNode is a node in the block-pruning predicate tree.
+//
+// Leaf node (len(Children) == 0): Column names the fully-scoped column to look up.
+// At most one of Values, Min/Max, or Pattern is meaningful:
+//   - Values non-empty: equality / point-lookup (values are OR'd together).
+//   - Min or Max non-nil: interval lookup for range predicates (>, >=, <, <=).
+//   - Pattern non-empty: regex pattern; buildPredicates extracts a literal prefix.
+//
+// Composite node (len(Children) > 0): IsOR controls combination semantics.
+//   - IsOR=false (AND): block must satisfy ALL children.
+//   - IsOR=true  (OR):  block must satisfy AT LEAST ONE child with a range index;
+//     children whose column has no range index are skipped (treated as empty).
+//
+// Unscoped attribute predicates (e.g. .service.name = "bob") are expanded at compile
+// time into OR composites covering resource.*, span.*, and log.* scoped children.
+type RangeNode struct {
+	Min *Value // interval lower bound (nil = no lower bound)
+	Max *Value // interval upper bound (nil = no upper bound)
+	// Leaf fields — set when len(Children) == 0.
+	Column  string // fully-scoped column (e.g. "resource.service.name", "span:duration")
+	Pattern string // regex pattern for prefix-based range pruning
+
+	Values   []Value // equality lookup values; multiple values are OR'd
+	Children []RangeNode
+
+	// Composite fields — set when len(Children) > 0.
+	IsOR bool
 }
 
-// QueryPredicates contains extracted predicates for block-level filtering
-// Moved here from executor package to avoid circular dependency
+// QueryPredicates holds block-level pruning predicates extracted from a compiled query.
 type QueryPredicates struct {
-	// Attribute equality filters: attribute name -> values
-	AttributeEquals map[string][]Value
+	// Nodes is the top-level AND-combined list of pruning predicates.
+	// Each node is either a leaf (Column + values/range/pattern) or a composite (IsOR + Children).
+	Nodes []RangeNode
 
-	// Whether query accesses specific dedicated columns
-	DedicatedColumns map[string][]Value // column name -> values
-
-	// Unscoped dedicated columns expanded into OR across scopes.
-	// Key is UnscopedColumnPrefix + raw attribute path.
-	UnscopedColumnNames map[string][]string
-
-	// Regex patterns on dedicated columns (for LIKE queries)
-	// Maps column name -> regex pattern
-	DedicatedColumnsRegex map[string]string
-
-	// Range predicates on regular attributes (e.g., status_code >= 400)
-	AttributeRanges map[string]*RangePredicate
-
-	// Range predicates on dedicated columns (e.g., span.http.status_code >= 400)
-	DedicatedRanges map[string]*RangePredicate
-
-	// Attributes accessed (for bloom filter checking)
-	AttributesAccessed []string
-
-	// Trace ID filters (if any)
-	TraceIDEquals [][16]byte
-
-	// Time range filters (already handled separately in QueryOptions)
-	HasTimeFilter bool
-
-	// Whether the query contains OR operations
-	// If true, AttributeEquals predicates cannot be safely used for block pruning
-	HasOROperations bool
+	// Columns lists every attribute column accessed by the query.
+	// Used by ProgramWantColumns to select columns for the first-pass block decode.
+	// Includes columns from negation predicates that cannot appear in Nodes.
+	Columns []string
 }
 
 // Program represents a compiled TraceQL or SQL expression
@@ -114,64 +97,17 @@ type Program struct {
 	StreamingColumnPredicate StreamingColumnPredicate // Streaming version for aggregation (avoids RowSet)
 	Predicates               *QueryPredicates         // Extracted predicates for block-level pruning
 
-	// === Aggregation (SQL GROUP BY / aggregate functions) ===
-	AggregationPlan *AggregationPlan // Aggregation specification (nil if not an aggregate query)
-	OriginalQuery   string           // Original TraceQL query (optional, for debugging)
+	OriginalQuery string // Original TraceQL query (optional, for debugging)
 
 	// === VM Bytecode Execution (TraceQL) ===
 	Instructions []InstructionFunc // Closure for each instruction
 	Constants    []Value           // Constant pool
 	Attributes   []string          // Attribute names for lookups
 	Regexes      []*RegexCache     // Compiled regexes for =~ and !~
-	JSONPaths    []*JSONPathCache  // Compiled JSONPath queries
-}
-
-// AggFunction represents the type of aggregation function
-type AggFunction int
-
-const (
-	// AggCount represents a count aggregation function.
-	AggCount AggFunction = iota
-	// AggSum represents a sum aggregation function.
-	AggSum
-	// AggAvg represents an average aggregation function.
-	AggAvg
-	// AggMin represents a minimum aggregation function.
-	AggMin
-	// AggMax represents a maximum aggregation function.
-	AggMax
-	// AggRate represents a rate aggregation function.
-	AggRate
-	// AggQuantile represents a quantile aggregation function.
-	AggQuantile
-	// AggHistogram represents a histogram aggregation function.
-	AggHistogram
-	// AggStddev represents a standard deviation aggregation function.
-	AggStddev
-)
-
-// AggSpec specifies a single aggregation operation
-type AggSpec struct {
-	Field    string      // Field name to aggregate (empty for COUNT(*))
-	Alias    string      // Output column name (optional)
-	Function AggFunction // The aggregation function to apply
-	Quantile float64     // Quantile value (0-1) for QUANTILE function
-}
-
-// AggregationPlan describes how to perform aggregation on query results
-type AggregationPlan struct {
-	GroupByFields []string  // Fields to group by (empty for global aggregation)
-	Aggregates    []AggSpec // Aggregation functions to compute
 }
 
 // RegexCache holds a compiled regex pattern
 type RegexCache struct {
 	Regex   *regexp.Regexp // Nil until lazily compiled
 	Pattern string
-}
-
-// JSONPathCache holds a compiled JSONPath query.
-type JSONPathCache struct {
-	Compiled *jsonpath.Path // Nil until lazily compiled
-	Path     string
 }

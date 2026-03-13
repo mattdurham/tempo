@@ -15,6 +15,10 @@ real_world_comparison/*.parquet/
 # Benchmark artifacts
 benchmark/unified.txt
 benchmark/cost_analysis.txt
+benchmark/lokibench/testdata/
+benchmark/lokibench-logs.html
+benchmark/lokibench-bench.html
+benchmark/lokibench-largescale.html
 
 # Benchmark versioned results
 benchmark_results/
@@ -71,3 +75,6 @@ api
 
 # MCP server storage (local only)
 .blockpack-mcp/
+
+# Generated benchmark HTML reports
+benchmark/*.html

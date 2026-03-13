@@ -105,7 +105,7 @@ func parseRangeColumnEntry(
 	typedCount := int(binary.LittleEndian.Uint32(data[pos:]))
 	pos += 4
 
-	_, newPos2, err2 := skipTypedBoundaries(data, pos, colType, typedCount)
+	newPos2, err2 := skipTypedBoundaries(data, pos, colType, typedCount)
 	if err2 != nil {
 		return colName, idx, pos, fmt.Errorf("range entry %q: typed boundaries: %w", colName, err2)
 	}

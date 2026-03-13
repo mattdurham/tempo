@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"github.com/go-kit/log/level"
 	"github.com/grafana/dskit/user"
 	"github.com/parquet-go/parquet-go"
+	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 
 	"github.com/grafana/tempo/modules/distributor/forwarder/otlpgrpc"
@@ -39,12 +41,14 @@ func (a *arrayFlags) Set(value string) error {
 
 func main() {
 	var (
-		dir           string
-		endpoints     arrayFlags
-		insecure      bool
-		certFile      string
-		maxBatchBytes int
-		orgID         string
+		dir              string
+		endpoints        arrayFlags
+		insecure         bool
+		certFile         string
+		maxBatchBytes    int
+		maxInputGB       float64
+		orgID            string
+		rebaseTimestamps bool
 	)
 
 	flag.StringVar(&dir, "dir", "", "Directory containing Tempo block folders (<uuid>/data.parquet + meta.json)")
@@ -52,7 +56,9 @@ func main() {
 	flag.BoolVar(&insecure, "insecure", false, "Disable TLS for OTLP gRPC connections")
 	flag.StringVar(&certFile, "cert-file", "", "TLS certificate file for OTLP gRPC connections")
 	flag.IntVar(&maxBatchBytes, "max-batch-bytes", 3*1024*1024, "Max batch size in bytes before flushing (default 3MiB)")
+	flag.Float64Var(&maxInputGB, "max-input-gb", 0, "Stop after sending this many GB of OTLP data (0 = unlimited)")
 	flag.StringVar(&orgID, "org-id", "anonymous", "Org ID / tenant ID to send with requests (X-Scope-OrgID)")
+	flag.BoolVar(&rebaseTimestamps, "rebase-timestamps", false, "Shift all span timestamps so the newest trace ends at today's date")
 	flag.Parse()
 
 	logger := log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr))
@@ -116,22 +122,35 @@ func main() {
 	}
 	level.Info(logger).Log("msg", "found blocks", "count", len(blocks), "dir", dir)
 
+	var tsOffset time.Duration
+	if rebaseTimestamps {
+		tsOffset = computeTimestampOffset(blocks, logger)
+		level.Info(logger).Log("msg", "rebasing timestamps", "offset", tsOffset)
+	}
+
+	maxSendBytes := int64(maxInputGB * 1024 * 1024 * 1024)
 	totalTraces, totalBatches := 0, 0
+	var sentBytes atomic.Int64
 	for _, b := range blocks {
-		if ctx.Err() != nil {
+		if maxSendBytes > 0 && sentBytes.Load() >= maxSendBytes {
+			level.Info(logger).Log("msg", "reached send limit", "limit_gb", maxInputGB,
+				"sent_gb", fmt.Sprintf("%.2f", float64(sentBytes.Load())/(1024*1024*1024)))
 			break
 		}
-		n, batches, err := processBlock(ctx, b, fwd, maxBatchBytes, logger)
+
+		n, batches, err := processBlock(ctx, b, fwd, maxBatchBytes, tsOffset, &sentBytes, logger)
 		totalTraces += n
 		totalBatches += batches
 		if err != nil {
-			level.Error(logger).Log("msg", "error processing block", "block", b.parquetPath, "err", err)
+			level.Error(logger).Log("msg", "error processing blocks", "err", err)
 			os.Exit(1)
 		}
-		level.Info(logger).Log("msg", "processed block", "block", filepath.Base(filepath.Dir(b.parquetPath)), "traces", n, "batches", batches)
+		level.Info(logger).Log("msg", "processed block", "block", filepath.Base(filepath.Dir(b.parquetPath)), "traces", n, "batches", batches,
+			"sent_gb", fmt.Sprintf("%.2f", float64(sentBytes.Load())/(1024*1024*1024)))
 	}
 
-	level.Info(logger).Log("msg", "done", "total_traces", totalTraces, "total_batches", totalBatches)
+	level.Info(logger).Log("msg", "done", "total_traces", totalTraces, "total_batches", totalBatches,
+		"sent_gb", fmt.Sprintf("%.2f", float64(sentBytes.Load())/(1024*1024*1024)))
 }
 
 type blockPaths struct {
@@ -177,15 +196,15 @@ func findDataFile(blockDir string) string {
 	return ""
 }
 
-func processBlock(ctx context.Context, b blockPaths, fwd *otlpgrpc.Forwarder, maxBatchBytes int, logger log.Logger) (int, int, error) {
+func processBlock(ctx context.Context, b blockPaths, fwd *otlpgrpc.Forwarder, maxBatchBytes int, tsOffset time.Duration, sentBytes *atomic.Int64, logger log.Logger) (int, int, error) {
 	meta := readBlockMeta(b.metaPath, logger)
 
 	switch meta.Version {
 	case "vParquet4":
-		return processBlockV4(ctx, b, meta, fwd, maxBatchBytes, logger)
+		return processBlockV4(ctx, b, meta, fwd, maxBatchBytes, tsOffset, sentBytes, logger)
 	default:
 		// vParquet5 and anything unrecognised — fall through to v5
-		return processBlockV5(ctx, b, meta, fwd, maxBatchBytes, logger)
+		return processBlockV5(ctx, b, meta, fwd, maxBatchBytes, tsOffset, sentBytes, logger)
 	}
 }
 
@@ -202,7 +221,7 @@ func openParquetFile(path string) (*os.File, int64, error) {
 	return f, fi.Size(), nil
 }
 
-func processBlockV4(ctx context.Context, b blockPaths, meta *backend.BlockMeta, fwd *otlpgrpc.Forwarder, maxBatchBytes int, logger log.Logger) (int, int, error) {
+func processBlockV4(ctx context.Context, b blockPaths, meta *backend.BlockMeta, fwd *otlpgrpc.Forwarder, maxBatchBytes int, tsOffset time.Duration, sentBytes *atomic.Int64, logger log.Logger) (int, int, error) {
 	f, size, err := openParquetFile(b.parquetPath)
 	if err != nil {
 		return 0, 0, err
@@ -236,10 +255,12 @@ func processBlockV4(ctx context.Context, b blockPaths, meta *backend.BlockMeta, 
 			return 0, fmt.Errorf("forward traces: %w", err)
 		}
 		n := combined.ResourceSpans().Len()
+		sentBytes.Add(int64(combinedBytes))
 		combined = ptrace.NewTraces()
 		combinedBytes = 0
 		if time.Since(lastProgress) >= 5*time.Second {
-			level.Info(logger).Log("msg", "progress", "traces_sent", totalTraces+n, "batches_sent", totalBatches+1)
+			level.Info(logger).Log("msg", "progress", "traces_sent", totalTraces+n, "batches_sent", totalBatches+1,
+				"sent_gb", fmt.Sprintf("%.2f", float64(sentBytes.Load())/(1024*1024*1024)))
 			lastProgress = time.Now()
 		}
 		return n, nil
@@ -270,6 +291,10 @@ func processBlockV4(ctx context.Context, b blockPaths, meta *backend.BlockMeta, 
 			if err != nil {
 				level.Warn(logger).Log("msg", "failed to unmarshal trace as ptrace", "err", err)
 				continue
+			}
+
+			if tsOffset != 0 {
+				shiftTraceTimestamps(td, tsOffset)
 			}
 
 			// Measure the actual OTLP wire size, not the tempopb size
@@ -335,7 +360,7 @@ func processBlockV4(ctx context.Context, b blockPaths, meta *backend.BlockMeta, 
 	return totalTraces, totalBatches, nil
 }
 
-func processBlockV5(ctx context.Context, b blockPaths, meta *backend.BlockMeta, fwd *otlpgrpc.Forwarder, maxBatchBytes int, logger log.Logger) (int, int, error) {
+func processBlockV5(ctx context.Context, b blockPaths, meta *backend.BlockMeta, fwd *otlpgrpc.Forwarder, maxBatchBytes int, tsOffset time.Duration, sentBytes *atomic.Int64, logger log.Logger) (int, int, error) {
 	f, size, err := openParquetFile(b.parquetPath)
 	if err != nil {
 		return 0, 0, err
@@ -369,10 +394,12 @@ func processBlockV5(ctx context.Context, b blockPaths, meta *backend.BlockMeta, 
 			return 0, fmt.Errorf("forward traces: %w", err)
 		}
 		n := combined.ResourceSpans().Len()
+		sentBytes.Add(int64(combinedBytes))
 		combined = ptrace.NewTraces()
 		combinedBytes = 0
 		if time.Since(lastProgress) >= 5*time.Second {
-			level.Info(logger).Log("msg", "progress", "traces_sent", totalTraces+n, "batches_sent", totalBatches+1)
+			level.Info(logger).Log("msg", "progress", "traces_sent", totalTraces+n, "batches_sent", totalBatches+1,
+				"sent_gb", fmt.Sprintf("%.2f", float64(sentBytes.Load())/(1024*1024*1024)))
 			lastProgress = time.Now()
 		}
 		return n, nil
@@ -403,6 +430,10 @@ func processBlockV5(ctx context.Context, b blockPaths, meta *backend.BlockMeta, 
 			if err != nil {
 				level.Warn(logger).Log("msg", "failed to unmarshal trace as ptrace", "err", err)
 				continue
+			}
+
+			if tsOffset != 0 {
+				shiftTraceTimestamps(td, tsOffset)
 			}
 
 			// Measure the actual OTLP wire size, not the tempopb size
@@ -553,4 +584,38 @@ func readBlockMeta(path string, logger log.Logger) *backend.BlockMeta {
 		return &backend.BlockMeta{}
 	}
 	return meta
+}
+
+// computeTimestampOffset returns the duration to add to every span timestamp so
+// that the newest block's EndTime aligns with the start of today (UTC midnight).
+func computeTimestampOffset(blocks []blockPaths, logger log.Logger) time.Duration {
+	var maxEnd time.Time
+	for _, b := range blocks {
+		meta := readBlockMeta(b.metaPath, logger)
+		if !meta.EndTime.IsZero() && meta.EndTime.After(maxEnd) {
+			maxEnd = meta.EndTime
+		}
+	}
+	if maxEnd.IsZero() {
+		return 0
+	}
+	today := time.Now().UTC()
+	return today.Sub(maxEnd)
+}
+
+// shiftTraceTimestamps adds offset to every span's start and end timestamp.
+func shiftTraceTimestamps(td ptrace.Traces, offset time.Duration) {
+	offsetNs := int64(offset)
+	rss := td.ResourceSpans()
+	for i := 0; i < rss.Len(); i++ {
+		ss := rss.At(i).ScopeSpans()
+		for j := 0; j < ss.Len(); j++ {
+			spans := ss.At(j).Spans()
+			for k := 0; k < spans.Len(); k++ {
+				s := spans.At(k)
+				s.SetStartTimestamp(pcommon.Timestamp(int64(s.StartTimestamp()) + offsetNs))
+				s.SetEndTimestamp(pcommon.Timestamp(int64(s.EndTimestamp()) + offsetNs))
+			}
+		}
+	}
 }

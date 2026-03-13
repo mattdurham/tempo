@@ -437,6 +437,40 @@
       ],
       "title": "Blocklist Poll Latency p99",
       "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 60 },
+      "id": 104,
+      "title": "Distributor",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "lineWidth": 2 },
+          "unit": "Bps"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 61 },
+      "id": 14,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "rate(tempo_distributor_bytes_received_total{job=\"tempo-blockpack\"}[5m])",
+          "legendFormat": "blockpack"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "rate(tempo_distributor_bytes_received_total{job=\"tempo-parquet\"}[5m])",
+          "legendFormat": "parquet"
+        }
+      ],
+      "title": "Bytes Received Rate",
+      "type": "timeseries"
     }
   ],
   "refresh": "15s",

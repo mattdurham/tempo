@@ -5,18 +5,23 @@ package rw
 
 // NOTE: Any changes to this file must be reflected in the corresponding SPECS.md or NOTES.md.
 
-// DataType is a hint passed to ReaderProvider.ReadAt for caching layers.
-// Implementations may ignore it; it is used by caching layers for future segmentation.
-type DataType string
+// DataType is a hint passed to ReaderProvider.ReadAt identifying the kind of data being read.
+// Caching layers use it to determine eviction priority; other implementations may ignore it.
+// Higher-priority types survive cache pressure longer than lower-priority ones.
+//
+// Priority order (highest → lowest): Footer ≈ Header > Metadata ≈ TraceBloomFilter >
+// TimestampIndex > Block.
+type DataType uint8
 
-// DataType constants for read-type hints.
+// DataType constants ordered by eviction priority (lower numeric value = higher priority).
 const (
-	DataTypeFooter   DataType = "footer"
-	DataTypeHeader   DataType = "header"
-	DataTypeMetadata DataType = "metadata"
-	DataTypeBlock    DataType = "block"
-	DataTypeIndex    DataType = "index"
-	DataTypeCompact  DataType = "compact"
+	DataTypeUnknown          DataType = iota // 0 – unknown; treated as lowest priority
+	DataTypeFooter                           // 1 – file footer; highest priority, never evicted first
+	DataTypeHeader                           // 2 – file header; same tier as footer
+	DataTypeMetadata                         // 3 – block metadata section
+	DataTypeTraceBloomFilter                 // 4 – compact trace-ID bloom filter + lookup index
+	DataTypeTimestampIndex                   // 5 – per-file timestamp index
+	DataTypeBlock                            // 6 – span block payload; lowest priority, evicted first
 )
 
 // ReaderProvider is the storage backend interface.

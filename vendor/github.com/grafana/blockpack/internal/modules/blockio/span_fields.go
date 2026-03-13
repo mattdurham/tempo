@@ -75,6 +75,12 @@ func modulesGetValue(col *modules_reader.Column, rowIdx int) (any, bool) {
 		if v, ok := col.BytesValue(rowIdx); ok {
 			return v, true
 		}
+	case modules_shared.ColumnTypeUUID:
+		// UUID columns were originally string attributes; return the UUID-formatted string
+		// so callers see the same type as the original OTLP StringValue.
+		if v, ok := col.StringValue(rowIdx); ok {
+			return v, true
+		}
 	}
 	return nil, false
 }
@@ -91,13 +97,29 @@ func (a *modulesSpanFieldsAdapter) GetField(name string) (any, bool) {
 // IterateFields implements executor.SpanFieldsProvider.
 // Calls fn for each column present at this row. Stops early if fn returns false.
 // Iterates all block columns, including intrinsics (trace:id, span:id, etc.).
+// When multiple typed variants of the same name are present (same-name/different-type
+// OTLP attributes), only the first found variant with a present value is emitted;
+// this prevents duplicate name emissions since the callback key is name-only.
+//
+// NOTE-ITER-1: ColumnTypeRangeString columns are auto-parsed body fields (SPEC-11.5).
+// They are derivable from log:body and should not appear as explicit attributes in
+// enumeration. GetField() still resolves them for direct lookups.
 func (a *modulesSpanFieldsAdapter) IterateFields(fn func(name string, value any) bool) {
-	for name, col := range a.block.Columns() {
+	seen := make(map[string]struct{})
+	for key, col := range a.block.Columns() {
+		// NOTE-ITER-1: skip body-parsed auto-columns; they are not original attributes.
+		if key.Type == modules_shared.ColumnTypeRangeString {
+			continue
+		}
+		if _, already := seen[key.Name]; already {
+			continue
+		}
 		v, ok := modulesGetValue(col, a.rowIdx)
 		if !ok {
 			continue
 		}
-		if !fn(name, v) {
+		seen[key.Name] = struct{}{}
+		if !fn(key.Name, v) {
 			return
 		}
 	}

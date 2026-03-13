@@ -1,10 +1,12 @@
 package vm
 
 import (
+	"bytes"
 	"encoding/hex"
 	"fmt"
-	"regexp"
 	"strings"
+
+	regexp "github.com/coregx/coregex"
 
 	"github.com/grafana/blockpack/internal/traceqlparser"
 )
@@ -61,8 +63,8 @@ type traceqlCompiler struct {
 }
 
 // normalizeAttributePath converts TraceQL attribute paths to canonical column names.
-// This matches the normalization logic in executor/attribute_mapping.go to ensure
-// consistent behavior across the codebase.
+// Assembles scope + name into a full path, then delegates intrinsic normalization to
+// normalizeFieldName (query_spec.go) — the single source of truth for colon-form mapping.
 func normalizeAttributePath(scope, name string) string {
 	// Handle explicit intrinsic syntax with :
 	if strings.HasPrefix(name, ":") {
@@ -82,45 +84,8 @@ func normalizeAttributePath(scope, name string) string {
 		fullPath = scope + "." + name
 	}
 
-	// If already has : notation, pass through
-	if strings.Contains(fullPath, ":") {
-		return fullPath
-	}
-
-	// Handle unscoped span intrinsics (TraceQL compatibility)
-	switch fullPath {
-	case "name", "span.name":
-		return "span:name"
-	case "kind", "span.kind":
-		return "span:kind"
-	case "status", "span.status":
-		return "span:status"
-	case "status_message", "span.status_message":
-		return "span:status_message"
-	case "duration", "span.duration":
-		return "span:duration"
-	case "start", "span.start":
-		return "span:start"
-	case "end", "span.end":
-		return "span:end"
-	// Handle trace-level intrinsics
-	case "trace.id":
-		return intrinsicTraceID
-	case "trace.state":
-		return "trace:state"
-	case "span.id":
-		return intrinsicSpanID
-	case "span.parent_id":
-		return intrinsicSpanParentID
-	// Handle resource/scope schema URL intrinsics
-	case "resource.schema_url":
-		return "resource:schema_url"
-	case "scope.schema_url":
-		return "scope:schema_url"
-	}
-
-	// For unscoped and scoped paths, return as-is — callers handle OR expansion for unscoped attrs.
-	return fullPath
+	// Delegate intrinsic mapping to normalizeFieldName (query_spec.go)
+	return normalizeFieldName(fullPath)
 }
 
 func (c *traceqlCompiler) compileExpression(expr traceqlparser.Expr) error {
@@ -208,9 +173,9 @@ func (c *traceqlCompiler) compileBinaryExpr(expr *traceqlparser.BinaryExpr) erro
 }
 
 func (c *traceqlCompiler) compileComparison(expr *traceqlparser.BinaryExpr) error {
-	// Note: Regex operators (=~, !~) compile successfully but always return false in VM execution
-	// The ColumnPredicate path supports regex and will be used for actual evaluation
-	// This allows the program to compile even with regex, enabling ColumnPredicate-only execution
+	// Regex operators (=~, !~) use a pre-compiled *regexp.Regexp to evaluate per-span.
+	// The ColumnPredicate path (compileColumnPredicateComparison) handles bulk column scans;
+	// this VM instruction path handles row-by-row evaluation when the bulk scan is not used.
 
 	fieldExpr, ok := expr.Left.(*traceqlparser.FieldExpr)
 	if !ok {
@@ -243,6 +208,35 @@ func (c *traceqlCompiler) compileComparison(expr *traceqlparser.BinaryExpr) erro
 	attrIdx := c.addAttribute(fullAttrName)
 	constIdx := c.addConstantFromLiteral(decodedLiteral)
 	operator := expr.Op
+
+	// For regex operators, pre-compile at plan-compile time to avoid per-span recompilation.
+	if operator == traceqlparser.OpRegex || operator == traceqlparser.OpNotRegex {
+		patternStr, ok := decodedLiteral.Value.(string)
+		if !ok {
+			return fmt.Errorf("regex operator requires string literal")
+		}
+		re, reErr := regexp.Compile(patternStr)
+		if reErr != nil {
+			return fmt.Errorf("invalid regular expression %q: %w", patternStr, reErr)
+		}
+		op := operator
+		c.emit(func(vm *VM) int {
+			attrValue := vm.loadAttribute(attrIdx)
+			if attrValue.Type != TypeString {
+				vm.push(Value{Type: TypeBool, Data: false})
+				return vm.pc + 1
+			}
+			leftStr, ok := attrValue.Data.(string)
+			if !ok {
+				vm.push(Value{Type: TypeBool, Data: false})
+				return vm.pc + 1
+			}
+			matched := re.MatchString(leftStr)
+			vm.push(Value{Type: TypeBool, Data: matched == (op == traceqlparser.OpRegex)})
+			return vm.pc + 1
+		})
+		return nil
+	}
 
 	c.emit(func(vm *VM) int {
 		attrValue := vm.loadAttribute(attrIdx)
@@ -428,21 +422,6 @@ func compareValues(left, right Value, operator traceqlparser.BinaryOp) bool {
 		return compareNumeric(left, right) < 0
 	case traceqlparser.OpLte:
 		return compareNumeric(left, right) <= 0
-	case traceqlparser.OpRegex, traceqlparser.OpNotRegex:
-		if left.Type != TypeString || right.Type != TypeString {
-			return false
-		}
-		leftStr, ok1 := left.Data.(string)
-		pattern, ok2 := right.Data.(string)
-		if !ok1 || !ok2 {
-			return false
-		}
-		re, err := regexp.Compile(pattern)
-		if err != nil {
-			return false
-		}
-		matched := re.MatchString(leftStr)
-		return matched == (operator == traceqlparser.OpRegex)
 	default:
 		return false
 	}
@@ -470,6 +449,10 @@ func valuesEqual(left, right Value) bool {
 		leftBool, okL := left.Data.(bool)
 		rightBool, okR := right.Data.(bool)
 		return okL && okR && leftBool == rightBool
+	case TypeBytes:
+		leftBytes, okL := left.Data.([]byte)
+		rightBytes, okR := right.Data.([]byte)
+		return okL && okR && bytes.Equal(leftBytes, rightBytes)
 	default:
 		return false
 	}
@@ -525,11 +508,12 @@ func (c *traceqlCompiler) compileColumnPredicateExpr(expr traceqlparser.Expr) (C
 		return c.compileColumnPredicateBinary(e)
 	case *traceqlparser.FieldExpr:
 		// Standalone field reference - check if it exists (is not null).
-		// Unscoped user attributes expand to OR across resource and span scopes.
+		// Unscoped user attributes expand to OR across resource, span, and log scopes.
 		attrName := normalizeAttributePath(e.Scope, e.Name)
 		if e.Scope == "" && !isBuiltInField(attrName) {
 			resourceName := "resource." + e.Name
 			spanName := "span." + e.Name
+			logName := "log." + e.Name
 			return func(provider ColumnDataProvider) (RowSet, error) {
 				rs, err := provider.ScanIsNotNull(resourceName)
 				if err != nil {
@@ -539,7 +523,11 @@ func (c *traceqlCompiler) compileColumnPredicateExpr(expr traceqlparser.Expr) (C
 				if err != nil {
 					return nil, err
 				}
-				return provider.Union(rs, ss), nil
+				ls, err := provider.ScanIsNotNull(logName)
+				if err != nil {
+					return nil, err
+				}
+				return provider.Union(provider.Union(rs, ss), ls), nil
 			}, nil
 		}
 		return func(provider ColumnDataProvider) (RowSet, error) {
@@ -656,10 +644,88 @@ func (c *traceqlCompiler) compileColumnPredicateComparison(expr *traceqlparser.B
 
 	operator := expr.Op
 
-	// Unscoped user attributes expand to OR across resource and span scopes.
+	// For regex operators, pre-compile the pattern at plan-compile time to avoid
+	// per-block recompilation in the hot scan path.
+	if operator == traceqlparser.OpRegex || operator == traceqlparser.OpNotRegex {
+		if strVal, ok := value.(string); ok {
+			notMatch := operator == traceqlparser.OpNotRegex
+			// CI literal bypass: pure (?i)literal patterns use fold-contains instead
+			// of the NFA regex engine, avoiding tryBacktrack overhead.
+			if a := AnalyzeRegex(strVal); a != nil && a.IsLiteralContains && a.CaseInsensitive {
+				lp := a.Prefixes // pre-lowercased
+				if fieldExpr.Scope == "" && !isBuiltInField(attrName) {
+					rName := "resource." + fieldExpr.Name
+					sName := "span." + fieldExpr.Name
+					lName := "log." + fieldExpr.Name
+					return func(provider ColumnDataProvider) (RowSet, error) {
+						rs, err := scanColumnRegexFast(provider, rName, nil, lp, notMatch)
+						if err != nil {
+							return nil, err
+						}
+						ss, err := scanColumnRegexFast(provider, sName, nil, lp, notMatch)
+						if err != nil {
+							return nil, err
+						}
+						ls, err := scanColumnRegexFast(provider, lName, nil, lp, notMatch)
+						if err != nil {
+							return nil, err
+						}
+						return provider.Union(provider.Union(rs, ss), ls), nil
+					}, nil
+				}
+				return func(provider ColumnDataProvider) (RowSet, error) {
+					return scanColumnRegexFast(provider, attrName, nil, lp, notMatch)
+				}, nil
+			}
+			re, err := regexp.Compile(strVal)
+			if err != nil {
+				return nil, fmt.Errorf("invalid regex %q: %w", strVal, err)
+			}
+			prefixes := RegexPrefixes(strVal)
+			if fieldExpr.Scope == "" && !isBuiltInField(attrName) {
+				rName := "resource." + fieldExpr.Name
+				sName := "span." + fieldExpr.Name
+				lName := "log." + fieldExpr.Name
+				return func(provider ColumnDataProvider) (RowSet, error) {
+					rs, err := scanColumnRegexFast(provider, rName, re, prefixes, notMatch)
+					if err != nil {
+						return nil, err
+					}
+					ss, err := scanColumnRegexFast(provider, sName, re, prefixes, notMatch)
+					if err != nil {
+						return nil, err
+					}
+					ls, err := scanColumnRegexFast(provider, lName, re, prefixes, notMatch)
+					if err != nil {
+						return nil, err
+					}
+					return provider.Union(provider.Union(rs, ss), ls), nil
+				}, nil
+			}
+			return func(provider ColumnDataProvider) (RowSet, error) {
+				return scanColumnRegexFast(provider, attrName, re, prefixes, notMatch)
+			}, nil
+		}
+		return nil, fmt.Errorf("regex operator requires string value")
+	}
+
+	// Convert typed literals (status, kind, duration, etc.) to their wire representations
+	// for non-regex operators. Reuses convertTraceQLLiteralToValue so conversion logic
+	// stays consistent with the VM instruction path. Skipped for:
+	//   - regex operators (handled above) — raw string form required
+	//   - LitString — already the correct type; skipping also preserves any prior
+	//     hex→[]byte decode applied above for trace:id/span:id intrinsics
+	if literalExpr.Type != traceqlparser.LitString {
+		if converted, ok := convertTraceQLLiteralToValue(literalExpr); ok {
+			value = converted.Data
+		}
+	}
+
+	// Unscoped user attributes expand to OR across resource, span, and log scopes.
 	if fieldExpr.Scope == "" && !isBuiltInField(attrName) {
 		resourceName := "resource." + fieldExpr.Name
 		spanName := "span." + fieldExpr.Name
+		logName := "log." + fieldExpr.Name
 		return func(provider ColumnDataProvider) (RowSet, error) {
 			rs, err := scanColumnByOp(provider, resourceName, value, operator)
 			if err != nil {
@@ -669,7 +735,11 @@ func (c *traceqlCompiler) compileColumnPredicateComparison(expr *traceqlparser.B
 			if err != nil {
 				return nil, err
 			}
-			return provider.Union(rs, ss), nil
+			ls, err := scanColumnByOp(provider, logName, value, operator)
+			if err != nil {
+				return nil, err
+			}
+			return provider.Union(provider.Union(rs, ss), ls), nil
 		}, nil
 	}
 
@@ -714,6 +784,20 @@ func scanColumnByOp(
 	}
 }
 
+// scanColumnRegexFast dispatches a pre-compiled regex scan (match or not-match).
+func scanColumnRegexFast(
+	provider ColumnDataProvider,
+	col string,
+	re *regexp.Regexp,
+	prefixes []string,
+	notMatch bool,
+) (RowSet, error) {
+	if notMatch {
+		return provider.ScanRegexNotMatchFast(col, re, prefixes)
+	}
+	return provider.ScanRegexFast(col, re, prefixes)
+}
+
 // isHexBytesAttribute checks if an attribute stores hex-encoded bytes (trace:id, span:id)
 func isHexBytesAttribute(path string) bool {
 	switch path {
@@ -737,292 +821,260 @@ func isComputedField(columnName string) bool {
 	return computedFields[columnName]
 }
 
-// trackUnscopedAttr registers an unscoped attribute as an OR bloom predicate across
-// resource.<name> and span.<name>, ensuring block pruning only drops blocks where
-// both columns are definitively absent (rather than AND-ing two independent predicates).
-func trackUnscopedAttr(predicates *QueryPredicates, name string) {
-	resourceCol := "resource." + name
-	spanCol := "span." + name
-	predicates.UnscopedColumnNames[UnscopedColumnPrefix+name] = []string{resourceCol, spanCol}
-	if !contains(predicates.AttributesAccessed, resourceCol) {
-		predicates.AttributesAccessed = append(predicates.AttributesAccessed, resourceCol)
-	}
-	if !contains(predicates.AttributesAccessed, spanCol) {
-		predicates.AttributesAccessed = append(predicates.AttributesAccessed, spanCol)
-	}
+// unscopedCols returns the three scoped column names for an unscoped attribute.
+func unscopedCols(name string) (resource, span, log string) {
+	return "resource." + name, "span." + name, "log." + name
 }
 
 // isBuiltInField checks if a field is a built-in intrinsic field
 func isBuiltInField(attrPath string) bool {
 	switch attrPath {
 	case "span:name", "span:duration", "span:kind", "span:status", "span:status_message",
-		intrinsicTraceID, intrinsicSpanID, intrinsicSpanParentID, "span:start", "span:end":
+		intrinsicTraceID, intrinsicSpanID, intrinsicSpanParentID, "span:start", "span:end",
+		"log:timestamp", "log:observed_timestamp", "log:body", "log:severity_number",
+		"log:severity_text", "log:trace_id", "log:span_id", "log:flags":
 		return true
 	default:
 		return false
 	}
 }
 
-// extractTraceQLPredicates walks the TraceQL expression tree and extracts
-// QueryPredicates for block-level filtering. Returns populated predicates for
-// all stored-field operators (equality, range, regex).
+// extractTraceQLPredicates walks the TraceQL expression tree and returns QueryPredicates
+// for block-level pruning. Unscoped attributes are expanded to OR composites covering
+// resource.*, span.*, and log.* children so range-index lookup works on real scoped columns.
 func extractTraceQLPredicates(expr traceqlparser.Expr) *QueryPredicates {
-	predicates := &QueryPredicates{
-		AttributeEquals:       make(map[string][]Value),
-		DedicatedColumns:      make(map[string][]Value),
-		UnscopedColumnNames:   make(map[string][]string),
-		DedicatedColumnsRegex: make(map[string]string),
-		AttributeRanges:       make(map[string]*RangePredicate),
-		DedicatedRanges:       make(map[string]*RangePredicate),
-	}
-	extractTraceQLPredicatesRecursive(expr, predicates)
-
-	// Return nil only if we extracted absolutely nothing
-	hasAnyPredicates := len(predicates.DedicatedColumns) > 0 ||
-		len(predicates.AttributeEquals) > 0 ||
-		len(predicates.DedicatedRanges) > 0 ||
-		len(predicates.AttributeRanges) > 0 ||
-		len(predicates.DedicatedColumnsRegex) > 0 ||
-		len(predicates.AttributesAccessed) > 0
-
-	if !hasAnyPredicates {
+	nodes, cols := extractTraceQLNodes(expr)
+	if len(nodes) == 0 && len(cols) == 0 {
 		return nil
 	}
-
-	return predicates
+	return &QueryPredicates{Nodes: nodes, Columns: cols}
 }
 
-// extractTraceQLPredicatesRecursive recursively walks the expression tree and extracts predicates.
-// Always returns true now - we extract what we can and skip what we can't.
-func extractTraceQLPredicatesRecursive(expr traceqlparser.Expr, predicates *QueryPredicates) bool {
-	switch e := expr.(type) {
-	case *traceqlparser.BinaryExpr:
-		switch e.Op {
-		case traceqlparser.OpAnd:
-			extractTraceQLPredicatesRecursive(e.Left, predicates)
-			extractTraceQLPredicatesRecursive(e.Right, predicates)
-			return true
-		case traceqlparser.OpOr:
-			predicates.HasOROperations = true
-			extractTraceQLPredicatesRecursive(e.Left, predicates)
-			extractTraceQLPredicatesRecursive(e.Right, predicates)
-			return true
-		case traceqlparser.OpEq:
-			return extractTraceQLEqualityPredicate(e, predicates)
-		case traceqlparser.OpNeq:
-			// Track attribute access for bloom filter but don't add to equality predicates
-			// (NOT EQUAL can't be used for positive block pruning)
-			return extractTraceQLNegationPredicate(e, predicates)
-		case traceqlparser.OpGt, traceqlparser.OpGte, traceqlparser.OpLt, traceqlparser.OpLte:
-			return extractTraceQLRangePredicate(e, predicates)
-		case traceqlparser.OpRegex:
-			return extractTraceQLRegexPredicate(e, predicates)
-		case traceqlparser.OpNotRegex:
-			// Track attribute access only (negative regex can't prune)
-			return extractTraceQLNegationPredicate(e, predicates)
-		default:
-			// Unrecognized operator - skip extraction but don't fail
-			return true
-		}
-	default:
-		// Unrecognized expression type - skip extraction but don't fail
-		return true
+// extractTraceQLNodes recursively extracts block-pruning nodes and accessed columns.
+//
+// AND: left and right nodes concatenated (AND-combined at top level by the planner).
+// OR:  if both sides produce nodes, wraps in a single OR composite; if either side is
+//
+//	unconstrained (no nodes), the entire OR is unconstrained (returns nil nodes).
+//
+// Unscoped attribute predicates are expanded into OR composites covering all three scopes.
+// Negation operators (!= , !~) produce no nodes but do add to cols (for row-level decode).
+func extractTraceQLNodes(expr traceqlparser.Expr) (nodes []RangeNode, cols []string) {
+	e, ok := expr.(*traceqlparser.BinaryExpr)
+	if !ok {
+		return nil, nil
 	}
+
+	switch e.Op {
+	case traceqlparser.OpAnd:
+		ln, lc := extractTraceQLNodes(e.Left)
+		rn, rc := extractTraceQLNodes(e.Right)
+		return append(ln, rn...), dedupStrings(append(lc, rc...))
+
+	case traceqlparser.OpOr:
+		ln, lc := extractTraceQLNodes(e.Left)
+		rn, rc := extractTraceQLNodes(e.Right)
+		cols = dedupStrings(append(lc, rc...))
+		if len(ln) == 0 || len(rn) == 0 {
+			// One side of the user-written OR is unconstrained (e.g. involves a computed
+			// column or a negation). A block satisfying the unconstrained arm might match
+			// anything, so we cannot prune at all — return nil nodes.
+			// Note: this is different from unscoped-attribute OR composites, where each
+			// child is a scoped variant of the same predicate; those are built in
+			// extractEqNode/extractRangeNode/extractRegexNode with known columns.
+			return nil, cols
+		}
+		return []RangeNode{{IsOR: true, Children: append(ln, rn...)}}, cols
+
+	case traceqlparser.OpEq:
+		return extractEqNode(e)
+
+	case traceqlparser.OpNeq, traceqlparser.OpNotRegex:
+		// Negations cannot prune; just track accessed columns for the row-level decode.
+		return nil, negationCols(e)
+
+	case traceqlparser.OpGt, traceqlparser.OpGte, traceqlparser.OpLt, traceqlparser.OpLte:
+		return extractRangeNode(e)
+
+	case traceqlparser.OpRegex:
+		return extractRegexNode(e)
+	}
+	return nil, nil
 }
 
-// extractTraceQLEqualityPredicate extracts equality predicates for all stored fields
-func extractTraceQLEqualityPredicate(expr *traceqlparser.BinaryExpr, predicates *QueryPredicates) bool {
+// extractEqNode builds a RangeNode for an equality predicate (OpEq).
+// Unscoped user attributes expand to an OR composite over all three scopes.
+func extractEqNode(expr *traceqlparser.BinaryExpr) (nodes []RangeNode, cols []string) {
 	field, ok := expr.Left.(*traceqlparser.FieldExpr)
 	if !ok {
-		return true // Skip but don't fail
+		return nil, nil
 	}
 	lit, ok := expr.Right.(*traceqlparser.LiteralExpr)
 	if !ok {
-		return true // Skip but don't fail
+		return nil, nil
 	}
-
 	columnName := normalizeAttributePath(field.Scope, field.Name)
-
-	// Skip computed fields - they don't exist as stored columns
 	if isComputedField(columnName) {
-		return true
+		return nil, nil
 	}
-
-	// Convert literal to vm.Value
 	vmValue, ok := convertTraceQLLiteralToValue(lit)
 	if !ok {
-		return true // Skip unsupported literal types
+		return nil, nil
 	}
-
-	// Special case for trace:id and span:id: decode hex string to bytes
+	// Hex-decode trace:id / span:id / span:parent_id values.
 	if isHexBytesAttribute(columnName) {
 		if lit.Type == traceqlparser.LitString {
-			if hexStr, ok := lit.Value.(string); ok {
-				decoded, err := hex.DecodeString(hexStr)
-				if err == nil && len(decoded) == 16 {
+			if hexStr, ok2 := lit.Value.(string); ok2 {
+				if decoded, err := hex.DecodeString(hexStr); err == nil && len(decoded) == 16 {
 					vmValue = Value{Type: TypeBytes, Data: decoded}
 				}
 			}
 		}
 	}
 
-	// Unscoped user attributes must match in resource OR span: track as an OR bloom predicate
-	// and skip range-index pruning (which requires a single column).
 	if field.Scope == "" && !isBuiltInField(columnName) {
-		trackUnscopedAttr(predicates, field.Name)
-		return true
+		// Unscoped: expand to OR across resource.*, span.*, log.*
+		res, span, log := unscopedCols(field.Name)
+		cols = []string{res, span, log}
+		return []RangeNode{{
+			IsOR: true,
+			Children: []RangeNode{
+				{Column: res, Values: []Value{vmValue}},
+				{Column: span, Values: []Value{vmValue}},
+				{Column: log, Values: []Value{vmValue}},
+			},
+		}}, cols
 	}
-
-	// Scoped path: add to DedicatedColumns for range-index and bloom pruning.
-	predicates.DedicatedColumns[columnName] = append(
-		predicates.DedicatedColumns[columnName],
-		vmValue,
-	)
-
-	// For non-built-in fields (user attributes), also track in AttributesAccessed
-	// for bloom filter column name checking
+	// Scoped: single leaf node.
 	if !isBuiltInField(columnName) {
-		if !contains(predicates.AttributesAccessed, columnName) {
-			predicates.AttributesAccessed = append(predicates.AttributesAccessed, columnName)
-		}
+		cols = []string{columnName}
 	}
-
-	return true
+	return []RangeNode{{Column: columnName, Values: []Value{vmValue}}}, cols
 }
 
-// extractTraceQLNegationPredicate tracks attribute access for negation operators (!=, !~)
-// without adding predicates (negations can't be used for positive block pruning)
-func extractTraceQLNegationPredicate(expr *traceqlparser.BinaryExpr, predicates *QueryPredicates) bool {
+// extractRangeNode builds a RangeNode for a range predicate (>, >=, <, <=).
+// Unscoped user attributes expand to an OR composite over all three scopes.
+func extractRangeNode(expr *traceqlparser.BinaryExpr) (nodes []RangeNode, cols []string) {
 	field, ok := expr.Left.(*traceqlparser.FieldExpr)
 	if !ok {
-		return true
-	}
-
-	columnName := normalizeAttributePath(field.Scope, field.Name)
-
-	// Skip computed fields
-	if isComputedField(columnName) {
-		return true
-	}
-
-	// Track attribute access for bloom filter; expand unscoped to OR across both scopes.
-	if !isBuiltInField(columnName) {
-		if field.Scope == "" {
-			trackUnscopedAttr(predicates, field.Name)
-		} else if !contains(predicates.AttributesAccessed, columnName) {
-			predicates.AttributesAccessed = append(predicates.AttributesAccessed, columnName)
-		}
-	}
-
-	return true
-}
-
-// extractTraceQLRangePredicate extracts range predicates (>, >=, <, <=)
-func extractTraceQLRangePredicate(expr *traceqlparser.BinaryExpr, predicates *QueryPredicates) bool {
-	field, ok := expr.Left.(*traceqlparser.FieldExpr)
-	if !ok {
-		return true
+		return nil, nil
 	}
 	lit, ok := expr.Right.(*traceqlparser.LiteralExpr)
 	if !ok {
-		return true
+		return nil, nil
 	}
-
 	columnName := normalizeAttributePath(field.Scope, field.Name)
-
-	// Skip computed fields
 	if isComputedField(columnName) {
-		return true
+		return nil, nil
 	}
-
-	// Convert literal to vm.Value
 	vmValue, ok := convertTraceQLLiteralToValue(lit)
 	if !ok {
-		return true
+		return nil, nil
 	}
 
-	// Unscoped user attributes: bloom-OR across both scopes (range index requires single column).
-	if field.Scope == "" && !isBuiltInField(columnName) {
-		trackUnscopedAttr(predicates, field.Name)
-		return true
-	}
-
-	// Scoped path: get or create range predicate for this column.
-	rangePred := predicates.DedicatedRanges[columnName]
-	if rangePred == nil {
-		rangePred = &RangePredicate{}
-		predicates.DedicatedRanges[columnName] = rangePred
-	}
-
-	// Update range bounds based on operator
+	var minVal, maxVal *Value
 	switch expr.Op {
-	case traceqlparser.OpGt:
-		rangePred.MinValue = &vmValue
-		rangePred.MinInclusive = false
-	case traceqlparser.OpGte:
-		rangePred.MinValue = &vmValue
-		rangePred.MinInclusive = true
-	case traceqlparser.OpLt:
-		rangePred.MaxValue = &vmValue
-		rangePred.MaxInclusive = false
-	case traceqlparser.OpLte:
-		rangePred.MaxValue = &vmValue
-		rangePred.MaxInclusive = true
+	case traceqlparser.OpGt, traceqlparser.OpGte:
+		v := vmValue
+		minVal = &v
+	case traceqlparser.OpLt, traceqlparser.OpLte:
+		v := vmValue
+		maxVal = &v
 	}
 
-	// Track attribute access for non-built-in fields
+	if field.Scope == "" && !isBuiltInField(columnName) {
+		res, span, log := unscopedCols(field.Name)
+		cols = []string{res, span, log}
+		return []RangeNode{{
+			IsOR: true,
+			Children: []RangeNode{
+				{Column: res, Min: minVal, Max: maxVal},
+				{Column: span, Min: minVal, Max: maxVal},
+				{Column: log, Min: minVal, Max: maxVal},
+			},
+		}}, cols
+	}
 	if !isBuiltInField(columnName) {
-		if !contains(predicates.AttributesAccessed, columnName) {
-			predicates.AttributesAccessed = append(predicates.AttributesAccessed, columnName)
-		}
+		cols = []string{columnName}
 	}
-
-	return true
+	return []RangeNode{{Column: columnName, Min: minVal, Max: maxVal}}, cols
 }
 
-// extractTraceQLRegexPredicate extracts regex predicates
-func extractTraceQLRegexPredicate(expr *traceqlparser.BinaryExpr, predicates *QueryPredicates) bool {
+// extractRegexNode builds a RangeNode for a regex predicate (=~).
+// Unscoped user attributes expand to an OR composite over all three scopes.
+func extractRegexNode(expr *traceqlparser.BinaryExpr) (nodes []RangeNode, cols []string) {
 	field, ok := expr.Left.(*traceqlparser.FieldExpr)
 	if !ok {
-		return true
+		return nil, nil
 	}
 	lit, ok := expr.Right.(*traceqlparser.LiteralExpr)
+	if !ok || lit.Type != traceqlparser.LitString {
+		return nil, nil
+	}
+	pattern, ok := lit.Value.(string)
 	if !ok {
-		return true
+		return nil, nil
 	}
-	if lit.Type != traceqlparser.LitString {
-		return true
-	}
-
 	columnName := normalizeAttributePath(field.Scope, field.Name)
-
-	// Skip computed fields
 	if isComputedField(columnName) {
-		return true
+		return nil, nil
 	}
 
-	regexPattern, ok := lit.Value.(string)
-	if !ok {
-		return true
-	}
-
-	// Unscoped user attributes: bloom-OR across both scopes.
 	if field.Scope == "" && !isBuiltInField(columnName) {
-		trackUnscopedAttr(predicates, field.Name)
-		return true
+		res, span, log := unscopedCols(field.Name)
+		cols = []string{res, span, log}
+		return []RangeNode{{
+			IsOR: true,
+			Children: []RangeNode{
+				{Column: res, Pattern: pattern},
+				{Column: span, Pattern: pattern},
+				{Column: log, Pattern: pattern},
+			},
+		}}, cols
 	}
-
-	// Scoped path: add to DedicatedColumnsRegex for regex bloom pruning.
-	predicates.DedicatedColumnsRegex[columnName] = regexPattern
-
-	// Track attribute access for non-built-in fields
 	if !isBuiltInField(columnName) {
-		if !contains(predicates.AttributesAccessed, columnName) {
-			predicates.AttributesAccessed = append(predicates.AttributesAccessed, columnName)
+		cols = []string{columnName}
+	}
+	return []RangeNode{{Column: columnName, Pattern: pattern}}, cols
+}
+
+// negationCols returns the accessed column names for a negation operator (!=, !~).
+// These columns are needed for the row-level decode but produce NO pruning nodes.
+//
+// Negation cannot prune blocks: a block where service.name != "prod" might still contain
+// spans with service.name = "prod" (the negation is satisfied by OTHER spans in that block).
+// Pruning would cause false negatives. Column names are added to QueryPredicates.Columns
+// so ProgramWantColumns includes them in the two-pass first-pass column set.
+func negationCols(expr *traceqlparser.BinaryExpr) []string {
+	field, ok := expr.Left.(*traceqlparser.FieldExpr)
+	if !ok {
+		return nil
+	}
+	columnName := normalizeAttributePath(field.Scope, field.Name)
+	if isComputedField(columnName) || isBuiltInField(columnName) {
+		return nil
+	}
+	if field.Scope == "" {
+		res, span, log := unscopedCols(field.Name)
+		return []string{res, span, log}
+	}
+	return []string{columnName}
+}
+
+// dedupStrings returns a slice with duplicate strings removed, preserving order.
+func dedupStrings(ss []string) []string {
+	if len(ss) == 0 {
+		return ss
+	}
+	seen := make(map[string]struct{}, len(ss))
+	out := ss[:0]
+	for _, s := range ss {
+		if _, ok := seen[s]; !ok {
+			seen[s] = struct{}{}
+			out = append(out, s)
 		}
 	}
-
-	return true
+	return out
 }
 
 // convertTraceQLLiteralToValue converts a TraceQL LiteralExpr to a vm.Value
@@ -1100,14 +1152,4 @@ func statusCodeToInt64(status string) (int64, bool) {
 		return 2, true
 	}
 	return 0, false
-}
-
-// contains checks if a string slice contains a value
-func contains(slice []string, value string) bool {
-	for _, item := range slice {
-		if item == value {
-			return true
-		}
-	}
-	return false
 }

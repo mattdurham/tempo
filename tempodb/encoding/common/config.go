@@ -21,6 +21,7 @@ const (
 	DefaultBlockpackWriteBufferSize     = 1024 * 1024 // 1MB
 	DefaultBlockpackDictionaryMaxSize   = 1024 * 1024 // 1MB
 	DefaultBlockpackMinHashPermutations = 128
+	DefaultBlockpackMaxSpansPerBlock    = 2000
 )
 
 const DeprecatedError = "%s is no longer supported, please use %s or later"
@@ -72,6 +73,17 @@ type BlockpackConfig struct {
 
 	// EnableBitPacking enables bit-packing for integer columns
 	EnableBitPacking bool `yaml:"enable_bit_packing"`
+
+	// MaxSpansPerBlock controls how many spans are written per blockpack block.
+	// Defaults to 2000 if zero.
+	MaxSpansPerBlock int `yaml:"max_spans_per_block"`
+
+	// FileCachePath is the root directory for the disk-backed file cache.
+	// Leave empty to disable the disk cache.
+	FileCachePath string `yaml:"file_cache_path"`
+
+	// FileCacheMaxBytes is the maximum size of the disk cache in bytes (default: 4GB).
+	FileCacheMaxBytes int64 `yaml:"file_cache_max_bytes"`
 }
 
 func (cfg *BlockConfig) RegisterFlagsAndApplyDefaults(prefix string, f *flag.FlagSet) {
@@ -104,6 +116,15 @@ func (cfg *BlockpackConfig) applyDefaults() {
 	}
 	if cfg.MinHashPermutations == 0 {
 		cfg.MinHashPermutations = DefaultBlockpackMinHashPermutations
+	}
+	if cfg.MaxSpansPerBlock == 0 {
+		cfg.MaxSpansPerBlock = DefaultBlockpackMaxSpansPerBlock
+	}
+	if cfg.FileCachePath == "" {
+		cfg.FileCachePath = "/var/tempo/blockpack-cache"
+	}
+	if cfg.FileCacheMaxBytes == 0 {
+		cfg.FileCacheMaxBytes = 4 * 1024 * 1024 * 1024 // 4GB
 	}
 	// Booleans default to false, so we enable by default
 	if !cfg.EnableDictionary {
@@ -153,6 +174,10 @@ func (cfg *BlockpackConfig) validate() error {
 
 	if cfg.MinHashPermutations < 0 {
 		return fmt.Errorf("blockpack minhash permutations must be non-negative, got %d", cfg.MinHashPermutations)
+	}
+
+	if cfg.MaxSpansPerBlock < 0 {
+		return fmt.Errorf("blockpack max spans per block must be non-negative, got %d", cfg.MaxSpansPerBlock)
 	}
 
 	return nil

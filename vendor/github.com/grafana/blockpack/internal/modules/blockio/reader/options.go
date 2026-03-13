@@ -1,8 +1,15 @@
 package reader
 
-// NOTE: Any changes to this file must be reflected in the corresponding specs.md or NOTES.md.
+import "github.com/grafana/blockpack/internal/modules/filecache"
 
-// Option is a functional option for Reader construction.
-type Option func(*readerOptions)
+// Options configures a Reader at construction time.
+type Options struct {
+	// Cache, if non-nil, enables disk-backed caching for footer, header, metadata,
+	// compact index, and block reads. A nil Cache disables caching.
+	Cache *filecache.FileCache
 
-type readerOptions struct{}
+	// FileID is the unique identifier for this file within the cache namespace.
+	// Typically the file path or object storage key (e.g. "/data/blocks/abc.blockpack").
+	// Required when Cache is non-nil; ignored when Cache is nil.
+	FileID string
+}

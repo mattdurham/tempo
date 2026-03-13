@@ -1,5 +1,7 @@
 package vm
 
+import regexp "github.com/coregx/coregex"
+
 // RowSet represents a set of matching row indices
 // This interface is implemented by executor.RowSet to avoid import cycles
 type RowSet interface {
@@ -28,6 +30,17 @@ type ColumnDataProvider interface {
 	ScanRegex(column string, pattern string) (RowSet, error)
 	ScanRegexNotMatch(column string, pattern string) (RowSet, error)
 	ScanContains(column string, substring string) (RowSet, error)
+	// ScanRegexFast accepts a pre-compiled regexp and optional literal prefixes.
+	// Two calling conventions:
+	//   - re != nil: standard path. prefixes (if non-nil) are used as a fast-path
+	//     pre-filter — rows that contain none of the prefixes are skipped before
+	//     applying the regex. prefixes must be case-sensitive literals.
+	//   - re == nil: CI fold-contains path. prefixes must be pre-lowercased literals
+	//     (as produced by AnalyzeRegex for CaseInsensitive patterns). Implementations
+	//     use strings.ToLower(v) + strings.Contains instead of the regex engine.
+	ScanRegexFast(column string, re *regexp.Regexp, prefixes []string) (RowSet, error)
+	// ScanRegexNotMatchFast follows the same re/prefixes calling convention as ScanRegexFast.
+	ScanRegexNotMatchFast(column string, re *regexp.Regexp, prefixes []string) (RowSet, error)
 
 	// Streaming scans - call callback for each matching row (no RowSet allocation)
 	StreamScanEqual(column string, value interface{}, callback RowCallback) (int, error)

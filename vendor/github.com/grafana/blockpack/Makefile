@@ -1,4 +1,4 @@
-.PHONY: test-data clean-test-data help bench bench-report serve-report cost-analysis cost-analysis-no-freetier build-cost-tool build test format lint clean format-benchmark precommit ci install-tools nilaway betteralign betteralign-fix gofumpt-check gofumpt golines-check golines format-all bench-profile-writes deadcode staticcheck
+.PHONY: test-data clean-test-data help bench bench-report serve-report cost-analysis cost-analysis-no-freetier build-cost-tool build test format lint clean format-benchmark precommit ci install-tools nilaway betteralign betteralign-fix gofumpt-check gofumpt golines-check golines format-all bench-profile-writes deadcode staticcheck bench-logs bench-logs-html bench-logs-full bench-logs-full-html clean-bench-logs-full
 
 # Number of traces to generate (approximately 670K spans like original dataset)
 NUM_TRACES ?= 191119
@@ -64,6 +64,10 @@ help:
 	@echo "  make bench-report     - Generate unified HTML report from benchmarks"
 	@echo "  make bench-store      - Validate and store benchmark results with metadata"
 	@echo "  make bench-full       - Complete pipeline: data + benchmarks + validation + storage"
+	@echo "  make bench-logs       - Run synthetic log benchmark (blockpack vs Loki chunks, ~50 MB)"
+	@echo "  make bench-logs-html  - Run synthetic log benchmark and open HTML report"
+	@echo "  make bench-logs-full  - Run synthetic + large-scale (1 GB) log benchmarks"
+	@echo "  make bench-logs-full-html - Run full log benchmarks and open HTML reports"
 	@echo "  make serve-report     - Start HTTP server to view benchmark reports (port 10001)"
 	@echo "  make bench-profile-writes - Run write path benchmark with CPU+mem pprof (profiles in benchmark/profiles/)"
 	@echo ""
@@ -470,12 +474,69 @@ $(BENCH_OUTPUT):
 	@echo "Error: $(BENCH_OUTPUT) not found. Run 'make bench' first."
 	@exit 1
 
+# Synthetic log benchmark: Loki chunks vs blockpack, no external data required.
+# Generates synthetic log data in-process (~50 MB, 50 streams, 1 hour window).
+# Writes HTML report to /tmp/lokibench-synthetic-report.html.
+LOKIBENCH_HTML ?= benchmark/lokibench-bench.html
+
+bench-logs:
+	@echo "==> Running synthetic log benchmark (blockpack vs Loki chunks)..."
+	@echo "==> Generating ~50 MB synthetic data in-process (no external files required)"
+	@cd benchmark/lokibench && \
+		go test -run '^$$' \
+		-bench BenchmarkSynthetic \
+		-benchtime=1x \
+		-timeout 600s \
+		-count=1 \
+		-v \
+		-benchmem \
+		./... 2>&1
+	@echo "==> HTML report: $(LOKIBENCH_HTML)"
+
+bench-logs-html: bench-logs
+	@echo "==> Opening HTML report..."
+	@if command -v xdg-open >/dev/null 2>&1; then \
+		xdg-open $(LOKIBENCH_HTML); \
+	elif command -v open >/dev/null 2>&1; then \
+		open $(LOKIBENCH_HTML); \
+	else \
+		echo "==> Open manually: $(LOKIBENCH_HTML)"; \
+	fi
+
+LOKIBENCH_LARGESCALE_HTML ?= benchmark/lokibench-logs.html
+
+bench-logs-full:
+	@echo "==> Running unified log benchmark (50 queries × 100 MB + 1 GB OTLP datasets)..."
+	@echo "==> Data generated in benchmark/lokibench/testdata/ (bench-logs-full-html cleans this first)"
+	@cd benchmark/lokibench && \
+		LOGFILTER_REPORT=../lokibench-logs.html \
+		LOGFILTER_IO_LATENCY=10ms \
+		go test -run '^$$' \
+		-bench BenchmarkLogsFull \
+		-benchtime=1x \
+		-timeout 3600s \
+		-count=1 \
+		-v \
+		-benchmem \
+		./... 2>&1
+	@echo "==> HTML report: $(LOKIBENCH_LARGESCALE_HTML)"
+
+clean-bench-logs-full:
+	@echo "==> Cleaning benchmark/lokibench/testdata/ for a fresh run..."
+	@rm -rf benchmark/lokibench/testdata/
+
+bench-logs-full-html: clean-bench-logs-full bench-logs-full
+	@echo "==> Opening HTML report..."
+	@if command -v xdg-open >/dev/null 2>&1; then \
+		xdg-open $(LOKIBENCH_LARGESCALE_HTML); \
+	elif command -v open >/dev/null 2>&1; then \
+		open $(LOKIBENCH_LARGESCALE_HTML); \
+	else \
+		echo "==> Open manually: $(LOKIBENCH_LARGESCALE_HTML)"; \
+	fi
+
 # Serve benchmark reports via Go HTTP server
 serve-report:
-	@if [ ! -f $(BENCH_HTML) ]; then \
-		echo "Error: $(BENCH_HTML) not found. Run 'make bench-report' first."; \
-		exit 1; \
-	fi
 	@go run ./cmd/serve-report
 
 # Build cost analysis tool
@@ -497,5 +558,21 @@ cost-analysis-freetier: build-cost-tool $(BENCH_OUTPUT)
 	@cat $(BENCH_OUTPUT) | ./$(COST_TOOL) -scale=1000 -free-tier=true | tee $(COST_OUTPUT)
 	@echo ""
 	@echo "==> Cost analysis saved to $(COST_OUTPUT)"
+
+.PHONY: lokibench-smoke
+lokibench-smoke: ## Run blockpack LogQL bench smoke test (fast, ~30s)
+	cd benchmark/lokibench && go test -v -run 'TestBlockpackSmoke' -timeout 180s ./...
+
+.PHONY: lokibench-test
+lokibench-test: ## Run full blockpack LogQL storage equality test (~10min)
+	cd benchmark/lokibench && go test -v -run 'TestStorageEquality' -timeout 600s ./...
+
+.PHONY: lokibench-verify
+lokibench-verify: ## Run chunk-store vs blockpack mismatch verification tests (~2min)
+	cd benchmark/lokibench && go test \
+		-run 'TestSyntheticDeepCompare|TestSMLeakMismatch|TestLokiConverter_SelectLogs_MultiLabelEquality' \
+		-timeout 120s \
+		-v \
+		./...
 
 .DEFAULT_GOAL := help

@@ -17,6 +17,12 @@ type cachedRange struct {
 // If a requested range is fully contained within a cached range, the bytes are
 // served from memory without a new I/O call.
 // All methods are safe for concurrent use.
+//
+// WARNING: The cache grows without bound for the lifetime of this instance.
+// There is no eviction policy. This type is intended for short-lived, per-file
+// use: create one instance per open file, read, and discard. Do NOT reuse a
+// RangeCachingProvider across multiple files or after the underlying storage
+// has changed. See rw/NOTES.md §5.
 type RangeCachingProvider struct {
 	underlying ReaderProvider
 	cache      []cachedRange

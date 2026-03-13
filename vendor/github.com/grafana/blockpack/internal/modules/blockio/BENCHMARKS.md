@@ -6,6 +6,13 @@ is specified as a `testing.B` function, with required custom metrics reported vi
 
 For design rationale behind the performance targets see NOTES.md.
 
+> **Implementation status:** Many benchmarks in this document are aspirational targets and
+> have not yet been implemented. Entries without a `Back-ref:` are planned targets — they
+> define the performance contract for future work. Do not remove them.
+>
+> Currently implemented: BENCH-W-01 through BENCH-W-05 (writer/writer_bench_test.go),
+> BENCH-R-08 (reader/reader_test.go).
+
 ---
 
 ## Metric Targets (Never Regress Below)
@@ -132,6 +139,7 @@ All encoding benchmarks use 1000-row synthetic columns and measure both encode a
 roundtrips separately. They report bytes per encoded output.
 
 ### BENCH-E-01: BenchmarkEncodingDictionary
+*Status: not yet implemented*
 
 **Setup:** 1000 string values drawn from a 20-entry vocabulary (forces dictionary encoding).
 
@@ -146,6 +154,7 @@ b.ReportMetric(float64(uncompressedLen)/float64(encodedLen), "compress_ratio")
 ---
 
 ### BENCH-E-02: BenchmarkEncodingRLE
+*Status: not yet implemented*
 
 **Setup:** 1000 uint64 values with cardinality ≤ 3 (forces RLE index encoding, kind 6).
 
@@ -154,6 +163,7 @@ b.ReportMetric(float64(uncompressedLen)/float64(encodedLen), "compress_ratio")
 ---
 
 ### BENCH-E-03: BenchmarkEncodingDeltaUint64
+*Status: not yet implemented*
 
 **Setup:** 1000 monotonically increasing timestamps with range < 65535 (forces kind 5).
 
@@ -166,6 +176,7 @@ b.ReportMetric(float64(deltaWidth), "delta_width_bytes")
 ---
 
 ### BENCH-E-04: BenchmarkEncodingXOR
+*Status: not yet implemented*
 
 **Setup:** 1000 16-byte span IDs with adjacent IDs sharing the first 12 bytes.
 
@@ -178,6 +189,7 @@ b.ReportMetric(float64(16000)/float64(encodedLen), "compress_ratio")  // 16 byte
 ---
 
 ### BENCH-E-05: BenchmarkEncodingPrefix
+*Status: not yet implemented*
 
 **Setup:** 1000 URLs sharing a common 30-character prefix.
 
@@ -190,6 +202,7 @@ b.ReportMetric(float64(prefixCount), "prefix_dict_entries")
 ---
 
 ### BENCH-E-06: BenchmarkEncodingDeltaDictionary
+*Status: not yet implemented*
 
 **Setup:** 1000 16-byte trace IDs, sorted, adjacent entries differing by ≤ 4 bytes.
 
@@ -198,6 +211,7 @@ b.ReportMetric(float64(prefixCount), "prefix_dict_entries")
 ---
 
 ### BENCH-E-07: BenchmarkEncodingSelection_Uint64Timestamp
+*Status: not yet implemented*
 
 Verifies that the encoding selection logic selects `DeltaUint64` (kind 5) for timestamps.
 
@@ -214,6 +228,7 @@ b.ReportMetric(float64(b.N)/elapsed.Seconds(), "selections/sec")
 ---
 
 ### BENCH-E-08: BenchmarkEncodingSelection_SpanID
+*Status: not yet implemented*
 
 Verifies that `isIDColumn("span:id")` selects XOR encoding (kind 8).
 
@@ -229,6 +244,7 @@ b.ReportMetric(float64(encodingKind), "encoding_kind_selected")  // must be 8
 ---
 
 ### BENCH-E-09: BenchmarkEncodingSelection_URL
+*Status: not yet implemented*
 
 Verifies prefix encoding (kind 10) is selected for URL columns.
 
@@ -242,6 +258,7 @@ b.ReportMetric(float64(encodingKind), "encoding_kind_selected")  // must be 10
 ---
 
 ### BENCH-E-10: BenchmarkPresenceRLEEncode / BenchmarkPresenceRLEDecode
+*Status: not yet implemented*
 
 **Sub-benchmarks:**
 - `_Dense` — all 1000 rows present (no nulls)
@@ -259,6 +276,7 @@ b.ReportMetric(float64(runCount), "rle_runs")
 ## 3. Read Path Benchmarks
 
 ### BENCH-R-01: BenchmarkReaderParseMetadata
+*Status: not yet implemented*
 
 Measures time to open a reader (read footer + header + metadata section).
 
@@ -278,6 +296,7 @@ b.ReportMetric(elapsed.Milliseconds(), "ms/open")
 ---
 
 ### BENCH-R-02: BenchmarkGetBlockWithBytes_AllColumns
+*Status: not yet implemented*
 
 Measures decode time for a single block with all columns requested.
 
@@ -298,6 +317,7 @@ b.ReportMetric(elapsed.Milliseconds(), "ms/block")
 ---
 
 ### BENCH-R-03: BenchmarkGetBlockWithBytes_FilteredColumns
+*Status: not yet implemented*
 
 Verifies no per-column I/O occurs when only 3 of 20 columns are requested.
 
@@ -315,6 +335,7 @@ b.ReportMetric(float64(blockBytes-usefulBytes), "bytes_wasted")
 ---
 
 ### BENCH-R-04: BenchmarkGetBlockWithBytes_Reuse
+*Status: not yet implemented*
 
 Measures allocation reduction when reusing a `*BlockWithBytes` across iterations.
 
@@ -330,6 +351,7 @@ b.ReportMetric(float64(allocsPerOp), "allocs/op")
 ---
 
 ### BENCH-R-05: BenchmarkReaderGetColumn_StringValue
+*Status: not yet implemented*
 
 Measures per-value accessor cost for a decoded string column.
 
@@ -343,6 +365,7 @@ b.ReportMetric(float64(b.N*2000)/elapsed.Seconds(), "lookups/sec")
 ---
 
 ### BENCH-R-06: BenchmarkLazyDedicatedParse_FirstAccess
+*Status: not yet implemented*
 
 Measures first-access parse cost for a dedicated column index.
 
@@ -357,6 +380,7 @@ b.ReportMetric(float64(valuesIndexed), "values_indexed")
 ---
 
 ### BENCH-R-07: BenchmarkLazyDedicatedParse_CachedAccess
+*Status: not yet implemented*
 
 Measures repeated-access cost (result already cached).
 
@@ -372,6 +396,7 @@ b.ReportMetric(elapsed.Nanoseconds(), "ns/cached_access")
 ## 4. Block Pruning Benchmarks
 
 ### BENCH-P-01: BenchmarkBloomFilterPruning
+*Status: not yet implemented*
 
 Measures bloom-based block skipping effectiveness.
 
@@ -389,6 +414,7 @@ b.ReportMetric(float64(falsePositives), "false_positives")  // bloom FPs
 ---
 
 ### BENCH-P-02: BenchmarkDedicatedIndexLookup_Exact
+*Status: not yet implemented*
 
 Measures exact-string predicate lookup over the dedicated index.
 
@@ -403,6 +429,7 @@ b.ReportMetric(float64(blocksReturned), "blocks_returned")
 ---
 
 ### BENCH-P-03: BenchmarkDedicatedIndexLookup_Range
+*Status: not yet implemented*
 
 Measures range-predicate lookup over a KLL-bucketed numeric column.
 
@@ -419,6 +446,7 @@ b.ReportMetric(float64(bucketsScan), "buckets_scanned")
 ---
 
 ### BENCH-P-04: BenchmarkTimestampRangePruning
+*Status: not yet implemented*
 
 Measures how many blocks are skipped by `MinStart/MaxStart` range checks.
 
@@ -434,9 +462,33 @@ b.ReportMetric(float64(blocksPruned), "blocks_pruned")    // must be ~950
 
 ---
 
+### BENCH-P-05: BenchmarkTraceIDBloomLookup
+
+Measures the throughput of `BlocksForTraceIDCompact` for bloom-hit (trace present)
+and bloom-miss (trace absent) paths, establishing a regression baseline for the O(k)
+bloom check fast path.
+
+**Setup:**
+- Write a file with 5000 unique trace IDs across multiple blocks; flush.
+- Open with `NewLeanReaderFromProvider` (compact index parsed eagerly).
+- Prepare two lookup ID sets: 1000 present IDs and 1000 absent IDs.
+
+**Metrics:**
+```
+b.ReportMetric(float64(ops), "lookups/op")
+b.ReportMetric(float64(hits)/float64(ops)*100, "hit_pct")
+```
+
+**Baseline targets (to be measured; update after first run):**
+- Bloom-miss path: < 200 ns/op (k=7 hash computations on random bytes, no map access).
+- Bloom-hit path: < 500 ns/op (k=7 checks + hash map lookup).
+
+---
+
 ## 5. Coalescing Benchmarks
 
 ### BENCH-C-01: BenchmarkCoalesceBlocks_Adjacent
+*Status: not yet implemented*
 
 All blocks lay adjacent in the file (gap = 0).
 
@@ -451,6 +503,7 @@ b.ReportMetric(float64(100), "individual_reads_saved")
 ---
 
 ### BENCH-C-02: BenchmarkCoalesceBlocks_SmallGaps
+*Status: not yet implemented*
 
 Blocks separated by 1 KB gaps (well within 4 MB `AggressiveCoalesceConfig` threshold).
 
@@ -465,6 +518,7 @@ b.ReportMetric(float64(wastedBytes), "wasted_bytes")
 ---
 
 ### BENCH-C-03: BenchmarkCoalesceBlocks_LargeGaps
+*Status: not yet implemented*
 
 Blocks separated by 10 MB gaps (exceeds `AggressiveCoalesceConfig.MaxGapBytes = 4 MB`).
 
@@ -476,6 +530,7 @@ b.ReportMetric(float64(coalescedReads), "coalesced_reads")  // should equal bloc
 ---
 
 ### BENCH-C-04: BenchmarkReadCoalescedBlocks_Merged_vs_Individual
+*Status: not yet implemented*
 
 Compares latency of 1 merged read vs 10 individual reads using a simulated-latency provider.
 
@@ -496,6 +551,7 @@ b.ReportMetric(float64(ioOps), "io_ops")
 ## 6. I/O Metrics Validation Benchmarks
 
 ### BENCH-IO-01: BenchmarkIOOpsPerBlock
+*Status: not yet implemented*
 
 Validates the single-I/O-per-block invariant from NOTES §1 using `TrackingReaderProvider`.
 
@@ -515,6 +571,7 @@ b.ReportMetric(float64(tracker.BytesRead())/float64(ioOps), "bytes/io")
 ---
 
 ### BENCH-IO-02: BenchmarkIOOpsPerQuery
+*Status: not yet implemented*
 
 Measures total I/O operations for a full query across all blocks.
 
@@ -531,6 +588,7 @@ b.ReportMetric(float64(bytesRead)/float64(ioOps), "bytes/io")
 ---
 
 ### BENCH-IO-03: BenchmarkProviderStackOverhead
+*Status: not yet implemented*
 
 Measures overhead added by the DefaultProvider wrapper chain vs a bare provider.
 
@@ -548,6 +606,7 @@ b.ReportMetric(elapsed.Nanoseconds()/int64(b.N), "ns/readat")
 ## 7. KLL Sketch Benchmarks
 
 ### BENCH-K-01: BenchmarkKLLAdd_Uint64
+*Status: not yet implemented*
 
 Measures cost of adding values to a `KLL[uint64]` sketch.
 
@@ -559,6 +618,7 @@ b.ReportMetric(float64(b.N)/elapsed.Seconds(), "values/sec")
 ---
 
 ### BENCH-K-02: BenchmarkKLLBoundaries_Uint64
+*Status: not yet implemented*
 
 Measures cost of computing bucket boundaries from a populated sketch.
 
@@ -573,6 +633,7 @@ b.ReportMetric(float64(nBuckets), "buckets")
 ---
 
 ### BENCH-K-03: BenchmarkKLLBytes_Boundaries
+*Status: not yet implemented*
 
 Measures boundary computation for the bytes/string KLL (reservoir-based).
 
@@ -588,6 +649,7 @@ b.ReportMetric(elapsed.Microseconds(), "us/boundaries")
 ## 8. Round-Trip Benchmarks
 
 ### BENCH-RT-01: BenchmarkRoundTrip_SmallFile
+*Status: not yet implemented*
 
 Full write + read cycle for a small file.
 
@@ -603,6 +665,7 @@ b.ReportMetric(float64(spansRead), "spans_read")
 ---
 
 ### BENCH-RT-02: BenchmarkRoundTrip_LargeFile
+*Status: not yet implemented*
 
 Full write + read cycle for a large file.
 

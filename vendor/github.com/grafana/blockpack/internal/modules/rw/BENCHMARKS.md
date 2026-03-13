@@ -34,6 +34,25 @@ that simulate real-world object-storage first-byte latency.
 
 ---
 
+## Benchmark: SharedLRUProvider — Cross-Reader Cache Hit
+
+**BENCH-RW-03:** `BenchmarkSharedLRUProviderCacheHit`
+
+**Target:** Cache hit through `SharedLRUProvider` must add < 5 µs overhead vs. a direct
+memory copy — the mutex acquisition and map lookup must not dominate.
+
+```
+BenchmarkSharedLRUProviderCacheHit — cache hit: 0 I/O, < 5 µs/op
+```
+
+**Setup:** 1 MB payload; `SharedLRUCache(10 MB)`; prime cache with one read; then
+measure repeated hits. A miss would cause an underlying read (defeating the benchmark).
+
+**What to watch:** If hit latency climbs above 10 µs under concurrent load, the mutex
+in `SharedLRUCache` may be a bottleneck — consider sharding the index.
+
+---
+
 ## Notes
 
 - `TrackingReaderProvider.IOOps()` is the source of truth for `io_ops` metrics.
@@ -42,3 +61,5 @@ that simulate real-world object-storage first-byte latency.
   (see NOTES.md §1 for the composition rationale).
 - Benchmarks should use `NewDefaultProvider` (not raw providers) to accurately reflect
   the production code path.
+- `SharedLRUProvider` does not wrap a `TrackingReaderProvider` — callers that need
+  I/O metrics should compose: `SharedLRUProvider → TrackingReaderProvider → storage`.

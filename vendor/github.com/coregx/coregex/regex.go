@@ -1,0 +1,1464 @@
+// Package coregex provides a high-performance regex engine for Go.
+//
+// coregex achieves 5-50x speedup over Go's stdlib regexp through:
+//   - Multi-engine architecture (NFA, Lazy DFA, prefilters)
+//   - SIMD-accelerated primitives (memchr, memmem, teddy)
+//   - Literal extraction and prefiltering
+//   - Automatic strategy selection
+//
+// The public API is compatible with stdlib regexp where possible, making it
+// easy to migrate existing code.
+//
+// Basic usage:
+//
+//	// Compile a pattern
+//	re, err := coregex.Compile(`\d+`)
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//
+//	// Find first match
+//	match := re.Find([]byte("hello 123 world"))
+//	fmt.Println(string(match)) // "123"
+//
+//	// Check if matches
+//	if re.Match([]byte("hello 123")) {
+//	    fmt.Println("matched!")
+//	}
+//
+// Advanced usage:
+//
+//	// Custom configuration
+//	config := coregex.DefaultConfig()
+//	config.MaxDFAStates = 50000
+//	re, err := coregex.CompileWithConfig("(a|b|c)*", config)
+//
+// Performance characteristics:
+//   - Patterns with literals: 5-50x faster (prefilter optimization)
+//   - Simple patterns: comparable to stdlib
+//   - Complex patterns: 2-10x faster (DFA avoids backtracking)
+//   - Worst case: guaranteed O(m*n) (ReDoS safe)
+//
+// Limitations (v1.0):
+//   - No capture groups (coming in v1.1)
+//   - No replace functions (coming in v1.1)
+//   - No multiline/case-insensitive flags (coming in v1.1)
+package coregex
+
+import (
+	"io"
+	"regexp/syntax"
+	"unsafe"
+
+	"github.com/coregx/coregex/meta"
+)
+
+// stringToBytes converts string to []byte without allocation.
+// This is the Go equivalent of Rust's str.as_bytes() - a zero-cost reinterpret cast.
+// The returned slice MUST NOT be modified (same as Rust's immutable &[u8]).
+//
+//go:inline
+func stringToBytes(s string) []byte {
+	if s == "" {
+		return nil
+	}
+	// G103: Safe - read-only view of immutable string data (like Rust's as_bytes)
+	return unsafe.Slice(unsafe.StringData(s), len(s)) //nolint:gosec
+}
+
+// Regex represents a compiled regular expression.
+//
+// A Regex is safe to use concurrently from multiple goroutines, except for
+// methods that modify internal state (like ResetStats).
+//
+// Example:
+//
+//	re := coregex.MustCompile(`hello`)
+//	if re.Match([]byte("hello world")) {
+//	    println("matched!")
+//	}
+type Regex struct {
+	engine  *meta.Engine
+	pattern string
+	longest bool // if true, prefer leftmost-longest match (POSIX semantics)
+}
+
+// Regexp is an alias for Regex to provide drop-in compatibility with stdlib regexp.
+// This allows replacing `import "regexp"` with `import regexp "github.com/coregx/coregex"`
+// without changing type names in existing code.
+//
+// Example:
+//
+//	import regexp "github.com/coregx/coregex"
+//
+//	var re *regexp.Regexp = regexp.MustCompile(`\d+`)
+type Regexp = Regex
+
+// Compile compiles a regular expression pattern.
+//
+// Syntax is Perl-compatible (same as Go's stdlib regexp).
+// Returns an error if the pattern is invalid.
+//
+// Example:
+//
+//	re, err := coregex.Compile(`\d{3}-\d{4}`)
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+func Compile(pattern string) (*Regex, error) {
+	engine, err := meta.Compile(pattern)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Regex{
+		engine:  engine,
+		pattern: pattern,
+	}, nil
+}
+
+// MustCompile compiles a regular expression pattern and panics if it fails.
+//
+// This is useful for patterns known to be valid at compile time.
+//
+// Example:
+//
+//	var emailRegex = coregex.MustCompile(`[a-z]+@[a-z]+\.[a-z]+`)
+func MustCompile(pattern string) *Regex {
+	re, err := Compile(pattern)
+	if err != nil {
+		panic("regexp: Compile(`" + pattern + "`): " + err.Error())
+	}
+	return re
+}
+
+// CompilePOSIX is like Compile but restricts the regular expression to
+// POSIX ERE (egrep) syntax and changes the match semantics to leftmost-longest.
+//
+// That is, when matching against text, the regexp returns a match that
+// begins as early as possible in the input (leftmost), and among those
+// it chooses a match that is as long as possible.
+// This so-called leftmost-longest matching is the same semantics
+// that early regular expression implementations used and that POSIX
+// specifies.
+func CompilePOSIX(pattern string) (*Regex, error) {
+	re, err := Compile(pattern)
+	if err != nil {
+		return nil, err
+	}
+	re.Longest()
+	return re, nil
+}
+
+// MustCompilePOSIX is like CompilePOSIX but panics if the expression cannot
+// be parsed.
+// It simplifies safe initialization of global variables holding compiled
+// regular expressions.
+func MustCompilePOSIX(pattern string) *Regex {
+	re, err := CompilePOSIX(pattern)
+	if err != nil {
+		panic("regexp: CompilePOSIX(`" + pattern + "`): " + err.Error())
+	}
+	return re
+}
+
+// Match reports whether the byte slice b contains any match of the regular
+// expression pattern.
+// More complicated queries need to use Compile and the full Regexp interface.
+func Match(pattern string, b []byte) (matched bool, err error) {
+	re, err := Compile(pattern)
+	if err != nil {
+		return false, err
+	}
+	return re.Match(b), nil
+}
+
+// MatchString reports whether the string s contains any match of the regular
+// expression pattern.
+// More complicated queries need to use Compile and the full Regexp interface.
+func MatchString(pattern string, s string) (matched bool, err error) {
+	re, err := Compile(pattern)
+	if err != nil {
+		return false, err
+	}
+	return re.MatchString(s), nil
+}
+
+// CompileWithConfig compiles a pattern with custom configuration.
+//
+// This allows fine-tuning of performance characteristics.
+//
+// Example:
+//
+//	config := coregex.DefaultConfig()
+//	config.MaxDFAStates = 100000 // Larger cache
+//	re, err := coregex.CompileWithConfig("(a|b|c)*", config)
+func CompileWithConfig(pattern string, config meta.Config) (*Regex, error) {
+	engine, err := meta.CompileWithConfig(pattern, config)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Regex{
+		engine:  engine,
+		pattern: pattern,
+	}, nil
+}
+
+// DefaultConfig returns the default configuration for compilation.
+//
+// Users can customize this and pass to CompileWithConfig.
+//
+// Example:
+//
+//	config := coregex.DefaultConfig()
+//	config.EnableDFA = false // Use NFA only
+//	re, _ := coregex.CompileWithConfig("pattern", config)
+func DefaultConfig() meta.Config {
+	return meta.DefaultConfig()
+}
+
+// QuoteMeta returns a string that escapes all regular expression metacharacters
+// inside the argument text; the returned string is a regular expression matching
+// the literal text.
+//
+// Example:
+//
+//	escaped := coregex.QuoteMeta("hello.world")
+//	// escaped = "hello\\.world"
+//	re := coregex.MustCompile(escaped)
+//	re.MatchString("hello.world") // true
+func QuoteMeta(s string) string {
+	// Special characters that need escaping in regex
+	const special = `\.+*?()|[]{}^$`
+
+	// Count how many characters need escaping
+	n := 0
+	for i := 0; i < len(s); i++ {
+		if isSpecial(s[i], special) {
+			n++
+		}
+	}
+
+	// If no escaping needed, return original
+	if n == 0 {
+		return s
+	}
+
+	// Build escaped string
+	buf := make([]byte, len(s)+n)
+	j := 0
+	for i := 0; i < len(s); i++ {
+		if isSpecial(s[i], special) {
+			buf[j] = '\\'
+			j++
+		}
+		buf[j] = s[i]
+		j++
+	}
+	return string(buf)
+}
+
+// isSpecial returns true if c is in the special characters string.
+func isSpecial(c byte, special string) bool {
+	for i := 0; i < len(special); i++ {
+		if c == special[i] {
+			return true
+		}
+	}
+	return false
+}
+
+// Match reports whether the byte slice b contains any match of the pattern.
+//
+// Example:
+//
+//	re := coregex.MustCompile(`\d+`)
+//	if re.Match([]byte("hello 123")) {
+//	    println("contains digits")
+//	}
+func (r *Regex) Match(b []byte) bool {
+	return r.engine.IsMatch(b)
+}
+
+// MatchString reports whether the string s contains any match of the pattern.
+// This is a zero-allocation operation (like Rust's is_match).
+//
+// Example:
+//
+//	re := coregex.MustCompile(`hello`)
+//	if re.MatchString("hello world") {
+//	    println("matched!")
+//	}
+func (r *Regex) MatchString(s string) bool {
+	return r.engine.IsMatch(stringToBytes(s))
+}
+
+// Find returns a slice holding the text of the leftmost match in b.
+// Returns nil if no match is found.
+//
+// Example:
+//
+//	re := coregex.MustCompile(`\d+`)
+//	match := re.Find([]byte("age: 42"))
+//	println(string(match)) // "42"
+func (r *Regex) Find(b []byte) []byte {
+	// Use zero-allocation FindIndices internally
+	start, end, found := r.engine.FindIndices(b)
+	if !found {
+		return nil
+	}
+	return b[start:end]
+}
+
+// FindString returns a string holding the text of the leftmost match in s.
+// Returns empty string if no match is found.
+//
+// Example:
+//
+//	re := coregex.MustCompile(`\d+`)
+//	match := re.FindString("age: 42")
+//	println(match) // "42"
+func (r *Regex) FindString(s string) string {
+	b := stringToBytes(s)
+	start, end, found := r.engine.FindIndices(b)
+	if !found {
+		return ""
+	}
+	return s[start:end] // Return substring of original string - no allocation for input
+}
+
+// FindIndex returns a two-element slice of integers defining the location of
+// the leftmost match in b. The match is at b[loc[0]:loc[1]].
+// Returns nil if no match is found.
+//
+// Example:
+//
+//	re := coregex.MustCompile(`\d+`)
+//	loc := re.FindIndex([]byte("age: 42"))
+//	println(loc[0], loc[1]) // 5, 7
+func (r *Regex) FindIndex(b []byte) []int {
+	// Use zero-allocation FindIndices internally
+	start, end, found := r.engine.FindIndices(b)
+	if !found {
+		return nil
+	}
+	return []int{start, end}
+}
+
+// FindStringIndex returns a two-element slice of integers defining the location
+// of the leftmost match in s. The match is at s[loc[0]:loc[1]].
+// Returns nil if no match is found.
+//
+// Example:
+//
+//	re := coregex.MustCompile(`\d+`)
+//	loc := re.FindStringIndex("age: 42")
+//	println(loc[0], loc[1]) // 5, 7
+func (r *Regex) FindStringIndex(s string) []int {
+	start, end, found := r.engine.FindIndices(stringToBytes(s))
+	if !found {
+		return nil
+	}
+	return []int{start, end}
+}
+
+// FindAll returns a slice of all successive matches of the pattern in b.
+// If n > 0, it returns at most n matches. If n <= 0, it returns all matches.
+//
+// Example:
+//
+//	re := coregex.MustCompile(`\d+`)
+//	matches := re.FindAll([]byte("1 2 3"), -1)
+//	// matches = [[]byte("1"), []byte("2"), []byte("3")]
+func (r *Regex) FindAll(b []byte, n int) [][]byte {
+	if n == 0 {
+		return nil
+	}
+
+	// Use optimized streaming path for ALL strategies (state-reusing, no sync.Pool overhead)
+	return r.findAllStreaming(b, n)
+}
+
+// findAllStreaming uses state-reusing search loop for all strategies.
+// This avoids sync.Pool overhead (1.29M Get/Put → 1 for 6MB input).
+func (r *Regex) findAllStreaming(b []byte, n int) [][]byte {
+	// Get streaming indices ([][2]int format)
+	streamResults := r.engine.FindAllIndicesStreaming(b, n, nil)
+
+	if len(streamResults) == 0 {
+		return nil
+	}
+
+	// Convert indices to byte slices
+	matches := make([][]byte, len(streamResults))
+	for i, m := range streamResults {
+		matches[i] = b[m[0]:m[1]]
+	}
+
+	return matches
+}
+
+// FindAllString returns a slice of all successive matches of the pattern in s.
+// If n > 0, it returns at most n matches. If n <= 0, it returns all matches.
+//
+// Example:
+//
+//	re := coregex.MustCompile(`\d+`)
+//	matches := re.FindAllString("1 2 3", -1)
+//	// matches = ["1", "2", "3"]
+func (r *Regex) FindAllString(s string, n int) []string {
+	b := stringToBytes(s)
+	matches := r.FindAll(b, n)
+	if matches == nil {
+		return nil
+	}
+
+	result := make([]string, len(matches))
+	for i, m := range matches {
+		if len(m) == 0 {
+			result[i] = ""
+		} else {
+			// G103: Safe pointer arithmetic to compute substring offset within same backing array
+			start := int(uintptr(unsafe.Pointer(&m[0])) - uintptr(unsafe.Pointer(&b[0]))) //nolint:gosec
+			result[i] = s[start : start+len(m)]
+		}
+	}
+	return result
+}
+
+// String returns the source text used to compile the regular expression.
+//
+// Example:
+//
+//	re := coregex.MustCompile(`\d+`)
+//	println(re.String()) // `\d+`
+func (r *Regex) String() string {
+	return r.pattern
+}
+
+// Longest makes future searches prefer the leftmost-longest match.
+//
+// By default, coregex uses leftmost-first (Perl) semantics where the first
+// alternative in an alternation wins. After calling Longest(), coregex uses
+// leftmost-longest (POSIX) semantics where the longest match wins.
+//
+// Example:
+//
+//	re := coregex.MustCompile(`(a|ab)`)
+//	re.FindString("ab")    // returns "a" (leftmost-first: first branch wins)
+//
+//	re.Longest()
+//	re.FindString("ab")    // returns "ab" (leftmost-longest: longest wins)
+//
+// Note: Unlike stdlib, calling Longest() modifies the regex state and should
+// not be called concurrently with search methods.
+func (r *Regex) Longest() {
+	r.longest = true
+	r.engine.SetLongest(true)
+}
+
+// LiteralPrefix returns a literal string that must begin any match of the
+// regular expression re. It returns the boolean true if the literal string
+// comprises the entire regular expression.
+//
+// Example:
+//
+//	re := coregex.MustCompile(`Hello, \w+`)
+//	prefix, complete := re.LiteralPrefix()
+//	// prefix = "Hello, ", complete = false
+//
+//	re2 := coregex.MustCompile(`Hello`)
+//	prefix2, complete2 := re2.LiteralPrefix()
+//	// prefix2 = "Hello", complete2 = true
+func (r *Regex) LiteralPrefix() (prefix string, complete bool) {
+	re, err := syntax.Parse(r.pattern, syntax.Perl)
+	if err != nil {
+		return "", false
+	}
+	re = re.Simplify()
+	return literalPrefix(re)
+}
+
+// literalPrefix extracts the literal prefix from a parsed regex AST.
+func literalPrefix(re *syntax.Regexp) (string, bool) {
+	switch re.Op {
+	case syntax.OpLiteral:
+		return string(re.Rune), true
+	case syntax.OpConcat:
+		// Concatenation: collect literal prefixes from the beginning
+		var prefix []rune
+		hasAnchor := false
+		for _, sub := range re.Sub {
+			switch sub.Op {
+			case syntax.OpLiteral:
+				prefix = append(prefix, sub.Rune...)
+			case syntax.OpCapture:
+				// Look inside capture group
+				inner, complete := literalPrefix(sub)
+				prefix = append(prefix, []rune(inner)...)
+				if !complete {
+					return string(prefix), false
+				}
+			case syntax.OpBeginLine, syntax.OpEndLine, syntax.OpBeginText, syntax.OpEndText:
+				// Skip anchors - they don't produce literal characters
+				// but mark that pattern has anchors (not complete)
+				hasAnchor = true
+				continue
+			case syntax.OpEmptyMatch:
+				// Empty match doesn't affect prefix
+				continue
+			default:
+				// Non-literal found
+				return string(prefix), false
+			}
+		}
+		// If we have anchors, the pattern is not "complete" (has additional constraints)
+		if hasAnchor {
+			return string(prefix), false
+		}
+		return string(prefix), true
+	case syntax.OpCapture:
+		// Capture group: look at the contents
+		if len(re.Sub) == 1 {
+			return literalPrefix(re.Sub[0])
+		}
+		return "", false
+	case syntax.OpBeginLine, syntax.OpEndLine, syntax.OpBeginText, syntax.OpEndText:
+		// Anchors alone mean no literal prefix and not complete
+		return "", false
+	case syntax.OpEmptyMatch:
+		return "", true
+	default:
+		return "", false
+	}
+}
+
+// NumSubexp returns the number of parenthesized subexpressions in this Regex.
+// This does NOT include group 0 (the entire match), matching stdlib regexp behavior.
+//
+// Example:
+//
+//	re := coregex.MustCompile(`(\w+)@(\w+)\.(\w+)`)
+//	println(re.NumSubexp()) // 3 (just the capture groups)
+func (r *Regex) NumSubexp() int {
+	// Subtract 1 because NumCaptures() includes group 0 (entire match)
+	// but NumSubexp should only count parenthesized subexpressions
+	n := r.engine.NumCaptures() - 1
+	if n < 0 {
+		return 0
+	}
+	return n
+}
+
+// SubexpNames returns the names of the parenthesized subexpressions in this Regex.
+// The name for the first sub-expression is names[1], so that if m is a match slice,
+// the name for m[i] is SubexpNames()[i].
+// Since the Regexp as a whole cannot be named, names[0] is always the empty string.
+// The slice returned is shared and must not be modified.
+//
+// Example:
+//
+//	re := coregex.MustCompile(`(?P<year>\d+)-(?P<month>\d+)`)
+//	names := re.SubexpNames()
+//	// names[0] = ""
+//	// names[1] = "year"
+//	// names[2] = "month"
+func (r *Regex) SubexpNames() []string {
+	return r.engine.SubexpNames()
+}
+
+// SubexpIndex returns the index of the first subexpression with the given name,
+// or -1 if there is no subexpression with that name.
+//
+// Note that multiple subexpressions can be written using the same name, as in
+// (?P<bob>a+)(?P<bob>b+), which declares two subexpressions named "bob".
+// In this case, SubexpIndex returns the index of the leftmost such subexpression
+// in the regular expression.
+//
+// Example:
+//
+//	re := coregex.MustCompile(`(?P<year>\d+)-(?P<month>\d+)`)
+//	re.SubexpIndex("year")  // returns 1
+//	re.SubexpIndex("month") // returns 2
+//	re.SubexpIndex("day")   // returns -1
+func (r *Regex) SubexpIndex(name string) int {
+	if name == "" {
+		return -1
+	}
+	names := r.SubexpNames()
+	for i, n := range names {
+		if n == name {
+			return i
+		}
+	}
+	return -1
+}
+
+// FindSubmatch returns a slice holding the text of the leftmost match
+// and the matches of all capture groups.
+//
+// A return value of nil indicates no match.
+// Result[0] is the entire match, result[i] is the ith capture group.
+// Unmatched groups will be nil.
+//
+// Example:
+//
+//	re := coregex.MustCompile(`(\w+)@(\w+)\.(\w+)`)
+//	match := re.FindSubmatch([]byte("user@example.com"))
+//	// match[0] = "user@example.com"
+//	// match[1] = "user"
+//	// match[2] = "example"
+//	// match[3] = "com"
+func (r *Regex) FindSubmatch(b []byte) [][]byte {
+	match := r.engine.FindSubmatch(b)
+	if match == nil {
+		return nil
+	}
+	return match.AllGroups()
+}
+
+// FindStringSubmatch returns a slice of strings holding the text of the leftmost
+// match and the matches of all capture groups.
+//
+// Example:
+//
+//	re := coregex.MustCompile(`(\w+)@(\w+)\.(\w+)`)
+//	match := re.FindStringSubmatch("user@example.com")
+//	// match[0] = "user@example.com"
+//	// match[1] = "user"
+func (r *Regex) FindStringSubmatch(s string) []string {
+	match := r.engine.FindSubmatch(stringToBytes(s))
+	if match == nil {
+		return nil
+	}
+	return match.AllGroupStrings()
+}
+
+// FindSubmatchIndex returns a slice holding the index pairs for the leftmost
+// match and the matches of all capture groups.
+//
+// A return value of nil indicates no match.
+// Result[2*i:2*i+2] is the indices for the ith group.
+// Unmatched groups have -1 indices.
+//
+// Example:
+//
+//	re := coregex.MustCompile(`(\w+)@(\w+)\.(\w+)`)
+//	idx := re.FindSubmatchIndex([]byte("user@example.com"))
+//	// idx[0:2] = indices for entire match
+//	// idx[2:4] = indices for first capture group
+func (r *Regex) FindSubmatchIndex(b []byte) []int {
+	match := r.engine.FindSubmatch(b)
+	if match == nil {
+		return nil
+	}
+
+	numGroups := match.NumCaptures()
+	result := make([]int, numGroups*2)
+	for i := 0; i < numGroups; i++ {
+		idx := match.GroupIndex(i)
+		if len(idx) >= 2 {
+			result[i*2] = idx[0]
+			result[i*2+1] = idx[1]
+		} else {
+			result[i*2] = -1
+			result[i*2+1] = -1
+		}
+	}
+	return result
+}
+
+// FindStringSubmatchIndex returns the index pairs for the leftmost match
+// and capture groups. Same as FindSubmatchIndex but for strings.
+func (r *Regex) FindStringSubmatchIndex(s string) []int {
+	return r.FindSubmatchIndex(stringToBytes(s))
+}
+
+// FindAllIndex returns a slice of all successive matches of the pattern in b,
+// as index pairs [start, end].
+// If n > 0, it returns at most n matches. If n <= 0, it returns all matches.
+//
+// Example:
+//
+//	re := coregex.MustCompile(`\d+`)
+//	indices := re.FindAllIndex([]byte("1 2 3"), -1)
+//	// indices = [[0,1], [2,3], [4,5]]
+func (r *Regex) FindAllIndex(b []byte, n int) [][]int {
+	if n == 0 {
+		return nil
+	}
+
+	// Fast path: CharClassSearcher uses streaming state machine (single-pass, no per-match overhead)
+	// This is 2-3x faster than the loop below for patterns like \w+, \d+, [a-z]+
+	if r.engine.Strategy() == meta.UseCharClassSearcher {
+		return r.findAllIndexStreaming(b, n)
+	}
+
+	var indices [][]int
+	pos := 0
+	lastMatchEnd := -1 // Track where the last non-empty match ended
+
+	for {
+		// Use zero-allocation FindIndicesAt instead of FindAt (avoids Match object creation)
+		start, end, found := r.engine.FindIndicesAt(b, pos)
+		if !found {
+			break
+		}
+
+		// Lazy allocation: only allocate once we find the first match
+		if indices == nil {
+			// Pre-allocate with estimated capacity
+			// Heuristic: for typical patterns, estimate ~10 matches per 1KB
+			estimatedCap := len(b) / 100
+			if estimatedCap < 4 {
+				estimatedCap = 4
+			}
+			if n > 0 && estimatedCap > n {
+				estimatedCap = n
+			}
+			indices = make([][]int, 0, estimatedCap)
+		}
+
+		// Skip empty matches that start exactly where the previous non-empty match ended.
+		// This matches Go's stdlib behavior:
+		// - "a*" on "ab" returns [[0 1] [2 2]], not [[0 1] [1 1] [2 2]]
+		// - After matching "a" at [0,1], an empty match at [1,1] is skipped
+		// - But empty matches at [2,2] (after the 'b') are allowed
+		//nolint:gocritic // badCond: intentional - checking empty match (start==end) at lastMatchEnd
+		if start == end && start == lastMatchEnd {
+			// Skip this empty match and try at the next position
+			pos++
+			if pos > len(b) {
+				break
+			}
+			continue
+		}
+
+		indices = append(indices, []int{start, end})
+
+		// Track non-empty match ends for the skip rule
+		if start != end {
+			lastMatchEnd = end
+		}
+
+		// Move position past this match
+		switch {
+		case start == end:
+			// Empty match: advance by 1 to avoid infinite loop
+			pos = end + 1
+		case end > pos:
+			pos = end
+		default:
+			// Fallback (shouldn't normally happen)
+			pos++
+		}
+
+		if pos > len(b) {
+			break
+		}
+
+		// Check limit
+		if n > 0 && len(indices) >= n {
+			break
+		}
+	}
+
+	return indices
+}
+
+// findAllIndexStreaming uses single-pass streaming state machine for CharClassSearcher patterns.
+// This avoids per-match function call overhead (2-3x faster than the loop approach).
+// CharClassSearcher patterns like \w+, \d+, [a-z]+ cannot produce empty matches (minMatch=1),
+// so the empty match handling logic is not needed here.
+func (r *Regex) findAllIndexStreaming(b []byte, n int) [][]int {
+	// Get streaming results ([][2]int format)
+	streamResults := r.engine.FindAllIndicesStreaming(b, n, nil)
+
+	if len(streamResults) == 0 {
+		return nil
+	}
+
+	// Convert [][2]int to [][]int for stdlib-compatible API
+	// This allocation is necessary for API compatibility, but still faster than per-match overhead
+	indices := make([][]int, len(streamResults))
+	for i, m := range streamResults {
+		indices[i] = []int{m[0], m[1]}
+	}
+
+	return indices
+}
+
+// FindAllIndexCompact returns all successive matches as a compact [][2]int slice.
+// This is a zero-allocation API (single allocation for the result slice).
+// Unlike FindAllIndex which returns [][]int (N allocations for N matches),
+// this method pre-allocates the entire result in one contiguous block.
+//
+// Performance: ~2x fewer allocations than FindAllIndex for high match counts.
+//
+// If n > 0, it returns at most n matches. If n <= 0, it returns all matches.
+// The optional 'results' slice can be provided for reuse (set to nil for fresh allocation).
+//
+// Example:
+//
+//	re := coregex.MustCompile(`\d+`)
+//	indices := re.FindAllIndexCompact([]byte("a1b2c3"), -1, nil)
+//	// indices = [[1,2], [3,4], [5,6]]
+func (r *Regex) FindAllIndexCompact(b []byte, n int, results [][2]int) [][2]int {
+	if n == 0 {
+		return nil
+	}
+	return r.engine.FindAllIndicesStreaming(b, n, results)
+}
+
+// FindAllStringIndexCompact returns all successive matches as a compact [][2]int slice.
+// This is the string version of FindAllIndexCompact.
+func (r *Regex) FindAllStringIndexCompact(s string, n int, results [][2]int) [][2]int {
+	return r.FindAllIndexCompact(stringToBytes(s), n, results)
+}
+
+// FindAllStringIndex returns a slice of all successive matches of the pattern in s,
+// as index pairs [start, end].
+// If n > 0, it returns at most n matches. If n <= 0, it returns all matches.
+//
+// Example:
+//
+//	re := coregex.MustCompile(`\d+`)
+//	indices := re.FindAllStringIndex("1 2 3", -1)
+//	// indices = [[0,1], [2,3], [4,5]]
+func (r *Regex) FindAllStringIndex(s string, n int) [][]int {
+	return r.FindAllIndex(stringToBytes(s), n)
+}
+
+// ReplaceAllLiteral returns a copy of src, replacing matches of the pattern
+// with the replacement bytes repl.
+// The replacement is substituted directly, without expanding $ variables.
+//
+// Example:
+//
+//	re := coregex.MustCompile(`\d+`)
+//	result := re.ReplaceAllLiteral([]byte("age: 42"), []byte("XX"))
+//	// result = []byte("age: XX")
+func (r *Regex) ReplaceAllLiteral(src, repl []byte) []byte {
+	indices := r.FindAllIndex(src, -1)
+	if len(indices) == 0 {
+		// No matches, return copy of src
+		result := make([]byte, len(src))
+		copy(result, src)
+		return result
+	}
+
+	// Pre-allocate result buffer
+	// Estimate: len(src) + (len(repl)-avgMatchLen)*numMatches
+	totalMatchLen := 0
+	for _, idx := range indices {
+		totalMatchLen += idx[1] - idx[0]
+	}
+	avgMatchLen := totalMatchLen / len(indices)
+	estimatedLen := len(src) + (len(repl)-avgMatchLen)*len(indices)
+	if estimatedLen < 0 {
+		estimatedLen = len(src)
+	}
+
+	result := make([]byte, 0, estimatedLen)
+	lastEnd := 0
+
+	for _, idx := range indices {
+		// Append text before match
+		result = append(result, src[lastEnd:idx[0]]...)
+		// Append replacement
+		result = append(result, repl...)
+		lastEnd = idx[1]
+	}
+
+	// Append remaining text
+	result = append(result, src[lastEnd:]...)
+	return result
+}
+
+// ReplaceAllLiteralString returns a copy of src, replacing matches of the pattern
+// with the replacement string repl.
+// The replacement is substituted directly, without expanding $ variables.
+//
+// Example:
+//
+//	re := coregex.MustCompile(`\d+`)
+//	result := re.ReplaceAllLiteralString("age: 42", "XX")
+//	// result = "age: XX"
+func (r *Regex) ReplaceAllLiteralString(src, repl string) string {
+	return string(r.ReplaceAllLiteral([]byte(src), []byte(repl)))
+}
+
+// Expand appends template to dst and returns the result; during the
+// append, Expand replaces variables in the template with corresponding
+// matches drawn from src. The match slice should contain the progressively
+// numbered submatches as returned by FindSubmatchIndex.
+//
+// In the template, a variable is denoted by a substring of the form $name
+// or ${name}, where name is a non-empty sequence of letters, digits, and
+// underscores. A purely numeric name like $1 refers to the submatch with
+// the corresponding index; other names refer to capturing parentheses
+// named with the (?P<name>...) syntax. A reference to an out of range or
+// unmatched index or a name that is not present in the regular expression
+// is replaced with an empty slice.
+//
+// In the $name form, name is taken to be as long as possible: $1x is
+// equivalent to ${1x}, not ${1}x, and, $10 is equivalent to ${10}, not ${1}0.
+//
+// To insert a literal $ in the output, use $$ in the template.
+func (r *Regex) Expand(dst []byte, template []byte, src []byte, match []int) []byte {
+	return r.expand(dst, template, src, match)
+}
+
+// ExpandString is like Expand but the template and source are strings.
+// It appends to and returns a byte slice in order to give the caller
+// control over allocation.
+func (r *Regex) ExpandString(dst []byte, template string, src string, match []int) []byte {
+	return r.expand(dst, []byte(template), []byte(src), match)
+}
+
+// expand appends template to dst and returns the result; during the
+// append, it replaces $1, $2, etc. with the corresponding submatch.
+// $0 is the entire match.
+func (r *Regex) expand(dst []byte, template []byte, src []byte, match []int) []byte {
+	i := 0
+	for i < len(template) {
+		if template[i] != '$' || i+1 >= len(template) {
+			dst = append(dst, template[i])
+			i++
+			continue
+		}
+
+		// Handle $ escape sequences
+		next := template[i+1]
+
+		// Check for $0-$9
+		if next >= '0' && next <= '9' {
+			groupNum := int(next - '0')
+			// Each group occupies 2 indices in match array
+			groupIdx := groupNum * 2
+			if groupIdx+1 < len(match) && match[groupIdx] >= 0 {
+				dst = append(dst, src[match[groupIdx]:match[groupIdx+1]]...)
+			}
+			i += 2
+			continue
+		}
+
+		// Check for ${name} - not supported yet, treat as literal
+		if next == '{' {
+			dst = append(dst, '$')
+			i++
+			continue
+		}
+
+		// $$ -> $
+		if next == '$' {
+			dst = append(dst, '$')
+			i += 2
+			continue
+		}
+
+		// Unknown $ escape, treat as literal
+		dst = append(dst, '$')
+		i++
+	}
+	return dst
+}
+
+// ReplaceAll returns a copy of src, replacing matches of the pattern
+// with the replacement bytes repl.
+// Inside repl, $ signs are interpreted as in Regexp.Expand:
+// $0 is the entire match, $1 is the first capture group, etc.
+//
+// Example:
+//
+//	re := coregex.MustCompile(`(\w+)@(\w+)\.(\w+)`)
+//	result := re.ReplaceAll([]byte("user@example.com"), []byte("$1 at $2 dot $3"))
+//	// result = []byte("user at example dot com")
+func (r *Regex) ReplaceAll(src, repl []byte) []byte {
+	// Check if replacement contains $ variables
+	hasDollar := false
+	for _, b := range repl {
+		if b == '$' {
+			hasDollar = true
+			break
+		}
+	}
+
+	// If no $ variables, use faster literal replacement
+	if !hasDollar {
+		return r.ReplaceAllLiteral(src, repl)
+	}
+
+	// Need to find submatches for expansion
+	// Use NumCaptures() (includes group 0) for internal buffer sizing
+	// NumSubexp() returns only parenthesized groups (excluding group 0)
+	numCaptures := r.engine.NumCaptures() // includes group 0
+
+	// Pre-allocate result buffer based on input size
+	// Estimate: input size + 25% for replacements
+	estimatedLen := len(src) * 5 / 4
+	result := make([]byte, 0, estimatedLen)
+
+	// Pre-allocate matchIndices buffer and reuse it (avoid allocation per match)
+	// This includes group 0 (entire match) plus all capture groups
+	matchIndices := make([]int, numCaptures*2)
+
+	lastEnd := 0
+	pos := 0
+	lastNonEmptyMatchEnd := -1 // Track where the last non-empty match ended
+
+	for {
+		// Search from current position using FindSubmatchAt to preserve absolute positions
+		// This is critical for correct anchor handling (^ should only match at pos 0)
+		matchData := r.engine.FindSubmatchAt(src, pos)
+		if matchData == nil {
+			break
+		}
+
+		// Get match indices (already absolute from FindSubmatchAt)
+		// Reuse pre-allocated buffer (reset values each iteration)
+		for i := 0; i < numCaptures; i++ {
+			idx := matchData.GroupIndex(i)
+			if len(idx) >= 2 {
+				matchIndices[i*2] = idx[0]
+				matchIndices[i*2+1] = idx[1]
+			} else {
+				matchIndices[i*2] = -1
+				matchIndices[i*2+1] = -1
+			}
+		}
+
+		absStart := matchIndices[0]
+		absEnd := matchIndices[1]
+
+		// Skip empty matches that start exactly where the previous non-empty match ended.
+		// This matches Go's stdlib behavior for preventing duplicate empty matches.
+		//nolint:gocritic // badCond: intentional - checking empty match at lastNonEmptyMatchEnd
+		if absStart == absEnd && absStart == lastNonEmptyMatchEnd {
+			pos++
+			if pos > len(src) {
+				break
+			}
+			continue
+		}
+
+		// Append text before match
+		result = append(result, src[lastEnd:absStart]...)
+
+		// Expand template
+		result = r.expand(result, repl, src, matchIndices)
+
+		lastEnd = absEnd
+
+		// Track non-empty match ends for the skip rule
+		if absStart != absEnd {
+			lastNonEmptyMatchEnd = absEnd
+		}
+
+		// Move position past this match
+		switch {
+		case absStart == absEnd:
+			// Empty match: advance by 1 to avoid infinite loop
+			pos = absEnd + 1
+		case absEnd > pos:
+			pos = absEnd
+		default:
+			// Fallback (shouldn't normally happen)
+			pos++
+		}
+
+		if pos > len(src) {
+			break
+		}
+	}
+
+	// Append remaining text
+	result = append(result, src[lastEnd:]...)
+	return result
+}
+
+// ReplaceAllString returns a copy of src, replacing matches of the pattern
+// with the replacement string repl.
+// Inside repl, $ signs are interpreted as in Regexp.Expand:
+// $0 is the entire match, $1 is the first capture group, etc.
+//
+// Example:
+//
+//	re := coregex.MustCompile(`(\w+)@(\w+)\.(\w+)`)
+//	result := re.ReplaceAllString("user@example.com", "$1 at $2 dot $3")
+//	// result = "user at example dot com"
+func (r *Regex) ReplaceAllString(src, repl string) string {
+	return string(r.ReplaceAll([]byte(src), []byte(repl)))
+}
+
+// ReplaceAllFunc returns a copy of src in which all matches of the pattern
+// have been replaced by the return value of function repl applied to the matched
+// byte slice. The replacement returned by repl is substituted directly, without
+// using Expand.
+//
+// Example:
+//
+//	re := coregex.MustCompile(`\d+`)
+//	result := re.ReplaceAllFunc([]byte("1 2 3"), func(s []byte) []byte {
+//	    n, _ := strconv.Atoi(string(s))
+//	    return []byte(strconv.Itoa(n * 2))
+//	})
+//	// result = []byte("2 4 6")
+func (r *Regex) ReplaceAllFunc(src []byte, repl func([]byte) []byte) []byte {
+	indices := r.FindAllIndex(src, -1)
+	if len(indices) == 0 {
+		// No matches, return copy of src
+		result := make([]byte, len(src))
+		copy(result, src)
+		return result
+	}
+
+	var result []byte
+	lastEnd := 0
+
+	for _, idx := range indices {
+		// Append text before match
+		result = append(result, src[lastEnd:idx[0]]...)
+		// Apply replacement function
+		replacement := repl(src[idx[0]:idx[1]])
+		result = append(result, replacement...)
+		lastEnd = idx[1]
+	}
+
+	// Append remaining text
+	result = append(result, src[lastEnd:]...)
+	return result
+}
+
+// ReplaceAllStringFunc returns a copy of src in which all matches of the pattern
+// have been replaced by the return value of function repl applied to the matched
+// string. The replacement returned by repl is substituted directly, without using
+// Expand.
+//
+// Example:
+//
+//	re := coregex.MustCompile(`\d+`)
+//	result := re.ReplaceAllStringFunc("1 2 3", func(s string) string {
+//	    n, _ := strconv.Atoi(s)
+//	    return strconv.Itoa(n * 2)
+//	})
+//	// result = "2 4 6"
+func (r *Regex) ReplaceAllStringFunc(src string, repl func(string) string) string {
+	indices := r.FindAllStringIndex(src, -1)
+	if len(indices) == 0 {
+		return src
+	}
+
+	var result string
+	lastEnd := 0
+
+	for _, idx := range indices {
+		// Append text before match
+		result += src[lastEnd:idx[0]]
+		// Apply replacement function
+		replacement := repl(src[idx[0]:idx[1]])
+		result += replacement
+		lastEnd = idx[1]
+	}
+
+	// Append remaining text
+	result += src[lastEnd:]
+	return result
+}
+
+// Split slices s into substrings separated by the expression and returns a slice
+// of the substrings between those expression matches.
+//
+// The slice returned by this method consists of all the substrings of s not
+// contained in the slice returned by FindAllString. When called on an expression
+// that contains no metacharacters, it is equivalent to strings.SplitN.
+//
+// The count determines the number of substrings to return:
+//
+//	n > 0: at most n substrings; the last substring will be the unsplit remainder.
+//	n == 0: the result is nil (zero substrings)
+//	n < 0: all substrings
+//
+// Example:
+//
+//	re := coregex.MustCompile(`,`)
+//	parts := re.Split("a,b,c", -1)
+//	// parts = ["a", "b", "c"]
+//
+//	parts = re.Split("a,b,c", 2)
+//	// parts = ["a", "b,c"]
+func (r *Regex) Split(s string, n int) []string {
+	if n == 0 {
+		return nil
+	}
+
+	indices := r.FindAllStringIndex(s, -1)
+	if len(indices) == 0 {
+		// No matches, return entire string
+		return []string{s}
+	}
+
+	// Determine the number of splits
+	numSplits := len(indices) + 1
+	if n > 0 && n < numSplits {
+		numSplits = n
+	}
+
+	// Pre-allocate result slice
+	result := make([]string, 0, numSplits)
+
+	lastEnd := 0
+	for _, idx := range indices {
+		// Skip empty match at the beginning (position 0 with zero-width match)
+		// This matches stdlib behavior: Split("", "abc") = ["a", "b", "c"], not ["", "a", "b", "c", ""]
+		if lastEnd == 0 && idx[0] == 0 && idx[1] == 0 {
+			continue
+		}
+
+		// Skip empty match at the very end of string
+		if idx[0] == len(s) && idx[1] == len(s) {
+			break
+		}
+
+		// Add substring before match
+		result = append(result, s[lastEnd:idx[0]])
+		lastEnd = idx[1]
+
+		// Check if we've reached the limit (but need room for final element)
+		if n > 0 && len(result) >= n-1 {
+			// Add the rest as the final element
+			result = append(result, s[lastEnd:])
+			return result
+		}
+	}
+
+	// Add remaining text after last match
+	// Always add even if empty (matches stdlib behavior)
+	result = append(result, s[lastEnd:])
+	return result
+}
+
+// Count returns the number of non-overlapping matches of the pattern in b.
+// If n > 0, counts at most n matches. If n <= 0, counts all matches.
+//
+// This is optimized for counting without building result slices.
+//
+// Example:
+//
+//	re := coregex.MustCompile(`\d+`)
+//	count := re.Count([]byte("1 2 3 4 5"), -1)
+//	// count == 5
+func (r *Regex) Count(b []byte, n int) int {
+	return r.engine.Count(b, n)
+}
+
+// CountString returns the number of non-overlapping matches of the pattern in s.
+// If n > 0, counts at most n matches. If n <= 0, counts all matches.
+//
+// Example:
+//
+//	re := coregex.MustCompile(`\d+`)
+//	count := re.CountString("1 2 3 4 5", -1)
+//	// count == 5
+func (r *Regex) CountString(s string, n int) int {
+	return r.engine.Count(stringToBytes(s), n)
+}
+
+// FindAllSubmatch returns a slice of all successive matches of the pattern in b,
+// where each match includes all capture groups.
+// If n > 0, returns at most n matches. If n <= 0, returns all matches.
+//
+// Example:
+//
+//	re := coregex.MustCompile(`(\w+)@(\w+)\.(\w+)`)
+//	matches := re.FindAllSubmatch([]byte("a@b.c x@y.z"), -1)
+//	// len(matches) == 2
+//	// matches[0][0] = "a@b.c"
+//	// matches[0][1] = "a"
+func (r *Regex) FindAllSubmatch(b []byte, n int) [][][]byte {
+	matches := r.engine.FindAllSubmatch(b, n)
+	if matches == nil {
+		return nil
+	}
+
+	result := make([][][]byte, len(matches))
+	for i, m := range matches {
+		result[i] = m.AllGroups()
+	}
+	return result
+}
+
+// FindAllStringSubmatch returns a slice of all successive matches of the pattern in s,
+// where each match includes all capture groups as strings.
+// If n > 0, returns at most n matches. If n <= 0, returns all matches.
+//
+// Example:
+//
+//	re := coregex.MustCompile(`(\w+)@(\w+)\.(\w+)`)
+//	matches := re.FindAllStringSubmatch("a@b.c x@y.z", -1)
+//	// len(matches) == 2
+//	// matches[0][0] = "a@b.c"
+//	// matches[0][1] = "a"
+func (r *Regex) FindAllStringSubmatch(s string, n int) [][]string {
+	matches := r.engine.FindAllSubmatch(stringToBytes(s), n)
+	if matches == nil {
+		return nil
+	}
+
+	result := make([][]string, len(matches))
+	for i, m := range matches {
+		result[i] = m.AllGroupStrings()
+	}
+	return result
+}
+
+// FindAllSubmatchIndex returns a slice of all successive matches of the pattern in b,
+// where each match includes index pairs for all capture groups.
+// If n > 0, returns at most n matches. If n <= 0, returns all matches.
+//
+// Example:
+//
+//	re := coregex.MustCompile(`(\w+)@(\w+)\.(\w+)`)
+//	indices := re.FindAllSubmatchIndex([]byte("a@b.c x@y.z"), -1)
+//	// len(indices) == 2
+//	// indices[0] contains start/end pairs for each group
+func (r *Regex) FindAllSubmatchIndex(b []byte, n int) [][]int {
+	matches := r.engine.FindAllSubmatch(b, n)
+	if matches == nil {
+		return nil
+	}
+
+	result := make([][]int, len(matches))
+	for i, m := range matches {
+		numGroups := m.NumCaptures()
+		indices := make([]int, numGroups*2)
+		for j := 0; j < numGroups; j++ {
+			idx := m.GroupIndex(j)
+			if len(idx) >= 2 {
+				indices[j*2] = idx[0]
+				indices[j*2+1] = idx[1]
+			} else {
+				indices[j*2] = -1
+				indices[j*2+1] = -1
+			}
+		}
+		result[i] = indices
+	}
+	return result
+}
+
+// FindAllStringSubmatchIndex returns a slice of all successive matches of the pattern in s,
+// where each match includes index pairs for all capture groups.
+// If n > 0, returns at most n matches. If n <= 0, returns all matches.
+//
+// Example:
+//
+//	re := coregex.MustCompile(`(\w+)@(\w+)\.(\w+)`)
+//	indices := re.FindAllStringSubmatchIndex("a@b.c x@y.z", -1)
+func (r *Regex) FindAllStringSubmatchIndex(s string, n int) [][]int {
+	return r.FindAllSubmatchIndex(stringToBytes(s), n)
+}
+
+// Copy returns a new Regex object copied from re.
+// Calling Longest on one copy does not affect another.
+//
+// Deprecated: In earlier releases, when using a Regexp in multiple goroutines,
+// giving each goroutine its own copy helped to avoid lock contention.
+// As of Go 1.12, using Copy is no longer necessary to avoid lock contention.
+// Copy may still be appropriate if the reason for its use is to make
+// two copies with different Longest settings.
+func (r *Regex) Copy() *Regex {
+	// Create a new Regex with the same pattern
+	// Note: This re-compiles the pattern, which is slightly slower than
+	// sharing the internal engine, but ensures complete independence.
+	re, err := Compile(r.pattern)
+	if err != nil {
+		// This should never happen since the pattern was already compiled
+		return nil
+	}
+	if r.longest {
+		re.Longest()
+	}
+	return re
+}
+
+// MarshalText implements encoding.TextMarshaler. The output
+// is the result of r.String().
+func (r *Regex) MarshalText() ([]byte, error) {
+	return []byte(r.pattern), nil
+}
+
+// UnmarshalText implements encoding.TextUnmarshaler by calling
+// Compile on the encoded value.
+func (r *Regex) UnmarshalText(text []byte) error {
+	newRe, err := Compile(string(text))
+	if err != nil {
+		return err
+	}
+	*r = *newRe
+	return nil
+}
+
+// MatchReader reports whether the text returned by the RuneReader
+// contains any match of the regular expression re.
+func (r *Regex) MatchReader(reader io.RuneReader) bool {
+	// Read all runes into a string and match
+	var runes []rune
+	for {
+		rn, _, err := reader.ReadRune()
+		if err != nil {
+			break
+		}
+		runes = append(runes, rn)
+	}
+	return r.MatchString(string(runes))
+}
+
+// FindReaderIndex returns a two-element slice of integers defining the
+// location of the leftmost match of the regular expression in text read from
+// the RuneReader. The match text was found in the input stream at
+// byte offset loc[0] through loc[1]-1.
+// A return value of nil indicates no match.
+func (r *Regex) FindReaderIndex(reader io.RuneReader) []int {
+	// Read all runes into a string and find
+	var runes []rune
+	for {
+		rn, _, err := reader.ReadRune()
+		if err != nil {
+			break
+		}
+		runes = append(runes, rn)
+	}
+	return r.FindStringIndex(string(runes))
+}
+
+// FindReaderSubmatchIndex returns a slice holding the index pairs
+// identifying the leftmost match of the regular expression of text
+// read by the RuneReader, and the matches, if any, of its subexpressions,
+// as defined by the 'Submatch' and 'Index' descriptions in the
+// package comment.
+// A return value of nil indicates no match.
+func (r *Regex) FindReaderSubmatchIndex(reader io.RuneReader) []int {
+	// Read all runes into a string and find
+	var runes []rune
+	for {
+		rn, _, err := reader.ReadRune()
+		if err != nil {
+			break
+		}
+		runes = append(runes, rn)
+	}
+	return r.FindStringSubmatchIndex(string(runes))
+}
+
+// MatchReader reports whether the text returned by the RuneReader
+// contains any match of the regular expression pattern.
+// More complicated queries need to use Compile and the full Regexp interface.
+func MatchReader(pattern string, r io.RuneReader) (matched bool, err error) {
+	re, err := Compile(pattern)
+	if err != nil {
+		return false, err
+	}
+	return re.MatchReader(r), nil
+}

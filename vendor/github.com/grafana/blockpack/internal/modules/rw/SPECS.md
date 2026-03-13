@@ -10,7 +10,7 @@ TESTS.md (test plan).
 
 rw **provides the storage abstraction layer for blockpack**. It owns the byte-moving
 types: the storage backend interface, read-type hints, and provider compositions
-(tracking, caching, default). It does not parse or encode blockpack file formats.
+(tracking, caching, default, shared LRU). It does not parse or encode blockpack file formats.
 
 | Concern | Owner |
 |---------|-------|
@@ -19,6 +19,7 @@ types: the storage backend interface, read-type hints, and provider compositions
 | I/O counting and byte tracking (TrackingReaderProvider) | **rw** |
 | Sub-range memory caching (RangeCachingProvider) | **rw** |
 | Standard provider composition (DefaultProvider) | **rw** |
+| Shared cross-reader LRU cache (SharedLRUCache / SharedLRUProvider) | **rw** |
 | Format parsing and encoding | caller packages (blockio/reader, blockio/writer) |
 | Span field access | blockio/shared (SpanFieldsProvider) |
 
@@ -50,29 +51,40 @@ pread-style offset-based random read.
 **Invariant:** Safe for concurrent use from multiple goroutines.
 
 **Invariant:** `dataType` is a hint only — implementations may ignore it entirely.
-Caching layers use it for future segmentation; correctness must not depend on its value.
+Caching layers use it for priority-based eviction; correctness must not depend on its value.
 
 ---
 
 ## 3. DataType — Read-Type Hint
 
 ```go
-type DataType string
+type DataType uint8
 ```
 
-A hint passed to `ReaderProvider.ReadAt` to inform caching layers of the semantic
-category of the bytes being read. Implementations are free to ignore the hint.
+A typed constant (not a string) passed to `ReaderProvider.ReadAt` identifying the
+semantic category of bytes being read. Caching layers use it to determine eviction
+priority. Implementations that do not cache may ignore it.
+
+**Breaking change from prior versions:** `DataType` was previously `string`; it is
+now `uint8` with iota-assigned values. String conversion is no longer valid. See
+NOTES.md §7 for rationale.
 
 ### 3.1 Constants
 
-| Constant | Value | Semantic |
-|----------|-------|----------|
-| `DataTypeFooter` | `"footer"` | File footer section |
-| `DataTypeHeader` | `"header"` | File header section |
-| `DataTypeMetadata` | `"metadata"` | Metadata section |
-| `DataTypeBlock` | `"block"` | Block data section |
-| `DataTypeIndex` | `"index"` | Index section |
-| `DataTypeCompact` | `"compact"` | Compact trace index section |
+| Constant | Iota | Semantic | Eviction tier |
+|----------|------|----------|---------------|
+| `DataTypeUnknown` | 0 | Unknown / unset; treated as lowest priority | 3 (easiest) |
+| `DataTypeFooter` | 1 | File footer section | 0 (hardest) |
+| `DataTypeHeader` | 2 | File header section | 0 (hardest) |
+| `DataTypeMetadata` | 3 | Block metadata section | 1 |
+| `DataTypeTraceBloomFilter` | 4 | Compact trace-ID bloom filter + lookup index | 1 |
+| `DataTypeTimestampIndex` | 5 | Per-file timestamp index | 2 |
+| `DataTypeBlock` | 6 | Span block payload | 3 (easiest) |
+
+**Priority order (hardest to evict → easiest):**
+`Footer ≈ Header > Metadata ≈ TraceBloomFilter > TimestampIndex > Block`
+
+Back-ref: `internal/modules/rw/provider.go:DataType`
 
 ---
 
@@ -209,6 +221,91 @@ metadata reads vs. block reads) without creating a new provider instance.
 
 ---
 
-## 7. Thread Safety
+## 7. SharedLRUCache — Cross-Reader Shared Cache
+
+```go
+type SharedLRUCache struct { ... }
+```
+
+A byte-bounded, priority-tiered LRU cache designed to be shared across multiple
+`SharedLRUProvider` instances (one per file). The total memory footprint never
+exceeds `maxBytes`. When capacity is exceeded, entries from the lowest-priority
+tier are evicted first; within a tier, the least-recently-used entry is removed first.
+
+### 7.1 NewSharedLRUCache
+
+```go
+func NewSharedLRUCache(maxBytes int64) *SharedLRUCache
+```
+
+Creates a cache with the given byte capacity. Safe for concurrent use immediately.
+
+### 7.2 Get
+
+```go
+func (c *SharedLRUCache) Get(readerID string, off int64, length int) ([]byte, bool)
+```
+
+Looks up a cached range keyed by `(readerID, off, length)`. On hit, promotes the
+entry to MRU position within its tier and returns a **copy** of the cached bytes.
+Returns `(nil, false)` on miss.
+
+**Invariant:** Returned bytes are a copy — callers may mutate them without affecting the cache.
+
+### 7.3 Put
+
+```go
+func (c *SharedLRUCache) Put(readerID string, off int64, data []byte, dt DataType)
+```
+
+Stores `data` in the cache keyed by `(readerID, off, len(data))` with priority
+derived from `dt`. No-ops if the key already exists or if `len(data) > maxBytes`.
+Before inserting, evicts entries from lower-priority tiers until the new entry fits.
+
+**Invariant:** `curBytes` never exceeds `maxBytes` after any `Put`.
+
+**Invariant:** Eviction order: tier 3 (Block) → tier 2 (TimestampIndex) → tier 1
+(Metadata/TraceBloomFilter) → tier 0 (Footer/Header). Within a tier, LRU is evicted first.
+
+Back-ref: `internal/modules/rw/lru.go:SharedLRUCache`
+
+---
+
+## 8. SharedLRUProvider — Per-Reader Cache Front-End
+
+```go
+type SharedLRUProvider struct { ... }
+```
+
+Wraps a `ReaderProvider` and routes all reads through a `*SharedLRUCache`. Multiple
+`SharedLRUProvider` instances sharing the same `*SharedLRUCache` share the cache
+namespace. Each provider identifies itself via a `readerID` string (e.g. file path).
+
+### 8.1 NewSharedLRUProvider
+
+```go
+func NewSharedLRUProvider(underlying ReaderProvider, readerID string, cache *SharedLRUCache) *SharedLRUProvider
+```
+
+`readerID` must be unique within the cache namespace (e.g. object storage key).
+
+### 8.2 ReadAt
+
+1. Check cache: `cache.Get(readerID, off, len(p))`.
+2. On hit: copy cached bytes into `p`, return.
+3. On miss: call `underlying.ReadAt`; on success store result via `cache.Put`; return.
+4. If underlying returns `n < len(p)` with `err == nil`, return `(n, io.ErrUnexpectedEOF)`.
+   The partial read is not cached.
+
+**Invariant:** Cache hits never issue underlying I/O.
+
+Back-ref: `internal/modules/rw/lru.go:SharedLRUProvider`
+
+---
+
+## 9. Thread Safety
 
 All exported types in this package are safe for concurrent use.
+
+---
+

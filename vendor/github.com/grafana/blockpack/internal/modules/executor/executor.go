@@ -8,18 +8,18 @@
 // # Usage
 //
 //	exec := executor.New()
-//	result, err := exec.Execute(r, program, executor.Options{})
-//	// result.Matches contains matching spans; result.Plan contains block selection stats
+//	rows, err := exec.Collect(r, program, executor.CollectOptions{})
+//	// rows contains matched MatchedRow values; use SpanMatchFromRow to extract TraceID/SpanID
+//
+//	rows, logErr = executor.CollectLogs(r, program, nil, executor.CollectOptions{TimestampColumn: "log:timestamp"})
 package executor
 
 // NOTE: Any changes to this file must be reflected in the corresponding specs.md or NOTES.md.
 
 import (
-	"fmt"
-
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
+	modules_shared "github.com/grafana/blockpack/internal/modules/blockio/shared"
 	"github.com/grafana/blockpack/internal/modules/queryplanner"
-	"github.com/grafana/blockpack/internal/vm"
 )
 
 // SpanMatch is a span that matched the query.
@@ -40,6 +40,9 @@ type Result struct {
 
 // Options controls query execution behavior.
 type Options struct {
+	// TimeRange constrains block scanning to blocks whose time window overlaps this range.
+	// A zero-value TimeRange disables time pruning.
+	TimeRange queryplanner.TimeRange
 	// Limit caps the number of returned matches. 0 means no limit.
 	Limit int
 }
@@ -51,75 +54,32 @@ type Executor struct{}
 // New returns a new Executor.
 func New() *Executor { return &Executor{} }
 
-// Execute selects candidate blocks via queryplanner, fetches them in bulk,
-// then evaluates program.ColumnPredicate against each block's spans.
-//
-// r is a *reader.Reader. program must be compiled with vm.CompileTraceQLFilter.
-func (e *Executor) Execute(
-	r *modules_reader.Reader,
-	program *vm.Program,
-	opts Options,
-) (*Result, error) {
-	if r == nil {
-		return &Result{}, nil
-	}
-
-	planner := queryplanner.NewPlanner(r)
-	plan := planner.Plan(buildPredicates(r, program))
-
-	result := &Result{Plan: plan}
-	if len(plan.SelectedBlocks) == 0 {
-		return result, nil
-	}
-
-	rawBlocks, err := planner.FetchBlocks(plan)
-	if err != nil {
-		return nil, fmt.Errorf("FetchBlocks: %w", err)
-	}
-
-	for _, blockIdx := range plan.SelectedBlocks {
-		raw, ok := rawBlocks[blockIdx]
-		if !ok {
-			continue
-		}
-		result.BytesRead += int64(len(raw)) //nolint:gosec
-
-		meta := r.BlockMeta(blockIdx)
-		bwb, parseErr := r.ParseBlockFromBytes(raw, nil, meta)
-		if parseErr != nil {
-			return nil, fmt.Errorf("ParseBlockFromBytes block %d: %w", blockIdx, parseErr)
-		}
-
-		provider := newBlockColumnProvider(bwb.Block)
-		rowSet, evalErr := program.ColumnPredicate(provider)
-		if evalErr != nil {
-			return nil, fmt.Errorf("ColumnPredicate block %d: %w", blockIdx, evalErr)
-		}
-
-		result.BlocksScanned++
-
-		for _, rowIdx := range rowSet.ToSlice() {
-			match := spanMatchFromBlock(bwb.Block, blockIdx, rowIdx)
-			result.Matches = append(result.Matches, match)
-			if opts.Limit > 0 && len(result.Matches) >= opts.Limit {
-				return result, nil
-			}
-		}
-	}
-
-	return result, nil
+// SpanMatchFromRow extracts a SpanMatch from a MatchedRow by reading the appropriate
+// trace and span identity columns for the given signal type. For trace signals it
+// reads "trace:id" and "span:id"; for log signals it reads "log:trace_id" and "log:span_id".
+func SpanMatchFromRow(row MatchedRow, signalType uint8) SpanMatch {
+	return spanMatchFromBlock(row.Block, row.BlockIdx, row.RowIdx, signalType)
 }
 
 // spanMatchFromBlock extracts a SpanMatch from a block row.
-func spanMatchFromBlock(block *modules_reader.Block, blockIdx, rowIdx int) SpanMatch {
+// signalType determines which column names hold the trace and span IDs:
+// log files use "log:trace_id" / "log:span_id"; trace files use "trace:id" / "span:id".
+func spanMatchFromBlock(block *modules_reader.Block, blockIdx, rowIdx int, signalType uint8) SpanMatch {
 	m := SpanMatch{BlockIdx: blockIdx, RowIdx: rowIdx}
 
-	if col := block.GetColumn("trace:id"); col != nil {
+	traceIDCol := "trace:id"
+	spanIDCol := "span:id"
+	if signalType == modules_shared.SignalTypeLog {
+		traceIDCol = "log:trace_id"
+		spanIDCol = "log:span_id"
+	}
+
+	if col := block.GetColumn(traceIDCol); col != nil {
 		if v, ok := col.BytesValue(rowIdx); ok && len(v) == 16 {
 			copy(m.TraceID[:], v)
 		}
 	}
-	if col := block.GetColumn("span:id"); col != nil {
+	if col := block.GetColumn(spanIDCol); col != nil {
 		if v, ok := col.BytesValue(rowIdx); ok {
 			m.SpanID = make([]byte, len(v))
 			copy(m.SpanID, v)

@@ -5,17 +5,13 @@ package writer
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"math"
 	"sort"
 
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
 )
-
-type traceBlockRef struct {
-	spanIndices []uint16
-	blockID     uint16
-}
 
 // writeBlockIndexSection serializes the block index.
 // Returns the serialized bytes (without the length prefix — caller adds it).
@@ -24,7 +20,10 @@ func writeBlockIndexSection(_ io.Writer, version uint8, metas []shared.BlockMeta
 
 	// block_count[4 LE]
 	var tmp [4]byte
-	binary.LittleEndian.PutUint32(tmp[:], uint32(len(metas))) //nolint:gosec // safe: block count bounded by MaxBlocks (100_000)
+	binary.LittleEndian.PutUint32(
+		tmp[:],
+		uint32(len(metas)),
+	) //nolint:gosec // safe: block count bounded by MaxBlocks (100_000)
 	buf.Write(tmp[:])
 
 	for _, m := range metas {
@@ -60,8 +59,6 @@ func writeBlockIndexSection(_ io.Writer, version uint8, metas []shared.BlockMeta
 		// max_trace_id[16]
 		buf.Write(m.MaxTraceID[:])
 
-		// column_name_bloom[32]
-		buf.Write(m.ColumnNameBloom[:])
 	}
 
 	return buf.Bytes(), nil
@@ -86,14 +83,19 @@ func writeRangeIndexSection(_ io.Writer, rIdx rangeIndex) ([]byte, error) {
 
 	// col_count[4 LE]
 	var tmp [4]byte
-	binary.LittleEndian.PutUint32(tmp[:], uint32(len(colNames))) //nolint:gosec // safe: column count bounded by MaxColumns
+	binary.LittleEndian.PutUint32(
+		tmp[:],
+		uint32(len(colNames)),
+	) //nolint:gosec // safe: column count bounded by MaxColumns
 	buf.Write(tmp[:])
 
 	for _, colName := range colNames {
 		cd := rIdx[colName]
 
 		// col_name_len[2 LE] + col_name
-		buf.Write([]byte{byte(len(colName)), byte(len(colName) >> 8)}) //nolint:gosec // safe: col name len bounded by MaxNameLen (1024)
+		buf.Write(
+			[]byte{byte(len(colName)), byte(len(colName) >> 8)},
+		) //nolint:gosec // safe: col name len bounded by MaxNameLen (1024)
 		buf.WriteString(colName)
 
 		// col_type[1]
@@ -102,7 +104,10 @@ func writeRangeIndexSection(_ io.Writer, rIdx rangeIndex) ([]byte, error) {
 		writeRangeBucketMeta(&buf, cd)
 
 		// value_count[4 LE]
-		binary.LittleEndian.PutUint32(tmp[:], uint32(len(cd.values))) //nolint:gosec // safe: value count bounded by MaxDictionarySize
+		binary.LittleEndian.PutUint32(
+			tmp[:],
+			uint32(len(cd.values)),
+		) //nolint:gosec // safe: value count bounded by MaxDictionarySize
 		buf.Write(tmp[:])
 
 		// Sort value keys for deterministic output.
@@ -118,7 +123,10 @@ func writeRangeIndexSection(_ io.Writer, rIdx rangeIndex) ([]byte, error) {
 			writeRangeValueKey(&buf, cd.colType, key)
 
 			// block_id_count[4 LE]
-			binary.LittleEndian.PutUint32(tmp[:], uint32(len(blockIDs))) //nolint:gosec // safe: block ID count bounded by MaxBlocks
+			binary.LittleEndian.PutUint32(
+				tmp[:],
+				uint32(len(blockIDs)),
+			) //nolint:gosec // safe: block ID count bounded by MaxBlocks
 			buf.Write(tmp[:])
 
 			// block_ids[N × 4 LE]
@@ -138,42 +146,69 @@ func writeRangeBucketMeta(buf *bytes.Buffer, cd *rangeColumnData) {
 	var tmp4 [4]byte
 
 	// bucket_min[8 LE]
-	binary.LittleEndian.PutUint64(tmp8[:], uint64(cd.bucketMin)) //nolint:gosec // safe: storing int64 bits as uint64 for wire format
+	binary.LittleEndian.PutUint64(
+		tmp8[:],
+		uint64(cd.bucketMin),
+	) //nolint:gosec // safe: storing int64 bits as uint64 for wire format
 	buf.Write(tmp8[:])
 	// bucket_max[8 LE]
-	binary.LittleEndian.PutUint64(tmp8[:], uint64(cd.bucketMax)) //nolint:gosec // safe: storing int64 bits as uint64 for wire format
+	binary.LittleEndian.PutUint64(
+		tmp8[:],
+		uint64(cd.bucketMax),
+	) //nolint:gosec // safe: storing int64 bits as uint64 for wire format
 	buf.Write(tmp8[:])
 
 	// boundary_count[4 LE] + boundaries[N × 8 LE int64]
-	binary.LittleEndian.PutUint32(tmp4[:], uint32(len(cd.boundaries))) //nolint:gosec // safe: boundary count bounded by defaultRangeBuckets+1
+	binary.LittleEndian.PutUint32(
+		tmp4[:],
+		uint32(len(cd.boundaries)),
+	) //nolint:gosec // safe: boundary count bounded by defaultRangeBuckets+1
 	buf.Write(tmp4[:])
 	for _, b := range cd.boundaries {
-		binary.LittleEndian.PutUint64(tmp8[:], uint64(b)) //nolint:gosec // safe: storing int64 bits as uint64 for wire format
+		binary.LittleEndian.PutUint64(
+			tmp8[:],
+			uint64(b),
+		) //nolint:gosec // safe: storing int64 bits as uint64 for wire format
 		buf.Write(tmp8[:])
 	}
 
 	// typed_count[4 LE] + typed boundaries
 	switch cd.colType {
 	case shared.ColumnTypeRangeFloat64:
-		binary.LittleEndian.PutUint32(tmp4[:], uint32(len(cd.float64Bounds))) //nolint:gosec // safe: float64 boundary count bounded by defaultRangeBuckets+1
+		binary.LittleEndian.PutUint32(
+			tmp4[:],
+			uint32(len(cd.float64Bounds)),
+		) //nolint:gosec // safe: float64 boundary count bounded by defaultRangeBuckets+1
 		buf.Write(tmp4[:])
 		for _, f := range cd.float64Bounds {
 			binary.LittleEndian.PutUint64(tmp8[:], math.Float64bits(f))
 			buf.Write(tmp8[:])
 		}
 	case shared.ColumnTypeRangeString:
-		binary.LittleEndian.PutUint32(tmp4[:], uint32(len(cd.stringBounds))) //nolint:gosec // safe: string boundary count bounded by defaultRangeBuckets+1
+		binary.LittleEndian.PutUint32(
+			tmp4[:],
+			uint32(len(cd.stringBounds)),
+		) //nolint:gosec // safe: string boundary count bounded by defaultRangeBuckets+1
 		buf.Write(tmp4[:])
 		for _, s := range cd.stringBounds {
-			binary.LittleEndian.PutUint32(tmp4[:], uint32(len(s))) //nolint:gosec // safe: string boundary length bounded by MaxStringLen
+			binary.LittleEndian.PutUint32(
+				tmp4[:],
+				uint32(len(s)),
+			) //nolint:gosec // safe: string boundary length bounded by MaxStringLen
 			buf.Write(tmp4[:])
 			buf.WriteString(s)
 		}
 	case shared.ColumnTypeRangeBytes:
-		binary.LittleEndian.PutUint32(tmp4[:], uint32(len(cd.bytesBounds))) //nolint:gosec // safe: bytes boundary count bounded by defaultRangeBuckets+1
+		binary.LittleEndian.PutUint32(
+			tmp4[:],
+			uint32(len(cd.bytesBounds)),
+		) //nolint:gosec // safe: bytes boundary count bounded by defaultRangeBuckets+1
 		buf.Write(tmp4[:])
 		for _, b := range cd.bytesBounds {
-			binary.LittleEndian.PutUint32(tmp4[:], uint32(len(b))) //nolint:gosec // safe: bytes boundary length bounded by MaxBytesLen
+			binary.LittleEndian.PutUint32(
+				tmp4[:],
+				uint32(len(b)),
+			) //nolint:gosec // safe: bytes boundary length bounded by MaxBytesLen
 			buf.Write(tmp4[:])
 			buf.Write(b)
 		}
@@ -191,7 +226,10 @@ func writeRangeValueKey(buf *bytes.Buffer, colType shared.ColumnType, key string
 	case shared.ColumnTypeString, shared.ColumnTypeBytes,
 		shared.ColumnTypeRangeString, shared.ColumnTypeRangeBytes:
 		// len(4 LE) + key_bytes
-		binary.LittleEndian.PutUint32(tmp4[:], uint32(len(key))) //nolint:gosec // safe: key length bounded by MaxStringLen
+		binary.LittleEndian.PutUint32(
+			tmp4[:],
+			uint32(len(key)),
+		) //nolint:gosec // safe: key length bounded by MaxStringLen
 		buf.Write(tmp4[:])
 		buf.WriteString(key)
 	case shared.ColumnTypeInt64, shared.ColumnTypeUint64, shared.ColumnTypeFloat64:
@@ -208,9 +246,13 @@ func writeRangeValueKey(buf *bytes.Buffer, colType shared.ColumnType, key string
 	}
 }
 
-// writeTraceBlockIndexSection serializes the trace block index.
+// NOTE-37: trace index v2 — block IDs only, no span indices; reader scans in-block.
+// writeTraceBlockIndexSection serializes the trace block index (format version 2).
+// Format: fmt_version[1]=0x02 + trace_count[4 LE] +
+// per trace: trace_id[16] + block_ref_count[2 LE] + block_id[2 LE] × N.
+// Span indices are not stored; the reader scans the trace:id column in-block.
 // Returns the serialized bytes.
-func writeTraceBlockIndexSection(_ io.Writer, traceIndex map[[16]byte][]traceBlockRef) ([]byte, error) {
+func writeTraceBlockIndexSection(_ io.Writer, traceIndex map[[16]byte][]uint16) ([]byte, error) {
 	var buf bytes.Buffer
 
 	// Sort trace IDs for deterministic output.
@@ -222,46 +264,60 @@ func writeTraceBlockIndexSection(_ io.Writer, traceIndex map[[16]byte][]traceBlo
 		return bytes.Compare(traceIDs[i][:], traceIDs[j][:]) < 0
 	})
 
-	// fmt_version[1] = 0x01
-	buf.WriteByte(shared.TraceIndexFmtVersion)
+	// fmt_version[1] = 0x02
+	buf.WriteByte(shared.TraceIndexFmtVersion2)
 
 	// trace_count[4 LE]
 	var tmp4 [4]byte
-	binary.LittleEndian.PutUint32(tmp4[:], uint32(len(traceIDs))) //nolint:gosec // safe: trace count bounded by MaxTraceCount
+	binary.LittleEndian.PutUint32(
+		tmp4[:],
+		uint32(len(traceIDs)),
+	) //nolint:gosec // safe: trace count bounded by MaxTraceCount
 	buf.Write(tmp4[:])
 
 	var tmp2 [2]byte
 
 	for _, tid := range traceIDs {
-		refs := traceIndex[tid]
+		blockIDs := traceIndex[tid]
+
+		if len(blockIDs) > math.MaxUint16 {
+			return nil, fmt.Errorf("trace_index: trace %x has %d block refs, exceeds uint16 max", tid, len(blockIDs))
+		}
 
 		// trace_id[16]
 		buf.Write(tid[:])
 
 		// block_ref_count[2 LE]
-		binary.LittleEndian.PutUint16(tmp2[:], uint16(len(refs))) //nolint:gosec // safe: block ref count bounded by MaxBlocks (100_000) fits uint16
+		binary.LittleEndian.PutUint16(
+			tmp2[:],
+			uint16(len(blockIDs)),
+		) //nolint:gosec // safe: len(blockIDs) <= math.MaxUint16 checked above
 		buf.Write(tmp2[:])
 
-		for _, ref := range refs {
-			// block_id[2 LE]
-			binary.LittleEndian.PutUint16(tmp2[:], ref.blockID)
+		// block_id[2 LE] × N
+		for _, bid := range blockIDs {
+			binary.LittleEndian.PutUint16(tmp2[:], bid)
 			buf.Write(tmp2[:])
-			// span_count[2 LE]
-			binary.LittleEndian.PutUint16(tmp2[:], uint16(len(ref.spanIndices))) //nolint:gosec // safe: span count <= MaxBlockSpans (65535)
-			buf.Write(tmp2[:])
-			// span_indices[span_count × uint16 LE]
-			for _, idx := range ref.spanIndices {
-				binary.LittleEndian.PutUint16(tmp2[:], idx)
-				buf.Write(tmp2[:])
-			}
 		}
 	}
 
 	return buf.Bytes(), nil
 }
 
-// writeFileHeader writes the 21-byte file header.
-func writeFileHeader(w io.Writer, version uint8, metadataOffset, metadataLen uint64) error {
+// writeFileHeader writes the file header.
+// For version < 12: 21 bytes (magic[4] + version[1] + metadataOffset[8] + metadataLen[8]).
+// For version 12+:  22 bytes (same + signalType[1] at offset 21).
+func writeFileHeader(w io.Writer, version uint8, metadataOffset, metadataLen uint64, signalType uint8) error {
+	if version >= shared.VersionV12 {
+		var buf [22]byte
+		binary.LittleEndian.PutUint32(buf[0:], shared.MagicNumber)
+		buf[4] = version
+		binary.LittleEndian.PutUint64(buf[5:], metadataOffset)
+		binary.LittleEndian.PutUint64(buf[13:], metadataLen)
+		buf[21] = signalType
+		_, err := w.Write(buf[:])
+		return err
+	}
 	var buf [21]byte
 	binary.LittleEndian.PutUint32(buf[0:], shared.MagicNumber)
 	buf[4] = version
@@ -271,12 +327,15 @@ func writeFileHeader(w io.Writer, version uint8, metadataOffset, metadataLen uin
 	return err
 }
 
-// writeCompactTraceIndex writes the compact trace index section.
+// NOTE-36: bloom-enabled compact index (v2) — see SPECS.md §6
+// writeCompactTraceIndex writes the compact trace index section (version 2).
+// Format: magic[4] + version[1]=2 + block_count[4] + bloom_bytes[4] + bloom_data[N] +
+// block_table[block_count×12] + trace_index[...].
 // Returns bytes written.
 func writeCompactTraceIndex(
 	w io.Writer,
 	blockMetas []shared.BlockMeta,
-	traceIndex map[[16]byte][]traceBlockRef,
+	traceIndex map[[16]byte][]uint16,
 ) (int64, error) {
 	var buf bytes.Buffer
 
@@ -285,19 +344,40 @@ func writeCompactTraceIndex(
 	binary.LittleEndian.PutUint32(tmp4[:], shared.CompactIndexMagic)
 	buf.Write(tmp4[:])
 
-	// version[1] = 1
-	buf.WriteByte(shared.CompactIndexVersion)
+	// version[1] = 2 (bloom-enabled)
+	buf.WriteByte(shared.CompactIndexVersion2)
 
 	// block_count[4 LE]
-	binary.LittleEndian.PutUint32(tmp4[:], uint32(len(blockMetas))) //nolint:gosec // safe: block count bounded by MaxBlocks
+	binary.LittleEndian.PutUint32(
+		tmp4[:],
+		uint32(len(blockMetas)),
+	) //nolint:gosec // safe: block count bounded by MaxBlocks
 	buf.Write(tmp4[:])
+
+	// Build trace ID bloom filter from all trace IDs in the index.
+	bloomSize := shared.TraceIDBloomSize(len(traceIndex))
+	bloom := make([]byte, bloomSize)
+	for tid := range traceIndex {
+		shared.AddTraceIDToBloom(bloom, tid)
+	}
+
+	// bloom_bytes[4 LE] + bloom_data[bloom_bytes]
+	binary.LittleEndian.PutUint32(
+		tmp4[:],
+		uint32(bloomSize),
+	) //nolint:gosec // safe: bloom size bounded by TraceIDBloomMaxBytes (1MB) fits uint32
+	buf.Write(tmp4[:])
+	buf.Write(bloom)
 
 	// block_table: block_count × { file_offset[8 LE] + file_length[4 LE] }
 	for _, m := range blockMetas {
 		var tmp8 [8]byte
 		binary.LittleEndian.PutUint64(tmp8[:], m.Offset)
 		buf.Write(tmp8[:])
-		binary.LittleEndian.PutUint32(tmp4[:], uint32(m.Length)) //nolint:gosec // safe: block length bounded by MaxBlockSize (1GB) fits uint32
+		binary.LittleEndian.PutUint32(
+			tmp4[:],
+			uint32(m.Length),
+		) //nolint:gosec // safe: block length bounded by MaxBlockSize (1GB) fits uint32
 		buf.Write(tmp4[:])
 	}
 
@@ -319,6 +399,27 @@ func writeFooter(w io.Writer, headerOffset, compactOffset uint64, compactLen uin
 	binary.LittleEndian.PutUint64(buf[2:], headerOffset)
 	binary.LittleEndian.PutUint64(buf[10:], compactOffset)
 	binary.LittleEndian.PutUint32(buf[18:], compactLen)
+	_, err := w.Write(buf[:])
+	return err
+}
+
+// writeFooterV4 writes the 34-byte v4 footer.
+// v4 footer layout:
+//
+//	version[2 LE]              = 4
+//	header_offset[8 LE]
+//	compact_offset[8 LE]
+//	compact_len[4 LE]
+//	intrinsic_index_offset[8 LE]
+//	intrinsic_index_len[4 LE]
+func writeFooterV4(w io.Writer, headerOffset, compactOffset uint64, compactLen uint32, intrinsicIndexOffset uint64, intrinsicIndexLen uint32) error {
+	var buf [34]byte
+	binary.LittleEndian.PutUint16(buf[0:], shared.FooterV4Version)
+	binary.LittleEndian.PutUint64(buf[2:], headerOffset)
+	binary.LittleEndian.PutUint64(buf[10:], compactOffset)
+	binary.LittleEndian.PutUint32(buf[18:], compactLen)
+	binary.LittleEndian.PutUint64(buf[22:], intrinsicIndexOffset)
+	binary.LittleEndian.PutUint32(buf[30:], intrinsicIndexLen)
 	_, err := w.Write(buf[:])
 	return err
 }

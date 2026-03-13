@@ -69,7 +69,7 @@ byte positions within the file unless noted as relative to a block start.
 ║  │    offset[8] · length[8] · kind[1]  ← kind byte added in v11                  │ ║
 ║  │    span_count[4] · min_start[8] · max_start[8]                                 │ ║
 ║  │    min_trace_id[16] · max_trace_id[16]                                          │ ║
-║  │    column_name_bloom[32]  (256-bit bloom of column names in this block)         │ ║
+║  │    (column_name_bloom[32] removed in 2026-03-07 — see NOTE-BLOOM-REMOVAL)        │ ║
 ║  │                                                                                 │ ║
 ║  │  ── RANGE INDEX ───────────────────────────────────────────────    │ ║
 ║  │  range_count[4]                                                             │ ║
@@ -84,26 +84,74 @@ byte positions within the file unless noted as relative to a block start.
 ║  │  per block: col_count[4] = 0                                                    │ ║
 ║  │                                                                                 │ ║
 ║  │  ── TRACE BLOCK INDEX ────────────────────────────────────────────────────    │ ║
-║  │  fmt_version[1]=0x01 · trace_count[4]                                           │ ║
+║  │  fmt_version[1]=0x02 · trace_count[4]                                           │ ║
 ║  │  per trace (sorted by trace_id):                                                │ ║
-║  │    trace_id[16] · block_count[2]                                                │ ║
-║  │    per block: block_id[2] · span_count[2] · span_indices[span_count×2]         │ ║
+║  │    trace_id[16] · block_count[2] · block_id[2] × N                             │ ║
+║  │  (v1 legacy: block_id[2] · span_count[2] · span_indices[N×2] — readable)       │ ║
+║  │                                                                                 │ ║
+║  │  ── TS INDEX ────────────────────────────────────────────────────────────    │ ║
+║  │  magic[4]=0xC011FEED · version[1]=1 · count[4]                                  │ ║
+║  │  per block (sorted by min_ts ascending):                                        │ ║
+║  │    block_idx[4] · min_ts[8] · max_ts[8]                         (20 bytes ea)   │ ║
+║  │                                                                                 │ ║
+║  │  ── SKETCH INDEX (column-major; absent if no blocks) ────────────────────    │ ║
+║  │  magic[4]=0x534B5443 ("SKTC") · num_blocks[4] · num_columns[4]                 │ ║
+║  │  per column (sorted by name):                                                   │ ║
+║  │    col_name_len[2] · col_name[N]                                                │ ║
+║  │    presence[⌈num_blocks/8⌉ bytes]  (bitset: 1=column present in block)          │ ║
+║  │    distinct[num_blocks × 4]  (uint32 per block, 0 if absent — HLL cardinality)  │ ║
+║  │    topk_k[1]=20                                                                 │ ║
+║  │    per present block: entry_count[1] × { fp[8 LE] · count[2 LE] }              │ ║
+║  │    cms_depth[1]=4 · cms_width[2 LE]=64                                          │ ║
+║  │    per present block: cms_data[depth × width × 2]  (512 bytes)                  │ ║
+║  │    per present block: fuse_len[4 LE] · fuse_data[fuse_len]                      │ ║
 ║  └────────────────────────────────────────────────────────────────────────────────┘ ║
 ║                                                                                      ║
 ║  compact_offset  ◄── from footer  (absent if compact_len = 0)                       ║
 ║  ┌────────────────────────────────────────────────────────────────────────────────┐ ║
 ║  │ COMPACT TRACE INDEX                                                             │ ║
-║  │  magic[4]=0xC01DC1DE · version[1]=1 · block_count[4]                           │ ║
+║  │  magic[4]=0xC01DC1DE · version[1]=2 · block_count[4]                           │ ║
+║  │  bloom_bytes[4] · bloom_data[bloom_bytes]                                       │ ║
 ║  │  block_table: block_count × { file_offset[8] · file_length[4] }  (12 bytes ea) │ ║
-║  │  fmt_version[1]=0x01 · trace_count[4]                                           │ ║
-║  │  per trace: trace_id[16] · block_count[2]                                       │ ║
-║  │             per block: block_id[2] · span_count[2] · span_indices[N×2]         │ ║
+║  │  fmt_version[1]=0x02 · trace_count[4]                                           │ ║
+║  │  per trace: trace_id[16] · block_count[2] · block_id[2] × N                   │ ║
 ║  └────────────────────────────────────────────────────────────────────────────────┘ ║
 ║                                                                                      ║
-║  file_size - 22  (footer always 22 bytes)                                           ║
+║  file_size - 22  (footer v3, 22 bytes)                                              ║
 ║  ┌────────────────────────────────────────────────────────────────────────────────┐ ║
-║  │ FOOTER  (22 bytes)                                                              │ ║
+║  │ FOOTER V3  (22 bytes, legacy — readable but no longer written)                 │ ║
 ║  │  version[2]=3 · header_offset[8] · compact_offset[8] · compact_len[4]         │ ║
+║  └────────────────────────────────────────────────────────────────────────────────┘ ║
+╚══════════════════════════════════════════════════════════════════════════════════════╝
+```
+
+**V4 footer layout (new files, 2026-03-11 onward):**
+
+```
+╔══════════════════════════════════════════════════════════════════════════════════════╗
+║                   BLOCKPACK FILE FORMAT  (v11-v12 / footer v4)                      ║
+╠══════════════════════════════════════════════════════════════════════════════════════╣
+║  ... blocks, file header, metadata section, compact trace index (same as v3) ...    ║
+║                                                                                      ║
+║  intrinsic_index_offset  ◄── from footer v4  (0 if no intrinsic section)            ║
+║  ┌────────────────────────────────────────────────────────────────────────────────┐ ║
+║  │ INTRINSIC SECTION  (optional; absent when intrinsic_index_len = 0)            │ ║
+║  │                                                                                 │ ║
+║  │  per intrinsic column blob (one per column; flat or dict format):              │ ║
+║  │    snappy-compressed payload (see §13 for wire format)                         │ ║
+║  │                                                                                 │ ║
+║  │  ── TOC (Table of Contents) ───────────────────────────────────────────────── │ ║
+║  │  snappy-compressed msgpack array:                                              │ ║
+║  │    per entry: [name[str], type[uint8], format[uint8],                          │ ║
+║  │                offset[uint64], length[uint64], count[uint32],                  │ ║
+║  │                min[str], max[str]]                                              │ ║
+║  └────────────────────────────────────────────────────────────────────────────────┘ ║
+║                                                                                      ║
+║  file_size - 34  (footer v4, 34 bytes)                                              ║
+║  ┌────────────────────────────────────────────────────────────────────────────────┐ ║
+║  │ FOOTER V4  (34 bytes)                                                          │ ║
+║  │  version[2]=4 · header_offset[8] · compact_offset[8] · compact_len[4]         │ ║
+║  │  intrinsic_index_offset[8] · intrinsic_index_len[4]                           │ ║
 ║  └────────────────────────────────────────────────────────────────────────────────┘ ║
 ╚══════════════════════════════════════════════════════════════════════════════════════╝
 ```
@@ -118,16 +166,25 @@ CompactIndexMagic  = 0xC01DC1DE  // 4-byte compact trace index section magic
 
 VersionV10  uint8  = 10          // Block encoding version (current minimum)
 VersionV11  uint8  = 11          // Block encoding version (adds Kind byte to block index entry)
-VersionV12  uint8  = 12          // File version: metadata section is snappy-compressed
+VersionV12  uint8  = 12          // V12: snappy-compressed metadata section + extended header with signal_type byte at offset 21
+
+SignalTypeTrace uint8  = 0x01        // File header signal type: OTEL trace spans
+SignalTypeLog   uint8  = 0x02        // File header signal type: OTEL log records
 
 FooterV3Version uint16 = 3       // Current footer (22 bytes)
 
 ColumnEncodingVersion uint8 = 2  // Per-column encoding header version
 
-CompactIndexVersion uint8 = 1    // Compact trace index section version
+CompactIndexVersion  uint8 = 1   // Legacy compact trace index section version (no bloom)
+CompactIndexVersion2 uint8 = 2   // Compact trace index version with trace ID bloom filter
 
-ColumnNameBloomBits  = 256       // Bits in the column name bloom filter
-ColumnNameBloomBytes = 32        // Bytes in the column name bloom filter
+// ColumnNameBloomBits and ColumnNameBloomBytes removed 2026-03-07 (see NOTE-BLOOM-REMOVAL).
+
+// Trace ID bloom filter constants (used in compact index v2):
+TraceIDBloomK             = 7        // Kirsch-Mitzenmacher hash functions
+TraceIDBloomBitsPerTrace  = 10       // Bloom bits per trace ID (~0.8% FP rate with k=7)
+TraceIDBloomMinBytes      = 128      // Minimum bloom filter size (bytes)
+TraceIDBloomMaxBytes      = 1<<20    // Maximum bloom filter size (bytes, 1 MiB cap)
 ```
 
 ### 1.1 Limits
@@ -135,13 +192,13 @@ ColumnNameBloomBytes = 32        // Bytes in the column name bloom filter
 | Constant             | Value        | Description |
 |----------------------|-------------|-------------|
 | MaxSpans             | 1,000,000   | Maximum spans per block |
-| MaxBlocks            | 100,000     | Maximum blocks per file |
+| MaxBlocks            | 65,535      | Maximum blocks per file (uint16 block ID in trace index) |
 | MaxColumns           | 10,000      | Maximum columns per block |
 | MaxDictionarySize    | 1,000,000   | Maximum dictionary entries per column |
 | MaxStringLen         | 10,485,760  | Maximum string/bytes value length (10 MB) |
 | MaxBytesLen          | 10,485,760  | Maximum bytes value length (10 MB) |
 | MaxBlockSize         | 1,073,741,824 | Maximum uncompressed block size (1 GB) |
-| MaxMetadataSize      | 104,857,600 | Maximum metadata section size (100 MiB) |
+| MaxMetadataSize      | 268,435,456 | Maximum metadata section size (256 MiB) |
 | MaxTraceCount        | 1,000,000   | Maximum unique traces per block |
 | MaxNameLen           | 1,024        | Maximum column/field name length |
 | MaxCompactSectionSize| 52,428,800  | Maximum compact trace index size (50 MB) |
@@ -223,16 +280,29 @@ If `compact_len == 0` the Compact Trace Index section is absent and `compact_off
 
 ---
 
-## 4. File Header (21 bytes)
+## 4. File Header (v10–v11: 21 bytes; v12+: 22 bytes)
 
 Located at `header_offset` from the footer.
 
 | Field           | Type       | Bytes | Description |
 |-----------------|-----------|-------|-------------|
 | magic           | uint32 LE | 4     | Must equal 0xC011FEA1 |
-| version         | uint8     | 1     | File version: 10, 11, or 12 (12 = metadata section is snappy-compressed) |
+| version         | uint8     | 1     | File version: 10, 11, or 12 (12 = snappy-compressed metadata + extended header with signal_type) |
 | metadata_offset | uint64 LE | 8     | Absolute byte offset of the Metadata Section |
 | metadata_len    | uint64 LE | 8     | Byte length of the Metadata Section |
+
+### 4.1 File Header v12 Extension
+
+When `version == 12`, the file header is 22 bytes. An additional byte at offset 21 encodes
+the signal type:
+
+| Field       | Type  | Bytes | Offset | Description |
+|-------------|-------|-------|--------|-------------|
+| signal_type | uint8 | 1     | 21     | 0x01 = trace spans, 0x02 = log records |
+
+Readers that do not recognize version 12 MUST reject the file with a version error.
+Writers producing log files MUST write version 12 and signal_type = 0x02.
+Writers producing trace files with version 12 MUST write signal_type = 0x01.
 
 ---
 
@@ -254,7 +324,7 @@ identically to V10/V11 metadata.
 
 The `metadata_len` field in the file header stores the **compressed** byte length (the
 on-disk size). After decompression, readers MUST validate that the decoded length does not
-exceed `MaxMetadataSize` (100 MiB) to prevent decompression-bomb attacks.
+exceed `MaxMetadataSize` (256 MiB) to prevent decompression-bomb attacks.
 
 Block payloads, the compact trace index, and the footer are NOT compressed; they are
 unaffected by V12. Block index entries inside the metadata section use the V11 layout
@@ -264,7 +334,7 @@ unaffected by V12. Block index entries inside the metadata section use the V11 l
 
 **Writer:** always written (`writeBlockIndexSection` in `writer/metadata.go`).
 **Reader:** always parsed at open time (`parseBlockIndex` in `reader/parser.go`); stored as `r.blockMetas`.
-**Query use:** all fields are actively consumed — `Offset`/`Length` drive block I/O, `SpanCount` bounds row iteration, `MinStart`/`MaxStart` prune by time range, `MinTraceID`/`MaxTraceID` prune by trace ID, `ColumnNameBloom` prunes blocks missing a queried column, `Kind` is reserved for future block types.
+**Query use:** all fields are actively consumed — `Offset`/`Length` drive block I/O, `SpanCount` bounds row iteration, `MinStart`/`MaxStart` prune by time range, `MinTraceID`/`MaxTraceID` prune by trace ID, `Kind` is reserved for future block types. (`ColumnNameBloom` was removed 2026-03-07 — see NOTE-BLOOM-REMOVAL in NOTES.md.)
 
 ```
 block_count    uint32 LE       // Number of blocks
@@ -282,9 +352,7 @@ block_count    uint32 LE       // Number of blocks
 | max_start       | uint64 LE     | 8     | Maximum span start timestamp (nanoseconds) |
 | min_trace_id    | [16]byte      | 16    | Minimum trace ID (lexicographic) |
 | max_trace_id    | [16]byte      | 16    | Maximum trace ID (lexicographic) |
-| column_name_bloom | [32]byte    | 32    | 256-bit bloom filter of column names |
-
-**Total fixed: 100 bytes.**
+**Total fixed: 68 bytes.** (`column_name_bloom[32]` was removed 2026-03-07 — old total was 100 bytes.)
 
 #### Block Index Entry (v11 addition)
 
@@ -294,7 +362,7 @@ After `length` and before `span_count`, a single `kind` byte is inserted:
 |--------|------|-------|-------------|
 | kind   | uint8 | 1     | Block entry kind: 0 = leaf (only value in use) |
 
-**v11 layout:** offset(8) + length(8) + kind(1) + span_count(4) + min_start(8) + max_start(8) + min_trace_id(16) + max_trace_id(16) + column_name_bloom(32).
+**v11 layout:** offset(8) + length(8) + kind(1) + span_count(4) + min_start(8) + max_start(8) + min_trace_id(16) + max_trace_id(16). Total: 69 bytes per entry. (`column_name_bloom(32)` removed 2026-03-07.)
 
 ### 5.2 Range Index
 
@@ -427,12 +495,15 @@ value space approximately uniformly.
 
 **Writer:** always written (`writeTraceBlockIndexSection` in `writer/metadata.go`).
 **Reader:** always parsed at open time (`parseTraceBlockIndex` in `reader/parser.go`); stored as `r.traceIndex`. Also duplicated in the Compact Trace Index (§6) for readers that avoid parsing the full metadata.
-**Query use:** actively consumed — `BlocksForTraceID(traceID)` looks up `r.traceIndex` (or the compact index) to find which blocks contain a given trace and which row indices to fetch. Used by `FindTraceByID`.
+**Query use:** actively consumed — `BlocksForTraceID(traceID)` looks up `r.traceIndex` (or the compact index) to find which blocks contain a given trace. At fetch time (`GetTraceByID`), the already-loaded block is scanned in-memory for rows matching the trace ID. See NOTE-37.
 
 Immediately follows the column index stub.
 
+Two format versions are defined:
+
+#### Version 1 (legacy — with per-block span indices)
 ```
-format_version uint8         // Must equal 0x01
+format_version uint8         // 0x01
 trace_count    uint32 LE
 [trace_count × TraceEntry]   // Sorted by trace_id (lexicographic)
 ```
@@ -441,15 +512,34 @@ Each `TraceEntry`:
 ```
 trace_id       [16]byte      // 128-bit trace ID
 block_count    uint16 LE     // Number of blocks containing this trace
-[block_count × TraceBlockEntry]
+[block_count × TraceBlockEntryV1]
 ```
 
-Each `TraceBlockEntry`:
+Each `TraceBlockEntryV1`:
 ```
 block_id       uint16 LE     // Index into the block array
 span_count     uint16 LE     // Number of spans in this block belonging to this trace
-span_indices   [span_count × uint16 LE]  // Row indices within the block
+span_indices   [span_count × uint16 LE]  // Row indices within the block (discarded on read)
 ```
+
+#### Version 2 (current — block IDs only)
+```
+format_version uint8         // 0x02
+trace_count    uint32 LE
+[trace_count × TraceEntry]   // Sorted by trace_id (lexicographic)
+```
+
+Each `TraceEntry`:
+```
+trace_id       [16]byte      // 128-bit trace ID
+block_count    uint16 LE     // Number of blocks containing this trace
+block_ids      [block_count × uint16 LE]  // Block indices (no span indices stored)
+```
+
+Span indices are not stored. The reader scans the `trace:id` column in the already-loaded
+block to find matching rows. This is valid because blocks are always fetched in a single
+full I/O (SPEC-007), so the scan is pure CPU work with no additional I/O.
+Back-ref: `reader/parser.go:parseTraceBlockIndex`, `api.go:GetTraceByID`
 
 ---
 
@@ -458,6 +548,9 @@ span_indices   [span_count × uint16 LE]  // Row indices within the block
 Located at `compact_offset`, length `compact_len` (v3 footer only). Provides a
 self-contained trace lookup structure independent of the full metadata.
 
+Two versions are defined:
+
+### Version 1 (legacy, no bloom filter)
 ```
 magic          uint32 LE     // Must equal 0xC01DC1DE
 version        uint8         // Must equal 1
@@ -467,6 +560,25 @@ format_version uint8         // 0x01 (same as Trace Block Index §5.4)
 trace_count    uint32 LE
 [trace_count × TraceEntry]   // Same format as §5.4 TraceEntry
 ```
+
+### Version 2 (current, with trace ID bloom filter)
+```
+magic          uint32 LE     // Must equal 0xC01DC1DE
+version        uint8         // Must equal 2
+block_count    uint32 LE
+bloom_bytes    uint32 LE     // Byte length of the trace ID bloom filter
+bloom_data     [bloom_bytes] // Bloom filter bytes (see §11 for algorithm)
+block_table    [block_count × CompactBlockEntry]
+format_version uint8         // 0x02 (Trace Block Index §5.3 version 2 — block IDs only)
+trace_count    uint32 LE
+[trace_count × TraceEntry]   // Same format as §5.3 TraceEntry version 2
+```
+
+The bloom filter allows `BlocksForTraceIDCompact` to return nil for absent trace IDs
+without performing a hash map lookup; the trace-index map is still parsed and allocated
+as part of opening the compact index. Size is computed as `max(TraceIDBloomMinBytes,
+min(TraceIDBloomMaxBytes, traceCount × TraceIDBloomBitsPerTrace / 8))` bytes. Readers that
+encounter an unknown version must return an error.
 
 Each `CompactBlockEntry`:
 ```
@@ -780,15 +892,32 @@ Decode: accumulate deltas starting from 0. `index[i] = prev + delta[i]`. Result 
 
 ## 10. Bloom Filter
 
-The `column_name_bloom` field in every Block Index Entry is a 256-bit (32-byte) bloom
-filter. It encodes which column names appear in that block.
+### 10.1 Column Name Bloom Filter (Removed 2026-03-07)
 
-To test for membership: compute `FNV1a(name) % 256` and `MurmurHash3(name) % 256` and
-check that both corresponding bits are set.
+The `column_name_bloom` field was removed from every Block Index Entry. See
+NOTE-BLOOM-REMOVAL in NOTES.md. CMS (Count-Min Sketch) subsumes column presence:
+an absent column has CMS count 0, which the planner treats conservatively (block passes).
 
-The writer uses `SetBit(bloom[:], hash % 256)` for two independent hash functions per
-column name. Readers use `IsBitSet(bloom[:], hash % 256)` for both; a block is pruned
-if either bit is unset.
+### 10.2 Trace ID Bloom Filter (Compact Index §6 version 2)
+
+The `bloom_data` field in the Compact Trace Index (version 2) is a variable-length bloom
+filter encoding all trace IDs present in the file. It is used by `BlocksForTraceIDCompact`
+to eliminate files that definitely do not contain a queried trace ID without allocating or
+searching the trace index hash map.
+
+**Size:** `max(TraceIDBloomMinBytes=128, min(TraceIDBloomMaxBytes=1<<20, n×TraceIDBloomBitsPerTrace/8))`
+where `n` is the number of distinct trace IDs. With `TraceIDBloomBitsPerTrace=10` and
+`TraceIDBloomK=7` hash functions, the expected false-positive rate is ≈0.8%.
+
+**Hash algorithm:** Kirsch-Mitzenmacher double-hashing. Let `h1 = LittleEndian.Uint64(traceID[0:8])`
+and `h2 = LittleEndian.Uint64(traceID[8:16]) | 1` (force odd stride). For `i in [0, k)`:
+`pos = (h1 + i×h2) mod (m×8)`, then set/test `bloom[pos/8] bit (pos%8)`. Trace IDs are
+random 128-bit values and serve as their own entropy source — no additional hashing is needed.
+
+**Vacuous semantics:** A nil or zero-length bloom slice always returns `true` (safe fallback
+for version-1 compact indexes and old readers). No false negatives are possible.
+
+Back-ref: `internal/modules/blockio/shared/bloom.go:AddTraceIDToBloom`, `TestTraceIDBloom`
 
 ---
 
@@ -853,3 +982,229 @@ the canonical format. Readers MUST tolerate their presence and MUST NOT require 
 | Column Name   | Type   | Description |
 |---------------|--------|-------------|
 | `trace.index` | Uint64 | Maps span row → trace index within the block (old blockio writer only) |
+
+### 11.4 Log Signal Intrinsic Column Names
+
+When a blockpack file has signal_type = 0x02 (log), blocks contain the following
+intrinsic columns instead of the span intrinsics (§11.1):
+
+| Column Name                   | Type    | Source                          | Notes |
+|-------------------------------|---------|---------------------------------|-------|
+| `log:timestamp`               | Uint64  | LogRecord.TimeUnixNano          | Always present |
+| `log:observed_timestamp`      | Uint64  | LogRecord.ObservedTimeUnixNano  | Always present |
+| `log:body`                    | String  | LogRecord.Body (AnyValue→Str)   | Always present |
+| `log:severity_number`         | Int64   | LogRecord.SeverityNumber        | Null when zero |
+| `log:severity_text`           | String  | LogRecord.SeverityText          | Null when empty |
+| `log:trace_id`                | Bytes   | LogRecord.TraceId               | Null when absent |
+| `log:span_id`                 | Bytes   | LogRecord.SpanId                | Null when absent |
+| `log:flags`                   | Uint64  | LogRecord.Flags                 | Null when zero |
+
+User-defined attribute column names for log files use these prefixes:
+
+| Column Name Pattern | Source |
+|---------------------|--------|
+| `resource.{key}`    | ResourceLogs.Resource.Attributes[key] |
+| `scope.{key}`       | ScopeLogs.Scope.Attributes[key] |
+| `log.{key}`         | LogRecord.Attributes[key] |
+
+Sort key for log files: (resource.service.name ASC, MinHashSig ASC, log:timestamp ASC).
+Log files have no trace block index; the trace block index section is written with
+trace_count = 0 (valid per §5.3 format). MinStart/MaxStart in BlockMeta carry the
+min/max log:timestamp for block-level time range pruning.
+
+### 11.5 Auto-Parsed Log Body Columns
+
+When a log record body is a JSON object or a logfmt string, the writer automatically
+parses all top-level key-value pairs and stores them as additional sparse range string
+columns using the `log.{key}` naming convention.
+
+**Detection heuristic:** If the trimmed body starts with `{`, attempt JSON unmarshal.
+Otherwise, attempt logfmt decode.
+
+**Extraction rules:**
+- JSON: all top-level keys are extracted. String values stored as-is. Non-string values
+  (numbers, booleans, nested objects) are stored as `fmt.Sprint(value)`.
+- logfmt: all `key=value` pairs are extracted. Keys and values stored as-is. A plain
+  text body with no `=` pairs produces nil (not treated as structured logfmt).
+- Nested JSON objects are NOT recursed — only top-level fields are stored.
+
+**Failure semantics:** If the body cannot be parsed (or is empty), no extra columns are
+added and no error is reported. The `log:body` intrinsic column is always stored
+regardless (NOTE 37, NOTE-007).
+
+**No field cap:** All extracted fields become range string columns. There is no limit on
+the number of fields extracted per record.
+
+**Column type:** All auto-parsed body fields are stored as `ColumnTypeRangeString` to
+enable min/max block-level pruning.
+
+**Interaction with `log.{key}` attribute columns:** Both OTLP LogRecord.Attributes and
+auto-parsed body fields use the `log.{key}` prefix. Body-parsed fields are processed
+first in `addLogRecordFromProto` and are stored as `ColumnTypeRangeString` columns.
+OTLP LogRecord.Attributes are processed after and are stored as `ColumnTypeString`
+columns. Because the `ColumnKey` type includes the column type, a shared key name
+(e.g., `log.level`) results in TWO separate columns — one `ColumnTypeRangeString` (body)
+and one `ColumnTypeString` (attribute) — rather than a collision or skip. No deduplication
+occurs at ingest time. Block-level pruning operates on the `ColumnTypeRangeString`
+(body-parsed) column.
+
+Back-ref: `internal/modules/blockio/writer/writer_log_body.go:parseLogBody`,
+          `internal/modules/blockio/writer/writer_log.go:addLogRecordFromProto`
+
+## 12. Per-File Timestamp Index (TS Index)
+
+The TS index is an optional section appended to the decompressed metadata after the trace
+block index. It is written by all new files (2026-03-02 onward). Old files that lack this
+section are handled gracefully by the reader.
+
+### 12.1 Wire Format (little-endian)
+
+```
+magic[4]    = 0xC011FEED
+version[1]  = 1
+count[4]    = number of entries (one per block)
+per entry (20 bytes):
+  min_ts[8]   = BlockMeta.MinStart (Unix nanoseconds)
+  max_ts[8]   = BlockMeta.MaxStart (Unix nanoseconds)
+  block_id[4] = index into the block index array (0-based)
+```
+
+### 12.2 Ordering
+
+Entries are sorted by min_ts ascending. This enables O(log N) binary search for blocks
+overlapping a query time window.
+
+### 12.3 Overlap Semantics
+
+A block overlaps query window [queryMin, queryMax] when:
+  block.max_ts >= queryMin  AND  block.min_ts <= queryMax
+
+Blocks with min_ts == max_ts == 0 (unknown time; trace files) are always included.
+
+### 12.4 Backward Compatibility
+
+Old readers that do not know about this section will ignore trailing bytes in the metadata
+section (the metadata parser is pos-based and does not assert pos == len(data) at end).
+New readers that open old files receive (nil, 0, nil) from parseTSIndex and degrade
+gracefully to metadata-scan mode in BlocksInTimeRange.
+
+---
+
+## 13. Intrinsic Columns Section (Footer V4)
+
+The intrinsic columns section is a file-level columnar index for span intrinsic fields.
+It is written by all new files (2026-03-11 onward) and is absent in files with footer v3.
+
+### 13.1 Purpose
+
+The intrinsic columns section stores per-column arrays covering the entire file (all blocks).
+Unlike per-block columns (which are decoded during query execution), the intrinsic section is
+designed to be read independently for use-cases such as block-level pruning and pre-filtering
+without reading any block data.
+
+Covered intrinsic columns (written when non-empty):
+- `trace:id` — trace ID bytes (16 bytes each)
+- `span:id` — span ID bytes (8 bytes each)
+- `span:parent_id` — parent span ID bytes (8 bytes each)
+- `span:name` — span operation name (string)
+- `span:kind` — span kind (int64, OTLP enum values)
+- `span:start` — span start time (uint64, Unix nanoseconds)
+- `span:end` — span end time (uint64, Unix nanoseconds)
+- `span:duration` — span duration (uint64, nanoseconds)
+- `span:status` — span status code (int64, OTLP enum values)
+- `span:status_message` — span status message (string)
+- `resource.service.name` — service name (string)
+
+### 13.2 Safety Cap
+
+If the total number of rows across all blocks exceeds `MaxIntrinsicRows = 10,000,000`,
+an empty TOC (0 entries) is written. The reader treats an empty TOC identically to an
+absent intrinsic section (no pruning benefit). This cap prevents memory exhaustion for
+very large files.
+
+### 13.3 Flat Column Wire Format
+
+Used for uint64 (span:duration, span:start, span:end) and bytes (trace:id, span:id, span:parent_id) columns.
+
+```
+format_version[1] = 0x01
+column_type[1]    = shared.ColumnType (e.g. 0x04 for Uint64, 0x08 for Bytes)
+count[4]          = number of entries (uint32 LE)
+per entry (sorted ascending by value):
+  value[N]        = uint64 LE (8 bytes) for numeric, or length[4]+bytes for Bytes
+  block_idx[2]    = block index within file (uint16 LE)
+  row_idx[2]      = span row index within the block (uint16 LE)
+```
+
+Entries are sorted ascending by value. For uint64 columns this enables binary search
+range pruning. For bytes columns this enables exact-match lookup.
+
+### 13.4 Dict Column Wire Format
+
+Used for string (span:name, span:status_message, resource.service.name) and int64
+(span:kind, span:status) columns.
+
+```
+format_version[1] = 0x01
+column_type[1]    = shared.ColumnType (e.g. 0x01 for String, 0x02 for Int64)
+dict_count[4]     = number of unique values (uint32 LE)
+per unique value (sorted ascending by value):
+  value_len[4]    = byte length of value (uint32 LE)
+  value[N]        = raw bytes of value (string UTF-8 or int64 LE)
+  ref_count[4]    = number of spans with this value (uint32 LE)
+  per ref (ref_count entries):
+    block_idx[2]  = block index within file (uint16 LE)
+    row_idx[2]    = span row index within the block (uint16 LE)
+```
+
+Entries within each dict value are not sorted. The dict entries themselves are sorted
+ascending by value.
+
+### 13.5 Table of Contents (TOC) Wire Format
+
+The TOC is the last blob written in the intrinsic section. Its offset and length are
+stored in the v4 footer fields `intrinsic_index_offset` and `intrinsic_index_len`.
+
+The TOC is a snappy-compressed msgpack array. Each element is an 8-element msgpack array:
+
+```
+[0] name    (str)    — column name e.g. "span:duration"
+[1] type    (uint8)  — shared.ColumnType value
+[2] format  (uint8)  — 0x01 = flat, 0x02 = dict
+[3] offset  (uint64) — absolute byte offset of column blob in file
+[4] length  (uint64) — byte length of column blob (snappy-compressed)
+[5] count   (uint32) — number of rows (entries) in the column
+[6] min     (str)    — minimum value (binary-encoded, same as value wire format)
+[7] max     (str)    — maximum value (binary-encoded, same as value wire format)
+```
+
+Min/max for uint64: 8-byte little-endian. Min/max for bytes: raw bytes. Min/max for
+string: raw UTF-8. Min/max for int64: 8-byte little-endian.
+
+### 13.6 Footer V4 Layout
+
+```
+offset  size  field
+0       2     version = 4 (uint16 LE)
+2       8     header_offset (uint64 LE) — same as v3
+10      8     compact_offset (uint64 LE) — same as v3
+18      4     compact_len (uint32 LE) — same as v3
+22      8     intrinsic_index_offset (uint64 LE) — abs offset of TOC blob (0 if empty)
+30      4     intrinsic_index_len (uint32 LE) — byte length of TOC blob (0 if empty)
+34      —     (end of footer)
+```
+
+### 13.7 Reader Detection Strategy
+
+The reader tries v4 first:
+1. Seek to `fileSize - 34` and read 34 bytes.
+2. If `version == 4`: parse full v4 footer, including intrinsic fields.
+3. Else seek to `fileSize - 22` and read 22 bytes.
+4. If `version == 3`: parse v3 footer; set `intrinsicIndexLen = 0`.
+5. Else: return "unsupported footer version" error.
+
+### 13.8 Backward Compatibility
+
+Files with footer v3 have no intrinsic section. The reader sets `intrinsicIndexLen = 0`
+and all code that consumes the intrinsic section is skipped. This ensures full
+read-compatibility with pre-v4 files.
