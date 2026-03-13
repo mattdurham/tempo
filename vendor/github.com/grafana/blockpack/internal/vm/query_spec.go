@@ -92,7 +92,9 @@ func (qs *QuerySpec) Normalize() {
 	qs.Filter.AttributeRanges = normalizedRanges
 }
 
-// normalizeFieldName converts attribute paths to canonical form.
+// normalizeFieldName converts attribute paths to canonical colon form.
+// This is the single source of truth for intrinsic field normalization in the vm package.
+// Called by normalizeAttributePath (traceql_compiler.go) after scope+name assembly.
 func normalizeFieldName(path string) string {
 	if path == "" {
 		return ""
@@ -119,25 +121,52 @@ func normalizeFieldName(path string) string {
 		return spanStart
 	case fieldEnd, "end_time":
 		return spanEnd
+	// trace-level intrinsics
+	case "trace.id":
+		return "trace:id"
+	case "trace.state":
+		return "trace:state"
+	// resource/scope schema URL intrinsics
+	case "resource.schema_url":
+		return "resource:schema_url"
+	case "scope.schema_url":
+		return "scope:schema_url"
+	// log intrinsics
+	case "log.timestamp":
+		return "log:timestamp"
+	case "log.observed_timestamp":
+		return "log:observed_timestamp"
+	case "log.body":
+		return "log:body"
+	case "log.severity_number":
+		return "log:severity_number"
+	case "log.severity_text":
+		return "log:severity_text"
+	case "log.trace_id":
+		return "log:trace_id"
+	case "log.span_id":
+		return "log:span_id"
+	case "log.flags":
+		return "log:flags"
 	}
 
 	// Handle span.intrinsic (dot notation) - convert to span:intrinsic for known intrinsics
-	if fieldName, ok := strings.CutPrefix(path, "span."); ok {
-		switch fieldName {
+	if after, ok := strings.CutPrefix(path, "span."); ok {
+		switch after {
 		case "name", "kind", "status", "status_message", "start", "end", "duration",
 			"id", "parent_id", "trace_state", "dropped_attributes_count",
 			"dropped_events_count", "dropped_links_count":
-			return "span:" + fieldName
+			return "span:" + after
 		}
 		// It's an attribute, keep dot notation
 		return path
 	}
 
 	// Handle resource.intrinsic
-	if fieldName, ok := strings.CutPrefix(path, "resource."); ok {
-		switch fieldName {
+	if after, ok := strings.CutPrefix(path, "resource."); ok {
+		switch after {
 		case "schema_url", "dropped_attributes_count":
-			return "resource:" + fieldName
+			return "resource:" + after
 		}
 		// It's an attribute, keep dot notation
 		return path

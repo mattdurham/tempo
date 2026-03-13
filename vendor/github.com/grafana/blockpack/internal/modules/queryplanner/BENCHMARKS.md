@@ -19,6 +19,7 @@ cost independently of I/O by pre-building the `BlockIndexer` outside the timed l
 ## 1. Planning Benchmarks
 
 ### BENCH-QP-01: BenchmarkPlanNoPredicates
+*Status: not yet implemented*
 
 Measures the baseline cost of `Plan(nil)` — no bloom work, just `allBlocks`.
 
@@ -43,6 +44,7 @@ b.ReportMetric(float64(numBlocks), "blocks")
 ---
 
 ### BENCH-QP-02: BenchmarkPlanBloomOnly
+*Status: not yet implemented*
 
 Measures `Plan` cost when bloom pruning eliminates ~50% of blocks.
 
@@ -68,6 +70,7 @@ b.ReportMetric(float64(b.N)/elapsed.Seconds(), "plans/sec")
 ## 2. FetchBlocks Benchmarks
 
 ### BENCH-QP-03: BenchmarkFetchBlocks
+*Status: not yet implemented*
 
 Measures end-to-end I/O for `FetchBlocks` using an in-memory provider.
 
@@ -93,11 +96,11 @@ b.ReportMetric(float64(len(rawBlocks)), "blocks_fetched")
 ## 3. Removed Benchmarks
 
 The following benchmarks were removed when dedicated column index support was removed
-(see NOTES.md §7):
+(see NOTES.md §7). These IDs are retired and must not be reused.
 
-- **BENCH-QP-03 (old): BenchmarkPlanDedicatedIndex** — measured planning cost with
+- **BENCH-QP-R01 (was QP-03): BenchmarkPlanDedicatedIndex** — measured planning cost with
   dedicated index pruning for a single-value service-name predicate.
-- **BENCH-QP-04 (old): BenchmarkPlanORValues** — measured planning cost with a multi-value
-  OR predicate against a 100-block file.
-- **BENCH-QP-06 (old): BenchmarkPlanAndFetch** — measured combined Plan + FetchBlocks cost
-  with dedicated index pruning for a selective service-name predicate.
+- **BENCH-QP-R02 (was QP-04): BenchmarkPlanORValues** — measured planning cost with a
+  multi-value OR predicate against a 100-block file.
+- **BENCH-QP-R03 (was QP-06): BenchmarkPlanAndFetch** — measured combined Plan + FetchBlocks
+  cost with dedicated index pruning for a selective service-name predicate.

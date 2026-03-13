@@ -1,4 +1,8 @@
 // Package compaction merges and deduplicates multiple modules-format blockpack files.
+//
+// NOTE: Core invariant — spans are copied via Writer.AddRow (native columnar path),
+// not via OTLP object reconstruction. Deduplication is keyed on (trace:id, span:id).
+// Spans with missing or invalid IDs are silently dropped and counted in droppedSpans.
 package compaction
 
 import (
@@ -42,39 +46,41 @@ type writerState struct {
 
 // compactionState holds mutable state during a single CompactBlocks call.
 type compactionState struct {
-	current     *writerState
-	stagingDir  string
-	stagedFiles []string
-	seenSpans   map[[24]byte]struct{}
-	cfg         Config
-	maxSpans    int
-	outputSeq   int
+	current      *writerState
+	stagingDir   string
+	stagedFiles  []string
+	seenSpans    map[[24]byte]struct{}
+	cfg          Config
+	maxSpans     int
+	outputSeq    int
+	droppedSpans int64 // spans dropped due to missing trace:id or span:id
 }
 
 // CompactBlocks reads input blockpack providers, merges spans, deduplicates them,
 // and writes compacted output to outputStorage.
-// Returns relative paths of all output files written.
+// Returns relative paths of all output files written and the count of spans dropped
+// due to missing trace:id or span:id columns.
 func CompactBlocks(
 	ctx context.Context,
 	providers []modules_rw.ReaderProvider,
 	cfg Config,
 	outputStorage OutputStorage,
-) ([]string, error) {
+) ([]string, int64, error) {
 	if len(providers) == 0 {
-		return nil, nil
+		return nil, 0, nil
 	}
 
 	if err := ctx.Err(); err != nil {
-		return nil, fmt.Errorf("context canceled before compaction: %w", err)
+		return nil, 0, fmt.Errorf("context canceled before compaction: %w", err)
 	}
 
 	if outputStorage == nil {
-		return nil, fmt.Errorf("outputStorage cannot be nil")
+		return nil, 0, fmt.Errorf("outputStorage cannot be nil")
 	}
 
 	stagingDir, cleanup, err := prepareStagingDir(cfg.StagingDir)
 	if err != nil {
-		return nil, fmt.Errorf("prepare staging dir: %w", err)
+		return nil, 0, fmt.Errorf("prepare staging dir: %w", err)
 	}
 	defer cleanup()
 
@@ -93,24 +99,24 @@ func CompactBlocks(
 
 	for i, provider := range providers {
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, fmt.Errorf("context canceled: %w", ctxErr)
+			return nil, state.droppedSpans, fmt.Errorf("context canceled: %w", ctxErr)
 		}
 
 		if processErr := state.processProvider(provider); processErr != nil {
-			return nil, fmt.Errorf("process provider %d: %w", i, processErr)
+			return nil, state.droppedSpans, fmt.Errorf("process provider %d: %w", i, processErr)
 		}
 	}
 
 	if flushErr := state.flushCurrentWriter(); flushErr != nil {
-		return nil, fmt.Errorf("flush final writer: %w", flushErr)
+		return nil, state.droppedSpans, fmt.Errorf("flush final writer: %w", flushErr)
 	}
 
 	outputPaths, err := pushStagedFiles(state.stagedFiles, outputStorage)
 	if err != nil {
-		return nil, fmt.Errorf("push staged files: %w", err)
+		return nil, state.droppedSpans, fmt.Errorf("push staged files: %w", err)
 	}
 
-	return outputPaths, nil
+	return outputPaths, state.droppedSpans, nil
 }
 
 // processProvider feeds all spans from the given provider into the current writer.
@@ -128,17 +134,27 @@ func (s *compactionState) processProvider(provider modules_rw.ReaderProvider) (r
 		return fmt.Errorf("open reader: %w", err)
 	}
 
-	for blockIdx := range r.BlockCount() {
-		bwb, getErr := r.GetBlockWithBytes(blockIdx, nil, nil)
-		if getErr != nil {
-			return fmt.Errorf("get block %d: %w", blockIdx, getErr)
+	allBlocks := make([]int, r.BlockCount())
+	for i := range allBlocks {
+		allBlocks[i] = i
+	}
+	for _, group := range r.CoalescedGroups(allBlocks) {
+		rawMap, fetchErr := r.ReadGroup(group)
+		if fetchErr != nil {
+			return fmt.Errorf("read group: %w", fetchErr)
 		}
-		if bwb == nil {
-			continue
-		}
-
-		if processErr := s.processBlock(bwb.Block); processErr != nil {
-			return fmt.Errorf("process block %d: %w", blockIdx, processErr)
+		for _, blockIdx := range group.BlockIDs {
+			raw, ok := rawMap[blockIdx]
+			if !ok {
+				continue
+			}
+			bwb, parseErr := r.ParseBlockFromBytes(raw, nil, r.BlockMeta(blockIdx))
+			if parseErr != nil {
+				return fmt.Errorf("parse block %d: %w", blockIdx, parseErr)
+			}
+			if processErr := s.processBlock(bwb.Block); processErr != nil {
+				return fmt.Errorf("process block %d: %w", blockIdx, processErr)
+			}
 		}
 	}
 
@@ -193,7 +209,8 @@ func (s *compactionState) addSpanFromBlock(block *modules_reader.Block, rowIdx i
 
 	key, ok := dedupeKey(block, rowIdx)
 	if !ok {
-		return nil // skip rows without valid trace+span IDs
+		s.droppedSpans++
+		return nil // skip rows without valid trace:id or span:id
 	}
 	if _, seen := s.seenSpans[key]; seen {
 		return nil

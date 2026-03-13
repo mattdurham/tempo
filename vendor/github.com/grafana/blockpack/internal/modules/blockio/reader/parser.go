@@ -12,12 +12,6 @@ import (
 	"github.com/grafana/blockpack/internal/modules/rw"
 )
 
-// traceBlockRef describes span indices for one trace in one block.
-type traceBlockRef struct {
-	spanIndices []uint16
-	blockID     uint16
-}
-
 // rangeIndexMeta records the byte range within metadataBytes for a
 // range column index entry (lazy parsing).
 type rangeIndexMeta struct {
@@ -26,21 +20,70 @@ type rangeIndexMeta struct {
 	length int
 }
 
-// readFooter reads the last 22 bytes (v3 footer).
+// readFooter reads the footer from the end of the file.
+// Supports v3 (22 bytes) and v4 (34 bytes) footer formats.
+// v4 adds intrinsicIndexOffset[8] + intrinsicIndexLen[4] after the v3 fields.
+//
+// Detection strategy: try v4 first (read 34 bytes from fileSize-34). If the first 2 bytes
+// are version=4, parse v4. Otherwise fall back to v3 (read 22 bytes from fileSize-22).
+// This avoids reading extra data before the v3 footer into the version field.
 func (r *Reader) readFooter() error {
 	if r.fileSize < int64(shared.FooterV3Size) {
 		return fmt.Errorf("file too small for footer: %d bytes", r.fileSize)
 	}
 
-	buf := make([]byte, shared.FooterV3Size)
-	off := r.fileSize - int64(shared.FooterV3Size)
-	n, err := r.provider.ReadAt(buf, off, rw.DataTypeFooter)
-	if err != nil {
-		return fmt.Errorf("readFooter: %w", err)
+	cacheKey := r.fileID + "/footer"
+
+	// Try v4 first: only possible if file is large enough.
+	if r.fileSize >= int64(shared.FooterV4Size) {
+		off := r.fileSize - int64(shared.FooterV4Size)
+		buf, err := r.cache.GetOrFetch(cacheKey+"/v4", func() ([]byte, error) {
+			b := make([]byte, shared.FooterV4Size)
+			n, readErr := r.provider.ReadAt(b, off, rw.DataTypeFooter)
+			if readErr != nil {
+				return nil, fmt.Errorf("readFooter: %w", readErr)
+			}
+			if n != int(shared.FooterV4Size) {
+				return nil, fmt.Errorf("readFooter: short read: %d bytes", n)
+			}
+			return b, nil
+		})
+		if err != nil {
+			return fmt.Errorf("readFooter: %w", err)
+		}
+
+		if binary.LittleEndian.Uint16(buf[0:]) == shared.FooterV4Version {
+			r.footerVersion = shared.FooterV4Version
+			r.footerFields.headerOffset = binary.LittleEndian.Uint64(buf[2:])
+			r.footerFields.compactOffset = binary.LittleEndian.Uint64(buf[10:])
+			r.footerFields.compactLen = binary.LittleEndian.Uint32(buf[18:])
+			r.intrinsicIndexOffset = binary.LittleEndian.Uint64(buf[22:])
+			r.intrinsicIndexLen = binary.LittleEndian.Uint32(buf[30:])
+			if r.footerFields.headerOffset == 0 {
+				return fmt.Errorf("readFooter: header_offset is zero")
+			}
+			r.headerOffset = r.footerFields.headerOffset
+			r.compactOffset = r.footerFields.compactOffset
+			r.compactLen = r.footerFields.compactLen
+			return nil
+		}
 	}
 
-	if n != int(shared.FooterV3Size) {
-		return fmt.Errorf("readFooter: short read: %d bytes", n)
+	// Fall back to v3.
+	off := r.fileSize - int64(shared.FooterV3Size)
+	buf, err := r.cache.GetOrFetch(cacheKey, func() ([]byte, error) {
+		b := make([]byte, shared.FooterV3Size)
+		n, readErr := r.provider.ReadAt(b, off, rw.DataTypeFooter)
+		if readErr != nil {
+			return nil, fmt.Errorf("readFooter: %w", readErr)
+		}
+		if n != int(shared.FooterV3Size) {
+			return nil, fmt.Errorf("readFooter: short read: %d bytes", n)
+		}
+		return b, nil
+	})
+	if err != nil {
+		return fmt.Errorf("readFooter: %w", err)
 	}
 
 	ver := binary.LittleEndian.Uint16(buf[0:])
@@ -63,17 +106,36 @@ func (r *Reader) readFooter() error {
 	return nil
 }
 
-// readHeader reads the 21-byte file header at footer.headerOffset.
+// readHeader reads the file header at footer.headerOffset.
+// For version < 12: 21 bytes (magic[4] + version[1] + metadataOffset[8] + metadataLen[8]).
+// For version 12+:  22 bytes (same + signalType[1] at offset 21).
+//
+// We always read 22 bytes from the provider. For V10/V11 files this reads 1 extra byte
+// past the 21-byte header, which is safe because the header is immediately followed by
+// other file sections (metadata, compact index, footer), so the extra byte comes from
+// subsequent data. This means V12 signal_type (at offset 21) is always present in the
+// fixed-size 22-byte buffer.
 func (r *Reader) readHeader() error {
-	const headerSize = 21
-	buf := make([]byte, headerSize)
-	n, err := r.provider.ReadAt(buf, int64(r.headerOffset), rw.DataTypeHeader) //nolint:gosec // safe: headerOffset is a file offset, fits in int64
+	const headerSize = 22
+	cacheKey := r.fileID + "/header"
+
+	buf, err := r.cache.GetOrFetch(cacheKey, func() ([]byte, error) {
+		b := make([]byte, headerSize)
+		n, readErr := r.provider.ReadAt(
+			b,
+			int64(r.headerOffset),
+			rw.DataTypeHeader,
+		) //nolint:gosec // safe: headerOffset is a file offset, fits in int64
+		if readErr != nil {
+			return nil, fmt.Errorf("readHeader: %w", readErr)
+		}
+		if n != headerSize {
+			return nil, fmt.Errorf("readHeader: short read: %d bytes", n)
+		}
+		return b, nil
+	})
 	if err != nil {
 		return fmt.Errorf("readHeader: %w", err)
-	}
-
-	if n != headerSize {
-		return fmt.Errorf("readHeader: short read: %d bytes", n)
 	}
 
 	magic := binary.LittleEndian.Uint32(buf[0:])
@@ -81,7 +143,7 @@ func (r *Reader) readHeader() error {
 		return fmt.Errorf("readHeader: bad magic 0x%08X", magic)
 	}
 
-	version := buf[4] //nolint:gosec // safe: buf is headerSize (21) bytes, validated by short-read check above
+	version := buf[4] //nolint:gosec // safe: buf is headerSize (22) bytes, validated by short-read check above
 	if version != shared.VersionV10 && version != shared.VersionV11 && version != shared.VersionV12 {
 		return fmt.Errorf("readHeader: unsupported version %d", version)
 	}
@@ -89,6 +151,13 @@ func (r *Reader) readHeader() error {
 	r.fileVersion = version
 	r.metadataOffset = binary.LittleEndian.Uint64(buf[5:])
 	r.metadataLen = binary.LittleEndian.Uint64(buf[13:])
+
+	// V12+ file header has an extra signal_type byte at offset 21.
+	// Extracted from the cached buffer — no second provider read needed.
+	if r.fileVersion >= shared.VersionV12 {
+		r.signalType = buf[21]
+	}
+
 	return nil
 }
 
@@ -105,7 +174,11 @@ func (r *Reader) parseV5MetadataLazy() error {
 		return fmt.Errorf("parseMetadata: metadata too large: %d bytes", r.metadataLen)
 	}
 
-	data, err := r.readRange(r.metadataOffset, r.metadataLen, rw.DataTypeMetadata)
+	cacheKey := r.fileID + "/metadata"
+
+	data, err := r.cache.GetOrFetch(cacheKey, func() ([]byte, error) {
+		return r.readRange(r.metadataOffset, r.metadataLen, rw.DataTypeMetadata)
+	})
 	if err != nil {
 		return fmt.Errorf("parseMetadata: %w", err)
 	}
@@ -183,12 +256,37 @@ func (r *Reader) parseV5MetadataLazy() error {
 	pos += newPos
 
 	// Trace block index.
-	traceIdx, _, err := parseTraceBlockIndex(data[pos:])
+	traceIdx, consumed, err := parseTraceBlockIndex(data[pos:])
 	if err != nil {
 		return fmt.Errorf("parseMetadata: trace_index: %w", err)
 	}
 
 	r.traceIndex = traceIdx
+	pos += consumed
+
+	// TS index section — optional, present in files written after 2026-03-02.
+	// parseTSIndex returns (nil, 0, nil) for old files, enabling graceful degradation.
+	if pos < len(data) {
+		tsEntries, tsConsumed, tsErr := parseTSIndex(data[pos:])
+		if tsErr != nil {
+			return fmt.Errorf("parseMetadata: ts_index: %w", tsErr)
+		}
+		r.tsEntries = tsEntries
+		pos += tsConsumed
+	}
+
+	// Sketch index section — optional, present in files written after 2026-03-07.
+	// parseSketchIndexSection returns (nil, 0, nil) for old files (graceful degradation).
+	if pos < len(data) {
+		sketches, skConsumed, skErr := parseSketchIndexSection(data[pos:])
+		if skErr != nil {
+			return fmt.Errorf("parseMetadata: sketch_index: %w", skErr)
+		}
+		r.sketchIdx = sketches
+		pos += skConsumed
+	}
+
+	_ = pos
 	return nil
 }
 
@@ -242,14 +340,6 @@ func parseBlockIndexEntry(
 	pos += 16
 	copy(meta.MaxTraceID[:], data[pos:pos+16])
 	pos += 16
-
-	// column_name_bloom[32]
-	if pos+32 > len(data) {
-		return meta, pos, fmt.Errorf("block_index entry: short for bloom")
-	}
-
-	copy(meta.ColumnNameBloom[:], data[pos:pos+32])
-	pos += 32
 
 	return meta, pos, nil
 }
@@ -305,21 +395,23 @@ func skipColumnIndex(data []byte, blockCount int) (int, error) {
 }
 
 // parseTraceBlockIndex parses the trace block index section.
+// Supports fmt_version 0x01 (v1: with per-block span indices, discarded on read)
+// and fmt_version 0x02 (v2: block IDs only).
 // Returns the parsed map and bytes consumed.
-func parseTraceBlockIndex(data []byte) (map[[16]byte][]traceBlockRef, int, error) {
+func parseTraceBlockIndex(data []byte) (map[[16]byte][]uint16, int, error) {
 	if len(data) < 5 {
 		return nil, 0, nil
 	}
 
 	fmtVersion := data[0]
-	if fmtVersion != shared.TraceIndexFmtVersion {
+	if fmtVersion != shared.TraceIndexFmtVersion && fmtVersion != shared.TraceIndexFmtVersion2 {
 		return nil, 0, fmt.Errorf("trace_index: unsupported fmt_version %d", fmtVersion)
 	}
 
 	traceCount := int(binary.LittleEndian.Uint32(data[1:]))
 	pos := 5
 
-	result := make(map[[16]byte][]traceBlockRef, traceCount)
+	result := make(map[[16]byte][]uint16, traceCount)
 
 	for t := range traceCount {
 		if pos+18 > len(data) {
@@ -330,40 +422,42 @@ func parseTraceBlockIndex(data []byte) (map[[16]byte][]traceBlockRef, int, error
 		copy(tid[:], data[pos:pos+16])
 		pos += 16
 
-		blockCount := int(binary.LittleEndian.Uint16(data[pos:]))
+		blockRefCount := int(binary.LittleEndian.Uint16(data[pos:]))
 		pos += 2
 
-		refs := make([]traceBlockRef, 0, blockCount)
-		for b := range blockCount {
-			if pos+4 > len(data) {
-				return nil, pos, fmt.Errorf("trace_index: trace[%d] block[%d]: short for block_id+span_count", t, b)
+		blockIDs := make([]uint16, 0, blockRefCount)
+
+		if fmtVersion == shared.TraceIndexFmtVersion {
+			// v1: block_id[2] + span_count[2] + span_indices[N×2] — discard span indices.
+			for b := range blockRefCount {
+				if pos+4 > len(data) {
+					return nil, pos, fmt.Errorf("trace_index: trace[%d] block[%d]: short for block_id+span_count", t, b)
+				}
+				blockID := binary.LittleEndian.Uint16(data[pos:])
+				pos += 2
+				spanCount := int(binary.LittleEndian.Uint16(data[pos:]))
+				pos += 2
+				if pos+spanCount*2 > len(data) {
+					return nil, pos, fmt.Errorf(
+						"trace_index: trace[%d] block[%d]: short for span_indices (%d × 2 bytes)",
+						t, b, spanCount,
+					)
+				}
+				pos += spanCount * 2
+				blockIDs = append(blockIDs, blockID)
 			}
-
-			blockID := binary.LittleEndian.Uint16(data[pos:])
-			pos += 2
-			spanCount := int(binary.LittleEndian.Uint16(data[pos:]))
-			pos += 2
-
-			if pos+spanCount*2 > len(data) {
-				return nil, pos, fmt.Errorf(
-					"trace_index: trace[%d] block[%d]: short for span_indices (%d × 2 bytes)",
-					t, b, spanCount,
-				)
+		} else {
+			// v2: block_id[2] only.
+			for b := range blockRefCount {
+				if pos+2 > len(data) {
+					return nil, pos, fmt.Errorf("trace_index: trace[%d] block[%d]: short for block_id", t, b)
+				}
+				blockIDs = append(blockIDs, binary.LittleEndian.Uint16(data[pos:]))
+				pos += 2
 			}
-
-			indices := make([]uint16, spanCount)
-			for s := range spanCount {
-				indices[s] = binary.LittleEndian.Uint16(data[pos+s*2:])
-			}
-
-			pos += spanCount * 2
-			refs = append(refs, traceBlockRef{
-				blockID:     blockID,
-				spanIndices: indices,
-			})
 		}
 
-		result[tid] = refs
+		result[tid] = blockIDs
 	}
 
 	return result, pos, nil
@@ -426,12 +520,11 @@ func scanRangeIndexOffsets(data []byte, dedCount int) (map[string]rangeIndexMeta
 		typedCount := int(binary.LittleEndian.Uint32(data[pos:]))
 		pos += 4
 
-		typedBytes, newPos, err := skipTypedBoundaries(data, pos, colType, typedCount)
+		newPos, err := skipTypedBoundaries(data, pos, colType, typedCount)
 		if err != nil {
 			return nil, pos, fmt.Errorf("range[%d] %q: typed boundaries: %w", i, name, err)
 		}
 
-		_ = typedBytes
 		pos = newPos
 
 		// value_count[4]
@@ -463,58 +556,58 @@ func scanRangeIndexOffsets(data []byte, dedCount int) (map[string]rangeIndexMeta
 }
 
 // skipTypedBoundaries skips typed boundary data based on column type.
-func skipTypedBoundaries(data []byte, pos int, colType shared.ColumnType, count int) (int, int, error) {
+func skipTypedBoundaries(data []byte, pos int, colType shared.ColumnType, count int) (int, error) {
 	switch colType {
 	case shared.ColumnTypeRangeFloat64:
 		// count × float64_bits(8)
 		need := count * 8
 		if pos+need > len(data) {
-			return 0, pos, fmt.Errorf("typed boundaries(float64): need %d bytes at pos %d", need, pos)
+			return pos, fmt.Errorf("typed boundaries(float64): need %d bytes at pos %d", need, pos)
 		}
 
-		return 0, pos + need, nil
+		return pos + need, nil
 
 	case shared.ColumnTypeRangeString:
 		for i := range count {
 			if pos+4 > len(data) {
-				return 0, pos, fmt.Errorf("typed boundaries(string)[%d]: short for len", i)
+				return pos, fmt.Errorf("typed boundaries(string)[%d]: short for len", i)
 			}
 
 			sLen := int(binary.LittleEndian.Uint32(data[pos:]))
 			pos += 4
 			if pos+sLen > len(data) {
-				return 0, pos, fmt.Errorf("typed boundaries(string)[%d]: short for data", i)
+				return pos, fmt.Errorf("typed boundaries(string)[%d]: short for data", i)
 			}
 
 			pos += sLen
 		}
 
-		return 0, pos, nil
+		return pos, nil
 
 	case shared.ColumnTypeRangeBytes:
 		for i := range count {
 			if pos+4 > len(data) {
-				return 0, pos, fmt.Errorf("typed boundaries(bytes)[%d]: short for len", i)
+				return pos, fmt.Errorf("typed boundaries(bytes)[%d]: short for len", i)
 			}
 
 			bLen := int(binary.LittleEndian.Uint32(data[pos:]))
 			pos += 4
 			if pos+bLen > len(data) {
-				return 0, pos, fmt.Errorf("typed boundaries(bytes)[%d]: short for data", i)
+				return pos, fmt.Errorf("typed boundaries(bytes)[%d]: short for data", i)
 			}
 
 			pos += bLen
 		}
 
-		return 0, pos, nil
+		return pos, nil
 
 	default:
 		// RangeInt64/RangeUint64/RangeDuration: typed_count must be 0.
 		if count != 0 {
-			return 0, pos, fmt.Errorf("typed boundaries: non-zero count %d for type %d", count, colType)
+			return pos, fmt.Errorf("typed boundaries: non-zero count %d for type %d", count, colType)
 		}
 
-		return 0, pos, nil
+		return pos, nil
 	}
 }
 
@@ -562,7 +655,10 @@ func skipRangeValueEntry(data []byte, pos int, colType shared.ColumnType) (int, 
 
 		pos++
 
-	case shared.ColumnTypeRangeInt64, shared.ColumnTypeRangeUint64, shared.ColumnTypeRangeDuration, shared.ColumnTypeRangeFloat64:
+	case shared.ColumnTypeRangeInt64,
+		shared.ColumnTypeRangeUint64,
+		shared.ColumnTypeRangeDuration,
+		shared.ColumnTypeRangeFloat64:
 		// length_prefix(1 uint8) + key_data where length_prefix is 2 (bucket ID) or 8 (raw value)
 		if pos+1 > len(data) {
 			return pos, fmt.Errorf("value_key(range numeric): short for length_prefix")

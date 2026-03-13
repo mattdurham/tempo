@@ -285,18 +285,11 @@ round-trip correctly.
 
 ---
 
-### META-03: Column name bloom filter
+### META-03: *(Removed)* Column-name bloom filter — 2026-03-07
 
-**Scenario:** Bloom filter correctly reports column presence.
-
-**Setup:**
-- Write spans with columns `"a.b.c"` and `"x.y.z"`.
-- Flush and read back.
-
-**Assertions:**
-- `blockMeta.ColumnNameBloom` tests as present for `"a.b.c"` and `"x.y.z"`.
-- Bloom tests as absent for a column name not added (with very high probability).
-- No false negatives: columns actually present must always pass the bloom test.
+`TestBlockMeta_ColumnNameBloom` has been removed. `ColumnNameBloom` no longer exists in
+`BlockMeta`. The CMS equivalent is covered by sketch index tests (see queryplanner TESTS.md
+§QP-T-17/QP-T-18).
 
 ---
 
@@ -344,6 +337,24 @@ round-trip correctly.
 
 ---
 
+### META-07: BlocksForRangeInterval — string interval lookup
+
+**Scenario:** `BlocksForRangeInterval` returns blocks from all buckets whose lower boundary
+falls within [min, max]. NOTE-011: interval matching for case-insensitive regex prefix lookups.
+
+**Setup:**
+- Write 3 blocks with distinct `service.name` values: `"alpha-svc"`, `"beta-svc"`, `"gamma-svc"`.
+- 5 spans per block (to force block boundaries).
+
+**Assertions:**
+- Interval `["alpha", "beta\xff"]` returns blocks for alpha-svc and beta-svc, not gamma-svc.
+- Interval `["a", "z"]` returns at least as many blocks as the narrower interval.
+- Interval `["000", "111"]` (below all boundaries) returns empty.
+
+Back-ref: `internal/modules/blockio/reader/reader_test.go:TestBlocksForRangeInterval_StringColumn`
+
+---
+
 ## 4. Trace Block Index Tests
 
 ### TBI-01: Single trace across one block
@@ -356,7 +367,7 @@ round-trip correctly.
 
 **Assertions:**
 - `reader.BlocksForTraceID(traceID)` returns `[0]`.
-- The `TraceBlockEntry` for block 0 has `SpanIndices` containing the row indices of all 3 spans.
+- `reader.TraceEntries(traceID)` returns one entry with `BlockID == 0`.
 
 ---
 
@@ -371,8 +382,7 @@ round-trip correctly.
 
 **Assertions:**
 - `reader.BlocksForTraceID(traceID)` returns `[0, 1]`.
-- Both blocks have `TraceBlockEntry` entries for the trace.
-- Total `SpanIndices` across both blocks == 6 unique row indices.
+- `reader.TraceEntries(traceID)` returns two entries, one per block.
 
 ---
 
@@ -385,10 +395,57 @@ round-trip correctly.
 - Flush.
 
 **Assertions:**
-- `reader.BlocksForTraceID(traceID1)` returns `[0]` with 2 span indices.
-- `reader.BlocksForTraceID(traceID2)` returns `[0]` with 2 span indices.
-- `reader.BlocksForTraceID(traceID3)` returns `[0]` with 2 span indices.
+- `reader.BlocksForTraceID(traceID1)` returns `[0]`.
+- `reader.BlocksForTraceID(traceID2)` returns `[0]`.
+- `reader.BlocksForTraceID(traceID3)` returns `[0]`.
 - Unknown trace ID returns empty slice.
+
+---
+
+### TBI-04: v2 format round-trip via GetTraceByID
+
+**Scenario:** Writing a file (v2 trace index) and calling `GetTraceByID` returns all spans.
+
+**Setup:**
+- Write N spans sharing one trace ID across one or more blocks.
+- Flush.
+- Open reader and call `GetTraceByID`.
+
+**Assertions:**
+- All N spans are returned (verified by span ID set equality).
+- No spans from other traces are returned.
+- The in-block scan correctly skips rows where `trace:id` does not match.
+
+---
+
+### TBI-05: v1 backward compatibility — old file readable with new reader
+
+**Scenario:** A file written by a v1 writer (with span indices in trace block index) is
+opened by the current reader and `GetTraceByID` returns correct spans.
+
+**Setup:**
+- Construct a v1-format trace block index byte slice manually (fmt_version=0x01,
+  with span_count and span_indices per block ref).
+- Parse it with `parseTraceBlockIndex`.
+
+**Assertions:**
+- `parseTraceBlockIndex` succeeds.
+- The returned map contains the correct block IDs (span indices are discarded).
+- `BlocksForTraceID` returns the correct block indices.
+
+---
+
+### TBI-06: GetTraceByID with absent trace:id column is skipped gracefully
+
+**Scenario:** A block that lacks the `trace:id` column does not panic or error.
+
+**Setup:**
+- Construct or mock a `BlockWithBytes` whose decoded `Block` has no `trace:id` column.
+- Call the `GetTraceByID` path (or a unit covering the nil-column branch).
+
+**Assertions:**
+- No panic; no error returned.
+- The block is skipped (zero spans emitted for that block).
 
 ---
 
@@ -404,7 +461,10 @@ round-trip correctly.
 **Assertions:**
 - Footer `compact_len > 0`.
 - `parseCompactTraceIndex` returns valid block table and trace entries.
-- Magic == 0xC01DC1DE, version == 1.
+- Magic == 0xC01DC1DE, version == 2 (current writer always emits version 2 with bloom).
+- `bloom_bytes > 0` and `bloom_data` is non-nil.
+
+Note: Version 1 (no bloom) is the legacy format; new files always use version 2.
 
 ---
 
@@ -416,9 +476,89 @@ round-trip correctly.
 - Write 10 spans from 5 traces and Flush.
 
 **Assertions:**
-- For every trace ID, `BlocksForTraceID` returns the same blocks whether using the
+- For every trace ID, `BlocksForTraceID` returns the same block IDs whether using the
   compact index or the main metadata trace block index.
-- Span indices match.
+- `TraceEntries` via full reader and lean reader return the same set of block IDs per trace.
+
+---
+
+### TIDBLOOM-01: Present trace IDs always pass bloom check
+
+**Scenario:** All trace IDs written to a file must be found via `BlocksForTraceID` after
+opening with `NewLeanReaderFromProvider` (which uses the compact index with bloom).
+
+**Setup:**
+- Write 50 spans with distinct trace IDs and Flush.
+- Open with `NewLeanReaderFromProvider`.
+
+**Assertions:**
+- `BlocksForTraceID(tid)` returns a non-nil, non-empty slice for every inserted trace ID.
+- No false negatives: inserted traces must never be pruned by the bloom filter.
+
+Back-ref: `reader/reader_test.go:TestTraceIDBloom_PresentTraces`
+
+---
+
+### TIDBLOOM-02: Absent trace ID returns nil
+
+**Scenario:** A trace ID never written to the file returns nil from `BlocksForTraceID`.
+
+**Setup:**
+- Write 100 spans with trace IDs having `tid[1] = 0xAA`. Flush.
+- Open with `NewLeanReaderFromProvider`.
+
+**Assertions:**
+- The all-0xFF trace ID (`[16]byte{0xFF,...,0xFF}`) is guaranteed absent and must return nil.
+
+Back-ref: `reader/reader_test.go:TestTraceIDBloom_AbsentTrace`
+
+---
+
+### TIDBLOOM-03: LeanReader uses bloom-enabled compact index (v2)
+
+**Scenario:** `NewLeanReaderFromProvider` correctly handles version-2 compact indexes.
+
+**Setup:**
+- Write one span (traceID `{0xDE,0xAD,0xBE,0xEF,...}`). Flush.
+- Open with `NewLeanReaderFromProvider`.
+
+**Assertions:**
+- Present trace ID returns non-nil blocks.
+- Absent trace ID (`{0xFF,...,0xFF}`) returns nil.
+
+Back-ref: `reader/reader_test.go:TestTraceIDBloom_LeanReader`
+
+---
+
+### TIDBLOOM-04: Full and lean readers agree on all trace lookups
+
+**Scenario:** Both `NewReaderFromProvider` and `NewLeanReaderFromProvider` return
+identical block lists for every inserted trace ID.
+
+**Setup:**
+- Write 20 spans with sequential trace IDs `{i+1, 0, ..., 0}`. Flush.
+- Open with both reader constructors.
+
+**Assertions:**
+- For every trace ID: `BlocksForTraceID` returns the same blocks from both readers.
+- All 20 trace IDs return non-empty results from both readers.
+
+Back-ref: `reader/reader_test.go:TestTraceIDBloom_VersionV2`
+
+---
+
+### TIDBLOOM-UNIT-01 through TIDBLOOM-UNIT-05: Trace ID bloom unit tests
+
+**Scenario:** Unit tests for `TraceIDBloomSize`, `AddTraceIDToBloom`, and `TestTraceIDBloom`.
+
+Back-ref: `shared/shared_test.go:TestTraceIDBloomSize`, `TestTraceIDBloomNoFalseNegatives`,
+`TestTraceIDBloomEmptyBloom`, `TestTraceIDBloomAbsentTrace`, `TestTraceIDBloomFalsePositiveRate`
+
+- **Size:** `TraceIDBloomSize(0)` = `TraceIDBloomMinBytes`; grows with count; capped at `TraceIDBloomMaxBytes`.
+- **No false negatives:** All 200 inserted random trace IDs test true in their bloom.
+- **Empty bloom:** `TestTraceIDBloom(nil, id)` = true (vacuous); `TestTraceIDBloom([]byte{}, id)` = true.
+- **All-zero bloom:** No trace ID tests true in a zero-filled bloom.
+- **FP rate:** With 1000 inserts and 10,000 absent tests, observed FP rate < 3%.
 
 ---
 
@@ -888,7 +1028,7 @@ correctly; all block index, trace index, and range index data survive compressio
 
 **Assertions:**
 - `reader.BlockCount()` == 3.
-- Total span indices in the trace block index == 13 (sum across all trace block entries).
+- `reader.TraceEntries(traceID)` returns 3 entries (one per block).
 - `BlockMeta(0).MaxStart > BlockMeta(0).MinStart`.
 - No error opening the reader.
 
@@ -1104,3 +1244,184 @@ every column value matches the written input.
 - Covers all intrinsic fields that are captured as block columns.
 - Assertions for `event:name` and `link:trace_id` are added once reader support for
   those columns is implemented.
+
+## TS Index Tests
+
+### TSI-01: TestWriteTSIndexSection_Empty
+**Scenario:** writeTSIndexSection with nil metas produces a 9-byte header with count=0.
+**Assertions:** len == 9, magic correct, version correct, count == 0.
+
+### TSI-02: TestWriteTSIndexSection_SortedByMinTS
+**Scenario:** 3 blocks with out-of-order minTS values. Verify entries sorted by minTS
+ascending and blockID tracks original position.
+**Assertions:** Entry 0 has smallest minTS; blockID matches original index.
+
+### TSI-03: TestBlocksInTimeRange_* (6 cases)
+Unit tests covering: nil entries, all match, partial match, none match,
+zero-time blocks always included, exact boundary values.
+
+### TSI-04: TestTSIndexRoundTrip_LogFile (integration)
+Full write→flush→read round-trip. 6 log records in 3 blocks with distinct time ranges.
+Verify TimeIndex() is non-nil, len==3, and BlocksInTimeRange for a window covering one
+block returns exactly that block with correct metadata overlap.
+
+---
+
+## 18. Log Body Auto-Parse Tests
+
+### LOG-01: TestParseLogBody_JSON
+**Scenario:** JSON log body is parsed and all top-level scalar fields are returned.
+**Setup:** Call `parseLogBody` with `{"level":"info","msg":"started","count":42}`.
+**Assertions:**
+- `result["level"]` == "info".
+- `result["msg"]` == "started".
+- `result["count"]` == "42" (numeric stringified).
+
+### LOG-02: TestParseLogBody_Logfmt
+**Scenario:** Logfmt log body is parsed and all key=value pairs are returned.
+**Setup:** Call `parseLogBody` with `level=info msg=started count=42`.
+**Assertions:**
+- `result["level"]` == "info", `result["msg"]` == "started", `result["count"]` == "42".
+
+### LOG-03: TestParseLogBody_InvalidBody_ReturnsNil
+**Scenario:** Plain text that is neither JSON nor logfmt returns nil (silent failure).
+**Setup:** Call `parseLogBody` with `"this is not json or logfmt structured"`.
+**Assertions:**
+- Return value is nil.
+
+### LOG-04: TestParseLogBody_EmptyBody_ReturnsNil
+**Scenario:** Empty string body returns nil — no columns created.
+**Setup:** Call `parseLogBody("")`.
+**Assertions:**
+- Return value is nil.
+
+### LOG-05: TestParseLogBody_NestedJSON_OnlyTopLevel
+**Scenario:** Nested JSON objects are stringified, not recursed.
+**Setup:** Call `parseLogBody` with `{"level":"info","nested":{"a":1}}`.
+**Assertions:**
+- `result["level"]` == "info".
+- `result["nested"]` is non-empty (stringified object value).
+
+### LOG-06: TestParseLogBody_ManyFields_AllExtracted
+**Scenario:** Logfmt body with multiple fields — all extracted into the result map.
+**Setup:** Call `parseLogBody` with `level=info service=api region=us-east-1 status=200 latency=42ms`.
+**Assertions:**
+- All five keys present with correct values.
+
+### LOG-07: TestParseLogBody_JSONInvalidNotObject_ReturnsNil
+**Scenario:** JSON array (top-level non-object) returns nil.
+**Setup:** Call `parseLogBody` with `["a","b","c"]`.
+**Assertions:**
+- Return value is nil.
+
+### LOG-08: TestAddLogRecordFromProto_JSONBodyExtracted
+**Scenario:** JSON log body produces `log.{key}` columns of type `ColumnTypeRangeString`.
+**Setup:** Create a `logBlockBuilder`. Add a `pendingLogRecord` with JSON body
+`{"level":"error","service":"api"}`. Call `addLogRecordFromProto`.
+**Assertions:**
+- Column key `{Name:"log.level", Type:ColumnTypeRangeString}` exists in `bb.columns`.
+- Column key `{Name:"log.service", Type:ColumnTypeRangeString}` exists in `bb.columns`.
+- `rowCount()` on the level column == 1.
+
+### LOG-09: TestAddLogRecordFromProto_LogfmtBodyExtracted
+**Scenario:** Logfmt log body produces `log.{key}` range columns.
+**Setup:** Create a `logBlockBuilder`. Add a pendingLogRecord with logfmt body
+`level=warn msg=timeout duration=150ms`. Call `addLogRecordFromProto`.
+**Assertions:**
+- Column key `{Name:"log.level", Type:ColumnTypeRangeString}` exists with rowCount==1.
+
+### LOG-10: TestAddLogRecordFromProto_UnparsedBodyNoExtraColumns
+**Scenario:** Unparseable body (plain text) produces no extra `log.{key}` columns.
+**Setup:** Create a `logBlockBuilder`. Record column count before call. Add a pendingLogRecord
+with plain-text body. Call `addLogRecordFromProto`.
+**Assertions:**
+- `len(bb.columns)` is unchanged from before the call (no new log.{key} columns added).
+
+### LOG-11: TestAddLogRecordFromProto_NilBodyNoExtraColumns
+**Scenario:** Nil body field produces no extra columns.
+**Setup:** Create a `logBlockBuilder`. Record column count before. Add a pendingLogRecord
+with `Body: nil`. Call `addLogRecordFromProto`.
+**Assertions:**
+- `len(bb.columns)` is unchanged.
+
+---
+
+## 16. Intrinsic Columns (Footer V4)
+
+### INTR-01: TestFlatAccumFeedAndEncode
+**Scenario:** Flat accumulator encodes uint64 values in sorted order.
+**Setup:** Create a new `intrinsicAccumulator`. Feed three `span:duration` uint64 values
+out-of-order: 300 (blockIdx=0, rowIdx=2), 100 (blockIdx=0, rowIdx=0), 200 (blockIdx=0, rowIdx=1).
+Encode via `encodeColumn("span:duration")`.
+**Assertions:**
+- Decoded column has Count=3.
+- Uint64Values sorted ascending: [100, 200, 300].
+- BlockRefs aligned to sorted order: rowIdx [0, 1, 2].
+
+### INTR-02: TestDictAccumFeedAndEncode
+**Scenario:** Dict accumulator deduplicates string values.
+**Setup:** Feed "GET /foo" (block 0, row 0), "POST /bar" (block 0, row 1), "GET /foo" again
+(block 1, row 0). Encode via `encodeColumn("span:name")`.
+**Assertions:**
+- DictEntries has 2 entries.
+- "GET /foo" has 2 BlockRefs; "POST /bar" has 1 BlockRef.
+
+### INTR-03: TestBytesAccumFeedAndEncode
+**Scenario:** Bytes accumulator sorts IDs lexicographically.
+**Setup:** Feed two trace IDs: id1 = {1..16}, id2 = {0..15} (id2 < id1 lexicographically).
+Encode via `encodeColumn("trace:id")`.
+**Assertions:**
+- Decoded column has Count=2.
+- BytesValues[0] == id2 (lexicographically smaller).
+
+### INTR-04: TestMaxIntrinsicRowsCap
+**Scenario:** Accumulator triggers cap flag at MaxIntrinsicRows.
+**Setup:** Feed MaxIntrinsicRows+1 uint64 values into `span:duration`.
+**Assertions:**
+- `overCap()` returns true.
+
+### INTR-05: TestAccumEncodeTOC
+**Scenario:** TOC round-trips correctly through encode/decode.
+**Setup:** Create two IntrinsicColMeta entries (one flat, one dict). Call `encodeTOC` then
+`decodeTOC`.
+**Assertions:**
+- Decoded length == 2.
+- First entry name, offset, and count match input.
+- Second entry name and min match input.
+
+### INTR-06: TestWriterAccumulatesIntrinsics
+**Scenario:** Writer populates intrinsicAccum after block build.
+**Setup:** Create a Writer with MaxBlockSpans=1 and MaxBufferedSpans=1. Add one span.
+**Assertions:**
+- `w.intrinsicAccum` is non-nil after AddSpan triggers auto-flush.
+
+### INTR-07: TestWriterFlushWritesIntrinsicSection
+**Scenario:** Flush writes v4 footer and readable TOC.
+**Setup:** Create a Writer with in-memory buffer. Add one span with known duration. Flush.
+**Assertions:**
+- Footer version == 4 (read from file_size-34).
+- `intrinsic_index_len` > 0.
+- TOC parses to at least one entry.
+- Entry for "span:duration" has Count=1.
+
+### INTR-08: TestReaderParsesV4Footer (to be added with intrinsic_reader.go)
+**Scenario:** Reader correctly parses a v4 footer and exposes intrinsic metadata.
+**Setup:** Write a file with the Writer (which produces v4 footer). Open with Reader.
+**Assertions:**
+- Reader `footerVersion` == 4.
+- Reader `intrinsicIndexLen` > 0.
+- `IntrinsicTOC()` (or equivalent) returns the TOC entries.
+
+### INTR-09: TestReaderFallsBackToV3 (to be added with intrinsic_reader.go)
+**Scenario:** Reader handles legacy v3 footer without error.
+**Setup:** Construct a minimal file with footer v3 (22-byte footer, version=3).
+**Assertions:**
+- Reader opens successfully.
+- `intrinsicIndexLen` == 0 (no intrinsic data).
+
+### INTR-10: TestWriterOverCapWritesEmptyTOC (to be added with integration test)
+**Scenario:** Writer writes empty TOC when row count exceeds MaxIntrinsicRows.
+**Setup:** Write a file where the accumulator exceeds MaxIntrinsicRows spans.
+**Assertions:**
+- Footer version == 4.
+- `intrinsic_index_len` refers to a TOC with 0 entries.

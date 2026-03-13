@@ -101,13 +101,20 @@ func DecodePresenceRLE(data []byte, nBits int) ([]byte, error) {
 		off += 8
 
 		if runVal == 1 {
-			for range runLen {
-				if bitIdx >= nBits {
-					break
-				}
-
-				out[bitIdx/8] |= 1 << uint(bitIdx%8)
-				bitIdx++
+			end := min(bitIdx+runLen, nBits)
+			// Partial leading bits up to the next byte boundary.
+			firstFull := min((bitIdx+7)&^7, end)
+			for ; bitIdx < firstFull; bitIdx++ {
+				out[bitIdx>>3] |= 1 << uint(bitIdx&7)
+			}
+			// Fill complete bytes with 0xFF — the hot path for dense columns.
+			lastFull := end &^ 7
+			for ; bitIdx < lastFull; bitIdx += 8 {
+				out[bitIdx>>3] = 0xFF
+			}
+			// Partial trailing bits.
+			for ; bitIdx < end; bitIdx++ {
+				out[bitIdx>>3] |= 1 << uint(bitIdx&7)
 			}
 		} else {
 			bitIdx += runLen

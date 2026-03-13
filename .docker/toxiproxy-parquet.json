@@ -3,6 +3,18 @@
     "name": "s3proxy-parquet",
     "listen": "0.0.0.0:9000",
     "upstream": "s3proxy-parquet:8080",
-    "enabled": true
+    "enabled": true,
+    "toxics": [
+      {
+        "name": "latency",
+        "type": "latency",
+        "stream": "downstream",
+        "toxicity": 1.0,
+        "attributes": {
+          "latency": 20,
+          "jitter": 0
+        }
+      }
+    ]
   }
 ]

@@ -73,7 +73,8 @@ func CoalesceBlocks(metas []shared.BlockMeta, blockOrder []int, cfg shared.Coale
 			wasteRatio = float64(wasteBytes) / float64(mergedLen)
 		}
 
-		canMerge := gap <= cfg.MaxGapBytes && wasteRatio <= cfg.MaxWasteRatio
+		canMerge := gap <= cfg.MaxGapBytes && wasteRatio <= cfg.MaxWasteRatio &&
+			(cfg.MaxReadBytes <= 0 || mergedLen <= cfg.MaxReadBytes)
 
 		if canMerge {
 			cur.Length = max(cur.Length, mergedEnd-cur.Offset)
@@ -128,9 +129,8 @@ func ReadCoalescedBlocks(provider rw.ReaderProvider, cr []shared.CoalescedRead) 
 				)
 			}
 
-			blockBuf := make([]byte, bLen)
-			copy(blockBuf, buf[bOff:end])
-			result[blockID] = blockBuf
+			// Sub-slice into buf directly — no copy. buf stays alive through these references.
+			result[blockID] = buf[bOff:end:end]
 		}
 	}
 

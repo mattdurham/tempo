@@ -3,8 +3,6 @@ package vm
 import (
 	"fmt"
 	"time"
-
-	"github.com/grafana/blockpack/internal/quantile"
 )
 
 // VM is a stack-based virtual machine for executing TraceQL bytecode
@@ -20,20 +18,16 @@ type VM struct {
 // AggBucket holds aggregation state for a single group.
 // A JSON-friendly payload used to exist but was removed; this is the sole bucket struct.
 type AggBucket struct {
-	Quantiles  map[string]*quantile.QuantileSketch // field_name -> quantile sketch
-	Histograms map[string]*HistogramData           // field_name -> histogram data
-	GroupKey   GroupKey
-	Sum        float64
-	Count      int64
-	Rate       float64
-	Min        float64
-	Max        float64
-	SumSq      float64 // Sum of squares for stddev calculation
+	GroupKey GroupKey
+	Sum      float64
+	Count    int64
+	Rate     float64
+	Min      float64
+	Max      float64
 }
 
 // Merge combines another AggBucket into this one.
 // This is used to merge aggregation results from multiple files.
-// Quantile sketches are properly merged to maintain accuracy.
 func (b *AggBucket) Merge(other *AggBucket) {
 	if other == nil {
 		return
@@ -65,25 +59,6 @@ func (b *AggBucket) Merge(other *AggBucket) {
 		}
 	}
 
-	// Merge quantile sketches
-	if other.Quantiles != nil {
-		if b.Quantiles == nil {
-			b.Quantiles = make(map[string]*quantile.QuantileSketch)
-		}
-		for field, otherSketch := range other.Quantiles {
-			if otherSketch == nil {
-				continue
-			}
-			if b.Quantiles[field] == nil {
-				// Clone the other sketch instead of sharing the reference
-				b.Quantiles[field] = otherSketch.Clone()
-			} else {
-				// Merge the other sketch into ours
-				b.Quantiles[field].Merge(otherSketch)
-			}
-		}
-	}
-
 	// Rate is recalculated after merge, not merged directly
 }
 
@@ -109,13 +84,12 @@ func MergeAggregationResults(results ...map[string]*AggBucket) map[string]*AggBu
 			} else {
 				// Create new bucket with copied values
 				merged[key] = &AggBucket{
-					GroupKey:  bucket.GroupKey,
-					Count:     bucket.Count,
-					Sum:       bucket.Sum,
-					Min:       bucket.Min,
-					Max:       bucket.Max,
-					Rate:      bucket.Rate,
-					Quantiles: bucket.Quantiles,
+					GroupKey: bucket.GroupKey,
+					Count:    bucket.Count,
+					Sum:      bucket.Sum,
+					Min:      bucket.Min,
+					Max:      bucket.Max,
+					Rate:     bucket.Rate,
 				}
 			}
 		}
@@ -127,22 +101,6 @@ func MergeAggregationResults(results ...map[string]*AggBucket) map[string]*AggBu
 // GroupKey represents a unique combination of group-by field values
 type GroupKey struct {
 	Values []Value // Ordered by GROUP BY fields in query
-}
-
-// QuantileSketch is a stub for quantile operations (not used in SQL path)
-// QuantileSketch is an alias for quantile.QuantileSketch for backward compatibility
-type QuantileSketch = quantile.QuantileSketch
-
-// HistogramData holds histogram buckets and counts
-type HistogramData struct {
-	Buckets []float64 // Bucket boundaries
-	Counts  []int64   // Count in each bucket
-}
-
-// JSONValue is a stub for JSON operations (not used in SQL path)
-type JSONValue struct {
-	Data interface{}
-	Raw  []byte
 }
 
 // DateBinInfo holds date_bin configuration

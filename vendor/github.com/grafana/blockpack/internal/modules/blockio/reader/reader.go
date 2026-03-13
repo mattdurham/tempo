@@ -5,8 +5,11 @@ package reader
 import (
 	"fmt"
 	"sort"
+	"sync"
 
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
+	"github.com/grafana/blockpack/internal/modules/filecache"
+	"github.com/grafana/blockpack/internal/modules/queryplanner"
 	"github.com/grafana/blockpack/internal/modules/rw"
 )
 
@@ -19,22 +22,40 @@ type footerRaw struct {
 
 // compactTraceIndex holds the parsed compact trace index section.
 type compactTraceIndex struct {
-	traceIndex map[[16]byte][]traceBlockRef
-	blockTable []compactBlockEntry
+	traceIndex   map[[16]byte][]uint16
+	blockTable   []compactBlockEntry
+	traceIDBloom []byte // nil for version-1 compact indexes (no bloom); vacuous true on lookup
 }
 
 // Reader reads and decodes a blockpack file.
 type Reader struct {
-	provider   rw.ReaderProvider
-	traceIndex map[[16]byte][]traceBlockRef
+	provider rw.ReaderProvider
+	// cache is the optional disk-backed file cache for footer/header/metadata/block reads.
+	// Nil when no cache is configured.
+	cache  *filecache.FileCache
+	fileID string
+
+	traceIndex map[[16]byte][]uint16
 
 	// Range index — lazy.
 	rangeOffsets  map[string]rangeIndexMeta
 	rangeParsed   map[string]parsedRangeIndex
 	compactParsed *compactTraceIndex
 
-	// Options.
-	opts readerOptions
+	// internStrings is the per-reader string intern map for dictionary column values.
+	// Shared across all block parses on this reader; single-goroutine use only.
+	internStrings map[string]string
+
+	// sketchIdx holds parsed column-major sketch data for the file.
+	// Nil for files written before the sketch section was introduced (old format).
+	sketchIdx *sketchIndex
+
+	// fileSummary is the lazily computed file-level sketch summary.
+	fileSummary *FileSketchSummary
+
+	// tsEntries is the parsed per-file timestamp index (sorted by minTS ascending).
+	// Nil for files written before the TS index was introduced.
+	tsEntries []tsIndexEntry
 
 	// Parsed during NewReaderFromProvider.
 	blockMetas    []shared.BlockMeta
@@ -52,27 +73,56 @@ type Reader struct {
 	metadataOffset uint64
 	metadataLen    uint64
 
+	fileSummaryOnce sync.Once
+
 	compactLen uint32
 
 	footerVersion uint16
 	fileVersion   uint8
+
+	// signalType is parsed from the V12 file header signal_type byte.
+	// Defaults to shared.SignalTypeTrace (0x01) for older files.
+	signalType uint8
+
+	// intrinsicIndexOffset and intrinsicIndexLen are parsed from the v4 footer.
+	// Both are 0 for v3 footer files or files with no intrinsic section.
+	intrinsicIndexOffset uint64
+	intrinsicIndexLen    uint32
+
+	// intrinsicIndex holds the parsed TOC entries, keyed by column name.
+	// Populated by parseIntrinsicTOC during NewReaderFromProvider. Nil for
+	// v3 footer files or files with intrinsicIndexLen == 0.
+	intrinsicIndex map[string]shared.IntrinsicColMeta
+
+	// intrinsicDecoded caches fully decoded intrinsic columns by name.
+	// Populated lazily by GetIntrinsicColumn.
+	intrinsicDecoded map[string]*shared.IntrinsicColumn
 }
 
 // NewReaderFromProvider constructs a Reader by reading the footer, header,
 // and metadata section from provider.
-func NewReaderFromProvider(provider rw.ReaderProvider, opts ...Option) (*Reader, error) {
+func NewReaderFromProvider(provider rw.ReaderProvider) (*Reader, error) {
+	return NewReaderFromProviderWithOptions(provider, Options{})
+}
+
+// NewReaderFromProviderWithOptions constructs a Reader with the given options.
+// Use this to attach a file cache for footer, header, metadata, and block reads.
+func NewReaderFromProviderWithOptions(provider rw.ReaderProvider, opts Options) (*Reader, error) {
+	if opts.Cache != nil && opts.FileID == "" {
+		return nil, fmt.Errorf("NewReaderFromProvider: Options.FileID must be set when Cache is non-nil")
+	}
+
 	size, err := provider.Size()
 	if err != nil {
 		return nil, fmt.Errorf("NewReaderFromProvider: Size: %w", err)
 	}
 
 	r := &Reader{
-		provider: provider,
-		fileSize: size,
-	}
-
-	for _, opt := range opts {
-		opt(&r.opts)
+		provider:      provider,
+		cache:         opts.Cache,
+		fileID:        opts.FileID,
+		fileSize:      size,
+		internStrings: make(map[string]string),
 	}
 
 	if err = r.readFooter(); err != nil {
@@ -87,6 +137,10 @@ func NewReaderFromProvider(provider rw.ReaderProvider, opts ...Option) (*Reader,
 		return nil, fmt.Errorf("NewReaderFromProvider: %w", err)
 	}
 
+	if err = r.parseIntrinsicTOC(); err != nil {
+		return nil, fmt.Errorf("NewReaderFromProvider: %w", err)
+	}
+
 	return r, nil
 }
 
@@ -94,19 +148,28 @@ func NewReaderFromProvider(provider rw.ReaderProvider, opts ...Option) (*Reader,
 // (22B) and the compact trace index section. This is the optimal path for
 // FindTraceByID workloads. Falls back to NewReaderFromProvider for files
 // without a compact trace index (compactLen == 0).
-func NewLeanReaderFromProvider(provider rw.ReaderProvider, opts ...Option) (*Reader, error) {
+func NewLeanReaderFromProvider(provider rw.ReaderProvider) (*Reader, error) {
+	return NewLeanReaderFromProviderWithOptions(provider, Options{})
+}
+
+// NewLeanReaderFromProviderWithOptions constructs a lean Reader with the given options.
+// Use this to attach a file cache for footer, compact index, and block reads.
+func NewLeanReaderFromProviderWithOptions(provider rw.ReaderProvider, opts Options) (*Reader, error) {
+	if opts.Cache != nil && opts.FileID == "" {
+		return nil, fmt.Errorf("NewLeanReaderFromProvider: Options.FileID must be set when Cache is non-nil")
+	}
+
 	size, err := provider.Size()
 	if err != nil {
 		return nil, fmt.Errorf("NewLeanReaderFromProvider: Size: %w", err)
 	}
 
 	r := &Reader{
-		provider: provider,
-		fileSize: size,
-	}
-
-	for _, opt := range opts {
-		opt(&r.opts)
+		provider:      provider,
+		cache:         opts.Cache,
+		fileID:        opts.FileID,
+		fileSize:      size,
+		internStrings: make(map[string]string),
 	}
 
 	// I/O #1: read footer.
@@ -116,7 +179,7 @@ func NewLeanReaderFromProvider(provider rw.ReaderProvider, opts ...Option) (*Rea
 
 	// Fall back to full reader when there is no compact section.
 	if r.compactLen == 0 {
-		return NewReaderFromProvider(provider, opts...)
+		return NewReaderFromProviderWithOptions(provider, opts)
 	}
 
 	// I/O #2: read and parse the compact index (eagerly).
@@ -133,9 +196,45 @@ func NewLeanReaderFromProvider(provider rw.ReaderProvider, opts ...Option) (*Rea
 // BlockCount returns the number of blocks in the file.
 func (r *Reader) BlockCount() int { return len(r.blockMetas) }
 
+// TraceCount returns the number of unique traces in the file.
+// Uses the trace index (full or compact) to determine the count.
+// Returns 0 if no trace index is available.
+func (r *Reader) TraceCount() int {
+	if len(r.traceIndex) > 0 {
+		return len(r.traceIndex)
+	}
+	if r.compactParsed != nil {
+		return len(r.compactParsed.traceIndex)
+	}
+	return 0
+}
+
+// SignalType returns the signal type stored in the file header.
+// Returns shared.SignalTypeTrace for files written with version < 12 (trace-only era).
+func (r *Reader) SignalType() uint8 {
+	if r.signalType == 0 {
+		return shared.SignalTypeTrace
+	}
+	return r.signalType
+}
+
 // BlockMeta returns the metadata for the block at blockIdx.
 func (r *Reader) BlockMeta(blockIdx int) shared.BlockMeta {
 	return r.blockMetas[blockIdx]
+}
+
+// ColumnSketch returns the column-major sketch data for the named column, or nil if
+// no sketch section was written or the column was not sketched.
+// Implements queryplanner.BlockIndexer.
+func (r *Reader) ColumnSketch(col string) queryplanner.ColumnSketch {
+	if r.sketchIdx == nil {
+		return nil
+	}
+	cd := r.sketchIdx.columns[col]
+	if cd == nil {
+		return nil
+	}
+	return cd
 }
 
 // BlocksForRange returns the sorted block indices that may contain the given query value
@@ -177,40 +276,80 @@ func (r *Reader) BlocksForRange(colName string, queryValue shared.RangeValueKey)
 	return result, nil
 }
 
-// GetBlockWithBytes reads one block (single I/O) and decodes requested columns.
-// wantColumns: nil = all columns. prevBlock: optional reuse target.
-// INVARIANT: exactly one readRange call per block (NOTES §1).
-func (r *Reader) GetBlockWithBytes(
-	blockIdx int,
-	wantColumns map[string]struct{},
-	prevBlock *BlockWithBytes,
-) (*BlockWithBytes, error) {
-	var meta shared.BlockMeta
-	if blockIdx >= 0 && blockIdx < len(r.blockMetas) {
-		meta = r.blockMetas[blockIdx]
-	} else if r.compactParsed != nil && blockIdx >= 0 && blockIdx < len(r.compactParsed.blockTable) {
-		e := r.compactParsed.blockTable[blockIdx]
-		meta = shared.BlockMeta{Offset: e.fileOffset, Length: uint64(e.fileLength)}
-	} else {
-		return nil, fmt.Errorf("GetBlockWithBytes: blockIdx %d out of range", blockIdx)
+// BlocksForRangeInterval returns block indices from all buckets whose range overlaps
+// [minKey, maxKey]. The implementation finds the bucket containing minKey (largest
+// lower boundary ≤ minKey) and the last bucket whose lower boundary ≤ maxKey, then
+// unions all block IDs in between. This correctly includes the bucket containing
+// minKey even when its lower boundary is < minKey.
+// NOTE-011: Used for case-insensitive regex prefix lookups where the query spans a
+// lexicographic range (e.g., all case variants from "DEBUG" to "debug").
+func (r *Reader) BlocksForRangeInterval(
+	colName string, minKey, maxKey shared.RangeValueKey,
+) ([]int, error) {
+	if err := r.ensureRangeColumnParsed(colName); err != nil {
+		return nil, err
 	}
 
-	rawBytes, err := r.readRange(meta.Offset, meta.Length, rw.DataTypeBlock)
-	if err != nil {
-		return nil, fmt.Errorf("GetBlockWithBytes block %d: %w", blockIdx, err)
+	idx := r.rangeParsed[colName]
+	entries := idx.entries
+
+	if len(entries) == 0 {
+		return nil, nil
 	}
 
-	var prevBlk *Block
-	if prevBlock != nil {
-		prevBlk = prevBlock.Block
+	// Find the bucket that contains minKey: last entry whose lower ≤ minKey.
+	lo := sort.Search(len(entries), func(i int) bool {
+		return compareRangeKey(idx.colType, entries[i].lower, minKey) > 0
+	}) - 1
+	if lo < 0 {
+		lo = 0 // minKey is below all boundaries; start from the first bucket.
 	}
 
-	blk, err := parseBlockColumnsReuse(rawBytes, r.fileVersion, wantColumns, prevBlk, meta)
-	if err != nil {
-		return nil, fmt.Errorf("GetBlockWithBytes block %d: parse: %w", blockIdx, err)
+	// Find the last bucket whose lower ≤ maxKey.
+	hi := sort.Search(len(entries), func(i int) bool {
+		return compareRangeKey(idx.colType, entries[i].lower, maxKey) > 0
+	}) - 1
+	if hi < 0 {
+		return nil, nil // maxKey is below all lower boundaries — no overlap.
 	}
 
-	return &BlockWithBytes{Block: blk, RawBytes: rawBytes}, nil
+	// Union block IDs from all buckets in [lo, hi].
+	seen := make(map[int]struct{})
+	for i := lo; i <= hi; i++ {
+		for _, id := range entries[i].blockIDs {
+			seen[int(id)] = struct{}{}
+		}
+	}
+
+	result := make([]int, 0, len(seen))
+	for id := range seen {
+		result = append(result, id)
+	}
+	sort.Ints(result)
+
+	return result, nil
+}
+
+
+// ColumnNames returns all column names known to this reader — the union of
+// range-indexed columns (rangeOffsets) and sketch columns (sketchIdx).
+// These are derived from the file header/metadata, so no block I/O is needed.
+func (r *Reader) ColumnNames() []string {
+	seen := make(map[string]struct{})
+	for col := range r.rangeOffsets {
+		seen[col] = struct{}{}
+	}
+	if r.sketchIdx != nil {
+		for col := range r.sketchIdx.columns {
+			seen[col] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for col := range seen {
+		out = append(out, col)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // RangeColumnType returns the ColumnType for a range-indexed column, if it exists.
@@ -242,10 +381,25 @@ func (r *Reader) ReadBlocks(blockIndices []int) (map[int][]byte, error) {
 	return ReadCoalescedBlocks(r.provider, coalesced)
 }
 
+// CoalescedGroups partitions blockIndices into coalesced read groups (~8 MB each) without
+// performing any I/O. Used by lazy-fetch callers that stop early on a limit.
+func (r *Reader) CoalescedGroups(blockIndices []int) []shared.CoalescedRead {
+	return CoalesceBlocks(r.blockMetas, blockIndices, shared.AggressiveCoalesceConfig)
+}
+
+// ReadGroup performs the I/O for a single CoalescedRead group.
+func (r *Reader) ReadGroup(cr shared.CoalescedRead) (map[int][]byte, error) {
+	return ReadCoalescedBlocks(r.provider, []shared.CoalescedRead{cr})
+}
+
 // ParseBlockFromBytes parses a Block from raw bytes using the given meta and column filter.
 // wantColumns nil = all columns.
-func (r *Reader) ParseBlockFromBytes(rawBytes []byte, wantColumns map[string]struct{}, meta shared.BlockMeta) (*BlockWithBytes, error) {
-	blk, err := parseBlockColumnsReuse(rawBytes, r.fileVersion, wantColumns, nil, meta)
+func (r *Reader) ParseBlockFromBytes(
+	rawBytes []byte,
+	wantColumns map[string]struct{},
+	meta shared.BlockMeta,
+) (*BlockWithBytes, error) {
+	blk, err := parseBlockColumnsReuse(rawBytes, wantColumns, nil, meta, r.internStrings)
 	if err != nil {
 		return nil, fmt.Errorf("ParseBlockFromBytes: %w", err)
 	}
@@ -257,32 +411,35 @@ func (r *Reader) HasTraceIndex() bool {
 	return len(r.traceIndex) > 0
 }
 
-// TraceEntry is a single trace-block reference with span indices.
+// TraceEntry is a single trace-block reference.
 type TraceEntry struct {
-	SpanIndices []uint16
-	BlockID     int
+	BlockID int
 }
 
-// TraceEntries returns per-block span-index entries for a trace ID.
+// TraceEntries returns the block IDs containing spans for the given trace ID.
 // Falls back to the compact trace index when the main index is empty (lean reader path).
 func (r *Reader) TraceEntries(traceID [16]byte) []TraceEntry {
-	refs, ok := r.traceIndex[traceID]
+	blockIDs, ok := r.traceIndex[traceID]
 	if !ok && r.compactParsed != nil {
-		refs, ok = r.compactParsed.traceIndex[traceID]
+		blockIDs, ok = r.compactParsed.traceIndex[traceID]
 	}
 	if !ok {
 		return nil
 	}
-	result := make([]TraceEntry, len(refs))
-	for i, ref := range refs {
-		indices := make([]uint16, len(ref.spanIndices))
-		copy(indices, ref.spanIndices)
-		result[i] = TraceEntry{
-			BlockID:     int(ref.blockID),
-			SpanIndices: indices,
-		}
+	result := make([]TraceEntry, len(blockIDs))
+	for i, bid := range blockIDs {
+		result[i] = TraceEntry{BlockID: int(bid)}
 	}
 	return result
+}
+
+// ResetInternStrings clears the per-reader string intern map without reallocating it.
+// NOTE-020: call before each block's first-pass ParseBlockFromBytes in scan loops
+// to bound the intern map to one block's unique strings. Single-goroutine use only.
+func (r *Reader) ResetInternStrings() {
+	for k := range r.internStrings {
+		delete(r.internStrings, k)
+	}
 }
 
 // AddColumnsToBlock decodes additional columns from an already-loaded BlockWithBytes.
@@ -305,12 +462,19 @@ func (r *Reader) AddColumnsToBlock(bwb *BlockWithBytes, addColumns map[string]st
 		return fmt.Errorf("AddColumnsToBlock: column metadata: %w", err)
 	}
 
+	scratch := acquireDecompScratch()
+	defer releaseDecompScratch(scratch)
+	ctx := &decodeCtx{scratch: scratch, intern: r.internStrings}
+
 	for _, m := range metas {
-		if _, want := addColumns[m.name]; !want {
-			continue
+		// NOTE-022: nil means "add all missing columns"; non-nil filters by name.
+		if addColumns != nil {
+			if _, want := addColumns[m.name]; !want {
+				continue
+			}
 		}
 
-		if _, exists := bwb.Block.columns[m.name]; exists {
+		if _, exists := bwb.Block.columns[shared.ColumnKey{Name: m.name, Type: m.colType}]; exists {
 			continue
 		}
 
@@ -332,7 +496,7 @@ func (r *Reader) AddColumnsToBlock(bwb *BlockWithBytes, addColumns map[string]st
 			Type: m.colType,
 		}
 
-		decoded, err := readColumnEncoding(bwb.RawBytes[start:end], spanCount, m.colType)
+		decoded, err := readColumnEncoding(bwb.RawBytes[start:end], spanCount, m.colType, ctx)
 		if err != nil {
 			return fmt.Errorf("AddColumnsToBlock: col %q: %w", m.name, err)
 		}
@@ -353,8 +517,10 @@ func (r *Reader) AddColumnsToBlock(bwb *BlockWithBytes, addColumns map[string]st
 		col.Present = decoded.Present
 		col.SpanCount = decoded.SpanCount
 
-		bwb.Block.columns[m.name] = col
+		bwb.Block.columns[shared.ColumnKey{Name: m.name, Type: m.colType}] = col
 	}
+
+	bwb.Block.buildNameIndex()
 
 	return nil
 }

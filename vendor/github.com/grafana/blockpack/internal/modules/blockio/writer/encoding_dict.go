@@ -81,7 +81,7 @@ func encodeDictionaryKind(
 		dictPayload = encodeBoolDictPayload(entries)
 		dictSize = len(entries)
 
-	default: // ColumnTypeBytes, ColumnTypeRangeBytes
+	default: // ColumnTypeBytes, ColumnTypeRangeBytes, ColumnTypeUUID
 		bv, _ := values.([][]byte)
 		entries, idx := buildBytesDict(bv, present)
 		indexes = idx
@@ -149,7 +149,10 @@ func encodeDictionaryKind(
 
 	buf := make([]byte, 0, 3+4+len(compressedDict)+4+4+len(rleData)+nRows*int(indexWidth)+20)
 	buf = append(buf, shared.ColumnEncodingVersion, kind, indexWidth)
-	buf = appendUint32LE(buf, uint32(len(compressedDict))) //nolint:gosec // safe: dict size bounded by MaxDictionarySize
+	buf = appendUint32LE(
+		buf,
+		uint32(len(compressedDict)),
+	) //nolint:gosec // safe: dict size bounded by MaxDictionarySize
 	buf = append(buf, compressedDict...)
 	buf = appendUint32LE(buf, uint32(nRows))        //nolint:gosec // safe: nRows bounded by MaxBlockSpans (65535)
 	buf = appendUint32LE(buf, uint32(len(rleData))) //nolint:gosec // safe: rle data bounded by block size
@@ -161,7 +164,10 @@ func encodeDictionaryKind(
 		if err != nil {
 			return nil, err
 		}
-		buf = appendUint32LE(buf, uint32(len(fullIndexes)))  //nolint:gosec // safe: index count bounded by MaxBlockSpans
+		buf = appendUint32LE(
+			buf,
+			uint32(len(fullIndexes)),
+		) //nolint:gosec // safe: index count bounded by MaxBlockSpans
 		buf = appendUint32LE(buf, uint32(len(rleIndexData))) //nolint:gosec // safe: rle data bounded by block size
 		buf = append(buf, rleIndexData...)
 	} else {
@@ -253,7 +259,10 @@ func encodeDeltaDictionaryKind(
 		delta := cur - prev
 		prev = cur
 		var tmp [4]byte
-		binary.LittleEndian.PutUint32(tmp[:], uint32(delta)) //nolint:gosec // safe: reinterpreting int32 delta as uint32 bits for serialization
+		binary.LittleEndian.PutUint32(
+			tmp[:],
+			uint32(delta),
+		) //nolint:gosec // safe: reinterpreting int32 delta as uint32 bits for serialization
 		deltaData = append(deltaData, tmp[:]...)
 	}
 
@@ -264,12 +273,18 @@ func encodeDeltaDictionaryKind(
 
 	buf := make([]byte, 0, 3+4+len(compressedDict)+4+4+len(rleData)+4+len(compressedDelta))
 	buf = append(buf, shared.ColumnEncodingVersion, kind, indexWidth)
-	buf = appendUint32LE(buf, uint32(len(compressedDict))) //nolint:gosec // safe: dict size bounded by MaxDictionarySize
+	buf = appendUint32LE(
+		buf,
+		uint32(len(compressedDict)),
+	) //nolint:gosec // safe: dict size bounded by MaxDictionarySize
 	buf = append(buf, compressedDict...)
 	buf = appendUint32LE(buf, uint32(nRows))        //nolint:gosec // safe: nRows bounded by MaxBlockSpans (65535)
 	buf = appendUint32LE(buf, uint32(len(rleData))) //nolint:gosec // safe: rle data bounded by block size
 	buf = append(buf, rleData...)
-	buf = appendUint32LE(buf, uint32(len(compressedDelta))) //nolint:gosec // safe: compressed data bounded by block size
+	buf = appendUint32LE(
+		buf,
+		uint32(len(compressedDelta)),
+	) //nolint:gosec // safe: compressed data bounded by block size
 	buf = append(buf, compressedDelta...)
 
 	return buf, nil
@@ -552,7 +567,10 @@ func encodeInt64DictPayload(entries []int64) []byte {
 
 	for _, e := range entries {
 		var tmp [8]byte
-		binary.LittleEndian.PutUint64(tmp[:], uint64(e)) //nolint:gosec // safe: reinterpreting int64 bits as uint64 for serialization
+		binary.LittleEndian.PutUint64(
+			tmp[:],
+			uint64(e),
+		) //nolint:gosec // safe: reinterpreting int64 bits as uint64 for serialization
 		buf = append(buf, tmp[:]...)
 	}
 

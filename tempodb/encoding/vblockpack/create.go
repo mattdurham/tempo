@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/grafana/tempo/tempodb/backend"
@@ -17,22 +18,11 @@ import (
 func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.BlockMeta,
 	i common.Iterator, r backend.Reader, to backend.Writer) (*backend.BlockMeta, error) {
 
-	// Create blockpack writer with configured block size
-	// Default to 2000 spans per block, but use cfg.RowGroupSizeBytes as hint
-	maxSpans := 2000
-	if cfg.RowGroupSizeBytes > 0 {
-		// Rough estimate: 1KB per span average
-		maxSpans = cfg.RowGroupSizeBytes / 1024
-		if maxSpans < 100 {
-			maxSpans = 100
-		}
-		if maxSpans > 10000 {
-			maxSpans = 10000
-		}
-	}
+	// Initialize disk cache on first block creation (no-op if already initialized).
+	ConfigureFileCache(cfg.Blockpack.FileCachePath, cfg.Blockpack.FileCacheMaxBytes)
 
 	var buf bytes.Buffer
-	writer, err := blockpack.NewWriter(&buf, maxSpans)
+	writer, err := blockpack.NewWriter(&buf, cfg.Blockpack.MaxSpansPerBlock)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create blockpack writer: %w", err)
 	}
@@ -71,9 +61,15 @@ func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.Blo
 	}
 	data := buf.Bytes()
 
-	// Update metadata with actual stats
+	// Update metadata with actual stats.
+	// TotalRecords is set by setBlockTimeRange below to the internal block count,
+	// allowing the frontend sharder to split this file into sub-file jobs.
 	meta.TotalObjects = int64(traceCount)
 	meta.Size_ = uint64(len(data))
+
+	// Populate StartTime/EndTime from actual span timestamps in the blockpack file.
+	// This allows Tempo's block selector to skip blocks outside the query time range.
+	setBlockTimeRange(meta, data)
 
 	// Write blockpack file to backend storage
 	blockUUID := uuid.UUID(meta.BlockID)
@@ -87,4 +83,36 @@ func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.Blo
 	}
 
 	return meta, nil
+}
+
+// setBlockTimeRange populates meta.StartTime and meta.EndTime from the actual
+// span timestamps in the blockpack data. This allows Tempo's block selector to
+// skip blocks outside the query time range, reducing blocks scanned per query.
+// If the data cannot be parsed or contains no spans, StartTime/EndTime are unchanged.
+func setBlockTimeRange(meta *backend.BlockMeta, data []byte) {
+	r, err := blockpack.NewReaderFromProvider(&bytesReaderProvider{data: data})
+	if err != nil {
+		return
+	}
+	var minStart uint64 = ^uint64(0)
+	var maxEnd uint64
+	for i := range r.BlockCount() {
+		bm := r.BlockMeta(i)
+		if bm.MinStart < minStart {
+			minStart = bm.MinStart
+		}
+		if bm.MaxStart > maxEnd {
+			maxEnd = bm.MaxStart
+		}
+	}
+	if r.BlockCount() > 0 && minStart != ^uint64(0) {
+		meta.StartTime = time.Unix(0, int64(minStart))
+		meta.EndTime = time.Unix(0, int64(maxEnd))
+	}
+	// TotalRecords = internal block count. The frontend sharder uses this to split
+	// a single blockpack file into multiple sub-file jobs, each scanning a subset
+	// of internal blocks. Must be >= 1 or the sharder skips the block entirely.
+	if bc := r.BlockCount(); bc > 0 {
+		meta.TotalRecords = uint32(bc)
+	}
 }

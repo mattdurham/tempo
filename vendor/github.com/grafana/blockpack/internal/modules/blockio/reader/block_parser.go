@@ -103,19 +103,26 @@ func parseColumnMetadataArray(data []byte, offset int, colCount int) ([]colMetaE
 // parseBlockColumnsReuse decodes rawBytes into a Block.
 // wantColumns: if non-nil, only decode columns in this set.
 // prevBlock: if non-nil and same column set, reuse Column allocations.
+// intern is the caller's per-reader string intern table; if nil a new map is used.
 func parseBlockColumnsReuse(
 	rawBytes []byte,
-	version uint8,
 	wantColumns map[string]struct{},
 	prevBlock *Block,
 	meta shared.BlockMeta,
+	intern map[string]string,
 ) (*Block, error) {
+	// Acquire a scratch buffer for zstd decompression and bundle with the intern map.
+	// The scratch is returned to the pool on exit; intern outlives this call.
+	scratch := acquireDecompScratch()
+	defer releaseDecompScratch(scratch)
+	if intern == nil {
+		intern = make(map[string]string)
+	}
+	ctx := &decodeCtx{scratch: scratch, intern: intern}
 	hdr, err := parseBlockHeader(rawBytes)
 	if err != nil {
 		return nil, fmt.Errorf("parseBlock: %w", err)
 	}
-
-	_ = version
 
 	spanCount := int(hdr.spanCount)
 	colCount := int(hdr.columnCount)
@@ -125,7 +132,7 @@ func parseBlockColumnsReuse(
 		return nil, fmt.Errorf("parseBlock: column metadata: %w", err)
 	}
 
-	var columns map[string]*Column
+	var columns map[shared.ColumnKey]*Column
 	if prevBlock != nil && prevBlock.columns != nil {
 		columns = prevBlock.columns
 		// Clear values from existing columns; we will re-populate.
@@ -133,7 +140,7 @@ func parseBlockColumnsReuse(
 			resetColumn(col)
 		}
 	} else {
-		columns = make(map[string]*Column, colCount)
+		columns = make(map[shared.ColumnKey]*Column, colCount)
 	}
 
 	for _, m := range metas {
@@ -159,8 +166,9 @@ func parseBlockColumnsReuse(
 
 		colData := rawBytes[start:end]
 
+		key := shared.ColumnKey{Name: m.name, Type: m.colType}
 		var col *Column
-		if existing, ok := columns[m.name]; ok {
+		if existing, ok := columns[key]; ok {
 			col = existing
 		} else {
 			col = &Column{}
@@ -169,7 +177,7 @@ func parseBlockColumnsReuse(
 		col.Name = m.name
 		col.Type = m.colType
 
-		decoded, err := readColumnEncoding(colData, spanCount, m.colType)
+		decoded, err := readColumnEncoding(colData, spanCount, m.colType, ctx)
 		if err != nil {
 			return nil, fmt.Errorf("parseBlock: col %q: %w", m.name, err)
 		}
@@ -191,14 +199,59 @@ func parseBlockColumnsReuse(
 		col.Present = decoded.Present
 		col.SpanCount = decoded.SpanCount
 
-		columns[m.name] = col
+		columns[key] = col
+	}
+
+	// NOTE-001: Lazy registration — when wantColumns is non-nil, eagerly-skipped columns
+	// are registered with a rawEncoding sub-slice into rawBytes and NO immediate decode.
+	// Presence is decoded on the first IsPresent() call (NOTE-002: lazy presence).
+	// Full value decode is deferred to the first value accessor call (decodeNow).
+	//
+	// NOTE-002: Arena-like pre-allocation — one []Column slice sized to len(metas)
+	// replaces N individual *Column heap allocations. Pointers into the slice are stable
+	// because capacity is fixed upfront and append never reallocates.
+	var lazyStore []Column
+	if wantColumns != nil {
+		lazyStore = make([]Column, 0, len(metas))
+		for _, m := range metas {
+			if _, wanted := wantColumns[m.name]; wanted {
+				continue // already eagerly decoded
+			}
+
+			if m.dataLen == 0 {
+				continue // trace-level column, no data
+			}
+
+			key := shared.ColumnKey{Name: m.name, Type: m.colType}
+			if _, exists := columns[key]; exists {
+				continue // already registered (shouldn't happen, but guard)
+			}
+
+			start := int(m.dataOffset)    //nolint:gosec
+			end := start + int(m.dataLen) //nolint:gosec
+			if start < 0 || end > len(rawBytes) {
+				continue // skip unreadable columns silently
+			}
+
+			lazyStore = append(lazyStore, Column{
+				Name:        m.name,
+				Type:        m.colType,
+				SpanCount:   spanCount,
+				rawEncoding: rawBytes[start:end],
+				internMap:   intern,
+			})
+			// Safe: cap was set to len(metas) and we append ≤ len(metas) items, so no realloc.
+			columns[key] = &lazyStore[len(lazyStore)-1]
+		}
 	}
 
 	blk := &Block{
-		spanCount: spanCount,
-		columns:   columns,
-		meta:      meta,
+		spanCount:       spanCount,
+		columns:         columns,
+		lazyColumnStore: lazyStore,
+		meta:            meta,
 	}
+	blk.buildNameIndex()
 
 	return blk, nil
 }
@@ -219,4 +272,7 @@ func resetColumn(col *Column) {
 	col.BytesIdx = col.BytesIdx[:0]
 	col.BytesInline = nil
 	col.Present = nil
+	// NOTE-001: clear lazy decode fields so reused columns don't carry stale state.
+	col.rawEncoding = nil
+	col.internMap = nil
 }

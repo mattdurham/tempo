@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	commonv1 "go.opentelemetry.io/proto/otlp/common/v1"
+	logsv1 "go.opentelemetry.io/proto/otlp/logs/v1"
 	resourcev1 "go.opentelemetry.io/proto/otlp/resource/v1"
 	tracev1 "go.opentelemetry.io/proto/otlp/trace/v1"
 )
@@ -121,6 +122,111 @@ func NormalizeTracesForBlockpack(traces []*tracev1.TracesData) ([]*tracev1.Trace
 	}
 
 	return normalized, nil
+}
+
+// NormalizeLogsForBlockpack coerces mixed attribute types to a consistent type per key.
+// Mirrors NormalizeTracesForBlockpack for the LogsData hierarchy.
+func NormalizeLogsForBlockpack(logs []*logsv1.LogsData) ([]*logsv1.LogsData, error) {
+	kinds := collectLogAttributeKinds(logs)
+	normalized := make([]*logsv1.LogsData, len(logs))
+
+	for i, ld := range logs {
+		resourceLogs := make([]*logsv1.ResourceLogs, len(ld.ResourceLogs))
+		for rIdx, rl := range ld.ResourceLogs {
+			if rl == nil {
+				continue
+			}
+			resource := &resourcev1.Resource{
+				Attributes:             normalizeAttributes(rl.GetResource().GetAttributes(), "resource.", kinds),
+				DroppedAttributesCount: rl.GetResource().GetDroppedAttributesCount(),
+			}
+			scopeLogs := make([]*logsv1.ScopeLogs, len(rl.GetScopeLogs()))
+			for sIdx, sl := range rl.GetScopeLogs() {
+				if sl == nil {
+					continue
+				}
+				scope := sl.GetScope()
+				var normalizedScope *commonv1.InstrumentationScope
+				if scope != nil {
+					normalizedScope = &commonv1.InstrumentationScope{
+						Name:                   scope.GetName(),
+						Version:                scope.GetVersion(),
+						Attributes:             normalizeAttributes(scope.GetAttributes(), "scope.", kinds),
+						DroppedAttributesCount: scope.GetDroppedAttributesCount(),
+					}
+				}
+				logRecords := make([]*logsv1.LogRecord, len(sl.LogRecords))
+				for lIdx, record := range sl.LogRecords {
+					if record == nil {
+						continue
+					}
+					logRecords[lIdx] = &logsv1.LogRecord{
+						TimeUnixNano:           record.TimeUnixNano,
+						ObservedTimeUnixNano:   record.ObservedTimeUnixNano,
+						SeverityNumber:         record.SeverityNumber,
+						SeverityText:           record.SeverityText,
+						Body:                   record.Body,
+						Attributes:             normalizeAttributes(record.Attributes, "log.", kinds),
+						DroppedAttributesCount: record.DroppedAttributesCount,
+						Flags:                  record.Flags,
+						TraceId:                record.TraceId,
+						SpanId:                 record.SpanId,
+					}
+				}
+				scopeLogs[sIdx] = &logsv1.ScopeLogs{
+					Scope:      normalizedScope,
+					SchemaUrl:  sl.SchemaUrl,
+					LogRecords: logRecords,
+				}
+			}
+			resourceLogs[rIdx] = &logsv1.ResourceLogs{
+				Resource:  resource,
+				SchemaUrl: rl.SchemaUrl,
+				ScopeLogs: scopeLogs,
+			}
+		}
+		normalized[i] = &logsv1.LogsData{ResourceLogs: resourceLogs}
+	}
+
+	return normalized, nil
+}
+
+// collectLogAttributeKinds scans a LogsData slice to detect per-key type consistency.
+// Uses "resource.", "scope.", and "log." prefixes to namespace attribute keys.
+func collectLogAttributeKinds(logs []*logsv1.LogsData) map[string]valueKind {
+	kinds := make(map[string]valueKind)
+	for _, ld := range logs {
+		for _, rl := range ld.GetResourceLogs() {
+			if rl == nil {
+				continue
+			}
+			for _, attr := range rl.GetResource().GetAttributes() {
+				key := "resource." + attr.Key
+				kinds[key] = mergeKind(kinds[key], kindFromAnyValue(attr.Value))
+			}
+			for _, sl := range rl.GetScopeLogs() {
+				if sl == nil {
+					continue
+				}
+				if scope := sl.GetScope(); scope != nil {
+					for _, attr := range scope.GetAttributes() {
+						key := "scope." + attr.Key
+						kinds[key] = mergeKind(kinds[key], kindFromAnyValue(attr.Value))
+					}
+				}
+				for _, record := range sl.GetLogRecords() {
+					if record == nil {
+						continue
+					}
+					for _, attr := range record.GetAttributes() {
+						key := "log." + attr.Key
+						kinds[key] = mergeKind(kinds[key], kindFromAnyValue(attr.Value))
+					}
+				}
+			}
+		}
+	}
+	return kinds
 }
 
 func collectAttributeKinds(traces []*tracev1.TracesData) map[string]valueKind {

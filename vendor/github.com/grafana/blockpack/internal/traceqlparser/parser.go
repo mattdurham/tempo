@@ -84,9 +84,16 @@ func hasStructuralOperator(query string) bool {
 		} else if braceDepth == 0 && parenDepth == 0 {
 			// We're outside braces and parens, check for structural operators
 			// Check for two-character operators first
+			// Check for three-character operators first: !>>
+			if i+2 < len(query) {
+				threeChar := query[i : i+3]
+				if threeChar == opStrNotDescendant {
+					return true
+				}
+			}
 			if i+1 < len(query) {
 				twoChar := query[i : i+2]
-				if twoChar == ">>" || twoChar == "<<" || twoChar == "!~" {
+				if twoChar == ">>" || twoChar == "<<" || twoChar == "!~" || twoChar == "!>" {
 					return true
 				}
 			}
@@ -140,10 +147,17 @@ func findStructuralOperator(query string) (int, string) {
 		} else if ch == ')' {
 			parenDepth--
 		} else if braceDepth == 0 && parenDepth == 0 {
-			// Check for two-character operators first
+			// Check for three-character operators first: !>>
+			if i+2 < len(query) {
+				threeChar := query[i : i+3]
+				if threeChar == opStrNotDescendant {
+					return i, threeChar
+				}
+			}
+			// Check for two-character operators
 			if i+1 < len(query) {
 				twoChar := query[i : i+2]
-				if twoChar == ">>" || twoChar == "<<" || twoChar == "!~" {
+				if twoChar == ">>" || twoChar == "<<" || twoChar == "!~" || twoChar == "!>" {
 					return i, twoChar
 				}
 			}
@@ -226,6 +240,10 @@ func parseStructuralQuery(query string) (*StructuralQuery, error) {
 		op = OpParent
 	case "!~":
 		op = OpNotSibling
+	case opStrNotDescendant:
+		op = OpNotDescendant
+	case opStrNotChild:
+		op = OpNotChild
 	default:
 		return nil, fmt.Errorf("unknown structural operator: %s", opStr)
 	}
@@ -319,47 +337,237 @@ func findPipeOutsideBraces(query string) int {
 	return -1
 }
 
-// parsePipeline parses a pipeline operation: aggregate() by (fields)
+// parsePipeline parses a pipeline expression which may contain multiple stages
+// separated by | operators. Examples:
+//   - count() > 2
+//   - avg(duration) > 5ms
+//   - count() > 3 | by(resource.service.name)
+//   - select(span.http.method)
+//   - by(resource.service.name)
 func parsePipeline(input string) (*PipelineStage, error) {
 	input = strings.TrimSpace(input)
 	if input == "" {
 		return nil, fmt.Errorf("empty pipeline")
 	}
 
-	// Parse aggregate function (everything before "by")
-	// Split on " by " to separate aggregate from GROUP BY clause
-	byIndex := findByClause(input)
+	// Split on | to handle multi-stage pipelines (e.g., "count() > 3 | by(svc)")
+	stages := splitPipelineStages(input)
+	result := &PipelineStage{}
 
-	var aggregatePart string
-	var byPart string
+	for _, stage := range stages {
+		stage = strings.TrimSpace(stage)
+		if stage == "" {
+			continue
+		}
 
-	if byIndex != -1 {
-		aggregatePart = strings.TrimSpace(input[:byIndex])
-		byPart = strings.TrimSpace(input[byIndex+3:]) // +3 to skip " by"
-	} else {
-		aggregatePart = input
-		byPart = ""
-	}
+		// Check if this stage is a by() clause
+		if strings.HasPrefix(stage, "by(") || strings.HasPrefix(stage, "by (") {
+			byFields, err := parseByClause(stage[2:]) // skip "by"
+			if err != nil {
+				return nil, err
+			}
+			result.By = byFields
+			continue
+		}
 
-	// Parse the aggregate function
-	agg, err := parseAggregateFunc(aggregatePart)
-	if err != nil {
-		return nil, err
-	}
+		// Check if this stage is a select() clause
+		if strings.HasPrefix(stage, "select(") || strings.HasPrefix(stage, "select (") {
+			selectPart := stage[6:] // skip "select"
+			selectPart = strings.TrimSpace(selectPart)
+			if !strings.HasPrefix(selectPart, "(") || !strings.HasSuffix(selectPart, ")") {
+				return nil, fmt.Errorf("select clause must have parentheses: %s", stage)
+			}
+			content := strings.TrimSpace(selectPart[1 : len(selectPart)-1])
+			for _, f := range strings.Split(content, ",") {
+				f = strings.TrimSpace(f)
+				if f != "" {
+					result.Select = append(result.Select, f)
+				}
+			}
+			continue
+		}
 
-	// Parse the by clause if present
-	var byFields []string
-	if byPart != "" {
-		byFields, err = parseByClause(byPart)
+		// Otherwise, parse as aggregate with optional threshold: "count() > 2"
+		// Also handle inline by-clause: "count_over_time() by (svc)"
+		// First check for inline by clause before splitting threshold.
+		inlineBy := findByClause(stage)
+		var byPart string
+		aggStage := stage
+		if inlineBy != -1 {
+			byPart = strings.TrimSpace(stage[inlineBy+3:]) // skip " by"
+			aggStage = strings.TrimSpace(stage[:inlineBy])
+		}
+
+		aggStr, thresholdOp, thresholdVal, hasThreshold, err := splitAggregateThreshold(aggStage)
 		if err != nil {
 			return nil, err
 		}
+		agg, err := parseAggregateFunc(aggStr)
+		if err != nil {
+			return nil, err
+		}
+		if result.Aggregate.Name != "" {
+			return nil, fmt.Errorf("pipeline has multiple aggregate stages; only one is allowed")
+		}
+		result.Aggregate = agg
+		if hasThreshold {
+			result.HasThreshold = true
+			result.ThresholdOp = thresholdOp
+			result.ThresholdVal = thresholdVal
+		}
+		if byPart != "" {
+			byFields, byErr := parseByClause(byPart)
+			if byErr != nil {
+				return nil, byErr
+			}
+			result.By = byFields
+		}
 	}
 
-	return &PipelineStage{
-		Aggregate: agg,
-		By:        byFields,
-	}, nil
+	return result, nil
+}
+
+// splitPipelineStages splits a pipeline string on | operators outside parentheses.
+func splitPipelineStages(input string) []string {
+	var stages []string
+	parenDepth := 0
+	start := 0
+	for i := 0; i < len(input); i++ {
+		switch input[i] {
+		case '(':
+			parenDepth++
+		case ')':
+			parenDepth--
+		case '|':
+			if parenDepth == 0 {
+				// Check for || (logical OR) — skip
+				if i+1 < len(input) && input[i+1] == '|' {
+					i++
+					continue
+				}
+				stages = append(stages, input[start:i])
+				start = i + 1
+			}
+		}
+	}
+	stages = append(stages, input[start:])
+	return stages
+}
+
+// splitAggregateThreshold splits "count() > 2" into ("count()", OpGt, 2, true, nil).
+// Also handles inline by-clause: expressions like "count_over_time() by (svc)" are returned
+// unchanged with hasThreshold=false so the caller can handle the by-clause separately.
+// If no threshold is present, returns the input as-is with hasThreshold=false.
+func splitAggregateThreshold(
+	input string,
+) (aggPart string, op BinaryOp, val interface{}, hasThreshold bool, err error) {
+	// Find the closing paren of the function call, then look for a comparison operator after it.
+	closeParen := -1
+	parenDepth := 0
+	for i := 0; i < len(input); i++ {
+		switch input[i] {
+		case '(':
+			parenDepth++
+		case ')':
+			parenDepth--
+			if parenDepth == 0 && closeParen == -1 {
+				closeParen = i
+			}
+		}
+	}
+	if closeParen == -1 {
+		return input, 0, nil, false, nil
+	}
+
+	rest := strings.TrimSpace(input[closeParen+1:])
+	if rest == "" {
+		return input[:closeParen+1], 0, nil, false, nil
+	}
+
+	// Check for inline "by (...)" after the aggregate (no threshold).
+	if strings.HasPrefix(rest, "by ") || strings.HasPrefix(rest, "by(") {
+		// Return just the aggregate part; the caller will re-parse with the by clause.
+		return input, 0, nil, false, nil
+	}
+
+	// Parse comparison operator
+	var opStr string
+	for _, candidate := range []string{">=", "<=", "!=", ">", "<", "="} {
+		if strings.HasPrefix(rest, candidate) {
+			opStr = candidate
+			break
+		}
+	}
+	if opStr == "" {
+		return "", 0, nil, false, fmt.Errorf(
+			"expected comparison operator after %s, got: %s",
+			input[:closeParen+1],
+			rest,
+		)
+	}
+
+	var thresholdOp BinaryOp
+	switch opStr {
+	case ">":
+		thresholdOp = OpGt
+	case ">=":
+		thresholdOp = OpGte
+	case "<":
+		thresholdOp = OpLt
+	case "<=":
+		thresholdOp = OpLte
+	case "=":
+		thresholdOp = OpEq
+	case "!=":
+		thresholdOp = OpNeq
+	}
+
+	valStr := strings.TrimSpace(rest[len(opStr):])
+	// Parse value — could be int, float, or duration
+	thresholdVal, parseErr := parseThresholdValue(valStr)
+	if parseErr != nil {
+		return "", 0, nil, false, fmt.Errorf("invalid threshold value %q: %w", valStr, parseErr)
+	}
+
+	return input[:closeParen+1], thresholdOp, thresholdVal, true, nil
+}
+
+// parseThresholdValue parses a threshold value as int, duration, or float.
+func parseThresholdValue(s string) (interface{}, error) {
+	s = strings.TrimSpace(s)
+
+	// Try duration first (e.g., "5ms", "100us", "1s")
+	for _, suffix := range []struct {
+		unit  string
+		nanos int64
+	}{
+		{"ns", 1},
+		{"us", 1000},
+		{"µs", 1000},
+		{"ms", 1000000},
+		{"s", 1000000000},
+		{"m", 60 * 1000000000},
+		{"h", 3600 * 1000000000},
+	} {
+		if strings.HasSuffix(s, suffix.unit) {
+			numStr := strings.TrimSpace(s[:len(s)-len(suffix.unit)])
+			n, err := strconv.ParseInt(numStr, 10, 64)
+			if err != nil {
+				return nil, err
+			}
+			return n * suffix.nanos, nil
+		}
+	}
+
+	// Try integer
+	if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return n, nil
+	}
+	// Try float
+	if f, err := strconv.ParseFloat(s, 64); err == nil {
+		return f, nil
+	}
+	return nil, fmt.Errorf("cannot parse %q as number or duration", s)
 }
 
 // findByClause finds the position of " by " in the input that's not inside parentheses
@@ -417,7 +625,7 @@ func parseAggregateFunc(input string) (AggregateFunc, error) {
 
 	// Parse based on function name
 	switch funcName {
-	case "rate", "count_over_time":
+	case "rate", "count_over_time", "count":
 		// No arguments expected
 		if argsStr != "" {
 			return AggregateFunc{}, fmt.Errorf("%s() takes no arguments", funcName)
@@ -451,7 +659,10 @@ func parseAggregateFunc(input string) (AggregateFunc, error) {
 		// Split on comma
 		args := strings.Split(argsStr, ",")
 		if len(args) < 2 {
-			return AggregateFunc{}, fmt.Errorf("quantile_over_time() requires at least 2 arguments (field, quantile), got %d", len(args))
+			return AggregateFunc{}, fmt.Errorf(
+				"quantile_over_time() requires at least 2 arguments (field, quantile), got %d",
+				len(args),
+			)
 		}
 		field := strings.TrimSpace(args[0])
 		quantileStr := strings.TrimSpace(args[1])
@@ -531,17 +742,14 @@ type StructuralQuery struct {
 	Op    StructuralOp      // The structural operator (>>, >, ~, <<, <, !~)
 }
 
-// Validate checks if the structural query is well-formed
-func (sq *StructuralQuery) Validate() error {
-	// Note: It's valid to have both sides be nil (e.g., {} >> {} is valid)
-	// It's also valid to have one side be nil (e.g., {} >> { .foo } is valid)
-	return nil
-}
-
 // PipelineStage represents a pipeline operation
 type PipelineStage struct {
-	Aggregate AggregateFunc // The aggregate function
-	By        []string      // GROUP BY fields
+	ThresholdVal interface{}
+	Aggregate    AggregateFunc
+	By           []string
+	Select       []string
+	ThresholdOp  BinaryOp
+	HasThreshold bool
 }
 
 // AggregateFunc represents a TraceQL aggregate function
@@ -594,6 +802,12 @@ const (
 // StructuralOp represents structural query operators.
 type StructuralOp int
 
+// Structural operator string literals used during parsing.
+const (
+	opStrNotDescendant = "!>>"
+	opStrNotChild      = "!>"
+)
+
 const (
 	// OpDescendant is the descendant operator (>>).
 	OpDescendant StructuralOp = iota
@@ -607,6 +821,10 @@ const (
 	OpParent
 	// OpNotSibling is the not sibling operator (!~).
 	OpNotSibling
+	// OpNotDescendant is the negated descendant operator (!>>).
+	OpNotDescendant
+	// OpNotChild is the negated child operator (!>).
+	OpNotChild
 )
 
 func (op BinaryOp) String() string {
@@ -650,6 +868,10 @@ func (op StructuralOp) String() string {
 		return "<"
 	case OpNotSibling:
 		return "!~"
+	case OpNotDescendant:
+		return opStrNotDescendant
+	case OpNotChild:
+		return opStrNotChild
 	default:
 		return "UNKNOWN"
 	}
@@ -973,11 +1195,11 @@ func (p *parser) parseFieldPath(path string) (*FieldExpr, error) {
 		// Validate scope
 		validScopes := map[string]bool{
 			"span": true, "resource": true, "event": true, "link": true,
-			"instrumentation": true, "trace": true,
+			"instrumentation": true, "trace": true, "log": true,
 		}
 		if !validScopes[scope] {
 			return nil, fmt.Errorf(
-				"invalid scope: %s (must be span, resource, event, link, instrumentation, or trace)",
+				"invalid scope: %s (must be span, resource, event, link, instrumentation, trace, or log)",
 				scope,
 			)
 		}

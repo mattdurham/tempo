@@ -232,9 +232,14 @@ func (w *walBlock) SearchTagValuesV2(ctx context.Context, tag traceql.Attribute,
 	return nil
 }
 
-// Fetch implements the Searcher interface
-func (w *walBlock) Fetch(ctx context.Context, req traceql.FetchSpansRequest, opts common.SearchOptions) (traceql.FetchSpansResponse, error) {
-	return traceql.FetchSpansResponse{}, nil
+// Fetch implements the Searcher interface.
+// Returns an empty (but non-nil) iterator — walBlock does not support in-memory search.
+// A nil Results field causes a panic in traceql.Engine.ExecuteSearch.
+func (w *walBlock) Fetch(_ context.Context, _ traceql.FetchSpansRequest, _ common.SearchOptions) (traceql.FetchSpansResponse, error) {
+	return traceql.FetchSpansResponse{
+		Results: &sliceSpansetIterator{},
+		Bytes:   func() uint64 { return 0 },
+	}, nil
 }
 
 // FetchTagValues implements the Searcher interface
@@ -270,15 +275,16 @@ func newBlockpackIterator(reader *blockpack.Reader) (*blockpackIterator, error) 
 	byTrace := make(map[string][]blockpack.SpanMatch)
 	var traceOrder []string
 
-	err := blockpack.StreamTraceQL(reader, "{}", blockpack.QueryOptions{}, func(match *blockpack.SpanMatch) bool {
+	allMatches, err := blockpack.QueryTraceQL(reader, "{}", blockpack.QueryOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to query spans: %w", err)
+	}
+	for i := range allMatches {
+		match := &allMatches[i]
 		if _, exists := byTrace[match.TraceID]; !exists {
 			traceOrder = append(traceOrder, match.TraceID)
 		}
-		byTrace[match.TraceID] = append(byTrace[match.TraceID], match.Clone())
-		return true
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to stream spans: %w", err)
+		byTrace[match.TraceID] = append(byTrace[match.TraceID], *match)
 	}
 
 	traces := make([]blockpackTrace, 0, len(byTrace))

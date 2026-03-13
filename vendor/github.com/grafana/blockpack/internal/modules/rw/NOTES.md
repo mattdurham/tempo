@@ -100,6 +100,15 @@ add overhead with no benefit in this lifetime-bounded use case.
 different files or after the underlying storage has changed. Cache invalidation is not
 supported; create a new provider instance instead.
 
+**Known Limitation — Unbounded Memory Growth:** The `cache` slice grows without bound
+as new ranges are read. There is no size limit, LRU eviction, or TTL. In long-lived
+or reused provider instances, this will exhaust memory proportional to total bytes
+read. This is intentional for the expected per-file lifecycle, but operators must
+ensure `RangeCachingProvider` instances are discarded promptly after the file is
+no longer needed. The godoc on `RangeCachingProvider` carries a warning to this effect.
+
+Back-ref: `internal/modules/rw/caching.go:RangeCachingProvider`
+
 ---
 
 ## 6. Short-Read Guard in RangeCachingProvider
@@ -129,3 +138,94 @@ surface as `io.ErrUnexpectedEOF` at the caching layer. All production providers
 (`os.File` via `storageReaderProvider`) already satisfy the full-read contract.
 Test doubles that deliberately return short reads must account for this; see
 `shortReadProvider` and RW-T-05 in `provider_test.go`.
+
+---
+
+## 7. Why DataType Changed from string to uint8
+*Added: 2026-03-04*
+
+**Decision:** `DataType` was changed from `type DataType string` to `type DataType uint8`
+with iota-assigned constants. This is a **breaking change** — callers that used string
+literals (e.g. `DataType("footer")`) must migrate to the typed constants.
+
+**Rationale:** The string representation was used for human-readable debugging, but it
+provided no correctness benefit. The `uint8` representation:
+- Enables exhaustive switch statements and compile-time checks for unknown values.
+- Allows `dataTypeTier()` to be a simple switch with a zero-allocation fast path.
+- Makes it impossible to construct an arbitrary string and accidentally pass it as a
+  valid DataType — the type system now enforces use of declared constants.
+- Is more compact in memory when stored in structs or passed on the stack.
+
+**Removed constants:**
+- `DataTypeIndex` — was defined but never used in any `ReadAt` call.
+- `DataTypeCompact` — renamed to `DataTypeTraceBloomFilter` for clarity; the compact
+  trace index section contains both the trace-ID bloom filter and the hash map.
+
+**New constants:**
+- `DataTypeUnknown` (iota 0) — the zero value; treated as lowest priority.
+- `DataTypeTraceBloomFilter` — replaces `DataTypeCompact`.
+- `DataTypeTimestampIndex` — for per-file timestamp index reads.
+
+Back-ref: `internal/modules/rw/provider.go:DataType`
+
+---
+
+## 8. SharedLRUCache — Priority-Tiered Eviction Design
+*Added: 2026-03-04*
+
+**Decision:** `SharedLRUCache` uses four independent `container/list` LRU queues
+(one per priority tier) rather than a single LRU or a size-weighted heap.
+
+**Rationale:** The blockpack read path issues reads with very different re-use
+profiles: footer/header reads happen once per file open and are tiny (< 1 KB);
+bloom filter and timestamp index reads happen once per query and are small (< 100 KB);
+block reads happen many times per query and are large (10 KB – 10 MB). A single
+unified LRU would evict footers under block read pressure even though footers are
+the cheapest possible cache hits (saves the most I/O per byte cached). Tiered
+eviction ensures that the most cost-effective data (footers, bloom filters) survives
+cache pressure from the cheapest-to-re-read data (blocks).
+
+**Why four tiers not two:** Three meaningful priority gaps exist:
+1. Footer/Header — critical for opening any file, always tiny.
+2. Metadata/TraceBloomFilter — critical for query pruning, small.
+3. TimestampIndex — useful for time-range pruning, medium.
+4. Block — large, re-readable from storage with predictable cost.
+
+**Why `container/list` not a custom heap:** The eviction pattern is always
+"evict LRU from tier N before tier N-1". A doubly-linked list per tier gives
+O(1) append (MRU push to back), O(1) eviction (pop from front), and O(1)
+promotion (MoveToBack). A heap would add O(log n) cost for no benefit.
+
+**Cache key design:** Keys are `(readerID string, offset int64, length int32)`.
+Length is included because the same offset can be read with different lengths
+(e.g. footer is 22 bytes; a block at the same offset would be larger).
+Sub-range serving (as in `RangeCachingProvider`) is intentionally not implemented:
+`SharedLRUCache` targets exact-match reuse across readers, not sub-range reuse
+within a single reader's read sequence.
+
+**TOCTOU note:** `SharedLRUCache.Put` checks for key existence under the mutex,
+so duplicate entries cannot accumulate (unlike `RangeCachingProvider`).
+
+Back-ref: `internal/modules/rw/lru.go:SharedLRUCache`
+
+---
+
+## NOTE-009: Disk-Backed Caches Removed (ObjectCache and DiskCache)
+*Added: 2026-03-05*
+
+**Decision:** `ObjectCache` (bbolt-backed, string-keyed, async writes) and `DiskCache` /
+`DiskLRUProvider` (bbolt-backed, offset-keyed, synchronous writes) were removed entirely.
+
+**Rationale:** Benchmarking showed both implementations hurt rather than helped performance
+due to excessive allocations:
+- `ObjectCache.Put` made 2 full-block copies (a `dataCopy` slice + the encode buffer);
+  `Get` made 1 additional copy from the bbolt mmap — 3× the allocations of the no-cache path.
+- `DiskCache.Put` was synchronous (blocking `db.Update`), adding ~1–10 ms latency per write
+  on the hot query path and negating the supposed latency benefit for subsequent reads.
+
+The in-memory `RangeCachingProvider` and `SharedLRUProvider` remain. They avoid disk I/O
+entirely and do not suffer the allocation overhead.
+
+**Consequence:** All `readThroughCache` callsites in `blockio/reader` were replaced with
+direct `readRange` / `provider.ReadAt` calls. The `WithObjectCache` and `WithPath` reader
+options were removed. The `ReaderOption` type still exists for future extensibility.

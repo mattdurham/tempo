@@ -137,11 +137,26 @@ func appendUintLE(buf []byte, v uint64, width uint8) []byte {
 	case 2:
 		return append(buf, byte(v), byte(v>>8)) //nolint:gosec // safe: truncating to width bytes as designed
 	case 4:
-		return append(buf, byte(v), byte(v>>8), byte(v>>16), byte(v>>24)) //nolint:gosec // safe: truncating to width bytes as designed
+		return append(
+			buf,
+			byte(v),
+			byte(v>>8),
+			byte(v>>16),
+			byte(v>>24),
+		) //nolint:gosec // safe: truncating to width bytes as designed
 	default: // 8
-		return append(buf,
-			byte(v), byte(v>>8), byte(v>>16), byte(v>>24), //nolint:gosec // safe: truncating to width bytes as designed
-			byte(v>>32), byte(v>>40), byte(v>>48), byte(v>>56), //nolint:gosec // safe: truncating to width bytes as designed
+		return append(
+			buf,
+			byte(v),
+			byte(v>>8),
+			byte(v>>16),
+			byte(v>>24), //nolint:gosec // safe: truncating to width bytes as designed
+			byte(
+				v>>32,
+			),
+			byte(v>>40),
+			byte(v>>48),
+			byte(v>>56), //nolint:gosec // safe: truncating to width bytes as designed
 		)
 	}
 }

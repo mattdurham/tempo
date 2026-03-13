@@ -73,6 +73,7 @@ func newColumnBuilder(typ shared.ColumnType, colName string, initCap int) column
 	case shared.ColumnTypeString, shared.ColumnTypeRangeString:
 		return &stringColumnBuilder{
 			colName: colName,
+			typ:     typ,
 			values:  make([]string, 0, initCap),
 			present: make([]bool, 0, initCap),
 		}

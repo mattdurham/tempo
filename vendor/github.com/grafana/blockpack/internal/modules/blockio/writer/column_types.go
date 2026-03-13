@@ -9,9 +9,11 @@ import (
 // ---- stringColumnBuilder ----
 
 type stringColumnBuilder struct {
-	colName string
-	values  []string
-	present []bool
+	colName        string
+	values         []string
+	present        []bool
+	typ            shared.ColumnType // ColumnTypeString or ColumnTypeRangeString; preserved in colType()
+	detectedAsUUID bool              // set by buildData when all values are valid UUIDs
 }
 
 func (b *stringColumnBuilder) resetForReuse(colName string) {
@@ -20,6 +22,7 @@ func (b *stringColumnBuilder) resetForReuse(colName string) {
 	b.values = b.values[:0]
 	b.present = b.present[:0]
 	b.colName = colName
+	b.detectedAsUUID = false
 }
 
 func (b *stringColumnBuilder) prepare(nRows int) {
@@ -60,7 +63,12 @@ func (b *stringColumnBuilder) nullCount() int {
 	return n
 }
 
-func (b *stringColumnBuilder) colType() shared.ColumnType { return shared.ColumnTypeString }
+func (b *stringColumnBuilder) colType() shared.ColumnType {
+	if b.detectedAsUUID {
+		return shared.ColumnTypeUUID
+	}
+	return b.typ
+}
 
 func (b *stringColumnBuilder) buildData(enc *zstdEncoder) ([]byte, error) {
 	nRows := len(b.values)
@@ -88,6 +96,7 @@ func (b *stringColumnBuilder) buildData(enc *zstdEncoder) ([]byte, error) {
 			byteVals[i] = parsed[:]
 		}
 		if uuidOK {
+			b.detectedAsUUID = true
 			bb := &bytesColumnBuilder{
 				values:  byteVals,
 				present: b.present,

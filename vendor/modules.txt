@@ -123,6 +123,9 @@ github.com/AzureAD/microsoft-authentication-library-for-go/apps/internal/shared
 github.com/AzureAD/microsoft-authentication-library-for-go/apps/internal/version
 github.com/AzureAD/microsoft-authentication-library-for-go/apps/managedidentity
 github.com/AzureAD/microsoft-authentication-library-for-go/apps/public
+# github.com/FastFilter/xorfilter v0.5.1
+## explicit; go 1.22
+github.com/FastFilter/xorfilter
 # github.com/GoogleCloudPlatform/opentelemetry-operations-go/detectors/gcp v1.31.0
 ## explicit; go 1.24.0
 github.com/GoogleCloudPlatform/opentelemetry-operations-go/detectors/gcp
@@ -375,6 +378,21 @@ github.com/cncf/xds/go/xds/data/orca/v3
 github.com/cncf/xds/go/xds/service/orca/v3
 github.com/cncf/xds/go/xds/type/matcher/v3
 github.com/cncf/xds/go/xds/type/v3
+# github.com/coregx/ahocorasick v0.1.0
+## explicit; go 1.25.4
+github.com/coregx/ahocorasick
+# github.com/coregx/coregex v0.12.4
+## explicit; go 1.25.4
+github.com/coregx/coregex
+github.com/coregx/coregex/dfa/lazy
+github.com/coregx/coregex/dfa/onepass
+github.com/coregx/coregex/internal/conv
+github.com/coregx/coregex/internal/sparse
+github.com/coregx/coregex/literal
+github.com/coregx/coregex/meta
+github.com/coregx/coregex/nfa
+github.com/coregx/coregex/prefilter
+github.com/coregx/coregex/simd
 # github.com/coreos/go-semver v0.3.0
 ## explicit
 github.com/coreos/go-semver/semver
@@ -709,19 +727,22 @@ github.com/googleapis/gax-go/v2/iterator
 # github.com/gorilla/mux v1.8.1
 ## explicit; go 1.20
 github.com/gorilla/mux
-# github.com/grafana/blockpack v0.0.0-20260227234803-7f2958e70834 => /home/matt/source/blockpack
+# github.com/grafana/blockpack v0.0.0-20260308224815-c1a38b35d211 => /home/matt/source/blockpack-tempo-worktrees/feat/intrinsic-columns
 ## explicit; go 1.26.0
 github.com/grafana/blockpack
+github.com/grafana/blockpack/internal/logqlparser
 github.com/grafana/blockpack/internal/modules/blockio
 github.com/grafana/blockpack/internal/modules/blockio/compaction
 github.com/grafana/blockpack/internal/modules/blockio/reader
 github.com/grafana/blockpack/internal/modules/blockio/shared
 github.com/grafana/blockpack/internal/modules/blockio/writer
 github.com/grafana/blockpack/internal/modules/executor
+github.com/grafana/blockpack/internal/modules/filecache
 github.com/grafana/blockpack/internal/modules/queryplanner
 github.com/grafana/blockpack/internal/modules/rw
+github.com/grafana/blockpack/internal/modules/sketch
 github.com/grafana/blockpack/internal/otlpconvert
-github.com/grafana/blockpack/internal/quantile
+github.com/grafana/blockpack/internal/s3provider
 github.com/grafana/blockpack/internal/traceqlparser
 github.com/grafana/blockpack/internal/vm
 # github.com/grafana/dskit v0.0.0-20251031165806-a6f15387939b
@@ -980,7 +1001,7 @@ github.com/magefile/mage/sh
 github.com/mailru/easyjson/buffer
 github.com/mailru/easyjson/jlexer
 github.com/mailru/easyjson/jwriter
-# github.com/mark3labs/mcp-go v0.44.0
+# github.com/mark3labs/mcp-go v0.44.1
 ## explicit; go 1.23.0
 github.com/mark3labs/mcp-go/client
 github.com/mark3labs/mcp-go/client/transport
@@ -1231,7 +1252,7 @@ github.com/parquet-go/bitpack/unsafecast
 # github.com/parquet-go/jsonlite v1.0.0
 ## explicit; go 1.23
 github.com/parquet-go/jsonlite
-# github.com/parquet-go/parquet-go v0.27.0
+# github.com/parquet-go/parquet-go v0.28.0
 ## explicit; go 1.24.9
 github.com/parquet-go/parquet-go
 github.com/parquet-go/parquet-go/bloom
@@ -1502,10 +1523,6 @@ github.com/stretchr/testify/require
 github.com/subosito/gotenv
 # github.com/theory/jsonpath v0.10.2
 ## explicit; go 1.23
-github.com/theory/jsonpath
-github.com/theory/jsonpath/parser
-github.com/theory/jsonpath/registry
-github.com/theory/jsonpath/spec
 # github.com/tinylib/msgp v1.6.1
 ## explicit; go 1.24
 github.com/tinylib/msgp/msgp
@@ -1636,6 +1653,12 @@ github.com/yusufpapurcu/wmi
 # github.com/zeebo/xxh3 v1.1.0
 ## explicit; go 1.22
 github.com/zeebo/xxh3
+# go.etcd.io/bbolt v1.4.3
+## explicit; go 1.23
+go.etcd.io/bbolt
+go.etcd.io/bbolt/errors
+go.etcd.io/bbolt/internal/common
+go.etcd.io/bbolt/internal/freelist
 # go.etcd.io/etcd/api/v3 v3.5.12
 ## explicit; go 1.20
 go.etcd.io/etcd/api/v3/authpb
@@ -2229,6 +2252,7 @@ golang.org/x/oauth2/jwt
 ## explicit; go 1.24.0
 golang.org/x/sync/errgroup
 golang.org/x/sync/semaphore
+golang.org/x/sync/singleflight
 # golang.org/x/sys v0.41.0
 ## explicit; go 1.24.0
 golang.org/x/sys/cpu
@@ -2585,4 +2609,4 @@ k8s.io/utils/clock
 # k8s.io/api => k8s.io/api v0.35.1
 # k8s.io/client-go => k8s.io/client-go v0.35.1
 # github.com/hashicorp/memberlist => github.com/grafana/memberlist v0.3.1-0.20251024160842-5cd332c2849a
-# github.com/grafana/blockpack => /home/matt/source/blockpack
+# github.com/grafana/blockpack => /home/matt/source/blockpack-tempo-worktrees/feat/intrinsic-columns

@@ -26,7 +26,10 @@ func CompileTraceQLMetrics(query string, startTime, endTime int64) (*Program, *Q
 	// Type assert to MetricsQuery
 	metricsQuery, ok := result.(*traceqlparser.MetricsQuery)
 	if !ok {
-		return nil, nil, fmt.Errorf("expected MetricsQuery, got %T (use CompileTraceQLFilter for filter queries)", result)
+		return nil, nil, fmt.Errorf(
+			"expected MetricsQuery, got %T (use CompileTraceQLFilter for filter queries)",
+			result,
+		)
 	}
 
 	// Compile to QuerySpec for semantic matching
@@ -43,54 +46,11 @@ func CompileTraceQLMetrics(query string, startTime, endTime int64) (*Program, *Q
 		return nil, nil, fmt.Errorf("failed to compile to QuerySpec: %w", err)
 	}
 
-	// Compile to VM Program. Start with a match-all filter program, then attach the
-	// AggregationPlan built from the QuerySpec so StreamQuery takes the aggregation path.
+	// Compile to VM Program with a match-all filter program for row scanning.
 	program := compileMatchAllProgram()
 	program.Predicates = filterSpecToPredicates(spec.Filter)
-	aggPlan, err := buildAggregationPlan(spec.Aggregate)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to build aggregation plan: %w", err)
-	}
-	program.AggregationPlan = aggPlan
 
 	return program, spec, nil
-}
-
-// buildAggregationPlan converts an AggregateSpec to an AggregationPlan for the VM executor.
-func buildAggregationPlan(agg AggregateSpec) (*AggregationPlan, error) {
-	var fn AggFunction
-	switch agg.Function {
-	case FuncNameCOUNT:
-		fn = AggCount
-	case FuncNameSUM:
-		fn = AggSum
-	case FuncNameAVG:
-		fn = AggAvg
-	case FuncNameMIN:
-		fn = AggMin
-	case FuncNameMAX:
-		fn = AggMax
-	case FuncNameRATE:
-		fn = AggRate
-	case FuncNameQUANTILE:
-		fn = AggQuantile
-	case FuncNameHISTOGRAM:
-		fn = AggHistogram
-	case FuncNameSTDDEV:
-		fn = AggStddev
-	default:
-		return nil, fmt.Errorf("unsupported aggregation function %q", agg.Function)
-	}
-	return &AggregationPlan{
-		GroupByFields: agg.GroupBy,
-		Aggregates: []AggSpec{
-			{
-				Field:    agg.Field,
-				Function: fn,
-				Quantile: agg.Quantile,
-			},
-		},
-	}, nil
 }
 
 // compileToQuerySpec compiles a TraceQL metrics query to QuerySpec IR.
@@ -231,7 +191,9 @@ func extractPredicates(expr traceqlparser.Expr, spec *FilterSpec) error {
 }
 
 // extractFieldAndLiteral extracts field and literal from a comparison expression.
-func extractFieldAndLiteral(expr *traceqlparser.BinaryExpr) (*traceqlparser.FieldExpr, *traceqlparser.LiteralExpr, error) {
+func extractFieldAndLiteral(
+	expr *traceqlparser.BinaryExpr,
+) (*traceqlparser.FieldExpr, *traceqlparser.LiteralExpr, error) {
 	// Check if left is field and right is literal
 	if field, ok := expr.Left.(*traceqlparser.FieldExpr); ok {
 		if literal, ok := expr.Right.(*traceqlparser.LiteralExpr); ok {
@@ -270,10 +232,8 @@ func filterSpecToPredicates(filter FilterSpec) *QueryPredicates {
 		return nil
 	}
 
-	preds := &QueryPredicates{
-		DedicatedColumns: make(map[string][]Value),
-		DedicatedRanges:  make(map[string]*RangePredicate),
-	}
+	var nodes []RangeNode
+	var cols []string
 
 	for col, vals := range filter.AttributeEquals {
 		vmVals := make([]Value, 0, len(vals))
@@ -283,35 +243,32 @@ func filterSpecToPredicates(filter FilterSpec) *QueryPredicates {
 			}
 		}
 		if len(vmVals) > 0 {
-			preds.DedicatedColumns[col] = vmVals
-			preds.AttributesAccessed = append(preds.AttributesAccessed, col)
+			nodes = append(nodes, RangeNode{Column: col, Values: vmVals})
+			cols = append(cols, col)
 		}
 	}
 
 	for col, rs := range filter.AttributeRanges {
-		rp := &RangePredicate{
-			MinInclusive: rs.MinInclusive,
-			MaxInclusive: rs.MaxInclusive,
-		}
+		node := RangeNode{Column: col}
 		if rs.MinValue != nil {
 			if v, ok := interfaceToValue(rs.MinValue); ok {
-				rp.MinValue = &v
+				node.Min = &v
 			}
 		}
 		if rs.MaxValue != nil {
 			if v, ok := interfaceToValue(rs.MaxValue); ok {
-				rp.MaxValue = &v
+				node.Max = &v
 			}
 		}
-		preds.DedicatedRanges[col] = rp
-		preds.AttributesAccessed = append(preds.AttributesAccessed, col)
+		nodes = append(nodes, node)
+		cols = append(cols, col)
 	}
 
-	if len(preds.DedicatedColumns) == 0 && len(preds.DedicatedRanges) == 0 {
+	if len(nodes) == 0 {
 		return nil
 	}
 
-	return preds
+	return &QueryPredicates{Nodes: nodes, Columns: cols}
 }
 
 // interfaceToValue converts an interface{} value to a VM Value.

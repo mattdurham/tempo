@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 
 	"github.com/golang/snappy"
+	logsv1 "go.opentelemetry.io/proto/otlp/logs/v1"
 	tracev1 "go.opentelemetry.io/proto/otlp/trace/v1"
 
 	"github.com/grafana/blockpack/internal/modules/blockio/reader"
@@ -23,8 +24,8 @@ type Writer struct {
 	// then reset and reused for subsequent blocks to eliminate per-block allocations.
 	bb *blockBuilder
 
-	// trace_id → list of {blockID, rowIdx} across all blocks
-	traceIndex map[[16]byte][]traceBlockRef
+	// trace_id → list of block IDs (uint16) across all blocks
+	traceIndex map[[16]byte][]uint16
 
 	// UUID column detection: column name → detected as UUID
 	uuidColumns map[string]bool
@@ -33,19 +34,20 @@ type Writer struct {
 	// Replaces the old flat log + O(n log n) sort approach.
 	rangeIdx rangeIndex
 
+	// sketchIdx accumulates per-block sketch sets across all blocks.
+	// Indexed parallel to blockMetas: sketchIdx[i] is the sketch for block i.
+	// Consumed at Flush() by buildMetadataSectionBytes.
+	sketchIdx []blockSketchSet
+
 	out countingWriter
+
+	cfg Config
 
 	// pending holds lightweight pendingSpan records awaiting the next flushBlocks call.
 	// Each pendingSpan stores sort keys and proto pointers only; full OTLP→column
 	// decoding is deferred to addRowFromProto at flush time.
 	pending    []pendingSpan
 	blockMetas []shared.BlockMeta
-
-	// pending holds lightweight sort records (~88 bytes each: sort keys + proto pointers).
-	// protoRoots holds the TracesData proto roots that keep the sub-objects (rs/ss/span)
-	// referenced by pending entries alive in the GC. Without protoRoots, the GC could
-	// collect the proto tree while pending still holds pointers into it.
-	// After flushBlocks() clears pending, protoRoots is also cleared to release memory.
 
 	// protoRoots anchors TracesData protos (and synthetic ResourceSpans for AddSpan)
 	// until flushBlocks() processes all pending spans referencing them.
@@ -56,12 +58,27 @@ type Writer struct {
 	// WAL block lifetime, causing 3× RSS vs. parquet.
 	protoRoots []*tracev1.TracesData
 
-	cfg Config
+	// pendingLogs holds lightweight log records awaiting the next flushLogBlocks call.
+	// Parallel to w.pending (trace path). Protected by the same inUse guard.
+	pendingLogs []pendingLogRecord
+
+	// logProtoRoots anchors LogsData protos until flushLogBlocks() processes all pending
+	// log records referencing them. Cleared after flushLogBlocks(). Mirrors protoRoots.
+	logProtoRoots []*logsv1.LogsData
 
 	// inUse is a concurrency guard: AddSpan, AddTracesData, and Flush each do
 	// CompareAndSwap(false, true) on entry and panic if the swap fails, detecting
 	// concurrent callers. The Writer is documented as NOT thread-safe (NOTES §9).
 	inUse atomic.Bool
+
+	// signalType identifies whether this Writer produces trace or log files.
+	// Set implicitly on the first AddLogsData or AddTracesData/AddSpan call.
+	// 0 means unset; shared.SignalTypeTrace = 0x01; shared.SignalTypeLog = 0x02.
+	signalType uint8
+
+	// intrinsicAccum accumulates file-level intrinsic column data across all blocks.
+	// Created on first use in buildAndWriteBlock; cleared at the end of Flush().
+	intrinsicAccum *intrinsicAccumulator
 }
 
 // countingWriter wraps io.Writer and tracks total bytes written.
@@ -103,7 +120,7 @@ func NewWriterWithConfig(cfg Config) (*Writer, error) {
 		cfg:         cfg,
 		out:         countingWriter{w: cfg.OutputStream},
 		enc:         enc,
-		traceIndex:  make(map[[16]byte][]traceBlockRef),
+		traceIndex:  make(map[[16]byte][]uint16),
 		uuidColumns: make(map[string]bool),
 		rangeIdx:    make(rangeIndex),
 		// Pre-allocate pending to MaxBufferedSpans to avoid growslice on the hot path.
@@ -128,6 +145,11 @@ func (w *Writer) AddSpan(
 		panic("writer: concurrent use detected")
 	}
 	defer w.inUse.Store(false)
+
+	if w.signalType == shared.SignalTypeLog {
+		return fmt.Errorf("writer: cannot mix trace and log records in the same Writer")
+	}
+	w.signalType = shared.SignalTypeTrace
 
 	// Synthesize proto containers for the attribute maps so addRowFromProto can
 	// read them uniformly. These synthetic protos are anchored in protoRoots until
@@ -167,10 +189,20 @@ func (w *Writer) AddSpan(
 // Use this when you already have a TracesData proto (e.g. from an OTLP pipeline) —
 // it avoids synthesizing a wrapper proto. Use AddSpan when building spans
 // individually or from non-proto sources (maps, structs).
+// Panics if called concurrently (NOTES §9).
 func (w *Writer) AddTracesData(td *tracev1.TracesData) error {
 	if td == nil {
 		return nil
 	}
+	if !w.inUse.CompareAndSwap(false, true) {
+		panic("writer: concurrent use detected")
+	}
+	defer w.inUse.Store(false)
+
+	if w.signalType == shared.SignalTypeLog {
+		return fmt.Errorf("writer: cannot mix trace and log records in the same Writer")
+	}
+	w.signalType = shared.SignalTypeTrace
 	// Anchor the proto until flushBlocks() processes all pending spans.
 	// After flushBlocks() clears w.pending, protoRoots is also cleared —
 	// but w.rangeIdx map keys keep string data alive independently (GC traces them).
@@ -187,9 +219,6 @@ func (w *Writer) AddTracesData(td *tracev1.TracesData) error {
 			for _, span := range ss.Spans {
 				if span == nil {
 					continue
-				}
-				if !w.inUse.CompareAndSwap(false, true) {
-					panic("writer: concurrent use detected")
 				}
 
 				var tid [16]byte
@@ -210,11 +239,63 @@ func (w *Writer) AddTracesData(td *tracev1.TracesData) error {
 				// Auto-flush when buffer reaches MaxBufferedSpans.
 				if w.cfg.MaxBufferedSpans > 0 && len(w.pending) >= w.cfg.MaxBufferedSpans {
 					if flushErr := w.flushBlocks(); flushErr != nil {
-						w.inUse.Store(false)
 						return fmt.Errorf("writer: auto-flush: %w", flushErr)
 					}
 				}
-				w.inUse.Store(false)
+			}
+		}
+	}
+	return nil
+}
+
+// AddLogsData buffers all log records from an OTLP LogsData message.
+// The Writer must not have had AddTracesData or AddSpan called on it (signal types cannot
+// be mixed in a single Writer). Returns an error if signalType is already SignalTypeTrace
+// and there are buffered trace records.
+func (w *Writer) AddLogsData(ld *logsv1.LogsData) error {
+	if ld == nil {
+		return nil
+	}
+	// Guard against mixing signal types.
+	if w.signalType == shared.SignalTypeTrace {
+		return fmt.Errorf("writer: cannot mix trace and log records in the same Writer")
+	}
+	if !w.inUse.CompareAndSwap(false, true) {
+		panic("writer: concurrent use detected")
+	}
+	defer w.inUse.Store(false)
+	w.signalType = shared.SignalTypeLog
+	w.logProtoRoots = append(w.logProtoRoots, ld)
+
+	for _, rl := range ld.ResourceLogs {
+		if rl == nil {
+			continue
+		}
+		svcName := extractSvcNameFromProto(rl.Resource)
+		for _, sl := range rl.ScopeLogs {
+			if sl == nil {
+				continue
+			}
+			for _, record := range sl.LogRecords {
+				if record == nil {
+					continue
+				}
+
+				plr := pendingLogRecord{
+					svcName:   svcName,
+					rl:        rl,
+					sl:        sl,
+					record:    record,
+					timestamp: record.TimeUnixNano,
+				}
+				computeMinHashSigFromLog(&plr)
+				w.pendingLogs = append(w.pendingLogs, plr)
+
+				if w.cfg.MaxBufferedSpans > 0 && len(w.pendingLogs) >= w.cfg.MaxBufferedSpans {
+					if flushErr := w.flushLogBlocks(); flushErr != nil {
+						return fmt.Errorf("writer: auto-flush: %w", flushErr)
+					}
+				}
 			}
 		}
 	}
@@ -229,30 +310,47 @@ func (w *Writer) Flush() (int64, error) {
 	}
 	defer w.inUse.Store(false)
 
-	if len(w.pending) == 0 && len(w.blockMetas) == 0 {
+	if len(w.pending) == 0 && len(w.pendingLogs) == 0 && len(w.blockMetas) == 0 {
 		// Nothing has ever been written — produce a valid empty file.
 		return w.writeEmptyFile()
 	}
 
-	// 1. Flush any remaining buffered spans into blocks.
-	if err := w.flushBlocks(); err != nil {
-		return w.out.total, err
+	// 1. Flush any remaining buffered spans/records into blocks.
+	if w.signalType == shared.SignalTypeLog {
+		if err := w.flushLogBlocks(); err != nil {
+			return w.out.total, err
+		}
+	} else {
+		if err := w.flushBlocks(); err != nil {
+			return w.out.total, err
+		}
+	}
+
+	// 1.5. Write intrinsic columns section (after all blocks, before metadata).
+	intrinsicIndexOffset, intrinsicIndexLen, err := w.writeIntrinsicSection()
+	if err != nil {
+		return w.out.total, fmt.Errorf("writer: intrinsic section: %w", err)
 	}
 
 	// 2. Record metadata offset.
-	metadataOffset := uint64(w.out.total) //nolint:gosec // safe: total bytes written fits in int64 and int64 fits in uint64 for file offsets
+	metadataOffset := uint64(
+		w.out.total,
+	) //nolint:gosec // safe: total bytes written fits in int64 and int64 fits in uint64 for file offsets
 
 	// 3. Apply KLL bucket boundaries to the range index.
 	// KLL sketches were built incrementally in buildAndWriteBlock (one Add per
 	// block min and max), so no re-scan is needed here.
 	applyRangeBuckets(w.rangeIdx, defaultRangeBuckets)
 
-	// 4. Write metadata section (snappy-compressed, V12).
+	// 4. Write metadata section (snappy-compressed, V12 format).
+	// All new files use V12 regardless of signal type. V12 adds snappy-compressed
+	// metadata and the signal_type byte in the file header.
 	metaBytes, err := buildMetadataSectionBytes(
 		shared.VersionV11, // block index uses V11 entry layout; block encoding is unchanged
 		w.blockMetas,
 		w.rangeIdx,
 		w.traceIndex,
+		w.sketchIdx,
 	)
 	if err != nil {
 		return w.out.total, fmt.Errorf("writer: build metadata: %w", err)
@@ -264,21 +362,29 @@ func (w *Writer) Flush() (int64, error) {
 		return w.out.total, fmt.Errorf("writer: write metadata: %w", err)
 	}
 
-	// 5. Write file header.
-	headerOffset := uint64(w.out.total) //nolint:gosec // safe: total bytes written fits in int64 and int64 fits in uint64 for file offsets
-	if err = writeFileHeader(&w.out, shared.VersionV12, metadataOffset, metadataLen); err != nil {
+	// 5. Write file header (always V12).
+	signalTypeForHeader := w.signalType
+	if signalTypeForHeader == 0 {
+		signalTypeForHeader = shared.SignalTypeTrace
+	}
+	headerOffset := uint64(
+		w.out.total,
+	) //nolint:gosec // safe: total bytes written fits in int64 and int64 fits in uint64 for file offsets
+	if err = writeFileHeader(&w.out, shared.VersionV12, metadataOffset, metadataLen, signalTypeForHeader); err != nil {
 		return w.out.total, fmt.Errorf("writer: write file header: %w", err)
 	}
 
 	// 6. Write compact trace index.
-	compactOffset := uint64(w.out.total) //nolint:gosec // safe: total bytes written fits in int64 and int64 fits in uint64 for file offsets
+	compactOffset := uint64(
+		w.out.total,
+	) //nolint:gosec // safe: total bytes written fits in int64 and int64 fits in uint64 for file offsets
 	compactN, err := writeCompactTraceIndex(&w.out, w.blockMetas, w.traceIndex)
 	if err != nil {
 		return w.out.total, fmt.Errorf("writer: write compact index: %w", err)
 	}
 
-	// 7. Write footer.
-	if err = writeFooter(&w.out, headerOffset, compactOffset, uint32(compactN)); err != nil { //nolint:gosec // safe: compact index size bounded by MaxCompactSectionSize (50MB) fits uint32
+	// 7. Write footer (v4 with intrinsic index pointer).
+	if err = writeFooterV4(&w.out, headerOffset, compactOffset, uint32(compactN), intrinsicIndexOffset, intrinsicIndexLen); err != nil { //nolint:gosec // safe: compact index size bounded by MaxCompactSectionSize (50MB) fits uint32
 		return w.out.total, fmt.Errorf("writer: write footer: %w", err)
 	}
 
@@ -287,6 +393,7 @@ func (w *Writer) Flush() (int64, error) {
 	// 8. Reset ALL state.
 	w.pending = w.pending[:0]
 	w.blockMetas = nil
+	w.sketchIdx = w.sketchIdx[:0]
 	for k := range w.rangeIdx {
 		delete(w.rangeIdx, k)
 	}
@@ -297,12 +404,23 @@ func (w *Writer) Flush() (int64, error) {
 	clear(w.protoRoots)
 	w.protoRoots = w.protoRoots[:0]
 
+	// Reset log state (parallel to trace state reset above).
+	w.pendingLogs = w.pendingLogs[:0]
+	clear(w.logProtoRoots)
+	w.logProtoRoots = w.logProtoRoots[:0]
+	w.signalType = 0
+
+	// Reset intrinsic accumulator so the next Flush() starts fresh.
+	w.intrinsicAccum = nil
+
 	return total, nil
 }
 
 // writeEmptyFile writes a minimal valid blockpack file with zero blocks.
 func (w *Writer) writeEmptyFile() (int64, error) {
-	metadataOffset := uint64(w.out.total) //nolint:gosec // safe: total bytes written fits in int64 and int64 fits in uint64 for file offsets
+	metadataOffset := uint64(
+		w.out.total,
+	) //nolint:gosec // safe: total bytes written fits in int64 and int64 fits in uint64 for file offsets
 
 	rIdx := make(rangeIndex)
 	metaBytes, err := buildMetadataSectionBytes(
@@ -310,29 +428,39 @@ func (w *Writer) writeEmptyFile() (int64, error) {
 		nil,
 		rIdx,
 		w.traceIndex,
+		nil, // no sketches for empty file
 	)
 	if err != nil {
 		return w.out.total, err
 	}
 
-	compressedMeta := snappy.Encode(nil, metaBytes)
-	metadataLen := uint64(len(compressedMeta))
-	if _, err = w.out.Write(compressedMeta); err != nil {
+	// All empty files use V12 (snappy-compressed metadata + signal_type header byte).
+	compressedEmptyMeta := snappy.Encode(nil, metaBytes)
+	metadataLen := uint64(len(compressedEmptyMeta))
+	if _, err = w.out.Write(compressedEmptyMeta); err != nil {
 		return w.out.total, err
 	}
 
-	headerOffset := uint64(w.out.total) //nolint:gosec // safe: total bytes written fits in int64 and int64 fits in uint64 for file offsets
-	if err = writeFileHeader(&w.out, shared.VersionV12, metadataOffset, metadataLen); err != nil {
+	signalTypeForHeader := w.signalType
+	if signalTypeForHeader == 0 {
+		signalTypeForHeader = shared.SignalTypeTrace
+	}
+	headerOffset := uint64(
+		w.out.total,
+	) //nolint:gosec // safe: total bytes written fits in int64 and int64 fits in uint64 for file offsets
+	if err = writeFileHeader(&w.out, shared.VersionV12, metadataOffset, metadataLen, signalTypeForHeader); err != nil {
 		return w.out.total, err
 	}
 
-	compactOffset := uint64(w.out.total) //nolint:gosec // safe: total bytes written fits in int64 and int64 fits in uint64 for file offsets
+	compactOffset := uint64(
+		w.out.total,
+	) //nolint:gosec // safe: total bytes written fits in int64 and int64 fits in uint64 for file offsets
 	compactN, err := writeCompactTraceIndex(&w.out, nil, w.traceIndex)
 	if err != nil {
 		return w.out.total, err
 	}
 
-	if err = writeFooter(&w.out, headerOffset, compactOffset, uint32(compactN)); err != nil { //nolint:gosec // safe: compact index size bounded by MaxCompactSectionSize (50MB) fits uint32
+	if err = writeFooterV4(&w.out, headerOffset, compactOffset, uint32(compactN), 0, 0); err != nil { //nolint:gosec // safe: compact index size bounded by MaxCompactSectionSize (50MB) fits uint32
 		return w.out.total, err
 	}
 
@@ -341,8 +469,32 @@ func (w *Writer) writeEmptyFile() (int64, error) {
 
 // buildAndWriteBlock builds one block from pending[0:end], writes it to the output, and
 // records BlockMeta, range index entries, and traceIndex refs.
+// Returns an error if blockID exceeds the uint16 trace-index wire format limit.
+// Block IDs are 0-based and encoded as uint16, so the maximum valid ID is 65534
+// (allowing at most 65535 blocks with IDs 0–65534; this keeps block_ref_count within uint16).
 func (w *Writer) buildAndWriteBlock(blockID int, pending []pendingSpan) error {
-	blockOffset := uint64(w.out.total) //nolint:gosec // safe: total bytes written fits in int64 and int64 fits in uint64 for file offsets
+	if blockID >= 65535 {
+		return fmt.Errorf(
+			"writer: block %d exceeds trace-index limit: block IDs are 0-based and encoded as uint16 (max ID 65534)",
+			blockID,
+		)
+	}
+	blockOffset := uint64(
+		w.out.total,
+	) //nolint:gosec // safe: total bytes written fits in int64 and int64 fits in uint64 for file offsets
+
+	// Initialize intrinsic accumulator on first block.
+	if w.intrinsicAccum == nil {
+		w.intrinsicAccum = newIntrinsicAccumulator()
+	}
+
+	// Wire accumulator into block builder before building the block.
+	// The blockBuilder checks bb.intrinsicAccum != nil before feeding.
+	if w.bb == nil {
+		w.bb = newBlockBuilder(len(pending))
+	}
+	w.bb.intrinsicAccum = w.intrinsicAccum
+	w.bb.intrinsicBlockID = uint16(blockID) //nolint:gosec // safe: blockID bounded by MaxBlocks (65534)
 
 	built, bb, err := buildBlock(pending, w.enc, w.bb)
 	w.bb = bb
@@ -356,15 +508,14 @@ func (w *Writer) buildAndWriteBlock(blockID int, pending []pendingSpan) error {
 
 	// Record BlockMeta.
 	meta := shared.BlockMeta{
-		Offset:          blockOffset,
-		Length:          uint64(len(built.payload)),
-		Kind:            shared.BlockKindLeaf,
-		SpanCount:       uint32(built.spanCount), //nolint:gosec // safe: spanCount bounded by MaxBlockSpans (65535)
-		MinStart:        built.minStart,
-		MaxStart:        built.maxStart,
-		MinTraceID:      built.minTraceID,
-		MaxTraceID:      built.maxTraceID,
-		ColumnNameBloom: built.bloom,
+		Offset:     blockOffset,
+		Length:     uint64(len(built.payload)),
+		Kind:       shared.BlockKindLeaf,
+		SpanCount:  uint32(built.spanCount), //nolint:gosec // safe: spanCount bounded by MaxBlockSpans (65535)
+		MinStart:   built.minStart,
+		MaxStart:   built.maxStart,
+		MinTraceID: built.minTraceID,
+		MaxTraceID: built.maxTraceID,
 	}
 	w.blockMetas = append(w.blockMetas, meta)
 
@@ -380,14 +531,15 @@ func (w *Writer) buildAndWriteBlock(blockID int, pending []pendingSpan) error {
 		addBlockRangeToColumn(cd, mm, bid)
 	}
 
-	// Update the file-level trace index using built.traceRows, which is already
-	// populated by addRowFromProto. This avoids the redundant blockTraceRows map that
-	// previously duplicated the same data.
-	for tid, rowIdxs := range built.traceRows {
-		w.traceIndex[tid] = append(w.traceIndex[tid], traceBlockRef{
-			blockID:     uint16(blockID), //nolint:gosec // safe: blockID bounded by MaxBlocks (100_000) fits uint16 per block limit
-			spanIndices: rowIdxs,
-		})
+	// Collect sketch set for this block (parallel to blockMetas).
+	w.sketchIdx = append(w.sketchIdx, built.colSketches)
+
+	// Update the file-level trace index: record the block ID for each trace present.
+	for tid := range built.traceRows {
+		w.traceIndex[tid] = append(
+			w.traceIndex[tid],
+			uint16(blockID),
+		) //nolint:gosec // safe: blockID <= 65535 enforced by guard above
 	}
 
 	return nil
@@ -445,6 +597,83 @@ func (w *Writer) flushBlocks() error {
 	return nil
 }
 
+// buildAndWriteLogBlock builds one log block from pending[0:end], writes it to the output,
+// and records BlockMeta and range index entries. Does NOT update w.traceIndex.
+func (w *Writer) buildAndWriteLogBlock(blockID int, pending []pendingLogRecord) error {
+	blockOffset := uint64(
+		w.out.total,
+	) //nolint:gosec // safe: total bytes written fits in int64 and int64 fits in uint64 for file offsets
+
+	built, err := buildLogBlock(pending, w.enc)
+	if err != nil {
+		return fmt.Errorf("writer: log block %d finalize: %w", blockID, err)
+	}
+
+	if _, err = w.out.Write(built.payload); err != nil {
+		return fmt.Errorf("writer: log block %d write: %w", blockID, err)
+	}
+
+	meta := shared.BlockMeta{
+		Offset:    blockOffset,
+		Length:    uint64(len(built.payload)),
+		Kind:      shared.BlockKindLeaf,
+		SpanCount: uint32(built.spanCount), //nolint:gosec // safe: spanCount bounded by MaxBlockSpans (65535)
+		MinStart:  built.minStart,
+		MaxStart:  built.maxStart,
+		// MinTraceID and MaxTraceID are zero ([16]byte zero value) for log blocks.
+	}
+	w.blockMetas = append(w.blockMetas, meta)
+
+	bid := uint32(blockID) //nolint:gosec // safe: blockID bounded by MaxBlocks (100_000), fits uint32
+	for _, mm := range built.colMinMax {
+		cd, ok := w.rangeIdx[mm.colName]
+		if !ok {
+			cd = newRangeColumnData(mm.colType)
+			w.rangeIdx[mm.colName] = cd
+		}
+		addBlockRangeToColumn(cd, mm, bid)
+	}
+
+	// Collect sketch set for this log block (parallel to blockMetas).
+	w.sketchIdx = append(w.sketchIdx, built.colSketches)
+
+	// No trace index update for log blocks.
+	return nil
+}
+
+// flushLogBlocks sorts w.pendingLogs, writes all pending log blocks, and resets the buffer.
+// Mirrors flushBlocks for the log signal path.
+func (w *Writer) flushLogBlocks() error {
+	if len(w.pendingLogs) == 0 {
+		return nil
+	}
+
+	sortPendingLogs(w.pendingLogs)
+
+	blockStart := 0
+	for blockStart < len(w.pendingLogs) {
+		blockEnd := min(blockStart+w.cfg.MaxBlockSpans, len(w.pendingLogs))
+
+		blockID := len(w.blockMetas)
+		if err := w.buildAndWriteLogBlock(blockID, w.pendingLogs[blockStart:blockEnd]); err != nil {
+			clear(w.pendingLogs)
+			w.pendingLogs = w.pendingLogs[:0]
+			clear(w.logProtoRoots)
+			w.logProtoRoots = w.logProtoRoots[:0]
+			return err
+		}
+		blockStart = blockEnd
+	}
+
+	clear(w.pendingLogs)
+	w.pendingLogs = w.pendingLogs[:0]
+
+	clear(w.logProtoRoots)
+	w.logProtoRoots = w.logProtoRoots[:0]
+
+	return nil
+}
+
 // buildMetadataSectionBytes serializes the metadata section to a byte slice.
 // Sections are concatenated directly with no length prefixes; the reader parses
 // them sequentially using the counts embedded in each section header.
@@ -454,7 +683,8 @@ func buildMetadataSectionBytes(
 	version uint8,
 	blockMetas []shared.BlockMeta,
 	rIdx rangeIndex,
-	traceIndex map[[16]byte][]traceBlockRef,
+	traceIndex map[[16]byte][]uint16,
+	sketchIdx []blockSketchSet,
 ) ([]byte, error) {
 	blockIdxData, err := writeBlockIndexSection(nil, version, blockMetas)
 	if err != nil {
@@ -482,6 +712,19 @@ func buildMetadataSectionBytes(
 		buf = append(buf, 0, 0, 0, 0) // col_count[4 LE] = 0
 	}
 	buf = append(buf, traceIdxData...)
+
+	// TS index section — per-file timestamp index for direction-aware block ordering.
+	tsBytes := writeTSIndexSection(blockMetas)
+	buf = append(buf, tsBytes...)
+
+	// Sketch index section — per-block HLL/CMS/BinaryFuse8 sketch data.
+	if len(sketchIdx) > 0 {
+		sketchBytes, err := writeSketchIndexSection(sketchIdx)
+		if err != nil {
+			return nil, fmt.Errorf("sketch_index: %w", err)
+		}
+		buf = append(buf, sketchBytes...)
+	}
 
 	return buf, nil
 }
@@ -565,5 +808,62 @@ func (w *Writer) AddRow(block *reader.Block, rowIdx int) error {
 
 // CurrentSize returns estimated buffered size in bytes.
 func (w *Writer) CurrentSize() int64 {
-	return int64(len(w.pending)) * estimatedBytesPerSpan
+	return int64(len(w.pending)+len(w.pendingLogs)) * estimatedBytesPerSpan
+}
+
+// writeIntrinsicSection encodes all accumulated intrinsic column blobs, writes them to
+// the output, and returns the TOC offset and length for the v4 footer.
+// Returns (tocOffset=0, tocLen=0, nil) when the accumulator is empty or over cap.
+func (w *Writer) writeIntrinsicSection() (tocOffset uint64, tocLen uint32, err error) {
+	if w.intrinsicAccum == nil || w.intrinsicAccum.overCap() {
+		return 0, 0, nil
+	}
+
+	names := w.intrinsicAccum.columnNames()
+	if len(names) == 0 {
+		return 0, 0, nil
+	}
+
+	entries := make([]shared.IntrinsicColMeta, 0, len(names))
+	for _, name := range names {
+		blob, encErr := w.intrinsicAccum.encodeColumn(name)
+		if encErr != nil {
+			return 0, 0, fmt.Errorf("writeIntrinsicSection: encode %q: %w", name, encErr)
+		}
+		if len(blob) == 0 {
+			continue
+		}
+		colOffset := uint64(w.out.total) //nolint:gosec // safe: total bytes written fits in int64 and int64 fits in uint64 for file offsets
+		if _, writeErr := w.out.Write(blob); writeErr != nil {
+			return 0, 0, fmt.Errorf("writeIntrinsicSection: write %q: %w", name, writeErr)
+		}
+		colType, format := w.intrinsicAccum.colTypeFor(name)
+		minVal, maxVal := w.intrinsicAccum.computeMinMax(name)
+		entries = append(entries, shared.IntrinsicColMeta{
+			Name:   name,
+			Type:   colType,
+			Format: format,
+			Offset: colOffset,
+			Length: uint32(len(blob)), //nolint:gosec // safe: column blob size bounded by snappy output of accumulated rows
+			Count:  w.intrinsicAccum.rowCount(name),
+			Min:    minVal,
+			Max:    maxVal,
+		})
+	}
+
+	if len(entries) == 0 {
+		return 0, 0, nil
+	}
+
+	toc, tocErr := encodeTOC(entries)
+	if tocErr != nil {
+		return 0, 0, fmt.Errorf("writeIntrinsicSection: encodeTOC: %w", tocErr)
+	}
+
+	off := uint64(w.out.total) //nolint:gosec // safe: total bytes written fits in int64 and int64 fits in uint64 for file offsets
+	if _, writeErr := w.out.Write(toc); writeErr != nil {
+		return 0, 0, fmt.Errorf("writeIntrinsicSection: write TOC: %w", writeErr)
+	}
+
+	return off, uint32(len(toc)), nil //nolint:gosec // safe: TOC size bounded by snappy output of IntrinsicColMeta entries, well under uint32 max
 }

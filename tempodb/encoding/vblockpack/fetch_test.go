@@ -325,6 +325,289 @@ func TestFetch_OpNoneConditions(t *testing.T) {
 	require.Len(t, spansets, 2, "OpNone conditions should not filter — expect all 2 traces")
 }
 
+// TestFetch_KindFilter verifies that {kind=client} correctly filters spans by OTLP SpanKind.
+func TestFetch_KindFilter(t *testing.T) {
+	// Build a block with two traces:
+	//   trace A: span with Kind=CLIENT
+	//   trace B: span with Kind=SERVER
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	rawR, rawW, _, err := local.New(&local.Config{Path: tmpDir})
+	require.NoError(t, err)
+	r := backend.NewReader(rawR)
+	w := backend.NewWriter(rawW)
+
+	traceIDA := []byte{0xa, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xa}
+	traceIDB := []byte{0xb, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xb}
+	now := uint64(time.Now().UnixNano())
+
+	traces := []*tempopb.Trace{
+		{
+			ResourceSpans: []*tempotrace.ResourceSpans{{
+				Resource: &temporesource.Resource{
+					Attributes: []*tempocommon.KeyValue{
+						{Key: "service.name", Value: &tempocommon.AnyValue{Value: &tempocommon.AnyValue_StringValue{StringValue: "svc-client"}}},
+					},
+				},
+				ScopeSpans: []*tempotrace.ScopeSpans{{
+					Spans: []*tempotrace.Span{{
+						TraceId:           traceIDA,
+						SpanId:            []byte{0xa, 0, 0, 0, 0, 0, 0, 0xa},
+						Name:              "client-span",
+						Kind:              tempotrace.Span_SPAN_KIND_CLIENT,
+						StartTimeUnixNano: now,
+						EndTimeUnixNano:   now + uint64(50*time.Millisecond),
+					}},
+				}},
+			}},
+		},
+		{
+			ResourceSpans: []*tempotrace.ResourceSpans{{
+				Resource: &temporesource.Resource{
+					Attributes: []*tempocommon.KeyValue{
+						{Key: "service.name", Value: &tempocommon.AnyValue{Value: &tempocommon.AnyValue_StringValue{StringValue: "svc-server"}}},
+					},
+				},
+				ScopeSpans: []*tempotrace.ScopeSpans{{
+					Spans: []*tempotrace.Span{{
+						TraceId:           traceIDB,
+						SpanId:            []byte{0xb, 0, 0, 0, 0, 0, 0, 0xb},
+						Name:              "server-span",
+						Kind:              tempotrace.Span_SPAN_KIND_SERVER,
+						StartTimeUnixNano: now + uint64(10*time.Millisecond),
+						EndTimeUnixNano:   now + uint64(60*time.Millisecond),
+					}},
+				}},
+			}},
+		},
+	}
+
+	meta := backend.NewBlockMeta("single-tenant", uuid.New(), VersionString)
+	meta.TotalRecords = 1
+
+	iter := &mockIterator{traces: traces, ids: [][]byte{traceIDA, traceIDB}}
+	cfg := &common.BlockConfig{RowGroupSizeBytes: 100 * 1024 * 1024}
+	resultMeta, err := CreateBlock(ctx, cfg, meta, iter, r, w)
+	require.NoError(t, err)
+
+	blk := newBackendBlock(resultMeta, r)
+
+	// Query for kind=client — should return only trace A.
+	conditions := []traceql.Condition{
+		{Attribute: traceql.NewIntrinsic(traceql.IntrinsicKind), Op: traceql.OpEqual, Operands: []traceql.Static{traceql.NewStaticKind(traceql.KindClient)}},
+	}
+	spansets := collectFetch(t, blk, conditions, false)
+	require.Len(t, spansets, 1, "kind=client should match exactly 1 trace (svc-client)")
+	require.Equal(t, "svc-client", spansets[0].RootServiceName)
+
+	// Query for kind=server — should return only trace B.
+	conditions = []traceql.Condition{
+		{Attribute: traceql.NewIntrinsic(traceql.IntrinsicKind), Op: traceql.OpEqual, Operands: []traceql.Static{traceql.NewStaticKind(traceql.KindServer)}},
+	}
+	spansets = collectFetch(t, blk, conditions, false)
+	require.Len(t, spansets, 1, "kind=server should match exactly 1 trace (svc-server)")
+	require.Equal(t, "svc-server", spansets[0].RootServiceName)
+}
+
+// TestFetch_StatusFilter verifies that {status=error} and {status=ok} correctly filter spans by OTLP status code.
+func TestFetch_StatusFilter(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	rawR, rawW, _, err := local.New(&local.Config{Path: tmpDir})
+	require.NoError(t, err)
+	r := backend.NewReader(rawR)
+	w := backend.NewWriter(rawW)
+
+	traceIDA := []byte{0xc, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xc}
+	traceIDB := []byte{0xd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xd}
+	now := uint64(time.Now().UnixNano())
+
+	traces := []*tempopb.Trace{
+		{
+			ResourceSpans: []*tempotrace.ResourceSpans{{
+				Resource: &temporesource.Resource{
+					Attributes: []*tempocommon.KeyValue{
+						{Key: "service.name", Value: &tempocommon.AnyValue{Value: &tempocommon.AnyValue_StringValue{StringValue: "svc-error"}}},
+					},
+				},
+				ScopeSpans: []*tempotrace.ScopeSpans{{
+					Spans: []*tempotrace.Span{{
+						TraceId:           traceIDA,
+						SpanId:            []byte{0xc, 0, 0, 0, 0, 0, 0, 0xc},
+						Name:              "error-span",
+						Status:            &tempotrace.Status{Code: tempotrace.Status_STATUS_CODE_ERROR},
+						StartTimeUnixNano: now,
+						EndTimeUnixNano:   now + uint64(50*time.Millisecond),
+					}},
+				}},
+			}},
+		},
+		{
+			ResourceSpans: []*tempotrace.ResourceSpans{{
+				Resource: &temporesource.Resource{
+					Attributes: []*tempocommon.KeyValue{
+						{Key: "service.name", Value: &tempocommon.AnyValue{Value: &tempocommon.AnyValue_StringValue{StringValue: "svc-ok"}}},
+					},
+				},
+				ScopeSpans: []*tempotrace.ScopeSpans{{
+					Spans: []*tempotrace.Span{{
+						TraceId:           traceIDB,
+						SpanId:            []byte{0xd, 0, 0, 0, 0, 0, 0, 0xd},
+						Name:              "ok-span",
+						Status:            &tempotrace.Status{Code: tempotrace.Status_STATUS_CODE_OK},
+						StartTimeUnixNano: now + uint64(10*time.Millisecond),
+						EndTimeUnixNano:   now + uint64(60*time.Millisecond),
+					}},
+				}},
+			}},
+		},
+	}
+
+	meta := backend.NewBlockMeta("single-tenant", uuid.New(), VersionString)
+	meta.TotalRecords = 1
+
+	iter := &mockIterator{traces: traces, ids: [][]byte{traceIDA, traceIDB}}
+	cfg := &common.BlockConfig{RowGroupSizeBytes: 100 * 1024 * 1024}
+	resultMeta, err := CreateBlock(ctx, cfg, meta, iter, r, w)
+	require.NoError(t, err)
+
+	blk := newBackendBlock(resultMeta, r)
+
+	// Query for status=error — should return only trace A.
+	conditions := []traceql.Condition{
+		{Attribute: traceql.NewIntrinsic(traceql.IntrinsicStatus), Op: traceql.OpEqual, Operands: []traceql.Static{traceql.NewStaticStatus(traceql.StatusError)}},
+	}
+	spansets := collectFetch(t, blk, conditions, false)
+	require.Len(t, spansets, 1, "status=error should match exactly 1 trace (svc-error)")
+	require.Equal(t, "svc-error", spansets[0].RootServiceName)
+
+	// Query for status=ok — should return only trace B.
+	conditions = []traceql.Condition{
+		{Attribute: traceql.NewIntrinsic(traceql.IntrinsicStatus), Op: traceql.OpEqual, Operands: []traceql.Static{traceql.NewStaticStatus(traceql.StatusOk)}},
+	}
+	spansets = collectFetch(t, blk, conditions, false)
+	require.Len(t, spansets, 1, "status=ok should match exactly 1 trace (svc-ok)")
+	require.Equal(t, "svc-ok", spansets[0].RootServiceName)
+}
+
+// TestFetch_KindStatusAttributeFor verifies that AttributeFor correctly translates
+// OTLP int values for span:kind and span:status into Tempo's traceql enum values.
+//
+// Root cause of the original bug: OTLP and Tempo use different int orderings for
+// Kind (OTLP SERVER=2, CLIENT=3 vs Tempo KindClient=2, KindServer=3) and Status
+// (OTLP OK=1, ERROR=2 vs Tempo StatusError=0, StatusOk=1, StatusUnset=2).
+// Without explicit conversion, kind/status filtering would return wrong spans.
+func TestFetch_KindStatusAttributeFor(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	rawR, rawW, _, err := local.New(&local.Config{Path: tmpDir})
+	require.NoError(t, err)
+	r := backend.NewReader(rawR)
+	w := backend.NewWriter(rawW)
+
+	traceIDA := []byte{0xe, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xe}
+	traceIDB := []byte{0xf, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xf}
+	now := uint64(time.Now().UnixNano())
+
+	traces := []*tempopb.Trace{
+		{
+			ResourceSpans: []*tempotrace.ResourceSpans{{
+				Resource: &temporesource.Resource{
+					Attributes: []*tempocommon.KeyValue{
+						{Key: "service.name", Value: &tempocommon.AnyValue{Value: &tempocommon.AnyValue_StringValue{StringValue: "svc-client"}}},
+					},
+				},
+				ScopeSpans: []*tempotrace.ScopeSpans{{
+					Spans: []*tempotrace.Span{{
+						TraceId:           traceIDA,
+						SpanId:            []byte{0xe, 0, 0, 0, 0, 0, 0, 0xe},
+						Name:              "client-error-span",
+						Kind:              tempotrace.Span_SPAN_KIND_CLIENT,
+						Status:            &tempotrace.Status{Code: tempotrace.Status_STATUS_CODE_ERROR},
+						StartTimeUnixNano: now,
+						EndTimeUnixNano:   now + uint64(50*time.Millisecond),
+					}},
+				}},
+			}},
+		},
+		{
+			ResourceSpans: []*tempotrace.ResourceSpans{{
+				Resource: &temporesource.Resource{
+					Attributes: []*tempocommon.KeyValue{
+						{Key: "service.name", Value: &tempocommon.AnyValue{Value: &tempocommon.AnyValue_StringValue{StringValue: "svc-server"}}},
+					},
+				},
+				ScopeSpans: []*tempotrace.ScopeSpans{{
+					Spans: []*tempotrace.Span{{
+						TraceId:           traceIDB,
+						SpanId:            []byte{0xf, 0, 0, 0, 0, 0, 0, 0xf},
+						Name:              "server-ok-span",
+						Kind:              tempotrace.Span_SPAN_KIND_SERVER,
+						Status:            &tempotrace.Status{Code: tempotrace.Status_STATUS_CODE_OK},
+						StartTimeUnixNano: now + uint64(10*time.Millisecond),
+						EndTimeUnixNano:   now + uint64(60*time.Millisecond),
+					}},
+				}},
+			}},
+		},
+	}
+
+	meta := backend.NewBlockMeta("single-tenant", uuid.New(), VersionString)
+	meta.TotalRecords = 1
+
+	iter := &mockIterator{traces: traces, ids: [][]byte{traceIDA, traceIDB}}
+	cfg := &common.BlockConfig{RowGroupSizeBytes: 100 * 1024 * 1024}
+	resultMeta, err := CreateBlock(ctx, cfg, meta, iter, r, w)
+	require.NoError(t, err)
+
+	blk := newBackendBlock(resultMeta, r)
+
+	// Fetch all spans with no filter and check AttributeFor returns the right Tempo enum values.
+	spansets := collectFetch(t, blk, nil, false)
+	require.Len(t, spansets, 2)
+
+	byService := map[string]*traceql.Spanset{}
+	for _, ss := range spansets {
+		byService[ss.RootServiceName] = ss
+	}
+
+	// Verify svc-client span: OTLP CLIENT (3) → Tempo KindClient (2), OTLP ERROR (2) → Tempo StatusError (0)
+	clientSS := byService["svc-client"]
+	require.NotNil(t, clientSS)
+	require.Len(t, clientSS.Spans, 1)
+	clientSpan := clientSS.Spans[0]
+
+	kindVal, ok := clientSpan.AttributeFor(traceql.NewIntrinsic(traceql.IntrinsicKind))
+	require.True(t, ok, "span:kind should be present on client span")
+	kind, ok := kindVal.Kind()
+	require.True(t, ok)
+	require.Equal(t, traceql.KindClient, kind, "OTLP CLIENT=3 must map to Tempo KindClient=2")
+
+	statusVal, ok := clientSpan.AttributeFor(traceql.NewIntrinsic(traceql.IntrinsicStatus))
+	require.True(t, ok, "span:status should be present on error span")
+	status, ok := statusVal.Status()
+	require.True(t, ok)
+	require.Equal(t, traceql.StatusError, status, "OTLP ERROR=2 must map to Tempo StatusError=0")
+
+	// Verify svc-server span: OTLP SERVER (2) → Tempo KindServer (3), OTLP OK (1) → Tempo StatusOk (1)
+	serverSS := byService["svc-server"]
+	require.NotNil(t, serverSS)
+	require.Len(t, serverSS.Spans, 1)
+	serverSpan := serverSS.Spans[0]
+
+	kindVal, ok = serverSpan.AttributeFor(traceql.NewIntrinsic(traceql.IntrinsicKind))
+	require.True(t, ok, "span:kind should be present on server span")
+	kind, ok = kindVal.Kind()
+	require.True(t, ok)
+	require.Equal(t, traceql.KindServer, kind, "OTLP SERVER=2 must map to Tempo KindServer=3")
+
+	statusVal, ok = serverSpan.AttributeFor(traceql.NewIntrinsic(traceql.IntrinsicStatus))
+	require.True(t, ok, "span:status should be present on ok span")
+	status, ok = statusVal.Status()
+	require.True(t, ok)
+	require.Equal(t, traceql.StatusOk, status, "OTLP OK=1 must map to Tempo StatusOk=1")
+}
+
 // TestFetch_SpansetMetadata verifies that Fetch populates the four trace-level
 // metadata fields on each returned Spanset.
 func TestFetch_SpansetMetadata(t *testing.T) {
@@ -357,58 +640,46 @@ func TestFetch_SpansetMetadata(t *testing.T) {
 		"DurationNanos for svc-b should be ~200ms")
 }
 
-// TestFetch_SecondPass_PassThrough verifies that a SecondPass function that returns
-// the spanset unchanged results in all spansets being returned, and that SecondPass
-// is called exactly once per trace.
-func TestFetch_SecondPass_PassThrough(t *testing.T) {
-	block, _ := createFetchTestBlock(t)
+// TestFetch_TimeRangeSkip verifies that Fetch returns empty results immediately when the
+// query time range falls entirely outside the block's actual span timestamps.
+// This exercises the r.BlocksInTimeRange early-return path in Fetch().
+//
+// The block is created with spans at current time. A query window ending 1 year ago
+// has no overlap — BlocksInTimeRange should return a non-nil empty slice, triggering
+// the early return with an empty iterator.
+func TestFetch_TimeRangeSkip(t *testing.T) {
+	block, resultMeta := createFetchTestBlock(t)
+
+	// Sanity check: block has a real time range set by setBlockTimeRange.
+	require.False(t, resultMeta.StartTime.IsZero(), "block StartTime must be set by setBlockTimeRange")
+	require.False(t, resultMeta.EndTime.IsZero(), "block EndTime must be set by setBlockTimeRange")
 
 	ctx := context.Background()
-	callCount := 0
+
+	// Query window: 1 year ago to 6 months ago — entirely before the block's spans.
+	oneYearAgo := uint64(time.Now().Add(-365 * 24 * time.Hour).UnixNano())
+	sixMonthsAgo := uint64(time.Now().Add(-180 * 24 * time.Hour).UnixNano())
+
 	req := traceql.FetchSpansRequest{
-		Conditions:    nil,
-		AllConditions: false,
-		SecondPass: func(ss *traceql.Spanset) ([]*traceql.Spanset, error) {
-			callCount++
-			return []*traceql.Spanset{ss}, nil
-		},
+		Conditions:          nil,
+		StartTimeUnixNanos:  oneYearAgo,
+		EndTimeUnixNanos:    sixMonthsAgo,
 	}
+
 	resp, err := block.Fetch(ctx, req, common.SearchOptions{})
 	require.NoError(t, err)
 	defer resp.Results.Close()
 
-	var spansets []*traceql.Spanset
+	var results []*traceql.Spanset
 	for {
 		ss, err := resp.Results.Next(ctx)
 		require.NoError(t, err)
 		if ss == nil {
 			break
 		}
-		spansets = append(spansets, ss)
+		results = append(results, ss)
 	}
 
-	require.Len(t, spansets, 2, "pass-through SecondPass should keep all 2 spansets")
-	require.Equal(t, 2, callCount, "SecondPass must be called once per trace (2 traces)")
+	require.Empty(t, results, "time-range skip: block with future spans must return empty when queried in the past")
 }
 
-// TestFetch_SecondPass_FilterAll verifies that a SecondPass function that returns
-// nil (no spansets) causes all spansets to be discarded.
-func TestFetch_SecondPass_FilterAll(t *testing.T) {
-	block, _ := createFetchTestBlock(t)
-
-	ctx := context.Background()
-	req := traceql.FetchSpansRequest{
-		Conditions:    nil,
-		AllConditions: false,
-		SecondPass: func(ss *traceql.Spanset) ([]*traceql.Spanset, error) {
-			return nil, nil // discard every spanset
-		},
-	}
-	resp, err := block.Fetch(ctx, req, common.SearchOptions{})
-	require.NoError(t, err)
-	defer resp.Results.Close()
-
-	ss, err := resp.Results.Next(ctx)
-	require.NoError(t, err)
-	require.Nil(t, ss, "SecondPass returning nil should discard all spansets; iterator must be empty")
-}

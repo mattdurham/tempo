@@ -14,17 +14,46 @@ import (
 	"github.com/klauspost/compress/zstd"
 
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
+	"github.com/grafana/blockpack/internal/modules/sketch"
 )
 
 // FileLayoutReport is the top-level result of AnalyzeFileLayout.
 type FileLayoutReport struct {
 	Sections        []FileLayoutSection `json:"sections"`
 	RangeIndex      []RangeIndexColumn  `json:"range_index,omitempty"`
+	SketchIndex     *SketchIndexInfo    `json:"sketch_index,omitempty"`
 	BlockSpanCounts []uint32            `json:"block_span_counts,omitempty"`
 	FileSize        int64               `json:"file_size"`
 	TotalSpans      int64               `json:"total_spans"`
 	BlockCount      int                 `json:"block_count"`
 	FileVersion     uint8               `json:"file_version"`
+}
+
+// SketchIndexInfo summarizes the sketch index stored in the file.
+type SketchIndexInfo struct {
+	// Blocks holds one summary per block (parallel to FileLayoutReport.BlockSpanCounts).
+	Blocks []BlockSketchSummary `json:"blocks"`
+	// EstimatedBytes is the estimated uncompressed size of the sketch section.
+	EstimatedBytes int `json:"estimated_bytes"`
+	// SketchedBlockCount is the number of blocks that have at least one sketched column.
+	SketchedBlockCount int `json:"sketched_block_count"`
+}
+
+// BlockSketchSummary holds per-column sketch statistics for one block.
+type BlockSketchSummary struct {
+	// Columns holds sketch stats for each column that has sketch data in this block.
+	Columns []ColumnSketchStat `json:"columns"`
+}
+
+// ColumnSketchStat holds sketch statistics for one column in one block.
+type ColumnSketchStat struct {
+	ColumnName string `json:"column_name"`
+	// HLLCardinality is the estimated number of distinct values (HyperLogLog).
+	HLLCardinality uint64 `json:"hll_cardinality"`
+	// FuseBytes is the byte size of the BinaryFuse8 filter for this column (0 if absent).
+	FuseBytes int `json:"fuse_bytes,omitempty"`
+	// TopKCount is the number of TopK entries for this column (0 if none).
+	TopKCount int `json:"top_k_count,omitempty"`
 }
 
 // RangeIndexColumn describes the pruning index for one column.
@@ -61,9 +90,18 @@ type FileLayoutSection struct {
 // Invariant: sum(section.CompressedSize) == FileSize.
 func (r *Reader) FileLayout() (*FileLayoutReport, error) {
 	const (
-		footerSize = int64(shared.FooterV3Size) // 22
-		headerSize = int64(21)
+		headerSizeV11 = int64(21)
+		headerSizeV12 = int64(22) // V12 adds signal_type byte at offset 21
 	)
+	footerSize := int64(shared.FooterV3Size)
+	if r.footerVersion == shared.FooterV4Version {
+		footerSize = int64(shared.FooterV4Size)
+	}
+
+	headerSize := headerSizeV11
+	if r.fileVersion >= shared.VersionV12 {
+		headerSize = headerSizeV12
+	}
 
 	var sections []FileLayoutSection
 
@@ -74,7 +112,7 @@ func (r *Reader) FileLayout() (*FileLayoutReport, error) {
 		CompressedSize: footerSize,
 	})
 
-	// File header: 21 bytes at r.headerOffset.
+	// File header: 21 bytes (V11) or 22 bytes (V12) at r.headerOffset.
 	sections = append(sections, FileLayoutSection{
 		Section:        "file_header",
 		Offset:         int64(r.headerOffset), //nolint:gosec
@@ -108,11 +146,49 @@ func (r *Reader) FileLayout() (*FileLayoutReport, error) {
 		})
 	}
 
+	// Intrinsic section (v4 footer only): per-column blobs + TOC.
+	if r.footerVersion == shared.FooterV4Version && r.intrinsicIndexLen > 0 {
+		// Emit per-column sections from the TOC.
+		var columnsEnd int64
+		for _, name := range r.IntrinsicColumnNames() {
+			meta, ok := r.IntrinsicColumnMeta(name)
+			if !ok {
+				continue
+			}
+			formatName := "flat"
+			if meta.Format == shared.IntrinsicFormatDict {
+				formatName = "dict"
+			}
+			sections = append(sections, FileLayoutSection{
+				Section:        "intrinsic.column[" + name + "]",
+				ColumnName:     name,
+				ColumnType:     columnTypeName(meta.Type),
+				Encoding:       formatName,
+				Offset:         int64(meta.Offset),    //nolint:gosec
+				CompressedSize: int64(meta.Length),     //nolint:gosec
+			})
+			end := int64(meta.Offset) + int64(meta.Length) //nolint:gosec
+			if end > columnsEnd {
+				columnsEnd = end
+			}
+		}
+		// TOC blob: from end of last column to end of intrinsic index.
+		tocEnd := int64(r.intrinsicIndexOffset) + int64(r.intrinsicIndexLen) //nolint:gosec
+		if columnsEnd > 0 && tocEnd > columnsEnd {
+			sections = append(sections, FileLayoutSection{
+				Section:        "intrinsic.toc",
+				Offset:         columnsEnd,
+				CompressedSize: tocEnd - columnsEnd,
+			})
+		}
+	}
+
 	sort.Slice(sections, func(i, j int) bool {
 		return sections[i].Offset < sections[j].Offset
 	})
 
 	rangeIndex := r.buildRangeIndex()
+	sketchIndex := r.buildSketchIndexInfo()
 
 	spanCounts := make([]uint32, len(r.blockMetas))
 	var totalSpans int64
@@ -129,7 +205,98 @@ func (r *Reader) FileLayout() (*FileLayoutReport, error) {
 		BlockSpanCounts: spanCounts,
 		Sections:        sections,
 		RangeIndex:      rangeIndex,
+		SketchIndex:     sketchIndex,
 	}, nil
+}
+
+// buildSketchIndexInfo builds the SketchIndexInfo from the reader's parsed column-major sketch data.
+// Returns nil when no sketches are present.
+func (r *Reader) buildSketchIndexInfo() *SketchIndexInfo {
+	if r.sketchIdx == nil || len(r.sketchIdx.columns) == 0 {
+		return nil
+	}
+
+	numBlocks := r.sketchIdx.numBlocks
+	info := &SketchIndexInfo{
+		Blocks: make([]BlockSketchSummary, numBlocks),
+	}
+
+	// Build per-block summaries from column-major data.
+	// For each block, collect which columns are present and their stats.
+	type blockColStat struct {
+		name        string
+		cardinality uint64
+		topkCount   int
+	}
+	blockCols := make([][]blockColStat, numBlocks)
+
+	for name, cd := range r.sketchIdx.columns {
+		for pi, blockIdx := range cd.presentMap {
+			stat := blockColStat{
+				name:        name,
+				cardinality: uint64(cd.distinct[blockIdx]),
+				topkCount:   len(cd.topkFP[pi]),
+			}
+			blockCols[blockIdx] = append(blockCols[blockIdx], stat)
+		}
+	}
+
+	for blockIdx := range numBlocks {
+		cols := blockCols[blockIdx]
+		if len(cols) == 0 {
+			continue
+		}
+		info.SketchedBlockCount++
+
+		// Sort by column name for deterministic output.
+		sort.Slice(cols, func(i, j int) bool { return cols[i].name < cols[j].name })
+
+		stats := make([]ColumnSketchStat, 0, len(cols))
+		for _, c := range cols {
+			stats = append(stats, ColumnSketchStat{
+				ColumnName:     c.name,
+				HLLCardinality: c.cardinality,
+				TopKCount:      c.topkCount,
+			})
+		}
+		info.Blocks[blockIdx] = BlockSketchSummary{Columns: stats}
+	}
+
+	info.EstimatedBytes = estimateSketchSectionSize(r.sketchIdx)
+	return info
+}
+
+// estimateSketchSectionSize estimates the uncompressed size of the column-major sketch section.
+// Header: 12 bytes. Per column: name + presence + distinct + topk + cms + fuse.
+func estimateSketchSectionSize(idx *sketchIndex) int {
+	if idx == nil {
+		return 0
+	}
+	numBlocks := idx.numBlocks
+	presenceBytes := (numBlocks + 7) / 8
+
+	total := 12 // magic[4] + num_blocks[4] + num_columns[4]
+	for name, cd := range idx.columns {
+		presentCount := len(cd.presentMap)
+		total += 2 + len(name) // name_len[2] + name
+		total += presenceBytes // presence bitset
+		total += numBlocks * 4 // distinct counts
+		total++                // topk_k[1]
+		total += presentCount  // topk_entry_count per present block
+		for pi := range presentCount {
+			total += len(cd.topkFP[pi]) * 10 // fp[8] + count[2] per entry
+		}
+		total++                                                       // cms_depth[1]
+		total += 2                                                    // cms_width[2]
+		total += presentCount * sketch.CMSDepth * sketch.CMSWidth * 2 // cms data per present block
+		for pi := range presentCount {
+			total += 4 // fuse_len[4]
+			if pi < len(cd.fuseRawLens) {
+				total += cd.fuseRawLens[pi]
+			}
+		}
+	}
+	return total
 }
 
 // buildRangeIndex parses every column's range index and returns the result sorted by column name.
@@ -287,9 +454,11 @@ func (r *Reader) layoutMetadata() ([]FileLayoutSection, error) {
 	// breaking the byte invariant (sum(CompressedSize) == FileSize).
 	if isV12 {
 		sections = append(sections, FileLayoutSection{
-			Section:          "metadata.compressed",
-			Offset:           base,
-			CompressedSize:   int64(r.metadataLen),        //nolint:gosec // safe: metadataLen is a file length, fits int64
+			Section: "metadata.compressed",
+			Offset:  base,
+			CompressedSize: int64(
+				r.metadataLen,
+			), //nolint:gosec // safe: metadataLen is a file length, fits int64
 			UncompressedSize: int64(len(r.metadataBytes)), //nolint:gosec // safe: len(slice) always fits int64
 		})
 		return sections, nil
@@ -394,6 +563,8 @@ func columnTypeName(t shared.ColumnType) string {
 		return "RangeBytes"
 	case shared.ColumnTypeRangeString:
 		return "RangeString"
+	case shared.ColumnTypeUUID:
+		return "UUID"
 	default:
 		return fmt.Sprintf("Unknown(%d)", t)
 	}

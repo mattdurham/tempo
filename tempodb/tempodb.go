@@ -35,6 +35,7 @@ import (
 	"github.com/grafana/tempo/tempodb/blocklist"
 	"github.com/grafana/tempo/tempodb/encoding"
 	"github.com/grafana/tempo/tempodb/encoding/common"
+	"github.com/grafana/tempo/tempodb/encoding/vblockpack"
 	"github.com/grafana/tempo/tempodb/pool"
 	"github.com/grafana/tempo/tempodb/wal"
 )
@@ -231,6 +232,14 @@ func New(cfg *Config, cacheProvider cache.Provider, logger gkLog.Logger) (Reader
 	rw.wal, err = wal.New(rw.cfg.WAL)
 	if err != nil {
 		return nil, nil, nil, err
+	}
+
+	// Initialize the blockpack disk cache so it's available for queries.
+	// CreateBlock/Compact also call this, but the querier never runs those paths.
+	// NOTE: In local benchmarks with minio, bbolt overhead (mmap memmove + GC pressure)
+	// exceeds the S3 latency savings. The disk cache helps more with real S3 (50-100ms RTT).
+	if cfg.Block != nil && cfg.Block.Blockpack.FileCachePath != "" {
+		vblockpack.ConfigureFileCache(cfg.Block.Blockpack.FileCachePath, cfg.Block.Blockpack.FileCacheMaxBytes)
 	}
 
 	return rw, rw, rw, nil
