@@ -397,9 +397,8 @@ func (b *blockBuilder) addRowFromProto(ps *pendingSpan, rowIdx int) {
 		binary.LittleEndian.PutUint64(tmp[:], span.EndTimeUnixNano)
 		b.updateMinMax("span:end", shared.ColumnTypeUint64, string(tmp[:]))
 	}
-	if a := b.intrinsicAccum; a != nil {
-		a.feedUint64("span:end", shared.ColumnTypeUint64, span.EndTimeUnixNano, b.intrinsicBlockID, rowIdx)
-	}
+	// span:end is NOT written to the intrinsic section — it is synthesized
+	// from span:start + span:duration on read, saving ~6% of file size.
 
 	// span:duration — always present.
 	var dur uint64
@@ -698,9 +697,7 @@ func (b *blockBuilder) addRowFromBlock(srcBlock *modules_reader.Block, srcRowIdx
 				b.updateMinMax("span:end", shared.ColumnTypeUint64, string(tmp[:]))
 				spanEnd = v
 				spanEndFound = true
-				if a := b.intrinsicAccum; a != nil {
-					a.feedUint64("span:end", shared.ColumnTypeUint64, v, b.intrinsicBlockID, dstRowIdx)
-				}
+				// span:end NOT written to intrinsic section — synthesized on read.
 			}
 			continue
 

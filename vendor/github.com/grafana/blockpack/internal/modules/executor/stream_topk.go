@@ -134,100 +134,17 @@ func topKScanRows(
 //
 // SPEC-STREAM-7: CollectTopK guarantees global top-K correctness.
 // Back-ref: internal/modules/executor/stream_topk.go:CollectTopK
+// CollectTopK is a compatibility shim. Timestamp-sorted top-K collection is now
+// handled inside Collect: when TimestampColumn and Limit are both set, Collect uses
+// a heap-based scan to guarantee globally correct top-K results.
+//
+// Callers should prefer Collect directly. CollectTopK remains for backward compatibility.
 func (e *Executor) CollectTopK(
 	r *modules_reader.Reader,
 	program *vm.Program,
 	opts CollectOptions,
 ) ([]MatchedRow, error) {
-	if r == nil {
-		return nil, nil
-	}
-	if opts.Limit == 0 {
-		return e.Collect(r, program, opts)
-	}
-	if opts.TimestampColumn == "" {
-		return nil, fmt.Errorf("executor.CollectTopK: TimestampColumn must be set for top-K queries")
-	}
-	if program == nil {
-		return nil, fmt.Errorf("executor.CollectTopK: program must not be nil")
-	}
-	if opts.StartBlock < 0 || opts.BlockCount < 0 {
-		return nil, fmt.Errorf(
-			"executor.CollectTopK: invalid shard parameters: StartBlock=%d BlockCount=%d",
-			opts.StartBlock,
-			opts.BlockCount,
-		)
-	}
-	if opts.BlockCount > 0 && opts.StartBlock+opts.BlockCount < opts.StartBlock {
-		return nil, fmt.Errorf(
-			"executor.CollectTopK: shard range overflow: StartBlock=%d BlockCount=%d",
-			opts.StartBlock,
-			opts.BlockCount,
-		)
-	}
-
-	planner := queryplanner.NewPlanner(r)
-	predicates := buildPredicates(r, program)
-	// No Limit passed to plan — we select top-K ourselves via the heap.
-	plan := planner.PlanWithOptions(predicates, opts.TimeRange, queryplanner.PlanOptions{
-		Direction: opts.Direction,
-	})
-
-	// Sub-file sharding: filter to assigned block range.
-	if opts.BlockCount > 0 {
-		endBlock := opts.StartBlock + opts.BlockCount
-		filtered := plan.SelectedBlocks[:0]
-		for _, bi := range plan.SelectedBlocks {
-			if bi >= opts.StartBlock && bi < endBlock {
-				filtered = append(filtered, bi)
-			}
-		}
-		plan.SelectedBlocks = filtered
-	}
-
-	fetchedBlocks := 0
-	if opts.OnStats != nil {
-		defer func() {
-			opts.OnStats(CollectStats{
-				TotalBlocks:    plan.TotalBlocks,
-				PrunedByTime:   plan.PrunedByTime,
-				PrunedByIndex:  plan.PrunedByIndex,
-				PrunedByFuse:   plan.PrunedByFuse,
-				PrunedByCMS:    plan.PrunedByCMS,
-				SelectedBlocks: len(plan.SelectedBlocks),
-				FetchedBlocks:  fetchedBlocks,
-				Explain:        plan.Explain,
-			})
-		}()
-	}
-
-	if len(plan.SelectedBlocks) == 0 {
-		return nil, nil
-	}
-
-	backward := opts.Direction == queryplanner.Backward
-	buf := &topKHeap{
-		entries:  make([]topKEntry, 0, opts.Limit),
-		backward: backward,
-	}
-
-	groups := r.CoalescedGroups(plan.SelectedBlocks)
-	blockToGroup := make(map[int]int, len(plan.SelectedBlocks))
-	for gi, g := range groups {
-		for _, bi := range g.BlockIDs {
-			blockToGroup[bi] = gi
-		}
-	}
-
-	wantColumns := ProgramWantColumns(program)
-
-	var err error
-	fetchedBlocks, err = topKScanBlocks(r, program, wantColumns, opts, plan, buf, groups, blockToGroup, backward)
-	if err != nil {
-		return nil, err
-	}
-
-	return topKDeliver(buf, backward), nil
+	return e.Collect(r, program, opts)
 }
 
 // topKScanBlocks iterates selected blocks, fetches them lazily, and fills buf.

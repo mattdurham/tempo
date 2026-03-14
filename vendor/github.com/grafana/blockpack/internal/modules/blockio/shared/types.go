@@ -103,6 +103,29 @@ type IntrinsicDictEntry struct {
 	Int64Val  int64  // set for Int64 type
 }
 
+// PageMeta describes one page in a paged (v2) intrinsic column.
+// All page blobs are stored contiguously after the page TOC blob in the on-disk region.
+type PageMeta struct {
+	// Pointer fields first for better GC scan alignment.
+	Min   string // encoded min value (same encoding as IntrinsicColMeta)
+	Max   string // encoded max value
+	Bloom []byte // bloom filter bytes; nil for flat columns
+	// Scalar fields.
+	Offset   uint32 // byte offset of this page blob relative to first page blob start
+	Length   uint32 // compressed page blob size in bytes
+	RowCount uint32 // number of records in this page
+}
+
+// PagedIntrinsicTOC holds the page index (table of contents) for one v2 paged column.
+// It is decoded from the snappy-compressed TOC blob that precedes the page blobs.
+type PagedIntrinsicTOC struct {
+	Pages         []PageMeta
+	BlockIdxWidth uint8
+	RowIdxWidth   uint8
+	Format        uint8      // IntrinsicFormatFlat or IntrinsicFormatDict
+	ColType       ColumnType
+}
+
 // IntrinsicColMeta is one entry in the intrinsic column TOC (table of contents).
 // Each entry records the location and summary statistics for one intrinsic column blob.
 type IntrinsicColMeta struct {

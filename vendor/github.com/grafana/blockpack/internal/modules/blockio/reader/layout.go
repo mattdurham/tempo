@@ -159,13 +159,31 @@ func (r *Reader) FileLayout() (*FileLayoutReport, error) {
 			if meta.Format == shared.IntrinsicFormatDict {
 				formatName = "dict"
 			}
+
+			// Check if this column uses v2 paged format by reading the first byte.
+			blob, blobErr := r.GetIntrinsicColumnBlob(name)
+			isPaged := blobErr == nil && len(blob) > 0 && blob[0] == shared.IntrinsicPagedVersion
+			if isPaged {
+				formatName += "/paged"
+				// Decode page TOC to get per-page breakdown.
+				if len(blob) >= 5 {
+					tocLen := int(binary.LittleEndian.Uint32(blob[1:5]))
+					if 5+tocLen <= len(blob) {
+						ptoc, tocErr := shared.DecodePageTOC(blob[5 : 5+tocLen])
+						if tocErr == nil {
+							formatName = fmt.Sprintf("%s/paged(%d pages)", formatName[:len(formatName)-6], len(ptoc.Pages))
+						}
+					}
+				}
+			}
+
 			sections = append(sections, FileLayoutSection{
 				Section:        "intrinsic.column[" + name + "]",
 				ColumnName:     name,
 				ColumnType:     columnTypeName(meta.Type),
 				Encoding:       formatName,
-				Offset:         int64(meta.Offset),    //nolint:gosec
-				CompressedSize: int64(meta.Length),     //nolint:gosec
+				Offset:         int64(meta.Offset), //nolint:gosec
+				CompressedSize: int64(meta.Length),  //nolint:gosec
 			})
 			end := int64(meta.Offset) + int64(meta.Length) //nolint:gosec
 			if end > columnsEnd {

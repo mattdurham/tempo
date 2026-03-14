@@ -5,12 +5,23 @@ package reader
 import (
 	"encoding/binary"
 	"fmt"
+	"sync"
 
 	"github.com/golang/snappy"
 
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
 	"github.com/grafana/blockpack/internal/modules/rw"
 )
+
+// parsedSketchCache caches fully parsed sketchIndex objects by fileID+"/sketch".
+// Since sketch data is immutable (written once per file), entries are never evicted.
+// This avoids re-parsing the sketch section on every Reader creation.
+var parsedSketchCache sync.Map // key: string → value: *sketchIndex
+
+// parsedIntrinsicCache caches fully decoded IntrinsicColumn objects by fileID+"/intrinsic/"+colName.
+// Since intrinsic column data is immutable (written once per file), entries are never evicted.
+// This avoids re-running DecodeIntrinsicColumnBlob (snappy + struct build) on every Reader creation.
+var parsedIntrinsicCache sync.Map // key: string → value: *shared.IntrinsicColumn
 
 // rangeIndexMeta records the byte range within metadataBytes for a
 // range column index entry (lazy parsing).
@@ -174,34 +185,43 @@ func (r *Reader) parseV5MetadataLazy() error {
 		return fmt.Errorf("parseMetadata: metadata too large: %d bytes", r.metadataLen)
 	}
 
-	cacheKey := r.fileID + "/metadata"
-
-	data, err := r.cache.GetOrFetch(cacheKey, func() ([]byte, error) {
-		return r.readRange(r.metadataOffset, r.metadataLen, rw.DataTypeMetadata)
-	})
+	// NOTE-PERF: For snappy-compressed metadata (VersionV12), we cache the *decompressed*
+	// bytes under a distinct key ("/metadata/dec") so snappy.Decode runs only on a cache miss,
+	// not on every Reader creation. The old "/metadata" key stored compressed bytes and paid
+	// full decompression cost every query — profiling showed 23+ s/30s wasted there.
+	var (
+		cacheKey string
+		data     []byte
+		err      error
+	)
+	if r.fileVersion == shared.VersionV12 {
+		cacheKey = r.fileID + "/metadata/dec"
+		data, err = r.cache.GetOrFetch(cacheKey, func() ([]byte, error) {
+			compressed, readErr := r.readRange(r.metadataOffset, r.metadataLen, rw.DataTypeMetadata)
+			if readErr != nil {
+				return nil, readErr
+			}
+			// Guard against decompression bombs before allocating the decode buffer.
+			decodedLen, lenErr := snappy.DecodedLen(compressed)
+			if lenErr != nil {
+				return nil, fmt.Errorf("snappy decoded length: %w", lenErr)
+			}
+			if uint64(decodedLen) > shared.MaxMetadataSize { //nolint:gosec // safe: decodedLen is non-negative
+				return nil, fmt.Errorf(
+					"snappy decoded size %d exceeds MaxMetadataSize %d",
+					decodedLen, shared.MaxMetadataSize,
+				)
+			}
+			return snappy.Decode(nil, compressed)
+		})
+	} else {
+		cacheKey = r.fileID + "/metadata"
+		data, err = r.cache.GetOrFetch(cacheKey, func() ([]byte, error) {
+			return r.readRange(r.metadataOffset, r.metadataLen, rw.DataTypeMetadata)
+		})
+	}
 	if err != nil {
 		return fmt.Errorf("parseMetadata: %w", err)
-	}
-
-	if r.fileVersion == shared.VersionV12 {
-		// Guard against decompression bombs before allocating the decode buffer.
-		decodedLen, lenErr := snappy.DecodedLen(data)
-		if lenErr != nil {
-			return fmt.Errorf("parseMetadata: snappy decoded length: %w", lenErr)
-		}
-		if uint64(decodedLen) > shared.MaxMetadataSize { //nolint:gosec // safe: decodedLen is non-negative
-			return fmt.Errorf(
-				"parseMetadata: snappy decoded size %d exceeds MaxMetadataSize %d",
-				decodedLen, shared.MaxMetadataSize,
-			)
-		}
-		// Note: snappy.Decode re-reads the length prefix internally; the pre-check above
-		// cannot be avoided with this API.
-		decoded, decErr := snappy.Decode(nil, data)
-		if decErr != nil {
-			return fmt.Errorf("parseMetadata: snappy decode: %w", decErr)
-		}
-		data = decoded
 	}
 
 	r.metadataBytes = data
@@ -255,13 +275,15 @@ func (r *Reader) parseV5MetadataLazy() error {
 
 	pos += newPos
 
-	// Trace block index.
-	traceIdx, consumed, err := parseTraceBlockIndex(data[pos:])
+	// Trace block index — parsed lazily on first access (search queries never use it).
+	// Store raw bytes and skip over the section to reach TS and sketch sections.
+	consumed, err := skipTraceBlockIndex(data[pos:])
 	if err != nil {
 		return fmt.Errorf("parseMetadata: trace_index: %w", err)
 	}
-
-	r.traceIndex = traceIdx
+	if consumed > 0 {
+		r.traceIndexRaw = data[pos : pos+consumed]
+	}
 	pos += consumed
 
 	// TS index section — optional, present in files written after 2026-03-02.
@@ -276,8 +298,23 @@ func (r *Reader) parseV5MetadataLazy() error {
 	}
 
 	// Sketch index section — optional, present in files written after 2026-03-07.
-	// parseSketchIndexSection returns (nil, 0, nil) for old files (graceful degradation).
-	if pos < len(data) {
+	// Cache the parsed result by fileID to avoid re-parsing on every Reader creation.
+	if pos < len(data) && r.fileID != "" {
+		skCacheKey := r.fileID + "/sketch"
+		if cached, ok := parsedSketchCache.Load(skCacheKey); ok {
+			r.sketchIdx = cached.(*sketchIndex)
+		} else {
+			sketches, skConsumed, skErr := parseSketchIndexSection(data[pos:])
+			if skErr != nil {
+				return fmt.Errorf("parseMetadata: sketch_index: %w", skErr)
+			}
+			r.sketchIdx = sketches
+			pos += skConsumed
+			if sketches != nil {
+				parsedSketchCache.Store(skCacheKey, sketches)
+			}
+		}
+	} else if pos < len(data) {
 		sketches, skConsumed, skErr := parseSketchIndexSection(data[pos:])
 		if skErr != nil {
 			return fmt.Errorf("parseMetadata: sketch_index: %w", skErr)
@@ -461,6 +498,43 @@ func parseTraceBlockIndex(data []byte) (map[[16]byte][]uint16, int, error) {
 	}
 
 	return result, pos, nil
+}
+
+// skipTraceBlockIndex advances past a trace block index section without building
+// the map. This avoids O(N) allocations for search queries that never use the index.
+// Returns (consumed, nil) on success; (0, nil) for empty/missing sections.
+func skipTraceBlockIndex(data []byte) (int, error) {
+	if len(data) < 5 {
+		return 0, nil
+	}
+	fmtVersion := data[0]
+	if fmtVersion != shared.TraceIndexFmtVersion && fmtVersion != shared.TraceIndexFmtVersion2 {
+		return 0, fmt.Errorf("trace_index: unsupported fmt_version %d", fmtVersion)
+	}
+	traceCount := int(binary.LittleEndian.Uint32(data[1:]))
+	pos := 5
+	for t := range traceCount {
+		if pos+18 > len(data) {
+			return pos, fmt.Errorf("trace_index: trace[%d]: short for trace_id+block_count", t)
+		}
+		pos += 16 // trace_id
+		blockRefCount := int(binary.LittleEndian.Uint16(data[pos:]))
+		pos += 2
+		if fmtVersion == shared.TraceIndexFmtVersion {
+			// v1: block_id[2] + span_count[2] + span_indices[N×2]
+			for b := range blockRefCount {
+				if pos+4 > len(data) {
+					return pos, fmt.Errorf("trace_index: trace[%d] block[%d]: short", t, b)
+				}
+				spanCount := int(binary.LittleEndian.Uint16(data[pos+2:]))
+				pos += 4 + spanCount*2
+			}
+		} else {
+			// v2: block_id[2] only
+			pos += blockRefCount * 2
+		}
+	}
+	return pos, nil
 }
 
 // scanRangeIndexOffsets scans the range index data recording byte offset+length

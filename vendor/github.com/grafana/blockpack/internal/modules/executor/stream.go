@@ -8,6 +8,7 @@ import (
 	"slices"
 
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
+	modules_shared "github.com/grafana/blockpack/internal/modules/blockio/shared"
 	"github.com/grafana/blockpack/internal/modules/queryplanner"
 	"github.com/grafana/blockpack/internal/vm"
 )
@@ -113,6 +114,18 @@ func (e *Executor) Collect(
 		}
 	}
 
+	// Intrinsic fast path: for intrinsic-only queries with a limit, read only the
+	// intrinsic column section (small blobs, no full block I/O) to get matching
+	// (blockIdx, rowIdx) pairs, then fetch only the minimal set of blocks needed.
+	// When TimestampColumn is set (MostRecent queries), the timestamp intrinsic column
+	// is used to select the globally top-K rows without reading any full blocks.
+	// Falls through to the regular planner path when not applicable.
+	if opts.Limit > 0 && opts.BlockCount == 0 && ProgramIsIntrinsicOnly(program) {
+		if rows, err := collectFromIntrinsicRefs(r, program, opts, wantColumns, secondPassCols); rows != nil || err != nil {
+			return rows, err
+		}
+	}
+
 	planner := queryplanner.NewPlanner(r)
 	predicates := buildPredicates(r, program)
 	plan := planner.PlanWithOptions(predicates, opts.TimeRange, queryplanner.PlanOptions{
@@ -175,8 +188,6 @@ func (e *Executor) Collect(
 		return nil, nil
 	}
 
-	var results []MatchedRow
-
 	// SPEC-STREAM-2: Partition selected blocks into ~8 MB coalesced groups for lazy batched I/O.
 	groups := r.CoalescedGroups(plan.SelectedBlocks)
 
@@ -187,6 +198,23 @@ func (e *Executor) Collect(
 			blockToGroup[bi] = gi
 		}
 	}
+
+	// Heap-based scan for timestamp-sorted queries (MostRecent/Oldest with a limit).
+	// Guarantees globally correct top-K by scanning all blocks and maintaining a priority
+	// queue. The intrinsic fast path (above) already handles intrinsic-only queries without
+	// full block I/O; this path handles all other timestamp-sorted queries.
+	if opts.TimestampColumn != "" && opts.Limit > 0 {
+		backward := opts.Direction == queryplanner.Backward
+		buf := &topKHeap{entries: make([]topKEntry, 0, opts.Limit), backward: backward}
+		fc, scanErr := topKScanBlocks(r, program, wantColumns, opts, plan, buf, groups, blockToGroup, backward)
+		fetchedBlocks = fc
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		return topKDeliver(buf, backward), nil
+	}
+
+	var results []MatchedRow
 
 	fetched := make(map[int][]byte)
 	fetchedGroupsSeen := make(map[int]bool)
@@ -322,4 +350,206 @@ func streamSortedRows(
 		}
 	}
 	return false
+}
+
+// collectFromIntrinsicRefs is the fast path for intrinsic-only queries with a limit.
+// It reads only the tiny intrinsic column blobs to get matching BlockRefs, then
+// fetches only the blocks containing those refs — skipping all unneeded block I/O.
+//
+// When opts.TimestampColumn is set (MostRecent queries), delegates to
+// collectTopKFromIntrinsicRefs which selects the globally top-K rows by timestamp
+// using only intrinsic column data — no full block reads for predicate evaluation.
+//
+// Returns (nil, nil) to signal the caller to fall through to the regular Collect path when:
+//   - The file has no intrinsic section
+//   - BlockRefsFromIntrinsicTOC returns nil (predicate not evaluable from intrinsic data)
+//   - No matching refs are found (caller should still run regular path to be safe)
+func collectFromIntrinsicRefs(
+	r *modules_reader.Reader,
+	program *vm.Program,
+	opts CollectOptions,
+	wantColumns map[string]struct{},
+	secondPassCols map[string]struct{},
+) ([]MatchedRow, error) {
+	if opts.TimestampColumn != "" {
+		return collectTopKFromIntrinsicRefs(r, program, opts, wantColumns, secondPassCols)
+	}
+	refs := BlockRefsFromIntrinsicTOC(r, program, opts.Limit)
+	if refs == nil {
+		return nil, nil // fast path not available — fall through
+	}
+	if len(refs) == 0 {
+		return nil, nil // no matches: fall through so regular path can confirm
+	}
+
+	// Group refs by block index.
+	type blockEntry struct {
+		blockIdx int
+		rowIdxs  []int
+	}
+	// Maintain insertion order so we respect block order.
+	blockOrder := make([]int, 0, 4)
+	blockRows := make(map[int][]int, 4)
+	for _, ref := range refs {
+		bi := int(ref.BlockIdx)
+		if _, seen := blockRows[bi]; !seen {
+			blockOrder = append(blockOrder, bi)
+		}
+		blockRows[bi] = append(blockRows[bi], int(ref.RowIdx))
+	}
+
+	var results []MatchedRow
+
+	for _, blockIdx := range blockOrder {
+		rowIdxs := blockRows[blockIdx]
+
+		// Fetch raw bytes for this block via a single-block coalesced group.
+		groups := r.CoalescedGroups([]int{blockIdx})
+		if len(groups) == 0 {
+			continue
+		}
+		groupRaw, err := r.ReadGroup(groups[0])
+		if err != nil {
+			return nil, fmt.Errorf("collectFromIntrinsicRefs ReadGroup block %d: %w", blockIdx, err)
+		}
+		raw, ok := groupRaw[blockIdx]
+		if !ok {
+			continue
+		}
+
+		meta := r.BlockMeta(blockIdx)
+		r.ResetInternStrings()
+		bwb, err := r.ParseBlockFromBytes(raw, wantColumns, meta)
+		if err != nil {
+			return nil, fmt.Errorf("collectFromIntrinsicRefs ParseBlockFromBytes block %d: %w", blockIdx, err)
+		}
+
+		// Second pass if needed (same logic as Collect).
+		if wantColumns != nil {
+			bwb, err = r.ParseBlockFromBytes(bwb.RawBytes, secondPassCols, meta)
+			if err != nil {
+				return nil, fmt.Errorf("collectFromIntrinsicRefs second pass block %d: %w", blockIdx, err)
+			}
+		}
+
+		for _, rowIdx := range rowIdxs {
+			results = append(results, MatchedRow{Block: bwb.Block, BlockIdx: blockIdx, RowIdx: rowIdx})
+			if opts.Limit > 0 && len(results) >= opts.Limit {
+				return results, nil
+			}
+		}
+	}
+
+	return results, nil
+}
+
+// collectTopKFromIntrinsicRefs is the fast path for intrinsic-only queries with
+// a timestamp sort (MostRecent). It uses only intrinsic column blobs to:
+//  1. Get ALL refs matching the predicate (no block I/O, no per-row limit).
+//  2. Build a lookup set for O(1) membership checks.
+//  3. Read opts.TimestampColumn (a flat sorted-ascending uint64 column).
+//  4. Scan from newest (end) or oldest (start) based on Direction, checking membership.
+//  5. Collect the top opts.Limit matching refs — these are the globally top-K by timestamp.
+//  6. Fetch only the blocks containing those rows for result materialization.
+//
+// Returns (nil, nil) to fall through to the regular Collect path when:
+//   - BlockRefsFromIntrinsicTOC returns nil (predicate not evaluable or no intrinsic section)
+//   - The timestamp intrinsic column is unavailable or not a flat uint64 column
+//   - No matching refs survive the predicate
+func collectTopKFromIntrinsicRefs(
+	r *modules_reader.Reader,
+	program *vm.Program,
+	opts CollectOptions,
+	wantColumns map[string]struct{},
+	secondPassCols map[string]struct{},
+) ([]MatchedRow, error) {
+	// limit=0 → all refs (no per-row cutoff); top-K selection happens via tsCol scan.
+	allRefs := BlockRefsFromIntrinsicTOC(r, program, 0)
+	if allRefs == nil {
+		return nil, nil // fast path not available
+	}
+	if len(allRefs) == 0 {
+		return nil, nil // no matches: fall through so regular path can confirm
+	}
+
+	// Build lookup set for O(1) membership checks.
+	type refKey struct{ blockIdx, rowIdx uint16 }
+	refSet := make(map[refKey]struct{}, len(allRefs))
+	for _, ref := range allRefs {
+		refSet[refKey{ref.BlockIdx, ref.RowIdx}] = struct{}{}
+	}
+
+	// Scan timestamp column refs directly from raw bytes — skips value decode entirely.
+	// The sorted order of refs mirrors the sorted timestamp values (parallel arrays).
+	backward := opts.Direction == queryplanner.Backward
+	tsBlob, tsBlobErr := r.GetIntrinsicColumnBlob(opts.TimestampColumn)
+	if tsBlobErr != nil || tsBlob == nil {
+		return nil, nil // no timestamp intrinsic column — fall through
+	}
+
+	selected := modules_shared.ScanFlatColumnRefsFiltered(tsBlob, backward, opts.Limit,
+		func(ref modules_shared.BlockRef) bool {
+			_, ok := refSet[refKey{ref.BlockIdx, ref.RowIdx}]
+			return ok
+		},
+	)
+	if selected == nil {
+		return nil, nil // not a flat column or decode error — fall through
+	}
+	if len(selected) == 0 {
+		return nil, nil // no matches after timestamp filtering — fall through
+	}
+
+	// Collect the unique block indices needed (preserving selected order for later).
+	uniqueBlocks := make([]int, 0, 4)
+	seenBlocks := make(map[int]struct{}, 4)
+	for _, ref := range selected {
+		bi := int(ref.BlockIdx)
+		if _, seen := seenBlocks[bi]; !seen {
+			seenBlocks[bi] = struct{}{}
+			uniqueBlocks = append(uniqueBlocks, bi)
+		}
+	}
+
+	// Fetch and parse each needed block once.
+	parsedBlocks := make(map[int]*modules_reader.Block, len(uniqueBlocks))
+	for _, blockIdx := range uniqueBlocks {
+		groups := r.CoalescedGroups([]int{blockIdx})
+		if len(groups) == 0 {
+			continue
+		}
+		groupRaw, fetchErr := r.ReadGroup(groups[0])
+		if fetchErr != nil {
+			return nil, fmt.Errorf("collectTopKFromIntrinsicRefs ReadGroup block %d: %w", blockIdx, fetchErr)
+		}
+		raw, ok := groupRaw[blockIdx]
+		if !ok {
+			continue
+		}
+		meta := r.BlockMeta(blockIdx)
+		r.ResetInternStrings()
+		bwb, parseErr := r.ParseBlockFromBytes(raw, wantColumns, meta)
+		if parseErr != nil {
+			return nil, fmt.Errorf("collectTopKFromIntrinsicRefs ParseBlockFromBytes block %d: %w", blockIdx, parseErr)
+		}
+		if wantColumns != nil {
+			bwb, parseErr = r.ParseBlockFromBytes(bwb.RawBytes, secondPassCols, meta)
+			if parseErr != nil {
+				return nil, fmt.Errorf("collectTopKFromIntrinsicRefs second pass block %d: %w", blockIdx, parseErr)
+			}
+		}
+		parsedBlocks[blockIdx] = bwb.Block
+	}
+
+	// Build results in selected order (preserves timestamp ordering from the scan).
+	results := make([]MatchedRow, 0, len(selected))
+	for _, ref := range selected {
+		bi := int(ref.BlockIdx)
+		block, ok := parsedBlocks[bi]
+		if !ok {
+			continue
+		}
+		results = append(results, MatchedRow{Block: block, BlockIdx: bi, RowIdx: int(ref.RowIdx)})
+	}
+	return results, nil
 }

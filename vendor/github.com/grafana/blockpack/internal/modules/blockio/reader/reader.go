@@ -37,6 +37,10 @@ type Reader struct {
 
 	traceIndex map[[16]byte][]uint16
 
+	// traceIndexRaw holds the raw bytes of the trace index section for lazy parsing.
+	// Populated during parseV5MetadataLazy; parsed into traceIndex on first access.
+	traceIndexRaw []byte
+
 	// Range index — lazy.
 	rangeOffsets  map[string]rangeIndexMeta
 	rangeParsed   map[string]parsedRangeIndex
@@ -200,6 +204,7 @@ func (r *Reader) BlockCount() int { return len(r.blockMetas) }
 // Uses the trace index (full or compact) to determine the count.
 // Returns 0 if no trace index is available.
 func (r *Reader) TraceCount() int {
+	r.ensureTraceIndex()
 	if len(r.traceIndex) > 0 {
 		return len(r.traceIndex)
 	}
@@ -207,6 +212,19 @@ func (r *Reader) TraceCount() int {
 		return len(r.compactParsed.traceIndex)
 	}
 	return 0
+}
+
+// ensureTraceIndex parses the trace block index from raw bytes if not yet parsed.
+// No-op if already parsed or no raw bytes are available.
+func (r *Reader) ensureTraceIndex() {
+	if r.traceIndex != nil || len(r.traceIndexRaw) == 0 {
+		return
+	}
+	idx, _, err := parseTraceBlockIndex(r.traceIndexRaw)
+	if err == nil {
+		r.traceIndex = idx
+	}
+	r.traceIndexRaw = nil // free raw bytes after parsing
 }
 
 // SignalType returns the signal type stored in the file header.
@@ -408,6 +426,7 @@ func (r *Reader) ParseBlockFromBytes(
 
 // HasTraceIndex reports whether the reader has a populated trace block index.
 func (r *Reader) HasTraceIndex() bool {
+	r.ensureTraceIndex()
 	return len(r.traceIndex) > 0
 }
 
@@ -419,6 +438,7 @@ type TraceEntry struct {
 // TraceEntries returns the block IDs containing spans for the given trace ID.
 // Falls back to the compact trace index when the main index is empty (lean reader path).
 func (r *Reader) TraceEntries(traceID [16]byte) []TraceEntry {
+	r.ensureTraceIndex()
 	blockIDs, ok := r.traceIndex[traceID]
 	if !ok && r.compactParsed != nil {
 		blockIDs, ok = r.compactParsed.traceIndex[traceID]

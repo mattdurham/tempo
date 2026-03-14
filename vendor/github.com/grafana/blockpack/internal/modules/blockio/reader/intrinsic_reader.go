@@ -66,10 +66,35 @@ func (r *Reader) IntrinsicColumnNames() []string {
 	return names
 }
 
+// GetIntrinsicColumnBlob returns the raw (snappy-compressed) column blob bytes
+// for the named intrinsic column, fetched from cache or disk. Returns nil, nil
+// if no intrinsic section or column not present. The returned bytes must not be
+// modified by the caller.
+func (r *Reader) GetIntrinsicColumnBlob(name string) ([]byte, error) {
+	if r.intrinsicIndex == nil {
+		return nil, nil
+	}
+	meta, ok := r.intrinsicIndex[name]
+	if !ok {
+		return nil, nil
+	}
+	cacheKey := fmt.Sprintf("%s/intrinsic/%s", r.fileID, name)
+	blob, err := r.cache.GetOrFetch(cacheKey, func() ([]byte, error) {
+		return r.readRange(meta.Offset, uint64(meta.Length), rw.DataTypeMetadata)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("GetIntrinsicColumnBlob %q: read: %w", name, err)
+	}
+	return blob, nil
+}
+
 // GetIntrinsicColumn returns the decoded intrinsic column for the given name,
 // or nil if the file has no intrinsic section or the column is not present.
 // The column blob is read and decoded on first call; subsequent calls return the
 // cached result (lazy decode, single I/O per column).
+//
+// span:end is synthesized from span:start + span:duration when not stored in the
+// intrinsic section (files written after the span:end elimination optimization).
 //
 // NOT safe for concurrent use without external synchronization.
 func (r *Reader) GetIntrinsicColumn(name string) (*shared.IntrinsicColumn, error) {
@@ -78,6 +103,10 @@ func (r *Reader) GetIntrinsicColumn(name string) (*shared.IntrinsicColumn, error
 	}
 	meta, ok := r.intrinsicIndex[name]
 	if !ok {
+		// Synthesize span:end from span:start + span:duration.
+		if name == "span:end" {
+			return r.synthesizeSpanEnd()
+		}
 		return nil, nil
 	}
 
@@ -85,6 +114,18 @@ func (r *Reader) GetIntrinsicColumn(name string) (*shared.IntrinsicColumn, error
 		if cached, ok := r.intrinsicDecoded[name]; ok {
 			return cached, nil
 		}
+	}
+
+	// Check process-level cache first — decoded IntrinsicColumn is immutable once written.
+	// This avoids re-running DecodeIntrinsicColumnBlob (snappy + struct build) across Reader instances.
+	procKey := r.fileID + "/intrinsic/" + name
+	if cached, ok := parsedIntrinsicCache.Load(procKey); ok {
+		col := cached.(*shared.IntrinsicColumn)
+		if r.intrinsicDecoded == nil {
+			r.intrinsicDecoded = make(map[string]*shared.IntrinsicColumn)
+		}
+		r.intrinsicDecoded[name] = col
+		return col, nil
 	}
 
 	cacheKey := fmt.Sprintf("%s/intrinsic/%s", r.fileID, name)
@@ -101,9 +142,55 @@ func (r *Reader) GetIntrinsicColumn(name string) (*shared.IntrinsicColumn, error
 	}
 	col.Name = name
 
+	parsedIntrinsicCache.Store(procKey, col)
+
 	if r.intrinsicDecoded == nil {
 		r.intrinsicDecoded = make(map[string]*shared.IntrinsicColumn)
 	}
 	r.intrinsicDecoded[name] = col
+	return col, nil
+}
+
+// synthesizeSpanEnd builds a span:end intrinsic column from span:start + span:duration.
+// The result is cached like any other intrinsic column.
+func (r *Reader) synthesizeSpanEnd() (*shared.IntrinsicColumn, error) {
+	if r.intrinsicDecoded != nil {
+		if cached, ok := r.intrinsicDecoded["span:end"]; ok {
+			return cached, nil
+		}
+	}
+
+	startCol, err := r.GetIntrinsicColumn("span:start")
+	if err != nil || startCol == nil {
+		return nil, nil
+	}
+	durCol, err := r.GetIntrinsicColumn("span:duration")
+	if err != nil || durCol == nil {
+		return nil, nil
+	}
+
+	// Both must be flat uint64 columns with matching lengths.
+	if len(startCol.Uint64Values) == 0 || len(startCol.Uint64Values) != len(durCol.Uint64Values) {
+		return nil, nil
+	}
+
+	n := len(startCol.Uint64Values)
+	col := &shared.IntrinsicColumn{
+		Name:         "span:end",
+		Type:         shared.ColumnTypeUint64,
+		Format:       shared.IntrinsicFormatFlat,
+		Count:        uint32(n), //nolint:gosec
+		Uint64Values: make([]uint64, n),
+		BlockRefs:    make([]shared.BlockRef, n),
+	}
+	for i := range n {
+		col.Uint64Values[i] = startCol.Uint64Values[i] + durCol.Uint64Values[i]
+		col.BlockRefs[i] = startCol.BlockRefs[i]
+	}
+
+	if r.intrinsicDecoded == nil {
+		r.intrinsicDecoded = make(map[string]*shared.IntrinsicColumn)
+	}
+	r.intrinsicDecoded["span:end"] = col
 	return col, nil
 }
