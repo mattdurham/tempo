@@ -4,9 +4,13 @@ package shared
 
 // This file provides bloom filter helpers for paged intrinsic dict columns.
 // Unlike the trace-ID bloom (which hashes 16-byte UUIDs directly), these functions
-// accept arbitrary byte slices and use FNV-1a double-hashing.
+// accept arbitrary byte slices and use inline FNV-1a double-hashing.
 
-import "hash/fnv"
+// FNV-1a constants (64-bit).
+const (
+	fnvOffset64 = 14695981039346656037
+	fnvPrime64  = 1099511628211
+)
 
 // IntrinsicBloomSize returns the byte size for a bloom filter covering itemCount unique
 // values. Sized at IntrinsicPageBloomBitsPerItem bits per item, clamped to
@@ -26,13 +30,22 @@ func IntrinsicBloomSize(itemCount int) int {
 }
 
 // intrinsicBloomHashes derives (h1, h2) for Kirsch-Mitzenmacher double-hashing
-// from an arbitrary byte key using FNV-1a. h2 is forced odd for good stride distribution.
+// from an arbitrary byte key using inline FNV-1a. Zero allocations.
+// h2 is forced odd for good stride distribution.
 func intrinsicBloomHashes(key []byte) (h1, h2 uint64) {
-	h := fnv.New64a()
-	_, _ = h.Write(key)
-	h1 = h.Sum64()
-	_, _ = h.Write(key) // feed key again to get a distinct second hash
-	h2 = h.Sum64() | 1  // force odd
+	// First pass: FNV-1a of key → h1.
+	h := uint64(fnvOffset64)
+	for _, b := range key {
+		h ^= uint64(b)
+		h *= fnvPrime64
+	}
+	h1 = h
+	// Second pass: continue hashing key again → h2.
+	for _, b := range key {
+		h ^= uint64(b)
+		h *= fnvPrime64
+	}
+	h2 = h | 1 // force odd
 	return h1, h2
 }
 

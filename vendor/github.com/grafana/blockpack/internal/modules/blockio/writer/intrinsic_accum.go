@@ -242,39 +242,8 @@ func writeRef(buf *bytes.Buffer, ref shared.BlockRef, blockW, rowW uint8) {
 //	  bytes:  length-prefixed (2-byte LE len + raw bytes)
 //	refs[row_count × (block_idx_width+row_idx_width)] = (blockIdx, rowIdx) parallel to values
 func encodeFlatColumn(c *flatAccum) ([]byte, error) {
-	// Sort by value.
+	sortFlatAccum(c)
 	n := len(c.refs)
-	if len(c.uint64Values) > 0 {
-		// Sort uint64 ascending.
-		type row struct {
-			val uint64
-			ref shared.BlockRef
-		}
-		rows := make([]row, n)
-		for i := range n {
-			rows[i] = row{c.uint64Values[i], c.refs[i]}
-		}
-		sort.Slice(rows, func(i, j int) bool { return rows[i].val < rows[j].val })
-		for i := range n {
-			c.uint64Values[i] = rows[i].val
-			c.refs[i] = rows[i].ref
-		}
-	} else if len(c.bytesValues) > 0 {
-		// Sort bytes lexicographic.
-		type row struct {
-			val []byte
-			ref shared.BlockRef
-		}
-		rows := make([]row, n)
-		for i := range n {
-			rows[i] = row{c.bytesValues[i], c.refs[i]}
-		}
-		sort.Slice(rows, func(i, j int) bool { return bytes.Compare(rows[i].val, rows[j].val) < 0 })
-		for i := range n {
-			c.bytesValues[i] = rows[i].val
-			c.refs[i] = rows[i].ref
-		}
-	}
 
 	blockW, rowW := refWidths(c.refs)
 

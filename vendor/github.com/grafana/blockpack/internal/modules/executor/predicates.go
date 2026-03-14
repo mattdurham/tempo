@@ -1327,52 +1327,6 @@ func scanIntrinsicLeafRefs(
 	return modules_shared.ScanFlatColumnRefs(blob, lo, hi, hasLo, hasHi, maxRefs)
 }
 
-// intrinsicDictMatchRefs returns up to max BlockRefs from a dict column matching the predicate.
-// Returns nil when the predicate type is not supported for dict columns (range/pattern).
-func intrinsicDictMatchRefs(col *modules_shared.IntrinsicColumn, leaf vm.RangeNode, max int) []modules_shared.BlockRef {
-	if len(leaf.Values) == 0 {
-		return nil // range or pattern on dict column — not supported
-	}
-	wantStr := make(map[string]struct{}, len(leaf.Values))
-	wantInt := make(map[int64]struct{}, len(leaf.Values))
-	for _, v := range leaf.Values {
-		switch v.Type {
-		case vm.TypeString:
-			if s, ok := v.Data.(string); ok {
-				wantStr[s] = struct{}{}
-			}
-		case vm.TypeInt:
-			if i, ok := v.Data.(int64); ok {
-				wantInt[i] = struct{}{}
-			}
-		case vm.TypeDuration:
-			if i, ok := v.Data.(int64); ok {
-				wantInt[i] = struct{}{}
-			}
-		}
-	}
-
-	var result []modules_shared.BlockRef
-	for _, entry := range col.DictEntries {
-		var match bool
-		if entry.Value != "" {
-			_, match = wantStr[entry.Value]
-		} else {
-			_, match = wantInt[entry.Int64Val]
-		}
-		if !match {
-			continue
-		}
-		for _, ref := range entry.BlockRefs {
-			result = append(result, ref)
-			if max > 0 && len(result) >= max {
-				return result
-			}
-		}
-	}
-	return result
-}
-
 // intrinsicFlatMatchRefs returns up to max BlockRefs from a flat (uint64-sorted) column
 // matching the predicate range. Returns nil when the predicate cannot be evaluated.
 func intrinsicFlatMatchRefs(col *modules_shared.IntrinsicColumn, leaf vm.RangeNode, max int) []modules_shared.BlockRef {
