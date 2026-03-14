@@ -715,20 +715,10 @@ func scanDictPagedBlob(
 	bloomKeys [][]byte,
 	maxRefs int,
 ) []BlockRef {
-	if len(blob) < 5 {
+	toc, pos, ok := parsePagedBlobHeader(blob)
+	if !ok || toc.Format != IntrinsicFormatDict {
 		return nil
 	}
-	pos := 1 // skip sentinel
-	tocLen := int(binary.LittleEndian.Uint32(blob[pos:]))
-	pos += 4
-	if pos+tocLen > len(blob) {
-		return nil
-	}
-	toc, err := DecodePageTOC(blob[pos : pos+tocLen])
-	if err != nil || toc.Format != IntrinsicFormatDict {
-		return nil
-	}
-	pos += tocLen // pos now points to first page blob
 
 	blockW := int(toc.BlockIdxWidth)
 	rowW := int(toc.RowIdxWidth)
@@ -883,22 +873,29 @@ func ScanDictColumnRefsWithBloom(
 	return ScanDictColumnRefs(blob, matchFn, maxRefs)
 }
 
+// parsePagedBlobHeader parses the v2 paged blob header: sentinel[1] + toc_len[4] + toc_blob.
+// Returns the decoded TOC, the byte offset of the first page blob, and success.
+func parsePagedBlobHeader(blob []byte) (PagedIntrinsicTOC, int, bool) {
+	if len(blob) < 5 {
+		return PagedIntrinsicTOC{}, 0, false
+	}
+	tocLen := int(binary.LittleEndian.Uint32(blob[1:5]))
+	if 5+tocLen > len(blob) {
+		return PagedIntrinsicTOC{}, 0, false
+	}
+	toc, err := DecodePageTOC(blob[5 : 5+tocLen])
+	if err != nil {
+		return PagedIntrinsicTOC{}, 0, false
+	}
+	return toc, 5 + tocLen, true
+}
+
 // scanFlatPagedBlob handles v2 paged flat column blobs for range scan.
 func scanFlatPagedBlob(blob []byte, lo, hi uint64, hasLo, hasHi bool, maxRefs int) []BlockRef {
-	if len(blob) < 5 {
+	toc, pos, ok := parsePagedBlobHeader(blob)
+	if !ok || toc.Format != IntrinsicFormatFlat || toc.ColType == ColumnTypeBytes {
 		return nil
 	}
-	pos := 1 // skip sentinel
-	tocLen := int(binary.LittleEndian.Uint32(blob[pos:]))
-	pos += 4
-	if pos+tocLen > len(blob) {
-		return nil
-	}
-	toc, err := DecodePageTOC(blob[pos : pos+tocLen])
-	if err != nil || toc.Format != IntrinsicFormatFlat || toc.ColType == ColumnTypeBytes {
-		return nil
-	}
-	pos += tocLen
 
 	blockW := int(toc.BlockIdxWidth)
 	rowW := int(toc.RowIdxWidth)
@@ -929,7 +926,7 @@ func scanFlatPagedBlob(blob []byte, lo, hi uint64, hasLo, hasHi bool, maxRefs in
 		}
 
 		rowCount := int(pm.RowCount)
-		refsStart := pageRefsStart(pageRaw, rowCount)
+		refsStart := pageRefsStart(pageRaw)
 
 		// Varint delta-decode values to find matching range.
 		var acc uint64
@@ -975,20 +972,10 @@ func scanFlatPagedBlob(blob []byte, lo, hi uint64, hasLo, hasHi bool, maxRefs in
 
 // scanFlatPagedTopK handles v2 paged flat column blobs for top-K scan.
 func scanFlatPagedTopK(blob []byte, limit int, backward bool) []BlockRef {
-	if len(blob) < 5 {
+	toc, pos, ok := parsePagedBlobHeader(blob)
+	if !ok || toc.Format != IntrinsicFormatFlat || toc.ColType == ColumnTypeBytes {
 		return nil
 	}
-	pos := 1
-	tocLen := int(binary.LittleEndian.Uint32(blob[pos:]))
-	pos += 4
-	if pos+tocLen > len(blob) {
-		return nil
-	}
-	toc, err := DecodePageTOC(blob[pos : pos+tocLen])
-	if err != nil || toc.Format != IntrinsicFormatFlat || toc.ColType == ColumnTypeBytes {
-		return nil
-	}
-	pos += tocLen
 
 	blockW := int(toc.BlockIdxWidth)
 	rowW := int(toc.RowIdxWidth)
@@ -1011,7 +998,7 @@ func scanFlatPagedTopK(blob []byte, limit int, backward bool) []BlockRef {
 				return nil
 			}
 			rowCount := int(pm.RowCount)
-			refsStart := pageRefsStart(pageRaw, rowCount)
+			refsStart := pageRefsStart(pageRaw)
 			count := remaining
 			if count > rowCount {
 				count = rowCount
@@ -1047,7 +1034,7 @@ func scanFlatPagedTopK(blob []byte, limit int, backward bool) []BlockRef {
 				return nil
 			}
 			rowCount := int(pm.RowCount)
-			refsStart := pageRefsStart(pageRaw, rowCount)
+			refsStart := pageRefsStart(pageRaw)
 			count := remaining
 			if count > rowCount {
 				count = rowCount
@@ -1068,20 +1055,10 @@ func scanFlatPagedTopK(blob []byte, limit int, backward bool) []BlockRef {
 
 // scanFlatPagedFiltered handles v2 paged flat column blobs for filtered scan.
 func scanFlatPagedFiltered(blob []byte, backward bool, limit int, filter func(BlockRef) bool) []BlockRef {
-	if len(blob) < 5 {
+	toc, pos, ok := parsePagedBlobHeader(blob)
+	if !ok || toc.Format != IntrinsicFormatFlat || toc.ColType == ColumnTypeBytes {
 		return nil
 	}
-	pos := 1
-	tocLen := int(binary.LittleEndian.Uint32(blob[pos:]))
-	pos += 4
-	if pos+tocLen > len(blob) {
-		return nil
-	}
-	toc, err := DecodePageTOC(blob[pos : pos+tocLen])
-	if err != nil || toc.Format != IntrinsicFormatFlat || toc.ColType == ColumnTypeBytes {
-		return nil
-	}
-	pos += tocLen
 
 	blockW := int(toc.BlockIdxWidth)
 	rowW := int(toc.RowIdxWidth)
@@ -1100,7 +1077,7 @@ func scanFlatPagedFiltered(blob []byte, backward bool, limit int, filter func(Bl
 			return false
 		}
 		rowCount := int(pm.RowCount)
-		refsStart := pageRefsStart(pageRaw, rowCount)
+		refsStart := pageRefsStart(pageRaw)
 
 		if backward {
 			for i := rowCount - 1; i >= 0 && len(result) < limit; i-- {
@@ -1405,7 +1382,7 @@ func ScanFlatColumnRefsFiltered(
 // pageRefsStart returns the byte offset of the refs section in a flat page blob.
 // For uint64 pages: values_len[4 LE] + varint_values[values_len], so refs start at 4 + values_len.
 // For bytes pages (no values_len prefix): caller must compute from scanning values.
-func pageRefsStart(pageRaw []byte, _ int) int {
+func pageRefsStart(pageRaw []byte) int {
 	if len(pageRaw) < 4 {
 		return 0
 	}
