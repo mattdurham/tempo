@@ -140,13 +140,23 @@ func (a *intrinsicAccumulator) columnNames() []string {
 	return names
 }
 
-// encodeColumn serializes one column's accumulated data into a snappy-compressed blob.
-// The blob starts with IntrinsicFormatVersion[1] + format[1] (flat or dict) + colType[1].
+// encodeColumn serializes one column's accumulated data into a compressed blob.
+// Uses paged (v2) format when row count exceeds IntrinsicPageSize, otherwise v1 monolithic.
 func (a *intrinsicAccumulator) encodeColumn(name string) ([]byte, error) {
 	if c, ok := a.flatCols[name]; ok {
+		if len(c.refs) > shared.IntrinsicPageSize {
+			return encodePagedFlatColumn(c)
+		}
 		return encodeFlatColumn(c)
 	}
 	if c, ok := a.dictCols[name]; ok {
+		total := 0
+		for _, e := range c.entries {
+			total += len(e.refs)
+		}
+		if total > shared.IntrinsicPageSize {
+			return encodePagedDictColumn(c)
+		}
 		return encodeDictColumn(c)
 	}
 	return nil, nil
@@ -482,4 +492,337 @@ func decodeTOC(blob []byte) ([]shared.IntrinsicColMeta, error) {
 // Delegates to shared.DecodeIntrinsicColumnBlob; kept here so writer-internal tests can call it.
 func decodeIntrinsicColumnBlob(blob []byte) (*shared.IntrinsicColumn, error) {
 	return shared.DecodeIntrinsicColumnBlob(blob)
+}
+
+// sortFlatAccum sorts the flat accumulator's values and refs together in-place.
+// Must be called before computing ref widths or chunking into pages.
+func sortFlatAccum(c *flatAccum) {
+	n := len(c.refs)
+	if len(c.uint64Values) > 0 {
+		type row struct {
+			val uint64
+			ref shared.BlockRef
+		}
+		rows := make([]row, n)
+		for i := range n {
+			rows[i] = row{c.uint64Values[i], c.refs[i]}
+		}
+		sort.Slice(rows, func(i, j int) bool { return rows[i].val < rows[j].val })
+		for i := range n {
+			c.uint64Values[i] = rows[i].val
+			c.refs[i] = rows[i].ref
+		}
+	} else if len(c.bytesValues) > 0 {
+		type row struct {
+			val []byte
+			ref shared.BlockRef
+		}
+		rows := make([]row, n)
+		for i := range n {
+			rows[i] = row{c.bytesValues[i], c.refs[i]}
+		}
+		sort.Slice(rows, func(i, j int) bool { return bytes.Compare(rows[i].val, rows[j].val) < 0 })
+		for i := range n {
+			c.bytesValues[i] = rows[i].val
+			c.refs[i] = rows[i].ref
+		}
+	}
+}
+
+// encodeFlatPageBlob encodes a range of flat column rows (values + refs) into a
+// snappy-compressed page blob with NO header. Returns compressed blob and min/max strings.
+//
+// Flat page format for uint64 (uncompressed):
+//
+//	values_len[4 LE]                     // byte length of varint-encoded values
+//	varint_delta_values[values_len]      // varint delta-encoded uint64 values
+//	refs[count × refSize]                // BlockRefs
+//
+// Flat page format for bytes: length-prefixed bytes[count] + refs[count × refSize] (no values_len prefix).
+func encodeFlatPageBlob(c *flatAccum, start, end int, blockW, rowW uint8) (blob []byte, minVal, maxVal string) {
+	var buf bytes.Buffer
+	var tmp8 [8]byte
+	var tmp2 [2]byte
+	var tmp4 [4]byte
+
+	if len(c.uint64Values) > 0 {
+		// Varint delta encoding with values_len prefix for O(1) ref offset.
+		var valBuf bytes.Buffer
+		var varintTmp [10]byte
+		var prev uint64
+		for i := start; i < end; i++ {
+			v := c.uint64Values[i]
+			n := binary.PutUvarint(varintTmp[:], v-prev)
+			valBuf.Write(varintTmp[:n])
+			prev = v
+		}
+		// Write values_len[4 LE] + varint values.
+		binary.LittleEndian.PutUint32(tmp4[:], uint32(valBuf.Len())) //nolint:gosec
+		buf.Write(tmp4[:])
+		buf.Write(valBuf.Bytes())
+		// Min/max from sorted order.
+		binary.LittleEndian.PutUint64(tmp8[:], c.uint64Values[start])
+		minVal = string(tmp8[:])
+		binary.LittleEndian.PutUint64(tmp8[:], c.uint64Values[end-1])
+		maxVal = string(tmp8[:])
+	} else if len(c.bytesValues) > 0 {
+		for i := start; i < end; i++ {
+			v := c.bytesValues[i]
+			binary.LittleEndian.PutUint16(tmp2[:], uint16(len(v))) //nolint:gosec
+			buf.Write(tmp2[:])
+			buf.Write(v)
+		}
+		minVal = string(c.bytesValues[start])
+		maxVal = string(c.bytesValues[end-1])
+	}
+
+	for i := start; i < end; i++ {
+		writeRef(&buf, c.refs[i], blockW, rowW)
+	}
+
+	return snappy.Encode(nil, buf.Bytes()), minVal, maxVal
+}
+
+// encodePagedFlatColumn encodes a flat accumulator using the v2 paged format.
+// Called when row count > IntrinsicPageSize.
+//
+// Returns a raw blob starting with IntrinsicPagedVersion[1]:
+//
+//	sentinel[1] = 0x02
+//	toc_len[4 LE]
+//	toc_blob[toc_len]  (snappy-compressed PagedIntrinsicTOC)
+//	page_blob_0[...]
+//	page_blob_1[...]
+//	...
+func encodePagedFlatColumn(c *flatAccum) ([]byte, error) {
+	sortFlatAccum(c)
+
+	n := len(c.refs)
+	blockW, rowW := refWidths(c.refs)
+
+	// Chunk into pages of IntrinsicPageSize rows each.
+	pageCount := (n + shared.IntrinsicPageSize - 1) / shared.IntrinsicPageSize
+	pages := make([]shared.PageMeta, 0, pageCount)
+	pageBlobs := make([][]byte, 0, pageCount)
+
+	var offset uint32
+	for p := range pageCount {
+		start := p * shared.IntrinsicPageSize
+		end := start + shared.IntrinsicPageSize
+		if end > n {
+			end = n
+		}
+		blob, minVal, maxVal := encodeFlatPageBlob(c, start, end, blockW, rowW)
+		pages = append(pages, shared.PageMeta{
+			Offset:   offset,
+			Length:   uint32(len(blob)),      //nolint:gosec
+			RowCount: uint32(end - start),    //nolint:gosec
+			Min:      minVal,
+			Max:      maxVal,
+		})
+		pageBlobs = append(pageBlobs, blob)
+		offset += uint32(len(blob)) //nolint:gosec
+	}
+
+	toc := shared.PagedIntrinsicTOC{
+		Pages:         pages,
+		BlockIdxWidth: blockW,
+		RowIdxWidth:   rowW,
+		Format:        shared.IntrinsicFormatFlat,
+		ColType:       c.colType,
+	}
+	tocBlob, err := shared.EncodePageTOC(toc)
+	if err != nil {
+		return nil, err
+	}
+
+	return assemblePagedBlob(tocBlob, pageBlobs), nil
+}
+
+// encodeDictPageBlob encodes a range of dict entries into a snappy-compressed page blob
+// with NO header. Also builds and returns a bloom filter over the unique values in this page.
+//
+// Dict page format (uncompressed):
+//
+//	value_count[4 LE]
+//	per value:
+//	  value_len[2 LE] + value[value_len]  (0-sentinel + 8 bytes for int64)
+//	  ref_count[4 LE]
+//	  refs[ref_count × refSize]
+func encodeDictPageBlob(
+	entries []dictEntry,
+	entryRefRanges [][2]int, // [start, end) ref indices per entry for this page
+	isInt64 bool,
+	blockW, rowW uint8,
+) (blob []byte, minVal, maxVal string, bloom []byte) {
+	// Count unique values in this page (entries with at least one ref in range).
+	uniqueCount := 0
+	for _, rng := range entryRefRanges {
+		if rng[0] < rng[1] {
+			uniqueCount++
+		}
+	}
+
+	bloomSize := shared.IntrinsicBloomSize(uniqueCount)
+	bloom = make([]byte, bloomSize)
+
+	var buf bytes.Buffer
+	var tmp4 [4]byte
+	var tmp8 [8]byte
+	var tmp2 [2]byte
+
+	binary.LittleEndian.PutUint32(tmp4[:], uint32(uniqueCount)) //nolint:gosec
+	buf.Write(tmp4[:])
+
+	first := true
+	for i, rng := range entryRefRanges {
+		if rng[0] >= rng[1] {
+			continue
+		}
+		e := entries[i]
+		if isInt64 {
+			binary.LittleEndian.PutUint16(tmp2[:], 0)
+			buf.Write(tmp2[:])
+			binary.LittleEndian.PutUint64(tmp8[:], uint64(e.int64Val)) //nolint:gosec
+			buf.Write(tmp8[:])
+			// Bloom: use 8-byte LE encoding of int64 as key.
+			shared.AddIntrinsicToBloom(bloom, tmp8[:])
+			if first {
+				binary.LittleEndian.PutUint64(tmp8[:], uint64(e.int64Val)) //nolint:gosec
+				minVal = string(tmp8[:])
+			}
+			binary.LittleEndian.PutUint64(tmp8[:], uint64(e.int64Val)) //nolint:gosec
+			maxVal = string(tmp8[:])
+		} else {
+			binary.LittleEndian.PutUint16(tmp2[:], uint16(len(e.strVal))) //nolint:gosec
+			buf.Write(tmp2[:])
+			buf.WriteString(e.strVal)
+			shared.AddIntrinsicToBloom(bloom, []byte(e.strVal))
+			if first {
+				minVal = e.strVal
+			}
+			maxVal = e.strVal
+		}
+		first = false
+
+		refCount := rng[1] - rng[0]
+		binary.LittleEndian.PutUint32(tmp4[:], uint32(refCount)) //nolint:gosec
+		buf.Write(tmp4[:])
+		for j := rng[0]; j < rng[1]; j++ {
+			writeRef(&buf, e.refs[j], blockW, rowW)
+		}
+	}
+
+	return snappy.Encode(nil, buf.Bytes()), minVal, maxVal, bloom
+}
+
+// encodePagedDictColumn encodes a dict accumulator using the v2 paged format.
+// Pages are chunked by cumulative ref count (each page has ~IntrinsicPageSize total refs).
+func encodePagedDictColumn(c *dictAccum) ([]byte, error) {
+	isInt64 := c.colType == shared.ColumnTypeInt64 || c.colType == shared.ColumnTypeRangeInt64
+	sort.Slice(c.entries, func(i, j int) bool {
+		if isInt64 {
+			return c.entries[i].int64Val < c.entries[j].int64Val
+		}
+		return c.entries[i].strVal < c.entries[j].strVal
+	})
+
+	blockW, rowW := dictRefWidths(c.entries)
+
+	// Assign refs to pages: chunk the total ref stream by IntrinsicPageSize.
+	// Track which refs of each entry belong to each page.
+	var pages []shared.PageMeta
+	var pageBlobs [][]byte
+
+	totalRefs := 0
+	for _, e := range c.entries {
+		totalRefs += len(e.refs)
+	}
+
+	pageCount := (totalRefs + shared.IntrinsicPageSize - 1) / shared.IntrinsicPageSize
+	if pageCount == 0 {
+		pageCount = 1
+	}
+
+	var offset uint32
+	for p := range pageCount {
+		pageStart := p * shared.IntrinsicPageSize
+		pageEnd := pageStart + shared.IntrinsicPageSize
+		if pageEnd > totalRefs {
+			pageEnd = totalRefs
+		}
+
+		// For each entry, determine what slice of its refs falls in [pageStart, pageEnd).
+		entryRanges := make([][2]int, len(c.entries))
+		cursor := 0
+		for i, e := range c.entries {
+			entryStart := cursor
+			entryEnd := cursor + len(e.refs)
+			// Clamp to [pageStart, pageEnd).
+			lo := entryStart
+			if lo < pageStart {
+				lo = pageStart
+			}
+			hi := entryEnd
+			if hi > pageEnd {
+				hi = pageEnd
+			}
+			if lo < hi {
+				entryRanges[i] = [2]int{lo - entryStart, hi - entryStart}
+			} else {
+				entryRanges[i] = [2]int{0, 0}
+			}
+			cursor += len(e.refs)
+		}
+
+		blob, minVal, maxVal, bloom := encodeDictPageBlob(c.entries, entryRanges, isInt64, blockW, rowW)
+		rowCount := pageEnd - pageStart
+		pages = append(pages, shared.PageMeta{
+			Offset:   offset,
+			Length:   uint32(len(blob)), //nolint:gosec
+			RowCount: uint32(rowCount),  //nolint:gosec
+			Min:      minVal,
+			Max:      maxVal,
+			Bloom:    bloom,
+		})
+		pageBlobs = append(pageBlobs, blob)
+		offset += uint32(len(blob)) //nolint:gosec
+	}
+
+	toc := shared.PagedIntrinsicTOC{
+		Pages:         pages,
+		BlockIdxWidth: blockW,
+		RowIdxWidth:   rowW,
+		Format:        shared.IntrinsicFormatDict,
+		ColType:       c.colType,
+	}
+	tocBlob, err := shared.EncodePageTOC(toc)
+	if err != nil {
+		return nil, err
+	}
+
+	return assemblePagedBlob(tocBlob, pageBlobs), nil
+}
+
+// assemblePagedBlob assembles the final v2 paged blob from a TOC blob and page blobs.
+//
+// Wire format: sentinel[1] + toc_len[4 LE] + toc_blob[toc_len] + page_blob_0 + page_blob_1 + ...
+func assemblePagedBlob(tocBlob []byte, pageBlobs [][]byte) []byte {
+	total := 1 + 4 + len(tocBlob)
+	for _, pb := range pageBlobs {
+		total += len(pb)
+	}
+
+	out := make([]byte, 0, total)
+	out = append(out, shared.IntrinsicPagedVersion)
+
+	var tmp4 [4]byte
+	binary.LittleEndian.PutUint32(tmp4[:], uint32(len(tocBlob))) //nolint:gosec
+	out = append(out, tmp4[:]...)
+	out = append(out, tocBlob...)
+
+	for _, pb := range pageBlobs {
+		out = append(out, pb...)
+	}
+	return out
 }

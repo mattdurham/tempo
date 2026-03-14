@@ -52,6 +52,20 @@ const (
 	IntrinsicFormatFlat    uint8 = 0x01 // flat array: delta-encoded uint64 or length-prefixed bytes
 	IntrinsicFormatDict    uint8 = 0x02 // dictionary (string or int64 enum columns)
 
+	// IntrinsicPagedVersion is the sentinel byte that identifies a v2 paged column region.
+	// When the first byte of a column blob is 0x02 the blob is NOT snappy-compressed as a
+	// whole; instead it contains: sentinel[1] + toc_len[4 LE] + toc_blob[toc_len] + page blobs.
+	IntrinsicPagedVersion uint8 = 0x02
+
+	// IntrinsicPageSize is the maximum number of rows stored in one page of a v2 column.
+	// Columns with more than this many rows are written in paged (v2) format.
+	IntrinsicPageSize = 10_000
+
+	// Per-page bloom filter parameters for dict columns.
+	IntrinsicPageBloomK           = 7  // number of hash functions (Kirsch-Mitzenmacher)
+	IntrinsicPageBloomBitsPerItem = 10 // bits per unique value in the bloom filter
+	IntrinsicPageBloomMinBytes    = 16 // minimum bloom filter size in bytes
+
 	// MaxIntrinsicRows is the safety cap on accumulated rows. If total rows across all
 	// blocks exceeds this, the intrinsic section is written empty (TOC with 0 columns).
 	MaxIntrinsicRows = 10_000_000

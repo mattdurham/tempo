@@ -165,9 +165,11 @@ func main() {
 		}
 		var icCols []*icAgg
 		var tocBytes int64
+		var totalIntrinsicBytes int64
 		for _, s := range report.Sections {
 			if s.Section == "intrinsic.toc" {
 				tocBytes = s.CompressedSize
+				totalIntrinsicBytes += s.CompressedSize
 				continue
 			}
 			if len(s.Section) > 10 && s.Section[:10] == "intrinsic." && s.ColumnName != "" {
@@ -177,21 +179,24 @@ func main() {
 					colType:  s.ColumnType,
 					bytes:    s.CompressedSize,
 				})
+				totalIntrinsicBytes += s.CompressedSize
 			}
 		}
 		sort.Slice(icCols, func(i, j int) bool {
 			return icCols[i].bytes > icCols[j].bytes
 		})
-		fmt.Printf("%-40s %-10s %-10s %12s %8s\n", "Column", "Type", "Format", "Size", "% File")
-		fmt.Printf("%-40s %-10s %-10s %12s %8s\n", "------", "----", "------", "----", "------")
+		fmt.Printf("%-40s %-10s %-25s %12s %8s\n", "Column", "Type", "Format", "Size", "% File")
+		fmt.Printf("%-40s %-10s %-25s %12s %8s\n", "------", "----", "------", "----", "------")
 		for _, c := range icCols {
 			pct := 100.0 * float64(c.bytes) / float64(report.FileSize)
-			fmt.Printf("%-40s %-10s %-10s %12s %7.1f%%\n", c.name, c.colType, c.encoding, humanBytes(c.bytes), pct)
+			fmt.Printf("%-40s %-10s %-25s %12s %7.1f%%\n", c.name, c.colType, c.encoding, humanBytes(c.bytes), pct)
 		}
 		if tocBytes > 0 {
 			pct := 100.0 * float64(tocBytes) / float64(report.FileSize)
-			fmt.Printf("%-40s %-10s %-10s %12s %7.1f%%\n", "(TOC)", "", "", humanBytes(tocBytes), pct)
+			fmt.Printf("%-40s %-10s %-25s %12s %7.1f%%\n", "(TOC)", "", "", humanBytes(tocBytes), pct)
 		}
+		pct := 100.0 * float64(totalIntrinsicBytes) / float64(report.FileSize)
+		fmt.Printf("\n  Total intrinsic section: %s (%.1f%% of file)\n", humanBytes(totalIntrinsicBytes), pct)
 	}
 
 	if len(os.Args) > 2 && os.Args[2] == "-json" {

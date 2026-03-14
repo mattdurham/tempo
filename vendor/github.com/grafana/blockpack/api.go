@@ -295,8 +295,8 @@ type QueryOptions struct {
 	Limit int // Maximum number of spans to return (0 = unlimited).
 	// MostRecent controls block traversal order. Always use keyed struct literals:
 	// QueryOptions{Limit: 10, MostRecent: true}.
-	// With Limit > 0, uses CollectTopK for globally newest-first ordering by span:start.
-	// With Limit == 0, ordering is per-block newest-first; not globally sorted when block ranges overlap.
+	// Uses Backward direction with span:start timestamp sorting. For intrinsic-only queries,
+	// top-K selection uses only the intrinsic column blobs (no full block I/O).
 	MostRecent bool
 	// StartNano is the inclusive lower bound for block-level time pruning (unix nanoseconds).
 	// Internal blocks whose span:start range ends before StartNano are skipped entirely.
@@ -759,16 +759,7 @@ func streamFilterProgram(r *Reader, program *vm.Program, opts QueryOptions, fn s
 		collectOpts.Direction = modules_queryplanner.Backward
 		collectOpts.TimestampColumn = "span:start"
 	}
-	ex := modules_executor.New()
-	var (
-		rows []modules_executor.MatchedRow
-		err  error
-	)
-	if opts.MostRecent && opts.Limit > 0 {
-		rows, err = ex.CollectTopK(r, program, collectOpts)
-	} else {
-		rows, err = ex.Collect(r, program, collectOpts)
-	}
+	rows, err := modules_executor.New().Collect(r, program, collectOpts)
 	if err != nil {
 		return err
 	}
@@ -1128,7 +1119,7 @@ func streamLogProgram(r *Reader, program *vm.Program, opts LogQueryOptions, fn s
 	if opts.Forward {
 		direction = modules_queryplanner.Forward
 	}
-	rows, err := modules_executor.New().CollectTopK(
+	rows, err := modules_executor.New().Collect(
 		r,
 		program,
 		modules_executor.CollectOptions{

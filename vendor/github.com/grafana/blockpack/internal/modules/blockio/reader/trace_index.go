@@ -32,6 +32,7 @@ func (r *Reader) BlocksForTraceID(traceID [16]byte) []int {
 		}
 	}
 
+	r.ensureTraceIndex()
 	blockIDs, ok := r.traceIndex[traceID]
 	if !ok {
 		return nil
