@@ -10,6 +10,7 @@ import (
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/encoding/common"
 	"github.com/grafana/tempo/tempodb/encoding/unsupported"
+	"github.com/grafana/tempo/tempodb/encoding/vblockpack"
 	"github.com/grafana/tempo/tempodb/encoding/vparquet3"
 	"github.com/grafana/tempo/tempodb/encoding/vparquet4"
 	"github.com/grafana/tempo/tempodb/encoding/vparquet5"
@@ -67,6 +68,8 @@ type VersionedEncoding interface {
 // FromVersion returns a versioned encoding for the provided string
 func FromVersion(v string) (VersionedEncoding, error) {
 	switch v {
+	case vblockpack.VersionString:
+		return vblockpack.Encoding{}, nil
 	case vparquet3.VersionString:
 		return vparquet3.Encoding{}, nil
 	case vparquet4.VersionString:

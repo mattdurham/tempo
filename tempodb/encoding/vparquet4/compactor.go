@@ -149,6 +149,15 @@ func (c *Compactor) Compact(ctx context.Context, l log.Logger, r backend.Reader,
 		m               = newMultiblockIterator(bookmarks, combine)
 		recordsPerBlock = (totalRecords / int64(c.opts.OutputBlocks))
 		currentBlock    *streamingBlock
+
+		// estimateMarshalledSizeFromParquetRow is expensive (iterates all column values per
+		// trace). Since it returns a rough estimate already (66-100% accurate), sample it
+		// every sizeEstimateSampleRate traces and reuse the last computed value between
+		// samples. This reduces the call count by sizeEstimateSampleRate with negligible
+		// impact on block size accuracy.
+		sizeEstimateSampleRate = 16
+		sizeEstimateCounter    = 0
+		lastObjectSize         = 0
 	)
 	defer m.Close()
 
@@ -183,8 +192,18 @@ func (c *Compactor) Compact(ctx context.Context, l log.Logger, r backend.Reader,
 			newCompactedBlocks = append(newCompactedBlocks, currentBlock.meta)
 		}
 
+		// Sample estimateMarshalledSizeFromParquetRow every sizeEstimateSampleRate traces.
+		// The estimate is already rough (66-100% of actual), so reusing the last value for
+		// a handful of traces does not meaningfully affect block size accuracy.
+		sizeEstimateCounter++
+		if sizeEstimateCounter >= sizeEstimateSampleRate || lastObjectSize == 0 {
+			lastObjectSize = estimateMarshalledSizeFromParquetRow(lowestObject)
+			sizeEstimateCounter = 0
+		}
+		lowestObjectSize := lastObjectSize
+
 		// Flush existing block data if the next trace can't fit
-		if currentBlock.EstimatedBufferedBytes() > 0 && currentBlock.EstimatedBufferedBytes()+estimateMarshalledSizeFromParquetRow(lowestObject) > c.opts.BlockConfig.RowGroupSizeBytes {
+		if currentBlock.EstimatedBufferedBytes() > 0 && currentBlock.EstimatedBufferedBytes()+lowestObjectSize > c.opts.BlockConfig.RowGroupSizeBytes {
 			runtime.GC()
 			err = c.appendBlock(ctx, currentBlock, l)
 			if err != nil {
@@ -195,7 +214,7 @@ func (c *Compactor) Compact(ctx context.Context, l log.Logger, r backend.Reader,
 		// Write trace.
 		// Note - not specifying trace start/end here, we set the overall block start/stop
 		// times from the input metas.
-		err = currentBlock.AddRaw(lowestID, lowestObject, 0, 0)
+		err = currentBlock.addRawWithSize(lowestID, lowestObject, 0, 0, lowestObjectSize)
 		if err != nil {
 			return nil, err
 		}

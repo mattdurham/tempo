@@ -1,12 +1,35 @@
 package parquetquery
 
-import "github.com/parquet-go/parquet-go"
+import (
+	"sync"
+
+	"github.com/parquet-go/parquet-go"
+)
 
 type ColumnChunkHelper struct {
 	parquet.ColumnChunk
 	pages     parquet.Pages
 	firstPage parquet.Page
 	err       error
+}
+
+var columnChunkHelperPool = sync.Pool{
+	New: func() interface{} {
+		return &ColumnChunkHelper{}
+	},
+}
+
+func getColumnChunkHelper(cc parquet.ColumnChunk) *ColumnChunkHelper {
+	h := columnChunkHelperPool.Get().(*ColumnChunkHelper)
+	h.ColumnChunk = cc
+	h.err = nil
+	return h
+}
+
+func putColumnChunkHelper(h *ColumnChunkHelper) {
+	// Clear the interface field so GC can release the underlying column chunk.
+	h.ColumnChunk = nil
+	columnChunkHelperPool.Put(h)
 }
 
 // Dictionary makes it easier to access the dictionary for this column chunk which

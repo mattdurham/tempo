@@ -2,10 +2,40 @@ package common
 
 import (
 	"bytes"
+	"context"
 	"hash"
 	"hash/fnv"
 	"sort"
 )
+
+// originalTraceQLQueryKey is a context key for storing the original TraceQL query string.
+type originalTraceQLQueryKey struct{}
+
+// traceQLMostRecentKey is a context key for the most_recent hint.
+type traceQLMostRecentKey struct{}
+
+// WithOriginalTraceQLQuery stores the original TraceQL query string (with Tempo hints stripped)
+// in the context so that encoding backends (e.g. vblockpack) can use the full query instead of
+// a reconstructed approximation built from extracted conditions.
+// mostRecent should be true when the original query included "with (most_recent=true)".
+func WithOriginalTraceQLQuery(ctx context.Context, query string, mostRecent bool) context.Context {
+	ctx = context.WithValue(ctx, originalTraceQLQueryKey{}, query)
+	ctx = context.WithValue(ctx, traceQLMostRecentKey{}, mostRecent)
+	return ctx
+}
+
+// OriginalTraceQLQuery retrieves the original TraceQL query string from the context.
+// Returns ("", false) when not set.
+func OriginalTraceQLQuery(ctx context.Context) (string, bool) {
+	v, ok := ctx.Value(originalTraceQLQueryKey{}).(string)
+	return v, ok && v != ""
+}
+
+// TraceQLMostRecent returns true if the original query included "with (most_recent=true)".
+func TraceQLMostRecent(ctx context.Context) bool {
+	v, _ := ctx.Value(traceQLMostRecentKey{}).(bool)
+	return v
+}
 
 // This file contains types that need to be referenced by both the ./encoding and ./encoding/vX packages.
 // It primarily exists here to break dependency loops.

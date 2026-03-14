@@ -35,6 +35,7 @@ import (
 	"github.com/grafana/tempo/tempodb/blocklist"
 	"github.com/grafana/tempo/tempodb/encoding"
 	"github.com/grafana/tempo/tempodb/encoding/common"
+	"github.com/grafana/tempo/tempodb/encoding/vblockpack"
 	"github.com/grafana/tempo/tempodb/pool"
 	"github.com/grafana/tempo/tempodb/wal"
 )
@@ -233,6 +234,14 @@ func New(cfg *Config, cacheProvider cache.Provider, logger gkLog.Logger) (Reader
 		return nil, nil, nil, err
 	}
 
+	// Initialize the blockpack disk cache so it's available for queries.
+	// CreateBlock/Compact also call this, but the querier never runs those paths.
+	// NOTE: In local benchmarks with minio, bbolt overhead (mmap memmove + GC pressure)
+	// exceeds the S3 latency savings. The disk cache helps more with real S3 (50-100ms RTT).
+	if cfg.Block != nil && cfg.Block.Blockpack.FileCachePath != "" {
+		vblockpack.ConfigureFileCache(cfg.Block.Blockpack.FileCachePath, cfg.Block.Blockpack.FileCacheMaxBytes)
+	}
+
 	return rw, rw, rw, nil
 }
 
@@ -355,14 +364,25 @@ func (rw *readerWriter) Find(ctx context.Context, tenantID string, id common.ID,
 	blocksSearched := 0
 	compactedBlocksSearched := 0
 
+	// Pre-convert timeStart/timeEnd from Unix seconds to time.Time once to avoid
+	// calling time.Time.Unix() per block inside includeBlock (hot path with many blocks).
+	var timeStartT, timeEndT time.Time
+	if timeStart != 0 {
+		timeStartT = time.Unix(timeStart, 0)
+	}
+	if timeEnd != 0 {
+		timeEndT = time.Unix(timeEnd, 0)
+	}
+
 	for _, b := range blocklist {
-		if includeBlock(b, id, blockStartBytes, blockEndBytes, timeStart, timeEnd, opts.RF1After) {
+		if includeBlock(b, id, blockStartBytes, blockEndBytes, timeStartT, timeEndT, opts.RF1After) {
 			copiedBlocklist = append(copiedBlocklist, b)
 			blocksSearched++
 		}
 	}
+	compactedLookback := time.Now().Add(-(2 * rw.cfg.BlocklistPoll))
 	for _, c := range compactedBlocklist {
-		if includeCompactedBlock(c, id, blockStartBytes, blockEndBytes, rw.cfg.BlocklistPoll, timeStart, timeEnd, opts.RF1After) {
+		if includeCompactedBlock(c, id, blockStartBytes, blockEndBytes, compactedLookback, timeStartT, timeEndT, opts.RF1After) {
 			copiedBlocklist = append(copiedBlocklist, &c.BlockMeta)
 			compactedBlocksSearched++
 		}
@@ -711,7 +731,7 @@ func (rw *readerWriter) pollBlocklist(ctx context.Context) {
 }
 
 // includeBlock indicates whether a given block should be included in a backend search
-func includeBlock(b *backend.BlockMeta, _ common.ID, blockStart, blockEnd []byte, timeStart, timeEnd int64, rf1After time.Time) bool {
+func includeBlock(b *backend.BlockMeta, _ common.ID, blockStart, blockEnd []byte, timeStart, timeEnd time.Time, rf1After time.Time) bool {
 	// todo: restore this functionality once it works. min/max ids are currently not recorded
 	//    https://github.com/grafana/tempo/issues/1903
 	//  correctly in a block
@@ -719,8 +739,8 @@ func includeBlock(b *backend.BlockMeta, _ common.ID, blockStart, blockEnd []byte
 	// 	return false
 	// }
 
-	if timeStart != 0 && timeEnd != 0 {
-		if b.StartTime.Unix() >= timeEnd || b.EndTime.Unix() <= timeStart {
+	if !timeStart.IsZero() && !timeEnd.IsZero() {
+		if !b.StartTime.Before(timeEnd) || !b.EndTime.After(timeStart) {
 			return false
 		}
 	}
@@ -741,8 +761,8 @@ func includeBlock(b *backend.BlockMeta, _ common.ID, blockStart, blockEnd []byte
 }
 
 // if block is compacted within lookback period, and is within shard ranges, include it in search
-func includeCompactedBlock(c *backend.CompactedBlockMeta, id common.ID, blockStart, blockEnd []byte, poll time.Duration, timeStart, timeEnd int64, rf1After time.Time) bool {
-	lookback := time.Now().Add(-(2 * poll))
+// lookback is the pre-computed cutoff time: blocks compacted before this time are excluded.
+func includeCompactedBlock(c *backend.CompactedBlockMeta, id common.ID, blockStart, blockEnd []byte, lookback time.Time, timeStart, timeEnd time.Time, rf1After time.Time) bool {
 	if c.CompactedTime.Before(lookback) {
 		return false
 	}

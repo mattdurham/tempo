@@ -598,9 +598,10 @@ func (c *SyncIterator) seekRowGroup(seekTo RowNumber, definitionLevel int) (done
 			continue
 		}
 
-		cc := &ColumnChunkHelper{ColumnChunk: rg.ColumnChunks()[c.column]}
+		cc := getColumnChunkHelper(rg.ColumnChunks()[c.column])
 		if c.filter != nil && !c.filter.KeepColumnChunk(cc) {
 			cc.Close()
+			putColumnChunkHelper(cc)
 			continue
 		}
 
@@ -756,9 +757,10 @@ func (c *SyncIterator) next() (RowNumber, *pq.Value, error) {
 				return EmptyRowNumber(), nil, nil
 			}
 
-			cc := &ColumnChunkHelper{ColumnChunk: rg.ColumnChunks()[c.column]}
+			cc := getColumnChunkHelper(rg.ColumnChunks()[c.column])
 			if c.filter != nil && !c.filter.KeepColumnChunk(cc) {
 				cc.Close()
+				putColumnChunkHelper(cc)
 				continue
 			}
 
@@ -867,6 +869,7 @@ func (c *SyncIterator) setPage(pg pq.Page) {
 func (c *SyncIterator) closeCurrRowGroup() {
 	if c.currChunk != nil {
 		c.currChunk.Close()
+		putColumnChunkHelper(c.currChunk)
 	}
 
 	c.currRowGroup = nil
