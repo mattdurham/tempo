@@ -169,9 +169,17 @@ func (r *Reader) synthesizeSpanEnd() (*shared.IntrinsicColumn, error) {
 		return nil, nil
 	}
 
-	// Both must be flat uint64 columns with matching lengths.
-	if len(startCol.Uint64Values) == 0 || len(startCol.Uint64Values) != len(durCol.Uint64Values) {
+	// Both must be flat uint64 columns.
+	if len(startCol.Uint64Values) == 0 || len(durCol.Uint64Values) == 0 {
 		return nil, nil
+	}
+
+	// Flat columns are independently sorted by value, so position i in span:start
+	// and position i in span:duration refer to different spans. Join on BlockRef
+	// to pair the correct start and duration for each span.
+	durByRef := make(map[shared.BlockRef]uint64, len(durCol.Uint64Values))
+	for i, ref := range durCol.BlockRefs {
+		durByRef[ref] = durCol.Uint64Values[i]
 	}
 
 	n := len(startCol.Uint64Values)
@@ -180,13 +188,18 @@ func (r *Reader) synthesizeSpanEnd() (*shared.IntrinsicColumn, error) {
 		Type:         shared.ColumnTypeUint64,
 		Format:       shared.IntrinsicFormatFlat,
 		Count:        uint32(n), //nolint:gosec
-		Uint64Values: make([]uint64, n),
-		BlockRefs:    make([]shared.BlockRef, n),
+		Uint64Values: make([]uint64, 0, n),
+		BlockRefs:    make([]shared.BlockRef, 0, n),
 	}
-	for i := range n {
-		col.Uint64Values[i] = startCol.Uint64Values[i] + durCol.Uint64Values[i]
-		col.BlockRefs[i] = startCol.BlockRefs[i]
+	for i, ref := range startCol.BlockRefs {
+		dur, ok := durByRef[ref]
+		if !ok {
+			continue // span has start but no duration — skip
+		}
+		col.Uint64Values = append(col.Uint64Values, startCol.Uint64Values[i]+dur)
+		col.BlockRefs = append(col.BlockRefs, ref)
 	}
+	col.Count = uint32(len(col.BlockRefs)) //nolint:gosec
 
 	if r.intrinsicDecoded == nil {
 		r.intrinsicDecoded = make(map[string]*shared.IntrinsicColumn)
