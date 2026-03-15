@@ -1,19 +1,8 @@
 package vm
 
 import (
-	"fmt"
 	"time"
 )
-
-// VM is a stack-based virtual machine for executing TraceQL bytecode
-type VM struct {
-	provider AttributeProvider
-
-	program *Program
-	stack   []Value
-	sp      int // Stack pointer
-	pc      int // Program counter (current instruction index)
-}
 
 // AggBucket holds aggregation state for a single group.
 // A JSON-friendly payload used to exist but was removed; this is the sole bucket struct.
@@ -107,60 +96,4 @@ type GroupKey struct {
 type DateBinInfo struct {
 	Interval        time.Duration // e.g., 5*time.Minute for "5m"
 	OriginTimestamp int64         // Query start time (Unix nanoseconds)
-}
-
-// NewVM creates a new VM instance
-func NewVM(program *Program) *VM {
-	return &VM{
-		program: program,
-		stack:   make([]Value, 256), // Pre-allocate stack
-		sp:      0,
-	}
-}
-
-func (vm *VM) pop() Value {
-	if vm.sp == 0 {
-		return Value{Type: TypeNil, Data: nil}
-	}
-	vm.sp--
-	return vm.stack[vm.sp]
-}
-
-func (vm *VM) push(val Value) {
-	if vm.sp >= len(vm.stack) {
-		vm.stack = append(vm.stack, val)
-		vm.sp++
-	} else {
-		vm.stack[vm.sp] = val
-		vm.sp++
-	}
-}
-
-func (vm *VM) loadAttribute(attrIdx int) Value {
-	if attrIdx < 0 || attrIdx >= len(vm.program.Attributes) {
-		return Value{Type: TypeNil, Data: nil}
-	}
-
-	attrName := vm.program.Attributes[attrIdx]
-
-	// Use provider if available (blockpack execution)
-	if vm.provider != nil {
-		return vm.provider.GetAttribute(attrName)
-	}
-
-	// OTLP execution path not yet implemented
-	// Programs compiled by CompileTraceQLFilter() MUST be executed with an AttributeProvider
-	// (e.g., via blockpack ColumnDataProvider). Direct OTLP span execution is not supported.
-	panic(
-		fmt.Sprintf(
-			"attribute lookup without provider: %s (OTLP execution path not implemented - use ColumnPredicate with blockpack provider)",
-			attrName,
-		),
-	)
-}
-
-// AttributeProvider enables VM execution over alternate data sources (e.g., blockpack).
-type AttributeProvider interface {
-	GetAttribute(attrPath string) Value
-	GetStartTime() (uint64, bool)
 }

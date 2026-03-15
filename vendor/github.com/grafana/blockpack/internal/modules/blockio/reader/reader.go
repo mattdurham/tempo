@@ -32,14 +32,9 @@ type Reader struct {
 	provider rw.ReaderProvider
 	// cache is the optional disk-backed file cache for footer/header/metadata/block reads.
 	// Nil when no cache is configured.
-	cache  *filecache.FileCache
-	fileID string
+	cache *filecache.FileCache
 
 	traceIndex map[[16]byte][]uint16
-
-	// traceIndexRaw holds the raw bytes of the trace index section for lazy parsing.
-	// Populated during parseV5MetadataLazy; parsed into traceIndex on first access.
-	traceIndexRaw []byte
 
 	// Range index — lazy.
 	rangeOffsets  map[string]rangeIndexMeta
@@ -56,6 +51,20 @@ type Reader struct {
 
 	// fileSummary is the lazily computed file-level sketch summary.
 	fileSummary *FileSketchSummary
+
+	// intrinsicIndex holds the parsed TOC entries, keyed by column name.
+	// Populated by parseIntrinsicTOC during NewReaderFromProvider. Nil for
+	// v3 footer files or files with intrinsicIndexLen == 0.
+	intrinsicIndex map[string]shared.IntrinsicColMeta
+
+	// intrinsicDecoded caches fully decoded intrinsic columns by name.
+	// Populated lazily by GetIntrinsicColumn.
+	intrinsicDecoded map[string]*shared.IntrinsicColumn
+	fileID           string
+
+	// traceIndexRaw holds the raw bytes of the trace index section for lazy parsing.
+	// Populated during parseV5MetadataLazy; parsed into traceIndex on first access.
+	traceIndexRaw []byte
 
 	// tsEntries is the parsed per-file timestamp index (sorted by minTS ascending).
 	// Nil for files written before the TS index was introduced.
@@ -77,9 +86,15 @@ type Reader struct {
 	metadataOffset uint64
 	metadataLen    uint64
 
+	// intrinsicIndexOffset and intrinsicIndexLen are parsed from the v4 footer.
+	// Both are 0 for v3 footer files or files with no intrinsic section.
+	intrinsicIndexOffset uint64
+
 	fileSummaryOnce sync.Once
 
 	compactLen uint32
+
+	intrinsicIndexLen uint32
 
 	footerVersion uint16
 	fileVersion   uint8
@@ -87,20 +102,6 @@ type Reader struct {
 	// signalType is parsed from the V12 file header signal_type byte.
 	// Defaults to shared.SignalTypeTrace (0x01) for older files.
 	signalType uint8
-
-	// intrinsicIndexOffset and intrinsicIndexLen are parsed from the v4 footer.
-	// Both are 0 for v3 footer files or files with no intrinsic section.
-	intrinsicIndexOffset uint64
-	intrinsicIndexLen    uint32
-
-	// intrinsicIndex holds the parsed TOC entries, keyed by column name.
-	// Populated by parseIntrinsicTOC during NewReaderFromProvider. Nil for
-	// v3 footer files or files with intrinsicIndexLen == 0.
-	intrinsicIndex map[string]shared.IntrinsicColMeta
-
-	// intrinsicDecoded caches fully decoded intrinsic columns by name.
-	// Populated lazily by GetIntrinsicColumn.
-	intrinsicDecoded map[string]*shared.IntrinsicColumn
 }
 
 // NewReaderFromProvider constructs a Reader by reading the footer, header,
@@ -348,7 +349,6 @@ func (r *Reader) BlocksForRangeInterval(
 	return result, nil
 }
 
-
 // ColumnNames returns all column names known to this reader — the union of
 // range-indexed columns (rangeOffsets) and sketch columns (sketchIdx).
 // These are derived from the file header/metadata, so no block I/O is needed.
@@ -377,6 +377,43 @@ func (r *Reader) RangeColumnType(colName string) (shared.ColumnType, bool) {
 		return 0, false
 	}
 	return meta.typ, true
+}
+
+// RangeBoundaries exposes the file-level value range for a range-indexed column.
+// BucketMin and BucketMax are the global min/max across all blocks (stored in
+// the wire format bucket metadata). For RangeFloat64, Float64Bounds holds the
+// typed boundary values. For RangeString, StringBounds holds them. For
+// RangeBytes, BytesBounds holds them. For numeric types (Int64/Uint64/Duration),
+// BucketMin/BucketMax are sufficient for file-level fast reject.
+type RangeBoundaries struct {
+	Float64Bounds []float64
+	StringBounds  []string
+	BytesBounds   [][]byte
+	BucketMin     int64
+	BucketMax     int64
+	ColType       shared.ColumnType
+}
+
+// RangeColumnBoundaries returns the parsed boundaries for a range-indexed column.
+// Returns nil if the column is not range-indexed or an error occurs during parsing.
+// The result may be used for file-level fast reject: if a query value falls entirely
+// outside [BucketMin, BucketMax], no spans in the file can match.
+func (r *Reader) RangeColumnBoundaries(colName string) *RangeBoundaries {
+	if err := r.ensureRangeColumnParsed(colName); err != nil {
+		return nil
+	}
+	idx, ok := r.rangeParsed[colName]
+	if !ok {
+		return nil
+	}
+	return &RangeBoundaries{
+		ColType:       idx.colType,
+		BucketMin:     idx.bucketMin,
+		BucketMax:     idx.bucketMax,
+		Float64Bounds: idx.float64Bounds,
+		StringBounds:  idx.stringBounds,
+		BytesBounds:   idx.bytesBounds,
+	}
 }
 
 // ReadBlockRaw reads the raw bytes for the block at blockIdx from the provider.
@@ -477,7 +514,7 @@ func (r *Reader) AddColumnsToBlock(bwb *BlockWithBytes, addColumns map[string]st
 	spanCount := int(hdr.spanCount)
 	colCount := int(hdr.columnCount)
 
-	metas, _, err := parseColumnMetadataArray(bwb.RawBytes, 24, colCount)
+	metas, _, err := parseColumnMetadataArray(bwb.RawBytes, 24, colCount, hdr.version)
 	if err != nil {
 		return fmt.Errorf("AddColumnsToBlock: column metadata: %w", err)
 	}
@@ -543,4 +580,28 @@ func (r *Reader) AddColumnsToBlock(bwb *BlockWithBytes, addColumns map[string]st
 	bwb.Block.buildNameIndex()
 
 	return nil
+}
+
+// GetBlockWithBytes reads, parses, and returns a full block. Compatibility shim that
+// combines ReadBlockRaw + ParseBlockFromBytes into a single call.
+func (r *Reader) GetBlockWithBytes(
+	blockIdx int,
+	wantColumns map[string]struct{},
+	secondPassCols map[string]struct{},
+) (*BlockWithBytes, error) {
+	raw, err := r.ReadBlockRaw(blockIdx)
+	if err != nil {
+		return nil, err
+	}
+	bwb, err := r.ParseBlockFromBytes(raw, wantColumns, r.BlockMeta(blockIdx))
+	if err != nil {
+		return nil, err
+	}
+	if secondPassCols != nil {
+		bwb, err = r.ParseBlockFromBytes(bwb.RawBytes, secondPassCols, r.BlockMeta(blockIdx))
+		if err != nil {
+			return nil, err
+		}
+	}
+	return bwb, nil
 }

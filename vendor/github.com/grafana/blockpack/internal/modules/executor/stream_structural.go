@@ -51,7 +51,14 @@ func (e *Executor) ExecuteStructural(
 		return nil, err
 	}
 
-	traceSpans, err := collectAllStructuralSpans(r, leftProg, rightProg)
+	traceSpans, err := collectAllStructuralSpans(
+		r,
+		leftProg,
+		rightProg,
+		opts.TimeRange,
+		opts.StartBlock,
+		opts.BlockCount,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -83,15 +90,29 @@ func compileStructuralFilterPrograms(q *traceqlparser.StructuralQuery) (left, ri
 	return left, right, nil
 }
 
-// collectAllStructuralSpans fetches all blocks and accumulates per-trace span records.
-// Returns a map keyed by [16]byte trace ID.
+// collectAllStructuralSpans fetches blocks (optionally filtered by time range and sub-file
+// sharding) and accumulates per-trace span records. Returns a map keyed by [16]byte trace ID.
 func collectAllStructuralSpans(
 	r *modules_reader.Reader,
 	leftProg, rightProg *vm.Program,
+	tr queryplanner.TimeRange,
+	startBlock, blockCount int,
 ) (map[[16]byte][]structuralSpanRec, error) {
 	planner := queryplanner.NewPlanner(r)
-	// Structural queries must scan all blocks — pass nil predicates and zero TimeRange.
-	plan := planner.Plan(nil, queryplanner.TimeRange{})
+	// Structural queries pass nil predicates (no value-based pruning) but do use time-range pruning.
+	plan := planner.Plan(nil, tr)
+
+	// Sub-file sharding: restrict to assigned block range.
+	if blockCount > 0 {
+		endBlock := startBlock + blockCount
+		filtered := plan.SelectedBlocks[:0]
+		for _, bi := range plan.SelectedBlocks {
+			if bi >= startBlock && bi < endBlock {
+				filtered = append(filtered, bi)
+			}
+		}
+		plan.SelectedBlocks = filtered
+	}
 
 	if len(plan.SelectedBlocks) == 0 {
 		return nil, nil
@@ -406,7 +427,7 @@ func evalOpNotSiblingStruct(spans []structuralSpanRec) []int {
 	return result
 }
 
-// evalOpNotDescendantStruct: R is rightMatch but NOT a descendant of any leftMatch span (!>>).
+// SPEC-STRUCT-6: evalOpNotDescendantStruct: R is rightMatch but NOT a descendant of any leftMatch span (!>>).
 // Walk R's ancestor chain; if no ancestor is leftMatch, emit R.
 func evalOpNotDescendantStruct(spans []structuralSpanRec) []int {
 	leftSet := make(map[int]bool)
@@ -436,7 +457,7 @@ func evalOpNotDescendantStruct(spans []structuralSpanRec) []int {
 	return result
 }
 
-// evalOpNotChildStruct: R is rightMatch but its direct parent is NOT leftMatch (!>).
+// SPEC-STRUCT-7: evalOpNotChildStruct: R is rightMatch but its direct parent is NOT leftMatch (!>).
 // R qualifies if it has no parent, or its parent is not leftMatch.
 func evalOpNotChildStruct(spans []structuralSpanRec) []int {
 	var result []int

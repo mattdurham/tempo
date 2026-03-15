@@ -71,7 +71,7 @@ func (a *intrinsicAccumulator) overCap() bool {
 	return false
 }
 
-// feedUint64 adds one uint64 value (span:duration, span:start, span:end, etc.) to the
+// feedUint64 adds one uint64 value (span:duration, span:start, etc.) to the
 // named flat column. colType must be ColumnTypeUint64 or ColumnTypeRangeUint64.
 func (a *intrinsicAccumulator) feedUint64(name string, colType shared.ColumnType, val uint64, blockIdx uint16, rowIdx int) {
 	c, ok := a.flatCols[name]
@@ -105,7 +105,7 @@ func (a *intrinsicAccumulator) feedString(name string, colType shared.ColumnType
 	})
 }
 
-// feedInt64 adds one int64 value (span:kind, span:status, log:severity_number) to the named dict column.
+// feedInt64 adds one int64 value (span:kind, span:status) to the named dict column.
 func (a *intrinsicAccumulator) feedInt64(name string, colType shared.ColumnType, val int64, blockIdx uint16, rowIdx int) {
 	c, ok := a.dictCols[name]
 	if !ok {
@@ -584,8 +584,8 @@ func encodePagedFlatColumn(c *flatAccum) ([]byte, error) {
 		blob, minVal, maxVal := encodeFlatPageBlob(c, start, end, blockW, rowW)
 		pages = append(pages, shared.PageMeta{
 			Offset:   offset,
-			Length:   uint32(len(blob)),      //nolint:gosec
-			RowCount: uint32(end - start),    //nolint:gosec
+			Length:   uint32(len(blob)),   //nolint:gosec
+			RowCount: uint32(end - start), //nolint:gosec
 			Min:      minVal,
 			Max:      maxVal,
 		})

@@ -61,9 +61,7 @@ func StreamLogs(
 		wantColumns = wantCopy
 	}
 
-	planner := queryplanner.NewPlanner(r)
-	predicates := buildPredicates(r, program)
-	plan := planner.Plan(predicates, queryplanner.TimeRange{})
+	plan := planBlocks(r, program, queryplanner.TimeRange{}, queryplanner.PlanOptions{})
 
 	if len(plan.SelectedBlocks) == 0 {
 		return nil, nil

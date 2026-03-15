@@ -166,5 +166,18 @@ func (r *Reader) ensureCompactIndexParsed() error {
 		traceIndex:   traceIdx,
 		traceIDBloom: traceIDBloom,
 	}
+
+	// Populate blockMetas from the compact block table so ReadBlockRaw,
+	// CoalescedGroups, and other block-access methods work for lean readers.
+	if len(r.blockMetas) == 0 {
+		r.blockMetas = make([]shared.BlockMeta, len(blockTable))
+		for i, entry := range blockTable {
+			r.blockMetas[i] = shared.BlockMeta{
+				Offset: entry.fileOffset,
+				Length: uint64(entry.fileLength),
+			}
+		}
+	}
+
 	return nil
 }

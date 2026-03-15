@@ -56,36 +56,25 @@ func CompactLogFile(input modules_rw.ReaderProvider, output io.Writer, cfg Confi
 	}
 
 	// Phase 1: Read all blocks, reconstruct OTLP protos, compute sort keys.
-	allBlocks := make([]int, totalBlocks)
-	for i := range allBlocks {
-		allBlocks[i] = i
-	}
 	var rows []pendingLogRow
-	for _, group := range r.CoalescedGroups(allBlocks) {
-		rawMap, fetchErr := r.ReadGroup(group)
-		if fetchErr != nil {
-			return fmt.Errorf("compact log: read group: %w", fetchErr)
+	for blockIdx := range totalBlocks {
+		bwb, getErr := r.GetBlockWithBytes(blockIdx, nil, nil)
+		if getErr != nil {
+			return fmt.Errorf("compact log: get block %d: %w", blockIdx, getErr)
 		}
-		for _, blockIdx := range group.BlockIDs {
-			raw, ok := rawMap[blockIdx]
-			if !ok {
-				continue
-			}
-			bwb, getErr := r.ParseBlockFromBytes(raw, nil, r.BlockMeta(blockIdx))
-			if getErr != nil {
-				return fmt.Errorf("compact log: parse block %d: %w", blockIdx, getErr)
-			}
-			block := bwb.Block
-			for rowIdx := range block.SpanCount() {
-				ld := reconstructLogRecord(block, rowIdx)
-				var sig [4]uint64
-				ts := computeLogRowSortKey(block, rowIdx, &sig)
-				rows = append(rows, pendingLogRow{
-					ld:         ld,
-					minHashSig: sig,
-					timestamp:  ts,
-				})
-			}
+		if bwb == nil {
+			continue
+		}
+		block := bwb.Block
+		for rowIdx := range block.SpanCount() {
+			ld := reconstructLogRecord(block, rowIdx)
+			var sig [4]uint64
+			ts := computeLogRowSortKey(block, rowIdx, &sig)
+			rows = append(rows, pendingLogRow{
+				ld:         ld,
+				minHashSig: sig,
+				timestamp:  ts,
+			})
 		}
 	}
 

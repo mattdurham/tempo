@@ -50,22 +50,3 @@ before the next `ResetInternStrings()` call, so the borrowed reference is always
 for `decodeNow()`.
 
 Back-ref: `internal/modules/blockio/reader/column.go:decodeNow`
-
----
-
-## NOTE-003: Intrinsic Column Decode — Lazy Mirrors Block Column Lazy Decode
-*Added: 2026-03-11*
-
-The intrinsic column design follows the same lazy-decode pattern as block columns (see SPEC-002):
-- **TOC is parsed eagerly** at `NewReaderFromProvider` time (one I/O for the TOC blob).
-  This is analogous to how metadata is parsed eagerly.
-- **Column blobs are decoded lazily** on first `GetIntrinsicColumn(name)` call.
-  This avoids loading all column data (potentially many MB) when only one column is needed.
-- **Results are cached** in `intrinsicDecoded` so repeated calls are O(1) map lookups.
-
-The decode functions (`shared.DecodeTOC`, `shared.DecodeIntrinsicColumnBlob`) live in the
-`shared` package (not `writer`) to avoid a circular import: `writer` imports `reader`, so
-`reader` cannot import `writer`. Both packages can safely import `shared`.
-
-Back-ref: `internal/modules/blockio/reader/intrinsic_reader.go`,
-`internal/modules/blockio/shared/intrinsic_codec.go`

@@ -573,7 +573,7 @@ func buildLogBlock(pending []pendingLogRecord, enc *zstdEncoder) (builtBlock, er
 			bb.colMinMax[name] = fmm
 		}
 	}
-	payload, err := bb.finalize(enc)
+	payload, err := bb.finalize(enc, shared.VersionBlockV12)
 	if err != nil {
 		return builtBlock{}, err
 	}
@@ -594,12 +594,12 @@ func buildLogBlock(pending []pendingLogRecord, enc *zstdEncoder) (builtBlock, er
 // Delegates to the shared finalize logic on blockBuilder by using its column map.
 // Since logBlockBuilder mirrors blockBuilder's column infrastructure exactly,
 // we build a minimal blockBuilder shell to reuse finalize().
-func (b *logBlockBuilder) finalize(enc *zstdEncoder) ([]byte, error) {
+func (b *logBlockBuilder) finalize(enc *zstdEncoder, blockVersion uint8) ([]byte, error) {
 	// Build a minimal blockBuilder to reuse the finalize() method.
 	// We only need the columns map and spanCount fields for finalization.
 	shell := &blockBuilder{
 		columns:   b.columns,
 		spanCount: b.recordCount,
 	}
-	return shell.finalize(enc)
+	return shell.finalize(enc, blockVersion)
 }

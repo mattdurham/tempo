@@ -60,7 +60,6 @@ func ExecuteTraceMetrics(
 		return nil, fmt.Errorf("ExecuteTraceMetrics: program cannot be nil")
 	}
 
-	predicates := buildPredicates(r, program)
 	var tr queryplanner.TimeRange
 	if querySpec.TimeBucketing.Enabled {
 		tr = queryplanner.TimeRange{
@@ -68,8 +67,7 @@ func ExecuteTraceMetrics(
 			MaxNano: uint64(querySpec.TimeBucketing.EndTime),   //nolint:gosec
 		}
 	}
-	planner := queryplanner.NewPlanner(r)
-	plan := planner.Plan(predicates, tr)
+	plan := planBlocks(r, program, tr, queryplanner.PlanOptions{})
 
 	result := &TraceMetricsResult{}
 	if len(plan.SelectedBlocks) == 0 {
@@ -91,7 +89,7 @@ func ExecuteTraceMetrics(
 		wantColumns[c] = struct{}{}
 	}
 
-	rawBlocks, err := planner.FetchBlocks(plan)
+	rawBlocks, err := r.ReadBlocks(plan.SelectedBlocks)
 	if err != nil {
 		return nil, fmt.Errorf("FetchBlocks: %w", err)
 	}

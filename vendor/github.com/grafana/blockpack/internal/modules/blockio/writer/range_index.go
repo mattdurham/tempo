@@ -107,12 +107,8 @@ func addBlockRangeToColumn(cd *rangeColumnData, mm *blockColMinMax, bid uint32) 
 	switch cd.colType {
 	case shared.ColumnTypeRangeInt64, shared.ColumnTypeRangeDuration:
 		if cd.kllInt64 != nil && len(mm.minKey) >= 8 && len(mm.maxKey) >= 8 {
-			minV := int64(
-				binary.LittleEndian.Uint64([]byte(mm.minKey)),
-			) //nolint:gosec // safe: reinterpreting uint64 bits as int64
-			maxV := int64(
-				binary.LittleEndian.Uint64([]byte(mm.maxKey)),
-			) //nolint:gosec // safe: reinterpreting uint64 bits as int64
+			minV := int64(binary.LittleEndian.Uint64([]byte(mm.minKey))) //nolint:gosec
+			maxV := int64(binary.LittleEndian.Uint64([]byte(mm.maxKey))) //nolint:gosec
 			cd.kllInt64.Add(minV)
 			cd.kllInt64.Add(maxV)
 		}
@@ -149,8 +145,8 @@ func encodeRangeKey(typ shared.ColumnType, val shared.AttrValue) string {
 	case shared.ColumnTypeInt64, shared.ColumnTypeRangeDuration, shared.ColumnTypeRangeInt64:
 		binary.LittleEndian.PutUint64(
 			tmp[:],
-			uint64(val.Int),
-		) //nolint:gosec // safe: reinterpreting int64 bits as uint64
+			uint64(val.Int), //nolint:gosec // safe: reinterpreting int64 bits as uint64
+		)
 		return string(tmp[:])
 	case shared.ColumnTypeUint64, shared.ColumnTypeRangeUint64:
 		binary.LittleEndian.PutUint64(tmp[:], val.Uint)
@@ -205,9 +201,7 @@ func findBucketInt64(v int64, bounds []int64) uint16 {
 	}
 	idx := lo - 1
 	if idx >= len(bounds)-1 {
-		return uint16(
-			len(bounds) - 2,
-		) //nolint:gosec // safe: len(bounds)-2 is in range [0, nBuckets-1] which fits uint16
+		return uint16(len(bounds) - 2) //nolint:gosec
 	}
 	return uint16(idx) //nolint:gosec // safe: idx is in range [0, len(bounds)-2] which fits uint16
 }
@@ -226,9 +220,7 @@ func findBucketUint64(v uint64, bounds []uint64) uint16 {
 	}
 	idx := lo - 1
 	if idx >= len(bounds)-1 {
-		return uint16(
-			len(bounds) - 2,
-		) //nolint:gosec // safe: len(bounds)-2 is in range [0, nBuckets-1] which fits uint16
+		return uint16(len(bounds) - 2) //nolint:gosec
 	}
 	return uint16(idx) //nolint:gosec // safe: idx is in range [0, len(bounds)-2] which fits uint16
 }
@@ -247,9 +239,7 @@ func findBucketFloat64(v float64, bounds []float64) uint16 {
 	}
 	idx := lo - 1
 	if idx >= len(bounds)-1 {
-		return uint16(
-			len(bounds) - 2,
-		) //nolint:gosec // safe: len(bounds)-2 is in range [0, nBuckets-1] which fits uint16
+		return uint16(len(bounds) - 2) //nolint:gosec
 	}
 	return uint16(idx) //nolint:gosec // safe: idx is in range [0, len(bounds)-2] which fits uint16
 }
@@ -268,9 +258,7 @@ func findBucketString(v string, bounds []string) uint16 {
 	}
 	idx := lo - 1
 	if idx >= len(bounds)-1 {
-		return uint16(
-			len(bounds) - 2,
-		) //nolint:gosec // safe: len(bounds)-2 is in range [0, nBuckets-1] which fits uint16
+		return uint16(len(bounds) - 2) //nolint:gosec
 	}
 	return uint16(idx) //nolint:gosec // safe: idx is in range [0, len(bounds)-2] which fits uint16
 }
@@ -416,10 +404,8 @@ func tryApplyExactValues(cd *rangeColumnData) bool {
 		sorted := make([]int64, 0, len(distinct))
 		for k := range distinct {
 			if len(k) >= 8 {
-				sorted = append(
-					sorted,
-					int64(binary.LittleEndian.Uint64([]byte(k))),
-				) //nolint:gosec // safe: reinterpreting uint64 bits as int64
+				v := int64(binary.LittleEndian.Uint64([]byte(k))) //nolint:gosec
+				sorted = append(sorted, v)
 			}
 		}
 		slices.Sort(sorted)
@@ -433,10 +419,8 @@ func tryApplyExactValues(cd *rangeColumnData) bool {
 		sorted := make([]int64, 0, len(distinct))
 		for k := range distinct {
 			if len(k) >= 8 {
-				sorted = append(
-					sorted,
-					int64(binary.LittleEndian.Uint64([]byte(k))),
-				) //nolint:gosec // safe: reinterpreting uint64 bits as int64
+				v := int64(binary.LittleEndian.Uint64([]byte(k))) //nolint:gosec
+				sorted = append(sorted, v)
 			}
 		}
 		slices.Sort(sorted)
@@ -492,12 +476,8 @@ func applyOverlapInt64(cd *rangeColumnData, nBuckets int) {
 		if len(br.minKey) < 8 || len(br.maxKey) < 8 {
 			continue
 		}
-		minV := int64(
-			binary.LittleEndian.Uint64([]byte(br.minKey)),
-		) //nolint:gosec // safe: reinterpreting uint64 bits as int64
-		maxV := int64(
-			binary.LittleEndian.Uint64([]byte(br.maxKey)),
-		) //nolint:gosec // safe: reinterpreting uint64 bits as int64
+		minV := int64(binary.LittleEndian.Uint64([]byte(br.minKey))) //nolint:gosec
+		maxV := int64(binary.LittleEndian.Uint64([]byte(br.maxKey))) //nolint:gosec
 		if minV > maxV {
 			minV, maxV = maxV, minV // guard against string-order vs numeric-order inversion
 		}
@@ -551,9 +531,7 @@ func applyOverlapFloat64(cd *rangeColumnData, nBuckets int) {
 	cd.float64Bounds = bounds
 	cd.boundaries = make([]int64, len(bounds))
 	for i, b := range bounds {
-		cd.boundaries[i] = int64(
-			math.Float64bits(b),
-		) //nolint:gosec // safe: storing float64 bits as int64 for wire format
+		cd.boundaries[i] = int64(math.Float64bits(b)) //nolint:gosec
 	}
 	cd.bucketMin = int64(math.Float64bits(bounds[0]))             //nolint:gosec
 	cd.bucketMax = int64(math.Float64bits(bounds[len(bounds)-1])) //nolint:gosec

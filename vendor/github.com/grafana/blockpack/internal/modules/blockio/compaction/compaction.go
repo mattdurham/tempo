@@ -134,27 +134,17 @@ func (s *compactionState) processProvider(provider modules_rw.ReaderProvider) (r
 		return fmt.Errorf("open reader: %w", err)
 	}
 
-	allBlocks := make([]int, r.BlockCount())
-	for i := range allBlocks {
-		allBlocks[i] = i
-	}
-	for _, group := range r.CoalescedGroups(allBlocks) {
-		rawMap, fetchErr := r.ReadGroup(group)
-		if fetchErr != nil {
-			return fmt.Errorf("read group: %w", fetchErr)
+	for blockIdx := range r.BlockCount() {
+		bwb, getErr := r.GetBlockWithBytes(blockIdx, nil, nil)
+		if getErr != nil {
+			return fmt.Errorf("get block %d: %w", blockIdx, getErr)
 		}
-		for _, blockIdx := range group.BlockIDs {
-			raw, ok := rawMap[blockIdx]
-			if !ok {
-				continue
-			}
-			bwb, parseErr := r.ParseBlockFromBytes(raw, nil, r.BlockMeta(blockIdx))
-			if parseErr != nil {
-				return fmt.Errorf("parse block %d: %w", blockIdx, parseErr)
-			}
-			if processErr := s.processBlock(bwb.Block); processErr != nil {
-				return fmt.Errorf("process block %d: %w", blockIdx, processErr)
-			}
+		if bwb == nil {
+			continue
+		}
+
+		if processErr := s.processBlock(bwb.Block); processErr != nil {
+			return fmt.Errorf("process block %d: %w", blockIdx, processErr)
 		}
 	}
 

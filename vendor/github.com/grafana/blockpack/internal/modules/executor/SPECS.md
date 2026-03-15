@@ -577,6 +577,18 @@ Back-ref: `internal/modules/executor/stream_structural.go:ExecuteStructural`
   `[16]byte` value. `BlockIdx` and `RowIdx` are zero (structural queries aggregate across
   blocks; per-block row positions are not meaningful in the result).
 
+- **SPEC-STRUCT-6:** `OpNotDescendant (!>>)` — a rightMatch span R passes if NO span in
+  R's ancestor chain is a leftMatch. Root spans (parentIdx == -1) have an empty ancestor
+  chain and always pass. Contrast with `>>` (OpDescendant) which requires at least one
+  ancestor to be leftMatch. All blocks are still scanned (SPEC-STRUCT-2 applies).
+  Back-ref: `internal/modules/executor/stream_structural.go:evalOpNotDescendantStruct`
+
+- **SPEC-STRUCT-7:** `OpNotChild (!>)` — a rightMatch span R passes if R has no parent
+  (parentIdx == -1) or R's direct parent is not a leftMatch. Root spans trivially pass.
+  Contrast with `>` (OpChild) which requires the direct parent to be leftMatch.
+  All blocks are still scanned (SPEC-STRUCT-2 applies).
+  Back-ref: `internal/modules/executor/stream_structural.go:evalOpNotChildStruct`
+
 ### 11.4 Structural Operators
 
 | Operator | Symbol | Semantics |
@@ -587,63 +599,78 @@ Back-ref: `internal/modules/executor/stream_structural.go:ExecuteStructural`
 | OpAncestor    | `<<`  | R is any ancestor of L (walk L's parent chain) |
 | OpParent      | `<`   | R is the direct parent of L |
 | OpNotSibling  | `!~`  | R is rightMatch with no leftMatch sibling at the same parent |
+| OpNotDescendant | `!>>` | R is rightMatch but NO ancestor of R is leftMatch |
+| OpNotChild      | `!>`  | R is rightMatch and R's direct parent is NOT leftMatch (or R has no parent) |
 
 Back-ref: `internal/modules/executor/stream_structural.go:applyStructuralOp`
 
 ---
 
-## 12. Intrinsic-Guided Block Pruning (Phase 3)
+## 12. Pipeline Aggregate Queries (streamPipelineQuery)
 
-The intrinsic-guided pruning subsystem uses the file-level intrinsic columns section
-(present in v4 footer files) to narrow block selection before the standard planner pass.
+Invoked when `QueryTraceQL` receives a `*traceqlparser.MetricsQuery` (e.g.
+`{ filter } | count() > N` or `{ filter } | avg(span.latency_ms)`).
 
-### 12.1 ProgramIsIntrinsicOnly
+### 12.1 Algorithm
 
-**SPEC-IC-1:** `ProgramIsIntrinsicOnly(program *vm.Program) bool`
+1. Compile and run the filter expression with `Limit: 0` to collect all matching spans.
+2. If `pipeline == nil` or `pipeline.Aggregate.Name == ""`, emit all spans directly
+   (respecting `opts.Limit`). No grouping or aggregation is performed.
+3. Group spans into spansets keyed by `SpanMatch.TraceID` string.
+4. For each spanset in insertion order, compute the aggregate value.
+5. If `pipeline.HasThreshold == true`, discard spansets whose aggregate does not satisfy
+   `aggVal <op> thresholdVal`.
+6. Emit all spans from passing spansets, respecting `opts.Limit`.
 
-Returns `true` when all column references in the program can be served from the intrinsic
-columns section without reading any block data. Returns `false` if:
-- `program` is nil
-- The program has no predicates (match-all query)
-- Any referenced column is not in `traceIntrinsicColumns` or `logIntrinsicColumns`
+### 12.2 Supported Aggregates
 
-Intrinsic trace columns: `trace:id`, `span:id`, `span:parent_id`, `span:name`, `span:kind`,
-`span:start`, `span:end`, `span:duration`, `span:status`, `span:status_message`,
-`resource.service.name`
+| Name | Field required | Description |
+|---|---|---|
+| `count` / `count_over_time` | No | Number of spans in the spanset |
+| `avg` | Yes | Arithmetic mean of numeric field values |
+| `min` | Yes | Minimum of numeric field values |
+| `max` | Yes | Maximum of numeric field values |
+| `sum` | Yes | Sum of numeric field values |
 
-Intrinsic log columns: `log:timestamp`, `log:observed_timestamp`, `log:severity_number`,
-`log:severity_text`, `log:trace_id`, `log:span_id`, `log:flags`, `resource.service.name`
+### 12.3 Invariants
 
-Back-ref: `internal/modules/executor/predicates.go:ProgramIsIntrinsicOnly`
+- **SPEC-PA-1:** The aggregate field is looked up via `getSpanFieldNumeric`, which matches
+  `int64`, `uint64`, `float64`, and `int` field values. String and bool fields are
+  silently skipped per span. The field name supports scope-prefix tolerance:
+  `"span:duration"` matches `"duration"`; `"span.latency_ms"` matches `"latency_ms"`.
+  The aggregate field MUST appear in the filter expression for its column to be
+  included in `wantColumns`. Queries of the form `{ } | avg(span.latency_ms)` where
+  the field does not appear in the filter will silently return 0 results because
+  `streamPipelineQuery` does not set `AllColumns: true`. Use `{ span.latency_ms > 0 }`
+  or equivalent to ensure the field is loaded.
+  Back-ref: `api.go:getSpanFieldNumeric`
 
-### 12.2 BlocksFromIntrinsicTOC
+- **SPEC-PA-2:** When `avg/min/max/sum` finds no numeric field values in a spanset, the
+  aggregate returns `(0, false)` and the spanset is silently skipped — it is not emitted
+  even when `HasThreshold == false`.
+  Back-ref: `api.go:computeSpansetAggregate`
 
-**SPEC-IC-2:** `BlocksFromIntrinsicTOC(r *Reader, program *vm.Program) []int`
+- **SPEC-PA-3:** `count` / `count_over_time` always returns `(float64(len(spans)), true)`
+  regardless of field names. It cannot return `ok == false`.
+  Back-ref: `api.go:computeSpansetAggregate`
 
-Returns the set of block indices that **may** contain rows matching the given predicate
-program, using only the intrinsic column TOC (min/max per column). Conservative filter:
-returns nil (no pruning) when:
-- `r.HasIntrinsicSection()` is false (v3 footer or empty TOC)
-- `ProgramIsIntrinsicOnly(program)` is false
+- **SPEC-PA-4:** If total matched spans exceeds `maxPipelineSpans` (1,000,000), the query
+  returns an error immediately before grouping. Callers must narrow their filter expression.
+  Back-ref: `api.go:streamPipelineQuery`
 
-**Phase 3 (current):** Stub — always returns nil when conditions above are met (the
-infrastructure is in place but TOC-based min/max pruning is not yet implemented).
+- **SPEC-PA-5:** Spans are grouped by `SpanMatch.TraceID` string. Spans with an empty
+  TraceID are grouped under the sentinel key `"__no_trace_id__"`.
+  Back-ref: `api.go:streamPipelineQuery`
 
-**Phase 3b (future):** Use per-column min/max from the TOC to skip blocks whose entire
-range does not overlap the query range, without loading column blobs.
+- **SPEC-PA-6:** When `pipeline.HasThreshold == false`, all spansets with a successful
+  aggregate (`ok == true`) are emitted. This covers queries like `{ } | count()` with no
+  comparison operator.
+  Back-ref: `api.go:streamPipelineQuery`
 
-Back-ref: `internal/modules/executor/predicates.go:BlocksFromIntrinsicTOC`
+- **SPEC-PA-7:** When `pipeline == nil` or `pipeline.Aggregate.Name == ""` (pipeline with
+  no aggregate, e.g. only `by()`/`select()` clauses), all filtered spans are emitted
+  directly, respecting `opts.Limit`. No grouping or aggregation is performed.
+  Back-ref: `api.go:streamPipelineQuery`
 
-### 12.3 Column Sets
-
-`traceIntrinsicColumns` and `logIntrinsicColumns` are package-level maps in `predicates.go`
-that enumerate which column names are covered by the intrinsic section. They are used
-exclusively by `ProgramIsIntrinsicOnly`. `resource.service.name` is included in both sets
-as a "practically intrinsic" column (written for every span/log record).
-
-### 12.4 Phase 3b Note
-
-Full intrinsic-guided pruning (loading column blobs and doing exact row-level filtering
-without reading blocks) is deferred to Phase 3b. The stub in `BlocksFromIntrinsicTOC`
-ensures the code path exists and is tested. The API is stable; Phase 3b only fills in the
-implementation body.
+Back-ref: `api.go:streamPipelineQuery`, `api.go:computeSpansetAggregate`,
+`api.go:getSpanFieldNumeric`, `api.go:compareThreshold`

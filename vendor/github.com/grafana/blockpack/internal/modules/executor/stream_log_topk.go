@@ -117,14 +117,12 @@ func CollectLogs(
 		return nil, fmt.Errorf("CollectLogs: program cannot be nil")
 	}
 
-	planner := queryplanner.NewPlanner(r)
-	predicates := buildPredicates(r, program)
 	// NOTE-023: forward opts.TimeRange for block-level pruning when provided.
 	// When opts.TimeRange is zero, this is identical to the previous behavior.
-	plan := planner.Plan(predicates, queryplanner.TimeRange{
+	plan := planBlocks(r, program, queryplanner.TimeRange{
 		MinNano: opts.TimeRange.MinNano,
 		MaxNano: opts.TimeRange.MaxNano,
-	})
+	}, queryplanner.PlanOptions{})
 
 	fetchedBlocks := 0
 	if opts.OnStats != nil {

@@ -1,12 +1,16 @@
 package queryplanner
 
-// NOTE: Fuse/CMS block pruning for the queryplanner.
+// NOTE: Fuse/CMS block pruning and HLL-based block scoring for the queryplanner.
 // Stage 2b: pruneByFuseAll  — BinaryFuse8 membership filter (SPEC-SK-12, SPEC-SK-16)
 // Stage 3b: pruneByCMSAll   — Count-Min Sketch zero-estimate prune
+// Stage 4:  scoreBlocks     — freq/max(cardinality,1) selectivity scoring
 // NOTE-015: Fuse before CMS — fuse gives hard binary exclusion at 0.39% FPR.
 // NOTE-013: CMS zero means definitely absent (no false negatives for zero).
+// NOTE-014: Score = freq / max(cardinality, 1); higher = more selective block.
 
 import (
+	"math"
+
 	"github.com/grafana/blockpack/internal/modules/sketch"
 )
 
@@ -177,3 +181,88 @@ func pruneByCMSPred(r BlockIndexer, candidates, saved blockSet, pred Predicate) 
 	}
 }
 
+// scoreBlocks computes a selectivity score for each candidate block based on
+// HLL cardinality and CMS frequency estimates.
+//
+// score = sum(freq_i) / max(cardinality, 1)
+//
+// Higher score means more selective (fewer distinct values relative to frequency).
+// Only populated when sketch data is available; returns nil when no predicates or
+// no sketch data.
+// NOTE-014: score = freq/max(card,1).
+func scoreBlocks(r BlockIndexer, candidates blockSet, predicates []Predicate) map[int]float64 {
+	if len(predicates) == 0 || candidates.count() == 0 {
+		return nil
+	}
+	scores := make(map[int]float64, candidates.count())
+	anyScored := false
+	for _, pred := range predicates {
+		scoreBlocksForPred(r, candidates, pred, scores)
+	}
+	for _, v := range scores {
+		if v > 0 {
+			anyScored = true
+			break
+		}
+	}
+	if !anyScored {
+		return nil
+	}
+	return scores
+}
+
+// scoreBlocksForPred accumulates score contributions from one predicate into scores[].
+// Uses bulk slice fetches: Distinct(), TopKMatch(), CMSEstimate() called once per value.
+func scoreBlocksForPred(r BlockIndexer, candidates blockSet, pred Predicate, scores map[int]float64) {
+	if len(pred.Children) > 0 {
+		for _, child := range pred.Children {
+			scoreBlocksForPred(r, candidates, child, scores)
+		}
+		return
+	}
+
+	// Leaf node.
+	if len(pred.Values) == 0 || len(pred.Columns) != 1 {
+		return
+	}
+	col := pred.Columns[0]
+	cs := r.ColumnSketch(col)
+	if cs == nil {
+		return
+	}
+
+	distinct := cs.Distinct()
+
+	for _, val := range pred.Values {
+		// Try TopK first (exact count via FP lookup) — bulk fetch.
+		valFP := sketch.HashForFuse(val)
+		topkCounts := cs.TopKMatch(valFP)
+		cmsEst := cs.CMSEstimate(val)
+
+		candidates.iter(func(blockIdx int) {
+			if blockIdx >= len(distinct) {
+				return
+			}
+			card := float64(distinct[blockIdx])
+			if card < 1 {
+				card = 1
+			}
+			var freq float64
+			if blockIdx < len(topkCounts) && topkCounts[blockIdx] > 0 {
+				freq = float64(topkCounts[blockIdx])
+			} else if blockIdx < len(cmsEst) {
+				// Cap at math.MaxUint16: math.MaxUint32 is the sentinel for CMS
+				// deserialization failure (conservative "possibly present") and must
+				// not inflate the score.
+				est := cmsEst[blockIdx]
+				if est > math.MaxUint16 {
+					est = math.MaxUint16
+				}
+				freq = float64(est)
+			}
+			if freq > 0 {
+				scores[blockIdx] += freq / card
+			}
+		})
+	}
+}

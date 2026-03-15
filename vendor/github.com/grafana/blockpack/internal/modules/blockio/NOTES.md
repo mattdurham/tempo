@@ -1256,50 +1256,68 @@ to accommodate sketch section data at scale. The spec was not updated at the tim
 
 ---
 
-## 45. Intrinsic Columns Section and Footer V4
-*Added: 2026-03-11*
+## 45. KLL Bucket Boundary Parsing and File-Level Fast Reject
+*Added: 2026-03-14*
 
-**Change:** New files are written with footer v4 (34 bytes) instead of footer v3 (22 bytes).
-A new "intrinsic columns section" is written after the compact trace index, storing
-file-level columnar data for span intrinsic fields.
+**Decision:** Parse `bucket_min`, `bucket_max`, and typed boundary arrays from the range
+index wire format (previously skipped). Expose them via `Reader.RangeColumnBoundaries`.
+Use these in `executor.planBlocks` for file-level fast reject.
 
-**Design decisions:**
+**Rationale:** Before this change, the reader skipped all bucket metadata (min, max,
+boundaries) during `parseRangeColumnEntry` — only the value entries were used. This meant
+that the executor had no way to quickly discard entire files when the query value is
+completely outside the file's observed range. For example, a query `span:duration > 1h`
+against a file whose longest span was 10 seconds would still read and evaluate all blocks.
 
-**Why a separate footer version instead of extending v3?**
-The v3 footer is exactly 22 bytes. If we simply added 12 bytes, old readers would parse
-garbage (they read from `fileSize-22` and see the middle of the new footer). A version bump
-forces new detection logic and ensures old readers fail cleanly rather than silently
-reading wrong offsets.
+**File-level fast reject algorithm:**
+1. After `PlanWithOptions`, if `program.Predicates` is non-nil, call `fileLevelReject`.
+2. `fileLevelReject` walks AND-combined leaf `RangeNode` predicates.
+3. For each leaf with a `Min` or `Max` bound, fetch `RangeColumnBoundaries` for the column.
+4. If the predicate interval is entirely disjoint from `[BucketMin, BucketMax]`, return
+   early with empty `SelectedBlocks` (no block reads needed).
 
-**Why a file-level section instead of per-block columns?**
-Per-block intrinsic columns already exist (the standard column data). The file-level section
-is intended for whole-file operations such as block-set pruning and pre-filtering, where
-the caller wants to check whether *any* span in the file matches a predicate without
-reading individual blocks.
+**Scope:** Only numeric range columns (RangeInt64, RangeUint64, RangeDuration, RangeFloat64)
+support file-level reject; RangeString/RangeBytes are excluded (their BucketMin/BucketMax
+are 0 in the wire format and not meaningful for interval comparison).
 
-**Why snappy for the TOC and column blobs?**
-The column blobs are already binary-packed (sorted arrays of values + blockRefs). Snappy
-is fast to compress/decompress and achieves good ratios on repetitive values like span names
-and service names. zstd was considered but adds latency for the small blobs.
+**Back-refs:**
+- `internal/modules/blockio/reader/range_index.go:parseTypedBoundaries`
+- `internal/modules/blockio/reader/reader.go:RangeColumnBoundaries`
+- `internal/modules/executor/plan_blocks.go:fileLevelReject`
 
-**Why msgpack for the TOC?**
-TOC entries are structured records with named fields. msgpack is compact and self-describing
-without the overhead of a custom binary format. The TOC is typically small (<10 KB).
+---
 
-**Safety cap (MaxIntrinsicRows = 10,000,000):**
-If a file has more than 10M rows, building the intrinsic section would require >80 MB of
-in-memory data. The writer detects this condition and writes an empty TOC. The reader treats
-an empty TOC as "no intrinsic data" and skips pruning. This bounds memory usage at ~80 MB
-for the intrinsic accumulator regardless of file size.
+## 46. VersionV13 and VersionBlockV12 — Wire Format Space Reduction
+*Added: 2026-03-14*
 
-**Reader backward compatibility strategy:**
-The reader tries to read a 34-byte v4 footer from `fileSize-34`. If the first 2 bytes
-equal 4 (version), it parses the v4 fields. Otherwise it falls back to reading 22 bytes
-from `fileSize-22` and expecting version 3. This two-phase strategy avoids ambiguity
-without storing version information outside the footer itself.
+**Change:** Two new format versions eliminate dead wire fields:
 
-**Files changed:** `writer/metadata.go` (writeFooterV4), `writer/writer.go` (writeIntrinsicSection,
-Flush, writeEmptyFile), `writer/writer_block.go` (intrinsicAccum field), `writer/intrinsic_accum.go`
-(new file), `reader/parser.go` (v4 detection), `reader/reader.go` (intrinsicIndexOffset/Len fields),
-`reader/layout.go` (dynamic footer size), `shared/constants.go` (FooterV4Version, FooterV4Size,
-IntrinsicFormat* consts, MaxIntrinsicRows), `shared/types.go` (IntrinsicColMeta struct).
+1. **VersionV13 (file version):** Block index entries no longer include
+   `MinTraceID[16] + MaxTraceID[16]` (32 bytes per block). These fields were tracked
+   in `BlockMeta` but were never used for pruning — the compact trace index handles
+   trace lookup. Saves 32 bytes per block per file.
+
+2. **VersionBlockV12 (block-content version):** Column metadata entries no longer
+   include `stats_offset[8] + stats_len[8]` (16 bytes per column per block). These
+   stub fields were always written as zero and never read. Saves 16 bytes per column
+   per block.
+
+**Reader backward compatibility:** The reader (`parser.go:parseBlockIndexEntry`)
+conditionally includes/skips `MinTraceID+MaxTraceID` based on `version < VersionV13`.
+The block parser (`block_parser.go:parseColumnMetadataArray`) conditionally
+includes/skips stats fields based on `blockVersion < VersionBlockV12`.
+
+**Writer:** All new files use `VersionV13` as the file header version and
+`VersionBlockV12` as the block content version. The `buildBlock` function accepts
+`blockVersion` to allow future versions to add new block formats.
+
+**Files changed:** `shared/constants.go`, `writer/metadata.go`, `writer/writer.go`,
+`writer/writer_block.go`, `writer/writer_log.go`, `reader/parser.go`,
+`reader/block_parser.go`, `reader/layout.go`.
+
+**Back-refs:**
+- `internal/modules/blockio/shared/constants.go:VersionV13,VersionBlockV12`
+- `internal/modules/blockio/writer/metadata.go:writeBlockIndexSection`
+- `internal/modules/blockio/writer/writer_block.go:finalize`
+- `internal/modules/blockio/reader/parser.go:parseBlockIndexEntry`
+- `internal/modules/blockio/reader/block_parser.go:parseColumnMetadataArray`

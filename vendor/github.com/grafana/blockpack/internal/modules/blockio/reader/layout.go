@@ -171,7 +171,11 @@ func (r *Reader) FileLayout() (*FileLayoutReport, error) {
 					if 5+tocLen <= len(blob) {
 						ptoc, tocErr := shared.DecodePageTOC(blob[5 : 5+tocLen])
 						if tocErr == nil {
-							formatName = fmt.Sprintf("%s/paged(%d pages)", formatName[:len(formatName)-6], len(ptoc.Pages))
+							formatName = fmt.Sprintf(
+								"%s/paged(%d pages)",
+								formatName[:len(formatName)-6],
+								len(ptoc.Pages),
+							)
 						}
 					}
 				}
@@ -183,20 +187,26 @@ func (r *Reader) FileLayout() (*FileLayoutReport, error) {
 				ColumnType:     columnTypeName(meta.Type),
 				Encoding:       formatName,
 				Offset:         int64(meta.Offset), //nolint:gosec
-				CompressedSize: int64(meta.Length),  //nolint:gosec
+				CompressedSize: int64(meta.Length), //nolint:gosec
 			})
 			end := int64(meta.Offset) + int64(meta.Length) //nolint:gosec
 			if end > columnsEnd {
 				columnsEnd = end
 			}
 		}
-		// TOC blob: from end of last column to end of intrinsic index.
+		// TOC blob: from end of last column blob to end of intrinsic index region.
+		// When no column blobs are present (empty TOC), columnsEnd == 0 so the TOC
+		// section starts at intrinsicIndexOffset itself.
+		tocStart := columnsEnd
+		if tocStart == 0 {
+			tocStart = int64(r.intrinsicIndexOffset) //nolint:gosec
+		}
 		tocEnd := int64(r.intrinsicIndexOffset) + int64(r.intrinsicIndexLen) //nolint:gosec
-		if columnsEnd > 0 && tocEnd > columnsEnd {
+		if tocEnd > tocStart {
 			sections = append(sections, FileLayoutSection{
 				Section:        "intrinsic.toc",
-				Offset:         columnsEnd,
-				CompressedSize: tocEnd - columnsEnd,
+				Offset:         tocStart,
+				CompressedSize: tocEnd - tocStart,
 			})
 		}
 	}
@@ -380,7 +390,7 @@ func (r *Reader) layoutBlock(blockIdx int, meta shared.BlockMeta) ([]FileLayoutS
 		return nil, fmt.Errorf("parseBlockHeader: %w", err)
 	}
 
-	metas, colMetaEndPos, err := parseColumnMetadataArray(raw, 24, int(hdr.columnCount))
+	metas, colMetaEndPos, err := parseColumnMetadataArray(raw, 24, int(hdr.columnCount), hdr.version)
 	if err != nil {
 		return nil, fmt.Errorf("parseColumnMetadataArray: %w", err)
 	}
@@ -462,21 +472,19 @@ func (r *Reader) layoutMetadata() ([]FileLayoutSection, error) {
 
 	base := int64(r.metadataOffset) //nolint:gosec
 
-	isV12 := r.fileVersion == shared.VersionV12
+	isSnappyCompressed := r.fileVersion >= shared.VersionV12
 
 	var sections []FileLayoutSection
 
-	// For V12, emit only the physical compressed blob: the metadata bytes form a
+	// For V12+, emit only the physical compressed blob: the metadata bytes form a
 	// single snappy-compressed blob on disk. Logical sub-section offsets within the
 	// decompressed buffer are not physical file offsets and cannot be included without
 	// breaking the byte invariant (sum(CompressedSize) == FileSize).
-	if isV12 {
+	if isSnappyCompressed {
 		sections = append(sections, FileLayoutSection{
-			Section: "metadata.compressed",
-			Offset:  base,
-			CompressedSize: int64(
-				r.metadataLen,
-			), //nolint:gosec // safe: metadataLen is a file length, fits int64
+			Section:          "metadata.compressed",
+			Offset:           base,
+			CompressedSize:   int64(r.metadataLen),        //nolint:gosec
 			UncompressedSize: int64(len(r.metadataBytes)), //nolint:gosec // safe: len(slice) always fits int64
 		})
 		return sections, nil
@@ -499,7 +507,7 @@ func (r *Reader) layoutMetadata() ([]FileLayoutSection, error) {
 		Section:        "metadata.block_index",
 		Offset:         base,
 		CompressedSize: blockIdxSize,
-		IsLogical:      isV12,
+		IsLogical:      isSnappyCompressed,
 	})
 
 	// Range index: one section per column, using pre-parsed byte ranges.
@@ -516,7 +524,7 @@ func (r *Reader) layoutMetadata() ([]FileLayoutSection, error) {
 			ColumnType:     columnTypeName(dMeta.typ),
 			Offset:         base + int64(dMeta.offset), //nolint:gosec
 			CompressedSize: int64(dMeta.length),        //nolint:gosec
-			IsLogical:      isV12,
+			IsLogical:      isSnappyCompressed,
 		})
 	}
 
@@ -537,7 +545,7 @@ func (r *Reader) layoutMetadata() ([]FileLayoutSection, error) {
 			Section:        "metadata.column_index",
 			Offset:         base + int64(colIdxStart), //nolint:gosec
 			CompressedSize: colIdxSize,
-			IsLogical:      isV12,
+			IsLogical:      isSnappyCompressed,
 		})
 	}
 
@@ -547,7 +555,7 @@ func (r *Reader) layoutMetadata() ([]FileLayoutSection, error) {
 			Section:        "metadata.trace_index",
 			Offset:         base + int64(pos), //nolint:gosec
 			CompressedSize: traceIdxSize,
-			IsLogical:      isV12,
+			IsLogical:      isSnappyCompressed,
 		})
 	}
 

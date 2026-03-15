@@ -300,7 +300,7 @@ func (p *Planner) Plan(predicates []Predicate, timeRange TimeRange) *Plan {
 	}
 
 	if len(predicates) == 0 {
-		plan.SelectedBlocks = setToSortedByServiceAndTime(candidates, p.r, nil)
+		plan.SelectedBlocks = setToSortedByScore(candidates, p.r, nil)
 		explainPlan(p.r, predicates, plan, timeBlocks)
 		return plan
 	}
@@ -319,7 +319,11 @@ func (p *Planner) Plan(predicates []Predicate, timeRange TimeRange) *Plan {
 	// NOTE-013: CMS never under-counts, so zero is a safe hard prune.
 	plan.PrunedByCMS += pruneByCMSAll(p.r, candidates, predicates)
 
-	plan.SelectedBlocks = setToSortedByServiceAndTime(candidates, p.r, predicates)
+	// Stage 4: Score remaining blocks for selectivity (freq/max(cardinality,1)).
+	// NOTE-014: Higher score = fewer distinct values relative to query frequency.
+	plan.BlockScores = scoreBlocks(p.r, candidates, predicates)
+
+	plan.SelectedBlocks = setToSortedByScore(candidates, p.r, plan.BlockScores)
 	explainPlan(p.r, predicates, plan, timeBlocks)
 	return plan
 }
@@ -348,79 +352,32 @@ func (p *Planner) FetchBlocks(plan *Plan) (map[int][]byte, error) {
 	return p.r.ReadBlocks(plan.SelectedBlocks)
 }
 
-// setToSortedByServiceAndTime converts the candidate set to a slice sorted by:
-//  1. CMS frequency of queried span:name values (descending) — blocks densest in the
-//     queried span name come first, improving early termination for name-filtered queries.
-//  2. MinStart timestamp (ascending) — time ordering within each name group.
-//  3. Block index (ascending) — stable tiebreaker.
-//
-// When no span:name predicate is present, sorting is by MinStart then block index.
-func setToSortedByServiceAndTime(s blockSet, r BlockIndexer, predicates []Predicate) []int {
+// setToSortedByScore converts the candidate set to a slice sorted by block MinStart
+// timestamp (ascending), with sketch score as a secondary sort (descending — higher
+// score first). When scores are available, blocks with the same timestamp window are
+// ordered so the most promising blocks (high frequency, low cardinality) come first.
+// This improves early termination for limited queries: the executor is more likely to
+// find matches in the first few blocks.
+// Block index is used as a final tiebreaker for stable ordering.
+func setToSortedByScore(s blockSet, r BlockIndexer, scores map[int]float64) []int {
 	out := make([]int, 0, s.count())
-	s.iter(func(k int) { out = append(out, k) })
-
-	// Extract span:name values from predicates.
-	nameValues := extractColumnValues("span:name", predicates)
-
-	// Build per-block span:name CMS counts (sum across all queried values).
-	var nameCounts []uint32
-	if len(nameValues) > 0 {
-		cs := r.ColumnSketch("span:name")
-		if cs != nil {
-			total := r.BlockCount()
-			nameCounts = make([]uint32, total)
-			for _, val := range nameValues {
-				ests := cs.CMSEstimate(val)
-				for bi := range min(len(ests), total) {
-					nameCounts[bi] += ests[bi]
-				}
-			}
-		}
-	}
-
+	s.iter(func(k int) {
+		out = append(out, k)
+	})
 	slices.SortFunc(out, func(a, b int) int {
-		// Primary: higher span:name count first (descending).
-		if len(nameCounts) > 0 {
-			ca, cb := uint32(0), uint32(0)
-			if a < len(nameCounts) {
-				ca = nameCounts[a]
-			}
-			if b < len(nameCounts) {
-				cb = nameCounts[b]
-			}
-			if n := cmp.Compare(cb, ca); n != 0 { // descending
-				return n
-			}
-		}
-		// Secondary: MinStart ascending.
 		ma := r.BlockMeta(a)
 		mb := r.BlockMeta(b)
 		if n := cmp.Compare(ma.MinStart, mb.MinStart); n != 0 {
 			return n
 		}
+		// Secondary: higher score first (descending).
+		if len(scores) > 0 {
+			sa, sb := scores[a], scores[b]
+			if n := cmp.Compare(sb, sa); n != 0 { // note: sb before sa for descending
+				return n
+			}
+		}
 		return cmp.Compare(a, b)
 	})
 	return out
-}
-
-// extractColumnValues collects all equality-predicate values for the named column
-// from the predicate tree (leaf nodes only, non-interval).
-func extractColumnValues(column string, predicates []Predicate) []string {
-	var vals []string
-	for _, p := range predicates {
-		collectColumnValues(column, p, &vals)
-	}
-	return vals
-}
-
-func collectColumnValues(column string, p Predicate, out *[]string) {
-	if len(p.Children) > 0 {
-		for _, child := range p.Children {
-			collectColumnValues(column, child, out)
-		}
-		return
-	}
-	if len(p.Columns) == 1 && p.Columns[0] == column && !p.IntervalMatch {
-		*out = append(*out, p.Values...)
-	}
 }

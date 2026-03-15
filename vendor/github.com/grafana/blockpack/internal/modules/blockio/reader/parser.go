@@ -23,6 +23,21 @@ var parsedSketchCache sync.Map // key: string → value: *sketchIndex
 // This avoids re-running DecodeIntrinsicColumnBlob (snappy + struct build) on every Reader creation.
 var parsedIntrinsicCache sync.Map // key: string → value: *shared.IntrinsicColumn
 
+// parsedMetadataCache caches the fully parsed metadata result by fileID.
+// This avoids re-reading ~45 MB from bbolt FileCache and re-parsing metadata
+// on every Reader creation. File metadata is immutable after compaction.
+var parsedMetadataCache sync.Map // key: string → value: *parsedMetadata
+
+// parsedMetadata holds all parsed results from parseV5MetadataLazy.
+type parsedMetadata struct {
+	metadataBytes []byte
+	blockMetas    []shared.BlockMeta
+	rangeOffsets  map[string]rangeIndexMeta
+	traceIndexRaw []byte
+	tsEntries     []tsIndexEntry
+	sketchIdx     *sketchIndex
+}
+
 // rangeIndexMeta records the byte range within metadataBytes for a
 // range column index entry (lazy parsing).
 type rangeIndexMeta struct {
@@ -134,9 +149,9 @@ func (r *Reader) readHeader() error {
 		b := make([]byte, headerSize)
 		n, readErr := r.provider.ReadAt(
 			b,
-			int64(r.headerOffset),
+			int64(r.headerOffset), //nolint:gosec // safe: headerOffset is a file offset, fits in int64
 			rw.DataTypeHeader,
-		) //nolint:gosec // safe: headerOffset is a file offset, fits in int64
+		)
 		if readErr != nil {
 			return nil, fmt.Errorf("readHeader: %w", readErr)
 		}
@@ -155,7 +170,8 @@ func (r *Reader) readHeader() error {
 	}
 
 	version := buf[4] //nolint:gosec // safe: buf is headerSize (22) bytes, validated by short-read check above
-	if version != shared.VersionV10 && version != shared.VersionV11 && version != shared.VersionV12 {
+	if version != shared.VersionV10 && version != shared.VersionV11 &&
+		version != shared.VersionV12 && version != shared.VersionV13 {
 		return fmt.Errorf("readHeader: unsupported version %d", version)
 	}
 
@@ -185,6 +201,21 @@ func (r *Reader) parseV5MetadataLazy() error {
 		return fmt.Errorf("parseMetadata: metadata too large: %d bytes", r.metadataLen)
 	}
 
+	// Check process-level cache first — avoids re-reading ~45 MB from bbolt
+	// and re-parsing metadata on every Reader creation for the same file.
+	if r.fileID != "" {
+		if cached, ok := parsedMetadataCache.Load(r.fileID); ok {
+			pm := cached.(*parsedMetadata)
+			r.metadataBytes = pm.metadataBytes
+			r.blockMetas = pm.blockMetas
+			r.rangeOffsets = pm.rangeOffsets
+			r.traceIndexRaw = pm.traceIndexRaw
+			r.tsEntries = pm.tsEntries
+			r.sketchIdx = pm.sketchIdx
+			return nil
+		}
+	}
+
 	// NOTE-PERF: For snappy-compressed metadata (VersionV12), we cache the *decompressed*
 	// bytes under a distinct key ("/metadata/dec") so snappy.Decode runs only on a cache miss,
 	// not on every Reader creation. The old "/metadata" key stored compressed bytes and paid
@@ -194,7 +225,7 @@ func (r *Reader) parseV5MetadataLazy() error {
 		data     []byte
 		err      error
 	)
-	if r.fileVersion == shared.VersionV12 {
+	if r.fileVersion >= shared.VersionV12 {
 		cacheKey = r.fileID + "/metadata/dec"
 		data, err = r.cache.GetOrFetch(cacheKey, func() ([]byte, error) {
 			compressed, readErr := r.readRange(r.metadataOffset, r.metadataLen, rw.DataTypeMetadata)
@@ -324,6 +355,18 @@ func (r *Reader) parseV5MetadataLazy() error {
 	}
 
 	_ = pos
+
+	// Store in process-level cache for subsequent Reader creations on the same file.
+	if r.fileID != "" {
+		parsedMetadataCache.Store(r.fileID, &parsedMetadata{
+			metadataBytes: r.metadataBytes,
+			blockMetas:    r.blockMetas,
+			rangeOffsets:  r.rangeOffsets,
+			traceIndexRaw: r.traceIndexRaw,
+			tsEntries:     r.tsEntries,
+			sketchIdx:     r.sketchIdx,
+		})
+	}
 	return nil
 }
 
@@ -368,15 +411,17 @@ func parseBlockIndexEntry(
 	meta.MaxStart = binary.LittleEndian.Uint64(data[pos:])
 	pos += 8
 
-	// min_trace_id[16] + max_trace_id[16]
-	if pos+32 > len(data) {
-		return meta, pos, fmt.Errorf("block_index entry: short for trace IDs")
-	}
+	// min_trace_id[16] + max_trace_id[16] — present in V10/V11/V12 only; omitted in V13+.
+	if version < shared.VersionV13 {
+		if pos+32 > len(data) {
+			return meta, pos, fmt.Errorf("block_index entry: short for trace IDs")
+		}
 
-	copy(meta.MinTraceID[:], data[pos:pos+16])
-	pos += 16
-	copy(meta.MaxTraceID[:], data[pos:pos+16])
-	pos += 16
+		copy(meta.MinTraceID[:], data[pos:pos+16])
+		pos += 16
+		copy(meta.MaxTraceID[:], data[pos:pos+16])
+		pos += 16
+	}
 
 	return meta, pos, nil
 }
@@ -505,6 +550,9 @@ func parseTraceBlockIndex(data []byte) (map[[16]byte][]uint16, int, error) {
 // Returns (consumed, nil) on success; (0, nil) for empty/missing sections.
 func skipTraceBlockIndex(data []byte) (int, error) {
 	if len(data) < 5 {
+		// Treat short sections as empty/missing rather than corrupt. The caller
+		// (parseV5MetadataLazy) handles 0-consumed gracefully by skipping the section.
+		// A truly corrupt trace index would be caught by fmtVersion validation below.
 		return 0, nil
 	}
 	fmtVersion := data[0]
