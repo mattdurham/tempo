@@ -66,13 +66,13 @@ func encodePrefixBytes(
 	dictPayload := make([]byte, 0, 4+len(prefixes)*8)
 	dictPayload = appendUint32LE(
 		dictPayload,
-		uint32(len(prefixes)),
-	) //nolint:gosec // safe: prefix count bounded by MaxDictionarySize
+		uint32(len(prefixes)), //nolint:gosec // safe: prefix count bounded by MaxDictionarySize
+	)
 	for _, p := range prefixes {
 		dictPayload = appendUint32LE(
 			dictPayload,
-			uint32(len(p)),
-		) //nolint:gosec // safe: prefix length bounded by MaxStringLen
+			uint32(len(p)), //nolint:gosec // safe: prefix length bounded by MaxStringLen
+		)
 		dictPayload = append(dictPayload, p...)
 	}
 
@@ -88,8 +88,8 @@ func encodePrefixBytes(
 		suffixPayload = appendUintLE(suffixPayload, uint64(prefixIdx[i]), indexWidth)
 		suffixPayload = appendUint32LE(
 			suffixPayload,
-			uint32(len(suf)),
-		) //nolint:gosec // safe: suffix length bounded by MaxStringLen
+			uint32(len(suf)), //nolint:gosec // safe: suffix length bounded by MaxStringLen
+		)
 		suffixPayload = append(suffixPayload, suf...)
 	}
 
@@ -107,8 +107,8 @@ func encodePrefixBytes(
 	buf = append(buf, compressedDict...)
 	buf = appendUint32LE(
 		buf,
-		uint32(len(compressedSuffix)),
-	) //nolint:gosec // safe: compressed data bounded by block size
+		uint32(len(compressedSuffix)), //nolint:gosec // safe: compressed data bounded by block size
+	)
 	buf = append(buf, compressedSuffix...)
 
 	return buf, nil

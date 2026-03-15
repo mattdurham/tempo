@@ -58,6 +58,11 @@ type blockBuilder struct {
 	columns   map[shared.ColumnKey]columnBuilder // column (name, type) → builder (all columns, for finalize)
 	traceRows map[[16]byte]struct{}              // trace_id set; used by writer.go to build file-level trace index
 
+	// intrinsicAccum is the file-level accumulator, set by buildAndWriteBlock before
+	// per-row calls. Nil for test helpers that don't need accumulation.
+	intrinsicAccum   *intrinsicAccumulator
+	intrinsicBlockID uint16
+
 	// Column name caches: attribute key → full column name (e.g. "http.method" → "span.http.method").
 	// Populated lazily on first encounter within a block; eliminates per-span string concat allocs
 	// in addRowFromProto. Separate caches per prefix avoid key collisions between namespaces.
@@ -75,11 +80,6 @@ type blockBuilder struct {
 	// Populated alongside colMinMax; flushed at block write time.
 	colSketches blockSketchSet
 
-	// intrinsicAccum is the file-level accumulator, set by buildAndWriteBlock before
-	// per-row calls. Nil for test helpers that don't need accumulation.
-	intrinsicAccum  *intrinsicAccumulator
-	intrinsicBlockID uint16
-
 	// builderCache holds reset column builders from previous blocks, keyed by (name, type).
 	// On addColumn, a matching builder is popped from the cache and reused, avoiding
 	// fresh slice allocations. Most blocks share the same attribute columns, so the
@@ -90,9 +90,10 @@ type blockBuilder struct {
 	// spanHint is the expected total span count for this block.
 	// Used as the initial capacity for dynamically-created attribute column builder
 	// value/present slices, eliminating growslice calls in the per-span append loop.
-	spanHint   int
-	minStart   uint64
-	maxStart   uint64
+	spanHint int
+	minStart uint64
+	maxStart uint64
+
 	minTraceID [16]byte
 	maxTraceID [16]byte
 }
@@ -195,14 +196,19 @@ func (b *blockBuilder) reset(spanHint int) {
 // buildBlock constructs a single block from the given pending spans and returns
 // the serialized payload together with all per-block statistics.
 // If bb is non-nil it is reset and reused; otherwise a new blockBuilder is created.
+// intrinsicAccum is the file-level intrinsic accumulator; may be nil (no accumulation).
+// blockID is the 0-based block index used as BlockIdx in intrinsic refs.
 func buildBlock(
-	pending []pendingSpan, enc *zstdEncoder, bb *blockBuilder,
+	pending []pendingSpan, enc *zstdEncoder, bb *blockBuilder, blockVersion uint8,
+	intrinsicAccum *intrinsicAccumulator, blockID int,
 ) (builtBlock, *blockBuilder, error) {
 	if bb != nil {
 		bb.reset(len(pending))
 	} else {
 		bb = newBlockBuilder(len(pending))
 	}
+	bb.intrinsicAccum = intrinsicAccum
+	bb.intrinsicBlockID = uint16(blockID) //nolint:gosec // safe: blockID bounded by 65534 (checked by caller)
 	for rowIdx := range pending {
 		ps := &pending[rowIdx]
 		if ps.srcBlock != nil {
@@ -211,7 +217,7 @@ func buildBlock(
 			bb.addRowFromProto(ps, rowIdx)
 		}
 	}
-	payload, err := bb.finalize(enc)
+	payload, err := bb.finalize(enc, blockVersion)
 	if err != nil {
 		return builtBlock{}, bb, err
 	}
@@ -364,7 +370,10 @@ func (b *blockBuilder) addRowFromProto(ps *pendingSpan, rowIdx int) {
 	b.colSpanKind.present[rowIdx] = true
 	{
 		var tmp [8]byte
-		binary.LittleEndian.PutUint64(tmp[:], uint64(spanKind)) //nolint:gosec // safe: reinterpreting int64 bits as uint64
+		binary.LittleEndian.PutUint64(
+			tmp[:],
+			uint64(spanKind), //nolint:gosec // safe: reinterpreting int64 bits as uint64
+		)
 		b.updateMinMax("span:kind", shared.ColumnTypeInt64, string(tmp[:]))
 	}
 	if a := b.intrinsicAccum; a != nil {
@@ -663,7 +672,10 @@ func (b *blockBuilder) addRowFromBlock(srcBlock *modules_reader.Block, srcRowIdx
 				b.colSpanKind.values[dstRowIdx] = v
 				b.colSpanKind.present[dstRowIdx] = true
 				var tmp [8]byte
-				binary.LittleEndian.PutUint64(tmp[:], uint64(v)) //nolint:gosec // safe: reinterpreting int64 bits as uint64
+				binary.LittleEndian.PutUint64(
+					tmp[:],
+					uint64(v), //nolint:gosec // safe: reinterpreting int64 bits as uint64
+				)
 				b.updateMinMax("span:kind", shared.ColumnTypeInt64, string(tmp[:]))
 				if a := b.intrinsicAccum; a != nil {
 					a.feedInt64("span:kind", shared.ColumnTypeInt64, v, b.intrinsicBlockID, dstRowIdx)
@@ -679,11 +691,11 @@ func (b *blockBuilder) addRowFromBlock(srcBlock *modules_reader.Block, srcRowIdx
 				var tmp [8]byte
 				binary.LittleEndian.PutUint64(tmp[:], v)
 				b.updateMinMax("span:start", shared.ColumnTypeUint64, string(tmp[:]))
-				spanStart = v
-				spanStartFound = true
 				if a := b.intrinsicAccum; a != nil {
 					a.feedUint64("span:start", shared.ColumnTypeUint64, v, b.intrinsicBlockID, dstRowIdx)
 				}
+				spanStart = v
+				spanStartFound = true
 			}
 			continue
 
@@ -709,17 +721,20 @@ func (b *blockBuilder) addRowFromBlock(srcBlock *modules_reader.Block, srcRowIdx
 				var tmp [8]byte
 				binary.LittleEndian.PutUint64(tmp[:], v)
 				b.updateMinMax("span:duration", shared.ColumnTypeUint64, string(tmp[:]))
-				durationFound = true
 				if a := b.intrinsicAccum; a != nil {
 					a.feedUint64("span:duration", shared.ColumnTypeUint64, v, b.intrinsicBlockID, dstRowIdx)
 				}
+				durationFound = true
 			}
 			continue
 
 		case "span:status":
 			if v, ok := col.Int64Value(srcRowIdx); ok {
 				var tmp [8]byte
-				binary.LittleEndian.PutUint64(tmp[:], uint64(v)) //nolint:gosec // safe: reinterpreting int64 bits as uint64
+				binary.LittleEndian.PutUint64(
+					tmp[:],
+					uint64(v), //nolint:gosec // safe: reinterpreting int64 bits as uint64
+				)
 				b.updateMinMax("span:status", shared.ColumnTypeInt64, string(tmp[:]))
 				if a := b.intrinsicAccum; a != nil {
 					a.feedInt64("span:status", shared.ColumnTypeInt64, v, b.intrinsicBlockID, dstRowIdx)
@@ -728,20 +743,9 @@ func (b *blockBuilder) addRowFromBlock(srcBlock *modules_reader.Block, srcRowIdx
 			// Fall through to addPresent below (don't continue).
 
 		case "span:status_message":
-			if v, ok := col.StringValue(srcRowIdx); ok && v != "" {
-				if a := b.intrinsicAccum; a != nil {
-					a.feedString("span:status_message", shared.ColumnTypeString, v, b.intrinsicBlockID, dstRowIdx)
-				}
-			}
 			// Fall through to addPresent below (don't continue).
 
 		case "resource.service.name":
-			val, ok := readDynAttrValue(col, srcRowIdx, baseColumnType(col.Type))
-			if ok && val.Type == shared.ColumnTypeString && val.Str != "" {
-				if a := b.intrinsicAccum; a != nil {
-					a.feedString("resource.service.name", shared.ColumnTypeString, val.Str, b.intrinsicBlockID, dstRowIdx)
-				}
-			}
 			// Fall through to addPresent below (don't continue).
 		}
 
@@ -751,11 +755,34 @@ func (b *blockBuilder) addRowFromBlock(srcBlock *modules_reader.Block, srcRowIdx
 			continue
 		}
 		b.addPresent(dstRowIdx, colKey.Name, baseType, val)
+		// Feed intrinsic accumulator for select dynamic columns.
+		if a := b.intrinsicAccum; a != nil {
+			switch colKey.Name {
+			case "span:status_message":
+				if val.Type == shared.ColumnTypeString && val.Str != "" {
+					a.feedString("span:status_message", shared.ColumnTypeString, val.Str, b.intrinsicBlockID, dstRowIdx)
+				}
+			case "resource.service.name":
+				if val.Type == shared.ColumnTypeString && val.Str != "" {
+					a.feedString("resource.service.name", shared.ColumnTypeString, val.Str, b.intrinsicBlockID, dstRowIdx)
+				}
+			}
+		}
 	}
 
-	// If the source block lacked span:duration (e.g. filtered decode or older format),
-	// derive it from start and end — matching the proto path which always computes duration.
-	// Guard against underflow: if end < start (clock skew / corrupt data), use 0.
+	b.finalizeRowBookkeeping(
+		dstRowIdx, traceID, traceIDFound,
+		spanStart, spanStartFound, spanEnd, spanEndFound, durationFound,
+	)
+}
+
+// finalizeRowBookkeeping handles post-column-copy bookkeeping for addRowFromBlock:
+// derives missing duration, updates min/max start/traceID, and increments spanCount.
+func (b *blockBuilder) finalizeRowBookkeeping(
+	dstRowIdx int, traceID [16]byte, traceIDFound bool,
+	spanStart uint64, spanStartFound bool, spanEnd uint64, spanEndFound bool, durationFound bool,
+) {
+	// Derive duration from start+end if source block lacked span:duration.
 	if !durationFound && spanStartFound && spanEndFound {
 		var dur uint64
 		if spanEnd >= spanStart {
@@ -767,9 +794,12 @@ func (b *blockBuilder) addRowFromBlock(srcBlock *modules_reader.Block, srcRowIdx
 		var tmp [8]byte
 		binary.LittleEndian.PutUint64(tmp[:], dur)
 		b.updateMinMax("span:duration", shared.ColumnTypeUint64, string(tmp[:]))
+		if a := b.intrinsicAccum; a != nil {
+			a.feedUint64("span:duration", shared.ColumnTypeUint64, dur, b.intrinsicBlockID, dstRowIdx)
+		}
 	}
 
-	// Update min/max start time and trace ID bookkeeping — same as tail of addRowFromProto.
+	// Update min/max start time and trace ID bookkeeping.
 	if b.spanCount == 0 {
 		if spanStartFound {
 			b.minStart = spanStart
@@ -802,7 +832,7 @@ func (b *blockBuilder) addRowFromBlock(srcBlock *modules_reader.Block, srcRowIdx
 		b.traceRows[traceID] = struct{}{}
 	}
 
-	// Task T-TS-2: implied timestamp sketch for compaction path (same as addRowFromProto).
+	// Task T-TS-2: implied timestamp sketch for compaction path.
 	if spanStartFound && spanStart > 0 {
 		b.colSketches.add(sketchTimestampColName, encodeSecondBucket(spanStart))
 	}
@@ -948,7 +978,10 @@ func (b *blockBuilder) addPresent(rowIdx int, name string, typ shared.ColumnType
 
 // finalize encodes all columns and returns the serialized block bytes
 // (header + column metadata + data).
-func (b *blockBuilder) finalize(enc *zstdEncoder) ([]byte, error) {
+// blockVersion controls the on-disk layout:
+//   - shared.VersionBlockV12+: omits the 16-byte stats_offset/stats_len stubs per column
+//   - earlier: includes the stats_offset/stats_len stubs (always 0, dead data)
+func (b *blockBuilder) finalize(enc *zstdEncoder, blockVersion uint8) ([]byte, error) {
 	// Collect and sort columns by (name, type) for deterministic output.
 	// cb is placed before key to minimize GC scan region (betteralign).
 	type colEntry struct {
@@ -997,10 +1030,15 @@ func (b *blockBuilder) finalize(enc *zstdEncoder) ([]byte, error) {
 	headerSize := 24
 
 	// Compute column metadata array size.
+	// VersionBlockV12+: name_len[2] + name + col_type[1] + data_offset[8] + data_len[8]
+	// Earlier:          name_len[2] + name + col_type[1] + data_offset[8] + data_len[8] + stats_offset[8] + stats_len[8]
+	statsFieldSize := 0
+	if blockVersion < shared.VersionBlockV12 {
+		statsFieldSize = 16 // stats_offset[8] + stats_len[8]
+	}
 	colMetaSize := 0
 	for _, bl := range blobs {
-		// name_len[2] + name + col_type[1] + data_offset[8] + data_len[8] + stats_offset[8] + stats_len[8]
-		colMetaSize += 2 + len(bl.name) + 1 + 8 + 8 + 8 + 8
+		colMetaSize += 2 + len(bl.name) + 1 + 8 + 8 + statsFieldSize
 	}
 
 	// Data section starts immediately after column metadata (no stats section).
@@ -1024,7 +1062,7 @@ func (b *blockBuilder) finalize(enc *zstdEncoder) ([]byte, error) {
 	// magic[4]
 	payload = appendUint32LE(payload, shared.MagicNumber)
 	// version[1]
-	payload = append(payload, shared.VersionV11)
+	payload = append(payload, blockVersion)
 	// reserved[3]
 	payload = append(payload, 0, 0, 0)
 	// span_count[4]
@@ -1054,10 +1092,11 @@ func (b *blockBuilder) finalize(enc *zstdEncoder) ([]byte, error) {
 		payload = appendUint64LE(payload, dataOff)
 		// data_len[8 LE]
 		payload = appendUint64LE(payload, dataLen)
-		// stats_offset[8 LE] — always 0 (column stats section removed)
-		payload = appendUint64LE(payload, 0)
-		// stats_len[8 LE] — always 0 (column stats section removed)
-		payload = appendUint64LE(payload, 0)
+		// stats_offset[8 LE] + stats_len[8 LE] — omitted in VersionBlockV12+ (always were 0)
+		if blockVersion < shared.VersionBlockV12 {
+			payload = appendUint64LE(payload, 0)
+			payload = appendUint64LE(payload, 0)
+		}
 
 		curDataOff += dataLen
 	}

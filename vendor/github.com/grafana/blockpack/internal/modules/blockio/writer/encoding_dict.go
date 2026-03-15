@@ -151,8 +151,8 @@ func encodeDictionaryKind(
 	buf = append(buf, shared.ColumnEncodingVersion, kind, indexWidth)
 	buf = appendUint32LE(
 		buf,
-		uint32(len(compressedDict)),
-	) //nolint:gosec // safe: dict size bounded by MaxDictionarySize
+		uint32(len(compressedDict)), //nolint:gosec // safe: dict size bounded by MaxDictionarySize
+	)
 	buf = append(buf, compressedDict...)
 	buf = appendUint32LE(buf, uint32(nRows))        //nolint:gosec // safe: nRows bounded by MaxBlockSpans (65535)
 	buf = appendUint32LE(buf, uint32(len(rleData))) //nolint:gosec // safe: rle data bounded by block size
@@ -166,8 +166,8 @@ func encodeDictionaryKind(
 		}
 		buf = appendUint32LE(
 			buf,
-			uint32(len(fullIndexes)),
-		) //nolint:gosec // safe: index count bounded by MaxBlockSpans
+			uint32(len(fullIndexes)), //nolint:gosec // safe: index count bounded by MaxBlockSpans
+		)
 		buf = appendUint32LE(buf, uint32(len(rleIndexData))) //nolint:gosec // safe: rle data bounded by block size
 		buf = append(buf, rleIndexData...)
 	} else {
@@ -261,8 +261,8 @@ func encodeDeltaDictionaryKind(
 		var tmp [4]byte
 		binary.LittleEndian.PutUint32(
 			tmp[:],
-			uint32(delta),
-		) //nolint:gosec // safe: reinterpreting int32 delta as uint32 bits for serialization
+			uint32(delta), //nolint:gosec // safe: reinterpreting int32 delta as uint32 bits for serialization
+		)
 		deltaData = append(deltaData, tmp[:]...)
 	}
 
@@ -275,16 +275,16 @@ func encodeDeltaDictionaryKind(
 	buf = append(buf, shared.ColumnEncodingVersion, kind, indexWidth)
 	buf = appendUint32LE(
 		buf,
-		uint32(len(compressedDict)),
-	) //nolint:gosec // safe: dict size bounded by MaxDictionarySize
+		uint32(len(compressedDict)), //nolint:gosec // safe: dict size bounded by MaxDictionarySize
+	)
 	buf = append(buf, compressedDict...)
 	buf = appendUint32LE(buf, uint32(nRows))        //nolint:gosec // safe: nRows bounded by MaxBlockSpans (65535)
 	buf = appendUint32LE(buf, uint32(len(rleData))) //nolint:gosec // safe: rle data bounded by block size
 	buf = append(buf, rleData...)
 	buf = appendUint32LE(
 		buf,
-		uint32(len(compressedDelta)),
-	) //nolint:gosec // safe: compressed data bounded by block size
+		uint32(len(compressedDelta)), //nolint:gosec // safe: compressed data bounded by block size
+	)
 	buf = append(buf, compressedDelta...)
 
 	return buf, nil

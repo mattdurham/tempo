@@ -49,8 +49,8 @@ func encodeXORBytes(kind uint8, values [][]byte, present []bool, nRows int, enc 
 		xored := xorBytes(cur, prev)
 		xorPayload = appendUint32LE(
 			xorPayload,
-			uint32(len(xored)),
-		) //nolint:gosec // safe: entry length bounded by MaxBytesLen
+			uint32(len(xored)), //nolint:gosec // safe: entry length bounded by MaxBytesLen
+		)
 		xorPayload = append(xorPayload, xored...)
 		prev = cur
 	}

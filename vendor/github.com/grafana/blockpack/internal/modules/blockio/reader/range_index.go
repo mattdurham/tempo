@@ -20,9 +20,16 @@ type rangeEntry struct {
 
 // parsedRangeIndex holds the parsed result for one column's range index.
 // entries is sorted in ascending value order by lower boundary (SPECS §5.2.1).
+// bucketMin and bucketMax hold the global min/max across all blocks for the column
+// (stored in the wire format bucket metadata). For RangeString/RangeBytes they are 0.
 type parsedRangeIndex struct {
-	entries []rangeEntry
-	colType shared.ColumnType
+	entries       []rangeEntry
+	float64Bounds []float64 // decoded for RangeFloat64; nil otherwise
+	stringBounds  []string  // decoded for RangeString; nil otherwise
+	bytesBounds   [][]byte  // decoded for RangeBytes; nil otherwise
+	bucketMin     int64     // global min as int64 bits; 0 for String/Bytes
+	bucketMax     int64     // global max as int64 bits; 0 for String/Bytes
+	colType       shared.ColumnType
 }
 
 // ensureRangeColumnParsed parses the range index for colName if not already done.
@@ -92,10 +99,17 @@ func parseRangeColumnEntry(
 		return colName, idx, pos, fmt.Errorf("range entry %q: short for bucket header", colName)
 	}
 
-	pos += 16 // skip min + max
+	idx.bucketMin = int64(binary.LittleEndian.Uint64(data[pos:])) //nolint:gosec
+	pos += 8
+	idx.bucketMax = int64(binary.LittleEndian.Uint64(data[pos:])) //nolint:gosec
+	pos += 8
 	boundaryCount := int(binary.LittleEndian.Uint32(data[pos:]))
 	pos += 4
-	pos += boundaryCount * 8
+
+	if pos+boundaryCount*8 > len(data) {
+		return colName, idx, pos, fmt.Errorf("range entry %q: short for boundaries (%d)", colName, boundaryCount)
+	}
+	pos += boundaryCount * 8 // raw int64 boundaries (already captured via bucketMin/bucketMax)
 
 	// typed_count[4] + typed boundaries
 	if pos+4 > len(data) {
@@ -105,9 +119,9 @@ func parseRangeColumnEntry(
 	typedCount := int(binary.LittleEndian.Uint32(data[pos:]))
 	pos += 4
 
-	newPos2, err2 := skipTypedBoundaries(data, pos, colType, typedCount)
-	if err2 != nil {
-		return colName, idx, pos, fmt.Errorf("range entry %q: typed boundaries: %w", colName, err2)
+	newPos2, parseErr2 := parseTypedBoundaries(data, pos, colType, typedCount, &idx)
+	if parseErr2 != nil {
+		return colName, idx, pos, fmt.Errorf("range entry %q: typed boundaries: %w", colName, parseErr2)
 	}
 
 	pos = newPos2
@@ -157,6 +171,74 @@ func sortRangeEntries(colType shared.ColumnType, entries []rangeEntry) {
 		sort.Slice(entries, func(i, j int) bool {
 			return decodeFloat64Key(entries[i].lower) < decodeFloat64Key(entries[j].lower)
 		})
+	}
+}
+
+// parseTypedBoundaries reads typed boundary data and stores it in idx.
+// This mirrors skipTypedBoundaries but captures the values instead of discarding them.
+// For RangeInt64/RangeUint64/RangeDuration, typed_count must be 0 (no additional bytes).
+// For RangeFloat64, reads count×float64.
+// For RangeString, reads count×(uint32_len + string_bytes).
+// For RangeBytes, reads count×(uint32_len + bytes).
+func parseTypedBoundaries(
+	data []byte, pos int, colType shared.ColumnType, count int, idx *parsedRangeIndex,
+) (int, error) {
+	switch colType {
+	case shared.ColumnTypeRangeFloat64:
+		need := count * 8
+		if pos+need > len(data) {
+			return pos, fmt.Errorf("typed boundaries(float64): need %d bytes at pos %d", need, pos)
+		}
+		bounds := make([]float64, count)
+		for i := range count {
+			bits := binary.LittleEndian.Uint64(data[pos+i*8:])
+			bounds[i] = math.Float64frombits(bits)
+		}
+		idx.float64Bounds = bounds
+		return pos + need, nil
+
+	case shared.ColumnTypeRangeString:
+		bounds := make([]string, 0, count)
+		for i := range count {
+			if pos+4 > len(data) {
+				return pos, fmt.Errorf("typed boundaries(string)[%d]: short for len", i)
+			}
+			sLen := int(binary.LittleEndian.Uint32(data[pos:]))
+			pos += 4
+			if pos+sLen > len(data) {
+				return pos, fmt.Errorf("typed boundaries(string)[%d]: short for data", i)
+			}
+			bounds = append(bounds, string(data[pos:pos+sLen]))
+			pos += sLen
+		}
+		idx.stringBounds = bounds
+		return pos, nil
+
+	case shared.ColumnTypeRangeBytes:
+		bounds := make([][]byte, 0, count)
+		for i := range count {
+			if pos+4 > len(data) {
+				return pos, fmt.Errorf("typed boundaries(bytes)[%d]: short for len", i)
+			}
+			bLen := int(binary.LittleEndian.Uint32(data[pos:]))
+			pos += 4
+			if pos+bLen > len(data) {
+				return pos, fmt.Errorf("typed boundaries(bytes)[%d]: short for data", i)
+			}
+			b := make([]byte, bLen)
+			copy(b, data[pos:pos+bLen])
+			bounds = append(bounds, b)
+			pos += bLen
+		}
+		idx.bytesBounds = bounds
+		return pos, nil
+
+	default:
+		// RangeInt64/RangeUint64/RangeDuration: typed_count must be 0.
+		if count != 0 {
+			return pos, fmt.Errorf("typed boundaries: non-zero count %d for type %d", count, colType)
+		}
+		return pos, nil
 	}
 }
 

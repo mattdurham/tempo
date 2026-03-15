@@ -117,15 +117,18 @@ func (r *Reader) GetIntrinsicColumn(name string) (*shared.IntrinsicColumn, error
 	}
 
 	// Check process-level cache first — decoded IntrinsicColumn is immutable once written.
-	// This avoids re-running DecodeIntrinsicColumnBlob (snappy + struct build) across Reader instances.
-	procKey := r.fileID + "/intrinsic/" + name
-	if cached, ok := parsedIntrinsicCache.Load(procKey); ok {
-		col := cached.(*shared.IntrinsicColumn)
-		if r.intrinsicDecoded == nil {
-			r.intrinsicDecoded = make(map[string]*shared.IntrinsicColumn)
+	// Guard: only use process-level cache when fileID is non-empty to prevent cross-file collisions.
+	useProcessCache := r.fileID != ""
+	if useProcessCache {
+		procKey := r.fileID + "/intrinsic/" + name
+		if cached, ok := parsedIntrinsicCache.Load(procKey); ok {
+			col := cached.(*shared.IntrinsicColumn)
+			if r.intrinsicDecoded == nil {
+				r.intrinsicDecoded = make(map[string]*shared.IntrinsicColumn)
+			}
+			r.intrinsicDecoded[name] = col
+			return col, nil
 		}
-		r.intrinsicDecoded[name] = col
-		return col, nil
 	}
 
 	cacheKey := fmt.Sprintf("%s/intrinsic/%s", r.fileID, name)
@@ -142,7 +145,9 @@ func (r *Reader) GetIntrinsicColumn(name string) (*shared.IntrinsicColumn, error
 	}
 	col.Name = name
 
-	parsedIntrinsicCache.Store(procKey, col)
+	if useProcessCache {
+		parsedIntrinsicCache.Store(r.fileID+"/intrinsic/"+name, col)
+	}
 
 	if r.intrinsicDecoded == nil {
 		r.intrinsicDecoded = make(map[string]*shared.IntrinsicColumn)
@@ -162,11 +167,11 @@ func (r *Reader) synthesizeSpanEnd() (*shared.IntrinsicColumn, error) {
 
 	startCol, err := r.GetIntrinsicColumn("span:start")
 	if err != nil || startCol == nil {
-		return nil, nil
+		return nil, nil //nolint:nilerr // best-effort synthesis; missing columns are not errors
 	}
 	durCol, err := r.GetIntrinsicColumn("span:duration")
 	if err != nil || durCol == nil {
-		return nil, nil
+		return nil, nil //nolint:nilerr // best-effort synthesis; missing columns are not errors
 	}
 
 	// Both must be flat uint64 columns.

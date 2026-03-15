@@ -39,6 +39,11 @@ type Writer struct {
 	// Consumed at Flush() by buildMetadataSectionBytes.
 	sketchIdx []blockSketchSet
 
+	// intrinsicAccum accumulates file-level columnar data for intrinsic columns.
+	// Fed row-by-row during block building via blockBuilder.intrinsicAccum.
+	// Consumed at Flush() by writeIntrinsicSection to produce the footer V4 extension.
+	intrinsicAccum *intrinsicAccumulator
+
 	out countingWriter
 
 	cfg Config
@@ -75,10 +80,6 @@ type Writer struct {
 	// Set implicitly on the first AddLogsData or AddTracesData/AddSpan call.
 	// 0 means unset; shared.SignalTypeTrace = 0x01; shared.SignalTypeLog = 0x02.
 	signalType uint8
-
-	// intrinsicAccum accumulates file-level intrinsic column data across all blocks.
-	// Created on first use in buildAndWriteBlock; cleared at the end of Flush().
-	intrinsicAccum *intrinsicAccumulator
 }
 
 // countingWriter wraps io.Writer and tracks total bytes written.
@@ -117,12 +118,13 @@ func NewWriterWithConfig(cfg Config) (*Writer, error) {
 		return nil, fmt.Errorf("writer: zstd init: %w", err)
 	}
 	return &Writer{
-		cfg:         cfg,
-		out:         countingWriter{w: cfg.OutputStream},
-		enc:         enc,
-		traceIndex:  make(map[[16]byte][]uint16),
-		uuidColumns: make(map[string]bool),
-		rangeIdx:    make(rangeIndex),
+		cfg:            cfg,
+		out:            countingWriter{w: cfg.OutputStream},
+		enc:            enc,
+		traceIndex:     make(map[[16]byte][]uint16),
+		uuidColumns:    make(map[string]bool),
+		rangeIdx:       make(rangeIndex),
+		intrinsicAccum: newIntrinsicAccumulator(),
 		// Pre-allocate pending to MaxBufferedSpans to avoid growslice on the hot path.
 		// After each flushBlocks(), w.pending is reset to length 0 (capacity retained).
 		pending: make([]pendingSpan, 0, cfg.MaxBufferedSpans),
@@ -326,27 +328,20 @@ func (w *Writer) Flush() (int64, error) {
 		}
 	}
 
-	// 1.5. Write intrinsic columns section (after all blocks, before metadata).
-	intrinsicIndexOffset, intrinsicIndexLen, err := w.writeIntrinsicSection()
-	if err != nil {
-		return w.out.total, fmt.Errorf("writer: intrinsic section: %w", err)
-	}
-
 	// 2. Record metadata offset.
-	metadataOffset := uint64(
-		w.out.total,
-	) //nolint:gosec // safe: total bytes written fits in int64 and int64 fits in uint64 for file offsets
+	metadataOffset := uint64(w.out.total) //nolint:gosec
 
 	// 3. Apply KLL bucket boundaries to the range index.
 	// KLL sketches were built incrementally in buildAndWriteBlock (one Add per
 	// block min and max), so no re-scan is needed here.
 	applyRangeBuckets(w.rangeIdx, defaultRangeBuckets)
 
-	// 4. Write metadata section (snappy-compressed, V12 format).
-	// All new files use V12 regardless of signal type. V12 adds snappy-compressed
+	// 4. Write metadata section (snappy-compressed, V13 format).
+	// V13 removes MinTraceID/MaxTraceID from block index entries and
+	// stats_offset/stats_len from column metadata. V12 added snappy-compressed
 	// metadata and the signal_type byte in the file header.
 	metaBytes, err := buildMetadataSectionBytes(
-		shared.VersionV11, // block index uses V11 entry layout; block encoding is unchanged
+		shared.VersionV13, // V13: block index omits MinTraceID[16]+MaxTraceID[16] per entry
 		w.blockMetas,
 		w.rangeIdx,
 		w.traceIndex,
@@ -362,35 +357,37 @@ func (w *Writer) Flush() (int64, error) {
 		return w.out.total, fmt.Errorf("writer: write metadata: %w", err)
 	}
 
-	// 5. Write file header (always V12).
+	// 5. Write file header (V13).
 	signalTypeForHeader := w.signalType
 	if signalTypeForHeader == 0 {
 		signalTypeForHeader = shared.SignalTypeTrace
 	}
-	headerOffset := uint64(
-		w.out.total,
-	) //nolint:gosec // safe: total bytes written fits in int64 and int64 fits in uint64 for file offsets
-	if err = writeFileHeader(&w.out, shared.VersionV12, metadataOffset, metadataLen, signalTypeForHeader); err != nil {
+	headerOffset := uint64(w.out.total) //nolint:gosec
+	if err = writeFileHeader(&w.out, shared.VersionV13, metadataOffset, metadataLen, signalTypeForHeader); err != nil {
 		return w.out.total, fmt.Errorf("writer: write file header: %w", err)
 	}
 
 	// 6. Write compact trace index.
-	compactOffset := uint64(
-		w.out.total,
-	) //nolint:gosec // safe: total bytes written fits in int64 and int64 fits in uint64 for file offsets
+	compactOffset := uint64(w.out.total) //nolint:gosec
 	compactN, err := writeCompactTraceIndex(&w.out, w.blockMetas, w.traceIndex)
 	if err != nil {
 		return w.out.total, fmt.Errorf("writer: write compact index: %w", err)
 	}
 
-	// 7. Write footer (v4 with intrinsic index pointer).
-	if err = writeFooterV4(&w.out, headerOffset, compactOffset, uint32(compactN), intrinsicIndexOffset, intrinsicIndexLen); err != nil { //nolint:gosec // safe: compact index size bounded by MaxCompactSectionSize (50MB) fits uint32
+	// 7. Write intrinsic section (always — footer V4).
+	intrinsicOffset, intrinsicLen, err := w.writeIntrinsicSection()
+	if err != nil {
+		return w.out.total, fmt.Errorf("writer: write intrinsic section: %w", err)
+	}
+
+	// 8. Write footer V4 (always includes intrinsic section offsets).
+	if err = writeFooterV4(&w.out, headerOffset, compactOffset, uint32(compactN), intrinsicOffset, intrinsicLen); err != nil { //nolint:gosec // safe: compact index size bounded by MaxCompactSectionSize (50MB) fits uint32
 		return w.out.total, fmt.Errorf("writer: write footer: %w", err)
 	}
 
 	total := w.out.total
 
-	// 8. Reset ALL state.
+	// 9. Reset ALL state.
 	w.pending = w.pending[:0]
 	w.blockMetas = nil
 	w.sketchIdx = w.sketchIdx[:0]
@@ -410,21 +407,19 @@ func (w *Writer) Flush() (int64, error) {
 	w.logProtoRoots = w.logProtoRoots[:0]
 	w.signalType = 0
 
-	// Reset intrinsic accumulator so the next Flush() starts fresh.
-	w.intrinsicAccum = nil
+	// Reset intrinsic accumulator for reuse.
+	w.intrinsicAccum = newIntrinsicAccumulator()
 
 	return total, nil
 }
 
 // writeEmptyFile writes a minimal valid blockpack file with zero blocks.
 func (w *Writer) writeEmptyFile() (int64, error) {
-	metadataOffset := uint64(
-		w.out.total,
-	) //nolint:gosec // safe: total bytes written fits in int64 and int64 fits in uint64 for file offsets
+	metadataOffset := uint64(w.out.total) //nolint:gosec
 
 	rIdx := make(rangeIndex)
 	metaBytes, err := buildMetadataSectionBytes(
-		shared.VersionV11, // block index uses V11 entry layout; block encoding is unchanged
+		shared.VersionV13, // V13: block index omits MinTraceID[16]+MaxTraceID[16] per entry
 		nil,
 		rIdx,
 		w.traceIndex,
@@ -434,7 +429,7 @@ func (w *Writer) writeEmptyFile() (int64, error) {
 		return w.out.total, err
 	}
 
-	// All empty files use V12 (snappy-compressed metadata + signal_type header byte).
+	// All empty files use V13.
 	compressedEmptyMeta := snappy.Encode(nil, metaBytes)
 	metadataLen := uint64(len(compressedEmptyMeta))
 	if _, err = w.out.Write(compressedEmptyMeta); err != nil {
@@ -445,26 +440,97 @@ func (w *Writer) writeEmptyFile() (int64, error) {
 	if signalTypeForHeader == 0 {
 		signalTypeForHeader = shared.SignalTypeTrace
 	}
-	headerOffset := uint64(
-		w.out.total,
-	) //nolint:gosec // safe: total bytes written fits in int64 and int64 fits in uint64 for file offsets
-	if err = writeFileHeader(&w.out, shared.VersionV12, metadataOffset, metadataLen, signalTypeForHeader); err != nil {
+	headerOffset := uint64(w.out.total) //nolint:gosec
+	if err = writeFileHeader(&w.out, shared.VersionV13, metadataOffset, metadataLen, signalTypeForHeader); err != nil {
 		return w.out.total, err
 	}
 
-	compactOffset := uint64(
-		w.out.total,
-	) //nolint:gosec // safe: total bytes written fits in int64 and int64 fits in uint64 for file offsets
+	compactOffset := uint64(w.out.total) //nolint:gosec
 	compactN, err := writeCompactTraceIndex(&w.out, nil, w.traceIndex)
 	if err != nil {
 		return w.out.total, err
 	}
 
-	if err = writeFooterV4(&w.out, headerOffset, compactOffset, uint32(compactN), 0, 0); err != nil { //nolint:gosec // safe: compact index size bounded by MaxCompactSectionSize (50MB) fits uint32
+	// Empty files also get a V4 footer with an empty intrinsic section (TOC with 0 columns).
+	intrinsicOffset, intrinsicLen, err := w.writeIntrinsicSection()
+	if err != nil {
+		return w.out.total, err
+	}
+
+	if err = writeFooterV4(&w.out, headerOffset, compactOffset, uint32(compactN), intrinsicOffset, intrinsicLen); err != nil { //nolint:gosec // safe: compact index size bounded by MaxCompactSectionSize (50MB) fits uint32
 		return w.out.total, err
 	}
 
 	return w.out.total, nil
+}
+
+// writeIntrinsicSection encodes the intrinsic accumulator, writes all column blobs and the
+// TOC blob to the output stream, and returns the TOC's absolute file offset and byte length.
+//
+// If the accumulator is over cap (MaxIntrinsicRows), an empty TOC (0 columns) is written
+// to preserve the V4 footer invariant without occupying significant space.
+//
+// The on-disk layout is:
+//
+//	col_blob_0[...]
+//	col_blob_1[...]
+//	...
+//	toc_blob[...]    ← intrinsicIndexOffset points here; intrinsicIndexLen = len(toc_blob)
+func (w *Writer) writeIntrinsicSection() (intrinsicOffset uint64, intrinsicLen uint32, err error) {
+	a := w.intrinsicAccum
+	if a == nil || a.overCap() {
+		// Write empty TOC to satisfy V4 footer format.
+		tocBlob, encErr := encodeTOC(nil)
+		if encErr != nil {
+			return 0, 0, encErr
+		}
+		off := uint64(w.out.total) //nolint:gosec
+		if _, writeErr := w.out.Write(tocBlob); writeErr != nil {
+			return 0, 0, writeErr
+		}
+		return off, uint32(len(tocBlob)), nil //nolint:gosec // safe: TOC blob bounded by column count × entry size, well within uint32
+	}
+
+	names := a.columnNames()
+
+	// Encode and write each column blob, collecting metadata.
+	metas := make([]shared.IntrinsicColMeta, 0, len(names))
+	for _, name := range names {
+		blob, encErr := a.encodeColumn(name)
+		if encErr != nil {
+			return 0, 0, fmt.Errorf("intrinsic: encode column %q: %w", name, encErr)
+		}
+		if len(blob) == 0 {
+			continue
+		}
+		colOffset := uint64(w.out.total) //nolint:gosec
+		if _, writeErr := w.out.Write(blob); writeErr != nil {
+			return 0, 0, fmt.Errorf("intrinsic: write column %q: %w", name, writeErr)
+		}
+		minVal, maxVal := a.computeMinMax(name)
+		colType, format := a.colTypeFor(name)
+		metas = append(metas, shared.IntrinsicColMeta{
+			Name:   name,
+			Type:   colType,
+			Format: format,
+			Offset: colOffset,
+			Length: uint32(len(blob)), //nolint:gosec
+			Count:  a.rowCount(name),
+			Min:    minVal,
+			Max:    maxVal,
+		})
+	}
+
+	// Encode and write TOC blob.
+	tocBlob, encErr := encodeTOC(metas)
+	if encErr != nil {
+		return 0, 0, fmt.Errorf("intrinsic: encode TOC: %w", encErr)
+	}
+	tocOffset := uint64(w.out.total) //nolint:gosec
+	if _, writeErr := w.out.Write(tocBlob); writeErr != nil {
+		return 0, 0, fmt.Errorf("intrinsic: write TOC: %w", writeErr)
+	}
+	return tocOffset, uint32(len(tocBlob)), nil //nolint:gosec // safe: TOC blob bounded by column count × entry size, well within uint32
 }
 
 // buildAndWriteBlock builds one block from pending[0:end], writes it to the output, and
@@ -479,24 +545,9 @@ func (w *Writer) buildAndWriteBlock(blockID int, pending []pendingSpan) error {
 			blockID,
 		)
 	}
-	blockOffset := uint64(
-		w.out.total,
-	) //nolint:gosec // safe: total bytes written fits in int64 and int64 fits in uint64 for file offsets
+	blockOffset := uint64(w.out.total) //nolint:gosec
 
-	// Initialize intrinsic accumulator on first block.
-	if w.intrinsicAccum == nil {
-		w.intrinsicAccum = newIntrinsicAccumulator()
-	}
-
-	// Wire accumulator into block builder before building the block.
-	// The blockBuilder checks bb.intrinsicAccum != nil before feeding.
-	if w.bb == nil {
-		w.bb = newBlockBuilder(len(pending))
-	}
-	w.bb.intrinsicAccum = w.intrinsicAccum
-	w.bb.intrinsicBlockID = uint16(blockID) //nolint:gosec // safe: blockID bounded by MaxBlocks (65534)
-
-	built, bb, err := buildBlock(pending, w.enc, w.bb)
+	built, bb, err := buildBlock(pending, w.enc, w.bb, shared.VersionBlockV12, w.intrinsicAccum, blockID)
 	w.bb = bb
 	if err != nil {
 		return fmt.Errorf("writer: block %d finalize: %w", blockID, err)
@@ -538,8 +589,8 @@ func (w *Writer) buildAndWriteBlock(blockID int, pending []pendingSpan) error {
 	for tid := range built.traceRows {
 		w.traceIndex[tid] = append(
 			w.traceIndex[tid],
-			uint16(blockID),
-		) //nolint:gosec // safe: blockID <= 65535 enforced by guard above
+			uint16(blockID), //nolint:gosec // safe: blockID <= 65535 enforced by guard above
+		)
 	}
 
 	return nil
@@ -600,9 +651,7 @@ func (w *Writer) flushBlocks() error {
 // buildAndWriteLogBlock builds one log block from pending[0:end], writes it to the output,
 // and records BlockMeta and range index entries. Does NOT update w.traceIndex.
 func (w *Writer) buildAndWriteLogBlock(blockID int, pending []pendingLogRecord) error {
-	blockOffset := uint64(
-		w.out.total,
-	) //nolint:gosec // safe: total bytes written fits in int64 and int64 fits in uint64 for file offsets
+	blockOffset := uint64(w.out.total) //nolint:gosec
 
 	built, err := buildLogBlock(pending, w.enc)
 	if err != nil {
@@ -809,61 +858,4 @@ func (w *Writer) AddRow(block *reader.Block, rowIdx int) error {
 // CurrentSize returns estimated buffered size in bytes.
 func (w *Writer) CurrentSize() int64 {
 	return int64(len(w.pending)+len(w.pendingLogs)) * estimatedBytesPerSpan
-}
-
-// writeIntrinsicSection encodes all accumulated intrinsic column blobs, writes them to
-// the output, and returns the TOC offset and length for the v4 footer.
-// Returns (tocOffset=0, tocLen=0, nil) when the accumulator is empty or over cap.
-func (w *Writer) writeIntrinsicSection() (tocOffset uint64, tocLen uint32, err error) {
-	if w.intrinsicAccum == nil || w.intrinsicAccum.overCap() {
-		return 0, 0, nil
-	}
-
-	names := w.intrinsicAccum.columnNames()
-	if len(names) == 0 {
-		return 0, 0, nil
-	}
-
-	entries := make([]shared.IntrinsicColMeta, 0, len(names))
-	for _, name := range names {
-		blob, encErr := w.intrinsicAccum.encodeColumn(name)
-		if encErr != nil {
-			return 0, 0, fmt.Errorf("writeIntrinsicSection: encode %q: %w", name, encErr)
-		}
-		if len(blob) == 0 {
-			continue
-		}
-		colOffset := uint64(w.out.total) //nolint:gosec // safe: total bytes written fits in int64 and int64 fits in uint64 for file offsets
-		if _, writeErr := w.out.Write(blob); writeErr != nil {
-			return 0, 0, fmt.Errorf("writeIntrinsicSection: write %q: %w", name, writeErr)
-		}
-		colType, format := w.intrinsicAccum.colTypeFor(name)
-		minVal, maxVal := w.intrinsicAccum.computeMinMax(name)
-		entries = append(entries, shared.IntrinsicColMeta{
-			Name:   name,
-			Type:   colType,
-			Format: format,
-			Offset: colOffset,
-			Length: uint32(len(blob)), //nolint:gosec // safe: column blob size bounded by snappy output of accumulated rows
-			Count:  w.intrinsicAccum.rowCount(name),
-			Min:    minVal,
-			Max:    maxVal,
-		})
-	}
-
-	if len(entries) == 0 {
-		return 0, 0, nil
-	}
-
-	toc, tocErr := encodeTOC(entries)
-	if tocErr != nil {
-		return 0, 0, fmt.Errorf("writeIntrinsicSection: encodeTOC: %w", tocErr)
-	}
-
-	off := uint64(w.out.total) //nolint:gosec // safe: total bytes written fits in int64 and int64 fits in uint64 for file offsets
-	if _, writeErr := w.out.Write(toc); writeErr != nil {
-		return 0, 0, fmt.Errorf("writeIntrinsicSection: write TOC: %w", writeErr)
-	}
-
-	return off, uint32(len(toc)), nil //nolint:gosec // safe: TOC size bounded by snappy output of IntrinsicColMeta entries, well under uint32 max
 }

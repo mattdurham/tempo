@@ -47,8 +47,11 @@ func CompileTraceQLMetrics(query string, startTime, endTime int64) (*Program, *Q
 	}
 
 	// Compile to VM Program with a match-all filter program for row scanning.
+	// Use extractTraceQLPredicates for block-level pruning (same path as filter queries).
 	program := compileMatchAllProgram()
-	program.Predicates = filterSpecToPredicates(spec.Filter)
+	if metricsQuery.Filter != nil && metricsQuery.Filter.Expr != nil {
+		program.Predicates = extractTraceQLPredicates(metricsQuery.Filter.Expr)
+	}
 
 	return program, spec, nil
 }
@@ -60,22 +63,11 @@ func compileToQuerySpec(metricsQuery *traceqlparser.MetricsQuery, timeBucket Tim
 	}
 
 	spec := &QuerySpec{
-		Filter: FilterSpec{
-			AttributeEquals: make(map[string][]interface{}),
-			AttributeRanges: make(map[string]*RangeSpec),
-		},
 		TimeBucketing: timeBucket,
 	}
 
-	// Compile filter to FilterSpec
-	if metricsQuery.Filter != nil && metricsQuery.Filter.Expr != nil {
-		filterSpec, err := compileFilterToSpec(metricsQuery.Filter.Expr)
-		if err != nil {
-			return nil, fmt.Errorf("failed to compile filter: %w", err)
-		}
-		spec.Filter = filterSpec
-	} else {
-		// Empty filter matches all spans
+	// Set IsMatchAll when no filter expression is present.
+	if metricsQuery.Filter == nil || metricsQuery.Filter.Expr == nil {
 		spec.Filter.IsMatchAll = true
 	}
 
@@ -92,202 +84,6 @@ func compileToQuerySpec(metricsQuery *traceqlparser.MetricsQuery, timeBucket Tim
 	// Normalize to canonical form for matching
 	spec.Normalize()
 	return spec, nil
-}
-
-// compileFilterToSpec walks the TraceQL filter AST and extracts predicates into FilterSpec.
-func compileFilterToSpec(expr traceqlparser.Expr) (FilterSpec, error) {
-	spec := FilterSpec{
-		AttributeEquals: make(map[string][]interface{}),
-		AttributeRanges: make(map[string]*RangeSpec),
-		IsMatchAll:      false,
-	}
-
-	err := extractPredicates(expr, &spec)
-	if err != nil {
-		return spec, err
-	}
-
-	// If no predicates were extracted, this is effectively a match-all filter
-	if len(spec.AttributeEquals) == 0 && len(spec.AttributeRanges) == 0 {
-		spec.IsMatchAll = true
-	}
-
-	return spec, nil
-}
-
-// extractPredicates recursively walks the AST and extracts predicates.
-func extractPredicates(expr traceqlparser.Expr, spec *FilterSpec) error {
-	switch e := expr.(type) {
-	case *traceqlparser.BinaryExpr:
-		// Handle logical operators (AND, OR)
-		switch e.Op {
-		case traceqlparser.OpAnd:
-			// For AND, we can extract predicates from both sides
-			if err := extractPredicates(e.Left, spec); err != nil {
-				return err
-			}
-			return extractPredicates(e.Right, spec)
-		case traceqlparser.OpOr:
-			// For OR, we skip for now (complex to extract correctly)
-			return nil
-		}
-
-		// Handle comparison operators
-		field, literal, err := extractFieldAndLiteral(e)
-		if err != nil {
-			// Not a simple field-literal comparison, skip optimization (not a validation error)
-			return nil //nolint:nilerr // Skip optimization if extraction fails
-		}
-
-		fieldPath := getFieldPath(field)
-		if fieldPath == "" {
-			// Skip if field path is empty - defensive guard against nil map access
-			return nil
-		}
-
-		switch e.Op {
-		case traceqlparser.OpEq:
-			// Equality predicate
-			spec.AttributeEquals[fieldPath] = append(spec.AttributeEquals[fieldPath], literal.Value)
-
-		case traceqlparser.OpNeq:
-			// Not equal - we don't extract these as negative predicates
-			return nil
-
-		case traceqlparser.OpGt, traceqlparser.OpGte, traceqlparser.OpLt, traceqlparser.OpLte:
-			// Range predicate
-			rangeSpec := spec.AttributeRanges[fieldPath]
-			if rangeSpec == nil {
-				rangeSpec = &RangeSpec{}
-				spec.AttributeRanges[fieldPath] = rangeSpec
-			}
-
-			switch e.Op {
-			case traceqlparser.OpGt:
-				rangeSpec.MinValue = literal.Value
-				rangeSpec.MinInclusive = false
-			case traceqlparser.OpGte:
-				rangeSpec.MinValue = literal.Value
-				rangeSpec.MinInclusive = true
-			case traceqlparser.OpLt:
-				rangeSpec.MaxValue = literal.Value
-				rangeSpec.MaxInclusive = false
-			case traceqlparser.OpLte:
-				rangeSpec.MaxValue = literal.Value
-				rangeSpec.MaxInclusive = true
-			}
-
-		case traceqlparser.OpRegex, traceqlparser.OpNotRegex:
-			// Regex predicates are not extracted
-			return nil
-		}
-
-	default:
-		// Other expression types are not predicates themselves
-		return nil
-	}
-
-	return nil
-}
-
-// extractFieldAndLiteral extracts field and literal from a comparison expression.
-func extractFieldAndLiteral(
-	expr *traceqlparser.BinaryExpr,
-) (*traceqlparser.FieldExpr, *traceqlparser.LiteralExpr, error) {
-	// Check if left is field and right is literal
-	if field, ok := expr.Left.(*traceqlparser.FieldExpr); ok {
-		if literal, ok := expr.Right.(*traceqlparser.LiteralExpr); ok {
-			return field, literal, nil
-		}
-	}
-
-	// Check if right is field and left is literal (reversed)
-	if field, ok := expr.Right.(*traceqlparser.FieldExpr); ok {
-		if literal, ok := expr.Left.(*traceqlparser.LiteralExpr); ok {
-			return field, literal, nil
-		}
-	}
-
-	return nil, nil, fmt.Errorf("not a field-literal comparison")
-}
-
-// getFieldPath returns the normalized field path for a TraceQL field expression.
-func getFieldPath(field *traceqlparser.FieldExpr) string {
-	if field.Scope == "" {
-		// Unscoped field
-		return field.Name
-	}
-	// Scoped field: scope.name (e.g., "span.http.status_code")
-	return field.Scope + "." + field.Name
-}
-
-// filterSpecToPredicates converts a FilterSpec into *QueryPredicates for block-level pruning.
-// Returns nil if the filter matches all spans (no predicates to prune on).
-func filterSpecToPredicates(filter FilterSpec) *QueryPredicates {
-	if filter.IsMatchAll {
-		return nil
-	}
-
-	if len(filter.AttributeEquals) == 0 && len(filter.AttributeRanges) == 0 {
-		return nil
-	}
-
-	var nodes []RangeNode
-	var cols []string
-
-	for col, vals := range filter.AttributeEquals {
-		vmVals := make([]Value, 0, len(vals))
-		for _, v := range vals {
-			if vmVal, ok := interfaceToValue(v); ok {
-				vmVals = append(vmVals, vmVal)
-			}
-		}
-		if len(vmVals) > 0 {
-			nodes = append(nodes, RangeNode{Column: col, Values: vmVals})
-			cols = append(cols, col)
-		}
-	}
-
-	for col, rs := range filter.AttributeRanges {
-		node := RangeNode{Column: col}
-		if rs.MinValue != nil {
-			if v, ok := interfaceToValue(rs.MinValue); ok {
-				node.Min = &v
-			}
-		}
-		if rs.MaxValue != nil {
-			if v, ok := interfaceToValue(rs.MaxValue); ok {
-				node.Max = &v
-			}
-		}
-		nodes = append(nodes, node)
-		cols = append(cols, col)
-	}
-
-	if len(nodes) == 0 {
-		return nil
-	}
-
-	return &QueryPredicates{Nodes: nodes, Columns: cols}
-}
-
-// interfaceToValue converts an interface{} value to a VM Value.
-// Returns false if the type is not supported.
-func interfaceToValue(v interface{}) (Value, bool) {
-	switch t := v.(type) {
-	case string:
-		return Value{Type: TypeString, Data: t}, true
-	case int64:
-		return Value{Type: TypeInt, Data: t}, true
-	case int:
-		return Value{Type: TypeInt, Data: int64(t)}, true
-	case float64:
-		return Value{Type: TypeFloat, Data: t}, true
-	case bool:
-		return Value{Type: TypeBool, Data: t}, true
-	default:
-		return Value{}, false
-	}
 }
 
 // compilePipelineToSpec maps TraceQL aggregates to AggregateSpec.

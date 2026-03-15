@@ -77,8 +77,8 @@ func (c *SharedLRUCache) Get(readerID string, off int64, length int) ([]byte, bo
 	key := cacheKey{
 		readerID: readerID,
 		offset:   off,
-		length:   int32(length),
-	} //nolint:gosec // length is bounded by read-buffer size
+		length:   int32(length), //nolint:gosec // length is bounded by read-buffer size
+	}
 	elem, ok := c.index[key]
 	if !ok {
 		return nil, false

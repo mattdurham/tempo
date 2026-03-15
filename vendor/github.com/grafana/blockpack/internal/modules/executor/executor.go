@@ -45,6 +45,13 @@ type Options struct {
 	TimeRange queryplanner.TimeRange
 	// Limit caps the number of returned matches. 0 means no limit.
 	Limit int
+	// StartBlock is the first internal block index to include (0-based, inclusive).
+	// Used by the frontend sharder to partition a single file across multiple jobs.
+	// 0 with BlockCount==0 means scan all blocks (no sub-file sharding).
+	StartBlock int
+	// BlockCount is the number of internal blocks to include starting from StartBlock.
+	// 0 means no sub-file sharding (scan all blocks selected by the planner).
+	BlockCount int
 }
 
 // Executor runs TraceQL filter queries against a modules blockpack file.

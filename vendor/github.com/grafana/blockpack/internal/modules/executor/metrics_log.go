@@ -83,7 +83,6 @@ func ExecuteLogMetrics(
 		return nil, fmt.Errorf("ExecuteLogMetrics: program cannot be nil")
 	}
 
-	predicates := buildPredicates(r, program)
 	var tr queryplanner.TimeRange
 	if querySpec.TimeBucketing.Enabled {
 		tr = queryplanner.TimeRange{
@@ -91,8 +90,7 @@ func ExecuteLogMetrics(
 			MaxNano: uint64(querySpec.TimeBucketing.EndTime),   //nolint:gosec
 		}
 	}
-	planner := queryplanner.NewPlanner(r)
-	plan := planner.Plan(predicates, tr)
+	plan := planBlocks(r, program, tr, queryplanner.PlanOptions{})
 
 	result := &LogMetricsResult{}
 	if len(plan.SelectedBlocks) == 0 {
@@ -101,7 +99,7 @@ func ExecuteLogMetrics(
 
 	wantColumns := ProgramWantColumns(program)
 
-	rawBlocks, err := planner.FetchBlocks(plan)
+	rawBlocks, err := r.ReadBlocks(plan.SelectedBlocks)
 	if err != nil {
 		return nil, fmt.Errorf("FetchBlocks: %w", err)
 	}

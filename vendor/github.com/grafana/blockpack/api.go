@@ -226,7 +226,7 @@ func GetTraceByID(r *Reader, traceIDHex string) (results []SpanMatch, err error)
 	for _, entry := range entries {
 		raw, ok := rawMap[entry.BlockID]
 		if !ok {
-			continue
+			return nil, fmt.Errorf("GetTraceByID: block %d missing from coalesced read", entry.BlockID)
 		}
 		bwb, blockErr := r.ParseBlockFromBytes(raw, nil, r.BlockMeta(entry.BlockID))
 		if blockErr != nil {
@@ -409,6 +409,7 @@ type spanMatchFn func(match *SpanMatch, more bool) bool
 // For filter queries, each SpanMatch.Fields supports GetField and IterateFields.
 // For structural queries, SpanMatch.Fields is nil — only TraceID and SpanID are set.
 // Metrics queries return an error.
+
 // ColumnNames returns all column names known to this reader — the union of
 // range-indexed and sketch columns. Derived from file header metadata; no
 // block I/O is required. Returns a sorted slice of column name strings
@@ -417,6 +418,8 @@ func ColumnNames(r *Reader) []string {
 	return r.ColumnNames()
 }
 
+// QueryTraceQL executes a TraceQL query against a modules-format blockpack file
+// and returns all matching spans.
 func QueryTraceQL(r *Reader, traceqlQuery string, opts QueryOptions) (results []SpanMatch, err error) {
 	defer func() {
 		if rec := recover(); rec != nil {
@@ -448,7 +451,28 @@ func QueryTraceQL(r *Reader, traceqlQuery string, opts QueryOptions) (results []
 	case *traceqlparser.FilterExpression:
 		err = streamFilterQuery(r, q, opts, collector)
 	case *traceqlparser.StructuralQuery:
-		err = streamStructuralQuery(r, q, opts, collector)
+		execOpts := modules_executor.Options{
+			Limit:      opts.Limit,
+			TimeRange:  normalizeTimeRange(opts.StartNano, opts.EndNano),
+			StartBlock: opts.StartBlock,
+			BlockCount: opts.BlockCount,
+		}
+		exec := modules_executor.New()
+		var execResult *modules_executor.StructuralResult
+		execResult, err = exec.ExecuteStructural(r, q, execOpts)
+		if err == nil {
+			for i := range execResult.Matches {
+				m := &execResult.Matches[i]
+				match := &SpanMatch{
+					TraceID: fmt.Sprintf("%x", m.TraceID[:]),
+					SpanID:  fmt.Sprintf("%x", m.SpanID),
+				}
+				if !collector(match, true) {
+					break
+				}
+			}
+			collector(nil, false)
+		}
 	case *traceqlparser.MetricsQuery:
 		err = streamPipelineQuery(r, q, opts, collector)
 	default:
@@ -460,7 +484,8 @@ func QueryTraceQL(r *Reader, traceqlQuery string, opts QueryOptions) (results []
 	return results, err
 }
 
-// streamPipelineQuery executes a TraceQL pipeline query ({filter} | aggregate() > threshold).
+// SPEC-PA-4, SPEC-PA-5, SPEC-PA-6, SPEC-PA-7: streamPipelineQuery executes a TraceQL pipeline query
+// ({filter} | aggregate() > threshold).
 // It runs the filter part, groups matching spans into spansets by trace ID, applies the
 // aggregate function per spanset, filters by threshold, and emits qualifying spans.
 func streamPipelineQuery(r *Reader, mq *traceqlparser.MetricsQuery, opts QueryOptions, fn spanMatchFn) error {
@@ -593,7 +618,7 @@ func streamPipelineQuery(r *Reader, mq *traceqlparser.MetricsQuery, opts QueryOp
 	return nil
 }
 
-// computeSpansetAggregate computes an aggregate value over a spanset.
+// SPEC-PA-1, SPEC-PA-2, SPEC-PA-3: computeSpansetAggregate computes an aggregate value over a spanset.
 func computeSpansetAggregate(aggName, aggField string, indices []int, allSpans []SpanMatch) (float64, bool) {
 	switch aggName {
 	case "count", "count_over_time":
@@ -646,7 +671,7 @@ func computeSpansetAggregate(aggName, aggField string, indices []int, allSpans [
 	return 0, false
 }
 
-// getSpanFieldNumeric extracts a numeric value from a span's fields.
+// SPEC-PA-1: getSpanFieldNumeric extracts a numeric value from a span's fields.
 // It matches fieldName exactly first, then falls back to unscoped/scoped variants
 // (e.g. "duration" matches "span:duration", and "span.duration" matches "duration").
 func getSpanFieldNumeric(sp SpanMatch, fieldName string) (float64, bool) {
@@ -764,8 +789,25 @@ func streamFilterProgram(r *Reader, program *vm.Program, opts QueryOptions, fn s
 		return err
 	}
 	for _, row := range rows {
-		fields := modules_blockio.NewSpanFieldsAdapter(row.Block, row.RowIdx)
-		traceIDHex, spanIDHex := extractIDs(row.Block, row.RowIdx)
+		var fields SpanFieldsProvider
+		var traceIDHex, spanIDHex string
+		if row.IntrinsicFields != nil {
+			// Intrinsic fast path — fields resolved from intrinsic columns, no block read.
+			fields = row.IntrinsicFields
+			if v, ok := fields.GetField("trace:id"); ok {
+				if b, ok := v.(string); ok {
+					traceIDHex = b
+				}
+			}
+			if v, ok := fields.GetField("span:id"); ok {
+				if b, ok := v.(string); ok {
+					spanIDHex = b
+				}
+			}
+		} else {
+			fields = modules_blockio.NewSpanFieldsAdapter(row.Block, row.RowIdx)
+			traceIDHex, spanIDHex = extractIDs(row.Block, row.RowIdx)
+		}
 		match := &SpanMatch{Fields: fields, TraceID: traceIDHex, SpanID: spanIDHex}
 		if !fn(match, true) {
 			break
@@ -1171,462 +1213,6 @@ func extractIDs(block *modules_reader.Block, rowIdx int) (traceID, spanID string
 		}
 	}
 	return traceID, spanID
-}
-
-// structSpanRec records per-span data collected during a structural query scan.
-type structSpanRec struct {
-	spanID     []byte
-	parentID   []byte // nil after phase 2
-	parentIdx  int    // -1 = root; set during phase 2
-	leftMatch  bool
-	rightMatch bool
-}
-
-// streamStructuralQuery executes a structural TraceQL query against all blocks.
-// It collects span records in phase 1, resolves parent indices in phase 2,
-// and evaluates the structural operator per trace in phase 3.
-func streamStructuralQuery(r *Reader, q *traceqlparser.StructuralQuery, opts QueryOptions, fn spanMatchFn) error {
-	if r == nil {
-		return fmt.Errorf("streamStructuralQuery: reader cannot be nil")
-	}
-
-	leftProg, rightProg, err := compileStructuralPrograms(q)
-	if err != nil {
-		return err
-	}
-
-	traceSpans, err := collectStructuralSpans(r, leftProg, rightProg, opts)
-	if err != nil {
-		return err
-	}
-
-	resolveParentIndices(traceSpans)
-	return emitStructuralMatches(traceSpans, q.Op, opts, fn)
-}
-
-// compileStructuralPrograms compiles left and right filter expressions.
-// A nil FilterExpression compiles to a nil program (matches all rows).
-func compileStructuralPrograms(q *traceqlparser.StructuralQuery) (left, right *vm.Program, err error) {
-	if q.Left != nil {
-		left, err = vm.CompileTraceQLFilter(q.Left)
-		if err != nil {
-			return nil, nil, fmt.Errorf("compile structural left filter: %w", err)
-		}
-	}
-	if q.Right != nil {
-		right, err = vm.CompileTraceQLFilter(q.Right)
-		if err != nil {
-			return nil, nil, fmt.Errorf("compile structural right filter: %w", err)
-		}
-	}
-	return left, right, nil
-}
-
-// collectStructuralSpans scans blocks and accumulates per-trace span records.
-// Returns a map: traceIDHex → []structSpanRec (in block scan order).
-// opts.StartBlock/BlockCount restrict scanning to the assigned sub-file shard.
-func collectStructuralSpans(
-	r *Reader,
-	leftProg, rightProg *vm.Program,
-	opts QueryOptions,
-) (map[string][]structSpanRec, error) {
-	planner := modules_queryplanner.NewPlanner(r)
-	plan := planner.Plan(nil, normalizeTimeRange(opts.StartNano, opts.EndNano))
-
-	// Sub-file sharding: restrict to assigned block range.
-	if opts.BlockCount > 0 {
-		endBlock := opts.StartBlock + opts.BlockCount
-		filtered := plan.SelectedBlocks[:0]
-		for _, bi := range plan.SelectedBlocks {
-			if bi >= opts.StartBlock && bi < endBlock {
-				filtered = append(filtered, bi)
-			}
-		}
-		plan.SelectedBlocks = filtered
-	}
-
-	if len(plan.SelectedBlocks) == 0 {
-		return nil, nil
-	}
-
-	rawBlocks, fetchErr := planner.FetchBlocks(plan)
-	if fetchErr != nil {
-		return nil, fmt.Errorf("structural FetchBlocks: %w", fetchErr)
-	}
-
-	result := make(map[string][]structSpanRec)
-	for _, blockIdx := range plan.SelectedBlocks {
-		raw, ok := rawBlocks[blockIdx]
-		if !ok {
-			continue
-		}
-		if err := collectBlockStructuralSpans(r, blockIdx, raw, leftProg, rightProg, result); err != nil {
-			return nil, err
-		}
-	}
-	return result, nil
-}
-
-// collectBlockStructuralSpans parses one block and appends span records to result.
-func collectBlockStructuralSpans(
-	r *Reader,
-	blockIdx int,
-	raw []byte,
-	leftProg, rightProg *vm.Program,
-	result map[string][]structSpanRec,
-) error {
-	meta := r.BlockMeta(blockIdx)
-	// Union predicate columns from both programs plus the identity columns appendBlockSpanRecs reads.
-	wantColumns := modules_executor.ProgramWantColumns(leftProg, "trace:id", "span:id", "span:parent_id")
-	if right := modules_executor.ProgramWantColumns(rightProg, "trace:id", "span:id", "span:parent_id"); right != nil {
-		if wantColumns == nil {
-			wantColumns = right
-		} else {
-			for c := range right {
-				wantColumns[c] = struct{}{}
-			}
-		}
-	}
-	bwb, err := r.ParseBlockFromBytes(raw, wantColumns, meta)
-	if err != nil {
-		return fmt.Errorf("structural ParseBlockFromBytes block %d: %w", blockIdx, err)
-	}
-
-	colProvider := modules_executor.NewColumnProvider(bwb.Block)
-	leftSet, err := evalOptionalProgram(leftProg, colProvider, bwb.Block.SpanCount())
-	if err != nil {
-		return fmt.Errorf("structural left ColumnPredicate block %d: %w", blockIdx, err)
-	}
-	rightSet, err := evalOptionalProgram(rightProg, colProvider, bwb.Block.SpanCount())
-	if err != nil {
-		return fmt.Errorf("structural right ColumnPredicate block %d: %w", blockIdx, err)
-	}
-
-	appendBlockSpanRecs(bwb.Block, leftSet, rightSet, result)
-	return nil
-}
-
-// evalOptionalProgram evaluates a compiled program or returns an all-match set if prog is nil.
-func evalOptionalProgram(prog *vm.Program, colProvider vm.ColumnDataProvider, spanCount int) (vm.RowSet, error) {
-	if prog != nil {
-		return prog.ColumnPredicate(colProvider)
-	}
-	// nil program means "match all rows"
-	rs := allRowsSet(spanCount)
-	return rs, nil
-}
-
-// allRowsSet returns a RowSet containing all row indices [0, n).
-type allMatchRowSet struct{ n int }
-
-func allRowsSet(n int) vm.RowSet              { return &allMatchRowSet{n: n} }
-func (a *allMatchRowSet) Add(_ int)           {}
-func (a *allMatchRowSet) Contains(_ int) bool { return true }
-func (a *allMatchRowSet) Size() int           { return a.n }
-func (a *allMatchRowSet) IsEmpty() bool       { return a.n == 0 }
-func (a *allMatchRowSet) ToSlice() []int {
-	s := make([]int, a.n)
-	for i := range a.n {
-		s[i] = i
-	}
-	return s
-}
-
-// appendBlockSpanRecs appends structSpanRec entries to the result map for every row in the block.
-func appendBlockSpanRecs(block *modules_reader.Block, leftSet, rightSet vm.RowSet, result map[string][]structSpanRec) {
-	traceCol := block.GetColumn("trace:id")
-	spanCol := block.GetColumn("span:id")
-	parentCol := block.GetColumn("span:parent_id")
-
-	n := block.SpanCount()
-	for rowIdx := range n {
-		traceIDHex := bytesColHex(traceCol, rowIdx)
-		if traceIDHex == "" {
-			continue
-		}
-		spanIDBytes := bytesColRaw(spanCol, rowIdx)
-		parentIDBytes := bytesColRaw(parentCol, rowIdx)
-
-		rec := structSpanRec{
-			spanID:     spanIDBytes,
-			parentID:   parentIDBytes,
-			parentIdx:  -1,
-			leftMatch:  leftSet.Contains(rowIdx),
-			rightMatch: rightSet.Contains(rowIdx),
-		}
-		result[traceIDHex] = append(result[traceIDHex], rec)
-	}
-}
-
-// bytesColHex returns a hex string for the bytes column value at rowIdx, or "" if absent.
-func bytesColHex(col *modules_reader.Column, rowIdx int) string {
-	if col == nil {
-		return ""
-	}
-	v, ok := col.BytesValue(rowIdx)
-	if !ok {
-		return ""
-	}
-	return fmt.Sprintf("%x", v)
-}
-
-// bytesColRaw returns the raw bytes for a bytes column value at rowIdx, or nil if absent.
-func bytesColRaw(col *modules_reader.Column, rowIdx int) []byte {
-	if col == nil {
-		return nil
-	}
-	v, ok := col.BytesValue(rowIdx)
-	if !ok {
-		return nil
-	}
-	// Copy to avoid aliasing into the block's memory.
-	out := make([]byte, len(v))
-	copy(out, v)
-	return out
-}
-
-// resolveParentIndices walks each trace's span list, builds a spanID→index map,
-// and sets parentIdx for each span. After resolution, parentID is cleared.
-func resolveParentIndices(traceSpans map[string][]structSpanRec) {
-	for traceID := range traceSpans {
-		spans := traceSpans[traceID]
-		// Build spanID → index map using hex strings as keys.
-		byID := make(map[string]int, len(spans))
-		for i, sp := range spans {
-			if len(sp.spanID) > 0 {
-				byID[fmt.Sprintf("%x", sp.spanID)] = i
-			}
-		}
-		// Set parentIdx for each span.
-		for i := range spans {
-			if len(spans[i].parentID) == 0 {
-				spans[i].parentIdx = -1
-			} else {
-				parentKey := fmt.Sprintf("%x", spans[i].parentID)
-				if idx, ok := byID[parentKey]; ok {
-					spans[i].parentIdx = idx
-				} else {
-					spans[i].parentIdx = -1
-				}
-			}
-			spans[i].parentID = nil // clear to release memory
-		}
-		traceSpans[traceID] = spans
-	}
-}
-
-// emitStructuralMatches evaluates the structural operator for each trace and
-// calls fn for each matching right-side span. Returns early if limit is reached.
-func emitStructuralMatches(
-	traceSpans map[string][]structSpanRec,
-	op traceqlparser.StructuralOp,
-	opts QueryOptions,
-	fn spanMatchFn,
-) error {
-	matched := 0
-	for traceIDHex, spans := range traceSpans {
-		rightIndices := evalStructuralOp(spans, op)
-		// Deduplicate right indices (keep first occurrence per index).
-		seen := make(map[int]bool, len(rightIndices))
-		for _, ri := range rightIndices {
-			if seen[ri] {
-				continue
-			}
-			seen[ri] = true
-
-			spanIDHex := fmt.Sprintf("%x", spans[ri].spanID)
-			match := &SpanMatch{
-				TraceID: traceIDHex,
-				SpanID:  spanIDHex,
-			}
-			if !fn(match, true) {
-				fn(nil, false)
-				return nil
-			}
-			matched++
-			if opts.Limit > 0 && matched >= opts.Limit {
-				fn(nil, false)
-				return nil
-			}
-		}
-	}
-	fn(nil, false)
-	return nil
-}
-
-// evalStructuralOp returns the right-side span indices matched by the operator.
-func evalStructuralOp(spans []structSpanRec, op traceqlparser.StructuralOp) []int {
-	switch op {
-	case traceqlparser.OpDescendant:
-		return evalOpDescendant(spans)
-	case traceqlparser.OpChild:
-		return evalOpChild(spans)
-	case traceqlparser.OpSibling:
-		return evalOpSibling(spans)
-	case traceqlparser.OpAncestor:
-		return evalOpAncestor(spans)
-	case traceqlparser.OpParent:
-		return evalOpParent(spans)
-	case traceqlparser.OpNotSibling:
-		return evalOpNotSibling(spans)
-	case traceqlparser.OpNotDescendant:
-		return evalOpNotDescendant(spans)
-	case traceqlparser.OpNotChild:
-		return evalOpNotChild(spans)
-	default:
-		return nil
-	}
-}
-
-// evalOpDescendant: R is a descendant of L (>>) — walk R's ancestor chain.
-func evalOpDescendant(spans []structSpanRec) []int {
-	var result []int
-	for ri, r := range spans {
-		if !r.rightMatch {
-			continue
-		}
-		// Walk ancestor chain of R; if any ancestor is leftMatch, emit R.
-		cur := r.parentIdx
-		for cur >= 0 {
-			if spans[cur].leftMatch {
-				result = append(result, ri)
-				break
-			}
-			cur = spans[cur].parentIdx
-		}
-	}
-	return result
-}
-
-// evalOpChild: R's direct parent is L (>) .
-func evalOpChild(spans []structSpanRec) []int {
-	var result []int
-	for ri, r := range spans {
-		if !r.rightMatch || r.parentIdx < 0 {
-			continue
-		}
-		if spans[r.parentIdx].leftMatch {
-			result = append(result, ri)
-		}
-	}
-	return result
-}
-
-// evalOpSibling: R shares a parent with a leftMatch span (~), R != L.
-func evalOpSibling(spans []structSpanRec) []int {
-	// Build set of parentIdx values that have at least one leftMatch child.
-	leftParents := make(map[int]bool)
-	for _, sp := range spans {
-		if sp.leftMatch {
-			leftParents[sp.parentIdx] = true
-		}
-	}
-	var result []int
-	for ri, r := range spans {
-		if !r.rightMatch {
-			continue
-		}
-		if leftParents[r.parentIdx] && !r.leftMatch {
-			result = append(result, ri)
-		}
-	}
-	return result
-}
-
-// evalOpAncestor: R is an ancestor of L (<<) — walk L's parent chain.
-func evalOpAncestor(spans []structSpanRec) []int {
-	var result []int
-	for _, l := range spans {
-		if !l.leftMatch {
-			continue
-		}
-		cur := l.parentIdx
-		for cur >= 0 {
-			if spans[cur].rightMatch {
-				result = append(result, cur)
-			}
-			cur = spans[cur].parentIdx
-		}
-	}
-	return result
-}
-
-// evalOpParent: R is the direct parent of L (<).
-func evalOpParent(spans []structSpanRec) []int {
-	var result []int
-	for _, l := range spans {
-		if !l.leftMatch || l.parentIdx < 0 {
-			continue
-		}
-		if spans[l.parentIdx].rightMatch {
-			result = append(result, l.parentIdx)
-		}
-	}
-	return result
-}
-
-// evalOpNotSibling: R is rightMatch with no leftMatch sibling (!~).
-func evalOpNotSibling(spans []structSpanRec) []int {
-	// For each parentIdx group, check if any leftMatch exists.
-	leftParents := make(map[int]bool)
-	for _, sp := range spans {
-		if sp.leftMatch {
-			leftParents[sp.parentIdx] = true
-		}
-	}
-	var result []int
-	for ri, r := range spans {
-		if r.rightMatch && !leftParents[r.parentIdx] {
-			result = append(result, ri)
-		}
-	}
-	return result
-}
-
-// evalOpNotDescendant: R is rightMatch but NOT a descendant of any leftMatch span (!>>).
-func evalOpNotDescendant(spans []structSpanRec) []int {
-	// Build set of all leftMatch span indices.
-	leftSet := make(map[int]bool)
-	for i, sp := range spans {
-		if sp.leftMatch {
-			leftSet[i] = true
-		}
-	}
-	var result []int
-	for ri, r := range spans {
-		if !r.rightMatch {
-			continue
-		}
-		// Walk ancestor chain of R; if any ancestor is leftMatch, R IS a descendant → skip.
-		isDescendant := false
-		cur := r.parentIdx
-		for cur >= 0 {
-			if leftSet[cur] {
-				isDescendant = true
-				break
-			}
-			cur = spans[cur].parentIdx
-		}
-		if !isDescendant {
-			result = append(result, ri)
-		}
-	}
-	return result
-}
-
-// evalOpNotChild: R is rightMatch but its direct parent is NOT leftMatch (!>).
-func evalOpNotChild(spans []structSpanRec) []int {
-	var result []int
-	for ri, r := range spans {
-		if !r.rightMatch {
-			continue
-		}
-		// R qualifies if it has no parent, or its parent is not leftMatch.
-		if r.parentIdx < 0 || !spans[r.parentIdx].leftMatch {
-			result = append(result, ri)
-		}
-	}
-	return result
 }
 
 // FileLayoutReport is the top-level result of AnalyzeFileLayout.

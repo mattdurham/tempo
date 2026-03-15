@@ -691,7 +691,11 @@ func scanDictPageRaw(
 		pos += 4
 
 		if !matchFn(strVal, i64Val, isInt64) {
-			pos += refCount * refSize
+			skip := refCount * refSize
+			if skip/refSize != refCount || pos+skip > len(pageRaw) {
+				return result, false // corrupt refCount
+			}
+			pos += skip
 			continue
 		}
 		for range refCount {
@@ -835,10 +839,11 @@ func ScanDictColumnRefs(
 
 		if !matchFn(strVal, i64Val, isInt64) {
 			// Skip all refs for this value — no struct allocation.
-			pos += refCount * refSize
-			if pos > len(raw) {
-				return nil
+			skip := refCount * refSize
+			if skip/refSize != refCount || pos+skip > len(raw) {
+				return nil // corrupt refCount
 			}
+			pos += skip
 			continue
 		}
 
@@ -927,14 +932,22 @@ func scanFlatPagedBlob(blob []byte, lo, hi uint64, hasLo, hasHi bool, maxRefs in
 
 		rowCount := int(pm.RowCount)
 		refsStart := pageRefsStart(pageRaw)
+		if refsStart > len(pageRaw) {
+			return nil // corrupt page: values_len exceeds page size
+		}
 
 		// Varint delta-decode values to find matching range.
+		// Bound reads to the values section to prevent spilling into refs on corrupt pages.
 		var acc uint64
 		startIdx := -1
 		endIdx := rowCount
 		valPos := 4 // skip values_len prefix
+		valEnd := refsStart
 		for i := range rowCount {
-			delta, n := binary.Uvarint(pageRaw[valPos:])
+			if valPos >= valEnd {
+				break
+			}
+			delta, n := binary.Uvarint(pageRaw[valPos:valEnd])
 			if n <= 0 {
 				break
 			}
@@ -985,7 +998,7 @@ func scanFlatPagedTopK(blob []byte, limit int, backward bool) []BlockRef {
 	remaining := limit
 
 	if backward {
-		// Scan from last page toward first.
+		// Scan from last page toward first, collecting forward then reversing once.
 		for i := len(toc.Pages) - 1; i >= 0 && remaining > 0; i-- {
 			pm := toc.Pages[i]
 			pageStart := pos + int(pm.Offset)
@@ -1003,19 +1016,21 @@ func scanFlatPagedTopK(blob []byte, limit int, backward bool) []BlockRef {
 			if count > rowCount {
 				count = rowCount
 			}
-			// Read the last `count` refs of this page.
+			// Read the last `count` refs of this page (appended forward).
 			refPos := refsStart + (rowCount-count)*refSize
-			pageRefs := make([]BlockRef, 0, count)
 			for range count {
 				if refPos+refSize > len(pageRaw) {
 					break
 				}
-				pageRefs = append(pageRefs, decodeRef(pageRaw, refPos, blockW, rowW))
+				result = append(result, decodeRef(pageRaw, refPos, blockW, rowW))
 				refPos += refSize
 			}
-			// Prepend so overall order is newest-first.
-			result = append(pageRefs, result...)
-			remaining -= len(pageRefs)
+			remaining = limit - len(result)
+		}
+		// Reverse to get newest-first order (pages were scanned last-to-first,
+		// but refs within each page were appended forward).
+		for i, j := 0, len(result)-1; i < j; i, j = i+1, j-1 {
+			result[i], result[j] = result[j], result[i]
 		}
 	} else {
 		// Scan from first page forward.

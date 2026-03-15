@@ -58,9 +58,11 @@ func leafBlockSet(r BlockIndexer, pred Predicate) (map[int]struct{}, error) {
 // Returns nil when the node is unconstrained (no index coverage).
 //
 // Leaf: delegates to leafBlockSet.
-// Composite LogicalOR: union of constrained children; unconstrained (nil) children are
-// skipped — they contribute no pruning, but they do not invalidate other children.
-// Returns nil only when ALL children are unconstrained (NOTE-012).
+// Composite LogicalOR: union of constrained children; unconstrained (nil) children
+// are skipped — they represent columns with no range index (absent from the file
+// entirely per the writer invariant). Returns nil only when ALL children are
+// unconstrained. See NOTE-012.
+//
 // Composite LogicalAND: intersection of children; unconstrained children are skipped
 // (conservative — cannot prune what cannot be indexed).
 func blockSetForPred(r BlockIndexer, pred Predicate) (map[int]struct{}, error) {
@@ -69,9 +71,11 @@ func blockSetForPred(r BlockIndexer, pred Predicate) (map[int]struct{}, error) {
 	}
 
 	if pred.Op == LogicalOR {
-		// Union children. Skip unconstrained children (nil set) — an OR child with no
-		// range index simply cannot be pruned, but other constrained children still can.
-		// If ALL children are unconstrained, the entire OR is unconstrained.
+		// NOTE-012: OR skip-nil semantics. Union constrained children, skip
+		// unconstrained (nil) ones. A nil child means the column has no range
+		// index, which (per writer invariant) means it is absent from the file
+		// entirely — no block can satisfy that scope, so skipping is safe.
+		// Returns nil only when ALL children are unconstrained.
 		var union map[int]struct{}
 		anyConstrained := false
 		for _, child := range pred.Children {
@@ -80,7 +84,7 @@ func blockSetForPred(r BlockIndexer, pred Predicate) (map[int]struct{}, error) {
 				return nil, err
 			}
 			if set == nil {
-				continue // skip unconstrained child
+				continue // unconstrained child — column absent from file, skip
 			}
 			anyConstrained = true
 			for b := range set {
@@ -91,7 +95,7 @@ func blockSetForPred(r BlockIndexer, pred Predicate) (map[int]struct{}, error) {
 			}
 		}
 		if !anyConstrained {
-			return nil, nil // all children unconstrained → OR is unconstrained
+			return nil, nil // all children unconstrained — no pruning possible
 		}
 		if union == nil {
 			union = make(map[int]struct{}) // all constrained children found nothing

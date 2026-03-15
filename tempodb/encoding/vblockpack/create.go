@@ -109,10 +109,11 @@ func setBlockTimeRange(meta *backend.BlockMeta, data []byte) {
 		meta.StartTime = time.Unix(0, int64(minStart))
 		meta.EndTime = time.Unix(0, int64(maxEnd))
 	}
-	// TotalRecords = internal block count. The frontend sharder uses this to split
-	// a single blockpack file into multiple sub-file jobs, each scanning a subset
-	// of internal blocks. Must be >= 1 or the sharder skips the block entirely.
-	if bc := r.BlockCount(); bc > 0 {
-		meta.TotalRecords = uint32(bc)
-	}
+	// TotalRecords = 1: one job per file (no sub-file sharding).
+	// Blockpack's intrinsic fast path evaluates all internal blocks using
+	// intrinsic column blobs (~10 MB) instead of reading full blocks (~180 MB).
+	// Sub-file sharding disables this fast path by restricting each job to a
+	// block range, forcing full block reads. Setting TotalRecords=1 ensures the
+	// frontend creates exactly one job per file.
+	meta.TotalRecords = 1
 }

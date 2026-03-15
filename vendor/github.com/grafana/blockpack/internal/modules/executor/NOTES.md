@@ -1198,38 +1198,30 @@ Back-ref: `internal/modules/executor/stream.go:Collect`,
 
 ---
 
-## NOTE-036: Intrinsic-Guided Block Pruning Design (Phase 3)
-*Added: 2026-03-11*
+## NOTE-036: planBlocks Unification — Intrinsic TOC Pruning in All Query Paths
+*Added: 2026-03-14*
 
-**Change:** Added `ProgramIsIntrinsicOnly` and `BlocksFromIntrinsicTOC` to `predicates.go`,
-plus a test file `intrinsic_pruning_test.go`.
+**Decision:** All five query paths (Collect, ExecuteTraceMetrics, ExecuteLogMetrics,
+StreamLogs, CollectLogs) now use a shared `planBlocks` helper that runs:
+1. `buildPredicates` — converts vm.Program predicates into planner predicates
+2. `PlanWithOptions` — range-index/fuse/CMS pruning and time range filtering
+3. `fileLevelReject` — O(1) file-level fast reject using KLL bucketMin/bucketMax boundaries
+4. `BlocksFromIntrinsicTOC` intersection — intrinsic-column fast reject
 
-**Why intrinsic columns in the executor?**
+**Rationale:** Before this change, intrinsic TOC pruning was only active in `Collect`.
+The four other paths called `planner.Plan` or `planner.PlanWithOptions` directly without
+the `BlocksFromIntrinsicTOC` intersection step. Queries involving intrinsic columns (e.g.
+trace:id, span:id) on the metrics or log paths could therefore scan blocks that would have
+been pruned on the trace search path — wasting I/O.
 
-The executor is the natural owner of block selection logic. Adding intrinsic-guided pruning
-here, rather than in the reader or planner, keeps the selection policy in one place: the
-executor knows both the program (query predicates) and the reader (file contents).
+**Why safe:** `BlocksFromIntrinsicTOC` returns nil when no pruning is possible (no intrinsic
+section, no intrinsic predicates, or all blocks survive). The intersection is only applied
+when it actually shrinks the selected set, so correctness is preserved and there is no
+performance regression for queries with no intrinsic predicates.
 
-**Why `ProgramIsIntrinsicOnly` instead of per-column checks?**
-
-Block pruning is only useful when ALL predicates can be evaluated against the intrinsic
-section. If even one predicate references a dynamic attribute (`span.http.method`), the
-executor must read blocks anyway. Checking "intrinsic-only" is a single gate that avoids
-partial evaluation.
-
-**Why is Phase 3b deferred?**
-
-Phase 3b (exact row-level pruning via column blobs) requires: (a) reading column blobs from
-S3, (b) binary search or dict lookup for predicate matching, and (c) mapping matched rows
-back to block indices. This is non-trivial and should be benchmarked against the existing
-planner before being enabled. The Phase 3 stub establishes the API without blocking the
-rest of the feature.
-
-**`resource.service.name` as "practically intrinsic":**
-
-The service name is stored as an OTLP resource attribute, but in practice every span has
-one. Including it in `traceIntrinsicColumns` enables common "filter by service" queries
-to be classified as intrinsic-only, making them eligible for Phase 3b pruning.
-
-**Files changed:** `internal/modules/executor/predicates.go` (new functions + maps),
-`internal/modules/executor/intrinsic_pruning_test.go` (new tests).
+Back-ref: `internal/modules/executor/plan_blocks.go:planBlocks`,
+`internal/modules/executor/stream.go:Collect`,
+`internal/modules/executor/metrics_trace.go:ExecuteTraceMetrics`,
+`internal/modules/executor/metrics_log.go:ExecuteLogMetrics`,
+`internal/modules/executor/stream_log.go:StreamLogs`,
+`internal/modules/executor/stream_log_topk.go:CollectLogs`

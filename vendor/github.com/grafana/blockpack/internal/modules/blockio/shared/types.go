@@ -84,13 +84,13 @@ type BlockRef struct {
 // IntrinsicColumn is the decoded result of reading one intrinsic column blob.
 // Returned by GetIntrinsicColumn on a Reader.
 type IntrinsicColumn struct {
+	Name string
 	// For flat columns (IntrinsicFormatFlat):
 	Uint64Values []uint64   // non-nil for ColumnTypeUint64
 	BytesValues  [][]byte   // non-nil for ColumnTypeBytes
 	BlockRefs    []BlockRef // parallel to Uint64Values / BytesValues
 	// For dict columns (IntrinsicFormatDict):
 	DictEntries []IntrinsicDictEntry
-	Name        string
 	Count       uint32
 	Type        ColumnType
 	Format      uint8
@@ -98,9 +98,9 @@ type IntrinsicColumn struct {
 
 // IntrinsicDictEntry is one entry in a decoded dictionary intrinsic column.
 type IntrinsicDictEntry struct {
-	BlockRefs []BlockRef
 	Value     string // string representation (for Int64: decimal string)
-	Int64Val  int64  // set for Int64 type
+	BlockRefs []BlockRef
+	Int64Val  int64 // set for Int64 type
 }
 
 // PageMeta describes one page in a paged (v2) intrinsic column.
@@ -122,7 +122,7 @@ type PagedIntrinsicTOC struct {
 	Pages         []PageMeta
 	BlockIdxWidth uint8
 	RowIdxWidth   uint8
-	Format        uint8      // IntrinsicFormatFlat or IntrinsicFormatDict
+	Format        uint8 // IntrinsicFormatFlat or IntrinsicFormatDict
 	ColType       ColumnType
 }
 

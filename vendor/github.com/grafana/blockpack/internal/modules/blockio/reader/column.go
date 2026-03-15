@@ -356,9 +356,7 @@ func decodeDictBody(dictBytes []byte, col *Column, ctx *decodeCtx) error {
 				return fmt.Errorf("dict body(int64): short at entry")
 			}
 
-			v := int64(
-				binary.LittleEndian.Uint64(dictBytes[pos:]),
-			) //nolint:gosec // safe: reinterpreting serialized int64 bits
+			v := int64(binary.LittleEndian.Uint64(dictBytes[pos:])) //nolint:gosec
 			pos += 8
 			col.Int64Dict = append(col.Int64Dict, v)
 		}
@@ -1146,9 +1144,7 @@ func decodeDeltaDictionary(data []byte, kind uint8, spanCount int, ctx *decodeCt
 	switch kind {
 	case 12: // dense
 		for i := range rowCount {
-			delta := int32(
-				binary.LittleEndian.Uint32(deltaBytes[i*4:]),
-			) //nolint:gosec // safe: delta dict index bounded by dictSize check below
+			delta := int32(binary.LittleEndian.Uint32(deltaBytes[i*4:])) //nolint:gosec
 			prev += delta
 			if prev < 0 || int(prev) >= dictSize {
 				return nil, fmt.Errorf(
@@ -1171,9 +1167,7 @@ func decodeDeltaDictionary(data []byte, kind uint8, spanCount int, ctx *decodeCt
 				break
 			}
 
-			delta := int32(
-				binary.LittleEndian.Uint32(deltaBytes[si*4:]),
-			) //nolint:gosec // safe: delta dict index bounded by dictSize check below
+			delta := int32(binary.LittleEndian.Uint32(deltaBytes[si*4:])) //nolint:gosec
 			prev += delta
 			if prev < 0 || int(prev) >= dictSize {
 				return nil, fmt.Errorf(

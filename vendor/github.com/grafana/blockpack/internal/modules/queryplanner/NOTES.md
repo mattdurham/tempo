@@ -149,11 +149,10 @@ distinct service names:
 - Without range pruning: all 100 blocks pass (service.name is present everywhere)
 - Range pruning: only the ~1-2 blocks whose range bucket includes "auth" are selected
 
-**OR composite pruning (updated 2026-03-06):** OR composites now carry per-child
-`Values` and use nil-skip semantics in `blockSetForPred`. Unconstrained (unindexed)
-children are skipped rather than making the entire OR unconstrained. This is safe
-because unindexed columns represent scopes with no data in the file — the row-level
-`ColumnPredicate` remains authoritative. See NOTE-012 for the full safety proof.
+**OR composite pruning (updated 2026-03-14):** OR composites carry per-child `Values`.
+In `blockSetForPred`, if any OR child is unconstrained (nil), the entire OR returns nil —
+no blocks can be pruned when any alternative is unindexed. Only when all children are
+indexed does the OR return a union of their block sets. See NOTE-012.
 
 ---
 
@@ -228,9 +227,8 @@ the condition was `!AND && !OR` (union semantics) instead of `!AND || !OR` (inte
 - The top-level `[]Predicate` passed to `Plan` is implicitly AND-combined.
 
 **Correctness properties preserved:**
-- OR nil-skip semantics: unconstrained OR children (no range index) are skipped rather
-  than making the whole OR unconstrained. Only when ALL children are unconstrained does
-  the OR node return nil. See NOTE-012 for the full rationale and safety proof.
+- OR nil-return semantics: if any OR child is unconstrained (no range index), the entire
+  OR returns nil. The AND layer then skips it conservatively. See NOTE-012.
 - AND-conservative: unconstrained AND children are skipped; the AND node only prunes
   based on what the range index can actually determine.
 - No false negatives: range index is conservative by construction.
@@ -245,42 +243,25 @@ the condition was `!AND && !OR` (union semantics) instead of `!AND || !OR` (inte
 
 ---
 
-## NOTE-012: OR Node Nil-Skip Semantics — Skip Unconstrained Children, Not Whole OR
-*Added: 2026-03-06*
+## NOTE-012: OR Node Nil-Skip Semantics — Unconstrained Children Skipped
+*Added: 2026-03-06; verified correct 2026-03-14*
 
-**Decision:** In `blockSetForPred`, the `LogicalOR` branch skips nil (unconstrained)
-children rather than returning nil for the entire OR node when any child is unconstrained.
+**Decision:** In `blockSetForPred`, `LogicalOR` children that return nil (unconstrained)
+are skipped. The OR returns the union of constrained children's block sets. The OR returns
+nil only when ALL children are unconstrained.
 
-**Previous behaviour:** If any OR child had no range index (returned nil), the entire OR
-node returned nil — treating the OR as fully unconstrained. This was correct for OR queries
-where each arm is a distinct user-written condition (e.g. `{ .env = "prod" || .region = "us" }`),
-because a block satisfying the unconstrained arm might match anything.
+**Safety proof:** The writer builds a range index entry for every column present in any
+block (via `colMinMax` → `addBlockRangeToColumn`). A column with no range index entry is
+therefore absent from the file entirely — no block can contain data for that scope. Skipping
+a nil OR child is safe because no block can satisfy a predicate on an absent column.
 
-**Problem with the RangeNode redesign:** The TraceQL/LogQL compilers now expand every
-unscoped attribute predicate (e.g. `.service.name = "auth"`) into an OR composite:
-`{IsOR:true, Children:[resource.service.name, span.service.name, log.service.name]}`.
-For log-signal files, `span.service.name` has no range index (logs don't have spans), so
-the old logic returned nil for the entire OR — nullifying the range-index pruning that
-`resource.service.name` could provide.
+**Example:** Unscoped `.service.name="auth"` expands to `OR(resource.service.name,
+span.service.name, log.service.name)`. On a trace-only file, `log.service.name` has no
+range index (absent from file). Nil-skip means the OR prunes using `resource.service.name`
+and `span.service.name` — correct and efficient.
 
-**New behaviour:** OR children that return nil are skipped. The OR node returns nil only
-when ALL children are unconstrained. When at least one child IS constrained, its block set
-forms the basis of the union. This is still sound:
-- The pruned blocks are a superset of those the constrained child alone would keep.
-- No block that satisfies ANY OR arm is pruned (the union includes all constrained arms'
-  blocks; unconstrained arms contribute no pruning, so their blocks remain in candidates).
-
-**Safety proof:** Let `S_c` = blocks returned by constrained child c. A block B is pruned
-iff it's absent from the union ∪S_c. If B could satisfy an unconstrained child, B was
-never in the constrained children's sets and thus cannot be pruned by them. If B is in ∪S_c,
-it's kept. No false negatives.
-
-**Unstated invariant that makes this sound:** The writer stores every `ColumnTypeString`
-attribute as a `ColumnTypeRangeString` range column. A column with no range index is
-therefore absent from the file entirely — no row can match via that scope. This means an
-unconstrained OR child (nil from `leafBlockSet`) truly represents "no data in this scope",
-not "data exists but is unindexed". Without this invariant, skipping nil children would
-risk false negatives (pruning a block that has unindexed matching data).
+**When all OR children are indexed:** The union of their block sets is the result — a block
+is pruned only if it satisfies none of the OR alternatives.
 
 **Back-ref:** `internal/modules/queryplanner/selection.go:blockSetForPred` (LogicalOR branch)
 

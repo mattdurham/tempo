@@ -1,14 +1,6 @@
 // Package vm provides virtual machine execution for query evaluation.
 package vm
 
-import (
-	"regexp"
-)
-
-// InstructionFunc is a closure that executes a single bytecode instruction
-// It returns the next instruction index to execute
-type InstructionFunc func(vm *VM) int
-
 // Value represents a runtime value in the VM
 type Value struct {
 	Data interface{} // int64, float64, string, bool, []byte, []Value, or nil
@@ -91,23 +83,10 @@ type QueryPredicates struct {
 
 // Program represents a compiled TraceQL or SQL expression
 type Program struct {
-	// === Closure-based Execution (SQL) ===
 	// ColumnPredicate filters rows using bulk column scans (fast)
 	ColumnPredicate          ColumnPredicate          // Direct column-scan execution closure for WHERE clause
 	StreamingColumnPredicate StreamingColumnPredicate // Streaming version for aggregation (avoids RowSet)
 	Predicates               *QueryPredicates         // Extracted predicates for block-level pruning
 
 	OriginalQuery string // Original TraceQL query (optional, for debugging)
-
-	// === VM Bytecode Execution (TraceQL) ===
-	Instructions []InstructionFunc // Closure for each instruction
-	Constants    []Value           // Constant pool
-	Attributes   []string          // Attribute names for lookups
-	Regexes      []*RegexCache     // Compiled regexes for =~ and !~
-}
-
-// RegexCache holds a compiled regex pattern
-type RegexCache struct {
-	Regex   *regexp.Regexp // Nil until lazily compiled
-	Pattern string
 }

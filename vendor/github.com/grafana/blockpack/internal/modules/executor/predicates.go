@@ -454,7 +454,7 @@ func isNumericColType(ct modules_shared.ColumnType) bool {
 // For numeric columns, treats the 8-byte LE encoding as uint64 bits.
 // For string columns, returns (0, maxUint64, true) since string comparison
 // is handled separately. Returns (0, 0, false) if decoding fails.
-func decodeTOCRange(meta modules_shared.IntrinsicColMeta, isNumeric bool) (min, max uint64, ok bool) {
+func decodeTOCRange(meta modules_shared.IntrinsicColMeta, isNumeric bool) (lo, hi uint64, ok bool) {
 	if !isNumeric {
 		// String columns: caller uses string comparison — return sentinel values.
 		return 0, ^uint64(0), true
@@ -511,6 +511,9 @@ func intrinsicDictMatches(col *modules_shared.IntrinsicColumn, leaf vm.RangeNode
 	blockSet := make(map[int]struct{})
 	for _, entry := range col.DictEntries {
 		var match bool
+		// Dict entries use Value=="" to signal int64 type (wire format stores int64 with vLen=0).
+		// Empty-string string values cannot reach here — dict columns are typed, so a string-typed
+		// column never produces entries with Value=="" (the encoder writes vLen>0 for empty strings).
 		if entry.Value != "" {
 			_, match = wantStr[entry.Value]
 		} else {
@@ -687,17 +690,17 @@ func allBlockBitset(n int) blockBitset {
 	}
 	// Clear trailing bits in the last word that are beyond n-1.
 	if rem := n % 64; rem != 0 {
-		b[words-1] = (uint64(1) << uint(rem)) - 1
+		b[words-1] = (uint64(1) << uint(rem)) - 1 //nolint:gosec // safe: rem = n%64, always in [1,63]
 	}
 	return b
 }
 
 func (b blockBitset) set(i int) {
-	b[i/64] |= 1 << uint(i%64)
+	b[i/64] |= 1 << uint(i%64) //nolint:gosec // safe: i%64 always in [0,63]
 }
 
 func (b blockBitset) test(i int) bool {
-	return b[i/64]>>uint(i%64)&1 != 0
+	return b[i/64]>>uint(i%64)&1 != 0 //nolint:gosec // safe: i%64 always in [0,63]
 }
 
 func (b blockBitset) count() int {
@@ -1125,12 +1128,15 @@ func encodeValue(v vm.Value, colType modules_shared.ColumnType) (string, bool) {
 //
 // Returns nil when:
 //   - The file has no intrinsic section
-//   - The query is not intrinsic-only (references non-intrinsic columns)
 //   - No intrinsic predicate leaves are found
 //   - Any predicate leaf cannot be evaluated from intrinsic data
 //
+// Note: this function does NOT check whether the program is intrinsic-only.
+// Callers must verify that separately (see ProgramIsIntrinsicOnly).
+//
 // For AND predicates, refs are intersected across leaves (most-selective first).
-// The returned slice contains at most limit entries, sorted by BlockIdx then RowIdx.
+// The returned slice contains at most limit entries in predicate-scan order (not
+// necessarily sorted by BlockIdx). Callers that need block order must sort explicitly.
 func BlockRefsFromIntrinsicTOC(r *modules_reader.Reader, program *vm.Program, limit int) []modules_shared.BlockRef {
 	if !r.HasIntrinsicSection() || program == nil || program.Predicates == nil {
 		return nil
@@ -1329,7 +1335,11 @@ func scanIntrinsicLeafRefs(
 
 // intrinsicFlatMatchRefs returns up to max BlockRefs from a flat (uint64-sorted) column
 // matching the predicate range. Returns nil when the predicate cannot be evaluated.
-func intrinsicFlatMatchRefs(col *modules_shared.IntrinsicColumn, leaf vm.RangeNode, max int) []modules_shared.BlockRef {
+func intrinsicFlatMatchRefs(
+	col *modules_shared.IntrinsicColumn,
+	leaf vm.RangeNode,
+	limit int,
+) []modules_shared.BlockRef {
 	if len(col.Uint64Values) == 0 {
 		return nil // bytes flat column — not range-searchable
 	}
@@ -1349,7 +1359,7 @@ func intrinsicFlatMatchRefs(col *modules_shared.IntrinsicColumn, leaf vm.RangeNo
 			i := sortSearchUint64(vals, target)
 			for i < len(vals) && vals[i] == target {
 				result = append(result, col.BlockRefs[i])
-				if max > 0 && len(result) >= max {
+				if limit > 0 && len(result) >= limit {
 					return result
 				}
 				i++
@@ -1386,8 +1396,8 @@ func intrinsicFlatMatchRefs(col *modules_shared.IntrinsicColumn, leaf vm.RangeNo
 		return []modules_shared.BlockRef{} // no matches but evaluable
 	}
 	count := end - start
-	if max > 0 && count > max {
-		count = max
+	if limit > 0 && count > limit {
+		count = limit
 	}
 	result := make([]modules_shared.BlockRef, count)
 	copy(result, col.BlockRefs[start:start+count])

@@ -122,23 +122,15 @@ func topKScanRows(
 // Unlike Collect, which stops at the first opts.Limit rows encountered, CollectTopK
 // guarantees the returned rows are the globally top-Limit entries by timestamp.
 // A min-heap (Backward) or max-heap (Forward) of size opts.Limit is maintained;
-// incoming rows replace the worst entry when they are a better fit.
+// CollectTopK is a compatibility shim that delegates to Collect.
+// Timestamp-sorted top-K collection is now handled inside Collect: when
+// TimestampColumn and Limit are both set, Collect uses a heap-based scan
+// to guarantee globally correct top-K results.
 //
-// Block-level early termination: once the heap is full, blocks whose entire
-// timestamp range cannot contain a better entry than the heap root are skipped
-// (no I/O, no parsing). For Backward: blocks with MaxStart <= heap.min are skipped.
-// For Forward: blocks with MinStart >= heap.max are skipped.
-//
-// When opts.Limit == 0, delegates to Collect (no buffering needed).
-// Requires opts.TimestampColumn to be set; returns an error otherwise.
+// Callers should prefer Collect directly. CollectTopK remains for backward compatibility.
 //
 // SPEC-STREAM-7: CollectTopK guarantees global top-K correctness.
 // Back-ref: internal/modules/executor/stream_topk.go:CollectTopK
-// CollectTopK is a compatibility shim. Timestamp-sorted top-K collection is now
-// handled inside Collect: when TimestampColumn and Limit are both set, Collect uses
-// a heap-based scan to guarantee globally correct top-K results.
-//
-// Callers should prefer Collect directly. CollectTopK remains for backward compatibility.
 func (e *Executor) CollectTopK(
 	r *modules_reader.Reader,
 	program *vm.Program,

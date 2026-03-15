@@ -161,10 +161,8 @@ func writeSketchIndexSection(sketchIdx []blockSketchSet) ([]byte, error) {
 				fp := sketch.HashForFuse(e.Key)
 				binary.LittleEndian.PutUint64(tmp8[:], fp)
 				buf = append(buf, tmp8[:]...)
-				binary.LittleEndian.PutUint16(
-					tmp2[:],
-					uint16(e.Count),
-				) //nolint:gosec // truncated to uint16 — counts > 65535 lose precision but never cause false negatives in scoring
+				uint16Count := uint16(e.Count) //nolint:gosec
+				binary.LittleEndian.PutUint16(tmp2[:], uint16Count)
 				buf = append(buf, tmp2[:]...)
 			}
 		}

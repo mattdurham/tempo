@@ -10,6 +10,14 @@ const (
 	VersionV10 uint8 = 10
 	VersionV11 uint8 = 11
 	VersionV12 uint8 = 12 // V12: snappy-compressed metadata section + extended header with signal_type byte at offset 21
+	VersionV13 uint8 = 13 // V13: block index omits MinTraceID[16]+MaxTraceID[16] per entry (saves 32 bytes/block)
+
+	// VersionBlockV12 is the block-content format version written into each block's 24-byte
+	// header starting with file version V13. It eliminates the 16-byte stats_offset/stats_len
+	// stub fields from column metadata entries (saves 16 bytes per column per block).
+	// Earlier files use VersionV11 blocks; the reader detects the block header version and
+	// applies version-aware parsing.
+	VersionBlockV12 uint8 = 12
 
 	SignalTypeTrace uint8 = 0x01 // file contains OTEL trace spans
 	SignalTypeLog   uint8 = 0x02 // file contains OTEL log records

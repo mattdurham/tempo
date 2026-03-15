@@ -140,12 +140,6 @@ func (b *blockpackBlock) newReader() (*blockpack.Reader, error) {
 	return blockpack.NewReaderWithCache(b.newReaderProvider(), fileID, getFileCache())
 }
 
-// newLeanReader creates a lean Reader (2 I/Os: footer + compact index) with disk caching.
-// Ideal for FindTraceByID.
-func (b *blockpackBlock) newLeanReader() (*blockpack.Reader, error) {
-	fileID := b.meta.TenantID + "/" + b.meta.BlockID.String()
-	return blockpack.NewLeanReaderWithCache(b.newReaderProvider(), fileID, getFileCache())
-}
 
 // executeQuery creates a reader and executes a TraceQL query, returning all matching spans.
 func (b *blockpackBlock) executeQuery(query string, opts blockpack.QueryOptions) ([]blockpack.SpanMatch, error) {
@@ -161,13 +155,13 @@ func (b *blockpackBlock) BlockMeta() *backend.BlockMeta {
 	return b.meta
 }
 
-// FindTraceByID finds a trace by ID using blockpack's lean reader for minimal I/O.
+// FindTraceByID finds a trace by ID.
 func (b *blockpackBlock) FindTraceByID(_ context.Context, id common.ID, _ common.SearchOptions) (*tempopb.TraceByIDResponse, error) {
 	if len(id) != 16 {
 		return nil, fmt.Errorf("trace ID must be 16 bytes, got %d", len(id))
 	}
 
-	r, err := b.newLeanReader()
+	r, err := b.newReader()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create blockpack reader: %w", err)
 	}

@@ -825,53 +825,125 @@ Query: `{ } | histogram_over_time(span.duration) by (span.env, span.region)`.
 
 ---
 
-## Phase 3: Intrinsic-Guided Pruning Tests
+## EX-ST-10: TestExecuteStructural_NotDescendant
 
-### SPEC-IC-1: TestProgramIsIntrinsicOnly
+**Scenario:** `!>>` returns only rightMatch spans with no leftMatch ancestor (SPEC-STRUCT-6).
 
-**Scenario:** Detection of intrinsic-only vs mixed-attribute programs.
-
-**Test file:** `executor/intrinsic_pruning_test.go`
-
-**Cases:**
-| Query | Expected |
-|-------|----------|
-| `{ span:duration > 100ms }` | true |
-| `{ span:name = "foo" }` | true |
-| `{ span:kind = server }` | true |
-| `{ span.http.method = "GET" }` | false (dynamic attr) |
-| `{ resource.service.name = "svc" }` | true (practically intrinsic) |
-| `{ span:duration > 100ms && span.http.method = "GET" }` | false (mixed) |
-
----
-
-### SPEC-IC-2: TestIntrinsicOnlyQueryPrunesBlocks
-
-**Scenario:** Query on span:duration against a 2-block file with distinct duration ranges.
-
-**Setup:** Write file with 6 spans: blocks 0 (durations 100/200/300 ns) and block 1
-(durations 1000/2000/3000 ns). Query: `{ span:duration > 500 }`.
+**Setup:** Standard 4-span trace (root→child1→grandchild, root→child2).
+Query: `{ name = "root-op" } !>> {}`.
+All 4 spans are rightMatch (wildcard). Root has no ancestors → passes.
+child1, child2, grandchild all have root in their ancestor chain → excluded.
 
 **Assertions:**
-- `Collect` returns exactly 3 rows (all from block 1).
+- `len(result.Matches) == 1`
+- root (spanID 0xAA) is present
+- child1 (0xBB), child2 (0xDD), grandchild (0xCC) are absent
 
 ---
 
-### SPEC-IC-3: TestBlocksFromIntrinsicTOC_NoSection
+## EX-ST-11: TestExecuteStructural_NotChild
 
-**Scenario:** Stub returns nil regardless of intrinsic section presence.
+**Scenario:** `!>` returns rightMatch spans whose direct parent is NOT leftMatch, or spans
+with no parent (SPEC-STRUCT-7).
 
-**Setup:** Write file with v4 footer (has intrinsic section). Call `BlocksFromIntrinsicTOC`
-with an intrinsic-only program.
+**Setup:** Standard 4-span trace. Query: `{ name = "root-op" } !> {}`.
+root has no parent → passes. child1/child2 have parent=root (leftMatch) → excluded.
+grandchild has parent=child1 (not leftMatch) → passes.
 
-**Assertions:** Returns nil (Phase 3 stub — TOC-based pruning not yet implemented).
+**Assertions:**
+- `len(result.Matches) == 2`
+- root (0xAA) and grandchild (0xCC) are present
+- child1 (0xBB) and child2 (0xDD) are absent
 
 ---
 
-### SPEC-IC-4: TestBlocksFromIntrinsicTOC_NonIntrinsicQuery
+## EX-PA-01: TestQueryTraceQL_PipelineCount
 
-**Scenario:** Stub returns nil for non-intrinsic-only programs.
+**Scenario:** `| count()` with no threshold emits all spans from every spanset (SPEC-PA-3, SPEC-PA-6).
 
-**Setup:** Write file. Call `BlocksFromIntrinsicTOC` with `{ span.http.method = "GET" }`.
+**Setup:** 3 spans in the same trace, `resource.service.name = "test-svc"`.
+Query: `{ resource.service.name = "test-svc" } | count()`.
 
-**Assertions:** Returns nil (non-intrinsic query never uses intrinsic pruning).
+**Assertions:** 3 spans returned.
+
+---
+
+## EX-PA-02: TestQueryTraceQL_PipelineAvg
+
+**Scenario:** `| avg(span.latency_ms)` without threshold emits all spans (SPEC-PA-1, SPEC-PA-6).
+
+**Setup:** 3 spans with latency_ms = 10, 20, 30 (int64). Same trace.
+Query: `{ span.latency_ms > 0 } | avg(span.latency_ms)`.
+Note: aggregate field must appear in filter predicate to be loaded into wantColumns.
+
+**Assertions:** 3 spans returned (avg=20.0, no threshold → passes).
+
+---
+
+## EX-PA-03: TestQueryTraceQL_PipelineMin
+
+**Scenario:** `| min(span.latency_ms) > 15` keeps only qualifying spansets (SPEC-PA-1).
+
+**Setup:** trace-A: latency_ms=5,25 (min=5 → fails); trace-B: latency_ms=20,30 (min=20 → passes).
+Query: `{ span.latency_ms > 0 } | min(span.latency_ms) > 15`.
+
+**Assertions:** 2 spans returned (trace-B only).
+
+---
+
+## EX-PA-04: TestQueryTraceQL_PipelineMax
+
+**Scenario:** `| max(span.latency_ms) < 50` keeps only qualifying spansets (SPEC-PA-1).
+
+**Setup:** trace-A: latency_ms=10,80 (max=80 → fails); trace-B: latency_ms=10,40 (max=40 → passes).
+Query: `{ span.latency_ms > 0 } | max(span.latency_ms) < 50`.
+
+**Assertions:** 2 spans returned (trace-B only).
+
+---
+
+## EX-PA-05: TestQueryTraceQL_PipelineThreshold
+
+**Scenario:** `| count() > N` filters traces by span count (SPEC-PA-3).
+
+**Setup:** trace-A: 2 spans; trace-B: 5 spans. Query: `{ resource.service.name = "test-svc" } | count() > 3`.
+
+**Assertions:** 5 spans returned (trace-B only).
+
+---
+
+## EX-PA-06: TestQueryTraceQL_PipelineNoMatchingField
+
+**Scenario:** avg over non-existent field → all spansets skipped (SPEC-PA-2).
+
+**Setup:** 3 spans with `resource.service.name = "test-svc"` and NO `latency_ms` attribute.
+Query: `{ resource.service.name = "test-svc" } | avg(span.latency_ms)`.
+
+**Note:** Two invariants combine to produce 0 results here: (1) SPEC-PA-1 — because
+`span.latency_ms` does not appear in the filter predicate, it is not loaded into
+`wantColumns` and `getSpanFieldNumeric` finds no values; (2) SPEC-PA-2 — even if the
+column were loaded, it is absent from the data. Both invariants contribute to the zero
+result. This test primarily demonstrates the interaction between SPEC-PA-1 and SPEC-PA-2.
+
+**Assertions:** 0 spans returned.
+
+---
+
+## EX-PA-07: TestQueryTraceQL_PipelineNoAggregate
+
+**Scenario:** Pipeline with no aggregate emits all filtered spans (SPEC-PA-7).
+
+**Setup:** 3 spans. Query: `{ resource.service.name = "test-svc" } | by(resource.service.name)`.
+
+**Assertions:** 3 spans returned.
+
+---
+
+## EX-PA-08: TestQueryTraceQL_PipelineSum
+
+**Scenario:** `| sum(span.latency_ms)` without threshold emits all spans (SPEC-PA-1, SPEC-PA-6).
+
+**Setup:** 3 spans with latency_ms = 10, 20, 30 (int64). Same trace.
+Query: `{ span.latency_ms > 0 } | sum(span.latency_ms)`.
+
+**Assertions:** 3 spans returned (sum=60.0, HasThreshold=false, spanset passes).
