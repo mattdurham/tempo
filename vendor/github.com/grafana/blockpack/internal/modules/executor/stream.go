@@ -14,8 +14,8 @@ import (
 	"github.com/grafana/blockpack/internal/vm"
 )
 
-// errNeedBlockScan is returned by collectIntrinsicPlain and collectIntrinsicTopK when the
-// intrinsic fast path is not applicable and the caller should fall through to a full block scan.
+// errNeedBlockScan is returned by collectFromIntrinsicRefs and collectTopKFromIntrinsicRefs
+// when the intrinsic fast path is not applicable and the caller should fall through to a full block scan.
 // NOTE-039: sentinel error for fallback from intrinsic to block scan.
 var errNeedBlockScan = errors.New("intrinsic fast path not applicable")
 
@@ -504,9 +504,11 @@ func intersectSortedKeys(a, b []uint32) []uint32 {
 // returning sorted packed keys (blockIdx<<16 | rowIdx).
 // Returns (keys, true) when evaluable; (nil, false) when not.
 // OR: union all children; fail if any child is not evaluable.
-// AND: intersect evaluable children; skip unevaluable (conservative over-fetch).
+// AND: intersect all children; fail if any child is not evaluable.
 //
 // NOTE-039: mirrors evalNodeBlockRefs but works with sorted []uint32 keys for binary search.
+// Both AND and OR must fail fast on unevaluable children because the keys are used as a
+// definitive match set (no VM re-evaluation after collectTopKFromIntrinsicRefs).
 func evalNodeMatchKeys(r *modules_reader.Reader, node vm.RangeNode) ([]uint32, bool) {
 	// Leaf node.
 	if len(node.Children) == 0 {
@@ -545,13 +547,15 @@ func evalNodeMatchKeys(r *modules_reader.Reader, node vm.RangeNode) ([]uint32, b
 		return union, true
 	}
 
-	// AND: intersect — skip unevaluable children (conservative over-fetch).
+	// AND: intersect — all children must be evaluable.
+	// Keys are used as a definitive match set without VM re-evaluation, so skipping
+	// any child would return rows that do not satisfy the full predicate.
 	var result []uint32
 	hasResult := false
 	for _, child := range node.Children {
 		childKeys, ok := evalNodeMatchKeys(r, child)
 		if !ok {
-			continue // skip unevaluable — conservative
+			return nil, false // any unevaluable child makes AND unevaluable
 		}
 		if !hasResult {
 			result = childKeys
@@ -561,7 +565,7 @@ func evalNodeMatchKeys(r *modules_reader.Reader, node vm.RangeNode) ([]uint32, b
 		}
 	}
 	if !hasResult {
-		return nil, false // no evaluable children
+		return nil, false
 	}
 	return result, true
 }
