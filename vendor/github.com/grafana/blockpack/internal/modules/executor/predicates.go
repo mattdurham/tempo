@@ -497,12 +497,13 @@ func intrinsicDictMatches(col *modules_shared.IntrinsicColumn, leaf vm.RangeNode
 		}
 		blockSet := make(map[int]struct{})
 		for _, entry := range col.DictEntries {
-			var match bool
-			if entry.Value != "" {
-				match = re.MatchString(entry.Value)
+			// Dict entries use Value=="" to signal int64 type (wire format stores int64
+			// with vLen=0; the encoder writes vLen>0 even for empty strings in string
+			// columns). Int64 entries are not string-matchable — skip them.
+			if entry.Value == "" {
+				continue
 			}
-			// Int64 dict entries are not string-matchable; skip.
-			if !match {
+			if !re.MatchString(entry.Value) {
 				continue
 			}
 			for _, ref := range entry.BlockRefs {
@@ -1206,11 +1207,13 @@ func intersectBlockRefSets(sets [][]modules_shared.BlockRef, limit int) []module
 		return sets[0]
 	}
 
-	// Sort sets by size ascending — intersect from smallest.
+	// Intersect: start from smallest set, check membership in others.
+	// Sort sets by size ascending for efficiency.
 	slices.SortFunc(sets, func(a, b []modules_shared.BlockRef) int {
 		return len(a) - len(b)
 	})
 
+	// Build lookup sets for all but the first (smallest).
 	type refKey struct{ blockIdx, rowIdx uint16 }
 	lookups := make([]map[refKey]struct{}, len(sets)-1)
 	for i, s := range sets[1:] {
@@ -1244,11 +1247,11 @@ func intersectBlockRefSets(sets [][]modules_shared.BlockRef, limit int) []module
 // evalNodeBlockRefs recursively evaluates a RangeNode tree against intrinsic column blobs.
 // Returns (refs, true) when the node is fully evaluable; (nil, false) when not.
 // OR nodes: union all children refs; fail if any child is not evaluable.
-// AND nodes: intersect evaluable children refs; skip unevaluable children (conservative over-fetch).
+// AND nodes: intersect all children refs; fail if any child is not evaluable.
 //
-// NOTE-039: recursive OR/AND evaluation for intrinsic fast path. OR support requires all
-// children to be evaluable — if any child returns (nil, false), the OR itself is not
-// evaluable (we cannot union partial results without potentially missing matches).
+// NOTE-039: recursive OR/AND evaluation for intrinsic fast path. Both OR and AND must
+// fail fast on unevaluable children because refs are returned directly as results without
+// VM re-evaluation — skipping any child would return rows that don't satisfy the full predicate.
 func evalNodeBlockRefs(
 	r *modules_reader.Reader,
 	node vm.RangeNode,
@@ -1283,17 +1286,19 @@ func evalNodeBlockRefs(
 		return union, true
 	}
 
-	// AND: intersect — skip unevaluable children (conservative over-fetch).
+	// AND: intersect — all children must be evaluable.
+	// Refs are returned directly as results without VM re-evaluation, so skipping
+	// any child would return rows that do not satisfy the full predicate.
 	var evaluableSets [][]modules_shared.BlockRef
 	for _, child := range node.Children {
 		childRefs, ok := evalNodeBlockRefs(r, child, overFetch)
 		if !ok {
-			continue // skip unevaluable — conservative: may over-fetch
+			return nil, false // any unevaluable child makes AND unevaluable
 		}
 		evaluableSets = append(evaluableSets, childRefs)
 	}
 	if len(evaluableSets) == 0 {
-		return nil, false // no evaluable children
+		return nil, false
 	}
 	return intersectBlockRefSets(evaluableSets, overFetch), true
 }

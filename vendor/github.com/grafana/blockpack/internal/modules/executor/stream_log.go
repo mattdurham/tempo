@@ -14,19 +14,34 @@ import (
 	"github.com/grafana/blockpack/internal/vm"
 )
 
+// LogAttrs holds log.* ColumnTypeString column values collected for a single log row.
+// Names and Values are parallel slices; Names[i] is the full column name (e.g.
+// "log.detected_level") and Values[i] is the corresponding string value.
+// Both slices are nil when no log.* attributes are present for the row.
+type LogAttrs struct {
+	Names  []string
+	Values []string
+}
+
+// Len returns the number of log.* attributes.
+func (a LogAttrs) Len() int { return len(a.Names) }
+
 // LogEntry is one matched log row returned by StreamLogs.
-// SPEC-SL-3: Labels are built lazily from resource.* and log.* columns with prefixes stripped.
-// SPEC-SL-5: Pipeline.Process is called per matched row; it may mutate an intermediate label
-// set used during evaluation. Labels holds a materialized map snapshot of that set taken
-// after pipeline processing, and is safe to retain after StreamLogs returns.
+// SPEC-SL-5: Pipeline.Process is called per matched row and may drop it.
+// LokiLabels holds the raw value of the resource.__loki_labels__ column (the Loki
+// stream selector string, e.g. `{service_name="api", env="prod"}`). It is the only
+// resource-label field callers need; building a full map[string]string per row was
+// wasteful because consumers only ever read this one key.
 type LogEntry struct {
-	Labels map[string]string
-	// LogAttrs holds log.* ColumnTypeString column values keyed by full column name
-	// (e.g. "log.detected_level"). These are original LogRecord attributes and must be
-	// exposed with the "log." prefix intact so callers (e.g. extractStructuredMetadata)
-	// can distinguish them from pipeline-derived labels. Nil when none present.
-	LogAttrs       map[string]string
-	Line           string
+	// LokiLabels is the value of resource.__loki_labels__ for this row.
+	LokiLabels string
+	Line       string
+	// LogAttrs holds log.* ColumnTypeString column values as parallel name/value slices
+	// (e.g. Names=["log.detected_level"], Values=["info"]). These are original LogRecord
+	// attributes and must be exposed with the "log." prefix intact so callers (e.g.
+	// extractStructuredMetadata) can distinguish them from pipeline-derived labels.
+	// Both slices are nil when none present.
+	LogAttrs       LogAttrs
 	TimestampNanos uint64
 }
 
@@ -42,7 +57,7 @@ func StreamLogs(
 	r *modules_reader.Reader,
 	program *vm.Program,
 	pipeline *logqlparser.Pipeline,
-) ([]*LogEntry, error) {
+) ([]LogEntry, error) {
 	if r == nil {
 		return nil, nil
 	}
@@ -67,7 +82,16 @@ func StreamLogs(
 		return nil, nil
 	}
 
-	var results []*LogEntry
+	// Pre-allocate with a capacity hint: min(totalSpanCount, 4096) to avoid repeated
+	// slice growth copies while not over-allocating for selective queries.
+	var totalRows int
+	for _, blockIdx := range plan.SelectedBlocks {
+		totalRows += int(r.BlockMeta(blockIdx).SpanCount)
+	}
+	if totalRows > 4096 {
+		totalRows = 4096
+	}
+	results := make([]LogEntry, 0, totalRows)
 
 	// Partition selected blocks into ~8 MB coalesced groups for lazy batched I/O.
 	groups := r.CoalescedGroups(plan.SelectedBlocks)
@@ -126,8 +150,7 @@ func StreamLogs(
 		// Cache column pointers for the row loop.
 		tsCol := bwb.Block.GetColumn("log:timestamp")
 		bodyCol := bwb.Block.GetColumn("log:body")
-		colNames, colMap, colCols := buildBlockColMaps(bwb.Block)
-		logStrNames, logStrCols := buildLogStringColCache(bwb.Block)
+		colNames, colMap, colCols, logStrNames, logStrCols := buildBlockColMapsWithLogCache(bwb.Block)
 		skipParsers := pipeline != nil && blockHasBodyParsed(bwb.Block)
 		for _, rowIdx := range rowSet.ToSlice() {
 			var tsNanos uint64
@@ -145,13 +168,12 @@ func StreamLogs(
 
 			// NOTE-SL-016: acquire from pool — zero map allocation for dropped rows.
 			bls := acquireBlockLabelSet(bwb.Block, rowIdx, colNames, colMap, colCols)
-			var labels logqlparser.LabelSet = bls
 			if pipeline != nil {
 				var keep bool
 				if skipParsers {
-					line, labels, keep = pipeline.ProcessSkipParsers(tsNanos, line, bls)
+					line, _, keep = pipeline.ProcessSkipParsers(tsNanos, line, bls)
 				} else {
-					line, labels, keep = pipeline.Process(tsNanos, line, bls)
+					line, _, keep = pipeline.Process(tsNanos, line, bls)
 				}
 				if !keep {
 					releaseBlockLabelSet(bls)
@@ -159,13 +181,14 @@ func StreamLogs(
 				}
 			}
 
+			// Read __loki_labels__ via the post-pipeline LabelSet so that mutations
+			// (drop/keep/label_format) are respected if they affect this field.
+			lokiLabels := bls.Get("__loki_labels__")
 			logAttrs := collectLogStringAttrs(logStrNames, logStrCols, rowIdx)
-			// Materialize to stable map before releasing bls (pool-backed, unsafe to retain).
-			matLabels := labels.Materialize()
 			releaseBlockLabelSet(bls)
 			results = append(
 				results,
-				&LogEntry{TimestampNanos: tsNanos, Line: line, Labels: matLabels, LogAttrs: logAttrs},
+				LogEntry{TimestampNanos: tsNanos, Line: line, LokiLabels: lokiLabels, LogAttrs: logAttrs},
 			)
 		}
 	}

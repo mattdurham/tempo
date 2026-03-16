@@ -947,3 +947,219 @@ result. This test primarily demonstrates the interaction between SPEC-PA-1 and S
 Query: `{ span.latency_ms > 0 } | sum(span.latency_ms)`.
 
 **Assertions:** 3 spans returned (sum=60.0, HasThreshold=false, spanset passes).
+
+---
+
+## EX-CL-01: TestClassifyCollect_IntrinsicTopK
+
+**Scenario:** Intrinsic-only predicate + limit + TimestampColumn set + HasIntrinsicSection
+→ `modeIntrinsicTopK`.
+
+**Setup:** In-memory reader with intrinsic section. Program with intrinsic-only predicate
+(resource.service.name). `opts.Limit=5, opts.TimestampColumn="span:start"`.
+
+**Assertions:** `classifyCollect(r, program, opts) == modeIntrinsicTopK`.
+
+---
+
+## EX-CL-02: TestClassifyCollect_IntrinsicPlain
+
+**Scenario:** Intrinsic-only predicate + limit + no TimestampColumn → `modeIntrinsicPlain`.
+
+**Setup:** Same as EX-CL-01 but `opts.TimestampColumn=""`.
+
+**Assertions:** `classifyCollect(r, program, opts) == modeIntrinsicPlain`.
+
+---
+
+## EX-CL-03: TestClassifyCollect_BlockFallback_NoIntrinsicSection
+
+**Scenario:** Intrinsic-only predicate but file has no intrinsic section → `modeBlockTopK`
+(when TimestampColumn set) or `modeBlockPlain`.
+
+**Setup:** Reader without intrinsic section. Intrinsic-only program.
+`opts.Limit=5, opts.TimestampColumn="span:start"`.
+
+**Assertions:** `classifyCollect(r, program, opts) == modeBlockTopK`.
+
+---
+
+## EX-CL-04: TestClassifyCollect_BlockTopK
+
+**Scenario:** Non-intrinsic predicate + TimestampColumn + Limit → `modeBlockTopK`.
+
+**Setup:** Any reader. Non-intrinsic program (e.g. span attribute filter).
+`opts.Limit=10, opts.TimestampColumn="span:start"`.
+
+**Assertions:** `classifyCollect(r, program, opts) == modeBlockTopK`.
+
+---
+
+## EX-CL-05: TestClassifyCollect_BlockPlain
+
+**Scenario:** Default case → `modeBlockPlain`.
+
+**Setup:** Any reader. Any program. `opts.Limit=0, opts.TimestampColumn=""`.
+
+**Assertions:** `classifyCollect(r, program, opts) == modeBlockPlain`.
+
+---
+
+## EX-CL-06: TestClassifyCollect_ZeroLimitNotIntrinsic
+
+**Scenario:** `opts.Limit == 0` with intrinsic-only program → `modeBlockPlain`.
+Intrinsic fast path only activates when Limit > 0.
+
+**Setup:** Reader with intrinsic section. Intrinsic-only program. `opts.Limit=0`.
+
+**Assertions:** `classifyCollect(r, program, opts) == modeBlockPlain`.
+
+---
+
+## EX-CC-01: TestComputeColumnSets_MatchAll
+
+**Scenario:** A match-all program (no predicates) returns nil for both wantColumns and
+secondPassCols.
+
+**Setup:** `vm.Program` with no `Predicates` field set. `opts = CollectOptions{}`.
+
+**Assertions:** `wantColumns == nil`; `secondPassCols == nil`.
+
+---
+
+## EX-CC-02: TestComputeColumnSets_AllColumns
+
+**Scenario:** `AllColumns=true` sets secondPassCols to nil even when wantColumns is
+non-nil (AllColumns overrides the narrow column set).
+
+**Setup:** Predicate program with `resource.service.name` in nodes. `opts.AllColumns=true`.
+
+**Assertions:** `wantColumns != nil`; `secondPassCols == nil`.
+
+---
+
+## EX-CC-03: TestComputeColumnSets_NarrowColumns
+
+**Scenario:** `AllColumns=false` with a non-nil wantColumns produces
+`secondPassCols = searchMetaColumns ∪ wantColumns`.
+
+**Setup:** Predicate program with `resource.service.name` in nodes. `opts.AllColumns=false`.
+
+**Assertions:** `wantColumns != nil`; `secondPassCols != nil`;
+`secondPassCols` contains all entries from `wantColumns`;
+`secondPassCols` contains all entries from `searchMetaColumns()`.
+
+---
+
+## EX-CL-03b: TestClassifyCollect_NonIntrinsicProgram_BlockTopK
+
+**Scenario:** Non-intrinsic program with TimestampColumn + Limit → `modeBlockTopK`
+(covers the block-mode fallback even when the file has an intrinsic section, because
+the program references a non-intrinsic column).
+
+**Setup:** Reader with intrinsic section. Non-intrinsic program (`span.http.method`).
+`opts.Limit=5, opts.TimestampColumn="span:start"`.
+
+**Assertions:** `classifyCollect(r, program, opts) == modeBlockTopK`.
+
+---
+
+## EX-CL-07: TestClassifyCollect_BlockTopK_NoLimit
+
+**Scenario:** `TimestampColumn` set but `Limit == 0` → `modeBlockPlain`.
+`modeBlockTopK` requires both `TimestampColumn != ""` AND `Limit > 0`.
+
+**Setup:** Any reader. Non-intrinsic program. `opts.Limit=0, opts.TimestampColumn="span:start"`.
+
+**Assertions:** `classifyCollect(r, program, opts) == modeBlockPlain`.
+
+---
+
+## EX-CL-08: TestClassifyCollect_Direction_DoesNotAffectMode
+
+**Scenario:** `Direction=Backward` alone (no TimestampColumn, no Limit) → `modeBlockPlain`.
+Direction is applied at plan time but does not change the collect mode.
+
+**Setup:** Any reader. Non-intrinsic program. `opts.Direction=queryplanner.Backward`.
+No TimestampColumn, no Limit.
+
+**Assertions:** `classifyCollect(r, program, opts) == modeBlockPlain`.
+
+---
+
+## EX-OR-01: TestIntrinsicFastPath_ORPredicateReturnsResults
+*Added: NOTE-039*
+
+**Scenario:** A query with an OR predicate on an intrinsic dict column returns correct results
+via the intrinsic fast path (not zero results due to the old `collectIntrinsicLeaves` skip).
+
+**Setup:** Reader with intrinsic section containing `resource.service.name` dict column with
+at least two distinct values ("A" and "B"). Program with OR predicate:
+`resource.service.name="A" || resource.service.name="B"`. `opts.Limit=100`.
+
+**Assertions:** `Collect` returns all rows where service.name is "A" or "B"; result count
+matches the union of both sets; no `errNeedBlockScan` propagated (fast path succeeds).
+
+---
+
+## EX-OR-02: TestIntrinsicFastPath_RegexDictColumn
+*Added: NOTE-039*
+
+**Scenario:** A regex predicate on an intrinsic dict column returns correct results via the
+intrinsic fast path.
+
+**Setup:** Reader with intrinsic section containing `resource.service.name` dict column.
+Program with regex predicate `resource.service.name=~"loki-.*"`. `opts.Limit=100`.
+
+**Assertions:** `Collect` returns rows whose service.name matches the regex; count matches
+results from an equivalent equality query; no `errNeedBlockScan` propagated.
+
+---
+
+## EX-OR-03: TestIntrinsicFastPath_UnevaluableFallsBackToBlockScan
+*Added: NOTE-039*
+
+**Scenario:** When the intrinsic fast path cannot evaluate a predicate (returns nil from
+`evalNodeBlockRefs`), `collectIntrinsicPlain` returns `errNeedBlockScan` and `Collect`
+falls through to `collectBlockPlain`, producing correct results.
+
+**Setup:** Reader with intrinsic section. Program with a predicate that is not evaluable
+from intrinsic blobs (e.g., a range predicate `span:duration > 1s`). `opts.Limit=10`.
+
+**Assertions:** `Collect` returns the same results as if the mode were `modeBlockPlain`
+from the start; no empty result due to missing fallback.
+
+---
+
+## EX-OR-04: TestEvalNodeBlockRefs_ORUnion
+*Added: NOTE-039*
+
+**Scenario:** `evalNodeBlockRefs` with an OR node correctly unions children's refs.
+
+**Setup:** OR node with two evaluable leaf children, each contributing disjoint BlockRefs.
+
+**Assertions:** Returned refs = union of both children's refs. `ok == true`.
+
+---
+
+## EX-OR-05: TestEvalNodeBlockRefs_ORUnevaluableChild
+*Added: NOTE-039*
+
+**Scenario:** `evalNodeBlockRefs` with an OR node where one child is not evaluable returns
+`(nil, false)`.
+
+**Setup:** OR node with one evaluable leaf and one unevaluable leaf (e.g., range predicate
+on dict column).
+
+**Assertions:** Returns `(nil, false)`. Cannot union partial results.
+
+---
+
+## EX-OR-06: TestEvalNodeMatchKeys_ORUnionSorted
+*Added: NOTE-039*
+
+**Scenario:** `evalNodeMatchKeys` with an OR node correctly unions and sorts children's keys.
+
+**Setup:** OR node with two evaluable leaf children, producing sorted key slices.
+
+**Assertions:** Returned keys = sorted union (merge-dedup) of both children. `ok == true`.

@@ -346,3 +346,61 @@ func buildBlockColMaps(
 
 	return colNames, colMap, colCols
 }
+
+// buildBlockColMapsWithLogCache combines buildBlockColMaps and buildLogStringColCache
+// into a single block.Columns() pass, reducing per-block iteration overhead.
+// logStrNames and logStrCols are the same outputs as buildLogStringColCache.
+func buildBlockColMapsWithLogCache(
+	block *modules_reader.Block,
+) (colNames []string, colMap map[string]int, colCols []*modules_reader.Column, logStrNames []string, logStrCols []*modules_reader.Column) {
+	cols := block.Columns()
+	colNames = make([]string, 0, len(cols))
+	colMap = make(map[string]int, len(cols))
+	colCols = make([]*modules_reader.Column, 0, len(cols))
+
+	type candidate struct {
+		col     *modules_reader.Column
+		colName string
+		colType modules_shared.ColumnType
+	}
+	logCandidates := make(map[string]candidate, len(cols))
+
+	for key, c := range cols {
+		name := key.Name
+		isString := key.Type == modules_shared.ColumnTypeString
+		if after, ok := strings.CutPrefix(name, "resource."); ok {
+			if _, dup := colMap[after]; dup {
+				continue
+			}
+			colMap[after] = len(colNames)
+			colNames = append(colNames, name)
+			colCols = append(colCols, c)
+		} else if after, ok := strings.CutPrefix(name, "log."); ok {
+			// Collect for log string cache (ColumnTypeString and ColumnTypeUUID only;
+			// ColumnTypeRangeString body-auto-parsed columns are intentionally excluded).
+			if key.Type == modules_shared.ColumnTypeString || key.Type == modules_shared.ColumnTypeUUID {
+				logStrNames = append(logStrNames, name)
+				logStrCols = append(logStrCols, c)
+			}
+			// Collect for label map (precedence: ColumnTypeString wins over ColumnTypeRangeString).
+			if prev, exists := logCandidates[after]; exists {
+				prevIsString := prev.colType == modules_shared.ColumnTypeString
+				if prevIsString || !isString {
+					continue
+				}
+			}
+			logCandidates[after] = candidate{colName: name, col: c, colType: key.Type}
+		}
+	}
+
+	for labelName, cand := range logCandidates {
+		if _, covered := colMap[labelName]; covered {
+			continue
+		}
+		colMap[labelName] = len(colNames)
+		colNames = append(colNames, cand.colName)
+		colCols = append(colCols, cand.col)
+	}
+
+	return colNames, colMap, colCols, logStrNames, logStrCols
+}
