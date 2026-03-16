@@ -364,8 +364,10 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 		MostRecent: common.TraceQLMostRecent(ctx),
 		StartNano:  req.StartTimeUnixNanos,
 		EndNano:    req.EndTimeUnixNanos,
-		StartBlock: opts.StartPage,
-		BlockCount: opts.TotalPages,
+		// Do not use StartBlock/BlockCount: Tempo's TotalPages concept maps to parquet
+		// row groups, not blockpack internal blocks. Passing TotalPages=1 as BlockCount
+		// would scan only 1 internal block out of potentially hundreds. Blockpack files
+		// are already one job per file at the Tempo level, so scan all internal blocks.
 	})
 	if fetchErr == nil {
 		for i := range matches {
