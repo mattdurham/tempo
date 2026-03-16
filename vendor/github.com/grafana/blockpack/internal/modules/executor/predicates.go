@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"math"
 	"math/bits"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -480,12 +481,43 @@ func decodeNumericKey(enc string, isNumeric bool) (uint64, bool) {
 }
 
 // intrinsicDictMatches finds all distinct block indices in a dict column that match
-// the predicate leaf. Only exact-equality predicates (Values) are supported; pattern
-// and range predicates return nil (no pruning — fall through to bloom/range).
+// the predicate leaf. Equality predicates (Values) and regex (Pattern) are supported;
+// range predicates (Min/Max with no Values) return nil (no pruning — fall through to bloom/range).
 func intrinsicDictMatches(col *modules_shared.IntrinsicColumn, leaf vm.RangeNode) []int {
-	if len(leaf.Values) == 0 {
-		// Range or pattern on a dict column — not handled; skip pruning.
+	if len(leaf.Values) == 0 && leaf.Pattern == "" {
+		// Range predicate on a dict column — not handled; skip pruning.
 		return nil
+	}
+
+	// Regex predicate: compile and match each dict entry by value.
+	if len(leaf.Values) == 0 && leaf.Pattern != "" {
+		re, err := regexp.Compile(leaf.Pattern)
+		if err != nil {
+			return nil // invalid regex — skip pruning
+		}
+		blockSet := make(map[int]struct{})
+		for _, entry := range col.DictEntries {
+			var match bool
+			if entry.Value != "" {
+				match = re.MatchString(entry.Value)
+			}
+			// Int64 dict entries are not string-matchable; skip.
+			if !match {
+				continue
+			}
+			for _, ref := range entry.BlockRefs {
+				blockSet[int(ref.BlockIdx)] = struct{}{}
+			}
+		}
+		if len(blockSet) == 0 {
+			return []int{} // empty: no blocks match
+		}
+		result := make([]int, 0, len(blockSet))
+		for bi := range blockSet {
+			result = append(result, bi)
+		}
+		slices.Sort(result)
+		return result
 	}
 
 	// Build a set of query values for O(1) lookup.
@@ -1123,58 +1155,47 @@ func encodeValue(v vm.Value, colType modules_shared.ColumnType) (string, bool) {
 	return "", false
 }
 
-// BlockRefsFromIntrinsicTOC returns up to limit matching BlockRefs for an intrinsic-only
-// query, reading only the intrinsic column section (no full block I/O).
-//
-// Returns nil when:
-//   - The file has no intrinsic section
-//   - No intrinsic predicate leaves are found
-//   - Any predicate leaf cannot be evaluated from intrinsic data
-//
-// Note: this function does NOT check whether the program is intrinsic-only.
-// Callers must verify that separately (see ProgramIsIntrinsicOnly).
-//
-// For AND predicates, refs are intersected across leaves (most-selective first).
-// The returned slice contains at most limit entries in predicate-scan order (not
-// necessarily sorted by BlockIdx). Callers that need block order must sort explicitly.
-func BlockRefsFromIntrinsicTOC(r *modules_reader.Reader, program *vm.Program, limit int) []modules_shared.BlockRef {
-	if !r.HasIntrinsicSection() || program == nil || program.Predicates == nil {
-		return nil
-	}
-	if len(program.Predicates.Nodes) == 0 {
-		return nil
-	}
-	// limit == 0 means no limit (return all matching refs).
-	// limit < 0 is invalid — return nil.
-	if limit < 0 {
-		return nil
-	}
-
-	var leaves []vm.RangeNode
-	for _, node := range program.Predicates.Nodes {
-		collectIntrinsicLeaves(node, &leaves)
-	}
-	if len(leaves) == 0 {
-		return nil
-	}
-
-	// For each leaf, collect matching BlockRefs.
-	// When limit > 0, over-fetch by leafCount to have enough candidates after intersection.
-	// When limit == 0, pass 0 to dict/flat match functions (0 means no limit there too).
-	overFetch := 0
-	if limit > 0 {
-		overFetch = limit * (len(leaves) + 1)
-	}
-	var sets [][]modules_shared.BlockRef
-	for _, leaf := range leaves {
-		colName := leaf.Column
-		refs := scanIntrinsicLeafRefs(r, colName, leaf, overFetch)
-		if refs == nil {
-			return nil // predicate not evaluable — abort fast path
+// countIntrinsicLeaves counts all leaf nodes recursively in a RangeNode tree.
+// Used to compute the overFetch multiplier for BlockRefsFromIntrinsicTOC.
+func countIntrinsicLeaves(node vm.RangeNode) int {
+	if len(node.Children) == 0 {
+		if node.Column == "" {
+			return 0
 		}
-		sets = append(sets, refs)
+		return 1
 	}
+	n := 0
+	for _, child := range node.Children {
+		n += countIntrinsicLeaves(child)
+	}
+	return n
+}
 
+// unionBlockRefs merges two BlockRef slices, deduplicating by (BlockIdx, RowIdx).
+func unionBlockRefs(a, b []modules_shared.BlockRef) []modules_shared.BlockRef {
+	type refKey struct{ blockIdx, rowIdx uint16 }
+	seen := make(map[refKey]struct{}, len(a)+len(b))
+	result := make([]modules_shared.BlockRef, 0, len(a)+len(b))
+	for _, ref := range a {
+		k := refKey{ref.BlockIdx, ref.RowIdx}
+		if _, ok := seen[k]; !ok {
+			seen[k] = struct{}{}
+			result = append(result, ref)
+		}
+	}
+	for _, ref := range b {
+		k := refKey{ref.BlockIdx, ref.RowIdx}
+		if _, ok := seen[k]; !ok {
+			seen[k] = struct{}{}
+			result = append(result, ref)
+		}
+	}
+	return result
+}
+
+// intersectBlockRefSets intersects multiple BlockRef slices, returning only refs
+// present in all sets. Uses smallest-first strategy for efficiency.
+func intersectBlockRefSets(sets [][]modules_shared.BlockRef, limit int) []modules_shared.BlockRef {
 	if len(sets) == 0 {
 		return nil
 	}
@@ -1185,13 +1206,11 @@ func BlockRefsFromIntrinsicTOC(r *modules_reader.Reader, program *vm.Program, li
 		return sets[0]
 	}
 
-	// Intersect: start from smallest set, check membership in others.
-	// Sort sets by size ascending for efficiency.
+	// Sort sets by size ascending — intersect from smallest.
 	slices.SortFunc(sets, func(a, b []modules_shared.BlockRef) int {
 		return len(a) - len(b)
 	})
 
-	// Build lookup sets for all but the first (smallest).
 	type refKey struct{ blockIdx, rowIdx uint16 }
 	lookups := make([]map[refKey]struct{}, len(sets)-1)
 	for i, s := range sets[1:] {
@@ -1222,6 +1241,120 @@ func BlockRefsFromIntrinsicTOC(r *modules_reader.Reader, program *vm.Program, li
 	return result
 }
 
+// evalNodeBlockRefs recursively evaluates a RangeNode tree against intrinsic column blobs.
+// Returns (refs, true) when the node is fully evaluable; (nil, false) when not.
+// OR nodes: union all children refs; fail if any child is not evaluable.
+// AND nodes: intersect evaluable children refs; skip unevaluable children (conservative over-fetch).
+//
+// NOTE-039: recursive OR/AND evaluation for intrinsic fast path. OR support requires all
+// children to be evaluable — if any child returns (nil, false), the OR itself is not
+// evaluable (we cannot union partial results without potentially missing matches).
+func evalNodeBlockRefs(
+	r *modules_reader.Reader,
+	node vm.RangeNode,
+	overFetch int,
+) ([]modules_shared.BlockRef, bool) {
+	// Leaf node.
+	if len(node.Children) == 0 {
+		if node.Column == "" {
+			return nil, false
+		}
+		refs := scanIntrinsicLeafRefs(r, node.Column, node, overFetch)
+		return refs, refs != nil
+	}
+
+	if node.IsOR {
+		// OR: union — all children must be evaluable.
+		var union []modules_shared.BlockRef
+		for _, child := range node.Children {
+			childRefs, ok := evalNodeBlockRefs(r, child, overFetch)
+			if !ok {
+				return nil, false // any unevaluable child makes OR unevaluable
+			}
+			if union == nil {
+				union = childRefs
+			} else {
+				union = unionBlockRefs(union, childRefs)
+			}
+		}
+		if union == nil {
+			union = []modules_shared.BlockRef{} // evaluable but empty
+		}
+		return union, true
+	}
+
+	// AND: intersect — skip unevaluable children (conservative over-fetch).
+	var evaluableSets [][]modules_shared.BlockRef
+	for _, child := range node.Children {
+		childRefs, ok := evalNodeBlockRefs(r, child, overFetch)
+		if !ok {
+			continue // skip unevaluable — conservative: may over-fetch
+		}
+		evaluableSets = append(evaluableSets, childRefs)
+	}
+	if len(evaluableSets) == 0 {
+		return nil, false // no evaluable children
+	}
+	return intersectBlockRefSets(evaluableSets, overFetch), true
+}
+
+// BlockRefsFromIntrinsicTOC returns up to limit matching BlockRefs for an intrinsic-only
+// query, reading only the intrinsic column section (no full block I/O).
+//
+// Returns nil when:
+//   - The file has no intrinsic section
+//   - No top-level nodes are evaluable from intrinsic data
+//
+// Note: this function does NOT check whether the program is intrinsic-only.
+// Callers must verify that separately (see ProgramIsIntrinsicOnly).
+//
+// NOTE-039: Uses recursive evalNodeBlockRefs to support OR and regex predicates.
+// Top-level nodes are AND-combined (each node in program.Predicates.Nodes is intersected).
+// If any top-level node is not evaluable, returns nil (fast path not applicable).
+func BlockRefsFromIntrinsicTOC(r *modules_reader.Reader, program *vm.Program, limit int) []modules_shared.BlockRef {
+	if !r.HasIntrinsicSection() || program == nil || program.Predicates == nil {
+		return nil
+	}
+	if len(program.Predicates.Nodes) == 0 {
+		return nil
+	}
+	// limit == 0 means no limit (return all matching refs).
+	// limit < 0 is invalid — return nil.
+	if limit < 0 {
+		return nil
+	}
+
+	// Count total leaves for overFetch calculation.
+	totalLeaves := 0
+	for _, node := range program.Predicates.Nodes {
+		totalLeaves += countIntrinsicLeaves(node)
+	}
+	if totalLeaves == 0 {
+		return nil
+	}
+	overFetch := 0
+	if limit > 0 {
+		overFetch = limit * totalLeaves
+	}
+
+	// Evaluate each top-level node and intersect (top-level = AND-combined).
+	var topSets [][]modules_shared.BlockRef
+	for _, node := range program.Predicates.Nodes {
+		refs, ok := evalNodeBlockRefs(r, node, overFetch)
+		if !ok {
+			return nil // any unevaluable top-level node → fast path not applicable
+		}
+		topSets = append(topSets, refs)
+	}
+
+	if len(topSets) == 0 {
+		return nil
+	}
+
+	result := intersectBlockRefSets(topSets, limit)
+	return result
+}
+
 // scanIntrinsicLeafRefs loads the raw column blob and scans it directly for matching refs,
 // avoiding full struct materialization. Falls back to the full-decode path if raw scanning
 // is not applicable (e.g., bytes flat columns, regex patterns).
@@ -1242,8 +1375,23 @@ func scanIntrinsicLeafRefs(
 	}
 
 	if meta.Format == modules_shared.IntrinsicFormatDict {
-		if len(leaf.Values) == 0 {
-			return nil // range/pattern on dict — not supported in raw scan
+		if len(leaf.Values) == 0 && leaf.Pattern == "" {
+			return nil // range predicate on dict — not supported in raw scan
+		}
+		// Regex predicate: compile pattern and scan dict entries.
+		// NOTE-039: regex on dict columns uses ScanDictColumnRefsWithBloom with nil bloom keys
+		// (no bloom pruning possible for regex — any page could have matching entries).
+		if len(leaf.Values) == 0 && leaf.Pattern != "" {
+			re, err := regexp.Compile(leaf.Pattern)
+			if err != nil {
+				return nil // invalid regex — skip fast path
+			}
+			return modules_shared.ScanDictColumnRefsWithBloom(blob, func(value string, _ int64, isInt64 bool) bool {
+				if isInt64 {
+					return false // int64 dict entries are not string-matchable
+				}
+				return re.MatchString(value)
+			}, nil, maxRefs)
 		}
 		// Build match sets.
 		wantStr := make(map[string]struct{}, len(leaf.Values))
