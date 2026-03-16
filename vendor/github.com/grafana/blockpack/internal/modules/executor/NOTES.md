@@ -1225,3 +1225,140 @@ Back-ref: `internal/modules/executor/plan_blocks.go:planBlocks`,
 `internal/modules/executor/metrics_log.go:ExecuteLogMetrics`,
 `internal/modules/executor/stream_log.go:StreamLogs`,
 `internal/modules/executor/stream_log_topk.go:CollectLogs`
+
+---
+
+## NOTE-037: LogAttrs — Flat Slice Struct Instead of map[string]string
+*Added: 2026-03-15*
+
+**Decision:** `LogEntry.LogAttrs` field changed from `map[string]string` to a new
+`LogAttrs` struct with parallel `Names []string` and `Values []string` slices.
+`collectLogStringAttrs` uses slice append instead of map insertion.
+
+**Rationale:** Per-row map allocation was a hot path. Most rows have zero or one
+log.* attribute (log.level, log.detected_level). A flat slice struct avoids the
+map header allocation (~8 bytes overhead) and internal hash-table bucket
+allocations entirely. For the common zero-attribute case, both slices remain nil.
+
+**Impact on callers:**
+- `logEntryFields.GetField`: linear scan over Names slice (typically 0–2 entries;
+  faster than map lookup for such small N due to cache locality).
+- `logEntryFields.IterateFields`: iterate parallel slice indices.
+- `converter.logAttrsToLabelAdapters`: iterate `.Names`/`.Values` directly.
+- Tests: no assertions on LogAttrs type; no changes needed.
+
+Back-ref: `internal/modules/executor/stream_log.go:LogAttrs`,
+`internal/modules/executor/stream_log_topk.go:collectLogStringAttrs`,
+`api.go:logEntryFields`,
+`benchmark/lokibench/converter.go:logAttrsToLabelAdapters`
+
+---
+
+## NOTE-038: Classify-then-Dispatch Refactor for Collect
+*Added: 2026-03-15*
+
+**Decision:** `Collect` was refactored from 140 lines of nested if/else into a thin
+orchestrator: `classifyCollect(r, program, opts)` returns one of four `collectMode`
+constants; `Collect` dispatches via a switch.
+
+**Rationale:** The 4-branch structure (intrinsic topK, intrinsic plain, block topK,
+block plain) was already present in the original code. The problem was readability: the
+conditions were checked inline as sequential if/else, mixing dispatch logic with
+parameter setup. Named modes + a classification function make the dispatch explicit and
+allow each execution path to be a separately named, separately testable function.
+
+**Why not Approach 1 (full pipeline with QueryClassification struct):** The block-scan
+path inherently fuses SelectRefs (ColumnPredicate), Rank (heap insertion), and Resolve
+(block reference in MatchedRow) into a single loop. Forcing these into separate pipeline
+steps would require buffering all row indices across all selected blocks before ranking —
+O(N) memory with no algorithmic benefit. The pipeline separation is meaningful only for
+the intrinsic paths, which are already clean functions. The complexity cost of adding a
+`QueryClassification` type and 5 named pipeline steps is higher than the benefit.
+
+**Intrinsic fall-through eliminated:** The old code had `collectFromIntrinsicRefs` and
+`collectTopKFromIntrinsicRefs` returning `(nil, nil)` in ~5 places to signal "fast path
+unavailable, fall through to block scan". These were needed because `Collect` didn't
+know at dispatch time whether the file supported intrinsics. `classifyCollect` calls
+`r.HasIntrinsicSection()` once and decides definitively. The `(nil, nil)` sentinel
+convention is removed; the intrinsic functions now return `(nil, nil)` only to indicate
+"valid empty result" (no matches found), not "path unavailable".
+
+**`computeColumnSets` extraction:** `wantColumns` and `secondPassCols` are computed
+once before the dispatch switch (NOTE-028 invariant). Extracted into a named function
+for testability and to make the loop-invariant intent explicit.
+
+**Block mode CoalescedGroups construction:** `CoalescedGroups` and `blockToGroup` are
+constructed after the mode is known, only for block modes. Intrinsic modes don't need
+groups, so this avoids one allocation for fast-path queries.
+
+**`topKScanBlocks` placement:** The body of `topKScanBlocks` is inlined into
+`collectBlockTopK`. The heap types and helpers (`topKHeap`, `topKEntry`, `topKSkipBlock`,
+`topKInsert`, `topKScanRows`, `topKDeliver`) are extracted to `stream_heap.go`.
+
+**Relationship to NOTE-036:** NOTE-036 unified block selection under `planBlocks`.
+NOTE-038 unifies block execution dispatch under `classifyCollect`. Together, both
+refactors eliminate the two main sources of ad-hoc branching in `Collect`.
+
+Back-ref: `internal/modules/executor/stream.go:classifyCollect`,
+`internal/modules/executor/stream.go:computeColumnSets`,
+`internal/modules/executor/stream.go:collectIntrinsicTopK`,
+`internal/modules/executor/stream.go:collectIntrinsicPlain`,
+`internal/modules/executor/stream.go:collectBlockTopK`,
+`internal/modules/executor/stream.go:collectBlockPlain`,
+`internal/modules/executor/stream_heap.go`
+
+---
+
+## NOTE-039: OR and Regex Support in Intrinsic Fast Path with errNeedBlockScan Fallback
+*Added: 2026-03-16*
+
+**Decision:** The intrinsic fast path (`modeIntrinsicTopK` / `modeIntrinsicPlain`) now
+supports OR-combined predicates and regex predicates on dict columns. When a predicate is
+not evaluable from intrinsic blobs (e.g., range predicate on a flat column with no bounds),
+`errNeedBlockScan` is returned and the `Collect` dispatcher falls through to the appropriate
+block scan mode (`collectBlockTopK` / `collectBlockPlain`).
+
+**Rationale:** Prior to this change, OR nodes in the predicate tree were silently skipped by
+`collectIntrinsicLeaves`, causing queries like `{resource.service.name="A" || resource.service.name="B"}`
+to return 0 results instead of falling back to a block scan. Similarly, regex predicates on
+dict columns (`resource.service.name=~"loki-.*"`) returned nil from `scanIntrinsicLeafRefs`,
+which was treated as "fast path not applicable" but returned `(nil, nil)` (empty results)
+rather than falling back.
+
+**Three complementary fixes:**
+
+1. **Regex on dict columns (`intrinsicDictMatches` / `scanIntrinsicLeafRefs`):** When
+   `leaf.Pattern != ""` and `len(leaf.Values) == 0`, compile the regex and match each dict
+   entry's `Value` string. For `scanIntrinsicLeafRefs`, use `ScanDictColumnRefsWithBloom`
+   with a regex matcher and `nil` bloom keys (no bloom pruning for regex — any page could
+   contain matching entries).
+
+2. **Recursive OR/AND evaluation (`evalNodeBlockRefs` / `evalNodeMatchKeys`):** Replace the
+   flat `collectIntrinsicLeaves` + intersect approach with recursive evaluation:
+   - OR nodes: union all children refs/keys; return `(nil, false)` if any child is not
+     evaluable (cannot union partial results — would miss matches).
+   - AND nodes: intersect evaluable children; skip unevaluable children (conservative
+     over-fetch — may include extra blocks but never misses matches).
+   These helpers replace `BlockRefsFromIntrinsicTOC`'s internal leaf collection and
+   `buildPredicateMatchSet`'s leaf iteration.
+
+3. **`errNeedBlockScan` sentinel and fallback in `Collect`:** When the fast path cannot
+   evaluate the predicate (any top-level node returns `(nil, false)`), `collectIntrinsicPlain`
+   and `collectTopKFromIntrinsicRefs` return `errNeedBlockScan`. The `Collect` dispatcher
+   detects this sentinel and falls through to `collectBlockPlain` / `collectBlockTopK`.
+   Previously, returning `(nil, nil)` from the fast path was silently treated as "no results"
+   rather than "try the block scan".
+
+**Consequence:** OR queries and regex queries on intrinsic columns now either return correct
+results directly from the fast path (when evaluable) or fall back to a correct block scan
+(when not fully evaluable). The `programCanUseIntrinsicFastPath` workaround function that
+restricted the intrinsic fast path to equality-only predicates has been removed.
+
+Back-ref: `internal/modules/executor/predicates.go:evalNodeBlockRefs`,
+`internal/modules/executor/predicates.go:intrinsicDictMatches`,
+`internal/modules/executor/predicates.go:scanIntrinsicLeafRefs`,
+`internal/modules/executor/predicates.go:BlockRefsFromIntrinsicTOC`,
+`internal/modules/executor/stream.go:evalNodeMatchKeys`,
+`internal/modules/executor/stream.go:buildPredicateMatchSet`,
+`internal/modules/executor/stream.go:errNeedBlockScan`,
+`internal/modules/executor/stream.go:classifyCollect`

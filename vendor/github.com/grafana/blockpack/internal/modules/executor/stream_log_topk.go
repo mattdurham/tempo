@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"maps"
 	"slices"
-	"strings"
 
 	"github.com/grafana/blockpack/internal/logqlparser"
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
@@ -18,10 +17,9 @@ import (
 )
 
 // logTopKEntry holds one pipeline-passing log row buffered during a CollectLogs scan.
-// The processed LogEntry is stored (not block/row references) because the pipeline may
-// mutate labels in-place and the block may not be available at delivery time.
+// entry is stored by value to eliminate per-row heap allocation.
 type logTopKEntry struct {
-	entry *LogEntry
+	entry LogEntry
 	ts    uint64
 }
 
@@ -109,7 +107,7 @@ func CollectLogs(
 	program *vm.Program,
 	pipeline *logqlparser.Pipeline,
 	opts CollectOptions,
-) ([]*LogEntry, error) {
+) ([]LogEntry, error) {
 	if r == nil {
 		return nil, nil
 	}
@@ -175,7 +173,16 @@ func CollectLogs(
 	}
 
 	// Limit == 0: collect all, sort globally, deliver.
-	var all []logTopKEntry
+	// Pre-allocate with a capacity hint: min(totalSpanCount, 4096) to avoid repeated
+	// slice growth copies while not over-allocating for selective queries.
+	var totalRows int
+	for _, blockIdx := range plan.SelectedBlocks {
+		totalRows += int(r.BlockMeta(blockIdx).SpanCount)
+	}
+	if totalRows > 4096 {
+		totalRows = 4096
+	}
+	all := make([]logTopKEntry, 0, totalRows)
 	fb, scanErr = logCollectAll(r, program, wantColumns, pipeline, opts, plan, &all)
 	if scanErr != nil {
 		return nil, scanErr
@@ -252,10 +259,12 @@ func logTopKScan(
 
 		// NOTE-021: pre-filter by time using first-pass block before full second-pass decode.
 		// log:timestamp is guaranteed present (injected into wantColumns above).
+		rows := rowSet.ToSlice()
 		var keptByTime []int
 		if opts.TimeRange.MinNano > 0 || opts.TimeRange.MaxNano > 0 {
+			keptByTime = make([]int, 0, len(rows))
 			firstPassTSCol := bwb.Block.GetColumn("log:timestamp")
-			for _, rowIdx := range rowSet.ToSlice() {
+			for _, rowIdx := range rows {
 				ts := uint64(0)
 				if firstPassTSCol != nil {
 					if v, ok := firstPassTSCol.Uint64Value(rowIdx); ok {
@@ -274,7 +283,7 @@ func logTopKScan(
 				continue // skip second-pass decode entirely
 			}
 		} else {
-			keptByTime = rowSet.ToSlice()
+			keptByTime = rows
 		}
 
 		// NOTE-001: Lazy registration in ParseBlockFromBytes registers all columns with
@@ -283,8 +292,7 @@ func logTopKScan(
 		// Cache column pointers for the row loop.
 		tsCol := bwb.Block.GetColumn("log:timestamp")
 		bodyCol := bwb.Block.GetColumn("log:body")
-		colNames, colMap, colCols := buildBlockColMaps(bwb.Block)
-		logStrNames, logStrCols := buildLogStringColCache(bwb.Block)
+		colNames, colMap, colCols, logStrNames, logStrCols := buildBlockColMapsWithLogCache(bwb.Block)
 		skipParsers := pipeline != nil && blockHasBodyParsed(bwb.Block)
 		for _, rowIdx := range keptByTime {
 			var ts uint64
@@ -302,13 +310,12 @@ func logTopKScan(
 
 			// NOTE-SL-016: acquire from pool - zero map allocation for dropped rows.
 			bls := acquireBlockLabelSet(bwb.Block, rowIdx, colNames, colMap, colCols)
-			var labels logqlparser.LabelSet = bls
 			if pipeline != nil {
 				var keep bool
 				if skipParsers {
-					line, labels, keep = pipeline.ProcessSkipParsers(ts, line, bls)
+					line, _, keep = pipeline.ProcessSkipParsers(ts, line, bls)
 				} else {
-					line, labels, keep = pipeline.Process(ts, line, bls)
+					line, _, keep = pipeline.Process(ts, line, bls)
 				}
 				if !keep {
 					releaseBlockLabelSet(bls)
@@ -326,11 +333,12 @@ func logTopKScan(
 					continue
 				}
 			}
-			// Materialize to stable map before storing in heap (bls will be released).
-			matLabels := labels.Materialize()
+			// Read __loki_labels__ via the post-pipeline LabelSet so that mutations
+			// (drop/keep/label_format) are respected if they affect this field.
+			lokiLabels := bls.Get("__loki_labels__")
 			logAttrs := collectLogStringAttrs(logStrNames, logStrCols, rowIdx)
 			releaseBlockLabelSet(bls)
-			entry := &LogEntry{TimestampNanos: ts, Line: line, Labels: matLabels, LogAttrs: logAttrs}
+			entry := LogEntry{TimestampNanos: ts, Line: line, LokiLabels: lokiLabels, LogAttrs: logAttrs}
 			logTopKInsert(buf, opts.Limit, backward, logTopKEntry{entry: entry, ts: ts})
 		}
 	}
@@ -399,10 +407,12 @@ func logCollectAll(
 
 		// NOTE-021: pre-filter by time using first-pass block before full second-pass decode.
 		// log:timestamp is guaranteed present (injected into wantColumns above).
+		rows := rowSet.ToSlice()
 		var keptByTime []int
 		if opts.TimeRange.MinNano > 0 || opts.TimeRange.MaxNano > 0 {
+			keptByTime = make([]int, 0, len(rows))
 			firstPassTSCol := bwb.Block.GetColumn("log:timestamp")
-			for _, rowIdx := range rowSet.ToSlice() {
+			for _, rowIdx := range rows {
 				ts := uint64(0)
 				if firstPassTSCol != nil {
 					if v, ok := firstPassTSCol.Uint64Value(rowIdx); ok {
@@ -421,7 +431,7 @@ func logCollectAll(
 				continue // skip second-pass decode entirely
 			}
 		} else {
-			keptByTime = rowSet.ToSlice()
+			keptByTime = rows
 		}
 
 		// NOTE-001: Lazy registration in ParseBlockFromBytes registers all columns with
@@ -430,8 +440,7 @@ func logCollectAll(
 		// Cache column pointers for the row loop.
 		tsCol := bwb.Block.GetColumn("log:timestamp")
 		bodyCol := bwb.Block.GetColumn("log:body")
-		colNames, colMap, colCols := buildBlockColMaps(bwb.Block)
-		logStrNames, logStrCols := buildLogStringColCache(bwb.Block)
+		colNames, colMap, colCols, logStrNames, logStrCols := buildBlockColMapsWithLogCache(bwb.Block)
 		skipParsers := pipeline != nil && blockHasBodyParsed(bwb.Block)
 		for _, rowIdx := range keptByTime {
 			var ts uint64
@@ -449,24 +458,24 @@ func logCollectAll(
 
 			// NOTE-SL-016: acquire from pool - zero map allocation for dropped rows.
 			bls := acquireBlockLabelSet(bwb.Block, rowIdx, colNames, colMap, colCols)
-			var labels logqlparser.LabelSet = bls
 			if pipeline != nil {
 				var keep bool
 				if skipParsers {
-					line, labels, keep = pipeline.ProcessSkipParsers(ts, line, bls)
+					line, _, keep = pipeline.ProcessSkipParsers(ts, line, bls)
 				} else {
-					line, labels, keep = pipeline.Process(ts, line, bls)
+					line, _, keep = pipeline.Process(ts, line, bls)
 				}
 				if !keep {
 					releaseBlockLabelSet(bls)
 					continue
 				}
 			}
-			// Materialize to stable map before storing in slice (bls will be released).
-			matLabels := labels.Materialize()
+			// Read __loki_labels__ via the post-pipeline LabelSet so that mutations
+			// (drop/keep/label_format) are respected if they affect this field.
+			lokiLabels := bls.Get("__loki_labels__")
 			logAttrs := collectLogStringAttrs(logStrNames, logStrCols, rowIdx)
 			releaseBlockLabelSet(bls)
-			entry := &LogEntry{TimestampNanos: ts, Line: line, Labels: matLabels, LogAttrs: logAttrs}
+			entry := LogEntry{TimestampNanos: ts, Line: line, LokiLabels: lokiLabels, LogAttrs: logAttrs}
 			*all = append(*all, logTopKEntry{entry: entry, ts: ts})
 		}
 	}
@@ -474,36 +483,19 @@ func logCollectAll(
 }
 
 // logTopKDeliver sorts the heap entries and returns them in direction order.
-func logTopKDeliver(buf *logTopKHeap, backward bool) []*LogEntry {
+func logTopKDeliver(buf *logTopKHeap, backward bool) []LogEntry {
 	return logDeliverAll(buf.entries, backward)
 }
 
-// buildLogStringColCache builds a per-block cache of log.* string-valued columns.
-// Called once per block; the result is passed to collectLogStringAttrs per row.
-// Iterates block.Columns() directly (not buildBlockColMaps output) so that ALL original
-// LogRecord attributes are collected regardless of resource.* precedence rules -
-// a "log.foo" column must appear in SM even when "resource.foo" exists in the same block.
-// Includes ColumnTypeString and ColumnTypeUUID (writer may auto-detect UUID-shaped strings).
-// Body-auto-parsed columns (ColumnTypeRangeString) are intentionally excluded.
-func buildLogStringColCache(block *modules_reader.Block) (names []string, cols []*modules_reader.Column) {
-	for key, col := range block.Columns() {
-		if !strings.HasPrefix(key.Name, "log.") {
-			continue
-		}
-		if key.Type == shared.ColumnTypeString || key.Type == shared.ColumnTypeUUID {
-			names = append(names, key.Name)
-			cols = append(cols, col)
-		}
-	}
-	return names, cols
-}
-
 // collectLogStringAttrs collects log.* string-valued column values for rowIdx
-// using the per-block cache built by buildLogStringColCache.
-// Returns nil if no columns are present at this row.
+// using the per-block log column cache produced by buildBlockColMapsWithLogCache.
+// Returns a zero LogAttrs if no columns are present at this row.
 // Empty-but-present string values are included (IsPresent controls absence, not value content).
-func collectLogStringAttrs(names []string, cols []*modules_reader.Column, rowIdx int) map[string]string {
-	var result map[string]string
+// Names and Values slices are allocated with len(names) capacity on the first present
+// column found, avoiding both zero-allocation overhead for absent rows and growth
+// reallocs for rows where all columns are present.
+func collectLogStringAttrs(names []string, cols []*modules_reader.Column, rowIdx int) LogAttrs {
+	var result LogAttrs
 	for i, name := range names {
 		col := cols[i]
 		if col == nil || !col.IsPresent(rowIdx) {
@@ -513,22 +505,24 @@ func collectLogStringAttrs(names []string, cols []*modules_reader.Column, rowIdx
 		if !ok {
 			continue
 		}
-		if result == nil {
-			result = make(map[string]string, len(names))
+		if result.Names == nil {
+			result.Names = make([]string, 0, len(names))
+			result.Values = make([]string, 0, len(names))
 		}
-		result[name] = v
+		result.Names = append(result.Names, name)
+		result.Values = append(result.Values, v)
 	}
 	return result
 }
 
 // logDeliverAll sorts entries and returns them in direction order.
-func logDeliverAll(entries []logTopKEntry, backward bool) []*LogEntry {
+func logDeliverAll(entries []logTopKEntry, backward bool) []LogEntry {
 	if backward {
 		slices.SortFunc(entries, func(a, b logTopKEntry) int { return cmp.Compare(b.ts, a.ts) })
 	} else {
 		slices.SortFunc(entries, func(a, b logTopKEntry) int { return cmp.Compare(a.ts, b.ts) })
 	}
-	results := make([]*LogEntry, len(entries))
+	results := make([]LogEntry, len(entries))
 	for i, e := range entries {
 		results[i] = e.entry
 	}

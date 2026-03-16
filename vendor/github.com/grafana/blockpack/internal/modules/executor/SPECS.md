@@ -27,11 +27,20 @@ func (e *Executor) CollectTopK(r *modules_reader.Reader, program *vm.Program, op
 func SpanMatchFromRow(row MatchedRow, signalType uint8) SpanMatch
 ```
 
+Internal helpers (unexported, white-box testable):
+
+```go
+func classifyCollect(r *modules_reader.Reader, program *vm.Program, opts CollectOptions) collectMode
+func computeColumnSets(program *vm.Program, opts CollectOptions) (wantColumns, secondPassCols map[string]struct{})
+```
+
 `Executor` is stateless and safe for concurrent use. `New()` returns a zero-value `Executor`.
 
 `Collect` is the primary query entry point — it replaces the earlier `Execute` method.
 `CollectTopK` is the globally-ordered variant using a heap (see §6, SPEC-STREAM-7).
 `SpanMatchFromRow` extracts identity fields from a `MatchedRow` after collection.
+`classifyCollect` determines the execution mode; `computeColumnSets` computes the column sets
+once per `Collect` call (loop-invariant, NOTE-028). See §3.5 for the four execution modes.
 
 ---
 
@@ -46,24 +55,18 @@ func SpanMatchFromRow(row MatchedRow, signalType uint8) SpanMatch
 
 ### 3.2 Execution Steps
 
-1. Compute `wantColumns` from `program` and `secondPassCols` from `opts.AllColumns` (NOTE-028).
-2. Create a `queryplanner.Planner` backed by `r`.
-3. Call `planner.PlanWithOptions(buildPredicates(r, program), opts.TimeRange, ...)` —
-   range-index, fuse, and CMS pruning based on extracted column predicates, further
-   narrowed by `opts.TimeRange` if non-zero.
-4. Apply sub-file sharding filter if `opts.BlockCount > 0` (see §3.4).
-5. Fetch blocks lazily via `r.CoalescedGroups(plan.SelectedBlocks)` / `r.ReadGroup(group)`.
-6. For each selected block:
-   a. `r.ParseBlockFromBytes(raw, wantColumns, meta)` — eagerly decode predicate columns;
-      lazily register all other columns (presence-only decode, full decode deferred to
-      first value access). See NOTE-025.
-   b. `program.ColumnPredicate(provider)` — evaluate the filter closure against the block,
-      returning a `RowSet` of matching row indices.
-   c. Per-row time filtering via `TimestampColumn` if set (SPEC-STREAM-4).
-   d. Append `MatchedRow{Block, BlockIdx, RowIdx}` to results.
-   e. If `opts.Limit > 0` and `len(results) >= opts.Limit`, return early.
-7. If `opts.OnStats != nil`, invoke the deferred callback with `CollectStats`.
-8. Return `[]MatchedRow`.
+1. **Guard checks**: nil reader → (nil, nil); nil program → error; invalid shard params → error.
+2. **Classify**: `classifyCollect(r, program, opts)` determines one of four execution modes
+   (see §3.5). Checks `HasIntrinsicSection()` definitively — no runtime fall-through.
+3. **Compute column sets**: `wantColumns` and `secondPassCols` computed once (loop-invariant,
+   NOTE-028).
+4. **Plan**: `planBlocks(r, program, opts.TimeRange, ...)` — range-index, fuse, CMS pruning
+   (NOTE-036).
+5. **Shard**: If `opts.BlockCount > 0`, filter `plan.SelectedBlocks` to the assigned shard
+   range. Statistics remain file-wide; only iteration is narrowed.
+6. **Deferred stats**: If `opts.OnStats != nil`, register deferred callback (SPEC-STREAM-6).
+7. **Early exit**: If `len(plan.SelectedBlocks) == 0`, return nil.
+8. **Dispatch**: Call the appropriate collect function based on mode (see §3.5).
 
 ### 3.3 Error Conditions
 
@@ -87,8 +90,26 @@ construction. The planner still operates on the full file, so pruning statistics
 (`TotalBlocks`, `PrunedByTime`, etc.) reflect the whole file; only `SelectedBlocks` and
 `FetchedBlocks` reflect the shard.
 
-Back-ref: `internal/modules/executor/stream.go:Collect` (lines 109-121),
+Back-ref: `internal/modules/executor/stream.go:Collect`,
 `internal/modules/executor/stream_topk.go:CollectTopK`
+
+### 3.5 Execution Modes
+
+| Mode | Trigger | Implementation |
+|------|---------|----------------|
+| `modeIntrinsicTopK` | `Limit > 0 && ProgramIsIntrinsicOnly && HasIntrinsicSection && TimestampColumn != ""` | `collectIntrinsicTopK`: predicate + timestamp ranking from intrinsic blobs; falls back to `collectBlockTopK` via `errNeedBlockScan` when predicate not evaluable from intrinsic blobs (e.g., range predicate on non-intrinsic column) |
+| `modeIntrinsicPlain` | `Limit > 0 && ProgramIsIntrinsicOnly && HasIntrinsicSection && TimestampColumn == ""` | `collectIntrinsicPlain`: predicate from intrinsic blobs; falls back to `collectBlockPlain` via `errNeedBlockScan` when predicate not evaluable |
+| `modeBlockTopK` | `TimestampColumn != "" && Limit > 0` (and not eligible for intrinsic) | `collectBlockTopK`: heap-based scan over all selected blocks; guarantees globally correct top-K (SPEC-STREAM-7) |
+| `modeBlockPlain` | default | `collectBlockPlain`: sequential scan; lazy coalesced group I/O (SPEC-STREAM-2) |
+
+The first applicable condition wins (evaluated top-to-bottom). `classifyCollect` encodes
+this precedence. All SPEC-STREAM invariants apply regardless of mode.
+
+**NOTE-039:** OR predicates and regex predicates on intrinsic dict columns are now supported
+in the intrinsic fast path via recursive `evalNodeBlockRefs` / `evalNodeMatchKeys`. When any
+predicate node is not evaluable from intrinsic blobs, `errNeedBlockScan` is returned and the
+caller falls through to the appropriate block scan mode. The `programCanUseIntrinsicFastPath`
+workaround function has been removed.
 
 ---
 
@@ -121,15 +142,21 @@ If the relevant column is absent or the row is null, the field is left at its ze
 
 ```go
 type MatchedRow struct {
-    Block    *modules_reader.Block
-    BlockIdx int
-    RowIdx   int
+    Block *modules_reader.Block
+    // IntrinsicFields is set when the result was produced by the intrinsic fast path
+    // without reading full blocks. The caller should use this for field lookups
+    // when Block is nil.
+    IntrinsicFields modules_shared.SpanFieldsProvider
+    BlockIdx        int
+    RowIdx          int
 }
 ```
 
-`Collect` and `CollectTopK` return `[]MatchedRow`. Each row holds a reference to the
-parsed block and the row index within it. Use `SpanMatchFromRow(row, signalType)` to
-extract identity fields (`TraceID`, `SpanID`) after collection.
+`Collect` and `CollectTopK` return `[]MatchedRow`. When `IntrinsicFields` is non-nil,
+`Block` is nil and field values must be accessed via `IntrinsicFields`. When
+`IntrinsicFields` is nil, `Block` holds the parsed block. Use
+`SpanMatchFromRow(row, signalType)` to extract identity fields (`TraceID`, `SpanID`)
+after collection — it handles both cases safely.
 
 Matches are in block-then-row order (no randomization). For `CollectTopK`, matches are
 in globally-sorted timestamp order.
@@ -281,7 +308,7 @@ I/O path (see NOTE-035).
 
 - **SPEC-STREAM-1:** Nil reader returns `(nil, nil)`. Nil `program` returns an error.
 - **SPEC-STREAM-2:** Blocks are fetched lazily via `CoalescedGroups`/`ReadGroup` (~8 MB per I/O). Never per-column or per-block individual reads.
-- **SPEC-STREAM-3:** `FetchedBlocks <= SelectedBlocks`. `FetchedBlocks` is incremented at `ReadGroup` time by the count of blocks in the fetched group (actual I/O). Groups that are skipped due to early stop are not counted.
+- **SPEC-STREAM-3:** `FetchedBlocks <= SelectedBlocks`. `FetchedBlocks` is incremented at `ReadGroup` time by the count of blocks in the fetched group (actual I/O). Groups that are skipped due to early stop are not counted. **Note:** For intrinsic modes (`modeIntrinsicTopK`, `modeIntrinsicPlain`), `FetchedBlocks` may be 0 even when blocks are read internally — intrinsic paths do not update the `fetchedBlocks` counter captured by the deferred `OnStats` closure. This is an acknowledged limitation; the inequality `FetchedBlocks <= SelectedBlocks` is always satisfied (0 ≤ N).
 - **SPEC-STREAM-4:** `TimestampColumn == ""` disables per-row time filtering (trace mode). `TimestampColumn == "log:timestamp"` enables per-row `[MinNano, MaxNano]` checks.
 - **SPEC-STREAM-5:** Direction is applied at plan time (`PlanWithOptions`). Within each block, when `TimestampColumn` is set, rows are sorted by per-row timestamp: ascending for Forward (oldest first), descending for Backward (newest first). When `TimestampColumn` is empty (trace mode), rows are reversed for Backward direction.
 - **SPEC-STREAM-6:** `OnStats` is deferred; `FetchedBlocks` reflects actual I/O at the time execution completes (including early-stop paths).
