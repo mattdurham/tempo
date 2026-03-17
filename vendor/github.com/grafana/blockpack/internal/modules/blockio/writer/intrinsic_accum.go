@@ -24,8 +24,8 @@ type flatAccum struct {
 
 // dictEntry holds one unique string/int64 value and all block refs for that value.
 type dictEntry struct {
-	refs     []shared.BlockRef
 	strVal   string
+	refs     []shared.BlockRef
 	int64Val int64
 }
 
@@ -73,18 +73,54 @@ func (a *intrinsicAccumulator) overCap() bool {
 
 // feedUint64 adds one uint64 value (span:duration, span:start, etc.) to the
 // named flat column. colType must be ColumnTypeUint64 or ColumnTypeRangeUint64.
-func (a *intrinsicAccumulator) feedUint64(name string, colType shared.ColumnType, val uint64, blockIdx uint16, rowIdx int) {
+func (a *intrinsicAccumulator) feedUint64(
+	name string,
+	colType shared.ColumnType,
+	val uint64,
+	blockIdx uint16,
+	rowIdx int,
+) {
 	c, ok := a.flatCols[name]
 	if !ok {
 		c = &flatAccum{colType: colType}
 		a.flatCols[name] = c
 	}
 	c.uint64Values = append(c.uint64Values, val)
-	c.refs = append(c.refs, shared.BlockRef{BlockIdx: blockIdx, RowIdx: uint16(rowIdx)}) //nolint:gosec // safe: rowIdx bounded by MaxBlockSpans (65535)
+	ref := shared.BlockRef{BlockIdx: blockIdx, RowIdx: uint16(rowIdx)} //nolint:gosec // bounded by MaxBlockSpans
+	c.refs = append(c.refs, ref)
+}
+
+// feedBytes adds one byte slice value (trace:id, span:id, span:parent_id) to the named flat column.
+func (a *intrinsicAccumulator) feedBytes(
+	name string,
+	colType shared.ColumnType,
+	val []byte,
+	blockIdx uint16,
+	rowIdx int,
+) {
+	if len(val) == 0 {
+		return
+	}
+	c, ok := a.flatCols[name]
+	if !ok {
+		c = &flatAccum{colType: colType}
+		a.flatCols[name] = c
+	}
+	v := make([]byte, len(val))
+	copy(v, val)
+	c.bytesValues = append(c.bytesValues, v)
+	ref := shared.BlockRef{BlockIdx: blockIdx, RowIdx: uint16(rowIdx)} //nolint:gosec // bounded by MaxBlockSpans
+	c.refs = append(c.refs, ref)
 }
 
 // feedString adds one string value (span:name, span:status_message, etc.) to the named dict column.
-func (a *intrinsicAccumulator) feedString(name string, colType shared.ColumnType, val string, blockIdx uint16, rowIdx int) {
+func (a *intrinsicAccumulator) feedString(
+	name string,
+	colType shared.ColumnType,
+	val string,
+	blockIdx uint16,
+	rowIdx int,
+) {
 	if val == "" {
 		return
 	}
@@ -106,7 +142,13 @@ func (a *intrinsicAccumulator) feedString(name string, colType shared.ColumnType
 }
 
 // feedInt64 adds one int64 value (span:kind, span:status) to the named dict column.
-func (a *intrinsicAccumulator) feedInt64(name string, colType shared.ColumnType, val int64, blockIdx uint16, rowIdx int) {
+func (a *intrinsicAccumulator) feedInt64(
+	name string,
+	colType shared.ColumnType,
+	val int64,
+	blockIdx uint16,
+	rowIdx int,
+) {
 	c, ok := a.dictCols[name]
 	if !ok {
 		c = &dictAccum{index: make(map[string]int), colType: colType}
@@ -214,13 +256,13 @@ func dictRefWidths(entries []dictEntry) (blockW, rowW uint8) {
 func writeRef(buf *bytes.Buffer, ref shared.BlockRef, blockW, rowW uint8) {
 	var tmp2 [2]byte
 	if blockW == 1 {
-		buf.WriteByte(byte(ref.BlockIdx))
+		buf.WriteByte(byte(ref.BlockIdx)) //nolint:gosec // safe: blockW==1 only when BlockIdx<=255
 	} else {
 		binary.LittleEndian.PutUint16(tmp2[:], ref.BlockIdx)
 		buf.Write(tmp2[:])
 	}
 	if rowW == 1 {
-		buf.WriteByte(byte(ref.RowIdx))
+		buf.WriteByte(byte(ref.RowIdx)) //nolint:gosec // safe: rowW==1 only when RowIdx<=255
 	} else {
 		binary.LittleEndian.PutUint16(tmp2[:], ref.RowIdx)
 		buf.Write(tmp2[:])
@@ -333,9 +375,13 @@ func encodeDictColumn(c *dictAccum) ([]byte, error) {
 			binary.LittleEndian.PutUint64(tmp8[:], uint64(e.int64Val)) //nolint:gosec
 			buf.Write(tmp8[:])
 		} else {
-			binary.LittleEndian.PutUint16(tmp2[:], uint16(len(e.strVal))) //nolint:gosec
+			strVal := e.strVal
+			if len(strVal) > 65535 {
+				strVal = strVal[:65535]
+			}
+			binary.LittleEndian.PutUint16(tmp2[:], uint16(len(strVal))) //nolint:gosec
 			buf.Write(tmp2[:])
-			buf.WriteString(e.strVal)
+			buf.WriteString(strVal)
 		}
 		binary.LittleEndian.PutUint32(tmp4[:], uint32(len(e.refs))) //nolint:gosec
 		buf.Write(tmp4[:])
@@ -449,18 +495,6 @@ func encodeTOC(entries []shared.IntrinsicColMeta) ([]byte, error) {
 		buf.WriteString(e.Max)
 	}
 	return snappy.Encode(nil, buf.Bytes()), nil
-}
-
-// decodeTOC decompresses a TOC blob and parses it into a slice of IntrinsicColMeta.
-// Delegates to shared.DecodeTOC; kept here so writer-internal tests can call it.
-func decodeTOC(blob []byte) ([]shared.IntrinsicColMeta, error) {
-	return shared.DecodeTOC(blob)
-}
-
-// decodeIntrinsicColumnBlob decompresses and decodes a column data blob.
-// Delegates to shared.DecodeIntrinsicColumnBlob; kept here so writer-internal tests can call it.
-func decodeIntrinsicColumnBlob(blob []byte) (*shared.IntrinsicColumn, error) {
-	return shared.DecodeIntrinsicColumnBlob(blob)
 }
 
 // sortFlatAccum sorts the flat accumulator's values and refs together in-place.
@@ -663,14 +697,18 @@ func encodeDictPageBlob(
 			binary.LittleEndian.PutUint64(tmp8[:], uint64(e.int64Val)) //nolint:gosec
 			maxVal = string(tmp8[:])
 		} else {
-			binary.LittleEndian.PutUint16(tmp2[:], uint16(len(e.strVal))) //nolint:gosec
-			buf.Write(tmp2[:])
-			buf.WriteString(e.strVal)
-			shared.AddIntrinsicToBloom(bloom, []byte(e.strVal))
-			if first {
-				minVal = e.strVal
+			strVal := e.strVal
+			if len(strVal) > 65535 {
+				strVal = strVal[:65535]
 			}
-			maxVal = e.strVal
+			binary.LittleEndian.PutUint16(tmp2[:], uint16(len(strVal))) //nolint:gosec
+			buf.Write(tmp2[:])
+			buf.WriteString(strVal)
+			shared.AddIntrinsicToBloom(bloom, []byte(strVal))
+			if first {
+				minVal = strVal
+			}
+			maxVal = strVal
 		}
 		first = false
 
@@ -700,9 +738,6 @@ func encodePagedDictColumn(c *dictAccum) ([]byte, error) {
 
 	// Assign refs to pages: chunk the total ref stream by IntrinsicPageSize.
 	// Track which refs of each entry belong to each page.
-	var pages []shared.PageMeta
-	var pageBlobs [][]byte
-
 	totalRefs := 0
 	for _, e := range c.entries {
 		totalRefs += len(e.refs)
@@ -712,6 +747,9 @@ func encodePagedDictColumn(c *dictAccum) ([]byte, error) {
 	if pageCount == 0 {
 		pageCount = 1
 	}
+
+	pages := make([]shared.PageMeta, 0, pageCount)
+	pageBlobs := make([][]byte, 0, pageCount)
 
 	var offset uint32
 	for p := range pageCount {

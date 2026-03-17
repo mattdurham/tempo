@@ -30,12 +30,21 @@ var parsedMetadataCache sync.Map // key: string → value: *parsedMetadata
 
 // parsedMetadata holds all parsed results from parseV5MetadataLazy.
 type parsedMetadata struct {
+	sketchIdx     *sketchIndex
 	metadataBytes []byte
 	blockMetas    []shared.BlockMeta
 	rangeOffsets  map[string]rangeIndexMeta
 	traceIndexRaw []byte
 	tsEntries     []tsIndexEntry
-	sketchIdx     *sketchIndex
+}
+
+// ClearCaches resets all process-level caches. Intended for testing.
+// Uses Range+Delete instead of reassignment to avoid unsafely replacing a sync.Map
+// that may be in use concurrently.
+func ClearCaches() {
+	parsedSketchCache.Range(func(k, _ any) bool { parsedSketchCache.Delete(k); return true })
+	parsedIntrinsicCache.Range(func(k, _ any) bool { parsedIntrinsicCache.Delete(k); return true })
+	parsedMetadataCache.Range(func(k, _ any) bool { parsedMetadataCache.Delete(k); return true })
 }
 
 // rangeIndexMeta records the byte range within metadataBytes for a

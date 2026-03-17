@@ -795,14 +795,10 @@ func streamFilterProgram(r *Reader, program *vm.Program, opts QueryOptions, fn s
 			// Intrinsic fast path — fields resolved from intrinsic columns, no block read.
 			fields = row.IntrinsicFields
 			if v, ok := fields.GetField("trace:id"); ok {
-				if b, ok := v.(string); ok {
-					traceIDHex = b
-				}
+				traceIDHex = hexEncodeField(v)
 			}
 			if v, ok := fields.GetField("span:id"); ok {
-				if b, ok := v.(string); ok {
-					spanIDHex = b
-				}
+				spanIDHex = hexEncodeField(v)
 			}
 		} else {
 			fields = modules_blockio.NewSpanFieldsAdapter(row.Block, row.RowIdx)
@@ -856,6 +852,13 @@ type LogQueryOptions struct {
 // path. When pipeline stages are present, the native LogQL engine is used.
 //
 // Direction defaults to backward, traversing blocks from newest to oldest.
+//
+// Field access via SpanMatch.Fields: for log queries (pipeline path), each
+// SpanMatch exposes log:body, log:timestamp, resource.__loki_labels__, and
+// log.* ColumnTypeString attributes. It does not expose individual resource.*
+// label columns (e.g. GetField("service.name") returns ""). Callers needing
+// the full resource label set should parse the resource.__loki_labels__ string,
+// or use QueryTraceQL which uses SpanFieldsAdapter with lazy full-column access.
 func QueryLogQL(r *Reader, logqlQuery string, opts LogQueryOptions) (results []SpanMatch, err error) {
 	defer func() {
 		if rec := recover(); rec != nil {
@@ -937,10 +940,10 @@ func streamLogQLWithPipeline(
 	}
 	for _, entry := range entries {
 		match := &SpanMatch{Fields: &logEntryFields{
-			labelsMap: entry.Labels,
-			logAttrs:  entry.LogAttrs,
-			line:      entry.Line,
-			timestamp: entry.TimestampNanos,
+			lokiLabels: entry.LokiLabels,
+			logAttrs:   entry.LogAttrs,
+			line:       entry.Line,
+			timestamp:  entry.TimestampNanos,
 		}}
 		if !fn(match, true) {
 			break
@@ -950,16 +953,25 @@ func streamLogQLWithPipeline(
 	return nil
 }
 
-// logEntryFields adapts a log entry's labels to SpanFieldsProvider.
-// logAttrs holds log.* ColumnTypeString values (original LogRecord attributes) keyed
-// by full column name (e.g. "log.detected_level") so that extractStructuredMetadata
-// can find them via their "log." prefix. These are distinct from pipeline-derived labels
-// which are stored in labels with the prefix stripped.
+// logEntryFields adapts a log entry to SpanFieldsProvider.
+// lokiLabels is the raw resource.__loki_labels__ string (stream selector).
+// logAttrs holds log.* ColumnTypeString values as parallel name/value slices
+// (e.g. Names=["log.detected_level"]) so extractStructuredMetadata can find them via
+// the "log." prefix. IterateFields emits only these three sets — no full
+// resource-label map is built per row.
+//
+// NOTE: This exposes a reduced field set compared to SpanFieldsAdapter (used by the
+// trace query path via streamFilterProgram). SpanFieldsAdapter lazily resolves any
+// column by full name; logEntryFields only exposes log:body, log:timestamp,
+// resource.__loki_labels__, and log.* ColumnTypeString attributes. This is intentional:
+// the log pipeline path (streamLogQLWithPipeline) materializes only the fields that
+// downstream consumers (the LokiConverter) actually need. Callers requiring full
+// column access should use QueryTraceQL or the streamFilterProgram path instead.
 type logEntryFields struct {
-	labelsMap map[string]string
-	logAttrs  map[string]string
-	line      string
-	timestamp uint64
+	lokiLabels string
+	line       string
+	logAttrs   modules_executor.LogAttrs
+	timestamp  uint64
 }
 
 func (f *logEntryFields) GetField(name string) (any, bool) {
@@ -968,14 +980,15 @@ func (f *logEntryFields) GetField(name string) (any, bool) {
 		return f.line, true
 	case "log:timestamp":
 		return f.timestamp, true
+	case "resource.__loki_labels__":
+		return f.lokiLabels, true
 	}
-	if f.logAttrs != nil {
-		if v, ok := f.logAttrs[name]; ok {
-			return v, true
+	for i, n := range f.logAttrs.Names {
+		if n == name {
+			return f.logAttrs.Values[i], true
 		}
 	}
-	v, ok := f.labelsMap[name]
-	return v, ok
+	return "", false
 }
 
 func (f *logEntryFields) IterateFields(fn func(name string, value any) bool) {
@@ -985,13 +998,13 @@ func (f *logEntryFields) IterateFields(fn func(name string, value any) bool) {
 	if !fn("log:timestamp", f.timestamp) {
 		return
 	}
-	for k, v := range f.logAttrs {
-		if !fn(k, v) {
+	if f.lokiLabels != "" {
+		if !fn("resource.__loki_labels__", f.lokiLabels) {
 			return
 		}
 	}
-	for k, v := range f.labelsMap {
-		if !fn(k, v) {
+	for i, k := range f.logAttrs.Names {
+		if !fn(k, f.logAttrs.Values[i]) {
 			return
 		}
 	}
@@ -1189,8 +1202,20 @@ func streamLogProgram(r *Reader, program *vm.Program, opts LogQueryOptions, fn s
 		return err
 	}
 	for _, row := range rows {
-		fields := modules_blockio.NewSpanFieldsAdapter(row.Block, row.RowIdx)
-		traceIDHex, spanIDHex := extractIDs(row.Block, row.RowIdx)
+		var fields SpanFieldsProvider
+		var traceIDHex, spanIDHex string
+		if row.IntrinsicFields != nil {
+			fields = row.IntrinsicFields
+			if v, ok := fields.GetField("trace:id"); ok {
+				traceIDHex = hexEncodeField(v)
+			}
+			if v, ok := fields.GetField("span:id"); ok {
+				spanIDHex = hexEncodeField(v)
+			}
+		} else {
+			fields = modules_blockio.NewSpanFieldsAdapter(row.Block, row.RowIdx)
+			traceIDHex, spanIDHex = extractIDs(row.Block, row.RowIdx)
+		}
 		match := &SpanMatch{Fields: fields, TraceID: traceIDHex, SpanID: spanIDHex}
 		if !fn(match, true) {
 			break
@@ -1201,7 +1226,11 @@ func streamLogProgram(r *Reader, program *vm.Program, opts LogQueryOptions, fn s
 }
 
 // extractIDs extracts hex-encoded trace ID and span ID strings from a block row.
+// Returns empty strings when block is nil (intrinsic fast-path rows have no block).
 func extractIDs(block *modules_reader.Block, rowIdx int) (traceID, spanID string) {
+	if block == nil {
+		return "", ""
+	}
 	if col := block.GetColumn("trace:id"); col != nil {
 		if v, ok := col.BytesValue(rowIdx); ok {
 			traceID = fmt.Sprintf("%x", v)
@@ -1213,6 +1242,18 @@ func extractIDs(block *modules_reader.Block, rowIdx int) (traceID, spanID string
 		}
 	}
 	return traceID, spanID
+}
+
+// hexEncodeField converts a field value (string or []byte) to a hex string.
+// Used for trace:id and span:id which are stored as bytes in intrinsic columns.
+func hexEncodeField(v any) string {
+	switch b := v.(type) {
+	case string:
+		return b
+	case []byte:
+		return hex.EncodeToString(b)
+	}
+	return ""
 }
 
 // FileLayoutReport is the top-level result of AnalyzeFileLayout.
@@ -1580,4 +1621,10 @@ func CompactBlocks(
 	}
 	paths, _, err := modules_compaction.CompactBlocks(ctx, converted, cfg, output)
 	return paths, err
+}
+
+// ClearReaderCaches resets all process-level reader caches (metadata, sketch, intrinsic).
+// Intended for test isolation.
+func ClearReaderCaches() {
+	modules_reader.ClearCaches()
 }

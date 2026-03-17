@@ -236,6 +236,47 @@ func ProgramIsIntrinsicOnly(program *vm.Program) bool {
 	return true
 }
 
+// nodeHasIntrinsicLeaf reports whether the given RangeNode tree contains at least one
+// leaf whose column is an intrinsic column (present in traceIntrinsicColumns or
+// logIntrinsicColumns).
+func nodeHasIntrinsicLeaf(node vm.RangeNode) bool {
+	if len(node.Children) == 0 {
+		// Leaf node.
+		_, inTrace := traceIntrinsicColumns[node.Column]
+		_, inLog := logIntrinsicColumns[node.Column]
+		return inTrace || inLog
+	}
+	for _, child := range node.Children {
+		if nodeHasIntrinsicLeaf(child) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasSomeIntrinsicPredicates reports whether the program contains at least one predicate
+// leaf referencing an intrinsic column (e.g. resource.service.name, span:duration,
+// span:kind). Returns false for nil programs, match-all programs (nil Predicates or
+// empty Nodes), and programs with only non-intrinsic predicates.
+//
+// This is the gate for the unified intrinsic pre-filter path: a wider gate than
+// ProgramIsIntrinsicOnly, which requires ALL columns to be intrinsic. Mixed queries
+// like { resource.service.name = "svc" && span.http.method = "GET" } now benefit from
+// intrinsic pre-filtering even though they also reference non-intrinsic columns.
+//
+// NOTE-038: See NOTES.md for the design rationale and 4-case dispatch.
+func hasSomeIntrinsicPredicates(program *vm.Program) bool {
+	if program == nil || program.Predicates == nil {
+		return false
+	}
+	for _, node := range program.Predicates.Nodes {
+		if nodeHasIntrinsicLeaf(node) {
+			return true
+		}
+	}
+	return false
+}
+
 // BlocksFromIntrinsicTOC returns the set of block indices that may contain rows
 // matching the given predicate program, using the intrinsic column section.
 //
@@ -1249,9 +1290,12 @@ func intersectBlockRefSets(sets [][]modules_shared.BlockRef, limit int) []module
 // OR nodes: union all children refs; fail if any child is not evaluable.
 // AND nodes: intersect all children refs; fail if any child is not evaluable.
 //
-// NOTE-039: recursive OR/AND evaluation for intrinsic fast path. Both OR and AND must
-// fail fast on unevaluable children because refs are returned directly as results without
-// VM re-evaluation — skipping any child would return rows that don't satisfy the full predicate.
+// This strict variant is used for the pure-intrinsic path (ProgramIsIntrinsicOnly = true)
+// where refs are returned directly as results without VM re-evaluation — skipping any child
+// would return rows that don't satisfy the full predicate.
+//
+// NOTE-038: For mixed queries, use evalNodeBlockRefsPartialAND instead. That variant skips
+// unevaluable AND children and requires VM re-evaluation after fetching candidate blocks.
 func evalNodeBlockRefs(
 	r *modules_reader.Reader,
 	node vm.RangeNode,
@@ -1287,8 +1331,10 @@ func evalNodeBlockRefs(
 	}
 
 	// AND: intersect — all children must be evaluable.
-	// Refs are returned directly as results without VM re-evaluation, so skipping
-	// any child would return rows that do not satisfy the full predicate.
+	// Refs are returned directly as results without VM re-evaluation (pure intrinsic path),
+	// so skipping any child would return rows that do not satisfy the full predicate.
+	// NOTE-038: For mixed queries use evalNodeBlockRefsPartialAND which allows skipping
+	// non-intrinsic children.
 	var evaluableSets [][]modules_shared.BlockRef
 	for _, child := range node.Children {
 		childRefs, ok := evalNodeBlockRefs(r, child, overFetch)
@@ -1299,6 +1345,66 @@ func evalNodeBlockRefs(
 	}
 	if len(evaluableSets) == 0 {
 		return nil, false
+	}
+	return intersectBlockRefSets(evaluableSets, overFetch), true
+}
+
+// evalNodeBlockRefsPartialAND is a variant of evalNodeBlockRefs where AND nodes skip
+// unevaluable children rather than failing. The result is a superset of the true
+// matching rows — callers MUST re-evaluate the full predicate via program.ColumnPredicate
+// after fetching the candidate blocks.
+//
+// OR nodes remain fail-fast: an unevaluable OR child would produce an unbounded superset
+// that spans the entire file, defeating the pre-filter purpose.
+//
+// NOTE-038: Used by blockRefsFromIntrinsicPartial for mixed-query pre-filtering.
+func evalNodeBlockRefsPartialAND(
+	r *modules_reader.Reader,
+	node vm.RangeNode,
+	overFetch int,
+) ([]modules_shared.BlockRef, bool) {
+	// Leaf node.
+	if len(node.Children) == 0 {
+		if node.Column == "" {
+			return nil, false
+		}
+		refs := scanIntrinsicLeafRefs(r, node.Column, node, overFetch)
+		return refs, refs != nil
+	}
+
+	if node.IsOR {
+		// OR: union — all children must be evaluable (conservative: unevaluable OR
+		// child would be unbounded superset).
+		var union []modules_shared.BlockRef
+		for _, child := range node.Children {
+			childRefs, ok := evalNodeBlockRefsPartialAND(r, child, overFetch)
+			if !ok {
+				return nil, false
+			}
+			if union == nil {
+				union = childRefs
+			} else {
+				union = unionBlockRefs(union, childRefs)
+			}
+		}
+		if union == nil {
+			union = []modules_shared.BlockRef{}
+		}
+		return union, true
+	}
+
+	// AND: partial intersection — skip unevaluable children.
+	// Result is a superset; caller must VM-re-evaluate to correct it.
+	var evaluableSets [][]modules_shared.BlockRef
+	for _, child := range node.Children {
+		childRefs, ok := evalNodeBlockRefsPartialAND(r, child, overFetch)
+		if !ok {
+			continue // skip this child — do not intersect
+		}
+		evaluableSets = append(evaluableSets, childRefs)
+	}
+	if len(evaluableSets) == 0 {
+		return nil, false // no child was evaluable — this node contributes nothing
 	}
 	return intersectBlockRefSets(evaluableSets, overFetch), true
 }
@@ -1360,6 +1466,55 @@ func BlockRefsFromIntrinsicTOC(r *modules_reader.Reader, program *vm.Program, li
 	return result
 }
 
+// blockRefsFromIntrinsicPartial returns candidate BlockRefs for a mixed query using
+// partial-AND semantics. Unevaluable top-level nodes are skipped (not treated as failures).
+// If no top-level node is evaluable, returns nil (fast path not applicable).
+//
+// The returned refs are a SUPERSET of the true matching rows. Callers must
+// re-evaluate the full predicate using program.ColumnPredicate after fetching blocks.
+//
+// NOTE-038: Partial-AND variant used by the unified collectFromIntrinsicRefs for cases
+// where ProgramIsIntrinsicOnly is false.
+func blockRefsFromIntrinsicPartial(r *modules_reader.Reader, program *vm.Program, limit int) []modules_shared.BlockRef {
+	if !r.HasIntrinsicSection() || program == nil || program.Predicates == nil {
+		return nil
+	}
+	if len(program.Predicates.Nodes) == 0 {
+		return nil
+	}
+	if limit < 0 {
+		return nil
+	}
+
+	totalLeaves := 0
+	for _, node := range program.Predicates.Nodes {
+		totalLeaves += countIntrinsicLeaves(node)
+	}
+	if totalLeaves == 0 {
+		return nil
+	}
+	overFetch := 0
+	if limit > 0 {
+		overFetch = limit * totalLeaves
+	}
+
+	// Evaluate each top-level node with partial-AND semantics.
+	// Unevaluable top-level nodes are skipped (not failures).
+	var topSets [][]modules_shared.BlockRef
+	for _, node := range program.Predicates.Nodes {
+		refs, ok := evalNodeBlockRefsPartialAND(r, node, overFetch)
+		if !ok {
+			continue // this node has no intrinsic constraint — skip it
+		}
+		topSets = append(topSets, refs)
+	}
+	if len(topSets) == 0 {
+		return nil // no usable intrinsic constraint at all
+	}
+
+	return intersectBlockRefSets(topSets, limit)
+}
+
 // scanIntrinsicLeafRefs loads the raw column blob and scans it directly for matching refs,
 // avoiding full struct materialization. Falls back to the full-decode path if raw scanning
 // is not applicable (e.g., bytes flat columns, regex patterns).
@@ -1398,41 +1553,28 @@ func scanIntrinsicLeafRefs(
 				return re.MatchString(value)
 			}, nil, maxRefs)
 		}
-		// Build match sets.
+		// Build match sets and bloom keys in one pass.
+		// NOTE-040: merged from two sequential loops — identical switch structure, no ordering dependency.
 		wantStr := make(map[string]struct{}, len(leaf.Values))
 		wantInt := make(map[int64]struct{}, len(leaf.Values))
-		for _, v := range leaf.Values {
-			switch v.Type {
-			case vm.TypeString:
-				if s, ok := v.Data.(string); ok {
-					wantStr[s] = struct{}{}
-				}
-			case vm.TypeInt:
-				if i, ok := v.Data.(int64); ok {
-					wantInt[i] = struct{}{}
-				}
-			case vm.TypeDuration:
-				if i, ok := v.Data.(int64); ok {
-					wantInt[i] = struct{}{}
-				}
-			}
-		}
-		// Build bloom keys for page-level pruning on v2 paged blobs.
 		bloomKeys := make([][]byte, 0, len(leaf.Values))
 		for _, v := range leaf.Values {
 			switch v.Type {
 			case vm.TypeString:
 				if s, ok := v.Data.(string); ok {
+					wantStr[s] = struct{}{}
 					bloomKeys = append(bloomKeys, []byte(s))
 				}
 			case vm.TypeInt:
 				if i, ok := v.Data.(int64); ok {
+					wantInt[i] = struct{}{}
 					var buf [8]byte
 					binary.LittleEndian.PutUint64(buf[:], uint64(i)) //nolint:gosec
 					bloomKeys = append(bloomKeys, buf[:])
 				}
 			case vm.TypeDuration:
 				if i, ok := v.Data.(int64); ok {
+					wantInt[i] = struct{}{}
 					var buf [8]byte
 					binary.LittleEndian.PutUint64(buf[:], uint64(i)) //nolint:gosec
 					bloomKeys = append(bloomKeys, buf[:])

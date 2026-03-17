@@ -40,6 +40,14 @@ type Column struct {
 	// All lazy decodes complete within the same block's row loop before bwb goes out of scope.
 	rawEncoding []byte
 
+	// sparseDictIdx holds the raw sparse dict indexes before the dense Idx slice is built.
+	// Non-nil means expandDenseIdx() has not been called yet (lazy dense expansion).
+	// Set by decodeDictKind2Sparse / decodeRLEIndexes; cleared after first value access.
+	// NOTE-PERF-1: sparse dict columns (kind 2 / kind 7 RLE) defer the O(spanCount)
+	// expandSparseIndexes allocation until the column is first accessed, avoiding
+	// allocation for columns that are decoded but never read (e.g. early block exit).
+	sparseDictIdx []uint32
+
 	// Total span count this column covers (including nulls).
 	SpanCount int
 	Type      shared.ColumnType
@@ -59,6 +67,19 @@ func (c *Column) EnsureDecoded() {
 	if c.rawEncoding != nil {
 		c.decodeNow()
 	}
+	c.expandDenseIdx()
+}
+
+// expandDenseIdx builds the dense Idx slice from sparseDictIdx + Present on first access.
+// Called automatically by StringValue, Int64Value, etc. when sparseDictIdx is set.
+// NOTE-PERF-1: deferred from decode time to first-access time.
+func (c *Column) expandDenseIdx() {
+	if c.sparseDictIdx == nil {
+		return
+	}
+	dense := expandSparseIndexes(c.sparseDictIdx, c.Present, c.SpanCount)
+	c.sparseDictIdx = nil // release sparse slice — no longer needed
+	assignDictIdx(c, dense)
 }
 
 // IsPresent reports whether span at idx has a value.
@@ -94,6 +115,7 @@ func (c *Column) StringValue(idx int) (string, bool) {
 	if c.rawEncoding != nil {
 		c.decodeNow()
 	}
+	c.expandDenseIdx()
 	if !c.IsPresent(idx) {
 		return "", false
 	}
@@ -166,6 +188,7 @@ func (c *Column) Int64Value(idx int) (int64, bool) {
 	if c.rawEncoding != nil {
 		c.decodeNow()
 	}
+	c.expandDenseIdx()
 	if !c.IsPresent(idx) {
 		return 0, false
 	}
@@ -186,6 +209,7 @@ func (c *Column) Uint64Value(idx int) (uint64, bool) {
 	if c.rawEncoding != nil {
 		c.decodeNow()
 	}
+	c.expandDenseIdx()
 	if !c.IsPresent(idx) {
 		return 0, false
 	}
@@ -206,6 +230,7 @@ func (c *Column) Float64Value(idx int) (float64, bool) {
 	if c.rawEncoding != nil {
 		c.decodeNow()
 	}
+	c.expandDenseIdx()
 	if !c.IsPresent(idx) {
 		return 0, false
 	}
@@ -226,6 +251,7 @@ func (c *Column) BoolValue(idx int) (bool, bool) {
 	if c.rawEncoding != nil {
 		c.decodeNow()
 	}
+	c.expandDenseIdx()
 	if !c.IsPresent(idx) {
 		return false, false
 	}
@@ -246,6 +272,7 @@ func (c *Column) BytesValue(idx int) ([]byte, bool) {
 	if c.rawEncoding != nil {
 		c.decodeNow()
 	}
+	c.expandDenseIdx()
 	if !c.IsPresent(idx) {
 		return nil, false
 	}

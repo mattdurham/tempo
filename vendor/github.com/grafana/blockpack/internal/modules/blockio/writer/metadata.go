@@ -388,17 +388,6 @@ func writeCompactTraceIndex(
 	return int64(n), err
 }
 
-// writeFooter writes the 22-byte v3 footer.
-func writeFooter(w io.Writer, headerOffset, compactOffset uint64, compactLen uint32) error {
-	var buf [22]byte
-	binary.LittleEndian.PutUint16(buf[0:], shared.FooterV3Version)
-	binary.LittleEndian.PutUint64(buf[2:], headerOffset)
-	binary.LittleEndian.PutUint64(buf[10:], compactOffset)
-	binary.LittleEndian.PutUint32(buf[18:], compactLen)
-	_, err := w.Write(buf[:])
-	return err
-}
-
 // writeFooterV4 writes the 34-byte v4 footer with intrinsic section offsets.
 //
 // Wire format:
@@ -409,7 +398,13 @@ func writeFooter(w io.Writer, headerOffset, compactOffset uint64, compactLen uin
 //	compact_len[4 LE]
 //	intrinsic_index_offset[8 LE]
 //	intrinsic_index_len[4 LE]
-func writeFooterV4(w io.Writer, headerOffset, compactOffset uint64, compactLen uint32, intrinsicOffset uint64, intrinsicLen uint32) error {
+func writeFooterV4(
+	w io.Writer,
+	headerOffset, compactOffset uint64,
+	compactLen uint32,
+	intrinsicOffset uint64,
+	intrinsicLen uint32,
+) error {
 	var buf [34]byte
 	binary.LittleEndian.PutUint16(buf[0:], shared.FooterV4Version)
 	binary.LittleEndian.PutUint64(buf[2:], headerOffset)

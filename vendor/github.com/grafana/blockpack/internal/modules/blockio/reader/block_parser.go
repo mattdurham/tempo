@@ -209,6 +209,7 @@ func parseBlockColumnsReuse(
 		col.BytesInline = decoded.BytesInline
 		col.Present = decoded.Present
 		col.SpanCount = decoded.SpanCount
+		col.sparseDictIdx = decoded.sparseDictIdx // NOTE-PERF-1: lazy dense expansion
 
 		columns[key] = col
 	}
@@ -286,4 +287,5 @@ func resetColumn(col *Column) {
 	// NOTE-001: clear lazy decode fields so reused columns don't carry stale state.
 	col.rawEncoding = nil
 	col.internMap = nil
+	col.sparseDictIdx = nil // NOTE-PERF-1: clear deferred dense expansion
 }

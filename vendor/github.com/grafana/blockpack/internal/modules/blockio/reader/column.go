@@ -316,6 +316,7 @@ func (c *Column) decodeNow() {
 	c.BytesDict = decoded.BytesDict
 	c.BytesIdx = decoded.BytesIdx
 	c.BytesInline = decoded.BytesInline
+	c.sparseDictIdx = decoded.sparseDictIdx // NOTE-PERF-1: lazy dense expansion
 
 	c.rawEncoding = nil // signal: fully decoded
 	c.internMap = nil   // release borrowed reference
@@ -507,9 +508,8 @@ func decodeDictionary(
 		pos = newPos
 		_ = pos
 
-		// Expand sparse indexes to dense (one entry per span row; absent rows get 0).
-		idx := expandSparseIndexes(sparseIdx, present, spanCount)
-		assignDictIdx(col, idx)
+		// Defer dense expansion to first value access (NOTE-PERF-1).
+		col.sparseDictIdx = sparseIdx
 	}
 
 	return col, nil
@@ -831,7 +831,9 @@ func decodeRLEIndexes(
 			)
 		}
 
-		denseIdx = expandSparseIndexes(sparseIdx, present, spanCount)
+		// Defer dense expansion to first value access (NOTE-PERF-1).
+		col.sparseDictIdx = sparseIdx
+		return col, nil
 	}
 
 	assignDictIdx(col, denseIdx)
