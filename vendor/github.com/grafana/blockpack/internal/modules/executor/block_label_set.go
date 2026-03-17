@@ -279,75 +279,7 @@ func releaseBlockLabelSet(bls *blockLabelSet) {
 	blockLabelSetPool.Put(bls)
 }
 
-// buildBlockColMaps builds colNames (original column names), colMap (label name ->
-// index into colNames), and colCols (parallel *Column slice) for the given block.
-// Called once per block in the scan loop.
-// Only resource.* and log.* columns that can contribute labels are included.
-//
-// Precedence rules for the same stripped label name (e.g. "level"):
-//  1. resource.* always wins over log.* (OTLP attribute scope takes priority).
-//  2. Within the same scope, ColumnTypeString wins over ColumnTypeRangeString
-//     (explicit OTLP attribute wins over auto-parsed body field).
-//
-// This makes precedence deterministic regardless of map iteration order.
-//
-// NOTE-019: colCols[i] and colNames[i] always refer to the same column. Both slices
-// are built in lockstep — every append to colNames is immediately followed by an append
-// to colCols. This converts O(M) GetColumn map scans to O(1) slice indexing per row.
-func buildBlockColMaps(
-	block *modules_reader.Block,
-) (colNames []string, colMap map[string]int, colCols []*modules_reader.Column) {
-	cols := block.Columns()
-	colNames = make([]string, 0, len(cols))
-	colMap = make(map[string]int, len(cols))
-	colCols = make([]*modules_reader.Column, 0, len(cols))
-
-	// Two-pass: first resource.* (explicit OTLP attrs), then log.* (body-parsed fields).
-	// Within each pass, ColumnTypeString beats ColumnTypeRangeString for the same name.
-	type candidate struct {
-		col     *modules_reader.Column
-		colName string
-		colType modules_shared.ColumnType
-	}
-	// Collect log.* candidates keyed by label name so we can apply type precedence.
-	logCandidates := make(map[string]candidate, len(cols))
-
-	for key, c := range cols {
-		name := key.Name
-		isString := key.Type == modules_shared.ColumnTypeString
-		if after, ok := strings.CutPrefix(name, "resource."); ok {
-			if _, dup := colMap[after]; dup {
-				continue // resource.* already registered
-			}
-			colMap[after] = len(colNames)
-			colNames = append(colNames, name)
-			colCols = append(colCols, c)
-		} else if after, ok := strings.CutPrefix(name, "log."); ok {
-			if prev, exists := logCandidates[after]; exists {
-				// ColumnTypeString wins; skip if existing is already String.
-				prevIsString := prev.colType == modules_shared.ColumnTypeString
-				if prevIsString || !isString {
-					continue
-				}
-			}
-			logCandidates[after] = candidate{colName: name, col: c, colType: key.Type}
-		}
-	}
-
-	// Apply log.* candidates only for label names not already covered by resource.*.
-	for labelName, cand := range logCandidates {
-		if _, covered := colMap[labelName]; covered {
-			continue
-		}
-		colMap[labelName] = len(colNames)
-		colNames = append(colNames, cand.colName)
-		colCols = append(colCols, cand.col)
-	}
-
-	return colNames, colMap, colCols
-}
-
-// buildBlockColMapsWithLogCache combines buildBlockColMaps and buildLogStringColCache
+// buildBlockColMapsWithLogCache combines column-map construction and log string column caching
 // into a single block.Columns() pass, reducing per-block iteration overhead.
 // logStrNames and logStrCols are the same outputs as buildLogStringColCache.
 func buildBlockColMapsWithLogCache(

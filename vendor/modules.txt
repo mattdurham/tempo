@@ -727,7 +727,7 @@ github.com/googleapis/gax-go/v2/iterator
 # github.com/gorilla/mux v1.8.1
 ## explicit; go 1.20
 github.com/gorilla/mux
-# github.com/grafana/blockpack v0.0.0-20260308224815-c1a38b35d211 => /home/matt/source/blockpack-tempo-worktrees/feat/intrinsic-columns
+# github.com/grafana/blockpack v0.0.0-20260308224815-c1a38b35d211 => /home/matt/source/blockpack-tempo
 ## explicit; go 1.26.0
 github.com/grafana/blockpack
 github.com/grafana/blockpack/internal/logqlparser
@@ -1521,8 +1521,6 @@ github.com/stretchr/testify/require
 # github.com/subosito/gotenv v1.6.0
 ## explicit; go 1.18
 github.com/subosito/gotenv
-# github.com/theory/jsonpath v0.10.2
-## explicit; go 1.23
 # github.com/tinylib/msgp v1.6.1
 ## explicit; go 1.24
 github.com/tinylib/msgp/msgp
@@ -2609,4 +2607,4 @@ k8s.io/utils/clock
 # k8s.io/api => k8s.io/api v0.35.1
 # k8s.io/client-go => k8s.io/client-go v0.35.1
 # github.com/hashicorp/memberlist => github.com/grafana/memberlist v0.3.1-0.20251024160842-5cd332c2849a
-# github.com/grafana/blockpack => /home/matt/source/blockpack-tempo-worktrees/feat/intrinsic-columns
+# github.com/grafana/blockpack => /home/matt/source/blockpack-tempo

@@ -1,5 +1,7 @@
 package vm
 
+// NOTE: Any changes to this file must be reflected in the corresponding NOTES.md.
+
 import (
 	"bytes"
 	"encoding/hex"
@@ -295,6 +297,44 @@ func (c *traceqlCompiler) compileColumnPredicateBinary(expr *traceqlparser.Binar
 	}
 }
 
+// NOTE-043: unscopedOrScoped eliminates three identical unscoped attribute expansion
+// blocks from compileColumnPredicateComparison. See internal/vm/NOTES.md §NOTE-043.
+//
+// unscopedOrScoped returns a ColumnPredicate that, for unscoped user attributes,
+// scans resource.*, span.*, and log.* columns and unions the results. For scoped
+// attributes or built-ins, it scans only the named column.
+// scan must be a closure that captures all scan-function arguments except the
+// provider and column name.
+func unscopedOrScoped(
+	fieldExpr *traceqlparser.FieldExpr,
+	attrName string,
+	scan func(ColumnDataProvider, string) (RowSet, error),
+) ColumnPredicate {
+	if fieldExpr.Scope == "" && !isBuiltInField(attrName) {
+		rName := "resource." + fieldExpr.Name
+		sName := "span." + fieldExpr.Name
+		lName := "log." + fieldExpr.Name
+		return func(provider ColumnDataProvider) (RowSet, error) {
+			rs, err := scan(provider, rName)
+			if err != nil {
+				return nil, err
+			}
+			ss, err := scan(provider, sName)
+			if err != nil {
+				return nil, err
+			}
+			ls, err := scan(provider, lName)
+			if err != nil {
+				return nil, err
+			}
+			return provider.Union(provider.Union(rs, ss), ls), nil
+		}
+	}
+	return func(provider ColumnDataProvider) (RowSet, error) {
+		return scan(provider, attrName)
+	}
+}
+
 func (c *traceqlCompiler) compileColumnPredicateComparison(expr *traceqlparser.BinaryExpr) (ColumnPredicate, error) {
 	// Extract field and literal
 	fieldExpr, ok := expr.Left.(*traceqlparser.FieldExpr)
@@ -333,58 +373,18 @@ func (c *traceqlCompiler) compileColumnPredicateComparison(expr *traceqlparser.B
 			// of the NFA regex engine, avoiding tryBacktrack overhead.
 			if a := AnalyzeRegex(strVal); a != nil && a.IsLiteralContains && a.CaseInsensitive {
 				lp := a.Prefixes // pre-lowercased
-				if fieldExpr.Scope == "" && !isBuiltInField(attrName) {
-					rName := "resource." + fieldExpr.Name
-					sName := "span." + fieldExpr.Name
-					lName := "log." + fieldExpr.Name
-					return func(provider ColumnDataProvider) (RowSet, error) {
-						rs, err := scanColumnRegexFast(provider, rName, nil, lp, notMatch)
-						if err != nil {
-							return nil, err
-						}
-						ss, err := scanColumnRegexFast(provider, sName, nil, lp, notMatch)
-						if err != nil {
-							return nil, err
-						}
-						ls, err := scanColumnRegexFast(provider, lName, nil, lp, notMatch)
-						if err != nil {
-							return nil, err
-						}
-						return provider.Union(provider.Union(rs, ss), ls), nil
-					}, nil
-				}
-				return func(provider ColumnDataProvider) (RowSet, error) {
-					return scanColumnRegexFast(provider, attrName, nil, lp, notMatch)
-				}, nil
+				return unscopedOrScoped(fieldExpr, attrName, func(p ColumnDataProvider, name string) (RowSet, error) {
+					return scanColumnRegexFast(p, name, nil, lp, notMatch)
+				}), nil
 			}
 			re, err := regexp.Compile(strVal)
 			if err != nil {
 				return nil, fmt.Errorf("invalid regex %q: %w", strVal, err)
 			}
 			prefixes := RegexPrefixes(strVal)
-			if fieldExpr.Scope == "" && !isBuiltInField(attrName) {
-				rName := "resource." + fieldExpr.Name
-				sName := "span." + fieldExpr.Name
-				lName := "log." + fieldExpr.Name
-				return func(provider ColumnDataProvider) (RowSet, error) {
-					rs, err := scanColumnRegexFast(provider, rName, re, prefixes, notMatch)
-					if err != nil {
-						return nil, err
-					}
-					ss, err := scanColumnRegexFast(provider, sName, re, prefixes, notMatch)
-					if err != nil {
-						return nil, err
-					}
-					ls, err := scanColumnRegexFast(provider, lName, re, prefixes, notMatch)
-					if err != nil {
-						return nil, err
-					}
-					return provider.Union(provider.Union(rs, ss), ls), nil
-				}, nil
-			}
-			return func(provider ColumnDataProvider) (RowSet, error) {
-				return scanColumnRegexFast(provider, attrName, re, prefixes, notMatch)
-			}, nil
+			return unscopedOrScoped(fieldExpr, attrName, func(p ColumnDataProvider, name string) (RowSet, error) {
+				return scanColumnRegexFast(p, name, re, prefixes, notMatch)
+			}), nil
 		}
 		return nil, fmt.Errorf("regex operator requires string value")
 	}
@@ -402,31 +402,9 @@ func (c *traceqlCompiler) compileColumnPredicateComparison(expr *traceqlparser.B
 	}
 
 	// Unscoped user attributes expand to OR across resource, span, and log scopes.
-	if fieldExpr.Scope == "" && !isBuiltInField(attrName) {
-		resourceName := "resource." + fieldExpr.Name
-		spanName := "span." + fieldExpr.Name
-		logName := "log." + fieldExpr.Name
-		return func(provider ColumnDataProvider) (RowSet, error) {
-			rs, err := scanColumnByOp(provider, resourceName, value, operator)
-			if err != nil {
-				return nil, err
-			}
-			ss, err := scanColumnByOp(provider, spanName, value, operator)
-			if err != nil {
-				return nil, err
-			}
-			ls, err := scanColumnByOp(provider, logName, value, operator)
-			if err != nil {
-				return nil, err
-			}
-			return provider.Union(provider.Union(rs, ss), ls), nil
-		}, nil
-	}
-
-	// Scoped path: single column scan.
-	return func(provider ColumnDataProvider) (RowSet, error) {
-		return scanColumnByOp(provider, attrName, value, operator)
-	}, nil
+	return unscopedOrScoped(fieldExpr, attrName, func(p ColumnDataProvider, name string) (RowSet, error) {
+		return scanColumnByOp(p, name, value, operator)
+	}), nil
 }
 
 // scanColumnByOp dispatches a column scan for the given operator.
@@ -582,19 +560,40 @@ func extractTraceQLNodes(expr traceqlparser.Expr) (nodes []RangeNode, cols []str
 	return nil, nil
 }
 
+// NOTE-044: parseBinaryExprArgs — shared preamble for extract*Node helpers.
+// See internal/vm/NOTES.md §NOTE-044.
+//
+// parseBinaryExprArgs extracts the common preamble shared by extractEqNode,
+// extractRangeNode, and extractRegexNode: left must be FieldExpr, right must be
+// LiteralExpr, the column name must not be a computed field.
+//
+// Guard order: isComputedField is checked before lit.Type in this function.
+// extractRegexNode performs the additional LitString guard after parseBinaryExprArgs
+// returns. The original per-function code checked lit.Type first (before isComputedField)
+// in extractRegexNode, but since both guards return (nil, nil), the behavior is identical.
+func parseBinaryExprArgs(
+	expr *traceqlparser.BinaryExpr,
+) (field *traceqlparser.FieldExpr, lit *traceqlparser.LiteralExpr, columnName string, ok bool) {
+	f, fok := expr.Left.(*traceqlparser.FieldExpr)
+	if !fok {
+		return nil, nil, "", false
+	}
+	l, lok := expr.Right.(*traceqlparser.LiteralExpr)
+	if !lok {
+		return nil, nil, "", false
+	}
+	col := normalizeAttributePath(f.Scope, f.Name)
+	if isComputedField(col) {
+		return nil, nil, "", false
+	}
+	return f, l, col, true
+}
+
 // extractEqNode builds a RangeNode for an equality predicate (OpEq).
 // Unscoped user attributes expand to an OR composite over all three scopes.
 func extractEqNode(expr *traceqlparser.BinaryExpr) (nodes []RangeNode, cols []string) {
-	field, ok := expr.Left.(*traceqlparser.FieldExpr)
+	field, lit, columnName, ok := parseBinaryExprArgs(expr)
 	if !ok {
-		return nil, nil
-	}
-	lit, ok := expr.Right.(*traceqlparser.LiteralExpr)
-	if !ok {
-		return nil, nil
-	}
-	columnName := normalizeAttributePath(field.Scope, field.Name)
-	if isComputedField(columnName) {
 		return nil, nil
 	}
 	vmValue, ok := convertTraceQLLiteralToValue(lit)
@@ -635,16 +634,8 @@ func extractEqNode(expr *traceqlparser.BinaryExpr) (nodes []RangeNode, cols []st
 // extractRangeNode builds a RangeNode for a range predicate (>, >=, <, <=).
 // Unscoped user attributes expand to an OR composite over all three scopes.
 func extractRangeNode(expr *traceqlparser.BinaryExpr) (nodes []RangeNode, cols []string) {
-	field, ok := expr.Left.(*traceqlparser.FieldExpr)
+	field, lit, columnName, ok := parseBinaryExprArgs(expr)
 	if !ok {
-		return nil, nil
-	}
-	lit, ok := expr.Right.(*traceqlparser.LiteralExpr)
-	if !ok {
-		return nil, nil
-	}
-	columnName := normalizeAttributePath(field.Scope, field.Name)
-	if isComputedField(columnName) {
 		return nil, nil
 	}
 	vmValue, ok := convertTraceQLLiteralToValue(lit)
@@ -683,20 +674,12 @@ func extractRangeNode(expr *traceqlparser.BinaryExpr) (nodes []RangeNode, cols [
 // extractRegexNode builds a RangeNode for a regex predicate (=~).
 // Unscoped user attributes expand to an OR composite over all three scopes.
 func extractRegexNode(expr *traceqlparser.BinaryExpr) (nodes []RangeNode, cols []string) {
-	field, ok := expr.Left.(*traceqlparser.FieldExpr)
-	if !ok {
-		return nil, nil
-	}
-	lit, ok := expr.Right.(*traceqlparser.LiteralExpr)
+	field, lit, columnName, ok := parseBinaryExprArgs(expr)
 	if !ok || lit.Type != traceqlparser.LitString {
 		return nil, nil
 	}
 	pattern, ok := lit.Value.(string)
 	if !ok {
-		return nil, nil
-	}
-	columnName := normalizeAttributePath(field.Scope, field.Name)
-	if isComputedField(columnName) {
 		return nil, nil
 	}
 

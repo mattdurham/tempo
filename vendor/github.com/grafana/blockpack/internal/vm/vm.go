@@ -1,5 +1,7 @@
 package vm
 
+// NOTE: Any changes to this file must be reflected in the corresponding NOTES.md.
+
 import (
 	"time"
 )
@@ -71,15 +73,10 @@ func MergeAggregationResults(results ...map[string]*AggBucket) map[string]*AggBu
 				// Merge into existing bucket
 				existing.Merge(bucket)
 			} else {
-				// Create new bucket with copied values
-				merged[key] = &AggBucket{
-					GroupKey: bucket.GroupKey,
-					Count:    bucket.Count,
-					Sum:      bucket.Sum,
-					Min:      bucket.Min,
-					Max:      bucket.Max,
-					Rate:     bucket.Rate,
-				}
+				// Shallow copy is safe: GroupKey.Values slice is read-only after construction.
+				// Using struct copy ensures new AggBucket fields are automatically included.
+				b := *bucket
+				merged[key] = &b
 			}
 		}
 	}
@@ -89,7 +86,7 @@ func MergeAggregationResults(results ...map[string]*AggBucket) map[string]*AggBu
 
 // GroupKey represents a unique combination of group-by field values
 type GroupKey struct {
-	Values []Value // Ordered by GROUP BY fields in query
+	Values []Value // Ordered by GROUP BY fields in query; read-only after construction — shared by shallow-copied AggBuckets.
 }
 
 // DateBinInfo holds date_bin configuration

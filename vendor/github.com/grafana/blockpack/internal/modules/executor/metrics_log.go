@@ -135,7 +135,7 @@ func ExecuteLogMetrics(
 
 		result.BlocksScanned++
 
-		colNames, colMap, colCols := buildBlockColMaps(bwb.Block)
+		colNames, colMap, colCols, _, _ := buildBlockColMapsWithLogCache(bwb.Block)
 		for _, rowIdx := range rowSet.ToSlice() {
 			logAccumulateRow(
 				bwb.Block,

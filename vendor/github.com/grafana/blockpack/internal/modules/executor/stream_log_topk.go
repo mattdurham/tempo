@@ -18,9 +18,9 @@ import (
 
 // logTopKEntry holds one pipeline-passing log row buffered during a CollectLogs scan.
 // entry is stored by value to eliminate per-row heap allocation.
+// NOTE-041: ts field removed — heap comparisons use entry.TimestampNanos directly.
 type logTopKEntry struct {
 	entry LogEntry
-	ts    uint64
 }
 
 // logTopKHeap implements heap.Interface over logTopKEntry.
@@ -38,9 +38,9 @@ func (h *logTopKHeap) Swap(i, j int) {
 
 func (h *logTopKHeap) Less(i, j int) bool {
 	if h.backward {
-		return h.entries[i].ts < h.entries[j].ts // min-heap: oldest at root
+		return h.entries[i].entry.TimestampNanos < h.entries[j].entry.TimestampNanos // min-heap: oldest at root
 	}
-	return h.entries[i].ts > h.entries[j].ts // max-heap: newest at root
+	return h.entries[i].entry.TimestampNanos > h.entries[j].entry.TimestampNanos // max-heap: newest at root
 }
 
 func (h *logTopKHeap) Push(x any) { h.entries = append(h.entries, x.(logTopKEntry)) }
@@ -57,7 +57,7 @@ func logTopKCanSkipBlock(buf *logTopKHeap, limit int, backward bool, meta shared
 	if buf.Len() < limit {
 		return false
 	}
-	worst := buf.entries[0].ts
+	worst := buf.entries[0].entry.TimestampNanos
 	if backward {
 		// min-heap root is oldest; skip if even the block's newest entry is no better.
 		return meta.MaxStart != 0 && meta.MaxStart <= worst
@@ -73,11 +73,11 @@ func logTopKInsert(buf *logTopKHeap, limit int, backward bool, entry logTopKEntr
 		heap.Push(buf, entry)
 		return
 	}
-	worst := buf.entries[0].ts
-	if backward && entry.ts > worst {
+	worst := buf.entries[0].entry.TimestampNanos
+	if backward && entry.entry.TimestampNanos > worst {
 		heap.Pop(buf)
 		heap.Push(buf, entry)
-	} else if !backward && entry.ts < worst {
+	} else if !backward && entry.entry.TimestampNanos < worst {
 		heap.Pop(buf)
 		heap.Push(buf, entry)
 	}
@@ -191,17 +191,33 @@ func CollectLogs(
 	return logDeliverAll(all, backward), nil
 }
 
-// logTopKScan iterates selected blocks, applies block-level skip checks, fetches
-// lazily, and fills buf with the top-limit pipeline-passing rows.
-func logTopKScan(
+// iterateLogRows iterates all selected blocks, applying block-level pruning, time
+// pre-filtering (NOTE-021), and per-row pipeline processing, then calls fn for each
+// pipeline-passing row.
+//
+// canSkipBlock, if non-nil, is called before issuing any I/O for a block. If it returns
+// true the block is skipped. Used by logTopKScan for heap-based block pruning (SPEC-SLK-2).
+// logCollectAll passes nil (never skip).
+//
+// canSkip, if non-nil, is called after the row timestamp is read but BEFORE lokiLabels
+// and logAttrs are materialized. If it returns true, the row is skipped cheaply without
+// incurring materialization cost. Used by logTopKScan for NOTE-031 per-row early skip.
+// logCollectAll passes nil (no per-row skip needed).
+//
+// fn receives the row timestamp and the materialized LogEntry. fn returns true to
+// continue iteration, false to stop.
+//
+// Returns the number of blocks fetched.
+func iterateLogRows(
 	r *modules_reader.Reader,
 	program *vm.Program,
 	wantColumns map[string]struct{},
 	pipeline *logqlparser.Pipeline,
 	opts CollectOptions,
 	plan *queryplanner.Plan,
-	buf *logTopKHeap,
-	backward bool,
+	canSkipBlock func(meta shared.BlockMeta) bool,
+	canSkip func(ts uint64) bool,
+	fn func(ts uint64, entry LogEntry) bool,
 ) (int, error) {
 	groups := r.CoalescedGroups(plan.SelectedBlocks)
 	blockToGroup := make(map[int]int, len(plan.SelectedBlocks))
@@ -213,12 +229,20 @@ func logTopKScan(
 
 	fetched := make(map[int][]byte)
 	fetchedGroupsSeen := make(map[int]bool)
+	skippedBlocks := make(map[int]bool)
 	fetchCount := 0
 
 	for _, blockIdx := range plan.SelectedBlocks {
 		meta := r.BlockMeta(blockIdx)
-		if logTopKCanSkipBlock(buf, opts.Limit, backward, meta) {
-			delete(fetched, blockIdx) // release bytes if already fetched in this group
+		if canSkipBlock != nil && canSkipBlock(meta) {
+			// If the group is already fetched, release bytes immediately.
+			// Otherwise record the block as skipped so we can delete it after
+			// maps.Copy brings the whole group into fetched.
+			if fetchedGroupsSeen[blockToGroup[blockIdx]] {
+				delete(fetched, blockIdx)
+			} else {
+				skippedBlocks[blockIdx] = true
+			}
 			continue
 		}
 
@@ -232,6 +256,13 @@ func logTopKScan(
 				return fetchCount, fmt.Errorf("CollectLogs ReadGroup: %w", err)
 			}
 			maps.Copy(fetched, groupRaw)
+			// Remove any blocks in this group that were already skipped before
+			// the group was fetched, so their bytes don't linger in fetched.
+			for _, bi := range groups[gi].BlockIDs {
+				if skippedBlocks[bi] {
+					delete(fetched, bi)
+				}
+			}
 			fetchCount += len(groups[gi].BlockIDs)
 			fetchedGroupsSeen[gi] = true
 		}
@@ -308,6 +339,12 @@ func logTopKScan(
 				}
 			}
 
+			// NOTE-031: per-row early skip — called after ts is read but before
+			// lokiLabels/logAttrs are materialized, avoiding unnecessary allocation.
+			if canSkip != nil && canSkip(ts) {
+				continue
+			}
+
 			// NOTE-SL-016: acquire from pool - zero map allocation for dropped rows.
 			bls := acquireBlockLabelSet(bwb.Block, rowIdx, colNames, colMap, colCols)
 			if pipeline != nil {
@@ -322,27 +359,50 @@ func logTopKScan(
 					continue
 				}
 			}
-			// NOTE-031: Early skip - if heap is full and this row's ts cannot displace the
-			// current worst entry, skip materialization entirely. Pipeline must still run
-			// above (for keep/drop decisions) but map allocations are avoided for the ~99%
-			// of rows that don't make it into the top-K.
-			if buf.Len() >= opts.Limit {
-				worst := buf.entries[0].ts
-				if (backward && ts <= worst) || (!backward && ts >= worst) {
-					releaseBlockLabelSet(bls)
-					continue
-				}
-			}
 			// Read __loki_labels__ via the post-pipeline LabelSet so that mutations
 			// (drop/keep/label_format) are respected if they affect this field.
 			lokiLabels := bls.Get("__loki_labels__")
 			logAttrs := collectLogStringAttrs(logStrNames, logStrCols, rowIdx)
 			releaseBlockLabelSet(bls)
 			entry := LogEntry{TimestampNanos: ts, Line: line, LokiLabels: lokiLabels, LogAttrs: logAttrs}
-			logTopKInsert(buf, opts.Limit, backward, logTopKEntry{entry: entry, ts: ts})
+			if !fn(ts, entry) {
+				return fetchCount, nil
+			}
 		}
 	}
 	return fetchCount, nil
+}
+
+// logTopKScan iterates selected blocks, applies block-level skip checks, fetches
+// lazily, and fills buf with the top-limit pipeline-passing rows.
+func logTopKScan(
+	r *modules_reader.Reader,
+	program *vm.Program,
+	wantColumns map[string]struct{},
+	pipeline *logqlparser.Pipeline,
+	opts CollectOptions,
+	plan *queryplanner.Plan,
+	buf *logTopKHeap,
+	backward bool,
+) (int, error) {
+	return iterateLogRows(r, program, wantColumns, pipeline, opts, plan,
+		func(meta shared.BlockMeta) bool {
+			return logTopKCanSkipBlock(buf, opts.Limit, backward, meta)
+		},
+		// NOTE-031: per-row early skip — called before lokiLabels/logAttrs materialization.
+		// If the heap is full and this ts cannot displace the worst entry, skip cheaply.
+		func(ts uint64) bool {
+			if buf.Len() < opts.Limit {
+				return false
+			}
+			worst := buf.entries[0].entry.TimestampNanos
+			return (backward && ts <= worst) || (!backward && ts >= worst)
+		},
+		func(ts uint64, entry LogEntry) bool {
+			logTopKInsert(buf, opts.Limit, backward, logTopKEntry{entry: entry})
+			return true
+		},
+	)
 }
 
 // logCollectAll scans all selected blocks without heap pruning, collecting every
@@ -356,130 +416,14 @@ func logCollectAll(
 	plan *queryplanner.Plan,
 	all *[]logTopKEntry,
 ) (int, error) {
-	groups := r.CoalescedGroups(plan.SelectedBlocks)
-	blockToGroup := make(map[int]int, len(plan.SelectedBlocks))
-	for gi, g := range groups {
-		for _, bi := range g.BlockIDs {
-			blockToGroup[bi] = gi
-		}
-	}
-
-	fetched := make(map[int][]byte)
-	fetchedGroupsSeen := make(map[int]bool)
-	fetchCount := 0
-
-	for _, blockIdx := range plan.SelectedBlocks {
-		gi, ok := blockToGroup[blockIdx]
-		if !ok {
-			continue
-		}
-		if !fetchedGroupsSeen[gi] {
-			groupRaw, err := r.ReadGroup(groups[gi])
-			if err != nil {
-				return fetchCount, fmt.Errorf("CollectLogs ReadGroup: %w", err)
-			}
-			maps.Copy(fetched, groupRaw)
-			fetchCount += len(groups[gi].BlockIDs)
-			fetchedGroupsSeen[gi] = true
-		}
-
-		meta := r.BlockMeta(blockIdx)
-		raw, ok := fetched[blockIdx]
-		if !ok {
-			continue
-		}
-		delete(fetched, blockIdx)
-
-		r.ResetInternStrings()
-		bwb, err := r.ParseBlockFromBytes(raw, wantColumns, meta)
-		if err != nil {
-			return fetchCount, fmt.Errorf("CollectLogs ParseBlockFromBytes block %d: %w", blockIdx, err)
-		}
-
-		rowSet, err := program.ColumnPredicate(NewColumnProvider(bwb.Block))
-		if err != nil {
-			return fetchCount, fmt.Errorf("CollectLogs ColumnPredicate block %d: %w", blockIdx, err)
-		}
-
-		if rowSet.Size() == 0 {
-			continue
-		}
-
-		// NOTE-021: pre-filter by time using first-pass block before full second-pass decode.
-		// log:timestamp is guaranteed present (injected into wantColumns above).
-		rows := rowSet.ToSlice()
-		var keptByTime []int
-		if opts.TimeRange.MinNano > 0 || opts.TimeRange.MaxNano > 0 {
-			keptByTime = make([]int, 0, len(rows))
-			firstPassTSCol := bwb.Block.GetColumn("log:timestamp")
-			for _, rowIdx := range rows {
-				ts := uint64(0)
-				if firstPassTSCol != nil {
-					if v, ok := firstPassTSCol.Uint64Value(rowIdx); ok {
-						ts = v
-					}
-				}
-				if opts.TimeRange.MinNano > 0 && ts < opts.TimeRange.MinNano {
-					continue
-				}
-				if opts.TimeRange.MaxNano > 0 && ts > opts.TimeRange.MaxNano {
-					continue
-				}
-				keptByTime = append(keptByTime, rowIdx)
-			}
-			if len(keptByTime) == 0 {
-				continue // skip second-pass decode entirely
-			}
-		} else {
-			keptByTime = rows
-		}
-
-		// NOTE-001: Lazy registration in ParseBlockFromBytes registers all columns with
-		// presence-only decode. Full decode is triggered on first value access - no AddColumnsToBlock needed.
-
-		// Cache column pointers for the row loop.
-		tsCol := bwb.Block.GetColumn("log:timestamp")
-		bodyCol := bwb.Block.GetColumn("log:body")
-		colNames, colMap, colCols, logStrNames, logStrCols := buildBlockColMapsWithLogCache(bwb.Block)
-		skipParsers := pipeline != nil && blockHasBodyParsed(bwb.Block)
-		for _, rowIdx := range keptByTime {
-			var ts uint64
-			if tsCol != nil {
-				if v, ok := tsCol.Uint64Value(rowIdx); ok {
-					ts = v
-				}
-			}
-			var line string
-			if bodyCol != nil {
-				if v, ok := bodyCol.StringValue(rowIdx); ok {
-					line = v
-				}
-			}
-
-			// NOTE-SL-016: acquire from pool - zero map allocation for dropped rows.
-			bls := acquireBlockLabelSet(bwb.Block, rowIdx, colNames, colMap, colCols)
-			if pipeline != nil {
-				var keep bool
-				if skipParsers {
-					line, _, keep = pipeline.ProcessSkipParsers(ts, line, bls)
-				} else {
-					line, _, keep = pipeline.Process(ts, line, bls)
-				}
-				if !keep {
-					releaseBlockLabelSet(bls)
-					continue
-				}
-			}
-			// Read __loki_labels__ via the post-pipeline LabelSet so that mutations
-			// (drop/keep/label_format) are respected if they affect this field.
-			lokiLabels := bls.Get("__loki_labels__")
-			logAttrs := collectLogStringAttrs(logStrNames, logStrCols, rowIdx)
-			releaseBlockLabelSet(bls)
-			entry := LogEntry{TimestampNanos: ts, Line: line, LokiLabels: lokiLabels, LogAttrs: logAttrs}
-			*all = append(*all, logTopKEntry{entry: entry, ts: ts})
-		}
-	}
-	return fetchCount, nil
+	return iterateLogRows(r, program, wantColumns, pipeline, opts, plan,
+		nil, // no block-level skip for collect-all
+		nil, // no per-row skip for collect-all
+		func(_ uint64, entry LogEntry) bool {
+			*all = append(*all, logTopKEntry{entry: entry})
+			return true
+		},
+	)
 }
 
 // logTopKDeliver sorts the heap entries and returns them in direction order.
@@ -518,9 +462,13 @@ func collectLogStringAttrs(names []string, cols []*modules_reader.Column, rowIdx
 // logDeliverAll sorts entries and returns them in direction order.
 func logDeliverAll(entries []logTopKEntry, backward bool) []LogEntry {
 	if backward {
-		slices.SortFunc(entries, func(a, b logTopKEntry) int { return cmp.Compare(b.ts, a.ts) })
+		slices.SortFunc(entries, func(a, b logTopKEntry) int {
+			return cmp.Compare(b.entry.TimestampNanos, a.entry.TimestampNanos)
+		})
 	} else {
-		slices.SortFunc(entries, func(a, b logTopKEntry) int { return cmp.Compare(a.ts, b.ts) })
+		slices.SortFunc(entries, func(a, b logTopKEntry) int {
+			return cmp.Compare(a.entry.TimestampNanos, b.entry.TimestampNanos)
+		})
 	}
 	results := make([]LogEntry, len(entries))
 	for i, e := range entries {

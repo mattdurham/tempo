@@ -950,216 +950,188 @@ Query: `{ span.latency_ms > 0 } | sum(span.latency_ms)`.
 
 ---
 
-## EX-CL-01: TestClassifyCollect_IntrinsicTopK
+## EX-INT-06: TestIntrinsicFastPath_MixedPredicateBlockScan
 
-**Scenario:** Intrinsic-only predicate + limit + TimestampColumn set + HasIntrinsicSection
-→ `modeIntrinsicTopK`.
+**Scenario:** Mixed predicates — intrinsic pre-filter (Case C) narrows candidates by service
+name; VM re-evaluation eliminates all rows because no spans have the non-intrinsic attribute.
 
-**Setup:** In-memory reader with intrinsic section. Program with intrinsic-only predicate
-(resource.service.name). `opts.Limit=5, opts.TimestampColumn="span:start"`.
+**Setup:** 6 spans — 3 for "loki-querier", 2 for "grafana", 1 for "tempo-distributor".
+Query: `{ resource.service.name =~ "loki-.*" && span.http.method = "GET" }`.
+No spans have `http.method` set.
 
-**Assertions:** `classifyCollect(r, program, opts) == modeIntrinsicTopK`.
+**Assertions:**
+- `len(rows) == 0` (VM re-evaluation eliminates all intrinsic candidates).
+- No error, no panic.
 
----
-
-## EX-CL-02: TestClassifyCollect_IntrinsicPlain
-
-**Scenario:** Intrinsic-only predicate + limit + no TimestampColumn → `modeIntrinsicPlain`.
-
-**Setup:** Same as EX-CL-01 but `opts.TimestampColumn=""`.
-
-**Assertions:** `classifyCollect(r, program, opts) == modeIntrinsicPlain`.
+Back-ref: `intrinsic_correctness_test.go:TestIntrinsicFastPath_MixedPredicateBlockScan`
 
 ---
 
-## EX-CL-03: TestClassifyCollect_BlockFallback_NoIntrinsicSection
+## EX-INT-07: TestCollect_MixedPredicateNoSort
 
-**Scenario:** Intrinsic-only predicate but file has no intrinsic section → `modeBlockTopK`
-(when TimestampColumn set) or `modeBlockPlain`.
+**Scenario:** Mixed query (intrinsic + span attribute, no sort) uses intrinsic pre-filter
+then VM re-evaluation; returns only rows matching both conditions.
 
-**Setup:** Reader without intrinsic section. Intrinsic-only program.
-`opts.Limit=5, opts.TimestampColumn="span:start"`.
+**Setup:** 10 spans: 5 with `resource.service.name="svc-a"` + `span.http.method="GET"`,
+5 with `resource.service.name="svc-a"` + `span.http.method="POST"`.
+Query: `{ resource.service.name = "svc-a" && span.http.method = "GET" }`.
+`CollectOptions{Limit: 10}`.
 
-**Assertions:** `classifyCollect(r, program, opts) == modeBlockTopK`.
-
----
-
-## EX-CL-04: TestClassifyCollect_BlockTopK
-
-**Scenario:** Non-intrinsic predicate + TimestampColumn + Limit → `modeBlockTopK`.
-
-**Setup:** Any reader. Non-intrinsic program (e.g. span attribute filter).
-`opts.Limit=10, opts.TimestampColumn="span:start"`.
-
-**Assertions:** `classifyCollect(r, program, opts) == modeBlockTopK`.
+**Assertions:** `len(results) == 5`. All results have `span.http.method == "GET"`.
 
 ---
 
-## EX-CL-05: TestClassifyCollect_BlockPlain
+## EX-INT-08: TestCollect_MixedPredicateWithSort
 
-**Scenario:** Default case → `modeBlockPlain`.
+**Scenario:** Mixed query with timestamp sort uses intrinsic pre-filter + topKScanRows;
+returns globally correct top-K.
 
-**Setup:** Any reader. Any program. `opts.Limit=0, opts.TimestampColumn=""`.
+**Setup:** 6 spans across 2 blocks (MaxBlockSpans=3): 3 with `svc="target"` + `http.method="GET"`
+at timestamps T0, T2, T4; 3 with `svc="other"` at T1, T3, T5.
+Query: `{ resource.service.name = "target" && span.http.method = "GET" }`.
+`CollectOptions{Limit: 2, TimestampColumn: "span:start", Direction: Backward}`.
 
-**Assertions:** `classifyCollect(r, program, opts) == modeBlockPlain`.
-
----
-
-## EX-CL-06: TestClassifyCollect_ZeroLimitNotIntrinsic
-
-**Scenario:** `opts.Limit == 0` with intrinsic-only program → `modeBlockPlain`.
-Intrinsic fast path only activates when Limit > 0.
-
-**Setup:** Reader with intrinsic section. Intrinsic-only program. `opts.Limit=0`.
-
-**Assertions:** `classifyCollect(r, program, opts) == modeBlockPlain`.
+**Assertions:** `len(results) == 2`. Both results have `resource.service.name == "target"`.
+Results are in descending timestamp order.
 
 ---
 
-## EX-CC-01: TestComputeColumnSets_MatchAll
+## EX-INT-09: TestCollect_PureIntrinsicNoSort_RegressionGuard
 
-**Scenario:** A match-all program (no predicates) returns nil for both wantColumns and
-secondPassCols.
+**Scenario:** Pure intrinsic query with no sort still returns correct results after gate
+change from `ProgramIsIntrinsicOnly` to `hasSomeIntrinsicPredicates`.
 
-**Setup:** `vm.Program` with no `Predicates` field set. `opts = CollectOptions{}`.
+**Setup:** 10 spans: 5 with `svc="svc-a"`, 5 with `svc="svc-b"`.
+Query: `{ resource.service.name = "svc-a" }`. `CollectOptions{Limit: 5}`.
 
-**Assertions:** `wantColumns == nil`; `secondPassCols == nil`.
-
----
-
-## EX-CC-02: TestComputeColumnSets_AllColumns
-
-**Scenario:** `AllColumns=true` sets secondPassCols to nil even when wantColumns is
-non-nil (AllColumns overrides the narrow column set).
-
-**Setup:** Predicate program with `resource.service.name` in nodes. `opts.AllColumns=true`.
-
-**Assertions:** `wantColumns != nil`; `secondPassCols == nil`.
+**Assertions:** `len(results) == 5`. All results have `resource.service.name == "svc-a"`.
 
 ---
 
-## EX-CC-03: TestComputeColumnSets_NarrowColumns
+## EX-INT-10: TestCollect_PureIntrinsicWithSort_ZeroBlockRead
 
-**Scenario:** `AllColumns=false` with a non-nil wantColumns produces
-`secondPassCols = searchMetaColumns ∪ wantColumns`.
+**Scenario:** Pure intrinsic query with timestamp sort returns IntrinsicFields rows
+(zero block reads). Regression guard for Case B path.
 
-**Setup:** Predicate program with `resource.service.name` in nodes. `opts.AllColumns=false`.
+**Setup:** 6 spans: 3 with `svc="target"` at timestamps T0, T2, T4; 3 with `svc="other"`.
+Query: `{ resource.service.name = "target" }`.
+`CollectOptions{Limit: 2, TimestampColumn: "span:start", Direction: Backward}`.
 
-**Assertions:** `wantColumns != nil`; `secondPassCols != nil`;
-`secondPassCols` contains all entries from `wantColumns`;
-`secondPassCols` contains all entries from `searchMetaColumns()`.
-
----
-
-## EX-CL-03b: TestClassifyCollect_NonIntrinsicProgram_BlockTopK
-
-**Scenario:** Non-intrinsic program with TimestampColumn + Limit → `modeBlockTopK`
-(covers the block-mode fallback even when the file has an intrinsic section, because
-the program references a non-intrinsic column).
-
-**Setup:** Reader with intrinsic section. Non-intrinsic program (`span.http.method`).
-`opts.Limit=5, opts.TimestampColumn="span:start"`.
-
-**Assertions:** `classifyCollect(r, program, opts) == modeBlockTopK`.
+**Assertions:** `len(results) == 2`. Both results have `IntrinsicFields != nil`
+(confirms zero-block-read path). Results are in descending timestamp order.
 
 ---
 
-## EX-CL-07: TestClassifyCollect_BlockTopK_NoLimit
+## EX-INT-11: TestHasSomeIntrinsicPredicates
 
-**Scenario:** `TimestampColumn` set but `Limit == 0` → `modeBlockPlain`.
-`modeBlockTopK` requires both `TimestampColumn != ""` AND `Limit > 0`.
+**Scenario:** Unit test for the `hasSomeIntrinsicPredicates` helper.
 
-**Setup:** Any reader. Non-intrinsic program. `opts.Limit=0, opts.TimestampColumn="span:start"`.
+**Setup:** Table-driven, package-internal test in `predicates_helper_test.go`.
 
-**Assertions:** `classifyCollect(r, program, opts) == modeBlockPlain`.
+**Cases:**
+| Query | Expected |
+|---|---|
+| `{ resource.service.name = "svc" }` | `true` |
+| `{ span:duration > 1000 }` | `true` |
+| `{ span.http.method = "GET" }` | `false` |
+| `{ resource.service.name = "svc" && span.http.method = "GET" }` | `true` |
+| `{ span.http.method = "GET" \|\| resource.service.name = "svc" }` | `true` |
+| `{}` | `false` |
+| nil program | `false` |
 
----
-
-## EX-CL-08: TestClassifyCollect_Direction_DoesNotAffectMode
-
-**Scenario:** `Direction=Backward` alone (no TimestampColumn, no Limit) → `modeBlockPlain`.
-Direction is applied at plan time but does not change the collect mode.
-
-**Setup:** Any reader. Non-intrinsic program. `opts.Direction=queryplanner.Backward`.
-No TimestampColumn, no Limit.
-
-**Assertions:** `classifyCollect(r, program, opts) == modeBlockPlain`.
+**Assertions:** Return value equals expected for each case.
 
 ---
 
-## EX-OR-01: TestIntrinsicFastPath_ORPredicateReturnsResults
-*Added: NOTE-039*
+## EX-INT-12: TestCollect_MixedPredicatePartialAND_SupersetSafety
 
-**Scenario:** A query with an OR predicate on an intrinsic dict column returns correct results
-via the intrinsic fast path (not zero results due to the old `collectIntrinsicLeaves` skip).
+**Scenario:** Partial-AND pre-filter returns a superset; VM re-evaluation eliminates
+false positives. Verifies the superset safety invariant.
 
-**Setup:** Reader with intrinsic section containing `resource.service.name` dict column with
-at least two distinct values ("A" and "B"). Program with OR predicate:
-`resource.service.name="A" || resource.service.name="B"`. `opts.Limit=100`.
+**Setup:** 4 spans: span-0 `(svc-a, GET)`, span-1 `(svc-a, POST)`,
+span-2 `(svc-b, GET)`, span-3 `(svc-b, POST)`.
+Query: `{ resource.service.name = "svc-a" && span.http.method = "GET" }`.
+`CollectOptions{Limit: 10}`.
 
-**Assertions:** `Collect` returns all rows where service.name is "A" or "B"; result count
-matches the union of both sets; no `errNeedBlockScan` propagated (fast path succeeds).
-
----
-
-## EX-OR-02: TestIntrinsicFastPath_RegexDictColumn
-*Added: NOTE-039*
-
-**Scenario:** A regex predicate on an intrinsic dict column returns correct results via the
-intrinsic fast path.
-
-**Setup:** Reader with intrinsic section containing `resource.service.name` dict column.
-Program with regex predicate `resource.service.name=~"loki-.*"`. `opts.Limit=100`.
-
-**Assertions:** `Collect` returns rows whose service.name matches the regex; count matches
-results from an equivalent equality query; no `errNeedBlockScan` propagated.
+**Assertions:** `len(results) == 1`. The single result corresponds to span-0 only.
 
 ---
 
-## EX-OR-03: TestIntrinsicFastPath_UnevaluableFallsBackToBlockScan
-*Added: NOTE-039*
+## EX-INT-13: TestCollect_NonIntrinsicOnly_FallsBackToBlockScan
 
-**Scenario:** When the intrinsic fast path cannot evaluate a predicate (returns nil from
-`evalNodeBlockRefs`), `collectIntrinsicPlain` returns `errNeedBlockScan` and `Collect`
-falls through to `collectBlockPlain`, producing correct results.
+**Scenario:** True fallback to full block scan when query has ONLY non-intrinsic predicates.
+`hasSomeIntrinsicPredicates` returns false and the executor runs the full block scan path.
 
-**Setup:** Reader with intrinsic section. Program with a predicate that is not evaluable
-from intrinsic blobs (e.g., a range predicate `span:duration > 1s`). `opts.Limit=10`.
+**Setup:** Use `buildIntrinsicTestReader` data (6 spans across 3 services, none with
+`span.http.method` set). Query: `{ span.http.method = "GET" }`. `CollectOptions{Limit: 100}`.
 
-**Assertions:** `Collect` returns the same results as if the mode were `modeBlockPlain`
-from the start; no empty result due to missing fallback.
+**Assertions:** `len(results) == 0` (no spans have http.method); no error; no panic.
+Confirms the full block scan is correctly invoked when the intrinsic fast path is gated off.
 
----
-
-## EX-OR-04: TestEvalNodeBlockRefs_ORUnion
-*Added: NOTE-039*
-
-**Scenario:** `evalNodeBlockRefs` with an OR node correctly unions children's refs.
-
-**Setup:** OR node with two evaluable leaf children, each contributing disjoint BlockRefs.
-
-**Assertions:** Returned refs = union of both children's refs. `ok == true`.
 
 ---
 
-## EX-OR-05: TestEvalNodeBlockRefs_ORUnevaluableChild
-*Added: NOTE-039*
+## EX-PERF-01: TestCollect_IntrinsicTopK_MapPath_Stats
 
-**Scenario:** `evalNodeBlockRefs` with an OR node where one child is not evaluable returns
-`(nil, false)`.
+**Scenario:** Case B KLL path (M < SortScanThreshold) populates OnStats with
+ExecutionPath="intrinsic-topk-kll", IntrinsicRefCount=M, IntrinsicScanCount=0. NOTE-044.
 
-**Setup:** OR node with one evaluable leaf and one unevaluable leaf (e.g., range predicate
-on dict column).
+**Setup:** 3 spans with svc="rare-svc" at explicit timestamps T0 < T1 < T2. 5 spans
+with svc="other-svc". CollectOptions{Limit: 2, TimestampColumn: "span:start",
+Direction: Backward, OnStats: capture}.
 
-**Assertions:** Returns `(nil, false)`. Cannot union partial results.
+**Assertions:**
+- len(rows) == 2
+- stats.ExecutionPath == "intrinsic-topk-kll"
+- stats.IntrinsicRefCount == 3
+- stats.IntrinsicScanCount == 0
+- rows[0] is newer than rows[1] (correct descending timestamp order)
 
 ---
 
-## EX-OR-06: TestEvalNodeMatchKeys_ORUnionSorted
-*Added: NOTE-039*
+## EX-PERF-02: TestCollect_IntrinsicTopK_ScanPath_Stats
 
-**Scenario:** `evalNodeMatchKeys` with an OR node correctly unions and sorts children's keys.
+**Scenario:** Case B scan path forced via executor.SortScanThreshold=2 override.
+Confirms ExecutionPath="intrinsic-topk-scan" and IntrinsicScanCount > 0.
 
-**Setup:** OR node with two evaluable leaf children, producing sorted key slices.
+**Setup:** Set executor.SortScanThreshold = 2; restore in t.Cleanup. Do NOT t.Parallel().
+3 spans svc="target", 3 spans svc="other". CollectOptions{Limit: 2,
+TimestampColumn: "span:start", Direction: Backward, OnStats: capture}.
 
-**Assertions:** Returned keys = sorted union (merge-dedup) of both children. `ok == true`.
+**Assertions:**
+- stats.ExecutionPath == "intrinsic-topk-scan"
+- stats.IntrinsicScanCount > 0
+- len(rows) == 2
+
+---
+
+## EX-PERF-03: TestCollect_ExecutionPath_AllPaths
+
+**Scenario:** Table-driven sub-tests confirm each of the seven primary ExecutionPath
+values is produced by the correct query shape.
+
+**Sub-tests:** "intrinsic-plain", "intrinsic-topk-kll" (NOTE-044), "intrinsic-topk-scan"
+(override SortScanThreshold in sub-test, no t.Parallel), "mixed-plain", "mixed-topk",
+"block-plain", "block-topk".
+
+**Each sub-test assertions:** stats.ExecutionPath equals expected string; count fields
+(IntrinsicRefCount, MixedCandidateBlocks) are non-zero where applicable.
+
+---
+
+## EX-PERF-04: TestCollect_IntrinsicTopK_KLLPath
+
+**Scenario:** Case B KLL path (M < SortScanThreshold) groups refs by block, orders blocks
+by BlockMeta.MaxStart DESC, and returns globally correct top-K by timestamp. NOTE-044.
+
+**Setup:** 3 spans with svc="rare-svc" at distinct timestamps; 5 spans with svc="other-svc".
+CollectOptions{Limit: 2, TimestampColumn: "span:start", Direction: Backward, OnStats: capture}.
+
+**Assertions:**
+- len(rows) == 2
+- stats.ExecutionPath == "intrinsic-topk-kll"
+- stats.IntrinsicRefCount == 3
+- stats.IntrinsicScanCount == 0
+- rows[0].IntrinsicFields != nil (zero block reads)
+- rows[1].IntrinsicFields != nil
+- rows[0] span:start > rows[1] span:start (descending order)

@@ -1084,9 +1084,11 @@ forward — no zstd decompression, O(M/8) per column where M is span count.
 the block's row loop (before `bwb` goes out of scope). This guarantee holds because the
 scan is single-goroutine and sequential.
 
-**internMap validity:** `internMap` borrowed from `Reader.internStrings`.
-`ResetInternStrings` is called before each block's `ParseBlockFromBytes`. Lazy decodes
-for a block complete before the next `ResetInternStrings` call — safe.
+**internMap validity:** Each `ParseBlockFromBytes` and `AddColumnsToBlock` call creates its
+own fresh `make(map[string]string)` intern map local to that call. Strings do not persist
+across calls. `ResetInternStrings` is now a no-op retained for call-site compatibility.
+Cross-call intern reuse no longer occurs; the trade-off is accepted for race-safety.
+*(Addendum 2026-03-17: supersedes the original "borrowed from Reader.internStrings" design.)*
 
 **Performance impact:** For T9/Q66 (1997 blocks, ~90 non-predicate columns):
 eagerly decoding all columns cost ~0.87s in zstd decompression. Lazy decode replaces
