@@ -89,10 +89,6 @@ func (rw *readerWriter) CompactedBlockMeta(blockID uuid.UUID, tenantID string) (
 		return nil, readError(err)
 	}
 
-	if len(bytes) == 0 {
-		return nil, backend.ErrDoesNotExist
-	}
-
 	out := &backend.CompactedBlockMeta{}
 	err = json.Unmarshal(bytes, out)
 	if err != nil {
