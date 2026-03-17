@@ -544,7 +544,7 @@ map is allocated only when `Set` or `Delete` is called. For rows dropped by labe
 filters before any mutation, the per-row allocation cost is exactly zero (one pool
 Get/Put, which is amortised across goroutines via the sync.Pool shard mechanism).
 
-`buildBlockColMaps` is called once per block (not per row) to build the label-name →
+`buildBlockColMapsWithLogCache` is called once per block (not per row) to build the label-name →
 original-column-name index. The `colNames` slice and `colMap` map are shared across all
 rows in the block. The `*blockLabelSet` itself is reset per-row via `resetForRow`, which
 clears the overlay and deleted maps in-place to reuse their backing arrays.
@@ -553,13 +553,13 @@ For `StreamLogsTopK`, entries stored in the heap call `Materialize()` immediatel
 pipeline processing and before pool release. This ensures the heap holds stable
 `map[string]string`-backed `LabelSet` values regardless of pool reuse.
 
-**colName conflict resolution:** `buildBlockColMaps` uses a two-pass approach: `resource.*`
+**colName conflict resolution:** `buildBlockColMapsWithLogCache` uses a two-pass approach: `resource.*`
 columns are registered first (explicit OTLP attributes take priority), then `log.*`
 columns fill in gaps. Within each scope, `ColumnTypeString` wins over `ColumnTypeRangeString`
 for the same stripped label name (explicit attribute beats auto-parsed body field).
 
 Back-ref: `internal/modules/executor/block_label_set.go:blockLabelSet`,
-`internal/modules/executor/block_label_set.go:buildBlockColMaps`,
+`internal/modules/executor/block_label_set.go:buildBlockColMapsWithLogCache`,
 `internal/modules/executor/stream_log.go:StreamLogs`
 
 ---
@@ -609,7 +609,7 @@ Back-ref: `internal/modules/executor/predicates.go:ProgramWantColumns`,
 ## NOTE-019: GetColumn O(1) via colCols Slice in blockLabelSet
 *Added: 2026-03-05*
 
-**Decision:** `buildBlockColMaps` now resolves `*Column` pointers once per block into a
+**Decision:** `buildBlockColMapsWithLogCache` resolves `*Column` pointers once per block into a
 parallel `colCols []*Column` slice alongside `colNames`. All four `block.GetColumn(colNames[idx])`
 calls in `blockLabelSet.Get`, `Has`, `Keys`, and `Materialize` are replaced with direct
 `colCols[idx]` slice indexing. The `log:timestamp` and `log:body` column pointers are lifted
@@ -622,11 +622,16 @@ iterations. The column set is fixed for a block's lifetime; resolving `*Column` 
 once per block converts all per-row accesses to O(1) slice indexing.
 
 **Invariant:** `colCols[i]` and `colNames[i]` always refer to the same column. Both slices
-are built in lockstep in `buildBlockColMaps` — every append to `colNames` is immediately
+are built in lockstep in `buildBlockColMapsWithLogCache` — every append to `colNames` is immediately
 followed by an append to `colCols`. `colCols` is nil'd in `releaseBlockLabelSet` before
 pool return to prevent stale pointer retention.
 
-Back-ref: `internal/modules/executor/block_label_set.go:buildBlockColMaps`,
+**NOTE-038:** `buildBlockColMaps` was removed (2026-03-16) — it was a strict subset of
+`buildBlockColMapsWithLogCache`. Non-log callers now call `buildBlockColMapsWithLogCache`
+and discard the `logStrNames`/`logStrCols` returns with `_, _`. This eliminates ~55 lines
+of duplicated column-selection logic.
+
+Back-ref: `internal/modules/executor/block_label_set.go:buildBlockColMapsWithLogCache`,
 `internal/modules/executor/block_label_set.go:blockLabelSet`
 
 ---
@@ -1254,111 +1259,317 @@ Back-ref: `internal/modules/executor/stream_log.go:LogAttrs`,
 
 ---
 
-## NOTE-038: Classify-then-Dispatch Refactor for Collect
-*Added: 2026-03-15*
+## NOTE-039: cmp3 Generic Helper Reduces rowCompare Cyclomatic Complexity
+*Added: 2026-03-16*
 
-**Decision:** `Collect` was refactored from 140 lines of nested if/else into a thin
-orchestrator: `classifyCollect(r, program, opts)` returns one of four `collectMode`
-constants; `Collect` dispatches via a switch.
+**Decision:** Introduced `cmp3[T cmp.Ordered](a, b T) (int, bool)` — a one-line wrapper
+around `cmp.Compare` — in `column_provider.go`. All repeated three-way `switch { case v < t:
+return -1, true; case v > t: return 1, true; default: return 0, true }` blocks in
+`rowCompare` are replaced with `return cmp3(v, t)`.
 
-**Rationale:** The 4-branch structure (intrinsic topK, intrinsic plain, block topK,
-block plain) was already present in the original code. The problem was readability: the
-conditions were checked inline as sequential if/else, mixing dispatch logic with
-parameter setup. Named modes + a classification function make the dispatch explicit and
-allow each execution path to be a separately named, separately testable function.
+**Rationale:** `rowCompare` had cyclomatic complexity 40 (CRITICAL tier) with the same
+comparison pattern repeated 8+ times across all numeric and string types. Using the
+stdlib `cmp.Compare` (available since Go 1.21) reduces line count from ~120 to ~50 and
+cyclomatic complexity from 40 to ~20 with no behavior change.
 
-**Why not Approach 1 (full pipeline with QueryClassification struct):** The block-scan
-path inherently fuses SelectRefs (ColumnPredicate), Rank (heap insertion), and Resolve
-(block reference in MatchedRow) into a single loop. Forcing these into separate pipeline
-steps would require buffering all row indices across all selected blocks before ranking —
-O(N) memory with no algorithmic benefit. The pipeline separation is meaningful only for
-the intrinsic paths, which are already clean functions. The complexity cost of adding a
-`QueryClassification` type and 5 named pipeline steps is higher than the benefit.
+**Float64 parse path:** The `ColumnTypeString` + `float64` branch (numeric threshold against
+string column, used by `| latency_ms > 100` pipeline filters) retains its `strconv.ParseFloat`
+call — `cmp3(parsed, f)` replaces only the comparison switch, not the parse step.
 
-**Intrinsic fall-through eliminated:** The old code had `collectFromIntrinsicRefs` and
-`collectTopKFromIntrinsicRefs` returning `(nil, nil)` in ~5 places to signal "fast path
-unavailable, fall through to block scan". These were needed because `Collect` didn't
-know at dispatch time whether the file supported intrinsics. `classifyCollect` calls
-`r.HasIntrinsicSection()` once and decides definitively. The `(nil, nil)` sentinel
-convention is removed; the intrinsic functions now return `(nil, nil)` only to indicate
-"valid empty result" (no matches found), not "path unavailable".
-
-**`computeColumnSets` extraction:** `wantColumns` and `secondPassCols` are computed
-once before the dispatch switch (NOTE-028 invariant). Extracted into a named function
-for testability and to make the loop-invariant intent explicit.
-
-**Block mode CoalescedGroups construction:** `CoalescedGroups` and `blockToGroup` are
-constructed after the mode is known, only for block modes. Intrinsic modes don't need
-groups, so this avoids one allocation for fast-path queries.
-
-**`topKScanBlocks` placement:** The body of `topKScanBlocks` is inlined into
-`collectBlockTopK`. The heap types and helpers (`topKHeap`, `topKEntry`, `topKSkipBlock`,
-`topKInsert`, `topKScanRows`, `topKDeliver`) are extracted to `stream_heap.go`.
-
-**Relationship to NOTE-036:** NOTE-036 unified block selection under `planBlocks`.
-NOTE-038 unifies block execution dispatch under `classifyCollect`. Together, both
-refactors eliminate the two main sources of ad-hoc branching in `Collect`.
-
-Back-ref: `internal/modules/executor/stream.go:classifyCollect`,
-`internal/modules/executor/stream.go:computeColumnSets`,
-`internal/modules/executor/stream.go:collectIntrinsicTopK`,
-`internal/modules/executor/stream.go:collectIntrinsicPlain`,
-`internal/modules/executor/stream.go:collectBlockTopK`,
-`internal/modules/executor/stream.go:collectBlockPlain`,
-`internal/modules/executor/stream_heap.go`
+Back-ref: `internal/modules/executor/column_provider.go:rowCompare`,
+`internal/modules/executor/column_provider.go:cmp3`
 
 ---
 
-## NOTE-039: OR and Regex Support in Intrinsic Fast Path with errNeedBlockScan Fallback
+## NOTE-040: scanIntrinsicLeafRefs leaf.Values Loop Merged From Two Passes to One
 *Added: 2026-03-16*
 
-**Decision:** The intrinsic fast path (`modeIntrinsicTopK` / `modeIntrinsicPlain`) now
-supports OR-combined predicates and regex predicates on dict columns. When a predicate is
-not evaluable from intrinsic blobs (e.g., range predicate on a flat column with no bounds),
-`errNeedBlockScan` is returned and the `Collect` dispatcher falls through to the appropriate
-block scan mode (`collectBlockTopK` / `collectBlockPlain`).
+**Decision:** In `scanIntrinsicLeafRefs` (dict-format + exact-values branch), two sequential
+`for _, v := range leaf.Values` loops were merged into one. Previously:
+1. First loop: built `wantStr map[string]struct{}` and `wantInt map[int64]struct{}`
+2. Second loop: built `bloomKeys [][]byte`
 
-**Rationale:** Prior to this change, OR nodes in the predicate tree were silently skipped by
-`collectIntrinsicLeaves`, causing queries like `{resource.service.name="A" || resource.service.name="B"}`
-to return 0 results instead of falling back to a block scan. Similarly, regex predicates on
-dict columns (`resource.service.name=~"loki-.*"`) returned nil from `scanIntrinsicLeafRefs`,
-which was treated as "fast path not applicable" but returned `(nil, nil)` (empty results)
-rather than falling back.
+Both loops iterated the same `leaf.Values` slice with an identical `switch v.Type { case
+TypeString/TypeInt/TypeDuration }` structure, with no ordering dependency between the
+match-set population and bloom-key construction.
 
-**Three complementary fixes:**
+**Rationale:** The merge is a strict reduction — both outputs are constructed in a single
+pass. The identical switch structure makes the merge mechanical. `bloomKeys` is appended
+inline with the map insertions. No behavioral change.
 
-1. **Regex on dict columns (`intrinsicDictMatches` / `scanIntrinsicLeafRefs`):** When
-   `leaf.Pattern != ""` and `len(leaf.Values) == 0`, compile the regex and match each dict
-   entry's `Value` string. For `scanIntrinsicLeafRefs`, use `ScanDictColumnRefsWithBloom`
-   with a regex matcher and `nil` bloom keys (no bloom pruning for regex — any page could
-   contain matching entries).
+**Impact:** Reduces `scanIntrinsicLeafRefs` by ~20 lines and cyclomatic complexity from
+~35 to ~28.
 
-2. **Recursive OR/AND evaluation (`evalNodeBlockRefs` / `evalNodeMatchKeys`):** Replace the
-   flat `collectIntrinsicLeaves` + intersect approach with recursive evaluation:
-   - OR nodes: union all children refs/keys; return `(nil, false)` if any child is not
-     evaluable (cannot union partial results — would miss matches).
-   - AND nodes: intersect evaluable children; skip unevaluable children (conservative
-     over-fetch — may include extra blocks but never misses matches).
-   These helpers replace `BlockRefsFromIntrinsicTOC`'s internal leaf collection and
-   `buildPredicateMatchSet`'s leaf iteration.
+Back-ref: `internal/modules/executor/predicates.go:scanIntrinsicLeafRefs`
 
-3. **`errNeedBlockScan` sentinel and fallback in `Collect`:** When the fast path cannot
-   evaluate the predicate (any top-level node returns `(nil, false)`), `collectIntrinsicPlain`
-   and `collectTopKFromIntrinsicRefs` return `errNeedBlockScan`. The `Collect` dispatcher
-   detects this sentinel and falls through to `collectBlockPlain` / `collectBlockTopK`.
-   Previously, returning `(nil, nil)` from the fast path was silently treated as "no results"
-   rather than "try the block scan".
+---
 
-**Consequence:** OR queries and regex queries on intrinsic columns now either return correct
-results directly from the fast path (when evaluable) or fall back to a correct block scan
-(when not fully evaluable). The `programCanUseIntrinsicFastPath` workaround function that
-restricted the intrinsic fast path to equality-only predicates has been removed.
+## NOTE-041: logTopKEntry.ts Field Removed — Use entry.TimestampNanos Directly
+*Added: 2026-03-16*
 
-Back-ref: `internal/modules/executor/predicates.go:evalNodeBlockRefs`,
-`internal/modules/executor/predicates.go:intrinsicDictMatches`,
-`internal/modules/executor/predicates.go:scanIntrinsicLeafRefs`,
-`internal/modules/executor/predicates.go:BlockRefsFromIntrinsicTOC`,
-`internal/modules/executor/stream.go:evalNodeMatchKeys`,
-`internal/modules/executor/stream.go:buildPredicateMatchSet`,
-`internal/modules/executor/stream.go:errNeedBlockScan`,
-`internal/modules/executor/stream.go:classifyCollect`
+**Decision:** `logTopKEntry.ts uint64` has been removed. All heap comparisons
+(`logTopKHeap.Less`, `logTopKCanSkipBlock`, `logTopKInsert`, early-skip guard, sort closures
+in `logDeliverAll`) now read `entry.TimestampNanos` directly.
+
+**Rationale:** `ts` was always set to the same value as `entry.TimestampNanos` at every
+construction site. The redundant field added 8 bytes per entry × limit (e.g., 1000 entries =
+8KB overhead), plus one extra assignment per row. There was no case where `ts != entry.TimestampNanos`.
+Removing the field eliminates the class of bug where one is updated but the other is not.
+
+Back-ref: `internal/modules/executor/stream_log_topk.go:logTopKEntry`,
+`internal/modules/executor/stream_log_topk.go:logTopKHeap`
+
+---
+
+## NOTE-042: iterateLogRows Extracts Shared Block-Iteration Boilerplate
+*Added: 2026-03-16*
+
+**Decision:** The ~130 lines of shared block-iteration boilerplate that was duplicated between
+`logTopKScan` and `logCollectAll` has been extracted into `iterateLogRows`. Both callers
+are now ~15-line wrappers that pass their differing logic as callbacks:
+
+- `canSkipBlock func(meta shared.BlockMeta) bool` — `logTopKScan` passes heap-based block pruning;
+  `logCollectAll` passes nil (never skip).
+- `fn func(ts uint64, entry LogEntry) bool` — `logTopKScan` passes the NOTE-031 early-skip guard
+  + heap insertion; `logCollectAll` passes a slice append.
+
+**Rationale:** Both functions shared: `CoalescedGroups` + `blockToGroup`, `ReadGroup` loop,
+`ResetInternStrings` + `ParseBlockFromBytes`, `ColumnPredicate` evaluation, NOTE-021 time
+pre-filter, column cache setup, and the per-row pipeline loop. Any fix to the shared boilerplate
+(e.g., NOTE-021, NOTE-001, NOTE-SL-016) previously had to be applied twice. The extraction
+eliminates this duplication class.
+
+**Complexity impact:** Combined cyclomatic complexity drops from (36+30)=66 to one ~30
+(`iterateLogRows`) + two trivial callers.
+
+Back-ref: `internal/modules/executor/stream_log_topk.go:iterateLogRows`,
+`internal/modules/executor/stream_log_topk.go:logTopKScan`,
+`internal/modules/executor/stream_log_topk.go:logCollectAll`
+## NOTE-038: Unified Intrinsic Pre-Filter — Partial-AND for Mixed Queries
+*Added: 2026-03-16*
+
+**Decision:** `collectFromIntrinsicRefs` is rewritten as a unified 4-case dispatcher
+replacing the separate `collectFromIntrinsicRefs` (plain) and `collectTopKFromIntrinsicRefs`
+(topK) functions. The `Collect` entry gate changes from `ProgramIsIntrinsicOnly` to
+`hasSomeIntrinsicPredicates`, extending the intrinsic pre-filter to mixed queries.
+
+**Problem with the old design:**
+Mixed queries like `{ resource.service.name = "svc" && span.http.method = "GET" }` bypassed
+the intrinsic pre-filter entirely because `ProgramIsIntrinsicOnly` returned false. The pre-filter
+was an all-or-nothing gate: if any non-intrinsic column appeared, the full block scan ran.
+
+**New design — partial-AND semantics:**
+`evalNodeBlockRefsPartialAND` is a new variant of `evalNodeBlockRefs` where AND nodes skip
+unevaluable (non-intrinsic) children rather than failing. The result is a superset of the
+true matching rows. `blockRefsFromIntrinsicPartial` uses this variant to build candidate refs
+for mixed queries.
+
+**Why partial-AND is safe for AND nodes:**
+The pre-filter is a superset: it may return rows that do NOT satisfy non-intrinsic conditions.
+After fetching the candidate blocks, `program.ColumnPredicate` re-evaluates the full predicate,
+eliminating false positives. This is the same principle used by bloom-filter + range-index block
+pruning in `planBlocks`: the planner produces a superset, the VM corrects it.
+
+**Why OR nodes remain fail-fast:**
+An unevaluable OR child would produce an unbounded result — potentially the entire file's row
+set. There is no useful partial OR pre-filter: you cannot narrow candidates when any alternative
+is unconstrained. Keeping OR fail-fast means `blockRefsFromIntrinsicPartial` falls through to
+the full block scan when an evaluable-but-unevaluable-OR is encountered, which is conservative
+but correct.
+
+**4-case dispatch:**
+
+| ProgramIsIntrinsicOnly | TimestampColumn | Case | Block reads |
+|---|---|---|---|
+| true | empty | A | minimal (candidate blocks) |
+| true | set | B | zero (IntrinsicFields rows) |
+| false | empty | C | minimal (candidate blocks + ColumnPredicate) |
+| false | set | D | minimal (candidate blocks + ColumnPredicate + topK heap) |
+
+**Global top-K correctness for Case D:**
+The partial-AND pre-filter is a superset — it never excludes a row that satisfies all intrinsic
+predicates. Therefore all true matching rows (those satisfying both intrinsic and non-intrinsic
+conditions) are present among the candidate blocks. ColumnPredicate eliminates non-intrinsic
+false positives. topKScanRows then finds the globally correct top-K timestamp order within the
+true matching rows. SPEC-STREAM-7 is preserved.
+
+**Dead code removed:**
+`buildPredicateMatchSet`, `evalNodeMatchKeys`, `collectTopKFromIntrinsicRefs`,
+`unionSortedKeys`, `intersectSortedKeys` — all deleted. `collectTopKFromIntrinsicRefs`
+was a parallel implementation of `evalNodeBlockRefs` in packed-key representation; that
+duplication is eliminated by inlining the packed-key construction into `collectIntrinsicTopK`.
+
+**Relationship to NOTE-039 (in code comments referencing the old design):**
+NOTE-039 stated that both OR and AND must fail fast on unevaluable children because refs are
+returned directly without VM re-evaluation. This remains true for `evalNodeBlockRefs` (used
+on the pure-intrinsic path). The new `evalNodeBlockRefsPartialAND` explicitly relaxes the AND
+constraint for the mixed-query path, where VM re-evaluation is mandatory.
+
+Back-ref: `internal/modules/executor/predicates.go:hasSomeIntrinsicPredicates`,
+`internal/modules/executor/predicates.go:evalNodeBlockRefsPartialAND`,
+`internal/modules/executor/predicates.go:blockRefsFromIntrinsicPartial`,
+`internal/modules/executor/stream.go:collectFromIntrinsicRefs`
+
+---
+
+## NOTE-039: EX-INT-06 Comment Updated — Case C, Not True Fallback
+*Added: 2026-03-16*
+
+The comment in `TestIntrinsicFastPath_FallbackToBlockScan` previously said "fast path is
+not applicable" for the query `{ resource.service.name =~ "loki-.*" && span.http.method = "GET" }`.
+After the gate change from `ProgramIsIntrinsicOnly` to `hasSomeIntrinsicPredicates` (NOTE-038),
+this query now takes Case C (mixed + no sort): the intrinsic pre-filter narrows candidates
+by service name, then VM re-evaluation eliminates all rows because no spans have http.method
+set. The comment was updated to accurately describe Case C behaviour.
+
+---
+
+## NOTE-040: EX-INT-13 — True Non-Intrinsic-Only Fallback Path Test
+*Added: 2026-03-16*
+
+Added `TestCollect_NonIntrinsicOnly_FallsBackToBlockScan` (EX-INT-13) to exercise the true
+fallback path: a query with zero intrinsic leaves (e.g., `{ span.http.method = "GET" }`)
+causes `hasSomeIntrinsicPredicates` to return false, and the executor falls through to the
+full block scan. The test confirms no error and no panic, and returns 0 results because none
+of the test spans have `http.method` set.
+
+---
+
+## NOTE-041: SPECS.md §4.2 MatchedRow — IntrinsicFields Field Added
+*Added: 2026-03-16*
+
+The `IntrinsicFields modules_shared.SpanFieldsProvider` field added to `MatchedRow` in the
+unified pre-filter implementation (NOTE-038) was absent from the §4.2 struct definition in
+SPECS.md. The definition now matches the actual struct in `stream.go`. `SPEC-STREAM-9`
+already described the semantics (IntrinsicFields rows for Case A/B zero-block-read paths);
+this change ensures the struct definition itself is also complete.
+
+---
+
+## NOTE-042: collectIntrinsicTopK Sort Path — Map Lookup Replaces O(N) Scan of Timestamp Blob
+*Added: 2026-03-16*
+
+**Decision:** In `collectIntrinsicTopK`'s sort path (M < sortScanThreshold), the O(N) scan
+of the timestamp blob via `ScanFlatColumnRefsFiltered` is replaced for small M by a
+map-then-sort approach: build a `packed-key → timestamp` map from the full decoded
+`IntrinsicColumn`, look up each matching ref's timestamp in O(1), sort the M pairs by
+timestamp, and take top K.
+
+**Problem with the previous stash approach:**
+The stash tried to use `planBlocks` block ordering (KLL sketch, newest-first for MostRecent)
+to iterate matching refs. Block ordering only provides inter-block ordering — it says nothing
+about per-row timestamp ordering within a single block. When all matching refs live in a
+single block (common in tests and for rare-service queries), block ordering provided zero
+information, violating the descending-timestamp assertion in EX-INT-10.
+
+**Key observation — flat column layout:**
+The flat timestamp column (`span:start`, `log:timestamp`) stores `BlockRefs` in ascending
+timestamp order, NOT in ascending packed-key order. Binary search by packed key is therefore
+incorrect. The correct lookup is: build a `map[uint32]uint64` (packed-key → timestamp) from
+the decoded column's parallel `BlockRefs` and `Uint64Values` arrays, then look up each ref.
+
+**Performance characteristics:**
+- Map build: O(N) — same cost as the scan path but paid once per query.
+- Per-ref lookup: O(1) hash map (vs O(N/M) amortized for scan).
+- Sort: O(M log M) for M matching refs.
+- Effective for M << N (rare-service queries); scan path remains for M >= sortScanThreshold.
+- For Q35 (M=15, N=130K): map lookup + sort ≈ 130K insertions + 15 log(15) comparisons.
+  The dominant cost is the O(N) map build, but this avoids decompressing the blob again
+  since `GetIntrinsicColumn` returns the already-decoded column from cache.
+
+**Test fix:**
+`TestCollect_PureIntrinsicWithSort_ZeroBlockRead` (EX-INT-10) was failing because the stash
+used block-level ordering which does not provide per-row timestamp order within a single
+block. Map-then-sort correctly retrieves per-row timestamps regardless of block/row layout.
+
+Back-ref: `internal/modules/executor/stream.go:collectIntrinsicTopK`
+
+---
+
+## NOTE-043: CollectStats ExecutionPath Telemetry and Fast-Path OnStats Wiring
+*Added: 2026-03-17*
+
+**Decision:** `CollectStats` gains four new fields to identify which of the eight
+execution paths ran for a given `Collect` call:
+
+- `ExecutionPath string`: one of "intrinsic-plain" (Case A), "intrinsic-topk-sort"
+  (Case B map path), "intrinsic-topk-scan" (Case B scan path), "mixed-plain" (Case C),
+  "mixed-topk" (Case D), "block-plain" (block-scan no sort), "block-topk" (block-scan
+  with topK heap), "intrinsic-need-block-scan" (fast path tried but fell through).
+- `IntrinsicRefCount int`: number of refs from `BlockRefsFromIntrinsicTOC` (M for Case B).
+- `IntrinsicScanCount int`: entries visited by `ScanFlatColumnRefsFiltered` in Case B
+  scan path. Zero for the map path and all other paths.
+- `MixedCandidateBlocks int`: number of unique candidate blocks from
+  `blockRefsFromIntrinsicPartial` for Cases C and D. Zero for all other paths.
+
+**Problem solved:** The `OnStats` defer in `Collect` (SPEC-STREAM-6) fires only for the
+block-scan fallback. Fast-path returns from `collectFromIntrinsicRefs` exited before the
+defer was registered, giving callers no stats for the most common query case (intrinsic
+fast path). This was an observable gap: setting `OnStats` on a service-name filter query
+produced no callback at all.
+
+**Fix:** A `*CollectStats` pointer is passed to `collectFromIntrinsicRefs` and all four
+sub-functions. Each path populates its fields. `Collect` calls `opts.OnStats(fastStats)`
+synchronously on successful fast-path return (`err != errNeedBlockScan`). For
+`errNeedBlockScan`, the partial stats are discarded and the block-scan defer provides the
+final stats as before.
+
+**`SortScanThreshold` exported:** `sortScanThreshold` (unexported const) renamed to
+`SortScanThreshold` (exported var) to allow test overrides that force the scan path for
+small M. Production code does not modify this variable.
+
+**No double callback:** Fast-path and block-scan callbacks are mutually exclusive.
+`opts.OnStats(fastStats)` is called only when `err != errNeedBlockScan`, which means
+`return rows, err` follows immediately — the block-scan defer is registered AFTER this
+return and therefore never fires for the fast-path case.
+
+Back-ref: `internal/modules/executor/stream.go:CollectStats`,
+          `internal/modules/executor/stream.go:Collect`,
+          `internal/modules/executor/stream.go:collectFromIntrinsicRefs`,
+          `internal/modules/executor/stream.go:SortScanThreshold`
+
+---
+
+## NOTE-044: collectIntrinsicTopK KLL Path — Block-Level MaxStart Ordering
+*Added: 2026-03-17*
+
+**Decision:** In `collectIntrinsicTopK`'s small-M path (M < SortScanThreshold), replace the
+flat map-then-sort approach ("intrinsic-topk-sort") with a block-aware KLL path
+("intrinsic-topk-kll") that groups matching refs by BlockIdx and orders blocks by
+`BlockMeta.MaxStart` DESC before collecting per-row timestamps.
+
+**What changed:**
+- M refs are grouped into `blockRefs[BlockIdx]` and unique block indices collected into
+  `blockOrder []int`.
+- `blockOrder` is sorted by `r.BlockMeta(bi).MaxStart` DESC (largest MaxStart first — newest
+  block first). `MaxStart` is the KLL-sketch upper bound on `span:start` within a block.
+- For each block (newest first), each ref's timestamp is looked up in the packed-key →
+  timestamp map (same O(N) map build as before).
+- (ref,ts) pairs are collected in block-descending order, then sorted globally by timestamp
+  DESC (or ASC for forward) and top-K selected.
+- `ExecutionPath` is set to `"intrinsic-topk-kll"` to distinguish from the old sort path.
+
+**Why block ordering by MaxStart:**
+Block-level ordering by MaxStart biases collection toward newer blocks first. For the common
+case where matching refs are clustered in recent blocks, this provides a natural pre-sort
+benefit before the final O(M log M) sort. Future extensions can use early termination here
+(once the heap is full and the next block's MaxStart is below the heap min, all remaining
+blocks are pruned) without correctness risk — the current implementation always sorts all M
+pairs to ensure globally correct top-K.
+
+**Correctness:**
+The final sort over all M (ref,ts) pairs preserves the global ordering invariant. Block-level
+MaxStart ordering is an optimization hint, not a correctness dependency.
+
+**ExecutionPath telemetry:**
+The old path "intrinsic-topk-sort" is retired. The new path "intrinsic-topk-kll" replaces it
+for M < SortScanThreshold. The scan path "intrinsic-topk-scan" (M >= SortScanThreshold) is
+unchanged. `SPEC-STREAM-9` back-ref and SPECS.md §4.4 and §6.1 updated accordingly.
+
+Back-ref: `internal/modules/executor/stream.go:collectIntrinsicTopK`,
+          `internal/modules/executor/stream_perf_test.go:TestCollect_IntrinsicTopK_KLLPath`
+
+**Correction to NOTE-043 bullet list:** NOTE-043's `ExecutionPath` constant list
+(`intrinsic-topk-sort`) is retired by this note; the correct value is `intrinsic-topk-kll`
+for all non-scan small-M paths. The NOTE-043 bullet `"intrinsic-topk-sort" (Case B map path)`
+should be read as `"intrinsic-topk-kll" (Case B KLL path, M < SortScanThreshold)`.

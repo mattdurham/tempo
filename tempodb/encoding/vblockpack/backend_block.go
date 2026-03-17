@@ -398,7 +398,7 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 	spansets := make([]*traceql.Spanset, 0, len(traceMap))
 	for _, traceIDHex := range traceOrder {
 		entry := traceMap[traceIDHex]
-		rootSpanName, rootServiceName, startNanos, durationNanos := computeSpansetMetadata(entry.rawSpans)
+		rootSpanName, rootServiceName, startNanos, durationNanos := blockpack.SpanMatchesMetadata(entry.rawSpans)
 		ss := &traceql.Spanset{
 			TraceID:            entry.traceID,
 			Spans:              entry.spans,
@@ -406,7 +406,7 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 			RootServiceName:    rootServiceName,
 			StartTimeUnixNanos: startNanos,
 			DurationNanos:      durationNanos,
-			ServiceStats:       computeServiceStats(entry.rawSpans),
+			ServiceStats:       spanMatchesServiceStats(entry.rawSpans),
 		}
 		spansets = append(spansets, ss)
 	}
@@ -435,27 +435,13 @@ func (s *blockpackSpan) hasFields() bool {
 }
 
 func (s *blockpackSpan) StartTimeUnixNanos() uint64 {
-	if !s.hasFields() {
-		return 0
-	}
-	if v, ok := s.match.Fields.GetField("span:start"); ok {
-		if u, ok := v.(uint64); ok {
-			return u
-		}
-	}
-	return 0
+	v, _ := s.match.StartNano()
+	return v
 }
 
 func (s *blockpackSpan) DurationNanos() uint64 {
-	if !s.hasFields() {
-		return 0
-	}
-	if v, ok := s.match.Fields.GetField("span:duration"); ok {
-		if u, ok := v.(uint64); ok {
-			return u
-		}
-	}
-	return 0
+	v, _ := s.match.DurationNano()
+	return v
 }
 
 func (s *blockpackSpan) AttributeFor(attr traceql.Attribute) (traceql.Static, bool) {
@@ -464,24 +450,18 @@ func (s *blockpackSpan) AttributeFor(attr traceql.Attribute) (traceql.Static, bo
 	}
 	switch attr.Intrinsic {
 	case traceql.IntrinsicDuration:
-		if v, ok := s.match.Fields.GetField("span:duration"); ok {
-			if u, ok := v.(uint64); ok {
-				return traceql.NewStaticDuration(time.Duration(u)), true
-			}
+		if u, ok := s.match.DurationNano(); ok {
+			return traceql.NewStaticDuration(time.Duration(u)), true
 		}
 		return traceql.Static{}, false
 	case traceql.IntrinsicName:
-		if v, ok := s.match.Fields.GetField("span:name"); ok {
-			if str, ok := v.(string); ok {
-				return traceql.NewStaticString(str), true
-			}
+		if str, ok := s.match.Name(); ok {
+			return traceql.NewStaticString(str), true
 		}
 		return traceql.Static{}, false
 	case traceql.IntrinsicStatus:
-		if v, ok := s.match.Fields.GetField("span:status"); ok {
-			if i, ok := v.(int64); ok {
-				return traceql.NewStaticStatus(otlpStatusToTempoStatus(i)), true
-			}
+		if i, ok := s.match.StatusCode(); ok {
+			return traceql.NewStaticStatus(otlpStatusToTempoStatus(i)), true
 		}
 		return traceql.Static{}, false
 	case traceql.IntrinsicStatusMessage:
@@ -492,10 +472,8 @@ func (s *blockpackSpan) AttributeFor(attr traceql.Attribute) (traceql.Static, bo
 		}
 		return traceql.Static{}, false
 	case traceql.IntrinsicKind:
-		if v, ok := s.match.Fields.GetField("span:kind"); ok {
-			if i, ok := v.(int64); ok {
-				return traceql.NewStaticKind(otlpKindToTempoKind(i)), true
-			}
+		if i, ok := s.match.KindCode(); ok {
+			return traceql.NewStaticKind(otlpKindToTempoKind(i)), true
 		}
 		return traceql.Static{}, false
 	case traceql.IntrinsicNone:
@@ -588,25 +566,27 @@ func (i *sliceSpansetIterator) Close() {}
 // columnNameToAttribute converts a blockpack column name to a traceql.Attribute.
 // Returns false for internal columns (IDs, timestamps) that don't map to attributes.
 func columnNameToAttribute(colName string) (traceql.Attribute, bool) {
-	switch colName {
-	case "span:duration":
-		return traceql.NewIntrinsic(traceql.IntrinsicDuration), true
-	case "span:name":
-		return traceql.NewIntrinsic(traceql.IntrinsicName), true
-	case "span:status":
-		return traceql.NewIntrinsic(traceql.IntrinsicStatus), true
-	case "span:status_message":
-		return traceql.NewIntrinsic(traceql.IntrinsicStatusMessage), true
-	case "span:kind":
-		return traceql.NewIntrinsic(traceql.IntrinsicKind), true
-	case "trace:id", "span:id", "span:parent_id", "span:start", "span:end":
-		return traceql.Attribute{}, false
+	scope, attrName, isIntrinsic := blockpack.ColumnScope(colName)
+	if isIntrinsic {
+		switch attrName {
+		case "duration":
+			return traceql.NewIntrinsic(traceql.IntrinsicDuration), true
+		case "name":
+			return traceql.NewIntrinsic(traceql.IntrinsicName), true
+		case "status":
+			return traceql.NewIntrinsic(traceql.IntrinsicStatus), true
+		case "status_message":
+			return traceql.NewIntrinsic(traceql.IntrinsicStatusMessage), true
+		case "kind":
+			return traceql.NewIntrinsic(traceql.IntrinsicKind), true
+		}
+		return traceql.Attribute{}, false // id, parent_id, start, end — not user-visible
 	}
-	if strings.HasPrefix(colName, "span.") {
-		return traceql.NewScopedAttribute(traceql.AttributeScopeSpan, false, strings.TrimPrefix(colName, "span.")), true
-	}
-	if strings.HasPrefix(colName, "resource.") {
-		return traceql.NewScopedAttribute(traceql.AttributeScopeResource, false, strings.TrimPrefix(colName, "resource.")), true
+	switch scope {
+	case "span":
+		return traceql.NewScopedAttribute(traceql.AttributeScopeSpan, false, attrName), true
+	case "resource":
+		return traceql.NewScopedAttribute(traceql.AttributeScopeResource, false, attrName), true
 	}
 	return traceql.Attribute{}, false
 }
@@ -1258,41 +1238,33 @@ func tagToColumnName(tag string) string {
 	return "span:" + tag
 }
 
-// attributeToColumnName converts a traceql.Attribute to a blockpack column name
+// attributeToColumnName converts a traceql.Attribute to a blockpack column name.
 func attributeToColumnName(attr traceql.Attribute) string {
-	// Handle intrinsics
 	if attr.Intrinsic != traceql.IntrinsicNone {
 		switch attr.Intrinsic {
 		case traceql.IntrinsicDuration:
-			return "span:duration"
+			return blockpack.IntrinsicColumnName("duration")
 		case traceql.IntrinsicName:
-			return "span:name"
+			return blockpack.IntrinsicColumnName("name")
 		case traceql.IntrinsicStatus:
-			return "span:status"
+			return blockpack.IntrinsicColumnName("status")
 		case traceql.IntrinsicKind:
-			return "span:kind"
+			return blockpack.IntrinsicColumnName("kind")
 		case traceql.IntrinsicTraceID:
-			return "trace:id"
+			return blockpack.TraceIDColumnName
 		case traceql.IntrinsicSpanID:
-			return "span:id"
+			return blockpack.IntrinsicColumnName("id")
 		case traceql.IntrinsicParentID:
-			return "span:parent_id"
+			return blockpack.IntrinsicColumnName("parent_id")
 		}
 	}
 
-	// Handle scoped attributes
-	scope := attr.Scope.String()
-	switch scope {
-	case "span":
-		return "span." + attr.Name
-	case "resource":
-		return "resource." + attr.Name
-	case "none", "":
-		// For unscoped, default to span attribute
-		return "span." + attr.Name
+	switch attr.Scope {
+	case traceql.AttributeScopeResource:
+		return blockpack.AttributeColumnName("resource", attr.Name)
+	default: // span or unscoped — default to span
+		return blockpack.AttributeColumnName("span", attr.Name)
 	}
-
-	return attr.Name
 }
 
 // otlpKindToTempoKind converts an OTLP SpanKind int64 to Tempo's traceql.Kind enum.
@@ -1440,142 +1412,17 @@ func buildTraceMetadata(traceID string, spans []blockpack.SpanMatch) *tempopb.Tr
 // filtered result set (e.g. the TraceQL filter only matched child spans), the span with
 // the minimum span:start is used as a proxy for RootSpanName and RootServiceName, and
 // DurationNanos falls back to max(span:end) - min(span:start) across all matched spans.
-func computeSpansetMetadata(spans []blockpack.SpanMatch) (rootSpanName, rootServiceName string, startNanos, durationNanos uint64) {
-	if len(spans) == 0 {
-		return "", "", 0, 0
-	}
-
-	const maxUint64 = ^uint64(0)
-	var (
-		minStart    uint64 = maxUint64
-		maxEnd      uint64
-		rootIdx     int = -1 // index of root span in spans slice; -1 = not found
-		minStartIdx int = 0  // index of span with minimum start time (used as fallback)
-	)
-
-	for i, span := range spans {
-		// Structural queries (>>, ~, !>>, !~) can produce SpanMatch with nil Fields.
-		if span.Fields == nil {
-			continue
-		}
-
-		// Track minimum start time across all spans.
-		if v, ok := span.Fields.GetField("span:start"); ok {
-			if st, ok2 := v.(uint64); ok2 && st < minStart {
-				minStart = st
-				minStartIdx = i
-			}
-		}
-
-		// Track maximum end time (used for duration fallback when root not found).
-		if v, ok := span.Fields.GetField("span:end"); ok {
-			if et, ok2 := v.(uint64); ok2 && et > maxEnd {
-				maxEnd = et
-			}
-		}
-
-		// Detect root span: blockpack writer only sets the span:parent_id present-bit
-		// when ParentSpanId is non-empty (writer_block.go). A root span has the column
-		// absent, so !hasParent is the sole reliable root signal.
-		if rootIdx == -1 {
-			_, hasParent := span.Fields.GetField("span:parent_id")
-			if !hasParent {
-				rootIdx = i
-			}
-		}
-	}
-
-	// Normalise minStart: if no span:start field was found, use 0.
-	if minStart == maxUint64 {
-		minStart = 0
-	}
-	startNanos = minStart
-
-	// Choose which span to use for name and service name.
-	// Prefer the root span; fall back to the earliest span when root is absent.
-	proxyIdx := rootIdx
-	if proxyIdx == -1 {
-		proxyIdx = minStartIdx
-	}
-	proxy := spans[proxyIdx]
-
-	if proxy.Fields != nil {
-		if v, ok := proxy.Fields.GetField("span:name"); ok {
-			if s, ok2 := v.(string); ok2 {
-				rootSpanName = s
-			}
-		}
-		if v, ok := proxy.Fields.GetField("resource.service.name"); ok {
-			if s, ok2 := v.(string); ok2 {
-				rootServiceName = s
-			}
-		}
-	}
-
-	// Compute duration.
-	if rootIdx != -1 && spans[rootIdx].Fields != nil {
-		root := spans[rootIdx]
-		// Prefer the stored span:duration column.
-		if v, ok := root.Fields.GetField("span:duration"); ok {
-			if d, ok2 := v.(uint64); ok2 {
-				durationNanos = d
-			}
-		}
-		// Fallback: derive from root span's own start/end.
-		if durationNanos == 0 {
-			var rootStart, rootEnd uint64
-			if v, ok := root.Fields.GetField("span:start"); ok {
-				if st, ok2 := v.(uint64); ok2 {
-					rootStart = st
-				}
-			}
-			if v, ok := root.Fields.GetField("span:end"); ok {
-				if et, ok2 := v.(uint64); ok2 {
-					rootEnd = et
-				}
-			}
-			if rootEnd > rootStart {
-				durationNanos = rootEnd - rootStart
-			}
-		}
-	} else {
-		// Root not in result set or has nil Fields: use span-range as a best-effort duration.
-		if maxEnd > minStart {
-			durationNanos = maxEnd - minStart
-		}
-	}
-
-	return rootSpanName, rootServiceName, startNanos, durationNanos
-}
-
-// computeServiceStats builds a per-service span/error count map from the raw spans of a
-// single trace. It mirrors what parquet stores in the ServiceStats column, enabling
-// Grafana to display the service breakdown in search results.
-//
-// Error detection: a span is counted as an error if span:status == 2 (OTLP STATUS_CODE_ERROR).
-func computeServiceStats(spans []blockpack.SpanMatch) map[string]traceql.ServiceStats {
-	if len(spans) == 0 {
+// spanMatchesServiceStats converts blockpack.SpanMatchesServiceStats result to traceql.ServiceStats.
+// The two types have identical fields; the conversion is necessary because traceql.ServiceStats
+// is defined in the Tempo module and cannot be used in blockpack directly.
+func spanMatchesServiceStats(spans []blockpack.SpanMatch) map[string]traceql.ServiceStats {
+	bpStats := blockpack.SpanMatchesServiceStats(spans)
+	if len(bpStats) == 0 {
 		return nil
 	}
-	stats := make(map[string]traceql.ServiceStats)
-	for _, span := range spans {
-		if span.Fields == nil {
-			continue
-		}
-		svcName := ""
-		if v, ok := span.Fields.GetField("resource.service.name"); ok {
-			if s, ok2 := v.(string); ok2 {
-				svcName = s
-			}
-		}
-		s := stats[svcName]
-		s.SpanCount++
-		if v, ok := span.Fields.GetField("span:status"); ok {
-			if code, ok2 := v.(int64); ok2 && code == 2 { // 2 = OTLP STATUS_CODE_ERROR
-				s.ErrorCount++
-			}
-		}
-		stats[svcName] = s
+	out := make(map[string]traceql.ServiceStats, len(bpStats))
+	for svc, s := range bpStats {
+		out[svc] = traceql.ServiceStats{SpanCount: s.SpanCount, ErrorCount: s.ErrorCount}
 	}
-	return stats
+	return out
 }

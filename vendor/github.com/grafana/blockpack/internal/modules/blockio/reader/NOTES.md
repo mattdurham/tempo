@@ -42,9 +42,16 @@ Back-ref: `internal/modules/blockio/reader/column.go:decodePresenceOnly`,
 for the lifetime of the owning `BlockWithBytes`. All lazy decodes (`decodeNow()`) complete
 within the same block's row loop before `bwb` goes out of scope.
 
-**internMap safety:** `internMap` is borrowed from `Reader.internStrings`. `ResetInternStrings()`
-is called before each block's `ParseBlockFromBytes`. Lazy decodes for a given block complete
-before the next `ResetInternStrings()` call, so the borrowed reference is always valid.
+**internMap safety:** Each `ParseBlockFromBytes` and `AddColumnsToBlock` call creates its
+own fresh `make(map[string]string)` intern map local to that call. Strings interned during
+parsing and lazy decodes do not persist across calls. `ResetInternStrings()` is now a no-op
+retained for call-site compatibility — callers still invoke it before each block, but it has
+no effect. Cross-call intern reuse no longer occurs; this trade-off is accepted for
+race-safety (per-call maps eliminate any shared-map data race between concurrent readers).
+
+*Addendum (2026-03-17):* The original description (internMap borrowed from
+`Reader.internStrings`, bounded by `ResetInternStrings`) reflected an earlier design that
+was superseded when per-call intern maps were introduced for race-safety.
 
 **Single-goroutine guarantee:** The scan path is single-goroutine. No locking is required
 for `decodeNow()`.

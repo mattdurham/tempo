@@ -41,8 +41,9 @@ type Reader struct {
 	rangeParsed   map[string]parsedRangeIndex
 	compactParsed *compactTraceIndex
 
-	// internStrings is the per-reader string intern map for dictionary column values.
-	// Shared across all block parses on this reader; single-goroutine use only.
+	// internStrings is kept for API compatibility with ResetInternStrings callers.
+	// ParseBlockFromBytes and AddColumnsToBlock now each allocate a fresh local intern
+	// map per call, so this field is no longer borrowed by parse paths.
 	internStrings map[string]string
 
 	// sketchIdx holds parsed column-major sketch data for the file.
@@ -449,12 +450,16 @@ func (r *Reader) ReadGroup(cr shared.CoalescedRead) (map[int][]byte, error) {
 
 // ParseBlockFromBytes parses a Block from raw bytes using the given meta and column filter.
 // wantColumns nil = all columns.
+// Each call allocates its own fresh intern map; ResetInternStrings is a no-op and
+// no cross-call intern reuse occurs.
 func (r *Reader) ParseBlockFromBytes(
 	rawBytes []byte,
 	wantColumns map[string]struct{},
 	meta shared.BlockMeta,
 ) (*BlockWithBytes, error) {
-	blk, err := parseBlockColumnsReuse(rawBytes, wantColumns, nil, meta, r.internStrings)
+	localIntern := make(map[string]string)
+
+	blk, err := parseBlockColumnsReuse(rawBytes, wantColumns, nil, meta, localIntern)
 	if err != nil {
 		return nil, fmt.Errorf("ParseBlockFromBytes: %w", err)
 	}
@@ -490,14 +495,10 @@ func (r *Reader) TraceEntries(traceID [16]byte) []TraceEntry {
 	return result
 }
 
-// ResetInternStrings clears the per-reader string intern map without reallocating it.
-// NOTE-020: call before each block's first-pass ParseBlockFromBytes in scan loops
-// to bound the intern map to one block's unique strings. Single-goroutine use only.
-func (r *Reader) ResetInternStrings() {
-	for k := range r.internStrings {
-		delete(r.internStrings, k)
-	}
-}
+// ResetInternStrings is a no-op retained for API compatibility with existing scan loops.
+// ParseBlockFromBytes and AddColumnsToBlock now allocate their own fresh intern map per
+// call, so there is no shared state to reset between blocks.
+func (r *Reader) ResetInternStrings() {}
 
 // AddColumnsToBlock decodes additional columns from an already-loaded BlockWithBytes.
 // No additional I/O is performed.
@@ -521,7 +522,10 @@ func (r *Reader) AddColumnsToBlock(bwb *BlockWithBytes, addColumns map[string]st
 
 	scratch := acquireDecompScratch()
 	defer releaseDecompScratch(scratch)
-	ctx := &decodeCtx{scratch: scratch, intern: r.internStrings}
+
+	// Each AddColumnsToBlock call uses its own fresh intern map; ResetInternStrings
+	// is a no-op and no cross-call intern reuse occurs.
+	ctx := &decodeCtx{scratch: scratch, intern: make(map[string]string)}
 
 	for _, m := range metas {
 		// NOTE-022: nil means "add all missing columns"; non-nil filters by name.

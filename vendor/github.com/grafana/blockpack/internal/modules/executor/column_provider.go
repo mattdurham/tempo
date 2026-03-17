@@ -4,6 +4,7 @@ package executor
 
 import (
 	"bytes"
+	"cmp"
 	"fmt"
 	"strconv"
 	"strings"
@@ -14,6 +15,13 @@ import (
 	modules_shared "github.com/grafana/blockpack/internal/modules/blockio/shared"
 	"github.com/grafana/blockpack/internal/vm"
 )
+
+// cmp3 returns cmp.Compare(a, b) and true. Wraps cmp.Compare to match rowCompare's (int, bool) signature.
+// NOTE-039: reduces rowCompare cyclomatic complexity from 40 to ~20 by replacing repeated
+// three-way switch blocks with a single generic call.
+func cmp3[T cmp.Ordered](a, b T) (int, bool) {
+	return cmp.Compare(a, b), true
+}
 
 // blockColumnProvider implements vm.ColumnDataProvider for a modules Block.
 type blockColumnProvider struct {
@@ -116,6 +124,7 @@ func rowMatches(col *modules_reader.Column, rowIdx int, value interface{}) bool 
 
 // rowCompare returns -1/0/1 for col[rowIdx] <=> value (for range comparisons).
 // Returns (0, false) when the comparison is not applicable.
+// NOTE-039: uses cmp3 to eliminate repeated three-way switch blocks per type.
 func rowCompare(col *modules_reader.Column, rowIdx int, value interface{}) (int, bool) {
 	if !col.IsPresent(rowIdx) {
 		return 0, false
@@ -124,14 +133,7 @@ func rowCompare(col *modules_reader.Column, rowIdx int, value interface{}) (int,
 	case modules_shared.ColumnTypeString, modules_shared.ColumnTypeRangeString:
 		if v, ok := col.StringValue(rowIdx); ok {
 			if s, ok2 := value.(string); ok2 {
-				switch {
-				case v < s:
-					return -1, true
-				case v > s:
-					return 1, true
-				default:
-					return 0, true
-				}
+				return cmp3(v, s)
 			}
 			// Numeric comparison against a string column: parse the stored value as
 			// float64 and compare. This matches LabelFilterStage semantics where
@@ -141,99 +143,41 @@ func rowCompare(col *modules_reader.Column, rowIdx int, value interface{}) (int,
 				if err != nil {
 					return 0, false // non-numeric string vs numeric threshold → no match
 				}
-				switch {
-				case parsed < f:
-					return -1, true
-				case parsed > f:
-					return 1, true
-				default:
-					return 0, true
-				}
+				return cmp3(parsed, f)
 			}
 		}
 	case modules_shared.ColumnTypeInt64, modules_shared.ColumnTypeRangeInt64, modules_shared.ColumnTypeRangeDuration:
 		if v, ok := col.Int64Value(rowIdx); ok {
 			switch t := value.(type) {
 			case int64:
-				switch {
-				case v < t:
-					return -1, true
-				case v > t:
-					return 1, true
-				default:
-					return 0, true
-				}
+				return cmp3(v, t)
 			case float64:
-				switch {
-				case float64(v) < t:
-					return -1, true
-				case float64(v) > t:
-					return 1, true
-				default:
-					return 0, true
-				}
+				return cmp3(float64(v), t)
 			}
 		}
 	case modules_shared.ColumnTypeUint64, modules_shared.ColumnTypeRangeUint64:
 		if v, ok := col.Uint64Value(rowIdx); ok {
 			switch t := value.(type) {
 			case int64:
-				u := uint64(t) //nolint:gosec
-				switch {
-				case v < u:
-					return -1, true
-				case v > u:
-					return 1, true
-				default:
-					return 0, true
-				}
+				return cmp3(v, uint64(t)) //nolint:gosec
 			case float64:
-				switch {
-				case float64(v) < t:
-					return -1, true
-				case float64(v) > t:
-					return 1, true
-				default:
-					return 0, true
-				}
+				return cmp3(float64(v), t)
 			}
 		}
 	case modules_shared.ColumnTypeUUID:
 		// UUID columns are logically strings; compare as string.
 		if v, ok := col.StringValue(rowIdx); ok {
 			if s, ok2 := value.(string); ok2 {
-				switch {
-				case v < s:
-					return -1, true
-				case v > s:
-					return 1, true
-				default:
-					return 0, true
-				}
+				return cmp3(v, s)
 			}
 		}
 	case modules_shared.ColumnTypeFloat64, modules_shared.ColumnTypeRangeFloat64:
 		if v, ok := col.Float64Value(rowIdx); ok {
 			switch t := value.(type) {
 			case float64:
-				switch {
-				case v < t:
-					return -1, true
-				case v > t:
-					return 1, true
-				default:
-					return 0, true
-				}
+				return cmp3(v, t)
 			case int64:
-				f := float64(t)
-				switch {
-				case v < f:
-					return -1, true
-				case v > f:
-					return 1, true
-				default:
-					return 0, true
-				}
+				return cmp3(v, float64(t))
 			}
 		}
 	}
