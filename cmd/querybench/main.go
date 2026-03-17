@@ -146,9 +146,10 @@ func oldestStartNano(sr *searchResponse) int64 {
 
 // compareResults returns a human-readable diff summary, or "" if results match.
 // When trace IDs differ, it also checks whether the disagreement is a legitimate tie
-// (both engines returned traces with the same start time) or a real ordering problem
-// (one engine returned a newer trace the other missed).
-func compareResults(a, b *searchResponse) string {
+// (both engines returned traces with the same start time), a real ordering problem
+// (one engine returned a newer trace the other missed — [GAP]), or a definite miss
+// ([MISS]: B hit the limit but its newest result is older than a trace found only by A).
+func compareResults(a, b *searchResponse, limit int) string {
 	aIDs := traceIDs(a)
 	bIDs := traceIDs(b)
 
@@ -170,6 +171,16 @@ func compareResults(a, b *searchResponse) string {
 	if b != nil {
 		for _, t := range b.Traces {
 			bMap[t.TraceID] = t
+		}
+	}
+
+	// bNewest is the maximum startNano across all B results (0 if B empty or nil).
+	var bNewest int64
+	if b != nil {
+		for _, t := range b.Traces {
+			if n := startNano(t); n > bNewest {
+				bNewest = n
+			}
 		}
 	}
 
@@ -223,8 +234,24 @@ func compareResults(a, b *searchResponse) string {
 		}
 	}
 
+	// definiteMiss fires when B hit the limit but its newest result is older than a
+	// trace found exclusively by A. This is an unambiguous correctness failure:
+	// B had capacity for a newer trace but returned an older one instead.
+	definiteMiss := false
+	if limit > 0 && b != nil && len(b.Traces) >= limit && bNewest > 0 {
+		for _, id := range onlyA {
+			ts := startNano(aMap[id])
+			if ts > 0 && ts > bNewest {
+				definiteMiss = true
+				break
+			}
+		}
+	}
+
 	diffKind := "tie"
-	if realGap {
+	if definiteMiss {
+		diffKind = "MISS"
+	} else if realGap {
 		diffKind = "GAP"
 	}
 
@@ -367,7 +394,7 @@ func main() {
 			matchStr = "ERR"
 			errors++
 		} else {
-			diff := compareResults(lastA.resp, lastB.resp)
+			diff := compareResults(lastA.resp, lastB.resp, qf.Limit)
 			if diff != "" {
 				matchStr = fmt.Sprintf("DIFF(%s)", diff)
 				mismatches++
