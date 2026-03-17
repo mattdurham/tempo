@@ -29,3 +29,12 @@ integration/**/e2e_integration_test[0-9]*
 gh-token.txt
 .cache
 operations/jsonnet/microservices/vendor/
+
+# Built binaries
+cmd/bpanalyze/bpanalyze
+cmd/kafka-otlp-forwarder/kafka-otlp-forwarder
+cmd/parquet-otlp-forwarder/parquet-otlp-forwarder
+cmd/querybench/querybench
+parquet-otlp-forwarder
+bpanalyze
+querybench
