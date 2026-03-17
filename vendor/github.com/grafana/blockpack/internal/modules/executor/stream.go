@@ -48,7 +48,15 @@ type CollectOptions struct {
 // CollectStats reports block I/O statistics after execution.
 type CollectStats struct {
 	// Explain is an ASCII trace of how the predicate tree resolved to block sets.
-	Explain        string
+	Explain string
+	// ExecutionPath identifies which code path ran for this query. One of:
+	// "intrinsic-plain" (Case A), "intrinsic-topk-kll" (Case B KLL path),
+	// "intrinsic-topk-scan" (Case B scan path), "mixed-plain" (Case C),
+	// "mixed-topk" (Case D), "block-plain" (block-scan no sort),
+	// "block-topk" (block-scan with topK heap),
+	// "intrinsic-need-block-scan" (fast path fell through to block scan).
+	// NOTE-043, NOTE-044: see also SortScanThreshold.
+	ExecutionPath  string
 	TotalBlocks    int
 	PrunedByTime   int
 	PrunedByIndex  int
@@ -60,6 +68,15 @@ type CollectStats struct {
 	// when that group is fetched. FetchedBlocks <= SelectedBlocks when a Limit causes early stop
 	// and some groups are never read.
 	FetchedBlocks int
+	// IntrinsicRefCount is the number of matching refs from BlockRefsFromIntrinsicTOC
+	// (M for Case B). Set for intrinsic-topk-sort and intrinsic-topk-scan. Zero otherwise.
+	IntrinsicRefCount int
+	// IntrinsicScanCount is the number of entries visited by ScanFlatColumnRefsFiltered
+	// in the Case B scan path. Zero for the map path and all other paths.
+	IntrinsicScanCount int
+	// MixedCandidateBlocks is the number of unique candidate blocks from the partial-AND
+	// pre-filter for Cases C and D (mixed queries). Zero for all other paths.
+	MixedCandidateBlocks int
 }
 
 // MatchedRow holds a single row result from Collect or CollectTopK.
@@ -138,12 +155,19 @@ func (e *Executor) Collect(
 	// (ProgramIsIntrinsicOnly × opts.TimestampColumn != "").
 	// errNeedBlockScan signals the pre-filter is not applicable; fall through to full scan.
 	if opts.Limit > 0 && hasSomeIntrinsicPredicates(program) {
-		rows, err := collectFromIntrinsicRefs(r, program, opts, wantColumns, secondPassCols)
+		var fastStats CollectStats
+		rows, err := collectFromIntrinsicRefs(r, program, opts, wantColumns, secondPassCols,
+			&fastStats)
 		if err != errNeedBlockScan {
-			if rows != nil || err != nil {
-				return rows, err
+			// Fast path produced a definitive result (rows, empty result, or error).
+			// Call OnStats synchronously before returning. SPEC-STREAM-6 extended.
+			if opts.OnStats != nil {
+				opts.OnStats(fastStats)
 			}
+			return rows, err
 		}
+		// errNeedBlockScan: fall through to full block scan. fastStats is discarded.
+		// The block-scan defer below will call OnStats with the block-scan stats.
 	}
 
 	plan := planBlocks(r, program, opts.TimeRange, queryplanner.PlanOptions{
@@ -166,7 +190,9 @@ func (e *Executor) Collect(
 	}
 
 	// SPEC-STREAM-6: Defer stats callback so FetchedBlocks reflects actual I/O.
+	// blockScanPath is set just before the scan branch executes (see NOTE-043).
 	fetchedBlocks := 0
+	blockScanPath := ""
 	if opts.OnStats != nil {
 		defer func() {
 			opts.OnStats(CollectStats{
@@ -178,11 +204,13 @@ func (e *Executor) Collect(
 				SelectedBlocks: len(plan.SelectedBlocks),
 				FetchedBlocks:  fetchedBlocks,
 				Explain:        plan.Explain,
+				ExecutionPath:  blockScanPath,
 			})
 		}()
 	}
 
 	if len(plan.SelectedBlocks) == 0 {
+		blockScanPath = "block-pruned"
 		return nil, nil
 	}
 
@@ -202,6 +230,7 @@ func (e *Executor) Collect(
 	// queue. The intrinsic fast path (above) already handles intrinsic-only queries without
 	// full block I/O; this path handles all other timestamp-sorted queries.
 	if opts.TimestampColumn != "" && opts.Limit > 0 {
+		blockScanPath = "block-topk"
 		backward := opts.Direction == queryplanner.Backward
 		buf := &topKHeap{entries: make([]topKEntry, 0, opts.Limit), backward: backward}
 		fc, scanErr := topKScanBlocks(r, program, wantColumns, opts, plan, buf, groups, blockToGroup, backward)
@@ -212,6 +241,7 @@ func (e *Executor) Collect(
 		return topKDeliver(buf, backward), nil
 	}
 
+	blockScanPath = "block-plain"
 	var results []MatchedRow
 
 	fetched := make(map[int][]byte)
@@ -422,6 +452,7 @@ func collectFromIntrinsicRefs(
 	opts CollectOptions,
 	wantColumns map[string]struct{},
 	secondPassCols map[string]struct{},
+	stats *CollectStats,
 ) ([]MatchedRow, error) {
 	isPureIntrinsic := ProgramIsIntrinsicOnly(program)
 	hasSort := opts.TimestampColumn != ""
@@ -447,6 +478,7 @@ func collectFromIntrinsicRefs(
 		refs = blockRefsFromIntrinsicPartial(r, program, opts.Limit)
 	}
 	if refs == nil {
+		stats.ExecutionPath = "intrinsic-need-block-scan"
 		return nil, errNeedBlockScan
 	}
 	if len(refs) == 0 {
@@ -459,23 +491,24 @@ func collectFromIntrinsicRefs(
 	if !isPureIntrinsic {
 		uniqueBlocks := countUniqueBlockIdxs(refs)
 		if uniqueBlocks*2 > r.BlockCount() {
+			stats.ExecutionPath = "intrinsic-need-block-scan"
 			return nil, errNeedBlockScan
 		}
 	}
 
 	// Step 2: Dispatch based on (isPureIntrinsic, hasSort).
 	if isPureIntrinsic && !hasSort {
-		return collectIntrinsicPlain(r, refs, opts, wantColumns, secondPassCols)
+		return collectIntrinsicPlain(r, refs, opts, wantColumns, secondPassCols, stats)
 	}
 	if isPureIntrinsic && hasSort {
-		return collectIntrinsicTopK(r, refs, opts, secondPassCols)
+		return collectIntrinsicTopK(r, refs, opts, secondPassCols, stats)
 	}
 	if !hasSort {
 		// Case C: mixed + no sort
-		return collectMixedPlain(r, program, refs, opts, wantColumns, secondPassCols)
+		return collectMixedPlain(r, program, refs, opts, wantColumns, secondPassCols, stats)
 	}
 	// Case D: mixed + sort
-	return collectMixedTopK(r, program, refs, opts, wantColumns, secondPassCols)
+	return collectMixedTopK(r, program, refs, opts, wantColumns, secondPassCols, stats)
 }
 
 // collectIntrinsicPlain handles Case A: pure intrinsic + no sort.
@@ -486,7 +519,9 @@ func collectIntrinsicPlain(
 	opts CollectOptions,
 	wantColumns map[string]struct{},
 	secondPassCols map[string]struct{},
+	stats *CollectStats,
 ) ([]MatchedRow, error) {
+	stats.ExecutionPath = "intrinsic-plain"
 	// Sort refs by BlockIdx for deterministic block traversal order.
 	slices.SortFunc(refs, func(a, b modules_shared.BlockRef) int {
 		if a.BlockIdx != b.BlockIdx {
@@ -559,23 +594,26 @@ func collectIntrinsicPlain(
 	return results, nil
 }
 
-// sortScanThreshold is the max number of matching refs for which the map-then-sort path
-// is used. Below this threshold: build a packed-key→timestamp map from tsCol (O(N)),
-// look up each of the M refs in O(1), sort M pairs (O(M log M)). Above this threshold:
-// use ScanFlatColumnRefsFiltered — cheaper when M is large relative to N.
-// Crossover: O(N) map build vs O(N) scan — the map path wins by avoiding repeated blob
+// SortScanThreshold is the max number of matching refs for which the KLL path
+// is used in collectIntrinsicTopK (Case B). Below this threshold: group refs by block,
+// sort blocks by BlockMeta.MaxStart DESC (newest first), build a packed-key→timestamp
+// map from tsCol (O(N)), look up each of the M refs in O(1), sort M pairs (O(M log M)).
+// Above this threshold: use ScanFlatColumnRefsFiltered — cheaper when M is large relative to N.
+// Crossover: O(N) map build vs O(N) scan — the KLL path wins by avoiding repeated blob
 // decompression; for M >= 8K the scan path is preferred as it stops early after K results.
-const sortScanThreshold = 8000
+// Exported so tests can override it to force the scan path. See NOTE-043.
+var SortScanThreshold = 8000
 
 // collectIntrinsicTopK handles Case B: pure intrinsic + timestamp sort.
 // Returns IntrinsicFields MatchedRows with ZERO full block reads.
 //
-// For small ref sets (M < sortScanThreshold): decodes the timestamp intrinsic column,
-// builds a packed-key→timestamp map (O(N)), looks up each matching ref's timestamp in
-// O(1), sorts M pairs by timestamp, takes top K. Avoids re-decompression since the
-// decoded column is cached.
+// For small ref sets (M < SortScanThreshold): KLL path — groups refs by BlockIdx, orders
+// blocks by BlockMeta.MaxStart DESC (newest block first via KLL sketch metadata), builds
+// a packed-key→timestamp map from tsCol (O(N)), looks up each matching ref's timestamp in
+// O(1), sorts M pairs by timestamp, takes top K. Avoids re-decompression since the decoded
+// column is cached. NOTE-044: block-level ordering via MaxStart.
 //
-// For large ref sets (M >= sortScanThreshold): packs refs into a sorted key set
+// For large ref sets (M >= SortScanThreshold): packs refs into a sorted key set
 // and runs ScanFlatColumnRefsFiltered backward, stopping after K results.
 // O(K/rate × log M) — ideal for common predicates where rate is high.
 func collectIntrinsicTopK(
@@ -583,18 +621,21 @@ func collectIntrinsicTopK(
 	refs []modules_shared.BlockRef,
 	opts CollectOptions,
 	secondPassCols map[string]struct{},
+	stats *CollectStats,
 ) ([]MatchedRow, error) {
 	backward := opts.Direction == queryplanner.Backward
 	limit := opts.Limit
 
 	var selected []modules_shared.BlockRef
 
-	if len(refs) < sortScanThreshold {
-		// Map-then-sort path: O(N) build + O(M log M) sort.
-		// tsCol.BlockRefs is stored in ascending timestamp order (NOT packed-key order).
-		// Build a packed-key → timestamp map from the full column, then look up each
-		// matching ref's timestamp in O(1), sort, and take top K.
-		// NOTE-042: replaces O(N) scan of the blob for the small-M sort path.
+	if len(refs) < SortScanThreshold {
+		// KLL path: group refs by block, order blocks by MaxStart DESC (newest first),
+		// build packed-key→timestamp map from tsCol, look up each ref's timestamp in
+		// O(1), collect (ref,ts) pairs, sort DESC, take top K.
+		// NOTE-044: MaxStart from BlockMeta is the KLL-sketch upper bound on span:start
+		// within a block. Ordering by MaxStart DESC biases collection toward newer blocks
+		// first, but correctness requires a final sort over all M pairs since per-row
+		// timestamps within a block may span a wide range.
 		tsCol, tsErr := r.GetIntrinsicColumn(opts.TimestampColumn)
 		if tsErr != nil || tsCol == nil || len(tsCol.Uint64Values) < len(tsCol.BlockRefs) {
 			return nil, errNeedBlockScan
@@ -606,21 +647,48 @@ func collectIntrinsicTopK(
 		for i, br := range tsCol.BlockRefs {
 			tsMap[uint32(br.BlockIdx)<<16|uint32(br.RowIdx)] = tsCol.Uint64Values[i]
 		}
-		type refTS struct {
-			ref modules_shared.BlockRef
-			ts  uint64
-		}
-		pairs := make([]refTS, 0, len(refs))
+
+		// Group M refs by BlockIdx and collect unique block indices.
+		// NOTE-044: group so we can sort blockIdxs by MaxStart before collecting pairs.
+		blockOrder := make([]int, 0, 8)
+		blockRefs := make(map[uint16][]modules_shared.BlockRef, 8)
 		for _, ref := range refs {
 			bi := int(ref.BlockIdx)
 			if opts.BlockCount > 0 && (bi < opts.StartBlock || bi >= opts.StartBlock+opts.BlockCount) {
 				continue
 			}
-			key := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx)
-			if ts, ok := tsMap[key]; ok {
-				pairs = append(pairs, refTS{ref: ref, ts: ts})
+			if _, seen := blockRefs[ref.BlockIdx]; !seen {
+				blockOrder = append(blockOrder, bi)
+			}
+			blockRefs[ref.BlockIdx] = append(blockRefs[ref.BlockIdx], ref)
+		}
+
+		// Sort blockIdxs by BlockMeta.MaxStart DESC: process newest blocks first.
+		// NOTE-044: MaxStart is the maximum span:start in the block (KLL upper bound).
+		// This ordering biases iteration toward newer blocks, enabling early termination
+		// in future extensions, but correctness here requires the final sort over all pairs.
+		slices.SortFunc(blockOrder, func(a, b int) int {
+			metaA := r.BlockMeta(a)
+			metaB := r.BlockMeta(b)
+			// Descending: newer (larger MaxStart) first.
+			return cmp.Compare(metaB.MaxStart, metaA.MaxStart)
+		})
+
+		type refTS struct {
+			ref modules_shared.BlockRef
+			ts  uint64
+		}
+		pairs := make([]refTS, 0, len(refs))
+		for _, bi := range blockOrder {
+			for _, ref := range blockRefs[uint16(bi)] { //nolint:gosec // bi is bounded by block count
+				key := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx)
+				if ts, ok := tsMap[key]; ok {
+					pairs = append(pairs, refTS{ref: ref, ts: ts})
+				}
 			}
 		}
+		stats.ExecutionPath = "intrinsic-topk-kll"
+		stats.IntrinsicRefCount = len(refs)
 		if len(pairs) == 0 {
 			return nil, nil
 		}
@@ -637,9 +705,10 @@ func collectIntrinsicTopK(
 		for i, p := range pairs {
 			selected[i] = p.ref
 		}
+		// IntrinsicScanCount stays 0 — KLL path does not scan the blob.
 	} else {
 		// Scan path: pack matchKeys, scan timestamp blob from newest/oldest end.
-		// Used for large M (>= sortScanThreshold).
+		// Used for large M (>= SortScanThreshold).
 		matchKeys := make([]uint32, len(refs))
 		for i, ref := range refs {
 			matchKeys[i] = uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx)
@@ -656,8 +725,10 @@ func collectIntrinsicTopK(
 		if opts.BlockCount > 0 {
 			endBlock = startBlock + opts.BlockCount
 		}
+		scanCount := 0
 		selected = modules_shared.ScanFlatColumnRefsFiltered(tsBlob, backward, limit,
 			func(ref modules_shared.BlockRef) bool {
+				scanCount++
 				bi := int(ref.BlockIdx)
 				if endBlock > 0 && (bi < startBlock || bi >= endBlock) {
 					return false
@@ -667,6 +738,9 @@ func collectIntrinsicTopK(
 				return found
 			},
 		)
+		stats.ExecutionPath = "intrinsic-topk-scan"
+		stats.IntrinsicRefCount = len(refs)
+		stats.IntrinsicScanCount = scanCount
 	}
 
 	if len(selected) == 0 {
@@ -696,6 +770,7 @@ func collectMixedPlain(
 	opts CollectOptions,
 	wantColumns map[string]struct{},
 	secondPassCols map[string]struct{},
+	stats *CollectStats,
 ) ([]MatchedRow, error) {
 	// Sort refs and apply shard filter (same as collectIntrinsicPlain).
 	slices.SortFunc(refs, func(a, b modules_shared.BlockRef) int {
@@ -729,6 +804,8 @@ func collectMixedPlain(
 		}
 		blockCandidates[bi] = append(blockCandidates[bi], int(ref.RowIdx))
 	}
+	stats.ExecutionPath = "mixed-plain"
+	stats.MixedCandidateBlocks = len(blockOrder)
 
 	var results []MatchedRow
 	// Coalesce all candidate blocks for efficient batch I/O.
@@ -794,6 +871,7 @@ func collectMixedTopK(
 	opts CollectOptions,
 	wantColumns map[string]struct{},
 	secondPassCols map[string]struct{},
+	stats *CollectStats,
 ) ([]MatchedRow, error) {
 	backward := opts.Direction == queryplanner.Backward
 
@@ -823,6 +901,8 @@ func collectMixedTopK(
 		}
 		blockCandidates[bi] = append(blockCandidates[bi], int(ref.RowIdx))
 	}
+	stats.ExecutionPath = "mixed-topk"
+	stats.MixedCandidateBlocks = len(blockOrder)
 
 	buf := &topKHeap{entries: make([]topKEntry, 0, opts.Limit), backward: backward}
 
