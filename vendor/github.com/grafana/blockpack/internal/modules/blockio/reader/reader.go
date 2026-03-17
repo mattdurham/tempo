@@ -560,6 +560,7 @@ func (r *Reader) AddColumnsToBlock(bwb *BlockWithBytes, addColumns map[string]st
 
 		col.StringDict = decoded.StringDict
 		col.StringIdx = decoded.StringIdx
+		col.sparseDictIdx = decoded.sparseDictIdx // NOTE-PERF-1: lazy dense expansion
 		col.Int64Dict = decoded.Int64Dict
 		col.Int64Idx = decoded.Int64Idx
 		col.Uint64Dict = decoded.Uint64Dict
