@@ -3,7 +3,6 @@ package blockbuilder
 import (
 	"bytes"
 	"context"
-	"io"
 	"slices"
 	"sync"
 
@@ -56,8 +55,7 @@ func (i *liveTracesIter) Next(ctx context.Context) (common.ID, *tempopb.Trace, e
 		select {
 		case entries, ok := <-i.ch:
 			if !ok {
-				// Channel closed - we're done iterating
-				return nil, nil, io.EOF
+				return nil, nil, nil
 			}
 			i.chBuf = entries
 		case <-ctx.Done():
@@ -72,8 +70,8 @@ func (i *liveTracesIter) Next(ctx context.Context) (common.ID, *tempopb.Trace, e
 		return entry.id, entry.tr, entry.err
 	}
 
-	// Channel is open but buffer is empty - we're done
-	return nil, nil, io.EOF
+	// Channel is open but buffer is empty?
+	return nil, nil, nil
 }
 
 func (i *liveTracesIter) iter(ctx context.Context) {

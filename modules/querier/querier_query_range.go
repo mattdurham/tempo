@@ -80,7 +80,6 @@ func (q *Querier) queryBlock(ctx context.Context, req *tempopb.QueryRangeRequest
 	opts := common.DefaultSearchOptions()
 	opts.StartPage = int(req.StartPage)
 	opts.TotalPages = int(req.PagesToSearch)
-	opts.Streaming = true // metrics queries use streaming iteration to avoid OOM
 
 	unsafe := q.limits.UnsafeQueryHints(tenantID)
 
