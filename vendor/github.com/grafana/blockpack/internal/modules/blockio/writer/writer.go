@@ -488,7 +488,7 @@ func (w *Writer) writeIntrinsicSection() (intrinsicOffset uint64, intrinsicLen u
 		if _, writeErr := w.out.Write(tocBlob); writeErr != nil {
 			return 0, 0, writeErr
 		}
-		return off, uint32(len(tocBlob)), nil //nolint:gosec // safe: TOC blob bounded by column count × entry size, well within uint32
+		return off, uint32(len(tocBlob)), nil //nolint:gosec // safe: TOC blob bounded by column count × entry size
 	}
 
 	names := a.columnNames()
@@ -530,7 +530,7 @@ func (w *Writer) writeIntrinsicSection() (intrinsicOffset uint64, intrinsicLen u
 	if _, writeErr := w.out.Write(tocBlob); writeErr != nil {
 		return 0, 0, fmt.Errorf("intrinsic: write TOC: %w", writeErr)
 	}
-	return tocOffset, uint32(len(tocBlob)), nil //nolint:gosec // safe: TOC blob bounded by column count × entry size, well within uint32
+	return tocOffset, uint32(len(tocBlob)), nil //nolint:gosec // safe: TOC blob bounded by column count × entry size
 }
 
 // buildAndWriteBlock builds one block from pending[0:end], writes it to the output, and

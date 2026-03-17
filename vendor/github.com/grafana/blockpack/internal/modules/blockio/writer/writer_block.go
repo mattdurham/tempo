@@ -60,8 +60,7 @@ type blockBuilder struct {
 
 	// intrinsicAccum is the file-level accumulator, set by buildAndWriteBlock before
 	// per-row calls. Nil for test helpers that don't need accumulation.
-	intrinsicAccum   *intrinsicAccumulator
-	intrinsicBlockID uint16
+	intrinsicAccum *intrinsicAccumulator
 
 	// Column name caches: attribute key → full column name (e.g. "http.method" → "span.http.method").
 	// Populated lazily on first encounter within a block; eliminates per-span string concat allocs
@@ -90,9 +89,10 @@ type blockBuilder struct {
 	// spanHint is the expected total span count for this block.
 	// Used as the initial capacity for dynamically-created attribute column builder
 	// value/present slices, eliminating growslice calls in the per-span append loop.
-	spanHint int
-	minStart uint64
-	maxStart uint64
+	spanHint         int
+	minStart         uint64
+	maxStart         uint64
+	intrinsicBlockID uint16
 
 	minTraceID [16]byte
 	maxTraceID [16]byte
@@ -313,6 +313,34 @@ func (b *blockBuilder) addColumn(name string, typ shared.ColumnType) columnBuild
 	return cb
 }
 
+// feedIntrinsicUint64 feeds a uint64 value to the intrinsic accumulator if present.
+func (b *blockBuilder) feedIntrinsicUint64(name string, colType shared.ColumnType, val uint64, rowIdx int) {
+	if a := b.intrinsicAccum; a != nil {
+		a.feedUint64(name, colType, val, b.intrinsicBlockID, rowIdx)
+	}
+}
+
+// feedIntrinsicString feeds a string value to the intrinsic accumulator if present.
+func (b *blockBuilder) feedIntrinsicString(name string, colType shared.ColumnType, val string, rowIdx int) {
+	if a := b.intrinsicAccum; a != nil && val != "" {
+		a.feedString(name, colType, val, b.intrinsicBlockID, rowIdx)
+	}
+}
+
+// feedIntrinsicInt64 feeds an int64 value to the intrinsic accumulator if present.
+func (b *blockBuilder) feedIntrinsicInt64(name string, colType shared.ColumnType, val int64, rowIdx int) {
+	if a := b.intrinsicAccum; a != nil {
+		a.feedInt64(name, colType, val, b.intrinsicBlockID, rowIdx)
+	}
+}
+
+// feedIntrinsicBytes feeds a bytes value to the intrinsic accumulator if present.
+func (b *blockBuilder) feedIntrinsicBytes(name string, colType shared.ColumnType, val []byte, rowIdx int) {
+	if a := b.intrinsicAccum; a != nil && len(val) > 0 {
+		a.feedBytes(name, colType, val, b.intrinsicBlockID, rowIdx)
+	}
+}
+
 // copyBytes returns a copy of src. Returns nil for empty/nil input.
 func copyBytes(src []byte) []byte {
 	if len(src) == 0 {
@@ -335,12 +363,14 @@ func (b *blockBuilder) addRowFromProto(ps *pendingSpan, rowIdx int) {
 	// trace:id — always present; excluded from the range index.
 	b.colTraceID.values[rowIdx] = copyBytes(span.TraceId)
 	b.colTraceID.present[rowIdx] = true
+	b.feedIntrinsicBytes("trace:id", shared.ColumnTypeBytes, span.TraceId, rowIdx)
 
 	// span:id — may be absent.
 	if len(span.SpanId) > 0 {
 		b.colSpanID.values[rowIdx] = copyBytes(span.SpanId)
 		b.colSpanID.present[rowIdx] = true
 		b.updateMinMax("span:id", shared.ColumnTypeBytes, string(span.SpanId))
+		b.feedIntrinsicBytes("span:id", shared.ColumnTypeBytes, span.SpanId, rowIdx)
 	}
 
 	// span:parent_id — may be absent.
@@ -348,6 +378,7 @@ func (b *blockBuilder) addRowFromProto(ps *pendingSpan, rowIdx int) {
 		b.colParentID.values[rowIdx] = copyBytes(span.ParentSpanId)
 		b.colParentID.present[rowIdx] = true
 		b.updateMinMax("span:parent_id", shared.ColumnTypeBytes, string(span.ParentSpanId))
+		b.feedIntrinsicBytes("span:parent_id", shared.ColumnTypeBytes, span.ParentSpanId, rowIdx)
 	}
 
 	// span:name — always present; truncate to MaxStringLen.
@@ -359,9 +390,7 @@ func (b *blockBuilder) addRowFromProto(ps *pendingSpan, rowIdx int) {
 	b.colSpanName.present[rowIdx] = true
 	if spanName != "" {
 		b.updateMinMax("span:name", shared.ColumnTypeString, spanName)
-		if a := b.intrinsicAccum; a != nil {
-			a.feedString("span:name", shared.ColumnTypeString, spanName, b.intrinsicBlockID, rowIdx)
-		}
+		b.feedIntrinsicString("span:name", shared.ColumnTypeString, spanName, rowIdx)
 	}
 
 	// span:kind — always present.
@@ -376,9 +405,7 @@ func (b *blockBuilder) addRowFromProto(ps *pendingSpan, rowIdx int) {
 		)
 		b.updateMinMax("span:kind", shared.ColumnTypeInt64, string(tmp[:]))
 	}
-	if a := b.intrinsicAccum; a != nil {
-		a.feedInt64("span:kind", shared.ColumnTypeInt64, spanKind, b.intrinsicBlockID, rowIdx)
-	}
+	b.feedIntrinsicInt64("span:kind", shared.ColumnTypeInt64, spanKind, rowIdx)
 
 	// span:start — always present.
 	b.colSpanStart.values[rowIdx] = span.StartTimeUnixNano
@@ -389,9 +416,7 @@ func (b *blockBuilder) addRowFromProto(ps *pendingSpan, rowIdx int) {
 		binary.LittleEndian.PutUint64(tmp[:], span.StartTimeUnixNano)
 		b.updateMinMax("span:start", shared.ColumnTypeUint64, string(tmp[:]))
 	}
-	if a := b.intrinsicAccum; a != nil {
-		a.feedUint64("span:start", shared.ColumnTypeUint64, span.StartTimeUnixNano, b.intrinsicBlockID, rowIdx)
-	}
+	b.feedIntrinsicUint64("span:start", shared.ColumnTypeUint64, span.StartTimeUnixNano, rowIdx)
 	// Task T-TS-2: implied timestamp sketch — 1-second bucket granularity.
 	if span.StartTimeUnixNano > 0 {
 		b.colSketches.add(sketchTimestampColName, encodeSecondBucket(span.StartTimeUnixNano))
@@ -422,9 +447,7 @@ func (b *blockBuilder) addRowFromProto(ps *pendingSpan, rowIdx int) {
 		binary.LittleEndian.PutUint64(tmp[:], dur)
 		b.updateMinMax("span:duration", shared.ColumnTypeUint64, string(tmp[:]))
 	}
-	if a := b.intrinsicAccum; a != nil {
-		a.feedUint64("span:duration", shared.ColumnTypeUint64, dur, b.intrinsicBlockID, rowIdx)
-	}
+	b.feedIntrinsicUint64("span:duration", shared.ColumnTypeUint64, dur, rowIdx)
 
 	// --- Conditional intrinsic columns ---
 
@@ -438,17 +461,13 @@ func (b *blockBuilder) addRowFromProto(ps *pendingSpan, rowIdx int) {
 			Type: shared.ColumnTypeInt64,
 			Int:  int64(span.Status.Code),
 		})
-		if a := b.intrinsicAccum; a != nil {
-			a.feedInt64("span:status", shared.ColumnTypeInt64, int64(span.Status.Code), b.intrinsicBlockID, rowIdx)
-		}
+		b.feedIntrinsicInt64("span:status", shared.ColumnTypeInt64, int64(span.Status.Code), rowIdx)
 		if span.Status.Message != "" {
 			b.addPresent(rowIdx, "span:status_message", shared.ColumnTypeString, shared.AttrValue{
 				Type: shared.ColumnTypeString,
 				Str:  span.Status.Message,
 			})
-			if a := b.intrinsicAccum; a != nil {
-				a.feedString("span:status_message", shared.ColumnTypeString, span.Status.Message, b.intrinsicBlockID, rowIdx)
-			}
+			b.feedIntrinsicString("span:status_message", shared.ColumnTypeString, span.Status.Message, rowIdx)
 		}
 	}
 
@@ -492,10 +511,8 @@ func (b *blockBuilder) addRowFromProto(ps *pendingSpan, rowIdx int) {
 			name := b.internColName(kv.Key, b.resourceColNames, "resource.")
 			val := protoToAttrValue(kv.Value)
 			b.addPresent(rowIdx, name, val.Type, val)
-			if kv.Key == "service.name" {
-				if a := b.intrinsicAccum; a != nil && val.Type == shared.ColumnTypeString && val.Str != "" {
-					a.feedString("resource.service.name", shared.ColumnTypeString, val.Str, b.intrinsicBlockID, rowIdx)
-				}
+			if kv.Key == "service.name" && val.Type == shared.ColumnTypeString {
+				b.feedIntrinsicString("resource.service.name", shared.ColumnTypeString, val.Str, rowIdx)
 			}
 		}
 	}
@@ -635,6 +652,7 @@ func (b *blockBuilder) addRowFromBlock(srcBlock *modules_reader.Block, srcRowIdx
 				b.colTraceID.present[dstRowIdx] = true
 				copy(traceID[:], v)
 				traceIDFound = true
+				b.feedIntrinsicBytes("trace:id", shared.ColumnTypeBytes, v, dstRowIdx)
 			}
 			continue
 
@@ -643,6 +661,7 @@ func (b *blockBuilder) addRowFromBlock(srcBlock *modules_reader.Block, srcRowIdx
 				b.colSpanID.values[dstRowIdx] = slices.Clone(v)
 				b.colSpanID.present[dstRowIdx] = true
 				b.updateMinMax("span:id", shared.ColumnTypeBytes, string(v))
+				b.feedIntrinsicBytes("span:id", shared.ColumnTypeBytes, v, dstRowIdx)
 			}
 			continue
 
@@ -651,6 +670,7 @@ func (b *blockBuilder) addRowFromBlock(srcBlock *modules_reader.Block, srcRowIdx
 				b.colParentID.values[dstRowIdx] = slices.Clone(v)
 				b.colParentID.present[dstRowIdx] = true
 				b.updateMinMax("span:parent_id", shared.ColumnTypeBytes, string(v))
+				b.feedIntrinsicBytes("span:parent_id", shared.ColumnTypeBytes, v, dstRowIdx)
 			}
 			continue
 
@@ -660,9 +680,7 @@ func (b *blockBuilder) addRowFromBlock(srcBlock *modules_reader.Block, srcRowIdx
 				b.colSpanName.present[dstRowIdx] = true
 				if v != "" {
 					b.updateMinMax("span:name", shared.ColumnTypeString, v)
-					if a := b.intrinsicAccum; a != nil {
-						a.feedString("span:name", shared.ColumnTypeString, v, b.intrinsicBlockID, dstRowIdx)
-					}
+					b.feedIntrinsicString("span:name", shared.ColumnTypeString, v, dstRowIdx)
 				}
 			}
 			continue
@@ -677,9 +695,7 @@ func (b *blockBuilder) addRowFromBlock(srcBlock *modules_reader.Block, srcRowIdx
 					uint64(v), //nolint:gosec // safe: reinterpreting int64 bits as uint64
 				)
 				b.updateMinMax("span:kind", shared.ColumnTypeInt64, string(tmp[:]))
-				if a := b.intrinsicAccum; a != nil {
-					a.feedInt64("span:kind", shared.ColumnTypeInt64, v, b.intrinsicBlockID, dstRowIdx)
-				}
+				b.feedIntrinsicInt64("span:kind", shared.ColumnTypeInt64, v, dstRowIdx)
 			}
 			continue
 
@@ -691,9 +707,7 @@ func (b *blockBuilder) addRowFromBlock(srcBlock *modules_reader.Block, srcRowIdx
 				var tmp [8]byte
 				binary.LittleEndian.PutUint64(tmp[:], v)
 				b.updateMinMax("span:start", shared.ColumnTypeUint64, string(tmp[:]))
-				if a := b.intrinsicAccum; a != nil {
-					a.feedUint64("span:start", shared.ColumnTypeUint64, v, b.intrinsicBlockID, dstRowIdx)
-				}
+				b.feedIntrinsicUint64("span:start", shared.ColumnTypeUint64, v, dstRowIdx)
 				spanStart = v
 				spanStartFound = true
 			}
@@ -721,9 +735,7 @@ func (b *blockBuilder) addRowFromBlock(srcBlock *modules_reader.Block, srcRowIdx
 				var tmp [8]byte
 				binary.LittleEndian.PutUint64(tmp[:], v)
 				b.updateMinMax("span:duration", shared.ColumnTypeUint64, string(tmp[:]))
-				if a := b.intrinsicAccum; a != nil {
-					a.feedUint64("span:duration", shared.ColumnTypeUint64, v, b.intrinsicBlockID, dstRowIdx)
-				}
+				b.feedIntrinsicUint64("span:duration", shared.ColumnTypeUint64, v, dstRowIdx)
 				durationFound = true
 			}
 			continue
@@ -736,9 +748,7 @@ func (b *blockBuilder) addRowFromBlock(srcBlock *modules_reader.Block, srcRowIdx
 					uint64(v), //nolint:gosec // safe: reinterpreting int64 bits as uint64
 				)
 				b.updateMinMax("span:status", shared.ColumnTypeInt64, string(tmp[:]))
-				if a := b.intrinsicAccum; a != nil {
-					a.feedInt64("span:status", shared.ColumnTypeInt64, v, b.intrinsicBlockID, dstRowIdx)
-				}
+				b.feedIntrinsicInt64("span:status", shared.ColumnTypeInt64, v, dstRowIdx)
 			}
 			// Fall through to addPresent below (don't continue).
 
@@ -756,16 +766,12 @@ func (b *blockBuilder) addRowFromBlock(srcBlock *modules_reader.Block, srcRowIdx
 		}
 		b.addPresent(dstRowIdx, colKey.Name, baseType, val)
 		// Feed intrinsic accumulator for select dynamic columns.
-		if a := b.intrinsicAccum; a != nil {
+		if val.Type == shared.ColumnTypeString {
 			switch colKey.Name {
 			case "span:status_message":
-				if val.Type == shared.ColumnTypeString && val.Str != "" {
-					a.feedString("span:status_message", shared.ColumnTypeString, val.Str, b.intrinsicBlockID, dstRowIdx)
-				}
+				b.feedIntrinsicString("span:status_message", shared.ColumnTypeString, val.Str, dstRowIdx)
 			case "resource.service.name":
-				if val.Type == shared.ColumnTypeString && val.Str != "" {
-					a.feedString("resource.service.name", shared.ColumnTypeString, val.Str, b.intrinsicBlockID, dstRowIdx)
-				}
+				b.feedIntrinsicString("resource.service.name", shared.ColumnTypeString, val.Str, dstRowIdx)
 			}
 		}
 	}
@@ -794,9 +800,7 @@ func (b *blockBuilder) finalizeRowBookkeeping(
 		var tmp [8]byte
 		binary.LittleEndian.PutUint64(tmp[:], dur)
 		b.updateMinMax("span:duration", shared.ColumnTypeUint64, string(tmp[:]))
-		if a := b.intrinsicAccum; a != nil {
-			a.feedUint64("span:duration", shared.ColumnTypeUint64, dur, b.intrinsicBlockID, dstRowIdx)
-		}
+		b.feedIntrinsicUint64("span:duration", shared.ColumnTypeUint64, dur, dstRowIdx)
 	}
 
 	// Update min/max start time and trace ID bookkeeping.
