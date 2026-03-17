@@ -157,8 +157,7 @@ type GeneratorCodec interface {
 
 // PushBytesDecoder unmarshals tempopb.PushBytesRequest.
 type PushBytesDecoder struct {
-	dec   *Decoder
-	trace tempopb.Trace
+	dec *Decoder
 }
 
 func NewPushBytesDecoder() *PushBytesDecoder {
@@ -173,16 +172,14 @@ func (d *PushBytesDecoder) Decode(data []byte) (iter.Seq2[*tempopb.PushSpansRequ
 		return nil, err
 	}
 
+	trace := tempopb.Trace{}
 	return func(yield func(*tempopb.PushSpansRequest, error) bool) {
 		for _, tr := range spanBytes.Traces {
-			// Reuse the ResourceSpans backing array across calls to reduce alloc pressure.
-			// Nested objects (ScopeSpans, Span, KeyValue) are still allocated by Unmarshal,
-			// but reusing the top-level slice avoids growing it on every record.
-			d.trace.ResourceSpans = d.trace.ResourceSpans[:0]
-			err = d.trace.Unmarshal(tr.Slice)
+			trace.Reset()
+			err = trace.Unmarshal(tr.Slice)
 
 			yield(&tempopb.PushSpansRequest{
-				Batches:               d.trace.ResourceSpans,
+				Batches:               trace.ResourceSpans,
 				SkipMetricsGeneration: spanBytes.SkipMetricsGeneration,
 			}, err)
 
