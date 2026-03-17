@@ -14,10 +14,9 @@ import (
 	"github.com/grafana/blockpack/internal/vm"
 )
 
-// errNeedBlockScan is returned by collectFromIntrinsicRefs and collectTopKFromIntrinsicRefs
-// when the intrinsic fast path is not applicable and the caller should fall through to a
-// full block scan.
-// NOTE-039: sentinel error for fallback from intrinsic to block scan.
+// errNeedBlockScan is returned by collectFromIntrinsicRefs when the intrinsic pre-filter
+// is not applicable and the caller should fall through to a full block scan.
+// NOTE-038: sentinel error for fallback from intrinsic pre-filter to block scan.
 var errNeedBlockScan = errors.New("intrinsic fast path not applicable")
 
 // CollectOptions configures collect execution for both trace and log signals.
@@ -125,17 +124,20 @@ func (e *Executor) Collect(
 		}
 	}
 
-	// Intrinsic fast path: for intrinsic-only queries with a limit, read only the
-	// intrinsic column section (small blobs, no full block I/O) to get matching
-	// (blockIdx, rowIdx) pairs, then fetch only the minimal set of blocks needed.
-	// When TimestampColumn is set (MostRecent queries), the timestamp intrinsic column
-	// is used to select the globally top-K rows without reading any full blocks.
-	// Works with sub-file sharding: refs outside the shard's block range are filtered
-	// by the block-range check in collectFromIntrinsicRefs.
-	// NOTE-039: errNeedBlockScan signals the fast path is not applicable (e.g., OR/regex
-	// predicates that collectFromIntrinsicRefs could not evaluate). Fall through to
-	// the full block scan path below.
-	if opts.Limit > 0 && ProgramIsIntrinsicOnly(program) {
+	// Intrinsic pre-filter fast path: for queries with at least one intrinsic predicate
+	// (resource.service.name, span:duration, span:kind, etc.) and a limit, read only the
+	// intrinsic column section to get candidate (blockIdx, rowIdx) pairs, then fetch only
+	// the minimal set of blocks needed.
+	//
+	// For pure intrinsic + sorted (Case B): zero block reads — candidate rows returned
+	// directly from intrinsic column data via timestamp scan.
+	// For pure intrinsic + unsorted (Case A): reads only candidate blocks (not all blocks).
+	// For mixed queries (Cases C/D): candidate blocks read, VM ColumnPredicate re-evaluates.
+	//
+	// NOTE-038: 4-case dispatch inside collectFromIntrinsicRefs based on
+	// (ProgramIsIntrinsicOnly × opts.TimestampColumn != "").
+	// errNeedBlockScan signals the pre-filter is not applicable; fall through to full scan.
+	if opts.Limit > 0 && hasSomeIntrinsicPredicates(program) {
 		rows, err := collectFromIntrinsicRefs(r, program, opts, wantColumns, secondPassCols)
 		if err != errNeedBlockScan {
 			if rows != nil || err != nil {
@@ -383,18 +385,37 @@ func streamSortedRows(
 	return false
 }
 
-// collectFromIntrinsicRefs is the fast path for intrinsic-only queries with a limit.
-// It reads only the tiny intrinsic column blobs to get matching BlockRefs, then
-// fetches only the blocks containing those refs — skipping all unneeded block I/O.
+// countUniqueBlockIdxs returns the number of distinct BlockIdx values in refs.
+func countUniqueBlockIdxs(refs []modules_shared.BlockRef) int {
+	if len(refs) == 0 {
+		return 0
+	}
+	seen := make(map[uint16]struct{}, 16)
+	for _, ref := range refs {
+		seen[ref.BlockIdx] = struct{}{}
+	}
+	return len(seen)
+}
+
+// collectFromIntrinsicRefs is the unified intrinsic pre-filter fast path.
+// It dispatches based on (ProgramIsIntrinsicOnly × opts.TimestampColumn != ""):
 //
-// When opts.TimestampColumn is set (MostRecent queries), delegates to
-// collectTopKFromIntrinsicRefs which selects the globally top-K rows by timestamp
-// using only intrinsic column data — no full block reads for predicate evaluation.
+//	Case A: pure intrinsic + no sort  → BlockRefsFromIntrinsicTOC → fetch candidate
+//	        blocks → return MatchedRows (minimal block reads)
+//	Case B: pure intrinsic + sort     → BlockRefsFromIntrinsicTOC → pack into sorted
+//	        keys → ScanFlatColumnRefsFiltered → return IntrinsicFields MatchedRows
+//	        (ZERO block reads)
+//	Case C: mixed + no sort           → blockRefsFromIntrinsicPartial → fetch candidate
+//	        blocks → ColumnPredicate re-eval → intersect → collect up to limit
+//	Case D: mixed + sort              → blockRefsFromIntrinsicPartial → fetch candidate
+//	        blocks → ColumnPredicate re-eval → topKScanRows → topKDeliver
 //
-// Returns (nil, nil) to signal the caller to fall through to the regular Collect path when:
-//   - The file has no intrinsic section
-//   - BlockRefsFromIntrinsicTOC returns nil (predicate not evaluable from intrinsic data)
-//   - No matching refs are found (caller should still run regular path to be safe)
+// Returns (nil, errNeedBlockScan) when no intrinsic constraint is available (fall through
+// to full block scan). Returns (nil, nil) for valid empty-result cases.
+//
+// NOTE-038: The partial-AND pre-filter for mixed queries is a superset; ColumnPredicate
+// re-evaluation in Cases C/D provides correctness. Global top-K is preserved for Case D
+// because the pre-filter never excludes true matches (it is a superset, never a subset).
 func collectFromIntrinsicRefs(
 	r *modules_reader.Reader,
 	program *vm.Program,
@@ -402,19 +423,71 @@ func collectFromIntrinsicRefs(
 	wantColumns map[string]struct{},
 	secondPassCols map[string]struct{},
 ) ([]MatchedRow, error) {
-	if opts.TimestampColumn != "" {
-		return collectTopKFromIntrinsicRefs(r, program, opts, wantColumns, secondPassCols)
+	isPureIntrinsic := ProgramIsIntrinsicOnly(program)
+	hasSort := opts.TimestampColumn != ""
+
+	// Step 1: Get candidate refs using strict (pure intrinsic) or partial (mixed) eval.
+	// Case B (pure intrinsic + sort) uses limit=0 to get ALL matching refs — the
+	// timestamp scan needs the complete match set or it misses the newest spans
+	// (BlockRefsFromIntrinsicTOC returns refs in block order, not timestamp order;
+	// if we truncate at K refs we get the oldest K, and scanning backward finds 0).
+	var refs []modules_shared.BlockRef
+	if isPureIntrinsic {
+		refLimit := opts.Limit
+		if hasSort {
+			// Case B needs ALL matching refs for the timestamp scan — if refs are
+			// truncated to K, the oldest K are returned (block-order, not timestamp-
+			// order) and the backward scan finds 0 of the newest K results.
+			// Use limit=0 (unlimited) so scanIntrinsicLeafRefs appends dynamically
+			// instead of pre-allocating a large slice via make([]BlockRef, 0, overFetch).
+			refLimit = 0
+		}
+		refs = BlockRefsFromIntrinsicTOC(r, program, refLimit)
+	} else {
+		refs = blockRefsFromIntrinsicPartial(r, program, opts.Limit)
 	}
-	refs := BlockRefsFromIntrinsicTOC(r, program, opts.Limit)
 	if refs == nil {
-		return nil, errNeedBlockScan // fast path not available — fall through to block scan
+		return nil, errNeedBlockScan
 	}
 	if len(refs) == 0 {
-		return nil, nil // no matches — empty result
+		return nil, nil
 	}
 
-	// Sort refs by BlockIdx so block traversal order is deterministic
-	// (refs from BlockRefsFromIntrinsicTOC are in predicate-scan order, not block order).
+	// Selectivity guard: if the partial pre-filter covers more than half the internal
+	// blocks it offers no I/O benefit for Cases C/D, which must read blocks for VM eval.
+	// Fall through to the regular block scan (coalesced I/O, planBlocks pruning).
+	if !isPureIntrinsic {
+		uniqueBlocks := countUniqueBlockIdxs(refs)
+		if uniqueBlocks*2 > r.BlockCount() {
+			return nil, errNeedBlockScan
+		}
+	}
+
+	// Step 2: Dispatch based on (isPureIntrinsic, hasSort).
+	if isPureIntrinsic && !hasSort {
+		return collectIntrinsicPlain(r, refs, opts, wantColumns, secondPassCols)
+	}
+	if isPureIntrinsic && hasSort {
+		return collectIntrinsicTopK(r, refs, opts, secondPassCols)
+	}
+	if !hasSort {
+		// Case C: mixed + no sort
+		return collectMixedPlain(r, program, refs, opts, wantColumns, secondPassCols)
+	}
+	// Case D: mixed + sort
+	return collectMixedTopK(r, program, refs, opts, wantColumns, secondPassCols)
+}
+
+// collectIntrinsicPlain handles Case A: pure intrinsic + no sort.
+// Refs are exact matches from intrinsic data; fetch the candidate blocks and return rows.
+func collectIntrinsicPlain(
+	r *modules_reader.Reader,
+	refs []modules_shared.BlockRef,
+	opts CollectOptions,
+	wantColumns map[string]struct{},
+	secondPassCols map[string]struct{},
+) ([]MatchedRow, error) {
+	// Sort refs by BlockIdx for deterministic block traversal order.
 	slices.SortFunc(refs, func(a, b modules_shared.BlockRef) int {
 		if a.BlockIdx != b.BlockIdx {
 			return int(a.BlockIdx) - int(b.BlockIdx)
@@ -450,39 +523,32 @@ func collectFromIntrinsicRefs(
 	}
 
 	var results []MatchedRow
-
 	for _, blockIdx := range blockOrder {
 		rowIdxs := blockRows[blockIdx]
-
-		// Fetch raw bytes for this block via a single-block coalesced group.
 		groups := r.CoalescedGroups([]int{blockIdx})
 		if len(groups) == 0 {
 			continue
 		}
 		groupRaw, err := r.ReadGroup(groups[0])
 		if err != nil {
-			return nil, fmt.Errorf("collectFromIntrinsicRefs ReadGroup block %d: %w", blockIdx, err)
+			return nil, fmt.Errorf("collectIntrinsicPlain ReadGroup block %d: %w", blockIdx, err)
 		}
 		raw, ok := groupRaw[blockIdx]
 		if !ok {
 			continue
 		}
-
 		meta := r.BlockMeta(blockIdx)
 		r.ResetInternStrings()
 		bwb, err := r.ParseBlockFromBytes(raw, wantColumns, meta)
 		if err != nil {
-			return nil, fmt.Errorf("collectFromIntrinsicRefs ParseBlockFromBytes block %d: %w", blockIdx, err)
+			return nil, fmt.Errorf("collectIntrinsicPlain ParseBlockFromBytes block %d: %w", blockIdx, err)
 		}
-
-		// Second pass if needed (same logic as Collect).
 		if wantColumns != nil {
 			bwb, err = r.ParseBlockFromBytes(bwb.RawBytes, secondPassCols, meta)
 			if err != nil {
-				return nil, fmt.Errorf("collectFromIntrinsicRefs second pass block %d: %w", blockIdx, err)
+				return nil, fmt.Errorf("collectIntrinsicPlain second pass block %d: %w", blockIdx, err)
 			}
 		}
-
 		for _, rowIdx := range rowIdxs {
 			results = append(results, MatchedRow{Block: bwb.Block, BlockIdx: blockIdx, RowIdx: rowIdx})
 			if opts.Limit > 0 && len(results) >= opts.Limit {
@@ -490,224 +556,124 @@ func collectFromIntrinsicRefs(
 			}
 		}
 	}
-
 	return results, nil
 }
 
-// collectTopKFromIntrinsicRefs is the fast path for intrinsic-only queries with
-// a timestamp sort (MostRecent). It uses only intrinsic column blobs to:
-//  1. Get ALL refs matching the predicate (no block I/O, no per-row limit).
-//  2. Build a lookup set for O(1) membership checks.
-//  3. Read opts.TimestampColumn (a flat sorted-ascending uint64 column).
-//  4. Scan from newest (end) or oldest (start) based on Direction, checking membership.
-//  5. Collect the top opts.Limit matching refs — these are the globally top-K by timestamp.
-//  6. Fetch only the blocks containing those rows for result materialization.
+// sortScanThreshold is the max number of matching refs for which the map-then-sort path
+// is used. Below this threshold: build a packed-key→timestamp map from tsCol (O(N)),
+// look up each of the M refs in O(1), sort M pairs (O(M log M)). Above this threshold:
+// use ScanFlatColumnRefsFiltered — cheaper when M is large relative to N.
+// Crossover: O(N) map build vs O(N) scan — the map path wins by avoiding repeated blob
+// decompression; for M >= 8K the scan path is preferred as it stops early after K results.
+const sortScanThreshold = 8000
+
+// collectIntrinsicTopK handles Case B: pure intrinsic + timestamp sort.
+// Returns IntrinsicFields MatchedRows with ZERO full block reads.
 //
-// Returns (nil, errNeedBlockScan) to signal the caller to fall through to block scan when:
-//   - buildPredicateMatchSet returns nil (predicate not evaluable or no intrinsic section)
+// For small ref sets (M < sortScanThreshold): decodes the timestamp intrinsic column,
+// builds a packed-key→timestamp map (O(N)), looks up each matching ref's timestamp in
+// O(1), sorts M pairs by timestamp, takes top K. Avoids re-decompression since the
+// decoded column is cached.
 //
-// Returns (nil, nil) for valid empty-result cases (no matches, timestamp column unavailable).
-//
-// unionSortedKeys merges two sorted []uint32 slices, deduplicating equal elements.
-func unionSortedKeys(a, b []uint32) []uint32 {
-	result := make([]uint32, 0, len(a)+len(b))
-	i, j := 0, 0
-	for i < len(a) && j < len(b) {
-		switch {
-		case a[i] < b[j]:
-			result = append(result, a[i])
-			i++
-		case a[i] > b[j]:
-			result = append(result, b[j])
-			j++
-		default:
-			result = append(result, a[i])
-			i++
-			j++
-		}
-	}
-	result = append(result, a[i:]...)
-	result = append(result, b[j:]...)
-	return result
-}
-
-// intersectSortedKeys intersects two sorted []uint32 slices, keeping only common elements.
-func intersectSortedKeys(a, b []uint32) []uint32 {
-	result := make([]uint32, 0, min(len(a), len(b)))
-	i, j := 0, 0
-	for i < len(a) && j < len(b) {
-		if a[i] == b[j] {
-			result = append(result, a[i])
-			i++
-			j++
-		} else if a[i] < b[j] {
-			i++
-		} else {
-			j++
-		}
-	}
-	return result
-}
-
-// evalNodeMatchKeys recursively evaluates a RangeNode tree against intrinsic column blobs,
-// returning sorted packed keys (blockIdx<<16 | rowIdx).
-// Returns (keys, true) when evaluable; (nil, false) when not.
-// OR: union all children; fail if any child is not evaluable.
-// AND: intersect all children; fail if any child is not evaluable.
-//
-// NOTE-039: mirrors evalNodeBlockRefs but works with sorted []uint32 keys for binary search.
-// Both AND and OR must fail fast on unevaluable children because the keys are used as a
-// definitive match set (no VM re-evaluation after collectTopKFromIntrinsicRefs).
-func evalNodeMatchKeys(r *modules_reader.Reader, node vm.RangeNode) ([]uint32, bool) {
-	// Leaf node.
-	if len(node.Children) == 0 {
-		if node.Column == "" {
-			return nil, false
-		}
-		refs := scanIntrinsicLeafRefs(r, node.Column, node, 0)
-		if refs == nil {
-			return nil, false
-		}
-		keys := make([]uint32, len(refs))
-		for i, ref := range refs {
-			keys[i] = uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx)
-		}
-		slices.Sort(keys)
-		return keys, true
-	}
-
-	if node.IsOR {
-		// OR: union — all children must be evaluable.
-		var union []uint32
-		for _, child := range node.Children {
-			childKeys, ok := evalNodeMatchKeys(r, child)
-			if !ok {
-				return nil, false // any unevaluable child makes OR unevaluable
-			}
-			if union == nil {
-				union = childKeys
-			} else {
-				union = unionSortedKeys(union, childKeys)
-			}
-		}
-		if union == nil {
-			union = []uint32{} // evaluable but empty
-		}
-		return union, true
-	}
-
-	// AND: intersect — all children must be evaluable.
-	// Keys are used as a definitive match set without VM re-evaluation, so skipping
-	// any child would return rows that do not satisfy the full predicate.
-	var result []uint32
-	hasResult := false
-	for _, child := range node.Children {
-		childKeys, ok := evalNodeMatchKeys(r, child)
-		if !ok {
-			return nil, false // any unevaluable child makes AND unevaluable
-		}
-		if !hasResult {
-			result = childKeys
-			hasResult = true
-		} else {
-			result = intersectSortedKeys(result, childKeys)
-		}
-	}
-	if !hasResult {
-		return nil, false
-	}
-	return result, true
-}
-
-// buildPredicateMatchSet returns a sorted slice of packed ref keys (blockIdx<<16 | rowIdx)
-// for all refs matching the intrinsic predicate. The sorted slice enables
-// O(log N) binary search per timestamp ref during the streaming top-K scan.
-//
-// NOTE-039: now uses evalNodeMatchKeys to support OR and regex predicates.
-// Returns nil if the fast path is not available (any top-level node not evaluable).
-func buildPredicateMatchSet(r *modules_reader.Reader, program *vm.Program) []uint32 {
-	if !r.HasIntrinsicSection() || program == nil || program.Predicates == nil {
-		return nil
-	}
-	if len(program.Predicates.Nodes) == 0 {
-		return nil
-	}
-
-	// Evaluate each top-level node (AND-combined) and intersect.
-	var result []uint32
-	hasResult := false
-	for _, node := range program.Predicates.Nodes {
-		keys, ok := evalNodeMatchKeys(r, node)
-		if !ok {
-			return nil // any unevaluable top-level node → fast path not applicable
-		}
-		if !hasResult {
-			result = keys
-			hasResult = true
-		} else {
-			result = intersectSortedKeys(result, keys)
-		}
-	}
-	if !hasResult {
-		return nil
-	}
-	return result
-}
-
-func collectTopKFromIntrinsicRefs(
+// For large ref sets (M >= sortScanThreshold): packs refs into a sorted key set
+// and runs ScanFlatColumnRefsFiltered backward, stopping after K results.
+// O(K/rate × log M) — ideal for common predicates where rate is high.
+func collectIntrinsicTopK(
 	r *modules_reader.Reader,
-	program *vm.Program,
+	refs []modules_shared.BlockRef,
 	opts CollectOptions,
-	wantColumns map[string]struct{},
 	secondPassCols map[string]struct{},
 ) ([]MatchedRow, error) {
-	// Build sorted match set from predicate columns, then scan timestamp refs
-	// from newest (or oldest), checking each ref via binary search.
-	// This is timestamp-first: we scan in time order and check predicates per-ref,
-	// stopping as soon as we have opts.Limit matches.
-	matchKeys := buildPredicateMatchSet(r, program)
-	if matchKeys == nil {
-		return nil, errNeedBlockScan // fast path not available — fall through to block scan
+	backward := opts.Direction == queryplanner.Backward
+	limit := opts.Limit
+
+	var selected []modules_shared.BlockRef
+
+	if len(refs) < sortScanThreshold {
+		// Map-then-sort path: O(N) build + O(M log M) sort.
+		// tsCol.BlockRefs is stored in ascending timestamp order (NOT packed-key order).
+		// Build a packed-key → timestamp map from the full column, then look up each
+		// matching ref's timestamp in O(1), sort, and take top K.
+		// NOTE-042: replaces O(N) scan of the blob for the small-M sort path.
+		tsCol, tsErr := r.GetIntrinsicColumn(opts.TimestampColumn)
+		if tsErr != nil || tsCol == nil || len(tsCol.Uint64Values) < len(tsCol.BlockRefs) {
+			return nil, errNeedBlockScan
+		}
+		// Build packed-key → timestamp map from the full column (O(N)).
+		// Packing invariant: BlockRef fields are uint16, so BlockIdx occupies bits 31-16
+		// and RowIdx occupies bits 15-0 — no collision is possible.
+		tsMap := make(map[uint32]uint64, len(tsCol.BlockRefs))
+		for i, br := range tsCol.BlockRefs {
+			tsMap[uint32(br.BlockIdx)<<16|uint32(br.RowIdx)] = tsCol.Uint64Values[i]
+		}
+		type refTS struct {
+			ref modules_shared.BlockRef
+			ts  uint64
+		}
+		pairs := make([]refTS, 0, len(refs))
+		for _, ref := range refs {
+			bi := int(ref.BlockIdx)
+			if opts.BlockCount > 0 && (bi < opts.StartBlock || bi >= opts.StartBlock+opts.BlockCount) {
+				continue
+			}
+			key := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx)
+			if ts, ok := tsMap[key]; ok {
+				pairs = append(pairs, refTS{ref: ref, ts: ts})
+			}
+		}
+		if len(pairs) == 0 {
+			return nil, nil
+		}
+		// Sort by timestamp: descending for backward (MostRecent), ascending for forward.
+		if backward {
+			slices.SortFunc(pairs, func(a, b refTS) int { return cmp.Compare(b.ts, a.ts) })
+		} else {
+			slices.SortFunc(pairs, func(a, b refTS) int { return cmp.Compare(a.ts, b.ts) })
+		}
+		if limit > 0 && len(pairs) > limit {
+			pairs = pairs[:limit]
+		}
+		selected = make([]modules_shared.BlockRef, len(pairs))
+		for i, p := range pairs {
+			selected[i] = p.ref
+		}
+	} else {
+		// Scan path: pack matchKeys, scan timestamp blob from newest/oldest end.
+		// Used for large M (>= sortScanThreshold).
+		matchKeys := make([]uint32, len(refs))
+		for i, ref := range refs {
+			matchKeys[i] = uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx)
+		}
+		slices.Sort(matchKeys)
+
+		tsBlob, tsBlobErr := r.GetIntrinsicColumnBlob(opts.TimestampColumn)
+		if tsBlobErr != nil || tsBlob == nil {
+			return nil, errNeedBlockScan
+		}
+
+		startBlock := opts.StartBlock
+		endBlock := 0
+		if opts.BlockCount > 0 {
+			endBlock = startBlock + opts.BlockCount
+		}
+		selected = modules_shared.ScanFlatColumnRefsFiltered(tsBlob, backward, limit,
+			func(ref modules_shared.BlockRef) bool {
+				bi := int(ref.BlockIdx)
+				if endBlock > 0 && (bi < startBlock || bi >= endBlock) {
+					return false
+				}
+				key := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx)
+				_, found := slices.BinarySearch(matchKeys, key)
+				return found
+			},
+		)
 	}
-	if len(matchKeys) == 0 {
+
+	if len(selected) == 0 {
 		return nil, nil
 	}
 
-	backward := opts.Direction == queryplanner.Backward
-	tsBlob, tsBlobErr := r.GetIntrinsicColumnBlob(opts.TimestampColumn)
-	if tsBlobErr != nil || tsBlob == nil {
-		return nil, nil //nolint:nilerr // intentional fall-through to regular path
-	}
-
-	// Block-range filter for sub-file sharding: only include refs within the shard's range.
-	startBlock := opts.StartBlock
-	endBlock := 0
-	if opts.BlockCount > 0 {
-		endBlock = startBlock + opts.BlockCount
-	}
-
-	selected := modules_shared.ScanFlatColumnRefsFiltered(tsBlob, backward, opts.Limit,
-		func(ref modules_shared.BlockRef) bool {
-			bi := int(ref.BlockIdx)
-			// Sub-file shard filter: skip refs outside the assigned block range.
-			if endBlock > 0 && (bi < startBlock || bi >= endBlock) {
-				return false
-			}
-			key := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx)
-			_, found := slices.BinarySearch(matchKeys, key)
-			return found
-		},
-	)
-	if selected == nil {
-		return nil, nil // not a flat column or decode error — fall through
-	}
-	if len(selected) == 0 {
-		return nil, nil // no matches after timestamp filtering — fall through
-	}
-
-	// Build results directly from intrinsic columns — no full block reads needed.
-	// Look up field values for all selected refs in one pass per column.
-	fieldMaps := lookupIntrinsicFields(r, selected)
+	fieldMaps := lookupIntrinsicFields(r, selected, secondPassCols)
 	results := make([]MatchedRow, 0, len(selected))
 	for i, ref := range selected {
 		results = append(results, MatchedRow{
@@ -719,17 +685,216 @@ func collectTopKFromIntrinsicRefs(
 	return results, nil
 }
 
+// collectMixedPlain handles Case C: mixed predicate + no sort.
+// The refs from blockRefsFromIntrinsicPartial are a superset (partial-AND pre-filter).
+// For each candidate block, ColumnPredicate re-evaluates the full predicate to eliminate
+// false positives.
+func collectMixedPlain(
+	r *modules_reader.Reader,
+	program *vm.Program,
+	refs []modules_shared.BlockRef,
+	opts CollectOptions,
+	wantColumns map[string]struct{},
+	secondPassCols map[string]struct{},
+) ([]MatchedRow, error) {
+	// Sort refs and apply shard filter (same as collectIntrinsicPlain).
+	slices.SortFunc(refs, func(a, b modules_shared.BlockRef) int {
+		if a.BlockIdx != b.BlockIdx {
+			return int(a.BlockIdx) - int(b.BlockIdx)
+		}
+		return int(a.RowIdx) - int(b.RowIdx)
+	})
+	if opts.BlockCount > 0 {
+		endBlock := opts.StartBlock + opts.BlockCount
+		filtered := refs[:0]
+		for _, ref := range refs {
+			bi := int(ref.BlockIdx)
+			if bi >= opts.StartBlock && bi < endBlock {
+				filtered = append(filtered, ref)
+			}
+		}
+		refs = filtered
+		if len(refs) == 0 {
+			return nil, nil
+		}
+	}
+
+	// Group candidate row indices by block.
+	blockOrder := make([]int, 0, 4)
+	blockCandidates := make(map[int][]int, 4)
+	for _, ref := range refs {
+		bi := int(ref.BlockIdx)
+		if _, seen := blockCandidates[bi]; !seen {
+			blockOrder = append(blockOrder, bi)
+		}
+		blockCandidates[bi] = append(blockCandidates[bi], int(ref.RowIdx))
+	}
+
+	var results []MatchedRow
+	// Coalesce all candidate blocks for efficient batch I/O.
+	groups := r.CoalescedGroups(blockOrder)
+	for _, group := range groups {
+		fetched, err := r.ReadGroup(group)
+		if err != nil {
+			return nil, fmt.Errorf("collectMixedPlain ReadGroup: %w", err)
+		}
+		for _, blockIdx := range group.BlockIDs {
+			candidateRows := blockCandidates[blockIdx]
+			raw, ok := fetched[blockIdx]
+			if !ok {
+				continue
+			}
+			meta := r.BlockMeta(blockIdx)
+			r.ResetInternStrings()
+			bwb, parseErr := r.ParseBlockFromBytes(raw, wantColumns, meta)
+			if parseErr != nil {
+				return nil, fmt.Errorf("collectMixedPlain ParseBlockFromBytes block %d: %w", blockIdx, parseErr)
+			}
+			if wantColumns != nil {
+				bwb, parseErr = r.ParseBlockFromBytes(bwb.RawBytes, secondPassCols, meta)
+				if parseErr != nil {
+					return nil, fmt.Errorf("collectMixedPlain second pass block %d: %w", blockIdx, parseErr)
+				}
+			}
+
+			// Re-evaluate the full predicate against this block.
+			provider := newBlockColumnProvider(bwb.Block)
+			rowSet, evalErr := program.ColumnPredicate(provider)
+			if evalErr != nil {
+				return nil, fmt.Errorf("collectMixedPlain ColumnPredicate block %d: %w", blockIdx, evalErr)
+			}
+
+			// Intersect VM result with candidate rows from intrinsic pre-filter.
+			for _, rowIdx := range candidateRows {
+				if !rowSet.Contains(rowIdx) {
+					continue // eliminated by VM re-evaluation
+				}
+				results = append(results, MatchedRow{Block: bwb.Block, BlockIdx: blockIdx, RowIdx: rowIdx})
+				if opts.Limit > 0 && len(results) >= opts.Limit {
+					return results, nil
+				}
+			}
+		}
+	}
+	return results, nil
+}
+
+// collectMixedTopK handles Case D: mixed predicate + timestamp sort.
+// Fetches only candidate blocks (from partial-AND pre-filter), re-evaluates the full
+// predicate, runs topKScanRows on the qualifying rows, and delivers top-K by timestamp.
+//
+// Global top-K correctness is preserved: the partial-AND pre-filter is a superset, so
+// all true matching rows (those satisfying both intrinsic and non-intrinsic conditions)
+// are present among the candidate blocks. ColumnPredicate eliminates false positives.
+// topKScanRows then finds the globally correct top-K timestamp order within those candidates.
+func collectMixedTopK(
+	r *modules_reader.Reader,
+	program *vm.Program,
+	refs []modules_shared.BlockRef,
+	opts CollectOptions,
+	wantColumns map[string]struct{},
+	secondPassCols map[string]struct{},
+) ([]MatchedRow, error) {
+	backward := opts.Direction == queryplanner.Backward
+
+	// Apply shard filter.
+	if opts.BlockCount > 0 {
+		endBlock := opts.StartBlock + opts.BlockCount
+		filtered := refs[:0]
+		for _, ref := range refs {
+			bi := int(ref.BlockIdx)
+			if bi >= opts.StartBlock && bi < endBlock {
+				filtered = append(filtered, ref)
+			}
+		}
+		refs = filtered
+		if len(refs) == 0 {
+			return nil, nil
+		}
+	}
+
+	// Group candidate rows by block.
+	blockOrder := make([]int, 0, 4)
+	blockCandidates := make(map[int][]int, 4)
+	for _, ref := range refs {
+		bi := int(ref.BlockIdx)
+		if _, seen := blockCandidates[bi]; !seen {
+			blockOrder = append(blockOrder, bi)
+		}
+		blockCandidates[bi] = append(blockCandidates[bi], int(ref.RowIdx))
+	}
+
+	buf := &topKHeap{entries: make([]topKEntry, 0, opts.Limit), backward: backward}
+
+	// Coalesce all candidate blocks for efficient batch I/O.
+	groups := r.CoalescedGroups(blockOrder)
+	for _, group := range groups {
+		fetched, err := r.ReadGroup(group)
+		if err != nil {
+			return nil, fmt.Errorf("collectMixedTopK ReadGroup: %w", err)
+		}
+		for _, blockIdx := range group.BlockIDs {
+			candidateRows := blockCandidates[blockIdx]
+			raw, ok := fetched[blockIdx]
+			if !ok {
+				continue
+			}
+			meta := r.BlockMeta(blockIdx)
+			r.ResetInternStrings()
+			bwb, parseErr := r.ParseBlockFromBytes(raw, wantColumns, meta)
+			if parseErr != nil {
+				return nil, fmt.Errorf("collectMixedTopK ParseBlockFromBytes block %d: %w", blockIdx, parseErr)
+			}
+			if wantColumns != nil {
+				bwb, parseErr = r.ParseBlockFromBytes(bwb.RawBytes, secondPassCols, meta)
+				if parseErr != nil {
+					return nil, fmt.Errorf("collectMixedTopK second pass block %d: %w", blockIdx, parseErr)
+				}
+			}
+
+			// Re-evaluate the full predicate.
+			provider := newBlockColumnProvider(bwb.Block)
+			rowSet, evalErr := program.ColumnPredicate(provider)
+			if evalErr != nil {
+				return nil, fmt.Errorf("collectMixedTopK ColumnPredicate block %d: %w", blockIdx, evalErr)
+			}
+
+			// Collect rows that pass both the pre-filter and full predicate.
+			var qualifying []int
+			for _, rowIdx := range candidateRows {
+				if rowSet.Contains(rowIdx) {
+					qualifying = append(qualifying, rowIdx)
+				}
+			}
+			if len(qualifying) == 0 {
+				continue
+			}
+
+			// Get timestamp column for heap ordering.
+			tsCol := bwb.Block.GetColumn(opts.TimestampColumn)
+			if tsCol == nil {
+				continue
+			}
+
+			topKScanRows(buf, opts.Limit, backward, bwb.Block, blockIdx, tsCol, opts.TimeRange, qualifying)
+		}
+	}
+
+	return topKDeliver(buf, backward), nil
+}
+
 // intrinsicFieldsProvider implements SpanFieldsProvider by looking up field values
 // from intrinsic columns. Used by the intrinsic fast path to avoid reading full blocks.
 type intrinsicFieldsProvider struct {
 	fields map[string]any
 }
 
-// lookupIntrinsicFields resolves field values for a small set of refs from intrinsic columns.
-// For each ref, it scans each intrinsic column to find the value. This is efficient for
-// small ref sets (limit=20) since dict columns have few entries (3-50 values) and
-// flat column refs are sorted (binary searchable).
-func lookupIntrinsicFields(r *modules_reader.Reader, selected []modules_shared.BlockRef) []map[string]any {
+// lookupIntrinsicFields reads intrinsic column values for the given refs and returns one
+// map[string]any per ref. wantCols limits which columns are loaded — when non-nil only
+// columns present in wantCols are fetched (skipping expensive GetIntrinsicColumn calls
+// and the mergeIntrinsicColumns allocations they trigger for unwanted columns).
+// Pass nil to fetch all intrinsic columns (e.g. FindTraceByID needs every field).
+func lookupIntrinsicFields(r *modules_reader.Reader, selected []modules_shared.BlockRef, wantCols map[string]struct{}) []map[string]any {
 	// Build a set of target keys for quick matching.
 	targetKeys := make(map[uint32]int, len(selected)) // packed key → index in selected
 	for i, ref := range selected {
@@ -742,6 +907,13 @@ func lookupIntrinsicFields(r *modules_reader.Reader, selected []modules_shared.B
 	}
 
 	for _, colName := range r.IntrinsicColumnNames() {
+		// Skip columns not required by this query. wantCols == nil means "all columns"
+		// (used for FindTraceByID and match-all queries that need every field).
+		if wantCols != nil {
+			if _, needed := wantCols[colName]; !needed {
+				continue
+			}
+		}
 		col, err := r.GetIntrinsicColumn(colName)
 		if err != nil || col == nil {
 			continue
