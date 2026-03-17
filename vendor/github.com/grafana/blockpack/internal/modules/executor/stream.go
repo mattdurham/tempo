@@ -475,7 +475,11 @@ func collectFromIntrinsicRefs(
 		}
 		refs = BlockRefsFromIntrinsicTOC(r, program, refLimit)
 	} else {
-		refs = blockRefsFromIntrinsicPartial(r, program, opts.Limit)
+		// Cases C/D: pass limit=0 (unlimited) so the partial pre-filter returns a true
+		// superset. Passing opts.Limit would truncate the candidate set in block order,
+		// turning a superset into a subset — the VM re-eval in collectMixedPlain /
+		// collectMixedTopK cannot recover false negatives (true matches silently dropped).
+		refs = blockRefsFromIntrinsicPartial(r, program, 0)
 	}
 	if refs == nil {
 		stats.ExecutionPath = "intrinsic-need-block-scan"
@@ -558,36 +562,38 @@ func collectIntrinsicPlain(
 	}
 
 	var results []MatchedRow
-	for _, blockIdx := range blockOrder {
-		rowIdxs := blockRows[blockIdx]
-		groups := r.CoalescedGroups([]int{blockIdx})
-		if len(groups) == 0 {
-			continue
-		}
-		groupRaw, err := r.ReadGroup(groups[0])
+	// Coalesce all candidate blocks for efficient batch I/O — same pattern as
+	// collectMixedPlain. Computing CoalescedGroups once across all blockOrder entries
+	// allows the reader to issue multi-block reads instead of one per block.
+	groups := r.CoalescedGroups(blockOrder)
+	for _, group := range groups {
+		fetched, err := r.ReadGroup(group)
 		if err != nil {
-			return nil, fmt.Errorf("collectIntrinsicPlain ReadGroup block %d: %w", blockIdx, err)
+			return nil, fmt.Errorf("collectIntrinsicPlain ReadGroup: %w", err)
 		}
-		raw, ok := groupRaw[blockIdx]
-		if !ok {
-			continue
-		}
-		meta := r.BlockMeta(blockIdx)
-		r.ResetInternStrings()
-		bwb, err := r.ParseBlockFromBytes(raw, wantColumns, meta)
-		if err != nil {
-			return nil, fmt.Errorf("collectIntrinsicPlain ParseBlockFromBytes block %d: %w", blockIdx, err)
-		}
-		if wantColumns != nil {
-			bwb, err = r.ParseBlockFromBytes(bwb.RawBytes, secondPassCols, meta)
-			if err != nil {
-				return nil, fmt.Errorf("collectIntrinsicPlain second pass block %d: %w", blockIdx, err)
+		for _, blockIdx := range group.BlockIDs {
+			rowIdxs := blockRows[blockIdx]
+			raw, ok := fetched[blockIdx]
+			if !ok {
+				continue
 			}
-		}
-		for _, rowIdx := range rowIdxs {
-			results = append(results, MatchedRow{Block: bwb.Block, BlockIdx: blockIdx, RowIdx: rowIdx})
-			if opts.Limit > 0 && len(results) >= opts.Limit {
-				return results, nil
+			meta := r.BlockMeta(blockIdx)
+			r.ResetInternStrings()
+			bwb, parseErr := r.ParseBlockFromBytes(raw, wantColumns, meta)
+			if parseErr != nil {
+				return nil, fmt.Errorf("collectIntrinsicPlain ParseBlockFromBytes block %d: %w", blockIdx, parseErr)
+			}
+			if wantColumns != nil {
+				bwb, parseErr = r.ParseBlockFromBytes(bwb.RawBytes, secondPassCols, meta)
+				if parseErr != nil {
+					return nil, fmt.Errorf("collectIntrinsicPlain second pass block %d: %w", blockIdx, parseErr)
+				}
+			}
+			for _, rowIdx := range rowIdxs {
+				results = append(results, MatchedRow{Block: bwb.Block, BlockIdx: blockIdx, RowIdx: rowIdx})
+				if opts.Limit > 0 && len(results) >= opts.Limit {
+					return results, nil
+				}
 			}
 		}
 	}
@@ -686,6 +692,18 @@ func collectIntrinsicTopK(
 					pairs = append(pairs, refTS{ref: ref, ts: ts})
 				}
 			}
+		}
+		// Apply time range filter: O(M) pass to drop rows outside opts.TimeRange.
+		// Zero values for MinNano/MaxNano mean "no bound" (open interval).
+		if opts.TimeRange.MinNano > 0 || opts.TimeRange.MaxNano > 0 {
+			filtered := pairs[:0]
+			for _, p := range pairs {
+				if (opts.TimeRange.MinNano == 0 || p.ts >= opts.TimeRange.MinNano) &&
+					(opts.TimeRange.MaxNano == 0 || p.ts <= opts.TimeRange.MaxNano) {
+					filtered = append(filtered, p)
+				}
+			}
+			pairs = filtered
 		}
 		stats.ExecutionPath = "intrinsic-topk-kll"
 		stats.IntrinsicRefCount = len(refs)
