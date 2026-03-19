@@ -444,5 +444,3 @@ replace (
 // - https://github.com/grafana/memberlist/pull/3
 replace github.com/hashicorp/memberlist => github.com/grafana/memberlist v0.3.1-0.20251024160842-5cd332c2849a
 
-// Local development: use blockpack from local checkout.
-replace github.com/grafana/blockpack => /home/matt/source/blockpack-tempo

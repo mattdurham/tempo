@@ -690,6 +690,19 @@ metrics_generator:
                       name: http.status_code
                       type: int
                       options: []
+                blockpack:
+                    compression_codec: zstd
+                    compression_level: 3
+                    column_block_size: 65536
+                    write_buffer_size: 1048576
+                    enable_dictionary: true
+                    dictionary_max_size: 1048576
+                    enable_minhash: true
+                    minhash_permutations: 128
+                    enable_bit_packing: true
+                    max_spans_per_block: 2000
+                    file_cache_path: /var/tempo/blockpack-cache
+                    file_cache_max_bytes: 4294967296
             search:
                 chunk_size_bytes: 1000000
                 prefetch_trace_count: 1000
@@ -841,6 +854,19 @@ block_builder:
               name: http.status_code
               type: int
               options: []
+        blockpack:
+            compression_codec: zstd
+            compression_level: 3
+            column_block_size: 65536
+            write_buffer_size: 1048576
+            enable_dictionary: true
+            dictionary_max_size: 1048576
+            enable_minhash: true
+            minhash_permutations: 128
+            enable_bit_packing: true
+            max_spans_per_block: 2000
+            file_cache_path: /var/tempo/blockpack-cache
+            file_cache_max_bytes: 4294967296
     wal:
         path: /var/tempo/block-builder/traces
         ingestion_time_range_slack: 2m0s
@@ -914,6 +940,19 @@ storage:
                   name: http.status_code
                   type: int
                   options: []
+            blockpack:
+                compression_codec: zstd
+                compression_level: 3
+                column_block_size: 65536
+                write_buffer_size: 1048576
+                enable_dictionary: true
+                dictionary_max_size: 1048576
+                enable_minhash: true
+                minhash_permutations: 128
+                enable_bit_packing: true
+                max_spans_per_block: 2000
+                file_cache_path: /var/tempo/blockpack-cache
+                file_cache_max_bytes: 4294967296
         search:
             chunk_size_bytes: 1000000
             prefetch_trace_count: 1000
@@ -1417,6 +1456,19 @@ live_store:
               name: http.status_code
               type: int
               options: []
+        blockpack:
+            compression_codec: zstd
+            compression_level: 3
+            column_block_size: 65536
+            write_buffer_size: 1048576
+            enable_dictionary: true
+            dictionary_max_size: 1048576
+            enable_minhash: true
+            minhash_permutations: 128
+            enable_bit_packing: true
+            max_spans_per_block: 2000
+            file_cache_path: /var/tempo/blockpack-cache
+            file_cache_max_bytes: 4294967296
     readiness_target_lag: 0s
     readiness_max_wait: 30m0s
     fail_on_high_lag: false
