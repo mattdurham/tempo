@@ -3,9 +3,10 @@ package executor
 // NOTE: Any changes to this file must be reflected in the corresponding SPECS.md or NOTES.md.
 
 import (
+	"cmp"
 	"fmt"
 	"math"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -114,7 +115,7 @@ func ExecuteTraceMetrics(
 			return nil, fmt.Errorf("ParseBlockFromBytes block %d: %w", blockIdx, parseErr)
 		}
 
-		provider := NewColumnProvider(bwb.Block)
+		provider := newBlockColumnProvider(bwb.Block)
 		rowSet, evalErr := program.ColumnPredicate(provider)
 		if evalErr != nil {
 			return nil, fmt.Errorf("ColumnPredicate block %d: %w", blockIdx, evalErr)
@@ -314,38 +315,10 @@ func traceBuildDenseSeries(
 	buckets map[string]*aggBucketState,
 	querySpec *vm.QuerySpec,
 ) []TraceTimeSeries {
-	if len(buckets) == 0 {
+	attrGroupKeys, numBuckets := collectGroupKeys(buckets, querySpec.TimeBucketing)
+	if attrGroupKeys == nil {
 		return nil
 	}
-
-	tb := querySpec.TimeBucketing
-	numBuckets := int64(0)
-	if tb.Enabled && tb.StepSizeNanos > 0 {
-		numBuckets = (tb.EndTime - tb.StartTime + tb.StepSizeNanos - 1) / tb.StepSizeNanos
-	}
-	if numBuckets <= 0 {
-		return nil
-	}
-
-	// Collect unique attrGroupKeys.
-	attrGroupKeySet := make(map[string]struct{})
-	for compositeKey := range buckets {
-		// compositeKey is always "bucketIdx\x00attrGroupKey" by construction (see traceAccumulateRow).
-		_, after, ok := strings.Cut(compositeKey, "\x00")
-		if !ok {
-			continue
-		}
-		attrGroupKeySet[after] = struct{}{}
-	}
-	if len(attrGroupKeySet) == 0 {
-		return nil
-	}
-
-	attrGroupKeys := make([]string, 0, len(attrGroupKeySet))
-	for k := range attrGroupKeySet {
-		attrGroupKeys = append(attrGroupKeys, k)
-	}
-	sort.Strings(attrGroupKeys)
 
 	stepSec := float64(querySpec.TimeBucketing.StepSizeNanos) / 1e9
 	groupBy := querySpec.Aggregate.GroupBy
@@ -381,8 +354,8 @@ func traceBuildDenseSeries(
 	}
 
 	// Sort for deterministic output (SPEC-ETM-11).
-	sort.Slice(series, func(i, j int) bool {
-		return traceLabelString(series[i].Labels) < traceLabelString(series[j].Labels)
+	slices.SortFunc(series, func(a, b TraceTimeSeries) int {
+		return cmp.Compare(traceLabelString(a.Labels), traceLabelString(b.Labels))
 	})
 
 	return series
@@ -504,16 +477,15 @@ func traceHistogramSeries(
 	for k := range keySet {
 		sortedKeys = append(sortedKeys, k)
 	}
-	sort.Slice(sortedKeys, func(i, j int) bool {
-		ki, kj := sortedKeys[i], sortedKeys[j]
-		if ki.attrGroupKey != kj.attrGroupKey {
-			return ki.attrGroupKey < kj.attrGroupKey
+	slices.SortFunc(sortedKeys, func(a, b histSeriesKey) int {
+		if a.attrGroupKey != b.attrGroupKey {
+			return cmp.Compare(a.attrGroupKey, b.attrGroupKey)
 		}
 		// Parse boundaries as float64 to sort numerically, not lexicographically.
 		// %g formatting means "4" < "32" lexicographically but 4.0 < 32.0 numerically.
-		fi, _ := strconv.ParseFloat(ki.bucketBoundary, 64)
-		fj, _ := strconv.ParseFloat(kj.bucketBoundary, 64)
-		return fi < fj
+		fi, _ := strconv.ParseFloat(a.bucketBoundary, 64)
+		fj, _ := strconv.ParseFloat(b.bucketBoundary, 64)
+		return cmp.Compare(fi, fj)
 	})
 
 	groupBy := querySpec.Aggregate.GroupBy
@@ -544,8 +516,8 @@ func traceHistogramSeries(
 		series = append(series, TraceTimeSeries{Labels: labels, Values: values})
 	}
 
-	sort.Slice(series, func(i, j int) bool {
-		return traceLabelString(series[i].Labels) < traceLabelString(series[j].Labels)
+	slices.SortFunc(series, func(a, b TraceTimeSeries) int {
+		return cmp.Compare(traceLabelString(a.Labels), traceLabelString(b.Labels))
 	})
 	return series
 }

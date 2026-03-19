@@ -178,158 +178,203 @@ func parseSketchIndexSection(data []byte) (*sketchIndex, int, error) {
 
 		cd := &columnSketchData{numBlocks: numBlocks}
 
-		// presence_bytes[ceil(numBlocks/8)]
-		if pos+presenceBytes > len(data) {
-			return nil, 0, fmt.Errorf("sketch_index: col %q: too short for presence", name)
-		}
-		presenceRaw := data[pos : pos+presenceBytes]
-		pos += presenceBytes
-
-		// Build presence bitset ([]uint64) and presentMap.
-		presenceWords := (numBlocks + 63) / 64
-		if presenceWords > 0 {
-			cd.presence = make([]uint64, presenceWords)
-			for byteIdx, b := range presenceRaw {
-				wordIdx := byteIdx / 8
-				bitShift := uint(byteIdx%8) * 8
-				cd.presence[wordIdx] |= uint64(b) << bitShift
-			}
+		var err error
+		var presentCount int
+		pos, presentCount, err = parseColumnPresence(data, pos, name, numBlocks, presenceBytes, cd)
+		if err != nil {
+			return nil, 0, err
 		}
 
-		// Build presentMap: which block indices have this column.
-		for blockIdx := range numBlocks {
-			byteIdx := blockIdx / 8
-			bitIdx := uint(blockIdx % 8)
-			if byteIdx < len(presenceRaw) && presenceRaw[byteIdx]>>bitIdx&1 == 1 {
-				cd.presentMap = append(cd.presentMap, blockIdx)
-			}
-		}
-		presentCount := len(cd.presentMap)
-
-		// distinct_count[numBlocks × 4 LE uint32]
-		if pos+numBlocks*4 > len(data) {
-			return nil, 0, fmt.Errorf("sketch_index: col %q: too short for distinct counts", name)
-		}
-		cd.distinct = make([]uint32, numBlocks)
-		for i := range numBlocks {
-			cd.distinct[i] = binary.LittleEndian.Uint32(data[pos:])
-			pos += 4
+		pos, err = parseColumnDistinct(data, pos, name, numBlocks, cd)
+		if err != nil {
+			return nil, 0, err
 		}
 
-		// topk_k[1]
-		if pos >= len(data) {
-			return nil, 0, fmt.Errorf("sketch_index: col %q: missing topk_k", name)
-		}
-		topkK := int(data[pos])
-		pos++
-		// Accept any topkK in [1, 255] for forward compatibility — a future writer may
-		// use a larger TopKSize. Per-block entry counts (1-byte) are bounded independently.
-		if topkK <= 0 {
-			return nil, 0, fmt.Errorf("sketch_index: col %q: invalid topk_k=%d", name, topkK)
+		pos, err = parseColumnTopK(data, pos, name, presentCount, cd)
+		if err != nil {
+			return nil, 0, err
 		}
 
-		// Per present block: topk_entry_count[1] + entries (fp[8 LE] + count[2 LE]).
-		cd.topkFP = make([][]uint64, presentCount)
-		cd.topkCount = make([][]uint16, presentCount)
-		for pi := range presentCount {
-			if pos >= len(data) {
-				return nil, 0, fmt.Errorf("sketch_index: col %q: present block %d: missing topk entry count", name, pi)
-			}
-			entryCount := int(data[pos])
-			pos++
-			if entryCount > topkK {
-				return nil, 0, fmt.Errorf(
-					"sketch_index: col %q: present block %d: topk entry count %d exceeds declared topk_k=%d",
-					name, pi, entryCount, topkK,
-				)
-			}
-			fps := make([]uint64, entryCount)
-			counts := make([]uint16, entryCount)
-			for ei := range entryCount {
-				if pos+10 > len(data) {
-					return nil, 0, fmt.Errorf("sketch_index: col %q: topk entry %d/%d: too short", name, ei, entryCount)
-				}
-				fps[ei] = binary.LittleEndian.Uint64(data[pos:])
-				pos += 8
-				counts[ei] = binary.LittleEndian.Uint16(data[pos:])
-				pos += 2
-			}
-			cd.topkFP[pi] = fps
-			cd.topkCount[pi] = counts
+		pos, err = parseColumnCMS(data, pos, name, presentCount, cd)
+		if err != nil {
+			return nil, 0, err
 		}
 
-		// cms_depth[1]
-		if pos >= len(data) {
-			return nil, 0, fmt.Errorf("sketch_index: col %q: missing cms_depth", name)
-		}
-		cmsDepth := int(data[pos])
-		pos++
-		if cmsDepth != sketch.CMSDepth {
-			return nil, 0, fmt.Errorf(
-				"sketch_index: col %q: unexpected cms_depth=%d, want %d",
-				name,
-				cmsDepth,
-				sketch.CMSDepth,
-			)
-		}
-
-		// cms_width[2 LE]
-		if pos+2 > len(data) {
-			return nil, 0, fmt.Errorf("sketch_index: col %q: missing cms_width", name)
-		}
-		cmsWidth := int(binary.LittleEndian.Uint16(data[pos:]))
-		pos += 2
-		if cmsWidth != sketch.CMSWidth {
-			return nil, 0, fmt.Errorf(
-				"sketch_index: col %q: unexpected cms_width=%d, want %d",
-				name,
-				cmsWidth,
-				sketch.CMSWidth,
-			)
-		}
-
-		// Per present block: cms_counters[depth × width × 2 LE].
-		// Lazy: store raw byte slices, defer Unmarshal to first CMSEstimate call.
-		cmsMarshalSize := sketch.CMSDepth * sketch.CMSWidth * 2
-		cd.cmsRaw = make([][]byte, presentCount)
-		for pi := range presentCount {
-			if pos+cmsMarshalSize > len(data) {
-				return nil, 0, fmt.Errorf("sketch_index: col %q: present block %d: too short for CMS", name, pi)
-			}
-			// Copy to avoid pinning the entire metadata buffer until lazy inflation.
-			rawCopy := make([]byte, cmsMarshalSize)
-			copy(rawCopy, data[pos:pos+cmsMarshalSize])
-			cd.cmsRaw[pi] = rawCopy
-			pos += cmsMarshalSize
-		}
-
-		// Per present block: fuse_len[4 LE] + fuse_data[fuse_len].
-		// Lazy: store raw byte slices, defer UnmarshalBinary to first FuseContains call.
-		// fuseRawLens records the original byte length so estimateSketchSectionSize can
-		// report accurate sizes without calling MarshalBinary after raw bytes are freed.
-		cd.fuseRaw = make([][]byte, presentCount)
-		cd.fuseRawLens = make([]int, presentCount)
-		for pi := range presentCount {
-			if pos+4 > len(data) {
-				return nil, 0, fmt.Errorf("sketch_index: col %q: present block %d: too short for fuse_len", name, pi)
-			}
-			fuseLen := int(binary.LittleEndian.Uint32(data[pos:]))
-			pos += 4
-			cd.fuseRawLens[pi] = fuseLen
-			if fuseLen > 0 {
-				if pos+fuseLen > len(data) {
-					return nil, 0, fmt.Errorf("sketch_index: col %q: present block %d: fuse data too short", name, pi)
-				}
-				// Copy to avoid pinning the entire metadata buffer until lazy inflation.
-				fuseCopy := make([]byte, fuseLen)
-				copy(fuseCopy, data[pos:pos+fuseLen])
-				cd.fuseRaw[pi] = fuseCopy
-				pos += fuseLen
-			}
+		pos, err = parseColumnFuse(data, pos, name, presentCount, cd)
+		if err != nil {
+			return nil, 0, err
 		}
 
 		idx.columns[name] = cd
 	}
 
 	return idx, pos, nil
+}
+
+// parseColumnPresence parses the presence bitset and builds presentMap.
+// Returns (newPos, presentCount, error).
+func parseColumnPresence(data []byte, pos int, name string, numBlocks, presenceBytes int, cd *columnSketchData) (int, int, error) {
+	if pos+presenceBytes > len(data) {
+		return pos, 0, fmt.Errorf("sketch_index: col %q: too short for presence", name)
+	}
+	presenceRaw := data[pos : pos+presenceBytes]
+	pos += presenceBytes
+
+	// Build presence bitset ([]uint64) and presentMap.
+	presenceWords := (numBlocks + 63) / 64
+	if presenceWords > 0 {
+		cd.presence = make([]uint64, presenceWords)
+		for byteIdx, b := range presenceRaw {
+			wordIdx := byteIdx / 8
+			bitShift := uint(byteIdx%8) * 8
+			cd.presence[wordIdx] |= uint64(b) << bitShift
+		}
+	}
+
+	// Build presentMap: which block indices have this column.
+	for blockIdx := range numBlocks {
+		byteIdx := blockIdx / 8
+		bitIdx := uint(blockIdx % 8)
+		if byteIdx < len(presenceRaw) && presenceRaw[byteIdx]>>bitIdx&1 == 1 {
+			cd.presentMap = append(cd.presentMap, blockIdx)
+		}
+	}
+	return pos, len(cd.presentMap), nil
+}
+
+// parseColumnDistinct parses the per-block distinct count array.
+func parseColumnDistinct(data []byte, pos int, name string, numBlocks int, cd *columnSketchData) (int, error) {
+	if pos+numBlocks*4 > len(data) {
+		return pos, fmt.Errorf("sketch_index: col %q: too short for distinct counts", name)
+	}
+	cd.distinct = make([]uint32, numBlocks)
+	for i := range numBlocks {
+		cd.distinct[i] = binary.LittleEndian.Uint32(data[pos:])
+		pos += 4
+	}
+	return pos, nil
+}
+
+// parseColumnTopK parses topk_k and per-present-block top-K fingerprint/count entries.
+func parseColumnTopK(data []byte, pos int, name string, presentCount int, cd *columnSketchData) (int, error) {
+	// topk_k[1]
+	if pos >= len(data) {
+		return pos, fmt.Errorf("sketch_index: col %q: missing topk_k", name)
+	}
+	topkK := int(data[pos])
+	pos++
+	// Accept any topkK in [1, 255] for forward compatibility — a future writer may
+	// use a larger TopKSize. Per-block entry counts (1-byte) are bounded independently.
+	if topkK <= 0 {
+		return pos, fmt.Errorf("sketch_index: col %q: invalid topk_k=%d", name, topkK)
+	}
+
+	// Per present block: topk_entry_count[1] + entries (fp[8 LE] + count[2 LE]).
+	cd.topkFP = make([][]uint64, presentCount)
+	cd.topkCount = make([][]uint16, presentCount)
+	for pi := range presentCount {
+		if pos >= len(data) {
+			return pos, fmt.Errorf("sketch_index: col %q: present block %d: missing topk entry count", name, pi)
+		}
+		entryCount := int(data[pos])
+		pos++
+		if entryCount > topkK {
+			return pos, fmt.Errorf(
+				"sketch_index: col %q: present block %d: topk entry count %d exceeds declared topk_k=%d",
+				name, pi, entryCount, topkK,
+			)
+		}
+		fps := make([]uint64, entryCount)
+		counts := make([]uint16, entryCount)
+		for ei := range entryCount {
+			if pos+10 > len(data) {
+				return pos, fmt.Errorf("sketch_index: col %q: topk entry %d/%d: too short", name, ei, entryCount)
+			}
+			fps[ei] = binary.LittleEndian.Uint64(data[pos:])
+			pos += 8
+			counts[ei] = binary.LittleEndian.Uint16(data[pos:])
+			pos += 2
+		}
+		cd.topkFP[pi] = fps
+		cd.topkCount[pi] = counts
+	}
+	return pos, nil
+}
+
+// parseColumnCMS parses cms_depth, cms_width, and per-present-block raw CMS byte slices.
+func parseColumnCMS(data []byte, pos int, name string, presentCount int, cd *columnSketchData) (int, error) {
+	// cms_depth[1]
+	if pos >= len(data) {
+		return pos, fmt.Errorf("sketch_index: col %q: missing cms_depth", name)
+	}
+	cmsDepth := int(data[pos])
+	pos++
+	if cmsDepth != sketch.CMSDepth {
+		return pos, fmt.Errorf(
+			"sketch_index: col %q: unexpected cms_depth=%d, want %d",
+			name,
+			cmsDepth,
+			sketch.CMSDepth,
+		)
+	}
+
+	// cms_width[2 LE]
+	if pos+2 > len(data) {
+		return pos, fmt.Errorf("sketch_index: col %q: missing cms_width", name)
+	}
+	cmsWidth := int(binary.LittleEndian.Uint16(data[pos:]))
+	pos += 2
+	if cmsWidth != sketch.CMSWidth {
+		return pos, fmt.Errorf(
+			"sketch_index: col %q: unexpected cms_width=%d, want %d",
+			name,
+			cmsWidth,
+			sketch.CMSWidth,
+		)
+	}
+
+	// Per present block: cms_counters[depth × width × 2 LE].
+	// Lazy: store raw byte slices, defer Unmarshal to first CMSEstimate call.
+	cmsMarshalSize := sketch.CMSDepth * sketch.CMSWidth * 2
+	cd.cmsRaw = make([][]byte, presentCount)
+	for pi := range presentCount {
+		if pos+cmsMarshalSize > len(data) {
+			return pos, fmt.Errorf("sketch_index: col %q: present block %d: too short for CMS", name, pi)
+		}
+		// Copy to avoid pinning the entire metadata buffer until lazy inflation.
+		rawCopy := make([]byte, cmsMarshalSize)
+		copy(rawCopy, data[pos:pos+cmsMarshalSize])
+		cd.cmsRaw[pi] = rawCopy
+		pos += cmsMarshalSize
+	}
+	return pos, nil
+}
+
+// parseColumnFuse parses per-present-block fuse_len and raw fuse data byte slices.
+func parseColumnFuse(data []byte, pos int, name string, presentCount int, cd *columnSketchData) (int, error) {
+	// Per present block: fuse_len[4 LE] + fuse_data[fuse_len].
+	// Lazy: store raw byte slices, defer UnmarshalBinary to first FuseContains call.
+	// fuseRawLens records the original byte length so estimateSketchSectionSize can
+	// report accurate sizes without calling MarshalBinary after raw bytes are freed.
+	cd.fuseRaw = make([][]byte, presentCount)
+	cd.fuseRawLens = make([]int, presentCount)
+	for pi := range presentCount {
+		if pos+4 > len(data) {
+			return pos, fmt.Errorf("sketch_index: col %q: present block %d: too short for fuse_len", name, pi)
+		}
+		fuseLen := int(binary.LittleEndian.Uint32(data[pos:]))
+		pos += 4
+		cd.fuseRawLens[pi] = fuseLen
+		if fuseLen > 0 {
+			if pos+fuseLen > len(data) {
+				return pos, fmt.Errorf("sketch_index: col %q: present block %d: fuse data too short", name, pi)
+			}
+			// Copy to avoid pinning the entire metadata buffer until lazy inflation.
+			fuseCopy := make([]byte, fuseLen)
+			copy(fuseCopy, data[pos:pos+fuseLen])
+			cd.fuseRaw[pi] = fuseCopy
+			pos += fuseLen
+		}
+	}
+	return pos, nil
 }

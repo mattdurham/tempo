@@ -13,7 +13,7 @@ import (
 )
 
 // planBlocks runs the full block-selection pipeline for a query:
-//  1. buildPredicates — converts vm.Program predicates into planner predicates
+//  1. BuildPredicates — converts vm.Program predicates into planner predicates
 //  2. PlanWithOptions — applies bloom/range-index pruning and time range filtering
 //  3. fileLevelReject — fast-reject the entire file when bucketMin/bucketMax guarantees no match
 //  4. BlocksFromIntrinsicTOC intersection — intrinsic-column fast reject (when available)
@@ -27,7 +27,7 @@ func planBlocks(
 	tr queryplanner.TimeRange,
 	opts queryplanner.PlanOptions,
 ) *queryplanner.Plan {
-	predicates := buildPredicates(r, program)
+	predicates := BuildPredicates(r, program)
 	planner := queryplanner.NewPlanner(r)
 	plan := planner.PlanWithOptions(predicates, tr, opts)
 

@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"sort"
+	"slices"
 
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
 )
@@ -79,7 +79,7 @@ func writeRangeIndexSection(_ io.Writer, rIdx rangeIndex) ([]byte, error) {
 			colNames = append(colNames, name)
 		}
 	}
-	sort.Strings(colNames)
+	slices.Sort(colNames)
 
 	// col_count[4 LE]
 	var tmp [4]byte
@@ -113,7 +113,7 @@ func writeRangeIndexSection(_ io.Writer, rIdx rangeIndex) ([]byte, error) {
 		for k := range cd.values {
 			keys = append(keys, k)
 		}
-		sort.Strings(keys)
+		slices.Sort(keys)
 
 		for _, key := range keys {
 			blockIDs := cd.values[key]
@@ -256,8 +256,8 @@ func writeTraceBlockIndexSection(_ io.Writer, traceIndex map[[16]byte][]uint16) 
 	for tid := range traceIndex {
 		traceIDs = append(traceIDs, tid)
 	}
-	sort.Slice(traceIDs, func(i, j int) bool {
-		return bytes.Compare(traceIDs[i][:], traceIDs[j][:]) < 0
+	slices.SortFunc(traceIDs, func(a, b [16]byte) int {
+		return bytes.Compare(a[:], b[:])
 	})
 
 	// fmt_version[1] = 0x02

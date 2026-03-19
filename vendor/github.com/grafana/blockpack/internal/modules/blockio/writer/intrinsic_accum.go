@@ -4,8 +4,9 @@ package writer
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/binary"
-	"sort"
+	"slices"
 
 	"github.com/golang/snappy"
 
@@ -178,7 +179,7 @@ func (a *intrinsicAccumulator) columnNames() []string {
 	for n := range a.dictCols {
 		names = append(names, n)
 	}
-	sort.Strings(names)
+	slices.Sort(names)
 	return names
 }
 
@@ -250,6 +251,18 @@ func dictRefWidths(entries []dictEntry) (blockW, rowW uint8) {
 		rowW = 2
 	}
 	return
+}
+
+// sortDictEntries sorts c.entries in ascending order by value.
+// Int64 and RangeInt64 columns sort by int64Val; all others sort by strVal.
+func sortDictEntries(c *dictAccum) {
+	isInt64 := c.colType == shared.ColumnTypeInt64 || c.colType == shared.ColumnTypeRangeInt64
+	slices.SortFunc(c.entries, func(a, b dictEntry) int {
+		if isInt64 {
+			return cmp.Compare(a.int64Val, b.int64Val)
+		}
+		return cmp.Compare(a.strVal, b.strVal)
+	})
 }
 
 // writeRef writes a single BlockRef using the specified byte widths.
@@ -343,14 +356,8 @@ func encodeFlatColumn(c *flatAccum) ([]byte, error) {
 //	  ref_count[4 LE] = number of block refs for this value
 //	  refs[ref_count × (block_idx_width+row_idx_width)] = (blockIdx, rowIdx)
 func encodeDictColumn(c *dictAccum) ([]byte, error) {
-	// Sort entries by value.
+	sortDictEntries(c)
 	isInt64 := c.colType == shared.ColumnTypeInt64 || c.colType == shared.ColumnTypeRangeInt64
-	sort.Slice(c.entries, func(i, j int) bool {
-		if isInt64 {
-			return c.entries[i].int64Val < c.entries[j].int64Val
-		}
-		return c.entries[i].strVal < c.entries[j].strVal
-	})
 
 	blockW, rowW := dictRefWidths(c.entries)
 
@@ -510,7 +517,7 @@ func sortFlatAccum(c *flatAccum) {
 		for i := range n {
 			rows[i] = row{c.uint64Values[i], c.refs[i]}
 		}
-		sort.Slice(rows, func(i, j int) bool { return rows[i].val < rows[j].val })
+		slices.SortFunc(rows, func(a, b row) int { return cmp.Compare(a.val, b.val) })
 		for i := range n {
 			c.uint64Values[i] = rows[i].val
 			c.refs[i] = rows[i].ref
@@ -524,7 +531,7 @@ func sortFlatAccum(c *flatAccum) {
 		for i := range n {
 			rows[i] = row{c.bytesValues[i], c.refs[i]}
 		}
-		sort.Slice(rows, func(i, j int) bool { return bytes.Compare(rows[i].val, rows[j].val) < 0 })
+		slices.SortFunc(rows, func(a, b row) int { return bytes.Compare(a.val, b.val) })
 		for i := range n {
 			c.bytesValues[i] = rows[i].val
 			c.refs[i] = rows[i].ref
@@ -726,13 +733,8 @@ func encodeDictPageBlob(
 // encodePagedDictColumn encodes a dict accumulator using the v2 paged format.
 // Pages are chunked by cumulative ref count (each page has ~IntrinsicPageSize total refs).
 func encodePagedDictColumn(c *dictAccum) ([]byte, error) {
+	sortDictEntries(c)
 	isInt64 := c.colType == shared.ColumnTypeInt64 || c.colType == shared.ColumnTypeRangeInt64
-	sort.Slice(c.entries, func(i, j int) bool {
-		if isInt64 {
-			return c.entries[i].int64Val < c.entries[j].int64Val
-		}
-		return c.entries[i].strVal < c.entries[j].strVal
-	})
 
 	blockW, rowW := dictRefWidths(c.entries)
 

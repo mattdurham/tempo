@@ -411,7 +411,7 @@ func (c *traceqlCompiler) compileColumnPredicateComparison(expr *traceqlparser.B
 func scanColumnByOp(
 	provider ColumnDataProvider,
 	col string,
-	value interface{},
+	value any,
 	operator traceqlparser.BinaryOp,
 ) (RowSet, error) {
 	switch operator {

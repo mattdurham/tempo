@@ -19,12 +19,12 @@ type ColumnDataProvider interface {
 	GetRowCount() int
 
 	// Bulk column scans - return row sets
-	ScanEqual(column string, value interface{}) (RowSet, error)
-	ScanNotEqual(column string, value interface{}) (RowSet, error)
-	ScanLessThan(column string, value interface{}) (RowSet, error)
-	ScanLessThanOrEqual(column string, value interface{}) (RowSet, error)
-	ScanGreaterThan(column string, value interface{}) (RowSet, error)
-	ScanGreaterThanOrEqual(column string, value interface{}) (RowSet, error)
+	ScanEqual(column string, value any) (RowSet, error)
+	ScanNotEqual(column string, value any) (RowSet, error)
+	ScanLessThan(column string, value any) (RowSet, error)
+	ScanLessThanOrEqual(column string, value any) (RowSet, error)
+	ScanGreaterThan(column string, value any) (RowSet, error)
+	ScanGreaterThanOrEqual(column string, value any) (RowSet, error)
 	ScanIsNull(column string) (RowSet, error)
 	ScanIsNotNull(column string) (RowSet, error)
 	ScanRegex(column string, pattern string) (RowSet, error)
@@ -43,12 +43,12 @@ type ColumnDataProvider interface {
 	ScanRegexNotMatchFast(column string, re *regexp.Regexp, prefixes []string) (RowSet, error)
 
 	// Streaming scans - call callback for each matching row (no RowSet allocation)
-	StreamScanEqual(column string, value interface{}, callback RowCallback) (int, error)
-	StreamScanNotEqual(column string, value interface{}, callback RowCallback) (int, error)
-	StreamScanLessThan(column string, value interface{}, callback RowCallback) (int, error)
-	StreamScanLessThanOrEqual(column string, value interface{}, callback RowCallback) (int, error)
-	StreamScanGreaterThan(column string, value interface{}, callback RowCallback) (int, error)
-	StreamScanGreaterThanOrEqual(column string, value interface{}, callback RowCallback) (int, error)
+	StreamScanEqual(column string, value any, callback RowCallback) (int, error)
+	StreamScanNotEqual(column string, value any, callback RowCallback) (int, error)
+	StreamScanLessThan(column string, value any, callback RowCallback) (int, error)
+	StreamScanLessThanOrEqual(column string, value any, callback RowCallback) (int, error)
+	StreamScanGreaterThan(column string, value any, callback RowCallback) (int, error)
+	StreamScanGreaterThanOrEqual(column string, value any, callback RowCallback) (int, error)
 	StreamScanIsNull(column string, callback RowCallback) (int, error)
 	StreamScanIsNotNull(column string, callback RowCallback) (int, error)
 	StreamScanRegex(column string, pattern string, callback RowCallback) (int, error)
@@ -63,5 +63,5 @@ type ColumnDataProvider interface {
 	FullScan() RowSet
 
 	// Individual value access (for operations that can't use bulk scans)
-	GetValue(column string, rowIdx int) (interface{}, bool, error)
+	GetValue(column string, rowIdx int) (any, bool, error)
 }

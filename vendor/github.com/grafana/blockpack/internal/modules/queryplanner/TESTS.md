@@ -289,6 +289,22 @@ Back-ref: `scoring_test.go:TestBlockTopK`
 
 ---
 
+### QP-T-27: TestColumnMajorRoundTrip
+
+**Scenario:** Column-major sketch data (HLL, CMS, Fuse, TopK) survives a full
+write→flush→parse round-trip without data loss or corruption.
+
+**Setup:** Two-block file with distinct service names. Call `r.ColumnSketch(col)` and
+verify `CMSEstimate`, `FuseContains`, `TopKMatch`, and `Distinct` return non-zero/correct
+values.
+
+**Assertions:** Sketch data is non-nil. At least one column has a non-zero CMS estimate.
+FuseContains returns true for a present value.
+
+Back-ref: `scoring_test.go:TestColumnMajorRoundTrip`
+
+---
+
 ## 11. blockSet Unit Tests
 
 The `blockset_test.go` file tests the `blockSet` type in isolation:

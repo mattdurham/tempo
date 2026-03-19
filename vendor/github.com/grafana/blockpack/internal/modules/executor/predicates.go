@@ -17,7 +17,7 @@ import (
 	"github.com/grafana/blockpack/internal/vm"
 )
 
-// buildPredicates converts a compiled vm.Program into queryplanner.Predicate values
+// BuildPredicates converts a compiled vm.Program into queryplanner.Predicate values
 // for bloom-filter and range-index block pruning.
 //
 // Each top-level RangeNode in program.Predicates.Nodes is translated to a
@@ -33,7 +33,7 @@ import (
 //
 // NOTE-030: replaces the old flat-map approach (DedicatedColumns/DedicatedRanges/
 // UnscopedColumnNames/HasOROperations). See executor/NOTES.md §NOTE-030.
-func buildPredicates(r *modules_reader.Reader, program *vm.Program) []queryplanner.Predicate {
+func BuildPredicates(r *modules_reader.Reader, program *vm.Program) []queryplanner.Predicate {
 	if program == nil || program.Predicates == nil {
 		return nil
 	}
@@ -180,12 +180,6 @@ func translateRegexNode(r *modules_reader.Reader, col, pattern string) queryplan
 		Values:  encodedVals,
 		ColType: colType,
 	}
-}
-
-// BuildPredicates is an exported thin wrapper around buildPredicates.
-// Used by api.go's StreamTraceQLModules inline execute loop.
-func BuildPredicates(r *modules_reader.Reader, program *vm.Program) []queryplanner.Predicate {
-	return buildPredicates(r, program)
 }
 
 // traceIntrinsicColumns is the set of column names served by the intrinsic section
@@ -365,7 +359,7 @@ func BlocksFromIntrinsicTOC(r *modules_reader.Reader, program *vm.Program) []int
 				keepSet.set(bi)
 			}
 		}
-		selected.intersect(keepSet, total)
+		selected.intersect(keepSet)
 	}
 
 	// If nothing was actually pruned (all blocks still selected), return nil so the
@@ -785,8 +779,7 @@ func (b blockBitset) count() int {
 	return n
 }
 
-func (b blockBitset) intersect(other blockBitset, total int) {
-	_ = total
+func (b blockBitset) intersect(other blockBitset) {
 	for i := range b {
 		if i < len(other) {
 			b[i] &= other[i]

@@ -3,9 +3,9 @@ package queryplanner
 // NOTE: Any changes to this file must be reflected in the corresponding specs.md or NOTES.md.
 
 import (
+	"cmp"
 	"fmt"
 	"slices"
-	"sort"
 	"strings"
 
 	"github.com/grafana/blockpack/internal/modules/sketch"
@@ -140,11 +140,11 @@ func explainBlockPriority(sb *strings.Builder, r BlockIndexer, plan *Plan, predi
 	for b, s := range plan.BlockScores {
 		blocks = append(blocks, scoredBlock{b, s})
 	}
-	sort.Slice(blocks, func(i, j int) bool {
-		if blocks[i].score != blocks[j].score {
-			return blocks[i].score > blocks[j].score // descending
+	slices.SortFunc(blocks, func(a, b scoredBlock) int {
+		if a.score != b.score {
+			return cmp.Compare(b.score, a.score) // descending
 		}
-		return blocks[i].blockIdx < blocks[j].blockIdx // stable
+		return cmp.Compare(a.blockIdx, b.blockIdx) // deterministic tiebreak
 	})
 
 	sb.WriteString("\nBlock priority (best first):\n")

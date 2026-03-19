@@ -4,11 +4,11 @@ package writer
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/binary"
 	"fmt"
 	"math"
 	"slices"
-	"sort"
 
 	tracev1 "go.opentelemetry.io/proto/otlp/trace/v1"
 
@@ -536,16 +536,12 @@ func (b *blockBuilder) addRowFromProto(ps *pendingSpan, rowIdx int) {
 		b.minTraceID = ps.traceID
 		b.maxTraceID = ps.traceID
 	} else {
-		if span.StartTimeUnixNano < b.minStart {
-			b.minStart = span.StartTimeUnixNano
-		}
-		if span.StartTimeUnixNano > b.maxStart {
-			b.maxStart = span.StartTimeUnixNano
-		}
-		if bytes.Compare(ps.traceID[:], b.minTraceID[:]) < 0 {
+		b.minStart = min(b.minStart, span.StartTimeUnixNano)
+		b.maxStart = max(b.maxStart, span.StartTimeUnixNano)
+		if traceIDBefore(ps.traceID, b.minTraceID) {
 			b.minTraceID = ps.traceID
 		}
-		if bytes.Compare(ps.traceID[:], b.maxTraceID[:]) > 0 {
+		if traceIDBefore(b.maxTraceID, ps.traceID) {
 			b.maxTraceID = ps.traceID
 		}
 	}
@@ -554,6 +550,11 @@ func (b *blockBuilder) addRowFromProto(ps *pendingSpan, rowIdx int) {
 	b.traceRows[ps.traceID] = struct{}{}
 
 	b.spanCount++
+}
+
+// traceIDBefore reports whether trace ID a comes before b in lexicographic order.
+func traceIDBefore(a, b [16]byte) bool {
+	return bytes.Compare(a[:], b[:]) < 0
 }
 
 // baseColumnType normalizes Range column types to their base logical type.
@@ -815,18 +816,14 @@ func (b *blockBuilder) finalizeRowBookkeeping(
 		}
 	} else {
 		if spanStartFound {
-			if spanStart < b.minStart {
-				b.minStart = spanStart
-			}
-			if spanStart > b.maxStart {
-				b.maxStart = spanStart
-			}
+			b.minStart = min(b.minStart, spanStart)
+			b.maxStart = max(b.maxStart, spanStart)
 		}
 		if traceIDFound {
-			if bytes.Compare(traceID[:], b.minTraceID[:]) < 0 {
+			if traceIDBefore(traceID, b.minTraceID) {
 				b.minTraceID = traceID
 			}
-			if bytes.Compare(traceID[:], b.maxTraceID[:]) > 0 {
+			if traceIDBefore(b.maxTraceID, traceID) {
 				b.maxTraceID = traceID
 			}
 		}
@@ -996,11 +993,11 @@ func (b *blockBuilder) finalize(enc *zstdEncoder, blockVersion uint8) ([]byte, e
 	for k, cb := range b.columns {
 		entries = append(entries, colEntry{cb, k})
 	}
-	sort.Slice(entries, func(i, j int) bool {
-		if entries[i].key.Name != entries[j].key.Name {
-			return entries[i].key.Name < entries[j].key.Name
+	slices.SortFunc(entries, func(a, b colEntry) int {
+		if a.key.Name != b.key.Name {
+			return cmp.Compare(a.key.Name, b.key.Name)
 		}
-		return entries[i].key.Type < entries[j].key.Type
+		return cmp.Compare(a.key.Type, b.key.Type)
 	})
 
 	colCount := len(entries)

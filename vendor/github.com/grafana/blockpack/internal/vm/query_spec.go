@@ -1,7 +1,7 @@
 package vm
 
 import (
-	"sort"
+	"slices"
 	"strings"
 )
 
@@ -17,7 +17,7 @@ type QuerySpec struct {
 type FilterSpec struct {
 	// AttributeEquals maps attribute paths to lists of acceptable values (OR semantics)
 	// e.g., "span:status" -> ["ok", "error"]
-	AttributeEquals map[string][]interface{}
+	AttributeEquals map[string][]any
 
 	// AttributeRanges maps attribute paths to range specifications
 	// e.g., "span:duration" -> {MinValue: 100000000, MaxValue: 500000000}
@@ -29,10 +29,10 @@ type FilterSpec struct {
 
 // RangeSpec represents a range constraint on an attribute.
 type RangeSpec struct {
-	MinValue     interface{} // Minimum value (nil means unbounded)
-	MaxValue     interface{} // Maximum value (nil means unbounded)
-	MinInclusive bool        // Whether minimum is inclusive (>= vs >)
-	MaxInclusive bool        // Whether maximum is inclusive (<= vs <)
+	MinValue     any  // Minimum value (nil means unbounded)
+	MaxValue     any  // Maximum value (nil means unbounded)
+	MinInclusive bool // Whether minimum is inclusive (>= vs >)
+	MaxInclusive bool // Whether maximum is inclusive (<= vs <)
 }
 
 // AggregateSpec represents the aggregation function and grouping.
@@ -70,10 +70,10 @@ func (qs *QuerySpec) Normalize() {
 	}
 
 	// Sort GROUP BY fields after normalization
-	sort.Strings(qs.Aggregate.GroupBy)
+	slices.Sort(qs.Aggregate.GroupBy)
 
 	// Normalize filter attribute paths
-	normalizedEquals := make(map[string][]interface{})
+	normalizedEquals := make(map[string][]any)
 	for path, values := range qs.Filter.AttributeEquals {
 		normalizedPath := normalizeFieldName(path)
 		if existing, ok := normalizedEquals[normalizedPath]; ok {

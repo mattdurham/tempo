@@ -5,7 +5,7 @@ package executor
 import (
 	"fmt"
 	"math"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -120,7 +120,7 @@ func ExecuteLogMetrics(
 			return nil, fmt.Errorf("ParseBlockFromBytes block %d: %w", blockIdx, parseErr)
 		}
 
-		provider := NewColumnProvider(bwb.Block)
+		provider := newBlockColumnProvider(bwb.Block)
 		rowSet, evalErr := program.ColumnPredicate(provider)
 		if evalErr != nil {
 			return nil, fmt.Errorf("ColumnPredicate block %d: %w", blockIdx, evalErr)
@@ -275,6 +275,39 @@ func logUpdateBucket(labels logqlparser.LabelSet, line, funcName string, bucket 
 	}
 }
 
+// collectGroupKeys returns the sorted unique attr-group-key strings from buckets
+// and the number of time buckets. Returns (nil, 0) if the result set is empty.
+// compositeKey format: "bucketIdxStr\x00groupVal1[\x00groupVal2...]" — cuts at first \x00 to get attrGroupKey.
+func collectGroupKeys(buckets map[string]*aggBucketState, tb vm.TimeBucketSpec) ([]string, int64) {
+	if len(buckets) == 0 {
+		return nil, 0
+	}
+	numBuckets := int64(0)
+	if tb.Enabled && tb.StepSizeNanos > 0 {
+		numBuckets = (tb.EndTime - tb.StartTime + tb.StepSizeNanos - 1) / tb.StepSizeNanos
+	}
+	if numBuckets <= 0 {
+		return nil, 0
+	}
+	keySet := make(map[string]struct{})
+	for compositeKey := range buckets {
+		_, after, ok := strings.Cut(compositeKey, "\x00")
+		if !ok {
+			continue
+		}
+		keySet[after] = struct{}{}
+	}
+	if len(keySet) == 0 {
+		return nil, 0
+	}
+	keys := make([]string, 0, len(keySet))
+	for k := range keySet {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	return keys, numBuckets
+}
+
 // logBuildDenseRows builds the dense time-series grid from accumulated buckets.
 func logBuildDenseRows(
 	buckets map[string]*aggBucketState,
@@ -284,39 +317,10 @@ func logBuildDenseRows(
 	stepSec float64,
 	quantile float64,
 ) []LogMetricsRow {
-	if len(buckets) == 0 {
+	attrGroupKeys, numBuckets := collectGroupKeys(buckets, querySpec.TimeBucketing)
+	if attrGroupKeys == nil {
 		return nil
 	}
-
-	tb := querySpec.TimeBucketing
-	numBuckets := int64(0)
-	if tb.Enabled && tb.StepSizeNanos > 0 {
-		numBuckets = (tb.EndTime - tb.StartTime + tb.StepSizeNanos - 1) / tb.StepSizeNanos
-	}
-	if numBuckets <= 0 {
-		return nil
-	}
-
-	// Collect unique attrGroupKeys.
-	attrGroupKeySet := make(map[string]struct{})
-	for compositeKey := range buckets {
-		_, after, ok := strings.Cut(compositeKey, "\x00")
-		if !ok {
-			continue
-		}
-		attrGroupKeySet[after] = struct{}{}
-	}
-	if len(attrGroupKeySet) == 0 {
-		return nil
-	}
-
-	// Sort for deterministic output.
-	attrGroupKeys := make([]string, 0, len(attrGroupKeySet))
-	for k := range attrGroupKeySet {
-		attrGroupKeys = append(attrGroupKeys, k)
-	}
-	sort.Strings(attrGroupKeys)
-
 	rows := make([]LogMetricsRow, 0, int(numBuckets)*len(attrGroupKeys)) //nolint:gosec
 	for _, attrGroupKey := range attrGroupKeys {
 		var attrVals []string
@@ -398,7 +402,7 @@ func logComputeQuantile(values []float64, q float64) float64 {
 	}
 	sorted := make([]float64, len(values))
 	copy(sorted, values)
-	sort.Float64s(sorted)
+	slices.Sort(sorted)
 	if q <= 0 {
 		return sorted[0]
 	}

@@ -73,7 +73,7 @@ allows targeted column access via `ParseBlockFromBytes` + `GetColumn(name).Strin
 ## 6. Predicate Extraction and Dedicated Index Pruning
 *Added: 2026-02-25*
 
-**Decision:** The executor calls `buildPredicates(r, program)` (in `predicates.go`),
+**Decision:** The executor calls `BuildPredicates(r, program)` (in `predicates.go`),
 which extracts column names and encoded values from `program.Predicates` and builds
 `[]queryplanner.Predicate` for bloom-filter and range-index block pruning.
 
@@ -103,11 +103,11 @@ not only in `internal/modules/executor/executor_test.go`.
 
 `internal/modules/blockio/executor_test.go` exercises the full round-trip:
 writer (`modules_blockio.NewWriterWithConfig`) → reader
-(`modules_reader.NewReaderFromProvider`) → this executor (`New().Execute`).
+(`modules_reader.NewReaderFromProvider`) → this executor (`executor.Collect`).
 
 **Coverage provided by the blockio integration tests:**
 - `bloomPredicates` with real data (AND and OR query paths, EX-01, EX-03, EX-04, EX-06)
-- `Execute` empty-file short-circuit (EX-05)
+- `Collect` empty-file short-circuit (EX-05)
 - Multi-block scanning with `BlocksScanned >= 2` assertion (EX-04)
 - Zero-match result (EX-02)
 
@@ -148,14 +148,14 @@ safe: a block is only pruned when none of the three columns is present.
 
 ---
 
-## NOTE-010: buildPredicates Consumes DedicatedRanges; encodeValue Handles Plain Column Types
+## NOTE-010: BuildPredicates Consumes DedicatedRanges; encodeValue Handles Plain Column Types
 *Added: 2026-03-02 — superseded by NOTE-030 (2026-03-06)*
 
 **Superseded:** The `DedicatedRanges` map no longer exists. Range predicates are now
 represented as `RangeNode{Min, Max}` in the `Nodes` tree and translated by `translateNode`.
 The `encodeValue` function and its handling of plain vs `Range*` column types is unchanged.
 
-**Original decision (historical):** `buildPredicates` included a loop over
+**Original decision (historical):** `BuildPredicates` included a loop over
 `program.Predicates.DedicatedRanges` that encoded range bounds as point queries for
 range-index pruning. `encodeValue` accepted both the `Range*` column type variants and
 their non-range counterparts (`ColumnTypeUint64`, `ColumnTypeInt64`, `ColumnTypeFloat64`).
@@ -175,13 +175,13 @@ string types. The `Range*` and plain variants produce identical wire encoding.
 *Added: 2026-03-03 — updated 2026-03-06 (NOTE-030)*
 
 **Decision:** `translateRegexNode` (formerly a loop over `DedicatedColumnsRegex` in
-`buildPredicates`) analyzes regex patterns using `vm.AnalyzeRegex` and produces
+`BuildPredicates`) analyzes regex patterns using `vm.AnalyzeRegex` and produces
 range-index predicates when the pattern has an extractable literal prefix.
 
 **Design:**
 1. `vm.AnalyzeRegex(pattern)` parses the regex syntax tree (via `regexp/syntax`) and
    extracts literal prefixes from optimizable patterns: `foo.*`, `^error`, `error|warn`.
-2. For optimizable patterns, `buildPredicates` encodes each prefix as a `RangeString`
+2. For optimizable patterns, `BuildPredicates` encodes each prefix as a `RangeString`
    value in `Predicate.Values`. The planner's `pruneByIndex` uses `BlocksForRange` to
    eliminate blocks whose string range buckets don't overlap the prefix.
 3. The column type defaults to `ColumnTypeRangeString` when no range index exists (the
@@ -197,7 +197,7 @@ A point lookup via `BlocksForRange("col", "cluster-")` returns nil because `'-'`
 is less than `'0'` (0x30) — `"cluster-"` falls below all actual bucket lower boundaries
 (which start at values like `"cluster-0"`).
 
-Fix: for any case-sensitive regex with a **single extracted prefix**, `buildPredicates`
+Fix: for any case-sensitive regex with a **single extracted prefix**, `BuildPredicates`
 now uses interval matching `[prefix, prefix+"\xff"]` instead of a point lookup.
 `BlocksForRangeInterval("col", "cluster-", "cluster-\xff")` correctly finds all buckets
 with lower boundaries in that range (e.g., `"cluster-0"` through `"cluster-4"`).
@@ -239,15 +239,15 @@ lexicographic ranges — a single interval cannot safely cover all branches.
 reduction). Converting prefix patterns to range-index lookups enables block pruning
 without any writer-side changes.
 
-Back-ref: `internal/modules/executor/predicates.go:buildPredicates`,
+Back-ref: `internal/modules/executor/predicates.go:BuildPredicates`,
 `internal/vm/regex_optimize.go:AnalyzeRegex`
 
 ---
 
 ## NOTE-012: Stream vs Execute — Lazy Callback vs Eager Batch
-*Added: 2026-03-03*
+*Added: 2026-03-03* | *Historical — both `Stream` and `Execute` have been removed; see addendum below.*
 
-**Decision:** `Stream` is a separate method from `Execute` rather than a flag on `Options`.
+**Decision:** `Stream` was a separate method from `Execute` rather than a flag on `Options`.
 
 **Rationale:**
 - `Execute` returns `*Result` (batch `[]SpanMatch`). Callers like `tempoapi` expect a
@@ -264,8 +264,9 @@ trace mode (no per-row filter) from log mode (`"log:timestamp"` filter). The exe
 longer needs two divergent code paths — the difference is parameterized rather than
 duplicated.
 
-**Callers after this task:** `api.go:streamFilterProgram` and `api.go:streamLogProgram`
-are both thin wrappers over `executor.Stream`. No inline block-scan loops remain in api.go.
+**Callers after this task:** `api.go:streamFilterProgram` calls `executor.Collect`;
+`api.go:streamLogProgram` calls `executor.CollectLogs`. The `Stream` method has been
+removed — see NOTE-035. No inline block-scan loops remain in api.go.
 
 **Addendum (2026-03-03):** The "out of scope" logql/engine.go:StreamLogs work was completed
 as part of the logql→executor unification. StreamLogs and ExecuteLogMetrics now live in
@@ -580,7 +581,7 @@ candidate blocks have no matches (the common case), this eliminates the bulk of
 decompression work. For blocks with matches, the cost is a second parse, but those
 are a small fraction of candidate blocks in typical trace/log queries.
 
-**Exception — `Execute` and structural join:** These paths include identity columns
+**Exception — `ExecuteStructural`:** This path includes identity columns
 (`trace:id`, `span:id`, etc.) in `ProgramWantColumns(program, ...)` so output can be
 built from the first-pass block directly. No second parse is ever issued.
 
@@ -595,11 +596,10 @@ false-empty predicate results (regression). See NOTE-030.
 decodes all columns and no second pass is issued.
 
 Back-ref: `internal/modules/executor/predicates.go:ProgramWantColumns`,
-`internal/modules/executor/executor.go:Execute`,
-`internal/modules/executor/stream.go:Stream`,
+`internal/modules/executor/stream.go:Collect`,
 `internal/modules/executor/stream_log.go:StreamLogs`,
-`internal/modules/executor/metrics.go:ExecuteMetrics`,
 `internal/modules/executor/metrics_log.go:ExecuteLogMetrics`,
+`internal/modules/executor/metrics_trace.go:ExecuteTraceMetrics`,
 `internal/modules/executor/stream_topk.go:topKScanBlocks`,
 `internal/modules/executor/stream_log_topk.go:logTopKScan`,
 `internal/modules/executor/stream_log_topk.go:logCollectAll`
@@ -782,7 +782,7 @@ Back-ref: `internal/modules/executor/stream_log_topk.go:StreamLogsTopK`
 **Problem:** Go's `regexp/syntax` parser factors common prefixes from alternations before
 `AnalyzeRegex` receives the parsed tree. For `"cluster-0|cluster-1"`, the parser produces
 `Concat(Literal("cluster-"), CharClass([01]))`, so `AnalyzeRegex` returns a single prefix
-`"cluster-"`. `buildPredicates` emits interval `["cluster-", "cluster-\xff"]`, matching
+`"cluster-"`. `BuildPredicates` emits interval `["cluster-", "cluster-\xff"]`, matching
 ALL cluster-X blocks — zero pruning for non-matching clusters like cluster-2, cluster-3.
 
 **Fix:** `extractLiteralAlternatives(pattern string) []string` checks whether the raw
@@ -809,7 +809,7 @@ least one span with that exact attribute value.
 - `"debug.*"` (single prefix with trailing wildcard) → still uses interval — unchanged.
 - `"(?i)cluster-0|cluster-1"` → case-insensitive branch fires first — unchanged.
 
-Back-ref: `internal/modules/executor/predicates.go:buildPredicates`,
+Back-ref: `internal/modules/executor/predicates.go:BuildPredicates`,
 `internal/modules/executor/predicates.go:extractLiteralAlternatives`
 
 ---
@@ -914,7 +914,7 @@ Only improves pruning; never removes correct blocks.
 
 **Problem (T6/Q45 and T6/Q50 false-negative pruning):**
 
-In `buildPredicates`, when `len(analysis.Prefixes) > 1`, the code previously encoded
+In `BuildPredicates`, when `len(analysis.Prefixes) > 1`, the code previously encoded
 the Go-extracted prefixes as point lookups. This is safe for patterns like `"prod|staging|dev"`
 where Go does NOT factor a common prefix (3 independent literal branches). But for patterns
 like `"us-east-1|us-west-2|eu-west-1"`, Go's regex parser factors the common prefix:
@@ -947,7 +947,7 @@ Patterns with no common prefix factoring (`"prod|staging|dev"`) were unaffected.
 into a common prefix — enters the `len == 1` branch). NOTE-029 fixes the multi-prefix case
 (some alternatives share a prefix, others don't — enters the `len > 1` branch).
 
-**Back-ref:** `internal/modules/executor/predicates.go:buildPredicates` (multi-prefix branch)
+**Back-ref:** `internal/modules/executor/predicates.go:BuildPredicates` (multi-prefix branch)
 
 ---
 
@@ -970,7 +970,7 @@ set is 8 columns: `trace:id`, `span:id`, `span:start`, `span:end`, `span:duratio
 `FindTraceByID` (`GetTraceByID` in api.go) uses `GetBlockWithBytes` directly and always
 reads all columns — unaffected by this change. Only `QueryTraceQL` filter queries benefit.
 
-**Back-ref:** `internal/modules/executor/stream.go:Stream`,
+**Back-ref:** `internal/modules/executor/stream.go:Collect`,
 `internal/modules/executor/predicates.go:searchMetaColumns`
 
 ---
@@ -1011,7 +1011,7 @@ type QueryPredicates struct {
    at compile time, enabling per-scope range-index lookup.
 
 3. `DedicatedColumns` / `DedicatedRanges` / `DedicatedColumnsRegex` were separate maps
-   that `buildPredicates` iterated independently. The tree unifies all predicate types under
+   that `BuildPredicates` iterated independently. The tree unifies all predicate types under
    a single recursive `translateNode` function, eliminating the impedance mismatch between
    compile-time structure and runtime translation.
 
@@ -1021,7 +1021,7 @@ type QueryPredicates struct {
    in `Columns`; columns that drive pruning nodes are collected from `Nodes` via
    `collectNodeColumns`.
 
-**Backward-incompatible changes:** all callers of `buildPredicates`, `ProgramWantColumns`,
+**Backward-incompatible changes:** all callers of `BuildPredicates`, `ProgramWantColumns`,
 and the logql/traceql compilers were updated in the same commit. No old field names remain
 in production code.
 
@@ -1030,7 +1030,7 @@ says "column possibly present" — removing a block because `service.name != "pr
 risk removing blocks where some spans DO satisfy the predicate. Negations only go to
 `Columns` for the row-level decode.
 
-**Back-ref:** `internal/modules/executor/predicates.go:buildPredicates`,
+**Back-ref:** `internal/modules/executor/predicates.go:BuildPredicates`,
 `internal/modules/executor/predicates.go:translateNode`,
 `internal/modules/executor/predicates.go:ProgramWantColumns`,
 `internal/vm/bytecode.go:RangeNode`,
@@ -1191,15 +1191,14 @@ replaced by `Collect` (returning `[]MatchedRow`). The `Stream` method has been m
 
 **Nil program semantics change:** The old `Execute` panicked on nil `program` when blocks
 contained spans. `Collect` returns an error instead. This is safer for callers and consistent
-with `CollectTopK`, `StreamLogs`, and `StreamLogsTopK` which all return errors for nil program.
+with `StreamLogs`, and `StreamLogsTopK` which all return errors for nil program.
 
 **Sub-file sharding (added 2026-03-11):** `CollectOptions.StartBlock` and `BlockCount` allow
 the frontend sharder to partition a single blockpack file across multiple parallel jobs.
 Sharding is applied post-planner (after pruning) so all statistics remain file-wide; only
-the block iteration window is narrowed. Both `Collect` and `CollectTopK` support sharding.
+the block iteration window is narrowed. `Collect` supports sharding.
 
-Back-ref: `internal/modules/executor/stream.go:Collect`,
-`internal/modules/executor/stream_topk.go:CollectTopK`
+Back-ref: `internal/modules/executor/stream.go:Collect`
 
 ---
 
@@ -1208,7 +1207,7 @@ Back-ref: `internal/modules/executor/stream.go:Collect`,
 
 **Decision:** All five query paths (Collect, ExecuteTraceMetrics, ExecuteLogMetrics,
 StreamLogs, CollectLogs) now use a shared `planBlocks` helper that runs:
-1. `buildPredicates` — converts vm.Program predicates into planner predicates
+1. `BuildPredicates` — converts vm.Program predicates into planner predicates
 2. `PlanWithOptions` — range-index/fuse/CMS pruning and time range filtering
 3. `fileLevelReject` — O(1) file-level fast reject using KLL bucketMin/bucketMax boundaries
 4. `BlocksFromIntrinsicTOC` intersection — intrinsic-column fast reject
@@ -1344,7 +1343,8 @@ eliminates this duplication class.
 
 Back-ref: `internal/modules/executor/stream_log_topk.go:iterateLogRows`,
 `internal/modules/executor/stream_log_topk.go:logTopKScan`,
-`internal/modules/executor/stream_log_topk.go:logCollectAll`
+`internal/modules/executor/stream_log_topk.go:logCollectAll`,
+`internal/modules/executor/stream_log.go:StreamLogs`
 ## NOTE-038: Unified Intrinsic Pre-Filter — Partial-AND for Mixed Queries
 *Added: 2026-03-16*
 

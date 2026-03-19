@@ -4,7 +4,7 @@ package reader
 
 import (
 	"fmt"
-	"sort"
+	"slices"
 
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
 	"github.com/grafana/blockpack/internal/modules/rw"
@@ -62,7 +62,7 @@ func (r *Reader) IntrinsicColumnNames() []string {
 	for n := range r.intrinsicIndex {
 		names = append(names, n)
 	}
-	sort.Strings(names)
+	slices.Sort(names)
 	return names
 }
 

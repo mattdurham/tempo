@@ -34,7 +34,7 @@ type StructuralResult struct {
 //
 // All blocks are scanned — structural queries cannot use bloom or range pruning because
 // any block may contain spans from either side of the operator.
-func (e *Executor) ExecuteStructural(
+func ExecuteStructural(
 	r *modules_reader.Reader,
 	q *traceqlparser.StructuralQuery,
 	opts Options,

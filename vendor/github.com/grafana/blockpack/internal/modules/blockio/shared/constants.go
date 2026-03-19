@@ -74,10 +74,15 @@ const (
 	IntrinsicPageBloomBitsPerItem = 10 // bits per unique value in the bloom filter
 	IntrinsicPageBloomMinBytes    = 16 // minimum bloom filter size in bytes
 
-	// MaxIntrinsicRows is the safety cap on accumulated rows. If total rows across all
-	// blocks exceeds this, the intrinsic section is written empty (TOC with 0 columns).
-	MaxIntrinsicRows = 10_000_000
 )
+
+// MaxIntrinsicRows is the safety cap on accumulated rows. If total rows across all
+// blocks exceeds this, the intrinsic section is written empty (TOC with 0 columns).
+// Declared as a var (not const) so tests can temporarily lower it without writing 10M spans.
+//
+// WARNING: production code must never modify this variable. Only tests may override it,
+// and they must restore the original value via defer (see TestMaxIntrinsicRows_OverCap).
+var MaxIntrinsicRows = 10_000_000
 
 // Limits per SPECS §1.1
 const (

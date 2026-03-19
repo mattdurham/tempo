@@ -23,9 +23,10 @@ package reader
 // the original fingerprint keys, and CMS=0 is an equivalent absence signal with zero
 // false negatives. Block-level fuse filters continue to serve within-file pruning.
 import (
+	"cmp"
 	"encoding/binary"
 	"fmt"
-	"sort"
+	"slices"
 
 	"github.com/grafana/blockpack/internal/modules/sketch"
 )
@@ -124,7 +125,7 @@ func buildFileColumnSketch(cd *columnSketchData) *FileColumnSketch {
 	for fp, count := range topkAgg {
 		topk = append(topk, FileTopKEntry{FP: fp, Count: count})
 	}
-	sort.Slice(topk, func(i, j int) bool { return topk[i].Count > topk[j].Count })
+	slices.SortFunc(topk, func(a, b FileTopKEntry) int { return cmp.Compare(b.Count, a.Count) })
 	if len(topk) > sketch.TopKSize {
 		topk = topk[:sketch.TopKSize]
 	}
@@ -159,7 +160,7 @@ func MarshalFileSketchSummary(s *FileSketchSummary) ([]byte, error) {
 			names = append(names, name)
 		}
 	}
-	sort.Strings(names)
+	slices.Sort(names)
 
 	cmsSz := sketch.CMSDepth * sketch.CMSWidth * 2
 	buf := make([]byte, 0, 8+len(names)*(32+4+cmsSz+1+sketch.TopKSize*12))

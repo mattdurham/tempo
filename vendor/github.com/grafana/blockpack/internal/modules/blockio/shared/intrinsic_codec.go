@@ -752,7 +752,11 @@ func scanDictPagedBlob(
 		if decErr != nil {
 			return nil
 		}
-		result, _ = scanDictPageRaw(pageRaw, blockW, rowW, toc.ColType, matchFn, maxRefs, result)
+		var ok bool
+		result, ok = scanDictPageRaw(pageRaw, blockW, rowW, toc.ColType, matchFn, maxRefs, result)
+		if !ok {
+			return nil // corrupt page — return nil to signal failure to caller
+		}
 		if maxRefs > 0 && len(result) >= maxRefs {
 			return result
 		}
@@ -1012,10 +1016,7 @@ func scanFlatPagedTopK(blob []byte, limit int, backward bool) []BlockRef {
 			}
 			rowCount := int(pm.RowCount)
 			refsStart := pageRefsStart(pageRaw)
-			count := remaining
-			if count > rowCount {
-				count = rowCount
-			}
+			count := min(remaining, rowCount)
 			// Read the last `count` refs of this page (appended forward).
 			refPos := refsStart + (rowCount-count)*refSize
 			for range count {
@@ -1050,10 +1051,7 @@ func scanFlatPagedTopK(blob []byte, limit int, backward bool) []BlockRef {
 			}
 			rowCount := int(pm.RowCount)
 			refsStart := pageRefsStart(pageRaw)
-			count := remaining
-			if count > rowCount {
-				count = rowCount
-			}
+			count := min(remaining, rowCount)
 			refPos := refsStart
 			for range count {
 				if refPos+refSize > len(pageRaw) {
@@ -1278,10 +1276,7 @@ func ScanFlatColumnTopKRefs(blob []byte, limit int, backward bool) []BlockRef {
 
 	refsStart := pos + rowCount*8 // skip values section
 
-	count := limit
-	if count > rowCount {
-		count = rowCount
-	}
+	count := min(limit, rowCount)
 	if count <= 0 {
 		return nil
 	}
