@@ -10,11 +10,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/grafana/blockpack"
 	"github.com/grafana/tempo/pkg/tempopb"
 	"github.com/grafana/tempo/pkg/traceql"
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/encoding/common"
-	"github.com/grafana/blockpack"
 )
 
 type walBlock struct {
@@ -84,7 +84,7 @@ func (w *walBlock) AppendTrace(id common.ID, tr *tempopb.Trace, start, end uint3
 // initWriter creates the blockpack writer
 func (w *walBlock) initWriter() error {
 	// Ensure directory exists
-	if err := os.MkdirAll(w.path, 0755); err != nil {
+	if err := os.MkdirAll(w.path, 0o755); err != nil {
 		return fmt.Errorf("failed to create directory: %w", err)
 	}
 
@@ -122,7 +122,7 @@ func (w *walBlock) Flush() error {
 
 	// Write to disk
 	filePath := w.path + "/" + DataFileName
-	if err := os.WriteFile(filePath, data, 0644); err != nil {
+	if err := os.WriteFile(filePath, data, 0o644); err != nil {
 		return fmt.Errorf("failed to write blockpack file: %w", err)
 	}
 
