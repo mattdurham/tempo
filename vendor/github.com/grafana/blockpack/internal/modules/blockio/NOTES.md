@@ -382,13 +382,13 @@ are returned for any predicate on that column — correct, conservative behavior
 
 **As of the modules executor migration:** `internal/modules/blockio/executor_test.go`
 no longer routes through `adapter.go` + `internal/executor`. It calls
-`modules_executor.New().Execute(r, program, modules_executor.Options{})` directly,
+`modules_executor.Collect(r, program, modules_executor.CollectOptions{})` directly,
 with `r` being a `*modules_reader.Reader`.
 
 **What this means:**
 - EX-01 through EX-07 in `executor_test.go` are now integration tests of the real
   new execution path (writer → reader → queryplanner → executor).
-- The `bloomPredicates` function in `internal/modules/executor` is exercised by every
+- The `BuildPredicates` function (via `planBlocks`) in `internal/modules/executor` is exercised by every
   test that uses a named-column predicate (EX-01, EX-03, EX-04, EX-06).
 - `adapter.go` and `NewModulesBlockReader` are still present and exported; they are
   retained for `comparison_test.go`, which runs the same TraceQL query through both
@@ -1323,3 +1323,41 @@ includes/skips stats fields based on `blockVersion < VersionBlockV12`.
 - `internal/modules/blockio/writer/writer_block.go:finalize`
 - `internal/modules/blockio/reader/parser.go:parseBlockIndexEntry`
 - `internal/modules/blockio/reader/block_parser.go:parseColumnMetadataArray`
+
+---
+
+## 47. MaxCompactSectionSize — Defined But Unenforced (GAP-8)
+*Added: 2026-03-18*
+
+**Status: aspirational constant — no enforcement exists.**
+
+`MaxCompactSectionSize = 52_428_800` (50 MiB) is defined in `shared/constants.go` and
+referenced in two comments in `writer/writer.go` (lines ~384 and ~460). However, the
+constant is **never checked in any code path**:
+
+- `writeCompactTraceIndex` in `writer/metadata.go` builds the compact trace index blob
+  and returns its byte length, but does not check `buf.Len() > MaxCompactSectionSize`.
+- The reader (`parser.go`) reads `compactLen` bytes unconditionally with no size guard.
+- The two `writer.go` comments cite the constant to justify a `uint32` cast being safe,
+  but that safety argument is circular — the size is never actually bounded.
+
+**Why it was not enforced:** The compact index grows as `O(unique_traces × avg_blocks_per_trace)`.
+For typical workloads this is well under 1 MiB. The 50 MiB limit was chosen as a generous
+cap that would never be hit in practice, so enforcement was deferred.
+
+**Risk:** A pathological file with millions of unique traces across many blocks could
+produce a compact index exceeding 50 MiB, causing a silent `uint32` truncation in the
+`compactLen` field of the v4 footer. The reader would then read a wrong (truncated) byte
+count and corrupt the parse.
+
+**TODO:** If enforcement is added, the recommended approach is:
+1. Change `MaxCompactSectionSize` from `const` to `var` (to allow test override).
+2. Add a size check in `writeCompactTraceIndex` after building the blob: return an error
+   if `len(blob) > shared.MaxCompactSectionSize`.
+3. Write a test that lowers the limit to a small value, writes enough traces to exceed it,
+   and asserts the writer returns an error.
+
+**Back-refs:**
+- `internal/modules/blockio/shared/constants.go:MaxCompactSectionSize`
+- `internal/modules/blockio/writer/metadata.go:writeCompactTraceIndex`
+- `internal/modules/blockio/writer/writer.go` (comments on lines ~384, ~460)

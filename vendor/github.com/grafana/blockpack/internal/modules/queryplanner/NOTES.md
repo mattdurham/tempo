@@ -150,9 +150,10 @@ distinct service names:
 - Range pruning: only the ~1-2 blocks whose range bucket includes "auth" are selected
 
 **OR composite pruning (updated 2026-03-14):** OR composites carry per-child `Values`.
-In `blockSetForPred`, if any OR child is unconstrained (nil), the entire OR returns nil —
-no blocks can be pruned when any alternative is unindexed. Only when all children are
-indexed does the OR return a union of their block sets. See NOTE-012.
+In `blockSetForPred`, unconstrained (nil) OR children are **skipped** — they represent
+columns absent from the file entirely (writer invariant). The OR returns the union of
+constrained children's block sets. Returns nil only when ALL children are unconstrained.
+See NOTE-012.
 
 ---
 
@@ -227,8 +228,8 @@ the condition was `!AND && !OR` (union semantics) instead of `!AND || !OR` (inte
 - The top-level `[]Predicate` passed to `Plan` is implicitly AND-combined.
 
 **Correctness properties preserved:**
-- OR nil-return semantics: if any OR child is unconstrained (no range index), the entire
-  OR returns nil. The AND layer then skips it conservatively. See NOTE-012.
+- OR nil-skip semantics: unconstrained (nil) OR children are skipped; OR returns nil
+  only when ALL children are unconstrained. See NOTE-012.
 - AND-conservative: unconstrained AND children are skipped; the AND node only prunes
   based on what the range index can actually determine.
 - No false negatives: range index is conservative by construction.

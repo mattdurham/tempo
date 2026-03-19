@@ -66,15 +66,7 @@ func StreamLogs(
 	}
 
 	wantColumns := ProgramWantColumns(program)
-	// NOTE-021: ensure log:timestamp is always in the first-pass block for time pre-filtering.
-	// Also include resource.__loki_labels__ so stream-label metadata is always decoded.
-	if wantColumns != nil {
-		wantCopy := make(map[string]struct{}, len(wantColumns)+2)
-		maps.Copy(wantCopy, wantColumns)
-		wantCopy["log:timestamp"] = struct{}{}
-		wantCopy["resource.__loki_labels__"] = struct{}{}
-		wantColumns = wantCopy
-	}
+	wantColumns = injectLogRequiredColumns(wantColumns)
 
 	plan := planBlocks(r, program, queryplanner.TimeRange{}, queryplanner.PlanOptions{})
 
@@ -93,106 +85,19 @@ func StreamLogs(
 	}
 	results := make([]LogEntry, 0, totalRows)
 
-	// Partition selected blocks into ~8 MB coalesced groups for lazy batched I/O.
-	groups := r.CoalescedGroups(plan.SelectedBlocks)
-
-	blockToGroup := make(map[int]int, len(plan.SelectedBlocks))
-	for gi, g := range groups {
-		for _, bi := range g.BlockIDs {
-			blockToGroup[bi] = gi
-		}
+	// Delegate coalesced I/O, parse, and per-row pipeline to iterateLogRows.
+	// CollectOptions{} zero value means no time range filtering (MinNano==MaxNano==0
+	// is treated as open-ended by filterRowsByTimeRange).
+	_, err := iterateLogRows(r, program, wantColumns, pipeline, CollectOptions{}, plan,
+		nil, nil,
+		func(_ uint64, entry LogEntry) bool {
+			results = append(results, entry)
+			return true
+		},
+	)
+	if err != nil {
+		return nil, err
 	}
-
-	fetched := make(map[int][]byte)
-	fetchedGroupsSeen := make(map[int]bool)
-
-	for _, blockIdx := range plan.SelectedBlocks {
-		gi, ok := blockToGroup[blockIdx]
-		if !ok {
-			continue
-		}
-
-		if !fetchedGroupsSeen[gi] {
-			groupRaw, fetchErr := r.ReadGroup(groups[gi])
-			if fetchErr != nil {
-				return nil, fmt.Errorf("StreamLogs ReadGroup: %w", fetchErr)
-			}
-			maps.Copy(fetched, groupRaw)
-			fetchedGroupsSeen[gi] = true
-		}
-
-		raw, rawOK := fetched[blockIdx]
-		if !rawOK {
-			continue
-		}
-		delete(fetched, blockIdx)
-
-		meta := r.BlockMeta(blockIdx)
-		r.ResetInternStrings()
-		bwb, parseErr := r.ParseBlockFromBytes(raw, wantColumns, meta)
-		if parseErr != nil {
-			return nil, fmt.Errorf("StreamLogs ParseBlockFromBytes block %d: %w", blockIdx, parseErr)
-		}
-
-		colProvider := NewColumnProvider(bwb.Block)
-		rowSet, evalErr := program.ColumnPredicate(colProvider)
-		if evalErr != nil {
-			return nil, fmt.Errorf("StreamLogs ColumnPredicate block %d: %w", blockIdx, evalErr)
-		}
-
-		if rowSet.Size() == 0 {
-			continue
-		}
-
-		// NOTE-001: Lazy registration in ParseBlockFromBytes registers all columns with
-		// presence-only decode. Full decode is triggered on first value access — no AddColumnsToBlock needed.
-
-		// Cache column pointers for the row loop.
-		tsCol := bwb.Block.GetColumn("log:timestamp")
-		bodyCol := bwb.Block.GetColumn("log:body")
-		colNames, colMap, colCols, logStrNames, logStrCols := buildBlockColMapsWithLogCache(bwb.Block)
-		skipParsers := pipeline != nil && blockHasBodyParsed(bwb.Block)
-		for _, rowIdx := range rowSet.ToSlice() {
-			var tsNanos uint64
-			if tsCol != nil {
-				if v, ok := tsCol.Uint64Value(rowIdx); ok {
-					tsNanos = v
-				}
-			}
-			var line string
-			if bodyCol != nil {
-				if v, ok := bodyCol.StringValue(rowIdx); ok {
-					line = v
-				}
-			}
-
-			// NOTE-SL-016: acquire from pool — zero map allocation for dropped rows.
-			bls := acquireBlockLabelSet(bwb.Block, rowIdx, colNames, colMap, colCols)
-			if pipeline != nil {
-				var keep bool
-				if skipParsers {
-					line, _, keep = pipeline.ProcessSkipParsers(tsNanos, line, bls)
-				} else {
-					line, _, keep = pipeline.Process(tsNanos, line, bls)
-				}
-				if !keep {
-					releaseBlockLabelSet(bls)
-					continue // pipeline dropped the row
-				}
-			}
-
-			// Read __loki_labels__ via the post-pipeline LabelSet so that mutations
-			// (drop/keep/label_format) are respected if they affect this field.
-			lokiLabels := bls.Get("__loki_labels__")
-			logAttrs := collectLogStringAttrs(logStrNames, logStrCols, rowIdx)
-			releaseBlockLabelSet(bls)
-			results = append(
-				results,
-				LogEntry{TimestampNanos: tsNanos, Line: line, LokiLabels: lokiLabels, LogAttrs: logAttrs},
-			)
-		}
-	}
-
 	return results, nil
 }
 
@@ -210,4 +115,20 @@ func blockHasBodyParsed(block *modules_reader.Block) bool {
 		}
 	}
 	return false
+}
+
+// injectLogRequiredColumns returns a copy of wantColumns with log:timestamp and
+// resource.__loki_labels__ added. Both columns are required for log queries regardless
+// of predicates: log:timestamp for time pre-filtering (NOTE-021) and
+// resource.__loki_labels__ so stream-label metadata is always decoded.
+// Returns wantColumns unchanged when it is nil (nil means "want all columns").
+func injectLogRequiredColumns(wantColumns map[string]struct{}) map[string]struct{} {
+	if wantColumns == nil {
+		return nil
+	}
+	wantCopy := make(map[string]struct{}, len(wantColumns)+2)
+	maps.Copy(wantCopy, wantColumns)
+	wantCopy["log:timestamp"] = struct{}{}
+	wantCopy["resource.__loki_labels__"] = struct{}{}
+	return wantCopy
 }

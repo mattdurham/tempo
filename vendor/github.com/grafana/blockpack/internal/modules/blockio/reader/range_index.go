@@ -3,10 +3,11 @@ package reader
 // NOTE: Any changes to this file must be reflected in the corresponding specs.md or NOTES.md.
 
 import (
+	"cmp"
 	"encoding/binary"
 	"fmt"
 	"math"
-	"sort"
+	"slices"
 
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
 )
@@ -160,16 +161,16 @@ func parseRangeColumnEntry(
 func sortRangeEntries(colType shared.ColumnType, entries []rangeEntry) {
 	switch colType {
 	case shared.ColumnTypeRangeInt64, shared.ColumnTypeRangeDuration:
-		sort.Slice(entries, func(i, j int) bool {
-			return decodeInt64Key(entries[i].lower) < decodeInt64Key(entries[j].lower)
+		slices.SortFunc(entries, func(a, b rangeEntry) int {
+			return cmp.Compare(decodeInt64Key(a.lower), decodeInt64Key(b.lower))
 		})
 	case shared.ColumnTypeRangeUint64:
-		sort.Slice(entries, func(i, j int) bool {
-			return decodeUint64Key(entries[i].lower) < decodeUint64Key(entries[j].lower)
+		slices.SortFunc(entries, func(a, b rangeEntry) int {
+			return cmp.Compare(decodeUint64Key(a.lower), decodeUint64Key(b.lower))
 		})
 	case shared.ColumnTypeRangeFloat64:
-		sort.Slice(entries, func(i, j int) bool {
-			return decodeFloat64Key(entries[i].lower) < decodeFloat64Key(entries[j].lower)
+		slices.SortFunc(entries, func(a, b rangeEntry) int {
+			return cmp.Compare(decodeFloat64Key(a.lower), decodeFloat64Key(b.lower))
 		})
 	}
 }

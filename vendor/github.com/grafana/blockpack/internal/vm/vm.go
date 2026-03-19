@@ -2,10 +2,6 @@ package vm
 
 // NOTE: Any changes to this file must be reflected in the corresponding NOTES.md.
 
-import (
-	"time"
-)
-
 // AggBucket holds aggregation state for a single group.
 // A JSON-friendly payload used to exist but was removed; this is the sole bucket struct.
 type AggBucket struct {
@@ -24,6 +20,8 @@ func (b *AggBucket) Merge(other *AggBucket) {
 		return
 	}
 
+	origCount := b.Count
+
 	// Sum the counts
 	b.Count += other.Count
 
@@ -32,8 +30,8 @@ func (b *AggBucket) Merge(other *AggBucket) {
 
 	// Take the minimum
 	if other.Count > 0 {
-		if b.Count == other.Count {
-			// This is the first bucket being merged
+		if origCount == 0 {
+			// This is the first bucket being merged into an empty bucket
 			b.Min = other.Min
 		} else if other.Min < b.Min {
 			b.Min = other.Min
@@ -42,8 +40,8 @@ func (b *AggBucket) Merge(other *AggBucket) {
 
 	// Take the maximum
 	if other.Count > 0 {
-		if b.Count == other.Count {
-			// This is the first bucket being merged
+		if origCount == 0 {
+			// This is the first bucket being merged into an empty bucket
 			b.Max = other.Max
 		} else if other.Max > b.Max {
 			b.Max = other.Max
@@ -87,10 +85,4 @@ func MergeAggregationResults(results ...map[string]*AggBucket) map[string]*AggBu
 // GroupKey represents a unique combination of group-by field values
 type GroupKey struct {
 	Values []Value // Ordered by GROUP BY fields in query; read-only after construction — shared by shallow-copied AggBuckets.
-}
-
-// DateBinInfo holds date_bin configuration
-type DateBinInfo struct {
-	Interval        time.Duration // e.g., 5*time.Minute for "5m"
-	OriginTimestamp int64         // Query start time (Unix nanoseconds)
 }

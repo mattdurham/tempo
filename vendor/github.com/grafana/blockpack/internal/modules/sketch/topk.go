@@ -8,9 +8,10 @@
 package sketch
 
 import (
+	"cmp"
 	"encoding/binary"
 	"fmt"
-	"sort"
+	"slices"
 )
 
 const (
@@ -55,11 +56,11 @@ func (t *TopK) Entries() []TopKEntry {
 	for k, c := range t.counts {
 		entries = append(entries, TopKEntry{Key: k, Count: c})
 	}
-	sort.Slice(entries, func(i, j int) bool {
-		if entries[i].Count != entries[j].Count {
-			return entries[i].Count > entries[j].Count
+	slices.SortFunc(entries, func(a, b TopKEntry) int {
+		if a.Count != b.Count {
+			return cmp.Compare(b.Count, a.Count)
 		}
-		return entries[i].Key < entries[j].Key // stable secondary sort by key
+		return cmp.Compare(a.Key, b.Key) // deterministic secondary sort by key
 	})
 	if len(entries) > TopKSize {
 		entries = entries[:TopKSize]

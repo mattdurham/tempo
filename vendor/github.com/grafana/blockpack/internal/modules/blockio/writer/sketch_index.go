@@ -23,7 +23,7 @@ package writer
 import (
 	"encoding/binary"
 	"fmt"
-	"sort"
+	"slices"
 
 	"github.com/grafana/blockpack/internal/modules/sketch"
 )
@@ -89,7 +89,7 @@ func writeSketchIndexSection(sketchIdx []blockSketchSet) ([]byte, error) {
 	for name := range colSet {
 		colNames = append(colNames, name)
 	}
-	sort.Strings(colNames)
+	slices.Sort(colNames)
 	numColumns := len(colNames)
 
 	presenceBytes := (numBlocks + 7) / 8

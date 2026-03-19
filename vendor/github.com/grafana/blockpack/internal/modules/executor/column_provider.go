@@ -600,12 +600,14 @@ func (p *blockColumnProvider) ScanRegexNotMatchFast(
 // StreamFullScan calls cb for every row in the block.
 func (p *blockColumnProvider) StreamFullScan(cb vm.RowCallback) (int, error) {
 	n := p.block.SpanCount()
+	count := 0
 	for i := range n {
 		if !cb(i) {
-			return i, nil
+			return count, nil
 		}
+		count++
 	}
-	return n, nil
+	return count, nil
 }
 
 // --- Scan methods (collect into RowSet) ---

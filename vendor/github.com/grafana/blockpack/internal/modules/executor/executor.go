@@ -7,8 +7,7 @@
 //
 // # Usage
 //
-//	exec := executor.New()
-//	rows, err := exec.Collect(r, program, executor.CollectOptions{})
+//	rows, err := executor.Collect(r, program, executor.CollectOptions{})
 //	// rows contains matched MatchedRow values; use SpanMatchFromRow to extract TraceID/SpanID
 //
 //	rows, logErr = executor.CollectLogs(r, program, nil, executor.CollectOptions{TimestampColumn: "log:timestamp"})
@@ -17,7 +16,6 @@ package executor
 // NOTE: Any changes to this file must be reflected in the corresponding specs.md or NOTES.md.
 
 import (
-	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
 	modules_shared "github.com/grafana/blockpack/internal/modules/blockio/shared"
 	"github.com/grafana/blockpack/internal/modules/queryplanner"
 )
@@ -54,25 +52,14 @@ type Options struct {
 	BlockCount int
 }
 
-// Executor runs TraceQL filter queries against a modules blockpack file.
-// It is stateless and safe for concurrent use.
-type Executor struct{}
-
-// New returns a new Executor.
-func New() *Executor { return &Executor{} }
-
 // SpanMatchFromRow extracts a SpanMatch from a MatchedRow by reading the appropriate
 // trace and span identity columns for the given signal type. For trace signals it
 // reads "trace:id" and "span:id"; for log signals it reads "log:trace_id" and "log:span_id".
 func SpanMatchFromRow(row MatchedRow, signalType uint8) SpanMatch {
-	return spanMatchFromBlock(row.Block, row.BlockIdx, row.RowIdx, signalType)
-}
-
-// spanMatchFromBlock extracts a SpanMatch from a block row.
-// signalType determines which column names hold the trace and span IDs:
-// log files use "log:trace_id" / "log:span_id"; trace files use "trace:id" / "span:id".
-func spanMatchFromBlock(block *modules_reader.Block, blockIdx, rowIdx int, signalType uint8) SpanMatch {
-	m := SpanMatch{BlockIdx: blockIdx, RowIdx: rowIdx}
+	m := SpanMatch{BlockIdx: row.BlockIdx, RowIdx: row.RowIdx}
+	if row.Block == nil {
+		return m
+	}
 
 	traceIDCol := "trace:id"
 	spanIDCol := "span:id"
@@ -81,13 +68,13 @@ func spanMatchFromBlock(block *modules_reader.Block, blockIdx, rowIdx int, signa
 		spanIDCol = "log:span_id"
 	}
 
-	if col := block.GetColumn(traceIDCol); col != nil {
-		if v, ok := col.BytesValue(rowIdx); ok && len(v) == 16 {
+	if col := row.Block.GetColumn(traceIDCol); col != nil {
+		if v, ok := col.BytesValue(row.RowIdx); ok && len(v) == 16 {
 			copy(m.TraceID[:], v)
 		}
 	}
-	if col := block.GetColumn(spanIDCol); col != nil {
-		if v, ok := col.BytesValue(rowIdx); ok {
+	if col := row.Block.GetColumn(spanIDCol); col != nil {
+		if v, ok := col.BytesValue(row.RowIdx); ok {
 			m.SpanID = make([]byte, len(v))
 			copy(m.SpanID, v)
 		}

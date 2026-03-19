@@ -113,32 +113,6 @@ func topKScanRows(
 	}
 }
 
-// CollectTopK collects the top opts.Limit rows by per-row timestamp and returns
-// them as a slice in direction order after the scan completes.
-//
-// For Backward direction: opts.Limit newest entries (descending timestamp).
-// For Forward direction: opts.Limit oldest entries (ascending timestamp).
-//
-// Unlike Collect, which stops at the first opts.Limit rows encountered, CollectTopK
-// guarantees the returned rows are the globally top-Limit entries by timestamp.
-// A min-heap (Backward) or max-heap (Forward) of size opts.Limit is maintained;
-// CollectTopK is a compatibility shim that delegates to Collect.
-// Timestamp-sorted top-K collection is now handled inside Collect: when
-// TimestampColumn and Limit are both set, Collect uses a heap-based scan
-// to guarantee globally correct top-K results.
-//
-// Callers should prefer Collect directly. CollectTopK remains for backward compatibility.
-//
-// SPEC-STREAM-7: CollectTopK guarantees global top-K correctness.
-// Back-ref: internal/modules/executor/stream_topk.go:CollectTopK
-func (e *Executor) CollectTopK(
-	r *modules_reader.Reader,
-	program *vm.Program,
-	opts CollectOptions,
-) ([]MatchedRow, error) {
-	return e.Collect(r, program, opts)
-}
-
 // topKScanBlocks iterates selected blocks, fetches them lazily, and fills buf.
 // Returns the number of individual block fetches performed.
 func topKScanBlocks(
@@ -154,12 +128,18 @@ func topKScanBlocks(
 ) (int, error) {
 	fetched := make(map[int][]byte)
 	fetchedGroupsSeen := make(map[int]bool)
+	skippedBlocks := make(map[int]bool)
 	fetchCount := 0
 
 	for _, blockIdx := range plan.SelectedBlocks {
 		meta := r.BlockMeta(blockIdx)
 		if topKSkipBlock(buf, opts.Limit, backward, meta) {
-			delete(fetched, blockIdx) // release bytes if already fetched in this group
+			gi2, ok2 := blockToGroup[blockIdx]
+			if ok2 && fetchedGroupsSeen[gi2] {
+				delete(fetched, blockIdx)
+			} else {
+				skippedBlocks[blockIdx] = true
+			}
 			continue
 		}
 
@@ -173,6 +153,11 @@ func topKScanBlocks(
 				return fetchCount, fmt.Errorf("ReadGroup: %w", fetchErr)
 			}
 			maps.Copy(fetched, groupRaw)
+			for _, bi := range groups[gi].BlockIDs {
+				if skippedBlocks[bi] {
+					delete(fetched, bi)
+				}
+			}
 			fetchCount += len(groups[gi].BlockIDs)
 			fetchedGroupsSeen[gi] = true
 		}

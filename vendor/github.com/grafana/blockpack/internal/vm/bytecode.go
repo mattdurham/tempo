@@ -3,7 +3,7 @@ package vm
 
 // Value represents a runtime value in the VM
 type Value struct {
-	Data interface{} // int64, float64, string, bool, []byte, []Value, or nil
+	Data any // int64, float64, string, bool, []byte, []Value, or nil
 	Type ValueType
 }
 

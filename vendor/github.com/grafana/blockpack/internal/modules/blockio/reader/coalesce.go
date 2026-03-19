@@ -3,8 +3,9 @@ package reader
 // NOTE: Any changes to this file must be reflected in the corresponding specs.md or NOTES.md.
 
 import (
+	"cmp"
 	"fmt"
-	"sort"
+	"slices"
 
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
 	"github.com/grafana/blockpack/internal/modules/rw"
@@ -38,9 +39,7 @@ func CoalesceBlocks(metas []shared.BlockMeta, blockOrder []int, cfg shared.Coale
 		})
 	}
 
-	sort.Slice(extents, func(i, j int) bool {
-		return extents[i].offset < extents[j].offset
-	})
+	slices.SortFunc(extents, func(a, b blockExtent) int { return cmp.Compare(a.offset, b.offset) })
 
 	var result []shared.CoalescedRead
 	if len(extents) == 0 {

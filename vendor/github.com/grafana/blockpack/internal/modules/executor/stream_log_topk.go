@@ -16,18 +16,11 @@ import (
 	"github.com/grafana/blockpack/internal/vm"
 )
 
-// logTopKEntry holds one pipeline-passing log row buffered during a CollectLogs scan.
-// entry is stored by value to eliminate per-row heap allocation.
-// NOTE-041: ts field removed — heap comparisons use entry.TimestampNanos directly.
-type logTopKEntry struct {
-	entry LogEntry
-}
-
-// logTopKHeap implements heap.Interface over logTopKEntry.
+// logTopKHeap implements heap.Interface over LogEntry.
 // backward=true  → min-heap (root = oldest entry, evicted first when full).
 // backward=false → max-heap (root = newest entry, evicted first when full).
 type logTopKHeap struct {
-	entries  []logTopKEntry
+	entries  []LogEntry
 	backward bool
 }
 
@@ -38,12 +31,12 @@ func (h *logTopKHeap) Swap(i, j int) {
 
 func (h *logTopKHeap) Less(i, j int) bool {
 	if h.backward {
-		return h.entries[i].entry.TimestampNanos < h.entries[j].entry.TimestampNanos // min-heap: oldest at root
+		return h.entries[i].TimestampNanos < h.entries[j].TimestampNanos // min-heap: oldest at root
 	}
-	return h.entries[i].entry.TimestampNanos > h.entries[j].entry.TimestampNanos // max-heap: newest at root
+	return h.entries[i].TimestampNanos > h.entries[j].TimestampNanos // max-heap: newest at root
 }
 
-func (h *logTopKHeap) Push(x any) { h.entries = append(h.entries, x.(logTopKEntry)) }
+func (h *logTopKHeap) Push(x any) { h.entries = append(h.entries, x.(LogEntry)) }
 func (h *logTopKHeap) Pop() any {
 	n := len(h.entries)
 	x := h.entries[n-1]
@@ -57,7 +50,7 @@ func logTopKCanSkipBlock(buf *logTopKHeap, limit int, backward bool, meta shared
 	if buf.Len() < limit {
 		return false
 	}
-	worst := buf.entries[0].entry.TimestampNanos
+	worst := buf.entries[0].TimestampNanos
 	if backward {
 		// min-heap root is oldest; skip if even the block's newest entry is no better.
 		return meta.MaxStart != 0 && meta.MaxStart <= worst
@@ -68,16 +61,16 @@ func logTopKCanSkipBlock(buf *logTopKHeap, limit int, backward bool, meta shared
 
 // logTopKInsert inserts entry into buf. When full, evicts the worst entry only if
 // the new entry is a better fit.
-func logTopKInsert(buf *logTopKHeap, limit int, backward bool, entry logTopKEntry) {
+func logTopKInsert(buf *logTopKHeap, limit int, backward bool, entry LogEntry) {
 	if buf.Len() < limit {
 		heap.Push(buf, entry)
 		return
 	}
-	worst := buf.entries[0].entry.TimestampNanos
-	if backward && entry.entry.TimestampNanos > worst {
+	worst := buf.entries[0].TimestampNanos
+	if backward && entry.TimestampNanos > worst {
 		heap.Pop(buf)
 		heap.Push(buf, entry)
-	} else if !backward && entry.entry.TimestampNanos < worst {
+	} else if !backward && entry.TimestampNanos < worst {
 		heap.Pop(buf)
 		heap.Push(buf, entry)
 	}
@@ -143,17 +136,7 @@ func CollectLogs(
 	}
 
 	wantColumns := ProgramWantColumns(program)
-	// NOTE-021: ensure log:timestamp is always in the first-pass block for time pre-filtering.
-	// Also include resource.__loki_labels__ so callers accessing stream-label metadata via
-	// GetField("resource.__loki_labels__") or IterateFields always find a decoded value
-	// regardless of whether it appeared in a query predicate.
-	if wantColumns != nil {
-		wantCopy := make(map[string]struct{}, len(wantColumns)+2)
-		maps.Copy(wantCopy, wantColumns)
-		wantCopy["log:timestamp"] = struct{}{}
-		wantCopy["resource.__loki_labels__"] = struct{}{}
-		wantColumns = wantCopy
-	}
+	wantColumns = injectLogRequiredColumns(wantColumns)
 
 	backward := opts.Direction == queryplanner.Backward
 	var fb int
@@ -161,7 +144,7 @@ func CollectLogs(
 
 	if opts.Limit > 0 {
 		buf := &logTopKHeap{
-			entries:  make([]logTopKEntry, 0, opts.Limit),
+			entries:  make([]LogEntry, 0, opts.Limit),
 			backward: backward,
 		}
 		fb, scanErr = logTopKScan(r, program, wantColumns, pipeline, opts, plan, buf, backward)
@@ -169,7 +152,7 @@ func CollectLogs(
 			return nil, scanErr
 		}
 		fetchedBlocks = fb
-		return logTopKDeliver(buf, backward), nil
+		return logDeliverAll(buf.entries, backward), nil
 	}
 
 	// Limit == 0: collect all, sort globally, deliver.
@@ -182,13 +165,39 @@ func CollectLogs(
 	if totalRows > 4096 {
 		totalRows = 4096
 	}
-	all := make([]logTopKEntry, 0, totalRows)
+	all := make([]LogEntry, 0, totalRows)
 	fb, scanErr = logCollectAll(r, program, wantColumns, pipeline, opts, plan, &all)
 	if scanErr != nil {
 		return nil, scanErr
 	}
 	fetchedBlocks = fb
 	return logDeliverAll(all, backward), nil
+}
+
+// filterRowsByTimeRange filters rowIndices to those within [minNano, maxNano].
+// Zero values for minNano/maxNano mean open bounds.
+// NOTE-021: called after first-pass ColumnPredicate to skip second-pass decode for out-of-range rows.
+func filterRowsByTimeRange(tsCol *modules_reader.Column, rows []int, minNano, maxNano uint64) []int {
+	if minNano == 0 && maxNano == 0 {
+		return rows
+	}
+	kept := make([]int, 0, len(rows))
+	for _, rowIdx := range rows {
+		var ts uint64
+		if tsCol != nil {
+			if v, ok := tsCol.Uint64Value(rowIdx); ok {
+				ts = v
+			}
+		}
+		if minNano > 0 && ts < minNano {
+			continue
+		}
+		if maxNano > 0 && ts > maxNano {
+			continue
+		}
+		kept = append(kept, rowIdx)
+	}
+	return kept
 }
 
 // iterateLogRows iterates all selected blocks, applying block-level pruning, time
@@ -238,7 +247,8 @@ func iterateLogRows(
 			// If the group is already fetched, release bytes immediately.
 			// Otherwise record the block as skipped so we can delete it after
 			// maps.Copy brings the whole group into fetched.
-			if fetchedGroupsSeen[blockToGroup[blockIdx]] {
+			gi2, ok2 := blockToGroup[blockIdx]
+			if ok2 && fetchedGroupsSeen[gi2] {
 				delete(fetched, blockIdx)
 			} else {
 				skippedBlocks[blockIdx] = true
@@ -279,7 +289,7 @@ func iterateLogRows(
 			return fetchCount, fmt.Errorf("CollectLogs ParseBlockFromBytes block %d: %w", blockIdx, err)
 		}
 
-		rowSet, err := program.ColumnPredicate(NewColumnProvider(bwb.Block))
+		rowSet, err := program.ColumnPredicate(newBlockColumnProvider(bwb.Block))
 		if err != nil {
 			return fetchCount, fmt.Errorf("CollectLogs ColumnPredicate block %d: %w", blockIdx, err)
 		}
@@ -291,30 +301,12 @@ func iterateLogRows(
 		// NOTE-021: pre-filter by time using first-pass block before full second-pass decode.
 		// log:timestamp is guaranteed present (injected into wantColumns above).
 		rows := rowSet.ToSlice()
-		var keptByTime []int
-		if opts.TimeRange.MinNano > 0 || opts.TimeRange.MaxNano > 0 {
-			keptByTime = make([]int, 0, len(rows))
-			firstPassTSCol := bwb.Block.GetColumn("log:timestamp")
-			for _, rowIdx := range rows {
-				ts := uint64(0)
-				if firstPassTSCol != nil {
-					if v, ok := firstPassTSCol.Uint64Value(rowIdx); ok {
-						ts = v
-					}
-				}
-				if opts.TimeRange.MinNano > 0 && ts < opts.TimeRange.MinNano {
-					continue
-				}
-				if opts.TimeRange.MaxNano > 0 && ts > opts.TimeRange.MaxNano {
-					continue
-				}
-				keptByTime = append(keptByTime, rowIdx)
-			}
-			if len(keptByTime) == 0 {
-				continue // skip second-pass decode entirely
-			}
-		} else {
-			keptByTime = rows
+		keptByTime := filterRowsByTimeRange(
+			bwb.Block.GetColumn("log:timestamp"), rows,
+			opts.TimeRange.MinNano, opts.TimeRange.MaxNano,
+		)
+		if len(keptByTime) == 0 {
+			continue // skip second-pass decode entirely
 		}
 
 		// NOTE-001: Lazy registration in ParseBlockFromBytes registers all columns with
@@ -395,11 +387,11 @@ func logTopKScan(
 			if buf.Len() < opts.Limit {
 				return false
 			}
-			worst := buf.entries[0].entry.TimestampNanos
+			worst := buf.entries[0].TimestampNanos
 			return (backward && ts <= worst) || (!backward && ts >= worst)
 		},
 		func(ts uint64, entry LogEntry) bool {
-			logTopKInsert(buf, opts.Limit, backward, logTopKEntry{entry: entry})
+			logTopKInsert(buf, opts.Limit, backward, entry)
 			return true
 		},
 	)
@@ -414,21 +406,16 @@ func logCollectAll(
 	pipeline *logqlparser.Pipeline,
 	opts CollectOptions,
 	plan *queryplanner.Plan,
-	all *[]logTopKEntry,
+	all *[]LogEntry,
 ) (int, error) {
 	return iterateLogRows(r, program, wantColumns, pipeline, opts, plan,
 		nil, // no block-level skip for collect-all
 		nil, // no per-row skip for collect-all
 		func(_ uint64, entry LogEntry) bool {
-			*all = append(*all, logTopKEntry{entry: entry})
+			*all = append(*all, entry)
 			return true
 		},
 	)
-}
-
-// logTopKDeliver sorts the heap entries and returns them in direction order.
-func logTopKDeliver(buf *logTopKHeap, backward bool) []LogEntry {
-	return logDeliverAll(buf.entries, backward)
 }
 
 // collectLogStringAttrs collects log.* string-valued column values for rowIdx
@@ -460,19 +447,17 @@ func collectLogStringAttrs(names []string, cols []*modules_reader.Column, rowIdx
 }
 
 // logDeliverAll sorts entries and returns them in direction order.
-func logDeliverAll(entries []logTopKEntry, backward bool) []LogEntry {
+func logDeliverAll(entries []LogEntry, backward bool) []LogEntry {
 	if backward {
-		slices.SortFunc(entries, func(a, b logTopKEntry) int {
-			return cmp.Compare(b.entry.TimestampNanos, a.entry.TimestampNanos)
+		slices.SortFunc(entries, func(a, b LogEntry) int {
+			return cmp.Compare(b.TimestampNanos, a.TimestampNanos)
 		})
 	} else {
-		slices.SortFunc(entries, func(a, b logTopKEntry) int {
-			return cmp.Compare(a.entry.TimestampNanos, b.entry.TimestampNanos)
+		slices.SortFunc(entries, func(a, b LogEntry) int {
+			return cmp.Compare(a.TimestampNanos, b.TimestampNanos)
 		})
 	}
 	results := make([]LogEntry, len(entries))
-	for i, e := range entries {
-		results[i] = e.entry
-	}
+	copy(results, entries)
 	return results
 }

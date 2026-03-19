@@ -4,6 +4,7 @@ package reader
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"sync"
 
@@ -345,7 +346,7 @@ func (r *Reader) BlocksForRangeInterval(
 	for id := range seen {
 		result = append(result, id)
 	}
-	sort.Ints(result)
+	slices.Sort(result)
 
 	return result, nil
 }
@@ -367,7 +368,7 @@ func (r *Reader) ColumnNames() []string {
 	for col := range seen {
 		out = append(out, col)
 	}
-	sort.Strings(out)
+	slices.Sort(out)
 	return out
 }
 

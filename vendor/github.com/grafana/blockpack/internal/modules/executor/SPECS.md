@@ -19,18 +19,13 @@ This document defines the public contracts, input/output semantics, and invarian
 ## 2. Executor
 
 ```go
-type Executor struct{}
-
-func New() *Executor
-func (e *Executor) Collect(r *modules_reader.Reader, program *vm.Program, opts CollectOptions) ([]MatchedRow, error)
-func (e *Executor) CollectTopK(r *modules_reader.Reader, program *vm.Program, opts CollectOptions) ([]MatchedRow, error)
+func Collect(r *modules_reader.Reader, program *vm.Program, opts CollectOptions) ([]MatchedRow, error)
 func SpanMatchFromRow(row MatchedRow, signalType uint8) SpanMatch
 ```
 
-`Executor` is stateless and safe for concurrent use. `New()` returns a zero-value `Executor`.
-
 `Collect` is the primary query entry point — it replaces the earlier `Execute` method.
-`CollectTopK` is the globally-ordered variant using a heap (see §6, SPEC-STREAM-7).
+When `TimestampColumn` and `Limit` are both set, `Collect` uses a heap-based scan
+to guarantee globally correct top-K results (see §6, SPEC-STREAM-7).
 `SpanMatchFromRow` extracts identity fields from a `MatchedRow` after collection.
 
 ---
@@ -48,7 +43,7 @@ func SpanMatchFromRow(row MatchedRow, signalType uint8) SpanMatch
 
 1. Compute `wantColumns` from `program` and `secondPassCols` from `opts.AllColumns` (NOTE-028).
 2. Create a `queryplanner.Planner` backed by `r`.
-3. Call `planner.PlanWithOptions(buildPredicates(r, program), opts.TimeRange, ...)` —
+3. Call `planner.PlanWithOptions(BuildPredicates(r, program), opts.TimeRange, ...)` —
    range-index, fuse, and CMS pruning based on extracted column predicates, further
    narrowed by `opts.TimeRange` if non-zero.
 4. Apply sub-file sharding filter if `opts.BlockCount > 0` (see §3.4).
@@ -87,8 +82,7 @@ construction. The planner still operates on the full file, so pruning statistics
 (`TotalBlocks`, `PrunedByTime`, etc.) reflect the whole file; only `SelectedBlocks` and
 `FetchedBlocks` reflect the shard.
 
-Back-ref: `internal/modules/executor/stream.go:Collect` (lines 109-121),
-`internal/modules/executor/stream_topk.go:CollectTopK`
+Back-ref: `internal/modules/executor/stream.go:Collect` (lines 109-121)
 
 ---
 
@@ -132,12 +126,12 @@ type MatchedRow struct {
 }
 ```
 
-`Collect` and `CollectTopK` return `[]MatchedRow`. Each row holds a reference to the
+`Collect` returns `[]MatchedRow`. Each row holds a reference to the
 parsed block and the row index within it. Use `SpanMatchFromRow(row, signalType)` to
 extract identity fields (`TraceID`, `SpanID`) after collection.
 
-Matches are in block-then-row order (no randomization). For `CollectTopK`, matches are
-in globally-sorted timestamp order.
+Matches are in block-then-row order (no randomization). When `TimestampColumn` and
+`Limit` are both set, matches are in globally-sorted timestamp order.
 
 ### 4.3 CollectOptions
 
@@ -202,22 +196,21 @@ type Result struct {
 }
 ```
 
-`Result` and `Options` are retained for `ExecuteStructural` (§11) which still uses the
-original return shape.
+`Options` is shared with `ExecuteStructural` (§11). `ExecuteStructural` returns `*StructuralResult` (not `*Result`) — see §11 for its distinct return type.
 
 
 ---
 
-## 5. Predicate Extraction (buildPredicates)
+## 5. Predicate Extraction (BuildPredicates)
 
-`buildPredicates(r, program)` converts a compiled `vm.Program` into
+`BuildPredicates(r, program)` converts a compiled `vm.Program` into
 `[]queryplanner.Predicate` for bloom-filter and range-index pruning.
 
 The query compiler populates `program.Predicates` as a `*vm.QueryPredicates` containing:
 - `Nodes []vm.RangeNode` — a tree of pruning predicates (AND-combined at the top level).
 - `Columns []string` — additional columns needed for row-level decode (negations, `log:body`, etc.).
 
-`buildPredicates` iterates `Nodes` and calls `translateNode` to convert each `RangeNode`
+`BuildPredicates` iterates `Nodes` and calls `translateNode` to convert each `RangeNode`
 into a `queryplanner.Predicate`, preserving the tree structure (composites → Children,
 leaves → Columns/Values/IntervalMatch). The resulting predicates are AND-combined by the
 planner's top-level loop.
@@ -240,7 +233,7 @@ but do add column names to `Columns` so the two-pass decode loads the needed dat
 
 ### 5a. Regex Prefix Optimization
 
-When a `RangeNode` carries a `Pattern`, `buildPredicates` calls
+When a `RangeNode` carries a `Pattern`, `BuildPredicates` calls
 `vm.AnalyzeRegex(pattern)` to determine whether the pattern can be converted to
 range-index prefix lookups.
 
@@ -284,9 +277,9 @@ See NOTES.md §11 for regex optimization design decisions.
 
 ---
 
-## 6. Collect / CollectTopK Invariants
+## 6. Collect Invariants
 
-The SPEC-STREAM invariants apply to `Collect` and `CollectTopK`. The earlier `Stream`
+The SPEC-STREAM invariants apply to `Collect`. The earlier `Stream`
 callback-based method has been removed; `Collect` now uses the same lazy coalesced-group
 I/O path (see NOTE-035).
 
@@ -305,8 +298,8 @@ I/O path (see NOTE-035).
   `IntrinsicScanCount`, and `MixedCandidateBlocks` are populated as applicable.
   The block-scan deferred callback and the fast-path synchronous callback are mutually
   exclusive — exactly one fires for any given call. See NOTE-043, NOTE-044.
-- **SPEC-STREAM-7:** `CollectTopK` guarantees the returned rows are the globally top-`Limit` entries by per-row timestamp. A heap of size `Limit` is maintained: min-heap for Backward (evict oldest), max-heap for Forward (evict newest). Requires `TimestampColumn` to be set. When `Limit == 0`, delegates to `Collect`. Block-level early termination: blocks with `MaxStart <= heap.min` (Backward) or `MinStart >= heap.max` (Forward) are skipped entirely (no I/O). Results are delivered in sort order after the scan completes (not lazily).
-- **SPEC-STREAM-8:** `QueryOptions.MostRecent` in the public API (`api.go`) maps to `Direction: Backward` + `TimestampColumn: "span:start"` in `CollectOptions`. When `true` with no `Limit`, blocks are traversed in reverse `BlockMeta.MinStart` order and rows within each block are sorted by `span:start` descending — this is locally newest-first but does not guarantee global ordering when block time ranges overlap. When `true` with a `Limit`, `CollectTopK` is used instead, which guarantees the returned spans are the globally top-`Limit` by `span:start`. `span:start` is always in `searchMetaColumns` so no extra I/O is needed. Default (`false`) is forward with no timestamp sort. Only applies to filter queries; structural queries collect all blocks regardless.
+- **SPEC-STREAM-7:** When `TimestampColumn` and `Limit` are both set, `Collect` guarantees the returned rows are the globally top-`Limit` entries by per-row timestamp. A heap of size `Limit` is maintained: min-heap for Backward (evict oldest), max-heap for Forward (evict newest). Block-level early termination: blocks with `MaxStart <= heap.min` (Backward) or `MinStart >= heap.max` (Forward) are skipped entirely (no I/O). Results are delivered in sort order after the scan completes (not lazily). Back-ref: `internal/modules/executor/stream_topk.go:topKScanBlocks`
+- **SPEC-STREAM-8:** `QueryOptions.MostRecent` in the public API (`api.go`) maps to `Direction: Backward` + `TimestampColumn: "span:start"` in `CollectOptions`. When `true` with no `Limit`, blocks are traversed in reverse `BlockMeta.MinStart` order and rows within each block are sorted by `span:start` descending — this is locally newest-first but does not guarantee global ordering when block time ranges overlap. When `true` with a `Limit`, `Collect` is used with `TimestampColumn` set, which guarantees the returned spans are the globally top-`Limit` by `span:start` (SPEC-STREAM-7). `span:start` is always in `searchMetaColumns` so no extra I/O is needed. Default (`false`) is forward with no timestamp sort. Only applies to filter queries; structural queries collect all blocks regardless.
   Back-ref: `api.go:streamFilterProgram`
 - **SPEC-STREAM-9:** When `opts.Limit > 0` and the program contains at least one
   intrinsic predicate (`hasSomeIntrinsicPredicates` returns true), `Collect` runs an
@@ -326,7 +319,7 @@ I/O path (see NOTE-035).
             `internal/modules/executor/stream.go:collectIntrinsicTopK` (Case B KLL path:
             group refs by block, MaxStart DESC sort, O(N) map build, O(M log M) sort)
 
-Back-ref: `internal/modules/executor/stream.go:Collect`, `internal/modules/executor/stream.go:CollectOptions`, `internal/modules/executor/stream.go:collectFromIntrinsicRefs`, `internal/modules/executor/stream_topk.go:CollectTopK`
+Back-ref: `internal/modules/executor/stream.go:Collect`, `internal/modules/executor/stream.go:CollectOptions`, `internal/modules/executor/stream.go:collectFromIntrinsicRefs`
 
 ---
 
@@ -339,76 +332,74 @@ func StreamLogs(
     r *modules_reader.Reader,
     program *vm.Program,
     pipeline *logqlparser.Pipeline,
-    fn LogEntryCallback,
-) error
+) ([]LogEntry, error)
 ```
 
 ### 7.2 Types
 
 ```go
-type LogEntry struct {
-    Labels         logqlparser.LabelSet
-    LogAttrs       map[string]string
-    Line           string
-    TimestampNanos uint64
+type LogAttrs struct {
+    Names  []string
+    Values []string
 }
 
-type LogEntryCallback func(entry *LogEntry) bool
+type LogEntry struct {
+    LokiLabels     string
+    Line           string
+    LogAttrs       LogAttrs
+    TimestampNanos uint64
+}
 ```
 
-`LogAttrs` holds `log.*` `ColumnTypeString` column values keyed by their full column name
-(e.g. `"log.detected_level"`). These are original LogRecord attributes, distinct from
-body-auto-parsed fields (`ColumnTypeRangeString`). `LogAttrs` is nil when no such columns
-are present. Callers (e.g. `logEntryFields`) must emit these with the `"log."` prefix intact
-so that downstream SM extraction can identify them by prefix.
+`LokiLabels` holds the raw value of the `resource.__loki_labels__` column for the row
+(e.g. `{service_name="api", env="prod"}`). `LogAttrs` holds `log.*` `ColumnTypeString`
+column values as parallel `Names`/`Values` slices (e.g. `Names=["log.detected_level"]`,
+`Values=["info"]`). These are original LogRecord attributes, distinct from body-auto-parsed
+fields (`ColumnTypeRangeString`). Both slices are nil when no such columns are present.
+Callers (e.g. `logEntryFields`) must emit these with the `"log."` prefix intact so that
+downstream SM extraction can identify them by prefix.
 
 ### 7.3 Invariants
 
-- **SPEC-SL-1:** Nil reader returns nil error; `fn` is never called.
+- **SPEC-SL-1:** Nil reader returns nil, nil; result is empty.
 - **SPEC-SL-2:** Nil pipeline is valid; rows are delivered without pipeline transformation.
-- **SPEC-SL-3:** Labels are built lazily from `resource.*` and `log.*` columns with prefixes
-  stripped. On the pre-parsed block path, a `blockLabelSet` backed by block columns is
-  used — no map allocation until `Materialize()` is called.
-  `resource.service.name` → label key `service.name`; `log.level` → label key `level`.
-  Callers that need a `map[string]string` call `Labels.Materialize()`. This must be done
-  inside the `LogEntryCallback` — the `LabelSet` backing is released to the pool after
-  the callback returns.
-- **SPEC-SL-4:** Returning `false` from `fn` stops iteration; no further blocks are read.
-- **SPEC-SL-5:** `Pipeline.Process` is called per matched row; it may mutate the `LabelSet`.
-  The `LabelSet` passed to the pipeline is backed by block columns on the hot path.
+- **SPEC-SL-3:** `LokiLabels` holds the value of `resource.__loki_labels__` for the row.
+  This is the only resource-label field returned; building a full `map[string]string` per
+  row was wasteful because consumers only ever read this one key.
+- **SPEC-SL-4:** `Pipeline.Process` is called per matched row; it may drop or modify the row.
+- **SPEC-SL-5:** `Pipeline.Process` is called per matched row; it may mutate labels in-place.
 
 Back-ref: `internal/modules/executor/stream_log.go:StreamLogs`
 
 ---
 
-## 8. StreamLogsTopK
+## 8. CollectLogs
 
 ### 8.1 Signature
 
 ```go
-func StreamLogsTopK(
+func CollectLogs(
     r *modules_reader.Reader,
     program *vm.Program,
     pipeline *logqlparser.Pipeline,
-    opts StreamOptions,
-    fn LogEntryCallback,
-) error
+    opts CollectOptions,
+) ([]LogEntry, error)
 ```
 
 ### 8.2 Behaviour
 
-StreamLogsTopK collects the globally top `opts.Limit` log rows by per-row timestamp,
-applying the pipeline per row before inserting into the heap. Results are delivered via
-`fn` in sort order after the full scan completes. When `opts.Limit == 0`, all
-pipeline-passing rows are collected, sorted, and delivered.
+CollectLogs collects the globally top `opts.Limit` log rows by per-row timestamp,
+applying the pipeline per row before inserting into the heap. Results are returned as a
+`[]LogEntry` slice in sort order after the full scan completes. When `opts.Limit == 0`, all
+pipeline-passing rows are collected, sorted, and returned.
 
-This is the primary log streaming entry point for `api.go`'s pipeline path.
+This is the primary log collection entry point for `api.go`'s pipeline path.
 
 ### 8.3 Invariants
 
 - **SPEC-SLK-1:** The heap stores `LogEntry` by value (post-pipeline) not block/row references.
-  Value storage eliminates per-row heap allocation (see `logTopKEntry` struct comment).
-  The pipeline may mutate labels in-place; results must be captured at scan time.
+  Value storage eliminates per-row heap allocation. The pipeline may mutate labels in-place;
+  results must be captured at scan time.
 - **SPEC-SLK-2:** Block-level pruning: once the heap is full, blocks whose timestamp
   range cannot improve the heap root are skipped (no I/O, no parsing). For Backward:
   blocks with `MaxStart <= heap.root.ts` are skipped. For Forward: blocks with
@@ -421,12 +412,12 @@ This is the primary log streaming entry point for `api.go`'s pipeline path.
 - **SPEC-SLK-4:** Per-row time filtering is applied before the pipeline (fast path: no
   allocation for rows outside the time window). Nil pipeline is valid; rows pass through
   without transformation.
-- **SPEC-SLK-5:** Results are delivered in sort order after the full scan completes (not
+- **SPEC-SLK-5:** Results are returned in sort order after the full scan completes (not
   lazily). Backward: newest first. Forward: oldest first.
 - **SPEC-SLK-6:** `OnStats` is deferred; `FetchedBlocks` reflects actual I/O at the time
   execution completes. `FetchedBlocks` counts per-group, not per-block.
 
-Back-ref: `internal/modules/executor/stream_log_topk.go:StreamLogsTopK`
+Back-ref: `internal/modules/executor/stream_log_topk.go:CollectLogs`
 
 ---
 
@@ -579,8 +570,8 @@ type StructuralResult struct {
     Matches []SpanMatch
 }
 
-func (e *Executor) ExecuteStructural(
-    r *reader.Reader,
+func ExecuteStructural(
+    r *modules_reader.Reader,
     q *traceqlparser.StructuralQuery,
     opts Options,
 ) (*StructuralResult, error)
@@ -589,7 +580,7 @@ func (e *Executor) ExecuteStructural(
 ### 11.1 Overview
 
 `ExecuteStructural` executes a TraceQL structural query (e.g. `{ A } >> { B }`) against a
-modules blockpack Reader. It is the counterpart to `Execute` for structural operators.
+modules blockpack Reader. It is the counterpart to `Collect` for structural operators.
 
 ### 11.2 Three-Phase Algorithm
 

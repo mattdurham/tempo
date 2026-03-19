@@ -96,3 +96,25 @@ is safe. The NOTE invariant comment on the field is the signal to check.
 
 Back-ref: `internal/vm/vm.go:MergeAggregationResults`,
 `internal/vm/vm.go:GroupKey`
+
+---
+
+## NOTE-046: AggBucket.Merge First-Merge Detection Fix
+*Added: 2026-03-18*
+
+**Decision:** `AggBucket.Merge` captures `origCount := b.Count` before mutating `b.Count`, then uses `origCount == 0` to detect the first merge.
+
+**Rationale:** The original code mutated `b.Count += other.Count` and then checked `b.Count == other.Count` to detect "first merge" (i.e., receiver was empty). This was accidentally correct — if `b.Count` was 0 before the merge, the resulting check `0+other.Count == other.Count` was always true — but it is misleading because the semantics are unclear. The expression mixes a post-mutation value with a pre-mutation comparand in a non-obvious way. Capturing `origCount` before mutation makes the intent explicit: `origCount == 0` means "receiver had no samples before this merge." This is simpler to read and unambiguous under all inputs.
+
+Back-ref: `internal/vm/vm.go:AggBucket.Merge`
+
+---
+
+## NOTE-047: DateBinInfo Removed — Unused Exported Type
+*Added: 2026-03-18*
+
+**Decision:** `DateBinInfo` was removed from `internal/vm/vm.go`.
+
+**Rationale:** `DateBinInfo` was an exported struct that was never referenced outside of `vm.go` itself and was not anchored in `cmd/deadcode/main.go`. It was dead API surface — no callers exist in the codebase. Removing it shrinks the public surface of the `vm` package and eliminates a maintenance burden with no benefit.
+
+**If date-binning logic is needed in future:** Re-introduce a struct at that time with a concrete use case. Do not restore `DateBinInfo` as-is — the original design was never used.

@@ -20,7 +20,7 @@ func ParseTraceQL(query string) (interface{}, error) {
 	}
 
 	// Check if this is a metrics query (has pipe operator outside braces)
-	if hasPipeOutsideBraces(query) {
+	if findPipeOutsideBraces(query) >= 0 {
 		return parseMetricsQuery(query)
 	}
 
@@ -33,101 +33,27 @@ func ParseTraceQL(query string) (interface{}, error) {
 	return parseFilterExpression(query)
 }
 
-// hasPipeOutsideBraces checks if the query has a pipe operator outside of braces
-// This distinguishes metrics queries ({ filter } | aggregate) from filter queries with || operator
-func hasPipeOutsideBraces(query string) bool {
-	braceDepth := 0
-	for i := 0; i < len(query); i++ {
-		ch := query[i]
-		if ch == '{' {
-			braceDepth++
-		} else if ch == '}' {
-			braceDepth--
-		} else if ch == '|' && braceDepth == 0 {
-			// Check if this is a single pipe (not ||)
-			// Look ahead to see if next char is also |
-			if i+1 < len(query) && query[i+1] == '|' {
-				// This is ||, skip the next |
-				i++
-				continue
-			}
-			// Look back to see if previous char was also |
-			if i > 0 && query[i-1] == '|' {
-				// Already handled as part of ||
-				continue
-			}
-			// Single pipe outside braces - this is a metrics query
-			return true
-		}
+// skipWSBack returns the index of the last non-whitespace character at or before pos.
+func skipWSBack(s string, pos int) int {
+	for pos >= 0 && (s[pos] == ' ' || s[pos] == '\t' || s[pos] == '\n' || s[pos] == '\r') {
+		pos--
 	}
-	return false
+	return pos
 }
 
-// hasStructuralOperator checks if the query has a structural operator outside of braces
-// Structural operators: >>, >, ~, <<, <, !~
-// Note: > and < are also comparison operators, so we need to be careful
-// We only consider them structural if they appear between { } blocks
-func hasStructuralOperator(query string) bool {
-	braceDepth := 0
-	parenDepth := 0
-	i := 0
-	for i < len(query) {
-		ch := query[i]
-		if ch == '{' {
-			braceDepth++
-		} else if ch == '}' {
-			braceDepth--
-		} else if ch == '(' {
-			parenDepth++
-		} else if ch == ')' {
-			parenDepth--
-		} else if braceDepth == 0 && parenDepth == 0 {
-			// We're outside braces and parens, check for structural operators
-			// Check for two-character operators first
-			// Check for three-character operators first: !>>
-			if i+2 < len(query) {
-				threeChar := query[i : i+3]
-				if threeChar == opStrNotDescendant {
-					return true
-				}
-			}
-			if i+1 < len(query) {
-				twoChar := query[i : i+2]
-				if twoChar == ">>" || twoChar == "<<" || twoChar == "!~" || twoChar == "!>" {
-					return true
-				}
-			}
-			// Check for single-character structural operators
-			// These are only structural if they appear between two { } blocks
-			if (ch == '>' || ch == '<' || ch == '~') && i > 0 {
-				// Look back to see if there's a } before this
-				j := i - 1
-				for j >= 0 && (query[j] == ' ' || query[j] == '\t' || query[j] == '\n') {
-					j--
-				}
-				if j >= 0 && query[j] == '}' {
-					// Look ahead to see if there's a { after this
-					k := i + 1
-					// Skip the second character if it's part of a two-char operator
-					if ch == '>' && k < len(query) && query[k] == '>' {
-						k++
-					} else if ch == '<' && k < len(query) && query[k] == '<' {
-						k++
-					} else if ch == '!' && k < len(query) && query[k] == '~' {
-						k++
-					}
-					for k < len(query) && (query[k] == ' ' || query[k] == '\t' || query[k] == '\n') {
-						k++
-					}
-					if k < len(query) && query[k] == '{' {
-						return true
-					}
-				}
-			}
-		}
-		i++
+// skipWSFwd returns the index of the first non-whitespace character at or after pos.
+func skipWSFwd(s string, pos int) int {
+	for pos < len(s) && (s[pos] == ' ' || s[pos] == '\t' || s[pos] == '\n' || s[pos] == '\r') {
+		pos++
 	}
-	return false
+	return pos
+}
+
+// hasStructuralOperator checks if the query has a structural operator outside of braces.
+// Structural operators: >>, >, ~, <<, <, !~
+func hasStructuralOperator(query string) bool {
+	pos, _ := findStructuralOperator(query)
+	return pos >= 0
 }
 
 // findStructuralOperator finds the position of a structural operator outside of braces
@@ -164,16 +90,10 @@ func findStructuralOperator(query string) (int, string) {
 			// Check for single-character operators between { } blocks
 			if (ch == '>' || ch == '<' || ch == '~') && i > 0 {
 				// Look back for }
-				j := i - 1
-				for j >= 0 && (query[j] == ' ' || query[j] == '\t' || query[j] == '\n') {
-					j--
-				}
+				j := skipWSBack(query, i-1)
 				if j >= 0 && query[j] == '}' {
 					// Look ahead for {
-					k := i + 1
-					for k < len(query) && (query[k] == ' ' || query[k] == '\t' || query[k] == '\n') {
-						k++
-					}
+					k := skipWSFwd(query, i+1)
 					if k < len(query) && query[k] == '{' {
 						return i, string(ch)
 					}
@@ -584,7 +504,7 @@ func findByClause(input string) int {
 			// Check if we're at " by " (with spaces before and after)
 			if i > 0 && input[i] == 'b' && i+2 < len(input) && input[i:i+3] == "by " {
 				// Check if there's whitespace before "by"
-				if input[i-1] == ' ' || input[i-1] == '\t' {
+				if input[i-1] == ' ' || input[i-1] == '\t' || input[i-1] == '\n' || input[i-1] == '\r' {
 					return i - 1 // Return position of space before "by"
 				}
 			}

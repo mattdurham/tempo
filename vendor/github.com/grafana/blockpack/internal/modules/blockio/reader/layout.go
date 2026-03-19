@@ -4,10 +4,11 @@ package reader
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/binary"
 	"fmt"
 	"io"
-	"sort"
+	"slices"
 	"sync"
 	"time"
 
@@ -211,8 +212,8 @@ func (r *Reader) FileLayout() (*FileLayoutReport, error) {
 		}
 	}
 
-	sort.Slice(sections, func(i, j int) bool {
-		return sections[i].Offset < sections[j].Offset
+	slices.SortFunc(sections, func(a, b FileLayoutSection) int {
+		return cmp.Compare(a.Offset, b.Offset)
 	})
 
 	rangeIndex := r.buildRangeIndex()
@@ -277,7 +278,7 @@ func (r *Reader) buildSketchIndexInfo() *SketchIndexInfo {
 		info.SketchedBlockCount++
 
 		// Sort by column name for deterministic output.
-		sort.Slice(cols, func(i, j int) bool { return cols[i].name < cols[j].name })
+		slices.SortFunc(cols, func(a, b blockColStat) int { return cmp.Compare(a.name, b.name) })
 
 		stats := make([]ColumnSketchStat, 0, len(cols))
 		for _, c := range cols {
@@ -357,7 +358,7 @@ func (r *Reader) buildRangeIndex() []RangeIndexColumn {
 		cols = append(cols, col)
 	}
 
-	sort.Slice(cols, func(i, j int) bool { return cols[i].ColumnName < cols[j].ColumnName })
+	slices.SortFunc(cols, func(a, b RangeIndexColumn) int { return cmp.Compare(a.ColumnName, b.ColumnName) })
 
 	return cols
 }

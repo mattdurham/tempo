@@ -110,7 +110,7 @@ Query: `{ resource.service.name = "svc-a" && span.http.method = "GET" }`.
 
 ## Coverage Requirements
 
-- All public functions (`New`, `Execute`, `Stream`) must be exercised.
+- All public entry points must be exercised: `Collect`, `ExecuteStructural`, `StreamLogs`, `CollectLogs`, `ExecuteLogMetrics`, `ExecuteTraceMetrics`.
 - Both the empty-file short-circuit and the multi-block scan path must be covered.
 - The `Options.Limit` early-exit path must be exercised (EX-08).
 - `SpanMatch` field population must be verified (EX-09).
@@ -225,7 +225,7 @@ Query: `{ resource.service.name =~ "(?i)DEBUG.*" }`.
 
 ---
 
-## EX-17: TestBuildPredicates_LogRegexCommonPrefix
+## EX-19: TestBuildPredicates_LogRegexCommonPrefix
 
 **Scenario:** Case-sensitive alternation whose values share a common prefix produces
 point-lookup predicates for each literal alternative. NOTE-024.
@@ -295,7 +295,7 @@ Query: `{ resource.service.name =~ "cluster-0|cluster-1" }`.
 
 **Scenario:** Nil reader returns nil without calling callback.
 
-**Setup:** call `Stream(nil, program, StreamOptions{}, callback)`.
+**Setup:** call `Collect(nil, program, CollectOptions{})`.
 
 **Assertions:** error is nil; callback is never invoked.
 
@@ -353,7 +353,7 @@ Query: `{ resource.service.name =~ "cluster-0|cluster-1" }`.
 
 ## StreamLogsTopK Tests (stream_log_topk_test.go)
 
-### EX-SLK-01: TestStreamLogsTopK_BasicTopK
+### EX-SLK-01: TestStreamLogsTopK_GlobalOrder_Backward
 
 **Scenario:** Top-K by timestamp returns the globally correct K entries.
 
@@ -364,7 +364,7 @@ Query: `{ resource.service.name =~ "cluster-0|cluster-1" }`.
 
 ---
 
-### EX-SLK-02: TestStreamLogsTopK_PipelineFiltering
+### EX-SLK-02: TestStreamLogsTopK_PipelineFilters
 
 **Scenario:** Pipeline dropping rows reduces the heap candidates.
 
@@ -396,7 +396,7 @@ confirms block 0 was skipped because its MaxStart cannot improve the full heap.
 
 ---
 
-### EX-SLK-05: TestStreamLogsTopK_UnlimitedCollectAll
+### EX-SLK-05: TestStreamLogsTopK_LimitZeroDeliversAll
 
 **Scenario:** `opts.Limit == 0` delivers all pipeline-passing rows sorted.
 
@@ -418,13 +418,12 @@ confirms block 0 was skipped because its MaxStart cannot improve the full heap.
 
 **Scenario:** Nil pipeline passes all rows through without transformation.
 
-**Setup:** 3 records. No pipeline.
-
-**Assertions:** all 3 entries delivered.
+**Note:** No separate test function. Covered by `TestStreamLogsTopK_LimitZeroDeliversAll`
+(limit=0, no pipeline, all rows delivered).
 
 ---
 
-### EX-SLK-08: TestStreamLogsTopK_DirectionForward
+### EX-SLK-08: TestStreamLogsTopK_GlobalOrder_Forward
 
 **Scenario:** Forward direction delivers oldest K entries in ascending order.
 
@@ -544,7 +543,7 @@ pipeline `| logfmt | unwrap duration`.
 
 ---
 
-## EX-18: TestExtractLiteralAlternatives
+## EX-20: TestExtractLiteralAlternatives
 
 **Scenario:** `extractLiteralAlternatives` correctly classifies patterns.
 
@@ -568,6 +567,20 @@ pipeline `| logfmt | unwrap duration`.
 
 **Assertions:** Return value equals expected for each case; single-literal case returns
 a one-element slice (not nil) so the `len(lits) > 1` guard keeps it on the interval path.
+
+---
+
+## EX-21: TestBuildPredicates_LogRegexCaseInsensitiveAlternation
+
+**Scenario:** Case-insensitive alternation (`(?i)(error|warn)`) falls back to bloom-only
+predicate because each alternative requires a separate interval. NOTE-011.
+
+**Setup:** 1 log record with `resource.service.name = "my-service"`.
+Query: `{ resource.service.name =~ "(?i)(error|warn)" }`.
+
+**Assertions:** Predicate for `resource.service.name` has `IntervalMatch: false` and
+empty `Values` (bloom-only; no point lookups or interval bounds emitted for multi-prefix
+case-insensitive alternations).
 
 ---
 

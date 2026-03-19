@@ -5,6 +5,7 @@ package reader
 import (
 	"encoding/binary"
 	"fmt"
+	"slices"
 	"sort"
 
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
@@ -106,6 +107,6 @@ func (r *Reader) BlocksInTimeRange(minNano, maxNano uint64) []int {
 			result = append(result, int(e.blockID)) //nolint:gosec // safe: blockID bounded by MaxBlocks fits int
 		}
 	}
-	sort.Ints(result)
+	slices.Sort(result)
 	return result
 }

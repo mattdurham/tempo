@@ -3,8 +3,9 @@ package writer
 // NOTE: Any changes to this file must be reflected in the corresponding specs.md or NOTES.md.
 
 import (
+	"cmp"
 	"encoding/binary"
-	"sort"
+	"slices"
 
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
 )
@@ -42,8 +43,8 @@ func writeTSIndexSection(metas []shared.BlockMeta) []byte {
 			blockID: uint32(i), //nolint:gosec // safe: i bounded by MaxBlocks (100_000) fits uint32
 		}
 	}
-	sort.Slice(entries, func(i, j int) bool {
-		return entries[i].minTS < entries[j].minTS
+	slices.SortFunc(entries, func(a, b tsIndexEntry) int {
+		return cmp.Compare(a.minTS, b.minTS)
 	})
 
 	// Header: magic[4] + version[1] + count[4] = 9 bytes.
