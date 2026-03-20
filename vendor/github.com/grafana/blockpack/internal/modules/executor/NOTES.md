@@ -1573,3 +1573,63 @@ Back-ref: `internal/modules/executor/stream.go:collectIntrinsicTopK`,
 (`intrinsic-topk-sort`) is retired by this note; the correct value is `intrinsic-topk-kll`
 for all non-scan small-M paths. The NOTE-043 bullet `"intrinsic-topk-sort" (Case B map path)`
 should be read as `"intrinsic-topk-kll" (Case B KLL path, M < SortScanThreshold)`.
+
+---
+
+## NOTE-045: collectIntrinsicPlain — Zero Block Reads via lookupIntrinsicFields (Case A)
+*Added: 2026-03-20*
+
+**Problem:** `collectIntrinsicPlain` (Case A: pure intrinsic + no sort) was calling
+`forEachBlockInGroups`, which reads the full compressed block payload and calls
+`ParseBlockFromBytes` for every candidate block. For a query like `{duration>100ms}`,
+pprof showed this path consumed 54% of total query time:
+
+```
+collectFromIntrinsicRefs:   24.93s (54.48%)
+collectIntrinsicPlain:      24.60s (53.76%)
+forEachBlockInGroups:       24.60s (53.76%)
+parseBlockColumnsReuse:     15.06s (32.91%)   ← full block decode
+decodeXORBytes:              6.54s (14.29%)
+decodeDeltaUint64:           5.76s (12.59%)
+```
+
+**Root cause:** The original code read and decoded full blocks to populate `MatchedRow.Block`,
+which the caller (`streamFilterProgram`) then used via `SpanFieldsAdapter` for field access.
+However, for any pure intrinsic query, all columns required by the caller are present in the
+intrinsic section:
+- `searchMetaCols` (8 columns: `trace:id`, `span:id`, `span:start`, `span:end`,
+  `span:duration`, `span:name`, `span:parent_id`, `resource.service.name`) are all in
+  `traceIntrinsicColumns`.
+- The predicate columns (`span:duration` for `{duration>100ms}`) are also intrinsic.
+- `ProgramIsIntrinsicOnly` already verified all `wantColumns` are intrinsic before
+  dispatching to Case A.
+
+**Fix:** Replace `forEachBlockInGroups` with `lookupIntrinsicFields(r, refs, secondPassCols)`,
+exactly the same approach already used by Case B (`collectIntrinsicTopK`). The refs are
+truncated to `opts.Limit` before field lookup to avoid unnecessary work. Each result is
+returned as `MatchedRow{IntrinsicFields: ..., BlockIdx: ..., RowIdx: ...}` with `Block: nil`.
+
+**Impact:**
+- Full block reads for Case A drop from O(uniqueBlocks) to zero.
+- `ParseBlockFromBytes`, `decodeXORBytes`, `decodeDeltaUint64` are eliminated from the
+  hot path for all pure intrinsic queries without timestamp sort.
+- Expected wall-clock improvement: ~54% of `streamFilterProgram` time eliminated for
+  `{duration>100ms}` and similar queries. The same applies to `{span:kind=server}`,
+  `{resource.service.name="foo"}`, `{span:status=error}`, and any combination of
+  intrinsic-only filters.
+
+**Correctness:**
+- `ProgramIsIntrinsicOnly` guarantees all predicate columns are in the intrinsic set.
+- `lookupIntrinsicFields` is called with `secondPassCols = searchMetaCols ∪ wantColumns`;
+  since both are subsets of the intrinsic column set for Case A, the resulting field maps
+  contain everything the caller needs.
+- The `IntrinsicFields` path in `streamFilterProgram` already handles `Block == nil`
+  correctly (introduced for Case B).
+
+**SPECS.md update:**
+The `MatchedRow.IntrinsicFields` doc comment previously stated "Case A reads candidate
+blocks and leaves IntrinsicFields nil" — updated to reflect that both Case A and Case B
+now return `IntrinsicFields` with zero block reads.
+
+Back-ref: `internal/modules/executor/stream.go:collectIntrinsicPlain`,
+          `internal/modules/executor/SPECS.md:MatchedRow`

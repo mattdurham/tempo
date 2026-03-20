@@ -116,10 +116,11 @@ If the relevant column is absent or the row is null, the field is left at its ze
 ```go
 type MatchedRow struct {
     Block           *modules_reader.Block
-    // IntrinsicFields is set when the result was produced by Case B (pure intrinsic +
-    // sort) without reading full block data. Case A (pure intrinsic, no sort) reads
-    // candidate blocks and leaves IntrinsicFields nil. The caller should use this
-    // for field lookups when Block is nil. Nil for all other code paths.
+    // IntrinsicFields is set when the result was produced by Case A (pure intrinsic,
+    // no sort) or Case B (pure intrinsic + sort), both of which resolve fields from
+    // the intrinsic section without reading full block data. Block is nil for these
+    // cases. The caller should use IntrinsicFields for field lookups when Block is nil.
+    // Nil for mixed and block-scan code paths.
     IntrinsicFields modules_shared.SpanFieldsProvider
     BlockIdx        int
     RowIdx          int

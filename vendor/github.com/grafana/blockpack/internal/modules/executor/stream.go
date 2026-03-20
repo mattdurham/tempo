@@ -622,7 +622,10 @@ func forEachBlockInGroups(
 }
 
 // collectIntrinsicPlain handles Case A: pure intrinsic + no sort.
-// Refs are exact matches from intrinsic data; fetch the candidate blocks and return rows.
+// NOTE-045: For pure intrinsic queries all columns needed by the caller
+// (searchMetaCols ∪ predicate columns) are present in the intrinsic section.
+// We use lookupIntrinsicFields to resolve fields without reading any full blocks —
+// zero block reads, same as Case B. Refs are sorted once for deterministic order.
 func collectIntrinsicPlain(
 	r *modules_reader.Reader,
 	refs []modules_shared.BlockRef,
@@ -632,7 +635,7 @@ func collectIntrinsicPlain(
 	stats *CollectStats,
 ) ([]MatchedRow, error) {
 	stats.ExecutionPath = "intrinsic-plain"
-	// Sort refs by BlockIdx for deterministic block traversal order.
+	// Sort refs by (BlockIdx, RowIdx) for deterministic traversal order.
 	slices.SortFunc(refs, blockRefCompare)
 
 	// Filter refs to shard's block range if sub-file sharding is active.
@@ -641,25 +644,25 @@ func collectIntrinsicPlain(
 		return nil, nil
 	}
 
-	blockOrder, blockRows := groupRefsByBlock(refs)
+	// Apply limit: truncate refs before field lookup to avoid unnecessary work.
+	if opts.Limit > 0 && len(refs) > opts.Limit {
+		refs = refs[:opts.Limit]
+	}
 
-	var results []MatchedRow
-	// Coalesce all candidate blocks for efficient batch I/O — same pattern as
-	// collectMixedPlain. Computing CoalescedGroups once across all blockOrder entries
-	// allows the reader to issue multi-block reads instead of one per block.
-	err := forEachBlockInGroups(r, blockOrder, blockRows, wantColumns, secondPassCols, "collectIntrinsicPlain",
-		func(pb parsedBlock, rowIdxs []int) error {
-			for _, rowIdx := range rowIdxs {
-				results = append(results, MatchedRow{Block: pb.Block, BlockIdx: pb.BlockIdx, RowIdx: rowIdx})
-				if opts.Limit > 0 && len(results) >= opts.Limit {
-					return errLimitReached
-				}
-			}
-			return nil
-		},
-	)
-	if err != nil && err != errLimitReached {
-		return nil, err
+	// NOTE-045: Resolve all needed fields from intrinsic columns — no full block reads.
+	// secondPassCols is searchMetaCols ∪ predicate columns; for pure intrinsic queries
+	// every column in that set is available in the intrinsic section, so lookupIntrinsicFields
+	// provides complete results. This eliminates the forEachBlockInGroups call that was
+	// previously responsible for 54% of query time on intrinsic-only queries like
+	// {duration>100ms}.
+	fieldMaps := lookupIntrinsicFields(r, refs, secondPassCols)
+	results := make([]MatchedRow, len(refs))
+	for i, ref := range refs {
+		results[i] = MatchedRow{
+			IntrinsicFields: &intrinsicFieldsProvider{fields: fieldMaps[i]},
+			BlockIdx:        int(ref.BlockIdx),
+			RowIdx:          int(ref.RowIdx),
+		}
 	}
 	return results, nil
 }
