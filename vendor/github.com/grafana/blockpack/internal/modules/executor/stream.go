@@ -624,7 +624,7 @@ func forEachBlockInGroups(
 // collectIntrinsicPlain handles Case A: pure intrinsic + no sort.
 // NOTE-045: For pure intrinsic queries all columns needed by the caller
 // (searchMetaCols ∪ predicate columns) are present in the intrinsic section.
-// We use lookupIntrinsicFields to resolve fields without reading any full blocks —
+// We use extractIntrinsicRefsDirect to resolve fields without reading any full blocks —
 // zero block reads, same as Case B. Refs are sorted once for deterministic order.
 func collectIntrinsicPlain(
 	r *modules_reader.Reader,
@@ -649,13 +649,15 @@ func collectIntrinsicPlain(
 		refs = refs[:opts.Limit]
 	}
 
-	// NOTE-045: Resolve all needed fields from intrinsic columns — no full block reads.
+	// NOTE-047: Use extractIntrinsicRefsDirect instead of lookupIntrinsicFields.
+	// For limit=20, refs has at most 20 entries, but lookupIntrinsicFields scans
+	// all N entries in each decoded IntrinsicColumn (N = total file spans, up to 1M).
+	// extractIntrinsicRefsDirect exits each column scan as soon as all M targets
+	// are matched, reducing work from O(N × cols) to O(N/hit_rate × cols) for the
+	// common case where targets cluster in early dict entries or flat refs.
 	// secondPassCols is searchMetaCols ∪ predicate columns; for pure intrinsic queries
-	// every column in that set is available in the intrinsic section, so lookupIntrinsicFields
-	// provides complete results. This eliminates the forEachBlockInGroups call that was
-	// previously responsible for 54% of query time on intrinsic-only queries like
-	// {duration>100ms}.
-	fieldMaps := lookupIntrinsicFields(r, refs, secondPassCols)
+	// every column in that set is available in the intrinsic section.
+	fieldMaps := extractIntrinsicRefsDirect(r, refs, secondPassCols)
 	results := make([]MatchedRow, len(refs))
 	for i, ref := range refs {
 		results[i] = MatchedRow{
@@ -665,6 +667,110 @@ func collectIntrinsicPlain(
 		}
 	}
 	return results, nil
+}
+
+// extractIntrinsicRefsDirect resolves field values for a small set of target refs
+// from intrinsic columns, exiting each column's ref scan as soon as all targets
+// have been matched. This is the optimised replacement for lookupIntrinsicFields
+// in collectIntrinsicPlain (Case A), where refs has already been truncated to
+// opts.Limit (typically 20).
+//
+// Unlike lookupIntrinsicFields (which always scans all N refs in each decoded
+// column), this function maintains a remaining-targets counter and breaks out of
+// the inner scan loop once all M targets are found. For a file with 1M spans and
+// M=20 targets, this reduces inner-loop iterations from O(N) to O(found_at), where
+// found_at is the position in the column's ref list where the last target appears.
+//
+// NOTE-047: keepalive for lookupIntrinsicFields — it is still used by collectIntrinsicTopK
+// (Case B), where the full column scan is required to build the timestamp map.
+func extractIntrinsicRefsDirect(r *modules_reader.Reader, selected []modules_shared.BlockRef, wantCols map[string]struct{}) []map[string]any {
+	// Build a sorted index of target packed keys for O(log M) binary search per ref.
+	// selected is already sorted by blockRefCompare in collectIntrinsicPlain, so
+	// the sort below is a no-op in practice.
+	type keyIdx struct {
+		key uint32
+		idx int
+	}
+	m := len(selected)
+	index := make([]keyIdx, m)
+	for i, ref := range selected {
+		index[i] = keyIdx{key: uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx), idx: i}
+	}
+	slices.SortFunc(index, func(a, b keyIdx) int { return cmp.Compare(a.key, b.key) })
+
+	searchIndex := func(key uint32) int {
+		pos, found := slices.BinarySearchFunc(index, key, func(e keyIdx, k uint32) int {
+			return cmp.Compare(e.key, k)
+		})
+		if !found {
+			return -1
+		}
+		return index[pos].idx
+	}
+
+	result := make([]map[string]any, m)
+	for i := range result {
+		result[i] = make(map[string]any, 12)
+	}
+
+	for _, colName := range r.IntrinsicColumnNames() {
+		if wantCols != nil {
+			if _, needed := wantCols[colName]; !needed {
+				continue
+			}
+		}
+		col, err := r.GetIntrinsicColumn(colName)
+		if err != nil || col == nil {
+			continue
+		}
+		// remaining tracks how many of the M targets still need a value for this column.
+		// Once it reaches 0 we stop scanning — all targets have been matched.
+		remaining := m
+		switch col.Format {
+		case modules_shared.IntrinsicFormatDict:
+			for _, entry := range col.DictEntries {
+				if remaining == 0 {
+					break
+				}
+				var val any
+				if entry.Value != "" {
+					val = entry.Value
+				} else {
+					val = entry.Int64Val
+				}
+				for _, ref := range entry.BlockRefs {
+					key := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx)
+					if idx := searchIndex(key); idx >= 0 {
+						if _, already := result[idx][colName]; !already {
+							result[idx][colName] = val
+							remaining--
+							if remaining == 0 {
+								break
+							}
+						}
+					}
+				}
+			}
+		case modules_shared.IntrinsicFormatFlat:
+			for i, ref := range col.BlockRefs {
+				if remaining == 0 {
+					break
+				}
+				key := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx)
+				if idx := searchIndex(key); idx >= 0 {
+					if _, already := result[idx][colName]; !already {
+						if len(col.Uint64Values) > i {
+							result[idx][colName] = col.Uint64Values[i]
+						} else if len(col.BytesValues) > i {
+							result[idx][colName] = col.BytesValues[i]
+						}
+						remaining--
+					}
+				}
+			}
+		}
+	}
+	return result
 }
 
 // collectIntrinsicTopK handles Case B: pure intrinsic + timestamp sort.
