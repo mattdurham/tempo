@@ -50,13 +50,12 @@ func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.Blo
 		}
 
 		id, tr, nextErr := i.Next(ctx)
-		if nextErr == io.EOF {
+		if nextErr == io.EOF || (tr == nil && nextErr == nil) {
 			break
 		}
 		if nextErr != nil {
 			return nil, fmt.Errorf("failed to read from iterator: %w", nextErr)
 		}
-
 		if tr == nil {
 			continue
 		}
