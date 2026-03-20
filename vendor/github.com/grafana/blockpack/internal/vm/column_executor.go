@@ -20,6 +20,11 @@ type ColumnDataProvider interface {
 
 	// Bulk column scans - return row sets
 	ScanEqual(column string, value any) (RowSet, error)
+	// ScanEqualAny scans a single column for any of the given values in one pass.
+	// It is equivalent to unioning N ScanEqual calls but avoids repeating the full
+	// column scan for each value (dict fast-path for string columns: O(dict+spans)
+	// instead of N×O(spans)).
+	ScanEqualAny(column string, values []any) (RowSet, error)
 	ScanNotEqual(column string, value any) (RowSet, error)
 	ScanLessThan(column string, value any) (RowSet, error)
 	ScanLessThanOrEqual(column string, value any) (RowSet, error)

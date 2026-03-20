@@ -273,7 +273,19 @@ func (c *traceqlCompiler) compileColumnPredicateBinary(expr *traceqlparser.Binar
 		}, nil
 
 	case traceqlparser.OpOr:
-		// OR: union left and right results
+		// OR single-pass optimisation: when all arms of the OR tree are equality
+		// comparisons against the same column (e.g. svc="A" || svc="B" || svc="C"),
+		// compile to a single ScanEqualAny call instead of N separate ScanEqual calls.
+		// This avoids re-scanning the column once per value; the implementation uses
+		// a dict-level bool mask for string columns (O(dict+spans) vs N×O(spans)).
+		if field, values := gatherOrEqualAny(expr); field != nil {
+			attrName := normalizeAttributePath(field.Scope, field.Name)
+			vals := values // capture for closure
+			return unscopedOrScoped(field, attrName, func(p ColumnDataProvider, name string) (RowSet, error) {
+				return p.ScanEqualAny(name, vals)
+			}), nil
+		}
+		// General OR: union left and right results
 		leftPred, err := c.compileColumnPredicateExpr(expr.Left)
 		if err != nil {
 			return nil, err
@@ -467,6 +479,85 @@ func scanColumnRegexFast(
 		return provider.ScanRegexNotMatchFast(col, re, prefixes)
 	}
 	return provider.ScanRegexFast(col, re, prefixes)
+}
+
+// gatherOrEqualAny walks an OR expression tree and returns the common FieldExpr and the
+// list of converted scan values if — and only if — every leaf is an equality comparison
+// against the same (Scope, Name) field. Returns (nil, nil) for any other pattern.
+//
+// Examples that match:
+//
+//	svc="grafana" || svc="loki"
+//	resource.service.name="A" || resource.service.name="B" || resource.service.name="C"
+//
+// Examples that do NOT match (fall through to the general OR path):
+//
+//	svc="A" || span.http.method="GET"   (different fields)
+//	svc="A" || svc=~"loki.*"           (non-equality operator)
+func gatherOrEqualAny(expr traceqlparser.Expr) (*traceqlparser.FieldExpr, []any) {
+	var commonField *traceqlparser.FieldExpr
+	var values []any
+
+	var walk func(e traceqlparser.Expr) bool
+	walk = func(e traceqlparser.Expr) bool {
+		bin, ok := e.(*traceqlparser.BinaryExpr)
+		if !ok {
+			return false
+		}
+		if bin.Op == traceqlparser.OpOr {
+			return walk(bin.Left) && walk(bin.Right)
+		}
+		if bin.Op != traceqlparser.OpEq {
+			return false
+		}
+		field, ok := bin.Left.(*traceqlparser.FieldExpr)
+		if !ok {
+			return false
+		}
+		lit, ok := bin.Right.(*traceqlparser.LiteralExpr)
+		if !ok {
+			return false
+		}
+		if commonField == nil {
+			commonField = field
+		} else if field.Scope != commonField.Scope || field.Name != commonField.Name {
+			return false // different field — cannot merge
+		}
+		v := convertLiteralToScanValue(normalizeAttributePath(field.Scope, field.Name), lit)
+		values = append(values, v)
+		return true
+	}
+
+	if !walk(expr) {
+		return nil, nil
+	}
+	if len(values) < 2 {
+		// Single value: no benefit over the regular ScanEqual path.
+		return nil, nil
+	}
+	return commonField, values
+}
+
+// convertLiteralToScanValue applies the same value conversions as
+// compileColumnPredicateComparison does before calling ScanEqual:
+// hex decoding for trace:id / span:id, and type conversion for
+// non-string literals (duration, status, kind, …).
+func convertLiteralToScanValue(attrName string, lit *traceqlparser.LiteralExpr) any {
+	value := lit.Value
+	if isHexBytesAttribute(attrName) {
+		if hexStr, ok := value.(string); ok {
+			if decoded, err := hex.DecodeString(hexStr); err == nil {
+				return decoded
+			}
+		}
+		return value
+	}
+	if lit.Type != traceqlparser.LitString {
+		if converted, ok := convertTraceQLLiteralToValue(lit); ok {
+			return converted.Data
+		}
+	}
+	return value
 }
 
 // isHexBytesAttribute checks if an attribute stores hex-encoded bytes (trace:id, span:id)
