@@ -112,6 +112,35 @@ func (b *blockLabelSet) Has(key string) bool {
 	return col != nil && col.IsPresent(b.rowIdx)
 }
 
+// HasLive reports whether key has a live (immediately accessible) value.
+// Returns true if the key is in the overlay (not deleted) OR if the backing block
+// column is decoded (IsDecoded()==true) and present at this row.
+// Undecoded block columns (lazily registered, rawEncoding != nil) return false —
+// the column exists in storage but its value is not yet accessible without a
+// full zstd decode. See NOTE-SL-016 and SPEC-001a.
+func (b *blockLabelSet) HasLive(key string) bool {
+	// Deleted keys are not live.
+	if b.deleted != nil && b.deleted[key] {
+		return false
+	}
+	// Overlay values are always live.
+	if b.overlay != nil {
+		if _, ok := b.overlay[key]; ok {
+			return true
+		}
+	}
+	// Check block column: live only if decoded.
+	if b.block == nil {
+		return false
+	}
+	idx, ok := b.colMap[key]
+	if !ok {
+		return false
+	}
+	col := b.colCols[idx]
+	return col != nil && col.IsDecoded() && col.IsPresent(b.rowIdx)
+}
+
 // Set adds or overwrites key in the overlay.
 func (b *blockLabelSet) Set(key, val string) {
 	if b.overlay == nil {
@@ -132,6 +161,25 @@ func (b *blockLabelSet) Delete(key string) {
 	b.deleted[key] = true
 	if b.overlay != nil {
 		delete(b.overlay, key)
+	}
+}
+
+// HideBodyParsedColumns implements logqlparser.LabelSet. It marks all log.*
+// ingest-time column keys as deleted so that Get() returns "" for them unless
+// a pipeline stage explicitly sets the value via Set(). Called by LogfmtStage
+// and JSONStage before parsing the body so that ingest-time last-wins column
+// values cannot shadow body-re-parsed first-wins values. Set() un-deletes a
+// key when the stage writes to it, so the parsed result takes precedence.
+func (b *blockLabelSet) HideBodyParsedColumns() {
+	for _, name := range b.colNames {
+		labelName, ok := strings.CutPrefix(name, "log.")
+		if !ok {
+			continue
+		}
+		if b.deleted == nil {
+			b.deleted = make(map[string]bool, len(b.colNames))
+		}
+		b.deleted[labelName] = true
 	}
 }
 

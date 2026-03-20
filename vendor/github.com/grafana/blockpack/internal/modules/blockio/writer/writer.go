@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 
 	"github.com/golang/snappy"
+	"github.com/grafana/tempo/pkg/tempopb"
 	logsv1 "go.opentelemetry.io/proto/otlp/logs/v1"
 	tracev1 "go.opentelemetry.io/proto/otlp/trace/v1"
 
@@ -66,6 +67,11 @@ type Writer struct {
 	// This clearing is the key RSS fix: without it, protoRoots accumulates for the entire
 	// WAL block lifetime, causing 3× RSS vs. parquet.
 	protoRoots []*tracev1.TracesData
+
+	// tempoProtoRoots anchors *tempopb.Trace protos for the Tempo-native ingest path.
+	// Cleared after flushBlocks() processes all pending spans referencing them.
+	// Mirrors protoRoots for the AddTempoTrace path.
+	tempoProtoRoots []*tempopb.Trace
 
 	// pendingLogs holds lightweight log records awaiting the next flushLogBlocks call.
 	// Parallel to w.pending (trace path). Protected by the same inUse guard.
@@ -197,6 +203,8 @@ func (w *Writer) AddSpan(
 // it avoids synthesizing a wrapper proto. Use AddSpan when building spans
 // individually or from non-proto sources (maps, structs).
 // Panics if called concurrently (NOTES §9).
+//
+//nolint:dupl // intentional mirror of AddTempoTrace for OTLP types; different proto types prevent sharing
 func (w *Writer) AddTracesData(td *tracev1.TracesData) error {
 	if td == nil {
 		return nil
@@ -244,6 +252,67 @@ func (w *Writer) AddTracesData(td *tracev1.TracesData) error {
 				w.pending = append(w.pending, ps)
 
 				// Auto-flush when buffer reaches MaxBufferedSpans.
+				if w.cfg.MaxBufferedSpans > 0 && len(w.pending) >= w.cfg.MaxBufferedSpans {
+					if flushErr := w.flushBlocks(); flushErr != nil {
+						return fmt.Errorf("writer: auto-flush: %w", flushErr)
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// AddTempoTrace buffers all spans from a Tempo-native *tempopb.Trace message.
+// Use this when consuming data directly from Tempo's storage layer to avoid
+// the round-trip conversion through OTLP types.
+// Panics if called concurrently (NOTES §9).
+//
+//nolint:dupl // intentional mirror of AddTracesData for Tempo-native types; different proto types prevent sharing
+func (w *Writer) AddTempoTrace(trace *tempopb.Trace) error {
+	if trace == nil {
+		return nil
+	}
+	if !w.inUse.CompareAndSwap(false, true) {
+		panic("writer: concurrent use detected")
+	}
+	defer w.inUse.Store(false)
+
+	if w.signalType == shared.SignalTypeLog {
+		return fmt.Errorf("writer: cannot mix trace and log records in the same Writer")
+	}
+	w.signalType = shared.SignalTypeTrace
+	w.tempoProtoRoots = append(w.tempoProtoRoots, trace)
+
+	for _, rs := range trace.ResourceSpans {
+		if rs == nil {
+			continue
+		}
+		svcName := extractSvcNameFromTempoProto(rs.Resource)
+		for _, ss := range rs.ScopeSpans {
+			if ss == nil {
+				continue
+			}
+			for _, span := range ss.Spans {
+				if span == nil {
+					continue
+				}
+
+				var tid [16]byte
+				if len(span.TraceId) == 16 {
+					copy(tid[:], span.TraceId)
+				}
+
+				ps := pendingSpan{
+					traceID:   tid,
+					svcName:   svcName,
+					tempoRS:   rs,
+					tempoSS:   ss,
+					tempoSpan: span,
+				}
+				computeMinHashSigFromTempoProto(&ps)
+				w.pending = append(w.pending, ps)
+
 				if w.cfg.MaxBufferedSpans > 0 && len(w.pending) >= w.cfg.MaxBufferedSpans {
 					if flushErr := w.flushBlocks(); flushErr != nil {
 						return fmt.Errorf("writer: auto-flush: %w", flushErr)
@@ -403,9 +472,11 @@ func (w *Writer) Flush() (int64, error) {
 	for k := range w.traceIndex {
 		delete(w.traceIndex, k)
 	}
-	// protoRoots is already cleared by flushBlocks(); this is a defensive no-op.
+	// protoRoots and tempoProtoRoots are already cleared by flushBlocks(); these are defensive no-ops.
 	clear(w.protoRoots)
 	w.protoRoots = w.protoRoots[:0]
+	clear(w.tempoProtoRoots)
+	w.tempoProtoRoots = w.tempoProtoRoots[:0]
 
 	// Reset log state (parallel to trace state reset above).
 	w.pendingLogs = w.pendingLogs[:0]
@@ -640,6 +711,8 @@ func (w *Writer) flushBlocks() error {
 			w.pending = w.pending[:0]
 			clear(w.protoRoots)
 			w.protoRoots = w.protoRoots[:0]
+			clear(w.tempoProtoRoots)
+			w.tempoProtoRoots = w.tempoProtoRoots[:0]
 			return err
 		}
 		blockStart = blockEnd
@@ -663,6 +736,8 @@ func (w *Writer) flushBlocks() error {
 	// WAL block lifetime (which caused 3× RSS vs. parquet in prior versions).
 	clear(w.protoRoots)
 	w.protoRoots = w.protoRoots[:0]
+	clear(w.tempoProtoRoots)
+	w.tempoProtoRoots = w.tempoProtoRoots[:0]
 
 	return nil
 }

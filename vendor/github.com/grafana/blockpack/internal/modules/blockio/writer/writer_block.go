@@ -10,6 +10,7 @@ import (
 	"math"
 	"slices"
 
+	tempotrace "github.com/grafana/tempo/pkg/tempopb/trace/v1"
 	tracev1 "go.opentelemetry.io/proto/otlp/trace/v1"
 
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
@@ -20,21 +21,27 @@ import (
 // Stores only the sort keys and proto pointers; full OTLP→column decoding is deferred
 // to addRowFromProto, eliminating per-span AttrKV materialization and attrSlab growth.
 //
-// Size: ~88 bytes (4 pointer fields) vs shared.BufferedSpan ~344 bytes (13 pointer fields).
-// The proto fields are kept alive by w.protoRoots for the duration of the flush cycle.
+// Size: ~112 bytes (7 pointer fields) vs shared.BufferedSpan ~344 bytes (13 pointer fields).
+// OTLP proto fields (rs/ss/span) are kept alive by w.protoRoots; Tempo proto fields
+// (tempoRS/tempoSS/tempoSpan) by w.tempoProtoRoots. The two sets are mutually exclusive.
 //
 // For the columnar compaction path: srcBlock and srcRowIdx are set instead of proto fields.
 // When srcBlock is non-nil, addRowFromBlock is used instead of addRowFromProto, avoiding
 // all OTLP proto allocations.
 type pendingSpan struct {
-	rs         *tracev1.ResourceSpans // proto pointer; kept alive by w.protoRoots
-	ss         *tracev1.ScopeSpans    // proto pointer; kept alive by w.protoRoots
-	span       *tracev1.Span          // proto pointer; kept alive by w.protoRoots
-	srcBlock   *modules_reader.Block  // non-nil for columnar path (compaction); nil for proto path
-	svcName    string                 // sort key (primary); zero-copy reference into proto
-	minHashSig [4]uint64              // sort key (secondary)
-	srcRowIdx  int                    // source row index within srcBlock
-	traceID    [16]byte               // sort key (tertiary)
+	rs   *tracev1.ResourceSpans // proto pointer; kept alive by w.protoRoots
+	ss   *tracev1.ScopeSpans    // proto pointer; kept alive by w.protoRoots
+	span *tracev1.Span          // proto pointer; kept alive by w.protoRoots
+	// Tempo-native proto pointers (mutually exclusive with rs/ss/span above).
+	// Kept alive by w.tempoProtoRoots until flushBlocks() processes them.
+	tempoRS    *tempotrace.ResourceSpans
+	tempoSS    *tempotrace.ScopeSpans
+	tempoSpan  *tempotrace.Span
+	srcBlock   *modules_reader.Block // non-nil for columnar path (compaction); nil for proto path
+	svcName    string                // sort key (primary); zero-copy reference into proto
+	minHashSig [4]uint64             // sort key (secondary)
+	srcRowIdx  int                   // source row index within srcBlock
+	traceID    [16]byte              // sort key (tertiary)
 }
 
 // blockBuilder manages construction of a single block.
@@ -211,9 +218,12 @@ func buildBlock(
 	bb.intrinsicBlockID = uint16(blockID) //nolint:gosec // safe: blockID bounded by 65534 (checked by caller)
 	for rowIdx := range pending {
 		ps := &pending[rowIdx]
-		if ps.srcBlock != nil {
+		switch {
+		case ps.srcBlock != nil:
 			bb.addRowFromBlock(ps.srcBlock, ps.srcRowIdx, rowIdx)
-		} else {
+		case ps.tempoSpan != nil:
+			bb.addRowFromTempoProto(ps, rowIdx)
+		default:
 			bb.addRowFromProto(ps, rowIdx)
 		}
 	}
@@ -355,6 +365,8 @@ func copyBytes(src []byte) []byte {
 // Full OTLP→column decoding happens here (deferred from AddTracesData) to eliminate
 // per-span AttrKV materialization and attrSlab growth.
 // Column names for dynamic attributes are interned via the block-level name caches.
+//
+//nolint:dupl // intentional mirror of addRowFromTempoProto for OTLP types; different field types prevent sharing
 func (b *blockBuilder) addRowFromProto(ps *pendingSpan, rowIdx int) {
 	span := ps.span
 
@@ -511,7 +523,7 @@ func (b *blockBuilder) addRowFromProto(ps *pendingSpan, rowIdx int) {
 			name := b.internColName(kv.Key, b.resourceColNames, "resource.")
 			val := protoToAttrValue(kv.Value)
 			b.addPresent(rowIdx, name, val.Type, val)
-			if kv.Key == "service.name" && val.Type == shared.ColumnTypeString {
+			if kv.Key == svcNameAttrKey && val.Type == shared.ColumnTypeString {
 				b.feedIntrinsicString("resource.service.name", shared.ColumnTypeString, val.Str, rowIdx)
 			}
 		}
@@ -549,6 +561,178 @@ func (b *blockBuilder) addRowFromProto(ps *pendingSpan, rowIdx int) {
 	// Track which traces appear in this block.
 	b.traceRows[ps.traceID] = struct{}{}
 
+	b.spanCount++
+}
+
+// addRowFromTempoProto adds all column values for one span row from a pendingSpan sourced from
+// Tempo-native proto types. Mirrors addRowFromProto for tempocommon/tempotrace types.
+//
+//nolint:dupl // intentional mirror of addRowFromProto for Tempo types; different field types prevent sharing
+func (b *blockBuilder) addRowFromTempoProto(ps *pendingSpan, rowIdx int) { //nolint:cyclop // mirrors addRowFromProto complexity
+	span := ps.tempoSpan
+
+	b.colTraceID.values[rowIdx] = copyBytes(span.TraceId)
+	b.colTraceID.present[rowIdx] = true
+	b.feedIntrinsicBytes("trace:id", shared.ColumnTypeBytes, span.TraceId, rowIdx)
+
+	if len(span.SpanId) > 0 {
+		b.colSpanID.values[rowIdx] = copyBytes(span.SpanId)
+		b.colSpanID.present[rowIdx] = true
+		b.updateMinMax("span:id", shared.ColumnTypeBytes, string(span.SpanId))
+		b.feedIntrinsicBytes("span:id", shared.ColumnTypeBytes, span.SpanId, rowIdx)
+	}
+
+	if len(span.ParentSpanId) > 0 {
+		b.colParentID.values[rowIdx] = copyBytes(span.ParentSpanId)
+		b.colParentID.present[rowIdx] = true
+		b.updateMinMax("span:parent_id", shared.ColumnTypeBytes, string(span.ParentSpanId))
+		b.feedIntrinsicBytes("span:parent_id", shared.ColumnTypeBytes, span.ParentSpanId, rowIdx)
+	}
+
+	spanName := span.Name
+	if len(spanName) > shared.MaxStringLen {
+		spanName = spanName[:shared.MaxStringLen]
+	}
+	b.colSpanName.values[rowIdx] = spanName
+	b.colSpanName.present[rowIdx] = true
+	if spanName != "" {
+		b.updateMinMax("span:name", shared.ColumnTypeString, spanName)
+		b.feedIntrinsicString("span:name", shared.ColumnTypeString, spanName, rowIdx)
+	}
+
+	spanKind := int64(span.Kind)
+	b.colSpanKind.values[rowIdx] = spanKind
+	b.colSpanKind.present[rowIdx] = true
+	{
+		var tmp [8]byte
+		binary.LittleEndian.PutUint64(tmp[:], uint64(spanKind)) //nolint:gosec // safe: reinterpreting int64 bits as uint64
+		b.updateMinMax("span:kind", shared.ColumnTypeInt64, string(tmp[:]))
+	}
+	b.feedIntrinsicInt64("span:kind", shared.ColumnTypeInt64, spanKind, rowIdx)
+
+	b.colSpanStart.values[rowIdx] = span.StartTimeUnixNano
+	b.colSpanStart.present[rowIdx] = true
+	b.colSpanStart.trackMinMax(span.StartTimeUnixNano)
+	{
+		var tmp [8]byte
+		binary.LittleEndian.PutUint64(tmp[:], span.StartTimeUnixNano)
+		b.updateMinMax("span:start", shared.ColumnTypeUint64, string(tmp[:]))
+	}
+	b.feedIntrinsicUint64("span:start", shared.ColumnTypeUint64, span.StartTimeUnixNano, rowIdx)
+	if span.StartTimeUnixNano > 0 {
+		b.colSketches.add(sketchTimestampColName, encodeSecondBucket(span.StartTimeUnixNano))
+	}
+
+	b.colSpanEnd.values[rowIdx] = span.EndTimeUnixNano
+	b.colSpanEnd.present[rowIdx] = true
+	b.colSpanEnd.trackMinMax(span.EndTimeUnixNano)
+	{
+		var tmp [8]byte
+		binary.LittleEndian.PutUint64(tmp[:], span.EndTimeUnixNano)
+		b.updateMinMax("span:end", shared.ColumnTypeUint64, string(tmp[:]))
+	}
+
+	var dur uint64
+	if span.EndTimeUnixNano >= span.StartTimeUnixNano {
+		dur = span.EndTimeUnixNano - span.StartTimeUnixNano
+	}
+	b.colSpanDur.values[rowIdx] = dur
+	b.colSpanDur.present[rowIdx] = true
+	b.colSpanDur.trackMinMax(dur)
+	{
+		var tmp [8]byte
+		binary.LittleEndian.PutUint64(tmp[:], dur)
+		b.updateMinMax("span:duration", shared.ColumnTypeUint64, string(tmp[:]))
+	}
+	b.feedIntrinsicUint64("span:duration", shared.ColumnTypeUint64, dur, rowIdx)
+
+	if span.Status != nil {
+		b.addPresent(rowIdx, "span:status", shared.ColumnTypeInt64, shared.AttrValue{
+			Type: shared.ColumnTypeInt64,
+			Int:  int64(span.Status.Code),
+		})
+		b.feedIntrinsicInt64("span:status", shared.ColumnTypeInt64, int64(span.Status.Code), rowIdx)
+		if span.Status.Message != "" {
+			b.addPresent(rowIdx, "span:status_message", shared.ColumnTypeString, shared.AttrValue{
+				Type: shared.ColumnTypeString,
+				Str:  span.Status.Message,
+			})
+			b.feedIntrinsicString("span:status_message", shared.ColumnTypeString, span.Status.Message, rowIdx)
+		}
+	}
+
+	if span.TraceState != "" {
+		b.addPresent(rowIdx, "trace:state", shared.ColumnTypeString, shared.AttrValue{
+			Type: shared.ColumnTypeString,
+			Str:  span.TraceState,
+		})
+	}
+
+	if ps.tempoRS != nil && ps.tempoRS.SchemaUrl != "" {
+		b.addPresent(rowIdx, "resource:schema_url", shared.ColumnTypeString, shared.AttrValue{
+			Type: shared.ColumnTypeString,
+			Str:  ps.tempoRS.SchemaUrl,
+		})
+	}
+
+	if ps.tempoSS != nil && ps.tempoSS.SchemaUrl != "" {
+		b.addPresent(rowIdx, "scope:schema_url", shared.ColumnTypeString, shared.AttrValue{
+			Type: shared.ColumnTypeString,
+			Str:  ps.tempoSS.SchemaUrl,
+		})
+	}
+
+	for _, kv := range span.Attributes {
+		if kv == nil {
+			continue
+		}
+		name := b.internColName(kv.Key, b.spanColNames, "span.")
+		val := tempoToAttrValue(kv.Value)
+		b.addPresent(rowIdx, name, val.Type, val)
+	}
+
+	if ps.tempoRS != nil && ps.tempoRS.Resource != nil {
+		for _, kv := range ps.tempoRS.Resource.Attributes {
+			if kv == nil {
+				continue
+			}
+			name := b.internColName(kv.Key, b.resourceColNames, "resource.")
+			val := tempoToAttrValue(kv.Value)
+			b.addPresent(rowIdx, name, val.Type, val)
+			if kv.Key == svcNameAttrKey && val.Type == shared.ColumnTypeString {
+				b.feedIntrinsicString("resource.service.name", shared.ColumnTypeString, val.Str, rowIdx)
+			}
+		}
+	}
+
+	if ps.tempoSS != nil && ps.tempoSS.Scope != nil {
+		for _, kv := range ps.tempoSS.Scope.Attributes {
+			if kv == nil {
+				continue
+			}
+			name := b.internColName(kv.Key, b.scopeColNames, "scope.")
+			val := tempoToAttrValue(kv.Value)
+			b.addPresent(rowIdx, name, val.Type, val)
+		}
+	}
+
+	if b.spanCount == 0 {
+		b.minStart = span.StartTimeUnixNano
+		b.maxStart = span.StartTimeUnixNano
+		b.minTraceID = ps.traceID
+		b.maxTraceID = ps.traceID
+	} else {
+		b.minStart = min(b.minStart, span.StartTimeUnixNano)
+		b.maxStart = max(b.maxStart, span.StartTimeUnixNano)
+		if traceIDBefore(ps.traceID, b.minTraceID) {
+			b.minTraceID = ps.traceID
+		}
+		if traceIDBefore(b.maxTraceID, ps.traceID) {
+			b.maxTraceID = ps.traceID
+		}
+	}
+
+	b.traceRows[ps.traceID] = struct{}{}
 	b.spanCount++
 }
 

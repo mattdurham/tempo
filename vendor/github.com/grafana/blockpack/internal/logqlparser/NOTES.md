@@ -272,7 +272,51 @@ Back-ref: `internal/logqlparser/compile.go:extractPredicates`,
 
 ---
 
-## 12. Numeric pipeline filters skipped when no parser seen (NOTE-012)
+## 12. HasLive — Distinguishing Live Labels from Undecoded Block Columns
+*Added: 2026-03-09*
+
+**Decision:** `LabelSet` gains a `HasLive(key string) bool` method. `LogfmtStage` and
+`JSONStage` switch from `Has(k)` to `HasLive(k)` as the skip guard for "already stored"
+keys.
+
+**Problem:** `blockLabelSet.Has(k)` returns true for columns that are present in the
+block but not yet decoded (rawEncoding != nil). LogfmtStage used `Has` to skip such
+columns (interpreting them as "already stored at ingest"). But `Materialize()` also
+skips undecoded columns (NOTE-SL-016 performance optimization). So when a query runs
+`line_format "{{.caller}}: {{.msg}}"`, neither logfmt extraction nor Materialize provides
+the values — the output is `": "`.
+
+**Semantics of `HasLive`:**
+- `mapLabelSet`: `HasLive` == `Has` (map lookup; all values are immediately accessible).
+- `blockLabelSet`: `HasLive` returns true only if the key is in the overlay (not deleted)
+  OR the backing column is `IsDecoded() && IsPresent(rowIdx)`. Undecoded columns
+  (lazily registered with rawEncoding != nil) return false.
+
+**Why the existing "stored columns win" tests (LQP-TEST-127, LQP-TEST-128) still pass:**
+Those tests use `mapLabelSet` (via `NewMapLabelSet`). For `mapLabelSet`, `HasLive == Has`,
+so pre-populated map keys have HasLive=true and the skip guard still fires. The invariant
+"decoded/overlay labels win over pipeline extraction" is preserved; only undecoded block
+columns are now treated as absent by the parser stages.
+
+**`__error__` in `LogfmtStage`:**
+Blockpack uses Loki's default non-strict logfmt mode: `__error__` is always set to `""`
+regardless of whether the logfmt decoder reports an error. This matches Loki's behaviour
+where partial-parse bodies (e.g. access logs with quoted strings mid-body) are kept
+without an error label. `__error__` is set unconditionally and is not guarded by
+`HasLive`. Strict mode (`"LogfmtParserErr"` on failure) is not implemented.
+
+**`HideBodyParsedColumns` in LogfmtStage/JSONStage:**
+Parser stages call `labels.HideBodyParsedColumns()` immediately before parsing the body.
+This marks all ingest-time `log.*` columns as deleted in the `blockLabelSet` so that
+`Get()` returns `""` for them unless the stage explicitly sets the value via `Set()`.
+This ensures first-wins semantics from body re-parsing and prevents ingest-time last-wins
+column values from shadowing re-parsed results. The call is placed inside the stage
+function (not the executor loop) so that non-parser stages that execute before `| logfmt`
+(e.g. `| label_format`) operate on the full label set unaffected.
+
+---
+
+## 13. Numeric pipeline filters skipped when no parser seen (NOTE-012)
 *Added: 2026-03-19*
 
 **Decision:** `identifyPushdownStages` now adds parseable numeric ops (`OpGT/GTE/LT/LTE`)

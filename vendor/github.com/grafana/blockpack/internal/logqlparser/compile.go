@@ -1008,13 +1008,33 @@ func identifyPushdownStages(stages []PipelineStage) (skip, columnPred map[int]st
 		if stage.LabelFilter == nil {
 			break
 		}
+		// Labels starting with "__" (e.g. __error__, __preserve_error__) are
+		// synthetic pipeline labels set by parser stages — they are never stored
+		// as block columns. Pushing them down to ColumnPredicate would cause the
+		// bloom filter to return an empty row set (no log.__error__ column exists),
+		// silently dropping all rows.
+		isSynthetic := strings.HasPrefix(stage.LabelFilter.Name, "__")
 		switch stage.LabelFilter.Op {
 		case OpEqual, OpNotEqual, OpRegex, OpNotRegex:
-			columnPred[i] = struct{}{}
-			if !seenParser {
+			if !isSynthetic && !seenParser {
+				// Post-parser label filters must NOT be pushed to ColumnPredicate:
+				// ingest-time log.* columns use last-wins semantics and may differ
+				// from body re-parsing (duplicate keys, format mismatch like JSON
+				// bodies with | logfmt). A false-negative from ColumnPredicate
+				// silently drops rows before the pipeline can correct them.
+				columnPred[i] = struct{}{}
+			}
+			if !seenParser && !isSynthetic {
 				skip[i] = struct{}{}
 			}
 		case OpGT, OpGTE, OpLT, OpLTE:
+			// Post-parser numeric filters are not pushed down for the same reasons
+			// as string filters above: ingest-time columns may differ from re-parsed values.
+			// Synthetic labels (__error__ etc.) have no backing column, so pushing them
+			// would cause ColumnPredicate to return an empty row set.
+			if seenParser || isSynthetic {
+				continue
+			}
 			// Numeric: parse value to ensure it's a valid threshold. If unparseable,
 			// skip this stage entirely — it stays in the pipeline to correctly drop
 			// all rows (LabelFilterStage drops on ParseFloat error), but contributes
@@ -1067,6 +1087,8 @@ func compilePipelineSkipping(stages []PipelineStage, skip map[int]struct{}) (*Pi
 	var funcs []PipelineStageFunc
 	var parserFree []PipelineStageFunc
 	seenNonParser := false // tracks whether a non-parser stage has been added to funcs
+	hasLineFormat := false
+	hasParserStage := false
 	for i, stage := range stages {
 		if _, skipped := skip[i]; skipped {
 			continue
@@ -1087,12 +1109,18 @@ func compilePipelineSkipping(stages []PipelineStage, skip map[int]struct{}) (*Pi
 			if !isParser {
 				seenNonParser = true
 			}
+			if stage.Type == StageLineFormat {
+				hasLineFormat = true
+			}
+			if isParser {
+				hasParserStage = true
+			}
 		}
 	}
 	if len(funcs) == 0 {
 		return nil, nil
 	}
-	return &Pipeline{Stages: funcs, parserFreeStages: parserFree}, nil
+	return &Pipeline{Stages: funcs, parserFreeStages: parserFree, HasLineFormat: hasLineFormat, HasParserStage: hasParserStage}, nil
 }
 
 // parseLabelFormatParams converts "dst=src" param strings into a mappings map.

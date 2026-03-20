@@ -67,11 +67,7 @@ func (w *walBlock) AppendTrace(id common.ID, tr *tempopb.Trace, start, end uint3
 		}
 	}
 
-	// Convert tempopb.Trace to OTLP TracesData format for blockpack
-	td := tempoTraceToOTLP(tr)
-
-	// Write to blockpack
-	if err := w.writer.AddTracesData(td); err != nil {
+	if err := w.writer.AddTempoTrace(tr); err != nil {
 		return fmt.Errorf("failed to add trace to blockpack: %w", err)
 	}
 

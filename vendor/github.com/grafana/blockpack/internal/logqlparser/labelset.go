@@ -10,6 +10,21 @@ type LabelSet interface {
 	Get(key string) string
 	// Has reports whether key is present (even if the value is "").
 	Has(key string) bool
+	// HasLive reports whether key has a live (immediately accessible) value.
+	// A value is live if it is in the overlay (set by a previous stage) or in a
+	// decoded block column. Undecoded block columns return false — the value is in
+	// storage but not yet accessible to the pipeline.
+	// For mapLabelSet, HasLive == Has (all values are immediately accessible).
+	// SPEC-001a: Used by JSONStage and LogfmtStage to distinguish "column present in
+	// block storage" (Has) from "column has a usable value right now" (HasLive).
+	HasLive(key string) bool
+	// HideBodyParsedColumns marks all ingest-time body-parsed (log.*) columns as
+	// deleted so that Get() returns "" for them unless a pipeline stage explicitly
+	// sets the value via Set(). Called by LogfmtStage and JSONStage before parsing
+	// the body so that ingest-time last-wins column values cannot shadow re-parsed
+	// body values. Set() un-deletes a key when the stage writes to it, so the
+	// parsed result takes precedence. For mapLabelSet this is a no-op.
+	HideBodyParsedColumns()
 	// Set adds or overwrites key with val.
 	Set(key, val string)
 	// Delete removes key. No-op if absent.
@@ -40,10 +55,12 @@ func NewEmptyLabelSet() LabelSet {
 	return &mapLabelSet{m: make(map[string]string)}
 }
 
-func (s *mapLabelSet) Get(key string) string { return s.m[key] }
-func (s *mapLabelSet) Has(key string) bool   { _, ok := s.m[key]; return ok }
-func (s *mapLabelSet) Set(key, val string)   { s.m[key] = val }
-func (s *mapLabelSet) Delete(key string)     { delete(s.m, key) }
+func (s *mapLabelSet) Get(key string) string   { return s.m[key] }
+func (s *mapLabelSet) Has(key string) bool     { _, ok := s.m[key]; return ok }
+func (s *mapLabelSet) HasLive(key string) bool { _, ok := s.m[key]; return ok }
+func (s *mapLabelSet) Set(key, val string)     { s.m[key] = val }
+func (s *mapLabelSet) Delete(key string)       { delete(s.m, key) }
+func (s *mapLabelSet) HideBodyParsedColumns()  {} // no-op: map has no ingest-time columns
 
 func (s *mapLabelSet) Keys() []string {
 	keys := make([]string, 0, len(s.m))

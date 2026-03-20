@@ -1148,3 +1148,31 @@ CollectOptions{Limit: 2, TimestampColumn: "span:start", Direction: Backward, OnS
 - rows[0].IntrinsicFields != nil (zero block reads)
 - rows[1].IntrinsicFields != nil
 - rows[0] span:start > rows[1] span:start (descending order)
+
+
+
+**Scenario:** `HasLive` returns true when the key is in the overlay.
+
+**Setup:** Zero-column `blockLabelSet`; call `Set("level", "info")`.
+
+**Assertions:** `bls.HasLive("level") == true`.
+
+---
+
+## EXEC-TEST-BLS-012: TestBlockLabelSet_HasLive_MissingKey
+
+**Scenario:** `HasLive` returns false when the key is absent entirely.
+
+**Setup:** Zero-column `blockLabelSet`; no Set called.
+
+**Assertions:** `bls.HasLive("missing") == false`.
+
+---
+
+## EXEC-TEST-BLS-013: TestBlockLabelSet_HasLive_DeletedKey
+
+**Scenario:** `HasLive` returns false for a key that was Set then Deleted.
+
+**Setup:** Zero-column `blockLabelSet`; `Set("app", "svc")` then `Delete("app")`.
+
+**Assertions:** `bls.HasLive("app") == false`.

@@ -84,8 +84,7 @@ func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.Blo
 				}
 			}
 
-			td := tempoTraceToOTLP(tr)
-			if addErr := writer.AddTracesData(td); addErr != nil {
+			if addErr := writer.AddTempoTrace(tr); addErr != nil {
 				err = fmt.Errorf("failed to add trace to blockpack: %w", addErr)
 				return
 			}
