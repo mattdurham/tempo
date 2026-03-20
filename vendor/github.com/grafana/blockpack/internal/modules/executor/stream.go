@@ -649,24 +649,32 @@ func collectIntrinsicPlain(
 		refs = refs[:opts.Limit]
 	}
 
-	// NOTE-047: Use extractIntrinsicRefsDirect instead of lookupIntrinsicFields.
-	// For limit=20, refs has at most 20 entries, but lookupIntrinsicFields scans
-	// all N entries in each decoded IntrinsicColumn (N = total file spans, up to 1M).
-	// extractIntrinsicRefsDirect exits each column scan as soon as all M targets
-	// are matched, reducing work from O(N × cols) to O(N/hit_rate × cols) for the
-	// common case where targets cluster in early dict entries or flat refs.
-	// secondPassCols is searchMetaCols ∪ predicate columns; for pure intrinsic queries
-	// every column in that set is available in the intrinsic section.
-	fieldMaps := extractIntrinsicRefsDirect(r, refs, secondPassCols)
-	results := make([]MatchedRow, len(refs))
-	for i, ref := range refs {
-		results[i] = MatchedRow{
-			IntrinsicFields: &intrinsicFieldsProvider{fields: fieldMaps[i]},
-			BlockIdx:        int(ref.BlockIdx),
-			RowIdx:          int(ref.RowIdx),
+	// Group refs by internal block index for efficient read coalescing.
+	// M=20 refs typically span 1-3 internal blocks (~100-500KB each), far cheaper
+	// than scanning the full intrinsic section (all N spans in the file).
+	blockOrder := make([]int, 0, len(refs))
+	blockCandidates := make(map[int][]int, len(refs))
+	for _, ref := range refs {
+		idx := int(ref.BlockIdx)
+		if _, exists := blockCandidates[idx]; !exists {
+			blockOrder = append(blockOrder, idx)
 		}
+		blockCandidates[idx] = append(blockCandidates[idx], int(ref.RowIdx))
 	}
-	return results, nil
+
+	var results []MatchedRow
+	err := forEachBlockInGroups(r, blockOrder, blockCandidates, wantColumns, secondPassCols, "collectIntrinsicPlain",
+		func(pb parsedBlock, candidateRows []int) error {
+			for _, rowIdx := range candidateRows {
+				results = append(results, MatchedRow{
+					Block:    pb.Block,
+					BlockIdx: pb.BlockIdx,
+					RowIdx:   rowIdx,
+				})
+			}
+			return nil
+		})
+	return results, err
 }
 
 // extractIntrinsicRefsDirect resolves field values for a small set of target refs
