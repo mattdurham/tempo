@@ -684,28 +684,17 @@ func collectIntrinsicPlain(
 // NOTE-047: keepalive for lookupIntrinsicFields — it is still used by collectIntrinsicTopK
 // (Case B), where the full column scan is required to build the timestamp map.
 func extractIntrinsicRefsDirect(r *modules_reader.Reader, selected []modules_shared.BlockRef, wantCols map[string]struct{}) []map[string]any {
-	// Build a sorted index of target packed keys for O(log M) binary search per ref.
-	// selected is already sorted by blockRefCompare in collectIntrinsicPlain, so
-	// the sort below is a no-op in practice.
-	type keyIdx struct {
-		key uint32
-		idx int
-	}
 	m := len(selected)
-	index := make([]keyIdx, m)
+	index := make(map[uint32]int, m)
 	for i, ref := range selected {
-		index[i] = keyIdx{key: uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx), idx: i}
+		index[uint32(ref.BlockIdx)<<16|uint32(ref.RowIdx)] = i
 	}
-	slices.SortFunc(index, func(a, b keyIdx) int { return cmp.Compare(a.key, b.key) })
 
 	searchIndex := func(key uint32) int {
-		pos, found := slices.BinarySearchFunc(index, key, func(e keyIdx, k uint32) int {
-			return cmp.Compare(e.key, k)
-		})
-		if !found {
-			return -1
+		if idx, ok := index[key]; ok {
+			return idx
 		}
-		return index[pos].idx
+		return -1
 	}
 
 	result := make([]map[string]any, m)
@@ -1142,32 +1131,19 @@ type intrinsicFieldsProvider struct {
 // through hash buckets). This eliminates the mapaccess2_fast32 hotspot (previously
 // 30.95% of CPU) while keeping the column-scan loop unchanged.
 func lookupIntrinsicFields(r *modules_reader.Reader, selected []modules_shared.BlockRef, wantCols map[string]struct{}) []map[string]any {
-	// Build a sorted index: each entry holds (packed key, original position in selected).
-	// Sorting by packed key enables O(log M) binary search per column ref.
-	// collectIntrinsicPlain already calls slices.SortFunc(refs, blockRefCompare) which
-	// produces ascending packed-key order, so the sort below is a no-op in that case.
-	// collectIntrinsicTopK produces timestamp-sorted refs, so sorting is needed there.
-	type keyIdx struct {
-		key uint32
-		idx int
-	}
 	m := len(selected)
-	index := make([]keyIdx, m)
+	index := make(map[uint32]int, m)
 	for i, ref := range selected {
-		index[i] = keyIdx{key: uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx), idx: i}
+		index[uint32(ref.BlockIdx)<<16|uint32(ref.RowIdx)] = i
 	}
-	slices.SortFunc(index, func(a, b keyIdx) int { return cmp.Compare(a.key, b.key) })
 
 	// searchIndex returns the original position in selected for the given packed key,
-	// or -1 if not found. Uses binary search on the sorted index slice.
+	// or -1 if not found.
 	searchIndex := func(key uint32) int {
-		pos, found := slices.BinarySearchFunc(index, key, func(e keyIdx, k uint32) int {
-			return cmp.Compare(e.key, k)
-		})
-		if !found {
-			return -1
+		if idx, ok := index[key]; ok {
+			return idx
 		}
-		return index[pos].idx
+		return -1
 	}
 
 	result := make([]map[string]any, len(selected))
