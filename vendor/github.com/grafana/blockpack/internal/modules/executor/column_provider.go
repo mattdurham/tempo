@@ -233,6 +233,85 @@ func (p *blockColumnProvider) StreamScanEqual(column string, value interface{}, 
 	return n, nil
 }
 
+// StreamScanEqualAny scans all rows and calls cb for each row where column equals any of the
+// given values. For string columns it uses a dict fast-path: build a bool mask over the string
+// dictionary once (O(dict+nValues)), then scan rows via index lookups (O(spans)) — a single pass
+// regardless of how many values are checked. For other column types it falls back to sequential
+// rowEqual checks, which is still one pass over the rows (O(spans×nValues)) but avoids re-scanning
+// the column N times.
+func (p *blockColumnProvider) StreamScanEqualAny(column string, values []any, cb vm.RowCallback) (int, error) {
+	col := p.lookupColumn(column)
+	if col == nil {
+		return 0, nil
+	}
+	if len(values) == 0 {
+		return 0, nil
+	}
+	if len(values) == 1 {
+		return p.StreamScanEqual(column, values[0], cb)
+	}
+
+	// Dict fast-path for string columns: build a match mask over the dictionary once,
+	// then scan rows via StringIdx with a single bool lookup per row.
+	if col.Type == modules_shared.ColumnTypeString || col.Type == modules_shared.ColumnTypeRangeString {
+		col.EnsureDecoded()
+		// Build a set of wanted strings.
+		wantSet := make(map[string]struct{}, len(values))
+		for _, v := range values {
+			if s, ok := v.(string); ok {
+				wantSet[s] = struct{}{}
+			}
+		}
+		if len(wantSet) == 0 {
+			// All values are non-string; no string column can match.
+			return 0, nil
+		}
+		// Build a per-dict-entry match mask.
+		dictMatch := make([]bool, len(col.StringDict))
+		for i, s := range col.StringDict {
+			if _, ok := wantSet[s]; ok {
+				dictMatch[i] = true
+			}
+		}
+		spanCount := col.SpanCount
+		count := 0
+		for i := range spanCount {
+			if !col.IsPresent(i) {
+				continue
+			}
+			if i >= len(col.StringIdx) {
+				continue
+			}
+			di := int(col.StringIdx[i])
+			if di < len(dictMatch) && dictMatch[di] {
+				if !cb(i) {
+					return count, nil
+				}
+				count++
+			}
+		}
+		return count, nil
+	}
+
+	// Generic fallback: one pass, checking each value per row.
+	n := p.scanWith(col, func(i int) bool {
+		for _, v := range values {
+			if rowEqual(col, i, v) {
+				return true
+			}
+		}
+		return false
+	}, cb)
+	return n, nil
+}
+
+// ScanEqualAny returns a RowSet of all rows where column equals any of the given values.
+func (p *blockColumnProvider) ScanEqualAny(column string, values []any) (vm.RowSet, error) {
+	return collectStream(func(cb vm.RowCallback) (int, error) {
+		return p.StreamScanEqualAny(column, values, cb)
+	})
+}
+
 // StreamScanNotEqual scans all rows and calls cb for each row where column does not equal value.
 func (p *blockColumnProvider) StreamScanNotEqual(column string, value interface{}, cb vm.RowCallback) (int, error) {
 	col := p.lookupColumn(column)

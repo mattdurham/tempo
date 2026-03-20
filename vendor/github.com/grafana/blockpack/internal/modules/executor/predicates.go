@@ -393,13 +393,64 @@ func collectIntrinsicLeavesInto(node vm.RangeNode, out *[]vm.RangeNode) {
 		}
 		return
 	}
-	// Composite: only recurse into AND nodes; skip OR (too complex to intersect safely).
+	// Composite: only recurse into AND nodes.
+	// For OR nodes: if every child is a leaf referencing the same intrinsic column
+	// with equality (Values) predicates, synthesize a single merged leaf whose
+	// Values are the union of all children's values. This allows BlocksFromIntrinsicTOC
+	// to prune blocks that contain none of the OR'd values — previously all OR nodes
+	// were skipped entirely (conservative: no pruning).
+	// For any other OR pattern (mixed columns, range predicates, patterns), remain
+	// conservative and skip to avoid false negatives.
 	if node.IsOR {
+		merged, ok := mergeORIntrinsicLeaves(node.Children)
+		if ok {
+			*out = append(*out, merged)
+		}
 		return
 	}
 	for _, child := range node.Children {
 		collectIntrinsicLeavesInto(child, out)
 	}
+}
+
+// mergeORIntrinsicLeaves checks whether all children of an OR composite node are
+// leaf nodes referencing the same intrinsic column with equality (Values) predicates.
+// If so, it returns a synthesized leaf with all values merged (union) and ok=true.
+// Returns (zero, false) for any other pattern (different columns, range/pattern predicates,
+// nested composites, or non-intrinsic columns).
+func mergeORIntrinsicLeaves(children []vm.RangeNode) (vm.RangeNode, bool) {
+	if len(children) == 0 {
+		return vm.RangeNode{}, false
+	}
+	var commonCol string
+	var merged []vm.Value
+	for _, child := range children {
+		// Must be a leaf (no nested children).
+		if len(child.Children) > 0 {
+			return vm.RangeNode{}, false
+		}
+		// Must reference an intrinsic column.
+		_, inTrace := traceIntrinsicColumns[child.Column]
+		_, inLog := logIntrinsicColumns[child.Column]
+		if !inTrace && !inLog {
+			return vm.RangeNode{}, false
+		}
+		// Must be an equality predicate (Values non-empty, no Min/Max/Pattern).
+		if len(child.Values) == 0 || child.Min != nil || child.Max != nil || child.Pattern != "" {
+			return vm.RangeNode{}, false
+		}
+		if commonCol == "" {
+			commonCol = child.Column
+		} else if child.Column != commonCol {
+			// Different columns — cannot merge safely.
+			return vm.RangeNode{}, false
+		}
+		merged = append(merged, child.Values...)
+	}
+	if commonCol == "" {
+		return vm.RangeNode{}, false
+	}
+	return vm.RangeNode{Column: commonCol, Values: merged}, true
 }
 
 // intrinsicTOCOverlaps reports whether a predicate leaf can possibly match given the
