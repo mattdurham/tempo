@@ -1024,11 +1024,40 @@ type intrinsicFieldsProvider struct {
 // columns present in wantCols are fetched (skipping expensive GetIntrinsicColumn calls
 // and the mergeIntrinsicColumns allocations they trigger for unwanted columns).
 // Pass nil to fetch all intrinsic columns (e.g. FindTraceByID needs every field).
+//
+// NOTE-046: The lookup index uses a sorted []keyIdx slice (packed key + original index)
+// instead of map[uint32]int. For the common case of limit-bounded intrinsic queries
+// (M = 20–2000 selected refs), a compact sorted slice fits in a few cache lines and
+// binary search (~11 comparisons for M=2000) outperforms map lookup (pointer-chasing
+// through hash buckets). This eliminates the mapaccess2_fast32 hotspot (previously
+// 30.95% of CPU) while keeping the column-scan loop unchanged.
 func lookupIntrinsicFields(r *modules_reader.Reader, selected []modules_shared.BlockRef, wantCols map[string]struct{}) []map[string]any {
-	// Build a set of target keys for quick matching.
-	targetKeys := make(map[uint32]int, len(selected)) // packed key → index in selected
+	// Build a sorted index: each entry holds (packed key, original position in selected).
+	// Sorting by packed key enables O(log M) binary search per column ref.
+	// collectIntrinsicPlain already calls slices.SortFunc(refs, blockRefCompare) which
+	// produces ascending packed-key order, so the sort below is a no-op in that case.
+	// collectIntrinsicTopK produces timestamp-sorted refs, so sorting is needed there.
+	type keyIdx struct {
+		key uint32
+		idx int
+	}
+	m := len(selected)
+	index := make([]keyIdx, m)
 	for i, ref := range selected {
-		targetKeys[uint32(ref.BlockIdx)<<16|uint32(ref.RowIdx)] = i
+		index[i] = keyIdx{key: uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx), idx: i}
+	}
+	slices.SortFunc(index, func(a, b keyIdx) int { return cmp.Compare(a.key, b.key) })
+
+	// searchIndex returns the original position in selected for the given packed key,
+	// or -1 if not found. Uses binary search on the sorted index slice.
+	searchIndex := func(key uint32) int {
+		pos, found := slices.BinarySearchFunc(index, key, func(e keyIdx, k uint32) int {
+			return cmp.Compare(e.key, k)
+		})
+		if !found {
+			return -1
+		}
+		return index[pos].idx
 	}
 
 	result := make([]map[string]any, len(selected))
@@ -1051,8 +1080,7 @@ func lookupIntrinsicFields(r *modules_reader.Reader, selected []modules_shared.B
 		switch col.Format {
 		case modules_shared.IntrinsicFormatDict:
 			// Dict columns: iterate entries, for each entry scan its refs against targets.
-			// With 3-50 entries this is fast even with large ref arrays, because we use
-			// the target map for O(1) lookup per ref.
+			// Binary search on index gives O(log M) lookup per ref.
 			for _, entry := range col.DictEntries {
 				var val any
 				if entry.Value != "" {
@@ -1062,16 +1090,16 @@ func lookupIntrinsicFields(r *modules_reader.Reader, selected []modules_shared.B
 				}
 				for _, ref := range entry.BlockRefs {
 					key := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx)
-					if idx, ok := targetKeys[key]; ok {
+					if idx := searchIndex(key); idx >= 0 {
 						result[idx][colName] = val
 					}
 				}
 			}
 		case modules_shared.IntrinsicFormatFlat:
-			// Flat columns: scan refs with target map lookup.
+			// Flat columns: scan refs with binary search on index.
 			for i, ref := range col.BlockRefs {
 				key := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx)
-				if idx, ok := targetKeys[key]; ok {
+				if idx := searchIndex(key); idx >= 0 {
 					if len(col.Uint64Values) > i {
 						result[idx][colName] = col.Uint64Values[i]
 					} else if len(col.BytesValues) > i {
