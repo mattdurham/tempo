@@ -36,7 +36,8 @@ type Column struct {
 
 	// NOTE-001: Lazy decode fields — rawEncoding is a sub-slice of the block's RawBytes.
 	// Non-nil means this column has not been fully decoded yet (presence-only path).
-	// rawEncoding is valid for the lifetime of the owning BlockWithBytes.
+	// rawEncoding is valid for the lifetime of the owning BlockWithBytes (bwb = BlockWithBytes:
+	// the struct that pairs a decoded Block with its raw byte slice kept alive for lazy access).
 	// All lazy decodes complete within the same block's row loop before bwb goes out of scope.
 	rawEncoding []byte
 
@@ -55,13 +56,15 @@ type Column struct {
 
 // IsDecoded reports whether this column's values have been fully decoded.
 // NOTE-001: returns false when rawEncoding is non-nil (column is lazily registered and not yet decoded).
-// Materialize() uses this to skip columns that were not in wantColumns — calling any value
-// accessor on an un-decoded column triggers an expensive decodeNow (zstd decompression).
+// Callers use this to skip columns not in wantColumns — touching any value accessor on an
+// un-decoded column triggers decodeNow (zstd decompression), which must be avoided for
+// columns that were registered lazily but never requested.
 func (c *Column) IsDecoded() bool { return c.rawEncoding == nil }
 
 // EnsureDecoded triggers full decode if this column was lazily registered.
-// Callers that access StringDict/StringIdx/Int64Dict/etc. directly (bypassing the
-// per-row value accessors) must call this first so the slices are populated.
+// Per-row value accessors (StringValue, Int64Value, etc.) call decodeNow automatically,
+// so EnsureDecoded is only needed by callers that access the underlying slices directly
+// (StringDict, StringIdx, etc.), bypassing the per-row path.
 // NOTE-026: required by scanStringDictFloat before iterating StringDict.
 func (c *Column) EnsureDecoded() {
 	if c.rawEncoding != nil {

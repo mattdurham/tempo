@@ -59,7 +59,7 @@ type TimeBucketSpec struct {
 	StepSizeNanos int64 // Time bucket step size in nanoseconds
 }
 
-// Normalize converts the QuerySpec to canonical form for consistent matching.
+// Normalize converts the QuerySpec to canonical form in place for consistent matching.
 func (qs *QuerySpec) Normalize() {
 	// Normalize aggregate field name
 	qs.Aggregate.Field = normalizeFieldName(qs.Aggregate.Field)

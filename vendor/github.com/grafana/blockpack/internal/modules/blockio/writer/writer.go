@@ -44,6 +44,10 @@ type Writer struct {
 	// Consumed at Flush() by writeIntrinsicSection to produce the footer V4 extension.
 	intrinsicAccum *intrinsicAccumulator
 
+	// fileBloomSvcNames accumulates unique service names for file-level bloom construction.
+	// Fed from flushBlocks and flushLogBlocks; consumed at Flush by buildMetadataSectionBytes.
+	fileBloomSvcNames map[string]struct{}
+
 	out countingWriter
 
 	cfg Config
@@ -118,13 +122,14 @@ func NewWriterWithConfig(cfg Config) (*Writer, error) {
 		return nil, fmt.Errorf("writer: zstd init: %w", err)
 	}
 	return &Writer{
-		cfg:            cfg,
-		out:            countingWriter{w: cfg.OutputStream},
-		enc:            enc,
-		traceIndex:     make(map[[16]byte][]uint16),
-		uuidColumns:    make(map[string]bool),
-		rangeIdx:       make(rangeIndex),
-		intrinsicAccum: newIntrinsicAccumulator(),
+		cfg:               cfg,
+		out:               countingWriter{w: cfg.OutputStream},
+		enc:               enc,
+		traceIndex:        make(map[[16]byte][]uint16),
+		uuidColumns:       make(map[string]bool),
+		rangeIdx:          make(rangeIndex),
+		intrinsicAccum:    newIntrinsicAccumulator(),
+		fileBloomSvcNames: make(map[string]struct{}),
 		// Pre-allocate pending to MaxBufferedSpans to avoid growslice on the hot path.
 		// After each flushBlocks(), w.pending is reset to length 0 (capacity retained).
 		pending: make([]pendingSpan, 0, cfg.MaxBufferedSpans),
@@ -346,6 +351,7 @@ func (w *Writer) Flush() (int64, error) {
 		w.rangeIdx,
 		w.traceIndex,
 		w.sketchIdx,
+		w.fileBloomSvcNames,
 	)
 	if err != nil {
 		return w.out.total, fmt.Errorf("writer: build metadata: %w", err)
@@ -410,6 +416,11 @@ func (w *Writer) Flush() (int64, error) {
 	// Reset intrinsic accumulator for reuse.
 	w.intrinsicAccum = newIntrinsicAccumulator()
 
+	// Reset file-level bloom service names.
+	for k := range w.fileBloomSvcNames {
+		delete(w.fileBloomSvcNames, k)
+	}
+
 	return total, nil
 }
 
@@ -424,6 +435,7 @@ func (w *Writer) writeEmptyFile() (int64, error) {
 		rIdx,
 		w.traceIndex,
 		nil, // no sketches for empty file
+		nil, // no service names for empty file
 	)
 	if err != nil {
 		return w.out.total, err
@@ -633,6 +645,13 @@ func (w *Writer) flushBlocks() error {
 		blockStart = blockEnd
 	}
 
+	// Collect service names for file-level bloom filter.
+	for _, ps := range w.pending {
+		if ps.svcName != "" {
+			w.fileBloomSvcNames[ps.svcName] = struct{}{}
+		}
+	}
+
 	// Clear pending span buffer. blockMetas, traceIndex, rangeIdx
 	// accumulate across flushBlocks() calls and are consumed once at Flush().
 	clear(w.pending)
@@ -714,6 +733,13 @@ func (w *Writer) flushLogBlocks() error {
 		blockStart = blockEnd
 	}
 
+	// Collect service names for file-level bloom filter.
+	for _, pl := range w.pendingLogs {
+		if pl.svcName != "" {
+			w.fileBloomSvcNames[pl.svcName] = struct{}{}
+		}
+	}
+
 	clear(w.pendingLogs)
 	w.pendingLogs = w.pendingLogs[:0]
 
@@ -734,6 +760,7 @@ func buildMetadataSectionBytes(
 	rIdx rangeIndex,
 	traceIndex map[[16]byte][]uint16,
 	sketchIdx []blockSketchSet,
+	fileBloomSvcNames map[string]struct{},
 ) ([]byte, error) {
 	blockIdxData, err := writeBlockIndexSection(nil, version, blockMetas)
 	if err != nil {
@@ -773,6 +800,16 @@ func buildMetadataSectionBytes(
 			return nil, fmt.Errorf("sketch_index: %w", err)
 		}
 		buf = append(buf, sketchBytes...)
+	}
+
+	// File-level bloom section — service.name Fuse8 for fast file-level equality reject.
+	// NOTE-45: FileBloom section is always the last section in the metadata blob.
+	if len(fileBloomSvcNames) > 0 {
+		bloomBytes, err := writeFileBloomSection(fileBloomSvcNames)
+		if err != nil {
+			return nil, fmt.Errorf("file_bloom: %w", err)
+		}
+		buf = append(buf, bloomBytes...)
 	}
 
 	return buf, nil

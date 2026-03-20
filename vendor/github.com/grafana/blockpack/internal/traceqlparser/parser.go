@@ -7,6 +7,73 @@ import (
 	"strings"
 )
 
+const (
+	// OpAnd is the logical AND operator (&&).
+	OpAnd BinaryOp = iota
+	// OpOr is the logical OR operator (||).
+	OpOr
+	// OpEq is the equality operator (=).
+	OpEq
+	// OpNeq is the inequality operator (!=).
+	OpNeq
+	// OpGt is the greater than operator (>).
+	OpGt
+	// OpGte is the greater than or equal operator (>=).
+	OpGte
+	// OpLt is the less than operator (<).
+	OpLt
+	// OpLte is the less than or equal operator (<=).
+	OpLte
+	// OpRegex is the regex match operator (=~).
+	OpRegex
+	// OpNotRegex is the regex not match operator (!~).
+	OpNotRegex
+)
+
+// Structural operator string literals used during parsing.
+const (
+	opStrNotDescendant = "!>>"
+	opStrNotChild      = "!>"
+)
+
+const (
+	// OpDescendant is the descendant operator (>>).
+	OpDescendant StructuralOp = iota
+	// OpChild is the direct child operator (>).
+	OpChild
+	// OpSibling is the sibling operator (~).
+	OpSibling
+	// OpAncestor is the ancestor operator (<<).
+	OpAncestor
+	// OpParent is the direct parent operator (<).
+	OpParent
+	// OpNotSibling is the not sibling operator (!~).
+	OpNotSibling
+	// OpNotDescendant is the negated descendant operator (!>>).
+	OpNotDescendant
+	// OpNotChild is the negated child operator (!>).
+	OpNotChild
+)
+
+const (
+	// LitString represents a string literal.
+	LitString LiteralType = iota
+	// LitInt represents an integer literal.
+	LitInt
+	// LitFloat represents a float literal.
+	LitFloat
+	// LitBool represents a boolean literal.
+	LitBool
+	// LitDuration represents a duration literal.
+	LitDuration
+	// LitStatus represents a status literal (error, ok, unset).
+	LitStatus
+	// LitKind represents a kind literal (client, server, producer, consumer, internal, unspecified).
+	LitKind
+	// LitNil represents a nil literal.
+	LitNil
+)
+
 // ParseTraceQL parses a TraceQL query and returns an AST
 // Supports basic filter syntax: { <expression> }
 // Also supports metrics queries: { filter } | aggregate() by (fields)
@@ -64,38 +131,41 @@ func findStructuralOperator(query string) (int, string) {
 	i := 0
 	for i < len(query) {
 		ch := query[i]
-		if ch == '{' {
+		switch ch {
+		case '{':
 			braceDepth++
-		} else if ch == '}' {
+		case '}':
 			braceDepth--
-		} else if ch == '(' {
+		case '(':
 			parenDepth++
-		} else if ch == ')' {
+		case ')':
 			parenDepth--
-		} else if braceDepth == 0 && parenDepth == 0 {
-			// Check for three-character operators first: !>>
-			if i+2 < len(query) {
-				threeChar := query[i : i+3]
-				if threeChar == opStrNotDescendant {
-					return i, threeChar
+		default:
+			if braceDepth == 0 && parenDepth == 0 {
+				// Check for three-character operators first: !>>
+				if i+2 < len(query) {
+					threeChar := query[i : i+3]
+					if threeChar == opStrNotDescendant {
+						return i, threeChar
+					}
 				}
-			}
-			// Check for two-character operators
-			if i+1 < len(query) {
-				twoChar := query[i : i+2]
-				if twoChar == ">>" || twoChar == "<<" || twoChar == "!~" || twoChar == "!>" {
-					return i, twoChar
+				// Check for two-character operators
+				if i+1 < len(query) {
+					twoChar := query[i : i+2]
+					if twoChar == ">>" || twoChar == "<<" || twoChar == "!~" || twoChar == "!>" {
+						return i, twoChar
+					}
 				}
-			}
-			// Check for single-character operators between { } blocks
-			if (ch == '>' || ch == '<' || ch == '~') && i > 0 {
-				// Look back for }
-				j := skipWSBack(query, i-1)
-				if j >= 0 && query[j] == '}' {
-					// Look ahead for {
-					k := skipWSFwd(query, i+1)
-					if k < len(query) && query[k] == '{' {
-						return i, string(ch)
+				// Check for single-character operators between { } blocks
+				if (ch == '>' || ch == '<' || ch == '~') && i > 0 {
+					// Look back for }
+					j := skipWSBack(query, i-1)
+					if j >= 0 && query[j] == '}' {
+						// Look ahead for {
+						k := skipWSFwd(query, i+1)
+						if k < len(query) && query[k] == '{' {
+							return i, string(ch)
+						}
 					}
 				}
 			}
@@ -233,25 +303,23 @@ func findPipeOutsideBraces(query string) int {
 	braceDepth := 0
 	for i := 0; i < len(query); i++ {
 		ch := query[i]
-		if ch == '{' {
+		switch ch {
+		case '{':
 			braceDepth++
-		} else if ch == '}' {
+		case '}':
 			braceDepth--
-		} else if ch == '|' && braceDepth == 0 {
-			// Check if this is a single pipe (not ||)
-			// Look ahead to see if next char is also |
-			if i+1 < len(query) && query[i+1] == '|' {
-				// This is ||, skip the next |
-				i++
-				continue
+		default:
+			if ch == '|' && braceDepth == 0 {
+				// Check if this is a single pipe (not ||)
+				if i+1 < len(query) && query[i+1] == '|' {
+					i++
+					continue
+				}
+				if i > 0 && query[i-1] == '|' {
+					continue
+				}
+				return i
 			}
-			// Look back to see if previous char was also |
-			if i > 0 && query[i-1] == '|' {
-				// Already handled as part of ||
-				continue
-			}
-			// Single pipe outside braces - this is the split point
-			return i
 		}
 	}
 	return -1
@@ -496,16 +564,18 @@ func findByClause(input string) int {
 	// Look for " by " keyword that's not inside parentheses
 	parenDepth := 0
 	for i := 0; i < len(input); i++ {
-		if input[i] == '(' {
+		switch input[i] {
+		case '(':
 			parenDepth++
-		} else if input[i] == ')' {
+		case ')':
 			parenDepth--
-		} else if parenDepth == 0 {
-			// Check if we're at " by " (with spaces before and after)
-			if i > 0 && input[i] == 'b' && i+2 < len(input) && input[i:i+3] == "by " {
-				// Check if there's whitespace before "by"
-				if input[i-1] == ' ' || input[i-1] == '\t' || input[i-1] == '\n' || input[i-1] == '\r' {
-					return i - 1 // Return position of space before "by"
+		default:
+			if parenDepth == 0 {
+				// Check if we're at " by " (with spaces before and after)
+				if i > 0 && input[i] == 'b' && i+2 < len(input) && input[i:i+3] == "by " {
+					if input[i-1] == ' ' || input[i-1] == '\t' || input[i-1] == '\n' || input[i-1] == '\r' {
+						return i - 1 // Return position of space before "by"
+					}
 				}
 			}
 		}
@@ -696,56 +766,8 @@ func (BinaryExpr) exprNode() {}
 // BinaryOp represents binary comparison operators.
 type BinaryOp int
 
-const (
-	// OpAnd is the logical AND operator (&&).
-	OpAnd BinaryOp = iota
-	// OpOr is the logical OR operator (||).
-	OpOr
-	// OpEq is the equality operator (=).
-	OpEq
-	// OpNeq is the inequality operator (!=).
-	OpNeq
-	// OpGt is the greater than operator (>).
-	OpGt
-	// OpGte is the greater than or equal operator (>=).
-	OpGte
-	// OpLt is the less than operator (<).
-	OpLt
-	// OpLte is the less than or equal operator (<=).
-	OpLte
-	// OpRegex is the regex match operator (=~).
-	OpRegex
-	// OpNotRegex is the regex not match operator (!~).
-	OpNotRegex
-)
-
 // StructuralOp represents structural query operators.
 type StructuralOp int
-
-// Structural operator string literals used during parsing.
-const (
-	opStrNotDescendant = "!>>"
-	opStrNotChild      = "!>"
-)
-
-const (
-	// OpDescendant is the descendant operator (>>).
-	OpDescendant StructuralOp = iota
-	// OpChild is the direct child operator (>).
-	OpChild
-	// OpSibling is the sibling operator (~).
-	OpSibling
-	// OpAncestor is the ancestor operator (<<).
-	OpAncestor
-	// OpParent is the direct parent operator (<).
-	OpParent
-	// OpNotSibling is the not sibling operator (!~).
-	OpNotSibling
-	// OpNotDescendant is the negated descendant operator (!>>).
-	OpNotDescendant
-	// OpNotChild is the negated child operator (!>).
-	OpNotChild
-)
 
 func (op BinaryOp) String() string {
 	switch op {
@@ -817,25 +839,6 @@ func (LiteralExpr) exprNode() {}
 
 // LiteralType represents the type of a literal value.
 type LiteralType int
-
-const (
-	// LitString represents a string literal.
-	LitString LiteralType = iota
-	// LitInt represents an integer literal.
-	LitInt
-	// LitFloat represents a float literal.
-	LitFloat
-	// LitBool represents a boolean literal.
-	LitBool
-	// LitDuration represents a duration literal.
-	LitDuration
-	// LitStatus represents a status literal (error, ok, unset).
-	LitStatus
-	// LitKind represents a kind literal (client, server, producer, consumer, internal, unspecified).
-	LitKind
-	// LitNil represents a nil literal.
-	LitNil
-)
 
 // parseExpression parses logical OR (lowest precedence)
 func (p *parser) parseExpression() (*FilterExpression, error) {

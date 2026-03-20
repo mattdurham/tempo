@@ -84,3 +84,28 @@ uncompressed column sizes. The actual compressed file may be smaller. The rotati
 threshold is therefore a loose upper bound, not a hard limit.
 
 Back-ref: `internal/modules/blockio/compaction/compaction.go:addSpanFromBlock`
+
+---
+
+## NOTE-37: Log File Re-sort by MinHash+Timestamp
+*Added: 2026-03-18*
+
+`CompactLogFile` globally re-sorts a log blockpack file by `(minHash[0..3], timestamp)`
+to produce tight label-value boundaries per block. The MinHash signature is computed over
+all `"key=value"` attribute pairs for each log record.
+
+**Why minHash clustering:** Log files written by ingest have arbitrary row order within
+each block. Without re-sorting, the per-block label ranges (min/max service_name, etc.)
+span many different label values, making range index pruning ineffective — almost every
+block passes the bloom/range check. After re-sorting, blocks contain log records with
+similar label sets, so per-block label ranges are tight and queries for a specific
+`service_name` can skip the majority of blocks.
+
+**Why timestamp as secondary key:** Within each minHash cluster, timestamp ordering
+preserves time-locality. This is important for log queries that filter by time range:
+the per-block min/max timestamp bounds stay narrow, enabling block-level time pruning.
+
+**Tradeoff:** The sort is in-memory and O(N) in total rows. `CompactLogFile` is not
+suitable for arbitrarily large files; it is intended for moderate-size log segments.
+
+Back-ref: `internal/modules/blockio/compaction/log_compaction.go:CompactLogFile`

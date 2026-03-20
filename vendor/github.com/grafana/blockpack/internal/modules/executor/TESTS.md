@@ -83,7 +83,7 @@ Query: `{ resource.service.name = "svc-a" && span.http.method = "GET" }`.
 
 **Setup:** 10 spans. Query: `{}`. `Options{Limit: 3}`.
 
-**Assertions:** `len(result.Matches) == 3`.
+**Assertions:** `len(rows) == 3`.
 
 ---
 
@@ -93,18 +93,18 @@ Query: `{ resource.service.name = "svc-a" && span.http.method = "GET" }`.
 
 **Setup:** 1 span with known TraceID `{0xAB, 0xCD, ...}`. Query: `{}`.
 
-**Assertions:** `result.Matches[0].TraceID == [16]byte{0xAB, 0xCD}`,
-`len(result.Matches[0].SpanID) > 0`.
+**Assertions:** `SpanMatchFromRow(rows[0], r.SignalType()).TraceID == [16]byte{0xAB, 0xCD}`,
+`len(SpanMatchFromRow(rows[0], r.SignalType()).SpanID) > 0`.
 
 ---
 
 ## EX-10: TestExecute_PlanPopulated
 
-**Scenario:** `result.Plan` is populated with block count information.
+**Scenario:** `CollectStats.TotalBlocks` is populated with block count information via the `OnStats` callback.
 
 **Setup:** 5 spans. Query: `{ resource.service.name = "svc" }`.
 
-**Assertions:** `result.Plan != nil`, `result.Plan.TotalBlocks > 0`.
+**Assertions:** `statsOut.TotalBlocks > 0` (captured via `CollectOptions{OnStats: func(s CollectStats) { statsOut = s }}`).
 
 ---
 

@@ -1361,3 +1361,35 @@ count and corrupt the parse.
 - `internal/modules/blockio/shared/constants.go:MaxCompactSectionSize`
 - `internal/modules/blockio/writer/metadata.go:writeCompactTraceIndex`
 - `internal/modules/blockio/writer/writer.go` (comments on lines ~384, ~460)
+
+---
+
+## 48. FileBloom Section — Cacheable Fuse8 for File-Level Service Name Rejection
+*Added: 2026-03-20*
+
+**Decision:** Add an optional `FileBloom` section (magic `FBLM`) as the last entry in the
+metadata blob, storing a BinaryFuse8 filter for `resource.service.name` values.
+
+**Why Fuse8 (not CMS):** CMS is already available via `FileSketchSummary` but requires
+keeping the full metadata blob alive if cached. Fuse8 bytes are cloned to a standalone
+small buffer (~100–300 bytes for typical files), making them safe to cache by (path, size)
+without retaining the entire metadata blob.
+
+**Why service.name only (not trace:id):** trace:id has high cardinality (unique per trace),
+making a Fuse8 bloom large for big files (~8.8 bits/trace). The existing compact trace index
+bloom (Kirsch-Mitzenmacher, ~10 bits/trace) already covers trace:id; it is now exposed via
+`TraceBloomRaw()` and `MayContainTraceID()` for the same caching pattern.
+
+**Caching pattern:**
+```go
+svcBloom   := r.FileBloomRaw()   // clone, ~100–300 bytes
+traceBloom := r.TraceBloomRaw()  // clone, existing compact bloom
+// Later, without reopening the file:
+fb, _ := reader.ParseFileBloom(svcBloom)
+fb.MayContainString("resource.service.name", "grafana") // false → skip file
+shared.TestTraceIDBloom(traceBloom, traceID)            // false → skip file
+```
+
+Back-ref: `internal/modules/blockio/writer/file_bloom.go:writeFileBloomSection`,
+          `internal/modules/blockio/reader/file_bloom.go:FileBloom`,
+          `internal/modules/executor/plan_blocks.go:fileLevelBloomReject`

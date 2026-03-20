@@ -45,6 +45,20 @@ func planBlocks(
 		}
 	}
 
+	// File-level bloom reject: Fuse8 for service.name, compact bloom for trace:id.
+	// NOTE-45: Checks equality predicates via FileBloom (Fuse8) and compact trace bloom.
+	if program != nil && program.Predicates != nil {
+		if fileLevelBloomReject(r, program.Predicates.Nodes) {
+			plan.SelectedBlocks = nil
+			plan.Explain = "file-level reject: bloom filter absence for equality predicate"
+			plan.PrunedByIndex = 0
+			plan.PrunedByTime = 0
+			plan.PrunedByFuse = 0
+			plan.PrunedByCMS = 0
+			return plan
+		}
+	}
+
 	// Intersect with intrinsic-column TOC when available.
 	// Returns nil when no pruning is possible (no intrinsic section, no intrinsic
 	// predicates, or all blocks survive), so we skip the intersection step in that case.
@@ -63,6 +77,89 @@ func planBlocks(
 	}
 
 	return plan
+}
+
+// fileLevelBloomReject returns true if file-level bloom filters guarantee that no span
+// in the file can match the equality predicates in nodes.
+// NOTE-45: Checks resource.service.name via FileBloom (Fuse8) and trace:id via compact bloom.
+// AND semantics: reject if ANY leaf rejects. OR semantics: reject only if ALL children reject.
+func fileLevelBloomReject(r *modules_reader.Reader, nodes []vm.RangeNode) bool {
+	fb := r.FileBloom()
+	for i := range nodes {
+		if bloomRejectByEquality(r, fb, &nodes[i]) {
+			return true
+		}
+	}
+	return false
+}
+
+// bloomRejectByEquality returns true if the equality predicate tree guarantees no match
+// via file-level bloom filters.
+func bloomRejectByEquality(r *modules_reader.Reader, fb *modules_reader.FileBloom, node *vm.RangeNode) bool {
+	if len(node.Children) > 0 {
+		if node.IsOR {
+			// OR: reject only if ALL children reject.
+			for i := range node.Children {
+				if !bloomRejectByEquality(r, fb, &node.Children[i]) {
+					return false
+				}
+			}
+			return true
+		}
+		// AND: reject if ANY child rejects.
+		for i := range node.Children {
+			if bloomRejectByEquality(r, fb, &node.Children[i]) {
+				return true
+			}
+		}
+		return false
+	}
+	// Leaf node — only handle equality (Values non-empty, no range/pattern).
+	if len(node.Values) == 0 || node.Min != nil || node.Max != nil || node.Pattern != "" {
+		return false
+	}
+	if node.Column == "" {
+		return false
+	}
+	// trace:id: compact bloom.
+	if node.Column == "trace:id" {
+		return bloomRejectTraceID(r, node.Values)
+	}
+	// String columns: FileBloom Fuse8.
+	return bloomRejectString(fb, node.Column, node.Values)
+}
+
+// bloomRejectTraceID returns true if ALL trace:id values are definitely absent (compact bloom).
+func bloomRejectTraceID(r *modules_reader.Reader, values []vm.Value) bool {
+	for _, v := range values {
+		b, ok := v.Data.([]byte)
+		if !ok || len(b) != 16 {
+			return false
+		}
+		var tid [16]byte
+		copy(tid[:], b)
+		if r.MayContainTraceID(tid) {
+			return false
+		}
+	}
+	return len(values) > 0
+}
+
+// bloomRejectString returns true if ALL string values are definitely absent (FileBloom Fuse8).
+func bloomRejectString(fb *modules_reader.FileBloom, col string, values []vm.Value) bool {
+	if fb == nil {
+		return false
+	}
+	for _, v := range values {
+		s, ok := v.Data.(string)
+		if !ok {
+			return false
+		}
+		if fb.MayContainString(col, s) {
+			return false
+		}
+	}
+	return len(values) > 0
 }
 
 // fileLevelReject returns true if the AND-combined predicates in nodes guarantee

@@ -143,3 +143,45 @@ errors.
 
 Back-ref: `internal/modules/blockio/compaction/compaction.go:prepareStagingDir`,
 `internal/modules/blockio/compaction/compaction.go:CompactBlocks` (deferred `cleanup()`)
+
+---
+
+## 8. Log File Compaction (CompactLogFile / CompactLogFileBytes)
+
+### Signatures
+
+```go
+func CompactLogFile(input modules_rw.ReaderProvider, output io.Writer, cfg Config) error
+func CompactLogFileBytes(input []byte, cfg Config) ([]byte, error)
+```
+
+### Purpose
+
+`CompactLogFile` reads a log-signal blockpack file, globally re-sorts all rows by
+`(minHash[0..3], timestamp)`, and writes a new compacted file to `output`.
+
+The MinHash signature is computed over `"key=value"` attribute pairs for each log record.
+Re-sorting by minHash clusters log records with similar label sets into contiguous blocks,
+producing tight per-block label-value boundaries that the range index can prune effectively
+for label-based queries.
+
+`CompactLogFileBytes` is a convenience wrapper over `CompactLogFile` that accepts and
+returns byte slices. Intended for tests and single-file compaction workflows.
+
+### Invariants
+
+- **Signal type guard**: `CompactLogFile` returns an error if the input file's signal type
+  is not `SignalTypeLog`. Trace files must use `CompactBlocks`.
+- **Global sort**: all rows from all input blocks are collected into memory, sorted by
+  `(minHash[0..3], timestamp)`, then re-written as a new file. This is an O(N) memory
+  operation and is intended for moderate-size files.
+- **Config reuse**: `cfg` is passed through to the underlying writer; `MaxBlockSpans`
+  controls the output block size.
+
+Back-ref: `internal/modules/blockio/compaction/log_compaction.go:CompactLogFile`,
+`internal/modules/blockio/compaction/log_compaction.go:CompactLogFileBytes`
+
+### NOTE-37 (Design Rationale)
+
+See NOTE-37 in `NOTES.md`: global re-sort by `(minHash, timestamp)` is the mechanism
+that makes label-based range index pruning effective for log files.

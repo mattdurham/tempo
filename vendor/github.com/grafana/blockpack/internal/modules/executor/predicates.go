@@ -17,6 +17,35 @@ import (
 	"github.com/grafana/blockpack/internal/vm"
 )
 
+// traceIntrinsicColumns is the set of column names served by the intrinsic section
+// for trace files. Includes "practically intrinsic" columns (resource.service.name).
+var traceIntrinsicColumns = map[string]struct{}{
+	"trace:id":              {},
+	"span:id":               {},
+	"span:parent_id":        {},
+	"span:name":             {},
+	"span:kind":             {},
+	"span:start":            {},
+	"span:end":              {},
+	"span:duration":         {},
+	"span:status":           {},
+	"span:status_message":   {},
+	"resource.service.name": {},
+}
+
+// logIntrinsicColumns is the set of column names served by the intrinsic section
+// for log files.
+var logIntrinsicColumns = map[string]struct{}{
+	"log:timestamp":          {},
+	"log:observed_timestamp": {},
+	"log:severity_number":    {},
+	"log:severity_text":      {},
+	"log:trace_id":           {},
+	"log:span_id":            {},
+	"log:flags":              {},
+	"resource.service.name":  {},
+}
+
 // BuildPredicates converts a compiled vm.Program into queryplanner.Predicate values
 // for bloom-filter and range-index block pruning.
 //
@@ -182,35 +211,6 @@ func translateRegexNode(r *modules_reader.Reader, col, pattern string) queryplan
 	}
 }
 
-// traceIntrinsicColumns is the set of column names served by the intrinsic section
-// for trace files. Includes "practically intrinsic" columns (resource.service.name).
-var traceIntrinsicColumns = map[string]struct{}{
-	"trace:id":              {},
-	"span:id":               {},
-	"span:parent_id":        {},
-	"span:name":             {},
-	"span:kind":             {},
-	"span:start":            {},
-	"span:end":              {},
-	"span:duration":         {},
-	"span:status":           {},
-	"span:status_message":   {},
-	"resource.service.name": {},
-}
-
-// logIntrinsicColumns is the set of column names served by the intrinsic section
-// for log files.
-var logIntrinsicColumns = map[string]struct{}{
-	"log:timestamp":          {},
-	"log:observed_timestamp": {},
-	"log:severity_number":    {},
-	"log:severity_text":      {},
-	"log:trace_id":           {},
-	"log:span_id":            {},
-	"log:flags":              {},
-	"resource.service.name":  {},
-}
-
 // ProgramIsIntrinsicOnly reports whether all column references in program can be
 // served from the intrinsic columns section without reading any block data.
 // Returns false if program is nil, references any dynamic attribute column, or
@@ -310,7 +310,7 @@ func BlocksFromIntrinsicTOC(r *modules_reader.Reader, program *vm.Program) []int
 	// (conservative: don't prune when OR semantics are involved).
 	var intrinsicLeaves []vm.RangeNode
 	for _, node := range program.Predicates.Nodes {
-		collectIntrinsicLeaves(node, &intrinsicLeaves)
+		intrinsicLeaves = append(intrinsicLeaves, collectIntrinsicLeaves(node)...)
 	}
 	if len(intrinsicLeaves) == 0 {
 		return nil
@@ -371,9 +371,16 @@ func BlocksFromIntrinsicTOC(r *modules_reader.Reader, program *vm.Program) []int
 	return selected.toSortedSlice(total)
 }
 
-// collectIntrinsicLeaves walks a RangeNode tree and appends leaf nodes whose column
-// is in the intrinsic column set to dst. OR composite nodes are skipped (conservative).
-func collectIntrinsicLeaves(node vm.RangeNode, dst *[]vm.RangeNode) {
+// collectIntrinsicLeaves walks a RangeNode tree and returns leaf nodes whose column
+// is in the intrinsic column set. OR composite nodes are skipped (conservative).
+func collectIntrinsicLeaves(node vm.RangeNode) []vm.RangeNode {
+	var out []vm.RangeNode
+	collectIntrinsicLeavesInto(node, &out)
+	return out
+}
+
+// collectIntrinsicLeavesInto is the single-allocation accumulator backing collectIntrinsicLeaves.
+func collectIntrinsicLeavesInto(node vm.RangeNode, out *[]vm.RangeNode) {
 	if len(node.Children) == 0 {
 		// Leaf node — include if it references an intrinsic column.
 		if node.Column == "" {
@@ -382,7 +389,7 @@ func collectIntrinsicLeaves(node vm.RangeNode, dst *[]vm.RangeNode) {
 		_, inTrace := traceIntrinsicColumns[node.Column]
 		_, inLog := logIntrinsicColumns[node.Column]
 		if inTrace || inLog {
-			*dst = append(*dst, node)
+			*out = append(*out, node)
 		}
 		return
 	}
@@ -391,7 +398,7 @@ func collectIntrinsicLeaves(node vm.RangeNode, dst *[]vm.RangeNode) {
 		return
 	}
 	for _, child := range node.Children {
-		collectIntrinsicLeaves(child, dst)
+		collectIntrinsicLeavesInto(child, out)
 	}
 }
 
@@ -802,23 +809,24 @@ func (b blockBitset) toSortedSlice(total int) []int {
 // searchMetaColumns returns the minimal set of blockpack column names needed to
 // construct a Tempo search result from a matched span.
 //
+// searchMetaCols is the fixed set of columns needed to construct a Tempo search result
+// from a matched span. Read-only — never mutate this map.
+//
 // NOTE-028: Mirrors Tempo's SearchMetaConditions() (pkg/traceql/storage.go), translated
 // to blockpack column names. Tempo pre-computes RootSpanName, RootServiceName,
 // TraceDuration, and TraceStartTime as trace-level parquet columns; blockpack stores
 // everything per-span so root span detection requires span:parent_id, and root name/
 // service are derived from span:name and resource.service.name of the root span.
 // span:end is included for duration fallback when no root span is present in the result set.
-func searchMetaColumns() map[string]struct{} {
-	return map[string]struct{}{
-		"trace:id":              {},
-		"span:id":               {},
-		"span:start":            {},
-		"span:end":              {},
-		"span:duration":         {},
-		"span:name":             {},
-		"span:parent_id":        {},
-		"resource.service.name": {},
-	}
+var searchMetaCols = map[string]struct{}{
+	"trace:id":              {},
+	"span:id":               {},
+	"span:start":            {},
+	"span:end":              {},
+	"span:duration":         {},
+	"span:name":             {},
+	"span:parent_id":        {},
+	"resource.service.name": {},
 }
 
 // ProgramWantColumns returns the minimal set of column names needed to evaluate program.

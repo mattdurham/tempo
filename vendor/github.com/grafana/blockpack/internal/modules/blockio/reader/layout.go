@@ -86,6 +86,21 @@ type FileLayoutSection struct {
 	IsLogical bool `json:"is_logical,omitempty"`
 }
 
+// layoutDecoderPool pools zstd decoders for the layout analysis path. A separate pool
+// from the hot-path decoder ensures FileLayout() does not interfere with concurrent
+// query decoding. Each pooled decoder is configured with concurrency=1 (single-goroutine
+// streaming) and is Reset per chunk rather than reallocated, matching the recommendation
+// in the zstd library docs for streaming-to-Discard size measurement.
+var layoutDecoderPool = &sync.Pool{
+	New: func() any {
+		dec, err := zstd.NewReader(nil, zstd.WithDecoderConcurrency(1))
+		if err != nil {
+			panic("layout: zstd.NewReader: " + err.Error())
+		}
+		return dec
+	},
+}
+
 // FileLayout computes a byte-level layout of the blockpack file, returning a report
 // that accounts for every byte. The returned Sections slice is sorted by Offset ascending.
 // Invariant: sum(section.CompressedSize) == FileSize.
@@ -708,21 +723,6 @@ func inflatedZstdChunk(body []byte, pos int) (int64, int, error) {
 	}
 
 	return 4 + n, pos + cLen, nil
-}
-
-// layoutDecoderPool pools zstd decoders for the layout analysis path. A separate pool
-// from the hot-path decoder ensures FileLayout() does not interfere with concurrent
-// query decoding. Each pooled decoder is configured with concurrency=1 (single-goroutine
-// streaming) and is Reset per chunk rather than reallocated, matching the recommendation
-// in the zstd library docs for streaming-to-Discard size measurement.
-var layoutDecoderPool = &sync.Pool{
-	New: func() any {
-		dec, err := zstd.NewReader(nil, zstd.WithDecoderConcurrency(1))
-		if err != nil {
-			panic("layout: zstd.NewReader: " + err.Error())
-		}
-		return dec
-	},
 }
 
 // zstdStreamedSize decompresses compressed into io.Discard via a pooled decoder and

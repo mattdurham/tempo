@@ -48,10 +48,8 @@ func encodeDeltaUint64(values []uint64, present []bool, nRows int, enc *zstdEnco
 		if !hasAny {
 			base = v
 			hasAny = true
-		} else {
-			if v < base {
-				base = v
-			}
+		} else if v < base {
+			base = v
 		}
 	}
 

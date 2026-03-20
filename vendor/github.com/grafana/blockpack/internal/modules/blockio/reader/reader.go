@@ -62,7 +62,10 @@ type Reader struct {
 	// intrinsicDecoded caches fully decoded intrinsic columns by name.
 	// Populated lazily by GetIntrinsicColumn.
 	intrinsicDecoded map[string]*shared.IntrinsicColumn
-	fileID           string
+	// fileBloomParsed is the lazily parsed FileBloom section. Access via FileBloom().
+	fileBloomParsed *FileBloom
+
+	fileID string
 
 	// traceIndexRaw holds the raw bytes of the trace index section for lazy parsing.
 	// Populated during parseV5MetadataLazy; parsed into traceIndex on first access.
@@ -75,6 +78,10 @@ type Reader struct {
 	// Parsed during NewReaderFromProvider.
 	blockMetas    []shared.BlockMeta
 	metadataBytes []byte
+
+	// fileBloomRaw holds the raw bytes of the FileBloom section, for caller caching.
+	// Nil for files written before the FileBloom section was introduced.
+	fileBloomRaw []byte
 
 	footerFields footerRaw
 
@@ -91,6 +98,8 @@ type Reader struct {
 	// intrinsicIndexOffset and intrinsicIndexLen are parsed from the v4 footer.
 	// Both are 0 for v3 footer files or files with no intrinsic section.
 	intrinsicIndexOffset uint64
+
+	fileBloomOnce sync.Once
 
 	fileSummaryOnce sync.Once
 
@@ -500,6 +509,59 @@ func (r *Reader) TraceEntries(traceID [16]byte) []TraceEntry {
 // ParseBlockFromBytes and AddColumnsToBlock now allocate their own fresh intern map per
 // call, so there is no shared state to reset between blocks.
 func (r *Reader) ResetInternStrings() {}
+
+// FileBloom returns the parsed file-level bloom filter for resource.service.name.
+// Returns nil for files written before the FileBloom section was introduced.
+// The returned *FileBloom is safe for concurrent use after the first call.
+func (r *Reader) FileBloom() *FileBloom {
+	r.fileBloomOnce.Do(func() {
+		if r.fileBloomRaw != nil {
+			fb, _, err := parseFileBloomSection(r.fileBloomRaw)
+			if err == nil {
+				r.fileBloomParsed = fb
+			}
+		}
+	})
+	return r.fileBloomParsed
+}
+
+// FileBloomRaw returns a clone of the raw bytes of the FileBloom section.
+// Callers may cache this slice (keyed by file path + size) and reconstruct
+// a FileBloom via ParseFileBloom without reopening the file.
+// Returns nil for files without a FileBloom section (old format).
+func (r *Reader) FileBloomRaw() []byte {
+	if r.fileBloomRaw == nil {
+		return nil
+	}
+	return slices.Clone(r.fileBloomRaw)
+}
+
+// TraceBloomRaw returns a clone of the raw bytes of the compact trace ID bloom filter.
+// Callers may cache this slice and use shared.TestTraceIDBloom for trace:id
+// file-level rejection without reopening the file.
+// Returns nil for files without a compact trace index bloom.
+func (r *Reader) TraceBloomRaw() []byte {
+	if r.compactLen > 0 {
+		_ = r.ensureCompactIndexParsed()
+	}
+	if r.compactParsed == nil {
+		return nil
+	}
+	return slices.Clone(r.compactParsed.traceIDBloom)
+}
+
+// MayContainTraceID returns false only when the compact trace bloom guarantees
+// the trace ID is absent from this file. Returns true (conservative) when no
+// compact trace index or bloom is present.
+func (r *Reader) MayContainTraceID(traceID [16]byte) bool {
+	if r.compactLen > 0 {
+		_ = r.ensureCompactIndexParsed()
+	}
+	if r.compactParsed == nil {
+		return true
+	}
+	return shared.TestTraceIDBloom(r.compactParsed.traceIDBloom, traceID)
+}
 
 // AddColumnsToBlock decodes additional columns from an already-loaded BlockWithBytes.
 // No additional I/O is performed.
