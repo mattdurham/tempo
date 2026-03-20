@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"sort"
 
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
 	modules_shared "github.com/grafana/blockpack/internal/modules/blockio/shared"
@@ -741,19 +742,29 @@ func extractIntrinsicRefsDirect(r *modules_reader.Reader, selected []modules_sha
 				}
 			}
 		case modules_shared.IntrinsicFormatFlat:
-			for i, ref := range col.BlockRefs {
-				if remaining == 0 {
-					break
-				}
+			// Binary search col.BlockRefs (file-order sorted) for each target ref.
+			// O(M × log N) instead of O(N) scan — critical for small limits on large files.
+			for _, ref := range selected {
 				key := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx)
-				if idx := searchIndex(key); idx >= 0 {
-					if _, already := result[idx][colName]; !already {
-						if len(col.Uint64Values) > i {
-							result[idx][colName] = col.Uint64Values[i]
-						} else if len(col.BytesValues) > i {
-							result[idx][colName] = col.BytesValues[i]
+				idx := searchIndex(key)
+				if idx < 0 {
+					continue
+				}
+				if _, already := result[idx][colName]; already {
+					continue
+				}
+				pos := sort.Search(len(col.BlockRefs), func(i int) bool {
+					r := col.BlockRefs[i]
+					return uint32(r.BlockIdx)<<16|uint32(r.RowIdx) >= key
+				})
+				if pos < len(col.BlockRefs) {
+					r := col.BlockRefs[pos]
+					if uint32(r.BlockIdx)<<16|uint32(r.RowIdx) == key {
+						if len(col.Uint64Values) > pos {
+							result[idx][colName] = col.Uint64Values[pos]
+						} else if len(col.BytesValues) > pos {
+							result[idx][colName] = col.BytesValues[pos]
 						}
-						remaining--
 					}
 				}
 			}
