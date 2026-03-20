@@ -9,6 +9,7 @@ import (
 
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
+	tempocommon "github.com/grafana/tempo/pkg/tempopb/common/v1"
 	commonv1 "go.opentelemetry.io/proto/otlp/common/v1"
 )
 
@@ -70,6 +71,10 @@ func computeMinHashSigFromProto(ps *pendingSpan) {
 	}
 
 	hashKV := func(kv *commonv1.KeyValue) {
+		if kv.Value == nil {
+			shared.AddHashToMinHeap(kv.Key, &ps.minHashSig)
+			return
+		}
 		if sv, ok := kv.Value.GetValue().(*commonv1.AnyValue_StringValue); ok {
 			shared.AddKVHashToMinHeap(kv.Key, sv.StringValue, &ps.minHashSig)
 		} else {
@@ -93,6 +98,51 @@ func computeMinHashSigFromProto(ps *pendingSpan) {
 	}
 	if ps.ss != nil && ps.ss.Scope != nil {
 		for _, kv := range ps.ss.Scope.Attributes {
+			if kv != nil {
+				hashKV(kv)
+			}
+		}
+	}
+}
+
+// computeMinHashSigFromTempoProto computes a MinHash signature for a pendingSpan sourced from
+// Tempo-native proto types (github.com/grafana/tempo/pkg/tempopb/...).
+// Mirrors computeMinHashSigFromProto for tempocommon.KeyValue.
+//
+//nolint:dupl // intentional mirror of computeMinHashSigFromProto for Tempo types
+func computeMinHashSigFromTempoProto(ps *pendingSpan) {
+	ps.minHashSig = [4]uint64{
+		^uint64(0), ^uint64(0), ^uint64(0), ^uint64(0),
+	}
+
+	hashKV := func(kv *tempocommon.KeyValue) {
+		if kv.Value == nil {
+			shared.AddHashToMinHeap(kv.Key, &ps.minHashSig)
+			return
+		}
+		if sv, ok := kv.Value.GetValue().(*tempocommon.AnyValue_StringValue); ok {
+			shared.AddKVHashToMinHeap(kv.Key, sv.StringValue, &ps.minHashSig)
+		} else {
+			shared.AddHashToMinHeap(kv.Key, &ps.minHashSig)
+		}
+	}
+
+	if ps.tempoSpan != nil {
+		for _, kv := range ps.tempoSpan.Attributes {
+			if kv != nil {
+				hashKV(kv)
+			}
+		}
+	}
+	if ps.tempoRS != nil && ps.tempoRS.Resource != nil {
+		for _, kv := range ps.tempoRS.Resource.Attributes {
+			if kv != nil {
+				hashKV(kv)
+			}
+		}
+	}
+	if ps.tempoSS != nil && ps.tempoSS.Scope != nil {
+		for _, kv := range ps.tempoSS.Scope.Attributes {
 			if kv != nil {
 				hashKV(kv)
 			}

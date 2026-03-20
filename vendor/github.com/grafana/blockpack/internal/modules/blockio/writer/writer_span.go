@@ -5,12 +5,17 @@ package writer
 import (
 	"fmt"
 
+	tempocommon "github.com/grafana/tempo/pkg/tempopb/common/v1"
+	temporesource "github.com/grafana/tempo/pkg/tempopb/resource/v1"
 	commonv1 "go.opentelemetry.io/proto/otlp/common/v1"
 	resourcev1 "go.opentelemetry.io/proto/otlp/resource/v1"
 	tracev1 "go.opentelemetry.io/proto/otlp/trace/v1"
 
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
 )
+
+// svcNameAttrKey is the OpenTelemetry resource attribute key for service name.
+const svcNameAttrKey = "service.name"
 
 // protoToAttrValue converts an OTLP AnyValue to a shared.AttrValue.
 // String values are zero-copy references into the proto's backing bytes.
@@ -86,7 +91,7 @@ func extractSvcNameFromProto(r *resourcev1.Resource) string {
 		return ""
 	}
 	for _, kv := range r.Attributes {
-		if kv == nil || kv.Key != "service.name" || kv.Value == nil {
+		if kv == nil || kv.Key != svcNameAttrKey || kv.Value == nil {
 			continue
 		}
 		if sv, ok := kv.Value.Value.(*commonv1.AnyValue_StringValue); ok {
@@ -96,9 +101,50 @@ func extractSvcNameFromProto(r *resourcev1.Resource) string {
 	return ""
 }
 
+// tempoToAttrValue converts a Tempo AnyValue to a shared.AttrValue.
+// Mirrors protoToAttrValue for github.com/grafana/tempo/pkg/tempopb/common/v1 types.
+func tempoToAttrValue(v *tempocommon.AnyValue) shared.AttrValue {
+	if v == nil {
+		return shared.AttrValue{Type: shared.ColumnTypeString}
+	}
+	switch val := v.Value.(type) {
+	case *tempocommon.AnyValue_StringValue:
+		return shared.AttrValue{Type: shared.ColumnTypeString, Str: val.StringValue}
+	case *tempocommon.AnyValue_IntValue:
+		return shared.AttrValue{Type: shared.ColumnTypeInt64, Int: val.IntValue}
+	case *tempocommon.AnyValue_DoubleValue:
+		return shared.AttrValue{Type: shared.ColumnTypeFloat64, Float: val.DoubleValue}
+	case *tempocommon.AnyValue_BoolValue:
+		return shared.AttrValue{Type: shared.ColumnTypeBool, Bool: val.BoolValue}
+	case *tempocommon.AnyValue_BytesValue:
+		cp := make([]byte, len(val.BytesValue))
+		copy(cp, val.BytesValue)
+		return shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: cp}
+	default:
+		return shared.AttrValue{Type: shared.ColumnTypeString, Str: v.String()}
+	}
+}
+
+// extractSvcNameFromTempoProto scans a Tempo Resource proto for the service.name attribute.
+// Mirrors extractSvcNameFromProto for github.com/grafana/tempo/pkg/tempopb/resource/v1 types.
+func extractSvcNameFromTempoProto(r *temporesource.Resource) string {
+	if r == nil {
+		return ""
+	}
+	for _, kv := range r.Attributes {
+		if kv == nil || kv.Key != svcNameAttrKey || kv.Value == nil {
+			continue
+		}
+		if sv, ok := kv.Value.Value.(*tempocommon.AnyValue_StringValue); ok {
+			return sv.StringValue
+		}
+	}
+	return ""
+}
+
 // extractSvcNameFromMap returns the service.name string value from a map[string]any.
 func extractSvcNameFromMap(m map[string]any) string {
-	if v, ok := m["service.name"]; ok {
+	if v, ok := m[svcNameAttrKey]; ok {
 		if s, ok := v.(string); ok {
 			return s
 		}

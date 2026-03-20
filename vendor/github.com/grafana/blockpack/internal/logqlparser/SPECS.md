@@ -300,6 +300,7 @@ Back-ref: `internal/logqlparser/pipeline.go:PipelineStageFunc`
 type LabelSet interface {
     Get(key string) string
     Has(key string) bool
+    HasLive(key string) bool
     Set(key, val string)
     Delete(key string)
     Keys() []string
@@ -308,7 +309,8 @@ type LabelSet interface {
 ```
 
 - `Get` returns the value for `key`, or `""` if absent or deleted.
-- `Has` reports whether `key` is present, even when its value is `""`. Implementations MUST distinguish "present with empty value" from "absent". This is used by `JSONStage`/`LogfmtStage` to skip keys that were populated at ingest (the "stored columns win" invariant).
+- `Has` reports whether `key` is present anywhere — in the overlay, a decoded column, OR an undecoded block column. Used for block-level column presence checks. For per-row parser stages, prefer `HasLive`.
+- `HasLive` reports whether `key` has a live (immediately accessible) value — in the overlay (set by a previous stage) or in a decoded block column. Undecoded block columns (present in storage but not yet decompressed) return `false`. For `mapLabelSet`, `HasLive` is identical to `Has`. Used by `JSONStage` and `LogfmtStage` to skip only keys that are truly accessible, not merely present in block metadata.
 - `Set` adds or overwrites `key` with `val`. A subsequent `Has(key)` MUST return `true`.
 - `Delete` removes `key`. A subsequent `Has(key)` MUST return `false`.
 - `Materialize` copies all present labels into a new `map[string]string`.
@@ -336,7 +338,10 @@ Back-ref: `internal/logqlparser/pipeline.go:Pipeline.Process`
 
 `JSONStage()` parses the log line as a JSON object and extracts all top-level key-value
 pairs as labels. If the line is not valid JSON or not a JSON object, labels are unchanged
-and the row is kept (silent failure policy — NOTE-007).
+and the row is kept (silent failure policy — NOTE-007). When iterating JSON keys, keys
+where `labels.HasLive(k)` returns true are skipped (live labels win). Keys present in
+block storage but not yet decoded (HasLive=false) are populated into the overlay so that
+subsequent stages such as `line_format` can access them.
 
 Back-ref: `internal/logqlparser/pipeline.go:JSONStage`
 
@@ -344,7 +349,13 @@ Back-ref: `internal/logqlparser/pipeline.go:JSONStage`
 
 `LogfmtStage()` parses the log line as logfmt key=value pairs and extracts them as labels.
 Uses `github.com/go-logfmt/logfmt`. Invalid logfmt keeps labels unchanged; row is NOT
-dropped (NOTE-007).
+dropped (NOTE-007). Keys where `labels.HasLive(k)` returns true are skipped (live labels
+win). Undecoded block columns (HasLive=false) are populated into the overlay so that
+subsequent stages such as `line_format` can access them. Before parsing the body,
+`HideBodyParsedColumns()` is called on the label set so that ingest-time last-wins
+column values cannot shadow re-parsed first-wins values. After parsing, `__error__` is
+always set to `""` unconditionally (non-strict mode — parse errors do not set
+`"LogfmtParserErr"`). `__error__` is not guarded by `HasLive`.
 
 Back-ref: `internal/logqlparser/pipeline.go:LogfmtStage`
 

@@ -9,10 +9,9 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strconv"
 	"text/template"
-
-	regexp "github.com/coregx/coregex"
 
 	"github.com/go-logfmt/logfmt"
 )
@@ -33,6 +32,18 @@ type PipelineStageFunc func(ts uint64, line string, labels LabelSet) (string, La
 type Pipeline struct {
 	Stages           []PipelineStageFunc
 	parserFreeStages []PipelineStageFunc // same as Stages but with logfmt/JSON parser stages removed
+	// HasLineFormat is true when any stage is a line_format stage.
+	// When true, ProcessSkipParsers is unsafe: line_format calls Materialize() which
+	// only includes decoded columns. If the parser was skipped, body-parsed fields
+	// (caller, msg, etc.) are never put in the overlay → template produces "".
+	// The executor must use Process() instead to run logfmt and populate the overlay.
+	HasLineFormat bool
+	// HasParserStage is true when any stage is a logfmt or JSON parser stage.
+	// When true, the executor must call HideLogColumns() on the blockLabelSet before
+	// running Process() so that ingest-time log.* column values do not shadow
+	// re-parsed body values. This ensures first-wins logfmt semantics and correct
+	// behavior for non-logfmt bodies (e.g. JSON) that would fail logfmt parsing.
+	HasParserStage bool
 }
 
 // Process applies all stages in order to the given row.
@@ -78,15 +89,20 @@ func (p *Pipeline) ProcessSkipParsers(ts uint64, line string, labels LabelSet) (
 // and the row is kept (silent failure policy — NOTE-007).
 func JSONStage() PipelineStageFunc {
 	return func(_ uint64, line string, labels LabelSet) (string, LabelSet, bool) {
+		// Hide ingest-time log.* columns before parsing so body re-parse uses
+		// first-wins semantics. Runs immediately before the parser stage.
+		labels.HideBodyParsedColumns()
 		var obj map[string]interface{}
 		if err := json.Unmarshal([]byte(line), &obj); err != nil {
 			// Not valid JSON — keep row unchanged (SPEC-003, NOTE-007)
 			return line, labels, true
 		}
 		for k, v := range obj {
-			// SPEC-11.5 no-op: stored columns win; pipeline fills gaps only.
-			// Use Has to correctly skip keys whose stored value is "".
-			if labels.Has(k) {
+			// SPEC-11.5 no-op: live labels win; pipeline fills gaps for undecoded columns.
+			// HasLive skips only keys that have an immediately accessible value (overlay or
+			// decoded block column). Undecoded block columns return HasLive=false, so JSON
+			// extraction populates them into the overlay — line_format then sees the value.
+			if labels.HasLive(k) {
 				continue
 			}
 			switch s := v.(type) {
@@ -106,19 +122,28 @@ func JSONStage() PipelineStageFunc {
 // Invalid logfmt keeps labels unchanged; row is NOT dropped (NOTE-007).
 func LogfmtStage() PipelineStageFunc {
 	return func(_ uint64, line string, labels LabelSet) (string, LabelSet, bool) {
+		// Hide ingest-time log.* columns before parsing so body re-parse uses
+		// first-wins semantics and does not fall back to last-wins ingest values.
+		// This runs immediately before the parser, so prior non-parser stages
+		// (e.g. label_format) already executed and are unaffected.
+		labels.HideBodyParsedColumns()
 		dec := logfmt.NewDecoder(bytes.NewBufferString(line))
 		for dec.ScanRecord() {
 			for dec.ScanKeyval() {
 				k := string(dec.Key())
-				// SPEC-11.5 no-op: stored columns win; pipeline fills gaps only.
-				// Use Has to correctly skip keys whose stored value is "".
-				if labels.Has(k) {
+				// SPEC-11.5 no-op: live labels win; pipeline fills gaps for undecoded columns.
+				// HasLive skips only keys that have an immediately accessible value (overlay or
+				// decoded block column). Undecoded block columns return HasLive=false, so logfmt
+				// extraction populates them into the overlay — line_format then sees the value.
+				if labels.HasLive(k) {
 					continue
 				}
 				labels.Set(k, string(dec.Value()))
 			}
 		}
-		// Ignore decode errors — keep row with whatever was parsed (SPEC-004, NOTE-007)
+		// Loki non-strict logfmt: __error__ is always "" regardless of parse errors.
+		// __error__ is set unconditionally — not guarded by HasLive.
+		labels.Set("__error__", "")
 		return line, labels, true
 	}
 }
@@ -191,7 +216,9 @@ func LabelFilterStage(name, value string, op FilterOp) PipelineStageFunc {
 	var re *regexp.Regexp
 	if op == OpRegex || op == OpNotRegex {
 		var err error
-		re, err = regexp.Compile(value)
+		// Loki anchors label-filter regexes as full-string matches: ^(?:value)$
+		// Without anchoring, "warn|error" would match "warning" as a substring.
+		re, err = regexp.Compile("^(?:" + value + ")$")
 		if err != nil {
 			// Invalid regex — always drop (fail safe)
 			return func(_ uint64, line string, labels LabelSet) (string, LabelSet, bool) {

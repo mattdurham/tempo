@@ -379,7 +379,7 @@ func iterateLogRows(
 		tsCol := bwb.Block.GetColumn("log:timestamp")
 		bodyCol := bwb.Block.GetColumn("log:body")
 		colNames, colMap, colCols, logStrNames, logStrCols := buildBlockColMapsWithLogCache(bwb.Block)
-		skipParsers := pipeline != nil && blockHasBodyParsed(bwb.Block)
+		skipParsers := pipeline != nil && blockHasBodyParsed(bwb.Block) && !pipeline.HasLineFormat
 		if processLogRows(keptByTime, tsCol, bodyCol, colNames, colMap, colCols, logStrNames, logStrCols, bwb.Block, pipeline, skipParsers, canSkip, fn) {
 			return fetchCount, nil
 		}

@@ -216,3 +216,33 @@ Intersects with label matcher result.
 **Assertions:**
 - `labels["level"]` == "error".
 - `labels["service"]` == "payments".
+
+### LQP-TEST-131: TestLogfmtStage_ExtractsFieldWhenHasLiveFalse
+**Scenario:** LogfmtStage populates a key into the overlay when `Has(k)=true` but `HasLive(k)=false` (simulating an undecoded block column).
+**Setup:** Test-only `hasLiveMockLabelSet` with `"caller"` in storedKeys (Has=true, HasLive=false) and `"level"` in liveKeys (Has=true, HasLive=true, overlay="stored-level"). Logfmt body: `caller=main.go level=debug msg=hello`.
+**Assertions:**
+- `labels["caller"]` == "main.go" (extracted from logfmt into overlay).
+- `labels["level"]` == "stored-level" (live label wins; not overwritten).
+- `labels["msg"]` == "hello" (new key extracted normally).
+
+### LQP-TEST-132: TestLogfmtStage_SetsErrorLabelOnSuccess
+**Scenario:** LogfmtStage sets `__error__=""` after successful logfmt parse.
+**Setup:** Empty labels; body `level=info msg=ok`.
+**Assertions:**
+- `labels.Has("__error__")` == true.
+- `labels["__error__"]` == "".
+
+### LQP-TEST-133: TestJSONStage_ExtractsFieldWhenHasLiveFalse
+**Scenario:** JSONStage populates a key into the overlay when `HasLive(k)=false` (simulating an undecoded block column).
+**Setup:** Same `hasLiveMockLabelSet` as LQP-TEST-131. JSON body: `{"caller":"main.go","level":"debug","msg":"hello"}`.
+**Assertions:**
+- `labels["caller"]` == "main.go" (extracted from JSON into overlay).
+- `labels["level"]` == "stored-level" (live label wins).
+- `labels["msg"]` == "hello".
+
+### LQP-TEST-134: TestLogfmtStage_SetsErrorLabelOnFailure
+**Scenario:** LogfmtStage sets `__error__=""` even after a logfmt decode error (non-strict mode).
+**Setup:** Empty labels; body `=bad` (bare `=` causes logfmt error).
+**Assertions:**
+- `labels.Has("__error__")` == true.
+- `labels["__error__"]` == `""` (non-strict: parse errors do not set `"LogfmtParserErr"`).
