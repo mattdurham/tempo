@@ -1056,3 +1056,28 @@ Old readers that do not know about this section will ignore trailing bytes in th
 section (the metadata parser is pos-based and does not assert pos == len(data) at end).
 New readers that open old files receive (nil, 0, nil) from parseTSIndex and degrade
 gracefully to metadata-scan mode in BlocksInTimeRange.
+
+## SPEC-FBLM-1
+**FileBloom section** — optional trailing section in the metadata blob, written after the sketch index.
+Stores a BinaryFuse8 filter for `resource.service.name` values, enabling O(1) file-level rejection
+for service-name equality predicates without opening any block.
+
+Wire format:
+```
+magic[4 LE]     = 0x46424C4D ("FBLM")
+version[1]      = 0x01
+col_count[4 LE]
+per column (col_count entries, sorted by name):
+  name_len[2 LE] + name[name_len bytes]
+  fuse_len[4 LE] + fuse_data[fuse_len bytes]
+```
+
+Properties:
+- `fuse_len = 0` means no values were observed (no data bytes follow); reader treats as `true` (conservative).
+- `col_count` is bounded to ≤ 1000 and validated against remaining bytes on parse.
+- Old readers that do not know about the FileBloom section will stop parsing after the sketch index without corruption (graceful degradation).
+- BinaryFuse8 guarantees no false negatives (SPEC-SK-12); false positive rate ~0.39% (SPEC-SK-13).
+
+Back-ref: `internal/modules/blockio/writer/file_bloom.go:writeFileBloomSection`,
+          `internal/modules/blockio/reader/file_bloom.go:parseFileBloomSection`,
+          `internal/modules/executor/plan_blocks.go:fileLevelBloomReject`

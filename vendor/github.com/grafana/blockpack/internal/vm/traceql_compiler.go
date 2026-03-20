@@ -20,6 +20,14 @@ const (
 	intrinsicSpanParentID = "span:parent_id"
 )
 
+// computedFields are fields calculated at query time that do NOT exist as stored columns.
+// Extracting them into predicates causes false negatives (blocks rejected when they contain matching spans).
+var computedFields = map[string]bool{
+	"span.leaf":       true,
+	"span.root":       true,
+	"span.childCount": true,
+}
+
 // CompileTraceQLFilter compiles a TraceQL FilterExpression directly to a VM Program.
 // Generates a ColumnPredicate for fast bulk scanning against blockpack columns.
 func CompileTraceQLFilter(filter *traceqlparser.FilterExpression) (*Program, error) {
@@ -218,7 +226,12 @@ func (c *traceqlCompiler) compileColumnPredicateExpr(expr traceqlparser.Expr) (C
 	case *traceqlparser.LiteralExpr:
 		// Literal boolean value
 		if e.Type == traceqlparser.LitBool {
-			if e.Value.(bool) {
+			// SPEC-ROOT-001: two-value type assertion to prevent panic on unexpected LitBool value type
+			boolVal, ok := e.Value.(bool)
+			if !ok {
+				return nil, fmt.Errorf("LitBool literal has non-bool value: %T", e.Value)
+			}
+			if boolVal {
 				// true - match all
 				return func(provider ColumnDataProvider) (RowSet, error) {
 					return provider.FullScan(), nil
@@ -464,14 +477,6 @@ func isHexBytesAttribute(path string) bool {
 	default:
 		return false
 	}
-}
-
-// computedFields are fields calculated at query time that do NOT exist as stored columns.
-// Extracting them into predicates causes false negatives (blocks rejected when they contain matching spans).
-var computedFields = map[string]bool{
-	"span.leaf":       true,
-	"span.root":       true,
-	"span.childCount": true,
 }
 
 // isComputedField checks if a column name represents a computed field
@@ -730,7 +735,7 @@ func dedupStrings(ss []string) []string {
 		return ss
 	}
 	seen := make(map[string]struct{}, len(ss))
-	out := ss[:0]
+	out := make([]string, 0, len(ss))
 	for _, s := range ss {
 		if _, ok := seen[s]; !ok {
 			seen[s] = struct{}{}

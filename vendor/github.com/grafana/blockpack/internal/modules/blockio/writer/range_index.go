@@ -589,7 +589,7 @@ func applyOverlapBytes(cd *rangeColumnData, nBuckets int) {
 		return
 	}
 	// Deduplicate consecutive equal bounds.
-	bounds := slices.CompactFunc(rawBounds, func(a, b []byte) bool { return bytes.Equal(a, b) })
+	bounds := slices.CompactFunc(rawBounds, bytes.Equal)
 	if len(bounds) < 2 {
 		return
 	}

@@ -22,6 +22,9 @@ const (
 	sketchSectionMagic = uint32(0x534B5443) // "SKTC" — must match writer/sketch_index.go
 )
 
+// Ensure columnSketchData satisfies queryplanner.ColumnSketch at compile time.
+var _ queryplanner.ColumnSketch = (*columnSketchData)(nil)
+
 // columnSketchData holds parsed column-major sketch data for one column across all blocks.
 // CMS and fuse are lazily deserialized on first access to avoid paying the cost at file open.
 type columnSketchData struct {
@@ -133,9 +136,6 @@ func (cd *columnSketchData) FuseContains(valHash uint64) []bool {
 	}
 	return out
 }
-
-// Ensure columnSketchData satisfies queryplanner.ColumnSketch at compile time.
-var _ queryplanner.ColumnSketch = (*columnSketchData)(nil)
 
 // parseSketchIndexSection parses the sketch index section from data (column-major format).
 // Returns (*sketchIndex, bytesConsumed, nil) on success.

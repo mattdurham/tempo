@@ -269,3 +269,38 @@ to ensure the column is decoded for the row-level closure.
 
 Back-ref: `internal/logqlparser/compile.go:extractPredicates`,
 `internal/logqlparser/compile.go:addPushdownQueryPredicates`
+
+---
+
+## 12. Numeric pipeline filters skipped when no parser seen (NOTE-012)
+*Added: 2026-03-19*
+
+**Decision:** `identifyPushdownStages` now adds parseable numeric ops (`OpGT/GTE/LT/LTE`)
+to `skip` when `!seenParser`, matching the behaviour of string ops.
+
+**Rationale:** Previously numeric ops were always kept in the pipeline even when pushed
+into a `ColumnPredicate` (both `skip` and `columnPred` were populated for string ops;
+only `columnPred` was populated for numeric). This caused double evaluation:
+1. `ScanGreaterThan`/`ScanLessThan` (column predicate) — correct per-row comparison.
+2. `LabelFilterStage` (pipeline) — same comparison via `blockLabelSet.Get` + `strconv.ParseFloat`.
+
+`ScanGreaterThan` already handles `ColumnTypeRangeString` columns via a dict-level
+float pre-parse fast path (NOTE-022 in executor), so the pipeline stage was genuinely
+redundant for the pre-parser case.
+
+**When numeric ops are kept in pipeline:** when `seenParser=true` (a `| json` or
+`| logfmt` stage precedes the numeric filter in the full query). In that path the
+pipeline may run on blocks without body-parsed columns, where the parser stage extracts
+values the column predicate cannot see.
+
+**Scope note — numeric range predicates are log-scoped:** `compileSinglePushdownPredicate`
+for numeric ops scans only `log.{name}`, not `resource.{name}` (matching the comment
+at `compile.go:compileSinglePushdownPredicate` — "range predicates are log-scoped").
+String ops union both scopes. This means `| latency_ms > 200` will not match an
+attribute stored under `resource.latency_ms`. This was true before this change —
+the prior pipeline backstop (`LabelFilterStage` via `blockLabelSet.Get`) may have
+matched resource-scoped attributes as a side effect, but the column predicate never
+did. The correct mental model: numeric range filters target body-parsed log fields
+(`log.*`), not resource/stream labels. This case is unchanged.
+
+Back-ref: `internal/logqlparser/compile.go:identifyPushdownStages`

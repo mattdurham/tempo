@@ -19,6 +19,20 @@ import (
 // NOTE-038: sentinel error for fallback from intrinsic pre-filter to block scan.
 var errNeedBlockScan = errors.New("intrinsic fast path not applicable")
 
+// errLimitReached is used as an early-stop sentinel inside forEachBlockInGroups callbacks.
+// It signals that the results limit has been satisfied; it is never returned to callers.
+var errLimitReached = errors.New("limit reached")
+
+// SortScanThreshold is the max number of matching refs for which the KLL path
+// is used in collectIntrinsicTopK (Case B). Below this threshold: group refs by block,
+// sort blocks by BlockMeta.MaxStart DESC (newest first), build a packed-key→timestamp
+// map from tsCol (O(N)), look up each of the M refs in O(1), sort M pairs (O(M log M)).
+// Above this threshold: use ScanFlatColumnRefsFiltered — cheaper when M is large relative to N.
+// Crossover: O(N) map build vs O(N) scan — the KLL path wins by avoiding repeated blob
+// decompression; for M >= 8K the scan path is preferred as it stops early after K results.
+// Exported so tests can override it to force the scan path. See NOTE-043.
+var SortScanThreshold = 8000
+
 // blockRefCompare orders BlockRefs by (BlockIdx, RowIdx) ascending.
 func blockRefCompare(a, b modules_shared.BlockRef) int {
 	if n := cmp.Compare(a.BlockIdx, b.BlockIdx); n != 0 {
@@ -156,7 +170,7 @@ func Collect(
 	// nil means decode all columns (AllColumns=true or no column filter).
 	var secondPassCols map[string]struct{}
 	if wantColumns != nil && !opts.AllColumns {
-		searchCols := searchMetaColumns()
+		searchCols := searchMetaCols
 		secondPassCols = make(map[string]struct{}, len(searchCols)+len(wantColumns))
 		for k := range searchCols {
 			secondPassCols[k] = struct{}{}
@@ -540,6 +554,73 @@ func collectFromIntrinsicRefs(
 	return collectMixedTopK(r, program, refs, opts, wantColumns, secondPassCols, stats)
 }
 
+// parsedBlock holds the result of the two-pass parse for one block.
+type parsedBlock struct {
+	Block    *modules_reader.Block
+	BlockIdx int
+}
+
+// groupRefsByBlock converts a slice of BlockRefs into a stable block traversal order
+// and a map from block index to row indices. The order preserves first-seen block order.
+func groupRefsByBlock(refs []modules_shared.BlockRef) (blockOrder []int, blockRows map[int][]int) {
+	blockOrder = make([]int, 0, 4)
+	blockRows = make(map[int][]int, 4)
+	for _, ref := range refs {
+		bi := int(ref.BlockIdx)
+		if _, seen := blockRows[bi]; !seen {
+			blockOrder = append(blockOrder, bi)
+		}
+		blockRows[bi] = append(blockRows[bi], int(ref.RowIdx))
+	}
+	return blockOrder, blockRows
+}
+
+// forEachBlockInGroups iterates over coalesced block groups, performing the standard
+// two-pass fetch+parse for each block (first pass: wantColumns; second pass: secondPassCols),
+// and invokes fn for each successfully parsed block with its candidate row indices.
+// If fn returns a non-nil error, iteration stops and that error is returned.
+// callerName is used only for error context strings.
+func forEachBlockInGroups(
+	r *modules_reader.Reader,
+	blockOrder []int,
+	blockCandidates map[int][]int,
+	wantColumns map[string]struct{},
+	secondPassCols map[string]struct{},
+	callerName string,
+	fn func(pb parsedBlock, candidateRows []int) error,
+) error {
+	groups := r.CoalescedGroups(blockOrder)
+	for _, group := range groups {
+		fetched, err := r.ReadGroup(group)
+		if err != nil {
+			return fmt.Errorf("%s ReadGroup: %w", callerName, err)
+		}
+		for _, blockIdx := range group.BlockIDs {
+			candidateRows := blockCandidates[blockIdx]
+			raw, ok := fetched[blockIdx]
+			if !ok {
+				continue
+			}
+			meta := r.BlockMeta(blockIdx)
+			r.ResetInternStrings()
+			bwb, parseErr := r.ParseBlockFromBytes(raw, wantColumns, meta)
+			if parseErr != nil {
+				return fmt.Errorf("%s ParseBlockFromBytes block %d: %w", callerName, blockIdx, parseErr)
+			}
+			if wantColumns != nil {
+				bwb, parseErr = r.ParseBlockFromBytes(bwb.RawBytes, secondPassCols, meta)
+				if parseErr != nil {
+					return fmt.Errorf("%s second pass block %d: %w", callerName, blockIdx, parseErr)
+				}
+			}
+			if err := fn(parsedBlock{Block: bwb.Block, BlockIdx: blockIdx}, candidateRows); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // collectIntrinsicPlain handles Case A: pure intrinsic + no sort.
 // Refs are exact matches from intrinsic data; fetch the candidate blocks and return rows.
 func collectIntrinsicPlain(
@@ -560,65 +641,28 @@ func collectIntrinsicPlain(
 		return nil, nil
 	}
 
-	// Group refs by block index.
-	blockOrder := make([]int, 0, 4)
-	blockRows := make(map[int][]int, 4)
-	for _, ref := range refs {
-		bi := int(ref.BlockIdx)
-		if _, seen := blockRows[bi]; !seen {
-			blockOrder = append(blockOrder, bi)
-		}
-		blockRows[bi] = append(blockRows[bi], int(ref.RowIdx))
-	}
+	blockOrder, blockRows := groupRefsByBlock(refs)
 
 	var results []MatchedRow
 	// Coalesce all candidate blocks for efficient batch I/O — same pattern as
 	// collectMixedPlain. Computing CoalescedGroups once across all blockOrder entries
 	// allows the reader to issue multi-block reads instead of one per block.
-	groups := r.CoalescedGroups(blockOrder)
-	for _, group := range groups {
-		fetched, err := r.ReadGroup(group)
-		if err != nil {
-			return nil, fmt.Errorf("collectIntrinsicPlain ReadGroup: %w", err)
-		}
-		for _, blockIdx := range group.BlockIDs {
-			rowIdxs := blockRows[blockIdx]
-			raw, ok := fetched[blockIdx]
-			if !ok {
-				continue
-			}
-			meta := r.BlockMeta(blockIdx)
-			r.ResetInternStrings()
-			bwb, parseErr := r.ParseBlockFromBytes(raw, wantColumns, meta)
-			if parseErr != nil {
-				return nil, fmt.Errorf("collectIntrinsicPlain ParseBlockFromBytes block %d: %w", blockIdx, parseErr)
-			}
-			if wantColumns != nil {
-				bwb, parseErr = r.ParseBlockFromBytes(bwb.RawBytes, secondPassCols, meta)
-				if parseErr != nil {
-					return nil, fmt.Errorf("collectIntrinsicPlain second pass block %d: %w", blockIdx, parseErr)
-				}
-			}
+	err := forEachBlockInGroups(r, blockOrder, blockRows, wantColumns, secondPassCols, "collectIntrinsicPlain",
+		func(pb parsedBlock, rowIdxs []int) error {
 			for _, rowIdx := range rowIdxs {
-				results = append(results, MatchedRow{Block: bwb.Block, BlockIdx: blockIdx, RowIdx: rowIdx})
+				results = append(results, MatchedRow{Block: pb.Block, BlockIdx: pb.BlockIdx, RowIdx: rowIdx})
 				if opts.Limit > 0 && len(results) >= opts.Limit {
-					return results, nil
+					return errLimitReached
 				}
 			}
-		}
+			return nil
+		},
+	)
+	if err != nil && err != errLimitReached {
+		return nil, err
 	}
 	return results, nil
 }
-
-// SortScanThreshold is the max number of matching refs for which the KLL path
-// is used in collectIntrinsicTopK (Case B). Below this threshold: group refs by block,
-// sort blocks by BlockMeta.MaxStart DESC (newest first), build a packed-key→timestamp
-// map from tsCol (O(N)), look up each of the M refs in O(1), sort M pairs (O(M log M)).
-// Above this threshold: use ScanFlatColumnRefsFiltered — cheaper when M is large relative to N.
-// Crossover: O(N) map build vs O(N) scan — the KLL path wins by avoiding repeated blob
-// decompression; for M >= 8K the scan path is preferred as it stops early after K results.
-// Exported so tests can override it to force the scan path. See NOTE-043.
-var SortScanThreshold = 8000
 
 // collectIntrinsicTopK handles Case B: pure intrinsic + timestamp sort.
 // Returns IntrinsicFields MatchedRows with ZERO full block reads.
@@ -864,51 +908,19 @@ func collectMixedPlain(
 		return nil, nil
 	}
 
-	// Group candidate row indices by block.
-	blockOrder := make([]int, 0, 4)
-	blockCandidates := make(map[int][]int, 4)
-	for _, ref := range refs {
-		bi := int(ref.BlockIdx)
-		if _, seen := blockCandidates[bi]; !seen {
-			blockOrder = append(blockOrder, bi)
-		}
-		blockCandidates[bi] = append(blockCandidates[bi], int(ref.RowIdx))
-	}
+	blockOrder, blockCandidates := groupRefsByBlock(refs)
 	stats.ExecutionPath = "mixed-plain"
 	stats.MixedCandidateBlocks = len(blockOrder)
 
 	var results []MatchedRow
 	// Coalesce all candidate blocks for efficient batch I/O.
-	groups := r.CoalescedGroups(blockOrder)
-	for _, group := range groups {
-		fetched, err := r.ReadGroup(group)
-		if err != nil {
-			return nil, fmt.Errorf("collectMixedPlain ReadGroup: %w", err)
-		}
-		for _, blockIdx := range group.BlockIDs {
-			candidateRows := blockCandidates[blockIdx]
-			raw, ok := fetched[blockIdx]
-			if !ok {
-				continue
-			}
-			meta := r.BlockMeta(blockIdx)
-			r.ResetInternStrings()
-			bwb, parseErr := r.ParseBlockFromBytes(raw, wantColumns, meta)
-			if parseErr != nil {
-				return nil, fmt.Errorf("collectMixedPlain ParseBlockFromBytes block %d: %w", blockIdx, parseErr)
-			}
-			if wantColumns != nil {
-				bwb, parseErr = r.ParseBlockFromBytes(bwb.RawBytes, secondPassCols, meta)
-				if parseErr != nil {
-					return nil, fmt.Errorf("collectMixedPlain second pass block %d: %w", blockIdx, parseErr)
-				}
-			}
-
+	err := forEachBlockInGroups(r, blockOrder, blockCandidates, wantColumns, secondPassCols, "collectMixedPlain",
+		func(pb parsedBlock, candidateRows []int) error {
 			// Re-evaluate the full predicate against this block.
-			provider := newBlockColumnProvider(bwb.Block)
+			provider := newBlockColumnProvider(pb.Block)
 			rowSet, evalErr := program.ColumnPredicate(provider)
 			if evalErr != nil {
-				return nil, fmt.Errorf("collectMixedPlain ColumnPredicate block %d: %w", blockIdx, evalErr)
+				return fmt.Errorf("collectMixedPlain ColumnPredicate block %d: %w", pb.BlockIdx, evalErr)
 			}
 
 			// Intersect VM result with candidate rows from intrinsic pre-filter.
@@ -916,12 +928,16 @@ func collectMixedPlain(
 				if !rowSet.Contains(rowIdx) {
 					continue // eliminated by VM re-evaluation
 				}
-				results = append(results, MatchedRow{Block: bwb.Block, BlockIdx: blockIdx, RowIdx: rowIdx})
+				results = append(results, MatchedRow{Block: pb.Block, BlockIdx: pb.BlockIdx, RowIdx: rowIdx})
 				if opts.Limit > 0 && len(results) >= opts.Limit {
-					return results, nil
+					return errLimitReached
 				}
 			}
-		}
+			return nil
+		},
+	)
+	if err != nil && err != errLimitReached {
+		return nil, err
 	}
 	return results, nil
 }
@@ -951,52 +967,20 @@ func collectMixedTopK(
 		return nil, nil
 	}
 
-	// Group candidate rows by block.
-	blockOrder := make([]int, 0, 4)
-	blockCandidates := make(map[int][]int, 4)
-	for _, ref := range refs {
-		bi := int(ref.BlockIdx)
-		if _, seen := blockCandidates[bi]; !seen {
-			blockOrder = append(blockOrder, bi)
-		}
-		blockCandidates[bi] = append(blockCandidates[bi], int(ref.RowIdx))
-	}
+	blockOrder, blockCandidates := groupRefsByBlock(refs)
 	stats.ExecutionPath = "mixed-topk"
 	stats.MixedCandidateBlocks = len(blockOrder)
 
 	buf := &topKHeap{entries: make([]topKEntry, 0, opts.Limit), backward: backward}
 
 	// Coalesce all candidate blocks for efficient batch I/O.
-	groups := r.CoalescedGroups(blockOrder)
-	for _, group := range groups {
-		fetched, err := r.ReadGroup(group)
-		if err != nil {
-			return nil, fmt.Errorf("collectMixedTopK ReadGroup: %w", err)
-		}
-		for _, blockIdx := range group.BlockIDs {
-			candidateRows := blockCandidates[blockIdx]
-			raw, ok := fetched[blockIdx]
-			if !ok {
-				continue
-			}
-			meta := r.BlockMeta(blockIdx)
-			r.ResetInternStrings()
-			bwb, parseErr := r.ParseBlockFromBytes(raw, wantColumns, meta)
-			if parseErr != nil {
-				return nil, fmt.Errorf("collectMixedTopK ParseBlockFromBytes block %d: %w", blockIdx, parseErr)
-			}
-			if wantColumns != nil {
-				bwb, parseErr = r.ParseBlockFromBytes(bwb.RawBytes, secondPassCols, meta)
-				if parseErr != nil {
-					return nil, fmt.Errorf("collectMixedTopK second pass block %d: %w", blockIdx, parseErr)
-				}
-			}
-
+	if err := forEachBlockInGroups(r, blockOrder, blockCandidates, wantColumns, secondPassCols, "collectMixedTopK",
+		func(pb parsedBlock, candidateRows []int) error {
 			// Re-evaluate the full predicate.
-			provider := newBlockColumnProvider(bwb.Block)
+			provider := newBlockColumnProvider(pb.Block)
 			rowSet, evalErr := program.ColumnPredicate(provider)
 			if evalErr != nil {
-				return nil, fmt.Errorf("collectMixedTopK ColumnPredicate block %d: %w", blockIdx, evalErr)
+				return fmt.Errorf("collectMixedTopK ColumnPredicate block %d: %w", pb.BlockIdx, evalErr)
 			}
 
 			// Collect rows that pass both the pre-filter and full predicate.
@@ -1007,17 +991,20 @@ func collectMixedTopK(
 				}
 			}
 			if len(qualifying) == 0 {
-				continue
+				return nil
 			}
 
 			// Get timestamp column for heap ordering.
-			tsCol := bwb.Block.GetColumn(opts.TimestampColumn)
+			tsCol := pb.Block.GetColumn(opts.TimestampColumn)
 			if tsCol == nil {
-				continue
+				return nil
 			}
 
-			topKScanRows(buf, opts.Limit, backward, bwb.Block, blockIdx, tsCol, opts.TimeRange, qualifying)
-		}
+			topKScanRows(buf, opts.Limit, backward, pb.Block, pb.BlockIdx, tsCol, opts.TimeRange, qualifying)
+			return nil
+		},
+	); err != nil {
+		return nil, err
 	}
 
 	return topKDeliver(buf, backward), nil

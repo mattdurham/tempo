@@ -12,6 +12,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"log/slog"
 
 	"github.com/golang/snappy"
 )
@@ -507,133 +508,147 @@ func DecodeIntrinsicColumnBlob(blob []byte) (*IntrinsicColumn, error) {
 	col.Count = uint32(rowCount) //nolint:gosec
 
 	if format == IntrinsicFormatFlat {
-		// block_idx_width[1] and row_idx_width[1] — variable-width ref encoding.
-		if pos+2 > len(raw) {
-			return nil, fmt.Errorf("DecodeIntrinsicColumnBlob: truncated at ref widths")
-		}
-		blockW := int(raw[pos])
-		rowW := int(raw[pos+1])
-		pos += 2
-
-		isBytes := colType == ColumnTypeBytes
-		if isBytes {
-			col.BytesValues = make([][]byte, 0, rowCount)
-			for range rowCount {
-				if pos+2 > len(raw) {
-					return nil, fmt.Errorf("DecodeIntrinsicColumnBlob: truncated at bytes len")
-				}
-				vLen := int(binary.LittleEndian.Uint16(raw[pos:]))
-				pos += 2
-				if pos+vLen > len(raw) {
-					return nil, fmt.Errorf("DecodeIntrinsicColumnBlob: truncated at bytes value")
-				}
-				col.BytesValues = append(col.BytesValues, raw[pos:pos+vLen])
-				pos += vLen
-			}
-		} else {
-			// Delta-encoded uint64: each value is a delta from the previous.
-			col.Uint64Values = make([]uint64, 0, rowCount)
-			var acc uint64
-			for range rowCount {
-				if pos+8 > len(raw) {
-					return nil, fmt.Errorf("DecodeIntrinsicColumnBlob: truncated at uint64 value")
-				}
-				acc += binary.LittleEndian.Uint64(raw[pos:])
-				col.Uint64Values = append(col.Uint64Values, acc)
-				pos += 8
-			}
-		}
-		// Refs parallel to values, using variable-width encoding.
-		col.BlockRefs = make([]BlockRef, 0, rowCount)
-		for range rowCount {
-			refSize := blockW + rowW
-			if pos+refSize > len(raw) {
-				return nil, fmt.Errorf("DecodeIntrinsicColumnBlob: truncated at refs")
-			}
-			var blockIdx uint16
-			if blockW == 1 {
-				blockIdx = uint16(raw[pos])
-				pos++
-			} else {
-				blockIdx = binary.LittleEndian.Uint16(raw[pos:])
-				pos += 2
-			}
-			var rowIdx uint16
-			if rowW == 1 {
-				rowIdx = uint16(raw[pos])
-				pos++
-			} else {
-				rowIdx = binary.LittleEndian.Uint16(raw[pos:])
-				pos += 2
-			}
-			col.BlockRefs = append(col.BlockRefs, BlockRef{BlockIdx: blockIdx, RowIdx: rowIdx})
+		if err := decodeLegacyFlatBlob(raw, pos, colType, rowCount, col); err != nil {
+			return nil, err
 		}
 	} else { // IntrinsicFormatDict
-		isInt64 := colType == ColumnTypeInt64 || colType == ColumnTypeRangeInt64
-		valueCount := rowCount // for dict: row_count field holds value_count
-
-		// block_idx_width[1] and row_idx_width[1] — variable-width ref encoding.
-		if pos+2 > len(raw) {
-			return nil, fmt.Errorf("DecodeIntrinsicColumnBlob: truncated at dict ref widths")
-		}
-		blockW := int(raw[pos])
-		rowW := int(raw[pos+1])
-		pos += 2
-
-		col.DictEntries = make([]IntrinsicDictEntry, 0, valueCount)
-		for range valueCount {
-			if pos+2 > len(raw) {
-				return nil, fmt.Errorf("DecodeIntrinsicColumnBlob: truncated at dict value_len")
-			}
-			vLen := int(binary.LittleEndian.Uint16(raw[pos:]))
-			pos += 2
-			var entry IntrinsicDictEntry
-			if isInt64 && vLen == 0 {
-				if pos+8 > len(raw) {
-					return nil, fmt.Errorf("DecodeIntrinsicColumnBlob: truncated at int64 value")
-				}
-				entry.Int64Val = int64(binary.LittleEndian.Uint64(raw[pos:])) //nolint:gosec
-				pos += 8
-			} else {
-				if pos+vLen > len(raw) {
-					return nil, fmt.Errorf("DecodeIntrinsicColumnBlob: truncated at string value")
-				}
-				entry.Value = string(raw[pos : pos+vLen])
-				pos += vLen
-			}
-			if pos+4 > len(raw) {
-				return nil, fmt.Errorf("DecodeIntrinsicColumnBlob: truncated at ref_count")
-			}
-			refCount := int(binary.LittleEndian.Uint32(raw[pos:]))
-			pos += 4
-			entry.BlockRefs = make([]BlockRef, 0, refCount)
-			for range refCount {
-				refSize := blockW + rowW
-				if pos+refSize > len(raw) {
-					return nil, fmt.Errorf("DecodeIntrinsicColumnBlob: truncated at dict refs")
-				}
-				var blockIdx uint16
-				if blockW == 1 {
-					blockIdx = uint16(raw[pos])
-					pos++
-				} else {
-					blockIdx = binary.LittleEndian.Uint16(raw[pos:])
-					pos += 2
-				}
-				var rowIdx uint16
-				if rowW == 1 {
-					rowIdx = uint16(raw[pos])
-					pos++
-				} else {
-					rowIdx = binary.LittleEndian.Uint16(raw[pos:])
-					pos += 2
-				}
-				entry.BlockRefs = append(entry.BlockRefs, BlockRef{BlockIdx: blockIdx, RowIdx: rowIdx})
-			}
-			col.DictEntries = append(col.DictEntries, entry)
+		if err := decodeLegacyDictBlob(raw, pos, colType, rowCount, col); err != nil {
+			return nil, err
 		}
 	}
 	return col, nil
+}
+
+// decodeLegacyFlatBlob decodes the flat-format section of a legacy (v1) intrinsic column blob.
+// raw is the snappy-decoded buffer; pos is the offset after the row_count field.
+func decodeLegacyFlatBlob(raw []byte, pos int, colType ColumnType, rowCount int, col *IntrinsicColumn) error {
+	// block_idx_width[1] and row_idx_width[1] — variable-width ref encoding.
+	if pos+2 > len(raw) {
+		return fmt.Errorf("DecodeIntrinsicColumnBlob: truncated at ref widths")
+	}
+	blockW := int(raw[pos])
+	rowW := int(raw[pos+1])
+	pos += 2
+
+	isBytes := colType == ColumnTypeBytes
+	if isBytes {
+		col.BytesValues = make([][]byte, 0, rowCount)
+		for range rowCount {
+			if pos+2 > len(raw) {
+				return fmt.Errorf("DecodeIntrinsicColumnBlob: truncated at bytes len")
+			}
+			vLen := int(binary.LittleEndian.Uint16(raw[pos:]))
+			pos += 2
+			if pos+vLen > len(raw) {
+				return fmt.Errorf("DecodeIntrinsicColumnBlob: truncated at bytes value")
+			}
+			col.BytesValues = append(col.BytesValues, raw[pos:pos+vLen])
+			pos += vLen
+		}
+	} else {
+		// Delta-encoded uint64: each value is a delta from the previous.
+		col.Uint64Values = make([]uint64, 0, rowCount)
+		var acc uint64
+		for range rowCount {
+			if pos+8 > len(raw) {
+				return fmt.Errorf("DecodeIntrinsicColumnBlob: truncated at uint64 value")
+			}
+			acc += binary.LittleEndian.Uint64(raw[pos:])
+			col.Uint64Values = append(col.Uint64Values, acc)
+			pos += 8
+		}
+	}
+	// Refs parallel to values, using variable-width encoding.
+	col.BlockRefs = make([]BlockRef, 0, rowCount)
+	for range rowCount {
+		ref, newPos, err := decodeVariableWidthRef(raw, pos, blockW, rowW)
+		if err != nil {
+			return fmt.Errorf("DecodeIntrinsicColumnBlob: truncated at refs")
+		}
+		col.BlockRefs = append(col.BlockRefs, ref)
+		pos = newPos
+	}
+	return nil
+}
+
+// decodeLegacyDictBlob decodes the dict-format section of a legacy (v1) intrinsic column blob.
+// raw is the snappy-decoded buffer; pos is the offset after the row_count field.
+func decodeLegacyDictBlob(raw []byte, pos int, colType ColumnType, rowCount int, col *IntrinsicColumn) error {
+	isInt64 := colType == ColumnTypeInt64 || colType == ColumnTypeRangeInt64
+	valueCount := rowCount // for dict: row_count field holds value_count
+
+	// block_idx_width[1] and row_idx_width[1] — variable-width ref encoding.
+	if pos+2 > len(raw) {
+		return fmt.Errorf("DecodeIntrinsicColumnBlob: truncated at dict ref widths")
+	}
+	blockW := int(raw[pos])
+	rowW := int(raw[pos+1])
+	pos += 2
+
+	col.DictEntries = make([]IntrinsicDictEntry, 0, valueCount)
+	for range valueCount {
+		if pos+2 > len(raw) {
+			return fmt.Errorf("DecodeIntrinsicColumnBlob: truncated at dict value_len")
+		}
+		vLen := int(binary.LittleEndian.Uint16(raw[pos:]))
+		pos += 2
+		var entry IntrinsicDictEntry
+		if isInt64 && vLen == 0 {
+			if pos+8 > len(raw) {
+				return fmt.Errorf("DecodeIntrinsicColumnBlob: truncated at int64 value")
+			}
+			entry.Int64Val = int64(binary.LittleEndian.Uint64(raw[pos:])) //nolint:gosec
+			pos += 8
+		} else {
+			if pos+vLen > len(raw) {
+				return fmt.Errorf("DecodeIntrinsicColumnBlob: truncated at string value")
+			}
+			entry.Value = string(raw[pos : pos+vLen])
+			pos += vLen
+		}
+		if pos+4 > len(raw) {
+			return fmt.Errorf("DecodeIntrinsicColumnBlob: truncated at ref_count")
+		}
+		refCount := int(binary.LittleEndian.Uint32(raw[pos:]))
+		pos += 4
+		entry.BlockRefs = make([]BlockRef, 0, refCount)
+		for range refCount {
+			ref, newPos, err := decodeVariableWidthRef(raw, pos, blockW, rowW)
+			if err != nil {
+				return fmt.Errorf("DecodeIntrinsicColumnBlob: truncated at dict refs")
+			}
+			entry.BlockRefs = append(entry.BlockRefs, ref)
+			pos = newPos
+		}
+		col.DictEntries = append(col.DictEntries, entry)
+	}
+	return nil
+}
+
+// decodeVariableWidthRef decodes a single BlockRef using variable-width block/row index encoding.
+// Returns the decoded ref, updated position, and any bounds error.
+func decodeVariableWidthRef(raw []byte, pos, blockW, rowW int) (BlockRef, int, error) {
+	refSize := blockW + rowW
+	if pos+refSize > len(raw) {
+		return BlockRef{}, pos, fmt.Errorf("truncated ref")
+	}
+	var blockIdx uint16
+	if blockW == 1 {
+		blockIdx = uint16(raw[pos])
+		pos++
+	} else {
+		blockIdx = binary.LittleEndian.Uint16(raw[pos:])
+		pos += 2
+	}
+	var rowIdx uint16
+	if rowW == 1 {
+		rowIdx = uint16(raw[pos])
+		pos++
+	} else {
+		rowIdx = binary.LittleEndian.Uint16(raw[pos:])
+		pos += 2
+	}
+	return BlockRef{BlockIdx: blockIdx, RowIdx: rowIdx}, pos, nil
 }
 
 // --- Raw-byte scanning functions ---
@@ -750,6 +765,7 @@ func scanDictPagedBlob(
 		}
 		pageRaw, decErr := snappy.Decode(nil, blob[pageStart:pageEnd])
 		if decErr != nil {
+			slog.Debug("intrinsic_codec: snappy decode failed", "err", decErr)
 			return nil
 		}
 		var ok bool
@@ -781,7 +797,11 @@ func ScanDictColumnRefs(
 	}
 
 	raw, err := snappy.Decode(nil, blob)
-	if err != nil || len(raw) < 3 {
+	if err != nil {
+		slog.Debug("intrinsic_codec: snappy decode failed", "err", err)
+		return nil
+	}
+	if len(raw) < 3 {
 		return nil
 	}
 	pos := 0
@@ -899,6 +919,38 @@ func parsePagedBlobHeader(blob []byte) (PagedIntrinsicTOC, int, bool) {
 	return toc, 5 + tocLen, true
 }
 
+// findRangeBoundaries varint-scans the values section of a flat page to locate
+// the first and last row indices whose accumulated value falls within [lo, hi].
+// pageRaw is the decompressed page; refsStart is the byte offset where the refs
+// section begins (used as the end-of-values boundary); rowCount is the number of rows.
+// Returns (startIdx, endIdx) where startIdx == -1 means no rows matched.
+func findRangeBoundaries(pageRaw []byte, refsStart, rowCount int, lo, hi uint64, hasLo, hasHi bool) (startIdx, endIdx int) {
+	var acc uint64
+	startIdx = -1
+	endIdx = rowCount
+	valPos := 4 // skip values_len prefix
+	valEnd := refsStart
+	for i := range rowCount {
+		if valPos >= valEnd {
+			break
+		}
+		delta, n := binary.Uvarint(pageRaw[valPos:valEnd])
+		if n <= 0 {
+			break
+		}
+		acc += delta
+		valPos += n
+		if startIdx < 0 && (!hasLo || acc >= lo) {
+			startIdx = i
+		}
+		if hasHi && acc > hi {
+			endIdx = i
+			break
+		}
+	}
+	return startIdx, endIdx
+}
+
 // scanFlatPagedBlob handles v2 paged flat column blobs for range scan.
 func scanFlatPagedBlob(blob []byte, lo, hi uint64, hasLo, hasHi bool, maxRefs int) []BlockRef {
 	toc, pos, ok := parsePagedBlobHeader(blob)
@@ -931,6 +983,7 @@ func scanFlatPagedBlob(blob []byte, lo, hi uint64, hasLo, hasHi bool, maxRefs in
 		}
 		pageRaw, decErr := snappy.Decode(nil, blob[pageStart:pageEnd])
 		if decErr != nil {
+			slog.Debug("intrinsic_codec: snappy decode failed", "err", decErr)
 			return nil
 		}
 
@@ -940,31 +993,7 @@ func scanFlatPagedBlob(blob []byte, lo, hi uint64, hasLo, hasHi bool, maxRefs in
 			return nil // corrupt page: values_len exceeds page size
 		}
 
-		// Varint delta-decode values to find matching range.
-		// Bound reads to the values section to prevent spilling into refs on corrupt pages.
-		var acc uint64
-		startIdx := -1
-		endIdx := rowCount
-		valPos := 4 // skip values_len prefix
-		valEnd := refsStart
-		for i := range rowCount {
-			if valPos >= valEnd {
-				break
-			}
-			delta, n := binary.Uvarint(pageRaw[valPos:valEnd])
-			if n <= 0 {
-				break
-			}
-			acc += delta
-			valPos += n
-			if startIdx < 0 && (!hasLo || acc >= lo) {
-				startIdx = i
-			}
-			if hasHi && acc > hi {
-				endIdx = i
-				break
-			}
-		}
+		startIdx, endIdx := findRangeBoundaries(pageRaw, refsStart, rowCount, lo, hi, hasLo, hasHi)
 		if startIdx < 0 || startIdx >= endIdx {
 			continue
 		}
@@ -987,86 +1016,8 @@ func scanFlatPagedBlob(blob []byte, lo, hi uint64, hasLo, hasHi bool, maxRefs in
 	return result
 }
 
-// scanFlatPagedTopK handles v2 paged flat column blobs for top-K scan.
-func scanFlatPagedTopK(blob []byte, limit int, backward bool) []BlockRef {
-	toc, pos, ok := parsePagedBlobHeader(blob)
-	if !ok || toc.Format != IntrinsicFormatFlat || toc.ColType == ColumnTypeBytes {
-		return nil
-	}
-
-	blockW := int(toc.BlockIdxWidth)
-	rowW := int(toc.RowIdxWidth)
-	refSize := blockW + rowW
-
-	result := make([]BlockRef, 0, limit)
-	remaining := limit
-
-	if backward {
-		// Scan from last page toward first, collecting forward then reversing once.
-		for i := len(toc.Pages) - 1; i >= 0 && remaining > 0; i-- {
-			pm := toc.Pages[i]
-			pageStart := pos + int(pm.Offset)
-			pageEnd := pageStart + int(pm.Length)
-			if pageEnd > len(blob) {
-				return nil
-			}
-			pageRaw, decErr := snappy.Decode(nil, blob[pageStart:pageEnd])
-			if decErr != nil {
-				return nil
-			}
-			rowCount := int(pm.RowCount)
-			refsStart := pageRefsStart(pageRaw)
-			count := min(remaining, rowCount)
-			// Read the last `count` refs of this page (appended forward).
-			refPos := refsStart + (rowCount-count)*refSize
-			for range count {
-				if refPos+refSize > len(pageRaw) {
-					break
-				}
-				result = append(result, decodeRef(pageRaw, refPos, blockW, rowW))
-				refPos += refSize
-			}
-			remaining = limit - len(result)
-		}
-		// Reverse to get newest-first order (pages were scanned last-to-first,
-		// but refs within each page were appended forward).
-		for i, j := 0, len(result)-1; i < j; i, j = i+1, j-1 {
-			result[i], result[j] = result[j], result[i]
-		}
-	} else {
-		// Scan from first page forward.
-		for i := range toc.Pages {
-			if remaining <= 0 {
-				break
-			}
-			pm := toc.Pages[i]
-			pageStart := pos + int(pm.Offset)
-			pageEnd := pageStart + int(pm.Length)
-			if pageEnd > len(blob) {
-				return nil
-			}
-			pageRaw, decErr := snappy.Decode(nil, blob[pageStart:pageEnd])
-			if decErr != nil {
-				return nil
-			}
-			rowCount := int(pm.RowCount)
-			refsStart := pageRefsStart(pageRaw)
-			count := min(remaining, rowCount)
-			refPos := refsStart
-			for range count {
-				if refPos+refSize > len(pageRaw) {
-					break
-				}
-				result = append(result, decodeRef(pageRaw, refPos, blockW, rowW))
-				refPos += refSize
-				remaining--
-			}
-		}
-	}
-	return result
-}
-
 // scanFlatPagedFiltered handles v2 paged flat column blobs for filtered scan.
+// When filter is nil, all refs are accepted (equivalent to the former scanFlatPagedTopK fast path).
 func scanFlatPagedFiltered(blob []byte, backward bool, limit int, filter func(BlockRef) bool) []BlockRef {
 	toc, pos, ok := parsePagedBlobHeader(blob)
 	if !ok || toc.Format != IntrinsicFormatFlat || toc.ColType == ColumnTypeBytes {
@@ -1087,6 +1038,7 @@ func scanFlatPagedFiltered(blob []byte, backward bool, limit int, filter func(Bl
 		}
 		pageRaw, decErr := snappy.Decode(nil, blob[pageStart:pageEnd])
 		if decErr != nil {
+			slog.Debug("intrinsic_codec: snappy decode failed", "err", decErr)
 			return false
 		}
 		rowCount := int(pm.RowCount)
@@ -1099,7 +1051,7 @@ func scanFlatPagedFiltered(blob []byte, backward bool, limit int, filter func(Bl
 					continue
 				}
 				ref := decodeRef(pageRaw, refPos, blockW, rowW)
-				if filter(ref) {
+				if filter == nil || filter(ref) {
 					result = append(result, ref)
 				}
 			}
@@ -1113,7 +1065,7 @@ func scanFlatPagedFiltered(blob []byte, backward bool, limit int, filter func(Bl
 					break
 				}
 				ref := decodeRef(pageRaw, refPos, blockW, rowW)
-				if filter(ref) {
+				if filter == nil || filter(ref) {
 					result = append(result, ref)
 				}
 			}
@@ -1161,7 +1113,11 @@ func ScanFlatColumnRefs(
 	}
 
 	raw, err := snappy.Decode(nil, blob)
-	if err != nil || len(raw) < 3 {
+	if err != nil {
+		slog.Debug("intrinsic_codec: snappy decode failed", "err", err)
+		return nil
+	}
+	if len(raw) < 3 {
 		return nil
 	}
 	pos := 0
@@ -1242,11 +1198,15 @@ func ScanFlatColumnRefs(
 func ScanFlatColumnTopKRefs(blob []byte, limit int, backward bool) []BlockRef {
 	// v2 paged format.
 	if len(blob) > 0 && blob[0] == IntrinsicPagedVersion {
-		return scanFlatPagedTopK(blob, limit, backward)
+		return scanFlatPagedFiltered(blob, backward, limit, nil)
 	}
 
 	raw, err := snappy.Decode(nil, blob)
-	if err != nil || len(raw) < 3 {
+	if err != nil {
+		slog.Debug("intrinsic_codec: snappy decode failed", "err", err)
+		return nil
+	}
+	if len(raw) < 3 {
 		return nil
 	}
 	pos := 0
@@ -1325,7 +1285,11 @@ func ScanFlatColumnRefsFiltered(
 	}
 
 	raw, err := snappy.Decode(nil, blob)
-	if err != nil || len(raw) < 3 {
+	if err != nil {
+		slog.Debug("intrinsic_codec: snappy decode failed", "err", err)
+		return nil
+	}
+	if len(raw) < 3 {
 		return nil
 	}
 	pos := 0

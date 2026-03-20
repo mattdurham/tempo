@@ -518,14 +518,14 @@ func computeMinHashSigFromLog(plr *pendingLogRecord) {
 		^uint64(0), ^uint64(0), ^uint64(0), ^uint64(0),
 	}
 
-	// hashKV hashes "key=stringValue" for string attributes via addKVHashToMinHeap;
-	// falls back to addHashToMinHeap (key-only) for non-string attributes (int, double,
+	// hashKV hashes "key=stringValue" for string attributes via AddKVHashToMinHeap;
+	// falls back to AddHashToMinHeap (key-only) for non-string attributes (int, double,
 	// bool, bytes) to avoid allocating a string representation of the value.
 	hashKV := func(kv *commonv1.KeyValue) {
 		if sv, ok := kv.Value.GetValue().(*commonv1.AnyValue_StringValue); ok {
-			addKVHashToMinHeap(kv.Key, sv.StringValue, &plr.minHashSig)
+			shared.AddKVHashToMinHeap(kv.Key, sv.StringValue, &plr.minHashSig)
 		} else {
-			addHashToMinHeap(kv.Key, &plr.minHashSig)
+			shared.AddHashToMinHeap(kv.Key, &plr.minHashSig)
 		}
 	}
 

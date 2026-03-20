@@ -400,7 +400,20 @@ func (p *parser) parseLogSelector() (*LogSelector, error) {
 	}
 	p.advance() // skip '}'
 
-	// Parse optional line filters
+	if err := p.parsePostBraceLineFilters(sel); err != nil {
+		return nil, err
+	}
+
+	if err := p.parsePipelineStages(sel); err != nil {
+		return nil, err
+	}
+
+	return sel, nil
+}
+
+// parsePostBraceLineFilters parses the bare line filters (|=, |~) that may appear
+// directly after the label-matcher block, before any pipeline stages.
+func (p *parser) parsePostBraceLineFilters(sel *LogSelector) error {
 	for {
 		p.skipWhitespace()
 		if p.pos >= len(p.input) {
@@ -409,16 +422,20 @@ func (p *parser) parseLogSelector() (*LogSelector, error) {
 
 		lf, ok, err := p.parseLineFilter()
 		if err != nil {
-			return nil, err
+			return err
 		}
 		if !ok {
 			break
 		}
 		sel.LineFilters = append(sel.LineFilters, lf)
 	}
+	return nil
+}
 
-	// Parse optional pipeline stages (| json, | logfmt, | label_format, etc.).
-	// Stop if we encounter '[' (range duration marker) or ')' (closing paren).
+// parsePipelineStages parses optional pipeline stages (| json, | logfmt, | label_format, etc.)
+// and any interleaved line filters (!= !~ |= |~) that follow the label-matcher block.
+// Stops when it encounters '[' (range duration marker), ')' (closing paren), or EOF.
+func (p *parser) parsePipelineStages(sel *LogSelector) error {
 	for {
 		p.skipWhitespace()
 		if p.pos >= len(p.input) || p.peek() == '[' || p.peek() == ')' {
@@ -427,27 +444,14 @@ func (p *parser) parseLogSelector() (*LogSelector, error) {
 
 		// Handle != and !~ line filters that can appear after pipeline stages.
 		if p.peek() == '!' {
-			savedBang := p.pos
-			p.advance()
-			if p.pos < len(p.input) && (p.peek() == '=' || p.peek() == '~') {
-				var filterType FilterType
-				if p.peek() == '=' {
-					p.advance()
-					filterType = FilterNotContains
-				} else {
-					p.advance()
-					filterType = FilterNotRegex
-				}
-				p.skipWhitespace()
-				pattern, err := p.parseQuotedString()
-				if err != nil {
-					return nil, fmt.Errorf("logql: line filter pattern: %w", err)
-				}
-				sel.LineFilters = append(sel.LineFilters, LineFilter{Pattern: pattern, Type: filterType})
-				continue
+			done, err := p.parseBangLineFilter(sel)
+			if err != nil {
+				return err
 			}
-			p.pos = savedBang
-			break
+			if done {
+				break
+			}
+			continue
 		}
 
 		if p.peek() != '|' {
@@ -462,20 +466,11 @@ func (p *parser) parseLogSelector() (*LogSelector, error) {
 		if p.pos < len(p.input) && (p.peek() == '=' || p.peek() == '~') {
 			// Line filter after pipeline stage: |= "text" or |~ "regex".
 			// Parse it and append to LineFilters (they're position-independent in LogQL).
-			var filterType FilterType
-			if p.peek() == '=' {
-				p.advance()
-				filterType = FilterContains
-			} else {
-				p.advance()
-				filterType = FilterRegex
-			}
-			p.skipWhitespace()
-			pattern, err := p.parseQuotedString()
+			lf, err := p.parsePipeLineFilter()
 			if err != nil {
-				return nil, fmt.Errorf("logql: line filter pattern: %w", err)
+				return err
 			}
-			sel.LineFilters = append(sel.LineFilters, LineFilter{Pattern: pattern, Type: filterType})
+			sel.LineFilters = append(sel.LineFilters, lf)
 			continue
 		}
 		// Handle parenthesized label filter expressions:
@@ -484,7 +479,7 @@ func (p *parser) parseLogSelector() (*LogSelector, error) {
 		if p.pos < len(p.input) && p.peek() == '(' {
 			stage, err := p.parseParenLabelFilter()
 			if err != nil {
-				return nil, err
+				return err
 			}
 			sel.Pipeline = append(sel.Pipeline, stage)
 			continue
@@ -498,7 +493,7 @@ func (p *parser) parseLogSelector() (*LogSelector, error) {
 		}
 		stage, err := p.parsePipelineStageByName(stageName)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		// Check for "or" chaining on label filter stages:
 		//   | level="error" or level="warn"
@@ -507,8 +502,52 @@ func (p *parser) parseLogSelector() (*LogSelector, error) {
 		}
 		sel.Pipeline = append(sel.Pipeline, stage)
 	}
+	return nil
+}
 
-	return sel, nil
+// parseBangLineFilter handles a '!' prefix line filter (!= or !~) inside the pipeline loop.
+// Returns (true, nil) if no valid filter was found (loop should break), (false, nil) on success.
+func (p *parser) parseBangLineFilter(sel *LogSelector) (done bool, err error) {
+	savedBang := p.pos
+	p.advance()
+	if p.pos >= len(p.input) || (p.peek() != '=' && p.peek() != '~') {
+		p.pos = savedBang
+		return true, nil
+	}
+	var filterType FilterType
+	if p.peek() == '=' {
+		p.advance()
+		filterType = FilterNotContains
+	} else {
+		p.advance()
+		filterType = FilterNotRegex
+	}
+	p.skipWhitespace()
+	pattern, parseErr := p.parseQuotedString()
+	if parseErr != nil {
+		return false, fmt.Errorf("logql: line filter pattern: %w", parseErr)
+	}
+	sel.LineFilters = append(sel.LineFilters, LineFilter{Pattern: pattern, Type: filterType})
+	return false, nil
+}
+
+// parsePipeLineFilter parses a |= or |~ line filter that appears after the '|' has been consumed.
+// The cursor must be positioned on '=' or '~'.
+func (p *parser) parsePipeLineFilter() (LineFilter, error) {
+	var filterType FilterType
+	if p.peek() == '=' {
+		p.advance()
+		filterType = FilterContains
+	} else {
+		p.advance()
+		filterType = FilterRegex
+	}
+	p.skipWhitespace()
+	pattern, err := p.parseQuotedString()
+	if err != nil {
+		return LineFilter{}, fmt.Errorf("logql: line filter pattern: %w", err)
+	}
+	return LineFilter{Pattern: pattern, Type: filterType}, nil
 }
 
 // parsePipelineStageByName parses the parameters for a named pipeline stage.

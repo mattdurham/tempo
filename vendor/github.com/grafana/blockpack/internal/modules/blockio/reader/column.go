@@ -19,18 +19,6 @@ var (
 	zstdDec         *zstd.Decoder
 )
 
-func getZstdDecoder() *zstd.Decoder {
-	zstdDecoderOnce.Do(func() {
-		var err error
-		zstdDec, err = zstd.NewReader(nil, zstd.WithDecoderConcurrency(0))
-		if err != nil {
-			panic(fmt.Sprintf("reader: zstd.NewReader: %v", err))
-		}
-	})
-
-	return zstdDec
-}
-
 // decompScratchPool holds reusable scratch buffers for zstd decompression during
 // block parsing. A single scratch buffer is acquired per parseBlockColumnsReuse call
 // and reused across all column decodings within that block.
@@ -43,6 +31,18 @@ var decompScratchPool = &sync.Pool{ //nolint:gochecknoglobals
 		b := make([]byte, 0, 256*1024)
 		return &b
 	},
+}
+
+func getZstdDecoder() *zstd.Decoder {
+	zstdDecoderOnce.Do(func() {
+		var err error
+		zstdDec, err = zstd.NewReader(nil, zstd.WithDecoderConcurrency(0))
+		if err != nil {
+			panic(fmt.Sprintf("reader: zstd.NewReader: %v", err))
+		}
+	})
+
+	return zstdDec
 }
 
 func acquireDecompScratch() *[]byte {
@@ -477,13 +477,11 @@ func decodeDictionary(
 	// indexes
 	switch kind {
 	case 1: // dense: rowCount indexes
-		idx, newPos, err := readIndexArray(data, pos, rowCount, indexWidth)
+		idx, _, err := readIndexArray(data, pos, rowCount, indexWidth)
 		if err != nil {
 			return nil, fmt.Errorf("dictionary(dense): %w", err)
 		}
 
-		pos = newPos
-		_ = pos
 		assignDictIdx(col, idx)
 
 	case 2: // sparse: present_count[4] + presentCount indexes
@@ -500,13 +498,10 @@ func decodeDictionary(
 			)
 		}
 
-		sparseIdx, newPos, err := readIndexArray(data, pos, sparseCnt, indexWidth)
+		sparseIdx, _, err := readIndexArray(data, pos, sparseCnt, indexWidth)
 		if err != nil {
 			return nil, fmt.Errorf("dictionary(sparse): %w", err)
 		}
-
-		pos = newPos
-		_ = pos
 
 		// Defer dense expansion to first value access (NOTE-PERF-1).
 		col.sparseDictIdx = sparseIdx
@@ -685,13 +680,10 @@ func decodeDeltaUint64(data []byte, spanCount int, ctx *decodeCtx) (*Column, err
 		}
 	} else {
 		// Read compressed offset array — decompressed into scratch; values extracted before next scratch use.
-		offsetBytes, newPos, err := decompressZstdScratch(data, pos, ctx.scratch)
+		offsetBytes, _, err := decompressZstdScratch(data, pos, ctx.scratch)
 		if err != nil {
 			return nil, fmt.Errorf("delta_uint64: offsets: %w", err)
 		}
-
-		pos = newPos
-		_ = pos
 
 		stride := int(width)
 		need := presentCount * stride
@@ -804,8 +796,6 @@ func decodeRLEIndexes(
 	}
 
 	rleData := data[pos : pos+rleLen]
-	pos += rleLen
-	_ = pos
 
 	sparseIdx, err := shared.DecodeIndexRLE(rleData, indexCount)
 	if err != nil {
@@ -867,13 +857,10 @@ func decodeXORBytes(data []byte, kind uint8, spanCount int, ctx *decodeCtx) (*Co
 
 	// xor_len[4] + xor_data_zstd — decompressed into scratch; each row value is XOR-decoded
 	// into a fresh make([]byte,...) before the next scratch use, so scratch is not retained.
-	xorBytes, newPos, err := decompressZstdScratch(data, pos, ctx.scratch)
+	xorBytes, _, err := decompressZstdScratch(data, pos, ctx.scratch)
 	if err != nil {
 		return nil, fmt.Errorf("xor_bytes: payload: %w", err)
 	}
-
-	pos = newPos
-	_ = pos
 
 	// Decode XOR payload: for each present row: val_len[4] + xor_bytes.
 	col.BytesInline = make([][]byte, spanCount)
@@ -992,13 +979,10 @@ func decodePrefixBytes(data []byte, kind uint8, spanCount int, ctx *decodeCtx) (
 
 	// suffix_data_len[4] + suffix_data_zstd — scratch reuse is safe here because
 	// prefixDictBytes (first scratch use) is fully consumed above before this call.
-	suffixBytes, newPos, err := decompressZstdScratch(data, pos, ctx.scratch)
+	suffixBytes, _, err := decompressZstdScratch(data, pos, ctx.scratch)
 	if err != nil {
 		return nil, fmt.Errorf("prefix_bytes: suffix_data: %w", err)
 	}
-
-	pos = newPos
-	_ = pos
 
 	// Parse suffix section:
 	// prefix_index_width[1] + per present row: prefix_idx[piw bytes] + suffix_len[4] + suffix_bytes
@@ -1114,13 +1098,10 @@ func decodeDeltaDictionary(data []byte, kind uint8, spanCount int, ctx *decodeCt
 
 	// delta_len[4] + delta_data_zstd — scratch reuse is safe: dictBytes (first scratch use)
 	// is fully consumed by decodeDictBody above before this call resets scratch.
-	deltaBytes, newPos, err := decompressZstdScratch(data, pos, ctx.scratch)
+	deltaBytes, _, err := decompressZstdScratch(data, pos, ctx.scratch)
 	if err != nil {
 		return nil, fmt.Errorf("delta_dict: delta: %w", err)
 	}
-
-	pos = newPos
-	_ = pos
 
 	// Determine how many delta values to expect.
 	var nDeltas int

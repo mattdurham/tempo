@@ -9,6 +9,7 @@ package filecache
 import (
 	"encoding/binary"
 	"fmt"
+	"log/slog"
 	"sync"
 
 	bolt "go.etcd.io/bbolt"
@@ -158,7 +159,12 @@ func (c *FileCache) Put(key string, value []byte) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	return c.db.Update(func(tx *bolt.Tx) error {
+	// delta is computed inside the closure but applied only after a successful
+	// commit — this avoids a desync if bbolt's transaction commit fails after
+	// the closure has already executed (e.g., on disk-full or fsync failure).
+	var delta int64
+
+	err := c.db.Update(func(tx *bolt.Tx) error {
 		data := tx.Bucket(bucketData)
 		order := tx.Bucket(bucketOrder)
 
@@ -214,10 +220,16 @@ func (c *FileCache) Put(key string, value []byte) error {
 			return fmt.Errorf("data put: %w", err)
 		}
 
-		c.curBytes = c.curBytes - evicted + needed
+		delta = needed - evicted
 
 		return nil
 	})
+
+	if err == nil {
+		c.curBytes += delta
+	}
+
+	return err
 }
 
 // GetOrFetch returns the cached value for key, calling fetch() if not present.
@@ -257,7 +269,9 @@ func (c *FileCache) GetOrFetch(key string, fetch func() ([]byte, error)) ([]byte
 		}
 
 		// Store in cache; non-fatal on failure.
-		_ = c.Put(key, fetched)
+		if putErr := c.Put(key, fetched); putErr != nil {
+			slog.Debug("filecache: Put failed, skipping cache", "err", putErr)
+		}
 
 		return fetched, nil
 	})
@@ -267,7 +281,11 @@ func (c *FileCache) GetOrFetch(key string, fetch func() ([]byte, error)) ([]byte
 
 	// Copy once: singleflight shares the same backing array among all concurrent
 	// waiters, so every caller must receive its own independent slice.
-	src := result.([]byte)
+	// SPEC-ROOT-001: two-value type assertion to prevent panic on unexpected singleflight result type
+	src, ok := result.([]byte)
+	if !ok {
+		return nil, fmt.Errorf("filecache: unexpected singleflight result type %T", result)
+	}
 	out := make([]byte, len(src))
 	copy(out, src)
 

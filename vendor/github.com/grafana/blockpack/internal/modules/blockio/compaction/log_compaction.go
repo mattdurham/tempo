@@ -175,67 +175,17 @@ func computeLogRowSortKey(block *modules_reader.Block, rowIdx int, sig *[4]uint6
 			continue // intrinsic columns are not part of the label set
 		}
 		if sv, ok := col.StringValue(rowIdx); ok {
-			addKVHash(attrKey, sv, sig)
+			shared.AddKVHashToMinHeap(attrKey, sv, sig)
 		} else {
-			addKeyHash(attrKey, sig)
+			shared.AddHashToMinHeap(attrKey, sig)
 		}
 	}
 
 	var ts uint64
 	if tsCol := block.GetColumn("log:timestamp"); tsCol != nil {
-		ts, _ = tsCol.Uint64Value(rowIdx)
+		ts, _ = tsCol.Uint64Value(rowIdx) // ok=false means no timestamp; zero value sorts first (acceptable fallback)
 	}
 	return ts
-}
-
-// addKVHash hashes "key=value" via inline FNV-1a and inserts into the min-heap.
-// Mirrors writer.addKVHashToMinHeap.
-func addKVHash(key, value string, sig *[4]uint64) {
-	const (
-		offset = uint64(14695981039346656037)
-		prime  = uint64(1099511628211)
-	)
-	h := offset
-	for i := range len(key) {
-		h ^= uint64(key[i])
-		h *= prime
-	}
-	h ^= '='
-	h *= prime
-	for i := range len(value) {
-		h ^= uint64(value[i])
-		h *= prime
-	}
-	insertMinHash(h, sig)
-}
-
-// addKeyHash hashes just the key via inline FNV-1a and inserts into the min-heap.
-// Mirrors writer.addHashToMinHeap.
-func addKeyHash(key string, sig *[4]uint64) {
-	const (
-		offset = uint64(14695981039346656037)
-		prime  = uint64(1099511628211)
-	)
-	h := offset
-	for i := range len(key) {
-		h ^= uint64(key[i])
-		h *= prime
-	}
-	insertMinHash(h, sig)
-}
-
-// insertMinHash inserts v into the 4-element sorted min-heap.
-// Mirrors writer.insertMinHeap.
-func insertMinHash(v uint64, sig *[4]uint64) {
-	for i := range 4 {
-		if v < sig[i] {
-			for j := 3; j > i; j-- {
-				sig[j] = sig[j-1]
-			}
-			sig[i] = v
-			break
-		}
-	}
 }
 
 // reconstructLogRecord reads all columns for one log row and reconstructs an

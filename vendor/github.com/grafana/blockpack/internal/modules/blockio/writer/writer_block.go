@@ -627,6 +627,119 @@ func readDynAttrValue(col *modules_reader.Column, rowIdx int, baseType shared.Co
 	return val, true
 }
 
+// applyTraceID copies the trace:id column value for one row during compaction.
+func (b *blockBuilder) applyTraceID(col *modules_reader.Column, srcRowIdx, dstRowIdx int) (traceID [16]byte, found bool) {
+	if v, ok := col.BytesValue(srcRowIdx); ok && len(v) == 16 {
+		b.colTraceID.values[dstRowIdx] = slices.Clone(v)
+		b.colTraceID.present[dstRowIdx] = true
+		copy(traceID[:], v)
+		b.feedIntrinsicBytes("trace:id", shared.ColumnTypeBytes, v, dstRowIdx)
+		return traceID, true
+	}
+	return traceID, false
+}
+
+// applySpanID copies the span:id column value for one row during compaction.
+func (b *blockBuilder) applySpanID(col *modules_reader.Column, srcRowIdx, dstRowIdx int) {
+	if v, ok := col.BytesValue(srcRowIdx); ok && len(v) > 0 {
+		b.colSpanID.values[dstRowIdx] = slices.Clone(v)
+		b.colSpanID.present[dstRowIdx] = true
+		b.updateMinMax("span:id", shared.ColumnTypeBytes, string(v))
+		b.feedIntrinsicBytes("span:id", shared.ColumnTypeBytes, v, dstRowIdx)
+	}
+}
+
+// applySpanParentID copies the span:parent_id column value for one row during compaction.
+func (b *blockBuilder) applySpanParentID(col *modules_reader.Column, srcRowIdx, dstRowIdx int) {
+	if v, ok := col.BytesValue(srcRowIdx); ok && len(v) > 0 {
+		b.colParentID.values[dstRowIdx] = slices.Clone(v)
+		b.colParentID.present[dstRowIdx] = true
+		b.updateMinMax("span:parent_id", shared.ColumnTypeBytes, string(v))
+		b.feedIntrinsicBytes("span:parent_id", shared.ColumnTypeBytes, v, dstRowIdx)
+	}
+}
+
+// applySpanName copies the span:name column value for one row during compaction.
+func (b *blockBuilder) applySpanName(col *modules_reader.Column, srcRowIdx, dstRowIdx int) {
+	if v, ok := col.StringValue(srcRowIdx); ok {
+		b.colSpanName.values[dstRowIdx] = v
+		b.colSpanName.present[dstRowIdx] = true
+		if v != "" {
+			b.updateMinMax("span:name", shared.ColumnTypeString, v)
+			b.feedIntrinsicString("span:name", shared.ColumnTypeString, v, dstRowIdx)
+		}
+	}
+}
+
+// applySpanKind copies the span:kind column value for one row during compaction.
+func (b *blockBuilder) applySpanKind(col *modules_reader.Column, srcRowIdx, dstRowIdx int) {
+	if v, ok := col.Int64Value(srcRowIdx); ok {
+		b.colSpanKind.values[dstRowIdx] = v
+		b.colSpanKind.present[dstRowIdx] = true
+		var tmp [8]byte
+		binary.LittleEndian.PutUint64(tmp[:], uint64(v)) //nolint:gosec // safe: reinterpreting int64 bits as uint64
+		b.updateMinMax("span:kind", shared.ColumnTypeInt64, string(tmp[:]))
+		b.feedIntrinsicInt64("span:kind", shared.ColumnTypeInt64, v, dstRowIdx)
+	}
+}
+
+// applySpanStart copies the span:start column value for one row during compaction.
+// Returns the value and whether it was present (used by finalizeRowBookkeeping).
+func (b *blockBuilder) applySpanStart(col *modules_reader.Column, srcRowIdx, dstRowIdx int) (uint64, bool) {
+	if v, ok := col.Uint64Value(srcRowIdx); ok {
+		b.colSpanStart.values[dstRowIdx] = v
+		b.colSpanStart.present[dstRowIdx] = true
+		b.colSpanStart.trackMinMax(v)
+		var tmp [8]byte
+		binary.LittleEndian.PutUint64(tmp[:], v)
+		b.updateMinMax("span:start", shared.ColumnTypeUint64, string(tmp[:]))
+		b.feedIntrinsicUint64("span:start", shared.ColumnTypeUint64, v, dstRowIdx)
+		return v, true
+	}
+	return 0, false
+}
+
+// applySpanEnd copies the span:end column value for one row during compaction.
+// span:end is NOT written to the intrinsic section — it is synthesized on read.
+// Returns the value and whether it was present (used by finalizeRowBookkeeping).
+func (b *blockBuilder) applySpanEnd(col *modules_reader.Column, srcRowIdx, dstRowIdx int) (uint64, bool) {
+	if v, ok := col.Uint64Value(srcRowIdx); ok {
+		b.colSpanEnd.values[dstRowIdx] = v
+		b.colSpanEnd.present[dstRowIdx] = true
+		b.colSpanEnd.trackMinMax(v)
+		var tmp [8]byte
+		binary.LittleEndian.PutUint64(tmp[:], v)
+		b.updateMinMax("span:end", shared.ColumnTypeUint64, string(tmp[:]))
+		return v, true
+	}
+	return 0, false
+}
+
+// applySpanDuration copies the span:duration column value for one row during compaction.
+func (b *blockBuilder) applySpanDuration(col *modules_reader.Column, srcRowIdx, dstRowIdx int) bool {
+	if v, ok := col.Uint64Value(srcRowIdx); ok {
+		b.colSpanDur.values[dstRowIdx] = v
+		b.colSpanDur.present[dstRowIdx] = true
+		b.colSpanDur.trackMinMax(v)
+		var tmp [8]byte
+		binary.LittleEndian.PutUint64(tmp[:], v)
+		b.updateMinMax("span:duration", shared.ColumnTypeUint64, string(tmp[:]))
+		b.feedIntrinsicUint64("span:duration", shared.ColumnTypeUint64, v, dstRowIdx)
+		return true
+	}
+	return false
+}
+
+// applySpanStatus feeds the span:status column value into the intrinsic and dynamic paths.
+func (b *blockBuilder) applySpanStatus(col *modules_reader.Column, srcRowIdx, dstRowIdx int) {
+	if v, ok := col.Int64Value(srcRowIdx); ok {
+		var tmp [8]byte
+		binary.LittleEndian.PutUint64(tmp[:], uint64(v)) //nolint:gosec // safe: reinterpreting int64 bits as uint64
+		b.updateMinMax("span:status", shared.ColumnTypeInt64, string(tmp[:]))
+		b.feedIntrinsicInt64("span:status", shared.ColumnTypeInt64, v, dstRowIdx)
+	}
+}
+
 // addRowFromBlock adds all column values for one row from a source Block.
 // This is the native columnar path used by the compaction writer — it bypasses
 // all OTLP proto objects, reading typed values directly from decoded columns and
@@ -648,109 +761,39 @@ func (b *blockBuilder) addRowFromBlock(srcBlock *modules_reader.Block, srcRowIdx
 
 		switch colKey.Name {
 		case traceIDColumnName:
-			if v, ok := col.BytesValue(srcRowIdx); ok && len(v) == 16 {
-				b.colTraceID.values[dstRowIdx] = slices.Clone(v)
-				b.colTraceID.present[dstRowIdx] = true
-				copy(traceID[:], v)
-				traceIDFound = true
-				b.feedIntrinsicBytes("trace:id", shared.ColumnTypeBytes, v, dstRowIdx)
-			}
+			traceID, traceIDFound = b.applyTraceID(col, srcRowIdx, dstRowIdx)
 			continue
 
 		case "span:id":
-			if v, ok := col.BytesValue(srcRowIdx); ok && len(v) > 0 {
-				b.colSpanID.values[dstRowIdx] = slices.Clone(v)
-				b.colSpanID.present[dstRowIdx] = true
-				b.updateMinMax("span:id", shared.ColumnTypeBytes, string(v))
-				b.feedIntrinsicBytes("span:id", shared.ColumnTypeBytes, v, dstRowIdx)
-			}
+			b.applySpanID(col, srcRowIdx, dstRowIdx)
 			continue
 
 		case "span:parent_id":
-			if v, ok := col.BytesValue(srcRowIdx); ok && len(v) > 0 {
-				b.colParentID.values[dstRowIdx] = slices.Clone(v)
-				b.colParentID.present[dstRowIdx] = true
-				b.updateMinMax("span:parent_id", shared.ColumnTypeBytes, string(v))
-				b.feedIntrinsicBytes("span:parent_id", shared.ColumnTypeBytes, v, dstRowIdx)
-			}
+			b.applySpanParentID(col, srcRowIdx, dstRowIdx)
 			continue
 
 		case "span:name":
-			if v, ok := col.StringValue(srcRowIdx); ok {
-				b.colSpanName.values[dstRowIdx] = v
-				b.colSpanName.present[dstRowIdx] = true
-				if v != "" {
-					b.updateMinMax("span:name", shared.ColumnTypeString, v)
-					b.feedIntrinsicString("span:name", shared.ColumnTypeString, v, dstRowIdx)
-				}
-			}
+			b.applySpanName(col, srcRowIdx, dstRowIdx)
 			continue
 
 		case "span:kind":
-			if v, ok := col.Int64Value(srcRowIdx); ok {
-				b.colSpanKind.values[dstRowIdx] = v
-				b.colSpanKind.present[dstRowIdx] = true
-				var tmp [8]byte
-				binary.LittleEndian.PutUint64(
-					tmp[:],
-					uint64(v), //nolint:gosec // safe: reinterpreting int64 bits as uint64
-				)
-				b.updateMinMax("span:kind", shared.ColumnTypeInt64, string(tmp[:]))
-				b.feedIntrinsicInt64("span:kind", shared.ColumnTypeInt64, v, dstRowIdx)
-			}
+			b.applySpanKind(col, srcRowIdx, dstRowIdx)
 			continue
 
 		case "span:start":
-			if v, ok := col.Uint64Value(srcRowIdx); ok {
-				b.colSpanStart.values[dstRowIdx] = v
-				b.colSpanStart.present[dstRowIdx] = true
-				b.colSpanStart.trackMinMax(v)
-				var tmp [8]byte
-				binary.LittleEndian.PutUint64(tmp[:], v)
-				b.updateMinMax("span:start", shared.ColumnTypeUint64, string(tmp[:]))
-				b.feedIntrinsicUint64("span:start", shared.ColumnTypeUint64, v, dstRowIdx)
-				spanStart = v
-				spanStartFound = true
-			}
+			spanStart, spanStartFound = b.applySpanStart(col, srcRowIdx, dstRowIdx)
 			continue
 
 		case "span:end":
-			if v, ok := col.Uint64Value(srcRowIdx); ok {
-				b.colSpanEnd.values[dstRowIdx] = v
-				b.colSpanEnd.present[dstRowIdx] = true
-				b.colSpanEnd.trackMinMax(v)
-				var tmp [8]byte
-				binary.LittleEndian.PutUint64(tmp[:], v)
-				b.updateMinMax("span:end", shared.ColumnTypeUint64, string(tmp[:]))
-				spanEnd = v
-				spanEndFound = true
-				// span:end NOT written to intrinsic section — synthesized on read.
-			}
+			spanEnd, spanEndFound = b.applySpanEnd(col, srcRowIdx, dstRowIdx)
 			continue
 
 		case "span:duration":
-			if v, ok := col.Uint64Value(srcRowIdx); ok {
-				b.colSpanDur.values[dstRowIdx] = v
-				b.colSpanDur.present[dstRowIdx] = true
-				b.colSpanDur.trackMinMax(v)
-				var tmp [8]byte
-				binary.LittleEndian.PutUint64(tmp[:], v)
-				b.updateMinMax("span:duration", shared.ColumnTypeUint64, string(tmp[:]))
-				b.feedIntrinsicUint64("span:duration", shared.ColumnTypeUint64, v, dstRowIdx)
-				durationFound = true
-			}
+			durationFound = b.applySpanDuration(col, srcRowIdx, dstRowIdx)
 			continue
 
 		case "span:status":
-			if v, ok := col.Int64Value(srcRowIdx); ok {
-				var tmp [8]byte
-				binary.LittleEndian.PutUint64(
-					tmp[:],
-					uint64(v), //nolint:gosec // safe: reinterpreting int64 bits as uint64
-				)
-				b.updateMinMax("span:status", shared.ColumnTypeInt64, string(tmp[:]))
-				b.feedIntrinsicInt64("span:status", shared.ColumnTypeInt64, v, dstRowIdx)
-			}
+			b.applySpanStatus(col, srcRowIdx, dstRowIdx)
 			// Fall through to addPresent below (don't continue).
 
 		case "span:status_message":

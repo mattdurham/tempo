@@ -230,6 +230,24 @@ func QueryTraceQL(r *Reader, traceqlQuery string, opts QueryOptions) (results []
 	return results, err
 }
 
+// emitAllSpans sends every span in allSpans to fn, honoring the given limit
+// (0 = unlimited). Calls fn(nil, false) as the terminal signal after the last span.
+func emitAllSpans(allSpans []SpanMatch, limit int, fn spanMatchFn) {
+	remaining := limit
+	for i := range allSpans {
+		if !fn(&allSpans[i], true) {
+			break
+		}
+		if remaining > 0 {
+			remaining--
+			if remaining == 0 {
+				break
+			}
+		}
+	}
+	fn(nil, false)
+}
+
 // SPEC-PA-4, SPEC-PA-5, SPEC-PA-6, SPEC-PA-7: streamPipelineQuery executes a TraceQL pipeline query
 // ({filter} | aggregate() > threshold).
 // It runs the filter part, groups matching spans into spansets by trace ID, applies the
@@ -270,37 +288,13 @@ func streamPipelineQuery(r *Reader, mq *traceqlparser.MetricsQuery, opts QueryOp
 
 	if pipeline == nil {
 		// No pipeline stages — emit all spans, respecting limit.
-		remaining := opts.Limit
-		for i := range allSpans {
-			if !fn(&allSpans[i], true) {
-				break
-			}
-			if remaining > 0 {
-				remaining--
-				if remaining == 0 {
-					break
-				}
-			}
-		}
-		fn(nil, false)
+		emitAllSpans(allSpans, opts.Limit, fn)
 		return nil
 	}
 
 	// If pipeline has no aggregate (just by/select), emit all spans, respecting limit.
 	if pipeline.Aggregate.Name == "" {
-		remaining := opts.Limit
-		for i := range allSpans {
-			if !fn(&allSpans[i], true) {
-				break
-			}
-			if remaining > 0 {
-				remaining--
-				if remaining == 0 {
-					break
-				}
-			}
-		}
-		fn(nil, false)
+		emitAllSpans(allSpans, opts.Limit, fn)
 		return nil
 	}
 

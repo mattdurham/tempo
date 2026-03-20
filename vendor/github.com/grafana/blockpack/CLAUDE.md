@@ -144,15 +144,15 @@ This repo ships a project-specific MCP server pre-configured in `.mcp.json`. **B
 
 ## Code Quality & Pre-Commit Checks (STRICT ENFORCEMENT)
 
-- **ALWAYS** run `make precommit` before committing changes
-- This runs all quality checks: gofumpt, golines, golangci-lint, betteralign, gocyclo, tests, coverage
-- **NEVER** commit if `make precommit` fails
-- CI will enforce these same checks — precommit ensures you catch issues locally first
+- **ALWAYS** run `make precommit` as the final step before every commit — no exceptions
+- `make precommit` runs: gofumpt, golines, golangci-lint (includes gocritic, gocyclo, staticcheck, revive), betteralign, nilaway, build, tests, deadcode, staticcheck
+- **NEVER** commit if `make precommit` fails — fix all issues first
+- `make precommit` and `.github/workflows/ci.yml` are kept in sync — every check in one must be in the other (**exception:** `golines` runs in `make precommit` but is currently disabled in CI due to CI-only failures)
 - All checks are blocking — zero tolerance for violations
 
 ### Quality Standards
 
-- **Cyclomatic complexity:** < 40 (enforced by gocyclo and golangci-lint)
+- **Cyclomatic complexity:** < 30 (enforced by gocyclo and golangci-lint)
 - **Test coverage:** > 70% (enforced in CI)
 - **Formatting:** gofumpt (stricter than gofmt)
 - **Line length:** 120 characters (enforced by golines)

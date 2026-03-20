@@ -255,46 +255,45 @@ ci:
 		echo "✅ CI pipeline PASSED"; \
 	fi
 
-# Run all pre-commit quality checks (UPDATED)
+# Run all pre-commit quality checks
+# Mirrors .github/workflows/ci.yml — every check here must also run in GHA and vice versa.
+# Exception: golines runs here but is disabled in CI due to CI-only failures (see ci.yml comment).
 precommit:
 	@echo "==> Running pre-commit quality checks..."
 	@echo ""
-	@echo "[1/10] Auto-formatting code (gofumpt)..."
+	@echo "[1/9] Auto-formatting code (gofumpt)..."
 	@$(MAKE) gofumpt
 	@echo "✅ gofumpt: formatted"
 	@echo ""
-	@echo "[2/10] Auto-fixing line length (golines)..."
+	@echo "[2/9] Auto-fixing line length (golines)..."
 	@$(MAKE) golines
 	@echo "✅ golines: fixed"
 	@echo ""
-	@echo "[3/10] Running golangci-lint (40+ linters)..."
+	@echo "[3/9] Running golangci-lint (40+ linters, includes gocyclo + staticcheck)..."
 	@$(MAKE) lint
 	@echo "✅ golangci-lint: clean"
 	@echo ""
-	@echo "[4/10] Checking struct alignment (betteralign)..."
+	@echo "[4/9] Checking struct alignment (betteralign)..."
 	@$(MAKE) betteralign
 	@echo "✅ betteralign: clean"
 	@echo ""
-	@echo "[5/10] Building project..."
+	@echo "[5/9] Running nil safety checks (nilaway)..."
+	@$(MAKE) nilaway
+	@echo "✅ nilaway: clean"
+	@echo ""
+	@echo "[6/9] Building project..."
 	@go build $(PACKAGES)
 	@echo "✅ build: successful"
 	@echo ""
-	@echo "[6/10] Checking cyclomatic complexity..."
-	@golangci-lint run --enable-only=gocyclo ./... 2>&1 || (echo "❌ gocyclo found functions with complexity > 40"; exit 1)
-	@echo "✅ cyclomatic complexity: all < 40 (non-test code)"
-	@echo ""
-	@echo "[7/10] Running tests..."
+	@echo "[7/9] Running tests..."
 	@$(MAKE) test
 	@echo "✅ tests: all passing"
 	@echo ""
-	@echo "[8/10] Code coverage check — DISABLED (new cmd packages added without tests)"
-	@echo "⚠️  skipped"
-	@echo ""
-	@echo "[9/10] Running deadcode check..."
+	@echo "[8/9] Running deadcode check..."
 	@$(MAKE) deadcode
 	@echo "✅ deadcode: no unreachable code"
 	@echo ""
-	@echo "[10/10] Running staticcheck..."
+	@echo "[9/9] Running staticcheck..."
 	@$(MAKE) staticcheck
 	@echo "✅ staticcheck: clean"
 	@echo ""

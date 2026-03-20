@@ -217,6 +217,69 @@ func filterRowsByTimeRange(tsCol *modules_reader.Column, rows []int, minNano, ma
 // continue iteration, false to stop.
 //
 // Returns the number of blocks fetched.
+// processLogRows applies the per-row pipeline and callback for one block's kept rows.
+// Returns true if the callback requested early stop.
+func processLogRows(
+	rows []int,
+	tsCol, bodyCol *modules_reader.Column,
+	colNames []string,
+	colMap map[string]int,
+	colCols []*modules_reader.Column,
+	logStrNames []string,
+	logStrCols []*modules_reader.Column,
+	block *modules_reader.Block,
+	pipeline *logqlparser.Pipeline,
+	skipParsers bool,
+	canSkip func(ts uint64) bool,
+	fn func(ts uint64, entry LogEntry) bool,
+) bool {
+	for _, rowIdx := range rows {
+		var ts uint64
+		if tsCol != nil {
+			if v, ok := tsCol.Uint64Value(rowIdx); ok {
+				ts = v
+			}
+		}
+		var line string
+		if bodyCol != nil {
+			if v, ok := bodyCol.StringValue(rowIdx); ok {
+				line = v
+			}
+		}
+
+		// NOTE-031: per-row early skip — called after ts is read but before
+		// lokiLabels/logAttrs are materialized, avoiding unnecessary allocation.
+		if canSkip != nil && canSkip(ts) {
+			continue
+		}
+
+		// NOTE-SL-016: acquire from pool - zero map allocation for dropped rows.
+		bls := acquireBlockLabelSet(block, rowIdx, colNames, colMap, colCols)
+		if pipeline != nil {
+			var keep bool
+			if skipParsers {
+				line, _, keep = pipeline.ProcessSkipParsers(ts, line, bls)
+			} else {
+				line, _, keep = pipeline.Process(ts, line, bls)
+			}
+			if !keep {
+				releaseBlockLabelSet(bls)
+				continue
+			}
+		}
+		// Read __loki_labels__ via the post-pipeline LabelSet so that mutations
+		// (drop/keep/label_format) are respected if they affect this field.
+		lokiLabels := bls.Get("__loki_labels__")
+		logAttrs := collectLogStringAttrs(logStrNames, logStrCols, rowIdx)
+		releaseBlockLabelSet(bls)
+		entry := LogEntry{TimestampNanos: ts, Line: line, LokiLabels: lokiLabels, LogAttrs: logAttrs}
+		if !fn(ts, entry) {
+			return true
+		}
+	}
+	return false
+}
+
 func iterateLogRows(
 	r *modules_reader.Reader,
 	program *vm.Program,
@@ -317,49 +380,8 @@ func iterateLogRows(
 		bodyCol := bwb.Block.GetColumn("log:body")
 		colNames, colMap, colCols, logStrNames, logStrCols := buildBlockColMapsWithLogCache(bwb.Block)
 		skipParsers := pipeline != nil && blockHasBodyParsed(bwb.Block)
-		for _, rowIdx := range keptByTime {
-			var ts uint64
-			if tsCol != nil {
-				if v, ok := tsCol.Uint64Value(rowIdx); ok {
-					ts = v
-				}
-			}
-			var line string
-			if bodyCol != nil {
-				if v, ok := bodyCol.StringValue(rowIdx); ok {
-					line = v
-				}
-			}
-
-			// NOTE-031: per-row early skip — called after ts is read but before
-			// lokiLabels/logAttrs are materialized, avoiding unnecessary allocation.
-			if canSkip != nil && canSkip(ts) {
-				continue
-			}
-
-			// NOTE-SL-016: acquire from pool - zero map allocation for dropped rows.
-			bls := acquireBlockLabelSet(bwb.Block, rowIdx, colNames, colMap, colCols)
-			if pipeline != nil {
-				var keep bool
-				if skipParsers {
-					line, _, keep = pipeline.ProcessSkipParsers(ts, line, bls)
-				} else {
-					line, _, keep = pipeline.Process(ts, line, bls)
-				}
-				if !keep {
-					releaseBlockLabelSet(bls)
-					continue
-				}
-			}
-			// Read __loki_labels__ via the post-pipeline LabelSet so that mutations
-			// (drop/keep/label_format) are respected if they affect this field.
-			lokiLabels := bls.Get("__loki_labels__")
-			logAttrs := collectLogStringAttrs(logStrNames, logStrCols, rowIdx)
-			releaseBlockLabelSet(bls)
-			entry := LogEntry{TimestampNanos: ts, Line: line, LokiLabels: lokiLabels, LogAttrs: logAttrs}
-			if !fn(ts, entry) {
-				return fetchCount, nil
-			}
+		if processLogRows(keptByTime, tsCol, bodyCol, colNames, colMap, colCols, logStrNames, logStrCols, bwb.Block, pipeline, skipParsers, canSkip, fn) {
+			return fetchCount, nil
 		}
 	}
 	return fetchCount, nil

@@ -985,8 +985,8 @@ func appendIfMissing(dst []string, cols ...string) []string {
 //   - It uses a numeric op (>, >=, <, <=) with a parseable float threshold
 //
 // A StageLabelFilter is eligible for skip (removed from pipeline) only when:
-//   - It appears before any parser stage AND uses a string op or parseable numeric op
-//   - Numeric ops are never skipped regardless of position (type unknown at compile time)
+//   - It appears before any parser stage (!seenParser) AND uses a string op or parseable numeric op
+//   - Post-parser string and numeric ops are kept in the pipeline (see NOTE-012)
 //
 // Barrier stage types: StageLabelFormat, StageDrop, StageKeep, StageLineFormat —
 // these mutate the label map, so filters after them may depend on the mutation.
@@ -1016,7 +1016,9 @@ func identifyPushdownStages(stages []PipelineStage) (skip, columnPred map[int]st
 			}
 		case OpGT, OpGTE, OpLT, OpLTE:
 			// Numeric: parse value to ensure it's a valid threshold. If unparseable,
-			// skip — the pipeline's LabelFilterStage will drop rows correctly.
+			// skip this stage entirely — it stays in the pipeline to correctly drop
+			// all rows (LabelFilterStage drops on ParseFloat error), but contributes
+			// no useful column predicate for block-level pruning.
 			if _, err := strconv.ParseFloat(stage.LabelFilter.Value, 64); err != nil {
 				continue
 			}
@@ -1034,8 +1036,17 @@ func identifyPushdownStages(stages []PipelineStage) (skip, columnPred map[int]st
 				continue
 			}
 			columnPred[i] = struct{}{}
-			// Numeric range predicates: keep in pipeline always — the column type
-			// is unknown at compile time; pipeline does authoritative numeric evaluation.
+			// NOTE-012: numeric ops are skipped from pipeline when no parser has been seen,
+			// same as string ops. ScanGreaterThan/ScanLessThan handle both typed and
+			// ColumnTypeRangeString columns (dict-level float pre-parse), so the
+			// ColumnPredicate is the authoritative evaluator — LabelFilterStage would
+			// only repeat the same comparison redundantly.
+			// When a parser (json/logfmt) has been seen, keep in pipeline: the pipeline
+			// may run on blocks without body-parsed columns, where the parser stage
+			// extracts values the column predicate cannot see.
+			if !seenParser {
+				skip[i] = struct{}{}
+			}
 		}
 	}
 	return skip, columnPred

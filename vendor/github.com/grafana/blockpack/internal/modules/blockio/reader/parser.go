@@ -36,6 +36,7 @@ type parsedMetadata struct {
 	rangeOffsets  map[string]rangeIndexMeta
 	traceIndexRaw []byte
 	tsEntries     []tsIndexEntry
+	fileBloomRaw  []byte // raw FileBloom section bytes; nil for old files
 }
 
 // ClearCaches resets all process-level caches. Intended for testing.
@@ -221,6 +222,7 @@ func (r *Reader) parseV5MetadataLazy() error {
 			r.traceIndexRaw = pm.traceIndexRaw
 			r.tsEntries = pm.tsEntries
 			r.sketchIdx = pm.sketchIdx
+			r.fileBloomRaw = pm.fileBloomRaw
 			return nil
 		}
 	}
@@ -337,33 +339,26 @@ func (r *Reader) parseV5MetadataLazy() error {
 		pos += tsConsumed
 	}
 
-	// Sketch index section — optional, present in files written after 2026-03-07.
-	// Cache the parsed result by fileID to avoid re-parsing on every Reader creation.
-	if pos < len(data) && r.fileID != "" {
-		skCacheKey := r.fileID + "/sketch"
-		if cached, ok := parsedSketchCache.Load(skCacheKey); ok {
-			r.sketchIdx = cached.(*sketchIndex)
-		} else {
-			sketches, skConsumed, skErr := parseSketchIndexSection(data[pos:])
-			if skErr != nil {
-				return fmt.Errorf("parseMetadata: sketch_index: %w", skErr)
-			}
-			r.sketchIdx = sketches
-			pos += skConsumed
-			if sketches != nil {
-				parsedSketchCache.Store(skCacheKey, sketches)
-			}
-		}
-	} else if pos < len(data) {
-		sketches, skConsumed, skErr := parseSketchIndexSection(data[pos:])
-		if skErr != nil {
-			return fmt.Errorf("parseMetadata: sketch_index: %w", skErr)
-		}
-		r.sketchIdx = sketches
-		pos += skConsumed
+	sketchConsumed, skErr := r.parseAndCacheSketchSection(data[pos:])
+	if skErr != nil {
+		return skErr
 	}
+	pos += sketchConsumed
 
-	_ = pos
+	// FileBloom section — optional, present after sketch index (always the last section).
+	// NOTE-45: graceful degradation — old files without this section parse cleanly.
+	if pos < len(data) {
+		fb, fbConsumed, fbErr := parseFileBloomSection(data[pos:])
+		if fbErr != nil {
+			return fmt.Errorf("parseMetadata: file_bloom: %w", fbErr)
+		}
+		if fb != nil {
+			clone := make([]byte, fbConsumed)
+			copy(clone, data[pos:pos+fbConsumed])
+			r.fileBloomRaw = clone
+			r.fileBloomParsed = fb
+		}
+	}
 
 	// Store in process-level cache for subsequent Reader creations on the same file.
 	if r.fileID != "" {
@@ -374,9 +369,40 @@ func (r *Reader) parseV5MetadataLazy() error {
 			traceIndexRaw: r.traceIndexRaw,
 			tsEntries:     r.tsEntries,
 			sketchIdx:     r.sketchIdx,
+			fileBloomRaw:  r.fileBloomRaw,
 		})
 	}
 	return nil
+}
+
+// parseAndCacheSketchSection parses the sketch index section from data, caches the result,
+// and returns the number of bytes consumed. Returns (0, nil) when no sketch section is present.
+func (r *Reader) parseAndCacheSketchSection(data []byte) (int, error) {
+	if len(data) == 0 {
+		return 0, nil
+	}
+	if r.fileID != "" {
+		skCacheKey := r.fileID + "/sketch"
+		if cached, ok := parsedSketchCache.Load(skCacheKey); ok {
+			r.sketchIdx = cached.(*sketchIndex)
+			// Sketch is cached but we don't know how many bytes it consumed.
+			// Re-scan to advance pos past the sketch section so we can find FileBloom.
+			_, consumed, skErr := parseSketchIndexSection(data)
+			if skErr != nil {
+				return 0, fmt.Errorf("parseMetadata: sketch_index (cache hit rescan): %w", skErr)
+			}
+			return consumed, nil
+		}
+	}
+	sketches, consumed, skErr := parseSketchIndexSection(data)
+	if skErr != nil {
+		return 0, fmt.Errorf("parseMetadata: sketch_index: %w", skErr)
+	}
+	r.sketchIdx = sketches
+	if sketches != nil && r.fileID != "" {
+		parsedSketchCache.Store(r.fileID+"/sketch", sketches)
+	}
+	return consumed, nil
 }
 
 // parseBlockIndexEntry parses one block index entry for the given version.

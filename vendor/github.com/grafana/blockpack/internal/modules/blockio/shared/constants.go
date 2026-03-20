@@ -33,6 +33,11 @@ const (
 	TSIndexMagic   uint32 = 0xC011FEED // per-file timestamp index section
 	TSIndexVersion uint8  = 1
 
+	// FileBloomMagic is the magic number for the file-level bloom filter section.
+	// "FBLM" in ASCII.
+	FileBloomMagic   uint32 = 0x46424C4D
+	FileBloomVersion uint8  = 0x01
+
 	// CompactIndexVersion2 is the compact trace index version that includes the trace ID bloom filter.
 	CompactIndexVersion2 uint8 = 2
 

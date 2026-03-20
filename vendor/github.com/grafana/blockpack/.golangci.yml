@@ -21,7 +21,8 @@ linters:
 
     # Code Quality
     - revive          # Configurable style checker (replaces golint)
-    - gocyclo         # Cyclomatic complexity (threshold: 40)
+    - gocritic        # Opinionated style and performance checks
+    - gocyclo         # Cyclomatic complexity (threshold: 30)
     - dupl            # Duplicate code detection
     - goconst         # Repeated string/number constants
     - unconvert       # Unnecessary type conversions
@@ -39,7 +40,7 @@ linters:
       enable-all: true
 
     gocyclo:
-      min-complexity: 40
+      min-complexity: 30
 
     dupl:
       threshold: 200  # Increased to reduce noise from intentional type-specific code patterns
@@ -103,6 +104,30 @@ linters:
         text: "G404:"
         linters:
           - gosec
+
+      # appendAssign in tests is intentional — building crafted test payloads into new slices
+      - path: _test\.go
+        text: "appendAssign:"
+        linters:
+          - gocritic
+
+      # ifElseChain in cmd/ — chains use function calls or mixed conditions, not switchable
+      - path: cmd/
+        text: "ifElseChain:"
+        linters:
+          - gocritic
+
+      # ifElseChain in traceqlparser — chains call matchOperator(), not switchable
+      - path: internal/traceqlparser/parser\.go
+        text: "ifElseChain:"
+        linters:
+          - gocritic
+
+      # ifElseChain in vm — chains mix equality and HasPrefix, not switchable
+      - path: internal/vm/traceql_compiler\.go
+        text: "ifElseChain:"
+        linters:
+          - gocritic
 
       # "shared" is an established package name in this codebase used for cross-package types
       - path: internal/blockio/shared/

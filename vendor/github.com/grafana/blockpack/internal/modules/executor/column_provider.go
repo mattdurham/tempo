@@ -32,94 +32,33 @@ func newBlockColumnProvider(block *modules_reader.Block) *blockColumnProvider {
 	return &blockColumnProvider{block: block}
 }
 
-// lookupColumn finds a column by name, falling back to resource./span./log. prefixes for unscoped names.
+// lookupColumn finds a column by its fully-qualified name.
+// All callers (TraceQL via unscopedOrScoped, LogQL via compileSinglePushdownPredicate)
+// pre-expand unscoped attribute names to resource./span./log. at compile time,
+// so no runtime fallback is needed here.
 func (p *blockColumnProvider) lookupColumn(name string) *modules_reader.Column {
-	if col := p.block.GetColumn(name); col != nil {
-		return col
-	}
-	// For unscoped names (no dot or colon prefix), try resource., span., and log.
-	if !strings.ContainsAny(name, ".:") {
-		if col := p.block.GetColumn("resource." + name); col != nil {
-			return col
-		}
-		if col := p.block.GetColumn("span." + name); col != nil {
-			return col
-		}
-		if col := p.block.GetColumn("log." + name); col != nil {
-			return col
-		}
-	}
-	return nil
+	return p.block.GetColumn(name)
 }
 
-// GetRowCount returns the total span count.
+// GetRowCount returns the total row count (spans for traces, records for logs).
 func (p *blockColumnProvider) GetRowCount() int { return p.block.SpanCount() }
 
-// rowMatches reports whether row rowIdx of col matches value using equality semantics.
-func rowMatches(col *modules_reader.Column, rowIdx int, value interface{}) bool {
-	if !col.IsPresent(rowIdx) {
+// rowEqual reports whether col[rowIdx] equals value using type-strict semantics.
+// String columns only match string values (no float coercion) — use rowCompare for
+// range operators where numeric coercion of string columns is intentional.
+func rowEqual(col *modules_reader.Column, rowIdx int, value interface{}) bool {
+	cmp, ok := rowCompare(col, rowIdx, value)
+	if !ok {
 		return false
 	}
-	switch col.Type {
-	case modules_shared.ColumnTypeString, modules_shared.ColumnTypeRangeString:
-		if v, ok := col.StringValue(rowIdx); ok {
-			if s, ok2 := value.(string); ok2 {
-				return v == s
-			}
-		}
-	case modules_shared.ColumnTypeInt64, modules_shared.ColumnTypeRangeInt64, modules_shared.ColumnTypeRangeDuration:
-		if v, ok := col.Int64Value(rowIdx); ok {
-			switch t := value.(type) {
-			case int64:
-				return v == t
-			case float64:
-				return float64(v) == t
-			}
-		}
-	case modules_shared.ColumnTypeUint64, modules_shared.ColumnTypeRangeUint64:
-		if v, ok := col.Uint64Value(rowIdx); ok {
-			switch t := value.(type) {
-			case int64:
-				return v == uint64(t) //nolint:gosec
-			case uint64:
-				return v == t
-			case float64:
-				return float64(v) == t
-			}
-		}
-	case modules_shared.ColumnTypeFloat64, modules_shared.ColumnTypeRangeFloat64:
-		if v, ok := col.Float64Value(rowIdx); ok {
-			switch t := value.(type) {
-			case float64:
-				return v == t
-			case int64:
-				return v == float64(t)
-			}
-		}
-	case modules_shared.ColumnTypeBool:
-		if v, ok := col.BoolValue(rowIdx); ok {
-			if b, ok2 := value.(bool); ok2 {
-				return v == b
-			}
-		}
-	case modules_shared.ColumnTypeBytes, modules_shared.ColumnTypeRangeBytes:
-		if v, ok := col.BytesValue(rowIdx); ok {
-			switch t := value.(type) {
-			case []byte:
-				return bytes.Equal(v, t)
-			case string:
-				return string(v) == t
-			}
-		}
-	case modules_shared.ColumnTypeUUID:
-		// UUID columns are logically strings; compare against the formatted UUID string.
-		if v, ok := col.StringValue(rowIdx); ok {
-			if s, ok2 := value.(string); ok2 {
-				return v == s
-			}
+	// For string columns, rowCompare may succeed with float64 values via ParseFloat.
+	// Reject that path here: equality must be type-strict (string value == string query).
+	if col.Type == modules_shared.ColumnTypeString || col.Type == modules_shared.ColumnTypeRangeString {
+		if _, isFloat := value.(float64); isFloat {
+			return false
 		}
 	}
-	return false
+	return cmp == 0
 }
 
 // rowCompare returns -1/0/1 for col[rowIdx] <=> value (for range comparisons).
@@ -132,19 +71,7 @@ func rowCompare(col *modules_reader.Column, rowIdx int, value interface{}) (int,
 	switch col.Type {
 	case modules_shared.ColumnTypeString, modules_shared.ColumnTypeRangeString:
 		if v, ok := col.StringValue(rowIdx); ok {
-			if s, ok2 := value.(string); ok2 {
-				return cmp3(v, s)
-			}
-			// Numeric comparison against a string column: parse the stored value as
-			// float64 and compare. This matches LabelFilterStage semantics where
-			// | latency_ms > 100 parses both sides as float64.
-			if f, ok2 := value.(float64); ok2 {
-				parsed, err := strconv.ParseFloat(v, 64)
-				if err != nil {
-					return 0, false // non-numeric string vs numeric threshold → no match
-				}
-				return cmp3(parsed, f)
-			}
+			return rowCompareString(v, value)
 		}
 	case modules_shared.ColumnTypeInt64, modules_shared.ColumnTypeRangeInt64, modules_shared.ColumnTypeRangeDuration:
 		if v, ok := col.Int64Value(rowIdx); ok {
@@ -165,11 +92,18 @@ func rowCompare(col *modules_reader.Column, rowIdx int, value interface{}) (int,
 			}
 		}
 	case modules_shared.ColumnTypeUUID:
-		// UUID columns are logically strings; compare as string.
 		if v, ok := col.StringValue(rowIdx); ok {
 			if s, ok2 := value.(string); ok2 {
 				return cmp3(v, s)
 			}
+		}
+	case modules_shared.ColumnTypeBool:
+		if v, ok := col.BoolValue(rowIdx); ok {
+			return rowCompareBool(v, value)
+		}
+	case modules_shared.ColumnTypeBytes, modules_shared.ColumnTypeRangeBytes:
+		if v, ok := col.BytesValue(rowIdx); ok {
+			return rowCompareBytes(v, value)
 		}
 	case modules_shared.ColumnTypeFloat64, modules_shared.ColumnTypeRangeFloat64:
 		if v, ok := col.Float64Value(rowIdx); ok {
@@ -180,6 +114,49 @@ func rowCompare(col *modules_reader.Column, rowIdx int, value interface{}) (int,
 				return cmp3(v, float64(t))
 			}
 		}
+	}
+	return 0, false
+}
+
+// rowCompareString compares a stored string value against a query value (string or float64).
+// For float64 targets, the stored string is parsed as float64 (LabelFilterStage semantics).
+func rowCompareString(v string, value interface{}) (int, bool) {
+	if s, ok := value.(string); ok {
+		return cmp3(v, s)
+	}
+	if f, ok := value.(float64); ok {
+		parsed, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return 0, false
+		}
+		return cmp3(parsed, f)
+	}
+	return 0, false
+}
+
+// rowCompareBool compares a stored bool value against a query bool (false < true).
+func rowCompareBool(v bool, value interface{}) (int, bool) {
+	b, ok := value.(bool)
+	if !ok {
+		return 0, false
+	}
+	switch {
+	case v == b:
+		return 0, true
+	case !v: // false < true
+		return -1, true
+	default:
+		return 1, true
+	}
+}
+
+// rowCompareBytes compares a stored byte slice against a query []byte or string value.
+func rowCompareBytes(v []byte, value interface{}) (int, bool) {
+	switch t := value.(type) {
+	case []byte:
+		return cmp3(bytes.Compare(v, t), 0)
+	case string:
+		return cmp3(bytes.Compare(v, []byte(t)), 0)
 	}
 	return 0, false
 }
@@ -245,12 +222,14 @@ func (p *blockColumnProvider) scanWith(col *modules_reader.Column, cond func(i i
 // --- StreamScan methods ---
 
 // StreamScanEqual scans all rows and calls cb for each row where column equals value.
+// Uses rowEqual (type-strict) not rowCompare, so float64 queries never coerce string
+// column values via ParseFloat — that numeric coercion is only appropriate for GT/GTE/LT/LTE.
 func (p *blockColumnProvider) StreamScanEqual(column string, value interface{}, cb vm.RowCallback) (int, error) {
 	col := p.lookupColumn(column)
 	if col == nil {
 		return 0, nil
 	}
-	n := p.scanWith(col, func(i int) bool { return rowMatches(col, i, value) }, cb)
+	n := p.scanWith(col, func(i int) bool { return rowEqual(col, i, value) }, cb)
 	return n, nil
 }
 
@@ -262,7 +241,14 @@ func (p *blockColumnProvider) StreamScanNotEqual(column string, value interface{
 	for i := range n {
 		// NotEqual includes null rows (they are not equal to anything).
 		present := col != nil && col.IsPresent(i)
-		if !present || !rowMatches(col, i, value) {
+		if !present {
+			if !cb(i) {
+				return count, nil
+			}
+			count++
+			continue
+		}
+		if !rowEqual(col, i, value) {
 			if !cb(i) {
 				return count, nil
 			}
@@ -776,12 +762,6 @@ func (p *blockColumnProvider) Complement(rs vm.RowSet) vm.RowSet {
 }
 
 // --- GetValue ---
-
-// NewColumnProvider returns a vm.ColumnDataProvider backed by the given modules block.
-// Used by api.go's StreamTraceQLModules to evaluate vm.Program.ColumnPredicate per block.
-func NewColumnProvider(block *modules_reader.Block) vm.ColumnDataProvider {
-	return newBlockColumnProvider(block)
-}
 
 // GetValue returns the value at column/rowIdx.
 // Returns (nil, false, nil) when the column is absent or the row is null.

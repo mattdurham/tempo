@@ -114,7 +114,7 @@ writer (`modules_blockio.NewWriterWithConfig`) → reader
 `internal/modules/executor/executor_test.go` additionally covers:
 - `Options.Limit` early-exit (EX-08)
 - `SpanMatch.TraceID` / `SpanMatch.SpanID` field population (EX-09)
-- `result.Plan.TotalBlocks` populated (EX-10)
+- `statsOut.TotalBlocks` populated via CollectStats (EX-10)
 
 ---
 

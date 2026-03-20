@@ -20,6 +20,14 @@ import (
 // Ensure blockLabelSet satisfies LabelSet at compile time.
 var _ logqlparser.LabelSet = (*blockLabelSet)(nil)
 
+// blockLabelSetPool is a sync.Pool of *blockLabelSet for the hot scan path.
+// NOTE-SL-016: pool eliminates per-row struct allocation.
+var blockLabelSetPool = &sync.Pool{ //nolint:gochecknoglobals
+	New: func() any {
+		return &blockLabelSet{}
+	},
+}
+
 // blockLabelSet is a LabelSet backed by block columns.
 // NOTE-SL-016: hot-path implementation; reused across rows via resetForRow.
 type blockLabelSet struct {
@@ -49,7 +57,7 @@ func (b *blockLabelSet) resetForRow(rowIdx int) {
 // Non-string column types (int64, float64, bool, bytes) are converted to string
 // via metricsColumnString to match the behavior of the previous logReadLabels path.
 func (b *blockLabelSet) Get(key string) string {
-	// 1. Overlay mutations win.
+	// 1. Overlay wins: pipeline stages (label_format, drop, keep) write here via Set/Delete.
 	if b.overlay != nil {
 		if v, ok := b.overlay[key]; ok {
 			return v
@@ -235,14 +243,6 @@ func metricsColumnString(col *modules_reader.Column, rowIdx int) string {
 		}
 	}
 	return ""
-}
-
-// blockLabelSetPool is a sync.Pool of *blockLabelSet for the hot scan path.
-// NOTE-SL-016: pool eliminates per-row struct allocation.
-var blockLabelSetPool = &sync.Pool{ //nolint:gochecknoglobals
-	New: func() any {
-		return &blockLabelSet{}
-	},
 }
 
 // acquireBlockLabelSet retrieves a *blockLabelSet from the pool and initializes it for use.
