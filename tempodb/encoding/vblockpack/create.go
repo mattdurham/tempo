@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"time"
 
 	"github.com/google/uuid"
@@ -13,116 +14,102 @@ import (
 )
 
 // CreateBlock creates a new blockpack block from an iterator.
-// Streams blockpack data directly to backend storage to avoid buffering
-// the entire block in memory.
+// Writes blockpack data to a temp file to avoid buffering the entire block in
+// memory, then streams the file to backend storage with a known size.
 func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.BlockMeta,
 	i common.Iterator, r backend.Reader, to backend.Writer) (*backend.BlockMeta, error) {
 
 	// Initialize disk cache on first block creation (no-op if already initialized).
 	ConfigureFileCache(cfg.Blockpack.FileCachePath, cfg.Blockpack.FileCacheMaxBytes)
 
-	pr, pw := io.Pipe()
-	errCh := make(chan error, 1)
+	// Write to a temp file so we get a known size for StreamWriter and avoid
+	// holding the entire encoded block in RAM.
+	tmp, err := os.CreateTemp("", "vblockpack-*.bp")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp file: %w", err)
+	}
+	defer func() {
+		tmp.Close()
+		os.Remove(tmp.Name())
+	}()
+
+	writer, err := blockpack.NewWriter(tmp, cfg.Blockpack.MaxSpansPerBlock)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create blockpack writer: %w", err)
+	}
 
 	var (
-		traceCount   int
-		minStart     uint64 = ^uint64(0)
-		maxStart     uint64
-		bytesWritten int64
+		traceCount int
+		minStart   uint64 = ^uint64(0)
+		maxStart   uint64
 	)
 
-	// Write blockpack data into the pipe in a goroutine so StreamWriter can
-	// consume it concurrently, flushing each internal block to S3 as it fills
-	// up rather than accumulating the entire dataset in memory.
-	go func() {
-		var err error
-		defer func() {
-			if err != nil {
-				pw.CloseWithError(err)
-			} else {
-				pw.Close()
-			}
-			errCh <- err
-		}()
-
-		cw := &countingWriter{w: pw}
-		writer, err := blockpack.NewWriter(cw, cfg.Blockpack.MaxSpansPerBlock)
-		if err != nil {
-			err = fmt.Errorf("failed to create blockpack writer: %w", err)
-			return
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
 		}
 
-		for {
-			select {
-			case <-ctx.Done():
-				err = ctx.Err()
-				return
-			default:
-			}
+		id, tr, nextErr := i.Next(ctx)
+		if nextErr == io.EOF {
+			break
+		}
+		if nextErr != nil {
+			return nil, fmt.Errorf("failed to read from iterator: %w", nextErr)
+		}
 
-			id, tr, nextErr := i.Next(ctx)
-			if nextErr == io.EOF {
-				break
-			}
-			if nextErr != nil {
-				err = fmt.Errorf("failed to read from iterator: %w", nextErr)
-				return
-			}
+		if tr == nil {
+			continue
+		}
 
-			// Track time range from span timestamps so we can populate meta
-			// without re-parsing the block bytes after writing.
-			if tr == nil {
-				continue
-			}
-			for _, rs := range tr.ResourceSpans {
-				for _, ss := range rs.ScopeSpans {
-					for _, span := range ss.Spans {
-						if span.StartTimeUnixNano < minStart {
-							minStart = span.StartTimeUnixNano
-						}
-						if span.StartTimeUnixNano > maxStart {
-							maxStart = span.StartTimeUnixNano
-						}
+		// Track time range from span timestamps to populate meta without
+		// re-parsing the block bytes after writing.
+		for _, rs := range tr.ResourceSpans {
+			for _, ss := range rs.ScopeSpans {
+				for _, span := range ss.Spans {
+					if span.StartTimeUnixNano < minStart {
+						minStart = span.StartTimeUnixNano
+					}
+					if span.StartTimeUnixNano > maxStart {
+						maxStart = span.StartTimeUnixNano
 					}
 				}
 			}
-
-			if addErr := writer.AddTempoTrace(tr); addErr != nil {
-				err = fmt.Errorf("failed to add trace to blockpack: %w", addErr)
-				return
-			}
-
-			traceCount++
-			_ = id // Trace ID is embedded in the trace data
 		}
 
-		if _, flushErr := writer.Flush(); flushErr != nil {
-			err = fmt.Errorf("failed to flush blockpack writer: %w", flushErr)
-			return
+		if addErr := writer.AddTempoTrace(tr); addErr != nil {
+			return nil, fmt.Errorf("failed to add trace to blockpack: %w", addErr)
 		}
-		bytesWritten = cw.n
-	}()
 
-	// Stream blockpack output directly to backend storage.
-	// size=-1 enables chunked/multipart upload without requiring the size upfront.
-	blockUUID := uuid.UUID(meta.BlockID)
-	streamErr := to.StreamWriter(ctx, DataFileName, blockUUID, meta.TenantID, pr, -1)
-	goroutineErr := <-errCh
-
-	if streamErr != nil {
-		return nil, fmt.Errorf("failed to stream blockpack to backend: %w", streamErr)
+		traceCount++
+		_ = id // Trace ID is embedded in the trace data
 	}
-	if goroutineErr != nil {
-		return nil, goroutineErr
+
+	if _, err := writer.Flush(); err != nil {
+		return nil, fmt.Errorf("failed to flush blockpack writer: %w", err)
+	}
+
+	// Get file size and rewind for streaming.
+	size, err := tmp.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get temp file size: %w", err)
+	}
+	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("failed to rewind temp file: %w", err)
 	}
 
 	meta.TotalObjects = int64(traceCount)
-	meta.Size_ = uint64(bytesWritten)
-	// TotalRecords=1: one job per file — see setBlockTimeRange for rationale.
+	meta.Size_ = uint64(size)
 	meta.TotalRecords = 1
 	if minStart != ^uint64(0) {
 		meta.StartTime = time.Unix(0, int64(minStart))
 		meta.EndTime = time.Unix(0, int64(maxStart))
+	}
+
+	blockUUID := uuid.UUID(meta.BlockID)
+	if err := to.StreamWriter(ctx, DataFileName, blockUUID, meta.TenantID, tmp, size); err != nil {
+		return nil, fmt.Errorf("failed to stream blockpack to backend: %w", err)
 	}
 
 	if err := to.WriteBlockMeta(ctx, meta); err != nil {
@@ -163,16 +150,4 @@ func setBlockTimeRange(meta *backend.BlockMeta, data []byte) {
 	// block range, forcing full block reads. Setting TotalRecords=1 ensures the
 	// frontend creates exactly one job per file.
 	meta.TotalRecords = 1
-}
-
-// countingWriter wraps an io.Writer and counts bytes written.
-type countingWriter struct {
-	w io.Writer
-	n int64
-}
-
-func (c *countingWriter) Write(p []byte) (int, error) {
-	n, err := c.w.Write(p)
-	c.n += int64(n)
-	return n, err
 }
