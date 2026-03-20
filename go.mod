@@ -80,7 +80,7 @@ require (
 	github.com/evanphx/json-patch v5.9.11+incompatible
 	github.com/golang/groupcache v0.0.0-20241129210726-2c02b8208cf8
 	github.com/googleapis/gax-go/v2 v2.17.0
-	github.com/grafana/blockpack v0.0.0-20260320170303-54cfa1d117d2
+	github.com/grafana/blockpack v0.0.0-20260320171810-9d5de865c461
 	github.com/grafana/gomemcache v0.0.0-20251127154401-74f93547077b
 	github.com/grpc-ecosystem/go-grpc-middleware v1.4.0
 	github.com/hashicorp/golang-lru/v2 v2.0.7

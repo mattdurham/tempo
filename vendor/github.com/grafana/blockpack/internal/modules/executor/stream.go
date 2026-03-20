@@ -27,9 +27,9 @@ var errLimitReached = errors.New("limit reached")
 // is used in collectIntrinsicTopK (Case B). Below this threshold: group refs by block,
 // sort blocks by BlockMeta.MaxStart DESC (newest first), build a packed-key→timestamp
 // map from tsCol (O(N)), look up each of the M refs in O(1), sort M pairs (O(M log M)).
-// Above this threshold: use ScanFlatColumnRefsFiltered — cheaper when M is large relative to N.
-// Crossover: O(N) map build vs O(N) scan — the KLL path wins by avoiding repeated blob
-// decompression; for M >= 8K the scan path is preferred as it stops early after K results.
+// Above this threshold: use ScanFlatColumnRefsFiltered with a hash-set filter — avoids
+// materializing the full decoded timestamp column for large M. Both paths are O(N); the
+// scan path is preferred for large M because it skips the decoded-column allocation.
 // Exported so tests can override it to force the scan path. See NOTE-043.
 var SortScanThreshold = 8000
 
@@ -816,8 +816,10 @@ func collectIntrinsicTopKKLL(
 }
 
 // collectIntrinsicTopKScan handles the scan path of collectIntrinsicTopK: M >= SortScanThreshold.
-// Packs refs into a sorted key set and runs ScanFlatColumnRefsFiltered backward/forward,
-// stopping after K results. O(K/rate × log M). See NOTE-043.
+// Builds a hash set of M packed (BlockIdx<<16|RowIdx) keys and runs ScanFlatColumnRefsFiltered
+// backward/forward, stopping after K results. Each row in the timestamp column is checked
+// against the hash set in O(1), so the total cost is O(N) where N is the total span count.
+// See NOTE-043.
 func collectIntrinsicTopKScan(
 	r *modules_reader.Reader,
 	refs []modules_shared.BlockRef,
@@ -827,11 +829,13 @@ func collectIntrinsicTopKScan(
 	backward := opts.Direction == queryplanner.Backward
 	limit := opts.Limit
 
-	matchKeys := make([]uint32, len(refs))
-	for i, ref := range refs {
-		matchKeys[i] = uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx)
+	// Build a hash set for O(1) per-row membership tests during the blob scan.
+	// Previously this was a sorted []uint32 + slices.BinarySearch (O(log M) per row),
+	// which caused 43% CPU flat in pprof for files with 1M spans. See NOTE-043.
+	matchSet := make(map[uint32]struct{}, len(refs))
+	for _, ref := range refs {
+		matchSet[uint32(ref.BlockIdx)<<16|uint32(ref.RowIdx)] = struct{}{}
 	}
-	slices.Sort(matchKeys)
 
 	tsBlob, tsBlobErr := r.GetIntrinsicColumnBlob(opts.TimestampColumn)
 	if tsBlobErr != nil || tsBlob == nil {
@@ -852,7 +856,7 @@ func collectIntrinsicTopKScan(
 				return false
 			}
 			key := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx)
-			_, found := slices.BinarySearch(matchKeys, key)
+			_, found := matchSet[key]
 			return found
 		},
 	)
