@@ -71,6 +71,9 @@ func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.Blo
 
 			// Track time range from span timestamps so we can populate meta
 			// without re-parsing the block bytes after writing.
+			if tr == nil {
+				continue
+			}
 			for _, rs := range tr.ResourceSpans {
 				for _, ss := range rs.ScopeSpans {
 					for _, span := range ss.Spans {
