@@ -2,6 +2,20 @@
 
 High-performance columnar storage format for OpenTelemetry trace data, achieving 10-50x compression ratios with fast TraceQL query performance.
 
+## Wiki
+
+| Page | Description |
+|---|---|
+| [File Format](File-Format.md) | Block layout, column encodings, indexes, and I/O design |
+| [Execution Path](Execution-Path.md) | How a TraceQL query flows through the pipeline, with animation |
+| [Write Path](Write-Path.md) | How spans are ingested, clustered, encoded, and indexed |
+| [KLL Sketches](KLL.md) | Range index: quantile sketch for duration/timestamp pruning |
+| [Count-Min Sketch](CMS.md) | Frequency estimation and zero-estimate block pruning |
+| [TopK](TopK.md) | Top-K frequent values for block scoring |
+| [HyperLogLog](HLL.md) | Cardinality estimation for block scoring |
+| [Bloom Filters](Bloom-Filter.md) | BinaryFuse8 block and file-level membership tests |
+| [Intrinsic Columns](Intrinsic-Columns.md) | File-level core span attributes |
+
 ## Overview
 
 Blockpack is a specialized file format designed for storing and querying distributed traces. It combines columnar storage, adaptive compression, and multi-level indexing to provide:

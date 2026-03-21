@@ -59,6 +59,20 @@ func planBlocks(
 		}
 	}
 
+	// File-level CMS reject: merged Count-Min Sketch across all blocks.
+	// NOTE-045: Estimate==0 means the value is definitely absent from the entire file.
+	if program != nil && program.Predicates != nil {
+		if fileLevelCMSReject(r, program.Predicates.Nodes) {
+			plan.SelectedBlocks = nil
+			plan.Explain = "file-level reject: CMS absence for equality predicate"
+			plan.PrunedByIndex = 0
+			plan.PrunedByTime = 0
+			plan.PrunedByFuse = 0
+			plan.PrunedByCMS = 0
+			return plan
+		}
+	}
+
 	// Intersect with intrinsic-column TOC when available.
 	// Returns nil when no pruning is possible (no intrinsic section, no intrinsic
 	// predicates, or all blocks survive), so we skip the intersection step in that case.
@@ -160,6 +174,116 @@ func bloomRejectString(fb *modules_reader.FileBloom, col string, values []vm.Val
 		}
 	}
 	return len(values) > 0
+}
+
+// fileLevelCMSReject returns true if the file-level Count-Min Sketch guarantees that
+// no span in the file can match the equality predicates in nodes.
+// NOTE-045: Uses merged CMS from FileSketchSummary. Estimate==0 means definitely absent.
+// Only string-valued equality predicates are evaluated; non-string types pass through.
+// AND semantics: reject if ANY leaf rejects. OR semantics: reject only if ALL children reject.
+func fileLevelCMSReject(r *modules_reader.Reader, nodes []vm.RangeNode) bool {
+	// Fast path: skip the (lazy but non-trivial) FileSketchSummary build when
+	// no node in the tree is a CMS-eligible string equality predicate.
+	if !hasCMSEligibleEquality(nodes) {
+		return false
+	}
+	summary := r.FileSketchSummary()
+	return cmsRejectByNodes(summary, nodes)
+}
+
+// hasCMSEligibleEquality reports whether nodes contains at least one leaf equality
+// predicate with a string value that CMS can evaluate.
+func hasCMSEligibleEquality(nodes []vm.RangeNode) bool {
+	for i := range nodes {
+		if hasCMSEligibleNode(&nodes[i]) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasCMSEligibleNode reports whether node (or any descendant) is a CMS-eligible leaf.
+func hasCMSEligibleNode(node *vm.RangeNode) bool {
+	if len(node.Children) > 0 {
+		for i := range node.Children {
+			if hasCMSEligibleNode(&node.Children[i]) {
+				return true
+			}
+		}
+		return false
+	}
+	// Leaf: must be a non-empty string equality predicate (no range/pattern).
+	if len(node.Values) == 0 || node.Min != nil || node.Max != nil || node.Pattern != "" || node.Column == "" {
+		return false
+	}
+	for _, v := range node.Values {
+		if _, ok := v.Data.(string); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// cmsRejectByNodes is the inner logic for fileLevelCMSReject.
+// Accepts a *FileSketchSummary directly so it can be tested independently.
+func cmsRejectByNodes(summary *modules_reader.FileSketchSummary, nodes []vm.RangeNode) bool {
+	if summary == nil {
+		return false
+	}
+	for i := range nodes {
+		if cmsRejectByEquality(summary, &nodes[i]) {
+			return true
+		}
+	}
+	return false
+}
+
+// cmsRejectByEquality returns true if the CMS guarantees all string values in the
+// equality predicate are absent from the file. Non-string values (bytes, numerics)
+// are not evaluated — the sketch uses raw string wire-encoding for those types and
+// decoding them here would require column-type context. Such predicates pass through
+// conservatively (no rejection).
+func cmsRejectByEquality(summary *modules_reader.FileSketchSummary, node *vm.RangeNode) bool {
+	if len(node.Children) > 0 {
+		if node.IsOR {
+			// OR: reject only if ALL children reject.
+			for i := range node.Children {
+				if !cmsRejectByEquality(summary, &node.Children[i]) {
+					return false
+				}
+			}
+			return true
+		}
+		// AND: reject if ANY child rejects.
+		for i := range node.Children {
+			if cmsRejectByEquality(summary, &node.Children[i]) {
+				return true
+			}
+		}
+		return false
+	}
+	// Leaf node — only handle equality (Values non-empty, no range/pattern).
+	if len(node.Values) == 0 || node.Min != nil || node.Max != nil || node.Pattern != "" {
+		return false
+	}
+	if node.Column == "" {
+		return false
+	}
+	col := summary.Columns[node.Column]
+	if col == nil || col.CMS == nil {
+		return false // column not tracked — cannot reject
+	}
+	// Reject if ALL values are definitely absent (estimate==0).
+	for _, v := range node.Values {
+		s, ok := v.Data.(string)
+		if !ok {
+			return false // non-string value — conservative
+		}
+		if col.CMS.Estimate(s) != 0 {
+			return false // at least one value may be present
+		}
+	}
+	return len(node.Values) > 0
 }
 
 // fileLevelReject returns true if the AND-combined predicates in nodes guarantee

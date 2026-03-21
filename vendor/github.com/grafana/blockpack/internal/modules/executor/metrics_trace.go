@@ -90,6 +90,14 @@ func ExecuteTraceMetrics(
 		wantColumns[c] = struct{}{}
 	}
 
+	// NOTE-045: intrinsic fast path — zero block reads when all needed columns are in the
+	// intrinsic section (span:start, span:duration, resource.service.name, span:status, etc.).
+	if intrinsicResult, used, intrinsicErr := executeTraceMetricsIntrinsic(r, program, querySpec, wantColumns); intrinsicErr != nil {
+		return nil, intrinsicErr
+	} else if used {
+		return intrinsicResult, nil
+	}
+
 	rawBlocks, err := r.ReadBlocks(plan.SelectedBlocks)
 	if err != nil {
 		return nil, fmt.Errorf("FetchBlocks: %w", err)

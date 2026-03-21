@@ -60,6 +60,10 @@ type QueryOptions struct {
 	// BlockCount is the number of internal blocks to scan starting from StartBlock.
 	// 0 means scan all blocks (no sub-file sharding).
 	BlockCount int
+	// SelectColumns limits which column names appear in SpanMatch.Fields.
+	// When non-nil, only columns whose names are present in this slice are
+	// returned by GetField and IterateFields. nil means all columns are returned.
+	SelectColumns []string
 }
 
 // validateQueryOptions checks that sharding and time range parameters are valid.
@@ -140,6 +144,37 @@ func (m *materializedSpanFields) IterateFields(fn func(name string, value any) b
 			return
 		}
 	}
+}
+
+// filteredSpanFields wraps a SpanFieldsProvider and limits GetField / IterateFields
+// to a caller-specified column allowlist. Used to implement QueryOptions.SelectColumns.
+type filteredSpanFields struct {
+	inner   SpanFieldsProvider
+	allowed map[string]struct{}
+}
+
+func newFilteredSpanFields(inner SpanFieldsProvider, cols []string) *filteredSpanFields {
+	m := make(map[string]struct{}, len(cols))
+	for _, c := range cols {
+		m[c] = struct{}{}
+	}
+	return &filteredSpanFields{inner: inner, allowed: m}
+}
+
+func (f *filteredSpanFields) GetField(name string) (any, bool) {
+	if _, ok := f.allowed[name]; !ok {
+		return nil, false
+	}
+	return f.inner.GetField(name)
+}
+
+func (f *filteredSpanFields) IterateFields(fn func(name string, value any) bool) {
+	f.inner.IterateFields(func(name string, value any) bool {
+		if _, ok := f.allowed[name]; !ok {
+			return true // skip, but keep iterating
+		}
+		return fn(name, value)
+	})
 }
 
 // spanMatchFn is the internal callback type used by streaming query helpers.
@@ -542,6 +577,9 @@ func streamFilterProgram(r *Reader, program *vm.Program, opts QueryOptions, fn s
 		} else {
 			fields = modules_blockio.NewSpanFieldsAdapter(row.Block, row.RowIdx)
 			traceIDHex, spanIDHex = extractIDs(row.Block, row.RowIdx)
+		}
+		if len(opts.SelectColumns) > 0 {
+			fields = newFilteredSpanFields(fields, opts.SelectColumns)
 		}
 		match := &SpanMatch{Fields: fields, TraceID: traceIDHex, SpanID: spanIDHex}
 		if !fn(match, true) {

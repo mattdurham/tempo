@@ -1576,60 +1576,70 @@ should be read as `"intrinsic-topk-kll" (Case B KLL path, M < SortScanThreshold)
 
 ---
 
-## NOTE-045: collectIntrinsicPlain — Zero Block Reads via lookupIntrinsicFields (Case A)
+## NOTE-045: File-Level CMS Reject — Merged Count-Min Sketch for Equality Pruning
 *Added: 2026-03-20*
 
-**Problem:** `collectIntrinsicPlain` (Case A: pure intrinsic + no sort) was calling
-`forEachBlockInGroups`, which reads the full compressed block payload and calls
-`ParseBlockFromBytes` for every candidate block. For a query like `{duration>100ms}`,
-pprof showed this path consumed 54% of total query time:
+`fileLevelCMSReject` in `plan_blocks.go` uses the `FileSketchSummary` (a merged
+Count-Min Sketch across all blocks in the file) to reject a file entirely when a queried
+equality value is definitely absent from every block.
 
-```
-collectFromIntrinsicRefs:   24.93s (54.48%)
-collectIntrinsicPlain:      24.60s (53.76%)
-forEachBlockInGroups:       24.60s (53.76%)
-parseBlockColumnsReuse:     15.06s (32.91%)   ← full block decode
-decodeXORBytes:              6.54s (14.29%)
-decodeDeltaUint64:           5.76s (12.59%)
-```
+**Why CMS, not Fuse8, at file level?**
+- Block-level per-block Fuse8 filters are already wired into `PlanWithOptions` for per-block pruning.
+- File-level `FileBloom` (NOTE-045) uses Fuse8 but only covers `resource.service.name`.
+- The merged CMS covers all **string-valued** equality predicates for columns tracked by the sketch index.
+- CMS `Estimate(v)==0` is a zero-false-negative guarantee: if the merged CMS says 0, the value
+  never appeared in any block in the file.
 
-**Root cause:** The original code read and decoded full blocks to populate `MatchedRow.Block`,
-which the caller (`streamFilterProgram`) then used via `SpanFieldsAdapter` for field access.
-However, for any pure intrinsic query, all columns required by the caller are present in the
-intrinsic section:
-- `searchMetaCols` (8 columns: `trace:id`, `span:id`, `span:start`, `span:end`,
-  `span:duration`, `span:name`, `span:parent_id`, `resource.service.name`) are all in
-  `traceIntrinsicColumns`.
-- The predicate columns (`span:duration` for `{duration>100ms}`) are also intrinsic.
-- `ProgramIsIntrinsicOnly` already verified all `wantColumns` are intrinsic before
-  dispatching to Case A.
+**Why NOT a file-level Fuse8 for all columns?**
+- Fuse8 filters are not mergeable across blocks without reprocessing the original key set.
+- CMS is mergeable (element-wise sum, saturating). One merge pass produces the file-level summary.
+- For file-level pruning, CMS absence detection (Estimate==0) is sufficient — false positives
+  only mean we don't prune the file, which is conservative and safe.
 
-**Fix:** Replace `forEachBlockInGroups` with `lookupIntrinsicFields(r, refs, secondPassCols)`,
-exactly the same approach already used by Case B (`collectIntrinsicTopK`). The refs are
-truncated to `opts.Limit` before field lookup to avoid unnecessary work. Each result is
-returned as `MatchedRow{IntrinsicFields: ..., BlockIdx: ..., RowIdx: ...}` with `Block: nil`.
+**Integration**:
+- `Reader.FileSketchSummary()` computes lazily (sync.Once) from the per-block sketch index.
+- `Reader.FileSketchSummaryRaw()` serializes the summary for external caching (keyed by
+  file path + size), allowing callers to avoid re-reading the file on subsequent queries.
+- `cmsRejectByNodes` is the inner logic, accepting `*FileSketchSummary` directly for testability.
+- Only string-valued equality predicates are checked (Values non-empty, no Min/Max/Pattern).
+  Non-string types (bytes, numerics, durations) are skipped — the sketch uses raw wire-encoding
+  for those and decoding them requires column-type context not available here.
+- AND semantics: reject if ANY leaf rejects. OR semantics: reject only if ALL children reject.
 
-**Impact:**
-- Full block reads for Case A drop from O(uniqueBlocks) to zero.
-- `ParseBlockFromBytes`, `decodeXORBytes`, `decodeDeltaUint64` are eliminated from the
-  hot path for all pure intrinsic queries without timestamp sort.
-- Expected wall-clock improvement: ~54% of `streamFilterProgram` time eliminated for
-  `{duration>100ms}` and similar queries. The same applies to `{span:kind=server}`,
-  `{resource.service.name="foo"}`, `{span:status=error}`, and any combination of
-  intrinsic-only filters.
+**Limitations**:
+- CMS has false positives: `Estimate(v) > 0` does NOT mean v is present.
+- For small files or low-cardinality columns, false positives are common and pruning is unreliable.
+- Only string-typed predicate values are evaluated. Bytes, numeric, and duration predicates pass
+  through conservatively — extending to those types would require replicating the wire-encoding
+  logic from `encodeValue` in predicates.go.
+- This is an optimization only; correctness is maintained by the block-level scan that follows.
 
-**Correctness:**
-- `ProgramIsIntrinsicOnly` guarantees all predicate columns are in the intrinsic set.
-- `lookupIntrinsicFields` is called with `secondPassCols = searchMetaCols ∪ wantColumns`;
-  since both are subsets of the intrinsic column set for Case A, the resulting field maps
-  contain everything the caller needs.
-- The `IntrinsicFields` path in `streamFilterProgram` already handles `Block == nil`
-  correctly (introduced for Case B).
+Back-ref: `internal/modules/executor/plan_blocks.go:fileLevelCMSReject`,
+          `internal/modules/executor/plan_blocks.go:cmsRejectByNodes`,
+          `internal/modules/blockio/reader/reader.go:FileSketchSummaryRaw`
 
-**SPECS.md update:**
-The `MatchedRow.IntrinsicFields` doc comment previously stated "Case A reads candidate
-blocks and leaves IntrinsicFields nil" — updated to reflect that both Case A and Case B
-now return `IntrinsicFields` with zero block reads.
+## NOTE-046: Zero-Block-Read Fast Path for ExecuteTraceMetrics
+**Date:** 2026-03-20
 
-Back-ref: `internal/modules/executor/stream.go:collectIntrinsicPlain`,
-          `internal/modules/executor/SPECS.md:MatchedRow`
+`ExecuteTraceMetrics` previously called `r.ReadBlocks()` unconditionally — reading full block
+bytes even for queries like `{ } | count_over_time()` where only `span:start` is needed.
+
+**Fast path condition:** all `wantColumns` (span:start + aggregate field + group-by + filter columns)
+must be in `traceIntrinsicColumns`. When true, the query is answered entirely from the intrinsic
+section — which is read once at `NewReaderFromProvider` time and cached — with zero full block reads.
+
+**Eligible queries include:** `count_over_time()`, `rate()`, `histogram_over_time(span.duration)`,
+any aggregate grouped by `resource.service.name` or `span:status`, `span:kind`, etc.
+
+**Not eligible:** any query referencing non-intrinsic columns (e.g. `sum(span.latency_ms)`,
+`count by (span.http.status_code)`) — these fall through to the existing block-scan path.
+
+**Implementation:** `executeTraceMetricsIntrinsic` in `metrics_trace_intrinsic.go`.
+- No predicates (`{ }`) with group-by or aggregate field: builds `keyToBucket` (packKey → bucketIdx) by iterating `span:start` flat column. For count/rate with no group-by, span:start is streamed inline without allocating `keyToBucket`.
+- Intrinsic predicates: `BlockRefsFromIntrinsicTOC(r, program, 0)` filters refs before building `keyToBucket`.
+- count/rate, no group-by: streams `span:start` inline without `keyToBucket` (zero intermediate maps).
+- Group-by: `buildGroupKeyMap` iterates dict/flat column entries directly to build one composite key map.
+- Aggregate field + group-by: `buildAggValsMap` (one map) combined with `groupKeyMap` in final pass.
+- Aggregate field, no group-by: `streamAggColumnNoGroupBy` iterates the aggregate column directly.
+
+**Back-refs:** `metrics_trace_intrinsic.go`, `metrics_trace.go:executeTraceMetricsIntrinsic` call site.
