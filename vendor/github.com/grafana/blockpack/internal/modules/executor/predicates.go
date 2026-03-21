@@ -413,19 +413,38 @@ func collectIntrinsicLeavesInto(node vm.RangeNode, out *[]vm.RangeNode) {
 	}
 }
 
-// mergeORIntrinsicLeaves checks whether all children of an OR composite node are
-// leaf nodes referencing the same intrinsic column with equality (Values) predicates.
+// flattenORLeaves collects all leaf RangeNodes reachable from an OR subtree.
+// TraceQL may produce nested OR composites for chains (A||B||C → OR([OR([A,B]),C])),
+// so we recurse into OR children rather than only checking direct children.
+func flattenORLeaves(nodes []vm.RangeNode) []vm.RangeNode {
+	var out []vm.RangeNode
+	for _, n := range nodes {
+		if n.IsOR && len(n.Children) > 0 {
+			out = append(out, flattenORLeaves(n.Children)...)
+		} else {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// mergeORIntrinsicLeaves checks whether all leaves of an OR composite subtree
+// reference the same intrinsic column with equality (Values) predicates.
 // If so, it returns a synthesized leaf with all values merged (union) and ok=true.
 // Returns (zero, false) for any other pattern (different columns, range/pattern predicates,
-// nested composites, or non-intrinsic columns).
+// non-leaf nodes, or non-intrinsic columns).
+// Handles nested OR composites (e.g. A||B||C compiled as OR([OR([A,B]),C])) by
+// flattening before validation.
 func mergeORIntrinsicLeaves(children []vm.RangeNode) (vm.RangeNode, bool) {
 	if len(children) == 0 {
 		return vm.RangeNode{}, false
 	}
+	// Flatten nested OR subtrees so A||B||C works regardless of parse tree shape.
+	children = flattenORLeaves(children)
 	var commonCol string
 	var merged []vm.Value
 	for _, child := range children {
-		// Must be a leaf (no nested children).
+		// Must be a leaf after flattening (no nested children).
 		if len(child.Children) > 0 {
 			return vm.RangeNode{}, false
 		}

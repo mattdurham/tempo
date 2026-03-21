@@ -549,6 +549,7 @@ func convertLiteralToScanValue(attrName string, lit *traceqlparser.LiteralExpr) 
 			if decoded, err := hex.DecodeString(hexStr); err == nil {
 				return decoded
 			}
+			// Invalid hex: keep original string, matching compileColumnPredicateComparison behavior.
 		}
 		return value
 	}

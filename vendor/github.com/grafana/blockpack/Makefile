@@ -1,4 +1,4 @@
-.PHONY: test-data clean-test-data help bench bench-report serve-report cost-analysis cost-analysis-no-freetier build-cost-tool build test format lint clean format-benchmark precommit ci install-tools nilaway betteralign betteralign-fix gofumpt-check gofumpt golines-check golines format-all bench-profile-writes deadcode staticcheck bench-logs bench-logs-html bench-logs-full bench-logs-full-html clean-bench-logs-full
+.PHONY: test-data clean-test-data help bench bench-report serve-report cost-analysis cost-analysis-no-freetier build-cost-tool build test format lint clean format-benchmark precommit ci install-tools nilaway betteralign betteralign-fix gofumpt-check gofumpt golines-check golines format-all bench-profile-writes deadcode staticcheck bench-logs bench-logs-html bench-logs-full bench-logs-full-html clean-bench-logs-full animate animate-gif animate-play video-studio video-render video-gif
 
 # Number of traces to generate (approximately 670K spans like original dataset)
 NUM_TRACES ?= 191119
@@ -27,6 +27,12 @@ COST_OUTPUT := benchmark/cost_analysis.txt
 help:
 	@echo "Build targets:"
 	@echo "  make build            - Build all binaries to ./bin/"
+	@echo "  make animate          - Generate animation.cast (terminal TraceQL flow animation)"
+	@echo "  make animate-play     - Play animation in terminal (installs asciinema if needed)"
+	@echo "  make animate-gif      - Generate animation.gif from terminal animation (requires agg)"
+	@echo "  make video-studio     - Open Remotion studio (live preview in browser)"
+	@echo "  make video-render     - Render pipeline video to video/out/pipeline.mp4"
+	@echo "  make video-gif        - Render pipeline video to video/out/pipeline.gif"
 	@echo "  make clean            - Remove all build artifacts and test data"
 	@echo ""
 	@echo "Development targets:"
@@ -84,6 +90,40 @@ build:
 	@go build -o bin/temposerver ./cmd/temposerver
 	@go build -o bin/generate-unified-report ./cmd/generate_unified_report
 	@echo "==> Binaries built in ./bin/"
+
+# Generate the TraceQL flow animation (requires agg: cargo install --git https://github.com/asciinema/agg)
+animate:
+	@echo "==> Generating animation.cast ..."
+	@go run ./cmd/animate > animation.cast
+	@echo "==> Cast file written to animation.cast"
+	@echo "==> To render GIF: agg animation.cast animation.gif"
+	@echo "==> To render with custom speed: agg --speed 0.8 --font-size 12 animation.cast animation.gif"
+
+animate-gif: animate
+	@command -v agg >/dev/null 2>&1 || { echo "agg not found — install with: cargo install --git https://github.com/asciinema/agg"; exit 1; }
+	@echo "==> Rendering animation.gif ..."
+	@agg --speed 0.8 --font-size 12 animation.cast animation.gif
+	@echo "==> animation.gif written"
+
+animate-play: animate
+	@command -v asciinema >/dev/null 2>&1 || { echo "asciinema not found — install via your package manager (e.g. pip install asciinema or apt install asciinema). See https://asciinema.org"; exit 1; }
+	@asciinema play --speed 0.8 animation.cast
+
+video-studio:
+	@echo "==> Starting Remotion studio at http://localhost:11000 ..."
+	@cd video && npm install --silent && npx remotion studio src/index.ts --port=11000
+
+video-render:
+	@echo "==> Rendering pipeline.mp4 ..."
+	@cd video && npm install --silent && mkdir -p out
+	@cd video && npx remotion render src/index.ts Pipeline out/pipeline.mp4 --scale=2 --crf=12 --jpeg-quality=100
+	@echo "==> Written to video/out/pipeline.mp4"
+
+video-gif:
+	@echo "==> Rendering pipeline.gif ..."
+	@cd video && npm install --silent && mkdir -p out
+	@cd video && npx remotion gif src/index.ts Pipeline out/pipeline.gif --scale=2 --every-nth-frame=2
+	@echo "==> Written to video/out/pipeline.gif"
 
 # Run all tests
 test:

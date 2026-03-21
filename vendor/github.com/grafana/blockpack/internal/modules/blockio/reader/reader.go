@@ -536,6 +536,23 @@ func (r *Reader) FileBloomRaw() []byte {
 	return slices.Clone(r.fileBloomRaw)
 }
 
+// FileSketchSummaryRaw returns the serialized FileSketchSummary as bytes.
+// Callers may cache this slice (keyed by file path + size) and reconstruct
+// a FileSketchSummary via UnmarshalFileSketchSummary without reopening the file.
+// Returns nil for files without a sketch section (old format).
+// Returns nil if serialization fails (should not happen in practice).
+func (r *Reader) FileSketchSummaryRaw() []byte {
+	s := r.FileSketchSummary()
+	if s == nil {
+		return nil
+	}
+	b, err := MarshalFileSketchSummary(s)
+	if err != nil {
+		return nil
+	}
+	return b
+}
+
 // TraceBloomRaw returns a clone of the raw bytes of the compact trace ID bloom filter.
 // Callers may cache this slice and use shared.TestTraceIDBloom for trace:id
 // file-level rejection without reopening the file.
