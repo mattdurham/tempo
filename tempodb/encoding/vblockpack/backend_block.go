@@ -357,6 +357,18 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 		spanLimit = maxTraces * 20
 	}
 
+	// Build wanted columns from query conditions — used to limit AllAttributesFunc
+	// to only the queried attributes, matching parquet's selective fetch behavior.
+	wantedCols := make(map[string]bool, len(req.Conditions))
+	for _, cond := range req.Conditions {
+		if col := attributeToColumnName(cond.Attribute); col != "" {
+			wantedCols[col] = true
+		}
+	}
+	if len(wantedCols) == 0 {
+		wantedCols = nil // nil = no filtering (match-all queries)
+	}
+
 	var fetchErr error
 	var matches []blockpack.SpanMatch
 	matches, fetchErr = blockpack.QueryTraceQL(r, query, blockpack.QueryOptions{
@@ -383,7 +395,7 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 				traceMap[match.TraceID] = &traceEntry{traceID: traceIDBytes}
 				traceOrder = append(traceOrder, match.TraceID)
 			}
-			traceMap[match.TraceID].spans = append(traceMap[match.TraceID].spans, &blockpackSpan{match: *match})
+			traceMap[match.TraceID].spans = append(traceMap[match.TraceID].spans, &blockpackSpan{match: *match, wantedCols: wantedCols})
 			traceMap[match.TraceID].rawSpans = append(traceMap[match.TraceID].rawSpans, *match)
 		}
 	}
@@ -418,8 +430,12 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 }
 
 // blockpackSpan implements traceql.Span using a cloned blockpack.SpanMatch.
+// wantedCols, when non-nil, limits AllAttributesFunc to only the columns present
+// in the query conditions — matching parquet's behavior and preventing Grafana's
+// data frame from panicking on inconsistent attribute sets across spans.
 type blockpackSpan struct {
-	match blockpack.SpanMatch
+	match       blockpack.SpanMatch
+	wantedCols  map[string]bool
 }
 
 func (s *blockpackSpan) ID() []byte {
@@ -502,6 +518,12 @@ func (s *blockpackSpan) AllAttributesFunc(cb func(traceql.Attribute, traceql.Sta
 		return
 	}
 	s.match.Fields.IterateFields(func(name string, value any) bool {
+		// Only emit columns that were part of the query — matches parquet's selective
+		// fetch behavior and prevents Grafana data frame type panics when spans have
+		// inconsistent attribute sets.
+		if s.wantedCols != nil && !s.wantedCols[name] {
+			return true
+		}
 		attr, ok := columnNameToAttribute(name)
 		if !ok {
 			return true

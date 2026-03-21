@@ -829,3 +829,82 @@ func TestFetch_AllAttributesReturnsAllTypes(t *testing.T) {
 		require.Equal(t, "false", s)
 	}
 }
+
+// TestFetch_AllAttributesLimitedToQueryConditions verifies that AllAttributesFunc
+// only returns attributes from the query conditions, not ALL span attributes.
+// This matches parquet's selective fetch behavior and prevents Grafana's Tempo
+// datasource from panicking on inconsistent attribute sets across spans
+// (data frame column type must be uniform: nullable *string vs plain string).
+func TestFetch_AllAttributesLimitedToQueryConditions(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	rawR, rawW, _, err := local.New(&local.Config{Path: tmpDir})
+	require.NoError(t, err)
+	r := backend.NewReader(rawR)
+	w := backend.NewWriter(rawW)
+
+	traceID := []byte{0x22, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x22}
+	now := uint64(time.Now().UnixNano())
+
+	trace := &tempopb.Trace{
+		ResourceSpans: []*tempotrace.ResourceSpans{{
+			Resource: &temporesource.Resource{
+				Attributes: []*tempocommon.KeyValue{
+					{Key: "service.name", Value: &tempocommon.AnyValue{Value: &tempocommon.AnyValue_StringValue{StringValue: "svc-selective"}}},
+				},
+			},
+			ScopeSpans: []*tempotrace.ScopeSpans{{
+				Spans: []*tempotrace.Span{{
+					TraceId:           traceID,
+					SpanId:            []byte{0x22, 0, 0, 0, 0, 0, 0, 0x01},
+					Name:              "span-with-many-attrs",
+					StartTimeUnixNano: now,
+					EndTimeUnixNano:   now + 1000,
+					Attributes: []*tempocommon.KeyValue{
+						{Key: "http.method", Value: &tempocommon.AnyValue{Value: &tempocommon.AnyValue_StringValue{StringValue: "GET"}}},
+						{Key: "http.status_code", Value: &tempocommon.AnyValue{Value: &tempocommon.AnyValue_IntValue{IntValue: 200}}},
+						{Key: "db.system", Value: &tempocommon.AnyValue{Value: &tempocommon.AnyValue_StringValue{StringValue: "postgres"}}},
+					},
+				}},
+			}},
+		}},
+	}
+
+	meta := &backend.BlockMeta{BlockID: backend.NewUUID(), TenantID: "test", Version: VersionString}
+	meta.TotalRecords = 1
+	iter := &mockIterator{traces: []*tempopb.Trace{trace}, ids: [][]byte{traceID}}
+	resultMeta, err := CreateBlock(ctx, &common.BlockConfig{RowGroupSizeBytes: 100 * 1024 * 1024}, meta, iter, r, w)
+	require.NoError(t, err)
+	blk := newBackendBlock(resultMeta, r)
+
+	// Query filtering on http.method only — AllAttributes should only return that column.
+	req := traceql.FetchSpansRequest{
+		Conditions: []traceql.Condition{
+			{Attribute: traceql.NewScopedAttribute(traceql.AttributeScopeSpan, false, "http.method"), Op: traceql.OpEqual, Operands: []traceql.Static{traceql.NewStaticString("GET")}},
+		},
+	}
+	resp, err := blk.Fetch(ctx, req, common.DefaultSearchOptions())
+	require.NoError(t, err)
+
+	ss, err := resp.Results.Next(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, ss)
+	require.Len(t, ss.Spans, 1)
+
+	attrs := ss.Spans[0].AllAttributes()
+
+	// Use scoped attributes to match what columnNameToAttribute returns for span.* columns.
+	httpMethod := traceql.NewScopedAttribute(traceql.AttributeScopeSpan, false, "http.method")
+	httpStatus := traceql.NewScopedAttribute(traceql.AttributeScopeSpan, false, "http.status_code")
+	dbSystem := traceql.NewScopedAttribute(traceql.AttributeScopeSpan, false, "db.system")
+
+	// http.method was in conditions — must be present.
+	_, hasMethod := attrs[httpMethod]
+	require.True(t, hasMethod, "queried attribute http.method must be in AllAttributes")
+
+	// http.status_code and db.system were NOT in conditions — must be absent.
+	_, hasStatus := attrs[httpStatus]
+	require.False(t, hasStatus, "non-queried http.status_code must NOT be in AllAttributes — prevents Grafana data frame type panic")
+	_, hasDB := attrs[dbSystem]
+	require.False(t, hasDB, "non-queried db.system must NOT be in AllAttributes")
+}
