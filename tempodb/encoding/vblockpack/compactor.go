@@ -81,8 +81,9 @@ func (c *Compactor) Compact(ctx context.Context, l log.Logger, r backend.Reader,
 		endTime:           maxBlockEnd,
 	}
 
-	// Initialize disk cache on first compaction (no-op if already initialized).
+	// Initialize caches on first compaction (no-op if already initialized).
 	ConfigureFileCache(c.opts.BlockConfig.Blockpack.FileCachePath, c.opts.BlockConfig.Blockpack.FileCacheMaxBytes)
+	ConfigureLRU(c.opts.BlockConfig.Blockpack.LRUCacheBytes)
 
 	cfg := blockpack.CompactionConfig{
 		MaxSpansPerBlock: maxSpansFromConfig(&c.opts.BlockConfig),

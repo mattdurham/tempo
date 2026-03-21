@@ -84,6 +84,11 @@ type BlockpackConfig struct {
 
 	// FileCacheMaxBytes is the maximum size of the disk cache in bytes (default: 4GB).
 	FileCacheMaxBytes int64 `yaml:"file_cache_max_bytes"`
+
+	// LRUCacheBytes is the maximum size of the process-level in-memory LRU cache in bytes.
+	// This cache holds footer and file metadata only — sketch/bloom data should not be
+	// retained here. Defaults to 32MB.
+	LRUCacheBytes int64 `yaml:"lru_cache_bytes"`
 }
 
 func (cfg *BlockConfig) RegisterFlagsAndApplyDefaults(prefix string, f *flag.FlagSet) {
@@ -125,6 +130,9 @@ func (cfg *BlockpackConfig) applyDefaults() {
 	}
 	if cfg.FileCacheMaxBytes == 0 {
 		cfg.FileCacheMaxBytes = 4 * 1024 * 1024 * 1024 // 4GB
+	}
+	if cfg.LRUCacheBytes == 0 {
+		cfg.LRUCacheBytes = 32 * 1024 * 1024 // 32MB — footer/metadata only
 	}
 	// Booleans default to false, so we enable by default
 	if !cfg.EnableDictionary {

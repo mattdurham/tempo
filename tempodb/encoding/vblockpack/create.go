@@ -21,6 +21,7 @@ func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.Blo
 
 	// Initialize disk cache on first block creation (no-op if already initialized).
 	ConfigureFileCache(cfg.Blockpack.FileCachePath, cfg.Blockpack.FileCacheMaxBytes)
+	ConfigureLRU(cfg.Blockpack.LRUCacheBytes)
 
 	// Write to a temp file so we get a known size for StreamWriter and avoid
 	// holding the entire encoded block in RAM.
