@@ -683,3 +683,69 @@ func TestFetch_TimeRangeSkip(t *testing.T) {
 	require.Empty(t, results, "time-range skip: block with future spans must return empty when queried in the past")
 }
 
+
+// TestFetch_BoolAttrConvertedToString verifies that boolean span attributes are
+// returned as string "true"/"false" in AllAttributesFunc, not as Go bool.
+// Prevents a panic in Grafana's Tempo datasource plugin when mixed bool/string
+// attribute values appear across spans (data frame column type must be uniform).
+func TestFetch_BoolAttrConvertedToString(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	rawR, rawW, _, err := local.New(&local.Config{Path: tmpDir})
+	require.NoError(t, err)
+	r := backend.NewReader(rawR)
+	w := backend.NewWriter(rawW)
+
+	traceID := []byte{0x20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x20}
+	now := uint64(time.Now().UnixNano())
+
+	trace := &tempopb.Trace{
+		ResourceSpans: []*tempotrace.ResourceSpans{{
+			Resource: &temporesource.Resource{
+				Attributes: []*tempocommon.KeyValue{
+					{Key: "service.name", Value: &tempocommon.AnyValue{Value: &tempocommon.AnyValue_StringValue{StringValue: "svc-bool-test"}}},
+				},
+			},
+			ScopeSpans: []*tempotrace.ScopeSpans{{
+				Spans: []*tempotrace.Span{{
+					TraceId:           traceID,
+					SpanId:            []byte{0x20, 0, 0, 0, 0, 0, 0, 0x01},
+					Name:              "span-with-bool",
+					StartTimeUnixNano: now,
+					EndTimeUnixNano:   now + 1000,
+					Attributes: []*tempocommon.KeyValue{
+						{Key: "grpc.wait_for_ready", Value: &tempocommon.AnyValue{Value: &tempocommon.AnyValue_BoolValue{BoolValue: true}}},
+					},
+				}},
+			}},
+		}},
+	}
+
+	meta := &backend.BlockMeta{
+		BlockID:  backend.NewUUID(),
+		TenantID: "test",
+		Version:  VersionString,
+	}
+	meta.TotalRecords = 1
+
+	iter := &mockIterator{traces: []*tempopb.Trace{trace}, ids: [][]byte{traceID}}
+	cfg := &common.BlockConfig{RowGroupSizeBytes: 100 * 1024 * 1024}
+	resultMeta, err := CreateBlock(ctx, cfg, meta, iter, r, w)
+	require.NoError(t, err)
+
+	blk := newBackendBlock(resultMeta, r)
+	spansets := collectFetch(t, blk, nil, false)
+	require.Len(t, spansets, 1)
+
+	boolAttr := traceql.NewAttribute("grpc.wait_for_ready")
+	for _, ss := range spansets {
+		for _, span := range ss.Spans {
+			attrs := span.AllAttributes()
+			if v, ok := attrs[boolAttr]; ok {
+				// Must be string type — prevents Grafana data frame type panic.
+				require.Equal(t, traceql.TypeString, v.Type,
+					"bool span attribute must be converted to string for Grafana compatibility")
+			}
+		}
+	}
+}
