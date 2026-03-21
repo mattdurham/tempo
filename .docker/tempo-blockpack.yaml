@@ -107,6 +107,7 @@ storage:
       blockpack:
         file_cache_path: /var/tempo/blockpack-cache
         file_cache_max_bytes: 21474836480  # 20GB
+        lru_cache_bytes: 33554432  # 32MB — footer/metadata only
     wal:
       path: /var/tempo/wal
 

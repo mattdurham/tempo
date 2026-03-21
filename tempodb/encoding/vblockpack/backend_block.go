@@ -58,13 +58,29 @@ func (p *tempoReaderProvider) ReadAt(buf []byte, off int64, _ blockpack.DataType
 	return len(buf), nil
 }
 
-// blockpackLRU is a process-level shared LRU cache for blockpack reader data.
-// It caches footer, compact trace index, and metadata reads across requests,
-// keyed by (tenantID/blockID). Priority-tiered: footer/header/index survive
-// eviction pressure from large block reads.
-// 2 GB keeps metadata for ~4000 blocks (at ~500 KB metadata per file) warm
-// so that NewReaderFromProvider avoids S3 round-trips on every Fetch call.
-var blockpackLRU = blockpack.NewSharedLRUCache(512 * 1024 * 1024)
+// blockpackLRU is the process-level in-memory LRU cache (see below).
+// blockpackLRU is the process-level in-memory LRU cache for blockpack readers.
+// It caches footer and file metadata; size is configured via BlockpackConfig.LRUCacheBytes.
+// Initialized on first use via ConfigureLRU.
+var (
+	blockpackLRU     *blockpack.SharedLRUCache
+	blockpackLRUOnce sync.Once
+	blockpackLRUSize int64 = 32 * 1024 * 1024 // 32MB default
+)
+
+// ConfigureLRU sets the LRU cache size. Must be called before any Fetch/Search.
+func ConfigureLRU(sizeBytes int64) {
+	if sizeBytes > 0 {
+		blockpackLRUSize = sizeBytes
+	}
+}
+
+func getSharedLRU() *blockpack.SharedLRUCache {
+	blockpackLRUOnce.Do(func() {
+		blockpackLRU = blockpack.NewSharedLRUCache(blockpackLRUSize)
+	})
+	return blockpackLRU
+}
 
 // blockpackFileCache is a process-level disk-backed cache for blockpack block bytes.
 // A nil *FileCache is safe — all reads fall through to the provider.
@@ -130,7 +146,7 @@ func (b *blockpackBlock) newReaderProvider() blockpack.ReaderProvider {
 		knownSize: int64(b.meta.Size_),
 	}
 	readerID := b.meta.TenantID + "/" + b.meta.BlockID.String()
-	return blockpack.NewSharedLRUProvider(raw, readerID, blockpackLRU)
+	return blockpack.NewSharedLRUProvider(raw, readerID, getSharedLRU())
 }
 
 // newReader creates a Reader with both in-memory LRU and disk FileCache layers.
