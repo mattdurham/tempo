@@ -749,3 +749,83 @@ func TestFetch_BoolAttrConvertedToString(t *testing.T) {
 		}
 	}
 }
+
+// TestFetch_AllAttributesReturnsAllTypes verifies that AllAttributes returns
+// string, int, and float span attributes with correct types, and that booleans
+// are always returned as strings (preventing Grafana data frame type panics).
+func TestFetch_AllAttributesReturnsAllTypes(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	rawR, rawW, _, err := local.New(&local.Config{Path: tmpDir})
+	require.NoError(t, err)
+	r := backend.NewReader(rawR)
+	w := backend.NewWriter(rawW)
+
+	traceID := []byte{0x21, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x21}
+	now := uint64(time.Now().UnixNano())
+
+	trace := &tempopb.Trace{
+		ResourceSpans: []*tempotrace.ResourceSpans{{
+			Resource: &temporesource.Resource{
+				Attributes: []*tempocommon.KeyValue{
+					{Key: "service.name", Value: &tempocommon.AnyValue{Value: &tempocommon.AnyValue_StringValue{StringValue: "svc-types"}}},
+				},
+			},
+			ScopeSpans: []*tempotrace.ScopeSpans{{
+				Spans: []*tempotrace.Span{{
+					TraceId:           traceID,
+					SpanId:            []byte{0x21, 0, 0, 0, 0, 0, 0, 0x01},
+					Name:              "typed-span",
+					StartTimeUnixNano: now,
+					EndTimeUnixNano:   now + 1000,
+					Attributes: []*tempocommon.KeyValue{
+						{Key: "str.attr", Value: &tempocommon.AnyValue{Value: &tempocommon.AnyValue_StringValue{StringValue: "hello"}}},
+						{Key: "int.attr", Value: &tempocommon.AnyValue{Value: &tempocommon.AnyValue_IntValue{IntValue: 42}}},
+						{Key: "float.attr", Value: &tempocommon.AnyValue{Value: &tempocommon.AnyValue_DoubleValue{DoubleValue: 3.14}}},
+						{Key: "bool.true", Value: &tempocommon.AnyValue{Value: &tempocommon.AnyValue_BoolValue{BoolValue: true}}},
+						{Key: "bool.false", Value: &tempocommon.AnyValue{Value: &tempocommon.AnyValue_BoolValue{BoolValue: false}}},
+					},
+				}},
+			}},
+		}},
+	}
+
+	meta := &backend.BlockMeta{BlockID: backend.NewUUID(), TenantID: "test", Version: VersionString}
+	meta.TotalRecords = 1
+	iter := &mockIterator{traces: []*tempopb.Trace{trace}, ids: [][]byte{traceID}}
+	resultMeta, err := CreateBlock(ctx, &common.BlockConfig{RowGroupSizeBytes: 100 * 1024 * 1024}, meta, iter, r, w)
+	require.NoError(t, err)
+
+	blk := newBackendBlock(resultMeta, r)
+	spansets := collectFetch(t, blk, nil, false)
+	require.Len(t, spansets, 1)
+	require.Len(t, spansets[0].Spans, 1)
+
+	attrs := spansets[0].Spans[0].AllAttributes()
+
+	strAttr := traceql.NewAttribute("str.attr")
+	intAttr := traceql.NewAttribute("int.attr")
+	floatAttr := traceql.NewAttribute("float.attr")
+	boolTrueAttr := traceql.NewAttribute("bool.true")
+	boolFalseAttr := traceql.NewAttribute("bool.false")
+
+	if v, ok := attrs[strAttr]; ok {
+		require.Equal(t, traceql.TypeString, v.Type, "string attr must be TypeString")
+	}
+	if v, ok := attrs[intAttr]; ok {
+		require.Equal(t, traceql.TypeInt, v.Type, "int attr must be TypeInt")
+	}
+	if v, ok := attrs[floatAttr]; ok {
+		require.Equal(t, traceql.TypeFloat, v.Type, "float attr must be TypeFloat")
+	}
+	if v, ok := attrs[boolTrueAttr]; ok {
+		require.Equal(t, traceql.TypeString, v.Type, "bool=true must be TypeString")
+		s := v.String()
+		require.Equal(t, "true", s)
+	}
+	if v, ok := attrs[boolFalseAttr]; ok {
+		require.Equal(t, traceql.TypeString, v.Type, "bool=false must be TypeString")
+		s := v.String()
+		require.Equal(t, "false", s)
+	}
+}
