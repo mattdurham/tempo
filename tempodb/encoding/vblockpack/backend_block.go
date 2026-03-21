@@ -527,7 +527,18 @@ func (s *blockpackSpan) AllAttributesFunc(cb func(traceql.Attribute, traceql.Sta
 				return true
 			}
 		default:
-			st = toStaticType(value)
+			// Convert bool to string for display consistency.
+			// Grafana's data frame requires uniform types per column; mixed bool/string
+			// attribute values across spans cause a type panic in the Tempo datasource plugin.
+			if b, ok := value.(bool); ok {
+				if b {
+					st = traceql.NewStaticString("true")
+				} else {
+					st = traceql.NewStaticString("false")
+				}
+			} else {
+				st = toStaticType(value)
+			}
 		}
 		cb(attr, st)
 		return true
