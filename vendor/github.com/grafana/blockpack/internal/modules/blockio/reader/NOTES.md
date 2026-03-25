@@ -57,3 +57,86 @@ was superseded when per-call intern maps were introduced for race-safety.
 for `decodeNow()`.
 
 Back-ref: `internal/modules/blockio/reader/column.go:decodeNow`
+
+---
+
+## NOTE-003: objectcache Migration — GC-Cooperative Process-Level Caches
+*Added: 2026-03-23*
+
+**Problem:** The three `sync.Map` process-level caches in `parser.go` held strong
+`*T` pointers, causing parsed file metadata (~45 MB per file after snappy decode),
+sketch indexes, and decoded intrinsic columns to accumulate without bound. In Tempo
+deployments scanning hundreds of blockpack files, these caches grew until OOM or
+process restart. Additionally, the intrinsic TOC (`r.intrinsicIndex` map) had no
+process-level cache at all — it was re-decoded from bbolt bytes on every
+`NewReaderFromProvider` call even when the raw blob was already cached.
+
+**Solution:** Replace all three `sync.Map` globals with `objectcache.Cache[T]`
+instances (new `internal/modules/objectcache/` module). Add a fourth cache for
+the intrinsic TOC. `objectcache.Cache[T]` stores `weak.Pointer[T]` values:
+
+- GC may reclaim entries when no `*Reader` holds a strong reference (Go 1.24+
+  `weak` package; go.mod declares `go 1.26.0`).
+- Stale map keys are deleted lazily on `Get` (prevents key accumulation).
+- `ClearCaches()` updated to call `.Clear()` on all four instances.
+
+**`metadataBytes` safety:** `*Reader` copies `pm.metadataBytes` at construction,
+establishing a strong ref chain `Reader → metadataBytes` independent of the cache.
+Range index offsets sub-slice into this copied pointer, remaining valid for the
+entire reader lifetime regardless of GC activity on the cache entry.
+
+**Concurrent double-parse:** Two goroutines opening the same file simultaneously
+may both miss the cache and both parse. The second `Put` overwrites with an
+equivalent object (immutable data). This is the same race as the prior `sync.Map`
+code. `filecache.GetOrFetch` deduplicates the underlying I/O via singleflight, so
+at most one raw-bytes read occurs even if two parses run.
+
+Back-ref: `internal/modules/blockio/reader/parser.go`,
+`internal/modules/blockio/reader/intrinsic_reader.go`,
+`internal/modules/objectcache/cache.go`
+
+---
+
+## NOTE-004: BUG-07 — compareRangeKey float64 NaN safety via cmp.Compare
+*Added: 2026-03-23*
+
+**Problem:** The `ColumnTypeRangeFloat64` branch of `compareRangeKey` used manual `<` / `>`
+comparisons. IEEE 754 defines NaN as unordered: `NaN < x`, `NaN > x`, and `NaN == x` are
+all false. Both branches failed for any NaN operand, causing the function to fall through to
+`return 0` (equal). Binary search then placed NaN at an unpredictable position, corrupting
+`BlocksForRange` / `BlocksForRangeInterval` results silently.
+
+**Fix:** Replace manual comparisons with `cmp.Compare(va, vb)` (Go 1.21+). `cmp.Compare`
+implements a stable total order: NaN is treated as less than any non-NaN value (including
+`-Inf`). This matches the contract required by `slices.SortFunc` / `sort.Search` callers.
+
+**Why cmp.Compare and not NaN guard:** A NaN guard (`if math.IsNaN → return 0`) would still
+return 0 for `NaN vs NaN` (acceptable) but could return 0 for `NaN vs -Inf` (also NaN ==
+-Inf, wrong). `cmp.Compare` gives a consistent total order without special-casing.
+
+Back-ref: `internal/modules/blockio/reader/range_index.go:compareRangeKey`
+
+---
+
+## NOTE-005: BUG-08 — decode*Key sentinel values for malformed short keys
+*Added: 2026-03-23*
+
+**Problem:** `decodeInt64Key`, `decodeUint64Key`, and `decodeFloat64Key` all returned `0`
+for keys shorter than 8 bytes. Zero is a valid encoded value for all three types, so
+malformed (short) keys were silently treated as valid zero-values. This corrupted binary
+search comparisons in `compareRangeKey` and `BlocksForRange`/`BlocksForRangeInterval`.
+
+**Fix:** Apply type-appropriate sentinels for short-key fallback:
+- `decodeInt64Key`: return `math.MinInt64` — sorts below all valid int64 values.
+- `decodeUint64Key`: return `0` — already the minimum uint64 sentinel; no change needed.
+- `decodeFloat64Key`: return `math.NaN()` — `cmp.Compare` (NOTE-004/BUG-07) treats NaN as
+  less than any non-NaN, giving a consistent total order without corrupting search.
+
+**Shared helper:** `readLE8(key string) (uint64, bool)` extracts the 8-byte LE uint64 and
+returns `false` for short keys. Each decode function applies its own sentinel on `!ok`.
+
+Back-ref: `internal/modules/blockio/reader/range_index.go:readLE8`,
+          `internal/modules/blockio/reader/range_index.go:decodeInt64Key`,
+          `internal/modules/blockio/reader/range_index.go:decodeFloat64Key`
+Test: `internal/modules/blockio/reader/range_index_bugs_test.go:TestDecodeFloat64Key_ShortKey_ReturnsNaN`,
+      `internal/modules/blockio/reader/range_index_bugs_test.go:TestDecodeInt64Key_ShortKey_ReturnsSentinel`

@@ -5,28 +5,47 @@ package reader
 import (
 	"encoding/binary"
 	"fmt"
-	"sync"
 
 	"github.com/golang/snappy"
 
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
+	"github.com/grafana/blockpack/internal/modules/objectcache"
 	"github.com/grafana/blockpack/internal/modules/rw"
 )
 
 // parsedSketchCache caches fully parsed sketchIndex objects by fileID+"/sketch".
-// Since sketch data is immutable (written once per file), entries are never evicted.
-// This avoids re-parsing the sketch section on every Reader creation.
-var parsedSketchCache sync.Map // key: string → value: *sketchIndex
+// GC-cooperative: entries are reclaimed when no Reader holds a strong reference.
+// SPEC-OC-003, NOTE-003 (reader NOTES.md)
+var parsedSketchCache objectcache.Cache[sketchIndex]
 
-// parsedIntrinsicCache caches fully decoded IntrinsicColumn objects by fileID+"/intrinsic/"+colName.
-// Since intrinsic column data is immutable (written once per file), entries are never evicted.
-// This avoids re-running DecodeIntrinsicColumnBlob (snappy + struct build) on every Reader creation.
-var parsedIntrinsicCache sync.Map // key: string → value: *shared.IntrinsicColumn
+// parsedSketchSummaryCache caches the fully built FileSketchSummary by fileID+"/sketch-summary".
+// FileSketchSummary is expensive to build (CMS merge, TopK aggregation across all blocks) and
+// was previously rebuilt on every query because it was only cached per-Reader (short-lived).
+// GC-cooperative via weak.Pointer — the GC may reclaim when no Reader holds a strong reference.
+// SPEC-OC-003, NOTE-003 (reader NOTES.md)
+var parsedSketchSummaryCache objectcache.Cache[FileSketchSummary]
+
+// parsedIntrinsicCache caches fully decoded IntrinsicColumn objects by
+// fileID+"/intrinsic/"+colName. GC-cooperative via weak.Pointer.
+// SPEC-OC-003, NOTE-003 (reader NOTES.md)
+var parsedIntrinsicCache objectcache.Cache[shared.IntrinsicColumn]
 
 // parsedMetadataCache caches the fully parsed metadata result by fileID.
-// This avoids re-reading ~45 MB from bbolt FileCache and re-parsing metadata
-// on every Reader creation. File metadata is immutable after compaction.
-var parsedMetadataCache sync.Map // key: string → value: *parsedMetadata
+// GC-cooperative: allows the GC to reclaim ~45 MB metadata when no Reader is open.
+// SPEC-OC-003, NOTE-003 (reader NOTES.md)
+var parsedMetadataCache objectcache.Cache[parsedMetadata]
+
+// parsedIntrinsicTOCCache caches the parsed intrinsic TOC map by fileID+"/intrinsic/toc".
+// Previously the TOC was re-decoded from bbolt on every NewReaderFromProvider call.
+// SPEC-OC-003, NOTE-003 (reader NOTES.md)
+var parsedIntrinsicTOCCache objectcache.Cache[intrinsicTOC]
+
+// intrinsicTOC wraps the intrinsic column TOC map to give it stable pointer identity
+// for objectcache.Cache. Maps can be addressed with weak.Make by taking &m, but that
+// yields *map[K]V from the cache (less ergonomic than a named struct with a map field).
+type intrinsicTOC struct {
+	entries map[string]shared.IntrinsicColMeta
+}
 
 // parsedMetadata holds all parsed results from parseV5MetadataLazy.
 type parsedMetadata struct {
@@ -40,12 +59,12 @@ type parsedMetadata struct {
 }
 
 // ClearCaches resets all process-level caches. Intended for testing.
-// Uses Range+Delete instead of reassignment to avoid unsafely replacing a sync.Map
-// that may be in use concurrently.
 func ClearCaches() {
-	parsedSketchCache.Range(func(k, _ any) bool { parsedSketchCache.Delete(k); return true })
-	parsedIntrinsicCache.Range(func(k, _ any) bool { parsedIntrinsicCache.Delete(k); return true })
-	parsedMetadataCache.Range(func(k, _ any) bool { parsedMetadataCache.Delete(k); return true })
+	parsedSketchCache.Clear()
+	parsedSketchSummaryCache.Clear()
+	parsedIntrinsicCache.Clear()
+	parsedMetadataCache.Clear()
+	parsedIntrinsicTOCCache.Clear()
 }
 
 // rangeIndexMeta records the byte range within metadataBytes for a
@@ -214,8 +233,8 @@ func (r *Reader) parseV5MetadataLazy() error {
 	// Check process-level cache first — avoids re-reading ~45 MB from bbolt
 	// and re-parsing metadata on every Reader creation for the same file.
 	if r.fileID != "" {
-		if cached, ok := parsedMetadataCache.Load(r.fileID); ok {
-			pm := cached.(*parsedMetadata)
+		if pm := parsedMetadataCache.Get(r.fileID); pm != nil {
+			r.metaPin = pm // keep weak cache entry alive for lifetime of this Reader
 			r.metadataBytes = pm.metadataBytes
 			r.blockMetas = pm.blockMetas
 			r.rangeOffsets = pm.rangeOffsets
@@ -362,7 +381,7 @@ func (r *Reader) parseV5MetadataLazy() error {
 
 	// Store in process-level cache for subsequent Reader creations on the same file.
 	if r.fileID != "" {
-		parsedMetadataCache.Store(r.fileID, &parsedMetadata{
+		pm := &parsedMetadata{
 			metadataBytes: r.metadataBytes,
 			blockMetas:    r.blockMetas,
 			rangeOffsets:  r.rangeOffsets,
@@ -370,7 +389,11 @@ func (r *Reader) parseV5MetadataLazy() error {
 			tsEntries:     r.tsEntries,
 			sketchIdx:     r.sketchIdx,
 			fileBloomRaw:  r.fileBloomRaw,
-		})
+		}
+		if err := parsedMetadataCache.Put(r.fileID, pm); err != nil {
+			return fmt.Errorf("parseV5MetadataLazy: cache: %w", err)
+		}
+		r.metaPin = pm // keep weak cache entry alive for lifetime of this Reader
 	}
 	return nil
 }
@@ -383,8 +406,8 @@ func (r *Reader) parseAndCacheSketchSection(data []byte) (int, error) {
 	}
 	if r.fileID != "" {
 		skCacheKey := r.fileID + "/sketch"
-		if cached, ok := parsedSketchCache.Load(skCacheKey); ok {
-			r.sketchIdx = cached.(*sketchIndex)
+		if cached := parsedSketchCache.Get(skCacheKey); cached != nil {
+			r.sketchIdx = cached
 			// Sketch is cached but we don't know how many bytes it consumed.
 			// Re-scan to advance pos past the sketch section so we can find FileBloom.
 			_, consumed, skErr := parseSketchIndexSection(data)
@@ -400,7 +423,9 @@ func (r *Reader) parseAndCacheSketchSection(data []byte) (int, error) {
 	}
 	r.sketchIdx = sketches
 	if sketches != nil && r.fileID != "" {
-		parsedSketchCache.Store(r.fileID+"/sketch", sketches)
+		if err := parsedSketchCache.Put(r.fileID+"/sketch", sketches); err != nil {
+			return 0, fmt.Errorf("parseAndCacheSketchSection: cache: %w", err)
+		}
 	}
 	return consumed, nil
 }

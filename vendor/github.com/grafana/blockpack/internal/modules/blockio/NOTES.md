@@ -1393,3 +1393,110 @@ shared.TestTraceIDBloom(traceBloom, traceID)            // false → skip file
 Back-ref: `internal/modules/blockio/writer/file_bloom.go:writeFileBloomSection`,
           `internal/modules/blockio/reader/file_bloom.go:FileBloom`,
           `internal/modules/executor/plan_blocks.go:fileLevelBloomReject`
+
+
+## 49. Pre-Computed Column Iteration List on Block (iterFields)
+*Added: 2026-03-23*
+
+**Decision:** `Block.BuildIterFields()` pre-computes a deduplicated `[]ColIterEntry` slice
+at parse time. `modulesSpanFieldsAdapter.IterateFields` uses this slice directly when
+present, falling back to the original `seen` map path when it is nil.
+
+**Why:** pprof on BenchmarkRealWorldQueries (25K traces × 10 spans) attributed ~9%
+of all allocations and ~15% of bytes to `(*modulesSpanFieldsAdapter).IterateFields`. The
+dominant cost was `make(map[string]struct{})` called once per matched span — 250K+ map
+allocations per benchmark run. Deduplication is invariant for a given block (column set is
+fixed after parse), so it can safely be moved to parse time.
+
+**How to apply:** `BuildIterFields()` is called immediately after `buildNameIndex()` in
+every block parse path (`block_parser.go:parseBlockColumnsReuse` and
+`reader.go:AddColumnsToBlock`). `IterFields()` returns the slice; `IterateFields` uses it
+when non-nil. Blocks created without a full parse (unit tests using `NewBlockForParsing`)
+have `iterFields` nil and fall back to the seen-map path — functionally correct, just not
+zero-alloc.
+
+**Fallback path:** When `iterFields` is nil (block created without calling BuildIterFields,
+e.g., unit tests that call `NewBlockForParsing` without full parse), IterateFields falls
+back to the original seen-map path to avoid a nil-slice panic.
+
+Back-ref: `internal/modules/blockio/reader/block.go:BuildIterFields`,
+          `internal/modules/blockio/span_fields.go:IterateFields`
+
+## 50. Pooled modulesSpanFieldsAdapter (sync.Pool)
+*Added: 2026-03-23*
+
+**Decision:** `getSpanFieldsAdapter` / `putSpanFieldsAdapter` (unexported) wrap a `sync.Pool` for
+`*modulesSpanFieldsAdapter`. `NewSpanFieldsAdapter` delegates to `getSpanFieldsAdapter`.
+Callers must call `ReleaseSpanFieldsAdapter` (exported) after the adapter's last use (after Clone or
+after the span callback returns).
+
+**Why:** pprof attributed ~2% of all allocations to `blockio.NewSpanFieldsAdapter`.
+The struct is 2 fields (a pointer and an int) — 16 bytes — but is allocated once per
+matched span per block scan at high frequency. sync.Pool eliminates repeated small-object
+allocation/GC cycles.
+
+**Release discipline:** The adapter MUST be released after `SpanMatch.Clone()` completes
+(Clone materializes values out of the adapter into `materializedSpanFields`), or after the
+span match callback returns without cloning. In `api.go`, the release call appears
+immediately after the `fn(match)` callback returns, before the next iteration. Because Clone
+replaces `out.Fields` with a `materializedSpanFields` (not the original adapter), the
+original adapter pointer is not reachable from any returned `SpanMatch`.
+
+**Do not release inside the callback:** If the caller's `fn` stores the `SpanMatch` without
+cloning, it will hold a stale (pooled) adapter. The API contract is: clone if you need to
+retain. This is unchanged from before; Clone already existed for this purpose.
+
+Back-ref: `internal/modules/blockio/span_fields.go:getSpanFieldsAdapter`,
+          `api.go:streamFilterProgram`,
+          `api.go:streamLogProgram`
+
+## 51. BUG-02 — tryApplyExactValues sorted uint64 boundaries as int64
+*Added: 2026-03-23*
+
+**Problem:** The `ColumnTypeRangeUint64` case in `tryApplyExactValues` copied the
+`ColumnTypeRangeInt64` case verbatim: it built `[]int64` by casting uint64 bits to int64,
+then sorted with `slices.Sort([]int64)`. For values with the high bit set (>= 2^63), signed
+sort treated them as negative, placing them before small positive values. This produced
+inverted `cd.boundaries` which the query planner uses for binary-search block pruning,
+causing false-positive or false-negative block selection for uint64 columns with high-bit
+values (e.g. durations near math.MaxUint64 or span:kind=5).
+
+**Fix:** Sort as `[]uint64` (unsigned order), then reinterpret each element's bits as int64
+for the wire format, matching the pattern already used in `applyOverlapUint64`.
+
+Back-ref: `internal/modules/blockio/writer/range_index.go:tryApplyExactValues` (ColumnTypeRangeUint64 case)
+Test: `internal/modules/blockio/writer/range_index_bug02_test.go:TestTryApplyExactValues_Uint64_HighBit`
+
+## 52. BUG-07 — compareRangeKey float64 NaN total order (reader-side)
+*Added: 2026-03-23*
+
+See `internal/modules/blockio/reader/NOTES.md:NOTE-004` for full details.
+**Summary:** Replaced manual `<`/`>` comparisons in `compareRangeKey` (ColumnTypeRangeFloat64)
+with `cmp.Compare`, which provides a stable total order for NaN inputs.
+
+## 53. BUG-08 — decode*Key sentinel values for malformed short keys (reader-side)
+*Added: 2026-03-23*
+
+See `internal/modules/blockio/reader/NOTES.md:NOTE-005` for full details.
+**Summary:** `decodeInt64Key` now returns `math.MinInt64` and `decodeFloat64Key` returns
+`math.NaN()` for short keys, instead of `0` which is a valid value that silently corrupts
+binary search comparisons.
+
+## 54. DUP-01 — Generic findBucket Replaces Four Identical Binary-Search Functions
+*Added: 2026-03-23*
+
+**Decision:** Consolidated four identical binary-search helper functions
+(`findBucketInt64`, `findBucketUint64`, `findBucketFloat64`, `findBucketString`) into a
+single generic `findBucket[T cmp.Ordered]` using Go 1.21+ type constraints.
+
+**Rationale:** All four functions had byte-for-byte identical bodies; only the element type
+differed. Maintaining four copies introduced risk that a bug fix applied to one copy would
+not be propagated to the others (DUP class). The generic version is behaviorally identical
+to all four originals — `cmp.Ordered` covers `int64`, `uint64`, `float64`, and `string`
+safely without any semantic change.
+
+**Consequence:** Callers pass a typed slice; the compiler instantiates the appropriate
+version at compile time. No runtime overhead. Any future change to binary-search semantics
+needs to be made in exactly one place.
+
+Back-ref: `internal/modules/blockio/writer/range_index.go:findBucket`

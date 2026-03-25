@@ -58,29 +58,12 @@ func (p *tempoReaderProvider) ReadAt(buf []byte, off int64, _ blockpack.DataType
 	return len(buf), nil
 }
 
-// blockpackLRU is the process-level in-memory LRU cache (see below).
-// blockpackLRU is the process-level in-memory LRU cache for blockpack readers.
-// It caches footer and file metadata; size is configured via BlockpackConfig.LRUCacheBytes.
-// Initialized on first use via ConfigureLRU.
-var (
-	blockpackLRU     *blockpack.SharedLRUCache
-	blockpackLRUOnce sync.Once
-	blockpackLRUSize int64 = 32 * 1024 * 1024 // 32MB default
-)
-
-// ConfigureLRU sets the LRU cache size. Must be called before any Fetch/Search.
-func ConfigureLRU(sizeBytes int64) {
-	if sizeBytes > 0 {
-		blockpackLRUSize = sizeBytes
-	}
-}
-
-func getSharedLRU() *blockpack.SharedLRUCache {
-	blockpackLRUOnce.Do(func() {
-		blockpackLRU = blockpack.NewSharedLRUCache(blockpackLRUSize)
-	})
-	return blockpackLRU
-}
+// ConfigureLRU is a no-op retained for API compatibility.
+// The SharedLRU raw-byte cache was removed — pprof showed it was allocating
+// ~76 GB/s under load while providing no benefit: blocks (10-200 MB) exceeded
+// the 32 MB limit and were never stored; objectcache already caches parsed
+// metadata/sketches/intrinsic columns at a higher level.
+func ConfigureLRU(_ int64) {}
 
 // blockpackFileCache is a process-level disk-backed cache for blockpack block bytes.
 // A nil *FileCache is safe — all reads fall through to the provider.
@@ -134,19 +117,17 @@ func newBackendBlock(meta *backend.BlockMeta, r backend.Reader) *blockpackBlock 
 	}
 }
 
-// newReaderProvider returns a provider bound to this block's object, backed by
-// the process-level LRU cache. Footer, compact trace index, and metadata reads
-// are cached across requests keyed by tenantID/blockID, so FindTraceByID avoids
-// re-reading the 5+ MB compact index on every call.
+// newReaderProvider returns a provider bound to this block's S3 object.
+// Parsed metadata, sketches, and intrinsic columns are cached at the
+// objectcache layer inside blockpack (GC-cooperative weak.Pointer cache),
+// which supersedes the former SharedLRU raw-byte cache.
 func (b *blockpackBlock) newReaderProvider() blockpack.ReaderProvider {
-	raw := &tempoReaderProvider{
+	return &tempoReaderProvider{
 		reader:    b.reader,
 		tenantID:  b.meta.TenantID,
 		blockID:   uuid.UUID(b.meta.BlockID),
 		knownSize: int64(b.meta.Size_),
 	}
-	readerID := b.meta.TenantID + "/" + b.meta.BlockID.String()
-	return blockpack.NewSharedLRUProvider(raw, readerID, getSharedLRU())
 }
 
 // newReader creates a Reader with both in-memory LRU and disk FileCache layers.

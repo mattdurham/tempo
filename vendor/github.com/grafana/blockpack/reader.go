@@ -227,6 +227,7 @@ func GetTraceByID(r *Reader, traceIDHex string) (results []SpanMatch, err error)
 				SpanID:  spanIDStr,
 			}
 			results = append(results, match.Clone())
+			modules_blockio.ReleaseSpanFieldsAdapter(fields)
 		}
 	}
 

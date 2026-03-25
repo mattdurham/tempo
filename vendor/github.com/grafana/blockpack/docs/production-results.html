@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Production Results — Blockpack</title>
+  <link rel="stylesheet" href="/assets/css/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <a href="/" class="topbar-brand">Blockpack Docs</a>
+    <a href="https://github.com/grafana/blockpack" class="topbar-github">GitHub →</a>
+  </header>
+  <div class="layout">
+    <nav class="sidebar">
+  <div class="sidebar-brand">BLOCKPACK</div>
+  <div class="section-label">Overview</div>
+  <a href="/">Home</a>
+  <a href="/file-format">File Format</a>
+  <div class="section-label">Query Execution</div>
+  <a href="/execution-path">Execution Path</a>
+  <a href="/write-path">Write Path</a>
+  <div class="section-label">Indexes</div>
+  <a href="/kll">KLL Sketches</a>
+  <a href="/cms">Count-Min Sketch</a>
+  <a href="/topk">TopK</a>
+  <a href="/hll">HyperLogLog</a>
+  <a href="/bloom-filter">Bloom Filters</a>
+  <a href="/intrinsic-columns">Intrinsic Columns</a>
+  <div class="section-label">Blocks</div>
+  <a href="/block-scoring">Block Scoring</a>
+  <a href="/block-format">Block Format</a>
+  <div class="section-label">Performance</div>
+  <a href="/benchmarks/">Benchmarks</a>
+  <a href="/production-results" class="active">Production Results</a>
+</nav>
+    <main class="content">
+<h1>Blockpack vs Parquet — Production Latency Benchmark Results</h1>
+<ul>
+<li><strong>Date:</strong> 2026-03-24</li>
+<li><strong>Dataset:</strong> ~6.7 M traces, real-world Grafana Cloud production traffic</li>
+<li><strong>S3 latency:</strong> 36 ms average per GET request (<code>tempodb\<em>backend\</em>request\<em>duration\</em>seconds</code>, operation=GET status\_code=206)</li>
+<li><strong>Configuration:</strong> GOGC=100, GOMEMLIMIT=20 GiB</li>
+<li><strong>Compaction level:</strong> Level 2 (fully compacted)</li>
+</ul>
+<hr>
+<h2>Storage Footprint</h2>
+<table>
+<thead>
+<tr><th>Backend</th><th>On-disk size</th><th>Block count</th></tr>
+</thead>
+<tbody>
+<tr><td>Parquet (vParquet5)</td><td>3.29 GB</td><td>16</td></tr>
+<tr><td>Blockpack</td><td>3.64 GB</td><td>14</td></tr>
+</tbody>
+</table>
+<p>Blockpack stores ~11% more bytes on disk due to its unified columnar layout
+(all columns in one file per block) vs Parquet's row-group compression
+advantages. Both use default configuration with no dedicated columns.</p>
+<hr>
+<h2>Single-Query p50 Latency (warm cache, limit=20)</h2>
+<p>Each figure is the median of 5 runs against a fully warmed filecache.
+All queries issued against compacted level-2 blocks.</p>
+<table>
+<thead>
+<tr><th>Query Category</th><th>Parquet p50</th><th>Blockpack p50</th><th>Ratio</th></tr>
+</thead>
+<tbody>
+<tr><td>Match-all (no predicates)</td><td>603 ms</td><td>121 ms</td><td><strong>0.20x</strong></td></tr>
+<tr><td>Intrinsic range predicate</td><td>641 ms</td><td>583 ms</td><td>0.91x</td></tr>
+<tr><td>Intrinsic equality — single field</td><td>678 ms</td><td>61 ms</td><td><strong>0.09x</strong></td></tr>
+<tr><td>Intrinsic equality — categorical field</td><td>674 ms</td><td>62 ms</td><td><strong>0.09x</strong></td></tr>
+<tr><td>Service name equality</td><td>717 ms</td><td>79 ms</td><td><strong>0.11x</strong></td></tr>
+<tr><td>Service name regex</td><td>723 ms</td><td>184 ms</td><td><strong>0.25x</strong></td></tr>
+<tr><td>User attribute filter</td><td>770 ms</td><td>292 ms</td><td><strong>0.38x</strong></td></tr>
+<tr><td>Service + intrinsic AND</td><td>861 ms</td><td>783 ms</td><td>0.91x</td></tr>
+<tr><td>Service + user attribute AND</td><td>857 ms</td><td>462 ms</td><td><strong>0.54x</strong></td></tr>
+<tr><td>Multi-condition AND (regex + attribute + intrinsic)</td><td>1856 ms</td><td>1421 ms</td><td><strong>0.77x</strong></td></tr>
+</tbody>
+</table>
+<p>The advantage is most pronounced for intrinsic-column queries (status, kind,
+service name) because blockpack's per-file intrinsic TOC eliminates full block
+reads entirely — results come from pre-sorted flat column blobs. Parquet must
+scan row groups for every predicate regardless of column type.</p>
+<hr>
+<h2>Parallel Load Throughput (1500 queries × 50 concurrent)</h2>
+<p>Stress test: 30 representative query patterns, each fired 50 times in
+parallel (1500 total). Measures sustained throughput under realistic concurrent load.</p>
+<h3>With blockpack filecache enabled (bbolt disk cache)</h3>
+<table>
+<thead>
+<tr><th>Metric</th><th>Parquet</th><th>Blockpack warm</th><th>Blockpack cold</th></tr>
+</thead>
+<tbody>
+<tr><td>Wall time</td><td>19.2 s</td><td><strong>16.6 s (−14%)</strong></td><td>32.9 s (+66%)</td></tr>
+<tr><td>Peak CPU</td><td>~1490%</td><td>~1032%</td><td>~1032%</td></tr>
+<tr><td>Post-stress memory</td><td>7.0 GiB</td><td><strong>4.1 GiB (−41%)</strong></td><td>—</td></tr>
+</tbody>
+</table>
+<p>Blockpack warm (filecache populated) is 14% faster. Cold start is 1.7× slower
+than warm — and notably slower than the no-cache path — because a cold filecache
+incurs two I/O operations per block fetch: an S3 read followed by a synchronous
+bbolt write to persist the result to disk. The no-cache path (filecache disabled)
+only performs the S3 read. Once the cache is warm, S3 is bypassed entirely and
+reads come from the local bbolt file.</p>
+<h3>Apples-to-apples: no persistent cache on either side</h3>
+<p>Both backends hit S3 directly on every request (blockpack filecache disabled,
+parquet has no equivalent persistent disk cache in this configuration).</p>
+<table>
+<thead>
+<tr><th>Metric</th><th>Parquet</th><th>Blockpack</th><th>Delta</th></tr>
+</thead>
+<tbody>
+<tr><td>Wall time</td><td>18.1 s</td><td><strong>17.0 s</strong></td><td><strong>−6%</strong></td></tr>
+<tr><td>Peak CPU</td><td>~1490%</td><td>~1032%</td><td>−31%</td></tr>
+<tr><td>Post-stress memory</td><td>6.4 GiB</td><td><strong>4.9 GiB</strong></td><td><strong>−23%</strong></td></tr>
+</tbody>
+</table>
+<p>Without any caching advantage, blockpack is still 6% faster and 23% less memory
+at production S3 latency. The advantage comes from fewer S3 requests (intrinsic
+TOC pruning) and lower in-flight allocation cost (read buffer pooling,
+pre-allocated column merge).</p>
+<h3>Why blockpack is faster without a cache</h3>
+<p>Parquet makes ~124,000 S3 range requests per 1500-query run (many small column
+reads per row group). Blockpack makes ~29,000 (4.3× fewer), because the
+intrinsic TOC allows file-level and per-block rejection before any block data
+is fetched. At 36 ms/request, fewer requests directly reduces wall time even
+though individual reads are larger.</p>
+<h3>Memory breakdown (in-flight during load)</h3>
+<p>The dominant memory consumers (from heap profile during load):</p>
+<table>
+<thead>
+<tr><th>Source</th><th>Allocation rate</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td>Read buffers (pooled)</td><td>~37 GB/25 s</td><td>S3 block data in flight; pooled via <code>sync.Pool</code></td></tr>
+<tr><td>Filecache returns</td><td>~24 GB/25 s</td><td>Block bytes returned from disk cache</td></tr>
+<tr><td>Intrinsic column decode</td><td>~24 GB/25 s</td><td>Paged intrinsic blobs (snappy → decoded)</td></tr>
+<tr><td>Sketch summary build</td><td>~21 GB/25 s</td><td>Per-file CMS + Fuse8 aggregation</td></tr>
+<tr><td>Column decode</td><td>~90 GB/25 s</td><td>zstd/XOR/delta column decompression</td></tr>
+</tbody>
+</table>
+<hr>
+<h2>S3 Request Efficiency</h2>
+<p>A 36 ms latency per S3 GET was applied to all results, based on production
+measurements from Grafana Cloud Tempo queriers
+(<code>tempodb<em>backend</em>request<em>duration</em>seconds</code>, operation=GET status_code=206).
+This makes request count the dominant cost factor — each additional round-trip
+adds 36 ms of irreducible latency regardless of payload size.</p>
+<p>Blockpack makes far fewer S3 range requests per query than Parquet because
+its intrinsic TOC enables file-level rejection and per-block pruning before
+any block data is fetched.</p>
+<table>
+<thead>
+<tr><th>Query Category</th><th>Parquet range GETs</th><th>Blockpack range GETs</th></tr>
+</thead>
+<tbody>
+<tr><td>Match-all</td><td>many (all row groups)</td><td>few (intrinsic fast path)</td></tr>
+<tr><td>Intrinsic range</td><td>many</td><td><strong>3</strong> (intrinsic blob only)</td></tr>
+<tr><td>Intrinsic equality</td><td>many</td><td>~18–20</td></tr>
+<tr><td>User attribute filter</td><td>many</td><td>~55–60 (Fuse8 pruned)</td></tr>
+</tbody>
+</table>
+<p>At 36 ms/request, reducing round-trips by even 10–20 saves 360–720 ms per
+query. Parquet's advantage at lower latencies (< 20 ms) comes from
+column-level I/O projection — it reads only the needed column bytes per row
+group, whereas blockpack reads the full block and filters at decode time.</p>
+<hr>
+<h2>Notes</h2>
+<ul>
+<li>Results measured on localhost with s3fs (single-node, no network jitter).</li>
+</ul>
+<p>  Production results may vary based on S3 region, object size distribution,
+  and query concurrency.</p>
+<ul>
+<li>Parquet uses vParquet5 with default configuration (no dedicated columns).</li>
+<li>Blockpack uses the <code>parallel-block-reads</code> branch incorporating all</li>
+</ul>
+<p>  optimisations listed above.</p>
+<ul>
+<li>GC settings (GOGC=100, GOMEMLIMIT=20 GiB) reflect the recommended</li>
+</ul>
+<p>  production configuration for this workload.</p>
+
+    </main>
+  </div>
+</body>
+</html>

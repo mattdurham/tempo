@@ -6,10 +6,35 @@ import (
 	"cmp"
 	"fmt"
 	"slices"
+	"sync"
 
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
 	"github.com/grafana/blockpack/internal/modules/rw"
 )
+
+// coalescedReadPool holds reusable read buffers for ReadCoalescedBlocks.
+// Each buffer is returned immediately after per-block copies are made,
+// eliminating the ~90 GB/s allocation hot spot from repeated large mallocs.
+// Buffers larger than coalescedReadPoolMaxBytes are not returned to the pool —
+// an oversized allocation from a pathological block would otherwise sit in the
+// pool indefinitely, inflating steady-state RSS.
+var coalescedReadPool = &sync.Pool{
+	New: func() any {
+		b := make([]byte, 0, 8*1024*1024) // 8 MB initial capacity
+		return &b
+	},
+}
+
+// coalescedReadPoolMaxBytes is the largest buffer returned to the pool.
+// Reads larger than this are handled by a fresh allocation that is GC'd normally.
+const coalescedReadPoolMaxBytes = 32 * 1024 * 1024 // 32 MB
+
+// returnToPool returns a pooled buffer if it is within the size limit.
+func returnToPool(p *[]byte) {
+	if int64(cap(*p)) <= coalescedReadPoolMaxBytes {
+		coalescedReadPool.Put(p)
+	}
+}
 
 // blockExtent is an internal tuple used during coalescing.
 type blockExtent struct {
@@ -99,18 +124,34 @@ func CoalesceBlocks(metas []shared.BlockMeta, blockOrder []int, cfg shared.Coale
 
 // ReadCoalescedBlocks executes the merged I/O requests.
 // Returns a map from block index to raw block bytes.
+//
+// Each coalesced read uses a pooled buffer for the S3 fetch. Block data is
+// copied into independent per-block allocations so the pooled buffer can be
+// returned immediately — this eliminates the large-buffer allocation hot spot
+// without retaining ~8 MB per coalesced group for the caller's lifetime.
 func ReadCoalescedBlocks(provider rw.ReaderProvider, cr []shared.CoalescedRead) (map[int][]byte, error) {
 	result := make(map[int][]byte)
 
 	for i := range cr {
 		c := &cr[i]
-		buf := make([]byte, c.Length)
+
+		// Acquire a pooled read buffer; grow if needed.
+		bufPtr := coalescedReadPool.Get().(*[]byte)
+		if int64(cap(*bufPtr)) < c.Length {
+			*bufPtr = make([]byte, c.Length)
+		} else {
+			*bufPtr = (*bufPtr)[:c.Length]
+		}
+		buf := *bufPtr
+
 		n, err := provider.ReadAt(buf, c.Offset, rw.DataTypeBlock)
 		if err != nil {
+			returnToPool(bufPtr)
 			return nil, fmt.Errorf("coalesced read at offset %d length %d: %w", c.Offset, c.Length, err)
 		}
 
 		if int64(n) != c.Length {
+			returnToPool(bufPtr)
 			return nil, fmt.Errorf(
 				"coalesced read at offset %d: short read, got %d want %d",
 				c.Offset, n, c.Length,
@@ -122,15 +163,22 @@ func ReadCoalescedBlocks(provider rw.ReaderProvider, cr []shared.CoalescedRead) 
 			bLen := c.BlockLengths[j]
 			end := bOff + bLen
 			if bOff < 0 || end > int64(len(buf)) {
+				returnToPool(bufPtr)
 				return nil, fmt.Errorf(
 					"coalesced read: block %d slice [%d:%d] out of range for buf len %d",
 					blockID, bOff, end, len(buf),
 				)
 			}
 
-			// Sub-slice into buf directly — no copy. buf stays alive through these references.
-			result[blockID] = buf[bOff:end:end]
+			// Copy into an independent per-block allocation so the pooled buf
+			// can be returned immediately below (no shared sub-slice aliases).
+			block := make([]byte, bLen)
+			copy(block, buf[bOff:end])
+			result[blockID] = block
 		}
+
+		// Return pool buffer now — all block data has been copied out.
+		returnToPool(bufPtr)
 	}
 
 	return result, nil

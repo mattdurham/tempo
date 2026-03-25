@@ -2,6 +2,9 @@ services:
   # s3fs - minimal S3-compatible server backed by local filesystem
   # Replaces s3proxy + toxiproxy with a single service.
   # S3FS_LATENCY adds artificial per-request latency (replaces toxiproxy).
+  # Production S3 latency baseline: 36ms average GET latency measured on
+  # Grafana Cloud Tempo queriers (tempodb_backend_request_duration_seconds,
+  # operation=GET status_code=206) on 2026-03-24.
   s3fs:
     build:
       context: ../../s3fs
@@ -10,7 +13,7 @@ services:
     environment:
       S3FS_ROOT: /data
       S3FS_PORT: "8080"
-      S3FS_LATENCY: "${S3FS_LATENCY:-20}"
+      S3FS_LATENCY: "${S3FS_LATENCY:-36}"
     volumes:
       - ./s3-data:/data
     networks:
@@ -112,7 +115,7 @@ services:
       - "14319:4319"   # OTLP gRPC
       - "14320:4320"   # OTLP HTTP
     environment:
-      - GOGC=80
+      - GOGC=100
       - GOMEMLIMIT=20GiB
     networks:
       - tempo-network

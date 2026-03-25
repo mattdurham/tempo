@@ -13,9 +13,22 @@ import (
 // parseIntrinsicTOC reads and parses the intrinsic column TOC from the v4 footer.
 // Called during NewReaderFromProvider. For v3 footer files or files with no intrinsic
 // section, this is a no-op.
+// NOTE-003: the parsed TOC map is cached in parsedIntrinsicTOCCache (GC-cooperative)
+// to avoid re-decoding the blob on every NewReaderFromProvider call.
 func (r *Reader) parseIntrinsicTOC() error {
 	if r.footerVersion != shared.FooterV4Version || r.intrinsicIndexLen == 0 {
 		return nil
+	}
+
+	// Check process-level TOC cache first.
+	if r.fileID != "" {
+		tocKey := r.fileID + "/intrinsic/toc"
+		if cached := parsedIntrinsicTOCCache.Get(tocKey); cached != nil {
+			r.tocPin = cached // keep weak cache entry alive for lifetime of this Reader
+			// r.intrinsicIndex aliases cached.entries — map is immutable after construction.
+			r.intrinsicIndex = cached.entries
+			return nil
+		}
 	}
 
 	blob, err := r.readRange(r.intrinsicIndexOffset, uint64(r.intrinsicIndexLen), rw.DataTypeMetadata)
@@ -32,6 +45,16 @@ func (r *Reader) parseIntrinsicTOC() error {
 	for _, e := range entries {
 		r.intrinsicIndex[e.Name] = e
 	}
+
+	// Store parsed TOC in process-level cache.
+	if r.fileID != "" {
+		toc := &intrinsicTOC{entries: r.intrinsicIndex}
+		if err := parsedIntrinsicTOCCache.Put(r.fileID+"/intrinsic/toc", toc); err != nil {
+			return fmt.Errorf("parseIntrinsicTOC: cache: %w", err)
+		}
+		r.tocPin = toc // keep weak cache entry alive for lifetime of this Reader
+	}
+
 	return nil
 }
 
@@ -118,11 +141,12 @@ func (r *Reader) GetIntrinsicColumn(name string) (*shared.IntrinsicColumn, error
 
 	// Check process-level cache first — decoded IntrinsicColumn is immutable once written.
 	// Guard: only use process-level cache when fileID is non-empty to prevent cross-file collisions.
+	// NOTE-003: process-level cache uses objectcache.Cache (GC-cooperative weak pointers)
+	// instead of sync.Map with strong refs to allow GC to reclaim decoded columns.
 	useProcessCache := r.fileID != ""
 	if useProcessCache {
 		procKey := r.fileID + "/intrinsic/" + name
-		if cached, ok := parsedIntrinsicCache.Load(procKey); ok {
-			col := cached.(*shared.IntrinsicColumn)
+		if col := parsedIntrinsicCache.Get(procKey); col != nil {
 			if r.intrinsicDecoded == nil {
 				r.intrinsicDecoded = make(map[string]*shared.IntrinsicColumn)
 			}
@@ -146,7 +170,9 @@ func (r *Reader) GetIntrinsicColumn(name string) (*shared.IntrinsicColumn, error
 	col.Name = name
 
 	if useProcessCache {
-		parsedIntrinsicCache.Store(r.fileID+"/intrinsic/"+name, col)
+		if err := parsedIntrinsicCache.Put(r.fileID+"/intrinsic/"+name, col); err != nil {
+			return nil, fmt.Errorf("GetIntrinsicColumn %q: cache: %w", name, err)
+		}
 	}
 
 	if r.intrinsicDecoded == nil {

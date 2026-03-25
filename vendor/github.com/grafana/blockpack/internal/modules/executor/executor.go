@@ -55,11 +55,12 @@ type Options struct {
 // SpanMatchFromRow extracts a SpanMatch from a MatchedRow by reading the appropriate
 // trace and span identity columns for the given signal type. For trace signals it
 // reads "trace:id" and "span:id"; for log signals it reads "log:trace_id" and "log:span_id".
+//
+// Supports both row representations:
+//   - Block-populated rows (equality-predicate Case A, block-scan): reads columns from Block.
+//   - IntrinsicFields-populated rows (range-predicate Case A, Case B): reads from IntrinsicFields.
 func SpanMatchFromRow(row MatchedRow, signalType uint8) SpanMatch {
 	m := SpanMatch{BlockIdx: row.BlockIdx, RowIdx: row.RowIdx}
-	if row.Block == nil {
-		return m
-	}
 
 	traceIDCol := "trace:id"
 	spanIDCol := "span:id"
@@ -68,6 +69,27 @@ func SpanMatchFromRow(row MatchedRow, signalType uint8) SpanMatch {
 		spanIDCol = "log:span_id"
 	}
 
+	if row.IntrinsicFields != nil {
+		// Range-predicate Case A and Case B: IDs are in the IntrinsicFields map.
+		if v, ok := row.IntrinsicFields.GetField(traceIDCol); ok {
+			if b, ok := v.([]byte); ok && len(b) == 16 {
+				copy(m.TraceID[:], b)
+			}
+		}
+		if v, ok := row.IntrinsicFields.GetField(spanIDCol); ok {
+			if b, ok := v.([]byte); ok {
+				m.SpanID = make([]byte, len(b))
+				copy(m.SpanID, b)
+			}
+		}
+		return m
+	}
+
+	if row.Block == nil {
+		return m
+	}
+
+	// Equality-predicate Case A and block-scan: IDs are in the decoded Block.
 	if col := row.Block.GetColumn(traceIDCol); col != nil {
 		if v, ok := col.BytesValue(row.RowIdx); ok && len(v) == 16 {
 			copy(m.TraceID[:], v)

@@ -62,6 +62,17 @@ type Reader struct {
 	// intrinsicDecoded caches fully decoded intrinsic columns by name.
 	// Populated lazily by GetIntrinsicColumn.
 	intrinsicDecoded map[string]*shared.IntrinsicColumn
+
+	// metaPin holds a strong reference to the *parsedMetadata retrieved from the process-level
+	// cache, keeping its weak.Pointer entry valid for the lifetime of this Reader.
+	// Without this pin, *parsedMetadata is GC-eligible immediately after field copying,
+	// causing cache misses for concurrent/subsequent readers of the same file.
+	metaPin *parsedMetadata
+
+	// tocPin holds a strong reference to the *intrinsicTOC retrieved from the process-level
+	// cache, keeping its weak.Pointer entry valid for the lifetime of this Reader.
+	tocPin *intrinsicTOC
+
 	// fileBloomParsed is the lazily parsed FileBloom section. Access via FileBloom().
 	fileBloomParsed *FileBloom
 
@@ -663,12 +674,22 @@ func (r *Reader) AddColumnsToBlock(bwb *BlockWithBytes, addColumns map[string]st
 	}
 
 	bwb.Block.buildNameIndex()
+	bwb.Block.BuildIterFields()
 
 	return nil
 }
 
 // GetBlockWithBytes reads, parses, and returns a full block. Compatibility shim that
 // combines ReadBlockRaw + ParseBlockFromBytes into a single call.
+//
+// BUG-12 (latent trap): when secondPassCols is non-nil, a second ParseBlockFromBytes call
+// is made using secondPassCols as the column filter. This second call REPLACES the bwb
+// returned by the first pass — it does not merge with wantColumns. Any column present in
+// wantColumns but absent from secondPassCols will be silently discarded.
+//
+// No current caller passes a non-nil secondPassCols (all call sites use nil), so there is
+// no active data loss. If you ever need both wantColumns AND a second set of columns, call
+// ParseBlockFromBytes twice and merge the results manually rather than relying on this shim.
 func (r *Reader) GetBlockWithBytes(
 	blockIdx int,
 	wantColumns map[string]struct{},

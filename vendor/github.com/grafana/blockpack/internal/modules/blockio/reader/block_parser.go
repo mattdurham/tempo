@@ -264,6 +264,7 @@ func parseBlockColumnsReuse(
 		meta:            meta,
 	}
 	blk.buildNameIndex()
+	blk.BuildIterFields()
 
 	return blk, nil
 }

@@ -19,6 +19,7 @@ import (
 	"log/slog"
 	"math"
 	"strings"
+	"sync"
 
 	"github.com/grafana/blockpack/internal/logqlparser"
 	modules_blockio "github.com/grafana/blockpack/internal/modules/blockio"
@@ -39,12 +40,10 @@ type SpanFieldsProvider = modules_shared.SpanFieldsProvider
 
 // QueryOptions configures query execution.
 type QueryOptions struct {
-	Limit int // Maximum number of spans to return (0 = unlimited).
-	// MostRecent controls block traversal order. Always use keyed struct literals:
-	// QueryOptions{Limit: 10, MostRecent: true}.
-	// Uses Backward direction with span:start timestamp sorting. For intrinsic-only queries,
-	// top-K selection uses only the intrinsic column blobs (no full block I/O).
-	MostRecent bool
+	// SelectColumns limits which column names appear in SpanMatch.Fields.
+	// When non-nil, only columns whose names are present in this slice are
+	// returned by GetField and IterateFields. nil means all columns are returned.
+	SelectColumns []string
 	// StartNano is the inclusive lower bound for block-level time pruning (unix nanoseconds).
 	// Internal blocks whose span:start range ends before StartNano are skipped entirely.
 	// 0 means no lower bound.
@@ -53,6 +52,7 @@ type QueryOptions struct {
 	// Internal blocks whose span:start range begins after EndNano are skipped entirely.
 	// 0 means no upper bound.
 	EndNano uint64
+	Limit   int // Maximum number of spans to return (0 = unlimited).
 	// StartBlock is the first internal block index to scan (0-based, inclusive).
 	// Used by the frontend sharder to partition a single blockpack file into
 	// multiple sub-file jobs. 0 means start from the first block.
@@ -60,10 +60,11 @@ type QueryOptions struct {
 	// BlockCount is the number of internal blocks to scan starting from StartBlock.
 	// 0 means scan all blocks (no sub-file sharding).
 	BlockCount int
-	// SelectColumns limits which column names appear in SpanMatch.Fields.
-	// When non-nil, only columns whose names are present in this slice are
-	// returned by GetField and IterateFields. nil means all columns are returned.
-	SelectColumns []string
+	// MostRecent controls block traversal order. Always use keyed struct literals:
+	// QueryOptions{Limit: 10, MostRecent: true}.
+	// Uses Backward direction with span:start timestamp sorting. For intrinsic-only queries,
+	// top-K selection uses only the intrinsic column blobs (no full block I/O).
+	MostRecent bool
 }
 
 // validateQueryOptions checks that sharding and time range parameters are valid.
@@ -110,37 +111,71 @@ type SpanMatch struct {
 	SpanID  string
 }
 
+// kvField is a name-value pair used in materializedSpanFields.
+// NOTE-ALLOC-2: slice-backed materialization avoids map allocation in Clone.
+type kvField struct {
+	Value any
+	Name  string
+}
+
+// kvFieldSlicePool recycles []kvField backing arrays to reduce Clone allocations.
+// NOTE-ALLOC-2: pool holds *[]kvField so Reset clears slice length without losing capacity.
+var kvFieldSlicePool = sync.Pool{
+	New: func() any {
+		s := make([]kvField, 0, 32)
+		return &s
+	},
+}
+
 // Clone materializes all fields from the lazy provider and returns a deep copy
 // with stable ownership, safe to hold beyond any internal callback or function return.
 // If Fields is nil (e.g. structural queries), the clone has nil Fields.
+// NOTE-ALLOC-2: uses pooled []kvField backing slice instead of map[string]any.
 func (m *SpanMatch) Clone() SpanMatch {
 	out := SpanMatch{TraceID: m.TraceID, SpanID: m.SpanID}
 	if m.Fields == nil {
 		return out
 	}
-	materialized := make(map[string]any, 32) // pre-size to avoid grow/rehash for typical label counts
+	// Get pooled backing slice, fill it, then transfer ownership to materializedSpanFields.
+	sp := kvFieldSlicePool.Get().(*[]kvField)
+	fields := (*sp)[:0]
 	m.Fields.IterateFields(func(name string, value any) bool {
-		materialized[name] = value
+		fields = append(fields, kvField{Name: name, Value: value})
 		return true
 	})
-	out.Fields = &materializedSpanFields{fields: materialized}
+	// Copy into an exactly-sized owned slice for materializedSpanFields,
+	// then return the original pool slice (reset to len=0) for reuse.
+	// This ensures the pool backing array is actually reused across calls.
+	owned := make([]kvField, len(fields))
+	copy(owned, fields)
+	out.Fields = &materializedSpanFields{fields: owned}
+	*sp = fields[:0]
+	kvFieldSlicePool.Put(sp)
 	return out
 }
 
-// materializedSpanFields is a heap-allocated map-backed SpanFieldsProvider
+// materializedSpanFields is a heap-allocated slice-backed SpanFieldsProvider
 // returned by SpanMatch.Clone(). Safe to hold beyond the callback lifetime.
+// NOTE-ALLOC-2: uses []kvField instead of map[string]any to avoid map overhead.
 type materializedSpanFields struct {
-	fields map[string]any
+	fields []kvField
 }
 
+// GetField is an O(n) linear scan. For typical span field counts (10–30),
+// this is faster than a map lookup due to cache locality.
+// See executor/NOTES.md NOTE-047 for the trade-off rationale.
 func (m *materializedSpanFields) GetField(name string) (any, bool) {
-	v, ok := m.fields[name]
-	return v, ok
+	for i := range m.fields {
+		if m.fields[i].Name == name {
+			return m.fields[i].Value, true
+		}
+	}
+	return nil, false
 }
 
 func (m *materializedSpanFields) IterateFields(fn func(name string, value any) bool) {
-	for k, v := range m.fields {
-		if !fn(k, v) {
+	for i := range m.fields {
+		if !fn(m.fields[i].Name, m.fields[i].Value) {
 			return
 		}
 	}
@@ -245,8 +280,8 @@ func QueryTraceQL(r *Reader, traceqlQuery string, opts QueryOptions) (results []
 			for i := range execResult.Matches {
 				m := &execResult.Matches[i]
 				match := &SpanMatch{
-					TraceID: fmt.Sprintf("%x", m.TraceID[:]),
-					SpanID:  fmt.Sprintf("%x", m.SpanID),
+					TraceID: hex.EncodeToString(m.TraceID[:]),
+					SpanID:  hex.EncodeToString(m.SpanID),
 				}
 				if !collector(match, true) {
 					break
@@ -565,6 +600,7 @@ func streamFilterProgram(r *Reader, program *vm.Program, opts QueryOptions, fn s
 	for _, row := range rows {
 		var fields SpanFieldsProvider
 		var traceIDHex, spanIDHex string
+		var rawAdapter SpanFieldsProvider // tracked for pool release
 		if row.IntrinsicFields != nil {
 			// Intrinsic fast path — fields resolved from intrinsic columns, no block read.
 			fields = row.IntrinsicFields
@@ -575,7 +611,8 @@ func streamFilterProgram(r *Reader, program *vm.Program, opts QueryOptions, fn s
 				spanIDHex = hexEncodeField(v)
 			}
 		} else {
-			fields = modules_blockio.NewSpanFieldsAdapter(row.Block, row.RowIdx)
+			rawAdapter = modules_blockio.NewSpanFieldsAdapter(row.Block, row.RowIdx)
+			fields = rawAdapter
 			traceIDHex, spanIDHex = extractIDs(row.Block, row.RowIdx)
 		}
 		if len(opts.SelectColumns) > 0 {
@@ -583,8 +620,12 @@ func streamFilterProgram(r *Reader, program *vm.Program, opts QueryOptions, fn s
 		}
 		match := &SpanMatch{Fields: fields, TraceID: traceIDHex, SpanID: spanIDHex}
 		if !fn(match, true) {
+			// NOTE-ALLOC-4: release adapter back to pool after callback returns.
+			modules_blockio.ReleaseSpanFieldsAdapter(rawAdapter)
 			break
 		}
+		// NOTE-ALLOC-4: release adapter back to pool after callback returns.
+		modules_blockio.ReleaseSpanFieldsAdapter(rawAdapter)
 	}
 	fn(nil, false)
 	return nil
@@ -898,9 +939,13 @@ type TraceMetricLabel = modules_executor.TraceMetricLabel
 
 // TraceMetricOptions configures a TraceQL metrics query.
 type TraceMetricOptions struct {
-	// StartNano is the inclusive start of the query time window (unix nanoseconds).
+	// StartNano is the approximate start of the query time window (unix nanoseconds).
+	// Internally aligned down to the nearest StepNano boundary before query execution.
+	// The effective interval is right-closed: spans at exactly alignedStart are excluded.
 	StartNano int64
-	// EndNano is the exclusive end of the query time window (unix nanoseconds).
+	// EndNano is the approximate end of the query time window (unix nanoseconds).
+	// Internally aligned up to the nearest StepNano boundary before query execution.
+	// The effective interval is right-closed: spans at exactly alignedEnd are included.
 	EndNano int64
 	// StepNano is the time bucket step size in nanoseconds (default: 60 seconds).
 	StepNano int64
@@ -912,8 +957,10 @@ type TraceMetricOptions struct {
 // Supported metric functions: count_over_time(), rate(), sum(field), avg(field), min(field),
 // max(field), histogram_over_time(field), quantile_over_time(field, phi), stddev(field).
 //
-// Returns a TraceMetricsResult with one TraceTimeSeries per unique group-by key combination.
-// Each series has len(Values) == ceil((EndNano-StartNano)/StepNano) buckets.
+// StartNano and EndNano are aligned to StepNano boundaries before execution (matching Tempo
+// IntervalMapperQueryRange semantics). The actual bucket count is
+// ceil((alignedEnd-alignedStart)/StepNano), which may exceed ceil((EndNano-StartNano)/StepNano)
+// when the inputs are not already step-aligned.
 // COUNT/RATE: missing buckets are 0. Other functions: missing buckets are NaN.
 func ExecuteMetricsTraceQL(r *Reader, query string, opts TraceMetricOptions) (result *TraceMetricsResult, err error) {
 	defer func() {
@@ -932,7 +979,40 @@ func ExecuteMetricsTraceQL(r *Reader, query string, opts TraceMetricOptions) (re
 		stepNano = 60 * 1_000_000_000 // default: 1 minute
 	}
 
-	prog, spec, compileErr := vm.CompileTraceQLMetrics(query, opts.StartNano, opts.EndNano)
+	if opts.StartNano > opts.EndNano {
+		return nil, fmt.Errorf("ExecuteMetricsTraceQL: StartNano (%d) must not exceed EndNano (%d)",
+			opts.StartNano, opts.EndNano)
+	}
+
+	// Align start/end to step boundaries — matches Tempo IntervalMapperQueryRange semantics.
+	// alignedStart = start rounded down to nearest step (floor division).
+	// alignedEnd   = end rounded up to nearest step (ceiling division).
+	// Use explicit floor/ceil to handle negative timestamps correctly: Go's % keeps the sign
+	// of the dividend, so for negative values plain modulo rounds toward zero, not toward -∞.
+	startMod := opts.StartNano % stepNano
+	if startMod < 0 {
+		startMod += stepNano
+	}
+	if opts.StartNano < math.MinInt64+startMod {
+		return nil, fmt.Errorf("ExecuteMetricsTraceQL: StartNano (%d) too close to int64 min for step alignment",
+			opts.StartNano)
+	}
+	alignedStart := opts.StartNano - startMod
+	endMod := opts.EndNano % stepNano
+	if endMod < 0 {
+		endMod += stepNano
+	}
+	alignedEnd := opts.EndNano
+	if endMod != 0 {
+		bump := stepNano - endMod
+		if opts.EndNano > math.MaxInt64-bump {
+			return nil, fmt.Errorf("ExecuteMetricsTraceQL: EndNano (%d) too close to int64 max for step alignment",
+				opts.EndNano)
+		}
+		alignedEnd = opts.EndNano + bump
+	}
+
+	prog, spec, compileErr := vm.CompileTraceQLMetrics(query, alignedStart, alignedEnd)
 	if compileErr != nil {
 		return nil, fmt.Errorf("compile TraceQL metrics query: %w", compileErr)
 	}
@@ -981,6 +1061,7 @@ func streamLogProgram(r *Reader, program *vm.Program, opts LogQueryOptions, fn s
 	for _, row := range rows {
 		var fields SpanFieldsProvider
 		var traceIDHex, spanIDHex string
+		var rawAdapter SpanFieldsProvider // tracked for pool release
 		if row.IntrinsicFields != nil {
 			fields = row.IntrinsicFields
 			if v, ok := fields.GetField("trace:id"); ok {
@@ -990,13 +1071,18 @@ func streamLogProgram(r *Reader, program *vm.Program, opts LogQueryOptions, fn s
 				spanIDHex = hexEncodeField(v)
 			}
 		} else {
-			fields = modules_blockio.NewSpanFieldsAdapter(row.Block, row.RowIdx)
+			rawAdapter = modules_blockio.NewSpanFieldsAdapter(row.Block, row.RowIdx)
+			fields = rawAdapter
 			traceIDHex, spanIDHex = extractIDs(row.Block, row.RowIdx)
 		}
 		match := &SpanMatch{Fields: fields, TraceID: traceIDHex, SpanID: spanIDHex}
 		if !fn(match, true) {
+			// NOTE-ALLOC-4: release adapter back to pool after callback returns.
+			modules_blockio.ReleaseSpanFieldsAdapter(rawAdapter)
 			break
 		}
+		// NOTE-ALLOC-4: release adapter back to pool after callback returns.
+		modules_blockio.ReleaseSpanFieldsAdapter(rawAdapter)
 	}
 	fn(nil, false)
 	return nil
@@ -1010,12 +1096,12 @@ func extractIDs(block *modules_reader.Block, rowIdx int) (traceID, spanID string
 	}
 	if col := block.GetColumn("trace:id"); col != nil {
 		if v, ok := col.BytesValue(rowIdx); ok {
-			traceID = fmt.Sprintf("%x", v)
+			traceID = hex.EncodeToString(v)
 		}
 	}
 	if col := block.GetColumn("span:id"); col != nil {
 		if v, ok := col.BytesValue(rowIdx); ok {
-			spanID = fmt.Sprintf("%x", v)
+			spanID = hex.EncodeToString(v)
 		}
 	}
 	return traceID, spanID

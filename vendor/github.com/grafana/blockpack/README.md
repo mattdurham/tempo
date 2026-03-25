@@ -1,6 +1,8 @@
 # Blockpack
 
-High-performance columnar storage format for OpenTelemetry trace data, achieving 10-50x compression ratios with fast TraceQL query performance.
+**Blockpack** is a columnar storage format purpose-built for OpenTelemetry trace data. It achieves **10–50× compression** over raw OTLP and answers TraceQL queries with a fraction of the I/O of general-purpose columnar formats like Parquet — by indexing every column automatically and clustering spans by service, time, and attribute similarity before they are written.
+
+> Built for object storage. Designed for Tempo and Grafana.
 
 ## Wiki
 
@@ -15,6 +17,24 @@ High-performance columnar storage format for OpenTelemetry trace data, achieving
 | [HyperLogLog](HLL.md) | Cardinality estimation for block scoring |
 | [Bloom Filters](Bloom-Filter.md) | BinaryFuse8 block and file-level membership tests |
 | [Intrinsic Columns](Intrinsic-Columns.md) | File-level core span attributes |
+
+## Primary Goals
+
+Blockpack was designed around two core principles:
+
+### 1. Index every column via KLL
+
+Every numeric column — duration, timestamp, status code, latency, or any custom attribute — is automatically indexed using a [KLL quantile sketch](https://arxiv.org/abs/1603.05346). This means any range predicate (`duration > 5ms`, `latency < 100ms`) can be evaluated against the index to prune blocks before any I/O is issued. There is no need to declare which columns should be indexed at write time; the system indexes everything.
+
+### 2. Tight compaction through structured grouping
+
+Spans are clustered before being assigned to blocks using a three-level sort key:
+
+1. **`service.name`** — keeps spans from the same service together, maximising dictionary compression on resource attributes
+2. **`timestamp`** — ensures temporal locality within a service, making time-range pruning highly effective
+3. **Jaccard (MinHash) signature** — groups spans with similar attribute sets using a 32-byte MinHash fingerprint derived from their key/value pairs. Spans that share the same attributes (same HTTP route, same error code, same environment) land in the same block, dramatically improving columnar compression ratios
+
+This combination means blocks are internally homogeneous: similar spans grouped by service and attribute similarity, sorted by time. The result is the 10–50× compression ratio over raw OTLP and highly effective block-level pruning even for arbitrary attribute queries.
 
 ## Overview
 

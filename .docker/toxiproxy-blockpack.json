@@ -11,7 +11,7 @@
         "stream": "downstream",
         "toxicity": 1.0,
         "attributes": {
-          "latency": 20,
+          "latency": 36,
           "jitter": 0
         }
       }

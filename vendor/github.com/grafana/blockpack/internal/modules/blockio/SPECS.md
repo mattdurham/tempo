@@ -1057,6 +1057,36 @@ section (the metadata parser is pos-based and does not assert pos == len(data) a
 New readers that open old files receive (nil, 0, nil) from parseTSIndex and degrade
 gracefully to metadata-scan mode in BlocksInTimeRange.
 
+## SPEC-POOL-1
+**SpanFieldsAdapter pool ownership contract** — `NewSpanFieldsAdapter` and `ReleaseSpanFieldsAdapter`
+implement a `sync.Pool`-backed adapter lifecycle for `modulesSpanFieldsAdapter`. The following
+rules govern correct use:
+
+1. **Acquire:** `NewSpanFieldsAdapter(block, rowIdx)` returns a pooled adapter bound to the given
+   block and row. The caller owns the adapter from this point until `ReleaseSpanFieldsAdapter` is
+   called.
+
+2. **Release timing:** `ReleaseSpanFieldsAdapter` must be called after the adapter's last use —
+   after `Clone()` returns (which materializes all fields out of the adapter) or after the span
+   callback returns without cloning. It must NOT be called while the adapter's fields are still
+   being read (e.g., not inside the iteration callback, not before `Clone()` returns).
+
+3. **Post-Clone safety:** Once `SpanMatch.Clone()` has been called, the returned `SpanMatch`
+   holds a `materializedSpanFields` (not the adapter), so releasing the adapter is safe.
+
+4. **Nil / non-adapter safety:** `ReleaseSpanFieldsAdapter` is a no-op if the argument is nil or
+   does not implement `*modulesSpanFieldsAdapter` — safe to call on any `SpanFieldsProvider`.
+
+5. **Block pointer release:** `putSpanFieldsAdapter` zeroes `a.block` and `a.rowIdx` before
+   returning the adapter to the pool, preventing the pool from retaining live Block references.
+
+Back-ref: `internal/modules/blockio/span_fields.go:NewSpanFieldsAdapter`,
+          `internal/modules/blockio/span_fields.go:ReleaseSpanFieldsAdapter`,
+          `api.go:streamFilterProgram`, `api.go:streamLogProgram`,
+          `reader.go:GetTraceByID`
+
+---
+
 ## SPEC-FBLM-1
 **FileBloom section** — optional trailing section in the metadata blob, written after the sketch index.
 Stores a BinaryFuse8 filter for `resource.service.name` values, enabling O(1) file-level rejection

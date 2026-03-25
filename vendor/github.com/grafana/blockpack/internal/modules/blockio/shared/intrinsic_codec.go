@@ -409,8 +409,23 @@ func decodePagedColumnBlob(blob []byte) (*IntrinsicColumn, error) {
 	blockW := int(toc.BlockIdxWidth)
 	rowW := int(toc.RowIdxWidth)
 
-	// Decode each page and merge into combined IntrinsicColumn.
+	// Pre-allocate merged output from page TOC totals — eliminates repeated
+	// append reallocations as pages are merged one by one.
+	var totalRows int
+	for _, pm := range toc.Pages {
+		totalRows += int(pm.RowCount)
+	}
 	merged := &IntrinsicColumn{Type: toc.ColType, Format: toc.Format}
+	if toc.Format == IntrinsicFormatFlat {
+		merged.Uint64Values = make([]uint64, 0, totalRows)
+		merged.BytesValues = make([][]byte, 0, totalRows)
+		merged.BlockRefs = make([]BlockRef, 0, totalRows)
+	}
+
+	// For dict columns, maintain the value→index map across page merges so we
+	// don't rebuild it from scratch on each call (O(N²) → O(N) total).
+	var dictIdx map[string]int
+
 	for i, pm := range toc.Pages {
 		pageStart := pos + int(pm.Offset)
 		pageEnd := pageStart + int(pm.Length)
@@ -434,45 +449,32 @@ func decodePagedColumnBlob(blob []byte) (*IntrinsicColumn, error) {
 			return nil, fmt.Errorf("decodePagedColumnBlob: page %d: %w", i, err)
 		}
 
-		mergeIntrinsicColumns(merged, page)
-	}
-	return merged, nil
-}
+		// Flat merge: simple appends into pre-allocated slices.
+		merged.Uint64Values = append(merged.Uint64Values, page.Uint64Values...)
+		merged.BytesValues = append(merged.BytesValues, page.BytesValues...)
+		merged.BlockRefs = append(merged.BlockRefs, page.BlockRefs...)
+		merged.Count += page.Count
 
-// mergeIntrinsicColumns appends all data from src into dst in-place.
-func mergeIntrinsicColumns(dst, src *IntrinsicColumn) {
-	dst.Uint64Values = append(dst.Uint64Values, src.Uint64Values...)
-	dst.BytesValues = append(dst.BytesValues, src.BytesValues...)
-	dst.BlockRefs = append(dst.BlockRefs, src.BlockRefs...)
-	dst.Count += src.Count
-
-	if len(src.DictEntries) > 0 {
-		// Merge dict entries: if value already exists in dst, append refs; otherwise add new entry.
-		// Build a lookup map keyed by value string (or int64 as decimal string).
-		if dst.DictEntries == nil {
-			dst.DictEntries = make([]IntrinsicDictEntry, 0, len(src.DictEntries))
-		}
-		idx := make(map[string]int, len(dst.DictEntries))
-		for i, e := range dst.DictEntries {
-			key := e.Value
-			if key == "" {
-				key = "\x00" + string(binary.LittleEndian.AppendUint64(nil, uint64(e.Int64Val))) //nolint:gosec
+		// Dict merge: use persistent idx map to avoid O(N²) rebuild.
+		if len(page.DictEntries) > 0 {
+			if dictIdx == nil {
+				dictIdx = make(map[string]int, len(page.DictEntries)*len(toc.Pages))
 			}
-			idx[key] = i
-		}
-		for _, e := range src.DictEntries {
-			key := e.Value
-			if key == "" {
-				key = "\x00" + string(binary.LittleEndian.AppendUint64(nil, uint64(e.Int64Val))) //nolint:gosec
-			}
-			if i, ok := idx[key]; ok {
-				dst.DictEntries[i].BlockRefs = append(dst.DictEntries[i].BlockRefs, e.BlockRefs...)
-			} else {
-				idx[key] = len(dst.DictEntries)
-				dst.DictEntries = append(dst.DictEntries, e)
+			for _, e := range page.DictEntries {
+				key := e.Value
+				if key == "" {
+					key = "\x00" + string(binary.LittleEndian.AppendUint64(nil, uint64(e.Int64Val))) //nolint:gosec
+				}
+				if j, ok := dictIdx[key]; ok {
+					merged.DictEntries[j].BlockRefs = append(merged.DictEntries[j].BlockRefs, e.BlockRefs...)
+				} else {
+					dictIdx[key] = len(merged.DictEntries)
+					merged.DictEntries = append(merged.DictEntries, e)
+				}
 			}
 		}
 	}
+	return merged, nil
 }
 
 // DecodeIntrinsicColumnBlob decompresses and decodes a column data blob into an IntrinsicColumn.

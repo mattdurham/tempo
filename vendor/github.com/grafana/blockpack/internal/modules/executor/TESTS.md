@@ -1012,12 +1012,17 @@ Results are in descending timestamp order.
 ## EX-INT-09: TestCollect_PureIntrinsicNoSort_RegressionGuard
 
 **Scenario:** Pure intrinsic query with no sort still returns correct results after gate
-change from `ProgramIsIntrinsicOnly` to `hasSomeIntrinsicPredicates`.
+change from `ProgramIsIntrinsicOnly` to `hasSomeIntrinsicPredicates`. Also verifies
+adaptive dispatch: equality predicates populate `MatchedRow.Block` (forEachBlockInGroups),
+range predicates populate `MatchedRow.IntrinsicFields` (lookupIntrinsicFields).
 
 **Setup:** 10 spans: 5 with `svc="svc-a"`, 5 with `svc="svc-b"`.
-Query: `{ resource.service.name = "svc-a" }`. `CollectOptions{Limit: 5}`.
+Query: `{ resource.service.name = "svc-a" }` (equality). `CollectOptions{Limit: 5}`.
 
-**Assertions:** `len(results) == 5`. All results have `resource.service.name == "svc-a"`.
+**Assertions:**
+- `len(results) == 5`
+- For each row: `row.Block != nil` and `row.IntrinsicFields == nil` (equality → Block path)
+- `row.Block.GetColumn("resource.service.name")` is present and value is `"svc-a"`
 
 ---
 
@@ -1150,6 +1155,108 @@ CollectOptions{Limit: 2, TimestampColumn: "span:start", Direction: Backward, OnS
 - rows[0] span:start > rows[1] span:start (descending order)
 
 
+
+---
+
+## EP-01: TestExecutionPath_RangePredicate_IntrinsicFields
+
+**Scenario:** Range predicates on intrinsic columns (duration>X) route to "intrinsic-plain"
+and populate `MatchedRow.IntrinsicFields` via `lookupIntrinsicFields` (zero block decode).
+Regression guard for adaptive `collectIntrinsicPlain` dispatch (hasRangePredicate=true path).
+
+**Setup:** 5 spans with varying duration (2ms, 50ms, 200ms, 300ms, 2ms), status, kind,
+and service name. `CollectOptions{Limit: 10000, OnStats: capture}`.
+
+**Cases:**
+- `{ duration > 100ms }` → 2 results (200ms, 300ms spans)
+- `{ duration > 10ms }` → 3 results (50ms, 200ms, 300ms spans)
+
+**Assertions per case:**
+- `stats.ExecutionPath == "intrinsic-plain"`
+- `stats.FetchedBlocks == 0`
+- Each row: `row.IntrinsicFields != nil`, `row.Block == nil`
+
+---
+
+## EP-02: TestExecutionPath_EqualityPredicate_BlockPopulated
+
+**Scenario:** Equality predicates on intrinsic columns (status=error, kind=server, svc=X)
+route to "intrinsic-plain" and populate `MatchedRow.Block` via `forEachBlockInGroups`.
+Regression guard for adaptive `collectIntrinsicPlain` dispatch (hasRangePredicate=false path).
+
+**Setup:** Same 5-span dataset as EP-01. `CollectOptions{Limit: 10000, OnStats: capture}`.
+
+**Cases:**
+- `{ status = error }` → 2 results
+- `{ kind = server }` → 3 results
+- `{ resource.service.name = "svc-a" }` → 2 results
+- `{ resource.service.name = "svc-b" }` → 2 results
+
+**Assertions per case:**
+- `stats.ExecutionPath == "intrinsic-plain"`
+- Each row: `row.Block != nil`, `row.IntrinsicFields == nil`
+
+---
+
+## EP-03: TestExecutionPath_RangeAndEquality_IntrinsicFields
+
+**Scenario:** Combined range+equality intrinsic query uses the range (IntrinsicFields) path.
+When ANY predicate is a range, hasRangePredicate=true drives the whole group to
+`lookupIntrinsicFields`, including the equality parts.
+
+**Setup:** Same 5-span dataset. `CollectOptions{Limit: 10000, OnStats: capture}`.
+Query: `{ duration > 100ms && status = error }`.
+
+**Assertions:**
+- `len(results) == 1` (only span with 300ms duration AND error status)
+- `stats.ExecutionPath == "intrinsic-plain"`
+- Each row: `row.IntrinsicFields != nil`, `row.Block == nil`
+
+---
+
+## EP-04: TestExecutionPath_UserAttribute_UsesBlockScan
+
+**Scenario:** User attribute predicate (span.http.method) bypasses intrinsic fast path
+entirely — no intrinsic predicate → hasSomeIntrinsicPredicates=false → block-plain path.
+
+**Setup:** Same 5-span dataset; one span has `span.http.method="GET"`.
+`CollectOptions{Limit: 10000, OnStats: capture}`.
+Query: `{ span.http.method = "GET" }`.
+
+**Assertions:**
+- `len(results) == 1`
+- `stats.ExecutionPath == "block-plain"`
+- `stats.FetchedBlocks > 0`
+
+---
+
+## EP-05: TestExecutionPath_Correctness
+
+**Scenario:** Result count correctness across all query types — range, equality, OR, AND,
+user attribute. Guards against path optimizations silently changing observable results.
+
+**Setup:** Same 5-span dataset. Table-driven. `CollectOptions{Limit: 10000}`.
+
+**Cases:**
+| Query | Expected count |
+|---|---|
+| `{ duration > 100ms }` | 2 |
+| `{ duration > 10ms }` | 3 |
+| `{ duration > 1s }` | 0 |
+| `{ status = error }` | 2 |
+| `{ kind = server }` | 3 |
+| `{ kind = client }` | 2 |
+| `{ resource.service.name = "svc-a" }` | 2 |
+| `{ resource.service.name = "svc-b" }` | 2 |
+| `{ span.http.method = "GET" }` | 1 |
+| `{ duration > 100ms && status = error }` | 1 |
+| `{ status = error && kind = server }` | 0 |
+| `{ status = error \|\| kind = server }` | 5 |
+| `{ resource.service.name = "svc-a" && status = error }` | 1 |
+
+**Assertions:** `len(results) == expected` for every case; no errors.
+
+---
 
 **Scenario:** `HasLive` returns true when the key is in the overlay.
 
