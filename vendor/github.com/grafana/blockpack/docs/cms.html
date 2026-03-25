@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Count-Min Sketch — Blockpack</title>
+  <link rel="stylesheet" href="/assets/css/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <a href="/" class="topbar-brand">Blockpack Docs</a>
+    <a href="https://github.com/grafana/blockpack" class="topbar-github">GitHub →</a>
+  </header>
+  <div class="layout">
+    <nav class="sidebar">
+  <div class="sidebar-brand">BLOCKPACK</div>
+  <div class="section-label">Overview</div>
+  <a href="/">Home</a>
+  <a href="/file-format">File Format</a>
+  <div class="section-label">Query Execution</div>
+  <a href="/execution-path">Execution Path</a>
+  <a href="/write-path">Write Path</a>
+  <div class="section-label">Indexes</div>
+  <a href="/kll">KLL Sketches</a>
+  <a href="/cms" class="active">Count-Min Sketch</a>
+  <a href="/topk">TopK</a>
+  <a href="/hll">HyperLogLog</a>
+  <a href="/bloom-filter">Bloom Filters</a>
+  <a href="/intrinsic-columns">Intrinsic Columns</a>
+  <div class="section-label">Blocks</div>
+  <a href="/block-scoring">Block Scoring</a>
+  <a href="/block-format">Block Format</a>
+  <div class="section-label">Performance</div>
+  <a href="/benchmarks/">Benchmarks</a>
+  <a href="/production-results">Production Results</a>
+</nav>
+    <main class="content">
+<h1>Count-Min Sketch (CMS)</h1>
+<div class="video-wrap">
+  <video autoplay loop muted playsinline controls>
+    <source src="/videos/cms.mp4" type="video/mp4">
+  </video>
+</div>
+
+<p>The Count-Min Sketch is a probabilistic frequency counter that estimates how often each value appears in a stream, using a fixed-size 2D grid of counters. Blockpack stores one CMS per column per block and uses it to catch bloom filter false positives: a zero CMS estimate means the value is <strong>definitely absent</strong> from that block.</p>
+<h2>Source</h2>
+<table>
+<thead>
+<tr><th>File</th><th>Purpose</th></tr>
+</thead>
+<tbody>
+<tr><td><a href="https://github.com/grafana/blockpack/blob/main/internal/modules/sketch/cms.go"><code>internal/modules/sketch/cms.go</code></a></td><td>CMS implementation</td></tr>
+<tr><td><a href="https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/writer/sketch<em>index.go"><code>internal/modules/blockio/writer/sketch&lt;/em&gt;index.go</code></a></td><td>Where CMS is built per block</td></tr>
+<tr><td><a href="https://github.com/grafana/blockpack/blob/main/internal/modules/queryplanner/scoring.go"><code>internal/modules/queryplanner/scoring.go</code></a></td><td><code>pruneByCMSAll</code>, <code>pruneByCMSPred</code></td></tr>
+</tbody>
+</table>
+<p><strong>External references:</strong></p>
+<ul>
+<li><a href="https://dimacs.rutgers.edu/~graham/pubs/papers/cm-full.pdf">Original paper (Cormode & Muthukrishnan, 2005)</a></li>
+<li><a href="https://en.wikipedia.org/wiki/Count%E2%80%93min_sketch">Wikipedia: Count-min sketch</a></li>
+</ul>
+<hr>
+<h2>What It Is</h2>
+<p>A Count-Min Sketch answers: "approximately how many times did value X appear in the stream?" It is a 2D array of <code>depth × width</code> integer counters, where each counter is shared across many values (by design). The trade-off: estimates are always ≥ the true count (never undercounts), but may overcount when hash collisions occur.</p>
+<p><strong>Key property:</strong> <code>Estimate(X) == 0</code> if and only if X was never added. This no-false-negatives-for-zero property is what blockpack exploits for pruning.</p>
+<hr>
+<h2>Algorithm</h2>
+<p><strong>Structure:</strong> <code>rows[depth][width]</code> — a 2D array of counters. Blockpack uses depth=4, width=64, with <code>uint16</code> saturating counters (512 bytes total).</p>
+<p><strong>Add(value, count):</strong></p>
+<ol>
+<li>Compute a base hash <code>h = FNV-32a(value)</code>.</li>
+<li>For each row <code>i</code> in <code>[0, depth)</code>, compute column <code>col = (h XOR (i × 2654435761)) mod 64</code>.</li>
+<li>Increment <code>rows[i][col]</code> by <code>count</code>, saturating at <code>MaxUint16</code>.</li>
+</ol>
+<p><strong>Estimate(value):</strong></p>
+<ol>
+<li>Compute <code>h</code> as above.</li>
+<li>For each row <code>i</code>, read <code>rows[i][col]</code>.</li>
+<li>Return <code>min(rows[0][col&lt;em&gt;0], ..., rows[depth-1][col&lt;/em&gt;{depth-1}])</code>.</li>
+</ol>
+<p>The minimum across rows gives the tightest upper bound, since any individual row may have been inflated by hash collisions with other values. The minimum is less likely to be inflated by multiple independent hash functions all colliding on the same bucket.</p>
+<p><strong>Why saturating counters?</strong> A span block contains at most 2 000 spans. With <code>uint16</code> (max 65 535) and the 1-per-occurrence Add calls, saturation is essentially impossible for a single block.</p>
+<hr>
+<h2>How Blockpack Uses It</h2>
+<p>Every time <code>updateMinMax</code> is called during block construction (once per non-null value in each column), the encoded value key is fed to both the block's HLL and CMS via <code>blockSketchSet.add</code>. The CMS <code>Add(key, 1)</code> increments the counters for that value.</p>
+<p>At <code>Flush()</code>, per-block CMS data is serialized into the sketch index section: 512 bytes per column per block (4 rows × 64 counters × 2 bytes each).</p>
+<p><strong>At query time</strong> (<code>pruneByCMSAll</code> in <code>internal/modules/queryplanner/scoring.go</code>):</p>
+<p>After the BinaryFuse8 bloom filter pass (which uses a ~0.39% false positive rate), the CMS provides a secondary check. For each candidate block and each query value, if <code>Estimate(value) == 0</code>, the value is definitely absent from that column in that block — the block can be pruned. This catches bloom false positives without ever reading block data.</p>
+<p><strong>Scoring:</strong> The CMS also contributes to block scoring: <code>score = freq / max(cardinality, 1)</code>, where <code>freq</code> comes from the CMS estimate and <code>cardinality</code> from the HLL. Higher selectivity (high frequency, low cardinality) means the block is more likely to contain matching spans and should be prioritized for early query termination.</p>
+<p><strong>Pipeline:</strong> Fuse filter → CMS zero-prune → score → prioritized block reads.</p>
+<hr>
+<h2>Pros and Cons</h2>
+<table>
+<thead>
+<tr><th>Aspect</th><th>Detail</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Fixed size</strong></td><td>Always 512 bytes per column per block regardless of cardinality</td></tr>
+<tr><td><strong>No false negatives for zero</strong></td><td><code>Estimate(X) == 0</code> → X is definitely absent; safe to prune</td></tr>
+<tr><td><strong>Fast</strong></td><td>O(depth) = O(4) hash lookups per query</td></tr>
+<tr><td><strong>Overcounts</strong></td><td>Estimates are upper bounds; may be inflated by collisions</td></tr>
+<tr><td><strong>No deletion</strong></td><td>Counters can only increase; removing values is not supported</td></tr>
+<tr><td><strong>Approximate</strong></td><td>Cannot give exact counts; only useful for "present or not" and rough frequency</td></tr>
+<tr><td><strong>Width sensitivity</strong></td><td>With width=64, collision probability ≈ 1.6% per row; four independent rows reduce false inflation</td></tr>
+</tbody>
+</table>
+<hr>
+<h2>Key Property for Blockpack</h2>
+<p>The <strong>zero-estimate guarantee</strong> is the critical property: because counters only increase (never decrease), if <code>Estimate(X) == 0</code> across all four rows, then X's hash never collided with any added value in any row. This means X was definitely never added — no false negatives for zero estimates.</p>
+<p>This makes CMS zero-pruning <strong>safe</strong>: it never incorrectly prunes a block that should be included, while providing a practical speedup by catching bloom filter false positives.</p>
+<hr>
+<h2>Size</h2>
+<p><strong>Per column per block:</strong> 512 bytes fixed.</p>
+<ul>
+<li>4 rows × 64 counters × 2 bytes per <code>uint16</code> counter = 512 bytes exactly.</li>
+</ul>
+<p><strong>Typical file overhead:</strong> With ~50 blocks and ~10 columns each, total CMS data ≈ 50 × 10 × 512 bytes = 256 KB. This is stored in the sketch index section of the metadata, which is snappy-compressed.</p>
+<hr>
+<h2>Papers and Links</h2>
+<ul>
+<li>Original paper: <a href="https://dimacs.rutgers.edu/~graham/pubs/papers/cm-full.pdf">https://dimacs.rutgers.edu/~graham/pubs/papers/cm-full.pdf</a> — Cormode & Muthukrishnan (2005)</li>
+<li>Wikipedia: <a href="https://en.wikipedia.org/wiki/Count%E2%80%93min<em>sketch">https://en.wikipedia.org/wiki/Count%E2%80%93min</em>sketch</a></li>
+<li>Blockpack implementation: <a href="https://github.com/grafana/blockpack/blob/main/internal/modules/sketch/cms.go"><code>internal/modules/sketch/cms.go</code></a></li>
+<li>Query-time usage: <a href="https://github.com/grafana/blockpack/blob/main/internal/modules/queryplanner/scoring.go"><code>internal/modules/queryplanner/scoring.go</code></a></li>
+</ul>
+<hr>
+<p>Back to <a href="/write-path">Write-Path</a></p>
+
+    </main>
+  </div>
+</body>
+</html>

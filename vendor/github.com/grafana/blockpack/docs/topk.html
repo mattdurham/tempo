@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TopK — Blockpack</title>
+  <link rel="stylesheet" href="/assets/css/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <a href="/" class="topbar-brand">Blockpack Docs</a>
+    <a href="https://github.com/grafana/blockpack" class="topbar-github">GitHub →</a>
+  </header>
+  <div class="layout">
+    <nav class="sidebar">
+  <div class="sidebar-brand">BLOCKPACK</div>
+  <div class="section-label">Overview</div>
+  <a href="/">Home</a>
+  <a href="/file-format">File Format</a>
+  <div class="section-label">Query Execution</div>
+  <a href="/execution-path">Execution Path</a>
+  <a href="/write-path">Write Path</a>
+  <div class="section-label">Indexes</div>
+  <a href="/kll">KLL Sketches</a>
+  <a href="/cms">Count-Min Sketch</a>
+  <a href="/topk" class="active">TopK</a>
+  <a href="/hll">HyperLogLog</a>
+  <a href="/bloom-filter">Bloom Filters</a>
+  <a href="/intrinsic-columns">Intrinsic Columns</a>
+  <div class="section-label">Blocks</div>
+  <a href="/block-scoring">Block Scoring</a>
+  <a href="/block-format">Block Format</a>
+  <div class="section-label">Performance</div>
+  <a href="/benchmarks/">Benchmarks</a>
+  <a href="/production-results">Production Results</a>
+</nav>
+    <main class="content">
+<h1>TopK: Approximate Top-K Frequency Tracker</h1>
+<div class="video-wrap">
+  <video autoplay loop muted playsinline controls>
+    <source src="/videos/topk.mp4" type="video/mp4">
+  </video>
+</div>
+
+<p>TopK tracks the most frequently occurring values in a column within a single block. Blockpack stores the top 20 values per column per block and uses them at query time for block scoring — blocks that contain a high-frequency match for the query predicate are prioritized for reading, enabling faster early query termination.</p>
+<h2>Source</h2>
+<table>
+<thead>
+<tr><th>File</th><th>Purpose</th></tr>
+</thead>
+<tbody>
+<tr><td><a href="https://github.com/grafana/blockpack/blob/main/internal/modules/sketch/topk.go"><code>internal/modules/sketch/topk.go</code></a></td><td>TopK implementation</td></tr>
+<tr><td><a href="https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/writer/sketch<em>index.go"><code>internal/modules/blockio/writer/sketch&lt;/em&gt;index.go</code></a></td><td>Where TopK is built per block</td></tr>
+<tr><td><a href="https://github.com/grafana/blockpack/blob/main/internal/modules/queryplanner/scoring.go"><code>internal/modules/queryplanner/scoring.go</code></a></td><td>Where TopK feeds scoring</td></tr>
+</tbody>
+</table>
+<hr>
+<h2>What It Is</h2>
+<p>A Top-K data structure maintains a bounded set of the K most frequent items seen in a stream. The exact answer requires a full frequency map of all distinct values; approximate solutions trade some accuracy for bounded memory.</p>
+<p>Blockpack's implementation uses an <strong>exact frequency map</strong> (not approximate), which is safe because a single block contains at most 2 000 spans. The map is bounded in practice by block size, so memory is not a concern.</p>
+<hr>
+<h2>Algorithm</h2>
+<p><strong>Structure:</strong> <code>counts map[string]uint32</code> — a simple exact frequency map.</p>
+<p><strong>Add(key):</strong> Increment <code>counts[key]</code> by 1. Keys longer than 100 bytes are truncated before insertion.</p>
+<p><strong>Entries():</strong> Drain the map into a <code>[]TopKEntry{Key, Count}</code> slice, sort descending by count (ties broken alphabetically), and return at most 20 entries.</p>
+<p><strong>Wire format</strong> (<code>MarshalBinary</code>):</p>
+<pre><code>topk_count[1] + per_entry {
+    key_len[2 LE] + key[N bytes] + count[4 LE uint32]
+}
+</code></pre>
+<p>The stored count is truncated to <code>uint16</code> for compactness in the sketch index wire format.</p>
+<p>At query time, stored entries are compared using <code>sketch.HashForFuse(key)</code> fingerprints — the exact key bytes are not preserved in the sketch index (only the hash fingerprint and count), so comparison is probabilistic with a negligible collision rate.</p>
+<hr>
+<h2>How Blockpack Uses It</h2>
+<p>During block construction, every call to <code>updateMinMax</code> (once per non-null value per column) feeds the encoded value key into <code>blockSketchSet.add</code>, which calls <code>topk.Add(key)</code>.</p>
+<p>At <code>Flush()</code>, <code>Entries()</code> is called and the top-20 results are serialized into the sketch index section, stored column-major across all blocks.</p>
+<p><strong>At query time,</strong> the TopK entries are read from the sketch index and used in <code>scoreBlocks</code> (see <code>internal/modules/queryplanner/scoring.go</code>). The scoring formula is:</p>
+<pre><code>score = freq / max(cardinality, 1)
+</code></pre>
+<p>where:</p>
+<ul>
+<li><code>freq</code> = CMS estimate of the queried value's frequency in this block (or TopK exact count if the value appears in the top 20)</li>
+<li><code>cardinality</code> = HLL estimate of distinct values in this column in this block</li>
+</ul>
+<p>A higher score means the block has a high concentration of the queried value relative to its overall diversity — it is more selective and likely to produce matches. Blocks are sorted by score so that the most relevant blocks are read first, enabling early query termination when a <code>limit</code> is specified.</p>
+<hr>
+<h2>Pros and Cons</h2>
+<table>
+<thead>
+<tr><th>Aspect</th><th>Detail</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Simple</strong></td><td>Exact frequency map per block; no approximation needed given block size bounds</td></tr>
+<tr><td><strong>Fast scoring</strong></td><td>O(1) lookup per query value against the top-20 set</td></tr>
+<tr><td><strong>Selective</strong></td><td>High-selectivity blocks get higher scores → fewer total block reads for limit queries</td></tr>
+<tr><td><strong>Bounded coverage</strong></td><td>Only the top 20 values are tracked; long-tail values fall back to CMS estimates</td></tr>
+<tr><td><strong>Block-scoped</strong></td><td>Per-block, not file-level; a common value that is rare in one block is scored low for that block</td></tr>
+<tr><td><strong>Truncation</strong></td><td>Keys > 100 bytes are truncated; very long attribute values may produce incorrect matches</td></tr>
+</tbody>
+</table>
+<hr>
+<h2>Size</h2>
+<p><strong>Per column per block:</strong></p>
+<ul>
+<li>Header: 1 byte (entry count)</li>
+<li>Per entry: 2 bytes (key length) + key bytes (≤ 100) + 4 bytes (count)</li>
+<li>Maximum: 1 + 20 × (2 + 100 + 4) = 1 + 20 × 106 = 2 121 bytes</li>
+<li>Typical (short keys, ~10 byte average): 1 + 20 × (2 + 10 + 4) ≈ 321 bytes</li>
+</ul>
+<p><strong>Typical file overhead:</strong> With ~50 blocks and ~10 columns, total TopK data ≈ 50 × 10 × 321 bytes ≈ 161 KB (before snappy compression in the metadata section).</p>
+<hr>
+<h2>Related Reading</h2>
+<ul>
+<li>Space-Saving algorithm (related approximate approach): <a href="https://www.cs.ucsb.edu/research/tech-reports/2005-23">https://www.cs.ucsb.edu/research/tech-reports/2005-23</a></li>
+<li>Blockpack implementation: <a href="https://github.com/grafana/blockpack/blob/main/internal/modules/sketch/topk.go"><code>internal/modules/sketch/topk.go</code></a></li>
+<li>Query-time scoring: <a href="https://github.com/grafana/blockpack/blob/main/internal/modules/queryplanner/scoring.go"><code>internal/modules/queryplanner/scoring.go</code></a></li>
+<li>Block sketch accumulation: <a href="https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/writer/sketch<em>index.go"><code>internal/modules/blockio/writer/sketch&lt;/em&gt;index.go</code></a></li>
+</ul>
+<hr>
+<p>Back to <a href="/write-path">Write-Path</a></p>
+
+    </main>
+  </div>
+</body>
+</html>

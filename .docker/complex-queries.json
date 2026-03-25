@@ -1,0 +1,36 @@
+{
+  "start": 1769662800,
+  "end": 1769835600,
+  "limit": 20,
+  "queries": [
+    {"id": 90, "label": "grpc-client-error-5c", "complexity": "complex-5",
+     "query": "{kind=client && span.rpc.system=\"grpc\" && span.rpc.grpc.status_code!=\"0\" && status=error && duration>5ms}"},
+
+    {"id": 91, "label": "http-server-get-ok-5c", "complexity": "complex-5",
+     "query": "{kind=server && span.http.method=\"GET\" && span.http.status_code=\"200\" && status=ok && duration>1ms}"},
+
+    {"id": 92, "label": "http-post-500-6c", "complexity": "complex-6",
+     "query": "{kind=server && span.http.method=\"POST\" && span.http.status_code=\"500\" && status=error && duration>10ms && resource.k8s.namespace.name!=\"onboarding\"}"},
+
+    {"id": 93, "label": "redis-client-ok-5c", "complexity": "complex-5",
+     "query": "{kind=client && span.db.system=\"redis\" && status!=error && duration>1ms && duration<1s}"},
+
+    {"id": 94, "label": "grpc-server-ok-mimir-7c", "complexity": "complex-7",
+     "query": "{kind=server && span.rpc.system=\"grpc\" && span.rpc.grpc.status_code=\"0\" && status=ok && duration>1ms && duration<500ms && resource.k8s.namespace.name=~\"mimir.*\"}"},
+
+    {"id": 95, "label": "http-404-noncrdb-6c", "complexity": "complex-6",
+     "query": "{kind=server && span.http.method=\"GET\" && span.http.status_code=\"404\" && status=error && duration>1ms && resource.service.name!=\"CockroachDB\"}"},
+
+    {"id": 96, "label": "http-post-error-8c", "complexity": "complex-8",
+     "query": "{kind=server && status=error && span.http.method=\"POST\" && span.http.status_code=\"500\" && duration>10ms && resource.k8s.namespace.name!=\"onboarding\" && span.rpc.system!=\"aws-api\" && resource.service.name!=\"CockroachDB\"}"},
+
+    {"id": 97, "label": "grpc-error-mimir-nonint-4c", "complexity": "complex-nonint-4",
+     "query": "{span.rpc.system=\"grpc\" && span.rpc.grpc.status_code!=\"0\" && resource.k8s.namespace.name=~\"mimir.*\" && resource.service.name!=\"CockroachDB\"}"},
+
+    {"id": 98, "label": "slow-http-error-9c", "complexity": "complex-9",
+     "query": "{kind=server && span.http.method=\"GET\" && span.http.status_code!=\"200\" && status=error && duration>100ms && resource.k8s.namespace.name=~\"mimir.*\" && resource.service.name!=\"CockroachDB\" && span.rpc.system!=\"aws-api\" && span.db.system!=\"redis\"}"},
+
+    {"id": 99, "label": "grpc-error-attrs-only-5c", "complexity": "complex-nonint-5",
+     "query": "{span.rpc.system=\"grpc\" && span.rpc.grpc.status_code!=\"0\" && span.http.method!=\"GET\" && resource.k8s.namespace.name=~\"mimir.*\" && resource.service.name!=\"CockroachDB\"}"}
+  ]
+}

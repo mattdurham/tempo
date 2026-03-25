@@ -4,6 +4,7 @@ package writer
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/binary"
 	"math"
 	"slices"
@@ -187,9 +188,10 @@ func encodeFloat64BoundaryKey(v float64) string {
 	return string(tmp[:])
 }
 
-// findBucketInt64 returns the bucket index for v given the sorted boundaries.
+// findBucket returns the bucket index for v given the sorted boundaries.
 // Uses binary search: O(log n) comparisons instead of O(n).
-func findBucketInt64(v int64, bounds []int64) uint16 {
+// DUP-01: consolidated from findBucketInt64/Uint64/Float64/String — all had identical bodies.
+func findBucket[T cmp.Ordered](v T, bounds []T) uint16 {
 	lo, hi := 1, len(bounds)
 	for lo < hi {
 		mid := int(uint(lo+hi) >> 1)
@@ -206,62 +208,10 @@ func findBucketInt64(v int64, bounds []int64) uint16 {
 	return uint16(idx) //nolint:gosec // safe: idx is in range [0, len(bounds)-2] which fits uint16
 }
 
-// findBucketUint64 returns the bucket index for v given the sorted boundaries.
-// Uses binary search: O(log n) comparisons instead of O(n).
-func findBucketUint64(v uint64, bounds []uint64) uint16 {
-	lo, hi := 1, len(bounds)
-	for lo < hi {
-		mid := int(uint(lo+hi) >> 1)
-		if bounds[mid] <= v {
-			lo = mid + 1
-		} else {
-			hi = mid
-		}
-	}
-	idx := lo - 1
-	if idx >= len(bounds)-1 {
-		return uint16(len(bounds) - 2) //nolint:gosec
-	}
-	return uint16(idx) //nolint:gosec // safe: idx is in range [0, len(bounds)-2] which fits uint16
-}
-
-// findBucketFloat64 returns the bucket index for v given the sorted boundaries.
-// Uses binary search: O(log n) comparisons instead of O(n).
-func findBucketFloat64(v float64, bounds []float64) uint16 {
-	lo, hi := 1, len(bounds)
-	for lo < hi {
-		mid := int(uint(lo+hi) >> 1)
-		if bounds[mid] <= v {
-			lo = mid + 1
-		} else {
-			hi = mid
-		}
-	}
-	idx := lo - 1
-	if idx >= len(bounds)-1 {
-		return uint16(len(bounds) - 2) //nolint:gosec
-	}
-	return uint16(idx) //nolint:gosec // safe: idx is in range [0, len(bounds)-2] which fits uint16
-}
-
-// findBucketString returns the bucket index for v given the sorted string boundaries.
-// Uses binary search: O(log n) comparisons instead of O(n).
-func findBucketString(v string, bounds []string) uint16 {
-	lo, hi := 1, len(bounds)
-	for lo < hi {
-		mid := int(uint(lo+hi) >> 1)
-		if bounds[mid] <= v {
-			lo = mid + 1
-		} else {
-			hi = mid
-		}
-	}
-	idx := lo - 1
-	if idx >= len(bounds)-1 {
-		return uint16(len(bounds) - 2) //nolint:gosec
-	}
-	return uint16(idx) //nolint:gosec // safe: idx is in range [0, len(bounds)-2] which fits uint16
-}
+func findBucketInt64(v int64, bounds []int64) uint16       { return findBucket(v, bounds) }
+func findBucketUint64(v uint64, bounds []uint64) uint16    { return findBucket(v, bounds) }
+func findBucketFloat64(v float64, bounds []float64) uint16 { return findBucket(v, bounds) }
+func findBucketString(v string, bounds []string) uint16    { return findBucket(v, bounds) }
 
 // truncateBoundaryKey returns s truncated to maxLen bytes.
 func truncateBoundaryKey(s string, maxLen int) string {
@@ -416,18 +366,22 @@ func tryApplyExactValues(cd *rangeColumnData) bool {
 		}
 
 	case shared.ColumnTypeRangeUint64:
-		sorted := make([]int64, 0, len(distinct))
+		// BUG-02: sort as uint64 (unsigned order) then reinterpret bits as int64 for wire format.
+		// Sorting as int64 caused values >= 2^63 to appear negative, reversing their order.
+		sortedU := make([]uint64, 0, len(distinct))
 		for k := range distinct {
 			if len(k) >= 8 {
-				v := int64(binary.LittleEndian.Uint64([]byte(k))) //nolint:gosec
-				sorted = append(sorted, v)
+				sortedU = append(sortedU, binary.LittleEndian.Uint64([]byte(k)))
 			}
 		}
-		slices.Sort(sorted)
-		cd.boundaries = sorted
-		if len(sorted) > 0 {
-			cd.bucketMin = sorted[0]
-			cd.bucketMax = sorted[len(sorted)-1]
+		slices.Sort(sortedU)
+		cd.boundaries = make([]int64, len(sortedU))
+		for i, v := range sortedU {
+			cd.boundaries[i] = int64(v) //nolint:gosec // bit-reinterpretation for wire format
+		}
+		if len(sortedU) > 0 {
+			cd.bucketMin = int64(sortedU[0])              //nolint:gosec
+			cd.bucketMax = int64(sortedU[len(sortedU)-1]) //nolint:gosec
 		}
 
 	case shared.ColumnTypeRangeFloat64:

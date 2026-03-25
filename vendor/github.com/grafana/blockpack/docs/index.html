@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Home — Blockpack</title>
+  <link rel="stylesheet" href="/assets/css/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <a href="/" class="topbar-brand">Blockpack Docs</a>
+    <a href="https://github.com/grafana/blockpack" class="topbar-github">GitHub →</a>
+  </header>
+  <div class="layout">
+    <nav class="sidebar">
+  <div class="sidebar-brand">BLOCKPACK</div>
+  <div class="section-label">Overview</div>
+  <a href="/" class="active">Home</a>
+  <a href="/file-format">File Format</a>
+  <div class="section-label">Query Execution</div>
+  <a href="/execution-path">Execution Path</a>
+  <a href="/write-path">Write Path</a>
+  <div class="section-label">Indexes</div>
+  <a href="/kll">KLL Sketches</a>
+  <a href="/cms">Count-Min Sketch</a>
+  <a href="/topk">TopK</a>
+  <a href="/hll">HyperLogLog</a>
+  <a href="/bloom-filter">Bloom Filters</a>
+  <a href="/intrinsic-columns">Intrinsic Columns</a>
+  <div class="section-label">Blocks</div>
+  <a href="/block-scoring">Block Scoring</a>
+  <a href="/block-format">Block Format</a>
+  <div class="section-label">Performance</div>
+  <a href="/benchmarks/">Benchmarks</a>
+  <a href="/production-results">Production Results</a>
+</nav>
+    <main class="content">
+<h1>Blockpack</h1>
+<p><strong>Blockpack</strong> is a columnar storage format purpose-built for OpenTelemetry trace data. It achieves <strong>10–50× compression</strong> over raw OTLP and answers TraceQL queries with a fraction of the I/O of general-purpose columnar formats like Parquet — by indexing every column automatically and clustering spans by service, time, and attribute similarity before they are written.</p>
+<p>> Built for object storage. Designed for Tempo and Grafana.</p>
+<h2>Wiki</h2>
+<table>
+<thead>
+<tr><th>Page</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><a href="/file-format">File Format</a></td><td>Block layout, column encodings, indexes, and I/O design</td></tr>
+<tr><td><a href="/execution-path">Execution Path</a></td><td>How a TraceQL query flows through the pipeline, with animation</td></tr>
+<tr><td><a href="/write-path">Write Path</a></td><td>How spans are ingested, clustered, encoded, and indexed</td></tr>
+<tr><td><a href="/kll">KLL Sketches</a></td><td>Range index: quantile sketch for duration/timestamp pruning</td></tr>
+<tr><td><a href="/cms">Count-Min Sketch</a></td><td>Frequency estimation and zero-estimate block pruning</td></tr>
+<tr><td><a href="/topk">TopK</a></td><td>Top-K frequent values for block scoring</td></tr>
+<tr><td><a href="/hll">HyperLogLog</a></td><td>Cardinality estimation for block scoring</td></tr>
+<tr><td><a href="/bloom-filter">Bloom Filters</a></td><td>BinaryFuse8 block and file-level membership tests</td></tr>
+<tr><td><a href="/intrinsic-columns">Intrinsic Columns</a></td><td>File-level core span attributes</td></tr>
+</tbody>
+</table>
+<h2>Primary Goals</h2>
+<p>Blockpack was designed around two core principles:</p>
+<h3>1. Index every column via KLL</h3>
+<p>Every numeric column — duration, timestamp, status code, latency, or any custom attribute — is automatically indexed using a <a href="https://arxiv.org/abs/1603.05346">KLL quantile sketch</a>. This means any range predicate (<code>duration &gt; 5ms</code>, <code>latency &lt; 100ms</code>) can be evaluated against the index to prune blocks before any I/O is issued. There is no need to declare which columns should be indexed at write time; the system indexes everything.</p>
+<h3>2. Tight compaction through structured grouping</h3>
+<p>Spans are clustered before being assigned to blocks using a three-level sort key:</p>
+<ol>
+<li><strong><code>service.name</code></strong> — keeps spans from the same service together, maximising dictionary compression on resource attributes</li>
+<li><strong><code>timestamp</code></strong> — ensures temporal locality within a service, making time-range pruning highly effective</li>
+<li><strong>Jaccard (MinHash) signature</strong> — groups spans with similar attribute sets using a 32-byte MinHash fingerprint derived from their key/value pairs. Spans that share the same attributes (same HTTP route, same error code, same environment) land in the same block, dramatically improving columnar compression ratios</li>
+</ol>
+<p>This combination means blocks are internally homogeneous: similar spans grouped by service and attribute similarity, sorted by time. The result is the 10–50× compression ratio over raw OTLP and highly effective block-level pruning even for arbitrary attribute queries.</p>
+<h2>Overview</h2>
+<p>Blockpack is a specialized file format designed for storing and querying distributed traces. It combines columnar storage, adaptive compression, and multi-level indexing to provide:</p>
+<ul>
+<li><strong>10-50x compression</strong> compared to raw OTLP traces</li>
+<li><strong>Fast queries</strong> via TraceQL (filter, metrics, and structural queries)</li>
+<li><strong>Efficient trace lookups</strong> with O(log N) performance</li>
+<li><strong>Block-level pruning</strong> using bloom filters and statistics</li>
+<li><strong>Tempo compatibility</strong> for seamless Grafana integration</li>
+</ul>
+<h2>AI Workflow</h2>
+<p>Blockpack uses a SPECS/NOTES/BENCHMARKS/TESTS workflow, when an agent sees this please sync the code and details as appropriate.</p>
+<h2>Features</h2>
+<h3>Storage Efficiency</h3>
+<ul>
+<li><strong>Columnar layout</strong>: Each span attribute stored separately with type-specific encoding</li>
+<li><strong>Block organization</strong>: ~2000 spans per block with independent compression</li>
+<li><strong>Adaptive encoding</strong>: 11 encoding schemes automatically selected per column</li>
+<li><strong>Zstd compression</strong>: Dictionary-based compression achieving 3-5x size reduction</li>
+<li><strong>MinHash clustering</strong>: Spans sorted by service and similarity for optimal block locality</li>
+</ul>
+<h3>Query Performance</h3>
+<ul>
+<li><strong>Multi-level indexing</strong>: Bloom filters, min/max statistics, and dedicated indexes</li>
+<li><strong>Block pruning</strong>: Skip entire blocks using time/trace ranges (10-100x speedup)</li>
+<li><strong>Dedicated indexes</strong>: Global value→block mapping for high-cardinality columns</li>
+<li><strong>Trace index</strong>: Fast trace-by-ID lookups</li>
+<li><strong>Value statistics</strong>: Per-block attribute statistics for advanced pruning</li>
+<li><strong>Coalesced I/O</strong>: Adjacent blocks merged into single reads for object storage</li>
+</ul>
+<h3>Query Languages</h3>
+<ul>
+<li><strong>TraceQL filter</strong>: <code>{ span.http.status_code = 500 &amp;&amp; resource.service.name = &quot;frontend&quot; }</code></li>
+<li><strong>TraceQL metrics</strong>: <code>{ span.http.status_code = 500 } | rate() by (resource.service.name)</code></li>
+<li><strong>Structural TraceQL</strong>: <code>{ .parent } &gt;&gt; { .child }</code> (descendant, child, sibling operators)</li>
+</ul>
+<h2>Quick Start</h2>
+<h3>Writing Traces</h3>
+<p>Create a <code>Writer</code> with <code>NewWriter</code>, add OTLP trace data with <code>AddTracesData</code>, then call <code>Flush</code> to finalize the file.</p>
+<h3>Finding Traces by ID</h3>
+<p>Use <code>NewFileStorage</code> to create a storage backend, then call <code>FindTraceByID</code> with the file path and a hex-encoded trace ID for O(log N) lookup using the trace block index.</p>
+<h3>Tag Discovery (Tempo/Grafana Integration)</h3>
+<p><code>SearchTags</code> returns available attribute names scoped to <code>&quot;span&quot;</code>, <code>&quot;resource&quot;</code>, or all attributes. <code>SearchTagValues</code> returns up to 10,000 distinct values for a given attribute, powering Grafana autocomplete.</p>
+<h3>Compaction</h3>
+<p><code>CompactBlocks</code> merges spans from multiple providers into size-bounded output files, staging them locally before writing to a <code>WritableStorage</code> backend.</p>
+<h3>Format Conversion</h3>
+<p><code>ConvertProtoToBlockpack</code> converts an OTLP protobuf file. <code>ConvertParquetToBlockpack</code> converts a Tempo vparquet5 block directory.</p>
+<h2>Building and Testing</h2>
+<p>Install required tools with <code>make install-tools</code>. Then:</p>
+<ul>
+<li><strong>Build</strong>: <code>make build</code></li>
+<li><strong>Test</strong>: <code>make test</code></li>
+<li><strong>Pre-commit checks</strong> (required before committing): <code>make precommit</code> — runs formatting, linting, nil safety, struct alignment, cyclomatic complexity, tests, and coverage</li>
+<li><strong>Full CI pipeline</strong>: <code>make ci</code></li>
+<li><strong>Auto-fix formatting</strong>: <code>make format-all</code></li>
+</ul>
+<h2>Architecture</h2>
+<h3>File Structure</h3>
+<p>Each blockpack file is a sequence of block payloads followed by a metadata section (block index, dedicated column indexes, trace block index), a fixed header, and a 10-byte footer. See <a href="/doc/blockpack<em>format">doc/BLOCKPACK</em>FORMAT.md</a> for the full specification.</p>
+<h3>Query Execution Pipeline</h3>
+<p>A TraceQL string is parsed into a typed AST (<code>FilterExpression</code>, <code>MetricsQuery</code>, or <code>StructuralQuery</code>), compiled by the VM into a <code>Program</code> with column predicates and extracted block-pruning predicates, then executed by the <code>BlockpackExecutor</code>. The executor prunes blocks by time range, value statistics, bloom filters, and dedicated indexes before reading each selected block in a single I/O operation and evaluating per-span predicates.</p>
+<h3>Key Components</h3>
+<table>
+<thead>
+<tr><th>Package</th><th>Role</th></tr>
+</thead>
+<tbody>
+<tr><td><code>api.go</code></td><td>Minimal public API — thin wrappers only</td></tr>
+<tr><td><code>internal/blockio/writer/</code></td><td>Streaming write path; adaptive encodings; MinHash clustering</td></tr>
+<tr><td><code>internal/blockio/reader/</code></td><td>Columnar read path; block cache; index lookup</td></tr>
+<tr><td><code>internal/blockio/compaction/</code></td><td>Multi-file compaction with size-bounded output</td></tr>
+<tr><td><code>internal/executor/</code></td><td>TraceQL query executor; multi-stage block pruning</td></tr>
+<tr><td><code>internal/vm/</code></td><td>TraceQL compiler; closure-based column predicates; bytecode VM</td></tr>
+<tr><td><code>internal/traceqlparser/</code></td><td>TraceQL parser (filter, metrics, structural queries)</td></tr>
+<tr><td><code>internal/tempoapi/</code></td><td>Tempo-compatible API: FindTraceByID, SearchTags, GetBlockMeta</td></tr>
+<tr><td><code>cmd/mcp-server/</code></td><td>Project MCP server for Claude Code integration</td></tr>
+<tr><td><code>cmd/analyze/</code></td><td>Blockpack file analysis tool (service distribution, column stats)</td></tr>
+</tbody>
+</table>
+<h3>I/O Design</h3>
+<p>Blockpack targets object storage (S3/GCS/Azure) where request latency (50-100ms) dominates cost. Every block is always read in a single I/O operation — no per-column selective reads. Healthy query metrics:</p>
+<table>
+<thead>
+<tr><th>Metric</th><th>Good</th><th>Warning</th><th>Critical</th></tr>
+</thead>
+<tbody>
+<tr><td><code>io_ops</code></td><td><500</td><td>500-1000</td><td>>1000</td></tr>
+<tr><td><code>bytes/io</code></td><td>>100KB</td><td>10-100KB</td><td><10KB</td></tr>
+</tbody>
+</table>
+<h2>Documentation</h2>
+<ul>
+<li><a href="/doc/blockpack_format">Blockpack Format Specification</a> — Complete technical specification</li>
+<li><a href="/doc/benchmark_comparison">Benchmark Comparison</a> — Performance vs Parquet</li>
+<li><a href="/doc/query_planning">Query Planning</a> — Query optimization strategies</li>
+<li><a href="/doc/block_diagram">Block Diagram</a> — Visual representation of file structure</li>
+<li><a href="/doc/grammar">Grammar</a> — Naming conventions and intrinsic rules</li>
+</ul>
+<h2>Quality Standards</h2>
+<p>This project enforces strict quality standards:</p>
+<ul>
+<li><strong>Cyclomatic complexity</strong>: < 40 per function</li>
+<li><strong>Test coverage</strong>: > 70%</li>
+<li><strong>Formatting</strong>: gofumpt (stricter than gofmt)</li>
+<li><strong>Line length</strong>: 120 characters</li>
+<li><strong>Nil safety</strong>: nilaway checks for nil pointer dereferences</li>
+<li><strong>Memory efficiency</strong>: betteralign for struct field alignment</li>
+<li><strong>Linting</strong>: 40+ linters via golangci-lint</li>
+</ul>
+<p>All checks are enforced in CI and must pass locally via <code>make precommit</code> before committing.</p>
+<h2>Contributing</h2>
+<ol>
+<li>Make your changes</li>
+<li>Run <code>make precommit</code> (required)</li>
+<li>Commit with a descriptive message</li>
+<li>Open a pull request</li>
+</ol>
+<h2>License</h2>
+<p>Copyright Grafana Labs</p>
+<h2>Links</h2>
+<ul>
+<li><a href="https://github.com/grafana/blockpack">GitHub Repository</a></li>
+<li><a href="https://github.com/grafana/tempo">Grafana Tempo</a></li>
+<li><a href="https://opentelemetry.io/">OpenTelemetry</a></li>
+</ul>
+
+    </main>
+  </div>
+</body>
+</html>

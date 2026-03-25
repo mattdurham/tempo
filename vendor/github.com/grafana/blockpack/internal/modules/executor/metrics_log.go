@@ -186,6 +186,9 @@ func logAccumulateRow(
 	tsNanos := int64(tsVal) //nolint:gosec
 
 	// Skip rows outside the query time window.
+	// Log metrics uses left-closed intervals [StartTime, EndTime) — intentionally different
+	// from trace metrics which uses right-closed (StartTime, EndTime] (Tempo semantics).
+	// Log metrics has no equivalent Tempo/Loki interval alignment requirement.
 	if tsNanos < tb.StartTime || tsNanos >= tb.EndTime {
 		return
 	}

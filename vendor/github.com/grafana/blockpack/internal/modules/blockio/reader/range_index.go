@@ -243,28 +243,43 @@ func parseTypedBoundaries(
 	}
 }
 
-func decodeInt64Key(key string) int64 {
+// readLE8 reads an 8-byte little-endian uint64 from key.
+// Returns (value, true) on success, (0, false) if key is too short.
+// Callers use the bool to apply type-appropriate sentinels (BUG-08).
+func readLE8(key string) (uint64, bool) {
 	if len(key) < 8 {
-		return 0
+		return 0, false
 	}
 
-	return int64(binary.LittleEndian.Uint64([]byte(key))) //nolint:gosec // safe: reinterpreting uint64 bits as int64
+	return binary.LittleEndian.Uint64([]byte(key)), true
+}
+
+func decodeInt64Key(key string) int64 {
+	// BUG-08: return math.MinInt64 (not 0) for short keys — 0 is a valid value.
+	// Sentinel sorts below all valid int64 values; callers must not prune on it.
+	v, ok := readLE8(key)
+	if !ok {
+		return math.MinInt64
+	}
+
+	return int64(v) //nolint:gosec // safe: reinterpreting uint64 bits as int64
 }
 
 func decodeUint64Key(key string) uint64 {
-	if len(key) < 8 {
-		return 0
-	}
-
-	return binary.LittleEndian.Uint64([]byte(key))
+	// For uint64, 0 is already the minimum sentinel — no change from original.
+	v, _ := readLE8(key)
+	return v
 }
 
 func decodeFloat64Key(key string) float64 {
-	if len(key) < 8 {
-		return 0
+	// BUG-08: return NaN (not 0.0) for short keys — 0.0 is a valid value.
+	// BUG-07 fix ensures NaN is handled correctly by compareRangeKey via cmp.Compare.
+	v, ok := readLE8(key)
+	if !ok {
+		return math.NaN()
 	}
 
-	return math.Float64frombits(binary.LittleEndian.Uint64([]byte(key)))
+	return math.Float64frombits(v)
 }
 
 // compareRangeKey compares two encoded boundary keys using type-aware comparison.
@@ -294,15 +309,13 @@ func compareRangeKey(colType shared.ColumnType, a, b string) int {
 		return 0
 
 	case shared.ColumnTypeRangeFloat64:
+		// NOTE-BUG-07: Use cmp.Compare instead of manual < / > to handle NaN.
+		// IEEE 754: NaN < x, NaN > x, and NaN == x are all false, so the
+		// manual branches all failed for NaN inputs, returning 0 (equal) and
+		// corrupting binary search. cmp.Compare provides a stable total order:
+		// NaN is treated as less than any non-NaN value.
 		va, vb := decodeFloat64Key(a), decodeFloat64Key(b)
-		if va < vb {
-			return -1
-		}
-		if va > vb {
-			return 1
-		}
-
-		return 0
+		return cmp.Compare(va, vb)
 
 	default: // RangeString, RangeBytes: lexicographic
 		if a < b {

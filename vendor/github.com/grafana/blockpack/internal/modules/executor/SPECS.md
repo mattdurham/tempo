@@ -116,11 +116,12 @@ If the relevant column is absent or the row is null, the field is left at its ze
 ```go
 type MatchedRow struct {
     Block           *modules_reader.Block
-    // IntrinsicFields is set when the result was produced by Case B (pure intrinsic
-    // + sort), which resolves fields from the intrinsic section without reading full
-    // block data. Block is nil for Case B. Case A (pure intrinsic, no sort) populates
-    // Block via forEachBlockInGroups and leaves IntrinsicFields nil. The caller should
-    // use IntrinsicFields for field lookups when Block is nil.
+    // IntrinsicFields is set when the result was produced without reading full block
+    // data — either Case B (pure intrinsic + sort) or Case A with a range predicate
+    // (pure intrinsic + no sort + hasRangePredicate=true, see NOTE-047). Block is nil
+    // when IntrinsicFields is set. Case A with equality predicates populates Block via
+    // forEachBlockInGroups and leaves IntrinsicFields nil. The caller should use
+    // IntrinsicFields for field lookups when Block is nil.
     IntrinsicFields modules_shared.SpanFieldsProvider
     BlockIdx        int
     RowIdx          int
@@ -287,7 +288,12 @@ I/O path (see NOTE-035).
 ### 6.1 Invariants
 
 - **SPEC-STREAM-1:** Nil reader returns `(nil, nil)`. Nil `program` returns an error.
-- **SPEC-STREAM-2:** Blocks are fetched lazily via `CoalescedGroups`/`ReadGroup` (~8 MB per I/O). Never per-column or per-block individual reads.
+- **SPEC-STREAM-2:** Blocks are fetched lazily via `CoalescedGroups`/`ReadGroup`. When
+  `wantColumns` is set, the reader SHOULD use sub-block column I/O (SPEC-005) to transfer
+  only the bytes for the needed columns rather than the full block. When `wantColumns` is
+  nil (match-all), the full block is fetched as before. The unit of lazy fetch remains the
+  coalesced group, but each group's read volume is bounded by the sum of the wanted
+  columns' byte ranges across the group's blocks rather than the full block sizes.
 - **SPEC-STREAM-3:** `FetchedBlocks <= SelectedBlocks`. `FetchedBlocks` is incremented at `ReadGroup` time by the count of blocks in the fetched group (actual I/O). Groups that are skipped due to early stop are not counted.
 - **SPEC-STREAM-4:** `TimestampColumn == ""` disables per-row time filtering (trace mode). `TimestampColumn == "log:timestamp"` enables per-row `[MinNano, MaxNano]` checks.
 - **SPEC-STREAM-5:** Direction is applied at plan time (`PlanWithOptions`). Within each block, when `TimestampColumn` is set, rows are sorted by per-row timestamp: ascending for Forward (oldest first), descending for Backward (newest first). When `TimestampColumn` is empty (trace mode), rows are reversed for Backward direction.
@@ -306,7 +312,16 @@ I/O path (see NOTE-035).
   intrinsic predicate (`hasSomeIntrinsicPredicates` returns true), `Collect` runs an
   intrinsic pre-filter before the full block scan. The pre-filter dispatches on
   `(ProgramIsIntrinsicOnly × TimestampColumn != "")`:
-  - Pure intrinsic + no sort: fetch only candidate blocks, return rows (minimal I/O).
+  - Pure intrinsic + no sort (Case A): adaptive dispatch on `hasRangePredicate(program)`:
+      - Range predicates (Min or Max set, e.g. `duration>100ms`): `lookupIntrinsicFields`
+        reads field values from cached intrinsic blobs — zero internal block reads.
+        `MatchedRow.IntrinsicFields` is populated; `MatchedRow.Block` is nil.
+      - Equality predicates (Values set, e.g. `status=error`, `svc=X`): `forEachBlockInGroups`
+        reads only the internal blocks containing matched refs — targeted I/O.
+        `MatchedRow.Block` is populated; `MatchedRow.IntrinsicFields` is nil.
+      The range path is faster when refs are spread across many blocks (sorted flat column
+      scan scatters matches). The equality path is faster when refs cluster in 1-3 blocks
+      (dict-equality matches are sparse and highly localised). See NOTE-047.
   - Pure intrinsic + sort: group refs by block, order blocks by BlockMeta.MaxStart DESC
     (KLL path NOTE-044), build packed-key→timestamp map from tsCol (O(N)), look up each
     ref's timestamp, sort M pairs, return IntrinsicFields rows (zero block reads).
@@ -541,12 +556,18 @@ type TraceMetricsResult struct {
 - **SPEC-ETM-1:** Labels are an ordered slice; the same label name will not appear twice.
 - **SPEC-ETM-2:** `Values[i]` is NaN when no data exists for bucket i (except COUNT/RATE which use 0).
 - **SPEC-ETM-3:** `len(Values)` == numBuckets where `numBuckets = ceil((EndTime-StartTime)/StepSizeNanos)`.
+  Note: when called via `ExecuteMetricsTraceQL` (api.go), `StartTime` and `EndTime` are the
+  step-aligned values (`alignedStart`, `alignedEnd`), not the raw caller-supplied `StartNano`/`EndNano`.
 - **SPEC-ETM-4:** Nil reader returns empty `TraceMetricsResult` with no error. Note: the public
   wrapper `ExecuteMetricsTraceQL` (api.go) returns an error for a nil reader.
 - **SPEC-ETM-5:** Nil `querySpec` returns an error (`"ExecuteTraceMetrics: querySpec cannot be nil"`).
 - **SPEC-ETM-6:** Time bucketing uses `vm.QuerySpec.TimeBucketing.StartTime`, `EndTime`,
-  `StepSizeNanos` (nanoseconds). Spans outside `[StartTime, EndTime)` are skipped.
-  Bucket index = `(spanStart - StartTime) / StepSizeNanos`.
+  `StepSizeNanos` (nanoseconds). Intervals are **right-closed**: spans outside `(StartTime, EndTime]`
+  are skipped (start exclusive, end inclusive). This matches Tempo `IntervalMapperQueryRange` semantics.
+  Bucket index: `offset = spanStart - StartTime; idx = offset / StepSizeNanos;`
+  `if offset % StepSizeNanos == 0 { idx-- }` (spans at exact step boundaries belong to the previous bucket).
+  Back-ref: `internal/modules/executor/metrics_trace.go:traceAccumulateRow`,
+  `internal/modules/executor/metrics_trace_intrinsic.go:executeTraceMetricsIntrinsic`.
 - **SPEC-ETM-7:** `span:start` is used for time bucketing. Rows where `span:start` is absent
   or the column is nil are silently skipped (not counted).
 - **SPEC-ETM-8:** `GroupBy` is the list of attribute paths from `querySpec.Aggregate.GroupBy`

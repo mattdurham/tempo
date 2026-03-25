@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>File Format — Blockpack</title>
+  <link rel="stylesheet" href="/assets/css/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <a href="/" class="topbar-brand">Blockpack Docs</a>
+    <a href="https://github.com/grafana/blockpack" class="topbar-github">GitHub →</a>
+  </header>
+  <div class="layout">
+    <nav class="sidebar">
+  <div class="sidebar-brand">BLOCKPACK</div>
+  <div class="section-label">Overview</div>
+  <a href="/">Home</a>
+  <a href="/file-format" class="active">File Format</a>
+  <div class="section-label">Query Execution</div>
+  <a href="/execution-path">Execution Path</a>
+  <a href="/write-path">Write Path</a>
+  <div class="section-label">Indexes</div>
+  <a href="/kll">KLL Sketches</a>
+  <a href="/cms">Count-Min Sketch</a>
+  <a href="/topk">TopK</a>
+  <a href="/hll">HyperLogLog</a>
+  <a href="/bloom-filter">Bloom Filters</a>
+  <a href="/intrinsic-columns">Intrinsic Columns</a>
+  <div class="section-label">Blocks</div>
+  <a href="/block-scoring">Block Scoring</a>
+  <a href="/block-format">Block Format</a>
+  <div class="section-label">Performance</div>
+  <a href="/benchmarks/">Benchmarks</a>
+  <a href="/production-results">Production Results</a>
+</nav>
+    <main class="content">
+<h1>File Format</h1>
+<p>Blockpack is a columnar binary format for OpenTelemetry trace data. A single file contains everything needed to answer a query — block payloads, indexes, and metadata — with no external catalog required.</p>
+<h2>File Layout</h2>
+<pre><code>┌──────────────────────────────────────────┐
+│  Block 0 payload (columnar span data)    │
+├──────────────────────────────────────────┤
+│  Block 1 payload                         │
+├──────────────────────────────────────────┤
+│  ...                                     │
+├──────────────────────────────────────────┤
+│  Block N payload                         │
+├──────────────────────────────────────────┤
+│  Metadata blob                           │
+│  ├── Block index (offset + size per blk) │
+│  ├── Dedicated column indexes            │
+│  ├── Trace block index                   │
+│  └── File-level bloom filter (FBLM)      │
+├──────────────────────────────────────────┤
+│  Fixed header (magic, version, offsets)  │
+├──────────────────────────────────────────┤
+│  Footer (10 bytes)                       │
+└──────────────────────────────────────────┘
+</code></pre>
+<p>Files are read from the footer backward: the footer gives the header offset, the header gives metadata offsets, and the metadata gives block offsets. This enables efficient random access without scanning the entire file.</p>
+<h2>Blocks</h2>
+<p>Each block contains approximately 2,000 spans stored in columnar layout. Spans are clustered by service name and MinHash similarity before being written so that blocks tend to hold spans from the same service, improving compression ratios and pruning effectiveness.</p>
+<h3>Column Encoding</h3>
+<p>Every span attribute is a separate column. At write time, blockpack selects the best encoding for each column's observed value distribution:</p>
+<table>
+<thead>
+<tr><th>Encoding</th><th>Best for</th></tr>
+</thead>
+<tbody>
+<tr><td>Dictionary</td><td>Low-cardinality strings and numerics; payload Zstd-compressed</td></tr>
+<tr><td>Sparse Dictionary</td><td>Dictionary with sparse presence (>50% nulls)</td></tr>
+<tr><td>Delta Uint64</td><td>Uint64 columns with small range or high cardinality</td></tr>
+<tr><td>RLE Indexes</td><td>Index arrays with cardinality ≤ 3 (boolean-like enums)</td></tr>
+<tr><td>XOR Bytes</td><td>Byte columns (non-URL): XOR against previous row, then Zstd</td></tr>
+<tr><td>Prefix Bytes</td><td>URL/path columns: shared-prefix dictionary encoding</td></tr>
+<tr><td>Delta Dictionary</td><td><code>trace:id</code> column: delta-encoded sorted dictionary</td></tr>
+<tr><td>+ sparse variants</td><td>Sparse (>50% null) variants of the above</td></tr>
+</tbody>
+</table>
+<p>After column encoding, each block is compressed with <strong>Zstd</strong>, achieving 3–5× additional size reduction on top of encoding. Combined, blockpack reaches <strong>10–50× compression</strong> over raw OTLP.</p>
+<h2>Block Metadata</h2>
+<p>Each block carries a <code>BlockMeta</code> record stored in the metadata blob:</p>
+<table>
+<thead>
+<tr><th>Field</th><th>Purpose</th></tr>
+</thead>
+<tbody>
+<tr><td><code>MinNano</code> / <code>MaxNano</code></td><td>Time range — used for time-window pruning</td></tr>
+<tr><td><code>MinTraceID</code> / <code>MaxTraceID</code></td><td>Trace ID range — used for trace lookup pruning</td></tr>
+<tr><td>Column bloom filters</td><td>BinaryFuse8 per column — used to reject blocks that don't contain a queried value</td></tr>
+<tr><td>Range index entries</td><td>Per-column min/max bucket assignments (derived from file-level KLL sketch) — used for range predicate pruning</td></tr>
+<tr><td>Row count</td><td>Number of spans</td></tr>
+</tbody>
+</table>
+<h2>Indexes and Filters</h2>
+<p>Each of these structures is stored in the metadata blob and consulted during query planning — before any block payload bytes are fetched.</p>
+<h3>Block Index</h3>
+<p>Maps each block's ULID to its byte offset and size in the file. Loaded once on file open. Every block fetch goes through this index to locate the byte range to read.</p>
+<h3>Trace Block Index</h3>
+<p>A sorted array of <code>(traceID, blockID)</code> pairs. Enables O(log N) binary search for trace-by-ID lookups without reading any block payloads. Used by <code>FindTraceByID</code>.</p>
+<h3>Dedicated Column Indexes</h3>
+<p>For columns marked as high-cardinality at write time, blockpack builds a global inverted index: <code>value → []blockID</code>. At query time this allows O(1) block selection for exact-match predicates on those columns — skipping all per-block bloom checks entirely.</p>
+<h3>Bloom Filters (BinaryFuse8)</h3>
+<p>Blockpack uses <a href="https://github.com/FastFilter/xorfilter">BinaryFuse8</a> filters — a space-efficient probabilistic data structure that answers "does value X exist in this set?" with a ~0.4% false positive rate and ~1 byte per entry.</p>
+<p>There are two levels:</p>
+<p><strong>File-level bloom (<code>FBLM</code> section):</strong>
+Covers <code>resource.service.name</code> across all spans in the entire file. Checked first — if the queried service is absent, zero blocks are read and the query returns immediately.</p>
+<p><strong>Block-level bloom:</strong>
+One filter per column per block, built over the column's distinct values. Used during the pruning phase to reject blocks that cannot contain a queried value.
+False positives are tolerated (they cause unnecessary block reads); false negatives are impossible by construction.</p>
+<h3>KLL Range Sketches</h3>
+<p>At write time, blockpack builds a <a href="https://arxiv.org/abs/1603.05346">KLL sketch</a> (Karnin-Lang-Liberty) per numeric column across all blocks. The sketch is used to compute ~1,000 quantile bucket boundaries for the file-level range index. The sketch itself is not stored on disk — only the derived bucket boundaries are.</p>
+<p>Each block's contribution to the range index is recorded as the set of KLL buckets whose range overlaps that block's <code>[min, max]</code> values for that column.</p>
+<p>At query time, the planner uses <strong>interval matching</strong>: for a predicate <code>duration &gt; X</code>, a block is retained only if its recorded bucket range overlaps <code>[X, ∞)</code>. Blocks with no overlapping buckets are pruned without reading any payload bytes.</p>
+<p>For OR predicates, the planner keeps any block that satisfies at least one arm. A block need only pass the weaker condition to survive.</p>
+<h3>CMS (Count-Min Sketch)</h3>
+<p>Blockpack maintains a <a href="https://en.wikipedia.org/wiki/Count%E2%80%93min_sketch">Count-Min Sketch</a> per block for approximate frequency counting of high-cardinality string values. The CMS answers "roughly how many times does value X appear in this block?" in O(1) time and constant space.</p>
+<p>Used during query planning to score and rank blocks by estimated match density before issuing I/O. Blocks with a CMS score of zero for all queried values can be skipped; blocks with high scores are prioritised to allow early termination once enough results are found.</p>
+<h2>I/O Design</h2>
+<p>Blockpack targets <strong>object storage</strong> (S3, GCS, Azure Blob) where request latency (50–100ms) dominates cost, not bytes transferred. The core invariant:</p>
+<p>> <strong>One I/O per block — always read the entire block.</strong></p>
+<p>Per-column selective reads were tried and removed: they caused 10–120× more API calls with no meaningful reduction in bytes transferred. All column filtering happens in-memory after the single block fetch.</p>
+<table>
+<thead>
+<tr><th>Metric</th><th>Good</th><th>Warning</th><th>Critical</th></tr>
+</thead>
+<tbody>
+<tr><td><code>io_ops</code></td><td>< 500</td><td>500–1000</td><td>> 1000</td></tr>
+<tr><td><code>bytes/io</code></td><td>> 100KB</td><td>10–100KB</td><td>< 10KB</td></tr>
+</tbody>
+</table>
+
+    </main>
+  </div>
+</body>
+</html>

@@ -298,6 +298,14 @@ func (c *Column) BytesValue(idx int) ([]byte, bool) {
 	return nil, false
 }
 
+// ColIterEntry is a single entry in the pre-computed deduplicated column iteration list.
+// Built once by BuildIterFields after all columns are registered.
+// NOTE-049: Pre-computed column iteration order eliminates the per-span seen-map alloc.
+type ColIterEntry struct {
+	Col  *Column
+	Name string
+}
+
 // Block holds decoded columns for a single block.
 type Block struct {
 	columns map[shared.ColumnKey]*Column
@@ -310,8 +318,12 @@ type Block struct {
 	// Pointers into this slice (stored in columns map) are stable because the slice
 	// is sized to exact capacity before any appends — no reallocation ever occurs.
 	lazyColumnStore []Column
-	meta            shared.BlockMeta
-	spanCount       int
+	// iterFields is the pre-computed deduplicated column iteration list, built by
+	// BuildIterFields. When non-nil, IterateFields uses this slice directly — zero allocs.
+	// NOTE-049: see blockio/NOTES.md §49.
+	iterFields []ColIterEntry
+	meta       shared.BlockMeta
+	spanCount  int
 }
 
 // NewBlockForParsing creates a Block with an empty columns map, for use with AddColumnsToBlock.
@@ -334,6 +346,38 @@ func (b *Block) buildNameIndex() {
 		}
 	}
 }
+
+// BuildIterFields pre-computes a deduplicated column iteration slice for use by
+// modulesSpanFieldsAdapter.IterateFields. Called once after all columns are added.
+// After this call, IterateFields on any adapter for this block is allocation-free.
+// NOTE-049: Eliminates the per-span make(map[string]struct{}) in IterateFields.
+// Idempotent — calling twice rebuilds from the current column set.
+func (b *Block) BuildIterFields() {
+	seen := make(map[string]struct{}, len(b.columns))
+	entries := make([]ColIterEntry, 0, len(b.columns))
+	for key := range b.columns {
+		// NOTE-ITER-1: skip body-parsed auto-columns; they are not original attributes.
+		if key.Type == shared.ColumnTypeRangeString {
+			continue
+		}
+		if _, already := seen[key.Name]; already {
+			continue
+		}
+		seen[key.Name] = struct{}{}
+		// Use GetColumn for a stable tie-breaking column when multiple type variants
+		// share the same name — matches the semantics of direct GetColumn calls.
+		col := b.GetColumn(key.Name)
+		if col == nil {
+			continue
+		}
+		entries = append(entries, ColIterEntry{Col: col, Name: key.Name})
+	}
+	b.iterFields = entries
+}
+
+// IterFields returns the pre-computed deduplicated column list built by BuildIterFields.
+// Returns nil if BuildIterFields has not been called.
+func (b *Block) IterFields() []ColIterEntry { return b.iterFields }
 
 // SpanCount returns the number of spans in the block.
 func (b *Block) SpanCount() int { return b.spanCount }

@@ -32,6 +32,12 @@ This codebase is designed for agentic workflows. Agents are expected to:
 
 ## SPECS Workflow
 
+**`SPEC.md` (root) is the authoritative source for codebase-wide engineering invariants.**
+Read it before writing any new code. It defines rules for panic safety, file layout,
+lazy parsing, allocation discipline, pool/cache reuse, condition complexity, functional
+style, and TDD. Module-level `SPECS.md` files narrow these invariants for a specific package
+but never override the root.
+
 Each major component under `internal/modules/<name>/` has a set of living spec files:
 
 | File | Purpose |

@@ -64,14 +64,27 @@ type FileSketchSummary struct {
 }
 
 // FileSketchSummary returns the file-level aggregated sketch summary.
-// The result is computed once and reused on subsequent calls.
+// The result is computed once per file across all queries using the process-level
+// parsedSketchSummaryCache (GC-cooperative weak.Pointer). Falls back to building
+// from sketchIdx when the cache entry has been reclaimed.
 // Returns nil when the file has no sketch section (old format — degrade gracefully).
 func (r *Reader) FileSketchSummary() *FileSketchSummary {
 	if r.sketchIdx == nil {
 		return nil
 	}
 	r.fileSummaryOnce.Do(func() {
+		// Check process-level cache — avoids the expensive CMS merge + TopK
+		// aggregation on every query for the same file.
+		if r.fileID != "" {
+			if cached := parsedSketchSummaryCache.Get(r.fileID + "/sketch-summary"); cached != nil {
+				r.fileSummary = cached
+				return
+			}
+		}
 		r.fileSummary = buildFileSketchSummary(r.sketchIdx)
+		if r.fileID != "" {
+			_ = parsedSketchSummaryCache.Put(r.fileID+"/sketch-summary", r.fileSummary)
+		}
 	})
 	return r.fileSummary
 }

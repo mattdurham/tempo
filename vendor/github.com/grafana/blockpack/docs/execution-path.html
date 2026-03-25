@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Execution Path — Blockpack</title>
+  <link rel="stylesheet" href="/assets/css/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <a href="/" class="topbar-brand">Blockpack Docs</a>
+    <a href="https://github.com/grafana/blockpack" class="topbar-github">GitHub →</a>
+  </header>
+  <div class="layout">
+    <nav class="sidebar">
+  <div class="sidebar-brand">BLOCKPACK</div>
+  <div class="section-label">Overview</div>
+  <a href="/">Home</a>
+  <a href="/file-format">File Format</a>
+  <div class="section-label">Query Execution</div>
+  <a href="/execution-path" class="active">Execution Path</a>
+  <a href="/write-path">Write Path</a>
+  <div class="section-label">Indexes</div>
+  <a href="/kll">KLL Sketches</a>
+  <a href="/cms">Count-Min Sketch</a>
+  <a href="/topk">TopK</a>
+  <a href="/hll">HyperLogLog</a>
+  <a href="/bloom-filter">Bloom Filters</a>
+  <a href="/intrinsic-columns">Intrinsic Columns</a>
+  <div class="section-label">Blocks</div>
+  <a href="/block-scoring">Block Scoring</a>
+  <a href="/block-format">Block Format</a>
+  <div class="section-label">Performance</div>
+  <a href="/benchmarks/">Benchmarks</a>
+  <a href="/production-results">Production Results</a>
+</nav>
+    <main class="content">
+<h1>Execution Path</h1>
+<div class="video-wrap">
+  <video autoplay loop muted playsinline controls>
+    <source src="/videos/execution-path.mp4" type="video/mp4">
+  </video>
+</div>
+
+<p>When a TraceQL query arrives, blockpack runs it through a multi-stage pipeline that progressively narrows the set of blocks to read before evaluating any predicates against individual spans.</p>
+<h2>Pipeline Stages</h2>
+<h3>1. Query Parse</h3>
+<p>The TraceQL string is tokenized and built into a typed AST. The parser identifies the query type (filter, metrics, or structural) and produces a <code>ParsedPipeline</code> containing a <code>SpansetFilter</code> and a list of <code>AttributeCondition</code> nodes.</p>
+<h3>2. VM Compilation</h3>
+<p>The VM compiler walks the AST and produces two outputs:</p>
+<ul>
+<li><strong><code>ColumnPredicate</code> closure</strong> — a Go function that, given a decoded column, returns true/false per span row. This is the per-span evaluation function used at the very end of the pipeline.</li>
+<li><strong><code>RangeNode</code> tree</strong> — a structured representation of every range/equality condition in the query, used purely for block-level pruning. No span data is accessed at this stage.</li>
+</ul>
+<h3>3. Predicate Building</h3>
+<p>The predicate builder walks the <code>RangeNode</code> tree and wire-encodes each condition into a <code>QueryPredicates</code> struct ready for index lookup:</p>
+<ul>
+<li><strong><code>Ranges</code></strong> — interval predicates for KLL range index matching</li>
+<li><strong><code>BloomKeys</code></strong> — column name tokens for bloom filter checking</li>
+<li><strong><code>UnscopedColumnNames</code></strong> — column names needed by pushed-down pipeline predicates</li>
+</ul>
+<p><code>normalizeAttributePath()</code> maps TraceQL attribute syntax (<code>span.foo</code>, <code>resource.bar</code>, <code>duration</code>) to the canonical column names used inside blockpack files.</p>
+<h3>4. Block Pruning (5 stages)</h3>
+<p>The query planner runs five cascading filters, each shrinking the candidate block set:</p>
+<p>#### Stage 4a — File-Level Bloom
+Before touching any blocks, blockpack checks the file-level BinaryFuse8 bloom filter. If the queried service name is absent from the entire file, the query returns immediately with zero I/O.</p>
+<p>#### Stage 4b — Time-Range Reject
+Each block carries <code>[MinNano, MaxNano]</code>. Blocks outside the query's time window are dropped. This is the cheapest filter — purely metadata comparison.</p>
+<p>#### Stage 4c — KLL Range Index
+At write time, a KLL sketch is built per numeric column to derive ~1,000 quantile bucket boundaries for a file-level range index. Each block is recorded against the buckets that overlap its <code>[min, max]</code> for that column. At query time, the planner uses <strong>interval matching</strong>: for a predicate <code>duration &gt; X</code>, a block is kept only if it has at least one overlapping bucket in <code>[X, ∞)</code>. Blocks with no overlapping buckets are pruned.</p>
+<p>For OR predicates across multiple duration conditions, the planner keeps any block that satisfies <em>either</em> branch — a block need only pass one arm of an OR.</p>
+<p>#### Stage 4d — Block Bloom Filters
+Each block has a per-column BinaryFuse8 filter over its distinct values. Blocks where the filter definitively rejects a predicate value are dropped.</p>
+<p>#### Stage 4e — CMS Zero-Estimate
+For each remaining block, blockpack checks the Count-Min Sketch estimate for each queried exact value. A CMS estimate of zero means the value was <strong>definitively never added</strong> to that block's sketch — CMS never undercounts, so a zero is a safe prune with no false negatives.</p>
+<p>This catches bloom filter false positives: a block that passed the bloom check (which has a ~0.4% false positive rate) but has a CMS count of zero for the queried value is safely eliminated.</p>
+<p>After all pruning stages, typically 60–95% of blocks have been eliminated with zero I/O.</p>
+<h3>5. Executor Dispatch</h3>
+<p>The executor receives the pruned block list and dispatches to one of two paths:</p>
+<p><strong>Intrinsic fast-path (path A):</strong> Pure service-name / label queries can be answered using only bloom filters and the dedicated column index — no block bytes are ever fetched.</p>
+<p><strong>Full block scan (path B):</strong> Queries with range predicates (like <code>duration &gt; 500ms</code>) require reading block payloads. The executor iterates the remaining blocks one by one.</p>
+<h3>6. Block I/O</h3>
+<p>For each selected block, <code>GetBlockWithBytes</code> issues <strong>one</strong> HTTP/storage request and returns the full block as <code>[]byte</code>. The entire block is always read — never a subset of columns.</p>
+<p>This is the only point in the pipeline where I/O occurs.</p>
+<h3>7. Column Decode + Span Evaluation</h3>
+<p><code>parseBlockColumnsReuse</code> decodes only the columns referenced by the query (<code>wantColumns</code>). All other columns are skipped entirely.</p>
+<p>The <code>ColumnPredicate</code> closure — compiled in step 2 — is then invoked once per span row. It evaluates the full predicate tree (AND/OR/comparisons) directly against the decoded column values. Matching rows are emitted via <code>SpanMatchCallback</code>.</p>
+<h2>Pruning in Practice</h2>
+<p>For a query touching 1,000 blocks across a large dataset:</p>
+<table>
+<thead>
+<tr><th>Stage</th><th>Blocks remaining</th><th>Reason</th></tr>
+</thead>
+<tbody>
+<tr><td>File bloom</td><td>800</td><td>20% of files have no matching service</td></tr>
+<tr><td>Time range</td><td>400</td><td>50% outside query window</td></tr>
+<tr><td>KLL range index</td><td>120</td><td>70% of remaining have incompatible duration ranges</td></tr>
+<tr><td>Block bloom</td><td>40</td><td>67% lack the queried SLA value</td></tr>
+<tr><td>CMS zero-estimate</td><td>38</td><td>2 bloom false positives caught by count estimate</td></tr>
+<tr><td><strong>Span eval</strong></td><td><strong>38</strong></td><td>All 38 blocks read — one I/O each</td></tr>
+</tbody>
+</table>
+<p>40 I/O operations instead of 1,000. The bloom and KLL filters do most of the work before any bytes leave storage.</p>
+<h2>Key Invariant</h2>
+<p>> <strong>One I/O per block — always read the entire block. Column filtering is always in-memory.</strong></p>
+<p>This is enforced throughout the codebase. Any change that introduces per-column reads must be reviewed against the I/O metrics above.</p>
+
+    </main>
+  </div>
+</body>
+</html>

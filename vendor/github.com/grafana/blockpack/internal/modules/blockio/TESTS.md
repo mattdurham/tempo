@@ -1343,3 +1343,101 @@ with plain-text body. Call `addLogRecordFromProto`.
 with `Body: nil`. Call `addLogRecordFromProto`.
 **Assertions:**
 - `len(bb.columns)` is unchanged.
+
+---
+
+## 19. SpanFields Allocation Tests
+
+### ALLOC-01: TestIterateFieldsNoSeenMapAllocsAfterBuildIterFields
+**Scenario:** Verify that `IterateFields` on a block with a pre-built `iterFields` slice
+does not allocate a per-call seen-map (fast path, NOTE-049).
+Remaining allocs are numeric value boxing (int64/uint64 → any) which are unrelated to the seen-map fix.
+**Setup:**
+- Build a test block with `buildAllocTestBlock`.
+- Confirm `block.IterFields()` is non-nil (BuildIterFields was called during parse).
+- Acquire a pooled adapter via `NewSpanFieldsAdapter`.
+**Assertions:**
+- `testing.AllocsPerRun(100, ...)` calling `adapter.IterateFields` with a no-op visitor ≤ 10
+  (one boxing alloc per numeric column at most — no seen-map overhead).
+- Verified in `internal/modules/blockio/span_fields_allocs_test.go:TestIterateFieldsNoSeenMapAllocsAfterBuildIterFields`.
+
+### ALLOC-02: TestSpanMatchCloneAllocsPerSpan
+**Scenario:** Verify that `SpanMatch.Clone()` allocates significantly fewer heap objects after
+switching the fields container from `map[string]any` to a pooled `[]kvField` slice (NOTE-ALLOC-2).
+**Setup:**
+- Build a test block. Acquire adapter for row 0. Construct a `SpanMatch`.
+- Warm the `kvFieldSlicePool` with one Clone call.
+**Assertions:**
+- `testing.AllocsPerRun(100, ...)` for `sm.Clone()` is ≤ N_columns + 2 (N ≈ 10 for test block).
+- Result is strictly lower than the pre-optimization baseline of N + 3 (map header + buckets).
+- Verified in `internal/modules/blockio/span_fields_allocs_test.go:TestSpanMatchCloneAllocsPerSpan`.
+
+### ALLOC-03: TestNewSpanFieldsAdapterPooled
+**Scenario:** Verify that a pooled get+release round-trip of `NewSpanFieldsAdapter` /
+`ReleaseSpanFieldsAdapter` allocates zero heap objects after the pool is warmed (NOTE-ALLOC-4).
+**Setup:**
+- Build a test block. Warm the pool: call `NewSpanFieldsAdapter` then `ReleaseSpanFieldsAdapter`.
+**Assertions:**
+- `testing.AllocsPerRun(100, ...)` for get+release loop ≤1 (allows for one cold-pool alloc after GC sweep; sync.Pool may drop entries between AllocsPerRun iterations).
+- Verified in `internal/modules/blockio/span_fields_allocs_test.go:TestNewSpanFieldsAdapterPooled`.
+
+### ALLOC-04: BenchmarkExtractIDsHex
+**Scenario:** Measure the allocation profile of `hex.EncodeToString` replacing
+`fmt.Sprintf("%x", v)` for trace/span ID hex encoding (NOTE-ALLOC-1).
+**Setup:**
+- Fixed 16-byte trace ID and 8-byte span ID byte slices.
+**Assertions (benchmark):**
+- `b.ReportAllocs()` output; expected 1 alloc per call (one string allocation per encode).
+- Verified in `internal/modules/blockio/span_fields_allocs_test.go:BenchmarkExtractIDsHex`.
+
+---
+
+## 20. Bug Regression Tests (BUG-02, BUG-07, BUG-08)
+*Added: 2026-03-23*
+
+### BUG-02-01: TestTryApplyExactValues_Uint64_HighBit
+**File:** `internal/modules/blockio/writer/range_index_bug02_test.go`
+**Scenario:** `tryApplyExactValues` for `ColumnTypeRangeUint64` must sort boundaries in
+unsigned order. Values straddling 2^63 (e.g. `0x7FFFFFFFFFFFFFFF` and `0x8000000000000000`)
+were previously sorted as int64, making the high-bit value appear negative and sort first.
+**Setup:** Build a `rangeColumnData` with two blocks whose exact values are `math.MaxInt64`
+and `math.MaxInt64 + 1`. Call `tryApplyExactValues`.
+**Assertions:**
+- Returns `true` (exact-value path taken).
+- `len(cd.boundaries) == 2`.
+- `uint64(cd.boundaries[0]) < uint64(cd.boundaries[1])` (unsigned order preserved).
+- `uint64(cd.boundaries[0]) == math.MaxInt64`, `uint64(cd.boundaries[1]) == math.MaxInt64 + 1`.
+
+### BUG-07-01: TestCompareRangeKey_Float64_NaN
+**File:** `internal/modules/blockio/reader/range_index_bugs_test.go`
+**Scenario:** `compareRangeKey` for `ColumnTypeRangeFloat64` must not return 0 when either
+operand is NaN. IEEE 754: `NaN < x`, `NaN > x`, and `NaN == x` are all false — the old
+manual `<`/`>` branches both failed, returning 0 and corrupting binary search.
+**Setup:** Encode `math.NaN()`, `1.0`, and `math.Inf(-1)` as 8-byte LE keys.
+**Assertions:**
+- `compareRangeKey(NaN, 1.0) != 0`.
+- `compareRangeKey(1.0, NaN) != 0`.
+- `compareRangeKey(NaN, NaN) == 0` (stable total order).
+- `compareRangeKey(NaN, -Inf) < 0` (NaN sorts below all non-NaN per `cmp.Compare`).
+- Antisymmetry: `sign(NaN, 1.0) == -sign(1.0, NaN)`.
+
+### BUG-08-01: TestDecodeFloat64Key_ShortKey_ReturnsNaN
+**File:** `internal/modules/blockio/reader/range_index_bugs_test.go`
+**Scenario:** `decodeFloat64Key` must return `math.NaN()` for short keys (len < 8), not
+`0.0`. Returning `0.0` silently treats malformed data as a valid zero-value.
+**Setup:** Call `decodeFloat64Key("")` and `decodeFloat64Key("short")`.
+**Assertions:** Both calls return a value for which `math.IsNaN(v)` is true.
+
+### BUG-08-02: TestDecodeInt64Key_ShortKey_ReturnsSentinel
+**File:** `internal/modules/blockio/reader/range_index_bugs_test.go`
+**Scenario:** `decodeInt64Key` must return `math.MinInt64` for short keys, not `0`.
+`0` is a valid int64 value; `math.MinInt64` is the minimum sentinel (sorts below all valid).
+**Setup:** Call `decodeInt64Key("")` and `decodeInt64Key("short")`.
+**Assertions:** Both calls return `math.MinInt64`.
+
+### BUG-08-03: TestDecodeUint64Key_ShortKey_ReturnsSentinel
+**File:** `internal/modules/blockio/reader/range_index_bugs_test.go`
+**Scenario:** `decodeUint64Key` already returns `0` for short keys, which is the correct
+minimum uint64 sentinel. This test confirms the existing behavior is correct.
+**Setup:** Call `decodeUint64Key("")` and `decodeUint64Key("short")`.
+**Assertions:** Both calls return `uint64(0)`.

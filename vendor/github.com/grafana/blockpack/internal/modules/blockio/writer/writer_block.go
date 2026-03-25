@@ -568,7 +568,10 @@ func (b *blockBuilder) addRowFromProto(ps *pendingSpan, rowIdx int) {
 // Tempo-native proto types. Mirrors addRowFromProto for tempocommon/tempotrace types.
 //
 //nolint:dupl // intentional mirror of addRowFromProto for Tempo types; different field types prevent sharing
-func (b *blockBuilder) addRowFromTempoProto(ps *pendingSpan, rowIdx int) { //nolint:cyclop // mirrors addRowFromProto complexity
+func (b *blockBuilder) addRowFromTempoProto(
+	ps *pendingSpan,
+	rowIdx int,
+) { //nolint:cyclop // mirrors addRowFromProto complexity
 	span := ps.tempoSpan
 
 	b.colTraceID.values[rowIdx] = copyBytes(span.TraceId)
@@ -605,7 +608,10 @@ func (b *blockBuilder) addRowFromTempoProto(ps *pendingSpan, rowIdx int) { //nol
 	b.colSpanKind.present[rowIdx] = true
 	{
 		var tmp [8]byte
-		binary.LittleEndian.PutUint64(tmp[:], uint64(spanKind)) //nolint:gosec // safe: reinterpreting int64 bits as uint64
+		binary.LittleEndian.PutUint64(
+			tmp[:],
+			uint64(spanKind), //nolint:gosec // G115: safe reinterpret int64 bits as uint64
+		)
 		b.updateMinMax("span:kind", shared.ColumnTypeInt64, string(tmp[:]))
 	}
 	b.feedIntrinsicInt64("span:kind", shared.ColumnTypeInt64, spanKind, rowIdx)
@@ -812,7 +818,10 @@ func readDynAttrValue(col *modules_reader.Column, rowIdx int, baseType shared.Co
 }
 
 // applyTraceID copies the trace:id column value for one row during compaction.
-func (b *blockBuilder) applyTraceID(col *modules_reader.Column, srcRowIdx, dstRowIdx int) (traceID [16]byte, found bool) {
+func (b *blockBuilder) applyTraceID(
+	col *modules_reader.Column,
+	srcRowIdx, dstRowIdx int,
+) (traceID [16]byte, found bool) {
 	if v, ok := col.BytesValue(srcRowIdx); ok && len(v) == 16 {
 		b.colTraceID.values[dstRowIdx] = slices.Clone(v)
 		b.colTraceID.present[dstRowIdx] = true

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"sync"
 
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
 	modules_shared "github.com/grafana/blockpack/internal/modules/blockio/shared"
@@ -327,7 +328,7 @@ func scanBlocks(
 			continue
 		}
 
-		// Lazy group fetch: one ~8 MB coalesced I/O per group, guarded by fetchedGroupsSeen.
+		// Lazy group fetch: guarded by fetchedGroupsSeen for early-stop support.
 		// SPEC-STREAM-3: FetchedBlocks is incremented here (at I/O time) by the number of
 		// blocks in the group. Groups that are never fetched (due to early stop) are not counted.
 		if !fetchedGroupsSeen[gi] {
@@ -454,6 +455,39 @@ func streamSortedRows(
 	return false
 }
 
+// hasRangePredicate reports whether the program contains any predicate that
+// produces refs spread across many blocks: range predicates (Min or Max set,
+// e.g. duration>100ms) and regex/prefix predicates (Pattern set, e.g. svc=~"loki-.*").
+// Both scan the sorted flat/dict intrinsic column and can match refs in any block.
+// lookupIntrinsicFields is faster for these than targeted block reads.
+// Equality-only predicates cluster refs in few blocks, making forEachBlockInGroups
+// the faster choice.
+//
+// Invariant: this function is only called from collectFromIntrinsicRefs, which is
+// gated by hasSomeIntrinsicPredicates. hasSomeIntrinsicPredicates walks the same
+// program.Predicates.Nodes — if those are nil or empty (e.g. an OR with an
+// unconstrained arm collapsed to nil by extractTraceQLNodes), the fast path is
+// skipped entirely before this function is reached. hasRangePredicate therefore
+// only sees non-empty Nodes and does not need to handle the empty-Nodes case.
+func hasRangePredicate(program *vm.Program) bool {
+	if program == nil || program.Predicates == nil {
+		return false
+	}
+	var walk func(nodes []vm.RangeNode) bool
+	walk = func(nodes []vm.RangeNode) bool {
+		for _, n := range nodes {
+			if n.Min != nil || n.Max != nil || n.Pattern != "" {
+				return true
+			}
+			if walk(n.Children) {
+				return true
+			}
+		}
+		return false
+	}
+	return walk(program.Predicates.Nodes)
+}
+
 // countUniqueBlockIdxs returns the number of distinct BlockIdx values in refs.
 func countUniqueBlockIdxs(refs []modules_shared.BlockRef) int {
 	if len(refs) == 0 {
@@ -541,7 +575,7 @@ func collectFromIntrinsicRefs(
 
 	// Step 2: Dispatch based on (isPureIntrinsic, hasSort).
 	if isPureIntrinsic && !hasSort {
-		return collectIntrinsicPlain(r, refs, opts, wantColumns, secondPassCols, stats)
+		return collectIntrinsicPlain(r, refs, opts, wantColumns, secondPassCols, stats, hasRangePredicate(program))
 	}
 	if isPureIntrinsic && hasSort {
 		return collectIntrinsicTopK(r, refs, opts, secondPassCols, stats)
@@ -590,14 +624,44 @@ func forEachBlockInGroups(
 	fn func(pb parsedBlock, candidateRows []int) error,
 ) error {
 	groups := r.CoalescedGroups(blockOrder)
-	for _, group := range groups {
-		fetched, err := r.ReadGroup(group)
-		if err != nil {
-			return fmt.Errorf("%s ReadGroup: %w", callerName, err)
+	if len(groups) == 0 {
+		return nil
+	}
+
+	// Phase 1: fetch all groups in parallel (ARCH-003).
+	// I/O is parallelised here; Phase 2 remains single-goroutine because
+	// Reader.ParseBlockFromBytes is not concurrency-safe on the same Reader.
+	//
+	// Note: all groups are pre-fetched before Phase 2 begins. If fn returns an
+	// error (e.g. errLimitReached) during Phase 2, the remaining fetched group
+	// data is discarded — S3 reads for those groups have already been issued.
+	// For forEachBlockInGroups (Case A equality path) refs cluster in 1–3 blocks,
+	// so at most 1–2 groups are pre-fetched in practice; the over-fetch cost is low.
+	type fetchResult struct {
+		data map[int][]byte
+		err  error
+	}
+	fetched := make([]fetchResult, len(groups))
+	var wg sync.WaitGroup
+	for i, group := range groups {
+		wg.Add(1)
+		go func(i int, group modules_shared.CoalescedRead) {
+			defer wg.Done()
+			data, err := r.ReadGroup(group)
+			fetched[i] = fetchResult{data: data, err: err}
+		}(i, group)
+	}
+	wg.Wait()
+
+	// Phase 2: parse and invoke fn sequentially.
+	// Reader.ParseBlockFromBytes is not safe for concurrent use on the same Reader.
+	for i, group := range groups {
+		if fetched[i].err != nil {
+			return fmt.Errorf("%s ReadGroup: %w", callerName, fetched[i].err)
 		}
 		for _, blockIdx := range group.BlockIDs {
 			candidateRows := blockCandidates[blockIdx]
-			raw, ok := fetched[blockIdx]
+			raw, ok := fetched[i].data[blockIdx]
 			if !ok {
 				continue
 			}
@@ -613,6 +677,13 @@ func forEachBlockInGroups(
 					return fmt.Errorf("%s second pass block %d: %w", callerName, blockIdx, parseErr)
 				}
 			}
+			// Release raw bytes now. Safety: bwb (the local variable) holds a strong
+			// reference to bwb.RawBytes, which keeps the backing array alive through the
+			// fn call below. Lazily-decoded columns (NOTE-001 rawEncoding) slice into
+			// RawBytes via bwb, not via the fetched map entry — the delete is safe.
+			// Mirrors scanBlocks' delete(fetched, blockIdx); lets GC reclaim block bytes
+			// before the next group is processed. NOTE-048.
+			delete(fetched[i].data, blockIdx)
 			if err := fn(parsedBlock{Block: bwb.Block, BlockIdx: blockIdx}, candidateRows); err != nil {
 				return err
 			}
@@ -622,10 +693,22 @@ func forEachBlockInGroups(
 }
 
 // collectIntrinsicPlain handles Case A: pure intrinsic + no sort.
-// Groups refs by internal blockIdx and calls forEachBlockInGroups, which reads
-// only the specific internal blocks (typically 1-3, ~100-500KB each) containing
-// the matched refs. This is cheaper than scanning the full intrinsic section
-// (10-50MB) for all N spans when the result limit is small.
+//
+// useIntrinsicLookup=true (range or regex predicates like duration>100ms, svc=~"loki-.*"):
+//
+//	Resolves fields from intrinsic column blobs — no full block reads.
+//	Intrinsic column blobs (dict/flat) may be read on demand by GetIntrinsicColumn,
+//	but are much smaller than full block data. The predicate TOC scan has already
+//	cached the primary predicate's blob; additional columns (trace:id, span:id, etc.)
+//	are fetched per-column as needed. Flat intrinsic columns are pre-sorted by value,
+//	so range scans use page-level min/max skipping + early exit. lookupIntrinsicFields
+//	with early-exit hash map is faster than reading many scattered full blocks.
+//
+// useIntrinsicLookup=false (equality predicates like svc=X, kind=server):
+//
+//	Uses forEachBlockInGroups to read the specific internal blocks containing
+//	matched refs. Dict-equality queries cluster refs in 1-3 blocks (~100-500KB),
+//	making targeted block reads faster than the O(N) intrinsic column scan.
 func collectIntrinsicPlain(
 	r *modules_reader.Reader,
 	refs []modules_shared.BlockRef,
@@ -633,6 +716,7 @@ func collectIntrinsicPlain(
 	wantColumns map[string]struct{},
 	secondPassCols map[string]struct{},
 	stats *CollectStats,
+	useIntrinsicLookup bool,
 ) ([]MatchedRow, error) {
 	stats.ExecutionPath = "intrinsic-plain"
 	// Sort refs by (BlockIdx, RowIdx) for deterministic traversal order.
@@ -649,11 +733,23 @@ func collectIntrinsicPlain(
 		refs = refs[:opts.Limit]
 	}
 
-	// Group refs by internal block index using the shared helper.
-	// M=20 refs typically span 1-3 internal blocks (~100-500KB each), far cheaper
-	// than scanning the full intrinsic section (all N spans in the file).
-	blockOrder, blockCandidates := groupRefsByBlock(refs)
+	if useIntrinsicLookup {
+		// Range predicate path: resolve fields from cached intrinsic blobs, zero block reads.
+		fieldMaps := lookupIntrinsicFields(r, refs, secondPassCols)
+		results := make([]MatchedRow, 0, len(refs))
+		for i, ref := range refs {
+			results = append(results, MatchedRow{
+				IntrinsicFields: &intrinsicFieldsProvider{fields: fieldMaps[i]},
+				BlockIdx:        int(ref.BlockIdx),
+				RowIdx:          int(ref.RowIdx),
+			})
+		}
+		return results, nil
+	}
 
+	// Equality predicate path: read only the specific internal blocks containing
+	// the matched refs (typically 1-3 blocks for dict-equality queries).
+	blockOrder, blockCandidates := groupRefsByBlock(refs)
 	var results []MatchedRow
 	err := forEachBlockInGroups(r, blockOrder, blockCandidates, wantColumns, secondPassCols, "collectIntrinsicPlain",
 		func(pb parsedBlock, candidateRows []int) error {
@@ -1074,12 +1170,16 @@ func lookupIntrinsicFields(r *modules_reader.Reader, selected []modules_shared.B
 		case modules_shared.IntrinsicFormatDict:
 			// Dict columns: iterate entries, for each entry scan its refs against targets.
 			// Hash map lookup (searchIndex) gives O(1) per ref.
+			// Use col.Type to decide the Go type — not entry.Value != "" — so that
+			// empty-string values are preserved correctly for string columns.
+			isInt := col.Type == modules_shared.ColumnTypeInt64 ||
+				col.Type == modules_shared.ColumnTypeRangeInt64
 			for _, entry := range col.DictEntries {
 				var val any
-				if entry.Value != "" {
-					val = entry.Value
-				} else {
+				if isInt {
 					val = entry.Int64Val
+				} else {
+					val = entry.Value
 				}
 				for _, ref := range entry.BlockRefs {
 					key := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx)

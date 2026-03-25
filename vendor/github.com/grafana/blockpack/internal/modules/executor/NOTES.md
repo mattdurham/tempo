@@ -1643,3 +1643,63 @@ any aggregate grouped by `resource.service.name` or `span:status`, `span:kind`, 
 - Aggregate field, no group-by: `streamAggColumnNoGroupBy` iterates the aggregate column directly.
 
 **Back-refs:** `metrics_trace_intrinsic.go`, `metrics_trace.go:executeTraceMetricsIntrinsic` call site.
+
+---
+
+## NOTE-047: Adaptive Case A Dispatch — Range vs Equality in collectIntrinsicPlain
+**Date:** 2026-03-23
+
+Case A (pure intrinsic + no sort) has two sub-paths chosen by `hasRangePredicate(program)`:
+
+**Range predicates** (`duration>100ms`, `start>=T`):
+- The sorted flat column scan in `BlockRefsFromIntrinsicTOC` returns refs scattered across
+  many blocks (binary search on a sorted column → matches distributed throughout the file).
+- Reading those blocks via `forEachBlockInGroups` would cost O(distinct_blocks) I/Os.
+- `lookupIntrinsicFields` instead reads field values directly from the cached intrinsic blobs
+  (already in memory from the initial TOC read) — zero additional I/Os.
+- Result: `MatchedRow.IntrinsicFields` populated, `MatchedRow.Block` nil.
+
+**Equality predicates** (`status=error`, `svc="grafana"`, `kind=server`):
+- Dict-equality matches are sparse: all spans matching a specific service name or status
+  typically come from a few contiguous internal blocks (dict encoding clusters identical
+  values). `BlockRefsFromIntrinsicTOC` returns refs concentrated in 1-3 blocks.
+- `forEachBlockInGroups` fetches only those blocks (~100-500 KB), which is faster than
+  an O(N) scan over the entire intrinsic flat blob.
+- Result: `MatchedRow.Block` populated, `MatchedRow.IntrinsicFields` nil.
+
+**Precondition invariant:** `hasRangePredicate` is only called from `collectFromIntrinsicRefs`,
+which is gated by `hasSomeIntrinsicPredicates`. Both walk `program.Predicates.Nodes`. When an
+unconstrained OR arm collapses Nodes to nil (see `extractTraceQLNodes` OpOr branch),
+`hasSomeIntrinsicPredicates` returns false and the fast path is skipped before
+`hasRangePredicate` is ever reached — the empty-Nodes case is safe by construction.
+
+**Back-refs:** `stream.go:hasRangePredicate`, `stream.go:collectIntrinsicPlain`,
+`stream.go:collectFromIntrinsicRefs` (call site, line ~568).
+
+---
+
+## NOTE-048: Parallel Phase 1 Fetch in forEachBlockInGroups
+**Date:** 2026-03-24
+
+`forEachBlockInGroups` is split into two phases:
+
+**Phase 1 (parallel I/O):** All coalesced groups are fetched concurrently via goroutines.
+`r.ReadGroup` only calls `r.provider.ReadAt` which is stateless and safe for concurrent use.
+Parallelism overlaps S3/disk latency across groups — at 36ms per request, reading 3 sequential
+groups takes 108ms; in parallel it takes 36ms.
+
+**Phase 2 (sequential decode):** `Reader.ParseBlockFromBytes` is not safe for concurrent use
+on the same `*Reader` instance; Phase 2 remains single-goroutine.
+
+**Early-stop trade-off:** All groups are pre-fetched in Phase 1 before Phase 2 begins. If
+`fn` returns early (e.g. limit reached), the remaining group data is discarded — the S3 reads
+have already been issued. In practice `forEachBlockInGroups` is only called for Case A
+(pure intrinsic, equality predicates) where refs cluster in 1–3 blocks, so at most 1–2
+groups are ever pre-fetched. The over-fetch cost is negligible.
+
+**Buffer lifecycle:** Each group's `map[int][]byte` is released entry-by-entry via
+`delete(fetched[i].data, blockIdx)` immediately after `ParseBlockFromBytes` returns,
+letting the GC reclaim block bytes before the next group is processed. The local `bwb`
+variable holds `bwb.RawBytes` alive through the `fn` call (NOTE-001 lazy decode safety).
+
+**Back-refs:** `stream.go:forEachBlockInGroups`

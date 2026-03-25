@@ -38,3 +38,5 @@ cmd/querybench/querybench
 parquet-otlp-forwarder
 bpanalyze
 querybench
+.docker/tempo-blockpack
+cmd/tempo/tempo

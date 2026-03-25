@@ -174,11 +174,12 @@ func traceAccumulateRow(
 	tsNanos := int64(tsVal) //nolint:gosec
 
 	// Skip spans outside the query time window (SPEC-ETM-6).
-	if tsNanos < tb.StartTime || tsNanos >= tb.EndTime {
+	// Intervals are right-closed: (StartTime, EndTime] — matches Tempo semantics.
+	if tsNanos <= tb.StartTime || tsNanos > tb.EndTime {
 		return
 	}
 
-	bucketIdx := (tsNanos - tb.StartTime) / tb.StepSizeNanos
+	bucketIdx := timeBucketIndex(tsNanos, tb.StartTime, tb.StepSizeNanos)
 
 	// Build group key from GroupBy attributes (SPEC-ETM-8).
 	groupBy := querySpec.Aggregate.GroupBy
@@ -420,6 +421,19 @@ func traceRowValue(bucket *aggBucketState, funcName string, stepSec, quantile fl
 			return math.NaN()
 		}
 	}
+}
+
+// timeBucketIndex returns the right-closed bucket index for ts within (startTime, endTime].
+// Precondition: ts > startTime (caller must range-check before calling).
+// Intervals: (startTime, startTime+step], (startTime+step, startTime+2*step], …
+// A span at exactly startTime+N*step belongs to bucket N-1 (previous bucket).
+func timeBucketIndex(ts, startTime, stepNanos int64) int64 {
+	offset := ts - startTime
+	bkt := offset / stepNanos
+	if offset%stepNanos == 0 {
+		bkt--
+	}
+	return bkt
 }
 
 // traceLabelString builds a deterministic string key from a label slice for sorting.

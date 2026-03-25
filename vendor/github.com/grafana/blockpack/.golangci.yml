@@ -88,6 +88,7 @@ linters:
     # Exclude specific directories
     paths:
       - benchmark
+      - cmd/docs-build
       - bots
       - tempo_parquet_comparison
       - real_world_comparison

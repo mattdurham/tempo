@@ -104,13 +104,13 @@ func executeTraceMetricsIntrinsic(
 		return nil, false, nil
 	}
 
-	// Binary-search to find the index range that overlaps [StartTime, EndTime),
-	// avoiding O(total_spans) iteration when the query window is narrow.
+	// Binary-search to find the index range that overlaps (StartTime, EndTime].
+	// Intervals are right-closed — matches Tempo semantics.
 	lo := sort.Search(len(tsVals), func(i int) bool {
-		return int64(tsVals[i]) >= tb.StartTime //nolint:gosec
+		return int64(tsVals[i]) > tb.StartTime //nolint:gosec
 	})
 	hi := sort.Search(len(tsVals), func(i int) bool {
-		return int64(tsVals[i]) >= tb.EndTime //nolint:gosec
+		return int64(tsVals[i]) > tb.EndTime //nolint:gosec
 	})
 	inRangeRefs := tsCol.BlockRefs[lo:hi]
 	inRangeVals := tsVals[lo:hi]
@@ -128,7 +128,7 @@ func executeTraceMetricsIntrinsic(
 				}
 			}
 			ts := int64(inRangeVals[i]) //nolint:gosec
-			key := strconv.FormatInt((ts-tb.StartTime)/tb.StepSizeNanos, 10) + "\x00"
+			key := strconv.FormatInt(timeBucketIndex(ts, tb.StartTime, tb.StepSizeNanos), 10) + "\x00"
 			intrinsicGetOrCreateBucket(buckets, key).count++
 		}
 		if len(buckets) == 0 {
@@ -146,7 +146,7 @@ func executeTraceMetricsIntrinsic(
 				}
 			}
 			ts := int64(inRangeVals[i]) //nolint:gosec
-			keyToBucket[pk] = (ts - tb.StartTime) / tb.StepSizeNanos
+			keyToBucket[pk] = timeBucketIndex(ts, tb.StartTime, tb.StepSizeNanos)
 		}
 		if len(keyToBucket) == 0 {
 			return &TraceMetricsResult{}, true, nil

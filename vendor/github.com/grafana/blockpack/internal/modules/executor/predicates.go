@@ -889,6 +889,7 @@ func (b blockBitset) toSortedSlice(total int) []int {
 // service are derived from span:name and resource.service.name of the root span.
 // span:end is included for duration fallback when no root span is present in the result set.
 var searchMetaCols = map[string]struct{}{
+	// Trace signal identity and search columns.
 	"trace:id":              {},
 	"span:id":               {},
 	"span:start":            {},
@@ -897,6 +898,12 @@ var searchMetaCols = map[string]struct{}{
 	"span:name":             {},
 	"span:parent_id":        {},
 	"resource.service.name": {},
+	// Log signal identity columns — included so wantColumns covers them for log
+	// signal blocks. Log blocks use different identity column names than trace blocks
+	// (log:trace_id / log:span_id vs trace:id / span:id). NOTE-008.
+	"log:trace_id":  {},
+	"log:span_id":   {},
+	"log:timestamp": {},
 }
 
 // ProgramWantColumns returns the minimal set of column names needed to evaluate program.
