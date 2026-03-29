@@ -2035,9 +2035,9 @@ func scanDecodedDictRefs(col *modules_shared.IntrinsicColumn, leaf vm.RangeNode,
 	var result []modules_shared.BlockRef
 
 	if leaf.Pattern != "" {
-		// Regex predicate: use the package-level cache so the same pattern is only
-		// compiled once across all dict scans (not once per scanDecodedDictRefs call).
-		re, reErr := cachedRegexCompile(leaf.Pattern)
+		// Compile regex directly — avoid feeding unbounded query-driven patterns
+		// into the process-wide cachedRegexCompile sync.Map.
+		re, reErr := regexp.Compile(leaf.Pattern)
 		if reErr != nil {
 			return nil
 		}
