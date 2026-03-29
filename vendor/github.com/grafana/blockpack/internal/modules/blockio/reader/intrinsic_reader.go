@@ -148,7 +148,9 @@ func (r *Reader) GetIntrinsicColumn(name string) (*shared.IntrinsicColumn, error
 		}
 	}
 
-	// Check process-level cache first — decoded IntrinsicColumn is immutable once written.
+	// Check process-level cache first — decoded IntrinsicColumn value fields are immutable
+	// once written; refIndex is a derived, concurrency-safe cache built under sync.Once, so
+	// EnsureRefIndex mutations do not break the immutability assumption for value fields.
 	// Guard: only use process-level cache when fileID is non-empty to prevent cross-file collisions.
 	// NOTE-003: process-level cache uses objectcache.Cache (GC-cooperative weak pointers)
 	// instead of sync.Map with strong refs to allow GC to reclaim decoded columns.

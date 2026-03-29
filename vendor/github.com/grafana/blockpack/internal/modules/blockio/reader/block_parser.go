@@ -5,6 +5,7 @@ package reader
 import (
 	"encoding/binary"
 	"fmt"
+	"sync"
 
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
 )
@@ -270,6 +271,10 @@ func parseBlockColumnsReuse(
 }
 
 // resetColumn zeroes a Column's value fields while retaining the allocation.
+// IMPORTANT: decodeOnce must also be reset here because Column instances are reused
+// across block parses (ParseBlockFromBytes re-uses prevBlock.columns). Without resetting
+// decodeOnce, a lazily-registered column from the previous block would appear already
+// decoded on the next block and decodeNow would never run, leaving stale encoded data.
 func resetColumn(col *Column) {
 	col.StringDict = col.StringDict[:0]
 	col.StringIdx = col.StringIdx[:0]
@@ -289,4 +294,5 @@ func resetColumn(col *Column) {
 	col.rawEncoding = nil
 	col.internMap = nil
 	col.sparseDictIdx = nil // NOTE-PERF-1: clear deferred dense expansion
+	col.decodeOnce = sync.Once{}
 }

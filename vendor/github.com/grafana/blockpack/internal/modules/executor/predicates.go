@@ -1906,7 +1906,8 @@ func BlockRefsFromIntrinsicTOC(r *modules_reader.Reader, program *vm.Program, li
 	// of small independent sets yields ~0 matches, forcing all files to be scanned.
 	// Use a larger overFetch so each condition returns enough refs for the intersection
 	// to find real matches, enabling early-exit across files.
-	// The factor 200 assumes joint selectivity ≥ limit/overFetch = 20/4000 = 0.5%.
+	// limit*10000 capped at 500K balances recall against memory: at limit=20 this is
+	// 200K refs per condition (~4.8MB), giving joint selectivity ≥ 20/200000 = 0.01%.
 	overFetch := 0
 	if limit > 0 {
 		if len(program.Predicates.Nodes) == 1 {
@@ -1963,7 +1964,11 @@ func blockRefsFromIntrinsicPartial(r *modules_reader.Reader, program *vm.Program
 	}
 	overFetch := 0
 	if limit > 0 {
-		overFetch = limit * totalLeaves
+		if len(program.Predicates.Nodes) == 1 {
+			overFetch = limit * totalLeaves
+		} else {
+			overFetch = min(limit*10000, 500_000) // multi-condition AND: cap at 500K to avoid 12MB+ allocations
+		}
 	}
 
 	// Evaluate each top-level node with partial-AND semantics.
