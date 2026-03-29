@@ -68,5 +68,5 @@ func ComputeOverFetchForTest(nodeCount, totalLeaves, limit int) int {
 	if nodeCount == 1 {
 		return limit * totalLeaves
 	}
-	return min(limit*10000, 500_000)
+	return min(min(limit, 50)*10000, 500_000)
 }
