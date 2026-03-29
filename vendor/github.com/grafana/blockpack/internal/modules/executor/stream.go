@@ -845,10 +845,11 @@ func collectIntrinsicTopKKLL(
 	if tsErr != nil || tsCol == nil || len(tsCol.Uint64Values) < len(tsCol.BlockRefs) {
 		return nil, errNeedBlockScan
 	}
-	// Build the ref index once (O(N log N), cached on tsCol via sync.Once), then use
-	// O(log N) LookupRefFast per ref — avoiding per-call allocations vs the old O(N) map build.
-	// Note: EnsureRefIndex allocates on its first call; subsequent calls are free (sync.Once).
-	tsCol.EnsureRefIndex()
+	// Build packed-key → timestamp map from the full column (O(N)).
+	tsMap := make(map[uint32]uint64, len(tsCol.BlockRefs))
+	for i, br := range tsCol.BlockRefs {
+		tsMap[uint32(br.BlockIdx)<<16|uint32(br.RowIdx)] = tsCol.Uint64Values[i] //nolint:gosec
+	}
 
 	// Group M refs by BlockIdx and collect unique block indices.
 	// NOTE-044: group so we can sort blockIdxs by MaxStart before collecting pairs.
@@ -866,13 +867,9 @@ func collectIntrinsicTopKKLL(
 	}
 
 	// Sort blockIdxs by BlockMeta.MaxStart DESC: process newest blocks first.
-	// NOTE-044: MaxStart is the maximum span:start in the block (KLL upper bound).
-	// This ordering biases iteration toward newer blocks, enabling early termination
-	// in future extensions, but correctness here requires the final sort over all pairs.
 	slices.SortFunc(blockOrder, func(a, b int) int {
 		metaA := r.BlockMeta(a)
 		metaB := r.BlockMeta(b)
-		// Descending: newer (larger MaxStart) first.
 		return cmp.Compare(metaB.MaxStart, metaA.MaxStart)
 	})
 
@@ -883,9 +880,9 @@ func collectIntrinsicTopKKLL(
 	pairs := make([]refTS, 0, len(refs))
 	for _, bi := range blockOrder {
 		for _, ref := range blockRefs[uint16(bi)] { //nolint:gosec // bi is bounded by block count
-			packed := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx)
-			if val, ok := tsCol.LookupRefFast(packed); ok {
-				pairs = append(pairs, refTS{ref: ref, ts: val.(uint64)})
+			packed := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx) //nolint:gosec
+			if ts, ok := tsMap[packed]; ok {
+				pairs = append(pairs, refTS{ref: ref, ts: ts})
 			}
 		}
 	}
@@ -978,17 +975,18 @@ func collectIntrinsicTopKScan(
 	if len(selected) > 0 && (opts.TimeRange.MinNano > 0 || opts.TimeRange.MaxNano > 0) {
 		tsCol, tsErr := r.GetIntrinsicColumn(opts.TimestampColumn)
 		if tsErr == nil && tsCol != nil && len(tsCol.Uint64Values) == len(tsCol.BlockRefs) {
-			// Use EnsureRefIndex + LookupRefFast: O(K log N) avoiding per-call allocations
-			// vs the old O(N) map build over 3.3M entries.
-			tsCol.EnsureRefIndex()
+			// Build packed-key → timestamp map for time-range filtering.
+			tsMap := make(map[uint32]uint64, len(tsCol.BlockRefs))
+			for i, br := range tsCol.BlockRefs {
+				tsMap[uint32(br.BlockIdx)<<16|uint32(br.RowIdx)] = tsCol.Uint64Values[i] //nolint:gosec
+			}
 			filtered := selected[:0]
 			for _, ref := range selected {
-				packed := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx)
-				val, ok := tsCol.LookupRefFast(packed)
+				packed := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx) //nolint:gosec
+				ts, ok := tsMap[packed]
 				if !ok {
 					continue
 				}
-				ts := val.(uint64)
 				if opts.TimeRange.MinNano > 0 && ts < opts.TimeRange.MinNano {
 					continue
 				}
@@ -1213,20 +1211,50 @@ func filterRowSetByIntrinsicNodes(
 // span:end is synthesized from span:start + span:duration (no TOC entry) and handled
 // explicitly after the main column loop.
 func lookupIntrinsicFields(r *modules_reader.Reader, selected []modules_shared.BlockRef, wantCols map[string]struct{}) []map[string]any {
+	m := len(selected)
+	index := make(map[uint32]int, m)
+	for i, ref := range selected {
+		index[uint32(ref.BlockIdx)<<16|uint32(ref.RowIdx)] = i //nolint:gosec
+	}
+
 	result := make([]map[string]any, len(selected))
 	for i := range result {
 		result[i] = make(map[string]any, 12)
 	}
 
-	// lookupColumn uses EnsureRefIndex (O(N log N) one-time sort, cached on the column
-	// object in objectcache) then LookupRefFast (O(log N) binary search per ref).
-	// Total per column: O(M log N) for M target refs — versus the old O(N) full scan.
-	lookupColumn := func(colName string, col *modules_shared.IntrinsicColumn) {
-		col.EnsureRefIndex()
-		for i, ref := range selected {
-			packed := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx) //nolint:gosec
-			if val, ok := col.LookupRefFast(packed); ok {
-				result[i][colName] = val
+	// O(N) scan per column with O(1) hash-map lookup per entry. GetIntrinsicColumn is
+	// objectcache-backed so the column lives in process memory (zero S3 I/O after warmup).
+	// This is cheaper than EnsureRefIndex O(N log N) sort when objectcache entries are
+	// GC'd frequently (weak pointers), which happens at scale (49+ files × 7 columns).
+	loadColumn := func(colName string, col *modules_shared.IntrinsicColumn) {
+		switch col.Format {
+		case modules_shared.IntrinsicFormatDict:
+			isInt := col.Type == modules_shared.ColumnTypeInt64 ||
+				col.Type == modules_shared.ColumnTypeRangeInt64
+			for _, entry := range col.DictEntries {
+				var val any
+				if isInt {
+					val = entry.Int64Val
+				} else {
+					val = entry.Value
+				}
+				for _, ref := range entry.BlockRefs {
+					key := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx) //nolint:gosec
+					if idx, ok := index[key]; ok {
+						result[idx][colName] = val
+					}
+				}
+			}
+		case modules_shared.IntrinsicFormatFlat:
+			for i, ref := range col.BlockRefs {
+				key := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx) //nolint:gosec
+				if idx, ok := index[key]; ok {
+					if len(col.Uint64Values) > i {
+						result[idx][colName] = col.Uint64Values[i]
+					} else if len(col.BytesValues) > i {
+						result[idx][colName] = col.BytesValues[i]
+					}
+				}
 			}
 		}
 	}
@@ -1241,16 +1269,16 @@ func lookupIntrinsicFields(r *modules_reader.Reader, selected []modules_shared.B
 		if err != nil || col == nil {
 			continue
 		}
-		lookupColumn(colName, col)
+		loadColumn(colName, col)
 	}
 
 	if wantCols == nil {
 		if col, err := r.GetIntrinsicColumn("span:end"); err == nil && col != nil {
-			lookupColumn("span:end", col)
+			loadColumn("span:end", col)
 		}
 	} else if _, needed := wantCols["span:end"]; needed {
 		if col, err := r.GetIntrinsicColumn("span:end"); err == nil && col != nil {
-			lookupColumn("span:end", col)
+			loadColumn("span:end", col)
 		}
 	}
 
