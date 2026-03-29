@@ -51,9 +51,11 @@ type Column struct {
 	sparseDictIdx []uint32
 
 	// Total span count this column covers (including nulls).
-	SpanCount  int
-	decodeOnce sync.Once // ensures decodeNow runs at most once, safe for concurrent callers
-	Type       shared.ColumnType
+	SpanCount    int
+	decodeOnce   sync.Once // ensures decodeNow runs at most once, safe for concurrent callers
+	presenceOnce sync.Once // ensures lazy presence decode in IsPresent runs at most once
+	denseOnce    sync.Once // ensures expandDenseIdx runs at most once
+	Type         shared.ColumnType
 }
 
 // IsDecoded reports whether this column's values have been fully decoded.
@@ -79,12 +81,14 @@ func (c *Column) EnsureDecoded() {
 // Called automatically by StringValue, Int64Value, etc. when sparseDictIdx is set.
 // NOTE-PERF-1: deferred from decode time to first-access time.
 func (c *Column) expandDenseIdx() {
-	if c.sparseDictIdx == nil {
-		return
-	}
-	dense := expandSparseIndexes(c.sparseDictIdx, c.Present, c.SpanCount)
-	c.sparseDictIdx = nil // release sparse slice — no longer needed
-	assignDictIdx(c, dense)
+	c.denseOnce.Do(func() {
+		if c.sparseDictIdx == nil {
+			return
+		}
+		dense := expandSparseIndexes(c.sparseDictIdx, c.Present, c.SpanCount)
+		c.sparseDictIdx = nil // release sparse slice — no longer needed
+		assignDictIdx(c, dense)
+	})
 }
 
 // IsPresent reports whether span at idx has a value.
@@ -95,15 +99,16 @@ func (c *Column) expandDenseIdx() {
 func (c *Column) IsPresent(idx int) bool {
 	if c.Present == nil {
 		if c.rawEncoding != nil {
-			present, err := decodePresenceOnly(c.rawEncoding, c.SpanCount)
-			if err != nil {
-				// Mark column as fully-absent so retry returns false consistently.
-				c.Present = []byte{}
-				c.rawEncoding = nil
-				c.internMap = nil
-				return false
-			}
-			c.Present = present
+			c.presenceOnce.Do(func() {
+				present, err := decodePresenceOnly(c.rawEncoding, c.SpanCount)
+				if err != nil {
+					c.Present = []byte{}
+					c.rawEncoding = nil
+					c.internMap = nil
+					return
+				}
+				c.Present = present
+			})
 		} else {
 			return true // no presence bitmap = all spans present
 		}
