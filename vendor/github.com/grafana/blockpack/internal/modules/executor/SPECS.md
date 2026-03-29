@@ -782,3 +782,35 @@ Invoked when `QueryTraceQL` receives a `*traceqlparser.MetricsQuery` (e.g.
 
 Back-ref: `api.go:streamPipelineQuery`, `api.go:computeSpansetAggregate`,
 `api.go:getSpanFieldNumeric`, `api.go:compareThreshold`
+
+---
+
+## 13. Intrinsic Section Usage Invariant
+
+**SPEC-INTRINSIC-001: The intrinsic section is ONLY for predicate evaluation (filtering).**
+
+The intrinsic section (sorted-by-value columns) is used exclusively by `BlockRefsFromIntrinsicTOC`
+and `blockRefsFromIntrinsicPartial` to find matching refs via binary search, dict lookup, and
+set intersection. It is never used for span reconstruction or field population.
+
+Field values for search result display are always read from **block columns** via
+`forEachBlockInGroups`. Block columns contain all intrinsic values (dual storage).
+This separation ensures:
+- Predicate evaluation: O(log N + M) via sorted intrinsic columns (binary search, dict lookup)
+- Field population: O(M) via block reads (one read per matched block)
+
+**SPEC-INTRINSIC-002: Query result cardinality is always small (M << N).**
+
+Typical queries return <100 traces with <10 spans each. Field population via block reads
+is O(M) and always cheap. The intrinsic section optimization targets predicate evaluation
+(reducing N to M), not field population.
+
+**SPEC-INTRINSIC-003: TraceQL metrics queries may read intrinsic columns directly.**
+
+`ExecuteMetricsTraceQL` and `ExecuteTraceMetrics` aggregate over intrinsic flat columns
+(span:start, span:duration) without materializing spans. These are the exception to
+SPEC-INTRINSIC-001 — they read intrinsic column values for aggregation, not for span
+reconstruction.
+
+Back-ref: `stream.go:collectIntrinsicPlain`, `stream.go:collectIntrinsicTopK`,
+`predicates.go:BlockRefsFromIntrinsicTOC`, `metrics_trace.go:ExecuteTraceMetrics`
