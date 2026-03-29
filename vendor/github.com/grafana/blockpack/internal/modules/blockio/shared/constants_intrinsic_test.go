@@ -2,12 +2,6 @@ package shared
 
 import "testing"
 
-func TestIntrinsicPageTOCVersion2(t *testing.T) {
-	if IntrinsicPageTOCVersion2 != 0x02 {
-		t.Errorf("IntrinsicPageTOCVersion2 = 0x%02x, want 0x02", IntrinsicPageTOCVersion2)
-	}
-}
-
 func TestFooterV4Constants(t *testing.T) {
 	// FooterV4Size must be 34: version[2] + headerOffset[8] + compactOffset[8]
 	// + compactLen[4] + intrinsicIndexOffset[8] + intrinsicIndexLen[4]

@@ -626,3 +626,34 @@ func TestSearchMetaColsDoNotIncludeIntrinsicColumns(t *testing.T) {
 			"searchMetaCols must not include trace intrinsic column %q (served exclusively by intrinsic section)", col)
 	}
 }
+
+// TestOverFetchCap_SingleCondition verifies that for a single-node program the overFetch
+// equals limit * totalLeaves (no cap applied).
+func TestOverFetchCap_SingleCondition(t *testing.T) {
+	// 1 top-level node, 3 leaves, limit=20 → overFetch = 20*3 = 60
+	got := executor.ComputeOverFetchForTest(1, 3, 20)
+	assert.Equal(t, 60, got, "single-condition overFetch must be limit*leaves")
+}
+
+// TestOverFetchCap_MultiCondition verifies that for a multi-node program the overFetch
+// is min(limit*10000, 500_000) regardless of leaf count.
+// With limit=20 and 3 nodes: min(20*10000, 500_000) = min(200_000, 500_000) = 200_000.
+func TestOverFetchCap_MultiCondition(t *testing.T) {
+	// 3 top-level nodes (AND), limit=20 → overFetch = min(20*10000, 500_000) = 200_000
+	got := executor.ComputeOverFetchForTest(3, 3, 20)
+	assert.Equal(t, 200_000, got, "multi-condition overFetch must be min(limit*10000, 500_000)")
+}
+
+// TestOverFetchCap_LargeLimitCapped verifies that the cap of 500_000 applies when
+// limit*10000 would exceed it.
+// With limit=60: 60*10000 = 600_000 → capped at 500_000.
+func TestOverFetchCap_LargeLimitCapped(t *testing.T) {
+	got := executor.ComputeOverFetchForTest(2, 10, 60)
+	assert.Equal(t, 500_000, got, "overFetch must not exceed 500_000")
+}
+
+// TestOverFetchCap_ZeroLimit verifies that limit=0 produces overFetch=0 (no limit).
+func TestOverFetchCap_ZeroLimit(t *testing.T) {
+	got := executor.ComputeOverFetchForTest(3, 5, 0)
+	assert.Equal(t, 0, got, "overFetch must be 0 when limit=0")
+}

@@ -153,8 +153,7 @@ func EncodePageTOC(toc PagedIntrinsicTOC) ([]byte, error) {
 }
 
 // DecodePageTOC decompresses a page TOC blob and parses it into a PagedIntrinsicTOC.
-// Supports version 0x01 (no ref-range fields) and version 0x02 (legacy: ref-range fields
-// are read and discarded for backward compatibility). Unknown versions return an error.
+// Only version 0x01 (no ref-range fields) is supported. Unknown versions return an error.
 func DecodePageTOC(blob []byte) (PagedIntrinsicTOC, error) {
 	raw, err := snappy.Decode(nil, blob)
 	if err != nil {
@@ -167,7 +166,7 @@ func DecodePageTOC(blob []byte) (PagedIntrinsicTOC, error) {
 	version := raw[pos]
 	pos++ // page_toc_version
 
-	if version != 0x01 && version != IntrinsicPageTOCVersion2 {
+	if version != 0x01 {
 		return PagedIntrinsicTOC{}, fmt.Errorf("DecodePageTOC: unknown version %d", version)
 	}
 
@@ -235,33 +234,14 @@ func DecodePageTOC(blob []byte) (PagedIntrinsicTOC, error) {
 			pos += bloomLen
 		}
 
-		pm := PageMeta{
+		pages = append(pages, PageMeta{
 			Offset:   offset,
 			Length:   length,
 			RowCount: rowCount,
 			Min:      minVal,
 			Max:      maxVal,
 			Bloom:    bloom,
-		}
-
-		if version == IntrinsicPageTOCVersion2 {
-			// Read and discard ref-range index fields from legacy v0x02 files.
-			if pos+10 > len(raw) {
-				return PagedIntrinsicTOC{}, fmt.Errorf("DecodePageTOC: truncated at ref-range fields")
-			}
-			pos += 4 // MinRef — discard
-			pos += 4 // MaxRef — discard
-			refBloomLen := int(binary.LittleEndian.Uint16(raw[pos:]))
-			pos += 2
-			if refBloomLen > 0 {
-				if pos+refBloomLen > len(raw) {
-					return PagedIntrinsicTOC{}, fmt.Errorf("DecodePageTOC: truncated at ref_bloom")
-				}
-				pos += refBloomLen // RefBloom — discard
-			}
-		}
-
-		pages = append(pages, pm)
+		})
 	}
 
 	return PagedIntrinsicTOC{

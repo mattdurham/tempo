@@ -4,6 +4,7 @@ package shared
 
 import (
 	"encoding/binary"
+	"sync"
 	"testing"
 
 	"github.com/golang/snappy"
@@ -100,7 +101,6 @@ func buildMultiPageFlatBlob(pages []struct {
 }
 
 // TestPageMetaFields verifies that PageMeta stores core fields correctly.
-// (MinRef/MaxRef/RefBloom were removed in NOTE-007.)
 func TestPageMetaFields(t *testing.T) {
 	bloom := make([]byte, 16)
 	bloom[0] = 0xFF
@@ -188,10 +188,10 @@ func TestEncodeDecodeTOC_V1_RoundTrip(t *testing.T) {
 	}
 }
 
-// TestEncodeDecodeTOC_V1_Fallback verifies that a v0x01 TOC blob is decoded with
-// conservative fallback values: MinRef=0, MaxRef=^uint32(0), RefBloom=nil.
-func TestEncodeDecodeTOC_V1_Fallback(t *testing.T) {
-	// Build a v1 TOC manually (no MinRef/MaxRef/RefBloom fields).
+// TestEncodeDecodeTOC_V1_ManualBlob verifies that a manually-built v0x01 TOC blob
+// is decoded correctly (no ref-range fields present since NOTE-007).
+func TestEncodeDecodeTOC_V1_ManualBlob(t *testing.T) {
+	// Build a v1 TOC manually.
 	// Format: version[1]=0x01, page_count[4], block_idx_width[1], row_idx_width[1],
 	//         format[1], col_type[1], per page: offset[4], length[4], row_count[4],
 	//         min_len[2]+min, max_len[2]+max, bloom_len[2]+bloom.
@@ -611,7 +611,6 @@ func buildDictPageRaw(entries []dictTestEntry) []byte {
 	return raw
 }
 
-
 // assemblePaged assembles a v2 paged blob from a TOC blob and page blobs.
 func assemblePaged(tocBlob []byte, pageBlobs [][]byte) []byte {
 	total := 1 + 4 + len(tocBlob)
@@ -628,4 +627,177 @@ func assemblePaged(tocBlob []byte, pageBlobs [][]byte) []byte {
 		out = append(out, pb...)
 	}
 	return out
+}
+
+// --- EnsureRefIndex / LookupRefFast tests ---
+
+// TestEnsureRefIndex_Flat builds a flat IntrinsicColumn with known uint64 values and
+// refs, calls EnsureRefIndex, then verifies LookupRefFast returns correct values for
+// known refs and (nil, false) for unknown refs.
+func TestEnsureRefIndex_Flat(t *testing.T) {
+	col := &IntrinsicColumn{
+		Format: IntrinsicFormatFlat,
+		Type:   ColumnTypeUint64,
+		Uint64Values: []uint64{
+			1000,
+			2000,
+			3000,
+		},
+		BlockRefs: []BlockRef{
+			{BlockIdx: 0, RowIdx: 5},
+			{BlockIdx: 1, RowIdx: 10},
+			{BlockIdx: 2, RowIdx: 15},
+		},
+		Count: 3,
+	}
+
+	col.EnsureRefIndex()
+
+	tests := []struct {
+		name      string
+		blockIdx  uint16
+		rowIdx    uint16
+		wantVal   uint64
+		wantFound bool
+	}{
+		{"first ref", 0, 5, 1000, true},
+		{"middle ref", 1, 10, 2000, true},
+		{"last ref", 2, 15, 3000, true},
+		{"unknown ref", 9, 9, 0, false},
+		{"wrong row", 0, 6, 0, false},
+		{"wrong block", 3, 5, 0, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			packed := uint32(tt.blockIdx)<<16 | uint32(tt.rowIdx)
+			val, found := col.LookupRefFast(packed)
+			if found != tt.wantFound {
+				t.Fatalf("LookupRefFast: found=%v, want %v", found, tt.wantFound)
+			}
+			if tt.wantFound {
+				v, ok := val.(uint64)
+				if !ok {
+					t.Fatalf("val type = %T, want uint64", val)
+				}
+				if v != tt.wantVal {
+					t.Errorf("val = %d, want %d", v, tt.wantVal)
+				}
+			}
+		})
+	}
+}
+
+// TestEnsureRefIndex_Dict builds a dict IntrinsicColumn with known string entries,
+// calls EnsureRefIndex, then verifies LookupRefFast returns correct dict values.
+func TestEnsureRefIndex_Dict(t *testing.T) {
+	col := &IntrinsicColumn{
+		Format: IntrinsicFormatDict,
+		Type:   ColumnTypeString,
+		DictEntries: []IntrinsicDictEntry{
+			{
+				Value:     "alpha",
+				BlockRefs: []BlockRef{{BlockIdx: 0, RowIdx: 1}, {BlockIdx: 0, RowIdx: 2}},
+			},
+			{
+				Value:     "beta",
+				BlockRefs: []BlockRef{{BlockIdx: 1, RowIdx: 0}},
+			},
+			{
+				Value:     "gamma",
+				BlockRefs: []BlockRef{{BlockIdx: 2, RowIdx: 3}, {BlockIdx: 2, RowIdx: 4}},
+			},
+		},
+		Count: 5,
+	}
+
+	col.EnsureRefIndex()
+
+	tests := []struct {
+		name      string
+		blockIdx  uint16
+		rowIdx    uint16
+		wantVal   string
+		wantFound bool
+	}{
+		{"alpha ref 0", 0, 1, "alpha", true},
+		{"alpha ref 1", 0, 2, "alpha", true},
+		{"beta ref", 1, 0, "beta", true},
+		{"gamma ref 0", 2, 3, "gamma", true},
+		{"gamma ref 1", 2, 4, "gamma", true},
+		{"unknown", 9, 9, "", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			packed := uint32(tt.blockIdx)<<16 | uint32(tt.rowIdx)
+			val, found := col.LookupRefFast(packed)
+			if found != tt.wantFound {
+				t.Fatalf("LookupRefFast: found=%v, want %v", found, tt.wantFound)
+			}
+			if tt.wantFound {
+				s, ok := val.(string)
+				if !ok {
+					t.Fatalf("val type = %T, want string", val)
+				}
+				if s != tt.wantVal {
+					t.Errorf("val = %q, want %q", s, tt.wantVal)
+				}
+			}
+		})
+	}
+}
+
+// TestEnsureRefIndex_Nil verifies that EnsureRefIndex on a nil column is a no-op
+// and LookupRefFast on nil returns (nil, false).
+func TestEnsureRefIndex_Nil(t *testing.T) {
+	var col *IntrinsicColumn
+	col.EnsureRefIndex() // must not panic
+
+	val, found := col.LookupRefFast(0x00010001)
+	if found {
+		t.Errorf("LookupRefFast on nil: found=true, want false")
+	}
+	if val != nil {
+		t.Errorf("LookupRefFast on nil: val=%v, want nil", val)
+	}
+}
+
+// TestEnsureRefIndex_Concurrent calls EnsureRefIndex from 10 goroutines simultaneously
+// on the same column and verifies no panic and correct results after all goroutines finish.
+func TestEnsureRefIndex_Concurrent(t *testing.T) {
+	col := &IntrinsicColumn{
+		Format:       IntrinsicFormatFlat,
+		Type:         ColumnTypeUint64,
+		Uint64Values: []uint64{100, 200, 300},
+		BlockRefs: []BlockRef{
+			{BlockIdx: 0, RowIdx: 0},
+			{BlockIdx: 0, RowIdx: 1},
+			{BlockIdx: 0, RowIdx: 2},
+		},
+		Count: 3,
+	}
+
+	const goroutines = 10
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+
+	for range goroutines {
+		go func() {
+			defer wg.Done()
+			col.EnsureRefIndex()
+		}()
+	}
+	wg.Wait()
+
+	// After all goroutines complete, index must be valid and lookups must succeed.
+	packed := uint32(0)<<16 | uint32(1)
+	val, found := col.LookupRefFast(packed)
+	if !found {
+		t.Fatal("LookupRefFast after concurrent EnsureRefIndex: not found")
+	}
+	v, ok := val.(uint64)
+	if !ok || v != 200 {
+		t.Errorf("LookupRefFast: val=%v, want uint64(200)", val)
+	}
 }
