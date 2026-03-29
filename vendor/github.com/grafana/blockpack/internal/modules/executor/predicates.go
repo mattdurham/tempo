@@ -1912,7 +1912,7 @@ func BlockRefsFromIntrinsicTOC(r *modules_reader.Reader, program *vm.Program, li
 		if len(program.Predicates.Nodes) == 1 {
 			overFetch = limit * totalLeaves
 		} else {
-			overFetch = limit * 10000 // multi-condition AND: enough for very low-selectivity intersections
+			overFetch = min(limit*10000, 500_000) // multi-condition AND: cap at 500K to avoid 12MB+ allocations
 		}
 	}
 
@@ -2035,8 +2035,9 @@ func scanDecodedDictRefs(col *modules_shared.IntrinsicColumn, leaf vm.RangeNode,
 	var result []modules_shared.BlockRef
 
 	if leaf.Pattern != "" {
-		// Regex predicate.
-		re, reErr := regexp.Compile(leaf.Pattern)
+		// Regex predicate: use the package-level cache so the same pattern is only
+		// compiled once across all dict scans (not once per scanDecodedDictRefs call).
+		re, reErr := cachedRegexCompile(leaf.Pattern)
 		if reErr != nil {
 			return nil
 		}

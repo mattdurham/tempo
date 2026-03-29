@@ -111,7 +111,12 @@ func DecodePagedColumnBlobFiltered(blob []byte, refFilter map[uint32]struct{}) (
 		}
 	}
 
-	_ = refFilter // retained for API compatibility; page-skipping removed in NOTE-007
+	// refFilter is accepted for API compatibility: callers (e.g. GetIntrinsicColumnForRefs
+	// in intrinsic_reader.go) build and pass a non-nil map, but the page-skipping
+	// optimization that consumed it was removed in NOTE-007. All pages are decoded and
+	// the parameter is intentionally unused here. Callers must filter on the returned
+	// column's BlockRefs when they need a subset of rows.
+	_ = refFilter
 	return merged, nil
 }
 

@@ -616,7 +616,7 @@ func collectFromIntrinsicRefs(
 		return collectIntrinsicPlain(r, refs, opts, wantColumns, secondPassCols, stats)
 	}
 	if isPureIntrinsic && hasSort {
-		return collectIntrinsicTopK(r, refs, opts, wantColumns, secondPassCols, stats)
+		return collectIntrinsicTopK(r, refs, opts, secondPassCols, stats)
 	}
 	if !hasSort {
 		// Case C: mixed + no sort
@@ -796,7 +796,6 @@ func collectIntrinsicTopK(
 	r *modules_reader.Reader,
 	refs []modules_shared.BlockRef,
 	opts CollectOptions,
-	wantColumns map[string]struct{},
 	secondPassCols map[string]struct{},
 	stats *CollectStats,
 ) ([]MatchedRow, error) {
@@ -815,25 +814,14 @@ func collectIntrinsicTopK(
 	if len(selected) == 0 {
 		return nil, nil
 	}
-	// Use block reads for field population — same as collectIntrinsicPlain (NOTE-053).
-	// For K=20 selected refs this reads ~20 blocks × 800KB = 16MB instead of scanning
-	// all N entries in every intrinsic column via lookupIntrinsicFields.
-	slices.SortFunc(selected, blockRefCompare)
-	blockOrder, blockCandidates := groupRefsByBlock(selected)
-	var results []MatchedRow
-	err = forEachBlockInGroups(r, blockOrder, blockCandidates, wantColumns, secondPassCols, "collectIntrinsicTopK",
-		func(pb parsedBlock, candidateRows []int) error {
-			for _, rowIdx := range candidateRows {
-				results = append(results, MatchedRow{
-					Block:    pb.Block,
-					BlockIdx: pb.BlockIdx,
-					RowIdx:   rowIdx,
-				})
-			}
-			return nil
+	fieldMaps := lookupIntrinsicFields(r, selected, secondPassCols)
+	results := make([]MatchedRow, 0, len(selected))
+	for i, ref := range selected {
+		results = append(results, MatchedRow{
+			IntrinsicFields: &intrinsicFieldsProvider{fields: fieldMaps[i]},
+			BlockIdx:        int(ref.BlockIdx),
+			RowIdx:          int(ref.RowIdx),
 		})
-	if err != nil {
-		return nil, err
 	}
 	return results, nil
 }
@@ -859,13 +847,9 @@ func collectIntrinsicTopKKLL(
 	if tsErr != nil || tsCol == nil || len(tsCol.Uint64Values) < len(tsCol.BlockRefs) {
 		return nil, errNeedBlockScan
 	}
-	// Build packed-key → timestamp map from the full column (O(N)).
-	// Packing invariant: BlockRef fields are uint16, so BlockIdx occupies bits 31-16
-	// and RowIdx occupies bits 15-0 — no collision is possible.
-	tsMap := make(map[uint32]uint64, len(tsCol.BlockRefs))
-	for i, br := range tsCol.BlockRefs {
-		tsMap[uint32(br.BlockIdx)<<16|uint32(br.RowIdx)] = tsCol.Uint64Values[i]
-	}
+	// Build the ref index once (O(N log N), cached on tsCol via sync.Once), then use
+	// O(log N) LookupRefFast per ref — zero new allocation vs the old O(N) map build.
+	tsCol.EnsureRefIndex()
 
 	// Group M refs by BlockIdx and collect unique block indices.
 	// NOTE-044: group so we can sort blockIdxs by MaxStart before collecting pairs.
@@ -900,9 +884,9 @@ func collectIntrinsicTopKKLL(
 	pairs := make([]refTS, 0, len(refs))
 	for _, bi := range blockOrder {
 		for _, ref := range blockRefs[uint16(bi)] { //nolint:gosec // bi is bounded by block count
-			key := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx)
-			if ts, ok := tsMap[key]; ok {
-				pairs = append(pairs, refTS{ref: ref, ts: ts})
+			packed := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx)
+			if val, ok := tsCol.LookupRefFast(packed); ok {
+				pairs = append(pairs, refTS{ref: ref, ts: val.(uint64)})
 			}
 		}
 	}
@@ -995,17 +979,17 @@ func collectIntrinsicTopKScan(
 	if len(selected) > 0 && (opts.TimeRange.MinNano > 0 || opts.TimeRange.MaxNano > 0) {
 		tsCol, tsErr := r.GetIntrinsicColumn(opts.TimestampColumn)
 		if tsErr == nil && tsCol != nil && len(tsCol.Uint64Values) == len(tsCol.BlockRefs) {
-			tsMap := make(map[uint32]uint64, len(tsCol.BlockRefs))
-			for i, br := range tsCol.BlockRefs {
-				tsMap[uint32(br.BlockIdx)<<16|uint32(br.RowIdx)] = tsCol.Uint64Values[i]
-			}
+			// Use EnsureRefIndex + LookupRefFast: O(K log N) with zero new allocation
+			// vs the old O(N) map build over 3.3M entries.
+			tsCol.EnsureRefIndex()
 			filtered := selected[:0]
 			for _, ref := range selected {
-				key := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx)
-				ts, ok := tsMap[key]
+				packed := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx)
+				val, ok := tsCol.LookupRefFast(packed)
 				if !ok {
 					continue
 				}
+				ts := val.(uint64)
 				if opts.TimeRange.MinNano > 0 && ts < opts.TimeRange.MinNano {
 					continue
 				}
