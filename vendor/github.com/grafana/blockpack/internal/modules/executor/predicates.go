@@ -1913,7 +1913,7 @@ func BlockRefsFromIntrinsicTOC(r *modules_reader.Reader, program *vm.Program, li
 		if len(program.Predicates.Nodes) == 1 {
 			overFetch = limit * totalLeaves
 		} else {
-			overFetch = min(limit*10000, 500_000) // multi-condition AND: cap at 500K to avoid 12MB+ allocations
+			overFetch = min(min(limit, 50)*10000, 500_000) // multi-condition AND: cap limit to prevent int overflow
 		}
 	}
 
@@ -1967,7 +1967,7 @@ func blockRefsFromIntrinsicPartial(r *modules_reader.Reader, program *vm.Program
 		if len(program.Predicates.Nodes) == 1 {
 			overFetch = limit * totalLeaves
 		} else {
-			overFetch = min(limit*10000, 500_000) // multi-condition AND: cap at 500K to avoid 12MB+ allocations
+			overFetch = min(min(limit, 50)*10000, 500_000) // multi-condition AND: cap limit to prevent int overflow
 		}
 	}
 
