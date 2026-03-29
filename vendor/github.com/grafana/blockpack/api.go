@@ -602,11 +602,18 @@ func streamFilterProgram(r *Reader, program *vm.Program, opts QueryOptions, fn s
 	// these columns are present in block payloads and the maps are never needed.
 	var traceIDByRef map[uint32][]byte
 	var spanIDByRef map[uint32][]byte
+	// Separate "attempted" flags prevent repeated calls to buildIntrinsicBytesMap when
+	// it returns nil (e.g. no intrinsic section). Without these flags, every row would
+	// re-invoke the expensive O(N) map-build path and still get nil back.
+	var traceIDMapAttempted bool
+	var spanIDMapAttempted bool
 	buildIDMaps := func() {
-		if traceIDByRef == nil {
+		if !traceIDMapAttempted {
+			traceIDMapAttempted = true
 			traceIDByRef = buildIntrinsicBytesMap(r, "trace:id")
 		}
-		if spanIDByRef == nil {
+		if !spanIDMapAttempted {
+			spanIDMapAttempted = true
 			spanIDByRef = buildIntrinsicBytesMap(r, "span:id")
 		}
 	}

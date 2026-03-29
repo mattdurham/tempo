@@ -848,7 +848,8 @@ func collectIntrinsicTopKKLL(
 		return nil, errNeedBlockScan
 	}
 	// Build the ref index once (O(N log N), cached on tsCol via sync.Once), then use
-	// O(log N) LookupRefFast per ref — zero new allocation vs the old O(N) map build.
+	// O(log N) LookupRefFast per ref — avoiding per-call allocations vs the old O(N) map build.
+	// Note: EnsureRefIndex allocates on its first call; subsequent calls are free (sync.Once).
 	tsCol.EnsureRefIndex()
 
 	// Group M refs by BlockIdx and collect unique block indices.
@@ -979,7 +980,7 @@ func collectIntrinsicTopKScan(
 	if len(selected) > 0 && (opts.TimeRange.MinNano > 0 || opts.TimeRange.MaxNano > 0) {
 		tsCol, tsErr := r.GetIntrinsicColumn(opts.TimestampColumn)
 		if tsErr == nil && tsCol != nil && len(tsCol.Uint64Values) == len(tsCol.BlockRefs) {
-			// Use EnsureRefIndex + LookupRefFast: O(K log N) with zero new allocation
+			// Use EnsureRefIndex + LookupRefFast: O(K log N) avoiding per-call allocations
 			// vs the old O(N) map build over 3.3M entries.
 			tsCol.EnsureRefIndex()
 			filtered := selected[:0]
