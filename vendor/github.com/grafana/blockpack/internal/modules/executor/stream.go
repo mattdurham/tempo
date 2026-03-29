@@ -763,17 +763,24 @@ func collectIntrinsicPlain(
 		refs = refs[:opts.Limit]
 	}
 
-	// Resolve fields from objectcache-backed intrinsic columns — zero S3 I/O after
-	// warmup. lookupIntrinsicFields uses EnsureRefIndex for O(M log N) binary search
-	// per ref, cached on the column object via sync.Once.
-	fieldMaps := lookupIntrinsicFields(r, refs, secondPassCols)
-	results := make([]MatchedRow, 0, len(refs))
-	for i, ref := range refs {
-		results = append(results, MatchedRow{
-			IntrinsicFields: &intrinsicFieldsProvider{fields: fieldMaps[i]},
-			BlockIdx:        int(ref.BlockIdx),
-			RowIdx:          int(ref.RowIdx),
+	// Read the specific internal blocks containing matched refs.
+	// Block columns have all field values (dual storage). For M=20 refs this reads
+	// ~20 blocks × ~1MB each — cheaper than scanning 3.2M intrinsic entries per column.
+	blockOrder, blockCandidates := groupRefsByBlock(refs)
+	var results []MatchedRow
+	err := forEachBlockInGroups(r, blockOrder, blockCandidates, wantColumns, secondPassCols, "collectIntrinsicPlain",
+		func(pb parsedBlock, candidateRows []int) error {
+			for _, rowIdx := range candidateRows {
+				results = append(results, MatchedRow{
+					Block:    pb.Block,
+					BlockIdx: pb.BlockIdx,
+					RowIdx:   rowIdx,
+				})
+			}
+			return nil
 		})
+	if err != nil {
+		return nil, err
 	}
 	return results, nil
 }
