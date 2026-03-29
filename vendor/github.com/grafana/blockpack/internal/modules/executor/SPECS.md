@@ -812,5 +812,17 @@ is O(M) and always cheap. The intrinsic section optimization targets predicate e
 SPEC-INTRINSIC-001 — they read intrinsic column values for aggregation, not for span
 reconstruction.
 
+**SPEC-INTRINSIC-004: Always check bloom and min/max at every level before scanning.**
+
+Before any intrinsic column scan, the following pruning checks MUST be applied in order:
+
+1. **Tempo level (BlockMeta)**: time range, column-level min/max if available
+2. **File level (FileBloom)**: check file bloom filter for predicate values — skip entire file if bloom says "not present"
+3. **Block level (planBlocks / range index)**: per-internal-block min/max pruning — skip internal blocks whose value range doesn't overlap the predicate
+
+The intrinsic fast path (`collectFromIntrinsicRefs`) currently bypasses all three.
+This must be fixed: integrate FileBloom check before `BlockRefsFromIntrinsicTOC`,
+and pass the planBlocks-pruned block set to limit the intrinsic scan scope.
+
 Back-ref: `stream.go:collectIntrinsicPlain`, `stream.go:collectIntrinsicTopK`,
 `predicates.go:BlockRefsFromIntrinsicTOC`, `metrics_trace.go:ExecuteTraceMetrics`
