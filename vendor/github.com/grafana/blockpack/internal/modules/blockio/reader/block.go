@@ -5,13 +5,14 @@ package reader
 
 import (
 	"encoding/hex"
+	"sync"
 
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
 )
 
 // Column holds a decoded column ready for query evaluation.
 type Column struct {
-	internMap map[string]string // borrowed from Reader.internStrings for lazy decode
+	internMap map[string]string // per-column intern map for lazy decode
 	Name      string
 
 	// Dictionary fields — MUST be heap-allocated (never arena) per NOTES §10.
@@ -50,8 +51,9 @@ type Column struct {
 	sparseDictIdx []uint32
 
 	// Total span count this column covers (including nulls).
-	SpanCount int
-	Type      shared.ColumnType
+	SpanCount  int
+	decodeOnce sync.Once // ensures decodeNow runs at most once, safe for concurrent callers
+	Type       shared.ColumnType
 }
 
 // IsDecoded reports whether this column's values have been fully decoded.

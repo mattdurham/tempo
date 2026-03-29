@@ -661,9 +661,9 @@ func TestFetch_TimeRangeSkip(t *testing.T) {
 	sixMonthsAgo := uint64(time.Now().Add(-180 * 24 * time.Hour).UnixNano())
 
 	req := traceql.FetchSpansRequest{
-		Conditions:          nil,
-		StartTimeUnixNanos:  oneYearAgo,
-		EndTimeUnixNanos:    sixMonthsAgo,
+		Conditions:         nil,
+		StartTimeUnixNanos: oneYearAgo,
+		EndTimeUnixNanos:   sixMonthsAgo,
 	}
 
 	resp, err := block.Fetch(ctx, req, common.SearchOptions{})
@@ -682,7 +682,6 @@ func TestFetch_TimeRangeSkip(t *testing.T) {
 
 	require.Empty(t, results, "time-range skip: block with future spans must return empty when queried in the past")
 }
-
 
 // TestFetch_BoolAttrConvertedToString verifies that boolean span attributes are
 // returned as string "true"/"false" in AllAttributesFunc, not as Go bool.

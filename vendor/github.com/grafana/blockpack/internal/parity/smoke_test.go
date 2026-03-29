@@ -24,6 +24,7 @@ import (
 	blockpack "github.com/grafana/blockpack"
 	modules_blockio "github.com/grafana/blockpack/internal/modules/blockio"
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
+	modules_shared "github.com/grafana/blockpack/internal/modules/blockio/shared"
 	modules_rw "github.com/grafana/blockpack/internal/modules/rw"
 )
 
@@ -142,84 +143,112 @@ func TestParitySmokeTest(t *testing.T) {
 	b := bwb.Block
 	require.Equal(t, 1, b.SpanCount(), "block must contain exactly one span")
 
-	// --- Intrinsic field assertions ---
+	// --- Identity column assertions (NOTE-005) ---
+	// trace:id, span:id, span:parent_id are no longer stored in the intrinsic section
+	// (NOTE-005 in writer/NOTES.md). They are stored only in block column payloads.
 
 	t.Run("trace:id", func(t *testing.T) {
-		col := b.GetColumn("trace:id")
-		require.NotNil(t, col, "trace:id column must be present")
-		v, ok := col.BytesValue(0)
+		col, err := r.GetIntrinsicColumn("trace:id")
+		require.NoError(t, err)
+		assert.Nil(t, col, "trace:id must NOT be in intrinsic section (NOTE-005)")
+		// Must be present as a block column.
+		bcol := b.GetColumn("trace:id")
+		require.NotNil(t, bcol, "trace:id must be present as a block column")
+		v, ok := bcol.BytesValue(0)
 		assert.True(t, ok)
 		assert.Equal(t, traceID[:], v)
 	})
 
 	t.Run("span:id", func(t *testing.T) {
-		col := b.GetColumn("span:id")
-		require.NotNil(t, col, "span:id column must be present")
-		v, ok := col.BytesValue(0)
+		col, err := r.GetIntrinsicColumn("span:id")
+		require.NoError(t, err)
+		assert.Nil(t, col, "span:id must NOT be in intrinsic section (NOTE-005)")
+		// Must be present as a block column.
+		bcol := b.GetColumn("span:id")
+		require.NotNil(t, bcol, "span:id must be present as a block column")
+		v, ok := bcol.BytesValue(0)
 		assert.True(t, ok)
 		assert.Equal(t, spanID, v)
 	})
 
 	t.Run("span:parent_id", func(t *testing.T) {
-		col := b.GetColumn("span:parent_id")
-		require.NotNil(t, col, "span:parent_id column must be present")
-		v, ok := col.BytesValue(0)
+		col, err := r.GetIntrinsicColumn("span:parent_id")
+		require.NoError(t, err)
+		assert.Nil(t, col, "span:parent_id must NOT be in intrinsic section (NOTE-005)")
+		// Must be present as a block column.
+		bcol := b.GetColumn("span:parent_id")
+		require.NotNil(t, bcol, "span:parent_id must be present as a block column")
+		v, ok := bcol.BytesValue(0)
 		assert.True(t, ok)
 		assert.Equal(t, parentID, v)
 	})
 
 	t.Run("span:name", func(t *testing.T) {
-		col := b.GetColumn("span:name")
-		require.NotNil(t, col, "span:name column must be present")
-		v, ok := col.StringValue(0)
+		col, err := r.GetIntrinsicColumn("span:name")
+		require.NoError(t, err)
+		require.NotNil(t, col, "span:name must be in intrinsic section")
+		v, ok := intrinsicDictStringForRow(col, 0, 0)
 		assert.True(t, ok)
 		assert.Equal(t, "parity.smoke.operation", v)
 	})
 
 	t.Run("span:kind", func(t *testing.T) {
-		col := b.GetColumn("span:kind")
-		require.NotNil(t, col, "span:kind column must be present")
-		v, ok := col.Int64Value(0)
+		col, err := r.GetIntrinsicColumn("span:kind")
+		require.NoError(t, err)
+		require.NotNil(t, col, "span:kind must be in intrinsic section")
+		v, ok := intrinsicDictInt64ForRow(col, 0, 0)
 		assert.True(t, ok)
 		assert.Equal(t, int64(tracev1.Span_SPAN_KIND_SERVER), v)
 	})
 
 	t.Run("span:start", func(t *testing.T) {
-		col := b.GetColumn("span:start")
-		require.NotNil(t, col, "span:start column must be present")
-		v, ok := col.Uint64Value(0)
+		col, err := r.GetIntrinsicColumn("span:start")
+		require.NoError(t, err)
+		require.NotNil(t, col, "span:start must be in intrinsic section")
+		v, ok := intrinsicUint64ForRow(col, 0, 0)
 		assert.True(t, ok)
 		assert.Equal(t, uint64(1_000_000_000), v)
 	})
 
 	t.Run("span:end", func(t *testing.T) {
-		col := b.GetColumn("span:end")
-		require.NotNil(t, col, "span:end column must be present")
-		v, ok := col.Uint64Value(0)
+		// span:end is synthesized from span:start + span:duration on read.
+		col, err := r.GetIntrinsicColumn("span:end")
+		require.NoError(t, err)
+		require.NotNil(t, col, "span:end must be synthesized from intrinsic section")
+		v, ok := intrinsicUint64ForRow(col, 0, 0)
 		assert.True(t, ok)
 		assert.Equal(t, uint64(3_000_000_000), v)
 	})
 
 	t.Run("span:duration", func(t *testing.T) {
-		col := b.GetColumn("span:duration")
-		require.NotNil(t, col, "span:duration column must be present")
-		v, ok := col.Uint64Value(0)
+		col, err := r.GetIntrinsicColumn("span:duration")
+		require.NoError(t, err)
+		require.NotNil(t, col, "span:duration must be in intrinsic section")
+		v, ok := intrinsicUint64ForRow(col, 0, 0)
 		assert.True(t, ok)
 		assert.Equal(t, uint64(2_000_000_000), v) // 3e9 - 1e9
 	})
 
 	t.Run("span:status", func(t *testing.T) {
-		col := b.GetColumn("span:status")
-		require.NotNil(t, col, "span:status must be present for non-zero status code")
-		v, ok := col.Int64Value(0)
+		// span:status is now intrinsic-only; no longer written as a block column.
+		col, err := r.GetIntrinsicColumn("span:status")
+		require.NoError(t, err)
+		require.NotNil(t, col, "span:status must be in intrinsic section for non-zero status code")
+		v, ok := intrinsicDictInt64ForRow(col, 0, 0)
 		assert.True(t, ok)
 		assert.Equal(t, int64(tracev1.Status_STATUS_CODE_ERROR), v)
 	})
 
 	t.Run("span:status_message", func(t *testing.T) {
-		col := b.GetColumn("span:status_message")
-		require.NotNil(t, col, "span:status_message must be present for non-empty message")
-		v, ok := col.StringValue(0)
+		// span:status_message is no longer stored in the intrinsic section (NOTE-005).
+		// It is stored only in block column payloads.
+		col, err := r.GetIntrinsicColumn("span:status_message")
+		require.NoError(t, err)
+		assert.Nil(t, col, "span:status_message must NOT be in intrinsic section (NOTE-005)")
+		// Must be present as a block column.
+		bcol := b.GetColumn("span:status_message")
+		require.NotNil(t, bcol, "span:status_message must be present as a block column")
+		v, ok := bcol.StringValue(0)
 		assert.True(t, ok)
 		assert.Equal(t, "something went wrong", v)
 	})
@@ -293,9 +322,11 @@ func TestParitySmokeTest(t *testing.T) {
 	// --- Resource attribute assertions ---
 
 	t.Run("resource.service.name (string)", func(t *testing.T) {
-		col := b.GetColumn("resource.service.name")
-		require.NotNil(t, col, "resource.service.name must be present")
-		v, ok := col.StringValue(0)
+		// resource.service.name is now intrinsic-only; no longer written as a block column.
+		col, err := r.GetIntrinsicColumn("resource.service.name")
+		require.NoError(t, err)
+		require.NotNil(t, col, "resource.service.name must be in intrinsic section")
+		v, ok := intrinsicDictStringForRow(col, 0, 0)
 		assert.True(t, ok)
 		assert.Equal(t, "parity-svc", v)
 	})
@@ -373,6 +404,54 @@ func TestParitySmokeTest(t *testing.T) {
 		assert.True(t, ok)
 		assert.Equal(t, []byte{0xCA, 0xFE}, v)
 	})
+}
+
+// intrinsicBytesForRow returns the bytes value from a flat IntrinsicColumn for
+// the given (blockIdx, rowIdx). Returns nil if not found.
+func intrinsicBytesForRow(col *modules_shared.IntrinsicColumn, blockIdx, rowIdx uint16) []byte {
+	for i, ref := range col.BlockRefs {
+		if ref.BlockIdx == blockIdx && ref.RowIdx == rowIdx {
+			return col.BytesValues[i]
+		}
+	}
+	return nil
+}
+
+// intrinsicUint64ForRow returns the uint64 value from a flat IntrinsicColumn for
+// the given (blockIdx, rowIdx). Returns 0, false if not found.
+func intrinsicUint64ForRow(col *modules_shared.IntrinsicColumn, blockIdx, rowIdx uint16) (uint64, bool) {
+	for i, ref := range col.BlockRefs {
+		if ref.BlockIdx == blockIdx && ref.RowIdx == rowIdx {
+			return col.Uint64Values[i], true
+		}
+	}
+	return 0, false
+}
+
+// intrinsicDictStringForRow returns the string value from a dict IntrinsicColumn for
+// the given (blockIdx, rowIdx). Returns "", false if not found.
+func intrinsicDictStringForRow(col *modules_shared.IntrinsicColumn, blockIdx, rowIdx uint16) (string, bool) {
+	for _, entry := range col.DictEntries {
+		for _, ref := range entry.BlockRefs {
+			if ref.BlockIdx == blockIdx && ref.RowIdx == rowIdx {
+				return entry.Value, true
+			}
+		}
+	}
+	return "", false
+}
+
+// intrinsicDictInt64ForRow returns the int64 value from a dict IntrinsicColumn for
+// the given (blockIdx, rowIdx). Returns 0, false if not found.
+func intrinsicDictInt64ForRow(col *modules_shared.IntrinsicColumn, blockIdx, rowIdx uint16) (int64, bool) {
+	for _, entry := range col.DictEntries {
+		for _, ref := range entry.BlockRefs {
+			if ref.BlockIdx == blockIdx && ref.RowIdx == rowIdx {
+				return entry.Int64Val, true
+			}
+		}
+	}
+	return 0, false
 }
 
 // --- Public API surface checks ---

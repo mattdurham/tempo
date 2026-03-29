@@ -1,22 +1,8 @@
 # Blockpack
 
-**Blockpack** is a columnar storage format purpose-built for OpenTelemetry trace data. It achieves **10–50× compression** over raw OTLP and answers TraceQL queries with a fraction of the I/O of general-purpose columnar formats like Parquet — by indexing every column automatically and clustering spans by service, time, and attribute similarity before they are written.
+**Blockpack** is a research storage format for OpenTelemetry trace data exploring two ideas: automatically building a range index over every column using KLL quantile sketches, and clustering spans by attribute similarity using Jaccard (MinHash) signatures before block assignment. The goal is to make arbitrary range and attribute predicates efficiently prunable without any schema declaration at write time.
 
 > Built for object storage. Designed for Tempo and Grafana.
-
-## Wiki
-
-| Page | Description |
-|---|---|
-| [File Format](File-Format.md) | Block layout, column encodings, indexes, and I/O design |
-| [Execution Path](Execution-Path.md) | How a TraceQL query flows through the pipeline, with animation |
-| [Write Path](Write-Path.md) | How spans are ingested, clustered, encoded, and indexed |
-| [KLL Sketches](KLL.md) | Range index: quantile sketch for duration/timestamp pruning |
-| [Count-Min Sketch](CMS.md) | Frequency estimation and zero-estimate block pruning |
-| [TopK](TopK.md) | Top-K frequent values for block scoring |
-| [HyperLogLog](HLL.md) | Cardinality estimation for block scoring |
-| [Bloom Filters](Bloom-Filter.md) | BinaryFuse8 block and file-level membership tests |
-| [Intrinsic Columns](Intrinsic-Columns.md) | File-level core span attributes |
 
 ## Primary Goals
 
@@ -24,7 +10,7 @@ Blockpack was designed around two core principles:
 
 ### 1. Index every column via KLL
 
-Every numeric column — duration, timestamp, status code, latency, or any custom attribute — is automatically indexed using a [KLL quantile sketch](https://arxiv.org/abs/1603.05346). This means any range predicate (`duration > 5ms`, `latency < 100ms`) can be evaluated against the index to prune blocks before any I/O is issued. There is no need to declare which columns should be indexed at write time; the system indexes everything.
+Every column — numeric (duration, timestamp, status code, latency) or string (service name, HTTP route, environment) or bytes — is automatically indexed using a [KLL quantile sketch](https://arxiv.org/abs/1603.05346). This means any range predicate (`duration > 5ms`, `service.name > "m"`) can be evaluated against the index to prune blocks before any I/O is issued. There is no need to declare which columns should be indexed at write time; the system indexes everything.
 
 ### 2. Tight compaction through structured grouping
 
@@ -34,13 +20,13 @@ Spans are clustered before being assigned to blocks using a three-level sort key
 2. **`timestamp`** — ensures temporal locality within a service, making time-range pruning highly effective
 3. **Jaccard (MinHash) signature** — groups spans with similar attribute sets using a 32-byte MinHash fingerprint derived from their key/value pairs. Spans that share the same attributes (same HTTP route, same error code, same environment) land in the same block, dramatically improving columnar compression ratios
 
-This combination means blocks are internally homogeneous: similar spans grouped by service and attribute similarity, sorted by time. The result is the 10–50× compression ratio over raw OTLP and highly effective block-level pruning even for arbitrary attribute queries.
+This combination means blocks are internally homogeneous: similar spans grouped by service and attribute similarity, sorted by time. The result is that spans with common attributes land together in the same block, creating better compression opportunities for columnar encodings and making block-level pruning effective for arbitrary attribute queries.
 
 ## Overview
 
 Blockpack is a specialized file format designed for storing and querying distributed traces. It combines columnar storage, adaptive compression, and multi-level indexing to provide:
 
-- **10-50x compression** compared to raw OTLP traces
+- **Significant compression** over raw OTLP traces via columnar encoding and span clustering
 - **Fast queries** via TraceQL (filter, metrics, and structural queries)
 - **Efficient trace lookups** with O(log N) performance
 - **Block-level pruning** using bloom filters and statistics
@@ -49,6 +35,12 @@ Blockpack is a specialized file format designed for storing and querying distrib
 ## AI Workflow
 
 Blockpack uses a SPECS/NOTES/BENCHMARKS/TESTS workflow, when an agent sees this please sync the code and details as appropriate.
+
+Examples from the blockio module:
+- [SPECS.md](https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/SPECS.md)
+- [NOTES.md](https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/NOTES.md)
+- [BENCHMARKS.md](https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/BENCHMARKS.md)
+- [TESTS.md](https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/TESTS.md)
 
 ## Features
 
@@ -111,7 +103,7 @@ Install required tools with `make install-tools`. Then:
 
 ### File Structure
 
-Each blockpack file is a sequence of block payloads followed by a metadata section (block index, dedicated column indexes, trace block index), a fixed header, and a 10-byte footer. See [doc/BLOCKPACK_FORMAT.md](doc/BLOCKPACK_FORMAT.md) for the full specification.
+Each blockpack file is a sequence of block payloads followed by a metadata section (block index, dedicated column indexes, trace block index), a fixed header, and a 10-byte footer. See the [File Format](https://ubiquitous-couscous-qjl94l2.pages.github.io/File-Format) page for the full specification.
 
 ### Query Execution Pipeline
 
@@ -143,11 +135,11 @@ Blockpack targets object storage (S3/GCS/Azure) where request latency (50-100ms)
 
 ## Documentation
 
-- [Blockpack Format Specification](doc/BLOCKPACK_FORMAT.md) — Complete technical specification
-- [Benchmark Comparison](doc/BENCHMARK_COMPARISON.md) — Performance vs Parquet
-- [Query Planning](doc/query_planning.md) — Query optimization strategies
-- [Block Diagram](doc/BLOCK_DIAGRAM.md) — Visual representation of file structure
-- [Grammar](doc/GRAMMAR.md) — Naming conventions and intrinsic rules
+- [File Format](https://ubiquitous-couscous-qjl94l2.pages.github.io/file-format) — Block layout, column encodings, indexes
+- [Execution Path](https://ubiquitous-couscous-qjl94l2.pages.github.io/execution-path) — Query pipeline walkthrough
+- [Write Path](https://ubiquitous-couscous-qjl94l2.pages.github.io/write-path) — Ingestion, clustering, and index construction
+- [Block Format](https://ubiquitous-couscous-qjl94l2.pages.github.io/block-format) — Column layout, encoding types, read patterns
+- [Production Results](https://ubiquitous-couscous-qjl94l2.pages.github.io/production-results) — Benchmark vs Parquet on real traffic
 
 ## Quality Standards
 

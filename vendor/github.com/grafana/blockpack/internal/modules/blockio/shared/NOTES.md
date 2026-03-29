@@ -76,6 +76,61 @@ Back-ref: `internal/modules/blockio/shared/presence_rle.go`,
 
 ---
 
+## 6. NOTE-006: PageMeta Extended with Ref-Range Index (2026-03-28)
+*Added: 2026-03-28*
+
+**Decision:** Added `MinRef uint32`, `MaxRef uint32`, `RefBloom []byte` to `PageMeta`.
+
+**Rationale:** Enables O(M × page_fraction) reverse lookups instead of O(N) full column
+scans. When `lookupIntrinsicFields` needs values for M target spans from an N-row column,
+it previously decoded all N rows; now it decodes only pages whose ref-range covers at
+least one of the M target refs.
+
+**Wire format:** Page TOC version bumped to 0x02 (`IntrinsicPageTOCVersion2`). Version
+0x01 files are read with conservative defaults (MinRef=0, MaxRef=^uint32(0), RefBloom=nil)
+— all pages are decoded, no regression for old files.
+
+**Encoding of packed ref:** `uint32(blockIdx)<<16|uint32(rowIdx)`. Bloom key is the 4-byte
+little-endian encoding of this value. Same bloom parameters as value bloom
+(K=7, BitsPerItem=10, min=16 bytes, max=4096 bytes).
+
+**Access path:** `Reader.GetIntrinsicColumnForRefs` builds a `map[uint32]struct{}` from the
+target refs and calls `shared.DecodePagedColumnBlobFiltered`. The result is NOT cached
+(query-scoped partial column). The blob-level cache is still used for I/O efficiency.
+
+Back-ref: `internal/modules/blockio/shared/types.go:PageMeta`,
+`internal/modules/blockio/shared/intrinsic_ref_filter.go`,
+`internal/modules/blockio/shared/intrinsic_codec.go:EncodePageTOC/DecodePageTOC`
+
+*Superseded by NOTE-007 (2026-03-29): RefBloom/MinRef/MaxRef removed. See NOTE-007 for rationale.*
+
+---
+
+## 7. NOTE-007: RefBloom Removed from Page TOC (2026-03-29)
+*Added: 2026-03-29*
+
+**Decision:** Removed `RefBloom []byte`, `MinRef uint32`, and `MaxRef uint32` from
+`PageMeta`. Removed `IntrinsicRefBloomBytes` (256) and `IntrinsicRefBloomK` (3) constants.
+Removed `matchesRefFilter`, `refFilterRange`, `uint32ToLE` from `intrinsic_ref_filter.go`
+(functions were only used for page-skipping which is now removed). `EncodePageTOC` now
+writes version 0x01 (no ref-range fields). `DecodePageTOC` reads and discards the ref-range
+bytes in v0x02 files for backward compatibility.
+
+**Rationale:** RefBloom was designed to skip pages during reverse-lookup (`lookupIntrinsicFields`).
+After the companion change that switches field population entirely to `forEachBlockInGroups`
+(block reads), there are no remaining calls to `lookupIntrinsicFields` from the Case A
+(plain) path. The ref-bloom provided zero pruning benefit at 10K entries/page with 256 bytes
+(FPR ≈ 100% when full). Removal saves 256 bytes/page of storage and eliminates the bloom
+maintenance cost at write time.
+
+**Backward compat:** v0x02 files decode correctly — the ref-range bytes are read and
+discarded. New files write v0x01 (no ref-range fields).
+
+Back-ref: `shared/constants.go`, `shared/types.go`, `shared/intrinsic_codec.go`,
+`writer/intrinsic_accum.go`
+
+---
+
 ## 5. AttrKV Slice Instead of map[string]AttrValue
 *Added: 2026-03-05*
 

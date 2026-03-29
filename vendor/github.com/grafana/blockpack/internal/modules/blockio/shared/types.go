@@ -2,6 +2,8 @@ package shared
 
 // NOTE: Any changes to this file must be reflected in the corresponding specs.md or NOTES.md.
 
+import "sync"
+
 // ColumnType is the logical column type (0–12); values 13–255 are reserved.
 type ColumnType uint8
 
@@ -81,6 +83,13 @@ type BlockRef struct {
 	RowIdx   uint16
 }
 
+// RefIndexEntry is one entry in IntrinsicColumn.refIndex.
+// Enables O(log N) reverse lookup from packed ref to column value.
+type RefIndexEntry struct {
+	Packed uint32 // blockIdx<<16 | rowIdx
+	Pos    int32  // index into BlockRefs/values (flat) or DictEntries (dict)
+}
+
 // IntrinsicColumn is the decoded result of reading one intrinsic column blob.
 // Returned by GetIntrinsicColumn on a Reader.
 type IntrinsicColumn struct {
@@ -88,12 +97,20 @@ type IntrinsicColumn struct {
 	// For flat columns (IntrinsicFormatFlat):
 	Uint64Values []uint64   // non-nil for ColumnTypeUint64
 	BytesValues  [][]byte   // non-nil for ColumnTypeBytes
-	BlockRefs    []BlockRef // parallel to Uint64Values / BytesValues
+	BlockRefs    []BlockRef // parallel to Uint64Values / BytesValues; sorted by VALUE
 	// For dict columns (IntrinsicFormatDict):
 	DictEntries []IntrinsicDictEntry
 	Count       uint32
 	Type        ColumnType
 	Format      uint8
+
+	// refIndex is a sorted-by-packed-ref lookup table for O(log N) reverse lookup.
+	// Built lazily by EnsureRefIndex on first reverse-lookup call.
+	// For flat: Pos indexes into BlockRefs/Uint64Values/BytesValues.
+	// For dict: Pos is the DictEntries index.
+	// Thread safety: built under refIndexOnce; safe for concurrent reads after that.
+	refIndex     []RefIndexEntry
+	refIndexOnce sync.Once
 }
 
 // IntrinsicDictEntry is one entry in a decoded dictionary intrinsic column.

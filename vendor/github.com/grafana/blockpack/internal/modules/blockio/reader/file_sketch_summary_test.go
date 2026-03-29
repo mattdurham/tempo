@@ -56,8 +56,10 @@ func TestFileSketchSummary_ColumnPresent(t *testing.T) {
 	require.NotNil(t, summary)
 	require.NotEmpty(t, summary.Columns)
 
-	col := summary.Columns["resource.service.name"]
-	require.NotNil(t, col, "resource.service.name must be present")
+	// resource.service.name is now intrinsic-only and no longer tracked in the sketch index.
+	// Use span:name, which is still tracked in the sketch index via updateMinMax.
+	col := summary.Columns["span:name"]
+	require.NotNil(t, col, "span:name must be present in sketch")
 	assert.NotNil(t, col.CMS, "CMS must not be nil")
 	assert.Greater(t, col.TotalDistinct, uint32(0), "TotalDistinct must be positive")
 }
@@ -71,11 +73,12 @@ func TestFileSketchSummary_CMSAbsence(t *testing.T) {
 	summary := r.FileSketchSummary()
 	require.NotNil(t, summary)
 
-	col := summary.Columns["resource.service.name"]
+	// resource.service.name is now intrinsic-only; use span:name which is sketch-tracked.
+	col := summary.Columns["span:name"]
 	require.NotNil(t, col)
 
-	// "definitely-absent" was never added — CMS must return 0.
-	assert.Equal(t, uint16(0), col.CMS.Estimate("definitely-absent"),
+	// "definitely-absent-op" was never added as a span name — CMS must return 0.
+	assert.Equal(t, uint16(0), col.CMS.Estimate("definitely-absent-op"),
 		"CMS must return 0 for value never added (no false negatives)")
 }
 
@@ -89,11 +92,13 @@ func TestFileSketchSummary_CMSPresence(t *testing.T) {
 	summary := r.FileSketchSummary()
 	require.NotNil(t, summary)
 
-	col := summary.Columns["resource.service.name"]
+	// resource.service.name is now intrinsic-only; use span:name which is sketch-tracked.
+	// All spans were written with span name "op1".
+	col := summary.Columns["span:name"]
 	require.NotNil(t, col)
 
-	assert.Greater(t, col.CMS.Estimate("svc-a"), uint16(0),
-		"CMS must return >0 for value that was added")
+	assert.Greater(t, col.CMS.Estimate("op1"), uint16(0),
+		"CMS must return >0 for span name that was added")
 }
 
 // TestFileSketchSummary_MarshalRoundTrip verifies Marshal→Unmarshal preserves data.
@@ -202,10 +207,12 @@ func TestFileSketchSummary_TopKMerged(t *testing.T) {
 	summary := r.FileSketchSummary()
 	require.NotNil(t, summary)
 
-	col := summary.Columns["resource.service.name"]
+	// resource.service.name is now intrinsic-only; use span:name which is sketch-tracked.
+	// "op1" was used as span name for 50 spans; "op2" for 5 spans.
+	col := summary.Columns["span:name"]
 	require.NotNil(t, col)
 
-	hotFP := sketch.HashForFuse("svc-hot")
+	hotFP := sketch.HashForFuse("op1")
 	var hotCount uint32
 	for _, entry := range col.TopK {
 		if entry.FP == hotFP {
@@ -213,7 +220,7 @@ func TestFileSketchSummary_TopKMerged(t *testing.T) {
 			break
 		}
 	}
-	assert.Greater(t, hotCount, uint32(0), "svc-hot must appear in merged TopK")
+	assert.Greater(t, hotCount, uint32(0), "op1 must appear in merged TopK")
 }
 
 // TestFileSketchSummaryRaw_NilForNoSketch verifies that FileSketchSummaryRaw returns nil

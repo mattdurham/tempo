@@ -49,3 +49,9 @@ func BuildCaseSensitiveSinglePrefixPredicateForTest(
 ) queryplanner.Predicate {
 	return buildCaseSensitiveSinglePrefixPredicate(col, colType, pattern, analysis)
 }
+
+// SearchMetaCols exposes searchMetaCols for invariant tests.
+var SearchMetaCols = searchMetaCols
+
+// TraceIntrinsicColumns exposes traceIntrinsicColumns for invariant tests.
+var TraceIntrinsicColumns = traceIntrinsicColumns

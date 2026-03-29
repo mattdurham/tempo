@@ -487,6 +487,27 @@ func (r *Reader) ParseBlockFromBytes(
 	return &BlockWithBytes{Block: blk, RawBytes: rawBytes}, nil
 }
 
+// ParseBlockFromBytesWithIntern parses a Block from raw bytes using a caller-supplied intern map.
+// The intern map must remain valid until after all lazy column decodes complete (i.e. after
+// the row-emission loop). The caller is responsible for acquiring and releasing the map via
+// AcquireInternMap / ReleaseInternMap.
+//
+// NOTE-006: Used by scanBlocks to eliminate per-call make(map[string]string) allocations.
+// The pooled intern map is held alive for the entire block lifetime (first parse + row loop
+// + second parse) before being returned to the pool.
+func (r *Reader) ParseBlockFromBytesWithIntern(
+	rawBytes []byte,
+	wantColumns map[string]struct{},
+	meta shared.BlockMeta,
+	intern map[string]string,
+) (*BlockWithBytes, error) {
+	blk, err := parseBlockColumnsReuse(rawBytes, wantColumns, nil, meta, intern)
+	if err != nil {
+		return nil, fmt.Errorf("ParseBlockFromBytesWithIntern: %w", err)
+	}
+	return &BlockWithBytes{Block: blk, RawBytes: rawBytes}, nil
+}
+
 // HasTraceIndex reports whether the reader has a populated trace block index.
 func (r *Reader) HasTraceIndex() bool {
 	r.ensureTraceIndex()

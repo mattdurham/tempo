@@ -614,3 +614,15 @@ func TestBuildCaseSensitiveSinglePrefixPredicate_IntervalEncodeFail(t *testing.T
 	assert.Empty(t, pred.Values, "unsupported colType → encode fails → bloom-only")
 	assert.NotEmpty(t, pred.Columns)
 }
+
+// TestSearchMetaColsDoNotIncludeIntrinsicColumns verifies that searchMetaCols contains
+// no column names that are served exclusively by the intrinsic section (traceIntrinsicColumns).
+// Trace intrinsic columns do not exist in block payloads, so including them in searchMetaCols
+// causes useless nil-column decode attempts in ParseBlockFromBytes.
+func TestSearchMetaColsDoNotIncludeIntrinsicColumns(t *testing.T) {
+	for col := range executor.SearchMetaCols {
+		_, isIntrinsic := executor.TraceIntrinsicColumns[col]
+		assert.False(t, isIntrinsic,
+			"searchMetaCols must not include trace intrinsic column %q (served exclusively by intrinsic section)", col)
+	}
+}

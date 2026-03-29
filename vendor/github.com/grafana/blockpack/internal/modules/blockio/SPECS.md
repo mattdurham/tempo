@@ -909,6 +909,12 @@ The following column names are reserved by the format and populated from fixed O
 proto fields. A compliant writer MUST capture every field listed here. Fields that are
 absent or zero-valued in the source proto MAY be omitted from the block to save space.
 
+**Dual storage (as of 2026-03-26):** The modules writer stores these columns in BOTH the
+block column payload (for O(1) row access during result materialization) AND the intrinsic
+TOC section (for fast range scans, bloom pruning, and zero-block-read query paths). See
+writer NOTE-002 for rationale. PR #172 temporarily used exclusive-intrinsic storage but was
+rolled back due to O(8.6B) reverse-lookup cost at scale.
+
 | Column Name              | Type    | Source |
 |--------------------------|---------|--------|
 | `trace:id`               | Bytes   | Span.TraceId |
@@ -1111,3 +1117,76 @@ Properties:
 Back-ref: `internal/modules/blockio/writer/file_bloom.go:writeFileBloomSection`,
           `internal/modules/blockio/reader/file_bloom.go:parseFileBloomSection`,
           `internal/modules/executor/plan_blocks.go:fileLevelBloomReject`
+
+---
+
+## SPEC-INTRINSIC-TOC-V2: Page TOC Wire Format Version 0x02
+*Added: 2026-03-28*
+
+### Overview
+
+The intrinsic column paged format uses a table-of-contents (page TOC) blob that precedes
+the page data blobs. Version 0x01 of this TOC stored only value-range (min/max) and a
+value bloom per page. Version 0x02 adds per-page ref-range fields (`MinRef`, `MaxRef`,
+`RefBloom`) that enable efficient reverse lookups by skipping pages that cannot contain
+any of the target refs.
+
+### Wire Format — `EncodePageTOC` / `DecodePageTOC`
+
+The TOC blob is snappy-compressed. Uncompressed layout:
+
+```
+page_toc_version[1]   // 0x01 = old (no ref fields), 0x02 = new (with ref fields)
+page_count[4 LE]
+block_idx_width[1]    // 1 or 2 (bytes per blockIdx in all pages)
+row_idx_width[1]      // 1 or 2 (bytes per rowIdx in all pages)
+format[1]             // IntrinsicFormatFlat (0x01) or IntrinsicFormatDict (0x02)
+col_type[1]           // ColumnType byte
+
+per page (page_count entries):
+  offset[4 LE]              // byte offset from first page blob start
+  length[4 LE]              // compressed page blob size in bytes
+  row_count[4 LE]           // rows in this page
+  min_len[2 LE] + min[...]  // encoded min value (uint64 LE or string)
+  max_len[2 LE] + max[...]  // encoded max value
+  bloom_len[2 LE] + bloom[...]  // value bloom filter bytes (0 = absent, e.g. flat columns)
+
+  // v0x02 only — ref-range index:
+  min_ref[4 LE]                 // minimum packed ref (blockIdx<<16|rowIdx) in this page
+  max_ref[4 LE]                 // maximum packed ref in this page
+  ref_bloom_len[2 LE] + ref_bloom[...]  // bloom filter over packed refs (nil = empty page)
+```
+
+### Version Compatibility
+
+| Version | MinRef/MaxRef/RefBloom | Action when decoding |
+|---------|------------------------|----------------------|
+| 0x01    | Not present            | Set MinRef=0, MaxRef=^uint32(0), RefBloom=nil (never skip — correct) |
+| 0x02    | Present                | Parse and use for page-level pruning |
+| other   | N/A                    | Return error "DecodePageTOC: unknown version N" |
+
+### V1 Monolithic Format — Removed
+
+The v1 monolithic column format (first byte 0x01, snappy-compressed entire column) is no
+longer supported for encode or decode. `encodeColumn` always produces v2 paged format
+(`IntrinsicPagedVersion = 0x02`) regardless of row count. `DecodeIntrinsicColumnBlob`
+returns an error for any blob whose first byte is not 0x02.
+
+Old files with v1 blobs return an error during decode; callers treat this as column-absent
+(existing `err != nil → continue` in `lookupIntrinsicFields`).
+
+### Ref-Range Index Invariants
+
+- **Packed ref key:** `uint32(blockIdx)<<16 | uint32(rowIdx)` (4-byte LE for bloom).
+- **RefBloom parameters:** same as value bloom — K=7, BitsPerItem=10, min=16 bytes, max=4096 bytes.
+- **Empty pages:** MinRef=0, MaxRef=0, RefBloom=nil. All ref filters skip them (correct: no rows to match).
+- **V1 TOC pages:** MinRef=0, MaxRef=^uint32(0), RefBloom=nil — conservative, always decoded.
+- **encodeColumn invariant:** always produces IntrinsicPagedVersion (0x02) as the first byte.
+
+Back-ref: `internal/modules/blockio/shared/intrinsic_codec.go:EncodePageTOC`,
+`internal/modules/blockio/shared/intrinsic_codec.go:DecodePageTOC`,
+`internal/modules/blockio/shared/intrinsic_ref_filter.go:DecodePagedColumnBlobFiltered`,
+`internal/modules/blockio/writer/intrinsic_accum.go:encodePagedFlatColumn`,
+`internal/modules/blockio/writer/intrinsic_accum.go:encodePagedDictColumn`,
+`internal/modules/blockio/shared/NOTES.md:NOTE-006`,
+`internal/modules/blockio/writer/NOTES.md:NOTE-003,NOTE-004`

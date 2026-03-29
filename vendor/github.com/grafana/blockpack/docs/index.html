@@ -36,29 +36,12 @@
 </nav>
     <main class="content">
 <h1>Blockpack</h1>
-<p><strong>Blockpack</strong> is a columnar storage format purpose-built for OpenTelemetry trace data. It achieves <strong>10–50× compression</strong> over raw OTLP and answers TraceQL queries with a fraction of the I/O of general-purpose columnar formats like Parquet — by indexing every column automatically and clustering spans by service, time, and attribute similarity before they are written.</p>
+<p><strong>Blockpack</strong> is a research storage format for OpenTelemetry trace data exploring two ideas: automatically building a range index over every column using KLL quantile sketches, and clustering spans by attribute similarity using Jaccard (MinHash) signatures before block assignment. The goal is to make arbitrary range and attribute predicates efficiently prunable without any schema declaration at write time.</p>
 <p>> Built for object storage. Designed for Tempo and Grafana.</p>
-<h2>Wiki</h2>
-<table>
-<thead>
-<tr><th>Page</th><th>Description</th></tr>
-</thead>
-<tbody>
-<tr><td><a href="/file-format">File Format</a></td><td>Block layout, column encodings, indexes, and I/O design</td></tr>
-<tr><td><a href="/execution-path">Execution Path</a></td><td>How a TraceQL query flows through the pipeline, with animation</td></tr>
-<tr><td><a href="/write-path">Write Path</a></td><td>How spans are ingested, clustered, encoded, and indexed</td></tr>
-<tr><td><a href="/kll">KLL Sketches</a></td><td>Range index: quantile sketch for duration/timestamp pruning</td></tr>
-<tr><td><a href="/cms">Count-Min Sketch</a></td><td>Frequency estimation and zero-estimate block pruning</td></tr>
-<tr><td><a href="/topk">TopK</a></td><td>Top-K frequent values for block scoring</td></tr>
-<tr><td><a href="/hll">HyperLogLog</a></td><td>Cardinality estimation for block scoring</td></tr>
-<tr><td><a href="/bloom-filter">Bloom Filters</a></td><td>BinaryFuse8 block and file-level membership tests</td></tr>
-<tr><td><a href="/intrinsic-columns">Intrinsic Columns</a></td><td>File-level core span attributes</td></tr>
-</tbody>
-</table>
 <h2>Primary Goals</h2>
 <p>Blockpack was designed around two core principles:</p>
 <h3>1. Index every column via KLL</h3>
-<p>Every numeric column — duration, timestamp, status code, latency, or any custom attribute — is automatically indexed using a <a href="https://arxiv.org/abs/1603.05346">KLL quantile sketch</a>. This means any range predicate (<code>duration &gt; 5ms</code>, <code>latency &lt; 100ms</code>) can be evaluated against the index to prune blocks before any I/O is issued. There is no need to declare which columns should be indexed at write time; the system indexes everything.</p>
+<p>Every column — numeric (duration, timestamp, status code, latency) or string (service name, HTTP route, environment) or bytes — is automatically indexed using a <a href="https://arxiv.org/abs/1603.05346">KLL quantile sketch</a>. This means any range predicate (<code>duration &gt; 5ms</code>, <code>service.name &gt; &quot;m&quot;</code>) can be evaluated against the index to prune blocks before any I/O is issued. There is no need to declare which columns should be indexed at write time; the system indexes everything.</p>
 <h3>2. Tight compaction through structured grouping</h3>
 <p>Spans are clustered before being assigned to blocks using a three-level sort key:</p>
 <ol>
@@ -66,11 +49,11 @@
 <li><strong><code>timestamp</code></strong> — ensures temporal locality within a service, making time-range pruning highly effective</li>
 <li><strong>Jaccard (MinHash) signature</strong> — groups spans with similar attribute sets using a 32-byte MinHash fingerprint derived from their key/value pairs. Spans that share the same attributes (same HTTP route, same error code, same environment) land in the same block, dramatically improving columnar compression ratios</li>
 </ol>
-<p>This combination means blocks are internally homogeneous: similar spans grouped by service and attribute similarity, sorted by time. The result is the 10–50× compression ratio over raw OTLP and highly effective block-level pruning even for arbitrary attribute queries.</p>
+<p>This combination means blocks are internally homogeneous: similar spans grouped by service and attribute similarity, sorted by time. The result is that spans with common attributes land together in the same block, creating better compression opportunities for columnar encodings and making block-level pruning effective for arbitrary attribute queries.</p>
 <h2>Overview</h2>
 <p>Blockpack is a specialized file format designed for storing and querying distributed traces. It combines columnar storage, adaptive compression, and multi-level indexing to provide:</p>
 <ul>
-<li><strong>10-50x compression</strong> compared to raw OTLP traces</li>
+<li><strong>Significant compression</strong> over raw OTLP traces via columnar encoding and span clustering</li>
 <li><strong>Fast queries</strong> via TraceQL (filter, metrics, and structural queries)</li>
 <li><strong>Efficient trace lookups</strong> with O(log N) performance</li>
 <li><strong>Block-level pruning</strong> using bloom filters and statistics</li>
@@ -78,6 +61,13 @@
 </ul>
 <h2>AI Workflow</h2>
 <p>Blockpack uses a SPECS/NOTES/BENCHMARKS/TESTS workflow, when an agent sees this please sync the code and details as appropriate.</p>
+<p>Examples from the blockio module:</p>
+<ul>
+<li><a href="https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/SPECS.md">SPECS.md</a></li>
+<li><a href="https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/NOTES.md">NOTES.md</a></li>
+<li><a href="https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/BENCHMARKS.md">BENCHMARKS.md</a></li>
+<li><a href="https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/TESTS.md">TESTS.md</a></li>
+</ul>
 <h2>Features</h2>
 <h3>Storage Efficiency</h3>
 <ul>
@@ -124,7 +114,7 @@
 </ul>
 <h2>Architecture</h2>
 <h3>File Structure</h3>
-<p>Each blockpack file is a sequence of block payloads followed by a metadata section (block index, dedicated column indexes, trace block index), a fixed header, and a 10-byte footer. See <a href="/doc/blockpack<em>format">doc/BLOCKPACK</em>FORMAT.md</a> for the full specification.</p>
+<p>Each blockpack file is a sequence of block payloads followed by a metadata section (block index, dedicated column indexes, trace block index), a fixed header, and a 10-byte footer. See the <a href="https://ubiquitous-couscous-qjl94l2.pages.github.io/File-Format">File Format</a> page for the full specification.</p>
 <h3>Query Execution Pipeline</h3>
 <p>A TraceQL string is parsed into a typed AST (<code>FilterExpression</code>, <code>MetricsQuery</code>, or <code>StructuralQuery</code>), compiled by the VM into a <code>Program</code> with column predicates and extracted block-pruning predicates, then executed by the <code>BlockpackExecutor</code>. The executor prunes blocks by time range, value statistics, bloom filters, and dedicated indexes before reading each selected block in a single I/O operation and evaluating per-span predicates.</p>
 <h3>Key Components</h3>
@@ -158,11 +148,11 @@
 </table>
 <h2>Documentation</h2>
 <ul>
-<li><a href="/doc/blockpack_format">Blockpack Format Specification</a> — Complete technical specification</li>
-<li><a href="/doc/benchmark_comparison">Benchmark Comparison</a> — Performance vs Parquet</li>
-<li><a href="/doc/query_planning">Query Planning</a> — Query optimization strategies</li>
-<li><a href="/doc/block_diagram">Block Diagram</a> — Visual representation of file structure</li>
-<li><a href="/doc/grammar">Grammar</a> — Naming conventions and intrinsic rules</li>
+<li><a href="https://ubiquitous-couscous-qjl94l2.pages.github.io/file-format">File Format</a> — Block layout, column encodings, indexes</li>
+<li><a href="https://ubiquitous-couscous-qjl94l2.pages.github.io/execution-path">Execution Path</a> — Query pipeline walkthrough</li>
+<li><a href="https://ubiquitous-couscous-qjl94l2.pages.github.io/write-path">Write Path</a> — Ingestion, clustering, and index construction</li>
+<li><a href="https://ubiquitous-couscous-qjl94l2.pages.github.io/block-format">Block Format</a> — Column layout, encoding types, read patterns</li>
+<li><a href="https://ubiquitous-couscous-qjl94l2.pages.github.io/production-results">Production Results</a> — Benchmark vs Parquet on real traffic</li>
 </ul>
 <h2>Quality Standards</h2>
 <p>This project enforces strict quality standards:</p>

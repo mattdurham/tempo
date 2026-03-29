@@ -100,8 +100,10 @@ func TestIterateFieldsNoSeenMapAllocsAfterBuildIterFields(t *testing.T) {
 	require.NotNil(t, block.IterFields())
 
 	// No more than one alloc per column — no seen-map overhead.
-	// With 10 columns per block (7 string + 2 int-like + 1 bytes), expect ≤10 allocs total.
-	const maxExpected = 10.0
+	// With dual storage, intrinsic columns (trace:id, span:id, span:name, span:kind,
+	// span:start, span:end, span:duration) are now in block columns alongside user attrs.
+	// Column count: 7 intrinsics + 3 span attrs + 2 resource attrs = ~12 + buffer = ≤14.
+	const maxExpected = 14.0
 	if fastAllocs > maxExpected {
 		t.Errorf(
 			"IterateFields after BuildIterFields: got %.1f allocs, want ≤%.0f (seen-map must not allocate)",
@@ -134,9 +136,9 @@ func TestSpanMatchCloneAllocsPerSpan(t *testing.T) {
 	})
 	// After fix: allocs = N_columns (value boxing into any) + 1 (owned []kvField copy)
 	// + 1 (materializedSpanFields struct) = ~N+2 allocs.
-	// Previously (map[string]any): N_columns (boxing) + 1 (struct) + 2 (map header + buckets)
-	// = ~N+3 allocs. Set ceiling at 16 to tolerate minor GC/runtime variation across versions.
-	const maxExpected = 16.0
+	// With dual storage, N increased by 7 intrinsic columns now in block payload.
+	// Set ceiling at 18 to tolerate minor GC/runtime variation across versions.
+	const maxExpected = 18.0
 	if allocs > maxExpected {
 		t.Errorf("Clone: got %.1f allocs, want ≤%.0f", allocs, maxExpected)
 	}

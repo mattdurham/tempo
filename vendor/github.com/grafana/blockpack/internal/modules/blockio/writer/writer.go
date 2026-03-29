@@ -49,6 +49,12 @@ type Writer struct {
 	// Fed from flushBlocks and flushLogBlocks; consumed at Flush by buildMetadataSectionBytes.
 	fileBloomSvcNames map[string]struct{}
 
+	// addRowIntrinsicCache caches per-block intrinsic indexes built during AddRowFromReader
+	// calls. Key: (srcReader pointer, srcBlockIdx). Value: pre-built row→field map.
+	// Avoids O(N) IntrinsicBytesAt/IntrinsicDictStringAt scans on every per-row call,
+	// reducing AddRowFromReader from O(N^2) to O(N) per block.
+	addRowIntrinsicCache map[addRowCacheKey]intrinsicRowFields
+
 	out countingWriter
 
 	cfg Config
@@ -911,27 +917,27 @@ func (w *Writer) AddRow(block *reader.Block, rowIdx int) error {
 	if !traceOK || len(traceBytes) != 16 {
 		return fmt.Errorf("writer: AddRow: required column %q must have 16 bytes, got %d", "trace:id", len(traceBytes))
 	}
-	spanIDCol := block.GetColumn("span:id")
+	spanIDCol := block.GetColumn(spanIDColumnName)
 	if spanIDCol == nil {
-		return fmt.Errorf("writer: AddRow: required column %q missing", "span:id")
+		return fmt.Errorf("writer: AddRow: required column %q missing", spanIDColumnName)
 	}
 	spanIDBytes, spanIDOK := spanIDCol.BytesValue(rowIdx)
 	if !spanIDOK || len(spanIDBytes) != 8 {
-		return fmt.Errorf("writer: AddRow: required column %q must have 8 bytes, got %d", "span:id", len(spanIDBytes))
+		return fmt.Errorf("writer: AddRow: required column %q must have 8 bytes, got %d", spanIDColumnName, len(spanIDBytes))
 	}
-	startCol := block.GetColumn("span:start")
+	startCol := block.GetColumn(spanStartColumnName)
 	if startCol == nil {
-		return fmt.Errorf("writer: AddRow: required column %q missing", "span:start")
+		return fmt.Errorf("writer: AddRow: required column %q missing", spanStartColumnName)
 	}
 	if _, ok := startCol.Uint64Value(rowIdx); !ok {
-		return fmt.Errorf("writer: AddRow: required column %q must have uint64 value at row %d", "span:start", rowIdx)
+		return fmt.Errorf("writer: AddRow: required column %q must have uint64 value at row %d", spanStartColumnName, rowIdx)
 	}
-	endCol := block.GetColumn("span:end")
+	endCol := block.GetColumn(spanEndColumnName)
 	if endCol == nil {
-		return fmt.Errorf("writer: AddRow: required column %q missing", "span:end")
+		return fmt.Errorf("writer: AddRow: required column %q missing", spanEndColumnName)
 	}
 	if _, ok := endCol.Uint64Value(rowIdx); !ok {
-		return fmt.Errorf("writer: AddRow: required column %q must have uint64 value at row %d", "span:end", rowIdx)
+		return fmt.Errorf("writer: AddRow: required column %q must have uint64 value at row %d", spanEndColumnName, rowIdx)
 	}
 
 	if !w.inUse.CompareAndSwap(false, true) {
@@ -943,7 +949,7 @@ func (w *Writer) AddRow(block *reader.Block, rowIdx int) error {
 	copy(tid[:], traceBytes)
 
 	var svcName string
-	if col := block.GetColumn("resource.service.name"); col != nil {
+	if col := block.GetColumn(svcNameColumnName); col != nil {
 		if v, ok := col.StringValue(rowIdx); ok {
 			svcName = v
 		}
@@ -965,6 +971,111 @@ func (w *Writer) AddRow(block *reader.Block, rowIdx int) error {
 	}
 
 	return nil
+}
+
+// addRowCacheKey identifies a unique (reader, blockIdx) pair for the AddRowFromReader
+// per-block intrinsic index cache.
+type addRowCacheKey struct {
+	r        *reader.Reader
+	blockIdx int
+}
+
+// AddRowFromReader adds one row from the source block at rowIdx, reading required
+// identity fields (trace:id, span:id, span:start) from the source reader's intrinsic
+// section when block columns are absent (new storage format where intrinsic columns
+// live exclusively in the intrinsic section, not block columns).
+// Uses a per-Writer cache to build the intrinsic index once per (reader, blockIdx) pair,
+// reducing the trace:id and svcName lookups from O(N) per row to O(1).
+func (w *Writer) AddRowFromReader(block *reader.Block, rowIdx int, srcReader *reader.Reader, srcBlockIdx int) error {
+	if block == nil {
+		return fmt.Errorf("writer: AddRowFromReader: block is nil")
+	}
+	if rowIdx < 0 || rowIdx >= block.SpanCount() {
+		return fmt.Errorf("writer: AddRowFromReader: rowIdx %d out of range [0, %d)", rowIdx, block.SpanCount())
+	}
+
+	// Acquire single-use guard before any access to w.addRowIntrinsicCache.
+	if !w.inUse.CompareAndSwap(false, true) {
+		panic("writer: concurrent use detected")
+	}
+	defer w.inUse.Store(false)
+
+	// PATTERN: block-column-first with intrinsic-section fallback (shared across
+	// compaction/compaction.go, writer.go, executor/executor.go, executor/metrics_trace.go).
+	// v3 files store identity columns in block payloads; v4 files store them exclusively
+	// in the intrinsic section. Try the block column first for backwards compat.
+
+	// Resolve trace:id — block column if present, otherwise O(1) index lookup.
+	var traceBytes []byte
+	if col := block.GetColumn("trace:id"); col != nil {
+		traceBytes, _ = col.BytesValue(rowIdx)
+	}
+	if len(traceBytes) != 16 && srcReader != nil {
+		idx := w.getOrBuildAddRowIndex(srcReader, srcBlockIdx)
+		if idx != nil {
+			if v, ok := idx[uint16(rowIdx)]["trace:id"]; ok { //nolint:gosec // rowIdx bounded by SpanCount (≤65535)
+				traceBytes, _ = v.([]byte)
+			}
+		}
+	}
+	if len(traceBytes) != 16 {
+		return fmt.Errorf("writer: AddRowFromReader: trace:id missing at row %d", rowIdx)
+	}
+
+	var tid [16]byte
+	copy(tid[:], traceBytes)
+
+	// svcName — block column if present, otherwise O(1) index lookup.
+	var svcName string
+	if col := block.GetColumn(svcNameColumnName); col != nil {
+		svcName, _ = col.StringValue(rowIdx)
+	}
+	if svcName == "" && srcReader != nil {
+		idx := w.getOrBuildAddRowIndex(srcReader, srcBlockIdx)
+		if idx != nil {
+			if v, ok := idx[uint16(rowIdx)][svcNameColumnName]; ok { //nolint:gosec // rowIdx bounded by SpanCount (≤65535)
+				svcName, _ = v.(string)
+			}
+		}
+	}
+
+	ps := pendingSpan{
+		traceID:     tid,
+		svcName:     svcName,
+		srcBlock:    block,
+		srcReader:   srcReader,
+		srcBlockIdx: srcBlockIdx,
+		srcRowIdx:   rowIdx,
+	}
+	computeMinHashSigFromBlock(&ps, block)
+	w.pending = append(w.pending, ps)
+
+	if w.cfg.MaxBufferedSpans > 0 && len(w.pending) >= w.cfg.MaxBufferedSpans {
+		if err := w.flushBlocks(); err != nil {
+			return fmt.Errorf("writer: auto-flush: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// getOrBuildAddRowIndex returns the cached per-block intrinsic index for the given
+// (srcReader, srcBlockIdx) pair, building it on first access via buildIntrinsicBlockIndex.
+// Called by AddRowFromReader to avoid O(N) IntrinsicBytesAt/IntrinsicDictStringAt scans.
+// Must be called while w.inUse is held (AddRowFromReader acquires the CAS guard first).
+func (w *Writer) getOrBuildAddRowIndex(r *reader.Reader, blockIdx int) intrinsicRowFields {
+	k := addRowCacheKey{r, blockIdx}
+	if w.addRowIntrinsicCache != nil {
+		if idx, ok := w.addRowIntrinsicCache[k]; ok {
+			return idx
+		}
+	}
+	idx := buildIntrinsicBlockIndex(r, blockIdx)
+	if w.addRowIntrinsicCache == nil {
+		w.addRowIntrinsicCache = make(map[addRowCacheKey]intrinsicRowFields)
+	}
+	w.addRowIntrinsicCache[k] = idx
+	return idx
 }
 
 // CurrentSize returns estimated buffered size in bytes.

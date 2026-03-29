@@ -95,14 +95,15 @@ func TestBlockColumnProvider_GetRowCount(t *testing.T) {
 }
 
 func TestBlockColumnProvider_ScanLessThan(t *testing.T) {
+	// Use a user attribute column (span.label) — intrinsic columns (span:name) are no longer
+	// in block columns and are served from the intrinsic section only.
 	block := buildBlock(t, []spanDef{
-		{name: "aardvark", resAttrs: map[string]any{"service.name": "svc"}},
-		{name: "badger", resAttrs: map[string]any{"service.name": "svc"}},
-		{name: "cat", resAttrs: map[string]any{"service.name": "svc"}},
+		{name: "s1", attrs: []*commonv1.KeyValue{kv("label", "aardvark")}, resAttrs: map[string]any{"service.name": "svc"}},
+		{name: "s2", attrs: []*commonv1.KeyValue{kv("label", "badger")}, resAttrs: map[string]any{"service.name": "svc"}},
+		{name: "s3", attrs: []*commonv1.KeyValue{kv("label", "cat")}, resAttrs: map[string]any{"service.name": "svc"}},
 	})
 	p := newBlockColumnProvider(block)
-	// "span:name" is the actual column name (colon syntax for intrinsics)
-	rs, err := p.ScanLessThan("span:name", "badger")
+	rs, err := p.ScanLessThan("span.label", "badger")
 	require.NoError(t, err)
 	rows := collectRows(t, rs)
 	assert.Len(t, rows, 1) // only "aardvark" < "badger"
@@ -110,12 +111,12 @@ func TestBlockColumnProvider_ScanLessThan(t *testing.T) {
 
 func TestBlockColumnProvider_ScanLessThanOrEqual(t *testing.T) {
 	block := buildBlock(t, []spanDef{
-		{name: "aardvark", resAttrs: map[string]any{"service.name": "svc"}},
-		{name: "badger", resAttrs: map[string]any{"service.name": "svc"}},
-		{name: "cat", resAttrs: map[string]any{"service.name": "svc"}},
+		{name: "s1", attrs: []*commonv1.KeyValue{kv("label", "aardvark")}, resAttrs: map[string]any{"service.name": "svc"}},
+		{name: "s2", attrs: []*commonv1.KeyValue{kv("label", "badger")}, resAttrs: map[string]any{"service.name": "svc"}},
+		{name: "s3", attrs: []*commonv1.KeyValue{kv("label", "cat")}, resAttrs: map[string]any{"service.name": "svc"}},
 	})
 	p := newBlockColumnProvider(block)
-	rs, err := p.ScanLessThanOrEqual("span:name", "badger")
+	rs, err := p.ScanLessThanOrEqual("span.label", "badger")
 	require.NoError(t, err)
 	rows := collectRows(t, rs)
 	assert.Len(t, rows, 2) // "aardvark" and "badger" <= "badger"
@@ -123,12 +124,12 @@ func TestBlockColumnProvider_ScanLessThanOrEqual(t *testing.T) {
 
 func TestBlockColumnProvider_ScanGreaterThanOrEqual(t *testing.T) {
 	block := buildBlock(t, []spanDef{
-		{name: "aardvark", resAttrs: map[string]any{"service.name": "svc"}},
-		{name: "badger", resAttrs: map[string]any{"service.name": "svc"}},
-		{name: "cat", resAttrs: map[string]any{"service.name": "svc"}},
+		{name: "s1", attrs: []*commonv1.KeyValue{kv("label", "aardvark")}, resAttrs: map[string]any{"service.name": "svc"}},
+		{name: "s2", attrs: []*commonv1.KeyValue{kv("label", "badger")}, resAttrs: map[string]any{"service.name": "svc"}},
+		{name: "s3", attrs: []*commonv1.KeyValue{kv("label", "cat")}, resAttrs: map[string]any{"service.name": "svc"}},
 	})
 	p := newBlockColumnProvider(block)
-	rs, err := p.ScanGreaterThanOrEqual("span:name", "badger")
+	rs, err := p.ScanGreaterThanOrEqual("span.label", "badger")
 	require.NoError(t, err)
 	rows := collectRows(t, rs)
 	assert.Len(t, rows, 2) // "badger" and "cat" >= "badger"
@@ -172,12 +173,12 @@ func TestBlockColumnProvider_ScanIsNotNull_MissingColumn(t *testing.T) {
 
 func TestBlockColumnProvider_ScanRegex(t *testing.T) {
 	block := buildBlock(t, []spanDef{
-		{name: "http.get", resAttrs: map[string]any{"service.name": "svc"}},
-		{name: "grpc.call", resAttrs: map[string]any{"service.name": "svc"}},
-		{name: "http.post", resAttrs: map[string]any{"service.name": "svc"}},
+		{name: "s1", attrs: []*commonv1.KeyValue{kv("op", "http.get")}, resAttrs: map[string]any{"service.name": "svc"}},
+		{name: "s2", attrs: []*commonv1.KeyValue{kv("op", "grpc.call")}, resAttrs: map[string]any{"service.name": "svc"}},
+		{name: "s3", attrs: []*commonv1.KeyValue{kv("op", "http.post")}, resAttrs: map[string]any{"service.name": "svc"}},
 	})
 	p := newBlockColumnProvider(block)
-	rs, err := p.ScanRegex("span:name", "^http\\..*")
+	rs, err := p.ScanRegex("span.op", "^http\\..*")
 	require.NoError(t, err)
 	rows := collectRows(t, rs)
 	assert.Len(t, rows, 2)
@@ -185,10 +186,10 @@ func TestBlockColumnProvider_ScanRegex(t *testing.T) {
 
 func TestBlockColumnProvider_ScanRegex_InvalidPattern(t *testing.T) {
 	block := buildBlock(t, []spanDef{
-		{name: "s1", resAttrs: map[string]any{"service.name": "svc"}},
+		{name: "s1", attrs: []*commonv1.KeyValue{kv("op", "x")}, resAttrs: map[string]any{"service.name": "svc"}},
 	})
 	p := newBlockColumnProvider(block)
-	_, err := p.ScanRegex("span:name", "[invalid")
+	_, err := p.ScanRegex("span.op", "[invalid")
 	assert.Error(t, err)
 }
 
@@ -204,12 +205,12 @@ func TestBlockColumnProvider_ScanRegex_MissingColumn(t *testing.T) {
 
 func TestBlockColumnProvider_ScanRegexNotMatch(t *testing.T) {
 	block := buildBlock(t, []spanDef{
-		{name: "http.get", resAttrs: map[string]any{"service.name": "svc"}},
-		{name: "grpc.call", resAttrs: map[string]any{"service.name": "svc"}},
-		{name: "http.post", resAttrs: map[string]any{"service.name": "svc"}},
+		{name: "s1", attrs: []*commonv1.KeyValue{kv("op", "http.get")}, resAttrs: map[string]any{"service.name": "svc"}},
+		{name: "s2", attrs: []*commonv1.KeyValue{kv("op", "grpc.call")}, resAttrs: map[string]any{"service.name": "svc"}},
+		{name: "s3", attrs: []*commonv1.KeyValue{kv("op", "http.post")}, resAttrs: map[string]any{"service.name": "svc"}},
 	})
 	p := newBlockColumnProvider(block)
-	rs, err := p.ScanRegexNotMatch("span:name", "^http\\..*")
+	rs, err := p.ScanRegexNotMatch("span.op", "^http\\..*")
 	require.NoError(t, err)
 	rows := collectRows(t, rs)
 	assert.Len(t, rows, 1) // only "grpc.call" doesn't match
@@ -226,12 +227,12 @@ func TestBlockColumnProvider_ScanRegexNotMatch_InvalidPattern(t *testing.T) {
 
 func TestBlockColumnProvider_ScanContains(t *testing.T) {
 	block := buildBlock(t, []spanDef{
-		{name: "checkout-service", resAttrs: map[string]any{"service.name": "svc"}},
-		{name: "auth-service", resAttrs: map[string]any{"service.name": "svc"}},
-		{name: "checkout-processor", resAttrs: map[string]any{"service.name": "svc"}},
+		{name: "s1", attrs: []*commonv1.KeyValue{kv("svc", "checkout-service")}, resAttrs: map[string]any{"service.name": "svc"}},
+		{name: "s2", attrs: []*commonv1.KeyValue{kv("svc", "auth-service")}, resAttrs: map[string]any{"service.name": "svc"}},
+		{name: "s3", attrs: []*commonv1.KeyValue{kv("svc", "checkout-processor")}, resAttrs: map[string]any{"service.name": "svc"}},
 	})
 	p := newBlockColumnProvider(block)
-	rs, err := p.ScanContains("span:name", "checkout")
+	rs, err := p.ScanContains("span.svc", "checkout")
 	require.NoError(t, err)
 	rows := collectRows(t, rs)
 	assert.Len(t, rows, 2)
@@ -380,45 +381,48 @@ func TestBlockColumnProvider_StreamScanIsNull_MissingColumn(t *testing.T) {
 // --- StreamScanEqualAny tests ---
 
 func TestBlockColumnProvider_StreamScanEqualAny_StringDictFastPath(t *testing.T) {
+	// Use resource.region (a user resource attribute) — resource.service.name is also
+	// present in block columns (dual-storage per NOTE-050), but resource.region keeps
+	// this test independent of intrinsic column behavior.
 	block := buildBlock(t, []spanDef{
-		{name: "s0", resAttrs: map[string]any{"service.name": "svc-a"}},
-		{name: "s1", resAttrs: map[string]any{"service.name": "svc-b"}},
-		{name: "s2", resAttrs: map[string]any{"service.name": "svc-c"}},
-		{name: "s3", resAttrs: map[string]any{"service.name": "svc-a"}},
+		{name: "s0", resAttrs: map[string]any{"service.name": "svc", "region": "us-a"}},
+		{name: "s1", resAttrs: map[string]any{"service.name": "svc", "region": "eu-b"}},
+		{name: "s2", resAttrs: map[string]any{"service.name": "svc", "region": "ap-c"}},
+		{name: "s3", resAttrs: map[string]any{"service.name": "svc", "region": "us-a"}},
 	})
 	p := newBlockColumnProvider(block)
 	var rows []int
-	n, err := p.StreamScanEqualAny("resource.service.name", []any{"svc-a", "svc-c"}, func(rowIdx int) bool {
+	n, err := p.StreamScanEqualAny("resource.region", []any{"us-a", "ap-c"}, func(rowIdx int) bool {
 		rows = append(rows, rowIdx)
 		return true
 	})
 	require.NoError(t, err)
-	assert.Equal(t, 3, n, "svc-a (x2) + svc-c (x1) = 3 matches")
+	assert.Equal(t, 3, n, "us-a (x2) + ap-c (x1) = 3 matches")
 	assert.Len(t, rows, 3, "must return 3 rows")
-	// Verify matched service names — order depends on internal block sort.
-	col := block.GetColumn("resource.service.name")
+	// Verify matched region values — order depends on internal block sort.
+	col := block.GetColumn("resource.region")
 	require.NotNil(t, col)
 	for _, rowIdx := range rows {
 		v, ok := col.StringValue(rowIdx)
 		require.True(t, ok)
-		assert.True(t, v == "svc-a" || v == "svc-c", "matched row %d has value %q, expected svc-a or svc-c", rowIdx, v)
+		assert.True(t, v == "us-a" || v == "ap-c", "matched row %d has value %q, expected us-a or ap-c", rowIdx, v)
 	}
 }
 
 func TestBlockColumnProvider_StreamScanEqualAny_SingleValue_DelegatesToScanEqual(t *testing.T) {
 	block := buildBlock(t, []spanDef{
-		{name: "s0", resAttrs: map[string]any{"service.name": "svc-a"}},
-		{name: "s1", resAttrs: map[string]any{"service.name": "svc-b"}},
+		{name: "s0", resAttrs: map[string]any{"service.name": "svc", "region": "us-a"}},
+		{name: "s1", resAttrs: map[string]any{"service.name": "svc", "region": "eu-b"}},
 	})
 	p := newBlockColumnProvider(block)
 	var rows []int
-	n, err := p.StreamScanEqualAny("resource.service.name", []any{"svc-a"}, func(rowIdx int) bool {
+	n, err := p.StreamScanEqualAny("resource.region", []any{"us-a"}, func(rowIdx int) bool {
 		rows = append(rows, rowIdx)
 		return true
 	})
 	require.NoError(t, err)
 	assert.Equal(t, 1, n)
-	assert.Equal(t, []int{0}, rows)
+	assert.Len(t, rows, 1)
 }
 
 func TestBlockColumnProvider_StreamScanEqualAny_EmptyValues(t *testing.T) {

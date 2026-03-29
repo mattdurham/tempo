@@ -352,30 +352,57 @@ func snappyEncode(raw []byte) []byte {
 	return snappy.Encode(nil, raw)
 }
 
-// buildFlatUint64Blob builds a minimal valid snappy-encoded flat uint64 column blob
-// with the given row count. Each value is 8 zero bytes; refs are 1-byte each.
+// buildFlatUint64Blob builds a minimal valid v2-paged flat uint64 column blob with
+// the given row count. Each value is 0; refs have BlockIdx=0, RowIdx=i.
+// Uses EncodePageTOC and assembles the paged blob manually.
 func buildFlatUint64Blob(rowCount int) []byte {
-	// Layout (pre-snappy):
-	// format_version[1]=1, format[1]=IntrinsicFormatFlat, col_type[1]=ColumnTypeUint64
-	// row_count[4 LE], block_idx_width[1]=1, row_idx_width[1]=1
-	// values: rowCount × 8 bytes (delta-encoded uint64)
-	// refs: rowCount × 2 bytes (block[1] + row[1])
-	size := 3 + 4 + 2 + rowCount*8 + rowCount*2
-	raw := make([]byte, size)
-	pos := 0
-	raw[pos] = shared.IntrinsicFormatVersion
-	pos++
-	raw[pos] = shared.IntrinsicFormatFlat
-	pos++
-	raw[pos] = byte(shared.ColumnTypeUint64)
-	pos++
-	binary.LittleEndian.PutUint32(raw[pos:], uint32(rowCount)) //nolint:gosec
-	pos += 4
-	raw[pos] = 1 // blockW
-	pos++
-	raw[pos] = 1 // rowW
-	// values and refs already zeroed
-	return snappyEncode(raw)
+	// Build the flat page blob: values_len[4] + varints[...] + refs[rowCount×4]
+	// All values are 0 (delta encoded as 0 varints), refs are (0, i).
+	varintBuf := make([]byte, 0, rowCount) // delta=0 encodes as 1 byte per row
+	var varintTmp [10]byte
+	var prev uint64
+	for range rowCount {
+		n := binary.PutUvarint(varintTmp[:], 0-prev) // delta=0
+		varintBuf = append(varintBuf, varintTmp[:n]...)
+		prev = 0
+	}
+	// pageBuf: values_len[4] + varints + refs[rowCount×4 bytes]
+	pageBuf := make([]byte, 0, 4+len(varintBuf)+rowCount*4)
+	var tmp4 [4]byte
+	binary.LittleEndian.PutUint32(tmp4[:], uint32(len(varintBuf))) //nolint:gosec
+	pageBuf = append(pageBuf, tmp4[:]...)
+	pageBuf = append(pageBuf, varintBuf...)
+	var tmp2 [2]byte
+	for i := range rowCount {
+		binary.LittleEndian.PutUint16(tmp2[:], 0) // blockIdx=0
+		pageBuf = append(pageBuf, tmp2[:]...)
+		binary.LittleEndian.PutUint16(tmp2[:], uint16(i)) //nolint:gosec
+		pageBuf = append(pageBuf, tmp2[:]...)
+	}
+	pageBlob := snappy.Encode(nil, pageBuf)
+
+	// Build TOC.
+	toc := shared.PagedIntrinsicTOC{
+		Pages: []shared.PageMeta{{
+			Offset:   0,
+			Length:   uint32(len(pageBlob)), //nolint:gosec
+			RowCount: uint32(rowCount),      //nolint:gosec
+		}},
+		BlockIdxWidth: 2,
+		RowIdxWidth:   2,
+		Format:        shared.IntrinsicFormatFlat,
+		ColType:       shared.ColumnTypeUint64,
+	}
+	tocBlob, _ := shared.EncodePageTOC(toc)
+
+	// Assemble: sentinel[1] + toc_len[4] + toc_blob + page_blob.
+	out := make([]byte, 0, 1+4+len(tocBlob)+len(pageBlob))
+	out = append(out, shared.IntrinsicPagedVersion)
+	binary.LittleEndian.PutUint32(tmp4[:], uint32(len(tocBlob))) //nolint:gosec
+	out = append(out, tmp4[:]...)
+	out = append(out, tocBlob...)
+	out = append(out, pageBlob...)
+	return out
 }
 
 // TestDecodeIntrinsicColumnBlob_Corrupt verifies that DecodeIntrinsicColumnBlob returns

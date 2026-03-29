@@ -14,8 +14,56 @@ import (
 
 	modules_blockio "github.com/grafana/blockpack/internal/modules/blockio"
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
+	modules_shared "github.com/grafana/blockpack/internal/modules/blockio/shared"
 	modules_rw "github.com/grafana/blockpack/internal/modules/rw"
 )
+
+// blockIDPair holds the pre-fetched trace:id and span:id for a single row.
+// Built once per block by buildDedupeIndex; looked up O(1) by dedupeKey.
+type blockIDPair struct {
+	traceID []byte
+	spanID  []byte
+}
+
+// buildDedupeIndex builds a per-row deduplication index for the given (reader, blockIdx) pair.
+// Iterates the trace:id and span:id intrinsic columns once (O(N)), eliminating the
+// O(N) per-row linear scan that IntrinsicBytesAt performs.
+// Returns nil when r is nil or has no intrinsic section (callers fall back to block columns only).
+func buildDedupeIndex(r *modules_reader.Reader, blockIdx int) map[uint16]blockIDPair {
+	if r == nil {
+		return nil
+	}
+	names := r.IntrinsicColumnNames()
+	if len(names) == 0 {
+		return nil
+	}
+	out := make(map[uint16]blockIDPair)
+	for _, colName := range []string{"trace:id", "span:id"} {
+		col, err := r.GetIntrinsicColumn(colName)
+		if err != nil || col == nil {
+			continue
+		}
+		if col.Format != modules_shared.IntrinsicFormatFlat {
+			continue
+		}
+		for i, ref := range col.BlockRefs {
+			if int(ref.BlockIdx) != blockIdx {
+				continue
+			}
+			if i >= len(col.BytesValues) {
+				continue
+			}
+			entry := out[ref.RowIdx]
+			if colName == "trace:id" {
+				entry.traceID = col.BytesValues[i]
+			} else {
+				entry.spanID = col.BytesValues[i]
+			}
+			out[ref.RowIdx] = entry
+		}
+	}
+	return out
+}
 
 // Config configures the compaction operation.
 type Config struct {
@@ -143,7 +191,7 @@ func (s *compactionState) processProvider(provider modules_rw.ReaderProvider) (r
 			continue
 		}
 
-		if processErr := s.processBlock(bwb.Block); processErr != nil {
+		if processErr := s.processBlock(r, blockIdx, bwb.Block); processErr != nil {
 			return fmt.Errorf("process block %d: %w", blockIdx, processErr)
 		}
 	}
@@ -152,9 +200,14 @@ func (s *compactionState) processProvider(provider modules_rw.ReaderProvider) (r
 }
 
 // processBlock iterates all rows in block and adds each span to the current writer.
-func (s *compactionState) processBlock(block *modules_reader.Block) error {
+// Builds a per-block deduplication index once (O(N)) to avoid O(N^2) IntrinsicBytesAt
+// calls across the per-row loop.
+func (s *compactionState) processBlock(r *modules_reader.Reader, blockIdx int, block *modules_reader.Block) error {
+	// Build intrinsic ID index once per block; O(N) over intrinsic columns.
+	// dedupeKey uses this for O(1) per-row lookups instead of O(N) linear scans.
+	idIndex := buildDedupeIndex(r, blockIdx)
 	for rowIdx := range block.SpanCount() {
-		if err := s.addSpanFromBlock(block, rowIdx); err != nil {
+		if err := s.addSpanFromBlock(r, blockIdx, block, rowIdx, idIndex); err != nil {
 			return fmt.Errorf("row %d: %w", rowIdx, err)
 		}
 	}
@@ -162,25 +215,37 @@ func (s *compactionState) processBlock(block *modules_reader.Block) error {
 }
 
 // dedupeKey builds a 24-byte deduplication key from trace:id (16 bytes) and span:id (8 bytes).
+// Falls back to the pre-built idIndex (O(1) lookup) when block columns are absent (new storage
+// format where intrinsic columns live exclusively in the intrinsic section).
+// idIndex is built once per block by buildDedupeIndex; pass nil to disable intrinsic fallback.
 // Returns the key and true if both IDs are present and non-empty; false otherwise.
-func dedupeKey(block *modules_reader.Block, rowIdx int) ([24]byte, bool) {
+func dedupeKey(block *modules_reader.Block, rowIdx int, idIndex map[uint16]blockIDPair) ([24]byte, bool) {
 	var key [24]byte
 
-	traceCol := block.GetColumn("trace:id")
-	if traceCol == nil || !traceCol.IsPresent(rowIdx) {
-		return key, false
+	// PATTERN: block-column-first with intrinsic-section fallback (shared across
+	// compaction.go, writer/writer.go, executor/executor.go, executor/metrics_trace.go).
+	// v3 files store identity columns in block payloads; v4 files store them exclusively
+	// in the intrinsic section. Try the block column first for backwards compat.
+
+	// trace:id — try block column first, then O(1) index lookup.
+	var traceID []byte
+	if traceCol := block.GetColumn("trace:id"); traceCol != nil && traceCol.IsPresent(rowIdx) {
+		traceID, _ = traceCol.BytesValue(rowIdx)
+	} else if idIndex != nil {
+		traceID = idIndex[uint16(rowIdx)].traceID //nolint:gosec // rowIdx bounded by SpanCount (≤65535)
 	}
-	traceID, ok := traceCol.BytesValue(rowIdx)
-	if !ok || len(traceID) != 16 {
+	if len(traceID) != 16 {
 		return key, false
 	}
 
-	spanCol := block.GetColumn("span:id")
-	if spanCol == nil || !spanCol.IsPresent(rowIdx) {
-		return key, false
+	// span:id — try block column first, then O(1) index lookup.
+	var spanID []byte
+	if spanCol := block.GetColumn("span:id"); spanCol != nil && spanCol.IsPresent(rowIdx) {
+		spanID, _ = spanCol.BytesValue(rowIdx)
+	} else if idIndex != nil {
+		spanID = idIndex[uint16(rowIdx)].spanID //nolint:gosec // rowIdx bounded by SpanCount (≤65535)
 	}
-	spanID, ok := spanCol.BytesValue(rowIdx)
-	if !ok || len(spanID) != 8 {
+	if len(spanID) != 8 {
 		return key, false
 	}
 
@@ -191,13 +256,13 @@ func dedupeKey(block *modules_reader.Block, rowIdx int) ([24]byte, bool) {
 
 // addSpanFromBlock adds one row from block at rowIdx to the current writer via the
 // native columnar path, deduplicating by (trace:id, span:id) and respecting the
-// output file size limit.
-func (s *compactionState) addSpanFromBlock(block *modules_reader.Block, rowIdx int) error {
+// output file size limit. idIndex is the pre-built per-block dedup index (may be nil).
+func (s *compactionState) addSpanFromBlock(r *modules_reader.Reader, blockIdx int, block *modules_reader.Block, rowIdx int, idIndex map[uint16]blockIDPair) error {
 	if err := s.ensureWriter(); err != nil {
 		return fmt.Errorf("ensure writer: %w", err)
 	}
 
-	key, ok := dedupeKey(block, rowIdx)
+	key, ok := dedupeKey(block, rowIdx, idIndex)
 	if !ok {
 		s.droppedSpans++
 		return nil // skip rows without valid trace:id or span:id
@@ -207,7 +272,7 @@ func (s *compactionState) addSpanFromBlock(block *modules_reader.Block, rowIdx i
 	}
 	s.seenSpans[key] = struct{}{}
 
-	if err := s.current.w.AddRow(block, rowIdx); err != nil {
+	if err := s.current.w.AddRowFromReader(block, rowIdx, r, blockIdx); err != nil {
 		return fmt.Errorf("add row: %w", err)
 	}
 

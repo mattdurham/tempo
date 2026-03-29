@@ -66,13 +66,13 @@
 </thead>
 <tbody>
 <tr><td><a href="https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/writer/writer.go"><code>internal/modules/blockio/writer/writer.go</code></a></td><td>Main write API (<code>AddTracesData</code>, <code>Flush</code>)</td></tr>
-<tr><td><a href="https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/writer/writer<em>sort.go"><code>internal/modules/blockio/writer/writer&lt;/em&gt;sort.go</code></a></td><td>MinHash clustering and sort</td></tr>
-<tr><td><a href="https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/writer/writer<em>block.go"><code>internal/modules/blockio/writer/writer&lt;/em&gt;block.go</code></a></td><td>Block encoding, column selection</td></tr>
+<tr><td><a href="https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/writer/writer_sort.go"><code>internal/modules/blockio/writer/writer_sort.go</code></a></td><td>MinHash clustering and sort</td></tr>
+<tr><td><a href="https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/writer/writer_block.go"><code>internal/modules/blockio/writer/writer_block.go</code></a></td><td>Block encoding, column selection</td></tr>
 <tr><td><a href="https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/writer/kll.go"><code>internal/modules/blockio/writer/kll.go</code></a></td><td>KLL sketch construction</td></tr>
-<tr><td><a href="https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/writer/sketch<em>index.go"><code>internal/modules/blockio/writer/sketch&lt;/em&gt;index.go</code></a></td><td>CMS, HLL, TopK, BinaryFuse8 per block</td></tr>
-<tr><td><a href="https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/writer/intrinsic<em>accum.go"><code>internal/modules/blockio/writer/intrinsic&lt;/em&gt;accum.go</code></a></td><td>Intrinsic column accumulation</td></tr>
+<tr><td><a href="https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/writer/sketch_index.go"><code>internal/modules/blockio/writer/sketch_index.go</code></a></td><td>CMS, HLL, TopK, BinaryFuse8 per block</td></tr>
+<tr><td><a href="https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/writer/intrinsic_accum.go"><code>internal/modules/blockio/writer/intrinsic_accum.go</code></a></td><td>Intrinsic column accumulation</td></tr>
 <tr><td><a href="https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/writer/metadata.go"><code>internal/modules/blockio/writer/metadata.go</code></a></td><td>Metadata serialization and index writing</td></tr>
-<tr><td><a href="https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/writer/range<em>index.go"><code>internal/modules/blockio/writer/range&lt;/em&gt;index.go</code></a></td><td>Range index / KLL bucket assignment</td></tr>
+<tr><td><a href="https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/writer/range_index.go"><code>internal/modules/blockio/writer/range_index.go</code></a></td><td>Range index / KLL bucket assignment</td></tr>
 </tbody>
 </table>
 <hr>
@@ -131,7 +131,7 @@
 <ul>
 <li>Bytes columns → XOR (kind 8/9) or Prefix (kind 10/11) based on <code>isURLColumn</code></li>
 <li><code>trace:id</code> specifically → Delta Dictionary (kind 12/13)</li>
-<li>Other ID columns (<code>.id</code>, <code>&lt;em&gt;id</code> suffix, <code>span:id</code>, <code>span:parent&lt;/em&gt;id</code>) → XOR (kind 8/9)</li>
+<li>Other ID columns (<code>.id</code>, <code>_id</code> suffix, <code>span:id</code>, <code>span:parent_id</code>) → XOR (kind 8/9)</li>
 <li>Uint64 columns → Delta (kind 5) when <code>shouldUseDeltaEncoding</code> returns true; otherwise Dictionary (kind 1/2)</li>
 <li>All other numeric/string columns → Dictionary (kind 1/2) or RLE Indexes (kind 6/7) when cardinality ≤ 3</li>
 </ul>

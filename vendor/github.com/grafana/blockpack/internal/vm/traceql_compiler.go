@@ -741,13 +741,24 @@ func extractRangeNode(expr *traceqlparser.BinaryExpr) (nodes []RangeNode, cols [
 	}
 
 	var minVal, maxVal *Value
+	var minInclusive, maxInclusive bool
 	switch expr.Op {
-	case traceqlparser.OpGt, traceqlparser.OpGte:
+	case traceqlparser.OpGt:
 		v := vmValue
 		minVal = &v
-	case traceqlparser.OpLt, traceqlparser.OpLte:
+		minInclusive = false
+	case traceqlparser.OpGte:
+		v := vmValue
+		minVal = &v
+		minInclusive = true
+	case traceqlparser.OpLt:
 		v := vmValue
 		maxVal = &v
+		maxInclusive = false
+	case traceqlparser.OpLte:
+		v := vmValue
+		maxVal = &v
+		maxInclusive = true
 	}
 
 	if field.Scope == "" && !isBuiltInField(columnName) {
@@ -756,16 +767,16 @@ func extractRangeNode(expr *traceqlparser.BinaryExpr) (nodes []RangeNode, cols [
 		return []RangeNode{{
 			IsOR: true,
 			Children: []RangeNode{
-				{Column: res, Min: minVal, Max: maxVal},
-				{Column: span, Min: minVal, Max: maxVal},
-				{Column: log, Min: minVal, Max: maxVal},
+				{Column: res, Min: minVal, Max: maxVal, MinInclusive: minInclusive, MaxInclusive: maxInclusive},
+				{Column: span, Min: minVal, Max: maxVal, MinInclusive: minInclusive, MaxInclusive: maxInclusive},
+				{Column: log, Min: minVal, Max: maxVal, MinInclusive: minInclusive, MaxInclusive: maxInclusive},
 			},
 		}}, cols
 	}
 	if !isBuiltInField(columnName) {
 		cols = []string{columnName}
 	}
-	return []RangeNode{{Column: columnName, Min: minVal, Max: maxVal}}, cols
+	return []RangeNode{{Column: columnName, Min: minVal, Max: maxVal, MinInclusive: minInclusive, MaxInclusive: maxInclusive}}, cols
 }
 
 // extractRegexNode builds a RangeNode for a regex predicate (=~).

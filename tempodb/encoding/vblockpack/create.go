@@ -126,6 +126,23 @@ func setBlockTimeRange(meta *backend.BlockMeta, data []byte) {
 	if err != nil {
 		return
 	}
+
+	// PR #172 (dual-storage intrinsic format) stores span:start exclusively in
+	// the intrinsic section — it is no longer present in block columns. Read the
+	// time range from the intrinsic column, which is a sorted flat uint64 column:
+	// Uint64Values[0] is the minimum start time, Uint64Values[len-1] the maximum.
+	col, colErr := r.GetIntrinsicColumn("span:start")
+	if colErr == nil && col != nil && len(col.Uint64Values) > 0 {
+		minStart := col.Uint64Values[0]
+		maxStart := col.Uint64Values[len(col.Uint64Values)-1]
+		meta.StartTime = time.Unix(0, int64(minStart)) //nolint:gosec
+		meta.EndTime = time.Unix(0, int64(maxStart))   //nolint:gosec
+		meta.TotalRecords = 1
+		return
+	}
+
+	// Fallback: older format files store span:start in block columns and populate
+	// BlockMeta.MinStart / BlockMeta.MaxStart during compaction.
 	var minStart uint64 = ^uint64(0)
 	var maxEnd uint64
 	for i := range r.BlockCount() {
@@ -138,8 +155,8 @@ func setBlockTimeRange(meta *backend.BlockMeta, data []byte) {
 		}
 	}
 	if r.BlockCount() > 0 && minStart != ^uint64(0) {
-		meta.StartTime = time.Unix(0, int64(minStart))
-		meta.EndTime = time.Unix(0, int64(maxEnd))
+		meta.StartTime = time.Unix(0, int64(minStart)) //nolint:gosec
+		meta.EndTime = time.Unix(0, int64(maxEnd))     //nolint:gosec
 	}
 	// TotalRecords = 1: one job per file (no sub-file sharding).
 	// Blockpack's intrinsic fast path evaluates all internal blocks using

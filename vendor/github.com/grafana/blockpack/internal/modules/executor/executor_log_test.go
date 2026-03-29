@@ -93,7 +93,7 @@ func TestSpanMatchFromBlock_LogFile_UsesLogColumns(t *testing.T) {
 	rows := runQuery(t, r, `{ resource.service.name = "test-svc" }`)
 	require.Len(t, rows, 1, "expected exactly 1 match")
 
-	m := executor.SpanMatchFromRow(rows[0], r.SignalType())
+	m := executor.SpanMatchFromRow(rows[0], r.SignalType(), r)
 	assert.Equal(t, wantTraceID, m.TraceID, "TraceID must be non-zero and match the log record's trace_id")
 	assert.Equal(t, wantSpanID, m.SpanID, "SpanID must be non-nil and match the log record's span_id")
 }

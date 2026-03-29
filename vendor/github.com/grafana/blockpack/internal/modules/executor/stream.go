@@ -172,12 +172,29 @@ func Collect(
 	var secondPassCols map[string]struct{}
 	if wantColumns != nil && !opts.AllColumns {
 		searchCols := searchMetaCols
-		secondPassCols = make(map[string]struct{}, len(searchCols)+len(wantColumns))
+		// Always include trace identity columns so lookupIntrinsicFields returns trace:id
+		// and span:id for SpanMatchFromRow. These columns are stored exclusively in the
+		// intrinsic TOC section (NOTE-050); ParseBlockFromBytes returns nil for them.
+		secondPassCols = make(map[string]struct{}, len(searchCols)+len(wantColumns)+2)
 		for k := range searchCols {
 			secondPassCols[k] = struct{}{}
 		}
 		for k := range wantColumns {
 			secondPassCols[k] = struct{}{}
+		}
+		// NOTE-050: Include all trace intrinsic columns so ParseBlockFromBytes decodes
+		// them from block payloads (dual storage). Identity columns (trace:id, span:id,
+		// span:parent_id) are NOT in the intrinsic accumulator per NOTE-005 — they are
+		// stored only in block payloads. Case A results populate MatchedRow.Block via
+		// forEachBlockInGroups (NOTE-053); lookupIntrinsicFields is used by Case B
+		// (TopK) and structural queries where block reads are not taken.
+		for k := range traceIntrinsicColumns {
+			secondPassCols[k] = struct{}{}
+		}
+		// Include the sort timestamp column so Case B (TopK) IntrinsicFields
+		// contains the timestamp value used for ordering and time-range filtering.
+		if opts.TimestampColumn != "" {
+			secondPassCols[opts.TimestampColumn] = struct{}{}
 		}
 	}
 
@@ -194,8 +211,16 @@ func Collect(
 	// NOTE-038: 4-case dispatch inside collectFromIntrinsicRefs based on
 	// (ProgramIsIntrinsicOnly × opts.TimestampColumn != "").
 	// errNeedBlockScan signals the pre-filter is not applicable; fall through to full scan.
-	if opts.Limit > 0 && hasSomeIntrinsicPredicates(program) {
+	// NOTE-050: Pure intrinsic queries always use the fast path regardless of Limit —
+	// without the fast path, the block scan's ColumnPredicate evaluates user-attr
+	// predicates via nilIntrinsicScan (FullScan for nil intrinsic block columns) and
+	// then re-filters via filterRowSetByIntrinsicNodes. For files written between PR #172
+	// and its rollback, intrinsic columns may be absent from block payloads, so this
+	// path prevents false-negative results on those files.
+	// Mixed queries (Cases C/D) still require Limit > 0 to bound the pre-filter cost.
+	if hasSomeIntrinsicPredicates(program) && (opts.Limit > 0 || ProgramIsIntrinsicOnly(program)) {
 		var fastStats CollectStats
+		fastStats.TotalBlocks = r.BlockCount() // populate for OnStats callers (NOTE-050)
 		rows, err := collectFromIntrinsicRefs(r, program, opts, wantColumns, secondPassCols,
 			&fastStats)
 		if err != errNeedBlockScan {
@@ -285,7 +310,7 @@ func Collect(
 	var results []MatchedRow
 
 	fetched := make(map[int][]byte)
-	fetchedGroupsSeen := make(map[int]bool)
+	fetchedGroupsSeen := make(map[int]struct{})
 
 	var scanErr error
 	fetchedBlocks, scanErr = scanBlocks(
@@ -317,7 +342,7 @@ func scanBlocks(
 	groups []modules_shared.CoalescedRead,
 	blockToGroup map[int]int,
 	fetched map[int][]byte,
-	fetchedGroupsSeen map[int]bool,
+	fetchedGroupsSeen map[int]struct{},
 	results *[]MatchedRow,
 ) (int, error) {
 	fetchedBlocks := 0
@@ -331,7 +356,7 @@ func scanBlocks(
 		// Lazy group fetch: guarded by fetchedGroupsSeen for early-stop support.
 		// SPEC-STREAM-3: FetchedBlocks is incremented here (at I/O time) by the number of
 		// blocks in the group. Groups that are never fetched (due to early stop) are not counted.
-		if !fetchedGroupsSeen[gi] {
+		if _, seen := fetchedGroupsSeen[gi]; !seen {
 			groupRaw, fetchErr := r.ReadGroup(groups[gi])
 			if fetchErr != nil {
 				return fetchedBlocks, fmt.Errorf("ReadGroup: %w", fetchErr)
@@ -340,7 +365,7 @@ func scanBlocks(
 				fetched[bi] = raw
 			}
 			fetchedBlocks += len(groups[gi].BlockIDs)
-			fetchedGroupsSeen[gi] = true
+			fetchedGroupsSeen[gi] = struct{}{}
 		}
 
 		raw, rawOK := fetched[blockIdx]
@@ -353,33 +378,75 @@ func scanBlocks(
 
 		meta := r.BlockMeta(blockIdx)
 		r.ResetInternStrings()
-		bwb, parseErr := r.ParseBlockFromBytes(raw, wantColumns, meta)
+
+		// NOTE-006: Acquire a pooled intern map for this block's lifetime. The map must
+		// remain alive through both parse passes and the entire row-emission loop, because
+		// lazy columns (registered during first pass) call decodeNow() during row iteration
+		// and reference the intern map. Release after streamSortedRows completes.
+		internPtr := modules_reader.AcquireInternMap()
+		intern := *internPtr
+
+		bwb, parseErr := r.ParseBlockFromBytesWithIntern(raw, wantColumns, meta, intern)
 		if parseErr != nil {
+			modules_reader.ReleaseInternMap(internPtr)
 			return fetchedBlocks, fmt.Errorf("ParseBlockFromBytes block %d: %w", blockIdx, parseErr)
 		}
 
 		provider := newBlockColumnProvider(bwb.Block)
-		rowSet, evalErr := program.ColumnPredicate(provider)
+		// Only strip intrinsic predicates when the file has an intrinsic section.
+		// Log files do not have an intrinsic section; their block columns still hold
+		// all label values and ColumnPredicate must evaluate them directly.
+		var rowSet vm.RowSet
+		var evalErr error
+		if r.HasIntrinsicSection() {
+			uap := userAttrProgram(program)
+			if uap == nil {
+				rowSet = provider.FullScan()
+			} else {
+				rowSet, evalErr = uap.ColumnPredicate(provider)
+			}
+		} else {
+			rowSet, evalErr = program.ColumnPredicate(provider)
+		}
 		if evalErr != nil {
+			modules_reader.ReleaseInternMap(internPtr)
 			return fetchedBlocks, fmt.Errorf("ColumnPredicate block %d: %w", blockIdx, evalErr)
 		}
 
 		if rowSet.Size() == 0 {
+			modules_reader.ReleaseInternMap(internPtr)
 			continue
+		}
+
+		// Post-filter rowSet against any intrinsic predicates stripped by userAttrProgram.
+		// Only applies when the file has an intrinsic section (trace files with new storage format).
+		// Log files and legacy files evaluate intrinsic predicates directly via ColumnPredicate above.
+		intrNodes := programIntrinsicNodes(program)
+		if len(intrNodes) > 0 && r.HasIntrinsicSection() {
+			rowSet = filterRowSetByIntrinsicNodes(r, blockIdx, rowSet, intrNodes)
+			if rowSet.Size() == 0 {
+				modules_reader.ReleaseInternMap(internPtr)
+				continue
+			}
 		}
 
 		// NOTE-018: Second pass — decode result columns now that we know this block has matches.
 		// NOTE-028: secondPassCols is pre-computed above (searchMetaColumns ∪ wantColumns, or nil for all).
 		if wantColumns != nil {
-			bwb, parseErr = r.ParseBlockFromBytes(bwb.RawBytes, secondPassCols, meta)
+			bwb, parseErr = r.ParseBlockFromBytesWithIntern(bwb.RawBytes, secondPassCols, meta, intern)
 			if parseErr != nil {
+				modules_reader.ReleaseInternMap(internPtr)
 				return fetchedBlocks, fmt.Errorf("ParseBlockFromBytes (second pass) block %d: %w", blockIdx, parseErr)
 			}
 		}
 
-		// Copy the slice before sorting: ToSlice returns the backing slice of the
-		// RowSet and must not be modified (it may be used for Contains binary search).
-		rows := slices.Clone(rowSet.ToSlice())
+		// NOTE: rowSet is not used after ToSlice() — safe to sort in-place without clone.
+		// streamSortedRows sorts and reverses rows in-place via slices.SortFunc and index swap,
+		// which mutates the backing slice returned by ToSlice(). This is intentional: rowSet
+		// is never accessed again (no Contains calls) after this point in scanBlocks.
+		// If rowSet reuse is added in future, restore slices.Clone here to preserve the
+		// ascending-sorted invariant required by rowSet.Contains.
+		rows := rowSet.ToSlice()
 
 		// SPEC-STREAM-5: Sort rows by per-row timestamp when TimestampColumn is set.
 		var tsCol *modules_reader.Column
@@ -387,7 +454,10 @@ func scanBlocks(
 			tsCol = bwb.Block.GetColumn(opts.TimestampColumn)
 		}
 
-		if stop := streamSortedRows(bwb.Block, blockIdx, rows, tsCol, opts, results); stop {
+		stop := streamSortedRows(bwb.Block, blockIdx, rows, tsCol, opts, results)
+		// Release intern map after all lazy decodes in streamSortedRows are complete.
+		modules_reader.ReleaseInternMap(internPtr)
+		if stop {
 			return fetchedBlocks, nil
 		}
 	}
@@ -455,38 +525,6 @@ func streamSortedRows(
 	return false
 }
 
-// hasRangePredicate reports whether the program contains any predicate that
-// produces refs spread across many blocks: range predicates (Min or Max set,
-// e.g. duration>100ms) and regex/prefix predicates (Pattern set, e.g. svc=~"loki-.*").
-// Both scan the sorted flat/dict intrinsic column and can match refs in any block.
-// lookupIntrinsicFields is faster for these than targeted block reads.
-// Equality-only predicates cluster refs in few blocks, making forEachBlockInGroups
-// the faster choice.
-//
-// Invariant: this function is only called from collectFromIntrinsicRefs, which is
-// gated by hasSomeIntrinsicPredicates. hasSomeIntrinsicPredicates walks the same
-// program.Predicates.Nodes — if those are nil or empty (e.g. an OR with an
-// unconstrained arm collapsed to nil by extractTraceQLNodes), the fast path is
-// skipped entirely before this function is reached. hasRangePredicate therefore
-// only sees non-empty Nodes and does not need to handle the empty-Nodes case.
-func hasRangePredicate(program *vm.Program) bool {
-	if program == nil || program.Predicates == nil {
-		return false
-	}
-	var walk func(nodes []vm.RangeNode) bool
-	walk = func(nodes []vm.RangeNode) bool {
-		for _, n := range nodes {
-			if n.Min != nil || n.Max != nil || n.Pattern != "" {
-				return true
-			}
-			if walk(n.Children) {
-				return true
-			}
-		}
-		return false
-	}
-	return walk(program.Predicates.Nodes)
-}
 
 // countUniqueBlockIdxs returns the number of distinct BlockIdx values in refs.
 func countUniqueBlockIdxs(refs []modules_shared.BlockRef) int {
@@ -575,7 +613,7 @@ func collectFromIntrinsicRefs(
 
 	// Step 2: Dispatch based on (isPureIntrinsic, hasSort).
 	if isPureIntrinsic && !hasSort {
-		return collectIntrinsicPlain(r, refs, opts, wantColumns, secondPassCols, stats, hasRangePredicate(program))
+		return collectIntrinsicPlain(r, refs, opts, wantColumns, secondPassCols, stats)
 	}
 	if isPureIntrinsic && hasSort {
 		return collectIntrinsicTopK(r, refs, opts, secondPassCols, stats)
@@ -693,22 +731,11 @@ func forEachBlockInGroups(
 }
 
 // collectIntrinsicPlain handles Case A: pure intrinsic + no sort.
-//
-// useIntrinsicLookup=true (range or regex predicates like duration>100ms, svc=~"loki-.*"):
-//
-//	Resolves fields from intrinsic column blobs — no full block reads.
-//	Intrinsic column blobs (dict/flat) may be read on demand by GetIntrinsicColumn,
-//	but are much smaller than full block data. The predicate TOC scan has already
-//	cached the primary predicate's blob; additional columns (trace:id, span:id, etc.)
-//	are fetched per-column as needed. Flat intrinsic columns are pre-sorted by value,
-//	so range scans use page-level min/max skipping + early exit. lookupIntrinsicFields
-//	with early-exit hash map is faster than reading many scattered full blocks.
-//
-// useIntrinsicLookup=false (equality predicates like svc=X, kind=server):
-//
-//	Uses forEachBlockInGroups to read the specific internal blocks containing
-//	matched refs. Dict-equality queries cluster refs in 1-3 blocks (~100-500KB),
-//	making targeted block reads faster than the O(N) intrinsic column scan.
+// All results use forEachBlockInGroups to populate MatchedRow.Block.
+// This is correct for both equality predicates (status=error, kind=server) and
+// range predicates (duration>100ms, svc=~".*"). Block reads are O(M) where M is
+// the result count — far cheaper than the previous O(N) intrinsic column scan
+// for range predicates across 3.3M entries × 7 columns per file.
 func collectIntrinsicPlain(
 	r *modules_reader.Reader,
 	refs []modules_shared.BlockRef,
@@ -716,9 +743,9 @@ func collectIntrinsicPlain(
 	wantColumns map[string]struct{},
 	secondPassCols map[string]struct{},
 	stats *CollectStats,
-	useIntrinsicLookup bool,
 ) ([]MatchedRow, error) {
 	stats.ExecutionPath = "intrinsic-plain"
+	stats.SelectedBlocks = countUniqueBlockIdxs(refs)
 	// Sort refs by (BlockIdx, RowIdx) for deterministic traversal order.
 	slices.SortFunc(refs, blockRefCompare)
 
@@ -733,22 +760,7 @@ func collectIntrinsicPlain(
 		refs = refs[:opts.Limit]
 	}
 
-	if useIntrinsicLookup {
-		// Range predicate path: resolve fields from cached intrinsic blobs, zero block reads.
-		fieldMaps := lookupIntrinsicFields(r, refs, secondPassCols)
-		results := make([]MatchedRow, 0, len(refs))
-		for i, ref := range refs {
-			results = append(results, MatchedRow{
-				IntrinsicFields: &intrinsicFieldsProvider{fields: fieldMaps[i]},
-				BlockIdx:        int(ref.BlockIdx),
-				RowIdx:          int(ref.RowIdx),
-			})
-		}
-		return results, nil
-	}
-
-	// Equality predicate path: read only the specific internal blocks containing
-	// the matched refs (typically 1-3 blocks for dict-equality queries).
+	// Read only the specific internal blocks containing the matched refs.
 	blockOrder, blockCandidates := groupRefsByBlock(refs)
 	var results []MatchedRow
 	err := forEachBlockInGroups(r, blockOrder, blockCandidates, wantColumns, secondPassCols, "collectIntrinsicPlain",
@@ -1026,7 +1038,18 @@ func collectMixedPlain(
 		func(pb parsedBlock, candidateRows []int) error {
 			// Re-evaluate the full predicate against this block.
 			provider := newBlockColumnProvider(pb.Block)
-			rowSet, evalErr := program.ColumnPredicate(provider)
+			var rowSet vm.RowSet
+			var evalErr error
+			if r.HasIntrinsicSection() {
+				uap := userAttrProgram(program)
+				if uap == nil {
+					rowSet = provider.FullScan()
+				} else {
+					rowSet, evalErr = uap.ColumnPredicate(provider)
+				}
+			} else {
+				rowSet, evalErr = program.ColumnPredicate(provider)
+			}
 			if evalErr != nil {
 				return fmt.Errorf("collectMixedPlain ColumnPredicate block %d: %w", pb.BlockIdx, evalErr)
 			}
@@ -1086,7 +1109,18 @@ func collectMixedTopK(
 		func(pb parsedBlock, candidateRows []int) error {
 			// Re-evaluate the full predicate.
 			provider := newBlockColumnProvider(pb.Block)
-			rowSet, evalErr := program.ColumnPredicate(provider)
+			var rowSet vm.RowSet
+			var evalErr error
+			if r.HasIntrinsicSection() {
+				uap := userAttrProgram(program)
+				if uap == nil {
+					rowSet = provider.FullScan()
+				} else {
+					rowSet, evalErr = uap.ColumnPredicate(provider)
+				}
+			} else {
+				rowSet, evalErr = program.ColumnPredicate(provider)
+			}
 			if evalErr != nil {
 				return fmt.Errorf("collectMixedTopK ColumnPredicate block %d: %w", pb.BlockIdx, evalErr)
 			}
@@ -1103,12 +1137,14 @@ func collectMixedTopK(
 			}
 
 			// Get timestamp column for heap ordering.
+			// Falls back to intrinsic section for files that store span:start exclusively there.
 			tsCol := pb.Block.GetColumn(opts.TimestampColumn)
 			if tsCol == nil {
-				return nil
+				topKScanRowsFromIntrinsic(buf, opts.Limit, backward, r, pb.Block, pb.BlockIdx,
+					opts.TimestampColumn, opts.TimeRange, qualifying)
+			} else {
+				topKScanRows(buf, opts.Limit, backward, pb.Block, pb.BlockIdx, tsCol, opts.TimeRange, qualifying)
 			}
-
-			topKScanRows(buf, opts.Limit, backward, pb.Block, pb.BlockIdx, tsCol, opts.TimeRange, qualifying)
 			return nil
 		},
 	); err != nil {
@@ -1124,39 +1160,88 @@ type intrinsicFieldsProvider struct {
 	fields map[string]any
 }
 
+// filterRowSetByIntrinsicNodes filters rowSet against the given predicate nodes,
+// evaluating each node against the intrinsic section of the reader.
+// Returns a new RowSet containing only rows that satisfy the intrinsic predicates.
+// Non-intrinsic leaf nodes in nodes are ignored (rowSatisfiesIntrinsicNodes skips them).
+// Designed to be called after block-column ColumnPredicate. With dual storage (restored
+// after PR #172 rollback), intrinsic columns are present in block payloads for new files,
+// so userAttrProgram no longer strips them and this function is a no-op for those files.
+// It is kept as a backward-compatibility safety net for files written between the
+// PR #172 merge and this fix, where intrinsic columns (e.g. resource.service.name) were
+// absent from block payloads and could only be enforced via the intrinsic section here.
+func filterRowSetByIntrinsicNodes(
+	r *modules_reader.Reader, blockIdx int, rowSet vm.RowSet, nodes []vm.RangeNode,
+) vm.RowSet {
+	rows := rowSet.ToSlice()
+	if len(rows) == 0 {
+		return rowSet
+	}
+	// Build BlockRef slice for the candidate rows.
+	refs := make([]modules_shared.BlockRef, len(rows))
+	for i, rowIdx := range rows {
+		refs[i] = modules_shared.BlockRef{
+			BlockIdx: uint16(blockIdx), //nolint:gosec // bounded by file block count
+			RowIdx:   uint16(rowIdx),   //nolint:gosec // bounded by SpanCount
+		}
+	}
+	// Collect which intrinsic columns are needed.
+	want := make(map[string]struct{}, 4)
+	collectIntrinsicNodeColumns(nodes, want)
+	if len(want) == 0 {
+		return rowSet // no intrinsic columns in nodes
+	}
+	fields := lookupIntrinsicFields(r, refs, want)
+	// Build filtered RowSet. Rows without intrinsic data for the wanted columns are
+	// treated as "absent" and fail the predicate (absent value != any predicate value).
+	filtered := newRowSet()
+	for i, rowIdx := range rows {
+		if rowSatisfiesIntrinsicNodes(nodes, fields[i]) {
+			filtered.Add(rowIdx)
+		}
+	}
+	return filtered
+}
+
 // lookupIntrinsicFields reads intrinsic column values for the given refs and returns one
 // map[string]any per ref. wantCols limits which columns are loaded — when non-nil only
-// columns present in wantCols are fetched (skipping expensive GetIntrinsicColumn calls
-// and the mergeIntrinsicColumns allocations they trigger for unwanted columns).
+// columns present in wantCols are fetched (skipping expensive GetIntrinsicColumnForRefs
+// calls for unwanted columns).
 // Pass nil to fetch all intrinsic columns (e.g. FindTraceByID needs every field).
 //
 // The lookup index uses map[uint32]int (packed key → result position) for O(1)
 // access per scan entry. This eliminated the slices.BinarySearchFunc hotspot
 // that was previously 43% flat CPU when using a sorted []keyIdx slice.
+//
+// Field lookup: calls GetIntrinsicColumn to get the full decoded column, then
+// builds a refIndex via EnsureRefIndex (O(N log N), cached on the column object)
+// and does O(log N) LookupRefFast per ref. Total per column: O(M log N) for M target refs.
+//
+// NOTE-007: RefBloom/MinRef/MaxRef were removed from the page TOC — all pages are decoded
+// via DecodePagedColumnBlobFiltered, which no longer skips any pages. The refIndex provides
+// O(log N) reverse lookup after the full column is decoded.
+// The span:end synthesis case uses GetIntrinsicColumn("span:end") since span:end is not
+// in the intrinsic TOC (synthesized from start+duration).
 func lookupIntrinsicFields(r *modules_reader.Reader, selected []modules_shared.BlockRef, wantCols map[string]struct{}) []map[string]any {
-	m := len(selected)
-	index := make(map[uint32]int, m)
-	for i, ref := range selected {
-		index[uint32(ref.BlockIdx)<<16|uint32(ref.RowIdx)] = i
-	}
-
-	// searchIndex returns the original position in selected for the given packed key,
-	// or -1 if not found.
-	searchIndex := func(key uint32) int {
-		if idx, ok := index[key]; ok {
-			return idx
-		}
-		return -1
-	}
-
 	result := make([]map[string]any, len(selected))
 	for i := range result {
 		result[i] = make(map[string]any, 12)
 	}
 
+	// lookupColumn uses EnsureRefIndex (O(N log N) one-time sort, cached on the column
+	// object in objectcache) then LookupRefFast (O(log N) binary search per ref).
+	// Total per column: O(M log N) for M target refs — versus the old O(N) full scan.
+	lookupColumn := func(colName string, col *modules_shared.IntrinsicColumn) {
+		col.EnsureRefIndex()
+		for i, ref := range selected {
+			packed := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx) //nolint:gosec
+			if val, ok := col.LookupRefFast(packed); ok {
+				result[i][colName] = val
+			}
+		}
+	}
+
 	for _, colName := range r.IntrinsicColumnNames() {
-		// Skip columns not required by this query. wantCols == nil means "all columns"
-		// (used for FindTraceByID and match-all queries that need every field).
 		if wantCols != nil {
 			if _, needed := wantCols[colName]; !needed {
 				continue
@@ -1166,42 +1251,19 @@ func lookupIntrinsicFields(r *modules_reader.Reader, selected []modules_shared.B
 		if err != nil || col == nil {
 			continue
 		}
-		switch col.Format {
-		case modules_shared.IntrinsicFormatDict:
-			// Dict columns: iterate entries, for each entry scan its refs against targets.
-			// Hash map lookup (searchIndex) gives O(1) per ref.
-			// Use col.Type to decide the Go type — not entry.Value != "" — so that
-			// empty-string values are preserved correctly for string columns.
-			isInt := col.Type == modules_shared.ColumnTypeInt64 ||
-				col.Type == modules_shared.ColumnTypeRangeInt64
-			for _, entry := range col.DictEntries {
-				var val any
-				if isInt {
-					val = entry.Int64Val
-				} else {
-					val = entry.Value
-				}
-				for _, ref := range entry.BlockRefs {
-					key := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx)
-					if idx := searchIndex(key); idx >= 0 {
-						result[idx][colName] = val
-					}
-				}
-			}
-		case modules_shared.IntrinsicFormatFlat:
-			// Flat columns: scan refs with O(1) hash map lookup per ref.
-			for i, ref := range col.BlockRefs {
-				key := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx)
-				if idx := searchIndex(key); idx >= 0 {
-					if len(col.Uint64Values) > i {
-						result[idx][colName] = col.Uint64Values[i]
-					} else if len(col.BytesValues) > i {
-						result[idx][colName] = col.BytesValues[i]
-					}
-				}
-			}
+		lookupColumn(colName, col)
+	}
+
+	if wantCols == nil {
+		if col, err := r.GetIntrinsicColumn("span:end"); err == nil && col != nil {
+			lookupColumn("span:end", col)
+		}
+	} else if _, needed := wantCols["span:end"]; needed {
+		if col, err := r.GetIntrinsicColumn("span:end"); err == nil && col != nil {
+			lookupColumn("span:end", col)
 		}
 	}
+
 	return result
 }
 

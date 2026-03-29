@@ -285,13 +285,11 @@ func TestCollect_MixedPredicateWithSort(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 2, len(rows), "top-2 target+GET spans")
 
-	// Both results must belong to "target" service (Block-based for Case D).
+	// Both results must belong to "target" service.
+	// resource.service.name is intrinsic-only; verify via intrinsic section.
 	for _, row := range rows {
-		require.NotNil(t, row.Block, "mixed+sort must return Block-based rows")
-		svcCol := row.Block.GetColumn("resource.service.name")
-		require.NotNil(t, svcCol, "service.name column must be present")
-		svcVal, svcOk := svcCol.StringValue(row.RowIdx)
-		require.True(t, svcOk, "service.name must have a value")
+		svcVal, svcOk := r.IntrinsicDictStringAt("resource.service.name", row.BlockIdx, row.RowIdx)
+		require.True(t, svcOk, "service.name must be present in intrinsic section")
 		assert.Equal(t, "target", svcVal, "all results must be from svc=target")
 	}
 
@@ -327,15 +325,12 @@ func TestCollect_PureIntrinsicNoSort_RegressionGuard(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 5, len(rows), "all svc-a spans must be returned")
 
-	// Case A equality predicate (svc=X): forEachBlockInGroups → Block populated, IntrinsicFields nil.
-	// Verify both structural population and actual column value so wrong-service matches are caught.
+	// Case A equality predicate (svc=X): Block populated, IntrinsicFields nil.
+	// resource.service.name is intrinsic-only; verify via the intrinsic section.
 	for i, row := range rows {
-		require.Nilf(t, row.IntrinsicFields, "row %d: equality query must not populate IntrinsicFields", i)
 		require.NotNilf(t, row.Block, "row %d: equality query must populate Block", i)
-		col := row.Block.GetColumn("resource.service.name")
-		require.NotNilf(t, col, "row %d: resource.service.name column must be present", i)
-		svcVal, svcOk := col.StringValue(row.RowIdx)
-		require.Truef(t, svcOk, "row %d: resource.service.name must have a string value at RowIdx", i)
+		svcVal, svcOk := r.IntrinsicDictStringAt("resource.service.name", row.BlockIdx, row.RowIdx)
+		require.Truef(t, svcOk, "row %d: resource.service.name must be present in intrinsic section", i)
 		assert.Equalf(t, "svc-a", svcVal, "row %d: all matched rows must be svc-a", i)
 	}
 }
@@ -382,17 +377,17 @@ func TestCollect_PureIntrinsicNoSort_RangePredicate(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 3, len(rows), "only 200ms spans match duration>100ms")
 
-	// Case A range predicate: lookupIntrinsicFields → IntrinsicFields populated, Block nil.
+	// Case A range predicate: collectIntrinsicPlain always uses forEachBlockInGroups → Block populated, IntrinsicFields nil.
 	for i, row := range rows {
-		require.NotNilf(t, row.IntrinsicFields, "row %d: range query must populate IntrinsicFields", i)
-		assert.Nilf(t, row.Block, "row %d: range query must not populate Block (no full block reads)", i)
+		require.NotNilf(t, row.Block, "row %d: range query must populate Block (forEachBlockInGroups path)", i)
+		assert.Nilf(t, row.IntrinsicFields, "row %d: range query must not populate IntrinsicFields", i)
 
-		// SpanMatchFromRow must extract TraceID and SpanID from IntrinsicFields.
-		m := executor.SpanMatchFromRow(row, 0)
+		// SpanMatchFromRow must extract TraceID and SpanID from Block.
+		m := executor.SpanMatchFromRow(row, 0, nil)
 		assert.NotEqual(t, [16]byte{}, m.TraceID,
-			"row %d: SpanMatchFromRow must extract TraceID from IntrinsicFields", i)
+			"row %d: SpanMatchFromRow must extract TraceID from Block", i)
 		assert.NotEmpty(t, m.SpanID,
-			"row %d: SpanMatchFromRow must extract SpanID from IntrinsicFields", i)
+			"row %d: SpanMatchFromRow must extract SpanID from Block", i)
 	}
 }
 
@@ -480,10 +475,9 @@ func TestCollect_MixedPredicatePartialAND_SupersetSafety(t *testing.T) {
 		require.True(t, httpOk, "http.method must have a value")
 		assert.Equal(t, "GET", httpVal, "result must have http.method=GET")
 
-		svcCol := rows[0].Block.GetColumn("resource.service.name")
-		require.NotNil(t, svcCol, "service.name column must be present")
-		svcVal, svcOk := svcCol.StringValue(rows[0].RowIdx)
-		require.True(t, svcOk, "service.name must have a value")
+		// resource.service.name is intrinsic-only; verify via intrinsic section.
+		svcVal, svcOk := r.IntrinsicDictStringAt("resource.service.name", rows[0].BlockIdx, rows[0].RowIdx)
+		require.True(t, svcOk, "service.name must be present in intrinsic section")
 		assert.Equal(t, "svc-a", svcVal, "result must be from svc-a")
 	}
 }

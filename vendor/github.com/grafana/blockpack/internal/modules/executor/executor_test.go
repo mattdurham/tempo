@@ -262,7 +262,7 @@ func TestExecute_SpanMatchFields(t *testing.T) {
 	r := openReader(t, buf.Bytes())
 	rows := runQuery(t, r, `{}`)
 	require.Equal(t, 1, len(rows))
-	match := executor.SpanMatchFromRow(rows[0], r.SignalType())
+	match := executor.SpanMatchFromRow(rows[0], r.SignalType(), r)
 	assert.Equal(t, tid, match.TraceID)
 	assert.NotEmpty(t, match.SpanID)
 }
