@@ -295,4 +295,6 @@ func resetColumn(col *Column) {
 	col.internMap = nil
 	col.sparseDictIdx = nil // NOTE-PERF-1: clear deferred dense expansion
 	col.decodeOnce = sync.Once{}
+	col.presenceOnce = sync.Once{}
+	col.denseOnce = sync.Once{}
 }
