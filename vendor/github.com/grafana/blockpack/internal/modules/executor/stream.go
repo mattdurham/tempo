@@ -219,6 +219,13 @@ func Collect(
 	// path prevents false-negative results on those files.
 	// Mixed queries (Cases C/D) still require Limit > 0 to bound the pre-filter cost.
 	if hasSomeIntrinsicPredicates(program) && (opts.Limit > 0 || ProgramIsIntrinsicOnly(program)) {
+		// SPEC-INTRINSIC-004: check file-level bloom before any intrinsic scan.
+		// If the FileBloom guarantees no span matches the equality predicates, skip this
+		// file entirely — O(1) rejection vs O(N) intrinsic column scan.
+		if program.Predicates != nil && fileLevelBloomReject(r, program.Predicates.Nodes) {
+			return nil, nil
+		}
+
 		var fastStats CollectStats
 		fastStats.TotalBlocks = r.BlockCount() // populate for OnStats callers (NOTE-050)
 		rows, err := collectFromIntrinsicRefs(r, program, opts, wantColumns, secondPassCols,
