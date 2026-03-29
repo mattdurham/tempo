@@ -1205,19 +1205,14 @@ func filterRowSetByIntrinsicNodes(
 // calls for unwanted columns).
 // Pass nil to fetch all intrinsic columns (e.g. FindTraceByID needs every field).
 //
-// The lookup index uses map[uint32]int (packed key → result position) for O(1)
-// access per scan entry. This eliminated the slices.BinarySearchFunc hotspot
-// that was previously 43% flat CPU when using a sorted []keyIdx slice.
+// For each requested intrinsic column, GetIntrinsicColumn returns an objectcache-backed
+// column where EnsureRefIndex builds a sorted-by-ref lookup table once (O(N log N));
+// subsequent lookups use O(log N) binary search per selected ref via LookupRefFast.
+// Total per column: O(M log N) for M target refs — far cheaper than the previous O(N)
+// full-column scan when M << N.
 //
-// Field lookup: calls GetIntrinsicColumn to get the full decoded column, then
-// builds a refIndex via EnsureRefIndex (O(N log N), cached on the column object)
-// and does O(log N) LookupRefFast per ref. Total per column: O(M log N) for M target refs.
-//
-// NOTE-007: RefBloom/MinRef/MaxRef were removed from the page TOC — all pages are decoded
-// via DecodePagedColumnBlobFiltered, which no longer skips any pages. The refIndex provides
-// O(log N) reverse lookup after the full column is decoded.
-// The span:end synthesis case uses GetIntrinsicColumn("span:end") since span:end is not
-// in the intrinsic TOC (synthesized from start+duration).
+// span:end is synthesized from span:start + span:duration (no TOC entry) and handled
+// explicitly after the main column loop.
 func lookupIntrinsicFields(r *modules_reader.Reader, selected []modules_shared.BlockRef, wantCols map[string]struct{}) []map[string]any {
 	result := make([]map[string]any, len(selected))
 	for i := range result {
