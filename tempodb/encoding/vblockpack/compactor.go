@@ -184,8 +184,8 @@ func (s *tempoOutputStorage) Put(path string, data []byte) error {
 		DedicatedColumns:  s.dedicatedColumns,
 		StartTime:         s.startTime,
 		EndTime:           s.endTime,
-		Size_:        uint64(len(data)),
-		TotalObjects: totalObjects,
+		Size_:             uint64(len(data)),
+		TotalObjects:      totalObjects,
 		// TotalRecords is set by setBlockTimeRange to the internal block count,
 		// allowing the frontend sharder to split this file into sub-file jobs.
 		// Must be >= 1 or the sharder skips the block.

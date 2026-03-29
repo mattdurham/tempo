@@ -5,11 +5,14 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"math"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/grafana/blockpack"
 	"github.com/grafana/tempo/pkg/tempopb"
 	tempocommon "github.com/grafana/tempo/pkg/tempopb/common/v1"
 	temporesource "github.com/grafana/tempo/pkg/tempopb/resource/v1"
@@ -17,8 +20,11 @@ import (
 	"github.com/grafana/tempo/pkg/traceql"
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/encoding/common"
-	"github.com/grafana/blockpack"
 )
+
+// metricsOpRe extracts the metric function name from a TraceQL metrics query.
+// For example: "{}|rate()" → "rate", "{...}|count_over_time() by (x)" → "count_over_time".
+var metricsOpRe = regexp.MustCompile(`\|(\w+)\(`)
 
 // tempoReaderProvider implements blockpack.ReaderProvider directly against
 // Tempo's backend.Reader for a single fixed object (DataFileName).
@@ -137,7 +143,6 @@ func (b *blockpackBlock) newReader() (*blockpack.Reader, error) {
 	return blockpack.NewReaderWithCache(b.newReaderProvider(), fileID, getFileCache())
 }
 
-
 // executeQuery creates a reader and executes a TraceQL query, returning all matching spans.
 func (b *blockpackBlock) executeQuery(query string, opts blockpack.QueryOptions) ([]blockpack.SpanMatch, error) {
 	r, err := b.newReader()
@@ -150,6 +155,90 @@ func (b *blockpackBlock) executeQuery(query string, opts blockpack.QueryOptions)
 // BlockMeta returns the block metadata
 func (b *blockpackBlock) BlockMeta() *backend.BlockMeta {
 	return b.meta
+}
+
+// QueryRange implements the nativeMetricsQuerier optional interface.
+// It delegates to blockpack.ExecuteMetricsTraceQL which uses the intrinsic
+// column fast path — reading only ~10 MB of sorted flat blobs instead of
+// fetching the entire block (~200 MB) via the generic Fetch path.
+func (b *blockpackBlock) QueryRange(_ context.Context, req *tempopb.QueryRangeRequest, _ common.SearchOptions) (*tempopb.QueryRangeResponse, error) {
+	r, err := b.newReader()
+	if err != nil {
+		return nil, fmt.Errorf("blockpack QueryRange: new reader: %w", err)
+	}
+
+	result, err := blockpack.ExecuteMetricsTraceQL(r, req.Query, blockpack.TraceMetricOptions{
+		StartNano: int64(req.Start),
+		EndNano:   int64(req.End),
+		StepNano:  int64(req.Step),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("blockpack QueryRange: %w", err)
+	}
+
+	return convertTraceMetricsResult(result, req), nil
+}
+
+// convertTraceMetricsResult maps a blockpack TraceMetricsResult to a Tempo QueryRangeResponse.
+// Timestamps are generated using the same IntervalMapper as Tempo's parquet path so that
+// downstream combiners receive structurally identical series regardless of backend.
+func convertTraceMetricsResult(result *blockpack.TraceMetricsResult, req *tempopb.QueryRangeRequest) *tempopb.QueryRangeResponse {
+	mapper := traceql.NewIntervalMapperFromReq(req)
+	intervals := mapper.IntervalCount()
+
+	// For ungrouped queries, Tempo's parquet path adds {__name__=<op>} to match Prometheus
+	// convention. Blockpack returns empty labels for ungrouped queries, so we synthesize
+	// the __name__ label here using the op name extracted from the query string.
+	var ungroupedName string
+	if m := metricsOpRe.FindStringSubmatch(req.Query); len(m) > 1 {
+		ungroupedName = m[1]
+	}
+
+	series := make([]*tempopb.TimeSeries, 0, len(result.Series))
+	for _, s := range result.Series {
+		var labels []tempocommon.KeyValue
+		if len(s.Labels) == 0 && ungroupedName != "" {
+			// Ungrouped query — add synthetic __name__ label to match parquet output.
+			labels = []tempocommon.KeyValue{{
+				Key:   "__name__",
+				Value: &tempocommon.AnyValue{Value: &tempocommon.AnyValue_StringValue{StringValue: ungroupedName}},
+			}}
+		} else {
+			labels = make([]tempocommon.KeyValue, 0, len(s.Labels))
+			for _, lbl := range s.Labels {
+				labels = append(labels, tempocommon.KeyValue{
+					Key:   lbl.Name,
+					Value: &tempocommon.AnyValue{Value: &tempocommon.AnyValue_StringValue{StringValue: lbl.Value}},
+				})
+			}
+		}
+
+		samples := make([]tempopb.Sample, 0, len(s.Values))
+		for i, v := range s.Values {
+			if i >= intervals || math.IsNaN(v) {
+				continue
+			}
+			ts := mapper.TimestampOf(i)
+			samples = append(samples, tempopb.Sample{
+				TimestampMs: time.Unix(0, int64(ts)).UnixMilli(),
+				Value:       v,
+			})
+		}
+		if len(samples) == 0 {
+			continue
+		}
+		series = append(series, &tempopb.TimeSeries{
+			Labels:  labels,
+			Samples: samples,
+		})
+	}
+
+	return &tempopb.QueryRangeResponse{
+		Series: series,
+		Metrics: &tempopb.SearchMetrics{
+			InspectedBytes: uint64(result.BytesRead), //nolint:gosec
+		},
+	}
 }
 
 // FindTraceByID finds a trace by ID.
@@ -601,7 +690,6 @@ func (i *sliceSpansetIterator) Next(_ context.Context) (*traceql.Spanset, error)
 
 func (i *sliceSpansetIterator) Close() {}
 
-
 // columnNameToAttribute converts a blockpack column name to a traceql.Attribute.
 // Returns false for internal columns (IDs, timestamps) that don't map to attributes.
 func columnNameToAttribute(colName string) (traceql.Attribute, bool) {
@@ -1010,7 +1098,6 @@ func columnValue(col *blockpack.Column, rowIdx int) (any, bool) {
 	}
 	return nil, false
 }
-
 
 // blockpackValueToAnyValue converts a blockpack field value to an OTLP AnyValue.
 // Returns nil for unrecognised types so callers can skip unsupported values.

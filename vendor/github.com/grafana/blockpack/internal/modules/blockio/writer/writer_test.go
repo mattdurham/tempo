@@ -1784,20 +1784,32 @@ func TestAddTempoTrace_EquivalentToOTLP(t *testing.T) {
 	tempoR := openWriterTestReader(t, tempoBuf.Bytes())
 	assert.Equal(t, sumTempoSpans(otlpR), sumTempoSpans(tempoR), "span count must match")
 
-	// Verify resource.service.name column is present and correct in the Tempo-path file.
+	// Verify resource.service.name is present in the intrinsic section for both paths.
+	// Block columns no longer store intrinsic fields — use the intrinsic reader.
+	otlpSvcIntrinsic, err := otlpR.GetIntrinsicColumn("resource.service.name")
+	require.NoError(t, err)
+	require.NotNil(t, otlpSvcIntrinsic, "resource.service.name must be in intrinsic section (OTLP path)")
+
+	tempoSvcIntrinsic, err := tempoR.GetIntrinsicColumn("resource.service.name")
+	require.NoError(t, err)
+	require.NotNil(t, tempoSvcIntrinsic, "resource.service.name must be in intrinsic section (Tempo path)")
+
+	// Both must have the same service name.
+	require.NotEmpty(t, otlpSvcIntrinsic.DictEntries, "OTLP intrinsic must have dict entries")
+	require.NotEmpty(t, tempoSvcIntrinsic.DictEntries, "Tempo intrinsic must have dict entries")
+	assert.Equal(t, otlpSvcIntrinsic.DictEntries[0].Value, tempoSvcIntrinsic.DictEntries[0].Value,
+		"resource.service.name must match between OTLP and Tempo paths")
+
+	// Verify resource.service.name is present in block columns (dual storage) — both OTLP and Tempo paths.
 	otlpBWB, err := otlpR.GetBlockWithBytes(0, nil, nil)
 	require.NoError(t, err)
+	assert.NotNil(t, otlpBWB.Block.GetColumn("resource.service.name"),
+		"resource.service.name must be present in block columns (dual storage, OTLP path)")
+
 	tempoBWB, err := tempoR.GetBlockWithBytes(0, nil, nil)
 	require.NoError(t, err)
-
-	otlpSvcCol := otlpBWB.Block.GetColumn("resource.service.name")
-	require.NotNil(t, otlpSvcCol)
-	tempoSvcCol := tempoBWB.Block.GetColumn("resource.service.name")
-	require.NotNil(t, tempoSvcCol)
-
-	otlpSvc, _ := otlpSvcCol.StringValue(0)
-	tempoSvc, _ := tempoSvcCol.StringValue(0)
-	assert.Equal(t, otlpSvc, tempoSvc, "resource.service.name must match")
+	assert.NotNil(t, tempoBWB.Block.GetColumn("resource.service.name"),
+		"resource.service.name must be present in block columns (dual storage, Tempo path)")
 
 	// Verify the span attribute is also present.
 	tempoMethodCol := tempoBWB.Block.GetColumn("span.http.method")
@@ -1825,4 +1837,126 @@ func TestAddTempoTrace_MultipleBlocks(t *testing.T) {
 	r := openWriterTestReader(t, buf.Bytes())
 	assert.Equal(t, 12, sumTempoSpans(r))
 	assert.GreaterOrEqual(t, r.BlockCount(), 2, "expected at least 2 blocks for 12 spans with MaxBlockSpans=5")
+}
+
+// TestIntrinsicDualStorage verifies that span intrinsic fields are stored in BOTH
+// block columns (for O(1) reverse lookups) AND the intrinsic TOC section (for
+// fast block-level pruning). This dual-storage approach was restored to fix an
+// O(N) per-column reverse lookup regression introduced in PR #172.
+//
+// Note: trace:id, span:id, span:parent_id, span:status_message are identity columns
+// stored in block columns but NOT in the intrinsic section (NOTE-005 in writer/NOTES.md).
+func TestIntrinsicDualStorage(t *testing.T) {
+	var buf bytes.Buffer
+	w := newTestWriter(t, &buf, 0)
+
+	td := makeTracesData("acme", []*tracev1.Span{
+		makeSpan(makeTraceID(1), makeSpanID(1), "op-a", 1_000_000_000, 2_000_000_000, map[string]string{"env": "prod"}),
+		makeSpan(makeTraceID(2), makeSpanID(2), "op-b", 2_000_000_000, 3_000_000_000, nil),
+	})
+	require.NoError(t, w.AddTracesData(td))
+	_, err := w.Flush()
+	require.NoError(t, err)
+
+	r := openWriterTestReader(t, buf.Bytes())
+	require.GreaterOrEqual(t, r.BlockCount(), 1, "expected at least one block")
+
+	bwb, err := r.GetBlockWithBytes(0, nil, nil)
+	require.NoError(t, err)
+
+	// Intrinsic columns MUST be present in block columns (dual storage for O(1) lookups),
+	// including identity columns (trace:id, span:id) which are NOT in the intrinsic section.
+	intrinsicColNames := []string{
+		"trace:id",
+		"span:id",
+		"span:name",
+		"span:kind",
+		"span:start",
+		"span:end",
+		"span:duration",
+		"span:status",
+		"resource.service.name",
+	}
+	for _, name := range intrinsicColNames {
+		assert.NotNil(t, bwb.Block.GetColumn(name),
+			"intrinsic column %q must be present in block columns (dual storage)", name)
+	}
+
+	// The intrinsic section contains only non-identity predicate columns (7 total after NOTE-005).
+	// trace:id, span:id, span:parent_id, span:status_message are excluded from the intrinsic section.
+	intrinsicColumnNames := r.IntrinsicColumnNames()
+	intrinsicSet := make(map[string]struct{}, len(intrinsicColumnNames))
+	for _, n := range intrinsicColumnNames {
+		intrinsicSet[n] = struct{}{}
+	}
+	for _, want := range []string{
+		"span:name", "span:kind", "span:start", "span:duration",
+		"span:status", "resource.service.name",
+	} {
+		_, ok := intrinsicSet[want]
+		assert.True(t, ok, "intrinsic section must contain column %q", want)
+	}
+
+	// Identity columns must NOT be in the intrinsic section (NOTE-005).
+	for _, notWant := range []string{"trace:id", "span:id", "span:parent_id", "span:status_message"} {
+		_, ok := intrinsicSet[notWant]
+		assert.False(t, ok, "identity column %q must not be in intrinsic section (NOTE-005)", notWant)
+	}
+
+	// span:end must NOT be in the intrinsic section — it is synthesized from start+duration on read.
+	assert.NotContains(t, intrinsicSet, "span:end",
+		"span:end must not be written to the intrinsic section (synthesized on read)")
+}
+
+// TestCompactionDualStorage verifies that the compaction write path (addRowFromBlock / AddRow)
+// produces block column payloads with intrinsic columns, just like the ingestion path.
+// Without this, compacted files revert to the O(N) reverse-lookup path that this PR fixes.
+func TestCompactionDualStorage(t *testing.T) {
+	// Step 1: write a file with spans via the ingestion path.
+	var srcBuf bytes.Buffer
+	w := newTestWriter(t, &srcBuf, 0)
+	td := makeTracesData("acme", []*tracev1.Span{
+		makeSpan(makeTraceID(1), makeSpanID(1), "op-a", 1_000_000_000, 2_000_000_000, map[string]string{"env": "prod"}),
+		makeSpan(makeTraceID(2), makeSpanID(2), "op-b", 2_000_000_000, 3_000_000_000, nil),
+	})
+	require.NoError(t, w.AddTracesData(td))
+	_, err := w.Flush()
+	require.NoError(t, err)
+
+	// Step 2: compact via AddRow (the addRowFromBlock path).
+	srcR := openWriterTestReader(t, srcBuf.Bytes())
+	require.GreaterOrEqual(t, srcR.BlockCount(), 1)
+
+	var dstBuf bytes.Buffer
+	dstW := newTestWriter(t, &dstBuf, 0)
+	srcBlock, err := srcR.GetBlockWithBytes(0, nil, nil)
+	require.NoError(t, err)
+
+	for rowIdx := range srcBlock.Block.SpanCount() {
+		require.NoError(t, dstW.AddRow(srcBlock.Block, rowIdx))
+	}
+	_, err = dstW.Flush()
+	require.NoError(t, err)
+
+	// Step 3: verify intrinsic columns are present in the compacted block payloads.
+	dstR := openWriterTestReader(t, dstBuf.Bytes())
+	require.GreaterOrEqual(t, dstR.BlockCount(), 1)
+
+	dstBWB, err := dstR.GetBlockWithBytes(0, nil, nil)
+	require.NoError(t, err)
+
+	compactedIntrinsicCols := []string{
+		"trace:id",
+		"span:id",
+		"span:name",
+		"span:kind",
+		"span:start",
+		"span:end",
+		"span:duration",
+		"resource.service.name",
+	}
+	for _, name := range compactedIntrinsicCols {
+		assert.NotNil(t, dstBWB.Block.GetColumn(name),
+			"compacted block: intrinsic column %q must be present in block columns (dual storage)", name)
+	}
 }

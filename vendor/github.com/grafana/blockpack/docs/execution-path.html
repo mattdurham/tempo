@@ -62,23 +62,23 @@
 <p><code>normalizeAttributePath()</code> maps TraceQL attribute syntax (<code>span.foo</code>, <code>resource.bar</code>, <code>duration</code>) to the canonical column names used inside blockpack files.</p>
 <h3>4. Block Pruning (5 stages)</h3>
 <p>The query planner runs five cascading filters, each shrinking the candidate block set:</p>
-<p>#### Stage 4a — File-Level Bloom
-Before touching any blocks, blockpack checks the file-level BinaryFuse8 bloom filter. If the queried service name is absent from the entire file, the query returns immediately with zero I/O.</p>
-<p>#### Stage 4b — Time-Range Reject
-Each block carries <code>[MinNano, MaxNano]</code>. Blocks outside the query's time window are dropped. This is the cheapest filter — purely metadata comparison.</p>
-<p>#### Stage 4c — KLL Range Index
-At write time, a KLL sketch is built per numeric column to derive ~1,000 quantile bucket boundaries for a file-level range index. Each block is recorded against the buckets that overlap its <code>[min, max]</code> for that column. At query time, the planner uses <strong>interval matching</strong>: for a predicate <code>duration &gt; X</code>, a block is kept only if it has at least one overlapping bucket in <code>[X, ∞)</code>. Blocks with no overlapping buckets are pruned.</p>
+<h4>Stage 4a — File-Level Bloom</h4>
+<p>Before touching any blocks, blockpack checks the file-level BinaryFuse8 bloom filter. If the queried service name is absent from the entire file, the query returns immediately with zero I/O.</p>
+<h4>Stage 4b — Time-Range Reject</h4>
+<p>Each block carries <code>[MinNano, MaxNano]</code>. Blocks outside the query's time window are dropped. This is the cheapest filter — purely metadata comparison.</p>
+<h4>Stage 4c — KLL Range Index</h4>
+<p>At write time, a KLL sketch is built per numeric column to derive ~1,000 quantile bucket boundaries for a file-level range index. Each block is recorded against the buckets that overlap its <code>[min, max]</code> for that column. At query time, the planner uses <strong>interval matching</strong>: for a predicate <code>duration &gt; X</code>, a block is kept only if it has at least one overlapping bucket in <code>[X, ∞)</code>. Blocks with no overlapping buckets are pruned.</p>
 <p>For OR predicates across multiple duration conditions, the planner keeps any block that satisfies <em>either</em> branch — a block need only pass one arm of an OR.</p>
-<p>#### Stage 4d — Block Bloom Filters
-Each block has a per-column BinaryFuse8 filter over its distinct values. Blocks where the filter definitively rejects a predicate value are dropped.</p>
-<p>#### Stage 4e — CMS Zero-Estimate
-For each remaining block, blockpack checks the Count-Min Sketch estimate for each queried exact value. A CMS estimate of zero means the value was <strong>definitively never added</strong> to that block's sketch — CMS never undercounts, so a zero is a safe prune with no false negatives.</p>
+<h4>Stage 4d — Block Bloom Filters</h4>
+<p>Each block has a per-column BinaryFuse8 filter over its distinct values. Blocks where the filter definitively rejects a predicate value are dropped.</p>
+<h4>Stage 4e — CMS Zero-Estimate</h4>
+<p>For each remaining block, blockpack checks the Count-Min Sketch estimate for each queried exact value. A CMS estimate of zero means the value was <strong>definitively never added</strong> to that block's sketch — CMS never undercounts, so a zero is a safe prune with no false negatives.</p>
 <p>This catches bloom filter false positives: a block that passed the bloom check (which has a ~0.4% false positive rate) but has a CMS count of zero for the queried value is safely eliminated.</p>
 <p>After all pruning stages, typically 60–95% of blocks have been eliminated with zero I/O.</p>
 <h3>5. Executor Dispatch</h3>
 <p>The executor receives the pruned block list and dispatches to one of two paths:</p>
-<p><strong>Intrinsic fast-path (path A):</strong> Pure service-name / label queries can be answered using only bloom filters and the dedicated column index — no block bytes are ever fetched.</p>
-<p><strong>Full block scan (path B):</strong> Queries with range predicates (like <code>duration &gt; 500ms</code>) require reading block payloads. The executor iterates the remaining blocks one by one.</p>
+<p><strong>Intrinsic fast-path (path A):</strong> Predicates — both equality and range — on intrinsic columns (<code>span:duration</code>, <code>span:kind</code>, <code>span:name</code>, <code>resource.service.name</code>, etc.) are answered entirely from the file-level intrinsic section. The intrinsic TOC stores all values sorted with BlockRef pointers back to (blockID, rowIndex), so a query like <code>duration &gt; 500ms</code> does a binary search on the intrinsic duration column and returns matching BlockRefs directly. No block payload bytes are ever fetched.</p>
+<p><strong>Full block scan (path B):</strong> Predicates on non-intrinsic columns — user-defined span attributes like <code>high_sla=&quot;true&quot;</code> or <code>http.response.body_size &gt; 10000</code> — require reading block payloads. These attributes are not stored in the intrinsic section, so the executor must fetch each block, decode the relevant column, and evaluate the predicate span-by-span.</p>
 <h3>6. Block I/O</h3>
 <p>For each selected block, <code>GetBlockWithBytes</code> issues <strong>one</strong> HTTP/storage request and returns the full block as <code>[]byte</code>. The entire block is always read — never a subset of columns.</p>
 <p>This is the only point in the pipeline where I/O occurs.</p>

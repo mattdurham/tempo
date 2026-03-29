@@ -33,6 +33,66 @@ var decompScratchPool = &sync.Pool{ //nolint:gochecknoglobals
 	},
 }
 
+// internMapPool holds reusable string intern maps for block parsing.
+// Each map is cleared before return to prevent cross-block string retention.
+//
+// NOTE-006: The pool eliminates per-call make(map[string]string) allocations.
+// Maps must be acquired at the scanBlocks level (not inside ParseBlockFromBytes) because
+// lazy columns store an internMap reference that outlives the ParseBlockFromBytes call —
+// decodeNow() may be called during the row loop after ParseBlockFromBytes returns.
+// The caller (scanBlocks) must hold the pooled map alive until after streamSortedRows
+// completes (all lazy decodes done), then release it.
+//
+// Strings interned during parsing escape into Column.StringDict entries (heap-allocated),
+// so clearing the map does not corrupt previously interned string data.
+var internMapPool = &sync.Pool{ //nolint:gochecknoglobals
+	New: func() any {
+		m := make(map[string]string, 64)
+		return &m
+	},
+}
+
+// AcquireInternMap returns a pooled intern map, cleared and ready for use.
+func AcquireInternMap() *map[string]string {
+	return internMapPool.Get().(*map[string]string)
+}
+
+// ReleaseInternMap clears the map and returns it to the pool.
+func ReleaseInternMap(mp *map[string]string) {
+	clear(*mp)
+	internMapPool.Put(mp)
+}
+
+// presentRowsScratchPool holds reusable []int scratch slices for collectPresentRowsInto.
+// Each call to decodeXORBytes / decodePrefixBytes acquires one slice, resets it to [:0],
+// appends present-row indices, then releases it back after the per-row decode loop.
+//
+// NOTE-007: Eliminates per-call make([]int, 0, presentCount) in collectPresentRows.
+// Cap guard: slices larger than 65536 entries are replaced with a fresh small slice before
+// pool return to avoid retaining large backing arrays indefinitely.
+var presentRowsScratchPool = &sync.Pool{ //nolint:gochecknoglobals
+	New: func() any {
+		s := make([]int, 0, 2048)
+		return &s
+	},
+}
+
+func acquirePresentRowsScratch() *[]int {
+	return presentRowsScratchPool.Get().(*[]int)
+}
+
+func releasePresentRowsScratch(sp *[]int) {
+	if cap(*sp) > 65536 {
+		// Replace the oversized backing array with a fresh small slice.
+		// Assign through the pointer so the pool receives the new small slice,
+		// not a pointer to a local stack variable.
+		*sp = make([]int, 0, 2048)
+	} else {
+		*sp = (*sp)[:0]
+	}
+	presentRowsScratchPool.Put(sp)
+}
+
 func getZstdDecoder() *zstd.Decoder {
 	zstdDecoderOnce.Do(func() {
 		var err error
@@ -96,6 +156,9 @@ type decodeCtx struct {
 func internString(b []byte, ctx *decodeCtx) string {
 	if len(b) == 0 {
 		return ""
+	}
+	if ctx.intern == nil {
+		return string(b) // no intern map — safe for concurrent use
 	}
 	// Zero-alloc lookup: temporary string header pointing into b (stack-scoped).
 	key := unsafe.String(unsafe.SliceData(b), len(b)) //nolint:gosec // safe: key never escapes this func
@@ -277,49 +340,48 @@ func decodePresenceOnly(data []byte, spanCount int) ([]byte, error) {
 
 // decodeNow performs full decode of this column from rawEncoding.
 // Called on first StringValue/Int64Value/Uint64Value/Float64Value/BoolValue/BytesValue access.
-// NOTE-001: safe for single-goroutine scan path; no locking needed.
+// decodeOnce ensures at most one goroutine decodes; concurrent callers block until done.
 // rawEncoding is nil after this call regardless of decode outcome.
 func (c *Column) decodeNow() {
 	if c.rawEncoding == nil {
 		return // already decoded or never registered lazily
 	}
+	c.decodeOnce.Do(func() {
+		if c.rawEncoding == nil {
+			return
+		}
+		scratch := acquireDecompScratch()
+		ctx := &decodeCtx{scratch: scratch, intern: c.internMap}
+		decoded, err := readColumnEncoding(c.rawEncoding, c.SpanCount, c.Type, ctx)
+		releaseDecompScratch(scratch)
 
-	scratch := acquireDecompScratch()
-	ctx := &decodeCtx{scratch: scratch, intern: c.internMap}
-	decoded, err := readColumnEncoding(c.rawEncoding, c.SpanCount, c.Type, ctx)
-	releaseDecompScratch(scratch)
+		if err != nil {
+			c.rawEncoding = nil
+			c.internMap = nil
+			return
+		}
 
-	if err != nil {
-		// Treat decode error as absent column; rawEncoding cleared to prevent retry.
+		if c.Present == nil {
+			c.Present = decoded.Present
+		}
+		c.StringDict = decoded.StringDict
+		c.StringIdx = decoded.StringIdx
+		c.Int64Dict = decoded.Int64Dict
+		c.Int64Idx = decoded.Int64Idx
+		c.Uint64Dict = decoded.Uint64Dict
+		c.Uint64Idx = decoded.Uint64Idx
+		c.Float64Dict = decoded.Float64Dict
+		c.Float64Idx = decoded.Float64Idx
+		c.BoolDict = decoded.BoolDict
+		c.BoolIdx = decoded.BoolIdx
+		c.BytesDict = decoded.BytesDict
+		c.BytesIdx = decoded.BytesIdx
+		c.BytesInline = decoded.BytesInline
+		c.sparseDictIdx = decoded.sparseDictIdx
+
 		c.rawEncoding = nil
 		c.internMap = nil
-		return
-	}
-
-	// Copy decoded fields into self.
-	// NOTE-002: Present may still be nil if decodeNow is triggered before IsPresent
-	// (e.g. direct StringValue call). Copy decoded.Present in that case so subsequent
-	// IsPresent calls work correctly without needing to re-parse rawEncoding.
-	if c.Present == nil {
-		c.Present = decoded.Present
-	}
-	c.StringDict = decoded.StringDict
-	c.StringIdx = decoded.StringIdx
-	c.Int64Dict = decoded.Int64Dict
-	c.Int64Idx = decoded.Int64Idx
-	c.Uint64Dict = decoded.Uint64Dict
-	c.Uint64Idx = decoded.Uint64Idx
-	c.Float64Dict = decoded.Float64Dict
-	c.Float64Idx = decoded.Float64Idx
-	c.BoolDict = decoded.BoolDict
-	c.BoolIdx = decoded.BoolIdx
-	c.BytesDict = decoded.BytesDict
-	c.BytesIdx = decoded.BytesIdx
-	c.BytesInline = decoded.BytesInline
-	c.sparseDictIdx = decoded.sparseDictIdx // NOTE-PERF-1: lazy dense expansion
-
-	c.rawEncoding = nil // signal: fully decoded
-	c.internMap = nil   // release borrowed reference
+	})
 }
 
 // decodeDictBody decodes the zstd-compressed dictionary body and returns typed slices.
@@ -867,7 +929,11 @@ func decodeXORBytes(data []byte, kind uint8, spanCount int, ctx *decodeCtx) (*Co
 	var prev []byte
 	xPos := 0
 
-	for _, presentRow := range collectPresentRows(present, presentCount, spanCount) {
+	// NOTE-007: Acquire pooled scratch for present-row index list; defer release covers error paths.
+	presRowsBuf := acquirePresentRowsScratch()
+	defer releasePresentRowsScratch(presRowsBuf)
+	presentRows := collectPresentRowsInto(present, presentCount, spanCount, presRowsBuf)
+	for _, presentRow := range presentRows {
 		if xPos+4 > len(xorBytes) {
 			return nil, fmt.Errorf("xor_bytes: short at present row %d", presentRow)
 		}
@@ -904,16 +970,21 @@ func decodeXORBytes(data []byte, kind uint8, spanCount int, ctx *decodeCtx) (*Co
 	return col, nil
 }
 
-// collectPresentRows returns a slice of row indices where present bit is set.
-func collectPresentRows(present []byte, presentCount, spanCount int) []int {
-	rows := make([]int, 0, presentCount)
+// collectPresentRowsInto appends row indices where the present bit is set into *buf.
+// *buf is reset to [:0] before use; the caller owns buf and must release it to the pool.
+//
+// NOTE-007: Replaces collectPresentRows; eliminates per-call make([]int) allocation by
+// reusing a pooled scratch slice. The presentCount parameter is unused for pre-sizing
+// (the slice is pre-allocated by the pool) but retained for documentation clarity.
+func collectPresentRowsInto(present []byte, _ /*presentCount*/, spanCount int, buf *[]int) []int {
+	*buf = (*buf)[:0]
 	for i := range spanCount {
 		if shared.IsPresent(present, i) {
-			rows = append(rows, i)
+			*buf = append(*buf, i)
 		}
 	}
 
-	return rows
+	return *buf
 }
 
 // decodePrefixBytes decodes kind 10/11 (PrefixBytes/SparsePrefixBytes).
@@ -999,7 +1070,11 @@ func decodePrefixBytes(data []byte, kind uint8, spanCount int, ctx *decodeCtx) (
 
 	col.BytesInline = make([][]byte, spanCount)
 
-	for _, presentRow := range collectPresentRows(present, presentCount, spanCount) {
+	// NOTE-007: Acquire pooled scratch for present-row index list; defer release covers error paths.
+	presRowsBuf := acquirePresentRowsScratch()
+	defer releasePresentRowsScratch(presRowsBuf)
+	presentRows := collectPresentRowsInto(present, presentCount, spanCount, presRowsBuf)
+	for _, presentRow := range presentRows {
 		if sPos+piw > len(suffixBytes) {
 			return nil, fmt.Errorf("prefix_bytes: short at present row %d prefix_idx", presentRow)
 		}

@@ -228,6 +228,8 @@ func TestCompactBlocks_NativeColumns(t *testing.T) {
 		for rowIdx := range block.SpanCount() {
 			gs := gotSpan{}
 
+			// NOTE-005: trace:id and span:id are no longer in the intrinsic section.
+			// Read them from block column payloads (dual-storage, always present).
 			if col := block.GetColumn("trace:id"); col != nil {
 				if v, ok := col.BytesValue(rowIdx); ok {
 					copy(gs.traceID[:], v)
@@ -238,25 +240,20 @@ func TestCompactBlocks_NativeColumns(t *testing.T) {
 					copy(gs.spanID[:], v)
 				}
 			}
-			if col := block.GetColumn("span:name"); col != nil {
-				if v, ok := col.StringValue(rowIdx); ok {
-					gs.name = v
+			if v, ok := r.IntrinsicDictStringAt("span:name", blockIdx, rowIdx); ok {
+				gs.name = v
+			}
+			if v, ok := r.IntrinsicUint64At("span:start", blockIdx, rowIdx); ok {
+				gs.start = v
+			}
+			// span:end derived from start+duration
+			if start, okS := r.IntrinsicUint64At("span:start", blockIdx, rowIdx); okS {
+				if dur, okD := r.IntrinsicUint64At("span:duration", blockIdx, rowIdx); okD {
+					gs.end = start + dur
 				}
 			}
-			if col := block.GetColumn("span:start"); col != nil {
-				if v, ok := col.Uint64Value(rowIdx); ok {
-					gs.start = v
-				}
-			}
-			if col := block.GetColumn("span:end"); col != nil {
-				if v, ok := col.Uint64Value(rowIdx); ok {
-					gs.end = v
-				}
-			}
-			if col := block.GetColumn("resource.service.name"); col != nil {
-				if v, ok := col.StringValue(rowIdx); ok {
-					gs.svcName = v
-				}
+			if v, ok := r.IntrinsicDictStringAt("resource.service.name", blockIdx, rowIdx); ok {
+				gs.svcName = v
 			}
 			if col := block.GetColumn("span.http.method"); col != nil {
 				if v, ok := col.StringValue(rowIdx); ok {

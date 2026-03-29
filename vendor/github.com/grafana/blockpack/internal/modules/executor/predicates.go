@@ -8,8 +8,10 @@ import (
 	"math/bits"
 	"regexp"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
 	modules_shared "github.com/grafana/blockpack/internal/modules/blockio/shared"
@@ -33,6 +35,14 @@ var traceIntrinsicColumns = map[string]struct{}{
 	"resource.service.name": {},
 }
 
+// traceIntrinsicStringColumns is the subset of traceIntrinsicColumns that contain
+// string values. Only these columns support regex predicates via nilIntrinsicScan.
+var traceIntrinsicStringColumns = map[string]struct{}{
+	"span:name":             {},
+	"span:status_message":   {},
+	"resource.service.name": {},
+}
+
 // logIntrinsicColumns is the set of column names served by the intrinsic section
 // for log files.
 var logIntrinsicColumns = map[string]struct{}{
@@ -44,6 +54,26 @@ var logIntrinsicColumns = map[string]struct{}{
 	"log:span_id":            {},
 	"log:flags":              {},
 	"resource.service.name":  {},
+}
+
+// intrinsicRegexCache caches compiled regexes for intrinsic post-filter predicates
+// to avoid recompiling the same pattern on every row evaluation.
+var (
+	intrinsicRegexCache sync.Map // map[string]*regexp.Regexp
+)
+
+// cachedRegexCompile returns a compiled *regexp.Regexp for pattern, using a
+// package-level cache so the same pattern is only compiled once across all rows.
+func cachedRegexCompile(pattern string) (*regexp.Regexp, error) {
+	if v, ok := intrinsicRegexCache.Load(pattern); ok {
+		return v.(*regexp.Regexp), nil
+	}
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return nil, err
+	}
+	intrinsicRegexCache.Store(pattern, re)
+	return re, nil
 }
 
 // BuildPredicates converts a compiled vm.Program into queryplanner.Predicate values
@@ -215,14 +245,41 @@ func translateRegexNode(r *modules_reader.Reader, col, pattern string) queryplan
 // served from the intrinsic columns section without reading any block data.
 // Returns false if program is nil, references any dynamic attribute column, or
 // has no predicates (match-all queries are not intrinsic-only).
+//
+// NOTE: inspects program.Predicates directly rather than calling ProgramWantColumns,
+// because ProgramWantColumns strips intrinsic columns from its result — making it
+// return nil for pure-intrinsic queries, which would cause this function to return false.
 func ProgramIsIntrinsicOnly(program *vm.Program) bool {
-	wantCols := ProgramWantColumns(program)
-	if wantCols == nil {
+	if program == nil || program.Predicates == nil {
+		return false
+	}
+	p := program.Predicates
+	if len(p.Nodes) == 0 && len(p.Columns) == 0 {
 		return false // match-all queries are not intrinsic-only
 	}
-	for col := range wantCols {
+	// All explicit Columns (negations, log:body, etc.) must be intrinsic.
+	for _, col := range p.Columns {
 		_, inTrace := traceIntrinsicColumns[col]
 		_, inLog := logIntrinsicColumns[col]
+		if !inTrace && !inLog {
+			return false
+		}
+	}
+	// All leaf columns in the Nodes tree must be intrinsic.
+	return allNodesIntrinsic(p.Nodes)
+}
+
+// allNodesIntrinsic reports whether every leaf column in nodes is an intrinsic column.
+func allNodesIntrinsic(nodes []vm.RangeNode) bool {
+	for _, n := range nodes {
+		if len(n.Children) > 0 {
+			if !allNodesIntrinsic(n.Children) {
+				return false
+			}
+			continue
+		}
+		_, inTrace := traceIntrinsicColumns[n.Column]
+		_, inLog := logIntrinsicColumns[n.Column]
 		if !inTrace && !inLog {
 			return false
 		}
@@ -268,6 +325,12 @@ func hasSomeIntrinsicPredicates(program *vm.Program) bool {
 			return true
 		}
 	}
+	// NOTE: negation predicates (!=, !~) on intrinsic columns are stored in
+	// Predicates.Columns (not Nodes) and are intentionally not checked here.
+	// filterRowSetByIntrinsicNodes only processes Nodes; triggering the intrinsic
+	// fast path for negation-only queries would fall back to block scan where
+	// intrinsic columns are nil on v4 files, producing incorrect match-all results.
+	// Intrinsic negations are a known limitation; see NOTE-051.
 	return false
 }
 
@@ -888,19 +951,19 @@ func (b blockBitset) toSortedSlice(total int) []int {
 // everything per-span so root span detection requires span:parent_id, and root name/
 // service are derived from span:name and resource.service.name of the root span.
 // span:end is included for duration fallback when no root span is present in the result set.
+//
+// NOTE-050: Trace signal identity columns (trace:id, span:id, span:start, span:end,
+// span:duration, span:name, span:parent_id, resource.service.name) are stored exclusively
+// in the intrinsic TOC section (not in block payloads). They are excluded from
+// searchMetaCols because they are injected directly into secondPassCols via the
+// traceIntrinsicColumns loop in stream.go; identity values are fetched via
+// lookupIntrinsicFields. See NOTE-050 in executor/NOTES.md for rationale.
 var searchMetaCols = map[string]struct{}{
-	// Trace signal identity and search columns.
-	"trace:id":              {},
-	"span:id":               {},
-	"span:start":            {},
-	"span:end":              {},
-	"span:duration":         {},
-	"span:name":             {},
-	"span:parent_id":        {},
-	"resource.service.name": {},
 	// Log signal identity columns — included so wantColumns covers them for log
 	// signal blocks. Log blocks use different identity column names than trace blocks
 	// (log:trace_id / log:span_id vs trace:id / span:id). NOTE-008.
+	// Trace signal equivalents (trace:id, span:id, etc.) are injected via
+	// traceIntrinsicColumns in stream.go and are intentionally excluded from this map.
 	"log:trace_id":  {},
 	"log:span_id":   {},
 	"log:timestamp": {},
@@ -952,6 +1015,318 @@ func collectNodeColumns(nodes []vm.RangeNode, cols map[string]struct{}) {
 			cols[n.Column] = struct{}{}
 		}
 	}
+}
+
+// userAttrProgram returns a shallow copy of p with all RangeNode leaf nodes
+// whose Column is in traceIntrinsicColumns removed. Used by the block scan
+// path so intrinsic predicates (already satisfied by the intrinsic pre-filter)
+// are not re-evaluated against block columns.
+// With dual storage (restored after PR #172 rollback), new files have intrinsic
+// columns in block payloads and nilIntrinsicScan never fires. This function is
+// kept as a backward-compatibility safety net for files written between the
+// PR #172 merge and this fix, where intrinsic columns were absent from block
+// payloads and evaluating them via ColumnPredicate would produce false negatives.
+// Returns nil when all predicates are intrinsic (caller should treat as match-all).
+func userAttrProgram(p *vm.Program) *vm.Program {
+	if p == nil {
+		return p // caller must handle nil → match all
+	}
+	if p.Predicates == nil {
+		return p
+	}
+	var changed bool
+	filtered := filterIntrinsicNodes(p.Predicates.Nodes, &changed)
+	if !changed {
+		return p // nothing stripped
+	}
+	if len(filtered) == 0 {
+		return nil // all predicates were intrinsic → match all rows
+	}
+	filteredPreds := *p.Predicates
+	filteredPreds.Nodes = filtered
+	pCopy := *p
+	pCopy.Predicates = &filteredPreds
+	return &pCopy
+}
+
+// filterIntrinsicNodes recursively removes leaf RangeNodes whose Column is
+// an intrinsic column name, returning the filtered slice.
+// Sets *changed=true when any node is removed at any level of the tree.
+func filterIntrinsicNodes(nodes []vm.RangeNode, changed *bool) []vm.RangeNode {
+	if len(nodes) == 0 {
+		return nodes
+	}
+	// NOTE: must NOT alias nodes — use a fresh slice to avoid mutating the caller's slice.
+	out := make([]vm.RangeNode, 0, len(nodes))
+	for _, n := range nodes {
+		if n.Column != "" {
+			// Leaf node — skip if intrinsic
+			if _, isIntrinsic := traceIntrinsicColumns[n.Column]; isIntrinsic {
+				*changed = true
+				continue
+			}
+			out = append(out, n)
+			continue
+		}
+		// Composite node — recurse into children
+		n.Children = filterIntrinsicNodes(n.Children, changed)
+		if len(n.Children) == 0 {
+			// All children were intrinsic and stripped. For AND: vacuously true (omit node).
+			// For OR: vacuously "match all" in user-attr context (omit node).
+			// Either way, do not emit the empty composite node.
+			continue
+		}
+		out = append(out, n)
+	}
+	return out
+}
+
+// programIntrinsicNodes returns the program's predicate node list when the program
+// contains at least one intrinsic predicate; otherwise returns nil.
+// When non-nil, callers should post-filter candidate rows using
+// rowSatisfiesIntrinsicNodes to enforce the intrinsic predicates.
+// rowSatisfiesIntrinsicNodes naturally skips non-intrinsic leaf nodes, so the full
+// node list can be passed without needing to extract a subset.
+func programIntrinsicNodes(p *vm.Program) []vm.RangeNode {
+	if p == nil || p.Predicates == nil || len(p.Predicates.Nodes) == 0 {
+		return nil
+	}
+	var changed bool
+	filterIntrinsicNodes(p.Predicates.Nodes, &changed)
+	if !changed {
+		return nil // no intrinsic predicates — no post-filtering needed
+	}
+	return p.Predicates.Nodes
+}
+
+// collectIntrinsicNodeColumns walks the RangeNode tree and appends the names of
+// leaf columns that are intrinsic columns into dst.
+// Used by the structural executor to know which extra intrinsic columns to fetch.
+func collectIntrinsicNodeColumns(nodes []vm.RangeNode, dst map[string]struct{}) {
+	for _, n := range nodes {
+		if n.Column != "" {
+			if _, isIntrinsic := traceIntrinsicColumns[n.Column]; isIntrinsic {
+				dst[n.Column] = struct{}{}
+			}
+			continue
+		}
+		collectIntrinsicNodeColumns(n.Children, dst)
+	}
+}
+
+// rowSatisfiesIntrinsicNodes evaluates the intrinsic-column leaf nodes from the
+// given predicate tree against a per-row field map (as returned by lookupIntrinsicFields).
+// Only leaf nodes whose Column is in traceIntrinsicColumns are checked; composite nodes
+// preserve AND/OR semantics. Returns true when the row satisfies all constraints.
+func rowSatisfiesIntrinsicNodes(nodes []vm.RangeNode, fields map[string]any) bool {
+	for _, n := range nodes {
+		if n.Column != "" {
+			_, isIntrinsic := traceIntrinsicColumns[n.Column]
+			if !isIntrinsic {
+				continue // non-intrinsic leaves are handled by block-column evaluation
+			}
+			if !intrinsicLeafMatch(n, fields) {
+				return false
+			}
+			continue
+		}
+		// Composite node: AND/OR over children.
+		if n.IsOR {
+			if !rowSatisfiesIntrinsicNodesOR(n.Children, fields) {
+				return false
+			}
+		} else {
+			if !rowSatisfiesIntrinsicNodes(n.Children, fields) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// rowSatisfiesIntrinsicNodesOR returns true when any child in the OR group
+// satisfies the intrinsic constraints for the given row.
+func rowSatisfiesIntrinsicNodesOR(nodes []vm.RangeNode, fields map[string]any) bool {
+	for _, n := range nodes {
+		if n.Column != "" {
+			_, isIntrinsic := traceIntrinsicColumns[n.Column]
+			if !isIntrinsic {
+				continue // non-intrinsic leaf: evaluated by ColumnPredicate; post-filter skips
+			}
+			if intrinsicLeafMatch(n, fields) {
+				return true
+			}
+			continue
+		}
+		if n.IsOR {
+			if rowSatisfiesIntrinsicNodesOR(n.Children, fields) {
+				return true
+			}
+		} else {
+			if rowSatisfiesIntrinsicNodes(n.Children, fields) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// intrinsicLeafMatch evaluates a single leaf RangeNode against the per-row field map.
+// Returns true when the row's field value satisfies the node's constraint.
+func intrinsicLeafMatch(n vm.RangeNode, fields map[string]any) bool {
+	raw, ok := fields[n.Column]
+	if !ok {
+		// Field absent: satisfies only "is null" nodes; all value/range nodes fail.
+		return len(n.Values) == 0 && n.Min == nil && n.Max == nil && n.Pattern == ""
+	}
+	// Equality / set membership.
+	if len(n.Values) > 0 {
+		for _, v := range n.Values {
+			if intrinsicValuesMatch(raw, v) {
+				return true
+			}
+		}
+		return false
+	}
+	// Range / interval.
+	if n.Min != nil || n.Max != nil {
+		return intrinsicRangeMatch(raw, n)
+	}
+	// Pattern / regex: evaluate the regex against the actual string field value.
+	if n.Pattern != "" {
+		s, ok := fields[n.Column].(string)
+		if !ok {
+			return false // absent or non-string field does not match regex
+		}
+		re, err := cachedRegexCompile(n.Pattern)
+		if err != nil {
+			return false
+		}
+		return re.MatchString(s)
+	}
+	// No constraint on this node — present check only.
+	return true
+}
+
+// intrinsicValuesMatch reports whether fieldVal equals the query Value v.
+func intrinsicValuesMatch(fieldVal any, v vm.Value) bool {
+	switch v.Type {
+	case vm.TypeString:
+		s, ok := v.Data.(string)
+		if !ok {
+			return false
+		}
+		if fv, ok := fieldVal.(string); ok {
+			return fv == s
+		}
+	case vm.TypeInt:
+		i, ok := v.Data.(int64)
+		if !ok {
+			return false
+		}
+		if fv, ok := fieldVal.(int64); ok {
+			return fv == i
+		}
+	case vm.TypeDuration:
+		d, ok := v.Data.(int64)
+		if !ok {
+			return false
+		}
+		switch fv := fieldVal.(type) {
+		case int64:
+			return fv == d
+		case uint64:
+			return int64(fv) == d //nolint:gosec // safe: duration values fit int64
+		}
+	case vm.TypeFloat:
+		f, ok := v.Data.(float64)
+		if !ok {
+			return false
+		}
+		if fv, ok := fieldVal.(float64); ok {
+			return fv == f
+		}
+	case vm.TypeBool:
+		b, ok := v.Data.(bool)
+		if !ok {
+			return false
+		}
+		if fv, ok := fieldVal.(bool); ok {
+			return fv == b
+		}
+	}
+	return false
+}
+
+// intrinsicRangeMatch evaluates a range (Min/Max) predicate for an intrinsic field value.
+func intrinsicRangeMatch(fieldVal any, n vm.RangeNode) bool {
+	switch fv := fieldVal.(type) {
+	case int64:
+		if n.Min != nil {
+			if d, ok := n.Min.Data.(int64); ok {
+				if n.MinInclusive {
+					if fv < d {
+						return false
+					}
+				} else if fv <= d {
+					return false
+				}
+			}
+		}
+		if n.Max != nil {
+			if d, ok := n.Max.Data.(int64); ok {
+				if n.MaxInclusive {
+					if fv > d {
+						return false
+					}
+				} else if fv >= d {
+					return false
+				}
+			}
+		}
+		return true
+	case uint64:
+		// Durations / timestamps stored as uint64 in intrinsic column.
+		// Compare against int64 query values (nanoseconds, always >= 0).
+		if n.Min != nil {
+			var minVal int64
+			switch d := n.Min.Data.(type) {
+			case int64:
+				minVal = d
+			case uint64:
+				minVal = int64(d) //nolint:gosec // safe: bounded nanosecond values
+			default:
+				return true
+			}
+			if n.MinInclusive {
+				if fv < uint64(minVal) { //nolint:gosec // safe: minVal >= 0 for duration/timestamp
+					return false
+				}
+			} else if fv <= uint64(minVal) { //nolint:gosec // safe: same as above
+				return false
+			}
+		}
+		if n.Max != nil {
+			var maxVal int64
+			switch d := n.Max.Data.(type) {
+			case int64:
+				maxVal = d
+			case uint64:
+				maxVal = int64(d) //nolint:gosec // safe: bounded nanosecond values
+			default:
+				return true
+			}
+			if n.MaxInclusive {
+				if fv > uint64(maxVal) { //nolint:gosec // safe: maxVal >= 0 for duration/timestamp
+					return false
+				}
+			} else if fv >= uint64(maxVal) { //nolint:gosec // safe: same as above
+				return false
+			}
+		}
+		return true
+	}
+	return false // unknown field type cannot satisfy a numeric range predicate
 }
 
 // inferColTypeFromValues infers the best ColumnType for encoding a range predicate
@@ -1521,9 +1896,24 @@ func BlockRefsFromIntrinsicTOC(r *modules_reader.Reader, program *vm.Program, li
 	if totalLeaves == 0 {
 		return nil
 	}
+
+	// overFetch caps the number of refs collected per top-level AND condition.
+	//
+	// For single-condition queries (1 top node), limit*leaves is sufficient.
+	//
+	// For multi-condition AND queries (multiple top nodes), independent predicates
+	// have low joint selectivity. With overFetch=limit*leaves (~60), intersection
+	// of small independent sets yields ~0 matches, forcing all files to be scanned.
+	// Use a larger overFetch so each condition returns enough refs for the intersection
+	// to find real matches, enabling early-exit across files.
+	// The factor 200 assumes joint selectivity ≥ limit/overFetch = 20/4000 = 0.5%.
 	overFetch := 0
 	if limit > 0 {
-		overFetch = limit * totalLeaves
+		if len(program.Predicates.Nodes) == 1 {
+			overFetch = limit * totalLeaves
+		} else {
+			overFetch = limit * 10000 // multi-condition AND: enough for very low-selectivity intersections
+		}
 	}
 
 	// Evaluate each top-level node and intersect (top-level = AND-combined).
@@ -1596,114 +1986,182 @@ func blockRefsFromIntrinsicPartial(r *modules_reader.Reader, program *vm.Program
 // scanIntrinsicLeafRefs loads the raw column blob and scans it directly for matching refs,
 // avoiding full struct materialization. Falls back to the full-decode path if raw scanning
 // is not applicable (e.g., bytes flat columns, regex patterns).
+// scanIntrinsicLeafRefs returns the BlockRefs matching the leaf predicate using
+// the objectcache-backed decoded column (GetIntrinsicColumn). On warm queries the
+// decoded column lives in process memory — no disk I/O. On cold queries the blob is
+// read once from filecache, decoded, and stored in objectcache for all future calls.
+//
+// Falls back to blob-based scanning (GetIntrinsicColumnBlob) only when the column
+// is absent from objectcache and GetIntrinsicColumn returns an error.
 func scanIntrinsicLeafRefs(
 	r *modules_reader.Reader,
 	colName string,
 	leaf vm.RangeNode,
 	maxRefs int,
 ) []modules_shared.BlockRef {
-	meta, ok := r.IntrinsicColumnMeta(colName)
-	if !ok {
+	if _, ok := r.IntrinsicColumnMeta(colName); !ok {
 		return nil
 	}
 
-	blob, err := r.GetIntrinsicColumnBlob(colName)
-	if err != nil || blob == nil {
+	// Prefer GetIntrinsicColumn: populates objectcache on first call, returns
+	// in-memory decoded column on subsequent calls — zero disk I/O when warm.
+	col, err := r.GetIntrinsicColumn(colName)
+	if err != nil || col == nil {
 		return nil
 	}
 
-	if meta.Format == modules_shared.IntrinsicFormatDict {
-		if len(leaf.Values) == 0 && leaf.Pattern == "" {
-			return nil // range predicate on dict — not supported in raw scan
-		}
-		// Regex predicate: compile pattern and scan dict entries.
-		// NOTE-039: regex on dict columns uses ScanDictColumnRefsWithBloom with nil bloom keys
-		// (no bloom pruning possible for regex — any page could have matching entries).
-		if len(leaf.Values) == 0 && leaf.Pattern != "" {
-			re, err := regexp.Compile(leaf.Pattern)
-			if err != nil {
-				return nil // invalid regex — skip fast path
-			}
-			return modules_shared.ScanDictColumnRefsWithBloom(blob, func(value string, _ int64, isInt64 bool) bool {
-				if isInt64 {
-					return false // int64 dict entries are not string-matchable
-				}
-				return re.MatchString(value)
-			}, nil, maxRefs)
-		}
-		// Build match sets and bloom keys in one pass.
-		// NOTE-040: merged from two sequential loops — identical switch structure, no ordering dependency.
-		wantStr := make(map[string]struct{}, len(leaf.Values))
-		wantInt := make(map[int64]struct{}, len(leaf.Values))
-		bloomKeys := make([][]byte, 0, len(leaf.Values))
-		for _, v := range leaf.Values {
-			switch v.Type {
-			case vm.TypeString:
-				if s, ok := v.Data.(string); ok {
-					wantStr[s] = struct{}{}
-					bloomKeys = append(bloomKeys, []byte(s))
-				}
-			case vm.TypeInt:
-				if i, ok := v.Data.(int64); ok {
-					wantInt[i] = struct{}{}
-					var buf [8]byte
-					binary.LittleEndian.PutUint64(buf[:], uint64(i)) //nolint:gosec
-					bloomKeys = append(bloomKeys, buf[:])
-				}
-			case vm.TypeDuration:
-				if i, ok := v.Data.(int64); ok {
-					wantInt[i] = struct{}{}
-					var buf [8]byte
-					binary.LittleEndian.PutUint64(buf[:], uint64(i)) //nolint:gosec
-					bloomKeys = append(bloomKeys, buf[:])
-				}
-			}
-		}
-		return modules_shared.ScanDictColumnRefsWithBloom(blob, func(value string, int64Val int64, isInt64 bool) bool {
-			if isInt64 {
-				_, ok := wantInt[int64Val]
-				return ok
-			}
-			_, ok := wantStr[value]
-			return ok
-		}, bloomKeys, maxRefs)
+	if col.Format == modules_shared.IntrinsicFormatDict {
+		return scanDecodedDictRefs(col, leaf, maxRefs)
 	}
 
-	// Flat column — extract range bounds.
-	var lo, hi uint64
-	var hasLo, hasHi bool
-
+	// Flat column.
 	switch {
 	case len(leaf.Values) > 0:
-		// Equality: scan for each value. Use full-decode fallback for simplicity
-		// since equality on flat columns is rare and may have multiple values.
-		col, err := r.GetIntrinsicColumn(colName)
-		if err != nil || col == nil {
-			return nil
-		}
 		return intrinsicFlatMatchRefs(col, leaf, maxRefs)
-
 	case leaf.Min != nil || leaf.Max != nil:
-		if leaf.Min != nil {
-			v, ok := valueToUint64(*leaf.Min)
-			if !ok {
-				return nil
-			}
-			lo, hasLo = v, true
-		}
-		if leaf.Max != nil {
-			v, ok := valueToUint64(*leaf.Max)
-			if !ok {
-				return nil
-			}
-			hi, hasHi = v, true
-		}
-
+		return scanDecodedFlatRangeRefs(col, leaf, maxRefs)
 	default:
-		return nil // pattern or no constraint
+		return nil
+	}
+}
+
+// scanDecodedDictRefs scans a decoded dict IntrinsicColumn for entries matching
+// the leaf predicate (equality or regex). Returns at most maxRefs refs (0 = unlimited).
+func scanDecodedDictRefs(col *modules_shared.IntrinsicColumn, leaf vm.RangeNode, maxRefs int) []modules_shared.BlockRef {
+	if len(leaf.Values) == 0 && leaf.Pattern == "" {
+		return nil // range predicate on dict — not supported
 	}
 
-	return modules_shared.ScanFlatColumnRefs(blob, lo, hi, hasLo, hasHi, maxRefs)
+	var result []modules_shared.BlockRef
+
+	if leaf.Pattern != "" {
+		// Regex predicate.
+		re, reErr := regexp.Compile(leaf.Pattern)
+		if reErr != nil {
+			return nil
+		}
+		for _, entry := range col.DictEntries {
+			if !re.MatchString(entry.Value) {
+				continue
+			}
+			refs := entry.BlockRefs
+			if maxRefs > 0 && len(result)+len(refs) > maxRefs {
+				refs = refs[:maxRefs-len(result)]
+			}
+			result = append(result, refs...)
+			if maxRefs > 0 && len(result) >= maxRefs {
+				return result
+			}
+		}
+		return result
+	}
+
+	// Equality predicate: build match sets.
+	isInt := col.Type == modules_shared.ColumnTypeInt64 || col.Type == modules_shared.ColumnTypeRangeInt64
+	wantStr := make(map[string]struct{}, len(leaf.Values))
+	wantInt := make(map[int64]struct{}, len(leaf.Values))
+	for _, v := range leaf.Values {
+		switch v.Type {
+		case vm.TypeString:
+			if s, ok := v.Data.(string); ok {
+				wantStr[s] = struct{}{}
+			}
+		case vm.TypeInt, vm.TypeDuration:
+			if i, ok := v.Data.(int64); ok {
+				wantInt[i] = struct{}{}
+			}
+		}
+	}
+
+	for _, entry := range col.DictEntries {
+		var matched bool
+		if isInt {
+			_, matched = wantInt[entry.Int64Val]
+		} else {
+			_, matched = wantStr[entry.Value]
+		}
+		if !matched {
+			continue
+		}
+		refs := entry.BlockRefs
+		if maxRefs > 0 && len(result)+len(refs) > maxRefs {
+			refs = refs[:maxRefs-len(result)]
+		}
+		result = append(result, refs...)
+		if maxRefs > 0 && len(result) >= maxRefs {
+			return result
+		}
+	}
+	return result
+}
+
+// scanDecodedFlatRangeRefs performs a binary-search range scan on the decoded
+// Uint64Values slice (sorted ascending). Returns at most maxRefs refs (0 = unlimited).
+func scanDecodedFlatRangeRefs(col *modules_shared.IntrinsicColumn, leaf vm.RangeNode, maxRefs int) []modules_shared.BlockRef {
+	lo, hi, hasLo, hasHi, ok := extractFlatRangeBounds(leaf)
+	if !ok || len(col.Uint64Values) == 0 {
+		return nil
+	}
+
+	vals := col.Uint64Values
+	startIdx := 0
+	if hasLo {
+		startIdx = sort.Search(len(vals), func(i int) bool { return vals[i] >= lo })
+	}
+
+	endIdx := len(vals)
+	if hasHi {
+		endIdx = sort.Search(len(vals), func(i int) bool { return vals[i] > hi })
+	}
+
+	if startIdx >= endIdx {
+		return []modules_shared.BlockRef{}
+	}
+
+	count := endIdx - startIdx
+	if maxRefs > 0 && count > maxRefs {
+		count = maxRefs
+	}
+	result := make([]modules_shared.BlockRef, count)
+	copy(result, col.BlockRefs[startIdx:startIdx+count])
+	return result
+}
+
+// extractFlatRangeBounds converts a RangeNode's Min/Max into inclusive uint64 bounds
+// suitable for ScanFlatColumnRefs. Returns ok=false if the bounds cannot be encoded
+// or the constraint is empty (e.g. > MaxUint64, < 0).
+func extractFlatRangeBounds(leaf vm.RangeNode) (lo, hi uint64, hasLo, hasHi bool, ok bool) {
+	if leaf.Min != nil {
+		v, encOK := valueToUint64(*leaf.Min)
+		if !encOK {
+			return 0, 0, false, false, false
+		}
+		if !leaf.MinInclusive {
+			// Exclusive lower bound (> threshold): skip exact match by adding 1.
+			// If threshold is MaxUint64 there are no valid values above it.
+			if v == math.MaxUint64 {
+				return 0, 0, false, false, false
+			}
+			v++
+		}
+		lo, hasLo = v, true
+	}
+	if leaf.Max != nil {
+		v, encOK := valueToUint64(*leaf.Max)
+		if !encOK {
+			return 0, 0, false, false, false
+		}
+		if !leaf.MaxInclusive {
+			// Exclusive upper bound (< threshold): subtract 1 to make inclusive.
+			// If threshold is 0 there are no valid values below it.
+			if v == 0 {
+				return 0, 0, false, false, false
+			}
+			v--
+		}
+		hi, hasHi = v, true
+	}
+	return lo, hi, hasLo, hasHi, true
 }
 
 // intrinsicFlatMatchRefs returns up to max BlockRefs from a flat (uint64-sorted) column

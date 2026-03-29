@@ -17,6 +17,15 @@ import (
 // It writes defs to a fresh writer, flushes, opens a reader, and returns block 0.
 func writeSpansAndGetBlock(t *testing.T, defs []spanWriteDef) *reader.BlockWithBytes {
 	t.Helper()
+	_, bwb := writeSpansAndGetReader(t, defs)
+	return bwb
+}
+
+// writeSpansAndGetReader is like writeSpansAndGetBlock but also returns the reader.
+// Use this when intrinsic column access via r.IntrinsicBytesAt / r.IntrinsicUint64At
+// / r.IntrinsicDictStringAt is needed alongside the block.
+func writeSpansAndGetReader(t *testing.T, defs []spanWriteDef) (*reader.Reader, *reader.BlockWithBytes) {
+	t.Helper()
 	var buf bytes.Buffer
 	w, err := writer.NewWriterWithConfig(writer.Config{OutputStream: &buf})
 	require.NoError(t, err)
@@ -32,7 +41,7 @@ func writeSpansAndGetBlock(t *testing.T, defs []spanWriteDef) *reader.BlockWithB
 
 	bwb, err := r.GetBlockWithBytes(0, nil, nil)
 	require.NoError(t, err)
-	return bwb
+	return r, bwb
 }
 
 // spanWriteDef bundles data for one AddSpan call.
@@ -113,19 +122,19 @@ func TestDecodeDeltaUint64_Timestamps(t *testing.T) {
 		defs[i].span.SpanId = fixedSpanID(byte(i))
 	}
 
-	bwb := writeSpansAndGetBlock(t, defs)
-	col := bwb.Block.GetColumn("span:start")
-	require.NotNil(t, col, "span:start must be present")
+	r, _ := writeSpansAndGetReader(t, defs)
+	// span:start is now stored in the intrinsic section only, not in block columns.
+	require.True(t, r.HasIntrinsicSection(), "span:start requires intrinsic section")
 
-	// Collect all decoded timestamps and verify they match the expected set.
+	// Collect all timestamps from the intrinsic column and verify they match the expected set.
 	decoded := make(map[uint64]bool)
 	for i := range n {
-		v, ok := col.Uint64Value(i)
-		assert.True(t, ok, "row %d must be present", i)
+		v, ok := r.IntrinsicUint64At("span:start", 0, i)
+		assert.True(t, ok, "row %d must be present in intrinsic span:start", i)
 		decoded[v] = true
 	}
 	for _, st := range startTimes {
-		assert.True(t, decoded[st], "start time %d must round-trip", st)
+		assert.True(t, decoded[st], "start time %d must round-trip via intrinsic section", st)
 	}
 }
 
@@ -152,18 +161,19 @@ func TestDecodeXORBytes_IDs(t *testing.T) {
 	}
 
 	bwb := writeSpansAndGetBlock(t, defs)
+	// NOTE-005: span:id is no longer in the intrinsic section; read from block column.
 	col := bwb.Block.GetColumn("span:id")
-	require.NotNil(t, col, "span:id must be present")
+	require.NotNil(t, col, "span:id block column must be present")
 
-	// Collect decoded span IDs and check they all round-tripped correctly.
+	// Collect decoded span IDs from the block column and verify round-trip.
 	decoded := make(map[string]bool)
 	for i := range 5 {
 		v, ok := col.BytesValue(i)
-		assert.True(t, ok, "row %d span:id must be present", i)
+		assert.True(t, ok, "row %d span:id must be present in block column", i)
 		decoded[string(v)] = true
 	}
 	for _, sid := range spanIDs {
-		assert.True(t, decoded[string(sid)], "span ID %v must round-trip", sid)
+		assert.True(t, decoded[string(sid)], "span ID %v must round-trip via block column", sid)
 	}
 }
 
@@ -284,15 +294,15 @@ func TestDecodeDeltaDictionary_TraceID(t *testing.T) {
 	}
 
 	bwb := writeSpansAndGetBlock(t, defs)
+	// NOTE-005: trace:id is no longer in the intrinsic section; read from block column.
 	col := bwb.Block.GetColumn("trace:id")
-	require.NotNil(t, col, "trace:id must be present")
-	require.Equal(t, 10, col.SpanCount)
+	require.NotNil(t, col, "trace:id block column must be present")
 
-	// All 10 trace IDs must be present.
+	// All 10 trace IDs must be present in the block column.
 	decoded := make(map[[16]byte]bool)
 	for i := range 10 {
 		v, ok := col.BytesValue(i)
-		assert.True(t, ok, "row %d trace:id must be present", i)
+		assert.True(t, ok, "row %d trace:id must be present in block column", i)
 		if ok && len(v) == 16 {
 			var arr [16]byte
 			copy(arr[:], v)
@@ -425,23 +435,18 @@ func TestLazyColumnDecode_Uint64Value(t *testing.T) {
 	require.NoError(t, err)
 
 	r := openReader(t, buf.Bytes())
-
-	// Request only span:name — span:start is lazily registered.
-	wantCols := map[string]struct{}{"span:name": {}}
-	bwb, err := r.GetBlockWithBytes(0, wantCols, nil)
-	require.NoError(t, err)
-
-	col := bwb.Block.GetColumn("span:start")
-	require.NotNil(t, col, "span:start must be lazily registered")
+	// span:start is now stored in the intrinsic section only, not in block columns.
+	// Verify round-trip via r.IntrinsicUint64At instead of block column GetColumn.
+	require.True(t, r.HasIntrinsicSection(), "span:start requires intrinsic section")
 
 	decoded := make(map[uint64]bool)
 	for i := range n {
-		v, ok := col.Uint64Value(i)
-		assert.True(t, ok, "row %d must be present", i)
+		v, ok := r.IntrinsicUint64At("span:start", 0, i)
+		assert.True(t, ok, "row %d must be present in intrinsic span:start", i)
 		decoded[v] = true
 	}
 	for _, st := range startTimes {
-		assert.True(t, decoded[st], "start time %d must round-trip via lazy decode", st)
+		assert.True(t, decoded[st], "start time %d must round-trip via intrinsic section", st)
 	}
 }
 

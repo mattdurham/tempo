@@ -118,6 +118,75 @@ Back-ref: `internal/modules/blockio/reader/range_index.go:compareRangeKey`
 
 ---
 
+## NOTE-006: Intern Map Pool — per-call map replaced by sync.Pool
+*Added: 2026-03-25*
+
+**Problem:** `ParseBlockFromBytes` at `reader.go:481` allocated a fresh `make(map[string]string)`
+on every call. `scanBlocks` calls `ParseBlockFromBytes` twice per matching block (first pass for
+predicate evaluation, second pass to decode result columns), producing hundreds of map allocations
+per query over many blocks.
+
+**Why not pool inside ParseBlockFromBytes:** The returned `*BlockWithBytes` outlives the call.
+Lazy columns (registered during first-pass parsing) store an `internMap` reference and call
+`decodeNow()` during the row-emission loop after `ParseBlockFromBytes` returns. Clearing and
+returning the map inside `ParseBlockFromBytes` would corrupt lazy decodes in progress.
+
+**Solution:** Pool at the `scanBlocks` block-loop level. `scanBlocks` acquires one pooled map
+per block iteration, passes it to both first-pass and second-pass `ParseBlockFromBytesWithIntern`
+calls, then releases it **after** `streamSortedRows` completes (all lazy decodes done). This
+guarantees the map is alive for the full block lifetime.
+
+**Safety invariants:**
+- Strings interned during parsing are copied into heap-allocated `Column.StringDict` entries
+  before the intern map is cleared. Clearing the map only removes key→value references in the
+  map; the underlying string data in column dicts is unaffected.
+- The scan path is single-goroutine (NOTE-002). No concurrent access to the pooled map occurs.
+- `ParseBlockFromBytes` (the original public method) is unchanged — it still allocates a fresh
+  map for callers outside `scanBlocks`.
+
+**NOTE-002 addendum:** Per-call intern maps (introduced for race-safety) are now pooled rather
+than heap-allocated for the `scanBlocks` hot path. The race-safety guarantee is preserved: the
+pooled map is held exclusively by one goroutine's block iteration at a time (single-goroutine
+scan invariant), and is cleared before returning to the pool.
+
+**Related:** The companion clone elimination in `scanBlocks` (`executor` package) is documented in executor NOTE-049.
+
+Back-ref: `internal/modules/blockio/reader/column.go:internMapPool`,
+          `internal/modules/blockio/reader/column.go:AcquireInternMap`,
+          `internal/modules/blockio/reader/reader.go:ParseBlockFromBytesWithIntern`,
+          `internal/modules/executor/stream.go:scanBlocks`
+
+---
+
+## NOTE-007: Present-Rows Scratch Pool — collectPresentRowsInto
+*Added: 2026-03-25*
+
+**Problem:** `collectPresentRows` at `column.go` allocated a fresh `make([]int, 0, presentCount)`
+on every call. Both `decodeXORBytes` and `decodePrefixBytes` called this function, producing one
+allocation per XOR/prefix column per block parse. With many such columns per block this added up
+to hundreds of `[]int` allocations per query.
+
+**Solution:** Replaced `collectPresentRows` with `collectPresentRowsInto`, which accepts a
+caller-supplied `*[]int` buffer from `presentRowsScratchPool`. Callers (`decodeXORBytes`,
+`decodePrefixBytes`) acquire a scratch before the loop and release after. The buffer is reset
+to `[:0]` inside `collectPresentRowsInto` before each use.
+
+**Cap guard:** If the pooled slice grows beyond 65536 entries (due to a very large block), it is
+replaced with a fresh 2048-entry slice before pool return, preventing large backing arrays from
+being retained indefinitely.
+
+**Lifetime:** The scratch is valid for the duration of the per-row decode loop and released
+immediately after. The `presentRows` slice returned by `collectPresentRowsInto` is `*buf` — it
+is only iterated in the same stack frame and not stored. The loop variable `presentRow` is a
+copy. No aliasing issues.
+
+Back-ref: `internal/modules/blockio/reader/column.go:presentRowsScratchPool`,
+          `internal/modules/blockio/reader/column.go:collectPresentRowsInto`,
+          `internal/modules/blockio/reader/column.go:decodeXORBytes`,
+          `internal/modules/blockio/reader/column.go:decodePrefixBytes`
+
+---
+
 ## NOTE-005: BUG-08 — decode*Key sentinel values for malformed short keys
 *Added: 2026-03-23*
 
@@ -140,3 +209,24 @@ Back-ref: `internal/modules/blockio/reader/range_index.go:readLE8`,
           `internal/modules/blockio/reader/range_index.go:decodeFloat64Key`
 Test: `internal/modules/blockio/reader/range_index_bugs_test.go:TestDecodeFloat64Key_ShortKey_ReturnsNaN`,
       `internal/modules/blockio/reader/range_index_bugs_test.go:TestDecodeInt64Key_ShortKey_ReturnsSentinel`
+
+## NOTE-008: Span Identity Fields in Intrinsic Section Only (Not in Block Columns)
+*Added: 2026-03-25*
+
+*Addendum (2026-03-25): Original entry claimed dual-storage (block columns AND intrinsic
+section). That was incorrect. Span identity fields are written ONLY to the intrinsic TOC
+section; `addPresent` calls for these columns were removed from all write paths.*
+
+**Decision:** Span identity fields (trace:id, span:id, span:parent_id, span:name, span:kind,
+span:start, span:duration, span:status, span:status_message, resource.service.name) are
+stored exclusively in the intrinsic TOC section. `Block.GetColumn()` returns nil for
+these names — this is expected and handled by the executor's `nilIntrinsicScan` mechanism.
+
+**For consumers needing these fields:** Use `Reader.GetIntrinsicColumn(name)` or the
+executor's `lookupIntrinsicFields` helper. Do NOT call `Block.GetColumn()` for intrinsic
+field names and expect a non-nil result.
+
+**Back-ref:** `internal/modules/blockio/writer/writer_block.go:newBlockBuilder`,
+`internal/modules/executor/column_provider.go:nilIntrinsicScan`,
+`internal/modules/executor/stream_structural.go:collectBlockStructuralSpanRecs`,
+`internal/modules/executor/executor.go:SpanMatchFromRow`

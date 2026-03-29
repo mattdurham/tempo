@@ -113,6 +113,37 @@ func topKScanRows(
 	}
 }
 
+// topKScanRowsFromIntrinsic is the fallback for topKScanRows when the timestamp column
+// is not stored in block columns (intrinsic-only storage format). It reads per-row
+// timestamps directly from the reader's intrinsic section.
+func topKScanRowsFromIntrinsic(
+	buf *topKHeap,
+	limit int,
+	backward bool,
+	r *modules_reader.Reader,
+	block *modules_reader.Block,
+	blockIdx int,
+	tsColName string,
+	timeRange queryplanner.TimeRange,
+	rowIndices []int,
+) {
+	for _, rowIdx := range rowIndices {
+		ts, ok := r.IntrinsicUint64At(tsColName, blockIdx, rowIdx)
+		if !ok {
+			continue
+		}
+		if timeRange.MinNano > 0 && ts < timeRange.MinNano {
+			continue
+		}
+		if timeRange.MaxNano > 0 && ts > timeRange.MaxNano {
+			continue
+		}
+		topKInsert(buf, limit, backward, topKEntry{
+			ts: ts, blockIdx: blockIdx, rowIdx: rowIdx, block: block,
+		})
+	}
+}
+
 // topKScanBlocks iterates selected blocks, fetches them lazily, and fills buf.
 // Returns the number of individual block fetches performed.
 func topKScanBlocks(
@@ -127,18 +158,18 @@ func topKScanBlocks(
 	backward bool,
 ) (int, error) {
 	fetched := make(map[int][]byte)
-	fetchedGroupsSeen := make(map[int]bool)
-	skippedBlocks := make(map[int]bool)
+	fetchedGroupsSeen := make(map[int]struct{})
+	skippedBlocks := make(map[int]struct{})
 	fetchCount := 0
 
 	for _, blockIdx := range plan.SelectedBlocks {
 		meta := r.BlockMeta(blockIdx)
 		if topKSkipBlock(buf, opts.Limit, backward, meta) {
 			gi2, ok2 := blockToGroup[blockIdx]
-			if ok2 && fetchedGroupsSeen[gi2] {
+			if _, seen := fetchedGroupsSeen[gi2]; ok2 && seen {
 				delete(fetched, blockIdx)
 			} else {
-				skippedBlocks[blockIdx] = true
+				skippedBlocks[blockIdx] = struct{}{}
 			}
 			continue
 		}
@@ -147,19 +178,19 @@ func topKScanBlocks(
 		if !ok {
 			continue
 		}
-		if !fetchedGroupsSeen[gi] {
+		if _, seen := fetchedGroupsSeen[gi]; !seen {
 			groupRaw, fetchErr := r.ReadGroup(groups[gi])
 			if fetchErr != nil {
 				return fetchCount, fmt.Errorf("ReadGroup: %w", fetchErr)
 			}
 			maps.Copy(fetched, groupRaw)
 			for _, bi := range groups[gi].BlockIDs {
-				if skippedBlocks[bi] {
+				if _, skip := skippedBlocks[bi]; skip {
 					delete(fetched, bi)
 				}
 			}
 			fetchCount += len(groups[gi].BlockIDs)
-			fetchedGroupsSeen[gi] = true
+			fetchedGroupsSeen[gi] = struct{}{}
 		}
 
 		raw, rawOK := fetched[blockIdx]
@@ -195,9 +226,12 @@ func topKScanBlocks(
 
 		tsCol := bwb.Block.GetColumn(opts.TimestampColumn)
 		if tsCol == nil {
-			continue
+			// Timestamp column absent from block (intrinsic-only format): read from intrinsic section.
+			topKScanRowsFromIntrinsic(buf, opts.Limit, backward, r, bwb.Block, blockIdx,
+				opts.TimestampColumn, opts.TimeRange, rowSet.ToSlice())
+		} else {
+			topKScanRows(buf, opts.Limit, backward, bwb.Block, blockIdx, tsCol, opts.TimeRange, rowSet.ToSlice())
 		}
-		topKScanRows(buf, opts.Limit, backward, bwb.Block, blockIdx, tsCol, opts.TimeRange, rowSet.ToSlice())
 	}
 	return fetchCount, nil
 }

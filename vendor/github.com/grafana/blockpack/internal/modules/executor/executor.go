@@ -16,8 +16,10 @@ package executor
 // NOTE: Any changes to this file must be reflected in the corresponding specs.md or NOTES.md.
 
 import (
+	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
 	modules_shared "github.com/grafana/blockpack/internal/modules/blockio/shared"
 	"github.com/grafana/blockpack/internal/modules/queryplanner"
+	"github.com/grafana/blockpack/internal/vm"
 )
 
 // SpanMatch is a span that matched the query.
@@ -52,14 +54,32 @@ type Options struct {
 	BlockCount int
 }
 
+// Executor wraps the stateless Collect function behind a struct API.
+// It holds no mutable state; New() is a convenience constructor for tests
+// that prefer method-call syntax over the package-level Collect function.
+type Executor struct{}
+
+// New returns a zero-value Executor.
+func New() *Executor { return &Executor{} }
+
+// Collect delegates to the package-level Collect function.
+func (e *Executor) Collect(r *modules_reader.Reader, prog *vm.Program, opts CollectOptions) ([]MatchedRow, error) {
+	return Collect(r, prog, opts)
+}
+
 // SpanMatchFromRow extracts a SpanMatch from a MatchedRow by reading the appropriate
 // trace and span identity columns for the given signal type. For trace signals it
 // reads "trace:id" and "span:id"; for log signals it reads "log:trace_id" and "log:span_id".
 //
+// r is the Reader used to look up trace identity fields from the intrinsic section when
+// row.IntrinsicFields is nil and the columns are not present in the decoded Block.
+// Pass nil only for log signals (log identity columns remain in block columns).
+//
 // Supports both row representations:
-//   - Block-populated rows (equality-predicate Case A, block-scan): reads columns from Block.
 //   - IntrinsicFields-populated rows (range-predicate Case A, Case B): reads from IntrinsicFields.
-func SpanMatchFromRow(row MatchedRow, signalType uint8) SpanMatch {
+//   - Block-populated rows (block-scan path): reads from Block columns, then falls back
+//     to intrinsic section via r when trace identity columns are absent from the Block.
+func SpanMatchFromRow(row MatchedRow, signalType uint8, r *modules_reader.Reader) SpanMatch {
 	m := SpanMatch{BlockIdx: row.BlockIdx, RowIdx: row.RowIdx}
 
 	traceIDCol := "trace:id"
@@ -89,12 +109,41 @@ func SpanMatchFromRow(row MatchedRow, signalType uint8) SpanMatch {
 		return m
 	}
 
-	// Equality-predicate Case A and block-scan: IDs are in the decoded Block.
+	// Block-scan path: try to read from decoded Block columns first.
+	// PATTERN: block-column-first with intrinsic-section fallback (shared across
+	// compaction/compaction.go, writer/writer.go, executor.go, executor/metrics_trace.go).
+	// v3 files store identity columns in block payloads; v4 files store them exclusively
+	// in the intrinsic section. Try the block column first for backwards compat.
+	// For trace signals, trace:id and span:id are no longer present in block columns
+	// (intrinsic separation). Fall back to intrinsic section via r when missing.
 	if col := row.Block.GetColumn(traceIDCol); col != nil {
 		if v, ok := col.BytesValue(row.RowIdx); ok && len(v) == 16 {
 			copy(m.TraceID[:], v)
 		}
+	} else if r != nil && signalType != modules_shared.SignalTypeLog {
+		// Trace identity columns are intrinsic-only; look up via reader.
+		spanRef := modules_shared.BlockRef{
+			BlockIdx: uint16(row.BlockIdx), //nolint:gosec
+			RowIdx:   uint16(row.RowIdx),   //nolint:gosec
+		}
+		idCols := map[string]struct{}{traceIDCol: {}, spanIDCol: {}}
+		fieldMaps := lookupIntrinsicFields(r, []modules_shared.BlockRef{spanRef}, idCols)
+		if len(fieldMaps) > 0 && fieldMaps[0] != nil {
+			if v, ok := fieldMaps[0][traceIDCol]; ok {
+				if b, ok := v.([]byte); ok && len(b) == 16 {
+					copy(m.TraceID[:], b)
+				}
+			}
+			if v, ok := fieldMaps[0][spanIDCol]; ok {
+				if b, ok := v.([]byte); ok {
+					m.SpanID = make([]byte, len(b))
+					copy(m.SpanID, b)
+				}
+			}
+		}
+		return m
 	}
+
 	if col := row.Block.GetColumn(spanIDCol); col != nil {
 		if v, ok := col.BytesValue(row.RowIdx); ok {
 			m.SpanID = make([]byte, len(v))

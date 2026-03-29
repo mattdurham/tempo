@@ -61,7 +61,9 @@ func TestStream_TracePath(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Equal(t, 2, len(rows), "should return exactly two svc-alpha spans")
-	assert.GreaterOrEqual(t, stats.SelectedBlocks, 1)
+	// Pure intrinsic queries use the fast path (intrinsic section only), so SelectedBlocks
+	// is not populated in stats (blocks are not scanned via planBlocks). TotalBlocks is set.
+	assert.GreaterOrEqual(t, stats.TotalBlocks, 1)
 }
 
 // EX-S-02: TestStream_LogPath_TimeFilter verifies that Collect with TimestampColumn="log:timestamp"

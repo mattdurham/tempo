@@ -58,6 +58,7 @@ type StreamingColumnPredicate func(provider ColumnDataProvider, callback RowCall
 type RangeNode struct {
 	Min *Value // interval lower bound (nil = no lower bound)
 	Max *Value // interval upper bound (nil = no upper bound)
+
 	// Leaf fields — set when len(Children) == 0.
 	Column  string // fully-scoped column (e.g. "resource.service.name", "span:duration")
 	Pattern string // regex pattern for prefix-based range pruning
@@ -65,6 +66,11 @@ type RangeNode struct {
 	Values   []Value // equality lookup values; multiple values are OR'd
 	Children []RangeNode
 
+	// MinInclusive is true when Min comes from >= (>= x) rather than > (> x).
+	// Used by the intrinsic flat-column scan to decide inclusive vs exclusive lower bound.
+	MinInclusive bool
+	// MaxInclusive is true when Max comes from <= (<= x) rather than < (< x).
+	MaxInclusive bool
 	// Composite fields — set when len(Children) > 0.
 	IsOR bool
 }

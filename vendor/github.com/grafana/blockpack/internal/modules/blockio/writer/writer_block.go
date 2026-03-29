@@ -34,14 +34,16 @@ type pendingSpan struct {
 	span *tracev1.Span          // proto pointer; kept alive by w.protoRoots
 	// Tempo-native proto pointers (mutually exclusive with rs/ss/span above).
 	// Kept alive by w.tempoProtoRoots until flushBlocks() processes them.
-	tempoRS    *tempotrace.ResourceSpans
-	tempoSS    *tempotrace.ScopeSpans
-	tempoSpan  *tempotrace.Span
-	srcBlock   *modules_reader.Block // non-nil for columnar path (compaction); nil for proto path
-	svcName    string                // sort key (primary); zero-copy reference into proto
-	minHashSig [4]uint64             // sort key (secondary)
-	srcRowIdx  int                   // source row index within srcBlock
-	traceID    [16]byte              // sort key (tertiary)
+	tempoRS     *tempotrace.ResourceSpans
+	tempoSS     *tempotrace.ScopeSpans
+	tempoSpan   *tempotrace.Span
+	srcBlock    *modules_reader.Block  // non-nil for columnar path (compaction); nil for proto path
+	srcReader   *modules_reader.Reader // non-nil when srcBlock is set; used for intrinsic lookup
+	svcName     string                 // sort key (primary); zero-copy reference into proto
+	minHashSig  [4]uint64              // sort key (secondary)
+	srcRowIdx   int                    // source row index within srcBlock
+	srcBlockIdx int                    // block index within srcReader (for intrinsic lookup)
+	traceID     [16]byte               // sort key (tertiary)
 }
 
 // blockBuilder manages construction of a single block.
@@ -50,18 +52,6 @@ type pendingSpan struct {
 // because column builders must track running state (null-fill, bloom filter,
 // range values) that is simpler to maintain incrementally than in a batch pass.
 type blockBuilder struct {
-	// Cached intrinsic column builders for direct access without map lookup or
-	// interface dispatch. Pre-created in newBlockBuilder with pre-allocated
-	// value/present slices to eliminate growslice during the per-span append loop.
-	colTraceID   *bytesColumnBuilder
-	colSpanID    *bytesColumnBuilder
-	colParentID  *bytesColumnBuilder
-	colSpanName  *stringColumnBuilder
-	colSpanKind  *int64ColumnBuilder
-	colSpanStart *uint64ColumnBuilder
-	colSpanEnd   *uint64ColumnBuilder
-	colSpanDur   *uint64ColumnBuilder
-
 	columns   map[shared.ColumnKey]columnBuilder // column (name, type) → builder (all columns, for finalize)
 	traceRows map[[16]byte]struct{}              // trace_id set; used by writer.go to build file-level trace index
 
@@ -131,8 +121,7 @@ type builtBlock struct {
 }
 
 // reset clears the blockBuilder for reuse with the next block.
-// Intrinsic column builders are reset in place (preserving slice capacity).
-// Sparse (attribute) column builders are moved to builderCache for reuse by addColumn.
+// Attribute column builders are moved to builderCache for reuse by addColumn.
 // Column name caches (spanColNames, etc.) are preserved across blocks.
 func (b *blockBuilder) reset(spanHint int) {
 	b.spanHint = spanHint
@@ -142,45 +131,8 @@ func (b *blockBuilder) reset(spanHint int) {
 	b.minTraceID = [16]byte{}
 	b.maxTraceID = [16]byte{}
 
-	// Reset intrinsic column builders in place — preserves backing slice capacity.
-	// Then prepare to full block size (all slots null; indexed writes flip present).
-	b.colTraceID.resetForReuse(traceIDColumnName)
-	b.colTraceID.prepare(spanHint)
-	b.colSpanID.resetForReuse("span:id")
-	b.colSpanID.prepare(spanHint)
-	b.colParentID.resetForReuse("span:parent_id")
-	b.colParentID.prepare(spanHint)
-	b.colSpanName.resetForReuse("span:name")
-	b.colSpanName.prepare(spanHint)
-	b.colSpanKind.resetForReuse("")
-	b.colSpanKind.prepare(spanHint)
-	b.colSpanStart.resetForReuse("span:start")
-	b.colSpanStart.prepare(spanHint)
-	b.colSpanEnd.resetForReuse("span:end")
-	b.colSpanEnd.prepare(spanHint)
-	b.colSpanDur.resetForReuse("span:duration")
-	b.colSpanDur.prepare(spanHint)
-
-	// Move non-intrinsic builders to cache for reuse.
+	// Move all builders to cache for reuse.
 	for key, cb := range b.columns {
-		switch cb.(type) {
-		case *bytesColumnBuilder:
-			if cb == columnBuilder(b.colTraceID) || cb == columnBuilder(b.colSpanID) || cb == columnBuilder(b.colParentID) {
-				continue
-			}
-		case *stringColumnBuilder:
-			if cb == columnBuilder(b.colSpanName) {
-				continue
-			}
-		case *int64ColumnBuilder:
-			if cb == columnBuilder(b.colSpanKind) {
-				continue
-			}
-		case *uint64ColumnBuilder:
-			if cb == columnBuilder(b.colSpanStart) || cb == columnBuilder(b.colSpanEnd) || cb == columnBuilder(b.colSpanDur) {
-				continue
-			}
-		}
 		cb.resetForReuse(key.Name)
 		b.builderCache[key] = cb
 		delete(b.columns, key)
@@ -216,11 +168,38 @@ func buildBlock(
 	}
 	bb.intrinsicAccum = intrinsicAccum
 	bb.intrinsicBlockID = uint16(blockID) //nolint:gosec // safe: blockID bounded by 65534 (checked by caller)
+
+	// Pre-build per-(reader, srcBlockIdx) intrinsic index to avoid O(N) linear scans
+	// inside feedIntrinsicsFromIndex. Index is built once per unique (reader, blockIdx)
+	// pair; each row then does an O(1) map lookup.
+	type readerBlockKey struct {
+		r        *modules_reader.Reader
+		blockIdx int
+	}
+	var intrinsicIndexCache map[readerBlockKey]intrinsicRowFields
+	for i := range pending {
+		ps := &pending[i]
+		if ps.srcReader == nil {
+			continue
+		}
+		k := readerBlockKey{ps.srcReader, ps.srcBlockIdx}
+		if intrinsicIndexCache == nil {
+			intrinsicIndexCache = make(map[readerBlockKey]intrinsicRowFields)
+		}
+		if _, already := intrinsicIndexCache[k]; !already {
+			intrinsicIndexCache[k] = buildIntrinsicBlockIndex(ps.srcReader, ps.srcBlockIdx)
+		}
+	}
+
 	for rowIdx := range pending {
 		ps := &pending[rowIdx]
 		switch {
 		case ps.srcBlock != nil:
 			bb.addRowFromBlock(ps.srcBlock, ps.srcRowIdx, rowIdx)
+			if ps.srcReader != nil {
+				k := readerBlockKey{ps.srcReader, ps.srcBlockIdx}
+				bb.feedIntrinsicsFromIndex(intrinsicIndexCache[k], ps.srcRowIdx, rowIdx)
+			}
 		case ps.tempoSpan != nil:
 			bb.addRowFromTempoProto(ps, rowIdx)
 		default:
@@ -260,37 +239,6 @@ func newBlockBuilder(spanHint int) *blockBuilder {
 		resourceColNames: make(map[string]string, 16),
 		scopeColNames:    make(map[string]string, 8),
 	}
-
-	// Pre-create intrinsic column builders and prepare them to full block size.
-	// All slots start as null (zero value + present=false); addRowFromProto sets
-	// present values by index, eliminating append-based null-filling.
-
-	b.colTraceID = &bytesColumnBuilder{colName: traceIDColumnName}
-	b.colTraceID.prepare(spanHint)
-	b.colSpanID = &bytesColumnBuilder{colName: "span:id"}
-	b.colSpanID.prepare(spanHint)
-	b.colParentID = &bytesColumnBuilder{colName: "span:parent_id"}
-	b.colParentID.prepare(spanHint)
-	b.colSpanName = &stringColumnBuilder{colName: "span:name"}
-	b.colSpanName.prepare(spanHint)
-	b.colSpanKind = &int64ColumnBuilder{}
-	b.colSpanKind.prepare(spanHint)
-	b.colSpanStart = &uint64ColumnBuilder{colName: "span:start"}
-	b.colSpanStart.prepare(spanHint)
-	b.colSpanEnd = &uint64ColumnBuilder{colName: "span:end"}
-	b.colSpanEnd.prepare(spanHint)
-	b.colSpanDur = &uint64ColumnBuilder{colName: "span:duration"}
-	b.colSpanDur.prepare(spanHint)
-
-	// Register in map so finalize() can collect them.
-	b.columns[shared.ColumnKey{Name: traceIDColumnName, Type: shared.ColumnTypeBytes}] = b.colTraceID
-	b.columns[shared.ColumnKey{Name: "span:id", Type: shared.ColumnTypeBytes}] = b.colSpanID
-	b.columns[shared.ColumnKey{Name: "span:parent_id", Type: shared.ColumnTypeBytes}] = b.colParentID
-	b.columns[shared.ColumnKey{Name: "span:name", Type: shared.ColumnTypeString}] = b.colSpanName
-	b.columns[shared.ColumnKey{Name: "span:kind", Type: shared.ColumnTypeInt64}] = b.colSpanKind
-	b.columns[shared.ColumnKey{Name: "span:start", Type: shared.ColumnTypeUint64}] = b.colSpanStart
-	b.columns[shared.ColumnKey{Name: "span:end", Type: shared.ColumnTypeUint64}] = b.colSpanEnd
-	b.columns[shared.ColumnKey{Name: "span:duration", Type: shared.ColumnTypeUint64}] = b.colSpanDur
 
 	return b
 }
@@ -351,16 +299,6 @@ func (b *blockBuilder) feedIntrinsicBytes(name string, colType shared.ColumnType
 	}
 }
 
-// copyBytes returns a copy of src. Returns nil for empty/nil input.
-func copyBytes(src []byte) []byte {
-	if len(src) == 0 {
-		return nil
-	}
-	cp := make([]byte, len(src))
-	copy(cp, src)
-	return cp
-}
-
 // addRowFromProto adds all column values for one span row from a pendingSpan.
 // Full OTLP→column decoding happens here (deferred from AddTracesData) to eliminate
 // per-span AttrKV materialization and attrSlab growth.
@@ -370,27 +308,24 @@ func copyBytes(src []byte) []byte {
 func (b *blockBuilder) addRowFromProto(ps *pendingSpan, rowIdx int) {
 	span := ps.span
 
-	// --- Intrinsic columns (indexed writes into pre-allocated slices) ---
+	// --- Intrinsic columns — feed accumulator AND write block columns (dual storage) ---
 
 	// trace:id — always present; excluded from the range index.
-	b.colTraceID.values[rowIdx] = copyBytes(span.TraceId)
-	b.colTraceID.present[rowIdx] = true
-	b.feedIntrinsicBytes("trace:id", shared.ColumnTypeBytes, span.TraceId, rowIdx)
+	// Not fed to intrinsic accumulator (identity column — never used as predicate target).
+	b.addPresent(rowIdx, traceIDColumnName, shared.ColumnTypeBytes, shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: span.TraceId})
 
 	// span:id — may be absent.
+	// Not fed to intrinsic accumulator (identity column — never used as predicate target).
 	if len(span.SpanId) > 0 {
-		b.colSpanID.values[rowIdx] = copyBytes(span.SpanId)
-		b.colSpanID.present[rowIdx] = true
-		b.updateMinMax("span:id", shared.ColumnTypeBytes, string(span.SpanId))
-		b.feedIntrinsicBytes("span:id", shared.ColumnTypeBytes, span.SpanId, rowIdx)
+		b.updateMinMax(spanIDColumnName, shared.ColumnTypeBytes, string(span.SpanId))
+		b.addPresent(rowIdx, spanIDColumnName, shared.ColumnTypeBytes, shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: span.SpanId})
 	}
 
 	// span:parent_id — may be absent.
+	// Not fed to intrinsic accumulator (identity column — never used as predicate target).
 	if len(span.ParentSpanId) > 0 {
-		b.colParentID.values[rowIdx] = copyBytes(span.ParentSpanId)
-		b.colParentID.present[rowIdx] = true
-		b.updateMinMax("span:parent_id", shared.ColumnTypeBytes, string(span.ParentSpanId))
-		b.feedIntrinsicBytes("span:parent_id", shared.ColumnTypeBytes, span.ParentSpanId, rowIdx)
+		b.updateMinMax(spanParentIDColumnName, shared.ColumnTypeBytes, string(span.ParentSpanId))
+		b.addPresent(rowIdx, spanParentIDColumnName, shared.ColumnTypeBytes, shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: span.ParentSpanId})
 	}
 
 	// span:name — always present; truncate to MaxStringLen.
@@ -398,88 +333,72 @@ func (b *blockBuilder) addRowFromProto(ps *pendingSpan, rowIdx int) {
 	if len(spanName) > shared.MaxStringLen {
 		spanName = spanName[:shared.MaxStringLen]
 	}
-	b.colSpanName.values[rowIdx] = spanName
-	b.colSpanName.present[rowIdx] = true
 	if spanName != "" {
-		b.updateMinMax("span:name", shared.ColumnTypeString, spanName)
-		b.feedIntrinsicString("span:name", shared.ColumnTypeString, spanName, rowIdx)
+		b.updateMinMax(spanNameColumnName, shared.ColumnTypeString, spanName)
+		b.feedIntrinsicString(spanNameColumnName, shared.ColumnTypeString, spanName, rowIdx)
+		b.addPresent(rowIdx, spanNameColumnName, shared.ColumnTypeString, shared.AttrValue{Type: shared.ColumnTypeString, Str: spanName})
 	}
 
 	// span:kind — always present.
 	spanKind := int64(span.Kind)
-	b.colSpanKind.values[rowIdx] = spanKind
-	b.colSpanKind.present[rowIdx] = true
 	{
 		var tmp [8]byte
 		binary.LittleEndian.PutUint64(
 			tmp[:],
 			uint64(spanKind), //nolint:gosec // safe: reinterpreting int64 bits as uint64
 		)
-		b.updateMinMax("span:kind", shared.ColumnTypeInt64, string(tmp[:]))
+		b.updateMinMax(spanKindColumnName, shared.ColumnTypeInt64, string(tmp[:]))
 	}
-	b.feedIntrinsicInt64("span:kind", shared.ColumnTypeInt64, spanKind, rowIdx)
+	b.feedIntrinsicInt64(spanKindColumnName, shared.ColumnTypeInt64, spanKind, rowIdx)
+	b.addPresent(rowIdx, spanKindColumnName, shared.ColumnTypeInt64, shared.AttrValue{Type: shared.ColumnTypeInt64, Int: spanKind})
 
 	// span:start — always present.
-	b.colSpanStart.values[rowIdx] = span.StartTimeUnixNano
-	b.colSpanStart.present[rowIdx] = true
-	b.colSpanStart.trackMinMax(span.StartTimeUnixNano)
 	{
 		var tmp [8]byte
 		binary.LittleEndian.PutUint64(tmp[:], span.StartTimeUnixNano)
-		b.updateMinMax("span:start", shared.ColumnTypeUint64, string(tmp[:]))
+		b.updateMinMax(spanStartColumnName, shared.ColumnTypeUint64, string(tmp[:]))
 	}
-	b.feedIntrinsicUint64("span:start", shared.ColumnTypeUint64, span.StartTimeUnixNano, rowIdx)
+	b.feedIntrinsicUint64(spanStartColumnName, shared.ColumnTypeUint64, span.StartTimeUnixNano, rowIdx)
+	b.addPresent(rowIdx, spanStartColumnName, shared.ColumnTypeUint64, shared.AttrValue{Type: shared.ColumnTypeUint64, Uint: span.StartTimeUnixNano})
 	// Task T-TS-2: implied timestamp sketch — 1-second bucket granularity.
 	if span.StartTimeUnixNano > 0 {
 		b.colSketches.add(sketchTimestampColName, encodeSecondBucket(span.StartTimeUnixNano))
 	}
 
-	// span:end — always present.
-	b.colSpanEnd.values[rowIdx] = span.EndTimeUnixNano
-	b.colSpanEnd.present[rowIdx] = true
-	b.colSpanEnd.trackMinMax(span.EndTimeUnixNano)
+	// span:end — written to block columns; synthesized from start+duration in intrinsic path.
 	{
 		var tmp [8]byte
 		binary.LittleEndian.PutUint64(tmp[:], span.EndTimeUnixNano)
-		b.updateMinMax("span:end", shared.ColumnTypeUint64, string(tmp[:]))
+		b.updateMinMax(spanEndColumnName, shared.ColumnTypeUint64, string(tmp[:]))
 	}
-	// span:end is NOT written to the intrinsic section — it is synthesized
-	// from span:start + span:duration on read, saving ~6% of file size.
+	b.addPresent(rowIdx, spanEndColumnName, shared.ColumnTypeUint64, shared.AttrValue{Type: shared.ColumnTypeUint64, Uint: span.EndTimeUnixNano})
 
 	// span:duration — always present.
 	var dur uint64
 	if span.EndTimeUnixNano >= span.StartTimeUnixNano {
 		dur = span.EndTimeUnixNano - span.StartTimeUnixNano
 	}
-	b.colSpanDur.values[rowIdx] = dur
-	b.colSpanDur.present[rowIdx] = true
-	b.colSpanDur.trackMinMax(dur)
 	{
 		var tmp [8]byte
 		binary.LittleEndian.PutUint64(tmp[:], dur)
-		b.updateMinMax("span:duration", shared.ColumnTypeUint64, string(tmp[:]))
+		b.updateMinMax(spanDurationColumnName, shared.ColumnTypeUint64, string(tmp[:]))
 	}
-	b.feedIntrinsicUint64("span:duration", shared.ColumnTypeUint64, dur, rowIdx)
+	b.feedIntrinsicUint64(spanDurationColumnName, shared.ColumnTypeUint64, dur, rowIdx)
+	b.addPresent(rowIdx, spanDurationColumnName, shared.ColumnTypeUint64, shared.AttrValue{Type: shared.ColumnTypeUint64, Uint: dur})
 
 	// --- Conditional intrinsic columns ---
 
 	if span.Status != nil {
-		// Always write span:status when the Status object is present, even for code 0
+		// Always feed span:status when the Status object is present, even for code 0
 		// (STATUS_CODE_UNSET). This ensures the range index tracks unset status so that
 		// { status = unset } queries can prune blocks correctly. Spans where span.Status
 		// is nil entirely (the majority) remain null in the column — bloom filter handles
 		// block pruning for those cases.
-		b.addPresent(rowIdx, "span:status", shared.ColumnTypeInt64, shared.AttrValue{
-			Type: shared.ColumnTypeInt64,
-			Int:  int64(span.Status.Code),
-		})
-		b.feedIntrinsicInt64("span:status", shared.ColumnTypeInt64, int64(span.Status.Code), rowIdx)
+		b.feedIntrinsicInt64(spanStatusColumnName, shared.ColumnTypeInt64, int64(span.Status.Code), rowIdx)
+		b.addPresent(rowIdx, spanStatusColumnName, shared.ColumnTypeInt64, shared.AttrValue{Type: shared.ColumnTypeInt64, Int: int64(span.Status.Code)})
 		if span.Status.Message != "" {
-			b.addPresent(rowIdx, "span:status_message", shared.ColumnTypeString, shared.AttrValue{
-				Type: shared.ColumnTypeString,
-				Str:  span.Status.Message,
-			})
-			b.feedIntrinsicString("span:status_message", shared.ColumnTypeString, span.Status.Message, rowIdx)
+			// span:status_message not fed to intrinsic accumulator (identity/display column).
+			b.addPresent(rowIdx, spanStatusMsgColumnName, shared.ColumnTypeString, shared.AttrValue{Type: shared.ColumnTypeString, Str: span.Status.Message})
 		}
 	}
 
@@ -522,9 +441,15 @@ func (b *blockBuilder) addRowFromProto(ps *pendingSpan, rowIdx int) {
 			}
 			name := b.internColName(kv.Key, b.resourceColNames, "resource.")
 			val := protoToAttrValue(kv.Value)
-			b.addPresent(rowIdx, name, val.Type, val)
 			if kv.Key == svcNameAttrKey && val.Type == shared.ColumnTypeString {
-				b.feedIntrinsicString("resource.service.name", shared.ColumnTypeString, val.Str, rowIdx)
+				// resource.service.name is written to BOTH intrinsic section and block column (dual storage).
+				if val.Str != "" {
+					b.updateMinMax(svcNameColumnName, shared.ColumnTypeRangeString, val.Str)
+				}
+				b.feedIntrinsicString(svcNameColumnName, shared.ColumnTypeString, val.Str, rowIdx)
+				b.addPresent(rowIdx, name, val.Type, val)
+			} else {
+				b.addPresent(rowIdx, name, val.Type, val)
 			}
 		}
 	}
@@ -574,96 +499,82 @@ func (b *blockBuilder) addRowFromTempoProto(
 ) { //nolint:cyclop // mirrors addRowFromProto complexity
 	span := ps.tempoSpan
 
-	b.colTraceID.values[rowIdx] = copyBytes(span.TraceId)
-	b.colTraceID.present[rowIdx] = true
-	b.feedIntrinsicBytes("trace:id", shared.ColumnTypeBytes, span.TraceId, rowIdx)
+	// --- Intrinsic columns — feed accumulator AND write block columns (dual storage) ---
 
+	// trace:id — not fed to intrinsic accumulator (identity column).
+	b.addPresent(rowIdx, traceIDColumnName, shared.ColumnTypeBytes, shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: span.TraceId})
+
+	// span:id — not fed to intrinsic accumulator (identity column).
 	if len(span.SpanId) > 0 {
-		b.colSpanID.values[rowIdx] = copyBytes(span.SpanId)
-		b.colSpanID.present[rowIdx] = true
-		b.updateMinMax("span:id", shared.ColumnTypeBytes, string(span.SpanId))
-		b.feedIntrinsicBytes("span:id", shared.ColumnTypeBytes, span.SpanId, rowIdx)
+		b.updateMinMax(spanIDColumnName, shared.ColumnTypeBytes, string(span.SpanId))
+		b.addPresent(rowIdx, spanIDColumnName, shared.ColumnTypeBytes, shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: span.SpanId})
 	}
 
+	// span:parent_id — not fed to intrinsic accumulator (identity column).
 	if len(span.ParentSpanId) > 0 {
-		b.colParentID.values[rowIdx] = copyBytes(span.ParentSpanId)
-		b.colParentID.present[rowIdx] = true
-		b.updateMinMax("span:parent_id", shared.ColumnTypeBytes, string(span.ParentSpanId))
-		b.feedIntrinsicBytes("span:parent_id", shared.ColumnTypeBytes, span.ParentSpanId, rowIdx)
+		b.updateMinMax(spanParentIDColumnName, shared.ColumnTypeBytes, string(span.ParentSpanId))
+		b.addPresent(rowIdx, spanParentIDColumnName, shared.ColumnTypeBytes, shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: span.ParentSpanId})
 	}
 
 	spanName := span.Name
 	if len(spanName) > shared.MaxStringLen {
 		spanName = spanName[:shared.MaxStringLen]
 	}
-	b.colSpanName.values[rowIdx] = spanName
-	b.colSpanName.present[rowIdx] = true
 	if spanName != "" {
-		b.updateMinMax("span:name", shared.ColumnTypeString, spanName)
-		b.feedIntrinsicString("span:name", shared.ColumnTypeString, spanName, rowIdx)
+		b.updateMinMax(spanNameColumnName, shared.ColumnTypeString, spanName)
+		b.feedIntrinsicString(spanNameColumnName, shared.ColumnTypeString, spanName, rowIdx)
+		b.addPresent(rowIdx, spanNameColumnName, shared.ColumnTypeString, shared.AttrValue{Type: shared.ColumnTypeString, Str: spanName})
 	}
 
 	spanKind := int64(span.Kind)
-	b.colSpanKind.values[rowIdx] = spanKind
-	b.colSpanKind.present[rowIdx] = true
 	{
 		var tmp [8]byte
 		binary.LittleEndian.PutUint64(
 			tmp[:],
 			uint64(spanKind), //nolint:gosec // G115: safe reinterpret int64 bits as uint64
 		)
-		b.updateMinMax("span:kind", shared.ColumnTypeInt64, string(tmp[:]))
+		b.updateMinMax(spanKindColumnName, shared.ColumnTypeInt64, string(tmp[:]))
 	}
-	b.feedIntrinsicInt64("span:kind", shared.ColumnTypeInt64, spanKind, rowIdx)
+	b.feedIntrinsicInt64(spanKindColumnName, shared.ColumnTypeInt64, spanKind, rowIdx)
+	b.addPresent(rowIdx, spanKindColumnName, shared.ColumnTypeInt64, shared.AttrValue{Type: shared.ColumnTypeInt64, Int: spanKind})
 
-	b.colSpanStart.values[rowIdx] = span.StartTimeUnixNano
-	b.colSpanStart.present[rowIdx] = true
-	b.colSpanStart.trackMinMax(span.StartTimeUnixNano)
 	{
 		var tmp [8]byte
 		binary.LittleEndian.PutUint64(tmp[:], span.StartTimeUnixNano)
-		b.updateMinMax("span:start", shared.ColumnTypeUint64, string(tmp[:]))
+		b.updateMinMax(spanStartColumnName, shared.ColumnTypeUint64, string(tmp[:]))
 	}
-	b.feedIntrinsicUint64("span:start", shared.ColumnTypeUint64, span.StartTimeUnixNano, rowIdx)
+	b.feedIntrinsicUint64(spanStartColumnName, shared.ColumnTypeUint64, span.StartTimeUnixNano, rowIdx)
+	b.addPresent(rowIdx, spanStartColumnName, shared.ColumnTypeUint64, shared.AttrValue{Type: shared.ColumnTypeUint64, Uint: span.StartTimeUnixNano})
 	if span.StartTimeUnixNano > 0 {
 		b.colSketches.add(sketchTimestampColName, encodeSecondBucket(span.StartTimeUnixNano))
 	}
 
-	b.colSpanEnd.values[rowIdx] = span.EndTimeUnixNano
-	b.colSpanEnd.present[rowIdx] = true
-	b.colSpanEnd.trackMinMax(span.EndTimeUnixNano)
+	// span:end — written to block columns; synthesized from start+duration in intrinsic path.
 	{
 		var tmp [8]byte
 		binary.LittleEndian.PutUint64(tmp[:], span.EndTimeUnixNano)
-		b.updateMinMax("span:end", shared.ColumnTypeUint64, string(tmp[:]))
+		b.updateMinMax(spanEndColumnName, shared.ColumnTypeUint64, string(tmp[:]))
 	}
+	b.addPresent(rowIdx, spanEndColumnName, shared.ColumnTypeUint64, shared.AttrValue{Type: shared.ColumnTypeUint64, Uint: span.EndTimeUnixNano})
 
 	var dur uint64
 	if span.EndTimeUnixNano >= span.StartTimeUnixNano {
 		dur = span.EndTimeUnixNano - span.StartTimeUnixNano
 	}
-	b.colSpanDur.values[rowIdx] = dur
-	b.colSpanDur.present[rowIdx] = true
-	b.colSpanDur.trackMinMax(dur)
 	{
 		var tmp [8]byte
 		binary.LittleEndian.PutUint64(tmp[:], dur)
-		b.updateMinMax("span:duration", shared.ColumnTypeUint64, string(tmp[:]))
+		b.updateMinMax(spanDurationColumnName, shared.ColumnTypeUint64, string(tmp[:]))
 	}
-	b.feedIntrinsicUint64("span:duration", shared.ColumnTypeUint64, dur, rowIdx)
+	b.feedIntrinsicUint64(spanDurationColumnName, shared.ColumnTypeUint64, dur, rowIdx)
+	b.addPresent(rowIdx, spanDurationColumnName, shared.ColumnTypeUint64, shared.AttrValue{Type: shared.ColumnTypeUint64, Uint: dur})
 
 	if span.Status != nil {
-		b.addPresent(rowIdx, "span:status", shared.ColumnTypeInt64, shared.AttrValue{
-			Type: shared.ColumnTypeInt64,
-			Int:  int64(span.Status.Code),
-		})
-		b.feedIntrinsicInt64("span:status", shared.ColumnTypeInt64, int64(span.Status.Code), rowIdx)
+		b.feedIntrinsicInt64(spanStatusColumnName, shared.ColumnTypeInt64, int64(span.Status.Code), rowIdx)
+		b.addPresent(rowIdx, spanStatusColumnName, shared.ColumnTypeInt64, shared.AttrValue{Type: shared.ColumnTypeInt64, Int: int64(span.Status.Code)})
 		if span.Status.Message != "" {
-			b.addPresent(rowIdx, "span:status_message", shared.ColumnTypeString, shared.AttrValue{
-				Type: shared.ColumnTypeString,
-				Str:  span.Status.Message,
-			})
-			b.feedIntrinsicString("span:status_message", shared.ColumnTypeString, span.Status.Message, rowIdx)
+			// span:status_message not fed to intrinsic accumulator (identity/display column).
+			b.addPresent(rowIdx, spanStatusMsgColumnName, shared.ColumnTypeString, shared.AttrValue{Type: shared.ColumnTypeString, Str: span.Status.Message})
 		}
 	}
 
@@ -704,9 +615,15 @@ func (b *blockBuilder) addRowFromTempoProto(
 			}
 			name := b.internColName(kv.Key, b.resourceColNames, "resource.")
 			val := tempoToAttrValue(kv.Value)
-			b.addPresent(rowIdx, name, val.Type, val)
 			if kv.Key == svcNameAttrKey && val.Type == shared.ColumnTypeString {
-				b.feedIntrinsicString("resource.service.name", shared.ColumnTypeString, val.Str, rowIdx)
+				// resource.service.name is written to BOTH intrinsic section and block column (dual storage).
+				if val.Str != "" {
+					b.updateMinMax(svcNameColumnName, shared.ColumnTypeRangeString, val.Str)
+				}
+				b.feedIntrinsicString(svcNameColumnName, shared.ColumnTypeString, val.Str, rowIdx)
+				b.addPresent(rowIdx, name, val.Type, val)
+			} else {
+				b.addPresent(rowIdx, name, val.Type, val)
 			}
 		}
 	}
@@ -817,119 +734,103 @@ func readDynAttrValue(col *modules_reader.Column, rowIdx int, baseType shared.Co
 	return val, true
 }
 
-// applyTraceID copies the trace:id column value for one row during compaction.
-func (b *blockBuilder) applyTraceID(
-	col *modules_reader.Column,
-	srcRowIdx, dstRowIdx int,
-) (traceID [16]byte, found bool) {
+// applyTraceID writes trace:id to block column (dual storage). Not fed to intrinsic accumulator (identity column).
+// Returns the extracted traceID and whether it was valid (used for bookkeeping).
+func (b *blockBuilder) applyTraceID(col *modules_reader.Column, srcRowIdx, dstRowIdx int) (traceID [16]byte, found bool) {
 	if v, ok := col.BytesValue(srcRowIdx); ok && len(v) == 16 {
-		b.colTraceID.values[dstRowIdx] = slices.Clone(v)
-		b.colTraceID.present[dstRowIdx] = true
 		copy(traceID[:], v)
-		b.feedIntrinsicBytes("trace:id", shared.ColumnTypeBytes, v, dstRowIdx)
+		b.addPresent(dstRowIdx, traceIDColumnName, shared.ColumnTypeBytes, shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: v})
 		return traceID, true
 	}
 	return traceID, false
 }
 
-// applySpanID copies the span:id column value for one row during compaction.
+// applySpanID writes span:id to block column (dual storage). Not fed to intrinsic accumulator (identity column).
 func (b *blockBuilder) applySpanID(col *modules_reader.Column, srcRowIdx, dstRowIdx int) {
 	if v, ok := col.BytesValue(srcRowIdx); ok && len(v) > 0 {
-		b.colSpanID.values[dstRowIdx] = slices.Clone(v)
-		b.colSpanID.present[dstRowIdx] = true
-		b.updateMinMax("span:id", shared.ColumnTypeBytes, string(v))
-		b.feedIntrinsicBytes("span:id", shared.ColumnTypeBytes, v, dstRowIdx)
+		b.updateMinMax(spanIDColumnName, shared.ColumnTypeBytes, string(v))
+		b.addPresent(dstRowIdx, spanIDColumnName, shared.ColumnTypeBytes, shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: v})
 	}
 }
 
-// applySpanParentID copies the span:parent_id column value for one row during compaction.
+// applySpanParentID writes span:parent_id to block column (dual storage). Not fed to intrinsic accumulator (identity column).
 func (b *blockBuilder) applySpanParentID(col *modules_reader.Column, srcRowIdx, dstRowIdx int) {
 	if v, ok := col.BytesValue(srcRowIdx); ok && len(v) > 0 {
-		b.colParentID.values[dstRowIdx] = slices.Clone(v)
-		b.colParentID.present[dstRowIdx] = true
-		b.updateMinMax("span:parent_id", shared.ColumnTypeBytes, string(v))
-		b.feedIntrinsicBytes("span:parent_id", shared.ColumnTypeBytes, v, dstRowIdx)
+		b.updateMinMax(spanParentIDColumnName, shared.ColumnTypeBytes, string(v))
+		b.addPresent(dstRowIdx, spanParentIDColumnName, shared.ColumnTypeBytes, shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: v})
 	}
 }
 
-// applySpanName copies the span:name column value for one row during compaction.
+// applySpanName feeds span:name into the intrinsic accumulator and writes to block column (dual storage).
 func (b *blockBuilder) applySpanName(col *modules_reader.Column, srcRowIdx, dstRowIdx int) {
-	if v, ok := col.StringValue(srcRowIdx); ok {
-		b.colSpanName.values[dstRowIdx] = v
-		b.colSpanName.present[dstRowIdx] = true
-		if v != "" {
-			b.updateMinMax("span:name", shared.ColumnTypeString, v)
-			b.feedIntrinsicString("span:name", shared.ColumnTypeString, v, dstRowIdx)
-		}
+	if v, ok := col.StringValue(srcRowIdx); ok && v != "" {
+		b.updateMinMax(spanNameColumnName, shared.ColumnTypeString, v)
+		b.feedIntrinsicString(spanNameColumnName, shared.ColumnTypeString, v, dstRowIdx)
+		b.addPresent(dstRowIdx, spanNameColumnName, shared.ColumnTypeString, shared.AttrValue{Type: shared.ColumnTypeString, Str: v})
 	}
 }
 
-// applySpanKind copies the span:kind column value for one row during compaction.
+// applySpanKind feeds span:kind into the intrinsic accumulator and writes to block column (dual storage).
 func (b *blockBuilder) applySpanKind(col *modules_reader.Column, srcRowIdx, dstRowIdx int) {
 	if v, ok := col.Int64Value(srcRowIdx); ok {
-		b.colSpanKind.values[dstRowIdx] = v
-		b.colSpanKind.present[dstRowIdx] = true
 		var tmp [8]byte
 		binary.LittleEndian.PutUint64(tmp[:], uint64(v)) //nolint:gosec // safe: reinterpreting int64 bits as uint64
-		b.updateMinMax("span:kind", shared.ColumnTypeInt64, string(tmp[:]))
-		b.feedIntrinsicInt64("span:kind", shared.ColumnTypeInt64, v, dstRowIdx)
+		b.updateMinMax(spanKindColumnName, shared.ColumnTypeInt64, string(tmp[:]))
+		b.feedIntrinsicInt64(spanKindColumnName, shared.ColumnTypeInt64, v, dstRowIdx)
+		b.addPresent(dstRowIdx, spanKindColumnName, shared.ColumnTypeInt64, shared.AttrValue{Type: shared.ColumnTypeInt64, Int: v})
 	}
 }
 
-// applySpanStart copies the span:start column value for one row during compaction.
+// applySpanStart feeds span:start into the intrinsic accumulator and writes to block column (dual storage).
 // Returns the value and whether it was present (used by finalizeRowBookkeeping).
 func (b *blockBuilder) applySpanStart(col *modules_reader.Column, srcRowIdx, dstRowIdx int) (uint64, bool) {
 	if v, ok := col.Uint64Value(srcRowIdx); ok {
-		b.colSpanStart.values[dstRowIdx] = v
-		b.colSpanStart.present[dstRowIdx] = true
-		b.colSpanStart.trackMinMax(v)
 		var tmp [8]byte
 		binary.LittleEndian.PutUint64(tmp[:], v)
-		b.updateMinMax("span:start", shared.ColumnTypeUint64, string(tmp[:]))
-		b.feedIntrinsicUint64("span:start", shared.ColumnTypeUint64, v, dstRowIdx)
+		b.updateMinMax(spanStartColumnName, shared.ColumnTypeUint64, string(tmp[:]))
+		b.feedIntrinsicUint64(spanStartColumnName, shared.ColumnTypeUint64, v, dstRowIdx)
+		b.addPresent(dstRowIdx, spanStartColumnName, shared.ColumnTypeUint64, shared.AttrValue{Type: shared.ColumnTypeUint64, Uint: v})
 		return v, true
 	}
 	return 0, false
 }
 
-// applySpanEnd copies the span:end column value for one row during compaction.
-// span:end is NOT written to the intrinsic section — it is synthesized on read.
+// applySpanEnd updates span:end min/max and writes to block column (dual storage).
+// span:end is NOT written to the intrinsic section — it is synthesized on read from start+duration.
+// Written to block column payloads (dual storage); NOT written to intrinsic section.
 // Returns the value and whether it was present (used by finalizeRowBookkeeping).
 func (b *blockBuilder) applySpanEnd(col *modules_reader.Column, srcRowIdx, dstRowIdx int) (uint64, bool) {
 	if v, ok := col.Uint64Value(srcRowIdx); ok {
-		b.colSpanEnd.values[dstRowIdx] = v
-		b.colSpanEnd.present[dstRowIdx] = true
-		b.colSpanEnd.trackMinMax(v)
 		var tmp [8]byte
 		binary.LittleEndian.PutUint64(tmp[:], v)
-		b.updateMinMax("span:end", shared.ColumnTypeUint64, string(tmp[:]))
+		b.updateMinMax(spanEndColumnName, shared.ColumnTypeUint64, string(tmp[:]))
+		b.addPresent(dstRowIdx, spanEndColumnName, shared.ColumnTypeUint64, shared.AttrValue{Type: shared.ColumnTypeUint64, Uint: v})
 		return v, true
 	}
 	return 0, false
 }
 
-// applySpanDuration copies the span:duration column value for one row during compaction.
+// applySpanDuration feeds span:duration into the intrinsic accumulator and writes to block column (dual storage).
 func (b *blockBuilder) applySpanDuration(col *modules_reader.Column, srcRowIdx, dstRowIdx int) bool {
 	if v, ok := col.Uint64Value(srcRowIdx); ok {
-		b.colSpanDur.values[dstRowIdx] = v
-		b.colSpanDur.present[dstRowIdx] = true
-		b.colSpanDur.trackMinMax(v)
 		var tmp [8]byte
 		binary.LittleEndian.PutUint64(tmp[:], v)
-		b.updateMinMax("span:duration", shared.ColumnTypeUint64, string(tmp[:]))
-		b.feedIntrinsicUint64("span:duration", shared.ColumnTypeUint64, v, dstRowIdx)
+		b.updateMinMax(spanDurationColumnName, shared.ColumnTypeUint64, string(tmp[:]))
+		b.feedIntrinsicUint64(spanDurationColumnName, shared.ColumnTypeUint64, v, dstRowIdx)
+		b.addPresent(dstRowIdx, spanDurationColumnName, shared.ColumnTypeUint64, shared.AttrValue{Type: shared.ColumnTypeUint64, Uint: v})
 		return true
 	}
 	return false
 }
 
-// applySpanStatus feeds the span:status column value into the intrinsic and dynamic paths.
+// applySpanStatus feeds the span:status column value into the intrinsic accumulator and writes to block column (dual storage).
 func (b *blockBuilder) applySpanStatus(col *modules_reader.Column, srcRowIdx, dstRowIdx int) {
 	if v, ok := col.Int64Value(srcRowIdx); ok {
 		var tmp [8]byte
 		binary.LittleEndian.PutUint64(tmp[:], uint64(v)) //nolint:gosec // safe: reinterpreting int64 bits as uint64
-		b.updateMinMax("span:status", shared.ColumnTypeInt64, string(tmp[:]))
-		b.feedIntrinsicInt64("span:status", shared.ColumnTypeInt64, v, dstRowIdx)
+		b.updateMinMax(spanStatusColumnName, shared.ColumnTypeInt64, string(tmp[:]))
+		b.feedIntrinsicInt64(spanStatusColumnName, shared.ColumnTypeInt64, v, dstRowIdx)
+		b.addPresent(dstRowIdx, spanStatusColumnName, shared.ColumnTypeInt64, shared.AttrValue{Type: shared.ColumnTypeInt64, Int: v})
 	}
 }
 
@@ -957,60 +858,60 @@ func (b *blockBuilder) addRowFromBlock(srcBlock *modules_reader.Block, srcRowIdx
 			traceID, traceIDFound = b.applyTraceID(col, srcRowIdx, dstRowIdx)
 			continue
 
-		case "span:id":
+		case spanIDColumnName:
 			b.applySpanID(col, srcRowIdx, dstRowIdx)
 			continue
 
-		case "span:parent_id":
+		case spanParentIDColumnName:
 			b.applySpanParentID(col, srcRowIdx, dstRowIdx)
 			continue
 
-		case "span:name":
+		case spanNameColumnName:
 			b.applySpanName(col, srcRowIdx, dstRowIdx)
 			continue
 
-		case "span:kind":
+		case spanKindColumnName:
 			b.applySpanKind(col, srcRowIdx, dstRowIdx)
 			continue
 
-		case "span:start":
+		case spanStartColumnName:
 			spanStart, spanStartFound = b.applySpanStart(col, srcRowIdx, dstRowIdx)
 			continue
 
-		case "span:end":
+		case spanEndColumnName:
 			spanEnd, spanEndFound = b.applySpanEnd(col, srcRowIdx, dstRowIdx)
 			continue
 
-		case "span:duration":
+		case spanDurationColumnName:
 			durationFound = b.applySpanDuration(col, srcRowIdx, dstRowIdx)
 			continue
 
-		case "span:status":
+		case spanStatusColumnName:
 			b.applySpanStatus(col, srcRowIdx, dstRowIdx)
-			// Fall through to addPresent below (don't continue).
+			continue
 
-		case "span:status_message":
-			// Fall through to addPresent below (don't continue).
+		case spanStatusMsgColumnName:
+			// Not fed to intrinsic accumulator (identity/display column).
+			if v, ok := col.StringValue(srcRowIdx); ok && v != "" {
+				b.addPresent(dstRowIdx, spanStatusMsgColumnName, shared.ColumnTypeString, shared.AttrValue{Type: shared.ColumnTypeString, Str: v})
+			}
+			continue
 
-		case "resource.service.name":
-			// Fall through to addPresent below (don't continue).
+		case svcNameColumnName:
+			if v, ok := col.StringValue(srcRowIdx); ok && v != "" {
+				b.updateMinMax(svcNameColumnName, shared.ColumnTypeRangeString, v)
+				b.feedIntrinsicString(svcNameColumnName, shared.ColumnTypeString, v, dstRowIdx)
+				b.addPresent(dstRowIdx, svcNameColumnName, shared.ColumnTypeString, shared.AttrValue{Type: shared.ColumnTypeString, Str: v})
+			}
+			continue
 		}
 
-		// Dynamic attribute columns: read typed value and call addPresent.
+		// Dynamic attribute columns: read typed value and call addPresent to write to block column.
 		val, ok := readDynAttrValue(col, srcRowIdx, baseType)
 		if !ok {
 			continue
 		}
 		b.addPresent(dstRowIdx, colKey.Name, baseType, val)
-		// Feed intrinsic accumulator for select dynamic columns.
-		if val.Type == shared.ColumnTypeString {
-			switch colKey.Name {
-			case "span:status_message":
-				b.feedIntrinsicString("span:status_message", shared.ColumnTypeString, val.Str, dstRowIdx)
-			case "resource.service.name":
-				b.feedIntrinsicString("resource.service.name", shared.ColumnTypeString, val.Str, dstRowIdx)
-			}
-		}
 	}
 
 	b.finalizeRowBookkeeping(
@@ -1031,13 +932,10 @@ func (b *blockBuilder) finalizeRowBookkeeping(
 		if spanEnd >= spanStart {
 			dur = spanEnd - spanStart
 		}
-		b.colSpanDur.values[dstRowIdx] = dur
-		b.colSpanDur.present[dstRowIdx] = true
-		b.colSpanDur.trackMinMax(dur)
 		var tmp [8]byte
 		binary.LittleEndian.PutUint64(tmp[:], dur)
-		b.updateMinMax("span:duration", shared.ColumnTypeUint64, string(tmp[:]))
-		b.feedIntrinsicUint64("span:duration", shared.ColumnTypeUint64, dur, dstRowIdx)
+		b.updateMinMax(spanDurationColumnName, shared.ColumnTypeUint64, string(tmp[:]))
+		b.feedIntrinsicUint64(spanDurationColumnName, shared.ColumnTypeUint64, dur, dstRowIdx)
 	}
 
 	// Update min/max start time and trace ID bookkeeping.
@@ -1075,6 +973,161 @@ func (b *blockBuilder) finalizeRowBookkeeping(
 	}
 
 	b.spanCount++
+}
+
+// intrinsicRowFields is a per-row value cache built once per source block during compaction.
+// Key: rowIdx (uint16). Value: map of intrinsic field name → typed value.
+// Built by buildIntrinsicBlockIndex; consumed by feedIntrinsicsFromIndex.
+type intrinsicRowFields = map[uint16]map[string]any
+
+// buildIntrinsicBlockIndex builds a per-row intrinsic field cache for the given
+// (reader, srcBlockIdx) pair. Each intrinsic column is read once (O(N) over the
+// column's BlockRefs), avoiding the O(N) per-row linear scan done by IntrinsicBytesAt
+// and friends. Returns nil when r has no intrinsic section.
+//
+// The result maps typed values using the same Go types that feedIntrinsicsFromIndex
+// switches on: []byte for bytes columns, uint64 for uint64 columns, string for string
+// columns, and int64 for int64 columns.
+func buildIntrinsicBlockIndex(r *modules_reader.Reader, srcBlockIdx int) intrinsicRowFields {
+	if r == nil {
+		return nil
+	}
+	names := r.IntrinsicColumnNames()
+	if len(names) == 0 {
+		return nil
+	}
+	out := make(intrinsicRowFields)
+	for _, colName := range names {
+		col, err := r.GetIntrinsicColumn(colName)
+		if err != nil || col == nil {
+			continue
+		}
+		switch col.Format {
+		case shared.IntrinsicFormatFlat:
+			for i, ref := range col.BlockRefs {
+				if int(ref.BlockIdx) != srcBlockIdx {
+					continue
+				}
+				if out[ref.RowIdx] == nil {
+					out[ref.RowIdx] = make(map[string]any, 10)
+				}
+				if len(col.Uint64Values) > i {
+					out[ref.RowIdx][colName] = col.Uint64Values[i]
+				} else if len(col.BytesValues) > i {
+					out[ref.RowIdx][colName] = col.BytesValues[i]
+				}
+			}
+		case shared.IntrinsicFormatDict:
+			for _, entry := range col.DictEntries {
+				for _, ref := range entry.BlockRefs {
+					if int(ref.BlockIdx) != srcBlockIdx {
+						continue
+					}
+					if out[ref.RowIdx] == nil {
+						out[ref.RowIdx] = make(map[string]any, 10)
+					}
+					if col.Type == shared.ColumnTypeInt64 || col.Type == shared.ColumnTypeRangeInt64 {
+						out[ref.RowIdx][colName] = entry.Int64Val
+					} else {
+						out[ref.RowIdx][colName] = entry.Value
+					}
+				}
+			}
+		}
+	}
+	return out
+}
+
+// feedIntrinsicsFromIndex copies intrinsic column values from a pre-built per-block
+// index (see buildIntrinsicBlockIndex) into this block's intrinsic accumulator at
+// dstRowIdx. O(1) per call — the index is built once per source block.
+// Used by the compaction path when source blocks no longer carry intrinsic columns
+// in their block-column storage.
+func (b *blockBuilder) feedIntrinsicsFromIndex(index intrinsicRowFields, srcRowIdx, dstRowIdx int) {
+	if index == nil || b.intrinsicAccum == nil {
+		return
+	}
+	fields, ok := index[uint16(srcRowIdx)] //nolint:gosec // bounded by SpanCount (<= 65535)
+	if !ok {
+		return
+	}
+	// trace:id, span:id, span:parent_id: not fed to intrinsic accumulator (identity columns).
+	if v, ok := fields["trace:id"]; ok {
+		if bv, ok := v.([]byte); ok {
+			b.addPresent(dstRowIdx, traceIDColumnName, shared.ColumnTypeBytes, shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: bv})
+		}
+	}
+	if v, ok := fields[spanIDColumnName]; ok {
+		if bv, ok := v.([]byte); ok {
+			b.updateMinMax(spanIDColumnName, shared.ColumnTypeBytes, string(bv))
+			b.addPresent(dstRowIdx, spanIDColumnName, shared.ColumnTypeBytes, shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: bv})
+		}
+	}
+	if v, ok := fields[spanParentIDColumnName]; ok {
+		if bv, ok := v.([]byte); ok {
+			b.updateMinMax(spanParentIDColumnName, shared.ColumnTypeBytes, string(bv))
+			b.addPresent(dstRowIdx, spanParentIDColumnName, shared.ColumnTypeBytes, shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: bv})
+		}
+	}
+	if v, ok := fields[spanNameColumnName]; ok {
+		if sv, ok := v.(string); ok && sv != "" {
+			b.updateMinMax(spanNameColumnName, shared.ColumnTypeString, sv)
+			b.feedIntrinsicString(spanNameColumnName, shared.ColumnTypeString, sv, dstRowIdx)
+			b.addPresent(dstRowIdx, spanNameColumnName, shared.ColumnTypeString, shared.AttrValue{Type: shared.ColumnTypeString, Str: sv})
+		}
+	}
+	if v, ok := fields[spanKindColumnName]; ok {
+		if iv, ok := v.(int64); ok {
+			var tmp [8]byte
+			binary.LittleEndian.PutUint64(tmp[:], uint64(iv)) //nolint:gosec // safe: reinterpreting int64 bits as uint64
+			b.updateMinMax(spanKindColumnName, shared.ColumnTypeInt64, string(tmp[:]))
+			b.feedIntrinsicInt64(spanKindColumnName, shared.ColumnTypeInt64, iv, dstRowIdx)
+			b.addPresent(dstRowIdx, spanKindColumnName, shared.ColumnTypeInt64, shared.AttrValue{Type: shared.ColumnTypeInt64, Int: iv})
+		}
+	}
+	if v, ok := fields[spanStartColumnName]; ok {
+		if uv, ok := v.(uint64); ok {
+			var tmp [8]byte
+			binary.LittleEndian.PutUint64(tmp[:], uv)
+			b.updateMinMax(spanStartColumnName, shared.ColumnTypeUint64, string(tmp[:]))
+			b.feedIntrinsicUint64(spanStartColumnName, shared.ColumnTypeUint64, uv, dstRowIdx)
+			b.addPresent(dstRowIdx, spanStartColumnName, shared.ColumnTypeUint64, shared.AttrValue{Type: shared.ColumnTypeUint64, Uint: uv})
+			if uv > 0 {
+				b.colSketches.add(sketchTimestampColName, encodeSecondBucket(uv))
+			}
+		}
+	}
+	if v, ok := fields[spanDurationColumnName]; ok {
+		if uv, ok := v.(uint64); ok {
+			var tmp [8]byte
+			binary.LittleEndian.PutUint64(tmp[:], uv)
+			b.updateMinMax(spanDurationColumnName, shared.ColumnTypeUint64, string(tmp[:]))
+			b.feedIntrinsicUint64(spanDurationColumnName, shared.ColumnTypeUint64, uv, dstRowIdx)
+			b.addPresent(dstRowIdx, spanDurationColumnName, shared.ColumnTypeUint64, shared.AttrValue{Type: shared.ColumnTypeUint64, Uint: uv})
+		}
+	}
+	if v, ok := fields[spanStatusColumnName]; ok {
+		if iv, ok := v.(int64); ok {
+			var tmp [8]byte
+			binary.LittleEndian.PutUint64(tmp[:], uint64(iv)) //nolint:gosec // safe: reinterpreting int64 bits as uint64
+			b.updateMinMax(spanStatusColumnName, shared.ColumnTypeInt64, string(tmp[:]))
+			b.feedIntrinsicInt64(spanStatusColumnName, shared.ColumnTypeInt64, iv, dstRowIdx)
+			b.addPresent(dstRowIdx, spanStatusColumnName, shared.ColumnTypeInt64, shared.AttrValue{Type: shared.ColumnTypeInt64, Int: iv})
+		}
+	}
+	// span:status_message: not fed to intrinsic accumulator (identity/display column).
+	if v, ok := fields[spanStatusMsgColumnName]; ok {
+		if sv, ok := v.(string); ok && sv != "" {
+			b.addPresent(dstRowIdx, spanStatusMsgColumnName, shared.ColumnTypeString, shared.AttrValue{Type: shared.ColumnTypeString, Str: sv})
+		}
+	}
+	if v, ok := fields[svcNameColumnName]; ok {
+		if sv, ok := v.(string); ok && sv != "" {
+			b.updateMinMax(svcNameColumnName, shared.ColumnTypeRangeString, sv)
+			b.feedIntrinsicString(svcNameColumnName, shared.ColumnTypeString, sv, dstRowIdx)
+			b.addPresent(dstRowIdx, svcNameColumnName, shared.ColumnTypeString, shared.AttrValue{Type: shared.ColumnTypeString, Str: sv})
+		}
+	}
 }
 
 // internColName returns the full column name for the given attribute key and prefix,

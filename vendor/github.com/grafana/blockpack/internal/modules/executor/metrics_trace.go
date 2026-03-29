@@ -136,7 +136,7 @@ func ExecuteTraceMetrics(
 		result.BlocksScanned++
 
 		for _, rowIdx := range rowSet.ToSlice() {
-			traceAccumulateRow(bwb.Block, rowIdx, querySpec, buckets)
+			traceAccumulateRow(r, blockIdx, bwb.Block, rowIdx, querySpec, buckets)
 		}
 	}
 
@@ -152,6 +152,8 @@ func ExecuteTraceMetrics(
 
 // traceAccumulateRow accumulates one span's contribution into the buckets map.
 func traceAccumulateRow(
+	r *modules_reader.Reader,
+	blockIdx int,
 	block *modules_reader.Block,
 	rowIdx int,
 	querySpec *vm.QuerySpec,
@@ -162,16 +164,28 @@ func traceAccumulateRow(
 		return
 	}
 
-	// Read span:start column for time bucketing (SPEC-ETM-7).
-	tsCol := block.GetColumn("span:start")
-	if tsCol == nil {
+	// Read span:start for time bucketing (SPEC-ETM-7).
+	// PATTERN: block-column-first with intrinsic-section fallback (shared across
+	// compaction/compaction.go, writer/writer.go, executor/executor.go, metrics_trace.go).
+	// v3 files store identity columns in block payloads; v4 files store them exclusively
+	// in the intrinsic section. Try the block column first for backwards compat.
+	// span:start is stored in the intrinsic section; fall back to block column for legacy files.
+	var tsNanos int64
+	if tsCol := block.GetColumn("span:start"); tsCol != nil {
+		tsVal, ok := tsCol.Uint64Value(rowIdx)
+		if !ok {
+			return
+		}
+		tsNanos = int64(tsVal) //nolint:gosec
+	} else if r != nil {
+		tsVal, ok := r.IntrinsicUint64At("span:start", blockIdx, rowIdx)
+		if !ok {
+			return
+		}
+		tsNanos = int64(tsVal) //nolint:gosec
+	} else {
 		return
 	}
-	tsVal, ok := tsCol.Uint64Value(rowIdx)
-	if !ok {
-		return
-	}
-	tsNanos := int64(tsVal) //nolint:gosec
 
 	// Skip spans outside the query time window (SPEC-ETM-6).
 	// Intervals are right-closed: (StartTime, EndTime] — matches Tempo semantics.

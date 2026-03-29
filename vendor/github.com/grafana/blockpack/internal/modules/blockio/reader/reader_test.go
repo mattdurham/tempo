@@ -171,9 +171,13 @@ func TestRoundTrip_Basic(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, bwb)
 
-	blk := bwb.Block
-	require.NotNil(t, blk.GetColumn("span:name"), "span:name column must be present")
-	require.NotNil(t, blk.GetColumn("resource.service.name"), "resource.service.name column must be present")
+	// span:name and resource.service.name are now intrinsic-only columns.
+	// Verify their presence via the intrinsic section rather than block columns.
+	require.True(t, r.HasIntrinsicSection(), "intrinsic section must be present")
+	_, hasSpanName := r.IntrinsicColumnMeta("span:name")
+	require.True(t, hasSpanName, "span:name must be present in intrinsic section")
+	_, hasSvcName := r.IntrinsicColumnMeta("resource.service.name")
+	require.True(t, hasSvcName, "resource.service.name must be present in intrinsic section")
 }
 
 // ---- RT-02: Empty flush ----
@@ -562,22 +566,19 @@ func TestBlockReuse(t *testing.T) {
 	r := openReader(t, buf.Bytes())
 	require.Equal(t, 2, r.BlockCount())
 
-	// Load block 0.
-	bwb0, err := r.GetBlockWithBytes(0, nil, nil)
-	require.NoError(t, err)
+	// span:name is now stored in the intrinsic section only, not in block columns.
+	// Verify span:name values for each block via the intrinsic section.
+	require.True(t, r.HasIntrinsicSection(), "intrinsic section must be present")
 
-	// Load block 1 independently.
-	bwb1, err := r.GetBlockWithBytes(1, nil, nil)
-	require.NoError(t, err)
+	// Block 0 should have "op-one" spans; block 1 should have "op-two" spans.
+	// Verify at least one span:name is resolvable in each block.
+	name0, ok0 := r.IntrinsicDictStringAt("span:name", 0, 0)
+	assert.True(t, ok0, "span:name at block 0 row 0 must be present")
+	assert.Equal(t, "op-one", name0, "block 0 must contain op-one spans")
 
-	// Each block must have its own span:name values.
-	col0 := bwb0.Block.GetColumn("span:name")
-	require.NotNil(t, col0)
-	col1 := bwb1.Block.GetColumn("span:name")
-	require.NotNil(t, col1)
-	// Verify at least one span:name is present and parseable in each block.
-	_, ok := col1.StringValue(0)
-	assert.True(t, ok, "span:name value at row 0 of block 1 must be present")
+	name1, ok1 := r.IntrinsicDictStringAt("span:name", 1, 0)
+	assert.True(t, ok1, "span:name at block 1 row 0 must be present")
+	assert.Equal(t, "op-two", name1, "block 1 must contain op-two spans")
 }
 
 // ---- Column filtering: only requested columns decoded ----
@@ -636,11 +637,13 @@ func TestGetBlockWithBytes_NilWant(t *testing.T) {
 	bwb, err := r.GetBlockWithBytes(0, nil, nil)
 	require.NoError(t, err)
 
-	// All 3 attribute columns plus span intrinsics must be present.
+	// All 3 attribute columns must be present as block columns.
 	assert.NotNil(t, bwb.Block.GetColumn("span.colx.1"))
 	assert.NotNil(t, bwb.Block.GetColumn("span.colx.2"))
 	assert.NotNil(t, bwb.Block.GetColumn("span.colx.3"))
-	assert.NotNil(t, bwb.Block.GetColumn("span:name"))
+	// span:name is now an intrinsic-only column — verify via intrinsic section.
+	_, hasSpanName := r.IntrinsicColumnMeta("span:name")
+	assert.True(t, hasSpanName, "span:name must be present in intrinsic section")
 }
 
 // ---- Block meta tests ----
@@ -799,78 +802,79 @@ func TestRoundTrip_IntrinsicFields(t *testing.T) {
 	r := openReader(t, buf.Bytes())
 	require.Equal(t, 1, r.BlockCount())
 
-	bwb, err := r.GetBlockWithBytes(0, nil, nil)
-	require.NoError(t, err)
-	blk := bwb.Block
+	// Non-identity intrinsic columns are still stored in the intrinsic section.
+	require.True(t, r.HasIntrinsicSection(), "intrinsic section must be present")
 
-	// span:name
-	nameCol := blk.GetColumn("span:name")
-	require.NotNil(t, nameCol)
-	name, ok := nameCol.StringValue(0)
-	assert.True(t, ok)
+	// span:name (dict string)
+	name, ok := r.IntrinsicDictStringAt("span:name", 0, 0)
+	assert.True(t, ok, "span:name must be present in intrinsic section")
 	assert.Equal(t, "my.operation", name)
 
-	// span:start
-	stCol := blk.GetColumn("span:start")
-	require.NotNil(t, stCol)
-	st, ok := stCol.Uint64Value(0)
-	assert.True(t, ok)
+	// span:start (flat uint64)
+	st, ok := r.IntrinsicUint64At("span:start", 0, 0)
+	assert.True(t, ok, "span:start must be present in intrinsic section")
 	assert.Equal(t, uint64(1_000_000_000), st)
 
-	// span:end
-	etCol := blk.GetColumn("span:end")
-	require.NotNil(t, etCol)
-	et, ok := etCol.Uint64Value(0)
-	assert.True(t, ok)
+	// span:end (synthesized: start + duration)
+	et, ok := r.IntrinsicUint64At("span:end", 0, 0)
+	assert.True(t, ok, "span:end must be present in intrinsic section")
 	assert.Equal(t, uint64(2_000_000_000), et)
 
-	// span:duration = end - start = 1_000_000_000
-	durCol := blk.GetColumn("span:duration")
-	require.NotNil(t, durCol)
-	dur, ok := durCol.Uint64Value(0)
-	assert.True(t, ok)
+	// span:duration = end - start = 1_000_000_000 (flat uint64)
+	dur, ok := r.IntrinsicUint64At("span:duration", 0, 0)
+	assert.True(t, ok, "span:duration must be present in intrinsic section")
 	assert.Equal(t, uint64(1_000_000_000), dur)
 
-	// span:kind
-	kindCol := blk.GetColumn("span:kind")
-	require.NotNil(t, kindCol)
-	kind, ok := kindCol.Int64Value(0)
-	assert.True(t, ok)
+	// span:kind (dict int64)
+	kind, ok := r.IntrinsicDictInt64At("span:kind", 0, 0)
+	assert.True(t, ok, "span:kind must be present in intrinsic section")
 	assert.Equal(t, int64(tracev1.Span_SPAN_KIND_SERVER), kind)
 
-	// span:status
-	scCol := blk.GetColumn("span:status")
-	require.NotNil(t, scCol)
-	sc, ok := scCol.Int64Value(0)
-	assert.True(t, ok)
+	// span:status (dict int64)
+	sc, ok := r.IntrinsicDictInt64At("span:status", 0, 0)
+	assert.True(t, ok, "span:status must be present in intrinsic section")
 	assert.Equal(t, int64(tracev1.Status_STATUS_CODE_OK), sc)
 
-	// span:status_message
-	smCol := blk.GetColumn("span:status_message")
-	require.NotNil(t, smCol)
-	sm, ok := smCol.StringValue(0)
-	assert.True(t, ok)
+	// NOTE-005: trace:id, span:id, span:parent_id, span:status_message are no longer
+	// stored in the intrinsic section. Read them from block column payloads instead.
+	bwb, err := r.GetBlockWithBytes(0, nil, nil)
+	require.NoError(t, err)
+	b := bwb.Block
+
+	// span:status_message — now block-column only
+	_, okIntr := r.IntrinsicDictStringAt("span:status_message", 0, 0)
+	assert.False(t, okIntr, "span:status_message must NOT be in intrinsic section (NOTE-005)")
+	smCol := b.GetColumn("span:status_message")
+	require.NotNil(t, smCol, "span:status_message must be present as a block column")
+	sm, okSM := smCol.StringValue(0)
+	assert.True(t, okSM)
 	assert.Equal(t, "all good", sm)
 
-	// trace:id — stored as bytes
-	tidCol := blk.GetColumn("trace:id")
-	require.NotNil(t, tidCol)
-	tidVal, ok := tidCol.BytesValue(0)
-	assert.True(t, ok)
+	// trace:id — now block-column only
+	_, okTID := r.IntrinsicBytesAt("trace:id", 0, 0)
+	assert.False(t, okTID, "trace:id must NOT be in intrinsic section (NOTE-005)")
+	tidCol := b.GetColumn("trace:id")
+	require.NotNil(t, tidCol, "trace:id must be present as a block column")
+	tidVal, okTV := tidCol.BytesValue(0)
+	assert.True(t, okTV)
 	assert.Equal(t, traceID[:], tidVal)
 
-	// span:id — stored as bytes
-	sidCol := blk.GetColumn("span:id")
-	require.NotNil(t, sidCol)
-	sidVal, ok := sidCol.BytesValue(0)
-	assert.True(t, ok)
+	// span:id — now block-column only
+	_, okSID := r.IntrinsicBytesAt("span:id", 0, 0)
+	assert.False(t, okSID, "span:id must NOT be in intrinsic section (NOTE-005)")
+	sidCol := b.GetColumn("span:id")
+	require.NotNil(t, sidCol, "span:id must be present as a block column")
+	sidVal, okSV := sidCol.BytesValue(0)
+	assert.True(t, okSV)
 	assert.Equal(t, spanID, sidVal)
 
-	// span:parent_id — stored as bytes
-	pidCol := blk.GetColumn("span:parent_id")
-	require.NotNil(t, pidCol)
-	pidVal, ok := pidCol.BytesValue(0)
-	assert.True(t, ok)
+	// span:parent_id — now block-column only
+	_, okPID := r.IntrinsicBytesAt("span:parent_id", 0, 0)
+	assert.False(t, okPID, "span:parent_id must NOT be in intrinsic section (NOTE-005)")
+	pidCol := b.GetColumn("span:parent_id")
+	require.NotNil(t, pidCol, "span:parent_id must be present as a block column")
+	pidVal, okPV := pidCol.BytesValue(0)
+	assert.True(t, okPV)
 	assert.Equal(t, parentID, pidVal)
 }
 

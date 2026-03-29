@@ -93,6 +93,11 @@ type Reader interface {
 
 	// TODO(suraj): use common.MetricsCallback in Fetch and remove the Bytes callback from traceql.FetchSpansResponse
 	Fetch(ctx context.Context, meta *backend.BlockMeta, req traceql.FetchSpansRequest, opts common.SearchOptions) (traceql.FetchSpansResponse, error)
+
+	// QueryRange executes a TraceQL metrics query directly against a block using the block's
+	// native metrics implementation (if available). Returns (nil, nil) if the block encoding
+	// does not support native metrics queries — callers must fall back to the generic Fetch path.
+	QueryRange(ctx context.Context, meta *backend.BlockMeta, req *tempopb.QueryRangeRequest, opts common.SearchOptions) (*tempopb.QueryRangeResponse, error)
 	FetchTagValues(ctx context.Context, meta *backend.BlockMeta, req traceql.FetchTagValuesRequest, cb traceql.FetchTagValuesCallback, mcb common.MetricsCallback, opts common.SearchOptions) error
 	FetchTagNames(ctx context.Context, meta *backend.BlockMeta, req traceql.FetchTagsRequest, cb traceql.FetchTagsCallback, mcb common.MetricsCallback, opts common.SearchOptions) error
 
@@ -556,6 +561,27 @@ func (rw *readerWriter) Fetch(ctx context.Context, meta *backend.BlockMeta, req 
 
 	rw.cfg.Search.ApplyToOptions(&opts)
 	return block.Fetch(ctx, req, opts)
+}
+
+// nativeMetricsQuerier is an optional interface implemented by block encodings that
+// support native TraceQL metrics queries (e.g. vblockpack with the intrinsic fast path).
+type nativeMetricsQuerier interface {
+	QueryRange(ctx context.Context, req *tempopb.QueryRangeRequest, opts common.SearchOptions) (*tempopb.QueryRangeResponse, error)
+}
+
+// QueryRange dispatches to the block's native metrics implementation when available.
+// Returns (nil, nil) when the block encoding does not support native metrics queries.
+func (rw *readerWriter) QueryRange(ctx context.Context, meta *backend.BlockMeta, req *tempopb.QueryRangeRequest, opts common.SearchOptions) (*tempopb.QueryRangeResponse, error) {
+	block, err := encoding.OpenBlock(meta, rw.r)
+	if err != nil {
+		return nil, err
+	}
+	nm, ok := block.(nativeMetricsQuerier)
+	if !ok {
+		return nil, nil
+	}
+	rw.cfg.Search.ApplyToOptions(&opts)
+	return nm.QueryRange(ctx, req, opts)
 }
 
 func (rw *readerWriter) FetchTagValues(ctx context.Context, meta *backend.BlockMeta, req traceql.FetchTagValuesRequest, cb traceql.FetchTagValuesCallback, mcb common.MetricsCallback, opts common.SearchOptions) error {

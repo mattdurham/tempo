@@ -597,6 +597,19 @@ func streamFilterProgram(r *Reader, program *vm.Program, opts QueryOptions, fn s
 	if err != nil {
 		return err
 	}
+	// Intrinsic ID maps are built lazily: only constructed on the first block-scan result
+	// row where the block columns lack trace:id / span:id. For dual-storage files (PR #174+)
+	// these columns are present in block payloads and the maps are never needed.
+	var traceIDByRef map[uint32][]byte
+	var spanIDByRef map[uint32][]byte
+	buildIDMaps := func() {
+		if traceIDByRef == nil {
+			traceIDByRef = buildIntrinsicBytesMap(r, "trace:id")
+		}
+		if spanIDByRef == nil {
+			spanIDByRef = buildIntrinsicBytesMap(r, "span:id")
+		}
+	}
 	for _, row := range rows {
 		var fields SpanFieldsProvider
 		var traceIDHex, spanIDHex string
@@ -611,9 +624,17 @@ func streamFilterProgram(r *Reader, program *vm.Program, opts QueryOptions, fn s
 				spanIDHex = hexEncodeField(v)
 			}
 		} else {
-			rawAdapter = modules_blockio.NewSpanFieldsAdapter(row.Block, row.RowIdx)
+			rawAdapter = modules_blockio.NewSpanFieldsAdapterWithReader(row.Block, r, row.BlockIdx, row.RowIdx)
 			fields = rawAdapter
-			traceIDHex, spanIDHex = extractIDs(row.Block, row.RowIdx)
+			// For dual-storage blocks, trace:id and span:id are in block columns — extractIDs
+			// will find them there without using the fallback maps. Build maps lazily only on
+			// the first miss, avoiding the expensive O(N) buildIntrinsicBytesMap for new files.
+			if row.Block == nil ||
+				row.Block.GetColumn("trace:id") == nil ||
+				row.Block.GetColumn("span:id") == nil {
+				buildIDMaps()
+			}
+			traceIDHex, spanIDHex = extractIDs(row.Block, row.RowIdx, row.BlockIdx, traceIDByRef, spanIDByRef)
 		}
 		if len(opts.SelectColumns) > 0 {
 			fields = newFilteredSpanFields(fields, opts.SelectColumns)
@@ -1058,6 +1079,11 @@ func streamLogProgram(r *Reader, program *vm.Program, opts LogQueryOptions, fn s
 	if err != nil {
 		return err
 	}
+	// Pre-build intrinsic ID lookup maps for the block-scan path. These are used as a
+	// fallback when trace:id / span:id are absent from block columns (intrinsic-only storage).
+	// GetIntrinsicColumn is cached after first load so this is cheap on subsequent calls.
+	logTraceIDByRef := buildIntrinsicBytesMap(r, "trace:id")
+	logSpanIDByRef := buildIntrinsicBytesMap(r, "span:id")
 	for _, row := range rows {
 		var fields SpanFieldsProvider
 		var traceIDHex, spanIDHex string
@@ -1071,9 +1097,9 @@ func streamLogProgram(r *Reader, program *vm.Program, opts LogQueryOptions, fn s
 				spanIDHex = hexEncodeField(v)
 			}
 		} else {
-			rawAdapter = modules_blockio.NewSpanFieldsAdapter(row.Block, row.RowIdx)
+			rawAdapter = modules_blockio.NewSpanFieldsAdapterWithReader(row.Block, r, row.BlockIdx, row.RowIdx)
 			fields = rawAdapter
-			traceIDHex, spanIDHex = extractIDs(row.Block, row.RowIdx)
+			traceIDHex, spanIDHex = extractIDs(row.Block, row.RowIdx, row.BlockIdx, logTraceIDByRef, logSpanIDByRef)
 		}
 		match := &SpanMatch{Fields: fields, TraceID: traceIDHex, SpanID: spanIDHex}
 		if !fn(match, true) {
@@ -1089,22 +1115,54 @@ func streamLogProgram(r *Reader, program *vm.Program, opts LogQueryOptions, fn s
 }
 
 // extractIDs extracts hex-encoded trace ID and span ID strings from a block row.
-// Returns empty strings when block is nil (intrinsic fast-path rows have no block).
-func extractIDs(block *modules_reader.Block, rowIdx int) (traceID, spanID string) {
-	if block == nil {
-		return "", ""
+// Falls back to intrinsic section lookup maps when block columns are absent
+// (intrinsic-only storage after dual-storage removal).
+func extractIDs(
+	block *modules_reader.Block, rowIdx int, blockIdx int,
+	traceIDByRef, spanIDByRef map[uint32][]byte,
+) (traceID, spanID string) {
+	if block != nil {
+		if col := block.GetColumn("trace:id"); col != nil {
+			if v, ok := col.BytesValue(rowIdx); ok {
+				traceID = hex.EncodeToString(v)
+			}
+		}
+		if col := block.GetColumn("span:id"); col != nil {
+			if v, ok := col.BytesValue(rowIdx); ok {
+				spanID = hex.EncodeToString(v)
+			}
+		}
 	}
-	if col := block.GetColumn("trace:id"); col != nil {
-		if v, ok := col.BytesValue(rowIdx); ok {
+	// Fall back to intrinsic section when block columns are absent.
+	key := uint32(blockIdx)<<16 | uint32(rowIdx) //nolint:gosec // blockIdx and rowIdx are bounded
+	if traceID == "" {
+		if v, ok := traceIDByRef[key]; ok {
 			traceID = hex.EncodeToString(v)
 		}
 	}
-	if col := block.GetColumn("span:id"); col != nil {
-		if v, ok := col.BytesValue(rowIdx); ok {
+	if spanID == "" {
+		if v, ok := spanIDByRef[key]; ok {
 			spanID = hex.EncodeToString(v)
 		}
 	}
 	return traceID, spanID
+}
+
+// buildIntrinsicBytesMap builds a packed-key → bytes lookup map from an intrinsic flat column.
+// Key encoding: uint32(blockIdx)<<16 | uint32(rowIdx). Returns nil if the column is absent.
+func buildIntrinsicBytesMap(r *modules_reader.Reader, colName string) map[uint32][]byte {
+	col, err := r.GetIntrinsicColumn(colName)
+	if err != nil || col == nil || len(col.BytesValues) == 0 {
+		return nil
+	}
+	m := make(map[uint32][]byte, len(col.BlockRefs))
+	for i, ref := range col.BlockRefs {
+		if i < len(col.BytesValues) {
+			key := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx) //nolint:gosec // ref values are bounded
+			m[key] = col.BytesValues[i]
+		}
+	}
+	return m
 }
 
 // hexEncodeField converts a field value (string or []byte) to a hex string.

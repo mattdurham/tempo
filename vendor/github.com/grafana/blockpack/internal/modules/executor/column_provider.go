@@ -40,6 +40,35 @@ func (p *blockColumnProvider) lookupColumn(name string) *modules_reader.Column {
 	return p.block.GetColumn(name)
 }
 
+// nilIntrinsicScan handles the case where a column lookup returned nil for an
+// intrinsic column. With dual storage (restored after PR #172 rollback), new files
+// always have intrinsic columns in block payloads, so this path is a no-op for them.
+// It is kept as a backward-compatibility safety net for files written between the
+// PR #172 merge and this fix, which stored intrinsic columns ONLY in the intrinsic
+// TOC section and omitted them from block payloads. For those files, the block-scan
+// must treat the absent column as "all rows pass" so that AND intersection with
+// user-attribute predicates is not short-circuited to empty; the real per-row
+// filtering is applied afterwards by filterRowSetByIntrinsicNodes.
+// Returns (n, true, err) when handled; (0, false, nil) when the column is a
+// regular user attribute that is simply absent.
+func (p *blockColumnProvider) nilIntrinsicScan(name string, cb vm.RowCallback) (int, bool, error) {
+	if !isIntrinsicColumn(name) {
+		return 0, false, nil
+	}
+	n, err := p.StreamFullScan(cb)
+	return n, true, err
+}
+
+// isIntrinsicColumn reports whether name is an intrinsic column that is stored in
+// the file-level intrinsic section rather than in block payloads.
+// When absent from a block, intrinsic column scans must return FullScan() so that
+// the AND intersection with user-attr predicates does not short-circuit to empty;
+// filterRowSetByIntrinsicNodes applies the actual value filtering afterwards.
+func isIntrinsicColumn(name string) bool {
+	_, ok := traceIntrinsicColumns[name]
+	return ok
+}
+
 // GetRowCount returns the total row count (spans for traces, records for logs).
 func (p *blockColumnProvider) GetRowCount() int { return p.block.SpanCount() }
 
@@ -227,6 +256,9 @@ func (p *blockColumnProvider) scanWith(col *modules_reader.Column, cond func(i i
 func (p *blockColumnProvider) StreamScanEqual(column string, value interface{}, cb vm.RowCallback) (int, error) {
 	col := p.lookupColumn(column)
 	if col == nil {
+		if n, handled, err := p.nilIntrinsicScan(column, cb); handled {
+			return n, err
+		}
 		return 0, nil
 	}
 	n := p.scanWith(col, func(i int) bool { return rowEqual(col, i, value) }, cb)
@@ -240,11 +272,14 @@ func (p *blockColumnProvider) StreamScanEqual(column string, value interface{}, 
 // rowEqual checks, which is still one pass over the rows (O(spans×nValues)) but avoids re-scanning
 // the column N times.
 func (p *blockColumnProvider) StreamScanEqualAny(column string, values []any, cb vm.RowCallback) (int, error) {
+	if len(values) == 0 {
+		return 0, nil // empty value set: nothing can match regardless of column state
+	}
 	col := p.lookupColumn(column)
 	if col == nil {
-		return 0, nil
-	}
-	if len(values) == 0 {
+		if n, handled, err := p.nilIntrinsicScan(column, cb); handled {
+			return n, err
+		}
 		return 0, nil
 	}
 	if len(values) == 1 {
@@ -342,6 +377,9 @@ func (p *blockColumnProvider) StreamScanNotEqual(column string, value interface{
 func (p *blockColumnProvider) StreamScanLessThan(column string, value interface{}, cb vm.RowCallback) (int, error) {
 	col := p.lookupColumn(column)
 	if col == nil {
+		if n, handled, err := p.nilIntrinsicScan(column, cb); handled {
+			return n, err
+		}
 		return 0, nil
 	}
 	if f, ok := value.(float64); ok {
@@ -366,6 +404,9 @@ func (p *blockColumnProvider) StreamScanLessThanOrEqual(
 ) (int, error) {
 	col := p.lookupColumn(column)
 	if col == nil {
+		if n, handled, err := p.nilIntrinsicScan(column, cb); handled {
+			return n, err
+		}
 		return 0, nil
 	}
 	if f, ok := value.(float64); ok {
@@ -390,6 +431,9 @@ func (p *blockColumnProvider) StreamScanGreaterThan(
 ) (int, error) {
 	col := p.lookupColumn(column)
 	if col == nil {
+		if n, handled, err := p.nilIntrinsicScan(column, cb); handled {
+			return n, err
+		}
 		return 0, nil
 	}
 	if f, ok := value.(float64); ok {
@@ -414,6 +458,9 @@ func (p *blockColumnProvider) StreamScanGreaterThanOrEqual(
 ) (int, error) {
 	col := p.lookupColumn(column)
 	if col == nil {
+		if n, handled, err := p.nilIntrinsicScan(column, cb); handled {
+			return n, err
+		}
 		return 0, nil
 	}
 	if f, ok := value.(float64); ok {
@@ -460,6 +507,11 @@ func (p *blockColumnProvider) StreamScanIsNotNull(column string, cb vm.RowCallba
 func (p *blockColumnProvider) StreamScanRegex(column string, pattern string, cb vm.RowCallback) (int, error) {
 	col := p.lookupColumn(column)
 	if col == nil {
+		// Only FullScan for string-typed intrinsic columns (regex requires string values).
+		if _, ok := traceIntrinsicStringColumns[column]; ok {
+			n, err := p.StreamFullScan(cb)
+			return n, err
+		}
 		return 0, nil
 	}
 	re, err := regexp.Compile(pattern)
@@ -512,6 +564,11 @@ func (p *blockColumnProvider) StreamScanRegexNotMatch(
 func (p *blockColumnProvider) StreamScanContains(column string, substring string, cb vm.RowCallback) (int, error) {
 	col := p.lookupColumn(column)
 	if col == nil {
+		// Only FullScan for string-typed intrinsic columns (contains requires string values).
+		if _, ok := traceIntrinsicStringColumns[column]; ok {
+			n, err := p.StreamFullScan(cb)
+			return n, err
+		}
 		return 0, nil
 	}
 	n := p.scanWith(col, func(i int) bool {
@@ -639,6 +696,12 @@ func (p *blockColumnProvider) streamScanRegexNotMatchFast(
 func (p *blockColumnProvider) ScanRegexFast(column string, re *regexp.Regexp, prefixes []string) (vm.RowSet, error) {
 	col := p.lookupColumn(column)
 	if col == nil {
+		// Regex on absent intrinsic column: FullScan only for string-typed intrinsic columns
+		// (span:name, span:status_message, resource.service.name). Integer/bytes intrinsic
+		// columns (span:kind, span:status, trace:id, span:id) don't support regex → 0 rows.
+		if _, ok := traceIntrinsicStringColumns[column]; ok {
+			return p.FullScan(), nil
+		}
 		return &rowSet{}, nil
 	}
 	return collectStream(func(cb vm.RowCallback) (int, error) {

@@ -20,7 +20,7 @@ This document defines the public contracts, input/output semantics, and invarian
 
 ```go
 func Collect(r *modules_reader.Reader, program *vm.Program, opts CollectOptions) ([]MatchedRow, error)
-func SpanMatchFromRow(row MatchedRow, signalType uint8) SpanMatch
+func SpanMatchFromRow(row MatchedRow, signalType uint8, r *modules_reader.Reader) SpanMatch
 ```
 
 `Collect` is the primary query entry point — it replaces the earlier `Execute` method.
@@ -117,11 +117,10 @@ If the relevant column is absent or the row is null, the field is left at its ze
 type MatchedRow struct {
     Block           *modules_reader.Block
     // IntrinsicFields is set when the result was produced without reading full block
-    // data — either Case B (pure intrinsic + sort) or Case A with a range predicate
-    // (pure intrinsic + no sort + hasRangePredicate=true, see NOTE-047). Block is nil
-    // when IntrinsicFields is set. Case A with equality predicates populates Block via
-    // forEachBlockInGroups and leaves IntrinsicFields nil. The caller should use
-    // IntrinsicFields for field lookups when Block is nil.
+    // data — Case B (pure intrinsic + sort) only. Block is nil when IntrinsicFields is set.
+    // Case A (pure intrinsic + no sort) always populates Block via forEachBlockInGroups
+    // and leaves IntrinsicFields nil. The caller should use IntrinsicFields for field
+    // lookups when Block is nil.
     IntrinsicFields modules_shared.SpanFieldsProvider
     BlockIdx        int
     RowIdx          int
@@ -129,7 +128,7 @@ type MatchedRow struct {
 ```
 
 `Collect` returns `[]MatchedRow`. Each row holds a reference to the
-parsed block and the row index within it. Use `SpanMatchFromRow(row, signalType)` to
+parsed block and the row index within it. Use `SpanMatchFromRow(row, signalType, r)` to
 extract identity fields (`TraceID`, `SpanID`) after collection.
 
 Matches are in block-then-row order (no randomization). When `TimestampColumn` and
@@ -306,22 +305,19 @@ I/O path (see NOTE-035).
   The block-scan deferred callback and the fast-path synchronous callback are mutually
   exclusive — exactly one fires for any given call. See NOTE-043, NOTE-044.
 - **SPEC-STREAM-7:** When `TimestampColumn` and `Limit` are both set, `Collect` guarantees the returned rows are the globally top-`Limit` entries by per-row timestamp. A heap of size `Limit` is maintained: min-heap for Backward (evict oldest), max-heap for Forward (evict newest). Block-level early termination: blocks with `MaxStart <= heap.min` (Backward) or `MinStart >= heap.max` (Forward) are skipped entirely (no I/O). Results are delivered in sort order after the scan completes (not lazily). Back-ref: `internal/modules/executor/stream_topk.go:topKScanBlocks`
-- **SPEC-STREAM-8:** `QueryOptions.MostRecent` in the public API (`api.go`) maps to `Direction: Backward` + `TimestampColumn: "span:start"` in `CollectOptions`. When `true` with no `Limit`, blocks are traversed in reverse `BlockMeta.MinStart` order and rows within each block are sorted by `span:start` descending — this is locally newest-first but does not guarantee global ordering when block time ranges overlap. When `true` with a `Limit`, `Collect` is used with `TimestampColumn` set, which guarantees the returned spans are the globally top-`Limit` by `span:start` (SPEC-STREAM-7). `span:start` is always in `searchMetaColumns` so no extra I/O is needed. Default (`false`) is forward with no timestamp sort. Only applies to filter queries; structural queries collect all blocks regardless.
-  Back-ref: `api.go:streamFilterProgram`
+- **SPEC-STREAM-8:** `QueryOptions.MostRecent` in the public API (`api.go`) maps to `Direction: Backward` + `TimestampColumn: "span:start"` in `CollectOptions`. When `true` with no `Limit`, blocks are traversed in reverse `BlockMeta.MinStart` order and rows within each block are sorted by `span:start` descending — this is locally newest-first but does not guarantee global ordering when block time ranges overlap. When `true` with a `Limit`, `Collect` is used with `TimestampColumn` set, which guarantees the returned spans are the globally top-`Limit` by `span:start` (SPEC-STREAM-7). Default (`false`) is forward with no timestamp sort. Only applies to filter queries; structural queries collect all blocks regardless.
+  *Addendum (2026-03-25):* The original spec stated "`span:start` is always in `searchMetaColumns` so no extra I/O is needed." This is no longer accurate. `span:start` is now served via `traceIntrinsicColumns` injection into `secondPassCols` in `Collect` (see NOTE-050). When `wantColumns != nil && !opts.AllColumns`, `span:start` enters `secondPassCols` via the `traceIntrinsicColumns` loop, ensuring it is decoded for the per-row sort. When `opts.AllColumns = true`, `secondPassCols` is nil (decode all columns), which also covers `span:start`. Both paths guarantee `span:start` is available for sorting; no extra I/O is required.
+  Back-ref: `api.go:streamFilterProgram`, `internal/modules/executor/stream.go:Collect`
 - **SPEC-STREAM-9:** When `opts.Limit > 0` and the program contains at least one
   intrinsic predicate (`hasSomeIntrinsicPredicates` returns true), `Collect` runs an
   intrinsic pre-filter before the full block scan. The pre-filter dispatches on
   `(ProgramIsIntrinsicOnly × TimestampColumn != "")`:
-  - Pure intrinsic + no sort (Case A): adaptive dispatch on `hasRangePredicate(program)`:
-      - Range predicates (Min or Max set, e.g. `duration>100ms`): `lookupIntrinsicFields`
-        reads field values from cached intrinsic blobs — zero internal block reads.
-        `MatchedRow.IntrinsicFields` is populated; `MatchedRow.Block` is nil.
-      - Equality predicates (Values set, e.g. `status=error`, `svc=X`): `forEachBlockInGroups`
-        reads only the internal blocks containing matched refs — targeted I/O.
-        `MatchedRow.Block` is populated; `MatchedRow.IntrinsicFields` is nil.
-      The range path is faster when refs are spread across many blocks (sorted flat column
-      scan scatters matches). The equality path is faster when refs cluster in 1-3 blocks
-      (dict-equality matches are sparse and highly localised). See NOTE-047.
+  - Pure intrinsic + no sort (Case A): uses `forEachBlockInGroups` for field population.
+      `MatchedRow.Block` is populated; `MatchedRow.IntrinsicFields` is nil.
+      This applies to both equality predicates (status=error, kind=server) and range
+      predicates (duration>100ms, svc=~".*"). Block reads are O(M) where M is the result
+      count — cheaper than the former O(N) intrinsic column scan for range predicates.
+      See NOTE-047 (historical) and the companion note for the unified-path change.
   - Pure intrinsic + sort: group refs by block, order blocks by BlockMeta.MaxStart DESC
     (KLL path NOTE-044), build packed-key→timestamp map from tsCol (O(N)), look up each
     ref's timestamp, sort M pairs, return IntrinsicFields rows (zero block reads).
@@ -336,6 +332,67 @@ I/O path (see NOTE-035).
             group refs by block, MaxStart DESC sort, O(N) map build, O(M log M) sort)
 
 Back-ref: `internal/modules/executor/stream.go:Collect`, `internal/modules/executor/stream.go:CollectOptions`, `internal/modules/executor/stream.go:collectFromIntrinsicRefs`
+
+---
+
+## SPEC-STREAM-10: Intrinsic Column Separation Invariants
+
+*Updated 2026-03-26: PR #172 (exclusive-intrinsic storage) was rolled back — see writer
+NOTE-002 and executor NOTE-052. Intrinsic columns are now written to BOTH block column
+payloads AND the intrinsic TOC section (dual storage). The three mechanisms below remain
+correct and are now conservative no-ops for block-scan (block columns are populated, so
+nilIntrinsicScan is never triggered). They still protect against future format versions
+that omit intrinsic columns from block payloads, and the intrinsic fast paths (Cases A–D)
+continue to rely on the intrinsic TOC section.*
+
+Three mechanisms implement the dual-storage intrinsic model (NOTE-050, NOTE-051, NOTE-052).
+They work together so that block-column ColumnPredicate and intrinsic post-filtering
+never interfere with each other.
+
+### SPEC-STREAM-10.1: nilIntrinsicScan — FullScan on absent intrinsic column
+
+When `Block.GetColumn(name)` returns nil **and** `name` is an intrinsic column name
+(e.g. `resource.service.name`, `span:name`, `span:kind`, `trace:id`, `span:id`), the
+column scan returns a **FullScan** (all rows pass) rather than an empty row set.
+
+This is required so that AND intersection with user-attribute predicates is not
+short-circuited to empty — the intrinsic filter is applied later by
+`filterRowSetByIntrinsicNodes`. Without this invariant, every query against a v4 file
+with an intrinsic predicate would return 0 results.
+
+Contract: absent intrinsic column in block payload → FullScan, not empty.
+Back-ref: `internal/modules/executor/column_provider.go:nilIntrinsicScan`
+
+### SPEC-STREAM-10.2: userAttrProgram — strip intrinsic RangeNodes for block-column scan
+
+`userAttrProgram` returns a shallow copy of the Program with all RangeNode leaves whose
+`Column` field is an intrinsic column name removed. This copy is used during block
+column ColumnPredicate evaluation so that intrinsic predicates are not evaluated against
+nil block columns (which would cause false-negative results).
+
+Contract: `userAttrProgram` returns nil when **all** predicates are intrinsic, and the
+caller treats nil as match-all (proceeds to `filterRowSetByIntrinsicNodes` for the full
+row set). Composite nodes with no remaining user-attribute children are also omitted
+(empty OR/AND nodes must not be emitted into the filtered node list).
+Back-ref: `internal/modules/executor/predicates.go:userAttrProgram`,
+          `internal/modules/executor/predicates.go:filterIntrinsicNodes`
+
+### SPEC-STREAM-10.3: filterRowSetByIntrinsicNodes — post-filter via intrinsic section
+
+After ColumnPredicate, `filterRowSetByIntrinsicNodes` enforces intrinsic predicates
+against the file-level intrinsic section. It calls `lookupIntrinsicFields` to materialise
+field values for each candidate row, then evaluates each row against the intrinsic
+RangeNodes.
+
+Contract: rows absent from intrinsic data (field not present in the intrinsic section)
+**fail** the predicate — absent value does not match any equality or range predicate.
+
+Mixed-OR limitation (NOTE-051): when a non-intrinsic leaf appears inside an OR node
+alongside intrinsic leaves, `rowSatisfiesIntrinsicNodes` evaluates the non-intrinsic
+leaf as false (it has no intrinsic value). This is a known limitation — such queries
+fall through to the full block-scan path instead.
+Back-ref: `internal/modules/executor/stream.go:filterRowSetByIntrinsicNodes`,
+          `internal/modules/executor/stream.go:lookupIntrinsicFields`
 
 ---
 

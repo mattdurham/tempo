@@ -197,6 +197,36 @@ func GetTraceByID(r *Reader, traceIDHex string) (results []SpanMatch, err error)
 		}
 	}
 
+	// Ensure the intrinsic TOC is loaded — lean readers skip this at open time.
+	// Required because trace:id is now stored exclusively in the intrinsic section.
+	if err := r.EnsureIntrinsicTOC(); err != nil {
+		return nil, fmt.Errorf("GetTraceByID: load intrinsic TOC: %w", err)
+	}
+
+	// Build intrinsic trace:id lookup to find (blockID, rowIdx) pairs.
+	// After dual-storage removal, trace:id is only in the intrinsic section.
+	intrinsicTraceCol, traceColErr := r.GetIntrinsicColumn("trace:id")
+	if traceColErr != nil {
+		return nil, fmt.Errorf("GetTraceByID: load intrinsic trace:id: %w", traceColErr)
+	}
+
+	// rowsByBlock maps blockID → []rowIdx for rows matching traceID.
+	rowsByBlock := make(map[int][]int)
+	if intrinsicTraceCol != nil {
+		for i, ref := range intrinsicTraceCol.BlockRefs {
+			if i < len(intrinsicTraceCol.BytesValues) && bytes.Equal(intrinsicTraceCol.BytesValues[i], traceID[:]) {
+				rowsByBlock[int(ref.BlockIdx)] = append(rowsByBlock[int(ref.BlockIdx)], int(ref.RowIdx))
+			}
+		}
+	}
+
+	// Fall back to scanning trace:id block columns for legacy files that still have them.
+	// This handles files written before the dual-storage removal.
+	useLegacyScan := len(rowsByBlock) == 0 && intrinsicTraceCol == nil
+
+	// Pre-build intrinsic span:id map for ID extraction fallback.
+	spanIDByRef := buildIntrinsicBytesMap(r, "span:id")
+
 	for _, entry := range entries {
 		raw, ok := rawMap[entry.BlockID]
 		if !ok {
@@ -207,20 +237,36 @@ func GetTraceByID(r *Reader, traceIDHex string) (results []SpanMatch, err error)
 			return nil, fmt.Errorf("GetTraceByID: block %d: %w", entry.BlockID, blockErr)
 		}
 
-		// NOTE-37: scan the trace:id column for rows belonging to this trace.
-		traceIDCol := bwb.Block.GetColumn(
-			"trace:id",
-		) // matches traceIDColumnName in internal/modules/blockio/writer/constants.go
-		if traceIDCol == nil {
-			continue
-		}
-		for rowIdx := range bwb.Block.SpanCount() {
-			v, ok := traceIDCol.BytesValue(rowIdx)
-			if !ok || !bytes.Equal(v, traceID[:]) {
+		var matchingRows []int
+		if useLegacyScan {
+			// Legacy path: scan trace:id block column for matching rows.
+			traceIDCol := bwb.Block.GetColumn("trace:id")
+			if traceIDCol == nil {
 				continue
 			}
-			fields := modules_blockio.NewSpanFieldsAdapter(bwb.Block, rowIdx)
-			traceIDStr, spanIDStr := extractIDs(bwb.Block, rowIdx)
+			for rowIdx := range bwb.Block.SpanCount() {
+				v, ok2 := traceIDCol.BytesValue(rowIdx)
+				if ok2 && bytes.Equal(v, traceID[:]) {
+					matchingRows = append(matchingRows, rowIdx)
+				}
+			}
+		} else {
+			matchingRows = rowsByBlock[entry.BlockID]
+		}
+
+		for _, rowIdx := range matchingRows {
+			fields := modules_blockio.NewSpanFieldsAdapterWithReader(bwb.Block, r, entry.BlockID, rowIdx)
+			// trace:id is known; extract span:id via intrinsic fallback map.
+			traceIDStr := hex.EncodeToString(traceID[:])
+			spanIDStr := ""
+			key := uint32(entry.BlockID)<<16 | uint32(rowIdx) //nolint:gosec // bounded values
+			if v, ok2 := spanIDByRef[key]; ok2 {
+				spanIDStr = hex.EncodeToString(v)
+			} else if col := bwb.Block.GetColumn("span:id"); col != nil {
+				if v, ok2 := col.BytesValue(rowIdx); ok2 {
+					spanIDStr = hex.EncodeToString(v)
+				}
+			}
 			match := SpanMatch{
 				Fields:  fields,
 				TraceID: traceIDStr,

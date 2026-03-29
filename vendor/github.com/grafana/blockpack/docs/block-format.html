@@ -50,8 +50,8 @@
 <p>Each block is a sequence of encoded columns. The on-disk format is:</p>
 <ol>
 <li><strong>Block header</strong> — 24 bytes: magic, version, span count, column count</li>
-<li><strong>Column metadata array</strong> — per column: <code>(name&lt;em&gt;len, name, col&lt;/em&gt;type, data&lt;em&gt;offset, data&lt;/em&gt;len)</code></li>
-<li><strong>Column data</strong> — per column: <code>enc&lt;em&gt;version[1] + enc&lt;/em&gt;kind[1] + kind&lt;em&gt;specific&lt;/em&gt;data</code></li>
+<li><strong>Column metadata array</strong> — per column: <code>(name_len, name, col_type, data_offset, data_len)</code></li>
+<li><strong>Column data</strong> — per column: <code>enc_version[1] + enc_kind[1] + kind_specific_data</code></li>
 </ol>
 <p>Within each column's data:</p>
 <ul>
@@ -160,7 +160,7 @@ With coalescing (gap=0KB &lt; 4MB, merged=384KB &lt; 8MB):
 <tr><th>File</th><th>Purpose</th></tr>
 </thead>
 <tbody>
-<tr><td><a href="https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/writer/writer<em>block.go"><code>internal/modules/blockio/writer/writer&lt;/em&gt;block.go</code></a></td><td>Block encoding and column selection</td></tr>
+<tr><td><a href="https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/writer/writer_block.go"><code>internal/modules/blockio/writer/writer_block.go</code></a></td><td>Block encoding and column selection</td></tr>
 <tr><td><a href="https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/reader/reader.go"><code>internal/modules/blockio/reader/reader.go</code></a></td><td>GetBlockWithBytes, parseBlockColumnsReuse</td></tr>
 <tr><td><a href="https://github.com/grafana/blockpack/blob/main/internal/modules/queryplanner/scoring.go"><code>internal/modules/queryplanner/scoring.go</code></a></td><td>Block scoring formula</td></tr>
 <tr><td><a href="https://github.com/grafana/blockpack/blob/main/internal/modules/executor/stream.go"><code>internal/modules/executor/stream.go</code></a></td><td>Block iteration order</td></tr>

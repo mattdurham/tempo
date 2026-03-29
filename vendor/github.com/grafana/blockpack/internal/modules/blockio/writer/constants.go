@@ -22,8 +22,20 @@ const (
 	KindSparseDeltaDictionary uint8 = 13
 )
 
-// traceIDColumnName is the name of the trace ID column, excluded from the range index.
-const traceIDColumnName = "trace:id"
+// Trace intrinsic column name constants used throughout the writer package.
+const (
+	traceIDColumnName       = "trace:id"
+	spanIDColumnName        = "span:id"
+	spanParentIDColumnName  = "span:parent_id"
+	spanNameColumnName      = "span:name"
+	spanKindColumnName      = "span:kind"
+	spanStartColumnName     = "span:start"
+	spanEndColumnName       = "span:end"
+	spanDurationColumnName  = "span:duration"
+	spanStatusColumnName    = "span:status"
+	spanStatusMsgColumnName = "span:status_message"
+	svcNameColumnName       = "resource.service.name"
+)
 
 // Log intrinsic column names (SPECS §11 log signal extension).
 const (

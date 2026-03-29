@@ -21,7 +21,7 @@ func writeFileBloomSection(svcNames map[string]struct{}) ([]byte, error) {
 		return nil, nil
 	}
 
-	const colName = "resource.service.name"
+	const colName = svcNameColumnName
 	keys := make([]uint64, 0, len(svcNames))
 	for name := range svcNames {
 		keys = append(keys, sketch.HashForFuse(name))

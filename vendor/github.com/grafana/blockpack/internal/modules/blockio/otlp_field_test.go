@@ -10,11 +10,61 @@ import (
 	"bytes"
 	"testing"
 
+	modules_shared "github.com/grafana/blockpack/internal/modules/blockio/shared"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	commonv1 "go.opentelemetry.io/proto/otlp/common/v1"
 	tracev1 "go.opentelemetry.io/proto/otlp/trace/v1"
 )
+
+// intrinsicBytesAt returns the bytes value for an intrinsic flat column at (blockIdx, rowIdx).
+func intrinsicBytesAt(t *testing.T, col *modules_shared.IntrinsicColumn, blockIdx, rowIdx uint16) ([]byte, bool) {
+	t.Helper()
+	for i, ref := range col.BlockRefs {
+		if ref.BlockIdx == blockIdx && ref.RowIdx == rowIdx && i < len(col.BytesValues) {
+			return col.BytesValues[i], true
+		}
+	}
+	return nil, false
+}
+
+// intrinsicUint64At returns the uint64 value for an intrinsic flat column at (blockIdx, rowIdx).
+func intrinsicUint64At(t *testing.T, col *modules_shared.IntrinsicColumn, blockIdx, rowIdx uint16) (uint64, bool) {
+	t.Helper()
+	for i, ref := range col.BlockRefs {
+		if ref.BlockIdx == blockIdx && ref.RowIdx == rowIdx && i < len(col.Uint64Values) {
+			return col.Uint64Values[i], true
+		}
+	}
+	return 0, false
+}
+
+// intrinsicDictStringAt returns the string value for an intrinsic dict column at (blockIdx, rowIdx).
+func intrinsicDictStringAt(t *testing.T, col *modules_shared.IntrinsicColumn, blockIdx, rowIdx uint16) (string, bool) {
+	t.Helper()
+	for _, entry := range col.DictEntries {
+		for _, ref := range entry.BlockRefs {
+			if ref.BlockIdx == blockIdx && ref.RowIdx == rowIdx {
+				return entry.Value, true
+			}
+		}
+	}
+	return "", false
+}
+
+// intrinsicDictInt64At returns the int64 value for an intrinsic dict column at (blockIdx, rowIdx).
+// Int64 dict entries use Int64Val (not Value string).
+func intrinsicDictInt64At(t *testing.T, col *modules_shared.IntrinsicColumn, blockIdx, rowIdx uint16) (int64, bool) {
+	t.Helper()
+	for _, entry := range col.DictEntries {
+		for _, ref := range entry.BlockRefs {
+			if ref.BlockIdx == blockIdx && ref.RowIdx == rowIdx {
+				return entry.Int64Val, true
+			}
+		}
+	}
+	return 0, false
+}
 
 // ---- OFT-01: All intrinsic fields ----
 
@@ -73,87 +123,117 @@ func TestOTLPField_Intrinsics(t *testing.T) {
 
 	r := openModulesReader(t, buf.Bytes())
 	require.Equal(t, 1, r.BlockCount())
+	// Intrinsic columns are now stored exclusively in the intrinsic section (not block columns).
+	// Block columns contain only user attributes. Use r.GetIntrinsicColumn for intrinsic fields.
 	bwb, err := r.GetBlockWithBytes(0, nil, nil)
 	require.NoError(t, err)
 	b := bwb.Block
 	require.Equal(t, 1, b.SpanCount())
 
+	getFlat := func(t *testing.T, name string) *modules_shared.IntrinsicColumn {
+		t.Helper()
+		col, err := r.GetIntrinsicColumn(name)
+		require.NoError(t, err, "GetIntrinsicColumn %q", name)
+		require.NotNil(t, col, "intrinsic column %q must be present", name)
+		return col
+	}
+	getDict := func(t *testing.T, name string) *modules_shared.IntrinsicColumn {
+		t.Helper()
+		col, err := r.GetIntrinsicColumn(name)
+		require.NoError(t, err, "GetIntrinsicColumn %q", name)
+		require.NotNil(t, col, "intrinsic column %q must be present", name)
+		return col
+	}
+
+	// NOTE-005: trace:id, span:id, span:parent_id are no longer stored in the intrinsic
+	// section. They are stored only in block column payloads (dual-storage preserved for
+	// block payloads; intrinsic accumulator no longer feeds them).
 	t.Run("trace:id", func(t *testing.T) {
-		col := b.GetColumn("trace:id")
-		require.NotNil(t, col, "trace:id column must be present")
-		v, ok := col.BytesValue(0)
+		col, err := r.GetIntrinsicColumn("trace:id")
+		require.NoError(t, err)
+		assert.Nil(t, col, "trace:id must NOT be in intrinsic section (NOTE-005)")
+		bcol := b.GetColumn("trace:id")
+		require.NotNil(t, bcol, "trace:id must be present as a block column")
+		v, ok := bcol.BytesValue(0)
 		assert.True(t, ok)
 		assert.Equal(t, traceID[:], v)
 	})
 
 	t.Run("span:id", func(t *testing.T) {
-		col := b.GetColumn("span:id")
-		require.NotNil(t, col, "span:id column must be present")
-		v, ok := col.BytesValue(0)
+		col, err := r.GetIntrinsicColumn("span:id")
+		require.NoError(t, err)
+		assert.Nil(t, col, "span:id must NOT be in intrinsic section (NOTE-005)")
+		bcol := b.GetColumn("span:id")
+		require.NotNil(t, bcol, "span:id must be present as a block column")
+		v, ok := bcol.BytesValue(0)
 		assert.True(t, ok)
 		assert.Equal(t, spanID, v)
 	})
 
 	t.Run("span:parent_id", func(t *testing.T) {
-		col := b.GetColumn("span:parent_id")
-		require.NotNil(t, col, "span:parent_id column must be present")
-		v, ok := col.BytesValue(0)
+		col, err := r.GetIntrinsicColumn("span:parent_id")
+		require.NoError(t, err)
+		assert.Nil(t, col, "span:parent_id must NOT be in intrinsic section (NOTE-005)")
+		bcol := b.GetColumn("span:parent_id")
+		require.NotNil(t, bcol, "span:parent_id must be present as a block column")
+		v, ok := bcol.BytesValue(0)
 		assert.True(t, ok)
 		assert.Equal(t, parentSpanID, v)
 	})
 
 	t.Run("span:name", func(t *testing.T) {
-		col := b.GetColumn("span:name")
-		require.NotNil(t, col, "span:name column must be present")
-		v, ok := col.StringValue(0)
+		col := getDict(t, "span:name")
+		v, ok := intrinsicDictStringAt(t, col, 0, 0)
 		assert.True(t, ok)
 		assert.Equal(t, "full.coverage.operation", v)
 	})
 
 	t.Run("span:kind", func(t *testing.T) {
-		col := b.GetColumn("span:kind")
-		require.NotNil(t, col, "span:kind column must be present")
-		v, ok := col.Int64Value(0)
+		col := getDict(t, "span:kind")
+		v, ok := intrinsicDictInt64At(t, col, 0, 0)
 		assert.True(t, ok)
 		assert.Equal(t, int64(tracev1.Span_SPAN_KIND_SERVER), v)
 	})
 
 	t.Run("span:start", func(t *testing.T) {
-		col := b.GetColumn("span:start")
-		require.NotNil(t, col, "span:start column must be present")
-		v, ok := col.Uint64Value(0)
+		col := getFlat(t, "span:start")
+		v, ok := intrinsicUint64At(t, col, 0, 0)
 		assert.True(t, ok)
 		assert.Equal(t, uint64(1_000_000_000), v)
 	})
 
 	t.Run("span:end", func(t *testing.T) {
-		col := b.GetColumn("span:end")
-		require.NotNil(t, col, "span:end column must be present")
-		v, ok := col.Uint64Value(0)
-		assert.True(t, ok)
-		assert.Equal(t, uint64(3_000_000_000), v)
+		// span:end is derived from span:start + span:duration (both in intrinsic section).
+		startCol := getFlat(t, "span:start")
+		durCol := getFlat(t, "span:duration")
+		start, okS := intrinsicUint64At(t, startCol, 0, 0)
+		dur, okD := intrinsicUint64At(t, durCol, 0, 0)
+		assert.True(t, okS && okD, "span:start and span:duration must be present")
+		assert.Equal(t, uint64(3_000_000_000), start+dur)
 	})
 
 	t.Run("span:duration", func(t *testing.T) {
-		col := b.GetColumn("span:duration")
-		require.NotNil(t, col, "span:duration column must be present")
-		v, ok := col.Uint64Value(0)
+		col := getFlat(t, "span:duration")
+		v, ok := intrinsicUint64At(t, col, 0, 0)
 		assert.True(t, ok)
 		assert.Equal(t, uint64(2_000_000_000), v) // 3e9 - 1e9
 	})
 
 	t.Run("span:status (non-zero code)", func(t *testing.T) {
-		col := b.GetColumn("span:status")
-		require.NotNil(t, col, "span:status must be present for non-zero code")
-		v, ok := col.Int64Value(0)
+		col := getDict(t, "span:status")
+		v, ok := intrinsicDictInt64At(t, col, 0, 0)
 		assert.True(t, ok)
 		assert.Equal(t, int64(tracev1.Status_STATUS_CODE_ERROR), v)
 	})
 
+	// NOTE-005: span:status_message is no longer stored in the intrinsic section.
 	t.Run("span:status_message (non-empty)", func(t *testing.T) {
-		col := b.GetColumn("span:status_message")
-		require.NotNil(t, col, "span:status_message must be present for non-empty message")
-		v, ok := col.StringValue(0)
+		col, err := r.GetIntrinsicColumn("span:status_message")
+		require.NoError(t, err)
+		assert.Nil(t, col, "span:status_message must NOT be in intrinsic section (NOTE-005)")
+		bcol := b.GetColumn("span:status_message")
+		require.NotNil(t, bcol, "span:status_message must be present as a block column")
+		v, ok := bcol.StringValue(0)
 		assert.True(t, ok)
 		assert.Equal(t, "something went wrong", v)
 	})
@@ -327,9 +407,11 @@ func TestOTLPField_ResourceAttrTypes(t *testing.T) {
 	b := bwb.Block
 
 	t.Run("resource.service.name (string)", func(t *testing.T) {
-		col := b.GetColumn("resource.service.name")
-		require.NotNil(t, col)
-		v, ok := col.StringValue(0)
+		// resource.service.name is intrinsic-only (no block column); read from intrinsic section.
+		intrCol, err := r.GetIntrinsicColumn("resource.service.name")
+		require.NoError(t, err)
+		require.NotNil(t, intrCol, "resource.service.name must be in intrinsic section")
+		v, ok := intrinsicDictStringAt(t, intrCol, 0, 0)
 		assert.True(t, ok)
 		assert.Equal(t, "res-attr-svc", v)
 	})

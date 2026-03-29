@@ -49,7 +49,7 @@
 <tr><th>File</th><th>Purpose</th></tr>
 </thead>
 <tbody>
-<tr><td><a href="https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/writer/intrinsic<em>accum.go"><code>internal/modules/blockio/writer/intrinsic&lt;/em&gt;accum.go</code></a></td><td>Accumulation at write time</td></tr>
+<tr><td><a href="https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/writer/intrinsic_accum.go"><code>internal/modules/blockio/writer/intrinsic_accum.go</code></a></td><td>Accumulation at write time</td></tr>
 <tr><td><a href="https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/reader/reader.go"><code>internal/modules/blockio/reader/reader.go</code></a></td><td>Reading intrinsics at query time</td></tr>
 <tr><td><a href="https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/shared/SPECS.md"><code>internal/modules/blockio/shared/SPECS.md</code></a></td><td>Specs for intrinsic column contract</td></tr>
 </tbody>
@@ -128,15 +128,15 @@
 <p>Intrinsic column size is proportional to total rows (not distinct values for flat columns, distinct values for dict columns):</p>
 <ul>
 <li><strong>Flat columns</strong> (<code>trace:id</code>, <code>span:id</code>, <code>span:start</code>, <code>span:duration</code>): <code>rows × (value_size + 4 bytes BlockRef)</code>. For a 10 000-span file: <code>trace:id</code> ≈ 10 000 × (16 + 4) = 200 KB; <code>span:start</code> ≈ 10 000 × (8 + 4) = 120 KB.</li>
-<li><strong>Dict columns</strong> (<code>span:name</code>, <code>resource.service.name</code>): <code>distinct&lt;em&gt;values × string&lt;/em&gt;size + rows × 4 bytes</code>. For 100 distinct service names and 10 000 rows: dict ≈ 100 × 20 bytes + 10 000 × 4 = 42 KB.</li>
+<li><strong>Dict columns</strong> (<code>span:name</code>, <code>resource.service.name</code>): <code>distinct_values × string_size + rows × 4 bytes</code>. For 100 distinct service names and 10 000 rows: dict ≈ 100 × 20 bytes + 10 000 × 4 = 42 KB.</li>
 </ul>
 <p>All blobs are snappy-compressed. Typical intrinsic section for a 50-block, 100 000-span file: <strong>1–5 MB uncompressed, 200 KB–1 MB compressed</strong>.</p>
 <hr>
 <h2>Related Files</h2>
 <ul>
-<li>Writer accumulation: <a href="https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/writer/intrinsic<em>accum.go"><code>internal/modules/blockio/writer/intrinsic&lt;/em&gt;accum.go</code></a></li>
+<li>Writer accumulation: <a href="https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/writer/intrinsic_accum.go"><code>internal/modules/blockio/writer/intrinsic_accum.go</code></a></li>
 <li>Writer integration: <a href="https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/writer/writer.go"><code>internal/modules/blockio/writer/writer.go</code></a> (<code>writeIntrinsicSection</code>)</li>
-<li>Block builder feeds: <a href="https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/writer/writer<em>block.go"><code>internal/modules/blockio/writer/writer&lt;/em&gt;block.go</code></a> (<code>feedIntrinsicUint64</code>, <code>feedIntrinsicString</code>, etc.)</li>
+<li>Block builder feeds: <a href="https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/writer/writer_block.go"><code>internal/modules/blockio/writer/writer_block.go</code></a> (<code>feedIntrinsicUint64</code>, <code>feedIntrinsicString</code>, etc.)</li>
 </ul>
 <hr>
 <p>Back to <a href="/write-path">Write-Path</a></p>

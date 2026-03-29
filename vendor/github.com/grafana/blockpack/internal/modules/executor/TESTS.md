@@ -93,8 +93,8 @@ Query: `{ resource.service.name = "svc-a" && span.http.method = "GET" }`.
 
 **Setup:** 1 span with known TraceID `{0xAB, 0xCD, ...}`. Query: `{}`.
 
-**Assertions:** `SpanMatchFromRow(rows[0], r.SignalType()).TraceID == [16]byte{0xAB, 0xCD}`,
-`len(SpanMatchFromRow(rows[0], r.SignalType()).SpanID) > 0`.
+**Assertions:** `SpanMatchFromRow(rows[0], r.SignalType(), r).TraceID == [16]byte{0xAB, 0xCD}`,
+`len(SpanMatchFromRow(rows[0], r.SignalType(), r).SpanID) > 0`.
 
 ---
 
@@ -115,6 +115,7 @@ Query: `{ resource.service.name = "svc-a" && span.http.method = "GET" }`.
 - The `Options.Limit` early-exit path must be exercised (EX-08).
 - `SpanMatch` field population must be verified (EX-09).
 - Unscoped attribute expansion to resource, span, and log scopes must be covered (EX-11–EX-13).
+- Intrinsic fast-path cases (SPEC-STREAM-9 Cases A–D) must be covered by EX-INT-01 through EX-INT-10 (see below).
 
 ---
 
@@ -1012,16 +1013,16 @@ Results are in descending timestamp order.
 ## EX-INT-09: TestCollect_PureIntrinsicNoSort_RegressionGuard
 
 **Scenario:** Pure intrinsic query with no sort still returns correct results after gate
-change from `ProgramIsIntrinsicOnly` to `hasSomeIntrinsicPredicates`. Also verifies
-adaptive dispatch: equality predicates populate `MatchedRow.Block` (forEachBlockInGroups),
-range predicates populate `MatchedRow.IntrinsicFields` (lookupIntrinsicFields).
+change from `ProgramIsIntrinsicOnly` to `hasSomeIntrinsicPredicates`. Verifies that
+`collectIntrinsicPlain` always uses `forEachBlockInGroups`, populating `MatchedRow.Block`
+for all predicate types (equality and range). Updated 2026-03-29: removed adaptive dispatch.
 
 **Setup:** 10 spans: 5 with `svc="svc-a"`, 5 with `svc="svc-b"`.
 Query: `{ resource.service.name = "svc-a" }` (equality). `CollectOptions{Limit: 5}`.
 
 **Assertions:**
 - `len(results) == 5`
-- For each row: `row.Block != nil` and `row.IntrinsicFields == nil` (equality → Block path)
+- For each row: `row.Block != nil` and `row.IntrinsicFields == nil` (all predicates → Block path)
 - `row.Block.GetColumn("resource.service.name")` is present and value is `"svc-a"`
 
 ---
@@ -1158,11 +1159,12 @@ CollectOptions{Limit: 2, TimestampColumn: "span:start", Direction: Backward, OnS
 
 ---
 
-## EP-01: TestExecutionPath_RangePredicate_IntrinsicFields
+## EP-01: TestExecutionPath_RangePredicate_BlockPopulated
+*(Updated 2026-03-29: was TestExecutionPath_RangePredicate_IntrinsicFields)*
 
 **Scenario:** Range predicates on intrinsic columns (duration>X) route to "intrinsic-plain"
-and populate `MatchedRow.IntrinsicFields` via `lookupIntrinsicFields` (zero block decode).
-Regression guard for adaptive `collectIntrinsicPlain` dispatch (hasRangePredicate=true path).
+and populate `MatchedRow.Block` via `forEachBlockInGroups`. Range predicates now use the
+same block-read path as equality predicates (NOTE-053).
 
 **Setup:** 5 spans with varying duration (2ms, 50ms, 200ms, 300ms, 2ms), status, kind,
 and service name. `CollectOptions{Limit: 10000, OnStats: capture}`.
@@ -1174,7 +1176,7 @@ and service name. `CollectOptions{Limit: 10000, OnStats: capture}`.
 **Assertions per case:**
 - `stats.ExecutionPath == "intrinsic-plain"`
 - `stats.FetchedBlocks == 0`
-- Each row: `row.IntrinsicFields != nil`, `row.Block == nil`
+- Each row: `row.Block != nil`, `row.IntrinsicFields == nil`
 
 ---
 
@@ -1182,7 +1184,7 @@ and service name. `CollectOptions{Limit: 10000, OnStats: capture}`.
 
 **Scenario:** Equality predicates on intrinsic columns (status=error, kind=server, svc=X)
 route to "intrinsic-plain" and populate `MatchedRow.Block` via `forEachBlockInGroups`.
-Regression guard for adaptive `collectIntrinsicPlain` dispatch (hasRangePredicate=false path).
+Same execution path as range predicates (NOTE-053).
 
 **Setup:** Same 5-span dataset as EP-01. `CollectOptions{Limit: 10000, OnStats: capture}`.
 
@@ -1198,11 +1200,11 @@ Regression guard for adaptive `collectIntrinsicPlain` dispatch (hasRangePredicat
 
 ---
 
-## EP-03: TestExecutionPath_RangeAndEquality_IntrinsicFields
+## EP-03: TestExecutionPath_RangeAndEquality_BlockPopulated
+*(Updated 2026-03-29: was TestExecutionPath_RangeAndEquality_IntrinsicFields)*
 
-**Scenario:** Combined range+equality intrinsic query uses the range (IntrinsicFields) path.
-When ANY predicate is a range, hasRangePredicate=true drives the whole group to
-`lookupIntrinsicFields`, including the equality parts.
+**Scenario:** Combined range+equality intrinsic query uses `forEachBlockInGroups` (Block path).
+collectIntrinsicPlain always uses forEachBlockInGroups regardless of predicate type (NOTE-053).
 
 **Setup:** Same 5-span dataset. `CollectOptions{Limit: 10000, OnStats: capture}`.
 Query: `{ duration > 100ms && status = error }`.
@@ -1210,7 +1212,7 @@ Query: `{ duration > 100ms && status = error }`.
 **Assertions:**
 - `len(results) == 1` (only span with 300ms duration AND error status)
 - `stats.ExecutionPath == "intrinsic-plain"`
-- Each row: `row.IntrinsicFields != nil`, `row.Block == nil`
+- Each row: `row.Block != nil`, `row.IntrinsicFields == nil`
 
 ---
 
@@ -1283,3 +1285,230 @@ user attribute. Guards against path optimizations silently changing observable r
 **Setup:** Zero-column `blockLabelSet`; `Set("app", "svc")` then `Delete("app")`.
 
 **Assertions:** `bls.HasLive("app") == false`.
+
+---
+
+## Intrinsic Fast-Path Tests (intrinsic_correctness_test.go, intrinsic_pruning_test.go, metrics_trace_intrinsic_test.go)
+
+These tests verify the SPEC-STREAM-9 intrinsic execution path (Cases A–D) and the
+SPEC-STREAM-10 invariants (nilIntrinsicScan, userAttrProgram, filterRowSetByIntrinsicNodes).
+
+---
+
+### EX-INT-01: TestIntrinsicFastPath_RegexOnServiceName
+
+**Scenario:** A regex predicate on `resource.service.name` uses the intrinsic fast path
+(no full block read required when the service name column exists in the intrinsic TOC).
+
+**Setup:** v4 file with 3 spans of different `resource.service.name` values.
+Query: `{ resource.service.name =~ "svc.*" }`.
+
+**Assertions:** only matching spans returned; block read count is zero (intrinsic section only).
+
+Back-ref: `internal/modules/executor/intrinsic_correctness_test.go:TestIntrinsicFastPath_RegexOnServiceName`
+
+---
+
+### EX-INT-02: TestIntrinsicFastPath_OROnServiceName
+
+**Scenario:** An OR predicate with `resource.service.name` uses the intrinsic fast path.
+
+**Setup:** v4 file with spans from services A, B, C.
+Query: `{ resource.service.name = "A" OR resource.service.name = "B" }`.
+
+**Assertions:** spans from A and B returned; no block I/O.
+
+Back-ref: `internal/modules/executor/intrinsic_correctness_test.go:TestIntrinsicFastPath_OROnServiceName`
+
+---
+
+### EX-INT-03: TestCollect_PureIntrinsicNoSort_RegressionGuard
+
+**Scenario:** Pure intrinsic equality query (SPEC-STREAM-9 Case A, equality path) returns
+correct results with zero block reads. Regression guard for the intrinsic-section migration.
+
+**Setup:** v4 file. Query: `{ resource.service.name = "svc-alpha" }`.
+
+**Assertions:** only svc-alpha spans returned; `CollectStats.FetchedBlocks == 0`.
+
+Back-ref: `internal/modules/executor/intrinsic_correctness_test.go:TestCollect_PureIntrinsicNoSort_RegressionGuard`
+
+---
+
+### EX-INT-04: TestCollect_PureIntrinsicNoSort_RangePredicate
+
+**Scenario:** Pure intrinsic range predicate (SPEC-STREAM-9 Case A range path) returns
+correct results. After NOTE-053, `collectIntrinsicPlain` always uses `forEachBlockInGroups`
+(internal block reads), not `lookupIntrinsicFields`. `FetchedBlocks` counts only the outer
+`ReadGroup` path (block-scan), so `FetchedBlocks == 0` even though internal blocks are read.
+
+**Setup:** v4 file with spans whose `span:duration` values straddle a threshold.
+Query: `{ span:duration > X }`.
+
+**Assertions:**
+- Only spans with duration > X returned.
+- `CollectStats.FetchedBlocks == 0` (outer block-scan counter only; internal block reads are not counted here).
+- `row.Block != nil` — block payload populated by `forEachBlockInGroups`.
+- `row.IntrinsicFields == nil` — intrinsic-section reverse lookup not used in Case A.
+- `SpanMatchFromRow` extracts TraceID/SpanID from `Block`, not from `IntrinsicFields`.
+
+Back-ref: `internal/modules/executor/intrinsic_correctness_test.go:TestCollect_PureIntrinsicNoSort_RangePredicate`
+
+---
+
+### EX-INT-05: TestCollect_PureIntrinsicWithSort_ZeroBlockRead
+
+**Scenario:** Pure intrinsic query with top-K sort (SPEC-STREAM-9 Case B) returns
+globally correct top-K results with zero block reads.
+
+**Setup:** v4 file with N spans across multiple blocks. `CollectOptions{Limit: K, TimestampColumn: "span:start"}`.
+
+**Assertions:** K spans returned in timestamp order; `CollectStats.FetchedBlocks == 0`.
+
+Back-ref: `internal/modules/executor/intrinsic_correctness_test.go:TestCollect_PureIntrinsicWithSort_ZeroBlockRead`
+
+---
+
+### EX-INT-06: TestCollect_NonIntrinsicOnly_FallsBackToBlockScan
+
+**Scenario:** A non-intrinsic-only query (SPEC-STREAM-9 Case C/D) falls through to the
+full block scan path and still returns correct results.
+
+**Setup:** v4 file. Query: `{ span.http.status_code = 200 }` (non-intrinsic column).
+
+**Assertions:** correct spans returned; `CollectStats.FetchedBlocks >= 1`.
+
+Back-ref: `internal/modules/executor/intrinsic_correctness_test.go:TestCollect_NonIntrinsicOnly_FallsBackToBlockScan`
+
+---
+
+### EX-INT-07: TestIntrinsicOnlyQueryPrunesBlocks
+
+**Scenario:** An intrinsic-only predicate prunes blocks via the TOC before any block read.
+Verifies that block selection using the intrinsic index skips non-matching blocks.
+
+**Setup:** v4 file with multiple blocks; only one block contains the target service name.
+Query: `{ resource.service.name = "target-svc" }`.
+
+**Assertions:** `CollectStats.SelectedBlocks < total blocks`; correct spans returned.
+
+Back-ref: `internal/modules/executor/intrinsic_pruning_test.go:TestIntrinsicOnlyQueryPrunesBlocks`
+
+---
+
+### EX-INT-08: TestBlocksFromIntrinsicTOC_FlatDurationRange
+
+**Scenario:** A `span:duration` range predicate selects only the blocks whose duration
+range overlaps the predicate interval.
+
+**Setup:** v4 file with 2 blocks: one with short-duration spans, one with long-duration spans.
+Query: `{ span:duration > threshold }` where threshold is between the two groups.
+
+**Assertions:** only the block with matching spans is selected; no false-negative pruning.
+
+Back-ref: `internal/modules/executor/intrinsic_pruning_test.go:TestBlocksFromIntrinsicTOC_FlatDurationRange`
+
+---
+
+### EX-INT-09: TestProgramIsIntrinsicOnly
+
+**Scenario:** `programIsIntrinsicOnly` correctly identifies programs that reference only
+intrinsic columns (enabling the zero-block-read fast path).
+
+**Setup:** programs with (a) only intrinsic predicates, (b) mixed predicates,
+(c) only non-intrinsic predicates.
+
+**Assertions:** returns true only for (a); false for (b) and (c).
+
+Back-ref: `internal/modules/executor/intrinsic_pruning_test.go:TestProgramIsIntrinsicOnly`
+
+---
+
+### EX-INT-10: TestTraceMetrics_Intrinsic_CountAll_ZeroBlockReads
+
+**Scenario:** A trace metrics query that references only intrinsic columns executes
+with zero block reads (uses intrinsic section exclusively).
+
+**Setup:** v4 file. Metrics query: count all spans grouped by `resource.service.name`.
+
+**Assertions:** correct per-service counts; `stats.BlocksRead == 0`.
+
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic_test.go:TestTraceMetrics_Intrinsic_CountAll_ZeroBlockReads`
+
+---
+
+## Execution Path Tests (execution_path_test.go)
+
+Tests that verify queries route to the correct internal execution path and populate
+`MatchedRow` fields correctly. Added with NOTE-053 (2026-03-29).
+
+### EP-01: TestExecutionPath_RangePredicate_BlockPopulated
+
+**Scenario:** Range predicates on intrinsic columns route to `intrinsic-plain` and
+populate `MatchedRow.Block` (not `IntrinsicFields`).
+
+**Setup:** 5 spans with varying duration/kind/status. Queries: `{ duration > 100ms }` and
+`{ duration > 10ms }`.
+
+**Assertions:** `stats.ExecutionPath == "intrinsic-plain"`, `stats.FetchedBlocks == 0`
+(outer block-scan counter not incremented by intrinsic sub-path),
+`row.Block != nil`, `row.IntrinsicFields == nil` for all result rows.
+
+Back-ref: `internal/modules/executor/execution_path_test.go:TestExecutionPath_RangePredicate_BlockPopulated`
+
+---
+
+### EP-02: TestExecutionPath_EqualityPredicate_BlockPopulated
+
+**Scenario:** Equality predicates on intrinsic columns route to `intrinsic-plain` and
+populate `MatchedRow.Block` (not `IntrinsicFields`).
+
+**Setup:** 5 spans. Queries: `{ status = error }`, `{ kind = server }`,
+`{ resource.service.name = "svc-a" }`, `{ resource.service.name = "svc-b" }`.
+
+**Assertions:** `stats.ExecutionPath == "intrinsic-plain"`, `row.Block != nil`,
+`row.IntrinsicFields == nil` for all result rows.
+
+Back-ref: `internal/modules/executor/execution_path_test.go:TestExecutionPath_EqualityPredicate_BlockPopulated`
+
+---
+
+### EP-03: TestExecutionPath_RangeAndEquality_BlockPopulated
+
+**Scenario:** Combined range+equality predicate routes to `intrinsic-plain` and populates
+`MatchedRow.Block`.
+
+**Setup:** 5 spans. Query: `{ duration > 100ms && status = error }`.
+
+**Assertions:** 1 result (span 3 only); `stats.ExecutionPath == "intrinsic-plain"`;
+`row.Block != nil`, `row.IntrinsicFields == nil`.
+
+Back-ref: `internal/modules/executor/execution_path_test.go:TestExecutionPath_RangeAndEquality_BlockPopulated`
+
+---
+
+### EP-04: TestExecutionPath_UserAttribute_UsesBlockScan
+
+**Scenario:** A user attribute predicate (no intrinsic predicate) bypasses the intrinsic
+fast path and uses the full block-scan path.
+
+**Setup:** 5 spans; span 4 has `span.http.method = "GET"`. Query: `{ span.http.method = "GET" }`.
+
+**Assertions:** 1 result; `stats.ExecutionPath == "block-plain"`;
+`stats.FetchedBlocks > 0` (outer ReadGroup counter incremented).
+
+Back-ref: `internal/modules/executor/execution_path_test.go:TestExecutionPath_UserAttribute_UsesBlockScan`
+
+---
+
+### EP-05: TestExecutionPath_Correctness
+
+**Scenario:** Result count correctness across all query types — regression guard ensuring
+path optimizations do not change observable query results.
+
+**Setup:** 5 spans with varied intrinsic and user attributes. 13 query cases covering
+range, equality, AND, OR combinations.
+
+**Assertions:** each query returns the expected count regardless of execution path.
+
+Back-ref: `internal/modules/executor/execution_path_test.go:TestExecutionPath_Correctness`

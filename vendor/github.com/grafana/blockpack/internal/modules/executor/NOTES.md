@@ -973,6 +973,14 @@ reads all columns — unaffected by this change. Only `QueryTraceQL` filter quer
 **Back-ref:** `internal/modules/executor/stream.go:Collect`,
 `internal/modules/executor/predicates.go:searchMetaColumns`
 
+**Addendum (2026-03-25):** `searchMetaCols` was shrunk as part of the intrinsic-section
+migration (NOTE-050). Trace-signal identity columns (trace:id, span:id, span:start, span:end,
+span:duration, span:name, span:parent_id, resource.service.name, span:status,
+span:status_message, span:kind) were removed from `searchMetaCols` because they are now
+stored exclusively in the intrinsic TOC section and injected directly into `secondPassCols`
+via the `traceIntrinsicColumns` loop (all 11 columns). These columns are absent from block
+payloads; identity values are fetched via `lookupIntrinsicFields`.
+
 ---
 
 ## NOTE-030: RangeNode Tree Replaces Flat QueryPredicates Maps
@@ -1703,3 +1711,191 @@ letting the GC reclaim block bytes before the next group is processed. The local
 variable holds `bwb.RawBytes` alive through the `fn` call (NOTE-001 lazy decode safety).
 
 **Back-refs:** `stream.go:forEachBlockInGroups`
+
+---
+
+## NOTE-049: scanBlocks Intern Map Pool and Clone Elimination
+*Added: 2026-03-25*
+
+**Problem:** `scanBlocks` called `r.ParseBlockFromBytes` twice per matching block (first pass
+for predicate evaluation + second pass to decode result columns). Each call allocated a fresh
+`make(map[string]string)` intern map inside `ParseBlockFromBytes`. With hundreds of blocks
+per query, this produced hundreds of map allocations and corresponding GC pressure.
+
+Additionally, `rows := slices.Clone(rowSet.ToSlice())` allocated a redundant copy of the
+matched-row index slice. The clone comment stated it was needed because "ToSlice returns the
+backing slice and must not be modified", but `rowSet` is never accessed again after line 382
+in `scanBlocks` — no `Contains` calls occur on the `scanBlocks` code path after `ToSlice()`.
+
+**Fix 1 — Intern map pool:** `scanBlocks` now acquires a pooled `map[string]string` from
+`modules_reader.AcquireInternMap()` at the start of each block iteration and passes it to
+`r.ParseBlockFromBytesWithIntern()` for both parse passes. The map is released via
+`modules_reader.ReleaseInternMap()` after `streamSortedRows` completes — this is the correct
+release point because lazy columns registered during the first parse may call `decodeNow()`
+during row emission, and they reference the intern map directly. Releasing before
+`streamSortedRows` would corrupt lazy string decodes.
+
+**Fix 2 — Clone elimination:** Changed `rows := slices.Clone(rowSet.ToSlice())` to
+`rows := rowSet.ToSlice()`. The clone was conservative but unnecessary on this code path.
+`streamSortedRows` sorts `rows` in-place, but since `rowSet` is not used after `ToSlice()`,
+sorting the backing slice directly is safe.
+
+**Lifetime contract for pooled intern maps:**
+1. Acquire: at block-iteration start in `scanBlocks`.
+2. Keep alive: through both `ParseBlockFromBytesWithIntern` calls AND all of `streamSortedRows`
+   (where lazy `decodeNow()` calls may occur).
+3. Release: immediately after `streamSortedRows` returns (or on any early-exit error path).
+
+**Back-refs:** `stream.go:scanBlocks`,
+              `internal/modules/blockio/reader/column.go:AcquireInternMap`,
+              `internal/modules/blockio/reader/reader.go:ParseBlockFromBytesWithIntern`,
+              `internal/modules/blockio/reader/NOTES.md:NOTE-006`
+
+## NOTE-050: Intrinsic Columns — Stored Exclusively in Intrinsic TOC Section
+*Added: 2026-03-25*
+
+*Addendum (2026-03-29): The above entry and the earlier addendum were written before
+dual-storage was restored. Intrinsic columns ARE written to both the intrinsic TOC section
+AND block column payloads (`addPresent` calls retained). Identity columns (trace:id,
+span:id, span:parent_id, span:status_message) are NOT fed to the intrinsic accumulator
+(feedIntrinsic removed per NOTE-005) but addPresent is retained for block column storage.
+See NOTE-052 (dual storage coexistence) for the current invariant.*
+
+**Decision:** Intrinsic columns (trace:id, span:id, span:parent_id, span:name, span:kind,
+span:start, span:duration, span:status, span:status_message, resource.service.name) are
+stored exclusively in the intrinsic TOC section. They are NOT written to block column
+payloads. `ParseBlockFromBytes` returns nil columns for these names; this is handled by
+`nilIntrinsicScan` which produces FullScan results for AND intersection.
+
+**Rationale:**
+- The intrinsic section enables fast pre-filtering (bloom, min/max) and O(1) identity
+  lookup via `lookupIntrinsicFields` without full block decodes.
+- Removing dual-storage eliminates redundant data in block payloads.
+
+**Consequences for executor:**
+- `searchMetaCols` no longer lists trace-signal intrinsic column names because those
+  columns are served via the intrinsic section path (`lookupIntrinsicFields`) rather
+  than through the `wantColumns` second-pass decode. Log-signal identity columns remain
+  in `searchMetaCols` because log blocks use different identity column names.
+- `secondPassCols` injects all `traceIntrinsicColumns` (trace:id, span:id, span:start,
+  etc.) so that `lookupIntrinsicFields` populates `IntrinsicFields` correctly. The
+  names are passed to `ParseBlockFromBytes` as `wantColumns`; they return nil columns
+  since the data is absent from block payloads. Identity values come from `lookupIntrinsicFields`.
+- `SpanMatchFromRow` accepts a `*Reader` parameter and calls `lookupIntrinsicFields`
+  to populate identity fields from the intrinsic section for the block-scan path.
+- `RangeNode.MinInclusive`/`MaxInclusive` fields distinguish `>` vs `>=` and `<` vs `<=`
+  for the flat-column intrinsic scan, ensuring correctness at exact boundaries.
+
+**Back-ref:** `internal/modules/executor/predicates.go:searchMetaCols`,
+`internal/modules/executor/stream_structural.go:collectBlockStructuralSpanRecs`,
+`internal/modules/executor/stream.go:Collect`,
+`internal/modules/executor/executor.go:SpanMatchFromRow`,
+`internal/vm/bytecode.go:RangeNode`,
+`internal/modules/blockio/writer/writer_block.go:newBlockBuilder`
+
+## NOTE-051: Mixed-OR Predicates — False-Negative Limitation for OR(intrinsic, non-intrinsic)
+*Added: 2026-03-25*
+
+**Decision:** The block-scan post-filter (`filterRowSetByIntrinsicNodes` /
+`rowSatisfiesIntrinsicNodesOR`) uses a conservative skip for non-intrinsic leaves in an
+OR context: when a leaf references a non-intrinsic column it returns `false` (no match)
+rather than `true` (pass-through). This can produce false negatives for OR queries such as
+`{span:name="foo" || span.http.url="bar"}` where a row matches only the non-intrinsic branch.
+
+**Rationale:** Returning `true` for non-intrinsic leaves in OR would cause false positives
+because `nilIntrinsicScan` returns `FullScan` for nil intrinsic columns (columns absent from
+block payloads). In an AND context `FullScan` is an identity element (safe); in an OR context
+it would admit every row regardless of the non-intrinsic predicate value, producing incorrect
+results. Fixing this correctly requires a two-pass approach that evaluates non-intrinsic
+columns before composing the OR — a more invasive architectural change that is deferred.
+
+**Consequences:**
+- Queries combining an intrinsic predicate with a non-intrinsic predicate under OR may drop
+  rows that satisfy only the non-intrinsic branch during block-level scanning.
+- Impact is low: OR between intrinsic columns and user-attribute columns is uncommon in
+  practice. Queries with `Limit > 0` are unaffected because they use the intrinsic fast path
+  which does not go through `filterRowSetByIntrinsicNodes`.
+- Full-table scans (no limit, no intrinsic index pruning) are the only affected path.
+
+**Back-ref:** `internal/modules/executor/predicates.go:rowSatisfiesIntrinsicNodesOR`
+
+## NOTE-052: Dual Storage Coexistence — Block Columns and Intrinsic Section
+*Added: 2026-03-26*
+
+**Decision:** After the rollback of PR #172 (see writer NOTE-002), dual storage is in effect:
+intrinsic columns are present in BOTH block column payloads AND the intrinsic TOC section.
+Both fast paths and block-scan paths remain valid and coexist.
+
+**Two access patterns, two storage layers:**
+
+1. **Block column payloads** (via `ParseBlockFromBytes` + `GetColumn`) — used by the block-scan
+   path for predicate evaluation and result materialization. O(1) row access by (blockIdx, rowIdx)
+   once the block is in memory.
+
+2. **Intrinsic TOC section** (via `BlockRefsFromIntrinsicTOC`, `ScanFlatColumnRefsFiltered`,
+   `lookupIntrinsicFields`) — used by the intrinsic fast paths (Cases A–D from
+   `collectFromIntrinsicRefs`) for zero-block-read query execution, TOC-level bloom pruning,
+   and metrics aggregation over intrinsic columns.
+
+**Executor workarounds remain but are now conservative no-ops for block-scan:** The
+`nilIntrinsicScan` (SPEC-STREAM-10.1), `userAttrProgram` (SPEC-STREAM-10.2), and
+`filterRowSetByIntrinsicNodes` (SPEC-STREAM-10.3) mechanisms introduced for the
+exclusive-intrinsic model still compile and run. With dual storage, `Block.GetColumn` returns
+a non-nil column for all intrinsic names, so `nilIntrinsicScan` is never triggered during
+block-scan. These mechanisms add no overhead in the dual-storage regime and provide
+defence-in-depth should a future format version again omit intrinsic columns from block payloads.
+
+**Back-ref:** `internal/modules/executor/stream.go:collectFromIntrinsicRefs`,
+`internal/modules/executor/column_provider.go:nilIntrinsicScan`,
+`internal/modules/executor/predicates.go:userAttrProgram`,
+`internal/modules/blockio/writer/NOTES.md:NOTE-002`
+---
+
+## NOTE-054: lookupIntrinsicFields Uses GetIntrinsicColumn (2026-03-28)
+*Added: 2026-03-28*
+
+**Decision:** `lookupIntrinsicFields` calls `r.GetIntrinsicColumn(colName)` to obtain the
+full decoded intrinsic column, then uses `EnsureRefIndex` + `LookupRefFast` for O(log N)
+reverse lookup per target ref.
+
+*Note: This entry was originally written to describe a `GetIntrinsicColumnForRefs`
+page-skipping optimization. That optimization (MinRef/MaxRef/RefBloom) was added and
+then removed in NOTE-007 (2026-03-29). The current implementation uses `GetIntrinsicColumn`
+(full column decode) with a cached refIndex for O(M log N) total lookup cost.*
+
+**Rationale:** After NOTE-007 removed ref-range page-skipping, and NOTE-053 removed the
+`useIntrinsicLookup` branch from `collectIntrinsicPlain`, `lookupIntrinsicFields` is now
+only called from Case B (TopK/timestamp-sorted) and structural queries. For those call
+sites, full column decode + refIndex is acceptable since M (matched refs) is small.
+
+**span:end synthesis:** `GetIntrinsicColumn("span:end")` is used since span:end is not
+stored in the intrinsic TOC (synthesized from span:start + span:duration at read time).
+
+**Back-ref:** `internal/modules/executor/stream.go:lookupIntrinsicFields`,
+`internal/modules/blockio/shared/NOTES.md:NOTE-007`
+
+## NOTE-053: collectIntrinsicPlain Always Uses Block Reads (2026-03-29)
+*Added: 2026-03-29*
+
+**Decision:** Removed the `useIntrinsicLookup` branch from `collectIntrinsicPlain`. Range
+predicates (duration>X, svc=~".*") now use `forEachBlockInGroups` for field population,
+the same path as equality predicates. The `useIntrinsicLookup bool` parameter is removed.
+`hasRangePredicate` is removed (no remaining callers).
+
+**Rationale:** The `useIntrinsicLookup` branch called `lookupIntrinsicFields` which scanned
+all N entries in all intrinsic columns to find the M result refs. For a 3.3M-span file with
+7 remaining intrinsic columns, this is O(3.3M × 7) = O(23M) operations even for a 10-result
+query. `forEachBlockInGroups` groups refs by block and reads only the blocks containing
+matched spans — O(M × block_read_cost). For M=10 results across a few blocks, this is
+O(500K) bytes read vs O(286MB) of intrinsic scans: a 500x improvement.
+
+**Impact on execution paths:** Case A results now always populate `MatchedRow.Block` (not
+`IntrinsicFields`). `lookupIntrinsicFields` is retained — it is still used by Case B
+(`collectIntrinsicTopK`) for timestamp-sorted top-K queries where ordering requires the
+intrinsic timestamp column, and by `stream_structural.go` for identity field resolution.
+
+**Test changes:** `execution_path_test.go` EP-01 renamed to `TestExecutionPath_RangePredicate_BlockPopulated`
+and EP-03 renamed to `TestExecutionPath_RangeAndEquality_BlockPopulated`. Assertions updated from
+IntrinsicFields→populated/Block→nil to Block→populated/IntrinsicFields→nil.
+
+**Back-ref:** `executor/stream.go:collectIntrinsicPlain`

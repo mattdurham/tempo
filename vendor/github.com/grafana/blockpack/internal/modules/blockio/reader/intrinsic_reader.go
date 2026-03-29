@@ -10,6 +10,15 @@ import (
 	"github.com/grafana/blockpack/internal/modules/rw"
 )
 
+// EnsureIntrinsicTOC lazily loads the intrinsic column TOC if it has not been loaded yet.
+// Called by GetTraceByID when a lean reader needs intrinsic data on demand.
+func (r *Reader) EnsureIntrinsicTOC() error {
+	if r.intrinsicIndex != nil || r.intrinsicIndexLen == 0 {
+		return nil // already loaded or no intrinsic section
+	}
+	return r.parseIntrinsicTOC()
+}
+
 // parseIntrinsicTOC reads and parses the intrinsic column TOC from the v4 footer.
 // Called during NewReaderFromProvider. For v3 footer files or files with no intrinsic
 // section, this is a no-op.
@@ -182,6 +191,56 @@ func (r *Reader) GetIntrinsicColumn(name string) (*shared.IntrinsicColumn, error
 	return col, nil
 }
 
+// GetIntrinsicColumnForRefs returns a partial IntrinsicColumn containing only pages that
+// cover at least one of the target refs. This is the page-skipping optimized path for
+// reverse lookups: instead of decoding the entire column (O(N_file) rows), it decodes
+// only pages whose ref-range index (MinRef/MaxRef/RefBloom) matches a target ref.
+//
+// refs is a slice of BlockRef identifying the target rows. Returns (nil, nil) when:
+//   - refs is nil or empty (no rows needed)
+//   - the file has no intrinsic section
+//   - the named column is not in the TOC
+//
+// The returned column may contain rows from pages adjacent to the matched pages (bloom
+// false positives). Callers must still verify ref membership when consuming results.
+//
+// Results are NOT cached (they are query-scoped partial columns). The blob cache IS used
+// for the raw column data to avoid redundant I/O.
+func (r *Reader) GetIntrinsicColumnForRefs(name string, refs []shared.BlockRef) (*shared.IntrinsicColumn, error) {
+	if len(refs) == 0 {
+		return nil, nil
+	}
+	if r.intrinsicIndex == nil {
+		return nil, nil
+	}
+	if _, ok := r.intrinsicIndex[name]; !ok {
+		return nil, nil
+	}
+
+	blob, err := r.GetIntrinsicColumnBlob(name)
+	if err != nil {
+		return nil, fmt.Errorf("GetIntrinsicColumnForRefs %q: %w", name, err)
+	}
+	if blob == nil {
+		return nil, nil
+	}
+
+	// Build the ref filter map from the provided refs.
+	refFilter := make(map[uint32]struct{}, len(refs))
+	for _, ref := range refs {
+		refFilter[uint32(ref.BlockIdx)<<16|uint32(ref.RowIdx)] = struct{}{}
+	}
+
+	col, err := shared.DecodePagedColumnBlobFiltered(blob, refFilter)
+	if err != nil {
+		return nil, fmt.Errorf("GetIntrinsicColumnForRefs %q: decode: %w", name, err)
+	}
+	if col != nil {
+		col.Name = name
+	}
+	return col, nil
+}
+
 // synthesizeSpanEnd builds a span:end intrinsic column from span:start + span:duration.
 // The result is cached like any other intrinsic column.
 func (r *Reader) synthesizeSpanEnd() (*shared.IntrinsicColumn, error) {
@@ -237,4 +296,84 @@ func (r *Reader) synthesizeSpanEnd() (*shared.IntrinsicColumn, error) {
 	}
 	r.intrinsicDecoded["span:end"] = col
 	return col, nil
+}
+
+// IntrinsicBytesAt returns the bytes value for an intrinsic flat column at (blockIdx, rowIdx).
+// Returns (nil, false) when the column is absent or the ref is not found.
+//
+// WARNING: O(total entries for this column) linear scan. Do NOT call in per-row loops.
+// For batch access, use buildIntrinsicBlockIndex (writer package) or lookupIntrinsicFields
+// (executor package) which build a hash index once per block.
+func (r *Reader) IntrinsicBytesAt(name string, blockIdx, rowIdx int) ([]byte, bool) {
+	col, err := r.GetIntrinsicColumn(name)
+	if err != nil || col == nil {
+		return nil, false
+	}
+	for i, ref := range col.BlockRefs {
+		if int(ref.BlockIdx) == blockIdx && int(ref.RowIdx) == rowIdx && i < len(col.BytesValues) {
+			return col.BytesValues[i], true
+		}
+	}
+	return nil, false
+}
+
+// IntrinsicUint64At returns the uint64 value for an intrinsic flat column at (blockIdx, rowIdx).
+// Returns (0, false) when the column is absent or the ref is not found.
+//
+// WARNING: O(total entries for this column) linear scan. Do NOT call in per-row loops.
+// For batch access, use buildIntrinsicBlockIndex (writer package) or lookupIntrinsicFields
+// (executor package) which build a hash index once per block.
+func (r *Reader) IntrinsicUint64At(name string, blockIdx, rowIdx int) (uint64, bool) {
+	col, err := r.GetIntrinsicColumn(name)
+	if err != nil || col == nil {
+		return 0, false
+	}
+	for i, ref := range col.BlockRefs {
+		if int(ref.BlockIdx) == blockIdx && int(ref.RowIdx) == rowIdx && i < len(col.Uint64Values) {
+			return col.Uint64Values[i], true
+		}
+	}
+	return 0, false
+}
+
+// IntrinsicDictStringAt returns the string value for an intrinsic dict column at (blockIdx, rowIdx).
+// Returns ("", false) when the column is absent or the ref is not found.
+//
+// WARNING: O(total entries for this column) linear scan. Do NOT call in per-row loops.
+// For batch access, use buildIntrinsicBlockIndex (writer package) or lookupIntrinsicFields
+// (executor package) which build a hash index once per block.
+func (r *Reader) IntrinsicDictStringAt(name string, blockIdx, rowIdx int) (string, bool) {
+	col, err := r.GetIntrinsicColumn(name)
+	if err != nil || col == nil {
+		return "", false
+	}
+	for _, entry := range col.DictEntries {
+		for _, ref := range entry.BlockRefs {
+			if int(ref.BlockIdx) == blockIdx && int(ref.RowIdx) == rowIdx {
+				return entry.Value, true
+			}
+		}
+	}
+	return "", false
+}
+
+// IntrinsicDictInt64At returns the int64 value for an intrinsic dict column at (blockIdx, rowIdx).
+// Returns (0, false) when the column is absent or the ref is not found.
+//
+// WARNING: O(total entries for this column) linear scan. Do NOT call in per-row loops.
+// For batch access, use buildIntrinsicBlockIndex (writer package) or lookupIntrinsicFields
+// (executor package) which build a hash index once per block.
+func (r *Reader) IntrinsicDictInt64At(name string, blockIdx, rowIdx int) (int64, bool) {
+	col, err := r.GetIntrinsicColumn(name)
+	if err != nil || col == nil {
+		return 0, false
+	}
+	for _, entry := range col.DictEntries {
+		for _, ref := range entry.BlockRefs {
+			if int(ref.BlockIdx) == blockIdx && int(ref.RowIdx) == rowIdx {
+				return entry.Int64Val, true
+			}
+		}
+	}
+	return 0, false
 }

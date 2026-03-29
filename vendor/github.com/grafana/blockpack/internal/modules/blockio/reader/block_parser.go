@@ -250,7 +250,7 @@ func parseBlockColumnsReuse(
 				Type:        m.colType,
 				SpanCount:   spanCount,
 				rawEncoding: rawBytes[start:end],
-				internMap:   intern,
+				internMap:   nil, // nil → internString skips map; safe for concurrent lazy decode
 			})
 			// Safe: cap was set to len(metas) and we append ≤ len(metas) items, so no realloc.
 			columns[key] = &lazyStore[len(lazyStore)-1]

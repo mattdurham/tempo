@@ -5,13 +5,13 @@ package writer
 import "strings"
 
 // isIDColumn returns true for column names that should use XOR encoding.
-// Checks suffixes: ".id", "_id", "-id" and exact names "span:id", "span:parent_id".
+// Checks suffixes: ".id", "_id", "-id" and exact names spanIDColumnName, spanParentIDColumnName.
 // Explicit exclusion: "trace:id" returns false (uses DeltaDictionary).
 func isIDColumn(name string) bool {
 	if name == traceIDColumnName {
 		return false
 	}
-	if name == "span:id" || name == "span:parent_id" {
+	if name == spanIDColumnName || name == spanParentIDColumnName {
 		return true
 	}
 	return strings.HasSuffix(name, ".id") ||

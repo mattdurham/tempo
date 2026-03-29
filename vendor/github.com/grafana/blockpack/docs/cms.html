@@ -50,7 +50,7 @@
 </thead>
 <tbody>
 <tr><td><a href="https://github.com/grafana/blockpack/blob/main/internal/modules/sketch/cms.go"><code>internal/modules/sketch/cms.go</code></a></td><td>CMS implementation</td></tr>
-<tr><td><a href="https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/writer/sketch<em>index.go"><code>internal/modules/blockio/writer/sketch&lt;/em&gt;index.go</code></a></td><td>Where CMS is built per block</td></tr>
+<tr><td><a href="https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/writer/sketch_index.go"><code>internal/modules/blockio/writer/sketch_index.go</code></a></td><td>Where CMS is built per block</td></tr>
 <tr><td><a href="https://github.com/grafana/blockpack/blob/main/internal/modules/queryplanner/scoring.go"><code>internal/modules/queryplanner/scoring.go</code></a></td><td><code>pruneByCMSAll</code>, <code>pruneByCMSPred</code></td></tr>
 </tbody>
 </table>
@@ -76,7 +76,7 @@
 <ol>
 <li>Compute <code>h</code> as above.</li>
 <li>For each row <code>i</code>, read <code>rows[i][col]</code>.</li>
-<li>Return <code>min(rows[0][col&lt;em&gt;0], ..., rows[depth-1][col&lt;/em&gt;{depth-1}])</code>.</li>
+<li>Return <code>min(rows[0][col_0], ..., rows[depth-1][col_{depth-1}])</code>.</li>
 </ol>
 <p>The minimum across rows gives the tightest upper bound, since any individual row may have been inflated by hash collisions with other values. The minimum is less likely to be inflated by multiple independent hash functions all colliding on the same bucket.</p>
 <p><strong>Why saturating counters?</strong> A span block contains at most 2 000 spans. With <code>uint16</code> (max 65 535) and the 1-per-occurrence Add calls, saturation is essentially impossible for a single block.</p>
