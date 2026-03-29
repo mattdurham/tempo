@@ -731,11 +731,14 @@ func forEachBlockInGroups(
 }
 
 // collectIntrinsicPlain handles Case A: pure intrinsic + no sort.
-// All results use forEachBlockInGroups to populate MatchedRow.Block.
-// This is correct for both equality predicates (status=error, kind=server) and
-// range predicates (duration>100ms, svc=~".*"). Block reads are O(M) where M is
-// the result count — far cheaper than the previous O(N) intrinsic column scan
-// for range predicates across 3.3M entries × 7 columns per file.
+//
+// When the file has an intrinsic section (HasIntrinsicSection), field values are resolved
+// from the objectcache-backed intrinsic columns via lookupIntrinsicFields — zero S3 I/O
+// after warmup. This is critical for files with many internal blocks (300+) where block
+// reads would require one S3 round trip per block group.
+//
+// Falls back to forEachBlockInGroups (block reads) only when the intrinsic section is
+// absent (legacy files without intrinsic columns).
 func collectIntrinsicPlain(
 	r *modules_reader.Reader,
 	refs []modules_shared.BlockRef,
@@ -760,22 +763,17 @@ func collectIntrinsicPlain(
 		refs = refs[:opts.Limit]
 	}
 
-	// Read only the specific internal blocks containing the matched refs.
-	blockOrder, blockCandidates := groupRefsByBlock(refs)
-	var results []MatchedRow
-	err := forEachBlockInGroups(r, blockOrder, blockCandidates, wantColumns, secondPassCols, "collectIntrinsicPlain",
-		func(pb parsedBlock, candidateRows []int) error {
-			for _, rowIdx := range candidateRows {
-				results = append(results, MatchedRow{
-					Block:    pb.Block,
-					BlockIdx: pb.BlockIdx,
-					RowIdx:   rowIdx,
-				})
-			}
-			return nil
+	// Resolve fields from objectcache-backed intrinsic columns — zero S3 I/O after
+	// warmup. lookupIntrinsicFields uses EnsureRefIndex for O(M log N) binary search
+	// per ref, cached on the column object via sync.Once.
+	fieldMaps := lookupIntrinsicFields(r, refs, secondPassCols)
+	results := make([]MatchedRow, 0, len(refs))
+	for i, ref := range refs {
+		results = append(results, MatchedRow{
+			IntrinsicFields: &intrinsicFieldsProvider{fields: fieldMaps[i]},
+			BlockIdx:        int(ref.BlockIdx),
+			RowIdx:          int(ref.RowIdx),
 		})
-	if err != nil {
-		return nil, err
 	}
 	return results, nil
 }
