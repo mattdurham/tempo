@@ -78,12 +78,6 @@ const (
 	IntrinsicPageBloomK           = 7  // number of hash functions (Kirsch-Mitzenmacher)
 	IntrinsicPageBloomBitsPerItem = 10 // bits per unique value in the bloom filter
 	IntrinsicPageBloomMinBytes    = 16 // minimum bloom filter size in bytes
-
-	// IntrinsicPageTOCVersion2 is the page TOC wire format version that adds per-page
-	// MinRef/MaxRef/RefBloom fields to PageMeta.
-	// Version 0x01 (current) carries no ref-range index; version 0x02 (legacy) does.
-	// New files write 0x01; old 0x02 files are still decoded (ref-range bytes are discarded).
-	IntrinsicPageTOCVersion2 uint8 = 0x02
 )
 
 // MaxIntrinsicRows is the safety cap on accumulated rows. If total rows across all

@@ -113,18 +113,23 @@ Back-ref: `internal/modules/blockio/shared/types.go:PageMeta`,
 `PageMeta`. Removed `IntrinsicRefBloomBytes` (256) and `IntrinsicRefBloomK` (3) constants.
 Removed `matchesRefFilter`, `refFilterRange`, `uint32ToLE` from `intrinsic_ref_filter.go`
 (functions were only used for page-skipping which is now removed). `EncodePageTOC` now
-writes version 0x01 (no ref-range fields). `DecodePageTOC` reads and discards the ref-range
-bytes in v0x02 files for backward compatibility.
+writes version 0x01 (no ref-range fields). `DecodePageTOC` only accepts version 0x01;
+v0x02 is no longer supported and returns an error.
 
 **Rationale:** RefBloom was designed to skip pages during reverse-lookup (`lookupIntrinsicFields`).
 After the companion change that switches field population entirely to `forEachBlockInGroups`
 (block reads), there are no remaining calls to `lookupIntrinsicFields` from the Case A
 (plain) path. The ref-bloom provided zero pruning benefit at 10K entries/page with 256 bytes
 (FPR ≈ 100% when full). Removal saves 256 bytes/page of storage and eliminates the bloom
-maintenance cost at write time.
+maintenance cost at write time. `IntrinsicPageTOCVersion2` constant has also been removed
+from `shared/constants.go` — no code references v0x02 any longer.
 
-**Backward compat:** v0x02 files decode correctly — the ref-range bytes are read and
-discarded. New files write v0x01 (no ref-range fields).
+**Backward compat:** v0x02 files are not decoded. All production files write v0x01. If a
+v0x02 blob is encountered, `DecodePageTOC` returns a `"unknown version 2"` error (same as
+any other unrecognised version).
+
+*Addendum (2026-03-29):* Removed the read-and-discard v0x02 backward-compatibility branch
+from `DecodePageTOC`. Removed `IntrinsicPageTOCVersion2` constant from `constants.go`.
 
 Back-ref: `shared/constants.go`, `shared/types.go`, `shared/intrinsic_codec.go`,
 `writer/intrinsic_accum.go`

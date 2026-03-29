@@ -55,3 +55,18 @@ var SearchMetaCols = searchMetaCols
 
 // TraceIntrinsicColumns exposes traceIntrinsicColumns for invariant tests.
 var TraceIntrinsicColumns = traceIntrinsicColumns
+
+// ComputeOverFetchForTest exposes the overFetch calculation used in
+// BlockRefsFromIntrinsicTOC so that predicates_test.go can verify the cap logic.
+// nodeCount is the number of top-level predicate nodes (AND conditions).
+// totalLeaves is the sum of all leaf nodes across all top-level nodes.
+// limit is the query result limit.
+func ComputeOverFetchForTest(nodeCount, totalLeaves, limit int) int {
+	if limit <= 0 {
+		return 0
+	}
+	if nodeCount == 1 {
+		return limit * totalLeaves
+	}
+	return min(limit*10000, 500_000)
+}
