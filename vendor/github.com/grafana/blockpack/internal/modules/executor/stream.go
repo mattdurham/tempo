@@ -221,18 +221,7 @@ func Collect(
 	if hasSomeIntrinsicPredicates(program) && (opts.Limit > 0 || ProgramIsIntrinsicOnly(program)) {
 		var fastStats CollectStats
 		fastStats.TotalBlocks = r.BlockCount() // populate for OnStats callers (NOTE-050)
-
-		// SPEC-INTRINSIC-004: check file-level bloom before any intrinsic scan.
-		// Must populate fastStats and call OnStats before returning (SPEC-STREAM-6).
-		if program.Predicates != nil && fileLevelBloomReject(r, program.Predicates.Nodes) {
-			fastStats.ExecutionPath = "bloom-rejected"
-			if opts.OnStats != nil {
-				opts.OnStats(fastStats)
-			}
-			return nil, nil
-		}
-		rows, err := collectFromIntrinsicRefs(r, program, opts, wantColumns, secondPassCols,
-			&fastStats)
+		rows, err := collectWithBloomCheck(r, program, opts, wantColumns, secondPassCols, &fastStats)
 		if err != errNeedBlockScan {
 			// Fast path produced a definitive result (rows, empty result, or error).
 			// Call OnStats synchronously before returning. SPEC-STREAM-6 extended.
@@ -563,6 +552,24 @@ func countUniqueBlockIdxs(refs []modules_shared.BlockRef) int {
 // Returns (nil, errNeedBlockScan) when no intrinsic constraint is available (fall through
 // to full block scan). Returns (nil, nil) for valid empty-result cases.
 //
+// collectWithBloomCheck runs the intrinsic fast path with a FileBloom pre-check.
+// SPEC-INTRINSIC-004: reject the file in O(1) if bloom says no span matches.
+// SPEC-STREAM-6: always call OnStats before returning.
+func collectWithBloomCheck(
+	r *modules_reader.Reader,
+	program *vm.Program,
+	opts CollectOptions,
+	wantColumns map[string]struct{},
+	secondPassCols map[string]struct{},
+	stats *CollectStats,
+) ([]MatchedRow, error) {
+	if program.Predicates != nil && fileLevelBloomReject(r, program.Predicates.Nodes) {
+		stats.ExecutionPath = "bloom-rejected"
+		return nil, nil
+	}
+	return collectFromIntrinsicRefs(r, program, opts, wantColumns, secondPassCols, stats)
+}
+
 // NOTE-038: The partial-AND pre-filter for mixed queries is a superset; ColumnPredicate
 // re-evaluation in Cases C/D provides correctness. Global top-K is preserved for Case D
 // because the pre-filter never excludes true matches (it is a superset, never a subset).
