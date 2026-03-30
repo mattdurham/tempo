@@ -540,8 +540,8 @@ func countUniqueBlockIdxs(refs []modules_shared.BlockRef) int {
 // collectFromIntrinsicRefs is the unified intrinsic pre-filter fast path.
 // It dispatches based on (ProgramIsIntrinsicOnly × opts.TimestampColumn != ""):
 //
-//	Case A: pure intrinsic + no sort  → BlockRefsFromIntrinsicTOC → fetch candidate
-//	        blocks → return MatchedRows (minimal block reads)
+//	Case A: pure intrinsic + no sort  → BlockRefsFromIntrinsicTOC → lookupIntrinsicFields
+//	        → return IntrinsicFields MatchedRows (ZERO block reads; fields from objectcache)
 //	Case B: pure intrinsic + sort     → BlockRefsFromIntrinsicTOC → pack into sorted
 //	        keys → ScanFlatColumnRefsFiltered → return IntrinsicFields MatchedRows
 //	        (ZERO block reads)
