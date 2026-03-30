@@ -63,14 +63,16 @@ type Reader struct {
 	// Populated lazily by GetIntrinsicColumn.
 	intrinsicDecoded map[string]*shared.IntrinsicColumn
 
-	// metaPin holds a strong reference to the *parsedMetadata retrieved from the process-level
-	// cache, keeping its weak.Pointer entry valid for the lifetime of this Reader.
-	// Without this pin, *parsedMetadata is GC-eligible immediately after field copying,
-	// causing cache misses for concurrent/subsequent readers of the same file.
+	// intrinsicNames is the sorted slice of intrinsic column names, computed once
+	// (lazily on first IntrinsicColumnNames call) and reused. Callers only iterate.
+	intrinsicNames []string
+
+	// metaPin holds a reference to the *parsedMetadata retrieved from the process-level
+	// cache, ensuring the pointer remains valid for the lifetime of this Reader.
 	metaPin *parsedMetadata
 
-	// tocPin holds a strong reference to the *intrinsicTOC retrieved from the process-level
-	// cache, keeping its weak.Pointer entry valid for the lifetime of this Reader.
+	// tocPin holds a reference to the *intrinsicTOC retrieved from the process-level
+	// cache, ensuring the pointer remains valid for the lifetime of this Reader.
 	tocPin *intrinsicTOC
 
 	// fileBloomParsed is the lazily parsed FileBloom section. Access via FileBloom().

@@ -62,11 +62,5 @@ var TraceIntrinsicColumns = traceIntrinsicColumns
 // totalLeaves is the sum of all leaf nodes across all top-level nodes.
 // limit is the query result limit.
 func ComputeOverFetchForTest(nodeCount, totalLeaves, limit int) int {
-	if limit <= 0 {
-		return 0
-	}
-	if nodeCount == 1 {
-		return limit * totalLeaves
-	}
-	return min(min(limit, 50)*10000, 500_000)
+	return computeOverFetch(limit, nodeCount, totalLeaves)
 }

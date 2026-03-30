@@ -22,8 +22,8 @@ func (r *Reader) EnsureIntrinsicTOC() error {
 // parseIntrinsicTOC reads and parses the intrinsic column TOC from the v4 footer.
 // Called during NewReaderFromProvider. For v3 footer files or files with no intrinsic
 // section, this is a no-op.
-// NOTE-003: the parsed TOC map is cached in parsedIntrinsicTOCCache (GC-cooperative)
-// to avoid re-decoding the blob on every NewReaderFromProvider call.
+// NOTE-003: the parsed TOC map is cached in parsedIntrinsicTOCCache (strong references,
+// entries persist until Clear) to avoid re-decoding the blob on every NewReaderFromProvider call.
 func (r *Reader) parseIntrinsicTOC() error {
 	if r.footerVersion != shared.FooterV4Version || r.intrinsicIndexLen == 0 {
 		return nil
@@ -86,15 +86,20 @@ func (r *Reader) IntrinsicColumnMeta(name string) (shared.IntrinsicColMeta, bool
 
 // IntrinsicColumnNames returns the names of all intrinsic columns in the TOC,
 // sorted alphabetically. Returns nil if no intrinsic section is present.
+// The returned slice is owned by the Reader; callers must not modify it.
 func (r *Reader) IntrinsicColumnNames() []string {
 	if len(r.intrinsicIndex) == 0 {
 		return nil
+	}
+	if r.intrinsicNames != nil {
+		return r.intrinsicNames
 	}
 	names := make([]string, 0, len(r.intrinsicIndex))
 	for n := range r.intrinsicIndex {
 		names = append(names, n)
 	}
 	slices.Sort(names)
+	r.intrinsicNames = names
 	return names
 }
 
@@ -152,8 +157,8 @@ func (r *Reader) GetIntrinsicColumn(name string) (*shared.IntrinsicColumn, error
 	// once written; refIndex is a derived, concurrency-safe cache built under sync.Once, so
 	// EnsureRefIndex mutations do not break the immutability assumption for value fields.
 	// Guard: only use process-level cache when fileID is non-empty to prevent cross-file collisions.
-	// NOTE-003: process-level cache uses objectcache.Cache (GC-cooperative weak pointers)
-	// instead of sync.Map with strong refs to allow GC to reclaim decoded columns.
+	// NOTE-003: process-level cache uses objectcache.Cache (strong references, entries
+	// persist until Clear) for decoded IntrinsicColumn values.
 	useProcessCache := r.fileID != ""
 	if useProcessCache {
 		procKey := r.fileID + "/intrinsic/" + name
@@ -190,56 +195,6 @@ func (r *Reader) GetIntrinsicColumn(name string) (*shared.IntrinsicColumn, error
 		r.intrinsicDecoded = make(map[string]*shared.IntrinsicColumn)
 	}
 	r.intrinsicDecoded[name] = col
-	return col, nil
-}
-
-// GetIntrinsicColumnForRefs returns a partial IntrinsicColumn containing only pages that
-// cover at least one of the target refs. This is the page-skipping optimized path for
-// reverse lookups: instead of decoding the entire column (O(N_file) rows), it decodes
-// only pages whose ref-range index (MinRef/MaxRef/RefBloom) matches a target ref.
-//
-// refs is a slice of BlockRef identifying the target rows. Returns (nil, nil) when:
-//   - refs is nil or empty (no rows needed)
-//   - the file has no intrinsic section
-//   - the named column is not in the TOC
-//
-// The returned column may contain rows from pages adjacent to the matched pages (bloom
-// false positives). Callers must still verify ref membership when consuming results.
-//
-// Results are NOT cached (they are query-scoped partial columns). The blob cache IS used
-// for the raw column data to avoid redundant I/O.
-func (r *Reader) GetIntrinsicColumnForRefs(name string, refs []shared.BlockRef) (*shared.IntrinsicColumn, error) {
-	if len(refs) == 0 {
-		return nil, nil
-	}
-	if r.intrinsicIndex == nil {
-		return nil, nil
-	}
-	if _, ok := r.intrinsicIndex[name]; !ok {
-		return nil, nil
-	}
-
-	blob, err := r.GetIntrinsicColumnBlob(name)
-	if err != nil {
-		return nil, fmt.Errorf("GetIntrinsicColumnForRefs %q: %w", name, err)
-	}
-	if blob == nil {
-		return nil, nil
-	}
-
-	// Build the ref filter map from the provided refs.
-	refFilter := make(map[uint32]struct{}, len(refs))
-	for _, ref := range refs {
-		refFilter[uint32(ref.BlockIdx)<<16|uint32(ref.RowIdx)] = struct{}{}
-	}
-
-	col, err := shared.DecodePagedColumnBlobFiltered(blob, refFilter)
-	if err != nil {
-		return nil, fmt.Errorf("GetIntrinsicColumnForRefs %q: decode: %w", name, err)
-	}
-	if col != nil {
-		col.Name = name
-	}
 	return col, nil
 }
 
