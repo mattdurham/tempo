@@ -14,24 +14,24 @@ import (
 )
 
 // parsedSketchCache caches fully parsed sketchIndex objects by fileID+"/sketch".
-// GC-cooperative: entries are reclaimed when no Reader holds a strong reference.
+// Strong references: entries persist until Clear is called.
 // SPEC-OC-003, NOTE-003 (reader NOTES.md)
 var parsedSketchCache objectcache.Cache[sketchIndex]
 
 // parsedSketchSummaryCache caches the fully built FileSketchSummary by fileID+"/sketch-summary".
 // FileSketchSummary is expensive to build (CMS merge, TopK aggregation across all blocks) and
 // was previously rebuilt on every query because it was only cached per-Reader (short-lived).
-// GC-cooperative via weak.Pointer — the GC may reclaim when no Reader holds a strong reference.
+// Strong references: entries persist until Clear is called.
 // SPEC-OC-003, NOTE-003 (reader NOTES.md)
 var parsedSketchSummaryCache objectcache.Cache[FileSketchSummary]
 
 // parsedIntrinsicCache caches fully decoded IntrinsicColumn objects by
-// fileID+"/intrinsic/"+colName. GC-cooperative via weak.Pointer.
+// fileID+"/intrinsic/"+colName. Strong references: entries persist until Clear is called.
 // SPEC-OC-003, NOTE-003 (reader NOTES.md)
 var parsedIntrinsicCache objectcache.Cache[shared.IntrinsicColumn]
 
 // parsedMetadataCache caches the fully parsed metadata result by fileID.
-// GC-cooperative: allows the GC to reclaim ~45 MB metadata when no Reader is open.
+// Strong references: entries persist until Clear is called.
 // SPEC-OC-003, NOTE-003 (reader NOTES.md)
 var parsedMetadataCache objectcache.Cache[parsedMetadata]
 
@@ -41,8 +41,7 @@ var parsedMetadataCache objectcache.Cache[parsedMetadata]
 var parsedIntrinsicTOCCache objectcache.Cache[intrinsicTOC]
 
 // intrinsicTOC wraps the intrinsic column TOC map to give it stable pointer identity
-// for objectcache.Cache. Maps can be addressed with weak.Make by taking &m, but that
-// yields *map[K]V from the cache (less ergonomic than a named struct with a map field).
+// for objectcache.Cache. A named struct is more ergonomic than *map[K]V from the cache.
 type intrinsicTOC struct {
 	entries map[string]shared.IntrinsicColMeta
 }

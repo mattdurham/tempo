@@ -4,12 +4,10 @@ package executor
 
 import (
 	"encoding/binary"
-	"log/slog"
 	"math"
 	"math/bits"
 	"regexp"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1863,6 +1861,26 @@ func evalNodeBlockRefsPartialAND(
 	return intersectBlockRefSets(evaluableSets, overFetch), true
 }
 
+// computeOverFetch returns the overFetch multiplier for intrinsic-only ref collection.
+//
+// overFetch caps the number of refs collected per top-level AND condition so that
+// intersection across conditions has enough candidates to find real matches.
+//
+// For single-condition queries (nodeCount == 1), limit*totalLeaves is sufficient.
+// For multi-condition AND queries, independent predicates have low joint selectivity;
+// a larger overFetch (capped at 500K) avoids degenerate near-empty intersections.
+// limit*10000 capped at 500K balances recall against memory (at limit=20 this is
+// 200K refs per condition, giving joint selectivity >= 0.01%).
+func computeOverFetch(limit, nodeCount, totalLeaves int) int {
+	if limit <= 0 {
+		return 0
+	}
+	if nodeCount == 1 {
+		return limit * totalLeaves
+	}
+	return min(min(limit, 50)*10000, 500_000) // multi-condition AND: cap to prevent int overflow
+}
+
 // BlockRefsFromIntrinsicTOC returns up to limit matching BlockRefs for an intrinsic-only
 // query, reading only the intrinsic column section (no full block I/O).
 //
@@ -1897,26 +1915,7 @@ func BlockRefsFromIntrinsicTOC(r *modules_reader.Reader, program *vm.Program, li
 	if totalLeaves == 0 {
 		return nil
 	}
-
-	// overFetch caps the number of refs collected per top-level AND condition.
-	//
-	// For single-condition queries (1 top node), limit*leaves is sufficient.
-	//
-	// For multi-condition AND queries (multiple top nodes), independent predicates
-	// have low joint selectivity. With overFetch=limit*leaves (~60), intersection
-	// of small independent sets yields ~0 matches, forcing all files to be scanned.
-	// Use a larger overFetch so each condition returns enough refs for the intersection
-	// to find real matches, enabling early-exit across files.
-	// limit*10000 capped at 500K balances recall against memory: at limit=20 this is
-	// 200K refs per condition (~4.8MB), giving joint selectivity ≥ 20/200000 = 0.01%.
-	overFetch := 0
-	if limit > 0 {
-		if len(program.Predicates.Nodes) == 1 {
-			overFetch = limit * totalLeaves
-		} else {
-			overFetch = min(min(limit, 50)*10000, 500_000) // multi-condition AND: cap limit to prevent int overflow
-		}
-	}
+	overFetch := computeOverFetch(limit, len(program.Predicates.Nodes), totalLeaves)
 
 	// Evaluate each top-level node and intersect (top-level = AND-combined).
 	var topSets [][]modules_shared.BlockRef
@@ -1963,14 +1962,7 @@ func blockRefsFromIntrinsicPartial(r *modules_reader.Reader, program *vm.Program
 	if totalLeaves == 0 {
 		return nil
 	}
-	overFetch := 0
-	if limit > 0 {
-		if len(program.Predicates.Nodes) == 1 {
-			overFetch = limit * totalLeaves
-		} else {
-			overFetch = min(min(limit, 50)*10000, 500_000) // multi-condition AND: cap limit to prevent int overflow
-		}
-	}
+	overFetch := computeOverFetch(limit, len(program.Predicates.Nodes), totalLeaves)
 
 	// Evaluate each top-level node with partial-AND semantics.
 	// Unevaluable top-level nodes are skipped (not failures).
@@ -1992,152 +1984,100 @@ func blockRefsFromIntrinsicPartial(r *modules_reader.Reader, program *vm.Program
 // scanIntrinsicLeafRefs loads the raw column blob and scans it directly for matching refs,
 // avoiding full struct materialization. Falls back to the full-decode path if raw scanning
 // is not applicable (e.g., bytes flat columns, regex patterns).
-// scanIntrinsicLeafRefs returns the BlockRefs matching the leaf predicate using
-// the objectcache-backed decoded column (GetIntrinsicColumn). On warm queries the
-// decoded column lives in process memory — no disk I/O. On cold queries the blob is
-// read once from filecache, decoded, and stored in objectcache for all future calls.
-//
-// Falls back to blob-based scanning (GetIntrinsicColumnBlob) only when the column
-// is absent from objectcache and GetIntrinsicColumn returns an error.
 func scanIntrinsicLeafRefs(
 	r *modules_reader.Reader,
 	colName string,
 	leaf vm.RangeNode,
 	maxRefs int,
 ) []modules_shared.BlockRef {
-	if _, ok := r.IntrinsicColumnMeta(colName); !ok {
+	meta, ok := r.IntrinsicColumnMeta(colName)
+	if !ok {
 		return nil
 	}
 
-	// Prefer GetIntrinsicColumn: populates objectcache on first call, returns
-	// in-memory decoded column on subsequent calls — zero disk I/O when warm.
-	col, err := r.GetIntrinsicColumn(colName)
-	if err != nil {
-		// SPEC-ROOT-010: propagate decode errors — silent fallback caused 50x perf regression.
-		slog.Error("scanIntrinsicLeafRefs: GetIntrinsicColumn failed — query will use slow fallback",
-			"column", colName, "err", err)
-		return nil
-	}
-	if col == nil {
+	blob, err := r.GetIntrinsicColumnBlob(colName)
+	if err != nil || blob == nil {
 		return nil
 	}
 
-	if col.Format == modules_shared.IntrinsicFormatDict {
-		return scanDecodedDictRefs(col, leaf, maxRefs)
+	if meta.Format == modules_shared.IntrinsicFormatDict {
+		if len(leaf.Values) == 0 && leaf.Pattern == "" {
+			return nil // range predicate on dict — not supported in raw scan
+		}
+		// Regex predicate: compile pattern and scan dict entries.
+		// NOTE-039: regex on dict columns uses ScanDictColumnRefsWithBloom with nil bloom keys
+		// (no bloom pruning possible for regex — any page could have matching entries).
+		if len(leaf.Values) == 0 && leaf.Pattern != "" {
+			re, err := regexp.Compile(leaf.Pattern)
+			if err != nil {
+				return nil // invalid regex — skip fast path
+			}
+			return modules_shared.ScanDictColumnRefsWithBloom(blob, func(value string, _ int64, isInt64 bool) bool {
+				if isInt64 {
+					return false // int64 dict entries are not string-matchable
+				}
+				return re.MatchString(value)
+			}, nil, maxRefs)
+		}
+		// Build match sets and bloom keys in one pass.
+		// NOTE-040: merged from two sequential loops — identical switch structure, no ordering dependency.
+		wantStr := make(map[string]struct{}, len(leaf.Values))
+		wantInt := make(map[int64]struct{}, len(leaf.Values))
+		bloomKeys := make([][]byte, 0, len(leaf.Values))
+		for _, v := range leaf.Values {
+			switch v.Type {
+			case vm.TypeString:
+				if s, ok := v.Data.(string); ok {
+					wantStr[s] = struct{}{}
+					bloomKeys = append(bloomKeys, []byte(s))
+				}
+			case vm.TypeInt:
+				if i, ok := v.Data.(int64); ok {
+					wantInt[i] = struct{}{}
+					var buf [8]byte
+					binary.LittleEndian.PutUint64(buf[:], uint64(i)) //nolint:gosec
+					bloomKeys = append(bloomKeys, buf[:])
+				}
+			case vm.TypeDuration:
+				if i, ok := v.Data.(int64); ok {
+					wantInt[i] = struct{}{}
+					var buf [8]byte
+					binary.LittleEndian.PutUint64(buf[:], uint64(i)) //nolint:gosec
+					bloomKeys = append(bloomKeys, buf[:])
+				}
+			}
+		}
+		return modules_shared.ScanDictColumnRefsWithBloom(blob, func(value string, int64Val int64, isInt64 bool) bool {
+			if isInt64 {
+				_, ok := wantInt[int64Val]
+				return ok
+			}
+			_, ok := wantStr[value]
+			return ok
+		}, bloomKeys, maxRefs)
 	}
 
-	// Flat column.
+	// Flat column — extract range bounds.
 	switch {
 	case len(leaf.Values) > 0:
-		return intrinsicFlatMatchRefs(col, leaf, maxRefs)
-	case leaf.Min != nil || leaf.Max != nil:
-		return scanDecodedFlatRangeRefs(col, leaf, maxRefs)
-	default:
-		return nil
-	}
-}
-
-// scanDecodedDictRefs scans a decoded dict IntrinsicColumn for entries matching
-// the leaf predicate (equality or regex). Returns at most maxRefs refs (0 = unlimited).
-func scanDecodedDictRefs(col *modules_shared.IntrinsicColumn, leaf vm.RangeNode, maxRefs int) []modules_shared.BlockRef {
-	if len(leaf.Values) == 0 && leaf.Pattern == "" {
-		return nil // range predicate on dict — not supported
-	}
-
-	var result []modules_shared.BlockRef
-
-	if leaf.Pattern != "" {
-		// Compile regex directly — avoid feeding unbounded query-driven patterns
-		// into the process-wide cachedRegexCompile sync.Map.
-		re, reErr := regexp.Compile(leaf.Pattern)
-		if reErr != nil {
+		// Equality: scan for each value. Use full-decode fallback for simplicity
+		// since equality on flat columns is rare and may have multiple values.
+		col, err := r.GetIntrinsicColumn(colName)
+		if err != nil || col == nil {
 			return nil
 		}
-		for _, entry := range col.DictEntries {
-			if !re.MatchString(entry.Value) {
-				continue
-			}
-			refs := entry.BlockRefs
-			if maxRefs > 0 && len(result)+len(refs) > maxRefs {
-				refs = refs[:maxRefs-len(result)]
-			}
-			result = append(result, refs...)
-			if maxRefs > 0 && len(result) >= maxRefs {
-				return result
-			}
+		return intrinsicFlatMatchRefs(col, leaf, maxRefs)
+
+	case leaf.Min != nil || leaf.Max != nil:
+		lo, hi, hasLo, hasHi, ok := extractFlatRangeBounds(leaf)
+		if !ok {
+			return nil
 		}
-		return result
-	}
+		return modules_shared.ScanFlatColumnRefs(blob, lo, hi, hasLo, hasHi, maxRefs)
 
-	// Equality predicate: build match sets.
-	isInt := col.Type == modules_shared.ColumnTypeInt64 || col.Type == modules_shared.ColumnTypeRangeInt64
-	wantStr := make(map[string]struct{}, len(leaf.Values))
-	wantInt := make(map[int64]struct{}, len(leaf.Values))
-	for _, v := range leaf.Values {
-		switch v.Type {
-		case vm.TypeString:
-			if s, ok := v.Data.(string); ok {
-				wantStr[s] = struct{}{}
-			}
-		case vm.TypeInt, vm.TypeDuration:
-			if i, ok := v.Data.(int64); ok {
-				wantInt[i] = struct{}{}
-			}
-		}
+	default:
+		return nil // pattern or no constraint
 	}
-
-	for _, entry := range col.DictEntries {
-		var matched bool
-		if isInt {
-			_, matched = wantInt[entry.Int64Val]
-		} else {
-			_, matched = wantStr[entry.Value]
-		}
-		if !matched {
-			continue
-		}
-		refs := entry.BlockRefs
-		if maxRefs > 0 && len(result)+len(refs) > maxRefs {
-			refs = refs[:maxRefs-len(result)]
-		}
-		result = append(result, refs...)
-		if maxRefs > 0 && len(result) >= maxRefs {
-			return result
-		}
-	}
-	return result
-}
-
-// scanDecodedFlatRangeRefs performs a binary-search range scan on the decoded
-// Uint64Values slice (sorted ascending). Returns at most maxRefs refs (0 = unlimited).
-func scanDecodedFlatRangeRefs(col *modules_shared.IntrinsicColumn, leaf vm.RangeNode, maxRefs int) []modules_shared.BlockRef {
-	lo, hi, hasLo, hasHi, ok := extractFlatRangeBounds(leaf)
-	if !ok || len(col.Uint64Values) == 0 {
-		return nil
-	}
-
-	vals := col.Uint64Values
-	startIdx := 0
-	if hasLo {
-		startIdx = sort.Search(len(vals), func(i int) bool { return vals[i] >= lo })
-	}
-
-	endIdx := len(vals)
-	if hasHi {
-		endIdx = sort.Search(len(vals), func(i int) bool { return vals[i] > hi })
-	}
-
-	if startIdx >= endIdx {
-		return []modules_shared.BlockRef{}
-	}
-
-	count := endIdx - startIdx
-	if maxRefs > 0 && count > maxRefs {
-		count = maxRefs
-	}
-	result := make([]modules_shared.BlockRef, count)
-	copy(result, col.BlockRefs[startIdx:startIdx+count])
-	return result
 }
 
 // extractFlatRangeBounds converts a RangeNode's Min/Max into inclusive uint64 bounds

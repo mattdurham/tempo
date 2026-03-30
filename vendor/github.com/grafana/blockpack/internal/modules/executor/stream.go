@@ -6,7 +6,6 @@ import (
 	"cmp"
 	"errors"
 	"fmt"
-	"log/slog"
 	"slices"
 	"sync"
 
@@ -118,10 +117,6 @@ type CollectStats struct {
 	// MixedCandidateBlocks is the number of unique candidate blocks from the partial-AND
 	// pre-filter for Cases C and D (mixed queries). Zero for all other paths.
 	MixedCandidateBlocks int
-	// IntrinsicFallback is true when the intrinsic fast path was attempted but failed,
-	// falling back to the slower scanBlocks path. Check this to detect silent degradation.
-	// SPEC-ROOT-010: never silently degrade — callers should log or alert on this.
-	IntrinsicFallback bool
 }
 
 // MatchedRow holds a single row result from Collect.
@@ -187,12 +182,15 @@ func Collect(
 		for k := range wantColumns {
 			secondPassCols[k] = struct{}{}
 		}
-		// NOTE-050: Include all trace intrinsic columns so ParseBlockFromBytes decodes
-		// them from block payloads (dual storage). Identity columns (trace:id, span:id,
-		// span:parent_id) are NOT in the intrinsic accumulator per NOTE-005 — they are
-		// stored only in block payloads. Case A results populate MatchedRow.Block via
-		// forEachBlockInGroups (NOTE-053); lookupIntrinsicFields is used by Case B
-		// (TopK) and structural queries where block reads are not taken.
+		// NOTE-050: Include all trace intrinsic columns for lookupIntrinsicFields.
+		// searchMetaCols was trimmed to log-only; trace intrinsics must be injected here
+		// so IntrinsicFields rows contain trace:id, span:id, span:start, span:name, etc.
+		// With dual storage (restored after PR #172 rollback), new files store intrinsic
+		// columns in block payloads too, but ParseBlockFromBytes still returns nil for
+		// them when names are not in wantColumns. For backward compatibility with files
+		// written between the PR #172 merge and this fix (intrinsic-only storage),
+		// identity values must come from lookupIntrinsicFields; nilIntrinsicScan handles
+		// absent block columns for those files.
 		for k := range traceIntrinsicColumns {
 			secondPassCols[k] = struct{}{}
 		}
@@ -217,16 +215,11 @@ func Collect(
 	// (ProgramIsIntrinsicOnly × opts.TimestampColumn != "").
 	// errNeedBlockScan signals the pre-filter is not applicable; fall through to full scan.
 	// NOTE-050: Pure intrinsic queries always use the fast path regardless of Limit —
-	// without the fast path, the block scan's ColumnPredicate evaluates user-attr
-	// predicates via nilIntrinsicScan (FullScan for nil intrinsic block columns) and
-	// then re-filters via filterRowSetByIntrinsicNodes. For files written between PR #172
-	// and its rollback, intrinsic columns may be absent from block payloads, so this
-	// path prevents false-negative results on those files.
+	// intrinsic columns are no longer in block payloads, so the block scan path would
+	// evaluate nil columns and return 0 results for any intrinsic predicate.
 	// Mixed queries (Cases C/D) still require Limit > 0 to bound the pre-filter cost.
 	if hasSomeIntrinsicPredicates(program) && (opts.Limit > 0 || ProgramIsIntrinsicOnly(program)) {
 		// SPEC-INTRINSIC-004: check file-level bloom before any intrinsic scan.
-		// If the FileBloom guarantees no span matches the equality predicates, skip this
-		// file entirely — O(1) rejection vs O(N) intrinsic column scan.
 		if program.Predicates != nil && fileLevelBloomReject(r, program.Predicates.Nodes) {
 			return nil, nil
 		}
@@ -244,6 +237,7 @@ func Collect(
 			return rows, err
 		}
 		// errNeedBlockScan: fall through to full block scan. fastStats is discarded.
+		// The block-scan defer below will call OnStats with the block-scan stats.
 	}
 
 	plan := planBlocks(r, program, opts.TimeRange, queryplanner.PlanOptions{
@@ -536,7 +530,6 @@ func streamSortedRows(
 	return false
 }
 
-
 // countUniqueBlockIdxs returns the number of distinct BlockIdx values in refs.
 func countUniqueBlockIdxs(refs []modules_shared.BlockRef) int {
 	if len(refs) == 0 {
@@ -604,23 +597,16 @@ func collectFromIntrinsicRefs(
 		refs = blockRefsFromIntrinsicPartial(r, program, 0)
 	}
 	if refs == nil {
-		// SPEC-ROOT-010: error-level log when intrinsic fast path fails — silent fallback
-		// to scanBlocks caused a 50x perf regression undetected for days.
-		slog.Error("collectFromIntrinsicRefs: intrinsic fast path failed, falling back to slow scanBlocks",
-			"isPureIntrinsic", isPureIntrinsic, "hasSort", hasSort)
 		stats.ExecutionPath = "intrinsic-need-block-scan"
-		stats.IntrinsicFallback = true
 		return nil, errNeedBlockScan
 	}
 	if len(refs) == 0 {
 		return nil, nil
 	}
 
-	// Selectivity guard for Cases C/D only: if the partial pre-filter covers more than
-	// half the internal blocks it offers no I/O benefit, since mixed queries must read
-	// blocks for VM eval. Fall through to the regular block scan.
-	// Pure-intrinsic queries (Cases A/B) never fall back — they always use block reads
-	// for field population which is O(M) regardless of block spread.
+	// Selectivity guard: if the partial pre-filter covers more than half the internal
+	// blocks it offers no I/O benefit for Cases C/D, which must read blocks for VM eval.
+	// Fall through to the regular block scan (coalesced I/O, planBlocks pruning).
 	if !isPureIntrinsic {
 		uniqueBlocks := countUniqueBlockIdxs(refs)
 		if uniqueBlocks*2 > r.BlockCount() {
@@ -634,7 +620,7 @@ func collectFromIntrinsicRefs(
 		return collectIntrinsicPlain(r, refs, opts, wantColumns, secondPassCols, stats)
 	}
 	if isPureIntrinsic && hasSort {
-		return collectIntrinsicTopK(r, refs, opts, wantColumns, secondPassCols, stats)
+		return collectIntrinsicTopK(r, refs, opts, secondPassCols, stats)
 	}
 	if !hasSort {
 		// Case C: mixed + no sort
@@ -750,13 +736,10 @@ func forEachBlockInGroups(
 
 // collectIntrinsicPlain handles Case A: pure intrinsic + no sort.
 //
-// When the file has an intrinsic section (HasIntrinsicSection), field values are resolved
-// from the objectcache-backed intrinsic columns via lookupIntrinsicFields — zero S3 I/O
-// after warmup. This is critical for files with many internal blocks (300+) where block
-// reads would require one S3 round trip per block group.
-//
-// Falls back to forEachBlockInGroups (block reads) only when the intrinsic section is
-// absent (legacy files without intrinsic columns).
+// Field values are always resolved from objectcache-backed intrinsic columns via
+// lookupIntrinsicFields — zero S3 I/O after warmup. lookupIntrinsicFields uses
+// LookupRefFast for O(M log N) binary search per ref, which caches the ref index
+// on the column object (EnsureRefIndex is called internally on first use).
 func collectIntrinsicPlain(
 	r *modules_reader.Reader,
 	refs []modules_shared.BlockRef,
@@ -781,24 +764,17 @@ func collectIntrinsicPlain(
 		refs = refs[:opts.Limit]
 	}
 
-	// Read the specific internal blocks containing matched refs.
-	// Block columns have all field values (dual storage). For M=20 refs this reads
-	// ~20 blocks × ~1MB each — cheaper than scanning 3.2M intrinsic entries per column.
-	blockOrder, blockCandidates := groupRefsByBlock(refs)
-	var results []MatchedRow
-	err := forEachBlockInGroups(r, blockOrder, blockCandidates, wantColumns, secondPassCols, "collectIntrinsicPlain",
-		func(pb parsedBlock, candidateRows []int) error {
-			for _, rowIdx := range candidateRows {
-				results = append(results, MatchedRow{
-					Block:    pb.Block,
-					BlockIdx: pb.BlockIdx,
-					RowIdx:   rowIdx,
-				})
-			}
-			return nil
+	// Resolve fields from objectcache-backed intrinsic columns — zero S3 I/O after
+	// warmup. lookupIntrinsicFields uses EnsureRefIndex for O(M log N) binary search
+	// per ref, cached on the column object via sync.Once.
+	fieldMaps := lookupIntrinsicFields(r, refs, secondPassCols)
+	results := make([]MatchedRow, 0, len(refs))
+	for i, ref := range refs {
+		results = append(results, MatchedRow{
+			IntrinsicFields: &intrinsicFieldsProvider{fields: fieldMaps[i]},
+			BlockIdx:        int(ref.BlockIdx),
+			RowIdx:          int(ref.RowIdx),
 		})
-	if err != nil {
-		return nil, err
 	}
 	return results, nil
 }
@@ -819,7 +795,6 @@ func collectIntrinsicTopK(
 	r *modules_reader.Reader,
 	refs []modules_shared.BlockRef,
 	opts CollectOptions,
-	wantColumns map[string]struct{},
 	secondPassCols map[string]struct{},
 	stats *CollectStats,
 ) ([]MatchedRow, error) {
@@ -838,23 +813,14 @@ func collectIntrinsicTopK(
 	if len(selected) == 0 {
 		return nil, nil
 	}
-	// Block reads for field population — same as collectIntrinsicPlain.
-	slices.SortFunc(selected, blockRefCompare)
-	blockOrder, blockCandidates := groupRefsByBlock(selected)
-	var results []MatchedRow
-	err = forEachBlockInGroups(r, blockOrder, blockCandidates, wantColumns, secondPassCols, "collectIntrinsicTopK",
-		func(pb parsedBlock, candidateRows []int) error {
-			for _, rowIdx := range candidateRows {
-				results = append(results, MatchedRow{
-					Block:    pb.Block,
-					BlockIdx: pb.BlockIdx,
-					RowIdx:   rowIdx,
-				})
-			}
-			return nil
+	fieldMaps := lookupIntrinsicFields(r, selected, secondPassCols)
+	results := make([]MatchedRow, 0, len(selected))
+	for i, ref := range selected {
+		results = append(results, MatchedRow{
+			IntrinsicFields: &intrinsicFieldsProvider{fields: fieldMaps[i]},
+			BlockIdx:        int(ref.BlockIdx),
+			RowIdx:          int(ref.RowIdx),
 		})
-	if err != nil {
-		return nil, err
 	}
 	return results, nil
 }
@@ -880,11 +846,9 @@ func collectIntrinsicTopKKLL(
 	if tsErr != nil || tsCol == nil || len(tsCol.Uint64Values) < len(tsCol.BlockRefs) {
 		return nil, errNeedBlockScan
 	}
-	// Build packed-key → timestamp map from the full column (O(N)).
-	tsMap := make(map[uint32]uint64, len(tsCol.BlockRefs))
-	for i, br := range tsCol.BlockRefs {
-		tsMap[uint32(br.BlockIdx)<<16|uint32(br.RowIdx)] = tsCol.Uint64Values[i] //nolint:gosec
-	}
+	// Build the ref index once (O(N log N), cached on tsCol via sync.Once), then use
+	// O(log N) LookupRefFast per ref — avoiding per-call allocations vs the old O(N) map build.
+	// LookupRefFast calls EnsureRefIndex internally; no explicit call needed here.
 
 	// Group M refs by BlockIdx and collect unique block indices.
 	// NOTE-044: group so we can sort blockIdxs by MaxStart before collecting pairs.
@@ -902,9 +866,13 @@ func collectIntrinsicTopKKLL(
 	}
 
 	// Sort blockIdxs by BlockMeta.MaxStart DESC: process newest blocks first.
+	// NOTE-044: MaxStart is the maximum span:start in the block (KLL upper bound).
+	// This ordering biases iteration toward newer blocks, enabling early termination
+	// in future extensions, but correctness here requires the final sort over all pairs.
 	slices.SortFunc(blockOrder, func(a, b int) int {
 		metaA := r.BlockMeta(a)
 		metaB := r.BlockMeta(b)
+		// Descending: newer (larger MaxStart) first.
 		return cmp.Compare(metaB.MaxStart, metaA.MaxStart)
 	})
 
@@ -915,9 +883,9 @@ func collectIntrinsicTopKKLL(
 	pairs := make([]refTS, 0, len(refs))
 	for _, bi := range blockOrder {
 		for _, ref := range blockRefs[uint16(bi)] { //nolint:gosec // bi is bounded by block count
-			packed := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx) //nolint:gosec
-			if ts, ok := tsMap[packed]; ok {
-				pairs = append(pairs, refTS{ref: ref, ts: ts})
+			packed := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx)
+			if val, ok := tsCol.LookupRefFast(packed); ok {
+				pairs = append(pairs, refTS{ref: ref, ts: val.(uint64)})
 			}
 		}
 	}
@@ -1010,18 +978,17 @@ func collectIntrinsicTopKScan(
 	if len(selected) > 0 && (opts.TimeRange.MinNano > 0 || opts.TimeRange.MaxNano > 0) {
 		tsCol, tsErr := r.GetIntrinsicColumn(opts.TimestampColumn)
 		if tsErr == nil && tsCol != nil && len(tsCol.Uint64Values) == len(tsCol.BlockRefs) {
-			// Build packed-key → timestamp map for time-range filtering.
-			tsMap := make(map[uint32]uint64, len(tsCol.BlockRefs))
-			for i, br := range tsCol.BlockRefs {
-				tsMap[uint32(br.BlockIdx)<<16|uint32(br.RowIdx)] = tsCol.Uint64Values[i] //nolint:gosec
-			}
+			// Use LookupRefFast: O(K log N) avoiding per-call allocations
+			// vs the old O(N) map build over 3.3M entries.
+			// LookupRefFast calls EnsureRefIndex internally.
 			filtered := selected[:0]
 			for _, ref := range selected {
-				packed := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx) //nolint:gosec
-				ts, ok := tsMap[packed]
+				packed := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx)
+				val, ok := tsCol.LookupRefFast(packed)
 				if !ok {
 					continue
 				}
+				ts := val.(uint64)
 				if opts.TimeRange.MinNano > 0 && ts < opts.TimeRange.MinNano {
 					continue
 				}
@@ -1233,87 +1200,64 @@ func filterRowSetByIntrinsicNodes(
 
 // lookupIntrinsicFields reads intrinsic column values for the given refs and returns one
 // map[string]any per ref. wantCols limits which columns are loaded — when non-nil only
-// columns present in wantCols are fetched (skipping expensive GetIntrinsicColumnForRefs
-// calls for unwanted columns).
+// columns present in wantCols are fetched (skipping expensive GetIntrinsicColumn calls
+// for unwanted columns).
 // Pass nil to fetch all intrinsic columns (e.g. FindTraceByID needs every field).
 //
 // For each requested intrinsic column, GetIntrinsicColumn returns an objectcache-backed
 // column where EnsureRefIndex builds a sorted-by-ref lookup table once (O(N log N));
 // subsequent lookups use O(log N) binary search per selected ref via LookupRefFast.
-// Total per column: O(M log N) for M target refs — far cheaper than the previous O(N)
-// full-column scan when M << N.
-//
-// span:end is synthesized from span:start + span:duration (no TOC entry) and handled
-// explicitly after the main column loop.
-func lookupIntrinsicFields(r *modules_reader.Reader, selected []modules_shared.BlockRef, wantCols map[string]struct{}) []map[string]any {
-	m := len(selected)
-	index := make(map[uint32]int, m)
-	for i, ref := range selected {
-		index[uint32(ref.BlockIdx)<<16|uint32(ref.RowIdx)] = i //nolint:gosec
-	}
-
+// Total per column: O(M log N) for M target refs.
+func lookupIntrinsicFields(
+	r *modules_reader.Reader,
+	selected []modules_shared.BlockRef,
+	wantCols map[string]struct{},
+) []map[string]any {
 	result := make([]map[string]any, len(selected))
 	for i := range result {
 		result[i] = make(map[string]any, 12)
 	}
 
-	// O(N) scan per column with O(1) hash-map lookup per entry. GetIntrinsicColumn is
-	// objectcache-backed so the column lives in process memory (zero S3 I/O after warmup).
-	// This is cheaper than EnsureRefIndex O(N log N) sort when objectcache entries are
-	// GC'd frequently (weak pointers), which happens at scale (49+ files × 7 columns).
-	loadColumn := func(colName string, col *modules_shared.IntrinsicColumn) {
-		switch col.Format {
-		case modules_shared.IntrinsicFormatDict:
-			isInt := col.Type == modules_shared.ColumnTypeInt64 ||
-				col.Type == modules_shared.ColumnTypeRangeInt64
-			for _, entry := range col.DictEntries {
-				var val any
-				if isInt {
-					val = entry.Int64Val
-				} else {
-					val = entry.Value
-				}
-				for _, ref := range entry.BlockRefs {
-					key := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx) //nolint:gosec
-					if idx, ok := index[key]; ok {
-						result[idx][colName] = val
-					}
-				}
-			}
-		case modules_shared.IntrinsicFormatFlat:
-			for i, ref := range col.BlockRefs {
-				key := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx) //nolint:gosec
-				if idx, ok := index[key]; ok {
-					if len(col.Uint64Values) > i {
-						result[idx][colName] = col.Uint64Values[i]
-					} else if len(col.BytesValues) > i {
-						result[idx][colName] = col.BytesValues[i]
-					}
-				}
+	// lookupColumn populates result entries for one intrinsic column using O(log N)
+	// binary search. LookupRefFast calls EnsureRefIndex internally.
+	lookupColumn := func(colName string, col *modules_shared.IntrinsicColumn) {
+		for i, ref := range selected {
+			packed := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx) //nolint:gosec
+			if val, ok := col.LookupRefFast(packed); ok {
+				result[i][colName] = val
 			}
 		}
 	}
 
 	for _, colName := range r.IntrinsicColumnNames() {
+		// Skip columns not required by this query. wantCols == nil means "all columns"
+		// (used for FindTraceByID and match-all queries that need every field).
 		if wantCols != nil {
 			if _, needed := wantCols[colName]; !needed {
 				continue
 			}
 		}
+		// Use objectcache-backed full decode (GetIntrinsicColumn caches via parsedIntrinsicCache).
+		// EnsureRefIndex builds a sorted-by-ref lookup table once (O(N log N), cached in
+		// objectcache alongside the column). Subsequent calls use O(log N) binary search
+		// per target ref instead of the previous O(N) full-column scan.
 		col, err := r.GetIntrinsicColumn(colName)
 		if err != nil || col == nil {
 			continue
 		}
-		loadColumn(colName, col)
+		lookupColumn(colName, col)
 	}
 
+	// span:end is synthesized from span:start + span:duration and is NOT listed in
+	// IntrinsicColumnNames() (it has no TOC entry). Handle it explicitly here so that
+	// predicates on span:end are evaluated correctly.
 	if wantCols == nil {
 		if col, err := r.GetIntrinsicColumn("span:end"); err == nil && col != nil {
-			loadColumn("span:end", col)
+			lookupColumn("span:end", col)
 		}
 	} else if _, needed := wantCols["span:end"]; needed {
 		if col, err := r.GetIntrinsicColumn("span:end"); err == nil && col != nil {
-			loadColumn("span:end", col)
+			lookupColumn("span:end", col)
 		}
 	}
 

@@ -163,11 +163,17 @@ func (col *IntrinsicColumn) EnsureRefIndex() {
 }
 
 // LookupRefFast performs an O(log N) binary search for packedRef in col.refIndex.
-// Must call EnsureRefIndex before calling this. Returns (nil, false) when not found.
+// Calls EnsureRefIndex internally (sync.Once, so subsequent calls are free);
+// callers no longer need a separate EnsureRefIndex call before LookupRefFast.
+// Returns (nil, false) when not found.
 //
 // Return types mirror LookupRef: uint64 or []byte for flat, string or int64 for dict.
 func (col *IntrinsicColumn) LookupRefFast(packedRef uint32) (val any, found bool) {
-	if col == nil || len(col.refIndex) == 0 {
+	if col == nil {
+		return nil, false
+	}
+	col.EnsureRefIndex()
+	if len(col.refIndex) == 0 {
 		return nil, false
 	}
 	pos, ok := slices.BinarySearchFunc(col.refIndex, packedRef, func(e RefIndexEntry, target uint32) int {
