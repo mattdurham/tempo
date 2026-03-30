@@ -26,7 +26,9 @@ overwrites with an equivalent value.
 
 If `v` is nil, `Put` returns an error and no entry is stored.
 
-Memory is bounded at the process level by `GOMEMLIMIT`.
+`GOMEMLIMIT` is a soft GC pacing target, not a hard memory cap — the runtime
+increases GC frequency as heap approaches the limit but does not enforce a ceiling.
+Callers must manage cache lifetime explicitly via `Clear`.
 
 Back-ref: `internal/modules/objectcache/cache.go:Cache.Put`
 
@@ -37,9 +39,10 @@ Back-ref: `internal/modules/objectcache/cache.go:Cache.Put`
 *Updated: 2026-03-29*
 
 Entries are NOT GC'd while in the cache. The cache grows without explicit
-eviction. Memory is bounded at the process level by `GOMEMLIMIT` — the Go
-runtime soft-memory limit triggers GC pressure before OOM. Operators must set
-`GOMEMLIMIT` appropriately for their deployment.
+eviction. `GOMEMLIMIT` is a soft GC pacing target, not a hard memory cap — the
+Go runtime increases GC frequency as heap approaches the limit but does not
+enforce a ceiling. Callers must manage cache lifetime explicitly via `Clear`.
+Operators should set `GOMEMLIMIT` appropriately for their deployment.
 
 No per-entry eviction policy is implemented. Cached values (parsed file
 metadata, sketch indexes, decoded intrinsic columns) are immutable and

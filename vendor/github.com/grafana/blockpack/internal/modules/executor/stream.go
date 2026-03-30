@@ -94,7 +94,8 @@ type CollectStats struct {
 	// "intrinsic-topk-scan" (Case B scan path), "mixed-plain" (Case C),
 	// "mixed-topk" (Case D), "block-plain" (block-scan no sort),
 	// "block-topk" (block-scan with topK heap),
-	// "intrinsic-need-block-scan" (fast path fell through to block scan).
+	// "intrinsic-need-block-scan" (fast path fell through to block scan),
+	// "bloom-rejected" (all candidate blocks eliminated by bloom filter).
 	// NOTE-043, NOTE-044: see also SortScanThreshold.
 	ExecutionPath  string
 	TotalBlocks    int
