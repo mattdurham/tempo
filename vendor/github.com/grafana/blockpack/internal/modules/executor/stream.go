@@ -239,7 +239,6 @@ func Collect(
 			return rows, err
 		}
 		// errNeedBlockScan: fall through to full block scan. fastStats is discarded.
-		// The block-scan defer below will call OnStats with the block-scan stats.
 	}
 
 	plan := planBlocks(r, program, opts.TimeRange, queryplanner.PlanOptions{
@@ -607,9 +606,11 @@ func collectFromIntrinsicRefs(
 		return nil, nil
 	}
 
-	// Selectivity guard: if the partial pre-filter covers more than half the internal
-	// blocks it offers no I/O benefit for Cases C/D, which must read blocks for VM eval.
-	// Fall through to the regular block scan (coalesced I/O, planBlocks pruning).
+	// Selectivity guard for Cases C/D only: if the partial pre-filter covers more than
+	// half the internal blocks it offers no I/O benefit, since mixed queries must read
+	// blocks for VM eval. Fall through to the regular block scan.
+	// Pure-intrinsic queries (Cases A/B) never fall back — they always use block reads
+	// for field population which is O(M) regardless of block spread.
 	if !isPureIntrinsic {
 		uniqueBlocks := countUniqueBlockIdxs(refs)
 		if uniqueBlocks*2 > r.BlockCount() {
