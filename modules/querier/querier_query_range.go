@@ -93,6 +93,13 @@ func (q *Querier) queryBlock(ctx context.Context, req *tempopb.QueryRangeRequest
 		timeOverlapCutoff = v
 	}
 
+	// Use the block's native metrics path when available (e.g. blockpack's
+	// ExecuteMetricsTraceQL intrinsic fast path). Returns (nil, nil) for
+	// encodings that don't implement nativeMetricsQuerier.
+	if resp, nativeErr := q.store.QueryRange(ctx, meta, req, opts); resp != nil || nativeErr != nil {
+		return resp, nativeErr
+	}
+
 	eval, err := traceql.NewEngine().CompileMetricsQueryRange(req, timeOverlapCutoff, unsafe)
 	if err != nil {
 		return nil, err

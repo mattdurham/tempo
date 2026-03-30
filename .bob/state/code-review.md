@@ -1,141 +1,243 @@
-# Code Quality Review: Intrinsic Paging + Top-K Refactor
+# Code Review: Blockpack Intrinsic Optimization -- Efficiency Analysis
 
-Branch: `blockpack-integration`
-Date: 2026-03-13
-Scope: `vendor/github.com/grafana/blockpack/` and `cmd/bpanalyze/`
-
----
-
-## 1. Dead Code
-
-### 1a. `intrinsicDictMatchRefs` is dead code
-**File:** `executor/predicates.go:1332`
-**Issue:** `intrinsicDictMatchRefs` is defined but has zero callers. The `scanIntrinsicLeafRefs` function replaced it -- dict columns now go through `ScanDictColumnRefsWithBloom` (raw blob scanning), never through the old full-decode path.
-**Fix:** Delete `intrinsicDictMatchRefs` entirely.
-
-### 1b. `intrinsicFlatMatchRefs` is nearly dead -- only used as fallback for equality on flat columns
-**File:** `executor/predicates.go:1378`, called at line 1305
-**Issue:** `intrinsicFlatMatchRefs` requires a full `GetIntrinsicColumn` decode (building the entire `IntrinsicColumn` struct). It is only reached when `scanIntrinsicLeafRefs` handles equality predicates on flat columns (`len(leaf.Values) > 0`). The comment at line 1299 says "use full-decode fallback for simplicity since equality on flat columns is rare." This is the only remaining call site. Consider replacing it with a raw-scan variant for consistency, or at minimum add a TODO.
-**Fix:** Add `// TODO: replace with raw-scan variant (equality on flat columns is rare but this forces full struct decode)` or implement `ScanFlatColumnEqualityRefs`.
-
-### 1c. `CollectTopK` is now a trivial shim
-**File:** `executor/stream_topk.go:142`
-**Issue:** `CollectTopK` just delegates to `e.Collect(r, program, opts)`. The body went from ~70 lines of real logic to a one-liner. The method is exported and referenced in SPECS.md and api.go comments, so it cannot be deleted immediately, but it should be marked deprecated.
-**Fix:** Add a `// Deprecated: use Collect directly.` comment for Go documentation tooling.
-
----
-
-## 2. Duplicated Sorting Logic
-
-### 2a. `encodeFlatColumn` duplicates `sortFlatAccum`
-**File:** `writer/intrinsic_accum.go:244-277` vs `writer/intrinsic_accum.go:499-529`
-**Issue:** `encodeFlatColumn` (v1 monolithic path) contains inline sorting code that is identical to `sortFlatAccum` (extracted for the v2 paged path). The two sort blocks build the same `type row struct`, call `sort.Slice` the same way, and write back the same way.
-**Fix:** Replace the inline sort in `encodeFlatColumn` with a call to `sortFlatAccum(c)` before the encoding loop, matching how `encodePagedFlatColumn` does it at line 598.
-
----
-
-## 3. Duplicated Page TOC Parsing Preamble
-
-### 3a. Three `scanFlatPaged*` functions repeat identical TOC-parsing boilerplate
-**Files:** `shared/intrinsic_codec.go` lines 887-905 (`scanFlatPagedBlob`), 977-995 (`scanFlatPagedTopK`), 1070-1088 (`scanFlatPagedFiltered`)
-**Issue:** Each function independently does: check `len(blob) < 5`, skip sentinel, read `tocLen`, bounds-check, `DecodePageTOC`, validate format/colType, extract `blockW`/`rowW`/`refSize`. This is 18 lines copy-pasted three times with zero variation.
-**Fix:** Extract a helper:
-```go
-type pagedFlatContext struct {
-    toc      PagedIntrinsicTOC
-    blobBase int // byte offset of first page blob in blob
-    blockW   int
-    rowW     int
-    refSize  int
-}
-
-func parseFlatPagedHeader(blob []byte) (*pagedFlatContext, error) { ... }
-```
-Each `scanFlatPaged*` function calls `parseFlatPagedHeader` and gets a struct back instead of repeating 18 lines.
-
-### 3b. `scanDictPagedBlob` has the same preamble pattern
-**File:** `shared/intrinsic_codec.go`, `scanDictPagedBlob`
-**Issue:** Same sentinel-skip, tocLen-read, DecodePageTOC pattern. Could share a generic `parsePagedHeader` that returns format-agnostic TOC context.
-**Fix:** Generalize the helper from 3a to work for both flat and dict paged blobs (just don't validate format in the helper -- let callers check `toc.Format`).
-
----
-
-## 4. Unbounded Process-Level Caches (Memory Leak Risk)
-
-### 4a. `parsedIntrinsicCache` and `parsedSketchCache` are never evicted
-**File:** `reader/parser.go:19,24`
-**Issue:** Both are `sync.Map` with comments stating "entries are never evicted." In a long-running Tempo process that reads many blockpack files over time (compaction creates new files, old files get deleted), these maps grow unboundedly. Each `IntrinsicColumn` can hold millions of `BlockRef` entries and `[]uint64` values -- potentially hundreds of MB per column. The `sketchIndex` is smaller but still accumulates.
-**Fix:** Replace `sync.Map` with an LRU cache bounded by entry count or byte size. The existing `SharedLRUProvider` in the codebase could serve as a model. At minimum, add eviction when the source blockpack file is deleted/compacted away, or use a `sync.Map` with periodic sweeps.
-
----
-
-## 5. Stringly-Typed Column Names
-
-### 5a. Raw string literals for intrinsic column names
-**Files:** `reader/intrinsic_reader.go:107` (`"span:end"`), `reader/intrinsic_reader.go:143` (`"span:start"`, `"span:duration"`), `executor/predicates.go` (column name map)
-**Issue:** Column names like `"span:end"`, `"span:start"`, `"span:duration"` are repeated as raw strings across files. The `traceIntrinsicColumns` map in `predicates.go` already enumerates them, but there are no shared constants. A typo like `"span:End"` would silently fail.
-**Fix:** Define constants in `shared/constants.go`:
-```go
-const (
-    ColSpanStart    = "span:start"
-    ColSpanEnd      = "span:end"
-    ColSpanDuration = "span:duration"
-    // ... etc
-)
-```
-Use them consistently. Not urgent but prevents silent bugs.
-
----
-
-## 6. `pageRefsStart` Ignores Its Second Parameter
-
-**File:** `shared/intrinsic_codec.go:1408`
-```go
-func pageRefsStart(pageRaw []byte, _ int) int {
-```
-**Issue:** The `rowCount` parameter is declared but explicitly ignored with `_`. The function is called from 4 sites that all pass `rowCount`. Either the parameter should be used for validation, or the signature should drop it to avoid confusion.
-**Fix:** Remove the unused parameter from the signature and all 4 call sites, or add a bounds check using it.
-
----
-
-## 7. Bloom Filter: FNV Double-Hash Quality
-
-**File:** `shared/intrinsic_bloom.go:33-38`
-```go
-func intrinsicBloomHashes(key []byte) (h1, h2 uint64) {
-    h := fnv.New64a()
-    _, _ = h.Write(key)
-    h1 = h.Sum64()
-    _, _ = h.Write(key) // feed key again to get a distinct second hash
-    h2 = h.Sum64() | 1
-    return h1, h2
-}
-```
-**Issue:** This feeds the same `key` bytes twice into the same hasher instance to produce h2. The second `h.Write(key)` extends the internal state (it does not reset), so `h2 = FNV(key || key)`. For short keys (e.g., 3-byte service names), h1 and h2 are correlated because FNV is a simple polynomial hash -- `FNV(key || key)` is a deterministic function of `FNV(key)`. Kirsch-Mitzenmacher requires h1 and h2 to be independent.
-**Fix:** Use `fnv.New64()` (non-"a" variant) for h2, or use a 128-bit hash and split. The current approach likely works acceptably for the cardinalities involved (low false-positive rates at 10 bits/item with k=7) but is technically unsound.
-
----
-
-## 8. Minor Issues
-
-### 8a. `synthesizeSpanEnd` does not populate `parsedIntrinsicCache`
-**File:** `reader/intrinsic_reader.go:136-175`
-**Issue:** `GetIntrinsicColumn` stores decoded columns in `parsedIntrinsicCache` for cross-Reader reuse. But `synthesizeSpanEnd` only stores in the per-Reader `intrinsicDecoded` map, not the process-level cache. Every new Reader for the same file will re-synthesize span:end from scratch.
-**Fix:** Add `parsedIntrinsicCache.Store(r.fileID+"/intrinsic/span:end", col)` after synthesis.
-
-### 8b. `layout.go` page TOC parsing duplicates `intrinsic_codec.go`
-**File:** `reader/layout.go` (diff lines 482-497)
-**Issue:** The `FileLayout` method manually parses the paged header (sentinel byte check, read tocLen, decode TOC) instead of calling through the codec's shared path.
-**Fix:** Use a shared "is-paged + parse TOC" helper rather than duplicating the wire-format parsing inline.
+**Date:** 2026-03-29
+**Branch:** blockpack-integration
+**Reviewer:** Claude Opus 4.6 (code-reviewer agent)
+**Scope:** Efficiency review of intrinsic ref-filter, stream collect, and predicate scanning
 
 ---
 
 ## Summary
 
-| Priority | Count | Category |
-|----------|-------|----------|
-| High     | 1     | Dead code (`intrinsicDictMatchRefs`) |
-| High     | 1     | Unbounded process-level caches |
-| Medium   | 2     | Duplicated sort logic, duplicated TOC preamble (4 copies) |
-| Medium   | 1     | Bloom hash quality concern |
-| Low      | 4     | Unused param, stringly-typed names, missing cache store, layout duplication |
+Focused efficiency review of the intrinsic optimization hot paths: `DecodePagedColumnBlobFiltered`,
+`EnsureRefIndex`/`LookupRefFast`, `collectIntrinsicPlain`/`TopK`, `lookupIntrinsicFields`,
+`scanDecodedDictRefs`, `scanDecodedFlatRangeRefs`, and `BlockRefsFromIntrinsicTOC` overFetch logic.
+
+**Findings:** 9 issues (1 high, 2 medium-high, 1 medium, 2 low-medium, 3 very low)
+
+**Top priority:** Findings 4 and 5 -- full-column tsMap construction on hot paths allocates
+~130MB of short-lived memory per file per query when only K (typically 20) lookups are needed.
+The fix is straightforward using existing `EnsureRefIndex` + `LookupRefFast` infrastructure.
+
+---
+
+## Findings
+
+### 1. DEAD PARAMETER: refFilter in DecodePagedColumnBlobFiltered
+
+**WHAT:** The `refFilter map[uint32]struct{}` parameter is accepted, never used, and explicitly
+discarded on line 114 with `_ = refFilter`. The caller (`GetIntrinsicColumnForRefs` at
+intrinsic_reader.go:229) still builds the refFilter map, allocating memory for no purpose.
+
+**WHERE:** `internal/modules/blockio/shared/intrinsic_ref_filter.go:30` (parameter),
+`internal/modules/blockio/reader/intrinsic_reader.go:229-232` (caller allocates map)
+
+**WHY:** After NOTE-007 removed page-skipping, refFilter serves no purpose. The caller
+allocates a `map[uint32]struct{}` sized to `len(refs)` on every call (~48KB for 1000 refs)
+that is immediately discarded.
+
+**SEVERITY:** Low. `GetIntrinsicColumnForRefs` has no callers in the executor.
+
+**SUGGESTION:** Remove the parameter from `DecodePagedColumnBlobFiltered` and stop building
+the map in `GetIntrinsicColumnForRefs`. This is internal code with no external API contract.
+
+---
+
+### 2. DEAD CODE: LookupRef O(N) linear scan method
+
+**WHAT:** `LookupRef` (lines 208-243) performs O(N) linear scan. It has zero production callers
+-- all executor paths use `LookupRefFast` (O(log N) via `EnsureRefIndex`).
+
+**WHERE:** `internal/modules/blockio/shared/intrinsic_ref_filter.go:208-243`
+
+**WHY:** Superseded by `LookupRefFast`. Risks accidental use by future contributors.
+
+**SEVERITY:** Low.
+
+**SUGGESTION:** Add `// Deprecated:` annotation pointing to `LookupRefFast`, or remove.
+
+---
+
+### 3. UNBOUNDED OVERFETCH: overFetch = limit * 10000
+
+**WHAT:** In `BlockRefsFromIntrinsicTOC` (predicates.go:1915), multi-condition AND queries set
+`overFetch = limit * 10000`. With limit=20 this is 200K; with limit=100 this is 1M. Each
+condition returns up to `overFetch` BlockRefs (4 bytes each), then `intersectBlockRefSets`
+sorts each set at O(N log N).
+
+**WHERE:** `internal/modules/executor/predicates.go:1915`
+
+**WHY:** No upper bound. For 3-node AND with limit=100: 3 sets x 1M refs x 4 bytes = 12MB
+allocation + 3 sorts of 1M elements. The factor 10,000 assumes joint selectivity >= 0.5%
+but provides no cap.
+
+**SEVERITY:** Medium. Production Tempo uses limit=20 (200K refs = ~800KB per condition), but
+custom limits or many-condition queries could cause multi-MB allocations.
+
+**SUGGESTION:** Cap with a hard maximum: `overFetch = min(limit*10000, 500_000)`. This bounds
+worst-case to ~2MB per condition while still providing 0.004% joint selectivity for limit=20.
+
+---
+
+### 4. HOT PATH ALLOCATION: collectIntrinsicTopKScan builds full tsMap for time-range filter
+
+**WHAT:** When the scan path selects refs and a time range is active (lines 995-1019), it
+decodes the full timestamp column via `GetIntrinsicColumn` (cached, free on warm queries)
+then builds `tsMap := make(map[uint32]uint64, len(tsCol.BlockRefs))`. For 3.3M spans this
+allocates ~130MB (40 bytes/entry: 4-byte key + 8-byte value + ~28 bytes map overhead).
+This map is used only to look up `selected` refs, which is bounded by `limit` (typically 20).
+
+**WHERE:** `internal/modules/executor/stream.go:998-1001`
+
+**WHY:** Building a 3.3M-entry map to look up 20 keys is ~6500x over-provisioned. The map
+is short-lived (function-scoped), creating ~130MB of GC pressure per file per query.
+
+**SEVERITY:** High. With 50 concurrent queries x 10 files = 65GB of GC pressure.
+
+**SUGGESTION:** Use `EnsureRefIndex` + `LookupRefFast` on the cached timestamp column:
+
+```go
+// Replace lines 996-1018 with:
+if len(selected) > 0 && (opts.TimeRange.MinNano > 0 || opts.TimeRange.MaxNano > 0) {
+    tsCol, tsErr := r.GetIntrinsicColumn(opts.TimestampColumn)
+    if tsErr == nil && tsCol != nil {
+        tsCol.EnsureRefIndex()
+        filtered := selected[:0]
+        for _, ref := range selected {
+            key := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx)
+            val, ok := tsCol.LookupRefFast(key)
+            if !ok {
+                continue
+            }
+            ts := val.(uint64)
+            if opts.TimeRange.MinNano > 0 && ts < opts.TimeRange.MinNano {
+                continue
+            }
+            if opts.TimeRange.MaxNano > 0 && ts > opts.TimeRange.MaxNano {
+                continue
+            }
+            filtered = append(filtered, ref)
+        }
+        selected = filtered
+    }
+}
+```
+
+This gives O(K log N) for K=20 lookups with zero additional allocation (refIndex is cached
+on the column via sync.Once).
+
+---
+
+### 5. HOT PATH ALLOCATION: collectIntrinsicTopKKLL builds full tsMap for small ref sets
+
+**WHAT:** `collectIntrinsicTopKKLL` (stream.go:865-868) builds `tsMap` from the full timestamp
+column (3.3M entries, ~130MB) even though `refs` is bounded by `SortScanThreshold` (8000).
+Only 8000 lookups are performed against the 3.3M-entry map.
+
+**WHERE:** `internal/modules/executor/stream.go:865-868`
+
+**WHY:** Same root cause as Finding 4. The full column is cached (objectcache), but the map is
+rebuilt on every query invocation. O(N) construction + ~130MB allocation for O(M) lookups where
+M << N.
+
+**SEVERITY:** Medium-High. Same GC pressure as Finding 4, triggered on the KLL path.
+
+**SUGGESTION:** Use `EnsureRefIndex` + `LookupRefFast` instead of building tsMap. The KLL path
+needs timestamps for sorting, so build a local `pairs` slice directly:
+
+```go
+tsCol.EnsureRefIndex()
+for _, ref := range refs {
+    key := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx)
+    val, ok := tsCol.LookupRefFast(key)
+    if !ok {
+        continue
+    }
+    pairs = append(pairs, refTS{ref: ref, ts: val.(uint64)})
+}
+```
+
+This replaces O(N) map construction with O(M log N) lookups (M=8000, N=3.3M), eliminating
+the 130MB allocation entirely.
+
+---
+
+### 6. MISSED CACHE: scanDecodedDictRefs uses raw regexp.Compile
+
+**WHAT:** `scanDecodedDictRefs` (predicates.go:2039) calls `regexp.Compile(leaf.Pattern)`
+directly despite `cachedRegexCompile` existing at predicates.go:67.
+
+**WHERE:** `internal/modules/executor/predicates.go:2039`
+Also `internal/modules/executor/predicates.go:669` (another direct `regexp.Compile` call).
+
+**WHY:** Called per-file during `BlockRefsFromIntrinsicTOC`. For a regex query across 100
+files, the same pattern is compiled 100 times (~1-10us each = 0.1-1ms total).
+
+**SEVERITY:** Low-Medium. Easy fix.
+
+**SUGGESTION:** Replace `regexp.Compile(leaf.Pattern)` with `cachedRegexCompile(leaf.Pattern)`
+at both locations.
+
+---
+
+### 7. REDUNDANT ALLOCATION: scanDecodedDictRefs allocates both wantStr and wantInt
+
+**WHAT:** Lines 2061-2062 unconditionally allocate both `wantStr` and `wantInt` maps.
+Only one is ever consulted based on `isInt`.
+
+**WHERE:** `internal/modules/executor/predicates.go:2061-2062`
+
+**WHY:** One map per call is wasted (~200 bytes for typical 1-3 element predicates).
+
+**SEVERITY:** Very Low.
+
+**SUGGESTION:** Conditionally allocate: `if isInt { wantInt = make(...) } else { wantStr = make(...) }`.
+
+---
+
+### 8. UNBOUNDED CACHE: intrinsicRegexCache sync.Map grows forever
+
+**WHAT:** `intrinsicRegexCache` is a package-level `sync.Map` with no eviction or size limit.
+
+**WHERE:** `internal/modules/executor/predicates.go:62`
+
+**WHY:** In a long-running process, distinct regex patterns accumulate monotonically. Each
+compiled `*regexp.Regexp` holds AST and buffers. Practically bounded by user behavior.
+
+**SEVERITY:** Very Low. No action needed unless profiling shows growth.
+
+**SUGGESTION:** Monitor; replace with bounded LRU if needed.
+
+---
+
+### 9. SUBOPTIMAL INIT: DecodePagedColumnBlobFiltered zero-length slice allocation
+
+**WHAT:** Lines 58-60 initialize flat column slices as `make([]T, 0)` instead of pre-sizing
+from TOC metadata. The TOC `RowCount` per page is available before the decode loop.
+
+**WHERE:** `internal/modules/blockio/shared/intrinsic_ref_filter.go:58-60`
+
+**WHY:** Forces append to grow from zero, causing log2(N) reallocations. Could pre-compute
+total rows from `toc.Pages[i].RowCount` and allocate once.
+
+**SEVERITY:** Very Low. Amortized doubling cost is small.
+
+**SUGGESTION:** Sum `RowCount` across pages and pre-allocate with that capacity.
+
+---
+
+## Priority Summary
+
+| # | Finding | Severity | Estimated Impact |
+|---|---------|----------|-----------------|
+| 4 | Full tsMap in scan path time-filter | **High** | ~130MB alloc/file/query |
+| 5 | Full tsMap in KLL path | **Medium-High** | ~130MB alloc/file/query |
+| 3 | overFetch unbounded for high limits | Medium | Latent OOM for custom limits |
+| 6 | Missing cachedRegexCompile | Low-Medium | ~0.1-1ms wasted CPU per query |
+| 1 | refFilter dead parameter | Low | ~48KB wasted per call |
+| 2 | LookupRef dead code | Low | Maintenance risk |
+| 7 | Dual map allocation | Very Low | ~200 bytes |
+| 8 | Unbounded regex cache | Very Low | Theoretical |
+| 9 | Zero-length slice init | Very Low | Minor reallocation |
+
+**Recommended fix order:** 4, 5 (same pattern, one fix), then 3 (add cap), then 6 (one-line change).
