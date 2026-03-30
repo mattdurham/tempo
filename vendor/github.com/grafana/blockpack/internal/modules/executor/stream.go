@@ -623,7 +623,7 @@ func collectFromIntrinsicRefs(
 		return collectIntrinsicPlain(r, refs, opts, wantColumns, secondPassCols, stats)
 	}
 	if isPureIntrinsic && hasSort {
-		return collectIntrinsicTopK(r, refs, opts, secondPassCols, stats)
+		return collectIntrinsicTopK(r, refs, opts, wantColumns, secondPassCols, stats)
 	}
 	if !hasSort {
 		// Case C: mixed + no sort
@@ -808,6 +808,7 @@ func collectIntrinsicTopK(
 	r *modules_reader.Reader,
 	refs []modules_shared.BlockRef,
 	opts CollectOptions,
+	wantColumns map[string]struct{},
 	secondPassCols map[string]struct{},
 	stats *CollectStats,
 ) ([]MatchedRow, error) {
@@ -826,14 +827,23 @@ func collectIntrinsicTopK(
 	if len(selected) == 0 {
 		return nil, nil
 	}
-	fieldMaps := lookupIntrinsicFields(r, selected, secondPassCols)
-	results := make([]MatchedRow, 0, len(selected))
-	for i, ref := range selected {
-		results = append(results, MatchedRow{
-			IntrinsicFields: &intrinsicFieldsProvider{fields: fieldMaps[i]},
-			BlockIdx:        int(ref.BlockIdx),
-			RowIdx:          int(ref.RowIdx),
+	// Block reads for field population — same as collectIntrinsicPlain.
+	slices.SortFunc(selected, blockRefCompare)
+	blockOrder, blockCandidates := groupRefsByBlock(selected)
+	var results []MatchedRow
+	err = forEachBlockInGroups(r, blockOrder, blockCandidates, wantColumns, secondPassCols, "collectIntrinsicTopK",
+		func(pb parsedBlock, candidateRows []int) error {
+			for _, rowIdx := range candidateRows {
+				results = append(results, MatchedRow{
+					Block:    pb.Block,
+					BlockIdx: pb.BlockIdx,
+					RowIdx:   rowIdx,
+				})
+			}
+			return nil
 		})
+	if err != nil {
+		return nil, err
 	}
 	return results, nil
 }
