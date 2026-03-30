@@ -87,6 +87,7 @@ func (r *Reader) IntrinsicColumnMeta(name string) (shared.IntrinsicColMeta, bool
 // IntrinsicColumnNames returns the names of all intrinsic columns in the TOC,
 // sorted alphabetically. Returns nil if no intrinsic section is present.
 // The returned slice is owned by the Reader; callers must not modify it.
+// NOT safe for concurrent use — Reader is single-goroutine (see NewReaderFromProvider doc).
 func (r *Reader) IntrinsicColumnNames() []string {
 	if len(r.intrinsicIndex) == 0 {
 		return nil
