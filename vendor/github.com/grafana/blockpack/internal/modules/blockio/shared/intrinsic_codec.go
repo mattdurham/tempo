@@ -116,7 +116,7 @@ func DecodeTOC(blob []byte) ([]IntrinsicColMeta, error) {
 //	  bloom_len[2 LE] + bloom[bloom_len]
 func EncodePageTOC(toc PagedIntrinsicTOC) ([]byte, error) {
 	var buf bytes.Buffer
-	buf.WriteByte(0x01) // page_toc_version = 0x01 (no ref-range fields)
+	buf.WriteByte(0x01) // page_toc_version
 
 	var tmp4 [4]byte
 	var tmp2 [2]byte
@@ -153,7 +153,6 @@ func EncodePageTOC(toc PagedIntrinsicTOC) ([]byte, error) {
 }
 
 // DecodePageTOC decompresses a page TOC blob and parses it into a PagedIntrinsicTOC.
-// Only version 0x01 (no ref-range fields) is supported. Unknown versions return an error.
 func DecodePageTOC(blob []byte) (PagedIntrinsicTOC, error) {
 	raw, err := snappy.Decode(nil, blob)
 	if err != nil {
@@ -163,12 +162,7 @@ func DecodePageTOC(blob []byte) (PagedIntrinsicTOC, error) {
 		return PagedIntrinsicTOC{}, fmt.Errorf("DecodePageTOC: too short: %d bytes", len(raw))
 	}
 	pos := 0
-	version := raw[pos]
-	pos++ // page_toc_version
-
-	if version != 0x01 {
-		return PagedIntrinsicTOC{}, fmt.Errorf("DecodePageTOC: unknown version %d", version)
-	}
+	pos++ // page_toc_version (0x01)
 
 	pageCount := int(binary.LittleEndian.Uint32(raw[pos:]))
 	pos += 4
@@ -483,21 +477,180 @@ func decodePagedColumnBlob(blob []byte) (*IntrinsicColumn, error) {
 	return merged, nil
 }
 
-// DecodeIntrinsicColumnBlob decodes a column data blob into an IntrinsicColumn.
-// Only the v2 paged format (first byte == IntrinsicPagedVersion = 0x02) is supported.
-// Returns an error for empty blobs or blobs with any other first byte (including legacy
-// v1 monolithic format). V1 format support was removed; files with v1 blobs must be
-// rewritten to use v2 paged format.
+// DecodeIntrinsicColumnBlob decompresses and decodes a column data blob into an IntrinsicColumn.
 func DecodeIntrinsicColumnBlob(blob []byte) (*IntrinsicColumn, error) {
-	if len(blob) == 0 {
-		return nil, fmt.Errorf("DecodeIntrinsicColumnBlob: empty blob")
-	}
 	// v2 paged format: first byte is IntrinsicPagedVersion (0x02).
 	// The blob is NOT snappy-compressed as a whole; it contains the page TOC + page blobs.
-	if blob[0] == IntrinsicPagedVersion {
+	if len(blob) > 0 && blob[0] == IntrinsicPagedVersion {
 		return decodePagedColumnBlob(blob)
 	}
-	return nil, fmt.Errorf("DecodeIntrinsicColumnBlob: unsupported intrinsic column format: expected v2 paged (0x%02x), got 0x%02x", IntrinsicPagedVersion, blob[0])
+
+	raw, err := snappy.Decode(nil, blob)
+	if err != nil {
+		return nil, fmt.Errorf("DecodeIntrinsicColumnBlob: snappy: %w", err)
+	}
+	if len(raw) < 3 {
+		return nil, fmt.Errorf("DecodeIntrinsicColumnBlob: too short")
+	}
+	pos := 0
+	// format_version[1]
+	pos++
+	format := raw[pos]
+	pos++
+	colType := ColumnType(raw[pos])
+	pos++
+
+	col := &IntrinsicColumn{Type: colType, Format: format}
+
+	if pos+4 > len(raw) {
+		return nil, fmt.Errorf("DecodeIntrinsicColumnBlob: truncated at row_count")
+	}
+	rowCount := int(binary.LittleEndian.Uint32(raw[pos:]))
+	pos += 4
+	col.Count = uint32(rowCount) //nolint:gosec
+
+	if format == IntrinsicFormatFlat {
+		if err := decodeLegacyFlatBlob(raw, pos, colType, rowCount, col); err != nil {
+			return nil, err
+		}
+	} else { // IntrinsicFormatDict
+		if err := decodeLegacyDictBlob(raw, pos, colType, rowCount, col); err != nil {
+			return nil, err
+		}
+	}
+	return col, nil
+}
+
+// decodeLegacyFlatBlob decodes the flat-format section of a legacy (v1) intrinsic column blob.
+// raw is the snappy-decoded buffer; pos is the offset after the row_count field.
+func decodeLegacyFlatBlob(raw []byte, pos int, colType ColumnType, rowCount int, col *IntrinsicColumn) error {
+	// block_idx_width[1] and row_idx_width[1] — variable-width ref encoding.
+	if pos+2 > len(raw) {
+		return fmt.Errorf("DecodeIntrinsicColumnBlob: truncated at ref widths")
+	}
+	blockW := int(raw[pos])
+	rowW := int(raw[pos+1])
+	pos += 2
+
+	isBytes := colType == ColumnTypeBytes
+	if isBytes {
+		col.BytesValues = make([][]byte, 0, rowCount)
+		for range rowCount {
+			if pos+2 > len(raw) {
+				return fmt.Errorf("DecodeIntrinsicColumnBlob: truncated at bytes len")
+			}
+			vLen := int(binary.LittleEndian.Uint16(raw[pos:]))
+			pos += 2
+			if pos+vLen > len(raw) {
+				return fmt.Errorf("DecodeIntrinsicColumnBlob: truncated at bytes value")
+			}
+			col.BytesValues = append(col.BytesValues, raw[pos:pos+vLen])
+			pos += vLen
+		}
+	} else {
+		// Delta-encoded uint64: each value is a delta from the previous.
+		col.Uint64Values = make([]uint64, 0, rowCount)
+		var acc uint64
+		for range rowCount {
+			if pos+8 > len(raw) {
+				return fmt.Errorf("DecodeIntrinsicColumnBlob: truncated at uint64 value")
+			}
+			acc += binary.LittleEndian.Uint64(raw[pos:])
+			col.Uint64Values = append(col.Uint64Values, acc)
+			pos += 8
+		}
+	}
+	// Refs parallel to values, using variable-width encoding.
+	col.BlockRefs = make([]BlockRef, 0, rowCount)
+	for range rowCount {
+		ref, newPos, err := decodeVariableWidthRef(raw, pos, blockW, rowW)
+		if err != nil {
+			return fmt.Errorf("DecodeIntrinsicColumnBlob: truncated at refs")
+		}
+		col.BlockRefs = append(col.BlockRefs, ref)
+		pos = newPos
+	}
+	return nil
+}
+
+// decodeLegacyDictBlob decodes the dict-format section of a legacy (v1) intrinsic column blob.
+// raw is the snappy-decoded buffer; pos is the offset after the row_count field.
+func decodeLegacyDictBlob(raw []byte, pos int, colType ColumnType, rowCount int, col *IntrinsicColumn) error {
+	isInt64 := colType == ColumnTypeInt64 || colType == ColumnTypeRangeInt64
+	valueCount := rowCount // for dict: row_count field holds value_count
+
+	// block_idx_width[1] and row_idx_width[1] — variable-width ref encoding.
+	if pos+2 > len(raw) {
+		return fmt.Errorf("DecodeIntrinsicColumnBlob: truncated at dict ref widths")
+	}
+	blockW := int(raw[pos])
+	rowW := int(raw[pos+1])
+	pos += 2
+
+	col.DictEntries = make([]IntrinsicDictEntry, 0, valueCount)
+	for range valueCount {
+		if pos+2 > len(raw) {
+			return fmt.Errorf("DecodeIntrinsicColumnBlob: truncated at dict value_len")
+		}
+		vLen := int(binary.LittleEndian.Uint16(raw[pos:]))
+		pos += 2
+		var entry IntrinsicDictEntry
+		if isInt64 && vLen == 0 {
+			if pos+8 > len(raw) {
+				return fmt.Errorf("DecodeIntrinsicColumnBlob: truncated at int64 value")
+			}
+			entry.Int64Val = int64(binary.LittleEndian.Uint64(raw[pos:])) //nolint:gosec
+			pos += 8
+		} else {
+			if pos+vLen > len(raw) {
+				return fmt.Errorf("DecodeIntrinsicColumnBlob: truncated at string value")
+			}
+			entry.Value = string(raw[pos : pos+vLen])
+			pos += vLen
+		}
+		if pos+4 > len(raw) {
+			return fmt.Errorf("DecodeIntrinsicColumnBlob: truncated at ref_count")
+		}
+		refCount := int(binary.LittleEndian.Uint32(raw[pos:]))
+		pos += 4
+		entry.BlockRefs = make([]BlockRef, 0, refCount)
+		for range refCount {
+			ref, newPos, err := decodeVariableWidthRef(raw, pos, blockW, rowW)
+			if err != nil {
+				return fmt.Errorf("DecodeIntrinsicColumnBlob: truncated at dict refs")
+			}
+			entry.BlockRefs = append(entry.BlockRefs, ref)
+			pos = newPos
+		}
+		col.DictEntries = append(col.DictEntries, entry)
+	}
+	return nil
+}
+
+// decodeVariableWidthRef decodes a single BlockRef using variable-width block/row index encoding.
+// Returns the decoded ref, updated position, and any bounds error.
+func decodeVariableWidthRef(raw []byte, pos, blockW, rowW int) (BlockRef, int, error) {
+	refSize := blockW + rowW
+	if pos+refSize > len(raw) {
+		return BlockRef{}, pos, fmt.Errorf("truncated ref")
+	}
+	var blockIdx uint16
+	if blockW == 1 {
+		blockIdx = uint16(raw[pos])
+		pos++
+	} else {
+		blockIdx = binary.LittleEndian.Uint16(raw[pos:])
+		pos += 2
+	}
+	var rowIdx uint16
+	if rowW == 1 {
+		rowIdx = uint16(raw[pos])
+		pos++
+	} else {
+		rowIdx = binary.LittleEndian.Uint16(raw[pos:])
+		pos += 2
+	}
+	return BlockRef{BlockIdx: blockIdx, RowIdx: rowIdx}, pos, nil
 }
 
 // --- Raw-byte scanning functions ---
@@ -763,6 +916,7 @@ func parsePagedBlobHeader(blob []byte) (PagedIntrinsicTOC, int, bool) {
 	}
 	toc, err := DecodePageTOC(blob[5 : 5+tocLen])
 	if err != nil {
+		slog.Error("parsePagedBlobHeader: DecodePageTOC failed", "err", err)
 		return PagedIntrinsicTOC{}, 0, false
 	}
 	return toc, 5 + tocLen, true

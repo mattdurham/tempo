@@ -1,11 +1,12 @@
 # objectcache Module — Specifications
 
-## SPEC-OC-001: Get — nil on miss or GC eviction
+## SPEC-OC-001: Get — nil on miss
 *Added: 2026-03-23*
+*Updated: 2026-03-29*
 
-`Get(key string) *V` returns nil in two cases:
-1. No entry has ever been stored under `key`.
-2. An entry was stored but the GC reclaimed it (no strong references remained).
+`Get(key string) *V` returns nil when no entry has ever been stored under `key`,
+or when a previous entry was removed via `Clear`. There is no GC-cooperative
+eviction — entries are held by strong reference until explicitly removed.
 
 Callers must treat nil as a cache miss and recompute/re-fetch the value.
 
@@ -13,41 +14,52 @@ Back-ref: `internal/modules/objectcache/cache.go:Cache.Get`
 
 ---
 
-## SPEC-OC-002: Put — stores weak reference; caller retains ownership
+## SPEC-OC-002: Put — stores strong reference
 *Added: 2026-03-23*
+*Updated: 2026-03-29*
 
-`Put(key string, v *V)` stores `weak.Make(v)`. The entry is only guaranteed
-retrievable as long as at least one strong pointer to `*V` is held elsewhere.
-For immutable data (parsed metadata, sketches), a second Put for the same key
-is benign — it overwrites with an equivalent value.
+`Put(key string, v *V)` stores a strong `*V` reference in the underlying
+`sync.Map`. Entries are retained for the lifetime of the process (or until
+`Clear` is called) — the GC will not reclaim cached values. For immutable data
+(parsed metadata, sketches), a second Put for the same key is benign — it
+overwrites with an equivalent value.
 
 If `v` is nil, `Put` returns an error and no entry is stored.
+
+Memory is bounded at the process level by `GOMEMLIMIT`.
 
 Back-ref: `internal/modules/objectcache/cache.go:Cache.Put`
 
 ---
 
-## SPEC-OC-003: GC-cooperative eviction
+## SPEC-OC-003: Memory bound via GOMEMLIMIT
 *Added: 2026-03-23*
+*Updated: 2026-03-29*
 
-The GC may reclaim any value in the cache when no strong references remain.
-This is the primary design goal: the cache does not prevent GC of stale file
-metadata in long-running processes.
+Entries are NOT GC'd while in the cache. The cache grows without explicit
+eviction. Memory is bounded at the process level by `GOMEMLIMIT` — the Go
+runtime soft-memory limit triggers GC pressure before OOM. Operators must set
+`GOMEMLIMIT` appropriately for their deployment.
+
+No per-entry eviction policy is implemented. Cached values (parsed file
+metadata, sketch indexes, decoded intrinsic columns) are immutable and
+process-scoped; they remain valid and useful for the entire process lifetime.
 
 ---
 
-## SPEC-OC-004: Lazy stale-key deletion
+## SPEC-OC-004: No stale-key cleanup required
 *Added: 2026-03-23*
+*Updated: 2026-03-29*
 
-When `Get` detects that the weak pointer's `.Value()` is nil (GC'd), it calls
-`c.m.Delete(key)` before returning nil. This prevents unbounded map key
-accumulation in processes that open and close many distinct files over time.
+Because entries are held by strong reference, there are no GC'd (nil) weak
+pointers to clean up. The map never accumulates dead entries. No lazy deletion
+on `Get` is performed.
 
 Back-ref: `internal/modules/objectcache/cache.go:Cache.Get`
 
 ---
 
-## SPEC-OC-005: Clear — removes all entries
+## SPEC-OC-005: Clear removes all entries
 *Added: 2026-03-23*
 
 `Clear()` removes all entries via Range+Delete. Intended for test teardown

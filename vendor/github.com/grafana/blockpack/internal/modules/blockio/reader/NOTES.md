@@ -60,8 +60,9 @@ Back-ref: `internal/modules/blockio/reader/column.go:decodeNow`
 
 ---
 
-## NOTE-003: objectcache Migration — GC-Cooperative Process-Level Caches
+## NOTE-003: objectcache Migration — Process-Level Caches with Strong References
 *Added: 2026-03-23*
+*Updated: 2026-03-29*
 
 **Problem:** The three `sync.Map` process-level caches in `parser.go` held strong
 `*T` pointers, causing parsed file metadata (~45 MB per file after snappy decode),
@@ -73,17 +74,22 @@ process-level cache at all — it was re-decoded from bbolt bytes on every
 
 **Solution:** Replace all three `sync.Map` globals with `objectcache.Cache[T]`
 instances (new `internal/modules/objectcache/` module). Add a fourth cache for
-the intrinsic TOC. `objectcache.Cache[T]` stores `weak.Pointer[T]` values:
+the intrinsic TOC. `objectcache.Cache[T]` stores strong `*T` references:
 
-- GC may reclaim entries when no `*Reader` holds a strong reference (Go 1.24+
-  `weak` package; go.mod declares `go 1.26.0`).
-- Stale map keys are deleted lazily on `Get` (prevents key accumulation).
+- Entries are retained for the process lifetime; no GC reclamation occurs.
+- Memory is bounded by `GOMEMLIMIT` at the process level.
 - `ClearCaches()` updated to call `.Clear()` on all four instances.
+
+*Addendum (2026-03-29):* An intermediate design used `weak.Pointer[T]` for
+GC-cooperative eviction. Profiling revealed a 50x regression — weak entries were
+reclaimed between block scans, forcing constant re-decode from file cache. The
+implementation was reverted to strong references. See objectcache NOTE-OC-001 for
+the full rationale.
 
 **`metadataBytes` safety:** `*Reader` copies `pm.metadataBytes` at construction,
 establishing a strong ref chain `Reader → metadataBytes` independent of the cache.
 Range index offsets sub-slice into this copied pointer, remaining valid for the
-entire reader lifetime regardless of GC activity on the cache entry.
+entire reader lifetime.
 
 **Concurrent double-parse:** Two goroutines opening the same file simultaneously
 may both miss the cache and both parse. The second `Put` overwrites with an

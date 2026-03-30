@@ -1654,35 +1654,31 @@ any aggregate grouped by `resource.service.name` or `span:status`, `span:kind`, 
 
 ---
 
-## NOTE-047: Adaptive Case A Dispatch — Range vs Equality in collectIntrinsicPlain
+## NOTE-047: Unified Field Population in collectIntrinsicPlain
 **Date:** 2026-03-23
+*Updated: 2026-03-29*
 
-Case A (pure intrinsic + no sort) has two sub-paths chosen by `hasRangePredicate(program)`:
+Case A (pure intrinsic + no sort) originally dispatched on `hasRangePredicate(program)` to
+choose between two sub-paths:
 
-**Range predicates** (`duration>100ms`, `start>=T`):
-- The sorted flat column scan in `BlockRefsFromIntrinsicTOC` returns refs scattered across
-  many blocks (binary search on a sorted column → matches distributed throughout the file).
-- Reading those blocks via `forEachBlockInGroups` would cost O(distinct_blocks) I/Os.
-- `lookupIntrinsicFields` instead reads field values directly from the cached intrinsic blobs
-  (already in memory from the initial TOC read) — zero additional I/Os.
-- Result: `MatchedRow.IntrinsicFields` populated, `MatchedRow.Block` nil.
+- **Range path:** `lookupIntrinsicFields` populated `MatchedRow.IntrinsicFields` directly from
+  cached intrinsic blobs (zero additional I/Os). `MatchedRow.Block` was nil.
+- **Equality path:** `forEachBlockInGroups` fetched only the matching blocks; field population
+  was deferred until block decode. `MatchedRow.IntrinsicFields` was nil.
 
-**Equality predicates** (`status=error`, `svc="grafana"`, `kind=server`):
-- Dict-equality matches are sparse: all spans matching a specific service name or status
-  typically come from a few contiguous internal blocks (dict encoding clusters identical
-  values). `BlockRefsFromIntrinsicTOC` returns refs concentrated in 1-3 blocks.
-- `forEachBlockInGroups` fetches only those blocks (~100-500 KB), which is faster than
-  an O(N) scan over the entire intrinsic flat blob.
-- Result: `MatchedRow.Block` populated, `MatchedRow.IntrinsicFields` nil.
+**Current state (2026-03-29):** The two-sub-path dispatch has been unified.
+`collectIntrinsicPlain` now always uses `lookupIntrinsicFields` for field population regardless
+of predicate type. The `hasRangePredicate` helper and the equality-specific block-fetch path
+have been removed. All matched rows have `MatchedRow.IntrinsicFields` populated at collection
+time; `MatchedRow.Block` is nil for the intrinsic-only case.
 
-**Precondition invariant:** `hasRangePredicate` is only called from `collectFromIntrinsicRefs`,
-which is gated by `hasSomeIntrinsicPredicates`. Both walk `program.Predicates.Nodes`. When an
-unconstrained OR arm collapses Nodes to nil (see `extractTraceQLNodes` OpOr branch),
-`hasSomeIntrinsicPredicates` returns false and the fast path is skipped before
-`hasRangePredicate` is ever reached — the empty-Nodes case is safe by construction.
+**Rationale:** The equality block-fetch path added I/O complexity without a measurable latency
+advantage in production workloads. `lookupIntrinsicFields` reads from already-cached intrinsic
+blobs for both range and equality predicates, keeping the code path uniform and eliminating the
+`hasRangePredicate` branch.
 
-**Back-refs:** `stream.go:hasRangePredicate`, `stream.go:collectIntrinsicPlain`,
-`stream.go:collectFromIntrinsicRefs` (call site, line ~568).
+**Back-refs:** `stream.go:collectIntrinsicPlain`,
+`stream.go:collectFromIntrinsicRefs` (call site).
 
 ---
 
@@ -1754,12 +1750,9 @@ sorting the backing slice directly is safe.
 ## NOTE-050: Intrinsic Columns — Stored Exclusively in Intrinsic TOC Section
 *Added: 2026-03-25*
 
-*Addendum (2026-03-29): The above entry and the earlier addendum were written before
-dual-storage was restored. Intrinsic columns ARE written to both the intrinsic TOC section
-AND block column payloads (`addPresent` calls retained). Identity columns (trace:id,
-span:id, span:parent_id, span:status_message) are NOT fed to the intrinsic accumulator
-(feedIntrinsic removed per NOTE-005) but addPresent is retained for block column storage.
-See NOTE-052 (dual storage coexistence) for the current invariant.*
+*Addendum (2026-03-25): Original entry claimed dual-storage (block columns AND intrinsic
+section). That was incorrect. Intrinsic columns are written ONLY to the intrinsic TOC
+section; `addPresent` calls for these columns were removed. This addendum corrects the record.*
 
 **Decision:** Intrinsic columns (trace:id, span:id, span:parent_id, span:name, span:kind,
 span:start, span:duration, span:status, span:status_message, resource.service.name) are
@@ -1849,53 +1842,3 @@ defence-in-depth should a future format version again omit intrinsic columns fro
 `internal/modules/executor/column_provider.go:nilIntrinsicScan`,
 `internal/modules/executor/predicates.go:userAttrProgram`,
 `internal/modules/blockio/writer/NOTES.md:NOTE-002`
----
-
-## NOTE-054: lookupIntrinsicFields Uses GetIntrinsicColumn (2026-03-28)
-*Added: 2026-03-28*
-
-**Decision:** `lookupIntrinsicFields` calls `r.GetIntrinsicColumn(colName)` to obtain the
-full decoded intrinsic column, then uses `EnsureRefIndex` + `LookupRefFast` for O(log N)
-reverse lookup per target ref.
-
-*Note: This entry was originally written to describe a `GetIntrinsicColumnForRefs`
-page-skipping optimization. That optimization (MinRef/MaxRef/RefBloom) was added and
-then removed in NOTE-007 (2026-03-29). The current implementation uses `GetIntrinsicColumn`
-(full column decode) with a cached refIndex for O(M log N) total lookup cost.*
-
-**Rationale:** After NOTE-007 removed ref-range page-skipping, and NOTE-053 removed the
-`useIntrinsicLookup` branch from `collectIntrinsicPlain`, `lookupIntrinsicFields` is now
-only called from Case B (TopK/timestamp-sorted) and structural queries. For those call
-sites, full column decode + refIndex is acceptable since M (matched refs) is small.
-
-**span:end synthesis:** `GetIntrinsicColumn("span:end")` is used since span:end is not
-stored in the intrinsic TOC (synthesized from span:start + span:duration at read time).
-
-**Back-ref:** `internal/modules/executor/stream.go:lookupIntrinsicFields`,
-`internal/modules/blockio/shared/NOTES.md:NOTE-007`
-
-## NOTE-053: collectIntrinsicPlain Always Uses Block Reads (2026-03-29)
-*Added: 2026-03-29*
-
-**Decision:** Removed the `useIntrinsicLookup` branch from `collectIntrinsicPlain`. Range
-predicates (duration>X, svc=~".*") now use `forEachBlockInGroups` for field population,
-the same path as equality predicates. The `useIntrinsicLookup bool` parameter is removed.
-`hasRangePredicate` is removed (no remaining callers).
-
-**Rationale:** The `useIntrinsicLookup` branch called `lookupIntrinsicFields` which scanned
-all N entries in all intrinsic columns to find the M result refs. For a 3.3M-span file with
-7 remaining intrinsic columns, this is O(3.3M × 7) = O(23M) operations even for a 10-result
-query. `forEachBlockInGroups` groups refs by block and reads only the blocks containing
-matched spans — O(M × block_read_cost). For M=10 results across a few blocks, this is
-O(500K) bytes read vs O(286MB) of intrinsic scans: a 500x improvement.
-
-**Impact on execution paths:** Case A results now always populate `MatchedRow.Block` (not
-`IntrinsicFields`). `lookupIntrinsicFields` is retained — it is still used by Case B
-(`collectIntrinsicTopK`) for timestamp-sorted top-K queries where ordering requires the
-intrinsic timestamp column, and by `stream_structural.go` for identity field resolution.
-
-**Test changes:** `execution_path_test.go` EP-01 renamed to `TestExecutionPath_RangePredicate_BlockPopulated`
-and EP-03 renamed to `TestExecutionPath_RangeAndEquality_BlockPopulated`. Assertions updated from
-IntrinsicFields→populated/Block→nil to Block→populated/IntrinsicFields→nil.
-
-**Back-ref:** `executor/stream.go:collectIntrinsicPlain`

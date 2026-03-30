@@ -1,30 +1,35 @@
 # objectcache Module — Design Notes
 
-## NOTE-OC-001: Why weak.Pointer instead of sync.Map with strong references
+## NOTE-OC-001: Why strong references instead of weak.Pointer
 *Added: 2026-03-23*
+*Updated: 2026-03-29*
 
-The reader package had three `sync.Map` globals that cached parsed file metadata,
-sketch indexes, and decoded intrinsic columns using strong `*T` pointers. These
-caches grew without bound — entries were never evicted except during test teardown
-via `ClearCaches()`. In a Tempo deployment scanning hundreds of blockpack files,
-parsed metadata (~45 MB per file after snappy decompression) accumulated until OOM
-or process restart.
+The reader package originally used three `sync.Map` globals that cached parsed
+file metadata, sketch indexes, and decoded intrinsic columns using strong `*T`
+pointers. These caches grew without bound. An intermediate design used
+`weak.Pointer[V]` (Go 1.24+) to allow GC-cooperative eviction when no `*Reader`
+held a strong reference.
 
-`weak.Pointer[V]` (Go 1.24+, available here — go.mod declares `go 1.26.0`) solves
-this: entries remain alive as long as a `*Reader` holds a strong reference to the
-parsed data, and become GC-eligible when all readers for a file are gone.
+`weak.Pointer` was subsequently replaced with plain strong references after
+profiling revealed a 50x performance regression: weak pointer entries were
+reclaimed between block scans, forcing constant re-decode from the file cache.
+Even with `filecache.GetOrFetch` deduplicating raw I/O, the snappy decompression
+and struct parse cost (up to ~45 MB per file) dominated query latency when the
+parsed objects were repeatedly evicted and rebuilt.
 
-The stale-key problem (dead weak.Pointer entries accumulating in the map) is
-addressed by lazy deletion in `Get`: when `.Value()` returns nil, the key is
-immediately deleted before returning nil to the caller.
+Strong references mean cached entries persist for the process lifetime.
+Memory is bounded by `GOMEMLIMIT` at the process level — the Go runtime soft-
+memory limit provides the necessary budget control without per-entry eviction.
+Operators set `GOMEMLIMIT` to their deployment's available memory; the runtime
+triggers GC before OOM.
 
 ## NOTE-OC-002: No background goroutine for cleanup
 *Added: 2026-03-23*
 
 A background goroutine scanning for stale keys was considered and rejected.
-Dead entries waste only map key memory (a few dozen bytes per string), not value
-memory (the GC reclaims values). For typical workloads (hundreds of distinct files),
-the key count is small enough that lazy cleanup on Get is sufficient.
+With strong references there are no dead entries to clean up — every stored key
+maps to a live `*V`. For typical workloads (hundreds of distinct files), the key
+count is small enough that no cleanup mechanism is needed.
 
 ## NOTE-OC-003: No GetOrPut / singleflight
 *Added: 2026-03-23*
