@@ -1,6 +1,7 @@
 // Package objectcache provides a generic, concurrent in-memory cache with strong references.
 // Entries are retained until explicitly cleared — the GC will not reclaim cached values.
-// Use GOMEMLIMIT to bound total process memory; the cache grows within that budget.
+// Callers must call Clear or manage cache lifetime to prevent unbounded growth.
+// GOMEMLIMIT controls GC pacing but is NOT a hard memory cap.
 package objectcache
 
 // NOTE: Any changes to this file must be reflected in the corresponding SPECS.md or NOTES.md.
