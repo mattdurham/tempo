@@ -4,6 +4,7 @@ package executor
 
 import (
 	"encoding/binary"
+	"log/slog"
 	"math"
 	"math/bits"
 	"regexp"
@@ -2011,7 +2012,13 @@ func scanIntrinsicLeafRefs(
 	// Prefer GetIntrinsicColumn: populates objectcache on first call, returns
 	// in-memory decoded column on subsequent calls — zero disk I/O when warm.
 	col, err := r.GetIntrinsicColumn(colName)
-	if err != nil || col == nil {
+	if err != nil {
+		// SPEC-ROOT-010: propagate decode errors — silent fallback caused 50x perf regression.
+		slog.Error("scanIntrinsicLeafRefs: GetIntrinsicColumn failed — query will use slow fallback",
+			"column", colName, "err", err)
+		return nil
+	}
+	if col == nil {
 		return nil
 	}
 

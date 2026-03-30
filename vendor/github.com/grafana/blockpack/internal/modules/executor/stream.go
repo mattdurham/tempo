@@ -6,6 +6,7 @@ import (
 	"cmp"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"sync"
 
@@ -117,6 +118,10 @@ type CollectStats struct {
 	// MixedCandidateBlocks is the number of unique candidate blocks from the partial-AND
 	// pre-filter for Cases C and D (mixed queries). Zero for all other paths.
 	MixedCandidateBlocks int
+	// IntrinsicFallback is true when the intrinsic fast path was attempted but failed,
+	// falling back to the slower scanBlocks path. Check this to detect silent degradation.
+	// SPEC-ROOT-010: never silently degrade — callers should log or alert on this.
+	IntrinsicFallback bool
 }
 
 // MatchedRow holds a single row result from Collect.
@@ -599,7 +604,12 @@ func collectFromIntrinsicRefs(
 		refs = blockRefsFromIntrinsicPartial(r, program, 0)
 	}
 	if refs == nil {
+		// SPEC-ROOT-010: error-level log when intrinsic fast path fails — silent fallback
+		// to scanBlocks caused a 50x perf regression undetected for days.
+		slog.Error("collectFromIntrinsicRefs: intrinsic fast path failed, falling back to slow scanBlocks",
+			"isPureIntrinsic", isPureIntrinsic, "hasSort", hasSort)
 		stats.ExecutionPath = "intrinsic-need-block-scan"
+		stats.IntrinsicFallback = true
 		return nil, errNeedBlockScan
 	}
 	if len(refs) == 0 {

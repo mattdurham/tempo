@@ -1,6 +1,6 @@
 # Implementation Status
 
-Generated: 2026-03-16T00:00:00Z
+Generated: 2026-03-29T00:00:00Z
 Status: COMPLETE
 
 ---
@@ -8,128 +8,60 @@ Status: COMPLETE
 ## Changes Made
 
 **Files Modified:**
-- `vendor/github.com/grafana/blockpack/internal/modules/executor/predicates.go`
-  — Added `regexp` import
-  — Updated `intrinsicDictMatches`: regex support when `leaf.Pattern != ""`
-  — Updated `scanIntrinsicLeafRefs`: regex path for dict columns via `ScanDictColumnRefsWithBloom` with nil bloom keys
-  — Added `countIntrinsicLeaves`, `unionBlockRefs`, `intersectBlockRefSets` helpers
-  — Added `evalNodeBlockRefs` recursive helper (OR union / AND intersect)
-  — Replaced `BlockRefsFromIntrinsicTOC` implementation to use `evalNodeBlockRefs`
-
-- `vendor/github.com/grafana/blockpack/internal/modules/executor/stream.go`
-  — Added `errors` import
-  — Added `errNeedBlockScan` sentinel error variable
-  — Removed `programCanUseIntrinsicFastPath` and `nodeCanUseIntrinsicFastPath` workaround functions
-  — Updated `classifyCollect`: removed `&& programCanUseIntrinsicFastPath(program)` guard
-  — Added `unionSortedKeys`, `intersectSortedKeys` helpers for `[]uint32`
-  — Added `evalNodeMatchKeys` recursive helper (OR union / AND intersect on sorted keys)
-  — Replaced `buildPredicateMatchSet` implementation to use `evalNodeMatchKeys`
-  — Updated `collectTopKFromIntrinsicRefs`: returns `errNeedBlockScan` instead of `(nil, nil)` when fast path unavailable
-  — Updated `collectIntrinsicPlain`: returns `errNeedBlockScan` instead of `(nil, nil)` when refs == nil
-  — Updated `Collect` dispatcher: handles `errNeedBlockScan` fallback for both intrinsic modes
-
-**Spec Files Updated:**
-- `vendor/github.com/grafana/blockpack/internal/modules/executor/NOTES.md` — NOTE-039 added
-- `vendor/github.com/grafana/blockpack/internal/modules/executor/SPECS.md` — execution mode table updated with fallback description
-- `vendor/github.com/grafana/blockpack/internal/modules/executor/TESTS.md` — EX-OR-01 through EX-OR-06 added
+- `vendor/github.com/grafana/blockpack/internal/modules/executor/stream.go` — 3 comment fixes
+- `vendor/github.com/grafana/blockpack/internal/modules/executor/NOTES.md` — NOTE-NNN → NOTE-054, NOTE-050 addendum corrected
+- `vendor/github.com/grafana/blockpack/internal/modules/blockio/shared/NOTES.md` — NOTE-006 forward cross-ref added
+- `vendor/github.com/grafana/blockpack/internal/modules/blockio/writer/intrinsic_accum.go` — feedBytes docstring updated
+- `vendor/github.com/grafana/blockpack/internal/modules/executor/TESTS.md` — EP-01 through EP-05 entries added
 
 ---
 
-## Implementation Summary
+## Changes by Issue
 
-Fixed three bugs in the blockpack intrinsic fast path and added proper OR/regex support:
+### HIGH-1 (stream.go:217-219): NOTE-050 comment about intrinsic columns not in block payloads
+- Updated comment to say the fast path prevents false-negative results for files from the PR #172 window, without falsely claiming intrinsic columns are absent from block payloads.
 
-**Bug 1 — OR bug:** `collectIntrinsicLeaves` skipped OR nodes, so OR queries returned 0 results.
-Fixed by replacing the flat leaf-collect + intersect pattern with `evalNodeBlockRefs` (in
-predicates.go) and `evalNodeMatchKeys` (in stream.go) — both recursive helpers that handle
-OR (union) and AND (intersect) correctly.
+### HIGH-2 (stream.go:1216-1218): lookupIntrinsicFields page-skipping comment referencing removed MinRef/MaxRef/RefBloom
+- Replaced with accurate documentation: uses GetIntrinsicColumn (full column decode), refIndex provides O(log N) lookup, NOTE-007 removed page-skipping.
 
-**Bug 2 — Regex bug:** `intrinsicDictMatches` and `scanIntrinsicLeafRefs` returned nil for
-regex patterns on dict columns. Fixed by adding regex compilation + dict entry matching when
-`leaf.Pattern != ""` and `len(leaf.Values) == 0`.
+### MEDIUM-3 (executor/NOTES.md): NOTE-NNN placeholder
+- Renamed to NOTE-054. Updated the body to reflect the post-NOTE-007 reality: function uses GetIntrinsicColumn, not GetIntrinsicColumnForRefs (which was removed with MinRef/MaxRef/RefBloom).
 
-**Bug 3 — Fallback bug:** When the fast path returned nil (predicate not evaluable), the caller
-returned `(nil, nil)` = empty results instead of falling through to block scan. Fixed by
-introducing `errNeedBlockScan` sentinel error and updating the `Collect` dispatcher to fall
-through to `collectBlockTopK` / `collectBlockPlain` when the sentinel is received.
+### MEDIUM-4 (stream.go:185-193): secondPassCols comment about identity values source
+- Updated to accurately state that identity columns (NOTE-005) are in block payloads only; Case A populates MatchedRow.Block via forEachBlockInGroups (NOTE-053).
 
-**Workaround removed:** `programCanUseIntrinsicFastPath` and `nodeCanUseIntrinsicFastPath`
-(which restricted the intrinsic fast path to equality-only predicates) have been deleted.
-`classifyCollect` now enables the fast path for all intrinsic-only programs and lets
-`errNeedBlockScan` handle the fallback at execution time.
+### MEDIUM-5 (executor/NOTES.md NOTE-050 addendum): Addendum claimed addPresent calls were removed
+- Replaced addendum with corrected entry: dual storage is intact, addPresent calls retained, identity columns not fed to intrinsic accumulator but addPresent preserved. References NOTE-052.
 
-**Key Features:**
-- OR predicates on intrinsic columns: union semantics, all children must be evaluable
-- AND predicates: intersect evaluable children, skip unevaluable ones (conservative over-fetch)
-- Regex on dict columns: `regexp.Compile` + per-entry matching, nil bloom keys (can't prune for regex)
-- `errNeedBlockScan` sentinel: clean separation between "no results" and "try block scan"
-- `unionSortedKeys` / `intersectSortedKeys` helpers for sorted `[]uint32` key operations
+### LOW-6 (shared/NOTES.md NOTE-006): Missing forward cross-reference to NOTE-007
+- Added: `*Superseded by NOTE-007 (2026-03-29): RefBloom/MinRef/MaxRef removed. See NOTE-007 for rationale.*`
 
-**Test Results (integration via /tmp/check_regex2.go):**
-All 9 queries return 400 spans:
-- equality loki-querier: 400
-- regex loki-querier (exact): 400
-- regex loki-.* (wildcard): 400
-- regex .*loki.* (contains): 400
-- OR two equalities: 400
-- OR: grafana OR loki-querier: 400
-- span regex: 400
-- equality grafana: 400
-- span attr + regex svc: 400
+### LOW-7 (intrinsic_accum.go feedBytes docstring): Mentioned removed identity columns
+- Updated to: `// feedBytes adds one byte slice value to the named flat column.`
+
+### MEDIUM-3b (executor/TESTS.md): EP-01 through EP-05 not documented
+- Added EP-01 through EP-05 entries at the end of TESTS.md, each with scenario/setup/assertions and back-ref to execution_path_test.go.
 
 ---
 
-## TDD Process Followed
-
-Integration test verified: `go run -mod=vendor /tmp/check_regex2.go` — all 9 queries return 400
-Build verified: `go build -mod=vendor ./vendor/github.com/grafana/blockpack/...` — no errors
-Vet verified: `go vet -mod=vendor ./vendor/github.com/grafana/blockpack/...` — no warnings
-
----
-
-## Code Quality
-
-**Formatting:** Standard gofmt-compatible; follows existing file style
-**Complexity:** All new helpers are small and focused; recursive helpers have bounded depth
-**Error Handling:** Explicit — `errNeedBlockScan` sentinel, `(nil, false)` for unevaluable nodes
-**Documentation:** All exported items documented; NOTE-039 added to NOTES.md
-
----
-
-## Spec-Driven Compliance
-
-- SPECS.md updated: execution mode table updated to describe errNeedBlockScan fallback
-- NOTES.md entry added: NOTE-039 (OR and Regex Support in Intrinsic Fast Path with errNeedBlockScan Fallback)
-- TESTS.md updated: EX-OR-01 through EX-OR-06 added (6 new test scenarios documented)
-- BENCHMARKS.md updated: N/A (no new benchmarks required)
-- NOTE invariant on new .go files: N/A (no new files created)
-
----
-
-## Verification Commands
+## Verification
 
 ```bash
-# Build
-go build -mod=vendor ./vendor/github.com/grafana/blockpack/...
-
-# Vet
-go vet -mod=vendor ./vendor/github.com/grafana/blockpack/...
-
-# Integration test
-go run -mod=vendor /tmp/check_regex2.go
-# Expected: all 9 queries return 400 spans
+go build ./tempodb/...
+# PASS — no output
 ```
+
+---
+
+## TDD Process
+
+N/A — comment and documentation fixes only. No code logic changed.
 
 ---
 
 ## For workflow-coder
 
 **STATUS:** COMPLETE
-**FILES_CHANGED:**
-- vendor/github.com/grafana/blockpack/internal/modules/executor/predicates.go
-- vendor/github.com/grafana/blockpack/internal/modules/executor/stream.go
-- vendor/github.com/grafana/blockpack/internal/modules/executor/NOTES.md
-- vendor/github.com/grafana/blockpack/internal/modules/executor/SPECS.md
-- vendor/github.com/grafana/blockpack/internal/modules/executor/TESTS.md
-**TESTS_ADDED:** 6 scenario entries in TESTS.md; integration verified via /tmp/check_regex2.go
+**FILES_CHANGED:** stream.go, NOTES.md (executor), NOTES.md (shared), intrinsic_accum.go, TESTS.md (executor)
+**TESTS_ADDED:** 0 (documentation only)
 **READY_FOR_REVIEW:** true
