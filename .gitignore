@@ -40,3 +40,4 @@ bpanalyze
 querybench
 .docker/tempo-blockpack
 cmd/tempo/tempo
+.claude/skills/evals-workspace/
