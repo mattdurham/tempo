@@ -94,7 +94,8 @@ type CollectStats struct {
 	// "intrinsic-topk-scan" (Case B scan path), "mixed-plain" (Case C),
 	// "mixed-topk" (Case D), "block-plain" (block-scan no sort),
 	// "block-topk" (block-scan with topK heap),
-	// "intrinsic-need-block-scan" (fast path fell through to block scan).
+	// "intrinsic-need-block-scan" (fast path fell through to block scan),
+	// "bloom-rejected" (all candidate blocks eliminated by bloom filter).
 	// NOTE-043, NOTE-044: see also SortScanThreshold.
 	ExecutionPath  string
 	TotalBlocks    int
@@ -219,15 +220,9 @@ func Collect(
 	// evaluate nil columns and return 0 results for any intrinsic predicate.
 	// Mixed queries (Cases C/D) still require Limit > 0 to bound the pre-filter cost.
 	if hasSomeIntrinsicPredicates(program) && (opts.Limit > 0 || ProgramIsIntrinsicOnly(program)) {
-		// SPEC-INTRINSIC-004: check file-level bloom before any intrinsic scan.
-		if program.Predicates != nil && fileLevelBloomReject(r, program.Predicates.Nodes) {
-			return nil, nil
-		}
-
 		var fastStats CollectStats
 		fastStats.TotalBlocks = r.BlockCount() // populate for OnStats callers (NOTE-050)
-		rows, err := collectFromIntrinsicRefs(r, program, opts, wantColumns, secondPassCols,
-			&fastStats)
+		rows, err := collectWithBloomCheck(r, program, opts, wantColumns, secondPassCols, &fastStats)
 		if err != errNeedBlockScan {
 			// Fast path produced a definitive result (rows, empty result, or error).
 			// Call OnStats synchronously before returning. SPEC-STREAM-6 extended.
@@ -545,8 +540,8 @@ func countUniqueBlockIdxs(refs []modules_shared.BlockRef) int {
 // collectFromIntrinsicRefs is the unified intrinsic pre-filter fast path.
 // It dispatches based on (ProgramIsIntrinsicOnly × opts.TimestampColumn != ""):
 //
-//	Case A: pure intrinsic + no sort  → BlockRefsFromIntrinsicTOC → fetch candidate
-//	        blocks → return MatchedRows (minimal block reads)
+//	Case A: pure intrinsic + no sort  → BlockRefsFromIntrinsicTOC → lookupIntrinsicFields
+//	        → return IntrinsicFields MatchedRows (ZERO block reads; fields from objectcache)
 //	Case B: pure intrinsic + sort     → BlockRefsFromIntrinsicTOC → pack into sorted
 //	        keys → ScanFlatColumnRefsFiltered → return IntrinsicFields MatchedRows
 //	        (ZERO block reads)
@@ -558,6 +553,24 @@ func countUniqueBlockIdxs(refs []modules_shared.BlockRef) int {
 // Returns (nil, errNeedBlockScan) when no intrinsic constraint is available (fall through
 // to full block scan). Returns (nil, nil) for valid empty-result cases.
 //
+// collectWithBloomCheck runs the intrinsic fast path with a FileBloom pre-check.
+// SPEC-INTRINSIC-004: reject the file in O(1) if bloom says no span matches.
+// SPEC-STREAM-6: always call OnStats before returning.
+func collectWithBloomCheck(
+	r *modules_reader.Reader,
+	program *vm.Program,
+	opts CollectOptions,
+	wantColumns map[string]struct{},
+	secondPassCols map[string]struct{},
+	stats *CollectStats,
+) ([]MatchedRow, error) {
+	if program.Predicates != nil && fileLevelBloomReject(r, program.Predicates.Nodes) {
+		stats.ExecutionPath = "bloom-rejected"
+		return nil, nil
+	}
+	return collectFromIntrinsicRefs(r, program, opts, wantColumns, secondPassCols, stats)
+}
+
 // NOTE-038: The partial-AND pre-filter for mixed queries is a superset; ColumnPredicate
 // re-evaluation in Cases C/D provides correctness. Global top-K is preserved for Case D
 // because the pre-filter never excludes true matches (it is a superset, never a subset).
@@ -620,7 +633,7 @@ func collectFromIntrinsicRefs(
 		return collectIntrinsicPlain(r, refs, opts, wantColumns, secondPassCols, stats)
 	}
 	if isPureIntrinsic && hasSort {
-		return collectIntrinsicTopK(r, refs, opts, secondPassCols, stats)
+		return collectIntrinsicTopK(r, refs, opts, wantColumns, secondPassCols, stats)
 	}
 	if !hasSort {
 		// Case C: mixed + no sort
@@ -764,17 +777,24 @@ func collectIntrinsicPlain(
 		refs = refs[:opts.Limit]
 	}
 
-	// Resolve fields from objectcache-backed intrinsic columns — zero S3 I/O after
-	// warmup. lookupIntrinsicFields uses EnsureRefIndex for O(M log N) binary search
-	// per ref, cached on the column object via sync.Once.
-	fieldMaps := lookupIntrinsicFields(r, refs, secondPassCols)
-	results := make([]MatchedRow, 0, len(refs))
-	for i, ref := range refs {
-		results = append(results, MatchedRow{
-			IntrinsicFields: &intrinsicFieldsProvider{fields: fieldMaps[i]},
-			BlockIdx:        int(ref.BlockIdx),
-			RowIdx:          int(ref.RowIdx),
+	// Block reads for field population — O(M) where M is the result count.
+	// At scale (92+ files × 5M spans), lookupIntrinsicFields O(N×C) scan takes ~11s per query.
+	// Block reads scale with M (result count), not N (total spans per file).
+	blockOrder, blockCandidates := groupRefsByBlock(refs)
+	var results []MatchedRow
+	err := forEachBlockInGroups(r, blockOrder, blockCandidates, wantColumns, secondPassCols, "collectIntrinsicPlain",
+		func(pb parsedBlock, candidateRows []int) error {
+			for _, rowIdx := range candidateRows {
+				results = append(results, MatchedRow{
+					Block:    pb.Block,
+					BlockIdx: pb.BlockIdx,
+					RowIdx:   rowIdx,
+				})
+			}
+			return nil
 		})
+	if err != nil {
+		return nil, err
 	}
 	return results, nil
 }
@@ -795,6 +815,7 @@ func collectIntrinsicTopK(
 	r *modules_reader.Reader,
 	refs []modules_shared.BlockRef,
 	opts CollectOptions,
+	wantColumns map[string]struct{},
 	secondPassCols map[string]struct{},
 	stats *CollectStats,
 ) ([]MatchedRow, error) {
@@ -813,14 +834,23 @@ func collectIntrinsicTopK(
 	if len(selected) == 0 {
 		return nil, nil
 	}
-	fieldMaps := lookupIntrinsicFields(r, selected, secondPassCols)
-	results := make([]MatchedRow, 0, len(selected))
-	for i, ref := range selected {
-		results = append(results, MatchedRow{
-			IntrinsicFields: &intrinsicFieldsProvider{fields: fieldMaps[i]},
-			BlockIdx:        int(ref.BlockIdx),
-			RowIdx:          int(ref.RowIdx),
+	// Block reads for field population — same as collectIntrinsicPlain.
+	slices.SortFunc(selected, blockRefCompare)
+	blockOrder, blockCandidates := groupRefsByBlock(selected)
+	var results []MatchedRow
+	err = forEachBlockInGroups(r, blockOrder, blockCandidates, wantColumns, secondPassCols, "collectIntrinsicTopK",
+		func(pb parsedBlock, candidateRows []int) error {
+			for _, rowIdx := range candidateRows {
+				results = append(results, MatchedRow{
+					Block:    pb.Block,
+					BlockIdx: pb.BlockIdx,
+					RowIdx:   rowIdx,
+				})
+			}
+			return nil
 		})
+	if err != nil {
+		return nil, err
 	}
 	return results, nil
 }

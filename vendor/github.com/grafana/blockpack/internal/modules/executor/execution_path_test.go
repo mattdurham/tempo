@@ -157,12 +157,13 @@ func TestExecutionPath_RangePredicate_BlockPopulated(t *testing.T) {
 }
 
 // EP-02: Equality predicates on intrinsic columns route to intrinsic-plain and populate
-// MatchedRow.Block (not IntrinsicFields).
+// MatchedRow.IntrinsicFields (not Block).
 //
 // {status=error}, {kind=server}, {resource.service.name=X} are equality (Values) predicates.
-// collectIntrinsicPlain uses forEachBlockInGroups, returning results via MatchedRow.Block.
-// FetchedBlocks remains 0 because it only counts outer ReadGroup calls (block-scan path),
-// not the inner forEachBlockInGroups reads. Same execution path as range predicates.
+// All pure-intrinsic queries use lookupIntrinsicFields for field population — zero S3 I/O
+// after warmup. Results are returned via MatchedRow.IntrinsicFields; Block is nil.
+// FetchedBlocks remains 0 because lookupIntrinsicFields reads from the objectcache-backed
+// intrinsic section, not from full block I/O.
 func TestExecutionPath_EqualityPredicate_BlockPopulated(t *testing.T) {
 	t.Parallel()
 	r := buildEPReader(t)
@@ -182,20 +183,19 @@ func TestExecutionPath_EqualityPredicate_BlockPopulated(t *testing.T) {
 			assert.Equal(t, tc.want, len(rows), "result count")
 			assert.Equal(t, "intrinsic-plain", stats.ExecutionPath, "must route to intrinsic-plain")
 			for i, row := range rows {
-				assert.NotNil(t, row.Block,
-					"row %d: equality predicate must populate Block (forEachBlockInGroups path)", i)
-				assert.Nil(t, row.IntrinsicFields,
-					"row %d: equality predicate must not populate IntrinsicFields (lookupIntrinsicFields path)", i)
+				assert.NotNil(t, row.IntrinsicFields,
+					"row %d: equality predicate must populate IntrinsicFields (lookupIntrinsicFields path)", i)
+				assert.Nil(t, row.Block,
+					"row %d: equality predicate must not populate Block", i)
 			}
 		})
 	}
 }
 
-// EP-03: Range+equality combination routes to intrinsic-plain and populates Block.
+// EP-03: Range+equality combination routes to intrinsic-plain and populates IntrinsicFields.
 //
-// collectIntrinsicPlain always uses forEachBlockInGroups for the entire group,
-// regardless of whether any predicate is a range predicate. Results are returned
-// via MatchedRow.Block, not IntrinsicFields.
+// All pure-intrinsic queries use lookupIntrinsicFields for field population.
+// Results are returned via MatchedRow.IntrinsicFields, not Block.
 func TestExecutionPath_RangeAndEquality_BlockPopulated(t *testing.T) {
 	t.Parallel()
 	r := buildEPReader(t)
@@ -204,10 +204,10 @@ func TestExecutionPath_RangeAndEquality_BlockPopulated(t *testing.T) {
 	assert.Equal(t, 1, len(rows), "only span 3 has both duration>100ms and status=error")
 	assert.Equal(t, "intrinsic-plain", stats.ExecutionPath, "must route to intrinsic-plain")
 	for i, row := range rows {
-		assert.NotNil(t, row.Block,
-			"row %d: range+equality must populate Block (forEachBlockInGroups path)", i)
-		assert.Nil(t, row.IntrinsicFields,
-			"row %d: range+equality must not populate IntrinsicFields", i)
+		assert.NotNil(t, row.IntrinsicFields,
+			"row %d: range+equality must populate IntrinsicFields (lookupIntrinsicFields path)", i)
+		assert.Nil(t, row.Block,
+			"row %d: range+equality must not populate Block", i)
 	}
 }
 
