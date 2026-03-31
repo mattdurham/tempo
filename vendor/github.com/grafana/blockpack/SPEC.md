@@ -341,3 +341,54 @@ Without living spec files, design intent is lost in git history, invariants drif
 and new contributors (human or agent) have no authoritative reference. The four-file
 structure separates *what*, *why*, *verification*, and *performance* so each concern
 can be maintained independently.
+
+---
+
+## SPEC-ROOT-010: Never Swallow Errors
+
+**Invariant:** Errors must never be silently discarded. Every `err != nil` check must either:
+
+1. **Propagate** the error to the caller (`return ..., err` or `return ..., fmt.Errorf("context: %w", err)`)
+2. **Log** the error with `slog.Warn` or `slog.Error` and a clear explanation of why the error is non-fatal
+3. **Annotate** with `// SPEC-ROOT-010 exception: <reason>` when the error is intentionally ignored (e.g., best-effort cleanup)
+
+The following pattern is **prohibited**:
+```go
+result, err := doSomething()
+if err != nil {
+    return nil  // ← error silently swallowed
+}
+```
+
+The following patterns are **acceptable**:
+```go
+// Propagate
+result, err := doSomething()
+if err != nil {
+    return nil, fmt.Errorf("doSomething: %w", err)
+}
+
+// Log + degrade
+result, err := doSomething()
+if err != nil {
+    slog.Warn("doSomething failed, falling back", "err", err)
+    return fallbackResult, nil
+}
+
+// Intentional ignore (annotated)
+_ = f.Close() // SPEC-ROOT-010 exception: best-effort file close on error path
+```
+
+**Rationale:**
+
+Silent error swallowing causes invisible performance degradation and correctness issues.
+In this codebase, a swallowed `DecodePageTOC: unknown version` error caused the intrinsic
+fast path to silently fall back to a 50x slower block scan path for every query — with no
+error in logs, no metric, and correct results. The bug persisted undetected across multiple
+benchmark sessions.
+
+**Enforcement:**
+
+- `errcheck` linter catches unchecked error returns (already enabled)
+- Code review must verify that every `if err != nil` block propagates, logs, or annotates
+- No existing linter catches "checked but swallowed" — this is a manual review requirement

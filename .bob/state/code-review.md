@@ -1,243 +1,182 @@
-# Code Review: Blockpack Intrinsic Optimization -- Efficiency Analysis
+# Code Review: blockpack PR — Code Reuse Issues
 
-**Date:** 2026-03-29
-**Branch:** blockpack-integration
-**Reviewer:** Claude Opus 4.6 (code-reviewer agent)
-**Scope:** Efficiency review of intrinsic ref-filter, stream collect, and predicate scanning
+Date: 2026-03-29
+Branch: blockpack-integration (reviewed against main in /home/matt/source/blockpack-tempo)
+Scope: Code reuse, duplication, and missed helper opportunities
 
 ---
 
 ## Summary
 
-Focused efficiency review of the intrinsic optimization hot paths: `DecodePagedColumnBlobFiltered`,
-`EnsureRefIndex`/`LookupRefFast`, `collectIntrinsicPlain`/`TopK`, `lookupIntrinsicFields`,
-`scanDecodedDictRefs`, `scanDecodedFlatRangeRefs`, and `BlockRefsFromIntrinsicTOC` overFetch logic.
-
-**Findings:** 9 issues (1 high, 2 medium-high, 1 medium, 2 low-medium, 3 very low)
-
-**Top priority:** Findings 4 and 5 -- full-column tsMap construction on hot paths allocates
-~130MB of short-lived memory per file per query when only K (typically 20) lookups are needed.
-The fix is straightforward using existing `EnsureRefIndex` + `LookupRefFast` infrastructure.
+6 distinct reuse issues found across 5 files. None are correctness bugs.
+Issue 3 (stale comments) is the highest-priority for reviewers because it now
+describes the opposite of the cache's actual eviction behaviour.
+Issue 5 (unguarded type assertion) is the highest-priority for runtime safety.
 
 ---
 
-## Findings
+## Issue 1 — DUPLICATE: `packKey` helper ignored; inline `<<16` repeated across 5 sites in stream.go
 
-### 1. DEAD PARAMETER: refFilter in DecodePagedColumnBlobFiltered
+WHAT: `internal/modules/executor/metrics_trace_intrinsic.go:168` already defines a private
+`packKey(blockIdx, rowIdx uint16) uint32` helper. The new code in `stream.go` does not use it;
+instead it inlines `uint32(ref.BlockIdx)<<16|uint32(ref.RowIdx)` at five separate new sites.
+Including pre-existing inlines in `span_fields.go`, `api.go`, and `reader.go`, the same
+shift-or pattern appears at approximately 15 distinct source locations.
 
-**WHAT:** The `refFilter map[uint32]struct{}` parameter is accepted, never used, and explicitly
-discarded on line 114 with `_ = refFilter`. The caller (`GetIntrinsicColumnForRefs` at
-intrinsic_reader.go:229) still builds the refFilter map, allocating memory for no purpose.
+WHERE:
+- Existing helper: `internal/modules/executor/metrics_trace_intrinsic.go:168-170`
+- New sites in changed code:
+  - `internal/modules/executor/stream.go:919`
+  - `internal/modules/executor/stream.go:978`
+  - `internal/modules/executor/stream.go:999`
+  - `internal/modules/executor/stream.go:1019`
+  - `internal/modules/executor/stream.go:1259`
+- Also inlined in `intrinsic_ref_index.go:31,46,112,128`, `span_fields.go:180,194,208`,
+  `api.go:1144,1168`, `reader.go:262`
 
-**WHERE:** `internal/modules/blockio/shared/intrinsic_ref_filter.go:30` (parameter),
-`internal/modules/blockio/reader/intrinsic_reader.go:229-232` (caller allocates map)
+WHY: `packKey` is package-private inside `executor`, so callers in `shared` or `api.go` cannot
+reach it — but all five new `stream.go` sites could. Inlining makes the bit-width safety
+contract (both fields fit in uint16, no overflow) invisible at each call site and creates a
+copy-paste surface for future bugs. `RefIndexEntry.Packed` documents the same invariant in a
+struct comment rather than enforcing it at a single construction site.
 
-**WHY:** After NOTE-007 removed page-skipping, refFilter serves no purpose. The caller
-allocates a `map[uint32]struct{}` sized to `len(refs)` on every call (~48KB for 1000 refs)
-that is immediately discarded.
-
-**SEVERITY:** Low. `GetIntrinsicColumnForRefs` has no callers in the executor.
-
-**SUGGESTION:** Remove the parameter from `DecodePagedColumnBlobFiltered` and stop building
-the map in `GetIntrinsicColumnForRefs`. This is internal code with no external API contract.
-
----
-
-### 2. DEAD CODE: LookupRef O(N) linear scan method
-
-**WHAT:** `LookupRef` (lines 208-243) performs O(N) linear scan. It has zero production callers
--- all executor paths use `LookupRefFast` (O(log N) via `EnsureRefIndex`).
-
-**WHERE:** `internal/modules/blockio/shared/intrinsic_ref_filter.go:208-243`
-
-**WHY:** Superseded by `LookupRefFast`. Risks accidental use by future contributors.
-
-**SEVERITY:** Low.
-
-**SUGGESTION:** Add `// Deprecated:` annotation pointing to `LookupRefFast`, or remove.
+RECOMMENDATION: Promote `packKey` (or rename `PackRef`) to the `shared` package, co-located
+with `BlockRef` and `RefIndexEntry`. Use it everywhere a packed ref is constructed. The
+`nolint:gosec` annotations can then live in one place.
 
 ---
 
-### 3. UNBOUNDED OVERFETCH: overFetch = limit * 10000
+## Issue 2 — DUPLICATE: `overFetch` formula copy-pasted verbatim between two functions in predicates.go
 
-**WHAT:** In `BlockRefsFromIntrinsicTOC` (predicates.go:1915), multi-condition AND queries set
-`overFetch = limit * 10000`. With limit=20 this is 200K; with limit=100 this is 1M. Each
-condition returns up to `overFetch` BlockRefs (4 bytes each), then `intersectBlockRefSets`
-sorts each set at O(N log N).
+WHAT: The identical multi-condition overFetch branch — including the four-line explanatory
+comment — appears twice in the same file.
 
-**WHERE:** `internal/modules/executor/predicates.go:1915`
+WHERE:
+- `internal/modules/executor/predicates.go:1898-1916` (inside `BlockRefsFromIntrinsicTOC`)
+- `internal/modules/executor/predicates.go:1963-1970` (inside `blockRefsFromIntrinsicPartial`)
 
-**WHY:** No upper bound. For 3-node AND with limit=100: 3 sets x 1M refs x 4 bytes = 12MB
-allocation + 3 sorts of 1M elements. The factor 10,000 assumes joint selectivity >= 0.5%
-but provides no cap.
-
-**SEVERITY:** Medium. Production Tempo uses limit=20 (200K refs = ~800KB per condition), but
-custom limits or many-condition queries could cause multi-MB allocations.
-
-**SUGGESTION:** Cap with a hard maximum: `overFetch = min(limit*10000, 500_000)`. This bounds
-worst-case to ~2MB per condition while still providing 0.004% joint selectivity for limit=20.
-
----
-
-### 4. HOT PATH ALLOCATION: collectIntrinsicTopKScan builds full tsMap for time-range filter
-
-**WHAT:** When the scan path selects refs and a time range is active (lines 995-1019), it
-decodes the full timestamp column via `GetIntrinsicColumn` (cached, free on warm queries)
-then builds `tsMap := make(map[uint32]uint64, len(tsCol.BlockRefs))`. For 3.3M spans this
-allocates ~130MB (40 bytes/entry: 4-byte key + 8-byte value + ~28 bytes map overhead).
-This map is used only to look up `selected` refs, which is bounded by `limit` (typically 20).
-
-**WHERE:** `internal/modules/executor/stream.go:998-1001`
-
-**WHY:** Building a 3.3M-entry map to look up 20 keys is ~6500x over-provisioned. The map
-is short-lived (function-scoped), creating ~130MB of GC pressure per file per query.
-
-**SEVERITY:** High. With 50 concurrent queries x 10 files = 65GB of GC pressure.
-
-**SUGGESTION:** Use `EnsureRefIndex` + `LookupRefFast` on the cached timestamp column:
-
+Both blocks contain:
 ```go
-// Replace lines 996-1018 with:
-if len(selected) > 0 && (opts.TimeRange.MinNano > 0 || opts.TimeRange.MaxNano > 0) {
-    tsCol, tsErr := r.GetIntrinsicColumn(opts.TimestampColumn)
-    if tsErr == nil && tsCol != nil {
-        tsCol.EnsureRefIndex()
-        filtered := selected[:0]
-        for _, ref := range selected {
-            key := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx)
-            val, ok := tsCol.LookupRefFast(key)
-            if !ok {
-                continue
-            }
-            ts := val.(uint64)
-            if opts.TimeRange.MinNano > 0 && ts < opts.TimeRange.MinNano {
-                continue
-            }
-            if opts.TimeRange.MaxNano > 0 && ts > opts.TimeRange.MaxNano {
-                continue
-            }
-            filtered = append(filtered, ref)
-        }
-        selected = filtered
-    }
+if len(program.Predicates.Nodes) == 1 {
+    overFetch = limit * totalLeaves
+} else {
+    overFetch = min(min(limit, 50)*10000, 500_000)
 }
 ```
+The comment explaining the reasoning is only on the first copy; the second copy is silent.
 
-This gives O(K log N) for K=20 lookups with zero additional allocation (refIndex is cached
-on the column via sync.Once).
+WHY: Changing the formula (e.g., the 500_000 cap or the 50 clamp) requires two edits.
+Both functions have identical `program`, `limit`, and `totalLeaves` shapes, making extraction
+trivial.
 
----
-
-### 5. HOT PATH ALLOCATION: collectIntrinsicTopKKLL builds full tsMap for small ref sets
-
-**WHAT:** `collectIntrinsicTopKKLL` (stream.go:865-868) builds `tsMap` from the full timestamp
-column (3.3M entries, ~130MB) even though `refs` is bounded by `SortScanThreshold` (8000).
-Only 8000 lookups are performed against the 3.3M-entry map.
-
-**WHERE:** `internal/modules/executor/stream.go:865-868`
-
-**WHY:** Same root cause as Finding 4. The full column is cached (objectcache), but the map is
-rebuilt on every query invocation. O(N) construction + ~130MB allocation for O(M) lookups where
-M << N.
-
-**SEVERITY:** Medium-High. Same GC pressure as Finding 4, triggered on the KLL path.
-
-**SUGGESTION:** Use `EnsureRefIndex` + `LookupRefFast` instead of building tsMap. The KLL path
-needs timestamps for sorting, so build a local `pairs` slice directly:
-
-```go
-tsCol.EnsureRefIndex()
-for _, ref := range refs {
-    key := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx)
-    val, ok := tsCol.LookupRefFast(key)
-    if !ok {
-        continue
-    }
-    pairs = append(pairs, refTS{ref: ref, ts: val.(uint64)})
-}
-```
-
-This replaces O(N) map construction with O(M log N) lookups (M=8000, N=3.3M), eliminating
-the 130MB allocation entirely.
+RECOMMENDATION: Extract `computeOverFetch(limit, nodeCount, totalLeaves int) int`. Both
+functions call it after computing `totalLeaves`. Move the explanation comment to the helper.
 
 ---
 
-### 6. MISSED CACHE: scanDecodedDictRefs uses raw regexp.Compile
+## Issue 3 — STALE COMMENTS: objectcache changed from weak to strong refs but 7 comments still say weak
 
-**WHAT:** `scanDecodedDictRefs` (predicates.go:2039) calls `regexp.Compile(leaf.Pattern)`
-directly despite `cachedRegexCompile` existing at predicates.go:67.
+WHAT: `objectcache/cache.go` was changed in this PR from `weak.Pointer`-backed (GC reclaims
+when no strong reference exists) to strong-reference-backed (entries persist until `Clear()` or
+process exit). Seven comments across two files still describe the old weak-pointer semantics.
 
-**WHERE:** `internal/modules/executor/predicates.go:2039`
-Also `internal/modules/executor/predicates.go:669` (another direct `regexp.Compile` call).
+WHERE:
+- `internal/modules/blockio/reader/parser.go:17` — "GC-cooperative: entries are reclaimed when no Reader holds a strong reference."
+- `internal/modules/blockio/reader/parser.go:24` — "GC-cooperative via weak.Pointer — the GC may reclaim when no Reader holds a strong reference."
+- `internal/modules/blockio/reader/parser.go:29` — "fileID+'/intrinsic/'+colName. GC-cooperative via weak.Pointer."
+- `internal/modules/blockio/reader/parser.go:34` — "GC-cooperative: allows the GC to reclaim ~45 MB metadata when no Reader is open."
+- `internal/modules/blockio/reader/parser.go:44` — "Maps can be addressed with weak.Make by taking &m ..."
+- `internal/modules/blockio/reader/intrinsic_reader.go:155` — "NOTE-003: process-level cache uses objectcache.Cache (GC-cooperative weak pointers) instead of sync.Map with strong refs to allow GC to reclaim decoded columns."
+- `internal/modules/blockio/reader/reader.go:67,73` — "keeping its weak.Pointer entry valid for the lifetime of this Reader."
 
-**WHY:** Called per-file during `BlockRefsFromIntrinsicTOC`. For a regex query across 100
-files, the same pattern is compiled 100 times (~1-10us each = 0.1-1ms total).
+WHY: These comments now describe the opposite of actual behaviour. Under strong-reference
+semantics the GC will not reclaim decoded columns even when all Reader instances for a file are
+closed. Someone debugging memory growth will read these comments and look for strong-reference
+leaks, not realising the cache itself is intentionally holding everything alive. The NOTE-003
+cross-reference is also now misleading.
 
-**SEVERITY:** Low-Medium. Easy fix.
-
-**SUGGESTION:** Replace `regexp.Compile(leaf.Pattern)` with `cachedRegexCompile(leaf.Pattern)`
-at both locations.
-
----
-
-### 7. REDUNDANT ALLOCATION: scanDecodedDictRefs allocates both wantStr and wantInt
-
-**WHAT:** Lines 2061-2062 unconditionally allocate both `wantStr` and `wantInt` maps.
-Only one is ever consulted based on `isInt`.
-
-**WHERE:** `internal/modules/executor/predicates.go:2061-2062`
-
-**WHY:** One map per call is wasted (~200 bytes for typical 1-3 element predicates).
-
-**SEVERITY:** Very Low.
-
-**SUGGESTION:** Conditionally allocate: `if isInt { wantInt = make(...) } else { wantStr = make(...) }`.
+RECOMMENDATION: Update all seven comment sites to describe strong-reference semantics, remove
+references to `weak.Pointer` and `weak.Make`, and update NOTE-003 in the reader NOTES.md to
+document the intentional change and the `GOMEMLIMIT` bounding strategy.
 
 ---
 
-### 8. UNBOUNDED CACHE: intrinsicRegexCache sync.Map grows forever
+## Issue 4 — MISSED REUSE: `buildIntrinsicBytesMap` in api.go not migrated to `LookupRefFast`
 
-**WHAT:** `intrinsicRegexCache` is a package-level `sync.Map` with no eviction or size limit.
+WHAT: `buildIntrinsicBytesMap` (`api.go:1158`) constructs a `map[uint32][]byte` over the
+entire flat intrinsic column. The `EnsureRefIndex` / `LookupRefFast` machinery introduced in
+this PR was designed specifically to replace this pattern, and is already used in `stream.go`
+for the timestamp column. The `api.go` fallback paths (trace:id and span:id ID extraction)
+were not updated.
 
-**WHERE:** `internal/modules/executor/predicates.go:62`
+WHERE:
+- `api.go:1158-1173` — `buildIntrinsicBytesMap` still builds a `map[uint32][]byte`
+- `api.go:613,617` — lazy-init path in `streamFilterProgram` calls `buildIntrinsicBytesMap`
+- `api.go:1092,1093` — eager path in the log streaming function calls `buildIntrinsicBytesMap`
 
-**WHY:** In a long-running process, distinct regex patterns accumulate monotonically. Each
-compiled `*regexp.Regexp` holds AST and buffers. Practically bounded by user behavior.
+WHY: `buildIntrinsicBytesMap` allocates a typed map over the full column per file per call.
+`EnsureRefIndex` + `LookupRefFast` builds a compact sorted index cached on the column object
+itself (via sync.Once inside objectcache), so it is free on subsequent queries for the same
+file. Using two different lookup strategies for structurally identical problems increases the
+maintenance surface and means the api.go path does not benefit from the cached index.
 
-**SEVERITY:** Very Low. No action needed unless profiling shows growth.
-
-**SUGGESTION:** Monitor; replace with bounded LRU if needed.
-
----
-
-### 9. SUBOPTIMAL INIT: DecodePagedColumnBlobFiltered zero-length slice allocation
-
-**WHAT:** Lines 58-60 initialize flat column slices as `make([]T, 0)` instead of pre-sizing
-from TOC metadata. The TOC `RowCount` per page is available before the decode loop.
-
-**WHERE:** `internal/modules/blockio/shared/intrinsic_ref_filter.go:58-60`
-
-**WHY:** Forces append to grow from zero, causing log2(N) reallocations. Could pre-compute
-total rows from `toc.Pages[i].RowCount` and allocate once.
-
-**SEVERITY:** Very Low. Amortized doubling cost is small.
-
-**SUGGESTION:** Sum `RowCount` across pages and pre-allocate with that capacity.
+RECOMMENDATION: Replace `buildIntrinsicBytesMap` with a direct call to `col.EnsureRefIndex()`
+followed by `col.LookupRefFast(packed)` at the two lookup sites in `extractIDs`. The `[]byte`
+branch of `LookupRefFast` already handles `BytesValues` flat columns.
 
 ---
 
-## Priority Summary
+## Issue 5 — UNSAFE ASSERTION: `val.(uint64)` on `LookupRefFast` return, two sites, no fallback
 
-| # | Finding | Severity | Estimated Impact |
-|---|---------|----------|-----------------|
-| 4 | Full tsMap in scan path time-filter | **High** | ~130MB alloc/file/query |
-| 5 | Full tsMap in KLL path | **Medium-High** | ~130MB alloc/file/query |
-| 3 | overFetch unbounded for high limits | Medium | Latent OOM for custom limits |
-| 6 | Missing cachedRegexCompile | Low-Medium | ~0.1-1ms wasted CPU per query |
-| 1 | refFilter dead parameter | Low | ~48KB wasted per call |
-| 2 | LookupRef dead code | Low | Maintenance risk |
-| 7 | Dual map allocation | Very Low | ~200 bytes |
-| 8 | Unbounded regex cache | Very Low | Theoretical |
-| 9 | Zero-length slice init | Very Low | Minor reallocation |
+WHAT: `LookupRefFast` returns `(any, bool)`. At two call sites the returned `any` is
+immediately type-asserted to `uint64` with no comma-ok guard.
 
-**Recommended fix order:** 4, 5 (same pattern, one fix), then 3 (add cap), then 6 (one-line change).
+WHERE:
+- `internal/modules/executor/stream.go:921` — `pairs = append(pairs, refTS{ref: ref, ts: val.(uint64)})`
+- `internal/modules/executor/stream.go:1024` — `ts := val.(uint64)`
+
+WHY: The previous code used `tsMap[key]` where `tsMap` was typed `map[uint32]uint64`, so the
+type was statically guaranteed. Switching to `any` return without a defensive assertion makes
+the failure mode a runtime panic rather than a compile error. If a future format or bug stores
+the timestamp column with a different type (e.g., `int64`), these sites panic instead of
+producing an error or skipping the row.
+
+RECOMMENDATION: Either (a) add a typed method `LookupUint64Fast(packedRef uint32) (uint64, bool)`
+to `IntrinsicColumn` that avoids `any` boxing entirely, or (b) use `ts, ok := val.(uint64); if !ok { continue }`.
+Option (a) is preferred: it eliminates interface-boxing allocation for the uint64, and makes
+the type contract visible at the call site.
+
+---
+
+## Issue 6 — API DESIGN: `EnsureRefIndex` must be called before `LookupRefFast`; silent miss if forgotten
+
+WHAT: `LookupRefFast` checks `len(col.refIndex) == 0` and returns `(nil, false)` when the
+index has not been built. It does not build the index itself. Every caller is required to call
+`EnsureRefIndex` first. Three call sites in `stream.go` do this correctly, but `lookupColumn`
+(inside `lookupIntrinsicFields`) calls `EnsureRefIndex` at the top of the helper rather than
+letting `LookupRefFast` self-initialise. Forgetting `EnsureRefIndex` at any future call site
+produces silent data loss — every lookup returns a miss with no error and no log.
+
+WHERE:
+- Required pre-call documented at `internal/modules/blockio/shared/intrinsic_ref_index.go:57`
+- Call sites that correctly pre-call: `stream.go:882`, `stream.go:1016`, `stream.go:1258`
+- Different pattern inside helper: `stream.go:1257` calls `col.EnsureRefIndex()` before loop
+
+WHY: An "I must be called first" API contract that silently produces wrong results when
+violated is fragile. The sync.Once inside `EnsureRefIndex` means calling it inside
+`LookupRefFast` costs exactly one atomic load on the hot path — the same cost already paid to
+check `len(col.refIndex) == 0`.
+
+RECOMMENDATION: Move the `col.EnsureRefIndex()` call to the top of `LookupRefFast` (before the
+nil guard). Remove the explicit pre-calls from all call sites. If the separation is kept for
+documentation reasons, at minimum make `LookupRefFast` call `EnsureRefIndex` itself rather than
+returning a silent miss.
+
+---
+
+## Non-Issues Noted
+
+- `block.go` sync.Once additions (`decodeOnce`, `presenceOnce`, `denseOnce`): correct, no reuse issue.
+- `objectcache/cache.go` weak-to-strong simplification: intentional design change, the implementation is correct.
+- `fileLevelBloomReject` added in `stream.go:223`: correctly reuses the existing function from `plan_blocks.go`.
+- `collectIntrinsicPlain` boolean removal: reduces code, improves reuse of the intrinsic-lookup path.

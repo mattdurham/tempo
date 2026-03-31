@@ -83,13 +83,6 @@ type BlockRef struct {
 	RowIdx   uint16
 }
 
-// RefIndexEntry is one entry in IntrinsicColumn.refIndex.
-// Enables O(log N) reverse lookup from packed ref to column value.
-type RefIndexEntry struct {
-	Packed uint32 // blockIdx<<16 | rowIdx
-	Pos    int32  // index into BlockRefs/values (flat) or DictEntries (dict)
-}
-
 // IntrinsicColumn is the decoded result of reading one intrinsic column blob.
 // Returned by GetIntrinsicColumn on a Reader.
 type IntrinsicColumn struct {
@@ -100,9 +93,6 @@ type IntrinsicColumn struct {
 	BlockRefs    []BlockRef // parallel to Uint64Values / BytesValues; sorted by VALUE
 	// For dict columns (IntrinsicFormatDict):
 	DictEntries []IntrinsicDictEntry
-	Count       uint32
-	Type        ColumnType
-	Format      uint8
 
 	// refIndex is a sorted-by-packed-ref lookup table for O(log N) reverse lookup.
 	// Built lazily by EnsureRefIndex on first reverse-lookup call.
@@ -111,6 +101,30 @@ type IntrinsicColumn struct {
 	// Thread safety: built under refIndexOnce; safe for concurrent reads after that.
 	refIndex     []RefIndexEntry
 	refIndexOnce sync.Once
+	Count        uint32
+	Type         ColumnType
+	Format       uint8
+}
+
+// SizeBytes returns an estimate of the in-memory size of this column for LRU cache budgeting.
+func (col *IntrinsicColumn) SizeBytes() int64 {
+	n := int64(len(col.Uint64Values)) * 8
+	for _, b := range col.BytesValues {
+		n += int64(len(b))
+	}
+	n += int64(len(col.BlockRefs)) * 4
+	for _, e := range col.DictEntries {
+		n += int64(len(e.Value)) + int64(len(e.BlockRefs))*4 + 8
+	}
+	n += int64(len(col.refIndex)) * 8
+	return n
+}
+
+// RefIndexEntry is one entry in IntrinsicColumn.refIndex.
+// Enables O(log N) reverse lookup from packed ref to column value.
+type RefIndexEntry struct {
+	Packed uint32 // blockIdx<<16 | rowIdx
+	Pos    int32  // index into BlockRefs/values (flat) or DictEntries (dict)
 }
 
 // IntrinsicDictEntry is one entry in a decoded dictionary intrinsic column.
