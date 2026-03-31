@@ -27,7 +27,7 @@ reset: up
 		-endpoint localhost:14317 \
 		-endpoint localhost:14319 \
 		-insecure \
-		-max-input-gb 10 \
+		-max-input-gb 85 \
 		-rebase-timestamps; do echo "distributor not ready, retrying in 5s..."; sleep 5; done
 
 # Reload 10GB of trace data into both Tempo instances (original timestamps, no rebase)
@@ -38,4 +38,4 @@ reload:
 		-endpoint localhost:14317 \
 		-endpoint localhost:14319 \
 		-insecure \
-		-max-input-gb 10
+		-max-input-gb 85
