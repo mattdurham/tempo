@@ -1,0 +1,78 @@
+{
+  "start": 1769662800,
+  "end": 1769835600,
+  "limit": 20,
+  "queries": [
+    {"id": 1, "label": "match-all", "complexity": "simple", "query": "{}"},
+    {"id": 2, "label": "service-name", "complexity": "simple", "query": "{resource.service.name=\"CockroachDB\"}"},
+    {"id": 3, "label": "span-user-root", "complexity": "simple", "query": "{span.user=\"root\"}"},
+    {"id": 4, "label": "duration-gt-5ms", "complexity": "simple", "query": "{duration>5ms}"},
+    {"id": 5, "label": "duration-gt-50ms", "complexity": "simple", "query": "{duration>50ms}"},
+    {"id": 6, "label": "kind-server", "complexity": "simple", "query": "{kind=server}"},
+    {"id": 7, "label": "kind-client", "complexity": "simple", "query": "{kind=client}"},
+    {"id": 8, "label": "status-error", "complexity": "simple", "query": "{status=error}"},
+    {"id": 9, "label": "status-ok", "complexity": "simple", "query": "{status=ok}"},
+
+    {"id": 10, "label": "svc-and-duration-5ms", "complexity": "compound", "query": "{resource.service.name=\"CockroachDB\" && duration>5ms}"},
+    {"id": 11, "label": "svc-and-duration-50ms", "complexity": "compound", "query": "{resource.service.name=\"CockroachDB\" && duration>50ms}"},
+    {"id": 12, "label": "svc-and-kind-server", "complexity": "compound", "query": "{resource.service.name=\"CockroachDB\" && kind=server}"},
+    {"id": 13, "label": "svc-and-status-error", "complexity": "compound", "query": "{resource.service.name=\"CockroachDB\" && status=error}"},
+    {"id": 14, "label": "user-and-duration", "complexity": "compound", "query": "{span.user=\"root\" && duration>10ms}"},
+    {"id": 15, "label": "kind-server-status-err", "complexity": "compound", "query": "{kind=server && status=error}"},
+    {"id": 16, "label": "triple-predicate", "complexity": "compound", "query": "{resource.service.name=\"CockroachDB\" && kind=server && duration>5ms}"},
+    {"id": 17, "label": "triple-predicate-err", "complexity": "compound", "query": "{resource.service.name=\"CockroachDB\" && status=error && duration>1ms}"},
+
+    {"id": 20, "label": "span-name-eq", "complexity": "simple", "query": "{name=\"round trip\"}"},
+    {"id": 21, "label": "span-name-regex", "complexity": "regex", "query": "{name=~\".*round.*\"}"},
+    {"id": 22, "label": "svc-name-regex", "complexity": "regex", "query": "{resource.service.name=~\"Cockroach.*\"}"},
+    {"id": 23, "label": "user-regex", "complexity": "regex", "query": "{span.user=~\"ro.*\"}"},
+
+    {"id": 25, "label": "kind-not-server", "complexity": "negation", "query": "{kind!=server}"},
+    {"id": 26, "label": "status-not-ok", "complexity": "negation", "query": "{status!=ok}"},
+    {"id": 27, "label": "svc-not-match", "complexity": "negation", "query": "{resource.service.name!=\"CockroachDB\"}"},
+    {"id": 28, "label": "name-not-regex", "complexity": "negation", "query": "{name!~\".*round.*\"}"},
+
+    {"id": 30, "label": "by-service", "complexity": "pipeline", "query": "{} | by(resource.service.name)"},
+    {"id": 31, "label": "select-http-method", "complexity": "pipeline", "query": "{} | select(span.http.method)"},
+    {"id": 32, "label": "by-kind", "complexity": "pipeline", "query": "{kind=server} | by(resource.service.name)"},
+    {"id": 33, "label": "select-multi", "complexity": "pipeline", "query": "{resource.service.name=\"CockroachDB\"} | select(span.user, span.sql.query)"},
+    {"id": 34, "label": "by-status", "complexity": "pipeline", "query": "{} | by(status)"},
+    {"id": 35, "label": "by-name", "complexity": "pipeline", "query": "{resource.service.name=\"CockroachDB\"} | by(name)"},
+    {"id": 36, "label": "select-duration", "complexity": "pipeline", "query": "{status=error} | select(duration, name)"},
+
+    {"id": 40, "label": "count-gt-2", "complexity": "aggregate", "query": "{resource.service.name=\"CockroachDB\"} | count() > 2"},
+    {"id": 41, "label": "count-gt-5", "complexity": "aggregate", "query": "{resource.service.name=\"CockroachDB\"} | count() > 5"},
+    {"id": 42, "label": "count-gt-10", "complexity": "aggregate", "query": "{resource.service.name=\"CockroachDB\"} | count() > 10"},
+    {"id": 43, "label": "avg-duration-gt-5ms", "complexity": "aggregate", "query": "{resource.service.name=\"CockroachDB\"} | avg(duration) > 5ms"},
+    {"id": 44, "label": "max-duration-gt-50ms", "complexity": "aggregate", "query": "{resource.service.name=\"CockroachDB\"} | max(duration) > 50ms"},
+    {"id": 45, "label": "min-duration-gt-1ms", "complexity": "aggregate", "query": "{resource.service.name=\"CockroachDB\"} | min(duration) > 1ms"},
+    {"id": 46, "label": "count-err-gt-0", "complexity": "aggregate", "query": "{status=error} | count() > 0"},
+
+    {"id": 50, "label": "trace-duration-gt-100ms", "complexity": "trace-level", "query": "{trace:duration > 100ms}"},
+    {"id": 51, "label": "trace-duration-gt-1s", "complexity": "trace-level", "query": "{trace:duration > 1s}"},
+    {"id": 52, "label": "trace-rootsvc", "complexity": "trace-level", "query": "{trace:rootService.name = \"CockroachDB\"}"},
+    {"id": 53, "label": "trace-rootname", "complexity": "trace-level", "query": "{trace:rootName = \"round trip\"}"},
+
+    {"id": 60, "label": "inter-span-svc-err", "complexity": "structural", "query": "{resource.service.name=\"CockroachDB\"} && {status=error}"},
+    {"id": 61, "label": "inter-span-kind-dur", "complexity": "structural", "query": "{kind=server} && {duration>50ms}"},
+    {"id": 62, "label": "inter-span-user-err", "complexity": "structural", "query": "{span.user=\"root\"} && {status=error}"},
+    {"id": 63, "label": "child-of", "complexity": "structural", "query": "{kind=server} >> {duration>10ms}"},
+    {"id": 64, "label": "sibling", "complexity": "structural", "query": "{kind=server} ~ {kind=client}"},
+    {"id": 65, "label": "not-child", "complexity": "structural", "query": "{resource.service.name=\"CockroachDB\"} !>> {status=error}"},
+    {"id": 66, "label": "not-sibling", "complexity": "structural", "query": "{kind=server} !~ {status=error}"},
+
+    {"id": 70, "label": "unscoped-svc", "complexity": "scoping", "query": "{.service.name=\"CockroachDB\"}"},
+    {"id": 71, "label": "unscoped-user", "complexity": "scoping", "query": "{.user=\"root\"}"},
+    {"id": 72, "label": "parent-dot-svc", "complexity": "scoping", "query": "{parent.resource.service.name=\"CockroachDB\"}"},
+
+    {"id": 80, "label": "duration-range", "complexity": "real-world", "query": "{duration>=5ms && duration<100ms}"},
+    {"id": 81, "label": "slow-server-spans", "complexity": "real-world", "query": "{kind=server && duration>100ms}"},
+    {"id": 82, "label": "svc-err-slow", "complexity": "real-world", "query": "{resource.service.name=\"CockroachDB\" && status=error && duration>10ms}"},
+    {"id": 83, "label": "count-by-svc", "complexity": "real-world", "query": "{resource.service.name=\"CockroachDB\"} | count() > 3 | by(resource.service.name)"},
+    {"id": 84, "label": "avg-by-name", "complexity": "real-world", "query": "{resource.service.name=\"CockroachDB\"} | avg(duration) > 10ms | by(name)"},
+    {"id": 85, "label": "select-by-combo", "complexity": "real-world", "query": "{kind=server} | select(duration, name) | by(resource.service.name)"},
+    {"id": 86, "label": "deep-traces", "complexity": "real-world", "query": "{resource.service.name=\"CockroachDB\"} | count() > 20"},
+    {"id": 87, "label": "err-with-select", "complexity": "real-world", "query": "{status=error} | select(name, duration, resource.service.name)"},
+    {"id": 88, "label": "long-trace-err", "complexity": "real-world", "query": "{trace:duration > 500ms} && {status=error}"}
+  ]
+}

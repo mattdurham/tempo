@@ -1,0 +1,144 @@
+services:
+  # s3proxy - S3 API backed by filesystem (parquet)
+  s3proxy-parquet:
+    image: andrewgaul/s3proxy:latest
+    environment:
+      S3PROXY_AUTHORIZATION: none
+      S3PROXY_ENDPOINT: http://0.0.0.0:8080
+      S3PROXY_IDENTITY: minioadmin
+      S3PROXY_CREDENTIAL: minioadmin
+      JCLOUDS_PROVIDER: filesystem
+      JCLOUDS_FILESYSTEM_BASEDIR: /data
+    ports:
+      - "8082:8080"
+    volumes:
+      - ./s3-data-parquet:/data
+    networks:
+      - tempo-network-parquet
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Toxiproxy to simulate S3 latency (parquet)
+  toxiproxy-parquet:
+    image: ghcr.io/shopify/toxiproxy:latest
+    ports:
+      - "8475:8474"  # API port
+      - "9010:9000"  # S3 proxy port
+    depends_on:
+      s3proxy-parquet:
+        condition: service_healthy
+    networks:
+      - tempo-network-parquet
+    command: -host=0.0.0.0 -config=/config/toxiproxy-parquet.json
+    volumes:
+      - ./toxiproxy-parquet.json:/config/toxiproxy-parquet.json
+
+  # Kafka for Tempo ingest path (parquet)
+  kafka-parquet:
+    image: apache/kafka:latest
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-parquet:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-parquet:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 1
+    ports:
+      - "9093:9092"
+    healthcheck:
+      test: ["CMD", "/opt/kafka/bin/kafka-broker-api-versions.sh", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+    networks:
+      - tempo-network-parquet
+
+  # Single Tempo instance with vParquet5
+  tempo-parquet:
+    hostname: tempo-parquet-0
+    build:
+      context: /home/matt/source
+      dockerfile: tempo-mrd-worktrees/blockpack-integration/.docker/Dockerfile.tempo
+    command:
+      - "-config.file=/etc/tempo.yaml"
+      - "-target=all"
+    depends_on:
+      toxiproxy-parquet:
+        condition: service_started
+      kafka-parquet:
+        condition: service_healthy
+    volumes:
+      - ./tempo-parquet.yaml:/etc/tempo.yaml
+      - tempo-data-parquet:/var/tempo
+    ports:
+      - "3201:3200"   # Tempo HTTP
+      - "4327:4317"   # OTLP gRPC
+      - "4328:4318"   # OTLP HTTP
+    environment:
+      - GOGC=80
+    networks:
+      - tempo-network-parquet
+
+  # otel-loadgen for high-volume trace generation (parquet)
+  otel-loadgen-parquet:
+    image: streamfold/otel-loadgen:latest
+    restart: unless-stopped
+    command:
+      - gen
+      - traces
+      - --otlp-endpoint=tempo-parquet:4317
+      - --workers=10
+      - --spans-per-resource=100
+      - --duration=24h
+    depends_on:
+      - tempo-parquet
+    networks:
+      - tempo-network-parquet
+
+  # Prometheus for metrics (parquet)
+  prometheus-parquet:
+    image: prom/prometheus:latest
+    command:
+      - --config.file=/etc/prometheus.yaml
+      - --web.enable-remote-write-receiver
+    volumes:
+      - ./prometheus-parquet.yaml:/etc/prometheus.yaml
+    ports:
+      - "9091:9090"
+    depends_on:
+      - tempo-parquet
+    networks:
+      - tempo-network-parquet
+
+  # Grafana for visualization (parquet)
+  grafana-parquet:
+    image: grafana/grafana:latest
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_AUTH_DISABLE_LOGIN_FORM=true
+    volumes:
+      - ./grafana-datasources-parquet.yaml:/etc/grafana/provisioning/datasources/datasources.yaml
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus-parquet
+      - tempo-parquet
+    networks:
+      - tempo-network-parquet
+
+networks:
+  tempo-network-parquet:
+    driver: bridge
+
+volumes:
+  tempo-data-parquet:

@@ -78,12 +78,14 @@ require (
 	github.com/axiomhq/hyperloglog v0.2.6
 	github.com/bytedance/sonic v1.15.0
 	github.com/evanphx/json-patch v5.9.11+incompatible
+	github.com/golang/groupcache v0.0.0-20241129210726-2c02b8208cf8
 	github.com/googleapis/gax-go/v2 v2.19.0
+	github.com/grafana/blockpack v0.0.0-20260325000002-651d57fe
 	github.com/grafana/gomemcache v0.0.0-20251127154401-74f93547077b
 	github.com/grpc-ecosystem/go-grpc-middleware v1.4.0
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/jaegertracing/jaeger-idl v0.6.0
-	github.com/mark3labs/mcp-go v0.43.2
+	github.com/mark3labs/mcp-go v0.44.1
 	github.com/maypok86/otter/v2 v2.3.0
 	github.com/open-telemetry/opentelemetry-collector-contrib/exporter/zipkinexporter v0.148.0
 	github.com/open-telemetry/opentelemetry-collector-contrib/pkg/ottl v0.148.0
@@ -138,6 +140,7 @@ require (
 	cloud.google.com/go/monitoring v1.24.3 // indirect
 	github.com/Azure/azure-sdk-for-go/sdk/internal v1.11.2 // indirect
 	github.com/AzureAD/microsoft-authentication-library-for-go v1.6.0 // indirect
+	github.com/FastFilter/xorfilter v0.5.1 // indirect
 	github.com/GoogleCloudPlatform/opentelemetry-operations-go/detectors/gcp v1.31.0 // indirect
 	github.com/GoogleCloudPlatform/opentelemetry-operations-go/exporter/metric v0.55.0 // indirect
 	github.com/GoogleCloudPlatform/opentelemetry-operations-go/internal/resourcemapping v0.55.0 // indirect
@@ -177,6 +180,8 @@ require (
 	github.com/clipperhouse/uax29/v2 v2.6.0 // indirect
 	github.com/cloudwego/base64x v0.1.6 // indirect
 	github.com/cncf/xds/go v0.0.0-20251210132809-ee656c7534f5 // indirect
+	github.com/coregx/ahocorasick v0.1.0 // indirect
+	github.com/coregx/coregex v0.12.4 // indirect
 	github.com/coreos/go-semver v0.3.0 // indirect
 	github.com/coreos/go-systemd/v22 v22.6.0 // indirect
 	github.com/dennwc/varint v1.0.0 // indirect
@@ -343,6 +348,7 @@ require (
 	github.com/yuin/gopher-lua v1.1.1 // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
 	github.com/zeebo/xxh3 v1.1.0 // indirect
+	go.etcd.io/bbolt v1.4.3 // indirect
 	go.etcd.io/etcd/api/v3 v3.5.12 // indirect
 	go.etcd.io/etcd/client/pkg/v3 v3.5.12 // indirect
 	go.etcd.io/etcd/client/v3 v3.5.12 // indirect
@@ -437,3 +443,4 @@ replace (
 // - https://github.com/hashicorp/memberlist/pull/260
 // - https://github.com/grafana/memberlist/pull/3
 replace github.com/hashicorp/memberlist => github.com/grafana/memberlist v0.3.1-0.20251024160842-5cd332c2849a
+

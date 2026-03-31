@@ -1,0 +1,18 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'tempo-parquet'
+    static_configs:
+      - targets: ['tempo-parquet:3200']
+
+  - job_name: 'tempo-blockpack'
+    static_configs:
+      - targets: ['tempo-blockpack:3201']
+
+remote_write:
+  - url: ${GRAFANA_PROM_URL}
+    basic_auth:
+      username: ${GRAFANA_PROM_USER}
+      password: ${GRAFANA_PROM_TOKEN}

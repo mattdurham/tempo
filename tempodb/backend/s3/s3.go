@@ -428,15 +428,22 @@ func (rw *readerWriter) ListBlocks(
 			var (
 				err        error
 				res        minio.ListBucketV2Result
-				startAfter = prefix + minUUID.String()
+				startAfter      = prefix + minUUID.String()
+				continuationTok string
 			)
 
 			for res.IsTruncated = true; res.IsTruncated; {
 				if ctx.Err() != nil {
 					return
 				}
+				// NOTE: cannot pass both startAfter and continuationToken — s3proxy returns Bad Request.
+				// Use continuationToken on subsequent pages; startAfter only on first.
+				continuationTok = res.NextContinuationToken
+				if continuationTok != "" {
+					startAfter = ""
+				}
 
-				res, err = rw.core.ListObjectsV2(rw.cfg.Bucket, prefix, startAfter, res.NextContinuationToken, "", 0)
+				res, err = rw.core.ListObjectsV2(rw.cfg.Bucket, prefix, startAfter, continuationTok, "", 0)
 				if err != nil {
 					errChan <- fmt.Errorf("error finding objects in s3 bucket, bucket: %s: %w", rw.cfg.Bucket, err)
 					return

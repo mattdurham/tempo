@@ -520,6 +520,80 @@ block_builder:
     max_consuming_bytes: 5000000000
     block:
         max_block_bytes: 20971520
+        bloom_filter_false_positive: 0.01
+        bloom_filter_shard_size_bytes: 102400
+        version: ""
+        parquet_row_group_size_bytes: 100000000
+        parquet_dedicated_columns:
+            - scope: resource
+              name: k8s.cluster.name
+              type: string
+              options: []
+            - scope: resource
+              name: k8s.namespace.name
+              type: string
+              options: []
+            - scope: resource
+              name: k8s.pod.name
+              type: string
+              options: []
+            - scope: resource
+              name: k8s.container.name
+              type: string
+              options: []
+            - scope: span
+              name: http.request.method
+              type: string
+              options: []
+            - scope: span
+              name: http.response.status_code
+              type: int
+              options: []
+            - scope: span
+              name: url.path
+              type: string
+              options: []
+            - scope: span
+              name: url.route
+              type: string
+              options: []
+            - scope: span
+              name: server.address
+              type: string
+              options: []
+            - scope: span
+              name: server.port
+              type: int
+              options: []
+            - scope: span
+              name: http.method
+              type: string
+              options: []
+            - scope: span
+              name: http.url
+              type: string
+              options: []
+            - scope: span
+              name: http.route
+              type: string
+              options: []
+            - scope: span
+              name: http.status_code
+              type: int
+              options: []
+        blockpack:
+            compression_codec: zstd
+            compression_level: 3
+            column_block_size: 65536
+            write_buffer_size: 1048576
+            enable_dictionary: true
+            dictionary_max_size: 1048576
+            enable_minhash: true
+            minhash_permutations: 128
+            enable_bit_packing: true
+            max_spans_per_block: 2000
+            file_cache_path: /var/tempo/blockpack-cache
+            file_cache_max_bytes: 4294967296
     wal:
         path: /var/tempo/block-builder/traces
         ingestion_time_range_slack: 2m0s
@@ -593,6 +667,19 @@ storage:
                   name: http.status_code
                   type: int
                   options: []
+            blockpack:
+                compression_codec: zstd
+                compression_level: 3
+                column_block_size: 65536
+                write_buffer_size: 1048576
+                enable_dictionary: true
+                dictionary_max_size: 1048576
+                enable_minhash: true
+                minhash_permutations: 128
+                enable_bit_packing: true
+                max_spans_per_block: 2000
+                file_cache_path: /var/tempo/blockpack-cache
+                file_cache_max_bytes: 4294967296
         search:
             chunk_size_bytes: 1000000
             prefetch_trace_count: 1000
@@ -1044,6 +1131,81 @@ live_store:
     max_live_traces_bytes: 250000000
     max_block_duration: 1m0s
     max_block_bytes: 104857600
+    block_config:
+        bloom_filter_false_positive: 0.01
+        bloom_filter_shard_size_bytes: 102400
+        version: ""
+        parquet_row_group_size_bytes: 100000000
+        parquet_dedicated_columns:
+            - scope: resource
+              name: k8s.cluster.name
+              type: string
+              options: []
+            - scope: resource
+              name: k8s.namespace.name
+              type: string
+              options: []
+            - scope: resource
+              name: k8s.pod.name
+              type: string
+              options: []
+            - scope: resource
+              name: k8s.container.name
+              type: string
+              options: []
+            - scope: span
+              name: http.request.method
+              type: string
+              options: []
+            - scope: span
+              name: http.response.status_code
+              type: int
+              options: []
+            - scope: span
+              name: url.path
+              type: string
+              options: []
+            - scope: span
+              name: url.route
+              type: string
+              options: []
+            - scope: span
+              name: server.address
+              type: string
+              options: []
+            - scope: span
+              name: server.port
+              type: int
+              options: []
+            - scope: span
+              name: http.method
+              type: string
+              options: []
+            - scope: span
+              name: http.url
+              type: string
+              options: []
+            - scope: span
+              name: http.route
+              type: string
+              options: []
+            - scope: span
+              name: http.status_code
+              type: int
+              options: []
+        blockpack:
+            compression_codec: zstd
+            compression_level: 3
+            column_block_size: 65536
+            write_buffer_size: 1048576
+            enable_dictionary: true
+            dictionary_max_size: 1048576
+            enable_minhash: true
+            minhash_permutations: 128
+            enable_bit_packing: true
+            max_spans_per_block: 2000
+            file_cache_path: /var/tempo/blockpack-cache
+            file_cache_max_bytes: 4294967296
     readiness_target_lag: 0s
     readiness_max_wait: 30m0s
     fail_on_high_lag: false

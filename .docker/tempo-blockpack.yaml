@@ -1,0 +1,130 @@
+multitenancy_enabled: false
+
+partition_ring_live_store: true
+
+querier:
+  query_live_store: true
+  search:
+    # Extended for blockpack benchmarking — broad metrics queries ({}|rate()) read
+    # all columns per block (~200MB each) vs parquet which projects only timestamps.
+    # Default 30s is too short for full-table-scan metrics on 14 blocks.
+    query_timeout: 5m
+  frontend_worker:
+    grpc_client_config:
+      max_send_msg_size: 367001600  # 350 MiB — allows large trace responses
+
+server:
+  http_listen_port: 3201
+  log_level: info
+  grpc_server_max_recv_msg_size: 104857600
+  grpc_server_max_send_msg_size: 104857600
+  # Default 30s HTTP write timeout kills metrics queries before they complete.
+  # Blockpack reads all columns per block (~200MB), so broad queries need more time.
+  http_server_write_timeout: 10m
+  http_server_read_timeout: 10m
+
+distributor:
+  ingester_write_path_enabled: false
+  kafka_write_path_enabled: true
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4319
+        http:
+          endpoint: 0.0.0.0:4320
+
+live_store:
+  max_trace_live: 5m
+  max_trace_idle: 30s
+  flush_check_period: 10s
+  max_block_duration: 5m
+  partition_ring:
+    kvstore:
+      store: inmemory
+
+ingest:
+  enabled: true
+  kafka:
+    address: kafka:9092
+    topic: tempo-ingest-blockpack
+
+block_builder:
+  consume_cycle_duration: 10s
+  block:
+    version: vblockpack
+  wal:
+    ingestion_time_range_slack: 876000h
+  assigned_partitions:
+    block-builder-0:
+      - 0
+
+backend_scheduler:
+  provider:
+    compaction:
+      measure_interval: 1m
+      min_cycle_interval: 30s
+      max_jobs_per_tenant: 1000
+      min_input_blocks: 2
+      max_input_blocks: 4
+      max_compaction_level: 2
+      compaction:
+        block_retention: 1440h
+        compacted_block_retention: 1h
+        max_compaction_objects: 6000000
+        max_block_bytes: 107374182400
+        compaction_window: 1h
+        retention_concurrency: 10
+        max_time_per_tenant: 5m
+        compaction_cycle: 30s
+
+backend_worker:
+  compaction:
+    block_retention: 1440h
+    compacted_block_retention: 1h
+    max_compaction_objects: 6000000
+    max_block_bytes: 107374182400
+    compaction_window: 1h
+    retention_concurrency: 10
+    max_time_per_tenant: 5m
+    compaction_cycle: 30s
+
+storage:
+  trace:
+    pool:
+      # Limit pool workers to bound concurrent blockpack Reader allocations.
+      # Each reader parses bloom sketches (~70MB each); default 400 workers × N blocks → OOM.
+      max_workers: 10
+    backend: s3
+    s3:
+      bucket: tempo-blockpack
+      endpoint: s3fs:8080
+      access_key: minioadmin
+      secret_key: minioadmin
+      insecure: true
+    block:
+      version: vblockpack
+      blockpack:
+        file_cache_path: /var/tempo/blockpack-cache
+        file_cache_max_bytes: 21474836480  # 20GB
+        # lru_cache_bytes removed — SharedLRU replaced by objectcache
+    wal:
+      path: /var/tempo/wal
+
+query_frontend:
+  rf1_after: 1970-01-01T00:00:00Z
+  search:
+    max_duration: 0s
+    # Limit parallel block shard requests to bound concurrent Reader allocations.
+    # Default 1000 allows all 79 shards × many concurrent queries → OOM.
+    concurrent_jobs: 10
+  metrics:
+    max_duration: 0s
+
+overrides:
+  defaults:
+    global:
+      max_bytes_per_trace: 104857600
+    ingestion:
+      rate_limit_bytes: 104857600
+      burst_size_bytes: 104857600

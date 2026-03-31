@@ -1,0 +1,65 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+coverage.txt
+coverage.html
+
+# Go workspace file
+go.work
+
+# Dependency directories
+vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Benchmarks and profiling
+*.prof
+bench*.txt
+mem.prof
+cpu.prof
+
+# Temporary files
+*.tmp
+*.temp
+tmp/
+
+# Embedded git repositories (reference code)
+docs/dev/
+INDEX.md
+
+# Private Claude configuration
+.claude/
+
+# Development comparison benchmarks (separate module with external deps)
+benchmark/comparison/
+
+# Local benchmark baselines (generated per-machine)
+benchmark/baselines/
+
+# Debug/profile test files (local development only)
+*_profile_test.go
+*_debug_test.go
+
+# Local assets (screenshots, diagrams for docs)
+assets/
+regex-bench/
+
+*-cwd
