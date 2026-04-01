@@ -3,7 +3,6 @@ package objectcache_test
 // NOTE: Any changes to this file must be reflected in the corresponding SPECS.md or NOTES.md.
 
 import (
-	"runtime"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -14,17 +13,6 @@ import (
 
 type testValue struct {
 	n int
-}
-
-// putValue is a //go:noinline helper used by GC eviction tests.
-// Extracting the Put call into a noinline function guarantees the compiler
-// cannot keep the strong reference live past the call site, so GC can
-// collect the value in the caller after putValue returns.
-//
-//go:noinline
-func putValue(t *testing.T, c *objectcache.Cache[testValue], key string, val *testValue) {
-	t.Helper()
-	require.NoError(t, c.Put(key, val))
 }
 
 // TestCache_GetMissReturnsNil verifies that Get on an empty cache returns nil.
@@ -44,48 +32,18 @@ func TestCache_PutThenGet(t *testing.T) {
 	got := c.Get("key1")
 	require.NotNil(t, got)
 	assert.Equal(t, 42, got.n)
-	runtime.KeepAlive(v) // prevent GC from collecting v before Get returns
 }
 
-// TestCache_GCEviction verifies that after all strong references to a value are dropped
-// and GC runs, Get returns nil (the weak pointer was reclaimed).
-// SPEC-OC-003: GC-cooperative — entries are reclaimed when no strong refs remain.
-func TestCache_GCEviction(t *testing.T) {
+// TestCache_StrongReference verifies that entries survive GC cycles (strong references).
+// SPEC-OC-002: entries are not GC'd while in the cache.
+func TestCache_StrongReference(t *testing.T) {
 	var c objectcache.Cache[testValue]
+	require.NoError(t, c.Put("retained", &testValue{n: 99}))
 
-	// Use a //go:noinline helper so the compiler cannot keep the strong reference
-	// live past the call site. The only strong ref is gone when putValue returns.
-	putValue(t, &c, "evictable", &testValue{n: 99})
-
-	// Force GC cycles; the weak pointer should now report nil.
-	runtime.GC()
-	runtime.GC() // second GC to reduce nondeterminism in when weak pointers are cleared
-
-	got := c.Get("evictable")
-	assert.Nil(t, got, "value should be GC'd when no strong refs remain")
-}
-
-// TestCache_StaleKeyCleanedOnGet verifies that after GC evicts an entry,
-// a subsequent Get deletes the stale map key (prevents unbounded key growth).
-// SPEC-OC-004: stale keys are deleted lazily on Get.
-func TestCache_StaleKeyCleanedOnGet(t *testing.T) {
-	var c objectcache.Cache[testValue]
-
-	// Use //go:noinline helper so the strong ref is guaranteed off the stack.
-	putValue(t, &c, "stale", &testValue{n: 7})
-	runtime.GC()
-	runtime.GC()
-
-	// Get should return nil AND delete the stale key.
-	got := c.Get("stale")
-	assert.Nil(t, got)
-
-	// A second Put + Get cycle on the same key should work correctly.
-	v2 := &testValue{n: 8}
-	require.NoError(t, c.Put("stale", v2))
-	got2 := c.Get("stale")
-	require.NotNil(t, got2)
-	assert.Equal(t, 8, got2.n)
+	// Unlike weak-pointer cache, strong references survive GC.
+	got := c.Get("retained")
+	require.NotNil(t, got, "strong-reference cache must retain entries across GC")
+	assert.Equal(t, 99, got.n)
 }
 
 // TestCache_Clear verifies that Clear removes all entries from the cache.
@@ -115,26 +73,23 @@ func TestCache_ConcurrentPutGet(t *testing.T) {
 	var c objectcache.Cache[testValue]
 	done := make(chan struct{}, numGoroutines)
 
-	for g := 0; g < numGoroutines; g++ {
+	for g := range numGoroutines {
 		go func(id int) {
 			defer func() { done <- struct{}{} }()
-			for i := 0; i < numOpsPerGoroutine; i++ {
+			for i := range numOpsPerGoroutine {
 				v := &testValue{n: id*numOpsPerGoroutine + i}
-				_ = c.Put("shared", v) // error only on nil — never nil here
-				got := c.Get("shared")
-				// got may be nil if GC ran — acceptable per SPEC-OC-001/SPEC-OC-003
-				_ = got
+				_ = c.Put("shared", v)
+				_ = c.Get("shared")
 			}
 		}(g)
 	}
 
-	for i := 0; i < numGoroutines; i++ {
+	for range numGoroutines {
 		<-done
 	}
 }
 
 // TestCache_PutNilReturnsError verifies that Put returns an error when called with a nil pointer.
-// SPEC-OC-002: nil v returns an error.
 func TestCache_PutNilReturnsError(t *testing.T) {
 	var c objectcache.Cache[testValue]
 	err := c.Put("key", nil)
@@ -144,17 +99,15 @@ func TestCache_PutNilReturnsError(t *testing.T) {
 
 // TestCache_OverwriteSameKey verifies that Putting a new value for an existing key
 // replaces the old entry.
-// SPEC-OC-002: Put is idempotent for immutable data — second Put wins.
 func TestCache_OverwriteSameKey(t *testing.T) {
 	var c objectcache.Cache[testValue]
 	v1 := &testValue{n: 1}
 	v2 := &testValue{n: 2}
 
 	require.NoError(t, c.Put("k", v1))
-	require.NoError(t, c.Put("k", v2)) // overwrite
+	require.NoError(t, c.Put("k", v2))
 
 	got := c.Get("k")
 	require.NotNil(t, got)
 	assert.Equal(t, 2, got.n)
-	runtime.KeepAlive(v2) // prevent GC from collecting v2 before Get returns
 }

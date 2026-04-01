@@ -1,9 +1,6 @@
 package objectcache
 
-// NOTE: Any changes to this file must be reflected in the corresponding SPECS.md or NOTES.md.
-
 import (
-	"runtime"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -12,31 +9,48 @@ import (
 
 type internalTestValue struct{ n int }
 
-//go:noinline
-func putInternal(c *Cache[internalTestValue], key string, v *internalTestValue) error {
-	return c.Put(key, v)
-}
-
-// TestCache_StaleKeyActuallyDeleted verifies that a GC-evicted entry's map key is
-// removed from the underlying sync.Map by Get, not merely skipped.
-// SPEC-OC-004: stale keys are deleted lazily on Get.
-func TestCache_StaleKeyActuallyDeleted(t *testing.T) {
+// TestCache_StrongRefInternalMap verifies that entries are stored and retrievable.
+func TestCache_StrongRefInternalMap(t *testing.T) {
 	var c Cache[internalTestValue]
 
-	require.NoError(t, putInternal(&c, "gone", &internalTestValue{n: 1}))
+	require.NoError(t, c.Put("key", &internalTestValue{n: 1}))
 
-	runtime.GC()
-	runtime.GC()
+	val := c.Get("key")
+	assert.NotNil(t, val)
+	assert.Equal(t, 1, val.n)
+}
 
-	// Before Get: key should still be in the map (not yet cleaned).
-	_, existsBefore := c.m.Load("gone")
-	assert.True(t, existsBefore, "stale key should exist in map before Get is called")
+// TestCache_LRUEviction verifies entries are evicted when byte budget is exceeded.
+func TestCache_LRUEviction(t *testing.T) {
+	var c Cache[internalTestValue]
+	c.SetMaxBytes(3 << 20) // 3 MB budget, each entry defaults to 1 MB
 
-	// Get triggers lazy deletion.
-	got := c.Get("gone")
-	assert.Nil(t, got)
+	require.NoError(t, c.Put("a", &internalTestValue{n: 1}))
+	require.NoError(t, c.Put("b", &internalTestValue{n: 2}))
+	require.NoError(t, c.Put("c", &internalTestValue{n: 3}))
+	assert.Equal(t, 3, c.Len())
 
-	// After Get: key must be absent from the map.
-	_, existsAfter := c.m.Load("gone")
-	assert.False(t, existsAfter, "stale key must be deleted from map after Get returns nil")
+	// Adding a 4th should evict the LRU entry ("a").
+	require.NoError(t, c.Put("d", &internalTestValue{n: 4}))
+	assert.Equal(t, 3, c.Len())
+	assert.Nil(t, c.Get("a"), "LRU entry 'a' should be evicted")
+	assert.NotNil(t, c.Get("d"))
+}
+
+// TestCache_GetPromotesLRU verifies that Get promotes an entry so it isn't evicted.
+func TestCache_GetPromotesLRU(t *testing.T) {
+	var c Cache[internalTestValue]
+	c.SetMaxBytes(3 << 20) // 3 MB
+
+	require.NoError(t, c.Put("a", &internalTestValue{n: 1}))
+	require.NoError(t, c.Put("b", &internalTestValue{n: 2}))
+	require.NoError(t, c.Put("c", &internalTestValue{n: 3}))
+
+	// Touch "a" to promote it.
+	c.Get("a")
+
+	// Adding "d" should evict "b" (now the LRU), not "a".
+	require.NoError(t, c.Put("d", &internalTestValue{n: 4}))
+	assert.NotNil(t, c.Get("a"), "'a' was promoted and should survive")
+	assert.Nil(t, c.Get("b"), "'b' should be evicted as LRU")
 }

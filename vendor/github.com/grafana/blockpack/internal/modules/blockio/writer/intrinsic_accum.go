@@ -91,7 +91,7 @@ func (a *intrinsicAccumulator) feedUint64(
 	c.refs = append(c.refs, ref)
 }
 
-// feedBytes adds one byte slice value to the named flat column.
+// feedBytes adds one byte slice value (trace:id, span:id, span:parent_id) to the named flat column.
 func (a *intrinsicAccumulator) feedBytes(
 	name string,
 	colType shared.ColumnType,
@@ -184,15 +184,23 @@ func (a *intrinsicAccumulator) columnNames() []string {
 }
 
 // encodeColumn serializes one column's accumulated data into a compressed blob.
-// Always uses v2 paged format (IntrinsicPagedVersion = 0x02) regardless of row count.
-// The v1 monolithic format has been removed; all columns produce a v2 blob with at
-// least one page.
+// Uses paged (v2) format when row count exceeds IntrinsicPageSize, otherwise v1 monolithic.
 func (a *intrinsicAccumulator) encodeColumn(name string) ([]byte, error) {
 	if c, ok := a.flatCols[name]; ok {
-		return encodePagedFlatColumn(c)
+		if len(c.refs) > shared.IntrinsicPageSize {
+			return encodePagedFlatColumn(c)
+		}
+		return encodeFlatColumn(c)
 	}
 	if c, ok := a.dictCols[name]; ok {
-		return encodePagedDictColumn(c)
+		total := 0
+		for _, e := range c.entries {
+			total += len(e.refs)
+		}
+		if total > shared.IntrinsicPageSize {
+			return encodePagedDictColumn(c)
+		}
+		return encodeDictColumn(c)
 	}
 	return nil, nil
 }
@@ -272,6 +280,124 @@ func writeRef(buf *bytes.Buffer, ref shared.BlockRef, blockW, rowW uint8) {
 		binary.LittleEndian.PutUint16(tmp2[:], ref.RowIdx)
 		buf.Write(tmp2[:])
 	}
+}
+
+// encodeFlatColumn encodes a flat accumulator to wire format and snappy-compresses it.
+//
+// Wire format (uncompressed):
+//
+//	format_version[1]  = IntrinsicFormatVersion (0x01)
+//	format[1]          = IntrinsicFormatFlat (0x01)
+//	col_type[1]        = ColumnType byte
+//	row_count[4 LE]    = total rows
+//	block_idx_width[1] = bytes per blockIdx in refs (1 or 2)
+//	row_idx_width[1]   = bytes per rowIdx in refs (1 or 2)
+//	values[row_count × width] = sorted values:
+//	  uint64: delta-encoded (first value absolute, subsequent values are v[i]-v[i-1])
+//	  bytes:  length-prefixed (2-byte LE len + raw bytes)
+//	refs[row_count × (block_idx_width+row_idx_width)] = (blockIdx, rowIdx) parallel to values
+func encodeFlatColumn(c *flatAccum) ([]byte, error) {
+	sortFlatAccum(c)
+	n := len(c.refs)
+
+	blockW, rowW := refWidths(c.refs)
+
+	var buf bytes.Buffer
+	buf.WriteByte(shared.IntrinsicFormatVersion)
+	buf.WriteByte(shared.IntrinsicFormatFlat)
+	buf.WriteByte(byte(c.colType))
+
+	var tmp4 [4]byte
+	binary.LittleEndian.PutUint32(tmp4[:], uint32(n)) //nolint:gosec
+	buf.Write(tmp4[:])
+
+	buf.WriteByte(blockW)
+	buf.WriteByte(rowW)
+
+	var tmp8 [8]byte
+	var tmp2 [2]byte
+	if len(c.uint64Values) > 0 {
+		// Delta encoding: first value is absolute, subsequent values are deltas.
+		// Values are sorted ascending so all deltas are non-negative.
+		var prev uint64
+		for _, v := range c.uint64Values {
+			binary.LittleEndian.PutUint64(tmp8[:], v-prev)
+			buf.Write(tmp8[:])
+			prev = v
+		}
+	} else {
+		for _, v := range c.bytesValues {
+			binary.LittleEndian.PutUint16(tmp2[:], uint16(len(v))) //nolint:gosec
+			buf.Write(tmp2[:])
+			buf.Write(v)
+		}
+	}
+	// Block refs parallel to values, using variable-width encoding.
+	for _, ref := range c.refs {
+		writeRef(&buf, ref, blockW, rowW)
+	}
+
+	return snappy.Encode(nil, buf.Bytes()), nil
+}
+
+// encodeDictColumn encodes a dict accumulator to wire format and snappy-compresses it.
+//
+// Wire format (uncompressed):
+//
+//	format_version[1]  = IntrinsicFormatVersion (0x01)
+//	format[1]          = IntrinsicFormatDict (0x02)
+//	col_type[1]        = ColumnType byte
+//	value_count[4 LE]  = number of unique values
+//	block_idx_width[1] = bytes per blockIdx in all refs (1 or 2)
+//	row_idx_width[1]   = bytes per rowIdx in all refs (1 or 2)
+//	per value (sorted by value):
+//	  value_len[2 LE] = byte length of value string (0 for int64: 8 bytes follow)
+//	  value[value_len OR 8 bytes LE int64]
+//	  ref_count[4 LE] = number of block refs for this value
+//	  refs[ref_count × (block_idx_width+row_idx_width)] = (blockIdx, rowIdx)
+func encodeDictColumn(c *dictAccum) ([]byte, error) {
+	sortDictEntries(c)
+	isInt64 := c.colType == shared.ColumnTypeInt64 || c.colType == shared.ColumnTypeRangeInt64
+
+	blockW, rowW := dictRefWidths(c.entries)
+
+	var buf bytes.Buffer
+	buf.WriteByte(shared.IntrinsicFormatVersion)
+	buf.WriteByte(shared.IntrinsicFormatDict)
+	buf.WriteByte(byte(c.colType))
+
+	var tmp4 [4]byte
+	binary.LittleEndian.PutUint32(tmp4[:], uint32(len(c.entries))) //nolint:gosec
+	buf.Write(tmp4[:])
+
+	buf.WriteByte(blockW)
+	buf.WriteByte(rowW)
+
+	var tmp8 [8]byte
+	var tmp2 [2]byte
+	for _, e := range c.entries {
+		if isInt64 {
+			binary.LittleEndian.PutUint16(tmp2[:], 0) // sentinel: 0 len means int64 follows
+			buf.Write(tmp2[:])
+			binary.LittleEndian.PutUint64(tmp8[:], uint64(e.int64Val)) //nolint:gosec
+			buf.Write(tmp8[:])
+		} else {
+			strVal := e.strVal
+			if len(strVal) > 65535 {
+				strVal = strVal[:65535]
+			}
+			binary.LittleEndian.PutUint16(tmp2[:], uint16(len(strVal))) //nolint:gosec
+			buf.Write(tmp2[:])
+			buf.WriteString(strVal)
+		}
+		binary.LittleEndian.PutUint32(tmp4[:], uint32(len(e.refs))) //nolint:gosec
+		buf.Write(tmp4[:])
+		for _, ref := range e.refs {
+			writeRef(&buf, ref, blockW, rowW)
+		}
+	}
+
+	return snappy.Encode(nil, buf.Bytes()), nil
 }
 
 // computeMinMax extracts the min/max encoded values from a flat or dict column for the TOC.
@@ -468,7 +594,7 @@ func encodeFlatPageBlob(c *flatAccum, start, end int, blockW, rowW uint8) (blob 
 }
 
 // encodePagedFlatColumn encodes a flat accumulator using the v2 paged format.
-// Always used (regardless of row count) since v1 monolithic format has been removed.
+// Called when row count > IntrinsicPageSize.
 //
 // Returns a raw blob starting with IntrinsicPagedVersion[1]:
 //
@@ -485,8 +611,6 @@ func encodePagedFlatColumn(c *flatAccum) ([]byte, error) {
 	blockW, rowW := refWidths(c.refs)
 
 	// Chunk into pages of IntrinsicPageSize rows each.
-	// When n==0, pageCount==0 and the loop is skipped, producing a paged blob with an
-	// empty TOC. decodePagedColumnBlob handles zero pages correctly (returns empty column).
 	pageCount := (n + shared.IntrinsicPageSize - 1) / shared.IntrinsicPageSize
 	pages := make([]shared.PageMeta, 0, pageCount)
 	pageBlobs := make([][]byte, 0, pageCount)

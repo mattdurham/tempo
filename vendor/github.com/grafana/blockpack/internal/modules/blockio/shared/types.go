@@ -24,7 +24,7 @@ const (
 	ColumnTypeUUID          ColumnType = 12 // string column stored as 16-byte binary UUID; StringValue() returns formatted UUID
 )
 
-// BlockKind is the kind byte in a v11 block index entry.
+// BlockKind is the kind byte in a block index entry.
 type BlockKind uint8
 
 // BlockKindLeaf is the only defined block kind; leaf blocks contain span data.

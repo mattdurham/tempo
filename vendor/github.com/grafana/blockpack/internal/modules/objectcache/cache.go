@@ -28,10 +28,10 @@ const defaultEntrySize int64 = 1 << 20 // 1 MB fallback
 
 // entry is a doubly-linked list node for LRU tracking.
 type entry[V any] struct {
-	key        string
 	val        *V
-	sizeBytes  int64
 	prev, next *entry[V]
+	key        string
+	sizeBytes  int64
 }
 
 // Cache is a generic in-memory cache with strong references and LRU eviction.
@@ -46,12 +46,12 @@ type entry[V any] struct {
 // SPEC-OC-006: All methods are safe for concurrent use.
 // SPEC-OC-007: Byte budget defaults to 20% of GOMEMLIMIT; configurable via SetMaxBytes.
 type Cache[V any] struct {
-	mu       sync.Mutex
 	items    map[string]*entry[V]
 	head     *entry[V] // most recently used
 	tail     *entry[V] // least recently used
 	curBytes int64
 	maxBytes int64 // 0 = compute from GOMEMLIMIT on first Put
+	mu       sync.Mutex
 	inited   bool
 }
 

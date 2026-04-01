@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"time"
 
 	"github.com/grafana/blockpack/internal/logqlparser"
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
@@ -100,64 +101,91 @@ func CollectLogs(
 	program *vm.Program,
 	pipeline *logqlparser.Pipeline,
 	opts CollectOptions,
-) ([]LogEntry, error) {
+) ([]LogEntry, QueryStats, error) {
 	if r == nil {
-		return nil, nil
+		return nil, QueryStats{}, nil
 	}
 	if program == nil {
-		return nil, fmt.Errorf("CollectLogs: program cannot be nil")
+		return nil, QueryStats{}, fmt.Errorf("CollectLogs: program cannot be nil")
 	}
+
+	queryStart := time.Now()
+	var qs QueryStats
 
 	// NOTE-023: forward opts.TimeRange for block-level pruning when provided.
 	// When opts.TimeRange is zero, this is identical to the previous behavior.
+	planStart := time.Now()
 	plan := planBlocks(r, program, queryplanner.TimeRange{
 		MinNano: opts.TimeRange.MinNano,
 		MaxNano: opts.TimeRange.MaxNano,
 	}, queryplanner.PlanOptions{})
-
-	fetchedBlocks := 0
-	if opts.OnStats != nil {
-		defer func() {
-			opts.OnStats(CollectStats{
-				TotalBlocks:    plan.TotalBlocks,
-				PrunedByTime:   plan.PrunedByTime,
-				PrunedByIndex:  plan.PrunedByIndex,
-				PrunedByFuse:   plan.PrunedByFuse,
-				PrunedByCMS:    plan.PrunedByCMS,
-				SelectedBlocks: len(plan.SelectedBlocks),
-				FetchedBlocks:  fetchedBlocks,
-				Explain:        plan.Explain,
-			})
-		}()
-	}
+	qs.Steps = append(qs.Steps, StepStats{
+		Name:     "plan",
+		Duration: time.Since(planStart),
+		Metadata: map[string]any{
+			"total_blocks":    plan.TotalBlocks,
+			"pruned_by_time":  plan.PrunedByTime,
+			"pruned_by_index": plan.PrunedByIndex,
+			"pruned_by_fuse":  plan.PrunedByFuse,
+			"pruned_by_cms":   plan.PrunedByCMS,
+			"selected_blocks": len(plan.SelectedBlocks),
+			"explain":         plan.Explain,
+		},
+	})
 
 	if len(plan.SelectedBlocks) == 0 {
-		return nil, nil
+		qs.ExecutionPath = "block-pruned"
+		qs.TotalDuration = time.Since(queryStart)
+		return nil, qs, nil
 	}
 
 	wantColumns := ProgramWantColumns(program)
 	wantColumns = injectLogRequiredColumns(wantColumns)
 
 	backward := opts.Direction == queryplanner.Backward
-	var fb int
+	var fetchedGroups int
+	var fetchedBlocks int
+	var bytesRead int64
 	var scanErr error
 
+	scanStart := time.Now()
+
 	if opts.Limit > 0 {
+		qs.ExecutionPath = "block-topk"
 		buf := &logTopKHeap{
 			entries:  make([]LogEntry, 0, opts.Limit),
 			backward: backward,
 		}
-		fb, scanErr = logTopKScan(r, program, wantColumns, pipeline, opts, plan, buf, backward)
+		fetchedGroups, fetchedBlocks, bytesRead, scanErr = logTopKScan(
+			r,
+			program,
+			wantColumns,
+			pipeline,
+			opts,
+			plan,
+			buf,
+			backward,
+		)
 		if scanErr != nil {
-			return nil, scanErr
+			return nil, qs, scanErr
 		}
-		fetchedBlocks = fb
-		return logDeliverAll(buf.entries, backward), nil
+		qs.Steps = append(qs.Steps, StepStats{
+			Name:      "block-scan",
+			Duration:  time.Since(scanStart),
+			BytesRead: bytesRead,
+			IOOps:     fetchedGroups,
+			Metadata: map[string]any{
+				"fetched_blocks": fetchedBlocks,
+			},
+		})
+		qs.TotalDuration = time.Since(queryStart)
+		return logDeliverAll(buf.entries, backward), qs, nil
 	}
 
 	// Limit == 0: collect all, sort globally, deliver.
 	// Pre-allocate with a capacity hint: min(totalSpanCount, 4096) to avoid repeated
 	// slice growth copies while not over-allocating for selective queries.
+	qs.ExecutionPath = "block-plain"
 	var totalRows int
 	for _, blockIdx := range plan.SelectedBlocks {
 		totalRows += int(r.BlockMeta(blockIdx).SpanCount)
@@ -166,12 +194,29 @@ func CollectLogs(
 		totalRows = 4096
 	}
 	all := make([]LogEntry, 0, totalRows)
-	fb, scanErr = logCollectAll(r, program, wantColumns, pipeline, opts, plan, &all)
+	fetchedGroups, fetchedBlocks, bytesRead, scanErr = logCollectAll(
+		r,
+		program,
+		wantColumns,
+		pipeline,
+		opts,
+		plan,
+		&all,
+	)
 	if scanErr != nil {
-		return nil, scanErr
+		return nil, qs, scanErr
 	}
-	fetchedBlocks = fb
-	return logDeliverAll(all, backward), nil
+	qs.Steps = append(qs.Steps, StepStats{
+		Name:      "block-scan",
+		Duration:  time.Since(scanStart),
+		BytesRead: bytesRead,
+		IOOps:     fetchedGroups,
+		Metadata: map[string]any{
+			"fetched_blocks": fetchedBlocks,
+		},
+	})
+	qs.TotalDuration = time.Since(queryStart)
+	return logDeliverAll(all, backward), qs, nil
 }
 
 // filterRowsByTimeRange filters rowIndices to those within [minNano, maxNano].
@@ -216,7 +261,7 @@ func filterRowsByTimeRange(tsCol *modules_reader.Column, rows []int, minNano, ma
 // fn receives the row timestamp and the materialized LogEntry. fn returns true to
 // continue iteration, false to stop.
 //
-// Returns the number of blocks fetched.
+// Returns the number of blocks fetched and approximate bytes read.
 // processLogRows applies the per-row pipeline and callback for one block's kept rows.
 // Returns true if the callback requested early stop.
 func processLogRows(
@@ -280,6 +325,8 @@ func processLogRows(
 	return false
 }
 
+// iterateLogRows returns (fetchedGroups, fetchedBlocks, bytesRead, error):
+// fetchedGroups counts ReadGroup calls (IOOps); fetchedBlocks counts individual blocks fetched.
 func iterateLogRows(
 	r *modules_reader.Reader,
 	program *vm.Program,
@@ -290,7 +337,7 @@ func iterateLogRows(
 	canSkipBlock func(meta shared.BlockMeta) bool,
 	canSkip func(ts uint64) bool,
 	fn func(ts uint64, entry LogEntry) bool,
-) (int, error) {
+) (int, int, int64, error) {
 	groups := r.CoalescedGroups(plan.SelectedBlocks)
 	blockToGroup := make(map[int]int, len(plan.SelectedBlocks))
 	for gi, g := range groups {
@@ -302,7 +349,9 @@ func iterateLogRows(
 	fetched := make(map[int][]byte)
 	fetchedGroupsSeen := make(map[int]bool)
 	skippedBlocks := make(map[int]bool)
+	fetchedGroups := 0
 	fetchCount := 0
+	var bytesRead int64
 
 	for _, blockIdx := range plan.SelectedBlocks {
 		meta := r.BlockMeta(blockIdx)
@@ -326,16 +375,18 @@ func iterateLogRows(
 		if !fetchedGroupsSeen[gi] {
 			groupRaw, err := r.ReadGroup(groups[gi])
 			if err != nil {
-				return fetchCount, fmt.Errorf("CollectLogs ReadGroup: %w", err)
+				return fetchedGroups, fetchCount, bytesRead, fmt.Errorf("CollectLogs ReadGroup: %w", err)
 			}
 			maps.Copy(fetched, groupRaw)
-			// Remove any blocks in this group that were already skipped before
-			// the group was fetched, so their bytes don't linger in fetched.
+			// Count bytes for entire fetched group — ReadGroup reads all blocks in the group.
+			// Remove skipped blocks from fetched but still count their bytes.
 			for _, bi := range groups[gi].BlockIDs {
 				if skippedBlocks[bi] {
 					delete(fetched, bi)
 				}
+				bytesRead += int64(r.BlockMeta(bi).Length) //nolint:gosec // Length is block size, safe to cast
 			}
+			fetchedGroups++
 			fetchCount += len(groups[gi].BlockIDs)
 			fetchedGroupsSeen[gi] = true
 		}
@@ -349,12 +400,20 @@ func iterateLogRows(
 		r.ResetInternStrings()
 		bwb, err := r.ParseBlockFromBytes(raw, wantColumns, meta)
 		if err != nil {
-			return fetchCount, fmt.Errorf("CollectLogs ParseBlockFromBytes block %d: %w", blockIdx, err)
+			return fetchedGroups, fetchCount, bytesRead, fmt.Errorf(
+				"CollectLogs ParseBlockFromBytes block %d: %w",
+				blockIdx,
+				err,
+			)
 		}
 
 		rowSet, err := program.ColumnPredicate(newBlockColumnProvider(bwb.Block))
 		if err != nil {
-			return fetchCount, fmt.Errorf("CollectLogs ColumnPredicate block %d: %w", blockIdx, err)
+			return fetchedGroups, fetchCount, bytesRead, fmt.Errorf(
+				"CollectLogs ColumnPredicate block %d: %w",
+				blockIdx,
+				err,
+			)
 		}
 
 		if rowSet.Size() == 0 {
@@ -380,15 +439,30 @@ func iterateLogRows(
 		bodyCol := bwb.Block.GetColumn("log:body")
 		colNames, colMap, colCols, logStrNames, logStrCols := buildBlockColMapsWithLogCache(bwb.Block)
 		skipParsers := pipeline != nil && blockHasBodyParsed(bwb.Block) && !pipeline.HasLineFormat
-		if processLogRows(keptByTime, tsCol, bodyCol, colNames, colMap, colCols, logStrNames, logStrCols, bwb.Block, pipeline, skipParsers, canSkip, fn) {
-			return fetchCount, nil
+		if processLogRows(
+			keptByTime,
+			tsCol,
+			bodyCol,
+			colNames,
+			colMap,
+			colCols,
+			logStrNames,
+			logStrCols,
+			bwb.Block,
+			pipeline,
+			skipParsers,
+			canSkip,
+			fn,
+		) {
+			return fetchedGroups, fetchCount, bytesRead, nil
 		}
 	}
-	return fetchCount, nil
+	return fetchedGroups, fetchCount, bytesRead, nil
 }
 
 // logTopKScan iterates selected blocks, applies block-level skip checks, fetches
 // lazily, and fills buf with the top-limit pipeline-passing rows.
+// Returns (fetchedGroups, fetchedBlocks, bytesRead, error).
 func logTopKScan(
 	r *modules_reader.Reader,
 	program *vm.Program,
@@ -398,7 +472,7 @@ func logTopKScan(
 	plan *queryplanner.Plan,
 	buf *logTopKHeap,
 	backward bool,
-) (int, error) {
+) (int, int, int64, error) {
 	return iterateLogRows(r, program, wantColumns, pipeline, opts, plan,
 		func(meta shared.BlockMeta) bool {
 			return logTopKCanSkipBlock(buf, opts.Limit, backward, meta)
@@ -421,6 +495,7 @@ func logTopKScan(
 
 // logCollectAll scans all selected blocks without heap pruning, collecting every
 // pipeline-passing row. Used by CollectLogs when opts.Limit == 0.
+// Returns (fetchedGroups, fetchedBlocks, bytesRead, error).
 func logCollectAll(
 	r *modules_reader.Reader,
 	program *vm.Program,
@@ -429,7 +504,7 @@ func logCollectAll(
 	opts CollectOptions,
 	plan *queryplanner.Plan,
 	all *[]LogEntry,
-) (int, error) {
+) (int, int, int64, error) {
 	return iterateLogRows(r, program, wantColumns, pipeline, opts, plan,
 		nil, // no block-level skip for collect-all
 		nil, // no per-row skip for collect-all

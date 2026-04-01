@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
+	modules_shared "github.com/grafana/blockpack/internal/modules/blockio/shared"
 	"github.com/grafana/blockpack/internal/modules/queryplanner"
 	"github.com/grafana/blockpack/internal/traceqlparser"
 	"github.com/grafana/blockpack/internal/vm"
@@ -146,10 +147,13 @@ func collectBlockStructuralSpanRecs(
 ) error {
 	meta := r.BlockMeta(blockIdx)
 
+	hasIntrinsic := r.HasIntrinsicSection()
+
 	// Union predicate columns from both programs.
-	// Identity columns (trace:id, span:id, span:parent_id) are always read from block payloads.
-	// New files no longer store them in the intrinsic section (NOTE-005 in writer/NOTES.md).
-	// Always include them in wantColumns.
+	// For files with an intrinsic section, identity columns (trace:id, span:id,
+	// span:parent_id) are served from the intrinsic section — omit from wantColumns.
+	// For legacy files (no intrinsic section), identity columns live in block payloads
+	// and must be decoded — include them in wantColumns.
 	wantColumns := ProgramWantColumns(leftProg)
 	if rightCols := ProgramWantColumns(rightProg); rightCols != nil {
 		if wantColumns == nil {
@@ -160,12 +164,14 @@ func collectBlockStructuralSpanRecs(
 			}
 		}
 	}
-	if wantColumns == nil {
-		wantColumns = make(map[string]struct{})
+	if !hasIntrinsic {
+		if wantColumns == nil {
+			wantColumns = make(map[string]struct{})
+		}
+		wantColumns["trace:id"] = struct{}{}
+		wantColumns["span:id"] = struct{}{}
+		wantColumns["span:parent_id"] = struct{}{}
 	}
-	wantColumns["trace:id"] = struct{}{}
-	wantColumns["span:id"] = struct{}{}
-	wantColumns["span:parent_id"] = struct{}{}
 
 	// NOTE-020: Reset intern strings before each block parse to bound per-reader memory growth.
 	r.ResetInternStrings()
@@ -176,25 +182,60 @@ func collectBlockStructuralSpanRecs(
 
 	provider := newBlockColumnProvider(bwb.Block)
 
-	// Evaluate both programs directly against block columns.
-	// With dual storage (NOTE-002 in writer/NOTES.md), all intrinsic columns are present
-	// in block payloads — no need to strip them or post-filter via the intrinsic section.
-	// ColumnPredicate evaluates span:name, span:kind, etc. directly from the decoded block.
-	leftSet, err := evalStructuralProgram(leftProg, provider, bwb.Block.SpanCount())
+	// For files with an intrinsic section, strip intrinsic-column predicates before
+	// evaluating against block columns (they are absent from block payloads).
+	// For legacy files, intrinsic columns exist in block payloads — evaluate them
+	// directly via ColumnPredicate without stripping.
+	// userAttrProgram returns nil when all predicates are intrinsic → match-all.
+	var uapLeft, uapRight *vm.Program
+	if hasIntrinsic {
+		uapLeft = userAttrProgram(leftProg)
+		uapRight = userAttrProgram(rightProg)
+	} else {
+		uapLeft = leftProg
+		uapRight = rightProg
+	}
+
+	leftSet, err := evalStructuralProgram(uapLeft, provider, bwb.Block.SpanCount())
 	if err != nil {
 		return fmt.Errorf("structural left ColumnPredicate block %d: %w", blockIdx, err)
 	}
-	rightSet, err := evalStructuralProgram(rightProg, provider, bwb.Block.SpanCount())
+	rightSet, err := evalStructuralProgram(uapRight, provider, bwb.Block.SpanCount())
 	if err != nil {
 		return fmt.Errorf("structural right ColumnPredicate block %d: %w", blockIdx, err)
 	}
 
 	n := bwb.Block.SpanCount()
 
-	// Resolve identity fields from block columns (dual-storage — always present in block payloads).
-	// Identity columns (trace:id, span:id, span:parent_id) are NOT in the intrinsic section
-	// for new files (NOTE-005 in writer/NOTES.md), so block columns are the only source.
-	idFields := identityFieldsFromBlockCols(bwb.Block, n)
+	// Collect intrinsic predicate nodes for post-filtering (intrinsic-section files only).
+	// For legacy files, ColumnPredicate already evaluated intrinsic columns from block payloads.
+	intrinsicWant := map[string]struct{}{
+		"trace:id":       {},
+		"span:id":        {},
+		"span:parent_id": {},
+	}
+	var leftIntrinsicNodes, rightIntrinsicNodes []vm.RangeNode
+	if hasIntrinsic {
+		leftIntrinsicNodes, rightIntrinsicNodes = collectStructuralIntrinsicNodes(
+			leftProg, rightProg, intrinsicWant,
+		)
+	}
+
+	// Resolve identity fields. For files with an intrinsic section, use lookupIntrinsicFields.
+	// For legacy files, read identity columns directly from decoded block columns.
+	var idFields []map[string]any
+	if hasIntrinsic {
+		allRefs := make([]modules_shared.BlockRef, n)
+		for i := range n {
+			allRefs[i] = modules_shared.BlockRef{
+				BlockIdx: uint16(blockIdx), //nolint:gosec // safe: blockIdx bounded by file block count (<65535)
+				RowIdx:   uint16(i),        //nolint:gosec // safe: i bounded by SpanCount (<65535)
+			}
+		}
+		idFields = lookupIntrinsicFields(r, allRefs, intrinsicWant)
+	} else {
+		idFields = identityFieldsFromBlockCols(bwb.Block, n)
+	}
 
 	for rowIdx := range n {
 		fields := idFields[rowIdx]
@@ -226,8 +267,15 @@ func collectBlockStructuralSpanRecs(
 			}
 		}
 
+		// Post-filter block-column matches against intrinsic predicate nodes.
+		// For legacy files (no intrinsic section), ColumnPredicate already evaluated
+		// intrinsic columns from block payloads; skip the post-filter.
 		leftMatch := leftSet.Contains(rowIdx)
 		rightMatch := rightSet.Contains(rowIdx)
+		if hasIntrinsic {
+			leftMatch = leftMatch && rowSatisfiesIntrinsicNodes(leftIntrinsicNodes, fields)
+			rightMatch = rightMatch && rowSatisfiesIntrinsicNodes(rightIntrinsicNodes, fields)
+		}
 
 		rec := structuralSpanRec{
 			spanID:     spanIDBytes,
@@ -248,6 +296,22 @@ func evalStructuralProgram(prog *vm.Program, provider vm.ColumnDataProvider, spa
 		return prog.ColumnPredicate(provider)
 	}
 	return allMatchRowSet(spanCount), nil
+}
+
+// collectStructuralIntrinsicNodes collects intrinsic predicate nodes from both programs
+// into leftNodes and rightNodes, and adds their column names to want.
+func collectStructuralIntrinsicNodes(
+	leftProg, rightProg *vm.Program, want map[string]struct{},
+) (leftNodes, rightNodes []vm.RangeNode) {
+	if leftProg != nil && leftProg.Predicates != nil {
+		collectIntrinsicNodeColumns(leftProg.Predicates.Nodes, want)
+		leftNodes = leftProg.Predicates.Nodes
+	}
+	if rightProg != nil && rightProg.Predicates != nil {
+		collectIntrinsicNodeColumns(rightProg.Predicates.Nodes, want)
+		rightNodes = rightProg.Predicates.Nodes
+	}
+	return leftNodes, rightNodes
 }
 
 // identityFieldsFromBlockCols builds a per-row identity field map by reading

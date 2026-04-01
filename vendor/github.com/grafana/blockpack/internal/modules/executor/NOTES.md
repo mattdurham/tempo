@@ -1842,3 +1842,48 @@ defence-in-depth should a future format version again omit intrinsic columns fro
 `internal/modules/executor/column_provider.go:nilIntrinsicScan`,
 `internal/modules/executor/predicates.go:userAttrProgram`,
 `internal/modules/blockio/writer/NOTES.md:NOTE-002`
+
+---
+
+## NOTE-053: Replace CollectStats/OnStats Callback with QueryStats Return Value
+*Added: 2026-03-30*
+
+**Decision:** Remove the `OnStats func(CollectStats)` callback from `CollectOptions` and
+the `CollectStats` struct entirely. Replace them with a `QueryStats` second return value
+from `Collect` and `CollectLogs`. Public API type aliases `QueryStats` and `StepStats`
+are exported from `api.go`.
+
+**Rationale:** The callback pattern created ergonomic friction — callers had to declare
+a `var statsOut CollectStats` before the call and pass a closure. It was also easy to miss
+the callback entirely (no compiler enforcement). Returning stats as a value follows the
+standard Go convention for enriched return types (`net/http` `Response`, `sql` `Result`)
+and makes the stats impossible to miss in call sites.
+
+**Design — QueryStats:**
+- `ExecutionPath string` — one of the 8 path constants (unchanged from CollectStats).
+- `TotalDuration time.Duration` — wall-clock duration for the full call.
+- `Steps []StepStats` — one entry per phase that ran. Steps are absent if the phase did
+  not execute (e.g., no `"plan"` step on intrinsic fast paths).
+
+**Design — StepStats:**
+- `Name string` — phase name: `"plan"`, `"intrinsic"`, `"mixed-prefilter"`, `"block-scan"`.
+- `Duration time.Duration` — wall-clock for this phase.
+- `BytesRead int64` — raw bytes read from storage during this phase.
+- `IOOps int` — number of ReadGroup calls (coalesced I/O operations).
+- `Metadata map[string]any` — phase-specific numeric fields (total_blocks, fetched_blocks,
+  ref_count, scan_count, candidate_blocks, explain, etc.). Nil map is safe to read.
+
+**slog.Warn on errNeedBlockScan fallback:** When the intrinsic fast path falls through to
+the full block scan, `slog.Warn("intrinsic fast path fell through to full block scan", ...)`
+is emitted. This replaces the previously silent fallback and helps operators diagnose
+unexpected path switches in production.
+
+**Consequence:** All callers of `Collect` and `CollectLogs` must update to the 3-value
+return. Callers that do not need stats use `_` for the second return. The `LogQueryStats`
+type (formerly in `api.go`) is removed; `QueryStats` covers both trace and log queries.
+
+Back-ref: `internal/modules/executor/query_stats.go:QueryStats`,
+          `internal/modules/executor/query_stats.go:StepStats`,
+          `internal/modules/executor/stream.go:Collect`,
+          `internal/modules/executor/stream_log_topk.go:CollectLogs`,
+          `api.go:QueryStats`, `api.go:StepStats`

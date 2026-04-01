@@ -2,123 +2,15 @@ package shared
 
 // NOTE: Any changes to this file must be reflected in the corresponding specs.md or NOTES.md.
 
-// This file provides page-filtered decode functions for intrinsic columns and ref-index
-// lookup functions (EnsureRefIndex, LookupRefFast, LookupRef) used by lookupIntrinsicFields.
+// This file provides O(log N) reverse-lookup helpers for IntrinsicColumn.
+// EnsureRefIndex builds a sorted index by packed ref once (sync.Once).
+// LookupRefFast performs binary search into that index.
+// LookupRef is the O(N) linear-scan fallback (for small/filtered result sets).
 
 import (
 	"cmp"
-	"encoding/binary"
-	"fmt"
 	"slices"
-
-	"github.com/golang/snappy"
 )
-
-// DecodePagedColumnBlobFiltered decodes a v2 paged column blob.
-//
-// refFilter maps packed ref keys (blockIdx<<16|rowIdx) to an empty struct.
-// Pass nil to decode all pages (equivalent to decodePagedColumnBlob / full decode).
-//
-// NOTE: The ref-range page-skipping optimization (MinRef/MaxRef/RefBloom) was removed in
-// NOTE-007. All pages are decoded; the refFilter is retained for caller API compatibility.
-// Callers must still check ref membership when consuming results.
-//
-// Returns an error for malformed blobs; the first byte must be IntrinsicPagedVersion (0x02).
-//
-// NOTE: Results are NOT cached — this is a query-scoped decode. Use GetIntrinsicColumn
-// for the cached full-column path.
-func DecodePagedColumnBlobFiltered(blob []byte, refFilter map[uint32]struct{}) (*IntrinsicColumn, error) {
-	if len(blob) == 0 {
-		return nil, fmt.Errorf("DecodePagedColumnBlobFiltered: empty blob")
-	}
-	if blob[0] != IntrinsicPagedVersion {
-		return nil, fmt.Errorf("DecodePagedColumnBlobFiltered: expected paged sentinel 0x%02x, got 0x%02x", IntrinsicPagedVersion, blob[0])
-	}
-	if len(blob) < 5 {
-		return nil, fmt.Errorf("DecodePagedColumnBlobFiltered: too short")
-	}
-
-	tocLen := int(binary.LittleEndian.Uint32(blob[1:]))
-	tocStart := 5
-	if tocStart+tocLen > len(blob) {
-		return nil, fmt.Errorf("DecodePagedColumnBlobFiltered: truncated at toc_blob")
-	}
-	toc, err := DecodePageTOC(blob[tocStart : tocStart+tocLen])
-	if err != nil {
-		return nil, fmt.Errorf("DecodePagedColumnBlobFiltered: %w", err)
-	}
-	pageDataStart := tocStart + tocLen
-
-	blockW := int(toc.BlockIdxWidth)
-	rowW := int(toc.RowIdxWidth)
-
-	// Allocate merge output.
-	merged := &IntrinsicColumn{Type: toc.ColType, Format: toc.Format}
-	if toc.Format == IntrinsicFormatFlat {
-		merged.Uint64Values = make([]uint64, 0)
-		merged.BytesValues = make([][]byte, 0)
-		merged.BlockRefs = make([]BlockRef, 0)
-	}
-
-	var dictIdx map[string]int
-
-	for i, pm := range toc.Pages {
-		pageStart := pageDataStart + int(pm.Offset)
-		pageEnd := pageStart + int(pm.Length)
-		if pageEnd > len(blob) {
-			return nil, fmt.Errorf("DecodePagedColumnBlobFiltered: page %d out of bounds (offset=%d len=%d blobLen=%d)",
-				i, pm.Offset, pm.Length, len(blob))
-		}
-		pageCompressed := blob[pageStart:pageEnd]
-		pageRaw, decErr := snappy.Decode(nil, pageCompressed)
-		if decErr != nil {
-			return nil, fmt.Errorf("DecodePagedColumnBlobFiltered: page %d snappy: %w", i, decErr)
-		}
-
-		var page *IntrinsicColumn
-		if toc.Format == IntrinsicFormatFlat {
-			page, err = DecodeFlatPage(pageRaw, blockW, rowW, int(pm.RowCount), toc.ColType)
-		} else {
-			page, err = DecodeDictPage(pageRaw, blockW, rowW, toc.ColType)
-		}
-		if err != nil {
-			return nil, fmt.Errorf("DecodePagedColumnBlobFiltered: page %d: %w", i, err)
-		}
-
-		// Flat merge: append into result slices.
-		merged.Uint64Values = append(merged.Uint64Values, page.Uint64Values...)
-		merged.BytesValues = append(merged.BytesValues, page.BytesValues...)
-		merged.BlockRefs = append(merged.BlockRefs, page.BlockRefs...)
-		merged.Count += page.Count
-
-		// Dict merge: deduplicate values across pages.
-		if len(page.DictEntries) > 0 {
-			if dictIdx == nil {
-				dictIdx = make(map[string]int, len(page.DictEntries))
-			}
-			for _, e := range page.DictEntries {
-				key := e.Value
-				if key == "" {
-					key = "\x00" + string(binary.LittleEndian.AppendUint64(nil, uint64(e.Int64Val))) //nolint:gosec
-				}
-				if j, ok := dictIdx[key]; ok {
-					merged.DictEntries[j].BlockRefs = append(merged.DictEntries[j].BlockRefs, e.BlockRefs...)
-				} else {
-					dictIdx[key] = len(merged.DictEntries)
-					merged.DictEntries = append(merged.DictEntries, e)
-				}
-			}
-		}
-	}
-
-	// refFilter is accepted for API compatibility: callers (e.g. GetIntrinsicColumnForRefs
-	// in intrinsic_reader.go) build and pass a non-nil map, but the page-skipping
-	// optimization that consumed it was removed in NOTE-007. All pages are decoded and
-	// the parameter is intentionally unused here. Callers must filter on the returned
-	// column's BlockRefs when they need a subset of rows.
-	_ = refFilter
-	return merged, nil
-}
 
 // EnsureRefIndex builds a sorted-by-packed-ref lookup index into this column, enabling
 // O(log N) reverse lookup via LookupRefFast. Safe to call concurrently — the index is
@@ -137,7 +29,7 @@ func (col *IntrinsicColumn) EnsureRefIndex() {
 			for i, ref := range col.BlockRefs {
 				idx[i] = RefIndexEntry{
 					Packed: uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx), //nolint:gosec
-					Pos:    int32(i),                                       //nolint:gosec
+					Pos:    int32(i),                                      //nolint:gosec
 				}
 			}
 			slices.SortFunc(idx, func(a, b RefIndexEntry) int { return cmp.Compare(a.Packed, b.Packed) })

@@ -37,15 +37,14 @@ func parseBlockHeader(data []byte) (blockHeader, error) {
 		version:     data[4],
 		spanCount:   binary.LittleEndian.Uint32(data[8:]),
 		columnCount: binary.LittleEndian.Uint32(data[12:]),
-		// bytes 16-23: reserved2 (formerly trace_count + trace_table_len, always zero in v11+)
+		// bytes 16-23: reserved2 (formerly trace_count + trace_table_len, always zero)
 	}
 
 	if hdr.magic != shared.MagicNumber {
 		return blockHeader{}, fmt.Errorf("block header: bad magic 0x%08X", hdr.magic)
 	}
 
-	if hdr.version != shared.VersionV10 && hdr.version != shared.VersionV11 &&
-		hdr.version != shared.VersionBlockV12 {
+	if hdr.version != shared.VersionBlockV12 {
 		return blockHeader{}, fmt.Errorf("block header: unsupported version %d", hdr.version)
 	}
 
@@ -54,8 +53,7 @@ func parseBlockHeader(data []byte) (blockHeader, error) {
 
 // parseColumnMetadataArray parses colCount column metadata entries starting at offset.
 // Returns entries and the new offset after the last entry.
-// blockVersion controls the wire layout: VersionBlockV12+ omits stats_offset/stats_len.
-func parseColumnMetadataArray(data []byte, offset int, colCount int, blockVersion uint8) ([]colMetaEntry, int, error) {
+func parseColumnMetadataArray(data []byte, offset int, colCount int) ([]colMetaEntry, int, error) {
 	entries := make([]colMetaEntry, 0, colCount)
 	pos := offset
 
@@ -79,12 +77,7 @@ func parseColumnMetadataArray(data []byte, offset int, colCount int, blockVersio
 		pos += nameLen
 
 		// col_type[1] + data_offset[8] + data_len[8]
-		// VersionBlockV12+: stats_offset[8] + stats_len[8] are omitted
-		// Earlier: stats_offset[8] + stats_len[8] are present (always 0)
-		need := 17 // col_type[1] + data_offset[8] + data_len[8]
-		if blockVersion < shared.VersionBlockV12 {
-			need += 16 // stats_offset[8] + stats_len[8]
-		}
+		const need = 17
 		if pos+need > len(data) {
 			return nil, pos, fmt.Errorf("col_meta[%d]: short for type+offsets", i)
 		}
@@ -96,10 +89,6 @@ func parseColumnMetadataArray(data []byte, offset int, colCount int, blockVersio
 		pos += 8
 		dataLen := binary.LittleEndian.Uint64(data[pos:])
 		pos += 8
-
-		if blockVersion < shared.VersionBlockV12 {
-			pos += 16 // skip stats_offset[8] + stats_len[8] — always 0
-		}
 
 		entries = append(entries, colMetaEntry{
 			name:       name,
@@ -139,7 +128,7 @@ func parseBlockColumnsReuse(
 	spanCount := int(hdr.spanCount)
 	colCount := int(hdr.columnCount)
 
-	metas, _, err := parseColumnMetadataArray(rawBytes, 24, colCount, hdr.version)
+	metas, _, err := parseColumnMetadataArray(rawBytes, 24, colCount)
 	if err != nil {
 		return nil, fmt.Errorf("parseBlock: column metadata: %w", err)
 	}

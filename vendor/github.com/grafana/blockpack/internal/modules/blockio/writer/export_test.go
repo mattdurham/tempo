@@ -10,9 +10,8 @@ func NewDictAccumForTest(colType shared.ColumnType) *dictAccum {
 	}
 }
 
-// EncodeDictColumnForTest exposes encodePagedDictColumn for white-box testing.
-// (encodeDictColumn v1 monolithic format was removed; encodePagedDictColumn is always used.)
-var EncodeDictColumnForTest = encodePagedDictColumn
+// EncodeDictColumnForTest exposes encodeDictColumn for white-box testing.
+var EncodeDictColumnForTest = encodeDictColumn
 
 // NewIntrinsicAccumulatorForTest creates an empty intrinsicAccumulator for testing.
 func NewIntrinsicAccumulatorForTest() *intrinsicAccumulator {

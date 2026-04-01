@@ -1120,7 +1120,12 @@ func compilePipelineSkipping(stages []PipelineStage, skip map[int]struct{}) (*Pi
 	if len(funcs) == 0 {
 		return nil, nil
 	}
-	return &Pipeline{Stages: funcs, parserFreeStages: parserFree, HasLineFormat: hasLineFormat, HasParserStage: hasParserStage}, nil
+	return &Pipeline{
+		Stages:           funcs,
+		parserFreeStages: parserFree,
+		HasLineFormat:    hasLineFormat,
+		HasParserStage:   hasParserStage,
+	}, nil
 }
 
 // parseLabelFormatParams converts "dst=src" param strings into a mappings map.

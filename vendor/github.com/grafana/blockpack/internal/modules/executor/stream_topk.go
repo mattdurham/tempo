@@ -145,7 +145,8 @@ func topKScanRowsFromIntrinsic(
 }
 
 // topKScanBlocks iterates selected blocks, fetches them lazily, and fills buf.
-// Returns the number of individual block fetches performed.
+// Returns (fetchedGroups, fetchedBlocks, bytesRead, error): fetchedGroups counts ReadGroup
+// calls (IOOps); fetchedBlocks counts individual blocks fetched.
 func topKScanBlocks(
 	r *modules_reader.Reader,
 	program *vm.Program,
@@ -156,11 +157,13 @@ func topKScanBlocks(
 	groups []shared.CoalescedRead,
 	blockToGroup map[int]int,
 	backward bool,
-) (int, error) {
+) (int, int, int64, error) {
 	fetched := make(map[int][]byte)
 	fetchedGroupsSeen := make(map[int]struct{})
 	skippedBlocks := make(map[int]struct{})
+	fetchedGroups := 0
 	fetchCount := 0
+	var bytesRead int64
 
 	for _, blockIdx := range plan.SelectedBlocks {
 		meta := r.BlockMeta(blockIdx)
@@ -181,14 +184,17 @@ func topKScanBlocks(
 		if _, seen := fetchedGroupsSeen[gi]; !seen {
 			groupRaw, fetchErr := r.ReadGroup(groups[gi])
 			if fetchErr != nil {
-				return fetchCount, fmt.Errorf("ReadGroup: %w", fetchErr)
+				return fetchedGroups, fetchCount, bytesRead, fmt.Errorf("ReadGroup: %w", fetchErr)
 			}
 			maps.Copy(fetched, groupRaw)
+			// Count bytes for entire fetched group — ReadGroup reads all blocks in the group.
 			for _, bi := range groups[gi].BlockIDs {
 				if _, skip := skippedBlocks[bi]; skip {
 					delete(fetched, bi)
 				}
+				bytesRead += int64(r.BlockMeta(bi).Length) //nolint:gosec // Length is block size, safe to cast
 			}
+			fetchedGroups++
 			fetchCount += len(groups[gi].BlockIDs)
 			fetchedGroupsSeen[gi] = struct{}{}
 		}
@@ -202,13 +208,17 @@ func topKScanBlocks(
 		r.ResetInternStrings()
 		bwb, parseErr := r.ParseBlockFromBytes(raw, wantColumns, meta)
 		if parseErr != nil {
-			return fetchCount, fmt.Errorf("ParseBlockFromBytes block %d: %w", blockIdx, parseErr)
+			return fetchedGroups, fetchCount, bytesRead, fmt.Errorf(
+				"ParseBlockFromBytes block %d: %w",
+				blockIdx,
+				parseErr,
+			)
 		}
 
 		provider := newBlockColumnProvider(bwb.Block)
 		rowSet, evalErr := program.ColumnPredicate(provider)
 		if evalErr != nil {
-			return fetchCount, fmt.Errorf("ColumnPredicate block %d: %w", blockIdx, evalErr)
+			return fetchedGroups, fetchCount, bytesRead, fmt.Errorf("ColumnPredicate block %d: %w", blockIdx, evalErr)
 		}
 
 		if rowSet.Size() == 0 {
@@ -220,7 +230,11 @@ func topKScanBlocks(
 		if wantColumns != nil {
 			bwb, parseErr = r.ParseBlockFromBytes(bwb.RawBytes, nil, meta)
 			if parseErr != nil {
-				return fetchCount, fmt.Errorf("ParseBlockFromBytes (full) block %d: %w", blockIdx, parseErr)
+				return fetchedGroups, fetchCount, bytesRead, fmt.Errorf(
+					"ParseBlockFromBytes (full) block %d: %w",
+					blockIdx,
+					parseErr,
+				)
 			}
 		}
 
@@ -233,7 +247,7 @@ func topKScanBlocks(
 			topKScanRows(buf, opts.Limit, backward, bwb.Block, blockIdx, tsCol, opts.TimeRange, rowSet.ToSlice())
 		}
 	}
-	return fetchCount, nil
+	return fetchedGroups, fetchCount, bytesRead, nil
 }
 
 // topKDeliver sorts the heap contents and returns them in direction order.

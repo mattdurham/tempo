@@ -1,9 +1,122 @@
 package blockpack
 
-// spanmatch.go — typed accessors on SpanMatch, trace-level metadata helpers,
-// and column naming utilities. These are the primary integration surface for
-// callers that want to extract span fields without knowing column name strings
-// or performing type assertions on GetField results.
+// spanmatch.go — SpanMatch type, Clone, materialized/filtered field providers,
+// typed accessors, trace-level metadata helpers, and column naming utilities.
+
+import "sync"
+
+// SpanMatch represents a single span that matched the query.
+// Fields is safe to retain after QueryTraceQL or QueryLogQL returns.
+type SpanMatch struct {
+	Fields  SpanFieldsProvider
+	TraceID string
+	SpanID  string
+}
+
+// kvField is a name-value pair used in materializedSpanFields.
+// NOTE-ALLOC-2: slice-backed materialization avoids map allocation in Clone.
+type kvField struct {
+	Value any
+	Name  string
+}
+
+// kvFieldSlicePool recycles []kvField backing arrays to reduce Clone allocations.
+// NOTE-ALLOC-2: pool holds *[]kvField so Reset clears slice length without losing capacity.
+var kvFieldSlicePool = sync.Pool{
+	New: func() any {
+		s := make([]kvField, 0, 32)
+		return &s
+	},
+}
+
+// Clone materializes all fields from the lazy provider and returns a deep copy
+// with stable ownership, safe to hold beyond any internal callback or function return.
+// If Fields is nil (e.g. structural queries), the clone has nil Fields.
+// NOTE-ALLOC-2: uses pooled []kvField backing slice instead of map[string]any.
+func (m *SpanMatch) Clone() SpanMatch {
+	out := SpanMatch{TraceID: m.TraceID, SpanID: m.SpanID}
+	if m.Fields == nil {
+		return out
+	}
+	// Get pooled backing slice, fill it, then transfer ownership to materializedSpanFields.
+	sp := kvFieldSlicePool.Get().(*[]kvField)
+	fields := (*sp)[:0]
+	m.Fields.IterateFields(func(name string, value any) bool {
+		fields = append(fields, kvField{Name: name, Value: value})
+		return true
+	})
+	// Copy into an exactly-sized owned slice for materializedSpanFields,
+	// then return the original pool slice (reset to len=0) for reuse.
+	// This ensures the pool backing array is actually reused across calls.
+	owned := make([]kvField, len(fields))
+	copy(owned, fields)
+	out.Fields = &materializedSpanFields{fields: owned}
+	*sp = fields[:0]
+	kvFieldSlicePool.Put(sp)
+	return out
+}
+
+// materializedSpanFields is a heap-allocated slice-backed SpanFieldsProvider
+// returned by SpanMatch.Clone(). Safe to hold beyond the callback lifetime.
+// NOTE-ALLOC-2: uses []kvField instead of map[string]any to avoid map overhead.
+type materializedSpanFields struct {
+	fields []kvField
+}
+
+// GetField is an O(n) linear scan. For typical span field counts (10–30),
+// this is faster than a map lookup due to cache locality.
+// See executor/NOTES.md NOTE-047 for the trade-off rationale.
+func (m *materializedSpanFields) GetField(name string) (any, bool) {
+	for i := range m.fields {
+		if m.fields[i].Name == name {
+			return m.fields[i].Value, true
+		}
+	}
+	return nil, false
+}
+
+func (m *materializedSpanFields) IterateFields(fn func(name string, value any) bool) {
+	for i := range m.fields {
+		if !fn(m.fields[i].Name, m.fields[i].Value) {
+			return
+		}
+	}
+}
+
+// filteredSpanFields wraps a SpanFieldsProvider and limits GetField / IterateFields
+// to a caller-specified column allowlist. Used to implement QueryOptions.SelectColumns.
+type filteredSpanFields struct {
+	inner   SpanFieldsProvider
+	allowed map[string]struct{}
+}
+
+func newFilteredSpanFields(inner SpanFieldsProvider, cols []string) *filteredSpanFields {
+	m := make(map[string]struct{}, len(cols))
+	for _, c := range cols {
+		m[c] = struct{}{}
+	}
+	return &filteredSpanFields{inner: inner, allowed: m}
+}
+
+func (f *filteredSpanFields) GetField(name string) (any, bool) {
+	if _, ok := f.allowed[name]; !ok {
+		return nil, false
+	}
+	return f.inner.GetField(name)
+}
+
+func (f *filteredSpanFields) IterateFields(fn func(name string, value any) bool) {
+	f.inner.IterateFields(func(name string, value any) bool {
+		if _, ok := f.allowed[name]; !ok {
+			return true // skip, but keep iterating
+		}
+		return fn(name, value)
+	})
+}
+
+// spanMatchFn is the internal callback type used by streaming query helpers.
+// match is valid only for the duration of the call; more=false signals end of results.
+type spanMatchFn func(match *SpanMatch, more bool) bool
 
 // =============================================================================
 // SpanMatch typed field accessors

@@ -63,7 +63,11 @@ type Executor struct{}
 func New() *Executor { return &Executor{} }
 
 // Collect delegates to the package-level Collect function.
-func (e *Executor) Collect(r *modules_reader.Reader, prog *vm.Program, opts CollectOptions) ([]MatchedRow, error) {
+func (e *Executor) Collect(
+	r *modules_reader.Reader,
+	prog *vm.Program,
+	opts CollectOptions,
+) ([]MatchedRow, QueryStats, error) {
 	return Collect(r, prog, opts)
 }
 

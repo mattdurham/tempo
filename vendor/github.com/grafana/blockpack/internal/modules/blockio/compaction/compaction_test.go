@@ -228,17 +228,12 @@ func TestCompactBlocks_NativeColumns(t *testing.T) {
 		for rowIdx := range block.SpanCount() {
 			gs := gotSpan{}
 
-			// NOTE-005: trace:id and span:id are no longer in the intrinsic section.
-			// Read them from block column payloads (dual-storage, always present).
-			if col := block.GetColumn("trace:id"); col != nil {
-				if v, ok := col.BytesValue(rowIdx); ok {
-					copy(gs.traceID[:], v)
-				}
+			// Intrinsic columns are now in the intrinsic section, not block columns.
+			if v, ok := r.IntrinsicBytesAt("trace:id", blockIdx, rowIdx); ok {
+				copy(gs.traceID[:], v)
 			}
-			if col := block.GetColumn("span:id"); col != nil {
-				if v, ok := col.BytesValue(rowIdx); ok {
-					copy(gs.spanID[:], v)
-				}
+			if v, ok := r.IntrinsicBytesAt("span:id", blockIdx, rowIdx); ok {
+				copy(gs.spanID[:], v)
 			}
 			if v, ok := r.IntrinsicDictStringAt("span:name", blockIdx, rowIdx); ok {
 				gs.name = v

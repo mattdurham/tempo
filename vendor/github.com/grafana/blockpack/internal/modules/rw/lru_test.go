@@ -121,7 +121,22 @@ func TestSharedLRUCache_PriorityTierOrder(t *testing.T) {
 	extra := make([]byte, sz)
 	c.Put("f", 40, extra, rw.DataTypeBlock)
 
-	dstF2, dstBl, dstTS, dstBk, dstEx := make([]byte, sz), make([]byte, sz), make([]byte, sz), make([]byte, sz), make([]byte, sz)
+	dstF2, dstBl, dstTS, dstBk, dstEx := make(
+		[]byte,
+		sz,
+	), make(
+		[]byte,
+		sz,
+	), make(
+		[]byte,
+		sz,
+	), make(
+		[]byte,
+		sz,
+	), make(
+		[]byte,
+		sz,
+	)
 	footerOK := c.Get("f", 0, dstF2)
 	bloomOK := c.Get("f", 10, dstBl)
 	tsOK := c.Get("f", 20, dstTS)

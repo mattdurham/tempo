@@ -257,7 +257,13 @@ func dedupeKey(block *modules_reader.Block, rowIdx int, idIndex map[uint16]block
 // addSpanFromBlock adds one row from block at rowIdx to the current writer via the
 // native columnar path, deduplicating by (trace:id, span:id) and respecting the
 // output file size limit. idIndex is the pre-built per-block dedup index (may be nil).
-func (s *compactionState) addSpanFromBlock(r *modules_reader.Reader, blockIdx int, block *modules_reader.Block, rowIdx int, idIndex map[uint16]blockIDPair) error {
+func (s *compactionState) addSpanFromBlock(
+	r *modules_reader.Reader,
+	blockIdx int,
+	block *modules_reader.Block,
+	rowIdx int,
+	idIndex map[uint16]blockIDPair,
+) error {
 	if err := s.ensureWriter(); err != nil {
 		return fmt.Errorf("ensure writer: %w", err)
 	}

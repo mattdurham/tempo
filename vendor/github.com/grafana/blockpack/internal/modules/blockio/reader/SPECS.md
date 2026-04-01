@@ -54,7 +54,8 @@ Back-ref: `internal/modules/blockio/reader/block_parser.go:parseBlockColumnsReus
 *Added: 2026-03-23*
 
 The reader package maintains four process-level caches for file-level immutable
-parsed objects. All four use `objectcache.Cache[T]` (GC-cooperative weak pointers):
+parsed objects. All four use `objectcache.Cache[T]` (bounded LRU, strong `*T` references,
+default budget 20% of GOMEMLIMIT):
 
 | Cache variable            | Key format                       | Value type                |
 |---------------------------|----------------------------------|---------------------------|
@@ -67,8 +68,9 @@ parsed objects. All four use `objectcache.Cache[T]` (GC-cooperative weak pointer
 - Cache operations are only performed when `r.fileID != ""` (prevents cross-file
   collisions when no FileID is set).
 - `ClearCaches()` calls `.Clear()` on all four instances.
-- The GC may reclaim any cached value when no `*Reader` holds a strong reference;
-  the next `NewReaderFromProvider` call will re-populate from bbolt cache.
+- Entries are evicted only by LRU pressure or `ClearCaches()`. The GC does not
+  reclaim cached values; this is intentional to avoid the 50x re-parse regression
+  from the previous weak-pointer design (see NOTE-003 addendum 2026-03-29, NOTE-OC-001).
 - `metadataBytes` safety: `*Reader` copies the slice pointer from `parsedMetadata`
   at construction, establishing `Reader → metadataBytes` strong ref independently
   of the cache entry. Range index sub-slices remain valid for the reader's lifetime.
@@ -193,3 +195,40 @@ Back-ref: `internal/modules/blockio/reader/columnar_read.go:ReadGroupColumnar`,
 `internal/modules/blockio/reader/block_parser.go:parseBlockColumnsReuse`,
 `internal/modules/blockio/reader/reader.go:ReadGroup`,
 `internal/modules/blockio/reader/coalesce.go:CoalesceBlocks`
+
+---
+
+## SPEC-006: FileLayout() — Byte Invariant and Section Model
+*Added: 2026-03-31*
+
+`FileLayout()` returns a `FileLayoutReport` where:
+
+1. **Physical byte invariant:** `sum(s.CompressedSize for s in Sections where !s.IsLogical) == FileSize`.
+   Every byte on disk is represented by exactly one physical section.
+
+2. **Logical sections:** Sections with `IsLogical: true` describe internal structure within
+   an already-counted physical section (e.g. sub-components of `metadata.compressed`). They
+   MUST NOT be counted toward the file size.
+
+3. **V12 metadata model:** A single physical `metadata.compressed` section accounts for
+   `r.metadataLen` bytes. Per-component breakdown (range index columns, sketch, file bloom)
+   uses `IsLogical: true` sections with offsets relative to the decompressed metadata buffer.
+
+4. **Intrinsic paged columns:** When a column uses the v2 paged format, emit one physical
+   section per page (`intrinsic.column[name].page[N]`) plus a `intrinsic.column[name].page_toc`
+   section for the TOC header bytes. Pages are physical file bytes; the invariant is preserved
+   because pages plus toc replace (not supplement) the aggregate column section.
+
+5. **Sketch section:** `SketchIndexInfo.TotalBytes` is the actual uncompressed sketch
+   section size. `ColumnSketchStat.CMSBytes` and `TopKBytes` are actual per-block byte sizes.
+
+6. **Range index:** Every numeric `RangeIndexBucket` (Int64, Uint64, Float64, Duration)
+   has `End` populated (upper boundary). String/bytes buckets have empty `End` because
+   upper bounds are not encoded in the wire format (empty for string/bytes columns).
+   Every `RangeIndexColumn` has `BucketMin` and `BucketMax` from the wire-format global
+   bounds for numeric types; string/bytes columns have empty `BucketMin`/`BucketMax`.
+
+7. **FileBloom:** `FileLayoutReport.FileBloom` is nil for files without an FBLM section.
+   When non-nil, `TotalBytes` is the raw byte size of the FBLM section.
+
+Back-ref: `internal/modules/blockio/reader/layout.go:FileLayout`

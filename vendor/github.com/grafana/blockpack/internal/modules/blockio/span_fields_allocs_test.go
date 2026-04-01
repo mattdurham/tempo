@@ -52,9 +52,15 @@ func buildAllocTestBlock(t *testing.T) *modules_reader.Block {
 			StartTimeUnixNano: uint64(1_000_000_000 + i*1000), //nolint:gosec
 			EndTimeUnixNano:   uint64(1_000_002_000 + i*1000), //nolint:gosec
 			Attributes: []*commonv1.KeyValue{
-				{Key: "http.method", Value: &commonv1.AnyValue{Value: &commonv1.AnyValue_StringValue{StringValue: "GET"}}},
+				{
+					Key:   "http.method",
+					Value: &commonv1.AnyValue{Value: &commonv1.AnyValue_StringValue{StringValue: "GET"}},
+				},
 				{Key: "http.status_code", Value: &commonv1.AnyValue{Value: &commonv1.AnyValue_IntValue{IntValue: 200}}},
-				{Key: "span.kind", Value: &commonv1.AnyValue{Value: &commonv1.AnyValue_StringValue{StringValue: "server"}}},
+				{
+					Key:   "span.kind",
+					Value: &commonv1.AnyValue{Value: &commonv1.AnyValue_StringValue{StringValue: "server"}},
+				},
 			},
 		}
 		err = w.AddSpan(

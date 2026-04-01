@@ -7,7 +7,6 @@ import (
 	"io"
 	"testing"
 
-	"github.com/golang/snappy"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	commonv1 "go.opentelemetry.io/proto/otlp/common/v1"
@@ -802,7 +801,7 @@ func TestRoundTrip_IntrinsicFields(t *testing.T) {
 	r := openReader(t, buf.Bytes())
 	require.Equal(t, 1, r.BlockCount())
 
-	// Non-identity intrinsic columns are still stored in the intrinsic section.
+	// All intrinsic columns are now stored in the intrinsic section only.
 	require.True(t, r.HasIntrinsicSection(), "intrinsic section must be present")
 
 	// span:name (dict string)
@@ -835,46 +834,24 @@ func TestRoundTrip_IntrinsicFields(t *testing.T) {
 	assert.True(t, ok, "span:status must be present in intrinsic section")
 	assert.Equal(t, int64(tracev1.Status_STATUS_CODE_OK), sc)
 
-	// NOTE-005: trace:id, span:id, span:parent_id, span:status_message are no longer
-	// stored in the intrinsic section. Read them from block column payloads instead.
-	bwb, err := r.GetBlockWithBytes(0, nil, nil)
-	require.NoError(t, err)
-	b := bwb.Block
-
-	// span:status_message — now block-column only
-	_, okIntr := r.IntrinsicDictStringAt("span:status_message", 0, 0)
-	assert.False(t, okIntr, "span:status_message must NOT be in intrinsic section (NOTE-005)")
-	smCol := b.GetColumn("span:status_message")
-	require.NotNil(t, smCol, "span:status_message must be present as a block column")
-	sm, okSM := smCol.StringValue(0)
-	assert.True(t, okSM)
+	// span:status_message (dict string)
+	sm, ok := r.IntrinsicDictStringAt("span:status_message", 0, 0)
+	assert.True(t, ok, "span:status_message must be present in intrinsic section")
 	assert.Equal(t, "all good", sm)
 
-	// trace:id — now block-column only
-	_, okTID := r.IntrinsicBytesAt("trace:id", 0, 0)
-	assert.False(t, okTID, "trace:id must NOT be in intrinsic section (NOTE-005)")
-	tidCol := b.GetColumn("trace:id")
-	require.NotNil(t, tidCol, "trace:id must be present as a block column")
-	tidVal, okTV := tidCol.BytesValue(0)
-	assert.True(t, okTV)
+	// trace:id (flat bytes)
+	tidVal, ok := r.IntrinsicBytesAt("trace:id", 0, 0)
+	assert.True(t, ok, "trace:id must be present in intrinsic section")
 	assert.Equal(t, traceID[:], tidVal)
 
-	// span:id — now block-column only
-	_, okSID := r.IntrinsicBytesAt("span:id", 0, 0)
-	assert.False(t, okSID, "span:id must NOT be in intrinsic section (NOTE-005)")
-	sidCol := b.GetColumn("span:id")
-	require.NotNil(t, sidCol, "span:id must be present as a block column")
-	sidVal, okSV := sidCol.BytesValue(0)
-	assert.True(t, okSV)
+	// span:id (flat bytes)
+	sidVal, ok := r.IntrinsicBytesAt("span:id", 0, 0)
+	assert.True(t, ok, "span:id must be present in intrinsic section")
 	assert.Equal(t, spanID, sidVal)
 
-	// span:parent_id — now block-column only
-	_, okPID := r.IntrinsicBytesAt("span:parent_id", 0, 0)
-	assert.False(t, okPID, "span:parent_id must NOT be in intrinsic section (NOTE-005)")
-	pidCol := b.GetColumn("span:parent_id")
-	require.NotNil(t, pidCol, "span:parent_id must be present as a block column")
-	pidVal, okPV := pidCol.BytesValue(0)
-	assert.True(t, okPV)
+	// span:parent_id (flat bytes)
+	pidVal, ok := r.IntrinsicBytesAt("span:parent_id", 0, 0)
+	assert.True(t, ok, "span:parent_id must be present in intrinsic section")
 	assert.Equal(t, parentID, pidVal)
 }
 
@@ -1218,9 +1195,9 @@ func TestBlocksForRangeInterval_StringColumn(t *testing.T) {
 
 // ---- Lean reader (NewLeanReaderFromProvider) tests ----
 
-// TestLeanReader_TwoIO verifies that NewLeanReaderFromProvider opens a file with
-// exactly 2 I/O operations: footer read + compact index read.
-func TestLeanReader_TwoIO(t *testing.T) {
+// TestLeanReader_ThreeIO verifies that NewLeanReaderFromProvider opens a file with
+// exactly 3 I/O operations: footer read + header validation + compact index read.
+func TestLeanReader_ThreeIO(t *testing.T) {
 	var buf bytes.Buffer
 	w := mustNewWriter(t, &buf, 0)
 
@@ -1246,8 +1223,8 @@ func TestLeanReader_TwoIO(t *testing.T) {
 	require.NoError(t, err)
 
 	// Writer always produces V4 footers, so footer read succeeds in 1 I/O.
-	// Plus 1 I/O for compact index = 2 total.
-	assert.Equal(t, int64(2), tracker.IOOps(), "NewLeanReaderFromProvider: v4 footer + compact = 2 I/Os")
+	// Plus 1 I/O for header validation + 1 I/O for compact index = 3 total.
+	assert.Equal(t, int64(3), tracker.IOOps(), "NewLeanReaderFromProvider: v4 footer + header + compact = 3 I/Os")
 
 	// TraceEntries must work via compact index.
 	entries := r.TraceEntries(traceID)
@@ -1399,165 +1376,6 @@ func TestRoundTrip_MetadataCompression(t *testing.T) {
 	assert.Greater(t, meta0.MaxStart, meta0.MinStart, "MaxStart must exceed MinStart")
 }
 
-// ---- RT-BC-01: V11 files still open correctly after reader update ----
-
-// expandV13BlockIndexToV11 rewrites the block index section of V13 metadata bytes
-// into V11 format by inserting 32 zero bytes (MinTraceID[16]+MaxTraceID[16]) after
-// each block entry. This is needed when constructing a synthetic V11 file from a
-// V13-format file for backward compat testing.
-func expandV13BlockIndexToV11(t *testing.T, meta []byte) []byte {
-	t.Helper()
-	require.GreaterOrEqual(t, len(meta), 4, "metadata too short for block_count")
-
-	blockCount := int(binary.LittleEndian.Uint32(meta[0:]))
-
-	// V13 entry size: offset[8] + length[8] + kind[1] + span_count[4] + min_start[8] + max_start[8] = 37 bytes
-	const v13EntrySize = 37
-	// We'll add 32 bytes (MinTraceID[16]+MaxTraceID[16]) to each entry.
-	const traceIDPadding = 32
-
-	newBlockIndexSize := 4 + blockCount*(v13EntrySize+traceIDPadding)
-	newMeta := make([]byte, 0, len(meta)+blockCount*traceIDPadding)
-	newMeta = append(newMeta, meta[0:4]...) // block_count[4]
-
-	pos := 4
-	for range blockCount {
-		require.GreaterOrEqual(t, len(meta), pos+v13EntrySize, "metadata too short for block entry")
-		newMeta = append(newMeta, meta[pos:pos+v13EntrySize]...)
-		newMeta = append(newMeta, make([]byte, traceIDPadding)...) // zero-filled trace IDs
-		pos += v13EntrySize
-	}
-	_ = newBlockIndexSize // used implicitly via append capacity
-
-	// Append the rest of the metadata (range index, column index, trace index, etc.)
-	newMeta = append(newMeta, meta[pos:]...)
-	return newMeta
-}
-
-// makeV11FileFromV12 converts a V12/V13 (snappy-compressed metadata) file into a V11
-// (uncompressed metadata) file by:
-//  1. Parsing the file footer and header to locate the compressed metadata blob.
-//  2. Snappy-decompressing the metadata blob.
-//  3. Reconstructing the file with the uncompressed metadata, version byte = 11, and
-//     updated header/footer offsets.
-//
-// This exercises the r.fileVersion != VersionV12 branch in parseV5MetadataLazy.
-func makeV11FileFromV12(t *testing.T, v12data []byte) []byte {
-	t.Helper()
-
-	// Detect footer version and parse accordingly.
-	// V4 footer (34 bytes): version[2] + headerOffset[8] + compactOffset[8] + compactLen[4] + intrinsicOffset[8] + intrinsicLen[4]
-	// V3 footer (22 bytes): version[2] + headerOffset[8] + compactOffset[8] + compactLen[4]
-	// headerOffset and compactLen are at the same positions in both formats.
-	footerSize := int(shared.FooterV3Size)
-	if len(v12data) >= int(shared.FooterV4Size) {
-		fs := len(v12data) - int(shared.FooterV4Size)
-		if binary.LittleEndian.Uint16(v12data[fs:]) == shared.FooterV4Version {
-			footerSize = int(shared.FooterV4Size)
-		}
-	}
-	require.GreaterOrEqual(t, len(v12data), footerSize, "file too small for footer")
-	footerStart := len(v12data) - footerSize
-	headerOffset := binary.LittleEndian.Uint64(v12data[footerStart+2:])
-	compactLen := binary.LittleEndian.Uint32(v12data[footerStart+18:])
-
-	// Parse file header: magic[4] + version[1] + metadataOffset[8] + metadataLen[8] = 21 bytes.
-	require.Less(
-		t,
-		headerOffset+21,
-		uint64(len(v12data)),
-		"header offset out of range",
-	) //nolint:gosec // safe: len(v12data) is non-negative
-	hdr := v12data[headerOffset : headerOffset+21]
-	metadataOffset := binary.LittleEndian.Uint64(hdr[5:])
-	metadataLen := binary.LittleEndian.Uint64(hdr[13:])
-	fileVer := hdr[4]
-	require.True(
-		t,
-		fileVer == shared.VersionV12 || fileVer == shared.VersionV13,
-		"expected V12 or V13 input, got %d", fileVer,
-	)
-
-	// Decompress metadata blob.
-	compressedMeta := v12data[metadataOffset : metadataOffset+metadataLen]
-	uncompressedMeta, err := snappy.Decode(nil, compressedMeta)
-	require.NoError(t, err, "snappy.Decode failed on metadata")
-
-	// For V13 input: the block index entries lack the 32-byte MinTraceID+MaxTraceID
-	// fields that V11 requires. Re-expand them by inserting 32 zero bytes after each
-	// per-block entry so the reader can parse the metadata as a V11 file.
-	if fileVer >= shared.VersionV13 {
-		uncompressedMeta = expandV13BlockIndexToV11(t, uncompressedMeta)
-	}
-
-	// Locate the compact trace index section (immediately after the file header).
-	compactStart := headerOffset + 21
-	compactEnd := compactStart + uint64(compactLen)
-
-	// Build new file: blocks | uncompressed metadata | file header (v11) | compact index | footer.
-	var out []byte
-	out = append(out, v12data[:metadataOffset]...) // blocks unchanged
-
-	newMetadataOffset := uint64(len(out))
-	out = append(out, uncompressedMeta...)
-
-	newHeaderOffset := uint64(len(out))
-
-	// Write file header with version = 11.
-	var hdrBuf [21]byte
-	binary.LittleEndian.PutUint32(hdrBuf[0:], shared.MagicNumber)
-	hdrBuf[4] = shared.VersionV11
-	binary.LittleEndian.PutUint64(hdrBuf[5:], newMetadataOffset)
-	binary.LittleEndian.PutUint64(hdrBuf[13:], uint64(len(uncompressedMeta)))
-	out = append(out, hdrBuf[:]...)
-
-	// Compact trace index unchanged.
-	newCompactOffset := uint64(len(out))
-	if compactLen > 0 {
-		out = append(out, v12data[compactStart:compactEnd]...)
-	}
-
-	// Write footer with updated headerOffset.
-	var footerBuf [22]byte
-	binary.LittleEndian.PutUint16(footerBuf[0:], shared.FooterV3Version)
-	binary.LittleEndian.PutUint64(footerBuf[2:], newHeaderOffset)
-	binary.LittleEndian.PutUint64(footerBuf[10:], newCompactOffset)
-	binary.LittleEndian.PutUint32(footerBuf[18:], compactLen)
-	out = append(out, footerBuf[:]...)
-
-	return out
-}
-
-func TestBackwardCompat_V11Files(t *testing.T) {
-	// Write a V12 file, then convert it to a synthetic V11 file by decompressing the
-	// metadata and patching the version byte to 11. This exercises the
-	// r.fileVersion != VersionV12 branch in parseV5MetadataLazy, confirming the reader
-	// handles uncompressed-metadata files correctly after the V12 upgrade.
-	var buf bytes.Buffer
-	w := mustNewWriter(t, &buf, 0)
-
-	traceID := [16]byte{0x01, 0x02, 0x03, 0x04}
-	span := makeSpan(
-		traceID,
-		fixedSpanID(0x10),
-		"compat.op",
-		1_000_000_000,
-		2_000_000_000,
-		tracev1.Span_SPAN_KIND_CLIENT,
-		[]*commonv1.KeyValue{stringAttr("env", "prod")},
-	)
-	addSpanToWriter(t, w, traceID, span, map[string]any{"service.name": "compat-svc"})
-	_, err := w.Flush()
-	require.NoError(t, err)
-
-	v11data := makeV11FileFromV12(t, buf.Bytes())
-
-	// Reader must open and return sane data from the V11 file.
-	r := openReader(t, v11data)
-	assert.Equal(t, 1, r.BlockCount())
-	assert.NotNil(t, r.BlockMeta(0))
-}
-
 // ---- Security: decompression-bomb guard ----
 
 func TestDecompressionBombGuard(t *testing.T) {
@@ -1570,7 +1388,7 @@ func TestDecompressionBombGuard(t *testing.T) {
 	// Append a single zero byte so the slice is non-empty after the varint.
 	craftedPayload := append(fakeHeader, 0x00)
 
-	// Write a valid V12 file and replace its metadata blob with the crafted payload.
+	// Write a valid V13 file and replace its metadata blob with the crafted payload.
 	var buf bytes.Buffer
 	w := mustNewWriter(t, &buf, 0)
 	traceID := [16]byte{0xDE, 0xAD}
@@ -1587,37 +1405,37 @@ func TestDecompressionBombGuard(t *testing.T) {
 	_, err := w.Flush()
 	require.NoError(t, err)
 
-	v12data := buf.Bytes()
+	srcData := buf.Bytes()
 
 	// Parse the source file footer — detect V4 vs V3.
 	footerSize := int(shared.FooterV3Size)
-	if len(v12data) >= int(shared.FooterV4Size) {
-		fs := len(v12data) - int(shared.FooterV4Size)
-		if binary.LittleEndian.Uint16(v12data[fs:]) == shared.FooterV4Version {
+	if len(srcData) >= int(shared.FooterV4Size) {
+		fs := len(srcData) - int(shared.FooterV4Size)
+		if binary.LittleEndian.Uint16(srcData[fs:]) == shared.FooterV4Version {
 			footerSize = int(shared.FooterV4Size)
 		}
 	}
-	require.GreaterOrEqual(t, len(v12data), footerSize)
-	footerStart := len(v12data) - footerSize
-	headerOffset := binary.LittleEndian.Uint64(v12data[footerStart+2:])
-	compactLen := binary.LittleEndian.Uint32(v12data[footerStart+18:])
-	// File header for V12/V13 is 22 bytes (includes signal_type byte).
-	hdrBytes := v12data[headerOffset : headerOffset+22]
+	require.GreaterOrEqual(t, len(srcData), footerSize)
+	footerStart := len(srcData) - footerSize
+	headerOffset := binary.LittleEndian.Uint64(srcData[footerStart+2:])
+	compactLen := binary.LittleEndian.Uint32(srcData[footerStart+18:])
+	// File header is 22 bytes (includes signal_type byte).
+	hdrBytes := srcData[headerOffset : headerOffset+22]
 	metadataOffset := binary.LittleEndian.Uint64(hdrBytes[5:])
 
 	// Build a new file with the crafted payload in place of the real metadata.
 	var out []byte
-	out = append(out, v12data[:metadataOffset]...)
+	out = append(out, srcData[:metadataOffset]...)
 
 	newMetadataOffset := uint64(len(out))
 	out = append(out, craftedPayload...)
 
 	newHeaderOffset := uint64(len(out))
 
-	// Write a V12 file header (22 bytes, includes signal_type byte).
+	// Write a V13 file header (22 bytes, includes signal_type byte).
 	var hdrBuf [22]byte
 	binary.LittleEndian.PutUint32(hdrBuf[0:], shared.MagicNumber)
-	hdrBuf[4] = shared.VersionV12
+	hdrBuf[4] = shared.VersionV13
 	binary.LittleEndian.PutUint64(hdrBuf[5:], newMetadataOffset)
 	binary.LittleEndian.PutUint64(hdrBuf[13:], uint64(len(craftedPayload)))
 	hdrBuf[21] = shared.SignalTypeTrace
@@ -1628,7 +1446,7 @@ func TestDecompressionBombGuard(t *testing.T) {
 	newCompactOffset := uint64(len(out))
 	if compactLen > 0 {
 		compactEnd := compactStart + uint64(compactLen)
-		out = append(out, v12data[compactStart:compactEnd]...)
+		out = append(out, srcData[compactStart:compactEnd]...)
 	}
 
 	// Write a V3 footer (the crafted bomb file is intentionally V3 to test the reader's
@@ -1647,9 +1465,9 @@ func TestDecompressionBombGuard(t *testing.T) {
 		"expected decompression-bomb guard error, got: %v", openErr)
 }
 
-// ---- BENCH-R-08: Metadata open latency V11 vs V12 ----
+// ---- BENCH-R-08: Metadata open latency ----
 
-func BenchmarkReaderOpen_V12(b *testing.B) {
+func BenchmarkReaderOpen_V13(b *testing.B) {
 	// Generate a file with many blocks to stress the metadata section.
 	var buf bytes.Buffer
 	w, err := writer.NewWriterWithConfig(writer.Config{

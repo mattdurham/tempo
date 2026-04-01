@@ -5,6 +5,7 @@ import (
 	"math"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -109,7 +110,7 @@ func compileQuery(t *testing.T, query string) *vm.Program {
 func runQuery(t *testing.T, r *modules_reader.Reader, query string) []executor.MatchedRow {
 	t.Helper()
 	program := compileQuery(t, query)
-	rows, err := executor.Collect(r, program, executor.CollectOptions{})
+	rows, _, err := executor.Collect(r, program, executor.CollectOptions{})
 	require.NoError(t, err)
 	return rows
 }
@@ -175,14 +176,13 @@ func TestExecute_MultiBlock(t *testing.T) {
 	r := openReader(t, buf.Bytes())
 	require.GreaterOrEqual(t, r.BlockCount(), 2)
 
-	var statsOut executor.CollectStats
 	program := compileQuery(t, `{ span.batch.id = "b1" }`)
-	rows, err := executor.Collect(r, program, executor.CollectOptions{
-		OnStats: func(s executor.CollectStats) { statsOut = s },
-	})
+	rows, qs, err := executor.Collect(r, program, executor.CollectOptions{})
 	require.NoError(t, err)
 	assert.Equal(t, totalSpans, len(rows))
-	assert.GreaterOrEqual(t, statsOut.FetchedBlocks, 2)
+	blockScanStep := findStep(qs, "block-scan")
+	require.NotNil(t, blockScanStep, "block-scan step must be present")
+	assert.GreaterOrEqual(t, blockScanStep.Metadata["fetched_blocks"], 2)
 }
 
 // EX-05: Empty file.
@@ -246,7 +246,7 @@ func TestExecute_Limit(t *testing.T) {
 	mustFlush(t, w)
 
 	program := compileQuery(t, `{}`)
-	rows, err := executor.Collect(openReader(t, buf.Bytes()), program, executor.CollectOptions{Limit: 3})
+	rows, _, err := executor.Collect(openReader(t, buf.Bytes()), program, executor.CollectOptions{Limit: 3})
 	require.NoError(t, err)
 	assert.Equal(t, 3, len(rows))
 }
@@ -277,13 +277,12 @@ func TestExecute_PlanPopulated(t *testing.T) {
 	}
 	mustFlush(t, w)
 
-	var statsOut executor.CollectStats
 	program := compileQuery(t, `{ resource.service.name = "svc" }`)
-	_, err := executor.Collect(openReader(t, buf.Bytes()), program, executor.CollectOptions{
-		OnStats: func(s executor.CollectStats) { statsOut = s },
-	})
+	_, qs, err := executor.Collect(openReader(t, buf.Bytes()), program, executor.CollectOptions{})
 	require.NoError(t, err)
-	assert.Greater(t, statsOut.TotalBlocks, 0)
+	// resource.service.name is intrinsic — takes fast path; ExecutionPath is non-empty.
+	assert.NotEmpty(t, qs.ExecutionPath, "ExecutionPath must be set")
+	assert.True(t, len(qs.Steps) > 0, "at least one step must be present")
 }
 
 // EX-11: Unscoped attribute matches when value is in resource scope.
@@ -533,7 +532,7 @@ func TestCollect_StringTruncation(t *testing.T) {
 // SPEC-STREAM-1: TestCollect_NilReader verifies that passing a nil reader returns nil, nil.
 func TestCollect_NilReader(t *testing.T) {
 	prog := compileQuery(t, `{ resource.service.name = "x" }`)
-	rows, err := executor.Collect(nil, prog, executor.CollectOptions{})
+	rows, _, err := executor.Collect(nil, prog, executor.CollectOptions{})
 	require.NoError(t, err)
 	require.Nil(t, rows)
 }
@@ -552,9 +551,9 @@ func TestCollect_WantColumns_NilVsEmpty(t *testing.T) {
 	r := openReader(t, buf.Bytes())
 	prog := compileQuery(t, `{ resource.service.name = "svc" }`)
 
-	rows1, err := executor.Collect(r, prog, executor.CollectOptions{})
+	rows1, _, err := executor.Collect(r, prog, executor.CollectOptions{})
 	require.NoError(t, err)
-	rows2, err := executor.Collect(r, prog, executor.CollectOptions{})
+	rows2, _, err := executor.Collect(r, prog, executor.CollectOptions{})
 	require.NoError(t, err)
 	require.Equal(t, len(rows1), len(rows2), "same program must return same row count on both calls")
 }
@@ -566,7 +565,7 @@ func TestCollect_NilProgram(t *testing.T) {
 	mustFlush(t, w)
 	r := openReader(t, buf.Bytes())
 
-	_, err := executor.Collect(r, nil, executor.CollectOptions{})
+	_, _, err := executor.Collect(r, nil, executor.CollectOptions{})
 	require.ErrorContains(t, err, "program must not be nil")
 }
 
@@ -594,7 +593,7 @@ func TestCollect_InvalidShardParameters(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := executor.Collect(r, prog, executor.CollectOptions{
+			_, _, err := executor.Collect(r, prog, executor.CollectOptions{
 				StartBlock: tc.startBlock,
 				BlockCount: tc.blockCount,
 			})
@@ -603,10 +602,9 @@ func TestCollect_InvalidShardParameters(t *testing.T) {
 	}
 }
 
-// GAP-22: TestCollect_OnStats_NilAndInvoked verifies that:
-// - A nil OnStats callback does not panic.
-// - A non-nil OnStats callback is invoked exactly once with non-zero stats.
-func TestCollect_OnStats_NilAndInvoked(t *testing.T) {
+// GAP-22: TestCollect_ReturnsQueryStats verifies QueryStats is returned with
+// non-empty ExecutionPath and positive TotalDuration.
+func TestCollect_ReturnsQueryStats(t *testing.T) {
 	var buf bytes.Buffer
 	w := mustNewWriter(t, &buf, 0)
 	tid := [16]byte{0xF2}
@@ -617,20 +615,8 @@ func TestCollect_OnStats_NilAndInvoked(t *testing.T) {
 	r := openReader(t, buf.Bytes())
 	prog := compileQuery(t, `{ resource.service.name = "alpha" }`)
 
-	// Part 1: nil OnStats must not panic.
-	_, err := executor.Collect(r, prog, executor.CollectOptions{OnStats: nil})
+	_, qs, err := executor.Collect(r, prog, executor.CollectOptions{})
 	require.NoError(t, err)
-
-	// Part 2: non-nil OnStats must be invoked exactly once with non-zero TotalBlocks.
-	var called int
-	var gotStats executor.CollectStats
-	_, err = executor.Collect(r, prog, executor.CollectOptions{
-		OnStats: func(s executor.CollectStats) {
-			called++
-			gotStats = s
-		},
-	})
-	require.NoError(t, err)
-	require.Equal(t, 1, called, "OnStats must be invoked exactly once")
-	require.Greater(t, gotStats.TotalBlocks, 0, "TotalBlocks must be non-zero")
+	assert.NotEmpty(t, qs.ExecutionPath)
+	assert.Greater(t, qs.TotalDuration, time.Duration(0))
 }

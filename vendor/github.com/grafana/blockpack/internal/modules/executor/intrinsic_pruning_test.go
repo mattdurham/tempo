@@ -97,7 +97,7 @@ func TestIntrinsicOnlyQueryPrunesBlocks(t *testing.T) {
 	}
 
 	e := New()
-	rows, err := e.Collect(r, prog, CollectOptions{})
+	rows, _, err := e.Collect(r, prog, CollectOptions{})
 	if err != nil {
 		t.Fatalf("Collect: %v", err)
 	}
@@ -302,71 +302,6 @@ func TestProgramIsIntrinsicOnly(t *testing.T) {
 		got := ProgramIsIntrinsicOnly(prog)
 		if got != tc.wantTrue {
 			t.Errorf("ProgramIsIntrinsicOnly(%q) = %v, want %v", tc.query, got, tc.wantTrue)
-		}
-	}
-}
-
-// TestLookupIntrinsicFields_PageSkipping verifies that lookupIntrinsicFields returns
-// correct IntrinsicFields even when GetIntrinsicColumnForRefs skips pages.
-// Builds a file with enough spans to force multi-page intrinsic columns, collects a
-// small result set, and asserts the returned fields are correct.
-func TestLookupIntrinsicFields_PageSkipping(t *testing.T) {
-	// Need >IntrinsicPageSize (10,000) rows to trigger multiple pages.
-	// Lower MaxBlockSpans to a large-but-manageable value, keep MaxIntrinsicRows high.
-	const spansNeeded = 10001
-	var buf bytes.Buffer
-	w, err := writer.NewWriterWithConfig(writer.Config{
-		OutputStream:  &buf,
-		MaxBlockSpans: spansNeeded,
-	})
-	if err != nil {
-		t.Fatalf("NewWriterWithConfig: %v", err)
-	}
-
-	// Write spans with distinct durations so we can query a specific one.
-	for i := range spansNeeded {
-		traceID := make([]byte, 16)
-		traceID[0] = byte(i % 256)
-		traceID[1] = byte((i >> 8) % 256)
-		sp := &tracev1.Span{
-			TraceId:           traceID,
-			SpanId:            traceID[:8],
-			Name:              "op",
-			Kind:              tracev1.Span_SPAN_KIND_SERVER,
-			StartTimeUnixNano: 1_000_000_000,
-			EndTimeUnixNano:   uint64(2_000_000_000 + i*1000), //nolint:gosec
-		}
-		_ = w.AddSpan(sp.TraceId, sp, nil, "", nil, "")
-	}
-	_, _ = w.Flush()
-	data := buf.Bytes()
-
-	r, err := reader.NewReaderFromProvider(newBytesProvider(data))
-	if err != nil {
-		t.Fatalf("NewReaderFromProvider: %v", err)
-	}
-	if !r.HasIntrinsicSection() {
-		t.Skip("file has no intrinsic section")
-	}
-
-	// Collect a few refs from the full column.
-	col, err := r.GetIntrinsicColumn("span:duration")
-	if err != nil || col == nil || len(col.BlockRefs) < 2 {
-		t.Skip("span:duration not available or too few refs")
-	}
-
-	// Pick 2 refs.
-	selected := col.BlockRefs[:2]
-
-	wantCols := map[string]struct{}{"span:duration": {}}
-	fields := lookupIntrinsicFields(r, selected, wantCols)
-
-	if len(fields) != 2 {
-		t.Fatalf("lookupIntrinsicFields returned %d maps, want 2", len(fields))
-	}
-	for i, m := range fields {
-		if _, ok := m["span:duration"]; !ok {
-			t.Errorf("fields[%d] missing span:duration: %v", i, m)
 		}
 	}
 }

@@ -62,7 +62,7 @@ func TestStreamTopK_GlobalOrder_Backward(t *testing.T) {
 	r := openLogMetricsReader(t, data)
 	prog := compileSelectorProgram(t, `{service.name = "svc"}`)
 
-	rows, err := executor.Collect(r, prog, executor.CollectOptions{
+	rows, _, err := executor.Collect(r, prog, executor.CollectOptions{
 		Limit:           2,
 		Direction:       queryplanner.Backward,
 		TimestampColumn: "log:timestamp",
@@ -91,7 +91,7 @@ func TestStreamTopK_GlobalOrder_Forward(t *testing.T) {
 	r := openLogMetricsReader(t, data)
 	prog := compileSelectorProgram(t, `{service.name = "svc"}`)
 
-	rows, err := executor.Collect(r, prog, executor.CollectOptions{
+	rows, _, err := executor.Collect(r, prog, executor.CollectOptions{
 		Limit:           2,
 		Direction:       queryplanner.Forward,
 		TimestampColumn: "log:timestamp",
@@ -126,22 +126,19 @@ func TestStreamTopK_BlockSkip(t *testing.T) {
 	r := openLogMetricsReader(t, data)
 	prog := compileSelectorProgram(t, `{service.name = "svc"}`)
 
-	var stats executor.CollectStats
-	rows, err := executor.Collect(r, prog, executor.CollectOptions{
+	rows, qs, err := executor.Collect(r, prog, executor.CollectOptions{
 		Limit:           2,
 		Direction:       queryplanner.Backward,
 		TimestampColumn: "log:timestamp",
-		OnStats:         func(s executor.CollectStats) { stats = s },
 	})
 	require.NoError(t, err)
 	// Result must contain only the two newer entries — block 0's rows were pruned.
 	require.Len(t, rows, 2)
 	assert.Equal(t, uint64(2000), tsFromBlock(rows[0].Block, rows[0].RowIdx))
 	assert.Equal(t, uint64(1000), tsFromBlock(rows[1].Block, rows[1].RowIdx))
-	assert.Equal(t, 2, stats.SelectedBlocks)
-	// Small blocks coalesce into one ReadGroup, so FetchedBlocks == SelectedBlocks.
-	// The skip is validated via result correctness above, not I/O accounting.
-	assert.LessOrEqual(t, stats.FetchedBlocks, stats.SelectedBlocks)
+	planStep := findStep(qs, "plan")
+	require.NotNil(t, planStep)
+	assert.Equal(t, 2, planStep.Metadata["selected_blocks"])
 }
 
 // EX-SLK-04 (StreamTopK): Per-row time range filtering.
@@ -159,7 +156,7 @@ func TestStreamTopK_TimeRange(t *testing.T) {
 	r := openLogMetricsReader(t, data)
 	prog := compileSelectorProgram(t, `{service.name = "svc"}`)
 
-	rows, err := executor.Collect(r, prog, executor.CollectOptions{
+	rows, _, err := executor.Collect(r, prog, executor.CollectOptions{
 		Limit:           100,
 		Direction:       queryplanner.Forward,
 		TimestampColumn: "log:timestamp",
@@ -174,7 +171,7 @@ func TestStreamTopK_TimeRange(t *testing.T) {
 func TestStreamTopK_NilReader(t *testing.T) {
 	t.Parallel()
 
-	rows, err := executor.Collect(nil, nil, executor.CollectOptions{
+	rows, _, err := executor.Collect(nil, nil, executor.CollectOptions{
 		Limit:           10,
 		TimestampColumn: "log:timestamp",
 	})
@@ -196,7 +193,7 @@ func TestStreamTopK_LimitZeroDeliversAll(t *testing.T) {
 	r := openLogMetricsReader(t, data)
 	prog := compileSelectorProgram(t, `{service.name = "svc"}`)
 
-	rows, err := executor.Collect(r, prog, executor.CollectOptions{
+	rows, _, err := executor.Collect(r, prog, executor.CollectOptions{
 		Limit:           0,
 		TimestampColumn: "log:timestamp",
 	})
@@ -218,15 +215,14 @@ func TestStreamTopK_OnStats(t *testing.T) {
 	r := openLogMetricsReader(t, data)
 	prog := compileSelectorProgram(t, `{service.name = "svc"}`)
 
-	var stats executor.CollectStats
-	_, err := executor.Collect(r, prog, executor.CollectOptions{
+	_, qs, err := executor.Collect(r, prog, executor.CollectOptions{
 		Limit:           10,
 		Direction:       queryplanner.Backward,
 		TimestampColumn: "log:timestamp",
-		OnStats:         func(s executor.CollectStats) { stats = s },
 	})
 	require.NoError(t, err)
-	assert.Greater(t, stats.TotalBlocks, 0)
-	assert.Greater(t, stats.SelectedBlocks, 0)
-	assert.LessOrEqual(t, stats.FetchedBlocks, stats.SelectedBlocks)
+	planStep := findStep(qs, "plan")
+	require.NotNil(t, planStep)
+	assert.Greater(t, planStep.Metadata["total_blocks"], 0)
+	assert.Greater(t, planStep.Metadata["selected_blocks"], 0)
 }

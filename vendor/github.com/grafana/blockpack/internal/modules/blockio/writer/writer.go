@@ -417,11 +417,7 @@ func (w *Writer) Flush() (int64, error) {
 	applyRangeBuckets(w.rangeIdx, defaultRangeBuckets)
 
 	// 4. Write metadata section (snappy-compressed, V13 format).
-	// V13 removes MinTraceID/MaxTraceID from block index entries and
-	// stats_offset/stats_len from column metadata. V12 added snappy-compressed
-	// metadata and the signal_type byte in the file header.
 	metaBytes, err := buildMetadataSectionBytes(
-		shared.VersionV13, // V13: block index omits MinTraceID[16]+MaxTraceID[16] per entry
 		w.blockMetas,
 		w.rangeIdx,
 		w.traceIndex,
@@ -507,7 +503,6 @@ func (w *Writer) writeEmptyFile() (int64, error) {
 
 	rIdx := make(rangeIndex)
 	metaBytes, err := buildMetadataSectionBytes(
-		shared.VersionV13, // V13: block index omits MinTraceID[16]+MaxTraceID[16] per entry
 		nil,
 		rIdx,
 		w.traceIndex,
@@ -518,7 +513,6 @@ func (w *Writer) writeEmptyFile() (int64, error) {
 		return w.out.total, err
 	}
 
-	// All empty files use V13.
 	compressedEmptyMeta := snappy.Encode(nil, metaBytes)
 	metadataLen := uint64(len(compressedEmptyMeta))
 	if _, err = w.out.Write(compressedEmptyMeta); err != nil {
@@ -836,14 +830,13 @@ func (w *Writer) flushLogBlocks() error {
 // Column index section (§5.3) is written as block_count × uint32(0) for format
 // compatibility with existing readers; the per-column entry data is no longer written.
 func buildMetadataSectionBytes(
-	version uint8,
 	blockMetas []shared.BlockMeta,
 	rIdx rangeIndex,
 	traceIndex map[[16]byte][]uint16,
 	sketchIdx []blockSketchSet,
 	fileBloomSvcNames map[string]struct{},
 ) ([]byte, error) {
-	blockIdxData, err := writeBlockIndexSection(nil, version, blockMetas)
+	blockIdxData, err := writeBlockIndexSection(nil, blockMetas)
 	if err != nil {
 		return nil, err
 	}
@@ -923,21 +916,33 @@ func (w *Writer) AddRow(block *reader.Block, rowIdx int) error {
 	}
 	spanIDBytes, spanIDOK := spanIDCol.BytesValue(rowIdx)
 	if !spanIDOK || len(spanIDBytes) != 8 {
-		return fmt.Errorf("writer: AddRow: required column %q must have 8 bytes, got %d", spanIDColumnName, len(spanIDBytes))
+		return fmt.Errorf(
+			"writer: AddRow: required column %q must have 8 bytes, got %d",
+			spanIDColumnName,
+			len(spanIDBytes),
+		)
 	}
 	startCol := block.GetColumn(spanStartColumnName)
 	if startCol == nil {
 		return fmt.Errorf("writer: AddRow: required column %q missing", spanStartColumnName)
 	}
 	if _, ok := startCol.Uint64Value(rowIdx); !ok {
-		return fmt.Errorf("writer: AddRow: required column %q must have uint64 value at row %d", spanStartColumnName, rowIdx)
+		return fmt.Errorf(
+			"writer: AddRow: required column %q must have uint64 value at row %d",
+			spanStartColumnName,
+			rowIdx,
+		)
 	}
 	endCol := block.GetColumn(spanEndColumnName)
 	if endCol == nil {
 		return fmt.Errorf("writer: AddRow: required column %q missing", spanEndColumnName)
 	}
 	if _, ok := endCol.Uint64Value(rowIdx); !ok {
-		return fmt.Errorf("writer: AddRow: required column %q must have uint64 value at row %d", spanEndColumnName, rowIdx)
+		return fmt.Errorf(
+			"writer: AddRow: required column %q must have uint64 value at row %d",
+			spanEndColumnName,
+			rowIdx,
+		)
 	}
 
 	if !w.inUse.CompareAndSwap(false, true) {

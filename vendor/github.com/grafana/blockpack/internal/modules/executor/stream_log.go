@@ -88,7 +88,7 @@ func StreamLogs(
 	// Delegate coalesced I/O, parse, and per-row pipeline to iterateLogRows.
 	// CollectOptions{} zero value means no time range filtering (MinNano==MaxNano==0
 	// is treated as open-ended by filterRowsByTimeRange).
-	_, err := iterateLogRows(r, program, wantColumns, pipeline, CollectOptions{}, plan,
+	_, _, _, err := iterateLogRows(r, program, wantColumns, pipeline, CollectOptions{}, plan,
 		nil, nil,
 		func(_ uint64, entry LogEntry) bool {
 			results = append(results, entry)

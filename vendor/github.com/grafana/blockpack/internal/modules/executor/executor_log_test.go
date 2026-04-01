@@ -253,13 +253,13 @@ func TestBuildPredicates_DedicatedRanges_PrunesOutOfRangeBlocks(t *testing.T) {
 	require.Equal(t, 3, r.BlockCount(), "expected 3 blocks")
 
 	// Query for timestamp > 600: only records from the high block (1000, 2000) should match.
-	var statsOut executor.CollectStats
 	program := compileQuery(t, `{ log:timestamp > 600 }`)
-	rows, err := executor.Collect(r, program, executor.CollectOptions{
-		OnStats: func(s executor.CollectStats) { statsOut = s },
-	})
+	rows, qs, err := executor.Collect(r, program, executor.CollectOptions{})
 	require.NoError(t, err)
-	assert.Greater(t, statsOut.PrunedByIndex, 0, "at least 1 block should be pruned by range index")
+	planStep := findStep(qs, "plan")
+	require.NotNil(t, planStep, "plan step must be present")
+	prunedByIndex, _ := planStep.Metadata["pruned_by_index"].(int)
+	assert.Greater(t, prunedByIndex, 0, "at least 1 block should be pruned by range index")
 	assert.Equal(t, 2, len(rows), "only the 2 records with timestamp > 600 should match")
 }
 

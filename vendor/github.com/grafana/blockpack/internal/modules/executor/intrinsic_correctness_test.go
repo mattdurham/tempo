@@ -36,7 +36,16 @@ func buildIntrinsicTestReader(t *testing.T) ([]byte, int, int, int) {
 	addSpan(t, w, tid2, 2, "op", tracev1.Span_SPAN_KIND_SERVER, nil, map[string]any{"service.name": "loki-querier"})
 	addSpan(t, w, tid2, 3, "op", tracev1.Span_SPAN_KIND_SERVER, nil, map[string]any{"service.name": "grafana"})
 	addSpan(t, w, tid3, 4, "op", tracev1.Span_SPAN_KIND_CLIENT, nil, map[string]any{"service.name": "grafana"})
-	addSpan(t, w, tid3, 5, "op", tracev1.Span_SPAN_KIND_SERVER, nil, map[string]any{"service.name": "tempo-distributor"})
+	addSpan(
+		t,
+		w,
+		tid3,
+		5,
+		"op",
+		tracev1.Span_SPAN_KIND_SERVER,
+		nil,
+		map[string]any{"service.name": "tempo-distributor"},
+	)
 
 	mustFlush(t, w)
 	return buf.Bytes(), 3, 2, 1 // loki-querier=3, grafana=2, tempo-distributor=1
@@ -62,7 +71,7 @@ func TestIntrinsicFastPath_RegexOnServiceName(t *testing.T) {
 	} {
 		tc := tc
 		t.Run(tc.desc, func(t *testing.T) {
-			rows, err := executor.Collect(r, compileQuery(t, tc.query), executor.CollectOptions{Limit: 100})
+			rows, _, err := executor.Collect(r, compileQuery(t, tc.query), executor.CollectOptions{Limit: 100})
 			require.NoError(t, err)
 			assert.Equal(t, tc.want, len(rows), "query: %s", tc.query)
 		})
@@ -104,7 +113,7 @@ func TestIntrinsicFastPath_OROnServiceName(t *testing.T) {
 	} {
 		tc := tc
 		t.Run(tc.desc, func(t *testing.T) {
-			rows, err := executor.Collect(r, compileQuery(t, tc.query), executor.CollectOptions{Limit: 100})
+			rows, _, err := executor.Collect(r, compileQuery(t, tc.query), executor.CollectOptions{Limit: 100})
 			require.NoError(t, err)
 			assert.Equal(t, tc.want, len(rows), "query: %s", tc.query)
 		})
@@ -120,7 +129,11 @@ func TestIntrinsicFastPath_RegexAndAND(t *testing.T) {
 	r := openReader(t, data)
 
 	// All loki-querier spans are SERVER kind (3) — CLIENT kind (1) should be excluded.
-	rows, err := executor.Collect(r, compileQuery(t, `{ resource.service.name =~ "loki-.*" && kind = server }`), executor.CollectOptions{Limit: 100})
+	rows, _, err := executor.Collect(
+		r,
+		compileQuery(t, `{ resource.service.name =~ "loki-.*" && kind = server }`),
+		executor.CollectOptions{Limit: 100},
+	)
 	require.NoError(t, err)
 	assert.Equal(t, lokiCount-1, len(rows), "server-kind loki spans only")
 }
@@ -132,10 +145,14 @@ func TestIntrinsicFastPath_TopK_RegexMostRecent(t *testing.T) {
 	data, lokiCount, _, _ := buildIntrinsicTestReader(t)
 	r := openReader(t, data)
 
-	rows, err := executor.Collect(r, compileQuery(t, `{ resource.service.name =~ "loki-.*" }`), executor.CollectOptions{
-		Limit:           100,
-		TimestampColumn: "span:start",
-	})
+	rows, _, err := executor.Collect(
+		r,
+		compileQuery(t, `{ resource.service.name =~ "loki-.*" }`),
+		executor.CollectOptions{
+			Limit:           100,
+			TimestampColumn: "span:start",
+		},
+	)
 	require.NoError(t, err)
 	assert.Equal(t, lokiCount, len(rows), "MostRecent regex should find all loki-querier spans")
 }
@@ -147,10 +164,14 @@ func TestIntrinsicFastPath_TopK_ORMostRecent(t *testing.T) {
 	data, lokiCount, grafanaCount, _ := buildIntrinsicTestReader(t)
 	r := openReader(t, data)
 
-	rows, err := executor.Collect(r, compileQuery(t, `{ resource.service.name = "loki-querier" || resource.service.name = "grafana" }`), executor.CollectOptions{
-		Limit:           100,
-		TimestampColumn: "span:start",
-	})
+	rows, _, err := executor.Collect(
+		r,
+		compileQuery(t, `{ resource.service.name = "loki-querier" || resource.service.name = "grafana" }`),
+		executor.CollectOptions{
+			Limit:           100,
+			TimestampColumn: "span:start",
+		},
+	)
 	require.NoError(t, err)
 	assert.Equal(t, lokiCount+grafanaCount, len(rows), "MostRecent OR should find loki+grafana spans")
 }
@@ -167,7 +188,11 @@ func TestIntrinsicFastPath_MixedPredicateBlockScan(t *testing.T) {
 
 	// mixed predicates — intrinsic pre-filter narrows candidates (service name), VM re-check handles non-intrinsic (http.method).
 	// No spans have http.method set, so VM re-evaluation eliminates all candidates.
-	rows, err := executor.Collect(r, compileQuery(t, `{ resource.service.name =~ "loki-.*" && span.http.method = "GET" }`), executor.CollectOptions{Limit: 100})
+	rows, _, err := executor.Collect(
+		r,
+		compileQuery(t, `{ resource.service.name =~ "loki-.*" && span.http.method = "GET" }`),
+		executor.CollectOptions{Limit: 100},
+	)
 	require.NoError(t, err)
 	// No spans have http.method set, so result is 0 — but importantly: no error and no panic.
 	assert.Equal(t, 0, len(rows), "no spans have http.method")
@@ -210,7 +235,7 @@ func TestCollect_MixedPredicateNoSort(t *testing.T) {
 	data, getCount, _ := buildMixedTestReader(t)
 	r := openReader(t, data)
 
-	rows, err := executor.Collect(r,
+	rows, _, err := executor.Collect(r,
 		compileQuery(t, `{ resource.service.name = "svc-a" && span.http.method = "GET" }`),
 		executor.CollectOptions{Limit: 10})
 	require.NoError(t, err)
@@ -275,7 +300,7 @@ func TestCollect_MixedPredicateWithSort(t *testing.T) {
 	// Query: svc="target" (intrinsic) AND http.method="GET" (non-intrinsic).
 	// All target spans have http.method=GET, so 3 match. With limit=2 Backward,
 	// we expect the 2 most recent: idx=4 (T4) and idx=2 (T2).
-	rows, err := executor.Collect(r,
+	rows, _, err := executor.Collect(r,
 		compileQuery(t, `{ resource.service.name = "target" && span.http.method = "GET" }`),
 		executor.CollectOptions{
 			Limit:           2,
@@ -303,7 +328,7 @@ func TestCollect_MixedPredicateWithSort(t *testing.T) {
 
 // EX-INT-09: Pure intrinsic equality query (no sort) returns correct results via
 // forEachBlockInGroups (Block populated, IntrinsicFields nil). Regression guard
-// for Case A equality-predicate path: correct count, Block population, and field value.
+// for Case A equality-predicate path: correct count, Block populated, IntrinsicFields nil.
 func TestCollect_PureIntrinsicNoSort_RegressionGuard(t *testing.T) {
 	t.Parallel()
 	var buf bytes.Buffer
@@ -319,14 +344,13 @@ func TestCollect_PureIntrinsicNoSort_RegressionGuard(t *testing.T) {
 	mustFlush(t, w)
 	r := openReader(t, buf.Bytes())
 
-	rows, err := executor.Collect(r,
+	rows, _, err := executor.Collect(r,
 		compileQuery(t, `{ resource.service.name = "svc-a" }`),
 		executor.CollectOptions{Limit: 5})
 	require.NoError(t, err)
 	assert.Equal(t, 5, len(rows), "all svc-a spans must be returned")
 
-	// Case A equality predicate (svc=X): Block populated, IntrinsicFields nil.
-	// resource.service.name is intrinsic-only; verify via the intrinsic section.
+	// Case A: all pure-intrinsic queries use forEachBlockInGroups → Block populated, IntrinsicFields nil.
 	for i, row := range rows {
 		require.NotNilf(t, row.Block, "row %d: equality query must populate Block", i)
 		svcVal, svcOk := r.IntrinsicDictStringAt("resource.service.name", row.BlockIdx, row.RowIdx)
@@ -336,9 +360,9 @@ func TestCollect_PureIntrinsicNoSort_RegressionGuard(t *testing.T) {
 }
 
 // EX-INT-09b: Pure intrinsic range query (no sort) returns correct results via
-// lookupIntrinsicFields (IntrinsicFields populated, Block nil). Regression guard
-// for Case A range-predicate path: correct count, IntrinsicFields population, Block nil,
-// and that SpanMatchFromRow correctly extracts TraceID/SpanID from IntrinsicFields.
+// forEachBlockInGroups (Block populated, IntrinsicFields nil). Regression guard
+// for Case A range-predicate path: correct count, Block populated, IntrinsicFields nil,
+// and that SpanMatchFromRow correctly extracts TraceID/SpanID from Block columns.
 func TestCollect_PureIntrinsicNoSort_RangePredicate(t *testing.T) {
 	t.Parallel()
 
@@ -371,29 +395,29 @@ func TestCollect_PureIntrinsicNoSort_RangePredicate(t *testing.T) {
 	mustFlush(t, w)
 	r := openReader(t, buf.Bytes())
 
-	rows, err := executor.Collect(r,
+	rows, _, err := executor.Collect(r,
 		compileQuery(t, `{ duration > 100ms }`),
 		executor.CollectOptions{Limit: 10})
 	require.NoError(t, err)
 	assert.Equal(t, 3, len(rows), "only 200ms spans match duration>100ms")
 
-	// Case A range predicate: collectIntrinsicPlain always uses forEachBlockInGroups → Block populated, IntrinsicFields nil.
+	// Case A range predicate: forEachBlockInGroups → Block populated, IntrinsicFields nil.
 	for i, row := range rows {
-		require.NotNilf(t, row.Block, "row %d: range query must populate Block (forEachBlockInGroups path)", i)
+		require.NotNilf(t, row.Block, "row %d: range query must populate Block", i)
 		assert.Nilf(t, row.IntrinsicFields, "row %d: range query must not populate IntrinsicFields", i)
 
-		// SpanMatchFromRow must extract TraceID and SpanID from Block.
-		m := executor.SpanMatchFromRow(row, 0, nil)
+		// SpanMatchFromRow must extract TraceID and SpanID via the block+intrinsic fallback path.
+		m := executor.SpanMatchFromRow(row, 0, r)
 		assert.NotEqual(t, [16]byte{}, m.TraceID,
-			"row %d: SpanMatchFromRow must extract TraceID from Block", i)
+			"row %d: SpanMatchFromRow must extract TraceID from block/intrinsic", i)
 		assert.NotEmpty(t, m.SpanID,
-			"row %d: SpanMatchFromRow must extract SpanID from Block", i)
+			"row %d: SpanMatchFromRow must extract SpanID from block/intrinsic", i)
 	}
 }
 
-// EX-INT-10: Pure intrinsic query with timestamp sort returns IntrinsicFields rows
-// (zero block reads). Regression guard for Case B path.
-func TestCollect_PureIntrinsicWithSort_ZeroBlockRead(t *testing.T) {
+// EX-INT-10: Pure intrinsic query with timestamp sort returns Block rows (block-read populated).
+// Regression guard for Case B path: Block populated, IntrinsicFields nil.
+func TestCollect_PureIntrinsicWithSort_BlockPopulated(t *testing.T) {
 	t.Parallel()
 	var buf bytes.Buffer
 	w := mustNewWriter(t, &buf, 0)
@@ -411,7 +435,7 @@ func TestCollect_PureIntrinsicWithSort_ZeroBlockRead(t *testing.T) {
 	r := openReader(t, buf.Bytes())
 	_ = tid2
 
-	rows, err := executor.Collect(r,
+	rows, _, err := executor.Collect(r,
 		compileQuery(t, `{ resource.service.name = "target" }`),
 		executor.CollectOptions{
 			Limit:           2,
@@ -421,15 +445,16 @@ func TestCollect_PureIntrinsicWithSort_ZeroBlockRead(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 2, len(rows), "top-2 target spans")
 
-	// For pure intrinsic + sort (Case B), results carry IntrinsicFields, not Block.
+	// For pure intrinsic + sort (Case B), results carry Block, not IntrinsicFields.
 	for _, row := range rows {
-		assert.NotNil(t, row.IntrinsicFields, "pure intrinsic topK must return IntrinsicFields rows")
+		assert.NotNil(t, row.Block, "pure intrinsic topK must return Block rows")
+		assert.Nil(t, row.IntrinsicFields, "pure intrinsic topK must not return IntrinsicFields")
 	}
 
 	// Results must be in descending timestamp order (most recent first).
 	if len(rows) == 2 {
-		ts0 := getIntrinsicTimestamp(rows[0])
-		ts1 := getIntrinsicTimestamp(rows[1])
+		ts0 := getBlockSpanTimestamp(rows[0].Block, rows[0].RowIdx)
+		ts1 := getBlockSpanTimestamp(rows[1].Block, rows[1].RowIdx)
 		assert.GreaterOrEqual(t, ts0, ts1, "results must be in descending timestamp order")
 	}
 }
@@ -462,7 +487,7 @@ func TestCollect_MixedPredicatePartialAND_SupersetSafety(t *testing.T) {
 	mustFlush(t, w)
 	r := openReader(t, buf.Bytes())
 
-	rows, err := executor.Collect(r,
+	rows, _, err := executor.Collect(r,
 		compileQuery(t, `{ resource.service.name = "svc-a" && span.http.method = "GET" }`),
 		executor.CollectOptions{Limit: 10})
 	require.NoError(t, err)
@@ -493,7 +518,7 @@ func TestCollect_NonIntrinsicOnly_FallsBackToBlockScan(t *testing.T) {
 	// span.http.method is not an intrinsic column. No spans have http.method set.
 	// hasSomeIntrinsicPredicates returns false → full block scan runs.
 	// Result must be 0 (no spans have http.method=GET), with no error and no panic.
-	rows, err := executor.Collect(r,
+	rows, _, err := executor.Collect(r,
 		compileQuery(t, `{ span.http.method = "GET" }`),
 		executor.CollectOptions{Limit: 100})
 	require.NoError(t, err)
@@ -508,19 +533,4 @@ func getBlockSpanTimestamp(block *modules_reader.Block, rowIdx int) uint64 {
 	}
 	ts, _ := col.Uint64Value(rowIdx)
 	return ts
-}
-
-// getIntrinsicTimestamp returns the span:start value from an IntrinsicFields MatchedRow.
-func getIntrinsicTimestamp(row executor.MatchedRow) uint64 {
-	if row.IntrinsicFields == nil {
-		return 0
-	}
-	val, ok := row.IntrinsicFields.GetField("span:start")
-	if !ok {
-		return 0
-	}
-	if ts, ok := val.(uint64); ok {
-		return ts
-	}
-	return 0
 }

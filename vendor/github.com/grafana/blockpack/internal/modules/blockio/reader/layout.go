@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 	"slices"
 	"sync"
 	"time"
@@ -20,22 +21,26 @@ import (
 
 // FileLayoutReport is the top-level result of AnalyzeFileLayout.
 type FileLayoutReport struct {
-	Sections        []FileLayoutSection `json:"sections"`
-	RangeIndex      []RangeIndexColumn  `json:"range_index,omitempty"`
-	SketchIndex     *SketchIndexInfo    `json:"sketch_index,omitempty"`
-	BlockSpanCounts []uint32            `json:"block_span_counts,omitempty"`
-	FileSize        int64               `json:"file_size"`
-	TotalSpans      int64               `json:"total_spans"`
-	BlockCount      int                 `json:"block_count"`
-	FileVersion     uint8               `json:"file_version"`
+	Sections    []FileLayoutSection `json:"sections"`
+	RangeIndex  []RangeIndexColumn  `json:"range_index,omitempty"`
+	SketchIndex *SketchIndexInfo    `json:"sketch_index,omitempty"`
+	// FileBloom summarizes the file-level bloom filter section, if present.
+	FileBloom       *FileBloomInfo `json:"file_bloom,omitempty"`
+	BlockSpanCounts []uint32       `json:"block_span_counts,omitempty"`
+	FileSize        int64          `json:"file_size"`
+	TotalSpans      int64          `json:"total_spans"`
+	BlockCount      int            `json:"block_count"`
+	FileVersion     uint8          `json:"file_version"`
 }
 
 // SketchIndexInfo summarizes the sketch index stored in the file.
 type SketchIndexInfo struct {
 	// Blocks holds one summary per block (parallel to FileLayoutReport.BlockSpanCounts).
 	Blocks []BlockSketchSummary `json:"blocks"`
-	// EstimatedBytes is the estimated uncompressed size of the sketch section.
-	EstimatedBytes int `json:"estimated_bytes"`
+	// TotalBytes is the actual computed uncompressed size of the sketch section.
+	TotalBytes int `json:"total_bytes"`
+	// HeaderBytes is the fixed 12-byte sketch section header (magic + num_blocks + num_columns).
+	HeaderBytes int `json:"header_bytes"`
 	// SketchedBlockCount is the number of blocks that have at least one sketched column.
 	SketchedBlockCount int `json:"sketched_block_count"`
 }
@@ -55,35 +60,70 @@ type ColumnSketchStat struct {
 	FuseBytes int `json:"fuse_bytes,omitempty"`
 	// TopKCount is the number of TopK entries for this column (0 if none).
 	TopKCount int `json:"top_k_count,omitempty"`
+	// CMSBytes is the actual byte size of the Count-Min Sketch data for this column
+	// in this block (CMSDepth × CMSWidth × 2 bytes).
+	CMSBytes int `json:"cms_bytes,omitempty"`
+	// TopKBytes is the actual byte size of the TopK entries for this column in this
+	// block (1 + len(entries) × 10 bytes).
+	TopKBytes int `json:"top_k_bytes,omitempty"`
 }
 
 // RangeIndexColumn describes the pruning index for one column.
 type RangeIndexColumn struct {
-	ColumnName string             `json:"column_name"`
-	ColumnType string             `json:"column_type"`
-	Buckets    []RangeIndexBucket `json:"buckets"`
+	ColumnName string `json:"column_name"`
+	ColumnType string `json:"column_type"`
+	// BucketMin is the global minimum value across all blocks for this column.
+	BucketMin string `json:"bucket_min,omitempty"`
+	// BucketMax is the global maximum value across all blocks for this column.
+	BucketMax string             `json:"bucket_max,omitempty"`
+	Buckets   []RangeIndexBucket `json:"buckets"`
 }
 
 // RangeIndexBucket is one entry in a column's range index: the lower boundary
 // of a value bucket and the set of block indexes that cover it.
 type RangeIndexBucket struct {
-	Start    string   `json:"start"`
+	Start string `json:"start"`
+	// End is the upper boundary of this bucket (exclusive). For the last bucket this
+	// equals BucketMax of the column. Empty string for string/bytes columns where the
+	// upper bound is not encoded.
+	End      string   `json:"end,omitempty"`
 	BlockIDs []uint32 `json:"block_ids"`
 }
 
 // FileLayoutSection describes one contiguous byte range in a blockpack file.
 type FileLayoutSection struct {
-	Section          string `json:"section"`
-	ColumnName       string `json:"column_name,omitempty"`
-	ColumnType       string `json:"column_type,omitempty"`
-	Encoding         string `json:"encoding,omitempty"`
+	Section    string `json:"section"`
+	ColumnName string `json:"column_name,omitempty"`
+	ColumnType string `json:"column_type,omitempty"`
+	Encoding   string `json:"encoding,omitempty"`
+	// MinValue is the minimum value of this page (human-readable string).
+	MinValue string `json:"min_value,omitempty"`
+	// MaxValue is the maximum value of this page (human-readable string).
+	MaxValue         string `json:"max_value,omitempty"`
 	Offset           int64  `json:"offset"`
 	CompressedSize   int64  `json:"compressed_size"`
 	UncompressedSize int64  `json:"uncompressed_size,omitempty"`
 	BlockIndex       int    `json:"block_index,omitempty"`
+	// RowCount is the number of records in this page (intrinsic paged columns only).
+	RowCount int `json:"row_count,omitempty"`
 	// IsLogical is true for V12 metadata sub-sections whose Offset is relative to
 	// the start of the decompressed metadata buffer, not a physical file offset.
 	IsLogical bool `json:"is_logical,omitempty"`
+}
+
+// FileBloomInfo summarizes the file-level bloom filter section (FBLM).
+type FileBloomInfo struct {
+	// Columns holds per-column name and filter size.
+	Columns []FileBloomColumnInfo `json:"columns"`
+	// TotalBytes is the total uncompressed byte size of the FBLM section.
+	TotalBytes int `json:"total_bytes"`
+}
+
+// FileBloomColumnInfo describes one column's entry in the file bloom section.
+type FileBloomColumnInfo struct {
+	ColumnName string `json:"column_name"`
+	// FuseBytes is the byte size of the BinaryFuse8 filter for this column.
+	FuseBytes int `json:"fuse_bytes"`
 }
 
 // layoutDecoderPool pools zstd decoders for the layout analysis path. A separate pool
@@ -103,20 +143,14 @@ var layoutDecoderPool = &sync.Pool{
 
 // FileLayout computes a byte-level layout of the blockpack file, returning a report
 // that accounts for every byte. The returned Sections slice is sorted by Offset ascending.
-// Invariant: sum(section.CompressedSize) == FileSize.
+// Invariant: sum(section.CompressedSize where !IsLogical) == FileSize.
+// Logical sections (IsLogical=true) describe sub-structure within the decompressed
+// metadata buffer; their Offset is relative to that buffer, not the physical file.
 func (r *Reader) FileLayout() (*FileLayoutReport, error) {
-	const (
-		headerSizeV11 = int64(21)
-		headerSizeV12 = int64(22) // V12 adds signal_type byte at offset 21
-	)
+	const headerSize = int64(22) // magic[4] + version[1] + metadataOffset[8] + metadataLen[8] + signalType[1]
 	footerSize := int64(shared.FooterV3Size)
 	if r.footerVersion == shared.FooterV4Version {
 		footerSize = int64(shared.FooterV4Size)
-	}
-
-	headerSize := headerSizeV11
-	if r.fileVersion >= shared.VersionV12 {
-		headerSize = headerSizeV12
 	}
 
 	var sections []FileLayoutSection
@@ -128,7 +162,7 @@ func (r *Reader) FileLayout() (*FileLayoutReport, error) {
 		CompressedSize: footerSize,
 	})
 
-	// File header: 21 bytes (V11) or 22 bytes (V12) at r.headerOffset.
+	// File header: 22 bytes at r.headerOffset.
 	sections = append(sections, FileLayoutSection{
 		Section:        "file_header",
 		Offset:         int64(r.headerOffset), //nolint:gosec
@@ -179,35 +213,73 @@ func (r *Reader) FileLayout() (*FileLayoutReport, error) {
 			// Check if this column uses v2 paged format by reading the first byte.
 			blob, blobErr := r.GetIntrinsicColumnBlob(name)
 			isPaged := blobErr == nil && len(blob) > 0 && blob[0] == shared.IntrinsicPagedVersion
-			if isPaged {
-				formatName += "/paged"
-				// Decode page TOC to get per-page breakdown.
-				if len(blob) >= 5 {
-					tocLen := int(binary.LittleEndian.Uint32(blob[1:5]))
-					if 5+tocLen <= len(blob) {
-						ptoc, tocErr := shared.DecodePageTOC(blob[5 : 5+tocLen])
-						if tocErr == nil {
-							formatName = fmt.Sprintf(
-								"%s/paged(%d pages)",
-								formatName[:len(formatName)-6],
-								len(ptoc.Pages),
-							)
+
+			pagedEmitted := false
+			if isPaged && len(blob) >= 5 {
+				tocLen := int(binary.LittleEndian.Uint32(blob[1:5]))
+				if 5+tocLen <= len(blob) {
+					ptoc, tocErr := shared.DecodePageTOC(blob[5 : 5+tocLen])
+					if tocErr == nil && len(ptoc.Pages) > 0 {
+						// Compute absolute offset of first page blob:
+						// column blob offset + 1 (version byte) + 4 (toc_len prefix) + tocLen
+						headerLen := int64(1) + 4 + int64(tocLen)            //nolint:gosec
+						firstPageAbsOffset := int64(meta.Offset) + headerLen //nolint:gosec
+
+						// Emit a physical section for the per-page TOC header bytes
+						// (version + toc_len prefix + toc data) that precede the pages.
+						// headerLen is always >= 5 (1 version byte + 4 toc_len bytes).
+						sections = append(sections, FileLayoutSection{
+							Section:        "intrinsic.column[" + name + "].page_toc",
+							ColumnName:     name,
+							ColumnType:     columnTypeName(meta.Type),
+							Offset:         int64(meta.Offset), //nolint:gosec
+							CompressedSize: headerLen,
+						})
+						end := int64(meta.Offset) + headerLen //nolint:gosec
+						if end > columnsEnd {
+							columnsEnd = end
 						}
+
+						for pageIdx, pm := range ptoc.Pages {
+							pageAbsOffset := firstPageAbsOffset + int64(pm.Offset) //nolint:gosec
+							pageFmt := fmt.Sprintf("%s/paged", formatName)
+							sections = append(sections, FileLayoutSection{
+								Section:        fmt.Sprintf("intrinsic.column[%s].page[%d]", name, pageIdx),
+								ColumnName:     name,
+								ColumnType:     columnTypeName(meta.Type),
+								Encoding:       pageFmt,
+								Offset:         pageAbsOffset,
+								CompressedSize: int64(pm.Length), //nolint:gosec
+								RowCount:       int(pm.RowCount), //nolint:gosec
+								MinValue:       formatIntrinsicBound(meta.Type, pm.Min),
+								MaxValue:       formatIntrinsicBound(meta.Type, pm.Max),
+							})
+							end := pageAbsOffset + int64(pm.Length) //nolint:gosec
+							if end > columnsEnd {
+								columnsEnd = end
+							}
+						}
+						pagedEmitted = true
 					}
 				}
 			}
 
-			sections = append(sections, FileLayoutSection{
-				Section:        "intrinsic.column[" + name + "]",
-				ColumnName:     name,
-				ColumnType:     columnTypeName(meta.Type),
-				Encoding:       formatName,
-				Offset:         int64(meta.Offset), //nolint:gosec
-				CompressedSize: int64(meta.Length), //nolint:gosec
-			})
-			end := int64(meta.Offset) + int64(meta.Length) //nolint:gosec
-			if end > columnsEnd {
-				columnsEnd = end
+			if !pagedEmitted {
+				if isPaged {
+					formatName += "/paged"
+				}
+				sections = append(sections, FileLayoutSection{
+					Section:        "intrinsic.column[" + name + "]",
+					ColumnName:     name,
+					ColumnType:     columnTypeName(meta.Type),
+					Encoding:       formatName,
+					Offset:         int64(meta.Offset), //nolint:gosec
+					CompressedSize: int64(meta.Length), //nolint:gosec
+				})
+				end := int64(meta.Offset) + int64(meta.Length) //nolint:gosec
+				if end > columnsEnd {
+					columnsEnd = end
+				}
 			}
 		}
 		// TOC blob: from end of last column blob to end of intrinsic index region.
@@ -233,6 +305,7 @@ func (r *Reader) FileLayout() (*FileLayoutReport, error) {
 
 	rangeIndex := r.buildRangeIndex()
 	sketchIndex := r.buildSketchIndexInfo()
+	fileBloom := r.buildFileBloomInfo()
 
 	spanCounts := make([]uint32, len(r.blockMetas))
 	var totalSpans int64
@@ -250,6 +323,7 @@ func (r *Reader) FileLayout() (*FileLayoutReport, error) {
 		Sections:        sections,
 		RangeIndex:      rangeIndex,
 		SketchIndex:     sketchIndex,
+		FileBloom:       fileBloom,
 	}, nil
 }
 
@@ -261,29 +335,60 @@ func (r *Reader) buildSketchIndexInfo() *SketchIndexInfo {
 	}
 
 	numBlocks := r.sketchIdx.numBlocks
+	presenceBytes := (numBlocks + 7) / 8
 	info := &SketchIndexInfo{
-		Blocks: make([]BlockSketchSummary, numBlocks),
+		Blocks:      make([]BlockSketchSummary, numBlocks),
+		HeaderBytes: 12,
 	}
 
-	// Build per-block summaries from column-major data.
-	// For each block, collect which columns are present and their stats.
 	type blockColStat struct {
 		name        string
 		cardinality uint64
 		topkCount   int
+		cmsBytes    int
+		topkBytes   int
+		fuseBytes   int
 	}
 	blockCols := make([][]blockColStat, numBlocks)
 
+	totalBytes := 12 // header: magic[4] + num_blocks[4] + num_columns[4]
+
 	for name, cd := range r.sketchIdx.columns {
+		presentCount := len(cd.presentMap)
+		cmsBytesPerBlock := sketch.CMSDepth * sketch.CMSWidth * 2
+
+		// Per-column byte accounting.
+		totalBytes += 2 + len(name)    // name_len[2] + name
+		totalBytes += presenceBytes    // presence bitset
+		totalBytes += numBlocks * 4    // distinct counts
+		totalBytes += 1 + presentCount // topk_k[1] + entry_count per present block
+		totalBytes += 1 + 2            // cms_depth[1] + cms_width[2]
+		totalBytes += presentCount * cmsBytesPerBlock
+
 		for pi, blockIdx := range cd.presentMap {
+			topkEntries := len(cd.topkFP[pi])
+			topkBytesForBlock := 1 + topkEntries*10 // entry_count[1] + fp[8]+count[2] per entry
+			totalBytes += topkEntries * 10          // (entry_count already counted above)
+			totalBytes += 4                         // fuse_len[4]
+			fuseB := 0
+			if pi < len(cd.fuseRawLens) {
+				fuseB = cd.fuseRawLens[pi]
+				totalBytes += fuseB
+			}
+
 			stat := blockColStat{
 				name:        name,
 				cardinality: uint64(cd.distinct[blockIdx]),
-				topkCount:   len(cd.topkFP[pi]),
+				topkCount:   topkEntries,
+				cmsBytes:    cmsBytesPerBlock,
+				topkBytes:   topkBytesForBlock,
+				fuseBytes:   fuseB,
 			}
 			blockCols[blockIdx] = append(blockCols[blockIdx], stat)
 		}
 	}
+
+	info.TotalBytes = totalBytes
 
 	for blockIdx := range numBlocks {
 		cols := blockCols[blockIdx]
@@ -300,47 +405,16 @@ func (r *Reader) buildSketchIndexInfo() *SketchIndexInfo {
 			stats = append(stats, ColumnSketchStat{
 				ColumnName:     c.name,
 				HLLCardinality: c.cardinality,
+				FuseBytes:      c.fuseBytes,
 				TopKCount:      c.topkCount,
+				CMSBytes:       c.cmsBytes,
+				TopKBytes:      c.topkBytes,
 			})
 		}
 		info.Blocks[blockIdx] = BlockSketchSummary{Columns: stats}
 	}
 
-	info.EstimatedBytes = estimateSketchSectionSize(r.sketchIdx)
 	return info
-}
-
-// estimateSketchSectionSize estimates the uncompressed size of the column-major sketch section.
-// Header: 12 bytes. Per column: name + presence + distinct + topk + cms + fuse.
-func estimateSketchSectionSize(idx *sketchIndex) int {
-	if idx == nil {
-		return 0
-	}
-	numBlocks := idx.numBlocks
-	presenceBytes := (numBlocks + 7) / 8
-
-	total := 12 // magic[4] + num_blocks[4] + num_columns[4]
-	for name, cd := range idx.columns {
-		presentCount := len(cd.presentMap)
-		total += 2 + len(name) // name_len[2] + name
-		total += presenceBytes // presence bitset
-		total += numBlocks * 4 // distinct counts
-		total++                // topk_k[1]
-		total += presentCount  // topk_entry_count per present block
-		for pi := range presentCount {
-			total += len(cd.topkFP[pi]) * 10 // fp[8] + count[2] per entry
-		}
-		total++                                                       // cms_depth[1]
-		total += 2                                                    // cms_width[2]
-		total += presentCount * sketch.CMSDepth * sketch.CMSWidth * 2 // cms data per present block
-		for pi := range presentCount {
-			total += 4 // fuse_len[4]
-			if pi < len(cd.fuseRawLens) {
-				total += cd.fuseRawLens[pi]
-			}
-		}
-	}
-	return total
 }
 
 // buildRangeIndex parses every column's range index and returns the result sorted by column name.
@@ -360,6 +434,8 @@ func (r *Reader) buildRangeIndex() []RangeIndexColumn {
 		col := RangeIndexColumn{
 			ColumnName: colName,
 			ColumnType: columnTypeName(idx.colType),
+			BucketMin:  formatBucketBound(idx.colType, idx.bucketMin),
+			BucketMax:  formatBucketBound(idx.colType, idx.bucketMax),
 			Buckets:    make([]RangeIndexBucket, 0, len(idx.entries)),
 		}
 
@@ -370,12 +446,44 @@ func (r *Reader) buildRangeIndex() []RangeIndexColumn {
 			})
 		}
 
+		// Populate End for each bucket where an upper bound is defined:
+		// End[i] = Start[i+1]; End[last] = BucketMax.
+		// For string/bytes range columns, BucketMax is empty and End must remain empty
+		// because the wire format does not encode an upper boundary.
+		if col.BucketMax != "" {
+			for i := range col.Buckets {
+				if i+1 < len(col.Buckets) {
+					col.Buckets[i].End = col.Buckets[i+1].Start
+				} else {
+					col.Buckets[i].End = col.BucketMax
+				}
+			}
+		}
+
 		cols = append(cols, col)
 	}
 
 	slices.SortFunc(cols, func(a, b RangeIndexColumn) int { return cmp.Compare(a.ColumnName, b.ColumnName) })
 
 	return cols
+}
+
+// formatBucketBound formats a bucket global min/max stored as int64 bits in parsedRangeIndex.
+// The bits field is the raw int64 from bucketMin/bucketMax (wire format: LE uint64 reread as int64).
+func formatBucketBound(colType shared.ColumnType, bits int64) string {
+	switch colType {
+	case shared.ColumnTypeRangeInt64:
+		return fmt.Sprintf("%d", bits)
+	case shared.ColumnTypeRangeDuration:
+		return time.Duration(bits).String()
+	case shared.ColumnTypeRangeUint64:
+		return fmt.Sprintf("%d", uint64(bits)) //nolint:gosec
+	case shared.ColumnTypeRangeFloat64:
+		return fmt.Sprintf("%g", math.Float64frombits(uint64(bits))) //nolint:gosec
+	default:
+		// String/bytes: bucketMin/Max are 0 (not stored in wire format for these types).
+		return ""
+	}
 }
 
 // formatRangeKey decodes an encoded lower-boundary key to a human-readable string.
@@ -406,7 +514,7 @@ func (r *Reader) layoutBlock(blockIdx int, meta shared.BlockMeta) ([]FileLayoutS
 		return nil, fmt.Errorf("parseBlockHeader: %w", err)
 	}
 
-	metas, colMetaEndPos, err := parseColumnMetadataArray(raw, 24, int(hdr.columnCount), hdr.version)
+	metas, colMetaEndPos, err := parseColumnMetadataArray(raw, 24, int(hdr.columnCount))
 	if err != nil {
 		return nil, fmt.Errorf("parseColumnMetadataArray: %w", err)
 	}
@@ -471,111 +579,135 @@ func (r *Reader) layoutBlock(blockIdx int, meta shared.BlockMeta) ([]FileLayoutS
 
 // layoutMetadata returns FileLayoutSection entries for the metadata section.
 //
-// For V10/V11 files (uncompressed metadata), the sub-sections directly reflect
-// physical byte ranges on disk and their CompressedSize values sum to r.metadataLen.
-//
-// For V12 files (snappy-compressed metadata), the on-disk bytes form a single
-// compressed blob. A single "metadata.compressed" section accounts for all
-// r.metadataLen compressed bytes (preserving the byte invariant) and reports
-// the uncompressed size via UncompressedSize. Sub-section breakdown is not
-// reported for V12 because physical byte offsets within the compressed blob
-// are not meaningful.
+// All V12 metadata is a single snappy-compressed blob. The physical section
+// (metadata.compressed) accounts for r.metadataLen compressed bytes, preserving
+// the byte invariant. Logical sub-sections (IsLogical: true) describe the
+// decompressed content without adding to the physical byte count.
 func (r *Reader) layoutMetadata() ([]FileLayoutSection, error) {
-	data := r.metadataBytes
-	if len(data) < 8 {
-		return nil, fmt.Errorf("metadataBytes too short: need at least 8 bytes, have %d", len(data))
+	if len(r.metadataBytes) < 8 {
+		return nil, fmt.Errorf("metadataBytes too short: need at least 8 bytes, have %d", len(r.metadataBytes))
 	}
 
 	base := int64(r.metadataOffset) //nolint:gosec
 
-	isSnappyCompressed := r.fileVersion >= shared.VersionV12
-
-	var sections []FileLayoutSection
-
-	// For V12+, emit only the physical compressed blob: the metadata bytes form a
-	// single snappy-compressed blob on disk. Logical sub-section offsets within the
-	// decompressed buffer are not physical file offsets and cannot be included without
-	// breaking the byte invariant (sum(CompressedSize) == FileSize).
-	if isSnappyCompressed {
-		sections = append(sections, FileLayoutSection{
-			Section:          "metadata.compressed",
-			Offset:           base,
-			CompressedSize:   int64(r.metadataLen),        //nolint:gosec
-			UncompressedSize: int64(len(r.metadataBytes)), //nolint:gosec // safe: len(slice) always fits int64
-		})
-		return sections, nil
-	}
-
-	blockCount := len(r.blockMetas)
-	pos := 4 // skip block_count[4]
-
-	_, blockConsumed, err := parseBlockIndex(data[pos:], r.fileVersion, blockCount)
-	if err != nil {
-		return nil, fmt.Errorf("re-parse block_index: %w", err)
-	}
-
-	pos += blockConsumed
-	pos += 4 // skip range_count[4]; include it in block_index section
-
-	blockIdxSize := int64(pos)
-
+	sections := make([]FileLayoutSection, 0, 1+len(r.rangeOffsets))
 	sections = append(sections, FileLayoutSection{
-		Section:        "metadata.block_index",
-		Offset:         base,
-		CompressedSize: blockIdxSize,
-		IsLogical:      isSnappyCompressed,
+		Section:          "metadata.compressed",
+		Offset:           base,
+		CompressedSize:   int64(r.metadataLen),        //nolint:gosec
+		UncompressedSize: int64(len(r.metadataBytes)), //nolint:gosec
 	})
 
-	// Range index: one section per column, using pre-parsed byte ranges.
-	// Sum of entry lengths = total bytes consumed by range index entries.
-	var dedConsumed int
-	for _, dMeta := range r.rangeOffsets {
-		dedConsumed += dMeta.length
-	}
+	// Logical sub-sections within the decompressed metadata buffer.
+	sections = append(sections, r.layoutMetadataRangeIndex()...)
 
+	return sections, nil
+}
+
+// layoutMetadataRangeIndex returns logical FileLayoutSection entries for each
+// range-indexed column within the decompressed metadata buffer.
+func (r *Reader) layoutMetadataRangeIndex() []FileLayoutSection {
+	if len(r.rangeOffsets) == 0 {
+		return nil
+	}
+	sections := make([]FileLayoutSection, 0, len(r.rangeOffsets))
 	for colName, dMeta := range r.rangeOffsets {
 		sections = append(sections, FileLayoutSection{
 			Section:        "metadata.range_index.column[" + colName + "]",
 			ColumnName:     colName,
 			ColumnType:     columnTypeName(dMeta.typ),
-			Offset:         base + int64(dMeta.offset), //nolint:gosec
-			CompressedSize: int64(dMeta.length),        //nolint:gosec
-			IsLogical:      isSnappyCompressed,
+			Offset:         int64(dMeta.offset), //nolint:gosec
+			CompressedSize: int64(dMeta.length), //nolint:gosec
+			IsLogical:      true,
+		})
+	}
+	return sections
+}
+
+// buildFileBloomInfo builds a FileBloomInfo summary from the reader's raw file-bloom data.
+// Returns nil when no FileBloom section is present.
+//
+// This re-walks the raw FBLM wire format to extract per-column fuse filter byte sizes,
+// which are not retained by parseFileBloomSection (it only keeps the unmarshalled filters).
+// The raw bytes have already been validated by parseFileBloomSection during file open, so
+// magic/version checks here are defensive guards, not primary validation.
+func (r *Reader) buildFileBloomInfo() *FileBloomInfo {
+	raw := r.fileBloomRaw
+	if len(raw) == 0 {
+		return nil
+	}
+
+	info := &FileBloomInfo{
+		TotalBytes: len(raw),
+	}
+
+	// Wire: magic[4] + version[1] + col_count[4] = 9 bytes header.
+	if len(raw) < fileBloomMinLen {
+		return info
+	}
+	magic := binary.LittleEndian.Uint32(raw[0:])
+	if magic != shared.FileBloomMagic {
+		return info
+	}
+	if raw[4] != shared.FileBloomVersion {
+		return info
+	}
+	colCount := int(binary.LittleEndian.Uint32(raw[5:]))
+	pos := 9
+	for range colCount {
+		if pos+2 > len(raw) {
+			break
+		}
+		nameLen := int(binary.LittleEndian.Uint16(raw[pos:]))
+		pos += 2
+		if pos+nameLen > len(raw) {
+			break
+		}
+		name := string(raw[pos : pos+nameLen])
+		pos += nameLen
+		if pos+4 > len(raw) {
+			break
+		}
+		fuseLen := int(binary.LittleEndian.Uint32(raw[pos:]))
+		pos += 4
+		if pos+fuseLen > len(raw) {
+			break
+		}
+		pos += fuseLen
+		info.Columns = append(info.Columns, FileBloomColumnInfo{
+			ColumnName: name,
+			FuseBytes:  fuseLen,
 		})
 	}
 
-	pos += dedConsumed
+	slices.SortFunc(info.Columns, func(a, b FileBloomColumnInfo) int {
+		return cmp.Compare(a.ColumnName, b.ColumnName)
+	})
 
-	// Column index.
-	colIdxStart := pos
+	return info
+}
 
-	colConsumed, err := skipColumnIndex(data[pos:], blockCount)
-	if err != nil {
-		return nil, fmt.Errorf("skip column_index: %w", err)
+// formatIntrinsicBound decodes an encoded intrinsic column boundary to a human-readable string.
+// For ColumnTypeUint64 (span:duration, span:start) the bound is an 8-byte LE uint64.
+// For ColumnTypeInt64 the bound is an 8-byte LE int64.
+// For string/bytes types the bound is the raw string.
+func formatIntrinsicBound(colType shared.ColumnType, bound string) string {
+	if len(bound) == 0 {
+		return ""
 	}
-
-	pos += colConsumed
-
-	if colIdxSize := int64(pos - colIdxStart); colIdxSize > 0 {
-		sections = append(sections, FileLayoutSection{
-			Section:        "metadata.column_index",
-			Offset:         base + int64(colIdxStart), //nolint:gosec
-			CompressedSize: colIdxSize,
-			IsLogical:      isSnappyCompressed,
-		})
+	switch colType {
+	case shared.ColumnTypeUint64:
+		if len(bound) >= 8 {
+			v := binary.LittleEndian.Uint64([]byte(bound))
+			return fmt.Sprintf("%d", v)
+		}
+	case shared.ColumnTypeInt64:
+		if len(bound) >= 8 {
+			v := int64(binary.LittleEndian.Uint64([]byte(bound))) //nolint:gosec
+			return fmt.Sprintf("%d", v)
+		}
 	}
-
-	// Trace index: remaining bytes.
-	if traceIdxSize := int64(len(data) - pos); traceIdxSize > 0 {
-		sections = append(sections, FileLayoutSection{
-			Section:        "metadata.trace_index",
-			Offset:         base + int64(pos), //nolint:gosec
-			CompressedSize: traceIdxSize,
-			IsLogical:      isSnappyCompressed,
-		})
-	}
-
-	return sections, nil
+	return bound
 }
 
 // columnTypeName maps a ColumnType to its string name for layout reporting.
@@ -731,11 +863,17 @@ func inflatedZstdChunk(body []byte, pos int) (int64, int, error) {
 // files with many column chunks.
 func zstdStreamedSize(compressed []byte) (int64, error) {
 	dec := layoutDecoderPool.Get().(*zstd.Decoder)
-	defer layoutDecoderPool.Put(dec)
 	if err := dec.Reset(bytes.NewReader(compressed)); err != nil {
+		// Do not return a broken decoder to the pool; close it instead.
+		dec.Close()
 		return 0, err
 	}
 	n, err := io.Copy(io.Discard, dec)
+	if err == nil {
+		layoutDecoderPool.Put(dec)
+	} else {
+		dec.Close()
+	}
 	return n, err
 }
 

@@ -16,14 +16,9 @@ package blockpack
 import (
 	"encoding/hex"
 	"fmt"
-	"log/slog"
 	"math"
-	"strings"
-	"sync"
 
 	"github.com/grafana/blockpack/internal/logqlparser"
-	modules_blockio "github.com/grafana/blockpack/internal/modules/blockio"
-	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
 	modules_shared "github.com/grafana/blockpack/internal/modules/blockio/shared"
 	modules_executor "github.com/grafana/blockpack/internal/modules/executor"
 	modules_queryplanner "github.com/grafana/blockpack/internal/modules/queryplanner"
@@ -37,6 +32,13 @@ import (
 // SpanFieldsProvider gives access to all attributes for a single span row.
 // Use GetField for known attribute names, IterateFields to enumerate all.
 type SpanFieldsProvider = modules_shared.SpanFieldsProvider
+
+// QueryStats contains per-phase execution metrics returned by all query functions.
+// It replaces the LogQueryStats type and the OnStats callback pattern.
+type QueryStats = modules_executor.QueryStats
+
+// StepStats holds per-phase metrics for a single execution phase within a QueryStats.
+type StepStats = modules_executor.StepStats
 
 // QueryOptions configures query execution.
 type QueryOptions struct {
@@ -103,130 +105,6 @@ func normalizeTimeRange(startNano, endNano uint64) modules_queryplanner.TimeRang
 	return modules_queryplanner.TimeRange{MinNano: startNano, MaxNano: endNano}
 }
 
-// SpanMatch represents a single span that matched the query.
-// Fields is safe to retain after QueryTraceQL or QueryLogQL returns.
-type SpanMatch struct {
-	Fields  SpanFieldsProvider
-	TraceID string
-	SpanID  string
-}
-
-// kvField is a name-value pair used in materializedSpanFields.
-// NOTE-ALLOC-2: slice-backed materialization avoids map allocation in Clone.
-type kvField struct {
-	Value any
-	Name  string
-}
-
-// kvFieldSlicePool recycles []kvField backing arrays to reduce Clone allocations.
-// NOTE-ALLOC-2: pool holds *[]kvField so Reset clears slice length without losing capacity.
-var kvFieldSlicePool = sync.Pool{
-	New: func() any {
-		s := make([]kvField, 0, 32)
-		return &s
-	},
-}
-
-// Clone materializes all fields from the lazy provider and returns a deep copy
-// with stable ownership, safe to hold beyond any internal callback or function return.
-// If Fields is nil (e.g. structural queries), the clone has nil Fields.
-// NOTE-ALLOC-2: uses pooled []kvField backing slice instead of map[string]any.
-func (m *SpanMatch) Clone() SpanMatch {
-	out := SpanMatch{TraceID: m.TraceID, SpanID: m.SpanID}
-	if m.Fields == nil {
-		return out
-	}
-	// Get pooled backing slice, fill it, then transfer ownership to materializedSpanFields.
-	sp := kvFieldSlicePool.Get().(*[]kvField)
-	fields := (*sp)[:0]
-	m.Fields.IterateFields(func(name string, value any) bool {
-		fields = append(fields, kvField{Name: name, Value: value})
-		return true
-	})
-	// Copy into an exactly-sized owned slice for materializedSpanFields,
-	// then return the original pool slice (reset to len=0) for reuse.
-	// This ensures the pool backing array is actually reused across calls.
-	owned := make([]kvField, len(fields))
-	copy(owned, fields)
-	out.Fields = &materializedSpanFields{fields: owned}
-	*sp = fields[:0]
-	kvFieldSlicePool.Put(sp)
-	return out
-}
-
-// materializedSpanFields is a heap-allocated slice-backed SpanFieldsProvider
-// returned by SpanMatch.Clone(). Safe to hold beyond the callback lifetime.
-// NOTE-ALLOC-2: uses []kvField instead of map[string]any to avoid map overhead.
-type materializedSpanFields struct {
-	fields []kvField
-}
-
-// GetField is an O(n) linear scan. For typical span field counts (10–30),
-// this is faster than a map lookup due to cache locality.
-// See executor/NOTES.md NOTE-047 for the trade-off rationale.
-func (m *materializedSpanFields) GetField(name string) (any, bool) {
-	for i := range m.fields {
-		if m.fields[i].Name == name {
-			return m.fields[i].Value, true
-		}
-	}
-	return nil, false
-}
-
-func (m *materializedSpanFields) IterateFields(fn func(name string, value any) bool) {
-	for i := range m.fields {
-		if !fn(m.fields[i].Name, m.fields[i].Value) {
-			return
-		}
-	}
-}
-
-// filteredSpanFields wraps a SpanFieldsProvider and limits GetField / IterateFields
-// to a caller-specified column allowlist. Used to implement QueryOptions.SelectColumns.
-type filteredSpanFields struct {
-	inner   SpanFieldsProvider
-	allowed map[string]struct{}
-}
-
-func newFilteredSpanFields(inner SpanFieldsProvider, cols []string) *filteredSpanFields {
-	m := make(map[string]struct{}, len(cols))
-	for _, c := range cols {
-		m[c] = struct{}{}
-	}
-	return &filteredSpanFields{inner: inner, allowed: m}
-}
-
-func (f *filteredSpanFields) GetField(name string) (any, bool) {
-	if _, ok := f.allowed[name]; !ok {
-		return nil, false
-	}
-	return f.inner.GetField(name)
-}
-
-func (f *filteredSpanFields) IterateFields(fn func(name string, value any) bool) {
-	f.inner.IterateFields(func(name string, value any) bool {
-		if _, ok := f.allowed[name]; !ok {
-			return true // skip, but keep iterating
-		}
-		return fn(name, value)
-	})
-}
-
-// spanMatchFn is the internal callback type used by streaming query helpers.
-// match is valid only for the duration of the call; more=false signals end of results.
-type spanMatchFn func(match *SpanMatch, more bool) bool
-
-// QueryTraceQL executes a TraceQL query against a modules-format blockpack file
-// and returns all matching spans.
-//
-// Supported query types:
-//   - Filter expressions: `{ span.http.method = "GET" }`
-//   - Structural queries: `{ expr } OP { expr }` where OP is >>, >, ~, <<, <, !~
-//
-// For filter queries, each SpanMatch.Fields supports GetField and IterateFields.
-// For structural queries, SpanMatch.Fields is nil — only TraceID and SpanID are set.
-// Metrics queries return an error.
-
 // ColumnNames returns all column names known to this reader — the union of
 // range-indexed and sketch columns. Derived from file header metadata; no
 // block I/O is required. Returns a sorted slice of column name strings
@@ -237,6 +115,16 @@ func ColumnNames(r *Reader) []string {
 
 // QueryTraceQL executes a TraceQL query against a modules-format blockpack file
 // and returns all matching spans.
+//
+// Supported query types:
+//   - Filter expressions: `{ span.http.method = "GET" }`
+//   - Structural queries: `{ expr } OP { expr }` where OP is >>, >, ~, <<, <, !~
+//   - Pipeline queries: `{ filter } | aggregate() > threshold`
+//
+// For filter queries, each SpanMatch.Fields supports GetField and IterateFields.
+// For structural queries, SpanMatch.Fields is nil — only TraceID and SpanID are set.
+// Pipeline queries group matching spans into spansets, compute aggregates, and
+// filter by threshold before returning qualifying spans.
 func QueryTraceQL(r *Reader, traceqlQuery string, opts QueryOptions) (results []SpanMatch, err error) {
 	defer func() {
 		if rec := recover(); rec != nil {
@@ -300,384 +188,8 @@ func QueryTraceQL(r *Reader, traceqlQuery string, opts QueryOptions) (results []
 	return results, err
 }
 
-// emitAllSpans sends every span in allSpans to fn, honoring the given limit
-// (0 = unlimited). Calls fn(nil, false) as the terminal signal after the last span.
-func emitAllSpans(allSpans []SpanMatch, limit int, fn spanMatchFn) {
-	remaining := limit
-	for i := range allSpans {
-		if !fn(&allSpans[i], true) {
-			break
-		}
-		if remaining > 0 {
-			remaining--
-			if remaining == 0 {
-				break
-			}
-		}
-	}
-	fn(nil, false)
-}
-
-// SPEC-PA-4, SPEC-PA-5, SPEC-PA-6, SPEC-PA-7: streamPipelineQuery executes a TraceQL pipeline query
-// ({filter} | aggregate() > threshold).
-// It runs the filter part, groups matching spans into spansets by trace ID, applies the
-// aggregate function per spanset, filters by threshold, and emits qualifying spans.
-func streamPipelineQuery(r *Reader, mq *traceqlparser.MetricsQuery, opts QueryOptions, fn spanMatchFn) error {
-	// Compile and execute the filter part to get all matching spans.
-	program, compileErr := vm.CompileTraceQLFilter(mq.Filter)
-	if compileErr != nil {
-		return fmt.Errorf("compile pipeline filter: %w", compileErr)
-	}
-
-	// Run with no limit — we need all matching spans to compute aggregates.
-	filterOpts := opts
-	filterOpts.Limit = 0
-
-	var allSpans []SpanMatch
-	streamErr := streamFilterProgram(r, program, filterOpts, func(match *SpanMatch, more bool) bool {
-		if !more {
-			return false
-		}
-		allSpans = append(allSpans, match.Clone())
-		return true
-	})
-	if streamErr != nil {
-		return streamErr
-	}
-
-	const maxPipelineSpans = 1_000_000
-	if len(allSpans) > maxPipelineSpans {
-		return fmt.Errorf(
-			"pipeline query matched %d spans (max %d); narrow your filter",
-			len(allSpans),
-			maxPipelineSpans,
-		)
-	}
-
-	pipeline := mq.Pipeline
-
-	if pipeline == nil {
-		// No pipeline stages — emit all spans, respecting limit.
-		emitAllSpans(allSpans, opts.Limit, fn)
-		return nil
-	}
-
-	// If pipeline has no aggregate (just by/select), emit all spans, respecting limit.
-	if pipeline.Aggregate.Name == "" {
-		emitAllSpans(allSpans, opts.Limit, fn)
-		return nil
-	}
-
-	// Group spans by trace ID into spansets.
-	type spanset struct {
-		spans []int // indices into allSpans
-	}
-	traceGroups := make(map[string]*spanset)
-	traceOrder := make([]string, 0)
-	for i, sp := range allSpans {
-		tid := sp.TraceID
-		if tid == "" {
-			tid = "__no_trace_id__"
-		}
-		ss, ok := traceGroups[tid]
-		if !ok {
-			ss = &spanset{}
-			traceGroups[tid] = ss
-			traceOrder = append(traceOrder, tid)
-		}
-		ss.spans = append(ss.spans, i)
-	}
-
-	// Compute aggregate per spanset and filter by threshold.
-	aggName := pipeline.Aggregate.Name
-	aggField := pipeline.Aggregate.Field
-
-	// Track limit globally across all traces, not per-trace.
-	limit := opts.Limit
-	for _, tid := range traceOrder {
-		ss := traceGroups[tid]
-
-		aggVal, ok := computeSpansetAggregate(aggName, aggField, ss.spans, allSpans)
-		if !ok {
-			continue
-		}
-
-		if pipeline.HasThreshold {
-			if !compareThreshold(aggVal, pipeline.ThresholdOp, pipeline.ThresholdVal) {
-				continue
-			}
-		}
-
-		// Emit all spans from this qualifying spanset.
-		for _, idx := range ss.spans {
-			if !fn(&allSpans[idx], true) {
-				fn(nil, false)
-				return nil
-			}
-			if limit > 0 {
-				limit--
-				if limit == 0 {
-					fn(nil, false)
-					return nil
-				}
-			}
-		}
-	}
-
-	fn(nil, false)
-	return nil
-}
-
-// SPEC-PA-1, SPEC-PA-2, SPEC-PA-3: computeSpansetAggregate computes an aggregate value over a spanset.
-func computeSpansetAggregate(aggName, aggField string, indices []int, allSpans []SpanMatch) (float64, bool) {
-	switch aggName {
-	case "count", "count_over_time":
-		return float64(len(indices)), true
-
-	case "avg", "min", "max", "sum":
-		var values []float64
-		for _, idx := range indices {
-			v, ok := getSpanFieldNumeric(allSpans[idx], aggField)
-			if ok {
-				values = append(values, v)
-			}
-		}
-		if len(values) == 0 {
-			return 0, false
-		}
-		switch aggName {
-		case "avg":
-			sum := 0.0
-			for _, v := range values {
-				sum += v
-			}
-			return sum / float64(len(values)), true
-		case "min":
-			minVal := values[0]
-			for _, v := range values[1:] {
-				if v < minVal {
-					minVal = v
-				}
-			}
-			return minVal, true
-		case "max":
-			maxVal := values[0]
-			for _, v := range values[1:] {
-				if v > maxVal {
-					maxVal = v
-				}
-			}
-			return maxVal, true
-		case "sum":
-			sum := 0.0
-			for _, v := range values {
-				sum += v
-			}
-			return sum, true
-		}
-	default:
-		slog.Warn("unsupported aggregate in pipeline query", "aggregate", aggName)
-	}
-	return 0, false
-}
-
-// SPEC-PA-1: getSpanFieldNumeric extracts a numeric value from a span's fields.
-// It matches fieldName exactly first, then falls back to unscoped/scoped variants
-// (e.g. "duration" matches "span:duration", and "span.duration" matches "duration").
-func getSpanFieldNumeric(sp SpanMatch, fieldName string) (float64, bool) {
-	if sp.Fields == nil {
-		return 0, false
-	}
-	var result float64
-	var found bool
-	sp.Fields.IterateFields(func(name string, value any) bool {
-		if !fieldNameMatches(name, fieldName) {
-			return true
-		}
-		switch v := value.(type) {
-		case int64:
-			result = float64(v)
-			found = true
-		case uint64:
-			result = float64(v)
-			found = true
-		case float64:
-			result = v
-			found = true
-		case int:
-			result = float64(v)
-			found = true
-		}
-		return false // stop iteration
-	})
-	return result, found
-}
-
-// fieldNameMatches returns true if emitted matches the requested field name,
-// accounting for scope prefix differences (e.g. "span:duration" vs "duration",
-// "span.http.method" vs "http.method").
-func fieldNameMatches(emitted, requested string) bool {
-	if emitted == requested {
-		return true
-	}
-	// Try stripping "span:" or "span." prefix from emitted name.
-	for _, prefix := range []string{"span:", "span."} {
-		if strings.HasPrefix(emitted, prefix) {
-			if emitted[len(prefix):] == requested {
-				return true
-			}
-		}
-		if strings.HasPrefix(requested, prefix) {
-			if requested[len(prefix):] == emitted {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// compareThreshold compares an aggregate value against a threshold.
-func compareThreshold(aggVal float64, op traceqlparser.BinaryOp, threshold interface{}) bool {
-	var thresholdF float64
-	switch v := threshold.(type) {
-	case int64:
-		thresholdF = float64(v)
-	case float64:
-		thresholdF = v
-	default:
-		return false
-	}
-
-	switch op {
-	case traceqlparser.OpGt:
-		return aggVal > thresholdF
-	case traceqlparser.OpGte:
-		return aggVal >= thresholdF
-	case traceqlparser.OpLt:
-		return aggVal < thresholdF
-	case traceqlparser.OpLte:
-		return aggVal <= thresholdF
-	case traceqlparser.OpEq:
-		return math.Abs(aggVal-thresholdF) < 1e-9
-	case traceqlparser.OpNeq:
-		return math.Abs(aggVal-thresholdF) >= 1e-9
-	default:
-		return false
-	}
-}
-
-// streamFilterQuery executes a TraceQL filter query against a modules-format reader.
-func streamFilterQuery(r *Reader, filterExpr *traceqlparser.FilterExpression, opts QueryOptions, fn spanMatchFn) error {
-	program, compileErr := vm.CompileTraceQLFilter(filterExpr)
-	if compileErr != nil {
-		return fmt.Errorf("compile TraceQL filter: %w", compileErr)
-	}
-
-	return streamFilterProgram(r, program, opts, fn)
-}
-
-// streamFilterProgram executes a compiled filter program against a modules-format reader.
-func streamFilterProgram(r *Reader, program *vm.Program, opts QueryOptions, fn spanMatchFn) error {
-	// SPEC-STREAM-8: MostRecent maps to Backward direction with span:start timestamp sorting.
-	// span:start is always present in searchMetaColumns so no extra I/O is needed.
-	// When MostRecent+Limit, Collect gives globally top-K results by span:start.
-	collectOpts := modules_executor.CollectOptions{
-		TimeRange:  normalizeTimeRange(opts.StartNano, opts.EndNano),
-		Limit:      opts.Limit,
-		StartBlock: opts.StartBlock,
-		BlockCount: opts.BlockCount,
-		// NOTE-028: AllColumns defaults to false — for Collect this means the second pass decodes only
-		// searchMetaColumns ∪ predicate columns.
-	}
-	if opts.MostRecent {
-		collectOpts.Direction = modules_queryplanner.Backward
-		collectOpts.TimestampColumn = "span:start"
-	}
-	rows, err := modules_executor.Collect(r, program, collectOpts)
-	if err != nil {
-		return err
-	}
-	// Intrinsic ID maps are built lazily: only constructed on the first block-scan result
-	// row where the block columns lack trace:id / span:id. For dual-storage files (PR #174+)
-	// these columns are present in block payloads and the maps are never needed.
-	var traceIDByRef map[uint32][]byte
-	var spanIDByRef map[uint32][]byte
-	// Separate "attempted" flags prevent repeated calls to buildIntrinsicBytesMap when
-	// it returns nil (e.g. no intrinsic section). Without these flags, every row would
-	// re-invoke the expensive O(N) map-build path and still get nil back.
-	var traceIDMapAttempted bool
-	var spanIDMapAttempted bool
-	buildIDMaps := func() {
-		if !traceIDMapAttempted {
-			traceIDMapAttempted = true
-			traceIDByRef = buildIntrinsicBytesMap(r, "trace:id")
-		}
-		if !spanIDMapAttempted {
-			spanIDMapAttempted = true
-			spanIDByRef = buildIntrinsicBytesMap(r, "span:id")
-		}
-	}
-	for _, row := range rows {
-		var fields SpanFieldsProvider
-		var traceIDHex, spanIDHex string
-		var rawAdapter SpanFieldsProvider // tracked for pool release
-		if row.IntrinsicFields != nil {
-			// Intrinsic fast path — fields resolved from intrinsic columns, no block read.
-			fields = row.IntrinsicFields
-			if v, ok := fields.GetField("trace:id"); ok {
-				traceIDHex = hexEncodeField(v)
-			}
-			if v, ok := fields.GetField("span:id"); ok {
-				spanIDHex = hexEncodeField(v)
-			}
-		} else {
-			rawAdapter = modules_blockio.NewSpanFieldsAdapterWithReader(row.Block, r, row.BlockIdx, row.RowIdx)
-			fields = rawAdapter
-			// For dual-storage blocks, trace:id and span:id are in block columns — extractIDs
-			// will find them there without using the fallback maps. Build maps lazily only on
-			// the first miss, avoiding the expensive O(N) buildIntrinsicBytesMap for new files.
-			if row.Block == nil ||
-				row.Block.GetColumn("trace:id") == nil ||
-				row.Block.GetColumn("span:id") == nil {
-				buildIDMaps()
-			}
-			traceIDHex, spanIDHex = extractIDs(row.Block, row.RowIdx, row.BlockIdx, traceIDByRef, spanIDByRef)
-		}
-		if len(opts.SelectColumns) > 0 {
-			fields = newFilteredSpanFields(fields, opts.SelectColumns)
-		}
-		match := &SpanMatch{Fields: fields, TraceID: traceIDHex, SpanID: spanIDHex}
-		if !fn(match, true) {
-			// NOTE-ALLOC-4: release adapter back to pool after callback returns.
-			modules_blockio.ReleaseSpanFieldsAdapter(rawAdapter)
-			break
-		}
-		// NOTE-ALLOC-4: release adapter back to pool after callback returns.
-		modules_blockio.ReleaseSpanFieldsAdapter(rawAdapter)
-	}
-	fn(nil, false)
-	return nil
-}
-
-// LogQueryStats contains block selection and I/O statistics for a log query.
-// Reported via LogQueryOptions.OnStats after query execution completes.
-type LogQueryStats struct {
-	Explain        string // ASCII trace of predicate tree → block set resolution
-	TotalBlocks    int    // total blocks in the file
-	PrunedByTime   int    // blocks eliminated by time-range comparison
-	PrunedByIndex  int    // blocks eliminated by range index lookups
-	PrunedByFuse   int    // blocks eliminated by BinaryFuse8 membership checks
-	PrunedByCMS    int    // blocks eliminated by Count-Min Sketch zero-estimate checks
-	SelectedBlocks int    // blocks selected for reading after all pruning
-	FetchedBlocks  int    // blocks actually fetched (≤ SelectedBlocks when limit causes early stop)
-}
-
 // LogQueryOptions configures log query execution.
 type LogQueryOptions struct {
-	// OnStats is an optional callback invoked after query execution with block
-	// selection and I/O statistics. FetchedBlocks reflects actual I/O done,
-	// which is less than SelectedBlocks when a Limit causes early termination.
-	OnStats   func(LogQueryStats)
 	StartNano uint64 // Inclusive start (unix nanos); 0 = no lower bound.
 	EndNano   uint64 // Inclusive end (unix nanos); 0 = no upper bound.
 	Limit     int    // Max matches; 0 = unlimited.
@@ -705,7 +217,7 @@ type LogQueryOptions struct {
 // label columns (e.g. GetField("service.name") returns ""). Callers needing
 // the full resource label set should parse the resource.__loki_labels__ string,
 // or use QueryTraceQL which uses SpanFieldsAdapter with lazy full-column access.
-func QueryLogQL(r *Reader, logqlQuery string, opts LogQueryOptions) (results []SpanMatch, err error) {
+func QueryLogQL(r *Reader, logqlQuery string, opts LogQueryOptions) (results []SpanMatch, qs QueryStats, err error) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			err = fmt.Errorf("internal error in QueryLogQL: %v", rec)
@@ -713,17 +225,17 @@ func QueryLogQL(r *Reader, logqlQuery string, opts LogQueryOptions) (results []S
 	}()
 
 	if r == nil {
-		return nil, fmt.Errorf("QueryLogQL: reader cannot be nil")
+		return nil, QueryStats{}, fmt.Errorf("QueryLogQL: reader cannot be nil")
 	}
 
 	sel, parseErr := logqlparser.Parse(logqlQuery)
 	if parseErr != nil {
-		return nil, fmt.Errorf("parse LogQL: %w", parseErr)
+		return nil, QueryStats{}, fmt.Errorf("parse LogQL: %w", parseErr)
 	}
 
 	program, pipeline, compileErr := logqlparser.CompileAll(sel)
 	if compileErr != nil {
-		return nil, fmt.Errorf("compile LogQL: %w", compileErr)
+		return nil, QueryStats{}, fmt.Errorf("compile LogQL: %w", compileErr)
 	}
 
 	collector := func(match *SpanMatch, more bool) bool {
@@ -735,125 +247,11 @@ func QueryLogQL(r *Reader, logqlQuery string, opts LogQueryOptions) (results []S
 	}
 
 	if pipeline != nil {
-		err = streamLogQLWithPipeline(r, program, pipeline, opts, collector)
+		qs, err = streamLogQLWithPipeline(r, program, pipeline, opts, collector)
 	} else {
-		err = streamLogProgram(r, program, opts, collector)
+		qs, err = streamLogProgram(r, program, opts, collector)
 	}
-	return results, err
-}
-
-// streamLogQLWithPipeline streams log entries applying a compiled pipeline.
-// Delegates to CollectLogs which uses a heap with block-level timestamp pruning
-// for limited queries, and a collect-sort-deliver path for unlimited queries.
-func streamLogQLWithPipeline(
-	r *Reader,
-	program *vm.Program,
-	pipeline *logqlparser.Pipeline,
-	opts LogQueryOptions,
-	fn spanMatchFn,
-) error {
-	direction := modules_queryplanner.Backward
-	if opts.Forward {
-		direction = modules_queryplanner.Forward
-	}
-
-	entries, err := modules_executor.CollectLogs(
-		r,
-		program,
-		pipeline,
-		modules_executor.CollectOptions{
-			Limit:     opts.Limit,
-			TimeRange: modules_queryplanner.TimeRange{MinNano: opts.StartNano, MaxNano: opts.EndNano},
-			Direction: direction,
-			OnStats: func(s modules_executor.CollectStats) {
-				if opts.OnStats != nil {
-					opts.OnStats(LogQueryStats{
-						TotalBlocks:    s.TotalBlocks,
-						PrunedByTime:   s.PrunedByTime,
-						PrunedByIndex:  s.PrunedByIndex,
-						PrunedByFuse:   s.PrunedByFuse,
-						PrunedByCMS:    s.PrunedByCMS,
-						SelectedBlocks: s.SelectedBlocks,
-						FetchedBlocks:  s.FetchedBlocks,
-						Explain:        s.Explain,
-					})
-				}
-			},
-		},
-	)
-	if err != nil {
-		return err
-	}
-	for _, entry := range entries {
-		match := &SpanMatch{Fields: &logEntryFields{
-			lokiLabels: entry.LokiLabels,
-			logAttrs:   entry.LogAttrs,
-			line:       entry.Line,
-			timestamp:  entry.TimestampNanos,
-		}}
-		if !fn(match, true) {
-			break
-		}
-	}
-	fn(nil, false)
-	return nil
-}
-
-// logEntryFields adapts a log entry to SpanFieldsProvider.
-// lokiLabels is the raw resource.__loki_labels__ string (stream selector).
-// logAttrs holds log.* ColumnTypeString values as parallel name/value slices
-// (e.g. Names=["log.detected_level"]) so extractStructuredMetadata can find them via
-// the "log." prefix. IterateFields emits only these three sets — no full
-// resource-label map is built per row.
-//
-// NOTE: This exposes a reduced field set compared to SpanFieldsAdapter (used by the
-// trace query path via streamFilterProgram). SpanFieldsAdapter lazily resolves any
-// column by full name; logEntryFields only exposes log:body, log:timestamp,
-// resource.__loki_labels__, and log.* ColumnTypeString attributes. This is intentional:
-// the log pipeline path (streamLogQLWithPipeline) materializes only the fields that
-// downstream consumers (the LokiConverter) actually need. Callers requiring full
-// column access should use QueryTraceQL or the streamFilterProgram path instead.
-type logEntryFields struct {
-	lokiLabels string
-	line       string
-	logAttrs   modules_executor.LogAttrs
-	timestamp  uint64
-}
-
-func (f *logEntryFields) GetField(name string) (any, bool) {
-	switch name {
-	case "log:body":
-		return f.line, true
-	case "log:timestamp":
-		return f.timestamp, true
-	case "resource.__loki_labels__":
-		return f.lokiLabels, true
-	}
-	for i, n := range f.logAttrs.Names {
-		if n == name {
-			return f.logAttrs.Values[i], true
-		}
-	}
-	return "", false
-}
-
-func (f *logEntryFields) IterateFields(fn func(name string, value any) bool) {
-	if !fn("log:body", f.line) {
-		return
-	}
-	if !fn("log:timestamp", f.timestamp) {
-		return
-	}
-	if f.lokiLabels != "" {
-		if !fn("resource.__loki_labels__", f.lokiLabels) {
-			return
-		}
-	}
-	for i, k := range f.logAttrs.Names {
-		if !fn(k, f.logAttrs.Values[i]) {
-			return
-		}
-	}
+	return results, qs, err
 }
 
 // LogMetricsResult is the output of ExecuteMetricsLogQL.
@@ -1050,138 +448,3 @@ func ExecuteMetricsTraceQL(r *Reader, query string, opts TraceMetricOptions) (re
 
 	return modules_executor.ExecuteTraceMetrics(r, prog, spec)
 }
-
-// streamLogProgram executes a compiled log program against a modules-format reader.
-// Blocks are fetched lazily in ~8 MB coalesced batches; fetching stops once opts.Limit
-// matches have been delivered, so I/O is proportional to results returned.
-func streamLogProgram(r *Reader, program *vm.Program, opts LogQueryOptions, fn spanMatchFn) error {
-	direction := modules_queryplanner.Backward
-	if opts.Forward {
-		direction = modules_queryplanner.Forward
-	}
-	rows, err := modules_executor.Collect(
-		r,
-		program,
-		modules_executor.CollectOptions{
-			Limit:           opts.Limit,
-			TimeRange:       modules_queryplanner.TimeRange{MinNano: opts.StartNano, MaxNano: opts.EndNano},
-			Direction:       direction,
-			TimestampColumn: "log:timestamp",
-			OnStats: func(s modules_executor.CollectStats) {
-				if opts.OnStats != nil {
-					opts.OnStats(LogQueryStats{
-						TotalBlocks:    s.TotalBlocks,
-						PrunedByTime:   s.PrunedByTime,
-						PrunedByIndex:  s.PrunedByIndex,
-						PrunedByFuse:   s.PrunedByFuse,
-						PrunedByCMS:    s.PrunedByCMS,
-						SelectedBlocks: s.SelectedBlocks,
-						FetchedBlocks:  s.FetchedBlocks,
-						Explain:        s.Explain,
-					})
-				}
-			},
-		},
-	)
-	if err != nil {
-		return err
-	}
-	// Pre-build intrinsic ID lookup maps for the block-scan path. These are used as a
-	// fallback when trace:id / span:id are absent from block columns (intrinsic-only storage).
-	// GetIntrinsicColumn is cached after first load so this is cheap on subsequent calls.
-	logTraceIDByRef := buildIntrinsicBytesMap(r, "trace:id")
-	logSpanIDByRef := buildIntrinsicBytesMap(r, "span:id")
-	for _, row := range rows {
-		var fields SpanFieldsProvider
-		var traceIDHex, spanIDHex string
-		var rawAdapter SpanFieldsProvider // tracked for pool release
-		if row.IntrinsicFields != nil {
-			fields = row.IntrinsicFields
-			if v, ok := fields.GetField("trace:id"); ok {
-				traceIDHex = hexEncodeField(v)
-			}
-			if v, ok := fields.GetField("span:id"); ok {
-				spanIDHex = hexEncodeField(v)
-			}
-		} else {
-			rawAdapter = modules_blockio.NewSpanFieldsAdapterWithReader(row.Block, r, row.BlockIdx, row.RowIdx)
-			fields = rawAdapter
-			traceIDHex, spanIDHex = extractIDs(row.Block, row.RowIdx, row.BlockIdx, logTraceIDByRef, logSpanIDByRef)
-		}
-		match := &SpanMatch{Fields: fields, TraceID: traceIDHex, SpanID: spanIDHex}
-		if !fn(match, true) {
-			// NOTE-ALLOC-4: release adapter back to pool after callback returns.
-			modules_blockio.ReleaseSpanFieldsAdapter(rawAdapter)
-			break
-		}
-		// NOTE-ALLOC-4: release adapter back to pool after callback returns.
-		modules_blockio.ReleaseSpanFieldsAdapter(rawAdapter)
-	}
-	fn(nil, false)
-	return nil
-}
-
-// extractIDs extracts hex-encoded trace ID and span ID strings from a block row.
-// Falls back to intrinsic section lookup maps when block columns are absent
-// (intrinsic-only storage after dual-storage removal).
-func extractIDs(
-	block *modules_reader.Block, rowIdx int, blockIdx int,
-	traceIDByRef, spanIDByRef map[uint32][]byte,
-) (traceID, spanID string) {
-	if block != nil {
-		if col := block.GetColumn("trace:id"); col != nil {
-			if v, ok := col.BytesValue(rowIdx); ok {
-				traceID = hex.EncodeToString(v)
-			}
-		}
-		if col := block.GetColumn("span:id"); col != nil {
-			if v, ok := col.BytesValue(rowIdx); ok {
-				spanID = hex.EncodeToString(v)
-			}
-		}
-	}
-	// Fall back to intrinsic section when block columns are absent.
-	key := uint32(blockIdx)<<16 | uint32(rowIdx) //nolint:gosec // blockIdx and rowIdx are bounded
-	if traceID == "" {
-		if v, ok := traceIDByRef[key]; ok {
-			traceID = hex.EncodeToString(v)
-		}
-	}
-	if spanID == "" {
-		if v, ok := spanIDByRef[key]; ok {
-			spanID = hex.EncodeToString(v)
-		}
-	}
-	return traceID, spanID
-}
-
-// buildIntrinsicBytesMap builds a packed-key → bytes lookup map from an intrinsic flat column.
-// Key encoding: uint32(blockIdx)<<16 | uint32(rowIdx). Returns nil if the column is absent.
-func buildIntrinsicBytesMap(r *modules_reader.Reader, colName string) map[uint32][]byte {
-	col, err := r.GetIntrinsicColumn(colName)
-	if err != nil || col == nil || len(col.BytesValues) == 0 {
-		return nil
-	}
-	m := make(map[uint32][]byte, len(col.BlockRefs))
-	for i, ref := range col.BlockRefs {
-		if i < len(col.BytesValues) {
-			key := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx) //nolint:gosec // ref values are bounded
-			m[key] = col.BytesValues[i]
-		}
-	}
-	return m
-}
-
-// hexEncodeField converts a field value (string or []byte) to a hex string.
-// Used for trace:id and span:id which are stored as bytes in intrinsic columns.
-func hexEncodeField(v any) string {
-	switch b := v.(type) {
-	case string:
-		return b
-	case []byte:
-		return hex.EncodeToString(b)
-	}
-	return ""
-}
-
-// FileLayoutReport is the top-level result of AnalyzeFileLayout.

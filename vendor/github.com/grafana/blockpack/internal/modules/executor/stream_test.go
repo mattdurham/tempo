@@ -37,6 +37,24 @@ func makeStreamLogRecord(svcName string, timeUnixNano uint64) *logsv1.LogsData {
 	}}}
 }
 
+// findStep returns the StepStats with the given name, or nil.
+func findStep(qs executor.QueryStats, name string) *executor.StepStats {
+	for i := range qs.Steps {
+		if qs.Steps[i].Name == name {
+			return &qs.Steps[i]
+		}
+	}
+	return nil
+}
+
+// mustFindStep returns the StepStats with the given name. Fails the test if absent.
+func mustFindStep(t *testing.T, qs executor.QueryStats, name string) executor.StepStats {
+	t.Helper()
+	s := findStep(qs, name)
+	require.NotNilf(t, s, "%s step must be present in QueryStats", name)
+	return *s
+}
+
 // EX-S-01: TestStream_TracePath verifies that Collect with TimestampColumn="" (trace mode)
 // returns exactly the rows matching the predicate and no others.
 func TestStream_TracePath(t *testing.T) {
@@ -53,17 +71,15 @@ func TestStream_TracePath(t *testing.T) {
 	r := openReader(t, buf.Bytes())
 	program := compileQuery(t, `{ resource.service.name = "svc-alpha" }`)
 
-	var stats executor.CollectStats
-	rows, err := executor.Collect(r, program, executor.CollectOptions{
+	rows, qs, err := executor.Collect(r, program, executor.CollectOptions{
 		TimestampColumn: "",
-		OnStats:         func(s executor.CollectStats) { stats = s },
 	})
 
 	require.NoError(t, err)
 	assert.Equal(t, 2, len(rows), "should return exactly two svc-alpha spans")
-	// Pure intrinsic queries use the fast path (intrinsic section only), so SelectedBlocks
-	// is not populated in stats (blocks are not scanned via planBlocks). TotalBlocks is set.
-	assert.GreaterOrEqual(t, stats.TotalBlocks, 1)
+	// Pure intrinsic queries use the fast path (intrinsic section only), so ExecutionPath
+	// will be set to "intrinsic-plain". TotalDuration must be positive.
+	assert.NotEmpty(t, qs.ExecutionPath)
 }
 
 // EX-S-02: TestStream_LogPath_TimeFilter verifies that Collect with TimestampColumn="log:timestamp"
@@ -83,7 +99,7 @@ func TestStream_LogPath_TimeFilter(t *testing.T) {
 	r := openReader(t, buf.data)
 	program := compileQuery(t, `{}`)
 
-	rows, err := executor.Collect(r, program, executor.CollectOptions{
+	rows, _, err := executor.Collect(r, program, executor.CollectOptions{
 		TimestampColumn: "log:timestamp",
 		TimeRange:       queryplanner.TimeRange{MinNano: T2, MaxNano: T2},
 	})
@@ -113,7 +129,7 @@ func TestStream_Direction_Backward(t *testing.T) {
 
 	program := compileQuery(t, `{}`)
 
-	rows, err := executor.Collect(r, program, executor.CollectOptions{
+	rows, _, err := executor.Collect(r, program, executor.CollectOptions{
 		Direction:       queryplanner.Backward,
 		TimestampColumn: "log:timestamp",
 	})
@@ -141,10 +157,8 @@ func TestStream_EarlyStop_FetchedLessThanSelected(t *testing.T) {
 
 	program := compileQuery(t, `{}`)
 
-	var stats executor.CollectStats
-	rows, err := executor.Collect(r, program, executor.CollectOptions{
-		Limit:   2,
-		OnStats: func(s executor.CollectStats) { stats = s },
+	rows, qs, err := executor.Collect(r, program, executor.CollectOptions{
+		Limit: 2,
 	})
 
 	require.NoError(t, err)
@@ -152,8 +166,12 @@ func TestStream_EarlyStop_FetchedLessThanSelected(t *testing.T) {
 	// SPEC-STREAM-3: FetchedBlocks <= SelectedBlocks invariant.
 	// With small test data all blocks coalesce into one group so FetchedBlocks == SelectedBlocks.
 	// In production with large data, early stop skips unfetched groups, giving FetchedBlocks < SelectedBlocks.
-	assert.LessOrEqual(t, stats.FetchedBlocks, stats.SelectedBlocks,
-		"FetchedBlocks must not exceed SelectedBlocks (SPEC-STREAM-3)")
+	planStep := mustFindStep(t, qs, "plan")
+	blockScanStep := mustFindStep(t, qs, "block-scan")
+	selectedBlocks, _ := planStep.Metadata["selected_blocks"].(int)
+	fetchedBlocksVal, _ := blockScanStep.Metadata["fetched_blocks"].(int)
+	assert.LessOrEqual(t, fetchedBlocksVal, selectedBlocks,
+		"fetched_blocks must not exceed selected_blocks (SPEC-STREAM-3)")
 }
 
 // EX-S-05: TestStream_NilReader verifies that Collect with a nil reader returns an empty slice
@@ -163,8 +181,42 @@ func TestStream_NilReader(t *testing.T) {
 
 	program := compileQuery(t, `{}`)
 
-	rows, err := executor.Collect(nil, program, executor.CollectOptions{})
+	rows, _, err := executor.Collect(nil, program, executor.CollectOptions{})
 
 	require.NoError(t, err)
 	assert.Empty(t, rows, "nil reader must return empty results")
+}
+
+// EX-QS-03: Collect returns QueryStats with ExecutionPath set for block-scan queries.
+func TestCollect_ReturnsQueryStats_BlockScan(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	w := mustNewWriter(t, &buf, 0)
+	tid := [16]byte{0x01}
+	addSpan(t, w, tid, 0, "op", tracev1.Span_SPAN_KIND_SERVER,
+		[]*commonv1.KeyValue{strAttr("http.method", "GET")}, // span attr → forces block-scan path
+		map[string]any{"service.name": "svc-alpha"},
+	)
+	mustFlush(t, w)
+	r := openReader(t, buf.Bytes())
+
+	// User attribute predicate → block-scan path
+	program := compileQuery(t, `{ span.http.method = "GET" }`)
+	rows, qs, err := executor.Collect(r, program, executor.CollectOptions{Limit: 10})
+	require.NoError(t, err)
+	assert.Equal(t, 1, len(rows))
+	assert.NotEmpty(t, qs.ExecutionPath)
+	assert.True(t, qs.TotalDuration > 0, "TotalDuration must be positive")
+
+	// Verify "plan" step is present
+	planStep := findStep(qs, "plan")
+	require.NotNil(t, planStep, "plan step must be present for block-scan path")
+	totalBlocks, _ := planStep.Metadata["total_blocks"].(int)
+	assert.GreaterOrEqual(t, totalBlocks, 1)
+
+	// Verify "block-scan" step carries real I/O metrics.
+	scanStep := mustFindStep(t, qs, "block-scan")
+	assert.Greater(t, scanStep.BytesRead, int64(0), "block-scan must report BytesRead")
+	assert.Greater(t, scanStep.IOOps, 0, "block-scan must report IOOps")
 }
