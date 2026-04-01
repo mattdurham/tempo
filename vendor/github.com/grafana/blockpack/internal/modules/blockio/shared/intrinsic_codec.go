@@ -927,7 +927,12 @@ func parsePagedBlobHeader(blob []byte) (PagedIntrinsicTOC, int, bool) {
 // pageRaw is the decompressed page; refsStart is the byte offset where the refs
 // section begins (used as the end-of-values boundary); rowCount is the number of rows.
 // Returns (startIdx, endIdx) where startIdx == -1 means no rows matched.
-func findRangeBoundaries(pageRaw []byte, refsStart, rowCount int, lo, hi uint64, hasLo, hasHi bool) (startIdx, endIdx int) {
+func findRangeBoundaries(
+	pageRaw []byte,
+	refsStart, rowCount int,
+	lo, hi uint64,
+	hasLo, hasHi bool,
+) (startIdx, endIdx int) {
 	var acc uint64
 	startIdx = -1
 	endIdx = rowCount

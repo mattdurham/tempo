@@ -387,7 +387,9 @@ func TestPredicates_LogIntrinsic_ProducesLeafRangeNode(t *testing.T) {
 // TC-OR-01: same-column OR equality compiles without error and produces a ColumnPredicate.
 // The predicate is non-nil, indicating gatherOrEqualAny collapsed the OR tree.
 func TestCompiler_SameColumnOREquality_CompilesOK(t *testing.T) {
-	prog, err := CompileTraceQLFilter(mustParseFilter(t, `{ resource.service.name = "grafana" || resource.service.name = "loki" }`))
+	prog, err := CompileTraceQLFilter(
+		mustParseFilter(t, `{ resource.service.name = "grafana" || resource.service.name = "loki" }`),
+	)
 	require.NoError(t, err)
 	require.NotNil(t, prog.ColumnPredicate, "same-column OR must produce a ColumnPredicate")
 }
@@ -395,14 +397,21 @@ func TestCompiler_SameColumnOREquality_CompilesOK(t *testing.T) {
 // TC-OR-02: three-arm same-column OR compiles successfully.
 // Note: flattenORLeaves (nested OR composite handling) lives in predicates.go, not the compiler.
 func TestCompiler_ThreeArmSameColumnOR_CompilesOK(t *testing.T) {
-	prog, err := CompileTraceQLFilter(mustParseFilter(t, `{ resource.service.name = "a" || resource.service.name = "b" || resource.service.name = "c" }`))
+	prog, err := CompileTraceQLFilter(
+		mustParseFilter(
+			t,
+			`{ resource.service.name = "a" || resource.service.name = "b" || resource.service.name = "c" }`,
+		),
+	)
 	require.NoError(t, err)
 	require.NotNil(t, prog.ColumnPredicate, "three-arm same-column OR must compile successfully")
 }
 
 // TC-OR-03: mixed-column OR also compiles (falls back to union path, no ScanEqualAny).
 func TestCompiler_MixedColumnOR_CompilesOK(t *testing.T) {
-	prog, err := CompileTraceQLFilter(mustParseFilter(t, `{ resource.service.name = "grafana" || span.http.method = "GET" }`))
+	prog, err := CompileTraceQLFilter(
+		mustParseFilter(t, `{ resource.service.name = "grafana" || span.http.method = "GET" }`),
+	)
 	require.NoError(t, err)
 	require.NotNil(t, prog.ColumnPredicate, "mixed-column OR must compile successfully")
 }

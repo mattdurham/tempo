@@ -40,11 +40,9 @@ func TestCollect_SubFileShard_RestrictsBlocks(t *testing.T) {
 	program := compileQuery(t, `{ resource.service.name = "svc" }`)
 
 	// Shard: blocks [2, 4) — should return exactly 2 rows.
-	var stats executor.CollectStats
-	rows, err := executor.Collect(r, program, executor.CollectOptions{
+	rows, qs, err := executor.Collect(r, program, executor.CollectOptions{
 		StartBlock: 2,
 		BlockCount: 2,
-		OnStats:    func(s executor.CollectStats) { stats = s },
 	})
 
 	require.NoError(t, err)
@@ -53,7 +51,9 @@ func TestCollect_SubFileShard_RestrictsBlocks(t *testing.T) {
 		assert.GreaterOrEqual(t, row.BlockIdx, 2)
 		assert.Less(t, row.BlockIdx, 4)
 	}
-	assert.Equal(t, 6, stats.TotalBlocks, "TotalBlocks reflects entire file")
+	planStep := findStep(qs, "plan")
+	require.NotNil(t, planStep, "plan step must be present")
+	assert.Equal(t, 6, planStep.Metadata["total_blocks"], "TotalBlocks reflects entire file")
 }
 
 // EX-SHARD-02: Collect with BlockCount=0 (no sharding) returns all blocks.
@@ -64,7 +64,7 @@ func TestCollect_SubFileShard_ZeroMeansAll(t *testing.T) {
 	r := openReader(t, data)
 	program := compileQuery(t, `{ resource.service.name = "svc" }`)
 
-	rows, err := executor.Collect(r, program, executor.CollectOptions{
+	rows, _, err := executor.Collect(r, program, executor.CollectOptions{
 		StartBlock: 0,
 		BlockCount: 0,
 	})
@@ -81,7 +81,7 @@ func TestCollect_SubFileShard_BeyondRange(t *testing.T) {
 	r := openReader(t, data)
 	program := compileQuery(t, `{ resource.service.name = "svc" }`)
 
-	rows, err := executor.Collect(r, program, executor.CollectOptions{
+	rows, _, err := executor.Collect(r, program, executor.CollectOptions{
 		StartBlock: 10,
 		BlockCount: 5,
 	})
@@ -98,7 +98,7 @@ func TestCollect_SubFileShard_WithLimit(t *testing.T) {
 	r := openReader(t, data)
 	program := compileQuery(t, `{ resource.service.name = "svc" }`)
 
-	rows, err := executor.Collect(r, program, executor.CollectOptions{
+	rows, _, err := executor.Collect(r, program, executor.CollectOptions{
 		StartBlock: 0,
 		BlockCount: 4,
 		Limit:      2,
@@ -116,7 +116,7 @@ func TestCollect_SubFileShard_NegativeStartBlock(t *testing.T) {
 	r := openReader(t, data)
 	program := compileQuery(t, `{ resource.service.name = "svc" }`)
 
-	_, err := executor.Collect(r, program, executor.CollectOptions{
+	_, _, err := executor.Collect(r, program, executor.CollectOptions{
 		StartBlock: -1,
 		BlockCount: 1,
 	})
@@ -131,7 +131,7 @@ func TestCollect_SubFileShard_NegativeBlockCount(t *testing.T) {
 	r := openReader(t, data)
 	program := compileQuery(t, `{ resource.service.name = "svc" }`)
 
-	_, err := executor.Collect(r, program, executor.CollectOptions{
+	_, _, err := executor.Collect(r, program, executor.CollectOptions{
 		StartBlock: 0,
 		BlockCount: -1,
 	})
@@ -160,7 +160,7 @@ func TestCollectTopK_SubFileShard(t *testing.T) {
 	prog := compileSelectorProgram(t, `{service.name = "svc"}`)
 
 	// Shard: blocks [1, 3) — ts=200, ts=300. Top-1 backward = ts=300.
-	rows, err := executor.Collect(r, prog, executor.CollectOptions{
+	rows, _, err := executor.Collect(r, prog, executor.CollectOptions{
 		Limit:           1,
 		Direction:       queryplanner.Backward,
 		TimestampColumn: "log:timestamp",
@@ -189,7 +189,7 @@ func TestCollectTopK_SubFileShard_NegativeParams(t *testing.T) {
 	r := openLogMetricsReader(t, data)
 	prog := compileSelectorProgram(t, `{service.name = "svc"}`)
 
-	_, err := executor.Collect(r, prog, executor.CollectOptions{
+	_, _, err := executor.Collect(r, prog, executor.CollectOptions{
 		Limit:           1,
 		Direction:       queryplanner.Backward,
 		TimestampColumn: "log:timestamp",

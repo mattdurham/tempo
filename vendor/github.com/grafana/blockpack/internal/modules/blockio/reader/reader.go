@@ -211,13 +211,15 @@ func NewLeanReaderFromProviderWithOptions(provider rw.ReaderProvider, opts Optio
 		return NewReaderFromProviderWithOptions(provider, opts)
 	}
 
-	// I/O #2: read and parse the compact index (eagerly).
+	// I/O #2: read header to validate V13 and extract signal type.
+	if err = r.readHeader(); err != nil {
+		return nil, fmt.Errorf("NewLeanReaderFromProvider: header: %w", err)
+	}
+
+	// I/O #3: read and parse the compact index (eagerly).
 	if err = r.ensureCompactIndexParsed(); err != nil {
 		return nil, fmt.Errorf("NewLeanReaderFromProvider: compact index: %w", err)
 	}
-
-	// Compact sections are only written for V11 files.
-	r.fileVersion = shared.VersionV11
 
 	return r, nil
 }
@@ -629,7 +631,7 @@ func (r *Reader) AddColumnsToBlock(bwb *BlockWithBytes, addColumns map[string]st
 	spanCount := int(hdr.spanCount)
 	colCount := int(hdr.columnCount)
 
-	metas, _, err := parseColumnMetadataArray(bwb.RawBytes, 24, colCount, hdr.version)
+	metas, _, err := parseColumnMetadataArray(bwb.RawBytes, 24, colCount)
 	if err != nil {
 		return fmt.Errorf("AddColumnsToBlock: column metadata: %w", err)
 	}

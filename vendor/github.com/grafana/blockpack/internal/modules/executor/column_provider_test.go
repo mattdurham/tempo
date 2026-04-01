@@ -98,8 +98,16 @@ func TestBlockColumnProvider_ScanLessThan(t *testing.T) {
 	// Use a user attribute column (span.label) — intrinsic columns (span:name) are no longer
 	// in block columns and are served from the intrinsic section only.
 	block := buildBlock(t, []spanDef{
-		{name: "s1", attrs: []*commonv1.KeyValue{kv("label", "aardvark")}, resAttrs: map[string]any{"service.name": "svc"}},
-		{name: "s2", attrs: []*commonv1.KeyValue{kv("label", "badger")}, resAttrs: map[string]any{"service.name": "svc"}},
+		{
+			name:     "s1",
+			attrs:    []*commonv1.KeyValue{kv("label", "aardvark")},
+			resAttrs: map[string]any{"service.name": "svc"},
+		},
+		{
+			name:     "s2",
+			attrs:    []*commonv1.KeyValue{kv("label", "badger")},
+			resAttrs: map[string]any{"service.name": "svc"},
+		},
 		{name: "s3", attrs: []*commonv1.KeyValue{kv("label", "cat")}, resAttrs: map[string]any{"service.name": "svc"}},
 	})
 	p := newBlockColumnProvider(block)
@@ -111,8 +119,16 @@ func TestBlockColumnProvider_ScanLessThan(t *testing.T) {
 
 func TestBlockColumnProvider_ScanLessThanOrEqual(t *testing.T) {
 	block := buildBlock(t, []spanDef{
-		{name: "s1", attrs: []*commonv1.KeyValue{kv("label", "aardvark")}, resAttrs: map[string]any{"service.name": "svc"}},
-		{name: "s2", attrs: []*commonv1.KeyValue{kv("label", "badger")}, resAttrs: map[string]any{"service.name": "svc"}},
+		{
+			name:     "s1",
+			attrs:    []*commonv1.KeyValue{kv("label", "aardvark")},
+			resAttrs: map[string]any{"service.name": "svc"},
+		},
+		{
+			name:     "s2",
+			attrs:    []*commonv1.KeyValue{kv("label", "badger")},
+			resAttrs: map[string]any{"service.name": "svc"},
+		},
 		{name: "s3", attrs: []*commonv1.KeyValue{kv("label", "cat")}, resAttrs: map[string]any{"service.name": "svc"}},
 	})
 	p := newBlockColumnProvider(block)
@@ -124,8 +140,16 @@ func TestBlockColumnProvider_ScanLessThanOrEqual(t *testing.T) {
 
 func TestBlockColumnProvider_ScanGreaterThanOrEqual(t *testing.T) {
 	block := buildBlock(t, []spanDef{
-		{name: "s1", attrs: []*commonv1.KeyValue{kv("label", "aardvark")}, resAttrs: map[string]any{"service.name": "svc"}},
-		{name: "s2", attrs: []*commonv1.KeyValue{kv("label", "badger")}, resAttrs: map[string]any{"service.name": "svc"}},
+		{
+			name:     "s1",
+			attrs:    []*commonv1.KeyValue{kv("label", "aardvark")},
+			resAttrs: map[string]any{"service.name": "svc"},
+		},
+		{
+			name:     "s2",
+			attrs:    []*commonv1.KeyValue{kv("label", "badger")},
+			resAttrs: map[string]any{"service.name": "svc"},
+		},
 		{name: "s3", attrs: []*commonv1.KeyValue{kv("label", "cat")}, resAttrs: map[string]any{"service.name": "svc"}},
 	})
 	p := newBlockColumnProvider(block)
@@ -173,9 +197,21 @@ func TestBlockColumnProvider_ScanIsNotNull_MissingColumn(t *testing.T) {
 
 func TestBlockColumnProvider_ScanRegex(t *testing.T) {
 	block := buildBlock(t, []spanDef{
-		{name: "s1", attrs: []*commonv1.KeyValue{kv("op", "http.get")}, resAttrs: map[string]any{"service.name": "svc"}},
-		{name: "s2", attrs: []*commonv1.KeyValue{kv("op", "grpc.call")}, resAttrs: map[string]any{"service.name": "svc"}},
-		{name: "s3", attrs: []*commonv1.KeyValue{kv("op", "http.post")}, resAttrs: map[string]any{"service.name": "svc"}},
+		{
+			name:     "s1",
+			attrs:    []*commonv1.KeyValue{kv("op", "http.get")},
+			resAttrs: map[string]any{"service.name": "svc"},
+		},
+		{
+			name:     "s2",
+			attrs:    []*commonv1.KeyValue{kv("op", "grpc.call")},
+			resAttrs: map[string]any{"service.name": "svc"},
+		},
+		{
+			name:     "s3",
+			attrs:    []*commonv1.KeyValue{kv("op", "http.post")},
+			resAttrs: map[string]any{"service.name": "svc"},
+		},
 	})
 	p := newBlockColumnProvider(block)
 	rs, err := p.ScanRegex("span.op", "^http\\..*")
@@ -205,9 +241,21 @@ func TestBlockColumnProvider_ScanRegex_MissingColumn(t *testing.T) {
 
 func TestBlockColumnProvider_ScanRegexNotMatch(t *testing.T) {
 	block := buildBlock(t, []spanDef{
-		{name: "s1", attrs: []*commonv1.KeyValue{kv("op", "http.get")}, resAttrs: map[string]any{"service.name": "svc"}},
-		{name: "s2", attrs: []*commonv1.KeyValue{kv("op", "grpc.call")}, resAttrs: map[string]any{"service.name": "svc"}},
-		{name: "s3", attrs: []*commonv1.KeyValue{kv("op", "http.post")}, resAttrs: map[string]any{"service.name": "svc"}},
+		{
+			name:     "s1",
+			attrs:    []*commonv1.KeyValue{kv("op", "http.get")},
+			resAttrs: map[string]any{"service.name": "svc"},
+		},
+		{
+			name:     "s2",
+			attrs:    []*commonv1.KeyValue{kv("op", "grpc.call")},
+			resAttrs: map[string]any{"service.name": "svc"},
+		},
+		{
+			name:     "s3",
+			attrs:    []*commonv1.KeyValue{kv("op", "http.post")},
+			resAttrs: map[string]any{"service.name": "svc"},
+		},
 	})
 	p := newBlockColumnProvider(block)
 	rs, err := p.ScanRegexNotMatch("span.op", "^http\\..*")
@@ -227,9 +275,21 @@ func TestBlockColumnProvider_ScanRegexNotMatch_InvalidPattern(t *testing.T) {
 
 func TestBlockColumnProvider_ScanContains(t *testing.T) {
 	block := buildBlock(t, []spanDef{
-		{name: "s1", attrs: []*commonv1.KeyValue{kv("svc", "checkout-service")}, resAttrs: map[string]any{"service.name": "svc"}},
-		{name: "s2", attrs: []*commonv1.KeyValue{kv("svc", "auth-service")}, resAttrs: map[string]any{"service.name": "svc"}},
-		{name: "s3", attrs: []*commonv1.KeyValue{kv("svc", "checkout-processor")}, resAttrs: map[string]any{"service.name": "svc"}},
+		{
+			name:     "s1",
+			attrs:    []*commonv1.KeyValue{kv("svc", "checkout-service")},
+			resAttrs: map[string]any{"service.name": "svc"},
+		},
+		{
+			name:     "s2",
+			attrs:    []*commonv1.KeyValue{kv("svc", "auth-service")},
+			resAttrs: map[string]any{"service.name": "svc"},
+		},
+		{
+			name:     "s3",
+			attrs:    []*commonv1.KeyValue{kv("svc", "checkout-processor")},
+			resAttrs: map[string]any{"service.name": "svc"},
+		},
 	})
 	p := newBlockColumnProvider(block)
 	rs, err := p.ScanContains("span.svc", "checkout")

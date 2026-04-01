@@ -776,7 +776,9 @@ func extractRangeNode(expr *traceqlparser.BinaryExpr) (nodes []RangeNode, cols [
 	if !isBuiltInField(columnName) {
 		cols = []string{columnName}
 	}
-	return []RangeNode{{Column: columnName, Min: minVal, Max: maxVal, MinInclusive: minInclusive, MaxInclusive: maxInclusive}}, cols
+	return []RangeNode{
+		{Column: columnName, Min: minVal, Max: maxVal, MinInclusive: minInclusive, MaxInclusive: maxInclusive},
+	}, cols
 }
 
 // extractRegexNode builds a RangeNode for a regex predicate (=~).

@@ -143,43 +143,31 @@ func TestParitySmokeTest(t *testing.T) {
 	b := bwb.Block
 	require.Equal(t, 1, b.SpanCount(), "block must contain exactly one span")
 
-	// --- Identity column assertions (NOTE-005) ---
-	// trace:id, span:id, span:parent_id are no longer stored in the intrinsic section
-	// (NOTE-005 in writer/NOTES.md). They are stored only in block column payloads.
+	// --- Intrinsic field assertions ---
+	// These fields are stored in the intrinsic section only, not as block columns.
+	// Use GetIntrinsicColumn to read them and look up (blockIdx=0, rowIdx=0).
 
 	t.Run("trace:id", func(t *testing.T) {
 		col, err := r.GetIntrinsicColumn("trace:id")
 		require.NoError(t, err)
-		assert.Nil(t, col, "trace:id must NOT be in intrinsic section (NOTE-005)")
-		// Must be present as a block column.
-		bcol := b.GetColumn("trace:id")
-		require.NotNil(t, bcol, "trace:id must be present as a block column")
-		v, ok := bcol.BytesValue(0)
-		assert.True(t, ok)
+		require.NotNil(t, col, "trace:id must be in intrinsic section")
+		v := intrinsicBytesForRow(col, 0, 0)
 		assert.Equal(t, traceID[:], v)
 	})
 
 	t.Run("span:id", func(t *testing.T) {
 		col, err := r.GetIntrinsicColumn("span:id")
 		require.NoError(t, err)
-		assert.Nil(t, col, "span:id must NOT be in intrinsic section (NOTE-005)")
-		// Must be present as a block column.
-		bcol := b.GetColumn("span:id")
-		require.NotNil(t, bcol, "span:id must be present as a block column")
-		v, ok := bcol.BytesValue(0)
-		assert.True(t, ok)
+		require.NotNil(t, col, "span:id must be in intrinsic section")
+		v := intrinsicBytesForRow(col, 0, 0)
 		assert.Equal(t, spanID, v)
 	})
 
 	t.Run("span:parent_id", func(t *testing.T) {
 		col, err := r.GetIntrinsicColumn("span:parent_id")
 		require.NoError(t, err)
-		assert.Nil(t, col, "span:parent_id must NOT be in intrinsic section (NOTE-005)")
-		// Must be present as a block column.
-		bcol := b.GetColumn("span:parent_id")
-		require.NotNil(t, bcol, "span:parent_id must be present as a block column")
-		v, ok := bcol.BytesValue(0)
-		assert.True(t, ok)
+		require.NotNil(t, col, "span:parent_id must be in intrinsic section")
+		v := intrinsicBytesForRow(col, 0, 0)
 		assert.Equal(t, parentID, v)
 	})
 
@@ -240,15 +228,11 @@ func TestParitySmokeTest(t *testing.T) {
 	})
 
 	t.Run("span:status_message", func(t *testing.T) {
-		// span:status_message is no longer stored in the intrinsic section (NOTE-005).
-		// It is stored only in block column payloads.
+		// span:status_message is now intrinsic-only; no longer written as a block column.
 		col, err := r.GetIntrinsicColumn("span:status_message")
 		require.NoError(t, err)
-		assert.Nil(t, col, "span:status_message must NOT be in intrinsic section (NOTE-005)")
-		// Must be present as a block column.
-		bcol := b.GetColumn("span:status_message")
-		require.NotNil(t, bcol, "span:status_message must be present as a block column")
-		v, ok := bcol.StringValue(0)
+		require.NotNil(t, col, "span:status_message must be in intrinsic section for non-empty message")
+		v, ok := intrinsicDictStringForRow(col, 0, 0)
 		assert.True(t, ok)
 		assert.Equal(t, "something went wrong", v)
 	})
@@ -529,7 +513,10 @@ func buildParityFile(t *testing.T) []byte {
 		Attributes: []*commonv1.KeyValue{
 			{Key: "http.method", Value: &commonv1.AnyValue{Value: &commonv1.AnyValue_StringValue{StringValue: "GET"}}},
 			{Key: "http.status_code", Value: &commonv1.AnyValue{Value: &commonv1.AnyValue_IntValue{IntValue: 200}}},
-			{Key: "db.system", Value: &commonv1.AnyValue{Value: &commonv1.AnyValue_StringValue{StringValue: "postgres"}}},
+			{
+				Key:   "db.system",
+				Value: &commonv1.AnyValue{Value: &commonv1.AnyValue_StringValue{StringValue: "postgres"}},
+			},
 		},
 	}
 	require.NoError(t, w.AddSpan(traceID[:], span, map[string]any{"service.name": "parity-select-svc"}, "", nil, ""))
@@ -604,8 +591,23 @@ func TestSelectColumns_NilReturnsAll(t *testing.T) {
 			names = append(names, name)
 			return true
 		})
-		assert.Contains(t, names, "span.http.method", "nil SelectColumns must return all columns including span.http.method")
-		assert.Contains(t, names, "span.http.status_code", "nil SelectColumns must return all columns including span.http.status_code")
-		assert.Contains(t, names, "span.db.system", "nil SelectColumns must return all columns including span.db.system")
+		assert.Contains(
+			t,
+			names,
+			"span.http.method",
+			"nil SelectColumns must return all columns including span.http.method",
+		)
+		assert.Contains(
+			t,
+			names,
+			"span.http.status_code",
+			"nil SelectColumns must return all columns including span.http.status_code",
+		)
+		assert.Contains(
+			t,
+			names,
+			"span.db.system",
+			"nil SelectColumns must return all columns including span.db.system",
+		)
 	}
 }

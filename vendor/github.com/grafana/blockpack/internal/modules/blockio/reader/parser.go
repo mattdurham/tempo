@@ -160,15 +160,8 @@ func (r *Reader) readFooter() error {
 	return nil
 }
 
-// readHeader reads the file header at footer.headerOffset.
-// For version < 12: 21 bytes (magic[4] + version[1] + metadataOffset[8] + metadataLen[8]).
-// For version 12+:  22 bytes (same + signalType[1] at offset 21).
-//
-// We always read 22 bytes from the provider. For V10/V11 files this reads 1 extra byte
-// past the 21-byte header, which is safe because the header is immediately followed by
-// other file sections (metadata, compact index, footer), so the extra byte comes from
-// subsequent data. This means V12 signal_type (at offset 21) is always present in the
-// fixed-size 22-byte buffer.
+// readHeader reads the 22-byte file header at footer.headerOffset.
+// Layout: magic[4] + version[1] + metadataOffset[8] + metadataLen[8] + signalType[1].
 func (r *Reader) readHeader() error {
 	const headerSize = 22
 	cacheKey := r.fileID + "/header"
@@ -198,20 +191,14 @@ func (r *Reader) readHeader() error {
 	}
 
 	version := buf[4] //nolint:gosec // safe: buf is headerSize (22) bytes, validated by short-read check above
-	if version != shared.VersionV10 && version != shared.VersionV11 &&
-		version != shared.VersionV12 && version != shared.VersionV13 {
-		return fmt.Errorf("readHeader: unsupported version %d", version)
+	if version != shared.VersionV13 {
+		return fmt.Errorf("readHeader: unsupported version %d (V13 required)", version)
 	}
 
 	r.fileVersion = version
 	r.metadataOffset = binary.LittleEndian.Uint64(buf[5:])
 	r.metadataLen = binary.LittleEndian.Uint64(buf[13:])
-
-	// V12+ file header has an extra signal_type byte at offset 21.
-	// Extracted from the cached buffer — no second provider read needed.
-	if r.fileVersion >= shared.VersionV12 {
-		r.signalType = buf[21]
-	}
+	r.signalType = buf[21]
 
 	return nil
 }
@@ -245,41 +232,28 @@ func (r *Reader) parseV5MetadataLazy() error {
 		}
 	}
 
-	// NOTE-PERF: For snappy-compressed metadata (VersionV12), we cache the *decompressed*
-	// bytes under a distinct key ("/metadata/dec") so snappy.Decode runs only on a cache miss,
-	// not on every Reader creation. The old "/metadata" key stored compressed bytes and paid
-	// full decompression cost every query — profiling showed 23+ s/30s wasted there.
-	var (
-		cacheKey string
-		data     []byte
-		err      error
-	)
-	if r.fileVersion >= shared.VersionV12 {
-		cacheKey = r.fileID + "/metadata/dec"
-		data, err = r.cache.GetOrFetch(cacheKey, func() ([]byte, error) {
-			compressed, readErr := r.readRange(r.metadataOffset, r.metadataLen, rw.DataTypeMetadata)
-			if readErr != nil {
-				return nil, readErr
-			}
-			// Guard against decompression bombs before allocating the decode buffer.
-			decodedLen, lenErr := snappy.DecodedLen(compressed)
-			if lenErr != nil {
-				return nil, fmt.Errorf("snappy decoded length: %w", lenErr)
-			}
-			if uint64(decodedLen) > shared.MaxMetadataSize { //nolint:gosec // safe: decodedLen is non-negative
-				return nil, fmt.Errorf(
-					"snappy decoded size %d exceeds MaxMetadataSize %d",
-					decodedLen, shared.MaxMetadataSize,
-				)
-			}
-			return snappy.Decode(nil, compressed)
-		})
-	} else {
-		cacheKey = r.fileID + "/metadata"
-		data, err = r.cache.GetOrFetch(cacheKey, func() ([]byte, error) {
-			return r.readRange(r.metadataOffset, r.metadataLen, rw.DataTypeMetadata)
-		})
-	}
+	// NOTE-PERF: We cache the *decompressed* metadata bytes under a distinct key
+	// ("/metadata/dec") so snappy.Decode runs only on a cache miss, not on every
+	// Reader creation.
+	cacheKey := r.fileID + "/metadata/dec"
+	data, err := r.cache.GetOrFetch(cacheKey, func() ([]byte, error) {
+		compressed, readErr := r.readRange(r.metadataOffset, r.metadataLen, rw.DataTypeMetadata)
+		if readErr != nil {
+			return nil, readErr
+		}
+		// Guard against decompression bombs before allocating the decode buffer.
+		decodedLen, lenErr := snappy.DecodedLen(compressed)
+		if lenErr != nil {
+			return nil, fmt.Errorf("snappy decoded length: %w", lenErr)
+		}
+		if uint64(decodedLen) > shared.MaxMetadataSize { //nolint:gosec // safe: decodedLen is non-negative
+			return nil, fmt.Errorf(
+				"snappy decoded size %d exceeds MaxMetadataSize %d",
+				decodedLen, shared.MaxMetadataSize,
+			)
+		}
+		return snappy.Decode(nil, compressed)
+	})
 	if err != nil {
 		return fmt.Errorf("parseMetadata: %w", err)
 	}
@@ -295,7 +269,7 @@ func (r *Reader) parseV5MetadataLazy() error {
 	blockCount := int(binary.LittleEndian.Uint32(data[pos:]))
 	pos += 4
 
-	metas, newPos, err := parseBlockIndex(data[pos:pos+len(data)-pos], r.fileVersion, blockCount)
+	metas, newPos, err := parseBlockIndex(data[pos:pos+len(data)-pos], blockCount)
 	if err != nil {
 		return fmt.Errorf("parseMetadata: block_index: %w", err)
 	}
@@ -429,13 +403,9 @@ func (r *Reader) parseAndCacheSketchSection(data []byte) (int, error) {
 	return consumed, nil
 }
 
-// parseBlockIndexEntry parses one block index entry for the given version.
+// parseBlockIndexEntry parses one V13 block index entry.
 // Returns the entry and new position.
-func parseBlockIndexEntry(
-	data []byte,
-	pos int,
-	version uint8,
-) (shared.BlockMeta, int, error) {
+func parseBlockIndexEntry(data []byte, pos int) (shared.BlockMeta, int, error) {
 	var meta shared.BlockMeta
 
 	// offset[8] + length[8]
@@ -448,15 +418,13 @@ func parseBlockIndexEntry(
 	meta.Length = binary.LittleEndian.Uint64(data[pos:])
 	pos += 8
 
-	// v11+ adds kind[1] before span_count (V12 files also use V11 block layout).
-	if version >= shared.VersionV11 {
-		if pos+1 > len(data) {
-			return meta, pos, fmt.Errorf("block_index entry: short for kind")
-		}
-
-		meta.Kind = shared.BlockKind(data[pos])
-		pos++
+	// kind[1]
+	if pos+1 > len(data) {
+		return meta, pos, fmt.Errorf("block_index entry: short for kind")
 	}
+
+	meta.Kind = shared.BlockKind(data[pos])
+	pos++
 
 	// span_count[4] + min_start[8] + max_start[8]
 	if pos+20 > len(data) {
@@ -470,28 +438,18 @@ func parseBlockIndexEntry(
 	meta.MaxStart = binary.LittleEndian.Uint64(data[pos:])
 	pos += 8
 
-	// min_trace_id[16] + max_trace_id[16] — present in V10/V11/V12 only; omitted in V13+.
-	if version < shared.VersionV13 {
-		if pos+32 > len(data) {
-			return meta, pos, fmt.Errorf("block_index entry: short for trace IDs")
-		}
-
-		copy(meta.MinTraceID[:], data[pos:pos+16])
-		pos += 16
-		copy(meta.MaxTraceID[:], data[pos:pos+16])
-		pos += 16
-	}
+	// V13: MinTraceID/MaxTraceID omitted from block index entries.
 
 	return meta, pos, nil
 }
 
 // parseBlockIndex parses block_count block index entries from data.
-func parseBlockIndex(data []byte, version uint8, blockCount int) ([]shared.BlockMeta, int, error) {
+func parseBlockIndex(data []byte, blockCount int) ([]shared.BlockMeta, int, error) {
 	metas := make([]shared.BlockMeta, 0, blockCount)
 	pos := 0
 
 	for i := range blockCount {
-		meta, newPos, err := parseBlockIndexEntry(data, pos, version)
+		meta, newPos, err := parseBlockIndexEntry(data, pos)
 		if err != nil {
 			return nil, pos, fmt.Errorf("block[%d]: %w", i, err)
 		}

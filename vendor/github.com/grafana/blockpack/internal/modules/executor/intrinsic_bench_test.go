@@ -148,7 +148,7 @@ func BenchmarkCollect_IntrinsicMaterialization(b *testing.B) {
 		b.ReportAllocs()
 		b.ResetTimer()
 		for range b.N {
-			rows, err := executor.Collect(r, prog, executor.CollectOptions{})
+			rows, _, err := executor.Collect(r, prog, executor.CollectOptions{})
 			if err != nil {
 				b.Fatalf("Collect: %v", err)
 			}
@@ -167,7 +167,7 @@ func BenchmarkCollect_IntrinsicMaterialization(b *testing.B) {
 		b.ReportAllocs()
 		b.ResetTimer()
 		for range b.N {
-			rows, err := executor.Collect(r, prog, executor.CollectOptions{})
+			rows, _, err := executor.Collect(r, prog, executor.CollectOptions{})
 			if err != nil {
 				b.Fatalf("Collect: %v", err)
 			}
@@ -189,7 +189,7 @@ func BenchmarkCollect_IntrinsicMaterialization(b *testing.B) {
 		b.ReportAllocs()
 		b.ResetTimer()
 		for range b.N {
-			rows, err := executor.Collect(r, prog, executor.CollectOptions{
+			rows, _, err := executor.Collect(r, prog, executor.CollectOptions{
 				AllColumns: true,
 			})
 			if err != nil {

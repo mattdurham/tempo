@@ -132,7 +132,7 @@ func TestExecutor_BasicQuery(t *testing.T) {
 	r := openModulesReader(t, buf.Bytes())
 
 	program := compileExecutorQuery(t, `{ resource.service.name = "svc-alpha" }`)
-	rows, err := modules_executor.Collect(r, program, modules_executor.CollectOptions{})
+	rows, _, err := modules_executor.Collect(r, program, modules_executor.CollectOptions{})
 	require.NoError(t, err)
 
 	// Two spans belong to svc-alpha: op.alpha and op.gamma.
@@ -164,7 +164,7 @@ func TestExecutor_NoMatches(t *testing.T) {
 	r := openModulesReader(t, buf.Bytes())
 
 	program := compileExecutorQuery(t, `{ resource.service.name = "ghost-svc" }`)
-	rows, err := modules_executor.Collect(r, program, modules_executor.CollectOptions{})
+	rows, _, err := modules_executor.Collect(r, program, modules_executor.CollectOptions{})
 	require.NoError(t, err)
 
 	assert.Empty(t, rows, "non-existent service must return no matches")
@@ -199,7 +199,7 @@ func TestExecutor_SpanAttributeFilter(t *testing.T) {
 	r := openModulesReader(t, buf.Bytes())
 
 	program := compileExecutorQuery(t, `{ span.http.method = "GET" }`)
-	rows, err := modules_executor.Collect(r, program, modules_executor.CollectOptions{})
+	rows, _, err := modules_executor.Collect(r, program, modules_executor.CollectOptions{})
 	require.NoError(t, err)
 
 	// 3 GET spans out of 5 total.
@@ -238,14 +238,17 @@ func TestExecutor_MultiBlock(t *testing.T) {
 
 	// Match-all query: every span has batch.id = "b1".
 	program := compileExecutorQuery(t, `{ span.batch.id = "b1" }`)
-	var statsOut modules_executor.CollectStats
-	rows, err := modules_executor.Collect(r, program, modules_executor.CollectOptions{
-		OnStats: func(s modules_executor.CollectStats) { statsOut = s },
-	})
+	rows, qs, err := modules_executor.Collect(r, program, modules_executor.CollectOptions{})
 	require.NoError(t, err)
 
 	assert.Equal(t, totalSpans, len(rows), "all spans across all blocks must match")
-	assert.GreaterOrEqual(t, statsOut.FetchedBlocks, 2, "executor must scan at least 2 blocks")
+	var fetchedBlocks int
+	for i := range qs.Steps {
+		if qs.Steps[i].Name == "block-scan" {
+			fetchedBlocks, _ = qs.Steps[i].Metadata["fetched_blocks"].(int)
+		}
+	}
+	assert.GreaterOrEqual(t, fetchedBlocks, 2, "executor must scan at least 2 blocks")
 }
 
 // ---- EX-05: Empty file query ----
@@ -261,7 +264,7 @@ func TestExecutor_EmptyFile(t *testing.T) {
 	assert.Equal(t, 0, r.BlockCount(), "empty flush must have zero blocks")
 
 	program := compileExecutorQuery(t, `{ resource.service.name = "any-svc" }`)
-	rows, err := modules_executor.Collect(r, program, modules_executor.CollectOptions{})
+	rows, _, err := modules_executor.Collect(r, program, modules_executor.CollectOptions{})
 	require.NoError(t, err)
 
 	assert.Empty(t, rows, "empty file must return no matches")
@@ -306,7 +309,7 @@ func TestExecutor_ANDPredicate(t *testing.T) {
 
 	// Only svc-a with GET matches both conditions.
 	program := compileExecutorQuery(t, `{ resource.service.name = "svc-a" && span.http.method = "GET" }`)
-	rows, err := modules_executor.Collect(r, program, modules_executor.CollectOptions{})
+	rows, _, err := modules_executor.Collect(r, program, modules_executor.CollectOptions{})
 	require.NoError(t, err)
 
 	assert.Equal(t, 1, len(rows), "only svc-a+GET span must match the AND predicate")
@@ -341,7 +344,7 @@ func TestExecutor_MatchAll(t *testing.T) {
 	r := openModulesReader(t, buf.Bytes())
 
 	program := compileExecutorQuery(t, `{}`)
-	rows, err := modules_executor.Collect(r, program, modules_executor.CollectOptions{})
+	rows, _, err := modules_executor.Collect(r, program, modules_executor.CollectOptions{})
 	require.NoError(t, err)
 
 	assert.Equal(t, spanCount, len(rows), "match-all query must return all %d spans", spanCount)

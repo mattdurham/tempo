@@ -236,3 +236,41 @@ field names and expect a non-nil result.
 `internal/modules/executor/column_provider.go:nilIntrinsicScan`,
 `internal/modules/executor/stream_structural.go:collectBlockStructuralSpanRecs`,
 `internal/modules/executor/executor.go:SpanMatchFromRow`
+
+---
+
+## NOTE-009: FileLayout() V12-Only Simplification and Full-Byte-Detail Enhancement
+*Added: 2026-03-31*
+
+**Decision:** Remove V10/V11 code paths from `layoutMetadata()`. The codebase writes only
+V12 files (snappy-compressed metadata); V10/V11 paths were dead code that complicated the
+section model and prevented adding logical sub-sections for V12 metadata components.
+
+**Changes bundled in this decision:**
+1. **V12-only metadata:** `layoutMetadata()` emits one physical `metadata.compressed`
+   section plus logical sub-sections for range index columns. The old uncompressed
+   `metadata.block_index`, `metadata.column_index`, `metadata.trace_index` per-column
+   `metadata.range_index.column[*]` sections are removed.
+2. **Intrinsic paged breakdown:** For paged (v2) intrinsic columns, emit one physical
+   `intrinsic.column[name].page[N]` section per page plus a `intrinsic.column[name].page_toc`
+   section for the TOC header bytes, instead of a single aggregate section. Each page section
+   carries `RowCount`, `MinValue`, and `MaxValue` from its `PageMeta`.
+3. **Sketch actual bytes:** `SketchIndexInfo.EstimatedBytes` replaced by `TotalBytes`
+   (actual computed uncompressed sketch section size) and `HeaderBytes` (fixed 12 bytes).
+   `ColumnSketchStat` gains `CMSBytes` and `TopKBytes` for per-entry byte accounting.
+4. **KLL bucket boundaries:** `RangeIndexColumn` gains `BucketMin`/`BucketMax` (global
+   min/max from wire format). `RangeIndexBucket` gains `End` (upper boundary: next
+   bucket's Start for interior buckets, BucketMax for the last bucket).
+5. **FileBloom logical section:** `FileLayoutReport.FileBloom` (*FileBloomInfo) describes
+   the FBLM section: total bytes and per-column name + fuse filter size. Logical — not
+   a physical section, so no impact on the byte invariant.
+
+**Byte invariant preserved:** All new sections that describe content inside
+`metadata.compressed` or `intrinsic.toc` use `IsLogical: true`. The invariant
+`sum(physical CompressedSize) == FileSize` continues to hold.
+
+**Back-ref:** `internal/modules/blockio/reader/layout.go:FileLayout`,
+`internal/modules/blockio/reader/layout.go:layoutMetadata`,
+`internal/modules/blockio/reader/layout.go:buildSketchIndexInfo`,
+`internal/modules/blockio/reader/layout.go:buildRangeIndex`,
+`internal/modules/blockio/reader/layout.go:buildFileBloomInfo`

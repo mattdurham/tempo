@@ -15,7 +15,7 @@ import (
 
 // writeBlockIndexSection serializes the block index.
 // Returns the serialized bytes (without the length prefix — caller adds it).
-func writeBlockIndexSection(_ io.Writer, version uint8, metas []shared.BlockMeta) ([]byte, error) {
+func writeBlockIndexSection(_ io.Writer, metas []shared.BlockMeta) ([]byte, error) {
 	var buf bytes.Buffer
 
 	// block_count[4 LE]
@@ -36,10 +36,8 @@ func writeBlockIndexSection(_ io.Writer, version uint8, metas []shared.BlockMeta
 		binary.LittleEndian.PutUint64(off[:], m.Length)
 		buf.Write(off[:])
 
-		if version >= shared.VersionV11 {
-			// kind[1]
-			buf.WriteByte(byte(m.Kind))
-		}
+		// kind[1]
+		buf.WriteByte(byte(m.Kind))
 
 		// span_count[4 LE]
 		binary.LittleEndian.PutUint32(tmp[:], m.SpanCount)
@@ -53,12 +51,7 @@ func writeBlockIndexSection(_ io.Writer, version uint8, metas []shared.BlockMeta
 		binary.LittleEndian.PutUint64(off[:], m.MaxStart)
 		buf.Write(off[:])
 
-		if version < shared.VersionV13 {
-			// min_trace_id[16] + max_trace_id[16] — omitted in V13+ (never used for pruning)
-			buf.Write(m.MinTraceID[:])
-			buf.Write(m.MaxTraceID[:])
-		}
-
+		// V13: MinTraceID/MaxTraceID omitted (never used for pruning).
 	}
 
 	return buf.Bytes(), nil
@@ -300,25 +293,15 @@ func writeTraceBlockIndexSection(_ io.Writer, traceIndex map[[16]byte][]uint16) 
 	return buf.Bytes(), nil
 }
 
-// writeFileHeader writes the file header.
-// For version < 12: 21 bytes (magic[4] + version[1] + metadataOffset[8] + metadataLen[8]).
-// For version 12+:  22 bytes (same + signalType[1] at offset 21).
+// writeFileHeader writes the 22-byte file header.
+// Layout: magic[4] + version[1] + metadataOffset[8] + metadataLen[8] + signalType[1].
 func writeFileHeader(w io.Writer, version uint8, metadataOffset, metadataLen uint64, signalType uint8) error {
-	if version >= shared.VersionV12 {
-		var buf [22]byte
-		binary.LittleEndian.PutUint32(buf[0:], shared.MagicNumber)
-		buf[4] = version
-		binary.LittleEndian.PutUint64(buf[5:], metadataOffset)
-		binary.LittleEndian.PutUint64(buf[13:], metadataLen)
-		buf[21] = signalType
-		_, err := w.Write(buf[:])
-		return err
-	}
-	var buf [21]byte
+	var buf [22]byte
 	binary.LittleEndian.PutUint32(buf[0:], shared.MagicNumber)
 	buf[4] = version
 	binary.LittleEndian.PutUint64(buf[5:], metadataOffset)
 	binary.LittleEndian.PutUint64(buf[13:], metadataLen)
+	buf[21] = signalType
 	_, err := w.Write(buf[:])
 	return err
 }

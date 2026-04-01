@@ -6,8 +6,10 @@ import (
 	"cmp"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"sync"
+	"time"
 
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
 	modules_shared "github.com/grafana/blockpack/internal/modules/blockio/shared"
@@ -61,8 +63,6 @@ func filterRefsByShardRange(refs []modules_shared.BlockRef, opts CollectOptions)
 
 // CollectOptions configures collect execution for both trace and log signals.
 type CollectOptions struct {
-	// OnStats is an optional callback invoked after execution with I/O statistics.
-	OnStats func(CollectStats)
 	// TimestampColumn is the column for per-row time filtering.
 	// Empty string disables per-row filtering (trace mode).
 	// "log:timestamp" enables per-row filtering (log mode).
@@ -85,41 +85,6 @@ type CollectOptions struct {
 	BlockCount int
 }
 
-// CollectStats reports block I/O statistics after execution.
-type CollectStats struct {
-	// Explain is an ASCII trace of how the predicate tree resolved to block sets.
-	Explain string
-	// ExecutionPath identifies which code path ran for this query. One of:
-	// "intrinsic-plain" (Case A), "intrinsic-topk-kll" (Case B KLL path),
-	// "intrinsic-topk-scan" (Case B scan path), "mixed-plain" (Case C),
-	// "mixed-topk" (Case D), "block-plain" (block-scan no sort),
-	// "block-topk" (block-scan with topK heap),
-	// "intrinsic-need-block-scan" (fast path fell through to block scan),
-	// "bloom-rejected" (all candidate blocks eliminated by bloom filter).
-	// NOTE-043, NOTE-044: see also SortScanThreshold.
-	ExecutionPath  string
-	TotalBlocks    int
-	PrunedByTime   int
-	PrunedByIndex  int
-	PrunedByFuse   int // blocks eliminated by BinaryFuse8 membership checks
-	PrunedByCMS    int // blocks eliminated by Count-Min Sketch zero-estimate checks
-	SelectedBlocks int
-	// FetchedBlocks is the number of individual blocks actually fetched from storage (actual I/O).
-	// It is counted per coalesced group at ReadGroup time, so a group with N blocks contributes N
-	// when that group is fetched. FetchedBlocks <= SelectedBlocks when a Limit causes early stop
-	// and some groups are never read.
-	FetchedBlocks int
-	// IntrinsicRefCount is the number of matching refs from BlockRefsFromIntrinsicTOC
-	// (M for Case B). Set for intrinsic-topk-sort and intrinsic-topk-scan. Zero otherwise.
-	IntrinsicRefCount int
-	// IntrinsicScanCount is the number of entries visited by ScanFlatColumnRefsFiltered
-	// in the Case B scan path. Zero for the map path and all other paths.
-	IntrinsicScanCount int
-	// MixedCandidateBlocks is the number of unique candidate blocks from the partial-AND
-	// pre-filter for Cases C and D (mixed queries). Zero for all other paths.
-	MixedCandidateBlocks int
-}
-
 // MatchedRow holds a single row result from Collect.
 type MatchedRow struct {
 	Block *modules_reader.Block
@@ -138,33 +103,35 @@ type MatchedRow struct {
 // SPEC-STREAM-3: FetchedBlocks <= SelectedBlocks; early stop skips unfetched groups.
 // SPEC-STREAM-4: TimestampColumn == "" disables per-row time filtering (trace mode).
 // SPEC-STREAM-5: Direction is applied at plan time; rows are reversed within each block for Backward.
-// SPEC-STREAM-6: OnStats is deferred; FetchedBlocks reflects actual I/O at completion.
+// SPEC-STREAM-6: QueryStats is returned as the third return value with execution metrics.
 func Collect(
 	r *modules_reader.Reader,
 	program *vm.Program,
 	opts CollectOptions,
-) ([]MatchedRow, error) {
+) ([]MatchedRow, QueryStats, error) {
 	// SPEC-STREAM-1: nil reader — return nil result slice and nil error.
 	if r == nil {
-		return nil, nil
+		return nil, QueryStats{}, nil
 	}
 	if program == nil {
-		return nil, fmt.Errorf("executor.Collect: program must not be nil")
+		return nil, QueryStats{}, fmt.Errorf("executor.Collect: program must not be nil")
 	}
 	if opts.StartBlock < 0 || opts.BlockCount < 0 {
-		return nil, fmt.Errorf(
+		return nil, QueryStats{}, fmt.Errorf(
 			"executor.Collect: invalid shard parameters: StartBlock=%d BlockCount=%d",
 			opts.StartBlock,
 			opts.BlockCount,
 		)
 	}
 	if opts.BlockCount > 0 && opts.StartBlock+opts.BlockCount < opts.StartBlock {
-		return nil, fmt.Errorf(
+		return nil, QueryStats{}, fmt.Errorf(
 			"executor.Collect: shard range overflow: StartBlock=%d BlockCount=%d",
 			opts.StartBlock,
 			opts.BlockCount,
 		)
 	}
+
+	queryStart := time.Now()
 
 	wantColumns := ProgramWantColumns(program)
 
@@ -220,21 +187,24 @@ func Collect(
 	// evaluate nil columns and return 0 results for any intrinsic predicate.
 	// Mixed queries (Cases C/D) still require Limit > 0 to bound the pre-filter cost.
 	if hasSomeIntrinsicPredicates(program) && (opts.Limit > 0 || ProgramIsIntrinsicOnly(program)) {
-		var fastStats CollectStats
-		fastStats.TotalBlocks = r.BlockCount() // populate for OnStats callers (NOTE-050)
-		rows, err := collectWithBloomCheck(r, program, opts, wantColumns, secondPassCols, &fastStats)
+		rows, fastQS, err := collectWithBloomCheck(r, program, opts, wantColumns, secondPassCols)
 		if err != errNeedBlockScan {
 			// Fast path produced a definitive result (rows, empty result, or error).
-			// Call OnStats synchronously before returning. SPEC-STREAM-6 extended.
-			if opts.OnStats != nil {
-				opts.OnStats(fastStats)
-			}
-			return rows, err
+			fastQS.TotalDuration = time.Since(queryStart)
+			return rows, fastQS, err
 		}
-		// errNeedBlockScan: fall through to full block scan. fastStats is discarded.
-		// The block-scan defer below will call OnStats with the block-scan stats.
+		// SPEC-ROOT-010: slog.Warn when intrinsic fast path falls through to block scan.
+		slog.Warn("intrinsic fast path fell through to full block scan",
+			"execution_path", "intrinsic-need-block-scan",
+			"total_blocks", r.BlockCount(),
+		)
+		// errNeedBlockScan: fall through to full block scan. fastQS is discarded.
 	}
 
+	var qs QueryStats
+
+	// --- Plan step ---
+	planStart := time.Now()
 	plan := planBlocks(r, program, opts.TimeRange, queryplanner.PlanOptions{
 		Direction: opts.Direction,
 		Limit:     opts.Limit,
@@ -254,29 +224,24 @@ func Collect(
 		plan.SelectedBlocks = filtered
 	}
 
-	// SPEC-STREAM-6: Defer stats callback so FetchedBlocks reflects actual I/O.
-	// blockScanPath is set just before the scan branch executes (see NOTE-043).
-	fetchedBlocks := 0
-	blockScanPath := ""
-	if opts.OnStats != nil {
-		defer func() {
-			opts.OnStats(CollectStats{
-				TotalBlocks:    plan.TotalBlocks,
-				PrunedByTime:   plan.PrunedByTime,
-				PrunedByIndex:  plan.PrunedByIndex,
-				PrunedByFuse:   plan.PrunedByFuse,
-				PrunedByCMS:    plan.PrunedByCMS,
-				SelectedBlocks: len(plan.SelectedBlocks),
-				FetchedBlocks:  fetchedBlocks,
-				Explain:        plan.Explain,
-				ExecutionPath:  blockScanPath,
-			})
-		}()
-	}
+	qs.Steps = append(qs.Steps, StepStats{
+		Name:     "plan",
+		Duration: time.Since(planStart),
+		Metadata: map[string]any{
+			"total_blocks":    plan.TotalBlocks,
+			"pruned_by_time":  plan.PrunedByTime,
+			"pruned_by_index": plan.PrunedByIndex,
+			"pruned_by_fuse":  plan.PrunedByFuse,
+			"pruned_by_cms":   plan.PrunedByCMS,
+			"selected_blocks": len(plan.SelectedBlocks),
+			"explain":         plan.Explain,
+		},
+	})
 
 	if len(plan.SelectedBlocks) == 0 {
-		blockScanPath = "block-pruned"
-		return nil, nil
+		qs.ExecutionPath = "block-pruned"
+		qs.TotalDuration = time.Since(queryStart)
+		return nil, qs, nil
 	}
 
 	// SPEC-STREAM-2: Partition selected blocks into ~8 MB coalesced groups for lazy batched I/O.
@@ -290,48 +255,75 @@ func Collect(
 		}
 	}
 
+	// --- Block-scan step ---
+	scanStart := time.Now()
+	var fetchedGroups int
+	var fetchedBlocks int
+	var bytesRead int64
+	var results []MatchedRow
+
 	// Heap-based scan for timestamp-sorted queries (MostRecent/Oldest with a limit).
 	// Guarantees globally correct top-K by scanning all blocks and maintaining a priority
 	// queue. The intrinsic fast path (above) already handles intrinsic-only queries without
 	// full block I/O; this path handles all other timestamp-sorted queries.
 	if opts.TimestampColumn != "" && opts.Limit > 0 {
-		blockScanPath = "block-topk"
+		qs.ExecutionPath = "block-topk"
 		backward := opts.Direction == queryplanner.Backward
 		buf := &topKHeap{entries: make([]topKEntry, 0, opts.Limit), backward: backward}
-		fc, scanErr := topKScanBlocks(r, program, wantColumns, opts, plan, buf, groups, blockToGroup, backward)
-		fetchedBlocks = fc
+		var scanErr error
+		fetchedGroups, fetchedBlocks, bytesRead, scanErr = topKScanBlocks(
+			r,
+			program,
+			wantColumns,
+			opts,
+			plan,
+			buf,
+			groups,
+			blockToGroup,
+			backward,
+		)
 		if scanErr != nil {
-			return nil, scanErr
+			return nil, qs, scanErr
 		}
-		return topKDeliver(buf, backward), nil
+		results = topKDeliver(buf, backward)
+	} else {
+		qs.ExecutionPath = "block-plain"
+		fetched := make(map[int][]byte)
+		fetchedGroupsSeen := make(map[int]struct{})
+		var scanErr error
+		fetchedGroups, fetchedBlocks, bytesRead, scanErr = scanBlocks(
+			r, program, wantColumns, secondPassCols, opts,
+			plan.SelectedBlocks, groups, blockToGroup,
+			fetched, fetchedGroupsSeen,
+			&results,
+		)
+		if scanErr != nil {
+			return nil, qs, scanErr
+		}
 	}
 
-	blockScanPath = "block-plain"
-	var results []MatchedRow
+	qs.Steps = append(qs.Steps, StepStats{
+		Name:      "block-scan",
+		Duration:  time.Since(scanStart),
+		BytesRead: bytesRead,
+		IOOps:     fetchedGroups,
+		Metadata: map[string]any{
+			"fetched_blocks": fetchedBlocks,
+			"matched_rows":   len(results),
+		},
+	})
 
-	fetched := make(map[int][]byte)
-	fetchedGroupsSeen := make(map[int]struct{})
-
-	var scanErr error
-	fetchedBlocks, scanErr = scanBlocks(
-		r, program, wantColumns, secondPassCols, opts,
-		plan.SelectedBlocks, groups, blockToGroup,
-		fetched, fetchedGroupsSeen,
-		&results,
-	)
-	if scanErr != nil {
-		return nil, scanErr
-	}
-
-	return results, nil
+	qs.TotalDuration = time.Since(queryStart)
+	return results, qs, nil
 }
 
 // scanBlocks iterates over selectedBlocks in order, lazily fetching coalesced groups,
 // evaluating the program predicate, and appending matched rows to results.
-// Returns the number of blocks fetched from storage and any error encountered.
+// Returns the number of blocks fetched from storage, approximate bytes read, and any error.
 //
 // SPEC-STREAM-2: Each group is fetched at most once (~8 MB coalesced I/O).
-// SPEC-STREAM-3: fetchedBlocks is incremented at I/O time; early-stopped groups are not counted.
+// SPEC-STREAM-3: fetchedGroups counts ReadGroup calls; fetchedBlocks counts individual blocks fetched.
+// Groups that are never fetched (due to early stop) are not counted in either.
 func scanBlocks(
 	r *modules_reader.Reader,
 	program *vm.Program,
@@ -344,8 +336,10 @@ func scanBlocks(
 	fetched map[int][]byte,
 	fetchedGroupsSeen map[int]struct{},
 	results *[]MatchedRow,
-) (int, error) {
+) (int, int, int64, error) {
+	fetchedGroups := 0
 	fetchedBlocks := 0
+	var bytesRead int64
 
 	for _, blockIdx := range selectedBlocks {
 		gi, ok := blockToGroup[blockIdx]
@@ -354,16 +348,20 @@ func scanBlocks(
 		}
 
 		// Lazy group fetch: guarded by fetchedGroupsSeen for early-stop support.
-		// SPEC-STREAM-3: FetchedBlocks is incremented here (at I/O time) by the number of
-		// blocks in the group. Groups that are never fetched (due to early stop) are not counted.
+		// SPEC-STREAM-3: fetchedGroups counts ReadGroup calls (IOOps); fetchedBlocks counts
+		// individual blocks. Groups never fetched (early stop) are not counted in either.
 		if _, seen := fetchedGroupsSeen[gi]; !seen {
 			groupRaw, fetchErr := r.ReadGroup(groups[gi])
 			if fetchErr != nil {
-				return fetchedBlocks, fmt.Errorf("ReadGroup: %w", fetchErr)
+				return fetchedGroups, fetchedBlocks, bytesRead, fmt.Errorf("ReadGroup: %w", fetchErr)
 			}
 			for bi, raw := range groupRaw {
 				fetched[bi] = raw
 			}
+			for _, bi := range groups[gi].BlockIDs {
+				bytesRead += int64(r.BlockMeta(bi).Length) //nolint:gosec // Length is block size, safe to cast
+			}
+			fetchedGroups++
 			fetchedBlocks += len(groups[gi].BlockIDs)
 			fetchedGroupsSeen[gi] = struct{}{}
 		}
@@ -389,7 +387,11 @@ func scanBlocks(
 		bwb, parseErr := r.ParseBlockFromBytesWithIntern(raw, wantColumns, meta, intern)
 		if parseErr != nil {
 			modules_reader.ReleaseInternMap(internPtr)
-			return fetchedBlocks, fmt.Errorf("ParseBlockFromBytes block %d: %w", blockIdx, parseErr)
+			return fetchedGroups, fetchedBlocks, bytesRead, fmt.Errorf(
+				"ParseBlockFromBytes block %d: %w",
+				blockIdx,
+				parseErr,
+			)
 		}
 
 		provider := newBlockColumnProvider(bwb.Block)
@@ -410,7 +412,11 @@ func scanBlocks(
 		}
 		if evalErr != nil {
 			modules_reader.ReleaseInternMap(internPtr)
-			return fetchedBlocks, fmt.Errorf("ColumnPredicate block %d: %w", blockIdx, evalErr)
+			return fetchedGroups, fetchedBlocks, bytesRead, fmt.Errorf(
+				"ColumnPredicate block %d: %w",
+				blockIdx,
+				evalErr,
+			)
 		}
 
 		if rowSet.Size() == 0 {
@@ -436,7 +442,11 @@ func scanBlocks(
 			bwb, parseErr = r.ParseBlockFromBytesWithIntern(bwb.RawBytes, secondPassCols, meta, intern)
 			if parseErr != nil {
 				modules_reader.ReleaseInternMap(internPtr)
-				return fetchedBlocks, fmt.Errorf("ParseBlockFromBytes (second pass) block %d: %w", blockIdx, parseErr)
+				return fetchedGroups, fetchedBlocks, bytesRead, fmt.Errorf(
+					"ParseBlockFromBytes (second pass) block %d: %w",
+					blockIdx,
+					parseErr,
+				)
 			}
 		}
 
@@ -458,11 +468,11 @@ func scanBlocks(
 		// Release intern map after all lazy decodes in streamSortedRows are complete.
 		modules_reader.ReleaseInternMap(internPtr)
 		if stop {
-			return fetchedBlocks, nil
+			return fetchedGroups, fetchedBlocks, bytesRead, nil
 		}
 	}
 
-	return fetchedBlocks, nil
+	return fetchedGroups, fetchedBlocks, bytesRead, nil
 }
 
 // streamSortedRows sorts rows by timestamp (when tsCol is non-nil) or reverses them
@@ -555,20 +565,20 @@ func countUniqueBlockIdxs(refs []modules_shared.BlockRef) int {
 //
 // collectWithBloomCheck runs the intrinsic fast path with a FileBloom pre-check.
 // SPEC-INTRINSIC-004: reject the file in O(1) if bloom says no span matches.
-// SPEC-STREAM-6: always call OnStats before returning.
+// SPEC-STREAM-6: QueryStats is returned as part of the result.
 func collectWithBloomCheck(
 	r *modules_reader.Reader,
 	program *vm.Program,
 	opts CollectOptions,
 	wantColumns map[string]struct{},
 	secondPassCols map[string]struct{},
-	stats *CollectStats,
-) ([]MatchedRow, error) {
+) ([]MatchedRow, QueryStats, error) {
+	var qs QueryStats
 	if program.Predicates != nil && fileLevelBloomReject(r, program.Predicates.Nodes) {
-		stats.ExecutionPath = "bloom-rejected"
-		return nil, nil
+		qs.ExecutionPath = "bloom-rejected"
+		return nil, qs, nil
 	}
-	return collectFromIntrinsicRefs(r, program, opts, wantColumns, secondPassCols, stats)
+	return collectFromIntrinsicRefs(r, program, opts, wantColumns, secondPassCols, &qs)
 }
 
 // NOTE-038: The partial-AND pre-filter for mixed queries is a superset; ColumnPredicate
@@ -580,8 +590,8 @@ func collectFromIntrinsicRefs(
 	opts CollectOptions,
 	wantColumns map[string]struct{},
 	secondPassCols map[string]struct{},
-	stats *CollectStats,
-) ([]MatchedRow, error) {
+	qs *QueryStats,
+) ([]MatchedRow, QueryStats, error) {
 	isPureIntrinsic := ProgramIsIntrinsicOnly(program)
 	hasSort := opts.TimestampColumn != ""
 
@@ -610,11 +620,24 @@ func collectFromIntrinsicRefs(
 		refs = blockRefsFromIntrinsicPartial(r, program, 0)
 	}
 	if refs == nil {
-		stats.ExecutionPath = "intrinsic-need-block-scan"
-		return nil, errNeedBlockScan
+		qs.ExecutionPath = "intrinsic-need-block-scan"
+		return nil, *qs, errNeedBlockScan
 	}
 	if len(refs) == 0 {
-		return nil, nil
+		if isPureIntrinsic {
+			if hasSort {
+				qs.ExecutionPath = "intrinsic-topk-kll" // would have been Case B
+			} else {
+				qs.ExecutionPath = "intrinsic-plain" // would have been Case A
+			}
+		} else {
+			if hasSort {
+				qs.ExecutionPath = "mixed-topk" // would have been Case D
+			} else {
+				qs.ExecutionPath = "mixed-plain" // would have been Case C
+			}
+		}
+		return nil, *qs, nil
 	}
 
 	// Selectivity guard: if the partial pre-filter covers more than half the internal
@@ -623,24 +646,44 @@ func collectFromIntrinsicRefs(
 	if !isPureIntrinsic {
 		uniqueBlocks := countUniqueBlockIdxs(refs)
 		if uniqueBlocks*2 > r.BlockCount() {
-			stats.ExecutionPath = "intrinsic-need-block-scan"
-			return nil, errNeedBlockScan
+			qs.ExecutionPath = "intrinsic-need-block-scan"
+			return nil, *qs, errNeedBlockScan
 		}
 	}
 
+	// Apply sub-file shard filtering before computing selected_blocks so that
+	// sharded queries report accurate counts in the plan step.
+	refs = filterRefsByShardRange(refs, opts)
+
+	// Plan step for the intrinsic fast path: records block counts for observability.
+	// Unlike the block-scan path, no time-range or bloom pruning occurs here — the
+	// intrinsic TOC already filters refs by predicate. selected_blocks reflects the
+	// number of distinct blocks containing matching refs after shard filtering.
+	qs.Steps = append(qs.Steps, StepStats{
+		Name: "plan",
+		Metadata: map[string]any{
+			"total_blocks":    r.BlockCount(),
+			"selected_blocks": countUniqueBlockIdxs(refs),
+		},
+	})
+
 	// Step 2: Dispatch based on (isPureIntrinsic, hasSort).
 	if isPureIntrinsic && !hasSort {
-		return collectIntrinsicPlain(r, refs, opts, wantColumns, secondPassCols, stats)
+		rows, err := collectIntrinsicPlain(r, refs, opts, wantColumns, secondPassCols, qs)
+		return rows, *qs, err
 	}
 	if isPureIntrinsic && hasSort {
-		return collectIntrinsicTopK(r, refs, opts, wantColumns, secondPassCols, stats)
+		rows, err := collectIntrinsicTopK(r, refs, opts, wantColumns, secondPassCols, qs)
+		return rows, *qs, err
 	}
 	if !hasSort {
 		// Case C: mixed + no sort
-		return collectMixedPlain(r, program, refs, opts, wantColumns, secondPassCols, stats)
+		rows, err := collectMixedPlain(r, program, refs, opts, wantColumns, secondPassCols, qs)
+		return rows, *qs, err
 	}
 	// Case D: mixed + sort
-	return collectMixedTopK(r, program, refs, opts, wantColumns, secondPassCols, stats)
+	rows, err := collectMixedTopK(r, program, refs, opts, wantColumns, secondPassCols, qs)
+	return rows, *qs, err
 }
 
 // parsedBlock holds the result of the two-pass parse for one block.
@@ -759,16 +802,22 @@ func collectIntrinsicPlain(
 	opts CollectOptions,
 	wantColumns map[string]struct{},
 	secondPassCols map[string]struct{},
-	stats *CollectStats,
+	qs *QueryStats,
 ) ([]MatchedRow, error) {
-	stats.ExecutionPath = "intrinsic-plain"
-	stats.SelectedBlocks = countUniqueBlockIdxs(refs)
+	qs.ExecutionPath = "intrinsic-plain"
+	stepStart := time.Now()
 	// Sort refs by (BlockIdx, RowIdx) for deterministic traversal order.
 	slices.SortFunc(refs, blockRefCompare)
 
 	// Filter refs to shard's block range if sub-file sharding is active.
 	refs = filterRefsByShardRange(refs, opts)
+	selectedBlocks := countUniqueBlockIdxs(refs)
 	if len(refs) == 0 {
+		qs.Steps = append(qs.Steps, StepStats{
+			Name:     "intrinsic",
+			Duration: time.Since(stepStart),
+			Metadata: map[string]any{"selected_blocks": selectedBlocks},
+		})
 		return nil, nil
 	}
 
@@ -777,9 +826,8 @@ func collectIntrinsicPlain(
 		refs = refs[:opts.Limit]
 	}
 
-	// Block reads for field population — O(M) where M is the result count.
-	// At scale (92+ files × 5M spans), lookupIntrinsicFields O(N×C) scan takes ~11s per query.
-	// Block reads scale with M (result count), not N (total spans per file).
+	// Block reads for field population — groups refs by block, reads each block once,
+	// and returns MatchedRow.Block populated. O(M) where M is the result count.
 	blockOrder, blockCandidates := groupRefsByBlock(refs)
 	var results []MatchedRow
 	err := forEachBlockInGroups(r, blockOrder, blockCandidates, wantColumns, secondPassCols, "collectIntrinsicPlain",
@@ -796,11 +844,17 @@ func collectIntrinsicPlain(
 	if err != nil {
 		return nil, err
 	}
+	qs.Steps = append(qs.Steps, StepStats{
+		Name:     "intrinsic",
+		Duration: time.Since(stepStart),
+		Metadata: map[string]any{"selected_blocks": selectedBlocks},
+	})
 	return results, nil
 }
 
 // collectIntrinsicTopK handles Case B: pure intrinsic + timestamp sort.
-// Returns IntrinsicFields MatchedRows with ZERO full block reads.
+// Selects the top-K refs via KLL or scan path, then uses block reads to
+// populate MatchedRow.Block — same forEachBlockInGroups approach as collectIntrinsicPlain.
 //
 // For small ref sets (M < SortScanThreshold): KLL path — groups refs by BlockIdx, orders
 // blocks by BlockMeta.MaxStart DESC (newest block first via KLL sketch metadata), builds
@@ -817,16 +871,16 @@ func collectIntrinsicTopK(
 	opts CollectOptions,
 	wantColumns map[string]struct{},
 	secondPassCols map[string]struct{},
-	stats *CollectStats,
+	qs *QueryStats,
 ) ([]MatchedRow, error) {
 	var (
 		selected []modules_shared.BlockRef
 		err      error
 	)
 	if len(refs) < SortScanThreshold {
-		selected, err = collectIntrinsicTopKKLL(r, refs, opts, stats)
+		selected, err = collectIntrinsicTopKKLL(r, refs, opts, qs)
 	} else {
-		selected, err = collectIntrinsicTopKScan(r, refs, opts, stats)
+		selected, err = collectIntrinsicTopKScan(r, refs, opts, qs)
 	}
 	if err != nil {
 		return nil, err
@@ -852,6 +906,30 @@ func collectIntrinsicTopK(
 	if err != nil {
 		return nil, err
 	}
+	// Re-sort results by timestamp to restore the TopK ordering that KLL/scan paths
+	// established before block reads re-ordered rows by (BlockIdx, RowIdx).
+	// span:start is stored as a regular block column, so it is available on row.Block
+	// after forEachBlockInGroups populates MatchedRow.Block above.
+	if opts.TimestampColumn != "" && len(results) > 1 {
+		backward := opts.Direction == queryplanner.Backward
+		slices.SortStableFunc(results, func(a, b MatchedRow) int {
+			var tsA, tsB uint64
+			if a.Block != nil {
+				if col := a.Block.GetColumn(opts.TimestampColumn); col != nil {
+					tsA, _ = col.Uint64Value(a.RowIdx)
+				}
+			}
+			if b.Block != nil {
+				if col := b.Block.GetColumn(opts.TimestampColumn); col != nil {
+					tsB, _ = col.Uint64Value(b.RowIdx)
+				}
+			}
+			if backward {
+				return cmp.Compare(tsB, tsA) // descending: newer first
+			}
+			return cmp.Compare(tsA, tsB) // ascending: older first
+		})
+	}
 	return results, nil
 }
 
@@ -863,8 +941,9 @@ func collectIntrinsicTopKKLL(
 	r *modules_reader.Reader,
 	refs []modules_shared.BlockRef,
 	opts CollectOptions,
-	stats *CollectStats,
+	qs *QueryStats,
 ) ([]modules_shared.BlockRef, error) {
+	stepStart := time.Now()
 	backward := opts.Direction == queryplanner.Backward
 	limit := opts.Limit
 
@@ -931,8 +1010,15 @@ func collectIntrinsicTopKKLL(
 		}
 		pairs = filtered
 	}
-	stats.ExecutionPath = "intrinsic-topk-kll"
-	stats.IntrinsicRefCount = len(refs)
+	qs.ExecutionPath = "intrinsic-topk-kll"
+	qs.Steps = append(qs.Steps, StepStats{
+		Name:     "intrinsic",
+		Duration: time.Since(stepStart),
+		Metadata: map[string]any{
+			"ref_count":  len(refs),
+			"scan_count": 0, // KLL path does not scan the blob
+		},
+	})
 	if len(pairs) == 0 {
 		return nil, nil
 	}
@@ -962,8 +1048,9 @@ func collectIntrinsicTopKScan(
 	r *modules_reader.Reader,
 	refs []modules_shared.BlockRef,
 	opts CollectOptions,
-	stats *CollectStats,
+	qs *QueryStats,
 ) ([]modules_shared.BlockRef, error) {
+	stepStart := time.Now()
 	backward := opts.Direction == queryplanner.Backward
 	limit := opts.Limit
 
@@ -998,9 +1085,15 @@ func collectIntrinsicTopKScan(
 			return found
 		},
 	)
-	stats.ExecutionPath = "intrinsic-topk-scan"
-	stats.IntrinsicRefCount = len(refs)
-	stats.IntrinsicScanCount = scanCount
+	qs.ExecutionPath = "intrinsic-topk-scan"
+	qs.Steps = append(qs.Steps, StepStats{
+		Name:     "intrinsic",
+		Duration: time.Since(stepStart),
+		Metadata: map[string]any{
+			"ref_count":  len(refs),
+			"scan_count": scanCount,
+		},
+	})
 
 	// Apply time-range filter: the scan path does not have per-ref timestamps in scope,
 	// so we post-filter the selected refs by decoding the timestamp column.
@@ -1044,7 +1137,7 @@ func collectMixedPlain(
 	opts CollectOptions,
 	wantColumns map[string]struct{},
 	secondPassCols map[string]struct{},
-	stats *CollectStats,
+	qs *QueryStats,
 ) ([]MatchedRow, error) {
 	// Sort refs and apply shard filter (same as collectIntrinsicPlain).
 	slices.SortFunc(refs, blockRefCompare)
@@ -1053,9 +1146,16 @@ func collectMixedPlain(
 		return nil, nil
 	}
 
+	prefilterStart := time.Now()
 	blockOrder, blockCandidates := groupRefsByBlock(refs)
-	stats.ExecutionPath = "mixed-plain"
-	stats.MixedCandidateBlocks = len(blockOrder)
+	qs.ExecutionPath = "mixed-plain"
+	qs.Steps = append(qs.Steps, StepStats{
+		Name:     "mixed-prefilter",
+		Duration: time.Since(prefilterStart),
+		Metadata: map[string]any{
+			"candidate_blocks": len(blockOrder),
+		},
+	})
 
 	var results []MatchedRow
 	// Coalesce all candidate blocks for efficient batch I/O.
@@ -1113,7 +1213,7 @@ func collectMixedTopK(
 	opts CollectOptions,
 	wantColumns map[string]struct{},
 	secondPassCols map[string]struct{},
-	stats *CollectStats,
+	qs *QueryStats,
 ) ([]MatchedRow, error) {
 	backward := opts.Direction == queryplanner.Backward
 
@@ -1123,9 +1223,16 @@ func collectMixedTopK(
 		return nil, nil
 	}
 
+	prefilterStart := time.Now()
 	blockOrder, blockCandidates := groupRefsByBlock(refs)
-	stats.ExecutionPath = "mixed-topk"
-	stats.MixedCandidateBlocks = len(blockOrder)
+	qs.ExecutionPath = "mixed-topk"
+	qs.Steps = append(qs.Steps, StepStats{
+		Name:     "mixed-prefilter",
+		Duration: time.Since(prefilterStart),
+		Metadata: map[string]any{
+			"candidate_blocks": len(blockOrder),
+		},
+	})
 
 	buf := &topKHeap{entries: make([]topKEntry, 0, opts.Limit), backward: backward}
 
@@ -1177,12 +1284,6 @@ func collectMixedTopK(
 	}
 
 	return topKDeliver(buf, backward), nil
-}
-
-// intrinsicFieldsProvider implements SpanFieldsProvider by looking up field values
-// from intrinsic columns. Used by the intrinsic fast path to avoid reading full blocks.
-type intrinsicFieldsProvider struct {
-	fields map[string]any
 }
 
 // filterRowSetByIntrinsicNodes filters rowSet against the given predicate nodes,
@@ -1292,17 +1393,4 @@ func lookupIntrinsicFields(
 	}
 
 	return result
-}
-
-func (p *intrinsicFieldsProvider) GetField(name string) (any, bool) {
-	v, ok := p.fields[name]
-	return v, ok
-}
-
-func (p *intrinsicFieldsProvider) IterateFields(fn func(name string, value any) bool) {
-	for k, v := range p.fields {
-		if !fn(k, v) {
-			return
-		}
-	}
 }

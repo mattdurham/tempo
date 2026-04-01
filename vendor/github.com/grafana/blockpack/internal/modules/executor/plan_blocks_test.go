@@ -1449,7 +1449,10 @@ func TestFileLevelBloomReject_OR_OnePresent(t *testing.T) {
 					IsOR: true,
 					Children: []vm.RangeNode{
 						{Column: "resource.service.name", Values: []vm.Value{{Type: vm.TypeString, Data: "absent-1"}}},
-						{Column: "resource.service.name", Values: []vm.Value{{Type: vm.TypeString, Data: "svc-present"}}},
+						{
+							Column: "resource.service.name",
+							Values: []vm.Value{{Type: vm.TypeString, Data: "svc-present"}},
+						},
 					},
 				},
 			},

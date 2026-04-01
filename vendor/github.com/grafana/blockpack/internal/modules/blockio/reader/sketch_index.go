@@ -213,7 +213,13 @@ func parseSketchIndexSection(data []byte) (*sketchIndex, int, error) {
 
 // parseColumnPresence parses the presence bitset and builds presentMap.
 // Returns (newPos, presentCount, error).
-func parseColumnPresence(data []byte, pos int, name string, numBlocks, presenceBytes int, cd *columnSketchData) (int, int, error) {
+func parseColumnPresence(
+	data []byte,
+	pos int,
+	name string,
+	numBlocks, presenceBytes int,
+	cd *columnSketchData,
+) (int, int, error) {
 	if pos+presenceBytes > len(data) {
 		return pos, 0, fmt.Errorf("sketch_index: col %q: too short for presence", name)
 	}

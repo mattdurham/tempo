@@ -52,7 +52,7 @@ func TestStreamLogsTopK_GlobalOrder_Backward(t *testing.T) {
 	r := openLogMetricsReader(t, data)
 	prog := compileSelectorProgram(t, `{service.name = "svc"}`)
 
-	entries, err := modules_executor.CollectLogs(r, prog, nil, modules_executor.CollectOptions{
+	entries, _, err := modules_executor.CollectLogs(r, prog, nil, modules_executor.CollectOptions{
 		Limit:           2,
 		Direction:       queryplanner.Backward,
 		TimestampColumn: "log:timestamp",
@@ -82,7 +82,7 @@ func TestStreamLogsTopK_GlobalOrder_Forward(t *testing.T) {
 	r := openLogMetricsReader(t, data)
 	prog := compileSelectorProgram(t, `{service.name = "svc"}`)
 
-	entries, err := modules_executor.CollectLogs(r, prog, nil, modules_executor.CollectOptions{
+	entries, _, err := modules_executor.CollectLogs(r, prog, nil, modules_executor.CollectOptions{
 		Limit:           2,
 		Direction:       queryplanner.Forward,
 		TimestampColumn: "log:timestamp",
@@ -118,22 +118,19 @@ func TestStreamLogsTopK_BlockSkip(t *testing.T) {
 	r := openLogMetricsReader(t, data)
 	prog := compileSelectorProgram(t, `{service.name = "svc"}`)
 
-	var stats modules_executor.CollectStats
-	entries, err := modules_executor.CollectLogs(r, prog, nil, modules_executor.CollectOptions{
+	entries, qs, err := modules_executor.CollectLogs(r, prog, nil, modules_executor.CollectOptions{
 		Limit:           2,
 		Direction:       queryplanner.Backward,
 		TimestampColumn: "log:timestamp",
-		OnStats:         func(s modules_executor.CollectStats) { stats = s },
 	})
 	require.NoError(t, err)
 	// Result must contain only the two newer entries — block 0's rows were pruned.
 	require.Len(t, entries, 2)
 	assert.Equal(t, uint64(2000), entries[0].TimestampNanos)
 	assert.Equal(t, uint64(1000), entries[1].TimestampNanos)
-	assert.Equal(t, 2, stats.SelectedBlocks)
-	// Small blocks coalesce into one ReadGroup, so FetchedBlocks == SelectedBlocks.
-	// The skip is validated via result correctness above, not I/O accounting.
-	assert.LessOrEqual(t, stats.FetchedBlocks, stats.SelectedBlocks)
+	planStep := findStep(qs, "plan")
+	require.NotNil(t, planStep, "plan step must be present")
+	assert.Equal(t, 2, planStep.Metadata["selected_blocks"])
 }
 
 // EX-SLK-04 (StreamLogsTopK): Per-row time range filtering.
@@ -152,7 +149,7 @@ func TestStreamLogsTopK_TimeRange(t *testing.T) {
 	r := openLogMetricsReader(t, data)
 	prog := compileSelectorProgram(t, `{service.name = "svc"}`)
 
-	entries, err := modules_executor.CollectLogs(r, prog, nil, modules_executor.CollectOptions{
+	entries, _, err := modules_executor.CollectLogs(r, prog, nil, modules_executor.CollectOptions{
 		Limit:           100,
 		Direction:       queryplanner.Forward,
 		TimestampColumn: "log:timestamp",
@@ -169,7 +166,7 @@ func TestStreamLogsTopK_NilReader(t *testing.T) {
 
 	prog := compileSelectorProgram(t, `{service.name = "svc"}`)
 
-	entries, err := modules_executor.CollectLogs(nil, prog, nil, modules_executor.CollectOptions{
+	entries, _, err := modules_executor.CollectLogs(nil, prog, nil, modules_executor.CollectOptions{
 		Limit:           10,
 		TimestampColumn: "log:timestamp",
 	})
@@ -190,7 +187,7 @@ func TestStreamLogsTopK_NilProgram(t *testing.T) {
 	}, 0)
 	r := openLogMetricsReader(t, data)
 
-	_, err := modules_executor.CollectLogs(r, nil, nil, modules_executor.CollectOptions{
+	_, _, err := modules_executor.CollectLogs(r, nil, nil, modules_executor.CollectOptions{
 		Limit:           10,
 		TimestampColumn: "log:timestamp",
 	})
@@ -212,7 +209,7 @@ func TestStreamLogsTopK_LimitZeroDeliversAll(t *testing.T) {
 	r := openLogMetricsReader(t, data)
 	prog := compileSelectorProgram(t, `{service.name = "svc"}`)
 
-	entries, err := modules_executor.CollectLogs(r, prog, nil, modules_executor.CollectOptions{
+	entries, _, err := modules_executor.CollectLogs(r, prog, nil, modules_executor.CollectOptions{
 		Limit:           0,
 		TimestampColumn: "log:timestamp",
 	})
@@ -235,17 +232,16 @@ func TestStreamLogsTopK_OnStats(t *testing.T) {
 	r := openLogMetricsReader(t, data)
 	prog := compileSelectorProgram(t, `{service.name = "svc"}`)
 
-	var stats modules_executor.CollectStats
-	_, err := modules_executor.CollectLogs(r, prog, nil, modules_executor.CollectOptions{
+	_, qs, err := modules_executor.CollectLogs(r, prog, nil, modules_executor.CollectOptions{
 		Limit:           10,
 		Direction:       queryplanner.Backward,
 		TimestampColumn: "log:timestamp",
-		OnStats:         func(s modules_executor.CollectStats) { stats = s },
 	})
 	require.NoError(t, err)
-	assert.Greater(t, stats.TotalBlocks, 0)
-	assert.Greater(t, stats.SelectedBlocks, 0)
-	assert.LessOrEqual(t, stats.FetchedBlocks, stats.SelectedBlocks)
+	planStep := findStep(qs, "plan")
+	require.NotNil(t, planStep, "plan step must be present")
+	assert.Greater(t, planStep.Metadata["total_blocks"], 0)
+	assert.Greater(t, planStep.Metadata["selected_blocks"], 0)
 }
 
 // EX-SLK-02 (StreamLogsTopK): Pipeline stage filters entries — only entries passing the
@@ -278,7 +274,7 @@ func TestStreamLogsTopK_PipelineFilters(t *testing.T) {
 	pipeline, err := logqlparser.CompilePipeline(stages)
 	require.NoError(t, err)
 
-	entries, err := modules_executor.CollectLogs(r, prog, pipeline, modules_executor.CollectOptions{
+	entries, _, err := modules_executor.CollectLogs(r, prog, pipeline, modules_executor.CollectOptions{
 		Limit:           10,
 		Direction:       queryplanner.Backward,
 		TimestampColumn: "log:timestamp",

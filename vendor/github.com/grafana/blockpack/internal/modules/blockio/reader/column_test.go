@@ -160,20 +160,19 @@ func TestDecodeXORBytes_IDs(t *testing.T) {
 		defs[i].span.TraceId = tid[:]
 	}
 
-	bwb := writeSpansAndGetBlock(t, defs)
-	// NOTE-005: span:id is no longer in the intrinsic section; read from block column.
-	col := bwb.Block.GetColumn("span:id")
-	require.NotNil(t, col, "span:id block column must be present")
+	r, _ := writeSpansAndGetReader(t, defs)
+	// span:id is now stored in the intrinsic section only, not in block columns.
+	require.True(t, r.HasIntrinsicSection(), "span:id requires intrinsic section")
 
-	// Collect decoded span IDs from the block column and verify round-trip.
+	// Collect decoded span IDs from the intrinsic column and verify round-trip.
 	decoded := make(map[string]bool)
 	for i := range 5 {
-		v, ok := col.BytesValue(i)
-		assert.True(t, ok, "row %d span:id must be present in block column", i)
+		v, ok := r.IntrinsicBytesAt("span:id", 0, i)
+		assert.True(t, ok, "row %d span:id must be present in intrinsic section", i)
 		decoded[string(v)] = true
 	}
 	for _, sid := range spanIDs {
-		assert.True(t, decoded[string(sid)], "span ID %v must round-trip via block column", sid)
+		assert.True(t, decoded[string(sid)], "span ID %v must round-trip via intrinsic section", sid)
 	}
 }
 
@@ -293,16 +292,15 @@ func TestDecodeDeltaDictionary_TraceID(t *testing.T) {
 		defs = append(defs, d)
 	}
 
-	bwb := writeSpansAndGetBlock(t, defs)
-	// NOTE-005: trace:id is no longer in the intrinsic section; read from block column.
-	col := bwb.Block.GetColumn("trace:id")
-	require.NotNil(t, col, "trace:id block column must be present")
+	r, _ := writeSpansAndGetReader(t, defs)
+	// trace:id is now stored in the intrinsic section only, not in block columns.
+	require.True(t, r.HasIntrinsicSection(), "trace:id requires intrinsic section")
 
-	// All 10 trace IDs must be present in the block column.
+	// All 10 trace IDs must be present in the intrinsic section.
 	decoded := make(map[[16]byte]bool)
 	for i := range 10 {
-		v, ok := col.BytesValue(i)
-		assert.True(t, ok, "row %d trace:id must be present in block column", i)
+		v, ok := r.IntrinsicBytesAt("trace:id", 0, i)
+		assert.True(t, ok, "row %d trace:id must be present in intrinsic section", i)
 		if ok && len(v) == 16 {
 			var arr [16]byte
 			copy(arr[:], v)

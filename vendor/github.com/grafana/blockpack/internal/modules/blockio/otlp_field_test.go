@@ -145,38 +145,23 @@ func TestOTLPField_Intrinsics(t *testing.T) {
 		return col
 	}
 
-	// NOTE-005: trace:id, span:id, span:parent_id are no longer stored in the intrinsic
-	// section. They are stored only in block column payloads (dual-storage preserved for
-	// block payloads; intrinsic accumulator no longer feeds them).
 	t.Run("trace:id", func(t *testing.T) {
-		col, err := r.GetIntrinsicColumn("trace:id")
-		require.NoError(t, err)
-		assert.Nil(t, col, "trace:id must NOT be in intrinsic section (NOTE-005)")
-		bcol := b.GetColumn("trace:id")
-		require.NotNil(t, bcol, "trace:id must be present as a block column")
-		v, ok := bcol.BytesValue(0)
+		col := getFlat(t, "trace:id")
+		v, ok := intrinsicBytesAt(t, col, 0, 0)
 		assert.True(t, ok)
 		assert.Equal(t, traceID[:], v)
 	})
 
 	t.Run("span:id", func(t *testing.T) {
-		col, err := r.GetIntrinsicColumn("span:id")
-		require.NoError(t, err)
-		assert.Nil(t, col, "span:id must NOT be in intrinsic section (NOTE-005)")
-		bcol := b.GetColumn("span:id")
-		require.NotNil(t, bcol, "span:id must be present as a block column")
-		v, ok := bcol.BytesValue(0)
+		col := getFlat(t, "span:id")
+		v, ok := intrinsicBytesAt(t, col, 0, 0)
 		assert.True(t, ok)
 		assert.Equal(t, spanID, v)
 	})
 
 	t.Run("span:parent_id", func(t *testing.T) {
-		col, err := r.GetIntrinsicColumn("span:parent_id")
-		require.NoError(t, err)
-		assert.Nil(t, col, "span:parent_id must NOT be in intrinsic section (NOTE-005)")
-		bcol := b.GetColumn("span:parent_id")
-		require.NotNil(t, bcol, "span:parent_id must be present as a block column")
-		v, ok := bcol.BytesValue(0)
+		col := getFlat(t, "span:parent_id")
+		v, ok := intrinsicBytesAt(t, col, 0, 0)
 		assert.True(t, ok)
 		assert.Equal(t, parentSpanID, v)
 	})
@@ -226,14 +211,9 @@ func TestOTLPField_Intrinsics(t *testing.T) {
 		assert.Equal(t, int64(tracev1.Status_STATUS_CODE_ERROR), v)
 	})
 
-	// NOTE-005: span:status_message is no longer stored in the intrinsic section.
 	t.Run("span:status_message (non-empty)", func(t *testing.T) {
-		col, err := r.GetIntrinsicColumn("span:status_message")
-		require.NoError(t, err)
-		assert.Nil(t, col, "span:status_message must NOT be in intrinsic section (NOTE-005)")
-		bcol := b.GetColumn("span:status_message")
-		require.NotNil(t, bcol, "span:status_message must be present as a block column")
-		v, ok := bcol.StringValue(0)
+		col := getDict(t, "span:status_message")
+		v, ok := intrinsicDictStringAt(t, col, 0, 0)
 		assert.True(t, ok)
 		assert.Equal(t, "something went wrong", v)
 	})

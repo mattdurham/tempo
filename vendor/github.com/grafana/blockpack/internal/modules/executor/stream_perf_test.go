@@ -5,6 +5,7 @@ package executor_test
 import (
 	"bytes"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -52,35 +53,36 @@ func TestCollect_IntrinsicTopK_MapPath_Stats(t *testing.T) {
 	r := openReader(t, data)
 	program := compileQuery(t, `{ resource.service.name = "rare-svc" }`)
 
-	var stats executor.CollectStats
-	rows, err := executor.Collect(r, program, executor.CollectOptions{
+	rows, qs, err := executor.Collect(r, program, executor.CollectOptions{
 		Limit:           2,
 		TimestampColumn: "span:start",
 		Direction:       queryplanner.Backward,
-		OnStats:         func(s executor.CollectStats) { stats = s },
 	})
 	require.NoError(t, err)
 	assert.Len(t, rows, 2, "limit=2 should return exactly 2 rows")
 
-	assert.Equal(t, "intrinsic-topk-kll", stats.ExecutionPath,
+	assert.Equal(t, "intrinsic-topk-kll", qs.ExecutionPath,
 		"Case B KLL path should set ExecutionPath=intrinsic-topk-kll")
-	assert.Equal(t, 3, stats.IntrinsicRefCount,
-		"IntrinsicRefCount should equal the number of matching refs")
-	assert.Equal(t, 0, stats.IntrinsicScanCount,
-		"IntrinsicScanCount should be 0 for the map path")
+	intrStep := findStep(qs, "intrinsic")
+	require.NotNil(t, intrStep, "intrinsic step must be present")
+	assert.Equal(t, 3, intrStep.Metadata["ref_count"],
+		"ref_count should equal the number of matching refs")
+	scanCount, _ := intrStep.Metadata["scan_count"].(int)
+	assert.Equal(t, 0, scanCount,
+		"scan_count should be 0 for the KLL map path")
 
 	// Descending order: rows[0] should be newer than rows[1].
 	if len(rows) == 2 {
-		r0Fields := rows[0].IntrinsicFields
-		r1Fields := rows[1].IntrinsicFields
-		require.NotNil(t, r0Fields, "IntrinsicFields should be populated for Case B")
-		require.NotNil(t, r1Fields, "IntrinsicFields should be populated for Case B")
-		ts0, ok0 := r0Fields.GetField("span:start")
-		ts1, ok1 := r1Fields.GetField("span:start")
-		require.True(t, ok0, "span:start should be present in row 0")
-		require.True(t, ok1, "span:start should be present in row 1")
-		ts0u := ts0.(uint64)
-		ts1u := ts1.(uint64)
+		require.NotNil(t, rows[0].Block, "Block should be populated for Case B")
+		require.NotNil(t, rows[1].Block, "Block should be populated for Case B")
+		ts0Col := rows[0].Block.GetColumn("span:start")
+		ts1Col := rows[1].Block.GetColumn("span:start")
+		require.NotNil(t, ts0Col, "span:start column should be present in row 0")
+		require.NotNil(t, ts1Col, "span:start column should be present in row 1")
+		ts0u, ok0 := ts0Col.Uint64Value(rows[0].RowIdx)
+		ts1u, ok1 := ts1Col.Uint64Value(rows[1].RowIdx)
+		require.True(t, ok0, "span:start should have a value in row 0")
+		require.True(t, ok1, "span:start should have a value in row 1")
 		assert.Greater(t, ts0u, ts1u, "row[0] should have a newer timestamp than row[1] (descending)")
 	}
 }
@@ -102,19 +104,17 @@ func TestCollect_IntrinsicTopK_ScanPath_Stats(t *testing.T) {
 	r := openReader(t, data)
 	program := compileQuery(t, `{ resource.service.name = "target" }`)
 
-	var stats executor.CollectStats
-	rows, err := executor.Collect(r, program, executor.CollectOptions{
+	rows, qs, err := executor.Collect(r, program, executor.CollectOptions{
 		Limit:           2,
 		TimestampColumn: "span:start",
 		Direction:       queryplanner.Backward,
-		OnStats:         func(s executor.CollectStats) { stats = s },
 	})
 	require.NoError(t, err)
 	assert.Len(t, rows, 2)
 
-	assert.Equal(t, "intrinsic-topk-scan", stats.ExecutionPath,
+	assert.Equal(t, "intrinsic-topk-scan", qs.ExecutionPath,
 		"scan path (large M) should set ExecutionPath=intrinsic-topk-scan")
-	assert.Greater(t, stats.IntrinsicScanCount, 0,
+	assert.Greater(t, intrinsicStep(qs).Metadata["scan_count"].(int), 0,
 		"IntrinsicScanCount should be > 0 for the scan path")
 }
 
@@ -156,29 +156,29 @@ func TestCollect_ExecutionPath_AllPaths(t *testing.T) {
 		// Case A: pure intrinsic + no TimestampColumn + Limit
 		r := openReader(t, data)
 		program := compileQuery(t, `{ resource.service.name = "svc" }`)
-		var stats executor.CollectStats
-		_, err := executor.Collect(r, program, executor.CollectOptions{
-			Limit:   10,
-			OnStats: func(s executor.CollectStats) { stats = s },
+		_, qs, err := executor.Collect(r, program, executor.CollectOptions{
+			Limit: 10,
 		})
 		require.NoError(t, err)
-		assert.Equal(t, "intrinsic-plain", stats.ExecutionPath)
+		assert.Equal(t, "intrinsic-plain", qs.ExecutionPath)
+		intrStep := mustFindStep(t, qs, "intrinsic")
+		assert.Greater(t, intrStep.Duration, time.Duration(0), "intrinsic step duration must be positive")
 	})
 
 	t.Run("intrinsic-topk-kll", func(t *testing.T) {
 		// Case B KLL path: pure intrinsic + TimestampColumn + Limit + small M
 		r := openReader(t, data)
 		program := compileQuery(t, `{ resource.service.name = "svc" }`)
-		var stats executor.CollectStats
-		_, err := executor.Collect(r, program, executor.CollectOptions{
+		_, qs, err := executor.Collect(r, program, executor.CollectOptions{
 			Limit:           10,
 			TimestampColumn: "span:start",
 			Direction:       queryplanner.Backward,
-			OnStats:         func(s executor.CollectStats) { stats = s },
 		})
 		require.NoError(t, err)
-		assert.Equal(t, "intrinsic-topk-kll", stats.ExecutionPath)
-		assert.Greater(t, stats.IntrinsicRefCount, 0,
+		assert.Equal(t, "intrinsic-topk-kll", qs.ExecutionPath)
+		intrStep := mustFindStep(t, qs, "intrinsic")
+		assert.Greater(t, intrStep.Duration, time.Duration(0), "intrinsic step duration must be positive")
+		assert.Greater(t, intrStep.Metadata["ref_count"].(int), 0,
 			"IntrinsicRefCount should be set for Case B")
 	})
 
@@ -190,16 +190,16 @@ func TestCollect_ExecutionPath_AllPaths(t *testing.T) {
 
 		r := openReader(t, data)
 		program := compileQuery(t, `{ resource.service.name = "svc" }`)
-		var stats executor.CollectStats
-		_, err := executor.Collect(r, program, executor.CollectOptions{
+		_, qs, err := executor.Collect(r, program, executor.CollectOptions{
 			Limit:           10,
 			TimestampColumn: "span:start",
 			Direction:       queryplanner.Backward,
-			OnStats:         func(s executor.CollectStats) { stats = s },
 		})
 		require.NoError(t, err)
-		assert.Equal(t, "intrinsic-topk-scan", stats.ExecutionPath)
-		assert.Greater(t, stats.IntrinsicScanCount, 0,
+		assert.Equal(t, "intrinsic-topk-scan", qs.ExecutionPath)
+		intrStep := mustFindStep(t, qs, "intrinsic")
+		assert.Greater(t, intrStep.Duration, time.Duration(0), "intrinsic step duration must be positive")
+		assert.Greater(t, intrStep.Metadata["scan_count"].(int), 0,
 			"IntrinsicScanCount should be > 0 for the scan path")
 	})
 
@@ -207,59 +207,78 @@ func TestCollect_ExecutionPath_AllPaths(t *testing.T) {
 		// Case C: mixed (intrinsic + non-intrinsic) + no TimestampColumn
 		r := openReader(t, data)
 		program := compileQuery(t, `{ resource.service.name = "svc" && span.http.method = "GET" }`)
-		var stats executor.CollectStats
-		_, err := executor.Collect(r, program, executor.CollectOptions{
-			Limit:   10,
-			OnStats: func(s executor.CollectStats) { stats = s },
+		_, qs, err := executor.Collect(r, program, executor.CollectOptions{
+			Limit: 10,
 		})
 		require.NoError(t, err)
-		assert.Equal(t, "mixed-plain", stats.ExecutionPath)
-		assert.GreaterOrEqual(t, stats.MixedCandidateBlocks, 1,
+		assert.Equal(t, "mixed-plain", qs.ExecutionPath)
+		prefilterStep := mustFindStep(t, qs, "mixed-prefilter")
+		assert.Greater(t, prefilterStep.Duration, time.Duration(0))
+		assert.GreaterOrEqual(t, prefilterStep.Metadata["candidate_blocks"].(int), 1,
 			"MixedCandidateBlocks should be >= 1 for mixed queries")
+		// Mixed paths fetch candidate blocks via forEachBlockInGroups but do not emit
+		// a separate "block-scan" step — I/O is bundled inside the mixed prefilter phase.
 	})
 
 	t.Run("mixed-topk", func(t *testing.T) {
 		// Case D: mixed + TimestampColumn + Limit
 		r := openReader(t, data)
 		program := compileQuery(t, `{ resource.service.name = "svc" && span.http.method = "GET" }`)
-		var stats executor.CollectStats
-		_, err := executor.Collect(r, program, executor.CollectOptions{
+		_, qs, err := executor.Collect(r, program, executor.CollectOptions{
 			Limit:           2,
 			TimestampColumn: "span:start",
 			Direction:       queryplanner.Backward,
-			OnStats:         func(s executor.CollectStats) { stats = s },
 		})
 		require.NoError(t, err)
-		assert.Equal(t, "mixed-topk", stats.ExecutionPath)
-		assert.GreaterOrEqual(t, stats.MixedCandidateBlocks, 1,
+		assert.Equal(t, "mixed-topk", qs.ExecutionPath)
+		prefilterStep := mustFindStep(t, qs, "mixed-prefilter")
+		assert.Greater(t, prefilterStep.Duration, time.Duration(0))
+		assert.GreaterOrEqual(t, prefilterStep.Metadata["candidate_blocks"].(int), 1,
 			"MixedCandidateBlocks should be >= 1 for mixed queries")
+		// Mixed paths fetch candidate blocks via forEachBlockInGroups but do not emit
+		// a separate "block-scan" step — I/O is bundled inside the mixed prefilter phase.
 	})
 
 	t.Run("block-plain", func(t *testing.T) {
 		// No intrinsic predicates → full block scan, plain path.
 		r := openReader(t, data)
 		program := compileQuery(t, `{ span.http.method = "GET" }`)
-		var stats executor.CollectStats
-		_, err := executor.Collect(r, program, executor.CollectOptions{
-			OnStats: func(s executor.CollectStats) { stats = s },
-		})
+		_, qs, err := executor.Collect(r, program, executor.CollectOptions{})
 		require.NoError(t, err)
-		assert.Equal(t, "block-plain", stats.ExecutionPath)
+		assert.Equal(t, "block-plain", qs.ExecutionPath)
+		planStep := mustFindStep(t, qs, "plan")
+		assert.Greater(t, planStep.Duration, time.Duration(0), "plan step duration must be positive")
+		assert.Greater(t, planStep.Metadata["total_blocks"].(int), 0)
+		assert.Greater(t, planStep.Metadata["selected_blocks"].(int), 0)
+		scanStep := mustFindStep(t, qs, "block-scan")
+		assert.Greater(t, scanStep.Duration, time.Duration(0), "scan step duration must be positive")
+		assert.Greater(t, scanStep.BytesRead, int64(0), "BytesRead must be positive for block reads")
+		assert.Greater(t, scanStep.IOOps, 0, "IOOps must be positive for block reads")
+		assert.Greater(t, scanStep.Metadata["fetched_blocks"].(int), 0)
+		assert.Greater(t, scanStep.Metadata["matched_rows"].(int), 0)
 	})
 
 	t.Run("block-topk", func(t *testing.T) {
 		// No intrinsic predicates + TimestampColumn + Limit → block-scan topK path.
 		r := openReader(t, data)
 		program := compileQuery(t, `{ span.http.method = "GET" }`)
-		var stats executor.CollectStats
-		_, err := executor.Collect(r, program, executor.CollectOptions{
+		_, qs, err := executor.Collect(r, program, executor.CollectOptions{
 			Limit:           2,
 			TimestampColumn: "span:start",
 			Direction:       queryplanner.Backward,
-			OnStats:         func(s executor.CollectStats) { stats = s },
 		})
 		require.NoError(t, err)
-		assert.Equal(t, "block-topk", stats.ExecutionPath)
+		assert.Equal(t, "block-topk", qs.ExecutionPath)
+		planStep := mustFindStep(t, qs, "plan")
+		assert.Greater(t, planStep.Duration, time.Duration(0), "plan step duration must be positive")
+		assert.Greater(t, planStep.Metadata["total_blocks"].(int), 0)
+		assert.Greater(t, planStep.Metadata["selected_blocks"].(int), 0)
+		scanStep := mustFindStep(t, qs, "block-scan")
+		assert.Greater(t, scanStep.Duration, time.Duration(0), "scan step duration must be positive")
+		assert.Greater(t, scanStep.BytesRead, int64(0), "BytesRead must be positive for block reads")
+		assert.Greater(t, scanStep.IOOps, 0, "IOOps must be positive for block reads")
+		assert.Greater(t, scanStep.Metadata["fetched_blocks"].(int), 0)
+		assert.Greater(t, scanStep.Metadata["matched_rows"].(int), 0)
 	})
 }
 
@@ -303,12 +322,10 @@ func TestCollect_IntrinsicTopK_KLLPath(t *testing.T) {
 	r := openReader(t, buf.Bytes())
 	program := compileQuery(t, `{ resource.service.name = "rare-svc" }`)
 
-	var stats executor.CollectStats
-	rows, err := executor.Collect(r, program, executor.CollectOptions{
+	rows, qs, err := executor.Collect(r, program, executor.CollectOptions{
 		Limit:           10, // non-binding: only 3 rare-svc spans exist
 		TimestampColumn: "span:start",
 		Direction:       queryplanner.Backward,
-		OnStats:         func(s executor.CollectStats) { stats = s },
 	})
 	require.NoError(t, err)
 	// All 3 rare-svc spans must be returned despite living in the oldest block (lowest
@@ -316,27 +333,27 @@ func TestCollect_IntrinsicTopK_KLLPath(t *testing.T) {
 	// the final global sort over all 3 pairs yields all results regardless of block order.
 	assert.Len(t, rows, 3, "all 3 rare-svc spans must be returned from the oldest block")
 
-	assert.Equal(t, "intrinsic-topk-kll", stats.ExecutionPath,
+	assert.Equal(t, "intrinsic-topk-kll", qs.ExecutionPath,
 		"Case B KLL path should set ExecutionPath=intrinsic-topk-kll")
-	assert.Equal(t, 3, stats.IntrinsicRefCount,
+	assert.Equal(t, 3, intrinsicStep(qs).Metadata["ref_count"].(int),
 		"IntrinsicRefCount should equal the number of matching refs")
-	assert.Equal(t, 0, stats.IntrinsicScanCount,
+	assert.Equal(t, 0, intrinsicStep(qs).Metadata["scan_count"].(int),
 		"IntrinsicScanCount should be 0 for the KLL path")
-	assert.Equal(t, 0, stats.FetchedBlocks,
-		"KLL path must not read full blocks")
+	// Intrinsic KLL path does not produce a block-scan step (no full blocks read).
+	assert.Nil(t, blockScanStep(qs), "KLL path must not read full blocks")
 
 	// Descending order: rows[0] should be newer than rows[1].
 	if len(rows) >= 2 {
-		r0Fields := rows[0].IntrinsicFields
-		r1Fields := rows[1].IntrinsicFields
-		require.NotNil(t, r0Fields, "IntrinsicFields should be populated for Case B")
-		require.NotNil(t, r1Fields, "IntrinsicFields should be populated for Case B")
-		ts0, ok0 := r0Fields.GetField("span:start")
-		ts1, ok1 := r1Fields.GetField("span:start")
-		require.True(t, ok0, "span:start should be present in row 0")
-		require.True(t, ok1, "span:start should be present in row 1")
-		ts0u := ts0.(uint64)
-		ts1u := ts1.(uint64)
+		require.NotNil(t, rows[0].Block, "Block should be populated for Case B")
+		require.NotNil(t, rows[1].Block, "Block should be populated for Case B")
+		ts0Col := rows[0].Block.GetColumn("span:start")
+		ts1Col := rows[1].Block.GetColumn("span:start")
+		require.NotNil(t, ts0Col, "span:start column should be present in row 0")
+		require.NotNil(t, ts1Col, "span:start column should be present in row 1")
+		ts0u, ok0 := ts0Col.Uint64Value(rows[0].RowIdx)
+		ts1u, ok1 := ts1Col.Uint64Value(rows[1].RowIdx)
+		require.True(t, ok0, "span:start should have a value in row 0")
+		require.True(t, ok1, "span:start should have a value in row 1")
 		assert.Greater(t, ts0u, ts1u, "row[0] should have a newer timestamp than row[1] (descending)")
 	}
 }
@@ -351,7 +368,7 @@ func TestCollect_IntrinsicTopK_EmptyResult(t *testing.T) {
 
 	// KLL path (default threshold).
 	r := openReader(t, data)
-	rows, err := executor.Collect(r, prog, executor.CollectOptions{
+	rows, _, err := executor.Collect(r, prog, executor.CollectOptions{
 		Limit:           10,
 		TimestampColumn: "span:start",
 		Direction:       queryplanner.Backward,
@@ -365,7 +382,7 @@ func TestCollect_IntrinsicTopK_EmptyResult(t *testing.T) {
 	t.Cleanup(func() { executor.SortScanThreshold = oldT })
 
 	r2 := openReader(t, data)
-	rows2, err := executor.Collect(r2, prog, executor.CollectOptions{
+	rows2, _, err := executor.Collect(r2, prog, executor.CollectOptions{
 		Limit:           10,
 		TimestampColumn: "span:start",
 		Direction:       queryplanner.Backward,
@@ -389,7 +406,7 @@ func TestCollect_SortScanThreshold_Boundary(t *testing.T) {
 	t.Cleanup(func() { executor.SortScanThreshold = oldT })
 
 	r1 := openReader(t, data)
-	rowsKLL, err := executor.Collect(r1, prog, executor.CollectOptions{
+	rowsKLL, _, err := executor.Collect(r1, prog, executor.CollectOptions{
 		Limit:           20,
 		TimestampColumn: "span:start",
 		Direction:       queryplanner.Backward,
@@ -400,7 +417,7 @@ func TestCollect_SortScanThreshold_Boundary(t *testing.T) {
 	executor.SortScanThreshold = 3
 
 	r2 := openReader(t, data)
-	rowsScan, err := executor.Collect(r2, prog, executor.CollectOptions{
+	rowsScan, _, err := executor.Collect(r2, prog, executor.CollectOptions{
 		Limit:           20,
 		TimestampColumn: "span:start",
 		Direction:       queryplanner.Backward,
@@ -413,7 +430,7 @@ func TestCollect_SortScanThreshold_Boundary(t *testing.T) {
 
 // GAP-25: TestCollect_TimestampFilterBoundary verifies that TimeRange boundaries are inclusive:
 // a point query [T, T] returns exactly the span whose start equals T and no others.
-// Uses the intrinsic fast path (Limit > 0 + TimestampColumn) to populate IntrinsicFields.
+// Uses the intrinsic fast path (Limit > 0 + TimestampColumn) to populate Block.
 func TestCollect_TimestampFilterBoundary(t *testing.T) {
 	// Build 3 spans at distinct timestamps using spanIdx 0, 1, 2.
 	// makeSpan sets StartTimeUnixNano = 1_000_000_000 + spanIdx*1000.
@@ -430,8 +447,8 @@ func TestCollect_TimestampFilterBoundary(t *testing.T) {
 
 	// spanIdx=1 → StartTimeUnixNano = 1_000_001_000.
 	const targetTS = uint64(1_000_001_000)
-	rows, err := executor.Collect(r, prog, executor.CollectOptions{
-		Limit:           10, // Limit triggers intrinsic fast path, populating IntrinsicFields.
+	rows, _, err := executor.Collect(r, prog, executor.CollectOptions{
+		Limit:           10, // Limit triggers intrinsic fast path, populating Block.
 		TimestampColumn: "span:start",
 		Direction:       queryplanner.Backward,
 		TimeRange: queryplanner.TimeRange{
@@ -441,10 +458,12 @@ func TestCollect_TimestampFilterBoundary(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Len(t, rows, 1, "point query [T,T] must return exactly 1 span")
-	require.NotNil(t, rows[0].IntrinsicFields, "IntrinsicFields must be populated by intrinsic path")
-	ts, ok := rows[0].IntrinsicFields.GetField("span:start")
-	require.True(t, ok, "span:start must be present in IntrinsicFields")
-	require.Equal(t, targetTS, ts.(uint64), "returned span must have timestamp == T")
+	require.NotNil(t, rows[0].Block, "Block must be populated by intrinsic path")
+	tsCol := rows[0].Block.GetColumn("span:start")
+	require.NotNil(t, tsCol, "span:start column must be present in Block")
+	ts, ok := tsCol.Uint64Value(rows[0].RowIdx)
+	require.True(t, ok, "span:start must have a value")
+	require.Equal(t, targetTS, ts, "returned span must have timestamp == T")
 }
 
 // GAP-27 (shard): TestCollect_ShardFilter verifies that two non-overlapping shards together
@@ -465,7 +484,7 @@ func TestCollect_ShardFilter(t *testing.T) {
 
 	// Shard A: blocks [0, 3) — first 3 blocks.
 	rA := openReader(t, data)
-	rowsA, err := executor.Collect(rA, prog, executor.CollectOptions{
+	rowsA, _, err := executor.Collect(rA, prog, executor.CollectOptions{
 		StartBlock: 0,
 		BlockCount: 3,
 	})
@@ -473,7 +492,7 @@ func TestCollect_ShardFilter(t *testing.T) {
 
 	// Shard B: blocks [3, 2) — last 2 blocks.
 	rB := openReader(t, data)
-	rowsB, err := executor.Collect(rB, prog, executor.CollectOptions{
+	rowsB, _, err := executor.Collect(rB, prog, executor.CollectOptions{
 		StartBlock: 3,
 		BlockCount: 2,
 	})
@@ -511,8 +530,7 @@ func TestCollect_IntrinsicTopK_ScanPath_TimeRange(t *testing.T) {
 	const minNano = uint64(1_000_001_000)
 	const maxNano = uint64(1_000_003_000)
 
-	var stats executor.CollectStats
-	rows, err := executor.Collect(r, program, executor.CollectOptions{
+	rows, qs, err := executor.Collect(r, program, executor.CollectOptions{
 		Limit:           10,
 		TimestampColumn: "span:start",
 		Direction:       queryplanner.Backward,
@@ -520,20 +538,24 @@ func TestCollect_IntrinsicTopK_ScanPath_TimeRange(t *testing.T) {
 			MinNano: minNano,
 			MaxNano: maxNano,
 		},
-		OnStats: func(s executor.CollectStats) { stats = s },
 	})
 	require.NoError(t, err)
-	require.Equal(t, "intrinsic-topk-scan", stats.ExecutionPath,
+	require.Equal(t, "intrinsic-topk-scan", qs.ExecutionPath,
 		"SortScanThreshold=1 forces scan path")
 
 	// Critical assertion: only rows within [minNano, maxNano] are returned.
 	require.Len(t, rows, 3, "expect exactly 3 rows in time window [1_000_001_000, 1_000_003_000]")
 	for _, row := range rows {
-		require.NotNil(t, row.IntrinsicFields, "IntrinsicFields must be populated")
-		ts, ok := row.IntrinsicFields.GetField("span:start")
-		require.True(t, ok, "span:start must be present")
-		tsVal := ts.(uint64)
+		require.NotNil(t, row.Block, "Block must be populated")
+		tsCol := row.Block.GetColumn("span:start")
+		require.NotNil(t, tsCol, "span:start column must be present")
+		tsVal, ok := tsCol.Uint64Value(row.RowIdx)
+		require.True(t, ok, "span:start must have a value")
 		assert.GreaterOrEqual(t, tsVal, minNano, "timestamp must be >= MinNano")
 		assert.LessOrEqual(t, tsVal, maxNano, "timestamp must be <= MaxNano")
 	}
 }
+
+// Test step helpers.
+func intrinsicStep(qs executor.QueryStats) *executor.StepStats { return findStep(qs, "intrinsic") }
+func blockScanStep(qs executor.QueryStats) *executor.StepStats { return findStep(qs, "block-scan") }

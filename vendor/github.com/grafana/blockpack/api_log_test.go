@@ -68,7 +68,7 @@ func TestQueryLogQL_MatchAll(t *testing.T) {
 	data := writeTestLogBlockpack(t, 6, 10)
 	r := openLogReader(t, data)
 
-	matches, err := blockpack.QueryLogQL(r, `{service.name=~".+"}`, blockpack.LogQueryOptions{})
+	matches, _, err := blockpack.QueryLogQL(r, `{service.name=~".+"}`, blockpack.LogQueryOptions{})
 	require.NoError(t, err)
 	assert.Len(t, matches, 6, "all 6 records should match")
 }
@@ -77,7 +77,7 @@ func TestQueryLogQL_LabelFilter(t *testing.T) {
 	data := writeTestLogBlockpack(t, 6, 10)
 	r := openLogReader(t, data)
 
-	matches, err := blockpack.QueryLogQL(r, `{service.name="svc-a"}`, blockpack.LogQueryOptions{})
+	matches, _, err := blockpack.QueryLogQL(r, `{service.name="svc-a"}`, blockpack.LogQueryOptions{})
 	require.NoError(t, err)
 	// Even indices: 0, 2, 4 → "log message 0", "log message 2", "log message 4"
 	assert.Len(t, matches, 3)
@@ -87,7 +87,7 @@ func TestQueryLogQL_LineFilterContains(t *testing.T) {
 	data := writeTestLogBlockpack(t, 6, 10)
 	r := openLogReader(t, data)
 
-	matches, err := blockpack.QueryLogQL(r, `{service.name=~".+"} |= "message 3"`, blockpack.LogQueryOptions{})
+	matches, _, err := blockpack.QueryLogQL(r, `{service.name=~".+"} |= "message 3"`, blockpack.LogQueryOptions{})
 	require.NoError(t, err)
 	assert.Len(t, matches, 1)
 	if len(matches) > 0 {
@@ -108,7 +108,7 @@ func TestQueryLogQL_TimeRange(t *testing.T) {
 		EndNano:   4_000_000_000,
 	}
 
-	matches, err := blockpack.QueryLogQL(r, `{service.name=~".+"}`, opts)
+	matches, _, err := blockpack.QueryLogQL(r, `{service.name=~".+"}`, opts)
 	require.NoError(t, err)
 	// Only records at 2s, 3s, 4s should match.
 	assert.Len(t, matches, 3, "expected 3 records in [2s, 4s]")
@@ -126,7 +126,7 @@ func TestQueryLogQL_Limit(t *testing.T) {
 	data := writeTestLogBlockpack(t, 6, 10)
 	r := openLogReader(t, data)
 
-	matches, err := blockpack.QueryLogQL(r, `{service.name=~".+"}`, blockpack.LogQueryOptions{Limit: 2})
+	matches, _, err := blockpack.QueryLogQL(r, `{service.name=~".+"}`, blockpack.LogQueryOptions{Limit: 2})
 	require.NoError(t, err)
 	assert.Len(t, matches, 2, "limit should cap results at 2")
 }
@@ -136,7 +136,7 @@ func TestQueryLogQL_ForwardDirection(t *testing.T) {
 	data := writeTestLogBlockpack(t, 6, 10)
 	r := openLogReader(t, data)
 
-	matches, err := blockpack.QueryLogQL(r, `{service.name="svc-a"}`, blockpack.LogQueryOptions{Forward: true})
+	matches, _, err := blockpack.QueryLogQL(r, `{service.name="svc-a"}`, blockpack.LogQueryOptions{Forward: true})
 	require.NoError(t, err)
 	require.NotEmpty(t, matches)
 
@@ -158,7 +158,7 @@ func TestQueryLogQL_BackwardDirection(t *testing.T) {
 	data := writeTestLogBlockpack(t, 6, 10)
 	r := openLogReader(t, data)
 
-	matches, err := blockpack.QueryLogQL(r, `{service.name="svc-a"}`, blockpack.LogQueryOptions{Forward: false})
+	matches, _, err := blockpack.QueryLogQL(r, `{service.name="svc-a"}`, blockpack.LogQueryOptions{Forward: false})
 	require.NoError(t, err)
 	require.NotEmpty(t, matches)
 
@@ -180,20 +180,20 @@ func TestQueryLogQL_EmptyResult(t *testing.T) {
 	data := writeTestLogBlockpack(t, 4, 10)
 	r := openLogReader(t, data)
 
-	matches, err := blockpack.QueryLogQL(r, `{service.name="nonexistent"}`, blockpack.LogQueryOptions{})
+	matches, _, err := blockpack.QueryLogQL(r, `{service.name="nonexistent"}`, blockpack.LogQueryOptions{})
 	require.NoError(t, err)
 	assert.Empty(t, matches)
 }
 
 func TestQueryLogQL_NilReader(t *testing.T) {
-	_, err := blockpack.QueryLogQL(nil, `{}`, blockpack.LogQueryOptions{})
+	_, _, err := blockpack.QueryLogQL(nil, `{}`, blockpack.LogQueryOptions{})
 	assert.Error(t, err)
 }
 
 func TestQueryLogQL_ParseError(t *testing.T) {
 	data := writeTestLogBlockpack(t, 1, 10)
 	r := openLogReader(t, data)
-	_, err := blockpack.QueryLogQL(r, `not valid logql`, blockpack.LogQueryOptions{})
+	_, _, err := blockpack.QueryLogQL(r, `not valid logql`, blockpack.LogQueryOptions{})
 	assert.Error(t, err)
 }
 
@@ -241,7 +241,7 @@ func TestStreamLogQL_PipelinePathLogAttrs(t *testing.T) {
 	r := openLogReader(t, output.Bytes())
 
 	// `| logfmt` forces pipeline != nil → dispatches to streamLogQLWithPipeline.
-	matches, err := blockpack.QueryLogQL(r, `{service.name="svc-a"} | logfmt`, blockpack.LogQueryOptions{})
+	matches, _, err := blockpack.QueryLogQL(r, `{service.name="svc-a"} | logfmt`, blockpack.LogQueryOptions{})
 	require.NoError(t, err)
 	require.NotEmpty(t, matches, "expected at least one matched entry")
 
@@ -292,4 +292,38 @@ func TestExecuteMetricsLogQL_NotMetricQuery(t *testing.T) {
 	opts := blockpack.LogMetricOptions{StartNano: 0, EndNano: 10_000_000_000, StepNano: 10_000_000_000}
 	_, err := blockpack.ExecuteMetricsLogQL(r, `{service.name="svc-a"}`, opts)
 	assert.Error(t, err)
+}
+
+// QS-API-01: QueryLogQL returns QueryStats with a populated ExecutionPath and positive TotalDuration.
+func TestQueryLogQL_ReturnsQueryStats(t *testing.T) {
+	t.Parallel()
+
+	data := writeTestLogBlockpack(t, 4, 10)
+	r := openLogReader(t, data)
+
+	// Simple label filter — no pipeline stages, routes through streamLogProgram.
+	matches, qs, err := blockpack.QueryLogQL(r, `{service.name="svc-a"}`, blockpack.LogQueryOptions{})
+	require.NoError(t, err)
+	assert.NotEmpty(t, matches)
+	assert.NotEmpty(t, qs.ExecutionPath, "ExecutionPath must be set")
+	assert.True(t, qs.TotalDuration > 0, "TotalDuration must be positive")
+}
+
+// QS-API-02: QueryLogQL with a pipeline stage returns QueryStats via streamLogQLWithPipeline.
+func TestQueryLogQL_PipelinePath_ReturnsQueryStats(t *testing.T) {
+	t.Parallel()
+
+	data := writeTestLogBlockpack(t, 4, 10)
+	r := openLogReader(t, data)
+
+	// Pipeline stage forces the pipeline path (streamLogQLWithPipeline).
+	matches, qs, err := blockpack.QueryLogQL(
+		r,
+		`{service.name="svc-a"} | line_format "{{.line}}"`,
+		blockpack.LogQueryOptions{},
+	)
+	require.NoError(t, err)
+	assert.NotEmpty(t, matches)
+	assert.NotEmpty(t, qs.ExecutionPath, "ExecutionPath must be set for pipeline path")
+	assert.True(t, qs.TotalDuration > 0, "TotalDuration must be positive for pipeline path")
 }

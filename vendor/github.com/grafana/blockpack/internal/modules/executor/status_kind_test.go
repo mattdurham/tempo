@@ -57,7 +57,7 @@ func TestStatusKindQuery(t *testing.T) {
 		require.True(t, ok)
 		prog, err := vm.CompileTraceQLFilter(filterExpr)
 		require.NoError(t, err)
-		rows, err := executor.Collect(r, prog, executor.CollectOptions{})
+		rows, _, err := executor.Collect(r, prog, executor.CollectOptions{})
 		require.NoError(t, err)
 		return len(rows)
 	}

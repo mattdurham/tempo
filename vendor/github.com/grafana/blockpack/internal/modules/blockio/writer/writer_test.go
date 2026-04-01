@@ -881,10 +881,10 @@ func TestAutoFlush_SameOutputAsBatch(t *testing.T) {
 
 	prog := compileWriterTestQuery(t, `{}`)
 
-	rowsAuto, err := modules_executor.Collect(rAuto, prog, modules_executor.CollectOptions{})
+	rowsAuto, _, err := modules_executor.Collect(rAuto, prog, modules_executor.CollectOptions{})
 	require.NoError(t, err)
 
-	rowsBatch, err := modules_executor.Collect(rBatch, prog, modules_executor.CollectOptions{})
+	rowsBatch, _, err := modules_executor.Collect(rBatch, prog, modules_executor.CollectOptions{})
 	require.NoError(t, err)
 
 	assert.Equal(t, totalSpans, len(rowsAuto), "auto-flush must return all %d spans", totalSpans)
@@ -924,7 +924,7 @@ func TestAutoFlush_Triggered(t *testing.T) {
 	// All spans must be readable
 	r := openWriterTestReader(t, buf.Bytes())
 	prog := compileWriterTestQuery(t, `{}`)
-	rows, err := modules_executor.Collect(r, prog, modules_executor.CollectOptions{})
+	rows, _, err := modules_executor.Collect(r, prog, modules_executor.CollectOptions{})
 	require.NoError(t, err)
 	assert.Equal(t, totalSpans, len(rows), "all %d spans must be present after auto-flush", totalSpans)
 }
@@ -1026,7 +1026,7 @@ func TestAutoFlush_ZeroMeansNoAutoFlush(t *testing.T) {
 
 	r := openWriterTestReader(t, buf.Bytes())
 	prog := compileWriterTestQuery(t, `{}`)
-	rows, err := modules_executor.Collect(r, prog, modules_executor.CollectOptions{})
+	rows, _, err := modules_executor.Collect(r, prog, modules_executor.CollectOptions{})
 	require.NoError(t, err)
 	assert.Equal(t, totalSpans, len(rows))
 }
@@ -1361,7 +1361,7 @@ func TestBoundedMemory_PendingBufferBounded(t *testing.T) {
 	// Verify all spans are readable from the output.
 	r := openWriterTestReader(t, buf.Bytes())
 	prog := compileWriterTestQuery(t, `{}`)
-	rows, err := modules_executor.Collect(r, prog, modules_executor.CollectOptions{})
+	rows, _, err := modules_executor.Collect(r, prog, modules_executor.CollectOptions{})
 	require.NoError(t, err)
 	assert.Equal(t, totalSpans, len(rows), "all spans must be present in output")
 }
@@ -1712,13 +1712,21 @@ func TestAddTempoTrace_RejectsMixedSignal(t *testing.T) {
 			{
 				Resource: &resourcev1.Resource{
 					Attributes: []*commonv1.KeyValue{
-						{Key: "service.name", Value: &commonv1.AnyValue{Value: &commonv1.AnyValue_StringValue{StringValue: "svc"}}},
+						{
+							Key:   "service.name",
+							Value: &commonv1.AnyValue{Value: &commonv1.AnyValue_StringValue{StringValue: "svc"}},
+						},
 					},
 				},
 				ScopeLogs: []*logsv1.ScopeLogs{
 					{
 						LogRecords: []*logsv1.LogRecord{
-							{TimeUnixNano: 1000, Body: &commonv1.AnyValue{Value: &commonv1.AnyValue_StringValue{StringValue: "hello"}}},
+							{
+								TimeUnixNano: 1000,
+								Body: &commonv1.AnyValue{
+									Value: &commonv1.AnyValue_StringValue{StringValue: "hello"},
+								},
+							},
 						},
 					},
 				},
@@ -1753,7 +1761,12 @@ func TestAddTempoTrace_EquivalentToOTLP(t *testing.T) {
 			{
 				Resource: &temporesource.Resource{
 					Attributes: []*tempocommon.KeyValue{
-						{Key: "service.name", Value: &tempocommon.AnyValue{Value: &tempocommon.AnyValue_StringValue{StringValue: "my-svc"}}},
+						{
+							Key: "service.name",
+							Value: &tempocommon.AnyValue{
+								Value: &tempocommon.AnyValue_StringValue{StringValue: "my-svc"},
+							},
+						},
 					},
 				},
 				ScopeSpans: []*tempotrace.ScopeSpans{
@@ -1767,7 +1780,12 @@ func TestAddTempoTrace_EquivalentToOTLP(t *testing.T) {
 								StartTimeUnixNano: 1_000_000_000,
 								EndTimeUnixNano:   2_000_000_000,
 								Attributes: []*tempocommon.KeyValue{
-									{Key: "http.method", Value: &tempocommon.AnyValue{Value: &tempocommon.AnyValue_StringValue{StringValue: "GET"}}},
+									{
+										Key: "http.method",
+										Value: &tempocommon.AnyValue{
+											Value: &tempocommon.AnyValue_StringValue{StringValue: "GET"},
+										},
+									},
 								},
 							},
 						},
@@ -1843,9 +1861,6 @@ func TestAddTempoTrace_MultipleBlocks(t *testing.T) {
 // block columns (for O(1) reverse lookups) AND the intrinsic TOC section (for
 // fast block-level pruning). This dual-storage approach was restored to fix an
 // O(N) per-column reverse lookup regression introduced in PR #172.
-//
-// Note: trace:id, span:id, span:parent_id, span:status_message are identity columns
-// stored in block columns but NOT in the intrinsic section (NOTE-005 in writer/NOTES.md).
 func TestIntrinsicDualStorage(t *testing.T) {
 	var buf bytes.Buffer
 	w := newTestWriter(t, &buf, 0)
@@ -1864,8 +1879,9 @@ func TestIntrinsicDualStorage(t *testing.T) {
 	bwb, err := r.GetBlockWithBytes(0, nil, nil)
 	require.NoError(t, err)
 
-	// Intrinsic columns MUST be present in block columns (dual storage for O(1) lookups),
-	// including identity columns (trace:id, span:id) which are NOT in the intrinsic section.
+	// Intrinsic columns MUST be present in block columns (dual storage for O(1) lookups).
+	// 7 identity fields + span:status (Status{Code:STATUS_CODE_UNSET} is non-nil) +
+	// resource.service.name ("acme" service triggers dual-storage addPresent).
 	intrinsicColNames := []string{
 		"trace:id",
 		"span:id",
@@ -1882,25 +1898,18 @@ func TestIntrinsicDualStorage(t *testing.T) {
 			"intrinsic column %q must be present in block columns (dual storage)", name)
 	}
 
-	// The intrinsic section contains only non-identity predicate columns (7 total after NOTE-005).
-	// trace:id, span:id, span:parent_id, span:status_message are excluded from the intrinsic section.
+	// The intrinsic section must also contain the identity fields.
 	intrinsicColumnNames := r.IntrinsicColumnNames()
 	intrinsicSet := make(map[string]struct{}, len(intrinsicColumnNames))
 	for _, n := range intrinsicColumnNames {
 		intrinsicSet[n] = struct{}{}
 	}
 	for _, want := range []string{
-		"span:name", "span:kind", "span:start", "span:duration",
-		"span:status", "resource.service.name",
+		"trace:id", "span:id", "span:name", "span:kind",
+		"span:start", "span:duration", "span:status", "resource.service.name",
 	} {
 		_, ok := intrinsicSet[want]
 		assert.True(t, ok, "intrinsic section must contain column %q", want)
-	}
-
-	// Identity columns must NOT be in the intrinsic section (NOTE-005).
-	for _, notWant := range []string{"trace:id", "span:id", "span:parent_id", "span:status_message"} {
-		_, ok := intrinsicSet[notWant]
-		assert.False(t, ok, "identity column %q must not be in intrinsic section (NOTE-005)", notWant)
 	}
 
 	// span:end must NOT be in the intrinsic section — it is synthesized from start+duration on read.

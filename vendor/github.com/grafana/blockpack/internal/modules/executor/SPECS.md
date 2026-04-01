@@ -19,7 +19,7 @@ This document defines the public contracts, input/output semantics, and invarian
 ## 2. Executor
 
 ```go
-func Collect(r *modules_reader.Reader, program *vm.Program, opts CollectOptions) ([]MatchedRow, error)
+func Collect(r *modules_reader.Reader, program *vm.Program, opts CollectOptions) ([]MatchedRow, QueryStats, error)
 func SpanMatchFromRow(row MatchedRow, signalType uint8, r *modules_reader.Reader) SpanMatch
 ```
 
@@ -27,6 +27,7 @@ func SpanMatchFromRow(row MatchedRow, signalType uint8, r *modules_reader.Reader
 When `TimestampColumn` and `Limit` are both set, `Collect` uses a heap-based scan
 to guarantee globally correct top-K results (see §6, SPEC-STREAM-7).
 `SpanMatchFromRow` extracts identity fields from a `MatchedRow` after collection.
+`QueryStats` is always returned (never nil); callers may ignore it with `_`.
 
 ---
 
@@ -34,7 +35,7 @@ to guarantee globally correct top-K results (see §6, SPEC-STREAM-7).
 
 ### 3.1 Parameters
 
-- `r *modules_reader.Reader` — the modules blockpack reader. A nil `r` returns `(nil, nil)`.
+- `r *modules_reader.Reader` — the modules blockpack reader. A nil `r` returns `(nil, QueryStats{}, nil)`.
 - `program *vm.Program` — compiled TraceQL filter (from `vm.CompileTraceQLFilter`). A nil
   `program` returns an error (`"executor.Collect: program must not be nil"`).
 - `opts CollectOptions` — execution hints (see §4.3).
@@ -57,8 +58,8 @@ to guarantee globally correct top-K results (see §6, SPEC-STREAM-7).
    c. Per-row time filtering via `TimestampColumn` if set (SPEC-STREAM-4).
    d. Append `MatchedRow{Block, BlockIdx, RowIdx}` to results.
    e. If `opts.Limit > 0` and `len(results) >= opts.Limit`, return early.
-7. If `opts.OnStats != nil`, invoke the deferred callback with `CollectStats`.
-8. Return `[]MatchedRow`.
+7. Populate and return `QueryStats` with `ExecutionPath`, `TotalDuration`, and per-step `Steps` (see §4.4).
+8. Return `([]MatchedRow, QueryStats, nil)`.
 
 ### 3.3 Error Conditions
 
@@ -117,10 +118,11 @@ If the relevant column is absent or the row is null, the field is left at its ze
 type MatchedRow struct {
     Block           *modules_reader.Block
     // IntrinsicFields is set when the result was produced without reading full block
-    // data — Case B (pure intrinsic + sort) only. Block is nil when IntrinsicFields is set.
-    // Case A (pure intrinsic + no sort) always populates Block via forEachBlockInGroups
-    // and leaves IntrinsicFields nil. The caller should use IntrinsicFields for field
-    // lookups when Block is nil.
+    // data — either Case B (pure intrinsic + sort) or Case A with a range predicate
+    // (pure intrinsic + no sort + hasRangePredicate=true, see NOTE-047). Block is nil
+    // when IntrinsicFields is set. Case A with equality predicates populates Block via
+    // forEachBlockInGroups and leaves IntrinsicFields nil. The caller should use
+    // IntrinsicFields for field lookups when Block is nil.
     IntrinsicFields modules_shared.SpanFieldsProvider
     BlockIdx        int
     RowIdx          int
@@ -138,7 +140,6 @@ Matches are in block-then-row order (no randomization). When `TimestampColumn` a
 
 ```go
 type CollectOptions struct {
-    OnStats         func(CollectStats)
     TimestampColumn string
     TimeRange       queryplanner.TimeRange
     Limit           int
@@ -155,36 +156,50 @@ type CollectOptions struct {
 | `Limit` | Max matches. `0` = no limit. When reached, executor returns early. |
 | `Direction` | Forward (default, ascending) or Backward (descending). |
 | `TimestampColumn` | `""` disables per-row time filtering. `"log:timestamp"` or `"span:start"` enables it. |
-| `OnStats` | Optional; called (deferred) after execution with `CollectStats`. |
 | `AllColumns` | `false` (default): second pass decodes predicate + search columns. `true`: decode all columns. Only needed for `IterateFields()` callbacks (NOTE-028). |
 | `StartBlock` | First block index for sub-file sharding. See §3.4. |
 | `BlockCount` | Number of blocks for sub-file sharding. `0` = scan all. See §3.4. |
 
-### 4.4 CollectStats
+### 4.4 QueryStats and StepStats
+
+`Collect` and `CollectLogs` return a `QueryStats` value as their second return instead of
+calling an `OnStats` callback. `QueryStats` is always non-zero; callers may discard it
+with `_`.
 
 ```go
-type CollectStats struct {
-    Explain              string
-    TotalBlocks          int
-    PrunedByTime         int
-    PrunedByIndex        int
-    PrunedByFuse         int
-    PrunedByCMS          int
-    SelectedBlocks       int
-    FetchedBlocks        int
-    ExecutionPath        string
-    IntrinsicRefCount    int
-    IntrinsicScanCount   int
-    MixedCandidateBlocks int
+type QueryStats struct {
+    ExecutionPath string
+    TotalDuration time.Duration
+    Steps         []StepStats
+}
+
+type StepStats struct {
+    Name      string
+    Duration  time.Duration
+    BytesRead int64
+    IOOps     int
+    Metadata  map[string]any
 }
 ```
 
-- `Explain` — ASCII trace of how the predicate tree resolved to block sets.
-- `FetchedBlocks` — blocks actually read from storage (≤ `SelectedBlocks`).
-- `ExecutionPath` — one of 8 string constants identifying which code path ran (see §6.1 SPEC-STREAM-6). NOTE-044: "intrinsic-topk-sort" renamed to "intrinsic-topk-kll".
-- `IntrinsicRefCount` — number of refs from `BlockRefsFromIntrinsicTOC` (M for Case B). Zero for all other paths.
-- `IntrinsicScanCount` — entries visited by `ScanFlatColumnRefsFiltered` (Case B scan path only). Zero for map path and all other paths.
-- `MixedCandidateBlocks` — unique candidate blocks from partial-AND pre-filter (Cases C/D). Zero for all other paths.
+**`ExecutionPath`** — one of the path constants identifying which code branch ran (see §6.1 SPEC-STREAM-6). NOTE-044: "intrinsic-topk-sort" renamed to "intrinsic-topk-kll".
+
+**`Steps`** — ordered list of per-phase stats. Only phases that actually ran appear in the slice. Step `Name` values and their `Metadata` keys:
+
+| Step name | Appears when | Metadata keys |
+|-----------|-------------|---------------|
+| `"plan"` | Block-scan path (not intrinsic fast path) | `total_blocks`, `selected_blocks`, `pruned_by_time`, `pruned_by_index`, `pruned_by_fuse`, `pruned_by_cms`, `explain` |
+| `"intrinsic"` | Cases A, B, C, D fast paths | Case A plain: `selected_blocks`. Case B KLL: `ref_count`, `scan_count` (=0). Case B scan: `ref_count`, `scan_count`. |
+| `"mixed-prefilter"` | Cases C, D mixed paths | `candidate_blocks` |
+| `"block-scan"` | Block-scan path | `fetched_blocks`, `matched_rows` |
+
+**`QueryStats.Explain()`** — convenience method that returns the `"explain"` string from
+the `"plan"` step's Metadata, or `""` if the plan step is absent or has no explain value.
+Back-ref: `internal/modules/executor/query_stats.go:QueryStats.Explain`
+
+**`QueryStats.SelectedBlocks()`** — convenience method that returns the `"selected_blocks"` int
+from the `"plan"` step's Metadata, or `0` if the plan step is absent.
+Back-ref: `internal/modules/executor/query_stats.go:QueryStats.SelectedBlocks`
 
 ### 4.5 Result (Legacy)
 
@@ -293,17 +308,20 @@ I/O path (see NOTE-035).
   nil (match-all), the full block is fetched as before. The unit of lazy fetch remains the
   coalesced group, but each group's read volume is bounded by the sum of the wanted
   columns' byte ranges across the group's blocks rather than the full block sizes.
-- **SPEC-STREAM-3:** `FetchedBlocks <= SelectedBlocks`. `FetchedBlocks` is incremented at `ReadGroup` time by the count of blocks in the fetched group (actual I/O). Groups that are skipped due to early stop are not counted.
+- **SPEC-STREAM-3:** `StepStats.IOOps` counts `ReadGroup` calls (one per coalesced group fetched). `"fetched_blocks"` in step Metadata counts individual blocks fetched. Both values exclude groups skipped due to early stop.
 - **SPEC-STREAM-4:** `TimestampColumn == ""` disables per-row time filtering (trace mode). `TimestampColumn == "log:timestamp"` enables per-row `[MinNano, MaxNano]` checks.
 - **SPEC-STREAM-5:** Direction is applied at plan time (`PlanWithOptions`). Within each block, when `TimestampColumn` is set, rows are sorted by per-row timestamp: ascending for Forward (oldest first), descending for Backward (newest first). When `TimestampColumn` is empty (trace mode), rows are reversed for Backward direction.
-- **SPEC-STREAM-6:** `OnStats` is called exactly once per `Collect` invocation. For the
-  block-scan fallback path (when the intrinsic fast path is not used), `OnStats` is
-  deferred and `FetchedBlocks` reflects actual I/O at completion (including early-stop
-  paths). For fast-path returns (Cases A–D from `collectFromIntrinsicRefs`), `OnStats`
-  is called synchronously before `Collect` returns; `ExecutionPath`, `IntrinsicRefCount`,
-  `IntrinsicScanCount`, and `MixedCandidateBlocks` are populated as applicable.
-  The block-scan deferred callback and the fast-path synchronous callback are mutually
-  exclusive — exactly one fires for any given call. See NOTE-043, NOTE-044.
+- **SPEC-STREAM-6:** `Collect` always returns a non-zero `QueryStats` as its second value.
+  `QueryStats.ExecutionPath` identifies the code path: one of `"intrinsic-plain"`,
+  `"intrinsic-topk-kll"`, `"intrinsic-topk-scan"`, `"mixed-plain"`, `"mixed-topk"`,
+  `"intrinsic-need-block-scan"`, `"block-plain"`, `"block-topk"`, `"block-pruned"`, or
+  `"bloom-rejected"`.
+  `QueryStats.TotalDuration` is the wall-clock duration of the full `Collect` call.
+  `QueryStats.Steps` contains one entry per phase that ran; see §4.4 for step names and
+  metadata keys. The `"plan"` step is absent for intrinsic fast paths (Cases A–D) since
+  `planBlocks` is not called on those paths. When the intrinsic path falls through to the
+  full block scan (errNeedBlockScan), `slog.Warn` is emitted with the fast-path's
+  `ExecutionPath` and `total_blocks` fields. See NOTE-043, NOTE-044.
 - **SPEC-STREAM-7:** When `TimestampColumn` and `Limit` are both set, `Collect` guarantees the returned rows are the globally top-`Limit` entries by per-row timestamp. A heap of size `Limit` is maintained: min-heap for Backward (evict oldest), max-heap for Forward (evict newest). Block-level early termination: blocks with `MaxStart <= heap.min` (Backward) or `MinStart >= heap.max` (Forward) are skipped entirely (no I/O). Results are delivered in sort order after the scan completes (not lazily). Back-ref: `internal/modules/executor/stream_topk.go:topKScanBlocks`
 - **SPEC-STREAM-8:** `QueryOptions.MostRecent` in the public API (`api.go`) maps to `Direction: Backward` + `TimestampColumn: "span:start"` in `CollectOptions`. When `true` with no `Limit`, blocks are traversed in reverse `BlockMeta.MinStart` order and rows within each block are sorted by `span:start` descending — this is locally newest-first but does not guarantee global ordering when block time ranges overlap. When `true` with a `Limit`, `Collect` is used with `TimestampColumn` set, which guarantees the returned spans are the globally top-`Limit` by `span:start` (SPEC-STREAM-7). Default (`false`) is forward with no timestamp sort. Only applies to filter queries; structural queries collect all blocks regardless.
   *Addendum (2026-03-25):* The original spec stated "`span:start` is always in `searchMetaColumns` so no extra I/O is needed." This is no longer accurate. `span:start` is now served via `traceIntrinsicColumns` injection into `secondPassCols` in `Collect` (see NOTE-050). When `wantColumns != nil && !opts.AllColumns`, `span:start` enters `secondPassCols` via the `traceIntrinsicColumns` loop, ensuring it is decoded for the per-row sort. When `opts.AllColumns = true`, `secondPassCols` is nil (decode all columns), which also covers `span:start`. Both paths guarantee `span:start` is available for sorting; no extra I/O is required.
@@ -312,12 +330,16 @@ I/O path (see NOTE-035).
   intrinsic predicate (`hasSomeIntrinsicPredicates` returns true), `Collect` runs an
   intrinsic pre-filter before the full block scan. The pre-filter dispatches on
   `(ProgramIsIntrinsicOnly × TimestampColumn != "")`:
-  - Pure intrinsic + no sort (Case A): uses `forEachBlockInGroups` for field population.
-      `MatchedRow.Block` is populated; `MatchedRow.IntrinsicFields` is nil.
-      This applies to both equality predicates (status=error, kind=server) and range
-      predicates (duration>100ms, svc=~".*"). Block reads are O(M) where M is the result
-      count — cheaper than the former O(N) intrinsic column scan for range predicates.
-      See NOTE-047 (historical) and the companion note for the unified-path change.
+  - Pure intrinsic + no sort (Case A): adaptive dispatch on `hasRangePredicate(program)`:
+      - Range predicates (Min or Max set, e.g. `duration>100ms`): `lookupIntrinsicFields`
+        reads field values from cached intrinsic blobs — zero internal block reads.
+        `MatchedRow.IntrinsicFields` is populated; `MatchedRow.Block` is nil.
+      - Equality predicates (Values set, e.g. `status=error`, `svc=X`): `forEachBlockInGroups`
+        reads only the internal blocks containing matched refs — targeted I/O.
+        `MatchedRow.Block` is populated; `MatchedRow.IntrinsicFields` is nil.
+      The range path is faster when refs are spread across many blocks (sorted flat column
+      scan scatters matches). The equality path is faster when refs cluster in 1-3 blocks
+      (dict-equality matches are sparse and highly localised). See NOTE-047.
   - Pure intrinsic + sort: group refs by block, order blocks by BlockMeta.MaxStart DESC
     (KLL path NOTE-044), build packed-key→timestamp map from tsCol (O(N)), look up each
     ref's timestamp, sort M pairs, return IntrinsicFields rows (zero block reads).
@@ -456,7 +478,7 @@ func CollectLogs(
     program *vm.Program,
     pipeline *logqlparser.Pipeline,
     opts CollectOptions,
-) ([]LogEntry, error)
+) ([]LogEntry, QueryStats, error)
 ```
 
 ### 8.2 Behaviour
@@ -487,8 +509,13 @@ This is the primary log collection entry point for `api.go`'s pipeline path.
   without transformation.
 - **SPEC-SLK-5:** Results are returned in sort order after the full scan completes (not
   lazily). Backward: newest first. Forward: oldest first.
-- **SPEC-SLK-6:** `OnStats` is deferred; `FetchedBlocks` reflects actual I/O at the time
-  execution completes. `FetchedBlocks` counts per-group, not per-block.
+- **SPEC-SLK-6:** `CollectLogs` returns a `QueryStats` as its second value. The `"plan"`
+  step records `total_blocks` and `selected_blocks`; the `"block-scan"` step records
+  `fetched_blocks` (number of individual blocks fetched across all groups), `IOOps`
+  (number of `ReadGroup` calls, i.e. coalesced group fetches), and `BytesRead` (sum of
+  `BlockMeta.Length` for all blocks in fetched groups, including blocks skipped by
+  block-level pruning within the group). `TotalDuration` is wall-clock for the full call.
+  `ExecutionPath` is `"block-topk"` when `opts.Limit > 0`, else `"block-plain"`.
 
 Back-ref: `internal/modules/executor/stream_log_topk.go:CollectLogs`
 
@@ -782,47 +809,3 @@ Invoked when `QueryTraceQL` receives a `*traceqlparser.MetricsQuery` (e.g.
 
 Back-ref: `api.go:streamPipelineQuery`, `api.go:computeSpansetAggregate`,
 `api.go:getSpanFieldNumeric`, `api.go:compareThreshold`
-
----
-
-## 13. Intrinsic Section Usage Invariant
-
-**SPEC-INTRINSIC-001: The intrinsic section is ONLY for predicate evaluation (filtering).**
-
-The intrinsic section (sorted-by-value columns) is used exclusively by `BlockRefsFromIntrinsicTOC`
-and `blockRefsFromIntrinsicPartial` to find matching refs via binary search, dict lookup, and
-set intersection. It is never used for span reconstruction or field population.
-
-Field values for search result display are always read from **block columns** via
-`forEachBlockInGroups`. Block columns contain all intrinsic values (dual storage).
-This separation ensures:
-- Predicate evaluation: O(log N + M) via sorted intrinsic columns (binary search, dict lookup)
-- Field population: O(M) via block reads (one read per matched block)
-
-**SPEC-INTRINSIC-002: Query result cardinality is always small (M << N).**
-
-Typical queries return <100 traces with <10 spans each. Field population via block reads
-is O(M) and always cheap. The intrinsic section optimization targets predicate evaluation
-(reducing N to M), not field population.
-
-**SPEC-INTRINSIC-003: TraceQL metrics queries may read intrinsic columns directly.**
-
-`ExecuteMetricsTraceQL` and `ExecuteTraceMetrics` aggregate over intrinsic flat columns
-(span:start, span:duration) without materializing spans. These are the exception to
-SPEC-INTRINSIC-001 — they read intrinsic column values for aggregation, not for span
-reconstruction.
-
-**SPEC-INTRINSIC-004: Always check bloom and min/max at every level before scanning.**
-
-Before any intrinsic column scan, the following pruning checks MUST be applied in order:
-
-1. **Tempo level (BlockMeta)**: time range, column-level min/max if available
-2. **File level (FileBloom)**: check file bloom filter for predicate values — skip entire file if bloom says "not present"
-3. **Block level (planBlocks / range index)**: per-internal-block min/max pruning — skip internal blocks whose value range doesn't overlap the predicate
-
-The intrinsic fast path (`collectFromIntrinsicRefs`) currently bypasses all three.
-This must be fixed: integrate FileBloom check before `BlockRefsFromIntrinsicTOC`,
-and pass the planBlocks-pruned block set to limit the intrinsic scan scope.
-
-Back-ref: `stream.go:collectIntrinsicPlain`, `stream.go:collectIntrinsicTopK`,
-`predicates.go:BlockRefsFromIntrinsicTOC`, `metrics_trace.go:ExecuteTraceMetrics`

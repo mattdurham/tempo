@@ -7,16 +7,11 @@ const (
 	MagicNumber       uint32 = 0xC011FEA1
 	CompactIndexMagic uint32 = 0xC01DC1DE
 
-	VersionV10 uint8 = 10
-	VersionV11 uint8 = 11
-	VersionV12 uint8 = 12 // V12: snappy-compressed metadata section + extended header with signal_type byte at offset 21
-	VersionV13 uint8 = 13 // V13: block index omits MinTraceID[16]+MaxTraceID[16] per entry (saves 32 bytes/block)
+	VersionV13 uint8 = 13 // V13: snappy-compressed metadata, signal_type byte, no per-block trace IDs
 
 	// VersionBlockV12 is the block-content format version written into each block's 24-byte
-	// header starting with file version V13. It eliminates the 16-byte stats_offset/stats_len
-	// stub fields from column metadata entries (saves 16 bytes per column per block).
-	// Earlier files use VersionV11 blocks; the reader detects the block header version and
-	// applies version-aware parsing.
+	// header. It omits the 16-byte stats_offset/stats_len stub fields from column metadata
+	// entries (saves 16 bytes per column per block).
 	VersionBlockV12 uint8 = 12
 
 	SignalTypeTrace uint8 = 0x01 // file contains OTEL trace spans
@@ -78,6 +73,7 @@ const (
 	IntrinsicPageBloomK           = 7  // number of hash functions (Kirsch-Mitzenmacher)
 	IntrinsicPageBloomBitsPerItem = 10 // bits per unique value in the bloom filter
 	IntrinsicPageBloomMinBytes    = 16 // minimum bloom filter size in bytes
+
 )
 
 // MaxIntrinsicRows is the safety cap on accumulated rows. If total rows across all
