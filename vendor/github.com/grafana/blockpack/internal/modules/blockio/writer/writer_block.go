@@ -198,7 +198,17 @@ func buildBlock(
 			bb.addRowFromBlock(ps.srcBlock, ps.srcRowIdx, rowIdx)
 			if ps.srcReader != nil {
 				k := readerBlockKey{ps.srcReader, ps.srcBlockIdx}
-				bb.feedIntrinsicsFromIndex(intrinsicIndexCache[k], ps.srcRowIdx, rowIdx)
+				// feedIntrinsicsFromIndex is only needed for v4+ blocks that store
+				// identity columns (trace:id, span:id, etc.) exclusively in the
+				// intrinsic section. For v3 blocks that use dual storage (same fields
+				// in both block columns and the intrinsic section), addRowFromBlock
+				// has already written these fields via applyTraceID and friends.
+				// Calling feedIntrinsicsFromIndex for a dual-storage block would
+				// append a second entry to the intrinsic accumulator for the same
+				// (blockIdx, rowIdx), causing GetTraceByID to return each span twice.
+				if ps.srcBlock.GetColumn(traceIDColumnName) == nil {
+					bb.feedIntrinsicsFromIndex(intrinsicIndexCache[k], ps.srcRowIdx, rowIdx)
+				}
 			}
 		case ps.tempoSpan != nil:
 			bb.addRowFromTempoProto(ps, rowIdx)
