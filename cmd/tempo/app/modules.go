@@ -372,7 +372,7 @@ func (t *App) initBlockBuilder() (services.Service, error) {
 	}
 
 	t.cfg.BlockBuilder.IngestStorageConfig = t.cfg.Ingest
-	t.cfg.BlockBuilder.IngestStorageConfig.Kafka.ConsumerGroup = blockbuilder.ConsumerGroup
+	t.cfg.BlockBuilder.IngestStorageConfig.Kafka.ConsumerGroup = t.cfg.BlockBuilder.ConsumerGroup
 	t.cfg.BlockBuilder.GlobalBlockConfig = t.cfg.StorageConfig.Trace.Block
 
 	if IsSingleBinary(t.cfg.Target) && len(t.cfg.BlockBuilder.AssignedPartitionsMap) == 0 {
