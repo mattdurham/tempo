@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/go-kit/log/level"
 	httpgrpc_server "github.com/grafana/dskit/httpgrpc/server"
@@ -33,7 +32,6 @@ import (
 	"github.com/grafana/tempo/pkg/search"
 	"github.com/grafana/tempo/pkg/tempopb"
 	"github.com/grafana/tempo/pkg/traceql"
-	"github.com/grafana/tempo/pkg/traceqlmetrics"
 	"github.com/grafana/tempo/pkg/util/log"
 	"github.com/grafana/tempo/pkg/validation"
 	"github.com/grafana/tempo/tempodb/backend"
@@ -660,9 +658,14 @@ func (q *Querier) SearchBlock(ctx context.Context, req *tempopb.SearchBlockReque
 		}
 		ctx = common.WithOriginalTraceQLQuery(ctx, queryForBackend, mostRecent)
 
-		fetcher := traceql.NewSpansetFetcherWrapper(func(ctx context.Context, req traceql.FetchSpansRequest) (traceql.FetchSpansResponse, error) {
-			return q.store.Fetch(ctx, meta, req, opts)
-		})
+		fetcher := traceql.NewSpansetFetcherWrapperBoth(
+			func(ctx context.Context, req traceql.FetchSpansRequest) (traceql.FetchSpansResponse, error) {
+				return q.store.Fetch(ctx, meta, req, opts)
+			},
+			func(ctx context.Context, req traceql.FetchSpansRequest) (traceql.FetchSpansOnlyResponse, error) {
+				return q.store.FetchSpans(ctx, meta, req, opts)
+			},
+		)
 
 		return q.engine.ExecuteSearch(ctx, req.SearchReq, fetcher, q.limits.UnsafeQueryHints(tenantID))
 	}
@@ -707,8 +710,8 @@ func (q *Querier) internalTagsSearchBlockV2(ctx context.Context, req *tempopb.Se
 	opts.StartPage = int(req.StartPage)
 	opts.TotalPages = int(req.PagesToSearch)
 
-	query := traceql.ExtractMatchers(req.SearchReq.Query)
-	if traceql.IsEmptyQuery(query) {
+	extractedReq := traceql.ExtractFetchRequest(req.SearchReq.Query)
+	if extractedReq == nil || !extractedReq.AllConditions {
 		return q.store.SearchTags(ctx, meta, req, opts)
 	}
 
@@ -724,7 +727,7 @@ func (q *Querier) internalTagsSearchBlockV2(ctx context.Context, req *tempopb.Se
 		return nil, fmt.Errorf("unknown scope: %s", req.SearchReq.Scope)
 	}
 
-	err = q.engine.ExecuteTagNames(ctx, scope, query, func(tag string, scope traceql.AttributeScope) bool {
+	err = q.engine.ExecuteTagNames(ctx, scope, extractedReq.Conditions, func(tag string, scope traceql.AttributeScope) bool {
 		return valueCollector.Collect(scope.String(), tag)
 	}, fetcher)
 	if err != nil {
@@ -820,8 +823,8 @@ func (q *Querier) internalTagValuesSearchBlockV2(ctx context.Context, req *tempo
 	opts.StartPage = int(req.StartPage)
 	opts.TotalPages = int(req.PagesToSearch)
 
-	query := traceql.ExtractMatchers(req.SearchReq.Query)
-	if traceql.IsEmptyQuery(query) {
+	extractedReq := traceql.ExtractFetchRequest(req.SearchReq.Query)
+	if extractedReq == nil || !extractedReq.AllConditions {
 		return q.store.SearchTagValuesV2(ctx, meta, req.SearchReq, opts)
 	}
 
@@ -840,7 +843,7 @@ func (q *Querier) internalTagValuesSearchBlockV2(ctx context.Context, req *tempo
 		return q.store.FetchTagValues(ctx, meta, req, cb, func(bytesRead uint64) { inspectedBytes += bytesRead }, opts)
 	})
 
-	err = q.engine.ExecuteTagValues(ctx, tag, query, traceql.MakeCollectTagValueFunc(valueCollector.Collect), fetcher)
+	err = q.engine.ExecuteTagValues(ctx, tag, extractedReq.Conditions, traceql.MakeCollectTagValueFunc(valueCollector.Collect), fetcher)
 	if err != nil {
 		return nil, err
 	}
@@ -897,40 +900,4 @@ func countSpans(trace *tempopb.Trace) int {
 		}
 	}
 	return count
-}
-
-func protoToMetricSeries(proto []*tempopb.KeyValue) traceqlmetrics.MetricSeries {
-	r := traceqlmetrics.MetricSeries{}
-	for i := range proto {
-		r[i] = protoToTraceQLStatic(proto[i])
-	}
-	return r
-}
-
-func protoToTraceQLStatic(kv *tempopb.KeyValue) traceqlmetrics.KeyValue {
-	var val traceql.Static
-
-	switch traceql.StaticType(kv.Value.Type) {
-	case traceql.TypeInt:
-		val = traceql.NewStaticInt(int(kv.Value.N))
-	case traceql.TypeFloat:
-		val = traceql.NewStaticFloat(kv.Value.F)
-	case traceql.TypeString:
-		val = traceql.NewStaticString(kv.Value.S)
-	case traceql.TypeBoolean:
-		val = traceql.NewStaticBool(kv.Value.B)
-	case traceql.TypeDuration:
-		val = traceql.NewStaticDuration(time.Duration(kv.Value.D))
-	case traceql.TypeStatus:
-		val = traceql.NewStaticStatus(traceql.Status(kv.Value.Status))
-	case traceql.TypeKind:
-		val = traceql.NewStaticKind(traceql.Kind(kv.Value.Kind))
-	default:
-		val = traceql.NewStaticNil()
-	}
-
-	return traceqlmetrics.KeyValue{
-		Key:   kv.Key,
-		Value: val,
-	}
 }

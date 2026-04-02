@@ -13,6 +13,7 @@ import (
 	"github.com/grafana/blockpack"
 	"github.com/grafana/tempo/pkg/tempopb"
 	"github.com/grafana/tempo/pkg/traceql"
+	"github.com/grafana/tempo/pkg/util"
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/encoding/common"
 )
@@ -236,6 +237,10 @@ func (w *walBlock) Fetch(_ context.Context, _ traceql.FetchSpansRequest, _ commo
 		Results: &sliceSpansetIterator{},
 		Bytes:   func() uint64 { return 0 },
 	}, nil
+}
+
+func (w *walBlock) FetchSpans(_ context.Context, _ traceql.FetchSpansRequest, _ common.SearchOptions) (traceql.FetchSpansOnlyResponse, error) {
+	return traceql.FetchSpansOnlyResponse{}, util.ErrUnsupported
 }
 
 // FetchTagValues implements the Searcher interface
