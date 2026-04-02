@@ -67,7 +67,7 @@ type result struct {
 	err     error
 }
 
-func query(endpoint, q string, start, end int64, limit int) result {
+func query(endpoint, q, orgID string, start, end int64, limit int) result {
 	u, _ := url.Parse(endpoint + "/api/search")
 	params := url.Values{}
 	params.Set("q", q)
@@ -77,7 +77,11 @@ func query(endpoint, q string, start, end int64, limit int) result {
 	u.RawQuery = params.Encode()
 
 	t0 := time.Now()
-	resp, err := http.Get(u.String()) //nolint:noctx
+	req, _ := http.NewRequest(http.MethodGet, u.String(), nil) //nolint:noctx
+	if orgID != "" {
+		req.Header.Set("X-Scope-OrgID", orgID)
+	}
+	resp, err := http.DefaultClient.Do(req) //nolint:noctx
 	latency := time.Since(t0)
 	if err != nil {
 		return result{latency: latency, err: err}
@@ -297,11 +301,13 @@ func main() {
 	)
 
 	var mostRecent bool
+	var orgID string
 	flag.StringVar(&aEndpoint, "a", "http://localhost:13200", "First Tempo endpoint (parquet)")
 	flag.StringVar(&bEndpoint, "b", "http://localhost:13201", "Second Tempo endpoint (blockpack)")
 	flag.StringVar(&aLabel, "a-label", "A", "Label for first endpoint")
 	flag.StringVar(&bLabel, "b-label", "B", "Label for second endpoint")
 	flag.StringVar(&queryPath, "queries", "", "Path to queries JSON file")
+	flag.StringVar(&orgID, "org-id", "", "X-Scope-OrgID header value for multi-tenant Tempo")
 	flag.IntVar(&runs, "runs", 6, "Number of runs per query per endpoint")
 	flag.BoolVar(&warmup, "warmup", true, "Run one warmup query before benchmarking")
 	flag.BoolVar(&mostRecent, "most-recent", false, "Append 'with (most_recent=true)' to all queries")
@@ -329,8 +335,8 @@ func main() {
 		wStart, wEnd := qf.resolveTimeRange()
 		var wg sync.WaitGroup
 		wg.Add(2)
-		go func() { defer wg.Done(); query(aEndpoint, "{}", wStart, wEnd, 1) }()
-		go func() { defer wg.Done(); query(bEndpoint, "{}", wStart, wEnd, 1) }()
+		go func() { defer wg.Done(); query(aEndpoint, "{}", orgID, wStart, wEnd, 1) }()
+		go func() { defer wg.Done(); query(bEndpoint, "{}", orgID, wStart, wEnd, 1) }()
 		wg.Wait()
 		time.Sleep(500 * time.Millisecond)
 	}
@@ -370,11 +376,11 @@ func main() {
 			wg.Add(2)
 			go func() {
 				defer wg.Done()
-				ra = query(aEndpoint, qStr, start, end, qf.Limit)
+				ra = query(aEndpoint, qStr, orgID, start, end, qf.Limit)
 			}()
 			go func() {
 				defer wg.Done()
-				rb = query(bEndpoint, qStr, start, end, qf.Limit)
+				rb = query(bEndpoint, qStr, orgID, start, end, qf.Limit)
 			}()
 			wg.Wait()
 
