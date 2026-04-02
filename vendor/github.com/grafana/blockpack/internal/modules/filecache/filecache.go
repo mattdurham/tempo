@@ -111,7 +111,7 @@ func (c *FileCache) load() error {
 
 		// Remove orphaned temp files left by interrupted writes.
 		if filepath.Ext(path) == ".tmp" {
-			_ = os.Remove(path)
+			_ = os.Remove(path) //nolint:gosec // G122: path comes from trusted WalkDir, no symlink risk
 			return nil
 		}
 
@@ -122,19 +122,19 @@ func (c *FileCache) load() error {
 		key, valueSize, readErr := readFileHeader(path)
 		if readErr != nil {
 			// Corrupted entry — remove it and continue the walk.
-			_ = os.Remove(path)
-			return nil //nolint:nilerr
+			_ = os.Remove(path) //nolint:gosec // G122: path comes from trusted WalkDir, no symlink risk
+			return nil          //nolint:nilerr
 		}
 
 		if valueSize < 0 {
-			_ = os.Remove(path)
+			_ = os.Remove(path) //nolint:gosec // G122: path comes from trusted WalkDir, no symlink risk
 			return nil
 		}
 
 		size := int64(len(key)) + valueSize
 		if _, exists := c.index[key]; exists {
 			// Duplicate (shouldn't happen); remove the extra file.
-			_ = os.Remove(path)
+			_ = os.Remove(path) //nolint:gosec // G122: path comes from trusted WalkDir, no symlink risk
 			return nil
 		}
 
@@ -143,8 +143,8 @@ func (c *FileCache) load() error {
 		// lower mtime and therefore a lower order value).
 		info, statErr := d.Info()
 		if statErr != nil {
-			_ = os.Remove(path)
-			return nil //nolint:nilerr
+			_ = os.Remove(path) //nolint:gosec // G122: path comes from trusted WalkDir, no symlink risk
+			return nil          //nolint:nilerr
 		}
 		orderKey := uint64(info.ModTime().UnixNano()) //nolint:gosec
 

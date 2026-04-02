@@ -24,6 +24,7 @@ package writer
 
 import (
 	"encoding/binary"
+	"math"
 	"slices"
 	"sync"
 
@@ -39,7 +40,7 @@ const (
 )
 
 // colSketchPool and blockSketchSetPool reuse sketch accumulators across blocks.
-// Pooling avoids per-block GC churn for HLL, CMS, TopK, and SketchBloom objects.
+// Pooling avoids per-block GC churn for HLL, TopK, and SketchBloom objects.
 var (
 	colSketchPool      sync.Pool
 	blockSketchSetPool sync.Pool
@@ -207,7 +208,7 @@ func writeSketchIndexSection(sketchIdx []blockSketchSet) ([]byte, error) {
 				// e.FP is the HashForFuse fingerprint computed at Add() time — no re-hash needed.
 				binary.LittleEndian.PutUint64(tmp8[:], e.FP)
 				buf = append(buf, tmp8[:]...)
-				uint16Count := uint16(e.Count) //nolint:gosec
+				uint16Count := uint16(min(e.Count, math.MaxUint16)) //nolint:gosec // saturate: count bounded to uint16
 				binary.LittleEndian.PutUint16(tmp2[:], uint16Count)
 				buf = append(buf, tmp2[:]...)
 			}

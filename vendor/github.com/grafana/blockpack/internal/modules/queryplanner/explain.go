@@ -123,7 +123,7 @@ func explainLeaf(r BlockIndexer, pred Predicate) string {
 
 // explainBlockPriority appends per-block scoring details to the explain output.
 // Blocks are sorted by score descending (best candidates first) and annotated
-// with cardinality, frequency source (TopK exact or CMS estimate), and an English
+// with cardinality, frequency source (TopK approximate upper-bound), and an English
 // summary of why the block ranks where it does.
 func explainBlockPriority(sb *strings.Builder, r BlockIndexer, plan *Plan, predicates []Predicate) {
 	// Collect scored blocks sorted by score descending, then by block index ascending.
@@ -216,13 +216,15 @@ func explainBlockPred(r BlockIndexer, blockIdx int, pred Predicate, parts *[]str
 		cardDesc = "high"
 	}
 
-	// Aggregate frequency across all queried values using TopK.
+	// Aggregate frequency across all queried values.
 	var totalFreq uint32
+	freqSource := "topk"
 	for _, val := range pred.Values {
 		valFP := sketch.HashForFuse(val)
 		topk := cs.TopKMatch(valFP)
 		if blockIdx < len(topk) && topk[blockIdx] > 0 {
 			totalFreq += uint32(topk[blockIdx]) //nolint:gosec // safe: uint16 fits uint32
+			freqSource = "topk"
 		}
 	}
 
@@ -233,8 +235,8 @@ func explainBlockPred(r BlockIndexer, blockIdx int, pred Predicate, parts *[]str
 	}
 
 	*parts = append(*parts, fmt.Sprintf(
-		"%s: %s cardinality (%d distinct), freq=%d (topk)",
-		shortCol, cardDesc, card, totalFreq,
+		"%s: %s cardinality (%d distinct), freq=%d (%s)",
+		shortCol, cardDesc, card, totalFreq, freqSource,
 	))
 }
 

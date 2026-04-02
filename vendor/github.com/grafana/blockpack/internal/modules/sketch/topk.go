@@ -13,7 +13,7 @@
 //
 // Implementation uses a fixed [TopKSize]TopKEntry array instead of a map.
 // This eliminates all hash-table allocations and GC scanning on the hot write path.
-// Memory: 20 × 12 bytes = 240 bytes per column per block, stack-friendly.
+// Memory: 20 × 16 bytes = 320 bytes per column per block (uint64+uint32+4-byte pad), stack-friendly.
 package sketch
 
 import (

@@ -1,9 +1,9 @@
 package queryplanner
 
-// NOTE: Fuse block pruning and HLL-based block scoring for the queryplanner.
-// Stage 2b: pruneByFuseAll  — BinaryFuse8 membership filter (SPEC-SK-12, SPEC-SK-16)
+// NOTE: Bloom block pruning and HLL-based block scoring for the queryplanner.
+// Stage 2b: pruneByFuseAll  — SketchBloom membership filter (SPEC-SK-12, SPEC-SK-16)
 // Stage 3:  scoreBlocks     — freq/max(cardinality,1) selectivity scoring
-// NOTE-015: Fuse gives hard binary exclusion at 0.39% FPR.
+// NOTE-015: Bloom gives hard binary exclusion at low FPR.
 // NOTE-014: Score = freq / max(cardinality, 1); higher = more selective block.
 
 import (
@@ -99,7 +99,7 @@ func pruneByFusePred(r BlockIndexer, candidates, saved blockSet, pred Predicate)
 }
 
 // scoreBlocks computes a selectivity score for each candidate block based on
-// HLL cardinality and TopK frequency estimates.
+// HLL cardinality and TopK frequency counts.
 //
 // score = sum(freq_i) / max(cardinality, 1)
 //
@@ -151,7 +151,7 @@ func scoreBlocksForPred(r BlockIndexer, candidates blockSet, pred Predicate, sco
 	distinct := cs.Distinct()
 
 	for _, val := range pred.Values {
-		// Use TopK for frequency (exact count via FP lookup) — bulk fetch.
+		// Try TopK (Space-Saving approximate upper-bound count via FP lookup) — bulk fetch.
 		valFP := sketch.HashForFuse(val)
 		topkCounts := cs.TopKMatch(valFP)
 

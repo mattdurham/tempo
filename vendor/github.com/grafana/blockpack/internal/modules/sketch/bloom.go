@@ -21,11 +21,13 @@ const (
 
 	sketchBloomK    = 7
 	sketchBloomBits = uint64(SketchBloomBytes * 8) // 16 384 — power of two
-	sketchBloomMask = sketchBloomBits - 1           // 0x3FFF
+	sketchBloomMask = sketchBloomBits - 1          // 0x3FFF
 )
 
 // SketchBloom is a fixed-size Bloom filter keyed on uint64 fingerprints.
 // It is NOT safe for concurrent use.
+//
+//nolint:revive // SketchBloom name is intentional: "Bloom" alone is too generic within this package
 type SketchBloom struct {
 	data [SketchBloomBytes]byte
 }
@@ -79,4 +81,23 @@ func (b *SketchBloom) Unmarshal(d []byte) error {
 	}
 	copy(b.data[:], d)
 	return nil
+}
+
+// BloomContains returns false only if fp is definitely absent from the bloom filter
+// represented by the raw byte slice data. data must be exactly SketchBloomBytes bytes.
+// This zero-allocation variant allows the reader to query bloom filters without
+// copying the underlying metadata buffer into a SketchBloom struct.
+func BloomContains(data []byte, fp uint64) bool {
+	if len(data) != SketchBloomBytes {
+		return true // conservative: treat malformed data as "may contain"
+	}
+	h1 := fp
+	h2 := (fp>>32 | fp<<32) | 1
+	for i := range uint64(sketchBloomK) {
+		pos := (h1 + i*h2) & sketchBloomMask
+		if data[pos>>3]&(1<<(pos&7)) == 0 { //nolint:gosec // safe: pos&7 is 0..7
+			return false
+		}
+	}
+	return true
 }

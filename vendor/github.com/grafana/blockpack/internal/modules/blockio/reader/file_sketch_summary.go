@@ -4,7 +4,8 @@ package reader
 
 // FileSketchSummary is a file-level aggregation of per-block sketch data.
 // It merges HLL cardinalities and TopK entries across all blocks so callers
-// can make cross-file decisions without opening the file.
+// can make cross-file pruning decisions without opening the file.
+// File-level absence filtering now uses FileBloom (Fuse8) rather than CMS.
 //
 // Usage:
 //
@@ -15,7 +16,13 @@ package reader
 //	// later, from cache:
 //	summary, _ := UnmarshalFileSketchSummary(b)
 //	col := summary.Columns["resource.service.name"]
-//	if col != nil { /* use col.TopK, col.TotalDistinct */ }
+//	if col != nil {
+//	    // use col.TopK or col.TotalDistinct for selectivity hints
+//	}
+//
+// NOTE: No file-level fuse filter is included. Fuse filters are not mergeable without
+// the original fingerprint keys. FileBloom (Fuse8) serves as the file-level filter.
+// Block-level fuse filters continue to serve within-file pruning.
 import (
 	"cmp"
 	"encoding/binary"
@@ -25,8 +32,7 @@ import (
 	"github.com/grafana/blockpack/internal/modules/sketch"
 )
 
-// fileSketchSummaryMagic is "FSKU" — changed from "FSKT" to invalidate old CMS-containing caches.
-const fileSketchSummaryMagic = uint32(0x46534B55) // "FSKU"
+const fileSketchSummaryMagic = uint32(0x46534B55) // "FSKU" — bumped to invalidate CMS-containing caches
 
 // FileColumnSketch holds file-level aggregated sketch data for one column.
 type FileColumnSketch struct {
@@ -64,8 +70,8 @@ func (r *Reader) FileSketchSummary() *FileSketchSummary {
 		return nil
 	}
 	r.fileSummaryOnce.Do(func() {
-		// Check process-level cache — avoids the expensive TopK
-		// aggregation on every query for the same file.
+		// Check process-level cache — avoids the expensive TopK aggregation
+		// on every query for the same file.
 		if r.fileID != "" {
 			if cached := parsedSketchSummaryCache.Get(r.fileID + "/sketch-summary"); cached != nil {
 				r.fileSummary = cached

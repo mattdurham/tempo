@@ -1106,7 +1106,7 @@ func decodePrefixBytes(data []byte, kind uint8, spanCount int, ctx *decodeCtx) (
 		sPos += sLen
 
 		// noPrefix sentinel: 0xFFFFFFFF (or equivalent for smaller widths).
-		noPrefix := uint32((1 << (uint(piw) * 8)) - 1)
+		noPrefix := uint32((1 << (uint(piw) * 8)) - 1) //nolint:gosec // safe: piw bounded to 1-4 bytes
 		var value []byte
 		if pidx == noPrefix || int(pidx) >= len(prefixes) {
 			value = make([]byte, sLen)

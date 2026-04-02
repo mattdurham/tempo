@@ -343,7 +343,7 @@ func (r *Reader) buildSketchIndexInfo() *SketchIndexInfo {
 		cardinality uint64
 		topkCount   int
 		topkBytes   int
-		fuseBytes   int // bloom bytes (field name kept for JSON compat)
+		fuseBytes   int
 	}
 	blockCols := make([][]blockColStat, numBlocks)
 
@@ -351,18 +351,17 @@ func (r *Reader) buildSketchIndexInfo() *SketchIndexInfo {
 
 	for name, cd := range r.sketchIdx.columns {
 		presentCount := len(cd.presentMap)
-
 		// Per-column byte accounting.
 		totalBytes += 2 + len(name)    // name_len[2] + name
 		totalBytes += presenceBytes    // presence bitset
 		totalBytes += numBlocks * 4    // distinct counts
 		totalBytes += 1 + presentCount // topk_k[1] + entry_count per present block
-		totalBytes += 2               // bloom_size[2]
+		totalBytes += 2                // bloom_size[2]
 
 		for pi, blockIdx := range cd.presentMap {
 			topkEntries := len(cd.topkFP[pi])
 			topkBytesForBlock := 1 + topkEntries*10 // entry_count[1] + fp[8]+count[2] per entry
-			totalBytes += topkEntries * 10           // (entry_count already counted above)
+			totalBytes += topkEntries * 10          // (entry_count already counted above)
 			bloomB := sketch.SketchBloomBytes
 			totalBytes += bloomB
 

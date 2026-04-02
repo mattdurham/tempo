@@ -1,11 +1,11 @@
 // Package reader provides block reading and index parsing for blockpack files.
 // NOTE: Sketch index parsing for column-major HLL + SketchBloom + TopK data.
-// Three magic values are recognised:
+// Three magic values are recognized:
 //   - 0x534B5445 ("SKTE") — bloom only, no CMS (current writer)
 //   - 0x534B5444 ("SKTD") — bloom + CMS — skip CMS bytes, read bloom
 //   - 0x534B5443 ("SKTC") — legacy fuse-based format; degrades gracefully (no pruning)
 //
-// Files without any recognised magic degrade gracefully:
+// Files without any recognized magic degrade gracefully:
 // parseSketchIndexSection returns (nil, 0, nil) and ColumnSketch returns nil.
 //
 // Bloom data is copied at parse time (fixed-size, cheap).
@@ -15,6 +15,7 @@ import (
 	"encoding/binary"
 	"fmt"
 
+	"github.com/grafana/blockpack/internal/modules/blockio/shared"
 	"github.com/grafana/blockpack/internal/modules/queryplanner"
 	"github.com/grafana/blockpack/internal/modules/sketch"
 )
@@ -37,9 +38,10 @@ type columnSketchData struct {
 	topkCount  [][]uint16 // [presentIdx][entries] counts
 	presentMap []int      // presentMap[i] = blockIdx of the i-th present block
 
-	// Bloom filters: one SketchBloom per present block, populated at parse time.
-	// Nil for blocks parsed from legacy fuse-format files (FuseContains returns true).
-	bloom []*sketch.SketchBloom // [presentIdx]
+	// Bloom filters: raw byte slices into the metadata buffer, one per present block.
+	// Zero-copy: slices reference the decompressed metadata buffer retained by the Reader.
+	// Nil/empty for blocks parsed from legacy fuse-format files (FuseContains returns true).
+	bloom [][]byte // [presentIdx] each slice is exactly sketch.SketchBloomBytes bytes
 
 	numBlocks int
 }
@@ -72,6 +74,7 @@ func (cd *columnSketchData) TopKMatch(valFP uint64) []uint16 {
 
 // FuseContains returns true per block if the bloom filter indicates valHash may be present.
 // Returns true (conservative) for present blocks that have no bloom data (legacy fuse files).
+// Queries bloom data directly from the raw byte slices — no allocation.
 // Implements queryplanner.ColumnSketch; name kept for interface compatibility.
 func (cd *columnSketchData) FuseContains(valHash uint64) []bool {
 	out := make([]bool, cd.numBlocks)
@@ -79,7 +82,7 @@ func (cd *columnSketchData) FuseContains(valHash uint64) []bool {
 		if pi >= len(cd.bloom) || cd.bloom[pi] == nil {
 			out[blockIdx] = true // conservative: no bloom data for this block
 		} else {
-			out[blockIdx] = cd.bloom[pi].Contains(valHash)
+			out[blockIdx] = sketch.BloomContains(cd.bloom[pi], valHash)
 		}
 	}
 	return out
@@ -87,7 +90,7 @@ func (cd *columnSketchData) FuseContains(valHash uint64) []bool {
 
 // parseSketchIndexSection parses the sketch index section from data (column-major format).
 // Returns (*sketchIndex, bytesConsumed, nil) on success.
-// Returns (nil, 0, nil) when data does not start with a recognised magic (graceful degradation).
+// Returns (nil, 0, nil) when data does not start with a recognized magic (graceful degradation).
 // Returns (nil, 0, error) on parse failure after the magic is confirmed.
 //
 // Three magic values are handled:
@@ -110,9 +113,19 @@ func parseSketchIndexSection(data []byte) (*sketchIndex, int, error) {
 	// hasCMS is true for old formats (SKTD, SKTC) that contain CMS bytes in the stream.
 	hasCMS := isBloom || isLegacy
 
-	numBlocks := int(binary.LittleEndian.Uint32(data[4:]))
-	numColumns := int(binary.LittleEndian.Uint32(data[8:]))
+	rawBlocks := binary.LittleEndian.Uint32(data[4:])
+	rawColumns := binary.LittleEndian.Uint32(data[8:])
 	pos := 12
+
+	// Validate as uint32 before converting to int to avoid wrap-around on 32-bit platforms.
+	if rawBlocks > uint32(shared.MaxBlocks) || rawColumns > uint32(shared.MaxColumns) {
+		return nil, 0, fmt.Errorf(
+			"sketch index: numBlocks %d or numColumns %d exceeds limits (%d/%d)",
+			rawBlocks, rawColumns, shared.MaxBlocks, shared.MaxColumns,
+		)
+	}
+	numBlocks := int(rawBlocks)
+	numColumns := int(rawColumns)
 
 	presenceBytes := (numBlocks + 7) / 8
 
@@ -273,6 +286,7 @@ func parseColumnTopK(data []byte, pos int, name string, presentCount int, cd *co
 
 // skipColumnCMS advances pos past CMS bytes without any allocation.
 // Used when reading old "SKTD" or "SKTC" files that contain CMS data.
+// Size math is done in uint64 to prevent int overflow on corrupt inputs.
 func skipColumnCMS(data []byte, pos int, name string, presentCount int) (int, error) {
 	// cms_depth[1]
 	if pos >= len(data) {
@@ -280,6 +294,9 @@ func skipColumnCMS(data []byte, pos int, name string, presentCount int) (int, er
 	}
 	cmsDepth := int(data[pos])
 	pos++
+	if cmsDepth == 0 {
+		return pos, fmt.Errorf("sketch_index: col %q: invalid cms_depth=0", name)
+	}
 
 	// cms_width[2 LE]
 	if pos+2 > len(data) {
@@ -287,17 +304,25 @@ func skipColumnCMS(data []byte, pos int, name string, presentCount int) (int, er
 	}
 	cmsWidth := int(binary.LittleEndian.Uint16(data[pos:]))
 	pos += 2
+	if cmsWidth == 0 {
+		return pos, fmt.Errorf("sketch_index: col %q: invalid cms_width=0", name)
+	}
 
-	totalCMS := presentCount * cmsDepth * cmsWidth * 2
-	if pos+totalCMS > len(data) {
+	// Use uint64 to avoid int overflow on corrupt/large depth*width*presentCount values.
+	//nolint:gosec // G115: conversions to uint64 are intentional to prevent overflow
+	totalCMS64 := uint64(presentCount) * uint64(cmsDepth) * uint64(cmsWidth) * 2
+	remaining := uint64(len(data) - pos) //nolint:gosec // G115: len-pos is non-negative; validated above
+	if totalCMS64 > remaining {
 		return pos, fmt.Errorf("sketch_index: col %q: too short for CMS data", name)
 	}
-	pos += totalCMS
+	pos += int(totalCMS64) //nolint:gosec // safe: validated against remaining data length above
 	return pos, nil
 }
 
 // parseColumnBloom parses bloom_size[2 LE] and per-present-block bloom_data[bloom_size].
-// Each block gets its own SketchBloom deserialized at parse time (fixed-size, cheap).
+// Bloom data is stored as zero-copy slices into the existing metadata buffer — no allocation.
+// The Reader retains the full decompressed metadata buffer, so these slices remain valid
+// for the lifetime of the Reader.
 func parseColumnBloom(data []byte, pos int, name string, presentCount int, cd *columnSketchData) (int, error) {
 	// bloom_size[2 LE]: the fixed byte size for all blocks in this column.
 	if pos+2 > len(data) {
@@ -306,15 +331,12 @@ func parseColumnBloom(data []byte, pos int, name string, presentCount int, cd *c
 	bloomSize := int(binary.LittleEndian.Uint16(data[pos:]))
 	pos += 2
 
-	cd.bloom = make([]*sketch.SketchBloom, presentCount)
+	cd.bloom = make([][]byte, presentCount)
 	for pi := range presentCount {
 		if pos+bloomSize > len(data) {
 			return pos, fmt.Errorf("sketch_index: col %q: present block %d: too short for bloom_data", name, pi)
 		}
-		b := sketch.NewSketchBloom()
-		if err := b.Unmarshal(data[pos : pos+bloomSize]); err == nil {
-			cd.bloom[pi] = b
-		}
+		cd.bloom[pi] = data[pos : pos+bloomSize] // zero-copy slice into metadata buffer
 		pos += bloomSize
 	}
 	return pos, nil
@@ -322,18 +344,19 @@ func parseColumnBloom(data []byte, pos int, name string, presentCount int, cd *c
 
 // skipColumnFuse advances pos past the legacy fuse section without storing data.
 // Used when reading old "SKTC" files; bloom is left nil so FuseContains returns true.
+// fuseLen is validated as uint32 against remaining data to prevent int overflow.
 func skipColumnFuse(data []byte, pos int, name string, presentCount int) (int, error) {
 	for pi := range presentCount {
 		if pos+4 > len(data) {
 			return pos, fmt.Errorf("sketch_index: col %q: present block %d: too short for fuse_len", name, pi)
 		}
-		fuseLen := int(binary.LittleEndian.Uint32(data[pos:]))
+		fuseLen := binary.LittleEndian.Uint32(data[pos:])
 		pos += 4
 		if fuseLen > 0 {
-			if pos+fuseLen > len(data) {
+			if uint64(fuseLen) > uint64(len(data)-pos) { //nolint:gosec // G115: intentional promotion to uint64
 				return pos, fmt.Errorf("sketch_index: col %q: present block %d: fuse data too short", name, pi)
 			}
-			pos += fuseLen
+			pos += int(fuseLen) //nolint:gosec // safe: validated against remaining data length above
 		}
 	}
 	return pos, nil
