@@ -48,7 +48,7 @@ func explainPlan(r BlockIndexer, predicates []Predicate, plan *Plan, timeBlocks 
 	}
 
 	// --- Section 2: Pruning pipeline summary ---
-	if plan.PrunedByTime > 0 || plan.PrunedByIndex > 0 || plan.PrunedByFuse > 0 || plan.PrunedByCMS > 0 {
+	if plan.PrunedByTime > 0 || plan.PrunedByIndex > 0 || plan.PrunedByFuse > 0 {
 		sb.WriteString("\n\nPruning pipeline:\n")
 		remaining := plan.TotalBlocks
 		fmt.Fprintf(&sb, "  start: %d blocks\n", remaining)
@@ -64,11 +64,6 @@ func explainPlan(r BlockIndexer, predicates []Predicate, plan *Plan, timeBlocks 
 			remaining -= plan.PrunedByFuse
 			fmt.Fprintf(&sb, "  fuse-filter:  -%d → %d blocks (membership exclusion, 0.39%% FPR)\n",
 				plan.PrunedByFuse, remaining)
-		}
-		if plan.PrunedByCMS > 0 {
-			remaining -= plan.PrunedByCMS
-			fmt.Fprintf(&sb, "  cms-zero:     -%d → %d blocks (frequency=0, definitely absent)\n",
-				plan.PrunedByCMS, remaining)
 		}
 	}
 
@@ -128,7 +123,7 @@ func explainLeaf(r BlockIndexer, pred Predicate) string {
 
 // explainBlockPriority appends per-block scoring details to the explain output.
 // Blocks are sorted by score descending (best candidates first) and annotated
-// with cardinality, frequency source (TopK exact or CMS estimate), and an English
+// with cardinality, frequency source (TopK exact), and an English
 // summary of why the block ranks where it does.
 func explainBlockPriority(sb *strings.Builder, r BlockIndexer, plan *Plan, predicates []Predicate) {
 	// Collect scored blocks sorted by score descending, then by block index ascending.
@@ -223,18 +218,13 @@ func explainBlockPred(r BlockIndexer, blockIdx int, pred Predicate, parts *[]str
 
 	// Aggregate frequency across all queried values.
 	var totalFreq uint32
-	freqSource := "cms"
+	freqSource := "topk"
 	for _, val := range pred.Values {
 		valFP := sketch.HashForFuse(val)
 		topk := cs.TopKMatch(valFP)
 		if blockIdx < len(topk) && topk[blockIdx] > 0 {
 			totalFreq += uint32(topk[blockIdx]) //nolint:gosec // safe: uint16 fits uint32
 			freqSource = "topk"
-		} else {
-			cms := cs.CMSEstimate(val)
-			if blockIdx < len(cms) {
-				totalFreq += cms[blockIdx]
-			}
 		}
 	}
 

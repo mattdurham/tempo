@@ -1,8 +1,26 @@
 ## Review Scope
 
-This review covers the "intrinsic section optimization" changes on the blockpack-integration branch.
+This review covers the CMS removal from blockpack sketch system on the drop-cms-sketch branch.
 
-### What Changed (3 coupled changes)
+### Changed Files
+
+Production:
+- vendor/.../blockio/reader/file_sketch_summary.go
+- vendor/.../blockio/reader/layout.go
+- vendor/.../blockio/reader/sketch_index.go
+- vendor/.../blockio/writer/sketch_index.go
+- vendor/.../blockio/writer/writer_block.go
+- vendor/.../executor/plan_blocks.go
+- vendor/.../executor/stream.go
+- vendor/.../executor/stream_log_topk.go
+- vendor/.../queryplanner/column_sketch.go
+- vendor/.../queryplanner/explain.go
+- vendor/.../queryplanner/planner.go
+- vendor/.../queryplanner/scoring.go
+
+Tests: file_sketch_summary_test.go, layout_test.go, plan_blocks_test.go, pruning_bench_test.go, scoring_test.go, sketch_integration_test.go
+
+### What Changed (CMS removal)
 
 1. **Removed identity columns from intrinsic accumulator** (writer/writer_block.go, writer/intrinsic_accum.go):
    - Removed feedIntrinsic* calls for trace:id, span:id, span:parent_id, span:status_message

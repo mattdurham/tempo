@@ -1,750 +1,884 @@
-# Implementation Plan: Intrinsic Section Optimization
+# Implementation Plan: Remove Count-Min Sketch (CMS) from Blockpack Sketch System
 
 ## Overview
 
-Remove identity columns (trace:id, span:id, span:parent_id, span:status_message) from the
-intrinsic accumulator, switch range-predicate field population from O(N) intrinsic scan to
-O(M) block reads, and remove the RefBloom per-page filter (256 bytes/page, 100% FPR at 10K
-entries). All three changes land together because they are tightly coupled and share a single
-backward-compat story.
+Remove CMS from all write, read, and query paths in
+`vendor/github.com/grafana/blockpack/internal/`. New files will use magic `0x534B5445`
+("SKTE") and contain no CMS bytes. Old SKTC files will have their CMS bytes skipped
+zero-alloc via a new `skipColumnCMS` function. The `FileSketchSummary` magic bumps from
+`0x46534B54` to `0x46534B55` to invalidate stale cached summaries that contain CMS bytes.
 
-The vendor copy at `/home/matt/source/tempo-mrd/vendor/github.com/grafana/blockpack/` is the
-source of truth. All changes apply there first, then are mirrored to the upstream source at
-`/home/matt/source/blockpack-tempo/`.
-
----
-
-## Spec-Driven Modules in Scope
-
-| Module | Files with spec docs |
-|--------|---------------------|
-| `internal/modules/blockio/shared/` | NOTES.md |
-| `internal/modules/blockio/writer/` | NOTES.md |
-| `internal/modules/executor/` | SPECS.md, NOTES.md, TESTS.md, BENCHMARKS.md |
-
-All three modules carry the `// NOTE: Any changes to this file must be reflected in the
-corresponding specs.md or NOTES.md.` invariant. Doc updates are paired with code changes.
+All 17 tasks below are sized 10-30 minutes. The ordering is critical: callers of
+`CMSEstimate` must be removed before the interface method is removed, and the interface
+method must be removed before the implementation is removed.
 
 ---
 
-## Files to Modify (vendor copy — apply first)
+## Files to Modify
 
-1. `internal/modules/blockio/shared/constants.go` — remove `IntrinsicRefBloomBytes`, `IntrinsicRefBloomK`
-2. `internal/modules/blockio/shared/types.go` — remove `RefBloom []byte` from `PageMeta`; remove `RefIndexEntry` type and `refIndex`/`refIndexOnce` from `IntrinsicColumn`
-3. `internal/modules/blockio/shared/intrinsic_ref_filter.go` — delete file (all functions become dead)
-4. `internal/modules/blockio/shared/intrinsic_codec.go` — remove RefBloom from `EncodePageTOC`; update `DecodePageTOC` to read-and-discard RefBloom bytes from old v0x02 files without storing them
-5. `internal/modules/blockio/shared/NOTES.md` — add dated entry for RefBloom removal
-6. `internal/modules/blockio/writer/intrinsic_accum.go` — remove `computePageRefRange`, `collectDictPageRefs`; remove `RefBloom`/`MinRef`/`MaxRef` from `PageMeta` literals in `encodePagedFlatColumn` and `encodePagedDictColumn`
-7. `internal/modules/blockio/writer/writer_block.go` — remove `feedIntrinsicBytes` calls for `trace:id`, `span:id`, `span:parent_id` in `addRowFromProto`, `addRowFromTempoProto`, `applyTraceID`, `applySpanID`, `applySpanParentID`; remove `feedIntrinsicString` call for `span:status_message` in same functions; remove `feedIntrinsicBytes("trace:id", ...)` in `applyTraceID`; fix `feedIntrinsicsFromIndex` to skip the four identity columns
-8. `internal/modules/blockio/writer/NOTES.md` — add dated entry documenting removal of identity columns from intrinsic accumulator
-9. `internal/modules/executor/stream.go` — remove `useIntrinsicLookup` branch from `collectIntrinsicPlain`; always use `forEachBlockInGroups`; remove `useIntrinsicLookup bool` parameter from `collectIntrinsicPlain`; update call site at line 648
-10. `internal/modules/executor/SPECS.md` — update field-population invariant: block reads are always used for field population in Case A
-11. `internal/modules/executor/NOTES.md` — add dated entry for the change
-12. `internal/modules/executor/TESTS.md` — update test plan for `execution_path_test.go` changes
-13. `internal/modules/executor/execution_path_test.go` — update EP-01 and EP-03 to assert `Block` populated (not `IntrinsicFields`); update EP-02 description to match unified behavior; remove EP-01/EP-03 `IntrinsicFields != nil` assertions
+**Production code:**
 
-## Files to Mirror (upstream source — apply after vendor)
+1. `vendor/github.com/grafana/blockpack/internal/modules/queryplanner/scoring.go`
+   — Remove `pruneByCMSAll`, `pruneByCMSPred`, CMS branch in `scoreBlocksForPred`, `"math"` import
 
-Same list but rooted at `/home/matt/source/blockpack-tempo/`. Note that `RefBloom`/`MinRef`/`MaxRef` and `IntrinsicPageTOCVersion2` may not exist yet in the upstream source — adapt as needed (the changes may be no-ops for those symbols if the upstream is at an older version).
+2. `vendor/github.com/grafana/blockpack/internal/modules/queryplanner/explain.go`
+   — Remove CMS branch in `explainBlockPred`, `PrunedByCMS` check in `explainPlan`
+
+3. `vendor/github.com/grafana/blockpack/internal/modules/queryplanner/planner.go`
+   — Remove `PrunedByCMS int` from `Plan` struct, remove Stage 3 `pruneByCMSAll` call
+
+4. `vendor/github.com/grafana/blockpack/internal/modules/queryplanner/column_sketch.go`
+   — Remove `CMSEstimate(val string) []uint32` from the `ColumnSketch` interface
+
+5. `vendor/github.com/grafana/blockpack/internal/modules/executor/stream.go`
+   — Remove `"pruned_by_cms": plan.PrunedByCMS` from StepStats metadata map (~line 235)
+
+6. `vendor/github.com/grafana/blockpack/internal/modules/executor/stream_log_topk.go`
+   — Remove `"pruned_by_cms": plan.PrunedByCMS` from StepStats metadata map (~line 130)
+
+7. `vendor/github.com/grafana/blockpack/internal/modules/executor/plan_blocks.go`
+   — Remove `fileLevelCMSReject` call block (lines 62-74), remove 5 CMS helper functions,
+     remove `plan.PrunedByCMS = 0` from both early-return blocks
+
+8. `vendor/github.com/grafana/blockpack/internal/modules/blockio/reader/file_sketch_summary.go`
+   — Remove `CMS *sketch.CountMinSketch` from `FileColumnSketch`, remove CMS merge from
+     `buildFileColumnSketch`, remove CMS marshal/unmarshal, bump `fileSketchSummaryMagic`
+
+9. `vendor/github.com/grafana/blockpack/internal/modules/blockio/reader/sketch_index.go`
+   — Remove `cmsRaw`, `cms`, `cmsOnce` fields and `inflateCMS`, `CMSEstimate` methods;
+     add multi-magic dispatch; add `skipColumnCMS` function; remove `"math"` import
+
+10. `vendor/github.com/grafana/blockpack/internal/modules/blockio/writer/sketch_index.go`
+    — Change magic to SKTE, remove `cms` field from `colSketch`, remove CMS Add/Marshal
+      calls, remove `cmsMarshalSize` variable, fix buffer pre-allocation
+
+11. `vendor/github.com/grafana/blockpack/internal/modules/blockio/reader/layout.go`
+    — Remove `CMSBytes int` field from `ColumnSketchStat`, remove `cmsBytes` from
+      `buildSketchIndexInfo` accounting and `ColumnSketchStat` construction
+
+**Test files (vendor must compile; CMS-only tests deleted, mixed tests fixed):**
+
+12. `vendor/github.com/grafana/blockpack/internal/modules/queryplanner/scoring_test.go`
+
+13. `vendor/github.com/grafana/blockpack/internal/modules/queryplanner/sketch_integration_test.go`
+
+14. `vendor/github.com/grafana/blockpack/internal/modules/blockio/reader/file_sketch_summary_test.go`
+
+15. `vendor/github.com/grafana/blockpack/internal/modules/executor/plan_blocks_test.go`
+
+**Spec-driven doc files:**
+
+16. `queryplanner/` — NOTES.md, SPECS.md, TESTS.md, BENCHMARKS.md
+17. `blockio/reader/` — NOTES.md, SPECS.md
+18. `blockio/writer/` — NOTES.md
+19. `executor/` — NOTES.md, SPECS.md
 
 ---
 
 ## Implementation Steps
 
-### Phase 1: Update Tests First (TDD)
+### Task 1: scoring.go — Remove pruneByCMSAll, pruneByCMSPred, CMS scoring branch, math import
 
-**Step 1.1: Update `execution_path_test.go` to reflect new behavior**
+**File:** `queryplanner/scoring.go`
 
-File: `vendor/github.com/grafana/blockpack/internal/modules/executor/execution_path_test.go`
+- [ ] Update the package-level comment block at lines 3-9: remove
+      `// Stage 3b: pruneByCMSAll   — Count-Min Sketch zero-estimate prune`,
+      `// NOTE-013: CMS zero means definitely absent (no false negatives for zero).`, and
+      `// NOTE-015: Fuse before CMS — fuse gives hard binary exclusion at 0.39% FPR.`
+      Replace NOTE-015 with just `// NOTE-015: Fuse gives hard binary exclusion at 0.39% FPR.`
 
-After the change, `collectIntrinsicPlain` always uses `forEachBlockInGroups`. This means:
-- Range predicates now return `MatchedRow.Block` populated (not `IntrinsicFields`)
-- The comment at the top of the file must be updated to remove the distinction
+- [ ] Delete the entire `pruneByCMSAll` function (lines 114-135) and the entire
+      `pruneByCMSPred` function (lines 138-182).
 
-Actions:
-- [ ] Update the file-header comment: remove "Range/regex predicates → IntrinsicFields"; state "all collectIntrinsicPlain results return Block populated"
-- [ ] Update `TestExecutionPath_RangePredicate_IntrinsicFields` (EP-01):
-  - Rename to `TestExecutionPath_RangePredicate_BlockPopulated`
-  - Change assertions: `row.Block != nil` (not `IntrinsicFields`)
-  - Change assertions: `row.IntrinsicFields == nil` (not Block)
-  - Keep result count assertions unchanged
-- [ ] Update EP-03 `TestExecutionPath_RangeAndEquality_IntrinsicFields`:
-  - Rename to `TestExecutionPath_RangeAndEquality_BlockPopulated`
-  - Same assertion swap: Block not nil, IntrinsicFields nil
-- [ ] Update EP-02 `TestExecutionPath_EqualityPredicate_BlockPopulated`:
-  - Comment update only (the assertions are already correct: Block != nil, IntrinsicFields nil)
-  - Remove note about "different from range predicate path" since they now use the same path
+- [ ] In `scoreBlocksForPred`, within the `for _, val := range pred.Values` loop, remove:
+      ```go
+      cmsEst := cs.CMSEstimate(val)
+      ```
+      and the entire `else if blockIdx < len(cmsEst)` branch (the block that reads
+      `cmsEst[blockIdx]`, caps it at `math.MaxUint16`, and assigns `freq = float64(est)`).
+      After this removal, the `if blockIdx < len(topkCounts) && topkCounts[blockIdx] > 0`
+      branch is the only scoring path; if it does not fire, `freq` stays 0.
 
-**Step 1.2: Verify tests fail before implementation**
+- [ ] Remove `"math"` from the import block (line 12). It was only used for `math.MaxUint16`
+      in the now-deleted CMS branch.
 
-```bash
-cd /home/matt/source/tempo-mrd && go test ./vendor/github.com/grafana/blockpack/internal/modules/executor/ -run TestExecutionPath_RangePredicate_BlockPopulated -v 2>&1 | head -30
-```
+- [ ] Update the `scoreBlocksForPred` docstring: remove "CMSEstimate() called once per value"
+      from the comment on line 215.
 
-Expected: compilation error (function renamed) or test failure (IntrinsicFields still populated by old code).
+**Acceptance:** `scoring.go` has no `pruneByCMSAll`, no `pruneByCMSPred`, no `CMSEstimate`
+calls, no `math` import. The `sketch` import stays (used for `sketch.HashForFuse`).
 
 ---
 
-### Phase 2: Remove RefBloom from `shared/`
+### Task 2: explain.go — Remove CMS branch in explainBlockPred and PrunedByCMS in explainPlan
 
-**Step 2.1: Remove RefBloom constants**
+**File:** `queryplanner/explain.go`
 
-File: `vendor/github.com/grafana/blockpack/internal/modules/blockio/shared/constants.go`
+- [ ] In `explainPlan` (line 51), change the pipeline trigger condition from:
+      `if plan.PrunedByTime > 0 || plan.PrunedByIndex > 0 || plan.PrunedByFuse > 0 || plan.PrunedByCMS > 0`
+      to:
+      `if plan.PrunedByTime > 0 || plan.PrunedByIndex > 0 || plan.PrunedByFuse > 0`
 
-Remove these two constants (lines ~83-94):
-```go
-// IntrinsicRefBloomBytes is the fixed size of the per-page ref bloom filter in bytes.
-IntrinsicRefBloomBytes = 256
-// IntrinsicRefBloomK is the number of hash functions for the ref bloom filter.
-IntrinsicRefBloomK = 3
-```
+- [ ] Remove the `if plan.PrunedByCMS > 0` block (lines 68-73):
+      ```go
+      if plan.PrunedByCMS > 0 {
+          remaining -= plan.PrunedByCMS
+          fmt.Fprintf(&sb, "  cms-zero:     -%d → %d blocks (frequency=0, definitely absent)\n",
+              plan.PrunedByCMS, remaining)
+      }
+      ```
 
-Keep `IntrinsicPageTOCVersion2` — still needed by the codec to detect old files.
+- [ ] In `explainBlockPred`, change the `freqSource` initialization from
+      `freqSource := "cms"` (line 226) to `freqSource := "topk"`.
 
-Verify:
-```bash
-cd /home/matt/source/tempo-mrd && go build ./vendor/github.com/grafana/blockpack/internal/modules/blockio/shared/ 2>&1
-```
-Expected: errors for `IntrinsicRefBloomBytes` references (in `intrinsic_accum.go`, `intrinsic_ref_filter.go`). That is correct — those will be fixed in subsequent steps.
+- [ ] In `explainBlockPred`, remove the `else` branch after the TopK check:
+      ```go
+      } else {
+          cms := cs.CMSEstimate(val)
+          if blockIdx < len(cms) {
+              totalFreq += cms[blockIdx]
+          }
+      }
+      ```
+      After removal, the loop body is just the TopK check; if TopK returns 0 for a block,
+      `totalFreq` is not incremented for that value from that block.
 
-**Step 2.2: Remove RefBloom from `PageMeta` and `IntrinsicColumn` types**
+- [ ] Verify `freqSource` is still referenced in the `fmt.Sprintf` call below — it is
+      (line 248: `"freq=%d (%s)"`), so it will not trigger an unused-variable error.
 
-File: `vendor/github.com/grafana/blockpack/internal/modules/blockio/shared/types.go`
+**Acceptance:** `explain.go` has no `CMSEstimate` calls, no `PrunedByCMS` references.
+`freqSource` is initialized to `"topk"` and set to `"topk"` inside the TopK branch.
 
-Changes to `PageMeta`:
-- Remove `RefBloom []byte` field
-- Remove `MinRef uint32` and `MaxRef uint32` fields
-- Remove comments for those fields
+---
 
-Changes to `IntrinsicColumn`:
-- Remove `refIndex []RefIndexEntry` field
-- Remove `refIndexOnce sync.Once` field
-- Remove `sync` import if no longer used
+### Task 3: planner.go — Remove PrunedByCMS field and Stage 3 call
 
-Remove type `RefIndexEntry` entirely (was used only by `refIndex`).
+**File:** `queryplanner/planner.go`
 
-After removal, `PageMeta` becomes:
-```go
-type PageMeta struct {
-    Min      string
-    Max      string
-    Bloom    []byte
-    Offset   uint32
-    Length   uint32
-    RowCount uint32
-}
-```
+- [ ] Remove `PrunedByCMS int` and its doc comment from the `Plan` struct (lines 213-215).
 
-And `IntrinsicColumn` no longer has `refIndex`/`refIndexOnce`/`RefIndexEntry` fields.
+- [ ] In the `Plan()` method, remove the Stage 3 block:
+      ```go
+      // Stage 3: Count-Min Sketch zero-estimate pruning — CMS estimate == 0 is definitely absent.
+      // NOTE-013: CMS never under-counts, so zero is a safe hard prune.
+      plan.PrunedByCMS += pruneByCMSAll(p.r, candidates, predicates)
+      ```
+      (lines 318-320 approximately).
 
-**Step 2.3: Delete `intrinsic_ref_filter.go`**
+- [ ] Optionally renumber the comment `// Stage 4:` to `// Stage 3:` for the scoring call
+      that follows — this is cosmetic and not required for correctness.
 
-File to delete: `vendor/github.com/grafana/blockpack/internal/modules/blockio/shared/intrinsic_ref_filter.go`
+- [ ] Update the `Plan()` method docstring to remove Stage 3 from the description if it
+      mentions "Count-Min Sketch" (it does not currently in the planner.go docstring; the
+      stages are not listed there — skip this sub-step if no mention exists).
 
-This file contains: `matchesRefFilter`, `refFilterRange`, `DecodePagedColumnBlobFiltered`, `EnsureRefIndex`, `LookupRefFast`, `LookupRef`, `uint32ToLE`.
+**Acceptance:** `Plan` struct has no `PrunedByCMS`. `Plan()` method has no `pruneByCMSAll`
+call. At this point `queryplanner` package will fail to compile if `go build` is run
+because `CMSEstimate` is still on the interface and `columnSketchData` still has it —
+that is expected and will be resolved by Tasks 4+9.
 
-Before deleting, grep to confirm no other callers outside this file:
-```bash
-cd /home/matt/source/tempo-mrd && grep -r "DecodePagedColumnBlobFiltered\|EnsureRefIndex\|LookupRefFast\|matchesRefFilter" vendor/github.com/grafana/blockpack/ --include="*.go" | grep -v "_test.go" | grep -v "intrinsic_ref_filter.go"
-```
-Expected: matches in `internal/modules/blockio/reader/intrinsic_reader.go` and possibly `executor/`. Find all callers.
+---
 
-Check if `LookupRef` has callers:
-```bash
-cd /home/matt/source/tempo-mrd && grep -rn "\.LookupRef\b" vendor/github.com/grafana/blockpack/ --include="*.go"
-```
+### Task 4: column_sketch.go — Remove CMSEstimate from ColumnSketch interface
 
-If `LookupRef` (non-Fast) has callers outside this file, move it to `intrinsic_codec.go` before deleting. If it has no callers, delete.
+**File:** `queryplanner/column_sketch.go`
 
-To delete the file: replace its content with an empty package declaration or use `rm`. Since we cannot use Bash rm, overwrite with a redirect comment marking it for deletion. Actually — the Write tool can overwrite; but we cannot delete. Instead, remove all exported functions and make the file compile-clean with just the package declaration. The linter (`deadcode`) will flag unused unexported helpers. Best approach: keep the file but remove all functions except `LookupRef` if it has callers; otherwise overwrite with just `package shared`.
+- [ ] Remove lines 13-14 from the `ColumnSketch` interface:
+      ```go
+      // CMSEstimate returns CMS frequency estimate for val per block (0 for absent).
+      CMSEstimate(val string) []uint32
+      ```
 
-**Step 2.4: Update `intrinsic_codec.go` — EncodePageTOC**
+- [ ] The compile-time assertion `var _ queryplanner.ColumnSketch = (*columnSketchData)(nil)`
+      in `reader/sketch_index.go` will now fail because `columnSketchData` still has
+      `CMSEstimate` as an extra method (extra methods on a concrete type are fine in Go —
+      the assertion checks the type implements the interface, not that it has no extra methods).
+      Actually this is the OPPOSITE problem: the assertion verifies `*columnSketchData`
+      satisfies the interface. After removing `CMSEstimate` from the interface, the
+      assertion still passes because `*columnSketchData` has all 4 remaining methods.
+      The `CMSEstimate` method becomes unreferenced (no interface requires it) but is
+      not a compile error on its own — it is just dead code until Task 9 removes it.
+      **`go build` will pass after this task** provided Tasks 1-3 are also complete.
 
-File: `vendor/github.com/grafana/blockpack/internal/modules/blockio/shared/intrinsic_codec.go`
+**Acceptance:** Interface has 4 methods: `Presence`, `Distinct`, `TopKMatch`, `FuseContains`.
 
-In `EncodePageTOC`, remove the v0x02 block that writes `MinRef`, `MaxRef`, `RefBloom`:
-```go
-// REMOVE these lines:
-binary.LittleEndian.PutUint32(tmp4[:], p.MinRef)
-buf.Write(tmp4[:])
-binary.LittleEndian.PutUint32(tmp4[:], p.MaxRef)
-buf.Write(tmp4[:])
-binary.LittleEndian.PutUint16(tmp2[:], uint16(len(p.RefBloom)))
-buf.Write(tmp2[:])
-buf.Write(p.RefBloom)
-```
+---
 
-Change `EncodePageTOC` to write `IntrinsicPageTOCVersion2` still (to avoid changing the version byte, which keeps the wire format stable for new files). Actually — since we're removing the ref-range fields, we should write `0x01` or a new version. Best decision: write version `0x01` for new files (no ref-range fields). Old v0x02 files can still be read. This avoids creating a third version.
+### Task 5: stream.go — Remove pruned_by_cms from StepStats
 
-Update `EncodePageTOC`:
-- Change `buf.WriteByte(IntrinsicPageTOCVersion2)` to `buf.WriteByte(0x01)` — new files are v0x01, no ref-range fields.
+**File:** `executor/stream.go`
 
-Update `DecodePageTOC`:
-- Keep v0x01 decode path unchanged (already reads min/max/bloom, sets conservative MinRef/MaxRef defaults)
-- Keep v0x02 decode path: read MinRef/MaxRef/RefBloom bytes but discard them (do not store in `PageMeta` since those fields are removed). This preserves backward compat with existing files.
+- [ ] Find the `StepStats` metadata map for the "plan" step (around line 230-238).
+      Remove the line: `"pruned_by_cms": plan.PrunedByCMS,`
+- [ ] Scan the rest of the file for any other `plan.PrunedByCMS` references and remove them.
 
-The v0x02 decode path becomes:
-```go
-if version == IntrinsicPageTOCVersion2 {
-    // Read and discard ref-range index fields from legacy v0x02 files.
-    if pos+10 > len(raw) {
-        return PagedIntrinsicTOC{}, fmt.Errorf("DecodePageTOC: truncated at ref-range fields")
-    }
-    pos += 4 // MinRef — discard
-    pos += 4 // MaxRef — discard
-    refBloomLen := int(binary.LittleEndian.Uint16(raw[pos:]))
-    pos += 2
-    if refBloomLen > 0 {
-        if pos+refBloomLen > len(raw) {
-            return PagedIntrinsicTOC{}, fmt.Errorf("DecodePageTOC: truncated at ref_bloom")
+**Acceptance:** `stream.go` has no `PrunedByCMS` references.
+
+---
+
+### Task 6: stream_log_topk.go — Remove pruned_by_cms from StepStats
+
+**File:** `executor/stream_log_topk.go`
+
+- [ ] Find the `StepStats` metadata map for the "plan" step (around line 122-133).
+      Remove the line: `"pruned_by_cms": plan.PrunedByCMS,`
+- [ ] Scan the rest of the file for any other `plan.PrunedByCMS` references and remove them.
+
+**Acceptance:** `stream_log_topk.go` has no `PrunedByCMS` references.
+
+---
+
+### Task 7: plan_blocks.go — Remove fileLevelCMSReject and all helpers
+
+**File:** `executor/plan_blocks.go`
+
+- [ ] In `planBlocks`, remove the `fileLevelCMSReject` call block (lines 62-74):
+      ```go
+      // File-level CMS reject: merged Count-Min Sketch across all blocks.
+      // NOTE-045: Estimate==0 means the value is definitely absent from the entire file.
+      if program != nil && program.Predicates != nil {
+          if fileLevelCMSReject(r, program.Predicates.Nodes) {
+              plan.SelectedBlocks = nil
+              plan.Explain = "file-level reject: CMS absence for equality predicate"
+              plan.PrunedByIndex = 0
+              plan.PrunedByTime = 0
+              plan.PrunedByFuse = 0
+              plan.PrunedByCMS = 0
+              return plan
+          }
+      }
+      ```
+
+- [ ] In the `fileLevelReject` early-return block (lines 37-45), remove the line
+      `plan.PrunedByCMS = 0`.
+
+- [ ] In the `fileLevelBloomReject` early-return block (lines 50-59), remove the line
+      `plan.PrunedByCMS = 0`.
+
+- [ ] Delete these 5 functions entirely (lines 179-287 approximately):
+      - `fileLevelCMSReject` (lines 184-192)
+      - `hasCMSEligibleEquality` (lines 196-203)
+      - `hasCMSEligibleNode` (lines 206-225)
+      - `cmsRejectByNodes` (lines 229-239)
+      - `cmsRejectByEquality` (lines 246-287)
+
+- [ ] Verify imports remain valid: `modules_reader`, `modules_shared`, `queryplanner`, `vm`,
+      `math` are all still used by the remaining functions. No import changes needed.
+
+**Acceptance:** `plan_blocks.go` has no `PrunedByCMS`, no CMS helper functions, no
+`FileSketchSummary()` calls (since the only caller of `r.FileSketchSummary()` was
+`fileLevelCMSReject`).
+
+---
+
+### Task 8: file_sketch_summary.go — Remove CMS field and bump magic
+
+**File:** `blockio/reader/file_sketch_summary.go`
+
+- [ ] Change the magic constant:
+      ```go
+      // OLD:
+      const fileSketchSummaryMagic = uint32(0x46534B54) // "FSKT"
+      // NEW:
+      const fileSketchSummaryMagic = uint32(0x46534B55) // "FSKU" — bumped to invalidate CMS-containing caches
+      ```
+
+- [ ] Remove `CMS *sketch.CountMinSketch` and its doc comment from `FileColumnSketch` struct
+      (lines 40-43).
+
+- [ ] Update the file-level doc comment Usage example to remove the `col.CMS.Estimate(...)`
+      lines and replace with a comment that the file-level rejection now uses TopK only.
+
+- [ ] Update the `NOTE:` at line 24 that says "CMS=0 is an equivalent absence signal" —
+      change to note that file-level CMS rejection has been removed and `FileBloom` serves
+      as the file-level filter.
+
+- [ ] In `buildFileColumnSketch`:
+      - Remove `cd.cmsOnce.Do(cd.inflateCMS)`.
+      - Remove `merged := sketch.NewCountMinSketch()`.
+      - Remove the `for _, cms := range cd.cms { merged.Merge(cms) }` loop.
+      - Remove `CMS: merged,` from the returned struct literal.
+
+- [ ] In `MarshalFileSketchSummary`:
+      - Remove `cmsSz := sketch.CMSDepth * sketch.CMSWidth * 2` local variable.
+      - Update the buffer pre-allocation formula to remove `cmsSz` term:
+        ```go
+        buf := make([]byte, 0, 8+len(names)*(32+4+1+sketch.TopKSize*12))
+        ```
+      - Remove the wire format comment line `//   cms_bytes[CMSDepth × CMSWidth × 2]`.
+      - Remove the `// cms_bytes` section (the `if col.CMS != nil { ... } else { ... }` block).
+
+- [ ] In `UnmarshalFileSketchSummary`:
+      - Remove `cmsSz := sketch.CMSDepth * sketch.CMSWidth * 2` local variable.
+      - Remove the CMS read block:
+        ```go
+        if pos+cmsSz > len(b) {
+            return nil, fmt.Errorf(...)
         }
-        pos += refBloomLen // RefBloom — discard
-    }
-}
-```
+        cms := sketch.NewCountMinSketch()
+        if err := cms.Unmarshal(b[pos : pos+cmsSz]); err != nil {
+            return nil, fmt.Errorf(...)
+        }
+        pos += cmsSz
+        ```
+      - Remove `CMS: cms,` from the `FileColumnSketch` literal.
 
-**Step 2.5: Update `shared/NOTES.md`**
+- [ ] Check `sketch` import: after the change, `sketch.TopKSize` (used in the `slices` trim
+      at line 142) and `sketch.HashForFuse` usage — check if `HashForFuse` is actually used
+      in this file. If the only remaining `sketch.` usage is `sketch.TopKSize`, the import
+      remains valid. If `sketch.CMSDepth` and `sketch.CMSWidth` were the only usages, the
+      import must be removed. Read the file carefully before deciding.
 
-Append a new dated entry documenting the removal. The entry must be assigned the next sequential ID (check existing entries — current last is NOTE-006).
-
-New entry:
-```markdown
-## NOTE-007: RefBloom Removed from Page TOC (2026-03-29)
-*Added: 2026-03-29*
-
-**Decision:** Removed `RefBloom []byte`, `MinRef uint32`, and `MaxRef uint32` from
-`PageMeta`. Removed `IntrinsicRefBloomBytes` (256) and `IntrinsicRefBloomK` (3) constants.
-Removed `RefIndexEntry` type and `refIndex`/`refIndexOnce` fields from `IntrinsicColumn`.
-Deleted (emptied) `intrinsic_ref_filter.go`. `EncodePageTOC` now writes version 0x01 (no
-ref-range fields). `DecodePageTOC` reads and discards the ref-range bytes in v0x02 files for
-backward compatibility.
-
-**Rationale:** RefBloom was designed to skip pages during reverse-lookup (lookupIntrinsicFields).
-After the companion change that switches field population entirely to `forEachBlockInGroups`
-(block reads), there are no remaining reverse-lookup callers. The ref-bloom provided zero
-pruning benefit at 10K entries/page with 256 bytes (FPR ≈ 100% when full). Removal saves
-256 bytes/page of storage and eliminates the bloom maintenance cost at write time.
-
-**Backward compat:** v0x02 files decode correctly — the ref-range bytes are read and
-discarded. New files write v0x01 (no ref-range fields).
-
-Back-ref: `shared/constants.go`, `shared/types.go`, `shared/intrinsic_codec.go`,
-`writer/intrinsic_accum.go`
-```
+**Acceptance:** `FileColumnSketch` has no `CMS` field. `fileSketchSummaryMagic` is `0x46534B55`.
+Marshal writes only `total_distinct` + topk entries. Unmarshal reads the same.
 
 ---
 
-### Phase 3: Remove Identity Columns from Writer
+### Task 9: reader/sketch_index.go — Remove CMSEstimate, add skipColumnCMS, multi-magic dispatch
 
-**Step 3.1: Update `writer/intrinsic_accum.go`**
+**File:** `blockio/reader/sketch_index.go`
 
-File: `vendor/github.com/grafana/blockpack/internal/modules/blockio/writer/intrinsic_accum.go`
+This task is the most complex in the change. Do all sub-steps in order.
 
-Remove functions `computePageRefRange` and `collectDictPageRefs` (lines 702–737).
+- [ ] Remove the `"math"` import (currently at line 14 — used only for `math.MaxUint32` in
+      `CMSEstimate`). Confirm it is not used elsewhere in the file before removing.
 
-In `encodePagedFlatColumn`, update the `PageMeta` literal (lines ~502–514):
-```go
-// BEFORE:
-minRef, maxRef, refBloom := computePageRefRange(c.refs[start:end])
-pages = append(pages, shared.PageMeta{
-    Offset:   offset,
-    Length:   uint32(len(blob)),
-    RowCount: uint32(end - start),
-    Min:      minVal,
-    Max:      maxVal,
-    MinRef:   minRef,
-    MaxRef:   maxRef,
-    RefBloom: refBloom,
-})
+- [ ] Replace the single magic constant with two:
+      ```go
+      const (
+          sketchSectionMagicSKTC = uint32(0x534B5443) // "SKTC" — legacy with CMS bytes
+          sketchSectionMagicSKTE = uint32(0x534B5445) // "SKTE" — new, no CMS bytes
+      )
+      ```
+      Remove the old `sketchSectionMagic = uint32(0x534B5443)` constant.
 
-// AFTER:
-pages = append(pages, shared.PageMeta{
-    Offset:   offset,
-    Length:   uint32(len(blob)),   //nolint:gosec
-    RowCount: uint32(end - start), //nolint:gosec
-    Min:      minVal,
-    Max:      maxVal,
-})
-```
+- [ ] Remove from `columnSketchData` struct:
+      - `cmsRaw [][]byte` field (line 39)
+      - `cms    []*sketch.CountMinSketch` field (line 40)
+      - `cmsOnce sync.Once` field (line 47)
+      Keep `fuseOnce sync.Once` (line 49). The `sync` import stays.
 
-In `encodePagedDictColumn`, update the `PageMeta` literal (lines ~668–681):
-```go
-// BEFORE:
-pageRefs := collectDictPageRefs(c.entries, entryRanges)
-minRef, maxRef, refBloom := computePageRefRange(pageRefs)
-pages = append(pages, shared.PageMeta{
-    ...
-    Bloom:    bloom,
-    MinRef:   minRef,
-    MaxRef:   maxRef,
-    RefBloom: refBloom,
-})
+- [ ] Remove the `inflateCMS()` method (lines 65-77).
 
-// AFTER:
-pages = append(pages, shared.PageMeta{
-    ...
-    Bloom:    bloom,
-})
-```
+- [ ] Remove the `CMSEstimate(val string) []uint32` method (lines 82-94) and its doc comment.
 
-Also update the comment at the top of `encodeColumn` (line ~188-189) which references "RefBloom" in the v2 format description.
+- [ ] In `parseSketchIndexSection`, replace the magic check:
+      ```go
+      // OLD:
+      if magic != sketchSectionMagic {
+          return nil, 0, nil
+      }
 
-**Step 3.2: Remove identity columns from `writer_block.go`**
+      // NEW:
+      hasCMS := false
+      switch magic {
+      case sketchSectionMagicSKTC:
+          hasCMS = true
+      case sketchSectionMagicSKTE:
+          // hasCMS remains false
+      default:
+          return nil, 0, nil // unknown format — degrade gracefully
+      }
+      ```
 
-File: `vendor/github.com/grafana/blockpack/internal/modules/blockio/writer/writer_block.go`
+- [ ] In the per-column parse loop, replace the `parseColumnCMS` call:
+      ```go
+      // OLD:
+      pos, err = parseColumnCMS(data, pos, name, presentCount, cd)
+      if err != nil {
+          return nil, 0, err
+      }
 
-The four identity columns to remove from the intrinsic accumulator:
-- `trace:id` (traceIDColumnName) — `feedIntrinsicBytes` calls
-- `span:id` (spanIDColumnName) — `feedIntrinsicBytes` calls
-- `span:parent_id` (spanParentIDColumnName) — `feedIntrinsicBytes` calls
-- `span:status_message` (spanStatusMsgColumnName) — `feedIntrinsicString` calls
+      // NEW:
+      if hasCMS {
+          pos, err = skipColumnCMS(data, pos, name, presentCount)
+          if err != nil {
+              return nil, 0, err
+          }
+      }
+      ```
 
-The `addPresent` calls for all four columns STAY (block column payloads still need these values for field population via `forEachBlockInGroups`).
+- [ ] Remove the `parseColumnCMS` function entirely (lines 311-357).
 
-Locations to change:
+- [ ] Add the new `skipColumnCMS` function after `parseColumnTopK`:
+      ```go
+      // skipColumnCMS reads and discards the CMS section for one column in legacy SKTC files.
+      // Reads cms_depth[1] + cms_width[2 LE] from the file header to compute the exact skip
+      // distance: depth × width × 2 × presentCount. Zero allocations.
+      // This handles any depth/width values that may appear in old files, not just the
+      // current CMSDepth=4/CMSWidth=64 defaults.
+      func skipColumnCMS(data []byte, pos int, name string, presentCount int) (int, error) {
+          if pos >= len(data) {
+              return pos, fmt.Errorf("sketch_index: col %q: missing cms_depth", name)
+          }
+          cmsDepth := int(data[pos])
+          pos++
 
-**In `addRowFromProto` (~lines 314–402):**
-- Line 314: remove `b.feedIntrinsicBytes(traceIDColumnName, ...)`; keep `b.addPresent` on line 315
-- Lines 320–321: remove `b.feedIntrinsicBytes(spanIDColumnName, ...)`; keep `b.addPresent`
-- Lines 327–328: remove `b.feedIntrinsicBytes(spanParentIDColumnName, ...)`; keep `b.addPresent`
-- Line 400: remove `b.feedIntrinsicString(spanStatusMsgColumnName, ...)`; keep `b.addPresent`
+          if pos+2 > len(data) {
+              return pos, fmt.Errorf("sketch_index: col %q: missing cms_width", name)
+          }
+          cmsWidth := int(binary.LittleEndian.Uint16(data[pos:]))
+          pos += 2
 
-**In `addRowFromTempoProto` (~lines 504–577):**
-- Line 504: remove `b.feedIntrinsicBytes(traceIDColumnName, ...)`; keep `b.addPresent`
-- Lines 509–510: remove `b.feedIntrinsicBytes(spanIDColumnName, ...)`; keep `b.addPresent`
-- Lines 514–516: remove `b.feedIntrinsicBytes(spanParentIDColumnName, ...)`; keep `b.addPresent`
-- Line 576: remove `b.feedIntrinsicString(spanStatusMsgColumnName, ...)`; keep `b.addPresent`
+          cmsMarshalSize := cmsDepth * cmsWidth * 2
+          skipTotal := cmsMarshalSize * presentCount
+          if pos+skipTotal > len(data) {
+              return pos, fmt.Errorf(
+                  "sketch_index: col %q: CMS data too short (need %d bytes, have %d)",
+                  name, skipTotal, len(data)-pos,
+              )
+          }
+          pos += skipTotal
+          return pos, nil
+      }
+      ```
 
-**In `applyTraceID` (~line 742):**
-- Remove `b.feedIntrinsicBytes("trace:id", ...)` call; keep `b.addPresent`
+- [ ] Update the package-level comment to describe SKTC and SKTE handling:
+      ```
+      // CMS data in SKTC files is skipped zero-alloc via skipColumnCMS.
+      // SKTE files contain no CMS bytes and do not call skipColumnCMS.
+      ```
+      Remove the existing "CMS and fuse filters use lazy deserialization" sentence (CMS
+      is no longer lazily deserialized — it is skipped entirely).
 
-**In `applySpanID` (~line 753):**
-- Remove `b.feedIntrinsicBytes(spanIDColumnName, ...)` call; keep `b.addPresent`
+- [ ] Verify `sketch` import is still needed: `sketch.BinaryFuse8` is used in `inflateFuse`.
+      `sketch.CountMinSketch`, `sketch.CMSDepth`, `sketch.CMSWidth` are all gone from
+      this file. The import stays because of `sketch.BinaryFuse8`.
 
-**In `applySpanParentID` (~line 762):**
-- Remove `b.feedIntrinsicBytes(spanParentIDColumnName, ...)` call; keep `b.addPresent`
-
-**In `applySpanStatusMsg` (grep for spanStatusMsgColumnName in addRowFromBlock path, ~line 898):**
-- Remove `b.feedIntrinsicString(spanStatusMsgColumnName, ...)`; keep `b.addPresent`
-
-**In `feedIntrinsicsFromIndex` (~lines 1057–1132):**
-- Remove the `"trace:id"`, `spanIDColumnName`, `spanParentIDColumnName`, `spanStatusMsgColumnName` cases from the switch/if chain
-- These are the compaction path — since source files may have these in their intrinsic section (old files), `buildIntrinsicBlockIndex` would still load them, but `feedIntrinsicsFromIndex` should skip them to avoid re-adding to the new file's intrinsic accumulator
-
-**Step 3.3: Update `writer/NOTES.md`**
-
-Append a new dated entry:
-
-```markdown
-## NOTE-005: Identity Columns Removed from Intrinsic Accumulator (2026-03-29)
-*Added: 2026-03-29*
-
-**Decision:** `feedIntrinsicBytes` calls for `trace:id`, `span:id`, `span:parent_id` and
-`feedIntrinsicString` for `span:status_message` are removed from `addRowFromProto`,
-`addRowFromTempoProto`, `applyTraceID`, `applySpanID`, `applySpanParentID`, and
-`applySpanStatusMsg`. The corresponding `addPresent` calls are retained — block column
-payloads still store these values. `feedIntrinsicsFromIndex` now skips these four columns
-during compaction to avoid carrying them forward into new intrinsic accumulators.
-
-**Rationale:** These are identity/display-only columns — they are never used as predicate
-targets in the intrinsic predicate-evaluation path (`scanIntrinsicLeafRefs`). They only
-appeared in the intrinsic section to support `lookupIntrinsicFields` reverse lookups during
-field population. Since field population for Case A (plain) now uses `forEachBlockInGroups`
-(block reads), the intrinsic section entries are redundant.
-
-**Storage savings:** Removing these 4 columns shrinks the intrinsic section from 11 columns
-to 7, approximately 48% reduction in intrinsic section size (~125 MB per large file). The
-block column payloads retain these values unchanged.
-
-**Back-ref:** `writer/writer_block.go:addRowFromProto`, `writer/writer_block.go:addRowFromTempoProto`,
-`writer/writer_block.go:applyTraceID`, `writer/writer_block.go:feedIntrinsicsFromIndex`
-```
+**Acceptance:** `columnSketchData` satisfies `queryplanner.ColumnSketch` (4 methods).
+Compile-time assertion passes. `parseSketchIndexSection` handles SKTC (skip CMS) and
+SKTE (no CMS). `skipColumnCMS` has no allocations.
 
 ---
 
-### Phase 4: Update Executor — Remove `useIntrinsicLookup` Branch
+### Task 10: writer/sketch_index.go — Change magic to SKTE, remove CMS write path
 
-**Step 4.1: Update `executor/stream.go`**
+**File:** `blockio/writer/sketch_index.go`
 
-File: `vendor/github.com/grafana/blockpack/internal/modules/executor/stream.go`
+- [ ] Change the magic constant:
+      ```go
+      // OLD: sketchSectionMagic = uint32(0x534B5443) // "SKTC"
+      // NEW: sketchSectionMagic = uint32(0x534B5445) // "SKTE"
+      ```
 
-**Change 1: Remove `useIntrinsicLookup` parameter from `collectIntrinsicPlain`**
+- [ ] Update the package-level wire format comment to remove CMS lines:
+      Remove these 3 lines:
+      ```
+      //   cms_depth[1] = 4
+      //   cms_width[2 LE] = 64
+      //   per present block: cms_counters[depth × width × 2 LE] = 512 bytes
+      ```
 
-Current signature (line ~782):
-```go
-func collectIntrinsicPlain(
-    r *modules_reader.Reader,
-    refs []modules_shared.BlockRef,
-    opts CollectOptions,
-    wantColumns map[string]struct{},
-    secondPassCols map[string]struct{},
-    stats *CollectStats,
-    useIntrinsicLookup bool,
-) ([]MatchedRow, error) {
-```
+- [ ] Remove `cms *sketch.CountMinSketch` from the `colSketch` struct (line 41).
 
-New signature (remove `useIntrinsicLookup bool` parameter):
-```go
-func collectIntrinsicPlain(
-    r *modules_reader.Reader,
-    refs []modules_shared.BlockRef,
-    opts CollectOptions,
-    wantColumns map[string]struct{},
-    secondPassCols map[string]struct{},
-    stats *CollectStats,
-) ([]MatchedRow, error) {
-```
+- [ ] In `blockSketchSet.add()`:
+      - Remove `cms: sketch.NewCountMinSketch(),` from the `&colSketch{...}` initializer.
+      - Remove `cs.cms.Add(key, 1)` from the body.
 
-**Change 2: Remove the `useIntrinsicLookup` branch inside `collectIntrinsicPlain`**
+- [ ] In `writeSketchIndexSection`:
+      - Remove `cmsMarshalSize := sketch.CMSDepth * sketch.CMSWidth * 2` (line 98).
+      - Remove `numBlocks*cmsMarshalSize` term from the buffer pre-allocation formula
+        (line 102). New formula:
+        ```go
+        buf := make(
+            []byte,
+            0,
+            12+numColumns*(64+presenceBytes+numBlocks*4+1+numBlocks*(1+20*10)+numBlocks*16),
+        )
+        ```
+      - Remove the 3-line CMS write block:
+        ```go
+        // cms_depth[1]
+        buf = append(buf, byte(sketch.CMSDepth))
+        // cms_width[2 LE]
+        binary.LittleEndian.PutUint16(tmp2[:], uint16(sketch.CMSWidth))
+        buf = append(buf, tmp2[:]...)
+        // Per present block: cms_counters[depth × width × 2 LE] = 512 bytes.
+        for _, bs := range sketchIdx {
+            cs := bs[name]
+            if cs == nil {
+                continue
+            }
+            buf = append(buf, cs.cms.Marshal()...)
+        }
+        ```
+        (lines 170-184 approximately).
 
-Current code (~lines 807–820):
-```go
-if useIntrinsicLookup {
-    // Range predicate path: resolve fields from cached intrinsic blobs, zero block reads.
-    fieldMaps := lookupIntrinsicFields(r, refs, secondPassCols)
-    results := make([]MatchedRow, 0, len(refs))
-    for i, ref := range refs {
-        results = append(results, MatchedRow{
-            IntrinsicFields: &intrinsicFieldsProvider{fields: fieldMaps[i]},
-            BlockIdx:        int(ref.BlockIdx),
-            RowIdx:          int(ref.RowIdx),
-        })
-    }
-    return results, nil
-}
-```
+- [ ] Verify `sketch` import is still needed: `sketch.HyperLogLog`, `sketch.TopK`,
+      `sketch.NewBinaryFuse8`, `sketch.HashForFuse`, `sketch.TopKSize` are all still used.
+      `sketch.CountMinSketch`, `sketch.NewCountMinSketch`, `sketch.CMSDepth`,
+      `sketch.CMSWidth` are gone. Import stays.
 
-Delete this entire `if` block. The function body becomes the current `else` path (equality path via `forEachBlockInGroups`) for all cases.
-
-Update the function comment to reflect the new behavior:
-```go
-// collectIntrinsicPlain handles Case A: pure intrinsic + no sort.
-// All results use forEachBlockInGroups to populate MatchedRow.Block.
-// This is correct for both equality predicates (status=error, kind=server) and
-// range predicates (duration>100ms, svc=~".*"). Block reads are O(M) where M is
-// the result count — far cheaper than the previous O(N) intrinsic column scan
-// for range predicates across 3.3M entries × 7 columns per file.
-```
-
-**Change 3: Update call site**
-
-Current call (line ~648):
-```go
-return collectIntrinsicPlain(r, refs, opts, wantColumns, secondPassCols, stats, hasRangePredicate(program))
-```
-
-New call:
-```go
-return collectIntrinsicPlain(r, refs, opts, wantColumns, secondPassCols, stats)
-```
-
-**Step 4.2: Update `executor/SPECS.md`**
-
-Find the section describing Case A / field population (search for "lookupIntrinsicFields" or "Case A"). Update to say:
-
-```
-Case A (pure intrinsic, no sort): uses forEachBlockInGroups for field population.
-MatchedRow.Block is populated; MatchedRow.IntrinsicFields is nil.
-This applies to both equality predicates and range predicates.
-```
-
-**Step 4.3: Update `executor/NOTES.md`**
-
-Append a new dated entry. Current last note is around NOTE-050 or later — grep the file to find the last sequential ID before appending:
-
-```bash
-grep -n "## NOTE-0" /home/matt/source/tempo-mrd/vendor/github.com/grafana/blockpack/internal/modules/executor/NOTES.md | tail -5
-```
-
-New entry (assign next sequential ID after checking):
-```markdown
-## NOTE-0XX: collectIntrinsicPlain Always Uses Block Reads (2026-03-29)
-*Added: 2026-03-29*
-
-**Decision:** Removed the `useIntrinsicLookup` branch from `collectIntrinsicPlain`. Range
-predicates (duration>X, svc=~".*") now use `forEachBlockInGroups` for field population,
-the same path as equality predicates. The `useIntrinsicLookup bool` parameter is removed.
-
-**Rationale:** The `useIntrinsicLookup` branch called `lookupIntrinsicFields` which scanned
-all N entries in all intrinsic columns to find the M result refs. For a 3.3M-span file with
-7 remaining intrinsic columns, this is O(3.3M × 7) = O(23M) operations even for a 10-result
-query. `forEachBlockInGroups` groups refs by block and reads only the blocks containing
-matched spans — O(M × block_read_cost). For M=10 results across a few blocks, this is
-O(500K) bytes read vs O(286MB) of intrinsic scans: a 500x improvement.
-
-**Impact on execution paths:** Case A results now always populate `MatchedRow.Block` (not
-`IntrinsicFields`). `lookupIntrinsicFields` is retained — it is still used by Case B
-(`collectIntrinsicTopK`) for timestamp-sorted top-K queries where ordering requires the
-intrinsic timestamp column, and by `stream_structural.go` for identity field resolution.
-
-**Test changes:** `execution_path_test.go` EP-01 and EP-03 assertions updated from
-IntrinsicFields→populated/Block→nil to Block→populated/IntrinsicFields→nil.
-
-Back-ref: `executor/stream.go:collectIntrinsicPlain`
-```
-
-**Step 4.4: Update `executor/TESTS.md`**
-
-Append or update the test plan section for EP tests:
-
-```markdown
-## EP-01 (updated 2026-03-29)
-Range predicates now use forEachBlockInGroups. EP-01 verifies Block is populated and
-IntrinsicFields is nil (was reversed before 2026-03-29).
-
-## EP-03 (updated 2026-03-29)
-Range+equality combination also uses forEachBlockInGroups. EP-03 verifies Block populated.
-```
+**Acceptance:** Writer emits magic `0x534B5445` ("SKTE"). No CMS bytes in output.
+`colSketch` has no `cms` field.
 
 ---
 
-### Phase 5: Test and Fix Compilation
+### Task 11: reader/layout.go — Remove CMSBytes from ColumnSketchStat and buildSketchIndexInfo
 
-**Step 5.1: Build vendor copy**
+**File:** `blockio/reader/layout.go`
 
-```bash
-cd /home/matt/source/tempo-mrd && go build ./vendor/github.com/grafana/blockpack/... 2>&1
-```
+- [ ] Remove `CMSBytes int` and its doc comment from `ColumnSketchStat` struct (lines 63-66).
 
-Expected: clean build. Fix any remaining references to removed symbols.
+- [ ] In `buildSketchIndexInfo`:
+      - Remove `cmsBytesPerBlock := sketch.CMSDepth * sketch.CMSWidth * 2` (line 358).
+      - Remove from the per-column byte accounting block:
+        ```go
+        totalBytes += 1 + 2                          // cms_depth[1] + cms_width[2]
+        totalBytes += presentCount * cmsBytesPerBlock
+        ```
+        (lines 365-366).
+      - Remove `cmsBytes int` from the anonymous `blockColStat` struct (line 349).
+      - Remove `cmsBytes: cmsBytesPerBlock,` from the `stat := blockColStat{...}` initializer
+        (line 383).
+      - Remove `CMSBytes: c.cmsBytes,` from the `ColumnSketchStat{...}` constructor (line 410).
 
-Common issues to watch for:
-- Tests in `shared/intrinsic_ref_filter_test.go` — these test the deleted functions. They must be deleted or emptied.
-- Tests in `executor/intrinsic_pruning_test.go` around `TestLookupIntrinsicFields_PageSkipping` — this calls `lookupIntrinsicFields` directly; it should still compile since `lookupIntrinsicFields` is retained.
-- Tests in `executor/execution_path_test.go` — updated in Step 1.1.
+- [ ] Check `sketch` import in `layout.go`: after removing `sketch.CMSDepth * sketch.CMSWidth`,
+      search for all remaining `sketch.` usages in the file. If no other usages remain,
+      remove the `sketch` import. If `sketch.*` appears elsewhere in `layout.go`, keep it.
 
-**Step 5.2: Run tests for affected packages**
-
-```bash
-cd /home/matt/source/tempo-mrd && go test ./vendor/github.com/grafana/blockpack/internal/modules/blockio/shared/... -v -count=1 2>&1 | tail -30
-```
-
-```bash
-cd /home/matt/source/tempo-mrd && go test ./vendor/github.com/grafana/blockpack/internal/modules/blockio/writer/... -v -count=1 2>&1 | tail -30
-```
-
-```bash
-cd /home/matt/source/tempo-mrd && go test ./vendor/github.com/grafana/blockpack/internal/modules/executor/... -v -count=1 2>&1 | tail -40
-```
-
-Expected: all pass.
-
-**Step 5.3: Build Tempo**
-
-```bash
-cd /home/matt/source/tempo-mrd && go build ./tempodb/... 2>&1
-```
-
-Expected: clean build (Tempo code calls blockpack public API which is unchanged).
-
-**Step 5.4: Run Tempo tests**
-
-```bash
-cd /home/matt/source/tempo-mrd && go test ./tempodb/encoding/vblockpack/... -v -count=1 2>&1 | tail -30
-```
+**Acceptance:** `ColumnSketchStat` has no `CMSBytes` field. `buildSketchIndexInfo` byte
+accounting does not include CMS. `go build` on `blockio/reader` package passes.
 
 ---
 
-### Phase 6: Mirror Changes to Upstream Source
+### Task 12: scoring_test.go — Delete CMS-only tests, update mixed tests
 
-**Step 6.1: Identify divergence between vendor and upstream**
+**File:** `queryplanner/scoring_test.go`
 
-```bash
-diff -u /home/matt/source/blockpack-tempo/internal/modules/blockio/shared/constants.go \
-         /home/matt/source/tempo-mrd/vendor/github.com/grafana/blockpack/internal/modules/blockio/shared/constants.go
-```
+- [ ] Delete `TestPlanCMSPruning` (QP-T-17, lines 55-86) entirely.
 
-If the upstream does not have `IntrinsicRefBloomBytes`/`IntrinsicRefBloomK`, there is nothing to remove. Apply only the changes that exist in both.
+- [ ] `TestPlanCMSNoPruneForFalsePositive` (QP-T-18, lines 88-109) does not call
+      `CMSEstimate` but is CMS-named. Rename it to `TestPlanNoPruneForMember` and update
+      the doc comment. The assertion body is fine.
 
-**Step 6.2: Apply the same changes to upstream**
+- [ ] `TestPlanFusePruning` (QP-T-24), line 174: change
+      `plan.PrunedByIndex + plan.PrunedByFuse + plan.PrunedByCMS`
+      to `plan.PrunedByIndex + plan.PrunedByFuse`.
 
-For each file modified in vendor:
-1. Read the current upstream file
-2. Apply the equivalent changes (adapting for any version differences)
-3. Write the updated file
+- [ ] `TestColumnMajorRoundTrip` (QP-T-27), lines 288-293: remove the CMS block:
+      ```go
+      est := cs.CMSEstimate("service-A")
+      require.Len(t, est, 2)
+      assert.Greater(t, est[0], uint32(0), ...)
+      assert.Equal(t, uint32(0), est[1], ...)
+      ```
 
-**Step 6.3: Build upstream**
+- [ ] `TestColumnMajorGracefulDegradation` (QP-T-30), line 355: remove the line
+      `assert.Equal(t, 0, plan.PrunedByCMS, ...)`.
 
-```bash
-cd /home/matt/source/blockpack-tempo && go build ./... 2>&1
-```
+- [ ] `TestColumnMajorPlannerPruning` (QP-T-29), line 334: change
+      `plan.PrunedByIndex + plan.PrunedByFuse + plan.PrunedByCMS`
+      to `plan.PrunedByIndex + plan.PrunedByFuse`.
 
-Expected: clean build.
+- [ ] `TestFusePruneANDPredicate` (QP-T-32), line 410: change
+      `plan.PrunedByIndex + plan.PrunedByFuse + plan.PrunedByCMS`
+      to `plan.PrunedByIndex + plan.PrunedByFuse`.
 
-**Step 6.4: Run upstream tests (optional but recommended)**
+- [ ] Delete `TestCMSPruneZeroEstimate` (QP-T-35, lines 453-479) entirely.
 
-```bash
-cd /home/matt/source/blockpack-tempo && go test ./internal/modules/... -count=1 2>&1 | tail -30
-```
+- [ ] Delete `TestCMSPruneNonZeroKept` (QP-T-36, lines 481-505) entirely.
 
----
+- [ ] `TestScoreBlocksTopKFallback` (QP-T-39, lines 546+): the test body does not call
+      `CMSEstimate`. Update the doc comment to remove the CMS comparison language. No code
+      changes needed.
 
-### Phase 7: Final Verification
+- [ ] Verify `"github.com/grafana/blockpack/internal/modules/sketch"` import is still
+      needed: `sketch.HashForFuse` is used in `TestPlanFusePruning` (line 146) and
+      `TestColumnMajorRoundTrip` (line 295). Import stays.
 
-**Step 7.1: Full build and test**
-
-```bash
-cd /home/matt/source/tempo-mrd && go build ./tempodb/... && echo "BUILD OK"
-cd /home/matt/source/blockpack-tempo && go build ./... && echo "BUILD OK"
-```
-
-**Step 7.2: Run the parity smoke test (if available)**
-
-```bash
-cd /home/matt/source/tempo-mrd && go test ./vendor/github.com/grafana/blockpack/internal/parity/... -v -count=1 2>&1 | tail -20
-```
+**Acceptance:** File compiles. No `CMSEstimate` calls. No `PrunedByCMS` references.
 
 ---
 
-## Spec-Driven Verification Tests
+### Task 13: sketch_integration_test.go — Update explain and pipeline tests
 
-### Module: `internal/modules/executor/`
+**File:** `queryplanner/sketch_integration_test.go`
 
-Source: SPECS.md and NOTES.md invariants
+- [ ] `TestExplainBlockPriority`, lines 38-40: change:
+      ```go
+      // OLD:
+      assert.True(t,
+          strings.Contains(plan.Explain, "topk") || strings.Contains(plan.Explain, "cms"),
+          "explain must mention frequency source (topk or cms)")
 
-| Invariant | Test to Verify | Test File |
-|-----------|---------------|-----------|
-| Case A always populates `MatchedRow.Block` | `TestExecutionPath_RangePredicate_BlockPopulated` | execution_path_test.go |
-| Case A never populates `MatchedRow.IntrinsicFields` | `TestExecutionPath_RangePredicate_BlockPopulated` | execution_path_test.go |
-| Range+equality combination uses Block path | `TestExecutionPath_RangeAndEquality_BlockPopulated` | execution_path_test.go |
-| Result counts unchanged (correctness invariant) | `TestExecutionPath_Correctness` (EP-05, no change needed) | execution_path_test.go |
-| `lookupIntrinsicFields` still works for TopK | `TestIntrinsicTopK_*` (no change) | stream_topk_test.go |
+      // NEW:
+      assert.Contains(t, plan.Explain, "topk",
+          "explain must mention frequency source (topk)")
+      ```
 
-### Module: `internal/modules/blockio/shared/`
+- [ ] `TestExplainPruningPipeline`, line 62: change:
+      ```go
+      // OLD:
+      totalPruned := plan.PrunedByIndex + plan.PrunedByFuse + plan.PrunedByCMS
 
-| Invariant | Test to Verify | Test File |
-|-----------|---------------|-----------|
-| Old v0x02 files still decode without error | New test: `TestDecodePageTOC_V2LegacyBackwardCompat` | shared/intrinsic_ref_filter_test.go or codec test |
-| New files encode as v0x01 (no ref-range fields) | New test: `TestEncodeDecodePageTOC_NoRefBloom` | shared test |
+      // NEW:
+      totalPruned := plan.PrunedByIndex + plan.PrunedByFuse
+      ```
+
+- [ ] Read `TestMultiColumnSketchIndependence` in full — the brainstorm identifies it calls
+      `csSvc.CMSEstimate(...)` and `csEnv.CMSEstimate(...)`. Find those calls and replace
+      with assertions using `FuseContains` or `TopKMatch` to verify column independence.
+      For example, verify that `FuseContains(sketch.HashForFuse("svc-a"))` returns true
+      for block 0 and false for block 1, and similarly for the environment column.
+
+- [ ] Check if the `sketch` package import is still needed after CMS assertion removal.
+      If `sketch.HashForFuse` or other `sketch.*` is used elsewhere in the file, it stays.
+      If the only use was `CMSEstimate`-related (e.g., building test values), remove the
+      import if it becomes unused.
+
+**Acceptance:** File compiles. No `CMSEstimate` calls. No `PrunedByCMS` references.
+`TestExplainBlockPriority` asserts on `"topk"` only.
 
 ---
 
-## Spec-Driven Module Updates
+### Task 14: file_sketch_summary_test.go — Delete CMS tests, update round-trip tests
 
-### Module: `internal/modules/blockio/shared/`
+**File:** `blockio/reader/file_sketch_summary_test.go`
 
-**Spec files present:** NOTES.md
+- [ ] `TestFileSketchSummary_ColumnPresent` (lines 48-65): Remove `assert.NotNil(t, col.CMS, ...)`
+      (line 63). `TotalDistinct` and `TopK` assertions remain valid.
 
-**Required updates:**
-- [ ] Add NOTES.md entry NOTE-007: RefBloom removal decision and backward compat story (Step 2.5)
+- [ ] Delete `TestFileSketchSummary_CMSAbsence` (lines 67-83) entirely.
 
-### Module: `internal/modules/blockio/writer/`
+- [ ] Delete `TestFileSketchSummary_CMSPresence` (lines 85-103+) entirely.
 
-**Spec files present:** NOTES.md
+- [ ] Read `TestFileSketchSummary_MarshalRoundTrip` in full. Remove any `col.CMS.Estimate(...)`
+      or `col.CMS != nil` assertions. The round-trip test is still valid for `TotalDistinct`
+      and `TopK`.
 
-**Required updates:**
-- [ ] Add NOTES.md entry NOTE-005: identity columns removed from intrinsic accumulator (Step 3.3)
+- [ ] Read `TestFileSketchSummaryRaw_RoundTrip` in full and do the same.
 
-### Module: `internal/modules/executor/`
+- [ ] After editing, verify `"github.com/grafana/blockpack/internal/modules/sketch"` import
+      is still needed. If `sketch.NewCountMinSketch` or `sketch.CMSDepth`/`sketch.CMSWidth`
+      were the only uses, remove the import.
 
-**Spec files present:** SPECS.md, NOTES.md, TESTS.md, BENCHMARKS.md
+**Acceptance:** File compiles. No `col.CMS` accesses. No `sketch.NewCountMinSketch` calls
+in this file.
 
-**Required updates:**
-- [ ] Update SPECS.md: Case A field population section — block reads always used (Step 4.2)
-- [ ] Add NOTES.md entry NOTE-0XX: collectIntrinsicPlain change rationale (Step 4.3)
-- [ ] Update TESTS.md: EP-01 and EP-03 test scenario description (Step 4.4)
-- [ ] Update BENCHMARKS.md: Case A intrinsic query I/O target reduced (O(N) → O(M)) — update Metric Targets table if it has rows for range-predicate I/O cost
+---
+
+### Task 15: plan_blocks_test.go — Scan and clean PrunedByCMS
+
+**File:** `executor/plan_blocks_test.go`
+
+- [ ] Read the full file (already partially read above). The test file does not appear to
+      directly assert on `plan.PrunedByCMS` in the sections already read.
+- [ ] Search for `PrunedByCMS`, `cmsRejectByNodes`, `CMSEstimate`, `col.CMS` in the file.
+      If any appear, remove them.
+- [ ] The test file imports `sketch` — verify whether it uses `sketch.*` for anything other
+      than CMS-related assertions. If the import becomes unused after cleanup, remove it.
+
+**Acceptance:** File compiles. No CMS-related references.
+
+---
+
+### Task 16: Verify compile
+
+After Tasks 1-15 are all complete:
+
+- [ ] From `/home/mdurham/source/tempo-mrd-worktrees/drop-cms-sketch`, run:
+      `go build ./vendor/github.com/grafana/blockpack/...`
+      Expect: zero errors.
+
+- [ ] If errors appear, address them. Common traps to check:
+      - `"math"` import left in `scoring.go` (Task 1) or `sketch_index.go` (Task 9)
+      - `"sketch"` import in `layout.go` became unused (Task 11)
+      - `"sketch"` import in `file_sketch_summary.go` became unused (Task 8)
+      - Stale `CMSEstimate` call in a test file not yet updated — search for `CMSEstimate`
+      - `PrunedByCMS` reference in a test file not yet updated — search for `PrunedByCMS`
+      - `col.CMS` access in a test file — search for `col.CMS`
+
+- [ ] Run: `go build ./...` from the worktree root.
+      Expect: zero errors (Tempo-side code is not affected by these changes).
+
+---
+
+### Task 17: Spec-driven module documentation updates
+
+These files do not affect compilation but are required by the spec-driven module contract.
+
+**`queryplanner/NOTES.md`** — Add dated entry (2026-04-02):
+- Title: CMS Pruning Stage Removed — NOTE-013 Retired
+- Content: `pruneByCMSAll` (Stage 3b) removed from `Plan()`. `CMSEstimate` removed from
+  `ColumnSketch` interface. `PrunedByCMS` removed from `Plan` struct. Rationale: 61 MB per
+  file (70% of sketch section) causing OOM at 650 concurrent files on 16 GiB shadow pod.
+  Fuse filter (Stage 2b) provides equivalent block-level exclusion at 0.39% FPR.
+  NOTE-013 retired. NOTE-015 updated to remove "Fuse before CMS" ordering rationale.
+  `fileLevelCMSReject` removed from executor `plan_blocks.go`; `FileBloom` continues to
+  cover file-level rejection for service.name and trace:id.
+
+**`queryplanner/SPECS.md`** — Update:
+- Remove `CMSEstimate(val string) []uint32` from the `ColumnSketch` interface specification.
+- Remove Stage 3b (Count-Min Sketch zero-estimate pruning) from the planner stage list.
+- Remove `PrunedByCMS` from the `Plan` struct field documentation.
+
+**`queryplanner/TESTS.md`** — Update test registry:
+- Mark QP-T-17 (`TestPlanCMSPruning`) as DELETED.
+- Mark QP-T-35 (`TestCMSPruneZeroEstimate`) as DELETED.
+- Mark QP-T-36 (`TestCMSPruneNonZeroKept`) as DELETED.
+- Update QP-T-27 (`TestColumnMajorRoundTrip`) description to remove CMS assertions.
+
+**`queryplanner/BENCHMARKS.md`** — Update:
+- Note that the CMS pruning stage no longer runs; `Plan()` benchmark timings will be lower.
+  Update Metric Targets table if it includes a CMS stage timing budget.
+
+**`blockio/reader/NOTES.md`** — Add dated entry (2026-04-02):
+- Title: SKTC CMS Skip (skipColumnCMS) and SKTE Magic; fileSketchSummaryMagic Bump
+- Content: New reader handles two sketch magics: SKTC (legacy, CMS bytes skipped zero-alloc
+  via `skipColumnCMS`) and SKTE (new, no CMS bytes). `fileSketchSummaryMagic` bumped from
+  0x46534B54 to 0x46534B55 to invalidate stale cached `FileSketchSummary` entries that
+  contain CMS bytes. Old entries return a parse error on magic mismatch; callers rebuild
+  from the sketch index and cache the new CMS-free summary.
+
+**`blockio/reader/SPECS.md`** — Update:
+- Update sketch parse section: document SKTC (skip CMS zero-alloc) and SKTE (no CMS) magic
+  handling.
+- Update `FileColumnSketch` documentation to remove `CMS` field description.
+- Update backward-compat invariant to state that SKTC files are handled with `skipColumnCMS`.
+
+**`blockio/writer/NOTES.md`** — Add dated entry (2026-04-02):
+- Title: SKTE Magic — CMS Write Path Removed
+- Content: Writer now emits magic 0x534B5445 ("SKTE"). CMS depth/width header and per-block
+  CMS counter arrays are no longer written. Buffer pre-allocation formula updated. The
+  `colSketch` struct no longer has a `cms` field.
+
+**`executor/NOTES.md`** — Add dated entry (2026-04-02):
+- Title: fileLevelCMSReject Removed from planBlocks
+- Content: `fileLevelCMSReject` and its 4 helpers removed from `plan_blocks.go`. The
+  `pruned_by_cms` key removed from StepStats metadata maps in `stream.go` and
+  `stream_log_topk.go`. `FileBloom` (Fuse8 for service.name, compact bloom for trace:id)
+  still provides file-level rejection for the two most queried predicates.
+
+**`executor/SPECS.md`** — Update:
+- Remove references to CMS file-level rejection from the `planBlocks` spec section.
 
 ---
 
 ## Edge Cases to Handle
 
-### Edge Case 1: Old v0x02 Files on Decode
-**Scenario:** Existing blockpack files in production have RefBloom bytes in the page TOC.
-**Expected:** `DecodePageTOC` reads and discards the bytes; no panic, no data corruption.
-**Test:** `TestDecodePageTOC_V2LegacyBackwardCompat` — craft a v0x02 blob by hand and decode it.
+### Edge Case 1: SKTC files with non-standard CMSDepth or CMSWidth
+**Scenario:** An old file was written with different CMS dimensions than the current
+`CMSDepth=4, CMSWidth=64` defaults.
+**Expected:** `skipColumnCMS` reads `cmsDepth` and `cmsWidth` from the on-disk header bytes
+and computes `depth × width × 2 × presentCount` dynamically. The skip is always exact.
+**Handled by:** Task 9's `skipColumnCMS` implementation uses dynamic computation, not
+fixed constants.
 
-### Edge Case 2: Compaction of Old Files (feedIntrinsicsFromIndex)
-**Scenario:** Compaction source files (old format) have `trace:id`, `span:id`, `span:parent_id`, `span:status_message` in their intrinsic section. `buildIntrinsicBlockIndex` reads them; `feedIntrinsicsFromIndex` previously re-fed them.
-**Expected:** After the change, `feedIntrinsicsFromIndex` skips these four columns. New compacted files do NOT include them in the intrinsic section.
-**Test:** Existing compaction tests should cover this; verify they still pass.
+### Edge Case 2: SKTE magic encountered by an old (pre-change) reader
+**Scenario:** An old reader opens a new SKTE file.
+**Expected:** Old `parseSketchIndexSection` checks `magic != 0x534B5443`. SKTE (0x534B5445)
+does not match, so it returns `(nil, 0, nil)` — graceful degradation. Old readers treat new
+files as having no sketch section and scan all blocks. Correct, safe, no panic.
+**No code change needed:** Already handled by existing graceful-degradation logic.
 
-### Edge Case 3: lookupIntrinsicFields Still Used by TopK
-**Scenario:** Caller accidentally removes `lookupIntrinsicFields` thinking it's unused.
-**Expected:** TopK path (`collectIntrinsicTopK`) calls `lookupIntrinsicFields` after selecting refs. If removed, compilation error.
-**Mitigation:** Explicitly verify `lookupIntrinsicFields` has callers in `stream.go` and `stream_structural.go` after the change.
+### Edge Case 3: fileSketchSummaryMagic bump during rolling deploy
+**Scenario:** A cached `FileSketchSummary` with old magic 0x46534B54 is read by a pod
+running the new code.
+**Expected:** `UnmarshalFileSketchSummary` detects the magic mismatch and returns an error.
+The `fileSummaryOnce.Do` fallback calls `buildFileSketchSummary` from the sketch index,
+producing a new CMS-free summary which is cached with magic 0x46534B55.
+**No code change needed:** The magic-check error path already triggers this rebuild.
 
-### Edge Case 4: intrinsic_ref_filter_test.go References Deleted Types
-**Scenario:** `TestLookupRefFast`, `TestEnsureRefIndex`, etc. reference deleted functions.
-**Expected:** Compilation error if not updated.
-**Action:** Check test file content; either delete those specific test functions or replace them with backward-compat decode tests (see verification tests above).
+### Edge Case 4: freqSource default in explain.go
+**Scenario:** `freqSource` is initialized to `"topk"` and the TopK branch fires, setting
+it to `"topk"` again (redundantly). If TopK does not fire, `freqSource` stays `"topk"`.
+**Expected:** No unused-variable error. The variable is referenced in the `fmt.Sprintf` call.
+**Handled by:** Task 2 sets `freqSource := "topk"` at initialization; the variable is always
+used in the format string.
 
 ---
 
-## Risks
+## Risks/Concerns
 
-### Risk 1: Test `TestExecutionPath_RangePredicate_IntrinsicFields` fails before code change
-**Risk:** If the test is updated before the implementation, it will fail for the right reason.
-**Impact:** Expected — this is the TDD pattern. The test should fail until `collectIntrinsicPlain` is changed.
-**Mitigation:** Plan explicitly calls for test update first (Phase 1), then implementation (Phases 2-4).
+### Risk 1: "math" import left in scoring.go
+**Risk:** After removing the `else if blockIdx < len(cmsEst)` branch, `math.MaxUint16` is
+the only use of `math` in `scoring.go`. Forgetting to remove the import causes a compile error.
+**Mitigation:** Task 1 explicitly removes the `"math"` import in the same edit.
 
-### Risk 2: `lookupIntrinsicFields` Still Correct After Removing Identity Columns
-**Risk:** `collectIntrinsicTopK` calls `lookupIntrinsicFields(r, selected, secondPassCols)`. If `secondPassCols` contains `trace:id` or `span:id` and those are no longer in the intrinsic section, lookups return nil/zero.
-**Impact:** TopK results might have empty trace:id/span:id fields.
-**Mitigation:** After the change, `trace:id`/`span:id` are still in block column payloads (via `addPresent`). `lookupIntrinsicFields` reads from intrinsic columns — it will find nil for those names. `SpanMatchFromRow` reads from block columns when `lookupIntrinsicFields` returns nil. Verify `SpanMatchFromRow` fallback path handles nil correctly. Check `executor_test.go` EX-09 (SpanMatch.TraceID / SpanMatch.SpanID field population) passes.
+### Risk 2: "math" import left in sketch_index.go
+**Risk:** `CMSEstimate` uses `math.MaxUint32`. After Task 9 removes `CMSEstimate`, the `math`
+import (currently at line 14 of `sketch_index.go`) becomes unused.
+**Mitigation:** Task 9 includes an explicit sub-step to remove the `"math"` import.
 
-### Risk 3: `stream_structural.go` lookupIntrinsicFields for identity fields
-**Risk:** `stream_structural.go` line 235 calls `lookupIntrinsicFields(r, allRefs, intrinsicWant)` for identity columns (trace:id, span:id). After removing these from intrinsic section, this lookup returns empty maps.
-**Impact:** Structural queries might lose trace/span ID values.
-**Mitigation:** Check what `intrinsicWant` contains in `stream_structural.go`. If it requests trace:id/span:id, the lookup will return empty, and the code must fall back to block reads. This is a real risk — verify `stream_structural_test.go` still passes.
+### Risk 3: "sketch" import in layout.go becomes unused
+**Risk:** `buildSketchIndexInfo` uses `sketch.CMSDepth * sketch.CMSWidth`. After Task 11
+removes this expression, `sketch.*` may have no remaining uses in `layout.go`.
+**Mitigation:** Task 11 includes an explicit sub-step to check all `sketch.` usages in the
+file before committing the edit. If none remain, remove the import.
 
-### Risk 4: `execution_path_test.go` comment references `hasRangePredicate`
-**Risk:** The EP-01 test comment mentions `hasRangePredicate=true → lookupIntrinsicFields`. After the change this is stale.
-**Impact:** Misleading documentation only; no runtime impact.
-**Mitigation:** Update the comment in Step 1.1.
+### Risk 4: Missed CMS reference in a test file not listed
+**Risk:** A test file outside the four listed calls `CMSEstimate`, `PrunedByCMS`, or
+`col.CMS`.
+**Mitigation:** After all tasks, before declaring done, text-search all `_test.go` files
+under `vendor/github.com/grafana/blockpack/internal/` for the patterns `CMSEstimate`,
+`PrunedByCMS`, `col\.CMS`, `cms\.Estimate`.
+
+### Risk 5: Pruning regression (known, accepted)
+**Risk:** Removing CMS reduces block-level and file-level pruning coverage.
+**Impact:** ~1 in 256 blocks per query that fuse false-positives on; file-level CMS
+rejection gone for non-service-name, non-trace-id columns; scoring less precise for
+values outside TopK-20.
+**Accepted because:** The OOM condition (pod killed due to 20+ GB pinned memory at 650
+concurrent files) is the higher-severity problem. Fuse already covers the dominant pruning
+cases. This regression is documented in `queryplanner/NOTES.md`.
 
 ---
 
 ## Dependencies
 
 ### Internal Dependencies
-- `shared/` is imported by `writer/`, `reader/`, and `executor/` — changes propagate
-- `executor/stream.go` imports `modules_reader` and `modules_shared` — unchanged
-- No new external imports needed
+- `queryplanner.ColumnSketch` interface — changed in Task 4; both the definer and the
+  implementor (`columnSketchData`) are updated in the same changeset
+- `queryplanner.Plan` struct — `PrunedByCMS` field removed in Task 3; all field users
+  (`stream.go`, `stream_log_topk.go`, `plan_blocks.go`) updated in Tasks 5, 6, 7
+- `reader.FileColumnSketch.CMS` field — removed in Task 8; only production caller was
+  `cmsRejectByEquality` in `plan_blocks.go`, deleted in Task 7
+- `reader.ColumnSketchStat.CMSBytes` field — removed in Task 11; only populated in
+  `buildSketchIndexInfo` within the same file
 
 ### External Dependencies
-- None added
-
----
-
-## Complexity Analysis
-
-### Modified Functions
-- `collectIntrinsicPlain`: complexity decreases (removes `if useIntrinsicLookup` branch)
-- `encodePagedFlatColumn`: complexity unchanged (removes 3 lines, not a branch)
-- `encodePagedDictColumn`: complexity unchanged
-- `addRowFromProto`: complexity unchanged (removes 4 `feedIntrinsic*` calls, no branches)
-- `feedIntrinsicsFromIndex`: complexity slightly decreases (fewer cases)
+- No new external dependencies. `sketch/cms.go` and `sketch/cms_test.go` are retained.
 
 ---
 
 ## Success Criteria
 
-- [ ] `go build ./tempodb/...` passes cleanly
-- [ ] `go build ./...` in blockpack-tempo passes cleanly
-- [ ] All executor tests pass (`go test ./vendor/github.com/grafana/blockpack/internal/modules/executor/...`)
-- [ ] All shared tests pass
-- [ ] All writer tests pass
-- [ ] EP-01 and EP-03 now assert `Block != nil` and `IntrinsicFields == nil` for range predicates
-- [ ] EP-05 correctness tests unchanged (result counts unaffected)
-- [ ] TopK tests (`stream_topk_test.go`) unchanged and passing
-- [ ] Structural query tests (`stream_structural_test.go`) passing
-- [ ] Executor EX-09 (TraceID/SpanID field population) passing
-- [ ] NOTES.md updated in all three spec-driven modules
-- [ ] SPECS.md updated in executor
-- [ ] TESTS.md updated in executor
-- [ ] Old v0x02 files decode without error (backward compat test)
+- [ ] `go build ./vendor/github.com/grafana/blockpack/...` passes with zero errors
+- [ ] `go build ./...` from the worktree root passes with zero errors
+- [ ] Writer emits magic `0x534B5445` ("SKTE") — verified by reading `sketchSectionMagic`
+      in `writer/sketch_index.go`
+- [ ] Reader handles SKTC (skip CMS bytes via `skipColumnCMS`) and SKTE (no CMS bytes)
+- [ ] `fileSketchSummaryMagic` is `0x46534B55` in `file_sketch_summary.go`
+- [ ] `ColumnSketch` interface has exactly 4 methods: `Presence`, `Distinct`, `TopKMatch`,
+      `FuseContains`
+- [ ] `Plan` struct has no `PrunedByCMS` field
+- [ ] `FileColumnSketch` struct has no `CMS` field
+- [ ] `ColumnSketchStat` struct in `layout.go` has no `CMSBytes` field
+- [ ] No `CMSEstimate` references remain in any production file
+- [ ] No `PrunedByCMS` references remain in any file
+- [ ] All spec-driven module doc files have dated 2026-04-02 entries
 
 ---
 
 ## Notes
 
-- The `hasRangePredicate(program)` call at the `collectIntrinsicPlain` call site (line 648) is no longer needed as an argument. The function itself may still be useful elsewhere; check whether it has other callers before removing it.
-- `intrinsicFieldsProvider` struct and `IntrinsicFields` field on `MatchedRow` remain in place — they are still used by `collectIntrinsicTopK` (Case B). Only Case A's use of `IntrinsicFields` is removed.
-- The `NOTE-050` comment at stream.go line 185 (about trace intrinsic columns in `secondPassCols`) remains correct — `lookupIntrinsicFields` is still used by Case B and structural queries and still needs these columns in `secondPassCols`.
-- For the upstream mirror: if the upstream at `/home/matt/source/blockpack-tempo/` does not have `IntrinsicPageTOCVersion2`, `IntrinsicRefBloomBytes`, `IntrinsicRefBloomK`, `MinRef`, `MaxRef`, `RefBloom`, or `computePageRefRange`, those removals are no-ops. Apply only the changes that are applicable to the upstream's current state.
+### Task ordering rationale
+The ordering is strictly outside-in on callers to minimize compile breakage windows:
+1. Tasks 1-3: Remove all callers of `CMSEstimate` in queryplanner before touching the interface
+2. Tasks 5-7: Remove all `PrunedByCMS` references in executor before removing the struct field
+3. Task 4: Remove `CMSEstimate` from interface — safe now because all callers are gone
+4. Task 8: Remove `FileColumnSketch.CMS` — safe because `cmsRejectByEquality` (only caller)
+   was deleted in Task 7
+5. Task 9: Remove `CMSEstimate` from `columnSketchData` — safe because interface no longer
+   requires it. Also adds `skipColumnCMS` for backward compat.
+6. Task 10: Remove CMS from writer — independent of all above
+7. Task 11: Remove `CMSBytes` from layout — independent of all above
 
-## Questions/Uncertainties
+Tasks 10 and 11 can be done in any order relative to each other.
 
-- Does `stream_structural.go`'s `lookupIntrinsicFields` call need to be replaced with a block-read for trace/span identity fields after removing them from the intrinsic section? Examine `intrinsicWant` construction in that function before finalizing.
-- Does `TestLookupIntrinsicFields_PageSkipping` in `intrinsic_pruning_test.go` use `DecodePagedColumnBlobFiltered`? If so, that test becomes invalid and needs to be removed or replaced.
+### cms.go is intentionally retained
+`sketch/cms.go` and `sketch/cms_test.go` are not modified. The `CountMinSketch` type
+remains available in the `sketch` package but is no longer referenced by any production
+code path outside that package. Removing the files would require editing `vendor/modules.txt`
+and is unnecessary.

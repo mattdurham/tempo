@@ -34,10 +34,10 @@ func TestExplainBlockPriority(t *testing.T) {
 	assert.Contains(t, plan.Explain, "Block priority (best first):")
 	// Must mention cardinality in English.
 	assert.Contains(t, plan.Explain, "cardinality")
-	// Must mention frequency source (topk or cms).
+	// Must mention frequency source (topk).
 	assert.True(t,
-		strings.Contains(plan.Explain, "topk") || strings.Contains(plan.Explain, "cms"),
-		"explain must mention frequency source (topk or cms)")
+		strings.Contains(plan.Explain, "topk"),
+		"explain must mention frequency source (topk)")
 	// Must mention the score.
 	assert.Contains(t, plan.Explain, "score=")
 	// Must show block ranking.
@@ -58,8 +58,8 @@ func TestExplainPruningPipeline(t *testing.T) {
 	}
 	plan := p.Plan([]queryplanner.Predicate{pred}, queryplanner.TimeRange{})
 
-	// At least one pruning stage must have run (range-index, fuse, or cms).
-	totalPruned := plan.PrunedByIndex + plan.PrunedByFuse + plan.PrunedByCMS
+	// At least one pruning stage must have run (range-index or fuse).
+	totalPruned := plan.PrunedByIndex + plan.PrunedByFuse
 	require.Greater(t, totalPruned, 0, "at least one stage must prune block 1")
 
 	// Explain must contain the pipeline section.
@@ -145,7 +145,7 @@ func writeMultiColumnFile(t *testing.T) []byte {
 }
 
 // TestMultiColumnSketchIndependence verifies that sketch data for different
-// columns is independent: CMS for service.name and CMS for env are separate.
+// columns is independent: TopK for service.name and TopK for env are separate.
 func TestMultiColumnSketchIndependence(t *testing.T) {
 	data := writeMultiColumnFile(t)
 	r := openReader(t, data)
@@ -159,23 +159,26 @@ func TestMultiColumnSketchIndependence(t *testing.T) {
 	require.NotNil(t, csSvc, "service.name column sketch must exist")
 	require.NotNil(t, csEnv, "env column sketch must exist")
 
-	// CMS for service-A: block 0 > 0, block 1 == 0.
-	estSvc := csSvc.CMSEstimate("service-A")
-	require.Len(t, estSvc, 2)
-	assert.Greater(t, estSvc[0], uint32(0))
-	assert.Equal(t, uint32(0), estSvc[1])
+	// TopK for service-A: block 0 > 0, block 1 == 0.
+	hSvcA := sketch.HashForFuse("service-A")
+	topkSvc := csSvc.TopKMatch(hSvcA)
+	require.Len(t, topkSvc, 2)
+	assert.Greater(t, topkSvc[0], uint16(0))
+	assert.Equal(t, uint16(0), topkSvc[1])
 
-	// CMS for prod: block 0 > 0, block 1 == 0.
-	estEnv := csEnv.CMSEstimate("prod")
-	require.Len(t, estEnv, 2)
-	assert.Greater(t, estEnv[0], uint32(0))
-	assert.Equal(t, uint32(0), estEnv[1])
+	// TopK for prod: block 0 > 0, block 1 == 0.
+	hProd := sketch.HashForFuse("prod")
+	topkEnv := csEnv.TopKMatch(hProd)
+	require.Len(t, topkEnv, 2)
+	assert.Greater(t, topkEnv[0], uint16(0))
+	assert.Equal(t, uint16(0), topkEnv[1])
 
-	// CMS for staging: block 0 == 0, block 1 > 0.
-	estStaging := csEnv.CMSEstimate("staging")
-	require.Len(t, estStaging, 2)
-	assert.Equal(t, uint32(0), estStaging[0])
-	assert.Greater(t, estStaging[1], uint32(0))
+	// TopK for staging: block 0 == 0, block 1 > 0.
+	hStaging := sketch.HashForFuse("staging")
+	topkStaging := csEnv.TopKMatch(hStaging)
+	require.Len(t, topkStaging, 2)
+	assert.Equal(t, uint16(0), topkStaging[0])
+	assert.Greater(t, topkStaging[1], uint16(0))
 }
 
 // TestMultiColumnDistinctIndependence verifies cardinality counts are independent per column.
@@ -363,8 +366,8 @@ func TestAllBlocksPrunedBySketch(t *testing.T) {
 	plan := p.Plan([]queryplanner.Predicate{pred}, queryplanner.TimeRange{})
 
 	// service-X-nonexistent is not in any block.
-	// Combined pruning (range + fuse + CMS) should eliminate all blocks.
-	totalPruned := plan.PrunedByIndex + plan.PrunedByFuse + plan.PrunedByCMS
+	// Combined pruning (range + fuse) should eliminate all blocks.
+	totalPruned := plan.PrunedByIndex + plan.PrunedByFuse
 	assert.Equal(t, 2, totalPruned, "all blocks must be pruned for absent value")
 	assert.Empty(t, plan.SelectedBlocks)
 }

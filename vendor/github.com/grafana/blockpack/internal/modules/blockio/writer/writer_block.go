@@ -72,7 +72,7 @@ type blockBuilder struct {
 	// The map key is the column name; the value holds min/max encoded keys.
 	colMinMax map[string]*blockColMinMax // column name → min/max for this block
 
-	// colSketches accumulates HLL, CMS, and fuse keys per column for this block.
+	// colSketches accumulates HLL, TopK, and fuse keys per column for this block.
 	// Populated alongside colMinMax; flushed at block write time.
 	colSketches blockSketchSet
 
@@ -111,7 +111,7 @@ type blockColMinMax struct {
 type builtBlock struct {
 	traceRows   map[[16]byte]struct{}
 	colMinMax   map[string]*blockColMinMax // per-column min/max for this block
-	colSketches blockSketchSet             // per-column HLL/CMS/fuse sketches for this block
+	colSketches blockSketchSet             // per-column HLL/TopK/fuse sketches for this block
 	payload     []byte
 	spanCount   int
 	minStart    uint64
@@ -1373,7 +1373,7 @@ func (b *blockBuilder) internColName(key string, cache map[string]string, prefix
 }
 
 // updateMinMax updates the per-block min/max for the named column and records the
-// value in the sketch accumulators (HLL, CMS, BinaryFuse8 keys).
+// value in the sketch accumulators (HLL, TopK, BinaryFuse8 keys).
 // key is the encoded range key (from encodeRangeKey). Called once per present value.
 // On first call for a column, min and max are both set to key.
 // On subsequent calls, min and max are updated using type-aware comparison.

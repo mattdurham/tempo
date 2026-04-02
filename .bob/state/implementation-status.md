@@ -1,67 +1,105 @@
 # Implementation Status
 
-Generated: 2026-03-29T00:00:00Z
-Status: COMPLETE
+**Status:** COMPLETE
+**Date:** 2026-04-02
+**Iterations:** 1
 
 ---
 
-## Changes Made
+## Summary
 
-**Files Modified:**
-- `vendor/github.com/grafana/blockpack/internal/modules/executor/stream.go` — 3 comment fixes
-- `vendor/github.com/grafana/blockpack/internal/modules/executor/NOTES.md` — NOTE-NNN → NOTE-054, NOTE-050 addendum corrected
-- `vendor/github.com/grafana/blockpack/internal/modules/blockio/shared/NOTES.md` — NOTE-006 forward cross-ref added
-- `vendor/github.com/grafana/blockpack/internal/modules/blockio/writer/intrinsic_accum.go` — feedBytes docstring updated
-- `vendor/github.com/grafana/blockpack/internal/modules/executor/TESTS.md` — EP-01 through EP-05 entries added
+All issues from review.md and go-presubmit.md have been fixed. The benchmark packages now
+compile and vet cleanly. All spec/doc files have been updated to reflect the CMS removal.
+
+`go build ./internal/... ./benchmark/...` — CLEAN
+`go vet ./internal/... ./benchmark/...` — CLEAN
 
 ---
 
-## Changes by Issue
+## Files Changed
 
-### HIGH-1 (stream.go:217-219): NOTE-050 comment about intrinsic columns not in block payloads
-- Updated comment to say the fast path prevents false-negative results for files from the PR #172 window, without falsely claiming intrinsic columns are absent from block payloads.
+### CRITICAL — Benchmark Compile Fixes
 
-### HIGH-2 (stream.go:1216-1218): lookupIntrinsicFields page-skipping comment referencing removed MinRef/MaxRef/RefBloom
-- Replaced with accurate documentation: uses GetIntrinsicColumn (full column decode), refIndex provides O(log N) lookup, NOTE-007 removed page-skipping.
+**`vendor/github.com/grafana/blockpack/benchmark/modules_engine_bench_test.go`**
+- Line 172: `rows, err :=` → `rows, _, err :=` (Collect now returns 3 values)
+- Line 235: `rows, execErr :=` → `rows, _, execErr :=` (second Collect call, same fix)
 
-### MEDIUM-3 (executor/NOTES.md): NOTE-NNN placeholder
-- Renamed to NOTE-054. Updated the body to reflect the post-NOTE-007 reality: function uses GetIntrinsicColumn, not GetIntrinsicColumnForRefs (which was removed with MinRef/MaxRef/RefBloom).
+**`vendor/github.com/grafana/blockpack/benchmark/lokibench/converter.go`**
+- `lastStats atomic.Pointer[blockpack.LogQueryStats]` → `atomic.Pointer[blockpack.QueryStats]`
+- `LastStats() *blockpack.LogQueryStats` → `*blockpack.QueryStats`
+- Removed `OnStats func(CollectStats)` callback from both CollectOptions literals
+  (field no longer exists in CollectOptions)
+- Replaced `CollectStats` struct literal with direct store of `QueryStats` return value from
+  `CollectLogs` (which now returns `([]LogEntry, QueryStats, error)`)
+- Removed `PrunedByCMS` and `blockpack.LogQueryStats{...}` struct literals (type removed)
 
-### MEDIUM-4 (stream.go:185-193): secondPassCols comment about identity values source
-- Updated to accurately state that identity columns (NOTE-005) are in block payloads only; Case A populates MatchedRow.Block via forEachBlockInGroups (NOTE-053).
+### HIGH — Spec/Doc Files
 
-### MEDIUM-5 (executor/NOTES.md NOTE-050 addendum): Addendum claimed addPresent calls were removed
-- Replaced addendum with corrected entry: dual storage is intact, addPresent calls retained, identity columns not fed to intrinsic accumulator but addPresent preserved. References NOTE-052.
+**`vendor/github.com/grafana/blockpack/internal/modules/queryplanner/SPECS.md`**
+- Section 2.8: removed "Stage 3 (CMS pruning)" reference
+- Section 2a: removed `CMSEstimate` from ColumnSketch interface (now 4 methods: Presence,
+  Distinct, TopKMatch, FuseContains)
+- Section 4 Plan struct: removed `PrunedByCMS int` field (both occurrences, section 4 and section 8)
+- Section 4.6: deleted PrunedByCMS subsection; renumbered 4.7->4.6 BlockScores, 4.8->4.7 Explain
+- Section 5.3c: deleted pruneByCMSAll algorithm description; renamed 5.3d->5.3c for scoreBlocks
+- Section 5.3c (new): updated scoring formula — removed `cs.CMSEstimate` fallback, TopKMatch
+  is now the sole frequency source
+- Section 5.5: removed Stage 3 (CMS) from the safety invariants
 
-### LOW-6 (shared/NOTES.md NOTE-006): Missing forward cross-reference to NOTE-007
-- Added: `*Superseded by NOTE-007 (2026-03-29): RefBloom/MinRef/MaxRef removed. See NOTE-007 for rationale.*`
+**`vendor/github.com/grafana/blockpack/internal/modules/executor/SPECS.md`**
+- Section 3.2 step 3: "range-index, fuse, and CMS pruning" -> "range-index, fuse, and bloom pruning"
+- Section 4.4 StepStats table: removed `pruned_by_cms` from `"plan"` step metadata keys
 
-### LOW-7 (intrinsic_accum.go feedBytes docstring): Mentioned removed identity columns
-- Updated to: `// feedBytes adds one byte slice value to the named flat column.`
+**`vendor/github.com/grafana/blockpack/internal/modules/queryplanner/NOTES.md`**
+- NOTE-013: appended superseded annotation (2026-04-02; pruneByCMSAll removed, see NOTE-018)
+- NOTE-014: updated freq formula — removed CMS fallback reference
+- NOTE-015: appended superseded annotation (2026-04-02; CMS stage eliminated, see NOTE-018)
+- Added NOTE-018: CMS removal decision — wire format progression (SKTC->SKTD->SKTE),
+  skipColumnCMS backward compat rationale, fileSketchSummaryMagic bump explanation
 
-### MEDIUM-3b (executor/TESTS.md): EP-01 through EP-05 not documented
-- Added EP-01 through EP-05 entries at the end of TESTS.md, each with scenario/setup/assertions and back-ref to execution_path_test.go.
+**`vendor/github.com/grafana/blockpack/internal/modules/blockio/reader/NOTES.md`**
+- Added NOTE-010: skipColumnCMS zero-alloc backward compat for SKTC/SKTD files, rationale
+  for skip-vs-reject strategy, fileSketchSummaryMagic bump
+
+**`vendor/github.com/grafana/blockpack/internal/modules/blockio/writer/NOTES.md`**
+- Added NOTE-003: CMS removal from writer, SKTE wire format, per-column layout description
+
+### MEDIUM — Additional Fixes
+
+**`vendor/github.com/grafana/blockpack/internal/modules/blockio/reader/sketch_index.go`**
+- `skipColumnCMS`: added zero-value guards for `cmsDepth == 0` and `cmsWidth == 0`;
+  returns error instead of silently advancing pos by 0 and desynchronising the parser
+
+**`vendor/github.com/grafana/blockpack/internal/modules/blockio/writer/writer.go`**
+- Line ~870: updated comment "HLL/CMS/BinaryFuse8" -> "HLL/BinaryFuse8/TopK sketch data (magic: SKTE 0x534B5445)"
+
+**`vendor/github.com/grafana/blockpack/internal/modules/blockio/writer/writer_log.go`**
+- Line 55: "HLL, CMS, and fuse keys" -> "HLL, TopK, and fuse keys"
+- Line 204: "(HLL, CMS, BinaryFuse8 keys)" -> "(HLL, TopK, BinaryFuse8 keys)"
+
+**`vendor/github.com/grafana/blockpack/internal/modules/blockio/reader/SPECS.md`**
+- Line ~223: "ColumnSketchStat.CMSBytes and TopKBytes" -> "ColumnSketchStat.FuseBytes and TopKBytes"
+
+**`vendor/github.com/grafana/blockpack/internal/modules/queryplanner/TESTS.md`**
+- QP-T-17: renamed from TestPlanCMSPruning -> TestPlanFusePruning; rewrote to use FuseContains
+  and PrunedByFuse instead of CMSEstimate and PrunedByCMS
+- QP-T-18: renamed from TestPlanCMSNoPruneForFalsePositive -> TestPlanNoPruneForFalsePositive
+- QP-T-27: removed CMS/CMSEstimate references; updated to describe HLL/Fuse/TopK only
+
+**`vendor/github.com/grafana/blockpack/internal/modules/executor/NOTES.md`**
+- NOTE-045: retitled "File-Level Bloom Reject — Fuse8 and Compact Bloom for Equality Pruning";
+  rewrote body to document current fileLevelBloomReject -> bloomRejectByEquality ->
+  bloomRejectString / bloomRejectTraceID chain; added note on prior CMS path removal
+
+### LOW — Low-Priority Fixes
+
+**`vendor/github.com/grafana/blockpack/internal/modules/blockio/reader/parser.go`**
+- Line 22: removed "CMS merge" from FileSketchSummary build comment
 
 ---
 
 ## Verification
 
-```bash
-go build ./tempodb/...
-# PASS — no output
-```
-
----
-
-## TDD Process
-
-N/A — comment and documentation fixes only. No code logic changed.
-
----
-
-## For workflow-coder
-
-**STATUS:** COMPLETE
-**FILES_CHANGED:** stream.go, NOTES.md (executor), NOTES.md (shared), intrinsic_accum.go, TESTS.md (executor)
-**TESTS_ADDED:** 0 (documentation only)
-**READY_FOR_REVIEW:** true
+- `go build ./internal/... ./benchmark/...` from blockpack vendor root: CLEAN
+- `go vet ./internal/... ./benchmark/...` from blockpack vendor root: CLEAN
+- `go vet ./tempodb/...` from tempo worktree root: CLEAN

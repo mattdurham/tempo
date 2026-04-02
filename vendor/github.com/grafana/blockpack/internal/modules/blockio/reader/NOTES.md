@@ -274,3 +274,33 @@ section model and prevented adding logical sub-sections for V12 metadata compone
 `internal/modules/blockio/reader/layout.go:buildSketchIndexInfo`,
 `internal/modules/blockio/reader/layout.go:buildRangeIndex`,
 `internal/modules/blockio/reader/layout.go:buildFileBloomInfo`
+
+---
+
+## NOTE-010: CMS Removal — skipColumnCMS Zero-Alloc Backward Compat for SKTC/SKTD Files
+*Added: 2026-04-02*
+
+**Decision:** Remove CMS data from the sketch parse path. Legacy SKTC (`0x534B5443`) and
+SKTD (`0x534B5444`) files are still readable by `parseSketchIndexSection` via the
+`skipColumnCMS` helper, which reads and discards the CMS bytes with zero allocations.
+
+**Rationale:**
+- CMS contributed ~70% of sketch section size and caused OOM during compaction at scale.
+- Keeping the skip path (rather than rejecting old files outright) avoids a forced re-write
+  of all existing blockpack files when upgrading to SKTE. Legacy files remain queryable.
+
+**skipColumnCMS mechanics:**
+- Reads `cms_depth` (uint8) and `cms_width` (uint16 LE) from the file header.
+- Computes skip distance: `cms_depth × cms_width × 2 × presentCount` bytes.
+- Advances `pos` without allocating any heap objects.
+- Handles any depth/width values in old files; not limited to CMSDepth=4/CMSWidth=64 defaults.
+
+**`fileSketchSummaryMagic` bump:**
+- Changed from `0x46534B54` ("FSKT") to `0x46534B55` ("FSKU").
+- Invalidates any externally cached `FileSketchSummary` blobs that embedded CMS data.
+- Old-magic summaries return a bad-magic error on unmarshal (safe rejection, no silent corruption).
+
+**Back-ref:**
+- `internal/modules/blockio/reader/sketch_index.go:skipColumnCMS`
+- `internal/modules/blockio/reader/sketch_index.go:parseSketchIndexSection`
+- `internal/modules/blockio/shared/constants.go:fileSketchSummaryMagic`

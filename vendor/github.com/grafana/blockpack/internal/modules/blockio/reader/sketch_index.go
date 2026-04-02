@@ -1,9 +1,14 @@
 // Package reader provides block reading and index parsing for blockpack files.
-// NOTE: Sketch index parsing for column-major HLL + CMS + BinaryFuse8 + TopK data.
-// Files without the SKTC magic at the current parse position degrade gracefully:
+// NOTE: Sketch index parsing for column-major HLL + BinaryFuse8 + TopK data.
+// Supports three sketch section formats:
+//   - SKTC (0x534B5443): legacy format with CMS bytes — CMS data is skipped zero-alloc via skipColumnCMS.
+//   - SKTD (0x534B5444): legacy format with CMS bytes — CMS data is skipped zero-alloc via skipColumnCMS.
+//   - SKTE (0x534B5445): new format, no CMS bytes.
+//
+// Files without a recognized magic at the current parse position degrade gracefully:
 // parseSketchIndexSection returns (nil, 0, nil) and ColumnSketch returns nil.
 //
-// CMS and fuse filters use lazy deserialization: raw byte slices are retained at
+// Fuse filters use lazy deserialization: raw byte slices are retained at
 // parse time and deserialized on first query access. This keeps ReaderOpen fast
 // and avoids allocating memory for columns that are never queried.
 package reader
@@ -11,7 +16,6 @@ package reader
 import (
 	"encoding/binary"
 	"fmt"
-	"math"
 	"sync"
 
 	"github.com/grafana/blockpack/internal/modules/queryplanner"
@@ -19,14 +23,16 @@ import (
 )
 
 const (
-	sketchSectionMagic = uint32(0x534B5443) // "SKTC" — must match writer/sketch_index.go
+	sketchSectionMagicSKTC = uint32(0x534B5443) // "SKTC" — legacy with CMS bytes
+	sketchSectionMagicSKTD = uint32(0x534B5444) // "SKTD" — legacy with CMS bytes
+	sketchSectionMagicSKTE = uint32(0x534B5445) // "SKTE" — new, no CMS bytes
 )
 
 // Ensure columnSketchData satisfies queryplanner.ColumnSketch at compile time.
 var _ queryplanner.ColumnSketch = (*columnSketchData)(nil)
 
 // columnSketchData holds parsed column-major sketch data for one column across all blocks.
-// CMS and fuse are lazily deserialized on first access to avoid paying the cost at file open.
+// Fuse is lazily deserialized on first access to avoid paying the cost at file open.
 type columnSketchData struct {
 	presence   []uint64   // bitset: 1 bit per block
 	distinct   []uint32   // one per block (0 for absent)
@@ -34,17 +40,11 @@ type columnSketchData struct {
 	topkCount  [][]uint16 // [presentIdx][entries] counts
 	presentMap []int      // presentMap[i] = blockIdx of the i-th present block
 
-	// Lazy CMS: raw byte slices stored at parse time, deserialized on first CMSEstimate call.
-	cmsRaw [][]byte                 // [presentIdx] raw CMS data (nil after inflate)
-	cms    []*sketch.CountMinSketch // [presentIdx] populated lazily
-
 	// Lazy fuse: raw byte slices stored at parse time, deserialized on first FuseContains call.
 	fuseRaw     [][]byte              // [presentIdx] raw fuse data (nil after inflate)
 	fuseRawLens []int                 // [presentIdx] original fuse data byte lengths (preserved after inflate)
 	fuse        []*sketch.BinaryFuse8 // [presentIdx] populated lazily
 	numBlocks   int
-
-	cmsOnce sync.Once
 
 	fuseOnce sync.Once
 }
@@ -60,38 +60,6 @@ func (cd *columnSketchData) Presence() []uint64 { return cd.presence }
 
 // Distinct returns pre-computed HLL cardinality per block (0 for absent blocks).
 func (cd *columnSketchData) Distinct() []uint32 { return cd.distinct }
-
-// inflateCMS deserializes all CMS instances from raw bytes (called once).
-func (cd *columnSketchData) inflateCMS() {
-	cd.cms = make([]*sketch.CountMinSketch, len(cd.cmsRaw))
-	for pi, raw := range cd.cmsRaw {
-		if raw == nil {
-			continue
-		}
-		cms := sketch.NewCountMinSketch()
-		if err := cms.Unmarshal(raw); err == nil {
-			cd.cms[pi] = cms
-		}
-	}
-	cd.cmsRaw = nil // release raw bytes
-}
-
-// CMSEstimate returns CMS frequency estimate for val per block (0 for absent).
-// For present blocks where CMS deserialization failed, returns math.MaxUint32 as a
-// conservative "possibly present" signal to avoid false-negative pruning.
-func (cd *columnSketchData) CMSEstimate(val string) []uint32 {
-	cd.cmsOnce.Do(cd.inflateCMS)
-	out := make([]uint32, cd.numBlocks)
-	for pi, blockIdx := range cd.presentMap {
-		if pi < len(cd.cms) && cd.cms[pi] != nil {
-			out[blockIdx] = uint32(cd.cms[pi].Estimate(val)) //nolint:gosec // safe: uint16 fits in uint32
-		} else if pi < len(cd.cms) {
-			// Deserialization failed — conservative: treat as possibly present.
-			out[blockIdx] = math.MaxUint32
-		}
-	}
-	return out
-}
 
 // TopKMatch returns the TopK count for valFP per block (0 if not in top-K or absent).
 func (cd *columnSketchData) TopKMatch(valFP uint64) []uint16 {
@@ -139,17 +107,28 @@ func (cd *columnSketchData) FuseContains(valHash uint64) []bool {
 
 // parseSketchIndexSection parses the sketch index section from data (column-major format).
 // Returns (*sketchIndex, bytesConsumed, nil) on success.
-// Returns (nil, 0, nil) when data does not start with the SKTC magic (graceful degradation).
+// Returns (nil, 0, nil) when data does not start with a recognized sketch magic (graceful degradation).
 // Returns (nil, 0, error) on parse failure after the magic is confirmed.
 //
-// CMS and fuse data are stored as raw byte slices and deserialized lazily on first access.
+// CMS data in SKTC/SKTD files is skipped zero-alloc via skipColumnCMS.
+// SKTE files contain no CMS bytes and do not call skipColumnCMS.
+// Fuse data is stored as raw byte slices and deserialized lazily on first access.
 func parseSketchIndexSection(data []byte) (*sketchIndex, int, error) {
 	if len(data) < 12 {
 		return nil, 0, nil // too short for magic+num_blocks+num_columns
 	}
 	magic := binary.LittleEndian.Uint32(data[0:])
-	if magic != sketchSectionMagic {
-		return nil, 0, nil // not a sketch section — old file format, degrade gracefully
+
+	hasCMS := false
+	switch magic {
+	case sketchSectionMagicSKTC:
+		hasCMS = true
+	case sketchSectionMagicSKTD:
+		hasCMS = true
+	case sketchSectionMagicSKTE:
+		// hasCMS remains false
+	default:
+		return nil, 0, nil // unknown format — degrade gracefully
 	}
 
 	numBlocks := int(binary.LittleEndian.Uint32(data[4:]))
@@ -195,9 +174,11 @@ func parseSketchIndexSection(data []byte) (*sketchIndex, int, error) {
 			return nil, 0, err
 		}
 
-		pos, err = parseColumnCMS(data, pos, name, presentCount, cd)
-		if err != nil {
-			return nil, 0, err
+		if hasCMS {
+			pos, err = skipColumnCMS(data, pos, name, presentCount)
+			if err != nil {
+				return nil, 0, err
+			}
 		}
 
 		pos, err = parseColumnFuse(data, pos, name, presentCount, cd)
@@ -307,52 +288,39 @@ func parseColumnTopK(data []byte, pos int, name string, presentCount int, cd *co
 	return pos, nil
 }
 
-// parseColumnCMS parses cms_depth, cms_width, and per-present-block raw CMS byte slices.
-func parseColumnCMS(data []byte, pos int, name string, presentCount int, cd *columnSketchData) (int, error) {
-	// cms_depth[1]
+// skipColumnCMS reads and discards the CMS section for one column in legacy SKTC/SKTD files.
+// Reads cms_depth[1] + cms_width[2 LE] from the file header to compute the exact skip
+// distance: depth × width × 2 × presentCount. Zero allocations.
+// This handles any depth/width values that may appear in old files, not just the
+// current CMSDepth=4/CMSWidth=64 defaults.
+func skipColumnCMS(data []byte, pos int, name string, presentCount int) (int, error) {
 	if pos >= len(data) {
 		return pos, fmt.Errorf("sketch_index: col %q: missing cms_depth", name)
 	}
 	cmsDepth := int(data[pos])
 	pos++
-	if cmsDepth != sketch.CMSDepth {
-		return pos, fmt.Errorf(
-			"sketch_index: col %q: unexpected cms_depth=%d, want %d",
-			name,
-			cmsDepth,
-			sketch.CMSDepth,
-		)
+	if cmsDepth == 0 {
+		return pos, fmt.Errorf("sketch_index: col %q: invalid cms_depth=0", name)
 	}
 
-	// cms_width[2 LE]
 	if pos+2 > len(data) {
 		return pos, fmt.Errorf("sketch_index: col %q: missing cms_width", name)
 	}
 	cmsWidth := int(binary.LittleEndian.Uint16(data[pos:]))
 	pos += 2
-	if cmsWidth != sketch.CMSWidth {
-		return pos, fmt.Errorf(
-			"sketch_index: col %q: unexpected cms_width=%d, want %d",
-			name,
-			cmsWidth,
-			sketch.CMSWidth,
-		)
+	if cmsWidth == 0 {
+		return pos, fmt.Errorf("sketch_index: col %q: invalid cms_width=0", name)
 	}
 
-	// Per present block: cms_counters[depth × width × 2 LE].
-	// Lazy: store raw byte slices, defer Unmarshal to first CMSEstimate call.
-	cmsMarshalSize := sketch.CMSDepth * sketch.CMSWidth * 2
-	cd.cmsRaw = make([][]byte, presentCount)
-	for pi := range presentCount {
-		if pos+cmsMarshalSize > len(data) {
-			return pos, fmt.Errorf("sketch_index: col %q: present block %d: too short for CMS", name, pi)
-		}
-		// Copy to avoid pinning the entire metadata buffer until lazy inflation.
-		rawCopy := make([]byte, cmsMarshalSize)
-		copy(rawCopy, data[pos:pos+cmsMarshalSize])
-		cd.cmsRaw[pi] = rawCopy
-		pos += cmsMarshalSize
+	cmsMarshalSize := cmsDepth * cmsWidth * 2
+	skipTotal := cmsMarshalSize * presentCount
+	if pos+skipTotal > len(data) {
+		return pos, fmt.Errorf(
+			"sketch_index: col %q: CMS data too short (need %d bytes, have %d)",
+			name, skipTotal, len(data)-pos,
+		)
 	}
+	pos += skipTotal
 	return pos, nil
 }
 

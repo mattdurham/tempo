@@ -81,3 +81,33 @@ section as before.
 `internal/modules/blockio/writer/writer_block.go:addRowFromTempoProto`,
 `internal/modules/blockio/writer/writer_block.go:addRowFromBlock`,
 `internal/modules/blockio/writer/writer_block.go:feedIntrinsicsFromIndex`
+
+---
+
+## NOTE-003: CMS Removal — SKTE Writer Format, No CMS Data Written
+*Added: 2026-04-02*
+
+**Decision:** Remove CMS accumulation and marshalling from the sketch writer. New files use
+SKTE format (magic `0x534B5445`). The `colSketch` struct has no CMS field; `blockSketchSet.add()`
+writes HLL, TopK, and BinaryFuse8 keys only.
+
+**Rationale:**
+- CMS added ~70% to per-file sketch section size. At production scale (multi-GB blockpack
+  files) the sketch index alone exceeded heap limits during compaction, causing OOM.
+- TopK provides exact frequency counts for high-cardinality hot values (fingerprint lookup).
+  For values outside the top-K, the planner makes a conservative pass — no pruning — rather
+  than relying on CMS frequency estimates.
+- BinaryFuse8 membership checks cover the hard-absence pruning use case more efficiently.
+
+**Wire format:** SKTE per-column layout:
+1. HLL section: `hll_len[4 LE]` + HLL bytes per present block
+2. TopK section: `topk_count[4 LE]` + `(fp[8 LE], count[2 LE])` pairs per present block
+3. Fuse section: `fuse_len[4 LE]` + fuse filter bytes per present block
+
+No CMS bytes are written. Legacy SKTC/SKTD readers skip CMS bytes zero-alloc via
+`skipColumnCMS` in the reader package (see reader/NOTES.md NOTE-010).
+
+**Back-ref:**
+- `internal/modules/blockio/writer/sketch_index.go:writeSketchIndexSection`
+- `internal/modules/blockio/writer/sketch_index.go:sketchSectionMagic` (0x534B5445 = SKTE)
+- `internal/modules/blockio/writer/writer_log.go:blockSketchSet`

@@ -1,5 +1,49 @@
 # Fix Review Issues (Iteration 1)
 
+Read the full reviews at .bob/state/review.md AND .bob/state/go-presubmit.md.
+
+## CRITICAL — fix first
+
+### 1. benchmark/modules_engine_bench_test.go — compile break
+`modules_executor.Collect` now returns 3 values but the test assigns only 2.
+Fix: capture all 3 return values (use `_` for unused ones).
+File: benchmark/modules_engine_bench_test.go ~line 172
+
+### 2. benchmark/lokibench/converter.go — compile break
+References removed symbols: `blockpack.LogQueryStats`, `modules_executor.CollectStats`, `s.PrunedByCMS`, `OnStats` callback.
+Fix: update to current API. Read executor and api.go to find correct type/field names.
+
+## HIGH — spec/doc files
+
+### 3. queryplanner/SPECS.md — remove all CMS references
+ColumnSketch interface still shows CMSEstimate. PrunedByCMS still in Plan spec. pruneByCMSAll still in pipeline stages.
+Fix: update to reflect 4-method interface, no PrunedByCMS, no CMS pipeline stage.
+
+### 4. executor/SPECS.md — remove pruned_by_cms from StepStats docs
+
+### 5. NOTES.md files — add dated CMS removal entries (2026-04-02)
+queryplanner/NOTES.md, blockio/reader/NOTES.md, blockio/writer/NOTES.md
+Add entry explaining: CMS removal rationale (70% sketch size, OOM), SKTE magic, fileSketchSummaryMagic bump, skipColumnCMS backward compat.
+
+## MEDIUM
+
+### 6. skipColumnCMS — guard against cmsDepth=0 or cmsWidth=0
+Add: if cmsDepth == 0 || cmsWidth == 0 { return pos, nil }
+File: vendor/.../blockio/reader/sketch_index.go
+
+### 7. Stale "CMS" comments in writer.go (~line 870) and writer_log.go (~lines 55, 204)
+
+### 8. reader/SPECS.md — remove CMSBytes from ColumnSketchStat spec (~line 223)
+
+### 9. queryplanner/TESTS.md — remove plan.PrunedByCMS assertion (~line 215)
+
+### 10. executor/NOTES.md NOTE-045 — update dangling back-ref to removed fileLevelCMSReject
+
+## Constraints
+- Do NOT rewrite code unrelated to reported issues
+- Do NOT introduce new functionality
+- Working directory: /home/mdurham/source/tempo-mrd-worktrees/drop-cms-sketch
+
 ## Issues to Fix
 
 Read the full reviews at .bob/state/review.md AND .bob/state/go-presubmit.md.

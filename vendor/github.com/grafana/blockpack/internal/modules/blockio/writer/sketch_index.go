@@ -1,10 +1,10 @@
 // Package writer provides block building and serialization for blockpack files.
-// NOTE: Sketch index build and serialization for per-block HLL + CMS + BinaryFuse8 + TopK.
+// NOTE: Sketch index build and serialization for per-block HLL + BinaryFuse8 + TopK.
 // SPEC-SK-16: HashForFuse(key) is called here at write time; must match query time.
 //
 // Column-major wire format:
 //
-//	magic[4 LE] = 0x534B5443
+//	magic[4 LE] = 0x534B5445 ("SKTE")
 //	num_blocks[4 LE]
 //	num_columns[4 LE]
 //
@@ -14,9 +14,6 @@
 //	  distinct_count[num_blocks × 4 LE uint32]  // HLL.Cardinality() per block, 0 absent
 //	  topk_k[1] = 20
 //	  per present block: topk_entry_count[1] + entries (fp[8 LE] + count[2 LE])
-//	  cms_depth[1] = 4
-//	  cms_width[2 LE] = 64
-//	  per present block: cms_counters[depth × width × 2 LE] = 512 bytes
 //	  per present block: fuse_len[4 LE] + fuse_data[fuse_len]
 package writer
 
@@ -29,7 +26,7 @@ import (
 )
 
 const (
-	sketchSectionMagic     = uint32(0x534B5443) // "SKTC"
+	sketchSectionMagic     = uint32(0x534B5445) // "SKTE"
 	sketchTimestampColName = "__timestamp__"
 )
 
@@ -37,7 +34,6 @@ const (
 // keys holds all hashed values for BinaryFuse8 construction (flushed once at writeSketchIndexSection).
 type colSketch struct {
 	hll  *sketch.HyperLogLog
-	cms  *sketch.CountMinSketch
 	topk *sketch.TopK
 	keys []uint64 // hashed values for BinaryFuse8 construction
 }
@@ -58,14 +54,12 @@ func (bs blockSketchSet) add(col, key string) {
 	if !ok {
 		cs = &colSketch{
 			hll:  sketch.NewHyperLogLog(),
-			cms:  sketch.NewCountMinSketch(),
 			topk: sketch.NewTopK(),
 			keys: make([]uint64, 0, 64),
 		}
 		bs[col] = cs
 	}
 	cs.hll.Add(key)
-	cs.cms.Add(key, 1)
 	cs.topk.Add(key)
 	cs.keys = append(cs.keys, sketch.HashForFuse(key))
 }
@@ -95,11 +89,10 @@ func writeSketchIndexSection(sketchIdx []blockSketchSet) ([]byte, error) {
 	presenceBytes := (numBlocks + 7) / 8
 
 	// Pre-allocate buffer: header + estimated per-column data.
-	cmsMarshalSize := sketch.CMSDepth * sketch.CMSWidth * 2
 	buf := make(
 		[]byte,
 		0,
-		12+numColumns*(64+presenceBytes+numBlocks*4+1+numBlocks*(1+20*10)+1+2+numBlocks*cmsMarshalSize+numBlocks*16),
+		12+numColumns*(64+presenceBytes+numBlocks*4+1+numBlocks*(1+20*10)+numBlocks*16),
 	)
 
 	// magic[4 LE]
@@ -165,22 +158,6 @@ func writeSketchIndexSection(sketchIdx []blockSketchSet) ([]byte, error) {
 				binary.LittleEndian.PutUint16(tmp2[:], uint16Count)
 				buf = append(buf, tmp2[:]...)
 			}
-		}
-
-		// cms_depth[1]
-		buf = append(buf, byte(sketch.CMSDepth))
-
-		// cms_width[2 LE]
-		binary.LittleEndian.PutUint16(tmp2[:], uint16(sketch.CMSWidth)) //nolint:gosec // safe: CMSWidth fits uint16
-		buf = append(buf, tmp2[:]...)
-
-		// Per present block: cms_counters[depth × width × 2 LE] = 512 bytes.
-		for _, bs := range sketchIdx {
-			cs := bs[name]
-			if cs == nil {
-				continue
-			}
-			buf = append(buf, cs.cms.Marshal()...)
 		}
 
 		// Per present block: fuse_len[4 LE] + fuse_data[fuse_len].

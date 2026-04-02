@@ -169,7 +169,7 @@ func executeModulesFilterSearch(
 		return nil, fmt.Errorf("compile TraceQL: %w", err)
 	}
 
-	rows, err := modules_executor.Collect(r, program, modules_executor.CollectOptions{})
+	rows, _, err := modules_executor.Collect(r, program, modules_executor.CollectOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("execute query: %w", err)
 	}
@@ -232,7 +232,7 @@ func benchmarkModulesQuery(b *testing.B, modulesPath string, query benchmarkQuer
 		case *traceqlparser.FilterExpression:
 			program, compErr := vm.CompileTraceQLFilter(q)
 			require.NoError(b, compErr)
-			rows, execErr := modules_executor.Collect(r, program, modules_executor.CollectOptions{})
+			rows, _, execErr := modules_executor.Collect(r, program, modules_executor.CollectOptions{})
 			require.NoError(b, execErr)
 			signalType := r.SignalType()
 			matches = make([]modules_executor.SpanMatch, len(rows))

@@ -34,7 +34,7 @@ type LokiConverter struct {
 	linesProcessed atomic.Int64
 	// lastStats holds the most recent query's block selection statistics.
 	// Updated atomically on every SelectLogs and SelectSamples call.
-	lastStats atomic.Pointer[blockpack.LogQueryStats]
+	lastStats atomic.Pointer[blockpack.QueryStats]
 	// forceFullPipeline disables the fast path that bypasses sp.Process for
 	// fullyPushed queries. Used by TestSyntheticDeepCompare which validates
 	// entry metadata (StructuredMetadata/Parsed) against the chunk store.
@@ -49,7 +49,7 @@ func (q *LokiConverter) ResetLines() { q.linesProcessed.Store(0) }
 
 // LastStats returns the block selection statistics from the most recent query,
 // or nil if no query has been executed yet.
-func (q *LokiConverter) LastStats() *blockpack.LogQueryStats {
+func (q *LokiConverter) LastStats() *blockpack.QueryStats {
 	return q.lastStats.Load()
 }
 
@@ -116,20 +116,13 @@ func (q *LokiConverter) SelectLogs(
 	collectOpts := modules_executor.CollectOptions{
 		TimeRange: modules_queryplanner.TimeRange{MinNano: startNano, MaxNano: endNano},
 		Direction: collectDir,
-		OnStats: func(s modules_executor.CollectStats) {
-			q.lastStats.Store(&blockpack.LogQueryStats{
-				TotalBlocks: s.TotalBlocks, PrunedByTime: s.PrunedByTime,
-				PrunedByIndex: s.PrunedByIndex, PrunedByFuse: s.PrunedByFuse,
-				PrunedByCMS: s.PrunedByCMS, SelectedBlocks: s.SelectedBlocks,
-				FetchedBlocks: s.FetchedBlocks, Explain: s.Explain,
-			})
-		},
 	}
 
 	if ctx.Err() != nil {
 		return iter.NoopEntryIterator, ctx.Err()
 	}
-	entries, err := modules_executor.CollectLogs(q.reader, program, bpPipeline, collectOpts)
+	entries, qs, err := modules_executor.CollectLogs(q.reader, program, bpPipeline, collectOpts)
+	q.lastStats.Store(&qs)
 	if err != nil {
 		return nil, fmt.Errorf("LokiConverter.SelectLogs: %w", err)
 	}
@@ -249,20 +242,13 @@ func (q *LokiConverter) SelectSamples(
 
 	collectOpts := modules_executor.CollectOptions{
 		TimeRange: modules_queryplanner.TimeRange{MinNano: startNano, MaxNano: endNano},
-		OnStats: func(s modules_executor.CollectStats) {
-			q.lastStats.Store(&blockpack.LogQueryStats{
-				TotalBlocks: s.TotalBlocks, PrunedByTime: s.PrunedByTime,
-				PrunedByIndex: s.PrunedByIndex, PrunedByFuse: s.PrunedByFuse,
-				PrunedByCMS: s.PrunedByCMS, SelectedBlocks: s.SelectedBlocks,
-				FetchedBlocks: s.FetchedBlocks, Explain: s.Explain,
-			})
-		},
 	}
 
 	if ctx.Err() != nil {
 		return iter.NoopSampleIterator, ctx.Err()
 	}
-	entries, err := modules_executor.CollectLogs(q.reader, program, bpPipeline, collectOpts)
+	entries, qs, err := modules_executor.CollectLogs(q.reader, program, bpPipeline, collectOpts)
+	q.lastStats.Store(&qs)
 	if err != nil {
 		return nil, fmt.Errorf("LokiConverter.SelectSamples: %w", err)
 	}
@@ -471,7 +457,7 @@ func labelFilterFragment(lf *logqlparser.LabelFilter) string {
 	case logqlparser.OpNotEqual:
 		// Row-level ScanNotEqual handles negation correctly (rows where column
 		// is absent are included). Block-level bloom pruning is not affected —
-		// the planner only uses positive predicates for bloom/CMS checks.
+		// the planner only uses positive predicates for bloom/fuse checks.
 		return lf.Name + `!="` + lf.Value + `"`
 	case logqlparser.OpNotRegex:
 		return lf.Name + `!~"` + lf.Value + `"`
