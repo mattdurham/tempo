@@ -35,6 +35,7 @@ import (
 	"github.com/grafana/tempo/tempodb/blocklist"
 	"github.com/grafana/tempo/tempodb/encoding"
 	"github.com/grafana/tempo/tempodb/encoding/common"
+	"github.com/grafana/tempo/tempodb/encoding/vblockpack"
 	"github.com/grafana/tempo/tempodb/pool"
 	"github.com/grafana/tempo/tempodb/wal"
 )
@@ -92,6 +93,12 @@ type Reader interface {
 
 	// TODO(suraj): use common.MetricsCallback in Fetch and remove the Bytes callback from traceql.FetchSpansResponse
 	Fetch(ctx context.Context, meta *backend.BlockMeta, req traceql.FetchSpansRequest, opts common.SearchOptions) (traceql.FetchSpansResponse, error)
+
+	// QueryRange executes a TraceQL metrics query directly against a block using the block's
+	// native metrics implementation (if available). Returns (nil, nil) if the block encoding
+	// does not support native metrics queries — callers must fall back to the generic Fetch path.
+	QueryRange(ctx context.Context, meta *backend.BlockMeta, req *tempopb.QueryRangeRequest, opts common.SearchOptions) (*tempopb.QueryRangeResponse, error)
+
 	FetchSpans(ctx context.Context, meta *backend.BlockMeta, req traceql.FetchSpansRequest, opts common.SearchOptions) (traceql.FetchSpansOnlyResponse, error)
 	FetchTagValues(ctx context.Context, meta *backend.BlockMeta, req traceql.FetchTagValuesRequest, cb traceql.FetchTagValuesCallback, mcb common.MetricsCallback, opts common.SearchOptions) error
 	FetchTagNames(ctx context.Context, meta *backend.BlockMeta, req traceql.FetchTagsRequest, cb traceql.FetchTagsCallback, mcb common.MetricsCallback, opts common.SearchOptions) error
@@ -237,6 +244,14 @@ func New(cfg *Config, cacheProvider cache.Provider, logger gkLog.Logger) (Reader
 		return nil, nil, nil, err
 	}
 
+	// Initialize the blockpack disk cache so it's available for queries.
+	// CreateBlock/Compact also call this, but the querier never runs those paths.
+	// NOTE: In local benchmarks with minio, bbolt overhead (mmap memmove + GC pressure)
+	// exceeds the S3 latency savings. The disk cache helps more with real S3 (50-100ms RTT).
+	if cfg.Block != nil && cfg.Block.Blockpack.FileCachePath != "" {
+		vblockpack.ConfigureFileCache(cfg.Block.Blockpack.FileCachePath, cfg.Block.Blockpack.FileCacheMaxBytes)
+	}
+
 	return rw, rw, rw, nil
 }
 
@@ -359,14 +374,25 @@ func (rw *readerWriter) Find(ctx context.Context, tenantID string, id common.ID,
 	blocksSearched := 0
 	compactedBlocksSearched := 0
 
+	// Pre-convert timeStart/timeEnd from Unix seconds to time.Time once to avoid
+	// calling time.Time.Unix() per block inside includeBlock (hot path with many blocks).
+	var timeStartT, timeEndT time.Time
+	if timeStart != 0 {
+		timeStartT = time.Unix(timeStart, 0)
+	}
+	if timeEnd != 0 {
+		timeEndT = time.Unix(timeEnd, 0)
+	}
+
 	for _, b := range blocklist {
-		if includeBlock(b, id, blockStartBytes, blockEndBytes, timeStart, timeEnd, opts.RF1After) {
+		if includeBlock(b, id, blockStartBytes, blockEndBytes, timeStartT, timeEndT, opts.RF1After) {
 			copiedBlocklist = append(copiedBlocklist, b)
 			blocksSearched++
 		}
 	}
+	compactedLookback := time.Now().Add(-(2 * rw.cfg.BlocklistPoll))
 	for _, c := range compactedBlocklist {
-		if includeCompactedBlock(c, id, blockStartBytes, blockEndBytes, rw.cfg.BlocklistPoll, timeStart, timeEnd, opts.RF1After) {
+		if includeCompactedBlock(c, id, blockStartBytes, blockEndBytes, compactedLookback, timeStartT, timeEndT, opts.RF1After) {
 			copiedBlocklist = append(copiedBlocklist, &c.BlockMeta)
 			compactedBlocksSearched++
 		}
@@ -540,6 +566,27 @@ func (rw *readerWriter) Fetch(ctx context.Context, meta *backend.BlockMeta, req 
 
 	rw.cfg.Search.ApplyToOptions(&opts)
 	return block.Fetch(ctx, req, opts)
+}
+
+// nativeMetricsQuerier is an optional interface implemented by block encodings that
+// support native TraceQL metrics queries (e.g. vblockpack with the intrinsic fast path).
+type nativeMetricsQuerier interface {
+	QueryRange(ctx context.Context, req *tempopb.QueryRangeRequest, opts common.SearchOptions) (*tempopb.QueryRangeResponse, error)
+}
+
+// QueryRange dispatches to the block's native metrics implementation when available.
+// Returns (nil, nil) when the block encoding does not support native metrics queries.
+func (rw *readerWriter) QueryRange(ctx context.Context, meta *backend.BlockMeta, req *tempopb.QueryRangeRequest, opts common.SearchOptions) (*tempopb.QueryRangeResponse, error) {
+	block, err := encoding.OpenBlock(meta, rw.r)
+	if err != nil {
+		return nil, err
+	}
+	nm, ok := block.(nativeMetricsQuerier)
+	if !ok {
+		return nil, nil
+	}
+	rw.cfg.Search.ApplyToOptions(&opts)
+	return nm.QueryRange(ctx, req, opts)
 }
 
 func (rw *readerWriter) FetchSpans(ctx context.Context, meta *backend.BlockMeta, req traceql.FetchSpansRequest, opts common.SearchOptions) (traceql.FetchSpansOnlyResponse, error) {
@@ -819,7 +866,7 @@ func (rw *readerWriter) pollBlocklist(ctx context.Context) {
 }
 
 // includeBlock indicates whether a given block should be included in a backend search
-func includeBlock(b *backend.BlockMeta, _ common.ID, blockStart, blockEnd []byte, timeStart, timeEnd int64, rf1After time.Time) bool {
+func includeBlock(b *backend.BlockMeta, _ common.ID, blockStart, blockEnd []byte, timeStart, timeEnd time.Time, rf1After time.Time) bool {
 	// todo: restore this functionality once it works. min/max ids are currently not recorded
 	//    https://github.com/grafana/tempo/issues/1903
 	//  correctly in a block
@@ -827,8 +874,8 @@ func includeBlock(b *backend.BlockMeta, _ common.ID, blockStart, blockEnd []byte
 	// 	return false
 	// }
 
-	if timeStart != 0 && timeEnd != 0 {
-		if b.StartTime.Unix() >= timeEnd || b.EndTime.Unix() <= timeStart {
+	if !timeStart.IsZero() && !timeEnd.IsZero() {
+		if !b.StartTime.Before(timeEnd) || !b.EndTime.After(timeStart) {
 			return false
 		}
 	}
@@ -849,8 +896,8 @@ func includeBlock(b *backend.BlockMeta, _ common.ID, blockStart, blockEnd []byte
 }
 
 // if block is compacted within lookback period, and is within shard ranges, include it in search
-func includeCompactedBlock(c *backend.CompactedBlockMeta, id common.ID, blockStart, blockEnd []byte, poll time.Duration, timeStart, timeEnd int64, rf1After time.Time) bool {
-	lookback := time.Now().Add(-(2 * poll))
+// lookback is the pre-computed cutoff time: blocks compacted before this time are excluded.
+func includeCompactedBlock(c *backend.CompactedBlockMeta, id common.ID, blockStart, blockEnd []byte, lookback time.Time, timeStart, timeEnd time.Time, rf1After time.Time) bool {
 	if c.CompactedTime.Before(lookback) {
 		return false
 	}

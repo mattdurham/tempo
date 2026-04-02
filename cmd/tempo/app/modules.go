@@ -371,7 +371,7 @@ func (t *App) initGeneratorRingWatcher() (services.Service, error) {
 
 func (t *App) initBlockBuilder() (services.Service, error) {
 	t.cfg.BlockBuilder.IngestStorageConfig = t.cfg.Ingest
-	t.cfg.BlockBuilder.IngestStorageConfig.Kafka.ConsumerGroup = blockbuilder.ConsumerGroup
+	t.cfg.BlockBuilder.IngestStorageConfig.Kafka.ConsumerGroup = t.cfg.BlockBuilder.ConsumerGroup
 	// Block config and WAL version are always sourced from storage.trace.block.
 	t.cfg.BlockBuilder.BlockConfig.BlockConfig = *t.cfg.StorageConfig.Trace.Block
 	t.cfg.BlockBuilder.WAL.Version = t.cfg.StorageConfig.Trace.Block.Version

@@ -21,10 +21,23 @@
 /tempo-vulture
 /tempodb/encoding/benchmark_block
 private-key.key
+.docker/.env
+.docker/s3-data/
 integration/**/e2e_integration_test[0-9]*
 .tempo.yaml
 /tmp
 gh-token.txt
 .cache
 operations/jsonnet/microservices/vendor/
+
+# Built binaries
+cmd/bpanalyze/bpanalyze
+cmd/kafka-otlp-forwarder/kafka-otlp-forwarder
+cmd/parquet-otlp-forwarder/parquet-otlp-forwarder
+cmd/querybench/querybench
+parquet-otlp-forwarder
+bpanalyze
+querybench
+.docker/tempo-blockpack
+cmd/tempo/tempo
 .claude/skills/evals-workspace/

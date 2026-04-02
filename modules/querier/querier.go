@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strings"
 
 	"github.com/go-kit/log/level"
 	httpgrpc_server "github.com/grafana/dskit/httpgrpc/server"
@@ -642,8 +643,21 @@ func (q *Querier) SearchBlock(ctx context.Context, req *tempopb.SearchBlockReque
 	opts.StartPage = int(req.StartPage)
 	opts.TotalPages = int(req.PagesToSearch)
 	opts.MaxBytes = q.limits.MaxBytesPerTrace(tenantID)
+	opts.MaxTraces = int(req.SearchReq.Limit)
 
 	if api.IsTraceQLQuery(req.SearchReq) {
+		// Inject the original TraceQL query into context so that encoding backends
+		// that can evaluate TraceQL natively (e.g. vblockpack) receive the full query
+		// instead of a reconstructed approximation built from extracted conditions.
+		// Strip Tempo-specific hints (e.g. " with (most_recent=true)") before storing —
+		// backends that evaluate TraceQL natively don't understand hint syntax.
+		queryForBackend := req.SearchReq.Query
+		mostRecent := strings.Contains(queryForBackend, "most_recent=true")
+		if idx := strings.Index(queryForBackend, " with ("); idx != -1 {
+			queryForBackend = queryForBackend[:idx]
+		}
+		ctx = common.WithOriginalTraceQLQuery(ctx, queryForBackend, mostRecent)
+
 		fetcher := traceql.NewSpansetFetcherWrapperBoth(
 			func(ctx context.Context, req traceql.FetchSpansRequest) (traceql.FetchSpansResponse, error) {
 				return q.store.Fetch(ctx, meta, req, opts)
