@@ -173,7 +173,7 @@ func buildBlock(
 	// Pre-build all-blocks intrinsic index per reader in one pass; each row then does
 	// O(1) lookup. buildAllIntrinsicIndices scans BlockRefs once per reader across all
 	// blocks, eliminating the previous O(B × N) cost of building per-(reader,blockIdx).
-	var intrinsicIndexCache map[*modules_reader.Reader]map[int]intrinsicRowFields
+	var intrinsicIndexCache map[*modules_reader.Reader]intrinsicRowFields
 	for i := range pending {
 		ps := &pending[i]
 		if ps.srcReader == nil {
@@ -181,7 +181,7 @@ func buildBlock(
 		}
 		if _, already := intrinsicIndexCache[ps.srcReader]; !already {
 			if intrinsicIndexCache == nil {
-				intrinsicIndexCache = make(map[*modules_reader.Reader]map[int]intrinsicRowFields)
+				intrinsicIndexCache = make(map[*modules_reader.Reader]intrinsicRowFields)
 			}
 			intrinsicIndexCache[ps.srcReader] = buildAllIntrinsicIndices(ps.srcReader)
 		}
@@ -202,7 +202,7 @@ func buildBlock(
 				// append a second entry to the intrinsic accumulator for the same
 				// (blockIdx, rowIdx), causing GetTraceByID to return each span twice.
 				if ps.srcBlock.GetColumn(traceIDColumnName) == nil {
-					bb.feedIntrinsicsFromIndex(intrinsicIndexCache[ps.srcReader][ps.srcBlockIdx], ps.srcRowIdx, rowIdx)
+					bb.feedIntrinsicsFromIndex(intrinsicIndexCache[ps.srcReader], ps.srcBlockIdx, ps.srcRowIdx, rowIdx)
 				}
 			}
 		case ps.tempoSpan != nil:
@@ -1165,19 +1165,49 @@ const (
 	ifSpanDuration uint16 = 1 << 3
 )
 
-// intrinsicRowFields stores per-row intrinsic fields for one source block,
-// keyed by row index. Map allows unbounded row indices so compaction of blocks
-// written before the per-block row cap was introduced does not panic.
-type intrinsicRowFields = map[uint16]*intrinsicFields
+// packIntrinsicKey encodes (blockIdx, rowIdx) into a uint64 for flat map lookups.
+// blockIdx originates from ref.BlockIdx (uint16) so fits in bits 16–31; rowIdx occupies bits 0–15.
+func packIntrinsicKey(blockIdx int, rowIdx uint16) uint64 {
+	return uint64(blockIdx)<<16 | uint64(rowIdx) //nolint:gosec // blockIdx from BlockIdx (uint16)
+}
 
-// buildAllIntrinsicIndices builds intrinsicRowFields for every source block in r in a
-// single pass through each intrinsic column's BlockRefs. Returns a map from blockIdx to
-// intrinsicRowFields for that block. Returns nil when r has no intrinsic section.
+const intrinsicSlabChunkSize = 4096
+
+// intrinsicSlab is a chunk-based arena for intrinsicFields. Each chunk is allocated once
+// with a fixed capacity and never reallocated, so pointers returned by alloc remain stable
+// across subsequent calls. Reduces GC-tracked heap objects from O(spans) to O(spans/4096).
+type intrinsicSlab struct {
+	chunks [][]intrinsicFields
+}
+
+// alloc returns a pointer to a zeroed intrinsicFields from the slab.
+// The returned pointer is stable for the lifetime of the slab.
+func (s *intrinsicSlab) alloc() *intrinsicFields {
+	if len(s.chunks) == 0 {
+		s.chunks = append(s.chunks, make([]intrinsicFields, 0, intrinsicSlabChunkSize))
+	}
+	last := len(s.chunks) - 1
+	if len(s.chunks[last]) == intrinsicSlabChunkSize {
+		s.chunks = append(s.chunks, make([]intrinsicFields, 0, intrinsicSlabChunkSize))
+		last++
+	}
+	s.chunks[last] = append(s.chunks[last], intrinsicFields{})
+	return &s.chunks[last][len(s.chunks[last])-1]
+}
+
+// intrinsicRowFields is a flat map from packIntrinsicKey(blockIdx, rowIdx) → *intrinsicFields.
+// Replaces the previous nested map[int]map[uint16]*intrinsicFields, eliminating one map
+// allocation per unique blockIdx and allowing a single O(1) lookup per row.
+type intrinsicRowFields = map[uint64]*intrinsicFields
+
+// buildAllIntrinsicIndices builds a flat intrinsicRowFields for every source block in r
+// in a single pass through each intrinsic column's BlockRefs. Returns nil when r has no
+// intrinsic section.
 //
 // Replaces per-block buildIntrinsicBlockIndex: the previous approach scanned ALL BlockRefs
 // once per (reader, blockIdx) pair — O(B × N_cols × N_refs) total for B source blocks.
 // A single pass per reader reduces this to O(N_cols × N_refs) regardless of block count.
-func buildAllIntrinsicIndices(r *modules_reader.Reader) map[int]intrinsicRowFields {
+func buildAllIntrinsicIndices(r *modules_reader.Reader) intrinsicRowFields {
 	if r == nil {
 		return nil
 	}
@@ -1185,7 +1215,8 @@ func buildAllIntrinsicIndices(r *modules_reader.Reader) map[int]intrinsicRowFiel
 	if len(names) == 0 {
 		return nil
 	}
-	out := make(map[int]intrinsicRowFields)
+	out := make(intrinsicRowFields)
+	var slab intrinsicSlab
 	for _, colName := range names {
 		col, err := r.GetIntrinsicColumn(colName)
 		if err != nil || col == nil {
@@ -1200,28 +1231,28 @@ func buildAllIntrinsicIndices(r *modules_reader.Reader) map[int]intrinsicRowFiel
 				if i >= len(col.BytesValues) {
 					continue
 				}
-				intrinsicFieldFor(out, int(ref.BlockIdx), ref.RowIdx).traceID = col.BytesValues[i]
+				intrinsicFieldFor(out, &slab, int(ref.BlockIdx), ref.RowIdx).traceID = col.BytesValues[i]
 			}
 		case spanIDColumnName:
 			for i, ref := range col.BlockRefs {
 				if i >= len(col.BytesValues) {
 					continue
 				}
-				intrinsicFieldFor(out, int(ref.BlockIdx), ref.RowIdx).spanID = col.BytesValues[i]
+				intrinsicFieldFor(out, &slab, int(ref.BlockIdx), ref.RowIdx).spanID = col.BytesValues[i]
 			}
 		case spanParentIDColumnName:
 			for i, ref := range col.BlockRefs {
 				if i >= len(col.BytesValues) {
 					continue
 				}
-				intrinsicFieldFor(out, int(ref.BlockIdx), ref.RowIdx).parentSpanID = col.BytesValues[i]
+				intrinsicFieldFor(out, &slab, int(ref.BlockIdx), ref.RowIdx).parentSpanID = col.BytesValues[i]
 			}
 		case spanStartColumnName:
 			for i, ref := range col.BlockRefs {
 				if i >= len(col.Uint64Values) {
 					continue
 				}
-				f := intrinsicFieldFor(out, int(ref.BlockIdx), ref.RowIdx)
+				f := intrinsicFieldFor(out, &slab, int(ref.BlockIdx), ref.RowIdx)
 				f.spanStart = col.Uint64Values[i]
 				f.present |= ifSpanStart
 			}
@@ -1230,14 +1261,14 @@ func buildAllIntrinsicIndices(r *modules_reader.Reader) map[int]intrinsicRowFiel
 				if i >= len(col.Uint64Values) {
 					continue
 				}
-				f := intrinsicFieldFor(out, int(ref.BlockIdx), ref.RowIdx)
+				f := intrinsicFieldFor(out, &slab, int(ref.BlockIdx), ref.RowIdx)
 				f.spanDuration = col.Uint64Values[i]
 				f.present |= ifSpanDuration
 			}
 		case spanKindColumnName:
 			for _, entry := range col.DictEntries {
 				for _, ref := range entry.BlockRefs {
-					f := intrinsicFieldFor(out, int(ref.BlockIdx), ref.RowIdx)
+					f := intrinsicFieldFor(out, &slab, int(ref.BlockIdx), ref.RowIdx)
 					f.spanKind = entry.Int64Val
 					f.present |= ifSpanKind
 				}
@@ -1245,7 +1276,7 @@ func buildAllIntrinsicIndices(r *modules_reader.Reader) map[int]intrinsicRowFiel
 		case spanStatusColumnName:
 			for _, entry := range col.DictEntries {
 				for _, ref := range entry.BlockRefs {
-					f := intrinsicFieldFor(out, int(ref.BlockIdx), ref.RowIdx)
+					f := intrinsicFieldFor(out, &slab, int(ref.BlockIdx), ref.RowIdx)
 					f.spanStatus = entry.Int64Val
 					f.present |= ifSpanStatus
 				}
@@ -1253,19 +1284,19 @@ func buildAllIntrinsicIndices(r *modules_reader.Reader) map[int]intrinsicRowFiel
 		case spanNameColumnName:
 			for _, entry := range col.DictEntries {
 				for _, ref := range entry.BlockRefs {
-					intrinsicFieldFor(out, int(ref.BlockIdx), ref.RowIdx).spanName = entry.Value
+					intrinsicFieldFor(out, &slab, int(ref.BlockIdx), ref.RowIdx).spanName = entry.Value
 				}
 			}
 		case spanStatusMsgColumnName:
 			for _, entry := range col.DictEntries {
 				for _, ref := range entry.BlockRefs {
-					intrinsicFieldFor(out, int(ref.BlockIdx), ref.RowIdx).statusMsg = entry.Value
+					intrinsicFieldFor(out, &slab, int(ref.BlockIdx), ref.RowIdx).statusMsg = entry.Value
 				}
 			}
 		case svcNameColumnName:
 			for _, entry := range col.DictEntries {
 				for _, ref := range entry.BlockRefs {
-					intrinsicFieldFor(out, int(ref.BlockIdx), ref.RowIdx).svcName = entry.Value
+					intrinsicFieldFor(out, &slab, int(ref.BlockIdx), ref.RowIdx).svcName = entry.Value
 				}
 			}
 		}
@@ -1276,18 +1307,16 @@ func buildAllIntrinsicIndices(r *modules_reader.Reader) map[int]intrinsicRowFiel
 	return out
 }
 
-// intrinsicFieldFor returns the *intrinsicFields for (blockIdx, rowIdx), creating the
-// per-block map and the fields entry if absent.
-func intrinsicFieldFor(out map[int]intrinsicRowFields, blockIdx int, rowIdx uint16) *intrinsicFields {
-	rows := out[blockIdx]
-	if rows == nil {
-		rows = make(intrinsicRowFields)
-		out[blockIdx] = rows
+// intrinsicFieldFor returns the *intrinsicFields for (blockIdx, rowIdx) from the flat map,
+// allocating via slab on first access. Single O(1) map lookup; no inner map allocation.
+func intrinsicFieldFor(out intrinsicRowFields, slab *intrinsicSlab, blockIdx int, rowIdx uint16) *intrinsicFields {
+	key := packIntrinsicKey(blockIdx, rowIdx)
+	if f, ok := out[key]; ok {
+		return f
 	}
-	if rows[rowIdx] == nil {
-		rows[rowIdx] = &intrinsicFields{}
-	}
-	return rows[rowIdx]
+	f := slab.alloc()
+	out[key] = f
+	return f
 }
 
 // feedIntrinsicsFromIndex copies intrinsic column values from a pre-built per-block
@@ -1295,14 +1324,14 @@ func intrinsicFieldFor(out map[int]intrinsicRowFields, blockIdx int, rowIdx uint
 // dstRowIdx. O(1) per call — the index is built once per source block.
 // Used by the compaction path when source blocks no longer carry intrinsic columns
 // in their block-column storage.
-func (b *blockBuilder) feedIntrinsicsFromIndex(index intrinsicRowFields, srcRowIdx, dstRowIdx int) {
+func (b *blockBuilder) feedIntrinsicsFromIndex(index intrinsicRowFields, blockIdx, srcRowIdx, dstRowIdx int) {
 	if index == nil || b.intrinsicAccum == nil {
 		return
 	}
 	if srcRowIdx < 0 || srcRowIdx > int(^uint16(0)) {
 		return
 	}
-	f := index[uint16(srcRowIdx)] //nolint:gosec
+	f := index[packIntrinsicKey(blockIdx, uint16(srcRowIdx))] //nolint:gosec
 	if f == nil {
 		return
 	}
