@@ -210,9 +210,6 @@ type Plan struct {
 	// PrunedByFuse is the number of blocks eliminated by BinaryFuse8 membership checks.
 	PrunedByFuse int
 
-	// PrunedByCMS is the number of blocks eliminated by Count-Min Sketch zero-estimate checks.
-	PrunedByCMS int
-
 	// Limit is the early-termination hint passed via PlanOptions.
 	// 0 means no limit (all selected blocks should be scanned).
 	Limit int
@@ -312,14 +309,9 @@ func (p *Planner) Plan(predicates []Predicate, timeRange TimeRange) *Plan {
 	}
 
 	// Stage 2: BinaryFuse8 membership pruning — hard exclusion at ~0.39% FPR.
-	// NOTE-015: Fuse runs before CMS to eliminate clearly absent values cheaply.
 	plan.PrunedByFuse += pruneByFuseAll(p.r, candidates, predicates)
 
-	// Stage 3: Count-Min Sketch zero-estimate pruning — CMS estimate == 0 is definitely absent.
-	// NOTE-013: CMS never under-counts, so zero is a safe hard prune.
-	plan.PrunedByCMS += pruneByCMSAll(p.r, candidates, predicates)
-
-	// Stage 4: Score remaining blocks for selectivity (freq/max(cardinality,1)).
+	// Stage 3: Score remaining blocks for selectivity (freq/max(cardinality,1)).
 	// NOTE-014: Higher score = fewer distinct values relative to query frequency.
 	plan.BlockScores = scoreBlocks(p.r, candidates, predicates)
 

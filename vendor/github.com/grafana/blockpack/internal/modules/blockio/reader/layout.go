@@ -60,9 +60,6 @@ type ColumnSketchStat struct {
 	FuseBytes int `json:"fuse_bytes,omitempty"`
 	// TopKCount is the number of TopK entries for this column (0 if none).
 	TopKCount int `json:"top_k_count,omitempty"`
-	// CMSBytes is the actual byte size of the Count-Min Sketch data for this column
-	// in this block (CMSDepth × CMSWidth × 2 bytes).
-	CMSBytes int `json:"cms_bytes,omitempty"`
 	// TopKBytes is the actual byte size of the TopK entries for this column in this
 	// block (1 + len(entries) × 10 bytes).
 	TopKBytes int `json:"top_k_bytes,omitempty"`
@@ -345,9 +342,8 @@ func (r *Reader) buildSketchIndexInfo() *SketchIndexInfo {
 		name        string
 		cardinality uint64
 		topkCount   int
-		cmsBytes    int
 		topkBytes   int
-		fuseBytes   int
+		fuseBytes   int // bloom bytes (field name kept for JSON compat)
 	}
 	blockCols := make([][]blockColStat, numBlocks)
 
@@ -355,34 +351,27 @@ func (r *Reader) buildSketchIndexInfo() *SketchIndexInfo {
 
 	for name, cd := range r.sketchIdx.columns {
 		presentCount := len(cd.presentMap)
-		cmsBytesPerBlock := sketch.CMSDepth * sketch.CMSWidth * 2
 
 		// Per-column byte accounting.
 		totalBytes += 2 + len(name)    // name_len[2] + name
 		totalBytes += presenceBytes    // presence bitset
 		totalBytes += numBlocks * 4    // distinct counts
 		totalBytes += 1 + presentCount // topk_k[1] + entry_count per present block
-		totalBytes += 1 + 2            // cms_depth[1] + cms_width[2]
-		totalBytes += presentCount * cmsBytesPerBlock
+		totalBytes += 2               // bloom_size[2]
 
 		for pi, blockIdx := range cd.presentMap {
 			topkEntries := len(cd.topkFP[pi])
 			topkBytesForBlock := 1 + topkEntries*10 // entry_count[1] + fp[8]+count[2] per entry
-			totalBytes += topkEntries * 10          // (entry_count already counted above)
-			totalBytes += 4                         // fuse_len[4]
-			fuseB := 0
-			if pi < len(cd.fuseRawLens) {
-				fuseB = cd.fuseRawLens[pi]
-				totalBytes += fuseB
-			}
+			totalBytes += topkEntries * 10           // (entry_count already counted above)
+			bloomB := sketch.SketchBloomBytes
+			totalBytes += bloomB
 
 			stat := blockColStat{
 				name:        name,
 				cardinality: uint64(cd.distinct[blockIdx]),
 				topkCount:   topkEntries,
-				cmsBytes:    cmsBytesPerBlock,
 				topkBytes:   topkBytesForBlock,
-				fuseBytes:   fuseB,
+				fuseBytes:   bloomB,
 			}
 			blockCols[blockIdx] = append(blockCols[blockIdx], stat)
 		}
@@ -407,7 +396,6 @@ func (r *Reader) buildSketchIndexInfo() *SketchIndexInfo {
 				HLLCardinality: c.cardinality,
 				FuseBytes:      c.fuseBytes,
 				TopKCount:      c.topkCount,
-				CMSBytes:       c.cmsBytes,
 				TopKBytes:      c.topkBytes,
 			})
 		}

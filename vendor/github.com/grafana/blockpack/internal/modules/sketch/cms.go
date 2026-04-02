@@ -40,6 +40,9 @@ func NewCountMinSketch() *CountMinSketch {
 	return &CountMinSketch{}
 }
 
+// Reset clears all counters, returning the CMS to its zero state for reuse.
+func (c *CountMinSketch) Reset() { c.rows = [cmsD][cmsW]uint16{} }
+
 // Add increments the counters for v by count. Saturates at math.MaxUint16. (SPEC-SK-06)
 func (c *CountMinSketch) Add(v string, count uint16) {
 	h := cmsHash(v)

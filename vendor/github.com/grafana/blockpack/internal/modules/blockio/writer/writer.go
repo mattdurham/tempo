@@ -53,7 +53,7 @@ type Writer struct {
 	// calls. Key: (srcReader pointer, srcBlockIdx). Value: pre-built row→field map.
 	// Avoids O(N) IntrinsicBytesAt/IntrinsicDictStringAt scans on every per-row call,
 	// reducing AddRowFromReader from O(N^2) to O(N) per block.
-	addRowIntrinsicCache map[addRowCacheKey]intrinsicRowFields
+	addRowIntrinsicCache map[*reader.Reader]map[int]intrinsicRowFields
 
 	out countingWriter
 
@@ -467,6 +467,9 @@ func (w *Writer) Flush() (int64, error) {
 	// 9. Reset ALL state.
 	w.pending = w.pending[:0]
 	w.blockMetas = nil
+	for _, bs := range w.sketchIdx {
+		releaseBlockSketchSet(bs)
+	}
 	w.sketchIdx = w.sketchIdx[:0]
 	for k := range w.rangeIdx {
 		delete(w.rangeIdx, k)
@@ -978,13 +981,6 @@ func (w *Writer) AddRow(block *reader.Block, rowIdx int) error {
 	return nil
 }
 
-// addRowCacheKey identifies a unique (reader, blockIdx) pair for the AddRowFromReader
-// per-block intrinsic index cache.
-type addRowCacheKey struct {
-	r        *reader.Reader
-	blockIdx int
-}
-
 // AddRowFromReader adds one row from the source block at rowIdx, reading required
 // identity fields (trace:id, span:id, span:start) from the source reader's intrinsic
 // section when block columns are absent (new storage format where intrinsic columns
@@ -1018,8 +1014,8 @@ func (w *Writer) AddRowFromReader(block *reader.Block, rowIdx int, srcReader *re
 	if len(traceBytes) != 16 && srcReader != nil {
 		idx := w.getOrBuildAddRowIndex(srcReader, srcBlockIdx)
 		if idx != nil {
-			if v, ok := idx[uint16(rowIdx)]["trace:id"]; ok { //nolint:gosec // rowIdx bounded by SpanCount (≤65535)
-				traceBytes, _ = v.([]byte)
+			if f := idx[uint16(rowIdx)]; f != nil { //nolint:gosec
+				traceBytes = f.traceID
 			}
 		}
 	}
@@ -1038,8 +1034,8 @@ func (w *Writer) AddRowFromReader(block *reader.Block, rowIdx int, srcReader *re
 	if svcName == "" && srcReader != nil {
 		idx := w.getOrBuildAddRowIndex(srcReader, srcBlockIdx)
 		if idx != nil {
-			if v, ok := idx[uint16(rowIdx)][svcNameColumnName]; ok { //nolint:gosec // rowIdx bounded by SpanCount (≤65535)
-				svcName, _ = v.(string)
+			if f := idx[uint16(rowIdx)]; f != nil { //nolint:gosec
+				svcName = f.svcName
 			}
 		}
 	}
@@ -1065,22 +1061,26 @@ func (w *Writer) AddRowFromReader(block *reader.Block, rowIdx int, srcReader *re
 }
 
 // getOrBuildAddRowIndex returns the cached per-block intrinsic index for the given
-// (srcReader, srcBlockIdx) pair, building it on first access via buildIntrinsicBlockIndex.
-// Called by AddRowFromReader to avoid O(N) IntrinsicBytesAt/IntrinsicDictStringAt scans.
+// (srcReader, srcBlockIdx) pair. On first access for a reader, builds the full
+// all-blocks index via buildAllIntrinsicIndices (single pass through all BlockRefs),
+// then caches it keyed by reader pointer. Subsequent calls for different blockIdx
+// values on the same reader return the already-built index with O(1) lookup.
 // Must be called while w.inUse is held (AddRowFromReader acquires the CAS guard first).
 func (w *Writer) getOrBuildAddRowIndex(r *reader.Reader, blockIdx int) intrinsicRowFields {
-	k := addRowCacheKey{r, blockIdx}
 	if w.addRowIntrinsicCache != nil {
-		if idx, ok := w.addRowIntrinsicCache[k]; ok {
-			return idx
+		if allIdx, ok := w.addRowIntrinsicCache[r]; ok {
+			return allIdx[blockIdx]
 		}
 	}
-	idx := buildIntrinsicBlockIndex(r, blockIdx)
+	allIdx := buildAllIntrinsicIndices(r)
 	if w.addRowIntrinsicCache == nil {
-		w.addRowIntrinsicCache = make(map[addRowCacheKey]intrinsicRowFields)
+		w.addRowIntrinsicCache = make(map[*reader.Reader]map[int]intrinsicRowFields)
 	}
-	w.addRowIntrinsicCache[k] = idx
-	return idx
+	w.addRowIntrinsicCache[r] = allIdx // cache even if nil — avoids rebuild for readers with no intrinsics
+	if allIdx == nil {
+		return nil
+	}
+	return allIdx[blockIdx]
 }
 
 // CurrentSize returns estimated buffered size in bytes.

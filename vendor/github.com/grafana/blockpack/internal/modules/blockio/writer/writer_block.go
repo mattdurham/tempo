@@ -15,6 +15,7 @@ import (
 
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
+	"github.com/grafana/blockpack/internal/modules/sketch"
 )
 
 // pendingSpan is a lightweight span record buffered before sorting and flushing.
@@ -149,7 +150,7 @@ func (b *blockBuilder) reset(spanHint int) {
 	}
 
 	// Reset colSketches for reuse.
-	b.colSketches = newBlockSketchSet()
+	b.colSketches = getBlockSketchSet()
 }
 
 // buildBlock constructs a single block from the given pending spans and returns
@@ -169,25 +170,20 @@ func buildBlock(
 	bb.intrinsicAccum = intrinsicAccum
 	bb.intrinsicBlockID = uint16(blockID) //nolint:gosec // safe: blockID bounded by 65534 (checked by caller)
 
-	// Pre-build per-(reader, srcBlockIdx) intrinsic index to avoid O(N) linear scans
-	// inside feedIntrinsicsFromIndex. Index is built once per unique (reader, blockIdx)
-	// pair; each row then does an O(1) map lookup.
-	type readerBlockKey struct {
-		r        *modules_reader.Reader
-		blockIdx int
-	}
-	var intrinsicIndexCache map[readerBlockKey]intrinsicRowFields
+	// Pre-build all-blocks intrinsic index per reader in one pass; each row then does
+	// O(1) lookup. buildAllIntrinsicIndices scans BlockRefs once per reader across all
+	// blocks, eliminating the previous O(B × N) cost of building per-(reader,blockIdx).
+	var intrinsicIndexCache map[*modules_reader.Reader]map[int]intrinsicRowFields
 	for i := range pending {
 		ps := &pending[i]
 		if ps.srcReader == nil {
 			continue
 		}
-		k := readerBlockKey{ps.srcReader, ps.srcBlockIdx}
-		if intrinsicIndexCache == nil {
-			intrinsicIndexCache = make(map[readerBlockKey]intrinsicRowFields)
-		}
-		if _, already := intrinsicIndexCache[k]; !already {
-			intrinsicIndexCache[k] = buildIntrinsicBlockIndex(ps.srcReader, ps.srcBlockIdx)
+		if _, already := intrinsicIndexCache[ps.srcReader]; !already {
+			if intrinsicIndexCache == nil {
+				intrinsicIndexCache = make(map[*modules_reader.Reader]map[int]intrinsicRowFields)
+			}
+			intrinsicIndexCache[ps.srcReader] = buildAllIntrinsicIndices(ps.srcReader)
 		}
 	}
 
@@ -197,7 +193,6 @@ func buildBlock(
 		case ps.srcBlock != nil:
 			bb.addRowFromBlock(ps.srcBlock, ps.srcRowIdx, rowIdx)
 			if ps.srcReader != nil {
-				k := readerBlockKey{ps.srcReader, ps.srcBlockIdx}
 				// feedIntrinsicsFromIndex is only needed for v4+ blocks that store
 				// identity columns (trace:id, span:id, etc.) exclusively in the
 				// intrinsic section. For v3 blocks that use dual storage (same fields
@@ -207,7 +202,7 @@ func buildBlock(
 				// append a second entry to the intrinsic accumulator for the same
 				// (blockIdx, rowIdx), causing GetTraceByID to return each span twice.
 				if ps.srcBlock.GetColumn(traceIDColumnName) == nil {
-					bb.feedIntrinsicsFromIndex(intrinsicIndexCache[k], ps.srcRowIdx, rowIdx)
+					bb.feedIntrinsicsFromIndex(intrinsicIndexCache[ps.srcReader][ps.srcBlockIdx], ps.srcRowIdx, rowIdx)
 				}
 			}
 		case ps.tempoSpan != nil:
@@ -1146,20 +1141,43 @@ func (b *blockBuilder) finalizeRowBookkeeping(
 	b.spanCount++
 }
 
-// intrinsicRowFields is a per-row value cache built once per source block during compaction.
-// Key: rowIdx (uint16). Value: map of intrinsic field name → typed value.
-// Built by buildIntrinsicBlockIndex; consumed by feedIntrinsicsFromIndex.
-type intrinsicRowFields = map[uint16]map[string]any
+// intrinsicFields holds the 10 known intrinsic column values for one span row.
+// Using a typed struct eliminates per-row map allocation and interface boxing
+// that occurred with the previous map[string]any inner map.
+type intrinsicFields struct {
+	traceID      []byte // nil = not present
+	spanID       []byte // nil = not present
+	parentSpanID []byte // nil = not present
+	spanName     string // "" = not present
+	svcName      string // "" = not present
+	statusMsg    string // "" = not present
+	spanKind     int64
+	spanStatus   int64
+	spanStart    uint64
+	spanDuration uint64
+	present      uint16 // bitmask for numeric fields where zero is a valid value
+}
 
-// buildIntrinsicBlockIndex builds a per-row intrinsic field cache for the given
-// (reader, srcBlockIdx) pair. Each intrinsic column is read once (O(N) over the
-// column's BlockRefs), avoiding the O(N) per-row linear scan done by IntrinsicBytesAt
-// and friends. Returns nil when r has no intrinsic section.
+const (
+	ifSpanKind     uint16 = 1 << 0
+	ifSpanStatus   uint16 = 1 << 1
+	ifSpanStart    uint16 = 1 << 2
+	ifSpanDuration uint16 = 1 << 3
+)
+
+// intrinsicRowFields stores per-row intrinsic fields for one source block,
+// keyed by row index. Map allows unbounded row indices so compaction of blocks
+// written before the per-block row cap was introduced does not panic.
+type intrinsicRowFields = map[uint16]*intrinsicFields
+
+// buildAllIntrinsicIndices builds intrinsicRowFields for every source block in r in a
+// single pass through each intrinsic column's BlockRefs. Returns a map from blockIdx to
+// intrinsicRowFields for that block. Returns nil when r has no intrinsic section.
 //
-// The result maps typed values using the same Go types that feedIntrinsicsFromIndex
-// switches on: []byte for bytes columns, uint64 for uint64 columns, string for string
-// columns, and int64 for int64 columns.
-func buildIntrinsicBlockIndex(r *modules_reader.Reader, srcBlockIdx int) intrinsicRowFields {
+// Replaces per-block buildIntrinsicBlockIndex: the previous approach scanned ALL BlockRefs
+// once per (reader, blockIdx) pair — O(B × N_cols × N_refs) total for B source blocks.
+// A single pass per reader reduces this to O(N_cols × N_refs) regardless of block count.
+func buildAllIntrinsicIndices(r *modules_reader.Reader) map[int]intrinsicRowFields {
 	if r == nil {
 		return nil
 	}
@@ -1167,46 +1185,109 @@ func buildIntrinsicBlockIndex(r *modules_reader.Reader, srcBlockIdx int) intrins
 	if len(names) == 0 {
 		return nil
 	}
-	out := make(intrinsicRowFields)
+	out := make(map[int]intrinsicRowFields)
 	for _, colName := range names {
 		col, err := r.GetIntrinsicColumn(colName)
 		if err != nil || col == nil {
 			continue
 		}
-		switch col.Format {
-		case shared.IntrinsicFormatFlat:
+		// Column name switch is hoisted outside the ref loop: string comparisons
+		// run once per column, not once per span ref. Each case iterates refs with
+		// direct struct field assignment — no per-ref string comparison.
+		switch colName {
+		case "trace:id":
 			for i, ref := range col.BlockRefs {
-				if int(ref.BlockIdx) != srcBlockIdx {
+				if i >= len(col.BytesValues) {
 					continue
 				}
-				if out[ref.RowIdx] == nil {
-					out[ref.RowIdx] = make(map[string]any, 10)
-				}
-				if len(col.Uint64Values) > i {
-					out[ref.RowIdx][colName] = col.Uint64Values[i]
-				} else if len(col.BytesValues) > i {
-					out[ref.RowIdx][colName] = col.BytesValues[i]
-				}
+				intrinsicFieldFor(out, int(ref.BlockIdx), ref.RowIdx).traceID = col.BytesValues[i]
 			}
-		case shared.IntrinsicFormatDict:
+		case spanIDColumnName:
+			for i, ref := range col.BlockRefs {
+				if i >= len(col.BytesValues) {
+					continue
+				}
+				intrinsicFieldFor(out, int(ref.BlockIdx), ref.RowIdx).spanID = col.BytesValues[i]
+			}
+		case spanParentIDColumnName:
+			for i, ref := range col.BlockRefs {
+				if i >= len(col.BytesValues) {
+					continue
+				}
+				intrinsicFieldFor(out, int(ref.BlockIdx), ref.RowIdx).parentSpanID = col.BytesValues[i]
+			}
+		case spanStartColumnName:
+			for i, ref := range col.BlockRefs {
+				if i >= len(col.Uint64Values) {
+					continue
+				}
+				f := intrinsicFieldFor(out, int(ref.BlockIdx), ref.RowIdx)
+				f.spanStart = col.Uint64Values[i]
+				f.present |= ifSpanStart
+			}
+		case spanDurationColumnName:
+			for i, ref := range col.BlockRefs {
+				if i >= len(col.Uint64Values) {
+					continue
+				}
+				f := intrinsicFieldFor(out, int(ref.BlockIdx), ref.RowIdx)
+				f.spanDuration = col.Uint64Values[i]
+				f.present |= ifSpanDuration
+			}
+		case spanKindColumnName:
 			for _, entry := range col.DictEntries {
 				for _, ref := range entry.BlockRefs {
-					if int(ref.BlockIdx) != srcBlockIdx {
-						continue
-					}
-					if out[ref.RowIdx] == nil {
-						out[ref.RowIdx] = make(map[string]any, 10)
-					}
-					if col.Type == shared.ColumnTypeInt64 || col.Type == shared.ColumnTypeRangeInt64 {
-						out[ref.RowIdx][colName] = entry.Int64Val
-					} else {
-						out[ref.RowIdx][colName] = entry.Value
-					}
+					f := intrinsicFieldFor(out, int(ref.BlockIdx), ref.RowIdx)
+					f.spanKind = entry.Int64Val
+					f.present |= ifSpanKind
+				}
+			}
+		case spanStatusColumnName:
+			for _, entry := range col.DictEntries {
+				for _, ref := range entry.BlockRefs {
+					f := intrinsicFieldFor(out, int(ref.BlockIdx), ref.RowIdx)
+					f.spanStatus = entry.Int64Val
+					f.present |= ifSpanStatus
+				}
+			}
+		case spanNameColumnName:
+			for _, entry := range col.DictEntries {
+				for _, ref := range entry.BlockRefs {
+					intrinsicFieldFor(out, int(ref.BlockIdx), ref.RowIdx).spanName = entry.Value
+				}
+			}
+		case spanStatusMsgColumnName:
+			for _, entry := range col.DictEntries {
+				for _, ref := range entry.BlockRefs {
+					intrinsicFieldFor(out, int(ref.BlockIdx), ref.RowIdx).statusMsg = entry.Value
+				}
+			}
+		case svcNameColumnName:
+			for _, entry := range col.DictEntries {
+				for _, ref := range entry.BlockRefs {
+					intrinsicFieldFor(out, int(ref.BlockIdx), ref.RowIdx).svcName = entry.Value
 				}
 			}
 		}
 	}
+	if len(out) == 0 {
+		return nil
+	}
 	return out
+}
+
+// intrinsicFieldFor returns the *intrinsicFields for (blockIdx, rowIdx), creating the
+// per-block map and the fields entry if absent.
+func intrinsicFieldFor(out map[int]intrinsicRowFields, blockIdx int, rowIdx uint16) *intrinsicFields {
+	rows := out[blockIdx]
+	if rows == nil {
+		rows = make(intrinsicRowFields)
+		out[blockIdx] = rows
+	}
+	if rows[rowIdx] == nil {
+		rows[rowIdx] = &intrinsicFields{}
+	}
+	return rows[rowIdx]
 }
 
 // feedIntrinsicsFromIndex copies intrinsic column values from a pre-built per-block
@@ -1218,144 +1299,137 @@ func (b *blockBuilder) feedIntrinsicsFromIndex(index intrinsicRowFields, srcRowI
 	if index == nil || b.intrinsicAccum == nil {
 		return
 	}
-	fields, ok := index[uint16(srcRowIdx)] //nolint:gosec // bounded by SpanCount (<= 65535)
-	if !ok {
+	if srcRowIdx < 0 || srcRowIdx > int(^uint16(0)) {
 		return
 	}
-	if v, ok := fields["trace:id"]; ok {
-		if bv, ok := v.([]byte); ok {
-			b.feedIntrinsicBytes("trace:id", shared.ColumnTypeBytes, bv, dstRowIdx)
-			b.addPresent(
-				dstRowIdx,
-				traceIDColumnName,
-				shared.ColumnTypeBytes,
-				shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: bv},
-			)
+	f := index[uint16(srcRowIdx)] //nolint:gosec
+	if f == nil {
+		return
+	}
+	if f.traceID != nil {
+		bv := f.traceID
+		b.feedIntrinsicBytes("trace:id", shared.ColumnTypeBytes, bv, dstRowIdx)
+		b.addPresent(
+			dstRowIdx,
+			traceIDColumnName,
+			shared.ColumnTypeBytes,
+			shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: bv},
+		)
+	}
+	if f.spanID != nil {
+		bv := f.spanID
+		b.updateMinMax(spanIDColumnName, shared.ColumnTypeBytes, string(bv))
+		b.feedIntrinsicBytes(spanIDColumnName, shared.ColumnTypeBytes, bv, dstRowIdx)
+		b.addPresent(
+			dstRowIdx,
+			spanIDColumnName,
+			shared.ColumnTypeBytes,
+			shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: bv},
+		)
+	}
+	if f.parentSpanID != nil {
+		bv := f.parentSpanID
+		b.updateMinMax(spanParentIDColumnName, shared.ColumnTypeBytes, string(bv))
+		b.feedIntrinsicBytes(spanParentIDColumnName, shared.ColumnTypeBytes, bv, dstRowIdx)
+		b.addPresent(
+			dstRowIdx,
+			spanParentIDColumnName,
+			shared.ColumnTypeBytes,
+			shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: bv},
+		)
+	}
+	if f.spanName != "" {
+		sv := f.spanName
+		b.updateMinMax(spanNameColumnName, shared.ColumnTypeString, sv)
+		b.feedIntrinsicString(spanNameColumnName, shared.ColumnTypeString, sv, dstRowIdx)
+		b.addPresent(
+			dstRowIdx,
+			spanNameColumnName,
+			shared.ColumnTypeString,
+			shared.AttrValue{Type: shared.ColumnTypeString, Str: sv},
+		)
+	}
+	if f.present&ifSpanKind != 0 {
+		iv := f.spanKind
+		var tmp [8]byte
+		binary.LittleEndian.PutUint64(
+			tmp[:],
+			uint64(iv), //nolint:gosec // G115: safe reinterpret int64 bits as uint64
+		)
+		b.updateMinMax(spanKindColumnName, shared.ColumnTypeInt64, string(tmp[:]))
+		b.feedIntrinsicInt64(spanKindColumnName, shared.ColumnTypeInt64, iv, dstRowIdx)
+		b.addPresent(
+			dstRowIdx,
+			spanKindColumnName,
+			shared.ColumnTypeInt64,
+			shared.AttrValue{Type: shared.ColumnTypeInt64, Int: iv},
+		)
+	}
+	if f.present&ifSpanStart != 0 {
+		uv := f.spanStart
+		var tmp [8]byte
+		binary.LittleEndian.PutUint64(tmp[:], uv)
+		b.updateMinMax(spanStartColumnName, shared.ColumnTypeUint64, string(tmp[:]))
+		b.feedIntrinsicUint64(spanStartColumnName, shared.ColumnTypeUint64, uv, dstRowIdx)
+		b.addPresent(
+			dstRowIdx,
+			spanStartColumnName,
+			shared.ColumnTypeUint64,
+			shared.AttrValue{Type: shared.ColumnTypeUint64, Uint: uv},
+		)
+		if uv > 0 {
+			b.colSketches.add(sketchTimestampColName, encodeSecondBucket(uv))
 		}
 	}
-	if v, ok := fields[spanIDColumnName]; ok {
-		if bv, ok := v.([]byte); ok {
-			b.updateMinMax(spanIDColumnName, shared.ColumnTypeBytes, string(bv))
-			b.feedIntrinsicBytes(spanIDColumnName, shared.ColumnTypeBytes, bv, dstRowIdx)
-			b.addPresent(
-				dstRowIdx,
-				spanIDColumnName,
-				shared.ColumnTypeBytes,
-				shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: bv},
-			)
-		}
+	if f.present&ifSpanDuration != 0 {
+		uv := f.spanDuration
+		var tmp [8]byte
+		binary.LittleEndian.PutUint64(tmp[:], uv)
+		b.updateMinMax(spanDurationColumnName, shared.ColumnTypeUint64, string(tmp[:]))
+		b.feedIntrinsicUint64(spanDurationColumnName, shared.ColumnTypeUint64, uv, dstRowIdx)
+		b.addPresent(
+			dstRowIdx,
+			spanDurationColumnName,
+			shared.ColumnTypeUint64,
+			shared.AttrValue{Type: shared.ColumnTypeUint64, Uint: uv},
+		)
 	}
-	if v, ok := fields[spanParentIDColumnName]; ok {
-		if bv, ok := v.([]byte); ok {
-			b.updateMinMax(spanParentIDColumnName, shared.ColumnTypeBytes, string(bv))
-			b.feedIntrinsicBytes(spanParentIDColumnName, shared.ColumnTypeBytes, bv, dstRowIdx)
-			b.addPresent(
-				dstRowIdx,
-				spanParentIDColumnName,
-				shared.ColumnTypeBytes,
-				shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: bv},
-			)
-		}
+	if f.present&ifSpanStatus != 0 {
+		iv := f.spanStatus
+		var tmp [8]byte
+		binary.LittleEndian.PutUint64(
+			tmp[:],
+			uint64(iv), //nolint:gosec // G115: safe reinterpret int64 bits as uint64
+		)
+		b.updateMinMax(spanStatusColumnName, shared.ColumnTypeInt64, string(tmp[:]))
+		b.feedIntrinsicInt64(spanStatusColumnName, shared.ColumnTypeInt64, iv, dstRowIdx)
+		b.addPresent(
+			dstRowIdx,
+			spanStatusColumnName,
+			shared.ColumnTypeInt64,
+			shared.AttrValue{Type: shared.ColumnTypeInt64, Int: iv},
+		)
 	}
-	if v, ok := fields[spanNameColumnName]; ok {
-		if sv, ok := v.(string); ok && sv != "" {
-			b.updateMinMax(spanNameColumnName, shared.ColumnTypeString, sv)
-			b.feedIntrinsicString(spanNameColumnName, shared.ColumnTypeString, sv, dstRowIdx)
-			b.addPresent(
-				dstRowIdx,
-				spanNameColumnName,
-				shared.ColumnTypeString,
-				shared.AttrValue{Type: shared.ColumnTypeString, Str: sv},
-			)
-		}
+	if f.statusMsg != "" {
+		sv := f.statusMsg
+		b.feedIntrinsicString(spanStatusMsgColumnName, shared.ColumnTypeString, sv, dstRowIdx)
+		b.addPresent(
+			dstRowIdx,
+			spanStatusMsgColumnName,
+			shared.ColumnTypeString,
+			shared.AttrValue{Type: shared.ColumnTypeString, Str: sv},
+		)
 	}
-	if v, ok := fields[spanKindColumnName]; ok {
-		if iv, ok := v.(int64); ok {
-			var tmp [8]byte
-			binary.LittleEndian.PutUint64(
-				tmp[:],
-				uint64(iv), //nolint:gosec // G115: safe reinterpret int64 bits as uint64
-			)
-			b.updateMinMax(spanKindColumnName, shared.ColumnTypeInt64, string(tmp[:]))
-			b.feedIntrinsicInt64(spanKindColumnName, shared.ColumnTypeInt64, iv, dstRowIdx)
-			b.addPresent(
-				dstRowIdx,
-				spanKindColumnName,
-				shared.ColumnTypeInt64,
-				shared.AttrValue{Type: shared.ColumnTypeInt64, Int: iv},
-			)
-		}
-	}
-	if v, ok := fields[spanStartColumnName]; ok {
-		if uv, ok := v.(uint64); ok {
-			var tmp [8]byte
-			binary.LittleEndian.PutUint64(tmp[:], uv)
-			b.updateMinMax(spanStartColumnName, shared.ColumnTypeUint64, string(tmp[:]))
-			b.feedIntrinsicUint64(spanStartColumnName, shared.ColumnTypeUint64, uv, dstRowIdx)
-			b.addPresent(
-				dstRowIdx,
-				spanStartColumnName,
-				shared.ColumnTypeUint64,
-				shared.AttrValue{Type: shared.ColumnTypeUint64, Uint: uv},
-			)
-			if uv > 0 {
-				b.colSketches.add(sketchTimestampColName, encodeSecondBucket(uv))
-			}
-		}
-	}
-	if v, ok := fields[spanDurationColumnName]; ok {
-		if uv, ok := v.(uint64); ok {
-			var tmp [8]byte
-			binary.LittleEndian.PutUint64(tmp[:], uv)
-			b.updateMinMax(spanDurationColumnName, shared.ColumnTypeUint64, string(tmp[:]))
-			b.feedIntrinsicUint64(spanDurationColumnName, shared.ColumnTypeUint64, uv, dstRowIdx)
-			b.addPresent(
-				dstRowIdx,
-				spanDurationColumnName,
-				shared.ColumnTypeUint64,
-				shared.AttrValue{Type: shared.ColumnTypeUint64, Uint: uv},
-			)
-		}
-	}
-	if v, ok := fields[spanStatusColumnName]; ok {
-		if iv, ok := v.(int64); ok {
-			var tmp [8]byte
-			binary.LittleEndian.PutUint64(
-				tmp[:],
-				uint64(iv), //nolint:gosec // G115: safe reinterpret int64 bits as uint64
-			)
-			b.updateMinMax(spanStatusColumnName, shared.ColumnTypeInt64, string(tmp[:]))
-			b.feedIntrinsicInt64(spanStatusColumnName, shared.ColumnTypeInt64, iv, dstRowIdx)
-			b.addPresent(
-				dstRowIdx,
-				spanStatusColumnName,
-				shared.ColumnTypeInt64,
-				shared.AttrValue{Type: shared.ColumnTypeInt64, Int: iv},
-			)
-		}
-	}
-	if v, ok := fields[spanStatusMsgColumnName]; ok {
-		if sv, ok := v.(string); ok && sv != "" {
-			b.feedIntrinsicString(spanStatusMsgColumnName, shared.ColumnTypeString, sv, dstRowIdx)
-			b.addPresent(
-				dstRowIdx,
-				spanStatusMsgColumnName,
-				shared.ColumnTypeString,
-				shared.AttrValue{Type: shared.ColumnTypeString, Str: sv},
-			)
-		}
-	}
-	if v, ok := fields[svcNameColumnName]; ok {
-		if sv, ok := v.(string); ok && sv != "" {
-			b.updateMinMax(svcNameColumnName, shared.ColumnTypeRangeString, sv)
-			b.feedIntrinsicString(svcNameColumnName, shared.ColumnTypeString, sv, dstRowIdx)
-			b.addPresent(
-				dstRowIdx,
-				svcNameColumnName,
-				shared.ColumnTypeString,
-				shared.AttrValue{Type: shared.ColumnTypeString, Str: sv},
-			)
-		}
+	if f.svcName != "" {
+		sv := f.svcName
+		b.updateMinMax(svcNameColumnName, shared.ColumnTypeRangeString, sv)
+		b.feedIntrinsicString(svcNameColumnName, shared.ColumnTypeString, sv, dstRowIdx)
+		b.addPresent(
+			dstRowIdx,
+			svcNameColumnName,
+			shared.ColumnTypeString,
+			shared.AttrValue{Type: shared.ColumnTypeString, Str: sv},
+		)
 	}
 }
 
@@ -1401,7 +1475,18 @@ func (b *blockBuilder) updateMinMax(name string, typ shared.ColumnType, key stri
 	}
 	// Update sketch accumulators for every observed value (not just min/max).
 	// SPEC-SK-16: same key encoding as at query time.
-	b.colSketches.add(name, key)
+	// Inlined from blockSketchSet.add to reuse the colSketches map lookup here
+	// rather than doing a second string map lookup inside add(). fp is computed
+	// once and shared across HLL, TopK, and the bloom filter.
+	cs, ok := b.colSketches[name]
+	if !ok {
+		cs = getColSketch()
+		b.colSketches[name] = cs
+	}
+	fp := sketch.HashForFuse(key)
+	cs.hll.AddHash(fp)
+	cs.topk.AddFP(fp)
+	cs.bloom.Add(fp)
 }
 
 // rangeKeyLess returns true when encoded key a is strictly less than encoded key b,
