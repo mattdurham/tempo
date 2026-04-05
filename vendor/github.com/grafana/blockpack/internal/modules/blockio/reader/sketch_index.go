@@ -1,32 +1,36 @@
 // Package reader provides block reading and index parsing for blockpack files.
-// NOTE: Sketch index parsing for column-major HLL + CMS + BinaryFuse8 + TopK data.
-// Files without the SKTC magic at the current parse position degrade gracefully:
+// NOTE: Sketch index parsing for column-major HLL + SketchBloom + TopK data.
+// Three magic values are recognized:
+//   - 0x534B5445 ("SKTE") — bloom only, no CMS (current writer)
+//   - 0x534B5444 ("SKTD") — bloom + CMS — skip CMS bytes, read bloom
+//   - 0x534B5443 ("SKTC") — legacy fuse-based format; degrades gracefully (no pruning)
+//
+// Files without any recognized magic degrade gracefully:
 // parseSketchIndexSection returns (nil, 0, nil) and ColumnSketch returns nil.
 //
-// CMS and fuse filters use lazy deserialization: raw byte slices are retained at
-// parse time and deserialized on first query access. This keeps ReaderOpen fast
-// and avoids allocating memory for columns that are never queried.
+// Bloom data is stored as zero-copy slices into the retained metadata buffer (no allocation).
 package reader
 
 import (
 	"encoding/binary"
 	"fmt"
-	"math"
-	"sync"
 
+	"github.com/grafana/blockpack/internal/modules/blockio/shared"
 	"github.com/grafana/blockpack/internal/modules/queryplanner"
 	"github.com/grafana/blockpack/internal/modules/sketch"
 )
 
 const (
-	sketchSectionMagic = uint32(0x534B5443) // "SKTC" — must match writer/sketch_index.go
+	sketchSectionMagicNoCMS  = uint32(0x534B5445) // "SKTE" — bloom only, no CMS (current)
+	sketchSectionMagicBloom  = uint32(0x534B5444) // "SKTD" — bloom + CMS (skip CMS bytes)
+	sketchSectionMagicLegacy = uint32(0x534B5443) // "SKTC" — fuse variant (old, read-only)
 )
 
 // Ensure columnSketchData satisfies queryplanner.ColumnSketch at compile time.
 var _ queryplanner.ColumnSketch = (*columnSketchData)(nil)
 
 // columnSketchData holds parsed column-major sketch data for one column across all blocks.
-// CMS and fuse are lazily deserialized on first access to avoid paying the cost at file open.
+// Bloom data is fixed-size and copied directly at parse time.
 type columnSketchData struct {
 	presence   []uint64   // bitset: 1 bit per block
 	distinct   []uint32   // one per block (0 for absent)
@@ -34,19 +38,12 @@ type columnSketchData struct {
 	topkCount  [][]uint16 // [presentIdx][entries] counts
 	presentMap []int      // presentMap[i] = blockIdx of the i-th present block
 
-	// Lazy CMS: raw byte slices stored at parse time, deserialized on first CMSEstimate call.
-	cmsRaw [][]byte                 // [presentIdx] raw CMS data (nil after inflate)
-	cms    []*sketch.CountMinSketch // [presentIdx] populated lazily
+	// Bloom filters: raw byte slices into the metadata buffer, one per present block.
+	// Zero-copy: slices reference the decompressed metadata buffer retained by the Reader.
+	// Nil/empty for blocks parsed from legacy fuse-format files (FuseContains returns true).
+	bloom [][]byte // [presentIdx] each slice is exactly sketch.SketchBloomBytes bytes
 
-	// Lazy fuse: raw byte slices stored at parse time, deserialized on first FuseContains call.
-	fuseRaw     [][]byte              // [presentIdx] raw fuse data (nil after inflate)
-	fuseRawLens []int                 // [presentIdx] original fuse data byte lengths (preserved after inflate)
-	fuse        []*sketch.BinaryFuse8 // [presentIdx] populated lazily
-	numBlocks   int
-
-	cmsOnce sync.Once
-
-	fuseOnce sync.Once
+	numBlocks int
 }
 
 // sketchIndex holds all column sketch data for the file.
@@ -60,38 +57,6 @@ func (cd *columnSketchData) Presence() []uint64 { return cd.presence }
 
 // Distinct returns pre-computed HLL cardinality per block (0 for absent blocks).
 func (cd *columnSketchData) Distinct() []uint32 { return cd.distinct }
-
-// inflateCMS deserializes all CMS instances from raw bytes (called once).
-func (cd *columnSketchData) inflateCMS() {
-	cd.cms = make([]*sketch.CountMinSketch, len(cd.cmsRaw))
-	for pi, raw := range cd.cmsRaw {
-		if raw == nil {
-			continue
-		}
-		cms := sketch.NewCountMinSketch()
-		if err := cms.Unmarshal(raw); err == nil {
-			cd.cms[pi] = cms
-		}
-	}
-	cd.cmsRaw = nil // release raw bytes
-}
-
-// CMSEstimate returns CMS frequency estimate for val per block (0 for absent).
-// For present blocks where CMS deserialization failed, returns math.MaxUint32 as a
-// conservative "possibly present" signal to avoid false-negative pruning.
-func (cd *columnSketchData) CMSEstimate(val string) []uint32 {
-	cd.cmsOnce.Do(cd.inflateCMS)
-	out := make([]uint32, cd.numBlocks)
-	for pi, blockIdx := range cd.presentMap {
-		if pi < len(cd.cms) && cd.cms[pi] != nil {
-			out[blockIdx] = uint32(cd.cms[pi].Estimate(val)) //nolint:gosec // safe: uint16 fits in uint32
-		} else if pi < len(cd.cms) {
-			// Deserialization failed — conservative: treat as possibly present.
-			out[blockIdx] = math.MaxUint32
-		}
-	}
-	return out
-}
 
 // TopKMatch returns the TopK count for valFP per block (0 if not in top-K or absent).
 func (cd *columnSketchData) TopKMatch(valFP uint64) []uint16 {
@@ -107,31 +72,17 @@ func (cd *columnSketchData) TopKMatch(valFP uint64) []uint16 {
 	return out
 }
 
-// inflateFuse deserializes all fuse filters from raw bytes (called once).
-func (cd *columnSketchData) inflateFuse() {
-	cd.fuse = make([]*sketch.BinaryFuse8, len(cd.fuseRaw))
-	for pi, raw := range cd.fuseRaw {
-		if len(raw) == 0 {
-			continue
-		}
-		f := &sketch.BinaryFuse8{}
-		if err := f.UnmarshalBinary(raw); err == nil {
-			cd.fuse[pi] = f
-		}
-	}
-	cd.fuseRaw = nil // release raw bytes
-}
-
-// FuseContains returns true per block if the fuse filter indicates valHash may be present.
-// Returns true (conservative) for blocks without a fuse filter.
+// FuseContains returns true per block if the bloom filter indicates valHash may be present.
+// Returns true (conservative) for present blocks that have no bloom data (legacy fuse files).
+// Queries bloom data directly from the raw byte slices — no allocation.
+// Implements queryplanner.ColumnSketch; name kept for interface compatibility.
 func (cd *columnSketchData) FuseContains(valHash uint64) []bool {
-	cd.fuseOnce.Do(cd.inflateFuse)
 	out := make([]bool, cd.numBlocks)
 	for pi, blockIdx := range cd.presentMap {
-		if pi >= len(cd.fuse) || cd.fuse[pi] == nil {
-			out[blockIdx] = true // conservative
+		if pi >= len(cd.bloom) || cd.bloom[pi] == nil {
+			out[blockIdx] = true // conservative: no bloom data for this block
 		} else {
-			out[blockIdx] = cd.fuse[pi].Contains(valHash)
+			out[blockIdx] = sketch.BloomContains(cd.bloom[pi], valHash)
 		}
 	}
 	return out
@@ -139,22 +90,42 @@ func (cd *columnSketchData) FuseContains(valHash uint64) []bool {
 
 // parseSketchIndexSection parses the sketch index section from data (column-major format).
 // Returns (*sketchIndex, bytesConsumed, nil) on success.
-// Returns (nil, 0, nil) when data does not start with the SKTC magic (graceful degradation).
+// Returns (nil, 0, nil) when data does not start with a recognized magic (graceful degradation).
 // Returns (nil, 0, error) on parse failure after the magic is confirmed.
 //
-// CMS and fuse data are stored as raw byte slices and deserialized lazily on first access.
+// Three magic values are handled:
+//   - 0x534B5445 ("SKTE"): bloom only, no CMS (current) — bloom data parsed per block.
+//   - 0x534B5444 ("SKTD"): bloom + CMS — CMS bytes skipped, bloom parsed per block.
+//   - 0x534B5443 ("SKTC"): legacy fuse-based format — fuse bytes skipped; bloom left nil
+//     so FuseContains returns true (conservative, no pruning for old blocks).
 func parseSketchIndexSection(data []byte) (*sketchIndex, int, error) {
 	if len(data) < 12 {
 		return nil, 0, nil // too short for magic+num_blocks+num_columns
 	}
 	magic := binary.LittleEndian.Uint32(data[0:])
-	if magic != sketchSectionMagic {
+	isNoCMS := magic == sketchSectionMagicNoCMS
+	isBloom := magic == sketchSectionMagicBloom
+	isLegacy := magic == sketchSectionMagicLegacy
+	if !isNoCMS && !isBloom && !isLegacy {
 		return nil, 0, nil // not a sketch section — old file format, degrade gracefully
 	}
 
-	numBlocks := int(binary.LittleEndian.Uint32(data[4:]))
-	numColumns := int(binary.LittleEndian.Uint32(data[8:]))
+	// hasCMS is true for old formats (SKTD, SKTC) that contain CMS bytes in the stream.
+	hasCMS := isBloom || isLegacy
+
+	rawBlocks := binary.LittleEndian.Uint32(data[4:])
+	rawColumns := binary.LittleEndian.Uint32(data[8:])
 	pos := 12
+
+	// Validate as uint32 before converting to int to avoid wrap-around on 32-bit platforms.
+	if rawBlocks > uint32(shared.MaxBlocks) || rawColumns > uint32(shared.MaxColumns) {
+		return nil, 0, fmt.Errorf(
+			"sketch index: numBlocks %d or numColumns %d exceeds limits (%d/%d)",
+			rawBlocks, rawColumns, shared.MaxBlocks, shared.MaxColumns,
+		)
+	}
+	numBlocks := int(rawBlocks)
+	numColumns := int(rawColumns)
 
 	presenceBytes := (numBlocks + 7) / 8
 
@@ -195,12 +166,18 @@ func parseSketchIndexSection(data []byte) (*sketchIndex, int, error) {
 			return nil, 0, err
 		}
 
-		pos, err = parseColumnCMS(data, pos, name, presentCount, cd)
-		if err != nil {
-			return nil, 0, err
+		if hasCMS {
+			pos, err = skipColumnCMS(data, pos, name, presentCount)
+			if err != nil {
+				return nil, 0, err
+			}
 		}
 
-		pos, err = parseColumnFuse(data, pos, name, presentCount, cd)
+		if isNoCMS || isBloom {
+			pos, err = parseColumnBloom(data, pos, name, presentCount, cd)
+		} else {
+			pos, err = skipColumnFuse(data, pos, name, presentCount)
+		}
 		if err != nil {
 			return nil, 0, err
 		}
@@ -307,21 +284,18 @@ func parseColumnTopK(data []byte, pos int, name string, presentCount int, cd *co
 	return pos, nil
 }
 
-// parseColumnCMS parses cms_depth, cms_width, and per-present-block raw CMS byte slices.
-func parseColumnCMS(data []byte, pos int, name string, presentCount int, cd *columnSketchData) (int, error) {
+// skipColumnCMS advances pos past CMS bytes without any allocation.
+// Used when reading old "SKTD" or "SKTC" files that contain CMS data.
+// Size math is done in uint64 to prevent int overflow on corrupt inputs.
+func skipColumnCMS(data []byte, pos int, name string, presentCount int) (int, error) {
 	// cms_depth[1]
 	if pos >= len(data) {
 		return pos, fmt.Errorf("sketch_index: col %q: missing cms_depth", name)
 	}
 	cmsDepth := int(data[pos])
 	pos++
-	if cmsDepth != sketch.CMSDepth {
-		return pos, fmt.Errorf(
-			"sketch_index: col %q: unexpected cms_depth=%d, want %d",
-			name,
-			cmsDepth,
-			sketch.CMSDepth,
-		)
+	if cmsDepth == 0 {
+		return pos, fmt.Errorf("sketch_index: col %q: invalid cms_depth=0", name)
 	}
 
 	// cms_width[2 LE]
@@ -330,56 +304,62 @@ func parseColumnCMS(data []byte, pos int, name string, presentCount int, cd *col
 	}
 	cmsWidth := int(binary.LittleEndian.Uint16(data[pos:]))
 	pos += 2
-	if cmsWidth != sketch.CMSWidth {
-		return pos, fmt.Errorf(
-			"sketch_index: col %q: unexpected cms_width=%d, want %d",
-			name,
-			cmsWidth,
-			sketch.CMSWidth,
-		)
+	if cmsWidth == 0 {
+		return pos, fmt.Errorf("sketch_index: col %q: invalid cms_width=0", name)
 	}
 
-	// Per present block: cms_counters[depth × width × 2 LE].
-	// Lazy: store raw byte slices, defer Unmarshal to first CMSEstimate call.
-	cmsMarshalSize := sketch.CMSDepth * sketch.CMSWidth * 2
-	cd.cmsRaw = make([][]byte, presentCount)
+	// Use uint64 to avoid int overflow on corrupt/large depth*width*presentCount values.
+	//nolint:gosec // G115: conversions to uint64 are intentional to prevent overflow
+	totalCMS64 := uint64(presentCount) * uint64(cmsDepth) * uint64(cmsWidth) * 2
+	remaining := uint64(len(data) - pos) //nolint:gosec // G115: len-pos is non-negative; validated above
+	if totalCMS64 > remaining {
+		return pos, fmt.Errorf("sketch_index: col %q: too short for CMS data", name)
+	}
+	pos += int(totalCMS64) //nolint:gosec // safe: validated against remaining data length above
+	return pos, nil
+}
+
+// parseColumnBloom parses bloom_size[2 LE] and per-present-block bloom_data[bloom_size].
+// Bloom data is stored as zero-copy slices into the existing metadata buffer — no allocation.
+// The Reader retains the full decompressed metadata buffer, so these slices remain valid
+// for the lifetime of the Reader.
+func parseColumnBloom(data []byte, pos int, name string, presentCount int, cd *columnSketchData) (int, error) {
+	// bloom_size[2 LE]: the fixed byte size for all blocks in this column.
+	if pos+2 > len(data) {
+		return pos, fmt.Errorf("sketch_index: col %q: too short for bloom_size", name)
+	}
+	bloomSize := int(binary.LittleEndian.Uint16(data[pos:]))
+	pos += 2
+	if bloomSize == 0 {
+		return pos, fmt.Errorf("sketch_index: col %q: invalid bloom_size=0", name)
+	}
+
+	cd.bloom = make([][]byte, presentCount)
 	for pi := range presentCount {
-		if pos+cmsMarshalSize > len(data) {
-			return pos, fmt.Errorf("sketch_index: col %q: present block %d: too short for CMS", name, pi)
+		if pos+bloomSize > len(data) {
+			return pos, fmt.Errorf("sketch_index: col %q: present block %d: too short for bloom_data", name, pi)
 		}
-		// Copy to avoid pinning the entire metadata buffer until lazy inflation.
-		rawCopy := make([]byte, cmsMarshalSize)
-		copy(rawCopy, data[pos:pos+cmsMarshalSize])
-		cd.cmsRaw[pi] = rawCopy
-		pos += cmsMarshalSize
+		cd.bloom[pi] = data[pos : pos+bloomSize] // zero-copy slice into metadata buffer
+		pos += bloomSize
 	}
 	return pos, nil
 }
 
-// parseColumnFuse parses per-present-block fuse_len and raw fuse data byte slices.
-func parseColumnFuse(data []byte, pos int, name string, presentCount int, cd *columnSketchData) (int, error) {
-	// Per present block: fuse_len[4 LE] + fuse_data[fuse_len].
-	// Lazy: store raw byte slices, defer UnmarshalBinary to first FuseContains call.
-	// fuseRawLens records the original byte length so estimateSketchSectionSize can
-	// report accurate sizes without calling MarshalBinary after raw bytes are freed.
-	cd.fuseRaw = make([][]byte, presentCount)
-	cd.fuseRawLens = make([]int, presentCount)
+// skipColumnFuse advances pos past the legacy fuse section without storing data.
+// Used when reading old "SKTC" files; bloom is left nil so FuseContains returns true.
+// fuseLen is validated as uint32 against remaining data to prevent int overflow.
+func skipColumnFuse(data []byte, pos int, name string, presentCount int) (int, error) {
 	for pi := range presentCount {
 		if pos+4 > len(data) {
 			return pos, fmt.Errorf("sketch_index: col %q: present block %d: too short for fuse_len", name, pi)
 		}
-		fuseLen := int(binary.LittleEndian.Uint32(data[pos:]))
+		fuseLen := binary.LittleEndian.Uint32(data[pos:])
 		pos += 4
-		cd.fuseRawLens[pi] = fuseLen
 		if fuseLen > 0 {
-			if pos+fuseLen > len(data) {
+			if uint64(fuseLen) > uint64(len(data)-pos) { //nolint:gosec // G115: intentional promotion to uint64
 				return pos, fmt.Errorf("sketch_index: col %q: present block %d: fuse data too short", name, pi)
 			}
-			// Copy to avoid pinning the entire metadata buffer until lazy inflation.
-			fuseCopy := make([]byte, fuseLen)
-			copy(fuseCopy, data[pos:pos+fuseLen])
-			cd.fuseRaw[pi] = fuseCopy
-			pos += fuseLen
+			pos += int(fuseLen) //nolint:gosec // safe: validated against remaining data length above
 		}
 	}
 	return pos, nil

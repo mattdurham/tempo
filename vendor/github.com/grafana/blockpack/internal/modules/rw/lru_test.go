@@ -243,6 +243,80 @@ func TestSharedLRUProvider_SizeDelegates(t *testing.T) {
 	assert.Equal(t, int64(42), sz)
 }
 
+// TestSharedLRUCache_KeyUsesFullIntLength verifies that two Put calls with the same offset
+// but different lengths produce independent cache entries — length is a discriminating key
+// component. This is a regression test for BUG-15 (int32 truncation of length field).
+// RW-T-09.
+//
+// This test only checks that the length field participates in the cache key; it does not
+// exercise the int32-truncation behavior of BUG-15, which only manifests for lengths larger
+// than math.MaxInt32 (values that cannot be constructed in a practical unit test). Any two
+// unequal small lengths (100 and 200 bytes here) are sufficient to assert that distinct
+// lengths at the same offset yield distinct cached entries.
+func TestSharedLRUCache_KeyUsesFullIntLength(t *testing.T) {
+	c := rw.NewSharedLRUCache(1024)
+
+	data100 := make([]byte, 100)
+	data200 := make([]byte, 200)
+	for i := range data100 {
+		data100[i] = 0xAA
+	}
+	for i := range data200 {
+		data200[i] = 0xBB
+	}
+
+	c.Put("f", 0, append([]byte(nil), data100...), rw.DataTypeBlock)
+	c.Put("f", 0, append([]byte(nil), data200...), rw.DataTypeBlock)
+
+	dst100 := make([]byte, 100)
+	dst200 := make([]byte, 200)
+
+	require.True(t, c.Get("f", 0, dst100), "100-byte entry must hit")
+	require.True(t, c.Get("f", 0, dst200), "200-byte entry must hit")
+
+	assert.Equal(t, data100, dst100, "100-byte Get must return 100-byte data")
+	assert.Equal(t, data200, dst200, "200-byte Get must return 200-byte data")
+}
+
+// TestSharedLRUCache_KeyUsesFullIntLength_LargeValues verifies that cacheKey correctly
+// distinguishes lengths that share the same lower 16 bits but differ in higher bits.
+// RW-T-09 (extended).
+func TestSharedLRUCache_KeyUsesFullIntLength_LargeValues(t *testing.T) {
+	// Verify that the cache key uses the full length value, not just lower bits.
+	// We construct two slices whose lengths share the same lower 16 bits but differ
+	// in higher bits, and ensure they are treated as distinct entries in the cache.
+	//
+	// This complements TestSharedLRUCache_KeyUsesFullIntLength by exercising a
+	// moderately large length, while still being small enough for a unit test.
+	// The important property is that the two lengths are different, even though
+	// their low-order bits coincide, so any truncation of the length would cause
+	// them to collide.
+	const base = 1<<16 + 100 // 65636: same lower 16 bits as 100, but different full value
+	data1 := make([]byte, 100)
+	data2 := make([]byte, base)
+	for i := range data1 {
+		data1[i] = 0xCC
+	}
+	for i := range data2 {
+		data2[i] = 0xDD
+	}
+
+	// Cache capacity must fit both entries.
+	c := rw.NewSharedLRUCache(int64(len(data1) + len(data2) + 1024))
+
+	c.Put("g", 0, append([]byte(nil), data1...), rw.DataTypeBlock)
+	c.Put("g", 0, append([]byte(nil), data2...), rw.DataTypeBlock)
+
+	dst1 := make([]byte, 100)
+	dst2 := make([]byte, base)
+
+	require.True(t, c.Get("g", 0, dst1), "100-byte entry must hit")
+	require.True(t, c.Get("g", 0, dst2), "large entry must hit")
+
+	assert.Equal(t, data1, dst1, "100-byte Get must return original data")
+	assert.Equal(t, data2, dst2, "large Get must return original data")
+}
+
 // TestSharedLRUProvider_ShortReadBecomesErrUnexpectedEOF verifies that a short read
 // from the underlying provider (n < len(p), err == nil) is escalated to
 // io.ErrUnexpectedEOF and is NOT cached (a subsequent read must still go to underlying).

@@ -531,7 +531,7 @@ func TestSelectColumns_NoExtraColumns(t *testing.T) {
 	r, err := blockpack.NewReaderFromProvider(&smokeReaderProvider{data: data})
 	require.NoError(t, err)
 
-	results, err := blockpack.QueryTraceQL(r, `{ span.http.method = "GET" }`, blockpack.QueryOptions{
+	results, _, err := blockpack.QueryTraceQL(r, `{ span.http.method = "GET" }`, blockpack.QueryOptions{
 		SelectColumns: []string{"span.http.method", "resource.service.name"},
 	})
 	require.NoError(t, err)
@@ -555,7 +555,7 @@ func TestSelectColumns_NoMissingColumns(t *testing.T) {
 	r, err := blockpack.NewReaderFromProvider(&smokeReaderProvider{data: data})
 	require.NoError(t, err)
 
-	results, err := blockpack.QueryTraceQL(r, `{ span.http.method = "GET" }`, blockpack.QueryOptions{
+	results, _, err := blockpack.QueryTraceQL(r, `{ span.http.method = "GET" }`, blockpack.QueryOptions{
 		SelectColumns: []string{"span.http.method", "resource.service.name"},
 	})
 	require.NoError(t, err)
@@ -578,7 +578,7 @@ func TestSelectColumns_NilReturnsAll(t *testing.T) {
 	r, err := blockpack.NewReaderFromProvider(&smokeReaderProvider{data: data})
 	require.NoError(t, err)
 
-	results, err := blockpack.QueryTraceQL(r, `{ span.http.method = "GET" }`, blockpack.QueryOptions{})
+	results, _, err := blockpack.QueryTraceQL(r, `{ span.http.method = "GET" }`, blockpack.QueryOptions{})
 	require.NoError(t, err)
 	require.NotEmpty(t, results)
 

@@ -1,7 +1,6 @@
 package sketch_test
 
 import (
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -28,11 +27,11 @@ func TestTopK_AddAndEntries(t *testing.T) {
 
 	entries := tk.Entries()
 	require.Len(t, entries, 3)
-	assert.Equal(t, "c", entries[0].Key)
+	assert.Equal(t, sketch.HashForFuse("c"), entries[0].FP)
 	assert.Equal(t, uint32(3), entries[0].Count)
-	assert.Equal(t, "b", entries[1].Key)
+	assert.Equal(t, sketch.HashForFuse("b"), entries[1].FP)
 	assert.Equal(t, uint32(2), entries[1].Count)
-	assert.Equal(t, "a", entries[2].Key)
+	assert.Equal(t, sketch.HashForFuse("a"), entries[2].FP)
 	assert.Equal(t, uint32(1), entries[2].Count)
 }
 
@@ -47,16 +46,6 @@ func TestTopK_ExceedsK(t *testing.T) {
 	}
 	entries := tk.Entries()
 	assert.LessOrEqual(t, len(entries), sketch.TopKSize, "must return at most TopKSize entries")
-}
-
-// SK-T-20: TestTopK_TruncatesLongKeys — keys longer than TopKMaxKeyLen are truncated at write.
-func TestTopK_TruncatesLongKeys(t *testing.T) {
-	tk := sketch.NewTopK()
-	longKey := strings.Repeat("x", sketch.TopKMaxKeyLen+50)
-	tk.Add(longKey)
-	entries := tk.Entries()
-	require.Len(t, entries, 1)
-	assert.Equal(t, sketch.TopKMaxKeyLen, len(entries[0].Key), "key must be truncated to TopKMaxKeyLen")
 }
 
 // SK-T-21: TestTopK_MarshalRoundTrip — marshal/unmarshal preserves all entries.
@@ -74,11 +63,11 @@ func TestTopK_MarshalRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, len(data), consumed, "all bytes should be consumed")
 	require.Len(t, entries, 3)
-	assert.Equal(t, "gamma", entries[0].Key)
+	assert.Equal(t, sketch.HashForFuse("gamma"), entries[0].FP)
 	assert.Equal(t, uint32(3), entries[0].Count)
-	assert.Equal(t, "alpha", entries[1].Key)
+	assert.Equal(t, sketch.HashForFuse("alpha"), entries[1].FP)
 	assert.Equal(t, uint32(2), entries[1].Count)
-	assert.Equal(t, "beta", entries[2].Key)
+	assert.Equal(t, sketch.HashForFuse("beta"), entries[2].FP)
 	assert.Equal(t, uint32(1), entries[2].Count)
 }
 

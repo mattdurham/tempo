@@ -947,7 +947,7 @@ func TestAddColumn_LateColumnCapacity(t *testing.T) {
 	require.NoError(t, err)
 
 	// Build blockSize-1 spans WITHOUT "late_attr".
-	earlySpans := make([]*tracev1.Span, blockSize-1)
+	earlySpans := make([]*tracev1.Span, blockSize-1) //nolint:prealloc
 	for i := range blockSize - 1 {
 		tid := make([]byte, 16)
 		tid[0] = byte(i)

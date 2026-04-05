@@ -81,3 +81,35 @@ section as before.
 `internal/modules/blockio/writer/writer_block.go:addRowFromTempoProto`,
 `internal/modules/blockio/writer/writer_block.go:addRowFromBlock`,
 `internal/modules/blockio/writer/writer_block.go:feedIntrinsicsFromIndex`
+
+---
+
+## NOTE-003: CMS Removal — SKTE Writer Format, No CMS Data Written
+*Added: 2026-04-02*
+
+**Decision:** Remove CMS accumulation and marshalling from the sketch writer. New files use
+SKTE format (magic `0x534B5445`). The `colSketch` struct holds HLL, TopK, and SketchBloom;
+`blockSketchSet.add()` feeds all three incrementally — no key accumulation needed.
+
+**Rationale:**
+- CMS added ~70% to per-file sketch section size. At production scale (multi-GB blockpack
+  files) the sketch index alone exceeded heap limits during compaction, causing OOM.
+- TopK provides approximate (Space-Saving upper-bound) frequency counts for hot values.
+  For values outside the top-K, the planner makes a conservative pass — no pruning — rather
+  than relying on CMS frequency estimates.
+- SketchBloom (fixed 2 KiB, k=7, incremental Add()) replaces BinaryFuse8, eliminating the
+  large keys []uint64 accumulation buffer that required all keys before construction.
+
+**Wire format:** SKTE per-column layout:
+1. Presence bitset: `ceil(num_blocks/8)` bytes
+2. Distinct counts: `num_blocks × 4 LE uint32` (HLL cardinality per block)
+3. TopK section: `topk_k[1]` + per present block: `entry_count[1]` + `(fp[8 LE], count[2 LE])` pairs
+4. Bloom section: `bloom_size[2 LE]` + per present block: `bloom_data[bloom_size]` (fixed 2048 bytes)
+
+No CMS bytes are written. Legacy SKTC/SKTD readers skip CMS bytes zero-alloc via
+`skipColumnCMS` in the reader package (see reader/NOTES.md NOTE-010).
+
+**Back-ref:**
+- `internal/modules/blockio/writer/sketch_index.go:writeSketchIndexSection`
+- `internal/modules/blockio/writer/sketch_index.go:sketchSectionMagic` (0x534B5445 = SKTE)
+- `internal/modules/blockio/writer/writer_log.go:blockSketchSet`

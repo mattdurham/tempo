@@ -568,7 +568,7 @@ func TestFileLayout_IntrinsicPageBreakdown(t *testing.T) {
 }
 
 // TestFileLayout_SketchActualBytes verifies TotalBytes is populated and that
-// ColumnSketchStat has CMSBytes and TopKBytes fields.
+// ColumnSketchStat has TopKBytes fields.
 func TestFileLayout_SketchActualBytes(t *testing.T) {
 	var buf bytes.Buffer
 	w := mustNewWriter(t, &buf, 200)
@@ -593,10 +593,8 @@ func TestFileLayout_SketchActualBytes(t *testing.T) {
 	si := report.SketchIndex
 	assert.Greater(t, si.TotalBytes, 0, "TotalBytes must be positive")
 
-	for blockIdx, block := range si.Blocks {
+	for _, block := range si.Blocks {
 		for _, col := range block.Columns {
-			assert.Greater(t, col.CMSBytes, 0,
-				"block %d col %q: CMSBytes must be >0", blockIdx, col.ColumnName)
 			_ = col.TopKBytes // field must exist (compile check)
 		}
 	}

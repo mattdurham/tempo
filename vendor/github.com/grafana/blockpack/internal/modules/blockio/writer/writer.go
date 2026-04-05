@@ -467,6 +467,9 @@ func (w *Writer) Flush() (int64, error) {
 	// 9. Reset ALL state.
 	w.pending = w.pending[:0]
 	w.blockMetas = nil
+	for _, bs := range w.sketchIdx {
+		releaseBlockSketchSet(bs)
+	}
 	w.sketchIdx = w.sketchIdx[:0]
 	for k := range w.rangeIdx {
 		delete(w.rangeIdx, k)
@@ -867,7 +870,7 @@ func buildMetadataSectionBytes(
 	tsBytes := writeTSIndexSection(blockMetas)
 	buf = append(buf, tsBytes...)
 
-	// Sketch index section — per-block HLL/CMS/BinaryFuse8 sketch data.
+	// Sketch index section — per-block HLL/BinaryFuse8/TopK sketch data (magic: SKTE 0x534B5445).
 	if len(sketchIdx) > 0 {
 		sketchBytes, err := writeSketchIndexSection(sketchIdx)
 		if err != nil {

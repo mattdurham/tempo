@@ -144,10 +144,10 @@ func (b *blockpackBlock) newReader() (*blockpack.Reader, error) {
 }
 
 // executeQuery creates a reader and executes a TraceQL query, returning all matching spans.
-func (b *blockpackBlock) executeQuery(query string, opts blockpack.QueryOptions) ([]blockpack.SpanMatch, error) {
+func (b *blockpackBlock) executeQuery(query string, opts blockpack.QueryOptions) ([]blockpack.SpanMatch, blockpack.QueryStats, error) {
 	r, err := b.newReader()
 	if err != nil {
-		return nil, fmt.Errorf("failed to create blockpack reader: %w", err)
+		return nil, blockpack.QueryStats{}, fmt.Errorf("failed to create blockpack reader: %w", err)
 	}
 	return blockpack.QueryTraceQL(r, query, opts)
 }
@@ -279,7 +279,7 @@ func (b *blockpackBlock) Search(ctx context.Context, req *tempopb.SearchRequest,
 	query := buildSearchQuery(req)
 
 	// Execute TraceQL query using public API
-	matches, err := b.executeQuery(query, blockpack.QueryOptions{
+	matches, _, err := b.executeQuery(query, blockpack.QueryOptions{
 		Limit: int(req.Limit),
 	})
 	if err != nil {
@@ -334,7 +334,7 @@ func (b *blockpackBlock) SearchTagValues(ctx context.Context, tag string, cb com
 	query := "{}" // Match all spans
 
 	// Execute TraceQL query using public API
-	matches, err := b.executeQuery(query, blockpack.QueryOptions{})
+	matches, _, err := b.executeQuery(query, blockpack.QueryOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to execute query: %w", err)
 	}
@@ -362,7 +362,7 @@ func (b *blockpackBlock) SearchTagValuesV2(ctx context.Context, tag traceql.Attr
 	query := "{}"
 
 	// Execute TraceQL query using public API
-	matches, err := b.executeQuery(query, blockpack.QueryOptions{})
+	matches, _, err := b.executeQuery(query, blockpack.QueryOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to execute query: %w", err)
 	}
@@ -473,7 +473,7 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 
 	var fetchErr error
 	var matches []blockpack.SpanMatch
-	matches, fetchErr = blockpack.QueryTraceQL(r, query, blockpack.QueryOptions{
+	matches, _, fetchErr = blockpack.QueryTraceQL(r, query, blockpack.QueryOptions{
 		Limit:         spanLimit,
 		MostRecent:    common.TraceQLMostRecent(ctx),
 		StartNano:     req.StartTimeUnixNanos,
@@ -725,7 +725,7 @@ func (b *blockpackBlock) FetchTagValues(ctx context.Context, req traceql.FetchTa
 	query := conditionsToTraceQL(req.Conditions, true) // Use AND for multiple conditions
 
 	// Execute TraceQL query using public API
-	matches, err := b.executeQuery(query, blockpack.QueryOptions{})
+	matches, _, err := b.executeQuery(query, blockpack.QueryOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to execute query: %w", err)
 	}
@@ -761,7 +761,7 @@ func (b *blockpackBlock) FetchTagNames(ctx context.Context, req traceql.FetchTag
 		query := conditionsToTraceQL(req.Conditions, true)
 
 		// Execute TraceQL query using public API
-		matches, err := b.executeQuery(query, blockpack.QueryOptions{})
+		matches, _, err := b.executeQuery(query, blockpack.QueryOptions{})
 		if err != nil {
 			return fmt.Errorf("failed to execute query: %w", err)
 		}

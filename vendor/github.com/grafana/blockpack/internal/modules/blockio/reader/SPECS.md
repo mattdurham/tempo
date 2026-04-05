@@ -220,7 +220,7 @@ Back-ref: `internal/modules/blockio/reader/columnar_read.go:ReadGroupColumnar`,
    because pages plus toc replace (not supplement) the aggregate column section.
 
 5. **Sketch section:** `SketchIndexInfo.TotalBytes` is the actual uncompressed sketch
-   section size. `ColumnSketchStat.CMSBytes` and `TopKBytes` are actual per-block byte sizes.
+   section size. `ColumnSketchStat.FuseBytes` and `TopKBytes` are actual per-block byte sizes.
 
 6. **Range index:** Every numeric `RangeIndexBucket` (Int64, Uint64, Float64, Duration)
    has `End` populated (upper boundary). String/bytes buckets have empty `End` because

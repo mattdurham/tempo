@@ -109,13 +109,12 @@ func BenchmarkPlannerPruning(b *testing.B) {
 			b.ReportMetric(float64(len(plan.SelectedBlocks)), "selected_blocks")
 			b.ReportMetric(float64(plan.PrunedByIndex), "pruned_by_index")
 			b.ReportMetric(float64(plan.PrunedByFuse), "pruned_by_fuse")
-			b.ReportMetric(float64(plan.PrunedByCMS), "pruned_by_cms")
 		})
 	}
 }
 
 // BenchmarkPlannerSketchOnly measures Plan() for a column that has sketch data
-// but NO range index. This is where fuse+CMS pruning provides value that the
+// but NO range index. This is where fuse+TopK pruning provides value that the
 // range index cannot.
 //
 // Setup: N blocks, each with distinct span-level attribute "http.method" values.
@@ -216,7 +215,6 @@ func BenchmarkPlannerSketchOnly(b *testing.B) {
 			b.ReportMetric(float64(len(plan.SelectedBlocks)), "selected_blocks")
 			b.ReportMetric(float64(plan.PrunedByIndex), "pruned_by_index")
 			b.ReportMetric(float64(plan.PrunedByFuse), "pruned_by_fuse")
-			b.ReportMetric(float64(plan.PrunedByCMS), "pruned_by_cms")
 
 			if !hasRange {
 				b.Log("span.http.method: no range index (sketch-only pruning)")

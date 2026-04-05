@@ -206,3 +206,18 @@ errors (partial result was not cached — underlying is called again).
 `DiskCache`, `DiskLRUProvider`, and `ObjectCache` were removed in 2026-03-05.
 Their test files (`disk_cache_test.go`, `object_cache_test.go`) were deleted.
 See NOTES.md NOTE-009 for the removal rationale.
+
+---
+
+## RW-T-09: cacheKey Length Field Regression
+*File: `lru_test.go`*
+
+### TestSharedLRUCache_KeyUsesFullIntLength
+**Scenario:** Two Put calls with the same offset but different lengths produce independent
+cache entries — length is a discriminating key component.
+**Setup:** `NewSharedLRUCache(1024)`; `Put("f", 0, data100, DataTypeBlock)` (100 bytes);
+`Put("f", 0, data200, DataTypeBlock)` (200 bytes).
+**Assertions:** `Get("f", 0, dst100)` hits (returns true); `Get("f", 0, dst200)` hits;
+both return their respective data. No collision between the two entries.
+**Rationale:** Regression guard for BUG-15 — `int32` truncation of the length field would
+cause silent cache misses for buffers > math.MaxInt32. See NOTE-010.

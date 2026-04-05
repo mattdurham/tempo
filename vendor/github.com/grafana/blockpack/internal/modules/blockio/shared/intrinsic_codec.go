@@ -630,6 +630,12 @@ func decodeLegacyDictBlob(raw []byte, pos int, colType ColumnType, rowCount int,
 // decodeVariableWidthRef decodes a single BlockRef using variable-width block/row index encoding.
 // Returns the decoded ref, updated position, and any bounds error.
 func decodeVariableWidthRef(raw []byte, pos, blockW, rowW int) (BlockRef, int, error) {
+	// BUG-13 fix: blockW and rowW must each be 1 or 2 — any other value
+	// indicates a corrupt column header. Reject early rather than producing
+	// silently wrong BlockRef values.
+	if (blockW != 1 && blockW != 2) || (rowW != 1 && rowW != 2) {
+		return BlockRef{}, pos, fmt.Errorf("invalid ref width: blockW=%d rowW=%d", blockW, rowW)
+	}
 	refSize := blockW + rowW
 	if pos+refSize > len(raw) {
 		return BlockRef{}, pos, fmt.Errorf("truncated ref")
@@ -1151,9 +1157,18 @@ func ScanFlatColumnRefs(
 	blockW := int(raw[pos])
 	rowW := int(raw[pos+1])
 	pos += 2
+	// BUG-13 fix: reject invalid width values from corrupt blobs.
+	if (blockW != 1 && blockW != 2) || (rowW != 1 && rowW != 2) {
+		return nil
+	}
 	refSize := blockW + rowW
 
 	valuesStart := pos
+	// BUG-1 fix: use division-based check to avoid int overflow on 32-bit platforms.
+	// rowCount*8 overflows int when rowCount > math.MaxInt/8; (len(raw)-valuesStart)/8 is safe.
+	if rowCount < 0 || rowCount > (len(raw)-valuesStart)/8 {
+		return nil
+	}
 	refsStart := valuesStart + rowCount*8
 
 	// Streaming delta-decode to find start and end indices.
@@ -1240,8 +1255,17 @@ func ScanFlatColumnTopKRefs(blob []byte, limit int, backward bool) []BlockRef {
 	blockW := int(raw[pos])
 	rowW := int(raw[pos+1])
 	pos += 2
+	// BUG-13 fix: reject invalid width values from corrupt blobs.
+	if (blockW != 1 && blockW != 2) || (rowW != 1 && rowW != 2) {
+		return nil
+	}
 	refSize := blockW + rowW
 
+	// BUG-1 fix: overflow-safe check — rowCount > remaining/8 without computing rowCount*8.
+	remaining := len(raw) - pos
+	if rowCount < 0 || rowCount > remaining/8 {
+		return nil
+	}
 	refsStart := pos + rowCount*8 // skip values section
 
 	count := min(limit, rowCount)
@@ -1323,8 +1347,19 @@ func ScanFlatColumnRefsFiltered(
 	blockW := int(raw[pos])
 	rowW := int(raw[pos+1])
 	pos += 2
+	// BUG-13 fix: reject invalid width values from corrupt blobs.
+	if (blockW != 1 && blockW != 2) || (rowW != 1 && rowW != 2) {
+		return nil
+	}
 	refSize := blockW + rowW
 
+	// BUG-1 fix: overflow-safe refsStart guard.
+	if pos > len(raw) {
+		return nil
+	}
+	if rowCount < 0 || rowCount > (len(raw)-pos)/8 {
+		return nil
+	}
 	refsStart := pos + rowCount*8 // skip values section entirely
 
 	if limit <= 0 || rowCount == 0 {

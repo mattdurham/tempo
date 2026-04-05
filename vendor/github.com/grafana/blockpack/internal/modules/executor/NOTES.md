@@ -1216,7 +1216,7 @@ Back-ref: `internal/modules/executor/stream.go:Collect`
 **Decision:** All five query paths (Collect, ExecuteTraceMetrics, ExecuteLogMetrics,
 StreamLogs, CollectLogs) now use a shared `planBlocks` helper that runs:
 1. `BuildPredicates` — converts vm.Program predicates into planner predicates
-2. `PlanWithOptions` — range-index/fuse/CMS pruning and time range filtering
+2. `PlanWithOptions` — range-index/fuse pruning and time range filtering
 3. `fileLevelReject` — O(1) file-level fast reject using KLL bucketMin/bucketMax boundaries
 4. `BlocksFromIntrinsicTOC` intersection — intrinsic-column fast reject
 
@@ -1584,47 +1584,47 @@ should be read as `"intrinsic-topk-kll" (Case B KLL path, M < SortScanThreshold)
 
 ---
 
-## NOTE-045: File-Level CMS Reject — Merged Count-Min Sketch for Equality Pruning
-*Added: 2026-03-20*
+## NOTE-045: File-Level Bloom Reject — Fuse8 and Compact Bloom for Equality Pruning
+*Added: 2026-03-20; updated: 2026-04-02 (CMS removed, bloom path documented)*
 
-`fileLevelCMSReject` in `plan_blocks.go` uses the `FileSketchSummary` (a merged
-Count-Min Sketch across all blocks in the file) to reject a file entirely when a queried
-equality value is definitely absent from every block.
+`fileLevelBloomReject` in `plan_blocks.go` uses file-level bloom filters to reject a file
+entirely when a queried equality value is definitely absent from every block.
 
-**Why CMS, not Fuse8, at file level?**
-- Block-level per-block Fuse8 filters are already wired into `PlanWithOptions` for per-block pruning.
-- File-level `FileBloom` (NOTE-045) uses Fuse8 but only covers `resource.service.name`.
-- The merged CMS covers all **string-valued** equality predicates for columns tracked by the sketch index.
-- CMS `Estimate(v)==0` is a zero-false-negative guarantee: if the merged CMS says 0, the value
-  never appeared in any block in the file.
+**Two filter types:**
+- `resource.service.name` and other string columns: `FileBloom` (Fuse8 per column, FBLM section).
+  `bloomRejectString` checks each value against the per-column Fuse8 filter in the `FileBloom`.
+- `trace:id`: compact per-file bloom via `r.MayContainTraceID`. `bloomRejectTraceID` checks
+  each 16-byte trace ID value.
 
-**Why NOT a file-level Fuse8 for all columns?**
-- Fuse8 filters are not mergeable across blocks without reprocessing the original key set.
-- CMS is mergeable (element-wise sum, saturating). One merge pass produces the file-level summary.
-- For file-level pruning, CMS absence detection (Estimate==0) is sufficient — false positives
-  only mean we don't prune the file, which is conservative and safe.
+**Call chain:**
+```
+fileLevelBloomReject(r, nodes)
+  └─ bloomRejectByEquality(r, fb, node)          // recursive over AND/OR tree
+       ├─ bloomRejectTraceID(r, values)           // for node.Column == "trace:id"
+       └─ bloomRejectString(fb, col, values)      // for string columns via FileBloom
+```
 
-**Integration**:
-- `Reader.FileSketchSummary()` computes lazily (sync.Once) from the per-block sketch index.
-- `Reader.FileSketchSummaryRaw()` serializes the summary for external caching (keyed by
-  file path + size), allowing callers to avoid re-reading the file on subsequent queries.
-- `cmsRejectByNodes` is the inner logic, accepting `*FileSketchSummary` directly for testability.
-- Only string-valued equality predicates are checked (Values non-empty, no Min/Max/Pattern).
-  Non-string types (bytes, numerics, durations) are skipped — the sketch uses raw wire-encoding
-  for those and decoding them requires column-type context not available here.
-- AND semantics: reject if ANY leaf rejects. OR semantics: reject only if ALL children reject.
+**AND/OR semantics:**
+- AND node: reject if ANY child rejects (conservative).
+- OR node: reject only if ALL children reject (conservative).
+- Leaf: only equality predicates (Values non-empty, no Min/Max/Pattern).
 
-**Limitations**:
-- CMS has false positives: `Estimate(v) > 0` does NOT mean v is present.
-- For small files or low-cardinality columns, false positives are common and pruning is unreliable.
-- Only string-typed predicate values are evaluated. Bytes, numeric, and duration predicates pass
-  through conservatively — extending to those types would require replicating the wire-encoding
-  logic from `encodeValue` in predicates.go.
+**Limitations:**
+- `FileBloom` only covers columns for which a Fuse8 filter was written (typically
+  `resource.service.name` and high-cardinality string columns). Other columns pass through.
+- Both filter types have false positives (Fuse8 ~0.39% FPR, compact bloom also FPR > 0).
+  False positives mean we don't prune the file — conservative and safe.
 - This is an optimization only; correctness is maintained by the block-level scan that follows.
 
-Back-ref: `internal/modules/executor/plan_blocks.go:fileLevelCMSReject`,
-          `internal/modules/executor/plan_blocks.go:cmsRejectByNodes`,
-          `internal/modules/blockio/reader/reader.go:FileSketchSummaryRaw`
+**Note on prior CMS path:** The original NOTE-045 described a `fileLevelCMSReject` function
+that used a merged `FileSketchSummary` (Count-Min Sketch). That function and `cmsRejectByNodes`
+were removed when CMS was eliminated from the sketch system (2026-04-02; see queryplanner/NOTES.md
+NOTE-018). File-level pruning is now exclusively bloom-based.
+
+Back-ref: `internal/modules/executor/plan_blocks.go:fileLevelBloomReject`,
+          `internal/modules/executor/plan_blocks.go:bloomRejectByEquality`,
+          `internal/modules/executor/plan_blocks.go:bloomRejectString`,
+          `internal/modules/executor/plan_blocks.go:bloomRejectTraceID`
 
 ## NOTE-046: Zero-Block-Read Fast Path for ExecuteTraceMetrics
 **Date:** 2026-03-20

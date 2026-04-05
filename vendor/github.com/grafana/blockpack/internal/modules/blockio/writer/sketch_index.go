@@ -1,10 +1,10 @@
 // Package writer provides block building and serialization for blockpack files.
-// NOTE: Sketch index build and serialization for per-block HLL + CMS + BinaryFuse8 + TopK.
+// NOTE: Sketch index build and serialization for per-block HLL + SketchBloom + TopK.
 // SPEC-SK-16: HashForFuse(key) is called here at write time; must match query time.
 //
-// Column-major wire format:
+// Column-major wire format (magic 0x534B5445 "SKTE" — bloom only, no CMS):
 //
-//	magic[4 LE] = 0x534B5443
+//	magic[4 LE] = 0x534B5445
 //	num_blocks[4 LE]
 //	num_columns[4 LE]
 //
@@ -14,32 +14,84 @@
 //	  distinct_count[num_blocks × 4 LE uint32]  // HLL.Cardinality() per block, 0 absent
 //	  topk_k[1] = 20
 //	  per present block: topk_entry_count[1] + entries (fp[8 LE] + count[2 LE])
-//	  cms_depth[1] = 4
-//	  cms_width[2 LE] = 64
-//	  per present block: cms_counters[depth × width × 2 LE] = 512 bytes
-//	  per present block: fuse_len[4 LE] + fuse_data[fuse_len]
+//	  bloom_size[2 LE] = 2048
+//	  per present block: bloom_data[bloom_size]
+//
+// Old files written with magic 0x534B5444 ("SKTD") included CMS before bloom.
+// Old files written with magic 0x534B5443 ("SKTC") used BinaryFuse8 in the last
+// section. Readers that encounter the old magic degrade gracefully (no pruning).
 package writer
 
 import (
 	"encoding/binary"
-	"fmt"
+	"math"
 	"slices"
+	"sync"
 
 	"github.com/grafana/blockpack/internal/modules/sketch"
 )
 
 const (
-	sketchSectionMagic     = uint32(0x534B5443) // "SKTC"
+	// sketchSectionMagic is the magic for the bloom-only sketch section ("SKTE" — no CMS).
+	// Old "SKTD" (0x534B5444) included CMS; old "SKTC" (0x534B5443) used fuse filters.
+	// Readers encountering the old magic degrade gracefully.
+	sketchSectionMagic     = uint32(0x534B5445) // "SKTE"
 	sketchTimestampColName = "__timestamp__"
 )
 
+// colSketchPool and blockSketchSetPool reuse sketch accumulators across blocks.
+// Pooling avoids per-block GC churn for HLL, TopK, and SketchBloom objects.
+var (
+	colSketchPool      sync.Pool
+	blockSketchSetPool sync.Pool
+)
+
+// getColSketch returns a reset colSketch from the pool, or allocates a fresh one.
+func getColSketch() *colSketch {
+	if v := colSketchPool.Get(); v != nil {
+		return v.(*colSketch)
+	}
+	return &colSketch{
+		hll:   sketch.NewHyperLogLog(),
+		topk:  sketch.NewTopK(),
+		bloom: sketch.NewSketchBloom(),
+	}
+}
+
+// putColSketch resets cs and returns it to the pool.
+// cs must not be used after this call.
+func putColSketch(cs *colSketch) {
+	cs.hll.Reset()
+	cs.topk.Reset()
+	cs.bloom.Reset()
+	colSketchPool.Put(cs)
+}
+
+// getBlockSketchSet returns a cleared blockSketchSet from the pool, or allocates a fresh one.
+func getBlockSketchSet() blockSketchSet {
+	if v := blockSketchSetPool.Get(); v != nil {
+		return v.(blockSketchSet)
+	}
+	return make(blockSketchSet, 64)
+}
+
+// releaseBlockSketchSet returns all colSketches and the map itself to their pools.
+// bs must not be used after this call.
+func releaseBlockSketchSet(bs blockSketchSet) {
+	for k, cs := range bs {
+		putColSketch(cs)
+		delete(bs, k)
+	}
+	blockSketchSetPool.Put(bs)
+}
+
 // colSketch holds sketch accumulators for one column within one block.
-// keys holds all hashed values for BinaryFuse8 construction (flushed once at writeSketchIndexSection).
+// bloom is updated incrementally at add() time, eliminating the need to
+// accumulate a keys slice for BinaryFuse8 construction.
 type colSketch struct {
-	hll  *sketch.HyperLogLog
-	cms  *sketch.CountMinSketch
-	topk *sketch.TopK
-	keys []uint64 // hashed values for BinaryFuse8 construction
+	hll   *sketch.HyperLogLog
+	topk  *sketch.TopK
+	bloom *sketch.SketchBloom
 }
 
 // blockSketchSet maps column name → colSketch for one block.
@@ -53,21 +105,17 @@ func newBlockSketchSet() blockSketchSet {
 // add records one observed value (key string) for the named column.
 // key is the wire-encoded string passed to updateMinMax (8-byte LE for numerics, raw string for strings).
 // SPEC-SK-16: HashForFuse(key) is the canonical hash used at query time as well.
+// fp is computed once and shared across HLL, TopK, and the bloom filter.
 func (bs blockSketchSet) add(col, key string) {
 	cs, ok := bs[col]
 	if !ok {
-		cs = &colSketch{
-			hll:  sketch.NewHyperLogLog(),
-			cms:  sketch.NewCountMinSketch(),
-			topk: sketch.NewTopK(),
-			keys: make([]uint64, 0, 64),
-		}
+		cs = getColSketch()
 		bs[col] = cs
 	}
-	cs.hll.Add(key)
-	cs.cms.Add(key, 1)
-	cs.topk.Add(key)
-	cs.keys = append(cs.keys, sketch.HashForFuse(key))
+	fp := sketch.HashForFuse(key)
+	cs.hll.AddHash(fp)
+	cs.topk.AddFP(fp)
+	cs.bloom.Add(fp)
 }
 
 // writeSketchIndexSection serializes the sketch index for all blocks in column-major format.
@@ -95,11 +143,10 @@ func writeSketchIndexSection(sketchIdx []blockSketchSet) ([]byte, error) {
 	presenceBytes := (numBlocks + 7) / 8
 
 	// Pre-allocate buffer: header + estimated per-column data.
-	cmsMarshalSize := sketch.CMSDepth * sketch.CMSWidth * 2
 	buf := make(
 		[]byte,
 		0,
-		12+numColumns*(64+presenceBytes+numBlocks*4+1+numBlocks*(1+20*10)+1+2+numBlocks*cmsMarshalSize+numBlocks*16),
+		12+numColumns*(64+presenceBytes+numBlocks*4+1+numBlocks*(1+20*10)+2+numBlocks*sketch.SketchBloomBytes),
 	)
 
 	// magic[4 LE]
@@ -158,48 +205,26 @@ func writeSketchIndexSection(sketchIdx []blockSketchSet) ([]byte, error) {
 			entries := cs.topk.Entries()
 			buf = append(buf, byte(len(entries))) //nolint:gosec // safe: entries len bounded by TopKSize (20)
 			for _, e := range entries {
-				fp := sketch.HashForFuse(e.Key)
-				binary.LittleEndian.PutUint64(tmp8[:], fp)
+				// e.FP is the HashForFuse fingerprint computed at Add() time — no re-hash needed.
+				binary.LittleEndian.PutUint64(tmp8[:], e.FP)
 				buf = append(buf, tmp8[:]...)
-				uint16Count := uint16(e.Count) //nolint:gosec
+				uint16Count := uint16(min(e.Count, math.MaxUint16)) //nolint:gosec // saturate: count bounded to uint16
 				binary.LittleEndian.PutUint16(tmp2[:], uint16Count)
 				buf = append(buf, tmp2[:]...)
 			}
 		}
 
-		// cms_depth[1]
-		buf = append(buf, byte(sketch.CMSDepth))
-
-		// cms_width[2 LE]
-		binary.LittleEndian.PutUint16(tmp2[:], uint16(sketch.CMSWidth)) //nolint:gosec // safe: CMSWidth fits uint16
+		// bloom_size[2 LE]: fixed size for all present blocks in this column.
+		binary.LittleEndian.PutUint16(tmp2[:], uint16(sketch.SketchBloomBytes)) //nolint:gosec // safe: 2048 fits uint16
 		buf = append(buf, tmp2[:]...)
 
-		// Per present block: cms_counters[depth × width × 2 LE] = 512 bytes.
+		// Per present block: bloom_data[bloom_size].
 		for _, bs := range sketchIdx {
 			cs := bs[name]
 			if cs == nil {
 				continue
 			}
-			buf = append(buf, cs.cms.Marshal()...)
-		}
-
-		// Per present block: fuse_len[4 LE] + fuse_data[fuse_len].
-		for _, bs := range sketchIdx {
-			cs := bs[name]
-			if cs == nil {
-				continue
-			}
-			fuse, err := sketch.NewBinaryFuse8(cs.keys)
-			if err != nil {
-				return nil, fmt.Errorf("sketch_index col %q: fuse8: %w", name, err)
-			}
-			fuseBytes, err := fuse.MarshalBinary()
-			if err != nil {
-				return nil, fmt.Errorf("sketch_index col %q: fuse8 marshal: %w", name, err)
-			}
-			binary.LittleEndian.PutUint32(tmp4[:], uint32(len(fuseBytes))) //nolint:gosec // safe: fuse size fits uint32
-			buf = append(buf, tmp4[:]...)
-			buf = append(buf, fuseBytes...)
+			buf = append(buf, cs.bloom.Marshal()...)
 		}
 	}
 

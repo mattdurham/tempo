@@ -1485,3 +1485,16 @@ with zero block reads (uses intrinsic section exclusively).
 **Assertions:** correct per-service counts; `stats.BlocksRead == 0`.
 
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic_test.go:TestTraceMetrics_Intrinsic_CountAll_ZeroBlockReads`
+
+---
+
+### EX-INT-11: TestLogBuildDenseRows_CapPrealloc
+
+**Scenario:** `logBuildDenseRows` with a realistic time window and multiple attr group keys
+does not panic and returns the correct row count.
+
+**Setup:** 10 time buckets, 3 attr group keys; each bucket populated in the input map.
+
+**Assertions:** `len(rows) == 30` (10 * 3); no panic; result is non-nil.
+
+Back-ref: `internal/modules/executor/metrics_log_overflow_test.go:TestLogBuildDenseRows_CapPrealloc`

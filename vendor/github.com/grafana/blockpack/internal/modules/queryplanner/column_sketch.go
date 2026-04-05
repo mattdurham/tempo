@@ -10,8 +10,6 @@ type ColumnSketch interface {
 	Presence() []uint64
 	// Distinct returns pre-computed HLL cardinality per block (0 for absent blocks).
 	Distinct() []uint32
-	// CMSEstimate returns CMS frequency estimate for val per block (0 for absent).
-	CMSEstimate(val string) []uint32
 	// TopKMatch returns the TopK count for valFP per block (0 if not in top-K or absent).
 	TopKMatch(valFP uint64) []uint16
 	// FuseContains returns true per block if the fuse filter indicates valHash may be present.

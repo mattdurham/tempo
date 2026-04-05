@@ -93,7 +93,7 @@ const (
 	MaxStringLen          = 10_485_760
 	MaxBytesLen           = 10_485_760
 	MaxBlockSize          = 1_073_741_824
-	MaxMetadataSize       = 268_435_456 // 256 MiB — raised from 100 MiB to accommodate sketch data at scale
+	MaxMetadataSize       = 2_147_483_648 // 2 GiB — raised from 256 MiB; production blocks can reach 600+ MB after sketch growth
 	MaxTraceCount         = 1_000_000
 	MaxNameLen            = 1_024
 	MaxCompactSectionSize = 52_428_800

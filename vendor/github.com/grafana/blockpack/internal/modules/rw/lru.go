@@ -31,7 +31,7 @@ func dataTypeTier(dt DataType) int {
 type cacheKey struct {
 	readerID string
 	offset   int64
-	length   int32
+	length   int // BUG-15 fix: was int32; changed to int to prevent silent truncation for buffers > math.MaxInt32
 }
 
 // lruEntry holds one cached range and its tier.
@@ -80,7 +80,7 @@ func (c *SharedLRUCache) Get(readerID string, off int64, dst []byte) bool {
 	key := cacheKey{
 		readerID: readerID,
 		offset:   off,
-		length:   int32(len(dst)), //nolint:gosec // length is bounded by read-buffer size
+		length:   len(dst),
 	}
 	elem, ok := c.index[key]
 	if !ok {
@@ -103,7 +103,7 @@ func (c *SharedLRUCache) Put(readerID string, off int64, data []byte, dt DataTyp
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	key := cacheKey{readerID: readerID, offset: off, length: int32(len(data))} //nolint:gosec
+	key := cacheKey{readerID: readerID, offset: off, length: len(data)}
 	if _, exists := c.index[key]; exists {
 		return
 	}

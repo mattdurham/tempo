@@ -166,6 +166,43 @@ Back-ref: `shared_test.go:TestAggressiveCoalesceConfig`
 
 ---
 
+## Flat-Column Bounds Check Tests (BUG-1 / BUG-13)
+
+### SHARED-18: TestScanFlatColumnRefs_OversizedRowCount
+**Scenario:** Blob with rowCount*8 > len(raw) returns nil without panic.
+**Setup:** Hand-crafted snappy blob with rowCount=0x0FFFFFFF, minimal trailing bytes.
+**Assertions:** `ScanFlatColumnRefs(blob, ...)` returns nil; no panic.
+Back-ref: `intrinsic_codec_bounds_test.go:TestScanFlatColumnRefs_OversizedRowCount`
+
+### SHARED-19: TestScanFlatColumnTopKRefs_OversizedRowCount
+**Scenario:** Same oversized rowCount triggers early return in TopKRefs variant.
+**Assertions:** `ScanFlatColumnTopKRefs(blob, 10, false)` returns nil; no panic.
+Back-ref: `intrinsic_codec_bounds_test.go:TestScanFlatColumnTopKRefs_OversizedRowCount`
+
+### SHARED-20: TestScanFlatColumnRefsFiltered_OversizedRowCount
+**Scenario:** Same oversized rowCount triggers early return in Filtered variant with a non-nil filter callback.
+**Setup:** Hand-crafted snappy blob with rowCount=0x0FFFFFFF, minimal trailing bytes; non-nil filter callback that always returns true.
+**Assertions:** `ScanFlatColumnRefsFiltered(blob, false, 10, func(_ BlockRef) bool { return true })` returns nil; no panic.
+Back-ref: `intrinsic_codec_bounds_test.go:TestScanFlatColumnRefsFiltered_OversizedRowCount`
+
+### SHARED-21: TestDecodeVariableWidthRef_BlockWZero
+**Scenario:** `decodeVariableWidthRef` with blockW=0 returns an error.
+**Assertions:** error is non-nil; no garbage BlockRef produced.
+Back-ref: `intrinsic_codec_bounds_test.go:TestDecodeVariableWidthRef_BlockWZero`
+
+### SHARED-22: TestDecodeVariableWidthRef_BlockWThree / TestDecodeVariableWidthRef_RowWZero
+**Scenario:** Invalid width values (3, 0) each return an error from `decodeVariableWidthRef`.
+**Assertions:** error is non-nil for blockW=3; error is non-nil for rowW=0.
+Back-ref: `intrinsic_codec_bounds_test.go:TestDecodeVariableWidthRef_BlockWThree`, `TestDecodeVariableWidthRef_RowWZero`
+
+### SHARED-23: TestScanFlat*_InvalidBlockW
+**Scenario:** Blob encoding blockW=0 causes each flat-scan function to return nil.
+**Assertions:** All three scan functions return nil for blockW=0; no garbage refs.
+Back-ref: `intrinsic_codec_bounds_test.go:TestScanFlatColumnRefs_InvalidBlockW`,
+  `TestScanFlatColumnTopKRefs_InvalidBlockW`, `TestScanFlatColumnRefsFiltered_InvalidBlockW`
+
+---
+
 ## Coverage Requirements
 
 - All bloom filter functions (`AddToBloom`, `TestBloom`, `BloomHash1`, `BloomHash2`, `SetBit`,

@@ -46,47 +46,8 @@ func writeTwoBlockFileSvc(t *testing.T, svc0, svc1 string, nBlock0, nBlock1 int)
 	return combined.Bytes()
 }
 
-// QP-T-17: TestPlanCMSPruning — CMS data is present and correct; block containing only
-// service-B has CMS estimate == 0 for service-A; combined pruning selects only block 0.
-//
-// Note: Stage 1 range index pruning may eliminate block 1 before CMS runs.
-// This test verifies that (a) CMS sketch data is correct and (b) the planner correctly
-// selects only the block containing service-A, regardless of which stage prunes block 1.
-func TestPlanCMSPruning(t *testing.T) {
-	data := writeTwoBlockFileSvc(t, "service-A", "service-B", 5, 5)
-	r := openReader(t, data)
-	require.Equal(t, 2, r.BlockCount())
-
-	col := "resource.service.name"
-
-	// Verify CMS data is present and correct via ColumnSketch (SPEC-SK-07/08):
-	// block 1 has zero estimate for service-A, confirming it was never written.
-	cs := r.ColumnSketch(col)
-	require.NotNil(t, cs, "ColumnSketch must be non-nil for resource.service.name")
-
-	est0 := cs.CMSEstimate("service-A")
-	require.Greater(t, len(est0), 0, "CMSEstimate must return slice")
-	assert.Greater(t, est0[0], uint32(0), "block 0 CMS must estimate > 0 for service-A")
-
-	est1 := cs.CMSEstimate("service-A")
-	require.Greater(t, len(est1), 1, "CMSEstimate must cover block 1")
-	assert.Equal(t, uint32(0), est1[1], "block 1 CMS must estimate 0 for service-A (never written)")
-
-	// Verify the planner correctly selects only block 0 via combined pruning.
-	p := queryplanner.NewPlanner(r)
-	pred := queryplanner.Predicate{
-		Columns: []string{col},
-		Values:  []string{"service-A"},
-	}
-	plan := p.Plan([]queryplanner.Predicate{pred}, queryplanner.TimeRange{})
-	assert.Equal(t, []int{0}, plan.SelectedBlocks,
-		"only block 0 (containing service-A) should survive combined pruning")
-	assert.Greater(t, plan.PrunedByIndex+plan.PrunedByFuse+plan.PrunedByCMS, 0,
-		"at least one pruning stage must eliminate block 1")
-}
-
-// QP-T-18: TestPlanCMSNoPruneForFalsePositive — a block containing the queried value is never pruned.
-func TestPlanCMSNoPruneForFalsePositive(t *testing.T) {
+// QP-T-18: TestPlanNoPruneForFalsePositive — a block containing the queried value is never pruned.
+func TestPlanNoPruneForFalsePositive(t *testing.T) {
 	data := writeTwoBlockFileSvc(t, "service-A", "service-B", 5, 5)
 	r := openReader(t, data)
 	require.Equal(t, 2, r.BlockCount())
@@ -171,7 +132,7 @@ func TestPlanFusePruning(t *testing.T) {
 	plan := p.Plan([]queryplanner.Predicate{pred}, queryplanner.TimeRange{})
 	assert.Equal(t, []int{0}, plan.SelectedBlocks,
 		"only block 0 (containing service-A) should survive combined pruning")
-	assert.Greater(t, plan.PrunedByIndex+plan.PrunedByFuse+plan.PrunedByCMS, 0,
+	assert.Greater(t, plan.PrunedByIndex+plan.PrunedByFuse, 0,
 		"at least one pruning stage must eliminate block 1")
 }
 
@@ -269,7 +230,7 @@ func writeThreeBlockFileSvc(t *testing.T, svc0, svc1, svc2 string, nBlock0, nBlo
 }
 
 // QP-T-27: TestColumnMajorRoundTrip — column-major sketch data survives write+read cycle.
-// Distinct counts, TopK, CMS, and Fuse are all accessible via ColumnSketch after round-trip.
+// Distinct counts, TopK, and Fuse are all accessible via ColumnSketch after round-trip.
 func TestColumnMajorRoundTrip(t *testing.T) {
 	data := writeTwoBlockFileSvc(t, "service-A", "service-B", 5, 5)
 	r := openReader(t, data)
@@ -284,12 +245,6 @@ func TestColumnMajorRoundTrip(t *testing.T) {
 	require.Len(t, distinct, 2, "Distinct must cover all 2 blocks")
 	assert.Greater(t, distinct[0], uint32(0), "block 0 must have non-zero distinct count")
 	assert.Greater(t, distinct[1], uint32(0), "block 1 must have non-zero distinct count")
-
-	// CMSEstimate is non-zero for the block that contains the value.
-	est := cs.CMSEstimate("service-A")
-	require.Len(t, est, 2)
-	assert.Greater(t, est[0], uint32(0), "block 0 CMS must be > 0 for service-A")
-	assert.Equal(t, uint32(0), est[1], "block 1 CMS must be 0 for service-A")
 
 	// FuseContains has no false negatives.
 	h := sketch.HashForFuse("service-A")
@@ -331,7 +286,7 @@ func TestColumnMajorPlannerPruning(t *testing.T) {
 	assert.Contains(t, plan.SelectedBlocks, 1, "block 1 (service-B) must be selected")
 	assert.NotContains(t, plan.SelectedBlocks, 0, "block 0 (service-A) must be pruned")
 	assert.NotContains(t, plan.SelectedBlocks, 2, "block 2 (service-C) must be pruned")
-	assert.Greater(t, plan.PrunedByIndex+plan.PrunedByFuse+plan.PrunedByCMS, 0,
+	assert.Greater(t, plan.PrunedByIndex+plan.PrunedByFuse, 0,
 		"at least one pruning stage must eliminate non-matching blocks")
 }
 
@@ -348,11 +303,10 @@ func TestColumnMajorGracefulDegradation(t *testing.T) {
 	}
 	plan := p.Plan([]queryplanner.Predicate{pred}, queryplanner.TimeRange{})
 
-	// When no sketch data exists for the column, fuse/CMS stages must conservatively keep all blocks.
+	// When no sketch data exists for the column, fuse stage must conservatively keep all blocks.
 	assert.Equal(t, 2, len(plan.SelectedBlocks),
 		"all blocks must survive when ColumnSketch is nil (graceful degradation)")
 	assert.Equal(t, 0, plan.PrunedByFuse, "fuse must not prune blocks when ColumnSketch is nil")
-	assert.Equal(t, 0, plan.PrunedByCMS, "CMS must not prune blocks when ColumnSketch is nil")
 }
 
 // QP-T-31: TestFusePruneORPredicate — OR predicate: a block is kept if it contains ANY value.
@@ -407,7 +361,7 @@ func TestFusePruneANDPredicate(t *testing.T) {
 	}
 	// No assertion on exact selected set due to FPR, but PrunedByFuse should be > 0
 	// or range-index pruning should eliminate them.
-	assert.GreaterOrEqual(t, plan.PrunedByIndex+plan.PrunedByFuse+plan.PrunedByCMS, 0,
+	assert.GreaterOrEqual(t, plan.PrunedByIndex+plan.PrunedByFuse, 0,
 		"AND predicate pipeline must run without error")
 }
 
@@ -450,60 +404,6 @@ func TestFusePruneIntervalSkipped(t *testing.T) {
 	assert.Equal(t, 2, len(plan.SelectedBlocks), "all blocks must survive interval predicate")
 }
 
-// QP-T-35: TestCMSPruneZeroEstimate — CMS prunes a block when estimate is 0 for all queried values.
-func TestCMSPruneZeroEstimate(t *testing.T) {
-	data := writeTwoBlockFileSvc(t, "service-A", "service-B", 5, 5)
-	r := openReader(t, data)
-	require.Equal(t, 2, r.BlockCount())
-
-	col := "resource.service.name"
-	cs := r.ColumnSketch(col)
-	require.NotNil(t, cs)
-
-	// Confirm that block 1 has zero CMS estimate for service-A.
-	est := cs.CMSEstimate("service-A")
-	require.Greater(t, len(est), 1)
-	assert.Equal(t, uint32(0), est[1], "block 1 CMS must be 0 for service-A (pre-condition)")
-
-	p := queryplanner.NewPlanner(r)
-	pred := queryplanner.Predicate{
-		Columns: []string{col},
-		Values:  []string{"service-A"},
-	}
-	plan := p.Plan([]queryplanner.Predicate{pred}, queryplanner.TimeRange{})
-
-	// Block 1 must be pruned (by fuse, CMS, or range-index).
-	assert.NotContains(t, plan.SelectedBlocks, 1, "block 1 must be pruned for service-A query")
-	assert.Greater(t, plan.PrunedByIndex+plan.PrunedByFuse+plan.PrunedByCMS, 0,
-		"at least one pruning stage must remove block 1")
-}
-
-// QP-T-36: TestCMSPruneNonZeroKept — CMS never prunes a block with non-zero estimate.
-func TestCMSPruneNonZeroKept(t *testing.T) {
-	data := writeTwoBlockFileSvc(t, "service-A", "service-B", 5, 5)
-	r := openReader(t, data)
-	require.Equal(t, 2, r.BlockCount())
-
-	col := "resource.service.name"
-	cs := r.ColumnSketch(col)
-	require.NotNil(t, cs)
-
-	// Confirm block 0 has non-zero CMS estimate for service-A.
-	est := cs.CMSEstimate("service-A")
-	require.Greater(t, len(est), 0)
-	assert.Greater(t, est[0], uint32(0), "block 0 CMS must be > 0 for service-A (pre-condition)")
-
-	p := queryplanner.NewPlanner(r)
-	pred := queryplanner.Predicate{
-		Columns: []string{col},
-		Values:  []string{"service-A"},
-	}
-	plan := p.Plan([]queryplanner.Predicate{pred}, queryplanner.TimeRange{})
-
-	// Block 0 must never be pruned (contains service-A).
-	assert.Contains(t, plan.SelectedBlocks, 0, "block 0 (non-zero CMS) must never be pruned by CMS")
-}
-
 // QP-T-37: TestScoreBlocksWithSketchData — BlockScores is populated when sketch data is present.
 func TestScoreBlocksWithSketchData(t *testing.T) {
 	data := writeTwoBlockFileSvc(t, "service-A", "service-B", 5, 5)
@@ -543,10 +443,9 @@ func TestScoreBlocksNoSketchData(t *testing.T) {
 	assert.Nil(t, plan.BlockScores, "BlockScores must be nil when no sketch data exists for queried column")
 }
 
-// QP-T-39: TestScoreBlocksTopKFallback — scoring prefers TopK exact count over CMS estimate.
+// QP-T-39: TestScoreBlocksTopKFallback — scoring uses TopK exact count.
 // Block 0 has 5 spans with service-A; TopK should have an exact count.
-// We verify score is derived from TopK (exact) rather than CMS (estimate) by confirming
-// that TopK returns a non-zero count for service-A in block 0.
+// We verify score is derived from TopK by confirming TopK returns a non-zero count for service-A in block 0.
 func TestScoreBlocksTopKFallback(t *testing.T) {
 	data := writeTwoBlockFileSvc(t, "service-A", "service-B", 5, 5)
 	r := openReader(t, data)
@@ -562,7 +461,7 @@ func TestScoreBlocksTopKFallback(t *testing.T) {
 
 	// Block 0 must have TopK count >= 5 (5 spans all with service-A).
 	assert.GreaterOrEqual(t, topk[0], uint16(5),
-		"block 0 TopK must have exact count for service-A (used for scoring, not CMS estimate)")
+		"block 0 TopK must have exact count for service-A (used for scoring)")
 
 	// Verify the planner produces a positive score for block 0 using TopK data.
 	p := queryplanner.NewPlanner(r)

@@ -196,7 +196,7 @@ cache pressure from the cheapest-to-re-read data (blocks).
 O(1) append (MRU push to back), O(1) eviction (pop from front), and O(1)
 promotion (MoveToBack). A heap would add O(log n) cost for no benefit.
 
-**Cache key design:** Keys are `(readerID string, offset int64, length int32)`.
+**Cache key design:** Keys are `(readerID string, offset int64, length int)`.
 Length is included because the same offset can be read with different lengths
 (e.g. footer is 22 bytes; a block at the same offset would be larger).
 Sub-range serving (as in `RangeCachingProvider`) is intentionally not implemented:
@@ -229,3 +229,22 @@ entirely and do not suffer the allocation overhead.
 **Consequence:** All `readThroughCache` callsites in `blockio/reader` were replaced with
 direct `readRange` / `provider.ReadAt` calls. The `WithObjectCache` and `WithPath` reader
 options were removed. The `ReaderOption` type still exists for future extensibility.
+
+---
+
+## NOTE-010: BUG-15 Fix — cacheKey.length Changed from int32 to int (2026-04-01)
+*Added: 2026-04-01*
+
+**Decision:** `cacheKey.length` field changed from `int32` to `int`. The `//nolint:gosec`
+conversion annotations on both `Get` and `Put` were removed (no conversion needed).
+
+**Rationale:** `int32` silently truncates lengths exceeding 2^31-1 (≈2 GB), producing a
+negative or wrapped cache key. A cache `Get` with a >2 GB buffer would not match a `Put`
+of the same data because the stored key has a different `length` value. The result is a
+silent cache miss on every subsequent read of that range — correct behavior but degraded
+performance. In practice, `MaxBlockSize` (1 GB) prevents any single read buffer from
+reaching this limit, but the type mismatch is a latent trap for future callers or platform
+changes. Using plain `int` (native word size: 32-bit on 32-bit, 64-bit on 64-bit platforms)
+eliminates the truncation on 64-bit builds and the nolint annotations that suppressed it.
+
+Back-ref: `internal/modules/rw/lru.go:cacheKey`

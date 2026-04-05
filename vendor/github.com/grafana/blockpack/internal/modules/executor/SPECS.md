@@ -45,7 +45,7 @@ to guarantee globally correct top-K results (see §6, SPEC-STREAM-7).
 1. Compute `wantColumns` from `program` and `secondPassCols` from `opts.AllColumns` (NOTE-028).
 2. Create a `queryplanner.Planner` backed by `r`.
 3. Call `planner.PlanWithOptions(BuildPredicates(r, program), opts.TimeRange, ...)` —
-   range-index, fuse, and CMS pruning based on extracted column predicates, further
+   range-index and membership pruning (SketchBloom) based on extracted column predicates, further
    narrowed by `opts.TimeRange` if non-zero.
 4. Apply sub-file sharding filter if `opts.BlockCount > 0` (see §3.4).
 5. Fetch blocks lazily via `r.CoalescedGroups(plan.SelectedBlocks)` / `r.ReadGroup(group)`.
@@ -188,7 +188,7 @@ type StepStats struct {
 
 | Step name | Appears when | Metadata keys |
 |-----------|-------------|---------------|
-| `"plan"` | Block-scan path (not intrinsic fast path) | `total_blocks`, `selected_blocks`, `pruned_by_time`, `pruned_by_index`, `pruned_by_fuse`, `pruned_by_cms`, `explain` |
+| `"plan"` | Block-scan path (not intrinsic fast path) | `total_blocks`, `selected_blocks`, `pruned_by_time`, `pruned_by_index`, `pruned_by_fuse`, `explain` |
 | `"intrinsic"` | Cases A, B, C, D fast paths | Case A plain: `selected_blocks`. Case B KLL: `ref_count`, `scan_count` (=0). Case B scan: `ref_count`, `scan_count`. |
 | `"mixed-prefilter"` | Cases C, D mixed paths | `candidate_blocks` |
 | `"block-scan"` | Block-scan path | `fetched_blocks`, `matched_rows` |

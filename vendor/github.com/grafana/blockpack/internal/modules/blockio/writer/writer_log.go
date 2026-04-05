@@ -52,7 +52,7 @@ type logBlockBuilder struct {
 	colFloatMinMax   map[string]*blockColMinMax // float64-encoded min/max for all-float string cols
 	colNonNumeric    map[string]bool            // true if any non-empty value failed int64 parse
 	colNonFloat      map[string]bool            // true if any non-empty value failed float64 parse
-	// colSketches accumulates HLL, CMS, and fuse keys per column for this log block.
+	// colSketches accumulates HLL, TopK, and fuse keys per column for this log block.
 	colSketches blockSketchSet
 
 	sparseColumns []columnBuilder
@@ -201,7 +201,7 @@ func (b *logBlockBuilder) fillNullsForLogRow(rowIdx int) {
 }
 
 // updateLogMinMax updates the per-block min/max for the named column and records
-// the value in the sketch accumulators (HLL, CMS, BinaryFuse8 keys).
+// the value in the sketch accumulators (HLL, TopK, BinaryFuse8 keys).
 // Delegates to the same logic as blockBuilder.updateMinMax (same types, same semantics).
 func (b *logBlockBuilder) updateLogMinMax(name string, typ shared.ColumnType, key string) {
 	if mm, ok := b.colMinMax[name]; ok {

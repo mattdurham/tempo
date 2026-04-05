@@ -271,7 +271,7 @@ func newBlockpackIterator(reader *blockpack.Reader) (*blockpackIterator, error) 
 	byTrace := make(map[string][]blockpack.SpanMatch)
 	var traceOrder []string
 
-	allMatches, err := blockpack.QueryTraceQL(reader, "{}", blockpack.QueryOptions{})
+	allMatches, _, err := blockpack.QueryTraceQL(reader, "{}", blockpack.QueryOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to query spans: %w", err)
 	}

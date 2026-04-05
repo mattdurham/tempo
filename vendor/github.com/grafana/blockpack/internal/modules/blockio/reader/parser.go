@@ -19,7 +19,7 @@ import (
 var parsedSketchCache objectcache.Cache[sketchIndex]
 
 // parsedSketchSummaryCache caches the fully built FileSketchSummary by fileID+"/sketch-summary".
-// FileSketchSummary is expensive to build (CMS merge, TopK aggregation across all blocks) and
+// FileSketchSummary is expensive to build (TopK aggregation across all blocks) and
 // was previously rebuilt on every query because it was only cached per-Reader (short-lived).
 // Strong references: entries persist until Clear is called.
 // SPEC-OC-003, NOTE-003 (reader NOTES.md)

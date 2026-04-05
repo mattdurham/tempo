@@ -114,7 +114,9 @@ func ColumnNames(r *Reader) []string {
 }
 
 // QueryTraceQL executes a TraceQL query against a modules-format blockpack file
-// and returns all matching spans.
+// and returns all matching spans along with per-phase execution statistics.
+// QueryStats is populated for filter queries; structural and pipeline queries
+// return an empty QueryStats.
 //
 // Supported query types:
 //   - Filter expressions: `{ span.http.method = "GET" }`
@@ -125,7 +127,11 @@ func ColumnNames(r *Reader) []string {
 // For structural queries, SpanMatch.Fields is nil — only TraceID and SpanID are set.
 // Pipeline queries group matching spans into spansets, compute aggregates, and
 // filter by threshold before returning qualifying spans.
-func QueryTraceQL(r *Reader, traceqlQuery string, opts QueryOptions) (results []SpanMatch, err error) {
+func QueryTraceQL(
+	r *Reader,
+	traceqlQuery string,
+	opts QueryOptions,
+) (results []SpanMatch, stats QueryStats, err error) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			err = fmt.Errorf("internal error in QueryTraceQL: %v", rec)
@@ -133,15 +139,15 @@ func QueryTraceQL(r *Reader, traceqlQuery string, opts QueryOptions) (results []
 	}()
 
 	if r == nil {
-		return nil, fmt.Errorf("QueryTraceQL: reader cannot be nil")
+		return nil, QueryStats{}, fmt.Errorf("QueryTraceQL: reader cannot be nil")
 	}
 	if shardErr := validateQueryOptions(opts); shardErr != nil {
-		return nil, fmt.Errorf("QueryTraceQL: %w", shardErr)
+		return nil, QueryStats{}, fmt.Errorf("QueryTraceQL: %w", shardErr)
 	}
 
 	parsed, parseErr := traceqlparser.ParseTraceQL(traceqlQuery)
 	if parseErr != nil {
-		return nil, fmt.Errorf("parse TraceQL: %w", parseErr)
+		return nil, QueryStats{}, fmt.Errorf("parse TraceQL: %w", parseErr)
 	}
 
 	collector := func(match *SpanMatch, more bool) bool {
@@ -154,7 +160,7 @@ func QueryTraceQL(r *Reader, traceqlQuery string, opts QueryOptions) (results []
 
 	switch q := parsed.(type) {
 	case *traceqlparser.FilterExpression:
-		err = streamFilterQuery(r, q, opts, collector)
+		stats, err = streamFilterQuery(r, q, opts, collector)
 	case *traceqlparser.StructuralQuery:
 		execOpts := modules_executor.Options{
 			Limit:      opts.Limit,
@@ -185,7 +191,7 @@ func QueryTraceQL(r *Reader, traceqlQuery string, opts QueryOptions) (results []
 			parsed,
 		)
 	}
-	return results, err
+	return results, stats, err
 }
 
 // LogQueryOptions configures log query execution.

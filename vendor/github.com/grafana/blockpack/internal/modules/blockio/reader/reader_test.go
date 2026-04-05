@@ -1923,3 +1923,23 @@ func TestTraceIDBloom_VersionV2(t *testing.T) {
 		assert.Equal(t, bFull, bLean, "full and lean must agree for trace %d", i)
 	}
 }
+
+// TestGetBlockWithBytes_NonNilSecondPassColsReturnsError verifies that GetBlockWithBytes
+// returns an error (not a panic) when secondPassCols is non-nil (BUG-4 / BUG-12 guard).
+func TestGetBlockWithBytes_NonNilSecondPassColsReturnsError(t *testing.T) {
+	var buf bytes.Buffer
+	w := mustNewWriter(t, &buf, 0)
+
+	var tid [16]byte
+	tid[0] = 0x01
+	span := makeSpan(tid, fixedSpanID(1), "op.test", 100, 200, 0, nil)
+	addSpanToWriter(t, w, tid, span, map[string]any{"service.name": "svc"})
+	flushToBuffer(t, &buf, w)
+
+	r := openReader(t, buf.Bytes())
+
+	secondPass := map[string]struct{}{"span:name": {}}
+	_, err := r.GetBlockWithBytes(0, nil, secondPass)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "secondPassCols must be nil")
+}

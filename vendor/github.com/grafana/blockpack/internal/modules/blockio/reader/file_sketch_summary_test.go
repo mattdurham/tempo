@@ -60,45 +60,7 @@ func TestFileSketchSummary_ColumnPresent(t *testing.T) {
 	// Use span:name, which is still tracked in the sketch index via updateMinMax.
 	col := summary.Columns["span:name"]
 	require.NotNil(t, col, "span:name must be present in sketch")
-	assert.NotNil(t, col.CMS, "CMS must not be nil")
 	assert.Greater(t, col.TotalDistinct, uint32(0), "TotalDistinct must be positive")
-}
-
-// TestFileSketchSummary_CMSAbsence verifies CMS estimate==0 for a value never added.
-func TestFileSketchSummary_CMSAbsence(t *testing.T) {
-	r := buildSketchReader(t, 0, func(w *writer.Writer) {
-		addServiceSpan(t, w, "svc-a", "op1", 1)
-		addServiceSpan(t, w, "svc-b", "op2", 2)
-	})
-	summary := r.FileSketchSummary()
-	require.NotNil(t, summary)
-
-	// resource.service.name is now intrinsic-only; use span:name which is sketch-tracked.
-	col := summary.Columns["span:name"]
-	require.NotNil(t, col)
-
-	// "definitely-absent-op" was never added as a span name — CMS must return 0.
-	assert.Equal(t, uint16(0), col.CMS.Estimate("definitely-absent-op"),
-		"CMS must return 0 for value never added (no false negatives)")
-}
-
-// TestFileSketchSummary_CMSPresence verifies CMS estimate>0 for values that were added.
-func TestFileSketchSummary_CMSPresence(t *testing.T) {
-	r := buildSketchReader(t, 0, func(w *writer.Writer) {
-		for i := range 10 {
-			addServiceSpan(t, w, "svc-a", "op1", byte(i+1))
-		}
-	})
-	summary := r.FileSketchSummary()
-	require.NotNil(t, summary)
-
-	// resource.service.name is now intrinsic-only; use span:name which is sketch-tracked.
-	// All spans were written with span name "op1".
-	col := summary.Columns["span:name"]
-	require.NotNil(t, col)
-
-	assert.Greater(t, col.CMS.Estimate("op1"), uint16(0),
-		"CMS must return >0 for span name that was added")
 }
 
 // TestFileSketchSummary_MarshalRoundTrip verifies Marshal→Unmarshal preserves data.
@@ -129,11 +91,6 @@ func TestFileSketchSummary_MarshalRoundTrip(t *testing.T) {
 		assert.Equal(t, origCol.TotalDistinct, restCol.TotalDistinct, "TotalDistinct mismatch for %q", name)
 		assert.Equal(t, len(origCol.TopK), len(restCol.TopK), "TopK length mismatch for %q", name)
 
-		// CMS estimates for known values must match.
-		assert.Equal(t, origCol.CMS.Estimate("svc-a"), restCol.CMS.Estimate("svc-a"),
-			"CMS estimate mismatch for svc-a in %q", name)
-		assert.Equal(t, origCol.CMS.Estimate("definitely-absent"), restCol.CMS.Estimate("definitely-absent"),
-			"CMS absence mismatch for %q", name)
 	}
 }
 
@@ -254,17 +211,14 @@ func TestFileSketchSummaryRaw_RoundTrip(t *testing.T) {
 	require.Equal(t, len(original.Columns), len(restored.Columns),
 		"restored summary must have same number of columns")
 
-	// CMS estimates must be identical for a written value.
+	// TotalDistinct and TopK must match across columns.
 	for name, origCol := range original.Columns {
 		restCol := restored.Columns[name]
 		require.NotNil(t, restCol, "column %q missing from restored summary", name)
-		// Spot-check: CMS estimate for "svc-raw-test" in resource.service.name.
-		if name == "resource.service.name" {
-			assert.Equal(t,
-				origCol.CMS.Estimate("svc-raw-test"),
-				restCol.CMS.Estimate("svc-raw-test"),
-				"CMS estimate must be preserved across marshal/unmarshal")
-		}
+		assert.Equal(t, origCol.TotalDistinct, restCol.TotalDistinct,
+			"TotalDistinct must be preserved across marshal/unmarshal for %q", name)
+		assert.Equal(t, len(origCol.TopK), len(restCol.TopK),
+			"TopK length must be preserved across marshal/unmarshal for %q", name)
 	}
 }
 

@@ -127,7 +127,6 @@ func CollectLogs(
 			"pruned_by_time":  plan.PrunedByTime,
 			"pruned_by_index": plan.PrunedByIndex,
 			"pruned_by_fuse":  plan.PrunedByFuse,
-			"pruned_by_cms":   plan.PrunedByCMS,
 			"selected_blocks": len(plan.SelectedBlocks),
 			"explain":         plan.Explain,
 		},

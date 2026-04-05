@@ -720,6 +720,13 @@ func (r *Reader) GetBlockWithBytes(
 	wantColumns map[string]struct{},
 	secondPassCols map[string]struct{},
 ) (*BlockWithBytes, error) {
+	// BUG-4 fix: secondPassCols must be nil — see BUG-12 comment. Check before I/O.
+	if secondPassCols != nil {
+		return nil, fmt.Errorf(
+			"GetBlockWithBytes: secondPassCols must be nil (BUG-12: non-nil secondPassCols silently discards first-pass columns); got %d secondPassCols entries",
+			len(secondPassCols),
+		)
+	}
 	raw, err := r.ReadBlockRaw(blockIdx)
 	if err != nil {
 		return nil, err
@@ -727,12 +734,6 @@ func (r *Reader) GetBlockWithBytes(
 	bwb, err := r.ParseBlockFromBytes(raw, wantColumns, r.BlockMeta(blockIdx))
 	if err != nil {
 		return nil, err
-	}
-	if secondPassCols != nil {
-		bwb, err = r.ParseBlockFromBytes(bwb.RawBytes, secondPassCols, r.BlockMeta(blockIdx))
-		if err != nil {
-			return nil, err
-		}
 	}
 	return bwb, nil
 }

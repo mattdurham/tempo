@@ -37,8 +37,7 @@ type BlockIndexer interface {
 
 Returns bulk per-block sketch data for the named column, or nil when no sketch data is
 available (old files or column not sketched). The returned `ColumnSketch` has methods that
-return slices indexed by block number. Used by Stage 2 (Fuse pruning), Stage 3 (CMS pruning),
-and Stage 4 (block scoring).
+return slices indexed by block number. Used by Stage 2 (Fuse pruning) and Stage 3 (block scoring).
 
 ---
 
@@ -46,17 +45,16 @@ and Stage 4 (block scoring).
 
 ```go
 type ColumnSketch interface {
-    Presence() []uint64        // bitset: 1 bit per block (1 = column present)
-    Distinct() []uint32        // HLL cardinality per block (0 for absent blocks)
-    CMSEstimate(val string) []uint32  // CMS frequency estimate per block (0 = definitely absent)
+    Presence() []uint64             // bitset: 1 bit per block (1 = column present)
+    Distinct() []uint32             // HLL cardinality per block (0 for absent blocks)
     TopKMatch(valFP uint64) []uint16  // TopK count per block (0 if not in top-K or absent)
     FuseContains(valHash uint64) []bool // fuse membership per block (true = may be present)
 }
 ```
 
 All methods return slices of length `BlockCount()`. For blocks where the column is absent,
-`Distinct` returns 0, `CMSEstimate` returns 0, `TopKMatch` returns 0, and `FuseContains`
-returns true (conservative — no false negatives).
+`Distinct` returns 0, `TopKMatch` returns 0, and `FuseContains` returns true (conservative —
+no false negatives).
 
 ---
 
@@ -216,7 +214,6 @@ type Plan struct {
     PrunedByIndex  int
     PrunedByTime   int
     PrunedByFuse   int
-    PrunedByCMS    int
     BlockScores    map[int]float64
     Explain        string
     Direction      Direction  // ordering of SelectedBlocks; set by PlanWithOptions (default Forward)
@@ -254,19 +251,13 @@ Count of blocks eliminated by BinaryFuse8 membership checks (Stage 2). A block i
 when the fuse filter definitively excludes all queried values for every AND-combined
 top-level predicate. `PrunedByFuse` is 0 when no sketch data is available.
 
-### 4.6 PrunedByCMS
-
-Count of blocks eliminated by Count-Min Sketch zero-estimate checks (Stage 3). A block is
-pruned when CMS.Estimate == 0 for all queried values for every AND-combined top-level
-predicate. `PrunedByCMS` is 0 when no sketch data is available.
-
-### 4.7 BlockScores
+### 4.6 BlockScores
 
 Per-block selectivity score: `freq / max(cardinality, 1)`. Higher scores indicate more
 selective blocks (fewer distinct values relative to query frequency). Only populated when
 sketch data is available and at least one block remains after pruning. Nil otherwise.
 
-### 4.8 Explain
+### 4.7 Explain
 
 ASCII trace of how the predicate tree resolved to block sets. Always populated when
 predicates are present. Format:
@@ -349,24 +340,13 @@ top-level predicate.
 **No false negatives:** BinaryFuse8 has ~0.39% FPR (false positives only). A block that
 does contain the queried value will always pass the fuse check (SPEC-SK-12).
 
-### 5.3c Count-Min Sketch pruning stage (Stage 3)
-
-`pruneByCMSAll` uses `ColumnSketch.CMSEstimate(val)` to eliminate blocks where CMS returns
-zero for all queried values for every AND-combined top-level predicate.
-
-- For each predicate leaf, `cs.CMSEstimate(val)` is called once per value — returns a
-  `[]uint32` slice of length `BlockCount()`.
-- A block is pruned if all estimates are zero across all values and all predicates.
-- CMS never under-counts (SPEC-SK-08), so Estimate==0 is a hard "definitely absent" signal.
-- Returns `PrunedByCMS` count.
-
-### 5.3d Block scoring stage (Stage 4)
+### 5.3c Block scoring stage (Stage 3)
 
 `scoreBlocks` computes a selectivity score for each surviving block:
 `score = sum_over_predicates(freq / max(cardinality, 1))`
 
 - `cardinality` = `cs.Distinct()[blockIdx]` (HLL estimate)
-- `freq` = `cs.TopKMatch(valFP)[blockIdx]` if non-zero, else `cs.CMSEstimate(val)[blockIdx]`
+- `freq` = `cs.TopKMatch(valFP)[blockIdx]` (TopK count; 0 if value is not in top-K for that block)
 
 Higher score = more selective (fewer distinct values relative to query frequency). Stored in
 `Plan.BlockScores`. Nil when no sketch data is available.
@@ -383,7 +363,6 @@ The planner only removes blocks that are **definitely** free of a queried value:
 - Stage 1 (range index): range bucket is conservative — a block is only pruned when the
   value is outside all stored bucket ranges.
 - Stage 2 (fuse): BinaryFuse8 has no false negatives (SPEC-SK-12).
-- Stage 3 (CMS): CMS never under-counts (SPEC-SK-08), so zero is a safe hard prune.
 
 No matching span is ever missed.
 
@@ -438,7 +417,6 @@ type Plan struct {
     PrunedByIndex  int
     PrunedByTime   int
     PrunedByFuse   int
-    PrunedByCMS    int
     BlockScores    map[int]float64
     Explain        string
     Direction      Direction  // ordering of SelectedBlocks; set by PlanWithOptions
