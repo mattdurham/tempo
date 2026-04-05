@@ -310,6 +310,18 @@ func collectGroupKeys(buckets map[string]*aggBucketState, tb vm.TimeBucketSpec) 
 	return keys, numBuckets
 }
 
+// calcInitialCap returns a safe pre-allocation cap for logBuildDenseRows.
+// It avoids int overflow when numBuckets is large by checking the guard condition
+// before multiplying. If nAttrKeys is zero or the product would exceed maxInitialCap,
+// maxInitialCap is returned.
+func calcInitialCap(numBuckets int64, nAttrKeys int) int {
+	const maxInitialCap = 1_000_000
+	if nAttrKeys == 0 || numBuckets > int64(maxInitialCap/nAttrKeys) {
+		return maxInitialCap
+	}
+	return int(numBuckets) * nAttrKeys
+}
+
 // logBuildDenseRows builds the dense time-series grid from accumulated buckets.
 func logBuildDenseRows(
 	buckets map[string]*aggBucketState,
@@ -323,7 +335,11 @@ func logBuildDenseRows(
 	if attrGroupKeys == nil {
 		return nil
 	}
-	rows := make([]LogMetricsRow, 0, int(numBuckets)*len(attrGroupKeys)) //nolint:gosec
+	// BUG-5 fix: guard against overflow when numBuckets is large (e.g. a very wide
+	// time window with fine step granularity). Cap the pre-allocation at 1M rows;
+	// the slice will grow naturally via append if needed.
+	initialCap := calcInitialCap(numBuckets, len(attrGroupKeys))
+	rows := make([]LogMetricsRow, 0, initialCap)
 	for _, attrGroupKey := range attrGroupKeys {
 		var attrVals []string
 		if attrGroupKey != "" {

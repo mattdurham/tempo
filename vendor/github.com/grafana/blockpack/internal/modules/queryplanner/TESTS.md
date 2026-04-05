@@ -108,7 +108,7 @@ The following tests were removed when the column-name bloom filter was removed
 
 - **QP-T-03: TestPlanBloomPruning** — column absent from some blocks eliminated by bloom.
   No replacement needed: column presence is no longer a pruning criterion. Value-level
-  pruning is covered by the CMS/Fuse8 sketch index (future Phase 5).
+  pruning is covered by the Fuse8 sketch index (SPEC-SK-12).
 - **QP-T-05: TestPlanORBloomPruning** — OR bloom predicate retains blocks with any column.
   No replacement needed for the same reason.
 
@@ -197,36 +197,36 @@ Back-ref: `planner_log_test.go:TestPlan_TimeRange_ZeroMaxNano_OpenUpperBound`
 
 ## 10. Sketch-Based Pruning Tests
 
-### QP-T-17: TestPlanCMSPruning
+### QP-T-17: TestPlanFusePruning
 
-**Scenario:** CMS sketch data is present; block containing only service-B has estimate==0
-for service-A; combined pruning (range+fuse+CMS) selects only block 0.
+**Scenario:** BinaryFuse8 sketch data is present; block containing only service-B is pruned
+by fuse check for service-A; combined pruning (range+fuse) selects only block 0.
 
 **Setup:**
 - Two-block file: block 0 has 5 spans with service.name="service-A", block 1 has 5 spans
   with service.name="service-B".
-- Verify via `r.ColumnSketch(col).CMSEstimate("service-A")` that block 1 estimate==0.
+- Verify via `r.ColumnSketch(col).FuseContains(hash)` that block 1 returns false for service-A hash.
 - Call `Plan` with `Predicate{Columns:["resource.service.name"], Values:["service-A"]}`.
 
 **Assertions:**
-- `cs.CMSEstimate("service-A")[0] > 0` (block 0 has service-A).
-- `cs.CMSEstimate("service-A")[1] == 0` (block 1 definitely doesn't have service-A).
+- `cs.FuseContains(hashOfServiceA)[0] == true` (block 0 may contain service-A).
+- `cs.FuseContains(hashOfServiceA)[1] == false` (block 1 definitely doesn't have service-A).
 - `plan.SelectedBlocks == [0]`.
-- `plan.PrunedByIndex + plan.PrunedByFuse + plan.PrunedByCMS > 0`.
+- `plan.PrunedByIndex + plan.PrunedByFuse > 0`.
 
-Back-ref: `scoring_test.go:TestPlanCMSPruning`
+Back-ref: `scoring_test.go:TestPlanFusePruning`
 
 ---
 
-### QP-T-18: TestPlanCMSNoPruneForFalsePositive
+### QP-T-18: TestPlanNoPruneForFalsePositive
 
-**Scenario:** A block containing the queried value is never pruned (no false negatives).
+**Scenario:** A block containing the queried value is never pruned (no false negatives from fuse).
 
 **Setup:** Same two-block file. Predicate for "service-A".
 
 **Assertions:** Block 0 (containing service-A) is always in `plan.SelectedBlocks`.
 
-Back-ref: `scoring_test.go:TestPlanCMSNoPruneForFalsePositive`
+Back-ref: `scoring_test.go:TestPlanNoPruneForFalsePositive`
 
 ---
 
@@ -291,14 +291,13 @@ Back-ref: `scoring_test.go:TestBlockTopK`
 
 ### QP-T-27: TestColumnMajorRoundTrip
 
-**Scenario:** Column-major sketch data (HLL, CMS, Fuse, TopK) survives a full
+**Scenario:** Column-major sketch data (HLL, Fuse, TopK) survives a full
 write→flush→parse round-trip without data loss or corruption.
 
 **Setup:** Two-block file with distinct service names. Call `r.ColumnSketch(col)` and
-verify `CMSEstimate`, `FuseContains`, `TopKMatch`, and `Distinct` return non-zero/correct
-values.
+verify `FuseContains`, `TopKMatch`, and `Distinct` return non-zero/correct values.
 
-**Assertions:** Sketch data is non-nil. At least one column has a non-zero CMS estimate.
+**Assertions:** Sketch data is non-nil. At least one column has a non-zero TopK count.
 FuseContains returns true for a present value.
 
 Back-ref: `scoring_test.go:TestColumnMajorRoundTrip`

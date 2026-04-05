@@ -68,21 +68,6 @@ func (c *CountMinSketch) Estimate(v string) uint16 {
 	return minVal
 }
 
-// Merge adds all counters from other into c, element-wise, with uint16 saturation.
-// Used to build file-level aggregated sketches from per-block sketches.
-func (c *CountMinSketch) Merge(other *CountMinSketch) {
-	for i := range cmsD {
-		for j := range cmsW {
-			sum := uint32(c.rows[i][j]) + uint32(other.rows[i][j])
-			if sum > math.MaxUint16 {
-				c.rows[i][j] = math.MaxUint16
-			} else {
-				c.rows[i][j] = uint16(sum) //nolint:gosec // safe: sum <= MaxUint16
-			}
-		}
-	}
-}
-
 // Marshal serializes the CMS to 512 bytes, little-endian uint16. (SPEC-SK-09)
 func (c *CountMinSketch) Marshal() []byte {
 	b := make([]byte, cmsMarshalSz)

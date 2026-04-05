@@ -567,10 +567,7 @@ func encodeInt64DictPayload(entries []int64) []byte {
 
 	for _, e := range entries {
 		var tmp [8]byte
-		binary.LittleEndian.PutUint64(
-			tmp[:],
-			uint64(e),
-		) //nolint:gosec // safe: reinterpreting int64 bits as uint64 for serialization
+		binary.LittleEndian.PutUint64(tmp[:], uint64(e)) //nolint:gosec // safe: reinterpreting int64 bits as uint64
 		buf = append(buf, tmp[:]...)
 	}
 

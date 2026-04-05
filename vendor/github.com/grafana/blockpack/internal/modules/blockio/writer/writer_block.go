@@ -72,7 +72,7 @@ type blockBuilder struct {
 	// The map key is the column name; the value holds min/max encoded keys.
 	colMinMax map[string]*blockColMinMax // column name → min/max for this block
 
-	// colSketches accumulates HLL, CMS, and fuse keys per column for this block.
+	// colSketches accumulates HLL, TopK, and fuse keys per column for this block.
 	// Populated alongside colMinMax; flushed at block write time.
 	colSketches blockSketchSet
 
@@ -111,7 +111,7 @@ type blockColMinMax struct {
 type builtBlock struct {
 	traceRows   map[[16]byte]struct{}
 	colMinMax   map[string]*blockColMinMax // per-column min/max for this block
-	colSketches blockSketchSet             // per-column HLL/CMS/fuse sketches for this block
+	colSketches blockSketchSet             // per-column HLL/TopK/fuse sketches for this block
 	payload     []byte
 	spanCount   int
 	minStart    uint64
@@ -148,8 +148,8 @@ func (b *blockBuilder) reset(spanHint int) {
 		delete(b.colMinMax, k)
 	}
 
-	// Reset colSketches for reuse.
-	b.colSketches = newBlockSketchSet()
+	// Reset colSketches for reuse (pool-aware).
+	b.colSketches = getBlockSketchSet()
 }
 
 // buildBlock constructs a single block from the given pending spans and returns
@@ -198,7 +198,17 @@ func buildBlock(
 			bb.addRowFromBlock(ps.srcBlock, ps.srcRowIdx, rowIdx)
 			if ps.srcReader != nil {
 				k := readerBlockKey{ps.srcReader, ps.srcBlockIdx}
-				bb.feedIntrinsicsFromIndex(intrinsicIndexCache[k], ps.srcRowIdx, rowIdx)
+				// feedIntrinsicsFromIndex is only needed for v4+ blocks that store
+				// identity columns (trace:id, span:id, etc.) exclusively in the
+				// intrinsic section. For v3 blocks that use dual storage (same fields
+				// in both block columns and the intrinsic section), addRowFromBlock
+				// has already written these fields via applyTraceID and friends.
+				// Calling feedIntrinsicsFromIndex for a dual-storage block would
+				// append a second entry to the intrinsic accumulator for the same
+				// (blockIdx, rowIdx), causing GetTraceByID to return each span twice.
+				if ps.srcBlock.GetColumn(traceIDColumnName) == nil {
+					bb.feedIntrinsicsFromIndex(intrinsicIndexCache[k], ps.srcRowIdx, rowIdx)
+				}
 			}
 		case ps.tempoSpan != nil:
 			bb.addRowFromTempoProto(ps, rowIdx)
@@ -1363,7 +1373,7 @@ func (b *blockBuilder) internColName(key string, cache map[string]string, prefix
 }
 
 // updateMinMax updates the per-block min/max for the named column and records the
-// value in the sketch accumulators (HLL, CMS, BinaryFuse8 keys).
+// value in the sketch accumulators (HLL, TopK, BinaryFuse8 keys).
 // key is the encoded range key (from encodeRangeKey). Called once per present value.
 // On first call for a column, min and max are both set to key.
 // On subsequent calls, min and max are updated using type-aware comparison.
@@ -1588,7 +1598,7 @@ func (b *blockBuilder) finalize(enc *zstdEncoder, blockVersion uint8) ([]byte, e
 
 	for i, bl := range blobs {
 		dataOff := curDataOff
-		dataLen := uint64(dataSizes[i])
+		dataLen := uint64(dataSizes[i]) //nolint:gosec // safe: dataSizes[i] is a non-negative byte count
 
 		// name_len[2 LE]
 		nameLen := len(bl.name)

@@ -504,3 +504,24 @@ func TestBlockColumnProvider_StreamScanEqualAny_MissingColumn(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 0, n)
 }
+
+// TestRowCompareString_Int64Coercion verifies that an int64 query value matches
+// a string column containing the decimal representation of that integer.
+// Regression test for the bug where {span.http.status_code = 500} matched
+// nothing on a string-typed column because int64 was not handled.
+func TestRowCompareString_Int64Coercion(t *testing.T) {
+	cmp, ok := rowCompareString("500", int64(500))
+	require.True(t, ok, "int64 coercion should succeed")
+	assert.Equal(t, 0, cmp, "\"500\" should equal int64(500)")
+
+	cmp, ok = rowCompareString("404", int64(500))
+	require.True(t, ok)
+	assert.Less(t, cmp, 0, "\"404\" should be less than int64(500)")
+
+	cmp, ok = rowCompareString("501", int64(500))
+	require.True(t, ok)
+	assert.Greater(t, cmp, 0, "\"501\" should be greater than int64(500)")
+
+	_, ok = rowCompareString("not-a-number", int64(500))
+	assert.False(t, ok, "non-numeric string should return ok=false")
+}

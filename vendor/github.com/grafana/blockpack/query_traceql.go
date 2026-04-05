@@ -18,17 +18,22 @@ import (
 )
 
 // streamFilterQuery executes a TraceQL filter query against a modules-format reader.
-func streamFilterQuery(r *Reader, filterExpr *traceqlparser.FilterExpression, opts QueryOptions, fn spanMatchFn) error {
+func streamFilterQuery(
+	r *Reader,
+	filterExpr *traceqlparser.FilterExpression,
+	opts QueryOptions,
+	fn spanMatchFn,
+) (QueryStats, error) {
 	program, compileErr := vm.CompileTraceQLFilter(filterExpr)
 	if compileErr != nil {
-		return fmt.Errorf("compile TraceQL filter: %w", compileErr)
+		return QueryStats{}, fmt.Errorf("compile TraceQL filter: %w", compileErr)
 	}
 
 	return streamFilterProgram(r, program, opts, fn)
 }
 
 // streamFilterProgram executes a compiled filter program against a modules-format reader.
-func streamFilterProgram(r *Reader, program *vm.Program, opts QueryOptions, fn spanMatchFn) error {
+func streamFilterProgram(r *Reader, program *vm.Program, opts QueryOptions, fn spanMatchFn) (QueryStats, error) {
 	// SPEC-STREAM-8: MostRecent maps to Backward direction with span:start timestamp sorting.
 	// span:start is always present in searchMetaColumns so no extra I/O is needed.
 	// When MostRecent+Limit, Collect gives globally top-K results by span:start.
@@ -44,9 +49,9 @@ func streamFilterProgram(r *Reader, program *vm.Program, opts QueryOptions, fn s
 		collectOpts.Direction = modules_queryplanner.Backward
 		collectOpts.TimestampColumn = "span:start"
 	}
-	rows, _, err := modules_executor.Collect(r, program, collectOpts)
+	rows, stats, err := modules_executor.Collect(r, program, collectOpts)
 	if err != nil {
-		return err
+		return stats, err
 	}
 	// Intrinsic ID maps are built lazily: only constructed on the first block-scan result
 	// row where the block columns lack trace:id / span:id. For dual-storage files (PR #174+)
@@ -107,7 +112,7 @@ func streamFilterProgram(r *Reader, program *vm.Program, opts QueryOptions, fn s
 		modules_blockio.ReleaseSpanFieldsAdapter(rawAdapter)
 	}
 	fn(nil, false)
-	return nil
+	return stats, nil
 }
 
 // emitAllSpans sends every span in allSpans to fn, honoring the given limit
@@ -144,7 +149,7 @@ func streamPipelineQuery(r *Reader, mq *traceqlparser.MetricsQuery, opts QueryOp
 	filterOpts.Limit = 0
 
 	var allSpans []SpanMatch
-	streamErr := streamFilterProgram(r, program, filterOpts, func(match *SpanMatch, more bool) bool {
+	_, streamErr := streamFilterProgram(r, program, filterOpts, func(match *SpanMatch, more bool) bool {
 		if !more {
 			return false
 		}

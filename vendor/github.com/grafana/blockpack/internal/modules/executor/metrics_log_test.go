@@ -425,3 +425,35 @@ func TestMetrics_RowsOutsideTimeRange(t *testing.T) {
 	require.Len(t, result.Rows, 1)
 	assert.Equal(t, float64(1), result.Rows[0].Values["count_over_time"])
 }
+
+// TestMetrics_MediumNumBuckets verifies that ExecuteLogMetrics handles a moderate number
+// of buckets correctly end-to-end (BUG-5 regression test — small numBuckets variant).
+// The overflow-branch guard is exercised by TestLogBuildDenseRows_CapPrealloc_OverflowBranch
+// in metrics_log_overflow_test.go, which calls logBuildDenseRows directly.
+// This test confirms that the full ExecuteLogMetrics pipeline returns valid results
+// and does not panic for a numBuckets value that keeps execution fast.
+func TestMetrics_MediumNumBuckets(t *testing.T) {
+	var buf bytes.Buffer
+	w := mustNewLogMetricsWriter(t, &buf, 0)
+
+	const secondNS = int64(1_000_000_000)
+	startNS := int64(1_000_000_000_000)
+
+	// Write one log record so the reader has data to process.
+	require.NoError(t, w.AddLogsData(makeLogRecord("svc", "test", nil, uint64(startNS+1_000)))) //nolint:gosec
+	_, err := w.Flush()
+	require.NoError(t, err)
+
+	r := openLogMetricsReader(t, buf.Bytes())
+	prog := compileSelectorProgram(t, `{service.name = "svc"}`)
+
+	// numBuckets = 100: small enough for fast test execution, verifies end-to-end
+	// pipeline works correctly with time bucketing.
+	qs := makeTimeBucketSpec(startNS, secondNS, 100)
+
+	assert.NotPanics(t, func() {
+		result, execErr := modules_executor.ExecuteLogMetrics(r, prog, nil, &qs, "count_over_time", nil)
+		require.NoError(t, execErr)
+		require.NotNil(t, result)
+	}, "ExecuteLogMetrics must not panic with numBuckets=100")
+}

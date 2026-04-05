@@ -317,6 +317,8 @@ value is definitely absent.
 
 **Back-ref:** `internal/modules/queryplanner/scoring.go:pruneByCMSAll`
 
+*Superseded [2026-04-02]: `pruneByCMSAll` and `CMSEstimate` removed from scoring.go; CMS pruning stage eliminated from the query pipeline. See NOTE-018 (CMS removal decision) for rationale.*
+
 ---
 
 ## NOTE-014: Score = freq / max(cardinality, 1) — Selectivity Metric
@@ -331,9 +333,8 @@ used to rank surviving blocks (after pruning) for the executor's early-terminati
 high-scoring blocks are processed first when direction+limit permit early exit.
 
 - `cardinality` = `cs.Distinct()[blockIdx]` (HLL estimate of distinct values in the block)
-- `freq` = `cs.TopKMatch(valFP)[blockIdx]` (exact count if in top-K) else `cs.CMSEstimate(val)[blockIdx]`
-- TopK count is preferred when available because it is an exact count via FP lookup; CMS is
-  used as fallback for values not in the top-K.
+- `freq` = `cs.TopKMatch(valFP)[blockIdx]` (Space-Saving approximate upper-bound if in top-K; 0 if not in top-K)
+- TopK count is the sole frequency source; there is no CMS fallback (see NOTE-018).
 
 **Back-ref:** `internal/modules/queryplanner/scoring.go:scoreBlocks`
 
@@ -352,6 +353,8 @@ actually contain the value. For dense datasets where most blocks contain most co
 eliminates more blocks than CMS for typical point-value queries.
 
 **Back-ref:** `internal/modules/queryplanner/planner.go:Plan` (Stage 2 before Stage 3)
+
+*Superseded [2026-04-02]: CMS pruning (Stage 3) eliminated. Fuse (Stage 2) now runs before block scoring (Stage 3). See NOTE-018 (CMS removal decision) for rationale.*
 
 ---
 
@@ -442,3 +445,45 @@ type sketchIndex struct {
 - `clear` during iteration is safe (we iterate a snapshot or use forward-only scanning).
 
 **Back-ref:** `internal/modules/queryplanner/blockset.go`
+
+---
+
+## NOTE-018: CMS Removal — SKTE Wire Format, skipColumnCMS Backward Compat
+*Added: 2026-04-02*
+
+**Decision:** Remove the Count-Min Sketch (CMS) data structure from the sketch index. New
+files use SKTE format (magic `0x534B5445`) which contains no CMS bytes. Legacy SKTC
+(`0x534B5443`) and SKTD (`0x534B5444`) files are still readable via a zero-alloc skip path.
+`CMSEstimate` is removed from the `ColumnSketch` interface; `pruneByCMSAll` is removed from
+the query planner pipeline.
+
+**Rationale:**
+- CMS added ~70% to sketch section size per block. At production scale this caused OOM
+  during compaction when the sketch index for a large file exceeded available heap.
+- TopK provides exact frequency counts for the top-K values (fingerprint lookup), which is
+  more precise than CMS for the common high-cardinality query patterns.
+- For values outside the top-K, the planner accepts no pruning (conservative pass) rather
+  than relying on CMS estimates that may have high false-positive rates for low-frequency values.
+- BinaryFuse8 pruning (Stage 2) eliminates definitely-absent blocks more reliably than CMS
+  zero-estimate checks for the same query patterns.
+
+**Wire format progression:**
+- SKTC (`0x534B5443`): HLL + CMS + Fuse (legacy; CMS bytes skipped zero-alloc on read)
+- SKTD (`0x534B5444`): HLL + CMS + Fuse (legacy; CMS bytes skipped zero-alloc on read)
+- SKTE (`0x534B5445`): HLL + TopK + Fuse (current; no CMS bytes written)
+
+**fileSketchSummaryMagic bump:** Magic changed from `0x46534B54` ("FSKT") to `0x46534B55`
+("FSKU") to invalidate any externally cached `FileSketchSummary` blobs that embedded CMS
+data. Cached summaries with the old magic return a bad-magic error on unmarshal.
+
+**skipColumnCMS:** Reads `cms_depth` (1 byte) and `cms_width` (uint16 LE) from the file,
+computes `depth × width × 2 × presentCount`, and advances `pos` by that amount. Zero
+allocations; no heap objects created. Handles any depth/width values that may appear in old
+files, not just the CMSDepth=4/CMSWidth=64 defaults.
+
+**Back-ref:**
+- `internal/modules/blockio/reader/sketch_index.go:skipColumnCMS`
+- `internal/modules/blockio/writer/sketch_index.go:writeSketchIndexSection`
+- `internal/modules/blockio/shared/constants.go:fileSketchSummaryMagic`
+- `internal/modules/queryplanner/scoring.go:scoreBlocks` (NOTE-013 superseded)
+- `internal/modules/queryplanner/planner.go:Plan` (NOTE-015 superseded)

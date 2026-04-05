@@ -122,3 +122,48 @@ Lookup is O(N) where N is the attribute count, which is acceptable at the write 
 spans are processed once.
 
 Back-ref: `internal/modules/blockio/shared/types.go:AttrKV`
+
+---
+
+## 8. NOTE-008: BUG-1 Fix — Bounds Check Before refsStart Arithmetic in Flat-Column Scan (2026-04-01)
+*Added: 2026-04-01*
+
+**Decision:** Added division-based bounds checks in `ScanFlatColumnRefs`, `ScanFlatColumnTopKRefs`,
+and `ScanFlatColumnRefsFiltered` before computing `refsStart`. Each check uses `rowCount > (len(raw)-pos)/8`
+rather than `pos+rowCount*8 > len(raw)` to avoid 32-bit integer overflow: on 32-bit platforms,
+`rowCount*8` can wrap to a negative value when `rowCount > math.MaxInt/8`, making the addition-based
+check ineffective.
+
+**Rationale:** `rowCount` is an untrusted uint32 read from a snappy-decoded blob. A corrupt
+or adversarially crafted blob can set `rowCount` to any value up to 2^32-1. Without this
+check, `pos + rowCount*8` can produce a value larger than `len(raw)`, making `refsStart`
+point well past the end of the buffer. Subsequent arithmetic on `refsStart`
+(`refPos = refsStart + i*refSize`) could then produce values that look valid to the
+`if refPos+refSize > len(raw)` per-ref guard (e.g. wrap-around on 32-bit platforms), leading
+to out-of-bounds memory access.
+
+The per-ref bounds checks (`if refPos+refSize > len(raw)`) remain in place as a defense-in-depth
+second layer. This new check is the primary gate.
+
+Back-ref: `internal/modules/blockio/shared/intrinsic_codec.go:ScanFlatColumnRefs`,
+`ScanFlatColumnTopKRefs`, `ScanFlatColumnRefsFiltered`
+
+---
+
+## 9. NOTE-009: BUG-13 Fix — Validate blockW/rowW Are 1 or 2 in Flat-Column Scan (2026-04-01)
+*Added: 2026-04-01*
+
+**Decision:** Added `if (blockW != 1 && blockW != 2) || (rowW != 1 && rowW != 2) { return nil }`
+in all flat-column scan callers of `decodeRef`, and added the same check with an error return
+in `decodeVariableWidthRef`.
+
+**Rationale:** `blockW` and `rowW` are read from an untrusted snappy-decoded blob header.
+Valid encoding uses 1-byte or 2-byte fields (supporting up to 256 or 65536 block/row indices
+respectively). Any other value (0, 3, or higher) indicates a corrupt blob. Without this check,
+`decodeRef` with `blockW==0` falls through to `binary.LittleEndian.Uint16` (reads 2 bytes for a
+0-width field), producing a `BlockRef` whose block index is derived from the wrong bytes.
+`decodeVariableWidthRef` had the same flaw. The fix makes both functions fail explicitly on
+invalid widths rather than silently producing garbage.
+
+Back-ref: `internal/modules/blockio/shared/intrinsic_codec.go:decodeVariableWidthRef`,
+`ScanFlatColumnRefs`, `ScanFlatColumnTopKRefs`, `ScanFlatColumnRefsFiltered`

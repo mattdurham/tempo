@@ -210,7 +210,7 @@ func collectStructuralMatches(t *testing.T, data []byte, query string) map[strin
 	r, err := blockpack.NewReaderFromProvider(&memReaderProvider{data: data})
 	require.NoError(t, err)
 
-	matches, err := blockpack.QueryTraceQL(r, query, blockpack.QueryOptions{})
+	matches, _, err := blockpack.QueryTraceQL(r, query, blockpack.QueryOptions{})
 	require.NoError(t, err)
 
 	matched := make(map[string]bool, len(matches))
@@ -413,20 +413,20 @@ func TestQueryTraceQL_MostRecent(t *testing.T) {
 	}
 
 	// Forward (default): block 0 first → span 0 is the first result.
-	fwd, err := blockpack.QueryTraceQL(r, `{}`, blockpack.QueryOptions{})
+	fwd, _, err := blockpack.QueryTraceQL(r, `{}`, blockpack.QueryOptions{})
 	require.NoError(t, err)
 	require.Len(t, fwd, 4)
 	assert.Equal(t, spanIDHex(0), fwd[0].SpanID, "forward: first result must be the oldest span")
 
 	// MostRecent=true (Backward): block 1 first → span 3 is the first result.
-	bwd, err := blockpack.QueryTraceQL(r, `{}`, blockpack.QueryOptions{MostRecent: true})
+	bwd, _, err := blockpack.QueryTraceQL(r, `{}`, blockpack.QueryOptions{MostRecent: true})
 	require.NoError(t, err)
 	require.Len(t, bwd, 4)
 	assert.Equal(t, spanIDHex(3), bwd[0].SpanID, "MostRecent: first result must be the newest span")
 	assert.Equal(t, spanIDHex(2), bwd[1].SpanID, "MostRecent: second result must be the second-newest span")
 
 	// MostRecent=true with Limit=2: exercises the global top-K path (SPEC-STREAM-7, SPEC-STREAM-8).
-	limited, err := blockpack.QueryTraceQL(r, `{}`, blockpack.QueryOptions{MostRecent: true, Limit: 2})
+	limited, _, err := blockpack.QueryTraceQL(r, `{}`, blockpack.QueryOptions{MostRecent: true, Limit: 2})
 	require.NoError(t, err)
 	require.Len(t, limited, 2)
 	assert.Equal(t, spanIDHex(3), limited[0].SpanID, "MostRecent+Limit: first result must be the newest span")
@@ -644,12 +644,12 @@ func TestQueryTraceQL_SubFileShard(t *testing.T) {
 	require.Equal(t, 6, r.BlockCount(), "expected 6 blocks")
 
 	// Full scan: all 6 spans.
-	all, err := blockpack.QueryTraceQL(r, `{}`, blockpack.QueryOptions{})
+	all, _, err := blockpack.QueryTraceQL(r, `{}`, blockpack.QueryOptions{})
 	require.NoError(t, err)
 	require.Len(t, all, 6, "full scan should return all 6 spans")
 
 	// Shard [2, 4): 2 spans.
-	shard, err := blockpack.QueryTraceQL(r, `{}`, blockpack.QueryOptions{
+	shard, _, err := blockpack.QueryTraceQL(r, `{}`, blockpack.QueryOptions{
 		StartBlock: 2,
 		BlockCount: 2,
 	})
@@ -666,13 +666,13 @@ func TestQueryTraceQL_SubFileShard_Validation(t *testing.T) {
 	r, err := blockpack.NewReaderFromProvider(&memReaderProvider{data: data})
 	require.NoError(t, err)
 
-	_, err = blockpack.QueryTraceQL(r, `{}`, blockpack.QueryOptions{
+	_, _, err = blockpack.QueryTraceQL(r, `{}`, blockpack.QueryOptions{
 		StartBlock: -1,
 		BlockCount: 1,
 	})
 	require.Error(t, err, "negative StartBlock should fail")
 
-	_, err = blockpack.QueryTraceQL(r, `{}`, blockpack.QueryOptions{
+	_, _, err = blockpack.QueryTraceQL(r, `{}`, blockpack.QueryOptions{
 		StartBlock: 0,
 		BlockCount: -1,
 	})
@@ -691,7 +691,7 @@ func TestQueryTraceQL_SubFileShard_TimeRange(t *testing.T) {
 	require.Equal(t, 4, r.BlockCount())
 
 	// Shard [0,2) with time range covering only the first block's start time.
-	results, err := blockpack.QueryTraceQL(r, `{}`, blockpack.QueryOptions{
+	results, _, err := blockpack.QueryTraceQL(r, `{}`, blockpack.QueryOptions{
 		StartBlock: 0,
 		BlockCount: 2,
 		StartNano:  1_000_000_000,
@@ -718,12 +718,12 @@ func TestQueryTraceQL_Structural_SubFileShard(t *testing.T) {
 	// Use a simple filter query to count spans per shard instead, since structural
 	// results depend on trace topology. The key invariant is that sharding restricts
 	// which blocks are scanned.
-	allResults, err := blockpack.QueryTraceQL(r, `{}`, blockpack.QueryOptions{})
+	allResults, _, err := blockpack.QueryTraceQL(r, `{}`, blockpack.QueryOptions{})
 	require.NoError(t, err)
 	require.Len(t, allResults, 6, "full scan should return all 6 spans")
 
 	// Shard [0, 1): only block 0 → 2 spans.
-	shard0, err := blockpack.QueryTraceQL(r, `{}`, blockpack.QueryOptions{
+	shard0, _, err := blockpack.QueryTraceQL(r, `{}`, blockpack.QueryOptions{
 		StartBlock: 0,
 		BlockCount: 1,
 	})
@@ -731,7 +731,7 @@ func TestQueryTraceQL_Structural_SubFileShard(t *testing.T) {
 	assert.Len(t, shard0, 2, "shard [0,1) should return 2 spans from block 0")
 
 	// Shard [1, 3): blocks 1 and 2 → 4 spans.
-	shard12, err := blockpack.QueryTraceQL(r, `{}`, blockpack.QueryOptions{
+	shard12, _, err := blockpack.QueryTraceQL(r, `{}`, blockpack.QueryOptions{
 		StartBlock: 1,
 		BlockCount: 2,
 	})
@@ -752,7 +752,7 @@ func TestQueryTraceQL_SubFileShard_StartBlockWithoutBlockCount(t *testing.T) {
 	r, err := blockpack.NewReaderFromProvider(&memReaderProvider{data: data})
 	require.NoError(t, err)
 
-	_, err = blockpack.QueryTraceQL(r, `{}`, blockpack.QueryOptions{
+	_, _, err = blockpack.QueryTraceQL(r, `{}`, blockpack.QueryOptions{
 		StartBlock: 5,
 		BlockCount: 0,
 	})
@@ -771,7 +771,7 @@ func TestQueryTraceQL_SubFileShard_UnboundedEndNano(t *testing.T) {
 	require.NoError(t, err)
 
 	// StartNano set, EndNano==0 → should behave as unbounded upper bound.
-	results, err := blockpack.QueryTraceQL(r, `{}`, blockpack.QueryOptions{
+	results, _, err := blockpack.QueryTraceQL(r, `{}`, blockpack.QueryOptions{
 		StartNano: 1,
 		EndNano:   0,
 	})
@@ -788,7 +788,7 @@ func TestQueryTraceQL_SubFileShard_StartNanoAfterEndNano(t *testing.T) {
 	r, err := blockpack.NewReaderFromProvider(&memReaderProvider{data: data})
 	require.NoError(t, err)
 
-	_, err = blockpack.QueryTraceQL(r, `{}`, blockpack.QueryOptions{
+	_, _, err = blockpack.QueryTraceQL(r, `{}`, blockpack.QueryOptions{
 		StartNano: 5000,
 		EndNano:   1000,
 	})
@@ -855,7 +855,7 @@ func TestQueryTraceQL_PipelineCount(t *testing.T) {
 	})
 	r, err := blockpack.NewReaderFromProvider(&memReaderProvider{data: data})
 	require.NoError(t, err)
-	results, err := blockpack.QueryTraceQL(
+	results, _, err := blockpack.QueryTraceQL(
 		r,
 		`{ resource.service.name = "test-svc" } | count()`,
 		blockpack.QueryOptions{},
@@ -875,7 +875,7 @@ func TestQueryTraceQL_PipelineAvg(t *testing.T) {
 	})
 	r, err := blockpack.NewReaderFromProvider(&memReaderProvider{data: data})
 	require.NoError(t, err)
-	results, err := blockpack.QueryTraceQL(
+	results, _, err := blockpack.QueryTraceQL(
 		r,
 		`{ span.latency_ms > 0 } | avg(span.latency_ms)`,
 		blockpack.QueryOptions{},
@@ -896,7 +896,7 @@ func TestQueryTraceQL_PipelineMin(t *testing.T) {
 	})
 	r, err := blockpack.NewReaderFromProvider(&memReaderProvider{data: data})
 	require.NoError(t, err)
-	results, err := blockpack.QueryTraceQL(
+	results, _, err := blockpack.QueryTraceQL(
 		r,
 		`{ span.latency_ms > 0 } | min(span.latency_ms) > 15`,
 		blockpack.QueryOptions{},
@@ -923,7 +923,7 @@ func TestQueryTraceQL_PipelineMax(t *testing.T) {
 	})
 	r, err := blockpack.NewReaderFromProvider(&memReaderProvider{data: data})
 	require.NoError(t, err)
-	results, err := blockpack.QueryTraceQL(
+	results, _, err := blockpack.QueryTraceQL(
 		r,
 		`{ span.latency_ms > 0 } | max(span.latency_ms) < 50`,
 		blockpack.QueryOptions{},
@@ -953,7 +953,7 @@ func TestQueryTraceQL_PipelineThreshold(t *testing.T) {
 	})
 	r, err := blockpack.NewReaderFromProvider(&memReaderProvider{data: data})
 	require.NoError(t, err)
-	results, err := blockpack.QueryTraceQL(
+	results, _, err := blockpack.QueryTraceQL(
 		r,
 		`{ resource.service.name = "test-svc" } | count() > 3`,
 		blockpack.QueryOptions{},
@@ -976,7 +976,7 @@ func TestQueryTraceQL_PipelineNoMatchingField(t *testing.T) {
 	})
 	r, err := blockpack.NewReaderFromProvider(&memReaderProvider{data: data})
 	require.NoError(t, err)
-	results, err := blockpack.QueryTraceQL(
+	results, _, err := blockpack.QueryTraceQL(
 		r,
 		`{ resource.service.name = "test-svc" } | avg(span.latency_ms)`,
 		blockpack.QueryOptions{},
@@ -996,7 +996,7 @@ func TestQueryTraceQL_PipelineNoAggregate(t *testing.T) {
 	})
 	r, err := blockpack.NewReaderFromProvider(&memReaderProvider{data: data})
 	require.NoError(t, err)
-	results, err := blockpack.QueryTraceQL(
+	results, _, err := blockpack.QueryTraceQL(
 		r,
 		`{ resource.service.name = "test-svc" } | by(resource.service.name)`,
 		blockpack.QueryOptions{},
@@ -1019,7 +1019,7 @@ func TestQueryTraceQL_PipelineSum(t *testing.T) {
 	require.NoError(t, err)
 
 	// sum(10+20+30) = 60.0; no threshold → spanset passes → all 3 spans emitted.
-	results, err := blockpack.QueryTraceQL(
+	results, _, err := blockpack.QueryTraceQL(
 		r,
 		`{ span.latency_ms > 0 } | sum(span.latency_ms)`,
 		blockpack.QueryOptions{},
@@ -1044,7 +1044,7 @@ func TestSelectColumns(t *testing.T) {
 
 	// Query requesting only span:name and resource.service.name.
 	wantCols := []string{"span:name", "resource.service.name"}
-	results, err := blockpack.QueryTraceQL(r, `{}`, blockpack.QueryOptions{
+	results, _, err := blockpack.QueryTraceQL(r, `{}`, blockpack.QueryOptions{
 		SelectColumns: wantCols,
 	})
 	require.NoError(t, err)
@@ -1092,7 +1092,7 @@ func TestSelectColumns_NilMeansAll(t *testing.T) {
 	require.NoError(t, err)
 
 	// No SelectColumns — all fields must be available.
-	results, err := blockpack.QueryTraceQL(r, `{}`, blockpack.QueryOptions{})
+	results, _, err := blockpack.QueryTraceQL(r, `{}`, blockpack.QueryOptions{})
 	require.NoError(t, err)
 	require.NotEmpty(t, results)
 
@@ -1104,4 +1104,75 @@ func TestSelectColumns_NilMeansAll(t *testing.T) {
 			t.Errorf("span %d: GetField(span:start) should be accessible when SelectColumns is nil", i)
 		}
 	}
+}
+
+// writeBlockpackWithStatusCodes writes a blockpack file containing spans with a
+// string-typed span.http.status_code attribute set to "200" or "500".
+func writeBlockpackWithStatusCodes(t *testing.T) []byte {
+	t.Helper()
+	output := &bytes.Buffer{}
+	w, err := blockpack.NewWriter(output, 10)
+	require.NoError(t, err)
+
+	codes := []string{"200", "500", "200", "500", "500"}
+	for i, code := range codes {
+		spanID := [8]byte{0, 0, 0, 0, 0, 0, 0, byte(i + 1)}                           //nolint:gosec
+		traceID := [16]byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, byte(i + 1)} //nolint:gosec
+		td := &tracev1.TracesData{
+			ResourceSpans: []*tracev1.ResourceSpans{{
+				Resource: &resourcev1.Resource{
+					Attributes: []*commonv1.KeyValue{{
+						Key:   "service.name",
+						Value: &commonv1.AnyValue{Value: &commonv1.AnyValue_StringValue{StringValue: "svc"}},
+					}},
+				},
+				ScopeSpans: []*tracev1.ScopeSpans{{
+					Spans: []*tracev1.Span{{
+						TraceId:           traceID[:],
+						SpanId:            spanID[:],
+						Name:              "req",
+						StartTimeUnixNano: uint64(1_000_000_000 + i*1_000_000), //nolint:gosec
+						EndTimeUnixNano:   uint64(1_001_000_000 + i*1_000_000), //nolint:gosec
+						Attributes: []*commonv1.KeyValue{{
+							Key:   "http.status_code",
+							Value: &commonv1.AnyValue{Value: &commonv1.AnyValue_StringValue{StringValue: code}},
+						}},
+					}},
+				}},
+			}},
+		}
+		require.NoError(t, w.AddTracesData(td))
+	}
+	_, err = w.Flush()
+	require.NoError(t, err)
+	return output.Bytes()
+}
+
+// TestQueryTraceQL_Int64CoercionOnStringColumn verifies that an integer literal
+// in a TraceQL filter matches a string-typed column, e.g. {span.http.status_code = 500}.
+func TestQueryTraceQL_Int64CoercionOnStringColumn(t *testing.T) {
+	data := writeBlockpackWithStatusCodes(t)
+	r, err := blockpack.NewReaderFromProvider(&memReaderProvider{data: data})
+	require.NoError(t, err)
+
+	intMatches, _, err := blockpack.QueryTraceQL(r, `{span.http.status_code = 500}`, blockpack.QueryOptions{})
+	require.NoError(t, err)
+
+	strMatches, _, err := blockpack.QueryTraceQL(r, `{span.http.status_code = "500"}`, blockpack.QueryOptions{})
+	require.NoError(t, err)
+
+	require.NotEmpty(t, intMatches, "integer literal should match string column '500'")
+	assert.Equal(t, len(strMatches), len(intMatches), "integer and string literals should match same spans")
+}
+
+// TestQueryTraceQL_StatsPopulatedForFilterQuery verifies that QueryTraceQL returns
+// non-empty QueryStats for a filter query.
+func TestQueryTraceQL_StatsPopulatedForFilterQuery(t *testing.T) {
+	data := writeTestBlockpack(t, 5, 5)
+	r, err := blockpack.NewReaderFromProvider(&memReaderProvider{data: data})
+	require.NoError(t, err)
+
+	_, stats, err := blockpack.QueryTraceQL(r, `{}`, blockpack.QueryOptions{})
+	require.NoError(t, err)
+	assert.NotEmpty(t, stats.ExecutionPath, "ExecutionPath should be populated for a filter query")
 }

@@ -58,7 +58,7 @@ func TestConvertFromParquetBlock_Roundtrip(t *testing.T) {
 	got := make(map[string]spanRecord)
 
 	var bpMatches []blockpack.SpanMatch
-	bpMatches, err = blockpack.QueryTraceQL(r, "{}", blockpack.QueryOptions{})
+	bpMatches, _, err = blockpack.QueryTraceQL(r, "{}", blockpack.QueryOptions{})
 	require.NoError(t, err)
 	for _, m := range bpMatches {
 		rec := spanRecord{}
@@ -159,7 +159,7 @@ func TestConvertFromProtoFile_Roundtrip(t *testing.T) {
 	got := make(map[string]spanRecord)
 
 	var bpMatches []blockpack.SpanMatch
-	bpMatches, err = blockpack.QueryTraceQL(r, "{}", blockpack.QueryOptions{})
+	bpMatches, _, err = blockpack.QueryTraceQL(r, "{}", blockpack.QueryOptions{})
 	require.NoError(t, err)
 	for _, m := range bpMatches {
 		rec := spanRecord{}

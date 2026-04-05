@@ -34,9 +34,17 @@ func NewHyperLogLog() *HyperLogLog {
 	return &HyperLogLog{}
 }
 
+// Reset clears all registers, returning the HLL to its zero state for reuse.
+func (h *HyperLogLog) Reset() { h.regs = [hllM]uint8{} }
+
 // Add hashes v and updates registers. Never panics. (SPEC-SK-01)
 func (h *HyperLogLog) Add(v string) {
-	hash := hllHash(v)
+	h.AddHash(hllHash(v))
+}
+
+// AddHash updates registers from a pre-computed hash, skipping the hash step.
+// Use when the caller already holds the HashForFuse fingerprint for the same value.
+func (h *HyperLogLog) AddHash(hash uint64) {
 	reg := hash >> (64 - hllP)               // top p bits select register index (0..15)
 	w := hash << hllP                        // shift out top p bits; remaining bits for rho
 	rho := uint8(bits.LeadingZeros64(w)) + 1 //nolint:gosec // safe: LeadingZeros64 returns 0..64, fits uint8

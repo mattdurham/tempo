@@ -81,8 +81,8 @@ when counts are equal. An empty TopK returns nil.
 Back-ref: `internal/modules/sketch/topk.go:Entries`
 
 ## SPEC-SK-18
-**TopK key truncation** — `TopK.Add(key)` and `TopK.MarshalBinary()` truncate keys to at most
-`TopKMaxKeyLen` (100) bytes. This prevents unbounded memory growth from large keys.
+**TopK fingerprint hashing** — `TopK.Add(key)` hashes the key via `HashForFuse(key)` (SPEC-SK-16)
+and delegates to `AddFP`. No key string is stored; only the uint64 fingerprint and its count.
 Back-ref: `internal/modules/sketch/topk.go:Add`
 
 ## SPEC-SK-26

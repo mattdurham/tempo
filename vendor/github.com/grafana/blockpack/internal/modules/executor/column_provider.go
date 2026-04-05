@@ -147,8 +147,8 @@ func rowCompare(col *modules_reader.Column, rowIdx int, value interface{}) (int,
 	return 0, false
 }
 
-// rowCompareString compares a stored string value against a query value (string or float64).
-// For float64 targets, the stored string is parsed as float64 (LabelFilterStage semantics).
+// rowCompareString compares a stored string value against a query value (string, float64, or int64).
+// For float64/int64 targets, the stored string is parsed as the target numeric type (LabelFilterStage semantics).
 func rowCompareString(v string, value interface{}) (int, bool) {
 	if s, ok := value.(string); ok {
 		return cmp3(v, s)
@@ -159,6 +159,13 @@ func rowCompareString(v string, value interface{}) (int, bool) {
 			return 0, false
 		}
 		return cmp3(parsed, f)
+	}
+	if i, ok := value.(int64); ok {
+		parsed, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		return cmp3(parsed, i)
 	}
 	return 0, false
 }
