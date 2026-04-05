@@ -246,6 +246,9 @@ func New(cfg *Config, cacheProvider cache.Provider, logger gkLog.Logger) (Reader
 	if cfg.Block != nil && cfg.Block.Blockpack.FileCachePath != "" {
 		vblockpack.ConfigureFileCache(cfg.Block.Blockpack.FileCachePath, cfg.Block.Blockpack.FileCacheMaxBytes)
 	}
+	if cfg.Block != nil && cfg.Block.Blockpack.EmbeddingURL != "" {
+		vblockpack.ConfigureEmbedding(cfg.Block.Blockpack.EmbeddingURL)
+	}
 
 	return rw, rw, rw, nil
 }

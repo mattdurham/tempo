@@ -76,6 +76,29 @@ const (
 
 )
 
+// VectorIndex section constants.
+const (
+	// VectorIndexMagic is the magic number for the vector index section. "VECI" in ASCII.
+	VectorIndexMagic   uint32 = 0x56454349
+	VectorIndexVersion uint8  = 0x01
+
+	// FooterV5Version extends V4 with vectorIndexOffset[8] + vectorIndexLen[4] = 12 extra bytes.
+	// V5 total: 34 (V4) + 12 = 46 bytes.
+	FooterV5Version uint16 = 5
+	FooterV5Size    uint   = 46 // version[2]+headerOffset[8]+compactOffset[8]+compactLen[4]+intrinsicOffset[8]+intrinsicLen[4]+vectorOffset[8]+vectorLen[4]
+)
+
+// Well-known vector column names. Double-underscore prefix signals internal/synthetic columns.
+// VECTOR_AI queries search __embedding__; VECTOR_ALL queries search __embedding_all__.
+const (
+	// EmbeddingColumnName is the vector column for VECTOR_AI (custom field config).
+	EmbeddingColumnName     = "__embedding__"
+	EmbeddingTextColumnName = "__embedding_text__"
+	// EmbeddingAllColumnName is the vector column for VECTOR_ALL (auto-assembled all fields).
+	EmbeddingAllColumnName     = "__embedding_all__"
+	EmbeddingAllTextColumnName = "__embedding_all_text__"
+)
+
 // MaxIntrinsicRows is the safety cap on accumulated rows. If total rows across all
 // blocks exceeds this, the intrinsic section is written empty (TOC with 0 columns).
 // Declared as a var (not const) so tests can temporarily lower it without writing 10M spans.

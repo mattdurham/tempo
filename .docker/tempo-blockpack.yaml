@@ -53,6 +53,9 @@ block_builder:
   consume_cycle_duration: 10s
   block:
     version: vblockpack
+    blockpack:
+      embedding_url: "http://embed-server:80"
+      vector_dimension: 768
   wal:
     ingestion_time_range_slack: 876000h
   assigned_partitions:
@@ -108,6 +111,8 @@ storage:
         file_cache_path: /var/tempo/blockpack-cache
         file_cache_max_bytes: 21474836480  # 20GB
         # lru_cache_bytes removed — SharedLRU replaced by objectcache
+        embedding_url: "http://embed-server:80"
+        vector_dimension: 768
     wal:
       path: /var/tempo/wal
 

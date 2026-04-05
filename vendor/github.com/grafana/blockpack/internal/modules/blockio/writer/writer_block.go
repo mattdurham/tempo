@@ -11,6 +11,7 @@ import (
 	"slices"
 
 	tempotrace "github.com/grafana/tempo/pkg/tempopb/trace/v1"
+	commonv1 "go.opentelemetry.io/proto/otlp/common/v1"
 	tracev1 "go.opentelemetry.io/proto/otlp/trace/v1"
 
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
@@ -55,7 +56,7 @@ type blockBuilder struct {
 	columns   map[shared.ColumnKey]columnBuilder // column (name, type) → builder (all columns, for finalize)
 	traceRows map[[16]byte]struct{}              // trace_id set; used by writer.go to build file-level trace index
 
-	// intrinsicAccum is the file-level accumulator, set by buildAndWriteBlock before
+	// intrinsicAccum is the per-goroutine accumulator, set by buildBlock before
 	// per-row calls. Nil for test helpers that don't need accumulation.
 	intrinsicAccum *intrinsicAccumulator
 
@@ -107,17 +108,26 @@ type blockColMinMax struct {
 
 // builtBlock holds the outputs of buildBlock: the serialized payload and all
 // per-block statistics extracted from blockBuilder after finalization.
-// It is an intermediate value type used only inside buildAndWriteBlock.
+// It is an intermediate value type populated by buildBlock and consumed in the flushBlocks serial pass.
 type builtBlock struct {
 	traceRows   map[[16]byte]struct{}
 	colMinMax   map[string]*blockColMinMax // per-column min/max for this block
 	colSketches blockSketchSet             // per-column HLL/TopK/fuse sketches for this block
-	payload     []byte
-	spanCount   int
-	minStart    uint64
-	maxStart    uint64
-	minTraceID  [16]byte
-	maxTraceID  [16]byte
+	// localAccum holds the per-block intrinsic data built during parallel block
+	// construction. Nil when buildBlock is called without a localAccum (legacy path
+	// or test helpers). Merged into w.intrinsicAccum during the serial post-build pass.
+	localAccum *intrinsicAccumulator
+	// blockVectors holds the extracted float32 vectors from the __embedding__ column.
+	// Populated during the parallel build phase (before bb is returned to the pool)
+	// and consumed by vectorAccum.accumulateBlock in the serial merge pass.
+	// Nil when VectorDimension == 0 or no embedding column was present.
+	blockVectors [][]float32
+	payload      []byte
+	spanCount    int
+	minStart     uint64
+	maxStart     uint64
+	minTraceID   [16]byte
+	maxTraceID   [16]byte
 }
 
 // reset clears the blockBuilder for reuse with the next block.
@@ -138,15 +148,13 @@ func (b *blockBuilder) reset(spanHint int) {
 		delete(b.columns, key)
 	}
 
-	// Clear traceRows map (keep allocated buckets).
-	for k := range b.traceRows {
-		delete(b.traceRows, k)
-	}
-
-	// Clear colMinMax map (keep allocated buckets).
-	for k := range b.colMinMax {
-		delete(b.colMinMax, k)
-	}
+	// Allocate fresh maps for traceRows and colMinMax rather than clearing in-place.
+	// builtBlock captures direct references to these maps, so clearing in-place would
+	// corrupt a previously returned builtBlock if this blockBuilder is reused (via bbPool)
+	// by a concurrent goroutine before the serial merge pass consumes that builtBlock.
+	// Consistent with colSketches which is always replaced, not cleared.
+	b.traceRows = make(map[[16]byte]struct{}, len(b.traceRows))
+	b.colMinMax = make(map[string]*blockColMinMax, len(b.colMinMax))
 
 	// Reset colSketches for reuse (pool-aware).
 	b.colSketches = getBlockSketchSet()
@@ -157,9 +165,12 @@ func (b *blockBuilder) reset(spanHint int) {
 // If bb is non-nil it is reset and reused; otherwise a new blockBuilder is created.
 // intrinsicAccum is the file-level intrinsic accumulator; may be nil (no accumulation).
 // blockID is the 0-based block index used as BlockIdx in intrinsic refs.
+// spanVectors, when non-nil, is parallel to pending: spanVectors[i] is the pre-computed
+// embedding vector for pending[i]. A nil element means no embedding for that span.
+// When spanVectors is nil, no embedding injection is performed (cfg.Embedder == nil path).
 func buildBlock(
 	pending []pendingSpan, enc *zstdEncoder, bb *blockBuilder, blockVersion uint8,
-	intrinsicAccum *intrinsicAccumulator, blockID int,
+	intrinsicAccum *intrinsicAccumulator, blockID int, spanVectors [][]float32,
 ) (builtBlock, *blockBuilder, error) {
 	if bb != nil {
 		bb.reset(len(pending))
@@ -215,6 +226,17 @@ func buildBlock(
 		default:
 			bb.addRowFromProto(ps, rowIdx)
 		}
+
+		// Inject pre-computed embedding vector if auto-embedding is active.
+		// spanVectors[rowIdx] is nil when the span produced no text or the embedder
+		// returned an empty vector; in both cases we skip injection to preserve the
+		// existing behavior (no __embedding__ column for that row).
+		if spanVectors != nil {
+			if vec := spanVectors[rowIdx]; len(vec) > 0 {
+				bb.addVectorPresent(rowIdx, shared.EmbeddingColumnName, vec)
+				bb.addVectorPresent(rowIdx, shared.EmbeddingAllColumnName, vec)
+			}
+		}
 	}
 	payload, err := bb.finalize(enc, blockVersion)
 	if err != nil {
@@ -230,6 +252,7 @@ func buildBlock(
 		traceRows:   bb.traceRows,
 		colMinMax:   bb.colMinMax,
 		colSketches: bb.colSketches,
+		localAccum:  intrinsicAccum,
 	}, bb, nil
 }
 
@@ -314,7 +337,7 @@ func (b *blockBuilder) feedIntrinsicBytes(name string, colType shared.ColumnType
 // per-span AttrKV materialization and attrSlab growth.
 // Column names for dynamic attributes are interned via the block-level name caches.
 //
-//nolint:dupl // intentional mirror of addRowFromTempoProto for OTLP types; different field types prevent sharing
+//nolint:dupl,cyclop,gocyclo // intentional mirror of addRowFromTempoProto for OTLP types; different field types prevent sharing; inherent complexity matches spec-driven intrinsic column set
 func (b *blockBuilder) addRowFromProto(ps *pendingSpan, rowIdx int) {
 	span := ps.span
 
@@ -488,9 +511,7 @@ func (b *blockBuilder) addRowFromProto(ps *pendingSpan, rowIdx int) {
 		if kv == nil {
 			continue
 		}
-		name := b.internColName(kv.Key, b.spanColNames, "span.")
-		val := protoToAttrValue(kv.Value)
-		b.addPresent(rowIdx, name, val.Type, val)
+		b.addSpanAttr(rowIdx, kv)
 	}
 
 	// --- Resource attributes ---
@@ -1077,6 +1098,14 @@ func (b *blockBuilder) addRowFromBlock(srcBlock *modules_reader.Block, srcRowIdx
 			continue
 		}
 
+		// Vector columns: use addVectorPresent instead of addPresent.
+		if baseType == shared.ColumnTypeVectorF32 {
+			if bv, ok := col.BytesValue(srcRowIdx); ok && len(bv) > 0 && len(bv)%4 == 0 {
+				b.addVectorPresent(dstRowIdx, colKey.Name, bytesToFloat32LE(bv))
+			}
+			continue
+		}
+
 		// Dynamic attribute columns: read typed value and call addPresent to write to block column.
 		val, ok := readDynAttrValue(col, srcRowIdx, baseType)
 		if !ok {
@@ -1643,4 +1672,106 @@ func appendUint64LE(buf []byte, v uint64) []byte {
 	var tmp [8]byte
 	binary.LittleEndian.PutUint64(tmp[:], v)
 	return append(buf, tmp[:]...)
+}
+
+// extractBlockVectors extracts all present float32 vectors from the __embedding__ column
+// of the given block builder. Returns nil if no such column exists or has no present rows.
+// Called in buildAndWriteBlock before the block builder is reset.
+// Only present (non-nil) vectors are returned; absent rows are skipped.
+func extractBlockVectors(bb *blockBuilder) [][]float32 {
+	key := shared.ColumnKey{Name: shared.EmbeddingColumnName, Type: shared.ColumnTypeVectorF32}
+	cb, ok := bb.columns[key]
+	if !ok {
+		return nil
+	}
+	vb, ok := cb.(*vectorF32ColumnBuilder)
+	if !ok {
+		return nil
+	}
+	var out [][]float32
+	for _, v := range vb.values {
+		if v == nil {
+			continue
+		}
+		cp := make([]float32, len(v))
+		copy(cp, v)
+		out = append(out, cp)
+	}
+	return out
+}
+
+// addVectorPresent marks rowIdx in the named VectorF32 column as present with the given vec.
+// addSpanAttr routes one span KeyValue attribute to the appropriate column.
+// Embedding columns (__embedding__, __embedding_text__) are stored without prefix;
+// all other span attributes are interned with "span." prefix.
+func (b *blockBuilder) addSpanAttr(rowIdx int, kv *commonv1.KeyValue) {
+	// Detect __embedding__ and __embedding_text__: stored under their own column names
+	// (no prefix) as ColumnTypeVectorF32 / ColumnTypeString respectively.
+	if kv.Key == shared.EmbeddingColumnName {
+		if bv := protoAttrBytes(kv.Value); len(bv) > 0 && len(bv)%4 == 0 {
+			b.addVectorPresent(rowIdx, shared.EmbeddingColumnName, bytesToFloat32LE(bv))
+		}
+		return
+	}
+	if kv.Key == shared.EmbeddingTextColumnName {
+		if s := protoAttrString(kv.Value); s != "" {
+			b.addPresent(rowIdx, shared.EmbeddingTextColumnName, shared.ColumnTypeString,
+				shared.AttrValue{Type: shared.ColumnTypeString, Str: s})
+		}
+		return
+	}
+	name := b.internColName(kv.Key, b.spanColNames, "span.")
+	val := protoToAttrValue(kv.Value)
+	b.addPresent(rowIdx, name, val.Type, val)
+}
+
+// If the column was pre-allocated by prepare(), sets the existing slot at rowIdx directly
+// (without appending) so that len(b.present) == spanHint is preserved.
+func (b *blockBuilder) addVectorPresent(rowIdx int, colName string, vec []float32) {
+	key := shared.ColumnKey{Name: colName, Type: shared.ColumnTypeVectorF32}
+	cb, ok := b.columns[key]
+	if !ok {
+		cb = b.addColumn(colName, shared.ColumnTypeVectorF32)
+	}
+	vb, ok := cb.(*vectorF32ColumnBuilder)
+	if !ok {
+		return
+	}
+	vb.setVectorAt(rowIdx, vec)
+}
+
+// protoAttrBytes extracts bytes from an OTLP AnyValue. Returns nil if not bytes type.
+func protoAttrBytes(v *commonv1.AnyValue) []byte {
+	if v == nil {
+		return nil
+	}
+	bv, ok := v.Value.(*commonv1.AnyValue_BytesValue)
+	if !ok {
+		return nil
+	}
+	return bv.BytesValue
+}
+
+// protoAttrString extracts a string from an OTLP AnyValue. Returns "" if not string type.
+func protoAttrString(v *commonv1.AnyValue) string {
+	if v == nil {
+		return ""
+	}
+	sv, ok := v.Value.(*commonv1.AnyValue_StringValue)
+	if !ok {
+		return ""
+	}
+	return sv.StringValue
+}
+
+// bytesToFloat32LE decodes a byte slice (LE float32 array) into a []float32.
+// Assumes len(b) is a multiple of 4.
+func bytesToFloat32LE(b []byte) []float32 {
+	n := len(b) / 4
+	out := make([]float32, n)
+	for i := range n {
+		bits := binary.LittleEndian.Uint32(b[i*4:])
+		out[i] = math.Float32frombits(bits)
+	}
+	return out
 }

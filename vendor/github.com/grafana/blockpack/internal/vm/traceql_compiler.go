@@ -6,10 +6,12 @@ import (
 	"bytes"
 	"encoding/hex"
 	"fmt"
+	"sort"
 	"strings"
 
 	regexp "github.com/coregx/coregex"
 
+	"github.com/grafana/blockpack/internal/modules/vectormath"
 	"github.com/grafana/blockpack/internal/traceqlparser"
 )
 
@@ -19,6 +21,10 @@ const (
 	intrinsicSpanID       = "span:id"
 	intrinsicSpanParentID = "span:parent_id"
 )
+
+// embeddingColumnName is the well-known column that stores float32 embedding vectors.
+// Duplicated from shared.EmbeddingColumnName to avoid import cycles.
+const embeddingColumnName = "__embedding__"
 
 // computedFields are fields calculated at query time that do NOT exist as stored columns.
 // Extracting them into predicates causes false negatives (blocks rejected when they contain matching spans).
@@ -37,7 +43,8 @@ func CompileTraceQLFilter(filter *traceqlparser.FilterExpression) (*Program, err
 	}
 
 	compiler := &traceqlCompiler{
-		program: &Program{},
+		program:  &Program{},
+		embedder: nil,
 	}
 
 	// Compile to ColumnPredicate (for blockpack bulk scanning)
@@ -53,8 +60,51 @@ func CompileTraceQLFilter(filter *traceqlparser.FilterExpression) (*Program, err
 	return compiler.program, nil
 }
 
+// CompileOptions carries optional context for CompileTraceQLFilterWithOptions.
+type CompileOptions struct {
+	// Embedder is required when the filter contains a VECTOR_AI() predicate.
+	// If nil and the filter uses VECTOR_AI(), compilation returns an error.
+	// Any type implementing TextEmbedder (defined in bytecode.go) is accepted —
+	// this keeps the VM decoupled from the concrete embedder implementation.
+	Embedder TextEmbedder
+	// Limit is the maximum number of vector results to return. 0 means DefaultVectorLimit.
+	// Maps directly to Program.VectorLimit for VECTOR_AI/VECTOR_ALL queries.
+	Limit int
+}
+
+// CompileTraceQLFilterWithOptions compiles a TraceQL FilterExpression with optional
+// CompileOptions. When the filter contains a VECTOR() predicate, opts.Embedder must
+// be non-nil; the query text is embedded at compile time and stored in Program.QueryVector.
+func CompileTraceQLFilterWithOptions(filter *traceqlparser.FilterExpression, opts CompileOptions) (*Program, error) {
+	if filter == nil || filter.Expr == nil {
+		return compileMatchAllProgram(), nil
+	}
+
+	compiler := &traceqlCompiler{
+		program:  &Program{},
+		embedder: opts.Embedder,
+		opts:     opts,
+	}
+
+	columnPredicate, err := compiler.compileColumnPredicate(filter.Expr)
+	if err != nil {
+		return nil, fmt.Errorf("compile column predicate: %w", err)
+	}
+	compiler.program.ColumnPredicate = columnPredicate
+	compiler.program.Predicates = extractTraceQLPredicates(filter.Expr)
+
+	// Populate QueryVector in RangeNodes after compilation (compilation sets program.QueryVector).
+	if compiler.program.HasVector && len(compiler.program.QueryVector) > 0 {
+		populateVectorNodes(compiler.program.Predicates, compiler.program.QueryVector)
+	}
+
+	return compiler.program, nil
+}
+
 type traceqlCompiler struct {
-	program *Program
+	program  *Program
+	embedder TextEmbedder
+	opts     CompileOptions
 }
 
 // normalizeAttributePath converts TraceQL attribute paths to canonical column names.
@@ -243,9 +293,166 @@ func (c *traceqlCompiler) compileColumnPredicateExpr(expr traceqlparser.Expr) (C
 			}, nil
 		}
 		return nil, fmt.Errorf("unsupported literal in column predicate: %v", e.Value)
+	case *traceqlparser.VectorExpr:
+		return c.compileVectorPredicate(e)
 	default:
 		return nil, fmt.Errorf("unsupported expression type for column predicate: %T", expr)
 	}
+}
+
+// compileVectorPredicate compiles a VECTOR_AI() or VECTOR_ALL() expression.
+// For VECTOR_AI: embeds the query text at compile time via the Embedder interface.
+// For VECTOR_ALL: uses a sentinel to indicate all-fields ranking at execution time.
+//
+// The vector predicate is split out of ColumnPredicate into program.VectorScorer so
+// that traditional predicates run first and vector scoring only operates on survivors.
+// The returned ColumnPredicate is a FullScan pass-through; Intersect with other
+// predicates in AND expressions reduces it to the non-vector candidate set.
+func (c *traceqlCompiler) compileVectorPredicate(e *traceqlparser.VectorExpr) (ColumnPredicate, error) {
+	if c.program.HasVector {
+		return nil, fmt.Errorf("VECTOR_AI/VECTOR_ALL may appear at most once in a filter expression")
+	}
+
+	switch e.Mode {
+	case traceqlparser.VectorModeAI:
+		return c.compileVectorAI(e)
+	case traceqlparser.VectorModeAll:
+		return c.compileVectorAll(e)
+	default:
+		return nil, fmt.Errorf("unknown vector mode: %d", e.Mode)
+	}
+}
+
+// compileVectorAI compiles VECTOR_AI("text", {"key": "value"}).
+// When an Embedder is available, embeds the query text at compile time and stores
+// a VectorScorer on the program. When no Embedder is provided (e.g. LIVESTORE),
+// returns a no-match predicate that produces empty results without erroring.
+func (c *traceqlCompiler) compileVectorAI(e *traceqlparser.VectorExpr) (ColumnPredicate, error) {
+	if c.embedder == nil {
+		// No embedder available — return a predicate that matches nothing.
+		// This allows LIVESTORE and other non-vector backends to accept
+		// queries containing VECTOR_AI() without failing.
+		c.program.HasVector = true
+		c.setVectorLimit()
+		return func(provider ColumnDataProvider) (RowSet, error) {
+			return provider.Complement(provider.FullScan()), nil // empty set
+		}, nil
+	}
+
+	text := assembleVectorQueryText(e.QueryText, e.KVPairs)
+
+	queryVec, err := c.embedder.Embed(text)
+	if err != nil {
+		return nil, fmt.Errorf("VECTOR_AI() embed query text: %w", err)
+	}
+
+	c.program.QueryVector = queryVec
+	c.program.HasVector = true
+	c.program.VectorColumn = "__embedding__"
+	c.setVectorLimit()
+
+	threshold := DefaultVectorThreshold
+	c.program.VectorScorer = buildVectorScorer(queryVec, threshold)
+
+	// Return FullScan so that when AND-combined with other predicates, Intersect
+	// reduces to the non-vector candidate set. VectorScorer runs after.
+	return func(provider ColumnDataProvider) (RowSet, error) {
+		return provider.FullScan(), nil
+	}, nil
+}
+
+// compileVectorAll compiles VECTOR_ALL("query text").
+// Same as VECTOR_AI but searches the __embedding_all__ column (auto-assembled all fields).
+func (c *traceqlCompiler) compileVectorAll(e *traceqlparser.VectorExpr) (ColumnPredicate, error) {
+	if c.embedder == nil {
+		c.program.HasVector = true
+		c.program.VectorAll = true
+		c.setVectorLimit()
+		return func(provider ColumnDataProvider) (RowSet, error) {
+			return provider.Complement(provider.FullScan()), nil
+		}, nil
+	}
+
+	text := assembleVectorQueryText(e.QueryText, e.KVPairs)
+
+	queryVec, err := c.embedder.Embed(text)
+	if err != nil {
+		return nil, fmt.Errorf("VECTOR_ALL() embed query text: %w", err)
+	}
+
+	c.program.QueryVector = queryVec
+	c.program.HasVector = true
+	c.program.VectorAll = true
+	c.program.VectorColumn = "__embedding_all__"
+	c.setVectorLimit()
+
+	threshold := DefaultVectorThreshold
+	c.program.VectorScorer = buildVectorScorer(queryVec, threshold)
+
+	// Return FullScan so that when AND-combined with other predicates, Intersect
+	// reduces to the non-vector candidate set. VectorScorer runs after.
+	return func(provider ColumnDataProvider) (RowSet, error) {
+		return provider.FullScan(), nil
+	}, nil
+}
+
+// buildVectorScorer constructs a VectorScorer closure that scores candidate rows
+// by cosine similarity to queryVec and returns those meeting minThreshold,
+// sorted by score descending.
+func buildVectorScorer(queryVec []float32, minThreshold float32) VectorScorer {
+	return func(getVec func(rowIdx int) ([]float32, bool), candidates RowSet) []ScoredRow {
+		rows := candidates.ToSlice()
+		scored := make([]ScoredRow, 0, len(rows))
+		for _, rowIdx := range rows {
+			vec, ok := getVec(rowIdx)
+			if !ok {
+				continue
+			}
+			sim := float32(1.0) - vectormath.CosineDistance(queryVec, vec)
+			if sim >= minThreshold {
+				scored = append(scored, ScoredRow{RowIdx: rowIdx, Score: sim})
+			}
+		}
+		// Insertion sort: sufficient for typical top-K sizes (limit ≤ 100).
+		for i := 1; i < len(scored); i++ {
+			for j := i; j > 0 && scored[j].Score > scored[j-1].Score; j-- {
+				scored[j], scored[j-1] = scored[j-1], scored[j]
+			}
+		}
+		return scored
+	}
+}
+
+// setVectorLimit sets the program's vector limit from compile options or default.
+func (c *traceqlCompiler) setVectorLimit() {
+	lim := c.opts.Limit
+	if lim <= 0 {
+		lim = DefaultVectorLimit
+	}
+	if c.program.VectorLimit == 0 {
+		c.program.VectorLimit = lim
+	}
+}
+
+// assembleVectorQueryText concatenates queryText with KVPairs sorted by key.
+func assembleVectorQueryText(queryText string, kvPairs map[string]string) string {
+	if len(kvPairs) == 0 {
+		return queryText
+	}
+	keys := make([]string, 0, len(kvPairs))
+	for k := range kvPairs {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var sb strings.Builder
+	sb.WriteString(queryText)
+	for _, k := range keys {
+		sb.WriteByte(' ')
+		sb.WriteString(k)
+		sb.WriteByte('=')
+		sb.WriteString(kvPairs[k])
+	}
+	return sb.String()
 }
 
 func (c *traceqlCompiler) compileColumnPredicateBinary(expr *traceqlparser.BinaryExpr) (ColumnPredicate, error) {
@@ -605,6 +812,30 @@ func extractTraceQLPredicates(expr traceqlparser.Expr) *QueryPredicates {
 	return &QueryPredicates{Nodes: nodes, Columns: cols}
 }
 
+// populateVectorNodes walks the QueryPredicates nodes and sets QueryVector on any
+// node with Column == embeddingColumnName (emitted by VectorExpr handling in extractTraceQLNodes).
+// This is called after compilation so the pre-computed query vector is available.
+func populateVectorNodes(preds *QueryPredicates, queryVec []float32) {
+	if preds == nil {
+		return
+	}
+	for i := range preds.Nodes {
+		populateVectorNode(&preds.Nodes[i], queryVec)
+	}
+}
+
+func populateVectorNode(n *RangeNode, queryVec []float32) {
+	if len(n.Children) > 0 {
+		for i := range n.Children {
+			populateVectorNode(&n.Children[i], queryVec)
+		}
+		return
+	}
+	if n.Column == embeddingColumnName && n.QueryVector == nil {
+		n.QueryVector = queryVec
+	}
+}
+
 // extractTraceQLNodes recursively extracts block-pruning nodes and accessed columns.
 //
 // AND: left and right nodes concatenated (AND-combined at top level by the planner).
@@ -615,6 +846,20 @@ func extractTraceQLPredicates(expr traceqlparser.Expr) *QueryPredicates {
 // Unscoped attribute predicates are expanded into OR composites covering all three scopes.
 // Negation operators (!= , !~) produce no nodes but do add to cols (for row-level decode).
 func extractTraceQLNodes(expr traceqlparser.Expr) (nodes []RangeNode, cols []string) {
+	// VectorExpr: emit a placeholder RangeNode for centroid pruning.
+	// QueryVector is nil here; populateVectorNodes fills it in after compilation.
+	// Use the correct embedding column: __embedding__ for VECTOR_AI, __embedding_all__ for VECTOR_ALL.
+	if ve, ok := expr.(*traceqlparser.VectorExpr); ok {
+		col := embeddingColumnName
+		if ve.Mode == traceqlparser.VectorModeAll {
+			col = "__embedding_all__"
+		}
+		return []RangeNode{{
+			Column:          col,
+			VectorThreshold: DefaultVectorThreshold,
+		}}, []string{col}
+	}
+
 	e, ok := expr.(*traceqlparser.BinaryExpr)
 	if !ok {
 		return nil, nil

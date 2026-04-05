@@ -113,6 +113,8 @@ var tokens = map[string]int{
 	"topk":                TOPK,
 	"bottomk":             BOTTOMK,
 	"with":                WITH,
+	"VECTOR_AI":           VECTOR_AI,
+	"VECTOR_ALL":          VECTOR_ALL,
 }
 
 type lexer struct {
@@ -123,6 +125,7 @@ type lexer struct {
 
 	parsingAttribute bool
 	currentScope     int
+	hasVector        bool // set when VECTOR_AI or VECTOR_ALL is parsed
 }
 
 func (l *lexer) Lex(lval *yySymType) int {

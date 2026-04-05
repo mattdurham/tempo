@@ -40,6 +40,14 @@ type RowCallback func(rowIdx int) bool
 // Returns number of matches and any error
 type StreamingColumnPredicate func(provider ColumnDataProvider, callback RowCallback) (int, error)
 
+// Vector search constants.
+const (
+	// DefaultVectorLimit is the default top-K results returned by a VECTOR() predicate.
+	DefaultVectorLimit = 10
+	// DefaultVectorThreshold is the minimum cosine similarity for a span to be included.
+	DefaultVectorThreshold float32 = 0.3
+)
+
 // RangeNode is a node in the block-pruning predicate tree.
 //
 // Leaf node (len(Children) == 0): Column names the fully-scoped column to look up.
@@ -47,6 +55,7 @@ type StreamingColumnPredicate func(provider ColumnDataProvider, callback RowCall
 //   - Values non-empty: equality / point-lookup (values are OR'd together).
 //   - Min or Max non-nil: interval lookup for range predicates (>, >=, <, <=).
 //   - Pattern non-empty: regex pattern; buildPredicates extracts a literal prefix.
+//   - QueryVector non-nil: VECTOR() ranking predicate — centroid pruning in planBlocks.
 //
 // Composite node (len(Children) > 0): IsOR controls combination semantics.
 //   - IsOR=false (AND): block must satisfy ALL children.
@@ -65,6 +74,14 @@ type RangeNode struct {
 
 	Values   []Value // equality lookup values; multiple values are OR'd
 	Children []RangeNode
+
+	// QueryVector is non-nil for VECTOR() ranking predicates.
+	// When set, planBlocks uses centroid distance to prune entire files/blocks.
+	QueryVector []float32
+
+	// VectorThreshold is the minimum cosine similarity for centroid pruning.
+	// Only meaningful when QueryVector is non-nil.
+	VectorThreshold float32
 
 	// MinInclusive is true when Min comes from >= (>= x) rather than > (> x).
 	// Used by the intrinsic flat-column scan to decide inclusive vs exclusive lower bound.
@@ -87,6 +104,28 @@ type QueryPredicates struct {
 	Columns []string
 }
 
+// TextEmbedder is the interface for converting text to embedding vectors.
+// This keeps the VM decoupled from the embedder implementation — callers provide
+// any implementation (HTTP backend, yzma, mock, etc.) via CompileOptions.
+type TextEmbedder interface {
+	Embed(text string) ([]float32, error)
+}
+
+// ScoredRow holds a row index and its cosine similarity score from vector scoring.
+type ScoredRow struct {
+	RowIdx int
+	Score  float32
+}
+
+// VectorScorer is a compiled vector-scoring closure that runs AFTER traditional
+// predicates have produced a candidate RowSet. It accepts a point-lookup accessor
+// for the embedding column and the candidate set, and returns scored rows at or
+// above the query threshold sorted by score descending.
+//
+// getVec(rowIdx) returns the embedding vector for a row and whether it is present.
+// Only candidate rows (those in candidates) are scored — non-candidates are skipped.
+type VectorScorer func(getVec func(rowIdx int) ([]float32, bool), candidates RowSet) []ScoredRow
+
 // Program represents a compiled TraceQL or SQL expression
 type Program struct {
 	// ColumnPredicate filters rows using bulk column scans (fast)
@@ -94,5 +133,24 @@ type Program struct {
 	StreamingColumnPredicate StreamingColumnPredicate // Streaming version for aggregation (avoids RowSet)
 	Predicates               *QueryPredicates         // Extracted predicates for block-level pruning
 
+	// VectorScorer is set when the query contains a VECTOR_AI() or VECTOR_ALL() predicate.
+	// It runs after ColumnPredicate produces candidates, scoring only those rows.
+	// When nil, no vector scoring is applied.
+	VectorScorer VectorScorer
+
 	OriginalQuery string // Original TraceQL query (optional, for debugging)
+
+	// VectorColumn is the block column name that VectorScorer reads via point lookup.
+	// "__embedding__" for VECTOR_AI, "__embedding_all__" for VECTOR_ALL.
+	VectorColumn string
+
+	// Vector search fields — non-zero when the query contains a VECTOR() predicate.
+	// QueryVector is pre-computed from the VECTOR() query text at compile time.
+	QueryVector []float32
+	// VectorLimit is the top-K result count (default: DefaultVectorLimit).
+	VectorLimit int
+	// HasVector is true when the query contains a VECTOR_AI() or VECTOR_ALL() predicate.
+	HasVector bool
+	// VectorAll is true for VECTOR_ALL() — ranks by stored all-fields embedding (no query vector needed).
+	VectorAll bool
 }

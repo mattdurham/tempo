@@ -840,6 +840,30 @@ func (LiteralExpr) exprNode() {}
 // LiteralType represents the type of a literal value.
 type LiteralType int
 
+// VectorMode distinguishes VECTOR_AI (custom query) from VECTOR_ALL (auto-assembled fields).
+type VectorMode int
+
+const (
+	// VectorModeAI is VECTOR_AI("query text", {"key": "value"}) — custom text query.
+	VectorModeAI VectorMode = iota
+	// VectorModeAll is VECTOR_ALL() — auto-assembles all span fields via AssembleAllFields.
+	VectorModeAll
+)
+
+// VectorExpr represents a VECTOR_AI() or VECTOR_ALL() function call in a TraceQL filter expression.
+// It acts as a ranking predicate that returns the top-K spans most similar to the query.
+//
+// VECTOR_AI("query text") — embeds the provided text and searches for similar spans.
+// VECTOR_AI("query text", {"key": "value"}) — with optional KV context.
+// VECTOR_ALL() — ranks all spans by similarity to their own auto-assembled embedding.
+type VectorExpr struct {
+	KVPairs   map[string]string // optional: {"key": "value"} embedding context (VECTOR_AI only)
+	QueryText string            // the natural language query text (VECTOR_AI only)
+	Mode      VectorMode        // VectorModeAI or VectorModeAll
+}
+
+func (VectorExpr) exprNode() {}
+
 // parseExpression parses logical OR (lowest precedence)
 func (p *parser) parseExpression() (*FilterExpression, error) {
 	expr, err := p.parseOr()
@@ -943,6 +967,7 @@ func (p *parser) parseComparison() (Expr, error) {
 		// No comparison operator
 		// For field references, treat as "field is not nil": { .foo } means { .foo != nil }
 		// For literals, just return the literal as-is: { true } is valid
+		// For VectorExpr, it stands alone as a ranking predicate.
 		if field, ok := left.(*FieldExpr); ok {
 			return &BinaryExpr{
 				Left:  field,
@@ -952,6 +977,10 @@ func (p *parser) parseComparison() (Expr, error) {
 		}
 		// Allow standalone literals (e.g., { true }, { false }, { "string" })
 		if _, ok := left.(*LiteralExpr); ok {
+			return left, nil
+		}
+		// Allow standalone VectorExpr (ranking predicate)
+		if _, ok := left.(*VectorExpr); ok {
 			return left, nil
 		}
 		return nil, fmt.Errorf("expected comparison operator at position %d", p.pos)
@@ -1008,6 +1037,13 @@ func (p *parser) parsePrimary() (Expr, error) {
 		return &LiteralExpr{Value: ident, Type: LitStatus}, nil
 	case "client", "server", "producer", "consumer", "internal", "unspecified":
 		return &LiteralExpr{Value: ident, Type: LitKind}, nil
+	case "VECTOR_AI":
+		return p.parseVectorAIExpr()
+	case "VECTOR_ALL":
+		return p.parseVectorAllExpr()
+	case "VECTOR":
+		// Backward compatibility: VECTOR is an alias for VECTOR_AI
+		return p.parseVectorAIExpr()
 	}
 
 	// Check if it's a field reference (contains '.' or ':')
@@ -1130,6 +1166,136 @@ func (p *parser) parseFieldPath(path string) (*FieldExpr, error) {
 	}
 
 	return nil, fmt.Errorf("invalid field path: %s", path)
+}
+
+// parseVectorAIExpr parses VECTOR_AI("query text") or VECTOR_AI("query text", {"key": "value", ...}).
+func (p *parser) parseVectorAIExpr() (*VectorExpr, error) {
+	return p.parseVectorFuncExpr("VECTOR_AI", VectorModeAI)
+}
+
+// parseVectorAllExpr parses VECTOR_ALL("query text") or VECTOR_ALL("query text", {"key": "value"}).
+func (p *parser) parseVectorAllExpr() (*VectorExpr, error) {
+	return p.parseVectorFuncExpr("VECTOR_ALL", VectorModeAll)
+}
+
+// parseVectorFuncExpr is the shared parser for VECTOR_AI and VECTOR_ALL.
+// Both accept ("query text") or ("query text", {"key": "value", ...}).
+func (p *parser) parseVectorFuncExpr(funcName string, mode VectorMode) (*VectorExpr, error) {
+	p.skipWhitespace()
+	if p.peek() != '(' {
+		return nil, fmt.Errorf("expected '(' after %s at position %d", funcName, p.pos)
+	}
+	p.advance() // consume '('
+	p.skipWhitespace()
+
+	if p.peek() != '"' {
+		return nil, fmt.Errorf("%s() first argument must be a string literal at position %d", funcName, p.pos)
+	}
+	queryTextExpr, err := p.parseString()
+	if err != nil {
+		return nil, fmt.Errorf("%s() query text: %w", funcName, err)
+	}
+	lit, ok := queryTextExpr.(*LiteralExpr)
+	if !ok || lit.Type != LitString {
+		return nil, fmt.Errorf("%s() first argument must be a string literal", funcName)
+	}
+	queryText, _ := lit.Value.(string)
+	if queryText == "" {
+		return nil, fmt.Errorf("%s() query text must be non-empty", funcName)
+	}
+
+	p.skipWhitespace()
+
+	var kvPairs map[string]string
+	if p.peek() == ',' {
+		p.advance()
+		p.skipWhitespace()
+		if p.peek() != '{' {
+			return nil, fmt.Errorf("%s() second argument must be a map literal '{...}' at position %d", funcName, p.pos)
+		}
+		kvPairs, err = p.parseMapLiteral()
+		if err != nil {
+			return nil, fmt.Errorf("%s() map literal: %w", funcName, err)
+		}
+		p.skipWhitespace()
+	}
+
+	if p.peek() != ')' {
+		return nil, fmt.Errorf("expected ')' to close %s() at position %d", funcName, p.pos)
+	}
+	p.advance()
+
+	return &VectorExpr{QueryText: queryText, KVPairs: kvPairs, Mode: mode}, nil
+}
+
+// parseMapLiteral parses a map literal: { "key": "value", ... }
+// Both keys and values must be string literals.
+func (p *parser) parseMapLiteral() (map[string]string, error) {
+	if p.peek() != '{' {
+		return nil, fmt.Errorf("expected '{' at position %d", p.pos)
+	}
+	p.advance() // consume '{'
+	p.skipWhitespace()
+
+	result := map[string]string{}
+
+	// Empty map literal
+	if p.peek() == '}' {
+		p.advance()
+		return result, nil
+	}
+
+	for {
+		p.skipWhitespace()
+		// Parse key (must be a string literal)
+		if p.peek() != '"' {
+			return nil, fmt.Errorf("map literal key must be a string literal at position %d", p.pos)
+		}
+		keyExpr, err := p.parseString()
+		if err != nil {
+			return nil, fmt.Errorf("map literal key: %w", err)
+		}
+		keyLit, ok := keyExpr.(*LiteralExpr)
+		if !ok || keyLit.Type != LitString {
+			return nil, fmt.Errorf("map literal key must be a string")
+		}
+		key, _ := keyLit.Value.(string)
+
+		p.skipWhitespace()
+		if p.peek() != ':' {
+			return nil, fmt.Errorf("expected ':' after map key at position %d", p.pos)
+		}
+		p.advance() // consume ':'
+		p.skipWhitespace()
+
+		// Parse value (must be a string literal)
+		if p.peek() != '"' {
+			return nil, fmt.Errorf("map literal value must be a string literal at position %d", p.pos)
+		}
+		valExpr, err := p.parseString()
+		if err != nil {
+			return nil, fmt.Errorf("map literal value: %w", err)
+		}
+		valLit, ok := valExpr.(*LiteralExpr)
+		if !ok || valLit.Type != LitString {
+			return nil, fmt.Errorf("map literal value must be a string")
+		}
+		val, _ := valLit.Value.(string)
+
+		result[key] = val
+		p.skipWhitespace()
+
+		if p.peek() == '}' {
+			p.advance()
+			break
+		}
+		if p.peek() != ',' {
+			return nil, fmt.Errorf("expected ',' or '}' in map literal at position %d", p.pos)
+		}
+		p.advance() // consume ','
+	}
+
+	return result, nil
 }
 
 // parseString parses a quoted string literal

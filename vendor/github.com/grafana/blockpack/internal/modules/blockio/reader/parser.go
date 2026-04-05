@@ -75,12 +75,11 @@ type rangeIndexMeta struct {
 }
 
 // readFooter reads the footer from the end of the file.
-// Supports v3 (22 bytes) and v4 (34 bytes) footer formats.
+// Supports v3 (22 bytes), v4 (34 bytes), and v5 (46 bytes) footer formats.
 // v4 adds intrinsicIndexOffset[8] + intrinsicIndexLen[4] after the v3 fields.
+// v5 adds vectorIndexOffset[8] + vectorIndexLen[4] after the v4 fields.
 //
-// Detection strategy: try v4 first (read 34 bytes from fileSize-34). If the first 2 bytes
-// are version=4, parse v4. Otherwise fall back to v3 (read 22 bytes from fileSize-22).
-// This avoids reading extra data before the v3 footer into the version field.
+// Detection strategy: try v5 first, then v4, then v3. The first 2 bytes are the version.
 func (r *Reader) readFooter() error {
 	if r.fileSize < int64(shared.FooterV3Size) {
 		return fmt.Errorf("file too small for footer: %d bytes", r.fileSize)
@@ -88,7 +87,66 @@ func (r *Reader) readFooter() error {
 
 	cacheKey := r.fileID + "/footer"
 
-	// Try v4 first: only possible if file is large enough.
+	// Try v5 first: only possible if file is large enough.
+	// V5 contains V4 at offset (FooterV5Size - FooterV4Size) = 12. If the V5 magic is absent
+	// but V4 is embedded in the same buffer, we parse V4 without an extra I/O.
+	if r.fileSize >= int64(shared.FooterV5Size) {
+		const v4InV5Off = int(shared.FooterV5Size - shared.FooterV4Size) // = 12
+		off := r.fileSize - int64(shared.FooterV5Size)
+		buf, err := r.cache.GetOrFetch(cacheKey+"/v5", func() ([]byte, error) {
+			b := make([]byte, shared.FooterV5Size)
+			n, readErr := r.provider.ReadAt(b, off, rw.DataTypeFooter)
+			if readErr != nil {
+				return nil, fmt.Errorf("readFooter: %w", readErr)
+			}
+			if n != int(shared.FooterV5Size) {
+				return nil, fmt.Errorf("readFooter: short read: %d bytes", n)
+			}
+			return b, nil
+		})
+		if err != nil {
+			return fmt.Errorf("readFooter: %w", err)
+		}
+
+		// V5 buffer layout: [0..45]. V4 footer occupies buf[v4InV5Off..45].
+		v4buf := buf[v4InV5Off:]
+		switch {
+		case binary.LittleEndian.Uint16(buf[0:]) == shared.FooterV5Version:
+			r.footerVersion = shared.FooterV5Version
+			r.footerFields.headerOffset = binary.LittleEndian.Uint64(buf[2:])
+			r.footerFields.compactOffset = binary.LittleEndian.Uint64(buf[10:])
+			r.footerFields.compactLen = binary.LittleEndian.Uint32(buf[18:])
+			r.intrinsicIndexOffset = binary.LittleEndian.Uint64(buf[22:])
+			r.intrinsicIndexLen = binary.LittleEndian.Uint32(buf[30:])
+			r.vectorIndexOffset = binary.LittleEndian.Uint64(buf[34:])
+			r.vectorIndexLen = binary.LittleEndian.Uint32(buf[42:])
+			if r.footerFields.headerOffset == 0 {
+				return fmt.Errorf("readFooter: header_offset is zero")
+			}
+			r.headerOffset = r.footerFields.headerOffset
+			r.compactOffset = r.footerFields.compactOffset
+			r.compactLen = r.footerFields.compactLen
+			return nil
+		case binary.LittleEndian.Uint16(v4buf[0:]) == shared.FooterV4Version:
+			// V4 footer is embedded at offset v4InV5Off in the V5 read buffer.
+			r.footerVersion = shared.FooterV4Version
+			r.footerFields.headerOffset = binary.LittleEndian.Uint64(v4buf[2:])
+			r.footerFields.compactOffset = binary.LittleEndian.Uint64(v4buf[10:])
+			r.footerFields.compactLen = binary.LittleEndian.Uint32(v4buf[18:])
+			r.intrinsicIndexOffset = binary.LittleEndian.Uint64(v4buf[22:])
+			r.intrinsicIndexLen = binary.LittleEndian.Uint32(v4buf[30:])
+			if r.footerFields.headerOffset == 0 {
+				return fmt.Errorf("readFooter: header_offset is zero")
+			}
+			r.headerOffset = r.footerFields.headerOffset
+			r.compactOffset = r.footerFields.compactOffset
+			r.compactLen = r.footerFields.compactLen
+			return nil
+		}
+		// Neither V5 nor V4 matched; fall through to smaller reads.
+	}
+
+	// Try v4: only possible if file is large enough (and file is too small for v5).
 	if r.fileSize >= int64(shared.FooterV4Size) {
 		off := r.fileSize - int64(shared.FooterV4Size)
 		buf, err := r.cache.GetOrFetch(cacheKey+"/v4", func() ([]byte, error) {

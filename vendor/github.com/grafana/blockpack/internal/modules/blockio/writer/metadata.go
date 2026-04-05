@@ -398,3 +398,29 @@ func writeFooterV4(
 	_, err := w.Write(buf[:])
 	return err
 }
+
+// writeFooterV5 writes a 46-byte V5 footer.
+// Layout: version[2]+headerOffset[8]+compactOffset[8]+compactLen[4]+
+//
+//	intrinsicOffset[8]+intrinsicLen[4]+vectorOffset[8]+vectorLen[4]
+func writeFooterV5(
+	w io.Writer,
+	headerOffset, compactOffset uint64,
+	compactLen uint32,
+	intrinsicOffset uint64,
+	intrinsicLen uint32,
+	vectorOffset uint64,
+	vectorLen uint32,
+) error {
+	var buf [46]byte
+	binary.LittleEndian.PutUint16(buf[0:], shared.FooterV5Version)
+	binary.LittleEndian.PutUint64(buf[2:], headerOffset)
+	binary.LittleEndian.PutUint64(buf[10:], compactOffset)
+	binary.LittleEndian.PutUint32(buf[18:], compactLen)
+	binary.LittleEndian.PutUint64(buf[22:], intrinsicOffset)
+	binary.LittleEndian.PutUint32(buf[30:], intrinsicLen)
+	binary.LittleEndian.PutUint64(buf[34:], vectorOffset)
+	binary.LittleEndian.PutUint32(buf[42:], vectorLen)
+	_, err := w.Write(buf[:])
+	return err
+}

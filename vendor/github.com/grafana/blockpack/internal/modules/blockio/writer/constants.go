@@ -20,6 +20,7 @@ const (
 	KindSparsePrefixBytes     uint8 = 11
 	KindDeltaDictionary       uint8 = 12
 	KindSparseDeltaDictionary uint8 = 13
+	KindVectorF32             uint8 = 14 // flat float32 array, per-row presence RLE, LE byte order
 )
 
 // Trace intrinsic column name constants used throughout the writer package.

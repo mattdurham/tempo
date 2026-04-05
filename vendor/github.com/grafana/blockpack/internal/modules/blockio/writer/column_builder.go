@@ -49,6 +49,9 @@ type columnBuilder interface {
 	addFloat64(val float64, present bool)
 	addBool(val bool, present bool)
 	addBytes(val []byte, present bool)
+	// addVectorF32 stores a float32 vector for the current row.
+	// Non-vector builders implement this as a no-op.
+	addVectorF32(val []float32, present bool)
 	rowCount() int
 	nullCount() int
 	colType() shared.ColumnType
@@ -104,6 +107,8 @@ func newColumnBuilder(typ shared.ColumnType, colName string, initCap int) column
 			values:  make([][]byte, 0, initCap),
 			present: make([]bool, 0, initCap),
 		}
+	case shared.ColumnTypeVectorF32:
+		return &vectorF32ColumnBuilder{}
 	default:
 		return &stringColumnBuilder{
 			colName: colName,

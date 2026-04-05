@@ -243,6 +243,13 @@ func readColumnEncoding(data []byte, spanCount int, colType shared.ColumnType, c
 		return nil, fmt.Errorf("column encoding: data too short (%d bytes)", len(data))
 	}
 
+	// NOTE-010 (shared/NOTES.md): ColumnTypeVectorF32 uses a custom wire format where
+	// only the float data is zstd-compressed. Dispatch by colType so decodeVectorF32 can
+	// handle the mixed compressed/uncompressed format directly.
+	if colType == shared.ColumnTypeVectorF32 {
+		return decodeVectorF32(data, spanCount, ctx)
+	}
+
 	encVersion := data[0]
 	if encVersion != shared.ColumnEncodingVersion {
 		return nil, fmt.Errorf("column encoding: unsupported version %d", encVersion)
@@ -274,7 +281,28 @@ func readColumnEncoding(data []byte, spanCount int, colType shared.ColumnType, c
 // only the uncompressed presence RLE. Called once per column during lazy registration.
 // No zstd decompression — O(M/8) where M is span count.
 // NOTE-001: lazy registration path — presence available immediately, values deferred.
-func decodePresenceOnly(data []byte, spanCount int) ([]byte, error) {
+// NOTE-010 (shared/NOTES.md): ColumnTypeVectorF32 columns are fully zstd-compressed;
+// colType is required to dispatch correctly before reading enc_version.
+func decodePresenceOnly(data []byte, spanCount int, colType shared.ColumnType) ([]byte, error) {
+	// ColumnTypeVectorF32: the blob starts with enc_version[1]+kind[1]+dim[2]+row_count[4]+rle_len[4]+rle.
+	// Presence RLE is stored uncompressed (only float data is zstd-compressed).
+	// NOTE-010 (shared/NOTES.md): presence is in the uncompressed header region.
+	if colType == shared.ColumnTypeVectorF32 {
+		const hdrSize = 1 + 1 + 2 + 4 + 4 // enc_version+kind+dim+row_count+rle_len
+		if len(data) < hdrSize {
+			return nil, fmt.Errorf("decodePresenceOnly(vectorF32): data too short: %d", len(data))
+		}
+		rleLen := int(binary.LittleEndian.Uint32(data[8:12]))
+		if hdrSize+rleLen > len(data) {
+			return nil, fmt.Errorf("decodePresenceOnly(vectorF32): rle truncated")
+		}
+		present, err := shared.DecodePresenceRLE(data[hdrSize:hdrSize+rleLen], spanCount)
+		if err != nil {
+			return nil, fmt.Errorf("decodePresenceOnly(vectorF32): %w", err)
+		}
+		return present, nil
+	}
+
 	if len(data) < 2 {
 		return nil, fmt.Errorf("decodePresenceOnly: data too short (%d bytes)", len(data))
 	}
@@ -1240,5 +1268,77 @@ func decodeDeltaDictionary(data []byte, kind uint8, spanCount int, ctx *decodeCt
 	}
 
 	col.BytesIdx = denseIdx
+	return col, nil
+}
+
+// decodeVectorF32 decodes a ColumnTypeVectorF32 column.
+// data is the raw column blob (output of vectorF32ColumnBuilder.buildData):
+//
+//	enc_version[1] + kind[1] + dim[2 LE] + row_count[4 LE] +
+//	presence_rle_len[4 LE] + presence_rle[N] +
+//	float_data_compressed_len[4 LE] + zstd(flat_float32_LE[present_count * dim * 4])
+//
+// Returns a Column with BytesInline populated: BytesInline[i] holds the raw LE float32 bytes
+// for present row i (length = dim*4). BytesInline[i] is nil for absent rows.
+// NOTE-010 (shared/NOTES.md): ColumnTypeVectorF32 encoding — only float data is zstd-compressed.
+func decodeVectorF32(data []byte, spanCount int, ctx *decodeCtx) (*Column, error) {
+	// Header: enc_version[1] + kind[1] + dim[2] + row_count[4] + rle_len[4] = 12 bytes minimum.
+	const hdrSize = 1 + 1 + 2 + 4 + 4
+	if len(data) < hdrSize {
+		return nil, fmt.Errorf("vectorF32: data too short: %d bytes", len(data))
+	}
+
+	dim := int(binary.LittleEndian.Uint16(data[2:4]))
+	rowCount := int(binary.LittleEndian.Uint32(data[4:8]))
+	rleLen := int(binary.LittleEndian.Uint32(data[8:12]))
+
+	if rowCount != spanCount {
+		return nil, fmt.Errorf("vectorF32: row_count %d != spanCount %d", rowCount, spanCount)
+	}
+
+	off := hdrSize
+	if off+rleLen > len(data) {
+		return nil, fmt.Errorf("vectorF32: presence RLE truncated: need %d bytes at offset %d", rleLen, off)
+	}
+	rleData := data[off : off+rleLen]
+	off += rleLen
+
+	// Decode presence bitset.
+	bitset, err := shared.DecodePresenceRLE(rleData, spanCount)
+	if err != nil {
+		return nil, fmt.Errorf("vectorF32: presence RLE: %w", err)
+	}
+
+	// Read length-prefixed zstd float data.
+	floatBytes, _, err := decompressZstdScratch(data, off, ctx.scratch)
+	if err != nil {
+		return nil, fmt.Errorf("vectorF32: float data: %w", err)
+	}
+
+	presentCount := shared.CountPresent(bitset, spanCount)
+	needed := presentCount * dim * 4
+	if len(floatBytes) < needed {
+		return nil, fmt.Errorf("vectorF32: float data too short: need %d bytes, have %d", needed, len(floatBytes))
+	}
+
+	col := &Column{
+		SpanCount:   spanCount,
+		Present:     bitset,
+		BytesInline: make([][]byte, spanCount),
+		Type:        shared.ColumnTypeVectorF32,
+	}
+
+	presentRow := 0
+	for i := range spanCount {
+		if !shared.IsPresent(bitset, i) {
+			continue
+		}
+		vecStart := presentRow * dim * 4
+		raw := make([]byte, dim*4)
+		copy(raw, floatBytes[vecStart:vecStart+dim*4])
+		col.BytesInline[i] = raw
+		presentRow++
+	}
+
 	return col, nil
 }

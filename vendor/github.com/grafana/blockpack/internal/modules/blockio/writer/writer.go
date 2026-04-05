@@ -5,7 +5,11 @@ package writer
 import (
 	"fmt"
 	"io"
+	"runtime"
+	"sync"
 	"sync/atomic"
+
+	"golang.org/x/sync/errgroup"
 
 	"github.com/golang/snappy"
 	"github.com/grafana/tempo/pkg/tempopb"
@@ -17,13 +21,17 @@ import (
 )
 
 // Writer encodes OTLP spans into the blockpack format.
-// NOT thread-safe — concurrent calls will panic (NOTES §9).
+// NOT thread-safe — concurrent calls will panic (NOTE-004).
 type Writer struct {
-	enc *zstdEncoder
+	// bbPool is a pool of reusable blockBuilders for parallel block construction.
+	// Each goroutine in flushBlocks checks out one builder, builds, then returns it.
+	// The pool starts empty; builders are created on first use by newBlockBuilder.
+	bbPool sync.Pool
 
-	// bb is the reusable block builder. Lazily created on first buildAndWriteBlock,
-	// then reset and reused for subsequent blocks to eliminate per-block allocations.
-	bb *blockBuilder
+	// encPool is a pool of reusable zstdEncoders for parallel block construction.
+	// zstdEncoder.compress() mutates internal buf — it is NOT goroutine-safe.
+	// Each goroutine must check out its own encoder from the pool.
+	encPool sync.Pool
 
 	// trace_id → list of block IDs (uint16) across all blocks
 	traceIndex map[[16]byte][]uint16
@@ -31,14 +39,9 @@ type Writer struct {
 	// UUID column detection: column name → detected as UUID
 	uuidColumns map[string]bool
 
-	// Range index built incrementally in buildAndWriteBlock, consumed at Flush.
+	// Range index built incrementally in flushBlocks serial pass, consumed at Flush.
 	// Replaces the old flat log + O(n log n) sort approach.
 	rangeIdx rangeIndex
-
-	// sketchIdx accumulates per-block sketch sets across all blocks.
-	// Indexed parallel to blockMetas: sketchIdx[i] is the sketch for block i.
-	// Consumed at Flush() by buildMetadataSectionBytes.
-	sketchIdx []blockSketchSet
 
 	// intrinsicAccum accumulates file-level columnar data for intrinsic columns.
 	// Fed row-by-row during block building via blockBuilder.intrinsicAccum.
@@ -55,9 +58,16 @@ type Writer struct {
 	// reducing AddRowFromReader from O(N^2) to O(N) per block.
 	addRowIntrinsicCache map[addRowCacheKey]intrinsicRowFields
 
+	// vectorAccum accumulates per-block vector data for building the VectorIndex section.
+	// Nil when cfg.VectorDimension == 0 (no vector support requested).
+	vectorAccum *vectorAccumulator
+
 	out countingWriter
 
-	cfg Config
+	// sketchIdx accumulates per-block sketch sets across all blocks.
+	// Indexed parallel to blockMetas: sketchIdx[i] is the sketch for block i.
+	// Consumed at Flush() by buildMetadataSectionBytes.
+	sketchIdx []blockSketchSet
 
 	// pending holds lightweight pendingSpan records awaiting the next flushBlocks call.
 	// Each pendingSpan stores sort keys and proto pointers only; full OTLP→column
@@ -87,9 +97,11 @@ type Writer struct {
 	// log records referencing them. Cleared after flushLogBlocks(). Mirrors protoRoots.
 	logProtoRoots []*logsv1.LogsData
 
+	cfg Config
+
 	// inUse is a concurrency guard: AddSpan, AddTracesData, and Flush each do
 	// CompareAndSwap(false, true) on entry and panic if the swap fails, detecting
-	// concurrent callers. The Writer is documented as NOT thread-safe (NOTES §9).
+	// concurrent callers. The Writer is documented as NOT thread-safe (NOTE-004).
 	inUse atomic.Bool
 
 	// signalType identifies whether this Writer produces trace or log files.
@@ -129,19 +141,31 @@ func NewWriterWithConfig(cfg Config) (*Writer, error) {
 	if cfg.MaxBufferedSpans == 0 {
 		cfg.MaxBufferedSpans = 5 * cfg.MaxBlockSpans
 	}
-	enc, err := newZstdEncoder()
-	if err != nil {
-		return nil, fmt.Errorf("writer: zstd init: %w", err)
+	// Auto-detect vector dimension from the embedder when one is configured but
+	// VectorDimension is not explicitly set. A probe embedding of a short string
+	// determines the actual output dimension; this avoids requiring callers to
+	// hard-code the dimension when using an embedder.
+	if cfg.Embedder != nil && cfg.VectorDimension == 0 {
+		probeVec, probeErr := cfg.Embedder.Embed("probe")
+		if probeErr != nil {
+			return nil, fmt.Errorf("writer: embedder probe failed: %w", probeErr)
+		}
+		cfg.VectorDimension = len(probeVec)
+	}
+
+	var va *vectorAccumulator
+	if cfg.VectorDimension > 0 {
+		va = newVectorAccumulator(cfg.VectorDimension)
 	}
 	return &Writer{
 		cfg:               cfg,
 		out:               countingWriter{w: cfg.OutputStream},
-		enc:               enc,
 		traceIndex:        make(map[[16]byte][]uint16),
 		uuidColumns:       make(map[string]bool),
 		rangeIdx:          make(rangeIndex),
 		intrinsicAccum:    newIntrinsicAccumulator(),
 		fileBloomSvcNames: make(map[string]struct{}),
+		vectorAccum:       va,
 		// Pre-allocate pending to MaxBufferedSpans to avoid growslice on the hot path.
 		// After each flushBlocks(), w.pending is reset to length 0 (capacity retained).
 		pending: make([]pendingSpan, 0, cfg.MaxBufferedSpans),
@@ -151,7 +175,7 @@ func NewWriterWithConfig(cfg Config) (*Writer, error) {
 // AddSpan buffers a single OTLP span.
 // resourceSchemaURL and scopeSchemaURL are the SchemaUrl fields from
 // ResourceSpans and ScopeSpans respectively; pass "" when not present.
-// Panics if called concurrently (NOTES §9).
+// Panics if called concurrently (NOTE-004).
 func (w *Writer) AddSpan(
 	traceID []byte,
 	span *tracev1.Span,
@@ -208,7 +232,7 @@ func (w *Writer) AddSpan(
 // Use this when you already have a TracesData proto (e.g. from an OTLP pipeline) —
 // it avoids synthesizing a wrapper proto. Use AddSpan when building spans
 // individually or from non-proto sources (maps, structs).
-// Panics if called concurrently (NOTES §9).
+// Panics if called concurrently (NOTE-004).
 //
 //nolint:dupl // intentional mirror of AddTempoTrace for OTLP types; different proto types prevent sharing
 func (w *Writer) AddTracesData(td *tracev1.TracesData) error {
@@ -272,7 +296,7 @@ func (w *Writer) AddTracesData(td *tracev1.TracesData) error {
 // AddTempoTrace buffers all spans from a Tempo-native *tempopb.Trace message.
 // Use this when consuming data directly from Tempo's storage layer to avoid
 // the round-trip conversion through OTLP types.
-// Panics if called concurrently (NOTES §9).
+// Panics if called concurrently (NOTE-004).
 //
 //nolint:dupl // intentional mirror of AddTracesData for Tempo-native types; different proto types prevent sharing
 func (w *Writer) AddTempoTrace(trace *tempopb.Trace) error {
@@ -412,8 +436,8 @@ func (w *Writer) Flush() (int64, error) {
 	metadataOffset := uint64(w.out.total) //nolint:gosec
 
 	// 3. Apply KLL bucket boundaries to the range index.
-	// KLL sketches were built incrementally in buildAndWriteBlock (one Add per
-	// block min and max), so no re-scan is needed here.
+	// KLL sketches were built incrementally in flushBlocks (one Add per block min
+	// and max), so no re-scan is needed here.
 	applyRangeBuckets(w.rangeIdx, defaultRangeBuckets)
 
 	// 4. Write metadata section (snappy-compressed, V13 format).
@@ -451,15 +475,38 @@ func (w *Writer) Flush() (int64, error) {
 		return w.out.total, fmt.Errorf("writer: write compact index: %w", err)
 	}
 
-	// 7. Write intrinsic section (always — footer V4).
+	// 7. Write intrinsic section (always — footer V4 minimum).
 	intrinsicOffset, intrinsicLen, err := w.writeIntrinsicSection()
 	if err != nil {
 		return w.out.total, fmt.Errorf("writer: write intrinsic section: %w", err)
 	}
 
-	// 8. Write footer V4 (always includes intrinsic section offsets).
-	if err = writeFooterV4(&w.out, headerOffset, compactOffset, uint32(compactN), intrinsicOffset, intrinsicLen); err != nil { //nolint:gosec // safe: compact index size bounded by MaxCompactSectionSize (50MB) fits uint32
-		return w.out.total, fmt.Errorf("writer: write footer: %w", err)
+	// 7.5. Write vector index section (V5 only).
+	var vectorIndexOffset uint64
+	var vectorIndexLen uint32
+	if w.vectorAccum != nil {
+		sectionBytes, buildErr := w.vectorAccum.build()
+		if buildErr != nil {
+			return w.out.total, fmt.Errorf("writer: build vector index: %w", buildErr)
+		}
+		if len(sectionBytes) > 0 {
+			vectorIndexOffset = uint64(w.out.total)    //nolint:gosec
+			vectorIndexLen = uint32(len(sectionBytes)) //nolint:gosec
+			if _, err = w.out.Write(sectionBytes); err != nil {
+				return w.out.total, fmt.Errorf("writer: write vector index: %w", err)
+			}
+		}
+	}
+
+	// 8. Write footer V5 if vector index was written; else V4.
+	if vectorIndexLen > 0 {
+		if err = writeFooterV5(&w.out, headerOffset, compactOffset, uint32(compactN), intrinsicOffset, intrinsicLen, vectorIndexOffset, vectorIndexLen); err != nil { //nolint:gosec
+			return w.out.total, fmt.Errorf("writer: write footer V5: %w", err)
+		}
+	} else {
+		if err = writeFooterV4(&w.out, headerOffset, compactOffset, uint32(compactN), intrinsicOffset, intrinsicLen); err != nil { //nolint:gosec // safe: compact index size bounded by MaxCompactSectionSize (50MB) fits uint32
+			return w.out.total, fmt.Errorf("writer: write footer: %w", err)
+		}
 	}
 
 	total := w.out.total
@@ -495,6 +542,11 @@ func (w *Writer) Flush() (int64, error) {
 	// Reset file-level bloom service names.
 	for k := range w.fileBloomSvcNames {
 		delete(w.fileBloomSvcNames, k)
+	}
+
+	// Reset vector accumulator for reuse.
+	if w.vectorAccum != nil {
+		w.vectorAccum = newVectorAccumulator(w.cfg.VectorDimension)
 	}
 
 	return total, nil
@@ -619,70 +671,8 @@ func (w *Writer) writeIntrinsicSection() (intrinsicOffset uint64, intrinsicLen u
 	return tocOffset, uint32(len(tocBlob)), nil //nolint:gosec // safe: TOC blob bounded by column count × entry size
 }
 
-// buildAndWriteBlock builds one block from pending[0:end], writes it to the output, and
-// records BlockMeta, range index entries, and traceIndex refs.
-// Returns an error if blockID exceeds the uint16 trace-index wire format limit.
-// Block IDs are 0-based and encoded as uint16, so the maximum valid ID is 65534
-// (allowing at most 65535 blocks with IDs 0–65534; this keeps block_ref_count within uint16).
-func (w *Writer) buildAndWriteBlock(blockID int, pending []pendingSpan) error {
-	if blockID >= 65535 {
-		return fmt.Errorf(
-			"writer: block %d exceeds trace-index limit: block IDs are 0-based and encoded as uint16 (max ID 65534)",
-			blockID,
-		)
-	}
-	blockOffset := uint64(w.out.total) //nolint:gosec
-
-	built, bb, err := buildBlock(pending, w.enc, w.bb, shared.VersionBlockV12, w.intrinsicAccum, blockID)
-	w.bb = bb
-	if err != nil {
-		return fmt.Errorf("writer: block %d finalize: %w", blockID, err)
-	}
-
-	if _, err = w.out.Write(built.payload); err != nil {
-		return fmt.Errorf("writer: block %d write: %w", blockID, err)
-	}
-
-	// Record BlockMeta.
-	meta := shared.BlockMeta{
-		Offset:     blockOffset,
-		Length:     uint64(len(built.payload)),
-		Kind:       shared.BlockKindLeaf,
-		SpanCount:  uint32(built.spanCount), //nolint:gosec // safe: spanCount bounded by MaxBlockSpans (65535)
-		MinStart:   built.minStart,
-		MaxStart:   built.maxStart,
-		MinTraceID: built.minTraceID,
-		MaxTraceID: built.maxTraceID,
-	}
-	w.blockMetas = append(w.blockMetas, meta)
-
-	// Update range index: one entry per column per block (O(columns_per_block)).
-	// Feed min and max into the column's KLL sketch and record the blockRange.
-	bid := uint32(blockID) //nolint:gosec // safe: blockID bounded by MaxBlocks (100_000), fits uint32
-	for _, mm := range built.colMinMax {
-		cd, ok := w.rangeIdx[mm.colName]
-		if !ok {
-			cd = newRangeColumnData(mm.colType)
-			w.rangeIdx[mm.colName] = cd
-		}
-		addBlockRangeToColumn(cd, mm, bid)
-	}
-
-	// Collect sketch set for this block (parallel to blockMetas).
-	w.sketchIdx = append(w.sketchIdx, built.colSketches)
-
-	// Update the file-level trace index: record the block ID for each trace present.
-	for tid := range built.traceRows {
-		w.traceIndex[tid] = append(
-			w.traceIndex[tid],
-			uint16(blockID), //nolint:gosec // safe: blockID <= 65535 enforced by guard above
-		)
-	}
-
-	return nil
-}
-
-// flushBlocks sorts w.pending, writes all pending blocks to the output, and resets w.pending to empty.
+// flushBlocks sorts w.pending, builds all blocks concurrently, writes payloads and
+// updates indexes in deterministic block-ID order, then resets w.pending to empty.
 // Appends to w.blockMetas/traceIndex and updates w.rangeIdx incrementally.
 //
 // Called automatically by AddSpan/AddTracesData when len(w.pending) >= cfg.MaxBufferedSpans,
@@ -690,7 +680,7 @@ func (w *Writer) buildAndWriteBlock(blockID int, pending []pendingSpan) error {
 //
 // INVARIANT (NOTES §17): Does NOT write metadata/header/footer. That happens only in Flush().
 // INVARIANT: rangeIdx is updated here but KLL/range-buckets are applied at Flush().
-// INVARIANT: Block IDs are globally sequential: blockID := len(w.blockMetas) before each block.
+// INVARIANT: Block IDs are globally sequential: blockID := len(w.blockMetas) + i.
 //
 // RSS bound: After processing all blocks, protoRoots is cleared. The w.rangeIdx map keys
 // independently keep string backing bytes alive (GC traces map key pointers), so clearing
@@ -702,23 +692,186 @@ func (w *Writer) flushBlocks() error {
 
 	sortPending(w.pending)
 
+	// Pre-compute block boundaries and pre-assign block IDs so goroutines can
+	// write to results[i] without any coordination.
+	type blockSlice struct {
+		spans   []pendingSpan
+		blockID int
+	}
+	var slices []blockSlice
 	blockStart := 0
 	for blockStart < len(w.pending) {
 		blockEnd := min(blockStart+w.cfg.MaxBlockSpans, len(w.pending))
+		slices = append(slices, blockSlice{
+			spans:   w.pending[blockStart:blockEnd],
+			blockID: len(w.blockMetas) + len(slices),
+		})
+		blockStart = blockEnd
+	}
 
-		blockID := len(w.blockMetas) // globally sequential: blockMetas accumulates across calls
-		if err := w.buildAndWriteBlock(blockID, w.pending[blockStart:blockEnd]); err != nil {
-			// Partial blocks may have been written; those are unrecoverable.
-			// Reset buffered state so the Writer is not stuck in a partial state.
+	// Validate all block IDs up-front so goroutines don't need error coordination
+	// for the uint16 overflow check.
+	for _, s := range slices {
+		if s.blockID >= 65535 {
+			return fmt.Errorf(
+				"writer: block %d exceeds trace-index limit: block IDs are 0-based and encoded as uint16 (max ID 65534)",
+				s.blockID,
+			)
+		}
+	}
+
+	// Pre-compute embedding vectors for all pending spans when auto-embedding is enabled.
+	// This runs sequentially before the parallel block-build phase because Embed() is
+	// typically a network/compute call that must not be parallelised without external
+	// fan-in coordination. The result is a flat slice parallel to w.pending; each block
+	// goroutine receives its own subslice (no per-goroutine allocation needed).
+	var allSpanVectors [][]float32
+	if w.cfg.Embedder != nil {
+		var embedErr error
+		allSpanVectors, embedErr = w.embedPendingSpans(w.pending)
+		if embedErr != nil {
 			clear(w.pending)
 			w.pending = w.pending[:0]
 			clear(w.protoRoots)
 			w.protoRoots = w.protoRoots[:0]
 			clear(w.tempoProtoRoots)
 			w.tempoProtoRoots = w.tempoProtoRoots[:0]
-			return err
+			return fmt.Errorf("writer: embed spans: %w", embedErr)
 		}
-		blockStart = blockEnd
+	}
+
+	results := make([]builtBlock, len(slices))
+
+	// Parallel build phase: each goroutine builds one block independently.
+	// localAccum is per-goroutine; merged serially below.
+	var g errgroup.Group
+	g.SetLimit(runtime.NumCPU())
+	for i, s := range slices {
+		i, s := i, s // capture loop variables
+		// Compute the vector subslice for this block. blockStart tracks the offset of
+		// s.spans within w.pending so the goroutine gets the right slice without any
+		// shared state. When allSpanVectors is nil (no embedder), blockVecs is nil.
+		var blockVecs [][]float32
+		if allSpanVectors != nil {
+			// Derive offset by pointer arithmetic: s.spans is a sub-slice of w.pending.
+			// We use the block slice index to compute the start offset.
+			spanOffset := 0
+			for j := 0; j < i; j++ {
+				spanOffset += len(slices[j].spans)
+			}
+			blockVecs = allSpanVectors[spanOffset : spanOffset+len(s.spans)]
+		}
+		g.Go(func() error {
+			localAccum := newIntrinsicAccumulator()
+			bb, _ := w.bbPool.Get().(*blockBuilder)
+			enc, _ := w.encPool.Get().(*zstdEncoder)
+			if enc == nil {
+				var newErr error
+				enc, newErr = newZstdEncoder()
+				if newErr != nil {
+					w.bbPool.Put(bb)
+					return fmt.Errorf("writer: block %d zstd init: %w", s.blockID, newErr)
+				}
+			}
+			built, bb, err := buildBlock(s.spans, enc, bb, shared.VersionBlockV12, localAccum, s.blockID, blockVecs)
+			w.encPool.Put(enc)
+			if err != nil {
+				w.bbPool.Put(bb)
+				return fmt.Errorf("writer: block %d finalize: %w", s.blockID, err)
+			}
+			// Extract vectors from bb BEFORE returning it to the pool.
+			// extractBlockVectors reads bb.columns which will be reset on pool reuse.
+			if w.vectorAccum != nil {
+				built.blockVectors = extractBlockVectors(bb)
+			}
+			results[i] = built
+			// Put bb AFTER results[i] is written — traceRows and colMinMax inside built
+			// are direct map references into bb. Returning bb to the pool before this
+			// assignment would allow a concurrent goroutine's reset() call to clear those
+			// maps while the serial merge pass is still reading them.
+			w.bbPool.Put(bb)
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		// At least one block failed. Reset buffered state to avoid a stuck Writer.
+		clear(w.pending)
+		w.pending = w.pending[:0]
+		clear(w.protoRoots)
+		w.protoRoots = w.protoRoots[:0]
+		clear(w.tempoProtoRoots)
+		w.tempoProtoRoots = w.tempoProtoRoots[:0]
+		return err
+	}
+
+	// Serial merge pass (in block-ID order): write payloads, merge accumulators,
+	// update indexes. Order is deterministic because results[i] corresponds to
+	// slices[i] which has a pre-assigned blockID.
+	for i, built := range results {
+		s := slices[i]
+		blockOffset := uint64(w.out.total) //nolint:gosec
+
+		if _, err := w.out.Write(built.payload); err != nil {
+			// Clear buffered state so the Writer is not left in a partially-flushed limbo.
+			// Blocks written before this failure are unrecoverable, but clearing prevents
+			// a subsequent Flush()/auto-flush from re-processing already-consumed spans.
+			clear(w.pending)
+			w.pending = w.pending[:0]
+			clear(w.protoRoots)
+			w.protoRoots = w.protoRoots[:0]
+			clear(w.tempoProtoRoots)
+			w.tempoProtoRoots = w.tempoProtoRoots[:0]
+			return fmt.Errorf("writer: block %d write: %w", s.blockID, err)
+		}
+
+		meta := shared.BlockMeta{
+			Offset:     blockOffset,
+			Length:     uint64(len(built.payload)),
+			Kind:       shared.BlockKindLeaf,
+			SpanCount:  uint32(built.spanCount), //nolint:gosec
+			MinStart:   built.minStart,
+			MaxStart:   built.maxStart,
+			MinTraceID: built.minTraceID,
+			MaxTraceID: built.maxTraceID,
+		}
+		// Release payload memory immediately after writing to bound peak RSS.
+		results[i].payload = nil
+
+		w.blockMetas = append(w.blockMetas, meta)
+
+		// Merge per-block intrinsic accumulator into the file-level one, then release.
+		if built.localAccum != nil {
+			w.intrinsicAccum.merge(built.localAccum)
+			results[i].localAccum = nil
+		}
+
+		// Accumulate vectors for PQ training (serial to avoid concurrent map writes).
+		if w.vectorAccum != nil && len(built.blockVectors) > 0 {
+			w.vectorAccum.accumulateBlock(s.blockID, built.blockVectors)
+			results[i].blockVectors = nil // release memory after accumulation
+		}
+
+		// Update range index.
+		bid := uint32(s.blockID) //nolint:gosec
+		for _, mm := range built.colMinMax {
+			cd, ok := w.rangeIdx[mm.colName]
+			if !ok {
+				cd = newRangeColumnData(mm.colType)
+				w.rangeIdx[mm.colName] = cd
+			}
+			addBlockRangeToColumn(cd, mm, bid)
+		}
+
+		// Collect sketch set for this block.
+		w.sketchIdx = append(w.sketchIdx, built.colSketches)
+
+		// Update file-level trace index.
+		for tid := range built.traceRows {
+			w.traceIndex[tid] = append(
+				w.traceIndex[tid],
+				uint16(s.blockID), //nolint:gosec
+			)
+		}
 	}
 
 	// Collect service names for file-level bloom filter.
@@ -728,15 +881,9 @@ func (w *Writer) flushBlocks() error {
 		}
 	}
 
-	// Clear pending span buffer. blockMetas, traceIndex, rangeIdx
-	// accumulate across flushBlocks() calls and are consumed once at Flush().
+	// Clear pending and proto anchors (same invariant as before).
 	clear(w.pending)
 	w.pending = w.pending[:0]
-
-	// Release proto anchors for this batch. The rangeIdx map keys independently
-	// keep necessary string data alive (GC traces string pointers in map keys).
-	// This is the key RSS fix: prevents protoRoots from accumulating for the entire
-	// WAL block lifetime (which caused 3× RSS vs. parquet in prior versions).
 	clear(w.protoRoots)
 	w.protoRoots = w.protoRoots[:0]
 	clear(w.tempoProtoRoots)
@@ -745,50 +892,9 @@ func (w *Writer) flushBlocks() error {
 	return nil
 }
 
-// buildAndWriteLogBlock builds one log block from pending[0:end], writes it to the output,
-// and records BlockMeta and range index entries. Does NOT update w.traceIndex.
-func (w *Writer) buildAndWriteLogBlock(blockID int, pending []pendingLogRecord) error {
-	blockOffset := uint64(w.out.total) //nolint:gosec
-
-	built, err := buildLogBlock(pending, w.enc)
-	if err != nil {
-		return fmt.Errorf("writer: log block %d finalize: %w", blockID, err)
-	}
-
-	if _, err = w.out.Write(built.payload); err != nil {
-		return fmt.Errorf("writer: log block %d write: %w", blockID, err)
-	}
-
-	meta := shared.BlockMeta{
-		Offset:    blockOffset,
-		Length:    uint64(len(built.payload)),
-		Kind:      shared.BlockKindLeaf,
-		SpanCount: uint32(built.spanCount), //nolint:gosec // safe: spanCount bounded by MaxBlockSpans (65535)
-		MinStart:  built.minStart,
-		MaxStart:  built.maxStart,
-		// MinTraceID and MaxTraceID are zero ([16]byte zero value) for log blocks.
-	}
-	w.blockMetas = append(w.blockMetas, meta)
-
-	bid := uint32(blockID) //nolint:gosec // safe: blockID bounded by MaxBlocks (100_000), fits uint32
-	for _, mm := range built.colMinMax {
-		cd, ok := w.rangeIdx[mm.colName]
-		if !ok {
-			cd = newRangeColumnData(mm.colType)
-			w.rangeIdx[mm.colName] = cd
-		}
-		addBlockRangeToColumn(cd, mm, bid)
-	}
-
-	// Collect sketch set for this log block (parallel to blockMetas).
-	w.sketchIdx = append(w.sketchIdx, built.colSketches)
-
-	// No trace index update for log blocks.
-	return nil
-}
-
-// flushLogBlocks sorts w.pendingLogs, writes all pending log blocks, and resets the buffer.
-// Mirrors flushBlocks for the log signal path.
+// flushLogBlocks sorts w.pendingLogs, builds all log blocks concurrently, writes payloads
+// and updates indexes in deterministic block-ID order, then resets the buffer.
+// Mirrors flushBlocks for the log signal path. Log blocks have no intrinsicAccum.
 func (w *Writer) flushLogBlocks() error {
 	if len(w.pendingLogs) == 0 {
 		return nil
@@ -796,19 +902,93 @@ func (w *Writer) flushLogBlocks() error {
 
 	sortPendingLogs(w.pendingLogs)
 
+	// Pre-compute block boundaries and pre-assign block IDs.
+	type logBlockSlice struct {
+		records []pendingLogRecord
+		blockID int
+	}
+	var slices []logBlockSlice
 	blockStart := 0
 	for blockStart < len(w.pendingLogs) {
 		blockEnd := min(blockStart+w.cfg.MaxBlockSpans, len(w.pendingLogs))
+		slices = append(slices, logBlockSlice{
+			records: w.pendingLogs[blockStart:blockEnd],
+			blockID: len(w.blockMetas) + len(slices),
+		})
+		blockStart = blockEnd
+	}
 
-		blockID := len(w.blockMetas)
-		if err := w.buildAndWriteLogBlock(blockID, w.pendingLogs[blockStart:blockEnd]); err != nil {
+	results := make([]builtBlock, len(slices))
+
+	// Parallel build phase.
+	var g errgroup.Group
+	g.SetLimit(runtime.NumCPU())
+	for i, s := range slices {
+		i, s := i, s
+		g.Go(func() error {
+			enc, _ := w.encPool.Get().(*zstdEncoder)
+			if enc == nil {
+				var newErr error
+				enc, newErr = newZstdEncoder()
+				if newErr != nil {
+					return fmt.Errorf("writer: log block %d zstd init: %w", s.blockID, newErr)
+				}
+			}
+			built, err := buildLogBlock(s.records, enc)
+			w.encPool.Put(enc)
+			if err != nil {
+				return fmt.Errorf("writer: log block %d finalize: %w", s.blockID, err)
+			}
+			results[i] = built
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		clear(w.pendingLogs)
+		w.pendingLogs = w.pendingLogs[:0]
+		clear(w.logProtoRoots)
+		w.logProtoRoots = w.logProtoRoots[:0]
+		return err
+	}
+
+	// Serial merge pass.
+	for i, built := range results {
+		s := slices[i]
+		blockOffset := uint64(w.out.total) //nolint:gosec
+
+		if _, err := w.out.Write(built.payload); err != nil {
+			// Clear buffered state so the Writer is not left in a partially-flushed limbo.
 			clear(w.pendingLogs)
 			w.pendingLogs = w.pendingLogs[:0]
 			clear(w.logProtoRoots)
 			w.logProtoRoots = w.logProtoRoots[:0]
-			return err
+			return fmt.Errorf("writer: log block %d write: %w", s.blockID, err)
 		}
-		blockStart = blockEnd
+		results[i].payload = nil
+
+		meta := shared.BlockMeta{
+			Offset:    blockOffset,
+			Length:    uint64(len(built.payload)),
+			Kind:      shared.BlockKindLeaf,
+			SpanCount: uint32(built.spanCount), //nolint:gosec
+			MinStart:  built.minStart,
+			MaxStart:  built.maxStart,
+			// MinTraceID and MaxTraceID are zero ([16]byte zero value) for log blocks.
+		}
+		w.blockMetas = append(w.blockMetas, meta)
+
+		bid := uint32(s.blockID) //nolint:gosec
+		for _, mm := range built.colMinMax {
+			cd, ok := w.rangeIdx[mm.colName]
+			if !ok {
+				cd = newRangeColumnData(mm.colType)
+				w.rangeIdx[mm.colName] = cd
+			}
+			addBlockRangeToColumn(cd, mm, bid)
+		}
+
+		w.sketchIdx = append(w.sketchIdx, built.colSketches)
+		// No trace index update for log blocks.
 	}
 
 	// Collect service names for file-level bloom filter.
@@ -820,7 +1000,6 @@ func (w *Writer) flushLogBlocks() error {
 
 	clear(w.pendingLogs)
 	w.pendingLogs = w.pendingLogs[:0]
-
 	clear(w.logProtoRoots)
 	w.logProtoRoots = w.logProtoRoots[:0]
 
@@ -896,7 +1075,7 @@ func buildMetadataSectionBytes(
 // This avoids all OTLP proto allocations — values are read directly from block columns
 // at flush time by addRowFromBlock. The caller owns the block; it must remain valid
 // until Flush() is called.
-// Panics if called concurrently (NOTES §9).
+// Panics if called concurrently (NOTE-004).
 func (w *Writer) AddRow(block *reader.Block, rowIdx int) error {
 	if block == nil {
 		return fmt.Errorf("writer: AddRow: block is nil")

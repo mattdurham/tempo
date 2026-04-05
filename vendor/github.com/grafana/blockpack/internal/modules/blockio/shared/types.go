@@ -4,7 +4,7 @@ package shared
 
 import "sync"
 
-// ColumnType is the logical column type (0–12); values 13–255 are reserved.
+// ColumnType is the logical column type (0–13); values 14–255 are reserved.
 type ColumnType uint8
 
 // ColumnType constants.
@@ -22,6 +22,7 @@ const (
 	ColumnTypeRangeBytes    ColumnType = 10
 	ColumnTypeRangeString   ColumnType = 11
 	ColumnTypeUUID          ColumnType = 12 // string column stored as 16-byte binary UUID; StringValue() returns formatted UUID
+	ColumnTypeVectorF32     ColumnType = 13 // flat float32 array; dim stored in column encoding header
 )
 
 // BlockKind is the kind byte in a block index entry.

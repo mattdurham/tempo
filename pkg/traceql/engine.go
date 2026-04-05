@@ -146,6 +146,12 @@ func (e *Engine) ExecuteSearch(ctx context.Context, searchReq *tempopb.SearchReq
 		Metrics: &tempopb.SearchMetrics{},
 	}
 	combiner := NewMetadataCombiner(int(searchReq.Limit), mostRecent)
+	// Vector queries: preserve insertion order (= score order from blockpack).
+	if rootExpr.HasVector {
+		if ac, ok := combiner.(*anyCombiner); ok {
+			ac.preserveOrder = true
+		}
+	}
 	for {
 		spanset, err := iterator.Next(ctx)
 		if err != nil && !errors.Is(err, io.EOF) {

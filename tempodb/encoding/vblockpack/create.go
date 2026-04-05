@@ -16,12 +16,15 @@ import (
 // CreateBlock creates a new blockpack block from an iterator.
 // Writes blockpack data to a temp file to avoid buffering the entire block in
 // memory, then streams the file to backend storage with a known size.
+// When cfg.Blockpack.VectorDimension > 0, the writer builds a VectorIndex
+// section in the V5 footer for any __embedding__ columns present in the data.
 func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.BlockMeta,
 	i common.Iterator, r backend.Reader, to backend.Writer) (*backend.BlockMeta, error) {
 
 	// Initialize disk cache on first block creation (no-op if already initialized).
 	ConfigureFileCache(cfg.Blockpack.FileCachePath, cfg.Blockpack.FileCacheMaxBytes)
 	ConfigureLRU(cfg.Blockpack.LRUCacheBytes)
+	ConfigureEmbedding(cfg.Blockpack.EmbeddingURL)
 
 	// Write to a temp file so we get a known size for StreamWriter and avoid
 	// holding the entire encoded block in RAM.
@@ -34,7 +37,20 @@ func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.Blo
 		os.Remove(tmp.Name())
 	}()
 
-	writer, err := blockpack.NewWriter(tmp, cfg.Blockpack.MaxSpansPerBlock)
+	writerCfg := blockpack.WriterConfig{
+		OutputStream:  tmp,
+		MaxBlockSpans: cfg.Blockpack.MaxSpansPerBlock,
+	}
+	// Pass embedder to blockpack writer — it handles field assembly and embedding internally.
+	// Must guard against nil *Embedder assigned to interface (Go nil interface trap).
+	if emb := getProcessEmbedder(cfg.Blockpack.EmbeddingURL); emb != nil {
+		writerCfg.Embedder = emb
+	}
+	if cfg.Blockpack.VectorDimension > 0 {
+		writerCfg.VectorDimension = cfg.Blockpack.VectorDimension
+	}
+
+	writer, err := blockpack.NewWriterWithConfig(writerCfg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create blockpack writer: %w", err)
 	}
@@ -158,11 +174,5 @@ func setBlockTimeRange(meta *backend.BlockMeta, data []byte) {
 		meta.StartTime = time.Unix(0, int64(minStart)) //nolint:gosec
 		meta.EndTime = time.Unix(0, int64(maxEnd))     //nolint:gosec
 	}
-	// TotalRecords = 1: one job per file (no sub-file sharding).
-	// Blockpack's intrinsic fast path evaluates all internal blocks using
-	// intrinsic column blobs (~10 MB) instead of reading full blocks (~180 MB).
-	// Sub-file sharding disables this fast path by restricting each job to a
-	// block range, forcing full block reads. Setting TotalRecords=1 ensures the
-	// frontend creates exactly one job per file.
 	meta.TotalRecords = 1
 }

@@ -36,6 +36,7 @@ type RootExpr struct {
 	MetricsSecondStage secondStageElement
 	Hints              *Hints
 	OptimizationCount  int
+	HasVector          bool // true when the query contains VECTOR_AI() or VECTOR_ALL()
 }
 
 func NeedsFullTrace(e ...Element) bool {
