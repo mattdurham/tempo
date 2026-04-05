@@ -18,13 +18,18 @@ import (
 )
 
 // streamFilterQuery executes a TraceQL filter query against a modules-format reader.
-func streamFilterQuery(
-	r *Reader,
-	filterExpr *traceqlparser.FilterExpression,
-	opts QueryOptions,
-	fn spanMatchFn,
-) (QueryStats, error) {
-	program, compileErr := vm.CompileTraceQLFilter(filterExpr)
+func streamFilterQuery(r *Reader, filterExpr *traceqlparser.FilterExpression, opts QueryOptions, fn spanMatchFn) (QueryStats, error) {
+	var program *vm.Program
+	var compileErr error
+	if opts.Embedder != nil {
+		compileOpts := vm.CompileOptions{
+			Embedder: opts.Embedder,
+			Limit:    opts.Limit,
+		}
+		program, compileErr = vm.CompileTraceQLFilterWithOptions(filterExpr, compileOpts)
+	} else {
+		program, compileErr = vm.CompileTraceQLFilter(filterExpr)
+	}
 	if compileErr != nil {
 		return QueryStats{}, fmt.Errorf("compile TraceQL filter: %w", compileErr)
 	}
@@ -102,7 +107,7 @@ func streamFilterProgram(r *Reader, program *vm.Program, opts QueryOptions, fn s
 		if len(opts.SelectColumns) > 0 {
 			fields = newFilteredSpanFields(fields, opts.SelectColumns)
 		}
-		match := &SpanMatch{Fields: fields, TraceID: traceIDHex, SpanID: spanIDHex}
+		match := &SpanMatch{Fields: fields, TraceID: traceIDHex, SpanID: spanIDHex, Score: row.Score}
 		if !fn(match, true) {
 			// NOTE-ALLOC-4: release adapter back to pool after callback returns.
 			modules_blockio.ReleaseSpanFieldsAdapter(rawAdapter)

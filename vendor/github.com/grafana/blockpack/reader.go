@@ -295,6 +295,10 @@ func (a *readerProviderAdapter) ReadAt(p []byte, off int64, dataType modules_rw.
 
 // AGENT: Writer constructors - minimal set needed for creating writers.
 
+// WriterConfig configures a blockpack Writer.
+// It is a type alias for the internal WriterConfig.
+type WriterConfig = modules_blockio.WriterConfig
+
 // NewWriter creates a streaming modules-format blockpack writer that writes to output.
 // maxSpansPerBlock controls block granularity (0 uses the default of 2000).
 func NewWriter(output io.Writer, maxSpansPerBlock int) (*Writer, error) {
@@ -302,6 +306,12 @@ func NewWriter(output io.Writer, maxSpansPerBlock int) (*Writer, error) {
 		OutputStream:  output,
 		MaxBlockSpans: maxSpansPerBlock,
 	})
+}
+
+// NewWriterWithConfig creates a Writer with full configuration control.
+// Use this when VectorDimension or other advanced settings are needed.
+func NewWriterWithConfig(cfg WriterConfig) (*Writer, error) {
+	return modules_blockio.NewWriterWithConfig(cfg)
 }
 
 // FileLayoutReport describes the byte-level structure of a blockpack file.

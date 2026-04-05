@@ -431,6 +431,9 @@ require (
 	k8s.io/client-go v0.34.1 // indirect
 	k8s.io/klog/v2 v2.130.1 // indirect
 	k8s.io/utils v0.0.0-20251002143259-bc988d571ff4 // indirect
+	github.com/viterin/vek v0.4.3 // indirect
+	github.com/viterin/partial v1.1.0 // indirect
+	github.com/chewxy/math32 v1.10.1 // indirect
 )
 
 replace (

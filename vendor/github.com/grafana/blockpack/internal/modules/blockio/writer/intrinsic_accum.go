@@ -53,6 +53,58 @@ func newIntrinsicAccumulator() *intrinsicAccumulator {
 	}
 }
 
+// merge appends all rows from other into the receiver.
+// Column types are taken from other when a column is new to the receiver.
+// No sorting is performed here; sorting happens at encodeColumn time.
+// Safe to call with an empty other accumulator (no-op).
+func (a *intrinsicAccumulator) merge(other *intrinsicAccumulator) {
+	for name, src := range other.flatCols {
+		dst, ok := a.flatCols[name]
+		if !ok {
+			dst = &flatAccum{colType: src.colType}
+			a.flatCols[name] = dst
+		}
+		dst.uint64Values = append(dst.uint64Values, src.uint64Values...)
+		dst.bytesValues = append(dst.bytesValues, src.bytesValues...)
+		dst.refs = append(dst.refs, src.refs...)
+	}
+	for name, src := range other.dictCols {
+		dst, ok := a.dictCols[name]
+		if !ok {
+			// New column: create a fresh dictAccum with empty entries and index.
+			// Entries are populated by the per-entry merge loop below, not copied wholesale.
+			dst = &dictAccum{
+				index:   make(map[string]int, len(src.index)),
+				entries: make([]dictEntry, 0, len(src.entries)),
+				colType: src.colType,
+			}
+			a.dictCols[name] = dst
+		}
+		// Merge entries: for each entry in src, find or create a matching entry in dst.
+		isInt64 := src.colType == shared.ColumnTypeInt64 || src.colType == shared.ColumnTypeRangeInt64
+		for _, srcEntry := range src.entries {
+			var key string
+			if isInt64 {
+				var tmp [8]byte
+				binary.LittleEndian.PutUint64(tmp[:], uint64(srcEntry.int64Val)) //nolint:gosec
+				key = string(tmp[:])
+			} else {
+				key = srcEntry.strVal
+			}
+			idx, exists := dst.index[key]
+			if !exists {
+				idx = len(dst.entries)
+				dst.index[key] = idx
+				dst.entries = append(dst.entries, dictEntry{
+					strVal:   srcEntry.strVal,
+					int64Val: srcEntry.int64Val,
+				})
+			}
+			dst.entries[idx].refs = append(dst.entries[idx].refs, srcEntry.refs...)
+		}
+	}
+}
+
 // overCap reports whether any single column exceeds MaxIntrinsicRows.
 func (a *intrinsicAccumulator) overCap() bool {
 	for _, c := range a.flatCols {

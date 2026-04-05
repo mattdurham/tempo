@@ -32,8 +32,10 @@ func NewMetadataCombiner(limit int, keepMostRecent bool) MetadataCombiner {
 }
 
 type anyCombiner struct {
-	trs   map[string]*tempopb.TraceSearchMetadata
-	limit int
+	trs            map[string]*tempopb.TraceSearchMetadata
+	insertionOrder []string // preserves order for vector queries
+	limit          int
+	preserveOrder  bool // when true, Metadata() returns insertion order instead of time-sorted
 }
 
 func newAnyCombiner(limit int) *anyCombiner {
@@ -74,6 +76,7 @@ func (c *anyCombiner) AddMetadata(meta *tempopb.TraceSearchMetadata) bool {
 	}
 
 	c.trs[meta.TraceID] = meta
+	c.insertionOrder = append(c.insertionOrder, meta.TraceID)
 	return true
 }
 
@@ -92,12 +95,21 @@ func (c *anyCombiner) IsCompleteFor(_ uint32) bool {
 
 func (c *anyCombiner) Metadata() []*tempopb.TraceSearchMetadata {
 	m := make([]*tempopb.TraceSearchMetadata, 0, len(c.trs))
-	for _, tr := range c.trs {
-		m = append(m, tr)
+	if c.preserveOrder && len(c.insertionOrder) > 0 {
+		// Vector queries: preserve insertion order (= score order from blockpack)
+		for _, id := range c.insertionOrder {
+			if tr, ok := c.trs[id]; ok {
+				m = append(m, tr)
+			}
+		}
+	} else {
+		for _, tr := range c.trs {
+			m = append(m, tr)
+		}
+		sort.Slice(m, func(i, j int) bool {
+			return m[i].StartTimeUnixNano > m[j].StartTimeUnixNano
+		})
 	}
-	sort.Slice(m, func(i, j int) bool {
-		return m[i].StartTimeUnixNano > m[j].StartTimeUnixNano
-	})
 	return m
 }
 

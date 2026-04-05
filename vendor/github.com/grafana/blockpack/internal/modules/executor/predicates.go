@@ -998,6 +998,17 @@ func ProgramWantColumns(program *vm.Program, extra ...string) map[string]struct{
 	for _, c := range extra {
 		cols[c] = struct{}{}
 	}
+	// Ensure the correct embedding column is always included when the program has a VECTOR() predicate.
+	// Use program.VectorColumn (set at compile time) to handle both VECTOR_AI (__embedding__)
+	// and VECTOR_ALL (__embedding_all__) correctly. Fall back to EmbeddingColumnName for
+	// programs constructed without VectorColumn (e.g. legacy tests).
+	if program.HasVector {
+		embCol := program.VectorColumn
+		if embCol == "" {
+			embCol = modules_shared.EmbeddingColumnName
+		}
+		cols[embCol] = struct{}{}
+	}
 	if len(cols) == 0 {
 		return nil
 	}

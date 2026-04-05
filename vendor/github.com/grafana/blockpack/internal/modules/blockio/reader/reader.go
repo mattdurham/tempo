@@ -4,6 +4,7 @@ package reader
 
 import (
 	"fmt"
+	"math"
 	"slices"
 	"sort"
 	"sync"
@@ -31,6 +32,8 @@ type compactTraceIndex struct {
 // Reader reads and decodes a blockpack file.
 type Reader struct {
 	provider rw.ReaderProvider
+	// vectorIndexErr holds any error from lazy vector index parsing.
+	vectorIndexErr error
 	// cache is the optional disk-backed file cache for footer/header/metadata/block reads.
 	// Nil when no cache is configured.
 	cache *filecache.FileCache
@@ -63,10 +66,6 @@ type Reader struct {
 	// Populated lazily by GetIntrinsicColumn.
 	intrinsicDecoded map[string]*shared.IntrinsicColumn
 
-	// intrinsicNames is the sorted slice of intrinsic column names, computed once
-	// (lazily on first IntrinsicColumnNames call) and reused. Callers only iterate.
-	intrinsicNames []string
-
 	// metaPin holds a reference to the *parsedMetadata retrieved from the process-level
 	// cache, ensuring the pointer remains valid for the lifetime of this Reader.
 	metaPin *parsedMetadata
@@ -78,7 +77,14 @@ type Reader struct {
 	// fileBloomParsed is the lazily parsed FileBloom section. Access via FileBloom().
 	fileBloomParsed *FileBloom
 
+	// vectorIndexParsed is the lazily parsed VectorIndex. Access via VectorIndex().
+	vectorIndexParsed *VectorIndex
+
 	fileID string
+
+	// intrinsicNames is the sorted slice of intrinsic column names, computed once
+	// (lazily on first IntrinsicColumnNames call) and reused. Callers only iterate.
+	intrinsicNames []string
 
 	// traceIndexRaw holds the raw bytes of the trace index section for lazy parsing.
 	// Populated during parseV5MetadataLazy; parsed into traceIndex on first access.
@@ -112,13 +118,23 @@ type Reader struct {
 	// Both are 0 for v3 footer files or files with no intrinsic section.
 	intrinsicIndexOffset uint64
 
+	// vectorIndexOffset and vectorIndexLen are parsed from the v5 footer.
+	// Both are 0 for v3/v4 footer files or files with no vector index section.
+	vectorIndexOffset uint64
+
 	fileBloomOnce sync.Once
 
 	fileSummaryOnce sync.Once
 
+	// vectorIndexOnce guards lazy parsing of the vector index section.
+	vectorIndexOnce sync.Once
+
 	compactLen uint32
 
 	intrinsicIndexLen uint32
+
+	// vectorIndexLen is parsed from the v5 footer.
+	vectorIndexLen uint32
 
 	footerVersion uint16
 	fileVersion   uint8
@@ -614,6 +630,51 @@ func (r *Reader) MayContainTraceID(traceID [16]byte) bool {
 		return true
 	}
 	return shared.TestTraceIDBloom(r.compactParsed.traceIDBloom, traceID)
+}
+
+// FooterVersion returns the version number parsed from the file footer.
+// Returns 3, 4, or 5 depending on the file format version.
+func (r *Reader) FooterVersion() uint16 {
+	return r.footerVersion
+}
+
+// VectorIndexRaw reads the raw vector index section bytes (for caller caching).
+// Returns nil for V3/V4 footer files or files with no vector index section.
+func (r *Reader) VectorIndexRaw() ([]byte, error) {
+	if r.vectorIndexOffset == 0 || r.vectorIndexLen == 0 {
+		return nil, nil
+	}
+	if r.vectorIndexLen > math.MaxInt32 {
+		return nil, fmt.Errorf("VectorIndexRaw: vectorIndexLen %d exceeds MaxInt32", r.vectorIndexLen)
+	}
+	//nolint:gosec // vectorIndexLen comes from a trusted file footer; overflow checked above
+	buf := make([]byte, r.vectorIndexLen)
+	n, err := r.provider.ReadAt(buf, int64(r.vectorIndexOffset), rw.DataTypeMetadata) //nolint:gosec // vectorIndexOffset fits in int64: file size bounded by object storage limits
+	if err != nil {
+		return nil, fmt.Errorf("VectorIndexRaw: ReadAt: %w", err)
+	}
+	if n != int(r.vectorIndexLen) {
+		return nil, fmt.Errorf("VectorIndexRaw: short read: %d of %d bytes", n, r.vectorIndexLen)
+	}
+	return buf, nil
+}
+
+// VectorIndex returns the lazily-parsed VectorIndex for this file.
+// Returns nil, nil for files with no vector index section.
+// Safe for concurrent use after the first call.
+func (r *Reader) VectorIndex() (*VectorIndex, error) {
+	r.vectorIndexOnce.Do(func() {
+		raw, err := r.VectorIndexRaw()
+		if err != nil {
+			r.vectorIndexErr = err
+			return
+		}
+		if raw == nil {
+			return
+		}
+		r.vectorIndexParsed, r.vectorIndexErr = parseVectorIndexSection(raw)
+	})
+	return r.vectorIndexParsed, r.vectorIndexErr
 }
 
 // AddColumnsToBlock decodes additional columns from an already-loaded BlockWithBytes.

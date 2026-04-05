@@ -3,7 +3,7 @@ package vblockpack
 import (
 	"bytes"
 	"context"
-	"encoding/hex"
+	"encoding/hex" //nolint:depguard
 	"fmt"
 	"io"
 	"os"
@@ -86,7 +86,15 @@ func (w *walBlock) initWriter() error {
 
 	// Pre-allocate 32 MiB to reduce buffer doubling during span ingestion.
 	w.buf = bytes.NewBuffer(make([]byte, 0, 32<<20))
-	writer, err := blockpack.NewWriter(w.buf, 2000)
+	cfg := blockpack.WriterConfig{
+		OutputStream:  w.buf,
+		MaxBlockSpans: 2000,
+	}
+	// Pass embedder if configured — blockpack handles field assembly + embedding internally.
+	if emb := getProcessEmbedder(configuredEmbedURL); emb != nil {
+		cfg.Embedder = emb
+	}
+	writer, err := blockpack.NewWriterWithConfig(cfg)
 	if err != nil {
 		return fmt.Errorf("failed to create blockpack writer: %w", err)
 	}
@@ -228,13 +236,120 @@ func (w *walBlock) SearchTagValuesV2(ctx context.Context, tag traceql.Attribute,
 	return nil
 }
 
-// Fetch implements the Searcher interface.
-// Returns an empty (but non-nil) iterator — walBlock does not support in-memory search.
-// A nil Results field causes a panic in traceql.Engine.ExecuteSearch.
-func (w *walBlock) Fetch(_ context.Context, _ traceql.FetchSpansRequest, _ common.SearchOptions) (traceql.FetchSpansResponse, error) {
+// Fetch implements the Searcher interface by querying the WAL block's accumulated data.
+// It snapshots the current writer state, creates a temporary reader, and runs the query.
+func (w *walBlock) Fetch(ctx context.Context, req traceql.FetchSpansRequest, opts common.SearchOptions) (traceql.FetchSpansResponse, error) {
+	w.mu.Lock()
+	var snapshot []byte
+
+	if w.writer != nil && w.buf != nil {
+		// Writer still active — flush pending data and snapshot the buffer.
+		if _, err := w.writer.Flush(); err != nil {
+			w.mu.Unlock()
+			return traceql.FetchSpansResponse{}, fmt.Errorf("walBlock Fetch: flush: %w", err)
+		}
+		if w.buf.Len() > 0 {
+			snapshot = make([]byte, w.buf.Len())
+			copy(snapshot, w.buf.Bytes())
+		}
+		// Re-initialize the writer so future appends work.
+		w.buf.Reset()
+		cfg := blockpack.WriterConfig{
+			OutputStream:  w.buf,
+			MaxBlockSpans: 2000,
+		}
+		if emb := getProcessEmbedder(configuredEmbedURL); emb != nil {
+			cfg.Embedder = emb
+		}
+		newWriter, err := blockpack.NewWriterWithConfig(cfg)
+		if err != nil {
+			w.mu.Unlock()
+			return traceql.FetchSpansResponse{}, fmt.Errorf("walBlock Fetch: re-init writer: %w", err)
+		}
+		w.writer = newWriter
+	} else {
+		// Writer already flushed to disk — read from file.
+		filePath := w.path + "/" + DataFileName
+		var err error
+		snapshot, err = os.ReadFile(filePath)
+		if err != nil || len(snapshot) == 0 {
+			w.mu.Unlock()
+			return traceql.FetchSpansResponse{
+				Results: &sliceSpansetIterator{},
+				Bytes:   func() uint64 { return 0 },
+			}, nil
+		}
+	}
+	w.mu.Unlock()
+
+	if len(snapshot) == 0 {
+		return traceql.FetchSpansResponse{
+			Results: &sliceSpansetIterator{},
+			Bytes:   func() uint64 { return 0 },
+		}, nil
+	}
+
+	// Create a reader from the snapshot and run the query.
+	r, err := blockpack.NewReaderFromProvider(&bytesReaderProvider{data: snapshot})
+	if err != nil {
+		return traceql.FetchSpansResponse{}, fmt.Errorf("walBlock Fetch: create reader: %w", err)
+	}
+
+	query := conditionsToTraceQL(req.Conditions, req.AllConditions)
+	if orig, ok := common.OriginalTraceQLQuery(ctx); ok {
+		query = orig
+	}
+
+	matches, _, fetchErr := blockpack.QueryTraceQL(r, query, blockpack.QueryOptions{
+		Limit:     opts.MaxTraces,
+		StartNano: req.StartTimeUnixNanos,
+		EndNano:   req.EndTimeUnixNanos,
+		Embedder:  getProcessEmbedder(configuredEmbedURL),
+	})
+	if fetchErr != nil {
+		return traceql.FetchSpansResponse{}, fmt.Errorf("walBlock Fetch: query: %w", fetchErr)
+	}
+
+	// Convert matches to spansets grouped by trace (mirrors backend_block.Fetch).
+	type traceEntry struct {
+		traceID  []byte
+		spans    []traceql.Span
+		rawSpans []blockpack.SpanMatch
+	}
+	traceMap := make(map[string]*traceEntry)
+	var traceOrder []string
+	for i := range matches {
+		m := &matches[i]
+		if _, exists := traceMap[m.TraceID]; !exists {
+			traceIDBytes, decErr := hex.DecodeString(m.TraceID)
+			if decErr != nil {
+				continue
+			}
+			traceMap[m.TraceID] = &traceEntry{traceID: traceIDBytes}
+			traceOrder = append(traceOrder, m.TraceID)
+		}
+		traceMap[m.TraceID].spans = append(traceMap[m.TraceID].spans, &blockpackSpan{match: *m})
+		traceMap[m.TraceID].rawSpans = append(traceMap[m.TraceID].rawSpans, *m)
+	}
+
+	spansets := make([]*traceql.Spanset, 0, len(traceOrder))
+	for _, tid := range traceOrder {
+		entry := traceMap[tid]
+		rootSpanName, rootServiceName, startNanos, durationNanos := blockpack.SpanMatchesMetadata(entry.rawSpans)
+		spansets = append(spansets, &traceql.Spanset{
+			TraceID:            entry.traceID,
+			Spans:              entry.spans,
+			RootSpanName:       rootSpanName,
+			RootServiceName:    rootServiceName,
+			StartTimeUnixNanos: startNanos,
+			DurationNanos:      durationNanos,
+			ServiceStats:       spanMatchesServiceStats(entry.rawSpans),
+		})
+	}
+
 	return traceql.FetchSpansResponse{
-		Results: &sliceSpansetIterator{},
-		Bytes:   func() uint64 { return 0 },
+		Results: &sliceSpansetIterator{spansets: spansets},
+		Bytes:   func() uint64 { return uint64(len(snapshot)) },
 	}, nil
 }
 

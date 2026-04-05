@@ -106,6 +106,7 @@ import (
                         RATE COUNT_OVER_TIME MIN_OVER_TIME MAX_OVER_TIME AVG_OVER_TIME SUM_OVER_TIME QUANTILE_OVER_TIME HISTOGRAM_OVER_TIME COMPARE
                         TOPK BOTTOMK
                         WITH
+                        VECTOR_AI VECTOR_ALL
 
 // Operators are listed with increasing precedence.
 %left <binOp> PIPE
@@ -122,12 +123,12 @@ import (
 // Pipeline
 // **********************
 root:
-    spansetPipeline                             { yylex.(*lexer).expr = newRootExpr($1) }
-  | spansetPipelineExpression                   { yylex.(*lexer).expr = newRootExpr($1) }
-  | scalarPipelineExpressionFilter              { yylex.(*lexer).expr = newRootExpr($1) } 
-  | spansetPipeline PIPE metricsAggregation     { yylex.(*lexer).expr = newRootExprWithMetrics($1, $3) }
+    spansetPipeline                             { l := yylex.(*lexer); l.expr = newRootExpr($1); l.expr.HasVector = l.hasVector }
+  | spansetPipelineExpression                   { l := yylex.(*lexer); l.expr = newRootExpr($1); l.expr.HasVector = l.hasVector }
+  | scalarPipelineExpressionFilter              { l := yylex.(*lexer); l.expr = newRootExpr($1); l.expr.HasVector = l.hasVector }
+  | spansetPipeline PIPE metricsAggregation     { l := yylex.(*lexer); l.expr = newRootExprWithMetrics($1, $3); l.expr.HasVector = l.hasVector }
   // note: would only work for single metrics pipeline and not for multiple metrics pipelines before the fucntions
-  | spansetPipeline PIPE metricsAggregation PIPE metricsSecondStage  { yylex.(*lexer).expr = newRootExprWithMetricsTwoStage($1, $3, $5) }
+  | spansetPipeline PIPE metricsAggregation PIPE metricsSecondStage  { l := yylex.(*lexer); l.expr = newRootExprWithMetricsTwoStage($1, $3, $5); l.expr.HasVector = l.hasVector }
   | root hints                                  { yylex.(*lexer).expr.withHints($2) }
   ;
 
@@ -384,6 +385,8 @@ fieldExpression:
   | intrinsicField                           { $$ = $1 }
   | attributeField                           { $$ = $1 }
   | scopedIntrinsicField                     { $$ = $1 }
+  | VECTOR_AI OPEN_PARENS STRING CLOSE_PARENS   { $$ = NewStaticBool(true); yylex.(*lexer).hasVector = true }
+  | VECTOR_ALL OPEN_PARENS STRING CLOSE_PARENS  { $$ = NewStaticBool(true); yylex.(*lexer).hasVector = true }
   ;
 
 // **********************

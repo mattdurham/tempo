@@ -342,6 +342,9 @@ github.com/bytedance/sonic/loader/internal/abi
 github.com/bytedance/sonic/loader/internal/iasm/expr
 github.com/bytedance/sonic/loader/internal/iasm/x86_64
 github.com/bytedance/sonic/loader/internal/rt
+# github.com/chewxy/math32 v1.10.1
+## explicit; go 1.19
+github.com/chewxy/math32
 # github.com/cenkalti/backoff/v4 v4.3.0
 ## explicit; go 1.18
 github.com/cenkalti/backoff/v4
@@ -736,6 +739,7 @@ github.com/grafana/blockpack/internal/modules/blockio/compaction
 github.com/grafana/blockpack/internal/modules/blockio/reader
 github.com/grafana/blockpack/internal/modules/blockio/shared
 github.com/grafana/blockpack/internal/modules/blockio/writer
+github.com/grafana/blockpack/internal/modules/embedder
 github.com/grafana/blockpack/internal/modules/executor
 github.com/grafana/blockpack/internal/modules/filecache
 github.com/grafana/blockpack/internal/modules/objectcache
@@ -745,6 +749,7 @@ github.com/grafana/blockpack/internal/modules/sketch
 github.com/grafana/blockpack/internal/otlpconvert
 github.com/grafana/blockpack/internal/s3provider
 github.com/grafana/blockpack/internal/traceqlparser
+github.com/grafana/blockpack/internal/modules/vectormath
 github.com/grafana/blockpack/internal/vm
 # github.com/grafana/dskit v0.0.0-20251031165806-a6f15387939b
 ## explicit; go 1.24.0
@@ -1619,6 +1624,14 @@ github.com/uber/jaeger-client-go/utils
 ## explicit
 github.com/uber/jaeger-lib/metrics
 github.com/uber/jaeger-lib/metrics/prometheus
+# github.com/viterin/partial v1.1.0
+## explicit; go 1.18
+github.com/viterin/partial
+# github.com/viterin/vek v0.4.3
+## explicit; go 1.19
+github.com/viterin/vek
+github.com/viterin/vek/internal/functions
+github.com/viterin/vek/vek32
 # github.com/willf/bitset v1.1.11
 ## explicit; go 1.14
 github.com/willf/bitset
@@ -2206,6 +2219,7 @@ golang.org/x/crypto/pkcs12/internal/rc2
 ## explicit; go 1.24.0
 golang.org/x/exp/constraints
 golang.org/x/exp/maps
+golang.org/x/exp/rand
 golang.org/x/exp/slices
 # golang.org/x/mod v0.33.0
 ## explicit; go 1.24.0

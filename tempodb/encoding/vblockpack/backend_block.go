@@ -479,6 +479,7 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 		StartNano:     req.StartTimeUnixNanos,
 		EndNano:       req.EndTimeUnixNanos,
 		SelectColumns: selectCols, // nil when empty = return all (match-all queries)
+		Embedder:      getProcessEmbedder(configuredEmbedURL),
 		// Do not use StartBlock/BlockCount: Tempo's TotalPages concept maps to parquet
 		// row groups, not blockpack internal blocks. Passing TotalPages=1 as BlockCount
 		// would scan only 1 internal block out of potentially hundreds. Blockpack files

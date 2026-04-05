@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-kit/log" //nolint:all deprecated
@@ -114,11 +115,16 @@ func (s asyncSearchSharder) RoundTrip(pipelineRequest pipeline.Request) (pipelin
 	// buffer of shards+1 allows us to insert ingestReq and metrics
 	reqCh := make(chan pipeline.Request, s.cfg.IngesterShards+1)
 
-	// build request to search ingesters based on query_backend_after config and time range
-	// pass subCtx in requests so we can cancel and exit early
-	jobMetrics, err := s.ingesterRequests(tenantID, pipelineRequest, *searchReq, reqCh)
-	if err != nil {
-		return nil, err
+	// Skip livestore for VECTOR queries — livestore WAL blocks don't have embeddings,
+	// so they return unscored results that dilute the ranked backend block results.
+	var jobMetrics *combiner.SearchJobResponse
+	if isVectorQuery(searchReq.Query) {
+		jobMetrics = &combiner.SearchJobResponse{}
+	} else {
+		jobMetrics, err = s.ingesterRequests(tenantID, pipelineRequest, *searchReq, reqCh)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// pass subCtx in requests so we can cancel and exit early
@@ -483,4 +489,9 @@ func backendJobsFunc(blocks []*backend.BlockMeta, targetBytesPerRequest int, max
 			shardIterCallback(jobsInShard, bytesInShard, 1) // final shard can cover all time. we don't need to be precise
 		}
 	}
+}
+
+// isVectorQuery returns true if the query contains VECTOR_AI or VECTOR_ALL functions.
+func isVectorQuery(query string) bool {
+	return strings.Contains(query, "VECTOR_AI(") || strings.Contains(query, "VECTOR_ALL(")
 }

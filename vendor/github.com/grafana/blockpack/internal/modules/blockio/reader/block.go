@@ -4,7 +4,9 @@ package reader
 // NOTE: Any changes to this file must be reflected in the corresponding specs.md or NOTES.md.
 
 import (
+	"encoding/binary"
 	"encoding/hex"
+	"math"
 	"sync"
 
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
@@ -100,7 +102,7 @@ func (c *Column) IsPresent(idx int) bool {
 	if c.Present == nil {
 		if c.rawEncoding != nil {
 			c.presenceOnce.Do(func() {
-				present, err := decodePresenceOnly(c.rawEncoding, c.SpanCount)
+				present, err := decodePresenceOnly(c.rawEncoding, c.SpanCount, c.Type)
 				if err != nil {
 					c.Present = []byte{}
 					c.rawEncoding = nil
@@ -303,6 +305,35 @@ func (c *Column) BytesValue(idx int) ([]byte, bool) {
 	}
 
 	return nil, false
+}
+
+// VectorF32Value returns the []float32 embedding vector at idx for ColumnTypeVectorF32 columns.
+// Returns (nil, false) when the row is not present or the column is not ColumnTypeVectorF32.
+// The raw bytes stored by decodeVectorF32 are dim*4 bytes in LE byte order.
+func (c *Column) VectorF32Value(idx int) ([]float32, bool) {
+	if c.rawEncoding != nil {
+		c.decodeNow()
+	}
+	if c.Type != shared.ColumnTypeVectorF32 {
+		return nil, false
+	}
+	if !c.IsPresent(idx) {
+		return nil, false
+	}
+	if c.BytesInline == nil || idx >= len(c.BytesInline) || c.BytesInline[idx] == nil {
+		return nil, false
+	}
+	raw := c.BytesInline[idx]
+	if len(raw)%4 != 0 {
+		return nil, false
+	}
+	dim := len(raw) / 4
+	vec := make([]float32, dim)
+	for i := range dim {
+		bits := binary.LittleEndian.Uint32(raw[i*4 : i*4+4])
+		vec[i] = math.Float32frombits(bits)
+	}
+	return vec, true
 }
 
 // ColIterEntry is a single entry in the pre-computed deduplicated column iteration list.

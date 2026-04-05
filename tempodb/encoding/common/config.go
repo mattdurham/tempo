@@ -89,6 +89,15 @@ type BlockpackConfig struct {
 	// This cache holds footer and file metadata only — sketch/bloom data should not be
 	// retained here. Defaults to 32MB.
 	LRUCacheBytes int64 `yaml:"lru_cache_bytes"`
+
+	// EmbeddingURL is the base URL of an embedding server (e.g. HuggingFace TEI).
+	// When set, spans are embedded at block creation time and VECTOR_AI()/VECTOR_ALL()
+	// queries are supported. Leave empty to disable embedding.
+	EmbeddingURL string `yaml:"embedding_url"`
+
+	// VectorDimension is the expected embedding vector dimension (e.g. 768 for nomic-embed-text-v1.5).
+	// Required when EmbeddingURL is set. Controls the writer's VectorIndex section.
+	VectorDimension int `yaml:"vector_dimension"`
 }
 
 func (cfg *BlockConfig) RegisterFlagsAndApplyDefaults(prefix string, f *flag.FlagSet) {
