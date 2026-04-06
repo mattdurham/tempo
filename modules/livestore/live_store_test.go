@@ -828,6 +828,19 @@ func TestIsLagged(t *testing.T) {
 	}
 }
 
+func TestCalculateTimeLagNilReader(t *testing.T) {
+	// Regression test: calculateTimeLag must not panic when reader is nil,
+	// which occurs if QueryRange is called before startup completes.
+	ls := &LiveStore{
+		logger: log.NewNopLogger(),
+		// reader intentionally left nil to simulate pre-startup state
+	}
+	ls.lastRecordTimeNanos.Store(-1)
+
+	result := ls.calculateTimeLag(0)
+	require.Nil(t, result, "nil reader should return indeterminate lag (nil)")
+}
+
 func TestLiveStoreKeepsPartitionOwnerOnShutdown(t *testing.T) {
 	tmpDir := t.TempDir()
 
