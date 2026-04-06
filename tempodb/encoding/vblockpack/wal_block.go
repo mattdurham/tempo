@@ -336,7 +336,7 @@ func (w *walBlock) Fetch(ctx context.Context, req traceql.FetchSpansRequest, opt
 	for _, tid := range traceOrder {
 		entry := traceMap[tid]
 		rootSpanName, rootServiceName, startNanos, durationNanos := blockpack.SpanMatchesMetadata(entry.rawSpans)
-		spansets = append(spansets, &traceql.Spanset{
+		ss := &traceql.Spanset{
 			TraceID:            entry.traceID,
 			Spans:              entry.spans,
 			RootSpanName:       rootSpanName,
@@ -344,7 +344,9 @@ func (w *walBlock) Fetch(ctx context.Context, req traceql.FetchSpansRequest, opt
 			StartTimeUnixNanos: startNanos,
 			DurationNanos:      durationNanos,
 			ServiceStats:       spanMatchesServiceStats(entry.rawSpans),
-		})
+		}
+		ss.AddAttribute(traceql.AttributeMatched, traceql.NewStaticInt(len(entry.spans)))
+		spansets = append(spansets, ss)
 	}
 
 	return traceql.FetchSpansResponse{
