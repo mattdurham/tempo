@@ -189,7 +189,10 @@ type Span interface {
 }
 
 // should we just make matched a field on the spanset instead of a special attribute?
-const attributeMatched = "__matched"
+const AttributeMatched = "__matched"
+
+// attributeMatched is an alias for backwards compatibility within this package.
+const attributeMatched = AttributeMatched
 
 type SpansetAttribute struct {
 	Name string

@@ -524,6 +524,10 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 			DurationNanos:      durationNanos,
 			ServiceStats:       spanMatchesServiceStats(entry.rawSpans),
 		}
+		// Set matched = span count so asTraceSearchMetadata populates SpanSet.Matched.
+		// The engine's SecondPass normally does this, but blockpack returns a pre-built
+		// iterator and SecondPass is never called.
+		ss.AddAttribute(traceql.AttributeMatched, traceql.NewStaticInt(len(entry.spans)))
 		spansets = append(spansets, ss)
 	}
 
