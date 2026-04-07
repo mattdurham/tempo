@@ -515,19 +515,27 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 	for _, traceIDHex := range traceOrder {
 		entry := traceMap[traceIDHex]
 		rootSpanName, rootServiceName, startNanos, durationNanos := blockpack.SpanMatchesMetadata(entry.rawSpans)
+		// Cap returned spans at DefaultSpansPerSpanSet (3) to match standard Tempo
+		// search behaviour — large traces would otherwise produce huge payloads.
+		// AttributeMatched must reflect the *total* count before the cap.
+		totalSpans := len(entry.spans)
+		returnedSpans := entry.spans
+		if len(returnedSpans) > traceql.DefaultSpansPerSpanSet {
+			returnedSpans = returnedSpans[:traceql.DefaultSpansPerSpanSet]
+		}
 		ss := &traceql.Spanset{
 			TraceID:            entry.traceID,
-			Spans:              entry.spans,
+			Spans:              returnedSpans,
 			RootSpanName:       rootSpanName,
 			RootServiceName:    rootServiceName,
 			StartTimeUnixNanos: startNanos,
 			DurationNanos:      durationNanos,
 			ServiceStats:       spanMatchesServiceStats(entry.rawSpans),
 		}
-		// Set matched = span count so asTraceSearchMetadata populates SpanSet.Matched.
+		// Set matched = total span count so asTraceSearchMetadata populates SpanSet.Matched.
 		// The engine's SecondPass normally does this, but blockpack returns a pre-built
 		// iterator and SecondPass is never called.
-		ss.AddAttribute(traceql.AttributeMatched, traceql.NewStaticInt(len(entry.spans)))
+		ss.AddAttribute(traceql.AttributeMatched, traceql.NewStaticInt(totalSpans))
 		spansets = append(spansets, ss)
 	}
 

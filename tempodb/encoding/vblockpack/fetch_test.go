@@ -907,3 +907,101 @@ func TestFetch_AllAttributesLimitedToQueryConditions(t *testing.T) {
 	_, hasDB := attrs[dbSystem]
 	require.False(t, hasDB, "non-queried db.system must NOT be in AllAttributes")
 }
+
+// TestFetch_SetsAttributeMatched verifies that Fetch() sets the attributeMatched
+// attribute on every returned spanset so that asTraceSearchMetadata can populate
+// SpanSet.Matched in search responses.
+func TestFetch_SetsAttributeMatched(t *testing.T) {
+	block, _ := createFetchTestBlock(t)
+	spansets := collectFetch(t, block, nil, false)
+	require.NotEmpty(t, spansets, "expected at least one spanset")
+
+	for _, ss := range spansets {
+		var matchedAttr *traceql.SpansetAttribute
+		for _, att := range ss.Attributes {
+			if att.Name == traceql.AttributeMatched {
+				matchedAttr = att
+				break
+			}
+		}
+		require.NotNil(t, matchedAttr, "spanset missing attributeMatched")
+		n, ok := matchedAttr.Val.Int()
+		require.True(t, ok, "attributeMatched value must be int")
+		require.Equal(t, len(ss.Spans), n, "attributeMatched must equal span count")
+		require.Greater(t, n, 0, "span count must be > 0")
+	}
+}
+
+// TestFetch_SpanCapAtDefaultSpansPerSpanSet verifies that Fetch() caps the returned
+// spans array at traceql.DefaultSpansPerSpanSet (3) while keeping AttributeMatched
+// equal to the true total — matching standard Tempo search behaviour and preventing
+// oversized payloads from reaching the Grafana UI.
+func TestFetch_SpanCapAtDefaultSpansPerSpanSet(t *testing.T) {
+	const totalSpans = 5 // deliberately > DefaultSpansPerSpanSet (3)
+
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	rawR, rawW, _, err := local.New(&local.Config{Path: tmpDir})
+	require.NoError(t, err)
+	r := backend.NewReader(rawR)
+	w := backend.NewWriter(rawW)
+
+	traceID := []byte{0xe, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xe}
+	now := uint64(time.Now().UnixNano())
+
+	spans := make([]*tempotrace.Span, totalSpans)
+	for i := range spans {
+		spans[i] = &tempotrace.Span{
+			TraceId:           traceID,
+			SpanId:            []byte{0xe, 0, 0, 0, 0, 0, 0, byte(i + 1)},
+			Name:              "span",
+			StartTimeUnixNano: now + uint64(i)*uint64(time.Millisecond),
+			EndTimeUnixNano:   now + uint64(i)*uint64(time.Millisecond) + uint64(10*time.Millisecond),
+		}
+	}
+
+	traces := []*tempopb.Trace{
+		{
+			ResourceSpans: []*tempotrace.ResourceSpans{{
+				Resource: &temporesource.Resource{
+					Attributes: []*tempocommon.KeyValue{
+						{Key: "service.name", Value: &tempocommon.AnyValue{Value: &tempocommon.AnyValue_StringValue{StringValue: "svc-many"}}},
+					},
+				},
+				ScopeSpans: []*tempotrace.ScopeSpans{{Spans: spans}},
+			}},
+		},
+	}
+
+	meta := backend.NewBlockMeta("test-tenant", uuid.New(), VersionString)
+	iter := &mockIterator{traces: traces, ids: [][]byte{traceID}}
+	cfg := &common.BlockConfig{}
+	resultMeta, err := CreateBlock(ctx, cfg, meta, iter, r, w)
+	require.NoError(t, err)
+
+	blk := newBackendBlock(resultMeta, r)
+	spansets := collectFetch(t, blk, nil, false)
+
+	require.Len(t, spansets, 1, "expected 1 spanset")
+	ss := spansets[0]
+
+	// Spans array must be capped at DefaultSpansPerSpanSet.
+	require.LessOrEqual(t, len(ss.Spans), traceql.DefaultSpansPerSpanSet,
+		"returned spans must be capped at DefaultSpansPerSpanSet (%d), got %d",
+		traceql.DefaultSpansPerSpanSet, len(ss.Spans))
+
+	// AttributeMatched must reflect the true total, not the capped count.
+	var matchedAttr *traceql.SpansetAttribute
+	for _, att := range ss.Attributes {
+		if att.Name == traceql.AttributeMatched {
+			matchedAttr = att
+			break
+		}
+	}
+	require.NotNil(t, matchedAttr, "spanset missing AttributeMatched")
+	n, ok := matchedAttr.Val.Int()
+	require.True(t, ok, "AttributeMatched value must be int")
+	require.Equal(t, totalSpans, n,
+		"AttributeMatched must equal total span count (%d), not capped count (%d)",
+		totalSpans, len(ss.Spans))
+}
