@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/grafana/blockpack"
 	"github.com/grafana/tempo/pkg/tempopb"
 	tempocommon "github.com/grafana/tempo/pkg/tempopb/common/v1"
 	temporesource "github.com/grafana/tempo/pkg/tempopb/resource/v1"
@@ -796,37 +797,49 @@ func TestFetch_AllAttributesReturnsAllTypes(t *testing.T) {
 	require.NoError(t, err)
 
 	blk := newBackendBlock(resultMeta, r)
-	spansets := collectFetch(t, blk, nil, false)
+
+	strAttr := traceql.NewScopedAttribute(traceql.AttributeScopeSpan, false, "str.attr")
+	intAttr := traceql.NewScopedAttribute(traceql.AttributeScopeSpan, false, "int.attr")
+	floatAttr := traceql.NewScopedAttribute(traceql.AttributeScopeSpan, false, "float.attr")
+	boolTrueAttr := traceql.NewScopedAttribute(traceql.AttributeScopeSpan, false, "bool.true")
+	boolFalseAttr := traceql.NewScopedAttribute(traceql.AttributeScopeSpan, false, "bool.false")
+
+	// Populate conditions so that requestedAttrs is non-empty and AllAttributesFunc
+	// actually exercises the type-conversion logic for each attribute.
+	conditions := []traceql.Condition{
+		{Attribute: strAttr},
+		{Attribute: intAttr},
+		{Attribute: floatAttr},
+		{Attribute: boolTrueAttr},
+		{Attribute: boolFalseAttr},
+	}
+	spansets := collectFetch(t, blk, conditions, false)
 	require.Len(t, spansets, 1)
 	require.Len(t, spansets[0].Spans, 1)
 
 	attrs := spansets[0].Spans[0].AllAttributes()
 
-	strAttr := traceql.NewAttribute("str.attr")
-	intAttr := traceql.NewAttribute("int.attr")
-	floatAttr := traceql.NewAttribute("float.attr")
-	boolTrueAttr := traceql.NewAttribute("bool.true")
-	boolFalseAttr := traceql.NewAttribute("bool.false")
+	v, ok := attrs[strAttr]
+	require.True(t, ok, "str.attr must be present in AllAttributes")
+	require.Equal(t, traceql.TypeString, v.Type, "string attr must be TypeString")
 
-	if v, ok := attrs[strAttr]; ok {
-		require.Equal(t, traceql.TypeString, v.Type, "string attr must be TypeString")
-	}
-	if v, ok := attrs[intAttr]; ok {
-		require.Equal(t, traceql.TypeInt, v.Type, "int attr must be TypeInt")
-	}
-	if v, ok := attrs[floatAttr]; ok {
-		require.Equal(t, traceql.TypeFloat, v.Type, "float attr must be TypeFloat")
-	}
-	if v, ok := attrs[boolTrueAttr]; ok {
-		require.Equal(t, traceql.TypeString, v.Type, "bool=true must be TypeString")
-		s := v.String()
-		require.Equal(t, "true", s)
-	}
-	if v, ok := attrs[boolFalseAttr]; ok {
-		require.Equal(t, traceql.TypeString, v.Type, "bool=false must be TypeString")
-		s := v.String()
-		require.Equal(t, "false", s)
-	}
+	v, ok = attrs[intAttr]
+	require.True(t, ok, "int.attr must be present in AllAttributes")
+	require.Equal(t, traceql.TypeInt, v.Type, "int attr must be TypeInt")
+
+	v, ok = attrs[floatAttr]
+	require.True(t, ok, "float.attr must be present in AllAttributes")
+	require.Equal(t, traceql.TypeFloat, v.Type, "float attr must be TypeFloat")
+
+	v, ok = attrs[boolTrueAttr]
+	require.True(t, ok, "bool.true must be present in AllAttributes")
+	require.Equal(t, traceql.TypeString, v.Type, "bool=true must be TypeString")
+	require.Equal(t, "true", v.EncodeToString(false))
+
+	v, ok = attrs[boolFalseAttr]
+	require.True(t, ok, "bool.false must be present in AllAttributes")
+	require.Equal(t, traceql.TypeString, v.Type, "bool=false must be TypeString")
+	require.Equal(t, "false", v.EncodeToString(false))
 }
 
 // TestFetch_AllAttributesLimitedToQueryConditions verifies that AllAttributesFunc
@@ -927,9 +940,328 @@ func TestFetch_SetsAttributeMatched(t *testing.T) {
 		require.NotNil(t, matchedAttr, "spanset missing attributeMatched")
 		n, ok := matchedAttr.Val.Int()
 		require.True(t, ok, "attributeMatched value must be int")
-		require.Equal(t, len(ss.Spans), n, "attributeMatched must equal span count")
+		require.GreaterOrEqual(t, n, len(ss.Spans), "attributeMatched must be >= returned span count")
 		require.Greater(t, n, 0, "span count must be > 0")
 	}
+}
+
+// staticFieldsProvider is a test-only SpanFieldsProvider that serves a fixed map of fields.
+// It lets us construct a blockpackSpan with fully controlled column content without going
+// through the full write→read pipeline — making unit tests for AllAttributesFunc fast,
+// explicit, and independent of blockpack internals.
+type staticFieldsProvider struct {
+	fields map[string]any
+}
+
+func (s *staticFieldsProvider) GetField(name string) (any, bool) {
+	v, ok := s.fields[name]
+	return v, ok
+}
+
+func (s *staticFieldsProvider) IterateFields(fn func(name string, value any) bool) {
+	for k, v := range s.fields {
+		if !fn(k, v) {
+			return
+		}
+	}
+}
+
+// allLeakColumns is the exhaustive list of blockpack columns that Fetch always selects
+// (via selectCols in backend_block.go) and that must NOT appear in AllAttributes() when
+// they were not part of the query conditions. This is the regression contract: if a new
+// always-selected column is added to selectCols, add it here and ensure it is gated.
+//
+// Columns intentionally omitted from this list:
+//   - span:name  — always allowed through (needed by asTraceSearchMetadata)
+//   - span:id / span:parent_id / span:start / span:end / trace:id — not exposed by
+//     columnNameToAttribute (returns false), so they never reach AllAttributes at all
+var allLeakColumns = []struct {
+	col  string
+	attr traceql.Attribute
+	// value must match the Go type that blockpack stores for this column
+	value any
+	label string
+}{
+	{
+		col:   "span:status",
+		attr:  traceql.NewIntrinsic(traceql.IntrinsicStatus),
+		value: int64(1), // OTLP STATUS_CODE_OK
+		label: "IntrinsicStatus",
+	},
+	{
+		col:   "span:kind",
+		attr:  traceql.NewIntrinsic(traceql.IntrinsicKind),
+		value: int64(2), // OTLP SPAN_KIND_SERVER
+		label: "IntrinsicKind",
+	},
+	{
+		col:   "span:status_message",
+		attr:  traceql.NewIntrinsic(traceql.IntrinsicStatusMessage),
+		value: "some message",
+		label: "IntrinsicStatusMessage",
+	},
+	{
+		col:   "resource.service.name",
+		attr:  traceql.NewScopedAttribute(traceql.AttributeScopeResource, false, "service.name"),
+		value: "my-service",
+		label: "resource.service.name",
+	},
+	{
+		col:   "span:duration",
+		attr:  traceql.NewIntrinsic(traceql.IntrinsicDuration),
+		value: uint64(100_000_000), // 100ms in nanoseconds
+		label: "IntrinsicDuration",
+	},
+}
+
+// TestAllAttributes_DirectUnit_NoRequestedAttrsFiltersAll is a pure unit test of
+// AllAttributesFunc. It constructs a blockpackSpan directly with all known leak columns
+// populated and empty requestedAttrs, then asserts that every leak column is absent from
+// the output.
+//
+// This is the strongest possible regression guard: it does not go through Fetch, blockpack
+// I/O, or SelectColumns. If AllAttributesFunc stops gating on requestedAttrs — or if a new
+// always-fetched column is added without a gate — this test catches it immediately.
+//
+// Contract: add any new always-fetched column to allLeakColumns above.
+func TestAllAttributes_DirectUnit_NoRequestedAttrsFiltersAll(t *testing.T) {
+	// Build field map with ALL leak columns populated.
+	fields := make(map[string]any, len(allLeakColumns)+2)
+	for _, lc := range allLeakColumns {
+		fields[lc.col] = lc.value
+	}
+	// Also include name so we can verify it IS allowed through.
+	fields["span:name"] = "test-span"
+
+	sp := &blockpackSpan{
+		match: blockpack.SpanMatch{
+			TraceID: "00000000000000000000000000000001",
+			SpanID:  "0000000000000001",
+			Fields:  &staticFieldsProvider{fields: fields},
+		},
+		// requestedAttrs is nil/empty — simulates a {} match-all query.
+	}
+
+	attrs := sp.AllAttributes()
+
+	// Every leak column must be absent.
+	for _, lc := range allLeakColumns {
+		_, present := attrs[lc.attr]
+		require.False(t, present,
+			"%s must NOT appear in AllAttributes when not in requestedAttrs (leak column %q)",
+			lc.label, lc.col)
+	}
+
+	// span:name must always be present (needed by asTraceSearchMetadata).
+	nameAttr := traceql.NewIntrinsic(traceql.IntrinsicName)
+	_, hasName := attrs[nameAttr]
+	require.True(t, hasName, "IntrinsicName must always appear in AllAttributes regardless of requestedAttrs")
+}
+
+// TestAllAttributes_DirectUnit_RequestedAttrsAllowThrough verifies the positive case:
+// each leak column appears in AllAttributes when it is explicitly in requestedAttrs.
+// Run as a sub-test per column so failures are pinpointed.
+func TestAllAttributes_DirectUnit_RequestedAttrsAllowThrough(t *testing.T) {
+	for _, lc := range allLeakColumns {
+		lc := lc // capture
+		t.Run(lc.label, func(t *testing.T) {
+			fields := map[string]any{lc.col: lc.value}
+			sp := &blockpackSpan{
+				match: blockpack.SpanMatch{
+					TraceID: "00000000000000000000000000000001",
+					SpanID:  "0000000000000001",
+					Fields:  &staticFieldsProvider{fields: fields},
+				},
+				requestedAttrs: map[traceql.Attribute]struct{}{
+					lc.attr: {},
+				},
+			}
+			attrs := sp.AllAttributes()
+			_, present := attrs[lc.attr]
+			require.True(t, present,
+				"%s must appear in AllAttributes when it is in requestedAttrs", lc.label)
+		})
+	}
+}
+
+// TestAllAttributes_MatchAllReturnsEmptyAttributes is the end-to-end regression guard.
+// It runs a real {} match-all Fetch and asserts that none of the known leak columns
+// appear in AllAttributes() on any returned span. Covers the full Fetch→blockpackSpan
+// pipeline — if selectCols in Fetch gains a new always-included column that isn't gated
+// in AllAttributesFunc, this test breaks.
+func TestAllAttributes_MatchAllReturnsEmptyAttributes(t *testing.T) {
+	block, _ := createFetchTestBlock(t)
+	spansets := collectFetch(t, block, nil, false)
+	require.Len(t, spansets, 2, "expected 2 spansets from createFetchTestBlock")
+
+	for _, ss := range spansets {
+		for _, sp := range ss.Spans {
+			attrs := sp.AllAttributes()
+
+			// Check every known leak column explicitly. If you add a new always-fetched
+			// column to selectCols in backend_block.go, add it to allLeakColumns above
+			// and ensure AllAttributesFunc gates it.
+			for _, lc := range allLeakColumns {
+				_, present := attrs[lc.attr]
+				require.False(t, present,
+					"traceID=%x: %s must not appear in AllAttributes for match-all {} query — "+
+						"add a requestedAttrs gate in AllAttributesFunc for column %q",
+					ss.TraceID, lc.label, lc.col)
+			}
+
+			// name is the one exception: always allowed through.
+			nameAttr := traceql.NewIntrinsic(traceql.IntrinsicName)
+			if _, hasName := attrs[nameAttr]; hasName {
+				// name may or may not be present depending on what blockpack returns — either is fine.
+				// The point is we don't prohibit it.
+			}
+			_ = nameAttr
+		}
+	}
+}
+
+// TestAllAttributes_QueriedAttributesAppear verifies that when a query conditions on
+// span.http.method, that attribute DOES appear in AllAttributes() on the matched span,
+// and that non-queried leak columns remain absent even in a filtered query.
+func TestAllAttributes_QueriedAttributesAppear(t *testing.T) {
+	block, _ := createFetchTestBlock(t)
+
+	conditions := []traceql.Condition{{
+		Attribute: traceql.NewScopedAttribute(traceql.AttributeScopeSpan, false, "http.method"),
+		Op:        traceql.OpEqual,
+		Operands:  traceql.Operands{traceql.NewStaticString("GET")},
+	}}
+	spansets := collectFetch(t, block, conditions, true)
+	require.Len(t, spansets, 1)
+
+	sp := spansets[0].Spans[0]
+	attrs := sp.AllAttributes()
+
+	// Queried attribute must be present.
+	httpAttr := traceql.NewScopedAttribute(traceql.AttributeScopeSpan, false, "http.method")
+	v, ok := attrs[httpAttr]
+	require.True(t, ok, "http.method must appear in AllAttributes when it was in query conditions")
+	require.Equal(t, "GET", v.EncodeToString(false), "http.method value must be 'GET'")
+
+	// Leak columns must remain absent even when other conditions are present.
+	for _, lc := range allLeakColumns {
+		_, present := attrs[lc.attr]
+		require.False(t, present,
+			"%s must NOT appear in AllAttributes even in filtered query — only queried attrs allowed (column %q)",
+			lc.label, lc.col)
+	}
+}
+
+// TestAllAttributes_QueriedIntrinsicAppears verifies that when a query conditions on
+// IntrinsicStatus, it appears in AllAttributes() on the matched span.
+func TestAllAttributes_QueriedIntrinsicAppears(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	rawR, rawW, _, err := local.New(&local.Config{Path: tmpDir})
+	require.NoError(t, err)
+	r := backend.NewReader(rawR)
+	w := backend.NewWriter(rawW)
+
+	traceID := []byte{0x30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x30}
+	now := uint64(time.Now().UnixNano())
+
+	trace := &tempopb.Trace{
+		ResourceSpans: []*tempotrace.ResourceSpans{{
+			Resource: &temporesource.Resource{
+				Attributes: []*tempocommon.KeyValue{
+					{Key: "service.name", Value: &tempocommon.AnyValue{Value: &tempocommon.AnyValue_StringValue{StringValue: "svc-err"}}},
+				},
+			},
+			ScopeSpans: []*tempotrace.ScopeSpans{{
+				Spans: []*tempotrace.Span{{
+					TraceId:           traceID,
+					SpanId:            []byte{0x30, 0, 0, 0, 0, 0, 0, 0x01},
+					Name:              "err-span",
+					Status:            &tempotrace.Status{Code: tempotrace.Status_STATUS_CODE_ERROR},
+					StartTimeUnixNano: now,
+					EndTimeUnixNano:   now + uint64(10*time.Millisecond),
+				}},
+			}},
+		}},
+	}
+
+	meta := &backend.BlockMeta{BlockID: backend.NewUUID(), TenantID: "test", Version: VersionString}
+	meta.TotalRecords = 1
+	iter := &mockIterator{traces: []*tempopb.Trace{trace}, ids: [][]byte{traceID}}
+	resultMeta, err := CreateBlock(ctx, &common.BlockConfig{}, meta, iter, r, w)
+	require.NoError(t, err)
+
+	blk := newBackendBlock(resultMeta, r)
+
+	conditions := []traceql.Condition{{
+		Attribute: traceql.NewIntrinsic(traceql.IntrinsicStatus),
+		Op:        traceql.OpEqual,
+		Operands:  traceql.Operands{traceql.NewStaticStatus(traceql.StatusError)},
+	}}
+	spansets := collectFetch(t, blk, conditions, true)
+	require.Len(t, spansets, 1)
+
+	sp := spansets[0].Spans[0]
+	attrs := sp.AllAttributes()
+
+	// IntrinsicStatus was queried — must appear.
+	statusAttr := traceql.NewIntrinsic(traceql.IntrinsicStatus)
+	v, ok := attrs[statusAttr]
+	require.True(t, ok, "IntrinsicStatus must appear in AllAttributes when it was in query conditions")
+	st, ok := v.Status()
+	require.True(t, ok, "AllAttributes value for IntrinsicStatus must be Status type")
+	require.Equal(t, traceql.StatusError, st, "status value must be StatusError")
+
+	// Other leak columns must not appear just because status was queried.
+	kindAttr := traceql.NewIntrinsic(traceql.IntrinsicKind)
+	_, hasKind := attrs[kindAttr]
+	require.False(t, hasKind, "IntrinsicKind must NOT appear when only IntrinsicStatus was queried")
+
+	svcAttr := traceql.NewScopedAttribute(traceql.AttributeScopeResource, false, "service.name")
+	_, hasSvc := attrs[svcAttr]
+	require.False(t, hasSvc, "resource.service.name must NOT appear when only IntrinsicStatus was queried")
+}
+
+// TestWALFindTraceByID verifies that walBlock.FindTraceByID returns the stored trace,
+// not nil. The current stub always returns nil, nil — this test is the TDD guard.
+func TestWALFindTraceByID(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+
+	traceID := []byte{0x40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x40}
+	now := uint64(time.Now().UnixNano())
+
+	walMeta := backend.NewBlockMeta("test-tenant", uuid.New(), VersionString)
+	wal, err := createWALBlock(walMeta, tmpDir, 0)
+	require.NoError(t, err)
+
+	tr := &tempopb.Trace{
+		ResourceSpans: []*tempotrace.ResourceSpans{{
+			Resource: &temporesource.Resource{
+				Attributes: []*tempocommon.KeyValue{
+					{Key: "service.name", Value: &tempocommon.AnyValue{Value: &tempocommon.AnyValue_StringValue{StringValue: "svc-wal"}}},
+				},
+			},
+			ScopeSpans: []*tempotrace.ScopeSpans{{
+				Spans: []*tempotrace.Span{{
+					TraceId:           traceID,
+					SpanId:            []byte{0x40, 0, 0, 0, 0, 0, 0, 0x01},
+					Name:              "wal-findtrace-span",
+					StartTimeUnixNano: now,
+					EndTimeUnixNano:   now + uint64(50*time.Millisecond),
+				}},
+			}},
+		}},
+	}
+
+	startSec := uint32(time.Now().Unix())
+	require.NoError(t, wal.AppendTrace(traceID, tr, startSec, startSec+1, false))
+
+	resp, err := wal.FindTraceByID(ctx, traceID, common.SearchOptions{})
+	require.NoError(t, err)
+	require.NotNil(t, resp, "FindTraceByID must return non-nil response for a stored trace")
+	require.NotNil(t, resp.Trace, "FindTraceByID response must contain a non-nil Trace")
+	require.NotEmpty(t, resp.Trace.ResourceSpans, "returned trace must have at least one ResourceSpans")
 }
 
 // TestFetch_SpanCapAtDefaultSpansPerSpanSet verifies that Fetch() caps the returned
@@ -1003,5 +1335,72 @@ func TestFetch_SpanCapAtDefaultSpansPerSpanSet(t *testing.T) {
 	require.True(t, ok, "AttributeMatched value must be int")
 	require.Equal(t, totalSpans, n,
 		"AttributeMatched must equal total span count (%d), not capped count (%d)",
+		totalSpans, len(ss.Spans))
+}
+
+// TestWALFetch_SpanCapAtDefaultSpansPerSpanSet mirrors TestFetch_SpanCapAtDefaultSpansPerSpanSet
+// for walBlock.Fetch. Verifies that the WAL path caps returned spans at DefaultSpansPerSpanSet
+// and sets AttributeMatched to the uncapped total.
+func TestWALFetch_SpanCapAtDefaultSpansPerSpanSet(t *testing.T) {
+	const totalSpans = 5 // deliberately > DefaultSpansPerSpanSet (3)
+
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	traceID := []byte{0xf, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xf}
+	now := uint64(time.Now().UnixNano())
+
+	meta := backend.NewBlockMeta("test-tenant", uuid.New(), VersionString)
+	block, err := createWALBlock(meta, tmpDir, 0)
+	require.NoError(t, err)
+
+	spans := make([]*tempotrace.Span, totalSpans)
+	for i := range spans {
+		spans[i] = &tempotrace.Span{
+			TraceId:           traceID,
+			SpanId:            []byte{0xf, 0, 0, 0, 0, 0, 0, byte(i + 1)},
+			Name:              "wal-span",
+			StartTimeUnixNano: now + uint64(i)*uint64(time.Millisecond),
+			EndTimeUnixNano:   now + uint64(i)*uint64(time.Millisecond) + uint64(10*time.Millisecond),
+		}
+	}
+	tr := &tempopb.Trace{
+		ResourceSpans: []*tempotrace.ResourceSpans{{
+			Resource: &temporesource.Resource{
+				Attributes: []*tempocommon.KeyValue{
+					{Key: "service.name", Value: &tempocommon.AnyValue{Value: &tempocommon.AnyValue_StringValue{StringValue: "wal-svc"}}},
+				},
+			},
+			ScopeSpans: []*tempotrace.ScopeSpans{{Spans: spans}},
+		}},
+	}
+	require.NoError(t, block.AppendTrace(traceID, tr, 0, 0, false))
+
+	req := traceql.FetchSpansRequest{}
+	resp, err := block.Fetch(ctx, req, common.DefaultSearchOptions())
+	require.NoError(t, err)
+	defer resp.Results.Close()
+
+	ss, err := resp.Results.Next(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, ss, "expected at least one spanset from WAL Fetch")
+
+	// Spans must be capped at DefaultSpansPerSpanSet.
+	require.LessOrEqual(t, len(ss.Spans), traceql.DefaultSpansPerSpanSet,
+		"WAL Fetch: returned spans must be capped at DefaultSpansPerSpanSet (%d), got %d",
+		traceql.DefaultSpansPerSpanSet, len(ss.Spans))
+
+	// AttributeMatched must reflect the true total.
+	var matchedAttr *traceql.SpansetAttribute
+	for _, att := range ss.Attributes {
+		if att.Name == traceql.AttributeMatched {
+			matchedAttr = att
+			break
+		}
+	}
+	require.NotNil(t, matchedAttr, "WAL spanset missing AttributeMatched")
+	n, ok := matchedAttr.Val.Int()
+	require.True(t, ok, "AttributeMatched value must be int")
+	require.Equal(t, totalSpans, n,
+		"WAL AttributeMatched must equal total span count (%d), not capped count (%d)",
 		totalSpans, len(ss.Spans))
 }

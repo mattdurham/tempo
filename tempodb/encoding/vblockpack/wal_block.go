@@ -206,14 +206,91 @@ func (w *walBlock) Clear() error {
 	return nil
 }
 
-// FindTraceByID finds a trace by ID
-func (w *walBlock) FindTraceByID(ctx context.Context, id common.ID, opts common.SearchOptions) (*tempopb.TraceByIDResponse, error) {
+// snapshot atomically flushes the active writer (if any), copies the serialized
+// bytes, and re-initialises the writer so future appends continue uninterrupted.
+// When the writer has already been flushed to disk the file is read instead.
+//
+// Returns (nil, nil) when there is no data (writer empty or file absent).
+// Returns (nil, err) on I/O or writer-reinit errors.
+//
+// Callers MUST NOT hold w.mu when calling snapshot — the method acquires and
+// releases the lock internally so the entire flush-copy-reinit sequence is atomic.
+func (w *walBlock) snapshot() ([]byte, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	// TODO: Query blockpack writer's in-memory data for trace
-	// For now, return not found
-	return nil, nil
+	if w.writer != nil && w.buf != nil {
+		// Writer still active — flush pending data and snapshot the buffer.
+		if _, err := w.writer.Flush(); err != nil {
+			return nil, fmt.Errorf("flush: %w", err)
+		}
+		var data []byte
+		if w.buf.Len() > 0 {
+			data = make([]byte, w.buf.Len())
+			copy(data, w.buf.Bytes())
+		}
+		// Re-initialize the writer so future appends work.
+		w.buf.Reset()
+		cfg := blockpack.WriterConfig{
+			OutputStream:  w.buf,
+			MaxBlockSpans: 2000,
+		}
+		if emb := getProcessEmbedder(configuredEmbedURL); emb != nil {
+			cfg.Embedder = emb
+		}
+		newWriter, err := blockpack.NewWriterWithConfig(cfg)
+		if err != nil {
+			return nil, fmt.Errorf("re-init writer: %w", err)
+		}
+		w.writer = newWriter
+		return data, nil
+	}
+
+	// Writer already flushed to disk — read from file.
+	filePath := w.path + "/" + DataFileName
+	data, err := os.ReadFile(filePath)
+	if os.IsNotExist(err) || len(data) == 0 {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read file: %w", err)
+	}
+	return data, nil
+}
+
+// FindTraceByID finds a trace by ID in the WAL block by snapshotting the current writer state.
+func (w *walBlock) FindTraceByID(ctx context.Context, id common.ID, opts common.SearchOptions) (*tempopb.TraceByIDResponse, error) {
+	if len(id) != 16 {
+		return nil, fmt.Errorf("trace ID must be 16 bytes, got %d", len(id))
+	}
+
+	snapshot, err := w.snapshot()
+	if err != nil {
+		return nil, fmt.Errorf("walBlock FindTraceByID: %w", err)
+	}
+	if len(snapshot) == 0 {
+		return nil, nil
+	}
+
+	r, err := blockpack.NewReaderFromProvider(&bytesReaderProvider{data: snapshot})
+	if err != nil {
+		return nil, fmt.Errorf("walBlock FindTraceByID: create reader: %w", err)
+	}
+
+	traceIDHex := hex.EncodeToString(id)
+	matches, err := blockpack.GetTraceByID(r, traceIDHex)
+	if err != nil {
+		return nil, fmt.Errorf("walBlock FindTraceByID: %w", err)
+	}
+	if len(matches) == 0 {
+		return nil, nil
+	}
+
+	trace, err := reconstructTrace(id, matches)
+	if err != nil {
+		return nil, fmt.Errorf("walBlock FindTraceByID: reconstruct: %w", err)
+	}
+	return &tempopb.TraceByIDResponse{Trace: trace}, nil
 }
 
 // Search performs a search (not implemented for WAL - WAL is write-only during ingestion)
@@ -239,54 +316,17 @@ func (w *walBlock) SearchTagValuesV2(ctx context.Context, tag traceql.Attribute,
 // Fetch implements the Searcher interface by querying the WAL block's accumulated data.
 // It snapshots the current writer state, creates a temporary reader, and runs the query.
 func (w *walBlock) Fetch(ctx context.Context, req traceql.FetchSpansRequest, opts common.SearchOptions) (traceql.FetchSpansResponse, error) {
-	w.mu.Lock()
-	var snapshot []byte
-
-	if w.writer != nil && w.buf != nil {
-		// Writer still active — flush pending data and snapshot the buffer.
-		if _, err := w.writer.Flush(); err != nil {
-			w.mu.Unlock()
-			return traceql.FetchSpansResponse{}, fmt.Errorf("walBlock Fetch: flush: %w", err)
-		}
-		if w.buf.Len() > 0 {
-			snapshot = make([]byte, w.buf.Len())
-			copy(snapshot, w.buf.Bytes())
-		}
-		// Re-initialize the writer so future appends work.
-		w.buf.Reset()
-		cfg := blockpack.WriterConfig{
-			OutputStream:  w.buf,
-			MaxBlockSpans: 2000,
-		}
-		if emb := getProcessEmbedder(configuredEmbedURL); emb != nil {
-			cfg.Embedder = emb
-		}
-		newWriter, err := blockpack.NewWriterWithConfig(cfg)
-		if err != nil {
-			w.mu.Unlock()
-			return traceql.FetchSpansResponse{}, fmt.Errorf("walBlock Fetch: re-init writer: %w", err)
-		}
-		w.writer = newWriter
-	} else {
-		// Writer already flushed to disk — read from file.
-		filePath := w.path + "/" + DataFileName
-		var err error
-		snapshot, err = os.ReadFile(filePath)
-		if err != nil || len(snapshot) == 0 {
-			w.mu.Unlock()
-			return traceql.FetchSpansResponse{
-				Results: &sliceSpansetIterator{},
-				Bytes:   func() uint64 { return 0 },
-			}, nil
-		}
+	emptyResp := traceql.FetchSpansResponse{
+		Results: &sliceSpansetIterator{},
+		Bytes:   func() uint64 { return 0 },
 	}
-	w.mu.Unlock()
 
+	snapshot, err := w.snapshot()
+	if err != nil {
+		return traceql.FetchSpansResponse{}, fmt.Errorf("walBlock Fetch: %w", err)
+	}
 	if len(snapshot) == 0 {
-		return traceql.FetchSpansResponse{
-			Results: &sliceSpansetIterator{},
-			Bytes:   func() uint64 { return 0 },
-		}, nil
+		return emptyResp, nil
 	}
 
 	// Create a reader from the snapshot and run the query.
@@ -310,6 +350,12 @@ func (w *walBlock) Fetch(ctx context.Context, req traceql.FetchSpansRequest, opt
 		return traceql.FetchSpansResponse{}, fmt.Errorf("walBlock Fetch: query: %w", fetchErr)
 	}
 
+	// Build requestedAttrs map from query conditions to filter AllAttributesFunc output.
+	requestedAttrs := make(map[traceql.Attribute]struct{}, len(req.Conditions))
+	for _, cond := range req.Conditions {
+		requestedAttrs[cond.Attribute] = struct{}{}
+	}
+
 	// Convert matches to spansets grouped by trace (mirrors backend_block.Fetch).
 	type traceEntry struct {
 		traceID  []byte
@@ -328,7 +374,7 @@ func (w *walBlock) Fetch(ctx context.Context, req traceql.FetchSpansRequest, opt
 			traceMap[m.TraceID] = &traceEntry{traceID: traceIDBytes}
 			traceOrder = append(traceOrder, m.TraceID)
 		}
-		traceMap[m.TraceID].spans = append(traceMap[m.TraceID].spans, &blockpackSpan{match: *m})
+		traceMap[m.TraceID].spans = append(traceMap[m.TraceID].spans, &blockpackSpan{match: *m, requestedAttrs: requestedAttrs})
 		traceMap[m.TraceID].rawSpans = append(traceMap[m.TraceID].rawSpans, *m)
 	}
 

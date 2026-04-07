@@ -26,6 +26,11 @@ import (
 // For example: "{}|rate()" → "rate", "{...}|count_over_time() by (x)" → "count_over_time".
 var metricsOpRe = regexp.MustCompile(`\|(\w+)\(`)
 
+// maxBlockpackFileBytes is the upper bound on the size of a blockpack file we will
+// allocate into memory at once.  Files larger than 4 GiB are rejected to prevent
+// OOM from a malformed or adversarial size field returned by StreamReader.
+const maxBlockpackFileBytes = 4 * 1024 * 1024 * 1024 // 4 GiB
+
 // tempoReaderProvider implements blockpack.ReaderProvider directly against
 // Tempo's backend.Reader for a single fixed object (DataFileName).
 // All methods are safe for concurrent use — ReadRange is stateless.
@@ -485,6 +490,11 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 		// would scan only 1 internal block out of potentially hundreds. Blockpack files
 		// are already one job per file at the Tempo level, so scan all internal blocks.
 	})
+	requestedAttrs := make(map[traceql.Attribute]struct{}, len(req.Conditions))
+	for _, cond := range req.Conditions {
+		requestedAttrs[cond.Attribute] = struct{}{}
+	}
+
 	if fetchErr == nil {
 		for i := range matches {
 			match := &matches[i]
@@ -499,7 +509,7 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 				traceMap[match.TraceID] = &traceEntry{traceID: traceIDBytes}
 				traceOrder = append(traceOrder, match.TraceID)
 			}
-			traceMap[match.TraceID].spans = append(traceMap[match.TraceID].spans, &blockpackSpan{match: *match})
+			traceMap[match.TraceID].spans = append(traceMap[match.TraceID].spans, &blockpackSpan{match: *match, requestedAttrs: requestedAttrs})
 			traceMap[match.TraceID].rawSpans = append(traceMap[match.TraceID].rawSpans, *match)
 		}
 	}
@@ -549,7 +559,8 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 // Field selectivity is handled upstream by QueryOptions.SelectColumns, which
 // limits SpanMatch.Fields to only the queried columns before reaching this type.
 type blockpackSpan struct {
-	match blockpack.SpanMatch
+	match          blockpack.SpanMatch
+	requestedAttrs map[traceql.Attribute]struct{} // attributes from req.Conditions; nil = no filter
 }
 
 func (s *blockpackSpan) ID() []byte {
@@ -631,10 +642,20 @@ func (s *blockpackSpan) AllAttributesFunc(cb func(traceql.Attribute, traceql.Sta
 	if !s.hasFields() {
 		return
 	}
+	// IterateFields convention: return true to continue iteration, false to stop.
+	// AllAttributesFunc's cb has no return value (visits all attributes unconditionally).
 	s.match.Fields.IterateFields(func(name string, value any) bool {
 		attr, ok := columnNameToAttribute(name)
 		if !ok {
-			return true
+			return true // continue — unrecognised column, skip it
+		}
+		// Filter: only expose IntrinsicName unconditionally plus attributes that were
+		// part of the query conditions. This matches parquet4 behavior where only fetched
+		// (conditioned-on) columns are present in the span's attribute map.
+		if attr.Intrinsic != traceql.IntrinsicName {
+			if _, queried := s.requestedAttrs[attr]; !queried {
+				return true
+			}
 		}
 		var st traceql.Static
 		switch attr.Intrinsic {
@@ -779,7 +800,9 @@ func (b *blockpackBlock) FetchTagNames(ctx context.Context, req traceql.FetchTag
 			return fmt.Errorf("failed to execute query: %w", err)
 		}
 
-		// Extract unique tag names from matching spans
+		// Extract unique tag names from matching spans.
+		// IterateFields convention: return true to continue, false to stop.
+		// FetchTagsCallback convention: return true to stop (caller has enough results).
 		seen := make(map[string]struct{})
 		for _, match := range matches {
 			match.Fields.IterateFields(func(colName string, _ any) bool {
@@ -788,11 +811,11 @@ func (b *blockpackBlock) FetchTagNames(ctx context.Context, req traceql.FetchTag
 					if _, exists := seen[tag]; !exists {
 						seen[tag] = struct{}{}
 						if cb(tag, req.Scope) {
-							return true // Stop iteration
+							return false // cb requested stop — false stops IterateFields
 						}
 					}
 				}
-				return false // Continue iteration
+				return true // continue IterateFields
 			})
 		}
 	} else {
@@ -804,6 +827,9 @@ func (b *blockpackBlock) FetchTagNames(ctx context.Context, req traceql.FetchTag
 		}
 		defer rc.Close()
 
+		if size <= 0 || size > maxBlockpackFileBytes {
+			return fmt.Errorf("blockpack file size %d is out of allowed range (1..%d)", size, maxBlockpackFileBytes)
+		}
 		data := make([]byte, size)
 		_, err = io.ReadFull(rc, data)
 		if err != nil {
@@ -818,7 +844,6 @@ func (b *blockpackBlock) FetchTagNames(ctx context.Context, req traceql.FetchTag
 
 		// Extract tag names from all blocks, deduplicated
 		seen := make(map[string]struct{})
-		done := false
 		allBlockIDs := make([]int, bpr.BlockCount())
 		for i := range allBlockIDs {
 			allBlockIDs[i] = i
@@ -848,13 +873,11 @@ func (b *blockpackBlock) FetchTagNames(ctx context.Context, req traceql.FetchTag
 					}
 					seen[tag] = struct{}{}
 					if cb(tag, req.Scope) {
-						done = true
 						break groupLoop
 					}
 				}
 			}
 		}
-		_ = done
 	}
 
 	return nil
@@ -873,6 +896,9 @@ func (b *blockpackBlock) Validate(ctx context.Context) error {
 	}
 	defer rc.Close()
 
+	if size <= 0 || size > maxBlockpackFileBytes {
+		return fmt.Errorf("blockpack file size %d is out of allowed range (1..%d)", size, maxBlockpackFileBytes)
+	}
 	// Read file data
 	data := make([]byte, size)
 	_, err = io.ReadFull(rc, data)
