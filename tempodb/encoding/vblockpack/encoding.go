@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io/fs"
+	"path/filepath"
 	"time"
 
 	"github.com/google/uuid"
@@ -41,13 +42,23 @@ func (e Encoding) CreateWALBlock(meta *backend.BlockMeta, filepath, dataEncoding
 	return createWALBlock(meta, filepath, ingestionSlack)
 }
 
-// OpenWALBlock opens an existing WAL block
+// OpenWALBlock opens an existing on-disk WAL block for replay.
+// Returns a read-only walBlock pointing at the existing directory; writer is nil
+// so no new appends are possible. Reads (FindTraceByID, Fetch, Iterator) fall through
+// to newDiskIterator which enumerates the numbered segment files written by Flush().
 func (e Encoding) OpenWALBlock(filename, path string, ingestionSlack, additionalStartSlack time.Duration) (
 	common.WALBlock, error, error) {
-	return nil, fmt.Errorf("not implemented"), nil
+	meta := backend.NewBlockMeta("", [16]byte{}, VersionString)
+	blockPath := filepath.Join(path, filename)
+	return &walBlock{
+		meta:           meta,
+		path:           blockPath,
+		ingestionSlack: ingestionSlack,
+	}, nil, nil
 }
 
-// CopyBlock copies a block from one backend to another
+// CopyBlock copies a backend block (single DataFileName) between backends.
+// This is NOT applicable to WAL blocks, which use numbered segment files (0000000001, etc.).
 func (e Encoding) CopyBlock(ctx context.Context, meta *backend.BlockMeta, from backend.Reader,
 	to backend.Writer) error {
 	// Read the blockpack data file from source

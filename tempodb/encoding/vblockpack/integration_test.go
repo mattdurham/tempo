@@ -76,8 +76,8 @@ func TestWALBlockBasicOperations(t *testing.T) {
 		t.Fatalf("failed to flush block: %v", err)
 	}
 
-	// Verify file was created
-	dataFile := filepath.Join(walDir, DataFileName)
+	// Verify numbered segment file was created
+	dataFile := filepath.Join(walDir, "0000000001")
 	if _, err := os.Stat(dataFile); os.IsNotExist(err) {
 		t.Fatalf("expected data file to exist at %s", dataFile)
 	}
@@ -571,8 +571,8 @@ func TestEndToEndTraceFlow(t *testing.T) {
 		t.Fatalf("failed to flush WAL: %v", err)
 	}
 
-	// Verify file was created
-	dataFile := filepath.Join(walDir, DataFileName)
+	// Verify numbered segment file was created
+	dataFile := filepath.Join(walDir, "0000000001")
 	if _, err := os.Stat(dataFile); os.IsNotExist(err) {
 		t.Errorf("expected WAL data file to exist at %s", dataFile)
 	}

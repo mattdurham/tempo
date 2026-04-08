@@ -2,6 +2,7 @@ package vblockpack
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -1240,8 +1241,8 @@ func TestAllAttributes_QueriedNameAppears(t *testing.T) {
 	}
 }
 
-// TestWALFindTraceByID verifies that walBlock.FindTraceByID returns the stored trace,
-// not nil. The current stub always returns nil, nil — this test is the TDD guard.
+// TestWALFindTraceByID verifies that walBlock.FindTraceByID finds and returns
+// a stored trace after sealCurrent seals the active dirty segment.
 func TestWALFindTraceByID(t *testing.T) {
 	ctx := context.Background()
 	tmpDir := t.TempDir()
@@ -1280,6 +1281,57 @@ func TestWALFindTraceByID(t *testing.T) {
 	require.NotNil(t, resp, "FindTraceByID must return non-nil response for a stored trace")
 	require.NotNil(t, resp.Trace, "FindTraceByID response must contain a non-nil Trace")
 	require.NotEmpty(t, resp.Trace.ResourceSpans, "returned trace must have at least one ResourceSpans")
+}
+
+// TestWALFindTraceByID_SecondCallNotNil is a regression test for the "works once,
+// 404 on refresh" bug: snapshot() was calling buf.Reset() + writer re-init on every
+// call, discarding accumulated data so the second FindTraceByID returned nil.
+func TestWALFindTraceByID_SecondCallNotNil(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+
+	traceID := []byte{0x41, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x41}
+	now := uint64(time.Now().UnixNano())
+
+	walMeta := backend.NewBlockMeta("test-tenant", uuid.New(), VersionString)
+	wal, err := createWALBlock(walMeta, tmpDir, 0)
+	require.NoError(t, err)
+
+	tr := &tempopb.Trace{
+		ResourceSpans: []*tempotrace.ResourceSpans{{
+			Resource: &temporesource.Resource{
+				Attributes: []*tempocommon.KeyValue{
+					{Key: "service.name", Value: &tempocommon.AnyValue{Value: &tempocommon.AnyValue_StringValue{StringValue: "svc-wal-refresh"}}},
+				},
+			},
+			ScopeSpans: []*tempotrace.ScopeSpans{{
+				Spans: []*tempotrace.Span{{
+					TraceId:           traceID,
+					SpanId:            []byte{0x41, 0, 0, 0, 0, 0, 0, 0x01},
+					Name:              "wal-refresh-span",
+					StartTimeUnixNano: now,
+					EndTimeUnixNano:   now + uint64(50*time.Millisecond),
+				}},
+			}},
+		}},
+	}
+
+	startSec := uint32(time.Now().Unix())
+	require.NoError(t, wal.AppendTrace(traceID, tr, startSec, startSec+1, false))
+
+	// First call — must succeed.
+	resp1, err := wal.FindTraceByID(ctx, traceID, common.SearchOptions{})
+	require.NoError(t, err)
+	require.NotNil(t, resp1, "first FindTraceByID must return non-nil")
+	require.NotNil(t, resp1.Trace)
+
+	// Second call without any new appends — must still return the same trace.
+	// This was the bug: snapshot() called buf.Reset(), so the second call returned nil.
+	resp2, err := wal.FindTraceByID(ctx, traceID, common.SearchOptions{})
+	require.NoError(t, err)
+	require.NotNil(t, resp2, "second FindTraceByID (refresh) must return non-nil — regression guard")
+	require.NotNil(t, resp2.Trace)
+	require.NotEmpty(t, resp2.Trace.ResourceSpans, "second call must return trace with spans")
 }
 
 // TestFetch_SpanCapAtDefaultSpansPerSpanSet verifies that Fetch() caps the returned
@@ -1421,4 +1473,126 @@ func TestWALFetch_SpanCapAtDefaultSpansPerSpanSet(t *testing.T) {
 	require.Equal(t, totalSpans, n,
 		"WAL AttributeMatched must equal total span count (%d), not capped count (%d)",
 		totalSpans, len(ss.Spans))
+}
+
+// TestWALFindTraceByID_MultiSegment verifies that FindTraceByID finds traces across multiple
+// sealed segments. The test appends trace A, triggers a seal via FindTraceByID (which calls
+// sealCurrent), appends traces B and C, then verifies all three are findable.
+func TestWALFindTraceByID_MultiSegment(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+
+	traceIDA := []byte{0x42, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x42}
+	traceIDB := []byte{0x43, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x43}
+	traceIDC := []byte{0x44, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x44}
+	now := uint64(time.Now().UnixNano())
+
+	mkTrace := func(traceID []byte, spanID byte, svcName, spanName string) *tempopb.Trace {
+		return &tempopb.Trace{
+			ResourceSpans: []*tempotrace.ResourceSpans{{
+				Resource: &temporesource.Resource{
+					Attributes: []*tempocommon.KeyValue{
+						{Key: "service.name", Value: &tempocommon.AnyValue{Value: &tempocommon.AnyValue_StringValue{StringValue: svcName}}},
+					},
+				},
+				ScopeSpans: []*tempotrace.ScopeSpans{{
+					Spans: []*tempotrace.Span{{
+						TraceId:           traceID,
+						SpanId:            []byte{spanID, 0, 0, 0, 0, 0, 0, 0x01},
+						Name:              spanName,
+						StartTimeUnixNano: now,
+						EndTimeUnixNano:   now + uint64(50*time.Millisecond),
+					}},
+				}},
+			}},
+		}
+	}
+
+	walMeta := backend.NewBlockMeta("test-tenant", uuid.New(), VersionString)
+	wal, err := createWALBlock(walMeta, tmpDir, 0)
+	require.NoError(t, err)
+
+	startSec := uint32(time.Now().Unix())
+
+	// Append trace A — segment 0 (dirty)
+	require.NoError(t, wal.AppendTrace(traceIDA, mkTrace(traceIDA, 0x42, "svc-a", "span-a"), startSec, startSec+1, false))
+
+	// FindTraceByID seals current dirty segment into flushed[0]
+	respA1, err := wal.FindTraceByID(ctx, traceIDA, common.SearchOptions{})
+	require.NoError(t, err)
+	require.NotNil(t, respA1, "trace A must be findable after first seal")
+
+	// Append traces B and C — they go into a new dirty segment
+	require.NoError(t, wal.AppendTrace(traceIDB, mkTrace(traceIDB, 0x43, "svc-b", "span-b"), startSec, startSec+1, false))
+	require.NoError(t, wal.AppendTrace(traceIDC, mkTrace(traceIDC, 0x44, "svc-c", "span-c"), startSec, startSec+1, false))
+
+	// FindTraceByID for B seals new segment into flushed[1]; now two segments exist
+	respB, err := wal.FindTraceByID(ctx, traceIDB, common.SearchOptions{})
+	require.NoError(t, err)
+	require.NotNil(t, respB, "trace B must be findable from second segment")
+	require.NotNil(t, respB.Trace)
+	require.NotEmpty(t, respB.Trace.ResourceSpans)
+
+	// Trace A must still be visible (it lives in flushed[0])
+	respA2, err := wal.FindTraceByID(ctx, traceIDA, common.SearchOptions{})
+	require.NoError(t, err)
+	require.NotNil(t, respA2, "trace A must still be findable from first segment after second seal")
+	require.NotNil(t, respA2.Trace)
+	require.NotEmpty(t, respA2.Trace.ResourceSpans)
+
+	// Trace C must also be visible
+	respC, err := wal.FindTraceByID(ctx, traceIDC, common.SearchOptions{})
+	require.NoError(t, err)
+	require.NotNil(t, respC, "trace C must be findable")
+	require.NotNil(t, respC.Trace)
+	require.NotEmpty(t, respC.Trace.ResourceSpans)
+}
+
+// TestWALConcurrentAppendAndFind validates lock discipline and flushed-slice safety
+// under concurrent AppendTrace + FindTraceByID. Run with -race to detect data races.
+func TestWALConcurrentAppendAndFind(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+
+	traceID := []byte{0x50, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x50}
+	now := uint64(time.Now().UnixNano())
+
+	tr := &tempopb.Trace{
+		ResourceSpans: []*tempotrace.ResourceSpans{{
+			Resource: &temporesource.Resource{
+				Attributes: []*tempocommon.KeyValue{
+					{Key: "service.name", Value: &tempocommon.AnyValue{Value: &tempocommon.AnyValue_StringValue{StringValue: "svc-concurrent"}}},
+				},
+			},
+			ScopeSpans: []*tempotrace.ScopeSpans{{
+				Spans: []*tempotrace.Span{{
+					TraceId:           traceID,
+					SpanId:            []byte{0x50, 0, 0, 0, 0, 0, 0, 0x01},
+					Name:              "concurrent-span",
+					StartTimeUnixNano: now,
+					EndTimeUnixNano:   now + uint64(50*time.Millisecond),
+				}},
+			}},
+		}},
+	}
+
+	walMeta := backend.NewBlockMeta("test-tenant", uuid.New(), VersionString)
+	walBlk, err := createWALBlock(walMeta, tmpDir, 0)
+	require.NoError(t, err)
+
+	startSec := uint32(time.Now().Unix())
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_ = walBlk.AppendTrace(traceID, tr, startSec, startSec+1, false)
+		}()
+		go func() {
+			defer wg.Done()
+			_, _ = walBlk.FindTraceByID(ctx, traceID, common.SearchOptions{})
+		}()
+	}
+	wg.Wait()
 }

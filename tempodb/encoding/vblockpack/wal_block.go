@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
@@ -23,17 +25,22 @@ type walBlock struct {
 	ingestionSlack time.Duration
 
 	// Blockpack writer for serialization
-	mu     sync.Mutex
-	writer *blockpack.Writer
-	buf    *bytes.Buffer
-	file   *os.File
+	mu             sync.Mutex
+	writer         *blockpack.Writer
+	buf            *bytes.Buffer
+	dirty          bool     // true if AppendTrace called since last sealCurrent()
+	flushed        [][]byte // sealed, complete blockpack files (one per sealCurrent() call)
+	nextSegmentIdx int      // monotonically increasing; used as on-disk segment file number
 }
 
-// createWALBlock creates a new WAL block
-func createWALBlock(meta *backend.BlockMeta, filepath string, ingestionSlack time.Duration) (*walBlock, error) {
+// createWALBlock creates a new WAL block and ensures its directory exists.
+func createWALBlock(meta *backend.BlockMeta, dirPath string, ingestionSlack time.Duration) (*walBlock, error) {
+	if err := os.MkdirAll(dirPath, 0o755); err != nil {
+		return nil, fmt.Errorf("createWALBlock: mkdir: %w", err)
+	}
 	return &walBlock{
 		meta:           meta,
-		path:           filepath,
+		path:           dirPath,
 		ingestionSlack: ingestionSlack,
 	}, nil
 }
@@ -70,6 +77,7 @@ func (w *walBlock) AppendTrace(id common.ID, tr *tempopb.Trace, start, end uint3
 	if err := w.writer.AddTempoTrace(tr); err != nil {
 		return fmt.Errorf("failed to add trace to blockpack: %w", err)
 	}
+	w.dirty = true
 
 	// Update metadata
 	w.meta.ObjectAdded(start, end)
@@ -77,17 +85,13 @@ func (w *walBlock) AppendTrace(id common.ID, tr *tempopb.Trace, start, end uint3
 	return nil
 }
 
-// initWriter creates the blockpack writer
+// initWriter creates a fresh blockpack writer, assigning w.buf and w.writer
+// only after both succeed so that a failure leaves the block in a consistent state.
 func (w *walBlock) initWriter() error {
-	// Ensure directory exists
-	if err := os.MkdirAll(w.path, 0o755); err != nil {
-		return fmt.Errorf("failed to create directory: %w", err)
-	}
-
 	// Pre-allocate 32 MiB to reduce buffer doubling during span ingestion.
-	w.buf = bytes.NewBuffer(make([]byte, 0, 32<<20))
+	buf := bytes.NewBuffer(make([]byte, 0, 32<<20))
 	cfg := blockpack.WriterConfig{
-		OutputStream:  w.buf,
+		OutputStream:  buf,
 		MaxBlockSpans: 2000,
 	}
 	// Pass embedder if configured — blockpack handles field assembly + embedding internally.
@@ -98,8 +102,42 @@ func (w *walBlock) initWriter() error {
 	if err != nil {
 		return fmt.Errorf("failed to create blockpack writer: %w", err)
 	}
+	// Assign only after both succeed — prevents broken state if NewWriterWithConfig fails.
+	w.buf = buf
 	w.writer = writer
+	return nil
+}
 
+// sealCurrent finalizes the active writer segment into w.flushed.
+// Must be called with w.mu held.
+// Returns nil immediately when dirty==false (nothing pending).
+// Returns an error when dirty==true but writer==nil (prior initWriter failure — stuck state).
+func (w *walBlock) sealCurrent() error {
+	if !w.dirty {
+		return nil // nothing pending
+	}
+	if w.writer == nil {
+		// dirty==true but writer==nil means a prior initWriter call failed.
+		// Surface the error rather than silently skipping.
+		return fmt.Errorf("sealCurrent: writer is nil but dirty flag set (prior initWriter failure)")
+	}
+	if _, err := w.writer.Flush(); err != nil {
+		return fmt.Errorf("sealCurrent: flush: %w", err)
+	}
+	if w.buf.Len() > 0 {
+		seg := make([]byte, w.buf.Len())
+		copy(seg, w.buf.Bytes())
+		w.flushed = append(w.flushed, seg)
+	}
+	// Clear dirty BEFORE reinit: if reinit fails, the next sealCurrent call will
+	// hit the writer==nil guard above and surface an error rather than silently
+	// re-entering this flush path with stale data.
+	w.dirty = false
+	if err := w.initWriter(); err != nil {
+		w.writer = nil
+		w.buf = nil
+		return fmt.Errorf("sealCurrent: reinit writer: %w", err)
+	}
 	return nil
 }
 
@@ -108,34 +146,40 @@ func (w *walBlock) IngestionSlack() time.Duration {
 	return w.ingestionSlack
 }
 
-// Flush writes accumulated traces to disk as blockpack format
+// Flush writes accumulated traces to disk as numbered blockpack segment files.
 func (w *walBlock) Flush() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	// Nothing to flush if no writer
-	if w.writer == nil {
+	// Seal any pending dirty data into w.flushed
+	if err := w.sealCurrent(); err != nil {
+		return fmt.Errorf("Flush: sealCurrent: %w", err)
+	}
+
+	if len(w.flushed) == 0 {
 		return nil
 	}
 
-	// Flush blockpack writer — data is written to w.buf
-	if _, err := w.writer.Flush(); err != nil {
-		return fmt.Errorf("failed to flush blockpack writer: %w", err)
+	var totalSize uint64
+	var written []string
+	for _, seg := range w.flushed {
+		w.nextSegmentIdx++
+		filePath := fmt.Sprintf("%s/%010d", w.path, w.nextSegmentIdx)
+		if err := os.WriteFile(filePath, seg, 0o644); err != nil {
+			// Best-effort cleanup of segments written in this call to avoid partial state.
+			for _, p := range written {
+				_ = os.Remove(p)
+			}
+			return fmt.Errorf("Flush: write segment %d: %w", w.nextSegmentIdx, err)
+		}
+		written = append(written, filePath)
+		totalSize += uint64(len(seg))
 	}
-	data := w.buf.Bytes()
 
-	// Write to disk
-	filePath := w.path + "/" + DataFileName
-	if err := os.WriteFile(filePath, data, 0o644); err != nil {
-		return fmt.Errorf("failed to write blockpack file: %w", err)
-	}
+	w.meta.Size_ = totalSize
 
-	// Update metadata with actual size
-	w.meta.Size_ = uint64(len(data))
-
-	// Release the in-memory buffer and writer — data is now on disk.
-	// Setting writer = nil means a subsequent Flush() call returns early
-	// at the w.writer == nil guard instead of panicking on w.buf.Bytes().
+	// Release in-memory segments and writer — data is now on disk
+	w.flushed = nil
 	w.buf = nil
 	w.writer = nil
 
@@ -147,50 +191,116 @@ func (w *walBlock) DataLength() uint64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	if w.writer == nil {
-		return 0
+	var total uint64
+	for _, seg := range w.flushed {
+		total += uint64(len(seg))
 	}
-
-	return uint64(w.writer.CurrentSize())
+	if w.writer != nil {
+		total += uint64(w.writer.CurrentSize())
+	}
+	return total
 }
 
-// Iterator returns an iterator over all traces in the WAL
+// Iterator returns an iterator over all traces in the WAL.
 func (w *walBlock) Iterator() (common.Iterator, error) {
 	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	var data []byte
 
 	if w.writer != nil {
-		// Writer still active (Flush not yet called) — flush now and read from buffer.
-		if _, err := w.writer.Flush(); err != nil {
-			return nil, fmt.Errorf("failed to flush for iterator: %w", err)
+		// In-memory path: seal current batch first
+		if err := w.sealCurrent(); err != nil {
+			w.mu.Unlock()
+			return nil, fmt.Errorf("Iterator: sealCurrent: %w", err)
 		}
-		data = w.buf.Bytes()
-	} else {
-		// Flush() was already called — data is on disk. Read it back.
-		// tempodb.CompleteBlockWithBackend calls Flush() then Iterator(), so
-		// this is the normal path during WAL→backend promotion.
-		filePath := w.path + "/" + DataFileName
-		var err error
-		data, err = os.ReadFile(filePath)
+	}
+
+	if len(w.flushed) > 0 {
+		// Deep-copy slice header and pointer list so concurrent appends to w.flushed
+		// or future buffer pooling cannot alias the iterator's view.
+		// Underlying []byte arrays are immutable after sealing (allocated via make+copy in sealCurrent).
+		segments := make([][]byte, len(w.flushed))
+		copy(segments, w.flushed)
+		w.mu.Unlock()
+		return newMultiSegmentIterator(segments)
+	}
+	w.mu.Unlock()
+
+	// Flushed to disk: enumerate numbered segment files
+	return newDiskIterator(w.path)
+}
+
+// newMultiSegmentIterator builds a blockpackIterator covering all traces from all segments.
+func newMultiSegmentIterator(segments [][]byte) (*blockpackIterator, error) {
+	byTrace := make(map[string][]blockpack.SpanMatch)
+	var traceOrder []string
+
+	for _, seg := range segments {
+		r, err := blockpack.NewReaderFromProvider(&bytesReaderProvider{data: seg})
+		if err != nil {
+			return nil, fmt.Errorf("newMultiSegmentIterator: create reader: %w", err)
+		}
+		allMatches, _, err := blockpack.QueryTraceQL(r, "{}", blockpack.QueryOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("newMultiSegmentIterator: query: %w", err)
+		}
+		for i := range allMatches {
+			match := &allMatches[i]
+			if _, exists := byTrace[match.TraceID]; !exists {
+				traceOrder = append(traceOrder, match.TraceID)
+			}
+			byTrace[match.TraceID] = append(byTrace[match.TraceID], *match)
+		}
+	}
+
+	traces := make([]blockpackTrace, 0, len(byTrace))
+	for _, traceIDHex := range traceOrder {
+		traceIDBytes, err := hex.DecodeString(traceIDHex)
+		if err != nil || len(traceIDBytes) != 16 {
+			continue
+		}
+		traces = append(traces, blockpackTrace{
+			id:      common.ID(traceIDBytes),
+			matches: byTrace[traceIDHex],
+		})
+	}
+	return &blockpackIterator{traces: traces}, nil
+}
+
+// newDiskIterator reads all numbered segment files from path and returns an iterator.
+func newDiskIterator(path string) (common.Iterator, error) {
+	entries, err := os.ReadDir(path)
+	if err != nil {
 		if os.IsNotExist(err) {
 			return &emptyIterator{}, nil
 		}
+		return nil, fmt.Errorf("newDiskIterator: readdir: %w", err)
+	}
+
+	var segments [][]byte
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		// Only load numbered data files (format: %010d), skip meta.json and others.
+		name := entry.Name()
+		if len(name) != 10 {
+			continue
+		}
+		if _, err := strconv.ParseUint(name, 10, 64); err != nil {
+			continue // not a numbered segment file
+		}
+		data, err := os.ReadFile(filepath.Join(path, name))
 		if err != nil {
-			return nil, fmt.Errorf("failed to read blockpack file for iterator: %w", err)
+			return nil, fmt.Errorf("newDiskIterator: read %s: %w", name, err)
 		}
-		if len(data) == 0 {
-			return &emptyIterator{}, nil
+		if len(data) > 0 {
+			segments = append(segments, data)
 		}
 	}
 
-	reader, err := blockpack.NewReaderFromProvider(&bytesReaderProvider{data: data})
-	if err != nil {
-		return nil, fmt.Errorf("failed to create reader: %w", err)
+	if len(segments) == 0 {
+		return &emptyIterator{}, nil
 	}
-
-	return newBlockpackIterator(reader)
+	return newMultiSegmentIterator(segments)
 }
 
 // Clear clears the WAL block
@@ -198,102 +308,61 @@ func (w *walBlock) Clear() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	// Close and reset writer
 	w.writer = nil
 	w.buf = nil
-	w.file = nil
+	w.flushed = nil
+	w.dirty = false
 
 	return nil
 }
 
-// snapshot atomically flushes the active writer (if any), copies the serialized
-// bytes, and re-initialises the writer so future appends continue uninterrupted.
-// When the writer has already been flushed to disk the file is read instead.
-//
-// Returns (nil, nil) when there is no data (writer empty or file absent).
-// Returns (nil, err) on I/O or writer-reinit errors.
-//
-// Callers MUST NOT hold w.mu when calling snapshot — the method acquires and
-// releases the lock internally so the entire flush-copy-reinit sequence is atomic.
-func (w *walBlock) snapshot() ([]byte, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	if w.writer != nil && w.buf != nil {
-		// Writer still active — flush pending data and snapshot the buffer.
-		if _, err := w.writer.Flush(); err != nil {
-			return nil, fmt.Errorf("flush: %w", err)
-		}
-		var data []byte
-		if w.buf.Len() > 0 {
-			data = make([]byte, w.buf.Len())
-			copy(data, w.buf.Bytes())
-		}
-		// Re-initialize the writer so future appends work.
-		w.buf.Reset()
-		cfg := blockpack.WriterConfig{
-			OutputStream:  w.buf,
-			MaxBlockSpans: 2000,
-		}
-		if emb := getProcessEmbedder(configuredEmbedURL); emb != nil {
-			cfg.Embedder = emb
-		}
-		newWriter, err := blockpack.NewWriterWithConfig(cfg)
-		if err != nil {
-			return nil, fmt.Errorf("re-init writer: %w", err)
-		}
-		w.writer = newWriter
-		return data, nil
-	}
-
-	// Writer already flushed to disk — read from file.
-	filePath := w.path + "/" + DataFileName
-	data, err := os.ReadFile(filePath)
-	if os.IsNotExist(err) || len(data) == 0 {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("read file: %w", err)
-	}
-	return data, nil
-}
-
-// FindTraceByID finds a trace by ID in the WAL block by snapshotting the current writer state.
+// FindTraceByID finds a trace by ID in the WAL block by iterating all sealed segments.
 func (w *walBlock) FindTraceByID(ctx context.Context, id common.ID, opts common.SearchOptions) (*tempopb.TraceByIDResponse, error) {
 	if len(id) != 16 {
 		return nil, fmt.Errorf("trace ID must be 16 bytes, got %d", len(id))
 	}
 
-	snapshot, err := w.snapshot()
-	if err != nil {
+	w.mu.Lock()
+	if err := w.sealCurrent(); err != nil {
+		w.mu.Unlock()
 		return nil, fmt.Errorf("walBlock FindTraceByID: %w", err)
 	}
-	if len(snapshot) == 0 {
-		return nil, nil
-	}
+	segments := w.flushed // slice header copy; underlying arrays are immutable after sealing
+	w.mu.Unlock()
 
-	r, err := blockpack.NewReaderFromProvider(&bytesReaderProvider{data: snapshot})
-	if err != nil {
-		return nil, fmt.Errorf("walBlock FindTraceByID: create reader: %w", err)
+	if len(segments) == 0 {
+		return nil, nil
 	}
 
 	traceIDHex := hex.EncodeToString(id)
-	matches, err := blockpack.GetTraceByID(r, traceIDHex)
-	if err != nil {
-		return nil, fmt.Errorf("walBlock FindTraceByID: %w", err)
+	var allMatches []blockpack.SpanMatch
+
+	for _, seg := range segments {
+		r, err := blockpack.NewReaderFromProvider(&bytesReaderProvider{data: seg})
+		if err != nil {
+			return nil, fmt.Errorf("walBlock FindTraceByID: create reader: %w", err)
+		}
+		matches, err := blockpack.GetTraceByID(r, traceIDHex)
+		if err != nil {
+			return nil, fmt.Errorf("walBlock FindTraceByID: %w", err)
+		}
+		allMatches = append(allMatches, matches...)
 	}
-	if len(matches) == 0 {
+
+	if len(allMatches) == 0 {
 		return nil, nil
 	}
 
-	trace, err := reconstructTrace(id, matches)
+	trace, err := reconstructTrace(id, allMatches)
 	if err != nil {
 		return nil, fmt.Errorf("walBlock FindTraceByID: reconstruct: %w", err)
 	}
 	return &tempopb.TraceByIDResponse{Trace: trace}, nil
 }
 
-// Search performs a search (not implemented for WAL - WAL is write-only during ingestion)
+// Search returns an empty response. Tag search operations are not served from WAL blocks.
+// The query pipeline falls through to backend blocks for all tag/search operations.
+// Only FindTraceByID and Fetch are used against the WAL during active ingestion.
 func (w *walBlock) Search(ctx context.Context, req *tempopb.SearchRequest, opts common.SearchOptions) (*tempopb.SearchResponse, error) {
 	return &tempopb.SearchResponse{}, nil
 }
@@ -314,25 +383,23 @@ func (w *walBlock) SearchTagValuesV2(ctx context.Context, tag traceql.Attribute,
 }
 
 // Fetch implements the Searcher interface by querying the WAL block's accumulated data.
-// It snapshots the current writer state, creates a temporary reader, and runs the query.
+// It iterates all sealed segments and collects matches from each.
 func (w *walBlock) Fetch(ctx context.Context, req traceql.FetchSpansRequest, opts common.SearchOptions) (traceql.FetchSpansResponse, error) {
 	emptyResp := traceql.FetchSpansResponse{
 		Results: &sliceSpansetIterator{},
 		Bytes:   func() uint64 { return 0 },
 	}
 
-	snapshot, err := w.snapshot()
-	if err != nil {
+	w.mu.Lock()
+	if err := w.sealCurrent(); err != nil {
+		w.mu.Unlock()
 		return traceql.FetchSpansResponse{}, fmt.Errorf("walBlock Fetch: %w", err)
 	}
-	if len(snapshot) == 0 {
-		return emptyResp, nil
-	}
+	segments := w.flushed // slice header copy; underlying arrays are immutable after sealing
+	w.mu.Unlock()
 
-	// Create a reader from the snapshot and run the query.
-	r, err := blockpack.NewReaderFromProvider(&bytesReaderProvider{data: snapshot})
-	if err != nil {
-		return traceql.FetchSpansResponse{}, fmt.Errorf("walBlock Fetch: create reader: %w", err)
+	if len(segments) == 0 {
+		return emptyResp, nil
 	}
 
 	query := conditionsToTraceQL(req.Conditions, req.AllConditions)
@@ -340,14 +407,23 @@ func (w *walBlock) Fetch(ctx context.Context, req traceql.FetchSpansRequest, opt
 		query = orig
 	}
 
-	matches, _, fetchErr := blockpack.QueryTraceQL(r, query, blockpack.QueryOptions{
-		Limit:     opts.MaxTraces,
-		StartNano: req.StartTimeUnixNanos,
-		EndNano:   req.EndTimeUnixNanos,
-		Embedder:  getProcessEmbedder(configuredEmbedURL),
-	})
-	if fetchErr != nil {
-		return traceql.FetchSpansResponse{}, fmt.Errorf("walBlock Fetch: query: %w", fetchErr)
+	// Collect matches from all segments
+	var allMatches []blockpack.SpanMatch
+	for _, seg := range segments {
+		r, err := blockpack.NewReaderFromProvider(&bytesReaderProvider{data: seg})
+		if err != nil {
+			return traceql.FetchSpansResponse{}, fmt.Errorf("walBlock Fetch: create reader: %w", err)
+		}
+		matches, _, fetchErr := blockpack.QueryTraceQL(r, query, blockpack.QueryOptions{
+			Limit:     opts.MaxTraces,
+			StartNano: req.StartTimeUnixNanos,
+			EndNano:   req.EndTimeUnixNanos,
+			Embedder:  getProcessEmbedder(configuredEmbedURL),
+		})
+		if fetchErr != nil {
+			return traceql.FetchSpansResponse{}, fmt.Errorf("walBlock Fetch: query: %w", fetchErr)
+		}
+		allMatches = append(allMatches, matches...)
 	}
 
 	// Build requestedAttrs map from query conditions to filter AllAttributesFunc output.
@@ -364,8 +440,8 @@ func (w *walBlock) Fetch(ctx context.Context, req traceql.FetchSpansRequest, opt
 	}
 	traceMap := make(map[string]*traceEntry)
 	var traceOrder []string
-	for i := range matches {
-		m := &matches[i]
+	for i := range allMatches {
+		m := &allMatches[i]
 		if _, exists := traceMap[m.TraceID]; !exists {
 			traceIDBytes, decErr := hex.DecodeString(m.TraceID)
 			if decErr != nil {
@@ -402,9 +478,14 @@ func (w *walBlock) Fetch(ctx context.Context, req traceql.FetchSpansRequest, opt
 		spansets = append(spansets, ss)
 	}
 
+	totalBytes := uint64(0)
+	for _, seg := range segments {
+		totalBytes += uint64(len(seg))
+	}
+
 	return traceql.FetchSpansResponse{
 		Results: &sliceSpansetIterator{spansets: spansets},
-		Bytes:   func() uint64 { return uint64(len(snapshot)) },
+		Bytes:   func() uint64 { return totalBytes },
 	}, nil
 }
 
