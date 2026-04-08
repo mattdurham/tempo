@@ -220,6 +220,26 @@ func GetTraceByID(r *Reader, traceIDHex string) (results []SpanMatch, err error)
 		}
 	}
 
+	// When the compact trace index was absent (older blocks), entries is empty but
+	// rowsByBlock may contain valid data from the intrinsic scan. Build synthetic
+	// entries from the rowsByBlock keys and populate rawMap for those blocks.
+	if len(entries) == 0 && len(rowsByBlock) > 0 {
+		syntheticBlockIDs := make([]int, 0, len(rowsByBlock))
+		for blockID := range rowsByBlock {
+			syntheticBlockIDs = append(syntheticBlockIDs, blockID)
+			entries = append(entries, modules_reader.TraceEntry{BlockID: blockID})
+		}
+		for _, group := range r.CoalescedGroups(syntheticBlockIDs) {
+			groupRaw, fetchErr := r.ReadGroup(group)
+			if fetchErr != nil {
+				return nil, fmt.Errorf("GetTraceByID: read group (intrinsic fallback): %w", fetchErr)
+			}
+			for bi, raw := range groupRaw {
+				rawMap[bi] = raw
+			}
+		}
+	}
+
 	// Fall back to scanning trace:id block columns for legacy files that still have them.
 	// This handles files written before the dual-storage removal.
 	useLegacyScan := len(rowsByBlock) == 0 && intrinsicTraceCol == nil
