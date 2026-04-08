@@ -649,13 +649,11 @@ func (s *blockpackSpan) AllAttributesFunc(cb func(traceql.Attribute, traceql.Sta
 		if !ok {
 			return true // continue — unrecognised column, skip it
 		}
-		// Filter: only expose IntrinsicName unconditionally plus attributes that were
-		// part of the query conditions. This matches parquet4 behavior where only fetched
-		// (conditioned-on) columns are present in the span's attribute map.
-		if attr.Intrinsic != traceql.IntrinsicName {
-			if _, queried := s.requestedAttrs[attr]; !queried {
-				return true
-			}
+		// Filter: only expose attributes that were part of the query conditions.
+		// This matches parquet4 behavior where only fetched (conditioned-on) columns
+		// are present in the span's attribute map.
+		if _, queried := s.requestedAttrs[attr]; !queried {
+			return true
 		}
 		var st traceql.Static
 		switch attr.Intrinsic {

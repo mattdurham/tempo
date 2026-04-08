@@ -972,7 +972,6 @@ func (s *staticFieldsProvider) IterateFields(fn func(name string, value any) boo
 // always-selected column is added to selectCols, add it here and ensure it is gated.
 //
 // Columns intentionally omitted from this list:
-//   - span:name  — always allowed through (needed by asTraceSearchMetadata)
 //   - span:id / span:parent_id / span:start / span:end / trace:id — not exposed by
 //     columnNameToAttribute (returns false), so they never reach AllAttributes at all
 var allLeakColumns = []struct {
@@ -982,6 +981,12 @@ var allLeakColumns = []struct {
 	value any
 	label string
 }{
+	{
+		col:   "span:name",
+		attr:  traceql.NewIntrinsic(traceql.IntrinsicName),
+		value: "test-span",
+		label: "IntrinsicName",
+	},
 	{
 		col:   "span:status",
 		attr:  traceql.NewIntrinsic(traceql.IntrinsicStatus),
@@ -1025,13 +1030,11 @@ var allLeakColumns = []struct {
 //
 // Contract: add any new always-fetched column to allLeakColumns above.
 func TestAllAttributes_DirectUnit_NoRequestedAttrsFiltersAll(t *testing.T) {
-	// Build field map with ALL leak columns populated.
-	fields := make(map[string]any, len(allLeakColumns)+2)
+	// Build field map with ALL leak columns populated (including span:name).
+	fields := make(map[string]any, len(allLeakColumns))
 	for _, lc := range allLeakColumns {
 		fields[lc.col] = lc.value
 	}
-	// Also include name so we can verify it IS allowed through.
-	fields["span:name"] = "test-span"
 
 	sp := &blockpackSpan{
 		match: blockpack.SpanMatch{
@@ -1044,18 +1047,14 @@ func TestAllAttributes_DirectUnit_NoRequestedAttrsFiltersAll(t *testing.T) {
 
 	attrs := sp.AllAttributes()
 
-	// Every leak column must be absent.
+	// Every column must be absent — including IntrinsicName. No attribute appears
+	// unless it was explicitly in req.Conditions, matching parquet4 behavior.
 	for _, lc := range allLeakColumns {
 		_, present := attrs[lc.attr]
 		require.False(t, present,
 			"%s must NOT appear in AllAttributes when not in requestedAttrs (leak column %q)",
 			lc.label, lc.col)
 	}
-
-	// span:name must always be present (needed by asTraceSearchMetadata).
-	nameAttr := traceql.NewIntrinsic(traceql.IntrinsicName)
-	_, hasName := attrs[nameAttr]
-	require.True(t, hasName, "IntrinsicName must always appear in AllAttributes regardless of requestedAttrs")
 }
 
 // TestAllAttributes_DirectUnit_RequestedAttrsAllowThrough verifies the positive case:
@@ -1108,14 +1107,6 @@ func TestAllAttributes_MatchAllReturnsEmptyAttributes(t *testing.T) {
 						"add a requestedAttrs gate in AllAttributesFunc for column %q",
 					ss.TraceID, lc.label, lc.col)
 			}
-
-			// name is the one exception: always allowed through.
-			nameAttr := traceql.NewIntrinsic(traceql.IntrinsicName)
-			if _, hasName := attrs[nameAttr]; hasName {
-				// name may or may not be present depending on what blockpack returns — either is fine.
-				// The point is we don't prohibit it.
-			}
-			_ = nameAttr
 		}
 	}
 }
@@ -1220,6 +1211,33 @@ func TestAllAttributes_QueriedIntrinsicAppears(t *testing.T) {
 	svcAttr := traceql.NewScopedAttribute(traceql.AttributeScopeResource, false, "service.name")
 	_, hasSvc := attrs[svcAttr]
 	require.False(t, hasSvc, "resource.service.name must NOT appear when only IntrinsicStatus was queried")
+
+	// IntrinsicName must NOT appear when it was not in the query conditions.
+	nameAttr := traceql.NewIntrinsic(traceql.IntrinsicName)
+	_, hasName := attrs[nameAttr]
+	require.False(t, hasName, "IntrinsicName must NOT appear when it was not in query conditions")
+}
+
+// TestAllAttributes_QueriedNameAppears verifies that IntrinsicName appears in AllAttributes
+// when it is explicitly included in query conditions — same rule as all other attributes.
+func TestAllAttributes_QueriedNameAppears(t *testing.T) {
+	block, _ := createFetchTestBlock(t)
+
+	conditions := []traceql.Condition{{
+		Attribute: traceql.NewIntrinsic(traceql.IntrinsicName),
+		Op:        traceql.OpNone,
+	}}
+	spansets := collectFetch(t, block, conditions, false)
+	require.NotEmpty(t, spansets)
+
+	nameAttr := traceql.NewIntrinsic(traceql.IntrinsicName)
+	for _, ss := range spansets {
+		for _, sp := range ss.Spans {
+			attrs := sp.AllAttributes()
+			_, ok := attrs[nameAttr]
+			require.True(t, ok, "IntrinsicName must appear in AllAttributes when it was in query conditions")
+		}
+	}
 }
 
 // TestWALFindTraceByID verifies that walBlock.FindTraceByID returns the stored trace,
