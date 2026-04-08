@@ -206,14 +206,77 @@ func (w *walBlock) Clear() error {
 	return nil
 }
 
-// FindTraceByID finds a trace by ID
-func (w *walBlock) FindTraceByID(ctx context.Context, id common.ID, opts common.SearchOptions) (*tempopb.TraceByIDResponse, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
+// FindTraceByID finds a trace by ID in the WAL block.
+// It snapshots the current writer state and queries blockpack for the given trace.
+func (w *walBlock) FindTraceByID(_ context.Context, id common.ID, _ common.SearchOptions) (*tempopb.TraceByIDResponse, error) {
+	if len(id) != 16 {
+		return nil, fmt.Errorf("trace ID must be 16 bytes, got %d", len(id))
+	}
 
-	// TODO: Query blockpack writer's in-memory data for trace
-	// For now, return not found
-	return nil, nil
+	w.mu.Lock()
+	var data []byte
+
+	if w.writer != nil && w.buf != nil {
+		// Writer still active — flush to snapshot the buffer without destroying state.
+		if _, err := w.writer.Flush(); err != nil {
+			w.mu.Unlock()
+			return nil, fmt.Errorf("walBlock FindTraceByID: flush: %w", err)
+		}
+		if w.buf.Len() > 0 {
+			data = make([]byte, w.buf.Len())
+			copy(data, w.buf.Bytes())
+		}
+		// Re-initialize writer so future appends continue to work.
+		w.buf.Reset()
+		cfg := blockpack.WriterConfig{
+			OutputStream:  w.buf,
+			MaxBlockSpans: 2000,
+		}
+		if emb := getProcessEmbedder(configuredEmbedURL); emb != nil {
+			cfg.Embedder = emb
+		}
+		newWriter, err := blockpack.NewWriterWithConfig(cfg)
+		if err != nil {
+			w.mu.Unlock()
+			return nil, fmt.Errorf("walBlock FindTraceByID: re-init writer: %w", err)
+		}
+		w.writer = newWriter
+	} else {
+		// Writer already flushed to disk — read from file.
+		filePath := w.path + "/" + DataFileName
+		var err error
+		data, err = os.ReadFile(filePath)
+		if err != nil || len(data) == 0 {
+			w.mu.Unlock()
+			return nil, nil
+		}
+	}
+	w.mu.Unlock()
+
+	if len(data) == 0 {
+		return nil, nil
+	}
+
+	r, err := blockpack.NewReaderFromProvider(&bytesReaderProvider{data: data})
+	if err != nil {
+		return nil, fmt.Errorf("walBlock FindTraceByID: create reader: %w", err)
+	}
+
+	traceIDHex := hex.EncodeToString(id)
+	matches, err := blockpack.GetTraceByID(r, traceIDHex)
+	if err != nil {
+		return nil, fmt.Errorf("walBlock FindTraceByID: GetTraceByID: %w", err)
+	}
+	if len(matches) == 0 {
+		return nil, nil
+	}
+
+	trace, err := reconstructTrace(id, matches)
+	if err != nil {
+		return nil, fmt.Errorf("walBlock FindTraceByID: reconstruct: %w", err)
+	}
+
+	return &tempopb.TraceByIDResponse{Trace: trace}, nil
 }
 
 // Search performs a search (not implemented for WAL - WAL is write-only during ingestion)
@@ -328,7 +391,7 @@ func (w *walBlock) Fetch(ctx context.Context, req traceql.FetchSpansRequest, opt
 			traceMap[m.TraceID] = &traceEntry{traceID: traceIDBytes}
 			traceOrder = append(traceOrder, m.TraceID)
 		}
-		traceMap[m.TraceID].spans = append(traceMap[m.TraceID].spans, &blockpackSpan{match: *m})
+		traceMap[m.TraceID].spans = append(traceMap[m.TraceID].spans, &blockpackSpan{match: *m, searchMode: true})
 		traceMap[m.TraceID].rawSpans = append(traceMap[m.TraceID].rawSpans, *m)
 	}
 

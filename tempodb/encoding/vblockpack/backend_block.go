@@ -499,7 +499,7 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 				traceMap[match.TraceID] = &traceEntry{traceID: traceIDBytes}
 				traceOrder = append(traceOrder, match.TraceID)
 			}
-			traceMap[match.TraceID].spans = append(traceMap[match.TraceID].spans, &blockpackSpan{match: *match})
+			traceMap[match.TraceID].spans = append(traceMap[match.TraceID].spans, &blockpackSpan{match: *match, searchMode: true})
 			traceMap[match.TraceID].rawSpans = append(traceMap[match.TraceID].rawSpans, *match)
 		}
 	}
@@ -548,8 +548,16 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 // blockpackSpan implements traceql.Span using a cloned blockpack.SpanMatch.
 // Field selectivity is handled upstream by QueryOptions.SelectColumns, which
 // limits SpanMatch.Fields to only the queried columns before reaching this type.
+//
+// When searchMode is true (set for spans returned from Fetch/search results),
+// AllAttributes and AllAttributesFunc suppress span name and all user-defined
+// attributes. This matches standard Tempo search behaviour: parquet blocks only
+// fetch SearchMetaConditions in the second pass, which excludes IntrinsicName
+// and user span/resource attributes. Without this suppression, asTraceSearchMetadata
+// would populate tempopb.Span.Name and .Attributes[], breaking the Grafana UI.
 type blockpackSpan struct {
-	match blockpack.SpanMatch
+	match      blockpack.SpanMatch
+	searchMode bool // true when span is used in a search (Fetch) context
 }
 
 func (s *blockpackSpan) ID() []byte {
@@ -585,6 +593,10 @@ func (s *blockpackSpan) AttributeFor(attr traceql.Attribute) (traceql.Static, bo
 		}
 		return traceql.Static{}, false
 	case traceql.IntrinsicName:
+		// In search mode, suppress span name — standard Tempo search does not include it.
+		if s.searchMode {
+			return traceql.Static{}, false
+		}
 		if str, ok := s.match.Name(); ok {
 			return traceql.NewStaticString(str), true
 		}
@@ -636,6 +648,22 @@ func (s *blockpackSpan) AllAttributesFunc(cb func(traceql.Attribute, traceql.Sta
 		if !ok {
 			return true
 		}
+
+		// In search mode, suppress span name and all user-defined span/resource
+		// attributes. Standard Tempo search (vparquet) fetches only SearchMetaConditions
+		// in the second pass, which excludes IntrinsicName and user attributes. Emitting
+		// them here causes asTraceSearchMetadata to populate tempopb.Span.Name and
+		// Attributes[], which the Grafana UI doesn't expect in search results.
+		if s.searchMode {
+			if attr.Intrinsic == traceql.IntrinsicName {
+				return true
+			}
+			if attr.Intrinsic == traceql.IntrinsicNone &&
+				(attr.Scope == traceql.AttributeScopeSpan || attr.Scope == traceql.AttributeScopeResource) {
+				return true
+			}
+		}
+
 		var st traceql.Static
 		switch attr.Intrinsic {
 		case traceql.IntrinsicDuration:
