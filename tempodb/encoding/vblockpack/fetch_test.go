@@ -1596,3 +1596,74 @@ func TestWALConcurrentAppendAndFind(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// TestWALFindTraceByID_AfterFlushToDisk verifies that FindTraceByID and Fetch
+// still return data after walBlock.Flush() writes all segments to disk and
+// clears the in-memory flushed[] slice.
+func TestWALFindTraceByID_AfterFlushToDisk(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+
+	traceID := []byte{0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x60}
+	now := uint64(time.Now().UnixNano())
+	nowSec := uint32(time.Now().Unix())
+
+	tr := &tempopb.Trace{
+		ResourceSpans: []*tempotrace.ResourceSpans{{
+			Resource: &temporesource.Resource{
+				Attributes: []*tempocommon.KeyValue{
+					{Key: "service.name", Value: &tempocommon.AnyValue{Value: &tempocommon.AnyValue_StringValue{StringValue: "svc-disk"}}},
+				},
+			},
+			ScopeSpans: []*tempotrace.ScopeSpans{{
+				Spans: []*tempotrace.Span{{
+					TraceId:           traceID,
+					SpanId:            []byte{0x60, 0, 0, 0, 0, 0, 0, 0x01},
+					Name:              "disk-span",
+					StartTimeUnixNano: now,
+					EndTimeUnixNano:   now + uint64(50*time.Millisecond),
+				}},
+			}},
+		}},
+	}
+
+	walMeta := backend.NewBlockMeta("test-tenant", uuid.New(), VersionString)
+	wal, err := createWALBlock(walMeta, tmpDir, 0)
+	require.NoError(t, err)
+
+	require.NoError(t, wal.AppendTrace(traceID, tr, nowSec, nowSec+1, false))
+
+	// Flush to disk — this sets flushed=nil, writer=nil, buf=nil.
+	require.NoError(t, wal.Flush())
+
+	// FindTraceByID must still return the trace from disk.
+	resp, err := wal.FindTraceByID(ctx, traceID, common.SearchOptions{})
+	require.NoError(t, err)
+	require.NotNil(t, resp, "FindTraceByID must find trace after Flush() to disk")
+	require.NotNil(t, resp.Trace)
+	require.NotEmpty(t, resp.Trace.ResourceSpans)
+
+	// Second call must also return the trace (idempotent disk reads).
+	resp2, err := wal.FindTraceByID(ctx, traceID, common.SearchOptions{})
+	require.NoError(t, err)
+	require.NotNil(t, resp2, "FindTraceByID second call must also find trace after Flush()")
+
+	// Fetch (search) must also return the trace from disk.
+	fetchReq := traceql.FetchSpansRequest{
+		Conditions: []traceql.Condition{},
+		StartTimeUnixNanos: now - uint64(time.Minute),
+		EndTimeUnixNanos:   now + uint64(time.Minute),
+	}
+	fetchResp, err := wal.Fetch(ctx, fetchReq, common.SearchOptions{})
+	require.NoError(t, err)
+	var found bool
+	for {
+		ss, err := fetchResp.Results.Next(ctx)
+		require.NoError(t, err)
+		if ss == nil {
+			break
+		}
+		found = true
+	}
+	require.True(t, found, "Fetch must return spans after Flush() to disk")
+}

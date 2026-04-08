@@ -108,6 +108,60 @@ func (w *walBlock) initWriter() error {
 	return nil
 }
 
+// resolveSegments returns the segments to query: if the block is still in memory
+// (writer != nil or flushed has data), it seals any dirty data and returns w.flushed.
+// If the block has been flushed to disk (writer==nil, flushed==nil), it loads and
+// returns the numbered segment files from w.path.
+// Safe to call without holding w.mu.
+func (w *walBlock) resolveSegments() ([][]byte, error) {
+	w.mu.Lock()
+	if err := w.sealCurrent(); err != nil {
+		w.mu.Unlock()
+		return nil, err
+	}
+	if len(w.flushed) > 0 || w.writer != nil {
+		// Still in-memory: return a copy of the slice header.
+		segs := w.flushed
+		w.mu.Unlock()
+		return segs, nil
+	}
+	path := w.path
+	w.mu.Unlock()
+
+	// Block has been flushed to disk — load numbered segment files.
+	if path == "" {
+		return nil, nil
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("resolveSegments: readdir: %w", err)
+	}
+	var segs [][]byte
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if len(name) != 10 {
+			continue
+		}
+		if _, err := strconv.ParseUint(name, 10, 64); err != nil {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(path, name))
+		if err != nil {
+			return nil, fmt.Errorf("resolveSegments: read %s: %w", name, err)
+		}
+		if len(data) > 0 {
+			segs = append(segs, data)
+		}
+	}
+	return segs, nil
+}
+
 // sealCurrent finalizes the active writer segment into w.flushed.
 // Must be called with w.mu held.
 // Returns nil immediately when dirty==false (nothing pending).
@@ -322,14 +376,10 @@ func (w *walBlock) FindTraceByID(ctx context.Context, id common.ID, opts common.
 		return nil, fmt.Errorf("trace ID must be 16 bytes, got %d", len(id))
 	}
 
-	w.mu.Lock()
-	if err := w.sealCurrent(); err != nil {
-		w.mu.Unlock()
+	segments, err := w.resolveSegments()
+	if err != nil {
 		return nil, fmt.Errorf("walBlock FindTraceByID: %w", err)
 	}
-	segments := w.flushed // slice header copy; underlying arrays are immutable after sealing
-	w.mu.Unlock()
-
 	if len(segments) == 0 {
 		return nil, nil
 	}
@@ -390,14 +440,10 @@ func (w *walBlock) Fetch(ctx context.Context, req traceql.FetchSpansRequest, opt
 		Bytes:   func() uint64 { return 0 },
 	}
 
-	w.mu.Lock()
-	if err := w.sealCurrent(); err != nil {
-		w.mu.Unlock()
+	segments, err := w.resolveSegments()
+	if err != nil {
 		return traceql.FetchSpansResponse{}, fmt.Errorf("walBlock Fetch: %w", err)
 	}
-	segments := w.flushed // slice header copy; underlying arrays are immutable after sealing
-	w.mu.Unlock()
-
 	if len(segments) == 0 {
 		return emptyResp, nil
 	}
