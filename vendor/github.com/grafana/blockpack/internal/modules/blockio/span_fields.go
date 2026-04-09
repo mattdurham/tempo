@@ -278,9 +278,10 @@ func (a *modulesSpanFieldsAdapter) GetField(name string) (any, bool) {
 // They are derivable from log:body and should not appear as explicit attributes in
 // enumeration. GetField() still resolves them for direct lookups.
 func (a *modulesSpanFieldsAdapter) IterateFields(fn func(name string, value any) bool) {
-	seen := make(map[string]struct{})
+	entries := a.block.IterFields()
+	seen := make(map[string]struct{}, len(entries)) // len(nil)==0 for fallback path; exact cap for fast path
 	// NOTE-049: Use pre-computed deduplicated slice when available — zero allocs.
-	if entries := a.block.IterFields(); entries != nil {
+	if entries != nil {
 		for i := range entries {
 			v, ok := modulesGetValue(entries[i].Col, a.rowIdx)
 			if !ok {

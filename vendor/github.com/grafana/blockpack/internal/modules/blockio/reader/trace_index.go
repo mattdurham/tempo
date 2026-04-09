@@ -54,8 +54,8 @@ func (r *Reader) BlocksForTraceIDCompact(traceID [16]byte) []int {
 		return nil
 	}
 
-	blockIDs, ok := r.compactParsed.traceIndex[traceID]
-	if !ok {
+	blockIDs := scanTraceIndexRaw(r.compactParsed.traceIndexRaw, traceID)
+	if blockIDs == nil {
 		return nil
 	}
 
@@ -76,6 +76,88 @@ func blockIDsToInts(blockIDs []uint16) []int {
 		}
 	}
 	return blocks
+}
+
+// scanTraceIndexRaw searches raw trace-index bytes for traceID without building a map.
+// Supports fmt_version 1 (v1: with per-block span indices) and 2 (v2: block IDs only).
+// Returns the block IDs for the matching trace, or nil if not found.
+// Zero allocations on miss; one small []uint16 allocation on hit.
+// NOTE-PERF-COMPACT: called by BlocksForTraceIDCompact and TraceEntries in place of a
+// map lookup. Eliminates O(traceCount) map+slice allocations from parseTraceBlockIndex.
+func scanTraceIndexRaw(data []byte, traceID [16]byte) []uint16 {
+	if len(data) < 5 {
+		return nil
+	}
+
+	fmtVersion := data[0]
+	if fmtVersion != shared.TraceIndexFmtVersion && fmtVersion != shared.TraceIndexFmtVersion2 {
+		return nil
+	}
+
+	traceCount := int(binary.LittleEndian.Uint32(data[1:]))
+	pos := 5
+
+	for range traceCount {
+		if pos+18 > len(data) {
+			return nil
+		}
+
+		// Compare trace ID in-place — no allocation.
+		match := *(*[16]byte)(data[pos : pos+16]) == traceID
+		pos += 16
+
+		blockRefCount := int(binary.LittleEndian.Uint16(data[pos:]))
+		pos += 2
+
+		if fmtVersion == shared.TraceIndexFmtVersion {
+			// v1: block_id[2] + span_count[2] + span_indices[N×2]
+			if match {
+				blockIDs := make([]uint16, 0, blockRefCount)
+				for range blockRefCount {
+					if pos+4 > len(data) {
+						return nil
+					}
+					blockID := binary.LittleEndian.Uint16(data[pos:])
+					spanCount := int(binary.LittleEndian.Uint16(data[pos+2:]))
+					pos += 4
+					if pos+spanCount*2 > len(data) {
+						return nil
+					}
+					pos += spanCount * 2
+					blockIDs = append(blockIDs, blockID)
+				}
+				return blockIDs
+			}
+			// Skip this trace's block entries without allocating.
+			for range blockRefCount {
+				if pos+4 > len(data) {
+					return nil
+				}
+				spanCount := int(binary.LittleEndian.Uint16(data[pos+2:]))
+				pos += 4
+				if pos+spanCount*2 > len(data) {
+					return nil
+				}
+				pos += spanCount * 2
+			}
+		} else {
+			// v2: block_id[2] only — fixed stride per block ref.
+			need := blockRefCount * 2
+			if pos+need > len(data) {
+				return nil
+			}
+			if match {
+				blockIDs := make([]uint16, blockRefCount)
+				for i := range blockRefCount {
+					blockIDs[i] = binary.LittleEndian.Uint16(data[pos+i*2:])
+				}
+				return blockIDs
+			}
+			pos += need
+		}
+	}
+
+	return nil
 }
 
 // ensureCompactIndexParsed lazily parses the compact trace index.
@@ -155,16 +237,25 @@ func (r *Reader) ensureCompactIndexParsed() error {
 		pos += 12
 	}
 
-	// Parse trace index in the same format as the main trace block index.
-	traceIdx, _, err := parseTraceBlockIndex(data[pos:])
-	if err != nil {
-		return fmt.Errorf("compact index: trace_index: %w", err)
+	// NOTE-PERF-COMPACT: store raw trace-index bytes in-place instead of parsing into a map.
+	// scanTraceIndexRaw scans the bytes linearly on each lookup, eliminating the O(traceCount)
+	// allocations from parseTraceBlockIndex (was #1 production allocator: 36.27% alloc_objects).
+	// The sub-slice is safe: data is owned by the filecache and outlives the Reader.
+	//
+	// Validate the trace-index section header before storing raw bytes so that corrupt or
+	// unsupported-version indexes fail fast here rather than silently returning no results.
+	if pos+5 > len(data) {
+		return fmt.Errorf("compact index: trace_index: data too short")
+	}
+	traceIdxFmtVer := data[pos]
+	if traceIdxFmtVer != shared.TraceIndexFmtVersion && traceIdxFmtVer != shared.TraceIndexFmtVersion2 {
+		return fmt.Errorf("compact index: trace_index: unsupported fmt_version %d", traceIdxFmtVer)
 	}
 
 	r.compactParsed = &compactTraceIndex{
-		blockTable:   blockTable,
-		traceIndex:   traceIdx,
-		traceIDBloom: traceIDBloom,
+		blockTable:    blockTable,
+		traceIndexRaw: data[pos:],
+		traceIDBloom:  traceIDBloom,
 	}
 
 	// Populate blockMetas from the compact block table so ReadBlockRaw,

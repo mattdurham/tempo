@@ -3,6 +3,7 @@ package reader
 // NOTE: Any changes to this file must be reflected in the corresponding specs.md or NOTES.md.
 
 import (
+	"encoding/binary"
 	"fmt"
 	"math"
 	"slices"
@@ -23,10 +24,15 @@ type footerRaw struct {
 }
 
 // compactTraceIndex holds the parsed compact trace index section.
+// NOTE-PERF-COMPACT: traceIndexRaw stores the raw trace-index bytes in-place (a sub-slice of the
+// cached compact-index buffer) rather than a pre-built map. scanTraceIndexRaw scans them linearly
+// on each lookup, eliminating O(traceCount) map + []uint16 allocations that were the #1 production
+// allocator (36.27% alloc_objects). Allocation on hit is one small []uint16 per lookup — far cheaper
+// than materializing every trace's block list at parse time.
 type compactTraceIndex struct {
-	traceIndex   map[[16]byte][]uint16
-	blockTable   []compactBlockEntry
-	traceIDBloom []byte // nil for version-1 compact indexes (no bloom); vacuous true on lookup
+	traceIndexRaw []byte // raw trace-index bytes; scanned in-place by scanTraceIndexRaw
+	blockTable    []compactBlockEntry
+	traceIDBloom  []byte // nil for version-1 compact indexes (no bloom); vacuous true on lookup
 }
 
 // Reader reads and decodes a blockpack file.
@@ -259,8 +265,12 @@ func (r *Reader) TraceCount() int {
 	if len(r.traceIndex) > 0 {
 		return len(r.traceIndex)
 	}
-	if r.compactParsed != nil {
-		return len(r.compactParsed.traceIndex)
+	if r.compactParsed != nil && len(r.compactParsed.traceIndexRaw) >= 5 {
+		fmtVer := r.compactParsed.traceIndexRaw[0]
+		if fmtVer == shared.TraceIndexFmtVersion || fmtVer == shared.TraceIndexFmtVersion2 {
+			// Trace count is encoded at bytes [1:5] of the raw trace-index section.
+			return int(binary.LittleEndian.Uint32(r.compactParsed.traceIndexRaw[1:]))
+		}
 	}
 	return 0
 }
@@ -553,7 +563,8 @@ func (r *Reader) TraceEntries(traceID [16]byte) []TraceEntry {
 	r.ensureTraceIndex()
 	blockIDs, ok := r.traceIndex[traceID]
 	if !ok && r.compactParsed != nil {
-		blockIDs, ok = r.compactParsed.traceIndex[traceID]
+		blockIDs = scanTraceIndexRaw(r.compactParsed.traceIndexRaw, traceID)
+		ok = blockIDs != nil
 	}
 	if !ok {
 		return nil
