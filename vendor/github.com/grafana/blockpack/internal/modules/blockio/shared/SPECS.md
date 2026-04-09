@@ -40,17 +40,22 @@ const (
     ColumnTypeRangeBytes    ColumnType = 10
     ColumnTypeRangeString   ColumnType = 11
     ColumnTypeUUID          ColumnType = 12 // string column stored as 16-byte binary UUID; StringValue() returns formatted UUID
+    ColumnTypeVectorF32     ColumnType = 13 // flat float32 array; dimension stored in column encoding header
 )
 ```
 
 **Invariant:** ColumnType values 0–5 are "plain" types (direct values); 6–11 are "range"
-types used in the range index; 12 is `ColumnTypeUUID` (a binary-encoded string variant).
-The `Range*` variants encode the same underlying value as their plain counterparts but carry
-additional metadata for range-index construction. Values 13–255 are reserved.
+types used in the range index; 12 is `ColumnTypeUUID` (a binary-encoded string variant);
+13 is `ColumnTypeVectorF32` (flat float32 array for semantic embeddings). Values 14–255
+are reserved.
 
 **Wire format:** ColumnType is stored as a single byte in the column encoding header.
 Do not reorder or remove values; doing so would break backward compatibility with existing
 blockpack files.
+
+Readers encountering `ColumnTypeVectorF32 = 13` in a block column header during non-vector
+queries must lazy-skip the column (not request it in `wantColumns`). Only semantic search
+queries request this column type.
 
 ---
 
@@ -186,11 +191,25 @@ from being merged in. Zero means no limit.
 | `MagicNumber` | `0xC011FEA1` | File magic at byte 0 |
 | `CompactIndexMagic` | `0xC01DC1DE` | Block index section magic |
 | `TSIndexMagic` | `0xC011FEED` | TS index section magic |
+| `VectorIndexMagic` | `0x56454349` | Vector index section magic ("VECI") |
+| `VectorIndexVersion` | `0x01` | VectorIndex section version |
+| `FooterV5Version` | 5 | V5 footer: V4 + vectorIndexOffset[8] + vectorIndexLen[4] |
+| `FooterV5Size` | 46 | V5 footer size in bytes |
 | `VersionV10` | 10 | File format version 10 |
 | `VersionV11` | 11 | File format version 11 |
 | `VersionV12` | 12 | File format version 12 (snappy metadata + signal type) |
 | `SignalTypeTrace` | `0x01` | File contains OTEL trace spans |
 | `SignalTypeLog` | `0x02` | File contains OTEL log records |
+
+### Well-Known Vector Column Names
+
+| Constant | Value | Description |
+|---|---|---|
+| `EmbeddingColumnName` | `__embedding__` | Float32 vector embedding column (ColumnTypeVectorF32) |
+| `EmbeddingTextColumnName` | `__embedding_text__` | Source text used to generate the embedding (ColumnTypeString) |
+
+Double-underscore prefix signals internal/synthetic columns that are generated at ingest
+time and not present in the original OTLP payload.
 
 ---
 

@@ -76,43 +76,83 @@ func (p *tempoReaderProvider) ReadAt(buf []byte, off int64, _ blockpack.DataType
 // metadata/sketches/intrinsic columns at a higher level.
 func ConfigureLRU(_ int64) {}
 
-// blockpackFileCache is a process-level disk-backed cache for blockpack block bytes.
-// A nil *FileCache is safe — all reads fall through to the provider.
+// blockpackCache is the process-level multi-tier cache for blockpack block bytes.
+// It is built once via getCache() and may be a ChainedCache (MemoryCache → FileCache → MemCache)
+// or nil if no caching is configured. A nil Cache is safe — all reads fall through to the provider.
 var (
-	blockpackFileCache     *blockpack.FileCache
-	blockpackFileCacheOnce sync.Once
-	blockpackFileCachePath string
-	blockpackFileCacheSize int64
+	blockpackCache     blockpack.Cache
+	blockpackCacheOnce sync.Once
+	blockpackCacheCfg  struct {
+		filePath         string
+		fileMaxBytes     int64
+		memServers       []string
+		memMaxBytes      int64
+		memoryCacheBytes int64
+	}
 )
 
-// ConfigureFileCache sets the disk cache path and max size for blockpack blocks.
-// Must be called before the first block is opened for disk caching to be active.
-// Safe to call multiple times; only the first invocation of getFileCache takes effect.
-func ConfigureFileCache(path string, maxBytes int64) {
-	blockpackFileCachePath = path
-	blockpackFileCacheSize = maxBytes
+// ConfigureCache sets the cache configuration for blockpack blocks.
+// Must be called before the first block is opened for caching to be active.
+// Safe to call multiple times; only the first invocation of getCache takes effect.
+func ConfigureCache(filePath string, fileMaxBytes int64, memServers []string, memMaxBytes int64, memoryCacheBytes int64) {
+	blockpackCacheCfg.filePath = filePath
+	blockpackCacheCfg.fileMaxBytes = fileMaxBytes
+	blockpackCacheCfg.memServers = memServers
+	blockpackCacheCfg.memMaxBytes = memMaxBytes
+	blockpackCacheCfg.memoryCacheBytes = memoryCacheBytes
 }
 
-// getFileCache initializes (once) and returns the process-level disk cache.
-// Returns nil if no path was configured or if opening the cache failed.
-func getFileCache() *blockpack.FileCache {
-	blockpackFileCacheOnce.Do(func() {
-		path := blockpackFileCachePath
-		maxBytes := blockpackFileCacheSize
-		if path == "" || maxBytes <= 0 {
-			return
+// ConfigureFileCache is a deprecated wrapper around ConfigureCache retained for backward compatibility.
+// Callers should switch to ConfigureCache to gain the full 3-tier chain.
+func ConfigureFileCache(path string, maxBytes int64) {
+	ConfigureCache(path, maxBytes, nil, 0, 0)
+}
+
+// getCache initializes (once) the process-level multi-tier cache and returns it.
+// The chain order is: MemoryCache → FileCache → MemCache (fastest-first).
+// Returns nil if no tiers could be configured.
+func getCache() blockpack.Cache {
+	blockpackCacheOnce.Do(func() {
+		var tiers []blockpack.Cache
+
+		// Tier 1: in-process LRU memory cache (fastest).
+		if blockpackCacheCfg.memoryCacheBytes > 0 {
+			mem, err := blockpack.NewMemoryCache(blockpack.MemoryCacheConfig{
+				MaxBytes: blockpackCacheCfg.memoryCacheBytes,
+			})
+			if err == nil && mem != nil {
+				tiers = append(tiers, mem)
+			}
 		}
-		c, err := blockpack.OpenFileCache(blockpack.FileCacheConfig{
-			Enabled:  true,
-			Path:     path,
-			MaxBytes: maxBytes,
-		})
-		if err != nil {
-			return
+
+		// Tier 2: disk-backed file cache.
+		if blockpackCacheCfg.filePath != "" && blockpackCacheCfg.fileMaxBytes > 0 {
+			disk, err := blockpack.OpenFileCache(blockpack.FileCacheConfig{
+				Enabled:  true,
+				Path:     blockpackCacheCfg.filePath,
+				MaxBytes: blockpackCacheCfg.fileMaxBytes,
+			})
+			if err == nil && disk != nil {
+				tiers = append(tiers, disk)
+			}
 		}
-		blockpackFileCache = c
+
+		// Tier 3: remote memcache (largest, slowest).
+		if len(blockpackCacheCfg.memServers) > 0 {
+			remote, err := blockpack.OpenMemCache(blockpack.MemCacheConfig{
+				Servers: blockpackCacheCfg.memServers,
+				Enabled: true,
+			})
+			if err == nil && remote != nil {
+				tiers = append(tiers, remote)
+			}
+		}
+
+		if len(tiers) > 0 {
+			blockpackCache = blockpack.NewChainedCache(tiers...)
+		}
 	})
-	return blockpackFileCache
+	return blockpackCache
 }
 
 type blockpackBlock struct {
@@ -141,11 +181,11 @@ func (b *blockpackBlock) newReaderProvider() blockpack.ReaderProvider {
 	}
 }
 
-// newReader creates a Reader with both in-memory LRU and disk FileCache layers.
+// newReader creates a Reader with the configured multi-tier cache.
 // Each call returns a new Reader — Reader is not safe for concurrent use.
 func (b *blockpackBlock) newReader() (*blockpack.Reader, error) {
 	fileID := b.meta.TenantID + "/" + b.meta.BlockID.String()
-	return blockpack.NewReaderWithCache(b.newReaderProvider(), fileID, getFileCache())
+	return blockpack.NewReaderWithCache(b.newReaderProvider(), fileID, getCache())
 }
 
 // executeQuery creates a reader and executes a TraceQL query, returning all matching spans.
@@ -247,14 +287,17 @@ func convertTraceMetricsResult(result *blockpack.TraceMetricsResult, req *tempop
 }
 
 // FindTraceByID finds a trace by ID.
+// Uses the lean reader (2 I/Os: footer + compact trace index) for minimal memory
+// and I/O overhead when scanning many blocks.
 func (b *blockpackBlock) FindTraceByID(_ context.Context, id common.ID, _ common.SearchOptions) (*tempopb.TraceByIDResponse, error) {
 	if len(id) != 16 {
 		return nil, fmt.Errorf("trace ID must be 16 bytes, got %d", len(id))
 	}
 
-	r, err := b.newReader()
+	fileID := b.meta.TenantID + "/" + b.meta.BlockID.String()
+	r, err := blockpack.NewLeanReaderWithCache(b.newReaderProvider(), fileID, getCache())
 	if err != nil {
-		return nil, fmt.Errorf("failed to create blockpack reader: %w", err)
+		return nil, fmt.Errorf("failed to create blockpack lean reader: %w", err)
 	}
 
 	traceIDHex := hex.EncodeToString(id)

@@ -158,9 +158,9 @@ func topKScanBlocks(
 	blockToGroup map[int]int,
 	backward bool,
 ) (int, int, int64, error) {
-	fetched := make(map[int][]byte)
-	fetchedGroupsSeen := make(map[int]struct{})
-	skippedBlocks := make(map[int]struct{})
+	fetched := make(map[int][]byte, len(plan.SelectedBlocks))
+	fetchedGroupsSeen := make(map[int]struct{}, len(groups))
+	skippedBlocks := make(map[int]struct{}, len(plan.SelectedBlocks))
 	fetchedGroups := 0
 	fetchCount := 0
 	var bytesRead int64

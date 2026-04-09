@@ -18,7 +18,12 @@ import (
 )
 
 // streamFilterQuery executes a TraceQL filter query against a modules-format reader.
-func streamFilterQuery(r *Reader, filterExpr *traceqlparser.FilterExpression, opts QueryOptions, fn spanMatchFn) (QueryStats, error) {
+func streamFilterQuery(
+	r *Reader,
+	filterExpr *traceqlparser.FilterExpression,
+	opts QueryOptions,
+	fn spanMatchFn,
+) (QueryStats, error) {
 	var program *vm.Program
 	var compileErr error
 	if opts.Embedder != nil {
@@ -107,7 +112,7 @@ func streamFilterProgram(r *Reader, program *vm.Program, opts QueryOptions, fn s
 		if len(opts.SelectColumns) > 0 {
 			fields = newFilteredSpanFields(fields, opts.SelectColumns)
 		}
-		match := &SpanMatch{Fields: fields, TraceID: traceIDHex, SpanID: spanIDHex, Score: row.Score}
+		match := &SpanMatch{Fields: fields, TraceID: traceIDHex, SpanID: spanIDHex}
 		if !fn(match, true) {
 			// NOTE-ALLOC-4: release adapter back to pool after callback returns.
 			modules_blockio.ReleaseSpanFieldsAdapter(rawAdapter)

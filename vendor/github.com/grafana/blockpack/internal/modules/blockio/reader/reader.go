@@ -34,9 +34,9 @@ type Reader struct {
 	provider rw.ReaderProvider
 	// vectorIndexErr holds any error from lazy vector index parsing.
 	vectorIndexErr error
-	// cache is the optional disk-backed file cache for footer/header/metadata/block reads.
-	// Nil when no cache is configured.
-	cache *filecache.FileCache
+	// cache is the cache used for footer/header/metadata/block reads.
+	// Never nil: defaults to filecache.NopCache when no cache is configured.
+	cache filecache.Cache
 
 	traceIndex map[[16]byte][]uint16
 
@@ -162,9 +162,13 @@ func NewReaderFromProviderWithOptions(provider rw.ReaderProvider, opts Options) 
 		return nil, fmt.Errorf("NewReaderFromProvider: Size: %w", err)
 	}
 
+	cache := opts.Cache
+	if cache == nil {
+		cache = filecache.NopCache
+	}
 	r := &Reader{
 		provider:      provider,
-		cache:         opts.Cache,
+		cache:         cache,
 		fileID:        opts.FileID,
 		fileSize:      size,
 		internStrings: make(map[string]string),
@@ -209,9 +213,13 @@ func NewLeanReaderFromProviderWithOptions(provider rw.ReaderProvider, opts Optio
 		return nil, fmt.Errorf("NewLeanReaderFromProvider: Size: %w", err)
 	}
 
+	leanCache := opts.Cache
+	if leanCache == nil {
+		leanCache = filecache.NopCache
+	}
 	r := &Reader{
 		provider:      provider,
-		cache:         opts.Cache,
+		cache:         leanCache,
 		fileID:        opts.FileID,
 		fileSize:      size,
 		internStrings: make(map[string]string),
@@ -649,7 +657,9 @@ func (r *Reader) VectorIndexRaw() ([]byte, error) {
 	}
 	//nolint:gosec // vectorIndexLen comes from a trusted file footer; overflow checked above
 	buf := make([]byte, r.vectorIndexLen)
-	n, err := r.provider.ReadAt(buf, int64(r.vectorIndexOffset), rw.DataTypeMetadata) //nolint:gosec // vectorIndexOffset fits in int64: file size bounded by object storage limits
+	// vectorIndexOffset fits in int64: file size is bounded by object storage limits (< 2^63).
+	vecOff := int64(r.vectorIndexOffset) //nolint:gosec
+	n, err := r.provider.ReadAt(buf, vecOff, rw.DataTypeMetadata)
 	if err != nil {
 		return nil, fmt.Errorf("VectorIndexRaw: ReadAt: %w", err)
 	}

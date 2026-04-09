@@ -167,3 +167,28 @@ invalid widths rather than silently producing garbage.
 
 Back-ref: `internal/modules/blockio/shared/intrinsic_codec.go:decodeVariableWidthRef`,
 `ScanFlatColumnRefs`, `ScanFlatColumnTopKRefs`, `ScanFlatColumnRefsFiltered`
+
+---
+
+## 10. NOTE-010: Add ColumnTypeVectorF32 = 13 for Semantic Embeddings (2026-04-02)
+*Added: 2026-04-02*
+
+**Decision:** Added `ColumnTypeVectorF32 ColumnType = 13` to the ColumnType enum, along with
+`VectorIndexMagic`, `VectorIndexVersion`, `FooterV5Version`, `FooterV5Size`, `EmbeddingColumnName`,
+and `EmbeddingTextColumnName` constants.
+
+**Rationale:** Value 13 is the first reserved slot after UUID (12); adding it here does not
+reorder or remove any existing constants. Float32 vectors for semantic embeddings are a new
+column kind with distinct wire-format requirements (flat IEEE-754 LE float array with a
+per-column dimension header), so a dedicated ColumnType is cleaner than overloading an
+existing type or using a magic prefix in the column name.
+
+**Consequence:** Readers encountering ColumnType = 13 in a block column header must handle it
+gracefully. For non-vector queries, the column is never in `wantColumns` and is lazy-skipped
+(no behavioral change). For semantic queries, a dedicated `vectorF32` decoder extracts the
+raw float32 slice. Old readers (pre-VectorF32) that encounter type 13 fall through to the
+default unknown-type path, which skips the column — backward-compatible by design.
+
+Back-ref: `internal/modules/blockio/shared/types.go:ColumnTypeVectorF32`,
+`internal/modules/blockio/shared/constants.go:VectorIndexMagic`,
+`internal/modules/blockio/shared/constants.go:EmbeddingColumnName`

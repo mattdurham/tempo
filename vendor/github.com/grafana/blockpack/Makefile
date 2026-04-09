@@ -1,4 +1,4 @@
-.PHONY: test-data clean-test-data help bench bench-report serve-report cost-analysis cost-analysis-no-freetier build-cost-tool build test format lint clean format-benchmark precommit ci install-tools nilaway betteralign betteralign-fix gofumpt-check gofumpt golines-check golines format-all bench-profile-writes deadcode staticcheck bench-logs bench-logs-html bench-logs-full bench-logs-full-html clean-bench-logs-full docs
+.PHONY: test-data clean-test-data help bench bench-report serve-report cost-analysis cost-analysis-no-freetier build-cost-tool build build-embed-server download-model docker-embed-server test format lint clean format-benchmark precommit ci install-tools nilaway betteralign betteralign-fix gofumpt-check gofumpt golines-check golines format-all bench-profile-writes deadcode staticcheck bench-logs bench-logs-html bench-logs-full bench-logs-full-html clean-bench-logs-full docs
 
 # Number of traces to generate (approximately 670K spans like original dataset)
 NUM_TRACES ?= 191119
@@ -27,6 +27,9 @@ COST_OUTPUT := benchmark/cost_analysis.txt
 help:
 	@echo "Build targets:"
 	@echo "  make build            - Build all binaries to ./bin/"
+	@echo "  make build-embed-server - Build embed-server binary (downloads model)"
+	@echo "  make docker-embed-server - Build embed-server Docker image"
+	@echo "  make download-model   - Download GGUF embedding model (~260MB)"
 	@echo "  make clean            - Remove all build artifacts and test data"
 	@echo ""
 	@echo "Development targets:"
@@ -85,6 +88,40 @@ build:
 	@go build -o bin/generate-unified-report ./cmd/generate_unified_report
 	@echo "==> Binaries built in ./bin/"
 
+# --- Embed-server ---
+
+# Model config
+EMBED_MODEL_URL  ?= https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/nomic-embed-text-v1.5.Q8_0.gguf
+EMBED_MODEL_DIR  ?= models
+EMBED_MODEL_FILE ?= $(EMBED_MODEL_DIR)/nomic-embed-text-v1.5.Q8_0.gguf
+
+# Download the GGUF model (skip if already present)
+download-model:
+	@mkdir -p $(EMBED_MODEL_DIR)
+	@if [ -f "$(EMBED_MODEL_FILE)" ]; then \
+		echo "==> Model already exists at $(EMBED_MODEL_FILE)"; \
+	else \
+		echo "==> Downloading model to $(EMBED_MODEL_FILE) (~260MB)..."; \
+		curl -L --progress-bar -o "$(EMBED_MODEL_FILE).tmp" "$(EMBED_MODEL_URL)" && \
+		mv "$(EMBED_MODEL_FILE).tmp" "$(EMBED_MODEL_FILE)"; \
+		echo "==> Model downloaded."; \
+	fi
+
+# Build the embed-server binary
+build-embed-server: download-model
+	@echo "==> Building embed-server..."
+	@mkdir -p bin
+	@go build -o bin/embed-server ./cmd/embed-server
+	@echo "==> bin/embed-server built (model at $(EMBED_MODEL_FILE))"
+
+# Build embed-server Docker image (downloads model during build)
+EMBED_SERVER_IMAGE ?= blockpack/embed-server
+docker-embed-server:
+	@echo "==> Building Docker image $(EMBED_SERVER_IMAGE)..."
+	docker build -t $(EMBED_SERVER_IMAGE) -f cmd/embed-server/Dockerfile .
+	@echo "==> Image built: $(EMBED_SERVER_IMAGE)"
+	@echo "    Run: docker run -p 8765:8765 $(EMBED_SERVER_IMAGE)"
+
 # Rebuild docs site from wiki Markdown sources
 docs:
 	@echo "==> Rebuilding docs site..."
@@ -137,9 +174,9 @@ deadcode:
 	@echo "    Building cmd/deadcode to anchor public APIs..."
 	@go build -o /dev/null ./cmd/deadcode
 	@echo "    Running deadcode tool..."
-	@output=$$(deadcode -test ./... | grep -v "internal/xunsafe\|internal/debug\|benchmark/\|Writer.allocBytes\|internal/modules/blockio\|internal/tempoapi\|internal/blockio"); \
+	@output=$$(deadcode -test ./... | grep -v "internal/xunsafe\|internal/debug\|benchmark/\|Writer.allocBytes\|internal/modules/blockio\|internal/tempoapi\|internal/blockio\|cmd/embed-server"); \
 	if [ -n "$$output" ]; then \
-		echo "❌ Deadcode found (excluding internal/xunsafe, internal/debug, benchmark, internal/modules/blockio, internal/tempoapi, internal/blockio):"; \
+		echo "❌ Deadcode found (excluding internal/xunsafe, internal/debug, benchmark, internal/modules/blockio, internal/tempoapi, internal/blockio, cmd/embed-server):"; \
 		echo "$$output"; \
 		exit 1; \
 	fi

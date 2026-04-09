@@ -28,7 +28,6 @@ type SpanMatch struct {
 	BlockIdx int      // block index within the file
 	RowIdx   int      // row (span) index within the block
 	TraceID  [16]byte // 16-byte trace ID
-	Score    float32  // Vector similarity score (0 = no vector query)
 }
 
 // Result is the output of Execute.
@@ -85,7 +84,7 @@ func (e *Executor) Collect(
 //   - Block-populated rows (block-scan path): reads from Block columns, then falls back
 //     to intrinsic section via r when trace identity columns are absent from the Block.
 func SpanMatchFromRow(row MatchedRow, signalType uint8, r *modules_reader.Reader) SpanMatch {
-	m := SpanMatch{BlockIdx: row.BlockIdx, RowIdx: row.RowIdx, Score: row.Score}
+	m := SpanMatch{BlockIdx: row.BlockIdx, RowIdx: row.RowIdx}
 
 	traceIDCol := "trace:id"
 	spanIDCol := "span:id"

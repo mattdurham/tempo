@@ -98,6 +98,16 @@ type BlockpackConfig struct {
 	// VectorDimension is the expected embedding vector dimension (e.g. 768 for nomic-embed-text-v1.5).
 	// Required when EmbeddingURL is set. Controls the writer's VectorIndex section.
 	VectorDimension int `yaml:"vector_dimension"`
+
+	// MemCacheServers is a list of memcache server addresses (e.g. ["memcached-01:11211"]).
+	// Leave empty to disable the remote memcache tier.
+	MemCacheServers []string `yaml:"memcache_servers"`
+
+	// MemCacheMaxBytes is the per-key size limit for remote memcache entries (default: 1MB).
+	MemCacheMaxBytes int64 `yaml:"memcache_max_bytes"`
+
+	// MemoryCacheBytes is the size of the in-process LRU memory cache (default: 256MB).
+	MemoryCacheBytes int64 `yaml:"memory_cache_bytes"`
 }
 
 func (cfg *BlockConfig) RegisterFlagsAndApplyDefaults(prefix string, f *flag.FlagSet) {
@@ -142,6 +152,12 @@ func (cfg *BlockpackConfig) applyDefaults() {
 	}
 	if cfg.LRUCacheBytes == 0 {
 		cfg.LRUCacheBytes = 32 * 1024 * 1024 // 32MB — footer/metadata only
+	}
+	if cfg.MemCacheMaxBytes == 0 {
+		cfg.MemCacheMaxBytes = 1 << 20 // 1MB
+	}
+	if cfg.MemoryCacheBytes == 0 {
+		cfg.MemoryCacheBytes = 256 << 20 // 256MB
 	}
 	// Booleans default to false, so we enable by default
 	if !cfg.EnableDictionary {

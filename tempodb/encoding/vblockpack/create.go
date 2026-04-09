@@ -13,6 +13,22 @@ import (
 	"github.com/grafana/tempo/tempodb/encoding/common"
 )
 
+// fileReaderProvider implements blockpack.ReaderProvider for an *os.File.
+// Used by setBlockTimeRangeFromFile to read the written blockpack without
+// loading the full file into memory.
+type fileReaderProvider struct {
+	f    *os.File
+	size int64
+}
+
+func (p *fileReaderProvider) Size() (int64, error) {
+	return p.size, nil
+}
+
+func (p *fileReaderProvider) ReadAt(b []byte, off int64, _ blockpack.DataType) (int, error) {
+	return p.f.ReadAt(b, off)
+}
+
 // CreateBlock creates a new blockpack block from an iterator.
 // Writes blockpack data to a temp file to avoid buffering the entire block in
 // memory, then streams the file to backend storage with a known size.
@@ -21,8 +37,14 @@ import (
 func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.BlockMeta,
 	i common.Iterator, r backend.Reader, to backend.Writer) (*backend.BlockMeta, error) {
 
-	// Initialize disk cache on first block creation (no-op if already initialized).
-	ConfigureFileCache(cfg.Blockpack.FileCachePath, cfg.Blockpack.FileCacheMaxBytes)
+	// Initialize multi-tier cache on first block creation (no-op if already initialized).
+	ConfigureCache(
+		cfg.Blockpack.FileCachePath,
+		cfg.Blockpack.FileCacheMaxBytes,
+		cfg.Blockpack.MemCacheServers,
+		cfg.Blockpack.MemCacheMaxBytes,
+		cfg.Blockpack.MemoryCacheBytes,
+	)
 	ConfigureLRU(cfg.Blockpack.LRUCacheBytes)
 	ConfigureEmbedding(cfg.Blockpack.EmbeddingURL)
 
@@ -55,11 +77,7 @@ func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.Blo
 		return nil, fmt.Errorf("failed to create blockpack writer: %w", err)
 	}
 
-	var (
-		traceCount int
-		minStart   uint64 = ^uint64(0)
-		maxStart   uint64
-	)
+	var traceCount int
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -75,21 +93,6 @@ func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.Blo
 		}
 		if tr == nil {
 			continue
-		}
-
-		// Track time range from span timestamps to populate meta without
-		// re-parsing the block bytes after writing.
-		for _, rs := range tr.ResourceSpans {
-			for _, ss := range rs.ScopeSpans {
-				for _, span := range ss.Spans {
-					if span.StartTimeUnixNano < minStart {
-						minStart = span.StartTimeUnixNano
-					}
-					if span.StartTimeUnixNano > maxStart {
-						maxStart = span.StartTimeUnixNano
-					}
-				}
-			}
 		}
 
 		if addErr := writer.AddTempoTrace(tr); addErr != nil {
@@ -116,10 +119,12 @@ func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.Blo
 	meta.TotalObjects = int64(traceCount)
 	meta.Size_ = uint64(size)
 	meta.TotalRecords = 1
-	if minStart != ^uint64(0) {
-		meta.StartTime = time.Unix(0, int64(minStart))
-		meta.EndTime = time.Unix(0, int64(maxStart))
-	}
+	// Read the actual span time range back from the written blockpack file.
+	// This is the authoritative source for StartTime/EndTime — reading from
+	// the intrinsic span:start column avoids the off-by-one where maxStart
+	// (latest span start) was incorrectly used as EndTime, and correctly
+	// handles any span whose StartTimeUnixNano differs from EndTimeUnixNano.
+	setBlockTimeRangeFromFile(meta, tmp, size)
 
 	blockUUID := uuid.UUID(meta.BlockID)
 	if err := to.StreamWriter(ctx, DataFileName, blockUUID, meta.TenantID, tmp, size); err != nil {
@@ -133,6 +138,22 @@ func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.Blo
 	return meta, nil
 }
 
+// setBlockTimeRangeFromFile populates meta.StartTime and meta.EndTime from the
+// blockpack file pointed to by f (size bytes). Unlike setBlockTimeRange which
+// requires the full file in memory, this reads directly from the file using
+// random-access I/O. If the file cannot be parsed or contains no spans,
+// StartTime/EndTime are left unchanged.
+func setBlockTimeRangeFromFile(meta *backend.BlockMeta, f *os.File, size int64) {
+	if size == 0 {
+		return
+	}
+	r, err := blockpack.NewReaderFromProvider(&fileReaderProvider{f: f, size: size})
+	if err != nil {
+		return
+	}
+	setBlockTimeRangeFromReader(meta, r)
+}
+
 // setBlockTimeRange populates meta.StartTime and meta.EndTime from the actual
 // span timestamps in the blockpack data. This allows Tempo's block selector to
 // skip blocks outside the query time range, reducing blocks scanned per query.
@@ -142,7 +163,15 @@ func setBlockTimeRange(meta *backend.BlockMeta, data []byte) {
 	if err != nil {
 		return
 	}
+	setBlockTimeRangeFromReader(meta, r)
+}
 
+// setBlockTimeRangeFromReader applies span timestamp bounds from a blockpack Reader
+// to meta.StartTime and meta.EndTime. It reads the intrinsic span:start column
+// (a sorted flat uint64 column whose first value is the minimum and last value
+// is the maximum start timestamp across all spans). Falls back to per-block
+// BlockMeta.MinStart/MaxStart for older files that predate the intrinsic section.
+func setBlockTimeRangeFromReader(meta *backend.BlockMeta, r *blockpack.Reader) {
 	// PR #172 (dual-storage intrinsic format) stores span:start exclusively in
 	// the intrinsic section — it is no longer present in block columns. Read the
 	// time range from the intrinsic column, which is a sorted flat uint64 column:

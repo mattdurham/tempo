@@ -207,13 +207,19 @@ func serializeVectorIndexSection(fileCentroid []float32, blocks []vectorBlockEnt
 	off += 4
 	buf[off] = shared.VectorIndexVersion
 	off++
-	binary.LittleEndian.PutUint16(buf[off:], uint16(dim)) //nolint:gosec // safe: dim <= 65535 (vector dimensions bounded by model spec)
+	binary.LittleEndian.PutUint16(
+		buf[off:],
+		uint16(dim), //nolint:gosec // safe: dim <= 65535 (vector dimensions bounded by model spec)
+	)
 	off += 2
 	binary.LittleEndian.PutUint16(buf[off:], uint16(cb.M)) //nolint:gosec // safe: M <= dim <= 65535
 	off += 2
 	binary.LittleEndian.PutUint16(buf[off:], uint16(cb.K)) //nolint:gosec // safe: K <= 256 (pqK constant)
 	off += 2
-	binary.LittleEndian.PutUint32(buf[off:], uint32(len(blocks))) //nolint:gosec // safe: block count bounded by writer limits
+	binary.LittleEndian.PutUint32(
+		buf[off:],
+		uint32(len(blocks)), //nolint:gosec // safe: block count bounded by writer limits
+	)
 	off += 4
 
 	// File centroid.
@@ -221,7 +227,10 @@ func serializeVectorIndexSection(fileCentroid []float32, blocks []vectorBlockEnt
 
 	// Per-block data.
 	for _, b := range blocks {
-		binary.LittleEndian.PutUint32(buf[off:], uint32(b.vectorCount)) //nolint:gosec // safe: vector count bounded by block size
+		binary.LittleEndian.PutUint32(
+			buf[off:],
+			uint32(b.vectorCount), //nolint:gosec // safe: vector count bounded by block size
+		)
 		off += 4
 		off = writeFloat32Slice(buf, off, b.centroid)
 		for _, code := range b.pqCodes {

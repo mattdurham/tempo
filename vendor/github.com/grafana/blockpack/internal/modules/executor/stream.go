@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"slices"
 	"sync"
 	"time"
@@ -291,8 +292,13 @@ func Collect(
 		results = topKDeliver(buf, backward)
 	} else {
 		qs.ExecutionPath = "block-plain"
-		fetched := make(map[int][]byte)
-		fetchedGroupsSeen := make(map[int]struct{})
+		// NOTE-054: when Limit > 0, preallocate exactly opts.Limit (exact upper bound for
+		// results). When unlimited, leave nil — result count is unbounded (append handles it).
+		if opts.Limit > 0 {
+			results = make([]MatchedRow, 0, opts.Limit)
+		}
+		fetched := make(map[int][]byte, len(plan.SelectedBlocks))
+		fetchedGroupsSeen := make(map[int]struct{}, len(groups))
 		var scanErr error
 		fetchedGroups, fetchedBlocks, bytesRead, scanErr = scanBlocks(
 			r, program, wantColumns, secondPassCols, opts,
@@ -371,9 +377,7 @@ func scanBlocks(
 			if fetchErr != nil {
 				return fetchedGroups, fetchedBlocks, bytesRead, fmt.Errorf("ReadGroup: %w", fetchErr)
 			}
-			for bi, raw := range groupRaw {
-				fetched[bi] = raw
-			}
+			maps.Copy(fetched, groupRaw)
 			for _, bi := range groups[gi].BlockIDs {
 				bytesRead += int64(r.BlockMeta(bi).Length) //nolint:gosec // Length is block size, safe to cast
 			}
@@ -573,7 +577,7 @@ func countUniqueBlockIdxs(refs []modules_shared.BlockRef) int {
 	if len(refs) == 0 {
 		return 0
 	}
-	seen := make(map[uint16]struct{}, 16)
+	seen := make(map[uint16]struct{}, min(len(refs), 64))
 	for _, ref := range refs {
 		seen[ref.BlockIdx] = struct{}{}
 	}
@@ -728,8 +732,10 @@ type parsedBlock struct {
 // groupRefsByBlock converts a slice of BlockRefs into a stable block traversal order
 // and a map from block index to row indices. The order preserves first-seen block order.
 func groupRefsByBlock(refs []modules_shared.BlockRef) (blockOrder []int, blockRows map[int][]int) {
-	blockOrder = make([]int, 0, 4)
-	blockRows = make(map[int][]int, 4)
+	// NOTE-054: cap at min(len(refs), 64). Distinct block count ≤ len(refs) but is typically
+	// far smaller. 64 avoids pathological over-allocation (e.g. 1000 refs across 5 blocks).
+	blockOrder = make([]int, 0, min(len(refs), 64))
+	blockRows = make(map[int][]int, min(len(refs), 64))
 	for _, ref := range refs {
 		bi := int(ref.BlockIdx)
 		if _, seen := blockRows[bi]; !seen {
@@ -862,7 +868,7 @@ func collectIntrinsicPlain(
 	// Block reads for field population — groups refs by block, reads each block once,
 	// and returns MatchedRow.Block populated. O(M) where M is the result count.
 	blockOrder, blockCandidates := groupRefsByBlock(refs)
-	var results []MatchedRow
+	results := make([]MatchedRow, 0, len(refs))
 	err := forEachBlockInGroups(r, blockOrder, blockCandidates, wantColumns, secondPassCols, "collectIntrinsicPlain",
 		func(pb parsedBlock, candidateRows []int) error {
 			for _, rowIdx := range candidateRows {
@@ -924,7 +930,7 @@ func collectIntrinsicTopK(
 	// Block reads for field population — same as collectIntrinsicPlain.
 	slices.SortFunc(selected, blockRefCompare)
 	blockOrder, blockCandidates := groupRefsByBlock(selected)
-	var results []MatchedRow
+	results := make([]MatchedRow, 0, len(selected))
 	err = forEachBlockInGroups(r, blockOrder, blockCandidates, wantColumns, secondPassCols, "collectIntrinsicTopK",
 		func(pb parsedBlock, candidateRows []int) error {
 			for _, rowIdx := range candidateRows {
@@ -994,8 +1000,10 @@ func collectIntrinsicTopKKLL(
 
 	// Group M refs by BlockIdx and collect unique block indices.
 	// NOTE-044: group so we can sort blockIdxs by MaxStart before collecting pairs.
-	blockOrder := make([]int, 0, 8)
-	blockRefs := make(map[uint16][]modules_shared.BlockRef, 8)
+	// Cap at min(len(refs), 64): distinct block count is always ≤ len(refs) but typically
+	// far smaller. 64 is a reasonable upper bound for per-query block fan-out. NOTE-054.
+	blockOrder := make([]int, 0, min(len(refs), 64))
+	blockRefs := make(map[uint16][]modules_shared.BlockRef, min(len(refs), 64))
 	for _, ref := range refs {
 		bi := int(ref.BlockIdx)
 		if opts.BlockCount > 0 && (bi < opts.StartBlock || bi >= opts.StartBlock+opts.BlockCount) {
@@ -1190,7 +1198,11 @@ func collectMixedPlain(
 		},
 	})
 
-	var results []MatchedRow
+	resultsCap := len(refs)
+	if opts.Limit > 0 && opts.Limit < resultsCap {
+		resultsCap = opts.Limit
+	}
+	results := make([]MatchedRow, 0, resultsCap)
 	// Coalesce all candidate blocks for efficient batch I/O.
 	err := forEachBlockInGroups(r, blockOrder, blockCandidates, wantColumns, secondPassCols, "collectMixedPlain",
 		func(pb parsedBlock, candidateRows []int) error {
@@ -1291,7 +1303,7 @@ func collectMixedTopK(
 			}
 
 			// Collect rows that pass both the pre-filter and full predicate.
-			var qualifying []int
+			qualifying := make([]int, 0, len(candidateRows))
 			for _, rowIdx := range candidateRows {
 				if rowSet.Contains(rowIdx) {
 					qualifying = append(qualifying, rowIdx)
@@ -1353,7 +1365,7 @@ func filterRowSetByIntrinsicNodes(
 	fields := lookupIntrinsicFields(r, refs, want)
 	// Build filtered RowSet. Rows without intrinsic data for the wanted columns are
 	// treated as "absent" and fail the predicate (absent value != any predicate value).
-	filtered := newRowSet()
+	filtered := newRowSetWithCap(len(rows))
 	for i, rowIdx := range rows {
 		if rowSatisfiesIntrinsicNodes(nodes, fields[i]) {
 			filtered.Add(rowIdx)
@@ -1378,8 +1390,12 @@ func lookupIntrinsicFields(
 	wantCols map[string]struct{},
 ) []map[string]any {
 	result := make([]map[string]any, len(selected))
+	innerCap := 12
+	if wantCols != nil {
+		innerCap = len(wantCols)
+	}
 	for i := range result {
-		result[i] = make(map[string]any, 12)
+		result[i] = make(map[string]any, innerCap)
 	}
 
 	// lookupColumn populates result entries for one intrinsic column using O(log N)

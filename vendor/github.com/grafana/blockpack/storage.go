@@ -18,7 +18,6 @@ import (
 	minio "github.com/minio/minio-go/v7"
 
 	modules_compaction "github.com/grafana/blockpack/internal/modules/blockio/compaction"
-	modules_embedder "github.com/grafana/blockpack/internal/modules/embedder"
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
 	modules_rw "github.com/grafana/blockpack/internal/modules/rw"
 	"github.com/grafana/blockpack/internal/otlpconvert"
@@ -395,15 +394,4 @@ func CompactBlocks(
 	}
 	paths, _, err := modules_compaction.CompactBlocks(ctx, converted, cfg, output)
 	return paths, err
-}
-
-// Embedder provides text-to-vector embedding via a pluggable Backend.
-type Embedder = modules_embedder.Embedder
-
-// EmbedderHTTPConfig configures the HTTP embedding backend.
-type EmbedderHTTPConfig = modules_embedder.HTTPConfig
-
-// NewHTTPEmbedder creates an Embedder backed by an HTTP embedding server (TEI or compatible).
-func NewHTTPEmbedder(cfg EmbedderHTTPConfig) (*Embedder, error) {
-	return modules_embedder.NewHTTP(cfg)
 }
