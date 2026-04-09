@@ -47,7 +47,8 @@ func (e Encoding) OpenWALBlock(filename, path string, ingestionSlack, additional
 	return nil, fmt.Errorf("not implemented"), nil
 }
 
-// CopyBlock copies a block from one backend to another
+// CopyBlock copies a block from one backend to another, preserving correct
+// block timestamps by reading them from the actual blockpack data.
 func (e Encoding) CopyBlock(ctx context.Context, meta *backend.BlockMeta, from backend.Reader,
 	to backend.Writer) error {
 	// Read the blockpack data file from source
@@ -56,6 +57,11 @@ func (e Encoding) CopyBlock(ctx context.Context, meta *backend.BlockMeta, from b
 	if err != nil {
 		return fmt.Errorf("failed to read blockpack data: %w", err)
 	}
+
+	// Populate StartTime/EndTime from actual span timestamps in the block file.
+	// This ensures the copied block metadata reflects real span times rather than
+	// the flush time that may have been recorded when the block was originally created.
+	setBlockTimeRange(meta, data)
 
 	// Write to destination
 	if err := to.Write(ctx, DataFileName, blockID, meta.TenantID, data, nil); err != nil {
