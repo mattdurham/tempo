@@ -278,6 +278,9 @@ func GetTraceByID(r *Reader, traceIDHex string) (results []SpanMatch, err error)
 	copy(traceID[:], traceIDBytes)
 
 	entries := r.TraceEntries(traceID)
+	if len(entries) == 0 {
+		return nil, nil
+	}
 	blockIDs := make([]int, len(entries))
 	for i, e := range entries {
 		blockIDs[i] = e.BlockID
