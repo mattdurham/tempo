@@ -15,6 +15,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -22,6 +23,7 @@ import (
 	"path/filepath"
 	"sync"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -42,6 +44,10 @@ type Config struct {
 	// Enabled controls whether the cache is active.
 	// If false, Open returns (nil, nil) and all cache operations are no-ops.
 	Enabled bool
+
+	// Registerer is an optional Prometheus registerer.
+	// When non-nil, cache metrics are registered and incremented.
+	Registerer prometheus.Registerer
 }
 
 // entry is one in-memory record for a cached file.
@@ -59,13 +65,17 @@ type entry struct {
 // Concurrent writes to different keys happen in parallel (OS-level).
 // Concurrent fetches for the same key are deduplicated via singleflight.
 type FileCache struct {
-	group    singleflight.Group // mutex (no ptr) then map ptr — starts pointer region
-	index    map[string]*entry  // key → entry
-	dir      string
-	mu       sync.Mutex
-	maxBytes int64
-	curBytes int64
-	seq      uint64 // monotonic insertion counter for FIFO ordering
+	group     singleflight.Group // mutex (no ptr) then map ptr — starts pointer region
+	index     map[string]*entry  // key → entry
+	dir       string
+	mu        sync.Mutex
+	maxBytes  int64
+	curBytes  int64
+	seq       uint64 // monotonic insertion counter for FIFO ordering
+	requests  *prometheus.CounterVec
+	bytes     *prometheus.CounterVec
+	evictions *prometheus.CounterVec
+	errs      *prometheus.CounterVec
 }
 
 // Open opens (or creates) a FileCache rooted at cfg.Path.
@@ -91,12 +101,48 @@ func Open(cfg Config) (*FileCache, error) {
 		index:    make(map[string]*entry),
 	}
 
+	if cfg.Registerer != nil {
+		c.requests = filecacheRegisterOrReuse(cfg.Registerer, prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "blockpack_cache_requests_total",
+			Help: "Total number of cache requests by tier and result.",
+		}, []string{"tier", "result"}))
+		c.bytes = filecacheRegisterOrReuse(cfg.Registerer, prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "blockpack_cache_bytes_total",
+			Help: "Total bytes read from cache by tier.",
+		}, []string{"tier"}))
+		c.evictions = filecacheRegisterOrReuse(cfg.Registerer, prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "blockpack_cache_evictions_total",
+			Help: "Total number of cache evictions by tier.",
+		}, []string{"tier"}))
+		c.errs = filecacheRegisterOrReuse(cfg.Registerer, prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "blockpack_cache_errors_total",
+			Help: "Total number of cache errors by tier.",
+		}, []string{"tier"}))
+	}
+
 	// Rebuild in-memory index by walking existing cache files.
 	if err := c.load(); err != nil {
 		return nil, fmt.Errorf("filecache: load: %w", err)
 	}
 
 	return c, nil
+}
+
+// filecacheRegisterOrReuse registers a CounterVec with the given Registerer.
+// If the metric is already registered (AlreadyRegisteredError), it returns the
+// previously registered metric instead of panicking.
+func filecacheRegisterOrReuse(reg prometheus.Registerer, cv *prometheus.CounterVec) *prometheus.CounterVec {
+	err := reg.Register(cv)
+	if err == nil {
+		return cv
+	}
+	var are prometheus.AlreadyRegisteredError
+	if errors.As(err, &are) {
+		if existing, ok := are.ExistingCollector.(*prometheus.CounterVec); ok {
+			return existing
+		}
+	}
+	return cv
 }
 
 // load scans dir and rebuilds the in-memory index from existing cache files.
@@ -182,6 +228,9 @@ func (c *FileCache) Get(key string) ([]byte, bool, error) {
 	e, ok := c.index[key]
 	c.mu.Unlock()
 	if !ok {
+		if c.requests != nil {
+			c.requests.WithLabelValues("disk", "miss").Inc()
+		}
 		return nil, false, nil
 	}
 
@@ -196,7 +245,16 @@ func (c *FileCache) Get(key string) ([]byte, bool, error) {
 			c.curBytes -= e.size
 		}
 		c.mu.Unlock()
+		if c.errs != nil {
+			c.errs.WithLabelValues("disk").Inc()
+		}
 		return nil, false, nil
+	}
+	if c.requests != nil {
+		c.requests.WithLabelValues("disk", "hit").Inc()
+	}
+	if c.bytes != nil {
+		c.bytes.WithLabelValues("disk").Add(float64(len(val)))
 	}
 	return val, true, nil
 }
@@ -303,6 +361,9 @@ func (c *FileCache) evictLocked(needed int64) {
 		_ = os.Remove(cand.e.filename)
 		delete(c.index, cand.key)
 		c.curBytes -= cand.e.size
+		if c.evictions != nil {
+			c.evictions.WithLabelValues("disk").Inc()
+		}
 	}
 }
 

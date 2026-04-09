@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/grafana/blockpack"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/grafana/tempo/pkg/tempopb"
 	tempocommon "github.com/grafana/tempo/pkg/tempopb/common/v1"
 	temporesource "github.com/grafana/tempo/pkg/tempopb/resource/v1"
@@ -118,7 +119,8 @@ func getCache() blockpack.Cache {
 		// Tier 1: in-process LRU memory cache (fastest).
 		if blockpackCacheCfg.memoryCacheBytes > 0 {
 			mem, err := blockpack.NewMemoryCache(blockpack.MemoryCacheConfig{
-				MaxBytes: blockpackCacheCfg.memoryCacheBytes,
+				MaxBytes:   blockpackCacheCfg.memoryCacheBytes,
+				Registerer: prometheus.DefaultRegisterer,
 			})
 			if err == nil && mem != nil {
 				tiers = append(tiers, mem)
@@ -128,9 +130,10 @@ func getCache() blockpack.Cache {
 		// Tier 2: disk-backed file cache.
 		if blockpackCacheCfg.filePath != "" && blockpackCacheCfg.fileMaxBytes > 0 {
 			disk, err := blockpack.OpenFileCache(blockpack.FileCacheConfig{
-				Enabled:  true,
-				Path:     blockpackCacheCfg.filePath,
-				MaxBytes: blockpackCacheCfg.fileMaxBytes,
+				Enabled:    true,
+				Path:       blockpackCacheCfg.filePath,
+				MaxBytes:   blockpackCacheCfg.fileMaxBytes,
+				Registerer: prometheus.DefaultRegisterer,
 			})
 			if err == nil && disk != nil {
 				tiers = append(tiers, disk)
@@ -140,8 +143,9 @@ func getCache() blockpack.Cache {
 		// Tier 3: remote memcache (largest, slowest).
 		if len(blockpackCacheCfg.memServers) > 0 {
 			remote, err := blockpack.OpenMemCache(blockpack.MemCacheConfig{
-				Servers: blockpackCacheCfg.memServers,
-				Enabled: true,
+				Servers:    blockpackCacheCfg.memServers,
+				Enabled:    true,
+				Registerer: prometheus.DefaultRegisterer,
 			})
 			if err == nil && remote != nil {
 				tiers = append(tiers, remote)

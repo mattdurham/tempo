@@ -14,6 +14,7 @@ import (
 	"fmt"
 
 	gomemcache "github.com/grafana/gomemcache/memcache"
+	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -37,6 +38,10 @@ type Config struct {
 	// Enabled controls whether the cache is active.
 	// If false, Open returns (nil, nil) and all operations become no-ops.
 	Enabled bool
+
+	// Registerer is an optional Prometheus registerer.
+	// When non-nil, cache metrics are registered and incremented.
+	Registerer prometheus.Registerer
 }
 
 // MemCache is a remote memcache-backed cache that implements filecache.Cache.
@@ -47,6 +52,9 @@ type MemCache struct {
 	group      singleflight.Group
 	c          client
 	expiration int32
+	requests   *prometheus.CounterVec
+	bytes      *prometheus.CounterVec
+	errs       *prometheus.CounterVec
 }
 
 // Open creates a MemCache connecting to cfg.Servers.
@@ -58,10 +66,42 @@ func Open(cfg Config) (*MemCache, error) {
 	if len(cfg.Servers) == 0 {
 		return nil, fmt.Errorf("memcache: at least one server address required")
 	}
-	return &MemCache{
+	m := &MemCache{
 		c:          gomemcache.New(cfg.Servers...),
 		expiration: cfg.Expiration,
-	}, nil
+	}
+	if cfg.Registerer != nil {
+		m.requests = memcacheRegisterOrReuse(cfg.Registerer, prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "blockpack_cache_requests_total",
+			Help: "Total number of cache requests by tier and result.",
+		}, []string{"tier", "result"}))
+		m.bytes = memcacheRegisterOrReuse(cfg.Registerer, prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "blockpack_cache_bytes_total",
+			Help: "Total bytes read from cache by tier.",
+		}, []string{"tier"}))
+		m.errs = memcacheRegisterOrReuse(cfg.Registerer, prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "blockpack_cache_errors_total",
+			Help: "Total number of cache errors by tier.",
+		}, []string{"tier"}))
+	}
+	return m, nil
+}
+
+// memcacheRegisterOrReuse registers a CounterVec with the given Registerer.
+// If the metric is already registered (AlreadyRegisteredError), it returns the
+// previously registered metric instead of panicking.
+func memcacheRegisterOrReuse(reg prometheus.Registerer, cv *prometheus.CounterVec) *prometheus.CounterVec {
+	err := reg.Register(cv)
+	if err == nil {
+		return cv
+	}
+	var are prometheus.AlreadyRegisteredError
+	if errors.As(err, &are) {
+		if existing, ok := are.ExistingCollector.(*prometheus.CounterVec); ok {
+			return existing
+		}
+	}
+	return cv
 }
 
 // memcacheKey converts an arbitrary blockpack cache key into a valid
@@ -80,15 +120,27 @@ func (m *MemCache) Get(key string) ([]byte, bool, error) {
 	}
 	item, err := m.c.Get(memcacheKey(key))
 	if errors.Is(err, gomemcache.ErrCacheMiss) {
+		if m.requests != nil {
+			m.requests.WithLabelValues("remote", "miss").Inc()
+		}
 		return nil, false, nil
 	}
 	if err != nil {
 		// Treat transient errors (connection loss, server unavailable) as misses.
 		// Memcache is a best-effort cache; the caller falls back to the underlying reader.
+		if m.errs != nil {
+			m.errs.WithLabelValues("remote").Inc()
+		}
 		return nil, false, nil //nolint:nilerr
 	}
 	out := make([]byte, len(item.Value))
 	copy(out, item.Value)
+	if m.requests != nil {
+		m.requests.WithLabelValues("remote", "hit").Inc()
+	}
+	if m.bytes != nil {
+		m.bytes.WithLabelValues("remote").Add(float64(len(out)))
+	}
 	return out, true, nil
 }
 

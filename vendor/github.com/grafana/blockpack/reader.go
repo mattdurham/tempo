@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	modules_blockio "github.com/grafana/blockpack/internal/modules/blockio"
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
 	modules_shared "github.com/grafana/blockpack/internal/modules/blockio/shared"
@@ -97,6 +99,10 @@ type FileCacheConfig struct {
 	// Enabled controls whether the cache is active.
 	// When false, OpenFileCache returns (nil, nil) and readers skip all caching.
 	Enabled bool
+
+	// Registerer is an optional Prometheus registerer.
+	// When non-nil, cache metrics are registered and incremented on cache operations.
+	Registerer prometheus.Registerer
 }
 
 // OpenFileCache opens (or creates) a FileCache with the given configuration.
@@ -104,9 +110,10 @@ type FileCacheConfig struct {
 // The caller must call FileCache.Close() when done.
 func OpenFileCache(cfg FileCacheConfig) (*FileCache, error) {
 	return modules_filecache.Open(modules_filecache.Config{
-		Enabled:  cfg.Enabled,
-		MaxBytes: cfg.MaxBytes,
-		Path:     cfg.Path,
+		Enabled:    cfg.Enabled,
+		MaxBytes:   cfg.MaxBytes,
+		Path:       cfg.Path,
+		Registerer: cfg.Registerer,
 	})
 }
 
@@ -120,12 +127,17 @@ type MemoryCacheConfig struct {
 	// MaxBytes is the maximum total bytes the cache may hold.
 	// Required and must be positive.
 	MaxBytes int64
+
+	// Registerer is an optional Prometheus registerer.
+	// When non-nil, cache metrics are registered and incremented on cache operations.
+	Registerer prometheus.Registerer
 }
 
 // NewMemoryCache creates an in-process LRU cache with the given byte capacity.
 func NewMemoryCache(cfg MemoryCacheConfig) (*MemoryCache, error) {
 	return modules_memorycache.New(modules_memorycache.Config{
-		MaxBytes: cfg.MaxBytes,
+		MaxBytes:   cfg.MaxBytes,
+		Registerer: cfg.Registerer,
 	})
 }
 
@@ -146,6 +158,10 @@ type MemCacheConfig struct {
 	// Enabled controls whether the cache is active.
 	// When false, OpenMemCache returns (nil, nil).
 	Enabled bool
+
+	// Registerer is an optional Prometheus registerer.
+	// When non-nil, cache metrics are registered and incremented on cache operations.
+	Registerer prometheus.Registerer
 }
 
 // OpenMemCache creates a MemCache connecting to the configured servers.
@@ -156,6 +172,7 @@ func OpenMemCache(cfg MemCacheConfig) (*MemCache, error) {
 		Servers:    cfg.Servers,
 		Expiration: cfg.Expiration,
 		Enabled:    cfg.Enabled,
+		Registerer: cfg.Registerer,
 	})
 }
 
