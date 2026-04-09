@@ -135,6 +135,7 @@ func ExecuteLogMetrics(
 		result.BlocksScanned++
 
 		colNames, colMap, colCols, _, _ := buildBlockColMapsWithLogCache(bwb.Block)
+		attrVals := make([]string, len(groupBy)) // NOTE-054: per-block scratch; cleared at top of logAccumulateRow
 		for _, rowIdx := range rowSet.ToSlice() {
 			logAccumulateRow(
 				bwb.Block,
@@ -147,6 +148,7 @@ func ExecuteLogMetrics(
 				funcName,
 				groupBy,
 				buckets,
+				attrVals,
 			)
 		}
 	}
@@ -157,6 +159,7 @@ func ExecuteLogMetrics(
 }
 
 // logAccumulateRow accumulates one log row's contribution into the buckets map.
+// attrVals is a scratch slice of len(groupBy) reused across calls.
 func logAccumulateRow(
 	block *modules_reader.Block,
 	rowIdx int,
@@ -168,7 +171,12 @@ func logAccumulateRow(
 	funcName string,
 	groupBy []string,
 	buckets map[string]*aggBucketState,
+	attrVals []string,
 ) {
+	// NOTE-054: clear attrVals at function entry so stale values from prior rows never
+	// survive an early return. strings.Join copies the joined string before reuse is safe.
+	clear(attrVals)
+
 	tb := querySpec.TimeBucketing
 	if !tb.Enabled || tb.StepSizeNanos <= 0 {
 		return
@@ -219,7 +227,6 @@ func logAccumulateRow(
 	bucketIdxStr := strconv.FormatInt(bucketIdx, 10)
 
 	// Build the group key from group-by label values.
-	attrVals := make([]string, len(groupBy))
 	for i, lbl := range groupBy {
 		attrVals[i] = labels.Get(lbl)
 	}

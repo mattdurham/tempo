@@ -55,16 +55,7 @@ func NewHTTP(cfg HTTPConfig) (*Embedder, error) {
 	}
 	b := &httpBackend{
 		serverURL: cfg.ServerURL,
-		client: &http.Client{
-			Timeout: timeout,
-			// Disable keep-alive so each batch request opens a new TCP connection.
-			// This lets kube-proxy (L4 load balancer) distribute requests evenly
-			// across all embed-server replicas rather than pinning each client to
-			// the single pod it first connected to.
-			Transport: &http.Transport{
-				DisableKeepAlives: true,
-			},
-		},
+		client:    &http.Client{Timeout: timeout},
 	}
 
 	// Probe with a single short text to determine dimension.
