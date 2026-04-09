@@ -254,7 +254,7 @@ func (r *Reader) ensureCompactIndexParsed() error {
 
 	r.compactParsed = &compactTraceIndex{
 		blockTable:    blockTable,
-		traceIndexRaw: data[pos:],
+		traceIndexRaw: append([]byte(nil), data[pos:]...),
 		traceIDBloom:  traceIDBloom,
 	}
 
