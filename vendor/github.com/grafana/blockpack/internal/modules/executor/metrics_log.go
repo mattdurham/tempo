@@ -298,7 +298,7 @@ func collectGroupKeys(buckets map[string]*aggBucketState, tb vm.TimeBucketSpec) 
 	if numBuckets <= 0 {
 		return nil, 0
 	}
-	keySet := make(map[string]struct{})
+	keySet := make(map[string]struct{}, len(buckets))
 	for compositeKey := range buckets {
 		_, after, ok := strings.Cut(compositeKey, "\x00")
 		if !ok {

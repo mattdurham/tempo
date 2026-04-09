@@ -495,7 +495,7 @@ func traceHistogramSeries(
 		attrGroupKey   string
 		bucketBoundary string
 	}
-	keySet := make(map[histSeriesKey]struct{})
+	keySet := make(map[histSeriesKey]struct{}, len(buckets))
 	for compositeKey := range buckets {
 		// Key format: "bucketIdx\x00attrGroupKey\x00histBoundary".
 		// attrGroupKey may itself contain "\x00" separating multiple GroupBy values,
