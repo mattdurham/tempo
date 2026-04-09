@@ -152,7 +152,13 @@ func l2SquaredDist(a, b []float32) float32 {
 
 // recomputeCentroids updates centroids as the mean of assigned subvectors.
 // Empty clusters get re-initialized with a random assigned vector from rng.
-func recomputeCentroids(subvecs [][]float32, centroids [][]float32, assignments []int, numCentroids, subvecDim int, rng *rand.Rand) {
+func recomputeCentroids(
+	subvecs [][]float32,
+	centroids [][]float32,
+	assignments []int,
+	numCentroids, subvecDim int,
+	rng *rand.Rand,
+) {
 	sums := make([][]float32, numCentroids)
 	counts := make([]int, numCentroids)
 	for k := 0; k < numCentroids; k++ {

@@ -10,10 +10,15 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	modules_blockio "github.com/grafana/blockpack/internal/modules/blockio"
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
 	modules_shared "github.com/grafana/blockpack/internal/modules/blockio/shared"
+	modules_chaincache "github.com/grafana/blockpack/internal/modules/chaincache"
 	modules_filecache "github.com/grafana/blockpack/internal/modules/filecache"
+	modules_memcache "github.com/grafana/blockpack/internal/modules/memcache"
+	modules_memorycache "github.com/grafana/blockpack/internal/modules/memorycache"
 	modules_rw "github.com/grafana/blockpack/internal/modules/rw"
 )
 
@@ -69,6 +74,13 @@ func NewSharedLRUProvider(underlying ReaderProvider, readerID string, cache *Sha
 	return modules_rw.NewSharedLRUProvider(adapted, readerID, cache)
 }
 
+// Cache is the common interface for all blockpack cache tiers.
+// Implementations: FileCache (disk), MemoryCache (in-process), MemCache (remote),
+// ChainedCache (multi-tier). Use NewChainedCache to compose tiers:
+//
+//	chain := NewChainedCache(memCache, diskCache, remoteCache)
+type Cache = modules_filecache.Cache
+
 // FileCache is a disk-backed, size-bounded byte cache for blockpack file sections
 // (footer, header, metadata, blocks). It deduplicates concurrent fetches for the
 // same key so that many goroutines opening the same file share a single I/O.
@@ -77,7 +89,7 @@ type FileCache = modules_filecache.FileCache
 
 // FileCacheConfig configures a disk-backed FileCache.
 type FileCacheConfig struct {
-	// Path is the file path of the bbolt database used for storage.
+	// Path is the directory path used for cache storage.
 	Path string
 
 	// MaxBytes is the maximum total bytes stored on disk.
@@ -87,6 +99,10 @@ type FileCacheConfig struct {
 	// Enabled controls whether the cache is active.
 	// When false, OpenFileCache returns (nil, nil) and readers skip all caching.
 	Enabled bool
+
+	// Registerer is an optional Prometheus registerer.
+	// When non-nil, cache metrics are registered and incremented on cache operations.
+	Registerer prometheus.Registerer
 }
 
 // OpenFileCache opens (or creates) a FileCache with the given configuration.
@@ -94,10 +110,88 @@ type FileCacheConfig struct {
 // The caller must call FileCache.Close() when done.
 func OpenFileCache(cfg FileCacheConfig) (*FileCache, error) {
 	return modules_filecache.Open(modules_filecache.Config{
-		Enabled:  cfg.Enabled,
-		MaxBytes: cfg.MaxBytes,
-		Path:     cfg.Path,
+		Enabled:    cfg.Enabled,
+		MaxBytes:   cfg.MaxBytes,
+		Path:       cfg.Path,
+		Registerer: cfg.Registerer,
 	})
+}
+
+// MemoryCache is a byte-bounded in-process LRU cache that implements Cache.
+// It is intended as the fastest tier in a multi-tier chain:
+// MemoryCache → FileCache → MemCache.
+type MemoryCache = modules_memorycache.MemoryCache
+
+// MemoryCacheConfig configures an in-process MemoryCache.
+type MemoryCacheConfig struct {
+	// MaxBytes is the maximum total bytes the cache may hold.
+	// Required and must be positive.
+	MaxBytes int64
+
+	// Registerer is an optional Prometheus registerer.
+	// When non-nil, cache metrics are registered and incremented on cache operations.
+	Registerer prometheus.Registerer
+}
+
+// NewMemoryCache creates an in-process LRU cache with the given byte capacity.
+func NewMemoryCache(cfg MemoryCacheConfig) (*MemoryCache, error) {
+	return modules_memorycache.New(modules_memorycache.Config{
+		MaxBytes:   cfg.MaxBytes,
+		Registerer: cfg.Registerer,
+	})
+}
+
+// MemCache is a remote memcache-backed cache that implements Cache.
+// It is intended as the outermost (largest) tier in a multi-tier chain.
+// Keys are hashed with SHA-256 before transmission, so arbitrary-length
+// blockpack cache keys are always valid memcache keys.
+type MemCache = modules_memcache.MemCache
+
+// MemCacheConfig configures a remote MemCache.
+type MemCacheConfig struct {
+	// Servers is the list of memcache server addresses (host:port).
+	Servers []string
+
+	// Expiration is the TTL in seconds for stored items. 0 = no expiration.
+	Expiration int32
+
+	// Enabled controls whether the cache is active.
+	// When false, OpenMemCache returns (nil, nil).
+	Enabled bool
+
+	// Registerer is an optional Prometheus registerer.
+	// When non-nil, cache metrics are registered and incremented on cache operations.
+	Registerer prometheus.Registerer
+}
+
+// OpenMemCache creates a MemCache connecting to the configured servers.
+// Returns (nil, nil) when cfg.Enabled is false.
+// The caller must call MemCache.Close() when done.
+func OpenMemCache(cfg MemCacheConfig) (*MemCache, error) {
+	return modules_memcache.Open(modules_memcache.Config{
+		Servers:    cfg.Servers,
+		Expiration: cfg.Expiration,
+		Enabled:    cfg.Enabled,
+		Registerer: cfg.Registerer,
+	})
+}
+
+// ChainedCache is a multi-tier Cache that searches tiers in order and writes
+// fetched values back to faster tiers on a hit. Use NewChainedCache to build one.
+type ChainedCache = modules_chaincache.ChainedCache
+
+// NewChainedCache creates a ChainedCache from the given tiers ordered fastest-first.
+// Recommended order: MemoryCache → FileCache → MemCache.
+//
+// Example:
+//
+//	mem, _ := blockpack.NewMemoryCache(blockpack.MemoryCacheConfig{MaxBytes: 100 << 20})
+//	disk, _ := blockpack.OpenFileCache(blockpack.FileCacheConfig{Path: "/tmp/bpcache", MaxBytes: 1 << 30, Enabled: true})
+//	remote, _ := blockpack.OpenMemCache(blockpack.MemCacheConfig{Servers: []string{"localhost:11211"}, Enabled: true})
+//	chain := blockpack.NewChainedCache(mem, disk, remote)
+//	reader, _ := blockpack.NewReaderWithCache(provider, fileID, chain)
+func NewChainedCache(tiers ...Cache) *ChainedCache {
+	return modules_chaincache.New(tiers...)
 }
 
 // Signal type constants for blockpack file discrimination.
@@ -130,10 +224,11 @@ func NewReaderFromProvider(provider ReaderProvider) (*Reader, error) {
 }
 
 // NewReaderWithCache creates a Reader that caches footer, header, metadata, and block
-// reads in the provided FileCache. fileID must uniquely identify the file within the
+// reads using the provided Cache. fileID must uniquely identify the file within the
 // cache namespace — typically the file path or object storage key.
-// A nil cache falls back to uncached reads.
-func NewReaderWithCache(provider ReaderProvider, fileID string, cache *FileCache) (*Reader, error) {
+// A nil cache falls back to uncached reads. cache may be any Cache implementation:
+// FileCache, MemoryCache, MemCache, or a ChainedCache.
+func NewReaderWithCache(provider ReaderProvider, fileID string, cache Cache) (*Reader, error) {
 	wrapped := &readerProviderAdapter{provider: provider}
 	return modules_reader.NewReaderFromProviderWithOptions(wrapped, modules_reader.Options{
 		Cache:  cache,
@@ -149,10 +244,11 @@ func NewLeanReaderFromProvider(provider ReaderProvider) (*Reader, error) {
 	return modules_reader.NewLeanReaderFromProvider(wrapped)
 }
 
-// NewLeanReaderWithCache creates a lean Reader with disk caching. Uses the same 2-I/O
+// NewLeanReaderWithCache creates a lean Reader with caching. Uses the same 2-I/O
 // path as NewLeanReaderFromProvider but caches footer and compact index reads.
 // fileID must uniquely identify the file within the cache namespace.
-func NewLeanReaderWithCache(provider ReaderProvider, fileID string, cache *FileCache) (*Reader, error) {
+// cache may be any Cache implementation: FileCache, MemoryCache, MemCache, or ChainedCache.
+func NewLeanReaderWithCache(provider ReaderProvider, fileID string, cache Cache) (*Reader, error) {
 	wrapped := &readerProviderAdapter{provider: provider}
 	return modules_reader.NewLeanReaderFromProviderWithOptions(wrapped, modules_reader.Options{
 		Cache:  cache,

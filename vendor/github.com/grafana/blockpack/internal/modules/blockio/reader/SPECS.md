@@ -232,3 +232,46 @@ Back-ref: `internal/modules/blockio/reader/columnar_read.go:ReadGroupColumnar`,
    When non-nil, `TotalBytes` is the raw byte size of the FBLM section.
 
 Back-ref: `internal/modules/blockio/reader/layout.go:FileLayout`
+
+---
+
+## SPEC-006: V5 Footer Parsing and VectorIndex Lazy Load
+*Added: 2026-04-02*
+
+### V5 Footer Detection
+
+The `readFooter()` method tries V5 (46 bytes) before V4 (34 bytes). Detection strategy:
+
+1. If `fileSize >= FooterV5Size` (46): read 46 bytes from `fileSize-46`.
+   - If `buf[0:2] == FooterV5Version (5)`: parse V5; extract `vectorIndexOffset` and `vectorIndexLen`.
+   - If `buf[12:14] == FooterV4Version (4)`: V4 footer is embedded in the V5 buffer at offset 12; parse V4 without a second I/O.
+   - Otherwise: fall through to separate V4 read.
+2. If `fileSize < FooterV5Size` but `>= FooterV4Size` (34): read 34-byte V4 footer.
+3. If `fileSize < FooterV4Size`: read 22-byte V3 footer.
+
+**Invariant:** For V4 files large enough to trigger the V5 read, V4 is parsed from the same
+I/O buffer — no extra I/O penalty for V4 files. The `TestLeanReader_ThreeIO` test enforces
+the 3-I/O budget.
+
+### VectorIndex Lazy Load
+
+`vectorIndexOffset` and `vectorIndexLen` are parsed from the V5 footer but the section bytes
+are NOT read during `readFooter`. Two lazy accessor methods are provided:
+
+```go
+// VectorIndexRaw reads the raw section bytes. Returns nil for V3/V4 files.
+func (r *Reader) VectorIndexRaw() ([]byte, error)
+
+// VectorIndex returns the parsed VectorIndex. Returns nil, nil for V3/V4 files.
+// Thread-safe: guarded by vectorIndexOnce.
+func (r *Reader) VectorIndex() (*VectorIndex, error)
+```
+
+**Rationale:** The vector index section can be large (codebook ~768KB + PQ codes 96B/vector).
+Loading it eagerly for every file open would inflate memory on readers that never perform
+semantic queries. Lazy loading ensures non-vector query paths pay zero vector I/O cost.
+
+Back-ref: `internal/modules/blockio/reader/parser.go:readFooter`,
+`internal/modules/blockio/reader/reader.go:VectorIndex`,
+`internal/modules/blockio/reader/reader.go:VectorIndexRaw`,
+`internal/modules/blockio/reader/vector_index.go:parseVectorIndexSection`

@@ -1,0 +1,20 @@
+services:
+  embed-server:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-latest
+    ports:
+      - "8765:80"
+    environment:
+      # HuggingFace cache directory inside the container
+      HF_HOME: /data
+    volumes:
+      - tei-models:/data
+    command: --model-id nomic-ai/nomic-embed-text-v1.5 --port 80
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:80/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 120s
+
+volumes:
+  tei-models:

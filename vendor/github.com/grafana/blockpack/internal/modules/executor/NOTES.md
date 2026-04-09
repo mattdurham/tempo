@@ -1887,3 +1887,37 @@ Back-ref: `internal/modules/executor/query_stats.go:QueryStats`,
           `internal/modules/executor/stream.go:Collect`,
           `internal/modules/executor/stream_log_topk.go:CollectLogs`,
           `api.go:QueryStats`, `api.go:StepStats`
+
+---
+
+## NOTE-054: attrVals Scratch-Slice Reuse with clear()
+*Added: 2026-04-08*
+
+**Decision:** `attrVals []string` is allocated once per block (outer loop in
+`ExecuteTraceMetrics` and `ExecuteLogMetrics`) and passed as a scratch parameter to
+`traceAccumulateRow` / `logAccumulateRow`. Each function clears the slice with `clear(attrVals)`
+as its very first statement, before any early-return guards.
+
+**Safety argument:** `strings.Join(attrVals, "\x00")` builds a new string by copying the
+slice contents. The resulting `attrGroupKey` / `compositeKey` string is independent of the
+backing array. Reusing `attrVals` on the next call cannot alias or corrupt previously built
+keys. The `clear` at function entry (not at the group-key build site) eliminates the latent
+hazard where an early return would leave stale values that a future refactor might read before
+the next `clear`.
+
+**Allocation benefit:** Eliminates one `make([]string, N)` allocation per matched row in
+metrics queries — from O(matched-rows) allocs to O(blocks) allocs for the scratch slice.
+For a 200-row single-block query with 1-element GroupBy, this removes 200 allocs/op.
+
+**Related changes in this PR:**
+- `blockOrder` / `blockRefs` in `collectIntrinsicTopKKLL` capped at `min(len(refs), 64)`
+  instead of `len(refs)`. Distinct block count per query is typically far smaller than the
+  total ref count; 64 is a safe upper bound for common block fan-out.
+- `results` in the `block-plain` path: when `opts.Limit == 0` (unlimited), the slice is
+  left nil rather than preallocated to `len(plan.SelectedBlocks)` (block count is not a
+  useful bound for span-level results).
+
+Back-ref: `internal/modules/executor/metrics_trace.go:traceAccumulateRow`,
+          `internal/modules/executor/metrics_log.go:logAccumulateRow`,
+          `internal/modules/executor/stream.go:collectIntrinsicTopKKLL`,
+          `internal/modules/executor/stream.go:Collect` (block-plain path)

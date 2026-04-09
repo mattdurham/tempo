@@ -124,7 +124,7 @@ func collectAllStructuralSpans(
 		return nil, fmt.Errorf("structural FetchBlocks: %w", err)
 	}
 
-	result := make(map[[16]byte][]structuralSpanRec)
+	result := make(map[[16]byte][]structuralSpanRec, len(plan.SelectedBlocks))
 	for _, blockIdx := range plan.SelectedBlocks {
 		raw, ok := rawBlocks[blockIdx]
 		if !ok {
@@ -444,7 +444,7 @@ func applyStructuralOp(spans []structuralSpanRec, op traceqlparser.StructuralOp)
 
 // evalOpDescendantStruct: R is a descendant of L (>>) — walk R's ancestor chain.
 func evalOpDescendantStruct(spans []structuralSpanRec) []int {
-	var result []int
+	result := make([]int, 0, len(spans))
 	for ri, r := range spans {
 		if !r.rightMatch {
 			continue
@@ -463,7 +463,7 @@ func evalOpDescendantStruct(spans []structuralSpanRec) []int {
 
 // evalOpChildStruct: R's direct parent is L (>).
 func evalOpChildStruct(spans []structuralSpanRec) []int {
-	var result []int
+	result := make([]int, 0, len(spans))
 	for ri, r := range spans {
 		if !r.rightMatch || r.parentIdx < 0 {
 			continue
@@ -486,7 +486,7 @@ func evalOpSiblingStruct(spans []structuralSpanRec) []int {
 			leftCounts[sp.parentIdx]++
 		}
 	}
-	var result []int
+	result := make([]int, 0, len(spans))
 	for ri, r := range spans {
 		if !r.rightMatch {
 			continue
@@ -502,7 +502,7 @@ func evalOpSiblingStruct(spans []structuralSpanRec) []int {
 
 // evalOpAncestorStruct: R is an ancestor of L (<<) — walk L's parent chain.
 func evalOpAncestorStruct(spans []structuralSpanRec) []int {
-	var result []int
+	result := make([]int, 0, len(spans))
 	for _, l := range spans {
 		if !l.leftMatch {
 			continue
@@ -520,7 +520,7 @@ func evalOpAncestorStruct(spans []structuralSpanRec) []int {
 
 // evalOpParentStruct: R is the direct parent of L (<).
 func evalOpParentStruct(spans []structuralSpanRec) []int {
-	var result []int
+	result := make([]int, 0, len(spans))
 	for _, l := range spans {
 		if !l.leftMatch || l.parentIdx < 0 {
 			continue
@@ -540,7 +540,7 @@ func evalOpNotSiblingStruct(spans []structuralSpanRec) []int {
 			leftParents[sp.parentIdx] = struct{}{}
 		}
 	}
-	var result []int
+	result := make([]int, 0, len(spans))
 	for ri, r := range spans {
 		if _, hasLeft := leftParents[r.parentIdx]; r.rightMatch && !hasLeft {
 			result = append(result, ri)
@@ -558,7 +558,7 @@ func evalOpNotDescendantStruct(spans []structuralSpanRec) []int {
 			leftSet[i] = struct{}{}
 		}
 	}
-	var result []int
+	result := make([]int, 0, len(spans))
 	for ri, r := range spans {
 		if !r.rightMatch {
 			continue
@@ -582,7 +582,7 @@ func evalOpNotDescendantStruct(spans []structuralSpanRec) []int {
 // SPEC-STRUCT-7: evalOpNotChildStruct: R is rightMatch but its direct parent is NOT leftMatch (!>).
 // R qualifies if it has no parent, or its parent is not leftMatch.
 func evalOpNotChildStruct(spans []structuralSpanRec) []int {
-	var result []int
+	result := make([]int, 0, len(spans))
 	for ri, r := range spans {
 		if !r.rightMatch {
 			continue

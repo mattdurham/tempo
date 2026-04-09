@@ -11,7 +11,6 @@ type SpanMatch struct {
 	Fields  SpanFieldsProvider
 	TraceID string
 	SpanID  string
-	Score   float32 // Vector similarity score (0 = no vector query, >0 = cosine similarity)
 }
 
 // kvField is a name-value pair used in materializedSpanFields.

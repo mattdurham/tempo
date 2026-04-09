@@ -97,29 +97,47 @@ Reviewed during code review. Benchmark regressions (bytes_decoded/op) are a sign
 
 ---
 
-## SPEC-ROOT-004: Preallocate Slices and Maps
+## SPEC-ROOT-004: Preallocate Slices and Maps — Minimize append
 
-**Always preallocate slices and maps when the size or a reasonable upper bound is known.**
+**Always preallocate slices and maps when the size or a reasonable upper bound is known.
+Calling `append` on a nil or under-sized slice in a hot path is a bug to fix, not an
+acceptable default.**
 
 **Rules:**
 
 - Use `make([]T, 0, n)` when appending up to `n` elements; use `make([]T, n)` when
-  filling by index.
+  filling by index. Never start from `var s []T` or `[]T{}` inside a hot loop.
 - Use `make(map[K]V, n)` with a capacity hint whenever the number of entries is
-  predictable.
-- Never use `var s []T` (nil slice) as the starting point for an append loop when
-  a capacity estimate is available.
-- For per-block or per-row scratch slices reused across iterations, prefer pooled
-  buffers (see SPEC-ROOT-005) over repeated allocations.
+  predictable. An unhinted map that will hold hundreds of entries is a bug.
+- **Trace up the call stack before declaring a size "unknown".**  If a function cannot
+  determine the capacity itself, check whether its callers know — the hint can be
+  threaded in as a parameter. Declaring something unbounded without checking ancestors
+  is not acceptable.
+- For maps keyed on a sparse domain (e.g. block indices from a large ref list), cap the
+  hint at a domain-appropriate maximum (e.g. `min(len(refs), 64)`) to avoid
+  pathological over-allocation.
+- For per-block or per-row scratch slices reused across iterations, hoist the allocation
+  outside the inner loop and use `clear()` to reset between iterations rather than
+  re-allocating each time (see NOTE-054 for the safe-reuse pattern with `strings.Join`).
+- Prefer pooled buffers (see SPEC-ROOT-005) for scratch objects with unbounded or
+  highly variable sizes.
 
 **Rationale:**
 
-Unbounded append growth causes repeated reallocations and GC pressure. Preallocating
-eliminates the resize copies and reduces heap churn on hot paths.
+Unbounded `append` growth causes repeated reallocations (growslice) and GC pressure.
+In the executor hot path, eliminating 1 alloc/row across 1800 spans/block removes
+~1800 allocations per query per block. Preallocating also improves cache locality by
+keeping data in contiguous memory from the first write.
+
+The "trace up the call stack" rule exists because function authors often declare a size
+unknown when the caller — or the caller's caller — already holds the bound. Threading a
+`hint int` parameter costs nothing and eliminates allocs.
 
 **Enforcement:**
 
-`make precommit` runs benchmarks; allocation regressions (allocs/op, B/op) surface violations.
+`make precommit` runs benchmarks; `allocs/op` and `B/op` regressions surface violations.
+New allocations on hot paths that have a statically derivable upper bound will be flagged
+in code review.
 
 
 ---

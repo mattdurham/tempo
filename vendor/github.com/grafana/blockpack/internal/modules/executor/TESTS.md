@@ -1498,3 +1498,49 @@ does not panic and returns the correct row count.
 **Assertions:** `len(rows) == 30` (10 * 3); no panic; result is non-nil.
 
 Back-ref: `internal/modules/executor/metrics_log_overflow_test.go:TestLogBuildDenseRows_CapPrealloc`
+
+---
+
+### EX-ROWSET-01: TestRowSetWithCap_ZeroHint
+*Added: 2026-04-08*
+
+**Scenario:** `newRowSetWithCap(0)` falls back to a nil backing slice (same as `newRowSet()`).
+
+**Setup:** Call `newRowSetWithCap(0)`.
+
+**Assertions:**
+- `rs.IsEmpty()` returns true.
+- `cap(rs.rows) == 0` — no backing array allocated.
+
+Back-ref: `internal/modules/executor/rowset_test.go:TestRowSetWithCap_ZeroHint`
+
+---
+
+### EX-ROWSET-02: TestRowSetWithCap_NegativeHint
+*Added: 2026-04-08*
+
+**Scenario:** `newRowSetWithCap(hint)` with `hint < 0` falls back to a nil backing slice.
+
+**Setup:** Call `newRowSetWithCap(-5)`.
+
+**Assertions:**
+- `rs.IsEmpty()` returns true.
+- `cap(rs.rows) == 0` — negative hint is ignored, no backing array allocated.
+
+Back-ref: `internal/modules/executor/rowset_test.go:TestRowSetWithCap_NegativeHint`
+
+---
+
+### EX-ROWSET-03: TestRowSetWithCap_PositiveHint
+*Added: 2026-04-08*
+
+**Scenario:** `newRowSetWithCap(hint)` with `hint > 0` preallocates exactly `hint` capacity.
+
+**Setup:** Call `newRowSetWithCap(10)`.
+
+**Assertions:**
+- `rs.IsEmpty()` returns true.
+- `cap(rs.rows) == 10` — backing array preallocated with requested capacity.
+- Add elements and verify `rs.Size()`, `rs.Contains()` work correctly regardless of hint.
+
+Back-ref: `internal/modules/executor/rowset_test.go:TestRowSetWithCap_PositiveHint`

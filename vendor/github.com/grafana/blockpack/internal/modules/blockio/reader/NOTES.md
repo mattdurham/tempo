@@ -304,3 +304,25 @@ SKTD (`0x534B5444`) files are still readable by `parseSketchIndexSection` via th
 - `internal/modules/blockio/reader/sketch_index.go:skipColumnCMS`
 - `internal/modules/blockio/reader/sketch_index.go:parseSketchIndexSection`
 - `internal/modules/blockio/shared/constants.go:fileSketchSummaryMagic`
+
+---
+
+## NOTE-011: V5 Footer Detection and VectorIndex Lazy Load (2026-04-02)
+*Added: 2026-04-02*
+
+**Decision:** The `readFooter()` method attempts V5 (46 bytes) detection before V4 (34 bytes).
+If `fileSize >= 46`, it reads a single 46-byte buffer from `fileSize-46`. The first two bytes
+determine the version:
+- `buf[0:2] == 5 (FooterV5Version)`: parse V5; extract `vectorIndexOffset` and `vectorIndexLen`.
+- `buf[12:14] == 4 (FooterV4Version)`: V4 footer is embedded at offset 12 of the V5 buffer; parse V4 from that slice with no extra I/O.
+
+`VectorIndex()` and `VectorIndexRaw()` are lazy: `vectorIndexOffset`/`vectorIndexLen` are stored at footer-parse time but the section bytes are NOT fetched. The section is read on first call to `VectorIndex()` or `VectorIndexRaw()`, guarded by `vectorIndexOnce`. For V3/V4 files, both methods return `nil, nil` immediately.
+
+**Rationale:** The vector index section can be large (codebook ≈ 768 KB for 768-dim PQ + PQ codes 96 bytes/vector). Eager loading for every file open would inflate memory on readers that never issue semantic queries. Lazy loading ensures non-vector query paths pay zero vector I/O cost. The single-buffer V5/V4 detection preserves the 3-I/O budget (`TestLeanReader_ThreeIO`) — V4 files large enough to trigger the V5 read pay no extra I/O penalty.
+
+**Consequence:** Writers with `VectorDimension > 0` emit a V5 footer. Writers with `VectorDimension == 0` continue to emit V4 footers with no behavioral change.
+
+Back-ref: `internal/modules/blockio/reader/parser.go:readFooter`,
+`internal/modules/blockio/reader/reader.go:VectorIndex`,
+`internal/modules/blockio/reader/reader.go:VectorIndexRaw`,
+`internal/modules/blockio/reader/vector_index.go:parseVectorIndexSection`

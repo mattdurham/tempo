@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/grafana/blockpack"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/grafana/tempo/pkg/tempopb"
 	tempocommon "github.com/grafana/tempo/pkg/tempopb/common/v1"
 	temporesource "github.com/grafana/tempo/pkg/tempopb/resource/v1"
@@ -98,9 +99,10 @@ func getFileCache() *blockpack.FileCache {
 			return
 		}
 		c, err := blockpack.OpenFileCache(blockpack.FileCacheConfig{
-			Enabled:  true,
-			Path:     path,
-			MaxBytes: maxBytes,
+			Enabled:    true,
+			Path:       path,
+			MaxBytes:   maxBytes,
+			Registerer: prometheus.DefaultRegisterer,
 		})
 		if err != nil {
 			return

@@ -1,3 +1,7 @@
+# Model files (downloaded by make download-model)
+models/
+/embed-server
+
 # Test data files
 cmd/temposerver/testdata/*.blockpack
 *.pb

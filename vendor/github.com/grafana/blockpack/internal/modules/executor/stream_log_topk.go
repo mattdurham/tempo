@@ -345,9 +345,9 @@ func iterateLogRows(
 		}
 	}
 
-	fetched := make(map[int][]byte)
-	fetchedGroupsSeen := make(map[int]bool)
-	skippedBlocks := make(map[int]bool)
+	fetched := make(map[int][]byte, len(plan.SelectedBlocks))
+	fetchedGroupsSeen := make(map[int]bool, len(groups))
+	skippedBlocks := make(map[int]bool, len(plan.SelectedBlocks))
 	fetchedGroups := 0
 	fetchCount := 0
 	var bytesRead int64

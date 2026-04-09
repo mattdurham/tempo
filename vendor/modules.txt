@@ -294,7 +294,7 @@ github.com/bboreham/go-loser
 # github.com/beorn7/perks v1.0.1
 ## explicit; go 1.11
 github.com/beorn7/perks/quantile
-# github.com/buger/jsonparser v1.1.1
+# github.com/buger/jsonparser v1.1.2
 ## explicit; go 1.13
 github.com/buger/jsonparser
 # github.com/bytedance/gopkg v0.1.3
@@ -342,9 +342,6 @@ github.com/bytedance/sonic/loader/internal/abi
 github.com/bytedance/sonic/loader/internal/iasm/expr
 github.com/bytedance/sonic/loader/internal/iasm/x86_64
 github.com/bytedance/sonic/loader/internal/rt
-# github.com/chewxy/math32 v1.10.1
-## explicit; go 1.19
-github.com/chewxy/math32
 # github.com/cenkalti/backoff/v4 v4.3.0
 ## explicit; go 1.18
 github.com/cenkalti/backoff/v4
@@ -354,6 +351,9 @@ github.com/cenkalti/backoff/v5
 # github.com/cespare/xxhash/v2 v2.3.0
 ## explicit; go 1.11
 github.com/cespare/xxhash/v2
+# github.com/chewxy/math32 v1.10.1
+## explicit; go 1.13
+github.com/chewxy/math32
 # github.com/clipperhouse/displaywidth v0.6.2
 ## explicit; go 1.18
 github.com/clipperhouse/displaywidth
@@ -435,12 +435,13 @@ github.com/eapache/go-xerial-snappy
 # github.com/eapache/queue v1.1.0
 ## explicit
 github.com/eapache/queue
-# github.com/ebitengine/purego v0.9.1
+# github.com/ebitengine/purego v0.10.0
 ## explicit; go 1.18
 github.com/ebitengine/purego
 github.com/ebitengine/purego/internal/cgo
 github.com/ebitengine/purego/internal/fakecgo
 github.com/ebitengine/purego/internal/strings
+github.com/ebitengine/purego/internal/xreflect
 # github.com/edsrzf/mmap-go v1.2.0
 ## explicit; go 1.17
 github.com/edsrzf/mmap-go
@@ -730,7 +731,7 @@ github.com/googleapis/gax-go/v2/iterator
 # github.com/gorilla/mux v1.8.1
 ## explicit; go 1.20
 github.com/gorilla/mux
-# github.com/grafana/blockpack v0.0.0-20260325000002-651d57fe
+# github.com/grafana/blockpack v0.0.0-20260325000002-651d57fe => /Users/mdurham/source/blockpack
 ## explicit; go 1.26.0
 github.com/grafana/blockpack
 github.com/grafana/blockpack/internal/logqlparser
@@ -739,17 +740,20 @@ github.com/grafana/blockpack/internal/modules/blockio/compaction
 github.com/grafana/blockpack/internal/modules/blockio/reader
 github.com/grafana/blockpack/internal/modules/blockio/shared
 github.com/grafana/blockpack/internal/modules/blockio/writer
+github.com/grafana/blockpack/internal/modules/chaincache
 github.com/grafana/blockpack/internal/modules/embedder
 github.com/grafana/blockpack/internal/modules/executor
 github.com/grafana/blockpack/internal/modules/filecache
+github.com/grafana/blockpack/internal/modules/memcache
+github.com/grafana/blockpack/internal/modules/memorycache
 github.com/grafana/blockpack/internal/modules/objectcache
 github.com/grafana/blockpack/internal/modules/queryplanner
 github.com/grafana/blockpack/internal/modules/rw
 github.com/grafana/blockpack/internal/modules/sketch
+github.com/grafana/blockpack/internal/modules/vectormath
 github.com/grafana/blockpack/internal/otlpconvert
 github.com/grafana/blockpack/internal/s3provider
 github.com/grafana/blockpack/internal/traceqlparser
-github.com/grafana/blockpack/internal/modules/vectormath
 github.com/grafana/blockpack/internal/vm
 # github.com/grafana/dskit v0.0.0-20251031165806-a6f15387939b
 ## explicit; go 1.24.0
@@ -874,6 +878,11 @@ github.com/hashicorp/memberlist
 # github.com/hashicorp/serf v0.10.2
 ## explicit; go 1.19
 github.com/hashicorp/serf/coordinate
+# github.com/hybridgroup/yzma v1.11.1
+## explicit; go 1.25.0
+github.com/hybridgroup/yzma/pkg/llama
+github.com/hybridgroup/yzma/pkg/loader
+github.com/hybridgroup/yzma/pkg/utils
 # github.com/iancoleman/strcase v0.3.0
 ## explicit; go 1.16
 github.com/iancoleman/strcase
@@ -955,6 +964,9 @@ github.com/jsternberg/zap-logfmt
 # github.com/julienschmidt/httprouter v1.3.0
 ## explicit; go 1.7
 github.com/julienschmidt/httprouter
+# github.com/jupiterrider/ffi v0.6.0
+## explicit; go 1.18
+github.com/jupiterrider/ffi
 # github.com/kamstrup/intmap v0.5.2
 ## explicit; go 1.23
 github.com/kamstrup/intmap
@@ -1625,7 +1637,7 @@ github.com/uber/jaeger-client-go/utils
 github.com/uber/jaeger-lib/metrics
 github.com/uber/jaeger-lib/metrics/prometheus
 # github.com/viterin/partial v1.1.0
-## explicit; go 1.18
+## explicit; go 1.19
 github.com/viterin/partial
 # github.com/viterin/vek v0.4.3
 ## explicit; go 1.19
@@ -1665,12 +1677,6 @@ github.com/yusufpapurcu/wmi
 # github.com/zeebo/xxh3 v1.1.0
 ## explicit; go 1.22
 github.com/zeebo/xxh3
-# go.etcd.io/bbolt v1.4.3
-## explicit; go 1.23
-go.etcd.io/bbolt
-go.etcd.io/bbolt/errors
-go.etcd.io/bbolt/internal/common
-go.etcd.io/bbolt/internal/freelist
 # go.etcd.io/etcd/api/v3 v3.5.12
 ## explicit; go 1.20
 go.etcd.io/etcd/api/v3/authpb
@@ -2215,8 +2221,8 @@ golang.org/x/crypto/md4
 golang.org/x/crypto/pbkdf2
 golang.org/x/crypto/pkcs12
 golang.org/x/crypto/pkcs12/internal/rc2
-# golang.org/x/exp v0.0.0-20260112195511-716be5621a96
-## explicit; go 1.24.0
+# golang.org/x/exp v0.0.0-20260218203240-3dfff04db8fa
+## explicit; go 1.25.0
 golang.org/x/exp/constraints
 golang.org/x/exp/maps
 golang.org/x/exp/rand
@@ -2390,7 +2396,7 @@ google.golang.org/genproto/googleapis/api/monitoredres
 google.golang.org/genproto/googleapis/rpc/code
 google.golang.org/genproto/googleapis/rpc/errdetails
 google.golang.org/genproto/googleapis/rpc/status
-# google.golang.org/grpc v1.79.1
+# google.golang.org/grpc v1.79.3
 ## explicit; go 1.24.0
 google.golang.org/grpc
 google.golang.org/grpc/attributes
@@ -2622,3 +2628,4 @@ k8s.io/utils/clock
 # k8s.io/api => k8s.io/api v0.35.1
 # k8s.io/client-go => k8s.io/client-go v0.35.1
 # github.com/hashicorp/memberlist => github.com/grafana/memberlist v0.3.1-0.20251024160842-5cd332c2849a
+# github.com/grafana/blockpack => /Users/mdurham/source/blockpack

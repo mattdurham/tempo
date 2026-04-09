@@ -13,6 +13,15 @@ type rowSet struct {
 
 func newRowSet() *rowSet { return &rowSet{} }
 
+// newRowSetWithCap returns a rowSet with a pre-allocated backing slice of capacity hint.
+// If hint <= 0, the backing slice is not allocated (same as newRowSet).
+func newRowSetWithCap(hint int) *rowSet {
+	if hint <= 0 {
+		return &rowSet{}
+	}
+	return &rowSet{rows: make([]int, 0, hint)}
+}
+
 // Add appends rowIdx. Callers must add indices in ascending order.
 func (r *rowSet) Add(rowIdx int) {
 	r.rows = append(r.rows, rowIdx)

@@ -135,8 +135,10 @@ func ExecuteTraceMetrics(
 
 		result.BlocksScanned++
 
+		groupBy := querySpec.Aggregate.GroupBy
+		attrVals := make([]string, len(groupBy)) // NOTE-054: per-block scratch; cleared at top of traceAccumulateRow
 		for _, rowIdx := range rowSet.ToSlice() {
-			traceAccumulateRow(r, blockIdx, bwb.Block, rowIdx, querySpec, buckets)
+			traceAccumulateRow(r, blockIdx, bwb.Block, rowIdx, querySpec, buckets, attrVals)
 		}
 	}
 
@@ -151,6 +153,7 @@ func ExecuteTraceMetrics(
 }
 
 // traceAccumulateRow accumulates one span's contribution into the buckets map.
+// attrVals is a scratch slice of len(querySpec.Aggregate.GroupBy) reused across calls.
 func traceAccumulateRow(
 	r *modules_reader.Reader,
 	blockIdx int,
@@ -158,7 +161,12 @@ func traceAccumulateRow(
 	rowIdx int,
 	querySpec *vm.QuerySpec,
 	buckets map[string]*aggBucketState,
+	attrVals []string,
 ) {
+	// NOTE-054: clear attrVals at function entry so stale values from prior rows never
+	// survive an early return. strings.Join copies the joined string before reuse is safe.
+	clear(attrVals)
+
 	tb := querySpec.TimeBucketing
 	if !tb.Enabled || tb.StepSizeNanos <= 0 {
 		return
@@ -197,7 +205,6 @@ func traceAccumulateRow(
 
 	// Build group key from GroupBy attributes (SPEC-ETM-8).
 	groupBy := querySpec.Aggregate.GroupBy
-	attrVals := make([]string, len(groupBy))
 	for i, attr := range groupBy {
 		col := block.GetColumn(attr)
 		if col != nil {

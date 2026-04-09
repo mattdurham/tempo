@@ -669,7 +669,7 @@ func intrinsicDictMatches(col *modules_shared.IntrinsicColumn, leaf vm.RangeNode
 		if err != nil {
 			return nil // invalid regex — skip pruning
 		}
-		blockSet := make(map[int]struct{})
+		blockSet := make(map[int]struct{}, len(col.DictEntries))
 		for _, entry := range col.DictEntries {
 			// Dict entries use Value=="" to signal int64 type (wire format stores int64
 			// with vLen=0; the encoder writes vLen>0 even for empty strings in string
@@ -715,7 +715,7 @@ func intrinsicDictMatches(col *modules_shared.IntrinsicColumn, leaf vm.RangeNode
 		}
 	}
 
-	blockSet := make(map[int]struct{})
+	blockSet := make(map[int]struct{}, len(col.DictEntries))
 	for _, entry := range col.DictEntries {
 		var match bool
 		// Dict entries use Value=="" to signal int64 type (wire format stores int64 with vLen=0).
@@ -760,7 +760,7 @@ func intrinsicFlatMatches(col *modules_shared.IntrinsicColumn, leaf vm.RangeNode
 	switch {
 	case len(leaf.Values) > 0:
 		// Equality: treat each value as both lo and hi (exact match).
-		blockSet := make(map[int]struct{})
+		blockSet := make(map[int]struct{}, len(leaf.Values))
 		for _, v := range leaf.Values {
 			target, ok := valueToUint64(v)
 			if !ok {
@@ -1728,7 +1728,11 @@ func intersectBlockRefSets(sets [][]modules_shared.BlockRef, limit int) []module
 		lookups[i] = m
 	}
 
-	var result []modules_shared.BlockRef
+	resCap := len(sets[0])
+	if limit > 0 && limit < resCap {
+		resCap = limit
+	}
+	result := make([]modules_shared.BlockRef, 0, resCap)
 	for _, ref := range sets[0] {
 		k := refKey{ref.BlockIdx, ref.RowIdx}
 		inAll := true

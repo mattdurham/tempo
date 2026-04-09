@@ -113,3 +113,104 @@ No CMS bytes are written. Legacy SKTC/SKTD readers skip CMS bytes zero-alloc via
 - `internal/modules/blockio/writer/sketch_index.go:writeSketchIndexSection`
 - `internal/modules/blockio/writer/sketch_index.go:sketchSectionMagic` (0x534B5445 = SKTE)
 - `internal/modules/blockio/writer/writer_log.go:blockSketchSet`
+
+---
+
+## NOTE-004: Parallel Block Building — Inter-Block Concurrency via errgroup + sync.Pool
+*Added: 2026-04-02*
+
+**Decision:** `flushBlocks()` and `flushLogBlocks()` build blocks concurrently using
+`errgroup.Group` limited to `runtime.NumCPU()` goroutines. Each goroutine draws a
+`*blockBuilder` from a `sync.Pool` (`bbPool`) and a `*zstdEncoder` from `encPool`, builds
+one block, and returns both to their respective pools. After all goroutines complete, a serial
+pass writes payloads and updates `blockMetas`, `rangeIdx`, `sketchIdx`, and `traceIndex` in
+block-ID order.
+
+For trace blocks, each goroutine receives its own `*intrinsicAccumulator` (`localAccum`).
+After the parallel phase, `localAccum` values are merged into `w.intrinsicAccum` via the
+new `merge()` method in block-ID order. No sorting is performed at merge time; sorting
+happens later in `encodeColumn`. Log blocks have no `intrinsicAccum`, so the merge step
+is absent from `flushLogBlocks`.
+
+**Rationale:** Block building (OTLP→column decode, dict/delta/XOR encoding, zstd compress)
+is CPU-bound and has no shared mutable state within a block. Blockpack block writing was
+2.7× slower than parquet in benchmarks; parquet achieves speed by building multiple
+row-groups concurrently. This change applies the same approach.
+
+**Consequence:**
+- The Writer remains NOT thread-safe from the caller's perspective (the `inUse` guard is
+  unchanged). Concurrency is internal to `flushBlocks`.
+- The `bb *blockBuilder` field and `enc *zstdEncoder` field are replaced by `bbPool` and
+  `encPool` (`sync.Pool`). The builder-cache optimization (reusing column builders across
+  blocks) is preserved: builders are returned to the pool with their `builderCache` intact,
+  so the next goroutine that checks out the builder reuses cached column builders from prior
+  blocks. `zstdEncoder` is NOT goroutine-safe (its `buf []byte` is mutated by `compress()`),
+  so each goroutine must use its own encoder from the pool.
+- Block IDs are pre-assigned before the parallel phase using the formula
+  `baseID + i` where `baseID = len(w.blockMetas)`. This ensures deterministic block
+  ordering even when goroutines finish out-of-order.
+- `buildAndWriteBlock` and `buildAndWriteLogBlock` are removed; their logic is inlined
+  into `flushBlocks` and `flushLogBlocks` respectively.
+- `blockBuilder.reset()` allocates fresh maps for `traceRows` and `colMinMax` rather than
+  clearing in-place. This breaks the aliasing between `builtBlock` map fields and the
+  pooled builder, preventing pool reuse from corrupting prior results.
+
+**Back-ref:** `internal/modules/blockio/writer/writer.go:flushBlocks`,
+`internal/modules/blockio/writer/writer.go:flushLogBlocks`,
+`internal/modules/blockio/writer/intrinsic_accum.go:merge`
+
+---
+
+## NOTE-005: vectorAccumulator Pattern — Accumulate-at-Build, Serialize-at-Flush (2026-04-02)
+*Added: 2026-04-02*
+
+**Decision:** The `vectorAccumulator` field in the `Writer` follows the same accumulate-at-block,
+serialize-at-flush pattern as `sketchIdx` and `fileBloomSvcNames`. `accumulateBlock` is called
+in the `flushBlocks` serial merge pass (after the parallel build phase) using vectors extracted
+from `builtBlock.blockVectors`; `build()` is called once in `Flush()` to train the PQ codebook
+and produce the serialized section bytes. The vector section is written AFTER the intrinsic
+section and BEFORE the footer.
+
+**Rationale:** PQ training requires all vectors to be present (reservoir sampling over the full
+file). Training per-block would produce per-block codebooks, making cross-block ADC comparison
+impossible. Accumulating all vectors and training once at flush time is the only option that
+supports asymmetric distance computation (ADC) across blocks.
+
+**Consequence:** Writers with `VectorDimension > 0` emit a V5 footer instead of V4.
+V4 readers encountering a V5 footer: the V5 footer is 46 bytes and V4 is 34 bytes; the V5
+detection code in the reader tries V5 first, so this is handled gracefully.
+Writers with `VectorDimension == 0` (or no vectors added) continue to emit V4 footers —
+no behavioral change for non-vector workflows.
+
+**Back-ref:** `internal/modules/blockio/writer/vector_index.go:vectorAccumulator`,
+`internal/modules/blockio/writer/vector_index.go:serializeVectorIndexSection`,
+`internal/modules/blockio/writer/writer.go:Flush`,
+`internal/modules/blockio/writer/writer_block.go:builtBlock`
+
+---
+
+## NOTE-006: Per-Block Vector Storage and Dimension Validation (2026-04-02)
+*Added: 2026-04-02*
+
+**Decision:** `vectorBlockEntry` now carries `vectors [][]float32` for per-block raw vector
+storage. `build()` encodes each block's vectors immediately after training, then clears
+`entry.vectors` to free memory. The `allVectors` field (formerly holding all file vectors
+in one slice) has been removed. Additionally, `accumulateBlock` validates incoming vector
+dimension against `a.dim` and skips mismatched blocks.
+
+**Rationale:**
+1. **Memory safety:** The old `allVectors` field accumulated all file vectors simultaneously.
+   For a 1M-span file at dim=768, this required ~3 GiB peak RSS at flush time, making the
+   feature unusable in production. Per-block storage allows each block's vectors to be freed
+   immediately after encoding, capping peak RSS to `max_block_vectors × dim × 4` bytes.
+2. **Panic prevention:** Mixed-dimension vectors in `allVectors` caused a SIMD panic in
+   `vectormath.Mean` and `extractSubvecs` when subsequent blocks had different dimensions.
+   Dimension validation at `accumulateBlock` entry prevents this.
+
+**Consequence:** Per-block `vectors` fields are `nil` after `build()` returns. Code that
+inspects `vectorBlockEntry.vectors` after flush will see nil slices — this is intentional.
+Skipping dimension-mismatched blocks produces a codebook trained only on the valid vectors;
+no error is returned (consistent with the writer's non-panicking contract).
+
+**Back-ref:** `internal/modules/blockio/writer/vector_index.go:accumulateBlock`,
+`internal/modules/blockio/writer/vector_index.go:build`
