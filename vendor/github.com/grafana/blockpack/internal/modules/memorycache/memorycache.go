@@ -19,13 +19,12 @@ import (
 
 // Config configures a MemoryCache.
 type Config struct {
-	// MaxBytes is the maximum total bytes the cache may hold.
-	// Required and must be positive.
-	MaxBytes int64
-
 	// Registerer is an optional Prometheus registerer.
 	// When non-nil, cache metrics are registered and incremented.
 	Registerer prometheus.Registerer
+	// MaxBytes is the maximum total bytes the cache may hold.
+	// Required and must be positive.
+	MaxBytes int64
 }
 
 // entry is one record in the LRU list.
@@ -42,12 +41,12 @@ type MemoryCache struct {
 	group     singleflight.Group
 	index     map[string]*list.Element
 	lru       *list.List // back = MRU, front = LRU
-	mu        sync.Mutex
-	maxBytes  int64
-	curBytes  int64
 	requests  *prometheus.CounterVec
 	bytes     *prometheus.CounterVec
 	evictions *prometheus.CounterVec
+	maxBytes  int64
+	curBytes  int64
+	mu        sync.Mutex
 }
 
 // New creates a MemoryCache with the given byte capacity.

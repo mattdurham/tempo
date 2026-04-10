@@ -65,8 +65,7 @@ func (p *blockColumnProvider) nilIntrinsicScan(name string, cb vm.RowCallback) (
 // the AND intersection with user-attr predicates does not short-circuit to empty;
 // filterRowSetByIntrinsicNodes applies the actual value filtering afterwards.
 func isIntrinsicColumn(name string) bool {
-	_, ok := traceIntrinsicColumns[name]
-	return ok
+	return modules_shared.IsIntrinsicColumn(name)
 }
 
 // GetRowCount returns the total row count (spans for traces, records for logs).

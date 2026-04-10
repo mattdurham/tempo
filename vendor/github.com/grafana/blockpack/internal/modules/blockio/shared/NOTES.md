@@ -150,6 +150,64 @@ Back-ref: `internal/modules/blockio/shared/intrinsic_codec.go:ScanFlatColumnRefs
 
 ---
 
+## 10. NOTE-010: V14 Format Constants — Why These Values (2026-04-10)
+*Added: 2026-04-10*
+
+**Decision:** Added `VersionBlockV14=14`, `VersionBlockEncV3=3`, `FooterV7Version=7`,
+`FooterV7Size=18`, six `Section*` byte constants, and `DirEntryKindType`/`DirEntryKindName`
+to `constants.go`. Added `DirEntryType`, `DirEntryName`, and `SectionDirectory` structs
+to `types.go`.
+
+**Version 7 rationale:** The agentic branch uses `FooterV5Version=5` (46-byte vector footer)
+and `FooterV6Version=6` (58-byte compact-traces footer). To avoid the version number collision,
+our V14 section-directory footer uses version 7.
+
+**Why V14:** The previous on-disk format (V12/V13, footer V3/V4) embedded all per-column
+zstd compression inside each column blob and bundled all file-level metadata (block index,
+range index, trace index, TS index, sketch, file bloom) into a single snappy-compressed
+blob. To check a bloom filter, the reader had to decompress the entire metadata section
+(potentially hundreds of MB). V14 makes each section independently addressable by storing
+each as its own snappy-compressed blob with a pointer in the section directory. It also
+moves compression responsibility to the column boundary (one snappy blob per column at the
+block level) and removes all internal zstd sub-segments from encoding types.
+
+**Why FooterV7Size=18:** `magic[4]+version[2]=7+dir_offset[8]+dir_len[4]` = 18 bytes. The
+footer is small and fixed-size — readers always know where to find it (last 18 bytes of
+file). `dir_len` is uint32 because the section directory (≤504 raw bytes) is small; uint32
+provides ample headroom.
+
+**Why 6 section types (0x01–0x06), not 7:** File-level intrinsic columns are name-keyed,
+not a single type-keyed section. The original design had `SectionIntrinsic=0x07` as a
+monolithic section containing all intrinsic column blobs, which would have required two
+I/Os to access any column: (1) read TOC blob → find column offset, (2) read column blob.
+The name-keyed entry design eliminates this indirection: each intrinsic column blob has its
+own `DirEntryName` in the section directory, enabling direct addressing in one I/O after
+reading the directory. Values 0x07+ remain reserved for future type-keyed sections.
+
+**Why two entry kinds (DirEntryKindType=0x00, DirEntryKindName=0x01):** The section
+directory must serve two structurally different needs: fixed enum-addressed sections (6
+total, stable across files) and dynamically-named columns (variable count, file-specific).
+A single fixed-size entry format cannot serve both without wasting bytes on name encoding
+for type-keyed entries or truncating names for name-keyed entries. The kind byte at the
+start of each entry allows parsers to dispatch to the correct unmarshal path.
+
+**Alternatives considered:**
+- *Keep single metadata blob*: Rejected — violates the requirement that each section must
+  be independently readable without decompressing unrelated sections.
+- *SectionIntrinsic as type-keyed (0x07) containing all intrinsic columns*: Rejected —
+  requires two I/Os to access any intrinsic column (TOC read + column read). Name-keyed
+  entries give direct per-column addressing.
+- *Store section directory at fixed offset 0*: Rejected — blocks at offset 0 means no fixed
+  structure before end-of-file; the footer-pointer pattern is consistent with V3/V4.
+
+**How to apply:** These constants are the sole definition of V14 wire format values. All
+writer and reader code must reference them rather than hardcoding numeric literals.
+
+Back-ref: `internal/modules/blockio/shared/constants.go`,
+`internal/modules/blockio/shared/types.go:DirEntryType`, `types.go:DirEntryName`
+
+---
+
 ## 9. NOTE-009: BUG-13 Fix — Validate blockW/rowW Are 1 or 2 in Flat-Column Scan (2026-04-01)
 *Added: 2026-04-01*
 
@@ -174,8 +232,8 @@ Back-ref: `internal/modules/blockio/shared/intrinsic_codec.go:decodeVariableWidt
 *Added: 2026-04-02*
 
 **Decision:** Added `ColumnTypeVectorF32 ColumnType = 13` to the ColumnType enum, along with
-`VectorIndexMagic`, `VectorIndexVersion`, `FooterV5Version`, `FooterV5Size`, `EmbeddingColumnName`,
-and `EmbeddingTextColumnName` constants.
+`VectorIndexMagic`, `VectorIndexVersion`, `FooterV5Version` (46-byte vector footer),
+`FooterV5Size`, `EmbeddingColumnName`, and `EmbeddingTextColumnName` constants.
 
 **Rationale:** Value 13 is the first reserved slot after UUID (12); adding it here does not
 reorder or remove any existing constants. Float32 vectors for semantic embeddings are a new

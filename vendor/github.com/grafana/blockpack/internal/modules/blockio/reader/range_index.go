@@ -24,13 +24,13 @@ type rangeEntry struct {
 // bucketMin and bucketMax hold the global min/max across all blocks for the column
 // (stored in the wire format bucket metadata). For RangeString/RangeBytes they are 0.
 type parsedRangeIndex struct {
-	entries       []rangeEntry
-	float64Bounds []float64 // decoded for RangeFloat64; nil otherwise
-	stringBounds  []string  // decoded for RangeString; nil otherwise
-	bytesBounds   [][]byte  // decoded for RangeBytes; nil otherwise
-	bucketMin     int64     // global min as int64 bits; 0 for String/Bytes
-	bucketMax     int64     // global max as int64 bits; 0 for String/Bytes
-	colType       shared.ColumnType
+	entries          []rangeEntry
+	float64BoundsRaw []byte   // NOTE-PERF-RANGE: zero-copy sub-slice of metadataBytes; decoded on demand in RangeColumnBoundaries
+	stringBounds     []string // decoded for RangeString; nil otherwise
+	bytesBounds      [][]byte // decoded for RangeBytes; nil otherwise
+	bucketMin        int64    // global min as int64 bits; 0 for String/Bytes
+	bucketMax        int64    // global max as int64 bits; 0 for String/Bytes
+	colType          shared.ColumnType
 }
 
 // ensureRangeColumnParsed parses the range index for colName if not already done.
@@ -38,6 +38,11 @@ type parsedRangeIndex struct {
 func (r *Reader) ensureRangeColumnParsed(colName string) error {
 	if _, ok := r.rangeParsed[colName]; ok {
 		return nil
+	}
+
+	// For V14 files, the range section bytes are loaded lazily on first access.
+	if err := r.ensureV14RangeSection(); err != nil {
+		return err
 	}
 
 	meta, ok := r.rangeOffsets[colName]
@@ -190,12 +195,9 @@ func parseTypedBoundaries(
 		if pos+need > len(data) {
 			return pos, fmt.Errorf("typed boundaries(float64): need %d bytes at pos %d", need, pos)
 		}
-		bounds := make([]float64, count)
-		for i := range count {
-			bits := binary.LittleEndian.Uint64(data[pos+i*8:])
-			bounds[i] = math.Float64frombits(bits)
-		}
-		idx.float64Bounds = bounds
+		// NOTE-PERF-RANGE: store a zero-copy sub-slice rather than decoding to []float64.
+		// Decoded on demand in RangeColumnBoundaries only when a caller requests boundaries.
+		idx.float64BoundsRaw = data[pos : pos+need]
 		return pos + need, nil
 
 	case shared.ColumnTypeRangeString:

@@ -214,3 +214,53 @@ no error is returned (consistent with the writer's non-panicking contract).
 
 **Back-ref:** `internal/modules/blockio/writer/vector_index.go:accumulateBlock`,
 `internal/modules/blockio/writer/vector_index.go:build`
+
+---
+
+## NOTE-007: V14 Writer Redesign — zstd Removal, Per-Column Snappy, Sectioned Metadata (2026-04-10)
+*Added: 2026-04-10*
+
+**Decision:** Redesign the write path for V14 format:
+1. Remove all internal zstd compression from encoding types (dict, delta, XOR, prefix, delta-dict).
+2. Apply one outer `snappy.Encode` per column blob at the block level, immediately after `buildData()`.
+3. Replace the single snappy-compressed metadata blob with 6 type-keyed independently-compressed
+   sections (block index, range index, trace index, TS index, sketch, file bloom) plus one
+   name-keyed section directory entry per file-level intrinsic column blob.
+4. Write a new V7 footer (18 bytes: magic+version[=7]+dir_offset+dir_len). Version 7 avoids
+   collision with agentic's V5 (46-byte vector footer) and V6 (58-byte compact-traces footer).
+5. Remove `encPool sync.Pool` and the `zstdEncoder` type entirely.
+
+**Why remove zstd from encoding internals:**
+The original design applied zstd inside each encoding type (e.g. `dict_zstd[4+N]` for the
+dictionary payload). This created two levels of compression: zstd inside the raw blob, then
+the entire column payload was conceptually uncompressed at the block level. The inner zstd
+provided good compression ratios but:
+- Required pooled `*zstd.Encoder` instances (concurrency complexity).
+- Made it impossible to snappy-wrap the whole column as a single unit, since zstd's framing
+  is already embedded inside.
+- Prevented the reader from knowing `uncompressed_len` without decompressing.
+
+In V14, each encoding type writes raw bytes (no zstd). A single `snappy.Encode(rawBlob)` at
+the block level wraps the entire column in one compressed unit. Snappy is faster than zstd
+and sufficient for the column-level wrapper since the encoding itself (delta, dict, XOR, prefix)
+already reduces redundancy before snappy sees it.
+
+**Why sectioned metadata:**
+The V12/V13 metadata blob bundled all file-level indexes into one snappy-compressed region.
+To check a file-level bloom filter, the reader had to decompress and parse the entire blob
+(hundreds of MB for large files with many distinct values). SPEC-ROOT-013 and SPEC-ROOT-014
+require each independently-used data structure to be independently readable. With 6 type-keyed
+sections plus name-keyed intrinsic column entries, a bloom check costs one `ReadAt` +
+one `snappy.Decode` of only the bloom section bytes, and any intrinsic column is directly
+addressable from the section directory without a separate TOC read.
+
+**encPool removal:**
+`encPool` was a `sync.Pool` of `*zstdEncoder` objects — one per goroutine in the parallel
+block build phase. Removing zstd from encoding types eliminates the need for per-goroutine
+encoders entirely. Block builders in V14 call `snappy.Encode(nil, rawBlob)` inline, which
+is stateless and goroutine-safe. No pool is needed.
+
+Back-ref: `internal/modules/blockio/writer/column_builder.go` (zstdEncoder removed),
+`internal/modules/blockio/writer/writer_block.go` (outer snappy per column),
+`internal/modules/blockio/writer/metadata.go:writeFooterV7`,
+`internal/modules/blockio/writer/writer.go:flushBlocks` (encPool removed)

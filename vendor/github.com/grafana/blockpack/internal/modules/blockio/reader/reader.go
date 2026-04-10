@@ -10,6 +10,7 @@ import (
 	"sort"
 	"sync"
 
+	"github.com/golang/snappy"
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
 	"github.com/grafana/blockpack/internal/modules/filecache"
 	"github.com/grafana/blockpack/internal/modules/queryplanner"
@@ -35,9 +36,11 @@ type footerRaw struct {
 // they can be fetched lazily — only when the bloom filter reports a hit. This keeps the eager read
 // at ~15 MB (bloom + block table) instead of ~700 MB (full compact section).
 type compactTraceIndex struct {
-	traceIndexRaw []byte // raw trace-index bytes; scanned in-place by scanTraceIndexRaw
-	blockTable    []compactBlockEntry
-	traceIDBloom  []byte // nil for version-1 compact indexes (no bloom); vacuous true on lookup
+	// traceIndexFetchErr holds any error from the lazy fetch so callers can surface it.
+	traceIndexFetchErr error
+	traceIndexRaw      []byte // raw trace-index bytes; scanned in-place by scanTraceIndexRaw
+	blockTable         []compactBlockEntry
+	traceIDBloom       []byte // nil for version-1 compact indexes (no bloom); vacuous true on lookup
 
 	// traceIndexOffset and traceIndexLen locate the trace-index bytes within the file.
 	// Used by ensureTraceIndexRaw to lazily fetch them on first bloom hit.
@@ -47,8 +50,6 @@ type compactTraceIndex struct {
 
 	// traceIndexOnce guards the lazy fetch of traceIndexRaw.
 	traceIndexOnce sync.Once
-	// traceIndexFetchErr holds any error from the lazy fetch so callers can surface it.
-	traceIndexFetchErr error
 }
 
 // Reader reads and decodes a blockpack file.
@@ -59,6 +60,18 @@ type Reader struct {
 	// cache is the cache used for footer/header/metadata/block reads.
 	// Never nil: defaults to filecache.NopCache when no cache is configured.
 	cache filecache.Cache
+
+	// sectionDir holds the decoded V14 section directory.
+	// Populated by readSectionDirectory() during NewReaderFromProvider for V14 files.
+	// Both maps are nil for V3/V4/V5/V6 footer files.
+	sectionDir shared.SectionDirectory
+
+	// v14 lazy section errors — set inside the corresponding sync.Once.Do and read after.
+	v14RangeErr  error
+	v14TraceErr  error
+	v14TSErr     error
+	v14SketchErr error
+	v14BloomErr  error
 
 	traceIndex map[[16]byte][]uint16
 
@@ -112,9 +125,11 @@ type Reader struct {
 	// Populated during parseV5MetadataLazy; parsed into traceIndex on first access.
 	traceIndexRaw []byte
 
-	// tsEntries is the parsed per-file timestamp index (sorted by minTS ascending).
-	// Nil for files written before the TS index was introduced.
-	tsEntries []tsIndexEntry
+	// tsRaw holds the raw 20-byte-per-entry TS index body (a zero-copy sub-slice of
+	// metadataBytes). tsCount is the number of entries. Entries are sorted by minTS
+	// ascending (as written). Nil/0 for files written before the TS index was introduced.
+	// NOTE-PERF-TS: raw bytes eliminate O(count) tsIndexEntry allocations at parse time.
+	tsRaw []byte
 
 	// Parsed during NewReaderFromProvider.
 	blockMetas    []shared.BlockMeta
@@ -125,6 +140,8 @@ type Reader struct {
 	fileBloomRaw []byte
 
 	footerFields footerRaw
+
+	tsCount int
 
 	fileSize int64
 
@@ -146,9 +163,13 @@ type Reader struct {
 	// Both are 0 for v3 footer files or files with no intrinsic section.
 	intrinsicIndexOffset uint64
 
-	// vectorIndexOffset and vectorIndexLen are parsed from the v5 footer.
+	// vectorIndexOffset and vectorIndexLen are parsed from the agentic v5 footer.
 	// Both are 0 for v3/v4 footer files or files with no vector index section.
 	vectorIndexOffset uint64
+
+	// V7 footer fields (FooterV7Version = 7, V14 section-directory files only).
+	// v7DirOffset and v7DirLen point to the snappy-compressed section directory.
+	v7DirOffset uint64
 
 	fileBloomOnce sync.Once
 
@@ -157,6 +178,14 @@ type Reader struct {
 	// vectorIndexOnce guards lazy parsing of the vector index section.
 	vectorIndexOnce sync.Once
 
+	// v14 lazy section loaders — each fires at most once per Reader for V14 files.
+	// Non-V14 readers leave these zero-valued; the ensure* helpers are no-ops for them.
+	v14RangeOnce  sync.Once
+	v14TraceOnce  sync.Once
+	v14TSOnce     sync.Once
+	v14SketchOnce sync.Once
+	v14BloomOnce  sync.Once
+
 	compactLen uint32
 
 	// compactTracesLen is parsed from the v6 footer; see compactTracesOffset.
@@ -164,8 +193,10 @@ type Reader struct {
 
 	intrinsicIndexLen uint32
 
-	// vectorIndexLen is parsed from the v5 footer.
+	// vectorIndexLen is parsed from the agentic v5 footer.
 	vectorIndexLen uint32
+
+	v7DirLen uint32
 
 	footerVersion uint16
 	fileVersion   uint8
@@ -207,6 +238,18 @@ func NewReaderFromProviderWithOptions(provider rw.ReaderProvider, opts Options) 
 
 	if err = r.readFooter(); err != nil {
 		return nil, fmt.Errorf("NewReaderFromProvider: %w", err)
+	}
+
+	if r.footerVersion == shared.FooterV7Version {
+		// V14 file: read section directory + parse sections from it.
+		r.sectionDir, err = r.readSectionDirectory()
+		if err != nil {
+			return nil, fmt.Errorf("NewReaderFromProvider: section directory: %w", err)
+		}
+		if err = r.parseSectionsLazyV14(); err != nil {
+			return nil, fmt.Errorf("NewReaderFromProvider: %w", err)
+		}
+		return r, nil
 	}
 
 	if err = r.readHeader(); err != nil {
@@ -261,7 +304,19 @@ func NewLeanReaderFromProviderWithOptions(provider rw.ReaderProvider, opts Optio
 		return nil, fmt.Errorf("NewLeanReaderFromProvider: footer: %w", err)
 	}
 
-	// Fall back to full reader when there is no compact section.
+	// V14 files: read section directory + all sections (no legacy compact section).
+	if r.footerVersion == shared.FooterV7Version {
+		r.sectionDir, err = r.readSectionDirectory()
+		if err != nil {
+			return nil, fmt.Errorf("NewLeanReaderFromProvider: section directory: %w", err)
+		}
+		if err = r.parseSectionsLazyV14(); err != nil {
+			return nil, fmt.Errorf("NewLeanReaderFromProvider: %w", err)
+		}
+		return r, nil
+	}
+
+	// V3/V4 files: fall back to full reader when there is no compact section.
 	if r.compactLen == 0 {
 		return NewReaderFromProviderWithOptions(provider, opts)
 	}
@@ -286,6 +341,7 @@ func (r *Reader) BlockCount() int { return len(r.blockMetas) }
 // Uses the trace index (full or compact) to determine the count.
 // Returns 0 if no trace index is available.
 func (r *Reader) TraceCount() int {
+	_ = r.ensureV14TraceSection()
 	r.ensureTraceIndex()
 	if len(r.traceIndex) > 0 {
 		return len(r.traceIndex)
@@ -331,6 +387,7 @@ func (r *Reader) BlockMeta(blockIdx int) shared.BlockMeta {
 // no sketch section was written or the column was not sketched.
 // Implements queryplanner.BlockIndexer.
 func (r *Reader) ColumnSketch(col string) queryplanner.ColumnSketch {
+	_ = r.ensureV14SketchSection()
 	if r.sketchIdx == nil {
 		return nil
 	}
@@ -402,12 +459,10 @@ func (r *Reader) BlocksForRangeInterval(
 	}
 
 	// Find the bucket that contains minKey: last entry whose lower ≤ minKey.
-	lo := sort.Search(len(entries), func(i int) bool {
+	// max(lo, 0): when lo is -1 (minKey below all boundaries), start from bucket 0.
+	lo := max(sort.Search(len(entries), func(i int) bool {
 		return compareRangeKey(idx.colType, entries[i].lower, minKey) > 0
-	}) - 1
-	if lo < 0 {
-		lo = 0 // minKey is below all boundaries; start from the first bucket.
-	}
+	})-1, 0)
 
 	// Find the last bucket whose lower ≤ maxKey.
 	hi := sort.Search(len(entries), func(i int) bool {
@@ -436,8 +491,10 @@ func (r *Reader) BlocksForRangeInterval(
 
 // ColumnNames returns all column names known to this reader — the union of
 // range-indexed columns (rangeOffsets) and sketch columns (sketchIdx).
-// These are derived from the file header/metadata, so no block I/O is needed.
 func (r *Reader) ColumnNames() []string {
+	// Ensure both V14 lazy sections are loaded before scanning.
+	_ = r.ensureV14RangeSection()
+	_ = r.ensureV14SketchSection()
 	seen := make(map[string]struct{})
 	for col := range r.rangeOffsets {
 		seen[col] = struct{}{}
@@ -457,6 +514,7 @@ func (r *Reader) ColumnNames() []string {
 
 // RangeColumnType returns the ColumnType for a range-indexed column, if it exists.
 func (r *Reader) RangeColumnType(colName string) (shared.ColumnType, bool) {
+	_ = r.ensureV14RangeSection()
 	meta, ok := r.rangeOffsets[colName]
 	if !ok {
 		return 0, false
@@ -491,14 +549,23 @@ func (r *Reader) RangeColumnBoundaries(colName string) *RangeBoundaries {
 	if !ok {
 		return nil
 	}
-	return &RangeBoundaries{
-		ColType:       idx.colType,
-		BucketMin:     idx.bucketMin,
-		BucketMax:     idx.bucketMax,
-		Float64Bounds: idx.float64Bounds,
-		StringBounds:  idx.stringBounds,
-		BytesBounds:   idx.bytesBounds,
+	rb := &RangeBoundaries{
+		ColType:      idx.colType,
+		BucketMin:    idx.bucketMin,
+		BucketMax:    idx.bucketMax,
+		StringBounds: idx.stringBounds,
+		BytesBounds:  idx.bytesBounds,
 	}
+	// NOTE-PERF-RANGE: decode float64 bounds on demand from raw bytes rather than
+	// storing a pre-decoded []float64 in parsedRangeIndex.
+	if len(idx.float64BoundsRaw) > 0 {
+		count := len(idx.float64BoundsRaw) / 8
+		rb.Float64Bounds = make([]float64, count)
+		for i := range count {
+			rb.Float64Bounds[i] = math.Float64frombits(binary.LittleEndian.Uint64(idx.float64BoundsRaw[i*8:]))
+		}
+	}
+	return rb
 }
 
 // ReadBlockRaw reads the raw bytes for the block at blockIdx from the provider.
@@ -585,6 +652,7 @@ type TraceEntry struct {
 // TraceEntries returns the block IDs containing spans for the given trace ID.
 // Falls back to the compact trace index when the main index is empty (lean reader path).
 func (r *Reader) TraceEntries(traceID [16]byte) []TraceEntry {
+	_ = r.ensureV14TraceSection()
 	r.ensureTraceIndex()
 	blockIDs, ok := r.traceIndex[traceID]
 	if !ok && r.compactParsed != nil {
@@ -612,8 +680,10 @@ func (r *Reader) ResetInternStrings() {}
 // Returns nil for files written before the FileBloom section was introduced.
 // The returned *FileBloom is safe for concurrent use after the first call.
 func (r *Reader) FileBloom() *FileBloom {
+	// For V14 files, load the bloom section lazily on first call.
+	_ = r.ensureV14BloomSection()
 	r.fileBloomOnce.Do(func() {
-		if r.fileBloomRaw != nil {
+		if r.fileBloomRaw != nil && r.fileBloomParsed == nil {
 			fb, _, err := parseFileBloomSection(r.fileBloomRaw)
 			if err == nil {
 				r.fileBloomParsed = fb
@@ -628,6 +698,7 @@ func (r *Reader) FileBloom() *FileBloom {
 // a FileBloom via ParseFileBloom without reopening the file.
 // Returns nil for files without a FileBloom section (old format).
 func (r *Reader) FileBloomRaw() []byte {
+	_ = r.ensureV14BloomSection()
 	if r.fileBloomRaw == nil {
 		return nil
 	}
@@ -656,6 +727,7 @@ func (r *Reader) FileSketchSummaryRaw() []byte {
 // file-level rejection without reopening the file.
 // Returns nil for files without a compact trace index bloom.
 func (r *Reader) TraceBloomRaw() []byte {
+	_ = r.ensureV14TraceSection()
 	if r.compactLen > 0 {
 		_ = r.ensureCompactIndexParsed()
 	}
@@ -669,6 +741,7 @@ func (r *Reader) TraceBloomRaw() []byte {
 // the trace ID is absent from this file. Returns true (conservative) when no
 // compact trace index or bloom is present.
 func (r *Reader) MayContainTraceID(traceID [16]byte) bool {
+	_ = r.ensureV14TraceSection()
 	if r.compactLen > 0 {
 		_ = r.ensureCompactIndexParsed()
 	}
@@ -740,17 +813,14 @@ func (r *Reader) AddColumnsToBlock(bwb *BlockWithBytes, addColumns map[string]st
 	spanCount := int(hdr.spanCount)
 	colCount := int(hdr.columnCount)
 
-	metas, _, err := parseColumnMetadataArray(bwb.RawBytes, 24, colCount)
+	metas, _, err := parseColumnMetadataArray(bwb.RawBytes, 24, colCount, hdr.version)
 	if err != nil {
 		return fmt.Errorf("AddColumnsToBlock: column metadata: %w", err)
 	}
 
-	scratch := acquireDecompScratch()
-	defer releaseDecompScratch(scratch)
-
 	// Each AddColumnsToBlock call uses its own fresh intern map; ResetInternStrings
 	// is a no-op and no cross-call intern reuse occurs.
-	ctx := &decodeCtx{scratch: scratch, intern: make(map[string]string)}
+	ctx := &decodeCtx{intern: make(map[string]string)}
 
 	for _, m := range metas {
 		// NOTE-022: nil means "add all missing columns"; non-nil filters by name.
@@ -782,7 +852,20 @@ func (r *Reader) AddColumnsToBlock(bwb *BlockWithBytes, addColumns map[string]st
 			Type: m.colType,
 		}
 
-		decoded, err := readColumnEncoding(bwb.RawBytes[start:end], spanCount, m.colType, ctx)
+		colData := bwb.RawBytes[start:end]
+		if hdr.version == shared.VersionBlockV14 {
+			// SPEC-ROOT-012: guard against decompression-bomb OOM.
+			if m.uncompressedLen > uint32(shared.MaxBlockSize) { //nolint:gosec
+				return fmt.Errorf("AddColumnsToBlock: col %q: uncompressed_len %d exceeds MaxBlockSize", m.name, m.uncompressedLen)
+			}
+			decompressed, decErr := snappy.Decode(nil, colData)
+			if decErr != nil {
+				return fmt.Errorf("AddColumnsToBlock: col %q snappy decode: %w", m.name, decErr)
+			}
+			colData = decompressed
+		}
+
+		decoded, err := readColumnEncoding(colData, spanCount, m.colType, ctx)
 		if err != nil {
 			return fmt.Errorf("AddColumnsToBlock: col %q: %w", m.name, err)
 		}

@@ -93,7 +93,7 @@ func (r *Reader) readBlockColumnar(blockOff, blockLen int64, wantColumns map[str
 		return nil, fmt.Errorf("readBlockColumnar: header: %w", err)
 	}
 
-	metas, tocEnd, err := parseColumnMetadataArray(toc, 24, int(hdr.columnCount))
+	metas, tocEnd, err := parseColumnMetadataArray(toc, 24, int(hdr.columnCount), hdr.version)
 	if err != nil {
 		// Metadata spills past tocHintBytes — fall back to full block read.
 		full := make([]byte, blockLen)

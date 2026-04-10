@@ -13,6 +13,15 @@ For design rationale behind the performance targets see NOTES.md.
 > Currently implemented: BENCH-W-01 through BENCH-W-05 (writer/writer_bench_test.go),
 > BENCH-R-08 (reader/reader_test.go).
 
+> **NOTE (2026-04-10) — V14 format change invalidates prior baselines.** The V14 format
+> redesign (per-column outer snappy, sectioned metadata, FooterV5) changes compression
+> characteristics, block layout, and I/O patterns significantly. All numeric baseline targets
+> in this document were measured against V12/V13 format files. After V14 implementation is
+> complete, all benchmarks listed below MUST be re-run against V14 files and the baseline
+> numbers updated accordingly. Until then, treat all specific numeric targets as placeholders
+> subject to revision. The qualitative targets (e.g. `compress_ratio >= 5.0`, `io_ops == 1`,
+> `ms/open < 50`) remain valid design goals; only the measured numbers may shift.
+
 ---
 
 ## Metric Targets (Never Regress Below)

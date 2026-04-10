@@ -26,6 +26,7 @@ func (r *Reader) EnsureIntrinsicTOC() error {
 // entries persist until Clear) to avoid re-decoding the blob on every NewReaderFromProvider call.
 func (r *Reader) parseIntrinsicTOC() error {
 	// V4+ footers include an intrinsic section. V3 does not.
+	// V7 (V14 section-directory) uses the section directory for intrinsics, not this path.
 	isV4Plus := r.footerVersion == shared.FooterV4Version ||
 		r.footerVersion == shared.FooterV5Version ||
 		r.footerVersion == shared.FooterV6Version
@@ -79,12 +80,32 @@ func (r *Reader) HasIntrinsicSection() bool {
 
 // IntrinsicColumnMeta returns the TOC metadata for the named intrinsic column.
 // Returns (IntrinsicColMeta{}, false) if no intrinsic section is present or the
-// column is not in the TOC. This is cheap — no I/O.
+// column is not in the TOC.
+//
+// For V14 files, Format and Type are populated lazily on first call by peeking the
+// compressed blob header (one I/O per column, cached). Subsequent calls are free.
 func (r *Reader) IntrinsicColumnMeta(name string) (shared.IntrinsicColMeta, bool) {
 	if r.intrinsicIndex == nil {
 		return shared.IntrinsicColMeta{}, false
 	}
 	meta, ok := r.intrinsicIndex[name]
+	if !ok {
+		return shared.IntrinsicColMeta{}, false
+	}
+	// V14 files: Format and Type are not stored in the section directory.
+	// Peek the compressed blob header on first access to populate them.
+	if meta.Format == 0 {
+		blob, err := r.GetIntrinsicColumnBlob(name)
+		if err == nil && len(blob) > 0 {
+			f, ct, cnt, peekErr := shared.PeekIntrinsicBlobHeader(blob)
+			if peekErr == nil {
+				meta.Format = f
+				meta.Type = ct
+				meta.Count = cnt
+				r.intrinsicIndex[name] = meta
+			}
+		}
+	}
 	return meta, ok
 }
 

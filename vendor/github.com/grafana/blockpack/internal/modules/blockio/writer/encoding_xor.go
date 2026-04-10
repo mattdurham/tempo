@@ -8,16 +8,16 @@ import (
 
 // encodeXORBytes encodes a []byte column using XOR-against-previous encoding (kinds 8/9).
 //
-// Wire format:
+// Wire format (V14 enc_version=3):
 //
 //	enc_version[1] + kind[1] + span_count[4 LE]
 //	+ presence_rle_len[4 LE] + presence_rle_data
-//	+ xor_data_len[4 LE] + zstd(xor_payload)
+//	+ xor_data_len[4 LE] + raw_xor_payload  (no zstd — outer snappy per column)
 //
 // XOR payload (for each present row in order):
 //
 //	val_len[4 LE] + xor_bytes
-func encodeXORBytes(kind uint8, values [][]byte, present []bool, nRows int, enc *zstdEncoder) ([]byte, error) {
+func encodeXORBytes(kind uint8, values [][]byte, present []bool, nRows int) ([]byte, error) {
 	// Build presence bitset.
 	bitsetLen := (nRows + 7) / 8
 	bitset := make([]byte, bitsetLen)
@@ -55,18 +55,14 @@ func encodeXORBytes(kind uint8, values [][]byte, present []bool, nRows int, enc 
 		prev = cur
 	}
 
-	compressed, err := enc.compress(xorPayload)
-	if err != nil {
-		return nil, err
-	}
-
-	buf := make([]byte, 0, 2+4+4+len(rleData)+4+len(compressed))
-	buf = append(buf, shared.ColumnEncodingVersion, kind)
+	// V14: XOR payload is raw (no zstd). Outer snappy applied per-column by block writer.
+	buf := make([]byte, 0, 2+4+4+len(rleData)+4+len(xorPayload))
+	buf = append(buf, shared.VersionBlockEncV3, kind)
 	buf = appendUint32LE(buf, uint32(nRows))        //nolint:gosec // safe: nRows bounded by MaxBlockSpans (65535)
 	buf = appendUint32LE(buf, uint32(len(rleData))) //nolint:gosec // safe: rle data bounded by block size
 	buf = append(buf, rleData...)
-	buf = appendUint32LE(buf, uint32(len(compressed))) //nolint:gosec // safe: compressed data bounded by block size
-	buf = append(buf, compressed...)
+	buf = appendUint32LE(buf, uint32(len(xorPayload))) //nolint:gosec // safe: raw data bounded by block size
+	buf = append(buf, xorPayload...)
 
 	return buf, nil
 }

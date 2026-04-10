@@ -261,3 +261,13 @@ Monitor these metrics when touching I/O code:
 - Batch related operations in a single message
 - Batch all file reads/writes/edits together
 - Batch all Bash commands together when they don't depend on each other
+
+---
+
+## Agent Guidance Files
+
+Additional guidance for specific workflows lives in `.agents/guidance/`. Read the relevant file before starting that type of work.
+
+| File | When to read |
+|---|---|
+| `.agents/guidance/code-review.md` | Before submitting or reviewing any PR — covers 10 recurring failure modes derived from Copilot review comments across 20 merged PRs |

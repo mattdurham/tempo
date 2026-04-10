@@ -213,6 +213,153 @@ time and not present in the original OTLP payload.
 
 ---
 
+## SPEC-V14-001: V14 Format Version Constants
+*Added: 2026-04-10*
+
+V14 introduces per-column outer snappy compression and independently-addressable metadata
+sections. The following constants define the V14 format.
+
+```go
+VersionBlockV14   uint8  = 14  // block header version byte for V14 blocks
+VersionBlockEncV3 uint8  = 3   // enc_version inside each column blob: no internal zstd sub-segments
+
+FooterV5Version uint16 = 5    // V5 footer version field value
+FooterV5Size    uint   = 18   // magic[4]+version[2]+dir_offset[8]+dir_len[4]
+
+// Section type constants for V14 type-keyed directory entries (6 fixed file-level sections).
+// Values 0x07+ are reserved for future type-keyed sections.
+SectionBlockIndex  uint8 = 0x01  // block index section
+SectionRangeIndex  uint8 = 0x02  // range index section
+SectionTraceIndex  uint8 = 0x03  // trace ID index section (combines compact + full index)
+SectionTSIndex     uint8 = 0x04  // timestamp index section
+SectionSketchIndex uint8 = 0x05  // sketch index section (HLL, TopK, bloom per column)
+SectionFileBloom   uint8 = 0x06  // file-level bloom filter section (FBLM)
+
+// DirEntryKind constants distinguish the two section directory entry kinds.
+DirEntryKindType uint8 = 0x00  // type-keyed entry (one of the 6 fixed sections)
+DirEntryKindName uint8 = 0x01  // name-keyed entry (one file-level intrinsic column blob)
+```
+
+**Invariants:**
+- All 6 section type constants are distinct and nonzero.
+- `FooterV5Size == 18` is fixed; any change requires a new footer version.
+- V14 files have no V3/V4/V12 footer or file header. The last 18 bytes are always the V5 footer.
+- File-level intrinsic column blobs use name-keyed entries (`DirEntryKindName`), not a single type-keyed section.
+
+Back-ref: `internal/modules/blockio/shared/constants.go`
+
+---
+
+## SPEC-V14-002: Section Directory Entry Wire Formats
+*Added: 2026-04-10 | Updated: 2026-04-10 — heterogeneous entry kinds*
+
+The V14 section directory is a snappy-compressed blob. When decoded it contains:
+`entry_count[4]` followed by `entry_count` entries of variable size.
+
+Each entry starts with `entry_kind[1]` which determines the entry format:
+
+**Type-keyed entry** (`entry_kind == DirEntryKindType == 0x00`) — 14 bytes total:
+```go
+// DirEntryType describes one of the 6 fixed file-level sections.
+// Wire: entry_kind[1]=0x00 + section_type[1] + offset[8] + compressed_len[4] = 14 bytes.
+type DirEntryType struct {
+    SectionType   uint8   // one of SectionBlockIndex..SectionFileBloom (0x01–0x06)
+    Offset        uint64  // absolute byte offset of the section in the file
+    CompressedLen uint32  // byte length of the snappy-compressed section blob
+}
+```
+
+| Field | Type | Bytes | Description |
+|---|---|---|---|
+| `entry_kind` | uint8 | 1 | 0x00 = type-keyed |
+| `section_type` | uint8 | 1 | Section type identifier (0x01–0x06) |
+| `offset` | uint64 LE | 8 | Absolute byte offset of section data in file |
+| `compressed_len` | uint32 LE | 4 | Byte length of compressed section blob |
+
+**Name-keyed entry** (`entry_kind == DirEntryKindName == 0x01`) — 15+len(name) bytes total:
+```go
+// DirEntryName describes one file-level intrinsic column blob.
+// Wire: entry_kind[1]=0x01 + name_len[2] + name + offset[8] + compressed_len[4] = 15+len(name) bytes.
+type DirEntryName struct {
+    Name          string  // intrinsic column name (e.g. "span:name", "span:duration")
+    Offset        uint64  // absolute byte offset of the column blob in the file
+    CompressedLen uint32  // byte length of the snappy-compressed column blob
+}
+```
+
+| Field | Type | Bytes | Description |
+|---|---|---|---|
+| `entry_kind` | uint8 | 1 | 0x01 = name-keyed |
+| `name_len` | uint16 LE | 2 | Byte length of column name string |
+| `name` | bytes | name_len | Column name (UTF-8) |
+| `offset` | uint64 LE | 8 | Absolute byte offset of column blob in file |
+| `compressed_len` | uint32 LE | 4 | Byte length of compressed column blob |
+
+**Invariants:**
+- The directory itself is snappy-compressed; `dir_offset`+`dir_len` in the V5 footer point to the compressed blob.
+- Readers MUST build `map[uint8]DirEntryType` and `map[string]DirEntryName` for O(1) lookup.
+- An absent section has no entry in the directory (not a zero-length entry).
+- There is no `SectionIntrinsic` type-keyed entry; each intrinsic column gets its own name-keyed entry.
+
+Back-ref: `internal/modules/blockio/shared/types.go:DirEntryType`, `types.go:DirEntryName`
+
+---
+
+## SPEC-V14-003: V14 Footer (FooterV5) Wire Layout
+*Added: 2026-04-10*
+
+The V14 footer occupies the last 18 bytes of every V14 file.
+
+| Field | Type | Bytes | Description |
+|---|---|---|---|
+| `magic` | uint32 LE | 4 | Must equal `MagicNumber` (0xC011FEA1) |
+| `version` | uint16 LE | 2 | Must equal `FooterV5Version` (5) |
+| `dir_offset` | uint64 LE | 8 | Absolute byte offset of the snappy-compressed section directory |
+| `dir_len` | uint32 LE | 4 | Byte length of the snappy-compressed section directory |
+
+**Read sequence for V14 files:**
+1. Read last 18 bytes → verify magic and version == 5.
+2. Read `dir_len` bytes at `dir_offset` → snappy-decompress → parse `entry_count[4]` + N entries.
+3. For each entry: read `entry_kind[1]`; if 0x00 → unmarshal `DirEntryType`; if 0x01 → unmarshal `DirEntryName`.
+4. Build `map[uint8]DirEntryType` and `map[string]DirEntryName` for O(1) lookup.
+5. Eager: read and parse `SectionBlockIndex`.
+6. Lazy: read and parse all other sections on demand.
+
+Back-ref: `internal/modules/blockio/writer/metadata.go:writeFooterV5`,
+`internal/modules/blockio/reader/parser.go:readFooter`
+
+---
+
+## SPEC-V14-004: V14 Column TOC Entry Format
+*Added: 2026-04-10*
+
+Each column metadata entry in the V14 block TOC uses compressed+uncompressed length fields
+instead of the V12 `data_len[8]` field. Total entry size is unchanged.
+
+**V14 column TOC entry wire format:**
+
+| Field | Type | Bytes | Description |
+|---|---|---|---|
+| `name_len` | uint16 LE | 2 | Length of column name string in bytes |
+| `name` | bytes | N | Column name (UTF-8, not null-terminated) |
+| `col_type` | uint8 | 1 | ColumnType enum value |
+| `data_offset` | uint64 LE | 8 | Byte offset of the snappy-compressed column blob, relative to block start |
+| `compressed_len` | uint32 LE | 4 | Byte length of the snappy-compressed column blob on disk |
+| `uncompressed_len` | uint32 LE | 4 | Byte length after snappy decompression |
+
+**Invariants:**
+- `data_offset` is relative to the start of the block payload (not the file).
+- Each column blob at `data_offset` is `snappy.Encode(rawEncodingPayload)` where
+  `rawEncodingPayload` starts with `enc_version[1]=3` + `encoding_kind[1]` followed by
+  encoding-specific bytes with no internal zstd sub-segments.
+- `uncompressed_len` MUST equal `snappy.DecodedLen(compressedBlob)` and MUST NOT exceed
+  `MaxBlockSize` to prevent decompression-bomb attacks.
+
+Back-ref: `internal/modules/blockio/writer/writer_block.go`,
+`internal/modules/blockio/reader/block_parser.go:parseBlockColumnsReuse`
+
+---
+
 ## 8. Limits
 
 | Constant | Value | Description |
