@@ -6,6 +6,8 @@ import (
 	"encoding/binary"
 	"fmt"
 
+	"github.com/golang/snappy"
+
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
 	"github.com/grafana/blockpack/internal/modules/rw"
 )
@@ -178,6 +180,12 @@ func scanTraceIndexRaw(data []byte, traceID [16]byte) []uint16 {
 //	bloom_bytes[4] + bloom_data[bloom_bytes]
 //	block_table: block_count × 12 bytes
 //	trace_index: fmt_version[1] + trace_count[4] + …  (rest of compact section)
+//
+// Compact section layout (version 3, v6 footer — split format):
+//
+//	compact header (raw, uncompressed): magic[4]+version[1]=3+block_count[4]+bloom_bytes[4]+bloom_data+block_table
+//	compact traces (separate, snappy-compressed): snappy(fmt_version[1]+trace_count[4]+traces...)
+//	Both sections are located by separate footer fields (compactOffset/compactLen and compactTracesOffset/compactTracesLen).
 func (r *Reader) ensureCompactHeaderParsed() error {
 	if r.compactParsed != nil {
 		return nil
@@ -187,6 +195,13 @@ func (r *Reader) ensureCompactHeaderParsed() error {
 		return fmt.Errorf("compact index: not present")
 	}
 
+	// V3 split format (footer V6): the compact header section is stored raw (uncompressed).
+	// compactTracesOffset/compactTracesLen point to the snappy-compressed trace index section.
+	if r.compactTracesLen > 0 {
+		return r.ensureCompactHeaderParsedV3()
+	}
+
+	// V1/V2 legacy format: read prefix to determine version and bloom size.
 	// Step 1: read the fixed 9-byte compact header to determine version and block_count.
 	// For version 2 we also need the 4-byte bloom_bytes field, so read 13 bytes total.
 	const prefixLen = 13 // magic[4] + version[1] + block_count[4] + bloom_bytes[4]
@@ -308,9 +323,99 @@ func (r *Reader) ensureCompactHeaderParsed() error {
 	return nil
 }
 
+// ensureCompactHeaderParsedV3 reads the v3 split compact header section (raw, uncompressed).
+// Called by ensureCompactHeaderParsed when compactTracesLen > 0 (footer V6).
+// The compact header section contains magic+version(3)+block_count+bloom+block_table only.
+// The trace index is stored separately and located via compactTracesOffset/compactTracesLen.
+func (r *Reader) ensureCompactHeaderParsedV3() error {
+	// Read the entire compact header section (raw, uncompressed, small — ~15 MB max).
+	cacheKey := r.fileID + "/compact-header"
+	data, err := r.cache.GetOrFetch(cacheKey, func() ([]byte, error) {
+		return r.readRange(r.compactOffset, uint64(r.compactLen), rw.DataTypeTraceBloomFilter) //nolint:gosec
+	})
+	if err != nil {
+		return fmt.Errorf("compact index v3: read header: %w", err)
+	}
+	if len(data) < 9 {
+		return fmt.Errorf("compact index v3: too short (%d bytes)", len(data))
+	}
+
+	magic := binary.LittleEndian.Uint32(data[0:])
+	if magic != shared.CompactIndexMagic {
+		return fmt.Errorf("compact index v3: bad magic 0x%08X", magic)
+	}
+
+	version := data[4]
+	if version != shared.CompactIndexVersion3 {
+		return fmt.Errorf("compact index v3: unexpected version %d (expected %d)", version, shared.CompactIndexVersion3)
+	}
+
+	blockCount := int(binary.LittleEndian.Uint32(data[5:])) //nolint:gosec // validated below before use
+	if blockCount > shared.MaxBlocks {
+		return fmt.Errorf("compact index v3: block_count %d exceeds maximum %d", blockCount, shared.MaxBlocks)
+	}
+
+	pos := 9
+
+	// Parse bloom filter (always present in v3).
+	if pos+4 > len(data) {
+		return fmt.Errorf("compact index v3: short for bloom_bytes")
+	}
+	bloomBytes := int(binary.LittleEndian.Uint32(data[pos:])) //nolint:gosec
+	pos += 4
+	if bloomBytes > shared.TraceIDBloomMaxBytes {
+		return fmt.Errorf("compact index v3: bloom_bytes %d exceeds maximum %d", bloomBytes, shared.TraceIDBloomMaxBytes)
+	}
+	if pos+bloomBytes > len(data) {
+		return fmt.Errorf("compact index v3: short for bloom_data (need %d bytes)", bloomBytes)
+	}
+	traceIDBloom := make([]byte, bloomBytes)
+	copy(traceIDBloom, data[pos:pos+bloomBytes])
+	pos += bloomBytes
+
+	// Parse block table.
+	need := blockCount * 12
+	if pos+need > len(data) {
+		return fmt.Errorf("compact index v3: short for block_table (need %d)", need)
+	}
+	blockTable := make([]compactBlockEntry, blockCount)
+	for i := range blockCount {
+		blockTable[i] = compactBlockEntry{
+			fileOffset: binary.LittleEndian.Uint64(data[pos:]),
+			fileLength: binary.LittleEndian.Uint32(data[pos+8:]),
+		}
+		pos += 12
+	}
+
+	r.compactParsed = &compactTraceIndex{
+		blockTable:       blockTable,
+		traceIDBloom:     traceIDBloom,
+		traceIndexOffset: r.compactTracesOffset,
+		traceIndexLen:    uint64(r.compactTracesLen),
+		// traceIndexRaw intentionally nil — fetched lazily in ensureTraceIndexRaw.
+	}
+
+	// Populate blockMetas from the compact block table.
+	if len(r.blockMetas) == 0 {
+		r.blockMetas = make([]shared.BlockMeta, len(blockTable))
+		for i, entry := range blockTable {
+			r.blockMetas[i] = shared.BlockMeta{
+				Offset: entry.fileOffset,
+				Length: uint64(entry.fileLength),
+			}
+		}
+	}
+
+	return nil
+}
+
 // ensureTraceIndexRaw fetches the raw trace-index bytes for a lean reader (lazy, phase 2).
 // Called only after a bloom-filter hit — for the vast majority of lookups (bloom miss)
 // this is never invoked, keeping peak RSS at ~15 MB instead of ~700 MB per file open.
+//
+// For v3 split format files (footer V6), the trace index is snappy-compressed at
+// compactTracesOffset/compactTracesLen and must be decompressed before use.
+// For v1/v2 format files, the trace index bytes are raw (uncompressed).
 //
 // Thread-safe: uses sync.Once; subsequent calls return immediately with cached result.
 // A fetch error is stored in traceIndexFetchErr and returned to callers.
@@ -342,24 +447,46 @@ func (r *Reader) ensureTraceIndexRaw() error {
 			r.compactParsed.traceIndexFetchErr = fmt.Errorf("compact index: trace_index: read: %w", err)
 			return
 		}
-		if len(data) < 5 {
-			r.compactParsed.traceIndexFetchErr = fmt.Errorf("compact index: trace_index: data too short (%d bytes)", len(data))
+		if len(data) == 0 {
+			r.compactParsed.traceIndexFetchErr = fmt.Errorf("compact index: trace_index: empty data")
 			return
 		}
-		fmtVer := data[0]
+
+		// V3 split format: trace index is snappy-compressed.
+		// V1/V2 format: trace index bytes are raw (uncompressed).
+		var rawData []byte
+		if r.compactTracesLen > 0 {
+			// V3: snappy-decompress the compact traces section.
+			decoded, decErr := snappy.Decode(nil, data)
+			if decErr != nil {
+				r.compactParsed.traceIndexFetchErr = fmt.Errorf("compact index: trace_index: snappy decode: %w", decErr)
+				return
+			}
+			rawData = decoded
+		} else {
+			// V1/V2: raw bytes.
+			rawData = data
+		}
+
+		if len(rawData) < 5 {
+			r.compactParsed.traceIndexFetchErr = fmt.Errorf("compact index: trace_index: data too short (%d bytes)", len(rawData))
+			return
+		}
+		fmtVer := rawData[0]
 		if fmtVer != shared.TraceIndexFmtVersion && fmtVer != shared.TraceIndexFmtVersion2 {
 			r.compactParsed.traceIndexFetchErr = fmt.Errorf("compact index: trace_index: unsupported fmt_version %d", fmtVer)
 			return
 		}
-		// Preserve the r20 fix: copy bytes so the slice is owned by this reader, not the cache buffer.
-		r.compactParsed.traceIndexRaw = append([]byte(nil), data...)
+		// Copy bytes so the slice is owned by this reader, not the cache buffer.
+		r.compactParsed.traceIndexRaw = append([]byte(nil), rawData...)
 	})
 
 	return r.compactParsed.traceIndexFetchErr
 }
 
 // ensureCompactIndexParsed lazily parses the compact trace index.
-// Supports version 1 (no bloom) and version 2 (with trace ID bloom filter).
+// Supports version 1 (no bloom), version 2 (with trace ID bloom filter), and
+// version 3 (v6 footer split format: bloom header uncompressed, trace index snappy-compressed).
 func (r *Reader) ensureCompactIndexParsed() error {
 	if r.compactParsed != nil {
 		return nil
@@ -369,6 +496,17 @@ func (r *Reader) ensureCompactIndexParsed() error {
 		return fmt.Errorf("compact index: not present")
 	}
 
+	// V3 split format (footer V6): parse the compact header section then eagerly fetch
+	// and decompress the compact traces section (for full readers that need trace index immediately).
+	if r.compactTracesLen > 0 {
+		if err := r.ensureCompactHeaderParsedV3(); err != nil {
+			return err
+		}
+		// Eagerly load the trace index so BlocksForTraceID works on the first call.
+		return r.ensureTraceIndexRaw()
+	}
+
+	// V1/V2 legacy format.
 	cacheKey := r.fileID + "/compact"
 
 	data, err := r.cache.GetOrFetch(cacheKey, func() ([]byte, error) {

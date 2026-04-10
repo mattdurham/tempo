@@ -86,6 +86,19 @@ const (
 	// V5 total: 34 (V4) + 12 = 46 bytes.
 	FooterV5Version uint16 = 5
 	FooterV5Size    uint   = 46 // version[2]+headerOffset[8]+compactOffset[8]+compactLen[4]+intrinsicOffset[8]+intrinsicLen[4]+vectorOffset[8]+vectorLen[4]
+
+	// FooterV6Version extends V5 with compactTracesOffset[8] + compactTracesLen[4] = 12 extra bytes.
+	// V6 total: 46 (V5) + 12 = 58 bytes.
+	// When compactTracesLen > 0, the compact section is split into two pieces:
+	//   - compact_offset / compact_len:        raw (uncompressed) bloom header + block table (v3 format)
+	//   - compactTracesOffset / compactTracesLen: snappy-compressed trace index
+	FooterV6Version uint16 = 6
+	FooterV6Size    uint   = 58 // version[2]+headerOffset[8]+compactOffset[8]+compactLen[4]+intrinsicOffset[8]+intrinsicLen[4]+vectorOffset[8]+vectorLen[4]+compactTracesOffset[8]+compactTracesLen[4]
+
+	// CompactIndexVersion3 marks the compact header section as v3 (split format).
+	// The bloom+block_table are stored raw (uncompressed) in the compact header section.
+	// The trace index is stored separately in the compact traces section (snappy-compressed).
+	CompactIndexVersion3 uint8 = 3
 )
 
 // Well-known vector column names. Double-underscore prefix signals internal/synthetic columns.
