@@ -29,10 +29,26 @@ type footerRaw struct {
 // on each lookup, eliminating O(traceCount) map + []uint16 allocations that were the #1 production
 // allocator (36.27% alloc_objects). Allocation on hit is one small []uint16 per lookup — far cheaper
 // than materializing every trace's block list at parse time.
+//
+// NOTE-LAZY-TRACE-INDEX: For lean readers, traceIndexRaw is not populated at construction time.
+// Instead, traceIndexOffset/traceIndexLen record where the trace index bytes live in the file so
+// they can be fetched lazily — only when the bloom filter reports a hit. This keeps the eager read
+// at ~15 MB (bloom + block table) instead of ~700 MB (full compact section).
 type compactTraceIndex struct {
 	traceIndexRaw []byte // raw trace-index bytes; scanned in-place by scanTraceIndexRaw
 	blockTable    []compactBlockEntry
 	traceIDBloom  []byte // nil for version-1 compact indexes (no bloom); vacuous true on lookup
+
+	// traceIndexOffset and traceIndexLen locate the trace-index bytes within the file.
+	// Used by ensureTraceIndexRaw to lazily fetch them on first bloom hit.
+	// Both are zero when traceIndexRaw is already populated (full compact read path).
+	traceIndexOffset uint64
+	traceIndexLen    uint64
+
+	// traceIndexOnce guards the lazy fetch of traceIndexRaw.
+	traceIndexOnce sync.Once
+	// traceIndexFetchErr holds any error from the lazy fetch so callers can surface it.
+	traceIndexFetchErr error
 }
 
 // Reader reads and decodes a blockpack file.
@@ -246,8 +262,8 @@ func NewLeanReaderFromProviderWithOptions(provider rw.ReaderProvider, opts Optio
 		return nil, fmt.Errorf("NewLeanReaderFromProvider: header: %w", err)
 	}
 
-	// I/O #3: read and parse the compact index (eagerly).
-	if err = r.ensureCompactIndexParsed(); err != nil {
+	// I/O #3: read bloom filter + block table only (lazy trace index — fetched on bloom hit).
+	if err = r.ensureCompactHeaderParsed(); err != nil {
 		return nil, fmt.Errorf("NewLeanReaderFromProvider: compact index: %w", err)
 	}
 
@@ -563,6 +579,8 @@ func (r *Reader) TraceEntries(traceID [16]byte) []TraceEntry {
 	r.ensureTraceIndex()
 	blockIDs, ok := r.traceIndex[traceID]
 	if !ok && r.compactParsed != nil {
+		// Ensure trace index bytes are loaded (lazy for lean readers; no-op for full readers).
+		_ = r.ensureTraceIndexRaw()
 		blockIDs = scanTraceIndexRaw(r.compactParsed.traceIndexRaw, traceID)
 		ok = blockIDs != nil
 	}

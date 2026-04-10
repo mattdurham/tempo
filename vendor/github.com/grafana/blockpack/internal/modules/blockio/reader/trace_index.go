@@ -44,6 +44,8 @@ func (r *Reader) BlocksForTraceID(traceID [16]byte) []int {
 // BlocksForTraceIDCompact searches the compact trace index.
 // Checks the trace ID bloom filter first — returns nil immediately if the bloom
 // reports the ID as definitely absent, avoiding a hash map lookup.
+// For lean readers, the trace index bytes are fetched lazily here on a bloom hit
+// (phase-2 I/O), so the phase-1 eager read stays at ~15 MB instead of ~700 MB.
 func (r *Reader) BlocksForTraceIDCompact(traceID [16]byte) []int {
 	if r.compactParsed == nil {
 		return nil
@@ -51,6 +53,11 @@ func (r *Reader) BlocksForTraceIDCompact(traceID [16]byte) []int {
 
 	// NOTE-36 / SPEC-10.2: bloom filter check before hash map — fast path for absent trace IDs.
 	if !shared.TestTraceIDBloom(r.compactParsed.traceIDBloom, traceID) {
+		return nil
+	}
+
+	// Bloom hit: ensure the trace index bytes are loaded (lazy for lean readers).
+	if err := r.ensureTraceIndexRaw(); err != nil {
 		return nil
 	}
 
@@ -158,6 +165,197 @@ func scanTraceIndexRaw(data []byte, traceID [16]byte) []uint16 {
 	}
 
 	return nil
+}
+
+// ensureCompactHeaderParsed reads the compact section header, bloom filter, and block table
+// without loading the trace index bytes. This is the phase-1 read for lean readers:
+// it keeps the eager I/O at ~15 MB instead of the full ~700 MB compact section.
+// The trace index byte range is recorded in compactParsed for later lazy fetching.
+//
+// Compact section layout (version 2):
+//
+//	magic[4] + version[1] + block_count[4]  =  9 bytes
+//	bloom_bytes[4] + bloom_data[bloom_bytes]
+//	block_table: block_count × 12 bytes
+//	trace_index: fmt_version[1] + trace_count[4] + …  (rest of compact section)
+func (r *Reader) ensureCompactHeaderParsed() error {
+	if r.compactParsed != nil {
+		return nil
+	}
+
+	if r.compactLen == 0 {
+		return fmt.Errorf("compact index: not present")
+	}
+
+	// Step 1: read the fixed 9-byte compact header to determine version and block_count.
+	// For version 2 we also need the 4-byte bloom_bytes field, so read 13 bytes total.
+	const prefixLen = 13 // magic[4] + version[1] + block_count[4] + bloom_bytes[4]
+	var prefixBuf [prefixLen]byte
+	readLen := uint64(prefixLen)
+	if uint64(r.compactLen) < readLen {
+		readLen = uint64(r.compactLen)
+	}
+	prefix, err := r.readRange(r.compactOffset, readLen, rw.DataTypeTraceBloomFilter)
+	if err != nil {
+		return fmt.Errorf("compact index: read header: %w", err)
+	}
+	if len(prefix) < 9 {
+		return fmt.Errorf("compact index: too short (%d bytes)", len(prefix))
+	}
+	copy(prefixBuf[:len(prefix)], prefix)
+
+	magic := binary.LittleEndian.Uint32(prefixBuf[0:])
+	if magic != shared.CompactIndexMagic {
+		return fmt.Errorf("compact index: bad magic 0x%08X", magic)
+	}
+
+	version := prefixBuf[4]
+	if version != shared.CompactIndexVersion && version != shared.CompactIndexVersion2 {
+		return fmt.Errorf("compact index: unsupported version %d", version)
+	}
+
+	blockCount := int(binary.LittleEndian.Uint32(prefixBuf[5:])) //nolint:gosec // validated below before use
+	if blockCount > shared.MaxBlocks {
+		return fmt.Errorf("compact index: block_count %d exceeds maximum %d", blockCount, shared.MaxBlocks)
+	}
+
+	// Step 2: read bloom filter + block table in one range read.
+	// pos tracks offset within the compact section (not the file).
+	pos := 9
+
+	var bloomBytes int
+	if version == shared.CompactIndexVersion2 {
+		if len(prefixBuf) < 13 {
+			return fmt.Errorf("compact index: short for bloom_bytes")
+		}
+		bloomBytes = int(binary.LittleEndian.Uint32(prefixBuf[9:])) //nolint:gosec // validated below before use
+		if bloomBytes > shared.TraceIDBloomMaxBytes {
+			return fmt.Errorf(
+				"compact index: bloom_bytes %d exceeds maximum %d",
+				bloomBytes, shared.TraceIDBloomMaxBytes,
+			)
+		}
+		pos += 4 // account for the bloom_bytes field
+	}
+
+	// phase1Len = bloom_bytes_field(4) + bloom_data + block_table
+	// For version 1 (no bloom): just the block_table portion after the 9-byte header.
+	need := bloomBytes + blockCount*12
+	cacheKey := r.fileID + "/compact-header"
+	bodyData, err := r.cache.GetOrFetch(cacheKey, func() ([]byte, error) {
+		bodyOffset := r.compactOffset + uint64(pos) //nolint:gosec // pos is small, fits in uint64
+		return r.readRange(bodyOffset, uint64(need), rw.DataTypeTraceBloomFilter) //nolint:gosec // need is bounded
+	})
+	if err != nil {
+		return fmt.Errorf("compact index: read bloom+table: %w", err)
+	}
+	if len(bodyData) < need {
+		return fmt.Errorf("compact index: short for bloom+table (need %d, got %d)", need, len(bodyData))
+	}
+
+	bodyPos := 0
+
+	// Parse bloom filter for version 2.
+	var traceIDBloom []byte
+	if version == shared.CompactIndexVersion2 {
+		traceIDBloom = make([]byte, bloomBytes)
+		copy(traceIDBloom, bodyData[bodyPos:bodyPos+bloomBytes])
+		bodyPos += bloomBytes
+	}
+
+	// Parse block table.
+	blockTable := make([]compactBlockEntry, blockCount)
+	for i := range blockCount {
+		blockTable[i] = compactBlockEntry{
+			fileOffset: binary.LittleEndian.Uint64(bodyData[bodyPos:]),
+			fileLength: binary.LittleEndian.Uint32(bodyData[bodyPos+8:]),
+		}
+		bodyPos += 12
+	}
+
+	// Compute where the trace index starts within the file and how many bytes it occupies.
+	// The trace index immediately follows the block table in the compact section.
+	traceIndexStart := uint64(pos) + uint64(need) //nolint:gosec // both small, fits in uint64
+	traceIndexLen := uint64(r.compactLen) - traceIndexStart
+	if traceIndexStart > uint64(r.compactLen) {
+		return fmt.Errorf("compact index: computed trace_index start %d exceeds compactLen %d",
+			traceIndexStart, r.compactLen)
+	}
+	if traceIndexLen < 5 {
+		return fmt.Errorf("compact index: trace_index too short (%d bytes)", traceIndexLen)
+	}
+
+	r.compactParsed = &compactTraceIndex{
+		blockTable:       blockTable,
+		traceIDBloom:     traceIDBloom,
+		traceIndexOffset: r.compactOffset + traceIndexStart,
+		traceIndexLen:    traceIndexLen,
+		// traceIndexRaw intentionally nil — fetched lazily in ensureTraceIndexRaw.
+	}
+
+	// Populate blockMetas from the compact block table so ReadBlockRaw,
+	// CoalescedGroups, and other block-access methods work for lean readers.
+	if len(r.blockMetas) == 0 {
+		r.blockMetas = make([]shared.BlockMeta, len(blockTable))
+		for i, entry := range blockTable {
+			r.blockMetas[i] = shared.BlockMeta{
+				Offset: entry.fileOffset,
+				Length: uint64(entry.fileLength),
+			}
+		}
+	}
+
+	return nil
+}
+
+// ensureTraceIndexRaw fetches the raw trace-index bytes for a lean reader (lazy, phase 2).
+// Called only after a bloom-filter hit — for the vast majority of lookups (bloom miss)
+// this is never invoked, keeping peak RSS at ~15 MB instead of ~700 MB per file open.
+//
+// Thread-safe: uses sync.Once; subsequent calls return immediately with cached result.
+// A fetch error is stored in traceIndexFetchErr and returned to callers.
+func (r *Reader) ensureTraceIndexRaw() error {
+	if r.compactParsed == nil {
+		return fmt.Errorf("compact index: not parsed")
+	}
+
+	// Fast path: already populated (either by ensureCompactIndexParsed or a prior lazy fetch).
+	if r.compactParsed.traceIndexRaw != nil {
+		return nil
+	}
+
+	// Also fast path if no lazy-load location is recorded (shouldn't happen in normal flow).
+	if r.compactParsed.traceIndexLen == 0 {
+		return fmt.Errorf("compact index: trace_index location not recorded")
+	}
+
+	r.compactParsed.traceIndexOnce.Do(func() {
+		cacheKey := r.fileID + "/compact-trace-index"
+		data, err := r.cache.GetOrFetch(cacheKey, func() ([]byte, error) {
+			return r.readRange(
+				r.compactParsed.traceIndexOffset,
+				r.compactParsed.traceIndexLen,
+				rw.DataTypeTraceBloomFilter,
+			)
+		})
+		if err != nil {
+			r.compactParsed.traceIndexFetchErr = fmt.Errorf("compact index: trace_index: read: %w", err)
+			return
+		}
+		if len(data) < 5 {
+			r.compactParsed.traceIndexFetchErr = fmt.Errorf("compact index: trace_index: data too short (%d bytes)", len(data))
+			return
+		}
+		fmtVer := data[0]
+		if fmtVer != shared.TraceIndexFmtVersion && fmtVer != shared.TraceIndexFmtVersion2 {
+			r.compactParsed.traceIndexFetchErr = fmt.Errorf("compact index: trace_index: unsupported fmt_version %d", fmtVer)
+			return
+		}
+		// Preserve the r20 fix: copy bytes so the slice is owned by this reader, not the cache buffer.
+		r.compactParsed.traceIndexRaw = append([]byte(nil), data...)
+	})
+
+	return r.compactParsed.traceIndexFetchErr
 }
 
 // ensureCompactIndexParsed lazily parses the compact trace index.
