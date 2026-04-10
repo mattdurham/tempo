@@ -145,8 +145,13 @@ var layoutDecoderPool = &sync.Pool{
 func (r *Reader) FileLayout() (*FileLayoutReport, error) {
 	const headerSize = int64(22) // magic[4] + version[1] + metadataOffset[8] + metadataLen[8] + signalType[1]
 	footerSize := int64(shared.FooterV3Size)
-	if r.footerVersion == shared.FooterV4Version {
+	switch r.footerVersion {
+	case shared.FooterV4Version:
 		footerSize = int64(shared.FooterV4Size)
+	case shared.FooterV5Version:
+		footerSize = int64(shared.FooterV5Size)
+	case shared.FooterV6Version:
+		footerSize = int64(shared.FooterV6Size)
 	}
 
 	var sections []FileLayoutSection
@@ -191,9 +196,20 @@ func (r *Reader) FileLayout() (*FileLayoutReport, error) {
 			CompressedSize: int64(r.compactLen),    //nolint:gosec
 		})
 	}
+	// V6: separate compact traces section (snappy-compressed trace index).
+	if r.compactTracesLen > 0 {
+		sections = append(sections, FileLayoutSection{
+			Section:        "compact_trace_index_traces",
+			Offset:         int64(r.compactTracesOffset), //nolint:gosec
+			CompressedSize: int64(r.compactTracesLen),    //nolint:gosec
+		})
+	}
 
-	// Intrinsic section (v4 footer only): per-column blobs + TOC.
-	if r.footerVersion == shared.FooterV4Version && r.intrinsicIndexLen > 0 {
+	// Intrinsic section (v4+ footer): per-column blobs + TOC.
+	isV4Plus := r.footerVersion == shared.FooterV4Version ||
+		r.footerVersion == shared.FooterV5Version ||
+		r.footerVersion == shared.FooterV6Version
+	if isV4Plus && r.intrinsicIndexLen > 0 {
 		// Emit per-column sections from the TOC.
 		var columnsEnd int64
 		for _, name := range r.IntrinsicColumnNames() {

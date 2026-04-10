@@ -4,7 +4,7 @@ import "fmt"
 
 type yzmaBackend struct{}
 
-func newYzmaBackend(_ Config) (*yzmaBackend, error) {
+func newYzmaBackend(_ Config) (Backend, error) {
 	return nil, fmt.Errorf("yzma backend not available in this build")
 }
 

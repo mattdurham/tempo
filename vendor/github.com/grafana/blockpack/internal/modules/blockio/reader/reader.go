@@ -131,6 +131,12 @@ type Reader struct {
 	// Compact trace index (v3 footer only).
 	compactOffset uint64
 
+	// compactTracesOffset and compactTracesLen are parsed from the v6 footer.
+	// When non-zero, the compact section is split: compact_offset/compact_len holds the
+	// uncompressed bloom+block_table header, and compactTracesOffset/compactTracesLen holds
+	// the snappy-compressed trace index (v3 split format).
+	compactTracesOffset uint64
+
 	// File header fields (populated in readHeader).
 	headerOffset   uint64
 	metadataOffset uint64
@@ -152,6 +158,9 @@ type Reader struct {
 	vectorIndexOnce sync.Once
 
 	compactLen uint32
+
+	// compactTracesLen is parsed from the v6 footer; see compactTracesOffset.
+	compactTracesLen uint32
 
 	intrinsicIndexLen uint32
 

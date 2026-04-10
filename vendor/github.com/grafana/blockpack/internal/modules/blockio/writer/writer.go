@@ -468,11 +468,18 @@ func (w *Writer) Flush() (int64, error) {
 		return w.out.total, fmt.Errorf("writer: write file header: %w", err)
 	}
 
-	// 6. Write compact trace index.
+	// 6. Write compact trace index (v3 split format: header uncompressed, traces snappy).
+	// compact_header: magic[4]+version[1]=3+block_count[4]+bloom_bytes[4]+bloom_data+block_table
+	// compact_traces: snappy( fmt_version[1]+trace_count[4]+traces... )
 	compactOffset := uint64(w.out.total) //nolint:gosec
-	compactN, err := writeCompactTraceIndex(&w.out, w.blockMetas, w.traceIndex)
+	compactN, err := writeCompactHeader(&w.out, w.blockMetas, w.traceIndex)
 	if err != nil {
-		return w.out.total, fmt.Errorf("writer: write compact index: %w", err)
+		return w.out.total, fmt.Errorf("writer: write compact header: %w", err)
+	}
+	compactTracesOffset := uint64(w.out.total) //nolint:gosec
+	compactTracesN, err := writeCompactTraceIndexV3(&w.out, w.traceIndex)
+	if err != nil {
+		return w.out.total, fmt.Errorf("writer: write compact traces: %w", err)
 	}
 
 	// 7. Write intrinsic section (always — footer V4 minimum).
@@ -481,7 +488,7 @@ func (w *Writer) Flush() (int64, error) {
 		return w.out.total, fmt.Errorf("writer: write intrinsic section: %w", err)
 	}
 
-	// 7.5. Write vector index section (V5 only).
+	// 7.5. Write vector index section.
 	var vectorIndexOffset uint64
 	var vectorIndexLen uint32
 	if w.vectorAccum != nil {
@@ -498,15 +505,9 @@ func (w *Writer) Flush() (int64, error) {
 		}
 	}
 
-	// 8. Write footer V5 if vector index was written; else V4.
-	if vectorIndexLen > 0 {
-		if err = writeFooterV5(&w.out, headerOffset, compactOffset, uint32(compactN), intrinsicOffset, intrinsicLen, vectorIndexOffset, vectorIndexLen); err != nil { //nolint:gosec
-			return w.out.total, fmt.Errorf("writer: write footer V5: %w", err)
-		}
-	} else {
-		if err = writeFooterV4(&w.out, headerOffset, compactOffset, uint32(compactN), intrinsicOffset, intrinsicLen); err != nil { //nolint:gosec // safe: compact index size bounded by MaxCompactSectionSize (50MB) fits uint32
-			return w.out.total, fmt.Errorf("writer: write footer: %w", err)
-		}
+	// 8. Write footer V6 (always — v3 split compact format).
+	if err = writeFooterV6(&w.out, headerOffset, compactOffset, uint32(compactN), intrinsicOffset, intrinsicLen, vectorIndexOffset, vectorIndexLen, compactTracesOffset, uint32(compactTracesN)); err != nil { //nolint:gosec
+		return w.out.total, fmt.Errorf("writer: write footer V6: %w", err)
 	}
 
 	total := w.out.total
@@ -584,18 +585,23 @@ func (w *Writer) writeEmptyFile() (int64, error) {
 	}
 
 	compactOffset := uint64(w.out.total) //nolint:gosec
-	compactN, err := writeCompactTraceIndex(&w.out, nil, w.traceIndex)
+	compactN, err := writeCompactHeader(&w.out, nil, w.traceIndex)
+	if err != nil {
+		return w.out.total, err
+	}
+	compactTracesOffset := uint64(w.out.total) //nolint:gosec
+	compactTracesN, err := writeCompactTraceIndexV3(&w.out, w.traceIndex)
 	if err != nil {
 		return w.out.total, err
 	}
 
-	// Empty files also get a V4 footer with an empty intrinsic section (TOC with 0 columns).
+	// Empty files also get a V6 footer with an empty intrinsic section (TOC with 0 columns).
 	intrinsicOffset, intrinsicLen, err := w.writeIntrinsicSection()
 	if err != nil {
 		return w.out.total, err
 	}
 
-	if err = writeFooterV4(&w.out, headerOffset, compactOffset, uint32(compactN), intrinsicOffset, intrinsicLen); err != nil { //nolint:gosec // safe: compact index size bounded by MaxCompactSectionSize (50MB) fits uint32
+	if err = writeFooterV6(&w.out, headerOffset, compactOffset, uint32(compactN), intrinsicOffset, intrinsicLen, 0, 0, compactTracesOffset, uint32(compactTracesN)); err != nil { //nolint:gosec
 		return w.out.total, err
 	}
 

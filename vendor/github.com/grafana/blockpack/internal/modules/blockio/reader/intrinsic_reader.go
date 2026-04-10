@@ -19,13 +19,17 @@ func (r *Reader) EnsureIntrinsicTOC() error {
 	return r.parseIntrinsicTOC()
 }
 
-// parseIntrinsicTOC reads and parses the intrinsic column TOC from the v4 footer.
+// parseIntrinsicTOC reads and parses the intrinsic column TOC from the v4+ footer.
 // Called during NewReaderFromProvider. For v3 footer files or files with no intrinsic
 // section, this is a no-op.
 // NOTE-003: the parsed TOC map is cached in parsedIntrinsicTOCCache (strong references,
 // entries persist until Clear) to avoid re-decoding the blob on every NewReaderFromProvider call.
 func (r *Reader) parseIntrinsicTOC() error {
-	if r.footerVersion != shared.FooterV4Version || r.intrinsicIndexLen == 0 {
+	// V4+ footers include an intrinsic section. V3 does not.
+	isV4Plus := r.footerVersion == shared.FooterV4Version ||
+		r.footerVersion == shared.FooterV5Version ||
+		r.footerVersion == shared.FooterV6Version
+	if !isV4Plus || r.intrinsicIndexLen == 0 {
 		return nil
 	}
 
