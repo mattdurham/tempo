@@ -28,6 +28,9 @@ type client interface {
 
 // Config configures a MemCache.
 type Config struct {
+	// Registerer is an optional Prometheus registerer.
+	// When non-nil, cache metrics are registered and incremented.
+	Registerer prometheus.Registerer
 	// Servers is the list of memcache server addresses (host:port).
 	Servers []string
 
@@ -38,10 +41,6 @@ type Config struct {
 	// Enabled controls whether the cache is active.
 	// If false, Open returns (nil, nil) and all operations become no-ops.
 	Enabled bool
-
-	// Registerer is an optional Prometheus registerer.
-	// When non-nil, cache metrics are registered and incremented.
-	Registerer prometheus.Registerer
 }
 
 // MemCache is a remote memcache-backed cache that implements filecache.Cache.
@@ -51,10 +50,10 @@ type Config struct {
 type MemCache struct {
 	group      singleflight.Group
 	c          client
-	expiration int32
 	requests   *prometheus.CounterVec
 	bytes      *prometheus.CounterVec
 	errs       *prometheus.CounterVec
+	expiration int32
 }
 
 // Open creates a MemCache connecting to cfg.Servers.

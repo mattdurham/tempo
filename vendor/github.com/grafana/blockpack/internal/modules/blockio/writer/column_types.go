@@ -71,10 +71,10 @@ func (b *stringColumnBuilder) colType() shared.ColumnType {
 	return b.typ
 }
 
-func (b *stringColumnBuilder) buildData(enc *zstdEncoder) ([]byte, error) {
+func (b *stringColumnBuilder) buildData() ([]byte, error) {
 	nRows := len(b.values)
 	if nRows == 0 {
-		return encodeDictionaryKind(KindDictionary, shared.ColumnTypeString, b.values, b.present, 0, enc)
+		return encodeDictionaryKind(KindDictionary, shared.ColumnTypeString, b.values, b.present, 0)
 	}
 
 	// UUID auto-detection: convert to bytes column if all sampled values are UUIDs.
@@ -103,7 +103,7 @@ func (b *stringColumnBuilder) buildData(enc *zstdEncoder) ([]byte, error) {
 				present: b.present,
 				colName: b.colName,
 			}
-			return bb.buildData(enc)
+			return bb.buildData()
 		}
 		// Fall through: non-UUID value found in full scan; use string encoding.
 	}
@@ -114,11 +114,11 @@ func (b *stringColumnBuilder) buildData(enc *zstdEncoder) ([]byte, error) {
 	// encodeDictionaryKind auto-upgrades to RLE when dictionary size ≤ rleCardinalityThreshold.
 	if sparse {
 		return encodeDictionaryKind(
-			KindSparseDictionary, shared.ColumnTypeString, b.values, b.present, nRows, enc,
+			KindSparseDictionary, shared.ColumnTypeString, b.values, b.present, nRows,
 		)
 	}
 	return encodeDictionaryKind(
-		KindDictionary, shared.ColumnTypeString, b.values, b.present, nRows, enc,
+		KindDictionary, shared.ColumnTypeString, b.values, b.present, nRows,
 	)
 }
 
@@ -175,7 +175,7 @@ func (b *int64ColumnBuilder) nullCount() int {
 
 func (b *int64ColumnBuilder) colType() shared.ColumnType { return shared.ColumnTypeInt64 }
 
-func (b *int64ColumnBuilder) buildData(enc *zstdEncoder) ([]byte, error) {
+func (b *int64ColumnBuilder) buildData() ([]byte, error) {
 	nRows := len(b.values)
 
 	nullRatio := 0.0
@@ -187,11 +187,11 @@ func (b *int64ColumnBuilder) buildData(enc *zstdEncoder) ([]byte, error) {
 	// encodeDictionaryKind auto-upgrades to RLE when dictionary size ≤ rleCardinalityThreshold.
 	if sparse {
 		return encodeDictionaryKind(
-			KindSparseDictionary, shared.ColumnTypeInt64, b.values, b.present, nRows, enc,
+			KindSparseDictionary, shared.ColumnTypeInt64, b.values, b.present, nRows,
 		)
 	}
 	return encodeDictionaryKind(
-		KindDictionary, shared.ColumnTypeInt64, b.values, b.present, nRows, enc,
+		KindDictionary, shared.ColumnTypeInt64, b.values, b.present, nRows,
 	)
 }
 
@@ -287,7 +287,7 @@ func (b *uint64ColumnBuilder) nullCount() int {
 
 func (b *uint64ColumnBuilder) colType() shared.ColumnType { return shared.ColumnTypeUint64 }
 
-func (b *uint64ColumnBuilder) buildData(enc *zstdEncoder) ([]byte, error) {
+func (b *uint64ColumnBuilder) buildData() ([]byte, error) {
 	nRows := len(b.values)
 
 	// Cheap cardinality estimate for delta encoding decision — no map allocation.
@@ -296,7 +296,7 @@ func (b *uint64ColumnBuilder) buildData(enc *zstdEncoder) ([]byte, error) {
 	if b.hasVals {
 		cardinality := cheapCardinalityUint64(b.values, b.present)
 		if shouldUseDeltaEncoding(b.minVal, b.maxVal, cardinality) {
-			return encodeDeltaUint64(b.values, b.present, nRows, enc)
+			return encodeDeltaUint64(b.values, b.present, nRows)
 		}
 	}
 
@@ -309,11 +309,11 @@ func (b *uint64ColumnBuilder) buildData(enc *zstdEncoder) ([]byte, error) {
 	// encodeDictionaryKind auto-upgrades to RLE when dictionary size ≤ rleCardinalityThreshold.
 	if sparse {
 		return encodeDictionaryKind(
-			KindSparseDictionary, shared.ColumnTypeUint64, b.values, b.present, nRows, enc,
+			KindSparseDictionary, shared.ColumnTypeUint64, b.values, b.present, nRows,
 		)
 	}
 	return encodeDictionaryKind(
-		KindDictionary, shared.ColumnTypeUint64, b.values, b.present, nRows, enc,
+		KindDictionary, shared.ColumnTypeUint64, b.values, b.present, nRows,
 	)
 }
 
@@ -397,7 +397,7 @@ func (b *float64ColumnBuilder) nullCount() int {
 
 func (b *float64ColumnBuilder) colType() shared.ColumnType { return shared.ColumnTypeFloat64 }
 
-func (b *float64ColumnBuilder) buildData(enc *zstdEncoder) ([]byte, error) {
+func (b *float64ColumnBuilder) buildData() ([]byte, error) {
 	nRows := len(b.values)
 
 	nullRatio := 0.0
@@ -409,11 +409,11 @@ func (b *float64ColumnBuilder) buildData(enc *zstdEncoder) ([]byte, error) {
 	// encodeDictionaryKind auto-upgrades to RLE when dictionary size ≤ rleCardinalityThreshold.
 	if sparse {
 		return encodeDictionaryKind(
-			KindSparseDictionary, shared.ColumnTypeFloat64, b.values, b.present, nRows, enc,
+			KindSparseDictionary, shared.ColumnTypeFloat64, b.values, b.present, nRows,
 		)
 	}
 	return encodeDictionaryKind(
-		KindDictionary, shared.ColumnTypeFloat64, b.values, b.present, nRows, enc,
+		KindDictionary, shared.ColumnTypeFloat64, b.values, b.present, nRows,
 	)
 }
 
@@ -470,7 +470,7 @@ func (b *boolColumnBuilder) nullCount() int {
 
 func (b *boolColumnBuilder) colType() shared.ColumnType { return shared.ColumnTypeBool }
 
-func (b *boolColumnBuilder) buildData(enc *zstdEncoder) ([]byte, error) {
+func (b *boolColumnBuilder) buildData() ([]byte, error) {
 	nRows := len(b.values)
 
 	nullRatio := 0.0
@@ -482,11 +482,11 @@ func (b *boolColumnBuilder) buildData(enc *zstdEncoder) ([]byte, error) {
 	// Bool has at most 2 distinct values — always qualifies for RLE.
 	if sparse {
 		return encodeDictionaryKind(
-			KindSparseRLEIndexes, shared.ColumnTypeBool, b.values, b.present, nRows, enc,
+			KindSparseRLEIndexes, shared.ColumnTypeBool, b.values, b.present, nRows,
 		)
 	}
 	return encodeDictionaryKind(
-		KindRLEIndexes, shared.ColumnTypeBool, b.values, b.present, nRows, enc,
+		KindRLEIndexes, shared.ColumnTypeBool, b.values, b.present, nRows,
 	)
 }
 
@@ -549,7 +549,7 @@ func (b *bytesColumnBuilder) nullCount() int {
 
 func (b *bytesColumnBuilder) colType() shared.ColumnType { return shared.ColumnTypeBytes }
 
-func (b *bytesColumnBuilder) buildData(enc *zstdEncoder) ([]byte, error) {
+func (b *bytesColumnBuilder) buildData() ([]byte, error) {
 	nRows := len(b.values)
 
 	nullRatio := 0.0
@@ -561,31 +561,31 @@ func (b *bytesColumnBuilder) buildData(enc *zstdEncoder) ([]byte, error) {
 	switch {
 	case b.colName == traceIDColumnName:
 		if sparse {
-			return encodeDeltaDictionaryKind(KindSparseDeltaDictionary, b.values, b.present, nRows, enc)
+			return encodeDeltaDictionaryKind(KindSparseDeltaDictionary, b.values, b.present, nRows)
 		}
-		return encodeDeltaDictionaryKind(KindDeltaDictionary, b.values, b.present, nRows, enc)
+		return encodeDeltaDictionaryKind(KindDeltaDictionary, b.values, b.present, nRows)
 
 	case isIDColumn(b.colName):
 		if sparse {
-			return encodeXORBytes(KindSparseXORBytes, b.values, b.present, nRows, enc)
+			return encodeXORBytes(KindSparseXORBytes, b.values, b.present, nRows)
 		}
-		return encodeXORBytes(KindXORBytes, b.values, b.present, nRows, enc)
+		return encodeXORBytes(KindXORBytes, b.values, b.present, nRows)
 
 	case isURLColumn(b.colName):
 		if sparse {
-			return encodePrefixBytes(KindSparsePrefixBytes, b.values, b.present, nRows, enc)
+			return encodePrefixBytes(KindSparsePrefixBytes, b.values, b.present, nRows)
 		}
-		return encodePrefixBytes(KindPrefixBytes, b.values, b.present, nRows, enc)
+		return encodePrefixBytes(KindPrefixBytes, b.values, b.present, nRows)
 
 	default:
 		// Array columns and all others: dictionary encoding.
 		if sparse {
 			return encodeDictionaryKind(
-				KindSparseDictionary, shared.ColumnTypeBytes, b.values, b.present, nRows, enc,
+				KindSparseDictionary, shared.ColumnTypeBytes, b.values, b.present, nRows,
 			)
 		}
 		return encodeDictionaryKind(
-			KindDictionary, shared.ColumnTypeBytes, b.values, b.present, nRows, enc,
+			KindDictionary, shared.ColumnTypeBytes, b.values, b.present, nRows,
 		)
 	}
 }

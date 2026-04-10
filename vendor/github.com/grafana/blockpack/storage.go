@@ -18,8 +18,8 @@ import (
 	minio "github.com/minio/minio-go/v7"
 
 	modules_compaction "github.com/grafana/blockpack/internal/modules/blockio/compaction"
-	modules_embedder "github.com/grafana/blockpack/internal/modules/embedder"
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
+	modules_embedder "github.com/grafana/blockpack/internal/modules/embedder"
 	modules_rw "github.com/grafana/blockpack/internal/modules/rw"
 	"github.com/grafana/blockpack/internal/otlpconvert"
 	"github.com/grafana/blockpack/internal/s3provider"

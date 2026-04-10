@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"runtime"
 	"slices"
-	"sync"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
 	modules_shared "github.com/grafana/blockpack/internal/modules/blockio/shared"
@@ -779,16 +781,21 @@ func forEachBlockInGroups(
 		err  error
 	}
 	fetched := make([]fetchResult, len(groups))
-	var wg sync.WaitGroup
+	// OOM guard: bound parallel I/O goroutines to NumCPU to prevent unbounded
+	// goroutine fan-out when groups is large (e.g. many disjoint block reads).
+	eg := &errgroup.Group{}
+	eg.SetLimit(runtime.NumCPU())
 	for i, group := range groups {
-		wg.Add(1)
-		go func(i int, group modules_shared.CoalescedRead) {
-			defer wg.Done()
+		i, group := i, group // capture loop variables for goroutine closure
+		eg.Go(func() error {
 			data, err := r.ReadGroup(group)
 			fetched[i] = fetchResult{data: data, err: err}
-		}(i, group)
+			return err
+		})
 	}
-	wg.Wait()
+	if err := eg.Wait(); err != nil {
+		return fmt.Errorf("%s ReadGroup parallel fetch: %w", callerName, err)
+	}
 
 	// Phase 2: parse and invoke fn sequentially.
 	// Reader.ParseBlockFromBytes is not safe for concurrent use on the same Reader.

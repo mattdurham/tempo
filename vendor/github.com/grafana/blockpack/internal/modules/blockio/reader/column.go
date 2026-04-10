@@ -9,29 +9,10 @@ import (
 	"sync"
 	"unsafe"
 
-	"github.com/grafana/blockpack/internal/modules/blockio/shared"
 	"github.com/klauspost/compress/zstd"
-)
 
-// zstdDecoder is a package-level zstd decoder shared across calls.
-var (
-	zstdDecoderOnce sync.Once
-	zstdDec         *zstd.Decoder
+	"github.com/grafana/blockpack/internal/modules/blockio/shared"
 )
-
-// decompScratchPool holds reusable scratch buffers for zstd decompression during
-// block parsing. A single scratch buffer is acquired per parseBlockColumnsReuse call
-// and reused across all column decodings within that block.
-//
-// INVARIANT: callers MUST NOT hold references to bytes returned by decompressZstdScratch
-// after calling decompressZstdScratch again with the same scratch pointer. All data
-// must be extracted into typed Go values (or copied) before the next call.
-var decompScratchPool = &sync.Pool{ //nolint:gochecknoglobals
-	New: func() any {
-		b := make([]byte, 0, 256*1024)
-		return &b
-	},
-}
 
 // internMapPool holds reusable string intern maps for block parsing.
 // Each map is cleared before return to prevent cross-block string retention.
@@ -93,6 +74,13 @@ func releasePresentRowsScratch(sp *[]int) {
 	presentRowsScratchPool.Put(sp)
 }
 
+// zstdDecoder is a package-level zstd decoder shared across calls.
+// Used only for the vectorF32 column decoder path.
+var (
+	zstdDecoderOnce sync.Once
+	zstdDec         *zstd.Decoder //nolint:gochecknoglobals
+)
+
 func getZstdDecoder() *zstd.Decoder {
 	zstdDecoderOnce.Do(func() {
 		var err error
@@ -101,53 +89,59 @@ func getZstdDecoder() *zstd.Decoder {
 			panic(fmt.Sprintf("reader: zstd.NewReader: %v", err))
 		}
 	})
-
 	return zstdDec
 }
 
-func acquireDecompScratch() *[]byte {
-	return decompScratchPool.Get().(*[]byte)
-}
-
-func releaseDecompScratch(s *[]byte) {
-	*s = (*s)[:0]
-	decompScratchPool.Put(s)
-}
-
-// decompressZstdScratch decompresses a zstd-compressed segment into scratch,
-// reusing the backing array across calls. The returned slice is valid only until
-// the next call to decompressZstdScratch with the same scratch pointer.
+// decompressZstdScratch decompresses a length-prefixed zstd-compressed segment from data[pos:].
+// The returned slice is valid only until the next call with the same scratch pointer.
+// Used only for the vectorF32 column decoder path.
 func decompressZstdScratch(data []byte, pos int, scratch *[]byte) ([]byte, int, error) {
 	if pos+4 > len(data) {
 		return nil, pos, fmt.Errorf("decompressZstd: need 4 bytes for length at pos %d, have %d", pos, len(data))
 	}
-
 	cLen := int(binary.LittleEndian.Uint32(data[pos:]))
 	pos += 4
-
 	if pos+cLen > len(data) {
 		return nil, pos, fmt.Errorf(
 			"decompressZstd: need %d compressed bytes at pos %d, have %d",
 			cLen, pos, len(data),
 		)
 	}
-
 	*scratch = (*scratch)[:0]
 	result, err := getZstdDecoder().DecodeAll(data[pos:pos+cLen], *scratch)
 	if err != nil {
 		return nil, pos, fmt.Errorf("decompressZstd: %w", err)
 	}
-
 	*scratch = result
 	return result, pos + cLen, nil
 }
 
+// readRawSegment reads a length-prefixed raw segment (raw_len[4]+raw_data) from data[pos:].
+// Returns the raw bytes slice and the new position after the segment.
+func readRawSegment(data []byte, pos int) ([]byte, int, error) {
+	if pos+4 > len(data) {
+		return nil, pos, fmt.Errorf("readRawSegment: need 4 bytes for length at pos %d, have %d", pos, len(data))
+	}
+
+	rLen := int(binary.LittleEndian.Uint32(data[pos:]))
+	pos += 4
+
+	if pos+rLen > len(data) {
+		return nil, pos, fmt.Errorf(
+			"readRawSegment: need %d bytes at pos %d, have %d",
+			rLen, pos, len(data),
+		)
+	}
+
+	return data[pos : pos+rLen], pos + rLen, nil
+}
+
 // decodeCtx bundles per-parse and per-reader state threaded through column decoders.
-// scratch is acquired from decompScratchPool for each block parse and must not be nil.
 // intern is the owning Reader's string intern table and must not be nil.
+// scratch is used only by the vectorF32 decoder path (zstd-compressed float data).
 type decodeCtx struct {
-	scratch *[]byte           // pooled zstd output buffer, reused across columns in one block
 	intern  map[string]string // per-reader string intern map, single-goroutine only
+	scratch *[]byte           // reusable zstd output buffer for vectorF32 decoder; may be nil
 }
 
 // internString looks up b in ctx.intern and returns the interned string.
@@ -237,7 +231,7 @@ func readIndexArray(data []byte, pos int, count int, indexWidth uint8) ([]uint32
 
 // readColumnEncoding reads enc_version[1] + encoding_kind[1] then dispatches.
 // colType is passed through so dictionary decoders can populate the correct typed fields.
-// ctx carries the pooled decompression scratch buffer and the per-reader intern table.
+// ctx carries the per-reader intern table.
 func readColumnEncoding(data []byte, spanCount int, colType shared.ColumnType, ctx *decodeCtx) (*Column, error) {
 	if len(data) < 2 {
 		return nil, fmt.Errorf("column encoding: data too short (%d bytes)", len(data))
@@ -251,8 +245,8 @@ func readColumnEncoding(data []byte, spanCount int, colType shared.ColumnType, c
 	}
 
 	encVersion := data[0]
-	if encVersion != shared.ColumnEncodingVersion {
-		return nil, fmt.Errorf("column encoding: unsupported version %d", encVersion)
+	if encVersion != shared.VersionBlockEncV3 {
+		return nil, fmt.Errorf("column encoding: unsupported version %d (only enc_version=3 supported)", encVersion)
 	}
 
 	kind := data[1]
@@ -277,9 +271,9 @@ func readColumnEncoding(data []byte, spanCount int, colType shared.ColumnType, c
 	}
 }
 
-// decodePresenceOnly skips past compressed blobs using length prefixes and decodes
+// decodePresenceOnly skips past raw sub-segment blobs using length prefixes and decodes
 // only the uncompressed presence RLE. Called once per column during lazy registration.
-// No zstd decompression — O(M/8) where M is span count.
+// O(M/8) where M is span count.
 // NOTE-001: lazy registration path — presence available immediately, values deferred.
 // NOTE-010 (shared/NOTES.md): ColumnTypeVectorF32 columns are fully zstd-compressed;
 // colType is required to dispatch correctly before reading enc_version.
@@ -308,8 +302,8 @@ func decodePresenceOnly(data []byte, spanCount int, colType shared.ColumnType) (
 	}
 
 	encVersion := data[0]
-	if encVersion != shared.ColumnEncodingVersion {
-		return nil, fmt.Errorf("decodePresenceOnly: unsupported enc_version %d", encVersion)
+	if encVersion != shared.VersionBlockEncV3 {
+		return nil, fmt.Errorf("decodePresenceOnly: unsupported enc_version %d (only enc_version=3 supported)", encVersion)
 	}
 
 	kind := data[1]
@@ -378,11 +372,8 @@ func (c *Column) decodeNow() {
 		if c.rawEncoding == nil {
 			return
 		}
-		scratch := acquireDecompScratch()
-		ctx := &decodeCtx{scratch: scratch, intern: c.internMap}
+		ctx := &decodeCtx{intern: c.internMap}
 		decoded, err := readColumnEncoding(c.rawEncoding, c.SpanCount, c.Type, ctx)
-		releaseDecompScratch(scratch)
-
 		if err != nil {
 			c.rawEncoding = nil
 			c.internMap = nil
@@ -532,7 +523,7 @@ func decodeDictionary(
 	pos := 1
 
 	// dict_len[4] + dict_zstd — decompressed into scratch; data extracted before next scratch use.
-	dictBytes, newPos, err := decompressZstdScratch(data, pos, ctx.scratch)
+	dictBytes, newPos, err := readRawSegment(data, pos)
 	if err != nil {
 		return nil, fmt.Errorf("dictionary: %w", err)
 	}
@@ -770,7 +761,7 @@ func decodeDeltaUint64(data []byte, spanCount int, ctx *decodeCtx) (*Column, err
 		}
 	} else {
 		// Read compressed offset array — decompressed into scratch; values extracted before next scratch use.
-		offsetBytes, _, err := decompressZstdScratch(data, pos, ctx.scratch)
+		offsetBytes, _, err := readRawSegment(data, pos)
 		if err != nil {
 			return nil, fmt.Errorf("delta_uint64: offsets: %w", err)
 		}
@@ -834,7 +825,7 @@ func decodeRLEIndexes(
 	pos := 1
 
 	// dict_len[4] + dict_zstd — decompressed into scratch; data extracted before next scratch use.
-	dictBytes, newPos, err := decompressZstdScratch(data, pos, ctx.scratch)
+	dictBytes, newPos, err := readRawSegment(data, pos)
 	if err != nil {
 		return nil, fmt.Errorf("rle_indexes: dict: %w", err)
 	}
@@ -947,7 +938,7 @@ func decodeXORBytes(data []byte, kind uint8, spanCount int, ctx *decodeCtx) (*Co
 
 	// xor_len[4] + xor_data_zstd — decompressed into scratch; each row value is XOR-decoded
 	// into a fresh make([]byte,...) before the next scratch use, so scratch is not retained.
-	xorBytes, _, err := decompressZstdScratch(data, pos, ctx.scratch)
+	xorBytes, _, err := readRawSegment(data, pos)
 	if err != nil {
 		return nil, fmt.Errorf("xor_bytes: payload: %w", err)
 	}
@@ -1042,7 +1033,7 @@ func decodePrefixBytes(data []byte, kind uint8, spanCount int, ctx *decodeCtx) (
 
 	// prefix_dict_len[4] + prefix_dict_zstd — decompressed into scratch; all prefix data
 	// is copy()-d into fresh allocations before the next scratch use (suffix decompression).
-	prefixDictBytes, newPos, err := decompressZstdScratch(data, pos, ctx.scratch)
+	prefixDictBytes, newPos, err := readRawSegment(data, pos)
 	if err != nil {
 		return nil, fmt.Errorf("prefix_bytes: prefix_dict: %w", err)
 	}
@@ -1078,7 +1069,7 @@ func decodePrefixBytes(data []byte, kind uint8, spanCount int, ctx *decodeCtx) (
 
 	// suffix_data_len[4] + suffix_data_zstd — scratch reuse is safe here because
 	// prefixDictBytes (first scratch use) is fully consumed above before this call.
-	suffixBytes, _, err := decompressZstdScratch(data, pos, ctx.scratch)
+	suffixBytes, _, err := readRawSegment(data, pos)
 	if err != nil {
 		return nil, fmt.Errorf("prefix_bytes: suffix_data: %w", err)
 	}
@@ -1165,7 +1156,7 @@ func decodeDeltaDictionary(data []byte, kind uint8, spanCount int, ctx *decodeCt
 	pos := 1
 
 	// dict_len[4] + dict_zstd — decompressed into scratch; data extracted before next scratch use.
-	dictBytes, newPos, err := decompressZstdScratch(data, pos, ctx.scratch)
+	dictBytes, newPos, err := readRawSegment(data, pos)
 	if err != nil {
 		return nil, fmt.Errorf("delta_dict: dict: %w", err)
 	}
@@ -1201,7 +1192,7 @@ func decodeDeltaDictionary(data []byte, kind uint8, spanCount int, ctx *decodeCt
 
 	// delta_len[4] + delta_data_zstd — scratch reuse is safe: dictBytes (first scratch use)
 	// is fully consumed by decodeDictBody above before this call resets scratch.
-	deltaBytes, _, err := decompressZstdScratch(data, pos, ctx.scratch)
+	deltaBytes, _, err := readRawSegment(data, pos)
 	if err != nil {
 		return nil, fmt.Errorf("delta_dict: delta: %w", err)
 	}
@@ -1310,7 +1301,13 @@ func decodeVectorF32(data []byte, spanCount int, ctx *decodeCtx) (*Column, error
 	}
 
 	// Read length-prefixed zstd float data.
-	floatBytes, _, err := decompressZstdScratch(data, off, ctx.scratch)
+	// Use ctx.scratch if set (pooled caller), else use a local scratch buffer.
+	scratchPtr := ctx.scratch
+	var localScratch []byte
+	if scratchPtr == nil {
+		scratchPtr = &localScratch
+	}
+	floatBytes, _, err := decompressZstdScratch(data, off, scratchPtr)
 	if err != nil {
 		return nil, fmt.Errorf("vectorF32: float data: %w", err)
 	}

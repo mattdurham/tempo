@@ -1026,13 +1026,257 @@ occurs at ingest time. Block-level pruning operates on the `ColumnTypeRangeStrin
 Back-ref: `internal/modules/blockio/writer/writer_log_body.go:parseLogBody`,
           `internal/modules/blockio/writer/writer_log.go:addLogRecordFromProto`
 
-## 12. Per-File Timestamp Index (TS Index)
+---
+
+## 12. V14 Format — Per-Column Snappy, Sectioned Metadata, Footer V5
+*Added: 2026-04-10*
+
+V14 replaces V12/V13 (footer V3/V4) with a redesigned format. No backward compatibility
+is maintained; V14 files cannot be read by V12/V13 readers, and vice versa.
+
+### 12.0 Complete V14 Format Diagram
+
+```
+╔══════════════════════════════════════════════════════════════════════════════════════╗
+║              BLOCKPACK FILE FORMAT  v14 — per-column snappy, single-tier blocks     ║
+╠══════════════════════════════════════════════════════════════════════════════════════╣
+║  byte 0                                                                              ║
+║  ┌────────────────────────────────────────────────────────────────────────────────┐ ║
+║  │ BLOCK 0                                                                        │ ║
+║  │  ┌──────────────────────────────────────────────────────────────────────────┐  │ ║
+║  │  │ BLOCK HEADER  (24 bytes — same layout as V12 header)                      │  │ ║
+║  │  │  magic[4]=0xC011FEA1 · version[1]=14 · reserved[3]                       │  │ ║
+║  │  │  span_count[4] · column_count[4]                                          │  │ ║
+║  │  │  reserved2[8] (zeros)                                                     │  │ ║
+║  │  ├──────────────────────────────────────────────────────────────────────────┤  │ ║
+║  │  │ COLUMN TOC  (column_count × entry)                                        │  │ ║
+║  │  │  name_len[1] · name · type[1]                                             │  │ ║
+║  │  │  data_offset[4] · compressed_len[4] · uncompressed_len[4]                │  │ ║
+║  │  ├──────────────────────────────────────────────────────────────────────────┤  │ ║
+║  │  │ COLUMN DATA  (one snappy blob per column)                                 │  │ ║
+║  │  │  Each blob = snappy.Encode(rawEncodingPayload, enc_version=3)             │  │ ║
+║  │  └──────────────────────────────────────────────────────────────────────────┘  │ ║
+║  ├─ BLOCK 1 (same structure) ────────────────────────────────────────────────────┤ ║
+║  ├─ ...                                                                            │ ║
+║  └─ BLOCK N-1                                                                      ║
+║                                                                                      ║
+║  ── FILE-LEVEL SECTIONS (each independently snappy-compressed) ──────────────────  ║
+║  ┌────────────────────────────────────────────────────────────────────────────────┐ ║
+║  │ BLOCK INDEX SECTION    (type=0x01, snappy-compressed)                          │ ║
+║  │   block_count[4] + per-block {offset[8]+length[8]+kind[1]+span_count[4]+...} │ ║
+║  ├────────────────────────────────────────────────────────────────────────────────┤ ║
+║  │ RANGE INDEX SECTION    (type=0x02, snappy-compressed)                          │ ║
+║  │   range_count[4] + per-column entries (same as §5.2 above)                     │ ║
+║  ├────────────────────────────────────────────────────────────────────────────────┤ ║
+║  │ TRACE ID INDEX SECTION (type=0x03, snappy-compressed)                          │ ║
+║  │   Same format as §6 Compact Trace Index version 2:                             │ ║
+║  │   magic[4]+version[1]+block_count[4]+bloom_bytes[4]+bloom_data+block_table     │ ║
+║  │   +trace_count[4]+trace_entries (§5.3 version 2 format)                        │ ║
+║  ├────────────────────────────────────────────────────────────────────────────────┤ ║
+║  │ TS INDEX SECTION       (type=0x04, snappy-compressed)                          │ ║
+║  │   magic[4]=0xC011FEED+version[1]+count[4]+entries[N×20] (same as §5.x)        │ ║
+║  ├────────────────────────────────────────────────────────────────────────────────┤ ║
+║  │ SKETCH INDEX SECTION   (type=0x05, snappy-compressed)                          │ ║
+║  │   SKTE format: magic[4]+num_blocks[4]+num_columns[4]+per-column SKTE data      │ ║
+║  ├────────────────────────────────────────────────────────────────────────────────┤ ║
+║  │ FILE BLOOM SECTION     (type=0x06, snappy-compressed)                          │ ║
+║  │   existing FBLM format (per-column BinaryFuse8 filters)                         │ ║
+║  ├────────────────────────────────────────────────────────────────────────────────┤ ║
+║  │ FILE-LEVEL INTRINSIC COLUMN BLOBS  (one snappy blob per column)                │ ║
+║  │   Each blob directly addressed via name-keyed section dir entry                │ ║
+║  │   No separate TOC blob — column name → (offset, compressed_len) in dir        │ ║
+║  │   e.g.: "span:name", "span:duration", "resource.service.name" blobs            │ ║
+║  └────────────────────────────────────────────────────────────────────────────────┘ ║
+║                                                                                      ║
+║  ── SECTION DIRECTORY ────────────────────────────────────────────────────────────  ║
+║  ┌────────────────────────────────────────────────────────────────────────────────┐ ║
+║  │ SECTION DIRECTORY  (snappy-compressed)                                         │ ║
+║  │   entry_count[4]                                                               │ ║
+║  │   Type-keyed (entry_kind=0x00): entry_kind[1]+type[1]+offset[8]+clen[4]=14B   │ ║
+║  │   Name-keyed (entry_kind=0x01): entry_kind[1]+nlen[2]+name+offset[8]+clen[4]  │ ║
+║  └────────────────────────────────────────────────────────────────────────────────┘ ║
+║                                                                                      ║
+║  file_size - 18  (footer always 18 bytes)                                           ║
+║  ┌────────────────────────────────────────────────────────────────────────────────┐ ║
+║  │ FOOTER V5  (18 bytes)                                                           │ ║
+║  │  magic[4]=0xC011FEA1 · version[2]=5 · dir_offset[8] · dir_len[4]              │ ║
+║  └────────────────────────────────────────────────────────────────────────────────┘ ║
+╚══════════════════════════════════════════════════════════════════════════════════════╝
+```
+
+### 12.1 V14 Block Header (24 bytes)
+
+The V14 block header is identical in layout to the V12 block header (24 bytes). The fields
+at offsets 12–23 retain the same layout: `column_count[4]` followed by `reserved2[8]`
+(all zeros). A two-tier split (intrinsic/attribute counts + two TOC offsets) was evaluated
+and deferred pending further profiling (see SPEC-ROOT-014).
+
+| Field | Type | Bytes | Offset | Description |
+|---|---|---|---|---|
+| magic | uint32 LE | 4 | 0 | Must equal 0xC011FEA1 |
+| version | uint8 | 1 | 4 | Must equal 14 (VersionBlockV14) |
+| reserved | [3]byte | 3 | 5 | Must be zero |
+| span_count | uint32 LE | 4 | 8 | Number of spans in this block |
+| column_count | uint32 LE | 4 | 12 | Total number of columns in this block |
+| reserved2 | [8]byte | 8 | 16 | Must be zero |
+
+### 12.2 V14 Column TOC Entry
+
+V14 uses a single unified column TOC immediately following the block header. All columns
+(intrinsic and attribute alike) are stored in a single flat list.
+
+**Column TOC entry** (2+N+1+8+4+4 = 19+N bytes):
+
+| Field | Type | Bytes | Description |
+|---|---|---|---|
+| name_len | uint16 LE | 2 | Column name length in bytes |
+| name | bytes | N | Column name (UTF-8) |
+| col_type | uint8 | 1 | ColumnType enum |
+| data_offset | uint64 LE | 8 | Offset of column blob from block start |
+| compressed_len | uint32 LE | 4 | Byte length of snappy blob on disk |
+| uncompressed_len | uint32 LE | 4 | Byte length after snappy decompress |
+
+Column classification (intrinsic vs attribute) is still available via
+`shared.IsIntrinsicColumn(name)` for query-level filtering, but is not encoded in the
+block wire format. See §12.7 for the classification rule and query filtering implications.
+
+### 12.3 V14 Column Blob Format (enc_version=3)
+
+Each column blob on disk = `snappy.Encode(rawBlob)`. After decompression:
+
+```
+enc_version    uint8  = 3     // VersionBlockEncV3 — no internal zstd sub-segments
+encoding_kind  uint8          // same kind table as §9
+```
+
+Followed by encoding-specific bytes using the same wire format as §9 EXCEPT:
+- All `*_zstd[len+data]` sub-segments are replaced by `*_raw[len+data]` (raw bytes, no zstd).
+- `len` fields remain uint32 LE (unchanged).
+- Snappy compression is applied once at the column level (outside); zstd is entirely absent.
+
+### 12.4 V14 Footer (FooterV5, 18 bytes)
+
+The V14 footer occupies the last 18 bytes of every V14 file.
+
+| Field | Type | Bytes | Description |
+|---|---|---|---|
+| magic | uint32 LE | 4 | Must equal MagicNumber (0xC011FEA1) |
+| version | uint16 LE | 2 | Must equal FooterV5Version (5) |
+| dir_offset | uint64 LE | 8 | Absolute byte offset of snappy-compressed section directory |
+| dir_len | uint32 LE | 4 | Byte length of snappy-compressed section directory |
+
+### 12.5 Section Directory
+
+The section directory is a snappy-compressed blob at `dir_offset` with byte length
+`dir_len`. After snappy decompression:
+
+```
+entry_count   uint32 LE
+[entry_count entries — each starts with entry_kind[1]]
+```
+
+**Type-keyed entry** (`entry_kind == 0x00` = `DirEntryKindType`) — 14 bytes:
+```
+entry_kind      uint8        // 0x00
+section_type    uint8        // one of SectionBlockIndex..SectionFileBloom (0x01–0x06)
+offset          uint64 LE    // absolute file byte offset of section data
+compressed_len  uint32 LE    // byte length of section snappy blob on disk
+```
+
+**Name-keyed entry** (`entry_kind == 0x01` = `DirEntryKindName`) — 15+len(name) bytes:
+```
+entry_kind      uint8        // 0x01
+name_len        uint16 LE    // byte length of column name
+name            bytes        // column name (UTF-8), name_len bytes
+offset          uint64 LE    // absolute file byte offset of column blob
+compressed_len  uint32 LE    // byte length of column snappy blob on disk
+```
+
+Name-keyed entries are used for file-level intrinsic column blobs. Each intrinsic column
+gets its own entry, enabling direct per-column addressing without a separate TOC read.
+
+**Signal-type entry** (`entry_kind == 0x02` = `DirEntryKindSignal`) — 2 bytes total:
+```
+entry_kind      uint8        // 0x02
+signal_type     uint8        // SignalTypeTrace=0x01 or SignalTypeLog=0x02
+```
+
+Exactly one signal-type entry is written per V14 file. It identifies whether the file
+contains OTEL trace spans or log records. Readers that find no signal-type entry default
+to `SignalTypeTrace`.
+
+**Directory entry count:** A V14 file with K intrinsic columns writes up to `6 + 1 + K`
+directory entries: up to 6 type-keyed entries (0x01–0x06; SectionSketchIndex and
+SectionFileBloom are omitted when empty), 1 signal-type entry (0x02), and K name-keyed
+entries (0x01). Entry order within the directory is unspecified; readers dispatch on
+`entry_kind` and MUST NOT rely on positional ordering.
+
+Back-ref: `internal/modules/blockio/shared/constants.go` (V14 constants),
+`internal/modules/blockio/shared/types.go:DirEntryType`, `types.go:DirEntryName`,
+`internal/modules/blockio/writer/writer_block.go` (block header + column TOC writes),
+`internal/modules/blockio/writer/metadata.go:writeFooterV5`,
+`internal/modules/blockio/reader/parser.go:readFooter`,
+`internal/modules/blockio/reader/parser.go:readSectionDirectory`
+
+### 12.6 ColDirEntry — File-Level Column Presence Index
+
+The name-keyed section directory entries (entry_kind=0x01) form a file-level column presence
+index: by scanning the directory alone, a reader can answer "does column X exist in this
+file?" without issuing any block I/O. This enables query planning to skip files that lack
+required columns entirely.
+
+At query time:
+- The section directory is read once (18-byte footer → `dir_offset`/`dir_len` → one
+  snappy-compressed read).
+- `SectionDirectory.NameEntries` maps each intrinsic column name to its `(offset,
+  compressed_len)` — sufficient for direct per-column access.
+- Block-level TOC reads are only issued when the executor needs to decode column values
+  from individual blocks.
+
+### 12.7 Query Filtering Hierarchy
+
+V14 files support multi-level pruning that short-circuits evaluation as early as possible.
+Each layer eliminates candidates before issuing the next, more expensive check:
+
+```
+1. File bloom filter (SectionFileBloom, type=0x06)
+   Fast probabilistic check: does file contain any matching attribute values?
+   No block I/O — bloom bytes read from section directory entry.
+
+2. Range/time index (SectionRangeIndex=0x02, SectionTSIndex=0x04)
+   Eliminates files (and, within a file, entire block ranges) whose min/max bounds
+   exclude the query predicate. No block I/O.
+
+3. Trace ID index (SectionTraceIndex=0x03)
+   For GetTraceByID: maps trace IDs to block IDs. Block I/O only for matched blocks.
+
+4. Intrinsic columns (block-level column TOC + snappy blobs filtered by IsIntrinsicColumn)
+   Read only if a query predicate targets an intrinsic column (span:name, span:duration,
+   resource.service.name, etc.). Attribute column blobs are skipped in-memory when
+   `wantColumns` contains only intrinsic names.
+
+5. Attribute columns (block-level column TOC + snappy blobs filtered by !IsIntrinsicColumn)
+   Read only if a query predicate targets a user-defined attribute column.
+   Skipped entirely for intrinsic-only queries.
+```
+
+**Invariant:** A query that filters solely on intrinsic columns (layer 4) never decodes
+attribute column blobs. Column filtering is performed in-memory after the single block I/O
+by checking `shared.IsIntrinsicColumn(name)` against `wantColumns`.
+
+Back-ref: `internal/modules/blockio/shared/column_classify.go:IsIntrinsicColumn`,
+`internal/modules/executor/stream.go:ProgramWantColumns`,
+`internal/modules/blockio/reader/columnar_read.go:ReadGroupColumnar`
+
+---
+
+## 13. Per-File Timestamp Index (TS Index)
 
 The TS index is an optional section appended to the decompressed metadata after the trace
 block index. It is written by all new files (2026-03-02 onward). Old files that lack this
 section are handled gracefully by the reader.
 
-### 12.1 Wire Format (little-endian)
+### 13.1 Wire Format (little-endian)
 
 ```
 magic[4]    = 0xC011FEED
@@ -1044,19 +1288,19 @@ per entry (20 bytes):
   block_id[4] = index into the block index array (0-based)
 ```
 
-### 12.2 Ordering
+### 13.2 Ordering
 
 Entries are sorted by min_ts ascending. This enables O(log N) binary search for blocks
 overlapping a query time window.
 
-### 12.3 Overlap Semantics
+### 13.3 Overlap Semantics
 
 A block overlaps query window [queryMin, queryMax] when:
   block.max_ts >= queryMin  AND  block.min_ts <= queryMax
 
 Blocks with min_ts == max_ts == 0 (unknown time; trace files) are always included.
 
-### 12.4 Backward Compatibility
+### 13.4 Backward Compatibility
 
 Old readers that do not know about this section will ignore trailing bytes in the metadata
 section (the metadata parser is pos-based and does not assert pos == len(data) at end).

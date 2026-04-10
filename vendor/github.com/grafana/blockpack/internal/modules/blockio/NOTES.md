@@ -1500,3 +1500,52 @@ version at compile time. No runtime overhead. Any future change to binary-search
 needs to be made in exactly one place.
 
 Back-ref: `internal/modules/blockio/writer/range_index.go:findBucket`
+
+## 55. NOTE-V14-001 — V14 Format: Single-Tier Block Layout
+*Added: 2026-04-10*
+
+**Decision:** V14 blocks use a single unified column TOC following the 24-byte block header.
+All columns — intrinsic and attribute alike — are stored in one flat list with a uniform
+entry format: `name_len[2 LE] + name[N] + col_type[1] + data_offset[8 LE] +
+compressed_len[4 LE] + uncompressed_len[4 LE]`. There is no separate per-tier TOC or
+per-tier data region at the block level.
+
+**Why single-tier (two-tier deferred):**
+A two-tier layout (separate intrinsic/attr TOC regions with intrinsic_toc_offset and
+attr_toc_offset in the block header) was evaluated but deferred (SPEC-ROOT-014). The
+performance win from skipping the attr TOC is captured instead at the file level via the
+section directory: file-level intrinsic columns have name-keyed section directory entries
+that allow direct per-column addressing without any block I/O. At the block level, the
+unified TOC is small enough (proportional to column count) that parsing it in full is
+faster than the additional logic of per-tier dispatch.
+
+**How to apply:** The writer writes a single column TOC per block in `blockBuilder.finalize()`.
+The reader parses it with `parseColumnMetadataArray` and uses `shared.IsIntrinsicColumn(name)`
+at query time to route columnar reads, not during TOC parsing.
+
+Back-ref: `internal/modules/blockio/shared/column_classify.go:IsIntrinsicColumn`,
+`internal/modules/blockio/writer/writer_block.go:finalize`,
+`internal/modules/blockio/reader/block_parser.go:parseColumnMetadataArray`
+
+## 56. NOTE-V14-002 — IsIntrinsicColumn Promoted to shared Package
+*Added: 2026-04-10*
+
+**Decision:** `IsIntrinsicColumn(name string) bool` is defined in
+`internal/modules/blockio/shared/` rather than in the writer or reader package.
+
+**Why:** Both the writer (for tier routing during block finalization) and the reader (for
+per-tier TOC parsing and columnar read optimization) need the same classification predicate.
+Placing it in `shared/` avoids an import cycle between writer and reader, and ensures both
+sides always agree on which columns are intrinsic. Any change to the classification rule
+takes effect in both directions simultaneously.
+
+**Classification rule:** `IsIntrinsicColumn` uses a fixed allow-list (a Go `map[string]struct{}`),
+not prefix matching. The set covers trace signal intrinsics (`trace:id`, `span:*` fields,
+`resource.service.name`) and log signal intrinsics (`log:*` fields). See
+`shared/column_classify.go:intrinsicColumnSet` for the canonical list. All column names
+absent from the allow-list are classified as attribute (user-defined).
+
+**How to apply:** Call `shared.IsIntrinsicColumn(colName)` at the point of tier assignment.
+Do not replicate this logic inline in writer or reader code.
+
+Back-ref: `internal/modules/blockio/shared/column_classify.go:IsIntrinsicColumn`

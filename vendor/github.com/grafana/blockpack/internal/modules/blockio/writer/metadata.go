@@ -10,8 +10,6 @@ import (
 	"math"
 	"slices"
 
-	"github.com/golang/snappy"
-
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
 )
 
@@ -295,19 +293,6 @@ func writeTraceBlockIndexSection(_ io.Writer, traceIndex map[[16]byte][]uint16) 
 	return buf.Bytes(), nil
 }
 
-// writeFileHeader writes the 22-byte file header.
-// Layout: magic[4] + version[1] + metadataOffset[8] + metadataLen[8] + signalType[1].
-func writeFileHeader(w io.Writer, version uint8, metadataOffset, metadataLen uint64, signalType uint8) error {
-	var buf [22]byte
-	binary.LittleEndian.PutUint32(buf[0:], shared.MagicNumber)
-	buf[4] = version
-	binary.LittleEndian.PutUint64(buf[5:], metadataOffset)
-	binary.LittleEndian.PutUint64(buf[13:], metadataLen)
-	buf[21] = signalType
-	_, err := w.Write(buf[:])
-	return err
-}
-
 // NOTE-36: bloom-enabled compact index (v2) — see SPECS.md §6
 // writeCompactTraceIndex writes the compact trace index section (version 2).
 // Format: magic[4] + version[1]=2 + block_count[4] + bloom_bytes[4] + bloom_data[N] +
@@ -373,165 +358,17 @@ func writeCompactTraceIndex(
 	return int64(n), err
 }
 
-// NOTE-38: compact section v3 — split bloom header (uncompressed) from trace index (snappy)
-// writeCompactHeader writes the small uncompressed header section for compact index v3.
-// Format: magic[4] + version[1]=3 + block_count[4] + bloom_bytes[4] + bloom_data[N] + block_table[block_count×12]
-// The section is stored raw (no snappy) so the bloom filter can be range-read and used directly.
-// Returns bytes written.
-func writeCompactHeader(
-	w io.Writer,
-	blockMetas []shared.BlockMeta,
-	traceIndex map[[16]byte][]uint16,
-) (int64, error) {
-	var buf bytes.Buffer
-
-	// magic[4 LE] = 0xC01DC1DE
-	var tmp4 [4]byte
-	binary.LittleEndian.PutUint32(tmp4[:], shared.CompactIndexMagic)
-	buf.Write(tmp4[:])
-
-	// version[1] = 3 (split format)
-	buf.WriteByte(shared.CompactIndexVersion3)
-
-	// block_count[4 LE]
-	binary.LittleEndian.PutUint32(
-		tmp4[:],
-		uint32(len(blockMetas)), //nolint:gosec // safe: block count bounded by MaxBlocks
-	)
-	buf.Write(tmp4[:])
-
-	// Build trace ID bloom filter from all trace IDs in the index.
-	bloomSize := shared.TraceIDBloomSize(len(traceIndex))
-	bloom := make([]byte, bloomSize)
-	for tid := range traceIndex {
-		shared.AddTraceIDToBloom(bloom, tid)
-	}
-
-	// bloom_bytes[4 LE] + bloom_data[bloom_bytes]
-	binary.LittleEndian.PutUint32(
-		tmp4[:],
-		uint32(bloomSize), //nolint:gosec // safe: bloom size bounded by TraceIDBloomMaxBytes (1MB) fits uint32
-	)
-	buf.Write(tmp4[:])
-	buf.Write(bloom)
-
-	// block_table: block_count × { file_offset[8 LE] + file_length[4 LE] }
-	for _, m := range blockMetas {
-		var tmp8 [8]byte
-		binary.LittleEndian.PutUint64(tmp8[:], m.Offset)
-		buf.Write(tmp8[:])
-		binary.LittleEndian.PutUint32(
-			tmp4[:],
-			uint32(m.Length), //nolint:gosec // safe: block length bounded by MaxBlockSize (1GB) fits uint32
-		)
-		buf.Write(tmp4[:])
-	}
-
-	n, err := w.Write(buf.Bytes())
-	return int64(n), err
-}
-
-// writeCompactTraceIndexV3 writes the snappy-compressed trace index section for compact index v3.
-// Format: snappy( fmt_version[1] + trace_count[4] + traces... )
-// Returns bytes written.
-func writeCompactTraceIndexV3(
-	w io.Writer,
-	traceIndex map[[16]byte][]uint16,
-) (int64, error) {
-	// Build the raw trace index bytes.
-	traceData, err := writeTraceBlockIndexSection(nil, traceIndex)
-	if err != nil {
-		return 0, err
-	}
-
-	// Snappy-compress the trace index.
-	compressed := snappy.Encode(nil, traceData)
-
-	n, err := w.Write(compressed)
-	return int64(n), err
-}
-
-// writeFooterV4 writes the 34-byte v4 footer with intrinsic section offsets.
+// writeFooterV7 writes the 18-byte V7 footer for V14 files.
 //
-// Wire format:
+// Wire format (SPEC-V14-004):
 //
-//	version[2 LE]                  = FooterV4Version (4)
-//	header_offset[8 LE]
-//	compact_offset[8 LE]
-//	compact_len[4 LE]
-//	intrinsic_index_offset[8 LE]
-//	intrinsic_index_len[4 LE]
-func writeFooterV4(
-	w io.Writer,
-	headerOffset, compactOffset uint64,
-	compactLen uint32,
-	intrinsicOffset uint64,
-	intrinsicLen uint32,
-) error {
-	var buf [34]byte
-	binary.LittleEndian.PutUint16(buf[0:], shared.FooterV4Version)
-	binary.LittleEndian.PutUint64(buf[2:], headerOffset)
-	binary.LittleEndian.PutUint64(buf[10:], compactOffset)
-	binary.LittleEndian.PutUint32(buf[18:], compactLen)
-	binary.LittleEndian.PutUint64(buf[22:], intrinsicOffset)
-	binary.LittleEndian.PutUint32(buf[30:], intrinsicLen)
-	_, err := w.Write(buf[:])
-	return err
-}
-
-// writeFooterV6 writes a 58-byte V6 footer.
-// Layout: version[2]+headerOffset[8]+compactOffset[8]+compactLen[4]+
-//
-//	intrinsicOffset[8]+intrinsicLen[4]+vectorOffset[8]+vectorLen[4]+
-//	compactTracesOffset[8]+compactTracesLen[4]
-func writeFooterV6(
-	w io.Writer,
-	headerOffset, compactOffset uint64,
-	compactLen uint32,
-	intrinsicOffset uint64,
-	intrinsicLen uint32,
-	vectorOffset uint64,
-	vectorLen uint32,
-	compactTracesOffset uint64,
-	compactTracesLen uint32,
-) error {
-	var buf [58]byte
-	binary.LittleEndian.PutUint16(buf[0:], shared.FooterV6Version)
-	binary.LittleEndian.PutUint64(buf[2:], headerOffset)
-	binary.LittleEndian.PutUint64(buf[10:], compactOffset)
-	binary.LittleEndian.PutUint32(buf[18:], compactLen)
-	binary.LittleEndian.PutUint64(buf[22:], intrinsicOffset)
-	binary.LittleEndian.PutUint32(buf[30:], intrinsicLen)
-	binary.LittleEndian.PutUint64(buf[34:], vectorOffset)
-	binary.LittleEndian.PutUint32(buf[42:], vectorLen)
-	binary.LittleEndian.PutUint64(buf[46:], compactTracesOffset)
-	binary.LittleEndian.PutUint32(buf[54:], compactTracesLen)
-	_, err := w.Write(buf[:])
-	return err
-}
-
-// writeFooterV5 writes a 46-byte V5 footer.
-// Layout: version[2]+headerOffset[8]+compactOffset[8]+compactLen[4]+
-//
-//	intrinsicOffset[8]+intrinsicLen[4]+vectorOffset[8]+vectorLen[4]
-func writeFooterV5(
-	w io.Writer,
-	headerOffset, compactOffset uint64,
-	compactLen uint32,
-	intrinsicOffset uint64,
-	intrinsicLen uint32,
-	vectorOffset uint64,
-	vectorLen uint32,
-) error {
-	var buf [46]byte
-	binary.LittleEndian.PutUint16(buf[0:], shared.FooterV5Version)
-	binary.LittleEndian.PutUint64(buf[2:], headerOffset)
-	binary.LittleEndian.PutUint64(buf[10:], compactOffset)
-	binary.LittleEndian.PutUint32(buf[18:], compactLen)
-	binary.LittleEndian.PutUint64(buf[22:], intrinsicOffset)
-	binary.LittleEndian.PutUint32(buf[30:], intrinsicLen)
-	binary.LittleEndian.PutUint64(buf[34:], vectorOffset)
-	binary.LittleEndian.PutUint32(buf[42:], vectorLen)
+//	magic[4]=0xC011FEA1 · version[2]=7 · dir_offset[8] · dir_len[4]
+func writeFooterV7(w io.Writer, dirOffset uint64, dirLen uint32) error {
+	var buf [18]byte
+	binary.LittleEndian.PutUint32(buf[0:], shared.MagicNumber)
+	binary.LittleEndian.PutUint16(buf[4:], shared.FooterV7Version)
+	binary.LittleEndian.PutUint64(buf[6:], dirOffset)
+	binary.LittleEndian.PutUint32(buf[14:], dirLen)
 	_, err := w.Write(buf[:])
 	return err
 }

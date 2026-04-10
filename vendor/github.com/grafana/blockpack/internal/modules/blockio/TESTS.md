@@ -1441,3 +1441,69 @@ manual `<`/`>` branches both failed, returning 0 and corrupting binary search.
 minimum uint64 sentinel. This test confirms the existing behavior is correct.
 **Setup:** Call `decodeUint64Key("")` and `decodeUint64Key("short")`.
 **Assertions:** Both calls return `uint64(0)`.
+
+---
+
+## 14. V14 Format Tests
+*Added: 2026-04-10*
+
+### V14-01: Round-trip write/read (TestNewFormatRoundTrip)
+**File:** `internal/modules/blockio/writer/format_v14_test.go`, `reader/format_v14_test.go`
+**Scenario:** Write spans using V14 writer; read back all columns and verify values match.
+**Setup:** Write N spans with intrinsic and attribute columns. Flush. Open V14 reader.
+**Assertions:**
+- All span field values round-trip correctly.
+- Block header version byte == 14.
+- FooterV5 magic and version fields correct (0xC011FEA1, version=5).
+- Section directory contains up to 6 type-keyed entries (0x01–0x06; SectionSketchIndex and SectionFileBloom are omitted when empty) and K name-keyed entries.
+- No SectionIntrinsic type-keyed 0x07 entry.
+
+### V14-02: Intrinsic-only query reads only requested column blobs (TestIntrinsicOnlyQuery)
+**File:** `internal/modules/blockio/reader/format_v14_test.go`
+**Scenario:** Issue a query that references only intrinsic column names. Verify that
+attribute column blobs are not fetched from disk.
+**Setup:** Write blocks with both intrinsic and attribute columns. Open reader with I/O
+counter provider. Query using only intrinsic wantColumns.
+**Assertions:**
+- I/O reads do not include bytes for attribute column blobs.
+- Column values for requested intrinsic columns are decoded correctly from the unified column TOC.
+
+### V14-03: Section directory parsing (TestSectionDirectoryParsing)
+**File:** `internal/modules/blockio/reader/parser_test.go`
+**Scenario:** Craft a minimal V14 file with a known section directory. Verify heterogeneous
+entry_kind dispatch works for type-keyed (0x00), name-keyed (0x01), and signal-type (0x02)
+entries.
+**Setup:** Build raw section directory bytes with all three entry kinds. Snappy-compress.
+Write FooterV5 pointing at directory.
+**Assertions:**
+- Type-keyed entries map section_type (0x01–0x06) to correct (offset, compressed_len).
+- Name-keyed entries map column name to correct (offset, compressed_len).
+- Signal-type entry sets SectionDirectory.SignalType correctly.
+- Unknown entry_kind returns error.
+
+### V14-04: Decompression bomb guard (TestDecompressionBombGuard)
+**File:** `internal/modules/blockio/reader/reader_test.go:TestDecompressionBombGuard`
+**Scenario:** Craft a snappy payload whose varint header claims decoded size > MaxMetadataSize.
+**Assertions:**
+- Reader rejects the file with an error containing "snappy decoded size".
+- No large allocation is attempted before the error is returned.
+- Tested for both V3 metadata path (V3_metadata subtest) and V14 section directory path
+  (V14_section_directory subtest).
+
+### V14-05: Signal type round-trip (TestSignalTypeRoundTrip)
+**File:** `internal/modules/blockio/writer/format_v14_test.go`
+**Scenario:** Write a V14 log file (SignalTypeLog). Read back and check signal type.
+**Setup:** Create writer with log signal type. Write log spans. Flush. Open reader.
+**Assertions:**
+- `reader.SignalType()` returns `SignalTypeLog` (0x02).
+- Section directory contains a DirEntryKindSignal entry with signal_type=0x02.
+
+### V14-06: Column TOC unified format (TestColumnTOCUnifiedFormat)
+**File:** `internal/modules/blockio/reader/format_v14_test.go`
+**Scenario:** Write a block with both intrinsic and attribute columns. Parse the block's
+unified column TOC and verify the wire format matches SPECS §12.2.
+**Assertions:**
+- Column TOC immediately follows the 24-byte block header (offset == 24).
+- Each TOC entry uses the wire format: name_len[2 LE]+name[N]+col_type[1]+data_offset[8 LE]+compressed_len[4 LE]+uncompressed_len[4 LE].
+- All column names (intrinsic and attribute) appear in a single flat list.
+- Column names, types, and blob lengths decode correctly for both intrinsic and attribute entries.

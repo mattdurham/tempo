@@ -10,6 +10,7 @@ import (
 	"math"
 	"slices"
 
+	"github.com/golang/snappy"
 	tempotrace "github.com/grafana/tempo/pkg/tempopb/trace/v1"
 	commonv1 "go.opentelemetry.io/proto/otlp/common/v1"
 	tracev1 "go.opentelemetry.io/proto/otlp/trace/v1"
@@ -169,8 +170,8 @@ func (b *blockBuilder) reset(spanHint int) {
 // embedding vector for pending[i]. A nil element means no embedding for that span.
 // When spanVectors is nil, no embedding injection is performed (cfg.Embedder == nil path).
 func buildBlock(
-	pending []pendingSpan, enc *zstdEncoder, bb *blockBuilder, blockVersion uint8,
-	intrinsicAccum *intrinsicAccumulator, blockID int, spanVectors [][]float32,
+	pending []pendingSpan, bb *blockBuilder, blockVersion uint8,
+	intrinsicAccum *intrinsicAccumulator, blockID int,
 ) (builtBlock, *blockBuilder, error) {
 	if bb != nil {
 		bb.reset(len(pending))
@@ -227,18 +228,10 @@ func buildBlock(
 			bb.addRowFromProto(ps, rowIdx)
 		}
 
-		// Inject pre-computed embedding vector if auto-embedding is active.
-		// spanVectors[rowIdx] is nil when the span produced no text or the embedder
-		// returned an empty vector; in both cases we skip injection to preserve the
-		// existing behavior (no __embedding__ column for that row).
-		if spanVectors != nil {
-			if vec := spanVectors[rowIdx]; len(vec) > 0 {
-				bb.addVectorPresent(rowIdx, shared.EmbeddingColumnName, vec)
-				bb.addVectorPresent(rowIdx, shared.EmbeddingAllColumnName, vec)
-			}
-		}
+		// Note: auto-embedding (spanVectors) was removed in V14. Vector injection
+		// is no longer performed in buildBlock; vectors must be added via AddSpan options.
 	}
-	payload, err := bb.finalize(enc, blockVersion)
+	payload, err := bb.finalize(blockVersion)
 	if err != nil {
 		return builtBlock{}, bb, err
 	}
@@ -1529,7 +1522,7 @@ func (b *blockBuilder) addPresent(rowIdx int, name string, typ shared.ColumnType
 // blockVersion controls the on-disk layout:
 //   - shared.VersionBlockV12+: omits the 16-byte stats_offset/stats_len stubs per column
 //   - earlier: includes the stats_offset/stats_len stubs (always 0, dead data)
-func (b *blockBuilder) finalize(enc *zstdEncoder, blockVersion uint8) ([]byte, error) {
+func (b *blockBuilder) finalize(blockVersion uint8) ([]byte, error) {
 	// Collect and sort columns by (name, type) for deterministic output.
 	// cb is placed before key to minimize GC scan region (betteralign).
 	type colEntry struct {
@@ -1550,35 +1543,51 @@ func (b *blockBuilder) finalize(enc *zstdEncoder, blockVersion uint8) ([]byte, e
 	colCount := len(entries)
 
 	// Build column data blobs.
+	// SPEC-V14-001: for V14 blocks, each blob is snappy-compressed (outer per-column snappy).
 	type colBlob struct {
-		name     string
-		dataBlob []byte
-		typ      shared.ColumnType
+		name            string
+		dataBlob        []byte // on-disk bytes (snappy-compressed for V14, raw for earlier)
+		typ             shared.ColumnType
+		uncompressedLen uint32 // V14 only: original raw byte length before snappy
 	}
 	blobs := make([]colBlob, 0, colCount)
 
 	for _, e := range entries {
-		data, err := e.cb.buildData(enc)
+		raw, err := e.cb.buildData()
 		if err != nil {
 			return nil, fmt.Errorf("finalize column %q (type %v): %w", e.key.Name, e.key.Type, err)
 		}
-		blobs = append(blobs, colBlob{
-			name:     e.key.Name,
-			typ:      e.cb.colType(),
-			dataBlob: data,
-		})
+		if blockVersion == shared.VersionBlockV14 {
+			// SPEC-V14-001: outer snappy per column — no internal zstd (enc_version=3).
+			compressed := snappy.Encode(nil, raw)
+			blobs = append(blobs, colBlob{
+				name:            e.key.Name,
+				typ:             e.cb.colType(),
+				dataBlob:        compressed,
+				uncompressedLen: uint32(len(raw)), //nolint:gosec // safe: raw blob bounded by block size
+			})
+		} else {
+			blobs = append(blobs, colBlob{
+				name:     e.key.Name,
+				typ:      e.cb.colType(),
+				dataBlob: raw,
+			})
+		}
 	}
 
 	// --- Compute layout ---
-	// Block header: 24 bytes
-	// Column metadata array: sum of (2 + len(name) + 1 + 8 + 8 + 8 + 8) per column
-	//   (stats_offset and stats_len are always 0 — column stats section removed)
+	// Block header: 24 bytes (V12/V13) or unchanged 24 bytes (V14 uses same header size here)
+	// Column metadata array: sum of (2 + len(name) + 1 + 8 + 8) per column
+	//   V14: data_offset[8] + compressed_len[4] + uncompressed_len[4] (same 16 bytes as old data_offset[8]+data_len[8])
+	//   Earlier: data_offset[8] + data_len[8]
+	//   (stats_offset and stats_len are always 0 — column stats section removed in V12+)
 	// Column data section: immediately after metadata
 
 	headerSize := 24
 
 	// Compute column metadata array size.
-	// VersionBlockV12+: name_len[2] + name + col_type[1] + data_offset[8] + data_len[8]
+	// VersionBlockV12+: name_len[2] + name + col_type[1] + data_offset[8] + data_len[8] (16 bytes fixed)
+	// VersionBlockV14:  name_len[2] + name + col_type[1] + data_offset[8] + compressed_len[4] + uncompressed_len[4] (same 16 bytes)
 	// Earlier:          name_len[2] + name + col_type[1] + data_offset[8] + data_len[8] + stats_offset[8] + stats_len[8]
 	statsFieldSize := 0
 	if blockVersion < shared.VersionBlockV12 {
@@ -1638,12 +1647,18 @@ func (b *blockBuilder) finalize(enc *zstdEncoder, blockVersion uint8) ([]byte, e
 		payload = append(payload, byte(bl.typ))
 		// data_offset[8 LE]
 		payload = appendUint64LE(payload, dataOff)
-		// data_len[8 LE]
-		payload = appendUint64LE(payload, dataLen)
-		// stats_offset[8 LE] + stats_len[8 LE] — omitted in VersionBlockV12+ (always were 0)
-		if blockVersion < shared.VersionBlockV12 {
-			payload = appendUint64LE(payload, 0)
-			payload = appendUint64LE(payload, 0)
+		if blockVersion == shared.VersionBlockV14 {
+			// SPEC-V14-001: compressed_len[4 LE] + uncompressed_len[4 LE]
+			payload = appendUint32LE(payload, uint32(dataLen)) //nolint:gosec // safe: blob bounded by block size
+			payload = appendUint32LE(payload, bl.uncompressedLen)
+		} else {
+			// data_len[8 LE]
+			payload = appendUint64LE(payload, dataLen)
+			// stats_offset[8 LE] + stats_len[8 LE] — omitted in VersionBlockV12+ (always were 0)
+			if blockVersion < shared.VersionBlockV12 {
+				payload = appendUint64LE(payload, 0)
+				payload = appendUint64LE(payload, 0)
+			}
 		}
 
 		curDataOff += dataLen

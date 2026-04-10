@@ -34,6 +34,9 @@ const (
 
 // Config configures the file cache.
 type Config struct {
+	// Registerer is an optional Prometheus registerer.
+	// When non-nil, cache metrics are registered and incremented.
+	Registerer prometheus.Registerer
 	// Path is the directory that will hold the cache files.
 	Path string
 
@@ -44,10 +47,6 @@ type Config struct {
 	// Enabled controls whether the cache is active.
 	// If false, Open returns (nil, nil) and all cache operations are no-ops.
 	Enabled bool
-
-	// Registerer is an optional Prometheus registerer.
-	// When non-nil, cache metrics are registered and incremented.
-	Registerer prometheus.Registerer
 }
 
 // entry is one in-memory record for a cached file.
@@ -67,15 +66,15 @@ type entry struct {
 type FileCache struct {
 	group     singleflight.Group // mutex (no ptr) then map ptr — starts pointer region
 	index     map[string]*entry  // key → entry
-	dir       string
-	mu        sync.Mutex
-	maxBytes  int64
-	curBytes  int64
-	seq       uint64 // monotonic insertion counter for FIFO ordering
 	requests  *prometheus.CounterVec
 	bytes     *prometheus.CounterVec
 	evictions *prometheus.CounterVec
 	errs      *prometheus.CounterVec
+	dir       string
+	maxBytes  int64
+	curBytes  int64
+	seq       uint64 // monotonic insertion counter for FIFO ordering
+	mu        sync.Mutex
 }
 
 // Open opens (or creates) a FileCache rooted at cfg.Path.

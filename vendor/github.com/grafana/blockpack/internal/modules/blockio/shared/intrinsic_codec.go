@@ -477,6 +477,61 @@ func decodePagedColumnBlob(blob []byte) (*IntrinsicColumn, error) {
 	return merged, nil
 }
 
+// PeekIntrinsicBlobHeader reads the format, column type, and row count from a V14
+// intrinsic column blob as stored on disk by writeV14Sections.
+//
+// V14 on-disk layout (writeV14Sections writes encodeColumn output directly):
+//   - Non-paged: snappy(format_version[1]+format[1]+col_type[1]+row_count[4]+...)
+//     encodeFlatColumn/encodeDictColumn return snappy-compressed v1 blobs.
+//   - Paged: IntrinsicPagedVersion[1]+toc_len[4]+toc_blob+page_blobs
+//     encodePagedFlatColumn/encodePagedDictColumn return raw paged blobs (not snappy-wrapped).
+//
+// Returns format, colType, count. Returns zeros without error for empty blobs.
+func PeekIntrinsicBlobHeader(blob []byte) (format uint8, colType ColumnType, count uint32, err error) {
+	if len(blob) == 0 {
+		return 0, 0, 0, nil
+	}
+	// Paged format: starts with IntrinsicPagedVersion (0x02) sentinel byte, stored raw.
+	if blob[0] == IntrinsicPagedVersion {
+		if len(blob) < 5 {
+			return 0, 0, 0, fmt.Errorf("PeekIntrinsicBlobHeader: paged blob too short")
+		}
+		tocLen := int(binary.LittleEndian.Uint32(blob[1:5]))
+		if len(blob) < 5+tocLen {
+			return 0, 0, 0, fmt.Errorf("PeekIntrinsicBlobHeader: paged toc truncated")
+		}
+		toc, tocErr := DecodePageTOC(blob[5 : 5+tocLen])
+		if tocErr != nil {
+			return 0, 0, 0, fmt.Errorf("PeekIntrinsicBlobHeader: %w", tocErr)
+		}
+		var totalRows uint32
+		for _, p := range toc.Pages {
+			totalRows += p.RowCount
+		}
+		return toc.Format, toc.ColType, totalRows, nil
+	}
+	// Non-paged: snappy-compressed v1 blob. Decode to get the header bytes.
+	// NOTE: snappy is a block format with no streaming/partial-decode API. There is no
+	// way to retrieve only the first N decoded bytes without decompressing the full blob.
+	// snappy.DecodedLen can be used as a pre-check guard (reject obviously-corrupt blobs
+	// before allocating) but the full decode cannot be avoided to read any content.
+	// TODO: if this proves expensive at scale, consider storing a tiny uncompressed prefix
+	// (format_version+format+col_type+row_count) alongside the compressed blob so that
+	// PeekIntrinsicBlobHeader can read 7 bytes without decompressing anything.
+	raw, decErr := snappy.Decode(nil, blob)
+	if decErr != nil {
+		return 0, 0, 0, fmt.Errorf("PeekIntrinsicBlobHeader: snappy: %w", decErr)
+	}
+	// v1 wire format: format_version[1]+format[1]+col_type[1]+row_count[4].
+	if len(raw) < 7 {
+		return 0, 0, 0, fmt.Errorf("PeekIntrinsicBlobHeader: v1 blob too short (%d bytes)", len(raw))
+	}
+	f := raw[1]
+	ct := ColumnType(raw[2])
+	c := binary.LittleEndian.Uint32(raw[3:7])
+	return f, ct, c, nil
+}
+
 // DecodeIntrinsicColumnBlob decompresses and decodes a column data blob into an IntrinsicColumn.
 func DecodeIntrinsicColumnBlob(blob []byte) (*IntrinsicColumn, error) {
 	// v2 paged format: first byte is IntrinsicPagedVersion (0x02).

@@ -89,6 +89,9 @@ type FileCache = modules_filecache.FileCache
 
 // FileCacheConfig configures a disk-backed FileCache.
 type FileCacheConfig struct {
+	// Registerer is an optional Prometheus registerer.
+	// When non-nil, cache metrics are registered and incremented on cache operations.
+	Registerer prometheus.Registerer
 	// Path is the directory path used for cache storage.
 	Path string
 
@@ -99,10 +102,6 @@ type FileCacheConfig struct {
 	// Enabled controls whether the cache is active.
 	// When false, OpenFileCache returns (nil, nil) and readers skip all caching.
 	Enabled bool
-
-	// Registerer is an optional Prometheus registerer.
-	// When non-nil, cache metrics are registered and incremented on cache operations.
-	Registerer prometheus.Registerer
 }
 
 // OpenFileCache opens (or creates) a FileCache with the given configuration.
@@ -124,13 +123,12 @@ type MemoryCache = modules_memorycache.MemoryCache
 
 // MemoryCacheConfig configures an in-process MemoryCache.
 type MemoryCacheConfig struct {
-	// MaxBytes is the maximum total bytes the cache may hold.
-	// Required and must be positive.
-	MaxBytes int64
-
 	// Registerer is an optional Prometheus registerer.
 	// When non-nil, cache metrics are registered and incremented on cache operations.
 	Registerer prometheus.Registerer
+	// MaxBytes is the maximum total bytes the cache may hold.
+	// Required and must be positive.
+	MaxBytes int64
 }
 
 // NewMemoryCache creates an in-process LRU cache with the given byte capacity.
@@ -149,6 +147,9 @@ type MemCache = modules_memcache.MemCache
 
 // MemCacheConfig configures a remote MemCache.
 type MemCacheConfig struct {
+	// Registerer is an optional Prometheus registerer.
+	// When non-nil, cache metrics are registered and incremented on cache operations.
+	Registerer prometheus.Registerer
 	// Servers is the list of memcache server addresses (host:port).
 	Servers []string
 
@@ -158,10 +159,6 @@ type MemCacheConfig struct {
 	// Enabled controls whether the cache is active.
 	// When false, OpenMemCache returns (nil, nil).
 	Enabled bool
-
-	// Registerer is an optional Prometheus registerer.
-	// When non-nil, cache metrics are registered and incremented on cache operations.
-	Registerer prometheus.Registerer
 }
 
 // OpenMemCache creates a MemCache connecting to the configured servers.

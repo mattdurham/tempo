@@ -33,10 +33,15 @@ var _ queryplanner.ColumnSketch = (*columnSketchData)(nil)
 // Bloom data is fixed-size and copied directly at parse time.
 type columnSketchData struct {
 	presence   []uint64   // bitset: 1 bit per block
-	distinct   []uint32   // one per block (0 for absent)
 	topkFP     [][]uint64 // [presentIdx][entries] fingerprints
 	topkCount  [][]uint16 // [presentIdx][entries] counts
 	presentMap []int      // presentMap[i] = blockIdx of the i-th present block
+
+	// NOTE-PERF-SKETCH: distinctRaw stores raw 4-byte-per-block distinct counts as a zero-copy
+	// sub-slice of the metadata buffer. Distinct() decodes on demand, eliminating make([]uint32,
+	// numBlocks) per column at parse time. distinctAt() provides single-block access used by
+	// layout and file_sketch_summary.
+	distinctRaw []byte // numBlocks×4 LE uint32s; zero-copy sub-slice of metadataBytes
 
 	// Bloom filters: raw byte slices into the metadata buffer, one per present block.
 	// Zero-copy: slices reference the decompressed metadata buffer retained by the Reader.
@@ -55,8 +60,32 @@ type sketchIndex struct {
 // Presence returns a bitset with 1 bit per block (1 = column present in block).
 func (cd *columnSketchData) Presence() []uint64 { return cd.presence }
 
-// Distinct returns pre-computed HLL cardinality per block (0 for absent blocks).
-func (cd *columnSketchData) Distinct() []uint32 { return cd.distinct }
+// Distinct decodes and returns per-block HLL cardinality (0 for absent blocks).
+// NOTE-PERF-SKETCH: decodes from distinctRaw on each call rather than returning a
+// pre-built slice, eliminating make([]uint32, numBlocks) per column at parse time.
+// Callers (scoring.go) capture the result in a local variable, so this runs once
+// per column per scoring pass — not per span.
+func (cd *columnSketchData) Distinct() []uint32 {
+	if len(cd.distinctRaw) == 0 {
+		return nil
+	}
+	count := len(cd.distinctRaw) / 4
+	out := make([]uint32, count)
+	for i := range count {
+		out[i] = binary.LittleEndian.Uint32(cd.distinctRaw[i*4:])
+	}
+	return out
+}
+
+// distinctAt returns the distinct count for blockIdx, reading directly from raw bytes.
+// Returns 0 for out-of-range indices or when no distinct data is present.
+func (cd *columnSketchData) distinctAt(blockIdx int) uint32 {
+	offset := blockIdx * 4
+	if offset+4 > len(cd.distinctRaw) {
+		return 0
+	}
+	return binary.LittleEndian.Uint32(cd.distinctRaw[offset:])
+}
 
 // TopKMatch returns the TopK count for valFP per block (0 if not in top-K or absent).
 func (cd *columnSketchData) TopKMatch(valFP uint64) []uint16 {
@@ -225,17 +254,16 @@ func parseColumnPresence(
 	return pos, len(cd.presentMap), nil
 }
 
-// parseColumnDistinct parses the per-block distinct count array.
+// parseColumnDistinct stores the per-block distinct count section as a zero-copy sub-slice.
+// NOTE-PERF-SKETCH: avoids make([]uint32, numBlocks) per column at parse time.
+// Distinct() and distinctAt() decode on demand from distinctRaw.
 func parseColumnDistinct(data []byte, pos int, name string, numBlocks int, cd *columnSketchData) (int, error) {
-	if pos+numBlocks*4 > len(data) {
+	need := numBlocks * 4
+	if pos+need > len(data) {
 		return pos, fmt.Errorf("sketch_index: col %q: too short for distinct counts", name)
 	}
-	cd.distinct = make([]uint32, numBlocks)
-	for i := range numBlocks {
-		cd.distinct[i] = binary.LittleEndian.Uint32(data[pos:])
-		pos += 4
-	}
-	return pos, nil
+	cd.distinctRaw = data[pos : pos+need]
+	return pos + need, nil
 }
 
 // parseColumnTopK parses topk_k and per-present-block top-K fingerprint/count entries.

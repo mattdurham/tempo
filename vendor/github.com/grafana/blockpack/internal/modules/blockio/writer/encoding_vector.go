@@ -4,10 +4,34 @@ package writer
 
 import (
 	"encoding/binary"
+	"fmt"
 	"math"
+	"sync"
+
+	"github.com/klauspost/compress/zstd"
 
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
 )
+
+// vectorZstdEnc is a package-level zstd encoder used only by vectorF32ColumnBuilder.
+var (
+	vectorZstdEncOnce sync.Once
+	vectorZstdEnc     *zstd.Encoder //nolint:gochecknoglobals
+)
+
+func getVectorZstdEncoder() *zstd.Encoder {
+	vectorZstdEncOnce.Do(func() {
+		var err error
+		vectorZstdEnc, err = zstd.NewWriter(nil,
+			zstd.WithEncoderLevel(zstd.SpeedDefault),
+			zstd.WithEncoderConcurrency(1),
+		)
+		if err != nil {
+			panic("writer: vector zstd.NewWriter: " + err.Error())
+		}
+	})
+	return vectorZstdEnc
+}
 
 // vectorF32ColumnBuilder accumulates float32 vectors for one column.
 // Wire format (buildData output):
@@ -86,7 +110,7 @@ func (b *vectorF32ColumnBuilder) nullCount() int {
 
 func (b *vectorF32ColumnBuilder) colType() shared.ColumnType { return shared.ColumnTypeVectorF32 }
 
-func (b *vectorF32ColumnBuilder) buildData(enc *zstdEncoder) ([]byte, error) {
+func (b *vectorF32ColumnBuilder) buildData() ([]byte, error) {
 	nRows := len(b.values)
 	dim := b.dim
 
@@ -125,9 +149,9 @@ func (b *vectorF32ColumnBuilder) buildData(enc *zstdEncoder) ([]byte, error) {
 		}
 	}
 
-	compressed, err := enc.compress(floatBuf)
-	if err != nil {
-		return nil, err
+	compressed := getVectorZstdEncoder().EncodeAll(floatBuf, nil)
+	if len(compressed) == 0 && len(floatBuf) > 0 {
+		return nil, fmt.Errorf("vectorF32: zstd compress produced empty output")
 	}
 
 	// Assemble the column blob:

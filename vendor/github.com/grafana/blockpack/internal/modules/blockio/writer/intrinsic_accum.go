@@ -483,32 +483,6 @@ func (a *intrinsicAccumulator) computeMinMax(name string) (minVal, maxVal string
 	return "", ""
 }
 
-// rowCount returns the total number of rows for the named column.
-func (a *intrinsicAccumulator) rowCount(name string) uint32 {
-	if c, ok := a.flatCols[name]; ok {
-		return uint32(len(c.refs)) //nolint:gosec
-	}
-	if c, ok := a.dictCols[name]; ok {
-		total := 0
-		for _, e := range c.entries {
-			total += len(e.refs)
-		}
-		return uint32(total) //nolint:gosec
-	}
-	return 0
-}
-
-// colTypeFor returns the ColumnType and format byte for the named column.
-func (a *intrinsicAccumulator) colTypeFor(name string) (shared.ColumnType, uint8) {
-	if c, ok := a.flatCols[name]; ok {
-		return c.colType, shared.IntrinsicFormatFlat
-	}
-	if c, ok := a.dictCols[name]; ok {
-		return c.colType, shared.IntrinsicFormatDict
-	}
-	return 0, 0
-}
-
 // encodeTOC serializes a slice of IntrinsicColMeta entries to a snappy-compressed blob.
 //
 // Wire format (uncompressed):

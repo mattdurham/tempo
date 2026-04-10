@@ -7,18 +7,60 @@ const (
 	MagicNumber       uint32 = 0xC011FEA1
 	CompactIndexMagic uint32 = 0xC01DC1DE
 
-	VersionV13 uint8 = 13 // V13: snappy-compressed metadata, signal_type byte, no per-block trace IDs
+	// VersionBlockV14 is the version byte at offset 4 in the 24-byte V14 block header.
+	// It is distinct from FooterV7Version (the file-level footer version).
+	VersionBlockV14 uint8 = 14
 
-	// VersionBlockV12 is the block-content format version written into each block's 24-byte
-	// header. It omits the 16-byte stats_offset/stats_len stub fields from column metadata
-	// entries (saves 16 bytes per column per block).
-	VersionBlockV12 uint8 = 12
+	// VersionBlockEncV3 is the enc_version byte inside each V14 column blob.
+	// V3 columns use raw (uncompressed) internal sub-segments; the outer snappy
+	// is applied per-column by the block writer.
+	VersionBlockEncV3 uint8 = 3
+
+	// FooterV7Version is the footer format version for the V14 section-directory footer (18 bytes).
+	// magic[4]+version[2]+dir_offset[8]+dir_len[4] = 18 bytes.
+	// Version 7 was chosen because agentic already uses 5 (46-byte vector footer) and 6 (58-byte compact-traces footer).
+	FooterV7Version uint16 = 7
+
+	// FooterV7Size is the total size of the V14 section-directory footer in bytes:
+	// magic[4]+version[2]+dir_offset[8]+dir_len[4] = 18 bytes.
+	FooterV7Size uint = 18
+
+	// BlockHeaderV14Size is the total size of the V14 block header in bytes:
+	// magic[4]+version[1]+reserved[3]+span_count[4]+column_count[4]+reserved2[8] = 24 bytes.
+	BlockHeaderV14Size uint = 24
+
+	// Section type constants for the V14 section directory type-keyed entries.
+	// Each constant identifies one independently snappy-compressed file-level section.
+	// Values 0x07+ are reserved for future type-keyed sections.
+	SectionBlockIndex  uint8 = 0x01
+	SectionRangeIndex  uint8 = 0x02
+	SectionTraceIndex  uint8 = 0x03
+	SectionTSIndex     uint8 = 0x04
+	SectionSketchIndex uint8 = 0x05
+	SectionFileBloom   uint8 = 0x06
+
+	// DirEntryKindType identifies a type-keyed section directory entry (one of the 6 fixed sections).
+	// Wire: entry_kind[1]=0x00 + section_type[1] + offset[8] + compressed_len[4] = 14 bytes.
+	DirEntryKindType uint8 = 0x00
+
+	// DirEntryKindName identifies a name-keyed section directory entry (one file-level intrinsic column).
+	// Wire: entry_kind[1]=0x01 + name_len[2] + name + offset[8] + compressed_len[4] = 15+len(name) bytes.
+	DirEntryKindName uint8 = 0x01
+
+	// DirEntryKindSignal identifies a signal-type entry in the section directory.
+	// Wire: entry_kind[1]=0x02 + signal_type[1] = 2 bytes total.
+	// Exactly one such entry is written per V14 file to identify the signal type.
+	DirEntryKindSignal uint8 = 0x02
+
+	// Preserved for backward compatibility with existing reader code during V14 migration.
+	// These will be removed once the reader/writer are fully migrated to V14.
+	VersionV13      uint8  = 13 // V13: snappy-compressed metadata, signal_type byte
+	VersionBlockV12 uint8  = 12 // V12: 24-byte block header, no per-column snappy
+	FooterV3Version uint16 = 3
+	FooterV3Size    uint   = 22
 
 	SignalTypeTrace uint8 = 0x01 // file contains OTEL trace spans
 	SignalTypeLog   uint8 = 0x02 // file contains OTEL log records
-
-	FooterV3Version uint16 = 3
-	FooterV3Size    uint   = 22
 
 	ColumnEncodingVersion uint8 = 2
 	CompactIndexVersion   uint8 = 1

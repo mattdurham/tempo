@@ -3,17 +3,14 @@ package reader
 // NOTE: Any changes to this file must be reflected in the corresponding specs.md or NOTES.md.
 
 import (
-	"bytes"
 	"cmp"
 	"encoding/binary"
 	"fmt"
-	"io"
 	"math"
 	"slices"
-	"sync"
 	"time"
 
-	"github.com/klauspost/compress/zstd"
+	"github.com/golang/snappy"
 
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
 )
@@ -122,27 +119,16 @@ type FileBloomColumnInfo struct {
 	FuseBytes int `json:"fuse_bytes"`
 }
 
-// layoutDecoderPool pools zstd decoders for the layout analysis path. A separate pool
-// from the hot-path decoder ensures FileLayout() does not interfere with concurrent
-// query decoding. Each pooled decoder is configured with concurrency=1 (single-goroutine
-// streaming) and is Reset per chunk rather than reallocated, matching the recommendation
-// in the zstd library docs for streaming-to-Discard size measurement.
-var layoutDecoderPool = &sync.Pool{
-	New: func() any {
-		dec, err := zstd.NewReader(nil, zstd.WithDecoderConcurrency(1))
-		if err != nil {
-			panic("layout: zstd.NewReader: " + err.Error())
-		}
-		return dec
-	},
-}
-
 // FileLayout computes a byte-level layout of the blockpack file, returning a report
 // that accounts for every byte. The returned Sections slice is sorted by Offset ascending.
 // Invariant: sum(section.CompressedSize where !IsLogical) == FileSize.
 // Logical sections (IsLogical=true) describe sub-structure within the decompressed
 // metadata buffer; their Offset is relative to that buffer, not the physical file.
 func (r *Reader) FileLayout() (*FileLayoutReport, error) {
+	if r.footerVersion == shared.FooterV7Version {
+		return r.fileLayoutV14()
+	}
+
 	const headerSize = int64(22) // magic[4] + version[1] + metadataOffset[8] + metadataLen[8] + signalType[1]
 	footerSize := int64(shared.FooterV3Size)
 	switch r.footerVersion {
@@ -209,106 +195,9 @@ func (r *Reader) FileLayout() (*FileLayoutReport, error) {
 	isV4Plus := r.footerVersion == shared.FooterV4Version ||
 		r.footerVersion == shared.FooterV5Version ||
 		r.footerVersion == shared.FooterV6Version
+	// V7 is V14 section-directory format — handled by fileLayoutV14 above, never reaches here.
 	if isV4Plus && r.intrinsicIndexLen > 0 {
-		// Emit per-column sections from the TOC.
-		var columnsEnd int64
-		for _, name := range r.IntrinsicColumnNames() {
-			meta, ok := r.IntrinsicColumnMeta(name)
-			if !ok {
-				continue
-			}
-			formatName := "flat"
-			if meta.Format == shared.IntrinsicFormatDict {
-				formatName = "dict"
-			}
-
-			// Check if this column uses v2 paged format by reading the first byte.
-			blob, blobErr := r.GetIntrinsicColumnBlob(name)
-			isPaged := blobErr == nil && len(blob) > 0 && blob[0] == shared.IntrinsicPagedVersion
-
-			pagedEmitted := false
-			if isPaged && len(blob) >= 5 {
-				tocLen := int(binary.LittleEndian.Uint32(blob[1:5]))
-				if 5+tocLen <= len(blob) {
-					ptoc, tocErr := shared.DecodePageTOC(blob[5 : 5+tocLen])
-					if tocErr == nil && len(ptoc.Pages) > 0 {
-						// Compute absolute offset of first page blob:
-						// column blob offset + 1 (version byte) + 4 (toc_len prefix) + tocLen
-						headerLen := int64(1) + 4 + int64(tocLen)            //nolint:gosec
-						firstPageAbsOffset := int64(meta.Offset) + headerLen //nolint:gosec
-
-						// Emit a physical section for the per-page TOC header bytes
-						// (version + toc_len prefix + toc data) that precede the pages.
-						// headerLen is always >= 5 (1 version byte + 4 toc_len bytes).
-						sections = append(sections, FileLayoutSection{
-							Section:        "intrinsic.column[" + name + "].page_toc",
-							ColumnName:     name,
-							ColumnType:     columnTypeName(meta.Type),
-							Offset:         int64(meta.Offset), //nolint:gosec
-							CompressedSize: headerLen,
-						})
-						end := int64(meta.Offset) + headerLen //nolint:gosec
-						if end > columnsEnd {
-							columnsEnd = end
-						}
-
-						for pageIdx, pm := range ptoc.Pages {
-							pageAbsOffset := firstPageAbsOffset + int64(pm.Offset) //nolint:gosec
-							pageFmt := fmt.Sprintf("%s/paged", formatName)
-							sections = append(sections, FileLayoutSection{
-								Section:        fmt.Sprintf("intrinsic.column[%s].page[%d]", name, pageIdx),
-								ColumnName:     name,
-								ColumnType:     columnTypeName(meta.Type),
-								Encoding:       pageFmt,
-								Offset:         pageAbsOffset,
-								CompressedSize: int64(pm.Length), //nolint:gosec
-								RowCount:       int(pm.RowCount), //nolint:gosec
-								MinValue:       formatIntrinsicBound(meta.Type, pm.Min),
-								MaxValue:       formatIntrinsicBound(meta.Type, pm.Max),
-							})
-							end := pageAbsOffset + int64(pm.Length) //nolint:gosec
-							if end > columnsEnd {
-								columnsEnd = end
-							}
-						}
-						pagedEmitted = true
-					}
-				}
-			}
-
-			if !pagedEmitted {
-				if isPaged {
-					formatName += "/paged"
-				}
-				sections = append(sections, FileLayoutSection{
-					Section:        "intrinsic.column[" + name + "]",
-					ColumnName:     name,
-					ColumnType:     columnTypeName(meta.Type),
-					Encoding:       formatName,
-					Offset:         int64(meta.Offset), //nolint:gosec
-					CompressedSize: int64(meta.Length), //nolint:gosec
-				})
-				end := int64(meta.Offset) + int64(meta.Length) //nolint:gosec
-				if end > columnsEnd {
-					columnsEnd = end
-				}
-			}
-		}
-		// TOC blob: from end of last column blob to end of intrinsic index region.
-		// When no column blobs are present (empty TOC), columnsEnd == 0 so the TOC
-		// section starts at intrinsicIndexOffset itself.
-		tocStart := columnsEnd
-		if tocStart == 0 {
-			tocStart = int64(r.intrinsicIndexOffset) //nolint:gosec
-		}
-		tocEnd := int64(r.intrinsicIndexOffset) + int64(r.intrinsicIndexLen) //nolint:gosec
-		if tocEnd > tocStart {
-			sections = append(sections, FileLayoutSection{
-				Section:        "intrinsic.toc",
-				Offset:         tocStart,
-				CompressedSize: tocEnd - tocStart,
-			})
-		}
+		sections = append(sections, r.layoutIntrinsicSections()...)
 	}
 
 	slices.SortFunc(sections, func(a, b FileLayoutSection) int {
@@ -339,9 +228,356 @@ func (r *Reader) FileLayout() (*FileLayoutReport, error) {
 	}, nil
 }
 
+// fileLayoutV14 builds the FileLayoutReport for V14 (FooterV7) files.
+// V14 layout: blocks + sections (type-keyed + name-keyed) + section_directory + footer.
+// There is no file_header or metadata.compressed blob in V14.
+func (r *Reader) fileLayoutV14() (*FileLayoutReport, error) {
+	sections := make([]FileLayoutSection, 0, 16)
+
+	// Footer: last 18 bytes.
+	footerSize := int64(shared.FooterV7Size) //nolint:gosec
+	sections = append(sections, FileLayoutSection{
+		Section:        "footer",
+		Offset:         r.fileSize - footerSize,
+		CompressedSize: footerSize,
+	})
+
+	// Section directory: snappy-compressed blob at v7DirOffset.
+	sections = append(sections, FileLayoutSection{
+		Section:        "section_directory",
+		Offset:         int64(r.v7DirOffset), //nolint:gosec
+		CompressedSize: int64(r.v7DirLen),    //nolint:gosec
+	})
+
+	// Type-keyed sections from the section directory.
+	sectionNames := map[uint8]string{
+		shared.SectionBlockIndex:  "block_index",
+		shared.SectionRangeIndex:  "range_index",
+		shared.SectionTraceIndex:  "trace_index",
+		shared.SectionTSIndex:     "ts_index",
+		shared.SectionSketchIndex: "sketch_index",
+		shared.SectionFileBloom:   "file_bloom",
+	}
+	for sType, e := range r.sectionDir.TypeEntries {
+		name, ok := sectionNames[sType]
+		if !ok {
+			name = fmt.Sprintf("section.0x%02X", sType)
+		}
+		sections = append(sections, FileLayoutSection{
+			Section:        "section." + name,
+			Offset:         int64(e.Offset),        //nolint:gosec
+			CompressedSize: int64(e.CompressedLen), //nolint:gosec
+		})
+	}
+
+	// Name-keyed entries: one intrinsic column blob per entry.
+	// Read each blob to detect paged format and emit per-page sections.
+	for name, e := range r.sectionDir.NameEntries {
+		pageSections, err := r.layoutIntrinsicColumnV14(name, e)
+		if err != nil || len(pageSections) == 0 {
+			// Fallback: emit as single section.
+			sections = append(sections, FileLayoutSection{
+				Section:        "intrinsic.column[" + name + "]",
+				ColumnName:     name,
+				Offset:         int64(e.Offset),        //nolint:gosec
+				CompressedSize: int64(e.CompressedLen), //nolint:gosec
+			})
+		} else {
+			sections = append(sections, pageSections...)
+		}
+	}
+
+	// Blocks.
+	for blockIdx, meta := range r.blockMetas {
+		blockSections, err := r.layoutBlockV14(blockIdx, meta)
+		if err != nil {
+			return nil, fmt.Errorf("block %d layout: %w", blockIdx, err)
+		}
+		sections = append(sections, blockSections...)
+	}
+
+	slices.SortFunc(sections, func(a, b FileLayoutSection) int {
+		return cmp.Compare(a.Offset, b.Offset)
+	})
+
+	rangeIndex := r.buildRangeIndex()
+	sketchIndex := r.buildSketchIndexInfo()
+	fileBloom := r.buildFileBloomInfo()
+
+	spanCounts := make([]uint32, len(r.blockMetas))
+	var totalSpans int64
+	for i, m := range r.blockMetas {
+		spanCounts[i] = m.SpanCount
+		totalSpans += int64(m.SpanCount) //nolint:gosec
+	}
+
+	return &FileLayoutReport{
+		FileSize:        r.fileSize,
+		FileVersion:     r.fileVersion,
+		BlockCount:      len(r.blockMetas),
+		TotalSpans:      totalSpans,
+		BlockSpanCounts: spanCounts,
+		Sections:        sections,
+		RangeIndex:      rangeIndex,
+		SketchIndex:     sketchIndex,
+		FileBloom:       fileBloom,
+	}, nil
+}
+
+// layoutIntrinsicColumnV14 reads a V14 name-keyed intrinsic column blob and, if it is
+// in paged format, returns one physical section per page plus a page_toc header section.
+// For non-paged blobs, returns nil so the caller emits a single section instead.
+func (r *Reader) layoutIntrinsicColumnV14(colName string, e shared.DirEntryName) ([]FileLayoutSection, error) {
+	// GetIntrinsicColumnBlob returns raw (snappy-compressed) bytes for V14 files.
+	// We need the decompressed bytes to check for paged format.
+	rawBlob, err := r.GetIntrinsicColumnBlob(colName)
+	if err != nil || len(rawBlob) == 0 {
+		return nil, err
+	}
+
+	// For V14 files, blobs on disk are snappy-compressed; decompress to inspect content.
+	blob, err := snappy.Decode(nil, rawBlob)
+	if err != nil {
+		// Not snappy-compressed (shouldn't happen for V14) — treat as non-paged.
+		blob = rawBlob
+	}
+
+	// Non-paged blob: let caller emit the simple section.
+	if len(blob) == 0 || blob[0] != shared.IntrinsicPagedVersion {
+		return nil, nil
+	}
+
+	// Paged format: blob[1:5] = toc_len[4], then toc_blob, then page blobs.
+	if len(blob) < 5 {
+		return nil, nil
+	}
+	tocLen := int(binary.LittleEndian.Uint32(blob[1:5]))
+	if 5+tocLen > len(blob) {
+		return nil, nil
+	}
+
+	ptoc, tocErr := shared.DecodePageTOC(blob[5 : 5+tocLen])
+	if tocErr != nil {
+		return nil, tocErr
+	}
+	if len(ptoc.Pages) == 0 {
+		return nil, nil
+	}
+
+	// The blob on disk is snappy-compressed, stored at e.Offset with e.CompressedLen bytes.
+	// The uncompressed paged blob has: sentinel[1] + toc_len[4] + toc_blob[tocLen] + pages.
+	// page absolute offsets are relative to the compressed blob start on disk —
+	// however the paged TOC stores offsets relative to the start of the first page blob
+	// within the uncompressed blob. For layout purposes, we emit logical sections.
+	headerLen := int64(1) + 4 + int64(tocLen) //nolint:gosec
+
+	sections := make([]FileLayoutSection, 0, 1+len(ptoc.Pages))
+
+	// Emit the TOC header as a logical section (describes uncompressed blob sub-structure).
+	// Offset=0: the header occupies bytes [0, headerLen) within the uncompressed blob.
+	sections = append(sections, FileLayoutSection{
+		Section:        "intrinsic.column[" + colName + "].page_toc",
+		ColumnName:     colName,
+		Offset:         0, // relative to uncompressed blob; header starts at byte 0
+		CompressedSize: headerLen,
+		IsLogical:      true,
+	})
+
+	// Emit per-page sections as logical sections.
+	for pageIdx, pm := range ptoc.Pages {
+		pageOffset := headerLen + int64(pm.Offset) //nolint:gosec
+		sections = append(sections, FileLayoutSection{
+			Section:        fmt.Sprintf("intrinsic.column[%s].page[%d]", colName, pageIdx),
+			ColumnName:     colName,
+			Offset:         pageOffset,
+			CompressedSize: int64(pm.Length), //nolint:gosec
+			RowCount:       int(pm.RowCount), //nolint:gosec
+			IsLogical:      true,
+		})
+	}
+
+	// Emit the compressed blob on disk as a single physical section that accounts for the bytes.
+	sections = append(sections, FileLayoutSection{
+		Section:          "intrinsic.column[" + colName + "]",
+		ColumnName:       colName,
+		Offset:           int64(e.Offset),        //nolint:gosec
+		CompressedSize:   int64(e.CompressedLen), //nolint:gosec
+		UncompressedSize: int64(len(blob)),       //nolint:gosec
+	})
+
+	return sections, nil
+}
+
+// layoutIntrinsicSections returns FileLayoutSection entries for all intrinsic columns
+// in legacy (V4/V5/V6 footer) files. It handles both flat and paged column formats.
+func (r *Reader) layoutIntrinsicSections() []FileLayoutSection {
+	var sections []FileLayoutSection
+	var columnsEnd int64
+
+	for _, name := range r.IntrinsicColumnNames() {
+		meta, ok := r.IntrinsicColumnMeta(name)
+		if !ok {
+			continue
+		}
+		formatName := "flat"
+		if meta.Format == shared.IntrinsicFormatDict {
+			formatName = "dict"
+		}
+
+		blob, blobErr := r.GetIntrinsicColumnBlob(name)
+		isPaged := blobErr == nil && len(blob) > 0 && blob[0] == shared.IntrinsicPagedVersion
+
+		pagedEmitted := false
+		if isPaged && len(blob) >= 5 {
+			tocLen := int(binary.LittleEndian.Uint32(blob[1:5]))
+			if 5+tocLen <= len(blob) {
+				ptoc, tocErr := shared.DecodePageTOC(blob[5 : 5+tocLen])
+				if tocErr == nil && len(ptoc.Pages) > 0 {
+					headerLen := int64(1) + 4 + int64(tocLen)            //nolint:gosec
+					firstPageAbsOffset := int64(meta.Offset) + headerLen //nolint:gosec
+					sections = append(sections, FileLayoutSection{
+						Section:        "intrinsic.column[" + name + "].page_toc",
+						ColumnName:     name,
+						ColumnType:     columnTypeName(meta.Type),
+						Offset:         int64(meta.Offset), //nolint:gosec
+						CompressedSize: headerLen,
+					})
+					if end := int64(meta.Offset) + headerLen; end > columnsEnd { //nolint:gosec
+						columnsEnd = end
+					}
+					for pageIdx, pm := range ptoc.Pages {
+						pageAbsOffset := firstPageAbsOffset + int64(pm.Offset) //nolint:gosec
+						sections = append(sections, FileLayoutSection{
+							Section:        fmt.Sprintf("intrinsic.column[%s].page[%d]", name, pageIdx),
+							ColumnName:     name,
+							ColumnType:     columnTypeName(meta.Type),
+							Encoding:       fmt.Sprintf("%s/paged", formatName),
+							Offset:         pageAbsOffset,
+							CompressedSize: int64(pm.Length), //nolint:gosec
+							RowCount:       int(pm.RowCount), //nolint:gosec
+							MinValue:       formatIntrinsicBound(meta.Type, pm.Min),
+							MaxValue:       formatIntrinsicBound(meta.Type, pm.Max),
+						})
+						if end := pageAbsOffset + int64(pm.Length); end > columnsEnd { //nolint:gosec
+							columnsEnd = end
+						}
+					}
+					pagedEmitted = true
+				}
+			}
+		}
+
+		if !pagedEmitted {
+			if isPaged {
+				formatName += "/paged"
+			}
+			sections = append(sections, FileLayoutSection{
+				Section:        "intrinsic.column[" + name + "]",
+				ColumnName:     name,
+				ColumnType:     columnTypeName(meta.Type),
+				Encoding:       formatName,
+				Offset:         int64(meta.Offset), //nolint:gosec
+				CompressedSize: int64(meta.Length), //nolint:gosec
+			})
+			if end := int64(meta.Offset) + int64(meta.Length); end > columnsEnd { //nolint:gosec
+				columnsEnd = end
+			}
+		}
+	}
+
+	// TOC blob: from end of last column blob to end of intrinsic index region.
+	tocStart := columnsEnd
+	if tocStart == 0 {
+		tocStart = int64(r.intrinsicIndexOffset) //nolint:gosec
+	}
+	tocEnd := int64(r.intrinsicIndexOffset) + int64(r.intrinsicIndexLen) //nolint:gosec
+	if tocEnd > tocStart {
+		sections = append(sections, FileLayoutSection{
+			Section:        "intrinsic.toc",
+			Offset:         tocStart,
+			CompressedSize: tocEnd - tocStart,
+		})
+	}
+	return sections
+}
+
+// layoutBlockV14 returns FileLayoutSection entries for one V14 block.
+// Column blobs are snappy-compressed on disk; the encoding kind is extracted by
+// snappy-decoding the first 2 bytes of each blob.
+func (r *Reader) layoutBlockV14(blockIdx int, meta shared.BlockMeta) ([]FileLayoutSection, error) {
+	raw, err := r.ReadBlockRaw(blockIdx)
+	if err != nil {
+		return nil, fmt.Errorf("ReadBlockRaw: %w", err)
+	}
+
+	hdr, err := parseBlockHeader(raw)
+	if err != nil {
+		return nil, fmt.Errorf("parseBlockHeader: %w", err)
+	}
+
+	metas, colMetaEndPos, err := parseColumnMetadataArray(raw, 24, int(hdr.columnCount), hdr.version)
+	if err != nil {
+		return nil, fmt.Errorf("parseColumnMetadataArray: %w", err)
+	}
+
+	prefix := fmt.Sprintf("block[%d]", blockIdx)
+	base := int64(meta.Offset) //nolint:gosec
+	sections := make([]FileLayoutSection, 0, 3+len(metas)*2)
+
+	// Block header: always 24 bytes.
+	sections = append(sections, FileLayoutSection{
+		Section:        prefix + ".header",
+		Offset:         base,
+		CompressedSize: 24,
+		BlockIndex:     blockIdx,
+	})
+
+	// Column metadata array: bytes [24, colMetaEndPos).
+	if colMetaSize := int64(colMetaEndPos - 24); colMetaSize > 0 {
+		sections = append(sections, FileLayoutSection{
+			Section:        prefix + ".column_metadata",
+			Offset:         base + 24,
+			CompressedSize: colMetaSize,
+			BlockIndex:     blockIdx,
+		})
+	}
+
+	// Per-column data: each blob is snappy-compressed on disk.
+	for _, m := range metas {
+		if m.compressedLen == 0 {
+			continue
+		}
+		colType := columnTypeName(m.colType)
+
+		// Get encoding kind by snappy-decoding the first 2 bytes of the blob.
+		var encKind string
+		start := int(m.dataOffset) //nolint:gosec
+		end := start + int(m.compressedLen)
+		if end <= len(raw) {
+			if decoded, decErr := snappy.Decode(nil, raw[start:end]); decErr == nil && len(decoded) >= 2 {
+				encKind = encodingKindName(decoded[1])
+			}
+		}
+
+		sections = append(sections, FileLayoutSection{
+			Section:          prefix + ".column[" + m.name + "].data",
+			ColumnName:       m.name,
+			ColumnType:       colType,
+			Encoding:         encKind,
+			Offset:           base + int64(m.dataOffset), //nolint:gosec
+			CompressedSize:   int64(m.compressedLen),     //nolint:gosec
+			UncompressedSize: int64(m.uncompressedLen),   //nolint:gosec
+			BlockIndex:       blockIdx,
+		})
+	}
+
+	return sections, nil
+}
+
 // buildSketchIndexInfo builds the SketchIndexInfo from the reader's parsed column-major sketch data.
 // Returns nil when no sketches are present.
 func (r *Reader) buildSketchIndexInfo() *SketchIndexInfo {
+	_ = r.ensureV14SketchSection()
 	if r.sketchIdx == nil || len(r.sketchIdx.columns) == 0 {
 		return nil
 	}
@@ -388,7 +624,7 @@ func (r *Reader) buildSketchIndexInfo() *SketchIndexInfo {
 
 			stat := blockColStat{
 				name:        name,
-				cardinality: uint64(cd.distinct[blockIdx]),
+				cardinality: uint64(cd.distinctAt(blockIdx)),
 				topkCount:   topkEntries,
 				topkBytes:   topkBytesForBlock,
 				fuseBytes:   bloomB,
@@ -427,6 +663,7 @@ func (r *Reader) buildSketchIndexInfo() *SketchIndexInfo {
 
 // buildRangeIndex parses every column's range index and returns the result sorted by column name.
 func (r *Reader) buildRangeIndex() []RangeIndexColumn {
+	_ = r.ensureV14RangeSection()
 	if len(r.rangeOffsets) == 0 {
 		return nil
 	}
@@ -522,7 +759,7 @@ func (r *Reader) layoutBlock(blockIdx int, meta shared.BlockMeta) ([]FileLayoutS
 		return nil, fmt.Errorf("parseBlockHeader: %w", err)
 	}
 
-	metas, colMetaEndPos, err := parseColumnMetadataArray(raw, 24, int(hdr.columnCount))
+	metas, colMetaEndPos, err := parseColumnMetadataArray(raw, 24, int(hdr.columnCount), hdr.version)
 	if err != nil {
 		return nil, fmt.Errorf("parseColumnMetadataArray: %w", err)
 	}
@@ -560,24 +797,14 @@ func (r *Reader) layoutBlock(blockIdx int, meta shared.BlockMeta) ([]FileLayoutS
 				encKind = encodingKindName(raw[start+1])
 			}
 
-			end := start + int(m.dataLen) //nolint:gosec
-			var uncompSize int64
-			if end <= len(raw) {
-				uncompSize, err = columnDataUncompressedSize(raw[start:end])
-				if err != nil {
-					return nil, fmt.Errorf("column %q uncompressed size: %w", m.name, err)
-				}
-			}
-
 			sections = append(sections, FileLayoutSection{
-				Section:          prefix + ".column[" + m.name + "].data",
-				ColumnName:       m.name,
-				ColumnType:       colType,
-				Encoding:         encKind,
-				Offset:           base + int64(m.dataOffset), //nolint:gosec
-				CompressedSize:   int64(m.dataLen),           //nolint:gosec
-				UncompressedSize: uncompSize,
-				BlockIndex:       blockIdx,
+				Section:        prefix + ".column[" + m.name + "].data",
+				ColumnName:     m.name,
+				ColumnType:     colType,
+				Encoding:       encKind,
+				Offset:         base + int64(m.dataOffset), //nolint:gosec
+				CompressedSize: int64(m.dataLen),           //nolint:gosec
+				BlockIndex:     blockIdx,
 			})
 		}
 	}
@@ -615,6 +842,7 @@ func (r *Reader) layoutMetadata() ([]FileLayoutSection, error) {
 // layoutMetadataRangeIndex returns logical FileLayoutSection entries for each
 // range-indexed column within the decompressed metadata buffer.
 func (r *Reader) layoutMetadataRangeIndex() []FileLayoutSection {
+	_ = r.ensureV14RangeSection()
 	if len(r.rangeOffsets) == 0 {
 		return nil
 	}
@@ -640,6 +868,7 @@ func (r *Reader) layoutMetadataRangeIndex() []FileLayoutSection {
 // The raw bytes have already been validated by parseFileBloomSection during file open, so
 // magic/version checks here are defensive guards, not primary validation.
 func (r *Reader) buildFileBloomInfo() *FileBloomInfo {
+	_ = r.ensureV14BloomSection()
 	raw := r.fileBloomRaw
 	if len(raw) == 0 {
 		return nil
@@ -784,294 +1013,4 @@ func encodingKindName(kind uint8) string {
 	default:
 		return fmt.Sprintf("Unknown(%d)", kind)
 	}
-}
-
-// columnDataUncompressedSize computes the total uncompressed size of a column data blob
-// by walking the encoding wire format, finding zstd-compressed chunks, decompressing them,
-// and returning the inflated size (all zstd chunks replaced by their decompressed contents).
-// For encodings without zstd (InlineBytes), returns the data length as-is.
-func columnDataUncompressedSize(data []byte) (int64, error) {
-	if len(data) < 2 {
-		return int64(len(data)), nil
-	}
-
-	kind := data[1]
-	body := data[2:] // skip enc_version[1] + kind[1]
-	overhead := int64(2)
-
-	var (
-		bodySize int64
-		err      error
-	)
-
-	switch kind {
-	case 1, 2: // Dictionary / SparseDictionary
-		bodySize, err = inflatedDictKind(body)
-
-	case 3, 4: // InlineBytes / SparseInlineBytes — no zstd compression
-		return int64(len(data)), nil
-
-	case 5: // DeltaUint64
-		bodySize, err = inflatedDeltaUint64(body)
-
-	case 6, 7: // RLEIndexes / SparseRLEIndexes
-		bodySize, err = inflatedRLEIndexes(body)
-
-	case 8, 9: // XORBytes / SparseXORBytes
-		bodySize, err = inflatedXORBytes(body)
-
-	case 10, 11: // PrefixBytes / SparsePrefixBytes
-		bodySize, err = inflatedPrefixBytes(body)
-
-	case 12, 13: // DeltaDictionary / SparseDeltaDictionary
-		bodySize, err = inflatedDeltaDict(body)
-
-	default:
-		return int64(len(data)), nil
-	}
-
-	if err != nil {
-		return 0, err
-	}
-
-	return overhead + bodySize, nil
-}
-
-// inflatedZstdChunk reads a len[4]+zstd_data[len] chunk at body[pos:], decompresses
-// to measure the uncompressed size, and returns (inflated_chunk_size, new_pos, error).
-// inflated_chunk_size = 4 (length prefix) + decompressed_size.
-func inflatedZstdChunk(body []byte, pos int) (int64, int, error) {
-	if pos+4 > len(body) {
-		return int64(len(body) - pos), len(body), nil
-	}
-
-	cLen := int(binary.LittleEndian.Uint32(body[pos:]))
-	pos += 4
-
-	if cLen == 0 {
-		// Zero-length chunk: only the 4-byte length prefix is present.
-		return 4, pos, nil
-	}
-	if pos+cLen > len(body) {
-		// Truncated chunk: clamp to remaining bytes so new_pos never exceeds len(body).
-		return int64(4 + max(len(body)-pos, 0)), len(body), nil
-	}
-
-	n, err := zstdStreamedSize(body[pos : pos+cLen])
-	if err != nil {
-		return 0, pos + cLen, fmt.Errorf("inflatedZstdChunk: %w", err)
-	}
-
-	return 4 + n, pos + cLen, nil
-}
-
-// zstdStreamedSize decompresses compressed into io.Discard via a pooled decoder and
-// returns the number of output bytes without materializing the full payload. The decoder
-// is returned to the pool after use, avoiding per-chunk allocation overhead for large
-// files with many column chunks.
-func zstdStreamedSize(compressed []byte) (int64, error) {
-	dec := layoutDecoderPool.Get().(*zstd.Decoder)
-	if err := dec.Reset(bytes.NewReader(compressed)); err != nil {
-		// Do not return a broken decoder to the pool; close it instead.
-		dec.Close()
-		return 0, err
-	}
-	n, err := io.Copy(io.Discard, dec)
-	if err == nil {
-		layoutDecoderPool.Put(dec)
-	} else {
-		dec.Close()
-	}
-	return n, err
-}
-
-// skipPresenceRLE skips a prl_len[4]+prl_data segment, returning (bytes_consumed, new_pos).
-func skipPresenceRLE(body []byte, pos int) (int64, int) {
-	if pos+4 > len(body) {
-		return int64(len(body) - pos), len(body)
-	}
-
-	prlLen := int(binary.LittleEndian.Uint32(body[pos:]))
-
-	newPos := pos + 4 + prlLen
-	if newPos > len(body) {
-		// Corrupt/too-large prlLen: clamp to end of body.
-		return int64(len(body) - pos), len(body)
-	}
-
-	return int64(4 + prlLen), newPos
-}
-
-// inflatedDictKind computes inflated size for encodings whose layout starts with a shared
-// dict chunk (kinds 1, 2, 6, 7: Dictionary, SparseDictionary, RLEIndexes, SparseRLEIndexes).
-// body starts after enc_version+kind.
-// Wire: index_width[1] + dict_len[4]+zstd(dict) + rest...
-func inflatedDictKind(body []byte) (int64, error) {
-	if len(body) < 1 {
-		return int64(len(body)), nil
-	}
-
-	total := int64(1) // index_width
-	pos := 1
-
-	// zstd dict chunk
-	chunkSize, newPos, err := inflatedZstdChunk(body, pos)
-	if err != nil {
-		return 0, err
-	}
-
-	total += chunkSize
-	// Remaining bytes (row_count, presence RLE, indexes) are not zstd-compressed.
-	total += int64(len(body) - newPos)
-
-	return total, nil
-}
-
-// inflatedRLEIndexes computes inflated size for RLEIndexes/SparseRLEIndexes kinds.
-// Same structure as dictKind: index_width[1] + dict_len[4]+zstd + rest...
-func inflatedRLEIndexes(body []byte) (int64, error) {
-	return inflatedDictKind(body)
-}
-
-// inflatedDeltaUint64 computes inflated size for DeltaUint64 kind.
-// Wire: span_count[4] + prl_len[4]+prl + base[8]+width[1] + [if width>0: len[4]+zstd]
-func inflatedDeltaUint64(body []byte) (int64, error) {
-	if len(body) < 4 {
-		return int64(len(body)), nil
-	}
-
-	total := int64(4) // span_count
-	pos := 4
-
-	// Skip presence RLE
-	prlSize, newPos := skipPresenceRLE(body, pos)
-	total += prlSize
-	pos = newPos
-
-	// base[8] + width[1]
-	if pos+9 > len(body) {
-		total += int64(len(body) - pos)
-		return total, nil
-	}
-
-	total += 9
-	width := body[pos+8]
-	pos += 9
-
-	if width > 0 {
-		chunkSize, newPos, err := inflatedZstdChunk(body, pos)
-		if err != nil {
-			return 0, err
-		}
-
-		total += chunkSize
-		total += int64(len(body) - newPos)
-	}
-
-	return total, nil
-}
-
-// inflatedXORBytes computes inflated size for XORBytes/SparseXORBytes kinds.
-// Wire: span_count[4] + prl_len[4]+prl + xor_len[4]+zstd(xor)
-func inflatedXORBytes(body []byte) (int64, error) {
-	if len(body) < 4 {
-		return int64(len(body)), nil
-	}
-
-	total := int64(4) // span_count
-	pos := 4
-
-	prlSize, newPos := skipPresenceRLE(body, pos)
-	total += prlSize
-	pos = newPos
-
-	chunkSize, newPos, err := inflatedZstdChunk(body, pos)
-	if err != nil {
-		return 0, err
-	}
-
-	total += chunkSize
-	total += int64(len(body) - newPos)
-
-	return total, nil
-}
-
-// inflatedPrefixBytes computes inflated size for PrefixBytes/SparsePrefixBytes kinds.
-// Wire: span_count[4] + prl_len[4]+prl + prefix_dict_len[4]+zstd1 + suffix_data_len[4]+zstd2
-func inflatedPrefixBytes(body []byte) (int64, error) {
-	if len(body) < 4 {
-		return int64(len(body)), nil
-	}
-
-	total := int64(4) // span_count
-	pos := 4
-
-	prlSize, newPos := skipPresenceRLE(body, pos)
-	total += prlSize
-	pos = newPos
-
-	// First zstd chunk: prefix dict
-	chunk1Size, newPos, err := inflatedZstdChunk(body, pos)
-	if err != nil {
-		return 0, err
-	}
-
-	total += chunk1Size
-	pos = newPos
-
-	// Second zstd chunk: suffix data
-	chunk2Size, newPos, err := inflatedZstdChunk(body, pos)
-	if err != nil {
-		return 0, err
-	}
-
-	total += chunk2Size
-	total += int64(len(body) - newPos)
-
-	return total, nil
-}
-
-// inflatedDeltaDict computes inflated size for DeltaDictionary/SparseDeltaDictionary kinds.
-// Wire: index_width[1] + dict_len[4]+zstd1 + row_count[4] + prl_len[4]+prl + delta_len[4]+zstd2
-func inflatedDeltaDict(body []byte) (int64, error) {
-	if len(body) < 1 {
-		return int64(len(body)), nil
-	}
-
-	total := int64(1) // index_width
-	pos := 1
-
-	// First zstd chunk: dict
-	chunk1Size, newPos, err := inflatedZstdChunk(body, pos)
-	if err != nil {
-		return 0, err
-	}
-
-	total += chunk1Size
-	pos = newPos
-
-	// row_count[4]
-	if pos+4 > len(body) {
-		total += int64(len(body) - pos)
-		return total, nil
-	}
-
-	total += 4
-	pos += 4
-
-	// presence RLE
-	prlSize, newPos := skipPresenceRLE(body, pos)
-	total += prlSize
-	pos = newPos
-
-	// Second zstd chunk: deltas
-	chunk2Size, newPos, err := inflatedZstdChunk(body, pos)
-	if err != nil {
-		return 0, err
-	}
-
-	total += chunk2Size
-	total += int64(len(body) - newPos)
-
-	return total, nil
 }

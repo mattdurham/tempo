@@ -326,3 +326,85 @@ Back-ref: `internal/modules/blockio/reader/parser.go:readFooter`,
 `internal/modules/blockio/reader/reader.go:VectorIndex`,
 `internal/modules/blockio/reader/reader.go:VectorIndexRaw`,
 `internal/modules/blockio/reader/vector_index.go:parseVectorIndexSection`
+
+---
+
+## NOTE-012: V7 Footer (FooterV7Version=7) — V14 Section Directory (2026-04-10)
+*Added: 2026-04-10*
+
+**Decision:** Redesign the write/read path for V14 format using a new FooterV7 (18 bytes):
+1. Replace the single snappy-compressed metadata blob with a section directory footer.
+   Footer wire format: `magic[4]+version[2]=7+dir_offset[8]+dir_len[4]` = 18 bytes.
+2. Add `readSectionDirectory` to decode the snappy-compressed section directory into
+   `map[uint8]shared.DirEntryType` and `map[string]shared.DirEntryName` for O(1) lookup.
+   File-level intrinsic columns use name-keyed entries (`DirEntryName`); fixed sections
+   use type-keyed entries (`DirEntryType`). No separate intrinsic TOC read needed.
+3. Replace `parseV5MetadataLazy` (single blob) with `parseSectionsLazy`: each section is
+   read on demand via `ReadAt(entry.Offset, entry.CompressedLen)` + `snappy.Decode`.
+4. Remove `zstdDec`, `decompScratchPool`, and `decompressZstdScratch` from `column.go`.
+5. Add snappy decode per column in the block-parse path: each column blob is
+   `snappy.Decode(compressedBlob)` before parsing encoding-specific bytes.
+
+**Version number rationale:** Agentic uses FooterV5Version=5 (46-byte vector footer) and
+FooterV6Version=6 (58-byte compact-traces footer). Our section-directory footer uses version 7
+to avoid the collision with both agentic footer versions.
+
+**Why section directory instead of footer offsets:**
+V3/V4/V5/V6 footers stored fixed offset fields for specific sections (header_offset,
+compact_offset, intrinsic_offset, vector_offset, etc.). Adding a new section required a footer
+format bump. The V7 section directory is extensible: new section types are added by writing a
+new entry without any footer wire-format change. Reader code performs a map lookup by
+section type rather than accessing a named struct field.
+
+**Why per-section lazy parse:**
+The block index section must be read eagerly (needed to populate `r.blockMetas` for all
+subsequent operations). All other sections are used only conditionally:
+- Range index: only when a range predicate needs pruning.
+- Trace index: only for `GetTraceByID`/`TraceEntries`.
+- TS index: only for time-range pruning.
+- Sketch index: only for TopK/HLL queries.
+- File bloom: only for bloom filter checks at query start.
+
+
+Lazy parse means opening a reader costs one `ReadAt` (footer) + one `ReadAt`+decode
+(section directory) + one `ReadAt`+decode (block index) + one `ReadAt` per intrinsic
+column name-keyed entry (to peek format/type/count via `PeekIntrinsicBlobHeader`,
+populating `IntrinsicColMeta` for executor fast-path dispatch). All other sections incur
+I/O only when their data is actually needed.
+
+**Why remove decompScratchPool:**
+The scratch pool held output buffers for zstd decompression. With zstd removed from
+column parsing entirely (all internal sub-segments are now raw bytes), there is no
+decompression within the column decode path. The outer snappy decode per column uses
+`snappy.Decode(nil, compressedBlob)`, which allocates its own output buffer — a single
+allocation per column decode, retained for the duration of the block scan. No pool is
+needed for this allocation pattern; it is too short-lived to benefit from pooling and the
+allocation count is proportional to `wantColumns` (typically small).
+
+**Why keep NewLeanReaderFromProvider:**
+`NewLeanReaderFromProvider` still exists and is retained for the trace-ID lookup path.
+For V14 files it delegates directly to `parseSectionsLazyV14` (same as
+`NewReaderFromProvider`), so both entry points are functionally equivalent on V14 files.
+For legacy V3/V4 files, `NewLeanReaderFromProvider` continues its original optimized path:
+reading only the footer and compact trace index, falling back to `NewReaderFromProvider`
+when no compact index is present.
+
+In V14 the section directory makes every section independently addressable, so the
+distinction between "lean" and "full" reader is less meaningful — but
+`NewLeanReaderFromProvider` is preserved for API compatibility.
+
+
+**Alternatives considered:**
+- *Keep decompScratchPool, use it for snappy decode output*: Rejected — column decode
+  output buffers are referenced by `rawEncoding` in `Column` structs and outlive the
+  decode call.
+- *Store section directory at file start (offset 0)*: Rejected — blocks are written at
+  offset 0 and there is no fixed-size prefix before block data. The footer-pointer pattern
+  is already established.
+
+Back-ref: `internal/modules/blockio/reader/parser.go:readFooter`,
+`internal/modules/blockio/reader/parser.go:readSectionDirectory`,
+`internal/modules/blockio/reader/parser.go:parseSectionsLazy`,
+`internal/modules/blockio/reader/column.go` (decompScratchPool removed),
+`internal/modules/blockio/reader/columnar_read.go` (snappy decode per column),
+`internal/modules/blockio/reader/reader.go:NewReaderFromProvider`

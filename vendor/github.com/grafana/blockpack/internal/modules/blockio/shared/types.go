@@ -2,7 +2,122 @@ package shared
 
 // NOTE: Any changes to this file must be reflected in the corresponding specs.md or NOTES.md.
 
-import "sync"
+import (
+	"encoding/binary"
+	"fmt"
+	"sync"
+)
+
+// DirEntryType describes a type-keyed entry in the V14 section directory.
+// Used for the 6 fixed file-level sections (block index, range index, etc.).
+// Wire format: entry_kind[1]=0x00 + section_type[1] + offset[8] + compressed_len[4] = 14 bytes.
+// Fields are ordered for minimal struct padding (string header first, then scalar fields).
+type DirEntryType struct {
+	Offset        uint64
+	CompressedLen uint32
+	SectionType   uint8
+}
+
+// DirEntryTypeWireSize is the fixed on-wire size of one type-keyed directory entry.
+// entry_kind[1]+section_type[1]+offset[8]+compressed_len[4] = 14 bytes.
+const DirEntryTypeWireSize = 14
+
+// Marshal serializes the entry to its 14-byte wire format.
+func (e DirEntryType) Marshal() []byte {
+	buf := make([]byte, DirEntryTypeWireSize)
+	buf[0] = DirEntryKindType
+	buf[1] = e.SectionType
+	binary.LittleEndian.PutUint64(buf[2:10], e.Offset)
+	binary.LittleEndian.PutUint32(buf[10:14], e.CompressedLen)
+	return buf
+}
+
+// MarshalInto serializes the entry into dst (must be at least 14 bytes).
+func (e DirEntryType) MarshalInto(dst []byte) {
+	dst[0] = DirEntryKindType
+	dst[1] = e.SectionType
+	binary.LittleEndian.PutUint64(dst[2:10], e.Offset)
+	binary.LittleEndian.PutUint32(dst[10:14], e.CompressedLen)
+}
+
+// UnmarshalDirEntryType parses a DirEntryType from a buffer starting at position after the kind byte.
+// data must start at section_type[1] (i.e., the kind byte was already consumed by the caller).
+func UnmarshalDirEntryType(data []byte) (DirEntryType, error) {
+	const want = DirEntryTypeWireSize - 1 // minus the kind byte already consumed
+	if len(data) < want {
+		return DirEntryType{}, fmt.Errorf("UnmarshalDirEntryType: need %d bytes, got %d", want, len(data))
+	}
+	return DirEntryType{
+		SectionType:   data[0],
+		Offset:        binary.LittleEndian.Uint64(data[1:9]),
+		CompressedLen: binary.LittleEndian.Uint32(data[9:13]),
+	}, nil
+}
+
+// DirEntryName describes a name-keyed entry in the V14 section directory.
+// Used for file-level intrinsic column blobs (one entry per column).
+// Wire format: entry_kind[1]=0x01 + name_len[2] + name + offset[8] + compressed_len[4] = 15+len(name) bytes.
+// Fields are ordered for minimal struct padding (string header first, then scalar fields).
+type DirEntryName struct {
+	Name          string
+	Offset        uint64
+	CompressedLen uint32
+}
+
+// WireSize returns the variable on-wire size of this name-keyed directory entry.
+// entry_kind[1]+name_len[2]+name+offset[8]+compressed_len[4] = 15+len(name) bytes.
+func (e DirEntryName) WireSize() int {
+	return 15 + len(e.Name)
+}
+
+// Marshal serializes the entry to its wire format.
+func (e DirEntryName) Marshal() []byte {
+	buf := make([]byte, e.WireSize())
+	e.MarshalInto(buf)
+	return buf
+}
+
+// MarshalInto serializes the entry into dst (must be at least WireSize() bytes).
+func (e DirEntryName) MarshalInto(dst []byte) {
+	dst[0] = DirEntryKindName
+	binary.LittleEndian.PutUint16(dst[1:3], uint16(len(e.Name))) //nolint:gosec // safe: name length bounded by MaxNameLen (1024), fits in uint16
+	copy(dst[3:3+len(e.Name)], e.Name)
+	off := 3 + len(e.Name)
+	binary.LittleEndian.PutUint64(dst[off:off+8], e.Offset)
+	binary.LittleEndian.PutUint32(dst[off+8:off+12], e.CompressedLen)
+}
+
+// UnmarshalDirEntryName parses a DirEntryName from a buffer starting after the kind byte.
+// data must start at name_len[2] (i.e., the kind byte was already consumed by the caller).
+// Returns the entry and the number of bytes consumed from data.
+func UnmarshalDirEntryName(data []byte) (DirEntryName, int, error) {
+	if len(data) < 2 {
+		return DirEntryName{}, 0, fmt.Errorf("UnmarshalDirEntryName: need at least 2 bytes for name_len, got %d", len(data))
+	}
+	nameLen := int(binary.LittleEndian.Uint16(data[0:2]))
+	need := 2 + nameLen + 8 + 4
+	if len(data) < need {
+		return DirEntryName{}, 0, fmt.Errorf("UnmarshalDirEntryName: need %d bytes, got %d", need, len(data))
+	}
+	name := string(data[2 : 2+nameLen])
+	off := 2 + nameLen
+	return DirEntryName{
+		Name:          name,
+		Offset:        binary.LittleEndian.Uint64(data[off : off+8]),
+		CompressedLen: binary.LittleEndian.Uint32(data[off+8 : off+12]),
+	}, need, nil
+}
+
+// SectionDirectory holds the decoded V14 section directory.
+// TypeEntries maps section_type (0x01–0x06) to its type-keyed entry.
+// NameEntries maps intrinsic column name to its name-keyed entry.
+// SignalType holds the file's signal type (SignalTypeTrace=0x01, SignalTypeLog=0x02).
+// Defaults to 0 (unknown) if no DirEntryKindSignal entry is present.
+type SectionDirectory struct {
+	TypeEntries map[uint8]DirEntryType
+	NameEntries map[string]DirEntryName
+	SignalType  uint8
+}
 
 // ColumnType is the logical column type (0–13); values 14–255 are reserved.
 type ColumnType uint8

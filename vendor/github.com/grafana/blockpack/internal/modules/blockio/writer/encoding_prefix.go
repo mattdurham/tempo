@@ -11,12 +11,12 @@ import (
 
 // encodePrefixBytes encodes a []byte column using prefix-dictionary compression (kinds 10/11).
 //
-// Wire format:
+// Wire format (V14 enc_version=3):
 //
 //	enc_version[1] + kind[1] + span_count[4 LE]
 //	+ presence_rle_len[4 LE] + presence_rle_data
-//	+ prefix_dict_len[4 LE] + zstd(prefix_dict_payload)
-//	+ suffix_data_len[4 LE] + zstd(suffix_data_payload)
+//	+ prefix_dict_len[4 LE] + raw_prefix_dict_payload  (no zstd)
+//	+ suffix_data_len[4 LE] + raw_suffix_data_payload  (no zstd)
 //
 // Prefix dict payload:
 //
@@ -30,7 +30,6 @@ func encodePrefixBytes(
 	values [][]byte,
 	present []bool,
 	nRows int,
-	enc *zstdEncoder,
 ) ([]byte, error) {
 	// Build presence bitset.
 	bitsetLen := (nRows + 7) / 8
@@ -76,11 +75,6 @@ func encodePrefixBytes(
 		dictPayload = append(dictPayload, p...)
 	}
 
-	compressedDict, err := enc.compress(dictPayload)
-	if err != nil {
-		return nil, err
-	}
-
 	// Encode suffix data payload: prefix_index_width[1] + per present row × SuffixEntry.
 	suffixPayload := make([]byte, 0, 1+len(presentValues)*12)
 	suffixPayload = append(suffixPayload, indexWidth)
@@ -93,23 +87,19 @@ func encodePrefixBytes(
 		suffixPayload = append(suffixPayload, suf...)
 	}
 
-	compressedSuffix, err := enc.compress(suffixPayload)
-	if err != nil {
-		return nil, err
-	}
-
-	buf := make([]byte, 0, 2+4+4+len(rleData)+4+len(compressedDict)+4+len(compressedSuffix))
-	buf = append(buf, shared.ColumnEncodingVersion, kind)
+	// V14: both dict and suffix are raw (no zstd). Outer snappy applied per-column by block writer.
+	buf := make([]byte, 0, 2+4+4+len(rleData)+4+len(dictPayload)+4+len(suffixPayload))
+	buf = append(buf, shared.VersionBlockEncV3, kind)
 	buf = appendUint32LE(buf, uint32(nRows))        //nolint:gosec // safe: nRows bounded by MaxBlockSpans (65535)
 	buf = appendUint32LE(buf, uint32(len(rleData))) //nolint:gosec // safe: rle data bounded by block size
 	buf = append(buf, rleData...)
-	buf = appendUint32LE(buf, uint32(len(compressedDict))) //nolint:gosec // safe: compressed data bounded by block size
-	buf = append(buf, compressedDict...)
+	buf = appendUint32LE(buf, uint32(len(dictPayload))) //nolint:gosec // safe: raw data bounded by block size
+	buf = append(buf, dictPayload...)
 	buf = appendUint32LE(
 		buf,
-		uint32(len(compressedSuffix)), //nolint:gosec // safe: compressed data bounded by block size
+		uint32(len(suffixPayload)), //nolint:gosec // safe: raw data bounded by block size
 	)
-	buf = append(buf, compressedSuffix...)
+	buf = append(buf, suffixPayload...)
 
 	return buf, nil
 }

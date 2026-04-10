@@ -5,39 +5,7 @@ package writer
 
 import (
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
-	"github.com/klauspost/compress/zstd"
 )
-
-// zstdEncoder wraps a *zstd.Encoder to compress data into a reusable buffer.
-// Per NOTES §5, a single encoder is reused for all blocks to bound memory usage.
-type zstdEncoder struct {
-	enc *zstd.Encoder
-	buf []byte
-}
-
-// newZstdEncoder creates a zstdEncoder with SpeedDefault and concurrency 1.
-func newZstdEncoder() (*zstdEncoder, error) {
-	enc, err := zstd.NewWriter(nil,
-		zstd.WithEncoderConcurrency(1),
-		zstd.WithEncoderLevel(zstd.SpeedDefault),
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	return &zstdEncoder{enc: enc}, nil
-}
-
-// compress encodes src using zstd and returns a copy of the compressed bytes.
-// The internal buf is reused across calls; callers must not retain the previous result.
-func (z *zstdEncoder) compress(src []byte) ([]byte, error) {
-	z.buf = z.enc.EncodeAll(src, z.buf[:0])
-
-	result := make([]byte, len(z.buf))
-	copy(result, z.buf)
-
-	return result, nil
-}
 
 // columnBuilder accumulates values for one column and encodes them to the wire format.
 // Each method corresponds to one value type; implementations ignore types that don't
@@ -56,8 +24,9 @@ type columnBuilder interface {
 	nullCount() int
 	colType() shared.ColumnType
 	// buildData returns the wire-format column blob:
-	// enc_version[1]=2 + encoding_kind[1] + payload (per SPECS §8.4).
-	buildData(enc *zstdEncoder) ([]byte, error)
+	// enc_version[1]=3 + encoding_kind[1] + payload (per SPECS §8.4, V14).
+	// Internal sub-segments are raw bytes (no zstd); outer snappy is applied by the block writer.
+	buildData() ([]byte, error)
 	// resetForReuse clears accumulated values (preserving slice capacity) so the
 	// builder can be reused for the next block without re-allocation.
 	resetForReuse(colName string)

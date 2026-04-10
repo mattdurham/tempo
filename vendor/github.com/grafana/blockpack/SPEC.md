@@ -410,3 +410,42 @@ benchmark sessions.
 - `errcheck` linter catches unchecked error returns (already enabled)
 - Code review must verify that every `if err != nil` block propagates, logs, or annotates
 - No existing linter catches "checked but swallowed" — this is a manual review requirement
+
+---
+
+## SPEC-ROOT-011: Bounded Goroutine Fan-Out
+
+**Invariant:** Executor block-group fetching must use `errgroup.SetLimit(runtime.NumCPU())`
+or equivalent to cap parallel goroutines. Unbounded fan-out causes OOM under large result sets.
+
+Back-ref: `internal/modules/executor/stream.go:forEachBlockInGroups`
+
+---
+
+## SPEC-ROOT-012: Per-Column Decompression Bomb Guard
+
+**Invariant:** Every `snappy.Decode` call on a V14 column blob must check `uncompressedLen`
+against `shared.MaxBlockSize` before allocating. A malformed snappy header can claim an
+enormous decoded size.
+
+Back-ref: `internal/modules/blockio/reader/block_parser.go:parseBlockColumnsReuse`
+
+---
+
+## SPEC-ROOT-013: V14-Only enc_version
+
+**Invariant:** V14 block columns use `enc_version=3` (VersionBlockEncV3). V12 columns with
+`enc_version=2` are not readable by the V14 decoder and must be rejected at the block header
+level.
+
+Back-ref: `internal/modules/blockio/reader/column.go:readColumnEncoding`
+
+---
+
+## SPEC-ROOT-014: Single-Tier Block TOC
+
+**Invariant:** V14 blocks use a unified single-tier column TOC (`column_count[4]` +
+`reserved2[8]` at header offsets 12–23), identical to the V12 header layout. A two-tier
+intrinsic/attribute split was evaluated and deferred pending further profiling.
+
+Back-ref: `internal/modules/blockio/reader/block_parser.go:parseBlockColumnsReuse`

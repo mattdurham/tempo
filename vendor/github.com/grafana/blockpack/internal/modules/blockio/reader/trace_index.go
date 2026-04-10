@@ -18,6 +18,79 @@ type compactBlockEntry struct {
 	fileLength uint32
 }
 
+// parseCompactIndexBytesV14 parses the compact trace index blob for V14 files.
+// The blob has the same format as the V13 compact index section:
+// magic[4]+version[1]+block_count[4]+[bloom_bytes[4]+bloom_data[N] for v2]+block_table[M×12]+trace_index.
+// On success, populates r.compactParsed so TraceEntries, GetTraceByID, and TraceCount work.
+func (r *Reader) parseCompactIndexBytesV14(data []byte) error {
+	if len(data) < 9 {
+		return fmt.Errorf("compact index: too short (%d bytes)", len(data))
+	}
+
+	magic := binary.LittleEndian.Uint32(data[0:])
+	if magic != shared.CompactIndexMagic {
+		return fmt.Errorf("compact index: bad magic 0x%08X", magic)
+	}
+
+	version := data[4]
+	if version != shared.CompactIndexVersion && version != shared.CompactIndexVersion2 {
+		return fmt.Errorf("compact index: unsupported version %d", version)
+	}
+
+	blockCount := int(binary.LittleEndian.Uint32(data[5:])) //nolint:gosec
+	if blockCount > shared.MaxBlocks {
+		return fmt.Errorf("compact index: block_count %d exceeds maximum %d", blockCount, shared.MaxBlocks)
+	}
+	pos := 9
+
+	var traceIDBloom []byte
+	if version == shared.CompactIndexVersion2 {
+		if pos+4 > len(data) {
+			return fmt.Errorf("compact index: short for bloom_bytes")
+		}
+		bloomBytes := int(binary.LittleEndian.Uint32(data[pos:])) //nolint:gosec
+		pos += 4
+		if bloomBytes > shared.TraceIDBloomMaxBytes {
+			return fmt.Errorf("compact index: bloom_bytes %d exceeds maximum %d", bloomBytes, shared.TraceIDBloomMaxBytes)
+		}
+		if pos+bloomBytes > len(data) {
+			return fmt.Errorf("compact index: short for bloom_data (need %d bytes)", bloomBytes)
+		}
+		traceIDBloom = make([]byte, bloomBytes)
+		copy(traceIDBloom, data[pos:pos+bloomBytes])
+		pos += bloomBytes
+	}
+
+	need := blockCount * 12
+	if pos+need > len(data) {
+		return fmt.Errorf("compact index: short for block_table (need %d)", need)
+	}
+
+	blockTable := make([]compactBlockEntry, blockCount)
+	for i := range blockCount {
+		blockTable[i] = compactBlockEntry{
+			fileOffset: binary.LittleEndian.Uint64(data[pos:]),
+			fileLength: binary.LittleEndian.Uint32(data[pos+8:]),
+		}
+		pos += 12
+	}
+
+	if pos+5 > len(data) {
+		return fmt.Errorf("compact index: trace_index: data too short")
+	}
+	traceIdxFmtVer := data[pos]
+	if traceIdxFmtVer != shared.TraceIndexFmtVersion && traceIdxFmtVer != shared.TraceIndexFmtVersion2 {
+		return fmt.Errorf("compact index: trace_index: unsupported fmt_version %d", traceIdxFmtVer)
+	}
+
+	r.compactParsed = &compactTraceIndex{
+		blockTable:    blockTable,
+		traceIndexRaw: data[pos:],
+		traceIDBloom:  traceIDBloom,
+	}
+	return nil
+}
+
 // BlocksForTraceID returns block indices containing the given trace ID.
 // Uses the compact index as a fast path when available. If the compact index
 // returns nil (bloom rejected the ID or ID not in hash map), falls through to
@@ -25,7 +98,15 @@ type compactBlockEntry struct {
 // For lean readers (NewLeanReaderFromProvider), r.traceIndex is always empty so
 // the compact index result is final.
 func (r *Reader) BlocksForTraceID(traceID [16]byte) []int {
-	if r.compactLen > 0 {
+	// For V14 files, compactParsed is populated lazily on first access.
+	_ = r.ensureV14TraceSection()
+	// For V3/V4 files, compactLen > 0 gates ensureCompactIndexParsed (lazy I/O).
+	if r.compactParsed != nil {
+		blocks := r.BlocksForTraceIDCompact(traceID)
+		if blocks != nil {
+			return blocks
+		}
+	} else if r.compactLen > 0 {
 		if err := r.ensureCompactIndexParsed(); err == nil {
 			blocks := r.BlocksForTraceIDCompact(traceID)
 			if blocks != nil {
@@ -258,7 +339,7 @@ func (r *Reader) ensureCompactHeaderParsed() error {
 	need := bloomBytes + blockCount*12
 	cacheKey := r.fileID + "/compact-header"
 	bodyData, err := r.cache.GetOrFetch(cacheKey, func() ([]byte, error) {
-		bodyOffset := r.compactOffset + uint64(pos) //nolint:gosec // pos is small, fits in uint64
+		bodyOffset := r.compactOffset + uint64(pos)                               //nolint:gosec // pos is small, fits in uint64
 		return r.readRange(bodyOffset, uint64(need), rw.DataTypeTraceBloomFilter) //nolint:gosec // need is bounded
 	})
 	if err != nil {

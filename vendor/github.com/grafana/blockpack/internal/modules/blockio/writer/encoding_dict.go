@@ -24,11 +24,11 @@ func pickIndexWidth(dictSize int) uint8 {
 
 // encodeDictionaryKind handles kinds 1/2/6/7 for any column type.
 //
-// Wire format:
+// Wire format (V14 enc_version=3):
 //
 //	enc_version[1] + kind[1]
 //	+ index_width[1]
-//	+ dict_data_len[4 LE] + zstd(dict_payload)
+//	+ dict_data_len[4 LE] + raw_dict_payload  (no zstd — outer snappy applied per column by block writer)
 //	+ row_count[4 LE]
 //	+ presence_rle_len[4 LE] + presence_rle_data
 //	+ indexes (kind 6/7: index_count[4]+rle_len[4]+rle_data; kind 1/2: index_count×index_width bytes)
@@ -38,7 +38,6 @@ func encodeDictionaryKind(
 	values any,
 	present []bool,
 	nRows int,
-	enc *zstdEncoder,
 ) ([]byte, error) {
 	// Build indexes and dict payload depending on column type.
 	var indexes []uint32
@@ -119,11 +118,6 @@ func encodeDictionaryKind(
 		return nil, err
 	}
 
-	compressedDict, err := enc.compress(dictPayload)
-	if err != nil {
-		return nil, err
-	}
-
 	// For sparse kinds (2, 7), indexes covers only present rows.
 	// For dense kinds (1, 6), indexes covers all rows.
 	// The indexes slice from buildXxxDict already contains only present-row indexes.
@@ -147,13 +141,14 @@ func encodeDictionaryKind(
 		fullIndexes = indexes
 	}
 
-	buf := make([]byte, 0, 3+4+len(compressedDict)+4+4+len(rleData)+nRows*int(indexWidth)+20)
-	buf = append(buf, shared.ColumnEncodingVersion, kind, indexWidth)
+	// V14: dict payload is raw (no zstd). Outer snappy applied per-column by block writer.
+	buf := make([]byte, 0, 3+4+len(dictPayload)+4+4+len(rleData)+nRows*int(indexWidth)+20)
+	buf = append(buf, shared.VersionBlockEncV3, kind, indexWidth)
 	buf = appendUint32LE(
 		buf,
-		uint32(len(compressedDict)), //nolint:gosec // safe: dict size bounded by MaxDictionarySize
+		uint32(len(dictPayload)), //nolint:gosec // safe: dict size bounded by MaxDictionarySize
 	)
-	buf = append(buf, compressedDict...)
+	buf = append(buf, dictPayload...)
 	buf = appendUint32LE(buf, uint32(nRows))        //nolint:gosec // safe: nRows bounded by MaxBlockSpans (65535)
 	buf = appendUint32LE(buf, uint32(len(rleData))) //nolint:gosec // safe: rle data bounded by block size
 	buf = append(buf, rleData...)
@@ -185,20 +180,19 @@ func encodeDictionaryKind(
 
 // encodeDeltaDictionaryKind handles kinds 12/13 for [][]byte columns.
 //
-// Wire format:
+// Wire format (V14 enc_version=3):
 //
 //	enc_version[1] + kind[1]
 //	+ index_width[1]
-//	+ dict_data_len[4 LE] + zstd(bytes_dict_payload)
+//	+ dict_data_len[4 LE] + raw_bytes_dict_payload  (no zstd)
 //	+ row_count[4 LE]
 //	+ presence_rle_len[4 LE] + presence_rle_data
-//	+ delta_len[4 LE] + zstd(delta_array)
+//	+ delta_len[4 LE] + raw_delta_array  (no zstd)
 func encodeDeltaDictionaryKind(
 	kind uint8,
 	values [][]byte,
 	present []bool,
 	nRows int,
-	enc *zstdEncoder,
 ) ([]byte, error) {
 	entries, indexes := buildBytesDict(values, present)
 	indexWidth := pickIndexWidth(len(entries))
@@ -220,11 +214,6 @@ func encodeDeltaDictionaryKind(
 	}
 
 	rleData, err := shared.EncodePresenceRLE(bitset, nRows)
-	if err != nil {
-		return nil, err
-	}
-
-	compressedDict, err := enc.compress(dictPayload)
 	if err != nil {
 		return nil, err
 	}
@@ -266,26 +255,22 @@ func encodeDeltaDictionaryKind(
 		deltaData = append(deltaData, tmp[:]...)
 	}
 
-	compressedDelta, err := enc.compress(deltaData)
-	if err != nil {
-		return nil, err
-	}
-
-	buf := make([]byte, 0, 3+4+len(compressedDict)+4+4+len(rleData)+4+len(compressedDelta))
-	buf = append(buf, shared.ColumnEncodingVersion, kind, indexWidth)
+	// V14: both dict and delta are raw (no zstd). Outer snappy applied per-column by block writer.
+	buf := make([]byte, 0, 3+4+len(dictPayload)+4+4+len(rleData)+4+len(deltaData))
+	buf = append(buf, shared.VersionBlockEncV3, kind, indexWidth)
 	buf = appendUint32LE(
 		buf,
-		uint32(len(compressedDict)), //nolint:gosec // safe: dict size bounded by MaxDictionarySize
+		uint32(len(dictPayload)), //nolint:gosec // safe: dict size bounded by MaxDictionarySize
 	)
-	buf = append(buf, compressedDict...)
+	buf = append(buf, dictPayload...)
 	buf = appendUint32LE(buf, uint32(nRows))        //nolint:gosec // safe: nRows bounded by MaxBlockSpans (65535)
 	buf = appendUint32LE(buf, uint32(len(rleData))) //nolint:gosec // safe: rle data bounded by block size
 	buf = append(buf, rleData...)
 	buf = appendUint32LE(
 		buf,
-		uint32(len(compressedDelta)), //nolint:gosec // safe: compressed data bounded by block size
+		uint32(len(deltaData)), //nolint:gosec // safe: delta data bounded by block size
 	)
-	buf = append(buf, compressedDelta...)
+	buf = append(buf, deltaData...)
 
 	return buf, nil
 }

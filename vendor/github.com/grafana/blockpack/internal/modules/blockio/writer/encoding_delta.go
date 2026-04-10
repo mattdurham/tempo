@@ -10,13 +10,13 @@ import (
 
 // encodeDeltaUint64 encodes a uint64 column using delta-from-base encoding (kind 5).
 //
-// Wire format:
+// Wire format (V14 enc_version=3):
 //
 //	enc_version[1] + kind(5)[1] + span_count[4 LE]
 //	+ presence_rle_len[4 LE] + presence_rle_data
 //	+ base[8 LE] + width[1]
-//	  if width > 0: offset_data_len[4 LE] + zstd_compressed_offsets
-func encodeDeltaUint64(values []uint64, present []bool, nRows int, enc *zstdEncoder) ([]byte, error) {
+//	  if width > 0: offset_data_len[4 LE] + raw_offsets  (no zstd — outer snappy per column)
+func encodeDeltaUint64(values []uint64, present []bool, nRows int) ([]byte, error) {
 	// Build presence bitset.
 	bitsetLen := (nRows + 7) / 8
 	bitset := make([]byte, bitsetLen)
@@ -72,7 +72,7 @@ func encodeDeltaUint64(values []uint64, present []bool, nRows int, enc *zstdEnco
 	width := pickDeltaWidth(maxOffset)
 
 	buf := make([]byte, 0, 2+4+4+len(rleData)+8+1+4+nRows*int(width)+1)
-	buf = append(buf, shared.ColumnEncodingVersion, KindDeltaUint64)
+	buf = append(buf, shared.VersionBlockEncV3, KindDeltaUint64)
 	buf = appendUint32LE(buf, uint32(nRows))        //nolint:gosec // safe: nRows bounded by MaxBlockSpans (65535)
 	buf = appendUint32LE(buf, uint32(len(rleData))) //nolint:gosec // safe: rle data bounded by block size
 	buf = append(buf, rleData...)
@@ -100,13 +100,9 @@ func encodeDeltaUint64(values []uint64, present []bool, nRows int, enc *zstdEnco
 		offsetBuf = appendUintLE(offsetBuf, offset, width)
 	}
 
-	compressed, err := enc.compress(offsetBuf)
-	if err != nil {
-		return nil, err
-	}
-
-	buf = appendUint32LE(buf, uint32(len(compressed))) //nolint:gosec // safe: compressed data bounded by block size
-	buf = append(buf, compressed...)
+	// V14: offsets are raw (no zstd). Outer snappy applied per-column by block writer.
+	buf = appendUint32LE(buf, uint32(len(offsetBuf))) //nolint:gosec // safe: raw data bounded by block size
+	buf = append(buf, offsetBuf...)
 
 	return buf, nil
 }

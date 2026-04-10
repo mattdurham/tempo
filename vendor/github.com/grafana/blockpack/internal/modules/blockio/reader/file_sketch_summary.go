@@ -66,6 +66,7 @@ type FileSketchSummary struct {
 // from sketchIdx when the cache entry has been reclaimed.
 // Returns nil when the file has no sketch section (old format — degrade gracefully).
 func (r *Reader) FileSketchSummary() *FileSketchSummary {
+	_ = r.ensureV14SketchSection()
 	if r.sketchIdx == nil {
 		return nil
 	}
@@ -109,8 +110,8 @@ func buildFileColumnSketch(cd *columnSketchData) *FileColumnSketch {
 
 	// Sum distinct counts (over-estimate when values repeat across blocks).
 	var totalDistinct uint32
-	for _, d := range cd.distinct {
-		totalDistinct += d
+	for i := range len(cd.distinctRaw) / 4 {
+		totalDistinct += binary.LittleEndian.Uint32(cd.distinctRaw[i*4:])
 	}
 
 	// Merge TopK: aggregate counts by fingerprint across all blocks.
