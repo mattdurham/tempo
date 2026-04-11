@@ -98,6 +98,14 @@ type BlockpackConfig struct {
 	// VectorDimension is the expected embedding vector dimension (e.g. 768 for nomic-embed-text-v1.5).
 	// Required when EmbeddingURL is set. Controls the writer's VectorIndex section.
 	VectorDimension int `yaml:"vector_dimension"`
+
+	// MemCacheServers is a list of memcache server addresses (e.g. ["memcached-01:11211"]).
+	// Leave empty to disable the remote memcache tier.
+	MemCacheServers []string `yaml:"memcache_servers"`
+
+	// MemoryCacheBytes is the size of the in-process LRU memory cache (default: 256MB).
+	// 256 MB in-process LRU cache is always on; set to 0 to disable.
+	MemoryCacheBytes int64 `yaml:"memory_cache_bytes"`
 }
 
 func (cfg *BlockConfig) RegisterFlagsAndApplyDefaults(prefix string, f *flag.FlagSet) {
@@ -134,14 +142,14 @@ func (cfg *BlockpackConfig) applyDefaults() {
 	if cfg.MaxSpansPerBlock == 0 {
 		cfg.MaxSpansPerBlock = DefaultBlockpackMaxSpansPerBlock
 	}
-	if cfg.FileCachePath == "" {
-		cfg.FileCachePath = "/var/tempo/blockpack-cache"
-	}
 	if cfg.FileCacheMaxBytes == 0 {
 		cfg.FileCacheMaxBytes = 4 * 1024 * 1024 * 1024 // 4GB
 	}
 	if cfg.LRUCacheBytes == 0 {
 		cfg.LRUCacheBytes = 32 * 1024 * 1024 // 32MB — footer/metadata only
+	}
+	if cfg.MemoryCacheBytes == 0 {
+		cfg.MemoryCacheBytes = 256 << 20 // 256MB
 	}
 	// Booleans default to false, so we enable by default
 	if !cfg.EnableDictionary {

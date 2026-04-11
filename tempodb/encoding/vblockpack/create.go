@@ -21,8 +21,13 @@ import (
 func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.BlockMeta,
 	i common.Iterator, r backend.Reader, to backend.Writer) (*backend.BlockMeta, error) {
 
-	// Initialize disk cache on first block creation (no-op if already initialized).
-	ConfigureFileCache(cfg.Blockpack.FileCachePath, cfg.Blockpack.FileCacheMaxBytes)
+	// Initialize multi-tier cache on first block creation (no-op if already initialized).
+	ConfigureCache(
+		cfg.Blockpack.FileCachePath,
+		cfg.Blockpack.FileCacheMaxBytes,
+		cfg.Blockpack.MemCacheServers,
+		cfg.Blockpack.MemoryCacheBytes,
+	)
 	ConfigureLRU(cfg.Blockpack.LRUCacheBytes)
 	ConfigureEmbedding(cfg.Blockpack.EmbeddingURL)
 

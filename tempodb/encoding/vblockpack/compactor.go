@@ -82,7 +82,12 @@ func (c *Compactor) Compact(ctx context.Context, l log.Logger, r backend.Reader,
 	}
 
 	// Initialize caches on first compaction (no-op if already initialized).
-	ConfigureFileCache(c.opts.BlockConfig.Blockpack.FileCachePath, c.opts.BlockConfig.Blockpack.FileCacheMaxBytes)
+	ConfigureCache(
+		c.opts.BlockConfig.Blockpack.FileCachePath,
+		c.opts.BlockConfig.Blockpack.FileCacheMaxBytes,
+		c.opts.BlockConfig.Blockpack.MemCacheServers,
+		c.opts.BlockConfig.Blockpack.MemoryCacheBytes,
+	)
 	ConfigureLRU(c.opts.BlockConfig.Blockpack.LRUCacheBytes)
 
 	cfg := blockpack.CompactionConfig{

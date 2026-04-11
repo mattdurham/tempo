@@ -239,12 +239,18 @@ func New(cfg *Config, cacheProvider cache.Provider, logger gkLog.Logger) (Reader
 		return nil, nil, nil, err
 	}
 
-	// Initialize the blockpack disk cache so it's available for queries.
+	// Initialize the blockpack multi-tier cache so it's available for queries.
 	// CreateBlock/Compact also call this, but the querier never runs those paths.
 	// NOTE: In local benchmarks with minio, bbolt overhead (mmap memmove + GC pressure)
 	// exceeds the S3 latency savings. The disk cache helps more with real S3 (50-100ms RTT).
-	if cfg.Block != nil && cfg.Block.Blockpack.FileCachePath != "" {
-		vblockpack.ConfigureFileCache(cfg.Block.Blockpack.FileCachePath, cfg.Block.Blockpack.FileCacheMaxBytes)
+	if cfg.Block != nil {
+		bp := cfg.Block.Blockpack
+		vblockpack.ConfigureCache(
+			bp.FileCachePath,
+			bp.FileCacheMaxBytes,
+			bp.MemCacheServers,
+			bp.MemoryCacheBytes,
+		)
 	}
 	if cfg.Block != nil && cfg.Block.Blockpack.EmbeddingURL != "" {
 		vblockpack.ConfigureEmbedding(cfg.Block.Blockpack.EmbeddingURL)
