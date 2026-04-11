@@ -8,6 +8,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/grafana/tempo/pkg/tempopb"
+	tempocommon "github.com/grafana/tempo/pkg/tempopb/common/v1"
+	temporesource "github.com/grafana/tempo/pkg/tempopb/resource/v1"
 	tempotrace "github.com/grafana/tempo/pkg/tempopb/trace/v1"
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/backend/local"
@@ -173,4 +175,93 @@ func TestRoundTrip_WriteAndReadBlock(t *testing.T) {
 
 	t.Logf("Roundtrip verified: found trace with span name '%s'", foundSpan.Name)
 	t.Log("Roundtrip test completed!")
+}
+
+// TestSearchMetadataRoundtrip verifies that Search results contain correct RootServiceName
+// and RootTraceName. This catches the bug where buildTraceMetadata omitted these fields,
+// causing Grafana trace-list rows to show blank service and span names.
+//
+// The test input must include resource.service.name and a root span (no ParentSpanId)
+// so that SpanMatchesMetadata can derive the expected values. A vacuous test — one that
+// uses empty resource attributes — would pass even with the bug present.
+func TestSearchMetadataRoundtrip(t *testing.T) {
+	ctx := context.Background()
+
+	traceID := []byte{2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2}
+	now := uint64(time.Now().UnixNano())
+
+	trace := &tempopb.Trace{
+		ResourceSpans: []*tempotrace.ResourceSpans{
+			{
+				Resource: &temporesource.Resource{
+					Attributes: []*tempocommon.KeyValue{
+						{
+							Key: "service.name",
+							Value: &tempocommon.AnyValue{
+								Value: &tempocommon.AnyValue_StringValue{StringValue: "my-test-service"},
+							},
+						},
+					},
+				},
+				ScopeSpans: []*tempotrace.ScopeSpans{
+					{
+						Spans: []*tempotrace.Span{
+							{
+								// Root span: no ParentSpanId
+								TraceId:           traceID,
+								SpanId:            []byte{2, 0, 0, 0, 0, 0, 0, 1},
+								Name:              "root-operation",
+								StartTimeUnixNano: now,
+								EndTimeUnixNano:   now + uint64(200*time.Millisecond),
+							},
+							{
+								// Child span: has ParentSpanId
+								TraceId:           traceID,
+								SpanId:            []byte{2, 0, 0, 0, 0, 0, 0, 2},
+								ParentSpanId:      []byte{2, 0, 0, 0, 0, 0, 0, 1},
+								Name:              "child-operation",
+								StartTimeUnixNano: now + uint64(10*time.Millisecond),
+								EndTimeUnixNano:   now + uint64(150*time.Millisecond),
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	iter := &mockIterator{
+		traces: []*tempopb.Trace{trace},
+		ids:    [][]byte{traceID},
+	}
+
+	tmpDir := t.TempDir()
+	rawR, rawW, _, err := local.New(&local.Config{Path: tmpDir})
+	require.NoError(t, err)
+
+	r := backend.NewReader(rawR)
+	w := backend.NewWriter(rawW)
+
+	cfg := &common.BlockConfig{RowGroupSizeBytes: 100 * 1024 * 1024}
+	meta := backend.NewBlockMeta("test-tenant", uuid.New(), VersionString)
+
+	resultMeta, err := CreateBlock(ctx, cfg, meta, iter, r, w)
+	require.NoError(t, err)
+
+	enc := Encoding{}
+	block, err := enc.OpenBlock(resultMeta, r)
+	require.NoError(t, err)
+
+	resp, err := block.Search(ctx, &tempopb.SearchRequest{Limit: 10}, common.SearchOptions{})
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.Len(t, resp.Traces, 1, "expected exactly one trace in search results")
+
+	got := resp.Traces[0]
+	require.Equal(t, "my-test-service", got.RootServiceName,
+		"RootServiceName must be populated from resource.service.name; empty means buildTraceMetadata is broken")
+	require.Equal(t, "root-operation", got.RootTraceName,
+		"RootTraceName must be the root span name (no ParentSpanId); empty means root detection is broken")
+	require.Greater(t, got.DurationMs, uint32(0), "DurationMs must be non-zero")
+	require.Greater(t, got.StartTimeUnixNano, uint64(0), "StartTimeUnixNano must be non-zero")
 }
