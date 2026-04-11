@@ -42,7 +42,7 @@ to guarantee globally correct top-K results (see §6, SPEC-STREAM-7).
 
 ### 3.2 Execution Steps
 
-1. Compute `wantColumns` from `program` and `secondPassCols` from `opts.AllColumns` (NOTE-028).
+1. Compute `wantColumns` from `program` and `opts.SelectColumns` (via `ProgramWantColumns`), and `secondPassCols` from `opts.AllColumns` (NOTE-028). When `opts.SelectColumns` is non-empty and the program has no predicate columns, `wantColumns` is derived from `SelectColumns` alone, enabling storage-level column projection.
 2. Create a `queryplanner.Planner` backed by `r`.
 3. Call `planner.PlanWithOptions(BuildPredicates(r, program), opts.TimeRange, ...)` —
    range-index and membership pruning (SketchBloom) based on extracted column predicates, further
@@ -145,6 +145,7 @@ type CollectOptions struct {
     Limit           int
     Direction       queryplanner.Direction
     AllColumns      bool
+    SelectColumns   []string
     StartBlock      int
     BlockCount      int
 }
@@ -157,6 +158,7 @@ type CollectOptions struct {
 | `Direction` | Forward (default, ascending) or Backward (descending). |
 | `TimestampColumn` | `""` disables per-row time filtering. `"log:timestamp"` or `"span:start"` enables it. |
 | `AllColumns` | `false` (default): second pass decodes predicate + search columns. `true`: decode all columns. Only needed for `IterateFields()` callbacks (NOTE-028). |
+| `SelectColumns` | Storage-level column projection. When non-empty, these column names are merged into `wantColumns` so that only the requested columns are decoded from block blobs. For queries with no predicate columns (e.g. `{}`), this prevents decoding all columns. Predicate columns are always included regardless of this list. |
 | `StartBlock` | First block index for sub-file sharding. See §3.4. |
 | `BlockCount` | Number of blocks for sub-file sharding. `0` = scan all. See §3.4. |
 

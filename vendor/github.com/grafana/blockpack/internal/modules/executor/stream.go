@@ -79,6 +79,14 @@ type CollectOptions struct {
 	// true: second pass decodes all columns. Only needed when the callback calls IterateFields()
 	// to enumerate every attribute. Search queries never need this.
 	AllColumns bool
+	// SelectColumns limits the scan to only these column names, in addition to predicate and
+	// search-meta columns. When the program has no column predicates (e.g. "{}"), wantColumns
+	// would normally be nil (decode all columns). If SelectColumns is non-empty, it is merged
+	// into wantColumns so that only the requested output columns are decoded from block blobs,
+	// skipping all others. This is the storage-level column projection path.
+	// NOTE: SelectColumns entries are always added to wantColumns; they never restrict columns
+	// that predicates already require.
+	SelectColumns []string
 	// StartBlock is the first internal block index to include (0-based, inclusive).
 	// Used by the frontend sharder to partition a single file across multiple jobs.
 	// 0 with BlockCount==0 means scan all blocks (no sub-file sharding).
@@ -139,6 +147,20 @@ func Collect(
 	queryStart := time.Now()
 
 	wantColumns := ProgramWantColumns(program)
+	// SelectColumns projection: when SelectColumns is set, merge its entries into wantColumns
+	// so that only those columns (plus predicate columns) are eagerly decoded from block blobs.
+	// When there are no predicate columns (wantColumns == nil, e.g. "{}"), this promotes
+	// SelectColumns to the sole filter, skipping readColumnEncoding for all other columns.
+	// When predicates already constrain wantColumns, SelectColumns is unioned in so that
+	// second-pass output columns benefit from the same lazy-decode optimisation.
+	if len(opts.SelectColumns) > 0 {
+		if wantColumns == nil {
+			wantColumns = make(map[string]struct{}, len(opts.SelectColumns))
+		}
+		for _, col := range opts.SelectColumns {
+			wantColumns[col] = struct{}{}
+		}
+	}
 
 	// NOTE-028: Compute secondPassCols once — wantColumns and opts.AllColumns are loop-invariant.
 	// nil means decode all columns (AllColumns=true or no column filter).
