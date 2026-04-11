@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	blockpack "github.com/grafana/blockpack"
 	"github.com/grafana/tempo/pkg/tempopb"
 	tempocommon "github.com/grafana/tempo/pkg/tempopb/common/v1"
 	temporesource "github.com/grafana/tempo/pkg/tempopb/resource/v1"
@@ -323,6 +324,69 @@ func TestFetch_OpNoneConditions(t *testing.T) {
 
 	t.Logf("OpNone-only conditions: got %d spanset(s)", len(spansets))
 	require.Len(t, spansets, 2, "OpNone conditions should not filter — expect all 2 traces")
+}
+
+// TestSearchMetaConditionsRoundtrip verifies that Fetch with SearchMetaConditions
+// returns the three intrinsics added in the Grafana format fix:
+// IntrinsicSpanID, IntrinsicSpanStartTime, and IntrinsicTraceID.
+//
+// Before the fix, AttributeFor returned (Static{}, false) for all three —
+// Grafana's trace explore view showed empty span IDs and timestamps.
+//
+// Note: IntrinsicDuration is also asserted as it was already present and must
+// remain working. IntrinsicName is intentionally NOT asserted — SearchMetaConditions()
+// does not request it, so wantedCols will not contain the name column and AllAttributesFunc
+// will filter it out.
+func TestSearchMetaConditionsRoundtrip(t *testing.T) {
+	t.Cleanup(blockpack.ClearReaderCaches)
+
+	block, _ := createFetchTestBlock(t)
+
+	spansets := collectFetch(t, block, traceql.SearchMetaConditions(), true)
+	require.Len(t, spansets, 2, "SearchMetaConditions must return all 2 traces")
+
+	for _, ss := range spansets {
+		require.NotEmpty(t, ss.Spans, "each spanset must have at least one span")
+		for _, sp := range ss.Spans {
+			// IntrinsicSpanID — must be a non-empty hex string.
+			v, ok := sp.AttributeFor(traceql.NewIntrinsic(traceql.IntrinsicSpanID))
+			require.True(t, ok, "IntrinsicSpanID must be present (was missing before fix)")
+			require.Equal(t, traceql.TypeString, v.Type, "IntrinsicSpanID must be TypeString")
+			require.NotEmpty(t, v.EncodeToString(false), "IntrinsicSpanID must be non-empty")
+
+			// IntrinsicSpanStartTime — must be a positive int (nanoseconds since epoch).
+			v, ok = sp.AttributeFor(traceql.NewIntrinsic(traceql.IntrinsicSpanStartTime))
+			require.True(t, ok, "IntrinsicSpanStartTime must be present (was missing before fix)")
+			require.Equal(t, traceql.TypeInt, v.Type, "IntrinsicSpanStartTime must be TypeInt")
+			n, _ := v.Int()
+			require.Greater(t, n, 0, "IntrinsicSpanStartTime must be > 0")
+
+			// IntrinsicTraceID — must be a non-empty hex string.
+			v, ok = sp.AttributeFor(traceql.NewIntrinsic(traceql.IntrinsicTraceID))
+			require.True(t, ok, "IntrinsicTraceID must be present (was missing before fix)")
+			require.Equal(t, traceql.TypeString, v.Type, "IntrinsicTraceID must be TypeString")
+			require.NotEmpty(t, v.EncodeToString(false), "IntrinsicTraceID must be non-empty")
+
+			// IntrinsicDuration — must be a positive duration.
+			// AttributeFor returns NewStaticDuration (TypeDuration).
+			v, ok = sp.AttributeFor(traceql.NewIntrinsic(traceql.IntrinsicDuration))
+			require.True(t, ok, "IntrinsicDuration must be present")
+			require.Equal(t, traceql.TypeDuration, v.Type, "IntrinsicDuration must be TypeDuration")
+			d, _ := v.Duration()
+			require.Greater(t, d, time.Duration(0), "IntrinsicDuration must be > 0")
+
+			// Smoke-test AllAttributesFunc: verify the iterator path surfaces the
+			// intrinsics that attributeToColumnName covers. IntrinsicDuration and
+			// IntrinsicSpanID must appear in the AllAttributes map since both are
+			// in wantedCols when built from SearchMetaConditions().
+			allAttrs := sp.AllAttributes()
+			require.NotEmpty(t, allAttrs, "AllAttributes must return a non-empty map")
+			_, hasDuration := allAttrs[traceql.NewIntrinsic(traceql.IntrinsicDuration)]
+			require.True(t, hasDuration, "AllAttributes must include IntrinsicDuration")
+			_, hasSpanID := allAttrs[traceql.NewIntrinsic(traceql.IntrinsicSpanID)]
+			require.True(t, hasSpanID, "AllAttributes must include IntrinsicSpanID")
+		}
+	}
 }
 
 // TestFetch_KindFilter verifies that {kind=client} correctly filters spans by OTLP SpanKind.

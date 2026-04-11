@@ -373,6 +373,17 @@ func (w *walBlock) Fetch(ctx context.Context, req traceql.FetchSpansRequest, opt
 		return traceql.FetchSpansResponse{}, fmt.Errorf("walBlock Fetch: query: %w", fetchErr)
 	}
 
+	// Build wanted columns from query conditions — limits AllAttributesFunc to queried attrs.
+	walWantedCols := make(map[string]bool, len(req.Conditions))
+	for _, cond := range req.Conditions {
+		if col := attributeToColumnName(cond.Attribute); col != "" {
+			walWantedCols[col] = true
+		}
+	}
+	if len(walWantedCols) == 0 {
+		walWantedCols = nil
+	}
+
 	// Convert matches to spansets grouped by trace (mirrors backend_block.Fetch).
 	type traceEntry struct {
 		traceID  []byte
@@ -391,7 +402,7 @@ func (w *walBlock) Fetch(ctx context.Context, req traceql.FetchSpansRequest, opt
 			traceMap[m.TraceID] = &traceEntry{traceID: traceIDBytes}
 			traceOrder = append(traceOrder, m.TraceID)
 		}
-		traceMap[m.TraceID].spans = append(traceMap[m.TraceID].spans, &blockpackSpan{match: *m, searchMode: true})
+		traceMap[m.TraceID].spans = append(traceMap[m.TraceID].spans, &blockpackSpan{match: *m, wantedCols: walWantedCols})
 		traceMap[m.TraceID].rawSpans = append(traceMap[m.TraceID].rawSpans, *m)
 	}
 

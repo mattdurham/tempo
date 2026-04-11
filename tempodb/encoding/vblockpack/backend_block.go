@@ -13,7 +13,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/grafana/blockpack"
-	"github.com/prometheus/client_golang/prometheus"
 	"github.com/grafana/tempo/pkg/tempopb"
 	tempocommon "github.com/grafana/tempo/pkg/tempopb/common/v1"
 	temporesource "github.com/grafana/tempo/pkg/tempopb/resource/v1"
@@ -21,7 +20,12 @@ import (
 	"github.com/grafana/tempo/pkg/traceql"
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/encoding/common"
+	"github.com/prometheus/client_golang/prometheus"
 )
+
+// maxBlobSize is the maximum size we will allocate for a blockpack file read.
+// Blocks larger than 512 MB indicate a corrupt or malformed backend response.
+const maxBlobSize = 512 << 20 // 512 MB
 
 // metricsOpRe extracts the metric function name from a TraceQL metrics query.
 // For example: "{}|rate()" → "rate", "{...}|count_over_time() by (x)" → "count_over_time".
@@ -72,44 +76,92 @@ func (p *tempoReaderProvider) ReadAt(buf []byte, off int64, _ blockpack.DataType
 // metadata/sketches/intrinsic columns at a higher level.
 func ConfigureLRU(_ int64) {}
 
-// blockpackFileCache is a process-level disk-backed cache for blockpack block bytes.
-// A nil *FileCache is safe — all reads fall through to the provider.
+// blockpackCache is the process-level multi-tier cache for blockpack block bytes.
+// It is built once via getCache() and may be a ChainedCache (MemoryCache → FileCache → MemCache)
+// or nil if no caching is configured. A nil Cache is safe — all reads fall through to the provider.
 var (
-	blockpackFileCache     *blockpack.FileCache
-	blockpackFileCacheOnce sync.Once
-	blockpackFileCachePath string
-	blockpackFileCacheSize int64
+	blockpackCacheMu   sync.Mutex
+	blockpackCache     blockpack.Cache
+	blockpackCacheOnce sync.Once
+	blockpackCacheCfg  struct {
+		filePath         string
+		fileMaxBytes     int64
+		memServers       []string
+		memoryCacheBytes int64
+	}
 )
 
-// ConfigureFileCache sets the disk cache path and max size for blockpack blocks.
-// Must be called before the first block is opened for disk caching to be active.
-// Safe to call multiple times; only the first invocation of getFileCache takes effect.
-func ConfigureFileCache(path string, maxBytes int64) {
-	blockpackFileCachePath = path
-	blockpackFileCacheSize = maxBytes
+// ConfigureCache sets the cache configuration for blockpack blocks.
+// Concurrent calls are safe. The first call before any getCache invocation wins.
+// Later calls update the struct under the mutex but have no effect on the
+// already-initialized cache. All callers should set the same config.
+func ConfigureCache(filePath string, fileMaxBytes int64, memServers []string, memoryCacheBytes int64) {
+	blockpackCacheMu.Lock()
+	defer blockpackCacheMu.Unlock()
+	blockpackCacheCfg.filePath = filePath
+	blockpackCacheCfg.fileMaxBytes = fileMaxBytes
+	blockpackCacheCfg.memServers = memServers
+	blockpackCacheCfg.memoryCacheBytes = memoryCacheBytes
 }
 
-// getFileCache initializes (once) and returns the process-level disk cache.
-// Returns nil if no path was configured or if opening the cache failed.
-func getFileCache() *blockpack.FileCache {
-	blockpackFileCacheOnce.Do(func() {
-		path := blockpackFileCachePath
-		maxBytes := blockpackFileCacheSize
-		if path == "" || maxBytes <= 0 {
-			return
+// ConfigureFileCache is a deprecated wrapper around ConfigureCache retained for backward compatibility.
+// Callers should switch to ConfigureCache to gain the full 3-tier chain.
+func ConfigureFileCache(path string, maxBytes int64) {
+	ConfigureCache(path, maxBytes, nil, 0)
+}
+
+// getCache initializes (once) the process-level multi-tier cache and returns it.
+// The chain order is: MemoryCache → FileCache → MemCache (fastest-first).
+// Returns nil if no tiers could be configured.
+func getCache() blockpack.Cache {
+	blockpackCacheOnce.Do(func() {
+		// Snapshot config under lock to avoid a data race with ConfigureCache.
+		blockpackCacheMu.Lock()
+		cfg := blockpackCacheCfg
+		blockpackCacheMu.Unlock()
+
+		var tiers []blockpack.Cache
+
+		// Tier 1: in-process LRU memory cache (fastest).
+		// 256 MB in-process LRU cache is always on; set to 0 to disable.
+		if cfg.memoryCacheBytes > 0 {
+			mem, err := blockpack.NewMemoryCache(blockpack.MemoryCacheConfig{
+				MaxBytes: cfg.memoryCacheBytes,
+			})
+			if err == nil && mem != nil {
+				tiers = append(tiers, mem)
+			}
 		}
-		c, err := blockpack.OpenFileCache(blockpack.FileCacheConfig{
-			Enabled:    true,
-			Path:       path,
-			MaxBytes:   maxBytes,
-			Registerer: prometheus.DefaultRegisterer,
-		})
-		if err != nil {
-			return
+
+		// Tier 2: disk-backed file cache.
+		if cfg.filePath != "" && cfg.fileMaxBytes > 0 {
+			disk, err := blockpack.OpenFileCache(blockpack.FileCacheConfig{
+				Enabled:    true,
+				Path:       cfg.filePath,
+				MaxBytes:   cfg.fileMaxBytes,
+				Registerer: prometheus.DefaultRegisterer,
+			})
+			if err == nil && disk != nil {
+				tiers = append(tiers, disk)
+			}
 		}
-		blockpackFileCache = c
+
+		// Tier 3: remote memcache (largest, slowest).
+		if len(cfg.memServers) > 0 {
+			remote, err := blockpack.OpenMemCache(blockpack.MemCacheConfig{
+				Servers: cfg.memServers,
+				Enabled: true,
+			})
+			if err == nil && remote != nil {
+				tiers = append(tiers, remote)
+			}
+		}
+
+		if len(tiers) > 0 {
+			blockpackCache = blockpack.NewChainedCache(tiers...)
+		}
 	})
-	return blockpackFileCache
+	return blockpackCache
 }
 
 type blockpackBlock struct {
@@ -138,11 +190,11 @@ func (b *blockpackBlock) newReaderProvider() blockpack.ReaderProvider {
 	}
 }
 
-// newReader creates a Reader with both in-memory LRU and disk FileCache layers.
+// newReader creates a Reader with the configured multi-tier cache.
 // Each call returns a new Reader — Reader is not safe for concurrent use.
 func (b *blockpackBlock) newReader() (*blockpack.Reader, error) {
 	fileID := b.meta.TenantID + "/" + b.meta.BlockID.String()
-	return blockpack.NewReaderWithCache(b.newReaderProvider(), fileID, getFileCache())
+	return blockpack.NewReaderWithCache(b.newReaderProvider(), fileID, getCache())
 }
 
 // executeQuery creates a reader and executes a TraceQL query, returning all matching spans.
@@ -244,14 +296,17 @@ func convertTraceMetricsResult(result *blockpack.TraceMetricsResult, req *tempop
 }
 
 // FindTraceByID finds a trace by ID.
+// Uses the lean reader (2 I/Os: footer + compact trace index) for minimal memory
+// and I/O overhead when scanning many blocks.
 func (b *blockpackBlock) FindTraceByID(_ context.Context, id common.ID, _ common.SearchOptions) (*tempopb.TraceByIDResponse, error) {
 	if len(id) != 16 {
 		return nil, fmt.Errorf("trace ID must be 16 bytes, got %d", len(id))
 	}
 
-	r, err := b.newReader()
+	fileID := b.meta.TenantID + "/" + b.meta.BlockID.String()
+	r, err := blockpack.NewLeanReaderWithCache(b.newReaderProvider(), fileID, getCache())
 	if err != nil {
-		return nil, fmt.Errorf("failed to create blockpack reader: %w", err)
+		return nil, fmt.Errorf("failed to create blockpack lean reader: %w", err)
 	}
 
 	traceIDHex := hex.EncodeToString(id)
@@ -438,8 +493,8 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 
 	// spanLimit lets Collect stop reading block groups early once enough spans have been
 	// found. We request maxTraces * 20 spans to ensure diverse trace coverage while
-	// bounding I/O: Collect fetches blocks lazily in ~8 MB coalesced batches and stops
-	// as soon as spanLimit spans are accumulated (SPEC-STREAM-2 / SPEC-STREAM-4).
+	// bounding I/O: spanLimit causes QueryTraceQL to stop fetching block batches once
+	// enough spans are accumulated, bounding I/O proportionally to maxTraces.
 	spanLimit := 0
 	if maxTraces > 0 {
 		spanLimit = maxTraces * 20
@@ -473,6 +528,18 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 		}
 	}
 
+	// Build wanted columns from query conditions — used to limit AllAttributesFunc
+	// to only the queried attributes, matching parquet's selective fetch behavior.
+	wantedCols := make(map[string]bool, len(req.Conditions))
+	for _, cond := range req.Conditions {
+		if col := attributeToColumnName(cond.Attribute); col != "" {
+			wantedCols[col] = true
+		}
+	}
+	if len(wantedCols) == 0 {
+		wantedCols = nil // nil = no filtering (match-all queries)
+	}
+
 	var fetchErr error
 	var matches []blockpack.SpanMatch
 	matches, _, fetchErr = blockpack.QueryTraceQL(r, query, blockpack.QueryOptions{
@@ -501,7 +568,7 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 				traceMap[match.TraceID] = &traceEntry{traceID: traceIDBytes}
 				traceOrder = append(traceOrder, match.TraceID)
 			}
-			traceMap[match.TraceID].spans = append(traceMap[match.TraceID].spans, &blockpackSpan{match: *match, searchMode: true})
+			traceMap[match.TraceID].spans = append(traceMap[match.TraceID].spans, &blockpackSpan{match: *match, wantedCols: wantedCols})
 			traceMap[match.TraceID].rawSpans = append(traceMap[match.TraceID].rawSpans, *match)
 		}
 	}
@@ -548,18 +615,12 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 }
 
 // blockpackSpan implements traceql.Span using a cloned blockpack.SpanMatch.
-// Field selectivity is handled upstream by QueryOptions.SelectColumns, which
-// limits SpanMatch.Fields to only the queried columns before reaching this type.
-//
-// When searchMode is true (set for spans returned from Fetch/search results),
-// AllAttributes and AllAttributesFunc suppress span name and all user-defined
-// attributes. This matches standard Tempo search behaviour: parquet blocks only
-// fetch SearchMetaConditions in the second pass, which excludes IntrinsicName
-// and user span/resource attributes. Without this suppression, asTraceSearchMetadata
-// would populate tempopb.Span.Name and .Attributes[], breaking the Grafana UI.
+// wantedCols, when non-nil, limits AllAttributesFunc to only the columns present
+// in the query conditions — matching parquet's behavior and preventing Grafana's
+// data frame from panicking on inconsistent attribute sets across spans.
 type blockpackSpan struct {
 	match      blockpack.SpanMatch
-	searchMode bool // true when span is used in a search (Fetch) context
+	wantedCols map[string]bool
 }
 
 func (s *blockpackSpan) ID() []byte {
@@ -595,10 +656,6 @@ func (s *blockpackSpan) AttributeFor(attr traceql.Attribute) (traceql.Static, bo
 		}
 		return traceql.Static{}, false
 	case traceql.IntrinsicName:
-		// In search mode, suppress span name — standard Tempo search does not include it.
-		if s.searchMode {
-			return traceql.Static{}, false
-		}
 		if str, ok := s.match.Name(); ok {
 			return traceql.NewStaticString(str), true
 		}
@@ -671,24 +728,15 @@ func (s *blockpackSpan) AllAttributesFunc(cb func(traceql.Attribute, traceql.Sta
 		return
 	}
 	s.match.Fields.IterateFields(func(name string, value any) bool {
+		// Only emit columns that were part of the query — matches parquet's selective
+		// fetch behavior and prevents Grafana data frame type panics when spans have
+		// inconsistent attribute sets.
+		if s.wantedCols != nil && !s.wantedCols[name] {
+			return true
+		}
 		attr, ok := columnNameToAttribute(name)
 		if !ok {
 			return true
-		}
-
-		// In search mode, suppress span name and all user-defined span/resource
-		// attributes. Standard Tempo search (vparquet) fetches only SearchMetaConditions
-		// in the second pass, which excludes IntrinsicName and user attributes. Emitting
-		// them here causes asTraceSearchMetadata to populate tempopb.Span.Name and
-		// Attributes[], which the Grafana UI doesn't expect in search results.
-		if s.searchMode {
-			if attr.Intrinsic == traceql.IntrinsicName {
-				return true
-			}
-			if attr.Intrinsic == traceql.IntrinsicNone &&
-				(attr.Scope == traceql.AttributeScopeSpan || attr.Scope == traceql.AttributeScopeResource) {
-				return true
-			}
 		}
 
 		var st traceql.Static
@@ -871,11 +919,11 @@ func (b *blockpackBlock) FetchTagNames(ctx context.Context, req traceql.FetchTag
 					if _, exists := seen[tag]; !exists {
 						seen[tag] = struct{}{}
 						if cb(tag, req.Scope) {
-							return true // Stop iteration
+							return false // cb says stop — false = stop in IterateFields
 						}
 					}
 				}
-				return false // Continue iteration
+				return true // continue iterating
 			})
 		}
 	} else {
@@ -887,6 +935,9 @@ func (b *blockpackBlock) FetchTagNames(ctx context.Context, req traceql.FetchTag
 		}
 		defer rc.Close()
 
+		if size <= 0 || size > maxBlobSize {
+			return fmt.Errorf("blockpack file size out of range: %d", size)
+		}
 		data := make([]byte, size)
 		_, err = io.ReadFull(rc, data)
 		if err != nil {
@@ -956,6 +1007,9 @@ func (b *blockpackBlock) Validate(ctx context.Context) error {
 	}
 	defer rc.Close()
 
+	if size <= 0 || size > maxBlobSize {
+		return fmt.Errorf("blockpack file size out of range: %d", size)
+	}
 	// Read file data
 	data := make([]byte, size)
 	_, err = io.ReadFull(rc, data)
@@ -1478,6 +1532,8 @@ func attributeToColumnName(attr traceql.Attribute) string {
 			return blockpack.IntrinsicColumnName("id")
 		case traceql.IntrinsicParentID:
 			return blockpack.IntrinsicColumnName("parent_id")
+		case traceql.IntrinsicSpanStartTime:
+			return blockpack.IntrinsicColumnName("start")
 		}
 	}
 
