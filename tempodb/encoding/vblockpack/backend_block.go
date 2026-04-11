@@ -126,7 +126,8 @@ func getCache() blockpack.Cache {
 		// 256 MB in-process LRU cache is always on; set to 0 to disable.
 		if cfg.memoryCacheBytes > 0 {
 			mem, err := blockpack.NewMemoryCache(blockpack.MemoryCacheConfig{
-				MaxBytes: cfg.memoryCacheBytes,
+				MaxBytes:   cfg.memoryCacheBytes,
+				Registerer: prometheus.DefaultRegisterer,
 			})
 			if err == nil && mem != nil {
 				tiers = append(tiers, mem)
