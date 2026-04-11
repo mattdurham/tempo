@@ -620,6 +620,31 @@ func (s *blockpackSpan) AttributeFor(attr traceql.Attribute) (traceql.Static, bo
 			return traceql.NewStaticKind(otlpKindToTempoKind(i)), true
 		}
 		return traceql.Static{}, false
+	// SearchMetaConditions — span-level fields Grafana always expects.
+	case traceql.IntrinsicSpanID:
+		if s.match.SpanID != "" {
+			return traceql.NewStaticString(s.match.SpanID), true
+		}
+		return traceql.Static{}, false
+	case traceql.IntrinsicSpanStartTime:
+		if u, ok := s.match.StartNano(); ok {
+			return traceql.NewStaticInt(int(u)), true //nolint:gosec // nanosecond timestamp fits int64
+		}
+		return traceql.Static{}, false
+	// SearchMetaConditions — trace-level fields; each span knows its own traceID.
+	case traceql.IntrinsicTraceID:
+		if s.match.TraceID != "" {
+			return traceql.NewStaticString(s.match.TraceID), true
+		}
+		return traceql.Static{}, false
+	// Trace-level root fields are populated at the Spanset level via SpanMatchesMetadata;
+	// returning false here lets the engine fall back to the Spanset-level values.
+	case traceql.IntrinsicTraceRootService,
+		traceql.IntrinsicTraceRootSpan,
+		traceql.IntrinsicTraceDuration,
+		traceql.IntrinsicTraceStartTime,
+		traceql.IntrinsicServiceStats:
+		return traceql.Static{}, false
 	case traceql.IntrinsicNone:
 		// Fall through to column lookup below.
 	default:
@@ -686,6 +711,28 @@ func (s *blockpackSpan) AllAttributesFunc(cb func(traceql.Attribute, traceql.Sta
 			} else {
 				return true
 			}
+		case traceql.IntrinsicSpanID:
+			if b, ok := value.([]byte); ok {
+				st = traceql.NewStaticString(hex.EncodeToString(b))
+			} else if str, ok := value.(string); ok {
+				st = traceql.NewStaticString(str)
+			} else {
+				return true
+			}
+		case traceql.IntrinsicSpanStartTime:
+			if u, ok := value.(uint64); ok {
+				st = traceql.NewStaticInt(int(u)) //nolint:gosec // nanosecond timestamp fits int64
+			} else {
+				return true
+			}
+		case traceql.IntrinsicParentID:
+			if b, ok := value.([]byte); ok {
+				st = traceql.NewStaticString(hex.EncodeToString(b))
+			} else if str, ok := value.(string); ok {
+				st = traceql.NewStaticString(str)
+			} else {
+				return true
+			}
 		default:
 			// Convert bool to string for display consistency.
 			// Grafana's data frame requires uniform types per column; mixed bool/string
@@ -749,8 +796,14 @@ func columnNameToAttribute(colName string) (traceql.Attribute, bool) {
 			return traceql.NewIntrinsic(traceql.IntrinsicStatusMessage), true
 		case "kind":
 			return traceql.NewIntrinsic(traceql.IntrinsicKind), true
+		case "id":
+			return traceql.NewIntrinsic(traceql.IntrinsicSpanID), true
+		case "start":
+			return traceql.NewIntrinsic(traceql.IntrinsicSpanStartTime), true
+		case "parent_id":
+			return traceql.NewIntrinsic(traceql.IntrinsicParentID), true
 		}
-		return traceql.Attribute{}, false // id, parent_id, start, end — not user-visible
+		// end, trace:id etc. remain internal-only
 	}
 	switch scope {
 	case "span":
