@@ -59,6 +59,40 @@ func buildIntrinsicBytesMap(r *modules_reader.Reader, colName string) map[uint32
 	return m
 }
 
+// buildIntrinsicBytesMapForRows builds a packed-key → bytes lookup map from an intrinsic flat
+// column, restricted to the (blockIdx, rowIdx) pairs present in wantRows.
+// wantRows maps blockID → []rowIdx (e.g. from GetTraceByID's rowsByBlock).
+// This avoids scanning the entire column when only a small subset of blocks are relevant.
+// Key encoding: uint32(blockIdx)<<16 | uint32(rowIdx). Returns nil if the column is absent.
+func buildIntrinsicBytesMapForRows(r *modules_reader.Reader, colName string, wantRows map[int][]int) map[uint32][]byte {
+	if len(wantRows) == 0 {
+		return nil
+	}
+	col, err := r.GetIntrinsicColumn(colName)
+	if err != nil || col == nil || len(col.BytesValues) == 0 {
+		return nil
+	}
+	// Build a set of all (blockIdx, rowIdx) pairs we care about for fast lookup.
+	type blockRow struct{ block, row uint16 }
+	wantSet := make(map[blockRow]struct{})
+	for blockID, rows := range wantRows {
+		for _, rowIdx := range rows {
+			wantSet[blockRow{uint16(blockID), uint16(rowIdx)}] = struct{}{} //nolint:gosec // bounded values
+		}
+	}
+	m := make(map[uint32][]byte, len(wantSet))
+	for i, ref := range col.BlockRefs {
+		if i >= len(col.BytesValues) {
+			break
+		}
+		if _, ok := wantSet[blockRow{ref.BlockIdx, ref.RowIdx}]; ok {
+			key := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx) //nolint:gosec // ref values are bounded
+			m[key] = col.BytesValues[i]
+		}
+	}
+	return m
+}
+
 // hexEncodeField converts a field value (string or []byte) to a hex string.
 // Used for trace:id and span:id which are stored as bytes in intrinsic columns.
 func hexEncodeField(v any) string {
