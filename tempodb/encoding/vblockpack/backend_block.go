@@ -1549,25 +1549,11 @@ func buildTraceMetadata(traceID string, spans []blockpack.SpanMatch) *tempopb.Tr
 		return metadata
 	}
 
-	// Find min/max times
-	var minStart, maxEnd uint64 = ^uint64(0), 0
-	for _, span := range spans {
-		if start, ok := span.Fields.GetField("span:start"); ok {
-			if st, ok := start.(uint64); ok && st < minStart {
-				minStart = st
-			}
-		}
-		if end, ok := span.Fields.GetField("span:end"); ok {
-			if et, ok := end.(uint64); ok && et > maxEnd {
-				maxEnd = et
-			}
-		}
-	}
-
-	metadata.StartTimeUnixNano = minStart
-	if maxEnd > minStart {
-		metadata.DurationMs = uint32((maxEnd - minStart) / 1000000)
-	}
+	rootSpanName, rootServiceName, startNano, durationNano := blockpack.SpanMatchesMetadata(spans)
+	metadata.RootTraceName = rootSpanName
+	metadata.RootServiceName = rootServiceName
+	metadata.StartTimeUnixNano = startNano
+	metadata.DurationMs = uint32(durationNano / 1_000_000) //nolint:gosec // duration fits in uint32 (ms)
 
 	return metadata
 }
