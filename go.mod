@@ -80,7 +80,7 @@ require (
 	github.com/evanphx/json-patch v5.9.11+incompatible
 	github.com/golang/groupcache v0.0.0-20241129210726-2c02b8208cf8
 	github.com/googleapis/gax-go/v2 v2.17.0
-	github.com/grafana/blockpack v0.0.0-20260410202741-744708a98ee2
+	github.com/grafana/blockpack v0.0.0-20260411153202-7f177ff59cae
 	github.com/grafana/gomemcache v0.0.0-20251127154401-74f93547077b
 	github.com/grpc-ecosystem/go-grpc-middleware v1.4.0
 	github.com/hashicorp/golang-lru/v2 v2.0.7
@@ -448,4 +448,3 @@ replace (
 // - https://github.com/grafana/memberlist/pull/3
 replace github.com/hashicorp/memberlist => github.com/grafana/memberlist v0.3.1-0.20251024160842-5cd332c2849a
 
-replace github.com/grafana/blockpack => /Users/mdurham/source/blockpack
