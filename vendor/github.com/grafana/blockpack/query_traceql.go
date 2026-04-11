@@ -48,10 +48,11 @@ func streamFilterProgram(r *Reader, program *vm.Program, opts QueryOptions, fn s
 	// span:start is always present in searchMetaColumns so no extra I/O is needed.
 	// When MostRecent+Limit, Collect gives globally top-K results by span:start.
 	collectOpts := modules_executor.CollectOptions{
-		TimeRange:  normalizeTimeRange(opts.StartNano, opts.EndNano),
-		Limit:      opts.Limit,
-		StartBlock: opts.StartBlock,
-		BlockCount: opts.BlockCount,
+		TimeRange:     normalizeTimeRange(opts.StartNano, opts.EndNano),
+		Limit:         opts.Limit,
+		StartBlock:    opts.StartBlock,
+		BlockCount:    opts.BlockCount,
+		SelectColumns: opts.SelectColumns,
 		// NOTE-028: AllColumns defaults to false — for Collect this means the second pass decodes only
 		// searchMetaColumns ∪ predicate columns.
 	}
