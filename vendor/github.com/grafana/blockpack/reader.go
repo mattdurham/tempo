@@ -279,8 +279,13 @@ func GetTraceByID(r *Reader, traceIDHex string) (results []SpanMatch, err error)
 		return nil, nil
 	}
 	blockIDs := make([]int, len(entries))
+	// matchingBlockSet is built here and reused below to filter intrinsic column scans.
+	// This prevents O(all-blocks) intrinsic column traversal when the trace exists in
+	// only a small fraction of blocks.
+	matchingBlockSet := make(map[int]bool, len(entries))
 	for i, e := range entries {
 		blockIDs[i] = e.BlockID
+		matchingBlockSet[e.BlockID] = true
 	}
 	rawMap := make(map[int][]byte, len(entries))
 	for _, group := range r.CoalescedGroups(blockIDs) {
@@ -307,9 +312,13 @@ func GetTraceByID(r *Reader, traceIDHex string) (results []SpanMatch, err error)
 	}
 
 	// rowsByBlock maps blockID → []rowIdx for rows matching traceID.
+	// Only entries in matchingBlockSet are considered, scoping the scan to relevant blocks.
 	rowsByBlock := make(map[int][]int)
 	if intrinsicTraceCol != nil {
 		for i, ref := range intrinsicTraceCol.BlockRefs {
+			if !matchingBlockSet[int(ref.BlockIdx)] {
+				continue // skip blocks that don't contain this trace
+			}
 			if i < len(intrinsicTraceCol.BytesValues) && bytes.Equal(intrinsicTraceCol.BytesValues[i], traceID[:]) {
 				rowsByBlock[int(ref.BlockIdx)] = append(rowsByBlock[int(ref.BlockIdx)], int(ref.RowIdx))
 			}
@@ -320,8 +329,10 @@ func GetTraceByID(r *Reader, traceIDHex string) (results []SpanMatch, err error)
 	// This handles files written before the dual-storage removal.
 	useLegacyScan := len(rowsByBlock) == 0 && intrinsicTraceCol == nil
 
-	// Pre-build intrinsic span:id map for ID extraction fallback.
-	spanIDByRef := buildIntrinsicBytesMap(r, "span:id")
+	// Pre-build intrinsic span:id map, scoped to rows in rowsByBlock.
+	// Using the filtered variant avoids scanning span:id entries for all blocks
+	// when only a small subset of blocks match the trace.
+	spanIDByRef := buildIntrinsicBytesMapForRows(r, "span:id", rowsByBlock)
 
 	for _, entry := range entries {
 		raw, ok := rawMap[entry.BlockID]
