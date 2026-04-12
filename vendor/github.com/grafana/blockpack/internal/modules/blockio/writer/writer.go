@@ -684,9 +684,25 @@ func (w *Writer) flushBlocks() error {
 		}
 	}
 
-	// NOTE: auto-embedding (w.cfg.Embedder) is not supported in the V14 per-column snappy
-	// writer; span vectors were previously threaded through buildBlock but that parameter
-	// was removed. Embedder config is ignored in this code path.
+	// Pre-compute embedding vectors for all pending spans when auto-embedding is enabled.
+	// This runs sequentially before the parallel block-build phase because Embed() is
+	// typically a network/compute call that must not be parallelised without external
+	// fan-in coordination. The result is a flat slice parallel to w.pending; each block
+	// goroutine receives its own subslice (no per-goroutine allocation needed).
+	var allSpanVectors [][]float32
+	if w.cfg.Embedder != nil {
+		var embedErr error
+		allSpanVectors, embedErr = w.embedPendingSpans(w.pending)
+		if embedErr != nil {
+			clear(w.pending)
+			w.pending = w.pending[:0]
+			clear(w.protoRoots)
+			w.protoRoots = w.protoRoots[:0]
+			clear(w.tempoProtoRoots)
+			w.tempoProtoRoots = w.tempoProtoRoots[:0]
+			return fmt.Errorf("writer: embed spans: %w", embedErr)
+		}
+	}
 
 	results := make([]builtBlock, len(slices))
 
@@ -697,9 +713,19 @@ func (w *Writer) flushBlocks() error {
 	for i, s := range slices {
 		i, s := i, s // capture loop variables
 		g.Go(func() error {
+			// Compute the vector subslice for this block. When allSpanVectors is nil
+			// (no embedder configured), blockVecs is nil and buildBlock skips injection.
+			var blockVecs [][]float32
+			if allSpanVectors != nil {
+				spanOffset := 0
+				for j := 0; j < i; j++ {
+					spanOffset += len(slices[j].spans)
+				}
+				blockVecs = allSpanVectors[spanOffset : spanOffset+len(s.spans)]
+			}
 			localAccum := newIntrinsicAccumulator()
 			bb, _ := w.bbPool.Get().(*blockBuilder)
-			built, bb, err := buildBlock(s.spans, bb, shared.VersionBlockV14, localAccum, s.blockID)
+			built, bb, err := buildBlock(s.spans, bb, shared.VersionBlockV14, localAccum, s.blockID, blockVecs)
 			if err != nil {
 				w.bbPool.Put(bb)
 				return fmt.Errorf("writer: block %d finalize: %w", s.blockID, err)

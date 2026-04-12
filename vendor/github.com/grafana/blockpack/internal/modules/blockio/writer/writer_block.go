@@ -171,7 +171,7 @@ func (b *blockBuilder) reset(spanHint int) {
 // When spanVectors is nil, no embedding injection is performed (cfg.Embedder == nil path).
 func buildBlock(
 	pending []pendingSpan, bb *blockBuilder, blockVersion uint8,
-	intrinsicAccum *intrinsicAccumulator, blockID int,
+	intrinsicAccum *intrinsicAccumulator, blockID int, spanVectors [][]float32,
 ) (builtBlock, *blockBuilder, error) {
 	if bb != nil {
 		bb.reset(len(pending))
@@ -228,8 +228,15 @@ func buildBlock(
 			bb.addRowFromProto(ps, rowIdx)
 		}
 
-		// Note: auto-embedding (spanVectors) was removed in V14. Vector injection
-		// is no longer performed in buildBlock; vectors must be added via AddSpan options.
+		// Inject pre-computed embedding vector if auto-embedding is active.
+		// spanVectors[rowIdx] is nil when the span produced no text or the embedder
+		// returned an empty vector; in both cases we skip injection to preserve the
+		// existing behavior (no __embedding__ column for that row).
+		if spanVectors != nil {
+			if vec := spanVectors[rowIdx]; len(vec) > 0 {
+				bb.addVectorPresent(rowIdx, shared.EmbeddingColumnName, vec)
+			}
+		}
 	}
 	payload, err := bb.finalize(blockVersion)
 	if err != nil {
