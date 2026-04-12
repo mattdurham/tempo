@@ -24,15 +24,22 @@ type HTTPConfig struct {
 	MaxTextLength int
 	// Timeout is the HTTP request timeout. Defaults to 30s if zero.
 	Timeout time.Duration
+	// MaxBatchSize is the maximum number of texts to send in a single POST /embed request.
+	// 0 means no chunking (use the server's limit — may return 422 for large batches).
+	// Defaults to 32 when set to 0 via NewHTTP, matching TEI's typical default limit.
+	MaxBatchSize int
 }
+
+const defaultMaxBatchSize = 32 // TEI default max_batch_tokens / typical per-request limit
 
 // httpBackend implements Backend by forwarding requests to an embedding server over HTTP.
 // Supports the TEI protocol: POST /embed with {"inputs": [...], "normalize": true}
 // Response: [[float, ...], ...] — flat array of vectors.
 type httpBackend struct {
-	client    *http.Client
-	serverURL string
-	dim       int
+	client       *http.Client
+	serverURL    string
+	dim          int
+	maxBatchSize int // max texts per request; 0 means no chunking
 }
 
 // teiRequest is the JSON request body for TEI's POST /embed.
@@ -53,9 +60,14 @@ func NewHTTP(cfg HTTPConfig) (*Embedder, error) {
 	if timeout <= 0 {
 		timeout = defaultHTTPTimeout
 	}
+	maxBatch := cfg.MaxBatchSize
+	if maxBatch <= 0 {
+		maxBatch = defaultMaxBatchSize
+	}
 	b := &httpBackend{
-		serverURL: cfg.ServerURL,
-		client:    &http.Client{Timeout: timeout},
+		serverURL:    cfg.ServerURL,
+		client:       &http.Client{Timeout: timeout},
+		maxBatchSize: maxBatch,
 	}
 
 	// Probe with a single short text to determine dimension.
@@ -89,30 +101,44 @@ func (b *httpBackend) Embed(text string) ([]float32, error) {
 	return vecs[0], nil
 }
 
-// EmbedBatch sends all texts to the server in a single POST /embed request.
+// EmbedBatch sends texts to the server, chunking into maxBatchSize requests when needed.
+// Returns one vector per input text in the same order.
 func (b *httpBackend) EmbedBatch(texts []string) ([][]float32, error) {
 	if len(texts) == 0 {
 		return [][]float32{}, nil
 	}
 
-	vecs, err := b.sendBatch(texts)
-	if err != nil {
-		return nil, fmt.Errorf("embedder http: embed batch: %w", err)
+	chunkSize := b.maxBatchSize
+	if chunkSize <= 0 {
+		chunkSize = len(texts) // no chunking
 	}
 
-	if len(vecs) != len(texts) {
-		return nil, fmt.Errorf("embedder http: server returned %d vectors for %d texts", len(vecs), len(texts))
-	}
+	all := make([][]float32, 0, len(texts))
+	for start := 0; start < len(texts); start += chunkSize {
+		end := start + chunkSize
+		if end > len(texts) {
+			end = len(texts)
+		}
+		chunk := texts[start:end]
 
-	if b.dim > 0 {
-		for i, v := range vecs {
-			if len(v) != b.dim {
-				return nil, fmt.Errorf("embedder http: vector[%d] has length %d, expected %d", i, len(v), b.dim)
+		vecs, err := b.sendBatch(chunk)
+		if err != nil {
+			return nil, fmt.Errorf("embedder http: embed batch: %w", err)
+		}
+		if len(vecs) != len(chunk) {
+			return nil, fmt.Errorf("embedder http: server returned %d vectors for %d texts", len(vecs), len(chunk))
+		}
+		if b.dim > 0 {
+			for i, v := range vecs {
+				if len(v) != b.dim {
+					return nil, fmt.Errorf("embedder http: vector[%d] has length %d, expected %d", start+i, len(v), b.dim)
+				}
 			}
 		}
+		all = append(all, vecs...)
 	}
 
-	return vecs, nil
+	return all, nil
 }
 
 // Close is a no-op for the HTTP backend.
