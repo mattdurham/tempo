@@ -150,8 +150,9 @@ func getCache() blockpack.Cache {
 		// Tier 3: remote memcache (largest, slowest).
 		if len(cfg.memServers) > 0 {
 			remote, err := blockpack.OpenMemCache(blockpack.MemCacheConfig{
-				Servers: cfg.memServers,
-				Enabled: true,
+				Servers:    cfg.memServers,
+				Enabled:    true,
+				Registerer: prometheus.DefaultRegisterer,
 			})
 			if err == nil && remote != nil {
 				tiers = append(tiers, remote)
