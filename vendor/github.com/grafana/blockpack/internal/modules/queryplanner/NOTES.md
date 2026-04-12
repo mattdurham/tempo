@@ -487,3 +487,32 @@ files, not just the CMSDepth=4/CMSWidth=64 defaults.
 - `internal/modules/blockio/shared/constants.go:fileSketchSummaryMagic`
 - `internal/modules/queryplanner/scoring.go:scoreBlocks` (NOTE-013 superseded)
 - `internal/modules/queryplanner/planner.go:Plan` (NOTE-015 superseded)
+
+---
+
+## NOTE-019: Selectivity-Ordered Predicate Intersection — Smallest Set First
+*Added: 2026-04-12*
+
+**Decision:** In `blockSetForPred` (LogicalAND branch) and `pruneByIndexAll`, collect all
+constrained child block sets first, then sort them by ascending size before intersecting.
+This is implemented via the `intersectBySelectivity` helper in `selection.go`.
+
+**Rationale:** AND intersection is commutative but not equally efficient in all orderings.
+Starting with the smallest set minimises the number of elements iterated at each step:
+if the most selective predicate produces a set of size S, all subsequent intersections
+iterate at most S elements regardless of the size of the other sets. Starting with the
+largest set means iterating the full set at every step until it is progressively reduced.
+
+**Concrete example — `{(span.http.method="GET" || span.http.method="POST") && status=error}`:**
+- Parse order: OR(http.method) → large set (many blocks), then AND status=error → small.
+  Intersection iterates `|OR set|` elements.
+- Selectivity order: status=error → small set first, then AND OR(http.method).
+  Intersection iterates `|status=error set|` ≪ `|OR set|` elements.
+
+**Early-exit:** `intersectBySelectivity` breaks as soon as `len(result) == 0`. Because we
+start with the smallest set, this empty-result short-circuit triggers as early as possible.
+
+**Invariant preserved:** The result set is identical regardless of intersection order —
+set intersection is commutative and associative. All existing correctness tests pass unchanged.
+
+**Back-ref:** `internal/modules/queryplanner/selection.go:intersectBySelectivity`

@@ -2,6 +2,44 @@ package queryplanner
 
 // NOTE: Any changes to this file must be reflected in the corresponding specs.md or NOTES.md.
 
+import "sort"
+
+// intersectBySelectivity intersects a slice of non-nil block sets in selectivity order
+// (smallest set first) to minimise intermediate result sizes. The caller must filter out
+// nil (unconstrained) sets before calling; nil maps in sets produce a panic.
+//
+// Returns nil when sets is empty (no constrained predicates → no pruning possible).
+// Returns the intersection result, which may be a non-nil empty map when a constrained
+// predicate matched no blocks (all candidates should be pruned for an AND predicate).
+//
+// NOTE-019: Intersecting in order of ascending set size (most selective first) minimises
+// the work done at each step: starting from the smallest set means subsequent intersections
+// iterate over fewer elements. For the common case of A && (B || C) where A is indexed on
+// a selective column and OR(B,C) is wide, processing A first prunes the block list to a
+// small set before OR(B,C) further intersects — rather than building the full OR union and
+// then reducing it.
+func intersectBySelectivity(sets []map[int]struct{}) map[int]struct{} {
+	if len(sets) == 0 {
+		return nil
+	}
+	// Sort ascending by size: smallest (most selective) first.
+	sort.Slice(sets, func(i, j int) bool {
+		return len(sets[i]) < len(sets[j])
+	})
+	result := sets[0]
+	for _, set := range sets[1:] {
+		for b := range result {
+			if _, ok := set[b]; !ok {
+				delete(result, b)
+			}
+		}
+		if len(result) == 0 {
+			break // already empty — no further intersections can add blocks
+		}
+	}
+	return result
+}
+
 // leafBlockSet returns the set of block indices that the range index indicates may
 // satisfy a leaf predicate.
 //
@@ -103,8 +141,10 @@ func blockSetForPred(r BlockIndexer, pred Predicate) (map[int]struct{}, error) {
 		return union, nil
 	}
 
-	// LogicalAND: intersect children, skipping unconstrained ones.
-	var result map[int]struct{}
+	// LogicalAND: collect constrained children then intersect in selectivity order
+	// (smallest set first) so that the most selective predicate prunes first.
+	// See NOTE-019.
+	var sets []map[int]struct{}
 	for _, child := range pred.Children {
 		set, err := blockSetForPred(r, child)
 		if err != nil {
@@ -113,25 +153,18 @@ func blockSetForPred(r BlockIndexer, pred Predicate) (map[int]struct{}, error) {
 		if set == nil {
 			continue // unconstrained AND child — skip conservatively
 		}
-		if result == nil {
-			result = set
-			continue
-		}
-		for b := range result {
-			if _, ok := set[b]; !ok {
-				delete(result, b)
-			}
-		}
+		sets = append(sets, set)
 	}
-	return result, nil // nil when no indexed children
+	return intersectBySelectivity(sets), nil // nil when no constrained children
 }
 
 // pruneByIndexAll evaluates the top-level predicates (AND-combined) via range index
 // and removes candidates that cannot satisfy the combined constraint.
 func pruneByIndexAll(r BlockIndexer, candidates blockSet, predicates []Predicate) (int, error) {
-	// Top-level predicates are AND-combined: intersect all constrained block sets.
-	var result map[int]struct{}
-	constrained := false
+	// Collect constrained block sets for all predicates, then intersect in selectivity
+	// order (smallest set first) so that the most selective predicate prunes first.
+	// See NOTE-019.
+	var sets []map[int]struct{}
 	for _, pred := range predicates {
 		set, err := blockSetForPred(r, pred)
 		if err != nil {
@@ -140,18 +173,10 @@ func pruneByIndexAll(r BlockIndexer, candidates blockSet, predicates []Predicate
 		if set == nil {
 			continue // unconstrained predicate — skip
 		}
-		if !constrained {
-			result = set
-			constrained = true
-			continue
-		}
-		for b := range result {
-			if _, ok := set[b]; !ok {
-				delete(result, b)
-			}
-		}
+		sets = append(sets, set)
 	}
-	if !constrained {
+	result := intersectBySelectivity(sets)
+	if result == nil {
 		return 0, nil
 	}
 	pruned := 0
