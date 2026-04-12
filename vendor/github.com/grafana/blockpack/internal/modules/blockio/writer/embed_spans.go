@@ -13,8 +13,8 @@ import (
 	"github.com/grafana/blockpack/internal/modules/embedder"
 )
 
-// embedPendingSpans assembles embedding text for each span in the slice and calls
-// cfg.Embedder.Embed on each. Returns a slice of vectors parallel to spans:
+// embedPendingSpans assembles embedding text for each span and calls EmbedBatch once
+// for all non-empty texts. Returns a slice of vectors parallel to spans:
 // vectors[i] is nil when the span produced no text.
 //
 // For proto-based spans (rs/ss/span set): field values are extracted directly from
@@ -24,9 +24,12 @@ import (
 // decoded columns.
 //
 // The returned slice is always len(spans). Callers check for nil elements.
-// Embedding is sequential — Embed() is typically a network or compute call.
+// A single EmbedBatch call is used for efficiency; the HTTP backend sends all texts
+// in one request.
 func (w *Writer) embedPendingSpans(spans []pendingSpan) ([][]float32, error) {
-	vecs := make([][]float32, len(spans))
+	// Phase 1: collect texts and track which span indices have non-empty text.
+	texts := make([]string, 0, len(spans))
+	indices := make([]int, 0, len(spans)) // maps texts[i] → spans index
 	for i := range spans {
 		ps := &spans[i]
 
@@ -44,12 +47,27 @@ func (w *Writer) embedPendingSpans(spans []pendingSpan) ([][]float32, error) {
 		if text == "" {
 			continue
 		}
+		texts = append(texts, text)
+		indices = append(indices, i)
+	}
 
-		vec, err := w.cfg.Embedder.Embed(text)
-		if err != nil {
-			return nil, fmt.Errorf("embedder: span %d: %w", i, err)
-		}
-		vecs[i] = vec
+	if len(texts) == 0 {
+		return make([][]float32, len(spans)), nil
+	}
+
+	// Phase 2: embed all texts in a single batch call.
+	batchVecs, err := w.cfg.Embedder.EmbedBatch(texts)
+	if err != nil {
+		return nil, fmt.Errorf("embedder: batch: %w", err)
+	}
+	if len(batchVecs) != len(texts) {
+		return nil, fmt.Errorf("embedder: batch returned %d vectors for %d texts", len(batchVecs), len(texts))
+	}
+
+	// Phase 3: scatter batch results back to span positions.
+	vecs := make([][]float32, len(spans))
+	for j, spanIdx := range indices {
+		vecs[spanIdx] = batchVecs[j]
 	}
 	return vecs, nil
 }

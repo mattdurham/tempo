@@ -4,12 +4,17 @@ package writer
 
 import "io"
 
-// TextEmbedder converts text to a float32 embedding vector.
-// This is a local interface matching vm.TextEmbedder — defined here to avoid
-// an import cycle between writer and vm packages. Go structural typing means
-// any vm.TextEmbedder or embedder.Embedder satisfies this interface.
+// TextEmbedder converts text to float32 embedding vectors.
+// Defined here to avoid an import cycle between writer and vm packages.
+// The public *blockpack.Embedder (HTTP and yzma backends) satisfies this interface.
+// Note: vm.TextEmbedder is a subset interface (Embed only); it does NOT satisfy
+// writer.TextEmbedder unless it also implements EmbedBatch.
 type TextEmbedder interface {
 	Embed(text string) ([]float32, error)
+	// EmbedBatch encodes a batch of texts in a single call. Must return exactly
+	// len(texts) vectors in the same order. Implementations may send a single
+	// HTTP request for all texts (HTTP backend) or process locally (yzma backend).
+	EmbedBatch(texts []string) ([][]float32, error)
 }
 
 // EmbeddingFieldConfig describes one span field to include in auto-embedding text.
