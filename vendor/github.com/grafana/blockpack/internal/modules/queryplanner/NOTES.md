@@ -503,11 +503,26 @@ if the most selective predicate produces a set of size S, all subsequent interse
 iterate at most S elements regardless of the size of the other sets. Starting with the
 largest set means iterating the full set at every step until it is progressively reduced.
 
-**Concrete example — `{(span.http.method="GET" || span.http.method="POST") && status=error}`:**
-- Parse order: OR(http.method) → large set (many blocks), then AND status=error → small.
-  Intersection iterates `|OR set|` elements.
-- Selectivity order: status=error → small set first, then AND OR(http.method).
-  Intersection iterates `|status=error set|` ≪ `|OR set|` elements.
+**Concrete example — `{resource.service.name="auth" && span.http.status_code="500"}`:**
+- Parse order: resource.service.name → wide set (present in many blocks),
+  then AND span.http.status_code="500" → narrow set (few blocks with 500 errors).
+  Without ordering, intersection iterates `|service.name set|` elements.
+- Selectivity order: span.http.status_code="500" (small) first, then AND resource.service.name.
+  Intersection iterates `|status_code set|` ≪ `|service.name set|` elements.
+
+Note: At least one constrained child block set is required to benefit from selectivity ordering; `intersectBySelectivity` is invoked whenever `blockSetForPred` or `pruneByIndexAll` collects at least one non-nil constrained set.
+The executor's intrinsic fast path (Cases A-D in executor/SPECS.md) is a separate subsystem
+that intercepts queries against span:status, span:duration, and span:name *after* block
+selection. The planner's block-set intersection (`blockSetForPred` / `intersectBySelectivity`)
+runs unconditionally during block selection, regardless of whether a column is stored in
+blockpack's intrinsic TOC section (i.e. `IsIntrinsicColumn` is unrelated to whether a
+predicate reaches this code path).
+
+**Caller contract and mutation:** The OR union for each child is computed eagerly by
+`blockSetForPred` before being passed to `intersectBySelectivity`. Inside
+`intersectBySelectivity`, the input maps are never mutated — a fresh result map is
+allocated from a copy of sets[0] (the smallest set after sorting). Callers may safely
+reuse their input maps after the call.
 
 **Early-exit:** `intersectBySelectivity` breaks as soon as `len(result) == 0`. Because we
 start with the smallest set, this empty-result short-circuit triggers as early as possible.

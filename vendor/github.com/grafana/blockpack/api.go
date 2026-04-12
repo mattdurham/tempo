@@ -50,8 +50,9 @@ type QueryOptions struct {
 	// VECTOR_ALL() does not require an Embedder.
 	Embedder vm.TextEmbedder
 	// SelectColumns limits which column names appear in SpanMatch.Fields.
-	// When non-nil, only columns whose names are present in this slice are
-	// returned by GetField and IterateFields. nil means all columns are returned.
+	// When non-empty, only columns whose names are present in this slice are
+	// returned by GetField and IterateFields. nil or empty means all columns
+	// are returned (no projection applied).
 	SelectColumns []string
 	// StartNano is the inclusive lower bound for block-level time pruning (unix nanoseconds).
 	// Internal blocks whose span:start range ends before StartNano are skipped entirely.

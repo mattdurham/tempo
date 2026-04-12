@@ -42,7 +42,7 @@ to guarantee globally correct top-K results (see §6, SPEC-STREAM-7).
 
 ### 3.2 Execution Steps
 
-1. Compute `wantColumns` from `program` and `opts.SelectColumns` (via `ProgramWantColumns`), and `secondPassCols` from `opts.AllColumns` (NOTE-028). When `opts.SelectColumns` is non-empty and the program has no predicate columns, `wantColumns` is derived from `SelectColumns` alone, enabling storage-level column projection.
+1. Compute `wantColumns` via `ProgramWantColumns(program)`. Apply `opts.SelectColumns` via a two-path strategy: (a) **no predicate columns** (`wantColumns == nil`, e.g. `{}`): promote `SelectColumns` to the sole first-pass filter so only the requested output columns are decoded from every block; (b) **predicate columns present**: do NOT add `SelectColumns` to `wantColumns` — output-only columns are deferred to `secondPassCols` so they are decoded only for blocks that match the filter, not every scanned block. Compute `secondPassCols` via `computeColumnFilters` (NOTE-028): when `opts.AllColumns=true`, `computeColumnFilters` returns early after setting `wantColumns`, leaving `secondPassCols=nil`; the second parse pass then decodes all columns unconditionally.
 2. Create a `queryplanner.Planner` backed by `r`.
 3. Call `planner.PlanWithOptions(BuildPredicates(r, program), opts.TimeRange, ...)` —
    range-index and membership pruning (SketchBloom) based on extracted column predicates, further
@@ -83,7 +83,7 @@ construction. The planner still operates on the full file, so pruning statistics
 (`TotalBlocks`, `PrunedByTime`, etc.) reflect the whole file; only `SelectedBlocks` and
 `FetchedBlocks` reflect the shard.
 
-Back-ref: `internal/modules/executor/stream.go:Collect` (lines 109-121)
+Back-ref: `internal/modules/executor/stream.go:Collect` (lines 125+); sub-file sharding filter at lines 248-256
 
 ---
 
@@ -157,8 +157,8 @@ type CollectOptions struct {
 | `Limit` | Max matches. `0` = no limit. When reached, executor returns early. |
 | `Direction` | Forward (default, ascending) or Backward (descending). |
 | `TimestampColumn` | `""` disables per-row time filtering. `"log:timestamp"` or `"span:start"` enables it. |
-| `AllColumns` | `false` (default): second pass decodes predicate + search columns. `true`: decode all columns. Only needed for `IterateFields()` callbacks (NOTE-028). |
-| `SelectColumns` | Storage-level column projection. When non-empty, these column names are merged into `wantColumns` so that only the requested columns are decoded from block blobs. For queries with no predicate columns (e.g. `{}`), this prevents decoding all columns. Predicate columns are always included regardless of this list. |
+| `AllColumns` | `false` (default): second pass decodes predicate + search columns. `true`: `computeColumnFilters` returns early, leaving `secondPassCols=nil`, so the second pass decodes all columns — all columns available after parsing. Only needed for `IterateFields()` callbacks (NOTE-028). For queries with predicate columns, `SelectColumns` is NOT in `wantColumns` (it would normally be deferred to `secondPassCols`); `SelectColumns` has no effect when `AllColumns=true`. |
+| `SelectColumns` | Storage-level column projection. When non-empty, these column names are merged into `wantColumns` so that only the requested columns are decoded from block blobs. For queries with no predicate columns (e.g. `{}`), this prevents decoding all columns. Predicate columns are always included regardless of this list. Has no effect when `AllColumns=true`. |
 | `StartBlock` | First block index for sub-file sharding. See §3.4. |
 | `BlockCount` | Number of blocks for sub-file sharding. `0` = scan all. See §3.4. |
 
