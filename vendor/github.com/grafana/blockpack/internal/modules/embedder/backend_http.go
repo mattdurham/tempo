@@ -5,13 +5,18 @@ package embedder
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"time"
 )
 
-const defaultHTTPTimeout = 30 * time.Second
+const defaultHTTPTimeout = 120 * time.Second
+
+// sendBatchMaxRetries is the number of times sendBatch retries on transient errors
+// (timeout, connection reset, 5xx) before propagating the error.
+const sendBatchMaxRetries = 3
 
 // HTTPConfig configures the HTTP embedding backend.
 type HTTPConfig struct {
@@ -145,6 +150,8 @@ func (b *httpBackend) EmbedBatch(texts []string) ([][]float32, error) {
 func (b *httpBackend) Close() {}
 
 // sendBatch posts texts to POST /embed using the TEI protocol and returns vectors.
+// Retries up to sendBatchMaxRetries times on transient network errors or 5xx responses,
+// with a short backoff between attempts.
 func (b *httpBackend) sendBatch(texts []string) ([][]float32, error) {
 	reqBody, err := json.Marshal(teiRequest{Inputs: texts, Normalize: true})
 	if err != nil {
@@ -152,15 +159,49 @@ func (b *httpBackend) sendBatch(texts []string) ([][]float32, error) {
 	}
 
 	url := b.serverURL + "/embed"
+
+	var lastErr error
+	for attempt := range sendBatchMaxRetries {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt*attempt) * time.Second) // 1s, 4s backoff
+		}
+
+		vecs, err := b.doPost(url, reqBody)
+		if err == nil {
+			return vecs, nil
+		}
+		lastErr = err
+
+		// Retry on network errors and 5xx; stop immediately on 4xx.
+		var httpErr *httpStatusError
+		if errors.As(err, &httpErr) && httpErr.status < 500 {
+			break
+		}
+	}
+	return nil, fmt.Errorf("POST %s: %w", url, lastErr)
+}
+
+// httpStatusError is returned by doPost when the server returns a non-200 HTTP status.
+type httpStatusError struct {
+	status int
+	body   string
+}
+
+func (e *httpStatusError) Error() string {
+	return fmt.Sprintf("HTTP %d — %s", e.status, e.body)
+}
+
+// doPost performs a single HTTP POST to url with reqBody and decodes the vector response.
+func (b *httpBackend) doPost(url string, reqBody []byte) ([][]float32, error) {
 	httpResp, err := b.client.Post(url, "application/json", bytes.NewReader(reqBody)) //nolint:noctx
 	if err != nil {
-		return nil, fmt.Errorf("POST %s: %w", url, err)
+		return nil, err
 	}
 	defer func() { _ = httpResp.Body.Close() }()
 
 	if httpResp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(httpResp.Body, 1024)) //nolint:gomnd
-		return nil, fmt.Errorf("POST %s: %s — %s", url, httpResp.Status, string(body))
+		return nil, &httpStatusError{status: httpResp.StatusCode, body: string(body)}
 	}
 
 	// TEI returns a flat JSON array of arrays: [[float, ...], ...]
