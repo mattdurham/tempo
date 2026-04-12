@@ -126,6 +126,16 @@ type ScoredRow struct {
 // Only candidate rows (those in candidates) are scored — non-candidates are skipped.
 type VectorScorer func(getVec func(rowIdx int) ([]float32, bool), candidates RowSet) []ScoredRow
 
+// NeedsColumnData reports whether this program requires full column data access
+// (column predicates, streaming predicates, or vector scoring).
+// A nil Program returns false — lean reader is sufficient for trace-index-only lookups.
+func (p *Program) NeedsColumnData() bool {
+	if p == nil {
+		return false
+	}
+	return p.ColumnPredicate != nil || p.StreamingColumnPredicate != nil || p.VectorScorer != nil
+}
+
 // Program represents a compiled TraceQL or SQL expression
 type Program struct {
 	// ColumnPredicate filters rows using bulk column scans (fast)

@@ -110,6 +110,34 @@ Back-ref: `internal/vm/vm.go:AggBucket.Merge`
 
 ---
 
+## NOTE-048: Program.NeedsColumnData — Reader Dispatch Helper
+*Added: 2026-04-12*
+
+**Decision:** Added `NeedsColumnData() bool` method to `*Program` in `bytecode.go`.
+
+**Rationale:** Callers that hold a compiled `*Program` and need to open a `Reader` for it
+face a choice: a full reader (all sections) or a lean reader (trace index only). The correct
+choice depends on whether the program will execute column predicates, streaming column
+predicates, or vector scoring — all of which require full column data access via `ReadGroup`.
+A nil Program (trace-index-only lookup, e.g. FindTraceByID) never needs column data.
+
+`NeedsColumnData` encapsulates this dispatch logic in one place, keeping it co-located with
+the `Program` type rather than scattered across reader construction sites. Callers pass the
+result directly to `blockpack.NewReaderForProgram` (the public API function) which selects
+the lean or full reader accordingly.
+
+**Nil safety:** `NeedsColumnData` is defined on `*Program` and returns `false` for a nil
+receiver, making nil-checking at call sites unnecessary.
+
+**Invariant:** A program with `ColumnPredicate != nil || StreamingColumnPredicate != nil ||
+VectorScorer != nil` requires column data. A program with all three fields nil (e.g. a
+trace-ID lookup with no filter) does not.
+
+Back-ref: `internal/vm/bytecode.go:Program.NeedsColumnData`,
+`blockpack/reader.go:NewReaderForProgram`
+
+---
+
 ## NOTE-047: DateBinInfo Removed — Unused Exported Type
 *Added: 2026-03-18*
 

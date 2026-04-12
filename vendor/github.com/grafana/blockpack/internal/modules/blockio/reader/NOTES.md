@@ -408,3 +408,53 @@ Back-ref: `internal/modules/blockio/reader/parser.go:readFooter`,
 `internal/modules/blockio/reader/column.go` (decompScratchPool removed),
 `internal/modules/blockio/reader/columnar_read.go` (snappy decode per column),
 `internal/modules/blockio/reader/reader.go:NewReaderFromProvider`
+
+---
+
+## NOTE-013: V14 Two-Phase Trace Index Loading
+*Added: 2026-04-12*
+
+**Problem:** `ensureV14TraceSection` previously called `readV14Section(SectionTraceIndex)` on
+every `BlocksForTraceID` call, reading and decompressing the entire ~50 MB trace section per
+block. With 59 blocks, a single FindTraceByID lookup incurred ~3 GB of reads — even with disk
+cache, this took ~6 seconds.
+
+**Solution:** Apply the same two-phase approach that V3/V4 lean readers already use:
+
+- **Phase 1 (eager, ~KB):** `ensureV14TraceSection` calls `readV14Section`, passes the result
+  to `splitV14CompactSection` to extract just the header (magic + version + block_count +
+  bloom + block_table), and stores it via `parseCompactIndexBytesV14Header`. The header bytes
+  are cached under `fileID+"/v14/compact-header"`.
+
+- **Phase 2 (lazy, ~50 MB, only on bloom hit):** `ensureTraceIndexRaw` detects
+  `compactParsed.isV14TraceSection == true` and re-reads the full V14 section, calls
+  `splitV14CompactSection` again to extract the trace index bytes, caches them under
+  `fileID+"/compact-trace-index"`, and stores them in `compactParsed.traceIndexRaw`.
+
+**Why re-read the full section in phase 2 instead of caching just the trace index part:**
+The V14 section is snappy-compressed as a single blob; there is no direct file offset for
+the trace index portion. The full blob must be fetched to decompress, then split. The
+`readV14Section` cache (`fileID+"/v14/sec/03/dec"`) already holds the decompressed blob
+for full readers; for lean readers the re-read on bloom hit is the correct trade-off.
+
+**Key functions:**
+- `splitV14CompactSection(data)` — stateless splitter; returns header and trace-index
+  sub-slices with no copy.
+- `parseCompactIndexBytesV14Header(header)` — parses header into `compactTraceIndex` with
+  `isV14TraceSection: true` and `traceIndexRaw: nil`.
+- `ensureV14TraceSection` — rewritten to use two-phase path.
+- `ensureTraceIndexRaw` — extended with V14 branch guarded by `isV14TraceSection`.
+
+**`parseCompactIndexBytesV14` unchanged:** The full-parse function (used by full readers
+and tests) remains intact. The new header-only path is additive.
+
+**`isV14TraceSection` field on `compactTraceIndex`:** Signals which fetch strategy
+`ensureTraceIndexRaw` should use. V3/V4 lean readers set `traceIndexOffset`/`traceIndexLen`
+and leave `isV14TraceSection: false`. V14 lean readers set `isV14TraceSection: true` and
+leave those fields zero.
+
+Back-ref: `internal/modules/blockio/reader/trace_index.go:splitV14CompactSection`,
+`internal/modules/blockio/reader/trace_index.go:parseCompactIndexBytesV14Header`,
+`internal/modules/blockio/reader/trace_index.go:ensureTraceIndexRaw`,
+`internal/modules/blockio/reader/parser.go:ensureV14TraceSection`,
+`internal/modules/blockio/reader/reader.go:compactTraceIndex`
