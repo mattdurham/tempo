@@ -20,6 +20,7 @@ import (
 	modules_memcache "github.com/grafana/blockpack/internal/modules/memcache"
 	modules_memorycache "github.com/grafana/blockpack/internal/modules/memorycache"
 	modules_rw "github.com/grafana/blockpack/internal/modules/rw"
+	vm "github.com/grafana/blockpack/internal/vm"
 )
 
 // AGENT: Reader types - these provide access to blockpack data.
@@ -251,6 +252,17 @@ func NewLeanReaderWithCache(provider ReaderProvider, fileID string, cache Cache)
 		Cache:  cache,
 		FileID: fileID,
 	})
+}
+
+// NewReaderForProgram returns the optimal Reader for the given program.
+// Programs that require column data (column predicates, streaming, vector scoring)
+// get a full reader. All other programs — including nil — get a lean reader
+// that reads only the compact trace index on bloom hit.
+func NewReaderForProgram(prog *vm.Program, provider ReaderProvider, fileID string, cache Cache) (*Reader, error) {
+	if prog.NeedsColumnData() {
+		return NewReaderWithCache(provider, fileID, cache)
+	}
+	return NewLeanReaderWithCache(provider, fileID, cache)
 }
 
 // GetTraceByID looks up all spans for the given trace ID and returns them.

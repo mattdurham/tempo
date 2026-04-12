@@ -86,10 +86,35 @@ const (
 	defaultContextSize = 2048
 )
 
-// New is not available in this build (yzma/llama.cpp backend not compiled).
-// Use NewHTTP or NewWithBackend instead.
-func New(_ Config) (*Embedder, error) {
-	return nil, fmt.Errorf("embedder: yzma backend not available in this build; use NewHTTP or NewWithBackend")
+// New loads the llama.cpp shared library and the GGUF model, then initializes
+// an embedding context backed by yzma. Returns error if the library or model cannot be loaded.
+//
+// If cfg.ModelPath is empty, DefaultModelPath() is used and AutoDownload is set to true
+// automatically. If cfg.AutoDownload is true and the model file does not exist,
+// EnsureModel is called to download it before loading.
+func New(cfg Config) (*Embedder, error) {
+	if cfg.BatchSize <= 0 {
+		cfg.BatchSize = defaultBatchSize
+	}
+	if cfg.MaxTextLength <= 0 {
+		cfg.MaxTextLength = defaultMaxTextLen
+	}
+	if cfg.ModelPath == "" {
+		cfg.ModelPath = DefaultModelPath()
+		cfg.AutoDownload = true
+	}
+	if cfg.AutoDownload {
+		if err := EnsureModel(cfg); err != nil {
+			return nil, fmt.Errorf("embedder: ensure model: %w", err)
+		}
+	}
+
+	b, err := newYzmaBackend(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Embedder{cfg: cfg, backend: b}, nil
 }
 
 // NewWithBackend creates an Embedder using a caller-supplied Backend implementation.

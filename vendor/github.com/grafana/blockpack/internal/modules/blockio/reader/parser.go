@@ -540,20 +540,45 @@ func (r *Reader) ensureV14RangeSection() error {
 // ensureV14TraceSection lazily loads the V14 trace index section on first call.
 // Populates r.compactParsed so TraceEntries, BlocksForTraceID, and TraceCount work.
 // No-op for non-V14 files (compactParsed is populated by ensureCompactIndexParsed).
+//
+// Two-phase loading: phase 1 reads only the bloom filter + block table (small header, ~KB)
+// so most FindTraceByID lookups pay only that cost. Phase 2 (the full ~50 MB trace index)
+// is deferred to ensureTraceIndexRaw, which is invoked only on a bloom hit.
+//
+// Cache keys:
+//   - Phase 1 header: fileID+"/v14/compact-header"
+//   - Phase 2 trace index bytes: fileID+"/compact-trace-index" (shared with V3/V4 lean path)
 func (r *Reader) ensureV14TraceSection() error {
 	if r.fileVersion != shared.VersionBlockV14 {
 		return nil
 	}
 	r.v14TraceOnce.Do(func() {
-		traceIdxRaw, err := r.readV14Section(shared.SectionTraceIndex)
+		// Two-phase loading: read only bloom+block_table (small) eagerly.
+		// Raw trace index bytes are deferred to ensureTraceIndexRaw on bloom hit.
+		// Cache key for the small header: separate from "/v14/sec/03/dec" (the full section).
+		headerKey := r.fileID + "/v14/compact-header"
+		headerBytes, err := r.cache.GetOrFetch(headerKey, func() ([]byte, error) {
+			raw, readErr := r.readV14Section(shared.SectionTraceIndex)
+			if readErr != nil {
+				return nil, readErr
+			}
+			if len(raw) == 0 {
+				return nil, nil
+			}
+			header, _, splitErr := splitV14CompactSection(raw)
+			if splitErr != nil {
+				return nil, splitErr
+			}
+			return append([]byte(nil), header...), nil
+		})
 		if err != nil {
-			r.v14TraceErr = fmt.Errorf("ensureV14TraceSection: %w", err)
+			r.v14TraceErr = fmt.Errorf("ensureV14TraceSection: header: %w", err)
 			return
 		}
-		if len(traceIdxRaw) == 0 {
+		if len(headerBytes) == 0 {
 			return
 		}
-		if parseErr := r.parseCompactIndexBytesV14(traceIdxRaw); parseErr != nil {
+		if parseErr := r.parseCompactIndexBytesV14Header(headerBytes); parseErr != nil {
 			r.v14TraceErr = fmt.Errorf("ensureV14TraceSection: parse: %w", parseErr)
 		}
 	})

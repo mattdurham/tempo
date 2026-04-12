@@ -275,3 +275,70 @@ Back-ref: `internal/modules/blockio/reader/parser.go:readFooter`,
 `internal/modules/blockio/reader/reader.go:VectorIndex`,
 `internal/modules/blockio/reader/reader.go:VectorIndexRaw`,
 `internal/modules/blockio/reader/vector_index.go:parseVectorIndexSection`
+
+---
+
+## SPEC-010: V14 Two-Phase Compact Trace Index Cache
+*Added: 2026-04-12*
+
+### Overview
+
+V14 lean readers load the compact trace index in two phases to avoid the ~50 MB per-block
+I/O cost of reading the full SectionTraceIndex blob on every `BlocksForTraceID` call.
+
+### Phase 1 — Eager Header Load (~KB)
+
+`ensureV14TraceSection` (called at most once per Reader via `v14TraceOnce`):
+
+1. Invokes `readV14Section(SectionTraceIndex)` to get the decompressed section blob.
+2. Passes it to `splitV14CompactSection` to locate the split point between header and
+   trace index.
+3. Copies and caches the header under `fileID+"/v14/compact-header"`.
+4. Calls `parseCompactIndexBytesV14Header(header)` which sets:
+   - `r.compactParsed.blockTable` — file offsets for each internal block.
+   - `r.compactParsed.traceIDBloom` — the trace ID bloom filter bytes.
+   - `r.compactParsed.isV14TraceSection = true` — signals the V14 phase-2 fetch path.
+   - `r.compactParsed.traceIndexRaw = nil` — not yet loaded.
+5. Also populates `r.blockMetas` if not already set.
+
+**Invariant SPEC-010a:** After `ensureV14TraceSection`, `compactParsed` is non-nil and the
+bloom filter is available. `BlocksForTraceIDCompact` can evaluate bloom filter checks.
+`compactParsed.traceIndexRaw` is nil until a bloom hit triggers phase 2.
+
+### Phase 2 — Lazy Trace Index Load (~50 MB, bloom hit only)
+
+`ensureTraceIndexRaw` (called via `traceIndexOnce`):
+
+1. Detects `compactParsed.isV14TraceSection == true`.
+2. Fetches the trace index bytes via `cache.GetOrFetch(fileID+"/compact-trace-index", ...)`.
+   The fetch function re-invokes `readV14Section(SectionTraceIndex)` (the full decompressed
+   blob is cached by `readV14Section` under `fileID+"/v14/sec/03/dec"`), then calls
+   `splitV14CompactSection` and returns the trace index sub-slice copied into a fresh buffer.
+3. Validates `fmt_version` of the trace index bytes.
+4. Assigns the result to `compactParsed.traceIndexRaw`.
+
+**Invariant SPEC-010b:** Phase 2 runs at most once per Reader (guarded by `traceIndexOnce`).
+`readV14Section` is idempotent (cached) so the re-read in phase 2 does not incur an extra
+network round-trip after the first call.
+
+### Cache Key Mapping
+
+| Cache key                          | Contents                                    | Written by                  |
+|------------------------------------|---------------------------------------------|-----------------------------|
+| `fileID+"/v14/sec/03/dec"`         | Full decompressed SectionTraceIndex blob    | `readV14Section`            |
+| `fileID+"/v14/compact-header"`     | Header sub-slice (bloom + block table only) | `ensureV14TraceSection`     |
+| `fileID+"/compact-trace-index"`    | Trace index bytes                           | `ensureTraceIndexRaw`       |
+
+### `splitV14CompactSection` Contract
+
+- Input: decompressed SectionTraceIndex blob.
+- Output: `(header, traceIndex)` sub-slices of input — no copy.
+- Error: returns error if magic is bad, version is unsupported, data is truncated, or
+  the trace index portion is less than 5 bytes.
+- Callers that cache the header or trace index must copy them (`append([]byte(nil), s...)`).
+
+Back-ref: `internal/modules/blockio/reader/trace_index.go:splitV14CompactSection`,
+`internal/modules/blockio/reader/trace_index.go:parseCompactIndexBytesV14Header`,
+`internal/modules/blockio/reader/trace_index.go:ensureTraceIndexRaw`,
+`internal/modules/blockio/reader/parser.go:ensureV14TraceSection`,
+`internal/modules/blockio/reader/reader.go:compactTraceIndex.isV14TraceSection`

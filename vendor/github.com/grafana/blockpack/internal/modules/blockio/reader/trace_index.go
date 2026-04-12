@@ -18,6 +18,150 @@ type compactBlockEntry struct {
 	fileLength uint32
 }
 
+// splitV14CompactSection splits a V14 compact trace section blob into its two logical parts:
+// the "header" (magic + version + block_count + optional bloom + block_table) and the
+// "trace index" (fmt_version[1] + trace_count[4] + ... to end of blob).
+//
+// The split point is computed by parsing the fixed-layout fields up through the block table.
+// Returns sub-slices of data (no copy); callers that need to retain the header or trace index
+// after the source buffer is released must copy them explicitly.
+//
+// Returns an error if data is too short, has a bad magic number, or has an unsupported version.
+// Also returns an error if the trace index portion is less than 5 bytes.
+func splitV14CompactSection(data []byte) (header []byte, traceIndex []byte, err error) {
+	if len(data) < 9 {
+		return nil, nil, fmt.Errorf("v14 compact section: too short (%d bytes)", len(data))
+	}
+
+	magic := binary.LittleEndian.Uint32(data[0:])
+	if magic != shared.CompactIndexMagic {
+		return nil, nil, fmt.Errorf("v14 compact section: bad magic 0x%08X", magic)
+	}
+
+	version := data[4]
+	if version != shared.CompactIndexVersion && version != shared.CompactIndexVersion2 {
+		return nil, nil, fmt.Errorf("v14 compact section: unsupported version %d", version)
+	}
+
+	blockCount := int(binary.LittleEndian.Uint32(data[5:])) //nolint:gosec
+	if blockCount > shared.MaxBlocks {
+		return nil, nil, fmt.Errorf("v14 compact section: block_count %d exceeds maximum %d", blockCount, shared.MaxBlocks)
+	}
+	pos := 9
+
+	if version == shared.CompactIndexVersion2 {
+		if pos+4 > len(data) {
+			return nil, nil, fmt.Errorf("v14 compact section: short for bloom_bytes")
+		}
+		bloomBytes := int(binary.LittleEndian.Uint32(data[pos:])) //nolint:gosec
+		pos += 4
+		if bloomBytes > shared.TraceIDBloomMaxBytes {
+			return nil, nil, fmt.Errorf("v14 compact section: bloom_bytes %d exceeds maximum %d", bloomBytes, shared.TraceIDBloomMaxBytes)
+		}
+		if pos+bloomBytes > len(data) {
+			return nil, nil, fmt.Errorf("v14 compact section: short for bloom_data (need %d bytes)", bloomBytes)
+		}
+		pos += bloomBytes
+	}
+
+	// Skip block table: block_count × 12 bytes.
+	need := blockCount * 12
+	if pos+need > len(data) {
+		return nil, nil, fmt.Errorf("v14 compact section: short for block_table (need %d)", need)
+	}
+	pos += need
+
+	// pos now points at the start of the trace index (fmt_version[1] + ...).
+	if len(data)-pos < 5 {
+		return nil, nil, fmt.Errorf("v14 compact section: trace_index too short (%d bytes)", len(data)-pos)
+	}
+
+	return data[:pos], data[pos:], nil
+}
+
+// parseCompactIndexBytesV14Header parses only the header portion of a V14 compact trace section:
+// magic + version + block_count + optional bloom filter + block table.
+// The trace index bytes are NOT parsed; instead isV14TraceSection is set on compactParsed so
+// ensureTraceIndexRaw will fetch and split them lazily on a bloom hit (phase-2 I/O).
+//
+// Also populates r.blockMetas from the block table if it is not already populated.
+//
+// The input header bytes must have been produced by splitV14CompactSection (header sub-slice).
+func (r *Reader) parseCompactIndexBytesV14Header(header []byte) error {
+	if len(header) < 9 {
+		return fmt.Errorf("v14 compact header: too short (%d bytes)", len(header))
+	}
+
+	magic := binary.LittleEndian.Uint32(header[0:])
+	if magic != shared.CompactIndexMagic {
+		return fmt.Errorf("v14 compact header: bad magic 0x%08X", magic)
+	}
+
+	version := header[4]
+	if version != shared.CompactIndexVersion && version != shared.CompactIndexVersion2 {
+		return fmt.Errorf("v14 compact header: unsupported version %d", version)
+	}
+
+	blockCount := int(binary.LittleEndian.Uint32(header[5:])) //nolint:gosec
+	if blockCount > shared.MaxBlocks {
+		return fmt.Errorf("v14 compact header: block_count %d exceeds maximum %d", blockCount, shared.MaxBlocks)
+	}
+	pos := 9
+
+	var traceIDBloom []byte
+	if version == shared.CompactIndexVersion2 {
+		if pos+4 > len(header) {
+			return fmt.Errorf("v14 compact header: short for bloom_bytes")
+		}
+		bloomBytes := int(binary.LittleEndian.Uint32(header[pos:])) //nolint:gosec
+		pos += 4
+		if bloomBytes > shared.TraceIDBloomMaxBytes {
+			return fmt.Errorf("v14 compact header: bloom_bytes %d exceeds maximum %d", bloomBytes, shared.TraceIDBloomMaxBytes)
+		}
+		if pos+bloomBytes > len(header) {
+			return fmt.Errorf("v14 compact header: short for bloom_data (need %d bytes)", bloomBytes)
+		}
+		traceIDBloom = make([]byte, bloomBytes)
+		copy(traceIDBloom, header[pos:pos+bloomBytes])
+		pos += bloomBytes
+	}
+
+	need := blockCount * 12
+	if pos+need > len(header) {
+		return fmt.Errorf("v14 compact header: short for block_table (need %d)", need)
+	}
+
+	blockTable := make([]compactBlockEntry, blockCount)
+	for i := range blockCount {
+		blockTable[i] = compactBlockEntry{
+			fileOffset: binary.LittleEndian.Uint64(header[pos:]),
+			fileLength: binary.LittleEndian.Uint32(header[pos+8:]),
+		}
+		pos += 12
+	}
+
+	r.compactParsed = &compactTraceIndex{
+		blockTable:        blockTable,
+		traceIDBloom:      traceIDBloom,
+		traceIndexRaw:     nil, // fetched lazily on bloom hit via ensureTraceIndexRaw
+		isV14TraceSection: true,
+	}
+
+	// Populate blockMetas from the compact block table so ReadBlockRaw,
+	// CoalescedGroups, and other block-access methods work for lean readers.
+	if len(r.blockMetas) == 0 {
+		r.blockMetas = make([]shared.BlockMeta, len(blockTable))
+		for i, entry := range blockTable {
+			r.blockMetas[i] = shared.BlockMeta{
+				Offset: entry.fileOffset,
+				Length: uint64(entry.fileLength),
+			}
+		}
+	}
+
+	return nil
+}
+
 // parseCompactIndexBytesV14 parses the compact trace index blob for V14 files.
 // The blob has the same format as the V13 compact index section:
 // magic[4]+version[1]+block_count[4]+[bloom_bytes[4]+bloom_data[N] for v2]+block_table[M×12]+trace_index.
@@ -494,6 +638,8 @@ func (r *Reader) ensureCompactHeaderParsedV3() error {
 // Called only after a bloom-filter hit — for the vast majority of lookups (bloom miss)
 // this is never invoked, keeping peak RSS at ~15 MB instead of ~700 MB per file open.
 //
+// For V14 files, the trace index is extracted from the full SectionTraceIndex blob via
+// splitV14CompactSection (see isV14TraceSection on compactTraceIndex).
 // For v3 split format files (footer V6), the trace index is snappy-compressed at
 // compactTracesOffset/compactTracesLen and must be decompressed before use.
 // For v1/v2 format files, the trace index bytes are raw (uncompressed).
@@ -510,14 +656,27 @@ func (r *Reader) ensureTraceIndexRaw() error {
 		return nil
 	}
 
-	// Also fast path if no lazy-load location is recorded (shouldn't happen in normal flow).
-	if r.compactParsed.traceIndexLen == 0 {
+	// Also fast path if no lazy-load location is recorded (V3/V4 path) and not V14.
+	if r.compactParsed.traceIndexLen == 0 && !r.compactParsed.isV14TraceSection {
 		return fmt.Errorf("compact index: trace_index location not recorded")
 	}
 
 	r.compactParsed.traceIndexOnce.Do(func() {
 		cacheKey := r.fileID + "/compact-trace-index"
 		data, err := r.cache.GetOrFetch(cacheKey, func() ([]byte, error) {
+			if r.compactParsed.isV14TraceSection {
+				// V14: re-read the full trace section and extract trace index bytes.
+				raw, readErr := r.readV14Section(shared.SectionTraceIndex)
+				if readErr != nil {
+					return nil, readErr
+				}
+				_, traceIdx, splitErr := splitV14CompactSection(raw)
+				if splitErr != nil {
+					return nil, splitErr
+				}
+				return append([]byte(nil), traceIdx...), nil
+			}
+			// V3/V4: read from known file offset.
 			return r.readRange(
 				r.compactParsed.traceIndexOffset,
 				r.compactParsed.traceIndexLen,
@@ -534,7 +693,7 @@ func (r *Reader) ensureTraceIndexRaw() error {
 		}
 
 		// V3 split format: trace index is snappy-compressed.
-		// V1/V2 format: trace index bytes are raw (uncompressed).
+		// V1/V2 format and V14 (already extracted above): trace index bytes are raw (uncompressed).
 		var rawData []byte
 		if r.compactTracesLen > 0 {
 			// V3: snappy-decompress the compact traces section.
@@ -545,7 +704,7 @@ func (r *Reader) ensureTraceIndexRaw() error {
 			}
 			rawData = decoded
 		} else {
-			// V1/V2: raw bytes.
+			// V1/V2/V14: raw bytes (V14 bytes were already extracted by splitV14CompactSection).
 			rawData = data
 		}
 

@@ -35,6 +35,13 @@ type footerRaw struct {
 // Instead, traceIndexOffset/traceIndexLen record where the trace index bytes live in the file so
 // they can be fetched lazily — only when the bloom filter reports a hit. This keeps the eager read
 // at ~15 MB (bloom + block table) instead of ~700 MB (full compact section).
+//
+// NOTE-V14-TRACE-LAZY: For V14 lean readers, isV14TraceSection signals that traceIndexRaw must
+// be fetched by re-reading the full V14 SectionTraceIndex, splitting out the trace index bytes
+// via splitV14CompactSection, and caching them. Unlike V3/V4 (which record a direct file offset),
+// V14 stores the compact section as a single snappy-compressed blob, so a direct range read is
+// not available — the full blob must be fetched, split, and the trace index portion extracted.
+// ensureTraceIndexRaw uses isV14TraceSection to select the correct fetch path.
 type compactTraceIndex struct {
 	// traceIndexFetchErr holds any error from the lazy fetch so callers can surface it.
 	traceIndexFetchErr error
@@ -47,6 +54,12 @@ type compactTraceIndex struct {
 	// Both are zero when traceIndexRaw is already populated (full compact read path).
 	traceIndexOffset uint64
 	traceIndexLen    uint64
+
+	// isV14TraceSection signals that this compactTraceIndex was populated from a V14 file's
+	// SectionTraceIndex compact blob (via parseCompactIndexBytesV14Header). When true,
+	// ensureTraceIndexRaw re-reads the full V14 section and extracts the trace index bytes
+	// via splitV14CompactSection, instead of using traceIndexOffset/traceIndexLen.
+	isV14TraceSection bool
 
 	// traceIndexOnce guards the lazy fetch of traceIndexRaw.
 	traceIndexOnce sync.Once
