@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -33,18 +34,24 @@ type HTTPConfig struct {
 	// 0 means no chunking (use the server's limit — may return 422 for large batches).
 	// Defaults to 32 when set to 0 via NewHTTP, matching TEI's typical default limit.
 	MaxBatchSize int
+	// MaxConcurrentBatches is the maximum number of batch requests to issue concurrently.
+	// When > 1, EmbedBatch sends multiple chunks in parallel, distributing load across
+	// multiple embed-server pods. Defaults to 8 when set to 0 via NewHTTP.
+	MaxConcurrentBatches int
 }
 
-const defaultMaxBatchSize = 32 // TEI default max_batch_tokens / typical per-request limit
+const defaultMaxBatchSize = 32         // TEI default max_batch_tokens / typical per-request limit
+const defaultMaxConcurrentBatches = 8  // concurrently hit up to 8 embed-server pods
 
 // httpBackend implements Backend by forwarding requests to an embedding server over HTTP.
 // Supports the TEI protocol: POST /embed with {"inputs": [...], "normalize": true}
 // Response: [[float, ...], ...] — flat array of vectors.
 type httpBackend struct {
-	client       *http.Client
-	serverURL    string
-	dim          int
-	maxBatchSize int // max texts per request; 0 means no chunking
+	client               *http.Client
+	serverURL            string
+	dim                  int
+	maxBatchSize         int // max texts per request; 0 means no chunking
+	maxConcurrentBatches int // max parallel requests; 1 means sequential
 }
 
 // teiRequest is the JSON request body for TEI's POST /embed.
@@ -69,6 +76,10 @@ func NewHTTP(cfg HTTPConfig) (*Embedder, error) {
 	if maxBatch <= 0 {
 		maxBatch = defaultMaxBatchSize
 	}
+	maxConc := cfg.MaxConcurrentBatches
+	if maxConc <= 0 {
+		maxConc = defaultMaxConcurrentBatches
+	}
 	b := &httpBackend{
 		serverURL: cfg.ServerURL,
 		client: &http.Client{
@@ -78,7 +89,8 @@ func NewHTTP(cfg HTTPConfig) (*Embedder, error) {
 			// with keep-alives all batches would go to the same pod.
 			Transport: &http.Transport{DisableKeepAlives: true},
 		},
-		maxBatchSize: maxBatch,
+		maxBatchSize:         maxBatch,
+		maxConcurrentBatches: maxConc,
 	}
 
 	// Probe with a single short text to determine dimension.
@@ -113,6 +125,7 @@ func (b *httpBackend) Embed(text string) ([]float32, error) {
 }
 
 // EmbedBatch sends texts to the server, chunking into maxBatchSize requests when needed.
+// Up to maxConcurrentBatches chunks are sent in parallel to distribute load across pods.
 // Returns one vector per input text in the same order.
 func (b *httpBackend) EmbedBatch(texts []string) ([][]float32, error) {
 	if len(texts) == 0 {
@@ -124,31 +137,69 @@ func (b *httpBackend) EmbedBatch(texts []string) ([][]float32, error) {
 		chunkSize = len(texts) // no chunking
 	}
 
-	all := make([][]float32, 0, len(texts))
+	// Build chunk index: each entry is the start offset into texts.
+	type chunk struct {
+		start int
+		end   int
+	}
+	var chunks []chunk
 	for start := 0; start < len(texts); start += chunkSize {
 		end := start + chunkSize
 		if end > len(texts) {
 			end = len(texts)
 		}
-		chunk := texts[start:end]
+		chunks = append(chunks, chunk{start, end})
+	}
 
-		vecs, err := b.sendBatch(chunk)
+	// Pre-allocate result slice so goroutines can write by index without locking.
+	results := make([]*[][]float32, len(chunks))
+	errs := make([]error, len(chunks))
+
+	// Semaphore to cap in-flight requests at maxConcurrentBatches.
+	sem := make(chan struct{}, b.maxConcurrentBatches)
+	var wg sync.WaitGroup
+	for i, c := range chunks {
+		i, c := i, c
+		sem <- struct{}{}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			vecs, err := b.sendBatch(texts[c.start:c.end])
+			if err != nil {
+				errs[i] = fmt.Errorf("chunk %d: %w", i, err)
+				return
+			}
+			results[i] = &vecs
+		}()
+	}
+	wg.Wait()
+
+	// Check for errors; report the first one found.
+	for i, err := range errs {
 		if err != nil {
 			return nil, fmt.Errorf("embedder http: embed batch: %w", err)
 		}
-		if len(vecs) != len(chunk) {
-			return nil, fmt.Errorf("embedder http: server returned %d vectors for %d texts", len(vecs), len(chunk))
+		vecs := *results[i]
+		c := chunks[i]
+		if len(vecs) != c.end-c.start {
+			return nil, fmt.Errorf("embedder http: server returned %d vectors for %d texts", len(vecs), c.end-c.start)
 		}
 		if b.dim > 0 {
-			for i, v := range vecs {
+			for j, v := range vecs {
 				if len(v) != b.dim {
-					return nil, fmt.Errorf("embedder http: vector[%d] has length %d, expected %d", start+i, len(v), b.dim)
+					return nil, fmt.Errorf("embedder http: vector[%d] has length %d, expected %d", c.start+j, len(v), b.dim)
 				}
 			}
 		}
-		all = append(all, vecs...)
 	}
 
+	// Flatten results in order.
+	all := make([][]float32, 0, len(texts))
+	for i := range chunks {
+		all = append(all, *results[i]...)
+	}
 	return all, nil
 }
 
