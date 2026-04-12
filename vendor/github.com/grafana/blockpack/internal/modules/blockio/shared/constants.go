@@ -89,8 +89,11 @@ const (
 	// TraceIDBloomMinBytes is the minimum trace ID bloom filter size in bytes.
 	TraceIDBloomMinBytes = 128
 
-	// TraceIDBloomMaxBytes is the maximum trace ID bloom filter size in bytes (1 MiB cap).
-	TraceIDBloomMaxBytes = 1 << 20
+	// TraceIDBloomMaxBytes is the maximum trace ID bloom filter size in bytes (6 MiB cap).
+	// At k=7 and 6 MiB, FPR stays under 1% for up to ~7.9M traces/block, giving
+	// ≤350ms warm FindTraceByID with 59 blocks (expected 0.35 false-positive reads/lookup).
+	// Previous cap was 1 MiB, which saturated at ~875K traces (~50% FPR for 2.8M-trace blocks).
+	TraceIDBloomMaxBytes = 6 << 20
 )
 
 // Intrinsic columns section constants.
