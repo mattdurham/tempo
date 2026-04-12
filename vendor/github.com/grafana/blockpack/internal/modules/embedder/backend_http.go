@@ -70,8 +70,14 @@ func NewHTTP(cfg HTTPConfig) (*Embedder, error) {
 		maxBatch = defaultMaxBatchSize
 	}
 	b := &httpBackend{
-		serverURL:    cfg.ServerURL,
-		client:       &http.Client{Timeout: timeout},
+		serverURL: cfg.ServerURL,
+		client: &http.Client{
+			Timeout: timeout,
+			// Disable keep-alives so each request gets a fresh connection.
+			// kube-proxy (iptables) load-balances per connection, not per request;
+			// with keep-alives all batches would go to the same pod.
+			Transport: &http.Transport{DisableKeepAlives: true},
+		},
 		maxBatchSize: maxBatch,
 	}
 
