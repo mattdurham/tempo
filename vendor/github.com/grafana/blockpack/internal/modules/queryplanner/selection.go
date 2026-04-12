@@ -5,28 +5,45 @@ package queryplanner
 import "sort"
 
 // intersectBySelectivity intersects a slice of non-nil block sets in selectivity order
-// (smallest set first) to minimise intermediate result sizes. The caller must filter out
-// nil (unconstrained) sets before calling; nil maps in sets produce a panic.
+// (smallest set first) to minimize intermediate result sizes. All sets in the slice
+// must be non-nil; a nil entry triggers an explicit panic (see below).
 //
 // Returns nil when sets is empty (no constrained predicates → no pruning possible).
 // Returns the intersection result, which may be a non-nil empty map when a constrained
 // predicate matched no blocks (all candidates should be pruned for an AND predicate).
 //
-// NOTE-019: Intersecting in order of ascending set size (most selective first) minimises
-// the work done at each step: starting from the smallest set means subsequent intersections
-// iterate over fewer elements. For the common case of A && (B || C) where A is indexed on
-// a selective column and OR(B,C) is wide, processing A first prunes the block list to a
-// small set before OR(B,C) further intersects — rather than building the full OR union and
-// then reducing it.
+// The input maps are never mutated — a fresh result map is allocated from a copy of
+// sets[0] (the smallest set after internal sort). Callers may safely reuse their maps
+// after this call.
+//
+// NOTE-019: The OR union for each child is computed eagerly before this function is
+// called; intersectBySelectivity sorts the resulting sets by size so the smallest
+// (most selective) is iterated first for each delete pass. This minimizes the number
+// of elements iterated at each step: if the most selective predicate produces a set of
+// size S, all subsequent intersections iterate at most S elements regardless of the
+// sizes of the other sets.
 func intersectBySelectivity(sets []map[int]struct{}) map[int]struct{} {
 	if len(sets) == 0 {
 		return nil
+	}
+	// Enforce non-nil precondition explicitly. A nil entry represents an unconstrained
+	// set (all blocks are candidates); the caller is responsible for filtering these out
+	// before calling. Ranging over a nil map silently produces an empty copy, which
+	// would incorrectly prune all blocks rather than leaving them unconstrained.
+	for _, s := range sets {
+		if s == nil {
+			panic("intersectBySelectivity: nil (unconstrained) set in input — callers must skip this call or filter nil sets before calling")
+		}
 	}
 	// Sort ascending by size: smallest (most selective) first.
 	sort.Slice(sets, func(i, j int) bool {
 		return len(sets[i]) < len(sets[j])
 	})
-	result := sets[0]
+	// Copy sets[0] so we never mutate caller-owned maps.
+	result := make(map[int]struct{}, len(sets[0]))
+	for k := range sets[0] {
+		result[k] = struct{}{}
+	}
 	for _, set := range sets[1:] {
 		for b := range result {
 			if _, ok := set[b]; !ok {

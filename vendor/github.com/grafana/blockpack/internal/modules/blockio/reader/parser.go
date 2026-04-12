@@ -318,6 +318,8 @@ func (r *Reader) readFooterV3(cacheKey string) error {
 // readSectionDirectory reads and decodes the V14 section directory.
 // Called after readFooter() when footerVersion == FooterV7Version.
 // Returns a SectionDirectory with TypeEntries and NameEntries populated.
+// Decompressed bytes are cached via r.cache (key: fileID+"/v14/sec-dir/dec") so repeated
+// reader creation for the same file avoids the GCS round-trip on warm cache.
 func (r *Reader) readSectionDirectory() (shared.SectionDirectory, error) {
 	if r.v7DirLen == 0 {
 		return shared.SectionDirectory{
@@ -326,14 +328,16 @@ func (r *Reader) readSectionDirectory() (shared.SectionDirectory, error) {
 		}, nil
 	}
 
-	compressed, err := r.readRange(r.v7DirOffset, uint64(r.v7DirLen), rw.DataTypeMetadata) //nolint:gosec // safe: v7DirLen is a file offset length, fits in uint64
+	cacheKey := r.fileID + "/v14/sec-dir/dec"
+	raw, err := r.cache.GetOrFetch(cacheKey, func() ([]byte, error) {
+		compressed, readErr := r.readRange(r.v7DirOffset, uint64(r.v7DirLen), rw.DataTypeMetadata) //nolint:gosec // safe: v7DirLen is a file offset length, fits in uint64
+		if readErr != nil {
+			return nil, readErr
+		}
+		return decodeBoundedSnappy(compressed)
+	})
 	if err != nil {
-		return shared.SectionDirectory{}, fmt.Errorf("readSectionDirectory: read: %w", err)
-	}
-
-	raw, err := decodeBoundedSnappy(compressed)
-	if err != nil {
-		return shared.SectionDirectory{}, fmt.Errorf("readSectionDirectory: snappy decode: %w", err)
+		return shared.SectionDirectory{}, fmt.Errorf("readSectionDirectory: %w", err)
 	}
 
 	if len(raw) < 4 {
@@ -442,6 +446,8 @@ func (r *Reader) parseSectionsLazyV14() error {
 	// Each blob on disk is snappy-compressed; the reader snappy-decodes it in GetIntrinsicColumn.
 	// We peek format and count from each blob here so the executor fast path can dispatch on
 	// meta.Format without a full decode (SPEC-V14-001: Format/Count must be populated at open time).
+	// Compressed blobs are cached via r.cache (key: fileID+"/v14/intr/<name>") to avoid
+	// repeated GCS round-trips when creating a new Reader for the same file.
 	if len(r.sectionDir.NameEntries) > 0 {
 		r.intrinsicIndex = make(map[string]shared.IntrinsicColMeta, len(r.sectionDir.NameEntries))
 		for name, e := range r.sectionDir.NameEntries {
@@ -453,7 +459,13 @@ func (r *Reader) parseSectionsLazyV14() error {
 			// Read the compressed blob to peek format/type/count; errors are non-fatal (fields stay 0).
 			// PeekIntrinsicBlobHeader reads the first byte to distinguish paged blobs (0x02 sentinel,
 			// raw pages) from non-paged blobs (snappy-compressed).
-			if blob, readErr := r.readRange(e.Offset, uint64(e.CompressedLen), rw.DataTypeMetadata); readErr == nil { //nolint:gosec
+			// Use the same key as GetIntrinsicColumnBlob so both operations share
+			// one cached entry per column per file.
+			cacheKey := fmt.Sprintf("%s/intrinsic/%s", r.fileID, name)
+			blob, readErr := r.cache.GetOrFetch(cacheKey, func() ([]byte, error) {
+				return r.readRange(e.Offset, uint64(e.CompressedLen), rw.DataTypeMetadata) //nolint:gosec
+			})
+			if readErr == nil {
 				if f, ct, cnt, peekErr := shared.PeekIntrinsicBlobHeader(blob); peekErr == nil && f != 0 {
 					meta.Format = f
 					meta.Type = ct
@@ -469,20 +481,26 @@ func (r *Reader) parseSectionsLazyV14() error {
 
 // readV14Section reads and snappy-decodes one type-keyed section from the section directory.
 // Returns (nil, nil) if the section is not present in the directory.
+// Decompressed bytes are cached via r.cache (key: fileID+"/v14/sec/<hex>/dec") so repeated
+// reader creation for the same file avoids re-reading and re-decompressing the section.
 func (r *Reader) readV14Section(sectionType uint8) ([]byte, error) {
 	e, ok := r.sectionDir.TypeEntries[sectionType]
 	if !ok {
 		return nil, nil
 	}
-	compressed, err := r.readRange(e.Offset, uint64(e.CompressedLen), rw.DataTypeMetadata) //nolint:gosec
-	if err != nil {
-		return nil, fmt.Errorf("section 0x%02X read: %w", sectionType, err)
-	}
-	raw, err := decodeBoundedSnappy(compressed)
-	if err != nil {
-		return nil, fmt.Errorf("section 0x%02X snappy: %w", sectionType, err)
-	}
-	return raw, nil
+	cacheKey := fmt.Sprintf("%s/v14/sec/%02x/dec", r.fileID, sectionType)
+	raw, err := r.cache.GetOrFetch(cacheKey, func() ([]byte, error) {
+		compressed, readErr := r.readRange(e.Offset, uint64(e.CompressedLen), rw.DataTypeMetadata) //nolint:gosec
+		if readErr != nil {
+			return nil, fmt.Errorf("section 0x%02X read: %w", sectionType, readErr)
+		}
+		dec, decErr := decodeBoundedSnappy(compressed)
+		if decErr != nil {
+			return nil, fmt.Errorf("section 0x%02X snappy: %w", sectionType, decErr)
+		}
+		return dec, nil
+	})
+	return raw, err
 }
 
 // ensureV14RangeSection lazily loads the V14 range index section on first call.

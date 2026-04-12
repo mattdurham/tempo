@@ -70,23 +70,17 @@ type CollectOptions struct {
 	// Empty string disables per-row filtering (trace mode).
 	// "log:timestamp" enables per-row filtering (log mode).
 	TimestampColumn string
-	TimeRange       queryplanner.TimeRange
-	Limit           int
-	// Direction controls block traversal order. Default (zero value) is Forward.
-	Direction queryplanner.Direction
-	// NOTE-028: AllColumns controls second-pass decode scope.
-	// false (default): second pass decodes searchMetaColumns ∪ wantColumns (predicate columns).
-	// true: second pass decodes all columns. Only needed when the callback calls IterateFields()
-	// to enumerate every attribute. Search queries never need this.
-	AllColumns bool
-	// SelectColumns limits the scan to only these column names, in addition to predicate and
-	// search-meta columns. When the program has no column predicates (e.g. "{}"), wantColumns
-	// would normally be nil (decode all columns). If SelectColumns is non-empty, it is merged
-	// into wantColumns so that only the requested output columns are decoded from block blobs,
-	// skipping all others. This is the storage-level column projection path.
-	// NOTE: SelectColumns entries are always added to wantColumns; they never restrict columns
-	// that predicates already require.
+	// SelectColumns limits which output columns are decoded from block blobs.
+	// Two-path strategy (see stream.go Collect for implementation):
+	//   - No predicate columns (e.g. "{}"): SelectColumns becomes the sole first-pass filter,
+	//     preventing all other columns from being decoded on every scanned block.
+	//   - Predicate columns present: SelectColumns is deferred to the second parse pass so
+	//     output-only columns are only decoded for blocks that match the filter, not for every
+	//     scanned block. Predicate columns are always included regardless of this list.
+	// NOTE: When AllColumns=true, SelectColumns has no effect (see AllColumns doc above).
 	SelectColumns []string
+	TimeRange     queryplanner.TimeRange
+	Limit         int
 	// StartBlock is the first internal block index to include (0-based, inclusive).
 	// Used by the frontend sharder to partition a single file across multiple jobs.
 	// 0 with BlockCount==0 means scan all blocks (no sub-file sharding).
@@ -94,6 +88,19 @@ type CollectOptions struct {
 	// BlockCount is the number of internal blocks to include starting from StartBlock.
 	// 0 means no sub-file sharding (scan all blocks selected by the planner).
 	BlockCount int
+	// Direction controls block traversal order. Default (zero value) is Forward.
+	Direction queryplanner.Direction
+	// NOTE-028: AllColumns controls second-pass decode scope.
+	// false (default): second pass decodes searchMetaColumns ∪ wantColumns (predicate columns).
+	// true: second pass decodes all columns. Only needed when the callback calls IterateFields()
+	// to enumerate every attribute. Search queries never need this.
+	// NOTE: When AllColumns=true, computeColumnFilters returns early after computing wantColumns
+	// (predicate columns only) and sets secondPassCols=nil. A nil secondPassCols causes the second
+	// parse pass to decode all columns unconditionally. For queries with predicate columns,
+	// SelectColumns is NOT in wantColumns (it would normally be deferred to secondPassCols), so
+	// output-only columns are not pre-decoded in the first pass either. Net effect: AllColumns=true
+	// guarantees full column availability after the second pass; SelectColumns has no influence.
+	AllColumns bool
 }
 
 // MatchedRow holds a single row result from Collect.
@@ -115,6 +122,51 @@ type MatchedRow struct {
 // SPEC-STREAM-2: Blocks are fetched lazily via CoalescedGroups/ReadGroup (~8 MB per I/O).
 // SPEC-STREAM-3: FetchedBlocks <= SelectedBlocks; early stop skips unfetched groups.
 // SPEC-STREAM-4: TimestampColumn == "" disables per-row time filtering (trace mode).
+// computeColumnFilters derives wantColumns (first-pass eager-decode set) and secondPassCols
+// (second-pass decode set) from the program and CollectOptions.
+//
+// SelectColumns two-path strategy (see CollectOptions.SelectColumns):
+//   - No predicate columns (wantColumns == nil, e.g. "{}"): promote SelectColumns to the sole
+//     first-pass filter so only the requested output columns are decoded from every block blob.
+//   - Predicate columns present: do NOT add SelectColumns to wantColumns — output-only columns
+//     are deferred to secondPassCols so they are decoded only for blocks that match the filter.
+func computeColumnFilters(program *vm.Program, opts CollectOptions) (wantColumns, secondPassCols map[string]struct{}) {
+	wantColumns = ProgramWantColumns(program)
+	if len(opts.SelectColumns) > 0 && wantColumns == nil {
+		wantColumns = make(map[string]struct{}, len(opts.SelectColumns))
+		for _, col := range opts.SelectColumns {
+			wantColumns[col] = struct{}{}
+		}
+	}
+	// NOTE-028: secondPassCols is nil when AllColumns=true or there is no column filter.
+	if wantColumns == nil || opts.AllColumns {
+		return
+	}
+	searchCols := searchMetaCols
+	secondPassCols = make(map[string]struct{}, len(searchCols)+len(wantColumns)+len(opts.SelectColumns)+2)
+	for k := range searchCols {
+		secondPassCols[k] = struct{}{}
+	}
+	for k := range wantColumns {
+		secondPassCols[k] = struct{}{}
+	}
+	// When predicate columns are present, SelectColumns was deferred from wantColumns.
+	// Add them here so they are decoded in the second pass (matching blocks only).
+	for _, col := range opts.SelectColumns {
+		secondPassCols[col] = struct{}{}
+	}
+	// NOTE-050: Include trace intrinsic columns for lookupIntrinsicFields (trace:id, span:id,
+	// span:start, span:name etc.) and the sort timestamp column for Case B (TopK) ordering.
+	for k := range traceIntrinsicColumns {
+		secondPassCols[k] = struct{}{}
+	}
+	if opts.TimestampColumn != "" {
+		secondPassCols[opts.TimestampColumn] = struct{}{}
+	}
+	return
+}
+
+// Collect executes program against all blocks in r and returns matched rows.
 // SPEC-STREAM-5: Direction is applied at plan time; rows are reversed within each block for Backward.
 // SPEC-STREAM-6: QueryStats is returned as the third return value with execution metrics.
 func Collect(
@@ -146,55 +198,7 @@ func Collect(
 
 	queryStart := time.Now()
 
-	wantColumns := ProgramWantColumns(program)
-	// SelectColumns projection: when SelectColumns is set, merge its entries into wantColumns
-	// so that only those columns (plus predicate columns) are eagerly decoded from block blobs.
-	// When there are no predicate columns (wantColumns == nil, e.g. "{}"), this promotes
-	// SelectColumns to the sole filter, skipping readColumnEncoding for all other columns.
-	// When predicates already constrain wantColumns, SelectColumns is unioned in so that
-	// second-pass output columns benefit from the same lazy-decode optimisation.
-	if len(opts.SelectColumns) > 0 {
-		if wantColumns == nil {
-			wantColumns = make(map[string]struct{}, len(opts.SelectColumns))
-		}
-		for _, col := range opts.SelectColumns {
-			wantColumns[col] = struct{}{}
-		}
-	}
-
-	// NOTE-028: Compute secondPassCols once — wantColumns and opts.AllColumns are loop-invariant.
-	// nil means decode all columns (AllColumns=true or no column filter).
-	var secondPassCols map[string]struct{}
-	if wantColumns != nil && !opts.AllColumns {
-		searchCols := searchMetaCols
-		// Always include trace identity columns so lookupIntrinsicFields returns trace:id
-		// and span:id for SpanMatchFromRow. These columns are stored exclusively in the
-		// intrinsic TOC section (NOTE-050); ParseBlockFromBytes returns nil for them.
-		secondPassCols = make(map[string]struct{}, len(searchCols)+len(wantColumns)+2)
-		for k := range searchCols {
-			secondPassCols[k] = struct{}{}
-		}
-		for k := range wantColumns {
-			secondPassCols[k] = struct{}{}
-		}
-		// NOTE-050: Include all trace intrinsic columns for lookupIntrinsicFields.
-		// searchMetaCols was trimmed to log-only; trace intrinsics must be injected here
-		// so IntrinsicFields rows contain trace:id, span:id, span:start, span:name, etc.
-		// With dual storage (restored after PR #172 rollback), new files store intrinsic
-		// columns in block payloads too, but ParseBlockFromBytes still returns nil for
-		// them when names are not in wantColumns. For backward compatibility with files
-		// written between the PR #172 merge and this fix (intrinsic-only storage),
-		// identity values must come from lookupIntrinsicFields; nilIntrinsicScan handles
-		// absent block columns for those files.
-		for k := range traceIntrinsicColumns {
-			secondPassCols[k] = struct{}{}
-		}
-		// Include the sort timestamp column so Case B (TopK) IntrinsicFields
-		// contains the timestamp value used for ordering and time-range filtering.
-		if opts.TimestampColumn != "" {
-			secondPassCols[opts.TimestampColumn] = struct{}{}
-		}
-	}
+	wantColumns, secondPassCols := computeColumnFilters(program, opts)
 
 	// Intrinsic pre-filter fast path: for queries with at least one intrinsic predicate
 	// (resource.service.name, span:duration, span:kind, etc.) and a limit, read only the
