@@ -16,8 +16,8 @@ import (
 const defaultHTTPTimeout = 120 * time.Second
 
 // sendBatchMaxRetries is the number of times sendBatch retries on transient errors
-// (timeout, connection reset, 5xx) before propagating the error.
-const sendBatchMaxRetries = 3
+// (timeout, connection reset, EOF, 5xx) before propagating the error.
+const sendBatchMaxRetries = 5
 
 // HTTPConfig configures the HTTP embedding backend.
 type HTTPConfig struct {
@@ -41,7 +41,7 @@ type HTTPConfig struct {
 }
 
 const defaultMaxBatchSize = 32         // TEI default max_batch_tokens / typical per-request limit
-const defaultMaxConcurrentBatches = 8  // concurrently hit up to 8 embed-server pods
+const defaultMaxConcurrentBatches = 4  // concurrently hit up to 4 embed-server pods
 
 // httpBackend implements Backend by forwarding requests to an embedding server over HTTP.
 // Supports the TEI protocol: POST /embed with {"inputs": [...], "normalize": true}
@@ -220,7 +220,9 @@ func (b *httpBackend) sendBatch(texts []string) ([][]float32, error) {
 	var lastErr error
 	for attempt := range sendBatchMaxRetries {
 		if attempt > 0 {
-			time.Sleep(time.Duration(attempt*attempt) * time.Second) // 1s, 4s backoff
+			// Backoff: 2s, 5s, 10s, 17s — gives crashing pods time to restart and
+			// become Ready before kube-proxy routes new connections to them.
+			time.Sleep(time.Duration(attempt*attempt+1) * time.Second)
 		}
 
 		vecs, err := b.doPost(url, reqBody)
