@@ -10,6 +10,7 @@ package objectcache
 
 import (
 	"errors"
+	"math"
 	"runtime/debug"
 	"sync"
 )
@@ -152,7 +153,10 @@ func (c *Cache[V]) ensureInit() {
 	}
 	c.inited = true
 	if c.maxBytes <= 0 {
-		if limit := debug.SetMemoryLimit(-1); limit > 0 {
+		// math.MaxInt64 is the sentinel Go uses for "no limit" (GOMEMLIMIT not set).
+		// Treat it the same as 0 — use the hard fallback rather than computing an
+		// astronomically large budget from float64(math.MaxInt64) * 0.20.
+		if limit := debug.SetMemoryLimit(-1); limit > 0 && limit != math.MaxInt64 {
 			c.maxBytes = int64(float64(limit) * defaultBudgetFraction) //nolint:gosec
 		} else {
 			c.maxBytes = defaultMaxBytesNoGOMEMLIMIT

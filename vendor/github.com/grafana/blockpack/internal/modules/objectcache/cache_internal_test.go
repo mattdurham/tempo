@@ -38,12 +38,16 @@ func TestCache_LRUEviction(t *testing.T) {
 }
 
 // TestCache_DefaultBudgetNeverZero verifies that a zero-value Cache always has a
-// finite byte budget after ensureInit — never unbounded (maxBytes==0).
+// finite byte budget after ensureInit — never unbounded (maxBytes==0 or math.MaxInt64 fraction).
 // NOTE-OC-004: fallback to defaultMaxBytesNoGOMEMLIMIT prevents OOM when GOMEMLIMIT unset.
 func TestCache_DefaultBudgetNeverZero(t *testing.T) {
 	var c Cache[internalTestValue]
 	c.ensureInit() // trigger budget computation
 	assert.Greater(t, c.maxBytes, int64(0), "budget must always be finite after init")
+	// Budget must also be sane — not an overflow from float64(math.MaxInt64)*0.20
+	// which would be ~1.8e18, effectively unbounded.
+	const saneBudgetCap = int64(1) << 40 // 1 TiB — anything larger is a bug
+	assert.Less(t, c.maxBytes, saneBudgetCap, "budget must not be an overflow from MaxInt64 sentinel")
 }
 
 // TestCache_GetPromotesLRU verifies that Get promotes an entry so it isn't evicted.
