@@ -253,7 +253,7 @@ func New(cfg *Config, cacheProvider cache.Provider, logger gkLog.Logger) (Reader
 		)
 	}
 	if cfg.Block != nil && cfg.Block.Blockpack.EmbeddingURL != "" {
-		vblockpack.ConfigureEmbedding(cfg.Block.Blockpack.EmbeddingURL)
+		vblockpack.ConfigureEmbedding(cfg.Block.Blockpack.EmbeddingURL, cfg.Block.Blockpack.EmbeddingConcurrentBatches, cfg.Block.Blockpack.EmbeddingBatchSize, cfg.Block.Blockpack.EmbeddingMaxTextLength)
 	}
 
 	return rw, rw, rw, nil

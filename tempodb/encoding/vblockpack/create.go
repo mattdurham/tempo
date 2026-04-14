@@ -29,7 +29,13 @@ func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.Blo
 		cfg.Blockpack.MemoryCacheBytes,
 	)
 	ConfigureLRU(cfg.Blockpack.LRUCacheBytes)
-	ConfigureEmbedding(cfg.Blockpack.EmbeddingURL)
+	// Only update the process-level embedding URL when cfg provides one explicitly.
+	// Calling ConfigureEmbedding("") would overwrite the URL that tempodb.go set at
+	// startup via storage.trace.block.blockpack.embedding_url — causing the block-builder
+	// (whose block_builder.block section has no embedding_url) to lose the embedder.
+	if cfg.Blockpack.EmbeddingURL != "" {
+		ConfigureEmbedding(cfg.Blockpack.EmbeddingURL, cfg.Blockpack.EmbeddingConcurrentBatches, cfg.Blockpack.EmbeddingBatchSize, cfg.Blockpack.EmbeddingMaxTextLength)
+	}
 
 	// Write to a temp file so we get a known size for StreamWriter and avoid
 	// holding the entire encoded block in RAM.
@@ -48,7 +54,13 @@ func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.Blo
 	}
 	// Pass embedder to blockpack writer — it handles field assembly and embedding internally.
 	// Must guard against nil *Embedder assigned to interface (Go nil interface trap).
-	if emb := getProcessEmbedder(cfg.Blockpack.EmbeddingURL); emb != nil {
+	// Fall back to configuredEmbedURL (set at startup from storage.trace.block) when
+	// cfg.Blockpack.EmbeddingURL is empty (e.g. block-builder's block_builder.block section).
+	embedURL := cfg.Blockpack.EmbeddingURL
+	if embedURL == "" {
+		embedURL = configuredEmbedURL
+	}
+	if emb := getProcessEmbedder(embedURL); emb != nil {
 		writerCfg.Embedder = emb
 	}
 	if cfg.Blockpack.VectorDimension > 0 {
