@@ -15,8 +15,13 @@ import (
 )
 
 // defaultBudgetFraction is the fraction of GOMEMLIMIT used as the default
-// per-Cache byte budget.
+// per-Cache byte budget when GOMEMLIMIT is set.
 const defaultBudgetFraction = 0.20
+
+// defaultMaxBytesNoGOMEMLIMIT is the hard byte budget used when GOMEMLIMIT is
+// not set. This prevents unbounded cache growth in deployments that omit the
+// env var. Callers can override via SetMaxBytes.
+const defaultMaxBytesNoGOMEMLIMIT = 256 << 20 // 256 MiB
 
 // Sizer is implemented by cached values that can report their in-memory size.
 // If a value does not implement Sizer, a default of 1 MB per entry is used.
@@ -35,7 +40,8 @@ type entry[V any] struct {
 }
 
 // Cache is a generic in-memory cache with strong references and LRU eviction.
-// The byte budget defaults to 20% of GOMEMLIMIT (or unbounded if GOMEMLIMIT is not set).
+// The byte budget defaults to 20% of GOMEMLIMIT when the env var is set, or
+// 256 MiB when it is not. Callers may override via SetMaxBytes.
 //
 // Cache is safe for concurrent use. The zero value is ready to use.
 // A Cache must not be copied after first use.
@@ -44,7 +50,7 @@ type entry[V any] struct {
 // SPEC-OC-002: Put stores a strong reference; entries are evicted by LRU, not GC.
 // SPEC-OC-005: Clear removes all entries.
 // SPEC-OC-006: All methods are safe for concurrent use.
-// SPEC-OC-007: Byte budget defaults to 20% of GOMEMLIMIT; configurable via SetMaxBytes.
+// SPEC-OC-007: Byte budget defaults to 20% of GOMEMLIMIT (or 256 MiB fallback); configurable via SetMaxBytes.
 type Cache[V any] struct {
 	items    map[string]*entry[V]
 	head     *entry[V] // most recently used
@@ -137,7 +143,9 @@ func (c *Cache[V]) Len() int {
 	return len(c.items)
 }
 
-// ensureInit lazily computes the default byte budget from GOMEMLIMIT.
+// ensureInit lazily computes the default byte budget.
+// Priority: (1) SetMaxBytes override, (2) 20% of GOMEMLIMIT, (3) 256 MiB hard fallback.
+// The fallback prevents unbounded cache growth in deployments that omit GOMEMLIMIT.
 func (c *Cache[V]) ensureInit() {
 	if c.inited {
 		return
@@ -146,8 +154,9 @@ func (c *Cache[V]) ensureInit() {
 	if c.maxBytes <= 0 {
 		if limit := debug.SetMemoryLimit(-1); limit > 0 {
 			c.maxBytes = int64(float64(limit) * defaultBudgetFraction) //nolint:gosec
+		} else {
+			c.maxBytes = defaultMaxBytesNoGOMEMLIMIT
 		}
-		// If GOMEMLIMIT not set, maxBytes stays 0 (unbounded).
 	}
 }
 
