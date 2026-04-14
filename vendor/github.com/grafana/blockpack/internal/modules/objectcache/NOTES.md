@@ -1,5 +1,27 @@
 # objectcache Module — Design Notes
 
+## NOTE-OC-004: Hard fallback budget when GOMEMLIMIT is not set
+*Added: 2026-04-14*
+
+The original `ensureInit` only set a byte budget when `GOMEMLIMIT` was configured;
+if the env var was absent, `maxBytes` stayed 0 and the eviction loop
+(`for c.maxBytes > 0 && ...`) never fired. This caused a production OOM: querier
+pods without `GOMEMLIMIT` filled `parsedIntrinsicCache` to ~7 GiB after a few
+`histogram_over_time` queries and were killed by the kernel.
+
+Fix: `ensureInit` now falls back to `defaultMaxBytesNoGOMEMLIMIT` (256 MiB) when
+`debug.SetMemoryLimit(-1)` returns 0 (i.e., GOMEMLIMIT not set). This ensures the
+cache is always bounded regardless of operator configuration.
+
+The 256 MiB fallback is conservative — enough for ~50-100 average-sized intrinsic
+columns but well below typical pod limits. Deployments with known memory budgets
+should set `GOMEMLIMIT` to get the 20%-fraction behaviour, or call `SetMaxBytes`
+directly.
+
+Back-ref: `internal/modules/objectcache/cache.go:ensureInit`
+
+---
+
 ## NOTE-OC-001: Why strong references instead of weak.Pointer
 *Added: 2026-03-23*
 *Updated: 2026-03-29*

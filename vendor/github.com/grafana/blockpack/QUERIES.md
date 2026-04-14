@@ -2,7 +2,7 @@
 
 **Environment:** dev-us-east-0 / tempo-dev-test-03  
 **Tenant:** `X-Scope-OrgID: 11638`  
-**Generated:** 2026-04-12 (updated 2026-04-14 with r60 results)  
+**Generated:** 2026-04-12 (updated 2026-04-14 with r60/r62 results)  
 **Time range queried:** last 3 hours  
 **Services active:** alloy, CockroachDB, apiserver, grafana
 
@@ -339,3 +339,42 @@ cuts query time by ~46% relative to M11 warm.
 ```
 
 **Result (r60):** `series=210  services=210  time=4.5s  blocks=147`
+
+---
+
+## r61 → r62 Optimization Results
+
+**Deployed:** 2026-04-14  
+**Image:** `mrdgrafana/tempo:blockpack-8742c344e-r62`  
+**Environment:** tempo-dev-test-03 (24h range, `GOMEMLIMIT=13GiB`, pod limit 18Gi)
+
+### Optimizations
+
+One allocation optimization targeting `streamHistogramGroupBy`:
+
+1. **streamHistogramGroupBy absent-pk guard** (`internal/modules/executor/metrics_trace_intrinsic.go`):
+   Skip the O(N) absent-row pass when `len(seen) == len(keyToBucket)`. For universal columns
+   like `span:duration` (FLAT format — value present for every span), this pass was always
+   redundant and added measurable overhead.
+
+### Context: r61 OOM root cause and fix
+
+r61 pods were OOMKilled because `GOMEMLIMIT` was not set → `objectcache.Cache` budget = 0
+(unbounded) → `parsedIntrinsicCache` grew without eviction to 6.8–7 Gi per pod, hitting the
+9 Gi limit after 4–6 M8 queries.
+
+**Fix:** `GOMEMLIMIT=13GiB` added to querier deployment env. Budget = 20% of 13 GiB = 2.6 GiB.
+Pods now stable at 13–13.5 Gi under sustained load (18 Gi limit, no OOMKill).
+
+### Performance Summary (r62, warm cache, GOMEMLIMIT=13GiB)
+
+| Query | r62 warm | series |
+|---|---|---|
+| M8: `{kind=server}⎮histogram_over_time(duration) by (resource.service.name)` | **5.15s** (5-run avg) | 1793 |
+| M11: `{kind=server}⎮rate() by (resource.service.name)` | **3.45s** (3-run avg) | 178 |
+| M13: `{kind=server}⎮count_over_time() by (span.status_code)` | **2.56s** (5-run avg) | 3 |
+
+> **Note:** Absolute numbers are not directly comparable to r60 baselines — the data set grows
+> continuously and these benchmarks were taken hours later in the day. Relative ordering (r62
+> faster than r61 on M8/M11/M13) is the meaningful comparison; a side-by-side on the same cluster
+> in the same session is needed for precise delta measurement.
