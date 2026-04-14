@@ -1921,3 +1921,62 @@ Back-ref: `internal/modules/executor/metrics_trace.go:traceAccumulateRow`,
           `internal/modules/executor/metrics_log.go:logAccumulateRow`,
           `internal/modules/executor/stream.go:collectIntrinsicTopKKLL`,
           `internal/modules/executor/stream.go:Collect` (block-plain path)
+
+---
+
+## NOTE-055: streamHistogramGroupBy — Dict Amortization for Histogram Group-By Path
+*Added: 2026-04-14*
+
+**Decision:** The `buildAggValsMap` + for-loop two-step in `accumulateIntrinsicBuckets`
+for `agg.Function == vm.FuncNameHISTOGRAM` is replaced by `streamHistogramGroupBy`,
+which streams the aggregate column directly and emits histogram buckets in a single pass.
+
+**Rationale:** `buildAggValsMap` allocates a `map[uint32]float64` of size `len(keyToBucket)`
+(one float64 per in-range span). The subsequent for-loop then calls
+`intrinsicHistogramBoundary` and `strconv.FormatFloat` for each span individually.
+
+For the dict column format (typical for `span:duration` which has ~30 distinct duration
+buckets across 10K+ spans), both operations can be computed once per dict entry and
+reused for every ref under that entry. `streamHistogramGroupBy` exploits this by hoisting
+`boundary` and `boundaryStr` outside the inner ref loop.
+
+For the flat column format there is no amortization win (each ref has a unique value), but
+the `map[uint32]float64` allocation is still eliminated — replaced by
+`map[uint32]struct{}` (seen-map, 8x smaller per entry) which is only needed to handle the
+absent-row fallback.
+
+**Invariant preserved:** Spans absent from the aggregate column fall into the boundary-0
+bucket, matching `streamAggColumnNoGroupBy` and the block-scan path.
+
+**Composite key format unchanged:**
+`strconv.FormatInt(bucketIdx, 10) + "\x00" + groupKey + "\x00" + boundaryStr`
+
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:streamHistogramGroupBy`,
+          `internal/modules/executor/metrics_trace_intrinsic.go:accumulateIntrinsicBuckets`
+
+---
+
+## NOTE-056: buildGroupKeyMap Single-Group-By Fast Path — colVals Elimination (2026-04-14)
+*Added: 2026-04-14*
+
+**Decision:** Added a fast path in `buildGroupKeyMap` for `len(groupBy) == 1` that writes
+values directly into the output map, eliminating the `colVals` intermediate map allocation.
+
+**Rationale:** The general multi-group-by path allocates
+`colVals := make(map[uint32]string, len(keyToBucket))` for each group-by column.
+For the overwhelmingly common case of a single group-by column (e.g.
+`by (resource.service.name)`), this allocation is unnecessary — values can be written
+directly into `out`. The fast path removes one map allocation from the critical path.
+
+For `len(groupBy) == 1`: one fewer `map[uint32]string` allocation per query.
+For `len(groupBy) > 1`: unchanged; the multi-column path continues to use per-column
+`colVals` maps.
+
+**Invariant preserved:** Rows absent from the group-by column receive an empty string in
+`out`, matching the Tempo convention (Tempo `strings.Join(attrVals, "\x00")` produces
+empty string for absent column positions).
+
+**Absent-pk fill:** The fast path explicitly fills absent pks with `""` after the column
+scan, matching the multi-column path's behavior of iterating `keyToBucket` for every row.
+
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:buildGroupKeyMap`

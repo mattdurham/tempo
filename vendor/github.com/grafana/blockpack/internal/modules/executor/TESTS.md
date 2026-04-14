@@ -808,6 +808,135 @@ Query: `{ } | histogram_over_time(span.duration) by (span.env, span.region)`.
 
 ---
 
+### EX-ETM-17: TestStreamHistogramGroupBy_DictParity
+
+**Scenario:** `histogram_over_time(span.duration) by (resource.service.name)` via
+`streamHistogramGroupBy` (dict column path) produces correct per-service bucket counts.
+
+**Setup:** 4 spans duration=10ms service.name="svc-a", 4 spans duration=100ms
+service.name="svc-b". Single time bucket. MaxBlockSpans ≥ 8 so all spans land in one
+block; equal durations within each service cause the writer to emit a dict column for
+`span:duration`.
+
+**Assertions:**
+- `result.BlocksScanned == 0` (intrinsic fast path taken).
+- `len(result.Series) > 0`.
+- Sum of all bucket counts for svc-a == 4; sum for svc-b == 4.
+- `__bucket` label values differ between svc-a and svc-b (different boundary values).
+
+---
+
+### EX-ETM-18: TestStreamHistogramGroupBy_FlatParity
+
+**Scenario:** `histogram_over_time(span.duration) by (resource.service.name)` via
+`streamHistogramGroupBy` (flat column path) produces correct per-service bucket counts
+when every span has a distinct duration value.
+
+**Setup:** 4 spans with durations 1ms/2ms/4ms/8ms service.name="svc-x"; 4 spans with
+durations 16ms/32ms/64ms/128ms service.name="svc-y". Single time bucket. Distinct values
+cause the writer to emit a flat intrinsic column for `span:duration`.
+
+**Assertions:**
+- `result.BlocksScanned == 0`.
+- `len(result.Series) > 0`.
+- Sum of all bucket counts for svc-x == 4; sum for svc-y == 4.
+- No series has a NaN value.
+
+---
+
+### EX-ETM-19: TestStreamHistogramGroupBy_NilColPath
+
+**Scenario:** `histogram_over_time(span.duration) by (resource.service.name)` when the
+aggregate column (span:duration) is entirely absent from the file. All in-range spans must
+fall into the boundary-0 bucket.
+
+**Setup:** 4 spans with zero duration (no span:duration intrinsic column written) and
+service.name="svc-nil". Single time bucket.
+
+**Assertions:**
+- `result.BlocksScanned == 0` (intrinsic fast path taken).
+- `len(result.Series) > 0`.
+- All `__bucket` labels equal `strconv.FormatFloat(0, 'g', -1, 64)` (= "0").
+- Total count across all series == 4.
+
+Back-ref: `executor/stream_histogram_groupby_test.go:TestStreamHistogramGroupBy_NilColPath`
+
+---
+
+### EX-ETM-20: TestStreamHistogramGroupBy_BucketLabelFormat
+
+**Scenario:** Verifies that the `__bucket` label contains the exact
+`strconv.FormatFloat(boundary, 'g', -1, 64)` string for a known duration value,
+catching regressions in `intrinsicHistogramBoundary` or `FormatFloat` format changes.
+
+**Setup:** 4 spans with duration=8ms (= 8_000_000 ns). Expected boundary:
+`2^floor(log2(0.008))` = `2^-7` = 0.0078125.
+`strconv.FormatFloat(0.0078125, 'g', -1, 64)` == "0.0078125".
+
+**Assertions:**
+- `result.BlocksScanned == 0`.
+- `len(result.Series) > 0`.
+- At least one series has a `__bucket` label equal to "0.0078125".
+
+Back-ref: `executor/stream_histogram_groupby_test.go:TestStreamHistogramGroupBy_BucketLabelFormat`
+
+---
+
+### EX-ETM-GKM-01: TestBuildGroupKeyMap_SingleGroupBy_Dict
+
+**Scenario:** `count_over_time() by (resource.service.name)` with a dict-encoded group-by
+column. Verifies the NOTE-056 single-group-by fast path produces correct per-service counts.
+
+**Assertions:** svc-a count == 3; svc-b count == 2; `BlocksScanned == 0`.
+
+Back-ref: `executor/group_key_map_test.go:TestBuildGroupKeyMap_SingleGroupBy_Dict`
+
+---
+
+### EX-ETM-GKM-02: TestBuildGroupKeyMap_SingleGroupBy_Flat
+
+**Scenario:** Same query with a flat-encoded group-by column (distinct service names).
+Verifies the flat column path in the NOTE-056 fast path.
+
+**Assertions:** Each of 4 distinct service names has count == 1; `BlocksScanned == 0`.
+
+Back-ref: `executor/group_key_map_test.go:TestBuildGroupKeyMap_SingleGroupBy_Flat`
+
+---
+
+### EX-ETM-GKM-03: TestBuildGroupKeyMap_SingleGroupBy_AbsentPK
+
+**Scenario:** 2 spans with service.name, 2 spans with empty service.name (absent pk).
+Verifies absent pks receive empty-string key (Tempo convention) and are still counted.
+
+**Assertions:** Total count across all series == 4; `BlocksScanned == 0`.
+
+Back-ref: `executor/group_key_map_test.go:TestBuildGroupKeyMap_SingleGroupBy_AbsentPK`
+
+---
+
+### EX-ETM-GKM-04: TestBuildGroupKeyMap_MultiGroupBy_Parity
+
+**Scenario:** Single-group-by query produces the same series counts as a baseline reference,
+verifying the fast path does not diverge from expected counts.
+
+**Assertions:** svc-a count == 4; svc-b count == 3.
+
+Back-ref: `executor/group_key_map_test.go:TestBuildGroupKeyMap_MultiGroupBy_Parity`
+
+---
+
+### EX-ETM-GKM-05: TestBuildGroupKeyMap_EndToEnd_Correctness
+
+**Scenario:** count_over_time() by (resource.service.name) with 2 time steps.
+5 spans split across 2 time buckets (2 in bucket 0, 3 in bucket 1).
+
+**Assertions:** svc-x has exactly 2 non-NaN values [2.0, 3.0]; `BlocksScanned == 0`.
+
+Back-ref: `executor/group_key_map_test.go:TestBuildGroupKeyMap_EndToEnd_Correctness`
+
+---
+
 ## EX-ST-01: TestExecuteStructural_NilReader
 
 **Scenario:** Nil reader returns empty result with no error.

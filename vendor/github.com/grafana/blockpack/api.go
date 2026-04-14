@@ -17,7 +17,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math"
-	"runtime"
 
 	"github.com/grafana/blockpack/internal/logqlparser"
 	modules_shared "github.com/grafana/blockpack/internal/modules/blockio/shared"
@@ -143,9 +142,7 @@ func QueryTraceQL(
 ) (results []SpanMatch, stats QueryStats, err error) {
 	defer func() {
 		if rec := recover(); rec != nil {
-			buf := make([]byte, 4096)
-			n := runtime.Stack(buf, false)
-			err = fmt.Errorf("internal error in QueryTraceQL: %v\n%s", rec, buf[:n])
+			err = fmt.Errorf("internal error in QueryTraceQL: %v", rec)
 		}
 	}()
 

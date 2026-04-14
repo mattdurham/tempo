@@ -303,7 +303,10 @@ func decodePresenceOnly(data []byte, spanCount int, colType shared.ColumnType) (
 
 	encVersion := data[0]
 	if encVersion != shared.VersionBlockEncV3 {
-		return nil, fmt.Errorf("decodePresenceOnly: unsupported enc_version %d (only enc_version=3 supported)", encVersion)
+		return nil, fmt.Errorf(
+			"decodePresenceOnly: unsupported enc_version %d (only enc_version=3 supported)",
+			encVersion,
+		)
 	}
 
 	kind := data[1]

@@ -250,3 +250,45 @@ default unknown-type path, which skips the column — backward-compatible by des
 Back-ref: `internal/modules/blockio/shared/types.go:ColumnTypeVectorF32`,
 `internal/modules/blockio/shared/constants.go:VectorIndexMagic`,
 `internal/modules/blockio/shared/constants.go:EmbeddingColumnName`
+
+---
+
+## NOTE-011: Snappy Decode Buffer Pool for Intrinsic Column Decoding (2026-04-14)
+*Added: 2026-04-14*
+
+**Decision:** Added `intrinsicBufPool` (`sync.Pool` of `*[]byte`) with 64KB default
+capacity and a 4MB cap guard. `AcquireIntrinsicBuf` / `ReleaseIntrinsicBuf` are used in
+`decodePagedColumnBlob` (per-page loop) and `DecodePageTOC` to reuse snappy decode scratch
+buffers across calls.
+
+**Rationale:** Before r60, every call to `decodePagedColumnBlob` allocated a new `[]byte`
+per page for `snappy.Decode(nil, ...)`. For a paged column with 10 pages of ~64KB each,
+that is 10 allocations × 64KB = 640KB of heap per decode. With the pool, the same buffer
+is reused across pages within a single decode call (via `defer ReleaseIntrinsicBuf`), and
+across calls from different goroutines (pool is shared). Benchmark (M8, histogram-by-service,
+10K spans): -59% wall time.
+
+**Pool design:**
+- Default cap 64KB — covers typical pages; avoids realloc for sub-64KB pages.
+- Cap guard 4MB — prevents pathological large pages from permanently occupying pool slots.
+- `ReleaseIntrinsicBuf` resets length to 0 before returning to pool; replaces oversized
+  buffers with a fresh 64KB buffer.
+- `*pageBuf = pageRaw` after `snappy.Decode` updates the pool pointer if snappy reallocated
+  (snappy reuses the buffer in-place when capacity is sufficient, reallocates otherwise).
+
+**Safety prerequisite — BytesValues copy:**
+`DecodeFlatPage` and `decodeLegacyFlatBlob` previously stored `BytesValues` as sub-slices
+of the raw decode buffer (`raw[pos:pos+vLen]`). With the pool, the same buffer may be
+reused on the next call while `IntrinsicColumn.BytesValues` still holds pointers into it,
+causing silent data corruption. Fix: both functions now use `make([]byte, vLen) + copy`
+before appending to `BytesValues`.
+
+**Invariant:** All `BytesValues` slices returned by intrinsic decode functions are
+independent copies that do not alias any pool buffer.
+
+Back-ref: `internal/modules/blockio/shared/intrinsic_codec.go:AcquireIntrinsicBuf`,
+          `internal/modules/blockio/shared/intrinsic_codec.go:ReleaseIntrinsicBuf`,
+          `internal/modules/blockio/shared/intrinsic_codec.go:decodePagedColumnBlob`,
+          `internal/modules/blockio/shared/intrinsic_codec.go:DecodePageTOC`,
+          `internal/modules/blockio/shared/intrinsic_codec.go:DecodeFlatPage`,
+          `internal/modules/blockio/shared/intrinsic_codec.go:decodeLegacyFlatBlob`

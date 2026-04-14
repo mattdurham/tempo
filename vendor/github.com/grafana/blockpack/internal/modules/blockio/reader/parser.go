@@ -330,7 +330,11 @@ func (r *Reader) readSectionDirectory() (shared.SectionDirectory, error) {
 
 	cacheKey := r.fileID + "/v14/sec-dir/dec"
 	raw, err := r.cache.GetOrFetch(cacheKey, func() ([]byte, error) {
-		compressed, readErr := r.readRange(r.v7DirOffset, uint64(r.v7DirLen), rw.DataTypeMetadata) //nolint:gosec // safe: v7DirLen is a file offset length, fits in uint64
+		compressed, readErr := r.readRange(
+			r.v7DirOffset,
+			uint64(r.v7DirLen),
+			rw.DataTypeMetadata,
+		) //nolint:gosec // safe: v7DirLen is a file offset length, fits in uint64
 		if readErr != nil {
 			return nil, readErr
 		}
@@ -341,14 +345,20 @@ func (r *Reader) readSectionDirectory() (shared.SectionDirectory, error) {
 	}
 
 	if len(raw) < 4 {
-		return shared.SectionDirectory{}, fmt.Errorf("readSectionDirectory: too short for entry_count: %d bytes", len(raw))
+		return shared.SectionDirectory{}, fmt.Errorf(
+			"readSectionDirectory: too short for entry_count: %d bytes",
+			len(raw),
+		)
 	}
 
 	entryCount := binary.LittleEndian.Uint32(raw[0:])
 	pos := 4
 
 	dir := shared.SectionDirectory{
-		TypeEntries: make(map[uint8]shared.DirEntryType, int(entryCount)), //nolint:gosec // safe: entryCount is a small count
+		TypeEntries: make(
+			map[uint8]shared.DirEntryType,
+			int(entryCount),
+		), //nolint:gosec // safe: entryCount is a small count
 		NameEntries: make(map[string]shared.DirEntryName),
 	}
 
@@ -362,26 +372,41 @@ func (r *Reader) readSectionDirectory() (shared.SectionDirectory, error) {
 		case shared.DirEntryKindType:
 			e, parseErr := shared.UnmarshalDirEntryType(raw[pos:])
 			if parseErr != nil {
-				return shared.SectionDirectory{}, fmt.Errorf("readSectionDirectory: entry[%d] type-keyed: %w", i, parseErr)
+				return shared.SectionDirectory{}, fmt.Errorf(
+					"readSectionDirectory: entry[%d] type-keyed: %w",
+					i,
+					parseErr,
+				)
 			}
 			pos += shared.DirEntryTypeWireSize - 1 // -1 for the kind byte already consumed
 			dir.TypeEntries[e.SectionType] = e
 		case shared.DirEntryKindName:
 			e, n, parseErr := shared.UnmarshalDirEntryName(raw[pos:])
 			if parseErr != nil {
-				return shared.SectionDirectory{}, fmt.Errorf("readSectionDirectory: entry[%d] name-keyed: %w", i, parseErr)
+				return shared.SectionDirectory{}, fmt.Errorf(
+					"readSectionDirectory: entry[%d] name-keyed: %w",
+					i,
+					parseErr,
+				)
 			}
 			pos += n
 			dir.NameEntries[e.Name] = e
 		case shared.DirEntryKindSignal:
 			// DirEntryKindSignal: signal_type[1] — 1 byte payload after the kind byte.
 			if pos >= len(raw) {
-				return shared.SectionDirectory{}, fmt.Errorf("readSectionDirectory: entry[%d] signal-kind: truncated", i)
+				return shared.SectionDirectory{}, fmt.Errorf(
+					"readSectionDirectory: entry[%d] signal-kind: truncated",
+					i,
+				)
 			}
 			dir.SignalType = raw[pos]
 			pos++
 		default:
-			return shared.SectionDirectory{}, fmt.Errorf("readSectionDirectory: entry[%d]: unknown kind 0x%02x", i, kind)
+			return shared.SectionDirectory{}, fmt.Errorf(
+				"readSectionDirectory: entry[%d]: unknown kind 0x%02x",
+				i,
+				kind,
+			)
 		}
 	}
 
@@ -553,33 +578,29 @@ func (r *Reader) ensureV14TraceSection() error {
 		return nil
 	}
 	r.v14TraceOnce.Do(func() {
-		// Two-phase loading: read only bloom+block_table (small) eagerly.
-		// Raw trace index bytes are deferred to ensureTraceIndexRaw on bloom hit.
-		// Cache key for the small header: separate from "/v14/sec/03/dec" (the full section).
-		headerKey := r.fileID + "/v14/compact-header"
-		headerBytes, err := r.cache.GetOrFetch(headerKey, func() ([]byte, error) {
-			raw, readErr := r.readV14Section(shared.SectionTraceIndex)
-			if readErr != nil {
-				return nil, readErr
-			}
-			if len(raw) == 0 {
-				return nil, nil
-			}
-			header, _, splitErr := splitV14CompactSection(raw)
-			if splitErr != nil {
-				return nil, splitErr
-			}
-			return append([]byte(nil), header...), nil
-		})
+		// Read the full trace section once; split into header and trace index bytes.
+		// Both parts are needed at different times — storing both avoids a second I/O on
+		// the first bloom hit (ensureTraceIndexRaw would otherwise re-read the section).
+		raw, err := r.readV14Section(shared.SectionTraceIndex)
 		if err != nil {
-			r.v14TraceErr = fmt.Errorf("ensureV14TraceSection: header: %w", err)
+			r.v14TraceErr = fmt.Errorf("ensureV14TraceSection: read: %w", err)
 			return
 		}
-		if len(headerBytes) == 0 {
+		if len(raw) == 0 {
 			return
 		}
-		if parseErr := r.parseCompactIndexBytesV14Header(headerBytes); parseErr != nil {
+		header, traceIdx, splitErr := splitV14CompactSection(raw)
+		if splitErr != nil {
+			r.v14TraceErr = fmt.Errorf("ensureV14TraceSection: split: %w", splitErr)
+			return
+		}
+		if parseErr := r.parseCompactIndexBytesV14Header(header); parseErr != nil {
 			r.v14TraceErr = fmt.Errorf("ensureV14TraceSection: parse: %w", parseErr)
+			return
+		}
+		// Store trace index bytes now so ensureTraceIndexRaw is a no-op (no second I/O).
+		if r.compactParsed != nil && len(traceIdx) > 0 {
+			r.compactParsed.traceIndexRaw = append([]byte(nil), traceIdx...)
 		}
 	})
 	return r.v14TraceErr

@@ -32,7 +32,9 @@ func intersectBySelectivity(sets []map[int]struct{}) map[int]struct{} {
 	// would incorrectly prune all blocks rather than leaving them unconstrained.
 	for _, s := range sets {
 		if s == nil {
-			panic("intersectBySelectivity: nil (unconstrained) set in input — callers must skip this call or filter nil sets before calling")
+			panic(
+				"intersectBySelectivity: nil (unconstrained) set in input — callers must skip this call or filter nil sets before calling",
+			)
 		}
 	}
 	// Sort ascending by size: smallest (most selective) first.

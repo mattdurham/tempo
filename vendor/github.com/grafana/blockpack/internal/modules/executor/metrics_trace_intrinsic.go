@@ -5,6 +5,7 @@ package executor
 // Intrinsic fast path for ExecuteTraceMetrics.
 // NOTE-046: When all needed columns (span:start, aggregate field, group-by) are in the
 // intrinsic section, metrics queries skip full block reads entirely. See NOTES.md NOTE-046.
+// See also NOTE-055 for the streamHistogramGroupBy dict-amortization extension.
 
 import (
 	"math"
@@ -44,10 +45,11 @@ func metricsColumnsAreIntrinsic(r *modules_reader.Reader, wantColumns map[string
 // Map allocation budget (all paths also allocate one buckets map and filteredKeys when
 // predicates are present; the counts below exclude those shared allocations):
 //
-//	count/rate, no group-by:   0 extra maps (span:start streamed inline)
-//	count/rate, N group-by:    2 maps (keyToBucket + groupKeyMap)
-//	agg field,  no group-by:   1 map  (keyToBucket; aggregate column streamed directly)
-//	agg field,  N group-by:    3 maps (keyToBucket + groupKeyMap + aggVals)
+//	count/rate, no group-by:                0 extra maps (span:start streamed inline)
+//	count/rate, N group-by:                 2 maps (keyToBucket + groupKeyMap)
+//	agg field,  no group-by:                1 map  (keyToBucket; aggregate column streamed directly)
+//	agg field,  N group-by (histogram):     2 maps (keyToBucket + groupKeyMap; seen inside streamHistogramGroupBy) — NOTE-056 fast path eliminates colVals for single group-by
+//	agg field,  N group-by (other):         3 maps (keyToBucket + groupKeyMap + aggVals)
 //
 // Returns (result, true, nil) when the fast path succeeds.
 // Returns (nil, false, nil) when the fast path is not applicable — caller falls through to block scan.
@@ -191,7 +193,8 @@ func intrinsicGetOrCreateBucket(buckets map[string]*aggBucketState, compositeKey
 //
 //	count/rate, N group-by:  build groupKeyMap (1 map), iterate keyToBucket
 //	agg field,  no group-by: stream aggregate column against keyToBucket (no aggVals map)
-//	agg field,  N group-by:  build groupKeyMap (1 map) + aggVals (1 map), iterate keyToBucket
+//	agg field,  N group-by (histogram): streamHistogramGroupBy (2 maps: keyToBucket + groupKeyMap; seen map is inside streamHistogramGroupBy)
+//	agg field,  N group-by (other):     build groupKeyMap (1 map) + aggVals (1 map), iterate keyToBucket
 func accumulateIntrinsicBuckets(
 	r *modules_reader.Reader,
 	keyToBucket map[uint32]int64,
@@ -223,9 +226,13 @@ func accumulateIntrinsicBuckets(
 		return nil
 	}
 
-	// Aggregate field with group-by: three maps total (keyToBucket + groupKeyMap + aggVals).
-	// aggVals is unavoidable here: we need both the group key and the aggregate value
-	// per row, but they come from different columns with different packKey orderings.
+	// HISTOGRAM with group-by: single-pass column scan — no aggVals map allocated.
+	// NOTE-055: streamHistogramGroupBy amortizes boundary computation across dict entries.
+	if agg.Function == vm.FuncNameHISTOGRAM {
+		return streamHistogramGroupBy(r, agg.Field, keyToBucket, groupKeyMap, buckets)
+	}
+
+	// Other aggregate functions with group-by: three maps total (keyToBucket + groupKeyMap + aggVals).
 	aggVals, err := buildAggValsMap(r, agg.Field, keyToBucket)
 	if err != nil {
 		return err
@@ -233,22 +240,12 @@ func accumulateIntrinsicBuckets(
 
 	for pk, bucketIdx := range keyToBucket {
 		groupKey := groupKeyMap[pk]
-		var compositeKey string
-		if agg.Function == vm.FuncNameHISTOGRAM {
-			// HISTOGRAM counts every matched span; absent field → boundary 0 (matches block-scan).
-			v := aggVals[pk] // 0.0 if absent — correct for histogram boundary computation
-			boundary := intrinsicHistogramBoundary(v, agg.Field)
-			compositeKey = strconv.FormatInt(bucketIdx, 10) + "\x00" + groupKey + "\x00" +
-				strconv.FormatFloat(boundary, 'g', -1, 64)
-			intrinsicGetOrCreateBucket(buckets, compositeKey).count++
-		} else {
-			compositeKey = strconv.FormatInt(bucketIdx, 10) + "\x00" + groupKey
-			// Always create the bucket so the series/group key is emitted even when
-			// the aggregate field is absent (matching block-scan: bucket.count==0 → NaN).
-			bucket := intrinsicGetOrCreateBucket(buckets, compositeKey)
-			if v, ok := aggVals[pk]; ok {
-				updateAggBucket(bucket, agg.Function, v)
-			}
+		compositeKey := strconv.FormatInt(bucketIdx, 10) + "\x00" + groupKey
+		// Always create the bucket so the series/group key is emitted even when
+		// the aggregate field is absent (matching block-scan: bucket.count==0 → NaN).
+		bucket := intrinsicGetOrCreateBucket(buckets, compositeKey)
+		if v, ok := aggVals[pk]; ok {
+			updateAggBucket(bucket, agg.Function, v)
 		}
 	}
 	return nil
@@ -369,12 +366,51 @@ func streamAggColumnNoGroupBy(
 	return nil
 }
 
+// scanIntrinsicColVals scans a single intrinsic column's dict/flat entries and writes
+// packKey → string value into dst for every ref that appears in keyToBucket.
+// Rows absent from the column are not written (callers handle absence as empty string).
+func scanIntrinsicColVals(col *modules_shared.IntrinsicColumn, keyToBucket map[uint32]int64, dst map[uint32]string) {
+	switch col.Format {
+	case modules_shared.IntrinsicFormatDict:
+		for _, entry := range col.DictEntries {
+			val := entry.Value
+			if val == "" {
+				val = strconv.FormatInt(entry.Int64Val, 10)
+			}
+			for _, ref := range entry.BlockRefs {
+				pk := packKey(ref.BlockIdx, ref.RowIdx)
+				if _, ok := keyToBucket[pk]; ok {
+					dst[pk] = val
+				}
+			}
+		}
+	case modules_shared.IntrinsicFormatFlat:
+		for j, ref := range col.BlockRefs {
+			pk := packKey(ref.BlockIdx, ref.RowIdx)
+			if _, ok := keyToBucket[pk]; !ok {
+				continue
+			}
+			var val string
+			if j < len(col.Uint64Values) {
+				val = strconv.FormatUint(col.Uint64Values[j], 10)
+			} else if j < len(col.BytesValues) {
+				val = string(col.BytesValues[j])
+				// else: val stays empty — row absent from this column (Tempo convention)
+			}
+			dst[pk] = val
+		}
+	}
+}
+
 // buildGroupKeyMap builds a packKey → compositeGroupKey map by iterating each group-by
 // column's dict/flat entries directly against keyToBucket. One map replaces N per-column maps.
 //
 // The composite key always has exactly len(groupBy)-1 "\x00" separators, matching the
 // strings.Join(attrVals, "\x00") produced by the block-scan path. Rows absent from a column
 // contribute an empty string for that position (Tempo convention).
+//
+// NOTE-056: single-group-by fast path — writes directly to out, eliminating the colVals
+// intermediate map for the common case of one group-by column.
 func buildGroupKeyMap(
 	r *modules_reader.Reader,
 	groupBy []string,
@@ -382,6 +418,25 @@ func buildGroupKeyMap(
 ) (map[uint32]string, error) {
 	out := make(map[uint32]string, len(keyToBucket))
 
+	// Fast path: single group-by column — write directly to out, skip colVals map.
+	if len(groupBy) == 1 {
+		col, err := r.GetIntrinsicColumn(groupBy[0])
+		if err != nil {
+			return nil, err
+		}
+		if col != nil {
+			scanIntrinsicColVals(col, keyToBucket, out)
+		}
+		// Fill absent pks with empty string (Tempo convention).
+		for pk := range keyToBucket {
+			if _, ok := out[pk]; !ok {
+				out[pk] = ""
+			}
+		}
+		return out, nil
+	}
+
+	// Multi-group-by path: build colVals per column.
 	for i, colName := range groupBy {
 		// Collect this column's values into a temporary per-pk map.
 		// Rows absent from the column get the empty string (Tempo convention).
@@ -391,35 +446,7 @@ func buildGroupKeyMap(
 			return nil, err
 		}
 		if col != nil {
-			switch col.Format {
-			case modules_shared.IntrinsicFormatDict:
-				for _, entry := range col.DictEntries {
-					val := entry.Value
-					if val == "" {
-						val = strconv.FormatInt(entry.Int64Val, 10)
-					}
-					for _, ref := range entry.BlockRefs {
-						pk := packKey(ref.BlockIdx, ref.RowIdx)
-						if _, ok := keyToBucket[pk]; ok {
-							colVals[pk] = val
-						}
-					}
-				}
-			case modules_shared.IntrinsicFormatFlat:
-				for j, ref := range col.BlockRefs {
-					pk := packKey(ref.BlockIdx, ref.RowIdx)
-					if _, ok := keyToBucket[pk]; !ok {
-						continue
-					}
-					var val string
-					if j < len(col.Uint64Values) {
-						val = strconv.FormatUint(col.Uint64Values[j], 10)
-					} else if j < len(col.BytesValues) {
-						val = string(col.BytesValues[j])
-					}
-					colVals[pk] = val
-				}
-			}
+			scanIntrinsicColVals(col, keyToBucket, colVals)
 		}
 
 		// Apply this column's values to out. Iterating keyToBucket ensures every in-range
@@ -488,6 +515,91 @@ func buildAggValsMap(
 	return out, nil
 }
 
+// streamHistogramGroupBy accumulates histogram buckets for the group-by path by
+// streaming the aggregate intrinsic column directly. Replaces the buildAggValsMap +
+// for-loop two-step for the HISTOGRAM function, eliminating the map[uint32]float64
+// allocation and amortizing boundary/boundaryStr computation across dict entries.
+//
+// NOTE-055: dict amortization — boundary and boundaryStr are computed once per dict
+// entry (typically ~30 distinct duration buckets) instead of once per span.
+func streamHistogramGroupBy(
+	r *modules_reader.Reader,
+	fieldName string,
+	keyToBucket map[uint32]int64,
+	groupKeyMap map[uint32]string,
+	buckets map[string]*aggBucketState,
+) error {
+	col, err := r.GetIntrinsicColumn(fieldName)
+	if err != nil {
+		return err
+	}
+	if col == nil {
+		// All spans absent from field → boundary-0 for every pk.
+		for pk, bucketIdx := range keyToBucket {
+			key := strconv.FormatInt(bucketIdx, 10) + "\x00" + groupKeyMap[pk] + "\x000"
+			intrinsicGetOrCreateBucket(buckets, key).count++
+		}
+		return nil
+	}
+
+	seen := make(map[uint32]struct{}, len(keyToBucket))
+
+	switch col.Format {
+	case modules_shared.IntrinsicFormatDict:
+		for _, entry := range col.DictEntries {
+			var v float64
+			if entry.Value != "" {
+				parsed, parseErr := strconv.ParseFloat(entry.Value, 64)
+				if parseErr != nil {
+					// Non-numeric: absent-row pass will emit boundary-0.
+					continue
+				}
+				v = parsed
+			} else {
+				v = float64(entry.Int64Val)
+			}
+			boundary := intrinsicHistogramBoundary(v, fieldName)
+			boundaryStr := strconv.FormatFloat(boundary, 'g', -1, 64)
+			for _, ref := range entry.BlockRefs {
+				pk := packKey(ref.BlockIdx, ref.RowIdx)
+				bucketIdx, ok := keyToBucket[pk]
+				if !ok {
+					continue
+				}
+				seen[pk] = struct{}{}
+				key := strconv.FormatInt(bucketIdx, 10) + "\x00" + groupKeyMap[pk] + "\x00" + boundaryStr
+				intrinsicGetOrCreateBucket(buckets, key).count++
+			}
+		}
+	case modules_shared.IntrinsicFormatFlat:
+		for i, ref := range col.BlockRefs {
+			if i >= len(col.Uint64Values) {
+				continue
+			}
+			pk := packKey(ref.BlockIdx, ref.RowIdx)
+			bucketIdx, ok := keyToBucket[pk]
+			if !ok {
+				continue
+			}
+			seen[pk] = struct{}{}
+			v := float64(col.Uint64Values[i])
+			boundary := intrinsicHistogramBoundary(v, fieldName)
+			key := strconv.FormatInt(bucketIdx, 10) + "\x00" + groupKeyMap[pk] + "\x00" +
+				strconv.FormatFloat(boundary, 'g', -1, 64)
+			intrinsicGetOrCreateBucket(buckets, key).count++
+		}
+	}
+
+	// Absent-row pass: pks not seen in the column → boundary-0.
+	for pk, bucketIdx := range keyToBucket {
+		if _, ok := seen[pk]; !ok {
+			key := strconv.FormatInt(bucketIdx, 10) + "\x00" + groupKeyMap[pk] + "\x000"
+			intrinsicGetOrCreateBucket(buckets, key).count++
+		}
+	}
+	return nil
+}
+
 // updateAggBucket updates a bucket with a single numeric value for non-count functions.
 func updateAggBucket(bucket *aggBucketState, fn string, v float64) {
 	switch fn {
@@ -514,7 +626,8 @@ func updateAggBucket(bucket *aggBucketState, fn string, v float64) {
 		bucket.mean += delta / float64(bucket.count)
 		bucket.m2 += delta * (v - bucket.mean)
 	default:
-		// HISTOGRAM: count-only; traceHistogramSeries reads bucket.count.
+		// Fallback for unrecognized aggregate functions: count only.
+		// NOTE: HISTOGRAM never reaches this path — it short-circuits to streamHistogramGroupBy.
 		bucket.count++
 	}
 }

@@ -203,6 +203,46 @@ Back-ref: `intrinsic_codec_bounds_test.go:TestScanFlatColumnRefs_InvalidBlockW`,
 
 ---
 
+## Intrinsic Buffer Pool Tests (NOTE-011)
+
+### SHARED-24: TestAcquireIntrinsicBuf_NonNil
+**Scenario:** AcquireIntrinsicBuf returns a non-nil *[]byte with a non-nil backing slice.
+**Assertions:** `bp != nil`, `*bp != nil`.
+Back-ref: `intrinsic_pool_test.go:TestAcquireIntrinsicBuf_NonNil`
+
+---
+
+### SHARED-25: TestReleaseIntrinsicBuf_ResetsLen
+**Scenario:** A buffer with 3 appended bytes is released; the next acquire returns len==0.
+**Assertions:** After `ReleaseIntrinsicBuf(bp)`, `AcquireIntrinsicBuf()` returns `len==0`.
+Back-ref: `intrinsic_pool_test.go:TestReleaseIntrinsicBuf_ResetsLen`
+
+---
+
+### SHARED-26: TestReleaseIntrinsicBuf_CapGuard
+**Scenario:** An oversized buffer (5MB > 4MB cap guard) is released; the pool discards it
+and returns a fresh 64KB buffer on the next acquire.
+**Assertions:** Reacquired buffer `len==0`; `cap <= 4MB`.
+Back-ref: `intrinsic_pool_test.go:TestReleaseIntrinsicBuf_CapGuard`
+
+---
+
+### SHARED-27: TestIntrinsicBufPool_DecodeCorrectness
+**Scenario:** A snappy-compressed blob is decoded using a pooled buffer; decoded bytes match
+the original input.
+**Assertions:** `snappy.Decode(*bp, compressed)` produces bytes equal to original.
+Back-ref: `intrinsic_pool_test.go:TestIntrinsicBufPool_DecodeCorrectness`
+
+---
+
+### SHARED-28: TestDecodeFlatPage_BytesAreCopied
+**Scenario:** `DecodeFlatPage` returns BytesValues that are independent copies of the raw
+input buffer. Mutating the raw input after decode must not affect the returned BytesValues.
+**Assertions:** `col.BytesValues[0]` equals original value after mutating `payload[2]`.
+Back-ref: `intrinsic_pool_test.go:TestDecodeFlatPage_BytesAreCopied`
+
+---
+
 ## Coverage Requirements
 
 - All bloom filter functions (`AddToBloom`, `TestBloom`, `BloomHash1`, `BloomHash2`, `SetBit`,
