@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Write Path &mdash; Blockpack</title>
+  <link rel="stylesheet" href="/assets/css/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <a href="/" class="topbar-brand">Blockpack Docs</a>
+    <a href="https://github.com/grafana/blockpack" class="topbar-github">GitHub &rarr;</a>
+  </header>
+  <div class="layout">
+    <nav class="sidebar">
+  <div class="sidebar-brand">BLOCKPACK</div>
+  <div class="section-label">Overview</div>
+  <a href="/">Home</a>
+  <a href="/file-format">File Format</a>
+  <div class="section-label">Query Paths</div>
+  <a href="/query-filter">Filter Query</a>
+  <a href="/query-intrinsic">Intrinsic Fast-Path</a>
+  <a href="/query-traceid">Trace by ID</a>
+  <a href="/query-metrics">Metrics Query</a>
+  <div class="section-label">Write Path</div>
+  <a href="/write-path" class="active">Write Pipeline</a>
+  <div class="section-label">Indexes</div>
+  <a href="/kll">KLL Sketches</a>
+  <a href="/cms">Count-Min Sketch</a>
+  <a href="/topk">TopK</a>
+  <a href="/hll">HyperLogLog</a>
+  <a href="/bloom-filter">Bloom Filters</a>
+  <a href="/intrinsic-columns">Intrinsic Columns</a>
+  <div class="section-label">Blocks</div>
+  <a href="/block-scoring">Block Scoring</a>
+  <a href="/block-format">Block Format</a>
+  <div class="section-label">Performance</div>
+  <a href="/benchmarks/">Benchmarks</a>
+  <a href="/production-results">Production Results</a>
+</nav>
+    <main class="content">
+
+<h1>Write Path</h1>
+
+<a href="/interactive/write-path" class="demo-link">
+  <div class="demo-link-text">
+    <div class="demo-link-title">Open Interactive Demo</div>
+    <div class="demo-link-sub">Watch spans organize into blocks through MinHash clustering and encoding</div>
+  </div>
+  <div class="demo-link-arrow">&rarr;</div>
+</a>
+
+<p>This page describes the complete journey from an incoming OTLP spans batch to a finished <code>.blockpack</code> file on disk. The write path is designed for high throughput with minimal memory overhead, deferring expensive work as long as possible and clustering data for maximum compression.</p>
+<h2>Overview</h2>
+<pre><code>AddTracesData / AddSpan / AddLogsData
+  &rarr; pendingSpan buffer (lightweight records, 88 bytes each)
+  &rarr; auto-flush at 5&times; MaxBlockSpans (default 10 000 spans)
+    &rarr; sort by (service.name, MinHashSig, TraceID)
+    &rarr; batched into blocks of &le; 2 000 spans each
+    &rarr; per block: column encoding, KLL sketch, CMS+HLL+TopK, BinaryFuse8 bloom
+  &rarr; Flush()
+    &rarr; apply KLL bucket boundaries to range index
+    &rarr; write metadata section (snappy-compressed)
+    &rarr; write file header
+    &rarr; write compact trace index
+    &rarr; write intrinsic section
+    &rarr; write footer V4
+</code></pre>
+<p>The only public entry points are <code>AddTracesData</code>, <code>AddSpan</code>, <code>AddLogsData</code>, and <code>Flush</code>. Everything else is internal batching and encoding.</p>
+<h2>Source</h2>
+<table>
+<thead>
+<tr><th>File</th><th>Purpose</th></tr>
+</thead>
+<tbody>
+<tr><td><a href="https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/writer/writer.go"><code>internal/modules/blockio/writer/writer.go</code></a></td><td>Main write API (<code>AddTracesData</code>, <code>Flush</code>)</td></tr>
+<tr><td><a href="https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/writer/writer_sort.go"><code>internal/modules/blockio/writer/writer_sort.go</code></a></td><td>MinHash clustering and sort</td></tr>
+<tr><td><a href="https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/writer/writer_block.go"><code>internal/modules/blockio/writer/writer_block.go</code></a></td><td>Block encoding, column selection</td></tr>
+<tr><td><a href="https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/writer/kll.go"><code>internal/modules/blockio/writer/kll.go</code></a></td><td>KLL sketch construction</td></tr>
+<tr><td><a href="https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/writer/sketch_index.go"><code>internal/modules/blockio/writer/sketch_index.go</code></a></td><td>CMS, HLL, TopK, BinaryFuse8 per block</td></tr>
+<tr><td><a href="https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/writer/intrinsic_accum.go"><code>internal/modules/blockio/writer/intrinsic_accum.go</code></a></td><td>Intrinsic column accumulation</td></tr>
+<tr><td><a href="https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/writer/metadata.go"><code>internal/modules/blockio/writer/metadata.go</code></a></td><td>Metadata serialization and index writing</td></tr>
+<tr><td><a href="https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/writer/range_index.go"><code>internal/modules/blockio/writer/range_index.go</code></a></td><td>Range index / KLL bucket assignment</td></tr>
+</tbody>
+</table>
+<hr>
+<h2>Stage 1: Span Ingestion</h2>
+<p>When <code>AddTracesData</code> or <code>AddSpan</code> is called, the writer does <strong>not</strong> immediately decode the span into column form. Instead it creates a <code>pendingSpan</code> record:</p>
+<pre><code class="language-go">type pendingSpan struct {
+    rs         *tracev1.ResourceSpans  // proto pointer (anchored in protoRoots)
+    ss         *tracev1.ScopeSpans
+    span       *tracev1.Span
+    svcName    string                  // sort key: zero-copy ref into proto
+    minHashSig [4]uint64               // MinHash of attribute set (4 &times; uint64)
+    traceID    [16]byte                // sort key (tertiary)
+    srcBlock   *reader.Block           // non-nil only on the compaction path
+    srcRowIdx  int
+}
+</code></pre>
+<p><strong>Size: ~88 bytes</strong> &mdash; a deliberate choice. The alternative (<code>BufferedSpan</code> with 13 pointer fields) was ~344 bytes and caused 3&times; RSS vs. Parquet for large WAL blocks. By storing only proto pointers and sort keys, the writer keeps 10 000 spans in under 1 MB while deferring all <code>AttrKV</code> materialization to flush time.</p>
+<p>The proto root is anchored in <code>w.protoRoots</code> until <code>flushBlocks()</code> processes it. After flushing, <code>protoRoots</code> is cleared so the GC can reclaim that batch's memory.</p>
+<p><strong>Auto-flush</strong> triggers when <code>len(w.pending) &gt;= MaxBufferedSpans</code> (default: 5 &times; <code>MaxBlockSpans</code> = 10 000). This bounds live memory to roughly one batch of five blocks.</p>
+<hr>
+<h2>Stage 2: MinHash Clustering</h2>
+<p>Before block assignment, <code>flushBlocks()</code> sorts the pending buffer by:</p>
+<pre><code>(service.name ASC, MinHashSig ASC, TraceID ASC)
+</code></pre>
+<p><strong>MinHashSig</strong> is computed at ingestion time (in <code>computeMinHashSigFromProto</code>) using classic bottom-k MinHash: hash all <code>key=value</code> pairs using FNV-1a; keep the four smallest hashes. Spans with similar attribute sets (same region, environment, version, etc.) produce similar MinHash signatures and therefore land adjacent in the sort order.</p>
+<p>Why this matters for compression: within a block, adjacent spans are likely to share the same resource attributes (service name, region, env). Dictionary columns for <code>resource.*</code> attributes then compress near-perfectly &mdash; the dictionary has few entries, and the index array is nearly constant. In real workloads this contributes meaningfully to the 10&ndash;50&times; compression ratio.</p>
+<p>The sort is applied to a separate index slice (O(n log n) comparisons without copying <code>pendingSpan</code> values), then the final permutation is applied in a single O(n) copy pass.</p>
+<hr>
+<h2>Stage 3: Block Batching</h2>
+<p>After sorting, the buffer is sliced into blocks of at most <code>MaxBlockSpans</code> spans (default <strong>2 000</strong>). Each block gets a sequentially-assigned block ID (0-based <code>uint16</code>). The maximum is 65 534 blocks per file.</p>
+<p><code>buildAndWriteBlock</code> constructs each block from its slice of <code>pendingSpan</code> records, writes the serialized bytes immediately to the output stream, and returns per-block statistics (min/max per column, sketch data, trace rows).</p>
+<p>Blocks are written <strong>immediately</strong> &mdash; the writer streams to disk rather than buffering the entire file in memory.</p>
+<hr>
+<h2>Stage 4: Column Encoding</h2>
+<p>Full OTLP-to-column decoding happens in <code>addRowFromProto</code>, called once per span inside <code>buildBlock</code>. Each span's attributes are decoded into typed column builders (<code>stringColumnBuilder</code>, <code>uint64ColumnBuilder</code>, etc.), which accumulate values until <code>finalize()</code> serializes the block.</p>
+<p>The writer selects among <strong>11 encoding kinds</strong> at finalize time (kinds 1, 2, 5&ndash;13; kinds 3&ndash;4 are reader-only legacy formats):</p>
+<table>
+<thead>
+<tr><th>Kind</th><th>Name</th><th>Used for</th></tr>
+</thead>
+<tbody>
+<tr><td>1</td><td>Dictionary</td><td>String/numeric columns with low-to-medium cardinality; dict payload zstd-compressed</td></tr>
+<tr><td>2</td><td>Sparse Dictionary</td><td>Same as Dictionary but with sparse presence (>50% nulls)</td></tr>
+<tr><td>5</td><td>Delta Uint64</td><td>Uint64 columns where range &le; 65 535, or range &le; uint32 with cardinality > 3</td></tr>
+<tr><td>6</td><td>RLE Indexes</td><td>Index arrays when cardinality &le; 3 (e.g., boolean-like enums)</td></tr>
+<tr><td>7</td><td>Sparse RLE Indexes</td><td>Sparse variant of RLE Indexes</td></tr>
+<tr><td>8</td><td>XOR Bytes</td><td>Bytes columns (non-URL, non-trace-ID): XOR against previous row, zstd</td></tr>
+<tr><td>9</td><td>Sparse XOR Bytes</td><td>Sparse variant of XOR Bytes</td></tr>
+<tr><td>10</td><td>Prefix Bytes</td><td>URL/path columns (<code>.url</code>, <code>.uri</code>, <code>.path</code>, <code>.target</code>): shared-prefix dictionary</td></tr>
+<tr><td>11</td><td>Sparse Prefix Bytes</td><td>Sparse variant of Prefix Bytes</td></tr>
+<tr><td>12</td><td>Delta Dictionary</td><td><code>trace:id</code> column: delta encoding within a sorted dictionary</td></tr>
+<tr><td>13</td><td>Sparse Delta Dictionary</td><td>Sparse variant of Delta Dictionary</td></tr>
+</tbody>
+</table>
+<p><strong>Selection logic</strong> (<code>encoding_select.go</code>):</p>
+<ul>
+<li>Bytes columns &rarr; XOR (kind 8/9) or Prefix (kind 10/11) based on <code>isURLColumn</code></li>
+<li><code>trace:id</code> specifically &rarr; Delta Dictionary (kind 12/13)</li>
+<li>Other ID columns (<code>.id</code>, <code>_id</code> suffix, <code>span:id</code>, <code>span:parent_id</code>) &rarr; XOR (kind 8/9)</li>
+<li>Uint64 columns &rarr; Delta (kind 5) when <code>shouldUseDeltaEncoding</code> returns true; otherwise Dictionary (kind 1/2)</li>
+<li>All other numeric/string columns &rarr; Dictionary (kind 1/2) or RLE Indexes (kind 6/7) when cardinality &le; 3</li>
+</ul>
+<p>Presence is encoded using RLE over a bitset (not stored per-value), so sparse columns pay only for their non-null rows.</p>
+<p>All column data blobs are individually zstd-compressed (or snappy for metadata), then written contiguously in the block with a column metadata header.</p>
+<hr>
+<h2>Stage 5: KLL Sketches</h2>
+<p>During block construction, <code>buildAndWriteBlock</code> feeds each block's observed <code>(column, minValue, maxValue)</code> pair into a per-column KLL sketch in the <code>rangeIndex</code>. At <code>Flush()</code> time, <code>applyRangeBuckets</code> calls each KLL sketch's <code>Boundaries(1000)</code> to produce 1 000 quantile bucket boundaries, then assigns each block to all overlapping buckets.</p>
+<p>The resulting range index is used at query time for <strong>interval-match pruning</strong> &mdash; for example, <code>span:duration &gt; 5ms</code> prunes all blocks whose maximum duration falls below 5ms without reading block data.</p>
+<p>See <a href="/kll">KLL.md</a> for algorithm details.</p>
+<hr>
+<h2>Stage 6: CMS + HLL + TopK</h2>
+<p>During every call to <code>updateMinMax</code> (once per non-null value in each column), the writer also feeds the encoded value key into three sketch accumulators via <code>blockSketchSet.add</code>:</p>
+<ul>
+<li><strong>HyperLogLog</strong> &mdash; cardinality estimate per column per block</li>
+<li><strong>Count-Min Sketch</strong> &mdash; frequency estimate per column per block</li>
+<li><strong>TopK</strong> &mdash; top-20 most frequent values per column per block</li>
+</ul>
+<p>These are accumulated per block and serialized in the sketch index section at <code>Flush()</code>.</p>
+<p>See <a href="/hll">HLL.md</a>, <a href="/cms">CMS.md</a>, and <a href="/topk">TopK.md</a> for algorithm details.</p>
+<hr>
+<h2>Stage 7: Bloom Filters (BinaryFuse8)</h2>
+<p>Also during <code>updateMinMax</code>, every value key is hashed (via <code>sketch.HashForFuse</code>) and appended to a <code>keys []uint64</code> slice per column per block. At the end of <code>writeSketchIndexSection</code>, a <code>BinaryFuse8</code> filter is constructed from those keys and serialized alongside each column's CMS and HLL data.</p>
+<p>At query time, the fuse filter answers "does this column in this block contain value X?" with no false negatives (~0.39% false positive rate).</p>
+<p>There is also a <strong>file-level bloom filter</strong> (FBLM) over <code>resource.service.name</code> across the entire file, allowing a single <code>Contains</code> check to skip all block I/O when the queried service is not in the file at all.</p>
+<p>See <a href="/bloom-filter">Bloom-Filter.md</a> for details.</p>
+<hr>
+<h2>Stage 8: Intrinsic Columns</h2>
+<p>Alongside each per-block column builder, the writer maintains a file-level <code>intrinsicAccumulator</code>. Intrinsic columns are fed into it row-by-row during block building.</p>
+<p><strong>Core columns (always present):</strong></p>
+<ul>
+<li><code>trace:id</code> &mdash; bytes</li>
+<li><code>span:name</code>, <code>resource.service.name</code> &mdash; strings (dict-encoded file-wide)</li>
+<li><code>span:start</code>, <code>span:duration</code> &mdash; uint64 flat</li>
+<li><code>span:kind</code> &mdash; int64 dict</li>
+</ul>
+<p><strong>Conditional columns (fed only when the value is present):</strong></p>
+<ul>
+<li><code>span:id</code>, <code>span:parent_id</code> &mdash; bytes (absent for root spans or spans with no parent)</li>
+<li><code>span:status</code>, <code>span:status_message</code> &mdash; int64 dict / string (absent when the span has no Status object)</li>
+</ul>
+<p>At <code>Flush()</code>, these are encoded and written as a contiguous intrinsic section, with a TOC (Table of Contents) blob pointing to each column blob. Intrinsic columns are stored sorted by value with <code>BlockRef</code> pointers back to block+row, enabling tag discovery (<code>SearchTags</code>, <code>SearchTagValues</code>) and certain query patterns without reading any block data.</p>
+<p>See <a href="/intrinsic-columns">Intrinsic-Columns.md</a> for details.</p>
+<hr>
+<h2>Stage 9: Indexes + FBLM</h2>
+<p>After all blocks are written, <code>Flush()</code> writes the following file-level structures in order:</p>
+<table>
+<thead>
+<tr><th>Structure</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Metadata section</strong></td><td>snappy-compressed; contains block index, range index, trace&rarr;block index, TS index, sketch index</td></tr>
+<tr><td><strong>File header</strong></td><td>Version, signal type, metadata offset + length</td></tr>
+<tr><td><strong>Compact trace index</strong></td><td>Binary-sorted (TraceID &rarr; []uint16 block IDs) for single-trace fetch</td></tr>
+<tr><td><strong>Intrinsic section</strong></td><td>File-level columnar data for core and conditional intrinsic attributes + TOC</td></tr>
+<tr><td><strong>Footer V4</strong></td><td>Offsets to header, compact index, and intrinsic section</td></tr>
+</tbody>
+</table>
+<p>The <strong>TS index</strong> records per-block (minStart, maxStart) pairs sorted for direction-aware traversal (newest-first or oldest-first queries). The <strong>range index</strong> contains, per column, a map from KLL bucket key to sorted block IDs. The <strong>trace index</strong> maps each TraceID to all block IDs that contain spans from that trace.</p>
+<hr>
+<h2>Size Breakdown (Approximate, Per 2 000-Span Block)</h2>
+<p>These numbers vary widely with data characteristics (cardinality, attribute count, value sizes).</p>
+<table>
+<thead>
+<tr><th>Structure</th><th>Typical size</th><th>Notes</th></tr>
+</thead>
+<tbody>
+<tr><td>Block header</td><td>24 bytes</td><td>Fixed</td></tr>
+<tr><td>Column metadata array</td><td>200&ndash;600 bytes</td><td>Scales with column count</td></tr>
+<tr><td><code>trace:id</code> column</td><td>5&ndash;10 KB</td><td>Delta-dict encoded, high entropy</td></tr>
+<tr><td><code>span:id</code> column</td><td>2&ndash;5 KB</td><td>XOR encoded</td></tr>
+<tr><td><code>span:start</code> column</td><td>1&ndash;3 KB</td><td>Delta encoded (timestamps are monotone)</td></tr>
+<tr><td><code>span:duration</code> column</td><td>1&ndash;4 KB</td><td>Delta or dict</td></tr>
+<tr><td><code>span:name</code> column</td><td>1&ndash;5 KB</td><td>Dict, usually low cardinality</td></tr>
+<tr><td>Dynamic attribute columns</td><td>2&ndash;20 KB</td><td>Highly variable</td></tr>
+<tr><td>KLL sketch data</td><td>200&ndash;500 bytes per range column</td><td>Serialized in range index</td></tr>
+<tr><td>HLL per column</td><td>16 bytes</td><td>Fixed-size per column per block</td></tr>
+<tr><td>CMS per column</td><td>512 bytes</td><td>Fixed-size per column per block</td></tr>
+<tr><td>TopK per column</td><td>~200 bytes typical</td><td>20 entries &times; ~10 bytes each</td></tr>
+<tr><td>BinaryFuse8 per column</td><td>~N bytes (N = distinct values)</td><td>~1 byte per distinct value</td></tr>
+<tr><td><strong>Total typical block</strong></td><td><strong>20&ndash;80 KB compressed</strong></td><td>Uncompressed ~100&ndash;400 KB</td></tr>
+</tbody>
+</table>
+
+    </main>
+  </div>
+</body>
+</html>

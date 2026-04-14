@@ -1,0 +1,1865 @@
+<!DOCTYPE html>
+<html>
+<head>
+	<meta charset="UTF-8">
+	<title>Benchmark Report - OTEL Generator Demo Data & Format Comparison</title>
+	<style>
+		body {
+			font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+			max-width: 1800px;
+			margin: 40px auto;
+			padding: 0 20px;
+			background: #f5f5f5;
+		}
+		h1 {
+			color: #333;
+			text-align: center;
+			margin-bottom: 20px;
+		}
+		.metadata {
+			text-align: center;
+			color: #666;
+			margin-bottom: 30px;
+			font-size: 14px;
+		}
+		.summary {
+			background: white;
+			padding: 20px;
+			margin-bottom: 30px;
+			border-radius: 4px;
+			box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+		}
+		.toc {
+			background: white;
+			padding: 20px;
+			margin-bottom: 30px;
+			border-radius: 4px;
+			box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+		}
+		.toc h2 {
+			margin-top: 0;
+			color: #333;
+			font-size: 18px;
+		}
+		.toc ul {
+			list-style: none;
+			padding: 0;
+			margin: 0;
+		}
+		.toc li {
+			margin: 10px 0;
+			padding-left: 20px;
+		}
+		.toc a {
+			color: #2c3e50;
+			text-decoration: none;
+			font-weight: 500;
+		}
+		.toc a:hover {
+			color: #3498db;
+			text-decoration: underline;
+		}
+		.summary h2 {
+			margin-top: 0;
+			color: #333;
+			font-size: 18px;
+		}
+		.summary-stat {
+			margin: 12px 0;
+			font-size: 15px;
+		}
+		.summary-stat strong {
+			color: #2c3e50;
+		}
+		.section-header {
+			background: #2c3e50;
+			color: white;
+			padding: 20px;
+			margin: 50px -20px 20px -20px; /* Negative margins to break out of body padding */
+			border-radius: 4px;
+			text-align: center;
+			font-size: 1.5rem;
+			font-weight: 600;
+			width: calc(100% + 40px); /* Full width including body padding */
+		}
+		button.section-header {
+			border: none;
+			font-family: inherit;
+			display: block;
+		}
+		.section-header.collapsible {
+			cursor: pointer;
+			user-select: none;
+		}
+		.section-header.collapsible:hover {
+			background: #34495e;
+		}
+		.chevron {
+			font-size: 0.8em;
+			display: inline-block;
+			transition: transform 0.2s;
+		}
+		.collapsible-content {
+			display: block; /* Sections start expanded */
+		}
+		table {
+			width: 100%;
+			border-collapse: collapse;
+			background: white;
+			box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+			margin-bottom: 30px;
+		}
+		th {
+			background: #2c3e50;
+			color: white;
+			padding: 12px;
+			text-align: left;
+			font-weight: 600;
+			font-size: 14px;
+		}
+		th.numeric {
+			text-align: right;
+		}
+		th.blockpack-col {
+			background: #27ae60;
+		}
+		th.aggregation-col {
+			background: #27ae60;
+		}
+		th.parquet-col {
+			background: #3498db;
+			border-left: 2px solid #ddd;
+		}
+		/* Vertical line between Blockpack and Parquet sections */
+		table.comparison-table tbody tr td:nth-child(10) {
+			border-left: 2px solid #ddd;
+		}
+		table.aggregation-comparison th.parquet-start,
+		table.aggregation-comparison td.parquet-start {
+			border-left: 2px solid #ddd;
+		}
+		td {
+			padding: 12px;
+			border-bottom: 1px solid #eee;
+		}
+		td.numeric {
+			text-align: right;
+			font-family: 'Monaco', 'Courier New', monospace;
+			font-size: 13px;
+		}
+		tr:hover {
+			background: #f9f9f9;
+		}
+		.query-name {
+			font-weight: 600;
+			font-size: 15px;
+		}
+		.query-name a {
+			color: #2c3e50;
+			text-decoration: none;
+		}
+		.query-name a:hover {
+			color: #3498db;
+			text-decoration: underline;
+		}
+		.metric {
+			font-family: 'Monaco', 'Courier New', monospace;
+			font-size: 13px;
+		}
+		.category-title {
+			font-size: 1.3rem;
+			margin-top: 40px;
+			margin-bottom: 16px;
+			color: #333;
+			padding: 10px;
+			background: white;
+			border-left: 4px solid #3498db;
+			box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+		}
+		.excellent {
+			color: #27ae60;
+			font-weight: 600;
+		}
+		.good {
+			color: #2ecc71;
+		}
+		.okay {
+			color: #f39c12;
+		}
+		.slow {
+			color: #e74c3c;
+		}
+		.winner-blockpack {
+			border-bottom: 2px solid #27ae60;
+			font-weight: 600;
+		}
+		.winner-aggregation {
+			border-bottom: 2px solid #27ae60;
+			font-weight: 600;
+		}
+		.winner-parquet {
+			border-bottom: 2px solid #3498db;
+			font-weight: 600;
+		}
+		.win-cell {
+			text-align: center;
+			font-weight: 700;
+			font-size: 0.85em;
+			white-space: nowrap;
+			vertical-align: middle;
+		}
+		.win-cell-blockpack {
+			background-color: #27ae60;
+			color: white;
+		}
+		.win-cell-parquet {
+			background-color: #3498db;
+			color: white;
+		}
+		.file-size-bar {
+			display: flex;
+			align-items: center;
+			justify-content: center;
+			gap: 12px;
+			margin: 8px 0 20px 0;
+			font-size: 14px;
+		}
+		.file-size-pill {
+			display: inline-block;
+			padding: 4px 14px;
+			border-radius: 20px;
+			font-weight: 600;
+			color: white;
+			font-size: 13px;
+		}
+		.file-size-pill-blockpack { background-color: #27ae60; }
+		.file-size-pill-parquet  { background-color: #3498db; }
+		.file-size-ratio {
+			color: #555;
+			font-size: 13px;
+		}
+		.speedup-blockpack {
+			color: #27ae60;
+			font-weight: 600;
+		}
+		.speedup-parquet {
+			color: #3498db;
+			font-weight: 600;
+		}
+		.legend {
+			text-align: center;
+			margin-top: 30px;
+			color: #666;
+			font-size: 14px;
+			margin-bottom: 40px;
+		}
+		.query-definitions {
+			margin-top: 50px;
+			margin-bottom: 50px;
+		}
+		.query-def {
+			background: white;
+			padding: 20px;
+			margin-bottom: 20px;
+			border-radius: 4px;
+			box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+		}
+		.query-def h3 {
+			margin-top: 0;
+			color: #2c3e50;
+			font-size: 16px;
+			border-bottom: 2px solid #3498db;
+			padding-bottom: 10px;
+		}
+		.query-def pre {
+			background: #f8f9fa;
+			padding: 12px;
+			border-radius: 3px;
+			overflow-x: auto;
+			font-size: 13px;
+			line-height: 1.5;
+			margin: 10px 0;
+		}
+		.query-def .description {
+			color: #666;
+			font-style: italic;
+			margin-bottom: 10px;
+		}
+		.cost-tooltip {
+			cursor: help;
+			text-decoration: underline dotted;
+			text-decoration-color: #999;
+		}
+		.cost-tooltip:hover {
+			font-weight: 600;
+		}
+	</style>
+	<script>
+		function toggleSection(header) {
+			const content = header.nextElementSibling;
+			const chevron = header.querySelector('.chevron');
+
+			const isHidden = content.style.display === 'none';
+			if (isHidden) {
+				content.style.display = 'block';
+				content.setAttribute('aria-hidden', 'false');
+				chevron.textContent = '▼';
+				header.setAttribute('aria-expanded', 'true');
+			} else {
+				content.style.display = 'none';
+				content.setAttribute('aria-hidden', 'true');
+				chevron.textContent = '▶';
+				header.setAttribute('aria-expanded', 'false');
+			}
+		}
+
+		function initCollapsibleSections() {
+			// Find elements that invoke toggleSection via an inline onclick handler
+			const headers = document.querySelectorAll('[onclick^="toggleSection"]');
+			headers.forEach((header) => {
+				// Make header behave like a button for assistive technologies
+				header.setAttribute('role', 'button');
+				if (!header.hasAttribute('tabindex')) {
+					header.setAttribute('tabindex', '0');
+				}
+
+				const content = header.nextElementSibling;
+				const isHidden = content && content.style.display === 'none';
+				header.setAttribute('aria-expanded', isHidden ? 'false' : 'true');
+				if (content) {
+					content.setAttribute('aria-hidden', isHidden ? 'true' : 'false');
+				}
+
+				header.addEventListener('keydown', function (event) {
+					const key = event.key || event.code;
+					if (key === 'Enter' || key === ' ' || key === 'Spacebar') {
+						event.preventDefault();
+						toggleSection(header);
+					}
+				});
+			});
+		}
+
+		if (document.readyState === 'loading') {
+			document.addEventListener('DOMContentLoaded', initCollapsibleSections);
+		} else {
+			initCollapsibleSections();
+		}
+	</script>
+</head>
+<body>
+	<h1>Comprehensive Benchmark Report</h1>
+	<div class="metadata">
+		OTEL Generator Demo Data Queries (Blockpack) + Format Comparison (Blockpack vs Parquet)<br>
+		Generated March 24, 2026 at 08:59 AM
+	</div>
+
+	<div class="io-info" style="background: #fff3cd; border-left: 4px solid #ffc107; padding: 15px; margin-bottom: 20px; border-radius: 4px;">
+		<h3 style="margin-top: 0; color: #856404;">⚠️ S3 Latency Simulation</h3>
+		<p style="margin: 0; color: #856404;">
+			<strong>All benchmarks include artificial 20ms latency per I/O operation</strong> to simulate otel-demo-data AWS S3 performance characteristics.
+			This reflects typical first-byte latency (10-20ms) for S3 requests within the same region. Total execution time = processing time + (I/O ops × 20ms).
+		</p>
+	</div>
+
+	<div class="summary">
+		<h2>📊 Overview</h2>
+		<div class="summary-stat"><strong>OTEL Generator Demo Data Queries:</strong> 19 (actual trace data, blockpack vs parquet)</div>
+		<div class="summary-stat"><strong>Limited Queries:</strong> 0 (blockpack vs parquet, max 20 traces × 3 spans)</div>
+		<div class="summary-stat"><strong>Trace-by-ID:</strong> 1 (single trace retrieval, blockpack vs parquet)</div>
+		<div class="summary-stat"><strong>Aggregation Comparisons:</strong> 0 (aggregation vs manual vs parquet)</div>
+		<div class="summary-stat"><strong>Format Comparisons:</strong> 30 (synthetic data, blockpack vs parquet)</div>
+	</div>
+
+	<div class="toc">
+		<h2>📑 Table of Contents</h2>
+		<ul>
+			<li><a href="#otel-demo-data">🌍 OTEL Generator Demo Data Queries (Blockpack vs Parquet)</a></li>
+			<li><a href="#limited">🎯 Limited Queries (Blockpack vs Parquet)</a></li>
+			<li><a href="#trace-by-id">🔍 Get Trace by ID (Blockpack vs Parquet)</a></li>
+			<li><a href="#aggregation-comparison">📊 Aggregation vs Parquet</a></li>
+			<li><a href="#format-comparison">⚖️ Format Comparison (Blockpack vs Parquet)</a></li>
+			<li><a href="#write-path">💾 Write Path (Blockpack vs Parquet)</a></li>
+			<li><a href="#query-definitions">📝 Query Definitions</a></li>
+		</ul>
+	</div>
+	
+	<button type="button" class="section-header collapsible" id="otel-demo-data" onclick="toggleSection(this)" aria-expanded="true" aria-controls="otel-demo-data-content">
+		<span class="chevron">▼</span> 🌍 OTEL Generator Demo Data Queries (Blockpack vs Parquet)
+	</button>
+	<div class="collapsible-content" id="otel-demo-data-content" aria-hidden="false">
+	<div style="text-align: center; color: #666; margin-bottom: 30px;">
+		Actual trace data from e-commerce demo • 669,886 spans
+	</div>
+	<div class="file-size-bar">
+	<span class="file-size-pill file-size-pill-blockpack">Blockpack 10.6 MB</span>
+	<span class="file-size-pill file-size-pill-parquet">Parquet 9.6 MB</span>
+	<span class="file-size-ratio">Blockpack is <strong>1.1x larger</strong></span>
+</div>
+
+	<table class="comparison-table">
+		<thead>
+			<tr>
+				<th rowspan="2">Query</th>
+				<th rowspan="2" style="text-align:center; min-width:90px">Win</th>
+				<th colspan="9" class="blockpack-col" style="text-align: center;">Blockpack</th>
+				<th colspan="9" class="parquet-col" style="text-align: center;">Parquet</th>
+			</tr>
+			<tr>
+				<th class="numeric blockpack-col">Wall</th>
+				<th class="numeric blockpack-col">CPU</th>
+				<th class="numeric blockpack-col">Bytes Read</th>
+				<th class="numeric blockpack-col">I/O Ops</th>
+				<th class="numeric blockpack-col">Traces</th>
+				<th class="numeric blockpack-col">Spans</th>
+				<th class="numeric blockpack-col">Memory</th>
+				<th class="numeric blockpack-col">Allocations</th>
+				<th class="numeric blockpack-col">Cost</th>
+				<th class="numeric parquet-col">Wall</th>
+				<th class="numeric parquet-col">CPU</th>
+				<th class="numeric parquet-col">Bytes Read</th>
+				<th class="numeric parquet-col">I/O Ops</th>
+				<th class="numeric parquet-col">Traces</th>
+				<th class="numeric parquet-col">Spans</th>
+				<th class="numeric parquet-col">Memory</th>
+				<th class="numeric parquet-col">Allocations</th>
+				<th class="numeric parquet-col">Cost</th>
+			</tr>
+		</thead>
+		<tbody>
+			<tr>
+				<td class="query-name"><a href="#query-rw-article-operations">Article Operations</a></td>
+				<td class="win-cell win-cell-blockpack">blockpack<br><small>(1.7x faster)<br>score: 340.97ms</small></td>
+				<td class="metric numeric winner-blockpack">204.97ms <span style="color: #999; font-size: 0.85em;">(1.9x)</span></td>
+				<td class="metric numeric winner-blockpack">136.00ms <span style="color: #999; font-size: 0.85em;">(1.3x)</span></td>
+				<td class="metric numeric">4.81 MB</td>
+				<td class="metric numeric winner-blockpack">6 <span style="color: #999; font-size: 0.85em;">(2.3x)</span></td>
+				<td class="metric numeric">12,500</td>
+				<td class="metric numeric">75,000</td>
+				<td class="metric numeric winner-blockpack">137.96 MB <span style="color: #999; font-size: 0.85em;">(1.4x)</span></td>
+				<td class="metric numeric">1,743,992</td>
+				<td class="metric numeric winner-blockpack"><span class="cost-tooltip" title="S3 GET: $0.000002&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000003&#10;Lambda Requests: $0.000000&#10;Total: $0.000006">$0.000006</span> <span style="color: #999; font-size: 0.85em;">(2.1x)</span></td>
+				<td class="metric numeric">399.60ms</td>
+				<td class="metric numeric">183.40ms</td>
+				<td class="metric numeric winner-parquet">3.21 MB <span style="color: #999; font-size: 0.85em;">(1.5x)</span></td>
+				<td class="metric numeric">14</td>
+				<td class="metric numeric">12,500</td>
+				<td class="metric numeric">75,000</td>
+				<td class="metric numeric">195.86 MB</td>
+				<td class="metric numeric winner-parquet">1,656,380 <span style="color: #999; font-size: 0.85em;">(1.1x)</span></td>
+				<td class="metric numeric"><span class="cost-tooltip" title="S3 GET: $0.000006&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000007&#10;Lambda Requests: $0.000000&#10;Total: $0.000013">$0.000013</span></td>
+			</tr>
+			<tr>
+				<td class="query-name"><a href="#query-rw-auth-failures">Auth Failures</a></td>
+				<td class="win-cell win-cell-blockpack">blockpack<br><small>(2.5x faster)<br>score: 166.22ms</small></td>
+				<td class="metric numeric winner-blockpack">139.89ms <span style="color: #999; font-size: 0.85em;">(2.6x)</span></td>
+				<td class="metric numeric winner-blockpack">26.33ms <span style="color: #999; font-size: 0.85em;">(2.1x)</span></td>
+				<td class="metric numeric">4.71 MB</td>
+				<td class="metric numeric winner-blockpack">6 <span style="color: #999; font-size: 0.85em;">(2.7x)</span></td>
+				<td class="metric numeric">6,250</td>
+				<td class="metric numeric">6,250</td>
+				<td class="metric numeric winner-blockpack">35.01 MB <span style="color: #999; font-size: 0.85em;">(1.1x)</span></td>
+				<td class="metric numeric winner-blockpack">300,776 <span style="color: #999; font-size: 0.85em;">(1.1x)</span></td>
+				<td class="metric numeric winner-blockpack"><span class="cost-tooltip" title="S3 GET: $0.000002&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000002&#10;Lambda Requests: $0.000000&#10;Total: $0.000005">$0.000005</span> <span style="color: #999; font-size: 0.85em;">(2.6x)</span></td>
+				<td class="metric numeric">361.94ms</td>
+				<td class="metric numeric">55.31ms</td>
+				<td class="metric numeric winner-parquet">3.39 MB <span style="color: #999; font-size: 0.85em;">(1.4x)</span></td>
+				<td class="metric numeric">16</td>
+				<td class="metric numeric">6,250</td>
+				<td class="metric numeric">6,250</td>
+				<td class="metric numeric">37.30 MB</td>
+				<td class="metric numeric">343,716</td>
+				<td class="metric numeric"><span class="cost-tooltip" title="S3 GET: $0.000006&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000006&#10;Lambda Requests: $0.000000&#10;Total: $0.000013">$0.000013</span></td>
+			</tr>
+			<tr>
+				<td class="query-name"><a href="#query-rw-auth-name-operations">Auth Name Operations</a></td>
+				<td class="win-cell win-cell-blockpack">blockpack<br><small>(2.0x faster)<br>score: 292.83ms</small></td>
+				<td class="metric numeric winner-blockpack">189.73ms <span style="color: #999; font-size: 0.85em;">(2.1x)</span></td>
+				<td class="metric numeric winner-blockpack">103.10ms <span style="color: #999; font-size: 0.85em;">(1.7x)</span></td>
+				<td class="metric numeric">4.81 MB</td>
+				<td class="metric numeric winner-blockpack">6 <span style="color: #999; font-size: 0.85em;">(2.3x)</span></td>
+				<td class="metric numeric">25,000</td>
+				<td class="metric numeric">50,000</td>
+				<td class="metric numeric winner-blockpack">114.65 MB <span style="color: #999; font-size: 0.85em;">(1.4x)</span></td>
+				<td class="metric numeric winner-blockpack">1,365,297 <span style="color: #999; font-size: 0.85em;">(1.2x)</span></td>
+				<td class="metric numeric winner-blockpack"><span class="cost-tooltip" title="S3 GET: $0.000002&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000003&#10;Lambda Requests: $0.000000&#10;Total: $0.000006">$0.000006</span> <span style="color: #999; font-size: 0.85em;">(2.2x)</span></td>
+				<td class="metric numeric">396.92ms</td>
+				<td class="metric numeric">179.20ms</td>
+				<td class="metric numeric winner-parquet">3.21 MB <span style="color: #999; font-size: 0.85em;">(1.5x)</span></td>
+				<td class="metric numeric">14</td>
+				<td class="metric numeric">25,000</td>
+				<td class="metric numeric">50,000</td>
+				<td class="metric numeric">155.27 MB</td>
+				<td class="metric numeric">1,631,316</td>
+				<td class="metric numeric"><span class="cost-tooltip" title="S3 GET: $0.000006&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000007&#10;Lambda Requests: $0.000000&#10;Total: $0.000012">$0.000012</span></td>
+			</tr>
+			<tr>
+				<td class="query-name"><a href="#query-rw-auth-service-spans">Auth Service Spans</a></td>
+				<td class="win-cell win-cell-blockpack">blockpack<br><small>(2.6x faster)<br>score: 207.77ms</small></td>
+				<td class="metric numeric winner-blockpack">155.27ms <span style="color: #999; font-size: 0.85em;">(2.5x)</span></td>
+				<td class="metric numeric winner-blockpack">52.50ms <span style="color: #999; font-size: 0.85em;">(2.7x)</span></td>
+				<td class="metric numeric">4.71 MB</td>
+				<td class="metric numeric winner-blockpack">6 <span style="color: #999; font-size: 0.85em;">(2.5x)</span></td>
+				<td class="metric numeric">25,000</td>
+				<td class="metric numeric">25,000</td>
+				<td class="metric numeric winner-blockpack">60.86 MB <span style="color: #999; font-size: 0.85em;">(1.6x)</span></td>
+				<td class="metric numeric winner-blockpack">656,022 <span style="color: #999; font-size: 0.85em;">(2.0x)</span></td>
+				<td class="metric numeric winner-blockpack"><span class="cost-tooltip" title="S3 GET: $0.000002&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000003&#10;Lambda Requests: $0.000000&#10;Total: $0.000005">$0.000005</span> <span style="color: #999; font-size: 0.85em;">(2.5x)</span></td>
+				<td class="metric numeric">394.10ms</td>
+				<td class="metric numeric">139.80ms</td>
+				<td class="metric numeric winner-parquet">3.21 MB <span style="color: #999; font-size: 0.85em;">(1.5x)</span></td>
+				<td class="metric numeric">15</td>
+				<td class="metric numeric">25,000</td>
+				<td class="metric numeric">25,000</td>
+				<td class="metric numeric">95.73 MB</td>
+				<td class="metric numeric">1,287,440</td>
+				<td class="metric numeric"><span class="cost-tooltip" title="S3 GET: $0.000006&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000007&#10;Lambda Requests: $0.000000&#10;Total: $0.000013">$0.000013</span></td>
+			</tr>
+			<tr>
+				<td class="query-name"><a href="#query-rw-auth-services">Auth Services</a></td>
+				<td class="win-cell win-cell-blockpack">blockpack<br><small>(2.6x faster)<br>score: 207.81ms</small></td>
+				<td class="metric numeric winner-blockpack">155.13ms <span style="color: #999; font-size: 0.85em;">(2.6x)</span></td>
+				<td class="metric numeric winner-blockpack">52.68ms <span style="color: #999; font-size: 0.85em;">(2.7x)</span></td>
+				<td class="metric numeric">4.71 MB</td>
+				<td class="metric numeric winner-blockpack">6 <span style="color: #999; font-size: 0.85em;">(2.5x)</span></td>
+				<td class="metric numeric">25,000</td>
+				<td class="metric numeric">25,000</td>
+				<td class="metric numeric winner-blockpack">61.04 MB <span style="color: #999; font-size: 0.85em;">(1.6x)</span></td>
+				<td class="metric numeric winner-blockpack">654,340 <span style="color: #999; font-size: 0.85em;">(2.0x)</span></td>
+				<td class="metric numeric winner-blockpack"><span class="cost-tooltip" title="S3 GET: $0.000002&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000003&#10;Lambda Requests: $0.000000&#10;Total: $0.000005">$0.000005</span> <span style="color: #999; font-size: 0.85em;">(2.5x)</span></td>
+				<td class="metric numeric">396.19ms</td>
+				<td class="metric numeric">142.20ms</td>
+				<td class="metric numeric winner-parquet">3.21 MB <span style="color: #999; font-size: 0.85em;">(1.5x)</span></td>
+				<td class="metric numeric">15</td>
+				<td class="metric numeric">25,000</td>
+				<td class="metric numeric">25,000</td>
+				<td class="metric numeric">96.07 MB</td>
+				<td class="metric numeric">1,287,626</td>
+				<td class="metric numeric"><span class="cost-tooltip" title="S3 GET: $0.000006&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000007&#10;Lambda Requests: $0.000000&#10;Total: $0.000013">$0.000013</span></td>
+			</tr>
+			<tr>
+				<td class="query-name"><a href="#query-rw-billing-services">Billing Services</a></td>
+				<td class="win-cell win-cell-blockpack">blockpack<br><small>(2.6x faster)<br>score: 153.98ms</small></td>
+				<td class="metric numeric winner-blockpack">134.76ms <span style="color: #999; font-size: 0.85em;">(2.5x)</span></td>
+				<td class="metric numeric winner-blockpack">19.22ms <span style="color: #999; font-size: 0.85em;">(2.9x)</span></td>
+				<td class="metric numeric">4.72 MB</td>
+				<td class="metric numeric winner-blockpack">6 <span style="color: #999; font-size: 0.85em;">(2.5x)</span></td>
+				<td class="metric numeric">6,250</td>
+				<td class="metric numeric">6,250</td>
+				<td class="metric numeric winner-blockpack">28.00 MB <span style="color: #999; font-size: 0.85em;">(1.3x)</span></td>
+				<td class="metric numeric winner-blockpack">212,526 <span style="color: #999; font-size: 0.85em;">(1.6x)</span></td>
+				<td class="metric numeric winner-blockpack"><span class="cost-tooltip" title="S3 GET: $0.000002&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000002&#10;Lambda Requests: $0.000000&#10;Total: $0.000005">$0.000005</span> <span style="color: #999; font-size: 0.85em;">(2.5x)</span></td>
+				<td class="metric numeric">340.89ms</td>
+				<td class="metric numeric">56.59ms</td>
+				<td class="metric numeric winner-parquet">3.21 MB <span style="color: #999; font-size: 0.85em;">(1.5x)</span></td>
+				<td class="metric numeric">15</td>
+				<td class="metric numeric">6,250</td>
+				<td class="metric numeric">6,250</td>
+				<td class="metric numeric">35.45 MB</td>
+				<td class="metric numeric">349,994</td>
+				<td class="metric numeric"><span class="cost-tooltip" title="S3 GET: $0.000006&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000006&#10;Lambda Requests: $0.000000&#10;Total: $0.000012">$0.000012</span></td>
+			</tr>
+			<tr>
+				<td class="query-name"><a href="#query-rw-db-operations">Db Operations</a></td>
+				<td class="win-cell win-cell-blockpack">blockpack<br><small>(3.1x faster)<br>score: 145.88ms</small></td>
+				<td class="metric numeric winner-blockpack">119.38ms <span style="color: #999; font-size: 0.85em;">(3.0x)</span></td>
+				<td class="metric numeric winner-blockpack">26.50ms <span style="color: #999; font-size: 0.85em;">(3.2x)</span></td>
+				<td class="metric numeric">4.22 MB</td>
+				<td class="metric numeric winner-blockpack">5 <span style="color: #999; font-size: 0.85em;">(3.0x)</span></td>
+				<td class="metric numeric">12,500</td>
+				<td class="metric numeric">12,500</td>
+				<td class="metric numeric winner-blockpack">33.72 MB <span style="color: #999; font-size: 0.85em;">(1.8x)</span></td>
+				<td class="metric numeric winner-blockpack">336,160 <span style="color: #999; font-size: 0.85em;">(2.1x)</span></td>
+				<td class="metric numeric winner-blockpack"><span class="cost-tooltip" title="S3 GET: $0.000002&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000002&#10;Lambda Requests: $0.000000&#10;Total: $0.000004">$0.000004</span> <span style="color: #999; font-size: 0.85em;">(2.9x)</span></td>
+				<td class="metric numeric">362.10ms</td>
+				<td class="metric numeric">85.30ms</td>
+				<td class="metric numeric winner-parquet">3.59 MB <span style="color: #999; font-size: 0.85em;">(1.2x)</span></td>
+				<td class="metric numeric">15</td>
+				<td class="metric numeric">12,500</td>
+				<td class="metric numeric">12,500</td>
+				<td class="metric numeric">59.07 MB</td>
+				<td class="metric numeric">706,292</td>
+				<td class="metric numeric"><span class="cost-tooltip" title="S3 GET: $0.000006&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000006&#10;Lambda Requests: $0.000000&#10;Total: $0.000012">$0.000012</span></td>
+			</tr>
+			<tr>
+				<td class="query-name"><a href="#query-rw-db-with-postgresql">Db With Postgresql</a></td>
+				<td class="win-cell win-cell-blockpack">blockpack<br><small>(3.4x faster)<br>score: 147.01ms</small></td>
+				<td class="metric numeric winner-blockpack">119.73ms <span style="color: #999; font-size: 0.85em;">(3.4x)</span></td>
+				<td class="metric numeric winner-blockpack">27.28ms <span style="color: #999; font-size: 0.85em;">(3.3x)</span></td>
+				<td class="metric numeric">4.22 MB</td>
+				<td class="metric numeric winner-blockpack">5 <span style="color: #999; font-size: 0.85em;">(3.4x)</span></td>
+				<td class="metric numeric">12,500</td>
+				<td class="metric numeric">12,500</td>
+				<td class="metric numeric winner-blockpack">34.23 MB <span style="color: #999; font-size: 0.85em;">(1.8x)</span></td>
+				<td class="metric numeric winner-blockpack">337,090 <span style="color: #999; font-size: 0.85em;">(2.3x)</span></td>
+				<td class="metric numeric winner-blockpack"><span class="cost-tooltip" title="S3 GET: $0.000002&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000002&#10;Lambda Requests: $0.000000&#10;Total: $0.000004">$0.000004</span> <span style="color: #999; font-size: 0.85em;">(3.3x)</span></td>
+				<td class="metric numeric">409.52ms</td>
+				<td class="metric numeric">89.86ms</td>
+				<td class="metric numeric winner-parquet">3.65 MB <span style="color: #999; font-size: 0.85em;">(1.2x)</span></td>
+				<td class="metric numeric">17</td>
+				<td class="metric numeric">12,500</td>
+				<td class="metric numeric">12,500</td>
+				<td class="metric numeric">62.24 MB</td>
+				<td class="metric numeric">781,550</td>
+				<td class="metric numeric"><span class="cost-tooltip" title="S3 GET: $0.000007&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000007&#10;Lambda Requests: $0.000000&#10;Total: $0.000014">$0.000014</span></td>
+			</tr>
+			<tr>
+				<td class="query-name"><a href="#query-rw-fast-operations">Fast Operations</a></td>
+				<td class="win-cell win-cell-blockpack">blockpack<br><small>(2.1x faster)<br>score: 148.18ms</small></td>
+				<td class="metric numeric winner-blockpack">132.22ms <span style="color: #999; font-size: 0.85em;">(2.2x)</span></td>
+				<td class="metric numeric winner-blockpack">15.96ms <span style="color: #999; font-size: 0.85em;">(1.2x)</span></td>
+				<td class="metric numeric">4.68 MB</td>
+				<td class="metric numeric winner-blockpack">6 <span style="color: #999; font-size: 0.85em;">(2.3x)</span></td>
+				<td class="metric numeric">481</td>
+				<td class="metric numeric">481</td>
+				<td class="metric numeric">27.97 MB</td>
+				<td class="metric numeric">94,119</td>
+				<td class="metric numeric winner-blockpack"><span class="cost-tooltip" title="S3 GET: $0.000002&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000002&#10;Lambda Requests: $0.000000&#10;Total: $0.000005">$0.000005</span> <span style="color: #999; font-size: 0.85em;">(2.2x)</span></td>
+				<td class="metric numeric">296.26ms</td>
+				<td class="metric numeric">19.36ms</td>
+				<td class="metric numeric winner-parquet">3.10 MB <span style="color: #999; font-size: 0.85em;">(1.5x)</span></td>
+				<td class="metric numeric">14</td>
+				<td class="metric numeric">481</td>
+				<td class="metric numeric">481</td>
+				<td class="metric numeric winner-parquet">15.59 MB <span style="color: #999; font-size: 0.85em;">(1.8x)</span></td>
+				<td class="metric numeric winner-parquet">29,868 <span style="color: #999; font-size: 0.85em;">(3.2x)</span></td>
+				<td class="metric numeric"><span class="cost-tooltip" title="S3 GET: $0.000006&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000005&#10;Lambda Requests: $0.000000&#10;Total: $0.000011">$0.000011</span></td>
+			</tr>
+			<tr>
+				<td class="query-name"><a href="#query-rw-get-requests">Get Requests</a></td>
+				<td class="win-cell win-cell-blockpack">blockpack<br><small>(2.2x faster)<br>score: 331.17ms</small></td>
+				<td class="metric numeric winner-blockpack">187.37ms <span style="color: #999; font-size: 0.85em;">(2.3x)</span></td>
+				<td class="metric numeric winner-blockpack">143.80ms <span style="color: #999; font-size: 0.85em;">(2.0x)</span></td>
+				<td class="metric numeric">4.35 MB</td>
+				<td class="metric numeric winner-blockpack">5 <span style="color: #999; font-size: 0.85em;">(2.8x)</span></td>
+				<td class="metric numeric">25,000</td>
+				<td class="metric numeric">81,250</td>
+				<td class="metric numeric winner-blockpack">148.96 MB <span style="color: #999; font-size: 0.85em;">(1.5x)</span></td>
+				<td class="metric numeric winner-blockpack">1,941,113 <span style="color: #999; font-size: 0.85em;">(1.3x)</span></td>
+				<td class="metric numeric winner-blockpack"><span class="cost-tooltip" title="S3 GET: $0.000002&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000003&#10;Lambda Requests: $0.000000&#10;Total: $0.000005">$0.000005</span> <span style="color: #999; font-size: 0.85em;">(2.5x)</span></td>
+				<td class="metric numeric">437.06ms</td>
+				<td class="metric numeric">292.00ms</td>
+				<td class="metric numeric winner-parquet">3.23 MB <span style="color: #999; font-size: 0.85em;">(1.3x)</span></td>
+				<td class="metric numeric">14</td>
+				<td class="metric numeric">25,000</td>
+				<td class="metric numeric">81,250</td>
+				<td class="metric numeric">230.71 MB</td>
+				<td class="metric numeric">2,475,004</td>
+				<td class="metric numeric"><span class="cost-tooltip" title="S3 GET: $0.000006&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000007&#10;Lambda Requests: $0.000000&#10;Total: $0.000013">$0.000013</span></td>
+			</tr>
+			<tr>
+				<td class="query-name"><a href="#query-rw-http-200">Http 200</a></td>
+				<td class="win-cell win-cell-blockpack">blockpack<br><small>(2.1x faster)<br>score: 361.33ms</small></td>
+				<td class="metric numeric winner-blockpack">198.13ms <span style="color: #999; font-size: 0.85em;">(2.3x)</span></td>
+				<td class="metric numeric winner-blockpack">163.20ms <span style="color: #999; font-size: 0.85em;">(1.8x)</span></td>
+				<td class="metric numeric">4.36 MB</td>
+				<td class="metric numeric winner-blockpack">5 <span style="color: #999; font-size: 0.85em;">(3.0x)</span></td>
+				<td class="metric numeric">18,750</td>
+				<td class="metric numeric">93,750</td>
+				<td class="metric numeric winner-blockpack">162.40 MB <span style="color: #999; font-size: 0.85em;">(1.5x)</span></td>
+				<td class="metric numeric winner-blockpack">2,165,555 <span style="color: #999; font-size: 0.85em;">(1.2x)</span></td>
+				<td class="metric numeric winner-blockpack"><span class="cost-tooltip" title="S3 GET: $0.000002&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000003&#10;Lambda Requests: $0.000000&#10;Total: $0.000005">$0.000005</span> <span style="color: #999; font-size: 0.85em;">(2.6x)</span></td>
+				<td class="metric numeric">460.71ms</td>
+				<td class="metric numeric">301.20ms</td>
+				<td class="metric numeric winner-parquet">3.34 MB <span style="color: #999; font-size: 0.85em;">(1.3x)</span></td>
+				<td class="metric numeric">15</td>
+				<td class="metric numeric">18,750</td>
+				<td class="metric numeric">93,750</td>
+				<td class="metric numeric">249.41 MB</td>
+				<td class="metric numeric">2,531,387</td>
+				<td class="metric numeric"><span class="cost-tooltip" title="S3 GET: $0.000006&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000008&#10;Lambda Requests: $0.000000&#10;Total: $0.000014">$0.000014</span></td>
+			</tr>
+			<tr>
+				<td class="query-name"><a href="#query-rw-http-errors">Http Errors</a></td>
+				<td class="win-cell win-cell-blockpack">blockpack<br><small>(2.1x faster)<br>score: 200.33ms</small></td>
+				<td class="metric numeric winner-blockpack">143.15ms <span style="color: #999; font-size: 0.85em;">(2.4x)</span></td>
+				<td class="metric numeric winner-blockpack">57.18ms <span style="color: #999; font-size: 0.85em;">(1.2x)</span></td>
+				<td class="metric numeric">4.36 MB</td>
+				<td class="metric numeric winner-blockpack">5 <span style="color: #999; font-size: 0.85em;">(3.0x)</span></td>
+				<td class="metric numeric">6,250</td>
+				<td class="metric numeric">18,750</td>
+				<td class="metric numeric winner-blockpack">64.15 MB <span style="color: #999; font-size: 0.85em;">(1.0x)</span></td>
+				<td class="metric numeric">769,986</td>
+				<td class="metric numeric winner-blockpack"><span class="cost-tooltip" title="S3 GET: $0.000002&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000002&#10;Lambda Requests: $0.000000&#10;Total: $0.000005">$0.000005</span> <span style="color: #999; font-size: 0.85em;">(2.6x)</span></td>
+				<td class="metric numeric">349.09ms</td>
+				<td class="metric numeric">69.15ms</td>
+				<td class="metric numeric winner-parquet">3.34 MB <span style="color: #999; font-size: 0.85em;">(1.3x)</span></td>
+				<td class="metric numeric">15</td>
+				<td class="metric numeric">6,250</td>
+				<td class="metric numeric">18,750</td>
+				<td class="metric numeric">65.96 MB</td>
+				<td class="metric numeric winner-parquet">568,601 <span style="color: #999; font-size: 0.85em;">(1.4x)</span></td>
+				<td class="metric numeric"><span class="cost-tooltip" title="S3 GET: $0.000006&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000006&#10;Lambda Requests: $0.000000&#10;Total: $0.000012">$0.000012</span></td>
+			</tr>
+			<tr>
+				<td class="query-name"><a href="#query-rw-long-running">Long Running</a></td>
+				<td class="win-cell win-cell-blockpack">blockpack<br><small>(2.0x faster)<br>score: 221.49ms</small></td>
+				<td class="metric numeric winner-blockpack">163.02ms <span style="color: #999; font-size: 0.85em;">(2.1x)</span></td>
+				<td class="metric numeric winner-blockpack">58.47ms <span style="color: #999; font-size: 0.85em;">(1.6x)</span></td>
+				<td class="metric numeric">4.78 MB</td>
+				<td class="metric numeric winner-blockpack">6 <span style="color: #999; font-size: 0.85em;">(2.3x)</span></td>
+				<td class="metric numeric">15,625</td>
+				<td class="metric numeric">21,875</td>
+				<td class="metric numeric">75.70 MB</td>
+				<td class="metric numeric winner-blockpack">717,844 <span style="color: #999; font-size: 0.85em;">(1.2x)</span></td>
+				<td class="metric numeric winner-blockpack"><span class="cost-tooltip" title="S3 GET: $0.000002&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000003&#10;Lambda Requests: $0.000000&#10;Total: $0.000005">$0.000005</span> <span style="color: #999; font-size: 0.85em;">(2.2x)</span></td>
+				<td class="metric numeric">345.92ms</td>
+				<td class="metric numeric">96.18ms</td>
+				<td class="metric numeric winner-parquet">3.10 MB <span style="color: #999; font-size: 0.85em;">(1.5x)</span></td>
+				<td class="metric numeric">14</td>
+				<td class="metric numeric">15,625</td>
+				<td class="metric numeric">21,875</td>
+				<td class="metric numeric winner-parquet">74.74 MB <span style="color: #999; font-size: 0.85em;">(1.0x)</span></td>
+				<td class="metric numeric">880,935</td>
+				<td class="metric numeric"><span class="cost-tooltip" title="S3 GET: $0.000006&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000006&#10;Lambda Requests: $0.000000&#10;Total: $0.000012">$0.000012</span></td>
+			</tr>
+			<tr>
+				<td class="query-name"><a href="#query-rw-payment-operations">Payment Operations</a></td>
+				<td class="win-cell win-cell-blockpack">blockpack<br><small>(2.4x faster)<br>score: 153.63ms</small></td>
+				<td class="metric numeric winner-blockpack">134.62ms <span style="color: #999; font-size: 0.85em;">(2.4x)</span></td>
+				<td class="metric numeric winner-blockpack">19.01ms <span style="color: #999; font-size: 0.85em;">(2.6x)</span></td>
+				<td class="metric numeric">4.72 MB</td>
+				<td class="metric numeric winner-blockpack">6 <span style="color: #999; font-size: 0.85em;">(2.3x)</span></td>
+				<td class="metric numeric">6,250</td>
+				<td class="metric numeric">6,250</td>
+				<td class="metric numeric winner-blockpack">27.74 MB <span style="color: #999; font-size: 0.85em;">(1.3x)</span></td>
+				<td class="metric numeric winner-blockpack">212,583 <span style="color: #999; font-size: 0.85em;">(1.5x)</span></td>
+				<td class="metric numeric winner-blockpack"><span class="cost-tooltip" title="S3 GET: $0.000002&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000002&#10;Lambda Requests: $0.000000&#10;Total: $0.000005">$0.000005</span> <span style="color: #999; font-size: 0.85em;">(2.3x)</span></td>
+				<td class="metric numeric">317.46ms</td>
+				<td class="metric numeric">49.84ms</td>
+				<td class="metric numeric winner-parquet">3.21 MB <span style="color: #999; font-size: 0.85em;">(1.5x)</span></td>
+				<td class="metric numeric">14</td>
+				<td class="metric numeric">6,250</td>
+				<td class="metric numeric">6,250</td>
+				<td class="metric numeric">36.13 MB</td>
+				<td class="metric numeric">324,936</td>
+				<td class="metric numeric"><span class="cost-tooltip" title="S3 GET: $0.000006&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000005&#10;Lambda Requests: $0.000000&#10;Total: $0.000011">$0.000011</span></td>
+			</tr>
+			<tr>
+				<td class="query-name"><a href="#query-rw-post-requests">Post Requests</a></td>
+				<td class="win-cell win-cell-blockpack">blockpack<br><small>(2.5x faster)<br>score: 235.93ms</small></td>
+				<td class="metric numeric winner-blockpack">153.19ms <span style="color: #999; font-size: 0.85em;">(2.6x)</span></td>
+				<td class="metric numeric winner-blockpack">82.74ms <span style="color: #999; font-size: 0.85em;">(2.4x)</span></td>
+				<td class="metric numeric">4.36 MB</td>
+				<td class="metric numeric winner-blockpack">5 <span style="color: #999; font-size: 0.85em;">(2.8x)</span></td>
+				<td class="metric numeric">25,000</td>
+				<td class="metric numeric">43,750</td>
+				<td class="metric numeric winner-blockpack">87.88 MB <span style="color: #999; font-size: 0.85em;">(1.7x)</span></td>
+				<td class="metric numeric winner-blockpack">1,100,138 <span style="color: #999; font-size: 0.85em;">(1.6x)</span></td>
+				<td class="metric numeric winner-blockpack"><span class="cost-tooltip" title="S3 GET: $0.000002&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000003&#10;Lambda Requests: $0.000000&#10;Total: $0.000005">$0.000005</span> <span style="color: #999; font-size: 0.85em;">(2.6x)</span></td>
+				<td class="metric numeric">394.50ms</td>
+				<td class="metric numeric">195.50ms</td>
+				<td class="metric numeric winner-parquet">3.23 MB <span style="color: #999; font-size: 0.85em;">(1.4x)</span></td>
+				<td class="metric numeric">14</td>
+				<td class="metric numeric">25,000</td>
+				<td class="metric numeric">43,750</td>
+				<td class="metric numeric">147.07 MB</td>
+				<td class="metric numeric">1,712,427</td>
+				<td class="metric numeric"><span class="cost-tooltip" title="S3 GET: $0.000006&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000007&#10;Lambda Requests: $0.000000&#10;Total: $0.000012">$0.000012</span></td>
+			</tr>
+			<tr>
+				<td class="query-name"><a href="#query-rw-shop-backend-spans">Shop Backend Spans</a></td>
+				<td class="win-cell win-cell-blockpack">blockpack<br><small>(2.2x faster)<br>score: 302.88ms</small></td>
+				<td class="metric numeric winner-blockpack">189.98ms <span style="color: #999; font-size: 0.85em;">(2.3x)</span></td>
+				<td class="metric numeric winner-blockpack">112.90ms <span style="color: #999; font-size: 0.85em;">(2.1x)</span></td>
+				<td class="metric numeric">4.73 MB</td>
+				<td class="metric numeric winner-blockpack">6 <span style="color: #999; font-size: 0.85em;">(2.5x)</span></td>
+				<td class="metric numeric">25,000</td>
+				<td class="metric numeric">68,750</td>
+				<td class="metric numeric winner-blockpack">121.28 MB <span style="color: #999; font-size: 0.85em;">(1.5x)</span></td>
+				<td class="metric numeric winner-blockpack">1,531,501 <span style="color: #999; font-size: 0.85em;">(1.4x)</span></td>
+				<td class="metric numeric winner-blockpack"><span class="cost-tooltip" title="S3 GET: $0.000002&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000003&#10;Lambda Requests: $0.000000&#10;Total: $0.000006">$0.000006</span> <span style="color: #999; font-size: 0.85em;">(2.4x)</span></td>
+				<td class="metric numeric">442.08ms</td>
+				<td class="metric numeric">239.30ms</td>
+				<td class="metric numeric winner-parquet">3.21 MB <span style="color: #999; font-size: 0.85em;">(1.5x)</span></td>
+				<td class="metric numeric">15</td>
+				<td class="metric numeric">25,000</td>
+				<td class="metric numeric">68,750</td>
+				<td class="metric numeric">182.21 MB</td>
+				<td class="metric numeric">2,181,303</td>
+				<td class="metric numeric"><span class="cost-tooltip" title="S3 GET: $0.000006&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000007&#10;Lambda Requests: $0.000000&#10;Total: $0.000014">$0.000014</span></td>
+			</tr>
+			<tr>
+				<td class="query-name"><a href="#query-rw-shop-services">Shop Services</a></td>
+				<td class="win-cell win-cell-blockpack">blockpack<br><small>(2.1x faster)<br>score: 317.09ms</small></td>
+				<td class="metric numeric winner-blockpack">191.49ms <span style="color: #999; font-size: 0.85em;">(2.3x)</span></td>
+				<td class="metric numeric winner-blockpack">125.60ms <span style="color: #999; font-size: 0.85em;">(1.9x)</span></td>
+				<td class="metric numeric">4.73 MB</td>
+				<td class="metric numeric winner-blockpack">6 <span style="color: #999; font-size: 0.85em;">(2.5x)</span></td>
+				<td class="metric numeric">25,000</td>
+				<td class="metric numeric">68,750</td>
+				<td class="metric numeric winner-blockpack">121.99 MB <span style="color: #999; font-size: 0.85em;">(1.5x)</span></td>
+				<td class="metric numeric winner-blockpack">1,529,665 <span style="color: #999; font-size: 0.85em;">(1.4x)</span></td>
+				<td class="metric numeric winner-blockpack"><span class="cost-tooltip" title="S3 GET: $0.000002&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000003&#10;Lambda Requests: $0.000000&#10;Total: $0.000006">$0.000006</span> <span style="color: #999; font-size: 0.85em;">(2.4x)</span></td>
+				<td class="metric numeric">444.23ms</td>
+				<td class="metric numeric">236.40ms</td>
+				<td class="metric numeric winner-parquet">3.21 MB <span style="color: #999; font-size: 0.85em;">(1.5x)</span></td>
+				<td class="metric numeric">15</td>
+				<td class="metric numeric">25,000</td>
+				<td class="metric numeric">68,750</td>
+				<td class="metric numeric">183.19 MB</td>
+				<td class="metric numeric">2,181,491</td>
+				<td class="metric numeric"><span class="cost-tooltip" title="S3 GET: $0.000006&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000007&#10;Lambda Requests: $0.000000&#10;Total: $0.000014">$0.000014</span></td>
+			</tr>
+			<tr>
+				<td class="query-name"><a href="#query-rw-slow-db-queries">Slow Db Queries</a></td>
+				<td class="win-cell win-cell-blockpack">blockpack<br><small>(2.6x faster)<br>score: 161.21ms</small></td>
+				<td class="metric numeric winner-blockpack">137.30ms <span style="color: #999; font-size: 0.85em;">(2.6x)</span></td>
+				<td class="metric numeric winner-blockpack">23.91ms <span style="color: #999; font-size: 0.85em;">(2.4x)</span></td>
+				<td class="metric numeric">4.68 MB</td>
+				<td class="metric numeric winner-blockpack">6 <span style="color: #999; font-size: 0.85em;">(2.7x)</span></td>
+				<td class="metric numeric">4,807</td>
+				<td class="metric numeric">4,807</td>
+				<td class="metric numeric">40.68 MB</td>
+				<td class="metric numeric winner-blockpack">183,512 <span style="color: #999; font-size: 0.85em;">(1.5x)</span></td>
+				<td class="metric numeric winner-blockpack"><span class="cost-tooltip" title="S3 GET: $0.000002&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000002&#10;Lambda Requests: $0.000000&#10;Total: $0.000005">$0.000005</span> <span style="color: #999; font-size: 0.85em;">(2.6x)</span></td>
+				<td class="metric numeric">362.24ms</td>
+				<td class="metric numeric">56.21ms</td>
+				<td class="metric numeric winner-parquet">3.59 MB <span style="color: #999; font-size: 0.85em;">(1.3x)</span></td>
+				<td class="metric numeric">16</td>
+				<td class="metric numeric">4,807</td>
+				<td class="metric numeric">4,807</td>
+				<td class="metric numeric winner-parquet">32.47 MB <span style="color: #999; font-size: 0.85em;">(1.3x)</span></td>
+				<td class="metric numeric">283,201</td>
+				<td class="metric numeric"><span class="cost-tooltip" title="S3 GET: $0.000006&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000006&#10;Lambda Requests: $0.000000&#10;Total: $0.000013">$0.000013</span></td>
+			</tr>
+			<tr>
+				<td class="query-name"><a href="#query-rw-slow-shop-requests">Slow Shop Requests</a></td>
+				<td class="win-cell win-cell-blockpack">blockpack<br><small>(2.0x faster)<br>score: 231.96ms</small></td>
+				<td class="metric numeric winner-blockpack">178.90ms <span style="color: #999; font-size: 0.85em;">(2.1x)</span></td>
+				<td class="metric numeric winner-blockpack">53.06ms <span style="color: #999; font-size: 0.85em;">(1.8x)</span></td>
+				<td class="metric numeric">5.18 MB</td>
+				<td class="metric numeric winner-blockpack">7 <span style="color: #999; font-size: 0.85em;">(2.1x)</span></td>
+				<td class="metric numeric">15,625</td>
+				<td class="metric numeric">15,625</td>
+				<td class="metric numeric">69.29 MB</td>
+				<td class="metric numeric winner-blockpack">520,383 <span style="color: #999; font-size: 0.85em;">(1.6x)</span></td>
+				<td class="metric numeric winner-blockpack"><span class="cost-tooltip" title="S3 GET: $0.000003&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000003&#10;Lambda Requests: $0.000000&#10;Total: $0.000006">$0.000006</span> <span style="color: #999; font-size: 0.85em;">(2.1x)</span></td>
+				<td class="metric numeric">367.66ms</td>
+				<td class="metric numeric">94.44ms</td>
+				<td class="metric numeric winner-parquet">3.15 MB <span style="color: #999; font-size: 0.85em;">(1.6x)</span></td>
+				<td class="metric numeric">15</td>
+				<td class="metric numeric">15,625</td>
+				<td class="metric numeric">15,625</td>
+				<td class="metric numeric winner-parquet">66.00 MB <span style="color: #999; font-size: 0.85em;">(1.0x)</span></td>
+				<td class="metric numeric">846,733</td>
+				<td class="metric numeric"><span class="cost-tooltip" title="S3 GET: $0.000006&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000006&#10;Lambda Requests: $0.000000&#10;Total: $0.000012">$0.000012</span></td>
+			</tr>
+		</tbody>
+	</table>
+
+	</div>
+
+	<button type="button" class="section-header collapsible" id="trace-by-id" onclick="toggleSection(this)" aria-expanded="true" aria-controls="trace-by-id-content">
+		<span class="chevron">▼</span> 🔍 Get Trace by ID (Blockpack vs Parquet)
+	</button>
+	<div class="collapsible-content" id="trace-by-id-content" aria-hidden="false">
+	<div style="text-align: center; color: #666; margin-bottom: 30px;">
+		Retrieve a single trace by trace ID • Tests point lookup performance
+	</div>
+	<div class="file-size-bar">
+	<span class="file-size-pill file-size-pill-blockpack">Blockpack 10.6 MB</span>
+	<span class="file-size-pill file-size-pill-parquet">Parquet 9.6 MB</span>
+	<span class="file-size-ratio">Blockpack is <strong>1.1x larger</strong></span>
+</div>
+
+	<table class="comparison-table">
+		<thead>
+			<tr>
+				<th rowspan="2">Query</th>
+				<th rowspan="2" style="text-align:center; min-width:90px">Win</th>
+				<th colspan="9" class="blockpack-col" style="text-align: center;">Blockpack</th>
+				<th colspan="9" class="parquet-col" style="text-align: center;">Parquet</th>
+			</tr>
+			<tr>
+				<th class="numeric blockpack-col">Wall</th>
+				<th class="numeric blockpack-col">CPU</th>
+				<th class="numeric blockpack-col">Bytes Read</th>
+				<th class="numeric blockpack-col">I/O Ops</th>
+				<th class="numeric blockpack-col">Traces</th>
+				<th class="numeric blockpack-col">Spans</th>
+				<th class="numeric blockpack-col">Memory</th>
+				<th class="numeric blockpack-col">Allocations</th>
+				<th class="numeric blockpack-col">Cost</th>
+				<th class="numeric parquet-col">Wall</th>
+				<th class="numeric parquet-col">CPU</th>
+				<th class="numeric parquet-col">Bytes Read</th>
+				<th class="numeric parquet-col">I/O Ops</th>
+				<th class="numeric parquet-col">Traces</th>
+				<th class="numeric parquet-col">Spans</th>
+				<th class="numeric parquet-col">Memory</th>
+				<th class="numeric parquet-col">Allocations</th>
+				<th class="numeric parquet-col">Cost</th>
+			</tr>
+		</thead>
+		<tbody>
+			<tr>
+				<td class="query-name">Get Trace by ID</td>
+				<td class="win-cell win-cell-blockpack">blockpack<br><small>(1.5x faster)<br>score: 187.51ms</small></td>
+				<td class="metric numeric winner-blockpack">158.40ms <span style="color: #999; font-size: 0.85em;">(1.8x)</span></td>
+				<td class="metric numeric">29.11ms</td>
+				<td class="metric numeric">5.71 MB</td>
+				<td class="metric numeric winner-blockpack">7 <span style="color: #999; font-size: 0.85em;">(2.0x)</span></td>
+				<td class="metric numeric">1</td>
+				<td class="metric numeric">7</td>
+				<td class="metric numeric">46.87 MB</td>
+				<td class="metric numeric">153,036</td>
+				<td class="metric numeric winner-blockpack"><span class="cost-tooltip" title="S3 GET: $0.000003&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000003&#10;Lambda Requests: $0.000000&#10;Total: $0.000006">$0.000006</span></td>
+				<td class="metric numeric">284.34ms</td>
+				<td class="metric numeric winner-parquet">3.57ms <span style="color: #999; font-size: 0.85em;">(8.2x)</span></td>
+				<td class="metric numeric winner-parquet">2.93 MB <span style="color: #999; font-size: 0.85em;">(2.0x)</span></td>
+				<td class="metric numeric">14</td>
+				<td class="metric numeric">0</td>
+				<td class="metric numeric">7</td>
+				<td class="metric numeric winner-parquet">701.66 KB <span style="color: #999; font-size: 0.85em;">(68.4x)</span></td>
+				<td class="metric numeric winner-parquet">4,642 <span style="color: #999; font-size: 0.85em;">(33.0x)</span></td>
+				<td class="metric numeric"><span class="cost-tooltip" title="S3 GET: $0.000006&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000005&#10;Lambda Requests: $0.000000&#10;Total: $0.000010">$0.000010</span></td>
+			</tr>
+		</tbody>
+	</table>
+
+	</div>
+
+	<button type="button" class="section-header collapsible" id="aggregation-comparison" onclick="toggleSection(this)" aria-expanded="true" aria-controls="aggregation-comparison-content">
+		<span class="chevron">▼</span> 📊 Aggregation vs Parquet
+	</button>
+	<div class="collapsible-content" id="aggregation-comparison-content" aria-hidden="false">
+	<div style="text-align: center; color: #666; margin-bottom: 30px;">
+		No aggregation comparison benchmarks were run.
+	</div>
+	</div>
+	
+	<button type="button" class="section-header collapsible" id="format-comparison" onclick="toggleSection(this)" aria-expanded="true" aria-controls="format-comparison-content">
+		<span class="chevron">▼</span> ⚖️ Format Comparison (Blockpack vs Parquet)
+	</button>
+	<div class="collapsible-content" id="format-comparison-content" aria-hidden="false">
+	<div style="text-align: center; color: #666; margin-bottom: 30px;">
+		Synthetic test data • 250,000 traces • Side-by-side performance comparison
+	</div>
+	<div class="file-size-bar">
+	<span class="file-size-pill file-size-pill-blockpack">Blockpack 116.3 MB</span>
+	<span class="file-size-pill file-size-pill-parquet">Parquet 95.1 MB</span>
+	<span class="file-size-ratio">Blockpack is <strong>1.2x larger</strong></span>
+</div>
+
+	<table class="comparison-table">
+		<thead>
+			<tr>
+				<th rowspan="2">Query</th>
+				<th rowspan="2" style="text-align:center; min-width:90px">Win</th>
+				<th colspan="9" class="blockpack-col" style="text-align: center;">Blockpack</th>
+				<th colspan="9" class="parquet-col" style="text-align: center;">Parquet</th>
+			</tr>
+			<tr>
+				<th class="numeric blockpack-col">Wall</th>
+				<th class="numeric blockpack-col">CPU</th>
+				<th class="numeric blockpack-col">Bytes Read</th>
+				<th class="numeric blockpack-col">I/O Ops</th>
+				<th class="numeric blockpack-col">Traces</th>
+				<th class="numeric blockpack-col">Spans</th>
+				<th class="numeric blockpack-col">Memory</th>
+				<th class="numeric blockpack-col">Allocations</th>
+				<th class="numeric blockpack-col">Cost</th>
+				<th class="numeric parquet-col">Wall</th>
+				<th class="numeric parquet-col">CPU</th>
+				<th class="numeric parquet-col">Bytes Read</th>
+				<th class="numeric parquet-col">I/O Ops</th>
+				<th class="numeric parquet-col">Traces</th>
+				<th class="numeric parquet-col">Spans</th>
+				<th class="numeric parquet-col">Memory</th>
+				<th class="numeric parquet-col">Allocations</th>
+				<th class="numeric parquet-col">Cost</th>
+			</tr>
+		</thead>
+		<tbody>
+			<tr>
+				<td class="query-name"><a href="#query-cmp-duration_gt_100ms">Duration Gt 100Ms</a></td>
+				<td class="win-cell win-cell-blockpack">blockpack<br><small>(1.4x faster)<br>score: 3.50s</small></td>
+				<td class="metric numeric winner-blockpack">1.30s <span style="color: #999; font-size: 0.85em;">(1.6x)</span></td>
+				<td class="metric numeric winner-blockpack">2.20s <span style="color: #999; font-size: 0.85em;">(1.3x)</span></td>
+				<td class="metric numeric">48.61 MB</td>
+				<td class="metric numeric winner-blockpack">9 <span style="color: #999; font-size: 0.85em;">(5.4x)</span></td>
+				<td class="metric numeric">187,500</td>
+				<td class="metric numeric">971,759</td>
+				<td class="metric numeric winner-blockpack">1.82 GB <span style="color: #999; font-size: 0.85em;">(1.1x)</span></td>
+				<td class="metric numeric">22,173,384</td>
+				<td class="metric numeric winner-blockpack"><span class="cost-tooltip" title="S3 GET: $0.000004&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000021&#10;Lambda Requests: $0.000000&#10;Total: $0.000025">$0.000025</span> <span style="color: #999; font-size: 0.85em;">(2.2x)</span></td>
+				<td class="metric numeric">2.13s</td>
+				<td class="metric numeric">2.82s</td>
+				<td class="metric numeric winner-parquet">30.91 MB <span style="color: #999; font-size: 0.85em;">(1.6x)</span></td>
+				<td class="metric numeric">49</td>
+				<td class="metric numeric">187,500</td>
+				<td class="metric numeric">971,759</td>
+				<td class="metric numeric">2.02 GB</td>
+				<td class="metric numeric winner-parquet">21,078,816 <span style="color: #999; font-size: 0.85em;">(1.1x)</span></td>
+				<td class="metric numeric"><span class="cost-tooltip" title="S3 GET: $0.000020&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000036&#10;Lambda Requests: $0.000000&#10;Total: $0.000055">$0.000055</span></td>
+			</tr>
+			<tr>
+				<td class="query-name"><a href="#query-cmp-experiment_traces">Experiment Traces</a></td>
+				<td class="win-cell win-cell-blockpack">blockpack<br><small>(3.1x faster)<br>score: 162.23ms</small></td>
+				<td class="metric numeric winner-blockpack">126.78ms <span style="color: #999; font-size: 0.85em;">(3.4x)</span></td>
+				<td class="metric numeric winner-blockpack">35.45ms <span style="color: #999; font-size: 0.85em;">(2.0x)</span></td>
+				<td class="metric numeric">13.61 MB</td>
+				<td class="metric numeric winner-blockpack">5 <span style="color: #999; font-size: 0.85em;">(3.6x)</span></td>
+				<td class="metric numeric">75</td>
+				<td class="metric numeric">470</td>
+				<td class="metric numeric">74.89 MB</td>
+				<td class="metric numeric">87,234</td>
+				<td class="metric numeric winner-blockpack"><span class="cost-tooltip" title="S3 GET: $0.000002&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000002&#10;Lambda Requests: $0.000000&#10;Total: $0.000004">$0.000004</span> <span style="color: #999; font-size: 0.85em;">(3.4x)</span></td>
+				<td class="metric numeric">426.67ms</td>
+				<td class="metric numeric">71.01ms</td>
+				<td class="metric numeric winner-parquet">10.14 MB <span style="color: #999; font-size: 0.85em;">(1.3x)</span></td>
+				<td class="metric numeric">18</td>
+				<td class="metric numeric">75</td>
+				<td class="metric numeric">470</td>
+				<td class="metric numeric winner-parquet">16.78 MB <span style="color: #999; font-size: 0.85em;">(4.5x)</span></td>
+				<td class="metric numeric winner-parquet">20,819 <span style="color: #999; font-size: 0.85em;">(4.2x)</span></td>
+				<td class="metric numeric"><span class="cost-tooltip" title="S3 GET: $0.000007&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000007&#10;Lambda Requests: $0.000000&#10;Total: $0.000015">$0.000015</span></td>
+			</tr>
+			<tr>
+				<td class="query-name"><a href="#query-cmp-filter_auth_namespace">Filter Auth Namespace</a></td>
+				<td class="win-cell win-cell-blockpack">blockpack<br><small>(3.7x faster)<br>score: 990.82ms</small></td>
+				<td class="metric numeric winner-blockpack">495.42ms <span style="color: #999; font-size: 0.85em;">(3.6x)</span></td>
+				<td class="metric numeric winner-blockpack">495.40ms <span style="color: #999; font-size: 0.85em;">(3.7x)</span></td>
+				<td class="metric numeric">42.19 MB</td>
+				<td class="metric numeric winner-blockpack">8 <span style="color: #999; font-size: 0.85em;">(6.6x)</span></td>
+				<td class="metric numeric">250,000</td>
+				<td class="metric numeric">250,000</td>
+				<td class="metric numeric winner-blockpack">587.79 MB <span style="color: #999; font-size: 0.85em;">(1.5x)</span></td>
+				<td class="metric numeric winner-blockpack">6,567,888 <span style="color: #999; font-size: 0.85em;">(2.0x)</span></td>
+				<td class="metric numeric winner-blockpack"><span class="cost-tooltip" title="S3 GET: $0.000003&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000008&#10;Lambda Requests: $0.000000&#10;Total: $0.000011">$0.000011</span> <span style="color: #999; font-size: 0.85em;">(4.6x)</span></td>
+				<td class="metric numeric">1.78s</td>
+				<td class="metric numeric">1.85s</td>
+				<td class="metric numeric winner-parquet">32.18 MB <span style="color: #999; font-size: 0.85em;">(1.3x)</span></td>
+				<td class="metric numeric">53</td>
+				<td class="metric numeric">250,000</td>
+				<td class="metric numeric">250,000</td>
+				<td class="metric numeric">855.40 MB</td>
+				<td class="metric numeric">13,077,582</td>
+				<td class="metric numeric"><span class="cost-tooltip" title="S3 GET: $0.000021&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000030&#10;Lambda Requests: $0.000000&#10;Total: $0.000051">$0.000051</span></td>
+			</tr>
+			<tr>
+				<td class="query-name"><a href="#query-cmp-filter_authenticate_operation">Filter Authenticate Operation</a></td>
+				<td class="win-cell win-cell-blockpack">blockpack<br><small>(2.2x faster)<br>score: 1.84s</small></td>
+				<td class="metric numeric winner-blockpack">861.35ms <span style="color: #999; font-size: 0.85em;">(2.2x)</span></td>
+				<td class="metric numeric winner-blockpack">983.00ms <span style="color: #999; font-size: 0.85em;">(2.3x)</span></td>
+				<td class="metric numeric">48.54 MB</td>
+				<td class="metric numeric winner-blockpack">9 <span style="color: #999; font-size: 0.85em;">(5.4x)</span></td>
+				<td class="metric numeric">250,000</td>
+				<td class="metric numeric">500,000</td>
+				<td class="metric numeric winner-blockpack">1.12 GB <span style="color: #999; font-size: 0.85em;">(1.2x)</span></td>
+				<td class="metric numeric winner-blockpack">13,669,842 <span style="color: #999; font-size: 0.85em;">(1.2x)</span></td>
+				<td class="metric numeric winner-blockpack"><span class="cost-tooltip" title="S3 GET: $0.000004&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000014&#10;Lambda Requests: $0.000000&#10;Total: $0.000017">$0.000017</span> <span style="color: #999; font-size: 0.85em;">(2.9x)</span></td>
+				<td class="metric numeric">1.88s</td>
+				<td class="metric numeric">2.25s</td>
+				<td class="metric numeric winner-parquet">32.03 MB <span style="color: #999; font-size: 0.85em;">(1.5x)</span></td>
+				<td class="metric numeric">49</td>
+				<td class="metric numeric">250,000</td>
+				<td class="metric numeric">500,000</td>
+				<td class="metric numeric">1.40 GB</td>
+				<td class="metric numeric">16,264,314</td>
+				<td class="metric numeric"><span class="cost-tooltip" title="S3 GET: $0.000020&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000031&#10;Lambda Requests: $0.000000&#10;Total: $0.000051">$0.000051</span></td>
+			</tr>
+			<tr>
+				<td class="query-name"><a href="#query-cmp-filter_billing_service">Filter Billing Service</a></td>
+				<td class="win-cell win-cell-blockpack">blockpack<br><small>(3.5x faster)<br>score: 500.52ms</small></td>
+				<td class="metric numeric winner-blockpack">318.62ms <span style="color: #999; font-size: 0.85em;">(3.7x)</span></td>
+				<td class="metric numeric winner-blockpack">181.90ms <span style="color: #999; font-size: 0.85em;">(3.2x)</span></td>
+				<td class="metric numeric">48.02 MB</td>
+				<td class="metric numeric winner-blockpack">9 <span style="color: #999; font-size: 0.85em;">(5.7x)</span></td>
+				<td class="metric numeric">62,500</td>
+				<td class="metric numeric">62,500</td>
+				<td class="metric numeric">301.76 MB</td>
+				<td class="metric numeric winner-blockpack">2,122,197 <span style="color: #999; font-size: 0.85em;">(1.6x)</span></td>
+				<td class="metric numeric winner-blockpack"><span class="cost-tooltip" title="S3 GET: $0.000004&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000005&#10;Lambda Requests: $0.000000&#10;Total: $0.000009">$0.000009</span> <span style="color: #999; font-size: 0.85em;">(4.5x)</span></td>
+				<td class="metric numeric">1.19s</td>
+				<td class="metric numeric">582.40ms</td>
+				<td class="metric numeric winner-parquet">31.96 MB <span style="color: #999; font-size: 0.85em;">(1.5x)</span></td>
+				<td class="metric numeric">51</td>
+				<td class="metric numeric">62,500</td>
+				<td class="metric numeric">62,500</td>
+				<td class="metric numeric winner-parquet">244.73 MB <span style="color: #999; font-size: 0.85em;">(1.2x)</span></td>
+				<td class="metric numeric">3,451,658</td>
+				<td class="metric numeric"><span class="cost-tooltip" title="S3 GET: $0.000020&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000020&#10;Lambda Requests: $0.000000&#10;Total: $0.000040">$0.000040</span></td>
+			</tr>
+			<tr>
+				<td class="query-name"><a href="#query-cmp-filter_by_db_operations">Filter By Db Operations</a></td>
+				<td class="win-cell win-cell-blockpack">blockpack<br><small>(4.2x faster)<br>score: 608.88ms</small></td>
+				<td class="metric numeric winner-blockpack">344.58ms <span style="color: #999; font-size: 0.85em;">(4.2x)</span></td>
+				<td class="metric numeric winner-blockpack">264.30ms <span style="color: #999; font-size: 0.85em;">(4.1x)</span></td>
+				<td class="metric numeric">42.02 MB</td>
+				<td class="metric numeric winner-blockpack">8 <span style="color: #999; font-size: 0.85em;">(6.8x)</span></td>
+				<td class="metric numeric">125,000</td>
+				<td class="metric numeric">125,000</td>
+				<td class="metric numeric winner-blockpack">346.61 MB <span style="color: #999; font-size: 0.85em;">(1.4x)</span></td>
+				<td class="metric numeric winner-blockpack">3,339,665 <span style="color: #999; font-size: 0.85em;">(2.1x)</span></td>
+				<td class="metric numeric winner-blockpack"><span class="cost-tooltip" title="S3 GET: $0.000003&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000005&#10;Lambda Requests: $0.000000&#10;Total: $0.000009">$0.000009</span> <span style="color: #999; font-size: 0.85em;">(5.2x)</span></td>
+				<td class="metric numeric">1.46s</td>
+				<td class="metric numeric">1.07s</td>
+				<td class="metric numeric winner-parquet">35.62 MB <span style="color: #999; font-size: 0.85em;">(1.2x)</span></td>
+				<td class="metric numeric">54</td>
+				<td class="metric numeric">125,000</td>
+				<td class="metric numeric">125,000</td>
+				<td class="metric numeric">485.54 MB</td>
+				<td class="metric numeric">7,015,828</td>
+				<td class="metric numeric"><span class="cost-tooltip" title="S3 GET: $0.000022&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000024&#10;Lambda Requests: $0.000000&#10;Total: $0.000046">$0.000046</span></td>
+			</tr>
+			<tr>
+				<td class="query-name"><a href="#query-cmp-filter_by_http_method_post">Filter By Http Method Post</a></td>
+				<td class="win-cell win-cell-blockpack">blockpack<br><small>(2.9x faster)<br>score: 1.49s</small></td>
+				<td class="metric numeric winner-blockpack">696.64ms <span style="color: #999; font-size: 0.85em;">(2.7x)</span></td>
+				<td class="metric numeric winner-blockpack">796.60ms <span style="color: #999; font-size: 0.85em;">(3.1x)</span></td>
+				<td class="metric numeric">42.44 MB</td>
+				<td class="metric numeric winner-blockpack">8 <span style="color: #999; font-size: 0.85em;">(6.1x)</span></td>
+				<td class="metric numeric">250,000</td>
+				<td class="metric numeric">437,500</td>
+				<td class="metric numeric winner-blockpack">878.39 MB <span style="color: #999; font-size: 0.85em;">(1.5x)</span></td>
+				<td class="metric numeric winner-blockpack">10,845,652 <span style="color: #999; font-size: 0.85em;">(1.6x)</span></td>
+				<td class="metric numeric winner-blockpack"><span class="cost-tooltip" title="S3 GET: $0.000003&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000011&#10;Lambda Requests: $0.000000&#10;Total: $0.000014">$0.000014</span> <span style="color: #999; font-size: 0.85em;">(3.6x)</span></td>
+				<td class="metric numeric">1.90s</td>
+				<td class="metric numeric">2.46s</td>
+				<td class="metric numeric winner-parquet">32.18 MB <span style="color: #999; font-size: 0.85em;">(1.3x)</span></td>
+				<td class="metric numeric">49</td>
+				<td class="metric numeric">250,000</td>
+				<td class="metric numeric">437,500</td>
+				<td class="metric numeric">1.31 GB</td>
+				<td class="metric numeric">17,076,887</td>
+				<td class="metric numeric"><span class="cost-tooltip" title="S3 GET: $0.000020&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000032&#10;Lambda Requests: $0.000000&#10;Total: $0.000051">$0.000051</span></td>
+			</tr>
+			<tr>
+				<td class="query-name"><a href="#query-cmp-filter_by_http_status_200">Filter By Http Status 200</a></td>
+				<td class="win-cell win-cell-blockpack">blockpack<br><small>(2.1x faster)<br>score: 2.99s</small></td>
+				<td class="metric numeric winner-blockpack">1.16s <span style="color: #999; font-size: 0.85em;">(2.0x)</span></td>
+				<td class="metric numeric winner-blockpack">1.83s <span style="color: #999; font-size: 0.85em;">(2.2x)</span></td>
+				<td class="metric numeric">42.57 MB</td>
+				<td class="metric numeric winner-blockpack">8 <span style="color: #999; font-size: 0.85em;">(6.5x)</span></td>
+				<td class="metric numeric">187,500</td>
+				<td class="metric numeric">937,500</td>
+				<td class="metric numeric winner-blockpack">1.62 GB <span style="color: #999; font-size: 0.85em;">(1.4x)</span></td>
+				<td class="metric numeric winner-blockpack">21,651,347 <span style="color: #999; font-size: 0.85em;">(1.2x)</span></td>
+				<td class="metric numeric winner-blockpack"><span class="cost-tooltip" title="S3 GET: $0.000003&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000019&#10;Lambda Requests: $0.000000&#10;Total: $0.000022">$0.000022</span> <span style="color: #999; font-size: 0.85em;">(2.7x)</span></td>
+				<td class="metric numeric">2.34s</td>
+				<td class="metric numeric">3.99s</td>
+				<td class="metric numeric winner-parquet">33.32 MB <span style="color: #999; font-size: 0.85em;">(1.3x)</span></td>
+				<td class="metric numeric">52</td>
+				<td class="metric numeric">187,500</td>
+				<td class="metric numeric">937,500</td>
+				<td class="metric numeric">2.31 GB</td>
+				<td class="metric numeric">25,265,210</td>
+				<td class="metric numeric"><span class="cost-tooltip" title="S3 GET: $0.000021&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000039&#10;Lambda Requests: $0.000000&#10;Total: $0.000060">$0.000060</span></td>
+			</tr>
+			<tr>
+				<td class="query-name"><a href="#query-cmp-filter_by_http_status_201">Filter By Http Status 201</a></td>
+				<td class="win-cell win-cell-blockpack">blockpack<br><small>(2.8x faster)<br>score: 697.91ms</small></td>
+				<td class="metric numeric winner-blockpack">385.31ms <span style="color: #999; font-size: 0.85em;">(3.2x)</span></td>
+				<td class="metric numeric winner-blockpack">312.60ms <span style="color: #999; font-size: 0.85em;">(2.4x)</span></td>
+				<td class="metric numeric">42.40 MB</td>
+				<td class="metric numeric winner-blockpack">8 <span style="color: #999; font-size: 0.85em;">(6.5x)</span></td>
+				<td class="metric numeric">62,500</td>
+				<td class="metric numeric">125,000</td>
+				<td class="metric numeric winner-blockpack">387.47 MB <span style="color: #999; font-size: 0.85em;">(1.0x)</span></td>
+				<td class="metric numeric winner-blockpack">4,031,122 <span style="color: #999; font-size: 0.85em;">(1.2x)</span></td>
+				<td class="metric numeric winner-blockpack"><span class="cost-tooltip" title="S3 GET: $0.000003&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000006&#10;Lambda Requests: $0.000000&#10;Total: $0.000010">$0.000010</span> <span style="color: #999; font-size: 0.85em;">(4.3x)</span></td>
+				<td class="metric numeric">1.23s</td>
+				<td class="metric numeric">749.90ms</td>
+				<td class="metric numeric winner-parquet">33.32 MB <span style="color: #999; font-size: 0.85em;">(1.3x)</span></td>
+				<td class="metric numeric">52</td>
+				<td class="metric numeric">62,500</td>
+				<td class="metric numeric">125,000</td>
+				<td class="metric numeric">400.25 MB</td>
+				<td class="metric numeric">5,014,205</td>
+				<td class="metric numeric"><span class="cost-tooltip" title="S3 GET: $0.000021&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000021&#10;Lambda Requests: $0.000000&#10;Total: $0.000042">$0.000042</span></td>
+			</tr>
+			<tr>
+				<td class="query-name"><a href="#query-cmp-filter_by_http_status_403">Filter By Http Status 403</a></td>
+				<td class="win-cell win-cell-blockpack">blockpack<br><small>(2.0x faster)<br>score: 1.13s</small></td>
+				<td class="metric numeric winner-blockpack">574.49ms <span style="color: #999; font-size: 0.85em;">(2.2x)</span></td>
+				<td class="metric numeric winner-blockpack">550.80ms <span style="color: #999; font-size: 0.85em;">(1.7x)</span></td>
+				<td class="metric numeric">42.57 MB</td>
+				<td class="metric numeric winner-blockpack">8 <span style="color: #999; font-size: 0.85em;">(6.5x)</span></td>
+				<td class="metric numeric">62,500</td>
+				<td class="metric numeric">187,500</td>
+				<td class="metric numeric">647.03 MB</td>
+				<td class="metric numeric">7,710,499</td>
+				<td class="metric numeric winner-blockpack"><span class="cost-tooltip" title="S3 GET: $0.000003&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000009&#10;Lambda Requests: $0.000000&#10;Total: $0.000013">$0.000013</span> <span style="color: #999; font-size: 0.85em;">(3.3x)</span></td>
+				<td class="metric numeric">1.28s</td>
+				<td class="metric numeric">917.80ms</td>
+				<td class="metric numeric winner-parquet">33.32 MB <span style="color: #999; font-size: 0.85em;">(1.3x)</span></td>
+				<td class="metric numeric">52</td>
+				<td class="metric numeric">62,500</td>
+				<td class="metric numeric">187,500</td>
+				<td class="metric numeric winner-parquet">535.98 MB <span style="color: #999; font-size: 0.85em;">(1.2x)</span></td>
+				<td class="metric numeric winner-parquet">5,639,435 <span style="color: #999; font-size: 0.85em;">(1.4x)</span></td>
+				<td class="metric numeric"><span class="cost-tooltip" title="S3 GET: $0.000021&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000021&#10;Lambda Requests: $0.000000&#10;Total: $0.000042">$0.000042</span></td>
+			</tr>
+			<tr>
+				<td class="query-name"><a href="#query-cmp-filter_by_service_auth">Filter By Service Auth</a></td>
+				<td class="win-cell win-cell-blockpack">blockpack<br><small>(3.6x faster)<br>score: 947.57ms</small></td>
+				<td class="metric numeric winner-blockpack">509.37ms <span style="color: #999; font-size: 0.85em;">(3.4x)</span></td>
+				<td class="metric numeric winner-blockpack">438.20ms <span style="color: #999; font-size: 0.85em;">(3.9x)</span></td>
+				<td class="metric numeric">48.15 MB</td>
+				<td class="metric numeric winner-blockpack">9 <span style="color: #999; font-size: 0.85em;">(5.7x)</span></td>
+				<td class="metric numeric">250,000</td>
+				<td class="metric numeric">250,000</td>
+				<td class="metric numeric winner-blockpack">638.21 MB <span style="color: #999; font-size: 0.85em;">(1.3x)</span></td>
+				<td class="metric numeric winner-blockpack">6,569,284 <span style="color: #999; font-size: 0.85em;">(2.0x)</span></td>
+				<td class="metric numeric winner-blockpack"><span class="cost-tooltip" title="S3 GET: $0.000004&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000008&#10;Lambda Requests: $0.000000&#10;Total: $0.000012">$0.000012</span> <span style="color: #999; font-size: 0.85em;">(4.2x)</span></td>
+				<td class="metric numeric">1.71s</td>
+				<td class="metric numeric">1.72s</td>
+				<td class="metric numeric winner-parquet">31.96 MB <span style="color: #999; font-size: 0.85em;">(1.5x)</span></td>
+				<td class="metric numeric">51</td>
+				<td class="metric numeric">250,000</td>
+				<td class="metric numeric">250,000</td>
+				<td class="metric numeric">841.27 MB</td>
+				<td class="metric numeric">12,826,952</td>
+				<td class="metric numeric"><span class="cost-tooltip" title="S3 GET: $0.000020&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000028&#10;Lambda Requests: $0.000000&#10;Total: $0.000049">$0.000049</span></td>
+			</tr>
+			<tr>
+				<td class="query-name"><a href="#query-cmp-filter_by_service_shop">Filter By Service Shop</a></td>
+				<td class="win-cell win-cell-blockpack">blockpack<br><small>(2.5x faster)<br>score: 2.11s</small></td>
+				<td class="metric numeric winner-blockpack">895.40ms <span style="color: #999; font-size: 0.85em;">(2.4x)</span></td>
+				<td class="metric numeric winner-blockpack">1.21s <span style="color: #999; font-size: 0.85em;">(2.6x)</span></td>
+				<td class="metric numeric">48.27 MB</td>
+				<td class="metric numeric winner-blockpack">9 <span style="color: #999; font-size: 0.85em;">(5.7x)</span></td>
+				<td class="metric numeric">250,000</td>
+				<td class="metric numeric">687,500</td>
+				<td class="metric numeric winner-blockpack">1.20 GB <span style="color: #999; font-size: 0.85em;">(1.4x)</span></td>
+				<td class="metric numeric winner-blockpack">15,298,200 <span style="color: #999; font-size: 0.85em;">(1.4x)</span></td>
+				<td class="metric numeric winner-blockpack"><span class="cost-tooltip" title="S3 GET: $0.000004&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000014&#10;Lambda Requests: $0.000000&#10;Total: $0.000018">$0.000018</span> <span style="color: #999; font-size: 0.85em;">(3.1x)</span></td>
+				<td class="metric numeric">2.14s</td>
+				<td class="metric numeric">3.17s</td>
+				<td class="metric numeric winner-parquet">31.96 MB <span style="color: #999; font-size: 0.85em;">(1.5x)</span></td>
+				<td class="metric numeric">51</td>
+				<td class="metric numeric">250,000</td>
+				<td class="metric numeric">687,500</td>
+				<td class="metric numeric">1.67 GB</td>
+				<td class="metric numeric">21,764,876</td>
+				<td class="metric numeric"><span class="cost-tooltip" title="S3 GET: $0.000020&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000036&#10;Lambda Requests: $0.000000&#10;Total: $0.000056">$0.000056</span></td>
+			</tr>
+			<tr>
+				<td class="query-name"><a href="#query-cmp-filter_payment_operation">Filter Payment Operation</a></td>
+				<td class="win-cell win-cell-blockpack">blockpack<br><small>(3.2x faster)<br>score: 501.22ms</small></td>
+				<td class="metric numeric winner-blockpack">318.62ms <span style="color: #999; font-size: 0.85em;">(3.5x)</span></td>
+				<td class="metric numeric winner-blockpack">182.60ms <span style="color: #999; font-size: 0.85em;">(2.7x)</span></td>
+				<td class="metric numeric">48.02 MB</td>
+				<td class="metric numeric winner-blockpack">9 <span style="color: #999; font-size: 0.85em;">(5.4x)</span></td>
+				<td class="metric numeric">62,500</td>
+				<td class="metric numeric">62,500</td>
+				<td class="metric numeric">301.23 MB</td>
+				<td class="metric numeric winner-blockpack">2,122,377 <span style="color: #999; font-size: 0.85em;">(1.5x)</span></td>
+				<td class="metric numeric winner-blockpack"><span class="cost-tooltip" title="S3 GET: $0.000004&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000005&#10;Lambda Requests: $0.000000&#10;Total: $0.000009">$0.000009</span> <span style="color: #999; font-size: 0.85em;">(4.3x)</span></td>
+				<td class="metric numeric">1.12s</td>
+				<td class="metric numeric">489.50ms</td>
+				<td class="metric numeric winner-parquet">32.03 MB <span style="color: #999; font-size: 0.85em;">(1.5x)</span></td>
+				<td class="metric numeric">49</td>
+				<td class="metric numeric">62,500</td>
+				<td class="metric numeric">62,500</td>
+				<td class="metric numeric winner-parquet">253.87 MB <span style="color: #999; font-size: 0.85em;">(1.2x)</span></td>
+				<td class="metric numeric">3,201,141</td>
+				<td class="metric numeric"><span class="cost-tooltip" title="S3 GET: $0.000020&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000019&#10;Lambda Requests: $0.000000&#10;Total: $0.000038">$0.000038</span></td>
+			</tr>
+			<tr>
+				<td class="query-name"><a href="#query-cmp-filter_shop_namespace">Filter Shop Namespace</a></td>
+				<td class="win-cell win-cell-blockpack">blockpack<br><small>(2.6x faster)<br>score: 3.10s</small></td>
+				<td class="metric numeric winner-blockpack">1.31s <span style="color: #999; font-size: 0.85em;">(2.1x)</span></td>
+				<td class="metric numeric winner-blockpack">1.79s <span style="color: #999; font-size: 0.85em;">(2.9x)</span></td>
+				<td class="metric numeric">42.57 MB</td>
+				<td class="metric numeric winner-blockpack">8 <span style="color: #999; font-size: 0.85em;">(6.6x)</span></td>
+				<td class="metric numeric">250,000</td>
+				<td class="metric numeric">1,125,000</td>
+				<td class="metric numeric winner-blockpack">1.85 GB <span style="color: #999; font-size: 0.85em;">(1.4x)</span></td>
+				<td class="metric numeric winner-blockpack">25,106,351 <span style="color: #999; font-size: 0.85em;">(1.2x)</span></td>
+				<td class="metric numeric winner-blockpack"><span class="cost-tooltip" title="S3 GET: $0.000003&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000021&#10;Lambda Requests: $0.000000&#10;Total: $0.000024">$0.000024</span> <span style="color: #999; font-size: 0.85em;">(2.8x)</span></td>
+				<td class="metric numeric">2.80s</td>
+				<td class="metric numeric">5.18s</td>
+				<td class="metric numeric winner-parquet">32.18 MB <span style="color: #999; font-size: 0.85em;">(1.3x)</span></td>
+				<td class="metric numeric">53</td>
+				<td class="metric numeric">250,000</td>
+				<td class="metric numeric">1,125,000</td>
+				<td class="metric numeric">2.57 GB</td>
+				<td class="metric numeric">31,078,199</td>
+				<td class="metric numeric"><span class="cost-tooltip" title="S3 GET: $0.000021&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000047&#10;Lambda Requests: $0.000000&#10;Total: $0.000068">$0.000068</span></td>
+			</tr>
+			<tr>
+				<td class="query-name"><a href="#query-cmp-full_scan">Full Scan</a></td>
+				<td class="win-cell win-cell-blockpack">blockpack<br><small>(1.6x faster)<br>score: 4.32s</small></td>
+				<td class="metric numeric winner-blockpack">1.59s <span style="color: #999; font-size: 0.85em;">(1.7x)</span></td>
+				<td class="metric numeric winner-blockpack">2.74s <span style="color: #999; font-size: 0.85em;">(1.6x)</span></td>
+				<td class="metric numeric">42.57 MB</td>
+				<td class="metric numeric winner-blockpack">8 <span style="color: #999; font-size: 0.85em;">(5.9x)</span></td>
+				<td class="metric numeric">250,000</td>
+				<td class="metric numeric">1,562,500</td>
+				<td class="metric numeric winner-blockpack">2.34 GB <span style="color: #999; font-size: 0.85em;">(1.3x)</span></td>
+				<td class="metric numeric">33,539,919</td>
+				<td class="metric numeric winner-blockpack"><span class="cost-tooltip" title="S3 GET: $0.000003&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000025&#10;Lambda Requests: $0.000000&#10;Total: $0.000029">$0.000029</span> <span style="color: #999; font-size: 0.85em;">(2.2x)</span></td>
+				<td class="metric numeric">2.65s</td>
+				<td class="metric numeric">4.39s</td>
+				<td class="metric numeric winner-parquet">30.91 MB <span style="color: #999; font-size: 0.85em;">(1.4x)</span></td>
+				<td class="metric numeric">47</td>
+				<td class="metric numeric">250,000</td>
+				<td class="metric numeric">1,562,500</td>
+				<td class="metric numeric">3.15 GB</td>
+				<td class="metric numeric winner-parquet">30,889,072 <span style="color: #999; font-size: 0.85em;">(1.1x)</span></td>
+				<td class="metric numeric"><span class="cost-tooltip" title="S3 GET: $0.000019&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000044&#10;Lambda Requests: $0.000000&#10;Total: $0.000063">$0.000063</span></td>
+			</tr>
+			<tr>
+				<td class="query-name"><a href="#query-cmp-gold_customers">Gold Customers</a></td>
+				<td class="win-cell win-cell-blockpack">blockpack<br><small>(2.5x faster)<br>score: 181.42ms</small></td>
+				<td class="metric numeric winner-blockpack">135.32ms <span style="color: #999; font-size: 0.85em;">(2.8x)</span></td>
+				<td class="metric numeric winner-blockpack">46.10ms <span style="color: #999; font-size: 0.85em;">(1.6x)</span></td>
+				<td class="metric numeric">13.94 MB</td>
+				<td class="metric numeric winner-blockpack">5 <span style="color: #999; font-size: 0.85em;">(3.2x)</span></td>
+				<td class="metric numeric">2,000</td>
+				<td class="metric numeric">12,500</td>
+				<td class="metric numeric">93.12 MB</td>
+				<td class="metric numeric">353,324</td>
+				<td class="metric numeric winner-blockpack"><span class="cost-tooltip" title="S3 GET: $0.000002&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000002&#10;Lambda Requests: $0.000000&#10;Total: $0.000005">$0.000005</span> <span style="color: #999; font-size: 0.85em;">(2.9x)</span></td>
+				<td class="metric numeric">384.36ms</td>
+				<td class="metric numeric">75.12ms</td>
+				<td class="metric numeric winner-parquet">8.99 MB <span style="color: #999; font-size: 0.85em;">(1.5x)</span></td>
+				<td class="metric numeric">16</td>
+				<td class="metric numeric">2,000</td>
+				<td class="metric numeric">12,500</td>
+				<td class="metric numeric winner-parquet">47.33 MB <span style="color: #999; font-size: 0.85em;">(2.0x)</span></td>
+				<td class="metric numeric winner-parquet">329,964 <span style="color: #999; font-size: 0.85em;">(1.1x)</span></td>
+				<td class="metric numeric"><span class="cost-tooltip" title="S3 GET: $0.000006&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000006&#10;Lambda Requests: $0.000000&#10;Total: $0.000013">$0.000013</span></td>
+			</tr>
+			<tr>
+				<td class="query-name"><a href="#query-cmp-gold_us_west">Gold Us West</a></td>
+				<td class="win-cell win-cell-blockpack">blockpack<br><small>(5.0x faster)<br>score: 174.26ms</small></td>
+				<td class="metric numeric winner-blockpack">131.78ms <span style="color: #999; font-size: 0.85em;">(4.6x)</span></td>
+				<td class="metric numeric winner-blockpack">42.48ms <span style="color: #999; font-size: 0.85em;">(6.0x)</span></td>
+				<td class="metric numeric">13.94 MB</td>
+				<td class="metric numeric winner-blockpack">5 <span style="color: #999; font-size: 0.85em;">(3.8x)</span></td>
+				<td class="metric numeric">666</td>
+				<td class="metric numeric">4,163</td>
+				<td class="metric numeric">83.07 MB</td>
+				<td class="metric numeric winner-blockpack">199,888 <span style="color: #999; font-size: 0.85em;">(3.3x)</span></td>
+				<td class="metric numeric winner-blockpack"><span class="cost-tooltip" title="S3 GET: $0.000002&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000002&#10;Lambda Requests: $0.000000&#10;Total: $0.000004">$0.000004</span> <span style="color: #999; font-size: 0.85em;">(4.1x)</span></td>
+				<td class="metric numeric">610.61ms</td>
+				<td class="metric numeric">256.20ms</td>
+				<td class="metric numeric winner-parquet">10.15 MB <span style="color: #999; font-size: 0.85em;">(1.4x)</span></td>
+				<td class="metric numeric">19</td>
+				<td class="metric numeric">666</td>
+				<td class="metric numeric">4,163</td>
+				<td class="metric numeric winner-parquet">59.24 MB <span style="color: #999; font-size: 0.85em;">(1.4x)</span></td>
+				<td class="metric numeric">665,514</td>
+				<td class="metric numeric"><span class="cost-tooltip" title="S3 GET: $0.000008&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000010&#10;Lambda Requests: $0.000000&#10;Total: $0.000018">$0.000018</span></td>
+			</tr>
+			<tr>
+				<td class="query-name"><a href="#query-cmp-intrinsic_kind_client">Intrinsic Kind Client</a></td>
+				<td class="win-cell win-cell-blockpack">blockpack<br><small>(2.7x faster)<br>score: 1.15s</small></td>
+				<td class="metric numeric winner-blockpack">566.06ms <span style="color: #999; font-size: 0.85em;">(2.7x)</span></td>
+				<td class="metric numeric winner-blockpack">581.90ms <span style="color: #999; font-size: 0.85em;">(2.7x)</span></td>
+				<td class="metric numeric">48.25 MB</td>
+				<td class="metric numeric winner-blockpack">9 <span style="color: #999; font-size: 0.85em;">(5.7x)</span></td>
+				<td class="metric numeric">125,000</td>
+				<td class="metric numeric">312,500</td>
+				<td class="metric numeric winner-blockpack">679.95 MB <span style="color: #999; font-size: 0.85em;">(1.3x)</span></td>
+				<td class="metric numeric winner-blockpack">7,537,058 <span style="color: #999; font-size: 0.85em;">(1.5x)</span></td>
+				<td class="metric numeric winner-blockpack"><span class="cost-tooltip" title="S3 GET: $0.000004&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000009&#10;Lambda Requests: $0.000000&#10;Total: $0.000013">$0.000013</span> <span style="color: #999; font-size: 0.85em;">(3.6x)</span></td>
+				<td class="metric numeric">1.54s</td>
+				<td class="metric numeric">1.54s</td>
+				<td class="metric numeric winner-parquet">31.72 MB <span style="color: #999; font-size: 0.85em;">(1.5x)</span></td>
+				<td class="metric numeric">51</td>
+				<td class="metric numeric">125,000</td>
+				<td class="metric numeric">312,500</td>
+				<td class="metric numeric">899.73 MB</td>
+				<td class="metric numeric">10,952,140</td>
+				<td class="metric numeric"><span class="cost-tooltip" title="S3 GET: $0.000020&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000026&#10;Lambda Requests: $0.000000&#10;Total: $0.000046">$0.000046</span></td>
+			</tr>
+			<tr>
+				<td class="query-name"><a href="#query-cmp-intrinsic_kind_server">Intrinsic Kind Server</a></td>
+				<td class="win-cell win-cell-blockpack">blockpack<br><small>(2.4x faster)<br>score: 3.53s</small></td>
+				<td class="metric numeric winner-blockpack">1.42s <span style="color: #999; font-size: 0.85em;">(2.0x)</span></td>
+				<td class="metric numeric winner-blockpack">2.11s <span style="color: #999; font-size: 0.85em;">(2.6x)</span></td>
+				<td class="metric numeric">48.54 MB</td>
+				<td class="metric numeric winner-blockpack">9 <span style="color: #999; font-size: 0.85em;">(5.7x)</span></td>
+				<td class="metric numeric">250,000</td>
+				<td class="metric numeric">1,250,000</td>
+				<td class="metric numeric winner-blockpack">2.05 GB <span style="color: #999; font-size: 0.85em;">(1.5x)</span></td>
+				<td class="metric numeric winner-blockpack">27,717,095 <span style="color: #999; font-size: 0.85em;">(1.2x)</span></td>
+				<td class="metric numeric winner-blockpack"><span class="cost-tooltip" title="S3 GET: $0.000004&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000023&#10;Lambda Requests: $0.000000&#10;Total: $0.000026">$0.000026</span> <span style="color: #999; font-size: 0.85em;">(2.5x)</span></td>
+				<td class="metric numeric">2.80s</td>
+				<td class="metric numeric">5.56s</td>
+				<td class="metric numeric winner-parquet">31.72 MB <span style="color: #999; font-size: 0.85em;">(1.5x)</span></td>
+				<td class="metric numeric">51</td>
+				<td class="metric numeric">250,000</td>
+				<td class="metric numeric">1,250,000</td>
+				<td class="metric numeric">3.08 GB</td>
+				<td class="metric numeric">32,952,838</td>
+				<td class="metric numeric"><span class="cost-tooltip" title="S3 GET: $0.000020&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000047&#10;Lambda Requests: $0.000000&#10;Total: $0.000067">$0.000067</span></td>
+			</tr>
+			<tr>
+				<td class="query-name"><a href="#query-cmp-intrinsic_status_error">Intrinsic Status Error</a></td>
+				<td class="win-cell win-cell-blockpack">blockpack<br><small>(1.7x faster)<br>score: 1.28s</small></td>
+				<td class="metric numeric winner-blockpack">621.48ms <span style="color: #999; font-size: 0.85em;">(2.1x)</span></td>
+				<td class="metric numeric winner-blockpack">662.10ms <span style="color: #999; font-size: 0.85em;">(1.4x)</span></td>
+				<td class="metric numeric">48.54 MB</td>
+				<td class="metric numeric winner-blockpack">9 <span style="color: #999; font-size: 0.85em;">(5.7x)</span></td>
+				<td class="metric numeric">62,500</td>
+				<td class="metric numeric">187,500</td>
+				<td class="metric numeric">700.35 MB</td>
+				<td class="metric numeric">7,711,866</td>
+				<td class="metric numeric winner-blockpack"><span class="cost-tooltip" title="S3 GET: $0.000004&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000010&#10;Lambda Requests: $0.000000&#10;Total: $0.000014">$0.000014</span> <span style="color: #999; font-size: 0.85em;">(3.0x)</span></td>
+				<td class="metric numeric">1.31s</td>
+				<td class="metric numeric">926.60ms</td>
+				<td class="metric numeric winner-parquet">31.72 MB <span style="color: #999; font-size: 0.85em;">(1.5x)</span></td>
+				<td class="metric numeric">51</td>
+				<td class="metric numeric">62,500</td>
+				<td class="metric numeric">187,500</td>
+				<td class="metric numeric winner-parquet">535.10 MB <span style="color: #999; font-size: 0.85em;">(1.3x)</span></td>
+				<td class="metric numeric winner-parquet">5,639,488 <span style="color: #999; font-size: 0.85em;">(1.4x)</span></td>
+				<td class="metric numeric"><span class="cost-tooltip" title="S3 GET: $0.000020&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000022&#10;Lambda Requests: $0.000000&#10;Total: $0.000042">$0.000042</span></td>
+			</tr>
+			<tr>
+				<td class="query-name"><a href="#query-cmp-intrinsic_status_ok">Intrinsic Status Ok</a></td>
+				<td class="win-cell win-cell-blockpack">blockpack<br><small>(2.3x faster)<br>score: 3.71s</small></td>
+				<td class="metric numeric winner-blockpack">1.50s <span style="color: #999; font-size: 0.85em;">(1.9x)</span></td>
+				<td class="metric numeric winner-blockpack">2.21s <span style="color: #999; font-size: 0.85em;">(2.6x)</span></td>
+				<td class="metric numeric">48.54 MB</td>
+				<td class="metric numeric winner-blockpack">9 <span style="color: #999; font-size: 0.85em;">(5.7x)</span></td>
+				<td class="metric numeric">187,500</td>
+				<td class="metric numeric">1,375,000</td>
+				<td class="metric numeric winner-blockpack">2.20 GB <span style="color: #999; font-size: 0.85em;">(1.5x)</span></td>
+				<td class="metric numeric winner-blockpack">29,906,272 <span style="color: #999; font-size: 0.85em;">(1.1x)</span></td>
+				<td class="metric numeric winner-blockpack"><span class="cost-tooltip" title="S3 GET: $0.000004&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000024&#10;Lambda Requests: $0.000000&#10;Total: $0.000028">$0.000028</span> <span style="color: #999; font-size: 0.85em;">(2.4x)</span></td>
+				<td class="metric numeric">2.81s</td>
+				<td class="metric numeric">5.80s</td>
+				<td class="metric numeric winner-parquet">31.72 MB <span style="color: #999; font-size: 0.85em;">(1.5x)</span></td>
+				<td class="metric numeric">51</td>
+				<td class="metric numeric">187,500</td>
+				<td class="metric numeric">1,375,000</td>
+				<td class="metric numeric">3.27 GB</td>
+				<td class="metric numeric">33,453,079</td>
+				<td class="metric numeric"><span class="cost-tooltip" title="S3 GET: $0.000020&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000047&#10;Lambda Requests: $0.000000&#10;Total: $0.000068">$0.000068</span></td>
+			</tr>
+			<tr>
+				<td class="query-name"><a href="#query-cmp-mixed_db_namespace_and_db">Mixed Db Namespace And Db</a></td>
+				<td class="win-cell win-cell-blockpack">blockpack<br><small>(4.4x faster)<br>score: 628.30ms</small></td>
+				<td class="metric numeric winner-blockpack">350.60ms <span style="color: #999; font-size: 0.85em;">(4.6x)</span></td>
+				<td class="metric numeric winner-blockpack">277.70ms <span style="color: #999; font-size: 0.85em;">(4.2x)</span></td>
+				<td class="metric numeric">42.02 MB</td>
+				<td class="metric numeric winner-blockpack">8 <span style="color: #999; font-size: 0.85em;">(7.2x)</span></td>
+				<td class="metric numeric">125,000</td>
+				<td class="metric numeric">125,000</td>
+				<td class="metric numeric winner-blockpack">352.08 MB <span style="color: #999; font-size: 0.85em;">(1.5x)</span></td>
+				<td class="metric numeric winner-blockpack">3,348,195 <span style="color: #999; font-size: 0.85em;">(2.3x)</span></td>
+				<td class="metric numeric winner-blockpack"><span class="cost-tooltip" title="S3 GET: $0.000003&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000006&#10;Lambda Requests: $0.000000&#10;Total: $0.000009">$0.000009</span> <span style="color: #999; font-size: 0.85em;">(5.6x)</span></td>
+				<td class="metric numeric">1.60s</td>
+				<td class="metric numeric">1.17s</td>
+				<td class="metric numeric winner-parquet">36.29 MB <span style="color: #999; font-size: 0.85em;">(1.2x)</span></td>
+				<td class="metric numeric">58</td>
+				<td class="metric numeric">125,000</td>
+				<td class="metric numeric">125,000</td>
+				<td class="metric numeric">514.31 MB</td>
+				<td class="metric numeric">7,766,984</td>
+				<td class="metric numeric"><span class="cost-tooltip" title="S3 GET: $0.000023&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000027&#10;Lambda Requests: $0.000000&#10;Total: $0.000050">$0.000050</span></td>
+			</tr>
+			<tr>
+				<td class="query-name"><a href="#query-cmp-platinum_customers">Platinum Customers</a></td>
+				<td class="win-cell win-cell-blockpack">blockpack<br><small>(2.5x faster)<br>score: 163.28ms</small></td>
+				<td class="metric numeric winner-blockpack">126.94ms <span style="color: #999; font-size: 0.85em;">(2.9x)</span></td>
+				<td class="metric numeric winner-blockpack">36.34ms <span style="color: #999; font-size: 0.85em;">(1.3x)</span></td>
+				<td class="metric numeric">13.63 MB</td>
+				<td class="metric numeric winner-blockpack">5 <span style="color: #999; font-size: 0.85em;">(3.2x)</span></td>
+				<td class="metric numeric">50</td>
+				<td class="metric numeric">317</td>
+				<td class="metric numeric">74.81 MB</td>
+				<td class="metric numeric">87,741</td>
+				<td class="metric numeric winner-blockpack"><span class="cost-tooltip" title="S3 GET: $0.000002&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000002&#10;Lambda Requests: $0.000000&#10;Total: $0.000004">$0.000004</span> <span style="color: #999; font-size: 0.85em;">(3.0x)</span></td>
+				<td class="metric numeric">364.19ms</td>
+				<td class="metric numeric">46.62ms</td>
+				<td class="metric numeric winner-parquet">8.99 MB <span style="color: #999; font-size: 0.85em;">(1.5x)</span></td>
+				<td class="metric numeric">16</td>
+				<td class="metric numeric">50</td>
+				<td class="metric numeric">317</td>
+				<td class="metric numeric winner-parquet">14.94 MB <span style="color: #999; font-size: 0.85em;">(5.0x)</span></td>
+				<td class="metric numeric winner-parquet">15,934 <span style="color: #999; font-size: 0.85em;">(5.5x)</span></td>
+				<td class="metric numeric"><span class="cost-tooltip" title="S3 GET: $0.000006&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000006&#10;Lambda Requests: $0.000000&#10;Total: $0.000013">$0.000013</span></td>
+			</tr>
+			<tr>
+				<td class="query-name"><a href="#query-cmp-platinum_us_west">Platinum Us West</a></td>
+				<td class="win-cell win-cell-blockpack">blockpack<br><small>(5.2x faster)<br>score: 161.99ms</small></td>
+				<td class="metric numeric winner-blockpack">126.03ms <span style="color: #999; font-size: 0.85em;">(4.8x)</span></td>
+				<td class="metric numeric winner-blockpack">35.96ms <span style="color: #999; font-size: 0.85em;">(6.8x)</span></td>
+				<td class="metric numeric">13.63 MB</td>
+				<td class="metric numeric winner-blockpack">5 <span style="color: #999; font-size: 0.85em;">(3.8x)</span></td>
+				<td class="metric numeric">16</td>
+				<td class="metric numeric">100</td>
+				<td class="metric numeric">74.75 MB</td>
+				<td class="metric numeric winner-blockpack">87,668 <span style="color: #999; font-size: 0.85em;">(6.1x)</span></td>
+				<td class="metric numeric winner-blockpack"><span class="cost-tooltip" title="S3 GET: $0.000002&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000002&#10;Lambda Requests: $0.000000&#10;Total: $0.000004">$0.000004</span> <span style="color: #999; font-size: 0.85em;">(4.2x)</span></td>
+				<td class="metric numeric">604.80ms</td>
+				<td class="metric numeric">245.40ms</td>
+				<td class="metric numeric winner-parquet">10.15 MB <span style="color: #999; font-size: 0.85em;">(1.3x)</span></td>
+				<td class="metric numeric">19</td>
+				<td class="metric numeric">16</td>
+				<td class="metric numeric">100</td>
+				<td class="metric numeric winner-parquet">46.70 MB <span style="color: #999; font-size: 0.85em;">(1.6x)</span></td>
+				<td class="metric numeric">533,804</td>
+				<td class="metric numeric"><span class="cost-tooltip" title="S3 GET: $0.000008&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000010&#10;Lambda Requests: $0.000000&#10;Total: $0.000018">$0.000018</span></td>
+			</tr>
+			<tr>
+				<td class="query-name"><a href="#query-cmp-regex_article_operations">Regex Article Operations</a></td>
+				<td class="win-cell win-cell-blockpack">blockpack<br><small>(1.6x faster)<br>score: 2.75s</small></td>
+				<td class="metric numeric winner-blockpack">1.07s <span style="color: #999; font-size: 0.85em;">(1.8x)</span></td>
+				<td class="metric numeric winner-blockpack">1.68s <span style="color: #999; font-size: 0.85em;">(1.4x)</span></td>
+				<td class="metric numeric">48.54 MB</td>
+				<td class="metric numeric winner-blockpack">9 <span style="color: #999; font-size: 0.85em;">(5.4x)</span></td>
+				<td class="metric numeric">125,000</td>
+				<td class="metric numeric">750,000</td>
+				<td class="metric numeric winner-blockpack">1.38 GB <span style="color: #999; font-size: 0.85em;">(1.3x)</span></td>
+				<td class="metric numeric">17,298,973</td>
+				<td class="metric numeric winner-blockpack"><span class="cost-tooltip" title="S3 GET: $0.000004&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000017&#10;Lambda Requests: $0.000000&#10;Total: $0.000021">$0.000021</span> <span style="color: #999; font-size: 0.85em;">(2.5x)</span></td>
+				<td class="metric numeric">1.94s</td>
+				<td class="metric numeric">2.40s</td>
+				<td class="metric numeric winner-parquet">32.03 MB <span style="color: #999; font-size: 0.85em;">(1.5x)</span></td>
+				<td class="metric numeric">49</td>
+				<td class="metric numeric">125,000</td>
+				<td class="metric numeric">750,000</td>
+				<td class="metric numeric">1.79 GB</td>
+				<td class="metric numeric winner-parquet">16,514,908 <span style="color: #999; font-size: 0.85em;">(1.0x)</span></td>
+				<td class="metric numeric"><span class="cost-tooltip" title="S3 GET: $0.000020&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000032&#10;Lambda Requests: $0.000000&#10;Total: $0.000052">$0.000052</span></td>
+			</tr>
+			<tr>
+				<td class="query-name"><a href="#query-cmp-structural_ancestor">Structural Ancestor</a></td>
+				<td class="win-cell win-cell-blockpack">blockpack<br><small>(2.5x faster)<br>score: 1.94s</small></td>
+				<td class="metric numeric winner-blockpack">887.79ms <span style="color: #999; font-size: 0.85em;">(2.7x)</span></td>
+				<td class="metric numeric winner-blockpack">1.05s <span style="color: #999; font-size: 0.85em;">(2.3x)</span></td>
+				<td class="metric numeric">42.57 MB</td>
+				<td class="metric numeric winner-blockpack">8 <span style="color: #999; font-size: 0.85em;">(7.8x)</span></td>
+				<td class="metric numeric">125,000</td>
+				<td class="metric numeric">250,000</td>
+				<td class="metric numeric winner-blockpack">845.60 MB <span style="color: #999; font-size: 0.85em;">(1.3x)</span></td>
+				<td class="metric numeric winner-blockpack">10,431,015 <span style="color: #999; font-size: 0.85em;">(1.3x)</span></td>
+				<td class="metric numeric winner-blockpack"><span class="cost-tooltip" title="S3 GET: $0.000003&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000015&#10;Lambda Requests: $0.000000&#10;Total: $0.000018">$0.000018</span> <span style="color: #999; font-size: 0.85em;">(3.6x)</span></td>
+				<td class="metric numeric">2.40s</td>
+				<td class="metric numeric">2.47s</td>
+				<td class="metric numeric winner-parquet">39.40 MB <span style="color: #999; font-size: 0.85em;">(1.1x)</span></td>
+				<td class="metric numeric">62</td>
+				<td class="metric numeric">125,000</td>
+				<td class="metric numeric">250,000</td>
+				<td class="metric numeric">1.09 GB</td>
+				<td class="metric numeric">13,456,430</td>
+				<td class="metric numeric"><span class="cost-tooltip" title="S3 GET: $0.000025&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000040&#10;Lambda Requests: $0.000000&#10;Total: $0.000065">$0.000065</span></td>
+			</tr>
+			<tr>
+				<td class="query-name"><a href="#query-cmp-structural_child">Structural Child</a></td>
+				<td class="win-cell win-cell-blockpack">blockpack<br><small>(2.4x faster)<br>score: 3.16s</small></td>
+				<td class="metric numeric winner-blockpack">1.59s <span style="color: #999; font-size: 0.85em;">(2.3x)</span></td>
+				<td class="metric numeric winner-blockpack">1.57s <span style="color: #999; font-size: 0.85em;">(2.5x)</span></td>
+				<td class="metric numeric">42.57 MB</td>
+				<td class="metric numeric winner-blockpack">8 <span style="color: #999; font-size: 0.85em;">(7.1x)</span></td>
+				<td class="metric numeric">250,000</td>
+				<td class="metric numeric">250,000</td>
+				<td class="metric numeric winner-blockpack">875.80 MB <span style="color: #999; font-size: 0.85em;">(1.6x)</span></td>
+				<td class="metric numeric winner-blockpack">10,556,888 <span style="color: #999; font-size: 0.85em;">(1.7x)</span></td>
+				<td class="metric numeric winner-blockpack"><span class="cost-tooltip" title="S3 GET: $0.000003&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000025&#10;Lambda Requests: $0.000000&#10;Total: $0.000028">$0.000028</span> <span style="color: #999; font-size: 0.85em;">(2.9x)</span></td>
+				<td class="metric numeric">3.61s</td>
+				<td class="metric numeric">3.98s</td>
+				<td class="metric numeric winner-parquet">35.14 MB <span style="color: #999; font-size: 0.85em;">(1.2x)</span></td>
+				<td class="metric numeric">57</td>
+				<td class="metric numeric">250,000</td>
+				<td class="metric numeric">250,000</td>
+				<td class="metric numeric">1.40 GB</td>
+				<td class="metric numeric">17,829,308</td>
+				<td class="metric numeric"><span class="cost-tooltip" title="S3 GET: $0.000023&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000060&#10;Lambda Requests: $0.000000&#10;Total: $0.000083">$0.000083</span></td>
+			</tr>
+			<tr>
+				<td class="query-name"><a href="#query-cmp-structural_descendant">Structural Descendant</a></td>
+				<td class="win-cell win-cell-blockpack">blockpack<br><small>(2.5x faster)<br>score: 1.67s</small></td>
+				<td class="metric numeric winner-blockpack">777.32ms <span style="color: #999; font-size: 0.85em;">(2.8x)</span></td>
+				<td class="metric numeric winner-blockpack">888.40ms <span style="color: #999; font-size: 0.85em;">(2.2x)</span></td>
+				<td class="metric numeric">42.57 MB</td>
+				<td class="metric numeric winner-blockpack">8 <span style="color: #999; font-size: 0.85em;">(7.8x)</span></td>
+				<td class="metric numeric">125,000</td>
+				<td class="metric numeric">125,000</td>
+				<td class="metric numeric winner-blockpack">766.90 MB <span style="color: #999; font-size: 0.85em;">(1.2x)</span></td>
+				<td class="metric numeric winner-blockpack">10,056,016 <span style="color: #999; font-size: 0.85em;">(1.1x)</span></td>
+				<td class="metric numeric winner-blockpack"><span class="cost-tooltip" title="S3 GET: $0.000003&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000013&#10;Lambda Requests: $0.000000&#10;Total: $0.000016">$0.000016</span> <span style="color: #999; font-size: 0.85em;">(3.8x)</span></td>
+				<td class="metric numeric">2.17s</td>
+				<td class="metric numeric">2.00s</td>
+				<td class="metric numeric winner-parquet">39.40 MB <span style="color: #999; font-size: 0.85em;">(1.1x)</span></td>
+				<td class="metric numeric">62</td>
+				<td class="metric numeric">125,000</td>
+				<td class="metric numeric">125,000</td>
+				<td class="metric numeric">937.18 MB</td>
+				<td class="metric numeric">11,081,301</td>
+				<td class="metric numeric"><span class="cost-tooltip" title="S3 GET: $0.000025&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000036&#10;Lambda Requests: $0.000000&#10;Total: $0.000061">$0.000061</span></td>
+			</tr>
+			<tr>
+				<td class="query-name"><a href="#query-cmp-structural_sibling">Structural Sibling</a></td>
+				<td class="win-cell win-cell-blockpack">blockpack<br><small>(1.6x faster)<br>score: 1.69s</small></td>
+				<td class="metric numeric winner-blockpack">766.93ms <span style="color: #999; font-size: 0.85em;">(2.0x)</span></td>
+				<td class="metric numeric winner-blockpack">919.70ms <span style="color: #999; font-size: 0.85em;">(1.2x)</span></td>
+				<td class="metric numeric">42.57 MB</td>
+				<td class="metric numeric winner-blockpack">8 <span style="color: #999; font-size: 0.85em;">(6.6x)</span></td>
+				<td class="metric numeric">62,500</td>
+				<td class="metric numeric">62,500</td>
+				<td class="metric numeric">705.65 MB</td>
+				<td class="metric numeric">9,808,593</td>
+				<td class="metric numeric winner-blockpack"><span class="cost-tooltip" title="S3 GET: $0.000003&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000013&#10;Lambda Requests: $0.000000&#10;Total: $0.000016">$0.000016</span> <span style="color: #999; font-size: 0.85em;">(3.0x)</span></td>
+				<td class="metric numeric">1.57s</td>
+				<td class="metric numeric">1.08s</td>
+				<td class="metric numeric winner-parquet">34.00 MB <span style="color: #999; font-size: 0.85em;">(1.3x)</span></td>
+				<td class="metric numeric">53</td>
+				<td class="metric numeric">62,500</td>
+				<td class="metric numeric">62,500</td>
+				<td class="metric numeric winner-parquet">468.04 MB <span style="color: #999; font-size: 0.85em;">(1.5x)</span></td>
+				<td class="metric numeric winner-parquet">5,452,745 <span style="color: #999; font-size: 0.85em;">(1.8x)</span></td>
+				<td class="metric numeric"><span class="cost-tooltip" title="S3 GET: $0.000021&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000026&#10;Lambda Requests: $0.000000&#10;Total: $0.000048">$0.000048</span></td>
+			</tr>
+			<tr>
+				<td class="query-name"><a href="#query-cmp-us_west_region">Us West Region</a></td>
+				<td class="win-cell win-cell-blockpack">blockpack<br><small>(2.3x faster)<br>score: 1.88s</small></td>
+				<td class="metric numeric winner-blockpack">835.36ms <span style="color: #999; font-size: 0.85em;">(2.2x)</span></td>
+				<td class="metric numeric winner-blockpack">1.04s <span style="color: #999; font-size: 0.85em;">(2.3x)</span></td>
+				<td class="metric numeric">42.57 MB</td>
+				<td class="metric numeric winner-blockpack">8 <span style="color: #999; font-size: 0.85em;">(6.8x)</span></td>
+				<td class="metric numeric">83,334</td>
+				<td class="metric numeric">520,837</td>
+				<td class="metric numeric winner-blockpack">1.07 GB <span style="color: #999; font-size: 0.85em;">(1.2x)</span></td>
+				<td class="metric numeric">13,896,885</td>
+				<td class="metric numeric winner-blockpack"><span class="cost-tooltip" title="S3 GET: $0.000003&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000014&#10;Lambda Requests: $0.000000&#10;Total: $0.000017">$0.000017</span> <span style="color: #999; font-size: 0.85em;">(3.1x)</span></td>
+				<td class="metric numeric">1.86s</td>
+				<td class="metric numeric">2.44s</td>
+				<td class="metric numeric winner-parquet">35.62 MB <span style="color: #999; font-size: 0.85em;">(1.2x)</span></td>
+				<td class="metric numeric">54</td>
+				<td class="metric numeric">83,334</td>
+				<td class="metric numeric">520,837</td>
+				<td class="metric numeric">1.32 GB</td>
+				<td class="metric numeric winner-parquet">13,766,619 <span style="color: #999; font-size: 0.85em;">(1.0x)</span></td>
+				<td class="metric numeric"><span class="cost-tooltip" title="S3 GET: $0.000022&#10;S3 Transfer: $0.000000&#10;Lambda Compute: $0.000031&#10;Lambda Requests: $0.000000&#10;Total: $0.000053">$0.000053</span></td>
+			</tr>
+		</tbody>
+	</table>
+	</div>
+
+	<button type="button" class="section-header collapsible" id="write-path" onclick="toggleSection(this)" aria-expanded="true" aria-controls="write-path-content">
+		<span class="chevron">▼</span> 💾 Write Path Comparison (Blockpack vs Parquet)
+	</button>
+	<div class="collapsible-content" id="write-path-content" aria-hidden="false">
+	<div style="text-align: center; color: #666; margin-bottom: 30px;">
+		Bulk write performance for a complete block
+	</div>
+
+	<table class="comparison-table">
+		<thead>
+			<tr>
+				<th rowspan="2">Scale</th>
+				<th colspan="6" class="blockpack-col" style="text-align: center;">Blockpack</th>
+				<th colspan="6" class="parquet-col" style="text-align: center;">Parquet</th>
+			</tr>
+			<tr>
+				<th class="numeric blockpack-col">Time</th>
+				<th class="numeric blockpack-col">Output Size</th>
+				<th class="numeric blockpack-col">Memory</th>
+				<th class="numeric blockpack-col">Allocs</th>
+				<th class="numeric blockpack-col">Spans Written</th>
+				<th class="numeric blockpack-col">ns/span</th>
+				<th class="numeric parquet-col">Time</th>
+				<th class="numeric parquet-col">Output Size</th>
+				<th class="numeric parquet-col">Memory</th>
+				<th class="numeric parquet-col">Allocs</th>
+				<th class="numeric parquet-col">Spans Written</th>
+				<th class="numeric parquet-col">ns/span</th>
+			</tr>
+		</thead>
+		<tbody>
+		<tr>
+			<td class="query-name">small</td>
+			<td class="metric numeric">280.44ms</td>
+			<td class="metric numeric">4.29 MB</td>
+			<td class="metric numeric">191.84 MB</td>
+			<td class="metric numeric">1,201,175</td>
+			<td class="metric numeric">62,500</td>
+			<td class="metric numeric">0.0</td>
+			<td class="metric numeric winner-parquet">142.55ms <span style="color: #999; font-size: 0.85em;">(2.0x)</span></td>
+			<td class="metric numeric winner-parquet">3.93 MB <span style="color: #999; font-size: 0.85em;">(1.1x)</span></td>
+			<td class="metric numeric winner-parquet">73.98 MB <span style="color: #999; font-size: 0.85em;">(2.6x)</span></td>
+			<td class="metric numeric winner-parquet">235,262 <span style="color: #999; font-size: 0.85em;">(5.1x)</span></td>
+			<td class="metric numeric">62,500</td>
+			<td class="metric numeric winner-parquet">0.0</td>
+		</tr>
+		</tbody>
+	</table>
+	</div>
+
+	<button type="button" class="section-header collapsible" id="query-definitions" onclick="toggleSection(this)" aria-expanded="true" aria-controls="query-definitions-content">
+		<span class="chevron">▼</span> 📝 Query Definitions
+	</button>
+
+	<div class="collapsible-content" id="query-definitions-content" aria-hidden="false">
+	<div class="query-definitions">
+		<h2 style="color: #333; margin-bottom: 20px;">OTEL Generator Demo Data Queries</h2>
+		<div class="query-def" id="query-rw-fast-operations">
+			<h3>Fast Operations</h3>
+			<strong>TraceQL:</strong>
+			<pre>{ duration &lt; 30ms }</pre>
+		</div>
+		<div class="query-def" id="query-rw-get-requests">
+			<h3>Get Requests</h3>
+			<strong>TraceQL:</strong>
+			<pre>{ span.http.method = &#34;GET&#34; }</pre>
+		</div>
+		<div class="query-def" id="query-rw-http-errors">
+			<h3>Http Errors</h3>
+			<strong>TraceQL:</strong>
+			<pre>{ span.http.status_code &gt;= 400 }</pre>
+		</div>
+		<div class="query-def" id="query-rw-payment-operations">
+			<h3>Payment Operations</h3>
+			<strong>TraceQL:</strong>
+			<pre>{ name =~ &#34;.*[Pp]ayment.*&#34; }</pre>
+		</div>
+		<div class="query-def" id="query-rw-post-requests">
+			<h3>Post Requests</h3>
+			<strong>TraceQL:</strong>
+			<pre>{ span.http.method = &#34;POST&#34; }</pre>
+		</div>
+
+		<h2 style="color: #333; margin-top: 40px; margin-bottom: 20px;">Format Comparison Queries</h2>
+		<div class="query-def" id="query-cmp-duration_gt_100ms">
+			<h3>Duration Gt 100Ms</h3>
+			<div class="description">Filter operations longer than 100ms</div>
+			<strong>TraceQL:</strong>
+			<pre>{ duration &gt; 100ms }</pre>
+		</div>
+		<div class="query-def" id="query-cmp-experiment_traces">
+			<h3>Experiment Traces</h3>
+			<div class="description">Experimental feature traces</div>
+			<strong>TraceQL:</strong>
+			<pre>{ span.experiment.id = &#34;exp-2024-q1&#34; }</pre>
+		</div>
+		<div class="query-def" id="query-cmp-filter_auth_namespace">
+			<h3>Filter Auth Namespace</h3>
+			<div class="description">Filter by auth namespace</div>
+			<strong>TraceQL:</strong>
+			<pre>{ resource.service.namespace = &#34;auth&#34; }</pre>
+		</div>
+		<div class="query-def" id="query-cmp-filter_authenticate_operation">
+			<h3>Filter Authenticate Operation</h3>
+			<div class="description">Filter authenticate operations</div>
+			<strong>TraceQL:</strong>
+			<pre>{ name = &#34;authenticate&#34; }</pre>
+		</div>
+		<div class="query-def" id="query-cmp-filter_billing_service">
+			<h3>Filter Billing Service</h3>
+			<div class="description">Filter by billing service</div>
+			<strong>TraceQL:</strong>
+			<pre>{ resource.service.name = &#34;billing-service&#34; }</pre>
+		</div>
+		<div class="query-def" id="query-cmp-filter_by_db_operations">
+			<h3>Filter By Db Operations</h3>
+			<div class="description">Filter PostgreSQL database operations</div>
+			<strong>TraceQL:</strong>
+			<pre>{ span.db.system = &#34;postgresql&#34; }</pre>
+		</div>
+		<div class="query-def" id="query-cmp-filter_by_http_method_post">
+			<h3>Filter By Http Method Post</h3>
+			<div class="description">Filter by HTTP POST method</div>
+			<strong>TraceQL:</strong>
+			<pre>{ span.http.method = &#34;POST&#34; }</pre>
+		</div>
+		<div class="query-def" id="query-cmp-filter_by_http_status_200">
+			<h3>Filter By Http Status 200</h3>
+			<div class="description">Filter by HTTP 200 status</div>
+			<strong>TraceQL:</strong>
+			<pre>{ span.http.status_code = 200 }</pre>
+		</div>
+		<div class="query-def" id="query-cmp-filter_by_http_status_201">
+			<h3>Filter By Http Status 201</h3>
+			<div class="description">Filter created resources - HTTP 201</div>
+			<strong>TraceQL:</strong>
+			<pre>{ span.http.status_code = 201 }</pre>
+		</div>
+		<div class="query-def" id="query-cmp-filter_by_http_status_403">
+			<h3>Filter By Http Status 403</h3>
+			<div class="description">Filter auth failures - HTTP 403</div>
+			<strong>TraceQL:</strong>
+			<pre>{ span.http.status_code = 403 }</pre>
+		</div>
+		<div class="query-def" id="query-cmp-filter_by_service_auth">
+			<h3>Filter By Service Auth</h3>
+			<div class="description">Filter by auth-service</div>
+			<strong>TraceQL:</strong>
+			<pre>{ resource.service.name = &#34;auth-service&#34; }</pre>
+		</div>
+		<div class="query-def" id="query-cmp-filter_by_service_shop">
+			<h3>Filter By Service Shop</h3>
+			<div class="description">Filter by shop-backend service</div>
+			<strong>TraceQL:</strong>
+			<pre>{ resource.service.name = &#34;shop-backend&#34; }</pre>
+		</div>
+		<div class="query-def" id="query-cmp-filter_payment_operation">
+			<h3>Filter Payment Operation</h3>
+			<div class="description">Filter payment operations</div>
+			<strong>TraceQL:</strong>
+			<pre>{ name = &#34;process_payment&#34; }</pre>
+		</div>
+		<div class="query-def" id="query-cmp-filter_shop_namespace">
+			<h3>Filter Shop Namespace</h3>
+			<div class="description">Filter by shop namespace</div>
+			<strong>TraceQL:</strong>
+			<pre>{ resource.service.namespace = &#34;shop&#34; }</pre>
+		</div>
+		<div class="query-def" id="query-cmp-full_scan">
+			<h3>Full Scan</h3>
+			<div class="description">Full table scan - all spans</div>
+			<strong>TraceQL:</strong>
+			<pre>{}</pre>
+		</div>
+		<div class="query-def" id="query-cmp-gold_customers">
+			<h3>Gold Customers</h3>
+			<div class="description">Gold tier customers</div>
+			<strong>TraceQL:</strong>
+			<pre>{ span.customer.tier = &#34;gold&#34; }</pre>
+		</div>
+		<div class="query-def" id="query-cmp-gold_us_west">
+			<h3>Gold Us West</h3>
+			<div class="description">Gold customers in us-west</div>
+			<strong>TraceQL:</strong>
+			<pre>{ span.customer.tier = &#34;gold&#34; &amp;&amp; span.deployment.region = &#34;us-west&#34; }</pre>
+		</div>
+		<div class="query-def" id="query-cmp-mixed_db_namespace_and_db">
+			<h3>Mixed Db Namespace And Db</h3>
+			<div class="description">Mixed filter: db namespace + PostgreSQL</div>
+			<strong>TraceQL:</strong>
+			<pre>{ resource.namespace = &#34;db&#34; &amp;&amp; span.db.system = &#34;postgresql&#34; }</pre>
+		</div>
+		<div class="query-def" id="query-cmp-platinum_customers">
+			<h3>Platinum Customers</h3>
+			<div class="description">Platinum tier customers only</div>
+			<strong>TraceQL:</strong>
+			<pre>{ span.customer.tier = &#34;platinum&#34; }</pre>
+		</div>
+		<div class="query-def" id="query-cmp-platinum_us_west">
+			<h3>Platinum Us West</h3>
+			<div class="description">Platinum customers in us-west</div>
+			<strong>TraceQL:</strong>
+			<pre>{ span.customer.tier = &#34;platinum&#34; &amp;&amp; span.deployment.region = &#34;us-west&#34; }</pre>
+		</div>
+		<div class="query-def" id="query-cmp-regex_article_operations">
+			<h3>Regex Article Operations</h3>
+			<div class="description">Regex match for article operations</div>
+			<strong>TraceQL:</strong>
+			<pre>{ name =~ &#34;.*article.*&#34; }</pre>
+		</div>
+		<div class="query-def" id="query-cmp-us_west_region">
+			<h3>Us West Region</h3>
+			<div class="description">US West region deployments</div>
+			<strong>TraceQL:</strong>
+			<pre>{ span.deployment.region = &#34;us-west&#34; }</pre>
+		</div>
+	</div>
+
+	<div class="legend">
+		<p><span style="color: #27ae60; font-weight: 600;">Green highlight</span> = Aggregation wins · <span style="color: #f39c12; font-weight: 600;">Orange highlight</span> = Manual wins · <span style="color: #3498db; font-weight: 600;">Blue highlight</span> = Parquet wins</p>
+		<p style="margin-top: 10px; font-size: 13px;">
+			Hardware: 13th Gen Intel Core i7-13700K (24 threads) • OS: Linux
+		</p>
+	</div>
+	</div>
+</body>
+</html>

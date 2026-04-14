@@ -591,10 +591,13 @@ func streamHistogramGroupBy(
 	}
 
 	// Absent-row pass: pks not seen in the column → boundary-0.
-	for pk, bucketIdx := range keyToBucket {
-		if _, ok := seen[pk]; !ok {
-			key := strconv.FormatInt(bucketIdx, 10) + "\x00" + groupKeyMap[pk] + "\x000"
-			intrinsicGetOrCreateBucket(buckets, key).count++
+	// Skip entirely if every pk was found (common for universal columns like span:duration).
+	if len(seen) < len(keyToBucket) {
+		for pk, bucketIdx := range keyToBucket {
+			if _, ok := seen[pk]; !ok {
+				key := strconv.FormatInt(bucketIdx, 10) + "\x00" + groupKeyMap[pk] + "\x000"
+				intrinsicGetOrCreateBucket(buckets, key).count++
+			}
 		}
 	}
 	return nil

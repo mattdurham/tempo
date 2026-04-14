@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Intrinsic Columns — Blockpack Interactive</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;background:#0F172A;color:#E2E8F0;overflow:hidden;height:100vh}
+
+/* Top bar */
+.bar{height:48px;background:#1E293B;border-bottom:1px solid #334155;display:flex;align-items:center;padding:0 24px;gap:16px}
+.bar a{color:#94A3B8;text-decoration:none;font-size:13px;transition:color .15s}
+.bar a:hover{color:#E2E8F0}
+.bar .title{color:#F8FAFC;font-weight:700;font-size:15px;flex:1}
+.bar .query-text{font-family:'Menlo','Consolas',monospace;font-size:12px;color:#93C5FD;background:#0F172A;padding:4px 12px;border-radius:6px;border:1px solid #334155;max-width:600px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bar kbd{font-size:11px;color:#64748B;background:#0F172A;padding:2px 6px;border-radius:4px;border:1px solid #334155;font-family:inherit}
+
+/* Main layout */
+.main{display:flex;height:calc(100vh - 48px)}
+
+/* Stages panel */
+.stages{width:280px;background:#1E293B;border-right:1px solid #334155;display:flex;flex-direction:column}
+.stages-title{font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#64748B;padding:16px 20px 8px}
+.stages-list{flex:1;overflow-y:auto;padding:0 0 12px}
+
+.stage{display:flex;align-items:flex-start;gap:12px;padding:10px 20px;cursor:pointer;transition:background .2s;position:relative}
+.stage:hover{background:#253347}
+.stage.active{background:#1E3A5F}
+.stage.active::before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;background:#3B82F6;border-radius:0 2px 2px 0}
+
+.stage-dot{width:28px;height:28px;border-radius:50%;background:#334155;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:#94A3B8;flex-shrink:0;transition:all .3s}
+.stage.active .stage-dot{background:#3B82F6;color:#fff;box-shadow:0 0 12px rgba(59,130,246,.4)}
+.stage.done .stage-dot{background:#10B981;color:#fff}
+
+.stage-text{flex:1;min-width:0}
+.stage-name{font-size:13px;font-weight:600;color:#CBD5E1;line-height:1.3}
+.stage.active .stage-name{color:#F8FAFC}
+.stage-meta{font-size:11px;color:#64748B;margin-top:2px}
+.stage.active .stage-meta{color:#60A5FA}
+
+/* Canvas — 50/50 split: viz top, explanation bottom */
+.canvas{flex:1;display:flex;flex-direction:column;min-width:0}
+.canvas-top{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:0;padding:12px 20px;overflow-y:auto}
+.canvas-bottom{flex:1;display:flex;flex-direction:column;min-height:0;border-top:1px solid #334155}
+
+.counter-bar{text-align:center;padding:0 0 8px;flex-shrink:0}
+.counter-num{font-size:42px;font-weight:800;color:#3B82F6;line-height:1;transition:color .3s}
+.counter-num.green{color:#10B981}
+.counter-label{font-size:13px;color:#94A3B8;margin-top:2px}
+.counter-sub{font-size:11px;color:#475569;margin-top:1px}
+
+.grid-area{display:flex;align-items:center;justify-content:center}
+
+/* Table rows */
+.viz-container{width:100%;max-width:720px}
+
+.column-pills{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin-bottom:16px}
+.pill{font-family:'Menlo','Consolas',monospace;font-size:10px;padding:3px 8px;border-radius:5px;border:1px solid #334155;background:#0F172A;color:#94A3B8;transition:all .3s}
+.pill.active{border-color:#3B82F6;background:#1E3A5F;color:#93C5FD;box-shadow:0 0 8px rgba(59,130,246,.3)}
+.pill.conditional{border-color:#D97706;background:#422006;color:#FBBF24}
+
+.table-row{display:flex;align-items:center;padding:5px 12px;font-family:'Menlo','Consolas',monospace;font-size:11px;border-left:3px solid transparent;transition:all .4s cubic-bezier(.4,0,.2,1)}
+.table-row:nth-child(odd){background:#1E293B}
+.table-row:nth-child(even){background:#162032}
+.table-row.highlight{border-left-color:#10B981;background:#0F2A1F !important;box-shadow:inset 0 0 12px rgba(16,185,129,.15)}
+.table-row.dim{opacity:.25}
+.table-row .val{flex:1;color:#E2E8F0;min-width:140px}
+.table-row .arrow{color:#475569;margin:0 12px;flex-shrink:0}
+.table-row .ref{color:#93C5FD;text-align:right;min-width:140px}
+.table-row.highlight .val{color:#6EE7B7}
+.table-row.highlight .arrow{color:#10B981}
+.table-row.highlight .ref{color:#6EE7B7}
+
+.boundary-line{height:2px;background:linear-gradient(90deg,transparent,#F59E0B,transparent);margin:4px 0;position:relative}
+.boundary-line::after{content:'> 5ms boundary';position:absolute;right:16px;top:-10px;font-size:10px;color:#F59E0B;font-family:'Menlo','Consolas',monospace}
+
+.search-bracket{position:absolute;right:-28px;top:0;bottom:0;width:20px;border:2px solid #10B981;border-left:none;border-radius:0 8px 8px 0;opacity:.6}
+
+/* Distinct values list */
+.distinct-values{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin-top:12px}
+.distinct-val{font-family:'Menlo','Consolas',monospace;font-size:12px;padding:6px 14px;border-radius:6px;background:#1E293B;border:1px solid #334155;color:#93C5FD}
+
+/* TOC schematic */
+.toc-schematic{display:flex;flex-direction:column;gap:6px;align-items:center;width:100%;max-width:480px;margin:0 auto}
+.toc-block{width:100%;border-radius:8px;display:flex;align-items:center;justify-content:center;font-family:'Menlo','Consolas',monospace;font-size:12px;font-weight:600;transition:all .3s}
+.toc-block.footer{height:28px;background:#7F1D1D;border:1px solid #EF4444;color:#FCA5A5}
+.toc-block.offset{height:18px;background:transparent;color:#64748B;font-size:10px}
+.toc-block.toc{height:36px;background:#3B0764;border:1px solid #A855F7;color:#D8B4FE}
+.toc-block.col-blob{height:32px;border:1px solid #334155;color:#E2E8F0}
+.toc-block.col-blob.blue{background:#1E3A5F;border-color:#3B82F6}
+.toc-block.col-blob.green{background:#14532D;border-color:#10B981}
+.toc-block.col-blob.amber{background:#422006;border-color:#D97706}
+.toc-arrow{color:#475569;font-size:14px}
+
+/* Detail panel — fills bottom half */
+.detail{flex:1;background:#1E293B;padding:20px 32px;overflow-y:auto}
+.detail h3{font-size:15px;font-weight:700;color:#F8FAFC;margin-bottom:8px}
+.detail p{font-size:13px;color:#94A3B8;line-height:1.65;max-width:800px}
+.detail code{font-family:'Menlo','Consolas',monospace;font-size:12px;color:#93C5FD;background:#0F172A;padding:1px 5px;border-radius:3px}
+.detail a{color:#60A5FA;text-decoration:none}
+.detail a:hover{text-decoration:underline}
+.detail .stat{display:inline-block;background:#0F172A;border:1px solid #334155;border-radius:6px;padding:3px 10px;font-size:12px;font-weight:600;color:#F59E0B;margin-right:8px;margin-top:6px}
+
+/* Controls — pinned at bottom of canvas-bottom */
+.controls{display:flex;justify-content:center;gap:10px;padding:12px;background:#0F172A;border-top:1px solid #1E293B;flex-shrink:0}
+.btn{padding:8px 20px;border:1px solid #334155;border-radius:8px;background:#1E293B;color:#CBD5E1;font-size:13px;font-weight:500;cursor:pointer;transition:all .15s;font-family:inherit}
+.btn:hover{background:#253347;border-color:#475569;color:#F8FAFC}
+.btn:disabled{opacity:.3;cursor:not-allowed}
+.btn.primary{background:#3B82F6;border-color:#3B82F6;color:#fff}
+.btn.primary:hover{background:#2563EB}
+
+/* Responsive */
+@media(max-width:900px){
+  .stages{width:220px}
+  .bar .query-text{display:none}
+}
+@media(max-width:640px){
+  .stages{display:none}
+}
+</style>
+</head>
+<body>
+
+<div class="bar">
+  <a href="/intrinsic-columns">&larr; Back to docs</a>
+  <div class="title">Intrinsic Columns</div>
+  <div class="query-text">Sorted file-level columnar data with BlockRef pointers</div>
+  <kbd>&larr; &rarr;</kbd>
+</div>
+
+<div class="main">
+  <div class="stages">
+    <div class="stages-title">Pipeline Stages</div>
+    <div class="stages-list" id="stageList"></div>
+  </div>
+  <div class="canvas">
+    <div class="canvas-top">
+      <div class="counter-bar">
+        <div class="counter-num" id="counterNum">18</div>
+        <div class="counter-label" id="counterLabel">sorted entries</div>
+        <div class="counter-sub" id="counterSub"></div>
+      </div>
+      <div class="grid-area">
+        <div class="viz-container" id="viz"></div>
+      </div>
+    </div>
+    <div class="canvas-bottom">
+      <div class="detail" id="detail"></div>
+      <div class="controls">
+        <button class="btn" id="prevBtn" onclick="go(-1)">&larr; Prev</button>
+        <button class="btn" id="resetBtn" onclick="goTo(0)">Reset</button>
+        <button class="btn primary" id="playBtn" onclick="togglePlay()">&#9654; Play</button>
+        <button class="btn" id="nextBtn" onclick="go(1)">Next &rarr;</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const SERVICE_ROWS = [
+  { val: 'auth-service', block: 3, row: 45 },
+  { val: 'auth-service', block: 3, row: 102 },
+  { val: 'auth-service', block: 7, row: 12 },
+  { val: 'auth-service', block: 7, row: 88 },
+  { val: 'backend',      block: 1, row: 0 },
+  { val: 'backend',      block: 1, row: 33 },
+  { val: 'backend',      block: 4, row: 15 },
+  { val: 'checkout',     block: 5, row: 71 },
+  { val: 'checkout',     block: 5, row: 88 },
+  { val: 'checkout',     block: 8, row: 22 },
+  { val: 'frontend',     block: 0, row: 5 },
+  { val: 'frontend',     block: 0, row: 19 },
+  { val: 'frontend',     block: 2, row: 44 },
+  { val: 'frontend',     block: 2, row: 67 },
+  { val: 'frontend',     block: 6, row: 3 },
+  { val: 'payments',     block: 9, row: 11 },
+  { val: 'payments',     block: 9, row: 55 },
+  { val: 'web-server',   block: 4, row: 91 },
+];
+
+const DURATION_ROWS = [
+  { val: '0.5ms',  block: 2, row: 14, ms: 0.5 },
+  { val: '1.2ms',  block: 0, row: 31, ms: 1.2 },
+  { val: '2.8ms',  block: 5, row: 7,  ms: 2.8 },
+  { val: '3.1ms',  block: 1, row: 62, ms: 3.1 },
+  { val: '4.2ms',  block: 3, row: 90, ms: 4.2 },
+  { val: '5.1ms',  block: 7, row: 22, ms: 5.1 },
+  { val: '6.8ms',  block: 4, row: 3,  ms: 6.8 },
+  { val: '8.3ms',  block: 8, row: 55, ms: 8.3 },
+  { val: '12.1ms', block: 6, row: 41, ms: 12.1 },
+  { val: '15.7ms', block: 9, row: 18, ms: 15.7 },
+  { val: '22.4ms', block: 0, row: 77, ms: 22.4 },
+  { val: '35.9ms', block: 3, row: 8,  ms: 35.9 },
+];
+
+const CORE_PILLS = ['trace:id','span:name','resource.service.name','span:start','span:duration','span:kind'];
+const COND_PILLS = ['span:id','span:parent_id','span:status','span:status_message'];
+const DISTINCT_VALUES = ['auth-service','backend','checkout','frontend','payments','web-server'];
+
+const STAGES = [
+  {
+    name: "Intrinsic Section", meta: "18 entries",
+    title: "Intrinsic Section",
+    desc: `The intrinsic section stores core columns sorted by value with BlockRef pointers (blockID, rowIndex). Built at <code>Flush()</code> time from the <code>intrinsicAccumulator</code>. Enables O(log N) lookups without reading block payloads.`,
+    count: 18, label: "sorted entries", sub: ""
+  },
+  {
+    name: "Core Columns", meta: "6 columns",
+    title: "Core Columns",
+    desc: `6 core columns always present. Each sorted independently. Currently viewing <code>resource.service.name</code>.`,
+    count: 6, label: "core columns", sub: "always present"
+  },
+  {
+    name: "Conditional Columns", meta: "4 columns",
+    title: "Conditional Columns",
+    desc: `4 conditional columns &mdash; present only when the span has the value. <code>span:parent_id</code> absent for root spans, <code>span:status</code> absent when no Status object.`,
+    count: 4, label: "conditional columns", sub: "present when value exists"
+  },
+  {
+    name: "Binary Search", meta: "\"frontend\"",
+    title: 'Binary Search: "frontend"',
+    desc: `Binary search for "frontend". O(log N) on sorted values finds the range. 5 matching entries &rarr; 5 BlockRefs pointing to blocks 0, 2, 6. No block data read.`,
+    count: 5, label: "entries found", sub: "O(log N) search"
+  },
+  {
+    name: "Range Scan", meta: "duration > 5ms",
+    title: "Range Scan: duration > 5ms",
+    desc: `Binary search finds first value > 5ms. All subsequent entries match (data is sorted). Returns BlockRefs without reading blocks.`,
+    count: 6, label: "entries match", sub: "range scan"
+  },
+  {
+    name: "Tag Discovery", meta: "SearchTagValues",
+    title: "Tag Discovery",
+    desc: `<code>SearchTagValues('resource.service.name')</code> walks the sorted column and returns up to 10,000 distinct values. Powers Grafana autocomplete in the Explore view.`,
+    count: 6, label: "distinct values", sub: "SearchTagValues"
+  },
+  {
+    name: "TOC Structure", meta: "metadata layout",
+    title: "TOC Structure",
+    desc: `The Table of Contents blob points to each column blob. Footer V4 &rarr; intrinsic section offset &rarr; TOC &rarr; column blobs (sorted data + BlockRefs).`,
+    count: 0, label: "extra I/O", sub: "All in metadata", green: true
+  }
+];
+
+let cur = 0;
+let playing = false;
+let timer = null;
+
+function init() {
+  const list = document.getElementById('stageList');
+  STAGES.forEach((s, i) => {
+    const el = document.createElement('div');
+    el.className = 'stage';
+    el.innerHTML = `<div class="stage-dot">${i}</div><div class="stage-text"><div class="stage-name">${s.name}</div><div class="stage-meta">${s.meta}</div></div>`;
+    el.onclick = () => goTo(i);
+    list.appendChild(el);
+  });
+  render();
+}
+
+function renderViz(stage) {
+  const viz = document.getElementById('viz');
+  let html = '';
+
+  if (stage <= 3 || stage === 5) {
+    // Stages 0-3 and 5: service name table
+    // Column pills for stages 1, 2, 5
+    if (stage >= 1) {
+      html += '<div class="column-pills">';
+      CORE_PILLS.forEach(p => {
+        const active = (p === 'resource.service.name') ? ' active' : '';
+        html += `<div class="pill${active}">${p}</div>`;
+      });
+      if (stage >= 2) {
+        COND_PILLS.forEach(p => {
+          html += `<div class="pill conditional">${p}</div>`;
+        });
+      }
+      html += '</div>';
+    }
+
+    // Table rows
+    SERVICE_ROWS.forEach((r, i) => {
+      let cls = 'table-row';
+      if (stage === 3) {
+        if (r.val === 'frontend') cls += ' highlight';
+        else cls += ' dim';
+      }
+      html += `<div class="${cls}">`;
+      html += `<span class="val">${r.val}</span>`;
+      html += `<span class="arrow">&rarr;</span>`;
+      html += `<span class="ref">Block ${r.block} &nbsp; Row ${r.row}</span>`;
+      html += '</div>';
+    });
+
+    // Distinct values for stage 5
+    if (stage === 5) {
+      html += '<div class="distinct-values">';
+      DISTINCT_VALUES.forEach(v => {
+        html += `<div class="distinct-val">${v}</div>`;
+      });
+      html += '</div>';
+    }
+
+  } else if (stage === 4) {
+    // Duration table with boundary
+    html += '<div class="column-pills">';
+    CORE_PILLS.forEach(p => {
+      const active = (p === 'span:duration') ? ' active' : '';
+      html += `<div class="pill${active}">${p}</div>`;
+    });
+    html += '</div>';
+
+    const boundaryIdx = 5; // first row > 5ms
+    DURATION_ROWS.forEach((r, i) => {
+      if (i === boundaryIdx) {
+        html += '<div class="boundary-line"></div>';
+      }
+      let cls = 'table-row';
+      if (r.ms > 5) cls += ' highlight';
+      else cls += ' dim';
+      html += `<div class="${cls}">`;
+      html += `<span class="val">${r.val}</span>`;
+      html += `<span class="arrow">&rarr;</span>`;
+      html += `<span class="ref">Block ${r.block} &nbsp; Row ${r.row}</span>`;
+      html += '</div>';
+    });
+
+  } else if (stage === 6) {
+    // TOC schematic
+    html += '<div class="toc-schematic">';
+    html += '<div class="toc-block footer">Footer (V4)</div>';
+    html += '<div class="toc-arrow">&darr; offset</div>';
+    html += '<div class="toc-block toc">Table of Contents (TOC)</div>';
+    html += '<div class="toc-arrow">&darr; column offsets</div>';
+    html += '<div class="toc-block col-blob blue">trace:id &nbsp; (sorted + BlockRefs)</div>';
+    html += '<div class="toc-block col-blob green">span:name &nbsp; (sorted + BlockRefs)</div>';
+    html += '<div class="toc-block col-blob blue">resource.service.name &nbsp; (sorted + BlockRefs)</div>';
+    html += '<div class="toc-block col-blob green">span:start &nbsp; (sorted + BlockRefs)</div>';
+    html += '<div class="toc-block col-blob amber">span:duration &nbsp; (sorted + BlockRefs)</div>';
+    html += '<div class="toc-block col-blob blue">span:kind &nbsp; (sorted + BlockRefs)</div>';
+    html += '</div>';
+  }
+
+  viz.innerHTML = html;
+}
+
+function render() {
+  const s = STAGES[cur];
+
+  // Stages
+  document.querySelectorAll('.stage').forEach((el, i) => {
+    el.className = 'stage';
+    if (i < cur) el.classList.add('done');
+    if (i === cur) el.classList.add('active');
+  });
+
+  // Viz
+  renderViz(cur);
+
+  // Counter
+  const num = document.getElementById('counterNum');
+  num.textContent = s.count;
+  num.className = 'counter-num' + (s.green ? ' green' : '');
+  document.getElementById('counterLabel').textContent = s.label;
+  document.getElementById('counterSub').textContent = s.sub;
+
+  // Detail
+  document.getElementById('detail').innerHTML = `<h3>${s.title}</h3><p>${s.desc}</p>`;
+
+  // Buttons
+  document.getElementById('prevBtn').disabled = cur === 0;
+  document.getElementById('nextBtn').disabled = cur === STAGES.length - 1;
+
+  // Scroll stage into view
+  const active = document.querySelector('.stage.active');
+  if (active) active.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+}
+
+function goTo(i) { cur = Math.max(0, Math.min(i, STAGES.length - 1)); render(); }
+function go(d) { goTo(cur + d); }
+
+function togglePlay() {
+  playing = !playing;
+  const btn = document.getElementById('playBtn');
+  if (playing) {
+    btn.innerHTML = '&#9646;&#9646; Pause';
+    tick();
+  } else {
+    btn.innerHTML = '&#9654; Play';
+    clearTimeout(timer);
+  }
+}
+
+function tick() {
+  if (!playing) return;
+  if (cur >= STAGES.length - 1) { togglePlay(); return; }
+  go(1);
+  timer = setTimeout(tick, 2400);
+}
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'ArrowRight' || e.key === ' ') { e.preventDefault(); go(1); }
+  if (e.key === 'ArrowLeft') { e.preventDefault(); go(-1); }
+  if (e.key === 'r') goTo(0);
+});
+
+init();
+</script>
+</body>
+</html>

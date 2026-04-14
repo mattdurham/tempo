@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Metrics Query — Blockpack</title>
+  <link rel="stylesheet" href="/assets/css/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <a href="/" class="topbar-brand">Blockpack Docs</a>
+    <a href="https://github.com/grafana/blockpack" class="topbar-github">GitHub &rarr;</a>
+  </header>
+  <div class="layout">
+    <nav class="sidebar">
+  <div class="sidebar-brand">BLOCKPACK</div>
+  <div class="section-label">Overview</div>
+  <a href="/">Home</a>
+  <a href="/file-format">File Format</a>
+  <div class="section-label">Query Paths</div>
+  <a href="/query-filter">Filter Query</a>
+  <a href="/query-intrinsic">Intrinsic Fast-Path</a>
+  <a href="/query-traceid">Trace by ID</a>
+  <a href="/query-metrics" class="active">Metrics Query</a>
+  <div class="section-label">Write Path</div>
+  <a href="/write-path">Write Pipeline</a>
+  <div class="section-label">Indexes</div>
+  <a href="/kll">KLL Sketches</a>
+  <a href="/cms">Count-Min Sketch</a>
+  <a href="/topk">TopK</a>
+  <a href="/hll">HyperLogLog</a>
+  <a href="/bloom-filter">Bloom Filters</a>
+  <a href="/intrinsic-columns">Intrinsic Columns</a>
+  <div class="section-label">Blocks</div>
+  <a href="/block-scoring">Block Scoring</a>
+  <a href="/block-format">Block Format</a>
+  <div class="section-label">Performance</div>
+  <a href="/benchmarks/">Benchmarks</a>
+  <a href="/production-results">Production Results</a>
+</nav>
+    <main class="content">
+
+<h1>Metrics Query Path</h1>
+<p>The block-pruning and aggregation pipeline for a TraceQL metrics query. The same pruning stages as a filter query narrow the candidate blocks, then matching spans are fed into a metrics aggregation engine.</p>
+
+<a href="/interactive/query-metrics" class="demo-link">
+  <div class="demo-link-text">
+    <div class="demo-link-title">Open Interactive Demo</div>
+    <div class="demo-link-sub">Step through the metrics aggregation pipeline with block pruning</div>
+  </div>
+  <div class="demo-link-arrow">&rarr;</div>
+</a>
+
+<h2>How It Works</h2>
+<p>A metrics query follows the same pruning pipeline as a <a href="/query-filter">filter query</a>, but instead of returning individual spans, the matching spans are fed into an aggregation engine that produces time series. The pruning stages eliminate blocks that cannot contain matching data, then each surviving block is read and its matching spans contribute to the aggregation result.</p>
+
+<h3>Metrics Pipeline</h3>
+<p>TraceQL supports several metrics aggregation functions that operate on the filtered span set:</p>
+<ul>
+  <li><code>rate()</code> &mdash; spans per second over the query window</li>
+  <li><code>count_over_time()</code> &mdash; total count of matching spans per interval</li>
+  <li><code>histogram()</code> &mdash; distribution of an attribute across matching spans</li>
+  <li><code>quantile_over_time()</code> &mdash; percentile values (p50, p95, p99) over time</li>
+</ul>
+<p>Each function receives every span that passes the filter predicate and produces one or more time series as output.</p>
+
+<h3>Grouping</h3>
+<p>The <code>by()</code> clause controls how results are split into separate time series. For example, <code>by(resource.service.name)</code> produces one series per service. The grouping key columns must be loaded from each matching span &mdash; they are added to <code>wantColumns</code> during predicate building so that <code>parseBlockColumnsReuse</code> decodes them alongside the filter columns.</p>
+
+<h3>vs Filter Query</h3>
+<p>Metrics queries typically scan <strong>wider time ranges</strong> than filter queries (e.g., &ldquo;last 1 hour&rdquo; vs &ldquo;last 5 minutes&rdquo;). This means fewer blocks are pruned by the time-range stage, and more blocks survive to the I/O stage. The tradeoff is intentional: accurate aggregation requires comprehensive coverage of the query window.</p>
+
+<h3>Optimization</h3>
+<p>When <code>by()</code> clauses reference intrinsic columns (such as <code>resource.service.name</code> or <code>duration</code>), those values can be resolved from the <a href="/intrinsic-columns">intrinsic section</a> of the block without decoding the full column data. This avoids extra column decoding overhead for the most common grouping keys.</p>
+
+<h2>Pruning in Practice</h2>
+<table>
+<thead><tr><th>Stage</th><th>Blocks remaining</th><th>Reduction</th></tr></thead>
+<tbody>
+<tr><td>Start</td><td>100</td><td>&mdash;</td></tr>
+<tr><td>Time range</td><td>50</td><td>50% outside window</td></tr>
+<tr><td>KLL range index</td><td>20</td><td>60% have max status_code &lt; 500</td></tr>
+<tr><td>Block bloom</td><td>15</td><td>25% lack status_code &ge; 500</td></tr>
+<tr><td><strong>Block I/O + Aggregation</strong></td><td><strong>15</strong></td><td>85% eliminated before any read</td></tr>
+</tbody>
+</table>
+
+<h2>Key Invariant</h2>
+<blockquote><strong>One I/O per block &mdash; always read the entire block. Column filtering and metrics aggregation are always in-memory.</strong></blockquote>
+
+    </main>
+  </div>
+</body>
+</html>

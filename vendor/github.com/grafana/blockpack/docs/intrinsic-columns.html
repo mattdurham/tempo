@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Intrinsic Columns — Blockpack</title>
+  <link rel="stylesheet" href="/assets/css/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <a href="/" class="topbar-brand">Blockpack Docs</a>
+    <a href="https://github.com/grafana/blockpack" class="topbar-github">GitHub &rarr;</a>
+  </header>
+  <div class="layout">
+    <nav class="sidebar">
+  <div class="sidebar-brand">BLOCKPACK</div>
+  <div class="section-label">Overview</div>
+  <a href="/">Home</a>
+  <a href="/file-format">File Format</a>
+  <div class="section-label">Query Paths</div>
+  <a href="/query-filter">Filter Query</a>
+  <a href="/query-intrinsic">Intrinsic Fast-Path</a>
+  <a href="/query-traceid">Trace by ID</a>
+  <a href="/query-metrics">Metrics Query</a>
+  <div class="section-label">Write Path</div>
+  <a href="/write-path">Write Pipeline</a>
+  <div class="section-label">Indexes</div>
+  <a href="/kll">KLL Sketches</a>
+  <a href="/cms">Count-Min Sketch</a>
+  <a href="/topk">TopK</a>
+  <a href="/hll">HyperLogLog</a>
+  <a href="/bloom-filter">Bloom Filters</a>
+  <a href="/intrinsic-columns" class="active">Intrinsic Columns</a>
+  <div class="section-label">Blocks</div>
+  <a href="/block-scoring">Block Scoring</a>
+  <a href="/block-format">Block Format</a>
+  <div class="section-label">Performance</div>
+  <a href="/benchmarks/">Benchmarks</a>
+  <a href="/production-results">Production Results</a>
+</nav>
+    <main class="content">
+<h1>Intrinsic Columns</h1>
+
+<a href="/interactive/intrinsic-columns" class="demo-link">
+  <div class="demo-link-text">
+    <div class="demo-link-title">Open Interactive Demo</div>
+    <div class="demo-link-sub">Explore sorted intrinsic data with binary search and BlockRef pointers</div>
+  </div>
+  <div class="demo-link-arrow">&rarr;</div>
+</a>
+
+<p>Intrinsic columns are a small set of core span attributes stored at the <strong>file level</strong> — once, sorted, deduplicated across all spans in the file — rather than per block. Because they are read in a single I/O operation, intrinsic columns enable tag discovery, service-name bloom filters, and field iteration without touching any block data.</p>
+<h2>Source</h2>
+<table>
+<thead>
+<tr><th>File</th><th>Purpose</th></tr>
+</thead>
+<tbody>
+<tr><td><a href="https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/writer/intrinsic_accum.go"><code>internal/modules/blockio/writer/intrinsic_accum.go</code></a></td><td>Accumulation at write time</td></tr>
+<tr><td><a href="https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/reader/reader.go"><code>internal/modules/blockio/reader/reader.go</code></a></td><td>Reading intrinsics at query time</td></tr>
+<tr><td><a href="https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/shared/SPECS.md"><code>internal/modules/blockio/shared/SPECS.md</code></a></td><td>Specs for intrinsic column contract</td></tr>
+</tbody>
+</table>
+<hr>
+<h2>What Are Intrinsic Columns</h2>
+<p>Most span attributes in blockpack are stored per-block: each block is self-contained with its own column encodings. Intrinsic columns break this pattern. They are accumulated during block construction via the <code>intrinsicAccumulator</code>, then written as a contiguous section (with a TOC blob) in the file footer. A single read loads all intrinsic data for the entire file.</p>
+<p>The 8 intrinsic columns are:</p>
+<table>
+<thead>
+<tr><th>Column</th><th>Type</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>trace:id</code></td><td>bytes (flat)</td><td>128-bit trace identifier for each span</td></tr>
+<tr><td><code>span:id</code></td><td>bytes (flat)</td><td>64-bit span identifier</td></tr>
+<tr><td><code>span:parent_id</code></td><td>bytes (flat)</td><td>64-bit parent span identifier</td></tr>
+<tr><td><code>span:name</code></td><td>string (dict)</td><td>Operation name</td></tr>
+<tr><td><code>span:kind</code></td><td>int64 (dict)</td><td>Span kind enum (CLIENT, SERVER, PRODUCER, etc.)</td></tr>
+<tr><td><code>span:start</code></td><td>uint64 (flat)</td><td>Start timestamp, nanoseconds since epoch</td></tr>
+<tr><td><code>span:duration</code></td><td>uint64 (flat)</td><td>Duration in nanoseconds</td></tr>
+<tr><td><code>resource.service.name</code></td><td>string (dict)</td><td>Service name from resource attributes</td></tr>
+</tbody>
+</table>
+<p>Additional conditional intrinsic columns include <code>span:status</code>, <code>span:status_message</code>, and <code>log:timestamp</code> (for log-signal files).</p>
+<p><strong>Note:</strong> <code>span:end</code> is deliberately excluded from the intrinsic section — it is synthesized on read from <code>span:start + span:duration</code>, saving ~6% of file size.</p>
+<hr>
+<h2>Why File-Level</h2>
+<p>These attributes are accessed on almost every query:</p>
+<ul>
+<li><code>span:start</code> / <code>span:duration</code> — nearly every TraceQL predicate and all time-range filters</li>
+<li><code>resource.service.name</code> — the most common filter in practice; also used to build the file-level bloom filter (FBLM)</li>
+<li><code>span:name</code>, <code>span:kind</code> — frequently queried intrinsic attributes</li>
+<li><code>trace:id</code>, <code>span:id</code> — required for trace reconstruction and span-by-ID fetch</li>
+</ul>
+<p>Storing these per-block would mean one I/O per block just to read basic metadata — at ~50 blocks per file and 50ms per object-storage request, that is 2.5 seconds of serial I/O before any span data is evaluated. By co-locating them in a single section, one I/O reads all intrinsics for the entire file.</p>
+<p>Additionally, intrinsic columns enable:</p>
+<ul>
+<li><strong>Tag discovery</strong> (<code>SearchTags</code>, <code>SearchTagValues</code>): scan <code>resource.service.name</code> or <code>span:name</code> distinct values without reading any block</li>
+<li><strong>File-level bloom filter (FBLM)</strong>: the <code>resource.service.name</code> intrinsic data provides the input keys for the file-level BinaryFuse8 filter</li>
+<li><strong>Time-range filtering</strong>: <code>span:start</code> values guide fast block selection before block data is read</li>
+</ul>
+<hr>
+<h2>Encoding</h2>
+<p>Intrinsic columns use two encoding strategies:</p>
+<p><strong>Flat columns</strong> (<code>trace:id</code>, <code>span:id</code>, <code>span:parent_id</code>, <code>span:start</code>, <code>span:duration</code>): values and <code>BlockRef</code> pointers are stored in parallel arrays, sorted by value at flush time. A <code>BlockRef</code> is a <code>(BlockIdx uint16, RowIdx uint16)</code> pair pointing back to the block and row where this value lives.</p>
+<p><strong>Dict columns</strong> (<code>span:name</code>, <code>span:kind</code>, <code>resource.service.name</code>): values are deduplicated into a dictionary. Each unique string (or int64) maps to a list of <code>BlockRef</code> pointers. Repeated values cost O(1) additional storage (only a new <code>BlockRef</code> is appended, not the value bytes again).</p>
+<p>For large files (>10 000 rows in any column, controlled by <code>MaxIntrinsicRows</code>), columns switch from a monolithic v1 format to a <strong>paged v2 format</strong> that splits data into independently-readable pages. If any column exceeds <code>MaxIntrinsicRows</code> total rows, the entire intrinsic section is written as an empty TOC to avoid unbounded growth.</p>
+<p>Both flat and dict formats are snappy-compressed at the blob level.</p>
+<hr>
+<h2>How Used at Query Time</h2>
+<p>The reader loads the intrinsic section once via <code>writeIntrinsicSection</code>-compatible decoding:</p>
+<ul>
+<li><strong><code>IterateFields</code></strong>: enumerates all distinct <code>resource.service.name</code>, <code>span:name</code>, etc. values for tag/value discovery, without reading block data.</li>
+<li><strong><code>GetField(name, value)</code></strong>: looks up a specific field value in the intrinsic dict, returning all <code>BlockRef</code> pointers that contain it — a direct index from value to blocks.</li>
+<li><strong>Service name bloom input</strong>: the FBLM writer reads all distinct <code>resource.service.name</code> values from the intrinsic section during file construction to build the file-level <code>BinaryFuse8</code>.</li>
+<li><strong>Time-range pre-filter</strong>: <code>span:start</code> flat column provides sorted timestamps for identifying which blocks overlap the query's time range before any block I/O.</li>
+</ul>
+<hr>
+<h2>Pros and Cons</h2>
+<table>
+<thead>
+<tr><th>Aspect</th><th>Detail</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Zero per-block I/O</strong></td><td>All core attributes accessible in one read regardless of file size</td></tr>
+<tr><td><strong>Fast tag discovery</strong></td><td><code>SearchTags</code>/<code>SearchTagValues</code> touch only the intrinsic section</td></tr>
+<tr><td><strong>Enables file-level bloom</strong></td><td><code>resource.service.name</code> intrinsics are the input for FBLM construction</td></tr>
+<tr><td><strong>Deduplication</strong></td><td>Dict columns: repeated service names or span names cost only a <code>BlockRef</code> (4 bytes), not the string again</td></tr>
+<tr><td><strong>Buffering required</strong></td><td>All intrinsic values must be accumulated in memory until <code>Flush()</code> — cannot be streamed per-block</td></tr>
+<tr><td><strong>Growth cap</strong></td><td>Files with >10 000 total rows in any intrinsic column write an empty TOC to avoid unbounded memory</td></tr>
+<tr><td><strong>8 fixed columns</strong></td><td>Adding a new intrinsic column requires a format version bump and changes to both writer and reader</td></tr>
+</tbody>
+</table>
+<hr>
+<h2>Size</h2>
+<p>Intrinsic column size is proportional to total rows (not distinct values for flat columns, distinct values for dict columns):</p>
+<ul>
+<li><strong>Flat columns</strong> (<code>trace:id</code>, <code>span:id</code>, <code>span:start</code>, <code>span:duration</code>): <code>rows x (value_size + 4 bytes BlockRef)</code>. For a 10 000-span file: <code>trace:id</code> ≈ 10 000 x (16 + 4) = 200 KB; <code>span:start</code> ≈ 10 000 x (8 + 4) = 120 KB.</li>
+<li><strong>Dict columns</strong> (<code>span:name</code>, <code>resource.service.name</code>): <code>distinct_values x string_size + rows x 4 bytes</code>. For 100 distinct service names and 10 000 rows: dict ≈ 100 x 20 bytes + 10 000 x 4 = 42 KB.</li>
+</ul>
+<p>All blobs are snappy-compressed. Typical intrinsic section for a 50-block, 100 000-span file: <strong>1–5 MB uncompressed, 200 KB–1 MB compressed</strong>.</p>
+<hr>
+<h2>Related Files</h2>
+<ul>
+<li>Writer accumulation: <a href="https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/writer/intrinsic_accum.go"><code>internal/modules/blockio/writer/intrinsic_accum.go</code></a></li>
+<li>Writer integration: <a href="https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/writer/writer.go"><code>internal/modules/blockio/writer/writer.go</code></a> (<code>writeIntrinsicSection</code>)</li>
+<li>Block builder feeds: <a href="https://github.com/grafana/blockpack/blob/main/internal/modules/blockio/writer/writer_block.go"><code>internal/modules/blockio/writer/writer_block.go</code></a> (<code>feedIntrinsicUint64</code>, <code>feedIntrinsicString</code>, etc.)</li>
+</ul>
+<hr>
+<p>Back to <a href="/write-path">Write-Path</a></p>
+
+    </main>
+  </div>
+</body>
+</html>

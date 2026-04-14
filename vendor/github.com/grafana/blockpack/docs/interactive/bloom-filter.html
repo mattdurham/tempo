@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bloom Filters (BinaryFuse8) — Blockpack Interactive</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;background:#0F172A;color:#E2E8F0;overflow:hidden;height:100vh}
+
+/* Top bar */
+.bar{height:48px;background:#1E293B;border-bottom:1px solid #334155;display:flex;align-items:center;padding:0 24px;gap:16px}
+.bar a{color:#94A3B8;text-decoration:none;font-size:13px;transition:color .15s}
+.bar a:hover{color:#E2E8F0}
+.bar .title{color:#F8FAFC;font-weight:700;font-size:15px;flex:1}
+.bar .query-text{font-family:'Menlo','Consolas',monospace;font-size:12px;color:#93C5FD;background:#0F172A;padding:4px 12px;border-radius:6px;border:1px solid #334155;max-width:600px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bar kbd{font-size:11px;color:#64748B;background:#0F172A;padding:2px 6px;border-radius:4px;border:1px solid #334155;font-family:inherit}
+
+/* Main layout */
+.main{display:flex;height:calc(100vh - 48px)}
+
+/* Stages panel */
+.stages{width:280px;background:#1E293B;border-right:1px solid #334155;display:flex;flex-direction:column}
+.stages-title{font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#64748B;padding:16px 20px 8px}
+.stages-list{flex:1;overflow-y:auto;padding:0 0 12px}
+
+.stage{display:flex;align-items:flex-start;gap:12px;padding:10px 20px;cursor:pointer;transition:background .2s;position:relative}
+.stage:hover{background:#253347}
+.stage.active{background:#1E3A5F}
+.stage.active::before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;background:#3B82F6;border-radius:0 2px 2px 0}
+
+.stage-dot{width:28px;height:28px;border-radius:50%;background:#334155;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:#94A3B8;flex-shrink:0;transition:all .3s}
+.stage.active .stage-dot{background:#3B82F6;color:#fff;box-shadow:0 0 12px rgba(59,130,246,.4)}
+.stage.done .stage-dot{background:#10B981;color:#fff}
+
+.stage-text{flex:1;min-width:0}
+.stage-name{font-size:13px;font-weight:600;color:#CBD5E1;line-height:1.3}
+.stage.active .stage-name{color:#F8FAFC}
+.stage-meta{font-size:11px;color:#64748B;margin-top:2px}
+.stage.active .stage-meta{color:#60A5FA}
+
+/* Canvas — 50/50 split: viz top, explanation bottom */
+.canvas{flex:1;display:flex;flex-direction:column;min-width:0}
+.canvas-top{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:0;padding:12px 20px}
+.canvas-bottom{flex:1;display:flex;flex-direction:column;min-height:0;border-top:1px solid #334155}
+
+.counter-bar{text-align:center;padding:0 0 8px;flex-shrink:0}
+.counter-num{font-size:42px;font-weight:800;color:#3B82F6;line-height:1;transition:color .3s}
+.counter-num.green{color:#10B981}
+.counter-num.red{color:#EF4444}
+.counter-num.amber{color:#F59E0B}
+.counter-label{font-size:13px;color:#94A3B8;margin-top:2px}
+.counter-sub{font-size:11px;color:#475569;margin-top:1px}
+
+.grid-area{display:flex;align-items:center;justify-content:center}
+
+/* Bloom filter visualization */
+.bloom-container{display:flex;flex-direction:column;align-items:center;gap:16px}
+
+/* Segment labels */
+.segment-labels{display:flex;gap:0;width:fit-content}
+.segment-label{font-size:10px;font-weight:700;color:#64748B;text-align:center;letter-spacing:.05em}
+
+/* Filter bars */
+.filter-row{display:flex;gap:1px}
+.filter-bar{width:5px;height:24px;border-radius:2px;background:#1E293B;border:1px solid #334155;transition:all .5s cubic-bezier(.4,0,.2,1)}
+.filter-bar.blue{background:#3B82F6;border-color:#3B82F6;box-shadow:0 0 4px rgba(59,130,246,.4)}
+.filter-bar.green{background:#10B981;border-color:#10B981;box-shadow:0 0 4px rgba(16,185,129,.4)}
+.filter-bar.red{background:#EF4444;border-color:#EF4444;box-shadow:0 0 4px rgba(239,68,68,.4)}
+.filter-bar.amber{background:#F59E0B;border-color:#F59E0B;box-shadow:0 0 4px rgba(245,158,11,.4)}
+
+/* Value labels */
+.values-area{display:flex;gap:10px;flex-wrap:wrap;justify-content:center;margin-top:8px}
+.value-tag{font-family:'Menlo','Consolas',monospace;font-size:11px;padding:3px 10px;border-radius:4px;background:#1E293B;border:1px solid #334155;color:#94A3B8;transition:all .3s}
+.value-tag.highlight{border-color:#3B82F6;color:#93C5FD;background:#1E3A5F}
+.value-tag.found{border-color:#10B981;color:#6EE7B7;background:#064E3B}
+.value-tag.reject{border-color:#EF4444;color:#FCA5A5;background:#450A0A}
+.value-tag.fp{border-color:#F59E0B;color:#FCD34D;background:#451A03}
+
+/* File schematic for stage 6 */
+.file-schematic{display:flex;gap:24px;align-items:center;justify-content:center}
+.file-box{width:100px;height:64px;border-radius:6px;border:2px solid #334155;background:#1E293B;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;transition:all .4s;position:relative}
+.file-box .file-name{font-size:11px;font-weight:600;color:#94A3B8}
+.file-box .file-status{font-size:20px;font-weight:800}
+.file-box.pass{border-color:#10B981;background:#064E3B}
+.file-box.pass .file-status{color:#10B981}
+.file-box.pass .file-name{color:#6EE7B7}
+.file-box.reject{border-color:#EF4444;background:#450A0A;opacity:.6}
+.file-box.reject .file-status{color:#EF4444}
+.file-box.reject .file-name{color:#FCA5A5}
+.file-box.reject::after{content:'';position:absolute;inset:0;background:repeating-linear-gradient(45deg,transparent,transparent 8px,rgba(239,68,68,.1) 8px,rgba(239,68,68,.1) 16px);border-radius:6px}
+
+/* Detail panel — fills bottom half */
+.detail{flex:1;background:#1E293B;padding:20px 32px;overflow-y:auto}
+.detail h3{font-size:15px;font-weight:700;color:#F8FAFC;margin-bottom:8px}
+.detail p{font-size:13px;color:#94A3B8;line-height:1.65;max-width:800px}
+.detail code{font-family:'Menlo','Consolas',monospace;font-size:12px;color:#93C5FD;background:#0F172A;padding:1px 5px;border-radius:3px}
+.detail a{color:#60A5FA;text-decoration:none}
+.detail a:hover{text-decoration:underline}
+.detail .stat{display:inline-block;background:#0F172A;border:1px solid #334155;border-radius:6px;padding:3px 10px;font-size:12px;font-weight:600;color:#F59E0B;margin-right:8px;margin-top:6px}
+
+/* Controls — pinned at bottom of canvas-bottom */
+.controls{display:flex;justify-content:center;gap:10px;padding:12px;background:#0F172A;border-top:1px solid #1E293B;flex-shrink:0}
+.btn{padding:8px 20px;border:1px solid #334155;border-radius:8px;background:#1E293B;color:#CBD5E1;font-size:13px;font-weight:500;cursor:pointer;transition:all .15s;font-family:inherit}
+.btn:hover{background:#253347;border-color:#475569;color:#F8FAFC}
+.btn:disabled{opacity:.3;cursor:not-allowed}
+.btn.primary{background:#3B82F6;border-color:#3B82F6;color:#fff}
+.btn.primary:hover{background:#2563EB}
+
+/* Responsive */
+@media(max-width:900px){
+  .stages{width:220px}
+  .bar .query-text{display:none}
+  .filter-bar{width:4px;height:20px}
+}
+@media(max-width:640px){
+  .stages{display:none}
+  .filter-bar{width:3px;height:16px}
+}
+</style>
+</head>
+<body>
+
+<div class="bar">
+  <a href="/bloom-filter">&larr; Back to docs</a>
+  <div class="title">Bloom Filters (BinaryFuse8)</div>
+  <div class="query-text">Block-level and file-level membership testing</div>
+  <kbd>&larr; &rarr;</kbd>
+</div>
+
+<div class="main">
+  <div class="stages">
+    <div class="stages-title">Pipeline Stages</div>
+    <div class="stages-list" id="stageList"></div>
+  </div>
+  <div class="canvas">
+    <div class="canvas-top">
+      <div class="counter-bar">
+        <div class="counter-num" id="counterNum">60</div>
+        <div class="counter-label" id="counterLabel">fingerprint slots</div>
+        <div class="counter-sub" id="counterSub"></div>
+      </div>
+      <div class="grid-area">
+        <div id="vizArea"></div>
+      </div>
+    </div>
+    <div class="canvas-bottom">
+      <div class="detail" id="detail"></div>
+      <div class="controls">
+        <button class="btn" id="prevBtn" onclick="go(-1)">&larr; Prev</button>
+        <button class="btn" id="resetBtn" onclick="goTo(0)">Reset</button>
+        <button class="btn primary" id="playBtn" onclick="togglePlay()">&#9654; Play</button>
+        <button class="btn" id="nextBtn" onclick="go(1)">Next &rarr;</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const TOTAL_BARS = 60;
+const SEG_SIZE = 20;
+
+// Hash positions for each value (one per segment A, B, C)
+const HASHES = {
+  frontend:  [3,  25, 48],
+  backend:   [7,  22, 42],
+  payments:  [11, 30, 55],
+  checkout:  [1,  33, 50],
+  auth:      [15, 28, 44]
+};
+
+// "grafana" hashes — position 41 is NOT in any value's set
+const GRAFANA_HASH = [7, 30, 41];
+// "monitoring" hashes — all 3 happen to be set by other values (false positive)
+const MONITORING_HASH = [11, 25, 42];
+
+// All positions set by the 5 values
+const ALL_SET = new Set();
+Object.values(HASHES).forEach(arr => arr.forEach(p => ALL_SET.add(p)));
+
+const VALUES = ['frontend', 'backend', 'payments', 'checkout', 'auth'];
+
+const STAGES = [
+  {
+    name: "Empty Filter", meta: "60 slots",
+    title: "Empty Filter",
+    desc: `BinaryFuse8 fingerprint array with 3 segments (A, B, C). Unlike classic Bloom, all keys must be known at construction time. ~1 byte per entry, ~0.39% false positive rate.`,
+    count: 60, label: "fingerprint slots", sub: "",
+    mode: 'filter', bars: [], barColors: {}, values: [], valueStyle: {}
+  },
+  {
+    name: "Hash Values", meta: "5 values",
+    title: "Hash Values",
+    desc: `Each value hashes to 3 positions (one per segment). Showing hash positions for <code>'frontend'</code>.`,
+    count: 5, label: "values to insert", sub: "3 positions per value",
+    mode: 'filter',
+    bars: HASHES.frontend,
+    barColors: Object.fromEntries(HASHES.frontend.map(p => [p, 'blue'])),
+    values: VALUES,
+    valueStyle: { frontend: 'highlight' }
+  },
+  {
+    name: "Build Filter", meta: "15 slots set",
+    title: "Build Filter",
+    desc: `All values' fingerprints XORed into the array. Construction uses peeling/solving algorithm so each key's fingerprint can be recovered from its 3 positions.`,
+    count: ALL_SET.size, label: "slots occupied", sub: "all 5 values inserted",
+    mode: 'filter',
+    bars: [...ALL_SET],
+    barColors: Object.fromEntries([...ALL_SET].map(p => [p, 'blue'])),
+    values: VALUES,
+    valueStyle: {}
+  },
+  {
+    name: "Lookup: \"frontend\"", meta: "true positive",
+    title: "Lookup: \"frontend\"",
+    desc: `Query: is <code>'frontend'</code> in the set? Hash to 3 positions [${HASHES.frontend.join(', ')}]. All 3 are set &rarr; <strong>YES</strong>. True positive.`,
+    count: '', label: '', sub: '', counterIcon: 'check',
+    mode: 'filter',
+    bars: [...ALL_SET],
+    barColors: (() => {
+      const m = Object.fromEntries([...ALL_SET].map(p => [p, 'blue']));
+      HASHES.frontend.forEach(p => m[p] = 'green');
+      return m;
+    })(),
+    values: VALUES,
+    valueStyle: { frontend: 'found' }
+  },
+  {
+    name: "Lookup: \"grafana\"", meta: "true negative",
+    title: "Lookup: \"grafana\"",
+    desc: `Query: is <code>'grafana'</code> in the set? Hash to 3 positions. Position 41 is NOT set &rarr; <strong>NO</strong>. True negative. Filter correctly rejects &mdash; block is pruned.`,
+    count: '', label: '', sub: '', counterIcon: 'cross',
+    mode: 'filter',
+    bars: [...ALL_SET],
+    barColors: (() => {
+      const m = Object.fromEntries([...ALL_SET].map(p => [p, 'blue']));
+      GRAFANA_HASH.forEach(p => {
+        m[p] = ALL_SET.has(p) ? 'green' : 'red';
+      });
+      // Position 41 is not set, mark it red
+      m[41] = 'red';
+      return m;
+    })(),
+    values: [...VALUES, 'grafana'],
+    valueStyle: { grafana: 'reject' }
+  },
+  {
+    name: "False Positive", meta: "~0.39% rate",
+    title: "False Positive",
+    desc: `Query: is <code>'monitoring'</code> in the set? All 3 positions happen to be set by other values &rarr; <strong>YES</strong>, but 'monitoring' was never added. False positive (~0.39% rate). The CMS zero-prune catches these.`,
+    count: '!', label: 'false positive', sub: '~0.39% probability', counterColor: 'amber',
+    mode: 'filter',
+    bars: [...ALL_SET],
+    barColors: (() => {
+      const m = Object.fromEntries([...ALL_SET].map(p => [p, 'blue']));
+      MONITORING_HASH.forEach(p => m[p] = 'amber');
+      return m;
+    })(),
+    values: [...VALUES, 'monitoring'],
+    valueStyle: { monitoring: 'fp' }
+  },
+  {
+    name: "File-Level FBLM", meta: "zero I/O",
+    title: "File-Level FBLM",
+    desc: `File-level BinaryFuse8 over <code>resource.service.name</code>. One check covers the ENTIRE file. If service absent &rarr; skip all blocks, zero I/O.`,
+    count: 0, label: "I/O for rejected files", sub: "", green: true,
+    mode: 'files'
+  }
+];
+
+let cur = 0;
+let playing = false;
+let timer = null;
+
+function init() {
+  const list = document.getElementById('stageList');
+  STAGES.forEach((s, i) => {
+    const el = document.createElement('div');
+    el.className = 'stage';
+    el.innerHTML = `<div class="stage-dot">${i}</div><div class="stage-text"><div class="stage-name">${s.name}</div><div class="stage-meta">${s.meta}</div></div>`;
+    el.onclick = () => goTo(i);
+    list.appendChild(el);
+  });
+  render();
+}
+
+function buildFilterHTML(s) {
+  const setPositions = new Set(s.bars);
+  let html = '<div class="bloom-container">';
+
+  // Segment labels
+  const segW = SEG_SIZE * 7; // approx width per segment
+  html += '<div class="segment-labels" style="display:flex;width:fit-content">';
+  html += `<div class="segment-label" style="width:${segW}px">Segment A</div>`;
+  html += `<div class="segment-label" style="width:${segW}px">Segment B</div>`;
+  html += `<div class="segment-label" style="width:${segW}px">Segment C</div>`;
+  html += '</div>';
+
+  // Filter bars
+  html += '<div class="filter-row">';
+  for (let i = 0; i < TOTAL_BARS; i++) {
+    const color = s.barColors[i] || '';
+    const cls = (setPositions.has(i) || color) ? color : '';
+    html += `<div class="filter-bar ${cls}"></div>`;
+    // Add segment separator
+    if (i === 19 || i === 39) {
+      html += '<div style="width:8px"></div>';
+    }
+  }
+  html += '</div>';
+
+  // Value tags
+  if (s.values && s.values.length > 0) {
+    html += '<div class="values-area">';
+    s.values.forEach(v => {
+      const style = (s.valueStyle && s.valueStyle[v]) || '';
+      html += `<div class="value-tag ${style}">${v}</div>`;
+    });
+    html += '</div>';
+  }
+
+  html += '</div>';
+  return html;
+}
+
+function buildFilesHTML() {
+  let html = '<div class="file-schematic">';
+  html += '<div class="file-box pass"><div class="file-name">block-0a2f.bp</div><div class="file-status">&#10003;</div><div style="font-size:10px;color:#6EE7B7">frontend found</div></div>';
+  html += '<div class="file-box reject"><div class="file-name">block-1b3e.bp</div><div class="file-status">&#10007;</div><div style="font-size:10px;color:#FCA5A5">no match</div></div>';
+  html += '<div class="file-box reject"><div class="file-name">block-2c4d.bp</div><div class="file-status">&#10007;</div><div style="font-size:10px;color:#FCA5A5">no match</div></div>';
+  html += '</div>';
+  return html;
+}
+
+function render() {
+  const s = STAGES[cur];
+
+  // Stages
+  document.querySelectorAll('.stage').forEach((el, i) => {
+    el.className = 'stage';
+    if (i < cur) el.classList.add('done');
+    if (i === cur) el.classList.add('active');
+  });
+
+  // Visualization
+  const viz = document.getElementById('vizArea');
+  if (s.mode === 'filter') {
+    viz.innerHTML = buildFilterHTML(s);
+  } else {
+    viz.innerHTML = buildFilesHTML();
+  }
+
+  // Counter
+  const num = document.getElementById('counterNum');
+  if (s.counterIcon === 'check') {
+    num.innerHTML = '&#10003;';
+    num.className = 'counter-num green';
+  } else if (s.counterIcon === 'cross') {
+    num.innerHTML = '&#10007;';
+    num.className = 'counter-num red';
+  } else if (s.counterColor === 'amber') {
+    num.textContent = s.count;
+    num.className = 'counter-num amber';
+  } else {
+    num.textContent = s.count;
+    num.className = 'counter-num' + (s.green ? ' green' : '');
+  }
+  document.getElementById('counterLabel').textContent = s.label;
+  document.getElementById('counterSub').textContent = s.sub;
+
+  // Detail
+  document.getElementById('detail').innerHTML = `<h3>${s.title}</h3><p>${s.desc}</p>`;
+
+  // Buttons
+  document.getElementById('prevBtn').disabled = cur === 0;
+  document.getElementById('nextBtn').disabled = cur === STAGES.length - 1;
+
+  // Scroll stage into view
+  const active = document.querySelector('.stage.active');
+  if (active) active.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+}
+
+function goTo(i) { cur = Math.max(0, Math.min(i, STAGES.length - 1)); render(); }
+function go(d) { goTo(cur + d); }
+
+function togglePlay() {
+  playing = !playing;
+  const btn = document.getElementById('playBtn');
+  if (playing) {
+    btn.innerHTML = '&#9646;&#9646; Pause';
+    tick();
+  } else {
+    btn.innerHTML = '&#9654; Play';
+    clearTimeout(timer);
+  }
+}
+
+function tick() {
+  if (!playing) return;
+  if (cur >= STAGES.length - 1) { togglePlay(); return; }
+  go(1);
+  timer = setTimeout(tick, 2200);
+}
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'ArrowRight' || e.key === ' ') { e.preventDefault(); go(1); }
+  if (e.key === 'ArrowLeft') { e.preventDefault(); go(-1); }
+  if (e.key === 'r') goTo(0);
+});
+
+init();
+</script>
+</body>
+</html>

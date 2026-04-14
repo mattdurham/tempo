@@ -1,0 +1,37 @@
+name: Renovate
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/renovate.json5'
+      - '.github/workflows/renovate.yml'
+
+  pull_request:
+    paths:
+      - '.github/renovate.json5'
+      - '.github/workflows/renovate.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate Config
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Cache npm packages
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npx-renovate
+
+      - name: Validate Renovate Config
+        run: |
+          npx --yes --package renovate -- renovate-config-validator .github/renovate.json5
