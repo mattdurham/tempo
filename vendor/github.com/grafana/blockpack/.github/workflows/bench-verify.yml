@@ -1,0 +1,37 @@
+name: Bench Verify
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  bench-verify:
+    name: Mismatch Verification (lokibench)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version: '1.26.x'
+
+      - name: Update go.sum for CI environment
+        # go.sum may be missing grpc sub-module checksums on a cold runner.
+        # -mod=mod allows Go to fetch and add missing entries before testing.
+        run: cd benchmark/lokibench && go mod tidy
+
+      - name: Run mismatch verification tests
+        run: |
+          cd benchmark/lokibench && go test \
+            -run 'TestSyntheticDeepCompare|TestSMLeakMismatch|TestLokiConverter_SelectLogs_MultiLabelEquality' \
+            -timeout 120s \
+            -v \
+            .
