@@ -91,7 +91,8 @@ func (c *Compactor) Compact(ctx context.Context, l log.Logger, r backend.Reader,
 	ConfigureLRU(c.opts.BlockConfig.Blockpack.LRUCacheBytes)
 
 	cfg := blockpack.CompactionConfig{
-		MaxSpansPerBlock: maxSpansFromConfig(&c.opts.BlockConfig),
+		MaxSpansPerBlock:  maxSpansFromConfig(&c.opts.BlockConfig),
+		MaxOutputFileSize: c.opts.BlockConfig.Blockpack.MaxOutputFileSize,
 	}
 
 	outputPaths, err := blockpack.CompactBlocks(ctx, providers, cfg, out)

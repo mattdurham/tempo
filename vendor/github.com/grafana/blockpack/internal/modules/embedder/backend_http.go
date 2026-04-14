@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"sync"
 	"time"
@@ -16,8 +17,8 @@ import (
 const defaultHTTPTimeout = 120 * time.Second
 
 // sendBatchMaxRetries is the number of times sendBatch retries on transient errors
-// (timeout, connection reset, EOF, 5xx) before propagating the error.
-const sendBatchMaxRetries = 5
+// (timeout, connection reset, EOF, 5xx, 429) before propagating the error.
+const sendBatchMaxRetries = 8
 
 // HTTPConfig configures the HTTP embedding backend.
 type HTTPConfig struct {
@@ -218,11 +219,22 @@ func (b *httpBackend) sendBatch(texts []string) ([][]float32, error) {
 	url := b.serverURL + "/embed"
 
 	var lastErr error
+	var lastWas429 bool
 	for attempt := range sendBatchMaxRetries {
 		if attempt > 0 {
-			// Backoff: 2s, 5s, 10s, 17s — gives crashing pods time to restart and
-			// become Ready before kube-proxy routes new connections to them.
-			time.Sleep(time.Duration(attempt*attempt+1) * time.Second)
+			if lastWas429 {
+				// Short jittered backoff for TEI overload.
+				// Base: 150ms×attempt (150ms, 300ms, 450ms...).
+				// Jitter: ±50% to prevent thundering-herd when many batches
+				// retry simultaneously after the same burst of 429 responses.
+				base := time.Duration(150*attempt) * time.Millisecond
+				jitter := time.Duration(rand.Int63n(int64(base/2+1))) //nolint:gosec
+				time.Sleep(base + jitter - jitter/2)
+			} else {
+				// Backoff: 2s, 5s, 10s, 17s — gives crashing pods time to restart and
+				// become Ready before kube-proxy routes new connections to them.
+				time.Sleep(time.Duration(attempt*attempt+1) * time.Second)
+			}
 		}
 
 		vecs, err := b.doPost(url, reqBody)
@@ -230,11 +242,19 @@ func (b *httpBackend) sendBatch(texts []string) ([][]float32, error) {
 			return vecs, nil
 		}
 		lastErr = err
+		lastWas429 = false
 
-		// Retry on network errors and 5xx; stop immediately on 4xx.
+		// Retry on network errors, 5xx, and 429 (Too Many Requests / service overloaded).
+		// Stop immediately on other 4xx (bad request, auth failure, etc.).
 		var httpErr *httpStatusError
-		if errors.As(err, &httpErr) && httpErr.status < 500 {
-			break
+		if errors.As(err, &httpErr) {
+			if httpErr.status == http.StatusTooManyRequests {
+				lastWas429 = true
+				continue // retry with short backoff
+			}
+			if httpErr.status < 500 {
+				break // other 4xx: not retryable
+			}
 		}
 	}
 	return nil, fmt.Errorf("POST %s: %w", url, lastErr)

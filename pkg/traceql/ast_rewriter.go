@@ -64,6 +64,7 @@ func (f *fieldExpressionRewriter) RewriteRoot(r *RootExpr) *RootExpr {
 		MetricsSecondStage: r.MetricsSecondStage,
 		Hints:              r.Hints,
 		OptimizationCount:  r.OptimizationCount + rwCount,
+		HasVector:          r.HasVector,
 	}
 }
 

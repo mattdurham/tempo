@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"regexp"
 	"strings"
@@ -542,20 +543,28 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 		wantedCols = nil // nil = no filtering (match-all queries)
 	}
 
-	var fetchErr error
-	var matches []blockpack.SpanMatch
-	matches, _, fetchErr = blockpack.QueryTraceQL(r, query, blockpack.QueryOptions{
+	// Build QueryOptions and set Embedder only when non-nil. Assigning a typed nil
+	// (*blockpack.Embedder)(nil) directly to the vm.TextEmbedder interface field creates
+	// a non-nil interface containing a nil pointer, causing a nil dereference panic inside
+	// CompileTraceQLFilterWithOptions when it calls embedder.Embed(). Checking the pointer
+	// before assigning keeps the interface nil when no embedder is configured.
+	queryOpts := blockpack.QueryOptions{
 		Limit:         spanLimit,
 		MostRecent:    common.TraceQLMostRecent(ctx),
 		StartNano:     req.StartTimeUnixNanos,
 		EndNano:       req.EndTimeUnixNanos,
 		SelectColumns: selectCols, // nil when empty = return all (match-all queries)
-		Embedder:      getProcessEmbedder(configuredEmbedURL),
 		// Do not use StartBlock/BlockCount: Tempo's TotalPages concept maps to parquet
 		// row groups, not blockpack internal blocks. Passing TotalPages=1 as BlockCount
 		// would scan only 1 internal block out of potentially hundreds. Blockpack files
 		// are already one job per file at the Tempo level, so scan all internal blocks.
-	})
+	}
+	if e := getProcessEmbedder(configuredEmbedURL); e != nil {
+		queryOpts.Embedder = e
+	}
+	var fetchErr error
+	var matches []blockpack.SpanMatch
+	matches, _, fetchErr = blockpack.QueryTraceQL(r, query, queryOpts)
 	if fetchErr == nil {
 		for i := range matches {
 			match := &matches[i]
@@ -575,6 +584,7 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 		}
 	}
 	if fetchErr != nil {
+		slog.Error("vblockpack QueryTraceQL error", "query", query, "err", fetchErr)
 		return traceql.FetchSpansResponse{}, fmt.Errorf("vblockpack Fetch: %w", fetchErr)
 	}
 
@@ -1692,3 +1702,4 @@ func spanMatchesServiceStats(spans []blockpack.SpanMatch) map[string]traceql.Ser
 	}
 	return out
 }
+
