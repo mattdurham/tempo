@@ -363,12 +363,15 @@ func (w *walBlock) Fetch(ctx context.Context, req traceql.FetchSpansRequest, opt
 		query = orig
 	}
 
-	matches, _, fetchErr := blockpack.QueryTraceQL(r, query, blockpack.QueryOptions{
+	walQueryOpts := blockpack.QueryOptions{
 		Limit:     opts.MaxTraces,
 		StartNano: req.StartTimeUnixNanos,
 		EndNano:   req.EndTimeUnixNanos,
-		Embedder:  getProcessEmbedder(configuredEmbedURL),
-	})
+	}
+	if e := getProcessEmbedder(configuredEmbedURL); e != nil {
+		walQueryOpts.Embedder = e
+	}
+	matches, _, fetchErr := blockpack.QueryTraceQL(r, query, walQueryOpts)
 	if fetchErr != nil {
 		return traceql.FetchSpansResponse{}, fmt.Errorf("walBlock Fetch: query: %w", fetchErr)
 	}
