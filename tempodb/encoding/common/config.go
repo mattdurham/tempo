@@ -78,6 +78,11 @@ type BlockpackConfig struct {
 	// Defaults to 2000 if zero.
 	MaxSpansPerBlock int `yaml:"max_spans_per_block"`
 
+	// MaxOutputFileSize is the maximum size in bytes of each compaction output file.
+	// When a compacted output block would exceed this size, blockpack splits it into
+	// a new file. Zero means no size limit.
+	MaxOutputFileSize int64 `yaml:"max_output_file_size"`
+
 	// FileCachePath is the root directory for the disk-backed file cache.
 	// Leave empty to disable the disk cache.
 	FileCachePath string `yaml:"file_cache_path"`
@@ -98,6 +103,22 @@ type BlockpackConfig struct {
 	// VectorDimension is the expected embedding vector dimension (e.g. 768 for nomic-embed-text-v1.5).
 	// Required when EmbeddingURL is set. Controls the writer's VectorIndex section.
 	VectorDimension int `yaml:"vector_dimension"`
+
+	// EmbeddingConcurrentBatches is the number of concurrent POST /embed requests sent to the
+	// embedding server during block creation. Higher values saturate more server pods.
+	// Defaults to the blockpack default (4) when 0.
+	EmbeddingConcurrentBatches int `yaml:"embedding_concurrent_batches"`
+
+	// EmbeddingBatchSize is the number of texts sent in a single POST /embed request.
+	// Larger values reduce HTTP round trips when span texts are short.
+	// Must not exceed the embedding server's max-batch-tokens / avg tokens per text.
+	// Defaults to the blockpack default (32) when 0.
+	EmbeddingBatchSize int `yaml:"embedding_batch_size"`
+
+	// EmbeddingMaxTextLength is the maximum character length of assembled span text sent to the
+	// embedding server. Shorter limits reduce token count for long spans (error messages, stack
+	// traces), improving GPU throughput. Defaults to 24000 (~8192 tokens) when 0.
+	EmbeddingMaxTextLength int `yaml:"embedding_max_text_length"`
 
 	// MemCacheServers is a list of memcache server addresses (e.g. ["memcached-01:11211"]).
 	// Leave empty to disable the remote memcache tier.
