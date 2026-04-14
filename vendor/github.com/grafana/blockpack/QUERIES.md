@@ -2,7 +2,7 @@
 
 **Environment:** dev-us-east-0 / tempo-dev-test-03  
 **Tenant:** `X-Scope-OrgID: 11638`  
-**Generated:** 2026-04-12  
+**Generated:** 2026-04-12 (updated 2026-04-14 with r60 results)  
 **Time range queried:** last 3 hours  
 **Services active:** alloy, CockroachDB, apiserver, grafana
 
@@ -272,3 +272,70 @@ Narrower bucket spread than query 6 because the `duration > 50ms` pre-filter eli
 
 **Result:** `series=2  datapoints=181  last_value=0.100 spans/s`  
 Most complex metrics query: two OR groups joined with AND across span attribute, status, and resource attribute, then aggregated as a rate over time.
+
+---
+
+## r59 → r60 Optimization Results
+
+**Deployed:** 2026-04-14  
+**Image:** `mrdgrafana/tempo:blockpack-f335840e9-r60`  
+**Environment:** tempo-dev-test-03 (24h time range, 147–149 blocks, ~7.9 GB block data)
+
+### Optimizations
+
+Two allocation optimizations targeting the `executeTraceMetricsIntrinsic` hot path:
+
+1. **Snappy decode buffer pool** (`internal/modules/blockio/shared/intrinsic_codec.go`):
+   `sync.Pool` of `*[]byte` reuses snappy decode buffers across pages. Eliminates ~6.4 GB/query
+   of heap allocations in the paged column decode path.
+
+2. **buildGroupKeyMap fast path** (`internal/modules/executor/metrics_trace_intrinsic.go`):
+   For single-group-by queries, writes directly to the output map, eliminating the `colVals`
+   intermediate `map[uint32]string` allocation (~1.5 GB/query).
+
+### Performance Summary
+
+Time range: 24 hours, step=1h (25 points), tenant `11638`.
+
+| Query | r58 | r59 | r60 (cold) | r60 (warm) | delta (r59→r60 warm) |
+|---|---|---|---|---|---|
+| `{}⎮histogram_over_time(duration) by (resource.service.name)` | ~22s | 17.5s | 10.4s | **7.2s** | **-59%** |
+| `{kind=server}⎮histogram_over_time(duration) by (resource.service.name)` | — | — | — | **3.9s** | — |
+| `{}⎮rate() by (resource.service.name)` | — | — | — | **4.5s** | — |
+
+### New Metric Queries (r60 baseline)
+
+These queries use the `by (resource.service.name)` aggregation, the key use case for the
+group key map optimization.
+
+#### M11. All-span duration histogram by service
+
+```traceql
+{} | histogram_over_time(duration) by (resource.service.name)
+```
+
+**Result (r60 warm):** `series=2978  services=210  buckets=39  time=7.2s  blocks=149`
+
+---
+
+#### M12. Server-span duration histogram by service (M8 target query)
+
+```traceql
+{kind=server} | histogram_over_time(duration) by (resource.service.name)
+```
+
+**Result (r60):** `series=1415  services=146  buckets=30  time=3.9s  blocks=149`
+
+This is the M8 production query (`{span.kind=server}` maps to the `kind` intrinsic column).
+The `kind=server` filter halves the series count vs M11 (only server-span buckets) and
+cuts query time by ~46% relative to M11 warm.
+
+---
+
+#### M13. All-span rate by service
+
+```traceql
+{} | rate() by (resource.service.name)
+```
+
+**Result (r60):** `series=210  services=210  time=4.5s  blocks=147`

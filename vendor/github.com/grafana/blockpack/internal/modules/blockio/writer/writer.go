@@ -599,7 +599,7 @@ func (w *Writer) writeV14Sections() error {
 			nameEntries = append(nameEntries, shared.DirEntryName{
 				Name:          name,
 				Offset:        colOffset,
-				CompressedLen: uint32(len(blob)), //nolint:gosec // safe: column blob bounded by MaxIntrinsicRows × entry size
+				CompressedLen: uint32(len(blob)), //nolint:gosec // bounded by MaxIntrinsicRows
 			})
 		}
 	}

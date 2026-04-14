@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/rand"
 	"net/http"
 	"sync"
 	"time"
@@ -17,8 +16,8 @@ import (
 const defaultHTTPTimeout = 120 * time.Second
 
 // sendBatchMaxRetries is the number of times sendBatch retries on transient errors
-// (timeout, connection reset, EOF, 5xx, 429) before propagating the error.
-const sendBatchMaxRetries = 8
+// (timeout, connection reset, EOF, 5xx) before propagating the error.
+const sendBatchMaxRetries = 5
 
 // HTTPConfig configures the HTTP embedding backend.
 type HTTPConfig struct {
@@ -29,7 +28,7 @@ type HTTPConfig struct {
 	Fields []EmbeddingField
 	// MaxTextLength is the maximum character length of assembled text (default: 24000).
 	MaxTextLength int
-	// Timeout is the HTTP request timeout. Defaults to 30s if zero.
+	// Timeout is the HTTP request timeout. Defaults to 120s if zero.
 	Timeout time.Duration
 	// MaxBatchSize is the maximum number of texts to send in a single POST /embed request.
 	// 0 means no chunking (use the server's limit — may return 422 for large batches).
@@ -37,12 +36,14 @@ type HTTPConfig struct {
 	MaxBatchSize int
 	// MaxConcurrentBatches is the maximum number of batch requests to issue concurrently.
 	// When > 1, EmbedBatch sends multiple chunks in parallel, distributing load across
-	// multiple embed-server pods. Defaults to 8 when set to 0 via NewHTTP.
+	// multiple embed-server pods. Defaults to 4 when set to 0 via NewHTTP.
 	MaxConcurrentBatches int
 }
 
-const defaultMaxBatchSize = 32         // TEI default max_batch_tokens / typical per-request limit
-const defaultMaxConcurrentBatches = 4  // concurrently hit up to 4 embed-server pods
+const (
+	defaultMaxBatchSize         = 32 // TEI default max_batch_tokens / typical per-request limit
+	defaultMaxConcurrentBatches = 4  // concurrently hit up to 4 embed-server pods
+)
 
 // httpBackend implements Backend by forwarding requests to an embedding server over HTTP.
 // Supports the TEI protocol: POST /embed with {"inputs": [...], "normalize": true}
@@ -190,7 +191,12 @@ func (b *httpBackend) EmbedBatch(texts []string) ([][]float32, error) {
 		if b.dim > 0 {
 			for j, v := range vecs {
 				if len(v) != b.dim {
-					return nil, fmt.Errorf("embedder http: vector[%d] has length %d, expected %d", c.start+j, len(v), b.dim)
+					return nil, fmt.Errorf(
+						"embedder http: vector[%d] has length %d, expected %d",
+						c.start+j,
+						len(v),
+						b.dim,
+					)
 				}
 			}
 		}
@@ -219,22 +225,11 @@ func (b *httpBackend) sendBatch(texts []string) ([][]float32, error) {
 	url := b.serverURL + "/embed"
 
 	var lastErr error
-	var lastWas429 bool
 	for attempt := range sendBatchMaxRetries {
 		if attempt > 0 {
-			if lastWas429 {
-				// Short jittered backoff for TEI overload.
-				// Base: 150ms×attempt (150ms, 300ms, 450ms...).
-				// Jitter: ±50% to prevent thundering-herd when many batches
-				// retry simultaneously after the same burst of 429 responses.
-				base := time.Duration(150*attempt) * time.Millisecond
-				jitter := time.Duration(rand.Int63n(int64(base/2+1))) //nolint:gosec
-				time.Sleep(base + jitter - jitter/2)
-			} else {
-				// Backoff: 2s, 5s, 10s, 17s — gives crashing pods time to restart and
-				// become Ready before kube-proxy routes new connections to them.
-				time.Sleep(time.Duration(attempt*attempt+1) * time.Second)
-			}
+			// Backoff: 2s, 5s, 10s, 17s — gives crashing pods time to restart and
+			// become Ready before kube-proxy routes new connections to them.
+			time.Sleep(time.Duration(attempt*attempt+1) * time.Second)
 		}
 
 		vecs, err := b.doPost(url, reqBody)
@@ -242,19 +237,11 @@ func (b *httpBackend) sendBatch(texts []string) ([][]float32, error) {
 			return vecs, nil
 		}
 		lastErr = err
-		lastWas429 = false
 
-		// Retry on network errors, 5xx, and 429 (Too Many Requests / service overloaded).
-		// Stop immediately on other 4xx (bad request, auth failure, etc.).
+		// Retry on network errors and 5xx; stop immediately on 4xx.
 		var httpErr *httpStatusError
-		if errors.As(err, &httpErr) {
-			if httpErr.status == http.StatusTooManyRequests {
-				lastWas429 = true
-				continue // retry with short backoff
-			}
-			if httpErr.status < 500 {
-				break // other 4xx: not retryable
-			}
+		if errors.As(err, &httpErr) && httpErr.status < 500 {
+			break
 		}
 	}
 	return nil, fmt.Errorf("POST %s: %w", url, lastErr)
@@ -262,8 +249,8 @@ func (b *httpBackend) sendBatch(texts []string) ([][]float32, error) {
 
 // httpStatusError is returned by doPost when the server returns a non-200 HTTP status.
 type httpStatusError struct {
-	status int
 	body   string
+	status int
 }
 
 func (e *httpStatusError) Error() string {

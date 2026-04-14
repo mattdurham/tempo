@@ -45,7 +45,11 @@ func splitV14CompactSection(data []byte) (header []byte, traceIndex []byte, err 
 
 	blockCount := int(binary.LittleEndian.Uint32(data[5:])) //nolint:gosec
 	if blockCount > shared.MaxBlocks {
-		return nil, nil, fmt.Errorf("v14 compact section: block_count %d exceeds maximum %d", blockCount, shared.MaxBlocks)
+		return nil, nil, fmt.Errorf(
+			"v14 compact section: block_count %d exceeds maximum %d",
+			blockCount,
+			shared.MaxBlocks,
+		)
 	}
 	pos := 9
 
@@ -56,7 +60,11 @@ func splitV14CompactSection(data []byte) (header []byte, traceIndex []byte, err 
 		bloomBytes := int(binary.LittleEndian.Uint32(data[pos:])) //nolint:gosec
 		pos += 4
 		if bloomBytes > shared.TraceIDBloomMaxBytes {
-			return nil, nil, fmt.Errorf("v14 compact section: bloom_bytes %d exceeds maximum %d", bloomBytes, shared.TraceIDBloomMaxBytes)
+			return nil, nil, fmt.Errorf(
+				"v14 compact section: bloom_bytes %d exceeds maximum %d",
+				bloomBytes,
+				shared.TraceIDBloomMaxBytes,
+			)
 		}
 		if pos+bloomBytes > len(data) {
 			return nil, nil, fmt.Errorf("v14 compact section: short for bloom_data (need %d bytes)", bloomBytes)
@@ -116,7 +124,11 @@ func (r *Reader) parseCompactIndexBytesV14Header(header []byte) error {
 		bloomBytes := int(binary.LittleEndian.Uint32(header[pos:])) //nolint:gosec
 		pos += 4
 		if bloomBytes > shared.TraceIDBloomMaxBytes {
-			return fmt.Errorf("v14 compact header: bloom_bytes %d exceeds maximum %d", bloomBytes, shared.TraceIDBloomMaxBytes)
+			return fmt.Errorf(
+				"v14 compact header: bloom_bytes %d exceeds maximum %d",
+				bloomBytes,
+				shared.TraceIDBloomMaxBytes,
+			)
 		}
 		if pos+bloomBytes > len(header) {
 			return fmt.Errorf("v14 compact header: short for bloom_data (need %d bytes)", bloomBytes)
@@ -159,79 +171,6 @@ func (r *Reader) parseCompactIndexBytesV14Header(header []byte) error {
 		}
 	}
 
-	return nil
-}
-
-// parseCompactIndexBytesV14 parses the compact trace index blob for V14 files.
-// The blob has the same format as the V13 compact index section:
-// magic[4]+version[1]+block_count[4]+[bloom_bytes[4]+bloom_data[N] for v2]+block_table[M×12]+trace_index.
-// On success, populates r.compactParsed so TraceEntries, GetTraceByID, and TraceCount work.
-func (r *Reader) parseCompactIndexBytesV14(data []byte) error {
-	if len(data) < 9 {
-		return fmt.Errorf("compact index: too short (%d bytes)", len(data))
-	}
-
-	magic := binary.LittleEndian.Uint32(data[0:])
-	if magic != shared.CompactIndexMagic {
-		return fmt.Errorf("compact index: bad magic 0x%08X", magic)
-	}
-
-	version := data[4]
-	if version != shared.CompactIndexVersion && version != shared.CompactIndexVersion2 {
-		return fmt.Errorf("compact index: unsupported version %d", version)
-	}
-
-	blockCount := int(binary.LittleEndian.Uint32(data[5:])) //nolint:gosec
-	if blockCount > shared.MaxBlocks {
-		return fmt.Errorf("compact index: block_count %d exceeds maximum %d", blockCount, shared.MaxBlocks)
-	}
-	pos := 9
-
-	var traceIDBloom []byte
-	if version == shared.CompactIndexVersion2 {
-		if pos+4 > len(data) {
-			return fmt.Errorf("compact index: short for bloom_bytes")
-		}
-		bloomBytes := int(binary.LittleEndian.Uint32(data[pos:])) //nolint:gosec
-		pos += 4
-		if bloomBytes > shared.TraceIDBloomMaxBytes {
-			return fmt.Errorf("compact index: bloom_bytes %d exceeds maximum %d", bloomBytes, shared.TraceIDBloomMaxBytes)
-		}
-		if pos+bloomBytes > len(data) {
-			return fmt.Errorf("compact index: short for bloom_data (need %d bytes)", bloomBytes)
-		}
-		traceIDBloom = make([]byte, bloomBytes)
-		copy(traceIDBloom, data[pos:pos+bloomBytes])
-		pos += bloomBytes
-	}
-
-	need := blockCount * 12
-	if pos+need > len(data) {
-		return fmt.Errorf("compact index: short for block_table (need %d)", need)
-	}
-
-	blockTable := make([]compactBlockEntry, blockCount)
-	for i := range blockCount {
-		blockTable[i] = compactBlockEntry{
-			fileOffset: binary.LittleEndian.Uint64(data[pos:]),
-			fileLength: binary.LittleEndian.Uint32(data[pos+8:]),
-		}
-		pos += 12
-	}
-
-	if pos+5 > len(data) {
-		return fmt.Errorf("compact index: trace_index: data too short")
-	}
-	traceIdxFmtVer := data[pos]
-	if traceIdxFmtVer != shared.TraceIndexFmtVersion && traceIdxFmtVer != shared.TraceIndexFmtVersion2 {
-		return fmt.Errorf("compact index: trace_index: unsupported fmt_version %d", traceIdxFmtVer)
-	}
-
-	r.compactParsed = &compactTraceIndex{
-		blockTable:    blockTable,
-		traceIndexRaw: data[pos:],
-		traceIDBloom:  traceIDBloom,
-	}
 	return nil
 }
 
@@ -483,7 +422,9 @@ func (r *Reader) ensureCompactHeaderParsed() error {
 	need := bloomBytes + blockCount*12
 	cacheKey := r.fileID + "/compact-header"
 	bodyData, err := r.cache.GetOrFetch(cacheKey, func() ([]byte, error) {
-		bodyOffset := r.compactOffset + uint64(pos)                               //nolint:gosec // pos is small, fits in uint64
+		bodyOffset := r.compactOffset + uint64( //nolint:gosec // pos is small, fits in uint64
+			pos,
+		)
 		return r.readRange(bodyOffset, uint64(need), rw.DataTypeTraceBloomFilter) //nolint:gosec // need is bounded
 	})
 	if err != nil {
@@ -589,7 +530,11 @@ func (r *Reader) ensureCompactHeaderParsedV3() error {
 	bloomBytes := int(binary.LittleEndian.Uint32(data[pos:])) //nolint:gosec
 	pos += 4
 	if bloomBytes > shared.TraceIDBloomMaxBytes {
-		return fmt.Errorf("compact index v3: bloom_bytes %d exceeds maximum %d", bloomBytes, shared.TraceIDBloomMaxBytes)
+		return fmt.Errorf(
+			"compact index v3: bloom_bytes %d exceeds maximum %d",
+			bloomBytes,
+			shared.TraceIDBloomMaxBytes,
+		)
 	}
 	if pos+bloomBytes > len(data) {
 		return fmt.Errorf("compact index v3: short for bloom_data (need %d bytes)", bloomBytes)
@@ -709,12 +654,18 @@ func (r *Reader) ensureTraceIndexRaw() error {
 		}
 
 		if len(rawData) < 5 {
-			r.compactParsed.traceIndexFetchErr = fmt.Errorf("compact index: trace_index: data too short (%d bytes)", len(rawData))
+			r.compactParsed.traceIndexFetchErr = fmt.Errorf(
+				"compact index: trace_index: data too short (%d bytes)",
+				len(rawData),
+			)
 			return
 		}
 		fmtVer := rawData[0]
 		if fmtVer != shared.TraceIndexFmtVersion && fmtVer != shared.TraceIndexFmtVersion2 {
-			r.compactParsed.traceIndexFetchErr = fmt.Errorf("compact index: trace_index: unsupported fmt_version %d", fmtVer)
+			r.compactParsed.traceIndexFetchErr = fmt.Errorf(
+				"compact index: trace_index: unsupported fmt_version %d",
+				fmtVer,
+			)
 			return
 		}
 		// Copy bytes so the slice is owned by this reader, not the cache buffer.

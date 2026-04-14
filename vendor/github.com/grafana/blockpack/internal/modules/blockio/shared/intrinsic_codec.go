@@ -13,9 +13,39 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log/slog"
+	"sync"
 
 	"github.com/golang/snappy"
 )
+
+// NOTE-011: Snappy decode buffer pool — 64KB default cap, 4MB cap guard.
+// AcquireIntrinsicBuf / ReleaseIntrinsicBuf are used in decodePagedColumnBlob
+// and DecodePageTOC to reuse decode scratch buffers across calls, avoiding
+// per-page allocations in the common case where page blobs are ≤64KB.
+// BytesValues returned from DecodeFlatPage / decodeLegacyFlatBlob must be copied
+// (make+copy) before appending to IntrinsicColumn so the pool buffer can be safely
+// reused on the next call without corrupting live column data.
+const (
+	intrinsicBufDefaultCap = 64 * 1024       // 64KB default
+	intrinsicBufMaxCap     = 4 * 1024 * 1024 // 4MB cap guard
+)
+
+var intrinsicBufPool = &sync.Pool{
+	New: func() any { b := make([]byte, 0, intrinsicBufDefaultCap); return &b },
+}
+
+// AcquireIntrinsicBuf returns a pooled *[]byte for snappy decode scratch space.
+func AcquireIntrinsicBuf() *[]byte { return intrinsicBufPool.Get().(*[]byte) }
+
+// ReleaseIntrinsicBuf returns bp to the pool. Resets length; replaces oversized buffers.
+func ReleaseIntrinsicBuf(bp *[]byte) {
+	if cap(*bp) > intrinsicBufMaxCap {
+		*bp = make([]byte, 0, intrinsicBufDefaultCap)
+	} else {
+		*bp = (*bp)[:0]
+	}
+	intrinsicBufPool.Put(bp)
+}
 
 // DecodeTOC decompresses a TOC blob and parses it into a slice of IntrinsicColMeta.
 func DecodeTOC(blob []byte) ([]IntrinsicColMeta, error) {
@@ -154,10 +184,15 @@ func EncodePageTOC(toc PagedIntrinsicTOC) ([]byte, error) {
 
 // DecodePageTOC decompresses a page TOC blob and parses it into a PagedIntrinsicTOC.
 func DecodePageTOC(blob []byte) (PagedIntrinsicTOC, error) {
-	raw, err := snappy.Decode(nil, blob)
+	// NOTE-011: use a pooled buffer for the snappy decode scratch space.
+	tocBuf := AcquireIntrinsicBuf()
+	raw, err := snappy.Decode(*tocBuf, blob)
 	if err != nil {
+		ReleaseIntrinsicBuf(tocBuf)
 		return PagedIntrinsicTOC{}, fmt.Errorf("DecodePageTOC: snappy: %w", err)
 	}
+	*tocBuf = raw
+	defer ReleaseIntrinsicBuf(tocBuf)
 	if len(raw) < 8 {
 		return PagedIntrinsicTOC{}, fmt.Errorf("DecodePageTOC: too short: %d bytes", len(raw))
 	}
@@ -273,7 +308,10 @@ func DecodeFlatPage(raw []byte, blockW, rowW, rowCount int, colType ColumnType) 
 			if pos+vLen > len(raw) {
 				return nil, fmt.Errorf("DecodeFlatPage: truncated at bytes value")
 			}
-			col.BytesValues = append(col.BytesValues, raw[pos:pos+vLen])
+			// NOTE-011: copy BytesValues so the pool buffer can be safely reused.
+			v := make([]byte, vLen)
+			copy(v, raw[pos:pos+vLen])
+			col.BytesValues = append(col.BytesValues, v)
 			pos += vLen
 		}
 	} else {
@@ -426,6 +464,10 @@ func decodePagedColumnBlob(blob []byte) (*IntrinsicColumn, error) {
 	// don't rebuild it from scratch on each call (O(N²) → O(N) total).
 	var dictIdx map[string]int
 
+	// NOTE-011: reuse a pooled decode buffer across page decodes.
+	pageBuf := AcquireIntrinsicBuf()
+	defer ReleaseIntrinsicBuf(pageBuf)
+
 	for i, pm := range toc.Pages {
 		pageStart := pos + int(pm.Offset)
 		pageEnd := pageStart + int(pm.Length)
@@ -434,10 +476,11 @@ func decodePagedColumnBlob(blob []byte) (*IntrinsicColumn, error) {
 				i, pm.Offset, pm.Length, len(blob))
 		}
 		pageCompressed := blob[pageStart:pageEnd]
-		pageRaw, decErr := snappy.Decode(nil, pageCompressed)
+		pageRaw, decErr := snappy.Decode(*pageBuf, pageCompressed)
 		if decErr != nil {
 			return nil, fmt.Errorf("decodePagedColumnBlob: page %d snappy: %w", i, decErr)
 		}
+		*pageBuf = pageRaw // update pool buffer pointer (snappy may have reallocated)
 
 		var page *IntrinsicColumn
 		if toc.Format == IntrinsicFormatFlat {
@@ -599,7 +642,10 @@ func decodeLegacyFlatBlob(raw []byte, pos int, colType ColumnType, rowCount int,
 			if pos+vLen > len(raw) {
 				return fmt.Errorf("DecodeIntrinsicColumnBlob: truncated at bytes value")
 			}
-			col.BytesValues = append(col.BytesValues, raw[pos:pos+vLen])
+			// NOTE-011: copy BytesValues so the pool buffer can be safely reused.
+			v := make([]byte, vLen)
+			copy(v, raw[pos:pos+vLen])
+			col.BytesValues = append(col.BytesValues, v)
 			pos += vLen
 		}
 	} else {

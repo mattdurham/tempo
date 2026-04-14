@@ -869,7 +869,11 @@ func (r *Reader) AddColumnsToBlock(bwb *BlockWithBytes, addColumns map[string]st
 		if hdr.version == shared.VersionBlockV14 {
 			// SPEC-ROOT-012: guard against decompression-bomb OOM.
 			if m.uncompressedLen > uint32(shared.MaxBlockSize) { //nolint:gosec
-				return fmt.Errorf("AddColumnsToBlock: col %q: uncompressed_len %d exceeds MaxBlockSize", m.name, m.uncompressedLen)
+				return fmt.Errorf(
+					"AddColumnsToBlock: col %q: uncompressed_len %d exceeds MaxBlockSize",
+					m.name,
+					m.uncompressedLen,
+				)
 			}
 			decompressed, decErr := snappy.Decode(nil, colData)
 			if decErr != nil {

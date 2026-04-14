@@ -80,7 +80,10 @@ func (e DirEntryName) Marshal() []byte {
 // MarshalInto serializes the entry into dst (must be at least WireSize() bytes).
 func (e DirEntryName) MarshalInto(dst []byte) {
 	dst[0] = DirEntryKindName
-	binary.LittleEndian.PutUint16(dst[1:3], uint16(len(e.Name))) //nolint:gosec // safe: name length bounded by MaxNameLen (1024), fits in uint16
+	binary.LittleEndian.PutUint16(
+		dst[1:3],
+		uint16(len(e.Name)), //nolint:gosec // safe: name length bounded by MaxNameLen (1024), fits in uint16
+	)
 	copy(dst[3:3+len(e.Name)], e.Name)
 	off := 3 + len(e.Name)
 	binary.LittleEndian.PutUint64(dst[off:off+8], e.Offset)
@@ -92,7 +95,10 @@ func (e DirEntryName) MarshalInto(dst []byte) {
 // Returns the entry and the number of bytes consumed from data.
 func UnmarshalDirEntryName(data []byte) (DirEntryName, int, error) {
 	if len(data) < 2 {
-		return DirEntryName{}, 0, fmt.Errorf("UnmarshalDirEntryName: need at least 2 bytes for name_len, got %d", len(data))
+		return DirEntryName{}, 0, fmt.Errorf(
+			"UnmarshalDirEntryName: need at least 2 bytes for name_len, got %d",
+			len(data),
+		)
 	}
 	nameLen := int(binary.LittleEndian.Uint16(data[0:2]))
 	need := 2 + nameLen + 8 + 4
