@@ -44,8 +44,8 @@ type SearchOptions struct {
 	ReadBufferCount    int
 	ReadBufferSize     int
 	RF1After           time.Time // Only blocks with RF1 are selected after this timestamp. RF3 is selected otherwise.
-	MaxTraces          int  // Maximum number of traces to return (0 = unlimited). Used by blockpack to stop streaming early.
-	Streaming          bool // If true, use streaming (channel-based) iteration for metrics queries to avoid OOM.
+	MaxTraces          int       // Maximum number of traces to return (0 = unlimited). Used by blockpack to stop streaming early.
+	Streaming          bool      // If true, use streaming (channel-based) iteration for metrics queries to avoid OOM.
 }
 
 // DefaultSearchOptions is used in a lot of places such as local ingester searches. It is important

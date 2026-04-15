@@ -158,6 +158,8 @@ func (s *tenantStore) Flush(ctx context.Context, r tempodb.Reader, w tempodb.Wri
 	if err != nil {
 		return err
 	}
+	createBlockElapsed := time.Since(st)
+	level.Info(s.logger).Log("msg", "CreateBlock complete", "tenant", s.tenantID, "elapsed", createBlockElapsed, "blockid", meta.BlockID)
 
 	if n, err := iter.DedupedSpans(); err != nil {
 		level.Error(s.logger).Log("msg", "failed to get deduped spans count", "err", err)
@@ -175,10 +177,12 @@ func (s *tenantStore) Flush(ctx context.Context, r tempodb.Reader, w tempodb.Wri
 		return err
 	}
 
+	writeStart := time.Now()
 	if err := w.WriteBlock(ctx, NewWriteableBlock(newBlock, reader, writer)); err != nil {
 		span.RecordError(err)
 		return err
 	}
+	level.Info(s.logger).Log("msg", "WriteBlock complete", "tenant", s.tenantID, "elapsed", time.Since(writeStart), "blockid", newMeta.BlockID)
 	s.noCompactBlockID = &newMeta.BlockID
 	span.AddEvent("wrote block to backend", trace.WithAttributes(attribute.String("block_id", newMeta.BlockID.String())))
 

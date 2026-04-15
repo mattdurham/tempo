@@ -144,16 +144,16 @@ func encodeGorillaDelta(vals []uint64) []byte {
 
 			switch {
 			case bitsNeeded <= 7:
-				w.writeBits(0b10, 2)    // prefix 10
+				w.writeBits(0b10, 2)             // prefix 10
 				w.writeBits(uint64(dod)&0x7F, 7) //nolint:gosec
 			case bitsNeeded <= 9:
-				w.writeBits(0b110, 3)   // prefix 110
+				w.writeBits(0b110, 3)             // prefix 110
 				w.writeBits(uint64(dod)&0x1FF, 9) //nolint:gosec
 			case bitsNeeded <= 12:
-				w.writeBits(0b1110, 4)  // prefix 1110
+				w.writeBits(0b1110, 4)             // prefix 1110
 				w.writeBits(uint64(dod)&0xFFF, 12) //nolint:gosec
 			default:
-				w.writeBits(0b1111, 4)  // prefix 1111
+				w.writeBits(0b1111, 4)       // prefix 1111
 				w.writeBits(uint64(dod), 64) //nolint:gosec
 			}
 		}

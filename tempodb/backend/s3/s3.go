@@ -426,8 +426,8 @@ func (rw *readerWriter) ListBlocks(
 			defer wg.Done()
 
 			var (
-				err        error
-				res        minio.ListBucketV2Result
+				err             error
+				res             minio.ListBucketV2Result
 				startAfter      = prefix + minUUID.String()
 				continuationTok string
 			)

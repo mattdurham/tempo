@@ -335,7 +335,8 @@ func (b *blockpackBlock) FindTraceByID(_ context.Context, id common.ID, _ common
 // Search performs a search across the blockpack block
 // Uses blockpack's query engine for tag/duration filtering
 func (b *blockpackBlock) Search(ctx context.Context, req *tempopb.SearchRequest,
-	_ common.SearchOptions) (*tempopb.SearchResponse, error) {
+	_ common.SearchOptions,
+) (*tempopb.SearchResponse, error) {
 	// Build TraceQL query from SearchRequest
 	query := buildSearchQuery(req)
 
@@ -823,9 +824,11 @@ func (s *blockpackSpan) AllAttributesFunc(cb func(traceql.Attribute, traceql.Sta
 func (s *blockpackSpan) SiblingOf(lhs, rhs []traceql.Span, falseForAll, union bool, buffer []traceql.Span) []traceql.Span {
 	return nil
 }
+
 func (s *blockpackSpan) DescendantOf(lhs, rhs []traceql.Span, falseForAll, invert, union bool, buffer []traceql.Span) []traceql.Span {
 	return nil
 }
+
 func (s *blockpackSpan) ChildOf(lhs, rhs []traceql.Span, falseForAll, invert, union bool, buffer []traceql.Span) []traceql.Span {
 	return nil
 }
@@ -1709,4 +1712,3 @@ func spanMatchesServiceStats(spans []blockpack.SpanMatch) map[string]traceql.Ser
 	}
 	return out
 }
-
