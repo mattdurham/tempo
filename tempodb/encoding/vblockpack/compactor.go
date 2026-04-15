@@ -133,7 +133,7 @@ func (p *tempoBlockProvider) Size() (int64, error) {
 	return size, nil
 }
 
-func (p *tempoBlockProvider) ReadAt(buf []byte, off int64, dataType blockpack.DataType) (int, error) {
+func (p *tempoBlockProvider) ReadAt(buf []byte, off int64, _ blockpack.DataType) (int, error) {
 	if off < 0 {
 		return 0, fmt.Errorf("negative offset: %d", off)
 	}
@@ -167,7 +167,7 @@ type tempoOutputStorage struct {
 	metas []*backend.BlockMeta
 }
 
-func (s *tempoOutputStorage) Put(path string, data []byte) error {
+func (s *tempoOutputStorage) Put(_ string, data []byte) error {
 	ctx := context.Background()
 	newID := backend.NewUUID()
 
@@ -213,16 +213,16 @@ func (s *tempoOutputStorage) Put(path string, data []byte) error {
 
 // Size and ReadAt satisfy the blockpack.WritableStorage interface (extends Storage).
 // Output storage is write-only; reads are not supported.
-func (s *tempoOutputStorage) Size(path string) (int64, error) {
+func (s *tempoOutputStorage) Size(_ string) (int64, error) {
 	return 0, fmt.Errorf("output storage does not support reads")
 }
 
-func (s *tempoOutputStorage) ReadAt(path string, p []byte, off int64, _ blockpack.DataType) (int, error) {
+func (s *tempoOutputStorage) ReadAt(_ string, _ []byte, _ int64, _ blockpack.DataType) (int, error) {
 	return 0, fmt.Errorf("output storage does not support reads")
 }
 
 // Delete satisfies the blockpack.WritableStorage interface but is not used for output files.
-func (s *tempoOutputStorage) Delete(path string) error {
+func (s *tempoOutputStorage) Delete(_ string) error {
 	return nil
 }
 

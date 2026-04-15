@@ -31,12 +31,12 @@ type walBlock struct {
 }
 
 // createWALBlock creates a new WAL block
-func createWALBlock(meta *backend.BlockMeta, filepath string, ingestionSlack time.Duration) (*walBlock, error) {
+func createWALBlock(meta *backend.BlockMeta, filepath string, ingestionSlack time.Duration) *walBlock {
 	return &walBlock{
 		meta:           meta,
 		path:           filepath,
 		ingestionSlack: ingestionSlack,
-	}, nil
+	}
 }
 
 // BlockMeta returns the block metadata
@@ -57,7 +57,7 @@ func (w *walBlock) Append(id common.ID, b []byte, start, end uint32, adjustInges
 
 // AppendTrace appends a trace object to the WAL block
 // Writes trace spans to blockpack format
-func (w *walBlock) AppendTrace(id common.ID, tr *tempopb.Trace, start, end uint32, adjustIngestionSlack bool) error {
+func (w *walBlock) AppendTrace(_ common.ID, tr *tempopb.Trace, start, end uint32, _ bool) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -127,7 +127,7 @@ func (w *walBlock) Flush() error {
 
 	// Write to disk
 	filePath := w.path + "/" + DataFileName
-	if err := os.WriteFile(filePath, data, 0o644); err != nil {
+	if err := os.WriteFile(filePath, data, 0o600); err != nil {
 		return fmt.Errorf("failed to write blockpack file: %w", err)
 	}
 
@@ -272,31 +272,27 @@ func (w *walBlock) FindTraceByID(_ context.Context, id common.ID, _ common.Searc
 		return nil, nil
 	}
 
-	trace, err := reconstructTrace(id, matches)
-	if err != nil {
-		return nil, fmt.Errorf("walBlock FindTraceByID: reconstruct: %w", err)
-	}
-
+	trace := reconstructTrace(id, matches)
 	return &tempopb.TraceByIDResponse{Trace: trace}, nil
 }
 
 // Search performs a search (not implemented for WAL - WAL is write-only during ingestion)
-func (w *walBlock) Search(ctx context.Context, req *tempopb.SearchRequest, opts common.SearchOptions) (*tempopb.SearchResponse, error) {
+func (w *walBlock) Search(_ context.Context, _ *tempopb.SearchRequest, _ common.SearchOptions) (*tempopb.SearchResponse, error) {
 	return &tempopb.SearchResponse{}, nil
 }
 
 // SearchTags implements the Searcher interface
-func (w *walBlock) SearchTags(ctx context.Context, scope traceql.AttributeScope, cb common.TagsCallback, mcb common.MetricsCallback, opts common.SearchOptions) error {
+func (w *walBlock) SearchTags(_ context.Context, _ traceql.AttributeScope, _ common.TagsCallback, _ common.MetricsCallback, _ common.SearchOptions) error {
 	return nil
 }
 
 // SearchTagValues implements the Searcher interface
-func (w *walBlock) SearchTagValues(ctx context.Context, tag string, cb common.TagValuesCallback, mcb common.MetricsCallback, opts common.SearchOptions) error {
+func (w *walBlock) SearchTagValues(_ context.Context, _ string, _ common.TagValuesCallback, _ common.MetricsCallback, _ common.SearchOptions) error {
 	return nil
 }
 
 // SearchTagValuesV2 implements the Searcher interface
-func (w *walBlock) SearchTagValuesV2(ctx context.Context, tag traceql.Attribute, cb common.TagValuesCallbackV2, mcb common.MetricsCallback, opts common.SearchOptions) error {
+func (w *walBlock) SearchTagValuesV2(_ context.Context, _ traceql.Attribute, _ common.TagValuesCallbackV2, _ common.MetricsCallback, _ common.SearchOptions) error {
 	return nil
 }
 
@@ -447,17 +443,17 @@ func (w *walBlock) FetchSpans(_ context.Context, _ traceql.FetchSpansRequest, _ 
 }
 
 // FetchTagValues implements the Searcher interface
-func (w *walBlock) FetchTagValues(ctx context.Context, req traceql.FetchTagValuesRequest, cb traceql.FetchTagValuesCallback, mcb common.MetricsCallback, opts common.SearchOptions) error {
+func (w *walBlock) FetchTagValues(_ context.Context, _ traceql.FetchTagValuesRequest, _ traceql.FetchTagValuesCallback, _ common.MetricsCallback, _ common.SearchOptions) error {
 	return nil
 }
 
 // FetchTagNames implements the Searcher interface
-func (w *walBlock) FetchTagNames(ctx context.Context, req traceql.FetchTagsRequest, cb traceql.FetchTagsCallback, mcb common.MetricsCallback, opts common.SearchOptions) error {
+func (w *walBlock) FetchTagNames(_ context.Context, _ traceql.FetchTagsRequest, _ traceql.FetchTagsCallback, _ common.MetricsCallback, _ common.SearchOptions) error {
 	return nil
 }
 
 // Validate validates the WAL block
-func (w *walBlock) Validate(ctx context.Context) error {
+func (w *walBlock) Validate(_ context.Context) error {
 	return nil
 }
 
@@ -515,11 +511,7 @@ func (i *blockpackIterator) Next(_ context.Context) (common.ID, *tempopb.Trace, 
 	t := i.traces[i.idx]
 	i.idx++
 
-	trace, err := reconstructTrace(t.id, t.matches)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to reconstruct trace: %w", err)
-	}
-
+	trace := reconstructTrace(t.id, t.matches)
 	return t.id, trace, nil
 }
 
@@ -529,7 +521,7 @@ func (i *blockpackIterator) Close() {}
 // emptyIterator is used when there's no data
 type emptyIterator struct{}
 
-func (i *emptyIterator) Next(ctx context.Context) (common.ID, *tempopb.Trace, error) {
+func (i *emptyIterator) Next(_ context.Context) (common.ID, *tempopb.Trace, error) {
 	return nil, nil, io.EOF
 }
 

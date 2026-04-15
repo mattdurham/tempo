@@ -29,6 +29,12 @@ import (
 // Blocks larger than 512 MB indicate a corrupt or malformed backend response.
 const maxBlobSize = 512 << 20 // 512 MB
 
+const (
+	attrPrefixSpanDot     = "span."
+	attrPrefixSpanColon   = "span:"
+	attrPrefixResourceDot = "resource."
+)
+
 // metricsOpRe extracts the metric function name from a TraceQL metrics query.
 // For example: "{}|rate()" → "rate", "{...}|count_over_time() by (x)" → "count_over_time".
 var metricsOpRe = regexp.MustCompile(`\|(\w+)\(`)
@@ -202,12 +208,13 @@ func (b *blockpackBlock) newReader() (*blockpack.Reader, error) {
 }
 
 // executeQuery creates a reader and executes a TraceQL query, returning all matching spans.
-func (b *blockpackBlock) executeQuery(query string, opts blockpack.QueryOptions) ([]blockpack.SpanMatch, blockpack.QueryStats, error) {
+func (b *blockpackBlock) executeQuery(query string, opts blockpack.QueryOptions) ([]blockpack.SpanMatch, error) {
 	r, err := b.newReader()
 	if err != nil {
-		return nil, blockpack.QueryStats{}, fmt.Errorf("failed to create blockpack reader: %w", err)
+		return nil, fmt.Errorf("failed to create blockpack reader: %w", err)
 	}
-	return blockpack.QueryTraceQL(r, query, opts)
+	matches, _, err := blockpack.QueryTraceQL(r, query, opts)
+	return matches, err
 }
 
 // BlockMeta returns the block metadata
@@ -324,24 +331,20 @@ func (b *blockpackBlock) FindTraceByID(_ context.Context, id common.ID, _ common
 		return nil, nil
 	}
 
-	trace, err := reconstructTrace(id, matches)
-	if err != nil {
-		return nil, fmt.Errorf("failed to reconstruct trace: %w", err)
-	}
-
+	trace := reconstructTrace(id, matches)
 	return &tempopb.TraceByIDResponse{Trace: trace}, nil
 }
 
 // Search performs a search across the blockpack block
 // Uses blockpack's query engine for tag/duration filtering
-func (b *blockpackBlock) Search(ctx context.Context, req *tempopb.SearchRequest,
+func (b *blockpackBlock) Search(_ context.Context, req *tempopb.SearchRequest,
 	_ common.SearchOptions,
 ) (*tempopb.SearchResponse, error) {
 	// Build TraceQL query from SearchRequest
 	query := buildSearchQuery(req)
 
 	// Execute TraceQL query using public API
-	matches, _, err := b.executeQuery(query, blockpack.QueryOptions{
+	matches, err := b.executeQuery(query, blockpack.QueryOptions{
 		Limit: int(req.Limit),
 	})
 	if err != nil {
@@ -389,14 +392,14 @@ func (b *blockpackBlock) SearchTags(_ context.Context, scope traceql.AttributeSc
 
 // SearchTagValues implements the Searcher interface
 // Extracts unique values for a given tag
-func (b *blockpackBlock) SearchTagValues(ctx context.Context, tag string, cb common.TagValuesCallback, _ common.MetricsCallback, _ common.SearchOptions) error {
+func (b *blockpackBlock) SearchTagValues(_ context.Context, tag string, cb common.TagValuesCallback, _ common.MetricsCallback, _ common.SearchOptions) error {
 	// Use empty TraceQL query to match all spans, then extract tag values
 	// Tag names like "service.name" become column names like "resource.service.name"
 	colName := tagToColumnName(tag)
 	query := "{}" // Match all spans
 
 	// Execute TraceQL query using public API
-	matches, _, err := b.executeQuery(query, blockpack.QueryOptions{})
+	matches, err := b.executeQuery(query, blockpack.QueryOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to execute query: %w", err)
 	}
@@ -417,14 +420,14 @@ func (b *blockpackBlock) SearchTagValues(ctx context.Context, tag string, cb com
 }
 
 // SearchTagValuesV2 implements the Searcher interface
-func (b *blockpackBlock) SearchTagValuesV2(ctx context.Context, tag traceql.Attribute, cb common.TagValuesCallbackV2, _ common.MetricsCallback, _ common.SearchOptions) error {
+func (b *blockpackBlock) SearchTagValuesV2(_ context.Context, tag traceql.Attribute, cb common.TagValuesCallbackV2, _ common.MetricsCallback, _ common.SearchOptions) error {
 	// Convert traceql.Attribute to column name
 	colName := tagToColumnName(tag.Name)
 	// Use match-all TraceQL query
 	query := "{}"
 
 	// Execute TraceQL query using public API
-	matches, _, err := b.executeQuery(query, blockpack.QueryOptions{})
+	matches, err := b.executeQuery(query, blockpack.QueryOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to execute query: %w", err)
 	}
@@ -821,15 +824,15 @@ func (s *blockpackSpan) AllAttributesFunc(cb func(traceql.Attribute, traceql.Sta
 }
 
 // Structural methods are not supported by blockpack (no nested-set indices stored).
-func (s *blockpackSpan) SiblingOf(lhs, rhs []traceql.Span, falseForAll, union bool, buffer []traceql.Span) []traceql.Span {
+func (s *blockpackSpan) SiblingOf(_, _ []traceql.Span, _, _ bool, _ []traceql.Span) []traceql.Span {
 	return nil
 }
 
-func (s *blockpackSpan) DescendantOf(lhs, rhs []traceql.Span, falseForAll, invert, union bool, buffer []traceql.Span) []traceql.Span {
+func (s *blockpackSpan) DescendantOf(_, _ []traceql.Span, _, _, _ bool, _ []traceql.Span) []traceql.Span {
 	return nil
 }
 
-func (s *blockpackSpan) ChildOf(lhs, rhs []traceql.Span, falseForAll, invert, union bool, buffer []traceql.Span) []traceql.Span {
+func (s *blockpackSpan) ChildOf(_, _ []traceql.Span, _, _, _ bool, _ []traceql.Span) []traceql.Span {
 	return nil
 }
 
@@ -891,7 +894,7 @@ func (b *blockpackBlock) FetchTagValues(ctx context.Context, req traceql.FetchTa
 	query := conditionsToTraceQL(req.Conditions, true) // Use AND for multiple conditions
 
 	// Execute TraceQL query using public API
-	matches, _, err := b.executeQuery(query, blockpack.QueryOptions{})
+	matches, err := b.executeQuery(query, blockpack.QueryOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to execute query: %w", err)
 	}
@@ -921,13 +924,13 @@ func (b *blockpackBlock) FetchTagValues(ctx context.Context, req traceql.FetchTa
 }
 
 // FetchTagNames implements the Searcher interface
-func (b *blockpackBlock) FetchTagNames(ctx context.Context, req traceql.FetchTagsRequest, cb traceql.FetchTagsCallback, mcb common.MetricsCallback, opts common.SearchOptions) error {
+func (b *blockpackBlock) FetchTagNames(ctx context.Context, req traceql.FetchTagsRequest, cb traceql.FetchTagsCallback, _ common.MetricsCallback, _ common.SearchOptions) error {
 	// If conditions are specified, execute query to filter spans first
 	if len(req.Conditions) > 0 {
 		query := conditionsToTraceQL(req.Conditions, true)
 
 		// Execute TraceQL query using public API
-		matches, _, err := b.executeQuery(query, blockpack.QueryOptions{})
+		matches, err := b.executeQuery(query, blockpack.QueryOptions{})
 		if err != nil {
 			return fmt.Errorf("failed to execute query: %w", err)
 		}
@@ -1200,7 +1203,7 @@ func (p *bytesReaderProvider) Size() (int64, error) {
 	return int64(len(p.data)), nil
 }
 
-func (p *bytesReaderProvider) ReadAt(b []byte, off int64, dataType blockpack.DataType) (int, error) {
+func (p *bytesReaderProvider) ReadAt(b []byte, off int64, _ blockpack.DataType) (int, error) {
 	// dataType is a hint for caching optimization - we ignore it for in-memory data
 	if off < 0 || off >= int64(len(p.data)) {
 		return 0, io.EOF
@@ -1213,63 +1216,6 @@ func (p *bytesReaderProvider) ReadAt(b []byte, off int64, dataType blockpack.Dat
 }
 
 func (p *bytesReaderProvider) Delete() error { return nil }
-
-// rowFieldsProvider implements blockpack.SpanFieldsProvider for a single row within a Block.
-// It mirrors modulesSpanFieldsAdapter (internal to blockpack) but is safe to construct
-// from outside the package since it works via the exported Column accessors.
-type rowFieldsProvider struct {
-	block  *blockpack.Block
-	rowIdx int
-}
-
-func (p *rowFieldsProvider) GetField(name string) (any, bool) {
-	col := p.block.GetColumn(name)
-	if col == nil {
-		return nil, false
-	}
-	return columnValue(col, p.rowIdx)
-}
-
-func (p *rowFieldsProvider) IterateFields(fn func(name string, value any) bool) {
-	seen := make(map[string]struct{})
-	for key, col := range p.block.Columns() {
-		if _, already := seen[key.Name]; already {
-			continue
-		}
-		v, ok := columnValue(col, p.rowIdx)
-		if !ok {
-			continue
-		}
-		seen[key.Name] = struct{}{}
-		if !fn(key.Name, v) {
-			return
-		}
-	}
-}
-
-// columnValue extracts the typed value from a blockpack column at rowIdx.
-// Each column has exactly one type populated, so we try each accessor in order.
-func columnValue(col *blockpack.Column, rowIdx int) (any, bool) {
-	if v, ok := col.BytesValue(rowIdx); ok {
-		return v, true
-	}
-	if v, ok := col.StringValue(rowIdx); ok {
-		return v, true
-	}
-	if v, ok := col.Uint64Value(rowIdx); ok {
-		return v, true
-	}
-	if v, ok := col.Int64Value(rowIdx); ok {
-		return v, true
-	}
-	if v, ok := col.Float64Value(rowIdx); ok {
-		return v, true
-	}
-	if v, ok := col.BoolValue(rowIdx); ok {
-		return v, true
-	}
-	return nil, false
-}
 
 // blockpackValueToAnyValue converts a blockpack field value to an OTLP AnyValue.
 // Returns nil for unrecognised types so callers can skip unsupported values.
@@ -1293,7 +1239,7 @@ func blockpackValueToAnyValue(value any) *tempocommon.AnyValue {
 
 // reconstructTrace rebuilds a tempopb.Trace from blockpack span matches
 // Groups spans by resource and scope to create proper OTLP hierarchy
-func reconstructTrace(traceID common.ID, matches []blockpack.SpanMatch) (*tempopb.Trace, error) {
+func reconstructTrace(traceID common.ID, matches []blockpack.SpanMatch) *tempopb.Trace {
 	// Group spans by resource, then by scope
 	type spanWithAttrs struct {
 		span          *tempotrace.Span
@@ -1374,13 +1320,13 @@ func reconstructTrace(traceID common.ID, matches []blockpack.SpanMatch) (*tempop
 				}
 			default:
 				// span.* → span attributes; resource.* → resource attributes (service.name handled above)
-				if strings.HasPrefix(name, "span.") {
-					key := strings.TrimPrefix(name, "span.")
+				if strings.HasPrefix(name, attrPrefixSpanDot) {
+					key := strings.TrimPrefix(name, attrPrefixSpanDot)
 					if av := blockpackValueToAnyValue(value); av != nil {
 						span.Attributes = append(span.Attributes, &tempocommon.KeyValue{Key: key, Value: av})
 					}
-				} else if strings.HasPrefix(name, "resource.") {
-					key := strings.TrimPrefix(name, "resource.")
+				} else if strings.HasPrefix(name, attrPrefixResourceDot) {
+					key := strings.TrimPrefix(name, attrPrefixResourceDot)
 					if av := blockpackValueToAnyValue(value); av != nil {
 						resourceAttrs = append(resourceAttrs, &tempocommon.KeyValue{Key: key, Value: av})
 					}
@@ -1470,7 +1416,7 @@ func reconstructTrace(traceID common.ID, matches []blockpack.SpanMatch) (*tempop
 
 	return &tempopb.Trace{
 		ResourceSpans: resourceSpans,
-	}, nil
+	}
 }
 
 // columnNameToTag converts a blockpack column name to a tag name based on scope
@@ -1485,23 +1431,23 @@ func columnNameToTag(colName string, scope traceql.AttributeScope) string {
 
 	switch scope {
 	case traceql.AttributeScopeSpan:
-		if len(colName) > 5 && colName[:5] == "span." {
-			return colName[5:] // Remove "span." prefix
+		if len(colName) > len(attrPrefixSpanDot) && colName[:len(attrPrefixSpanDot)] == attrPrefixSpanDot {
+			return colName[len(attrPrefixSpanDot):] // Remove "span." prefix
 		}
 		// Also include intrinsic span fields
-		if len(colName) > 5 && colName[:5] == "span:" {
+		if len(colName) > len(attrPrefixSpanColon) && colName[:len(attrPrefixSpanColon)] == attrPrefixSpanColon {
 			return colName // Keep full name for intrinsics
 		}
 	case traceql.AttributeScopeResource:
-		if len(colName) > 9 && colName[:9] == "resource." {
-			return colName[9:] // Remove "resource." prefix
+		if len(colName) > len(attrPrefixResourceDot) && colName[:len(attrPrefixResourceDot)] == attrPrefixResourceDot {
+			return colName[len(attrPrefixResourceDot):] // Remove "resource." prefix
 		}
 	case traceql.AttributeScopeNone:
 		// Return all attributes
-		if len(colName) > 5 && (colName[:5] == "span." || colName[:5] == "span:") {
+		if len(colName) > len(attrPrefixSpanDot) && (colName[:len(attrPrefixSpanDot)] == attrPrefixSpanDot || colName[:len(attrPrefixSpanColon)] == attrPrefixSpanColon) {
 			return colName
 		}
-		if len(colName) > 9 && colName[:9] == "resource." {
+		if len(colName) > len(attrPrefixResourceDot) && colName[:len(attrPrefixResourceDot)] == attrPrefixResourceDot {
 			return colName
 		}
 		if len(colName) > 6 && colName[:6] == "scope." {
@@ -1518,14 +1464,14 @@ func columnNameToTag(colName string, scope traceql.AttributeScope) string {
 func tagToColumnName(tag string) string {
 	// Common resource attributes
 	if tag == "service.name" || tag == "service.namespace" || tag == "deployment.environment" {
-		return "resource." + tag
+		return attrPrefixResourceDot + tag
 	}
 
 	// If it already has a prefix, return as-is
-	if len(tag) > 5 && (tag[:5] == "span." || tag[:5] == "span:") {
+	if len(tag) > len(attrPrefixSpanDot) && (tag[:len(attrPrefixSpanDot)] == attrPrefixSpanDot || tag[:len(attrPrefixSpanColon)] == attrPrefixSpanColon) {
 		return tag
 	}
-	if len(tag) > 9 && tag[:9] == "resource." {
+	if len(tag) > len(attrPrefixResourceDot) && tag[:len(attrPrefixResourceDot)] == attrPrefixResourceDot {
 		return tag
 	}
 	if len(tag) > 6 && tag[:6] == "scope." {
@@ -1533,7 +1479,7 @@ func tagToColumnName(tag string) string {
 	}
 
 	// Default to span attribute with colon (blockpack format)
-	return "span:" + tag
+	return attrPrefixSpanColon + tag
 }
 
 // attributeToColumnName converts a traceql.Attribute to a blockpack column name.
@@ -1631,10 +1577,10 @@ func toStaticType(val interface{}) traceql.Static {
 // e.g., "span:name" -> "name", "resource.service.name" -> "resource.service.name"
 func columnNameToTraceQLAttr(tag string) string {
 	// If already a column name with colon, convert to TraceQL format
-	if strings.HasPrefix(tag, "span:") {
-		return strings.TrimPrefix(tag, "span:")
+	if strings.HasPrefix(tag, attrPrefixSpanColon) {
+		return strings.TrimPrefix(tag, attrPrefixSpanColon)
 	}
-	if strings.HasPrefix(tag, "resource.") {
+	if strings.HasPrefix(tag, attrPrefixResourceDot) {
 		return tag // Keep resource attributes as-is
 	}
 	// Otherwise assume it's already in TraceQL format

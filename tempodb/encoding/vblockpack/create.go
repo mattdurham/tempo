@@ -2,6 +2,7 @@ package vblockpack
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -19,7 +20,7 @@ import (
 // When cfg.Blockpack.VectorDimension > 0, the writer builds a VectorIndex
 // section in the V5 footer for any __embedding__ columns present in the data.
 func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.BlockMeta,
-	i common.Iterator, r backend.Reader, to backend.Writer,
+	i common.Iterator, _ backend.Reader, to backend.Writer,
 ) (*backend.BlockMeta, error) {
 	// Initialize multi-tier cache on first block creation (no-op if already initialized).
 	ConfigureCache(
@@ -74,7 +75,7 @@ func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.Blo
 
 	var (
 		traceCount int
-		minStart   uint64 = ^uint64(0)
+		minStart   = ^uint64(0)
 		maxStart   uint64
 	)
 
@@ -84,7 +85,7 @@ func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.Blo
 		}
 
 		id, tr, nextErr := i.Next(ctx)
-		if nextErr == io.EOF || (tr == nil && nextErr == nil) {
+		if errors.Is(nextErr, io.EOF) || (tr == nil && nextErr == nil) {
 			break
 		}
 		if nextErr != nil {
@@ -176,7 +177,7 @@ func setBlockTimeRange(meta *backend.BlockMeta, data []byte) {
 
 	// Fallback: older format files store span:start in block columns and populate
 	// BlockMeta.MinStart / BlockMeta.MaxStart during compaction.
-	var minStart uint64 = ^uint64(0)
+	minStart := ^uint64(0)
 	var maxEnd uint64
 	for i := range r.BlockCount() {
 		bm := r.BlockMeta(i)

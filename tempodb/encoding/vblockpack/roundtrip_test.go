@@ -25,8 +25,7 @@ func TestWALToBackend_Iterator(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	walMeta := backend.NewBlockMeta("test-tenant", uuid.New(), VersionString)
-	wal, err := createWALBlock(walMeta, tmpDir, 0)
-	require.NoError(t, err)
+	wal := createWALBlock(walMeta, tmpDir, 0)
 
 	// Write a trace into the WAL block.
 	now := uint64(time.Now().UnixNano())
@@ -70,8 +69,7 @@ func TestWALToBackend_Iterator(t *testing.T) {
 	w := backend.NewWriter(rawW)
 
 	wal2Meta := backend.NewBlockMeta("test-tenant", uuid.New(), VersionString)
-	wal2, err := createWALBlock(wal2Meta, t.TempDir(), 0)
-	require.NoError(t, err)
+	wal2 := createWALBlock(wal2Meta, t.TempDir(), 0)
 	require.NoError(t, wal2.AppendTrace(nil, tr, startSec, startSec+1, false))
 	require.NoError(t, wal2.Flush())
 

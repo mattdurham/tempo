@@ -37,14 +37,14 @@ func (e Encoding) CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta
 }
 
 // CreateWALBlock creates a new WAL block for writing
-func (e Encoding) CreateWALBlock(meta *backend.BlockMeta, filepath, dataEncoding string,
+func (e Encoding) CreateWALBlock(meta *backend.BlockMeta, filepath string, _ string,
 	ingestionSlack time.Duration,
 ) (common.WALBlock, error) {
-	return createWALBlock(meta, filepath, ingestionSlack)
+	return createWALBlock(meta, filepath, ingestionSlack), nil
 }
 
 // OpenWALBlock opens an existing WAL block
-func (e Encoding) OpenWALBlock(filename, path string, ingestionSlack, additionalStartSlack time.Duration) (
+func (e Encoding) OpenWALBlock(_ string, _ string, _, _ time.Duration) (
 	common.WALBlock, error, error,
 ) {
 	return nil, fmt.Errorf("not implemented"), nil
@@ -81,8 +81,8 @@ func (e Encoding) CopyBlock(ctx context.Context, meta *backend.BlockMeta, from b
 }
 
 // MigrateBlock migrates a block from another format to blockpack
-func (e Encoding) MigrateBlock(ctx context.Context, fromMeta, toMeta *backend.BlockMeta, from backend.Reader,
-	to backend.Writer,
+func (e Encoding) MigrateBlock(_ context.Context, _, _ *backend.BlockMeta, _ backend.Reader,
+	_ backend.Writer,
 ) error {
 	return fmt.Errorf("not implemented")
 }

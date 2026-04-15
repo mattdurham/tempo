@@ -22,7 +22,7 @@ type mockIterator struct {
 	index  int
 }
 
-func (m *mockIterator) Next(ctx context.Context) (common.ID, *tempopb.Trace, error) {
+func (m *mockIterator) Next(_ context.Context) (common.ID, *tempopb.Trace, error) {
 	if m.index >= len(m.traces) {
 		return nil, nil, io.EOF
 	}
