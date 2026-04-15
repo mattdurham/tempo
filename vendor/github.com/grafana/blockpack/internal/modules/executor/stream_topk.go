@@ -5,8 +5,9 @@ package executor
 import (
 	"cmp"
 	"container/heap"
+	"context"
 	"fmt"
-	"maps"
+	"log/slog"
 	"slices"
 
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
@@ -43,7 +44,15 @@ func (h *topKHeap) Less(i, j int) bool {
 	return h.entries[i].ts > h.entries[j].ts // max-heap: newest at root
 }
 
-func (h *topKHeap) Push(x any) { h.entries = append(h.entries, x.(topKEntry)) }
+func (h *topKHeap) Push(x any) {
+	entry, ok := x.(topKEntry)
+	if !ok {
+		slog.Error("topKHeap.Push: unexpected type", "type", fmt.Sprintf("%T", x))
+		return
+	}
+	h.entries = append(h.entries, entry)
+}
+
 func (h *topKHeap) Pop() any {
 	n := len(h.entries)
 	x := h.entries[n-1]
@@ -144,9 +153,12 @@ func topKScanRowsFromIntrinsic(
 	}
 }
 
-// topKScanBlocks iterates selected blocks, fetches them lazily, and fills buf.
-// Returns (fetchedGroups, fetchedBlocks, bytesRead, error): fetchedGroups counts ReadGroup
-// calls (IOOps); fetchedBlocks counts individual blocks fetched.
+// topKScanBlocks iterates selected blocks concurrently via blockGroupPipeline and fills buf.
+// Returns (fetchedGroups, processedBlocks, bytesRead, error): fetchedGroups counts ReadGroup
+// calls (IOOps); processedBlocks counts individual blocks that passed the topKSkipBlock guard.
+//
+// SPEC-STREAM-11: I/O is concurrent across defaultPipelineWorkers goroutines; parse and heap
+// updates are sequential within processGroup callbacks, so buf requires no synchronization.
 func topKScanBlocks(
 	r *modules_reader.Reader,
 	program *vm.Program,
@@ -156,99 +168,87 @@ func topKScanBlocks(
 	plan *queryplanner.Plan,
 	buf *topKHeap,
 	groups []shared.CoalescedRead,
-	blockToGroup map[int]int,
 	backward bool,
 ) (int, int, int64, error) {
-	fetched := make(map[int][]byte, len(plan.SelectedBlocks))
-	fetchedGroupsSeen := make(map[int]struct{}, len(groups))
-	skippedBlocks := make(map[int]struct{}, len(plan.SelectedBlocks))
-	fetchedGroups := 0
-	fetchCount := 0
-	var bytesRead int64
-
-	for _, blockIdx := range plan.SelectedBlocks {
-		meta := r.BlockMeta(blockIdx)
-		if topKSkipBlock(buf, opts.Limit, backward, meta) {
-			gi2, ok2 := blockToGroup[blockIdx]
-			if _, seen := fetchedGroupsSeen[gi2]; ok2 && seen {
-				delete(fetched, blockIdx)
-			} else {
-				skippedBlocks[blockIdx] = struct{}{}
-			}
-			continue
+	// Build group→selected-blocks index in plan.SelectedBlocks order within each group.
+	// This ensures processGroup iterates only the ~N/G blocks relevant to its group,
+	// matching the O(N) total-work guarantee of the scanBlocks pipeline path.
+	blockToGroup := make(map[int]int, len(plan.SelectedBlocks))
+	for gi, g := range groups {
+		for _, bi := range g.BlockIDs {
+			blockToGroup[bi] = gi
 		}
-
-		gi, ok := blockToGroup[blockIdx]
+	}
+	groupToBlocks := make([][]int, len(groups))
+	for _, bi := range plan.SelectedBlocks {
+		gi, ok := blockToGroup[bi]
 		if !ok {
 			continue
 		}
-		if _, seen := fetchedGroupsSeen[gi]; !seen {
-			groupRaw, fetchErr := r.ReadGroup(groups[gi])
-			if fetchErr != nil {
-				return fetchedGroups, fetchCount, bytesRead, fmt.Errorf("ReadGroup: %w", fetchErr)
-			}
-			maps.Copy(fetched, groupRaw)
-			// Count bytes for entire fetched group — ReadGroup reads all blocks in the group.
-			for _, bi := range groups[gi].BlockIDs {
-				if _, skip := skippedBlocks[bi]; skip {
-					delete(fetched, bi)
-				}
-				bytesRead += int64(r.BlockMeta(bi).Length) //nolint:gosec // Length is block size, safe to cast
-			}
-			fetchedGroups++
-			fetchCount += len(groups[gi].BlockIDs)
-			fetchedGroupsSeen[gi] = struct{}{}
-		}
-
-		raw, rawOK := fetched[blockIdx]
-		if !rawOK {
-			continue
-		}
-		delete(fetched, blockIdx)
-
-		r.ResetInternStrings()
-		bwb, parseErr := r.ParseBlockFromBytes(raw, wantColumns, meta)
-		if parseErr != nil {
-			return fetchedGroups, fetchCount, bytesRead, fmt.Errorf(
-				"ParseBlockFromBytes block %d: %w",
-				blockIdx,
-				parseErr,
-			)
-		}
-
-		provider := newBlockColumnProvider(bwb.Block)
-		rowSet, evalErr := program.ColumnPredicate(provider)
-		if evalErr != nil {
-			return fetchedGroups, fetchCount, bytesRead, fmt.Errorf("ColumnPredicate block %d: %w", blockIdx, evalErr)
-		}
-
-		if rowSet.Size() == 0 {
-			continue
-		}
-
-		// Second pass: decode secondPassCols; the block is stored in the heap and
-		// accessed by the caller when delivering results.
-		if wantColumns != nil {
-			bwb, parseErr = r.ParseBlockFromBytes(bwb.RawBytes, secondPassCols, meta)
-			if parseErr != nil {
-				return fetchedGroups, fetchCount, bytesRead, fmt.Errorf(
-					"ParseBlockFromBytes (full) block %d: %w",
-					blockIdx,
-					parseErr,
-				)
-			}
-		}
-
-		tsCol := bwb.Block.GetColumn(opts.TimestampColumn)
-		if tsCol == nil {
-			// Timestamp column absent from block (intrinsic-only format): read from intrinsic section.
-			topKScanRowsFromIntrinsic(buf, opts.Limit, backward, r, bwb.Block, blockIdx,
-				opts.TimestampColumn, opts.TimeRange, rowSet.ToSlice())
-		} else {
-			topKScanRows(buf, opts.Limit, backward, bwb.Block, blockIdx, tsCol, opts.TimeRange, rowSet.ToSlice())
-		}
+		groupToBlocks[gi] = append(groupToBlocks[gi], bi)
 	}
-	return fetchedGroups, fetchCount, bytesRead, nil
+
+	// processedBlocks is mutated only inside processGroup, which blockGroupPipeline calls
+	// sequentially — no synchronization required.
+	var processedBlocks int
+
+	processGroup := func(groupIdx int, groupRaw map[int][]byte) error {
+		for _, blockIdx := range groupToBlocks[groupIdx] {
+			raw, ok := groupRaw[blockIdx]
+			if !ok {
+				continue
+			}
+			meta := r.BlockMeta(blockIdx)
+			if topKSkipBlock(buf, opts.Limit, backward, meta) {
+				continue
+			}
+			processedBlocks++
+			// Release raw bytes early; bwb.RawBytes below retains the backing array
+			// through the second parse, allowing GC to reclaim before the next group.
+			delete(groupRaw, blockIdx)
+
+			r.ResetInternStrings()
+			bwb, parseErr := r.ParseBlockFromBytes(raw, wantColumns, meta)
+			if parseErr != nil {
+				return fmt.Errorf("ParseBlockFromBytes block %d: %w", blockIdx, parseErr)
+			}
+
+			provider := newBlockColumnProvider(bwb.Block)
+			rowSet, evalErr := program.ColumnPredicate(provider)
+			if evalErr != nil {
+				return fmt.Errorf("ColumnPredicate block %d: %w", blockIdx, evalErr)
+			}
+			if rowSet.Size() == 0 {
+				continue
+			}
+
+			// Second pass: decode result columns for blocks with at least one match.
+			// NOTE-018: secondPassCols is pre-computed by computeColumnFilters.
+			if wantColumns != nil {
+				bwb, parseErr = r.ParseBlockFromBytes(bwb.RawBytes, secondPassCols, meta)
+				if parseErr != nil {
+					return fmt.Errorf("ParseBlockFromBytes (second pass) block %d: %w", blockIdx, parseErr)
+				}
+			}
+
+			tsCol := bwb.Block.GetColumn(opts.TimestampColumn)
+			if tsCol == nil {
+				// Timestamp column absent from block (intrinsic-only format): read from intrinsic section.
+				topKScanRowsFromIntrinsic(buf, opts.Limit, backward, r, bwb.Block, blockIdx,
+					opts.TimestampColumn, opts.TimeRange, rowSet.ToSlice())
+			} else {
+				topKScanRows(buf, opts.Limit, backward, bwb.Block, blockIdx, tsCol, opts.TimeRange, rowSet.ToSlice())
+			}
+		}
+		return nil
+	}
+
+	// SPEC-STREAM-11: concurrent I/O via blockGroupPipeline; processGroup called sequentially.
+	// TODO: propagate caller context (NOTE-058: Collect does not yet accept context.Context).
+	fetchedGroups, _, bytesRead, err := blockGroupPipeline(
+		context.Background(), r, groups, defaultPipelineWorkers, processGroup,
+	)
+	return fetchedGroups, processedBlocks, bytesRead, err
 }
 
 // topKDeliver sorts the heap contents and returns them in direction order.

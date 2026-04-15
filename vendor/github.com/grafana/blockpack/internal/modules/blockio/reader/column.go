@@ -247,7 +247,7 @@ func readColumnEncoding(data []byte, spanCount int, colType shared.ColumnType, c
 		return nil, fmt.Errorf("column encoding: data too short (%d bytes)", len(data))
 	}
 
-	// NOTE-010 (shared/NOTES.md): ColumnTypeVectorF32 uses a custom wire format where
+	// NOTE-011 (shared/NOTES.md): ColumnTypeVectorF32 uses a custom wire format where
 	// only the float data is zstd-compressed. Dispatch by colType so decodeVectorF32 can
 	// handle the mixed compressed/uncompressed format directly.
 	if colType == shared.ColumnTypeVectorF32 {
@@ -1229,7 +1229,7 @@ func decodeDeltaDictionary(data []byte, kind uint8, spanCount int, ctx *decodeCt
 //
 // Returns a Column with BytesInline populated: BytesInline[i] holds the raw LE float32 bytes
 // for present row i (length = dim*4). BytesInline[i] is nil for absent rows.
-// NOTE-010 (shared/NOTES.md): ColumnTypeVectorF32 encoding — only float data is zstd-compressed.
+// NOTE-011 (shared/NOTES.md): ColumnTypeVectorF32 encoding — only float data is zstd-compressed.
 func decodeVectorF32(data []byte, spanCount int, ctx *decodeCtx) (*Column, error) {
 	// Header: enc_version[1] + kind[1] + dim[2] + row_count[4] + rle_len[4] = 12 bytes minimum.
 	if len(data) < vf32HdrSize {
@@ -1257,7 +1257,17 @@ func decodeVectorF32(data []byte, spanCount int, ctx *decodeCtx) (*Column, error
 		return nil, fmt.Errorf("vectorF32: presence RLE: %w", err)
 	}
 
-	// Read length-prefixed zstd float data.
+	// SPEC-ROOT-012: compute needed size before decompression to prevent decompression bomb.
+	presentCount := shared.CountPresent(bitset, spanCount)
+	needed := int64(presentCount) * int64(dim) * 4
+	if needed > shared.MaxBlockSize {
+		return nil, fmt.Errorf(
+			"vectorF32: float data would exceed MaxBlockSize: needed=%d, dim=%d, presentCount=%d",
+			needed, dim, presentCount,
+		)
+	}
+
+	// Read length-prefixed zstd float data (size already validated above).
 	// Use ctx.scratch if set (pooled caller), else use a local scratch buffer.
 	scratchPtr := ctx.scratch
 	var localScratch []byte
@@ -1268,11 +1278,7 @@ func decodeVectorF32(data []byte, spanCount int, ctx *decodeCtx) (*Column, error
 	if err != nil {
 		return nil, fmt.Errorf("vectorF32: float data: %w", err)
 	}
-
-	presentCount := shared.CountPresent(bitset, spanCount)
-	needed := int64(presentCount) * int64(dim) * 4
-	// SPEC-ROOT-012: decompression-bomb and overflow guard — reject oversized vector float data.
-	if needed > shared.MaxBlockSize || len(floatBytes) < int(needed) {
+	if len(floatBytes) < int(needed) {
 		return nil, fmt.Errorf("vectorF32: float data too short: need %d bytes, have %d", needed, len(floatBytes))
 	}
 

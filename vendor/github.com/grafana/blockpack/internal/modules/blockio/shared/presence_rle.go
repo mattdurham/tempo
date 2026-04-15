@@ -8,7 +8,11 @@ import (
 	"math/bits"
 )
 
-const presenceRLEVersion uint8 = 1
+const (
+	presenceRLEVersion    uint8 = 1
+	presenceRLEHeaderSize int   = 5 // version[1] + run_count[4]
+	presenceRLERunSize    int   = 8 // run_length[4] + run_value[4]
+)
 
 // EncodePresenceRLE encodes a presence bitset (ceil(nBits/8) bytes) to rle_data bytes.
 // Wire format: version uint8, run_count uint32 LE, then run_count × {length uint32 LE, value uint32 LE}.
@@ -52,16 +56,16 @@ func EncodePresenceRLE(present []byte, nBits int) ([]byte, error) {
 		runs = append(runs, run{length: curLen, value: curVal})
 	}
 
-	// Encode: 1 (version) + 4 (run_count) + len(runs)*8
-	buf := make([]byte, 1+4+len(runs)*8)
+	// Encode: presenceRLEHeaderSize + len(runs)*presenceRLERunSize
+	buf := make([]byte, presenceRLEHeaderSize+len(runs)*presenceRLERunSize)
 	buf[0] = presenceRLEVersion
 	binary.LittleEndian.PutUint32(buf[1:], uint32(len(runs))) //nolint:gosec // safe: run count bounded by MaxSpans
 
-	off := 5
+	off := presenceRLEHeaderSize
 	for _, r := range runs {
 		binary.LittleEndian.PutUint32(buf[off:], r.length)
 		binary.LittleEndian.PutUint32(buf[off+4:], r.value)
-		off += 8
+		off += presenceRLERunSize
 	}
 
 	return buf, nil
@@ -73,7 +77,7 @@ func DecodePresenceRLE(data []byte, nBits int) ([]byte, error) {
 		return nil, fmt.Errorf("presence_rle: nBits must be non-negative, got %d", nBits)
 	}
 
-	if len(data) < 5 {
+	if len(data) < presenceRLEHeaderSize {
 		return nil, fmt.Errorf("presence_rle: data too short: %d bytes", len(data))
 	}
 
@@ -81,8 +85,8 @@ func DecodePresenceRLE(data []byte, nBits int) ([]byte, error) {
 		return nil, fmt.Errorf("presence_rle: unsupported version %d", data[0])
 	}
 
-	runCount := binary.LittleEndian.Uint32(data[1:5])
-	expectedLen := 5 + int(runCount)*8
+	runCount := binary.LittleEndian.Uint32(data[1:presenceRLEHeaderSize])
+	expectedLen := presenceRLEHeaderSize + int(runCount)*presenceRLERunSize
 	if len(data) < expectedLen {
 		return nil, fmt.Errorf(
 			"presence_rle: data too short for %d runs: need %d bytes, got %d",
@@ -94,11 +98,11 @@ func DecodePresenceRLE(data []byte, nBits int) ([]byte, error) {
 	out := make([]byte, byteLen)
 
 	bitIdx := 0
-	off := 5
+	off := presenceRLEHeaderSize
 	for range runCount {
 		runLen := int(binary.LittleEndian.Uint32(data[off:]))
 		runVal := binary.LittleEndian.Uint32(data[off+4:])
-		off += 8
+		off += presenceRLERunSize
 
 		if runVal == 1 {
 			end := min(bitIdx+runLen, nBits)

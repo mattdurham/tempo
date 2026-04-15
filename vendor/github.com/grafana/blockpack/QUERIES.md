@@ -460,7 +460,7 @@ comparison is the meaningful metric for format efficiency.
 
 ---
 
-## Post-Compaction Benchmark (2026-04-15)
+## Post-Compaction Benchmark (2026-04-15, r62)
 
 **Change:** `compaction_window` updated from `5m → 15m` in both backend-scheduler and backend-worker  
 **Block counts (total blocklist):** blockpack `11638` = **493 blocks**, parquet `6121` = **865 blocks**  
@@ -486,3 +486,33 @@ comparison is the meaningful metric for format efficiency.
 - **M3/M4/M5/M7/M8 (selective attribute filters):** blockpack 3.7–5.5× slower — parquet's column-selective I/O has a large advantage when the filter column is small relative to the full block
 - **M9/M10 (compound filters + histogram):** blockpack 2.1–2.3× slower — predicate pushdown partially closes the gap
 - **Root cause of remaining gap:** blockpack reads entire blocks (single-I/O invariant); parquet reads only the queried columns. On selective queries, parquet fetches ~10–50× fewer bytes per block.
+
+---
+
+## r63 Benchmark — V14 Lazy Decompression + Pool Optimization (2026-04-15)
+
+**Image:** `mrdgrafana/tempo:blockpack-7d21f9441-r63`  
+**Key changes vs r62:** V14 lazy decompression (non-queried columns not decompressed until first access), snappy decode buffer pool for per-page allocations, objectcache fixes  
+**Block counts:** same as above (bp=493, pq=865)  
+**Method:** 3 warm-up passes, then 1 measured pass. 6h window, step=60s.
+
+| Query | TraceQL | bp (ms) | pq (ms) | bp/pq | vs r62 bp/pq |
+|-------|---------|---------|---------|-------|--------------|
+| M1  | `{} \| rate()` | 499 | 530 | **0.9×** | was 0.7× |
+| M2  | `{} \| count_over_time()` | 408 | 488 | **0.8×** | was 0.8× |
+| M3  | `{span.http.method="GET"} \| rate()` | 1269 | 386 | 3.3× | was 4.7× ↑ |
+| M4  | `{resource.service.name="CockroachDB"} \| rate()` | 474 | 329 | 1.4× | was 3.9× ↑↑ |
+| M5  | `{status=error} \| rate()` | 788 | 364 | 2.2× | was 3.7× ↑ |
+| M6  | `{} \| histogram_over_time(duration)` | 1691 | 1352 | 1.3× | was 1.6× ↑ |
+| M7  | `{duration > 100ms} \| rate()` | 786 | 440 | 1.8× | was 5.5× ↑↑ |
+| M8  | `{GET\|\|POST} \| rate()` | 1053 | 558 | 1.9× | was 5.0× ↑↑ |
+| M9  | `{CockroachDB && dur>50ms} \| histogram_over_time(duration)` | 660 | 499 | 1.3× | was 2.3× ↑ |
+| M10 | `{(GET\|\|POST) && (err\|\|unset) && CockroachDB} \| rate()` | 966 | 714 | 1.4× | was 2.1× ↑ |
+
+**Key findings:**
+- **All selective queries improved significantly** — lazy decompression means non-queried columns are never decompressed, cutting CPU and memory on selective reads
+- **M4 (service name filter):** 3.9× → 1.4× — biggest improvement; service.name is a resource column so only 1 column decompressed instead of all
+- **M7/M8 (duration/method filters):** 5.5× → 1.8× and 5.0× → 1.9× — large wins; these columns are small relative to full block payload
+- **M5 (status=error):** 3.7× → 2.2× — status is indexed via TOC so gain is partly from skipping column decompression for non-matching blocks
+- **M1/M2 (full-scan):** near-parity with parquet (0.8–0.9×) — lazy decompression adds slight overhead when all columns are needed anyway
+- **Remaining gap (M3, M5, M6, M7, M8):** blockpack still slower because full blocks are fetched from S3 (single-I/O invariant) vs parquet's per-column fetches; lazy decompression removes the CPU overhead but not the I/O volume

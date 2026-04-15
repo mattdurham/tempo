@@ -16,6 +16,8 @@ package executor
 // NOTE: Any changes to this file must be reflected in the corresponding specs.md or NOTES.md.
 
 import (
+	"fmt"
+
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
 	modules_shared "github.com/grafana/blockpack/internal/modules/blockio/shared"
 	"github.com/grafana/blockpack/internal/modules/queryplanner"
@@ -27,14 +29,6 @@ type SpanMatch struct {
 	BlockIdx int      // block index within the file
 	RowIdx   int      // row (span) index within the block
 	TraceID  [16]byte // 16-byte trace ID
-}
-
-// Result is the output of Execute.
-type Result struct {
-	Plan          *queryplanner.Plan // block selection plan (pruning stats)
-	Matches       []SpanMatch        // matching spans
-	BytesRead     int64              // total raw bytes read from the provider
-	BlocksScanned int                // blocks that were actually read and evaluated
 }
 
 // Options controls query execution behavior.
@@ -65,7 +59,7 @@ type Options struct {
 //   - IntrinsicFields-populated rows (range-predicate Case A, Case B): reads from IntrinsicFields.
 //   - Block-populated rows (block-scan path): reads from Block columns, then falls back
 //     to intrinsic section via r when trace identity columns are absent from the Block.
-func SpanMatchFromRow(row MatchedRow, signalType uint8, r *modules_reader.Reader) SpanMatch {
+func SpanMatchFromRow(row MatchedRow, signalType uint8, r *modules_reader.Reader) (SpanMatch, error) {
 	m := SpanMatch{BlockIdx: row.BlockIdx, RowIdx: row.RowIdx}
 
 	traceIDCol := "trace:id"
@@ -88,11 +82,11 @@ func SpanMatchFromRow(row MatchedRow, signalType uint8, r *modules_reader.Reader
 				copy(m.SpanID, b)
 			}
 		}
-		return m
+		return m, nil
 	}
 
 	if row.Block == nil {
-		return m
+		return m, nil
 	}
 
 	// Block-scan path: try to read from decoded Block columns first.
@@ -113,7 +107,10 @@ func SpanMatchFromRow(row MatchedRow, signalType uint8, r *modules_reader.Reader
 			RowIdx:   uint16(row.RowIdx),   //nolint:gosec
 		}
 		idCols := map[string]struct{}{traceIDCol: {}, spanIDCol: {}}
-		fieldMaps := lookupIntrinsicFields(r, []modules_shared.BlockRef{spanRef}, idCols)
+		fieldMaps, intrinsicErr := lookupIntrinsicFields(r, []modules_shared.BlockRef{spanRef}, idCols)
+		if intrinsicErr != nil {
+			return m, fmt.Errorf("SpanMatchFromRow lookupIntrinsicFields: %w", intrinsicErr)
+		}
 		if len(fieldMaps) > 0 && fieldMaps[0] != nil {
 			if v, ok := fieldMaps[0][traceIDCol]; ok {
 				if b, ok := v.([]byte); ok && len(b) == 16 {
@@ -127,7 +124,7 @@ func SpanMatchFromRow(row MatchedRow, signalType uint8, r *modules_reader.Reader
 				}
 			}
 		}
-		return m
+		return m, nil
 	}
 
 	if col := row.Block.GetColumn(spanIDCol); col != nil {
@@ -136,5 +133,5 @@ func SpanMatchFromRow(row MatchedRow, signalType uint8, r *modules_reader.Reader
 			copy(m.SpanID, v)
 		}
 	}
-	return m
+	return m, nil
 }

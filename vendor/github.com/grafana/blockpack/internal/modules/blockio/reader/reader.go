@@ -28,7 +28,7 @@ type footerRaw struct {
 // NOTE-PERF-COMPACT: traceIndexRaw stores the raw trace-index bytes in-place (a sub-slice of the
 // cached compact-index buffer) rather than a pre-built map. scanTraceIndexRaw scans them linearly
 // on each lookup, eliminating O(traceCount) map + []uint16 allocations that were the #1 production
-// allocator (36.27% alloc_objects). Allocation on hit is one small []uint16 per lookup — far cheaper
+// allocator (top alloc_objects site in production profiling). Allocation on hit is one small []uint16 per lookup — far cheaper
 // than materializing every trace's block list at parse time.
 //
 // NOTE-LAZY-TRACE-INDEX: For lean readers, traceIndexRaw is not populated at construction time.
@@ -460,8 +460,7 @@ func (r *Reader) BlocksForRange(colName string, queryValue shared.RangeValueKey)
 // lower boundary ≤ minKey) and the last bucket whose lower boundary ≤ maxKey, then
 // unions all block IDs in between. This correctly includes the bucket containing
 // minKey even when its lower boundary is < minKey.
-// NOTE-011: Used for case-insensitive regex prefix lookups where the query spans a
-// lexicographic range (e.g., all case variants from "DEBUG" to "debug").
+// NOTE-011 (executor/NOTES.md): used for case-insensitive regex prefix lookups (range-index pruning).
 func (r *Reader) BlocksForRangeInterval(
 	colName string, minKey, maxKey shared.RangeValueKey,
 ) ([]int, error) {

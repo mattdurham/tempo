@@ -20,7 +20,7 @@ This document defines the public contracts, input/output semantics, and invarian
 
 ```go
 func Collect(r *modules_reader.Reader, program *vm.Program, opts CollectOptions) ([]MatchedRow, QueryStats, error)
-func SpanMatchFromRow(row MatchedRow, signalType uint8, r *modules_reader.Reader) SpanMatch
+func SpanMatchFromRow(row MatchedRow, signalType uint8, r *modules_reader.Reader) (SpanMatch, error)
 ```
 
 `Collect` is the primary query entry point — it replaces the earlier `Execute` method.
@@ -420,6 +420,75 @@ Back-ref: `internal/modules/executor/stream.go:filterRowSetByIntrinsicNodes`,
 
 ---
 
+## SPEC-STREAM-11: Unified Bounded Sliding-Window Block Pipeline
+*Added: 2026-04-15*
+
+All block-scan paths (scanBlocks, forEachBlockInGroups, ExecuteTraceMetrics,
+ExecuteLogMetrics, topKScanBlocks) use `blockGroupPipeline` for I/O.
+See NOTE-058 for the full caller inventory.
+Back-ref: `internal/modules/executor/stream_topk.go:topKScanBlocks`
+
+**Invariants:**
+- Dispatcher is semaphore-gated: at most `workerCount` groups are dispatched ahead of
+  `nextExpected` at any time. The semaphore token is released only AFTER `processGroup`
+  returns, ensuring the dispatcher cannot enqueue a new group while the current group's
+  data is still held in memory. Therefore the pending reorder map holds at most
+  `workerCount-1` out-of-order groups. Total peak in-memory = at most `workerCount`
+  groups (`workerCount-1` pending + 1 being processed in `processGroup`).
+  Back-ref: `block_group_pipeline.go:blockGroupPipeline` (sem channel)
+- At most `workerCount` (constant `defaultPipelineWorkers = 8`; see NOTE-058 for the
+  I/O-latency-hiding rationale and why GOMEMLIMIT scaling was rejected) coalesced
+  groups are dispatched ahead of the consumer at any time.
+- I/O (ReadGroup) is concurrent across W goroutines. Parse+process is sequential on the
+  consumer goroutine. `Reader.ParseBlockFromBytes` is not goroutine-safe.
+- Early exit: `processGroup` returning `errLimitReached` cancels further dispatch.
+  In-flight ReadGroup calls complete normally; their results are drained and discarded
+  without calling `processGroup`.
+- Group delivery order: the consumer reorders completions by groupIdx so `processGroup`
+  is always called in the same group sequence as `CoalescedGroups` returns.
+- Stats: `fetchedGroups` counts ReadGroup completions; `fetchedBlocks` sums BlockIDs
+  across fetched groups; `bytesRead` sums `BlockMeta.Length` per fetched block.
+  Groups whose ReadGroup was cancelled before dispatch are NOT counted. Groups that
+  completed ReadGroup but were buffered in the reorder map when errLimitReached fires
+  ARE counted in fetchedGroups/fetchedBlocks/bytesRead.
+- `ExecuteStructural` is exempt: it requires all blocks pre-fetched for parent-resolve
+  phase (NOTE-034) and continues to use `ReadBlocks` / `queryplanner.FetchBlocks`.
+- `logTopKScan` and `logCollectAll` (via `iterateLogRows`, `stream_log_topk.go`) are also
+  exempt: they issue sequential `ReadGroup` calls and hold at most one coalesced group in
+  memory at a time. They are not covered by the SPEC-STREAM-11 memory invariant.
+
+Back-ref: `internal/modules/executor/block_group_pipeline.go:blockGroupPipeline`
+
+---
+
+## SPEC-STREAM-12: Second-pass decode gate in forEachBlockInGroups
+*Added: 2026-04-15*
+
+`forEachBlockInGroups` accepts an optional `preFn func(pb parsedBlock, candidates []int) bool`
+parameter. When non-nil, `preFn` is called after the first-pass column decode with the
+first-pass parsed block and the candidate row indices. If `preFn` returns false, the
+second-pass decode and `fn` are both skipped for that block. When `preFn` is nil it is not
+called and the second-pass decode proceeds as usual.
+
+**Invariants:**
+- Callers with a column predicate (collectMixedPlain, collectMixedTopK) pass a preFn that
+  evaluates `program.ColumnPredicate`. On success it returns `rowSet.Size() > 0`; on
+  evaluation error it returns `true` (conservative passthrough) so fn can surface the
+  error with full block context via the shared preFnErr captured variable.
+- Intrinsic-only callers (collectIntrinsicPlain, collectIntrinsicTopK) pass nil — no
+  column predicate evaluation is required in those paths.
+- When `preFn` returns false, `fn` is never called for that block; no second-pass I/O or
+  allocation occurs.
+- `preFn` and `fn` are called sequentially on the same goroutine (processGroup is
+  sequential per SPEC-STREAM-11); closures may capture shared state without locks.
+
+Back-ref: `internal/modules/executor/stream.go:forEachBlockInGroups`
+Back-ref: `internal/modules/executor/stream_prefn_test.go:TestForEachBlockInGroupsPreFnNilPassthrough`
+Back-ref: `internal/modules/executor/stream_prefn_test.go:TestForEachBlockInGroupsPreFnFalseSkips`
+Back-ref: `internal/modules/executor/stream_prefn_test.go:TestForEachBlockInGroupsPreFnTruePassthrough`
+
+---
+
 ## SPEC-INTRINSIC-004: File-level bloom pre-check before intrinsic scan
 *Added: 2026-04-14*
 
@@ -689,8 +758,13 @@ type TraceMetricsResult struct {
   skipped per row — they do not increment `count` and do not affect the bucket value.
 - **SPEC-ETM-11:** Series in the output are sorted by their label string for deterministic output.
   Within a series, Values[i] corresponds to bucket i (0-indexed).
-
-Back-ref: `internal/modules/executor/metrics_trace.go:ExecuteTraceMetrics`
+- **SPEC-ETM-12:** Blocks are fetched concurrently via `blockGroupPipeline` (SPEC-STREAM-11):
+  up to `defaultPipelineWorkers` (W=8) coalesced groups (~8 MB each) are dispatched
+  concurrently (semaphore-gated). Peak memory is O(W × group_size): at most W groups
+  in memory at once (at most W-1 in pending reorder map + 1 being processed) ≈ 64 MB
+  for W=8, not one group at a time. Parse and accumulation remain sequential on the
+  consumer goroutine (see NOTE-058).
+  Back-ref: `internal/modules/executor/metrics_trace.go:ExecuteTraceMetrics`
 
 ---
 

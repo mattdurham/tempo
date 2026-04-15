@@ -278,19 +278,19 @@ func applyRangeBucketsForColumn(cd *rangeColumnData, nBuckets int) {
 // returns precisely the right blocks.
 //
 // NOTE-38: exact-value index for low-cardinality columns.
-// NOTE-38b / NOTE-42 / NOTE-43: the exact-value path is only safe when ALL blocks have
-// min==max. When a block spans multiple values (minKey != maxKey), storing the block under
-// only minKey and maxKey means intermediate values are not found by point lookup →
-// false-negative block pruning / data loss. This applies to ALL range column types, not
-// just strings: e.g., span:kind (uint64) with values {1,2,3,5} stored under keys 1 and 5
-// would miss a query for kind=2. When any block has min!=max, fall through to the KLL
-// overlap path which correctly assigns blocks to all overlapping bucket boundaries.
+// NOTE-38b: the exact-value path is only safe when ALL blocks have min==max. When a block
+// spans multiple values (minKey != maxKey), storing the block under only minKey and maxKey
+// means intermediate values are not found by point lookup → false-negative block pruning /
+// data loss. This applies to ALL range column types, not just strings: e.g., span:kind
+// (uint64) with values {1,2,3,5} stored under keys 1 and 5 would miss a query for kind=2.
+// When any block has min!=max, fall through to the KLL overlap path which correctly assigns
+// blocks to all overlapping bucket boundaries.
 func tryApplyExactValues(cd *rangeColumnData) bool {
 	if len(cd.blocks) == 0 {
 		return false
 	}
 
-	// NOTE-43: For ALL range column types, when a block spans multiple values
+	// NOTE-38b: For ALL range column types, when a block spans multiple values
 	// (minKey != maxKey), storing the block under only minKey and maxKey means
 	// intermediate values are missed by point lookup → false-negative pruning.
 	// Bail out to the KLL overlap path which handles intervals correctly.

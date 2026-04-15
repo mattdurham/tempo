@@ -1775,3 +1775,268 @@ Back-ref: `internal/modules/executor/rowset_test.go:TestRowSetWithCap_NegativeHi
 - Add elements and verify `rs.Size()`, `rs.Contains()` work correctly regardless of hint.
 
 Back-ref: `internal/modules/executor/rowset_test.go:TestRowSetWithCap_PositiveHint`
+
+---
+
+## Block Group Pipeline Tests (EX-BGP)
+
+These tests verify the `blockGroupPipeline` function introduced by SPEC-STREAM-11 / NOTE-058.
+All tests live in `internal/modules/executor/block_group_pipeline_test.go` in package `executor`.
+
+---
+
+### EX-BGP-01: TestBlockGroupPipeline_EarlyStop
+*Added: 2026-04-15*
+
+**Scenario:** Pipeline stops when `processGroup` returns `errLimitReached` after group 3.
+SPEC-STREAM-11: `errLimitReached` → nil error; groups beyond the stop are not processed.
+
+**Setup:** Fake reader with 10 groups of 2 blocks each; W=3. `processGroup` returns
+`errLimitReached` on the 3rd call.
+
+**Assertions:**
+- Return error is nil (errLimitReached swallowed).
+- `fetchedGroups <= numGroups` (total group count — see note below).
+- `fetchedGroups >= stopAfterGroup` (at least 3 groups fetched before stop).
+- `fetchedBlocks >= 0`, `bytesRead >= 0`.
+
+**Note:** The tighter assertion `fetchedGroups <= stopAfterGroup + workerCount`
+(bounded in-flight) is not enforced here because fake readers complete instantly
+— all I/O can finish before the stop signal propagates. The memory-bound
+invariant (at most W concurrent ReadGroup calls) is verified by EX-BGP-03, which uses
+concurrency counters rather than group-count bounds.
+
+Back-ref: `internal/modules/executor/block_group_pipeline_test.go:TestBlockGroupPipeline_EarlyStop`
+
+---
+
+### EX-BGP-02: TestBlockGroupPipeline_FullScan
+*Added: 2026-04-15*
+
+**Scenario:** Pipeline processes all groups when no limit is hit.
+SPEC-STREAM-11: `fetchedGroups == len(groups)`; `fetchedBlocks == total block IDs`;
+`processGroup` called in group-index order.
+
+**Setup:** Fake reader with 4 groups [3, 2, 4, 1 blocks]; uniform 50-byte block lengths; W=2.
+
+**Assertions:**
+- `fetchedGroups == 4`.
+- `fetchedBlocks == 10`.
+- `bytesRead == 500` (10 blocks × 50 bytes).
+- `processGroup` invoked in strict ascending groupIdx order.
+- `processGroup` invoked exactly 4 times.
+
+Back-ref: `internal/modules/executor/block_group_pipeline_test.go:TestBlockGroupPipeline_FullScan`
+
+---
+
+### EX-BGP-03: TestBlockGroupPipeline_IOConcurrencyBound
+*Added: 2026-04-15*
+
+**Scenario:** At most W concurrent ReadGroup calls in-flight at any time.
+SPEC-STREAM-11: concurrent I/O is bounded by `workerCount`. This test measures
+concurrent ReadGroup call count (I/O concurrency), not simultaneous live group data
+in memory. See EX-BGP-14 for the memory (peak in-memory groups) invariant.
+
+**Setup:** Fake reader with 20 groups, 2ms I/O delay per ReadGroup; W=2.
+`processGroup` sleeps 1ms to simulate parse work.
+
+**Assertions:**
+- No error.
+- Peak concurrent `ReadGroup` calls tracked by atomic counter ≤ W=2.
+
+Back-ref: `internal/modules/executor/block_group_pipeline_test.go:TestBlockGroupPipeline_IOConcurrencyBound`
+
+---
+
+### EX-BGP-04: TestBlockGroupPipeline_ConcurrentCorrectness
+*Added: 2026-04-15*
+
+**Scenario:** Each block's raw bytes arrive intact under concurrent I/O; no data races.
+
+**Setup:** Fake reader with 8 groups of 3 blocks each (24 total); W=4. Each block has
+deterministic content (block index encoded in bytes).
+
+**Assertions:**
+- No error.
+- All 24 blocks received exactly once (no duplicates, no missing).
+- Each block's bytes are non-empty.
+- No data races under `-race`.
+
+Back-ref: `internal/modules/executor/block_group_pipeline_test.go:TestBlockGroupPipeline_ConcurrentCorrectness`
+
+---
+
+### EX-BGP-05: TestBlockGroupPipeline_StatsAccumulation
+*Added: 2026-04-15*
+
+**Scenario:** Stats are accumulated correctly across groups.
+SPEC-STREAM-11: Stats accounting invariants.
+
+**Setup:** 3 groups: group 0 has 2 blocks (100, 200 bytes), group 1 has 1 block (50 bytes),
+group 2 has 3 blocks (10, 20, 30 bytes).
+
+**Assertions:**
+- `fetchedGroups == 3`.
+- `fetchedBlocks == 6`.
+- `bytesRead == 410`.
+
+Back-ref: `internal/modules/executor/block_group_pipeline_test.go:TestBlockGroupPipeline_StatsAccumulation`
+
+---
+
+### EX-BGP-06: LogMetrics pipeline regression suite
+*Added: 2026-04-15*
+
+**Scenario:** `ExecuteLogMetrics` produces correct aggregates after migration from
+`ReadBlocks` (eager all-upfront) to `blockGroupPipeline` (bounded sliding-window).
+
+**Regression goal:** Verify that the pipeline migration does not change log metric results.
+
+**Setup:** Existing `ExecuteLogMetrics` tests in `metrics_log_test.go`.
+
+**Assertions:**
+- All existing metrics_log tests pass with the new pipeline implementation.
+- Bucket counts, sums, rates match the pre-migration expected values.
+
+Back-ref: `internal/modules/executor/metrics_log_test.go`
+
+---
+
+### EX-BGP-07: TraceMetrics pipeline regression suite
+*Added: 2026-04-15*
+
+**Scenario:** `ExecuteTraceMetrics` produces correct aggregates after migration from
+sequential loop to `blockGroupPipeline` (bounded sliding-window).
+
+**Regression goal:** Verify that the pipeline migration does not change trace metric results.
+
+**Setup:** Existing `ExecuteTraceMetrics` tests in `metrics_trace_test.go`.
+
+**Assertions:**
+- All existing metrics_trace tests pass with the new pipeline implementation.
+- Series values match the pre-migration expected values.
+
+Back-ref: `internal/modules/executor/metrics_trace_test.go`
+
+---
+
+### EX-BGP-08: TestBlockGroupPipeline_PendingMapBound
+*Added: 2026-04-15*
+
+**Scenario:** Slow group 0 with W=4 workers and 12 groups.
+
+Verifies that the semaphore-gated dispatcher does not deadlock and completes all 12 groups
+when group 0 is delayed 50ms relative to groups 1-11.
+
+**Assertions:**
+- `fetchedGroups == 12`.
+- Pipeline completes without timeout (5s limit).
+
+SPEC-STREAM-11: pending map bounded to W-1 by semaphore.
+Back-ref: `internal/modules/executor/block_group_pipeline_test.go:TestBlockGroupPipeline_PendingMapBound`
+
+---
+
+### EX-BGP-09: TestBlockGroupPipeline_ContextCancellation
+*Added: 2026-04-15*
+
+**Scenario:** Outer context deadline expires mid-scan.
+
+Verifies that `blockGroupPipeline` returns `context.DeadlineExceeded` (not nil).
+
+**Assertions:**
+- `errors.Is(err, context.DeadlineExceeded)`.
+
+CRIT-BGP-2: `ctx.Err()` is checked after results drain.
+Back-ref: `internal/modules/executor/block_group_pipeline_test.go:TestBlockGroupPipeline_ContextCancellation`
+
+---
+
+### EX-BGP-10: TestBlockGroupPipeline_WorkerPanicRecovery
+*Added: 2026-04-15*
+
+**Scenario:** ReadGroup panics in a worker goroutine.
+
+Verifies that the `defer recover()` converts the panic to an error rather than crashing
+the process. Error message contains "panic".
+
+**Assertions:**
+- `err != nil`.
+- `strings.Contains(err.Error(), "panic")`.
+- Error message does not contain `"group 0"` when a later group panics (verifies correct group index attribution).
+
+SPEC-ROOT-001: goroutine panics must not crash the process.
+Back-ref: `internal/modules/executor/block_group_pipeline_test.go:TestBlockGroupPipeline_WorkerPanicRecovery`
+
+---
+
+### EX-BGP-11: TestForEachBlockInGroupsPreFnNilPassthrough
+*Added: 2026-04-15*
+
+**Scenario:** `preFn` is nil — no gate is applied.
+
+Builds a two-block file, calls `forEachBlockInGroups` with `preFn=nil`, and counts `fn`
+invocations.
+
+**Assertions:**
+- `fn` is called exactly once per block (equal to `r.BlockCount()`).
+
+SPEC-STREAM-12: nil preFn must not suppress any fn calls.
+Back-ref: `internal/modules/executor/stream_prefn_test.go:TestForEachBlockInGroupsPreFnNilPassthrough`
+
+---
+
+### EX-BGP-12: TestForEachBlockInGroupsPreFnFalseSkips
+*Added: 2026-04-15*
+
+**Scenario:** `preFn` returns false for every block — second-pass decode and fn are skipped.
+
+Builds a two-block file, calls `forEachBlockInGroups` with a preFn that always returns false,
+and counts both preFn and fn invocations.
+
+**Assertions:**
+- `preFn` is called exactly once per block.
+- `fn` is never called (call count == 0).
+
+SPEC-STREAM-12: preFn returning false must prevent fn invocation.
+Back-ref: `internal/modules/executor/stream_prefn_test.go:TestForEachBlockInGroupsPreFnFalseSkips`
+
+---
+
+### EX-BGP-13: TestForEachBlockInGroupsPreFnTruePassthrough
+*Added: 2026-04-15*
+
+**Scenario:** `preFn` returns true for every block — second-pass decode and fn proceed.
+
+Builds a two-block file, calls `forEachBlockInGroups` with a preFn that always returns true,
+and counts fn invocations.
+
+**Assertions:**
+- `fn` is called exactly once per block (equal to `r.BlockCount()`).
+
+SPEC-STREAM-12: preFn returning true must not suppress fn calls.
+Back-ref: `internal/modules/executor/stream_prefn_test.go:TestForEachBlockInGroupsPreFnTruePassthrough`
+
+---
+
+### EX-BGP-14: TestBlockGroupPipeline_PeakInMemoryGroupsBound
+*Added: 2026-04-15*
+
+**Scenario:** Semaphore token released only after processGroup returns — peak simultaneously live group data ≤ W.
+
+Verifies CRIT-BGP-1: the dispatcher cannot enqueue a new group while the current
+group's data is still held in memory by `processGroup`. Because `processGroup` is
+called sequentially on the consumer goroutine, peak in-memory groups must be exactly 1.
+
+**Setup:** Fake reader with 20 groups, 5ms I/O delay; W=3. `processGroup` atomically
+increments/decrements an in-memory counter, sleeps 2ms, and records the peak.
+
+**Assertions:**
+- No error.
+- Peak simultaneously live group data == 1 (processGroup is sequential; semaphore
+  released after processGroup returns, not before).
+
+CRIT-BGP-1 / SPEC-STREAM-11: semaphore must be released after processGroup to keep
+peak in-memory groups ≤ W.
+Back-ref: `internal/modules/executor/block_group_pipeline_test.go:TestBlockGroupPipeline_PeakInMemoryGroupsBound`

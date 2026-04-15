@@ -398,7 +398,7 @@ but never call writer-side methods. They are pure read paths.
 
 ---
 
-## NOTE-010: Free Functions Instead of Engine Struct
+## NOTE-064: Free Functions Instead of Engine Struct
 *Added: 2026-03-03*
 
 **Decision:** `StreamLogs` and `ExecuteLogMetrics` are package-level free functions, not
@@ -409,7 +409,7 @@ test, and reason about.
 
 ---
 
-## NOTE-011: Label Column Scoping — resource.* and log.* Prefixes Stripped
+## NOTE-065: Label Column Scoping — resource.* and log.* Prefixes Stripped
 *Added: 2026-03-03*
 
 **Decision:** `logReadLabels` strips the `resource.` and `log.` column name prefixes when
@@ -1266,7 +1266,7 @@ Back-ref: `internal/modules/executor/stream_log.go:LogAttrs`,
 
 ---
 
-## NOTE-039: cmp3 Generic Helper Reduces rowCompare Cyclomatic Complexity
+## NOTE-059: cmp3 Generic Helper Reduces rowCompare Cyclomatic Complexity
 *Added: 2026-03-16*
 
 **Decision:** Introduced `cmp3[T cmp.Ordered](a, b T) (int, bool)` — a one-line wrapper
@@ -1288,7 +1288,7 @@ Back-ref: `internal/modules/executor/column_provider.go:rowCompare`,
 
 ---
 
-## NOTE-040: scanIntrinsicLeafRefs leaf.Values Loop Merged From Two Passes to One
+## NOTE-060: scanIntrinsicLeafRefs leaf.Values Loop Merged From Two Passes to One
 *Added: 2026-03-16*
 
 **Decision:** In `scanIntrinsicLeafRefs` (dict-format + exact-values branch), two sequential
@@ -1311,7 +1311,7 @@ Back-ref: `internal/modules/executor/predicates.go:scanIntrinsicLeafRefs`
 
 ---
 
-## NOTE-041: logTopKEntry.ts Field Removed — Use entry.TimestampNanos Directly
+## NOTE-061: logTopKEntry.ts Field Removed — Use entry.TimestampNanos Directly
 *Added: 2026-03-16*
 
 **Decision:** `logTopKEntry.ts uint64` has been removed. All heap comparisons
@@ -1323,12 +1323,13 @@ construction site. The redundant field added 8 bytes per entry × limit (e.g., 1
 8KB overhead), plus one extra assignment per row. There was no case where `ts != entry.TimestampNanos`.
 Removing the field eliminates the class of bug where one is updated but the other is not.
 
-Back-ref: `internal/modules/executor/stream_log_topk.go:logTopKEntry`,
-`internal/modules/executor/stream_log_topk.go:logTopKHeap`
+Back-ref: `internal/modules/executor/stream_log_topk.go:logTopKHeap.Less`,
+`internal/modules/executor/stream_log_topk.go:logTopKInsert`,
+`internal/modules/executor/stream_log_topk.go:logTopKCanSkipBlock`
 
 ---
 
-## NOTE-042: iterateLogRows Extracts Shared Block-Iteration Boilerplate
+## NOTE-062: iterateLogRows Extracts Shared Block-Iteration Boilerplate
 *Added: 2026-03-16*
 
 **Decision:** The ~130 lines of shared block-iteration boilerplate that was duplicated between
@@ -1353,6 +1354,9 @@ Back-ref: `internal/modules/executor/stream_log_topk.go:iterateLogRows`,
 `internal/modules/executor/stream_log_topk.go:logTopKScan`,
 `internal/modules/executor/stream_log_topk.go:logCollectAll`,
 `internal/modules/executor/stream_log.go:StreamLogs`
+
+---
+
 ## NOTE-038: Unified Intrinsic Pre-Filter — Partial-AND for Mixed Queries
 *Added: 2026-03-16*
 
@@ -1979,4 +1983,128 @@ empty string for absent column positions).
 **Absent-pk fill:** The fast path explicitly fills absent pks with `""` after the column
 scan, matching the multi-column path's behavior of iterating `keyToBucket` for every row.
 
+---
+
+## NOTE-057: ExecuteTraceMetrics — Lazy CoalescedGroups I/O (M-20) (2026-04-15)
+*Added: 2026-04-15*
+
+**Decision:** Replaced the eager `r.ReadBlocks(plan.SelectedBlocks)` call in
+`ExecuteTraceMetrics` with a lazy `r.CoalescedGroups` / `r.ReadGroup` loop, mirroring
+the pattern already used by `Stream` and `CollectLogs`.
+
+**Rationale:** The previous implementation materialised all selected block bytes into a
+single `map[int][]byte` before processing any of them. For metrics queries over large time
+ranges, `SelectedBlocks` can be hundreds or thousands of blocks — peak memory was
+`N_blocks × avg_block_size`, which could reach GBs. With the `blockGroupPipeline`
+pattern, the semaphore-gated dispatcher limits in-flight dispatch to at most
+`defaultPipelineWorkers` (W=8) groups ahead of the consumer. Peak memory is bounded by
+W groups (at most W-1 in the pending reorder map + 1 being processed), not all selected
+blocks. See NOTE-058 for the full rationale on W=8.
+
+Unlike the `Stream` path there is no early-exit for metrics (all blocks must be scanned for
+correct aggregate results), so the lazy pattern here is purely a memory reduction, not a
+latency optimization. Correctness is unchanged: metrics accumulation is order-independent.
+
+**Why raw bytes are deleted from groupRaw before ParseBlockFromBytes:** The local `raw`
+variable holds the slice header and keeps the underlying bytes alive through the parse and
+row-iteration loop. Deleting the entry from `groupRaw` removes the map's reference so that
+the bytes become eligible for GC as soon as the enclosing block-index iteration exits —
+without waiting for the full group loop to complete.
+
+Back-ref: `internal/modules/executor/metrics_trace.go:ExecuteTraceMetrics`
+SPEC-ETM-12
+
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:buildGroupKeyMap`
+
+---
+
+## NOTE-058: blockGroupPipeline — Unified Bounded Sliding-Window I/O
+*Added: 2026-04-15*
+
+**Decision:** Replace the five divergent block-read loops (`scanBlocks`, `forEachBlockInGroups`,
+`ExecuteTraceMetrics` sequential loop, `ExecuteLogMetrics` eager `ReadBlocks` call,
+`topKScanBlocks`) with a single `blockGroupPipeline(ctx, r, groups, workerCount, processGroup)`
+function. (`topKScanBlocks` was migrated to `blockGroupPipeline` in a follow-up change; see
+SPEC-STREAM-11 update.)
+
+**Rationale:**
+1. `scanBlocks` was lazy-sequential (one group at a time); `forEachBlockInGroups` was
+   eager-parallel (all groups upfront); `ExecuteLogMetrics` used `ReadBlocks` (all upfront
+   without group awareness). Three incompatible patterns for the same underlying operation.
+2. The bounded channel (capacity=W) makes peak memory O(W × group_size ≈ W × 8MB)
+   regardless of total selected blocks. `ExecuteLogMetrics` previously held all selected
+   blocks in memory simultaneously.
+3. Concurrent I/O at W=defaultPipelineWorkers (8). Sequential parse is required
+   (Reader.ParseBlockFromBytes is not goroutine-safe — NOTE-048).
+4. An internal ordered reorder buffer ensures `processGroup` is called in group-index
+   order, preserving the block-then-row match ordering invariant (SPEC §4.2).
+5. `errLimitReached` as the early-exit sentinel is preserved from the previous design.
+   The pipeline translates it to a nil return, not an error.
+6. `ExecuteStructural` is exempt: NOTE-034 requires all blocks pre-fetched for the
+   three-phase parent-resolve algorithm. `queryplanner.FetchBlocks` / `ReadBlocks`
+   are retained for that path.
+7. `ParseBlockFromBytes` (no intern pool) is kept for `forEachBlockInGroups` callers
+   to minimize behavioral change. `scanBlocks`-derived callers continue to use
+   `ParseBlockFromBytesWithIntern` for allocation savings (NOTE-006).
+
+**Window size W — I/O-bound latency hiding:**
+This is an I/O-bound pipeline, not a CPU-bound one. The goroutines issuing `ReadGroup`
+calls are blocked in `ReadAt` (network syscall); they consume no CPU. W=8 was chosen
+for these reasons:
+
+- **Wrong frame**: `runtime.NumCPU()` is for CPU-bound work. NumCPU=4 under-parallelises
+  on small VMs; NumCPU=64 would hold 512MB in-flight on large nodes.
+- **Latency-hiding math**: T_io≈75ms (median S3), T_parse<5ms → optimal saturation
+  W≈15. W=8 absorbs S3 tail latency (225-375ms) across 8 concurrent requests.
+- **Memory ceiling**: W=8 → up to W=8 groups × 8MB = 64MB peak in-memory. The
+  semaphore-gated dispatcher limits dispatch to W groups ahead of nextExpected; the
+  pending reorder map holds at most W-1 out-of-order groups, plus 1 currently being
+  processed. Fixed and predictable. Does not consult GOMEMLIMIT (objectcache already
+  owns that budget via NOTE-OC-004).
+- **Empirical**: W=8 matches prior `NumCPU` default on typical pod sizes (8-16 vCPUs)
+  without coupling correctness to host topology.
+
+`blockGroupPipeline` takes `workerCount int` as a parameter for testability (tests use
+W=1 or W=2). All five production block-scan paths (`scanBlocks`, `forEachBlockInGroups`,
+`ExecuteTraceMetrics`, `ExecuteLogMetrics`, `topKScanBlocks`) pass
+`defaultPipelineWorkers = 8` to `blockGroupPipeline` (SPEC-STREAM-11).
+
+Back-ref: `internal/modules/executor/block_group_pipeline.go:blockGroupPipeline`
+Back-ref: `internal/modules/executor/block_group_pipeline.go:defaultPipelineWorkers`
+Back-ref: `internal/modules/executor/stream_topk.go:topKScanBlocks`
+
+Note (CRIT-BGP-1): The semaphore token is released only AFTER `processGroup` returns,
+not before. This ensures the dispatcher cannot enqueue a new group while the current
+group's raw bytes are still held in memory by `processGroup`, keeping peak in-memory
+groups strictly at ≤ W (not W+1).
+
+**Addendum — sequential log-TopK paths not covered by this pipeline:**
+`logTopKScan` and `logCollectAll` route through `iterateLogRows`
+(`stream_log_topk.go`), which uses a sequential per-group `r.ReadGroup` call.
+They are NOT covered by this bounded pipeline and hold at most one coalesced
+group in memory at a time. These paths are also exempt from SPEC-STREAM-11 along
+with `ExecuteStructural`.
+
+---
+
+## NOTE-066: preFn gate in forEachBlockInGroups
+*Added: 2026-04-15*
+
+**Decision:** A nullable `preFn func(pb parsedBlock, candidates []int) bool` parameter was
+added to `forEachBlockInGroups`. When non-nil, it is called after the first-pass column
+decode; returning false skips both the second-pass decode and `fn` invocation for that block.
+
+**Rationale:** Previously the second-pass decode always ran for every block that reached
+`forEachBlockInGroups`, even if `ColumnPredicate` on the first-pass columns would have
+returned an empty row set. For mixed-predicate paths (collectMixedPlain, collectMixedTopK)
+the predicate evaluation is now moved into preFn so that second-pass column decoding (which
+includes output-only columns such as `searchMetaColumns`) is skipped entirely for non-matching
+blocks. Intrinsic-only paths pass nil because they have no first-pass column predicate to
+evaluate.
+
+**How to apply:** Any future caller that evaluates a column predicate before emitting rows
+should pass a preFn rather than deferring the evaluation to fn. preFn and fn share a
+captured rowSet variable; processGroup is sequential (SPEC-STREAM-11) so no synchronisation
+is needed.
+
+Back-ref: `internal/modules/executor/stream.go:forEachBlockInGroups`

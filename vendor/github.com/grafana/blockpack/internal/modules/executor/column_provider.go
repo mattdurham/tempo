@@ -17,7 +17,7 @@ import (
 )
 
 // cmp3 returns cmp.Compare(a, b) and true. Wraps cmp.Compare to match rowCompare's (int, bool) signature.
-// NOTE-039: reduces rowCompare cyclomatic complexity from 40 to ~20 by replacing repeated
+// NOTE-059: reduces rowCompare cyclomatic complexity from 40 to ~20 by replacing repeated
 // three-way switch blocks with a single generic call.
 func cmp3[T cmp.Ordered](a, b T) (int, bool) {
 	return cmp.Compare(a, b), true
@@ -91,7 +91,7 @@ func rowEqual(col *modules_reader.Column, rowIdx int, value interface{}) bool {
 
 // rowCompare returns -1/0/1 for col[rowIdx] <=> value (for range comparisons).
 // Returns (0, false) when the comparison is not applicable.
-// NOTE-039: uses cmp3 to eliminate repeated three-way switch blocks per type.
+// NOTE-059: uses cmp3 to eliminate repeated three-way switch blocks per type.
 func rowCompare(col *modules_reader.Column, rowIdx int, value interface{}) (int, bool) {
 	if !col.IsPresent(rowIdx) {
 		return 0, false

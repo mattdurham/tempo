@@ -1637,7 +1637,7 @@ func encodeValue(v vm.Value, colType modules_shared.ColumnType) (string, bool) {
 		case vm.TypeString: // NOTE-027: cross-encoding string literals against float64 index
 			if s, ok := v.Data.(string); ok {
 				parsed, err := strconv.ParseFloat(s, 64)
-				// NOTE-040: writer excludes negative floats from the float range index
+				// NOTE-027: writer excludes negative floats from the float range index
 				// (negative IEEE-754 bit patterns sort in reverse under LE comparison).
 				// Reject negative thresholds here to match — no false negatives.
 				if err != nil || parsed < 0 {
@@ -1906,7 +1906,7 @@ func computeOverFetch(limit, nodeCount, totalLeaves int) int {
 // Note: this function does NOT check whether the program is intrinsic-only.
 // Callers must verify that separately (see ProgramIsIntrinsicOnly).
 //
-// NOTE-039: Uses recursive evalNodeBlockRefs to support OR and regex predicates.
+// NOTE-038: Uses recursive evalNodeBlockRefs to support OR and regex predicates.
 // Top-level nodes are AND-combined (each node in program.Predicates.Nodes is intersected).
 // If any top-level node is not evaluable, returns nil (fast path not applicable).
 func BlockRefsFromIntrinsicTOC(r *modules_reader.Reader, program *vm.Program, limit int) []modules_shared.BlockRef {
@@ -2020,7 +2020,7 @@ func scanIntrinsicLeafRefs(
 			return nil // range predicate on dict — not supported in raw scan
 		}
 		// Regex predicate: compile pattern and scan dict entries.
-		// NOTE-039: regex on dict columns uses ScanDictColumnRefsWithBloom with nil bloom keys
+		// NOTE-038: regex on dict columns uses ScanDictColumnRefsWithBloom with nil bloom keys
 		// (no bloom pruning possible for regex — any page could have matching entries).
 		if len(leaf.Values) == 0 && leaf.Pattern != "" {
 			re, err := regexp.Compile(leaf.Pattern)
@@ -2035,7 +2035,7 @@ func scanIntrinsicLeafRefs(
 			}, nil, maxRefs)
 		}
 		// Build match sets and bloom keys in one pass.
-		// NOTE-040: merged from two sequential loops — identical switch structure, no ordering dependency.
+		// NOTE-060: merged from two sequential loops — identical switch structure, no ordering dependency.
 		wantStr := make(map[string]struct{}, len(leaf.Values))
 		wantInt := make(map[int64]struct{}, len(leaf.Values))
 		bloomKeys := make([][]byte, 0, len(leaf.Values))

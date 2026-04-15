@@ -39,8 +39,8 @@ const (
 
 // parseBlockHeader parses the 24-byte block header from data.
 func parseBlockHeader(data []byte) (blockHeader, error) {
-	if len(data) < 24 {
-		return blockHeader{}, fmt.Errorf("block header: need 24 bytes, have %d", len(data))
+	if len(data) < int(shared.BlockHeaderV14Size) {
+		return blockHeader{}, fmt.Errorf("block header: need %d bytes, have %d", shared.BlockHeaderV14Size, len(data))
 	}
 
 	hdr := blockHeader{
@@ -62,6 +62,20 @@ func parseBlockHeader(data []byte) (blockHeader, error) {
 		return blockHeader{}, fmt.Errorf(
 			"block header: version %d not supported (only V14 supported; V12 files must be compacted to V14 first)",
 			hdr.version,
+		)
+	}
+
+	// SPEC-ROOT-011: reject implausible field counts to prevent pre-allocation OOM.
+	if hdr.columnCount > uint32(shared.MaxColumns) { //nolint:gosec
+		return blockHeader{}, fmt.Errorf(
+			"block header: column_count %d exceeds MaxColumns %d",
+			hdr.columnCount, shared.MaxColumns,
+		)
+	}
+	if hdr.spanCount > uint32(shared.MaxSpans) { //nolint:gosec
+		return blockHeader{}, fmt.Errorf(
+			"block header: span_count %d exceeds MaxSpans %d",
+			hdr.spanCount, shared.MaxSpans,
 		)
 	}
 

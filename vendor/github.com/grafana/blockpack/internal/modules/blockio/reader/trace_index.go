@@ -413,7 +413,9 @@ func (r *Reader) ensureCompactHeaderParsed() error {
 		if len(prefixBuf) < 13 {
 			return fmt.Errorf("compact index: short for bloom_bytes")
 		}
-		bloomBytes = int(binary.LittleEndian.Uint32(prefixBuf[shared.CompactIndexHeaderSize:])) //nolint:gosec // validated below before use
+		bloomBytes = int(
+			binary.LittleEndian.Uint32(prefixBuf[shared.CompactIndexHeaderSize:]),
+		) //nolint:gosec // validated below before use
 		if bloomBytes > shared.TraceIDBloomMaxBytes {
 			return fmt.Errorf(
 				"compact index: bloom_bytes %d exceeds maximum %d",

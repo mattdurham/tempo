@@ -4,6 +4,7 @@ package executor
 
 import (
 	"cmp"
+	"context"
 	"fmt"
 	"math"
 	"slices"
@@ -75,33 +76,45 @@ func ExecuteTraceMetrics(
 		return result, nil
 	}
 
-	// SPEC-ETM-9: wantColumns must include span:start, the aggregate field, and all GroupBy
-	// columns in addition to predicate columns. Missing these = silently wrong results.
-	wantColumns := ProgramWantColumns(program)
+	// predicateCols: only the columns required by ColumnPredicate (first pass).
+	// outputCols: metric columns needed for accumulation (always non-nil, even when
+	// predicateCols is nil). An explicit non-nil set is required so metricsColumnsAreIntrinsic
+	// can correctly evaluate intrinsic eligibility for each individual column; a nil set
+	// would make that function return true unconditionally (empty loop), incorrectly routing
+	// queries through the intrinsic path when custom attribute columns are needed.
+	// SPEC-ETM-9: span:start, the aggregate field, and all GroupBy columns are mandatory for
+	// correct metric accumulation; missing any produces silently wrong results.
+	// NOTE-018: two-pass decode — predicate columns first, output columns only for blocks with
+	// matches — avoids decoding metric columns on blocks that the predicate rejects entirely.
+	predicateCols := ProgramWantColumns(program)
 	extraCols := []string{"span:start"}
 	if querySpec.Aggregate.Field != "" {
 		extraCols = append(extraCols, querySpec.Aggregate.Field)
 	}
 	extraCols = append(extraCols, querySpec.Aggregate.GroupBy...)
-	if wantColumns == nil {
-		wantColumns = make(map[string]struct{}, len(extraCols))
+	// outputCols = predicateCols ∪ extraCols (always non-nil).
+	// When predicateCols is nil (predicate needs all columns), outputCols still explicitly
+	// lists the metric-specific columns so the intrinsic eligibility check is precise.
+	outputCols := make(map[string]struct{}, len(predicateCols)+len(extraCols))
+	for k := range predicateCols { // safe when predicateCols is nil (no-op)
+		outputCols[k] = struct{}{}
 	}
 	for _, c := range extraCols {
-		wantColumns[c] = struct{}{}
+		outputCols[c] = struct{}{}
 	}
 
 	// NOTE-045: intrinsic fast path — zero block reads when all needed columns are in the
 	// intrinsic section (span:start, span:duration, resource.service.name, span:status, etc.).
-	if intrinsicResult, used, intrinsicErr := executeTraceMetricsIntrinsic(r, program, querySpec, wantColumns); intrinsicErr != nil {
+	if intrinsicResult, used, intrinsicErr := executeTraceMetricsIntrinsic(r, program, querySpec, outputCols); intrinsicErr != nil {
 		return nil, intrinsicErr
 	} else if used {
 		return intrinsicResult, nil
 	}
 
-	rawBlocks, err := r.ReadBlocks(plan.SelectedBlocks)
-	if err != nil {
-		return nil, fmt.Errorf("FetchBlocks: %w", err)
-	}
+	// SPEC-ETM-12 / SPEC-STREAM-11: Blocks are fetched concurrently via blockGroupPipeline
+	// (W workers, bounded channel), processed sequentially for parse safety. Peak memory is
+	// O(W × group_size) rather than all selected blocks. NOTE-058.
+	groups := r.CoalescedGroups(plan.SelectedBlocks)
 
 	// buckets maps a composite key to aggBucketState.
 	// For most aggregates: bucketIdxStr + "\x00" + attrGroupKey.
@@ -110,36 +123,62 @@ func ExecuteTraceMetrics(
 	// See traceAccumulateRow for the authoritative key format.
 	buckets := make(map[string]*aggBucketState)
 
-	for _, blockIdx := range plan.SelectedBlocks {
-		raw, ok := rawBlocks[blockIdx]
-		if !ok {
-			continue
-		}
-		result.BytesRead += int64(len(raw)) //nolint:gosec
+	groupBy := querySpec.Aggregate.GroupBy
+	// TODO: propagate caller context (NOTE-058: ExecuteTraceMetrics does not yet accept context.Context).
+	_, _, _, pipelineErr := blockGroupPipeline(
+		context.Background(), r, groups, defaultPipelineWorkers,
+		func(groupIdx int, groupRaw map[int][]byte) error {
+			for _, blockIdx := range groups[groupIdx].BlockIDs {
+				raw, ok := groupRaw[blockIdx]
+				if !ok {
+					continue
+				}
+				// NOTE: uses actual compressed wire bytes (len(raw)), not BlockMeta.Length
+				// (uncompressed size). These differ for compressed blocks; len(raw) reflects
+				// actual I/O volume. The pipeline's bytesRead return (BlockMeta.Length-based)
+				// is discarded — this accumulation carries the wire-byte semantic.
+				result.BytesRead += int64(len(raw)) //nolint:gosec
+				// Release raw bytes immediately after use to allow GC before the next block.
+				delete(groupRaw, blockIdx)
 
-		meta := r.BlockMeta(blockIdx)
-		bwb, parseErr := r.ParseBlockFromBytes(raw, wantColumns, meta)
-		if parseErr != nil {
-			return nil, fmt.Errorf("ParseBlockFromBytes block %d: %w", blockIdx, parseErr)
-		}
+				meta := r.BlockMeta(blockIdx)
+				// First pass: decode predicate columns only.
+				bwb, parseErr := r.ParseBlockFromBytes(raw, predicateCols, meta)
+				if parseErr != nil {
+					return fmt.Errorf("ParseBlockFromBytes block %d: %w", blockIdx, parseErr)
+				}
 
-		provider := newBlockColumnProvider(bwb.Block)
-		rowSet, evalErr := program.ColumnPredicate(provider)
-		if evalErr != nil {
-			return nil, fmt.Errorf("ColumnPredicate block %d: %w", blockIdx, evalErr)
-		}
+				provider := newBlockColumnProvider(bwb.Block)
+				rowSet, evalErr := program.ColumnPredicate(provider)
+				if evalErr != nil {
+					return fmt.Errorf("ColumnPredicate block %d: %w", blockIdx, evalErr)
+				}
 
-		if rowSet.Size() == 0 {
-			continue
-		}
+				if rowSet.Size() == 0 {
+					continue
+				}
 
-		result.BlocksScanned++
+				// Second pass: decode metric output columns (span:start, aggregate field,
+				// GroupBy columns) only for blocks with matching rows. NOTE-018.
+				if predicateCols != nil {
+					bwb, parseErr = r.ParseBlockFromBytes(bwb.RawBytes, outputCols, meta)
+					if parseErr != nil {
+						return fmt.Errorf("ParseBlockFromBytes (second pass) block %d: %w", blockIdx, parseErr)
+					}
+				}
 
-		groupBy := querySpec.Aggregate.GroupBy
-		attrVals := make([]string, len(groupBy)) // NOTE-054: per-block scratch; cleared at top of traceAccumulateRow
-		for _, rowIdx := range rowSet.ToSlice() {
-			traceAccumulateRow(r, blockIdx, bwb.Block, rowIdx, querySpec, buckets, attrVals)
-		}
+				result.BlocksScanned++
+
+				attrVals := make([]string, len(groupBy)) // NOTE-054: per-block scratch; cleared at top of traceAccumulateRow
+				for _, rowIdx := range rowSet.ToSlice() {
+					traceAccumulateRow(r, blockIdx, bwb.Block, rowIdx, querySpec, buckets, attrVals)
+				}
+			}
+			return nil
+		},
+	)
+	if pipelineErr != nil {
+		return nil, pipelineErr
 	}
 
 	// NOTE-033: HISTOGRAM uses a dedicated series builder that reconstructs __bucket labels

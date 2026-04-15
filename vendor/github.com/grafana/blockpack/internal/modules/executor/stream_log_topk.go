@@ -6,6 +6,7 @@ import (
 	"cmp"
 	"container/heap"
 	"fmt"
+	"log/slog"
 	"maps"
 	"slices"
 	"time"
@@ -40,7 +41,8 @@ func (h *logTopKHeap) Less(i, j int) bool {
 func (h *logTopKHeap) Push(x any) {
 	entry, ok := x.(LogEntry)
 	if !ok {
-		panic(fmt.Sprintf("logTopKHeap.Push: expected LogEntry, got %T", x))
+		slog.Error("logTopKHeap.Push: unexpected type", "type", fmt.Sprintf("%T", x))
+		return
 	}
 	h.entries = append(h.entries, entry)
 }
@@ -439,8 +441,9 @@ func iterateLogRows(
 			continue // skip second-pass decode entirely
 		}
 
-		// NOTE-001: Lazy registration in ParseBlockFromBytes registers all columns with
-		// presence-only decode. Full decode is triggered on first value access - no AddColumnsToBlock needed.
+		// NOTE-001: Columns registered by ParseBlockFromBytes hold compressed bytes only;
+		// no decode happens at registration. Full decode is deferred to first accessor call
+		// via ensureDecompressed() + decodeNow().
 
 		// Cache column pointers for the row loop.
 		tsCol := bwb.Block.GetColumn("log:timestamp")
