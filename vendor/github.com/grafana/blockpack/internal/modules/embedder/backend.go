@@ -3,8 +3,13 @@ package embedder
 // NOTE: Any changes to this file must be reflected in the corresponding specs.md or NOTES.md.
 
 // Backend is the interface for embedding inference engines.
-// Implementations must be safe for sequential use; concurrent use requires external locking.
-// MockBackend is thread-safe; yzmaBackend and httpBackend are not.
+// Implementations must be safe for concurrent use after construction.
+// Specifically: any shared mutable state (inference contexts, connection pools,
+// etc.) must be protected by a sync.Mutex or equivalent. Immutable post-construction
+// state (like httpBackend) is inherently safe. Stateful backends that hold shared
+// resources (e.g. an llama.cpp context) must serialize access.
+// httpBackend is stateless after NewHTTP returns; all fields are immutable.
+// MockBackend is likewise thread-safe.
 type Backend interface {
 	// Embed encodes a single text string into an L2-normalized float32 vector.
 	// Returns error if inference fails.

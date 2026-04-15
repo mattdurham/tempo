@@ -114,9 +114,9 @@ func pickDeltaWidth(maxOffset uint64) uint8 {
 		return 0
 	case maxOffset <= 255:
 		return 1
-	case maxOffset <= 65535:
+	case maxOffset <= deltaRangeThreshold16:
 		return 2
-	case maxOffset <= 4_294_967_295:
+	case maxOffset <= deltaRangeThreshold32:
 		return 4
 	default:
 		return 8

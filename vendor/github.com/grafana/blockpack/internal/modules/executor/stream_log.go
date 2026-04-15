@@ -45,6 +45,9 @@ type LogEntry struct {
 	TimestampNanos uint64
 }
 
+// maxLogPreallocRows is the pre-allocation cap for log result slices; actual results can exceed this.
+const maxLogPreallocRows = 4096
+
 // StreamLogs scans a blockpack log file using the given vm.Program and optional
 // Pipeline, collecting all matched rows into a slice.
 //
@@ -80,8 +83,8 @@ func StreamLogs(
 	for _, blockIdx := range plan.SelectedBlocks {
 		totalRows += int(r.BlockMeta(blockIdx).SpanCount)
 	}
-	if totalRows > 4096 {
-		totalRows = 4096
+	if totalRows > maxLogPreallocRows {
+		totalRows = maxLogPreallocRows
 	}
 	results := make([]LogEntry, 0, totalRows)
 

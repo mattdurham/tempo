@@ -37,7 +37,14 @@ func (h *logTopKHeap) Less(i, j int) bool {
 	return h.entries[i].TimestampNanos > h.entries[j].TimestampNanos // max-heap: newest at root
 }
 
-func (h *logTopKHeap) Push(x any) { h.entries = append(h.entries, x.(LogEntry)) }
+func (h *logTopKHeap) Push(x any) {
+	entry, ok := x.(LogEntry)
+	if !ok {
+		panic(fmt.Sprintf("logTopKHeap.Push: expected LogEntry, got %T", x))
+	}
+	h.entries = append(h.entries, entry)
+}
+
 func (h *logTopKHeap) Pop() any {
 	n := len(h.entries)
 	x := h.entries[n-1]
@@ -120,7 +127,7 @@ func CollectLogs(
 		MaxNano: opts.TimeRange.MaxNano,
 	}, queryplanner.PlanOptions{})
 	qs.Steps = append(qs.Steps, StepStats{
-		Name:     "plan",
+		Name:     stepNamePlan,
 		Duration: time.Since(planStart),
 		Metadata: map[string]any{
 			"total_blocks":    plan.TotalBlocks,
@@ -133,7 +140,7 @@ func CollectLogs(
 	})
 
 	if len(plan.SelectedBlocks) == 0 {
-		qs.ExecutionPath = "block-pruned"
+		qs.ExecutionPath = ExecPathBlockPruned
 		qs.TotalDuration = time.Since(queryStart)
 		return nil, qs, nil
 	}
@@ -150,7 +157,7 @@ func CollectLogs(
 	scanStart := time.Now()
 
 	if opts.Limit > 0 {
-		qs.ExecutionPath = "block-topk"
+		qs.ExecutionPath = ExecPathBlockTopK
 		buf := &logTopKHeap{
 			entries:  make([]LogEntry, 0, opts.Limit),
 			backward: backward,
@@ -166,10 +173,11 @@ func CollectLogs(
 			backward,
 		)
 		if scanErr != nil {
+			qs.TotalDuration = time.Since(queryStart)
 			return nil, qs, scanErr
 		}
 		qs.Steps = append(qs.Steps, StepStats{
-			Name:      "block-scan",
+			Name:      stepNameBlockScan,
 			Duration:  time.Since(scanStart),
 			BytesRead: bytesRead,
 			IOOps:     fetchedGroups,
@@ -184,13 +192,13 @@ func CollectLogs(
 	// Limit == 0: collect all, sort globally, deliver.
 	// Pre-allocate with a capacity hint: min(totalSpanCount, 4096) to avoid repeated
 	// slice growth copies while not over-allocating for selective queries.
-	qs.ExecutionPath = "block-plain"
+	qs.ExecutionPath = ExecPathBlockPlain
 	var totalRows int
 	for _, blockIdx := range plan.SelectedBlocks {
 		totalRows += int(r.BlockMeta(blockIdx).SpanCount)
 	}
-	if totalRows > 4096 {
-		totalRows = 4096
+	if totalRows > maxLogPreallocRows {
+		totalRows = maxLogPreallocRows
 	}
 	all := make([]LogEntry, 0, totalRows)
 	fetchedGroups, fetchedBlocks, bytesRead, scanErr = logCollectAll(
@@ -203,10 +211,11 @@ func CollectLogs(
 		&all,
 	)
 	if scanErr != nil {
+		qs.TotalDuration = time.Since(queryStart)
 		return nil, qs, scanErr
 	}
 	qs.Steps = append(qs.Steps, StepStats{
-		Name:      "block-scan",
+		Name:      stepNameBlockScan,
 		Duration:  time.Since(scanStart),
 		BytesRead: bytesRead,
 		IOOps:     fetchedGroups,
@@ -297,7 +306,7 @@ func processLogRows(
 			continue
 		}
 
-		// NOTE-SL-016: acquire from pool - zero map allocation for dropped rows.
+		// NOTE-SL-017: acquire from pool - zero map allocation for dropped rows.
 		bls := acquireBlockLabelSet(block, rowIdx, colNames, colMap, colCols)
 		if pipeline != nil {
 			var keep bool

@@ -107,6 +107,14 @@ type QueryPredicates struct {
 // TextEmbedder is the interface for converting text to embedding vectors.
 // This keeps the VM decoupled from the embedder implementation — callers provide
 // any implementation (HTTP backend, yzma, mock, etc.) via CompileOptions.
+//
+// This interface is intentionally narrower than shared.TextEmbedder (which also
+// has EmbedBatch): the VM only needs single-text Embed() for VECTOR_AI() query
+// compilation. Any value that satisfies shared.TextEmbedder also satisfies this
+// interface via Go structural typing — no explicit declaration is needed.
+//
+// NOTE: Do not widen this interface to include EmbedBatch without updating all
+// callers — the narrow surface is part of the public API contract.
 type TextEmbedder interface {
 	Embed(text string) ([]float32, error)
 }

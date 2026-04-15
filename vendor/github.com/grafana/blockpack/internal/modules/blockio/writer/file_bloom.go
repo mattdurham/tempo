@@ -1,7 +1,7 @@
 package writer
 
 // NOTE: Any changes to this file must be reflected in the corresponding specs.md or NOTES.md.
-// NOTE-45: file-level bloom filter section — written at Flush time for resource.service.name.
+// NOTE-045: file-level bloom filter section — written at Flush time for resource.service.name.
 
 import (
 	"encoding/binary"

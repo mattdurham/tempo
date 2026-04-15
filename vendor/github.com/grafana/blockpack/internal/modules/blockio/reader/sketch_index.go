@@ -26,11 +26,18 @@ const (
 	sketchSectionMagicLegacy = uint32(0x534B5443) // "SKTC" — fuse variant (old, read-only)
 )
 
+// Sketch index section header field offsets (M-29).
+// Header layout: magic[4]+numBlocks[4]+numColumns[4] = 12 bytes.
+const (
+	sketchHdrNumBlocksOff  = 4 // byte offset of numBlocks uint32 field
+	sketchHdrNumColumnsOff = 8 // byte offset of numColumns uint32 field
+)
+
 // Ensure columnSketchData satisfies queryplanner.ColumnSketch at compile time.
 var _ queryplanner.ColumnSketch = (*columnSketchData)(nil)
 
 // columnSketchData holds parsed column-major sketch data for one column across all blocks.
-// Bloom data is fixed-size and copied directly at parse time.
+// Bloom data is stored as a zero-copy sub-slice of the metadata buffer; no copy is made at parse time.
 type columnSketchData struct {
 	presence   []uint64   // bitset: 1 bit per block
 	topkFP     [][]uint64 // [presentIdx][entries] fingerprints
@@ -55,6 +62,35 @@ type columnSketchData struct {
 type sketchIndex struct {
 	columns   map[string]*columnSketchData
 	numBlocks int
+}
+
+// SizeBytes returns the estimated in-memory size of this sketchIndex for LRU cache budgeting.
+// Counts owned heap allocations (topkFP, topkCount, presentMap, presence) plus the bloom and
+// distinctRaw bytes referenced into the metadata buffer, so the cache budget reflects the true
+// cost of keeping this entry alive.
+func (si *sketchIndex) SizeBytes() int64 {
+	const overhead = 64 // map + struct header
+	n := int64(overhead)
+	for _, cd := range si.columns {
+		// presence bitset
+		n += int64(len(cd.presence)) * 8
+		// topkFP + topkCount per present block
+		for i := range cd.topkFP {
+			n += int64(len(cd.topkFP[i])) * 8
+			if i < len(cd.topkCount) {
+				n += int64(len(cd.topkCount[i])) * 2
+			}
+		}
+		// presentMap
+		n += int64(len(cd.presentMap)) * 8
+		// distinctRaw and bloom: zero-copy into metadataBytes, but charge their size
+		// here so the cache budget accounts for the buffer they keep alive.
+		n += int64(len(cd.distinctRaw))
+		for _, b := range cd.bloom {
+			n += int64(len(b))
+		}
+	}
+	return n
 }
 
 // Presence returns a bitset with 1 bit per block (1 = column present in block).
@@ -142,8 +178,8 @@ func parseSketchIndexSection(data []byte) (*sketchIndex, int, error) {
 	// hasCMS is true for old formats (SKTD, SKTC) that contain CMS bytes in the stream.
 	hasCMS := isBloom || isLegacy
 
-	rawBlocks := binary.LittleEndian.Uint32(data[4:])
-	rawColumns := binary.LittleEndian.Uint32(data[8:])
+	rawBlocks := binary.LittleEndian.Uint32(data[sketchHdrNumBlocksOff:])
+	rawColumns := binary.LittleEndian.Uint32(data[sketchHdrNumColumnsOff:])
 	pos := 12
 
 	// Validate as uint32 before converting to int to avoid wrap-around on 32-bit platforms.

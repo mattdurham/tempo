@@ -30,7 +30,7 @@ type modulesSpanFieldsAdapter struct {
 
 // modulesSpanFieldsAdapterPool recycles *modulesSpanFieldsAdapter to avoid
 // per-span heap allocation. Use getSpanFieldsAdapter / putSpanFieldsAdapter.
-// NOTE-ALLOC-4: see blockio/NOTES.md §50.
+// NOTE-ALLOC-4: see blockio/NOTES.md § NOTE-ALLOC-4 (adapter pool avoids per-span heap allocation).
 var modulesSpanFieldsAdapterPool = sync.Pool{
 	New: func() any { return &modulesSpanFieldsAdapter{} },
 }

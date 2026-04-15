@@ -18,10 +18,23 @@ import (
 	"github.com/golang/snappy"
 )
 
+// decodeBoundedSnappyColumn snappy-decodes compressed, rejecting inputs whose
+// decoded size would exceed MaxBlockSize (decompression-bomb guard for column blobs).
+func decodeBoundedSnappyColumn(compressed []byte) ([]byte, error) {
+	decodedLen, lenErr := snappy.DecodedLen(compressed)
+	if lenErr != nil {
+		return nil, fmt.Errorf("snappy decoded length: %w", lenErr)
+	}
+	if decodedLen > MaxBlockSize {
+		return nil, fmt.Errorf("snappy decoded size %d exceeds MaxBlockSize %d", decodedLen, MaxBlockSize)
+	}
+	return snappy.Decode(nil, compressed)
+}
+
 // NOTE-011: Snappy decode buffer pool — 64KB default cap, 4MB cap guard.
 // AcquireIntrinsicBuf / ReleaseIntrinsicBuf are used in decodePagedColumnBlob
-// and DecodePageTOC to reuse decode scratch buffers across calls, avoiding
-// per-page allocations in the common case where page blobs are ≤64KB.
+// to reuse decode scratch buffers across calls, avoiding per-page allocations
+// in the common case where page blobs are ≤64KB.
 // BytesValues returned from DecodeFlatPage / decodeLegacyFlatBlob must be copied
 // (make+copy) before appending to IntrinsicColumn so the pool buffer can be safely
 // reused on the next call without corrupting live column data.
@@ -49,7 +62,7 @@ func ReleaseIntrinsicBuf(bp *[]byte) {
 
 // DecodeTOC decompresses a TOC blob and parses it into a slice of IntrinsicColMeta.
 func DecodeTOC(blob []byte) ([]IntrinsicColMeta, error) {
-	raw, err := snappy.Decode(nil, blob)
+	raw, err := decodeBoundedSnappyColumn(blob)
 	if err != nil {
 		return nil, fmt.Errorf("DecodeTOC: snappy: %w", err)
 	}
@@ -146,7 +159,7 @@ func DecodeTOC(blob []byte) ([]IntrinsicColMeta, error) {
 //	  bloom_len[2 LE] + bloom[bloom_len]
 func EncodePageTOC(toc PagedIntrinsicTOC) ([]byte, error) {
 	var buf bytes.Buffer
-	buf.WriteByte(0x01) // page_toc_version
+	buf.WriteByte(PageTOCVersion) // PageTOCVersion
 
 	var tmp4 [4]byte
 	var tmp2 [2]byte
@@ -184,20 +197,19 @@ func EncodePageTOC(toc PagedIntrinsicTOC) ([]byte, error) {
 
 // DecodePageTOC decompresses a page TOC blob and parses it into a PagedIntrinsicTOC.
 func DecodePageTOC(blob []byte) (PagedIntrinsicTOC, error) {
-	// NOTE-011: use a pooled buffer for the snappy decode scratch space.
-	tocBuf := AcquireIntrinsicBuf()
-	raw, err := snappy.Decode(*tocBuf, blob)
+	raw, err := decodeBoundedSnappyColumn(blob)
 	if err != nil {
-		ReleaseIntrinsicBuf(tocBuf)
 		return PagedIntrinsicTOC{}, fmt.Errorf("DecodePageTOC: snappy: %w", err)
 	}
-	*tocBuf = raw
-	defer ReleaseIntrinsicBuf(tocBuf)
 	if len(raw) < 8 {
 		return PagedIntrinsicTOC{}, fmt.Errorf("DecodePageTOC: too short: %d bytes", len(raw))
 	}
 	pos := 0
-	pos++ // page_toc_version (0x01)
+	tocVer := raw[pos]
+	pos++
+	if tocVer != PageTOCVersion {
+		return PagedIntrinsicTOC{}, fmt.Errorf("DecodePageTOC: unsupported page_toc_version %d (want %d)", tocVer, PageTOCVersion)
+	}
 
 	pageCount := int(binary.LittleEndian.Uint32(raw[pos:]))
 	pos += 4
@@ -561,7 +573,7 @@ func PeekIntrinsicBlobHeader(blob []byte) (format uint8, colType ColumnType, cou
 	// TODO: if this proves expensive at scale, consider storing a tiny uncompressed prefix
 	// (format_version+format+col_type+row_count) alongside the compressed blob so that
 	// PeekIntrinsicBlobHeader can read 7 bytes without decompressing anything.
-	raw, decErr := snappy.Decode(nil, blob)
+	raw, decErr := decodeBoundedSnappyColumn(blob)
 	if decErr != nil {
 		return 0, 0, 0, fmt.Errorf("PeekIntrinsicBlobHeader: snappy: %w", decErr)
 	}
@@ -583,7 +595,7 @@ func DecodeIntrinsicColumnBlob(blob []byte) (*IntrinsicColumn, error) {
 		return decodePagedColumnBlob(blob)
 	}
 
-	raw, err := snappy.Decode(nil, blob)
+	raw, err := decodeBoundedSnappyColumn(blob)
 	if err != nil {
 		return nil, fmt.Errorf("DecodeIntrinsicColumnBlob: snappy: %w", err)
 	}
@@ -872,7 +884,7 @@ func scanDictPagedBlob(
 		if pageEnd > len(blob) {
 			return nil
 		}
-		pageRaw, decErr := snappy.Decode(nil, blob[pageStart:pageEnd])
+		pageRaw, decErr := decodeBoundedSnappyColumn(blob[pageStart:pageEnd])
 		if decErr != nil {
 			slog.Debug("intrinsic_codec: snappy decode failed", "err", decErr)
 			return nil
@@ -905,7 +917,7 @@ func ScanDictColumnRefs(
 		return scanDictPagedBlob(blob, matchFn, nil, maxRefs)
 	}
 
-	raw, err := snappy.Decode(nil, blob)
+	raw, err := decodeBoundedSnappyColumn(blob)
 	if err != nil {
 		slog.Debug("intrinsic_codec: snappy decode failed", "err", err)
 		return nil
@@ -1096,7 +1108,7 @@ func scanFlatPagedBlob(blob []byte, lo, hi uint64, hasLo, hasHi bool, maxRefs in
 		if pageEnd > len(blob) {
 			return nil
 		}
-		pageRaw, decErr := snappy.Decode(nil, blob[pageStart:pageEnd])
+		pageRaw, decErr := decodeBoundedSnappyColumn(blob[pageStart:pageEnd])
 		if decErr != nil {
 			slog.Debug("intrinsic_codec: snappy decode failed", "err", decErr)
 			return nil
@@ -1151,7 +1163,7 @@ func scanFlatPagedFiltered(blob []byte, backward bool, limit int, filter func(Bl
 		if pageEnd > len(blob) {
 			return false
 		}
-		pageRaw, decErr := snappy.Decode(nil, blob[pageStart:pageEnd])
+		pageRaw, decErr := decodeBoundedSnappyColumn(blob[pageStart:pageEnd])
 		if decErr != nil {
 			slog.Debug("intrinsic_codec: snappy decode failed", "err", decErr)
 			return false
@@ -1227,7 +1239,7 @@ func ScanFlatColumnRefs(
 		return scanFlatPagedBlob(blob, lo, hi, hasLo, hasHi, maxRefs)
 	}
 
-	raw, err := snappy.Decode(nil, blob)
+	raw, err := decodeBoundedSnappyColumn(blob)
 	if err != nil {
 		slog.Debug("intrinsic_codec: snappy decode failed", "err", err)
 		return nil
@@ -1325,7 +1337,7 @@ func ScanFlatColumnTopKRefs(blob []byte, limit int, backward bool) []BlockRef {
 		return scanFlatPagedFiltered(blob, backward, limit, nil)
 	}
 
-	raw, err := snappy.Decode(nil, blob)
+	raw, err := decodeBoundedSnappyColumn(blob)
 	if err != nil {
 		slog.Debug("intrinsic_codec: snappy decode failed", "err", err)
 		return nil
@@ -1417,7 +1429,7 @@ func ScanFlatColumnRefsFiltered(
 		return scanFlatPagedFiltered(blob, backward, limit, filter)
 	}
 
-	raw, err := snappy.Decode(nil, blob)
+	raw, err := decodeBoundedSnappyColumn(blob)
 	if err != nil {
 		slog.Debug("intrinsic_codec: snappy decode failed", "err", err)
 		return nil

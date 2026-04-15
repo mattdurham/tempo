@@ -4,14 +4,40 @@ package executor
 
 import "time"
 
+// ExecutionPath constants identify which code path ran in a query.
+const (
+	ExecPathBlockPlain         = "block-plain"
+	ExecPathBlockTopK          = "block-topk"
+	ExecPathBlockPruned        = "block-pruned"
+	ExecPathIntrinsicPlain     = "intrinsic-plain"
+	ExecPathIntrinsicTopKKLL   = "intrinsic-topk-kll"
+	ExecPathIntrinsicTopKScan  = "intrinsic-topk-scan"
+	ExecPathMixedPlain         = "mixed-plain"
+	ExecPathMixedTopK          = "mixed-topk"
+	ExecPathBloomRejected      = "bloom-rejected"
+	ExecPathIntrinsicNeedBlock = "intrinsic-need-block-scan"
+)
+
+// StepStats.Name constants identify the phase within the query execution pipeline.
+const (
+	stepNamePlan           = "plan"
+	stepNameBlockScan      = "block-scan"
+	stepNameIntrinsic      = "intrinsic"
+	stepNameMixedPrefilter = "mixed-prefilter"
+)
+
 // QueryStats is returned by Collect and CollectLogs with per-phase execution metrics.
 // It replaces CollectStats (internal) and LogQueryStats (public api.go).
 //
-// ExecutionPath identifies which code path ran. One of:
+// ExecutionPath identifies which code path ran:
 //
-//	"intrinsic-plain", "intrinsic-topk-kll", "intrinsic-topk-scan",
-//	"mixed-plain", "mixed-topk", "block-plain", "block-topk",
-//	"intrinsic-need-block-scan", "bloom-rejected", "block-pruned".
+//	Collect (trace/span queries):
+//	  "intrinsic-plain", "intrinsic-topk-kll", "intrinsic-topk-scan",
+//	  "mixed-plain", "mixed-topk", "block-plain", "block-topk",
+//	  "intrinsic-need-block-scan", "bloom-rejected", "block-pruned".
+//
+//	CollectLogs (log queries):
+//	  "block-plain" (full block scan, no top-K), "block-topk" (heap-based top-K by timestamp).
 //
 // Steps contains one entry per phase that actually ran. Phases that were
 // skipped (e.g. intrinsic paths always skip the block-scan phase) are absent.
@@ -25,7 +51,7 @@ type QueryStats struct {
 // or "" if the plan step is absent or has no explain value.
 func (qs QueryStats) Explain() string {
 	for i := range qs.Steps {
-		if qs.Steps[i].Name == "plan" {
+		if qs.Steps[i].Name == stepNamePlan {
 			if v, ok := qs.Steps[i].Metadata["explain"].(string); ok {
 				return v
 			}
@@ -39,7 +65,7 @@ func (qs QueryStats) Explain() string {
 // or 0 if the plan step is absent.
 func (qs QueryStats) SelectedBlocks() int {
 	for i := range qs.Steps {
-		if qs.Steps[i].Name == "plan" {
+		if qs.Steps[i].Name == stepNamePlan {
 			if v, ok := qs.Steps[i].Metadata["selected_blocks"].(int); ok {
 				return v
 			}

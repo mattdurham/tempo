@@ -71,6 +71,8 @@ type CollectOptions struct {
 	// "log:timestamp" enables per-row filtering (log mode).
 	TimestampColumn string
 	// SelectColumns limits which output columns are decoded from block blobs.
+	// nil or empty means all columns are returned (no projection applied).
+	// A nil slice and a non-nil empty slice are equivalent: both mean all columns are returned.
 	// Two-path strategy (see stream.go Collect for implementation):
 	//   - No predicate columns (e.g. "{}"): SelectColumns becomes the sole first-pass filter,
 	//     preventing all other columns from being decoded on every scanned block.
@@ -80,7 +82,9 @@ type CollectOptions struct {
 	// NOTE: When AllColumns=true, SelectColumns has no effect (see AllColumns doc above).
 	SelectColumns []string
 	TimeRange     queryplanner.TimeRange
-	Limit         int
+	// Limit caps the number of returned rows. 0 means no limit (return all matches).
+	// Negative values are treated as 0 (unlimited) — the executor does not validate sign.
+	Limit int
 	// StartBlock is the first internal block index to include (0-based, inclusive).
 	// Used by the frontend sharder to partition a single file across multiple jobs.
 	// 0 with BlockCount==0 means scan all blocks (no sub-file sharding).
@@ -226,7 +230,7 @@ func Collect(
 		}
 		// SPEC-ROOT-010: slog.Warn when intrinsic fast path falls through to block scan.
 		slog.Warn("intrinsic fast path fell through to full block scan",
-			"execution_path", "intrinsic-need-block-scan",
+			"execution_path", ExecPathIntrinsicNeedBlock,
 			"total_blocks", r.BlockCount(),
 		)
 		// errNeedBlockScan: fall through to full block scan. fastQS is discarded.
@@ -256,7 +260,7 @@ func Collect(
 	}
 
 	qs.Steps = append(qs.Steps, StepStats{
-		Name:     "plan",
+		Name:     stepNamePlan,
 		Duration: time.Since(planStart),
 		Metadata: map[string]any{
 			"total_blocks":    plan.TotalBlocks,
@@ -269,7 +273,7 @@ func Collect(
 	})
 
 	if len(plan.SelectedBlocks) == 0 {
-		qs.ExecutionPath = "block-pruned"
+		qs.ExecutionPath = ExecPathBlockPruned
 		qs.TotalDuration = time.Since(queryStart)
 		return nil, qs, nil
 	}
@@ -299,7 +303,7 @@ func Collect(
 	// VECTOR() queries always use the plain scan path to enable correct cosine top-K;
 	// timestamp-sorted top-K and cosine-similarity top-K have incompatible semantics.
 	if shouldUseTopKPath(opts, program) {
-		qs.ExecutionPath = "block-topk"
+		qs.ExecutionPath = ExecPathBlockTopK
 		backward := opts.Direction == queryplanner.Backward
 		buf := &topKHeap{entries: make([]topKEntry, 0, opts.Limit), backward: backward}
 		var scanErr error
@@ -307,6 +311,7 @@ func Collect(
 			r,
 			program,
 			wantColumns,
+			secondPassCols,
 			opts,
 			plan,
 			buf,
@@ -315,11 +320,12 @@ func Collect(
 			backward,
 		)
 		if scanErr != nil {
+			qs.TotalDuration = time.Since(queryStart)
 			return nil, qs, scanErr
 		}
 		results = topKDeliver(buf, backward)
 	} else {
-		qs.ExecutionPath = "block-plain"
+		qs.ExecutionPath = ExecPathBlockPlain
 		// NOTE-054: when Limit > 0, preallocate exactly opts.Limit (exact upper bound for
 		// results). When unlimited, leave nil — result count is unbounded (append handles it).
 		if opts.Limit > 0 {
@@ -335,12 +341,13 @@ func Collect(
 			&results,
 		)
 		if scanErr != nil {
+			qs.TotalDuration = time.Since(queryStart)
 			return nil, qs, scanErr
 		}
 	}
 
 	qs.Steps = append(qs.Steps, StepStats{
-		Name:      "block-scan",
+		Name:      stepNameBlockScan,
 		Duration:  time.Since(scanStart),
 		BytesRead: bytesRead,
 		IOOps:     fetchedGroups,
@@ -619,7 +626,7 @@ func countUniqueBlockIdxs(refs []modules_shared.BlockRef) int {
 //	        → return IntrinsicFields MatchedRows (ZERO block reads; fields from objectcache)
 //	Case B: pure intrinsic + sort     → BlockRefsFromIntrinsicTOC → pack into sorted
 //	        keys → ScanFlatColumnRefsFiltered → return IntrinsicFields MatchedRows
-//	        (ZERO block reads)
+//	        (ZERO block reads only when wantColumns AND secondPassCols are both nil)
 //	Case C: mixed + no sort           → blockRefsFromIntrinsicPartial → fetch candidate
 //	        blocks → ColumnPredicate re-eval → intersect → collect up to limit
 //	Case D: mixed + sort              → blockRefsFromIntrinsicPartial → fetch candidate
@@ -640,7 +647,7 @@ func collectWithBloomCheck(
 ) ([]MatchedRow, QueryStats, error) {
 	var qs QueryStats
 	if program.Predicates != nil && fileLevelBloomReject(r, program.Predicates.Nodes) {
-		qs.ExecutionPath = "bloom-rejected"
+		qs.ExecutionPath = ExecPathBloomRejected
 		return nil, qs, nil
 	}
 	return collectFromIntrinsicRefs(r, program, opts, wantColumns, secondPassCols, &qs)
@@ -685,21 +692,21 @@ func collectFromIntrinsicRefs(
 		refs = blockRefsFromIntrinsicPartial(r, program, 0)
 	}
 	if refs == nil {
-		qs.ExecutionPath = "intrinsic-need-block-scan"
+		qs.ExecutionPath = ExecPathIntrinsicNeedBlock
 		return nil, *qs, errNeedBlockScan
 	}
 	if len(refs) == 0 {
 		if isPureIntrinsic {
 			if hasSort {
-				qs.ExecutionPath = "intrinsic-topk-kll" // would have been Case B
+				qs.ExecutionPath = ExecPathIntrinsicTopKKLL // would have been Case B
 			} else {
-				qs.ExecutionPath = "intrinsic-plain" // would have been Case A
+				qs.ExecutionPath = ExecPathIntrinsicPlain // would have been Case A
 			}
 		} else {
 			if hasSort {
-				qs.ExecutionPath = "mixed-topk" // would have been Case D
+				qs.ExecutionPath = ExecPathMixedTopK // would have been Case D
 			} else {
-				qs.ExecutionPath = "mixed-plain" // would have been Case C
+				qs.ExecutionPath = ExecPathMixedPlain // would have been Case C
 			}
 		}
 		return nil, *qs, nil
@@ -711,7 +718,7 @@ func collectFromIntrinsicRefs(
 	if !isPureIntrinsic {
 		uniqueBlocks := countUniqueBlockIdxs(refs)
 		if uniqueBlocks*2 > r.BlockCount() {
-			qs.ExecutionPath = "intrinsic-need-block-scan"
+			qs.ExecutionPath = ExecPathIntrinsicNeedBlock
 			return nil, *qs, errNeedBlockScan
 		}
 	}
@@ -725,7 +732,7 @@ func collectFromIntrinsicRefs(
 	// intrinsic TOC already filters refs by predicate. selected_blocks reflects the
 	// number of distinct blocks containing matching refs after shard filtering.
 	qs.Steps = append(qs.Steps, StepStats{
-		Name: "plan",
+		Name: stepNamePlan,
 		Metadata: map[string]any{
 			"total_blocks":    r.BlockCount(),
 			"selected_blocks": countUniqueBlockIdxs(refs),
@@ -841,7 +848,9 @@ func forEachBlockInGroups(
 			if parseErr != nil {
 				return fmt.Errorf("%s ParseBlockFromBytes block %d: %w", callerName, blockIdx, parseErr)
 			}
-			if wantColumns != nil {
+			// M-18: Skip second parse when candidateRows is empty — no rows passed the first-pass
+			// predicate, so decoding additional columns would produce no output for this block.
+			if wantColumns != nil && len(candidateRows) > 0 {
 				bwb, parseErr = r.ParseBlockFromBytes(bwb.RawBytes, secondPassCols, meta)
 				if parseErr != nil {
 					return fmt.Errorf("%s second pass block %d: %w", callerName, blockIdx, parseErr)
@@ -876,17 +885,16 @@ func collectIntrinsicPlain(
 	secondPassCols map[string]struct{},
 	qs *QueryStats,
 ) ([]MatchedRow, error) {
-	qs.ExecutionPath = "intrinsic-plain"
+	qs.ExecutionPath = ExecPathIntrinsicPlain
 	stepStart := time.Now()
 	// Sort refs by (BlockIdx, RowIdx) for deterministic traversal order.
+	// Shard filtering was already applied by collectFromIntrinsicRefs before this call.
 	slices.SortFunc(refs, blockRefCompare)
 
-	// Filter refs to shard's block range if sub-file sharding is active.
-	refs = filterRefsByShardRange(refs, opts)
 	selectedBlocks := countUniqueBlockIdxs(refs)
 	if len(refs) == 0 {
 		qs.Steps = append(qs.Steps, StepStats{
-			Name:     "intrinsic",
+			Name:     stepNameIntrinsic,
 			Duration: time.Since(stepStart),
 			Metadata: map[string]any{"selected_blocks": selectedBlocks},
 		})
@@ -917,7 +925,7 @@ func collectIntrinsicPlain(
 		return nil, err
 	}
 	qs.Steps = append(qs.Steps, StepStats{
-		Name:     "intrinsic",
+		Name:     stepNameIntrinsic,
 		Duration: time.Since(stepStart),
 		Metadata: map[string]any{"selected_blocks": selectedBlocks},
 	})
@@ -1084,9 +1092,9 @@ func collectIntrinsicTopKKLL(
 		}
 		pairs = filtered
 	}
-	qs.ExecutionPath = "intrinsic-topk-kll"
+	qs.ExecutionPath = ExecPathIntrinsicTopKKLL
 	qs.Steps = append(qs.Steps, StepStats{
-		Name:     "intrinsic",
+		Name:     stepNameIntrinsic,
 		Duration: time.Since(stepStart),
 		Metadata: map[string]any{
 			"ref_count":  len(refs),
@@ -1159,9 +1167,9 @@ func collectIntrinsicTopKScan(
 			return found
 		},
 	)
-	qs.ExecutionPath = "intrinsic-topk-scan"
+	qs.ExecutionPath = ExecPathIntrinsicTopKScan
 	qs.Steps = append(qs.Steps, StepStats{
-		Name:     "intrinsic",
+		Name:     stepNameIntrinsic,
 		Duration: time.Since(stepStart),
 		Metadata: map[string]any{
 			"ref_count":  len(refs),
@@ -1222,9 +1230,9 @@ func collectMixedPlain(
 
 	prefilterStart := time.Now()
 	blockOrder, blockCandidates := groupRefsByBlock(refs)
-	qs.ExecutionPath = "mixed-plain"
+	qs.ExecutionPath = ExecPathMixedPlain
 	qs.Steps = append(qs.Steps, StepStats{
-		Name:     "mixed-prefilter",
+		Name:     stepNameMixedPrefilter,
 		Duration: time.Since(prefilterStart),
 		Metadata: map[string]any{
 			"candidate_blocks": len(blockOrder),
@@ -1303,9 +1311,9 @@ func collectMixedTopK(
 
 	prefilterStart := time.Now()
 	blockOrder, blockCandidates := groupRefsByBlock(refs)
-	qs.ExecutionPath = "mixed-topk"
+	qs.ExecutionPath = ExecPathMixedTopK
 	qs.Steps = append(qs.Steps, StepStats{
-		Name:     "mixed-prefilter",
+		Name:     stepNameMixedPrefilter,
 		Duration: time.Since(prefilterStart),
 		Metadata: map[string]any{
 			"candidate_blocks": len(blockOrder),

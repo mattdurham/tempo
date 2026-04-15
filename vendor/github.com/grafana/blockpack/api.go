@@ -53,6 +53,7 @@ type QueryOptions struct {
 	// When non-empty, only columns whose names are present in this slice are
 	// returned by GetField and IterateFields. nil or empty means all columns
 	// are returned (no projection applied).
+	// A nil slice and a non-nil empty slice are equivalent: both mean all columns are returned.
 	SelectColumns []string
 	// StartNano is the inclusive lower bound for block-level time pruning (unix nanoseconds).
 	// Internal blocks whose span:start range ends before StartNano are skipped entirely.
@@ -62,7 +63,9 @@ type QueryOptions struct {
 	// Internal blocks whose span:start range begins after EndNano are skipped entirely.
 	// 0 means no upper bound.
 	EndNano uint64
-	Limit   int // Maximum number of spans to return (0 = unlimited).
+	// Limit is the maximum number of spans to return (0 = unlimited).
+	// Negative values are treated as 0 (unlimited) — the executor does not validate sign.
+	Limit int
 	// StartBlock is the first internal block index to scan (0-based, inclusive).
 	// Used by the frontend sharder to partition a single blockpack file into
 	// multiple sub-file jobs. 0 means start from the first block.
@@ -279,8 +282,12 @@ type LogMetricOptions struct {
 	// GroupBy lists label names to group the time series by.
 	GroupBy []string
 	// StartNano is the inclusive start of the query time window (unix nanoseconds).
+	// Zero means the Unix epoch (1970-01-01 00:00:00 UTC), NOT "no lower bound".
+	// Contrast with QueryOptions.StartNano (uint64) where 0 is treated as unbounded.
 	StartNano int64
 	// EndNano is the exclusive end of the query time window (unix nanoseconds).
+	// Zero means the Unix epoch (1970-01-01 00:00:00 UTC), NOT "no upper bound".
+	// Contrast with QueryOptions.EndNano (uint64) where 0 is treated as unbounded.
 	EndNano int64
 	// StepNano is the time bucket step size in nanoseconds (default: 60 seconds).
 	StepNano int64
@@ -382,10 +389,14 @@ type TraceMetricOptions struct {
 	// StartNano is the approximate start of the query time window (unix nanoseconds).
 	// Internally aligned down to the nearest StepNano boundary before query execution.
 	// The effective interval is right-closed: spans at exactly alignedStart are excluded.
+	// Zero means the Unix epoch (1970-01-01 00:00:00 UTC), NOT "no lower bound".
+	// Contrast with QueryOptions.StartNano (uint64) where 0 is treated as unbounded.
 	StartNano int64
 	// EndNano is the approximate end of the query time window (unix nanoseconds).
 	// Internally aligned up to the nearest StepNano boundary before query execution.
 	// The effective interval is right-closed: spans at exactly alignedEnd are included.
+	// Zero means the Unix epoch (1970-01-01 00:00:00 UTC), NOT "no upper bound".
+	// Contrast with QueryOptions.EndNano (uint64) where 0 is treated as unbounded.
 	EndNano int64
 	// StepNano is the time bucket step size in nanoseconds (default: 60 seconds).
 	StepNano int64

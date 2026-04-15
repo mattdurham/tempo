@@ -246,3 +246,37 @@ Intersects with label matcher result.
 **Assertions:**
 - `labels.Has("__error__")` == true.
 - `labels["__error__"]` == `""` (non-strict: parse errors do not set `"LogfmtParserErr"`).
+
+---
+
+## LabelSet Tests (labelset_test.go)
+
+### LQL-TEST-LS-001: TestNewEmptyLabelSet_Empty
+**Scenario:** `NewEmptyLabelSet` returns a zero-entry LabelSet; Get returns "", Keys returns nil/empty, Materialize returns empty map.
+
+### LQL-TEST-LS-002: TestNewMapLabelSet_GetSet
+**Scenario:** `NewMapLabelSet` wraps an existing map; Get returns wrapped values; Set overwrites them.
+
+### LQL-TEST-LS-003: TestMapLabelSet_Delete
+**Scenario:** Delete removes a key; Get returns ""; the key is absent from Keys().
+
+### LQL-TEST-LS-004: TestMapLabelSet_Keys
+**Scenario:** Keys returns all present (non-deleted) keys. After Delete("b"), only the remaining keys are returned.
+
+### LQL-TEST-LS-005: TestMapLabelSet_Materialize
+**Scenario:** Materialize returns a map with all present keys, including newly Set ones and excluding Deleted ones.
+
+### LQL-TEST-LS-006: TestEmptyLabelSet_SetAndGet
+**Scenario:** Set on an empty label set followed by Get returns the stored value.
+
+### LQL-TEST-LS-007: TestPipelineStageFunc_AcceptsLabelSet
+**Scenario:** `PipelineStageFunc` signature accepts and returns `LabelSet` (compile-time interface check).
+
+### LQL-TEST-LS-008: TestMapLabelSet_Has
+**Scenario:** `Has` returns true for keys with non-empty or empty values, false for absent or deleted keys. Also verifies that `Set` with empty value followed by `Has` returns true.
+
+### LQL-TEST-LS-009: TestLogfmtStage_SkipsEmptyStoredKey
+**Scenario:** LogfmtStage does not overwrite a pre-populated key that has an empty value (stored-column wins, even for empty). New keys in the logfmt body are still extracted.
+
+### LQL-TEST-LS-010: TestJSONStage_SkipsEmptyStoredKey
+**Scenario:** JSONStage does not overwrite a pre-populated key with an empty value. New keys in the JSON body are extracted normally.

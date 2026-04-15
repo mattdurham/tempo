@@ -173,7 +173,8 @@ type Backend interface {
 - `Dim` returns the embedding dimension (constant for the lifetime of the backend).
 - `Close` releases resources; calling it more than once must not panic.
 - Implementations need not be thread-safe unless documented otherwise.
-  `MockBackend` is thread-safe; `yzmaBackend` and `httpBackend` are not.
+  `MockBackend` is thread-safe; `httpBackend` is safe for concurrent use (stateless
+  after construction; `EmbedBatch` uses per-call goroutines with no shared mutable state).
 
 Back-ref: `internal/modules/embedder/backend.go:Backend`
 
@@ -181,31 +182,40 @@ Back-ref: `internal/modules/embedder/backend.go:Backend`
 
 ## SPEC-010: HTTPConfig and NewHTTP
 *Added: 2026-04-02*
+*Updated: 2026-04-14*
 
 ```go
 type HTTPConfig struct {
-    ServerURL     string
-    Fields        []EmbeddingField
-    MaxTextLength int
-    Timeout       time.Duration // defaults to 30s
+    ServerURL            string
+    Fields               []EmbeddingField
+    MaxTextLength        int
+    Timeout              time.Duration // defaults to 120s
+    MaxBatchSize         int           // defaults to 32 (TEI per-request limit)
+    MaxConcurrentBatches int           // defaults to 4 (parallel pod distribution)
 }
 
 func NewHTTP(cfg HTTPConfig) (*Embedder, error)
 ```
 
 **Behavior:**
-- `NewHTTP` sends a probe request (empty batch POST /embed) to determine `Dim()`.
-- Returns error if the server is unreachable, returns a non-200 status, or returns invalid JSON.
+- `NewHTTP` sends a probe request (`POST /embed` with `["probe"]`) via `doPost` (single
+  attempt, no retry loop) to determine `Dim()`.
+- Returns error if the server is unreachable, returns a non-200 status, or returns an
+  empty vector response.
 
-**HTTP protocol:**
-- Request: `POST <ServerURL>/embed` with JSON body `{"texts": ["t1", "t2", ...]}`
-- Response: `{"vectors": [[...], ...], "dim": N}`
+**HTTP protocol (TEI — HuggingFace Text Embeddings Inference):**
+- Request: `POST <ServerURL>/embed` with JSON body `{"inputs": ["t1", "t2", ...], "normalize": true}`
+- Response: `[[float32, ...], ...]` — flat JSON array of float32 vectors (one per input text)
 
 **Invariants:**
-- `Dim()` returns the value from the probe response `dim` field.
-- `EmbedBatch` returns error if `len(response.vectors) != len(texts)`.
-- `Close` is a no-op (no persistent connection is held).
-- `HTTPConfig.Timeout` defaults to 30s if zero.
+- `Dim()` returns `len(response[0])` from the probe response.
+- `EmbedBatch` chunks large batches into sub-batches of size `MaxBatchSize` and sends
+  up to `MaxConcurrentBatches` chunks in parallel.
+- `EmbedBatch` returns error if any chunk request fails or if `len(response) != len(chunk)`.
+- `Close` is a no-op (no persistent connection is held; keep-alives are disabled).
+- `HTTPConfig.Timeout` defaults to 120s if zero.
+- `HTTPConfig.MaxBatchSize` defaults to 32 if zero.
+- `HTTPConfig.MaxConcurrentBatches` defaults to 4 if zero.
 
 Back-ref: `internal/modules/embedder/backend_http.go:NewHTTP`
 

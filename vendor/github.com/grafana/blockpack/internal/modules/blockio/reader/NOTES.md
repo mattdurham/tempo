@@ -1,62 +1,104 @@
 # Reader Module — Design Notes
 
-## NOTE-001: Lazy Column Decode (Presence-First, On-Demand Full Decode)
+## NOTE-001: Lazy Column Decode (Compressed-First, On-Demand Full Decode)
 *Added: 2026-03-05*
+*Updated: 2026-04-14 — V14 two-stage model: compressedEncoding → ensureDecompressed → decodeNow*
 
 **Problem:** `ParseBlockFromBytes` with a `wantColumns` filter decoded only the predicate
 columns eagerly, leaving all remaining columns absent from the block. Callers (executor)
 had to issue a second pass via `AddColumnsToBlock` to decode those remaining columns eagerly
 before the row loop — decoding ~90 columns per block even when only ~10-15 were accessed.
 
-**Solution:** Replace the two-pass decode with a single-pass lazy model:
-1. **Eager pass** — decode `wantColumns` fully (presence + values). Unchanged.
-2. **Lazy registration** — for all other columns, call `decodePresenceOnly` (no zstd
-   decompression) and store a `rawEncoding` sub-slice into the block's raw bytes. The
-   `Column.Present` bitset is populated immediately; value data is deferred.
-3. **On-demand full decode** — the first call to any value accessor (`StringValue`,
-   `Uint64Value`, etc.) checks `rawEncoding != nil` and calls `decodeNow()`, which performs
-   the full zstd decompression and populates all typed fields.
+**Solution (V14):** Replace the two-pass decode with a single-pass lazy model:
+1. **Eager pass** — decode `wantColumns` fully (snappy decompress + presence + values).
+   Mark `decoded=true`. Unchanged.
+2. **Lazy registration** — for all other columns, store `compressedEncoding` as a zero-copy
+   sub-slice of rawBytes. No snappy decompression occurs. `rawEncoding` stays nil.
+   (SPEC-V14-002)
+3. **On-demand full decode** — the first call to any value accessor OR `IsPresent()` calls
+   `decodeNow()` (via `decodeOnce`), which first calls `ensureDecompressed()` (via
+   `decompressOnce`) to snappy-decode into `rawEncoding`, then runs `readColumnEncoding`
+   to populate all typed fields.
 
-**`decodePresenceOnly` complexity:** O(M/8) where M is span count — scans past compressed
-blob length prefixes to reach the uncompressed presence RLE. No zstd involved.
+**`Column.IsPresent()` behavior:** Triggers full decode on a lazy column (same path as
+any value accessor). After decode, if `c.Present` is nil, all spans are present (no
+bitmap). If non-nil, the bitset is consulted.
 
-**`Column.IsPresent()` contract:** Always available after `ParseBlockFromBytes` without
-triggering `decodeNow()`. Presence is decoded during lazy registration.
+**Savings estimate (T9/Q66, 1997 blocks, ~90 non-predicate columns accessed ~15 times):**
+- Old: 1997 × 90 × (snappy + full_decode) ≈ 870ms
+- New: 1997 × ~15 × (snappy + full_decode) ≈ 145ms (non-accessed columns: 0 cost)
+- Expected saving: ~725ms per query (improved from prior estimate by eliminating presence-only decode overhead)
 
-**Savings estimate (T9/Q66, 1997 blocks, ~90 non-predicate columns):**
-- Old: 1997 × 90 × zstd_decompress ≈ 870ms
-- New: 1997 × 90 × presence_only + 1997 × ~15 × zstd_decompress ≈ 40ms + 150ms = 190ms
-- Expected saving: ~680ms per query
-
-Back-ref: `internal/modules/blockio/reader/column.go:decodePresenceOnly`,
+Back-ref: `internal/modules/blockio/reader/column.go:ensureDecompressed`,
 `internal/modules/blockio/reader/column.go:decodeNow`,
 `internal/modules/blockio/reader/block.go:Column`,
 `internal/modules/blockio/reader/block_parser.go:parseBlockColumnsReuse`
 
 ---
 
-## NOTE-002: rawEncoding Lifetime Safety
+## NOTE-002: rawEncoding Lifetime Safety and Concurrency Model
 *Added: 2026-03-05*
+*Updated: 2026-04-14 — single-goroutine claim removed; decodeOnce/decompressOnce added for concurrent safety*
 
-**Invariant:** `rawEncoding` is a sub-slice into `BlockWithBytes.RawBytes`. It is valid
-for the lifetime of the owning `BlockWithBytes`. All lazy decodes (`decodeNow()`) complete
-within the same block's row loop before `bwb` goes out of scope.
+**rawEncoding lifetime:** `rawEncoding` is populated by `ensureDecompressed()` as a
+freshly-allocated snappy-decoded buffer. It is consumed by `decodeNow()` (which clears
+it on completion). Both operations are guarded by their respective `sync.Once` fields
+(`decompressOnce`, `decodeOnce`). All lazy decodes complete before the BlockWithBytes
+goes out of scope (query row loop).
+
+**compressedEncoding lifetime:** `compressedEncoding` is a zero-copy sub-slice of
+`BlockWithBytes.RawBytes`, valid for the lifetime of the owning BlockWithBytes.
+It is cleared inside `decompressOnce.Do` after snappy decoding.
 
 **internMap safety:** Each `ParseBlockFromBytes` and `AddColumnsToBlock` call creates its
-own fresh `make(map[string]string)` intern map local to that call. Strings interned during
-parsing and lazy decodes do not persist across calls. `ResetInternStrings()` is now a no-op
-retained for call-site compatibility — callers still invoke it before each block, but it has
-no effect. Cross-call intern reuse no longer occurs; this trade-off is accepted for
-race-safety (per-call maps eliminate any shared-map data race between concurrent readers).
+own fresh `make(map[string]string)` intern map local to that call. `ResetInternStrings()`
+is a no-op retained for call-site compatibility.
 
-*Addendum (2026-03-17):* The original description (internMap borrowed from
-`Reader.internStrings`, bounded by `ResetInternStrings`) reflected an earlier design that
-was superseded when per-call intern maps were introduced for race-safety.
+**Concurrency:** Column decode is safe for concurrent callers. `decompressOnce` and
+`decodeOnce` serialize concurrent access. `decoded atomic.Bool` provides a fast-path
+atomic check before entering `decodeOnce.Do` (NOTE-CONC-001). The scan path itself is
+typically single-goroutine, but `IsPresent()` and value accessors on the same Column
+may be called concurrently (e.g. when multiple executor goroutines share a block).
 
-**Single-goroutine guarantee:** The scan path is single-goroutine. No locking is required
-for `decodeNow()`.
+Back-ref: `internal/modules/blockio/reader/column.go:decodeNow`,
+`internal/modules/blockio/reader/column.go:ensureDecompressed`
 
-Back-ref: `internal/modules/blockio/reader/column.go:decodeNow`
+---
+
+## NOTE-CONC-001: decoded atomic.Bool — Cross-Goroutine Signal for Column Decode
+*Added: 2026-04-14*
+
+**Problem:** With two separate `sync.Once` fields (`presenceOnce` and `decodeOnce`),
+concurrent goroutines calling `IsPresent()` could read `rawEncoding` outside of any
+Once closure, racing with `decodeOnce.Do` writing `rawEncoding`. The two Onces
+operated on overlapping state, creating an undetected data race.
+
+**Solution:** Eliminate `presenceOnce`. Merge all decode into a single `decodeOnce`.
+Introduce `decoded atomic.Bool` as the ONLY cross-goroutine signal:
+
+- `decoded.Store(true)` is called in ALL exit paths of `decodeOnce.Do` (success, error,
+  and the nil-rawEncoding branch).
+- `decoded.Store(false)` is called in `resetColumn()` when a Column is reused for a
+  new block.
+- `needsDecode()` reads `decoded.Load()` atomically — this is the ONLY safe outer check.
+- `rawEncoding` and `compressedEncoding` MUST only be read or written inside their
+  respective Once closures (`decodeOnce.Do` and `decompressOnce.Do`). Reading them
+  outside (even as a nil-check) races with concurrent Once execution.
+
+**Why not rely solely on `decodeOnce.Do`?** `sync.Once.Do` is idempotent and cheap
+after the first call (one atomic load internally). The `decoded atomic.Bool` provides
+the same fast-path cost while making the "already decoded" state explicit and readable
+without relying on `sync.Once` internals. It also enables `IsDecoded()` to be a clean
+public API without exposing the Once.
+
+**Applied at:** `block.go:IsPresent`, `block.go:needsDecode`, `column.go:decodeNow`,
+`block_parser.go:parseBlockColumnsReuse` (eager path sets decoded=true immediately),
+`block_parser.go:resetColumn` (resets decoded=false for reused columns),
+`reader.go:AddColumnsToBlock` (sets decoded=true after eager decode).
+
+Back-ref: `internal/modules/blockio/reader/block.go:needsDecode`,
+`internal/modules/blockio/reader/block.go:decoded`,
+`internal/modules/blockio/reader/column.go:decodeNow`
 
 ---
 
@@ -458,3 +500,174 @@ Back-ref: `internal/modules/blockio/reader/trace_index.go:splitV14CompactSection
 `internal/modules/blockio/reader/trace_index.go:ensureTraceIndexRaw`,
 `internal/modules/blockio/reader/parser.go:ensureV14TraceSection`,
 `internal/modules/blockio/reader/reader.go:compactTraceIndex`
+
+---
+
+## NOTE-PERF-TS: Raw Byte Storage for TS Index — Zero-Alloc Parse
+*Added: 2026-04-14*
+
+**Decision:** The parsed TS index is stored as a raw `[]byte` sub-slice of the metadata
+buffer rather than a materialized `[]tsIndexEntry` slice. `BlocksInTimeRange` scans the
+20-byte-stride buffer in-place (minTS[8] + maxTS[8] + blockID[4] per entry).
+
+**Rationale:** Parsing the TS index into a `[]tsIndexEntry` at open time would allocate
+one large slice of N structs plus one entry per block. For a file with 10,000 blocks,
+this is eliminated entirely by the raw-byte approach. The in-place scan is O(N) sequential
+memory reads, which is cache-friendly and avoids any per-entry allocation.
+
+**How to apply:** Do NOT add a parsed `[]tsIndexEntry` field to the Reader or parser state.
+If new consumers of the TS index need per-entry access, extend `BlocksInTimeRange` or add
+a parallel scan function that reads from the raw byte slice.
+
+Back-ref: `internal/modules/blockio/reader/ts_index.go:parseTSIndex`,
+          `internal/modules/blockio/reader/ts_index.go:BlocksInTimeRange`,
+          `internal/modules/blockio/reader/reader.go:tsRaw`
+
+---
+
+## NOTE-PERF-1: Sparse Dict Columns — Deferred Dense Expansion
+*Added: 2026-04-14*
+
+**Decision:** Sparse dict columns (encoding kinds 2 and 7 RLE) defer the O(spanCount)
+`expandSparseIndexes` allocation until the column is first accessed. The raw sparse index
+bytes are stored in `sparseDictIdx` at decode time; `expandDenseIdx` runs at most once
+(via `sync.Once`) on the first value access.
+
+**Rationale:** Many queries decode columns for predicate evaluation but then exit early
+(e.g., the block does not match). If the dense `Idx` expansion ran eagerly at decode time,
+the O(spanCount) allocation would occur even for blocks where no row is ever read.
+
+**How to apply:** When adding new column encoding types with a sparse/dense split, follow
+the same pattern: store the raw sparse data at decode time, expand lazily at first access
+using `sync.Once`. Do NOT call `expandDenseIdx` from the decode path.
+
+Back-ref: `internal/modules/blockio/reader/block.go:expandDenseIdx`,
+          `internal/modules/blockio/reader/block_parser.go:sparseDictIdx`,
+          `internal/modules/blockio/reader/column.go:decodeDictKind2Sparse`
+
+---
+
+## NOTE-PERF-RANGE: Raw Byte Storage for Range Index Float64 Bounds
+*Added: 2026-04-14*
+
+**Decision:** Float64 range bounds in the range index are stored as a raw `[]byte` sub-slice
+of the metadata buffer (`float64BoundsRaw`). `RangeColumnBoundaries` decodes them on demand
+rather than materializing a `[]float64` slice at parse time.
+
+**Rationale:** Float64 bounds are only needed when a query contains a float64 range predicate.
+For files with many columns and mostly non-float64 queries, materializing all float64 bounds
+eagerly would waste O(numBuckets × numColumns) memory. The zero-copy approach keeps parse
+time and memory constant regardless of how many float64 columns exist.
+
+**How to apply:** Do NOT eagerly decode float64 bounds in `parseRangeIndex`. Any new
+per-bucket bound type should follow the same deferred-decode pattern.
+
+Back-ref: `internal/modules/blockio/reader/range_index.go:float64BoundsRaw`,
+          `internal/modules/blockio/reader/reader.go:RangeColumnBoundaries`
+
+---
+
+## NOTE-PERF-COMPACT: Raw Byte Storage for Compact Trace Index
+*Added: 2026-04-14*
+
+**Decision:** The compact trace index is stored as raw bytes (`traceIndexRaw`) in the
+Reader rather than parsed into a `map[[16]byte][]uint16` at load time. Lookups scan the
+sorted trace ID table in-place via binary search.
+
+**Rationale:** Parsing the compact trace index into a Go map would allocate one entry
+plus the `[]uint16` block list per trace. For a file with 100,000 distinct traces, this
+is ~100,000 heap allocations on every open call. The raw-byte approach defers all
+allocation to lookup time, allocating only for the matched trace's block list.
+
+**How to apply:** Do NOT add a parsed map for the compact trace index. New readers should
+extend `BlocksForTraceIDCompact` or `TraceEntries` to scan from the raw bytes.
+
+Back-ref: `internal/modules/blockio/reader/trace_index.go:BlocksForTraceIDCompact`,
+          `internal/modules/blockio/reader/trace_index.go:TraceEntries`,
+          `internal/modules/blockio/reader/reader.go:traceIndexRaw`
+
+---
+
+## NOTE-PERF-SKETCH: Zero-Copy Distinct Count Storage in Sketch Index
+*Added: 2026-04-14*
+
+**Decision:** Per-block distinct counts in the sketch index are stored as raw 4-byte-per-block
+LE uint32s in `distinctRaw` (a zero-copy sub-slice of the metadata buffer). `Distinct()`
+decodes on demand, and `distinctAt(i)` provides single-block access.
+
+**Rationale:** Materializing `make([]uint32, numBlocks)` per column at parse time adds
+O(numColumns × numBlocks) allocation to every reader open. For a file with 500 columns
+and 1,000 blocks, this is 500,000 uint32 values (~2 MB) that may never be read. The
+zero-copy approach stores only a slice header per column at parse time.
+
+**How to apply:** Do NOT allocate a `[]uint32` slice for distinct counts in `parseSketchIndex`.
+If adding new per-block numeric arrays, follow the same zero-copy sub-slice pattern.
+
+Back-ref: `internal/modules/blockio/reader/sketch_index.go:distinctRaw`,
+          `internal/modules/blockio/reader/sketch_index.go:Distinct`,
+          `internal/modules/blockio/reader/sketch_index.go:distinctAt`
+
+---
+
+## NOTE-014: V14 Phase-1 traceIndexRaw Pre-Population (Cache-Hit Fix)
+*Added: 2026-04-14*
+
+**Problem:** In `ensureV14TraceSection`, `traceIdxBytes` was captured inside the
+`GetOrFetch` closure, which only runs on a cache miss. On a cache hit, the closure
+was skipped, `traceIdxBytes` remained nil, and `r.compactParsed.traceIndexRaw` was
+never set. Consequently, `ensureTraceIndexRaw` (phase 2) always issued a second
+`readV14Section` call, even though the decompressed blob was already in the section
+cache (`fileID+"/v14/sec/03/dec"`).
+
+**Decision:** After `GetOrFetch` returns, check whether `traceIdxBytes` is nil (cache
+hit path). If so, call `readV14Section(SectionTraceIndex)` and run
+`splitV14CompactSection` again. Because the decompressed blob is already held by the
+section cache, this incurs zero provider I/O — it is a pure in-memory slice. The
+resulting trace index bytes are stored in `r.compactParsed.traceIndexRaw`.
+
+**Rationale:** Eliminates one redundant cache lookup per bloom-hit lookup on warm readers.
+The fix stays inside the `v14TraceOnce.Do` block so it runs at most once per Reader, and
+errors from the re-read are silently swallowed (phase 2 will retry normally if needed).
+
+**Consequence:** `SPEC-010a` updated — `traceIndexRaw` may be non-nil after phase 1.
+`ensureTraceIndexRaw` already short-circuits when `traceIndexRaw != nil`, so phase 2
+is a no-op for bloom hits after a warm phase 1.
+
+Back-ref: `internal/modules/blockio/reader/parser.go:ensureV14TraceSection`
+
+**Superseded by NOTE-015 (warm-hit eviction guard):** The Decision above describes an intermediate
+design. The shipped implementation uses `r.cache.Get` instead of `readV14Section` on the warm-hit
+path, avoiding provider I/O when the section blob has been LRU-evicted. See NOTE-015.
+
+---
+
+## NOTE-015: ensureV14TraceSection Cache-Eviction Guard
+*Added: 2026-04-14*
+
+**Problem:** The warm-hit path in `ensureV14TraceSection` (when the compact-header cache
+entry exists but the GetOrFetch closure did not run, leaving `traceIdxBytes` nil)
+unconditionally called `r.readV14Section(SectionTraceIndex)`. The comment claimed "zero
+provider I/O" — true only while the large ~50 MB decompressed blob
+(`fileID+"/v14/sec/03/dec"`) remained in the in-memory cache. Under LRU pressure the
+blob can be evicted, causing `readV14Section` to re-issue a ~50 MB network read. A
+second problem: `traceIndexRaw` was pre-populated on every phase-1 call, even for
+bloom-miss queries where the trace index is never accessed, holding ~50 MB per Reader.
+
+**Decision:** Replace the unconditional `readV14Section` call with `r.cache.Get`. If the
+section blob is hot in the cache, re-split it in-memory (zero I/O). If it was evicted,
+leave `traceIndexRaw` nil — `ensureTraceIndexRaw` handles the nil case and does the
+fetch on the first bloom hit. The guard `r.fileID != ""` skips the lookup for NopCache
+readers (which always run the GetOrFetch closure and never reach this branch), and also
+defensively skips any reader with an empty fileID — which should not occur in production
+but would otherwise produce a lookup against the NopCache or an incorrect cache key.
+
+**Rationale:** Phase 1 may opportunistically pre-populate `traceIndexRaw` when the
+section blob is already in-memory, but must not issue provider I/O or allocate large
+buffers when the blob is absent. This keeps the two-phase design valid under eviction.
+
+**Consequence:** SPEC-010a updated — `traceIndexRaw` is only pre-populated when the
+section blob is in the in-memory cache. Bloom-hit paths always work because
+`ensureTraceIndexRaw` handles the nil case. `ensureV14TraceSection` never issues a
+provider read on the warm-hit path.
+
+Back-ref: `internal/modules/blockio/reader/parser.go:ensureV14TraceSection`

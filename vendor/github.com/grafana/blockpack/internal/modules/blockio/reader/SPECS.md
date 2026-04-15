@@ -2,13 +2,23 @@
 
 ## SPEC-001: Column.IsPresent() — Always Available After ParseBlockFromBytes
 *Added: 2026-03-05*
+*Updated: 2026-04-14 — presenceOnce removed; IsPresent now triggers full decode*
 
 `Column.IsPresent(idx int) bool` returns the correct presence value for any column
 returned by `ParseBlockFromBytes`, regardless of whether the column was eagerly decoded
 (in `wantColumns`) or lazily registered (not in `wantColumns`).
 
-Lazy registration decodes the presence bitset immediately via `decodePresenceOnly`.
-`IsPresent()` MUST NOT trigger a full decode (`decodeNow()`).
+For eagerly-decoded columns, IsPresent() reads the already-populated `Present` slice
+directly (decoded.Load() is true, needsDecode() returns false — zero extra work).
+
+For lazily-registered columns, IsPresent() triggers full decode (snappy decompress via
+`ensureDecompressed` then `decodeNow` via `decodeOnce`) on the first call, populating
+all value slices and the presence bitmap together. Subsequent calls on the same column
+skip decode (decoded.Load() is true). Concurrent callers are serialized by decodeOnce.
+
+NOTE-CONC-001: IsPresent() always goes through needsDecode() (atomic load) before
+reading c.Present. This establishes the happens-before chain from decodeOnce.Do before
+any read of the c.Present pointer.
 
 Back-ref: `internal/modules/blockio/reader/block.go:IsPresent`
 
@@ -16,19 +26,26 @@ Back-ref: `internal/modules/blockio/reader/block.go:IsPresent`
 
 ## SPEC-002: Column Value Accessors — May Trigger Lazy Decode
 *Added: 2026-03-05*
+*Updated: 2026-04-14 — entry guard changed from rawEncoding!=nil to decoded atomic.Bool*
 
 `StringValue`, `Int64Value`, `Uint64Value`, `Float64Value`, `BoolValue`, `BytesValue`
-check `rawEncoding != nil` on entry. If set, they call `decodeNow()` to perform the full
-decode before accessing typed fields.
+check `c.needsDecode()` (i.e. `!c.decoded.Load()`) on entry. If true, they call
+`decodeNow()` to perform snappy decompression (`ensureDecompressed`) and full column
+decode before accessing typed fields. rawEncoding and compressedEncoding MUST NOT be
+read outside of their respective Once closures — the `decoded` atomic.Bool is the only
+safe cross-goroutine entry guard (NOTE-CONC-001).
 
 **Contract:** After the first call to any value accessor on a lazily-registered column,
 subsequent calls return values from the fully-decoded column without re-decoding.
+`decoded.Load()` returns true after the first successful or failed decode.
 
-**Error behavior:** If `decodeNow()` encounters a decode error, `rawEncoding` is cleared
-and all value accessors return zero/false for all rows (column treated as absent).
+**Error behavior:** If `decodeNow()` encounters a decode or decompression error,
+`Present` is set to `[]byte{}` and `decoded.Store(true)` is called, so all value
+accessors return zero/false for all rows (column treated as absent).
 
 Back-ref: `internal/modules/blockio/reader/block.go:StringValue`,
-`internal/modules/blockio/reader/column.go:decodeNow`
+`internal/modules/blockio/reader/column.go:decodeNow`,
+`internal/modules/blockio/reader/block.go:needsDecode`
 
 ---
 
@@ -36,10 +53,10 @@ Back-ref: `internal/modules/blockio/reader/block.go:StringValue`,
 *Added: 2026-03-05*
 
 After `ParseBlockFromBytes(raw, wantColumns, meta)` returns:
-- Columns in `wantColumns` are **eagerly decoded** (presence + values fully available).
-- All other columns with `dataLen > 0` are **lazily registered** (presence available,
-  values deferred until first accessor call).
-- Columns with `dataLen == 0` (trace-level columns) are absent.
+- Columns in `wantColumns` are **eagerly decoded** (presence + values fully available, decoded==true).
+- All other columns with `compressedLen > 0` are **lazily registered** with `compressedEncoding`
+  set. Both presence and values are deferred to the first accessor call (SPEC-V14-002).
+- Columns with `compressedLen == 0` (trace-level columns) are absent.
 - When `wantColumns == nil`, all columns are eagerly decoded (original behavior unchanged).
 
 **NOTE-001:** Lazy registration replaces the old requirement for a second pass via
@@ -47,6 +64,37 @@ After `ParseBlockFromBytes(raw, wantColumns, meta)` returns:
 
 Back-ref: `internal/modules/blockio/reader/block_parser.go:parseBlockColumnsReuse`,
 `internal/modules/blockio/reader/reader.go:ParseBlockFromBytes`
+
+---
+
+## SPEC-V14-002: Deferred Snappy Decompression for V14 Lazy Columns
+*Added: 2026-04-14*
+
+For V14 files, each column blob on disk is snappy-compressed. When `wantColumns` is
+non-nil and a column is not requested, its compressed bytes are stored in
+`Column.compressedEncoding` as a zero-copy sub-slice of the block's rawBytes. No
+snappy.Decode call is made at registration time.
+
+Snappy decompression is deferred to the first accessor call via `ensureDecompressed()`
+(guarded by `decompressOnce`), which populates `rawEncoding` and clears
+`compressedEncoding`. Full column decode then proceeds via `decodeNow()` (guarded by
+`decodeOnce`). Together these ensure:
+
+- Zero CPU and memory cost for non-wanted columns that are never accessed.
+- At most one decompression per column per block, safe for concurrent callers.
+- A TOC bomb guard at registration time: `uncompressedLen > MaxBlockSize` skips
+  registration without decompressing (SPEC-ROOT-012).
+
+**Invariant:** After `parseBlockColumnsReuse`, a lazy column has exactly one of:
+- `decoded==true` (eagerly decoded), OR
+- `compressedEncoding != nil` (registered lazy, not yet decompressed).
+
+After `ensureDecompressed` + `decodeNow` complete, both `compressedEncoding` and
+`rawEncoding` are nil; `decoded==true`.
+
+Back-ref: `internal/modules/blockio/reader/block_parser.go:parseBlockColumnsReuse`,
+`internal/modules/blockio/reader/column.go:ensureDecompressed`,
+`internal/modules/blockio/reader/block.go:compressedEncoding`
 
 ---
 
@@ -84,6 +132,7 @@ Back-ref: `internal/modules/blockio/reader/parser.go:ClearCaches`,
 ## SPEC-005: Sub-Block Column I/O — Lazy Column Loading
 *Added: 2026-03-24*
 *Updated: 2026-03-24 — design revised after implementation revealed coalescing constraint*
+*Updated: 2026-04-14 — added production-use restriction for ReadGroupColumnar*
 
 ### Motivation
 
@@ -189,7 +238,9 @@ round-trips, but requires either:
   (b) S3 multi-range GET to fetch multiple non-contiguous byte ranges in one request.
 
 `ReadGroupColumnar` in `columnar_read.go` is retained for future use when (a) or (b) is
-available.
+available. **ReadGroupColumnar MUST NOT be used in production query paths.** It is exported
+only because `package reader_test` (external test package) references it directly; it is
+NOT part of the public API. TODO: Unexport when tests are moved to `package reader`.
 
 Back-ref: `internal/modules/blockio/reader/columnar_read.go:ReadGroupColumnar`,
 `internal/modules/blockio/reader/block_parser.go:parseBlockColumnsReuse`,
@@ -235,7 +286,7 @@ Back-ref: `internal/modules/blockio/reader/layout.go:FileLayout`
 
 ---
 
-## SPEC-006: V5 Footer Parsing and VectorIndex Lazy Load
+## SPEC-007: V5 Footer Parsing and VectorIndex Lazy Load
 *Added: 2026-04-02*
 
 ### V5 Footer Detection
@@ -290,20 +341,35 @@ I/O cost of reading the full SectionTraceIndex blob on every `BlocksForTraceID` 
 
 `ensureV14TraceSection` (called at most once per Reader via `v14TraceOnce`):
 
-1. Invokes `readV14Section(SectionTraceIndex)` to get the decompressed section blob.
-2. Passes it to `splitV14CompactSection` to locate the split point between header and
-   trace index.
-3. Copies and caches the header under `fileID+"/v14/compact-header"`.
+1. Probes `cache.GetOrFetch(fileID+"/v14/compact-header", ...)` to obtain the cached
+   header bytes.
+   - **Cold-miss path:** The `GetOrFetch` closure runs; invokes `readV14Section(SectionTraceIndex)`
+     to fetch and decompress the full section blob, passes it to `splitV14CompactSection` to
+     locate the header/trace-index split, copies and returns the header bytes, and captures
+     `traceIdxBytes` from the split result. No provider I/O occurs for subsequent calls.
+   - **Warm-hit path:** The `GetOrFetch` closure does NOT run; `readV14Section` is never
+     called. `traceIdxBytes` remains nil after `GetOrFetch` returns.
+2. Passes the header bytes to `parseCompactIndexBytesV14Header` to parse the bloom filter
+   and block table from the header.
+3. The header is cached under `fileID+"/v14/compact-header"` by the `GetOrFetch` call.
 4. Calls `parseCompactIndexBytesV14Header(header)` which sets:
    - `r.compactParsed.blockTable` — file offsets for each internal block.
    - `r.compactParsed.traceIDBloom` — the trace ID bloom filter bytes.
    - `r.compactParsed.isV14TraceSection = true` — signals the V14 phase-2 fetch path.
-   - `r.compactParsed.traceIndexRaw = nil` — not yet loaded.
 5. Also populates `r.blockMetas` if not already set.
+6. On a cold cache miss, also pre-populates `compactParsed.traceIndexRaw` from the same
+   read (the trace index sub-slice is already in memory after `splitV14CompactSection`)
+   (NOTE-014). On a warm cache hit, probes `r.cache.Get` for the section blob
+   (`fileID+"/v14/sec/03/dec"`). If the blob is in-memory, splits it to pre-populate
+   `traceIndexRaw` (zero I/O). If the blob was evicted, leaves `traceIndexRaw` nil —
+   `ensureTraceIndexRaw` will fetch it on the first bloom hit (NOTE-015).
 
 **Invariant SPEC-010a:** After `ensureV14TraceSection`, `compactParsed` is non-nil and the
 bloom filter is available. `BlocksForTraceIDCompact` can evaluate bloom filter checks.
-`compactParsed.traceIndexRaw` is nil until a bloom hit triggers phase 2.
+`compactParsed.traceIndexRaw` is pre-populated only when the decompressed section blob is
+present in the in-memory cache at phase-1 time; if the blob was evicted, `traceIndexRaw`
+remains nil and phase 2 (`ensureTraceIndexRaw`) fetches it on the first bloom hit.
+`ensureV14TraceSection` never issues a provider read on the warm-hit path. See NOTE-015.
 
 ### Phase 2 — Lazy Trace Index Load (~50 MB, bloom hit only)
 

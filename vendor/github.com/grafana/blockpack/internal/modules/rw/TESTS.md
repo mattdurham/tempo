@@ -221,3 +221,9 @@ cache entries — length is a discriminating key component.
 both return their respective data. No collision between the two entries.
 **Rationale:** Regression guard for BUG-15 — `int32` truncation of the length field would
 cause silent cache misses for buffers > math.MaxInt32. See NOTE-010.
+
+### TestSharedLRUCache_KeyUsesFullIntLength_SharesLower16Bits
+**Scenario:** Two Put calls whose lengths share the same lower 16 bits but differ in higher
+bits produce distinct cache entries. Guards against uint16 truncation of the length field.
+**Setup:** lengths 100 and 65636 (= 1<<16 + 100) share lower 16 bits.
+**Assertions:** Both entries hit independently; data is not confused between entries.

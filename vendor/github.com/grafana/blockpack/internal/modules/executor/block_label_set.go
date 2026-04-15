@@ -2,7 +2,7 @@ package executor
 
 // NOTE: Any changes to this file must be reflected in the corresponding SPECS.md or NOTES.md.
 
-// NOTE-SL-016: blockLabelSet is the hot-path LabelSet implementation for pre-parsed blocks.
+// NOTE-SL-017: blockLabelSet is the hot-path LabelSet implementation for pre-parsed blocks.
 // Reads are zero-allocation — col.StringValue(rowIdx) is called directly.
 // Writes go into an overlay map allocated on first write.
 // A sync.Pool of *blockLabelSet eliminates per-row struct allocation on the scan loop.
@@ -21,7 +21,7 @@ import (
 var _ logqlparser.LabelSet = (*blockLabelSet)(nil)
 
 // blockLabelSetPool is a sync.Pool of *blockLabelSet for the hot scan path.
-// NOTE-SL-016: pool eliminates per-row struct allocation.
+// NOTE-SL-017: pool eliminates per-row struct allocation.
 var blockLabelSetPool = &sync.Pool{ //nolint:gochecknoglobals
 	New: func() any {
 		return &blockLabelSet{}
@@ -29,7 +29,7 @@ var blockLabelSetPool = &sync.Pool{ //nolint:gochecknoglobals
 }
 
 // blockLabelSet is a LabelSet backed by block columns.
-// NOTE-SL-016: hot-path implementation; reused across rows via resetForRow.
+// NOTE-SL-017: hot-path implementation; reused across rows via resetForRow.
 type blockLabelSet struct {
 	block    *modules_reader.Block
 	colMap   map[string]int           // label name (e.g. "service.name") → index into colNames
@@ -83,7 +83,7 @@ func (b *blockLabelSet) Get(key string) string {
 }
 
 // Has reports whether key is present in the block at this row (even if the value is "").
-// NOTE-SL-016: Has reflects block-level column presence, not decode state. A lazily-
+// NOTE-SL-017: Has reflects block-level column presence, not decode state. A lazily-
 // registered column (not in wantColumns) returns true here if the row has a value —
 // the subsequent Get() call will trigger full decode (decodeNow) on first access.
 // Materialize() intentionally excludes undecoded columns to avoid expensive zstd
@@ -117,7 +117,7 @@ func (b *blockLabelSet) Has(key string) bool {
 // column is decoded (IsDecoded()==true) and present at this row.
 // Undecoded block columns (lazily registered, rawEncoding != nil) return false —
 // the column exists in storage but its value is not yet accessible without a
-// full zstd decode. See NOTE-SL-016 and SPEC-001a.
+// full zstd decode. See NOTE-SL-017 and SPEC-001a.
 func (b *blockLabelSet) HasLive(key string) bool {
 	// Deleted keys are not live.
 	if b.deleted != nil && b.deleted[key] {
@@ -199,7 +199,11 @@ func (b *blockLabelSet) Keys() []string {
 		}
 		if b.block != nil {
 			col := b.colCols[idx]
-			if col == nil || !col.IsPresent(b.rowIdx) {
+			// Guard with IsDecoded() before IsPresent() to avoid triggering full snappy
+			// decompression + column decode on lazy non-wantColumns (same pattern as HasLive).
+			// Keys() is called by KeepStage for every matched row; decoding all lazy columns
+			// here would negate the benefit of wantColumns filtering.
+			if col == nil || !col.IsDecoded() || !col.IsPresent(b.rowIdx) {
 				continue
 			}
 		}
@@ -233,7 +237,7 @@ func (b *blockLabelSet) Materialize() map[string]string {
 				}
 			}
 			col := b.colCols[idx]
-			// NOTE-SL-016: skip columns that were not in wantColumns (rawEncoding != nil).
+			// NOTE-SL-017: skip columns that were not in wantColumns (rawEncoding != nil).
 			// Calling any value accessor on an un-decoded column triggers decodeNow — expensive
 			// zstd decompression. Only columns decoded during ColumnPredicate evaluation are
 			// included; body-parsed non-predicate columns are intentionally excluded.

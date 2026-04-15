@@ -264,3 +264,63 @@ Back-ref: `internal/modules/blockio/writer/column_builder.go` (zstdEncoder remov
 `internal/modules/blockio/writer/writer_block.go` (outer snappy per column),
 `internal/modules/blockio/writer/metadata.go:writeFooterV7`,
 `internal/modules/blockio/writer/writer.go:flushBlocks` (encPool removed)
+
+---
+
+## NOTE-36: Bloom-Enabled Compact Index (Version 2)
+*Added: 2026-04-14*
+
+The compact trace index version 2 embeds a per-file trace ID bloom filter in the
+section header, enabling O(1) negative lookups before loading the full hash map.
+Readers call `BlocksForTraceIDCompact` which checks the bloom first and only proceeds
+to the hash-map lookup on a bloom hit.
+
+Wire format:
+```
+magic[4] + version[1]=2 + block_count[4] + bloom_bytes[4] + bloom_data[bloom_bytes]
++ block_table[block_count×12] + trace_index_bytes[...]
+```
+
+Back-ref: `internal/modules/blockio/writer/metadata.go:writeCompactTraceIndex`
+Back-ref: `internal/modules/blockio/reader/trace_index.go:BlocksForTraceIDCompact`
+
+---
+
+## NOTE-37: Trace Index v2 — Block IDs Only, Reader-Side Span Scan
+*Added: 2026-04-14*
+
+The v2 trace block index stores only block IDs per trace (not per-span row indices).
+The reader scans the `trace:id` column within the identified blocks to locate matching
+spans. This reduces index size significantly versus a span-index approach.
+
+Note: `compaction/NOTES.md § NOTE-37` is a separate entry covering log file re-sort
+during compaction. This entry (in writer/NOTES.md) covers the trace-index wire format.
+
+Back-ref: `internal/modules/blockio/writer/metadata.go:writeTraceBlockIndexSection`
+
+---
+
+## NOTE-38: Exact-Value Range Index for Low-Cardinality Columns
+*Added: 2026-04-14*
+
+For columns where every block has `min == max` (single distinct value per block),
+the range index uses an exact-value map instead of KLL quantile buckets. Each distinct
+value maps directly to its block IDs, giving zero false positives for equality predicates.
+The wire format is identical to the KLL path — readers use the same binary-search lookup.
+
+Back-ref: `internal/modules/blockio/writer/range_index.go:applyRangeBucketsForColumn`
+Back-ref: `internal/modules/blockio/writer/range_index.go:tryApplyExactValues`
+
+---
+
+## NOTE-38b: Exact-Value Path Safety Invariant — All Blocks Must Be Single-Value
+*Added: 2026-04-14*
+
+The exact-value path (NOTE-38) is only safe when ALL blocks have `min == max`. If any
+block spans multiple values (`minKey != maxKey`), storing it under only minKey and maxKey
+causes false-negative pruning: intermediate values are missed by point lookup. When any
+block has `min != max`, `tryApplyExactValues` returns false and falls through to the KLL
+overlap path. This applies to all range column types: RangeInt64, RangeUint64,
+RangeFloat64, RangeString.
+
+Back-ref: `internal/modules/blockio/writer/range_index.go:tryApplyExactValues`

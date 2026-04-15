@@ -67,6 +67,14 @@ type BlockIndexer interface {
 	ColumnSketch(col string) ColumnSketch
 }
 
+// SketchEvictor is an optional interface that a BlockIndexer may implement.
+// When Plan() determines that all blocks in a file have been pruned, it calls
+// EvictSketch() to release the sketch section from the process-level cache,
+// preventing unbounded memory growth during wide time-range queries.
+type SketchEvictor interface {
+	EvictSketch()
+}
+
 // LogicalOp specifies the boolean operator used to combine a Predicate's children.
 type LogicalOp uint8
 
@@ -310,6 +318,18 @@ func (p *Planner) Plan(predicates []Predicate, timeRange TimeRange) *Plan {
 
 	// Stage 2: BinaryFuse8 membership pruning — hard exclusion at ~0.39% FPR.
 	plan.PrunedByFuse += pruneByFuseAll(p.r, candidates, predicates)
+
+	// If fuse pruning eliminated every block, evict the sketch section from the
+	// process-level cache. There is no point keeping tens of MB of sketch data for
+	// a file we have determined contains no matching spans.
+	if candidates.count() == 0 {
+		if ev, ok := p.r.(SketchEvictor); ok {
+			ev.EvictSketch()
+		}
+		plan.SelectedBlocks = nil
+		explainPlan(p.r, predicates, plan, timeBlocks)
+		return plan
+	}
 
 	// Stage 3: Score remaining blocks for selectivity (freq/max(cardinality,1)).
 	// NOTE-014: Higher score = fewer distinct values relative to query frequency.

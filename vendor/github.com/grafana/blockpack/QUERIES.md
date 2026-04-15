@@ -2,11 +2,20 @@
 
 **Environment:** dev-us-east-0 / tempo-dev-test-03  
 **Tenant:** `X-Scope-OrgID: 11638`  
-**Generated:** 2026-04-12 (updated 2026-04-14 with r60/r62 results)  
-**Time range queried:** last 3 hours  
+**Generated:** 2026-04-12 (updated 2026-04-14 with r60/r62 results; updated 2026-04-15 with disk cache + parquet comparison)  
+**Time range queried:** last 3 hours (search), last 6 hours (metrics, r62+disk)  
 **Services active:** alloy, CockroachDB, apiserver, grafana
 
 API endpoint: `http://<query-frontend>:3100/tempo/api/`
+
+## Org IDs (from jaeger/mirror.libsonnet in deployment_tools)
+
+| Cell | Org ID | Format | Endpoint |
+|------|--------|--------|----------|
+| tempo-dev-test-03 (dev-us-east-0) | `11638` | blockpack (vblockpack) | tempo-dev-test-03-dev-us-east-0.grafana-dev.net |
+| tempo-dev-02 (dev-us-east-0) | `6121` | parquet | tempo-dev-02-dev-us-east-0.grafana-dev.net |
+
+Source: `deployment_tools/ksonnet/environments/jaeger/mirror.libsonnet` (`TEMPO_MIRROR_USERNAME` / `TEMPO_MIRROR2_USERNAME`)
 
 ---
 
@@ -378,3 +387,102 @@ Pods now stable at 13–13.5 Gi under sustained load (18 Gi limit, no OOMKill).
 > continuously and these benchmarks were taken hours later in the day. Relative ordering (r62
 > faster than r61 on M8/M11/M13) is the meaningful comparison; a side-by-side on the same cluster
 > in the same session is needed for precise delta measurement.
+
+---
+
+## r62 + Disk Cache Results (2026-04-15)
+
+**Deployed:** 2026-04-15  
+**Image:** `mrdgrafana/tempo:blockpack-89035c852-r62` (same code, disk cache config added)  
+**Disk cache:** `file_cache_path: /var/tempo/blockpack-cache`, `file_cache_max_bytes: 8589934592` (8 GiB, 80% of 10 Gi emptyDir)  
+**Environment:** tempo-dev-test-03, 3 querier replicas, each with independent 8 GiB disk cache
+
+### Disk Cache Metrics (single pod, after warm-up)
+
+| Tier | Hits | Misses | Hit rate | Bytes served |
+|------|------|--------|----------|--------------|
+| memory (256 MB) | 8,787 | 15,850 | 36% | 299 MB |
+| **disk (8 GiB)** | **11,768** | **4,082** | **74%** | **32 GB** |
+| remote memcached | 3,158 | 924 | 77% | 30 MB |
+
+### GetTraceByID Latency (vulture-tenant, 24h-8h ago window)
+
+| Pass | Avg latency | Notes |
+|------|-------------|-------|
+| Cold (S3) | 368ms | Block fetched from S3, written to disk cache |
+| Warm pass 1 | 216ms | **−41%** — disk cache hit |
+| Warm pass 2 | 214ms | Stable |
+
+### Metrics Queries — 6h window, step=6m (2026-04-15)
+
+**Time range:** last 6 hours, step=360s, tenant `11638`, 113 blocks
+
+| Query | blockpack cold | blockpack warm | ms/block (warm) |
+|-------|---------------|----------------|-----------------|
+| M8: `{kind=server}⎮histogram_over_time(duration) by (resource.service.name)` | ~11-23s | — | ~151ms |
+| M11: `{kind=server}⎮rate() by (resource.service.name)` | ~13s | ~13s | ~116ms |
+| M13: `{kind=server}⎮count_over_time() by (span.status_code)` | ~22s | ~12s | ~155ms |
+
+> **Note:** High run-to-run variance (~2x) in 6h benchmarks is due to round-robin load balancing
+> across 3 querier replicas with independent disk caches. Each pod individually converges to ~150ms/block
+> once warm; the variation reflects different pods being hit per request.
+
+---
+
+## Blockpack vs Parquet Comparison (2026-04-15)
+
+**Method:** Same queries, same 6h window (step=6m), different cells.  
+**blockpack:** tempo-dev-test-03, org `11638`, 113 blocks  
+**parquet:** tempo-dev-02, org `6121`, 14 blocks  
+
+Org IDs sourced from `deployment_tools/ksonnet/environments/jaeger/mirror.libsonnet`.
+
+### Raw Results (2 passes each, warm cache)
+
+| Query | blockpack avg | parquet avg | blockpack blocks | parquet blocks |
+|-------|--------------|-------------|-----------------|----------------|
+| M8: histogram_over_time by service | 17,117ms | 6,111ms | 113 | 14 |
+| M11: rate() by service | 13,100ms | 1,331ms | 113 | 14 |
+| M13: count_over_time() by status_code | 17,555ms | 1,215ms | 113 | 14 |
+
+### Per-Block Normalized
+
+| Query | blockpack ms/block | parquet ms/block | winner |
+|-------|--------------------|-----------------|--------|
+| M8: histogram_over_time | **151ms** | 437ms | **blockpack 2.9×** |
+| M11: rate() | 116ms | **95ms** | parquet 1.2× |
+| M13: count_over_time() | 155ms | **87ms** | parquet 1.8× |
+
+**Key result:** Blockpack is significantly faster per block on M8 (histogram over time by service —
+the production query). Parquet is faster per block on rate/count aggregations. The raw absolute
+numbers favor parquet only because dev-02 had 8× fewer blocks in the 6h window; the per-block
+comparison is the meaningful metric for format efficiency.
+
+---
+
+## Post-Compaction Benchmark (2026-04-15)
+
+**Change:** `compaction_window` updated from `5m → 15m` in both backend-scheduler and backend-worker  
+**Block counts (total blocklist):** blockpack `11638` = **493 blocks**, parquet `6121` = **865 blocks**  
+**Method:** 3 warm-up passes to prime all 3 querier replicas, then benchmark pass. 6h window, step=60s.  
+**Note:** Parquet now has _more_ total blocks than blockpack — raw times are a fair comparison.
+
+| Query | TraceQL | bp (ms) | pq (ms) | bp/pq |
+|-------|---------|---------|---------|-------|
+| M1  | `{} \| rate()` | 397 | 595 | **0.7×** |
+| M2  | `{} \| count_over_time()` | 390 | 497 | **0.8×** |
+| M3  | `{span.http.method="GET"} \| rate()` | 1701 | 364 | 4.7× |
+| M4  | `{resource.service.name="CockroachDB"} \| rate()` | 1037 | 264 | 3.9× |
+| M5  | `{status=error} \| rate()` | 1602 | 429 | 3.7× |
+| M6  | `{} \| histogram_over_time(duration)` | 1993 | 1239 | 1.6× |
+| M7  | `{duration > 100ms} \| rate()` | 1850 | 337 | 5.5× |
+| M8  | `{GET\|\|POST} \| rate()` | 2053 | 414 | 5.0× |
+| M9  | `{CockroachDB && dur>50ms} \| histogram_over_time(duration)` | 1140 | 495 | 2.3× |
+| M10 | `{(GET\|\|POST) && (err\|\|unset) && CockroachDB} \| rate()` | 1386 | 661 | 2.1× |
+
+**Key findings:**
+- **M1/M2 (full-scan aggregations):** blockpack is _faster_ than parquet (0.7–0.8×) — the single-I/O-per-block design wins when all spans must be read anyway
+- **M6 (histogram over all spans):** blockpack 1.6× slower — expected, reads full block vs parquet column pruning
+- **M3/M4/M5/M7/M8 (selective attribute filters):** blockpack 3.7–5.5× slower — parquet's column-selective I/O has a large advantage when the filter column is small relative to the full block
+- **M9/M10 (compound filters + histogram):** blockpack 2.1–2.3× slower — predicate pushdown partially closes the gap
+- **Root cause of remaining gap:** blockpack reads entire blocks (single-I/O invariant); parquet reads only the queried columns. On selective queries, parquet fetches ~10–50× fewer bytes per block.

@@ -6,10 +6,15 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	"github.com/golang/snappy"
-
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
 	"github.com/grafana/blockpack/internal/modules/rw"
+)
+
+// Compact block table wire-format constants.
+// Each entry is file_offset[8] + file_length[4] = 12 bytes.
+const (
+	compactBlockEntrySize   = 12 // bytes per block table entry
+	compactFileLengthOffset = 8  // byte offset of file_length within an entry
 )
 
 // compactBlockEntry holds file location for one block as stored in the compact block table.
@@ -51,7 +56,7 @@ func splitV14CompactSection(data []byte) (header []byte, traceIndex []byte, err 
 			shared.MaxBlocks,
 		)
 	}
-	pos := 9
+	pos := shared.CompactIndexHeaderSize
 
 	if version == shared.CompactIndexVersion2 {
 		if pos+4 > len(data) {
@@ -73,7 +78,7 @@ func splitV14CompactSection(data []byte) (header []byte, traceIndex []byte, err 
 	}
 
 	// Skip block table: block_count × 12 bytes.
-	need := blockCount * 12
+	need := blockCount * compactBlockEntrySize
 	if pos+need > len(data) {
 		return nil, nil, fmt.Errorf("v14 compact section: short for block_table (need %d)", need)
 	}
@@ -114,7 +119,7 @@ func (r *Reader) parseCompactIndexBytesV14Header(header []byte) error {
 	if blockCount > shared.MaxBlocks {
 		return fmt.Errorf("v14 compact header: block_count %d exceeds maximum %d", blockCount, shared.MaxBlocks)
 	}
-	pos := 9
+	pos := shared.CompactIndexHeaderSize
 
 	var traceIDBloom []byte
 	if version == shared.CompactIndexVersion2 {
@@ -138,7 +143,7 @@ func (r *Reader) parseCompactIndexBytesV14Header(header []byte) error {
 		pos += bloomBytes
 	}
 
-	need := blockCount * 12
+	need := blockCount * compactBlockEntrySize
 	if pos+need > len(header) {
 		return fmt.Errorf("v14 compact header: short for block_table (need %d)", need)
 	}
@@ -147,9 +152,9 @@ func (r *Reader) parseCompactIndexBytesV14Header(header []byte) error {
 	for i := range blockCount {
 		blockTable[i] = compactBlockEntry{
 			fileOffset: binary.LittleEndian.Uint64(header[pos:]),
-			fileLength: binary.LittleEndian.Uint32(header[pos+8:]),
+			fileLength: binary.LittleEndian.Uint32(header[pos+compactFileLengthOffset:]),
 		}
-		pos += 12
+		pos += compactBlockEntrySize
 	}
 
 	r.compactParsed = &compactTraceIndex{
@@ -217,7 +222,8 @@ func (r *Reader) BlocksForTraceIDCompact(traceID [16]byte) []int {
 		return nil
 	}
 
-	// NOTE-36 / SPEC-10.2: bloom filter check before hash map — fast path for absent trace IDs.
+	// NOTE-36: bloom filter check before hash map — fast path for absent trace IDs.
+	// See writer/NOTES.md § NOTE-36 for the compact index v2 format.
 	if !shared.TestTraceIDBloom(r.compactParsed.traceIDBloom, traceID) {
 		return nil
 	}
@@ -400,14 +406,14 @@ func (r *Reader) ensureCompactHeaderParsed() error {
 
 	// Step 2: read bloom filter + block table in one range read.
 	// pos tracks offset within the compact section (not the file).
-	pos := 9
+	pos := shared.CompactIndexHeaderSize
 
 	var bloomBytes int
 	if version == shared.CompactIndexVersion2 {
 		if len(prefixBuf) < 13 {
 			return fmt.Errorf("compact index: short for bloom_bytes")
 		}
-		bloomBytes = int(binary.LittleEndian.Uint32(prefixBuf[9:])) //nolint:gosec // validated below before use
+		bloomBytes = int(binary.LittleEndian.Uint32(prefixBuf[shared.CompactIndexHeaderSize:])) //nolint:gosec // validated below before use
 		if bloomBytes > shared.TraceIDBloomMaxBytes {
 			return fmt.Errorf(
 				"compact index: bloom_bytes %d exceeds maximum %d",
@@ -449,9 +455,9 @@ func (r *Reader) ensureCompactHeaderParsed() error {
 	for i := range blockCount {
 		blockTable[i] = compactBlockEntry{
 			fileOffset: binary.LittleEndian.Uint64(bodyData[bodyPos:]),
-			fileLength: binary.LittleEndian.Uint32(bodyData[bodyPos+8:]),
+			fileLength: binary.LittleEndian.Uint32(bodyData[bodyPos+compactFileLengthOffset:]),
 		}
-		bodyPos += 12
+		bodyPos += compactBlockEntrySize
 	}
 
 	// Compute where the trace index starts within the file and how many bytes it occupies.
@@ -521,7 +527,7 @@ func (r *Reader) ensureCompactHeaderParsedV3() error {
 		return fmt.Errorf("compact index v3: block_count %d exceeds maximum %d", blockCount, shared.MaxBlocks)
 	}
 
-	pos := 9
+	pos := shared.CompactIndexHeaderSize
 
 	// Parse bloom filter (always present in v3).
 	if pos+4 > len(data) {
@@ -544,7 +550,7 @@ func (r *Reader) ensureCompactHeaderParsedV3() error {
 	pos += bloomBytes
 
 	// Parse block table.
-	need := blockCount * 12
+	need := blockCount * compactBlockEntrySize
 	if pos+need > len(data) {
 		return fmt.Errorf("compact index v3: short for block_table (need %d)", need)
 	}
@@ -552,9 +558,9 @@ func (r *Reader) ensureCompactHeaderParsedV3() error {
 	for i := range blockCount {
 		blockTable[i] = compactBlockEntry{
 			fileOffset: binary.LittleEndian.Uint64(data[pos:]),
-			fileLength: binary.LittleEndian.Uint32(data[pos+8:]),
+			fileLength: binary.LittleEndian.Uint32(data[pos+compactFileLengthOffset:]),
 		}
-		pos += 12
+		pos += compactBlockEntrySize
 	}
 
 	r.compactParsed = &compactTraceIndex{
@@ -642,7 +648,9 @@ func (r *Reader) ensureTraceIndexRaw() error {
 		var rawData []byte
 		if r.compactTracesLen > 0 {
 			// V3: snappy-decompress the compact traces section.
-			decoded, decErr := snappy.Decode(nil, data)
+			// SPEC-ROOT-012: use decodeBoundedSnappy — checks snappy.DecodedLen BEFORE
+			// allocating, preventing decompression-bomb OOM from malicious frame headers.
+			decoded, decErr := decodeBoundedSnappy(data)
 			if decErr != nil {
 				r.compactParsed.traceIndexFetchErr = fmt.Errorf("compact index: trace_index: snappy decode: %w", decErr)
 				return
@@ -725,7 +733,7 @@ func (r *Reader) ensureCompactIndexParsed() error {
 	if blockCount > shared.MaxBlocks {
 		return fmt.Errorf("compact index: block_count %d exceeds maximum %d", blockCount, shared.MaxBlocks)
 	}
-	pos := 9
+	pos := shared.CompactIndexHeaderSize
 
 	// Version 2: parse trace ID bloom filter before the block table.
 	var traceIDBloom []byte
@@ -750,7 +758,7 @@ func (r *Reader) ensureCompactIndexParsed() error {
 	}
 
 	// Parse block_table: block_count × 12 bytes (file_offset[8] + file_length[4]).
-	need := blockCount * 12
+	need := blockCount * compactBlockEntrySize
 	if pos+need > len(data) {
 		return fmt.Errorf("compact index: short for block_table (need %d)", need)
 	}
@@ -759,9 +767,9 @@ func (r *Reader) ensureCompactIndexParsed() error {
 	for i := range blockCount {
 		blockTable[i] = compactBlockEntry{
 			fileOffset: binary.LittleEndian.Uint64(data[pos:]),
-			fileLength: binary.LittleEndian.Uint32(data[pos+8:]),
+			fileLength: binary.LittleEndian.Uint32(data[pos+compactFileLengthOffset:]),
 		}
-		pos += 12
+		pos += compactBlockEntrySize
 	}
 
 	// NOTE-PERF-COMPACT: store raw trace-index bytes in-place instead of parsing into a map.

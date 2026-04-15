@@ -71,8 +71,7 @@ func NewSharedLRUCache(maxBytes int64) *SharedLRUCache {
 // readerID uniquely identifies this reader within the cache (e.g. file path or object key).
 // The returned provider satisfies ReaderProvider and is safe for concurrent use.
 func NewSharedLRUProvider(underlying ReaderProvider, readerID string, cache *SharedLRUCache) ReaderProvider {
-	adapted := &readerProviderAdapter{provider: underlying}
-	return modules_rw.NewSharedLRUProvider(adapted, readerID, cache)
+	return modules_rw.NewSharedLRUProvider(underlying, readerID, cache)
 }
 
 // Cache is the common interface for all blockpack cache tiers.
@@ -202,12 +201,11 @@ const (
 
 // ReaderProvider supplies random access to blockpack data.
 // Implementations can use files, memory, cloud storage, etc.
-type ReaderProvider interface {
-	Size() (int64, error)
-	ReadAt(p []byte, off int64, dataType DataType) (int, error)
-}
+type ReaderProvider = modules_rw.ReaderProvider
 
 // CloseableReaderProvider extends ReaderProvider with resource cleanup.
+// Implementations that hold open file descriptors or network connections
+// should implement Close to release them.
 type CloseableReaderProvider interface {
 	ReaderProvider
 	Close() error
@@ -217,8 +215,7 @@ type CloseableReaderProvider interface {
 
 // NewReaderFromProvider creates a modules-format reader from a ReaderProvider.
 func NewReaderFromProvider(provider ReaderProvider) (*Reader, error) {
-	wrappedProvider := &readerProviderAdapter{provider: provider}
-	return modules_reader.NewReaderFromProvider(wrappedProvider)
+	return modules_reader.NewReaderFromProvider(provider)
 }
 
 // NewReaderWithCache creates a Reader that caches footer, header, metadata, and block
@@ -227,28 +224,27 @@ func NewReaderFromProvider(provider ReaderProvider) (*Reader, error) {
 // A nil cache falls back to uncached reads. cache may be any Cache implementation:
 // FileCache, MemoryCache, MemCache, or a ChainedCache.
 func NewReaderWithCache(provider ReaderProvider, fileID string, cache Cache) (*Reader, error) {
-	wrapped := &readerProviderAdapter{provider: provider}
-	return modules_reader.NewReaderFromProviderWithOptions(wrapped, modules_reader.Options{
+	return modules_reader.NewReaderFromProviderWithOptions(provider, modules_reader.Options{
 		Cache:  cache,
 		FileID: fileID,
 	})
 }
 
-// NewLeanReaderFromProvider creates a lean Reader using only 2 I/Os (footer + compact
-// trace index). Ideal for GetTraceByID workloads. Falls back to NewReaderFromProvider
-// for files without a compact trace index (v3 footer).
+// NewLeanReaderFromProvider creates a lean Reader optimized for GetTraceByID workloads.
+// V13 files: 2 I/Os (footer + compact trace index).
+// V14 files: ≥3 I/Os on open (footer + section directory + block_index); remaining sections
+// are loaded lazily. Trace index deferred to first bloom hit (+1 I/O). See TestLeanReader_ThreeIO.
+// Falls back to NewReaderFromProvider for files without a compact trace index (v3 footer).
 func NewLeanReaderFromProvider(provider ReaderProvider) (*Reader, error) {
-	wrapped := &readerProviderAdapter{provider: provider}
-	return modules_reader.NewLeanReaderFromProvider(wrapped)
+	return modules_reader.NewLeanReaderFromProvider(provider)
 }
 
-// NewLeanReaderWithCache creates a lean Reader with caching. Uses the same 2-I/O
-// path as NewLeanReaderFromProvider but caches footer and compact index reads.
-// fileID must uniquely identify the file within the cache namespace.
+// NewLeanReaderWithCache creates a lean Reader with caching. Uses the same lean path
+// as NewLeanReaderFromProvider (version-dependent I/O count; see its doc for details)
+// but caches footer and section reads. fileID must uniquely identify the file within the cache namespace.
 // cache may be any Cache implementation: FileCache, MemoryCache, MemCache, or ChainedCache.
 func NewLeanReaderWithCache(provider ReaderProvider, fileID string, cache Cache) (*Reader, error) {
-	wrapped := &readerProviderAdapter{provider: provider}
-	return modules_reader.NewLeanReaderFromProviderWithOptions(wrapped, modules_reader.Options{
+	return modules_reader.NewLeanReaderFromProviderWithOptions(provider, modules_reader.Options{
 		Cache:  cache,
 		FileID: fileID,
 	})
@@ -397,19 +393,6 @@ func GetTraceByID(r *Reader, traceIDHex string) (results []SpanMatch, err error)
 	}
 
 	return results, nil
-}
-
-// readerProviderAdapter adapts the public ReaderProvider to modules_rw.ReaderProvider.
-type readerProviderAdapter struct {
-	provider ReaderProvider
-}
-
-func (a *readerProviderAdapter) Size() (int64, error) {
-	return a.provider.Size()
-}
-
-func (a *readerProviderAdapter) ReadAt(p []byte, off int64, dataType modules_rw.DataType) (int, error) {
-	return a.provider.ReadAt(p, off, dataType)
 }
 
 // AGENT: Writer constructors - minimal set needed for creating writers.

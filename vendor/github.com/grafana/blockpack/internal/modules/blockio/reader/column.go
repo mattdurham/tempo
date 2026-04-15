@@ -5,6 +5,7 @@ package reader
 import (
 	"encoding/binary"
 	"fmt"
+	"log/slog"
 	"math"
 	"sync"
 	"unsafe"
@@ -48,12 +49,26 @@ func ReleaseInternMap(mp *map[string]string) {
 // Each call to decodeXORBytes / decodePrefixBytes acquires one slice, resets it to [:0],
 // appends present-row indices, then releases it back after the per-row decode loop.
 //
+// Pool cap guard constants for presentRowsScratchPool.
+// NOTE-007: initial pool capacity and cap-guard threshold.
+const (
+	presentRowsScratchInitCap = 2048  // initial pool capacity
+	presentRowsScratchMaxCap  = 65536 // above this, return a fresh small slice instead
+)
+
+// VectorF32 column header field offsets.
+// Header layout: enc_version[1]+kind[1]+dim[2]+row_count[4]+rle_len[4] = 12 bytes.
+const (
+	vf32HdrSize   = 1 + 1 + 2 + 4 + 4 // VectorF32 column header: enc_version[1]+kind[1]+dim[2]+row_count[4]+rle_len[4] = 12 bytes
+	vf32RleLenOff = 8                 // byte offset of rle_len field within VectorF32 header
+)
+
 // NOTE-007: Eliminates per-call make([]int, 0, presentCount) in collectPresentRows.
-// Cap guard: slices larger than 65536 entries are replaced with a fresh small slice before
+// Cap guard: slices larger than presentRowsScratchMaxCap entries are replaced with a fresh small slice before
 // pool return to avoid retaining large backing arrays indefinitely.
 var presentRowsScratchPool = &sync.Pool{ //nolint:gochecknoglobals
 	New: func() any {
-		s := make([]int, 0, 2048)
+		s := make([]int, 0, presentRowsScratchInitCap)
 		return &s
 	},
 }
@@ -63,34 +78,29 @@ func acquirePresentRowsScratch() *[]int {
 }
 
 func releasePresentRowsScratch(sp *[]int) {
-	if cap(*sp) > 65536 {
+	if cap(*sp) > presentRowsScratchMaxCap {
 		// Replace the oversized backing array with a fresh small slice.
 		// Assign through the pointer so the pool receives the new small slice,
 		// not a pointer to a local stack variable.
-		*sp = make([]int, 0, 2048)
+		*sp = make([]int, 0, presentRowsScratchInitCap)
 	} else {
 		*sp = (*sp)[:0]
 	}
 	presentRowsScratchPool.Put(sp)
 }
 
-// zstdDecoder is a package-level zstd decoder shared across calls.
+// getZstdDecoder returns the package-level zstd decoder shared across calls.
 // Used only for the vectorF32 column decoder path.
-var (
-	zstdDecoderOnce sync.Once
-	zstdDec         *zstd.Decoder //nolint:gochecknoglobals
-)
-
-func getZstdDecoder() *zstd.Decoder {
-	zstdDecoderOnce.Do(func() {
-		var err error
-		zstdDec, err = zstd.NewReader(nil, zstd.WithDecoderConcurrency(0))
-		if err != nil {
-			panic(fmt.Sprintf("reader: zstd.NewReader: %v", err))
-		}
-	})
-	return zstdDec
-}
+// SPEC-ROOT-001: panic exempt — sync.OnceValue provides init()-equivalent lazy initialization
+// semantics. zstd.NewReader cannot return an error with valid options (WithDecoderConcurrency(0)
+// is always valid), so the panic path is unreachable dead code in practice.
+var getZstdDecoder = sync.OnceValue(func() *zstd.Decoder { //nolint:gochecknoglobals
+	dec, err := zstd.NewReader(nil, zstd.WithDecoderConcurrency(0))
+	if err != nil {
+		panic(fmt.Sprintf("reader: zstd.NewReader: %v", err))
+	}
+	return dec
+})
 
 // decompressZstdScratch decompresses a length-prefixed zstd-compressed segment from data[pos:].
 // The returned slice is valid only until the next call with the same scratch pointer.
@@ -252,157 +262,102 @@ func readColumnEncoding(data []byte, spanCount int, colType shared.ColumnType, c
 	kind := data[1]
 
 	switch kind {
-	case 1, 2:
+	case shared.KindDictionary, shared.KindSparseDictionary:
 		return decodeDictionary(data[2:], kind, spanCount, colType, ctx)
-	case 3, 4:
+	case shared.KindInlineBytes, shared.KindSparseInlineBytes:
 		return decodeInlineBytes(data[2:], kind, spanCount)
-	case 5:
+	case shared.KindDeltaUint64:
 		return decodeDeltaUint64(data[2:], spanCount, ctx)
-	case 6, 7:
+	case shared.KindRLEIndexes, shared.KindSparseRLEIndexes:
 		return decodeRLEIndexes(data[2:], kind, spanCount, colType, ctx)
-	case 8, 9:
+	case shared.KindXORBytes, shared.KindSparseXORBytes:
 		return decodeXORBytes(data[2:], kind, spanCount, ctx)
-	case 10, 11:
+	case shared.KindPrefixBytes, shared.KindSparsePrefixBytes:
 		return decodePrefixBytes(data[2:], kind, spanCount, ctx)
-	case 12, 13:
+	case shared.KindDeltaDictionary, shared.KindSparseDeltaDictionary:
 		return decodeDeltaDictionary(data[2:], kind, spanCount, ctx)
 	default:
 		return nil, fmt.Errorf("column encoding: unknown kind %d", kind)
 	}
 }
 
-// decodePresenceOnly skips past raw sub-segment blobs using length prefixes and decodes
-// only the uncompressed presence RLE. Called once per column during lazy registration.
-// O(M/8) where M is span count.
-// NOTE-001: lazy registration path — presence available immediately, values deferred.
-// NOTE-010 (shared/NOTES.md): ColumnTypeVectorF32 columns are fully zstd-compressed;
-// colType is required to dispatch correctly before reading enc_version.
-func decodePresenceOnly(data []byte, spanCount int, colType shared.ColumnType) ([]byte, error) {
-	// ColumnTypeVectorF32: the blob starts with enc_version[1]+kind[1]+dim[2]+row_count[4]+rle_len[4]+rle.
-	// Presence RLE is stored uncompressed (only float data is zstd-compressed).
-	// NOTE-010 (shared/NOTES.md): presence is in the uncompressed header region.
-	if colType == shared.ColumnTypeVectorF32 {
-		const hdrSize = 1 + 1 + 2 + 4 + 4 // enc_version+kind+dim+row_count+rle_len
-		if len(data) < hdrSize {
-			return nil, fmt.Errorf("decodePresenceOnly(vectorF32): data too short: %d", len(data))
+// ensureDecompressed snappy-decompresses compressedEncoding into rawEncoding on first call.
+// SPEC-V14-002: decompression is deferred to first column access so that non-wanted lazy
+// columns never pay the CPU/memory cost of snappy decode.
+// decompressOnce ensures at most one goroutine decompresses; concurrent callers block until done.
+// NOTE-CONC-001: no outer compressedEncoding check — that read would race with the write inside
+// the closure. decompressOnce.Do is idempotent: the inner guard handles the already-done case.
+func (c *Column) ensureDecompressed() {
+	c.decompressOnce.Do(func() {
+		if c.compressedEncoding == nil {
+			return // not a V14 lazy column or already handled
 		}
-		rleLen := int(binary.LittleEndian.Uint32(data[8:12]))
-		if hdrSize+rleLen > len(data) {
-			return nil, fmt.Errorf("decodePresenceOnly(vectorF32): rle truncated")
-		}
-		present, err := shared.DecodePresenceRLE(data[hdrSize:hdrSize+rleLen], spanCount)
+		decompressed, err := decompressV14ColumnData(c.Name, c.compressedEncoding, c.uncompressedLen)
 		if err != nil {
-			return nil, fmt.Errorf("decodePresenceOnly(vectorF32): %w", err)
+			// SPEC-ROOT-010: log decompression failures; silent skips hide data corruption.
+			slog.Warn("block_parser: V14 lazy column decompression failed",
+				"column", c.Name, "err", err,
+				"uncompressed_len", c.uncompressedLen,
+				"max_block_size", shared.MaxBlockSize)
+		} else {
+			c.rawEncoding = decompressed
 		}
-		return present, nil
-	}
-
-	if len(data) < 2 {
-		return nil, fmt.Errorf("decodePresenceOnly: data too short (%d bytes)", len(data))
-	}
-
-	encVersion := data[0]
-	if encVersion != shared.VersionBlockEncV3 {
-		return nil, fmt.Errorf(
-			"decodePresenceOnly: unsupported enc_version %d (only enc_version=3 supported)",
-			encVersion,
-		)
-	}
-
-	kind := data[1]
-	d := data[2:]
-	pos := 0
-
-	switch kind {
-	case 1, 2, 6, 7, 12, 13:
-		// dictionary kinds: index_width[1] + dict_len[4] + dict_data[N] + row_count[4]
-		if pos+1 > len(d) {
-			return nil, fmt.Errorf("decodePresenceOnly(kind=%d): need index_width byte", kind)
-		}
-
-		pos++ // skip index_width
-
-		if pos+4 > len(d) {
-			return nil, fmt.Errorf("decodePresenceOnly(kind=%d): need dict_len", kind)
-		}
-
-		dictLen := int(binary.LittleEndian.Uint32(d[pos:]))
-		pos += 4 + dictLen // skip compressed dict bytes
-
-		if pos+4 > len(d) {
-			return nil, fmt.Errorf("decodePresenceOnly(kind=%d): need row_count", kind)
-		}
-
-		pos += 4 // skip row_count
-
-	case 3, 4, 8, 9, 10, 11:
-		// kinds with span_count[4] prefix
-		if pos+4 > len(d) {
-			return nil, fmt.Errorf("decodePresenceOnly(kind=%d): need span_count", kind)
-		}
-
-		pos += 4
-
-	case 5:
-		// delta_uint64: span_count[4]
-		if pos+4 > len(d) {
-			return nil, fmt.Errorf("decodePresenceOnly(kind=5): need span_count")
-		}
-
-		pos += 4
-
-	default:
-		return nil, fmt.Errorf("decodePresenceOnly: unknown kind %d", kind)
-	}
-
-	present, _, _, err := decodePresenceRLEFromSlice(d, pos, spanCount)
-	if err != nil {
-		return nil, fmt.Errorf("decodePresenceOnly(kind=%d): %w", kind, err)
-	}
-
-	return present, nil
+		c.compressedEncoding = nil
+		c.uncompressedLen = 0
+	})
 }
 
 // decodeNow performs full decode of this column from rawEncoding.
-// Called on first StringValue/Int64Value/Uint64Value/Float64Value/BoolValue/BytesValue access.
-// decodeOnce ensures at most one goroutine decodes; concurrent callers block until done.
-// rawEncoding is nil after this call regardless of decode outcome.
+// Called by value accessors (StringValue, Int64Value, …) and IsPresent on first access.
+// decodeOnce ensures at most one goroutine runs the decode; concurrent callers block until done.
+// On success, Present and all Dict/Idx slices are populated and rawEncoding is cleared.
+// On failure (decompression error or corrupt data), Present is set to []byte{} so that
+// IsPresent returns false for every span, and decoded is set to true to prevent retries.
+// NOTE-CONC-001: no outer rawEncoding check — that read would race with the write inside
+// the closure. decodeOnce.Do is idempotent: the inner guard handles the already-done case.
 func (c *Column) decodeNow() {
-	if c.rawEncoding == nil {
-		return // already decoded or never registered lazily
-	}
+	c.ensureDecompressed()
 	c.decodeOnce.Do(func() {
 		if c.rawEncoding == nil {
+			// Decompression failed or this is an eagerly-decoded column being re-entered;
+			// mark as done so subsequent calls skip immediately.
+			c.Present = []byte{} // no data → treat all spans as absent
+			c.decoded.Store(true)
 			return
 		}
 		ctx := &decodeCtx{intern: c.internMap}
-		decoded, err := readColumnEncoding(c.rawEncoding, c.SpanCount, c.Type, ctx)
+		dec, err := readColumnEncoding(c.rawEncoding, c.SpanCount, c.Type, ctx)
 		if err != nil {
+			// SPEC-ROOT-010: log decode errors; silent drops hide data corruption.
+			slog.Warn("column decode failed", "column", c.Name, "type", c.Type, "err", err)
+			c.Present = []byte{} // corrupt data → treat all spans as absent
 			c.rawEncoding = nil
 			c.internMap = nil
+			c.decoded.Store(true)
 			return
 		}
 
 		if c.Present == nil {
-			c.Present = decoded.Present
+			c.Present = dec.Present
 		}
-		c.StringDict = decoded.StringDict
-		c.StringIdx = decoded.StringIdx
-		c.Int64Dict = decoded.Int64Dict
-		c.Int64Idx = decoded.Int64Idx
-		c.Uint64Dict = decoded.Uint64Dict
-		c.Uint64Idx = decoded.Uint64Idx
-		c.Float64Dict = decoded.Float64Dict
-		c.Float64Idx = decoded.Float64Idx
-		c.BoolDict = decoded.BoolDict
-		c.BoolIdx = decoded.BoolIdx
-		c.BytesDict = decoded.BytesDict
-		c.BytesIdx = decoded.BytesIdx
-		c.BytesInline = decoded.BytesInline
-		c.sparseDictIdx = decoded.sparseDictIdx
+		c.StringDict = dec.StringDict
+		c.StringIdx = dec.StringIdx
+		c.Int64Dict = dec.Int64Dict
+		c.Int64Idx = dec.Int64Idx
+		c.Uint64Dict = dec.Uint64Dict
+		c.Uint64Idx = dec.Uint64Idx
+		c.Float64Dict = dec.Float64Dict
+		c.Float64Idx = dec.Float64Idx
+		c.BoolDict = dec.BoolDict
+		c.BoolIdx = dec.BoolIdx
+		c.BytesDict = dec.BytesDict
+		c.BytesIdx = dec.BytesIdx
+		c.BytesInline = dec.BytesInline
+		c.sparseDictIdx = dec.sparseDictIdx
 
 		c.rawEncoding = nil
 		c.internMap = nil
+		c.decoded.Store(true)
 	})
 }
 
@@ -560,7 +515,7 @@ func decodeDictionary(
 
 	// indexes
 	switch kind {
-	case 1: // dense: rowCount indexes
+	case shared.KindDictionary: // dense: rowCount indexes
 		idx, _, err := readIndexArray(data, pos, rowCount, indexWidth)
 		if err != nil {
 			return nil, fmt.Errorf("dictionary(dense): %w", err)
@@ -568,7 +523,7 @@ func decodeDictionary(
 
 		assignDictIdx(col, idx)
 
-	case 2: // sparse: present_count[4] + presentCount indexes
+	case shared.KindSparseDictionary: // sparse: present_count[4] + presentCount indexes
 		if pos+4 > len(data) {
 			return nil, fmt.Errorf("dictionary(sparse): missing present_count")
 		}
@@ -656,7 +611,7 @@ func decodeInlineBytes(data []byte, kind uint8, spanCount int) (*Column, error) 
 	col.BytesInline = make([][]byte, spanCount)
 
 	switch kind {
-	case 3: // dense: rowCount × {len[4] + bytes}
+	case shared.KindInlineBytes: // dense: rowCount × {len[4] + bytes}
 		for i := range rowCount {
 			if pos+4 > len(data) {
 				return nil, fmt.Errorf("inline_bytes(dense): short at row %d", i)
@@ -674,7 +629,7 @@ func decodeInlineBytes(data []byte, kind uint8, spanCount int) (*Column, error) 
 			pos += bLen
 		}
 
-	case 4: // sparse: present_count[4] + presentCount × {len[4] + bytes}
+	case shared.KindSparseInlineBytes: // sparse: present_count[4] + presentCount × {len[4] + bytes}
 		if pos+4 > len(data) {
 			return nil, fmt.Errorf("inline_bytes(sparse): missing present_count")
 		}
@@ -890,14 +845,14 @@ func decodeRLEIndexes(
 	// For kind 6 (dense):  sparseIdx covers all rows.
 	var denseIdx []uint32
 	switch kind {
-	case 6: // dense
+	case shared.KindRLEIndexes: // dense
 		if indexCount != spanCount {
 			return nil, fmt.Errorf("rle_indexes(dense): index_count %d != spanCount %d", indexCount, spanCount)
 		}
 
 		denseIdx = sparseIdx
 
-	case 7: // sparse
+	case shared.KindSparseRLEIndexes: // sparse
 		if indexCount != presentCount {
 			return nil, fmt.Errorf(
 				"rle_indexes(sparse): index_count %d != presentCount %d",
@@ -1203,9 +1158,9 @@ func decodeDeltaDictionary(data []byte, kind uint8, spanCount int, ctx *decodeCt
 	// Determine how many delta values to expect.
 	var nDeltas int
 	switch kind {
-	case 12: // dense: one delta per row including nulls
+	case shared.KindDeltaDictionary: // dense: one delta per row including nulls
 		nDeltas = rowCount
-	case 13: // sparse: one delta per present row
+	case shared.KindSparseDeltaDictionary: // sparse: one delta per present row
 		nDeltas = presentCount
 	}
 
@@ -1222,7 +1177,7 @@ func decodeDeltaDictionary(data []byte, kind uint8, spanCount int, ctx *decodeCt
 	var prev int32
 
 	switch kind {
-	case 12: // dense
+	case shared.KindDeltaDictionary: // dense
 		for i := range rowCount {
 			delta := int32(binary.LittleEndian.Uint32(deltaBytes[i*4:])) //nolint:gosec
 			prev += delta
@@ -1236,7 +1191,7 @@ func decodeDeltaDictionary(data []byte, kind uint8, spanCount int, ctx *decodeCt
 			denseIdx[i] = uint32(prev) //nolint:gosec
 		}
 
-	case 13: // sparse
+	case shared.KindSparseDeltaDictionary: // sparse
 		si := 0
 		for i := range spanCount {
 			if !shared.IsPresent(present, i) {
@@ -1277,20 +1232,19 @@ func decodeDeltaDictionary(data []byte, kind uint8, spanCount int, ctx *decodeCt
 // NOTE-010 (shared/NOTES.md): ColumnTypeVectorF32 encoding — only float data is zstd-compressed.
 func decodeVectorF32(data []byte, spanCount int, ctx *decodeCtx) (*Column, error) {
 	// Header: enc_version[1] + kind[1] + dim[2] + row_count[4] + rle_len[4] = 12 bytes minimum.
-	const hdrSize = 1 + 1 + 2 + 4 + 4
-	if len(data) < hdrSize {
+	if len(data) < vf32HdrSize {
 		return nil, fmt.Errorf("vectorF32: data too short: %d bytes", len(data))
 	}
 
 	dim := int(binary.LittleEndian.Uint16(data[2:4]))
 	rowCount := int(binary.LittleEndian.Uint32(data[4:8]))
-	rleLen := int(binary.LittleEndian.Uint32(data[8:12]))
+	rleLen := int(binary.LittleEndian.Uint32(data[vf32RleLenOff : vf32RleLenOff+4]))
 
 	if rowCount != spanCount {
 		return nil, fmt.Errorf("vectorF32: row_count %d != spanCount %d", rowCount, spanCount)
 	}
 
-	off := hdrSize
+	off := vf32HdrSize
 	if off+rleLen > len(data) {
 		return nil, fmt.Errorf("vectorF32: presence RLE truncated: need %d bytes at offset %d", rleLen, off)
 	}
@@ -1316,8 +1270,9 @@ func decodeVectorF32(data []byte, spanCount int, ctx *decodeCtx) (*Column, error
 	}
 
 	presentCount := shared.CountPresent(bitset, spanCount)
-	needed := presentCount * dim * 4
-	if len(floatBytes) < needed {
+	needed := int64(presentCount) * int64(dim) * 4
+	// SPEC-ROOT-012: decompression-bomb and overflow guard — reject oversized vector float data.
+	if needed > shared.MaxBlockSize || len(floatBytes) < int(needed) {
 		return nil, fmt.Errorf("vectorF32: float data too short: need %d bytes, have %d", needed, len(floatBytes))
 	}
 
@@ -1333,9 +1288,9 @@ func decodeVectorF32(data []byte, spanCount int, ctx *decodeCtx) (*Column, error
 		if !shared.IsPresent(bitset, i) {
 			continue
 		}
-		vecStart := presentRow * dim * 4
+		vecStart := int64(presentRow) * int64(dim) * 4
 		raw := make([]byte, dim*4)
-		copy(raw, floatBytes[vecStart:vecStart+dim*4])
+		copy(raw, floatBytes[vecStart:vecStart+int64(dim)*4])
 		col.BytesInline[i] = raw
 		presentRow++
 	}

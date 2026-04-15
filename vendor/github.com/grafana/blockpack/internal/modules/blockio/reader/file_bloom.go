@@ -1,7 +1,7 @@
 package reader
 
 // NOTE: Any changes to this file must be reflected in the corresponding specs.md or NOTES.md.
-// NOTE-45: FileBloom provides file-level bloom filtering for resource.service.name.
+// NOTE-045: FileBloom provides file-level bloom filtering for resource.service.name.
 // Callers can cache FileBloom.Raw() bytes and reconstruct with ParseFileBloom.
 
 import (
@@ -71,7 +71,7 @@ func parseFileBloomSection(data []byte) (*FileBloom, int, error) {
 	}
 	// col_count[4]
 	colCount := int(binary.LittleEndian.Uint32(data[5:]))
-	pos := 9
+	pos := fileBloomMinLen // 9 = magic[4]+version[1]+col_count[4]
 
 	const (
 		minBytesPerCol = 2 + 4 // name_len[2] + fuse_len[4]

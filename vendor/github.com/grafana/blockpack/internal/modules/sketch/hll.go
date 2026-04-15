@@ -18,6 +18,13 @@ const (
 	hllM         = 1 << hllP // 16 registers
 	hllAlpha     = 0.673     // bias correction for p=4
 	hllMarshalSz = hllM      // 16 bytes
+
+	// hllSmallRangeThreshold is the Flajolet et al. 2007 threshold below which linear counting is used.
+	hllSmallRangeThreshold = 2.5
+
+	// MurmurHash3 64-bit finalizer constants (Appleby 2011)
+	murmur3Mix1 uint64 = 0xff51afd7ed558ccd
+	murmur3Mix2 uint64 = 0xc4ceb9fe1a85ec53
 )
 
 // HyperLogLog is a p=4 HLL with 16 uint8 registers.
@@ -66,7 +73,7 @@ func (h *HyperLogLog) Cardinality() uint64 {
 	m := float64(hllM)
 	est := hllAlpha * m * m / sum
 	// Small range correction: linear counting when estimate is small
-	if est <= 2.5*m && zeros > 0 {
+	if est <= hllSmallRangeThreshold*m && zeros > 0 {
 		est = m * math.Log(m/float64(zeros))
 	}
 	return uint64(math.Round(est))
@@ -104,9 +111,9 @@ func hllHash(s string) uint64 {
 	}
 	// Finalization mix: ensures uniform distribution in high bits.
 	h ^= h >> 33
-	h *= 0xff51afd7ed558ccd
+	h *= murmur3Mix1
 	h ^= h >> 33
-	h *= 0xc4ceb9fe1a85ec53
+	h *= murmur3Mix2
 	h ^= h >> 33
 	return h
 }

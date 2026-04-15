@@ -11,6 +11,20 @@ import (
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
 )
 
+// TS index wire-format constants: magic[4]+version[1]+count[4] = 9-byte header, 20-byte entries.
+const (
+	tsIndexHeaderSize = 9  // magic[4] + version[1] + count[4]
+	tsIndexEntrySize  = 20 // minTS[8] + maxTS[8] + blockID[4]
+	tsCountOffset     = 5  // byte offset of the count field within the header
+)
+
+// TS entry field offsets within each 20-byte TS index entry (M-30).
+// Entry layout: minTS[8]+maxTS[8]+blockID[4].
+const (
+	tsEntryMaxTSOff   = 8  // byte offset of maxTS uint64 field within a 20-byte TS entry
+	tsEntryBlockIDOff = 16 // byte offset of blockID uint32 field within a 20-byte TS entry
+)
+
 // parseTSIndex validates the TS index header and returns the raw 20-byte-per-entry body
 // as a zero-copy sub-slice of data, plus the entry count and total bytes consumed.
 //
@@ -20,12 +34,12 @@ import (
 // entries in-place (minTS[8] + maxTS[8] + blockID[4] per entry).
 //
 // Returns (nil, 0, 0, nil) when:
-//   - data is shorter than 9 bytes (too short for a header), or
+//   - data is shorter than tsIndexHeaderSize bytes (too short for a header), or
 //   - the magic number does not match (not a TS index section, e.g. old file format).
 //
 // Returns a non-nil error only when the magic matches but the data is malformed.
 func parseTSIndex(data []byte) (rawEntries []byte, entryCount int, consumed int, err error) {
-	if len(data) < 9 {
+	if len(data) < tsIndexHeaderSize {
 		return nil, 0, 0, nil // graceful: old file, no TS index
 	}
 
@@ -39,11 +53,11 @@ func parseTSIndex(data []byte) (rawEntries []byte, entryCount int, consumed int,
 		return nil, 0, 0, fmt.Errorf("ts_index: unsupported version %d", version)
 	}
 
-	n := int(binary.LittleEndian.Uint32(data[5:]))
+	n := int(binary.LittleEndian.Uint32(data[tsCountOffset:]))
 	if n > shared.MaxBlocks {
 		return nil, 0, 0, fmt.Errorf("ts_index: count %d exceeds MaxBlocks %d", n, shared.MaxBlocks)
 	}
-	need := 9 + n*20
+	need := tsIndexHeaderSize + n*tsIndexEntrySize
 	if len(data) < need {
 		return nil, 0, 0, fmt.Errorf(
 			"ts_index: short data for %d entries (need %d, have %d)",
@@ -51,7 +65,7 @@ func parseTSIndex(data []byte) (rawEntries []byte, entryCount int, consumed int,
 		)
 	}
 
-	return data[9:need], n, need, nil
+	return data[tsIndexHeaderSize:need], n, need, nil
 }
 
 // TimeIndexLen returns the number of entries in the per-file timestamp index.
@@ -97,8 +111,8 @@ func (r *Reader) BlocksInTimeRange(minNano, maxNano uint64) []int {
 	for i := range firstAfter {
 		base := i * stride
 		minTS := binary.LittleEndian.Uint64(r.tsRaw[base:])
-		maxTS := binary.LittleEndian.Uint64(r.tsRaw[base+8:])
-		blockID := binary.LittleEndian.Uint32(r.tsRaw[base+16:])
+		maxTS := binary.LittleEndian.Uint64(r.tsRaw[base+tsEntryMaxTSOff:])
+		blockID := binary.LittleEndian.Uint32(r.tsRaw[base+tsEntryBlockIDOff:])
 		// Include zero-time blocks always; include others only when maxTS >= minNano.
 		if (minTS == 0 && maxTS == 0) || maxTS >= minNano {
 			result = append(result, int(blockID)) //nolint:gosec // safe: blockID bounded by MaxBlocks fits int

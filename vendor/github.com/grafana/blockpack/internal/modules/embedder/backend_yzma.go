@@ -6,6 +6,7 @@ package embedder
 
 import (
 	"fmt"
+	"sync"
 
 	"github.com/hybridgroup/yzma/pkg/llama"
 )
@@ -13,6 +14,7 @@ import (
 // yzmaBackend implements Backend using the yzma llama.cpp Go bindings.
 // It requires a loaded llama.cpp shared library and a GGUF model file.
 type yzmaBackend struct {
+	mu    sync.Mutex
 	model llama.Model
 	lctx  llama.Context
 	vocab llama.Vocab
@@ -86,7 +88,10 @@ func (b *yzmaBackend) EmbedBatch(texts []string) ([][]float32, error) {
 }
 
 // Close frees model and context resources.
+// Locks mu to prevent use-after-free if Close and Embed race.
 func (b *yzmaBackend) Close() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if b.lctx != 0 {
 		_ = llama.Free(b.lctx)
 		b.lctx = 0
@@ -98,11 +103,17 @@ func (b *yzmaBackend) Close() {
 }
 
 // embedOne runs inference for a single text and returns the L2-normalized embedding.
+// llama.Tokenize reads the vocab only and is stateless, so it runs outside the lock.
+// llama.Decode and llama.GetEmbeddingsSeq operate on the shared lctx and must be
+// protected by mu for safe concurrent use.
 func (b *yzmaBackend) embedOne(text string) ([]float32, error) {
 	tokens := llama.Tokenize(b.vocab, text, true, true)
 	if len(tokens) == 0 {
 		return make([]float32, b.nEmbd), nil
 	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
 
 	batch := llama.BatchGetOne(tokens)
 	ret, err := llama.Decode(b.lctx, batch)

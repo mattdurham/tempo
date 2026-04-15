@@ -20,23 +20,37 @@ ensures the provider stack stays efficient on S3/GCS/Azure.
 
 ---
 
-## Benchmark: DefaultProvider Over In-Memory Storage with Latency
+## BENCH-RW-01: BenchmarkDefaultProviderSingleRead
 
 **Target:** Read a 1 MB payload in a single I/O; simulate 20 ms per-request latency.
 
 ```
 BenchmarkDefaultProviderSingleRead — cache miss: 1 I/O, ~20 ms, 1 MB/io
-BenchmarkDefaultProviderCacheHit   — cache hit:  0 I/O, < 1 µs
 ```
 
 Use `NewDefaultProviderWithLatency(underlying, 20*time.Millisecond)` for benchmarks
 that simulate real-world object-storage first-byte latency.
 
+**Implementation:** `BenchmarkDefaultProviderSingleRead` in `rw/provider_bench_test.go`.
+
 ---
 
-## Benchmark: SharedLRUProvider — Cross-Reader Cache Hit
+## BENCH-RW-02: BenchmarkDefaultProviderCacheHit
 
-**BENCH-RW-03:** `BenchmarkSharedLRUProviderCacheHit`
+**Target:** Cache-hit read through `DefaultProvider` must produce 0 I/Os in < 1 µs.
+
+```
+BenchmarkDefaultProviderCacheHit — cache hit: 0 I/O, < 1 µs
+```
+
+**Setup:** 1 MB payload; prime cache with one read; call `dp.Reset()` to zero counters;
+then measure repeated hits.
+
+**Implementation:** `BenchmarkDefaultProviderCacheHit` in `rw/provider_bench_test.go`.
+
+---
+
+## BENCH-RW-03: SharedLRUProvider — Cross-Reader Cache Hit
 
 **Target:** Cache hit through `SharedLRUProvider` must add < 5 µs overhead vs. a direct
 memory copy — the mutex acquisition and map lookup must not dominate.
@@ -50,6 +64,8 @@ measure repeated hits. A miss would cause an underlying read (defeating the benc
 
 **What to watch:** If hit latency climbs above 10 µs under concurrent load, the mutex
 in `SharedLRUCache` may be a bottleneck — consider sharding the index.
+
+**Implementation:** `BenchmarkSharedLRUProviderCacheHit` in `rw/provider_bench_test.go`.
 
 ---
 

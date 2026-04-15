@@ -5,12 +5,12 @@ package reader
 import (
 	"encoding/binary"
 	"fmt"
+	"log/slog"
 	"math"
 	"slices"
 	"sort"
 	"sync"
 
-	"github.com/golang/snappy"
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
 	"github.com/grafana/blockpack/internal/modules/filecache"
 	"github.com/grafana/blockpack/internal/modules/queryplanner"
@@ -92,11 +92,6 @@ type Reader struct {
 	rangeOffsets  map[string]rangeIndexMeta
 	rangeParsed   map[string]parsedRangeIndex
 	compactParsed *compactTraceIndex
-
-	// internStrings is kept for API compatibility with ResetInternStrings callers.
-	// ParseBlockFromBytes and AddColumnsToBlock now each allocate a fresh local intern
-	// map per call, so this field is no longer borrowed by parse paths.
-	internStrings map[string]string
 
 	// sketchIdx holds parsed column-major sketch data for the file.
 	// Nil for files written before the sketch section was introduced (old format).
@@ -242,11 +237,10 @@ func NewReaderFromProviderWithOptions(provider rw.ReaderProvider, opts Options) 
 		cache = filecache.NopCache
 	}
 	r := &Reader{
-		provider:      provider,
-		cache:         cache,
-		fileID:        opts.FileID,
-		fileSize:      size,
-		internStrings: make(map[string]string),
+		provider: provider,
+		cache:    cache,
+		fileID:   opts.FileID,
+		fileSize: size,
 	}
 
 	if err = r.readFooter(); err != nil {
@@ -280,10 +274,10 @@ func NewReaderFromProviderWithOptions(provider rw.ReaderProvider, opts Options) 
 	return r, nil
 }
 
-// NewLeanReaderFromProvider constructs a Reader using only 2 I/Os: the footer
-// (22B) and the compact trace index section. This is the optimal path for
-// FindTraceByID workloads. Falls back to NewReaderFromProvider for files
-// without a compact trace index (compactLen == 0).
+// NewLeanReaderFromProvider constructs a Reader using only 3 I/Os: the footer,
+// the compact trace index section, and the section directory (V13+ files).
+// This is the optimal path for FindTraceByID workloads. Falls back to
+// NewReaderFromProvider for files without a compact trace index (compactLen == 0).
 func NewLeanReaderFromProvider(provider rw.ReaderProvider) (*Reader, error) {
 	return NewLeanReaderFromProviderWithOptions(provider, Options{})
 }
@@ -305,11 +299,10 @@ func NewLeanReaderFromProviderWithOptions(provider rw.ReaderProvider, opts Optio
 		leanCache = filecache.NopCache
 	}
 	r := &Reader{
-		provider:      provider,
-		cache:         leanCache,
-		fileID:        opts.FileID,
-		fileSize:      size,
-		internStrings: make(map[string]string),
+		provider: provider,
+		cache:    leanCache,
+		fileID:   opts.FileID,
+		fileSize: size,
 	}
 
 	// I/O #1: read footer.
@@ -317,7 +310,9 @@ func NewLeanReaderFromProviderWithOptions(provider rw.ReaderProvider, opts Optio
 		return nil, fmt.Errorf("NewLeanReaderFromProvider: footer: %w", err)
 	}
 
-	// V14 files: read section directory + all sections (no legacy compact section).
+	// NOTE-M-16: V14 files (FooterV7Version) use a section directory rather than the legacy
+	// 22-byte file header, so readHeader() is skipped. The enc_version field inside each V14
+	// column blob is validated lazily at first block decode — see readColumnEncoding in column.go.
 	if r.footerVersion == shared.FooterV7Version {
 		r.sectionDir, err = r.readSectionDirectory()
 		if err != nil {
@@ -409,6 +404,16 @@ func (r *Reader) ColumnSketch(col string) queryplanner.ColumnSketch {
 		return nil
 	}
 	return cd
+}
+
+// EvictSketch removes this file's parsed sketch section from the process-global sketch cache.
+// Called by the query planner when fuse pruning eliminates all blocks in this file, so the
+// sketch data (which may be tens of MB) is not retained for a file we will never read.
+func (r *Reader) EvictSketch() {
+	if r.fileID != "" {
+		parsedSketchCache.Delete(r.fileID + "/sketch")
+	}
+	r.sketchIdx = nil
 }
 
 // BlocksForRange returns the sorted block indices that may contain the given query value
@@ -730,6 +735,8 @@ func (r *Reader) FileSketchSummaryRaw() []byte {
 	}
 	b, err := MarshalFileSketchSummary(s)
 	if err != nil {
+		// SPEC-ROOT-010: unexpected marshal failure — log for diagnostics.
+		slog.Warn("FileSketchSummaryRaw: marshal failed", "err", err)
 		return nil
 	}
 	return b
@@ -826,7 +833,7 @@ func (r *Reader) AddColumnsToBlock(bwb *BlockWithBytes, addColumns map[string]st
 	spanCount := int(hdr.spanCount)
 	colCount := int(hdr.columnCount)
 
-	metas, _, err := parseColumnMetadataArray(bwb.RawBytes, 24, colCount, hdr.version)
+	metas, _, err := parseColumnMetadataArray(bwb.RawBytes, 24, colCount)
 	if err != nil {
 		return fmt.Errorf("AddColumnsToBlock: column metadata: %w", err)
 	}
@@ -843,20 +850,25 @@ func (r *Reader) AddColumnsToBlock(bwb *BlockWithBytes, addColumns map[string]st
 			}
 		}
 
-		if _, exists := bwb.Block.columns[shared.ColumnKey{Name: m.name, Type: m.colType}]; exists {
+		if existing, exists := bwb.Block.columns[shared.ColumnKey{Name: m.name, Type: m.colType}]; exists {
+			// If the column was lazily registered (decoded==false), decode it now so the
+			// caller gets a fully-populated column. Eagerly-decoded columns are left alone.
+			if existing.needsDecode() {
+				existing.EnsureDecoded()
+			}
 			continue
 		}
 
-		if m.dataLen == 0 {
+		if m.compressedLen == 0 {
 			continue
 		}
 
-		start := int(m.dataOffset)    //nolint:gosec // safe: dataOffset bounded by block size < MaxBlockSize
-		end := start + int(m.dataLen) //nolint:gosec // safe: dataLen bounded by block size < MaxBlockSize
+		start := int(m.dataOffset)          //nolint:gosec // safe: dataOffset bounded by block size < MaxBlockSize
+		end := start + int(m.compressedLen) //nolint:gosec // safe: compressedLen bounded by block size < MaxBlockSize
 		if start < 0 || end > len(bwb.RawBytes) {
 			return fmt.Errorf(
 				"AddColumnsToBlock: col %q data offset %d len %d out of range",
-				m.name, m.dataOffset, m.dataLen,
+				m.name, m.dataOffset, m.compressedLen,
 			)
 		}
 
@@ -865,21 +877,11 @@ func (r *Reader) AddColumnsToBlock(bwb *BlockWithBytes, addColumns map[string]st
 			Type: m.colType,
 		}
 
-		colData := bwb.RawBytes[start:end]
-		if hdr.version == shared.VersionBlockV14 {
-			// SPEC-ROOT-012: guard against decompression-bomb OOM.
-			if m.uncompressedLen > uint32(shared.MaxBlockSize) { //nolint:gosec
-				return fmt.Errorf(
-					"AddColumnsToBlock: col %q: uncompressed_len %d exceeds MaxBlockSize",
-					m.name,
-					m.uncompressedLen,
-				)
-			}
-			decompressed, decErr := snappy.Decode(nil, colData)
-			if decErr != nil {
-				return fmt.Errorf("AddColumnsToBlock: col %q snappy decode: %w", m.name, decErr)
-			}
-			colData = decompressed
+		// SPEC-V14-001: column blobs are snappy-compressed; decompress before decode.
+		// SPEC-ROOT-012: decompressV14ColumnData guards against decompression-bomb OOM.
+		colData, err := decompressV14ColumnData(m.name, bwb.RawBytes[start:end], m.uncompressedLen)
+		if err != nil {
+			return fmt.Errorf("AddColumnsToBlock: %w", err)
 		}
 
 		decoded, err := readColumnEncoding(colData, spanCount, m.colType, ctx)
@@ -903,6 +905,7 @@ func (r *Reader) AddColumnsToBlock(bwb *BlockWithBytes, addColumns map[string]st
 		col.BytesInline = decoded.BytesInline
 		col.Present = decoded.Present
 		col.SpanCount = decoded.SpanCount
+		col.decoded.Store(true) // NOTE-CONC-001: mark eagerly decoded so needsDecode() is false
 
 		bwb.Block.columns[shared.ColumnKey{Name: m.name, Type: m.colType}] = col
 	}
@@ -915,27 +918,10 @@ func (r *Reader) AddColumnsToBlock(bwb *BlockWithBytes, addColumns map[string]st
 
 // GetBlockWithBytes reads, parses, and returns a full block. Compatibility shim that
 // combines ReadBlockRaw + ParseBlockFromBytes into a single call.
-//
-// BUG-12 (latent trap): when secondPassCols is non-nil, a second ParseBlockFromBytes call
-// is made using secondPassCols as the column filter. This second call REPLACES the bwb
-// returned by the first pass — it does not merge with wantColumns. Any column present in
-// wantColumns but absent from secondPassCols will be silently discarded.
-//
-// No current caller passes a non-nil secondPassCols (all call sites use nil), so there is
-// no active data loss. If you ever need both wantColumns AND a second set of columns, call
-// ParseBlockFromBytes twice and merge the results manually rather than relying on this shim.
 func (r *Reader) GetBlockWithBytes(
 	blockIdx int,
 	wantColumns map[string]struct{},
-	secondPassCols map[string]struct{},
 ) (*BlockWithBytes, error) {
-	// BUG-4 fix: secondPassCols must be nil — see BUG-12 comment. Check before I/O.
-	if secondPassCols != nil {
-		return nil, fmt.Errorf(
-			"GetBlockWithBytes: secondPassCols must be nil (BUG-12: non-nil secondPassCols silently discards first-pass columns); got %d secondPassCols entries",
-			len(secondPassCols),
-		)
-	}
 	raw, err := r.ReadBlockRaw(blockIdx)
 	if err != nil {
 		return nil, err

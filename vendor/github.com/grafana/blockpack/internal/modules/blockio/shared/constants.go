@@ -115,9 +115,10 @@ const (
 	IntrinsicPageSize = 10_000
 
 	// Per-page bloom filter parameters for dict columns.
-	IntrinsicPageBloomK           = 7  // number of hash functions (Kirsch-Mitzenmacher)
-	IntrinsicPageBloomBitsPerItem = 10 // bits per unique value in the bloom filter
-	IntrinsicPageBloomMinBytes    = 16 // minimum bloom filter size in bytes
+	IntrinsicPageBloomK           = 7    // number of hash functions (Kirsch-Mitzenmacher)
+	IntrinsicPageBloomBitsPerItem = 10   // bits per unique value in the bloom filter
+	IntrinsicPageBloomMinBytes    = 16   // minimum bloom filter size in bytes
+	IntrinsicPageBloomMaxBytes    = 4096 // maximum bloom filter size in bytes
 
 )
 
@@ -139,11 +140,77 @@ const (
 	//   - compactTracesOffset / compactTracesLen: snappy-compressed trace index
 	FooterV6Version uint16 = 6
 	FooterV6Size    uint   = 58 // version[2]+headerOffset[8]+compactOffset[8]+compactLen[4]+intrinsicOffset[8]+intrinsicLen[4]+vectorOffset[8]+vectorLen[4]+compactTracesOffset[8]+compactTracesLen[4]
+)
 
+// Paged-column TOC and compact trace index constants.
+const (
 	// CompactIndexVersion3 marks the compact header section as v3 (split format).
 	// The bloom+block_table are stored raw (uncompressed) in the compact header section.
 	// The trace index is stored separately in the compact traces section (snappy-compressed).
 	CompactIndexVersion3 uint8 = 3
+
+	// PageTOCVersion is the version field (first byte) inside a snappy-decompressed paged column
+	// TOC blob. It is distinct from IntrinsicPagedVersion (0x02), which is the outer type-sentinel
+	// that appears at byte 0 of the uncompressed column blob and selects the paged code path.
+	// Wire (after snappy decompress): page_toc_version[1]=0x01 + page_count[4] + block_idx_width[1]
+	//   + row_idx_width[1] + format[1] + col_type[1] + pages...
+	PageTOCVersion uint8 = 0x01
+
+	// CompactIndexHeaderSize is the fixed size in bytes of the compact index section header.
+	// Wire: magic[4] + version[1] + block_count[4] = 9 bytes.
+	CompactIndexHeaderSize = 9
+)
+
+// Encoding kind constants per SPECS §9.
+// Canonical definitions — writer/constants.go re-exports these as aliases for backward compatibility.
+const (
+	KindDictionary       uint8 = 1
+	KindSparseDictionary uint8 = 2
+	// KindInlineBytes and KindSparseInlineBytes are reader-only: they were emitted by
+	// earlier writer versions and must remain decodable. The current writer never selects
+	// these kinds — all bytes columns are encoded as KindXORBytes (8) or KindPrefixBytes (10).
+	KindInlineBytes           uint8 = 3
+	KindSparseInlineBytes     uint8 = 4
+	KindDeltaUint64           uint8 = 5
+	KindRLEIndexes            uint8 = 6
+	KindSparseRLEIndexes      uint8 = 7
+	KindXORBytes              uint8 = 8
+	KindSparseXORBytes        uint8 = 9
+	KindPrefixBytes           uint8 = 10
+	KindSparsePrefixBytes     uint8 = 11
+	KindDeltaDictionary       uint8 = 12
+	KindSparseDeltaDictionary uint8 = 13
+	KindVectorF32             uint8 = 14 // flat float32 array, per-row presence RLE, LE byte order
+)
+
+// Trace intrinsic column name constants — canonical colon-form names used across writer, reader, and vm packages.
+const (
+	TraceIDColumnName       = "trace:id"
+	SpanIDColumnName        = "span:id"
+	SpanParentIDColumnName  = "span:parent_id"
+	SpanNameColumnName      = "span:name"
+	SpanKindColumnName      = "span:kind"
+	SpanStartColumnName     = "span:start"
+	SpanEndColumnName       = "span:end"
+	SpanDurationColumnName  = "span:duration"
+	SpanStatusColumnName    = "span:status"
+	SpanStatusMsgColumnName = "span:status_message"
+	SvcNameColumnName       = "resource.service.name"
+	TraceStateColumnName    = "trace:state"
+	ResourceSchemaURL       = "resource:schema_url"
+	ScopeSchemaURL          = "scope:schema_url"
+)
+
+// Log intrinsic column name constants (SPECS §11 log signal extension).
+const (
+	LogTimestampColumnName         = "log:timestamp"
+	LogObservedTimestampColumnName = "log:observed_timestamp"
+	LogBodyColumnName              = "log:body"
+	LogSeverityNumberColumnName    = "log:severity_number"
+	LogSeverityTextColumnName      = "log:severity_text"
+	LogTraceIDColumnName           = "log:trace_id"
+	LogSpanIDColumnName            = "log:span_id"
+	LogFlagsColumnName             = "log:flags"
 )
 
 // Well-known vector column names. Double-underscore prefix signals internal/synthetic columns.

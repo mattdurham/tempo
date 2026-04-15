@@ -23,6 +23,7 @@ import (
 	modules_rw "github.com/grafana/blockpack/internal/modules/rw"
 	"github.com/grafana/blockpack/internal/otlpconvert"
 	"github.com/grafana/blockpack/internal/s3provider"
+	vm "github.com/grafana/blockpack/internal/vm"
 )
 
 // AGENT: Storage interfaces - minimal abstraction for storage backends.
@@ -389,11 +390,7 @@ func CompactBlocks(
 	cfg CompactionConfig,
 	output WritableStorage,
 ) ([]string, error) {
-	converted := make([]modules_rw.ReaderProvider, len(providers))
-	for i, p := range providers {
-		converted[i] = p
-	}
-	paths, _, err := modules_compaction.CompactBlocks(ctx, converted, cfg, output)
+	paths, _, err := modules_compaction.CompactBlocks(ctx, providers, cfg, output)
 	return paths, err
 }
 
@@ -407,3 +404,6 @@ type EmbedderHTTPConfig = modules_embedder.HTTPConfig
 func NewHTTPEmbedder(cfg EmbedderHTTPConfig) (*Embedder, error) {
 	return modules_embedder.NewHTTP(cfg)
 }
+
+// Compile-time check: *modules_embedder.Embedder satisfies vm.TextEmbedder.
+var _ vm.TextEmbedder = (*modules_embedder.Embedder)(nil)

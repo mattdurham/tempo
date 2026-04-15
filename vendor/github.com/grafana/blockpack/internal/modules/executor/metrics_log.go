@@ -209,7 +209,7 @@ func logAccumulateRow(
 		}
 	}
 
-	// NOTE-SL-016: acquire from pool — zero map allocation for dropped rows.
+	// NOTE-SL-017: acquire from pool — zero map allocation for dropped rows.
 	bls := acquireBlockLabelSet(block, rowIdx, colNames, colMap, colCols)
 	var labels logqlparser.LabelSet = bls
 

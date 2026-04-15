@@ -126,13 +126,13 @@ func (r *Reader) tryReadFooterV7(cacheKey string) (bool, error) {
 		return false, fmt.Errorf("readFooter: %w", err)
 	}
 	magic := binary.LittleEndian.Uint32(buf[0:])
-	ver := binary.LittleEndian.Uint16(buf[4:])
+	ver := binary.LittleEndian.Uint16(buf[footerV7OffVersion:])
 	if magic != shared.MagicNumber || ver != shared.FooterV7Version {
 		return false, nil
 	}
 	r.footerVersion = shared.FooterV7Version
-	r.v7DirOffset = binary.LittleEndian.Uint64(buf[6:])
-	r.v7DirLen = binary.LittleEndian.Uint32(buf[14:])
+	r.v7DirOffset = binary.LittleEndian.Uint64(buf[footerV7OffDirOff:])
+	r.v7DirLen = binary.LittleEndian.Uint32(buf[footerV7OffDirLen:])
 	return true, nil
 }
 
@@ -171,12 +171,47 @@ func (r *Reader) readFooterLegacy(cacheKey string) error {
 	return r.readFooterV3(cacheKey)
 }
 
+// Legacy footer field byte offsets within the footer buffer.
+// buf[0:2] = version[2], then fields follow in order.
+// Layout: version[2]+headerOffset[8]+compactOffset[8]+compactLen[4]+
+//
+//	intrinsicOffset[8]+intrinsicLen[4]+vectorOffset[8]+vectorLen[4]+
+//	compactTracesOffset[8]+compactTracesLen[4]
+const (
+	footerOffHeaderOffset        = 2  // uint64 header section offset
+	footerOffCompactOffset       = 10 // uint64 compact section offset
+	footerOffCompactLen          = 18 // uint32 compact section length
+	footerOffIntrinsicOffset     = 22 // uint64 intrinsic section offset (V4+)
+	footerOffIntrinsicLen        = 30 // uint32 intrinsic section length (V4+)
+	footerOffVectorOffset        = 34 // uint64 vector index offset (V5+)
+	footerOffVectorLen           = 42 // uint32 vector index length (V5+)
+	footerOffCompactTracesOffset = 46 // uint64 compact traces section offset (V6+)
+	footerOffCompactTracesLen    = 54 // uint32 compact traces section length (V6+)
+)
+
+// V7 footer field offsets (M-25).
+// Wire format: magic[4] · version[2] · dir_offset[8] · dir_len[4] = 18 bytes.
+const (
+	footerV7OffVersion = 4  // uint16 version field within 18-byte V7 footer
+	footerV7OffDirOff  = 6  // uint64 dir_offset field
+	footerV7OffDirLen  = 14 // uint32 dir_len field
+)
+
+// V13 file header field offsets (M-28b).
+// Wire format: magic[4] · version[1] · metadataOffset[8] · metadataLen[8] · signalType[1] = 22 bytes.
+const (
+	fileHdrV13OffVersion        = 4  // uint8 V13 file version field
+	fileHdrV13OffMetadataOffset = 5  // uint64 metadata offset
+	fileHdrV13OffMetadataLen    = 13 // uint64 metadata length
+	fileHdrV13OffSignalType     = 21 // uint8 signal type
+)
+
 // applyLegacyFooterCommon sets the common Reader fields from a parsed legacy footer buffer.
 // buf must start at the version[2] field (offset 0 = version, 2 = headerOffset, ...).
 func (r *Reader) applyLegacyFooterCommon(buf []byte) error {
-	r.footerFields.headerOffset = binary.LittleEndian.Uint64(buf[2:])
-	r.footerFields.compactOffset = binary.LittleEndian.Uint64(buf[10:])
-	r.footerFields.compactLen = binary.LittleEndian.Uint32(buf[18:])
+	r.footerFields.headerOffset = binary.LittleEndian.Uint64(buf[footerOffHeaderOffset:])
+	r.footerFields.compactOffset = binary.LittleEndian.Uint64(buf[footerOffCompactOffset:])
+	r.footerFields.compactLen = binary.LittleEndian.Uint32(buf[footerOffCompactLen:])
 	if r.footerFields.headerOffset == 0 {
 		return fmt.Errorf("readFooter: header_offset is zero")
 	}
@@ -208,20 +243,20 @@ func (r *Reader) tryReadFooterV6(cacheKey string) (bool, error) {
 	switch {
 	case binary.LittleEndian.Uint16(buf[0:]) == shared.FooterV6Version:
 		r.footerVersion = shared.FooterV6Version
-		r.intrinsicIndexOffset = binary.LittleEndian.Uint64(buf[22:])
-		r.intrinsicIndexLen = binary.LittleEndian.Uint32(buf[30:])
-		r.vectorIndexOffset = binary.LittleEndian.Uint64(buf[34:])
-		r.vectorIndexLen = binary.LittleEndian.Uint32(buf[42:])
-		r.compactTracesOffset = binary.LittleEndian.Uint64(buf[46:])
-		r.compactTracesLen = binary.LittleEndian.Uint32(buf[54:])
+		r.intrinsicIndexOffset = binary.LittleEndian.Uint64(buf[footerOffIntrinsicOffset:])
+		r.intrinsicIndexLen = binary.LittleEndian.Uint32(buf[footerOffIntrinsicLen:])
+		r.vectorIndexOffset = binary.LittleEndian.Uint64(buf[footerOffVectorOffset:])
+		r.vectorIndexLen = binary.LittleEndian.Uint32(buf[footerOffVectorLen:])
+		r.compactTracesOffset = binary.LittleEndian.Uint64(buf[footerOffCompactTracesOffset:])
+		r.compactTracesLen = binary.LittleEndian.Uint32(buf[footerOffCompactTracesLen:])
 		return true, r.applyLegacyFooterCommon(buf)
 	case binary.LittleEndian.Uint16(v5buf[0:]) == shared.FooterV5Version:
 		// V5 footer is embedded at offset v5InV6Off in the V6 read buffer.
 		r.footerVersion = shared.FooterV5Version
-		r.intrinsicIndexOffset = binary.LittleEndian.Uint64(v5buf[22:])
-		r.intrinsicIndexLen = binary.LittleEndian.Uint32(v5buf[30:])
-		r.vectorIndexOffset = binary.LittleEndian.Uint64(v5buf[34:])
-		r.vectorIndexLen = binary.LittleEndian.Uint32(v5buf[42:])
+		r.intrinsicIndexOffset = binary.LittleEndian.Uint64(v5buf[footerOffIntrinsicOffset:])
+		r.intrinsicIndexLen = binary.LittleEndian.Uint32(v5buf[footerOffIntrinsicLen:])
+		r.vectorIndexOffset = binary.LittleEndian.Uint64(v5buf[footerOffVectorOffset:])
+		r.vectorIndexLen = binary.LittleEndian.Uint32(v5buf[footerOffVectorLen:])
 		return true, r.applyLegacyFooterCommon(v5buf)
 	}
 	return false, nil
@@ -249,16 +284,16 @@ func (r *Reader) tryReadFooterV5(cacheKey string) (bool, error) {
 	switch {
 	case binary.LittleEndian.Uint16(buf[0:]) == shared.FooterV5Version:
 		r.footerVersion = shared.FooterV5Version
-		r.intrinsicIndexOffset = binary.LittleEndian.Uint64(buf[22:])
-		r.intrinsicIndexLen = binary.LittleEndian.Uint32(buf[30:])
-		r.vectorIndexOffset = binary.LittleEndian.Uint64(buf[34:])
-		r.vectorIndexLen = binary.LittleEndian.Uint32(buf[42:])
+		r.intrinsicIndexOffset = binary.LittleEndian.Uint64(buf[footerOffIntrinsicOffset:])
+		r.intrinsicIndexLen = binary.LittleEndian.Uint32(buf[footerOffIntrinsicLen:])
+		r.vectorIndexOffset = binary.LittleEndian.Uint64(buf[footerOffVectorOffset:])
+		r.vectorIndexLen = binary.LittleEndian.Uint32(buf[footerOffVectorLen:])
 		return true, r.applyLegacyFooterCommon(buf)
 	case binary.LittleEndian.Uint16(v4buf[0:]) == shared.FooterV4Version:
 		// V4 footer is embedded at offset v4InV5Off in the V5 read buffer.
 		r.footerVersion = shared.FooterV4Version
-		r.intrinsicIndexOffset = binary.LittleEndian.Uint64(v4buf[22:])
-		r.intrinsicIndexLen = binary.LittleEndian.Uint32(v4buf[30:])
+		r.intrinsicIndexOffset = binary.LittleEndian.Uint64(v4buf[footerOffIntrinsicOffset:])
+		r.intrinsicIndexLen = binary.LittleEndian.Uint32(v4buf[footerOffIntrinsicLen:])
 		return true, r.applyLegacyFooterCommon(v4buf)
 	}
 	return false, nil
@@ -285,8 +320,8 @@ func (r *Reader) tryReadFooterV4(cacheKey string) (bool, error) {
 		return false, nil
 	}
 	r.footerVersion = shared.FooterV4Version
-	r.intrinsicIndexOffset = binary.LittleEndian.Uint64(buf[22:])
-	r.intrinsicIndexLen = binary.LittleEndian.Uint32(buf[30:])
+	r.intrinsicIndexOffset = binary.LittleEndian.Uint64(buf[footerOffIntrinsicOffset:])
+	r.intrinsicIndexLen = binary.LittleEndian.Uint32(buf[footerOffIntrinsicLen:])
 	return true, r.applyLegacyFooterCommon(buf)
 }
 
@@ -578,29 +613,73 @@ func (r *Reader) ensureV14TraceSection() error {
 		return nil
 	}
 	r.v14TraceOnce.Do(func() {
-		// Read the full trace section once; split into header and trace index bytes.
-		// Both parts are needed at different times — storing both avoids a second I/O on
-		// the first bloom hit (ensureTraceIndexRaw would otherwise re-read the section).
-		raw, err := r.readV14Section(shared.SectionTraceIndex)
+		// Two-phase loading: read bloom+block_table (small header) eagerly, and also
+		// pre-populate traceIndexRaw from the same read to avoid a second I/O in
+		// ensureTraceIndexRaw on bloom hit.
+		// Cache key for the small header: separate from "/v14/sec/03/dec" (the full section).
+		headerKey := r.fileID + "/v14/compact-header"
+
+		// Read the full section once and split both halves. We store traceIdx directly on
+		// compactParsed after parseCompactIndexBytesV14Header sets it up, so ensureTraceIndexRaw
+		// finds traceIndexRaw already populated and skips its own provider read.
+		var traceIdxBytes []byte
+		headerBytes, err := r.cache.GetOrFetch(headerKey, func() ([]byte, error) {
+			raw, readErr := r.readV14Section(shared.SectionTraceIndex)
+			if readErr != nil {
+				return nil, readErr
+			}
+			if len(raw) == 0 {
+				return nil, nil
+			}
+			header, traceIdx, splitErr := splitV14CompactSection(raw)
+			if splitErr != nil {
+				return nil, splitErr
+			}
+			// Copy traceIdx out of the GetOrFetch closure before it returns.
+			// raw is a local variable (the full decompressed section bytes) that does not
+			// survive the closure return — we cannot store a sub-slice.
+			//
+			// Pre-populating traceIdxBytes here means ensureTraceIndexRaw will find
+			// traceIndexRaw already set and skip its own provider read (bloom-hit fast path).
+			// For bloom-miss lookups this copy is wasted, but raw is already decompressed in
+			// RAM at this point, so the cost is a memcopy — far cheaper than a second I/O.
+			// This path runs at most once per Reader via v14TraceOnce.
+			traceIdxBytes = append([]byte(nil), traceIdx...)
+			return append([]byte(nil), header...), nil
+		})
 		if err != nil {
 			r.v14TraceErr = fmt.Errorf("ensureV14TraceSection: read: %w", err)
 			return
 		}
-		if len(raw) == 0 {
+		if len(headerBytes) == 0 {
 			return
 		}
-		header, traceIdx, splitErr := splitV14CompactSection(raw)
-		if splitErr != nil {
-			r.v14TraceErr = fmt.Errorf("ensureV14TraceSection: split: %w", splitErr)
-			return
-		}
-		if parseErr := r.parseCompactIndexBytesV14Header(header); parseErr != nil {
+		if parseErr := r.parseCompactIndexBytesV14Header(headerBytes); parseErr != nil {
 			r.v14TraceErr = fmt.Errorf("ensureV14TraceSection: parse: %w", parseErr)
 			return
 		}
-		// Store trace index bytes now so ensureTraceIndexRaw is a no-op (no second I/O).
-		if r.compactParsed != nil && len(traceIdx) > 0 {
-			r.compactParsed.traceIndexRaw = append([]byte(nil), traceIdx...)
+		// Pre-populate traceIndexRaw so ensureTraceIndexRaw finds it on the fast path
+		// and does not issue a second provider read for the same section bytes.
+		//
+		// On a cache HIT the GetOrFetch closure above did not run, so traceIdxBytes is nil here.
+		// We probe the decompressed section blob directly via r.cache.Get — no readV14Section call.
+		// NOTE-015 (eviction-hole guard, see NOTE-015 in NOTES.md): if the blob was LRU-evicted,
+		// cache.Get returns ok=false and we skip this block entirely, leaving traceIndexRaw nil.
+		// ensureTraceIndexRaw will perform the provider read on the first actual bloom hit,
+		// preserving phase-2 laziness.
+		if traceIdxBytes == nil && r.fileID != "" {
+			sectionKey := fmt.Sprintf("%s/v14/sec/%02x/dec", r.fileID, shared.SectionTraceIndex)
+			if cached, ok, _ := r.cache.Get(sectionKey); ok && len(cached) > 0 {
+				// Error intentionally discarded: this is opportunistic pre-population on cache hit.
+				// ensureTraceIndexRaw (called on the first bloom hit) is the authoritative error path.
+				_, traceIdxBytes, _ = splitV14CompactSection(cached)
+				if traceIdxBytes != nil {
+					traceIdxBytes = append([]byte(nil), traceIdxBytes...)
+				}
+			}
+		}
+		if traceIdxBytes != nil {
+			r.compactParsed.traceIndexRaw = traceIdxBytes
 		}
 	})
 	return r.v14TraceErr
@@ -715,15 +794,15 @@ func (r *Reader) readHeader() error {
 		return fmt.Errorf("readHeader: bad magic 0x%08X", magic)
 	}
 
-	version := buf[4] //nolint:gosec // safe: buf is headerSize (22) bytes, validated by short-read check above
+	version := buf[fileHdrV13OffVersion] //nolint:gosec // safe: buf is headerSize (22) bytes, validated by short-read check above
 	if version != shared.VersionV13 {
 		return fmt.Errorf("readHeader: unsupported version %d (V13 required)", version)
 	}
 
 	r.fileVersion = version
-	r.metadataOffset = binary.LittleEndian.Uint64(buf[5:])
-	r.metadataLen = binary.LittleEndian.Uint64(buf[13:])
-	r.signalType = buf[21]
+	r.metadataOffset = binary.LittleEndian.Uint64(buf[fileHdrV13OffMetadataOffset:])
+	r.metadataLen = binary.LittleEndian.Uint64(buf[fileHdrV13OffMetadataLen:])
+	r.signalType = buf[fileHdrV13OffSignalType]
 
 	return nil
 }
@@ -865,7 +944,7 @@ func (r *Reader) parseV5MetadataLazy() error {
 	pos += sketchConsumed
 
 	// FileBloom section — optional, present after sketch index (always the last section).
-	// NOTE-45: graceful degradation — old files without this section parse cleanly.
+	// NOTE-045: graceful degradation — old files without this section parse cleanly.
 	if pos < len(data) {
 		fb, fbConsumed, fbErr := parseFileBloomSection(data[pos:])
 		if fbErr != nil {
@@ -1117,13 +1196,23 @@ func skipTraceBlockIndex(data []byte) (int, error) {
 			// v1: block_id[2] + span_count[2] + span_indices[N×2]
 			for b := range blockRefCount {
 				if pos+4 > len(data) {
-					return pos, fmt.Errorf("trace_index: trace[%d] block[%d]: short", t, b)
+					return pos, fmt.Errorf("trace_index: trace[%d] block[%d]: short for block_id+span_count", t, b)
 				}
 				spanCount := int(binary.LittleEndian.Uint16(data[pos+2:]))
-				pos += 4 + spanCount*2
+				pos += 4
+				if pos+spanCount*2 > len(data) {
+					return pos, fmt.Errorf(
+						"trace_index: trace[%d] block[%d]: short for span_indices (%d × 2 bytes)",
+						t, b, spanCount,
+					)
+				}
+				pos += spanCount * 2
 			}
 		} else {
 			// v2: block_id[2] only
+			if pos+blockRefCount*2 > len(data) {
+				return pos, fmt.Errorf("trace_index: trace[%d]: short for block_ids (%d × 2 bytes)", t, blockRefCount)
+			}
 			pos += blockRefCount * 2
 		}
 	}

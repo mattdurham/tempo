@@ -3,6 +3,8 @@ package vm
 import (
 	"slices"
 	"strings"
+
+	"github.com/grafana/blockpack/internal/modules/blockio/shared"
 )
 
 // QuerySpec is the canonical intermediate representation for metric queries.
@@ -92,6 +94,35 @@ func (qs *QuerySpec) Normalize() {
 	qs.Filter.AttributeRanges = normalizedRanges
 }
 
+// normalizedIntrinsics maps unscoped/dot-notation intrinsic names to their canonical colon form.
+// Replaces a 19-case switch, dropping cyclomatic complexity from 26 to ~4.
+var normalizedIntrinsics = map[string]string{ //nolint:gochecknoglobals
+	fieldName:          spanName,
+	fieldDuration:      spanDuration,
+	fieldKind:          spanKind,
+	fieldStatus:        spanStatus,
+	fieldStatusMessage: spanStatusMessage,
+	fieldStart:         spanStart,
+	"start_time":       spanStart,
+	fieldEnd:           spanEnd,
+	"end_time":         spanEnd,
+	// trace-level intrinsics
+	"trace.id":    shared.TraceIDColumnName,
+	"trace.state": shared.TraceStateColumnName,
+	// resource/scope schema URL intrinsics
+	"resource.schema_url": shared.ResourceSchemaURL,
+	"scope.schema_url":    shared.ScopeSchemaURL,
+	// log intrinsics
+	"log.timestamp":          shared.LogTimestampColumnName,
+	"log.observed_timestamp": shared.LogObservedTimestampColumnName,
+	"log.body":               shared.LogBodyColumnName,
+	"log.severity_number":    shared.LogSeverityNumberColumnName,
+	"log.severity_text":      shared.LogSeverityTextColumnName,
+	"log.trace_id":           shared.LogTraceIDColumnName,
+	"log.span_id":            shared.LogSpanIDColumnName,
+	"log.flags":              shared.LogFlagsColumnName,
+}
+
 // normalizeFieldName converts attribute paths to canonical colon form.
 // This is the single source of truth for intrinsic field normalization in the vm package.
 // Called by normalizeAttributePath (traceql_compiler.go) after scope+name assembly.
@@ -106,48 +137,8 @@ func normalizeFieldName(path string) string {
 	}
 
 	// Map unscoped intrinsics to span-scoped colon form
-	switch path {
-	case fieldName:
-		return spanName
-	case fieldDuration:
-		return spanDuration
-	case fieldKind:
-		return spanKind
-	case fieldStatus:
-		return spanStatus
-	case fieldStatusMessage:
-		return spanStatusMessage
-	case fieldStart, "start_time":
-		return spanStart
-	case fieldEnd, "end_time":
-		return spanEnd
-	// trace-level intrinsics
-	case "trace.id":
-		return "trace:id"
-	case "trace.state":
-		return "trace:state"
-	// resource/scope schema URL intrinsics
-	case "resource.schema_url":
-		return "resource:schema_url"
-	case "scope.schema_url":
-		return "scope:schema_url"
-	// log intrinsics
-	case "log.timestamp":
-		return "log:timestamp"
-	case "log.observed_timestamp":
-		return "log:observed_timestamp"
-	case "log.body":
-		return "log:body"
-	case "log.severity_number":
-		return "log:severity_number"
-	case "log.severity_text":
-		return "log:severity_text"
-	case "log.trace_id":
-		return "log:trace_id"
-	case "log.span_id":
-		return "log:span_id"
-	case "log.flags":
-		return "log:flags"
+	if norm, ok := normalizedIntrinsics[path]; ok {
+		return norm
 	}
 
 	// Handle span.intrinsic (dot notation) - convert to span:intrinsic for known intrinsics
@@ -186,13 +177,13 @@ const (
 	fieldStart         = "start"
 	fieldEnd           = "end"
 
-	spanName          = "span:name"
-	spanDuration      = "span:duration"
-	spanKind          = "span:kind"
-	spanStatus        = "span:status"
-	spanStatusMessage = "span:status_message"
-	spanStart         = "span:start"
-	spanEnd           = "span:end"
+	spanName          = shared.SpanNameColumnName
+	spanDuration      = shared.SpanDurationColumnName
+	spanKind          = shared.SpanKindColumnName
+	spanStatus        = shared.SpanStatusColumnName
+	spanStatusMessage = shared.SpanStatusMsgColumnName
+	spanStart         = shared.SpanStartColumnName
+	spanEnd           = shared.SpanEndColumnName
 )
 
 // Aggregation function names (uppercase - canonical form)

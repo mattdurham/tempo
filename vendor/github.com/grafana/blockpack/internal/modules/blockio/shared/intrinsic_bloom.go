@@ -23,8 +23,8 @@ func IntrinsicBloomSize(itemCount int) int {
 	if b < IntrinsicPageBloomMinBytes {
 		return IntrinsicPageBloomMinBytes
 	}
-	if b > 4096 {
-		return 4096
+	if b > IntrinsicPageBloomMaxBytes {
+		return IntrinsicPageBloomMaxBytes
 	}
 	return b
 }
