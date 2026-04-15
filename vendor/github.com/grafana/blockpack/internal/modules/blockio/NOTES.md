@@ -1549,3 +1549,115 @@ absent from the allow-list are classified as attribute (user-defined).
 Do not replicate this logic inline in writer or reader code.
 
 Back-ref: `internal/modules/blockio/shared/column_classify.go:IsIntrinsicColumn`
+
+---
+
+## NOTE-38b: Exact-Value Range Index — Multi-Value Block Safety Constraint
+*Added: 2026-04-14*
+
+**Decision:** The exact-value path in `tryApplyExactValues` is only safe when ALL blocks
+in the column have min==max (single distinct value per block). When any block spans multiple
+distinct values (minKey != maxKey), the column must fall through to the KLL overlap path.
+
+**Rationale:** The exact-value index stores each distinct value mapped to the block IDs
+where it appears as a boundary (min or max). A point-lookup for value V finds the entry
+with key≤V, returning the block set. If a block spans [1, 5], storing it only under keys
+1 and 5 means a query for V=3 would not find the block — a false-negative pruning error
+that produces incorrect (missing) results. This applies to all range column types: integer,
+uint64, duration, float64, string, and bytes. The KLL overlap path correctly assigns blocks
+to all overlapping bucket boundaries, ensuring no false negatives.
+
+**How to apply:** In `tryApplyExactValues`, check that all blocks have min==max before
+committing to the exact-value path. If any block has min!=max, return false to fall through
+to KLL. See also NOTE-42 and NOTE-43.
+
+Back-ref: `internal/modules/blockio/writer/range_index.go:tryApplyExactValues`,
+          `internal/modules/blockio/writer/constants.go:exactCardinalityThreshold`
+
+---
+
+## NOTE-ALLOC-2: SpanMatch.Clone — kvField Slice Pool
+*Added: 2026-04-14*
+
+**Decision:** `SpanMatch.Clone` allocates the fields slice from a `sync.Pool` of `*[]kvField`
+backing arrays, rather than allocating a fresh `map[string]any` per call.
+
+**Rationale:** Prior to this change, `Clone` allocated one `map[string]any` per cloned span,
+incurring one map allocation plus one allocation per key-value pair inserted. The hot path
+(trace search with result collection) clones every matched span, making this a dominant
+allocation site. Switching to a pooled `[]kvField` slice (a struct of name+value) reduces
+allocations substantially — the map header and bucket arrays are eliminated and the backing
+array is reused across calls.
+
+**How to apply:** `kvFieldSlicePool` holds `*[]kvField`. The pool returns a pointer to the
+slice to allow Reset (set length to 0 without losing capacity). Callers acquire via
+`kvFieldSlicePool.Get()`, populate, copy into `materializedSpanFields`, then return the
+backing array to the pool. The owned copy in `materializedSpanFields` is not pooled.
+
+Back-ref: `spanmatch.go:kvFieldSlicePool`, `spanmatch.go:SpanMatch.Clone`
+
+---
+
+## NOTE-ALLOC-4: modulesSpanFieldsAdapter — sync.Pool
+*Added: 2026-04-14*
+
+**Decision:** `modulesSpanFieldsAdapter` is recycled via `sync.Pool` rather than allocated
+fresh per span. Callers obtain an adapter via `getSpanFieldsAdapter` / `getSpanFieldsAdapterWithReader`
+and release it via `putSpanFieldsAdapter` or `ReleaseSpanFieldsAdapter`.
+
+**Rationale:** The adapter is a small struct that wraps a block pointer, row index, reader
+reference, and intrinsic cache. It is created once per matched span during collection and
+discarded immediately after `SpanMatch.Clone()` is called. With pool reuse, the steady-state
+allocation rate for this struct is zero on warm paths.
+
+**Release contract:** The adapter must be released after `SpanMatch.Clone()` is called
+(when the caller owns a copy of the data) or after the span callback returns — whichever
+comes first. Using the adapter after `putSpanFieldsAdapter` is called produces
+use-after-free bugs.
+
+Back-ref: `internal/modules/blockio/span_fields.go:modulesSpanFieldsAdapterPool`,
+          `internal/modules/blockio/span_fields.go:getSpanFieldsAdapter`,
+          `internal/modules/blockio/span_fields.go:ReleaseSpanFieldsAdapter`
+
+---
+
+## NOTE-ITER-1: IterateFields Skips Auto-Parsed Body Columns (ColumnTypeRangeString)
+*Added: 2026-04-14*
+
+**Decision:** `Block.BuildIterFields` and `modulesSpanFieldsAdapter.IterateFields` skip
+columns with type `ColumnTypeRangeString`. These columns are auto-parsed body fields
+(see SPEC-11.5) — derived from `log:body` at ingest time, not original log attributes.
+
+**Rationale:** `ColumnTypeRangeString` columns (`log.{key}`) are redundant — their values
+can be re-derived from `log:body` at query time. Exposing them as explicit attributes in
+`IterateFields` would confuse downstream consumers (e.g. Loki label extraction) which
+expect the output to represent original span/log attributes only. `GetField()` still
+resolves them for direct lookups (e.g. `{log.detected_level="info"}`), so filtering only
+affects enumeration, not point access.
+
+**How to apply:** In any IterateFields-style loop over block columns, skip entries where
+`col.Type == shared.ColumnTypeRangeString`. Do not apply this filter in GetField paths.
+
+Back-ref: `internal/modules/blockio/reader/block.go:BuildIterFields`,
+          `internal/modules/blockio/span_fields.go:IterateFields`
+
+---
+
+## NOTE-VEC-001: vectorAccumulator — Accumulate-at-Build, Serialize-at-Flush
+*Added: 2026-04-14*
+
+**Decision:** The `vectorAccumulator` collects per-block embedding vectors during block
+building (`flushBlocks`) and serializes them only at `Flush()` time, following the same
+pattern as `sketchIdx` and `fileBloomSvcNames`. Vectors are NOT serialized inside `flushBlocks`.
+
+**Rationale:** PQ training (`PQ.Train`) requires all vectors from all blocks to be visible
+at training time. Accumulating them through `flushBlocks` then training and encoding at `Flush()`
+time ensures a single, file-wide codebook that covers the full distribution of vectors. If
+vectors were serialized per-block during `flushBlocks`, the codebook would not exist yet.
+The accumulate-at-flush pattern is identical to sketch index construction, which also
+requires cross-block data (KLL quantile estimation).
+
+**How to apply:** Do not move vector serialization into `flushBlocks`. If adding new file-level
+structures that require cross-block data, follow the same accumulate-at-flush pattern.
+
+Back-ref: `internal/modules/blockio/writer/vector_index.go:vectorAccumulator`

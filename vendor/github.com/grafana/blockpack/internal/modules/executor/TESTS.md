@@ -1447,6 +1447,108 @@ user attribute. Guards against path optimizations silently changing observable r
 
 ---
 
+## EXEC-TEST-BLS-001: blockLabelSet interface compliance
+
+**Scenario:** `blockLabelSet` satisfies the `logqlparser.LabelSet` interface.
+
+**Setup:** Compile-time assertion `var _ logqlparser.LabelSet = (*blockLabelSet)(nil)`.
+
+**Assertions:** Compilation succeeds.
+
+---
+
+## EXEC-TEST-BLS-002: TestBlockLabelSet_GetMissing
+
+**Scenario:** `Get` on a zero-column `blockLabelSet` returns `""`.
+
+**Setup:** Zero-column `blockLabelSet`; call `Get("missing")`.
+
+**Assertions:** Returns `""`.
+
+---
+
+## EXEC-TEST-BLS-003: TestBlockLabelSet_SetAndGet
+
+**Scenario:** `Set`/`Get` round-trip via overlay.
+
+**Setup:** Zero-column `blockLabelSet`; call `Set("level", "info")`.
+
+**Assertions:** `Get("level") == "info"`.
+
+---
+
+## EXEC-TEST-BLS-004: TestBlockLabelSet_Delete
+
+**Scenario:** `Delete` marks key as deleted; `Get` returns `""` and `Keys` excludes it.
+
+**Setup:** `Set("app", "svc")` then `Delete("app")`.
+
+**Assertions:** `Get("app") == ""`, `Keys()` does not contain `"app"`.
+
+---
+
+## EXEC-TEST-BLS-005: TestBlockLabelSet_ResetForRow
+
+**Scenario:** `resetForRow` clears overlay and deleted maps; updates rowIdx.
+
+**Setup:** `Set("x", "1")`, `Delete("y")`, then `resetForRow(5)`.
+
+**Assertions:** `rowIdx == 5`, `overlay` is empty, `deleted` is empty.
+
+---
+
+## EXEC-TEST-BLS-006: TestBlockLabelSet_Materialize
+
+**Scenario:** `Materialize` returns overlay values.
+
+**Setup:** `Set("level", "warn")`, `Set("app", "svc")`.
+
+**Assertions:** `m["level"] == "warn"`, `m["app"] == "svc"`.
+
+---
+
+## EXEC-TEST-BLS-007: TestBlockLabelSet_Keys
+
+**Scenario:** `Keys` returns overlay keys excluding deleted keys.
+
+**Setup:** `Set("a", "1")`, `Set("b", "2")`, `Delete("b")`.
+
+**Assertions:** `Keys() == ["a"]`.
+
+---
+
+## EXEC-TEST-BLS-008: TestBlockLabelSetPool_AcquireRelease
+
+**Scenario:** Pool round-trip clears overlay between uses.
+
+**Setup:** Acquire, `Set("x", "1")`, release. Acquire again.
+
+**Assertions:** Second acquire returns a `blockLabelSet` with empty overlay.
+
+---
+
+## EXEC-TEST-BLS-009: TestBuildBlockColMapsWithLogCache_ColColsAlignment
+
+**Scenario:** `acquireBlockLabelSet` stores `colNames` with correct length alignment.
+
+**Setup:** Acquire with `colNames = ["a", "b"]`, `colCols = nil`.
+
+**Assertions:** `len(bls.colNames) == 2`, `bls.colCols == nil`.
+
+---
+
+## EXEC-TEST-BLS-010: TestBlockLabelSetPool_ColColsCleared
+
+**Scenario:** Pool return nils out `colCols` before reuse.
+
+**Setup:** Acquire with non-nil `colCols`, release, re-acquire.
+
+**Assertions:** `colCols == nil` after pool re-acquisition.
+
+---
+
+## EXEC-TEST-BLS-011: TestBlockLabelSet_HasLive_OverlayOnly
+
 **Scenario:** `HasLive` returns true when the key is in the overlay.
 
 **Setup:** Zero-column `blockLabelSet`; call `Set("level", "info")`.

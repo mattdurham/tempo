@@ -336,11 +336,15 @@ func (r *Reader) layoutIntrinsicColumnV14(colName string, e shared.DirEntryName)
 	}
 
 	// For V14 files, blobs on disk are snappy-compressed; decompress to inspect content.
-	blob, err := snappy.Decode(nil, rawBlob)
-	if err != nil {
-		// Not snappy-compressed (shouldn't happen for V14) — treat as non-paged.
-		blob = rawBlob
+	// Check decoded size before decompressing to guard against decompression bombs.
+	blob := rawBlob
+	if decodedLen, lenErr := snappy.DecodedLen(rawBlob); lenErr == nil && decodedLen <= shared.MaxBlockSize {
+		if dec, decErr := snappy.Decode(nil, rawBlob); decErr == nil {
+			blob = dec
+		}
+		// On decode error: treat as non-paged (not snappy-compressed for V14).
 	}
+	// If decoded size exceeds MaxBlockSize or DecodedLen fails, treat as non-paged.
 
 	// Non-paged blob: let caller emit the simple section.
 	if len(blob) == 0 || blob[0] != shared.IntrinsicPagedVersion {
@@ -515,7 +519,7 @@ func (r *Reader) layoutBlockV14(blockIdx int, meta shared.BlockMeta) ([]FileLayo
 		return nil, fmt.Errorf("parseBlockHeader: %w", err)
 	}
 
-	metas, colMetaEndPos, err := parseColumnMetadataArray(raw, 24, int(hdr.columnCount), hdr.version)
+	metas, colMetaEndPos, err := parseColumnMetadataArray(raw, 24, int(hdr.columnCount))
 	if err != nil {
 		return nil, fmt.Errorf("parseColumnMetadataArray: %w", err)
 	}
@@ -554,8 +558,11 @@ func (r *Reader) layoutBlockV14(blockIdx int, meta shared.BlockMeta) ([]FileLayo
 		start := int(m.dataOffset) //nolint:gosec
 		end := start + int(m.compressedLen)
 		if end <= len(raw) {
-			if decoded, decErr := snappy.Decode(nil, raw[start:end]); decErr == nil && len(decoded) >= 2 {
-				encKind = encodingKindName(decoded[1])
+			// SPEC-ROOT-012: guard against decompression-bomb OOM before decoding column blob.
+			if m.uncompressedLen <= uint32(shared.MaxBlockSize) { //nolint:gosec
+				if decoded, decErr := snappy.Decode(nil, raw[start:end]); decErr == nil && len(decoded) >= 2 {
+					encKind = encodingKindName(decoded[1])
+				}
 			}
 		}
 
@@ -759,7 +766,7 @@ func (r *Reader) layoutBlock(blockIdx int, meta shared.BlockMeta) ([]FileLayoutS
 		return nil, fmt.Errorf("parseBlockHeader: %w", err)
 	}
 
-	metas, colMetaEndPos, err := parseColumnMetadataArray(raw, 24, int(hdr.columnCount), hdr.version)
+	metas, colMetaEndPos, err := parseColumnMetadataArray(raw, 24, int(hdr.columnCount))
 	if err != nil {
 		return nil, fmt.Errorf("parseColumnMetadataArray: %w", err)
 	}
@@ -790,7 +797,7 @@ func (r *Reader) layoutBlock(blockIdx int, meta shared.BlockMeta) ([]FileLayoutS
 	for _, m := range metas {
 		colType := columnTypeName(m.colType)
 
-		if m.dataLen > 0 {
+		if m.compressedLen > 0 {
 			start := int(m.dataOffset) //nolint:gosec
 			var encKind string
 			if start+1 < len(raw) {
@@ -803,7 +810,7 @@ func (r *Reader) layoutBlock(blockIdx int, meta shared.BlockMeta) ([]FileLayoutS
 				ColumnType:     colType,
 				Encoding:       encKind,
 				Offset:         base + int64(m.dataOffset), //nolint:gosec
-				CompressedSize: int64(m.dataLen),           //nolint:gosec
+				CompressedSize: int64(m.compressedLen),     //nolint:gosec
 				BlockIndex:     blockIdx,
 			})
 		}
@@ -890,7 +897,7 @@ func (r *Reader) buildFileBloomInfo() *FileBloomInfo {
 		return info
 	}
 	colCount := int(binary.LittleEndian.Uint32(raw[5:]))
-	pos := 9
+	pos := shared.CompactIndexHeaderSize
 	for range colCount {
 		if pos+2 > len(raw) {
 			break
@@ -947,70 +954,54 @@ func formatIntrinsicBound(colType shared.ColumnType, bound string) string {
 	return bound
 }
 
+// columnTypeNames maps ColumnType values to their string names for layout reporting.
+var columnTypeNames = map[shared.ColumnType]string{ //nolint:gochecknoglobals
+	shared.ColumnTypeString:        "String",
+	shared.ColumnTypeInt64:         "Int64",
+	shared.ColumnTypeUint64:        "Uint64",
+	shared.ColumnTypeFloat64:       "Float64",
+	shared.ColumnTypeBool:          "Bool",
+	shared.ColumnTypeBytes:         "Bytes",
+	shared.ColumnTypeRangeInt64:    "RangeInt64",
+	shared.ColumnTypeRangeUint64:   "RangeUint64",
+	shared.ColumnTypeRangeDuration: "RangeDuration",
+	shared.ColumnTypeRangeFloat64:  "RangeFloat64",
+	shared.ColumnTypeRangeBytes:    "RangeBytes",
+	shared.ColumnTypeRangeString:   "RangeString",
+	shared.ColumnTypeUUID:          "UUID",
+	shared.ColumnTypeVectorF32:     "VectorF32",
+}
+
 // columnTypeName maps a ColumnType to its string name for layout reporting.
 func columnTypeName(t shared.ColumnType) string {
-	switch t {
-	case shared.ColumnTypeString:
-		return "String"
-	case shared.ColumnTypeInt64:
-		return "Int64"
-	case shared.ColumnTypeUint64:
-		return "Uint64"
-	case shared.ColumnTypeFloat64:
-		return "Float64"
-	case shared.ColumnTypeBool:
-		return "Bool"
-	case shared.ColumnTypeBytes:
-		return "Bytes"
-	case shared.ColumnTypeRangeInt64:
-		return "RangeInt64"
-	case shared.ColumnTypeRangeUint64:
-		return "RangeUint64"
-	case shared.ColumnTypeRangeDuration:
-		return "RangeDuration"
-	case shared.ColumnTypeRangeFloat64:
-		return "RangeFloat64"
-	case shared.ColumnTypeRangeBytes:
-		return "RangeBytes"
-	case shared.ColumnTypeRangeString:
-		return "RangeString"
-	case shared.ColumnTypeUUID:
-		return "UUID"
-	default:
-		return fmt.Sprintf("Unknown(%d)", t)
+	if name, ok := columnTypeNames[t]; ok {
+		return name
 	}
+	return fmt.Sprintf("Unknown(%d)", t)
+}
+
+// encodingKindNames maps encoding kind bytes to their string names.
+var encodingKindNames = map[uint8]string{ //nolint:gochecknoglobals
+	shared.KindDictionary:            "Dictionary",
+	shared.KindSparseDictionary:      "SparseDictionary",
+	shared.KindInlineBytes:           "InlineBytes",
+	shared.KindSparseInlineBytes:     "SparseInlineBytes",
+	shared.KindDeltaUint64:           "DeltaUint64",
+	shared.KindRLEIndexes:            "RLEIndexes",
+	shared.KindSparseRLEIndexes:      "SparseRLEIndexes",
+	shared.KindXORBytes:              "XORBytes",
+	shared.KindSparseXORBytes:        "SparseXORBytes",
+	shared.KindPrefixBytes:           "PrefixBytes",
+	shared.KindSparsePrefixBytes:     "SparsePrefixBytes",
+	shared.KindDeltaDictionary:       "DeltaDictionary",
+	shared.KindSparseDeltaDictionary: "SparseDeltaDictionary",
+	shared.KindVectorF32:             "VectorF32",
 }
 
 // encodingKindName maps the encoding kind byte (byte 1 of each column data blob) to its name.
 func encodingKindName(kind uint8) string {
-	switch kind {
-	case 1:
-		return "Dictionary"
-	case 2:
-		return "SparseDictionary"
-	case 3:
-		return "InlineBytes"
-	case 4:
-		return "SparseInlineBytes"
-	case 5:
-		return "DeltaUint64"
-	case 6:
-		return "RLEIndexes"
-	case 7:
-		return "SparseRLEIndexes"
-	case 8:
-		return "XORBytes"
-	case 9:
-		return "SparseXORBytes"
-	case 10:
-		return "PrefixBytes"
-	case 11:
-		return "SparsePrefixBytes"
-	case 12:
-		return "DeltaDictionary"
-	case 13:
-		return "SparseDeltaDictionary"
-	default:
-		return fmt.Sprintf("Unknown(%d)", kind)
+	if name, ok := encodingKindNames[kind]; ok {
+		return name
 	}
+	return fmt.Sprintf("Unknown(%d)", kind)
 }

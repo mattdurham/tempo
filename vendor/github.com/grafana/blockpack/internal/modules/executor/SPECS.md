@@ -420,6 +420,29 @@ Back-ref: `internal/modules/executor/stream.go:filterRowSetByIntrinsicNodes`,
 
 ---
 
+## SPEC-INTRINSIC-004: File-level bloom pre-check before intrinsic scan
+*Added: 2026-04-14*
+
+Before dispatching to the intrinsic fast path (`collectFromIntrinsicRefs`), the executor
+runs a file-level bloom filter check via `fileLevelBloomReject`. If the bloom filter
+indicates that no span in the file can satisfy the predicate nodes, the file is rejected
+in O(1) without reading any blocks or intrinsic sections.
+
+**Invariant:** When `fileLevelBloomReject` returns true, the result is an empty
+`MatchedRow` slice with `ExecutionPath = ExecPathBloomRejected`. No block I/O occurs.
+
+**Invariant:** The bloom pre-check is applied only when `program.Predicates != nil`.
+A nil predicate set (match-all program) bypasses the bloom check and proceeds directly
+to `collectFromIntrinsicRefs`.
+
+**Invariant:** The bloom check is a conservative filter — a false result (not rejected)
+does not guarantee any span matches; it only certifies the file *may* contain a match.
+False positives are expected and handled by subsequent predicate evaluation.
+
+Back-ref: `internal/modules/executor/stream.go:collectWithBloomCheck`
+
+---
+
 ## 7. StreamLogs
 
 ### 7.1 Signature

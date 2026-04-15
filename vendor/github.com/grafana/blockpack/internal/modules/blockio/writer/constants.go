@@ -1,53 +1,53 @@
 package writer
 
+import "github.com/grafana/blockpack/internal/modules/blockio/shared"
+
 // NOTE: Any changes to this file must be reflected in the corresponding specs.md or NOTES.md.
 
-// Encoding kind constants per SPECS §9.
+// Encoding kind constants per SPECS §9 — canonical definitions live in shared.Kind*.
+// These aliases are preserved so writer-internal code continues to compile unchanged.
 const (
-	KindDictionary       uint8 = 1
-	KindSparseDictionary uint8 = 2
-	// KindInlineBytes and KindSparseInlineBytes are reader-only: they were emitted by
-	// earlier writer versions and must remain decodable. The current writer never selects
-	// these kinds — all bytes columns are encoded as KindXORBytes (8) or KindPrefixBytes (10).
-	KindInlineBytes           uint8 = 3
-	KindSparseInlineBytes     uint8 = 4
-	KindDeltaUint64           uint8 = 5
-	KindRLEIndexes            uint8 = 6
-	KindSparseRLEIndexes      uint8 = 7
-	KindXORBytes              uint8 = 8
-	KindSparseXORBytes        uint8 = 9
-	KindPrefixBytes           uint8 = 10
-	KindSparsePrefixBytes     uint8 = 11
-	KindDeltaDictionary       uint8 = 12
-	KindSparseDeltaDictionary uint8 = 13
-	KindVectorF32             uint8 = 14 // flat float32 array, per-row presence RLE, LE byte order
+	KindDictionary            = shared.KindDictionary
+	KindSparseDictionary      = shared.KindSparseDictionary
+	KindInlineBytes           = shared.KindInlineBytes
+	KindSparseInlineBytes     = shared.KindSparseInlineBytes
+	KindDeltaUint64           = shared.KindDeltaUint64
+	KindRLEIndexes            = shared.KindRLEIndexes
+	KindSparseRLEIndexes      = shared.KindSparseRLEIndexes
+	KindXORBytes              = shared.KindXORBytes
+	KindSparseXORBytes        = shared.KindSparseXORBytes
+	KindPrefixBytes           = shared.KindPrefixBytes
+	KindSparsePrefixBytes     = shared.KindSparsePrefixBytes
+	KindDeltaDictionary       = shared.KindDeltaDictionary
+	KindSparseDeltaDictionary = shared.KindSparseDeltaDictionary
+	KindVectorF32             = shared.KindVectorF32
 )
 
-// Trace intrinsic column name constants used throughout the writer package.
+// Trace intrinsic column name constants — aliases to canonical definitions in shared.
 const (
-	traceIDColumnName       = "trace:id"
-	spanIDColumnName        = "span:id"
-	spanParentIDColumnName  = "span:parent_id"
-	spanNameColumnName      = "span:name"
-	spanKindColumnName      = "span:kind"
-	spanStartColumnName     = "span:start"
-	spanEndColumnName       = "span:end"
-	spanDurationColumnName  = "span:duration"
-	spanStatusColumnName    = "span:status"
-	spanStatusMsgColumnName = "span:status_message"
-	svcNameColumnName       = "resource.service.name"
+	traceIDColumnName       = shared.TraceIDColumnName
+	spanIDColumnName        = shared.SpanIDColumnName
+	spanParentIDColumnName  = shared.SpanParentIDColumnName
+	spanNameColumnName      = shared.SpanNameColumnName
+	spanKindColumnName      = shared.SpanKindColumnName
+	spanStartColumnName     = shared.SpanStartColumnName
+	spanEndColumnName       = shared.SpanEndColumnName
+	spanDurationColumnName  = shared.SpanDurationColumnName
+	spanStatusColumnName    = shared.SpanStatusColumnName
+	spanStatusMsgColumnName = shared.SpanStatusMsgColumnName
+	svcNameColumnName       = shared.SvcNameColumnName
 )
 
-// Log intrinsic column names (SPECS §11 log signal extension).
+// Log intrinsic column name constants — aliases to canonical definitions in shared.
 const (
-	logTimestampColumnName         = "log:timestamp"
-	logObservedTimestampColumnName = "log:observed_timestamp"
-	logBodyColumnName              = "log:body"
-	logSeverityNumberColumnName    = "log:severity_number"
-	logSeverityTextColumnName      = "log:severity_text"
-	logTraceIDColumnName           = "log:trace_id"
-	logSpanIDColumnName            = "log:span_id"
-	logFlagsColumnName             = "log:flags"
+	logTimestampColumnName         = shared.LogTimestampColumnName
+	logObservedTimestampColumnName = shared.LogObservedTimestampColumnName
+	logBodyColumnName              = shared.LogBodyColumnName
+	logSeverityNumberColumnName    = shared.LogSeverityNumberColumnName
+	logSeverityTextColumnName      = shared.LogSeverityTextColumnName
+	logTraceIDColumnName           = shared.LogTraceIDColumnName
+	logSpanIDColumnName            = shared.LogSpanIDColumnName
+	logFlagsColumnName             = shared.LogFlagsColumnName
 )
 
 const (

@@ -1343,7 +1343,7 @@ are now ~15-line wrappers that pass their differing logic as callbacks:
 **Rationale:** Both functions shared: `CoalescedGroups` + `blockToGroup`, `ReadGroup` loop,
 `ResetInternStrings` + `ParseBlockFromBytes`, `ColumnPredicate` evaluation, NOTE-021 time
 pre-filter, column cache setup, and the per-row pipeline loop. Any fix to the shared boilerplate
-(e.g., NOTE-021, NOTE-001, NOTE-SL-016) previously had to be applied twice. The extraction
+(e.g., NOTE-021, NOTE-001, NOTE-SL-017) previously had to be applied twice. The extraction
 eliminates this duplication class.
 
 **Complexity impact:** Combined cyclomatic complexity drops from (36+30)=66 to one ~30

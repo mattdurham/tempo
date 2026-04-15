@@ -148,7 +148,7 @@ across `log.{name}` and `resource.{name}`), and numeric ops (`OpGT/GTE/LT/LTE`) 
 `StageLabelFilter` stages is considered — any other stage type acts as a barrier.
 
 **Rationale:** Log body fields parsed at ingest are stored as `log.{key}` range string
-columns (see blockio NOTE-37). The existing block-pruning machinery already supports
+columns. The existing block-pruning machinery already supports
 min/max range index lookups and bloom filter checks for these columns. By generating
 `QueryPredicates` entries from pipeline label filters, the executor gains block-level
 skip for structured-body queries (`| level="error"`, `| component="api"`) at zero
@@ -282,7 +282,7 @@ keys.
 **Problem:** `blockLabelSet.Has(k)` returns true for columns that are present in the
 block but not yet decoded (rawEncoding != nil). LogfmtStage used `Has` to skip such
 columns (interpreting them as "already stored at ingest"). But `Materialize()` also
-skips undecoded columns (NOTE-SL-016 performance optimization). So when a query runs
+skips undecoded columns (NOTE-SL-017 performance optimization). So when a query runs
 `line_format "{{.caller}}: {{.msg}}"`, neither logfmt extraction nor Materialize provides
 the values — the output is `": "`.
 

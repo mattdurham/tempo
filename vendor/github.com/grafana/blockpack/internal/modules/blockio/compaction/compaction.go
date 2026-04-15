@@ -79,6 +79,14 @@ type Config struct {
 }
 
 // OutputStorage provides write access for pushing output files.
+//
+// The interface is intentionally narrow (Put only) because compaction is an
+// append-only operation: output blocks are written exactly once and never read
+// back by the compactor itself. Keeping Delete and any read methods out of scope
+// makes test doubles trivial to implement — a single-method interface requires a
+// single-method fake. Using blockpack.WritableStorage here would pull in Delete,
+// which compaction has no reason to call and which would widen the contract
+// unnecessarily.
 type OutputStorage interface {
 	Put(path string, data []byte) error
 }
@@ -183,7 +191,7 @@ func (s *compactionState) processProvider(provider modules_rw.ReaderProvider) (r
 	}
 
 	for blockIdx := range r.BlockCount() {
-		bwb, getErr := r.GetBlockWithBytes(blockIdx, nil, nil)
+		bwb, getErr := r.GetBlockWithBytes(blockIdx, nil)
 		if getErr != nil {
 			return fmt.Errorf("get block %d: %w", blockIdx, getErr)
 		}

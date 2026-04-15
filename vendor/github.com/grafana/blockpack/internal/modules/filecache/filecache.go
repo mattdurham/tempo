@@ -28,8 +28,9 @@ import (
 )
 
 const (
-	fileMagic     = "BPC1"
-	fileHeaderLen = 8 // 4B magic + 4B keyLen
+	fileMagic      = "BPC1"
+	fileHeaderLen  = 8    // 4B magic + 4B keyLen
+	maxCacheKeyLen = 4096 // arbitrary safe upper bound; prevents corrupt header entries
 )
 
 // Config configures the file cache.
@@ -425,8 +426,8 @@ func (c *FileCache) pathFor(key string) string {
 func writeFile(path string, key string, value []byte) error {
 	// Enforce the same key-length constraint that readFileHeader validates,
 	// so entries written now won't be rejected as corrupt on the next restart.
-	if len(key) == 0 || len(key) > 4096 {
-		return fmt.Errorf("filecache: key length %d out of range [1,4096]", len(key))
+	if len(key) == 0 || len(key) > maxCacheKeyLen {
+		return fmt.Errorf("filecache: key length %d out of range [1,%d]", len(key), maxCacheKeyLen)
 	}
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -492,7 +493,7 @@ func readFileHeader(path string) (key string, valueSize int64, err error) {
 	}
 
 	keyLen := int(binary.LittleEndian.Uint32(header[4:]))
-	if keyLen == 0 || keyLen > 4096 {
+	if keyLen == 0 || keyLen > maxCacheKeyLen {
 		return "", 0, fmt.Errorf("bad key length %d", keyLen)
 	}
 
@@ -529,7 +530,7 @@ func readFileValue(path string) ([]byte, error) {
 	}
 
 	keyLen := int(binary.LittleEndian.Uint32(header[4:]))
-	if keyLen == 0 || keyLen > 4096 {
+	if keyLen == 0 || keyLen > maxCacheKeyLen {
 		return nil, fmt.Errorf("bad key length %d", keyLen)
 	}
 	if _, err = f.Seek(int64(keyLen), io.SeekCurrent); err != nil {

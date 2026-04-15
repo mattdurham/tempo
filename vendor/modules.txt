@@ -359,7 +359,6 @@ github.com/chewxy/math32
 github.com/clipperhouse/displaywidth
 # github.com/clipperhouse/stringish v0.1.1
 ## explicit; go 1.18
-github.com/clipperhouse/stringish
 # github.com/clipperhouse/uax29/v2 v2.6.0
 ## explicit; go 1.18
 github.com/clipperhouse/uax29/v2/graphemes
@@ -727,7 +726,7 @@ github.com/googleapis/gax-go/v2/iterator
 # github.com/gorilla/mux v1.8.1
 ## explicit; go 1.20
 github.com/gorilla/mux
-# github.com/grafana/blockpack v0.0.0-20260414182050-f68426cdcb49
+# github.com/grafana/blockpack v0.0.0-20260415120037-901c167b2b76
 ## explicit; go 1.26.0
 github.com/grafana/blockpack
 github.com/grafana/blockpack/internal/logqlparser

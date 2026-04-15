@@ -10,12 +10,13 @@ import (
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
 )
 
-// pickIndexWidth returns 1, 2, or 4 bytes per index based on dictionary size.
+// pickIndexWidth returns 1, 2, or 4 bytes per index entry based on dictionary size.
+// Uses uint8/uint16 boundaries so each index value fits in the chosen width.
 func pickIndexWidth(dictSize int) uint8 {
 	switch {
-	case dictSize <= 255:
+	case dictSize <= math.MaxUint8:
 		return 1
-	case dictSize <= 65535:
+	case dictSize <= math.MaxUint16:
 		return 2
 	default:
 		return 4

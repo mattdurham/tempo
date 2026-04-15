@@ -520,30 +520,31 @@ func splitAggregateThreshold(
 	return input[:closeParen+1], thresholdOp, thresholdVal, true, nil
 }
 
+// durationMultipliers maps duration unit strings to their nanosecond multiplier.
+var durationMultipliers = map[string]int64{ //nolint:gochecknoglobals
+	"ns": 1,
+	"us": 1_000,
+	"µs": 1_000,
+	"ms": 1_000_000,
+	"s":  1_000_000_000,
+	"m":  60_000_000_000,
+	"h":  3_600_000_000_000,
+}
+
 // parseThresholdValue parses a threshold value as int, duration, or float.
 func parseThresholdValue(s string) (interface{}, error) {
 	s = strings.TrimSpace(s)
 
-	// Try duration first (e.g., "5ms", "100us", "1s")
-	for _, suffix := range []struct {
-		unit  string
-		nanos int64
-	}{
-		{"ns", 1},
-		{"us", 1000},
-		{"µs", 1000},
-		{"ms", 1000000},
-		{"s", 1000000000},
-		{"m", 60 * 1000000000},
-		{"h", 3600 * 1000000000},
-	} {
-		if strings.HasSuffix(s, suffix.unit) {
-			numStr := strings.TrimSpace(s[:len(s)-len(suffix.unit)])
+	// Try duration first (e.g., "5ms", "100us", "1s").
+	// Multi-char units are tried before single-char to avoid "s" matching the tail of "ms".
+	for _, unit := range []string{"ns", "us", "µs", "ms", "m", "h", "s"} {
+		if strings.HasSuffix(s, unit) {
+			numStr := strings.TrimSpace(s[:len(s)-len(unit)])
 			n, err := strconv.ParseInt(numStr, 10, 64)
 			if err != nil {
 				return nil, err
 			}
-			return n * suffix.nanos, nil
+			return n * durationMultipliers[unit], nil
 		}
 	}
 
@@ -1084,22 +1085,7 @@ func (p *parser) parseNumberOrDuration() (Expr, error) {
 			}
 
 			// Convert to nanoseconds
-			var nanos int64
-			switch unit {
-			case "ns":
-				nanos = num
-			case "us", "µs":
-				nanos = num * 1000
-			case "ms":
-				nanos = num * 1000000
-			case "s":
-				nanos = num * 1000000000
-			case "m":
-				nanos = num * 60 * 1000000000
-			case "h":
-				nanos = num * 60 * 60 * 1000000000
-			}
-
+			nanos := num * durationMultipliers[unit]
 			return &LiteralExpr{Value: nanos, Type: LitDuration}, nil
 		}
 
@@ -1121,12 +1107,8 @@ func (p *parser) parseNumberOrDuration() (Expr, error) {
 }
 
 func isDurationUnit(unit string) bool {
-	switch unit {
-	case "ns", "us", "µs", "ms", "s", "m", "h":
-		return true
-	default:
-		return false
-	}
+	_, ok := durationMultipliers[unit]
+	return ok
 }
 
 // parseFieldPath parses a field reference like .foo, span.bar, event:name

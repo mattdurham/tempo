@@ -15,6 +15,7 @@ dev/null/
 real_world_comparison/*.parquet/
 .bob/planning/
 .bob/state
+.bob/review/
 
 # Benchmark artifacts
 benchmark/unified.txt

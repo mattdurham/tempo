@@ -19,7 +19,6 @@ import (
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
 	modules_shared "github.com/grafana/blockpack/internal/modules/blockio/shared"
 	"github.com/grafana/blockpack/internal/modules/queryplanner"
-	"github.com/grafana/blockpack/internal/vm"
 )
 
 // SpanMatch is a span that matched the query.
@@ -52,23 +51,6 @@ type Options struct {
 	// BlockCount is the number of internal blocks to include starting from StartBlock.
 	// 0 means no sub-file sharding (scan all blocks selected by the planner).
 	BlockCount int
-}
-
-// Executor wraps the stateless Collect function behind a struct API.
-// It holds no mutable state; New() is a convenience constructor for tests
-// that prefer method-call syntax over the package-level Collect function.
-type Executor struct{}
-
-// New returns a zero-value Executor.
-func New() *Executor { return &Executor{} }
-
-// Collect delegates to the package-level Collect function.
-func (e *Executor) Collect(
-	r *modules_reader.Reader,
-	prog *vm.Program,
-	opts CollectOptions,
-) ([]MatchedRow, QueryStats, error) {
-	return Collect(r, prog, opts)
 }
 
 // SpanMatchFromRow extracts a SpanMatch from a MatchedRow by reading the appropriate

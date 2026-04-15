@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"math"
 	"sync"
+	"sync/atomic"
 
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
 )
@@ -37,12 +38,17 @@ type Column struct {
 	// Presence bitset — MAY be arena-allocated.
 	Present []byte
 
-	// NOTE-001: Lazy decode fields — rawEncoding is a sub-slice of the block's RawBytes.
-	// Non-nil means this column has not been fully decoded yet (presence-only path).
-	// rawEncoding is valid for the lifetime of the owning BlockWithBytes (bwb = BlockWithBytes:
-	// the struct that pairs a decoded Block with its raw byte slice kept alive for lazy access).
-	// All lazy decodes complete within the same block's row loop before bwb goes out of scope.
+	// NOTE-001: Lazy decode fields — rawEncoding holds decompressed column bytes.
+	// For eagerly-decoded columns: rawEncoding is nil (already decoded into Dict/Idx slices).
+	// For V14 lazily-registered columns: compressedEncoding holds the pending bytes until
+	// ensureDecompressed() runs on first access, populating rawEncoding; then decodeNow()
+	// consumes rawEncoding and clears it. rawEncoding is valid only inside decodeOnce.Do.
 	rawEncoding []byte
+
+	// compressedEncoding holds the snappy-compressed column blob for V14 lazy columns.
+	// It is a zero-copy sub-slice of the block's rawBytes and is nil after decompression.
+	// SPEC-V14-002: decompression is deferred to first column access (ensureDecompressed).
+	compressedEncoding []byte
 
 	// sparseDictIdx holds the raw sparse dict indexes before the dense Idx slice is built.
 	// Non-nil means expandDenseIdx() has not been called yet (lazy dense expansion).
@@ -53,19 +59,31 @@ type Column struct {
 	sparseDictIdx []uint32
 
 	// Total span count this column covers (including nulls).
-	SpanCount    int
-	decodeOnce   sync.Once // ensures decodeNow runs at most once, safe for concurrent callers
-	presenceOnce sync.Once // ensures lazy presence decode in IsPresent runs at most once
-	denseOnce    sync.Once // ensures expandDenseIdx runs at most once
-	Type         shared.ColumnType
+	SpanCount      int
+	decodeOnce     sync.Once   // ensures decodeNow runs at most once, safe for concurrent callers
+	denseOnce      sync.Once   // ensures expandDenseIdx runs at most once
+	decompressOnce sync.Once   // ensures ensureDecompressed runs at most once
+	decoded        atomic.Bool // true after decodeNow completes; the ONLY cross-goroutine signal
+	// NOTE-CONC-001: rawEncoding and compressedEncoding must ONLY be read/written inside their
+	// respective Once closures (decodeOnce and decompressOnce). The outer fast-path check uses
+	// decoded.Load() — an atomic read — to avoid races between concurrent accessors.
+	// IsPresent calls decodeNow (via decodeOnce) rather than a separate presenceOnce to
+	// eliminate the rawEncoding race that existed when presenceOnce and decodeOnce were independent.
+	uncompressedLen uint32 // V14 lazy only: expected decompressed size for SPEC-ROOT-012 bomb guard
+	Type            shared.ColumnType
 }
 
 // IsDecoded reports whether this column's values have been fully decoded.
-// NOTE-001: returns false when rawEncoding is non-nil (column is lazily registered and not yet decoded).
+// NOTE-001: returns false when decodeNow has not yet completed (column is lazily registered).
 // Callers use this to skip columns not in wantColumns — touching any value accessor on an
-// un-decoded column triggers decodeNow (zstd decompression), which must be avoided for
-// columns that were registered lazily but never requested.
-func (c *Column) IsDecoded() bool { return c.rawEncoding == nil }
+// un-decoded column triggers decodeNow (snappy + zstd decompression), which must be avoided
+// for columns registered lazily but never requested.
+// NOTE-CONC-001: uses the decoded atomic.Bool to avoid racing with decodeNow's Once write.
+func (c *Column) IsDecoded() bool { return c.decoded.Load() }
+
+// needsDecode reports whether decodeNow still needs to run.
+// NOTE-CONC-001: reads decoded atomically — the only safe cross-goroutine check.
+func (c *Column) needsDecode() bool { return !c.decoded.Load() }
 
 // EnsureDecoded triggers full decode if this column was lazily registered.
 // Per-row value accessors (StringValue, Int64Value, etc.) call decodeNow automatically,
@@ -73,7 +91,7 @@ func (c *Column) IsDecoded() bool { return c.rawEncoding == nil }
 // (StringDict, StringIdx, etc.), bypassing the per-row path.
 // NOTE-026: required by scanStringDictFloat before iterating StringDict.
 func (c *Column) EnsureDecoded() {
-	if c.rawEncoding != nil {
+	if c.needsDecode() {
 		c.decodeNow()
 	}
 	c.expandDenseIdx()
@@ -94,37 +112,28 @@ func (c *Column) expandDenseIdx() {
 }
 
 // IsPresent reports whether span at idx has a value.
-// NOTE-002: lazy presence decode — if rawEncoding is set and Present is nil, the
-// presence bitmap has not been decoded yet. Decode it now from rawEncoding.
-// rawEncoding remains non-nil after this call so decodeNow can still do the full decode.
-// If rawEncoding is nil and Present is nil, the column has no presence bitmap (all present).
+// NOTE-CONC-001: always goes through needsDecode() (atomic load) before reading c.Present.
+// This ensures the happens-before chain from decodeOnce.Do is established before we read
+// c.Present. Reading c.Present without this guard races with a concurrent decodeNow write.
+// After decodeNow returns, c.Present is nil for all-present columns (no bitmap = every span
+// present) or a non-nil bitset for partial-presence columns.
 func (c *Column) IsPresent(idx int) bool {
-	if c.Present == nil {
-		if c.rawEncoding != nil {
-			c.presenceOnce.Do(func() {
-				present, err := decodePresenceOnly(c.rawEncoding, c.SpanCount, c.Type)
-				if err != nil {
-					c.Present = []byte{}
-					c.rawEncoding = nil
-					c.internMap = nil
-					return
-				}
-				c.Present = present
-			})
-		} else {
-			return true // no presence bitmap = all spans present
-		}
+	if c.needsDecode() {
+		c.decodeNow()
 	}
-
-	return shared.IsPresent(c.Present, idx)
+	p := c.Present
+	if p == nil {
+		return true // no presence bitmap = all spans present
+	}
+	return shared.IsPresent(p, idx)
 }
 
 // StringValue returns the string value at idx and whether it is present.
 // For ColumnTypeUUID columns, the 16-byte binary value is formatted as a UUID string
 // (e.g. "213085fc-b15b-45fc-8fa0-d448d4a246be"), preserving the original string representation.
-// NOTE-001: triggers lazy decode on first call if rawEncoding is set.
+// NOTE-001: triggers lazy decode on first call if column is not yet decoded.
 func (c *Column) StringValue(idx int) (string, bool) {
-	if c.rawEncoding != nil {
+	if c.needsDecode() {
 		c.decodeNow()
 	}
 	c.expandDenseIdx()
@@ -195,9 +204,9 @@ func (c *Column) StringValues() []string {
 }
 
 // Int64Value returns the int64 value at idx and whether it is present.
-// NOTE-001: triggers lazy decode on first call if rawEncoding is set.
+// NOTE-001: triggers lazy decode on first call if column is not yet decoded.
 func (c *Column) Int64Value(idx int) (int64, bool) {
-	if c.rawEncoding != nil {
+	if c.needsDecode() {
 		c.decodeNow()
 	}
 	c.expandDenseIdx()
@@ -216,9 +225,9 @@ func (c *Column) Int64Value(idx int) (int64, bool) {
 }
 
 // Uint64Value returns the uint64 value at idx and whether it is present.
-// NOTE-001: triggers lazy decode on first call if rawEncoding is set.
+// NOTE-001: triggers lazy decode on first call if column is not yet decoded.
 func (c *Column) Uint64Value(idx int) (uint64, bool) {
-	if c.rawEncoding != nil {
+	if c.needsDecode() {
 		c.decodeNow()
 	}
 	c.expandDenseIdx()
@@ -237,9 +246,9 @@ func (c *Column) Uint64Value(idx int) (uint64, bool) {
 }
 
 // Float64Value returns the float64 value at idx and whether it is present.
-// NOTE-001: triggers lazy decode on first call if rawEncoding is set.
+// NOTE-001: triggers lazy decode on first call if column is not yet decoded.
 func (c *Column) Float64Value(idx int) (float64, bool) {
-	if c.rawEncoding != nil {
+	if c.needsDecode() {
 		c.decodeNow()
 	}
 	c.expandDenseIdx()
@@ -258,9 +267,9 @@ func (c *Column) Float64Value(idx int) (float64, bool) {
 }
 
 // BoolValue returns the bool value at idx and whether it is present.
-// NOTE-001: triggers lazy decode on first call if rawEncoding is set.
+// NOTE-001: triggers lazy decode on first call if column is not yet decoded.
 func (c *Column) BoolValue(idx int) (bool, bool) {
-	if c.rawEncoding != nil {
+	if c.needsDecode() {
 		c.decodeNow()
 	}
 	c.expandDenseIdx()
@@ -279,9 +288,9 @@ func (c *Column) BoolValue(idx int) (bool, bool) {
 }
 
 // BytesValue returns the bytes value at idx and whether it is present.
-// NOTE-001: triggers lazy decode on first call if rawEncoding is set.
+// NOTE-001: triggers lazy decode on first call if column is not yet decoded.
 func (c *Column) BytesValue(idx int) ([]byte, bool) {
-	if c.rawEncoding != nil {
+	if c.needsDecode() {
 		c.decodeNow()
 	}
 	c.expandDenseIdx()
@@ -311,7 +320,7 @@ func (c *Column) BytesValue(idx int) ([]byte, bool) {
 // Returns (nil, false) when the row is not present or the column is not ColumnTypeVectorF32.
 // The raw bytes stored by decodeVectorF32 are dim*4 bytes in LE byte order.
 func (c *Column) VectorF32Value(idx int) ([]float32, bool) {
-	if c.rawEncoding != nil {
+	if c.needsDecode() {
 		c.decodeNow()
 	}
 	if c.Type != shared.ColumnTypeVectorF32 {
@@ -364,9 +373,9 @@ type Block struct {
 	spanCount  int
 }
 
-// NewBlockForParsing creates a Block with an empty columns map, for use with AddColumnsToBlock.
+// newBlockForParsing creates a Block with an empty columns map, for use with AddColumnsToBlock.
 // Call buildNameIndex after all columns have been added.
-func NewBlockForParsing(meta shared.BlockMeta) *Block {
+func newBlockForParsing(meta shared.BlockMeta) *Block {
 	return &Block{
 		columns:   make(map[shared.ColumnKey]*Column),
 		meta:      meta,

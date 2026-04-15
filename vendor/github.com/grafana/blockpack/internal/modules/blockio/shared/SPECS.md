@@ -223,8 +223,8 @@ sections. The following constants define the V14 format.
 VersionBlockV14   uint8  = 14  // block header version byte for V14 blocks
 VersionBlockEncV3 uint8  = 3   // enc_version inside each column blob: no internal zstd sub-segments
 
-FooterV5Version uint16 = 5    // V5 footer version field value
-FooterV5Size    uint   = 18   // magic[4]+version[2]+dir_offset[8]+dir_len[4]
+FooterV7Version uint16 = 7    // footer version field value written by V14 writer
+FooterV7Size    uint   = 18   // magic[4]+version[2]+dir_offset[8]+dir_len[4]
 
 // Section type constants for V14 type-keyed directory entries (6 fixed file-level sections).
 // Values 0x07+ are reserved for future type-keyed sections.
@@ -242,8 +242,8 @@ DirEntryKindName uint8 = 0x01  // name-keyed entry (one file-level intrinsic col
 
 **Invariants:**
 - All 6 section type constants are distinct and nonzero.
-- `FooterV5Size == 18` is fixed; any change requires a new footer version.
-- V14 files have no V3/V4/V12 footer or file header. The last 18 bytes are always the V5 footer.
+- `FooterV7Size == 18` is fixed; any change requires a new footer version.
+- V14 files have no V3/V4/V12 footer or file header. The last 18 bytes are always the V7 footer (FooterV7Version == 7).
 - File-level intrinsic column blobs use name-keyed entries (`DirEntryKindName`), not a single type-keyed section.
 
 Back-ref: `internal/modules/blockio/shared/constants.go`
@@ -296,7 +296,7 @@ type DirEntryName struct {
 | `compressed_len` | uint32 LE | 4 | Byte length of compressed column blob |
 
 **Invariants:**
-- The directory itself is snappy-compressed; `dir_offset`+`dir_len` in the V5 footer point to the compressed blob.
+- The directory itself is snappy-compressed; `dir_offset`+`dir_len` in the V7 footer point to the compressed blob.
 - Readers MUST build `map[uint8]DirEntryType` and `map[string]DirEntryName` for O(1) lookup.
 - An absent section has no entry in the directory (not a zero-length entry).
 - There is no `SectionIntrinsic` type-keyed entry; each intrinsic column gets its own name-keyed entry.
@@ -305,7 +305,7 @@ Back-ref: `internal/modules/blockio/shared/types.go:DirEntryType`, `types.go:Dir
 
 ---
 
-## SPEC-V14-003: V14 Footer (FooterV5) Wire Layout
+## SPEC-V14-003: V14 Footer (FooterV7) Wire Layout
 *Added: 2026-04-10*
 
 The V14 footer occupies the last 18 bytes of every V14 file.
@@ -313,19 +313,19 @@ The V14 footer occupies the last 18 bytes of every V14 file.
 | Field | Type | Bytes | Description |
 |---|---|---|---|
 | `magic` | uint32 LE | 4 | Must equal `MagicNumber` (0xC011FEA1) |
-| `version` | uint16 LE | 2 | Must equal `FooterV5Version` (5) |
+| `version` | uint16 LE | 2 | Must equal `FooterV7Version` (7) |
 | `dir_offset` | uint64 LE | 8 | Absolute byte offset of the snappy-compressed section directory |
 | `dir_len` | uint32 LE | 4 | Byte length of the snappy-compressed section directory |
 
 **Read sequence for V14 files:**
-1. Read last 18 bytes → verify magic and version == 5.
+1. Read last 18 bytes → verify magic and version == 7.
 2. Read `dir_len` bytes at `dir_offset` → snappy-decompress → parse `entry_count[4]` + N entries.
 3. For each entry: read `entry_kind[1]`; if 0x00 → unmarshal `DirEntryType`; if 0x01 → unmarshal `DirEntryName`.
 4. Build `map[uint8]DirEntryType` and `map[string]DirEntryName` for O(1) lookup.
 5. Eager: read and parse `SectionBlockIndex`.
 6. Lazy: read and parse all other sections on demand.
 
-Back-ref: `internal/modules/blockio/writer/metadata.go:writeFooterV5`,
+Back-ref: `internal/modules/blockio/writer/metadata.go:writeFooterV7`,
 `internal/modules/blockio/reader/parser.go:readFooter`
 
 ---

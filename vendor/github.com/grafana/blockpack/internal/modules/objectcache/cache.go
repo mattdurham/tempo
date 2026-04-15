@@ -126,6 +126,19 @@ func (c *Cache[V]) Put(key string, v *V) error {
 	return nil
 }
 
+// Delete removes the entry for key if present. No-op if the key is absent.
+func (c *Cache[V]) Delete(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.items[key]
+	if !ok {
+		return
+	}
+	c.unlink(e)
+	delete(c.items, key)
+	c.curBytes -= e.sizeBytes
+}
+
 // Clear removes all entries from the cache.
 func (c *Cache[V]) Clear() {
 	c.mu.Lock()

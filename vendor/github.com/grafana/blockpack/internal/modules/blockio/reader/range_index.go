@@ -311,7 +311,7 @@ func compareRangeKey(colType shared.ColumnType, a, b string) int {
 		return 0
 
 	case shared.ColumnTypeRangeFloat64:
-		// NOTE-BUG-07: Use cmp.Compare instead of manual < / > to handle NaN.
+		// NOTE-004: Use cmp.Compare instead of manual < / > to handle NaN.
 		// IEEE 754: NaN < x, NaN > x, and NaN == x are all false, so the
 		// manual branches all failed for NaN inputs, returning 0 (equal) and
 		// corrupting binary search. cmp.Compare provides a stable total order:

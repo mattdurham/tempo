@@ -211,14 +211,13 @@ var priorityFields = []string{
 }
 
 // priorityIndex maps field name → position in priorityFields for O(1) lookup.
-var priorityIndex map[string]int //nolint:gochecknoglobals
-
-func init() { //nolint:gochecknoinits
-	priorityIndex = make(map[string]int, len(priorityFields))
+var priorityIndex = func() map[string]int { //nolint:gochecknoglobals
+	m := make(map[string]int, len(priorityFields))
 	for i, f := range priorityFields {
-		priorityIndex[f] = i
+		m[f] = i
 	}
-}
+	return m
+}()
 
 // AssembleAllFields builds embedding text from ALL fields on a span, ordered by priority.
 // Fields in skipFields are excluded. Priority fields come first (in the order defined by

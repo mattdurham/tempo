@@ -2,7 +2,7 @@
 
 package compaction
 
-// NOTE-37: CompactLogFile globally re-sorts a log blockpack file by
+// compaction/NOTES.md NOTE-37: CompactLogFile globally re-sorts a log blockpack file by
 // (minHash[0..3], timestamp) to produce tight label-value boundaries per block.
 // This enables the range index to prune effectively for label-based queries.
 
@@ -58,7 +58,7 @@ func CompactLogFile(input modules_rw.ReaderProvider, output io.Writer, cfg Confi
 	// Phase 1: Read all blocks, reconstruct OTLP protos, compute sort keys.
 	var rows []pendingLogRow
 	for blockIdx := range totalBlocks {
-		bwb, getErr := r.GetBlockWithBytes(blockIdx, nil, nil)
+		bwb, getErr := r.GetBlockWithBytes(blockIdx, nil)
 		if getErr != nil {
 			return fmt.Errorf("compact log: get block %d: %w", blockIdx, getErr)
 		}

@@ -151,6 +151,7 @@ func topKScanBlocks(
 	r *modules_reader.Reader,
 	program *vm.Program,
 	wantColumns map[string]struct{},
+	secondPassCols map[string]struct{},
 	opts CollectOptions,
 	plan *queryplanner.Plan,
 	buf *topKHeap,
@@ -225,10 +226,10 @@ func topKScanBlocks(
 			continue
 		}
 
-		// Second pass: decode all columns; the block is stored in the heap and
+		// Second pass: decode secondPassCols; the block is stored in the heap and
 		// accessed by the caller when delivering results.
 		if wantColumns != nil {
-			bwb, parseErr = r.ParseBlockFromBytes(bwb.RawBytes, nil, meta)
+			bwb, parseErr = r.ParseBlockFromBytes(bwb.RawBytes, secondPassCols, meta)
 			if parseErr != nil {
 				return fetchedGroups, fetchCount, bytesRead, fmt.Errorf(
 					"ParseBlockFromBytes (full) block %d: %w",

@@ -31,8 +31,8 @@ type HTTPConfig struct {
 	// Timeout is the HTTP request timeout. Defaults to 120s if zero.
 	Timeout time.Duration
 	// MaxBatchSize is the maximum number of texts to send in a single POST /embed request.
-	// 0 means no chunking (use the server's limit — may return 422 for large batches).
-	// Defaults to 32 when set to 0 via NewHTTP, matching TEI's typical default limit.
+	// 0 (or negative) defaults to 32 via NewHTTP, matching TEI's typical per-request limit.
+	// Increase this value for servers with higher token budgets; decrease it for smaller limits.
 	MaxBatchSize int
 	// MaxConcurrentBatches is the maximum number of batch requests to issue concurrently.
 	// When > 1, EmbedBatch sends multiple chunks in parallel, distributing load across
@@ -41,8 +41,9 @@ type HTTPConfig struct {
 }
 
 const (
-	defaultMaxBatchSize         = 32 // TEI default max_batch_tokens / typical per-request limit
-	defaultMaxConcurrentBatches = 4  // concurrently hit up to 4 embed-server pods
+	defaultMaxBatchSize         = 32   // TEI default max_batch_tokens / typical per-request limit
+	defaultMaxConcurrentBatches = 4    // concurrently hit up to 4 embed-server pods
+	maxErrorBodyBytes           = 1024 // enough for a descriptive HTTP error message
 )
 
 // httpBackend implements Backend by forwarding requests to an embedding server over HTTP.
@@ -96,7 +97,10 @@ func NewHTTP(cfg HTTPConfig) (*Embedder, error) {
 	}
 
 	// Probe with a single short text to determine dimension.
-	vecs, err := b.sendBatch([]string{"probe"})
+	// Use doPost directly (single attempt) so the probe does not block startup
+	// for the full sendBatch retry cycle (up to 17s with exponential backoff: 2s, 5s, 10s).
+	probeBody, _ := json.Marshal(teiRequest{Inputs: []string{"probe"}, Normalize: true})
+	vecs, err := b.doPost(b.serverURL+"/embed", probeBody)
 	if err != nil {
 		return nil, fmt.Errorf("embedder http: probe server %q: %w", cfg.ServerURL, err)
 	}
@@ -144,7 +148,7 @@ func (b *httpBackend) EmbedBatch(texts []string) ([][]float32, error) {
 		start int
 		end   int
 	}
-	var chunks []chunk
+	chunks := make([]chunk, 0, len(texts)/chunkSize+1)
 	for start := 0; start < len(texts); start += chunkSize {
 		end := start + chunkSize
 		if end > len(texts) {
@@ -165,8 +169,16 @@ func (b *httpBackend) EmbedBatch(texts []string) ([][]float32, error) {
 		sem <- struct{}{}
 		wg.Add(1)
 		go func() {
+			// Defer order (LIFO): recovery fires first (registered last), semaphore releases
+			// second, wg.Done fires last. This ensures panics are captured before semaphore
+			// and wg counters are decremented.
 			defer wg.Done()
 			defer func() { <-sem }()
+			defer func() {
+				if r := recover(); r != nil {
+					errs[i] = fmt.Errorf("chunk %d: panic: %v", i, r)
+				}
+			}()
 
 			vecs, err := b.sendBatch(texts[c.start:c.end])
 			if err != nil {
@@ -182,6 +194,9 @@ func (b *httpBackend) EmbedBatch(texts []string) ([][]float32, error) {
 	for i, err := range errs {
 		if err != nil {
 			return nil, fmt.Errorf("embedder http: embed batch: %w", err)
+		}
+		if results[i] == nil {
+			return nil, fmt.Errorf("embedder http: chunk %d returned nil result", i)
 		}
 		vecs := *results[i]
 		c := chunks[i]
@@ -226,9 +241,9 @@ func (b *httpBackend) sendBatch(texts []string) ([][]float32, error) {
 
 	var lastErr error
 	for attempt := range sendBatchMaxRetries {
-		if attempt > 0 {
-			// Backoff: 2s, 5s, 10s, 17s — gives crashing pods time to restart and
-			// become Ready before kube-proxy routes new connections to them.
+		if attempt > 0 && attempt < sendBatchMaxRetries-1 {
+			// Backoff: 2s, 5s, 10s — skip sleep on the last attempt to avoid delaying error return.
+			// Gives crashing pods time to restart and become Ready before kube-proxy routes new connections to them.
 			time.Sleep(time.Duration(attempt*attempt+1) * time.Second)
 		}
 
@@ -240,7 +255,7 @@ func (b *httpBackend) sendBatch(texts []string) ([][]float32, error) {
 
 		// Retry on network errors and 5xx; stop immediately on 4xx.
 		var httpErr *httpStatusError
-		if errors.As(err, &httpErr) && httpErr.status < 500 {
+		if errors.As(err, &httpErr) && httpErr.status < http.StatusInternalServerError {
 			break
 		}
 	}
@@ -266,16 +281,22 @@ func (b *httpBackend) doPost(url string, reqBody []byte) ([][]float32, error) {
 	defer func() { _ = httpResp.Body.Close() }()
 
 	if httpResp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(httpResp.Body, 1024)) //nolint:gomnd
+		body, _ := io.ReadAll(io.LimitReader(httpResp.Body, maxErrorBodyBytes))
 		return nil, &httpStatusError{status: httpResp.StatusCode, body: string(body)}
 	}
 
 	// TEI returns a flat JSON array of arrays: [[float, ...], ...]
 	const maxResponseBytes = 64 << 20 // 64 MB
-	limited := io.LimitReader(httpResp.Body, maxResponseBytes)
+	// N is maxResponseBytes+1 so that lr.N reaches 0 only when the response strictly
+	// exceeds the limit. An exactly-maxResponseBytes response leaves lr.N == 1 (not flagged).
+	lr := &io.LimitedReader{R: httpResp.Body, N: maxResponseBytes + 1}
 	var vecs [][]float32
-	if err := json.NewDecoder(limited).Decode(&vecs); err != nil {
-		return nil, fmt.Errorf("decode response: %w", err)
+	decErr := json.NewDecoder(lr).Decode(&vecs)
+	if lr.N == 0 {
+		return nil, fmt.Errorf("response body exceeded maximum size (%d bytes)", maxResponseBytes)
+	}
+	if decErr != nil {
+		return nil, fmt.Errorf("decode response: %w", decErr)
 	}
 
 	return vecs, nil

@@ -46,7 +46,7 @@ type Writer struct {
 
 	// intrinsicAccum accumulates file-level columnar data for intrinsic columns.
 	// Fed row-by-row during block building via blockBuilder.intrinsicAccum.
-	// Consumed at Flush() by writeV14Sections to produce the V5 footer intrinsic columns.
+	// Consumed at Flush() by writeV14Sections to produce the V7 footer intrinsic columns.
 	intrinsicAccum *intrinsicAccumulator
 
 	// fileBloomSvcNames accumulates unique service names for file-level bloom construction.
@@ -489,7 +489,7 @@ func (w *Writer) writeEmptyFile() (int64, error) {
 	return w.out.total, nil
 }
 
-// writeV14Sections writes all V14 metadata sections, section directory, and Footer V5.
+// writeV14Sections writes all V14 metadata sections, section directory, and Footer V7.
 //
 // Type-keyed sections (each snappy-compressed independently):
 //   - SectionBlockIndex  (0x01): block index
@@ -502,7 +502,7 @@ func (w *Writer) writeEmptyFile() (int64, error) {
 // Name-keyed entries (DirEntryName, one per file-level intrinsic column blob) are written
 // after the type-keyed sections. Each intrinsic column blob is snappy-compressed independently.
 //
-// After all sections: writes snappy-compressed section directory + Footer V5.
+// After all sections: writes snappy-compressed section directory + Footer V7.
 func (w *Writer) writeV14Sections() error {
 	var typeEntries []shared.DirEntryType
 	var nameEntries []shared.DirEntryName

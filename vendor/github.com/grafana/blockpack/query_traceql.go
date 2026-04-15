@@ -45,7 +45,8 @@ func streamFilterQuery(
 // streamFilterProgram executes a compiled filter program against a modules-format reader.
 func streamFilterProgram(r *Reader, program *vm.Program, opts QueryOptions, fn spanMatchFn) (QueryStats, error) {
 	// SPEC-STREAM-8: MostRecent maps to Backward direction with span:start timestamp sorting.
-	// span:start is always present in searchMetaColumns so no extra I/O is needed.
+	// span:start is in searchMetaColumns for V14 files (see NOTE-013); additional I/O may be
+	// needed for older formats.
 	// When MostRecent+Limit, Collect gives globally top-K results by span:start.
 	collectOpts := modules_executor.CollectOptions{
 		TimeRange:     normalizeTimeRange(opts.StartNano, opts.EndNano),

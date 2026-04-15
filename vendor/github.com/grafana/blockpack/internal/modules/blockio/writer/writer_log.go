@@ -359,8 +359,7 @@ func (b *logBlockBuilder) addLogRecordFromProto(plr *pendingLogRecord, rowIdx in
 		if bodyAttr.Str != "" {
 			b.updateLogMinMax(logBodyColumnName, shared.ColumnTypeString, bodyAttr.Str)
 		}
-		// SPEC-11.5: auto-parse body into log.{key} sparse range columns.
-		// NOTE-37: silent failure — nil parseLogBody result leaves body as-is.
+		// SPEC-11.5: auto-parse body into log.{key} sparse range columns — silent failure leaves body as-is.
 		if fields := parseLogBody(bodyAttr.Str); fields != nil {
 			for k, v := range fields {
 				colName := b.internLogColName(k, b.logColNames, "log.")
@@ -466,7 +465,7 @@ func (b *logBlockBuilder) addLogRecordFromProto(plr *pendingLogRecord, rowIdx in
 // sortPendingLogs sorts the pending log record buffer by
 // (minHashSig ASC, timestamp ASC).
 //
-// NOTE-37: svcName was removed as primary key to enable label-value locality.
+// compaction/NOTES.md NOTE-37: svcName was removed as primary key to enable label-value locality.
 // MinHash over key=value pairs clusters similar streams together, producing
 // blocks with tight per-column value ranges for effective range index pruning.
 // This only affects log files — the trace sort in sortPending is unchanged.

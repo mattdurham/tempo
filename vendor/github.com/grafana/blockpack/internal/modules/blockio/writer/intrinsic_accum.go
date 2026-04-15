@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"cmp"
 	"encoding/binary"
+	"math"
 	"slices"
 
 	"github.com/golang/snappy"
@@ -270,11 +271,11 @@ func refWidths(refs []shared.BlockRef) (blockW, rowW uint8) {
 		}
 	}
 	blockW = 1
-	if maxBlock > 255 {
+	if maxBlock > math.MaxUint8 {
 		blockW = 2
 	}
 	rowW = 1
-	if maxRow > 255 {
+	if maxRow > math.MaxUint8 {
 		rowW = 2
 	}
 	return
@@ -295,11 +296,11 @@ func dictRefWidths(entries []dictEntry) (blockW, rowW uint8) {
 		}
 	}
 	blockW = 1
-	if maxBlock > 255 {
+	if maxBlock > math.MaxUint8 {
 		blockW = 2
 	}
 	rowW = 1
-	if maxRow > 255 {
+	if maxRow > math.MaxUint8 {
 		rowW = 2
 	}
 	return

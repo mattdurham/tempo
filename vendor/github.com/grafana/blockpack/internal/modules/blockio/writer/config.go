@@ -2,20 +2,15 @@ package writer
 
 // NOTE: Any changes to this file must be reflected in the corresponding specs.md or NOTES.md.
 
-import "io"
+import (
+	"io"
 
-// TextEmbedder converts text to float32 embedding vectors.
-// Defined here to avoid an import cycle between writer and vm packages.
-// The public *blockpack.Embedder (HTTP and yzma backends) satisfies this interface.
-// Note: vm.TextEmbedder is a subset interface (Embed only); it does NOT satisfy
-// writer.TextEmbedder unless it also implements EmbedBatch.
-type TextEmbedder interface {
-	Embed(text string) ([]float32, error)
-	// EmbedBatch encodes a batch of texts in a single call. Must return exactly
-	// len(texts) vectors in the same order. Implementations may send a single
-	// HTTP request for all texts (HTTP backend) or process locally (yzma backend).
-	EmbedBatch(texts []string) ([][]float32, error)
-}
+	"github.com/grafana/blockpack/internal/modules/blockio/shared"
+)
+
+// TextEmbedder is the canonical embedding interface, defined in the shared package.
+// Aliased here for backwards compatibility within this package.
+type TextEmbedder = shared.TextEmbedder
 
 // EmbeddingFieldConfig describes one span field to include in auto-embedding text.
 type EmbeddingFieldConfig struct {

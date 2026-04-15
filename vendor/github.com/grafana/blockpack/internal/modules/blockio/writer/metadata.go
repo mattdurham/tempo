@@ -235,7 +235,7 @@ func writeRangeValueKey(buf *bytes.Buffer, colType shared.ColumnType, key string
 	}
 }
 
-// NOTE-37: trace index v2 — block IDs only, no span indices; reader scans in-block.
+// writer/NOTES.md NOTE-37: trace index v2 — block IDs only, no span indices; reader scans in-block.
 // writeTraceBlockIndexSection serializes the trace block index (format version 2).
 // Format: fmt_version[1]=0x02 + trace_count[4 LE] +
 // per trace: trace_id[16] + block_ref_count[2 LE] + block_id[2 LE] × N.
@@ -358,6 +358,14 @@ func writeCompactTraceIndex(
 	return int64(n), err
 }
 
+// V7 footer field offsets (M-25).
+// Wire format: magic[4] · version[2] · dir_offset[8] · dir_len[4] = 18 bytes.
+const (
+	footerV7OffVersion = 4  // uint16 version field within 18-byte V7 footer
+	footerV7OffDirOff  = 6  // uint64 dir_offset field
+	footerV7OffDirLen  = 14 // uint32 dir_len field
+)
+
 // writeFooterV7 writes the 18-byte V7 footer for V14 files.
 //
 // Wire format (SPEC-V14-004):
@@ -366,9 +374,9 @@ func writeCompactTraceIndex(
 func writeFooterV7(w io.Writer, dirOffset uint64, dirLen uint32) error {
 	var buf [18]byte
 	binary.LittleEndian.PutUint32(buf[0:], shared.MagicNumber)
-	binary.LittleEndian.PutUint16(buf[4:], shared.FooterV7Version)
-	binary.LittleEndian.PutUint64(buf[6:], dirOffset)
-	binary.LittleEndian.PutUint32(buf[14:], dirLen)
+	binary.LittleEndian.PutUint16(buf[footerV7OffVersion:], shared.FooterV7Version)
+	binary.LittleEndian.PutUint64(buf[footerV7OffDirOff:], dirOffset)
+	binary.LittleEndian.PutUint32(buf[footerV7OffDirLen:], dirLen)
 	_, err := w.Write(buf[:])
 	return err
 }

@@ -332,404 +332,210 @@ func (b *blockBuilder) feedIntrinsicBytes(name string, colType shared.ColumnType
 	}
 }
 
-// addRowFromProto adds all column values for one span row from a pendingSpan.
-// Full OTLP→column decoding happens here (deferred from AddTracesData) to eliminate
-// per-span AttrKV materialization and attrSlab growth.
-// Column names for dynamic attributes are interned via the block-level name caches.
-//
-//nolint:dupl,cyclop,gocyclo // intentional mirror of addRowFromTempoProto for OTLP types; different field types prevent sharing; inherent complexity matches spec-driven intrinsic column set
-func (b *blockBuilder) addRowFromProto(ps *pendingSpan, rowIdx int) {
-	span := ps.span
-
-	// --- Intrinsic columns — feed accumulator AND write block columns (dual storage) ---
-
+// feedSpanIdentifiers writes trace:id, span:id, and span:parent_id to the accumulator
+// and block columns. spanID and parentSpanID are written only when non-empty.
+func (b *blockBuilder) feedSpanIdentifiers(traceID, spanID, parentSpanID []byte, rowIdx int) {
 	// trace:id — always present; excluded from the range index.
-	b.feedIntrinsicBytes(traceIDColumnName, shared.ColumnTypeBytes, span.TraceId, rowIdx)
-	b.addPresent(
-		rowIdx,
-		traceIDColumnName,
-		shared.ColumnTypeBytes,
-		shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: span.TraceId},
-	)
+	b.feedIntrinsicBytes(traceIDColumnName, shared.ColumnTypeBytes, traceID, rowIdx)
+	b.addPresent(rowIdx, traceIDColumnName, shared.ColumnTypeBytes,
+		shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: traceID})
 
-	// span:id — may be absent.
-	if len(span.SpanId) > 0 {
-		b.updateMinMax(spanIDColumnName, shared.ColumnTypeBytes, string(span.SpanId))
-		b.feedIntrinsicBytes(spanIDColumnName, shared.ColumnTypeBytes, span.SpanId, rowIdx)
-		b.addPresent(
-			rowIdx,
-			spanIDColumnName,
-			shared.ColumnTypeBytes,
-			shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: span.SpanId},
-		)
+	if len(spanID) > 0 {
+		b.updateMinMax(spanIDColumnName, shared.ColumnTypeBytes, string(spanID))
+		b.feedIntrinsicBytes(spanIDColumnName, shared.ColumnTypeBytes, spanID, rowIdx)
+		b.addPresent(rowIdx, spanIDColumnName, shared.ColumnTypeBytes,
+			shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: spanID})
 	}
 
-	// span:parent_id — may be absent.
-	if len(span.ParentSpanId) > 0 {
-		b.updateMinMax(spanParentIDColumnName, shared.ColumnTypeBytes, string(span.ParentSpanId))
-		b.feedIntrinsicBytes(spanParentIDColumnName, shared.ColumnTypeBytes, span.ParentSpanId, rowIdx)
-		b.addPresent(
-			rowIdx,
-			spanParentIDColumnName,
-			shared.ColumnTypeBytes,
-			shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: span.ParentSpanId},
-		)
+	if len(parentSpanID) > 0 {
+		b.updateMinMax(spanParentIDColumnName, shared.ColumnTypeBytes, string(parentSpanID))
+		b.feedIntrinsicBytes(spanParentIDColumnName, shared.ColumnTypeBytes, parentSpanID, rowIdx)
+		b.addPresent(rowIdx, spanParentIDColumnName, shared.ColumnTypeBytes,
+			shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: parentSpanID})
 	}
+}
 
-	// span:name — always present; truncate to MaxStringLen.
-	spanName := span.Name
-	if len(spanName) > shared.MaxStringLen {
-		spanName = spanName[:shared.MaxStringLen]
+// feedSpanName writes span:name to the accumulator and block columns.
+// The name is truncated to MaxStringLen. Empty names are skipped.
+func (b *blockBuilder) feedSpanName(name string, rowIdx int) {
+	if len(name) > shared.MaxStringLen {
+		name = name[:shared.MaxStringLen]
 	}
-	if spanName != "" {
-		b.updateMinMax(spanNameColumnName, shared.ColumnTypeString, spanName)
-		b.feedIntrinsicString(spanNameColumnName, shared.ColumnTypeString, spanName, rowIdx)
-		b.addPresent(
-			rowIdx,
-			spanNameColumnName,
-			shared.ColumnTypeString,
-			shared.AttrValue{Type: shared.ColumnTypeString, Str: spanName},
-		)
+	if name != "" {
+		b.updateMinMax(spanNameColumnName, shared.ColumnTypeString, name)
+		b.feedIntrinsicString(spanNameColumnName, shared.ColumnTypeString, name, rowIdx)
+		b.addPresent(rowIdx, spanNameColumnName, shared.ColumnTypeString,
+			shared.AttrValue{Type: shared.ColumnTypeString, Str: name})
 	}
+}
 
-	// span:kind — always present.
-	spanKind := int64(span.Kind)
-	{
-		var tmp [8]byte
-		binary.LittleEndian.PutUint64(
-			tmp[:],
-			uint64(spanKind), //nolint:gosec // safe: reinterpreting int64 bits as uint64
-		)
-		b.updateMinMax(spanKindColumnName, shared.ColumnTypeInt64, string(tmp[:]))
-	}
-	b.feedIntrinsicInt64(spanKindColumnName, shared.ColumnTypeInt64, spanKind, rowIdx)
-	b.addPresent(
-		rowIdx,
-		spanKindColumnName,
-		shared.ColumnTypeInt64,
-		shared.AttrValue{Type: shared.ColumnTypeInt64, Int: spanKind},
-	)
+// feedSpanKind writes span:kind to the accumulator and block columns.
+func (b *blockBuilder) feedSpanKind(kind int64, rowIdx int) {
+	var tmp [8]byte
+	binary.LittleEndian.PutUint64(tmp[:], uint64(kind)) //nolint:gosec // safe: reinterpreting int64 bits as uint64
+	b.updateMinMax(spanKindColumnName, shared.ColumnTypeInt64, string(tmp[:]))
+	b.feedIntrinsicInt64(spanKindColumnName, shared.ColumnTypeInt64, kind, rowIdx)
+	b.addPresent(rowIdx, spanKindColumnName, shared.ColumnTypeInt64,
+		shared.AttrValue{Type: shared.ColumnTypeInt64, Int: kind})
+}
 
-	// span:start — always present.
-	{
-		var tmp [8]byte
-		binary.LittleEndian.PutUint64(tmp[:], span.StartTimeUnixNano)
-		b.updateMinMax(spanStartColumnName, shared.ColumnTypeUint64, string(tmp[:]))
-	}
-	b.feedIntrinsicUint64(spanStartColumnName, shared.ColumnTypeUint64, span.StartTimeUnixNano, rowIdx)
-	b.addPresent(
-		rowIdx,
-		spanStartColumnName,
-		shared.ColumnTypeUint64,
-		shared.AttrValue{Type: shared.ColumnTypeUint64, Uint: span.StartTimeUnixNano},
-	)
+// feedSpanTiming writes span:start, span:end, and span:duration to the accumulator and block
+// columns. span:end is written only to block columns (synthesized from start+duration on read).
+// The timestamp sketch is updated when start > 0.
+func (b *blockBuilder) feedSpanTiming(start, end uint64, rowIdx int) {
+	var tmp [8]byte
+
+	binary.LittleEndian.PutUint64(tmp[:], start)
+	b.updateMinMax(spanStartColumnName, shared.ColumnTypeUint64, string(tmp[:]))
+	b.feedIntrinsicUint64(spanStartColumnName, shared.ColumnTypeUint64, start, rowIdx)
+	b.addPresent(rowIdx, spanStartColumnName, shared.ColumnTypeUint64,
+		shared.AttrValue{Type: shared.ColumnTypeUint64, Uint: start})
 	// Task T-TS-2: implied timestamp sketch — 1-second bucket granularity.
-	if span.StartTimeUnixNano > 0 {
-		b.colSketches.add(sketchTimestampColName, encodeSecondBucket(span.StartTimeUnixNano))
+	if start > 0 {
+		b.colSketches.add(sketchTimestampColName, encodeSecondBucket(start))
 	}
 
-	// span:end — written to block columns; synthesized from start+duration in intrinsic path.
-	{
-		var tmp [8]byte
-		binary.LittleEndian.PutUint64(tmp[:], span.EndTimeUnixNano)
-		b.updateMinMax(spanEndColumnName, shared.ColumnTypeUint64, string(tmp[:]))
-	}
-	b.addPresent(
-		rowIdx,
-		spanEndColumnName,
-		shared.ColumnTypeUint64,
-		shared.AttrValue{Type: shared.ColumnTypeUint64, Uint: span.EndTimeUnixNano},
-	)
+	// span:end — written to block columns only; synthesized from start+duration in intrinsic path.
+	binary.LittleEndian.PutUint64(tmp[:], end)
+	b.updateMinMax(spanEndColumnName, shared.ColumnTypeUint64, string(tmp[:]))
+	b.addPresent(rowIdx, spanEndColumnName, shared.ColumnTypeUint64,
+		shared.AttrValue{Type: shared.ColumnTypeUint64, Uint: end})
 
-	// span:duration — always present.
 	var dur uint64
-	if span.EndTimeUnixNano >= span.StartTimeUnixNano {
-		dur = span.EndTimeUnixNano - span.StartTimeUnixNano
+	if end >= start {
+		dur = end - start
 	}
-	{
-		var tmp [8]byte
-		binary.LittleEndian.PutUint64(tmp[:], dur)
-		b.updateMinMax(spanDurationColumnName, shared.ColumnTypeUint64, string(tmp[:]))
-	}
+	binary.LittleEndian.PutUint64(tmp[:], dur)
+	b.updateMinMax(spanDurationColumnName, shared.ColumnTypeUint64, string(tmp[:]))
 	b.feedIntrinsicUint64(spanDurationColumnName, shared.ColumnTypeUint64, dur, rowIdx)
-	b.addPresent(
-		rowIdx,
-		spanDurationColumnName,
-		shared.ColumnTypeUint64,
-		shared.AttrValue{Type: shared.ColumnTypeUint64, Uint: dur},
-	)
+	b.addPresent(rowIdx, spanDurationColumnName, shared.ColumnTypeUint64,
+		shared.AttrValue{Type: shared.ColumnTypeUint64, Uint: dur})
+}
 
-	// --- Conditional intrinsic columns ---
+// feedSpanStatus writes span:status and (when non-empty) span:status_message.
+// statusPresent must be true when the Status object is non-nil on the proto span — even
+// status code 0 (STATUS_CODE_UNSET) is written so the range index can prune { status = unset }.
+func (b *blockBuilder) feedSpanStatus(statusPresent bool, code int64, message string, rowIdx int) {
+	if !statusPresent {
+		return
+	}
+	// Always feed span:status when Status is present, even for code 0 (STATUS_CODE_UNSET).
+	// This ensures the range index tracks unset status so that { status = unset } queries can
+	// prune blocks correctly. Spans where Status is nil remain null in the column.
+	b.feedIntrinsicInt64(spanStatusColumnName, shared.ColumnTypeInt64, code, rowIdx)
+	b.addPresent(rowIdx, spanStatusColumnName, shared.ColumnTypeInt64,
+		shared.AttrValue{Type: shared.ColumnTypeInt64, Int: code})
+	if message != "" {
+		b.feedIntrinsicString(spanStatusMsgColumnName, shared.ColumnTypeString, message, rowIdx)
+		b.addPresent(rowIdx, spanStatusMsgColumnName, shared.ColumnTypeString,
+			shared.AttrValue{Type: shared.ColumnTypeString, Str: message})
+	}
+}
 
-	if span.Status != nil {
-		// Always feed span:status when the Status object is present, even for code 0
-		// (STATUS_CODE_UNSET). This ensures the range index tracks unset status so that
-		// { status = unset } queries can prune blocks correctly. Spans where span.Status
-		// is nil entirely (the majority) remain null in the column — bloom filter handles
-		// block pruning for those cases.
-		b.feedIntrinsicInt64(spanStatusColumnName, shared.ColumnTypeInt64, int64(span.Status.Code), rowIdx)
-		b.addPresent(
-			rowIdx,
-			spanStatusColumnName,
-			shared.ColumnTypeInt64,
-			shared.AttrValue{Type: shared.ColumnTypeInt64, Int: int64(span.Status.Code)},
-		)
-		if span.Status.Message != "" {
-			b.feedIntrinsicString(spanStatusMsgColumnName, shared.ColumnTypeString, span.Status.Message, rowIdx)
-			b.addPresent(
-				rowIdx,
-				spanStatusMsgColumnName,
-				shared.ColumnTypeString,
-				shared.AttrValue{Type: shared.ColumnTypeString, Str: span.Status.Message},
-			)
+// feedSpanLabels writes optional string columns: trace:state, resource:schema_url, scope:schema_url.
+// Each is written only when its value is non-empty.
+func (b *blockBuilder) feedSpanLabels(traceState, rsSchemaURL, ssSchemaURL string, rowIdx int) {
+	if traceState != "" {
+		b.addPresent(rowIdx, shared.TraceStateColumnName, shared.ColumnTypeString,
+			shared.AttrValue{Type: shared.ColumnTypeString, Str: traceState})
+	}
+	if rsSchemaURL != "" {
+		b.addPresent(rowIdx, shared.ResourceSchemaURL, shared.ColumnTypeString,
+			shared.AttrValue{Type: shared.ColumnTypeString, Str: rsSchemaURL})
+	}
+	if ssSchemaURL != "" {
+		b.addPresent(rowIdx, shared.ScopeSchemaURL, shared.ColumnTypeString,
+			shared.AttrValue{Type: shared.ColumnTypeString, Str: ssSchemaURL})
+	}
+}
+
+// updateBlockBounds updates the block-level min/max start time and min/max trace ID
+// trackers. Must be called once per row, before incrementing spanCount.
+func (b *blockBuilder) updateBlockBounds(start uint64, traceID [16]byte) {
+	if b.spanCount == 0 {
+		b.minStart = start
+		b.maxStart = start
+		b.minTraceID = traceID
+		b.maxTraceID = traceID
+	} else {
+		b.minStart = min(b.minStart, start)
+		b.maxStart = max(b.maxStart, start)
+		if traceIDBefore(traceID, b.minTraceID) {
+			b.minTraceID = traceID
+		}
+		if traceIDBefore(b.maxTraceID, traceID) {
+			b.maxTraceID = traceID
 		}
 	}
+}
 
-	if span.TraceState != "" {
-		b.addPresent(rowIdx, "trace:state", shared.ColumnTypeString, shared.AttrValue{
-			Type: shared.ColumnTypeString,
-			Str:  span.TraceState,
-		})
+// feedProtoResourceAttrs writes OTLP resource attributes to block columns.
+// resource.service.name is written to both the intrinsic section and block columns (dual storage).
+func (b *blockBuilder) feedProtoResourceAttrs(ps *pendingSpan, rowIdx int) {
+	if ps.rs == nil || ps.rs.Resource == nil {
+		return
 	}
-
-	if ps.rs != nil && ps.rs.SchemaUrl != "" {
-		b.addPresent(rowIdx, "resource:schema_url", shared.ColumnTypeString, shared.AttrValue{
-			Type: shared.ColumnTypeString,
-			Str:  ps.rs.SchemaUrl,
-		})
-	}
-
-	if ps.ss != nil && ps.ss.SchemaUrl != "" {
-		b.addPresent(rowIdx, "scope:schema_url", shared.ColumnTypeString, shared.AttrValue{
-			Type: shared.ColumnTypeString,
-			Str:  ps.ss.SchemaUrl,
-		})
-	}
-
-	// --- Span attributes (interned column names, zero-copy values) ---
-	for _, kv := range span.Attributes {
+	for _, kv := range ps.rs.Resource.Attributes {
 		if kv == nil {
 			continue
 		}
-		b.addSpanAttr(rowIdx, kv)
-	}
-
-	// --- Resource attributes ---
-	if ps.rs != nil && ps.rs.Resource != nil {
-		for _, kv := range ps.rs.Resource.Attributes {
-			if kv == nil {
-				continue
+		name := b.internColName(kv.Key, b.resourceColNames, "resource.")
+		val := protoToAttrValue(kv.Value)
+		if kv.Key == svcNameAttrKey && val.Type == shared.ColumnTypeString {
+			// resource.service.name is written to BOTH intrinsic section and block column (dual storage).
+			if val.Str != "" {
+				b.updateMinMax(svcNameColumnName, shared.ColumnTypeRangeString, val.Str)
 			}
-			name := b.internColName(kv.Key, b.resourceColNames, "resource.")
-			val := protoToAttrValue(kv.Value)
-			if kv.Key == svcNameAttrKey && val.Type == shared.ColumnTypeString {
-				// resource.service.name is written to BOTH intrinsic section and block column (dual storage).
-				if val.Str != "" {
-					b.updateMinMax(svcNameColumnName, shared.ColumnTypeRangeString, val.Str)
-				}
-				b.feedIntrinsicString(svcNameColumnName, shared.ColumnTypeString, val.Str, rowIdx)
-				b.addPresent(rowIdx, name, val.Type, val)
-			} else {
-				b.addPresent(rowIdx, name, val.Type, val)
-			}
-		}
-	}
-
-	// --- Scope attributes ---
-	if ps.ss != nil && ps.ss.Scope != nil {
-		for _, kv := range ps.ss.Scope.Attributes {
-			if kv == nil {
-				continue
-			}
-			name := b.internColName(kv.Key, b.scopeColNames, "scope.")
-			val := protoToAttrValue(kv.Value)
+			b.feedIntrinsicString(svcNameColumnName, shared.ColumnTypeString, val.Str, rowIdx)
+			b.addPresent(rowIdx, name, val.Type, val)
+		} else {
 			b.addPresent(rowIdx, name, val.Type, val)
 		}
 	}
-
-	// Update min/max start time.
-	if b.spanCount == 0 {
-		b.minStart = span.StartTimeUnixNano
-		b.maxStart = span.StartTimeUnixNano
-		b.minTraceID = ps.traceID
-		b.maxTraceID = ps.traceID
-	} else {
-		b.minStart = min(b.minStart, span.StartTimeUnixNano)
-		b.maxStart = max(b.maxStart, span.StartTimeUnixNano)
-		if traceIDBefore(ps.traceID, b.minTraceID) {
-			b.minTraceID = ps.traceID
-		}
-		if traceIDBefore(b.maxTraceID, ps.traceID) {
-			b.maxTraceID = ps.traceID
-		}
-	}
-
-	// Track which traces appear in this block.
-	b.traceRows[ps.traceID] = struct{}{}
-
-	b.spanCount++
 }
 
-// addRowFromTempoProto adds all column values for one span row from a pendingSpan sourced from
-// Tempo-native proto types. Mirrors addRowFromProto for tempocommon/tempotrace types.
-//
-//nolint:dupl // intentional mirror of addRowFromProto for Tempo types; different field types prevent sharing
-func (b *blockBuilder) addRowFromTempoProto(
-	ps *pendingSpan,
-	rowIdx int,
-) { //nolint:cyclop // mirrors addRowFromProto complexity
-	span := ps.tempoSpan
-
-	// --- Intrinsic columns — feed accumulator AND write block columns (dual storage) ---
-
-	b.feedIntrinsicBytes(traceIDColumnName, shared.ColumnTypeBytes, span.TraceId, rowIdx)
-	b.addPresent(
-		rowIdx,
-		traceIDColumnName,
-		shared.ColumnTypeBytes,
-		shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: span.TraceId},
-	)
-
-	if len(span.SpanId) > 0 {
-		b.updateMinMax(spanIDColumnName, shared.ColumnTypeBytes, string(span.SpanId))
-		b.feedIntrinsicBytes(spanIDColumnName, shared.ColumnTypeBytes, span.SpanId, rowIdx)
-		b.addPresent(
-			rowIdx,
-			spanIDColumnName,
-			shared.ColumnTypeBytes,
-			shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: span.SpanId},
-		)
+// feedProtoScopeAttrs writes OTLP scope attributes to block columns.
+func (b *blockBuilder) feedProtoScopeAttrs(ps *pendingSpan, rowIdx int) {
+	if ps.ss == nil || ps.ss.Scope == nil {
+		return
 	}
+	for _, kv := range ps.ss.Scope.Attributes {
+		if kv == nil {
+			continue
+		}
+		name := b.internColName(kv.Key, b.scopeColNames, "scope.")
+		val := protoToAttrValue(kv.Value)
+		b.addPresent(rowIdx, name, val.Type, val)
+	}
+}
 
-	if len(span.ParentSpanId) > 0 {
-		b.updateMinMax(spanParentIDColumnName, shared.ColumnTypeBytes, string(span.ParentSpanId))
-		b.feedIntrinsicBytes(spanParentIDColumnName, shared.ColumnTypeBytes, span.ParentSpanId, rowIdx)
-		b.addPresent(
-			rowIdx,
-			spanParentIDColumnName,
-			shared.ColumnTypeBytes,
-			shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: span.ParentSpanId},
-		)
+// feedTempoResourceAttrs writes Tempo resource attributes to block columns.
+// resource.service.name is written to both the intrinsic section and block columns (dual storage).
+func (b *blockBuilder) feedTempoResourceAttrs(ps *pendingSpan, rowIdx int) {
+	if ps.tempoRS == nil || ps.tempoRS.Resource == nil {
+		return
 	}
-
-	spanName := span.Name
-	if len(spanName) > shared.MaxStringLen {
-		spanName = spanName[:shared.MaxStringLen]
-	}
-	if spanName != "" {
-		b.updateMinMax(spanNameColumnName, shared.ColumnTypeString, spanName)
-		b.feedIntrinsicString(spanNameColumnName, shared.ColumnTypeString, spanName, rowIdx)
-		b.addPresent(
-			rowIdx,
-			spanNameColumnName,
-			shared.ColumnTypeString,
-			shared.AttrValue{Type: shared.ColumnTypeString, Str: spanName},
-		)
-	}
-
-	spanKind := int64(span.Kind)
-	{
-		var tmp [8]byte
-		binary.LittleEndian.PutUint64(
-			tmp[:],
-			uint64(spanKind), //nolint:gosec // G115: safe reinterpret int64 bits as uint64
-		)
-		b.updateMinMax(spanKindColumnName, shared.ColumnTypeInt64, string(tmp[:]))
-	}
-	b.feedIntrinsicInt64(spanKindColumnName, shared.ColumnTypeInt64, spanKind, rowIdx)
-	b.addPresent(
-		rowIdx,
-		spanKindColumnName,
-		shared.ColumnTypeInt64,
-		shared.AttrValue{Type: shared.ColumnTypeInt64, Int: spanKind},
-	)
-
-	{
-		var tmp [8]byte
-		binary.LittleEndian.PutUint64(tmp[:], span.StartTimeUnixNano)
-		b.updateMinMax(spanStartColumnName, shared.ColumnTypeUint64, string(tmp[:]))
-	}
-	b.feedIntrinsicUint64(spanStartColumnName, shared.ColumnTypeUint64, span.StartTimeUnixNano, rowIdx)
-	b.addPresent(
-		rowIdx,
-		spanStartColumnName,
-		shared.ColumnTypeUint64,
-		shared.AttrValue{Type: shared.ColumnTypeUint64, Uint: span.StartTimeUnixNano},
-	)
-	if span.StartTimeUnixNano > 0 {
-		b.colSketches.add(sketchTimestampColName, encodeSecondBucket(span.StartTimeUnixNano))
-	}
-
-	// span:end — written to block columns; synthesized from start+duration in intrinsic path.
-	{
-		var tmp [8]byte
-		binary.LittleEndian.PutUint64(tmp[:], span.EndTimeUnixNano)
-		b.updateMinMax(spanEndColumnName, shared.ColumnTypeUint64, string(tmp[:]))
-	}
-	b.addPresent(
-		rowIdx,
-		spanEndColumnName,
-		shared.ColumnTypeUint64,
-		shared.AttrValue{Type: shared.ColumnTypeUint64, Uint: span.EndTimeUnixNano},
-	)
-
-	var dur uint64
-	if span.EndTimeUnixNano >= span.StartTimeUnixNano {
-		dur = span.EndTimeUnixNano - span.StartTimeUnixNano
-	}
-	{
-		var tmp [8]byte
-		binary.LittleEndian.PutUint64(tmp[:], dur)
-		b.updateMinMax(spanDurationColumnName, shared.ColumnTypeUint64, string(tmp[:]))
-	}
-	b.feedIntrinsicUint64(spanDurationColumnName, shared.ColumnTypeUint64, dur, rowIdx)
-	b.addPresent(
-		rowIdx,
-		spanDurationColumnName,
-		shared.ColumnTypeUint64,
-		shared.AttrValue{Type: shared.ColumnTypeUint64, Uint: dur},
-	)
-
-	if span.Status != nil {
-		b.feedIntrinsicInt64(spanStatusColumnName, shared.ColumnTypeInt64, int64(span.Status.Code), rowIdx)
-		b.addPresent(
-			rowIdx,
-			spanStatusColumnName,
-			shared.ColumnTypeInt64,
-			shared.AttrValue{Type: shared.ColumnTypeInt64, Int: int64(span.Status.Code)},
-		)
-		if span.Status.Message != "" {
-			b.feedIntrinsicString(spanStatusMsgColumnName, shared.ColumnTypeString, span.Status.Message, rowIdx)
-			b.addPresent(
-				rowIdx,
-				spanStatusMsgColumnName,
-				shared.ColumnTypeString,
-				shared.AttrValue{Type: shared.ColumnTypeString, Str: span.Status.Message},
-			)
+	for _, kv := range ps.tempoRS.Resource.Attributes {
+		if kv == nil {
+			continue
+		}
+		name := b.internColName(kv.Key, b.resourceColNames, "resource.")
+		val := tempoToAttrValue(kv.Value)
+		if kv.Key == svcNameAttrKey && val.Type == shared.ColumnTypeString {
+			// resource.service.name is written to BOTH intrinsic section and block column (dual storage).
+			if val.Str != "" {
+				b.updateMinMax(svcNameColumnName, shared.ColumnTypeRangeString, val.Str)
+			}
+			b.feedIntrinsicString(svcNameColumnName, shared.ColumnTypeString, val.Str, rowIdx)
+			b.addPresent(rowIdx, name, val.Type, val)
+		} else {
+			b.addPresent(rowIdx, name, val.Type, val)
 		}
 	}
+}
 
-	if span.TraceState != "" {
-		b.addPresent(rowIdx, "trace:state", shared.ColumnTypeString, shared.AttrValue{
-			Type: shared.ColumnTypeString,
-			Str:  span.TraceState,
-		})
-	}
-
-	if ps.tempoRS != nil && ps.tempoRS.SchemaUrl != "" {
-		b.addPresent(rowIdx, "resource:schema_url", shared.ColumnTypeString, shared.AttrValue{
-			Type: shared.ColumnTypeString,
-			Str:  ps.tempoRS.SchemaUrl,
-		})
-	}
-
-	if ps.tempoSS != nil && ps.tempoSS.SchemaUrl != "" {
-		b.addPresent(rowIdx, "scope:schema_url", shared.ColumnTypeString, shared.AttrValue{
-			Type: shared.ColumnTypeString,
-			Str:  ps.tempoSS.SchemaUrl,
-		})
-	}
-
+// feedTempoSpanAttrs writes Tempo span-level attributes to block columns.
+func (b *blockBuilder) feedTempoSpanAttrs(span *tempotrace.Span, rowIdx int) {
 	for _, kv := range span.Attributes {
 		if kv == nil {
 			continue
@@ -738,54 +544,99 @@ func (b *blockBuilder) addRowFromTempoProto(
 		val := tempoToAttrValue(kv.Value)
 		b.addPresent(rowIdx, name, val.Type, val)
 	}
+}
 
-	if ps.tempoRS != nil && ps.tempoRS.Resource != nil {
-		for _, kv := range ps.tempoRS.Resource.Attributes {
-			if kv == nil {
-				continue
-			}
-			name := b.internColName(kv.Key, b.resourceColNames, "resource.")
-			val := tempoToAttrValue(kv.Value)
-			if kv.Key == svcNameAttrKey && val.Type == shared.ColumnTypeString {
-				// resource.service.name is written to BOTH intrinsic section and block column (dual storage).
-				if val.Str != "" {
-					b.updateMinMax(svcNameColumnName, shared.ColumnTypeRangeString, val.Str)
-				}
-				b.feedIntrinsicString(svcNameColumnName, shared.ColumnTypeString, val.Str, rowIdx)
-				b.addPresent(rowIdx, name, val.Type, val)
-			} else {
-				b.addPresent(rowIdx, name, val.Type, val)
-			}
+// feedTempoScopeAttrs writes Tempo scope attributes to block columns.
+func (b *blockBuilder) feedTempoScopeAttrs(ps *pendingSpan, rowIdx int) {
+	if ps.tempoSS == nil || ps.tempoSS.Scope == nil {
+		return
+	}
+	for _, kv := range ps.tempoSS.Scope.Attributes {
+		if kv == nil {
+			continue
 		}
+		name := b.internColName(kv.Key, b.scopeColNames, "scope.")
+		val := tempoToAttrValue(kv.Value)
+		b.addPresent(rowIdx, name, val.Type, val)
+	}
+}
+
+// addRowFromProto adds all column values for one span row from a pendingSpan.
+// Full OTLP→column decoding happens here (deferred from AddTracesData) to eliminate
+// per-span AttrKV materialization and attrSlab growth.
+// Column names for dynamic attributes are interned via the block-level name caches.
+func (b *blockBuilder) addRowFromProto(ps *pendingSpan, rowIdx int) {
+	span := ps.span
+
+	b.feedSpanIdentifiers(span.TraceId, span.SpanId, span.ParentSpanId, rowIdx)
+	b.feedSpanName(span.Name, rowIdx)
+	b.feedSpanKind(int64(span.Kind), rowIdx)
+	b.feedSpanTiming(span.StartTimeUnixNano, span.EndTimeUnixNano, rowIdx)
+
+	var statusCode int64
+	var statusMsg string
+	if span.Status != nil {
+		statusCode = int64(span.Status.Code)
+		statusMsg = span.Status.Message
+	}
+	b.feedSpanStatus(span.Status != nil, statusCode, statusMsg, rowIdx)
+
+	var rsSchemaURL, ssSchemaURL string
+	if ps.rs != nil {
+		rsSchemaURL = ps.rs.SchemaUrl
+	}
+	if ps.ss != nil {
+		ssSchemaURL = ps.ss.SchemaUrl
+	}
+	b.feedSpanLabels(span.TraceState, rsSchemaURL, ssSchemaURL, rowIdx)
+
+	for _, kv := range span.Attributes {
+		if kv == nil {
+			continue
+		}
+		b.addSpanAttr(rowIdx, kv)
 	}
 
-	if ps.tempoSS != nil && ps.tempoSS.Scope != nil {
-		for _, kv := range ps.tempoSS.Scope.Attributes {
-			if kv == nil {
-				continue
-			}
-			name := b.internColName(kv.Key, b.scopeColNames, "scope.")
-			val := tempoToAttrValue(kv.Value)
-			b.addPresent(rowIdx, name, val.Type, val)
-		}
-	}
+	b.feedProtoResourceAttrs(ps, rowIdx)
+	b.feedProtoScopeAttrs(ps, rowIdx)
 
-	if b.spanCount == 0 {
-		b.minStart = span.StartTimeUnixNano
-		b.maxStart = span.StartTimeUnixNano
-		b.minTraceID = ps.traceID
-		b.maxTraceID = ps.traceID
-	} else {
-		b.minStart = min(b.minStart, span.StartTimeUnixNano)
-		b.maxStart = max(b.maxStart, span.StartTimeUnixNano)
-		if traceIDBefore(ps.traceID, b.minTraceID) {
-			b.minTraceID = ps.traceID
-		}
-		if traceIDBefore(b.maxTraceID, ps.traceID) {
-			b.maxTraceID = ps.traceID
-		}
-	}
+	b.updateBlockBounds(span.StartTimeUnixNano, ps.traceID)
+	b.traceRows[ps.traceID] = struct{}{}
+	b.spanCount++
+}
 
+// addRowFromTempoProto adds all column values for one span row from a pendingSpan sourced from
+// Tempo-native proto types. Mirrors addRowFromProto for tempocommon/tempotrace types.
+func (b *blockBuilder) addRowFromTempoProto(ps *pendingSpan, rowIdx int) {
+	span := ps.tempoSpan
+
+	b.feedSpanIdentifiers(span.TraceId, span.SpanId, span.ParentSpanId, rowIdx)
+	b.feedSpanName(span.Name, rowIdx)
+	b.feedSpanKind(int64(span.Kind), rowIdx)
+	b.feedSpanTiming(span.StartTimeUnixNano, span.EndTimeUnixNano, rowIdx)
+
+	var statusCode int64
+	var statusMsg string
+	if span.Status != nil {
+		statusCode = int64(span.Status.Code)
+		statusMsg = span.Status.Message
+	}
+	b.feedSpanStatus(span.Status != nil, statusCode, statusMsg, rowIdx)
+
+	var rsSchemaURL, ssSchemaURL string
+	if ps.tempoRS != nil {
+		rsSchemaURL = ps.tempoRS.SchemaUrl
+	}
+	if ps.tempoSS != nil {
+		ssSchemaURL = ps.tempoSS.SchemaUrl
+	}
+	b.feedSpanLabels(span.TraceState, rsSchemaURL, ssSchemaURL, rowIdx)
+
+	b.feedTempoSpanAttrs(span, rowIdx)
+	b.feedTempoResourceAttrs(ps, rowIdx)
+	b.feedTempoScopeAttrs(ps, rowIdx)
+
+	b.updateBlockBounds(span.StartTimeUnixNano, ps.traceID)
 	b.traceRows[ps.traceID] = struct{}{}
 	b.spanCount++
 }

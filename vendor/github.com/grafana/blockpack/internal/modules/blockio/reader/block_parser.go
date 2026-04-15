@@ -5,6 +5,7 @@ package reader
 import (
 	"encoding/binary"
 	"fmt"
+	"log/slog"
 	"sync"
 
 	"github.com/golang/snappy"
@@ -24,10 +25,17 @@ type colMetaEntry struct {
 	name            string
 	colType         shared.ColumnType
 	dataOffset      uint64
-	dataLen         uint64 // V12: on-disk byte length; V14: same as compressedLen
-	compressedLen   uint32 // V14 only: snappy-compressed byte length on disk
-	uncompressedLen uint32 // V14 only: raw byte length after snappy decompress
+	compressedLen   uint32 // snappy-compressed byte length on disk
+	uncompressedLen uint32 // raw byte length after snappy decompress
 }
+
+// Block header field offsets (M-28a).
+// Wire format: magic[4]+version[1]+reserved[3]+span_count[4]+column_count[4]+reserved2[8] = 24 bytes.
+const (
+	blkHdrOffVersion     = 4  // uint8 block version field
+	blkHdrOffSpanCount   = 8  // uint32 span_count field
+	blkHdrOffColumnCount = 12 // uint32 column_count field
+)
 
 // parseBlockHeader parses the 24-byte block header from data.
 func parseBlockHeader(data []byte) (blockHeader, error) {
@@ -37,9 +45,9 @@ func parseBlockHeader(data []byte) (blockHeader, error) {
 
 	hdr := blockHeader{
 		magic:       binary.LittleEndian.Uint32(data[0:]),
-		version:     data[4],
-		spanCount:   binary.LittleEndian.Uint32(data[8:]),
-		columnCount: binary.LittleEndian.Uint32(data[12:]),
+		version:     data[blkHdrOffVersion],
+		spanCount:   binary.LittleEndian.Uint32(data[blkHdrOffSpanCount:]),
+		columnCount: binary.LittleEndian.Uint32(data[blkHdrOffColumnCount:]),
 		// bytes 16-23: reserved2 (formerly trace_count + trace_table_len, always zero)
 	}
 
@@ -61,12 +69,12 @@ func parseBlockHeader(data []byte) (blockHeader, error) {
 }
 
 // parseColumnMetadataArray parses colCount column metadata entries starting at offset.
-// blockVersion controls the TOC wire format:
-//   - VersionBlockV14: data_offset[8]+compressed_len[4]+uncompressed_len[4]
-//   - Earlier:         data_offset[8]+data_len[8]
+// Wire format per entry (SPEC-V14-001):
+//
+//	name_len[2] + name[name_len] + col_type[1] + data_offset[8] + compressed_len[4] + uncompressed_len[4]
 //
 // Returns entries and the new offset after the last entry.
-func parseColumnMetadataArray(data []byte, offset int, colCount int, blockVersion uint8) ([]colMetaEntry, int, error) {
+func parseColumnMetadataArray(data []byte, offset int, colCount int) ([]colMetaEntry, int, error) {
 	entries := make([]colMetaEntry, 0, colCount)
 	pos := offset
 
@@ -89,9 +97,9 @@ func parseColumnMetadataArray(data []byte, offset int, colCount int, blockVersio
 		name := string(data[pos : pos+nameLen])
 		pos += nameLen
 
-		// col_type[1] + data_offset[8] + (compressed_len[4]+uncompressed_len[4] OR data_len[8])
-		const need = 17
-		if pos+need > len(data) {
+		// colMetaFixedSize: col_type[1] + data_offset[8] + compressed_len[4] + uncompressed_len[4] = 17 bytes
+		const colMetaFixedSize = 17
+		if pos+colMetaFixedSize > len(data) {
 			return nil, pos, fmt.Errorf("col_meta[%d]: short for type+offsets", i)
 		}
 
@@ -101,33 +109,19 @@ func parseColumnMetadataArray(data []byte, offset int, colCount int, blockVersio
 		dataOffset := binary.LittleEndian.Uint64(data[pos:])
 		pos += 8
 
-		var entry colMetaEntry
-		if blockVersion == shared.VersionBlockV14 {
-			// SPEC-V14-001: compressed_len[4 LE] + uncompressed_len[4 LE]
-			compressedLen := binary.LittleEndian.Uint32(data[pos:])
-			pos += 4
-			uncompressedLen := binary.LittleEndian.Uint32(data[pos:])
-			pos += 4
-			entry = colMetaEntry{
-				name:            name,
-				colType:         colType,
-				dataOffset:      dataOffset,
-				dataLen:         uint64(compressedLen), //nolint:gosec // safe: fits in uint64
-				compressedLen:   compressedLen,
-				uncompressedLen: uncompressedLen,
-			}
-		} else {
-			dataLen := binary.LittleEndian.Uint64(data[pos:])
-			pos += 8
-			entry = colMetaEntry{
-				name:       name,
-				colType:    colType,
-				dataOffset: dataOffset,
-				dataLen:    dataLen,
-			}
-		}
+		// SPEC-V14-001: compressed_len[4 LE] + uncompressed_len[4 LE]
+		compressedLen := binary.LittleEndian.Uint32(data[pos:])
+		pos += 4
+		uncompressedLen := binary.LittleEndian.Uint32(data[pos:])
+		pos += 4
 
-		entries = append(entries, entry)
+		entries = append(entries, colMetaEntry{
+			name:            name,
+			colType:         colType,
+			dataOffset:      dataOffset,
+			compressedLen:   compressedLen,
+			uncompressedLen: uncompressedLen,
+		})
 	}
 
 	return entries, pos, nil
@@ -156,7 +150,7 @@ func parseBlockColumnsReuse(
 	spanCount := int(hdr.spanCount)
 	colCount := int(hdr.columnCount)
 
-	metas, _, err := parseColumnMetadataArray(rawBytes, 24, colCount, hdr.version)
+	metas, _, err := parseColumnMetadataArray(rawBytes, 24, colCount)
 	if err != nil {
 		return nil, fmt.Errorf("parseBlock: column metadata: %w", err)
 	}
@@ -172,8 +166,6 @@ func parseBlockColumnsReuse(
 		columns = make(map[shared.ColumnKey]*Column, colCount)
 	}
 
-	isV14 := hdr.version == shared.VersionBlockV14
-
 	for _, m := range metas {
 		if wantColumns != nil {
 			if _, ok := wantColumns[m.name]; !ok {
@@ -181,38 +173,28 @@ func parseBlockColumnsReuse(
 			}
 		}
 
-		// Trace-level columns (dataLen == 0) are skipped here.
-		if m.dataLen == 0 {
+		// Trace-level columns (compressedLen == 0) are skipped here.
+		if m.compressedLen == 0 {
 			continue
 		}
 
-		start := int(m.dataOffset)    //nolint:gosec // safe: dataOffset bounded by block size < MaxBlockSize
-		end := start + int(m.dataLen) //nolint:gosec // safe: dataLen bounded by block size < MaxBlockSize
+		start := int(m.dataOffset)          //nolint:gosec // safe: dataOffset bounded by block size < MaxBlockSize
+		end := start + int(m.compressedLen) //nolint:gosec // safe: compressedLen bounded by block size < MaxBlockSize
 		if start < 0 || end > len(rawBytes) {
 			return nil, fmt.Errorf(
 				"parseBlock: col %q data offset %d len %d out of range (block %d bytes)",
-				m.name, m.dataOffset, m.dataLen, len(rawBytes),
+				m.name, m.dataOffset, m.compressedLen, len(rawBytes),
 			)
 		}
 
 		colData := rawBytes[start:end]
 
-		// SPEC-V14-001: for V14 blocks, each column blob is snappy-compressed.
-		// Decompress before passing to readColumnEncoding.
-		if isV14 {
-			// SPEC-ROOT-012: guard against decompression-bomb OOM.
-			if m.uncompressedLen > uint32(shared.MaxBlockSize) { //nolint:gosec
-				return nil, fmt.Errorf(
-					"parseBlock: col %q: uncompressed_len %d exceeds MaxBlockSize",
-					m.name,
-					m.uncompressedLen,
-				)
-			}
-			decompressed, decErr := snappy.Decode(nil, colData)
-			if decErr != nil {
-				return nil, fmt.Errorf("parseBlock: col %q snappy decode: %w", m.name, decErr)
-			}
-			colData = decompressed
+		// SPEC-V14-001: each column blob is snappy-compressed; decompress before decode.
+		// SPEC-ROOT-012: decompressV14ColumnData guards against decompression-bomb OOM.
+		var decErr error
+		colData, decErr = decompressV14ColumnData(m.name, colData, m.uncompressedLen)
+		if decErr != nil {
+			return nil, fmt.Errorf("parseBlock: %w", decErr)
 		}
 
 		key := shared.ColumnKey{Name: m.name, Type: m.colType}
@@ -248,14 +230,17 @@ func parseBlockColumnsReuse(
 		col.Present = decoded.Present
 		col.SpanCount = decoded.SpanCount
 		col.sparseDictIdx = decoded.sparseDictIdx // NOTE-PERF-1: lazy dense expansion
+		col.decoded.Store(true)                   // NOTE-CONC-001: mark eagerly decoded so needsDecode() is false
 
 		columns[key] = col
 	}
 
 	// NOTE-001: Lazy registration — when wantColumns is non-nil, eagerly-skipped columns
-	// are registered with a rawEncoding sub-slice into rawBytes and NO immediate decode.
-	// Presence is decoded on the first IsPresent() call (NOTE-002: lazy presence).
-	// Full value decode is deferred to the first value accessor call (decodeNow).
+	// are registered with compressedEncoding pointing into rawBytes and NO immediate decode.
+	// Both snappy decompression and full column decode are deferred to the first accessor call
+	// (ensureDecompressed then decodeNow). IsPresent() also triggers full decode on a lazy
+	// column (it calls decodeNow via decodeOnce). SPEC-V14-002: non-wanted columns pay zero
+	// CPU/memory cost for decompression until first accessed.
 	//
 	// NOTE-002: Arena-like pre-allocation — one []Column slice sized to len(metas)
 	// replaces N individual *Column heap allocations. Pointers into the slice are stable
@@ -268,7 +253,7 @@ func parseBlockColumnsReuse(
 				continue // already eagerly decoded
 			}
 
-			if m.dataLen == 0 {
+			if m.compressedLen == 0 {
 				continue // trace-level column, no data
 			}
 
@@ -277,32 +262,34 @@ func parseBlockColumnsReuse(
 				continue // already registered (shouldn't happen, but guard)
 			}
 
-			start := int(m.dataOffset)    //nolint:gosec
-			end := start + int(m.dataLen) //nolint:gosec
+			start := int(m.dataOffset)          //nolint:gosec
+			end := start + int(m.compressedLen) //nolint:gosec
 			if start < 0 || end > len(rawBytes) {
-				continue // skip unreadable columns silently
+				// SPEC-ROOT-010: log the skip so operators can detect corrupt/malicious data.
+				slog.Warn("block_parser: lazy column offset out of range — skipping",
+					"column", m.name, "start", start, "end", end,
+					"block_size", len(rawBytes))
+				continue
 			}
 
-			rawEncoding := rawBytes[start:end]
-			// SPEC-V14-001: for V14 blocks, snappy-decompress before lazy registration.
-			if isV14 {
-				// SPEC-ROOT-012: guard against decompression-bomb OOM.
-				if m.uncompressedLen > uint32(shared.MaxBlockSize) { //nolint:gosec
-					continue // skip columns with oversized uncompressed_len silently
-				}
-				decompressed, decErr := snappy.Decode(nil, rawEncoding)
-				if decErr != nil {
-					continue // skip columns that fail to decompress silently
-				}
-				rawEncoding = decompressed
+			// SPEC-ROOT-012: TOC bomb guard — reject oversized columns at registration time
+			// without paying the cost of decompression. Full snappy decode is deferred to
+			// first access via ensureDecompressed (SPEC-V14-002).
+			if m.uncompressedLen > uint32(shared.MaxBlockSize) { //nolint:gosec
+				slog.Warn("block_parser: lazy column uncompressed_len exceeds MaxBlockSize — skipping",
+					"column", m.name,
+					"uncompressed_len", m.uncompressedLen,
+					"max_block_size", shared.MaxBlockSize)
+				continue
 			}
 
 			lazyStore = append(lazyStore, Column{
-				Name:        m.name,
-				Type:        m.colType,
-				SpanCount:   spanCount,
-				rawEncoding: rawEncoding,
-				internMap:   nil, // nil → internString skips map; safe for concurrent lazy decode
+				Name:               m.name,
+				Type:               m.colType,
+				SpanCount:          spanCount,
+				compressedEncoding: rawBytes[start:end], // zero-copy sub-slice; decompressed on first access
+				uncompressedLen:    m.uncompressedLen,
+				internMap:          nil, // nil → internString skips map; safe for concurrent lazy decode
 			})
 			// Safe: cap was set to len(metas) and we append ≤ len(metas) items, so no realloc.
 			columns[key] = &lazyStore[len(lazyStore)-1]
@@ -321,11 +308,41 @@ func parseBlockColumnsReuse(
 	return blk, nil
 }
 
+// decompressV14ColumnData applies SPEC-ROOT-012 guards and snappy-decompresses a V14 column blob.
+// Returns the decompressed bytes or an error if the TOC length, frame header, or decode fails.
+// SPEC-ROOT-012: guards against decompression-bomb OOM via both TOC and snappy frame-header checks.
+func decompressV14ColumnData(name string, data []byte, uncompressedLen uint32) ([]byte, error) {
+	if uncompressedLen > uint32(shared.MaxBlockSize) { //nolint:gosec
+		return nil, fmt.Errorf("col %q: uncompressed_len %d exceeds MaxBlockSize", name, uncompressedLen)
+	}
+	frameLen, lenErr := snappy.DecodedLen(data)
+	if lenErr != nil {
+		return nil, fmt.Errorf("col %q: snappy frame header: %w", name, lenErr)
+	}
+	if frameLen > shared.MaxBlockSize {
+		return nil, fmt.Errorf("col %q: snappy frame claims %d bytes, exceeds MaxBlockSize", name, frameLen)
+	}
+	decompressed, decErr := snappy.Decode(nil, data)
+	if decErr != nil {
+		return nil, fmt.Errorf("col %q snappy decode: %w", name, decErr)
+	}
+	if uint32(len(decompressed)) != uncompressedLen { //nolint:gosec
+		return nil, fmt.Errorf(
+			"col %q: decoded length %d does not match uncompressed_len %d",
+			name,
+			len(decompressed),
+			uncompressedLen,
+		)
+	}
+	return decompressed, nil
+}
+
 // resetColumn zeroes a Column's value fields while retaining the allocation.
-// IMPORTANT: decodeOnce must also be reset here because Column instances are reused
-// across block parses (ParseBlockFromBytes re-uses prevBlock.columns). Without resetting
-// decodeOnce, a lazily-registered column from the previous block would appear already
-// decoded on the next block and decodeNow would never run, leaving stale encoded data.
+// IMPORTANT: both decodeOnce and decoded must be reset here because Column instances are
+// reused across block parses (ParseBlockFromBytes re-uses prevBlock.columns). decoded.Store(false)
+// is the primary guard — needsDecode() reads decoded atomically and would skip decodeNow for
+// any column that still has decoded==true from the previous block. Resetting decodeOnce alone
+// is not sufficient: decoded.Load() is the outer check, decodeOnce is the inner serializer.
 func resetColumn(col *Column) {
 	col.StringDict = col.StringDict[:0]
 	col.StringIdx = col.StringIdx[:0]
@@ -343,9 +360,12 @@ func resetColumn(col *Column) {
 	col.Present = nil
 	// NOTE-001: clear lazy decode fields so reused columns don't carry stale state.
 	col.rawEncoding = nil
+	col.compressedEncoding = nil // SPEC-V14-002: clear deferred decompression state
+	col.uncompressedLen = 0
 	col.internMap = nil
 	col.sparseDictIdx = nil // NOTE-PERF-1: clear deferred dense expansion
 	col.decodeOnce = sync.Once{}
-	col.presenceOnce = sync.Once{}
 	col.denseOnce = sync.Once{}
+	col.decompressOnce = sync.Once{}
+	col.decoded.Store(false) // NOTE-CONC-001: reset atomic so needsDecode() returns true for reused column
 }

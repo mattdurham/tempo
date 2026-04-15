@@ -692,10 +692,10 @@ b.ReportMetric(elapsed.Milliseconds(), "ms/roundtrip")
 
 ## 9. Metadata Compression Benchmarks
 
-### BENCH-R-08: BenchmarkReaderOpen_V12
+### BENCH-R-08: BenchmarkReaderOpen_V13
 
 Measures reader open latency (footer + header + metadata parse, including snappy
-decompression) for a V12 file with 1000 spans across 10 blocks.
+decompression) for a V13 file with 1000 spans across 10 blocks.
 
 **Setup:**
 - Write 1000 spans with `MaxBlockSpans=100` to produce 10 blocks.
@@ -712,7 +712,7 @@ b.ReportMetric(float64(len(data)), "file_bytes")
   negligible for metadata sizes up to 10 MB).
 - No allocation regression compared to V11 open time.
 
-**Implementation:** `BenchmarkReaderOpen_V12` in `reader/reader_test.go`.
+**Implementation:** `BenchmarkReaderOpen_V13` in `reader/reader_test.go`.
 
 ---
 

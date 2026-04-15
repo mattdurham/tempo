@@ -45,7 +45,7 @@ func planBlocks(
 	}
 
 	// File-level bloom reject: Fuse8 for service.name, compact bloom for trace:id.
-	// NOTE-45: Checks equality predicates via FileBloom (Fuse8) and compact trace bloom.
+	// NOTE-045: Checks equality predicates via FileBloom (Fuse8) and compact trace bloom.
 	if program != nil && program.Predicates != nil {
 		if fileLevelBloomReject(r, program.Predicates.Nodes) {
 			plan.SelectedBlocks = nil
@@ -90,7 +90,7 @@ func planBlocks(
 
 // fileLevelBloomReject returns true if file-level bloom filters guarantee that no span
 // in the file can match the equality predicates in nodes.
-// NOTE-45: Checks resource.service.name via FileBloom (Fuse8) and trace:id via compact bloom.
+// NOTE-045: Checks resource.service.name via FileBloom (Fuse8) and trace:id via compact bloom.
 // AND semantics: reject if ANY leaf rejects. OR semantics: reject only if ALL children reject.
 func fileLevelBloomReject(r *modules_reader.Reader, nodes []vm.RangeNode) bool {
 	fb := r.FileBloom()
@@ -173,7 +173,7 @@ func bloomRejectString(fb *modules_reader.FileBloom, col string, values []vm.Val
 
 // fileLevelReject returns true if the AND-combined predicates in nodes guarantee
 // that no span in the file can match — i.e. the file should be entirely skipped.
-// NOTE-45: Uses RangeColumnBoundaries (bucketMin/bucketMax) for O(1) file rejection.
+// NOTE-045: Uses RangeColumnBoundaries (bucketMin/bucketMax) for O(1) file rejection.
 // It is conservative: it only rejects when a leaf node's range predicate is entirely
 // outside the column's [bucketMin, bucketMax] range.
 //
