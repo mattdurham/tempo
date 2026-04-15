@@ -23,6 +23,10 @@ Tempo has two deployment modes: monolithic or microservices.
 
 Refer to [Plan your deployment](/docs/tempo/<TEMPO_VERSION>/set-up-for-tracing/setup-tempo/plan/) to determine the best method to deploy Tempo.
 
+{{< admonition type="note" >}}
+Tempo v3.0 requires a Kafka-compatible system (such as Apache Kafka, Redpanda, or WarpStream) as part of its infrastructure. Make sure to include this in your deployment planning. For more information, refer to the [Architecture documentation](https://grafana.com/docs/tempo/<TEMPO_VERSION>/introduction/architecture/).
+{{< /admonition >}}
+
 ## Deploy Tempo
 
 Once you have decided the best method, you can deploy and set up Tempo.
@@ -36,7 +40,6 @@ Refer to [Deploy Tempo](/docs/tempo/<TEMPO_VERSION>/set-up-for-tracing/setup-tem
 Once Tempo is deployed, you can validate Tempo by visualizing traces data:
 
 - Using a [test application for a Tempo cluster](/docs/tempo/<TEMPO_VERSION>/set-up-for-tracing/setup-tempo/test/set-up-test-app/) for the Kubernetes with Tanka setup
-- Using a [Docker example](/docs/tempo/<TEMPO_VERSION>/set-up-for-tracing/setup-tempo/test/test-monolithic-local/) to test the Linux setup
 
 These visualizations test Kubernetes with Tanka and Linux procedures.
 They don't check optional configuration you have enabled.

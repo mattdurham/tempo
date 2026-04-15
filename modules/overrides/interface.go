@@ -64,12 +64,6 @@ type Interface interface {
 	MetricsGeneratorProcessorSpanMetricsDimensions(userID string) []string
 	MetricsGeneratorProcessorSpanMetricsIntrinsicDimensions(userID string) map[string]bool
 	MetricsGeneratorProcessorSpanMetricsFilterPolicies(userID string) []config.FilterPolicy
-	MetricsGeneratorProcessorLocalBlocksMaxLiveTraces(userID string) uint64
-	MetricsGeneratorProcessorLocalBlocksMaxBlockDuration(userID string) time.Duration
-	MetricsGeneratorProcessorLocalBlocksMaxBlockBytes(userID string) uint64
-	MetricsGeneratorProcessorLocalBlocksTraceIdlePeriod(userID string) time.Duration
-	MetricsGeneratorProcessorLocalBlocksFlushCheckPeriod(userID string) time.Duration
-	MetricsGeneratorProcessorLocalBlocksCompleteBlockTimeout(userID string) time.Duration
 	MetricsGeneratorProcessorSpanMetricsDimensionMappings(userID string) []sharedconfig.DimensionMappings
 	MetricsGeneratorProcessorSpanMetricsEnableTargetInfo(userID string) (bool, bool) // returns (enabled, isSet)
 	MetricsGeneratorProcessorServiceGraphsEnableClientServerPrefix(userID string) bool
@@ -80,7 +74,9 @@ type Interface interface {
 	MetricsGeneratorProcessorHostInfoHostIdentifiers(userID string) []string
 	MetricsGeneratorProcessorHostInfoMetricName(userID string) string
 	MetricsGeneratorProcessorServiceGraphsSpanMultiplierKey(userID string) string
+	MetricsGeneratorProcessorServiceGraphsEnableTraceStateSpanMultiplier(userID string) (bool, bool)
 	MetricsGeneratorProcessorSpanMetricsSpanMultiplierKey(userID string) string
+	MetricsGeneratorProcessorSpanMetricsEnableTraceStateSpanMultiplier(userID string) (bool, bool)
 	MetricsGeneratorNativeHistogramBucketFactor(userID string) float64
 	MetricsGeneratorNativeHistogramMaxBucketNumber(userID string) uint32
 	MetricsGeneratorNativeHistogramMinResetDuration(userID string) time.Duration

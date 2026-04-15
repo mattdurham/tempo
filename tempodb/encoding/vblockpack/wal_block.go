@@ -13,6 +13,7 @@ import (
 	"github.com/grafana/blockpack"
 	"github.com/grafana/tempo/pkg/tempopb"
 	"github.com/grafana/tempo/pkg/traceql"
+	"github.com/grafana/tempo/pkg/util"
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/encoding/common"
 )
@@ -437,6 +438,12 @@ func (w *walBlock) Fetch(ctx context.Context, req traceql.FetchSpansRequest, opt
 		Results: &sliceSpansetIterator{spansets: spansets},
 		Bytes:   func() uint64 { return uint64(len(snapshot)) },
 	}, nil
+}
+
+// FetchSpans is not supported for vblockpack WAL blocks — blockpack evaluates TraceQL
+// natively via Fetch. The caller should use Fetch when FetchSpans returns ErrUnsupported.
+func (w *walBlock) FetchSpans(_ context.Context, _ traceql.FetchSpansRequest, _ common.SearchOptions) (traceql.FetchSpansOnlyResponse, error) {
+	return traceql.FetchSpansOnlyResponse{}, util.ErrUnsupported
 }
 
 // FetchTagValues implements the Searcher interface
