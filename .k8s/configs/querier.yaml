@@ -61,6 +61,7 @@ metrics_generator_client:
         max_send_msg_size: 1.048576e+08
 multitenancy_enabled: true
 overrides:
+    enable_legacy_overrides: true
     ingestion_burst_size_bytes: 2e+07
     ingestion_rate_limit_bytes: 500000
     ingestion_rate_strategy: global
