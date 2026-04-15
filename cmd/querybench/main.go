@@ -27,11 +27,11 @@ type queryDef struct {
 }
 
 type queryFile struct {
-	Start   int64         `json:"start"`
-	End     int64         `json:"end"`
-	Since   string        `json:"since"` // e.g. "1h", "30m" — if set, overrides Start/End with [now-since, now]
-	Limit   int           `json:"limit"`
-	Queries []queryDef    `json:"queries"`
+	Start   int64      `json:"start"`
+	End     int64      `json:"end"`
+	Since   string     `json:"since"` // e.g. "1h", "30m" — if set, overrides Start/End with [now-since, now]
+	Limit   int        `json:"limit"`
+	Queries []queryDef `json:"queries"`
 }
 
 // resolveTimeRange returns the start/end to use for queries.
@@ -268,10 +268,10 @@ func compareResults(a, b *searchResponse, limit int) string {
 		for i, id := range shown {
 			ns := startNano(m[id])
 			prefix := id
-		if len(prefix) > 16 {
-			prefix = prefix[:16]
-		}
-		strs[i] = fmt.Sprintf("%s@%dms", prefix, ns/1e6)
+			if len(prefix) > 16 {
+				prefix = prefix[:16]
+			}
+			strs[i] = fmt.Sprintf("%s@%dms", prefix, ns/1e6)
 		}
 		return strings.Join(strs, ",") + suffix
 	}

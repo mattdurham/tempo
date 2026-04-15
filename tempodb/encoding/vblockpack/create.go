@@ -19,8 +19,8 @@ import (
 // When cfg.Blockpack.VectorDimension > 0, the writer builds a VectorIndex
 // section in the V5 footer for any __embedding__ columns present in the data.
 func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.BlockMeta,
-	i common.Iterator, r backend.Reader, to backend.Writer) (*backend.BlockMeta, error) {
-
+	i common.Iterator, r backend.Reader, to backend.Writer,
+) (*backend.BlockMeta, error) {
 	// Initialize multi-tier cache on first block creation (no-op if already initialized).
 	ConfigureCache(
 		cfg.Blockpack.FileCachePath,

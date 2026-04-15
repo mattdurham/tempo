@@ -1,0 +1,131 @@
+cache:
+    caches:
+        - memcached:
+            consistent_hash: true
+            host: memcached-01
+            max_idle_conns: 100
+            max_item_size: 5.24288e+06
+            service: memcached-client
+            timeout: 200ms
+          roles:
+            - bloom
+        - memcached:
+            consistent_hash: true
+            host: memcached-01
+            max_idle_conns: 100
+            max_item_size: 5.24288e+06
+            service: memcached-client
+            timeout: 200ms
+          roles:
+            - trace-id-index
+        - memcached:
+            consistent_hash: true
+            host: memcached-01
+            max_idle_conns: 100
+            max_item_size: 5.24288e+06
+            service: memcached-client
+            timeout: 200ms
+          roles:
+            - parquet-footer
+        - memcached:
+            consistent_hash: true
+            host: memcached-frontend-search-01
+            max_idle_conns: 100
+            max_item_size: 1.048576e+06
+            service: memcached-client
+            timeout: 50ms
+          roles:
+            - frontend-search
+        - memcached:
+            consistent_hash: true
+            host: memcached-parquet-page-01
+            max_idle_conns: 100
+            max_item_size: 2.097152e+06
+            service: memcached-client
+            timeout: 200ms
+          roles:
+            - parquet-page
+distributor: {}
+http_api_prefix: /tempo
+memberlist:
+    abort_if_cluster_join_fails: false
+    bind_port: 7946
+    cluster_label: dev-us-east-0.tempo-dev-test-03
+    join_members:
+        - dns+gossip-ring.tempo-dev-test-03.svc.cluster.local.:7946
+memory:
+    automemlimit_enabled: true
+metrics_generator_client:
+    grpc_client_config:
+        max_recv_msg_size: 1.048576e+08
+        max_send_msg_size: 1.048576e+08
+multitenancy_enabled: true
+overrides:
+    ingestion_burst_size_bytes: 2e+07
+    ingestion_rate_limit_bytes: 500000
+    ingestion_rate_strategy: global
+    metrics_generator_native_histogram_max_bucket_number: 60
+    per_tenant_override_config: /overrides/overrides.yaml
+partition_ring_live_store: true
+querier:
+    frontend_worker:
+        frontend_address: query-frontend-discovery.tempo-dev-test-03.svc.cluster.local.:9095
+        grpc_client_config:
+            grpc_compression: ""
+            max_send_msg_size: 1.34217728e+08
+        match_max_concurrent: false
+        parallelism: 3
+    max_concurrent_queries: 50
+    trace_by_id:
+        external:
+            endpoint: http://sampler-querier.tempo-dev-test-03.svc.cluster.local.:3100
+            timeout: 30s
+query_frontend:
+    trace_by_id:
+        external_enabled: true
+server:
+    grpc_server_max_recv_msg_size: 1.048576e+08
+    grpc_server_max_send_msg_size: 1.048576e+08
+    http_listen_port: 3100
+storage:
+    trace:
+        azure:
+            container_name: dev-us-east-0-tempo-dev-test-03
+            hedge_requests_at: 400ms
+        backend: s3
+        block:
+            blockpack:
+                embedding_url: ""
+                embedding_concurrent_batches: 2
+                embedding_batch_size: 128
+                memcache_servers:
+                    - memcached-01.tempo-dev-test-03.svc.cluster.local:11211
+                file_cache_path: /var/tempo/blockpack-cache
+                file_cache_max_bytes: 8589934592  # 8 GiB (80% of 10 GiB emptyDir)
+            version: vblockpack
+        blocklist_poll: 5m
+        blocklist_poll_tenant_concurrency: 1
+        blocklist_poll_tenant_index_builders: 1
+        cache: ""
+        empty_tenant_deletion_age: 24h
+        empty_tenant_deletion_enabled: true
+        gcs:
+            bucket_name: dev-us-east-0-tempo-dev-test-03
+            chunk_buffer_size: 1.048576e+07
+            hedge_requests_at: 400ms
+        memcached: {}
+        pool:
+            max_workers: 400
+            queue_depth: 10000
+        s3:
+            bucket: dev-us-east-0-tempo-dev-test-03
+            endpoint: s3.dualstack.us-east-2.amazonaws.com
+            hedge_requests_at: 400ms
+            list_blocks_concurrency: 30
+        search:
+            cache_control:
+                footer: false
+            read_buffer_count: 32
+            read_buffer_size_bytes: 1.048576e+06
+        wal:
+            path: /var/tempo/wal

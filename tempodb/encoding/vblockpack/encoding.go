@@ -31,26 +31,30 @@ func (e Encoding) NewCompactor(opts common.CompactionOptions) common.Compactor {
 
 // CreateBlock creates a new blockpack block from an iterator
 func (e Encoding) CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.BlockMeta,
-	i common.Iterator, r backend.Reader, to backend.Writer) (*backend.BlockMeta, error) {
+	i common.Iterator, r backend.Reader, to backend.Writer,
+) (*backend.BlockMeta, error) {
 	return CreateBlock(ctx, cfg, meta, i, r, to)
 }
 
 // CreateWALBlock creates a new WAL block for writing
 func (e Encoding) CreateWALBlock(meta *backend.BlockMeta, filepath, dataEncoding string,
-	ingestionSlack time.Duration) (common.WALBlock, error) {
+	ingestionSlack time.Duration,
+) (common.WALBlock, error) {
 	return createWALBlock(meta, filepath, ingestionSlack)
 }
 
 // OpenWALBlock opens an existing WAL block
 func (e Encoding) OpenWALBlock(filename, path string, ingestionSlack, additionalStartSlack time.Duration) (
-	common.WALBlock, error, error) {
+	common.WALBlock, error, error,
+) {
 	return nil, fmt.Errorf("not implemented"), nil
 }
 
 // CopyBlock copies a block from one backend to another, preserving correct
 // block timestamps by reading them from the actual blockpack data.
 func (e Encoding) CopyBlock(ctx context.Context, meta *backend.BlockMeta, from backend.Reader,
-	to backend.Writer) error {
+	to backend.Writer,
+) error {
 	// Read the blockpack data file from source
 	blockID := uuid.UUID(meta.BlockID)
 	data, err := from.Read(ctx, DataFileName, blockID, meta.TenantID, nil)
@@ -78,7 +82,8 @@ func (e Encoding) CopyBlock(ctx context.Context, meta *backend.BlockMeta, from b
 
 // MigrateBlock migrates a block from another format to blockpack
 func (e Encoding) MigrateBlock(ctx context.Context, fromMeta, toMeta *backend.BlockMeta, from backend.Reader,
-	to backend.Writer) error {
+	to backend.Writer,
+) error {
 	return fmt.Errorf("not implemented")
 }
 

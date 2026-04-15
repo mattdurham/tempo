@@ -1,0 +1,72 @@
+backend_scheduler_client:
+    grpc_client_config:
+        max_recv_msg_size: 1.048576e+08
+        max_send_msg_size: 1.048576e+08
+backend_worker:
+    backend_scheduler_addr: backend-scheduler.tempo-dev-test-03.svc.cluster.local.:9095
+    backoff:
+        max_period: 30s
+        max_retries: 30
+        min_period: 1s
+    compaction:
+        block_retention: 720h
+        compaction_cycle: 1s
+        compaction_window: 15m
+        max_block_bytes: 8e+09
+        max_compaction_objects: 3e+06
+    ring:
+        kvstore:
+            store: memberlist
+        wait_stability_max_duration: 100s
+        wait_stability_min_duration: 10s
+distributor: {}
+http_api_prefix: /tempo
+memberlist:
+    abort_if_cluster_join_fails: false
+    bind_port: 7946
+    cluster_label: dev-us-east-0.tempo-dev-test-03
+    join_members:
+        - dns+gossip-ring.tempo-dev-test-03.svc.cluster.local.:7946
+memory:
+    automemlimit_enabled: true
+multitenancy_enabled: true
+overrides:
+    ingestion_burst_size_bytes: 2e+07
+    ingestion_rate_limit_bytes: 500000
+    ingestion_rate_strategy: global
+    metrics_generator_native_histogram_max_bucket_number: 60
+    per_tenant_override_config: /overrides/overrides.yaml
+server:
+    grpc_server_max_recv_msg_size: 1.572864e+07
+    grpc_server_max_send_msg_size: 1.572864e+07
+    http_listen_port: 3100
+storage:
+    trace:
+        azure:
+            container_name: dev-us-east-0-tempo-dev-test-03
+        backend: s3
+        block:
+            blockpack:
+                max_output_file_size: 10737418240
+                vector_dimension: 384
+                memcache_servers:
+                    - memcached-01.tempo-dev-test-03.svc.cluster.local:11211
+            version: vblockpack
+        blocklist_poll: "0"
+        blocklist_poll_tenant_concurrency: 1
+        blocklist_poll_tenant_index_builders: 1
+        cache: ""
+        empty_tenant_deletion_age: 24h
+        empty_tenant_deletion_enabled: true
+        gcs:
+            bucket_name: dev-us-east-0-tempo-dev-test-03
+            chunk_buffer_size: 1.048576e+07
+        memcached: {}
+        pool:
+            queue_depth: 2000
+        s3:
+            bucket: dev-us-east-0-tempo-dev-test-03
+            endpoint: s3.dualstack.us-east-2.amazonaws.com
+            list_blocks_concurrency: 30
+        wal:
+            path: /var/tempo/wal

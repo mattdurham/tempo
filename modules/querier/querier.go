@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/go-kit/log/level"
 	httpgrpc_server "github.com/grafana/dskit/httpgrpc/server"

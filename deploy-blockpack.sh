@@ -77,6 +77,10 @@ kubectl set image deployment/querier -n "$NAMESPACE" "querier=${IMAGE}"
 # Without it, the cache is unbounded and querier pods OOMKill after a few M8 histogram queries.
 # Format must be GiB (not Gi) — Go runtime panics on malformed GOMEMLIMIT.
 kubectl set env deployment/querier -n "$NAMESPACE" "GOMEMLIMIT=13GiB"
+# Add 10 Gi emptyDir for blockpack disk cache (file_cache_path: /var/tempo/blockpack-cache).
+# Strategic merge patch is idempotent — safe to re-apply on every deploy.
+kubectl patch deployment/querier -n "$NAMESPACE" --type=strategic -p \
+    '{"spec":{"template":{"spec":{"volumes":[{"name":"blockpack-cache","emptyDir":{"sizeLimit":"10Gi"}}],"containers":[{"name":"querier","volumeMounts":[{"name":"blockpack-cache","mountPath":"/var/tempo/blockpack-cache"}]}]}}}}'
 kubectl rollout restart deployment/querier -n "$NAMESPACE"
 
 echo "--- Updating query-frontend ---"
