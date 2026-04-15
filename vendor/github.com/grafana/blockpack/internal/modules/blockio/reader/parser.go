@@ -767,11 +767,10 @@ func (r *Reader) ensureV14BloomSection() error {
 // readHeader reads the 22-byte file header at footer.headerOffset.
 // Layout: magic[4] + version[1] + metadataOffset[8] + metadataLen[8] + signalType[1].
 func (r *Reader) readHeader() error {
-	const headerSize = 22
 	cacheKey := r.fileID + "/header"
 
 	buf, err := r.cache.GetOrFetch(cacheKey, func() ([]byte, error) {
-		b := make([]byte, headerSize)
+		b := make([]byte, shared.FileHeaderV13Size)
 		n, readErr := r.provider.ReadAt(
 			b,
 			int64(r.headerOffset), //nolint:gosec // safe: headerOffset is a file offset, fits in int64
@@ -780,7 +779,7 @@ func (r *Reader) readHeader() error {
 		if readErr != nil {
 			return nil, fmt.Errorf("readHeader: %w", readErr)
 		}
-		if n != headerSize {
+		if n != int(shared.FileHeaderV13Size) {
 			return nil, fmt.Errorf("readHeader: short read: %d bytes", n)
 		}
 		return b, nil

@@ -290,6 +290,7 @@ type LogMetricOptions struct {
 	// Contrast with QueryOptions.EndNano (uint64) where 0 is treated as unbounded.
 	EndNano int64
 	// StepNano is the time bucket step size in nanoseconds (default: 60 seconds).
+	// Values <= 0 are treated as the default (60 seconds). Negative values are not an error.
 	StepNano int64
 }
 
@@ -314,6 +315,14 @@ func ExecuteMetricsLogQL(r *Reader, logqlQuery string, opts LogMetricOptions) (r
 
 	if r == nil {
 		return nil, fmt.Errorf("ExecuteMetricsLogQL: reader cannot be nil")
+	}
+
+	// Mirror the guard in ExecuteMetricsTraceQL: reject inverted time ranges early.
+	if opts.StartNano > opts.EndNano {
+		return nil, fmt.Errorf(
+			"ExecuteMetricsLogQL: StartNano (%d) must not exceed EndNano (%d)",
+			opts.StartNano, opts.EndNano,
+		)
 	}
 
 	lq, parseErr := logqlparser.ParseQuery(logqlQuery)
@@ -399,6 +408,7 @@ type TraceMetricOptions struct {
 	// Contrast with QueryOptions.EndNano (uint64) where 0 is treated as unbounded.
 	EndNano int64
 	// StepNano is the time bucket step size in nanoseconds (default: 60 seconds).
+	// Values <= 0 are treated as the default (60 seconds). Negative values are not an error.
 	StepNano int64
 }
 

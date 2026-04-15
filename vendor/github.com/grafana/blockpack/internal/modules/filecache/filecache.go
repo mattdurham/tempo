@@ -21,6 +21,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -145,12 +146,26 @@ func filecacheRegisterOrReuse(reg prometheus.Registerer, cv *prometheus.CounterV
 	return cv
 }
 
+// loadCandidate is a transient struct used during load to collect entries before
+// assigning monotonic order counters.
+type loadCandidate struct {
+	path  string
+	key   string
+	size  int64
+	mtime int64 // UnixNano; used only for sorting
+}
+
 // load scans dir and rebuilds the in-memory index from existing cache files.
-// FIFO ordering after restart is approximated by file mtime: entries modified
-// earlier receive a lower order value, preserving approximate insertion order.
+// FIFO ordering after restart is approximated by file mtime: entries are
+// sorted by (mtime, filename) before strictly-monotonic seq counters are
+// assigned. The two-key sort ensures a stable, deterministic eviction order
+// even on 1-second-resolution filesystems where multiple files can share an
+// identical mtime.
 // Orphaned .tmp files (from interrupted writes) are deleted on load.
 func (c *FileCache) load() error {
-	return filepath.WalkDir(c.dir, func(path string, d os.DirEntry, err error) error {
+	var candidates []loadCandidate
+
+	walkErr := filepath.WalkDir(c.dir, func(path string, d os.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return err
 		}
@@ -177,37 +192,50 @@ func (c *FileCache) load() error {
 			return nil
 		}
 
-		size := int64(len(key)) + valueSize
-		if _, exists := c.index[key]; exists {
-			// Duplicate (shouldn't happen); remove the extra file.
-			_ = os.Remove(path) //nolint:gosec // G122: path comes from trusted WalkDir, no symlink risk
-			return nil
-		}
-
-		// Use mtime as a proxy for insertion order so that FIFO eviction is
-		// approximately correct after a restart (files written earlier have a
-		// lower mtime and therefore a lower order value).
 		info, statErr := d.Info()
 		if statErr != nil {
 			_ = os.Remove(path) //nolint:gosec // G122: path comes from trusted WalkDir, no symlink risk
 			return nil          //nolint:nilerr
 		}
-		orderKey := uint64(info.ModTime().UnixNano()) //nolint:gosec
 
-		// Keep c.seq ahead of all loaded order values so that new entries
-		// written after restart always sort after existing ones in FIFO eviction.
-		if orderKey >= c.seq {
-			c.seq = orderKey + 1
-		}
-		c.index[key] = &entry{
-			filename: path,
-			key:      key,
-			order:    orderKey,
-			size:     size,
-		}
-		c.curBytes += size
+		candidates = append(candidates, loadCandidate{
+			path:  path,
+			key:   key,
+			size:  int64(len(key)) + valueSize,
+			mtime: info.ModTime().UnixNano(),
+		})
 		return nil
 	})
+	if walkErr != nil {
+		return walkErr
+	}
+
+	// Sort by (mtime, filename) for stable FIFO ordering on low-resolution filesystems.
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].mtime != candidates[j].mtime {
+			return candidates[i].mtime < candidates[j].mtime
+		}
+		return candidates[i].path < candidates[j].path
+	})
+
+	// Assign strictly-monotonic order counters and build the index.
+	for i := range candidates {
+		cand := &candidates[i]
+		if _, exists := c.index[cand.key]; exists {
+			// Duplicate (shouldn't happen); remove the extra file.
+			_ = os.Remove(cand.path) //nolint:gosec // G122: path comes from trusted WalkDir, no symlink risk
+			continue
+		}
+		c.seq++
+		c.index[cand.key] = &entry{
+			filename: cand.path,
+			key:      cand.key,
+			order:    c.seq,
+			size:     cand.size,
+		}
+		c.curBytes += cand.size
+	}
+	return nil
 }
 
 // Close is a no-op for the file-per-entry implementation (no database handle).
@@ -236,9 +264,15 @@ func (c *FileCache) Get(key string) ([]byte, bool, error) {
 
 	val, err := readFileValue(e.filename)
 	if err != nil {
-		// On ENOENT (file deleted externally) treat as a miss and clean up.
-		// On other errors (permissions, corruption) also treat as miss — the
-		// stale index entry is removed so the next call retriggers the fetch.
+		if !errors.Is(err, os.ErrNotExist) {
+			// Real I/O error (permissions, corruption, partial read) — propagate so
+			// callers can detect the problem rather than silently re-fetching forever.
+			if c.errs != nil {
+				c.errs.WithLabelValues("disk").Inc()
+			}
+			return nil, false, fmt.Errorf("filecache: read %s: %w", e.filename, err)
+		}
+		// ErrNotExist: file deleted externally — true miss, clean up stale index entry.
 		c.mu.Lock()
 		if cur, still := c.index[key]; still && cur == e {
 			delete(c.index, key)

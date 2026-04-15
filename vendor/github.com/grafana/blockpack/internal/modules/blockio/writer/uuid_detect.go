@@ -4,16 +4,25 @@ package writer
 
 import "encoding/hex"
 
+// RFC 4122 UUID format constants.
+const (
+	uuidLen   = 36 // total length of a UUID string including dashes
+	uuidDash1 = 8  // position of first dash
+	uuidDash2 = 13 // position of second dash
+	uuidDash3 = 18 // position of third dash
+	uuidDash4 = 23 // position of fourth dash
+)
+
 // isUUID returns true if s is a valid RFC 4122 UUID (36 chars, dashes at positions
 // 8, 13, 18, 23; remaining characters are hex digits).
 func isUUID(s string) bool {
-	if len(s) != 36 {
+	if len(s) != uuidLen {
 		return false
 	}
 
 	for i, c := range s {
 		switch i {
-		case 8, 13, 18, 23:
+		case uuidDash1, uuidDash2, uuidDash3, uuidDash4:
 			if c != '-' {
 				return false
 			}

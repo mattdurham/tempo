@@ -4,15 +4,12 @@ package executor
 
 import (
 	"cmp"
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
-	"maps"
-	"runtime"
 	"slices"
 	"time"
-
-	"golang.org/x/sync/errgroup"
 
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
 	modules_shared "github.com/grafana/blockpack/internal/modules/blockio/shared"
@@ -25,8 +22,9 @@ import (
 // NOTE-038: sentinel error for fallback from intrinsic pre-filter to block scan.
 var errNeedBlockScan = errors.New("intrinsic fast path not applicable")
 
-// errLimitReached is used as an early-stop sentinel inside forEachBlockInGroups callbacks.
-// It signals that the results limit has been satisfied; it is never returned to callers.
+// errLimitReached is used as an early-stop sentinel inside block-scan pipeline callbacks
+// (scanBlocks, forEachBlockInGroups, collectMixedPlain). It signals that the results limit
+// has been satisfied. It is never returned to callers; blockGroupPipeline translates it to nil.
 var errLimitReached = errors.New("limit reached")
 
 // SortScanThreshold is the max number of matching refs for which the KLL path
@@ -281,14 +279,6 @@ func Collect(
 	// SPEC-STREAM-2: Partition selected blocks into ~8 MB coalesced groups for lazy batched I/O.
 	groups := r.CoalescedGroups(plan.SelectedBlocks)
 
-	// Map blockIdx -> group index for lazy fetching.
-	blockToGroup := make(map[int]int, len(plan.SelectedBlocks))
-	for gi, g := range groups {
-		for _, bi := range g.BlockIDs {
-			blockToGroup[bi] = gi
-		}
-	}
-
 	// --- Block-scan step ---
 	scanStart := time.Now()
 	var fetchedGroups int
@@ -316,7 +306,6 @@ func Collect(
 			plan,
 			buf,
 			groups,
-			blockToGroup,
 			backward,
 		)
 		if scanErr != nil {
@@ -331,14 +320,10 @@ func Collect(
 		if opts.Limit > 0 {
 			results = make([]MatchedRow, 0, opts.Limit)
 		}
-		fetched := make(map[int][]byte, len(plan.SelectedBlocks))
-		fetchedGroupsSeen := make(map[int]struct{}, len(groups))
 		var scanErr error
 		fetchedGroups, fetchedBlocks, bytesRead, scanErr = scanBlocks(
 			r, program, wantColumns, secondPassCols, opts,
-			plan.SelectedBlocks, groups, blockToGroup,
-			fetched, fetchedGroupsSeen,
-			&results,
+			plan.SelectedBlocks, groups, &results,
 		)
 		if scanErr != nil {
 			qs.TotalDuration = time.Since(queryStart)
@@ -374,13 +359,14 @@ func shouldUseTopKPath(opts CollectOptions, program *vm.Program) bool {
 	return opts.TimestampColumn != "" && opts.Limit > 0 && !program.HasVector
 }
 
-// scanBlocks iterates over selectedBlocks in order, lazily fetching coalesced groups,
-// evaluating the program predicate, and appending matched rows to results.
-// Returns the number of blocks fetched from storage, approximate bytes read, and any error.
+// scanBlocks iterates over selectedBlocks in order, concurrently fetching coalesced groups
+// via blockGroupPipeline, evaluating the program predicate, and appending matched rows.
+// Returns the number of groups fetched from storage, total blocks fetched, bytes read, and any error.
 //
 // SPEC-STREAM-2: Each group is fetched at most once (~8 MB coalesced I/O).
 // SPEC-STREAM-3: fetchedGroups counts ReadGroup calls; fetchedBlocks counts individual blocks fetched.
 // Groups that are never fetched (due to early stop) are not counted in either.
+// SPEC-STREAM-11: I/O is concurrent across defaultPipelineWorkers goroutines; parse is sequential.
 func scanBlocks(
 	r *modules_reader.Reader,
 	program *vm.Program,
@@ -389,162 +375,147 @@ func scanBlocks(
 	opts CollectOptions,
 	selectedBlocks []int,
 	groups []modules_shared.CoalescedRead,
-	blockToGroup map[int]int,
-	fetched map[int][]byte,
-	fetchedGroupsSeen map[int]struct{},
 	results *[]MatchedRow,
 ) (int, int, int64, error) {
-	fetchedGroups := 0
-	fetchedBlocks := 0
-	var bytesRead int64
-
-	for _, blockIdx := range selectedBlocks {
-		gi, ok := blockToGroup[blockIdx]
+	// Pre-build a blockToGroup map and a groupToBlocks index (maintaining selectedBlocks order)
+	// so processGroup iterates only the ~N/G blocks relevant to its group rather than all N.
+	// This restores O(N) total work across all groups (O(N/G) per group × G groups).
+	blockToGroup := make(map[int]int, len(selectedBlocks))
+	for gi, g := range groups {
+		for _, bi := range g.BlockIDs {
+			blockToGroup[bi] = gi
+		}
+	}
+	groupToBlocks := make([][]int, len(groups))
+	for _, bi := range selectedBlocks {
+		gi, ok := blockToGroup[bi]
 		if !ok {
 			continue
 		}
+		groupToBlocks[gi] = append(groupToBlocks[gi], bi)
+	}
 
-		// Lazy group fetch: guarded by fetchedGroupsSeen for early-stop support.
-		// SPEC-STREAM-3: fetchedGroups counts ReadGroup calls (IOOps); fetchedBlocks counts
-		// individual blocks. Groups never fetched (early stop) are not counted in either.
-		if _, seen := fetchedGroupsSeen[gi]; !seen {
-			groupRaw, fetchErr := r.ReadGroup(groups[gi])
-			if fetchErr != nil {
-				return fetchedGroups, fetchedBlocks, bytesRead, fmt.Errorf("ReadGroup: %w", fetchErr)
+	// processGroup is called sequentially (never concurrently) by blockGroupPipeline.
+	// It iterates groupToBlocks[groupIdx] — blocks in selectedBlocks order for this group only.
+	// This preserves block-then-row traversal order (SPEC-STREAM-2, §4.2 match ordering).
+	processGroup := func(groupIdx int, groupRaw map[int][]byte) error {
+		for _, blockIdx := range groupToBlocks[groupIdx] {
+			raw, ok := groupRaw[blockIdx]
+			if !ok {
+				continue
 			}
-			maps.Copy(fetched, groupRaw)
-			for _, bi := range groups[gi].BlockIDs {
-				bytesRead += int64(r.BlockMeta(bi).Length) //nolint:gosec // Length is block size, safe to cast
+			// Free raw bytes immediately after access — avoids retaining the full
+			// coalesced group in memory for the duration of the block scan loop.
+			delete(groupRaw, blockIdx)
+
+			meta := r.BlockMeta(blockIdx)
+			r.ResetInternStrings()
+
+			// NOTE-006: Acquire a pooled intern map for this block's lifetime. The map must
+			// remain alive through both parse passes and the entire row-emission loop, because
+			// lazy columns (registered during first pass) call decodeNow() during row iteration
+			// and reference the intern map. Release after streamSortedRows completes.
+			internPtr := modules_reader.AcquireInternMap()
+			intern := *internPtr
+
+			bwb, parseErr := r.ParseBlockFromBytesWithIntern(raw, wantColumns, meta, intern)
+			if parseErr != nil {
+				modules_reader.ReleaseInternMap(internPtr)
+				return fmt.Errorf("ParseBlockFromBytes block %d: %w", blockIdx, parseErr)
 			}
-			fetchedGroups++
-			fetchedBlocks += len(groups[gi].BlockIDs)
-			fetchedGroupsSeen[gi] = struct{}{}
-		}
 
-		raw, rawOK := fetched[blockIdx]
-		if !rawOK {
-			continue
-		}
-		// Free raw bytes immediately after parsing to avoid retaining the entire
-		// coalesced group in memory for the duration of the scan.
-		delete(fetched, blockIdx)
-
-		meta := r.BlockMeta(blockIdx)
-		r.ResetInternStrings()
-
-		// NOTE-006: Acquire a pooled intern map for this block's lifetime. The map must
-		// remain alive through both parse passes and the entire row-emission loop, because
-		// lazy columns (registered during first pass) call decodeNow() during row iteration
-		// and reference the intern map. Release after streamSortedRows completes.
-		internPtr := modules_reader.AcquireInternMap()
-		intern := *internPtr
-
-		bwb, parseErr := r.ParseBlockFromBytesWithIntern(raw, wantColumns, meta, intern)
-		if parseErr != nil {
-			modules_reader.ReleaseInternMap(internPtr)
-			return fetchedGroups, fetchedBlocks, bytesRead, fmt.Errorf(
-				"ParseBlockFromBytes block %d: %w",
-				blockIdx,
-				parseErr,
-			)
-		}
-
-		provider := newBlockColumnProvider(bwb.Block)
-		// Only strip intrinsic predicates when the file has an intrinsic section.
-		// Log files do not have an intrinsic section; their block columns still hold
-		// all label values and ColumnPredicate must evaluate them directly.
-		var rowSet vm.RowSet
-		var evalErr error
-		if r.HasIntrinsicSection() {
-			uap := userAttrProgram(program)
-			if uap == nil {
-				rowSet = provider.FullScan()
+			provider := newBlockColumnProvider(bwb.Block)
+			// Only strip intrinsic predicates when the file has an intrinsic section.
+			// Log files do not have an intrinsic section; their block columns still hold
+			// all label values and ColumnPredicate must evaluate them directly.
+			var rowSet vm.RowSet
+			var evalErr error
+			if r.HasIntrinsicSection() {
+				uap := userAttrProgram(program)
+				if uap == nil {
+					rowSet = provider.FullScan()
+				} else {
+					rowSet, evalErr = uap.ColumnPredicate(provider)
+				}
 			} else {
-				rowSet, evalErr = uap.ColumnPredicate(provider)
+				rowSet, evalErr = program.ColumnPredicate(provider)
 			}
-		} else {
-			rowSet, evalErr = program.ColumnPredicate(provider)
-		}
-		if evalErr != nil {
-			modules_reader.ReleaseInternMap(internPtr)
-			return fetchedGroups, fetchedBlocks, bytesRead, fmt.Errorf(
-				"ColumnPredicate block %d: %w",
-				blockIdx,
-				evalErr,
-			)
-		}
+			if evalErr != nil {
+				modules_reader.ReleaseInternMap(internPtr)
+				return fmt.Errorf("ColumnPredicate block %d: %w", blockIdx, evalErr)
+			}
 
-		if rowSet.Size() == 0 {
-			modules_reader.ReleaseInternMap(internPtr)
-			continue
-		}
-
-		// Post-filter rowSet against any intrinsic predicates stripped by userAttrProgram.
-		// Only applies when the file has an intrinsic section (trace files with new storage format).
-		// Log files and legacy files evaluate intrinsic predicates directly via ColumnPredicate above.
-		intrNodes := programIntrinsicNodes(program)
-		if len(intrNodes) > 0 && r.HasIntrinsicSection() {
-			rowSet = filterRowSetByIntrinsicNodes(r, blockIdx, rowSet, intrNodes)
 			if rowSet.Size() == 0 {
 				modules_reader.ReleaseInternMap(internPtr)
 				continue
 			}
-		}
 
-		// NOTE-018: Second pass — decode result columns now that we know this block has matches.
-		// NOTE-028: secondPassCols is pre-computed above (searchMetaColumns ∪ wantColumns, or nil for all).
-		if wantColumns != nil {
-			bwb, parseErr = r.ParseBlockFromBytesWithIntern(bwb.RawBytes, secondPassCols, meta, intern)
-			if parseErr != nil {
+			// Post-filter rowSet against any intrinsic predicates stripped by userAttrProgram.
+			// Only applies when the file has an intrinsic section (trace files with new storage format).
+			// Log files and legacy files evaluate intrinsic predicates directly via ColumnPredicate above.
+			intrNodes := programIntrinsicNodes(program)
+			if len(intrNodes) > 0 && r.HasIntrinsicSection() {
+				rowSet = filterRowSetByIntrinsicNodes(r, blockIdx, rowSet, intrNodes)
+				if rowSet.Size() == 0 {
+					modules_reader.ReleaseInternMap(internPtr)
+					continue
+				}
+			}
+
+			// NOTE-018: Second pass — decode result columns now that we know this block has matches.
+			// NOTE-028: secondPassCols is pre-computed above (searchMetaColumns ∪ wantColumns, or nil for all).
+			if wantColumns != nil {
+				bwb, parseErr = r.ParseBlockFromBytesWithIntern(bwb.RawBytes, secondPassCols, meta, intern)
+				if parseErr != nil {
+					modules_reader.ReleaseInternMap(internPtr)
+					return fmt.Errorf("ParseBlockFromBytes (second pass) block %d: %w", blockIdx, parseErr)
+				}
+			}
+
+			// Vector post-filter: when the query has a VectorScorer, score only the candidate
+			// rows (survivors of ColumnPredicate + intrinsic filter) via point lookup.
+			// Non-vector queries take the streamSortedRows path unchanged.
+			if program.VectorScorer != nil {
+				scoredRows := applyVectorScorerToBlock(bwb.Block, program, rowSet)
 				modules_reader.ReleaseInternMap(internPtr)
-				return fetchedGroups, fetchedBlocks, bytesRead, fmt.Errorf(
-					"ParseBlockFromBytes (second pass) block %d: %w",
-					blockIdx,
-					parseErr,
-				)
+				for _, sr := range scoredRows {
+					*results = append(*results, MatchedRow{
+						Block:    bwb.Block,
+						BlockIdx: blockIdx,
+						RowIdx:   sr.RowIdx,
+						Score:    sr.Score,
+					})
+				}
+				continue
 			}
-		}
 
-		// Vector post-filter: when the query has a VectorScorer, score only the candidate
-		// rows (survivors of ColumnPredicate + intrinsic filter) via point lookup.
-		// Non-vector queries take the streamSortedRows path unchanged.
-		if program.VectorScorer != nil {
-			scoredRows := applyVectorScorerToBlock(bwb.Block, program, rowSet)
+			// NOTE: rowSet is not used after ToSlice() — safe to sort in-place without clone.
+			// streamSortedRows sorts and reverses rows in-place via slices.SortFunc and index swap,
+			// which mutates the backing slice returned by ToSlice(). This is intentional: rowSet
+			// is never accessed again (no Contains calls) after this point in scanBlocks.
+			// If rowSet reuse is added in future, restore slices.Clone here to preserve the
+			// ascending-sorted invariant required by rowSet.Contains.
+			rows := rowSet.ToSlice()
+
+			// SPEC-STREAM-5: Sort rows by per-row timestamp when TimestampColumn is set.
+			var tsCol *modules_reader.Column
+			if opts.TimestampColumn != "" {
+				tsCol = bwb.Block.GetColumn(opts.TimestampColumn)
+			}
+
+			stop := streamSortedRows(bwb.Block, blockIdx, rows, tsCol, opts, results)
+			// Release intern map after all lazy decodes in streamSortedRows are complete.
 			modules_reader.ReleaseInternMap(internPtr)
-			for _, sr := range scoredRows {
-				*results = append(*results, MatchedRow{
-					Block:    bwb.Block,
-					BlockIdx: blockIdx,
-					RowIdx:   sr.RowIdx,
-					Score:    sr.Score,
-				})
+			if stop {
+				return errLimitReached
 			}
-			continue
 		}
-
-		// NOTE: rowSet is not used after ToSlice() — safe to sort in-place without clone.
-		// streamSortedRows sorts and reverses rows in-place via slices.SortFunc and index swap,
-		// which mutates the backing slice returned by ToSlice(). This is intentional: rowSet
-		// is never accessed again (no Contains calls) after this point in scanBlocks.
-		// If rowSet reuse is added in future, restore slices.Clone here to preserve the
-		// ascending-sorted invariant required by rowSet.Contains.
-		rows := rowSet.ToSlice()
-
-		// SPEC-STREAM-5: Sort rows by per-row timestamp when TimestampColumn is set.
-		var tsCol *modules_reader.Column
-		if opts.TimestampColumn != "" {
-			tsCol = bwb.Block.GetColumn(opts.TimestampColumn)
-		}
-
-		stop := streamSortedRows(bwb.Block, blockIdx, rows, tsCol, opts, results)
-		// Release intern map after all lazy decodes in streamSortedRows are complete.
-		modules_reader.ReleaseInternMap(internPtr)
-		if stop {
-			return fetchedGroups, fetchedBlocks, bytesRead, nil
-		}
+		return nil
 	}
 
-	return fetchedGroups, fetchedBlocks, bytesRead, nil
+	// SPEC-STREAM-11: concurrent I/O via blockGroupPipeline; processGroup called sequentially.
+	// TODO: propagate caller context (NOTE-058: Collect does not yet accept context.Context).
+	return blockGroupPipeline(context.Background(), r, groups, defaultPipelineWorkers, processGroup)
 }
 
 // streamSortedRows sorts rows by timestamp (when tsCol is non-nil) or reverses them
@@ -786,6 +757,14 @@ func groupRefsByBlock(refs []modules_shared.BlockRef) (blockOrder []int, blockRo
 // and invokes fn for each successfully parsed block with its candidate row indices.
 // If fn returns a non-nil error, iteration stops and that error is returned.
 // callerName is used only for error context strings.
+//
+// SPEC-STREAM-11: I/O is concurrent across defaultPipelineWorkers goroutines; parse is sequential.
+//
+// SPEC-STREAM-12: Second-pass decode gate.
+// When preFn is non-nil it is called after the first-pass decode with the parsed block and
+// candidate row indices. If preFn returns false, the second-pass decode and fn are both
+// skipped for that block. When preFn is nil it is not called and the second-pass decode
+// proceeds as usual (preserves behavior for intrinsic-only callers).
 func forEachBlockInGroups(
 	r *modules_reader.Reader,
 	blockOrder []int,
@@ -793,6 +772,7 @@ func forEachBlockInGroups(
 	wantColumns map[string]struct{},
 	secondPassCols map[string]struct{},
 	callerName string,
+	preFn func(pb parsedBlock, candidateRows []int) bool,
 	fn func(pb parsedBlock, candidateRows []int) error,
 ) error {
 	groups := r.CoalescedGroups(blockOrder)
@@ -800,53 +780,31 @@ func forEachBlockInGroups(
 		return nil
 	}
 
-	// Phase 1: fetch all groups in parallel (ARCH-003).
-	// I/O is parallelised here; Phase 2 remains single-goroutine because
-	// Reader.ParseBlockFromBytes is not concurrency-safe on the same Reader.
-	//
-	// Note: all groups are pre-fetched before Phase 2 begins. If fn returns an
-	// error (e.g. errLimitReached) during Phase 2, the remaining fetched group
-	// data is discarded — S3 reads for those groups have already been issued.
-	// For forEachBlockInGroups (Case A equality path) refs cluster in 1–3 blocks,
-	// so at most 1–2 groups are pre-fetched in practice; the over-fetch cost is low.
-	type fetchResult struct {
-		data map[int][]byte
-		err  error
-	}
-	fetched := make([]fetchResult, len(groups))
-	// OOM guard: bound parallel I/O goroutines to NumCPU to prevent unbounded
-	// goroutine fan-out when groups is large (e.g. many disjoint block reads).
-	eg := &errgroup.Group{}
-	eg.SetLimit(runtime.NumCPU())
-	for i, group := range groups {
-		i, group := i, group // capture loop variables for goroutine closure
-		eg.Go(func() error {
-			data, err := r.ReadGroup(group)
-			fetched[i] = fetchResult{data: data, err: err}
-			return err
-		})
-	}
-	if err := eg.Wait(); err != nil {
-		return fmt.Errorf("%s ReadGroup parallel fetch: %w", callerName, err)
-	}
-
-	// Phase 2: parse and invoke fn sequentially.
-	// Reader.ParseBlockFromBytes is not safe for concurrent use on the same Reader.
-	for i, group := range groups {
-		if fetched[i].err != nil {
-			return fmt.Errorf("%s ReadGroup: %w", callerName, fetched[i].err)
-		}
-		for _, blockIdx := range group.BlockIDs {
-			candidateRows := blockCandidates[blockIdx]
-			raw, ok := fetched[i].data[blockIdx]
+	// processGroup is called sequentially (never concurrently) by blockGroupPipeline.
+	// Reader.ParseBlockFromBytes is not concurrency-safe; sequential invocation is required.
+	// NOTE-048: ParseBlockFromBytes allocates a fresh local intern map per call.
+	// Iterate groups[groupIdx].BlockIDs (not range groupRaw) to preserve deterministic
+	// block-processing order within a group, matching the pre-migration behavior.
+	processGroup := func(groupIdx int, groupRaw map[int][]byte) error {
+		for _, blockIdx := range groups[groupIdx].BlockIDs {
+			raw, ok := groupRaw[blockIdx]
 			if !ok {
 				continue
 			}
+			candidateRows := blockCandidates[blockIdx]
 			meta := r.BlockMeta(blockIdx)
 			r.ResetInternStrings()
 			bwb, parseErr := r.ParseBlockFromBytes(raw, wantColumns, meta)
 			if parseErr != nil {
 				return fmt.Errorf("%s ParseBlockFromBytes block %d: %w", callerName, blockIdx, parseErr)
+			}
+			pb := parsedBlock{Block: bwb.Block, BlockIdx: blockIdx}
+			// SPEC-STREAM-12: gate second-pass decode on preFn result.
+			// When preFn is non-nil, call it with the first-pass block; skip the
+			// second-pass decode and fn entirely if it returns false.
+			if preFn != nil && !preFn(pb, candidateRows) {
+				delete(groupRaw, blockIdx)
+				continue
 			}
 			// M-18: Skip second parse when candidateRows is empty — no rows passed the first-pass
 			// predicate, so decoding additional columns would produce no output for this block.
@@ -855,20 +813,25 @@ func forEachBlockInGroups(
 				if parseErr != nil {
 					return fmt.Errorf("%s second pass block %d: %w", callerName, blockIdx, parseErr)
 				}
+				pb = parsedBlock{Block: bwb.Block, BlockIdx: blockIdx}
 			}
 			// Release raw bytes now. Safety: bwb (the local variable) holds a strong
 			// reference to bwb.RawBytes, which keeps the backing array alive through the
 			// fn call below. Lazily-decoded columns (NOTE-001 rawEncoding) slice into
-			// RawBytes via bwb, not via the fetched map entry — the delete is safe.
-			// Mirrors scanBlocks' delete(fetched, blockIdx); lets GC reclaim block bytes
-			// before the next group is processed. NOTE-048.
-			delete(fetched[i].data, blockIdx)
-			if err := fn(parsedBlock{Block: bwb.Block, BlockIdx: blockIdx}, candidateRows); err != nil {
+			// RawBytes via bwb, not via the raw map entry — the delete is safe.
+			// Lets GC reclaim block bytes before the next group is processed. NOTE-048.
+			delete(groupRaw, blockIdx)
+			if err := fn(pb, candidateRows); err != nil {
 				return err
 			}
 		}
+		return nil
 	}
-	return nil
+
+	// SPEC-STREAM-11: concurrent I/O via blockGroupPipeline; processGroup called sequentially.
+	// TODO: propagate caller context (NOTE-058: forEachBlockInGroups callers do not yet accept context.Context).
+	_, _, _, err := blockGroupPipeline(context.Background(), r, groups, defaultPipelineWorkers, processGroup)
+	return err
 }
 
 // collectIntrinsicPlain handles Case A: pure intrinsic + no sort.
@@ -910,7 +873,7 @@ func collectIntrinsicPlain(
 	// and returns MatchedRow.Block populated. O(M) where M is the result count.
 	blockOrder, blockCandidates := groupRefsByBlock(refs)
 	results := make([]MatchedRow, 0, len(refs))
-	err := forEachBlockInGroups(r, blockOrder, blockCandidates, wantColumns, secondPassCols, "collectIntrinsicPlain",
+	err := forEachBlockInGroups(r, blockOrder, blockCandidates, wantColumns, secondPassCols, "collectIntrinsicPlain", nil,
 		func(pb parsedBlock, candidateRows []int) error {
 			for _, rowIdx := range candidateRows {
 				results = append(results, MatchedRow{
@@ -972,7 +935,7 @@ func collectIntrinsicTopK(
 	slices.SortFunc(selected, blockRefCompare)
 	blockOrder, blockCandidates := groupRefsByBlock(selected)
 	results := make([]MatchedRow, 0, len(selected))
-	err = forEachBlockInGroups(r, blockOrder, blockCandidates, wantColumns, secondPassCols, "collectIntrinsicTopK",
+	err = forEachBlockInGroups(r, blockOrder, blockCandidates, wantColumns, secondPassCols, "collectIntrinsicTopK", nil,
 		func(pb parsedBlock, candidateRows []int) error {
 			for _, rowIdx := range candidateRows {
 				results = append(results, MatchedRow{
@@ -1244,30 +1207,41 @@ func collectMixedPlain(
 		resultsCap = opts.Limit
 	}
 	results := make([]MatchedRow, 0, resultsCap)
+	// rowSet and preFnErr are shared between preFn (which evaluates the predicate) and fn
+	// (which intersects). processGroup is called sequentially so no lock is needed.
+	var mixedPlainRowSet vm.RowSet
+	var mixedPlainPreFnErr error
 	// Coalesce all candidate blocks for efficient batch I/O.
 	err := forEachBlockInGroups(r, blockOrder, blockCandidates, wantColumns, secondPassCols, "collectMixedPlain",
-		func(pb parsedBlock, candidateRows []int) error {
-			// Re-evaluate the full predicate against this block.
+		func(pb parsedBlock, candidateRows []int) bool {
+			// Re-evaluate the full predicate on the first-pass block to gate second-pass decode.
 			provider := newBlockColumnProvider(pb.Block)
-			var rowSet vm.RowSet
-			var evalErr error
+			mixedPlainPreFnErr = nil
 			if r.HasIntrinsicSection() {
 				uap := userAttrProgram(program)
 				if uap == nil {
-					rowSet = provider.FullScan()
+					mixedPlainRowSet = provider.FullScan()
 				} else {
-					rowSet, evalErr = uap.ColumnPredicate(provider)
+					mixedPlainRowSet, mixedPlainPreFnErr = uap.ColumnPredicate(provider)
 				}
 			} else {
-				rowSet, evalErr = program.ColumnPredicate(provider)
+				mixedPlainRowSet, mixedPlainPreFnErr = program.ColumnPredicate(provider)
 			}
-			if evalErr != nil {
-				return fmt.Errorf("collectMixedPlain ColumnPredicate block %d: %w", pb.BlockIdx, evalErr)
+			if mixedPlainPreFnErr != nil {
+				// Treat evaluation errors conservatively: allow fn to run so it can
+				// surface the error with full block context.
+				return true
 			}
-
+			return mixedPlainRowSet.Size() > 0
+		},
+		func(pb parsedBlock, candidateRows []int) error {
+			if mixedPlainPreFnErr != nil {
+				return fmt.Errorf("collectMixedPlain ColumnPredicate block %d: %w", pb.BlockIdx, mixedPlainPreFnErr)
+			}
+			// mixedPlainRowSet was set by preFn; we arrive here only when Size() > 0.
 			// Intersect VM result with candidate rows from intrinsic pre-filter.
 			for _, rowIdx := range candidateRows {
-				if !rowSet.Contains(rowIdx) {
+				if !mixedPlainRowSet.Contains(rowIdx) {
 					continue // eliminated by VM re-evaluation
 				}
 				results = append(results, MatchedRow{Block: pb.Block, BlockIdx: pb.BlockIdx, RowIdx: rowIdx})
@@ -1278,7 +1252,9 @@ func collectMixedPlain(
 			return nil
 		},
 	)
-	if err != nil && err != errLimitReached {
+	// errLimitReached is consumed inside blockGroupPipeline (translated to nil); err is
+	// therefore never errLimitReached here.
+	if err != nil {
 		return nil, err
 	}
 	return results, nil
@@ -1322,31 +1298,41 @@ func collectMixedTopK(
 
 	buf := &topKHeap{entries: make([]topKEntry, 0, opts.Limit), backward: backward}
 
+	// rowSet and preFnErr are shared between preFn and fn; processGroup is sequential so no lock needed.
+	var mixedTopKRowSet vm.RowSet
+	var mixedTopKPreFnErr error
 	// Coalesce all candidate blocks for efficient batch I/O.
 	if err := forEachBlockInGroups(r, blockOrder, blockCandidates, wantColumns, secondPassCols, "collectMixedTopK",
-		func(pb parsedBlock, candidateRows []int) error {
-			// Re-evaluate the full predicate.
+		func(pb parsedBlock, candidateRows []int) bool {
+			// Re-evaluate the full predicate on the first-pass block to gate second-pass decode.
 			provider := newBlockColumnProvider(pb.Block)
-			var rowSet vm.RowSet
-			var evalErr error
+			mixedTopKPreFnErr = nil
 			if r.HasIntrinsicSection() {
 				uap := userAttrProgram(program)
 				if uap == nil {
-					rowSet = provider.FullScan()
+					mixedTopKRowSet = provider.FullScan()
 				} else {
-					rowSet, evalErr = uap.ColumnPredicate(provider)
+					mixedTopKRowSet, mixedTopKPreFnErr = uap.ColumnPredicate(provider)
 				}
 			} else {
-				rowSet, evalErr = program.ColumnPredicate(provider)
+				mixedTopKRowSet, mixedTopKPreFnErr = program.ColumnPredicate(provider)
 			}
-			if evalErr != nil {
-				return fmt.Errorf("collectMixedTopK ColumnPredicate block %d: %w", pb.BlockIdx, evalErr)
+			if mixedTopKPreFnErr != nil {
+				// Treat evaluation errors conservatively: allow fn to run so it can
+				// surface the error with full block context.
+				return true
 			}
-
+			return mixedTopKRowSet.Size() > 0
+		},
+		func(pb parsedBlock, candidateRows []int) error {
+			if mixedTopKPreFnErr != nil {
+				return fmt.Errorf("collectMixedTopK ColumnPredicate block %d: %w", pb.BlockIdx, mixedTopKPreFnErr)
+			}
+			// mixedTopKRowSet was set by preFn; we arrive here only when Size() > 0.
 			// Collect rows that pass both the pre-filter and full predicate.
 			qualifying := make([]int, 0, len(candidateRows))
 			for _, rowIdx := range candidateRows {
-				if rowSet.Contains(rowIdx) {
+				if mixedTopKRowSet.Contains(rowIdx) {
 					qualifying = append(qualifying, rowIdx)
 				}
 			}
@@ -1403,7 +1389,14 @@ func filterRowSetByIntrinsicNodes(
 	if len(want) == 0 {
 		return rowSet // no intrinsic columns in nodes
 	}
-	fields := lookupIntrinsicFields(r, refs, want)
+	fields, err := lookupIntrinsicFields(r, refs, want)
+	if err != nil {
+		// I/O error reading intrinsic columns: conservative fallback — return all
+		// candidates unpruned rather than incorrectly excluding matches.
+		slog.Error("filterRowSetByIntrinsicNodes: lookupIntrinsicFields failed, skipping intrinsic filter",
+			"err", err)
+		return rowSet
+	}
 	// Build filtered RowSet. Rows without intrinsic data for the wanted columns are
 	// treated as "absent" and fail the predicate (absent value != any predicate value).
 	filtered := newRowSetWithCap(len(rows))
@@ -1425,11 +1418,14 @@ func filterRowSetByIntrinsicNodes(
 // column where EnsureRefIndex builds a sorted-by-ref lookup table once (O(N log N));
 // subsequent lookups use O(log N) binary search per selected ref via LookupRefFast.
 // Total per column: O(M log N) for M target refs.
+//
+// SPEC-ROOT-010: I/O errors must not be silently swallowed. Returns an error if any
+// GetIntrinsicColumn call fails so callers can take appropriate action.
 func lookupIntrinsicFields(
 	r *modules_reader.Reader,
 	selected []modules_shared.BlockRef,
 	wantCols map[string]struct{},
-) []map[string]any {
+) ([]map[string]any, error) {
 	result := make([]map[string]any, len(selected))
 	innerCap := 12
 	if wantCols != nil {
@@ -1463,7 +1459,11 @@ func lookupIntrinsicFields(
 		// objectcache alongside the column). Subsequent calls use O(log N) binary search
 		// per target ref instead of the previous O(N) full-column scan.
 		col, err := r.GetIntrinsicColumn(colName)
-		if err != nil || col == nil {
+		if err != nil {
+			// SPEC-ROOT-010: I/O errors must not be silently swallowed.
+			return nil, fmt.Errorf("lookupIntrinsicFields: GetIntrinsicColumn %q: %w", colName, err)
+		}
+		if col == nil {
 			continue
 		}
 		lookupColumn(colName, col)
@@ -1473,14 +1473,24 @@ func lookupIntrinsicFields(
 	// IntrinsicColumnNames() (it has no TOC entry). Handle it explicitly here so that
 	// predicates on span:end are evaluated correctly.
 	if wantCols == nil {
-		if col, err := r.GetIntrinsicColumn("span:end"); err == nil && col != nil {
+		col, err := r.GetIntrinsicColumn("span:end")
+		if err != nil {
+			// SPEC-ROOT-010: I/O errors must not be silently swallowed.
+			return nil, fmt.Errorf("lookupIntrinsicFields: GetIntrinsicColumn %q: %w", "span:end", err)
+		}
+		if col != nil {
 			lookupColumn("span:end", col)
 		}
 	} else if _, needed := wantCols["span:end"]; needed {
-		if col, err := r.GetIntrinsicColumn("span:end"); err == nil && col != nil {
+		col, err := r.GetIntrinsicColumn("span:end")
+		if err != nil {
+			// SPEC-ROOT-010: I/O errors must not be silently swallowed.
+			return nil, fmt.Errorf("lookupIntrinsicFields: GetIntrinsicColumn %q: %w", "span:end", err)
+		}
+		if col != nil {
 			lookupColumn("span:end", col)
 		}
 	}
 
-	return result
+	return result, nil
 }

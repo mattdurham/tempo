@@ -124,7 +124,8 @@ func bloomRejectByEquality(r *modules_reader.Reader, fb *modules_reader.FileBloo
 		return false
 	}
 	// Leaf node — only handle equality (Values non-empty, no range/pattern).
-	if len(node.Values) == 0 || node.Min != nil || node.Max != nil || node.Pattern != "" {
+	// SPEC-ROOT-006: complex boolean extracted to named predicate.
+	if !nodeIsEqualityLeaf(node) {
 		return false
 	}
 	if node.Column == "" {
@@ -136,6 +137,13 @@ func bloomRejectByEquality(r *modules_reader.Reader, fb *modules_reader.FileBloo
 	}
 	// String columns: FileBloom Fuse8.
 	return bloomRejectString(fb, node.Column, node.Values)
+}
+
+// nodeIsEqualityLeaf returns true when node is an equality-only leaf: it has at
+// least one value and no range or pattern predicate. Bloom rejection is only
+// applicable to pure equality nodes.
+func nodeIsEqualityLeaf(node *vm.RangeNode) bool {
+	return len(node.Values) > 0 && node.Min == nil && node.Max == nil && node.Pattern == ""
 }
 
 // bloomRejectTraceID returns true if ALL trace:id values are definitely absent (compact bloom).

@@ -31,7 +31,7 @@ func decodeBoundedSnappyColumn(compressed []byte) ([]byte, error) {
 	return snappy.Decode(nil, compressed)
 }
 
-// NOTE-011: Snappy decode buffer pool — 64KB default cap, 4MB cap guard.
+// NOTE-012: Snappy decode buffer pool — 64KB default cap, 4MB cap guard.
 // AcquireIntrinsicBuf / ReleaseIntrinsicBuf are used in decodePagedColumnBlob
 // to reuse decode scratch buffers across calls, avoiding per-page allocations
 // in the common case where page blobs are ≤64KB.
@@ -41,6 +41,11 @@ func decodeBoundedSnappyColumn(compressed []byte) ([]byte, error) {
 const (
 	intrinsicBufDefaultCap = 64 * 1024       // 64KB default
 	intrinsicBufMaxCap     = 4 * 1024 * 1024 // 4MB cap guard
+
+	// v1 blob field offsets: format_version[1]+format[1]+col_type[1]+row_count[4]
+	intrinsicV1BlobOffFormat   = 1 // format byte offset within v1 blob
+	intrinsicV1BlobOffColType  = 2 // col_type byte offset within v1 blob
+	intrinsicV1BlobOffRowCount = 3 // row_count uint32 LE offset within v1 blob
 )
 
 var intrinsicBufPool = &sync.Pool{
@@ -208,7 +213,11 @@ func DecodePageTOC(blob []byte) (PagedIntrinsicTOC, error) {
 	tocVer := raw[pos]
 	pos++
 	if tocVer != PageTOCVersion {
-		return PagedIntrinsicTOC{}, fmt.Errorf("DecodePageTOC: unsupported page_toc_version %d (want %d)", tocVer, PageTOCVersion)
+		return PagedIntrinsicTOC{}, fmt.Errorf(
+			"DecodePageTOC: unsupported page_toc_version %d (want %d)",
+			tocVer,
+			PageTOCVersion,
+		)
 	}
 
 	pageCount := int(binary.LittleEndian.Uint32(raw[pos:]))
@@ -320,7 +329,7 @@ func DecodeFlatPage(raw []byte, blockW, rowW, rowCount int, colType ColumnType) 
 			if pos+vLen > len(raw) {
 				return nil, fmt.Errorf("DecodeFlatPage: truncated at bytes value")
 			}
-			// NOTE-011: copy BytesValues so the pool buffer can be safely reused.
+			// NOTE-012: copy BytesValues so the pool buffer can be safely reused.
 			v := make([]byte, vLen)
 			copy(v, raw[pos:pos+vLen])
 			col.BytesValues = append(col.BytesValues, v)
@@ -476,7 +485,7 @@ func decodePagedColumnBlob(blob []byte) (*IntrinsicColumn, error) {
 	// don't rebuild it from scratch on each call (O(N²) → O(N) total).
 	var dictIdx map[string]int
 
-	// NOTE-011: reuse a pooled decode buffer across page decodes.
+	// NOTE-012: reuse a pooled decode buffer across page decodes.
 	pageBuf := AcquireIntrinsicBuf()
 	defer ReleaseIntrinsicBuf(pageBuf)
 
@@ -581,9 +590,9 @@ func PeekIntrinsicBlobHeader(blob []byte) (format uint8, colType ColumnType, cou
 	if len(raw) < 7 {
 		return 0, 0, 0, fmt.Errorf("PeekIntrinsicBlobHeader: v1 blob too short (%d bytes)", len(raw))
 	}
-	f := raw[1]
-	ct := ColumnType(raw[2])
-	c := binary.LittleEndian.Uint32(raw[3:7])
+	f := raw[intrinsicV1BlobOffFormat]
+	ct := ColumnType(raw[intrinsicV1BlobOffColType])
+	c := binary.LittleEndian.Uint32(raw[intrinsicV1BlobOffRowCount : intrinsicV1BlobOffRowCount+4])
 	return f, ct, c, nil
 }
 
@@ -654,7 +663,7 @@ func decodeLegacyFlatBlob(raw []byte, pos int, colType ColumnType, rowCount int,
 			if pos+vLen > len(raw) {
 				return fmt.Errorf("DecodeIntrinsicColumnBlob: truncated at bytes value")
 			}
-			// NOTE-011: copy BytesValues so the pool buffer can be safely reused.
+			// NOTE-012: copy BytesValues so the pool buffer can be safely reused.
 			v := make([]byte, vLen)
 			copy(v, raw[pos:pos+vLen])
 			col.BytesValues = append(col.BytesValues, v)

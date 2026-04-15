@@ -68,4 +68,4 @@ is not optimizable.
 
 ---
 
-Back-ref: `internal/vm/regex_optimize.go:AnalyzeRegex`, NOTE-011
+Back-ref: `internal/vm/regex_optimize.go:AnalyzeRegex`, NOTE-011 (executor/NOTES.md)

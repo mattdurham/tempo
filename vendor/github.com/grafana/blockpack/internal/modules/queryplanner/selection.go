@@ -4,11 +4,13 @@ package queryplanner
 
 import "sort"
 
-// intersectBySelectivity intersects a slice of non-nil block sets in selectivity order
-// (smallest set first) to minimize intermediate result sizes. All sets in the slice
-// must be non-nil; a nil entry triggers an explicit panic (see below).
+// intersectBySelectivity intersects a slice of block sets in selectivity order
+// (smallest set first) to minimize intermediate result sizes. Nil entries are
+// silently filtered out — a nil set means all blocks are candidates (unconstrained);
+// including it as an intersection operand would incorrectly prune all blocks.
 //
-// Returns nil when sets is empty (no constrained predicates → no pruning possible).
+// Returns nil when sets is empty or all entries are nil (no constrained predicates →
+// no pruning possible).
 // Returns the intersection result, which may be a non-nil empty map when a constrained
 // predicate matched no blocks (all candidates should be pruned for an AND predicate).
 //
@@ -26,16 +28,18 @@ func intersectBySelectivity(sets []map[int]struct{}) map[int]struct{} {
 	if len(sets) == 0 {
 		return nil
 	}
-	// Enforce non-nil precondition explicitly. A nil entry represents an unconstrained
-	// set (all blocks are candidates); the caller is responsible for filtering these out
-	// before calling. Ranging over a nil map silently produces an empty copy, which
-	// would incorrectly prune all blocks rather than leaving them unconstrained.
+	// Filter out nil (unconstrained) sets. A nil set means all blocks are candidates;
+	// including it as an intersection operand would incorrectly prune all blocks.
+	// Conservative behavior: skip nil sets rather than panicking.
+	filtered := sets[:0]
 	for _, s := range sets {
-		if s == nil {
-			panic(
-				"intersectBySelectivity: nil (unconstrained) set in input — callers must skip this call or filter nil sets before calling",
-			)
+		if s != nil {
+			filtered = append(filtered, s)
 		}
+	}
+	sets = filtered
+	if len(sets) == 0 {
+		return nil
 	}
 	// Sort ascending by size: smallest (most selective) first.
 	sort.Slice(sets, func(i, j int) bool {

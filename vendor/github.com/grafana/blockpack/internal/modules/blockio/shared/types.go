@@ -54,6 +54,13 @@ func UnmarshalDirEntryType(data []byte) (DirEntryType, error) {
 	}, nil
 }
 
+// DirEntryName wire field widths (after the kind byte is consumed).
+const (
+	dirEntryNameLenSize       = 2 // name_len field: uint16 LE
+	dirEntryOffsetSize        = 8 // offset field: uint64 LE
+	dirEntryCompressedLenSize = 4 // compressed_len field: uint32 LE
+)
+
 // DirEntryName describes a name-keyed entry in the V14 section directory.
 // Used for file-level intrinsic column blobs (one entry per column).
 // Wire format: entry_kind[1]=0x01 + name_len[2] + name + offset[8] + compressed_len[4] = 15+len(name) bytes.
@@ -67,7 +74,7 @@ type DirEntryName struct {
 // WireSize returns the variable on-wire size of this name-keyed directory entry.
 // entry_kind[1]+name_len[2]+name+offset[8]+compressed_len[4] = 15+len(name) bytes.
 func (e DirEntryName) WireSize() int {
-	return 15 + len(e.Name)
+	return 1 + dirEntryNameLenSize + len(e.Name) + dirEntryOffsetSize + dirEntryCompressedLenSize
 }
 
 // Marshal serializes the entry to its wire format.
@@ -79,38 +86,39 @@ func (e DirEntryName) Marshal() []byte {
 
 // MarshalInto serializes the entry into dst (must be at least WireSize() bytes).
 func (e DirEntryName) MarshalInto(dst []byte) {
+	const kindSize = 1
 	dst[0] = DirEntryKindName
 	binary.LittleEndian.PutUint16(
-		dst[1:3],
+		dst[kindSize:kindSize+dirEntryNameLenSize],
 		uint16(len(e.Name)), //nolint:gosec // safe: name length bounded by MaxNameLen (1024), fits in uint16
 	)
-	copy(dst[3:3+len(e.Name)], e.Name)
-	off := 3 + len(e.Name)
-	binary.LittleEndian.PutUint64(dst[off:off+8], e.Offset)
-	binary.LittleEndian.PutUint32(dst[off+8:off+12], e.CompressedLen)
+	copy(dst[kindSize+dirEntryNameLenSize:kindSize+dirEntryNameLenSize+len(e.Name)], e.Name)
+	off := kindSize + dirEntryNameLenSize + len(e.Name)
+	binary.LittleEndian.PutUint64(dst[off:off+dirEntryOffsetSize], e.Offset)
+	binary.LittleEndian.PutUint32(dst[off+dirEntryOffsetSize:off+dirEntryOffsetSize+dirEntryCompressedLenSize], e.CompressedLen)
 }
 
 // UnmarshalDirEntryName parses a DirEntryName from a buffer starting after the kind byte.
 // data must start at name_len[2] (i.e., the kind byte was already consumed by the caller).
 // Returns the entry and the number of bytes consumed from data.
 func UnmarshalDirEntryName(data []byte) (DirEntryName, int, error) {
-	if len(data) < 2 {
+	if len(data) < dirEntryNameLenSize {
 		return DirEntryName{}, 0, fmt.Errorf(
-			"UnmarshalDirEntryName: need at least 2 bytes for name_len, got %d",
-			len(data),
+			"UnmarshalDirEntryName: need at least %d bytes for name_len, got %d",
+			dirEntryNameLenSize, len(data),
 		)
 	}
-	nameLen := int(binary.LittleEndian.Uint16(data[0:2]))
-	need := 2 + nameLen + 8 + 4
+	nameLen := int(binary.LittleEndian.Uint16(data[0:dirEntryNameLenSize]))
+	need := dirEntryNameLenSize + nameLen + dirEntryOffsetSize + dirEntryCompressedLenSize
 	if len(data) < need {
 		return DirEntryName{}, 0, fmt.Errorf("UnmarshalDirEntryName: need %d bytes, got %d", need, len(data))
 	}
-	name := string(data[2 : 2+nameLen])
-	off := 2 + nameLen
+	name := string(data[dirEntryNameLenSize : dirEntryNameLenSize+nameLen])
+	off := dirEntryNameLenSize + nameLen
 	return DirEntryName{
 		Name:          name,
-		Offset:        binary.LittleEndian.Uint64(data[off : off+8]),
-		CompressedLen: binary.LittleEndian.Uint32(data[off+8 : off+12]),
+		Offset:        binary.LittleEndian.Uint64(data[off : off+dirEntryOffsetSize]),
+		CompressedLen: binary.LittleEndian.Uint32(data[off+dirEntryOffsetSize : off+dirEntryOffsetSize+dirEntryCompressedLenSize]),
 	}, need, nil
 }
 

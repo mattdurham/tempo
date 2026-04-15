@@ -232,7 +232,11 @@ func collectBlockStructuralSpanRecs(
 				RowIdx:   uint16(i),        //nolint:gosec // safe: i bounded by SpanCount (<65535)
 			}
 		}
-		idFields = lookupIntrinsicFields(r, allRefs, intrinsicWant)
+		var intrinsicErr error
+		idFields, intrinsicErr = lookupIntrinsicFields(r, allRefs, intrinsicWant)
+		if intrinsicErr != nil {
+			return fmt.Errorf("structural lookupIntrinsicFields block %d: %w", blockIdx, intrinsicErr)
+		}
 	} else {
 		idFields = identityFieldsFromBlockCols(bwb.Block, n)
 	}

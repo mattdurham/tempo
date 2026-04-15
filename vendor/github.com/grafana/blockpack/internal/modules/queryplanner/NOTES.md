@@ -244,6 +244,27 @@ the condition was `!AND && !OR` (union semantics) instead of `!AND || !OR` (inte
 
 ---
 
+## NOTE-011: Interval Match for Case-Insensitive Regex Prefix Lookups
+*Added: 2026-03-06*
+
+**Decision:** When a `Predicate` carries an `IntervalMatch` (min/max key pair), `leafBlockSet`
+calls `BlocksForRangeInterval` instead of point lookups. This enables the range index to prune
+blocks for case-insensitive regex prefix queries such as `{ span.http.status_code =~ "(?i)ok.*" }`,
+where the expanded prefix range spans a lexicographic interval (e.g., `["OK", "ok"]`).
+
+**Rationale:** Case-folding a regex prefix can produce a range of byte strings rather than a
+single value. A point lookup on either endpoint alone produces false negatives. The interval
+lookup finds all KLL buckets whose lower boundary falls within `[min, max]`, correctly including
+all blocks that might contain any value in that range.
+
+**Nil-set skip:** `leafBlockSet` returns `nil` (not indexable) when `len(pred.Values) == 0`
+or `len(pred.Columns) != 1`. Callers treat nil conservatively — no pruning applied.
+
+Back-ref: `internal/modules/queryplanner/selection.go:leafBlockSet`
+Back-ref: `internal/modules/blockio/reader/reader.go:BlocksForRangeInterval`
+
+---
+
 ## NOTE-012: OR Node Nil-Skip Semantics — Unconstrained Children Skipped
 *Added: 2026-03-06; verified correct 2026-03-14*
 

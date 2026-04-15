@@ -59,6 +59,10 @@ const (
 	FooterV3Version uint16 = 3
 	FooterV3Size    uint   = 22
 
+	// FileHeaderV13Size is the size in bytes of the V13 file header.
+	// Wire format: magic[4] + version[1] + metadataOffset[8] + metadataLen[8] + signalType[1] = 22 bytes.
+	FileHeaderV13Size uint = 22
+
 	SignalTypeTrace uint8 = 0x01 // file contains OTEL trace spans
 	SignalTypeLog   uint8 = 0x02 // file contains OTEL log records
 

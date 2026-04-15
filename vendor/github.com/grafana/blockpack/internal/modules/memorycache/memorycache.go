@@ -96,7 +96,7 @@ func registerOrReuse(reg prometheus.Registerer, cv *prometheus.CounterVec) *prom
 }
 
 // Get returns the cached bytes for key, or (nil, false, nil) on a miss.
-// The returned slice is an independent copy safe for the caller to modify.
+// The returned slice is read-only; callers must not modify it.
 func (c *MemoryCache) Get(key string) ([]byte, bool, error) {
 	if c == nil {
 		return nil, false, nil
@@ -113,19 +113,18 @@ func (c *MemoryCache) Get(key string) ([]byte, bool, error) {
 	}
 	c.lru.MoveToBack(elem)
 	src := elem.Value.(*entry).data
-	out := make([]byte, len(src))
-	copy(out, src)
 	c.mu.Unlock()
 	if c.requests != nil {
 		c.requests.WithLabelValues("memory", "hit").Inc()
 	}
 	if c.bytes != nil {
-		c.bytes.WithLabelValues("memory").Add(float64(len(out)))
+		c.bytes.WithLabelValues("memory").Add(float64(len(src)))
 	}
-	return out, true, nil
+	return src, true, nil
 }
 
 // Put stores key→value in the cache.
+// The caller must not modify value after calling Put.
 // No-op if the key already exists or if len(value) > MaxBytes.
 func (c *MemoryCache) Put(key string, value []byte) error {
 	if c == nil {
@@ -149,9 +148,7 @@ func (c *MemoryCache) Put(key string, value []byte) error {
 		return nil // still over budget after eviction (shouldn't happen)
 	}
 
-	cp := make([]byte, len(value))
-	copy(cp, value)
-	e := &entry{key: key, data: cp}
+	e := &entry{key: key, data: value}
 	elem := c.lru.PushBack(e)
 	c.index[key] = elem
 	c.curBytes += needed
@@ -212,11 +209,7 @@ func (c *MemoryCache) GetOrFetch(key string, fetch func() ([]byte, error)) ([]by
 	if !ok {
 		return nil, fmt.Errorf("memorycache: unexpected singleflight result type %T", result)
 	}
-	// singleflight shares one fetched slice; callers may get back the same underlying
-	// array. Return a copy so callers cannot corrupt each other.
-	out := make([]byte, len(src))
-	copy(out, src)
-	return out, nil
+	return src, nil
 }
 
 // Close is a no-op for an in-memory cache.

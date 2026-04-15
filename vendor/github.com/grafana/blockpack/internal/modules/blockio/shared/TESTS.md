@@ -203,7 +203,7 @@ Back-ref: `intrinsic_codec_bounds_test.go:TestScanFlatColumnRefs_InvalidBlockW`,
 
 ---
 
-## Intrinsic Buffer Pool Tests (NOTE-011)
+## Intrinsic Buffer Pool Tests (NOTE-012)
 
 ### SHARED-24: TestAcquireIntrinsicBuf_NonNil
 **Scenario:** AcquireIntrinsicBuf returns a non-nil *[]byte with a non-nil backing slice.

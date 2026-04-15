@@ -121,7 +121,7 @@ func (r *Reader) readBlockColumnar(blockOff, blockLen int64, wantColumns map[str
 		return nil, fmt.Errorf("readBlockColumnar: header: %w", err)
 	}
 
-	metas, tocEnd, err := parseColumnMetadataArray(toc, 24, int(hdr.columnCount))
+	metas, tocEnd, err := parseColumnMetadataArray(toc, int(shared.BlockHeaderV14Size), int(hdr.columnCount))
 	if err != nil {
 		// Metadata spills past tocHintBytes — fall back to full block read.
 		full := make([]byte, blockLen)
@@ -163,7 +163,10 @@ func (r *Reader) readBlockColumnar(blockOff, blockLen int64, wantColumns map[str
 
 		// If the column data falls within the already-read TOC buffer, copy from there.
 		if colStart+colLen <= int64(len(toc)) {
-			copy(assembled[int(colStart):], toc[int(colStart):int(colStart)+int(colLen)]) //nolint:gosec // bounded by blockLen < MaxBlockSize
+			copy(
+				assembled[int(colStart):],
+				toc[int(colStart):int(colStart)+int(colLen)],
+			) //nolint:gosec // bounded by blockLen < MaxBlockSize
 			continue
 		}
 

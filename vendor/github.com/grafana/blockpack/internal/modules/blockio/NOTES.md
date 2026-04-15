@@ -1569,7 +1569,7 @@ to all overlapping bucket boundaries, ensuring no false negatives.
 
 **How to apply:** In `tryApplyExactValues`, check that all blocks have min==max before
 committing to the exact-value path. If any block has min!=max, return false to fall through
-to KLL. See also NOTE-42 and NOTE-43.
+to KLL. See NOTE-38 (writer/NOTES.md, exact-value path) and NOTE-38b (multi-value safety).
 
 Back-ref: `internal/modules/blockio/writer/range_index.go:tryApplyExactValues`,
           `internal/modules/blockio/writer/constants.go:exactCardinalityThreshold`

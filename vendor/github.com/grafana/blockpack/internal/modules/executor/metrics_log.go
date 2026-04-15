@@ -2,6 +2,7 @@ package executor
 
 // NOTE: Any changes to this file must be reflected in the corresponding SPECS.md or NOTES.md.
 import (
+	"context"
 	"fmt"
 	"math"
 	"slices"
@@ -98,59 +99,75 @@ func ExecuteLogMetrics(
 
 	wantColumns := ProgramWantColumns(program)
 
-	rawBlocks, err := r.ReadBlocks(plan.SelectedBlocks)
-	if err != nil {
-		return nil, fmt.Errorf("FetchBlocks: %w", err)
-	}
+	// SPEC-STREAM-11 / NOTE-058: Replace eager ReadBlocks (all-upfront) with blockGroupPipeline
+	// (W-concurrent, bounded memory). Peak memory is O(W × group_size) not O(all selected blocks).
+	groups := r.CoalescedGroups(plan.SelectedBlocks)
 
 	// buckets maps composite key (bucketIdxStr + "\x00" + attrGroupKey) to aggBucketState.
 	buckets := make(map[string]*aggBucketState)
 
-	for _, blockIdx := range plan.SelectedBlocks {
-		raw, ok := rawBlocks[blockIdx]
-		if !ok {
-			continue
-		}
-		result.BytesRead += int64(len(raw)) //nolint:gosec
+	// TODO: propagate caller context (NOTE-058: ExecuteLogMetrics does not yet accept context.Context).
+	_, _, _, pipelineErr := blockGroupPipeline(
+		context.Background(), r, groups, defaultPipelineWorkers,
+		func(groupIdx int, groupRaw map[int][]byte) error {
+			for _, blockIdx := range groups[groupIdx].BlockIDs {
+				raw, ok := groupRaw[blockIdx]
+				if !ok {
+					continue
+				}
+				// NOTE: uses actual compressed wire bytes (len(raw)), not BlockMeta.Length
+				// (uncompressed size). These differ for compressed blocks; len(raw) reflects
+				// actual I/O volume. The pipeline's bytesRead return (BlockMeta.Length-based)
+				// is discarded — this accumulation carries the wire-byte semantic.
+				result.BytesRead += int64(len(raw)) //nolint:gosec
+				// Release raw bytes immediately after use to allow GC before the next block.
+				delete(groupRaw, blockIdx)
 
-		meta := r.BlockMeta(blockIdx)
-		bwb, parseErr := r.ParseBlockFromBytes(raw, wantColumns, meta)
-		if parseErr != nil {
-			return nil, fmt.Errorf("ParseBlockFromBytes block %d: %w", blockIdx, parseErr)
-		}
+				meta := r.BlockMeta(blockIdx)
+				bwb, parseErr := r.ParseBlockFromBytes(raw, wantColumns, meta)
+				if parseErr != nil {
+					return fmt.Errorf("ParseBlockFromBytes block %d: %w", blockIdx, parseErr)
+				}
 
-		provider := newBlockColumnProvider(bwb.Block)
-		rowSet, evalErr := program.ColumnPredicate(provider)
-		if evalErr != nil {
-			return nil, fmt.Errorf("ColumnPredicate block %d: %w", blockIdx, evalErr)
-		}
+				provider := newBlockColumnProvider(bwb.Block)
+				rowSet, evalErr := program.ColumnPredicate(provider)
+				if evalErr != nil {
+					return fmt.Errorf("ColumnPredicate block %d: %w", blockIdx, evalErr)
+				}
 
-		if rowSet.Size() == 0 {
-			continue
-		}
+				if rowSet.Size() == 0 {
+					continue
+				}
 
-		// NOTE-001: Lazy registration in ParseBlockFromBytes registers all columns with
-		// presence-only decode. Full decode is triggered on first value access — no second pass needed.
+				// NOTE-001: Columns registered by ParseBlockFromBytes hold compressed bytes only;
+				// no decode happens at registration. Full decode is deferred to first accessor call
+				// via ensureDecompressed() + decodeNow().
 
-		result.BlocksScanned++
+				result.BlocksScanned++
 
-		colNames, colMap, colCols, _, _ := buildBlockColMapsWithLogCache(bwb.Block)
-		attrVals := make([]string, len(groupBy)) // NOTE-054: per-block scratch; cleared at top of logAccumulateRow
-		for _, rowIdx := range rowSet.ToSlice() {
-			logAccumulateRow(
-				bwb.Block,
-				rowIdx,
-				colNames,
-				colMap,
-				colCols,
-				pipeline,
-				querySpec,
-				funcName,
-				groupBy,
-				buckets,
-				attrVals,
-			)
-		}
+				colNames, colMap, colCols, _, _ := buildBlockColMapsWithLogCache(bwb.Block)
+				attrVals := make([]string, len(groupBy)) // NOTE-054: per-block scratch; cleared at top of logAccumulateRow
+				for _, rowIdx := range rowSet.ToSlice() {
+					logAccumulateRow(
+						bwb.Block,
+						rowIdx,
+						colNames,
+						colMap,
+						colCols,
+						pipeline,
+						querySpec,
+						funcName,
+						groupBy,
+						buckets,
+						attrVals,
+					)
+				}
+			}
+			return nil
+		},
+	)
+	if pipelineErr != nil {
+		return nil, pipelineErr
 	}
 
 	stepSec := float64(querySpec.TimeBucketing.StepSizeNanos) / 1e9

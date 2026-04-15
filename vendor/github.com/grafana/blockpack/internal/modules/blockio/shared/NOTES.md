@@ -228,7 +228,7 @@ Back-ref: `internal/modules/blockio/shared/intrinsic_codec.go:decodeVariableWidt
 
 ---
 
-## 10. NOTE-010: Add ColumnTypeVectorF32 = 13 for Semantic Embeddings (2026-04-02)
+## 10. NOTE-011: Add ColumnTypeVectorF32 = 13 for Semantic Embeddings (2026-04-02)
 *Added: 2026-04-02*
 
 **Decision:** Added `ColumnTypeVectorF32 ColumnType = 13` to the ColumnType enum, along with
@@ -253,7 +253,7 @@ Back-ref: `internal/modules/blockio/shared/types.go:ColumnTypeVectorF32`,
 
 ---
 
-## NOTE-011: Snappy Decode Buffer Pool for Intrinsic Column Decoding (2026-04-14)
+## NOTE-012: Snappy Decode Buffer Pool for Intrinsic Column Decoding (2026-04-14)
 *Added: 2026-04-14*
 
 **Decision:** Added `intrinsicBufPool` (`sync.Pool` of `*[]byte`) with 64KB default

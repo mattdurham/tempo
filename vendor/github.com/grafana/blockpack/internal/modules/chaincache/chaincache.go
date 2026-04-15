@@ -105,9 +105,7 @@ func (c *ChainedCache) GetOrFetch(key string, fetch func() ([]byte, error)) ([]b
 	if !ok {
 		return nil, fmt.Errorf("chaincache: unexpected singleflight result type %T", result)
 	}
-	out := make([]byte, len(src))
-	copy(out, src)
-	return out, nil
+	return src, nil
 }
 
 // Close closes every tier and returns any errors joined together.

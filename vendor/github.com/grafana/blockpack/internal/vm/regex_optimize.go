@@ -40,7 +40,7 @@ func RegexPrefixes(pattern string) []string {
 // AnalyzeRegex examines a regex pattern and returns a RegexAnalysis if the pattern
 // can be optimized into prefix-based range-index lookups. Returns nil if the pattern
 // is too complex to optimize.
-// NOTE-011: regex prefix optimization for range-index pruning.
+// NOTE-011 (executor/NOTES.md): regex prefix optimization for range-index pruning.
 //
 // Optimizable patterns:
 //   - Literal prefix: "foo.*", "^foo", "^foo.*$", "debug"
