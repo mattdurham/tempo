@@ -19,6 +19,7 @@ import (
 	temporesource "github.com/grafana/tempo/pkg/tempopb/resource/v1"
 	tempotrace "github.com/grafana/tempo/pkg/tempopb/trace/v1"
 	"github.com/grafana/tempo/pkg/traceql"
+	"github.com/grafana/tempo/pkg/util"
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/encoding/common"
 	"github.com/prometheus/client_golang/prometheus"
@@ -624,6 +625,12 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 		Results: &sliceSpansetIterator{spansets: spansets},
 		Bytes:   func() uint64 { return b.meta.Size_ },
 	}, nil
+}
+
+// FetchSpans is not supported for vblockpack — blockpack evaluates TraceQL natively
+// via Fetch. The caller should use Fetch when FetchSpans returns ErrUnsupported.
+func (b *blockpackBlock) FetchSpans(_ context.Context, _ traceql.FetchSpansRequest, _ common.SearchOptions) (traceql.FetchSpansOnlyResponse, error) {
+	return traceql.FetchSpansOnlyResponse{}, util.ErrUnsupported
 }
 
 // blockpackSpan implements traceql.Span using a cloned blockpack.SpanMatch.
