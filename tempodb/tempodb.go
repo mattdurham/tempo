@@ -827,7 +827,7 @@ func (rw *readerWriter) PollNow(ctx context.Context) {
 // that the blocklist has been updated.  The channel is never written to, but
 // allows waiting more precisely for updated information from the backend.
 func (rw *readerWriter) PollNotification(ctx context.Context) <-chan struct{} {
-	ctx, cancel := context.WithCancel(ctx)
+	ctx, cancel := context.WithCancel(ctx) //nolint:gosec // G118: cancel is stored in pollerNotificationFuncs and called by the polling loop when blocklist updates
 
 	rw.pollerNotificationLock.Lock()
 	defer rw.pollerNotificationLock.Unlock()

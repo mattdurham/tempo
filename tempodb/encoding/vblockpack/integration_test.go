@@ -29,10 +29,8 @@ func TestWALBlockBasicOperations(t *testing.T) {
 	meta.EndTime = time.Now()
 
 	// Create WAL block
-	block, err := createWALBlock(meta, walDir, time.Minute)
-	if err != nil {
-		t.Fatalf("failed to create WAL block: %v", err)
-	}
+	block := createWALBlock(meta, walDir, time.Minute)
+	var err error
 
 	// Create test trace
 	trace := &tempopb.Trace{
@@ -169,7 +167,7 @@ type testIterator struct {
 	index int
 }
 
-func (i *testIterator) Next(ctx context.Context) (common.ID, *tempopb.Trace, error) {
+func (i *testIterator) Next(_ context.Context) (common.ID, *tempopb.Trace, error) {
 	if i.index >= len(i.traces) {
 		return nil, nil, io.EOF
 	}
@@ -347,11 +345,11 @@ func TestSearchTags(t *testing.T) {
 
 	// Search for tags
 	foundTags := make(map[string]bool)
-	callback := func(tag string, scope traceql.AttributeScope) {
+	callback := func(tag string, _ traceql.AttributeScope) {
 		foundTags[tag] = true
 	}
 
-	metricsCallback := func(bytesRead uint64) {}
+	metricsCallback := func(_ uint64) {}
 
 	err = backendBlock.SearchTags(ctx, traceql.AttributeScopeNone, callback, metricsCallback, common.SearchOptions{})
 	if err != nil {
@@ -428,7 +426,7 @@ func TestSearchTagValues(t *testing.T) {
 		return false // Continue
 	}
 
-	metricsCallback := func(bytesRead uint64) {}
+	metricsCallback := func(_ uint64) {}
 
 	err = backendBlock.SearchTagValues(ctx, "name", callback, metricsCallback, common.SearchOptions{})
 	if err != nil {
@@ -546,10 +544,7 @@ func TestEndToEndTraceFlow(t *testing.T) {
 	walMeta.StartTime = time.Now().Add(-time.Hour)
 	walMeta.EndTime = time.Now()
 
-	walBlock, err := createWALBlock(walMeta, walDir, time.Minute)
-	if err != nil {
-		t.Fatalf("failed to create WAL block: %v", err)
-	}
+	walBlock := createWALBlock(walMeta, walDir, time.Minute)
 
 	// Append a trace to WAL
 	testTrace := traces[0].trace
@@ -585,10 +580,7 @@ func TestWALBlockFlushIdempotent(t *testing.T) {
 	tmpDir := t.TempDir()
 	meta := backend.NewBlockMeta("test-tenant", uuid.New(), VersionString)
 
-	block, err := createWALBlock(meta, tmpDir, time.Minute)
-	if err != nil {
-		t.Fatalf("createWALBlock: %v", err)
-	}
+	block := createWALBlock(meta, tmpDir, time.Minute)
 
 	trace := &tempopb.Trace{
 		ResourceSpans: []*tempotrace.ResourceSpans{
@@ -692,10 +684,10 @@ func TestMultipleBlocksSearch(t *testing.T) {
 	// Test searching for tags across all blocks
 	allTags := make(map[string]int)
 	for i, block := range blocks {
-		callback := func(tag string, scope traceql.AttributeScope) {
+		callback := func(tag string, _ traceql.AttributeScope) {
 			allTags[tag]++
 		}
-		metricsCallback := func(bytesRead uint64) {}
+		metricsCallback := func(_ uint64) {}
 
 		err := block.SearchTags(ctx, traceql.AttributeScopeNone, callback, metricsCallback, common.SearchOptions{})
 		if err != nil {
