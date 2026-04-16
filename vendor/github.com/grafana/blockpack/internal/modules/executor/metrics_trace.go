@@ -48,6 +48,7 @@ type TraceMetricsResult struct {
 // querySpec.TimeBucketing must be enabled with a positive StepSizeNanos.
 // Supported functions: COUNT, RATE, SUM, AVG, MIN, MAX, HISTOGRAM, QUANTILE, STDDEV.
 func ExecuteTraceMetrics(
+	ctx context.Context,
 	r *modules_reader.Reader,
 	program *vm.Program,
 	querySpec *vm.QuerySpec,
@@ -105,7 +106,7 @@ func ExecuteTraceMetrics(
 
 	// NOTE-045: intrinsic fast path — zero block reads when all needed columns are in the
 	// intrinsic section (span:start, span:duration, resource.service.name, span:status, etc.).
-	if intrinsicResult, used, intrinsicErr := executeTraceMetricsIntrinsic(r, program, querySpec, outputCols); intrinsicErr != nil {
+	if intrinsicResult, used, intrinsicErr := executeTraceMetricsIntrinsic(ctx, r, program, querySpec, outputCols); intrinsicErr != nil {
 		return nil, intrinsicErr
 	} else if used {
 		return intrinsicResult, nil
@@ -124,9 +125,8 @@ func ExecuteTraceMetrics(
 	buckets := make(map[string]*aggBucketState)
 
 	groupBy := querySpec.Aggregate.GroupBy
-	// TODO: propagate caller context (NOTE-058: ExecuteTraceMetrics does not yet accept context.Context).
 	_, _, _, pipelineErr := blockGroupPipeline(
-		context.Background(), r, groups, defaultPipelineWorkers,
+		ctx, r, groups, defaultPipelineWorkers,
 		func(groupIdx int, groupRaw map[int][]byte) error {
 			for _, blockIdx := range groups[groupIdx].BlockIDs {
 				raw, ok := groupRaw[blockIdx]

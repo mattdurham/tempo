@@ -226,13 +226,13 @@ func (b *blockpackBlock) BlockMeta() *backend.BlockMeta {
 // It delegates to blockpack.ExecuteMetricsTraceQL which uses the intrinsic
 // column fast path — reading only ~10 MB of sorted flat blobs instead of
 // fetching the entire block (~200 MB) via the generic Fetch path.
-func (b *blockpackBlock) QueryRange(_ context.Context, req *tempopb.QueryRangeRequest, _ common.SearchOptions) (*tempopb.QueryRangeResponse, error) {
+func (b *blockpackBlock) QueryRange(ctx context.Context, req *tempopb.QueryRangeRequest, _ common.SearchOptions) (*tempopb.QueryRangeResponse, error) {
 	r, err := b.newReader()
 	if err != nil {
 		return nil, fmt.Errorf("blockpack QueryRange: new reader: %w", err)
 	}
 
-	result, err := blockpack.ExecuteMetricsTraceQL(r, req.Query, blockpack.TraceMetricOptions{
+	result, err := blockpack.ExecuteMetricsTraceQL(ctx, r, req.Query, blockpack.TraceMetricOptions{
 		StartNano: int64(req.Start),
 		EndNano:   int64(req.End),
 		StepNano:  int64(req.Step),

@@ -90,10 +90,16 @@ func (c *Compactor) Compact(ctx context.Context, l log.Logger, r backend.Reader,
 	)
 	ConfigureLRU(c.opts.BlockConfig.Blockpack.LRUCacheBytes)
 
+	// Prefer per-tenant dedicated columns from the input block meta; fall back to
+	// block config default (DefaultDedicatedColumns) for tenants without overrides.
+	compactDedicatedCols := first.DedicatedColumns
+	if len(compactDedicatedCols) == 0 {
+		compactDedicatedCols = c.opts.BlockConfig.DedicatedColumns
+	}
 	cfg := blockpack.CompactionConfig{
 		MaxSpansPerBlock:  maxSpansFromConfig(&c.opts.BlockConfig),
 		MaxOutputFileSize: c.opts.BlockConfig.Blockpack.MaxOutputFileSize,
-		DedicatedColumns:  dedicatedColumnsToBlockpack(first.DedicatedColumns),
+		DedicatedColumns:  dedicatedColumnsToBlockpack(compactDedicatedCols),
 	}
 
 	outputPaths, err := blockpack.CompactBlocks(ctx, providers, cfg, out)

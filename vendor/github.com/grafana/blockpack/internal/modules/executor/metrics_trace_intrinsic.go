@@ -8,6 +8,7 @@ package executor
 // See also NOTE-055 for the streamHistogramGroupBy dict-amortization extension.
 
 import (
+	"context"
 	"math"
 	"sort"
 	"strconv"
@@ -55,6 +56,7 @@ func metricsColumnsAreIntrinsic(r *modules_reader.Reader, wantColumns map[string
 //   - program has no filter predicates (match-all { }): enumerate via span:start flat column.
 //   - program has only intrinsic predicates: BlockRefsFromIntrinsicTOC evaluates them.
 func executeTraceMetricsIntrinsic(
+	ctx context.Context,
 	r *modules_reader.Reader,
 	program *vm.Program,
 	querySpec *vm.QuerySpec,
@@ -62,6 +64,10 @@ func executeTraceMetricsIntrinsic(
 ) (*TraceMetricsResult, bool, error) {
 	if !metricsColumnsAreIntrinsic(r, wantColumns) {
 		return nil, false, nil
+	}
+
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
 	}
 
 	tsCol, err := r.GetIntrinsicColumn("span:start")
@@ -118,8 +124,14 @@ func executeTraceMetricsIntrinsic(
 	// Fast inline path for count/rate with no group-by: stream span:start directly
 	// without building keyToBucket. This is the most common metrics query shape
 	// ({ } | count_over_time(), { } | rate()) and avoids any intermediate hash map.
+	const ctxCheckInterval = 100_000 // check context every 100K spans to bound cancellation latency
 	if isCountRate && len(agg.GroupBy) == 0 {
 		for i, ref := range inRangeRefs {
+			if i%ctxCheckInterval == 0 {
+				if err := ctx.Err(); err != nil {
+					return nil, false, err
+				}
+			}
 			if filteredKeys != nil {
 				if _, ok := filteredKeys[packKey(ref.BlockIdx, ref.RowIdx)]; !ok {
 					continue
@@ -137,6 +149,11 @@ func executeTraceMetricsIntrinsic(
 		// dict/flat aggregate columns can look up the bucket index by pack key.
 		keyToBucket := make(map[uint32]int64, len(inRangeRefs))
 		for i, ref := range inRangeRefs {
+			if i%ctxCheckInterval == 0 {
+				if err := ctx.Err(); err != nil {
+					return nil, false, err
+				}
+			}
 			pk := packKey(ref.BlockIdx, ref.RowIdx)
 			if filteredKeys != nil {
 				if _, ok := filteredKeys[pk]; !ok {
