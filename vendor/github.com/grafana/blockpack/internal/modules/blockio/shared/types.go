@@ -95,7 +95,10 @@ func (e DirEntryName) MarshalInto(dst []byte) {
 	copy(dst[kindSize+dirEntryNameLenSize:kindSize+dirEntryNameLenSize+len(e.Name)], e.Name)
 	off := kindSize + dirEntryNameLenSize + len(e.Name)
 	binary.LittleEndian.PutUint64(dst[off:off+dirEntryOffsetSize], e.Offset)
-	binary.LittleEndian.PutUint32(dst[off+dirEntryOffsetSize:off+dirEntryOffsetSize+dirEntryCompressedLenSize], e.CompressedLen)
+	binary.LittleEndian.PutUint32(
+		dst[off+dirEntryOffsetSize:off+dirEntryOffsetSize+dirEntryCompressedLenSize],
+		e.CompressedLen,
+	)
 }
 
 // UnmarshalDirEntryName parses a DirEntryName from a buffer starting after the kind byte.
@@ -116,9 +119,11 @@ func UnmarshalDirEntryName(data []byte) (DirEntryName, int, error) {
 	name := string(data[dirEntryNameLenSize : dirEntryNameLenSize+nameLen])
 	off := dirEntryNameLenSize + nameLen
 	return DirEntryName{
-		Name:          name,
-		Offset:        binary.LittleEndian.Uint64(data[off : off+dirEntryOffsetSize]),
-		CompressedLen: binary.LittleEndian.Uint32(data[off+dirEntryOffsetSize : off+dirEntryOffsetSize+dirEntryCompressedLenSize]),
+		Name:   name,
+		Offset: binary.LittleEndian.Uint64(data[off : off+dirEntryOffsetSize]),
+		CompressedLen: binary.LittleEndian.Uint32(
+			data[off+dirEntryOffsetSize : off+dirEntryOffsetSize+dirEntryCompressedLenSize],
+		),
 	}, need, nil
 }
 

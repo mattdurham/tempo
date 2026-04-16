@@ -449,3 +449,33 @@ Back-ref: `internal/modules/blockio/reader/column.go:readColumnEncoding`
 intrinsic/attribute split was evaluated and deferred pending further profiling.
 
 Back-ref: `internal/modules/blockio/reader/block_parser.go:parseBlockColumnsReuse`
+
+---
+
+## SPEC-ROOT-015: Raw Block Bytes Must Route Through Cache
+
+**Invariant:** All raw block byte fetches (`ReadGroup`, `ReadBlocks`) must route through
+`r.cache` using the key `fileID+"/block/"+blockIndex`. Direct calls to `ReadCoalescedBlocks`
+or `provider.ReadAt` from `ReadGroup`/`ReadBlocks` are forbidden — they bypass the multi-tier
+cache and cause redundant S3 reads on every query for the same block.
+
+**Exception:** When `r.fileID == ""` no stable cache key can be formed; `ReadGroup` falls
+through to a direct `ReadCoalescedBlocks` call. Any code path that constructs a `Reader`
+without a fileID opts out of block-level caching and must document that trade-off.
+
+**Rationale:** S3 read latency (~50–100 ms) dominates query cost. Without block-level caching,
+repeated queries over the same time window re-fetch the same raw bytes on every call even when
+all decoded section data (intrinsic columns, trace index, bloom) is already cache-warm.
+Profiling showed `ReadCoalescedBlocks` allocating >294 MB per benchmark window — entirely from
+avoidable S3 re-reads. Routing through `r.cache` eliminates these re-reads for hot blocks.
+
+**Cache contract:**
+- On a full cache hit (all `cr.BlockIDs` present): `ReadGroup` returns without any S3 I/O.
+- On any cache miss: `ReadGroup` fetches the full group (coalesced), stores every block via
+  `r.cache.Put`, then returns. Re-fetching already-cached blocks in the same group is
+  deliberate — it avoids re-coalescing a partial group at the cost of re-reading a few
+  extra bytes from a pooled buffer (nanoseconds vs the 75 ms S3 round-trip).
+- `r.cache.Put` errors are silently discarded — eviction or size limits are not fatal.
+
+Back-ref: `internal/modules/blockio/reader/reader.go:Reader.ReadGroup`,
+`internal/modules/blockio/reader/reader.go:Reader.ReadBlocks`

@@ -169,7 +169,10 @@ func ExecuteTraceMetrics(
 
 				result.BlocksScanned++
 
-				attrVals := make([]string, len(groupBy)) // NOTE-054: per-block scratch; cleared at top of traceAccumulateRow
+				attrVals := make(
+					[]string,
+					len(groupBy),
+				) // NOTE-054: per-block scratch; cleared at top of traceAccumulateRow
 				for _, rowIdx := range rowSet.ToSlice() {
 					traceAccumulateRow(r, blockIdx, bwb.Block, rowIdx, querySpec, buckets, attrVals)
 				}

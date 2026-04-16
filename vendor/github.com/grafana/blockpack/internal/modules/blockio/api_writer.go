@@ -9,6 +9,10 @@ import (
 	"github.com/grafana/blockpack/internal/modules/blockio/writer"
 )
 
+// DedicatedColumn describes an attribute column to be stored in the intrinsic section
+// as a dedicated column. See writer.DedicatedColumn for full documentation.
+type DedicatedColumn = writer.DedicatedColumn
+
 // WriterConfig configures the blockpack Writer.
 type WriterConfig = writer.Config
 

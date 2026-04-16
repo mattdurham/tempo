@@ -70,6 +70,11 @@ type Config struct {
 	// StagingDir is a local directory for staging output files.
 	// If empty, os.TempDir() is used.
 	StagingDir string
+	// DedicatedColumns lists attribute columns to be written into the intrinsic section
+	// of output blocks, enabling the zero-block-read fast path for metrics queries.
+	// When non-empty, these columns are passed to each output Writer created during
+	// compaction. See writer.DedicatedColumn for documentation on the Name format.
+	DedicatedColumns []modules_blockio.DedicatedColumn
 	// MaxOutputFileSize is the maximum size in bytes of each output file (estimated).
 	// Zero means no size limit.
 	MaxOutputFileSize int64
@@ -310,8 +315,9 @@ func (s *compactionState) ensureWriter() error {
 
 	buf := &bytes.Buffer{}
 	w, err := modules_blockio.NewWriterWithConfig(modules_blockio.WriterConfig{
-		OutputStream:  buf,
-		MaxBlockSpans: s.maxSpans,
+		OutputStream:     buf,
+		MaxBlockSpans:    s.maxSpans,
+		DedicatedColumns: s.cfg.DedicatedColumns,
 	})
 	if err != nil {
 		return fmt.Errorf("new writer: %w", err)

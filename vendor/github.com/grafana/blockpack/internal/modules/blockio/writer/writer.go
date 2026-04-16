@@ -63,6 +63,13 @@ type Writer struct {
 	// Nil when cfg.VectorDimension == 0 (no vector support requested).
 	vectorAccum *vectorAccumulator
 
+	// dedicatedCols is the pre-built set of full column names (e.g. "span.http.method")
+	// configured as dedicated in cfg.DedicatedColumns. Built once in NewWriterWithConfig
+	// and passed to each buildBlock call so attribute loops can feed matching columns
+	// into the intrinsic section alongside the normal block columns.
+	// Nil when cfg.DedicatedColumns is empty.
+	dedicatedCols map[string]struct{}
+
 	out countingWriter
 
 	// pending holds lightweight pendingSpan records awaiting the next flushBlocks call.
@@ -153,6 +160,15 @@ func NewWriterWithConfig(cfg Config) (*Writer, error) {
 	if cfg.VectorDimension > 0 {
 		va = newVectorAccumulator(cfg.VectorDimension)
 	}
+	var dedicatedCols map[string]struct{}
+	if len(cfg.DedicatedColumns) > 0 {
+		dedicatedCols = make(map[string]struct{}, len(cfg.DedicatedColumns))
+		for _, dc := range cfg.DedicatedColumns {
+			if dc.Name != "" {
+				dedicatedCols[dc.Name] = struct{}{}
+			}
+		}
+	}
 	return &Writer{
 		cfg:               cfg,
 		out:               countingWriter{w: cfg.OutputStream},
@@ -162,6 +178,7 @@ func NewWriterWithConfig(cfg Config) (*Writer, error) {
 		intrinsicAccum:    newIntrinsicAccumulator(),
 		fileBloomSvcNames: make(map[string]struct{}),
 		vectorAccum:       va,
+		dedicatedCols:     dedicatedCols,
 		// Pre-allocate pending to MaxBufferedSpans to avoid growslice on the hot path.
 		// After each flushBlocks(), w.pending is reset to length 0 (capacity retained).
 		pending: make([]pendingSpan, 0, cfg.MaxBufferedSpans),
@@ -725,7 +742,15 @@ func (w *Writer) flushBlocks() error {
 			}
 			localAccum := newIntrinsicAccumulator()
 			bb, _ := w.bbPool.Get().(*blockBuilder)
-			built, bb, err := buildBlock(s.spans, bb, shared.VersionBlockV14, localAccum, s.blockID, blockVecs)
+			built, bb, err := buildBlock(
+				s.spans,
+				bb,
+				shared.VersionBlockV14,
+				localAccum,
+				s.blockID,
+				blockVecs,
+				w.dedicatedCols,
+			)
 			if err != nil {
 				w.bbPool.Put(bb)
 				return fmt.Errorf("writer: block %d finalize: %w", s.blockID, err)

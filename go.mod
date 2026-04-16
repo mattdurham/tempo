@@ -80,7 +80,7 @@ require (
 	github.com/evanphx/json-patch v5.9.11+incompatible
 	github.com/golang/groupcache v0.0.0-20241129210726-2c02b8208cf8
 	github.com/googleapis/gax-go/v2 v2.19.0
-	github.com/grafana/blockpack v0.0.0-20260415203038-b646a8d31067
+	github.com/grafana/blockpack v0.0.0-20260415214858-cb105f7a1135
 	github.com/grafana/gomemcache v0.0.0-20251127154401-74f93547077b
 	github.com/grpc-ecosystem/go-grpc-middleware v1.4.0
 	github.com/hashicorp/golang-lru/v2 v2.0.7
@@ -440,6 +440,7 @@ require (
 replace (
 	k8s.io/api => k8s.io/api v0.35.3
 	k8s.io/client-go => k8s.io/client-go v0.35.3
+	github.com/grafana/blockpack => ../blockpack_collection/blockpack
 )
 
 // Replace memberlist with our fork which includes some fixes that haven't been

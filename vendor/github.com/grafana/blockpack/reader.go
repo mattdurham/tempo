@@ -397,6 +397,12 @@ func GetTraceByID(r *Reader, traceIDHex string) (results []SpanMatch, err error)
 
 // AGENT: Writer constructors - minimal set needed for creating writers.
 
+// DedicatedColumn describes an attribute column to be stored in the intrinsic section
+// in addition to the standard block columns. Dedicated columns enable the zero-block-read
+// fast path for metrics queries that filter or group-by on them.
+// Name must be the full blockpack column name including prefix, e.g. "span.http.method".
+type DedicatedColumn = modules_blockio.DedicatedColumn
+
 // WriterConfig configures a blockpack Writer.
 // It is a type alias for the internal WriterConfig.
 type WriterConfig = modules_blockio.WriterConfig

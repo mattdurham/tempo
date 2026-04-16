@@ -394,6 +394,7 @@ network round-trip after the first call.
 | `fileID+"/v14/sec/03/dec"`         | Full decompressed SectionTraceIndex blob    | `readV14Section`            |
 | `fileID+"/v14/compact-header"`     | Header sub-slice (bloom + block table only) | `ensureV14TraceSection`     |
 | `fileID+"/compact-trace-index"`    | Trace index bytes                           | `ensureTraceIndexRaw`       |
+| `fileID+"/block/"+blockIdx`        | Raw block bytes (per-block entry)           | `ReadGroup`                 |
 
 ### `splitV14CompactSection` Contract
 
@@ -408,3 +409,30 @@ Back-ref: `internal/modules/blockio/reader/trace_index.go:splitV14CompactSection
 `internal/modules/blockio/reader/trace_index.go:ensureTraceIndexRaw`,
 `internal/modules/blockio/reader/parser.go:ensureV14TraceSection`,
 `internal/modules/blockio/reader/reader.go:compactTraceIndex.isV14TraceSection`
+
+---
+
+## SPEC-011: Raw Block Byte Reads Must Route Through Cache
+
+**Invariant:** `ReadGroup` and `ReadBlocks` must never call `ReadCoalescedBlocks` or
+`provider.ReadAt` without first checking `r.cache`. The canonical implementation:
+
+1. For each `blockID` in the group, probe `r.cache.Get(fileID+"/block/"+blockID)`.
+2. If all blocks hit: return the cached slices — zero S3 I/O.
+3. On any miss: call `ReadCoalescedBlocks` for the full group, store every fetched block via
+   `r.cache.Put(fileID+"/block/"+blockID, data)`, then return.
+
+The `r.fileID == ""` guard bypasses the cache (no stable key) — callers that construct a
+`Reader` without a fileID explicitly opt out of block-level caching.
+
+**Why fetch the full group on a partial miss (not just the missing blocks)?**
+Re-coalescing a partial subset of blocks adds code complexity and risks issuing more S3
+requests (smaller, non-coalesced reads). Since the coalesced group was already computed for
+optimal I/O, and re-reading a cached block from a pooled buffer costs nanoseconds vs the
+~75 ms S3 round-trip, fetching the full group on any miss is the correct trade-off.
+
+**Cache Put errors are discarded:** A Put failure (e.g., eviction, size limit) means the
+next read re-fetches from S3 — degraded performance but not incorrect behavior.
+
+Back-ref: `internal/modules/blockio/reader/reader.go:Reader.ReadGroup`,
+`internal/modules/blockio/reader/reader.go:Reader.ReadBlocks`

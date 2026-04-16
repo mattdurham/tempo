@@ -146,7 +146,10 @@ func ExecuteLogMetrics(
 				result.BlocksScanned++
 
 				colNames, colMap, colCols, _, _ := buildBlockColMapsWithLogCache(bwb.Block)
-				attrVals := make([]string, len(groupBy)) // NOTE-054: per-block scratch; cleared at top of logAccumulateRow
+				attrVals := make(
+					[]string,
+					len(groupBy),
+				) // NOTE-054: per-block scratch; cleared at top of logAccumulateRow
 				for _, rowIdx := range rowSet.ToSlice() {
 					logAccumulateRow(
 						bwb.Block,

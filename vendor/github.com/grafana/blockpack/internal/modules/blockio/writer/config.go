@@ -20,6 +20,17 @@ type EmbeddingFieldConfig struct {
 	Weight string
 }
 
+// DedicatedColumn describes one attribute column to be written into the intrinsic section
+// in addition to the standard block columns. Dedicated columns enable the zero-block-read
+// fast path (NOTE-046) for queries that filter or aggregate on them.
+//
+// Name must be the full blockpack column name, including prefix (e.g. "span.http.method",
+// "resource.deployment.environment"). Only span and resource attributes are supported;
+// built-in intrinsic columns (span:start, span:name, etc.) are already always intrinsic.
+type DedicatedColumn struct {
+	Name string
+}
+
 // Config holds configuration parameters for a blockpack writer instance.
 // Field order is optimized for struct alignment (betteralign).
 type Config struct {
@@ -39,6 +50,18 @@ type Config struct {
 	// text. If empty and Embedder is non-nil, all fields are included using the
 	// default priority ordering (AssembleAllFields).
 	EmbeddingFields []EmbeddingFieldConfig
+
+	// DedicatedColumns lists span and resource attribute columns to be written into
+	// the intrinsic section as well as the standard block columns. Writing a column
+	// here enables the zero-block-read fast path (NOTE-046) for metrics queries that
+	// filter or group-by on that column, at the cost of extra intrinsic section storage.
+	//
+	// Each Name must be the full blockpack column name including prefix, e.g.:
+	//   "span.http.method", "span.http.status_code", "resource.deployment.environment"
+	//
+	// Built-in intrinsic columns (span:start, span:name, resource.service.name, etc.)
+	// are already always written to the intrinsic section and need not be listed here.
+	DedicatedColumns []DedicatedColumn
 
 	MaxBlockSpans int
 

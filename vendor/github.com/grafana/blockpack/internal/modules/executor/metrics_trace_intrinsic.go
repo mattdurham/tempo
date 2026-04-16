@@ -19,18 +19,14 @@ import (
 
 // metricsColumnsAreIntrinsic reports whether all columns in wantColumns are available
 // in this file's intrinsic section, enabling the zero-block-read fast path.
-// It checks both the known-intrinsic set (traceIntrinsicColumns) and the file's actual
-// TOC metadata, so older files missing optional intrinsic columns fall back to block scan.
+// It checks the file's actual TOC metadata directly, so both standard intrinsic columns
+// and dedicated columns written by the writer are eligible. This also handles older files
+// that may be missing optional intrinsic columns (they fall back to block scan).
 func metricsColumnsAreIntrinsic(r *modules_reader.Reader, wantColumns map[string]struct{}) bool {
 	if !r.HasIntrinsicSection() {
 		return false
 	}
 	for col := range wantColumns {
-		if _, ok := traceIntrinsicColumns[col]; !ok {
-			return false
-		}
-		// Verify the column is actually present in this file's intrinsic TOC.
-		// Older file versions may not have written every intrinsic column.
 		if _, present := r.IntrinsicColumnMeta(col); !present {
 			return false
 		}
