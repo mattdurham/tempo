@@ -78,6 +78,16 @@ func (r *Reader) HasIntrinsicSection() bool {
 	return len(r.intrinsicIndex) > 0
 }
 
+// HasIntrinsicColumn reports whether the named column is present in the intrinsic section.
+// Unlike IntrinsicColumnMeta, this method never triggers any I/O — it is a pure map lookup.
+// Use this when only presence is needed (e.g. the metrics fast-path existence check in
+// metricsColumnsAreIntrinsic) to avoid triggering a blob read just to check if a column exists.
+// NOTE-016: zero-I/O existence check; see parser.go parseSectionsLazyV14 for context.
+func (r *Reader) HasIntrinsicColumn(name string) bool {
+	_, ok := r.intrinsicIndex[name]
+	return ok
+}
+
 // IntrinsicColumnMeta returns the TOC metadata for the named intrinsic column.
 // Returns (IntrinsicColMeta{}, false) if no intrinsic section is present or the
 // column is not in the TOC.

@@ -357,8 +357,6 @@ github.com/chewxy/math32
 # github.com/clipperhouse/displaywidth v0.10.0
 ## explicit; go 1.18
 github.com/clipperhouse/displaywidth
-# github.com/clipperhouse/stringish v0.1.1
-## explicit; go 1.18
 # github.com/clipperhouse/uax29/v2 v2.6.0
 ## explicit; go 1.18
 github.com/clipperhouse/uax29/v2/graphemes
@@ -2632,7 +2630,7 @@ k8s.io/klog/v2/internal/sloghandler
 # k8s.io/utils v0.0.0-20251002143259-bc988d571ff4
 ## explicit; go 1.18
 k8s.io/utils/clock
+# github.com/grafana/blockpack => ../blockpack_collection/blockpack
 # k8s.io/api => k8s.io/api v0.35.3
 # k8s.io/client-go => k8s.io/client-go v0.35.3
-# github.com/grafana/blockpack => ../blockpack_collection/blockpack
 # github.com/hashicorp/memberlist => github.com/grafana/memberlist v0.3.1-0.20251024160842-5cd332c2849a
