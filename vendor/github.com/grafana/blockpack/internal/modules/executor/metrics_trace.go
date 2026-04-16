@@ -10,12 +10,25 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
 	modules_shared "github.com/grafana/blockpack/internal/modules/blockio/shared"
 	"github.com/grafana/blockpack/internal/modules/queryplanner"
 	"github.com/grafana/blockpack/internal/vm"
 )
+
+// NOTE-070: compositeKey scratch-buffer pool — eliminates per-span string allocations in the
+// metrics accumulation hot loop. string([]byte) used as a map key does not allocate when the
+// compiler can prove the string doesn't escape the map index expression.
+//
+//nolint:gochecknoglobals
+var compositeKeyScratchPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 0, 64)
+		return &b
+	},
+}
 
 // TraceMetricLabel is a single label key-value pair for a TraceTimeSeries.
 // SPEC-ETM-1: Labels are an ordered slice; the same label name will not appear twice.
@@ -257,23 +270,27 @@ func traceAccumulateRow(
 	attrGroupKey := strings.Join(attrVals, "\x00")
 	// NOTE-033: HISTOGRAM embeds log2 bucket boundary as a 3rd "\x00" segment.
 	// Non-HISTOGRAM functions omit the 3rd segment (existing composite key format unchanged).
-	var compositeKey string
+	// NOTE-070: use pooled scratch buffer to build composite key without heap allocation.
+	//nolint:forcetypeassert
+	scratch := compositeKeyScratchPool.Get().(*[]byte)
+	*scratch = strconv.AppendInt((*scratch)[:0], bucketIdx, 10)
+	*scratch = append(*scratch, '\x00')
+	*scratch = append(*scratch, attrGroupKey...)
 	if querySpec.Aggregate.Function == vm.FuncNameHISTOGRAM {
 		histBoundary := traceHistogramBucket(block, rowIdx, querySpec.Aggregate.Field)
-		compositeKey = strconv.FormatInt(bucketIdx, 10) + "\x00" + attrGroupKey + "\x00" +
-			strconv.FormatFloat(histBoundary, 'g', -1, 64)
-	} else {
-		compositeKey = strconv.FormatInt(bucketIdx, 10) + "\x00" + attrGroupKey
+		*scratch = append(*scratch, '\x00')
+		*scratch = strconv.AppendFloat(*scratch, histBoundary, 'g', -1, 64)
 	}
-
-	bucket, exists := buckets[compositeKey]
+	bucket, exists := buckets[string(*scratch)]
 	if !exists {
+		compositeKey := string(*scratch) // allocate once, only on map miss
 		bucket = &aggBucketState{
 			min: math.MaxFloat64,
 			max: -math.MaxFloat64,
 		}
 		buckets[compositeKey] = bucket
 	}
+	compositeKeyScratchPool.Put(scratch)
 
 	traceUpdateBucket(block, rowIdx, querySpec.Aggregate, bucket)
 }
@@ -416,8 +433,14 @@ func traceBuildDenseSeries(
 
 		values := make([]float64, numBuckets)
 		for bucketIdx := int64(0); bucketIdx < numBuckets; bucketIdx++ {
-			compositeKey := strconv.FormatInt(bucketIdx, 10) + "\x00" + attrGroupKey
-			bucket := buckets[compositeKey]
+			// NOTE-070: pool scratch buffer for composite key lookup.
+			//nolint:forcetypeassert
+			scratch := compositeKeyScratchPool.Get().(*[]byte)
+			*scratch = strconv.AppendInt((*scratch)[:0], bucketIdx, 10)
+			*scratch = append(*scratch, '\x00')
+			*scratch = append(*scratch, attrGroupKey...)
+			bucket := buckets[string(*scratch)]
+			compositeKeyScratchPool.Put(scratch)
 			values[bucketIdx] = traceRowValue(bucket, querySpec.Aggregate.Function, stepSec,
 				querySpec.Aggregate.Quantile)
 		}
@@ -592,11 +615,18 @@ func traceHistogramSeries(
 
 		values := make([]float64, numBuckets)
 		for bucketIdx := int64(0); bucketIdx < numBuckets; bucketIdx++ {
-			compositeKey := strconv.FormatInt(bucketIdx, 10) + "\x00" +
-				sk.attrGroupKey + "\x00" + sk.bucketBoundary
-			if bucket := buckets[compositeKey]; bucket != nil {
+			// NOTE-070: pool scratch buffer for composite key lookup.
+			//nolint:forcetypeassert
+			scratch := compositeKeyScratchPool.Get().(*[]byte)
+			*scratch = strconv.AppendInt((*scratch)[:0], bucketIdx, 10)
+			*scratch = append(*scratch, '\x00')
+			*scratch = append(*scratch, sk.attrGroupKey...)
+			*scratch = append(*scratch, '\x00')
+			*scratch = append(*scratch, sk.bucketBoundary...)
+			if bucket := buckets[string(*scratch)]; bucket != nil {
 				values[bucketIdx] = float64(bucket.count)
 			}
+			compositeKeyScratchPool.Put(scratch)
 		}
 		series = append(series, TraceTimeSeries{Labels: labels, Values: values})
 	}

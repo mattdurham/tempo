@@ -78,7 +78,6 @@ require (
 	github.com/axiomhq/hyperloglog v0.2.6
 	github.com/bytedance/sonic v1.15.0
 	github.com/evanphx/json-patch v5.9.11+incompatible
-	github.com/golang/groupcache v0.0.0-20241129210726-2c02b8208cf8
 	github.com/googleapis/gax-go/v2 v2.19.0
 	github.com/grafana/blockpack v0.0.0-20260415214858-cb105f7a1135
 	github.com/grafana/gomemcache v0.0.0-20251127154401-74f93547077b
@@ -178,7 +177,6 @@ require (
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
 	github.com/chewxy/math32 v1.10.1 // indirect
 	github.com/clipperhouse/displaywidth v0.10.0 // indirect
-	github.com/clipperhouse/stringish v0.1.1 // indirect
 	github.com/clipperhouse/uax29/v2 v2.6.0 // indirect
 	github.com/cloudwego/base64x v0.1.6 // indirect
 	github.com/cncf/xds/go v0.0.0-20251210132809-ee656c7534f5 // indirect
@@ -221,6 +219,7 @@ require (
 	github.com/goccy/go-json v0.10.5 // indirect
 	github.com/gogo/googleapis v1.4.1 // indirect
 	github.com/golang-jwt/jwt/v5 v5.3.0 // indirect
+	github.com/golang/groupcache v0.0.0-20241129210726-2c02b8208cf8 // indirect
 	github.com/google/btree v1.1.3 // indirect
 	github.com/google/go-tpm v0.9.8 // indirect
 	github.com/google/s2a-go v0.1.9 // indirect
@@ -438,9 +437,9 @@ require (
 )
 
 replace (
+	github.com/grafana/blockpack => ../blockpack_collection/blockpack
 	k8s.io/api => k8s.io/api v0.35.3
 	k8s.io/client-go => k8s.io/client-go v0.35.3
-	github.com/grafana/blockpack => ../blockpack_collection/blockpack
 )
 
 // Replace memberlist with our fork which includes some fixes that haven't been

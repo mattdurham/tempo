@@ -48,9 +48,20 @@ func CompileTraceQLMetrics(query string, startTime, endTime int64) (*Program, *Q
 
 	// Compile to VM Program with a match-all filter program for row scanning.
 	// Use extractTraceQLPredicates for block-level pruning (same path as filter queries).
+	// NOTE-070: also compile ColumnPredicate for block-scan row-level filtering.
+	// The intrinsic fast path uses program.Predicates directly; the block scan path uses
+	// program.ColumnPredicate. Without this, filters like {kind=server && sc>=400} that
+	// fall back to block scan (because BlockRefsFromIntrinsicTOC cannot evaluate range
+	// predicates on dict columns) return match-all results — effectively ignoring the filter.
 	program := compileMatchAllProgram()
 	if metricsQuery.Filter != nil && metricsQuery.Filter.Expr != nil {
 		program.Predicates = extractTraceQLPredicates(metricsQuery.Filter.Expr)
+		compiler := &traceqlCompiler{program: program}
+		columnPredicate, compileErr := compiler.compileColumnPredicate(metricsQuery.Filter.Expr)
+		if compileErr != nil {
+			return nil, nil, fmt.Errorf("compile column predicate: %w", compileErr)
+		}
+		program.ColumnPredicate = columnPredicate
 	}
 
 	return program, spec, nil
