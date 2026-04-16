@@ -21,13 +21,37 @@ import (
 // NOTE-070: compositeKey scratch-buffer pool — eliminates per-span string allocations in the
 // metrics accumulation hot loop. string([]byte) used as a map key does not allocate when the
 // compiler can prove the string doesn't escape the map index expression.
-//
+
+// Pool cap guard constants for compositeKeyScratchPool.
+// compositeKeyScratchDefaultCap covers typical keys (3-digit bucket + NUL + service name + NUL + float boundary).
+// compositeKeyScratchMaxCap: buffers larger than this are replaced with a fresh default-sized slice on Put.
+const (
+	compositeKeyScratchDefaultCap = 128        // initial and replacement capacity
+	compositeKeyScratchMaxCap     = 256 * 1024 // 256 KB cap guard
+)
+
 //nolint:gochecknoglobals
-var compositeKeyScratchPool = sync.Pool{
+var compositeKeyScratchPool = &sync.Pool{
 	New: func() any {
-		b := make([]byte, 0, 64)
+		b := make([]byte, 0, compositeKeyScratchDefaultCap)
 		return &b
 	},
+}
+
+func acquireCompositeKeyScratch() *[]byte {
+	//nolint:forcetypeassert
+	return compositeKeyScratchPool.Get().(*[]byte)
+}
+
+func releaseCompositeKeyScratch(b *[]byte) {
+	if cap(*b) > compositeKeyScratchMaxCap {
+		// Replace oversized backing array with a fresh small slice.
+		// Assign through the pointer so the pool receives the new small slice.
+		*b = make([]byte, 0, compositeKeyScratchDefaultCap)
+	} else {
+		*b = (*b)[:0]
+	}
+	compositeKeyScratchPool.Put(b)
 }
 
 // TraceMetricLabel is a single label key-value pair for a TraceTimeSeries.
@@ -271,8 +295,7 @@ func traceAccumulateRow(
 	// NOTE-033: HISTOGRAM embeds log2 bucket boundary as a 3rd "\x00" segment.
 	// Non-HISTOGRAM functions omit the 3rd segment (existing composite key format unchanged).
 	// NOTE-070: use pooled scratch buffer to build composite key without heap allocation.
-	//nolint:forcetypeassert
-	scratch := compositeKeyScratchPool.Get().(*[]byte)
+	scratch := acquireCompositeKeyScratch()
 	*scratch = strconv.AppendInt((*scratch)[:0], bucketIdx, 10)
 	*scratch = append(*scratch, '\x00')
 	*scratch = append(*scratch, attrGroupKey...)
@@ -290,7 +313,7 @@ func traceAccumulateRow(
 		}
 		buckets[compositeKey] = bucket
 	}
-	compositeKeyScratchPool.Put(scratch)
+	releaseCompositeKeyScratch(scratch)
 
 	traceUpdateBucket(block, rowIdx, querySpec.Aggregate, bucket)
 }
@@ -431,19 +454,19 @@ func traceBuildDenseSeries(
 			}
 		}
 
+		// NOTE-070: acquire scratch buffer once for all buckets in this series;
+		// reset to [:0] at each inner iteration to avoid per-bucket pool roundtrips.
+		scratch := acquireCompositeKeyScratch()
 		values := make([]float64, numBuckets)
 		for bucketIdx := int64(0); bucketIdx < numBuckets; bucketIdx++ {
-			// NOTE-070: pool scratch buffer for composite key lookup.
-			//nolint:forcetypeassert
-			scratch := compositeKeyScratchPool.Get().(*[]byte)
 			*scratch = strconv.AppendInt((*scratch)[:0], bucketIdx, 10)
 			*scratch = append(*scratch, '\x00')
 			*scratch = append(*scratch, attrGroupKey...)
 			bucket := buckets[string(*scratch)]
-			compositeKeyScratchPool.Put(scratch)
 			values[bucketIdx] = traceRowValue(bucket, querySpec.Aggregate.Function, stepSec,
 				querySpec.Aggregate.Quantile)
 		}
+		releaseCompositeKeyScratch(scratch)
 
 		series = append(series, TraceTimeSeries{Labels: labels, Values: values})
 	}
@@ -613,11 +636,11 @@ func traceHistogramSeries(
 		}
 		labels = append(labels, TraceMetricLabel{Name: "__bucket", Value: sk.bucketBoundary})
 
+		// NOTE-070: acquire scratch buffer once for all buckets in this histogram series;
+		// reset to [:0] at each inner iteration to avoid per-bucket pool roundtrips.
+		scratch := acquireCompositeKeyScratch()
 		values := make([]float64, numBuckets)
 		for bucketIdx := int64(0); bucketIdx < numBuckets; bucketIdx++ {
-			// NOTE-070: pool scratch buffer for composite key lookup.
-			//nolint:forcetypeassert
-			scratch := compositeKeyScratchPool.Get().(*[]byte)
 			*scratch = strconv.AppendInt((*scratch)[:0], bucketIdx, 10)
 			*scratch = append(*scratch, '\x00')
 			*scratch = append(*scratch, sk.attrGroupKey...)
@@ -626,8 +649,8 @@ func traceHistogramSeries(
 			if bucket := buckets[string(*scratch)]; bucket != nil {
 				values[bucketIdx] = float64(bucket.count)
 			}
-			compositeKeyScratchPool.Put(scratch)
 		}
+		releaseCompositeKeyScratch(scratch)
 		series = append(series, TraceTimeSeries{Labels: labels, Values: values})
 	}
 

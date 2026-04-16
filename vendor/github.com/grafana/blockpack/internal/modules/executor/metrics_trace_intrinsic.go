@@ -8,8 +8,10 @@ package executor
 // See also NOTE-055 for the streamHistogramGroupBy dict-amortization extension.
 
 import (
+	"cmp"
 	"context"
 	"math"
+	"slices"
 	"sort"
 	"strconv"
 
@@ -18,17 +20,26 @@ import (
 	"github.com/grafana/blockpack/internal/vm"
 )
 
+// ctxCheckInterval is how often (in spans) to check for context cancellation in hot loops.
+// Large enough to bound overhead; small enough to bound cancellation latency.
+const ctxCheckInterval = 100_000
+
 // metricsColumnsAreIntrinsic reports whether all columns in wantColumns are available
 // in this file's intrinsic section, enabling the zero-block-read fast path.
 // It checks the file's actual TOC metadata directly, so both standard intrinsic columns
 // and dedicated columns written by the writer are eligible. This also handles older files
 // that may be missing optional intrinsic columns (they fall back to block scan).
+//
+// NOTE-067: Uses HasIntrinsicColumn (pure map lookup, zero I/O) rather than
+// IntrinsicColumnMeta to avoid triggering a blob read for each column just to
+// check existence. With N intrinsic columns per file and M files, IntrinsicColumnMeta
+// would issue N×M GCS reads here; HasIntrinsicColumn issues zero.
 func metricsColumnsAreIntrinsic(r *modules_reader.Reader, wantColumns map[string]struct{}) bool {
 	if !r.HasIntrinsicSection() {
 		return false
 	}
 	for col := range wantColumns {
-		if _, present := r.IntrinsicColumnMeta(col); !present {
+		if !r.HasIntrinsicColumn(col) {
 			return false
 		}
 	}
@@ -39,11 +50,11 @@ func metricsColumnsAreIntrinsic(r *modules_reader.Reader, wantColumns map[string
 // It accumulates metrics directly from the intrinsic column section without reading any
 // full blocks.
 //
-// Map allocation budget (all paths also allocate one buckets map and filteredKeys when
-// predicates are present; the counts below exclude those shared allocations):
+// Map allocation budget (all paths also allocate one buckets map; predicate-filtered paths
+// pay a one-time merge-join cost of slices.Clone+[]refIdx per file — see NOTE-070):
 //
-//	count/rate, no group-by:                0 extra maps (span:start streamed inline)
-//	count/rate, N group-by:                 2 maps (keyToBucket + groupKeyMap)
+//	count/rate, no group-by:                0 extra maps; 1 []int64 slice of size numSteps (span:start streamed inline)
+//	count/rate, N group-by:                 2 maps (keyToBucket + groupKeyMap) + 1 map[string][]int64 of size numGroups
 //	agg field,  no group-by:                1 map  (keyToBucket; aggregate column streamed directly)
 //	agg field,  N group-by (histogram):     2 maps (keyToBucket + groupKeyMap; seen inside streamHistogramGroupBy) — NOTE-056 fast path eliminates colVals for single group-by
 //	agg field,  N group-by (other):         3 maps (keyToBucket + groupKeyMap + aggVals)
@@ -80,15 +91,12 @@ func executeTraceMetricsIntrinsic(
 
 	hasPreds := program != nil && program.Predicates != nil && len(program.Predicates.Nodes) > 0
 
-	var filteredKeys map[uint32]struct{} // non-nil when predicates reduce the row set
+	// NOTE-070: filteredRefs is applied via merge-join after binary search narrows inRangeRefs.
+	var filteredRefs []modules_shared.BlockRef
 	if hasPreds {
-		refs := BlockRefsFromIntrinsicTOC(r, program, 0)
-		if refs == nil {
+		filteredRefs = BlockRefsFromIntrinsicTOC(r, program, 0)
+		if filteredRefs == nil {
 			return nil, false, nil
-		}
-		filteredKeys = make(map[uint32]struct{}, len(refs))
-		for _, ref := range refs {
-			filteredKeys[packKey(ref.BlockIdx, ref.RowIdx)] = struct{}{}
 		}
 	}
 
@@ -119,27 +127,24 @@ func executeTraceMetricsIntrinsic(
 	inRangeRefs := tsCol.BlockRefs[lo:hi]
 	inRangeVals := tsVals[lo:hi]
 
+	// Apply predicate filter via merge-join (NOTE-070).
+	// mergeJoinFilteredRefsWithVals sorts both slices by packKey before walking;
+	// inRangeRefs is timestamp-sorted (types.go:228), not packKey-sorted.
+	if filteredRefs != nil {
+		inRangeRefs, inRangeVals = mergeJoinFilteredRefsWithVals(filteredRefs, inRangeRefs, inRangeVals)
+		if len(inRangeRefs) == 0 {
+			return &TraceMetricsResult{}, true, nil
+		}
+	}
+
 	buckets := make(map[string]*aggBucketState)
 
-	// Fast inline path for count/rate with no group-by: stream span:start directly
-	// without building keyToBucket. This is the most common metrics query shape
-	// ({ } | count_over_time(), { } | rate()) and avoids any intermediate hash map.
-	const ctxCheckInterval = 100_000 // check context every 100K spans to bound cancellation latency
+	// Fast inline path for count/rate with no group-by: see streamCountRateNoGroupBy.
+	// NOTE-068: uses a flat []int64 slice instead of map[string]*aggBucketState in the
+	// hot loop to eliminate per-span string allocations and hash lookups.
 	if isCountRate && len(agg.GroupBy) == 0 {
-		for i, ref := range inRangeRefs {
-			if i%ctxCheckInterval == 0 {
-				if err := ctx.Err(); err != nil {
-					return nil, false, err
-				}
-			}
-			if filteredKeys != nil {
-				if _, ok := filteredKeys[packKey(ref.BlockIdx, ref.RowIdx)]; !ok {
-					continue
-				}
-			}
-			ts := int64(inRangeVals[i]) //nolint:gosec
-			key := strconv.FormatInt(timeBucketIndex(ts, tb.StartTime, tb.StepSizeNanos), 10) + "\x00"
-			intrinsicGetOrCreateBucket(buckets, key).count++
+		if err := streamCountRateNoGroupBy(ctx, inRangeRefs, inRangeVals, tb, buckets); err != nil {
+			return nil, false, err
 		}
 		if len(buckets) == 0 {
 			return &TraceMetricsResult{}, true, nil
@@ -155,18 +160,13 @@ func executeTraceMetricsIntrinsic(
 				}
 			}
 			pk := packKey(ref.BlockIdx, ref.RowIdx)
-			if filteredKeys != nil {
-				if _, ok := filteredKeys[pk]; !ok {
-					continue
-				}
-			}
 			ts := int64(inRangeVals[i]) //nolint:gosec
 			keyToBucket[pk] = timeBucketIndex(ts, tb.StartTime, tb.StepSizeNanos)
 		}
 		if len(keyToBucket) == 0 {
 			return &TraceMetricsResult{}, true, nil
 		}
-		if err := accumulateIntrinsicBuckets(r, keyToBucket, querySpec, buckets); err != nil {
+		if err := accumulateIntrinsicBuckets(ctx, r, keyToBucket, querySpec, buckets); err != nil {
 			return nil, false, err
 		}
 	}
@@ -185,6 +185,68 @@ func packKey(blockIdx, rowIdx uint16) uint32 {
 	return uint32(blockIdx)<<16 | uint32(rowIdx)
 }
 
+// mergeJoinFilteredRefsWithVals returns the subset of (inRangeRefs, inRangeVals)
+// whose packKey appears in filteredRefs.
+//
+// NOTE-070: Replaces filteredKeys map[uint32]struct{} to eliminate hash allocation
+// and O(N_all) hash lookups on the filtered intrinsic path.
+//
+// Sort invariant: inRangeRefs is timestamp-sorted (types.go:228), not packKey-sorted.
+// filteredRefs order is unspecified (intersectBlockRefSets may return any order).
+// Both must be sorted by packKey before the two-pointer walk.
+//
+// Mutation rules:
+//   - filteredRefs is cloned before sorting (caller's slice is not modified).
+//   - inRangeRefs is NOT sorted in-place (it is a sub-slice of a shared intrinsic
+//     column). A sorted index ([]refIdx) is built over original positions so that
+//     inRangeVals alignment is preserved.
+func mergeJoinFilteredRefsWithVals(
+	filteredRefs []modules_shared.BlockRef,
+	inRangeRefs []modules_shared.BlockRef,
+	inRangeVals []uint64,
+) (outRefs []modules_shared.BlockRef, outVals []uint64) {
+	if len(filteredRefs) == 0 || len(inRangeRefs) == 0 {
+		return nil, nil
+	}
+
+	// Sort a copy of filteredRefs by packKey (do not mutate caller's slice).
+	sortedFilter := slices.Clone(filteredRefs)
+	slices.SortFunc(sortedFilter, func(a, b modules_shared.BlockRef) int {
+		return cmp.Compare(packKey(a.BlockIdx, a.RowIdx), packKey(b.BlockIdx, b.RowIdx))
+	})
+
+	// Build a sorted index over inRangeRefs by packKey.
+	// Using an index avoids reordering inRangeVals (which must stay parallel to inRangeRefs).
+	type refIdx struct {
+		pk  uint32
+		pos int
+	}
+	idx := make([]refIdx, len(inRangeRefs))
+	for i, r := range inRangeRefs {
+		idx[i] = refIdx{packKey(r.BlockIdx, r.RowIdx), i}
+	}
+	slices.SortFunc(idx, func(a, b refIdx) int {
+		return cmp.Compare(a.pk, b.pk)
+	})
+
+	outCap := min(len(sortedFilter), len(idx))
+	outRefs = make([]modules_shared.BlockRef, 0, outCap)
+	outVals = make([]uint64, 0, outCap)
+
+	fi := 0
+	for _, ri := range idx {
+		// Advance filteredRefs pointer past any keys smaller than ri.pk.
+		for fi < len(sortedFilter) && packKey(sortedFilter[fi].BlockIdx, sortedFilter[fi].RowIdx) < ri.pk {
+			fi++
+		}
+		if fi < len(sortedFilter) && packKey(sortedFilter[fi].BlockIdx, sortedFilter[fi].RowIdx) == ri.pk {
+			outRefs = append(outRefs, inRangeRefs[ri.pos])
+			outVals = append(outVals, inRangeVals[ri.pos])
+		}
+	}
+	return outRefs, outVals
+}
+
 // intrinsicGetOrCreateBucket returns the bucket for compositeKey, creating it if absent.
 func intrinsicGetOrCreateBucket(buckets map[string]*aggBucketState, compositeKey string) *aggBucketState {
 	b, exists := buckets[compositeKey]
@@ -198,17 +260,113 @@ func intrinsicGetOrCreateBucket(buckets map[string]*aggBucketState, compositeKey
 	return b
 }
 
+// streamCountRateNoGroupBy is the hot loop for count/rate queries with no group-by.
+// It accumulates per-step counts into a flat []int64 slice (size = numSteps) rather
+// than a map[string]*aggBucketState, eliminating one string allocation and one hash
+// lookup per span. After the loop, non-zero entries are written into buckets.
+//
+// NOTE-068: This is where the 18% ctrlGroupMatchH2 and most of the 28% GC pressure
+// originated before this optimization (pprof, 2026-04-16). ~150M iterations for M1.
+func streamCountRateNoGroupBy(
+	ctx context.Context,
+	inRangeRefs []modules_shared.BlockRef,
+	inRangeVals []uint64,
+	tb vm.TimeBucketSpec,
+	buckets map[string]*aggBucketState,
+) error {
+	numSteps := (tb.EndTime - tb.StartTime + tb.StepSizeNanos - 1) / tb.StepSizeNanos
+	if numSteps <= 0 {
+		return nil
+	}
+	counts := make([]int64, numSteps)
+	for i := range inRangeRefs {
+		if i%ctxCheckInterval == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+		ts := int64(inRangeVals[i]) //nolint:gosec
+		idx := timeBucketIndex(ts, tb.StartTime, tb.StepSizeNanos)
+		if idx >= 0 && idx < numSteps {
+			counts[idx]++
+		}
+	}
+	// Populate buckets from non-zero entries only. At most numSteps iterations (e.g. 360
+	// for 6h/60s), negligible vs the savings above.
+	for idx, c := range counts {
+		if c > 0 {
+			key := strconv.FormatInt(int64(idx), 10) + "\x00" //nolint:gosec
+			intrinsicGetOrCreateBucket(buckets, key).count = c
+		}
+	}
+	return nil
+}
+
+// streamCountRateGroupBy is the hot loop for count/rate queries with group-by.
+// It accumulates per-(group, step) counts into a map[string][]int64 — one []int64
+// slice of size numSteps per unique group value — rather than building a composite
+// string key per span.
+//
+// NOTE-069: The old loop did `FormatInt(bucketIdx)+"\x00"+groupKeyMap[pk]` for every
+// span, allocating a new string each time. With ~150M spans for M5 ({} | rate() by
+// (kind)), that was ~150M string allocs. The new approach allocates one []int64 per
+// unique group value (e.g. 6 for kind, ~200 for service.name), then writes
+// counts[bucketIdx]++ — zero per-span allocations in the hot path.
+func streamCountRateGroupBy(
+	ctx context.Context,
+	keyToBucket map[uint32]int64,
+	groupKeyMap map[uint32]string,
+	tb vm.TimeBucketSpec,
+	buckets map[string]*aggBucketState,
+) error {
+	numSteps := (tb.EndTime - tb.StartTime + tb.StepSizeNanos - 1) / tb.StepSizeNanos
+	if numSteps <= 0 {
+		return nil
+	}
+	// groupCounts: group key → per-step count slice. One entry per unique group value.
+	groupCounts := make(map[string][]int64)
+	i := 0
+	for pk, bucketIdx := range keyToBucket {
+		if i%ctxCheckInterval == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+		i++
+		gk := groupKeyMap[pk]
+		counts := groupCounts[gk]
+		if counts == nil {
+			counts = make([]int64, numSteps)
+			groupCounts[gk] = counts
+		}
+		if bucketIdx >= 0 && bucketIdx < numSteps {
+			counts[bucketIdx]++
+		}
+	}
+	// Populate buckets from non-zero entries only.
+	for gk, counts := range groupCounts {
+		for idx, c := range counts {
+			if c > 0 {
+				key := strconv.FormatInt(int64(idx), 10) + "\x00" + gk //nolint:gosec
+				intrinsicGetOrCreateBucket(buckets, key).count = c
+			}
+		}
+	}
+	return nil
+}
+
 // accumulateIntrinsicBuckets handles queries that need keyToBucket: those with group-by
 // columns or an aggregate field. Count/rate with no group-by is handled inline in the
 // caller and never reaches this function.
 //
 // Strategy matrix:
 //
-//	count/rate, N group-by:  build groupKeyMap (1 map), iterate keyToBucket
+//	count/rate, N group-by:  build groupKeyMap (1 map), call streamCountRateGroupBy
 //	agg field,  no group-by: stream aggregate column against keyToBucket (no aggVals map)
 //	agg field,  N group-by (histogram): streamHistogramGroupBy (2 maps: keyToBucket + groupKeyMap; seen map is inside streamHistogramGroupBy)
 //	agg field,  N group-by (other):     build groupKeyMap (1 map) + aggVals (1 map), iterate keyToBucket
 func accumulateIntrinsicBuckets(
+	ctx context.Context,
 	r *modules_reader.Reader,
 	keyToBucket map[uint32]int64,
 	querySpec *vm.QuerySpec,
@@ -231,12 +389,10 @@ func accumulateIntrinsicBuckets(
 	}
 
 	if isCountRate {
-		// count/rate with group-by: two maps total (keyToBucket + groupKeyMap).
-		for pk, bucketIdx := range keyToBucket {
-			key := strconv.FormatInt(bucketIdx, 10) + "\x00" + groupKeyMap[pk]
-			intrinsicGetOrCreateBucket(buckets, key).count++
-		}
-		return nil
+		// count/rate with group-by: see streamCountRateGroupBy.
+		// NOTE-069: uses map[string][]int64 keyed by group value to eliminate
+		// per-span composite-string allocations (~150M for M5 {} | rate() by (kind)).
+		return streamCountRateGroupBy(ctx, keyToBucket, groupKeyMap, querySpec.TimeBucketing, buckets)
 	}
 
 	// HISTOGRAM with group-by: single-pass column scan — no aggVals map allocated.

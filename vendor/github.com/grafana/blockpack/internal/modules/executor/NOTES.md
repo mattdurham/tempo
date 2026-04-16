@@ -2108,3 +2108,188 @@ captured rowSet variable; processGroup is sequential (SPEC-STREAM-11) so no sync
 is needed.
 
 Back-ref: `internal/modules/executor/stream.go:forEachBlockInGroups`
+
+---
+
+## NOTE-067: metricsColumnsAreIntrinsic — Zero-I/O Fast-Path Existence Check (2026-04-16)
+*Added: 2026-04-16*
+
+**Problem:** `metricsColumnsAreIntrinsic` called `r.IntrinsicColumnMeta(col)` for each
+wanted column. For V14 files, `IntrinsicColumnMeta` triggers a lazy blob read when
+`meta.Format == 0` (i.e. on the first call per column). Combined with NOTE-016 removing
+the eager pre-reads from `parseSectionsLazyV14`, this meant every metrics query that
+hit the fast-path check would issue one GCS read per needed column per file — just to
+verify the column exists, before deciding whether to use the intrinsic fast path.
+
+**Decision:** Replace `r.IntrinsicColumnMeta(col)` with `r.HasIntrinsicColumn(col)` in
+`metricsColumnsAreIntrinsic`. `HasIntrinsicColumn` is a pure map lookup added to Reader
+(NOTE-016) that never issues any I/O. The existence check is all `metricsColumnsAreIntrinsic`
+needs — `Format/Type/Count` are not consulted here.
+
+**Rationale:** The cold-cache cost for a metrics query across 107 Tempo blocks was:
+- Before: 107 × N_columns GCS reads in `parseSectionsLazyV14` at open, plus N×107 in
+  `metricsColumnsAreIntrinsic` if eager reads were removed.
+- After: 0 GCS reads at open, 0 GCS reads in the existence check. Only the actual column
+  data needed by `executeTraceMetricsIntrinsic` (e.g. `span:start`, group-by column) is
+  fetched, lazily and only once per column per file.
+
+**How to apply:** Any future fast-path existence check that does not need Format/Type/Count
+should use `HasIntrinsicColumn` rather than `IntrinsicColumnMeta`.
+
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:metricsColumnsAreIntrinsic`
+
+---
+
+## NOTE-068: count/rate no-group-by fast path — flat []int64 instead of map[string]*aggBucketState (2026-04-16)
+*Added: 2026-04-16*
+
+The original hot loop for `count/rate` with no group-by allocated a new string per span
+(`strconv.FormatInt(idx, 10) + "\x00"`) and did a `map[string]*aggBucketState` lookup on every
+iteration. With ~1.4M spans/file × 107 files, M1 (`{} | rate()`) executed ~150M string
+allocations and hash lookups per query.
+
+Pyroscope CPU profile (2026-04-16, 2-hour window) showed:
+- `maps.ctrlGroupMatchH2`: 23s self (14%) — Swiss-table map probing from these lookups
+- `runtime.gcBgMarkWorker` + `gcDrain`: ~46s (28%) — GC pressure from string allocations
+
+**Fix:** Pre-allocate `counts []int64` of size `numSteps` (e.g., 360 for 6h/60s step).
+In the hot loop, write `counts[idx]++` — zero allocations, zero hash lookups.
+After the loop, populate `buckets` from non-zero `counts` entries (at most `numSteps` iterations).
+The key format (`strconv.FormatInt(idx, 10) + "\x00"`) is identical to before, so
+`traceBuildDenseSeries` and `collectGroupKeys` require no changes.
+
+**Why not apply to group-by paths:** The composite key includes the group-by value, so a
+simple slice index cannot replace the map without a separate dimension per group-by value.
+
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:executeTraceMetricsIntrinsic` lines 133–165
+
+---
+
+## NOTE-069: count/rate group-by fast path — map[string][]int64 instead of per-span composite string (2026-04-16)
+*Added: 2026-04-16*
+
+The group-by count/rate loop in `accumulateIntrinsicBuckets` built a composite string key
+(`strconv.FormatInt(bucketIdx, 10) + "\x00" + groupKeyMap[pk]`) for every span in
+`keyToBucket`, allocating a new string each iteration. For M5 (`{} | rate() by (kind)`)
+with ~150M spans, this was ~150M string allocations and hash lookups — the same pattern
+fixed in NOTE-068 for the no-group-by path.
+
+**Fix:** `streamCountRateGroupBy` uses `map[string][]int64` keyed by the group value
+(e.g., "server", "client") with a `[]int64` count slice of size `numSteps` as the value.
+Per-span work: one existing-string map lookup (`groupKeyMap[pk]`) + one array write.
+After the loop, populate `buckets` from non-zero (group, step) pairs only — at most
+`numGroups × numSteps` entries (e.g., 6 kinds × 360 steps = 2,160 for M5, vs 150M before).
+
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:streamCountRateGroupBy`
+
+---
+
+## NOTE-070: metrics ColumnPredicate was match-all — filters silently ignored in block scan path (2026-04-16)
+*Added: 2026-04-16*
+
+**Bug:** `CompileTraceQLMetrics` created programs with `ColumnPredicate = FullScan()` (match-all).
+The filter expression was only compiled into `program.Predicates` for block-level pruning
+(bloom filters, range indexes). Row-level filtering in the block scan path was never applied.
+
+**Effect:** Any metrics query with a filter that falls back to the block scan path returned
+results identical to the no-filter case. Queries like `{kind=server && sc>=400} | rate()`
+showed the same series count as `{} | rate()` (~197 series) instead of the correct filtered
+count (~39 series from parquet), because `BlockRefsFromIntrinsicTOC` cannot evaluate range
+predicates on dict-format columns (`span.http.response.status_code` is stored as dict),
+forcing a fall-through to the block scan where the predicate was a no-op.
+
+The intrinsic fast path was unaffected (it uses `program.Predicates` directly, not
+`program.ColumnPredicate`). Equality predicates on dict columns (e.g., `{kind=server}`,
+`{resource.service.name="grafana"}`) worked correctly through the intrinsic path. Only
+queries requiring block scan fallback — range predicates on dict columns — were broken.
+
+**Fix:** `CompileTraceQLMetrics` now also compiles the filter into `ColumnPredicate` via
+`traceqlCompiler.compileColumnPredicate`, matching the path used by `CompileTraceQLFilterWithOptions`.
+
+Back-ref: `internal/vm/metrics_compiler.go:CompileTraceQLMetrics`
+
+---
+
+## NOTE-071: compositeKey Scratch-Buffer Pool — Zero-Allocation Map Lookup (2026-04-16)
+
+(Renumbered from NOTE-070 to resolve collision with the ColumnPredicate fix above when merged
+onto perf-stack-local. Upstream PR grafana/blockpack#228 will keep NOTE-070; collision only
+exists on this local perf-stack-local branch.)
+
+**Problem:** `traceAccumulateRow`, `traceBuildDenseSeries`, and the histogram series builder each
+constructed a composite map key using `strconv.FormatInt(bucketIdx, 10) + "\x00" + attrGroupKey`,
+allocating one heap string per span per metrics query. Pyroscope object-count profiling showed
+2.2M `strconv.FormatInt` heap allocations per query, making GC the dominant CPU consumer
+(74% on querier).
+
+**Fix:** Added `compositeKeyScratchPool` (`sync.Pool` of `*[]byte`, 128-byte initial capacity).
+Key is built with `strconv.AppendInt` / `append` / `strconv.AppendFloat` into the pooled buffer.
+`string([]byte)` used as a map-index expression does not allocate — the Go compiler recognizes
+this pattern and avoids copying when the string doesn't escape the index expression. A real
+`string` allocation is made only inside the `!exists` branch where the key must be stored as a
+map key.
+
+**Why `*[]byte` not `[]byte`:** `sync.Pool` stores `any`; storing `*[]byte` avoids the interface
+boxing allocation on `Put` and lets `AppendInt`/`AppendFloat` grow the slice without losing the
+new backing array.
+
+Back-ref: `internal/modules/executor/metrics_trace.go:traceAccumulateRow`,
+`traceBuildDenseSeries`, `traceHistogramSeries`
+
+---
+
+## NOTE-072: mergeJoinFilteredRefsWithVals — Merge-Join Replaces filteredKeys Map (2026-04-16)
+*Added: 2026-04-16*
+
+(Renumbered from NOTE-070 to resolve collision with the ColumnPredicate fix above when merged
+onto perf-stack-local. Upstream PR grafana/blockpack#229 will keep NOTE-070; collision only
+exists on this local perf-stack-local branch.)
+
+**Problem:** `executeTraceMetricsIntrinsic` (and `streamCountRateNoGroupBy`) used a
+`filteredKeys map[uint32]struct{}` to record which packed keys passed the predicate filter.
+With ~1.4M spans/file × 107 files, this allocated one `map[uint32]struct{}` per file plus
+one map-insert and one map-lookup per span. Pyroscope CPU profiling (2026-04-16) attributed
+17.49% CPU to map operations and 10.66% to GC pressure from these allocations.
+
+**Fix:** `mergeJoinFilteredRefsWithVals` sorts both ref slices by packKey and walks them
+with two pointers in O(M log M + N log N + N + M). The sort is paid once per file call;
+per-span work is zero allocations and zero hash lookups.
+
+**Critical sort invariant:** `inRangeRefs` is a sub-slice of `tsCol.BlockRefs`, which is
+**timestamp-sorted** (`types.go:228`, NOTE-042) — NOT packKey-sorted. A binary search
+narrows `tsCol.BlockRefs` to the in-range window; that sub-slice preserves timestamp order.
+Using it directly as one side of a packKey merge-join is incorrect and would produce missing
+or spurious results.
+
+**Implementation:**
+- `filteredRefs` is cloned via `slices.Clone` before sorting. `BlockRefsFromIntrinsicTOC`
+  may return a sub-slice of a cached structure; sorting in-place would silently corrupt it.
+- `inRangeRefs` is NOT sorted in-place. A `[]refIdx` sorted index is built over the
+  original positions so that `inRangeVals` alignment is preserved (both slices are
+  parallel; reordering `inRangeRefs` without reordering `inRangeVals` would misalign values).
+- The two-pointer walk advances over the `refIdx` index and the sorted `filteredRefs` clone.
+  Matched entries use `ri.pos` to read the original `inRangeRefs[ri.pos]` and `inRangeVals[ri.pos]`.
+
+**Output slices:** `outRefs` and `outVals` are allocated once per file (size ≤ min(N,M))
+and passed through to `accumulateIntrinsicBuckets` or iterated directly in
+`streamCountRateNoGroupBy`. They are O(1) per file, not O(N spans).
+
+**Call sites:**
+- `executeTraceMetricsIntrinsic` (`metrics_trace_intrinsic.go`): calls
+  `mergeJoinFilteredRefsWithVals` after binary-search narrows `inRangeRefs`/`inRangeVals`,
+  BEFORE dispatching to `streamCountRateNoGroupBy` (count/rate, no group-by) or the
+  `keyToBucket` group-by / aggregate-field path. Both downstream paths receive the
+  already-filtered `inRangeRefs`/`inRangeVals` directly.
+- `streamCountRateNoGroupBy`: `filteredKeys map[uint32]struct{}` parameter removed and the
+  `filteredKeys != nil` check deleted from the loop body. The function now receives
+  pre-filtered `inRangeRefs`/`inRangeVals` from `executeTraceMetricsIntrinsic`.
+- `keyToBucket` loop (group-by / agg-field path in `executeTraceMetricsIntrinsic`):
+  `filteredKeys != nil` check removed; iterates pre-filtered `inRangeRefs` directly.
+
+**Benchmark result:** BENCH-EX-08 post-fix baseline: 76 allocs/op (~15452 B/op). All
+remaining allocations are O(1) per file (filteredRefs clone, refIdx index slice,
+outRefs/outVals output slices, buckets map, reader internals).
+
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:mergeJoinFilteredRefsWithVals`
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:streamCountRateNoGroupBy`
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:executeTraceMetricsIntrinsic`

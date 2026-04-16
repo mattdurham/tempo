@@ -2040,3 +2040,59 @@ increments/decrements an in-memory counter, sleeps 2ms, and records the peak.
 CRIT-BGP-1 / SPEC-STREAM-11: semaphore must be released after processGroup to keep
 peak in-memory groups ≤ W.
 Back-ref: `internal/modules/executor/block_group_pipeline_test.go:TestBlockGroupPipeline_PeakInMemoryGroupsBound`
+
+---
+
+### EXEC-TEST-POOL-001: compositeKey pool — zero allocations per map hit
+
+Verify that a metrics query against a block with multiple spans produces 0 allocations per
+span for the composite key construction (map hit path). Use `testing.AllocsPerRun` with a
+representative benchmark. Acceptable: ≤ 1 alloc/op for the entire `traceAccumulateRow`
+call on cache hit. New alloc occurs only on first bucket creation (`!exists` branch).
+Back-ref: `internal/modules/executor/metrics_trace_pool_test.go:TestCompositeKeyScratchPoolZeroAllocsOnHit`
+
+---
+
+## EX-ETM-INTR-07: TestMergeJoinRefs_CorrectnessVsMap
+
+**Scenario:** `mergeJoinFilteredRefsWithVals` produces identical results to the reference
+`filteredKeys map[uint32]struct{}` implementation for all input shapes, including empty
+inputs, no overlap, partial overlap, full overlap, and duplicate keys.
+
+**Setup:** Table-driven unit test in `internal/modules/executor/merge_join_test.go`.
+Tests use `packKeyVals` helper to construct parallel ref/val slices from `(blockIdx, rowIdx,
+val)` tuples. Both the merge-join output and the reference map output are compared for
+`outRefs` and `outVals` equality.
+
+**Cases include:**
+- Empty filteredRefs → empty output
+- Empty inRangeRefs → empty output
+- No overlap between filteredRefs and inRangeRefs → empty output
+- Full overlap (identical ref sets) → all entries in output
+- Partial overlap (interleaved) → only joined entries
+- Duplicate packed keys in inRangeRefs handled (only `ri` advances on match; `fi` stays, so duplicate inRangeRefs entries with the same packKey are all emitted)
+
+**Assertions:** `outRefs` and `outVals` match reference implementation for every case; no
+panic; zero map allocations during join (verified by `b.ReportAllocs()` in BENCH-EX-08).
+
+Back-ref: `internal/modules/executor/merge_join_test.go:TestMergeJoinRefs_CorrectnessVsMap`
+
+---
+
+## EX-ETM-INTR-08: BenchmarkTraceMetrics_FilteredIntrinsic_AllocCount
+
+**Scenario:** Measures per-op allocations for `{ status = error } | rate()` on a 300-span
+single-block file (200 matching, 100 non-matching) after the NOTE-072 merge-join optimization.
+
+After the fix, no `map[uint32]struct{}` allocation should appear per benchmark iteration.
+Total allocs/op reflects only sort-support allocations (`slices.Clone` for filteredRefs,
+`[]refIdx` for the index) — both O(1) per file, not O(N) per span. See BENCH-EX-08.
+
+**Setup (outside timed loop):**
+- Write 300 spans: 200 with `status=error`, 100 with `status=ok`. `MaxBlockSpans=301` (single block).
+- Compile `{ status = error } | rate()` with 6 × 60s buckets.
+- Run with `b.ReportAllocs()`.
+
+**Assertions:** No `map[uint32]struct{}` allocation per iteration; allocs/op matches BENCH-EX-08 baseline (~76 allocs/op).
+
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic_test.go:BenchmarkTraceMetrics_FilteredIntrinsic_AllocCount`

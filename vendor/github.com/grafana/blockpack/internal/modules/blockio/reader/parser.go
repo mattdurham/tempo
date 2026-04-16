@@ -504,35 +504,19 @@ func (r *Reader) parseSectionsLazyV14() error {
 
 	// Name-keyed entries: one per intrinsic column blob.
 	// Each blob on disk is snappy-compressed; the reader snappy-decodes it in GetIntrinsicColumn.
-	// We peek format and count from each blob here so the executor fast path can dispatch on
-	// meta.Format without a full decode (SPEC-V14-001: Format/Count must be populated at open time).
-	// Compressed blobs are cached via r.cache (key: fileID+"/v14/intr/<name>") to avoid
-	// repeated GCS round-trips when creating a new Reader for the same file.
+	// NOTE-016: Offset and Length are populated from the section directory at open time (zero I/O).
+	// Format/Type/Count are populated lazily on first IntrinsicColumnMeta call (one blob read per
+	// column, cached). This avoids reading all N intrinsic blobs at open time when a query only
+	// needs a subset (e.g. the metrics fast path needs only span:start and possibly one group-by
+	// column — not all N columns in the file).
 	if len(r.sectionDir.NameEntries) > 0 {
 		r.intrinsicIndex = make(map[string]shared.IntrinsicColMeta, len(r.sectionDir.NameEntries))
 		for name, e := range r.sectionDir.NameEntries {
-			meta := shared.IntrinsicColMeta{
+			r.intrinsicIndex[name] = shared.IntrinsicColMeta{
 				Name:   name,
 				Offset: e.Offset,
 				Length: e.CompressedLen,
 			}
-			// Read the compressed blob to peek format/type/count; errors are non-fatal (fields stay 0).
-			// PeekIntrinsicBlobHeader reads the first byte to distinguish paged blobs (0x02 sentinel,
-			// raw pages) from non-paged blobs (snappy-compressed).
-			// Use the same key as GetIntrinsicColumnBlob so both operations share
-			// one cached entry per column per file.
-			cacheKey := fmt.Sprintf("%s/intrinsic/%s", r.fileID, name)
-			blob, readErr := r.cache.GetOrFetch(cacheKey, func() ([]byte, error) {
-				return r.readRange(e.Offset, uint64(e.CompressedLen), rw.DataTypeMetadata) //nolint:gosec
-			})
-			if readErr == nil {
-				if f, ct, cnt, peekErr := shared.PeekIntrinsicBlobHeader(blob); peekErr == nil && f != 0 {
-					meta.Format = f
-					meta.Type = ct
-					meta.Count = cnt
-				}
-			}
-			r.intrinsicIndex[name] = meta
 		}
 	}
 

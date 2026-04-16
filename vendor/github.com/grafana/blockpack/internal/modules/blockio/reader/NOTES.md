@@ -671,3 +671,40 @@ section blob is in the in-memory cache. Bloom-hit paths always work because
 provider read on the warm-hit path.
 
 Back-ref: `internal/modules/blockio/reader/parser.go:ensureV14TraceSection`
+
+---
+
+## NOTE-016: parseSectionsLazyV14 — Deferred Intrinsic Blob Reads (2026-04-16)
+*Added: 2026-04-16*
+
+**Problem:** `parseSectionsLazyV14` previously called `r.cache.GetOrFetch` for every
+name-keyed intrinsic column blob to peek `Format/Type/Count` from each blob header at
+reader-open time. With N intrinsic columns per file and M blockpack files per Tempo shard
+query, this produced N×M GCS reads just to open readers — even for metrics queries that
+only need one or two columns (e.g. `span:start` for `{} | rate()`). On a cold cache with
+107 blocks × ~10 columns per block, this was ~1070 GCS reads before any useful work.
+
+**Decision:** Remove the eager blob reads from `parseSectionsLazyV14`. The intrinsic index
+is now populated with only `Name/Offset/Length` from the section directory (zero I/O).
+`Format/Type/Count` remain zero until the first `IntrinsicColumnMeta(name)` call for that
+column, which triggers the existing lazy-peek path (one blob read per column, cached).
+
+Alongside this, `HasIntrinsicColumn(name string) bool` was added to `Reader` as a
+pure map-lookup that never triggers any I/O. `metricsColumnsAreIntrinsic` now calls
+`HasIntrinsicColumn` instead of `IntrinsicColumnMeta` to check column existence without
+issuing a blob read per column per file.
+
+**Effect on I/O at open time:** Reader open for a V14 file is now exactly 3 reads:
+footer + section directory + block_index. All other sections (intrinsic blobs, trace
+index, range index, TS index, sketch index, file bloom) are deferred to first access.
+
+**Effect on predicate evaluation:** `predicates.go` calls `IntrinsicColumnMeta` which
+still triggers the lazy peek on first access per column. The blob is immediately cached
+in `r.cache` (same key as `GetIntrinsicColumnBlob`), so subsequent `GetIntrinsicColumnBlob`
+calls for the same column-file pair are cache hits.
+
+**Consequence:** The reader_test.go `TestLeanReader_ThreeIO` assertion was tightened from
+`>= 3` to `== 3` since reader open is now deterministically 3 reads for V14 files.
+
+Back-ref: `internal/modules/blockio/reader/parser.go:parseSectionsLazyV14`,
+`internal/modules/blockio/reader/intrinsic_reader.go:HasIntrinsicColumn`
