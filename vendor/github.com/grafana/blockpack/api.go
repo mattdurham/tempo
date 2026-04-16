@@ -14,6 +14,7 @@
 package blockpack
 
 import (
+	"context"
 	"encoding/hex"
 	"fmt"
 	"math"
@@ -423,7 +424,12 @@ type TraceMetricOptions struct {
 // ceil((alignedEnd-alignedStart)/StepNano), which may exceed ceil((EndNano-StartNano)/StepNano)
 // when the inputs are not already step-aligned.
 // COUNT/RATE: missing buckets are 0. Other functions: missing buckets are NaN.
-func ExecuteMetricsTraceQL(r *Reader, query string, opts TraceMetricOptions) (result *TraceMetricsResult, err error) {
+func ExecuteMetricsTraceQL(
+	ctx context.Context,
+	r *Reader,
+	query string,
+	opts TraceMetricOptions,
+) (result *TraceMetricsResult, err error) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			result = nil
@@ -433,6 +439,10 @@ func ExecuteMetricsTraceQL(r *Reader, query string, opts TraceMetricOptions) (re
 
 	if r == nil {
 		return nil, fmt.Errorf("ExecuteMetricsTraceQL: reader cannot be nil")
+	}
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	stepNano := opts.StepNano
@@ -481,5 +491,5 @@ func ExecuteMetricsTraceQL(r *Reader, query string, opts TraceMetricOptions) (re
 	// Override the step size with the caller-provided value (compiler uses a fixed default).
 	spec.TimeBucketing.StepSizeNanos = stepNano
 
-	return modules_executor.ExecuteTraceMetrics(r, prog, spec)
+	return modules_executor.ExecuteTraceMetrics(ctx, r, prog, spec)
 }

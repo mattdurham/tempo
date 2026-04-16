@@ -70,8 +70,14 @@ func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.Blo
 	// Map Tempo dedicated columns to blockpack dedicated columns.
 	// span-scope → "span." prefix; resource-scope → "resource." prefix.
 	// Event-scope and unknown scopes are not yet supported by blockpack and are skipped.
-	if len(meta.DedicatedColumns) > 0 {
-		writerCfg.DedicatedColumns = dedicatedColumnsToBlockpack(meta.DedicatedColumns)
+	// Prefer per-tenant override in meta; fall back to block config default (which carries
+	// DefaultDedicatedColumns for all tenants without an explicit per-tenant override).
+	dedicatedCols := meta.DedicatedColumns
+	if len(dedicatedCols) == 0 {
+		dedicatedCols = cfg.DedicatedColumns
+	}
+	if len(dedicatedCols) > 0 {
+		writerCfg.DedicatedColumns = dedicatedColumnsToBlockpack(dedicatedCols)
 	}
 
 	writer, err := blockpack.NewWriterWithConfig(writerCfg)
