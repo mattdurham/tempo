@@ -873,7 +873,14 @@ func collectIntrinsicPlain(
 	// and returns MatchedRow.Block populated. O(M) where M is the result count.
 	blockOrder, blockCandidates := groupRefsByBlock(refs)
 	results := make([]MatchedRow, 0, len(refs))
-	err := forEachBlockInGroups(r, blockOrder, blockCandidates, wantColumns, secondPassCols, "collectIntrinsicPlain", nil,
+	err := forEachBlockInGroups(
+		r,
+		blockOrder,
+		blockCandidates,
+		wantColumns,
+		secondPassCols,
+		"collectIntrinsicPlain",
+		nil,
 		func(pb parsedBlock, candidateRows []int) error {
 			for _, rowIdx := range candidateRows {
 				results = append(results, MatchedRow{
@@ -883,7 +890,8 @@ func collectIntrinsicPlain(
 				})
 			}
 			return nil
-		})
+		},
+	)
 	if err != nil {
 		return nil, err
 	}

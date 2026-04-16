@@ -95,6 +95,9 @@ func (w *walBlock) initWriter() error {
 	if emb := getProcessEmbedder(configuredEmbedURL); emb != nil {
 		cfg.Embedder = emb
 	}
+	if w.meta != nil && len(w.meta.DedicatedColumns) > 0 {
+		cfg.DedicatedColumns = dedicatedColumnsToBlockpack(w.meta.DedicatedColumns)
+	}
 	writer, err := blockpack.NewWriterWithConfig(cfg)
 	if err != nil {
 		return fmt.Errorf("failed to create blockpack writer: %w", err)
@@ -236,6 +239,9 @@ func (w *walBlock) FindTraceByID(_ context.Context, id common.ID, _ common.Searc
 		if emb := getProcessEmbedder(configuredEmbedURL); emb != nil {
 			cfg.Embedder = emb
 		}
+		if w.meta != nil && len(w.meta.DedicatedColumns) > 0 {
+			cfg.DedicatedColumns = dedicatedColumnsToBlockpack(w.meta.DedicatedColumns)
+		}
 		newWriter, err := blockpack.NewWriterWithConfig(cfg)
 		if err != nil {
 			w.mu.Unlock()
@@ -320,6 +326,9 @@ func (w *walBlock) Fetch(ctx context.Context, req traceql.FetchSpansRequest, opt
 		}
 		if emb := getProcessEmbedder(configuredEmbedURL); emb != nil {
 			cfg.Embedder = emb
+		}
+		if w.meta != nil && len(w.meta.DedicatedColumns) > 0 {
+			cfg.DedicatedColumns = dedicatedColumnsToBlockpack(w.meta.DedicatedColumns)
 		}
 		newWriter, err := blockpack.NewWriterWithConfig(cfg)
 		if err != nil {

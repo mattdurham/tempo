@@ -61,6 +61,12 @@ type blockBuilder struct {
 	// per-row calls. Nil for test helpers that don't need accumulation.
 	intrinsicAccum *intrinsicAccumulator
 
+	// dedicatedCols is the set of full column names (e.g. "span.http.method") to be
+	// written into the intrinsic section as dedicated columns. Set by buildBlock from
+	// the writer config; nil when no dedicated columns are configured. Not cleared on
+	// reset() since it is constant for the lifetime of the writer.
+	dedicatedCols map[string]struct{}
+
 	// Column name caches: attribute key → full column name (e.g. "http.method" → "span.http.method").
 	// Populated lazily on first encounter within a block; eliminates per-span string concat allocs
 	// in addRowFromProto. Separate caches per prefix avoid key collisions between namespaces.
@@ -169,9 +175,12 @@ func (b *blockBuilder) reset(spanHint int) {
 // spanVectors, when non-nil, is parallel to pending: spanVectors[i] is the pre-computed
 // embedding vector for pending[i]. A nil element means no embedding for that span.
 // When spanVectors is nil, no embedding injection is performed (cfg.Embedder == nil path).
+// dedicatedCols is the set of full column names to be written into the intrinsic section
+// as dedicated columns (in addition to the standard block column write). May be nil.
 func buildBlock(
 	pending []pendingSpan, bb *blockBuilder, blockVersion uint8,
 	intrinsicAccum *intrinsicAccumulator, blockID int, spanVectors [][]float32,
+	dedicatedCols map[string]struct{},
 ) (builtBlock, *blockBuilder, error) {
 	if bb != nil {
 		bb.reset(len(pending))
@@ -179,6 +188,7 @@ func buildBlock(
 		bb = newBlockBuilder(len(pending))
 	}
 	bb.intrinsicAccum = intrinsicAccum
+	bb.dedicatedCols = dedicatedCols
 	bb.intrinsicBlockID = uint16(blockID) //nolint:gosec // safe: blockID bounded by 65534 (checked by caller)
 
 	// Pre-build per-(reader, srcBlockIdx) intrinsic index to avoid O(N) linear scans
@@ -329,6 +339,29 @@ func (b *blockBuilder) feedIntrinsicInt64(name string, colType shared.ColumnType
 func (b *blockBuilder) feedIntrinsicBytes(name string, colType shared.ColumnType, val []byte, rowIdx int) {
 	if a := b.intrinsicAccum; a != nil && len(val) > 0 {
 		a.feedBytes(name, colType, val, b.intrinsicBlockID, rowIdx)
+	}
+}
+
+// feedDedicatedAttrValue feeds val to the intrinsic accumulator when name is in
+// the dedicated columns set. Called from attribute loops after addPresent so that
+// dedicated attributes land in both the block column and the intrinsic section.
+// No-op when dedicatedCols is nil or name is not in the set.
+func (b *blockBuilder) feedDedicatedAttrValue(name string, val shared.AttrValue, rowIdx int) {
+	if b.dedicatedCols == nil {
+		return
+	}
+	if _, ok := b.dedicatedCols[name]; !ok {
+		return
+	}
+	switch baseColumnType(val.Type) {
+	case shared.ColumnTypeString:
+		b.feedIntrinsicString(name, shared.ColumnTypeString, val.Str, rowIdx)
+	case shared.ColumnTypeInt64:
+		b.feedIntrinsicInt64(name, shared.ColumnTypeInt64, val.Int, rowIdx)
+	case shared.ColumnTypeUint64:
+		b.feedIntrinsicUint64(name, shared.ColumnTypeUint64, val.Uint, rowIdx)
+	case shared.ColumnTypeBytes:
+		b.feedIntrinsicBytes(name, shared.ColumnTypeBytes, val.Bytes, rowIdx)
 	}
 }
 
@@ -490,6 +523,7 @@ func (b *blockBuilder) feedProtoResourceAttrs(ps *pendingSpan, rowIdx int) {
 			b.addPresent(rowIdx, name, val.Type, val)
 		} else {
 			b.addPresent(rowIdx, name, val.Type, val)
+			b.feedDedicatedAttrValue(name, val, rowIdx)
 		}
 	}
 }
@@ -530,6 +564,7 @@ func (b *blockBuilder) feedTempoResourceAttrs(ps *pendingSpan, rowIdx int) {
 			b.addPresent(rowIdx, name, val.Type, val)
 		} else {
 			b.addPresent(rowIdx, name, val.Type, val)
+			b.feedDedicatedAttrValue(name, val, rowIdx)
 		}
 	}
 }
@@ -543,6 +578,7 @@ func (b *blockBuilder) feedTempoSpanAttrs(span *tempotrace.Span, rowIdx int) {
 		name := b.internColName(kv.Key, b.spanColNames, "span.")
 		val := tempoToAttrValue(kv.Value)
 		b.addPresent(rowIdx, name, val.Type, val)
+		b.feedDedicatedAttrValue(name, val, rowIdx)
 	}
 }
 
@@ -1596,6 +1632,7 @@ func (b *blockBuilder) addSpanAttr(rowIdx int, kv *commonv1.KeyValue) {
 	name := b.internColName(kv.Key, b.spanColNames, "span.")
 	val := protoToAttrValue(kv.Value)
 	b.addPresent(rowIdx, name, val.Type, val)
+	b.feedDedicatedAttrValue(name, val, rowIdx)
 }
 
 // If the column was pre-allocated by prepare(), sets the existing slot at rowIdx directly

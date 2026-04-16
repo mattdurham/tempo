@@ -67,6 +67,12 @@ func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.Blo
 	if cfg.Blockpack.VectorDimension > 0 {
 		writerCfg.VectorDimension = cfg.Blockpack.VectorDimension
 	}
+	// Map Tempo dedicated columns to blockpack dedicated columns.
+	// span-scope → "span." prefix; resource-scope → "resource." prefix.
+	// Event-scope and unknown scopes are not yet supported by blockpack and are skipped.
+	if len(meta.DedicatedColumns) > 0 {
+		writerCfg.DedicatedColumns = dedicatedColumnsToBlockpack(meta.DedicatedColumns)
+	}
 
 	writer, err := blockpack.NewWriterWithConfig(writerCfg)
 	if err != nil {
@@ -149,6 +155,24 @@ func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.Blo
 	}
 
 	return meta, nil
+}
+
+// dedicatedColumnsToBlockpack converts Tempo backend DedicatedColumns to blockpack
+// DedicatedColumn entries. Only span and resource scopes are supported; event-scope
+// and unknown scopes are skipped. The full column name is constructed by prepending
+// the scope prefix: "span." for span scope, "resource." for resource scope.
+func dedicatedColumnsToBlockpack(cols backend.DedicatedColumns) []blockpack.DedicatedColumn {
+	out := make([]blockpack.DedicatedColumn, 0, len(cols))
+	for _, dc := range cols {
+		switch dc.Scope {
+		case backend.DedicatedColumnScopeSpan:
+			out = append(out, blockpack.DedicatedColumn{Name: "span." + dc.Name})
+		case backend.DedicatedColumnScopeResource:
+			out = append(out, blockpack.DedicatedColumn{Name: "resource." + dc.Name})
+		}
+		// Event scope and unknown scopes are not yet supported by blockpack.
+	}
+	return out
 }
 
 // setBlockTimeRange populates meta.StartTime and meta.EndTime from the actual

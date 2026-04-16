@@ -93,6 +93,7 @@ func (c *Compactor) Compact(ctx context.Context, l log.Logger, r backend.Reader,
 	cfg := blockpack.CompactionConfig{
 		MaxSpansPerBlock:  maxSpansFromConfig(&c.opts.BlockConfig),
 		MaxOutputFileSize: c.opts.BlockConfig.Blockpack.MaxOutputFileSize,
+		DedicatedColumns:  dedicatedColumnsToBlockpack(first.DedicatedColumns),
 	}
 
 	outputPaths, err := blockpack.CompactBlocks(ctx, providers, cfg, out)

@@ -597,12 +597,23 @@ func (r *Reader) ReadBlockRaw(blockIdx int) ([]byte, error) {
 // ReadBlocks reads raw bytes for the given block indices using aggressive coalescing.
 // Adjacent block ranges are merged into as few I/O operations as possible (NOTES §13).
 // Returns a map from block index to raw byte slice. Invalid indices are silently skipped.
+// SPEC-ROOT-015: all block byte fetches route through r.cache via ReadGroup.
 func (r *Reader) ReadBlocks(blockIndices []int) (map[int][]byte, error) {
 	if len(blockIndices) == 0 {
 		return make(map[int][]byte), nil
 	}
-	coalesced := CoalesceBlocks(r.blockMetas, blockIndices, shared.AggressiveCoalesceConfig)
-	return ReadCoalescedBlocks(r.provider, coalesced)
+	groups := r.CoalescedGroups(blockIndices)
+	result := make(map[int][]byte, len(blockIndices))
+	for _, cr := range groups {
+		groupData, err := r.ReadGroup(cr)
+		if err != nil {
+			return nil, err
+		}
+		for k, v := range groupData {
+			result[k] = v
+		}
+	}
+	return result, nil
 }
 
 // CoalescedGroups partitions blockIndices into coalesced read groups (~8 MB each) without
@@ -612,8 +623,43 @@ func (r *Reader) CoalescedGroups(blockIndices []int) []shared.CoalescedRead {
 }
 
 // ReadGroup performs the I/O for a single CoalescedRead group.
+// All block byte fetches are routed through r.cache: cache hits avoid S3 I/O; on any
+// cache miss the full group is fetched via ReadCoalescedBlocks and every block is stored
+// back into r.cache for future reads.
+// SPEC-ROOT-015: raw block bytes always route through r.cache; never directly via provider.
 func (r *Reader) ReadGroup(cr shared.CoalescedRead) (map[int][]byte, error) {
-	return ReadCoalescedBlocks(r.provider, []shared.CoalescedRead{cr})
+	if r.fileID == "" {
+		// No stable cache key; fall through to direct fetch.
+		return ReadCoalescedBlocks(r.provider, []shared.CoalescedRead{cr})
+	}
+
+	result := make(map[int][]byte, len(cr.BlockIDs))
+	allHit := true
+	for _, blockID := range cr.BlockIDs {
+		val, ok, err := r.cache.Get(fmt.Sprintf("%s/block/%d", r.fileID, blockID))
+		if err != nil {
+			return nil, fmt.Errorf("ReadGroup: cache get block %d: %w", blockID, err)
+		}
+		if ok {
+			result[blockID] = val
+		} else {
+			allHit = false
+		}
+	}
+	if allHit {
+		return result, nil
+	}
+
+	// At least one cache miss: fetch the full group from object storage and populate cache.
+	fetched, err := ReadCoalescedBlocks(r.provider, []shared.CoalescedRead{cr})
+	if err != nil {
+		return nil, err
+	}
+	for blockID, data := range fetched {
+		_ = r.cache.Put(fmt.Sprintf("%s/block/%d", r.fileID, blockID), data)
+		result[blockID] = data
+	}
+	return result, nil
 }
 
 // ParseBlockFromBytes parses a Block from raw bytes using the given meta and column filter.
