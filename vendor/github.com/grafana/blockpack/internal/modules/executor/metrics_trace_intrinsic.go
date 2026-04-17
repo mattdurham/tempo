@@ -8,11 +8,12 @@ package executor
 // See also NOTE-055 for the streamHistogramGroupBy dict-amortization extension.
 
 import (
+	"cmp"
 	"context"
 	"math"
+	"slices"
 	"sort"
 	"strconv"
-	"sync"
 
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
 	modules_shared "github.com/grafana/blockpack/internal/modules/blockio/shared"
@@ -22,148 +23,6 @@ import (
 // ctxCheckInterval is how often (in spans) to check for context cancellation in hot loops.
 // Large enough to bound overhead; small enough to bound cancellation latency.
 const ctxCheckInterval = 100_000
-
-// NOTE-074: Pool cap constants for intersectBitmapPool.
-// intersectBitmapDefaultWords: 4096 words = 32 KB initial capacity.
-// intersectBitmapMaxWords: 16 MB cap — covers files up to ~134M spans (20 GB × ~200 B/span,
-// per SPEC-ROOT-016). Files exceeding this cap skip the pool and allocate directly.
-// Pool memory at typical load: 9 concurrent queries × 10 files/query × 12.5 MB ≈ 1.1 GB
-// worst-case pool residency, acceptable at the 20 GB file bound.
-const (
-	intersectBitmapDefaultWords = 4096
-	intersectBitmapMaxWords     = 2097152 // 16 MB cap — SPEC-ROOT-016
-)
-
-//nolint:gochecknoglobals
-var intersectBitmapPool = &sync.Pool{
-	New: func() any {
-		b := make([]uint64, 0, intersectBitmapDefaultWords)
-		return &b
-	},
-}
-
-func acquireIntersectBitmap(wordLen int) *[]uint64 {
-	//nolint:forcetypeassert
-	p := intersectBitmapPool.Get().(*[]uint64)
-	if cap(*p) < wordLen {
-		*p = make([]uint64, wordLen)
-	} else {
-		*p = (*p)[:wordLen]
-		clear(*p)
-	}
-	return p
-}
-
-func releaseIntersectBitmap(p *[]uint64) {
-	if cap(*p) > intersectBitmapMaxWords {
-		*p = make([]uint64, 0, intersectBitmapDefaultWords)
-	} else {
-		*p = (*p)[:0]
-	}
-	intersectBitmapPool.Put(p)
-}
-
-// blockOffsets returns a prefix-sum slice where blockOffsets[i] is the cumulative span count
-// starting at block i (i.e. the dense row index of the first span in block i). The second
-// return value is the total span count across all blocks (= bitmap size in bits).
-// O(numBlocks) walk over in-memory blockMetas — zero I/O.
-// SPEC-ROOT-016: sized for 20 GB files (~100M spans).
-func blockOffsets(r *modules_reader.Reader) ([]int, int) {
-	n := r.BlockCount()
-	if n == 0 {
-		return nil, 0
-	}
-	offsets := make([]int, n)
-	total := 0
-	for i := range n {
-		offsets[i] = total
-		total += int(r.BlockMeta(i).SpanCount)
-	}
-	return offsets, total
-}
-
-// denseRange returns the dense-index range [start, end) for blockIdx within blkOffsets.
-// Returns (0, 0) if blockIdx is out of range — callers treat (end == start) as skip.
-func denseRange(blkOffsets []int, totalSpans, blockIdx int) (start, end int) {
-	if blockIdx < 0 || blockIdx >= len(blkOffsets) {
-		return 0, 0
-	}
-	start = blkOffsets[blockIdx]
-	if blockIdx+1 < len(blkOffsets) {
-		end = blkOffsets[blockIdx+1]
-	} else {
-		end = totalSpans
-	}
-	return start, end
-}
-
-// bitmapIntersectRefsWithVals returns the subset of (inRangeRefs, inRangeVals) whose
-// (blockIdx, rowIdx) appears in filteredRefs. O(M+N) vs O(M log M + N log N) for merge-join.
-//
-// NOTE-074: Replaces mergeJoinFilteredRefsWithVals. No sort allocations.
-// blockOffsets is a prefix-sum slice where blockOffsets[blockIdx] is the cumulative span count
-// up to (but not including) block blockIdx, forming a dense address space [0, totalSpans).
-// totalSpans is the sum of all block SpanCounts. Both are derived from r via blockOffsets(r).
-//
-// Precondition: rowIdx < blockMeta[blockIdx].SpanCount for every ref (blockpack writer invariant).
-// Both BlockIdx and RowIdx are validated against their respective block bounds via denseRange.
-// Refs with out-of-range BlockIdx or RowIdx are silently skipped — no panic.
-// This prevents a ref with rowIdx >= blockRows from landing in an adjacent block's bitmap range.
-func bitmapIntersectRefsWithVals(
-	filteredRefs []modules_shared.BlockRef,
-	inRangeRefs []modules_shared.BlockRef,
-	inRangeVals []uint64,
-	blkOffsets []int,
-	totalSpans int,
-) (outRefs []modules_shared.BlockRef, outVals []uint64) {
-	if len(filteredRefs) == 0 || len(inRangeRefs) == 0 {
-		return nil, nil
-	}
-	if len(blkOffsets) == 0 || totalSpans <= 0 {
-		return nil, nil
-	}
-
-	// Dense bitmap: wordLen = ceil(totalSpans / 64).
-	// Typical file (1.4M spans): 21,875 words = 175 KB.
-	// 20 GB file (100M spans, SPEC-ROOT-016): 1,562,500 words = 12.5 MB.
-	wordLen := (totalSpans + 63) / 64
-
-	var bm *[]uint64
-	if wordLen <= intersectBitmapMaxWords {
-		bm = acquireIntersectBitmap(wordLen)
-		defer releaseIntersectBitmap(bm)
-	} else {
-		b := make([]uint64, wordLen)
-		bm = &b
-	}
-	words := *bm
-
-	for _, r := range filteredRefs {
-		start, end := denseRange(blkOffsets, totalSpans, int(r.BlockIdx))
-		rowIdx := int(r.RowIdx)
-		if rowIdx < 0 || rowIdx >= end-start {
-			continue
-		}
-		denseIdx := start + rowIdx
-		words[denseIdx>>6] |= uint64(1) << (denseIdx & 63)
-	}
-
-	outRefs = make([]modules_shared.BlockRef, 0, min(len(filteredRefs), len(inRangeRefs)))
-	outVals = make([]uint64, 0, cap(outRefs))
-	for i, r := range inRangeRefs {
-		start, end := denseRange(blkOffsets, totalSpans, int(r.BlockIdx))
-		rowIdx := int(r.RowIdx)
-		if rowIdx < 0 || rowIdx >= end-start {
-			continue
-		}
-		denseIdx := start + rowIdx
-		if words[denseIdx>>6]&(uint64(1)<<(denseIdx&63)) != 0 {
-			outRefs = append(outRefs, r)
-			outVals = append(outVals, inRangeVals[i])
-		}
-	}
-	return outRefs, outVals
-}
 
 // metricsColumnsAreIntrinsic reports whether all columns in wantColumns are available
 // in this file's intrinsic section, enabling the zero-block-read fast path.
@@ -192,7 +51,7 @@ func metricsColumnsAreIntrinsic(r *modules_reader.Reader, wantColumns map[string
 // full blocks.
 //
 // Map allocation budget (all paths also allocate one buckets map; predicate-filtered paths
-// pay a one-time bitmap-intersect cost (pooled []uint64, O(M+N)) per file — see NOTE-074):
+// pay a one-time merge-join cost of slices.Clone+[]refIdx per file — see NOTE-070):
 //
 //	count/rate, no group-by:                0 extra maps; 1 []int64 slice of size numSteps (span:start streamed inline)
 //	count/rate, N group-by:                 2 maps (keyToBucket + groupKeyMap) + 1 map[string][]int64 of size numGroups
@@ -232,7 +91,7 @@ func executeTraceMetricsIntrinsic(
 
 	hasPreds := program != nil && program.Predicates != nil && len(program.Predicates.Nodes) > 0
 
-	// NOTE-074: filteredRefs is applied via bitmap intersection after binary search narrows inRangeRefs.
+	// NOTE-070: filteredRefs is applied via merge-join after binary search narrows inRangeRefs.
 	var filteredRefs []modules_shared.BlockRef
 	if hasPreds {
 		filteredRefs = BlockRefsFromIntrinsicTOC(r, program, 0)
@@ -268,11 +127,11 @@ func executeTraceMetricsIntrinsic(
 	inRangeRefs := tsCol.BlockRefs[lo:hi]
 	inRangeVals := tsVals[lo:hi]
 
-	// NOTE-074: bitmap intersection replaces merge-join sort; O(M+N), pooled bitmap.
-	// SPEC-ROOT-016: blockOffsets sized for 20 GB files.
+	// Apply predicate filter via merge-join (NOTE-070).
+	// mergeJoinFilteredRefsWithVals sorts both slices by packKey before walking;
+	// inRangeRefs is timestamp-sorted (types.go:228), not packKey-sorted.
 	if filteredRefs != nil {
-		offsets, total := blockOffsets(r)
-		inRangeRefs, inRangeVals = bitmapIntersectRefsWithVals(filteredRefs, inRangeRefs, inRangeVals, offsets, total)
+		inRangeRefs, inRangeVals = mergeJoinFilteredRefsWithVals(filteredRefs, inRangeRefs, inRangeVals)
 		if len(inRangeRefs) == 0 {
 			return &TraceMetricsResult{}, true, nil
 		}
@@ -324,6 +183,68 @@ func executeTraceMetricsIntrinsic(
 // packKey packs (blockIdx, rowIdx) into a uint32 for use as a map key.
 func packKey(blockIdx, rowIdx uint16) uint32 {
 	return uint32(blockIdx)<<16 | uint32(rowIdx)
+}
+
+// mergeJoinFilteredRefsWithVals returns the subset of (inRangeRefs, inRangeVals)
+// whose packKey appears in filteredRefs.
+//
+// NOTE-070: Replaces filteredKeys map[uint32]struct{} to eliminate hash allocation
+// and O(N_all) hash lookups on the filtered intrinsic path.
+//
+// Sort invariant: inRangeRefs is timestamp-sorted (types.go:228), not packKey-sorted.
+// filteredRefs order is unspecified (intersectBlockRefSets may return any order).
+// Both must be sorted by packKey before the two-pointer walk.
+//
+// Mutation rules:
+//   - filteredRefs is cloned before sorting (caller's slice is not modified).
+//   - inRangeRefs is NOT sorted in-place (it is a sub-slice of a shared intrinsic
+//     column). A sorted index ([]refIdx) is built over original positions so that
+//     inRangeVals alignment is preserved.
+func mergeJoinFilteredRefsWithVals(
+	filteredRefs []modules_shared.BlockRef,
+	inRangeRefs []modules_shared.BlockRef,
+	inRangeVals []uint64,
+) (outRefs []modules_shared.BlockRef, outVals []uint64) {
+	if len(filteredRefs) == 0 || len(inRangeRefs) == 0 {
+		return nil, nil
+	}
+
+	// Sort a copy of filteredRefs by packKey (do not mutate caller's slice).
+	sortedFilter := slices.Clone(filteredRefs)
+	slices.SortFunc(sortedFilter, func(a, b modules_shared.BlockRef) int {
+		return cmp.Compare(packKey(a.BlockIdx, a.RowIdx), packKey(b.BlockIdx, b.RowIdx))
+	})
+
+	// Build a sorted index over inRangeRefs by packKey.
+	// Using an index avoids reordering inRangeVals (which must stay parallel to inRangeRefs).
+	type refIdx struct {
+		pk  uint32
+		pos int
+	}
+	idx := make([]refIdx, len(inRangeRefs))
+	for i, r := range inRangeRefs {
+		idx[i] = refIdx{packKey(r.BlockIdx, r.RowIdx), i}
+	}
+	slices.SortFunc(idx, func(a, b refIdx) int {
+		return cmp.Compare(a.pk, b.pk)
+	})
+
+	outCap := min(len(sortedFilter), len(idx))
+	outRefs = make([]modules_shared.BlockRef, 0, outCap)
+	outVals = make([]uint64, 0, outCap)
+
+	fi := 0
+	for _, ri := range idx {
+		// Advance filteredRefs pointer past any keys smaller than ri.pk.
+		for fi < len(sortedFilter) && packKey(sortedFilter[fi].BlockIdx, sortedFilter[fi].RowIdx) < ri.pk {
+			fi++
+		}
+		if fi < len(sortedFilter) && packKey(sortedFilter[fi].BlockIdx, sortedFilter[fi].RowIdx) == ri.pk {
+			outRefs = append(outRefs, inRangeRefs[ri.pos])
+			outVals = append(outVals, inRangeVals[ri.pos])
+		}
+	}
+	return outRefs, outVals
 }
 
 // intrinsicGetOrCreateBucket returns the bucket for compositeKey, creating it if absent.
