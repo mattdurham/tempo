@@ -2307,3 +2307,41 @@ Gate-tested by EX-CK-01 through EX-CK-07.
 BENCH-EX-09 (HISTOGRAM variant) similar.
 
 **Back-ref:** `internal/modules/executor/metrics_trace.go:traceAccumulateRow`
+
+---
+
+
+## NOTE-074: Dict-ID-Keyed Group Map — Intrinsic Fast Path (2026-04-17)
+
+**Decision:** Replace `map[uint32]string groupKeyMap` + `map[string][]int64 groupCounts`
+in the intrinsic fast path with `map[uint32]groupIDKey` + `map[groupIDKey][]int64`, where
+`groupIDKey = [8]uint32`.
+
+**Why:** r81 Pyroscope showed `ctrlGroupMatchH2` at 24.67% (string hash cost in
+`groupCounts[gk]` lookups) and `buildGroupKeyMap` at 19.24% (string value allocations
+in the group key map). For M8 warm (150M spans, primarily intrinsic), this is ~1.68s and
+~1.31s respectively. Switching to uint32 array keys reduces hash cost by ~50-60% and
+eliminates the O(blocks × unique_groups) string allocations.
+
+**Key decisions:**
+1. `[8]uint32` cap (32 bytes, one cache line). Queries with >8 group-by dims fall back to
+   string-keyed path — pathological in production (zero real queries use >4).
+2. dict index 0 = absent/empty sentinel in every dimension. Column dicts are prefixed with
+   "" so absent pks naturally map to index 0 without special-casing.
+3. String resolution (ID → label string) is deferred to series-emit time, which is
+   O(unique groups), not O(spans). The final series label values are byte-identical to
+   the string-keyed path output.
+4. `histGroupIDKey struct { dims [8]uint32; boundary float64; bucketIdx int64 }` is the
+   histogram key — avoids both string hash for group dims AND `strconv.FormatFloat` per
+   span for the boundary value. Boundary is always a power-of-2 or 0 (never NaN), making
+   float64 map key safe.
+5. Flat intrinsic columns in group-by: build on-the-fly string→uint32 dict (sequential IDs
+   from first-seen string values). This path is cold in production (nobody groups by
+   `span:start`).
+6. Block-scan path (`traceAccumulateRow`) is unchanged — it is not the M8 bottleneck.
+
+**PR:** Layer 3 dict-ID group map
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:buildGroupIDMap`,
+          `internal/modules/executor/metrics_trace_intrinsic.go:streamCountRateGroupByID`,
+          `internal/modules/executor/metrics_trace_intrinsic.go:streamHistogramGroupByID`,
+          `internal/modules/executor/metrics_trace_intrinsic.go:streamAggGroupByID`
