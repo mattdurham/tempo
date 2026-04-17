@@ -27,6 +27,13 @@ type EmbeddingFieldConfig struct {
 // Name must be the full blockpack column name, including prefix (e.g. "span.http.method",
 // "resource.deployment.environment"). Only span and resource attributes are supported;
 // built-in intrinsic columns (span:start, span:name, etc.) are already always intrinsic.
+//
+// TYPE LIMITATIONS: the intrinsic accumulator currently only supports STRING, INT64,
+// UINT64, and BYTES attribute types. Attributes of other types (notably BOOL and FLOAT64)
+// configured as DedicatedColumns are SILENTLY SKIPPED during block writing — no error
+// is returned, but the column will not actually be intrinsic and will fall back to the
+// generic attribute KV scan path. If you configure a dedicated column and don't see the
+// expected speedup, check the attribute's wire type. BOOL/FLOAT64 support is a follow-up.
 type DedicatedColumn struct {
 	Name string
 }

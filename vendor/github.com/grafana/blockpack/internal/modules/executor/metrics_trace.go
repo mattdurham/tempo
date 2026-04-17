@@ -100,6 +100,12 @@ func ExecuteTraceMetrics(
 	if program == nil {
 		return nil, fmt.Errorf("ExecuteTraceMetrics: program cannot be nil")
 	}
+	// Normalize nil context to Background so downstream ctx.Err()/ctx.Done() calls
+	// (intrinsic fast path, blockGroupPipeline) don't panic. Callers should pass a
+	// real context; this guard is a safety net.
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
 	var tr queryplanner.TimeRange
 	if querySpec.TimeBucketing.Enabled {

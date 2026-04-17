@@ -441,6 +441,13 @@ func ExecuteMetricsTraceQL(
 		return nil, fmt.Errorf("ExecuteMetricsTraceQL: reader cannot be nil")
 	}
 
+	// Normalize nil context to Background so downstream ctx.Err()/ctx.Done() calls
+	// don't panic. Callers should pass a real context; this guard is a safety net
+	// for the public API boundary.
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
