@@ -479,3 +479,36 @@ avoidable S3 re-reads. Routing through `r.cache` eliminates these re-reads for h
 
 Back-ref: `internal/modules/blockio/reader/reader.go:Reader.ReadGroup`,
 `internal/modules/blockio/reader/reader.go:Reader.ReadBlocks`
+
+---
+
+## SPEC-ROOT-016: Maximum file size — 20 GB per blockpack file
+
+**Invariant:** A single blockpack file (the unit produced by one writer.Flush cycle)
+can be up to 20 GB on disk. Implementations that size buffers, caches, or working
+memory per-file MUST tolerate this upper bound without unbounded growth.
+
+**Consequences:**
+- Span count per file: up to ~100M (at ~200 B/span compressed, typical mix of
+  attributes). Extreme high-cardinality workloads may reach ~200M spans per file
+  at ~100 B/span.
+- Working memory per file for set-like structures (bitmaps, row-masks, offset
+  arrays) must be sized against this span count, not against a small "typical"
+  file assumption.
+- Pool caps and allocation budgets that silently bypass the pool for large files
+  create hidden GC pressure at the 20 GB boundary. Pool cap guards MUST either
+  (a) accommodate files at this size, or (b) explicitly document the fallback
+  path (fresh per-call alloc) as acceptable for the large-file edge case.
+
+**Where this binds:**
+- `internal/modules/executor/`: intersectBitmapPool cap (NOTE-074) — sized for
+  ≤134M spans (16 MB bitmap).
+- `internal/modules/blockio/reader/`: block index, range index, sketch caches
+  — must not precompute O(spans) structures without a bounded working set.
+- `internal/modules/blockio/writer/`: block builder — MaxBlockSpans enforces
+  per-block upper bound, but total spans per file are not similarly capped.
+
+**How to apply:** When introducing any new per-file data structure, document
+its size against the 100M-span / 20 GB upper bound. If it exceeds a reasonable
+working-set budget (~50 MB per file per query), propose a tier (pool vs direct
+alloc vs compressed representation) rather than a single fixed allocation.

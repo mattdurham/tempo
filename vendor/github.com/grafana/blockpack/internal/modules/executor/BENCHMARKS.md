@@ -221,14 +221,15 @@ b.ReportMetric(float64(len(result.Matches)), "matches")
 
 Measures per-iteration allocations in `executeTraceMetricsIntrinsic` on the filtered
 intrinsic path (predicate filter present, count/rate, no aggregate column), exercising the
-`mergeJoinFilteredRefsWithVals` replacement for `filteredKeys map[uint32]struct{}`.
+`bitmapIntersectRefsWithVals` bitmap intersection (NOTE-074) and the `streamCountRateNoGroupBy`
+fast path (count/rate, no group-by, no aggregate column).
 
 **Setup (outside timed loop):**
 - Write 300 spans (200 with `status=error`, 100 with `status=ok`) with `MaxBlockSpans=301`
   (single block).
-- Compile `{ status = error } | rate()` with 6 × 60s buckets. Exercises the merge-join
-  path (filteredRefs non-empty) and the `streamCountRateNoGroupBy` fast path (count/rate,
-  no group-by, no aggregate column).
+- Compile `{ status = error } | rate()` with 6 × 60s buckets. Exercises
+  `bitmapIntersectRefsWithVals` (filteredRefs non-empty) and the `streamCountRateNoGroupBy`
+  fast path (count/rate, no group-by, no aggregate column).
 - Run with `b.ReportAllocs()`.
 
 **Run command:**
@@ -236,13 +237,22 @@ intrinsic path (predicate filter present, count/rate, no aggregate column), exer
 go test -bench=BenchmarkTraceMetrics_FilteredIntrinsic_AllocCount -benchmem -count=3 ./internal/modules/executor/
 ```
 
-**Baseline (post-merge-join):** ~76 allocs/op (~15452 B/op) — regression threshold.
+**Baseline (post-merge-join, NOTE-070):** ~76 allocs/op (~15452 B/op).
 All remaining allocations are O(1) per file: filteredRefs clone, refIdx index slice,
-outRefs/outVals output slices, buckets map, reader internals. Zero `map[uint32]struct{}`
-allocations per iteration (down from O(N) spans before this change).
+outRefs/outVals output slices, buckets map, reader internals.
+
+**Baseline (post-bitmap-intersect, NOTE-074):** ~74 allocs/op (~9868 B/op) — regression threshold.
+Bitmap eliminates the `slices.Clone(filteredRefs)` + `[]refIdx` sort-index allocations.
+The small delta on this micro-benchmark (1 block, 300 spans) understates production gains:
+at 700 blocks × 2000 rows/block the two eliminated O(N) sort allocs dominate.
+
+**Baseline (post-dense-layout, NOTE-074 HIGH-1 fix, 2026-04-16):** ~74 allocs/op (~9865 B/op).
+Dense `blockOffsets` layout shrinks typical bitmap from 5.5 MB (sparse packKey<<16) to 175 KB.
+Pool now hits in the typical single-file case (dense wordLen ≈ 21,875 words << 2,097,152-word cap).
+Pool cap raised to 16 MB (SPEC-ROOT-016) to cover 20 GB files (~100M spans = 12.5 MB bitmap).
 
 Before this change (filteredKeys map): ~17.49% CPU from map operations + ~10.66% GC
 pressure (Pyroscope profile 2026-04-16).
 
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic_test.go:BenchmarkTraceMetrics_FilteredIntrinsic_AllocCount`
-Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:mergeJoinFilteredRefsWithVals` (NOTE-070)
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:bitmapIntersectRefsWithVals` (NOTE-074)

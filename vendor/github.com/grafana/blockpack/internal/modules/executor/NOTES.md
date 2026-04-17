@@ -2278,7 +2278,7 @@ and passed through to `accumulateIntrinsicBuckets` or iterated directly in
 remaining allocations are O(1) per file (filteredRefs clone, refIdx index slice,
 outRefs/outVals output slices, buckets map, reader internals).
 
-Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:mergeJoinFilteredRefsWithVals`
+*(mergeJoinFilteredRefsWithVals deleted; replaced by bitmapIntersectRefsWithVals — see NOTE-074)*
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:streamCountRateNoGroupBy`
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:executeTraceMetricsIntrinsic`
 
@@ -2307,3 +2307,49 @@ Gate-tested by EX-CK-01 through EX-CK-07.
 BENCH-EX-09 (HISTOGRAM variant) similar.
 
 **Back-ref:** `internal/modules/executor/metrics_trace.go:traceAccumulateRow`
+
+## NOTE-074: bitmapIntersectRefsWithVals — Bitmap Replaces Merge-Join for Filtered Refs (2026-04-16)
+*Added: 2026-04-16*
+
+**Problem:** `mergeJoinFilteredRefsWithVals` (NOTE-072) sorts both `filteredRefs` (clone + sort)
+and `inRangeRefs` (sort index) on every call. These two O(M log M + N log N) sort allocations
+(`slices.Clone` + `[]refIdx`) were eliminated by switching to a bitmap set intersection.
+
+**Decision:** Replace with `bitmapIntersectRefsWithVals`. `filteredRefs` entries set bits in a
+pooled `[]uint64` bitmap; `inRangeRefs` is scanned linearly testing each bit. O(M+N),
+zero sorts, pooled bitmap.
+
+**Sizing (dense layout):** `denseIdx = blockOffsets[blockIdx] + rowIdx` maps each unique
+(blockIdx, rowIdx) pair to a dense integer in [0, totalSpans). `blockOffsets` is the prefix sum
+of `blockMeta[i].SpanCount` — O(numBlocks) walk, zero I/O. `wordLen = ceil(totalSpans / 64)`.
+- Typical file (1.4M spans): wordLen = 21,875 words = 175 KB ✓
+- 20 GB file (100M spans, SPEC-ROOT-016): wordLen = 1,562,500 words = 12.5 MB ✓ (within cap)
+- Previous sparse layout (`packKey<<16`) was incorrect: 700 blocks × 2000 rows → maxPK = 45,811,663
+  → wordLen = 715,808 (5.5 MB), always bypassing the pool. Dense layout fixes this.
+
+**Pool:** `intersectBitmapPool` holds `*[]uint64`. Default capacity: 4096 words (32 KB).
+Cap guard: 2,097,152 words (16 MB, SPEC-ROOT-016) — buffers larger than this are replaced
+with a fresh default-size slice on Put. Covers any realistic file size up to 20 GB.
+Mirrors `compositeKeyScratchPool` eviction pattern (NOTE-071).
+Bitmap is zeroed on acquire (via `clear`) to prevent stale-bit bugs.
+
+**Bounds checking:** Both build and probe loops validate each `BlockRef` against its block's
+row range via `denseRange(blkOffsets, totalSpans, blockIdx)`, which returns `[start, end)` such
+that valid rows satisfy `start <= denseIdx < end`. Refs with `RowIdx >= SpanCount` are silently
+skipped. This prevents a ref with `rowIdx >= blockRows` from writing or testing a bit in an
+adjacent block's address range — a class of silent-corruption bug. (~2ns overhead per ref,
+negligible vs bitmap lookup.) Added iteration 2 (Copilot review, PR #232,
+comments 3101342027 and 3101342078).
+
+**Output order:** `inRangeRefs` linear (timestamp) order — safe for both downstream paths
+(Q1 in brainstorm confirmed no order-dependence in `streamCountRateNoGroupBy` or `keyToBucket` build).
+
+**Allocations after change:** ~74 allocs/op for the 1-block benchmark (down from ~76); eliminates
+the two per-call sort allocations; savings scale with file size.
+
+**Back-refs:**
+- `internal/modules/executor/metrics_trace_intrinsic.go:bitmapIntersectRefsWithVals`
+- `internal/modules/executor/metrics_trace_intrinsic.go:acquireIntersectBitmap`
+- `internal/modules/executor/metrics_trace_intrinsic.go:releaseIntersectBitmap`
+- `internal/modules/executor/metrics_trace_intrinsic.go:blockOffsets`
+- SPEC-ROOT-016 (20 GB file size bound)
