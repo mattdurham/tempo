@@ -14,6 +14,7 @@ import (
 	"slices"
 	"sort"
 	"strconv"
+	"strings"
 
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
 	modules_shared "github.com/grafana/blockpack/internal/modules/blockio/shared"
@@ -361,10 +362,13 @@ func streamCountRateGroupBy(
 //
 // Strategy matrix:
 //
-//	count/rate, N group-by:  build groupKeyMap (1 map), call streamCountRateGroupBy
-//	agg field,  no group-by: stream aggregate column against keyToBucket (no aggVals map)
-//	agg field,  N group-by (histogram): streamHistogramGroupBy (2 maps: keyToBucket + groupKeyMap; seen map is inside streamHistogramGroupBy)
-//	agg field,  N group-by (other):     build groupKeyMap (1 map) + aggVals (1 map), iterate keyToBucket
+//	count/rate, N group-by (N≤8): buildGroupIDMap + streamCountRateGroupByID (NOTE-074 fast path)
+//	count/rate, N group-by (N>8): buildGroupKeyMap + streamCountRateGroupBy (string-keyed fallback)
+//	agg field,  no group-by:      stream aggregate column against keyToBucket (no aggVals map)
+//	agg field,  N group-by (histogram, N≤8): buildGroupIDMap + streamHistogramGroupByID (NOTE-074)
+//	agg field,  N group-by (histogram, N>8): buildGroupKeyMap + streamHistogramGroupBy (fallback)
+//	agg field,  N group-by (other, N≤8):    buildGroupIDMap + streamAggGroupByID (NOTE-074)
+//	agg field,  N group-by (other, N>8):    buildGroupKeyMap + aggVals iteration (fallback)
 func accumulateIntrinsicBuckets(
 	ctx context.Context,
 	r *modules_reader.Reader,
@@ -381,11 +385,29 @@ func accumulateIntrinsicBuckets(
 		return streamAggColumnNoGroupBy(r, agg, keyToBucket, buckets)
 	}
 
-	// Queries with group-by: build one composite groupKeyMap by iterating dict/flat
-	// column entries directly. This replaces N separate groupVals[i] maps with one.
-	groupKeyMap, err := buildGroupKeyMap(r, agg.GroupBy, keyToBucket)
+	// Try dict-ID fast path first (N ≤ 8 group-by dims, all intrinsic).
+	// NOTE-074: Falls back to string-keyed path for N > 8 or on any error.
+	// SPEC-ETM-13.1/13.2: transparent to callers — buckets output is byte-identical.
+	groupIDMap, dicts, ok, err := buildGroupIDMap(r, agg.GroupBy, keyToBucket)
 	if err != nil {
 		return err
+	}
+	if ok {
+		if isCountRate {
+			return streamCountRateGroupByID(ctx, keyToBucket, groupIDMap, dicts, querySpec.TimeBucketing, buckets)
+		}
+		if agg.Function == vm.FuncNameHISTOGRAM {
+			return streamHistogramGroupByID(ctx, r, agg.Field, keyToBucket, groupIDMap, dicts, buckets)
+		}
+		return streamAggGroupByID(ctx, r, agg, keyToBucket, groupIDMap, dicts, buckets)
+	}
+
+	// Fallback: string-keyed path for N > 8 dims.
+	// Queries with group-by: build one composite groupKeyMap by iterating dict/flat
+	// column entries directly. This replaces N separate groupVals[i] maps with one.
+	groupKeyMap, groupKeyErr := buildGroupKeyMap(r, agg.GroupBy, keyToBucket)
+	if groupKeyErr != nil {
+		return groupKeyErr
 	}
 
 	if isCountRate {
@@ -402,9 +424,9 @@ func accumulateIntrinsicBuckets(
 	}
 
 	// Other aggregate functions with group-by: three maps total (keyToBucket + groupKeyMap + aggVals).
-	aggVals, err := buildAggValsMap(r, agg.Field, keyToBucket)
-	if err != nil {
-		return err
+	aggVals, aggErr := buildAggValsMap(r, agg.Field, keyToBucket)
+	if aggErr != nil {
+		return aggErr
 	}
 
 	for pk, bucketIdx := range keyToBucket {
@@ -569,6 +591,160 @@ func scanIntrinsicColVals(col *modules_shared.IntrinsicColumn, keyToBucket map[u
 			dst[pk] = val
 		}
 	}
+}
+
+// maxGroupByDimsFastPath is the maximum number of group-by columns for the dict-ID
+// fast path. Queries with more dimensions fall back to the string-keyed path.
+// [8]uint32 = 32 bytes, fits in one cache line.
+// NOTE-074: SPEC-ETM-13.2 — used by buildGroupIDMap (task #6).
+const maxGroupByDimsFastPath = 8
+
+// groupIDKey encodes up to 8 group-by dimension dict IDs as a comparable map key.
+// dims[i] = 0 means "absent / empty string" (sentinel). Dict IDs for present rows
+// start at 1 (index 0 in each column's dicts slice is reserved for the empty string).
+// SPEC-ETM-13: Dict-ID group map fast path invariants.
+type groupIDKey [maxGroupByDimsFastPath]uint32
+
+// scanIntrinsicColDictIDs scans a single intrinsic column and writes
+// packKey → uint32 dict-entry index into dst. Index 0 is reserved for the
+// absent/empty-string sentinel; present dict entries start at index 1.
+// The dict slice passed in must already have "" pre-appended at index 0.
+// Returns the populated dict slice (may grow).
+// NOTE-074: Dict-ID fast path scanner — called by buildGroupIDMap (task #6).
+func scanIntrinsicColDictIDs(
+	col *modules_shared.IntrinsicColumn,
+	keyToBucket map[uint32]int64,
+	dst map[uint32]uint32,
+	dict []string,
+) []string {
+	switch col.Format {
+	case modules_shared.IntrinsicFormatDict:
+		for _, entry := range col.DictEntries {
+			val := entry.Value
+			if val == "" {
+				val = strconv.FormatInt(entry.Int64Val, 10)
+			}
+			dictIdx := uint32(len(dict)) //nolint:gosec
+			dict = append(dict, val)
+			for _, ref := range entry.BlockRefs {
+				pk := packKey(ref.BlockIdx, ref.RowIdx)
+				if _, ok := keyToBucket[pk]; ok {
+					dst[pk] = dictIdx
+				}
+			}
+		}
+	case modules_shared.IntrinsicFormatFlat:
+		seen := make(map[string]uint32)
+		for j, ref := range col.BlockRefs {
+			pk := packKey(ref.BlockIdx, ref.RowIdx)
+			if _, ok := keyToBucket[pk]; !ok {
+				continue
+			}
+			var val string
+			if j < len(col.Uint64Values) {
+				val = strconv.FormatUint(col.Uint64Values[j], 10)
+			} else if j < len(col.BytesValues) {
+				val = string(col.BytesValues[j])
+			}
+			id, exists := seen[val]
+			if !exists {
+				id = uint32(len(dict)) //nolint:gosec
+				dict = append(dict, val)
+				seen[val] = id
+			}
+			dst[pk] = id
+		}
+	}
+	return dict
+}
+
+// buildGroupIDMap builds a packKey → groupIDKey map for the dict-ID fast path.
+// Returns (idMap, dicts, true, nil) on success where dicts[i] maps dictIdx → string value
+// for the i-th group-by column (used at series-emit time to resolve IDs back to strings).
+// Returns (nil, nil, false, nil) when len(groupBy) > maxGroupByDimsFastPath (caller falls
+// back to buildGroupKeyMap).
+//
+// NOTE-074: Replaces buildGroupKeyMap for the intrinsic fast path. See NOTES.md.
+// SPEC-ETM-13.1/13.2: fast path for N≤8; fallback for N>8.
+func buildGroupIDMap(
+	r *modules_reader.Reader,
+	groupBy []string,
+	keyToBucket map[uint32]int64,
+) (map[uint32]groupIDKey, [][]string, bool, error) {
+	if len(groupBy) > maxGroupByDimsFastPath {
+		return nil, nil, false, nil
+	}
+
+	// Fast path: single group-by column — write directly to out via a flat pk→dictIdx map.
+	// NOTE-056-style optimization: skip the outer colMap intermediate for N=1.
+	if len(groupBy) == 1 {
+		dict := []string{""}
+		colMap := make(map[uint32]uint32, len(keyToBucket))
+		col, err := r.GetIntrinsicColumn(groupBy[0])
+		if err != nil {
+			return nil, nil, false, err
+		}
+		if col != nil {
+			dict = scanIntrinsicColDictIDs(col, keyToBucket, colMap, dict)
+		}
+		out := make(map[uint32]groupIDKey, len(keyToBucket))
+		for pk := range keyToBucket {
+			var key groupIDKey
+			if id, ok := colMap[pk]; ok {
+				key[0] = id
+			}
+			out[pk] = key
+		}
+		return out, [][]string{dict}, true, nil
+	}
+
+	// Multi-group-by path.
+	out := make(map[uint32]groupIDKey, len(keyToBucket))
+	dicts := make([][]string, len(groupBy))
+
+	// Initialize all pks to zero-key (all dims = 0 = empty/absent sentinel).
+	for pk := range keyToBucket {
+		out[pk] = groupIDKey{}
+	}
+
+	for i, colName := range groupBy {
+		dict := []string{""}
+		colMap := make(map[uint32]uint32, len(keyToBucket))
+		col, err := r.GetIntrinsicColumn(colName)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		if col != nil {
+			dict = scanIntrinsicColDictIDs(col, keyToBucket, colMap, dict)
+		}
+		// Apply dim i to each pk's key.
+		for pk, key := range out {
+			if id, ok := colMap[pk]; ok {
+				key[i] = id
+				out[pk] = key
+			}
+		}
+		dicts[i] = dict
+	}
+	return out, dicts, true, nil
+}
+
+// resolveGroupIDKey resolves a groupIDKey back to the composite string group key
+// using the per-dimension dicts. The format is identical to buildGroupKeyMap output:
+// values joined by "\x00" separators, matching traceBuildDenseSeries expectations.
+// NOTE-074: O(unique groups), not O(spans) — called only at series-emit time.
+func resolveGroupIDKey(key groupIDKey, dicts [][]string) string {
+	if len(dicts) == 0 {
+		return ""
+	}
+	vals := make([]string, len(dicts))
+	for i, dict := range dicts {
+		id := key[i]
+		if int(id) < len(dict) { //nolint:gosec
+			vals[i] = dict[id]
+		}
+	}
+	return strings.Join(vals, "\x00")
 }
 
 // buildGroupKeyMap builds a packKey → compositeGroupKey map by iterating each group-by
@@ -768,6 +944,243 @@ func streamHistogramGroupBy(
 				intrinsicGetOrCreateBucket(buckets, key).count++
 			}
 		}
+	}
+	return nil
+}
+
+// histGroupIDKey is the map key for dict-ID keyed histogram group-by.
+// Replaces the composite string key used in streamHistogramGroupBy.
+// boundary is always a power-of-2 or 0 (never NaN), so float64 comparison is safe.
+// SPEC-ETM-13.4: float64 boundary key is safe because intrinsicHistogramBoundary never returns NaN.
+type histGroupIDKey struct {
+	dims      groupIDKey
+	boundary  float64
+	bucketIdx int64
+}
+
+// aggGroupIDKey is the map key for dict-ID keyed non-histogram aggregate group-by.
+// NOTE-074: Accumulates SUM/AVG/MIN/MAX/QUANTILE/STDDEV keyed by (groupIDKey, bucketIdx);
+// resolves to string at emit time (O(unique groups), not O(spans)).
+type aggGroupIDKey struct {
+	dims      groupIDKey
+	bucketIdx int64
+}
+
+// streamCountRateGroupByID is the dict-ID variant of streamCountRateGroupBy.
+// Uses map[groupIDKey][]int64 instead of map[string][]int64 for groupCounts,
+// eliminating string hash operations in the hot loop (~150M for M8).
+//
+// NOTE-074: Dict-ID fast path — see NOTES.md. dicts[i] maps dictIdx → string
+// for resolution at series-emit time.
+func streamCountRateGroupByID(
+	ctx context.Context,
+	keyToBucket map[uint32]int64,
+	groupIDMap map[uint32]groupIDKey,
+	dicts [][]string,
+	tb vm.TimeBucketSpec,
+	buckets map[string]*aggBucketState,
+) error {
+	numSteps := (tb.EndTime - tb.StartTime + tb.StepSizeNanos - 1) / tb.StepSizeNanos
+	if numSteps <= 0 {
+		return nil
+	}
+	groupCounts := make(map[groupIDKey][]int64)
+	i := 0
+	for pk, bucketIdx := range keyToBucket {
+		if i%ctxCheckInterval == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+		i++
+		gid := groupIDMap[pk]
+		counts := groupCounts[gid]
+		if counts == nil {
+			counts = make([]int64, numSteps)
+			groupCounts[gid] = counts
+		}
+		if bucketIdx >= 0 && bucketIdx < numSteps {
+			counts[bucketIdx]++
+		}
+	}
+	// Resolve IDs back to strings at series-emit time. O(unique groups), not O(spans).
+	for gid, counts := range groupCounts {
+		gk := resolveGroupIDKey(gid, dicts)
+		for idx, c := range counts {
+			if c > 0 {
+				key := strconv.FormatInt(int64(idx), 10) + "\x00" + gk //nolint:gosec
+				intrinsicGetOrCreateBucket(buckets, key).count = c
+			}
+		}
+	}
+	return nil
+}
+
+// streamHistogramGroupByID is the dict-ID variant of streamHistogramGroupBy.
+// Uses map[histGroupIDKey]int64 keyed by (groupIDKey, boundary, bucketIdx) to eliminate
+// both string hash operations for group dims AND FormatFloat per span for the boundary.
+//
+// NOTE-074: Eliminates string hashing for group dims and FormatFloat+string
+// hashing for the histogram boundary. The boundary float64 is used directly as
+// part of the map key (safe: values are always powers-of-2 or 0, never NaN — SPEC-ETM-13.4).
+func streamHistogramGroupByID(
+	ctx context.Context,
+	r *modules_reader.Reader,
+	fieldName string,
+	keyToBucket map[uint32]int64,
+	groupIDMap map[uint32]groupIDKey,
+	dicts [][]string,
+	buckets map[string]*aggBucketState,
+) error {
+	col, err := r.GetIntrinsicColumn(fieldName)
+	if err != nil {
+		return err
+	}
+	if col == nil {
+		i := 0
+		for pk, bucketIdx := range keyToBucket {
+			if i%ctxCheckInterval == 0 {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+			}
+			i++
+			gid := groupIDMap[pk]
+			gk := resolveGroupIDKey(gid, dicts)
+			key := strconv.FormatInt(bucketIdx, 10) + "\x00" + gk + "\x000"
+			intrinsicGetOrCreateBucket(buckets, key).count++
+		}
+		return nil
+	}
+
+	// histCounts: (group, boundary, timeBucket) → count.
+	histCounts := make(map[histGroupIDKey]int64)
+	seen := make(map[uint32]struct{}, len(keyToBucket))
+	spanCount := 0
+
+	switch col.Format {
+	case modules_shared.IntrinsicFormatDict:
+		for _, entry := range col.DictEntries {
+			var v float64
+			if entry.Value != "" {
+				parsed, parseErr := strconv.ParseFloat(entry.Value, 64)
+				if parseErr != nil {
+					continue
+				}
+				v = parsed
+			} else {
+				v = float64(entry.Int64Val)
+			}
+			boundary := intrinsicHistogramBoundary(v, fieldName)
+			for _, ref := range entry.BlockRefs {
+				if spanCount%ctxCheckInterval == 0 {
+					if err := ctx.Err(); err != nil {
+						return err
+					}
+				}
+				spanCount++
+				pk := packKey(ref.BlockIdx, ref.RowIdx)
+				bucketIdx, ok := keyToBucket[pk]
+				if !ok {
+					continue
+				}
+				seen[pk] = struct{}{}
+				gid := groupIDMap[pk]
+				hk := histGroupIDKey{dims: gid, boundary: boundary, bucketIdx: bucketIdx}
+				histCounts[hk]++
+			}
+		}
+	case modules_shared.IntrinsicFormatFlat:
+		for i, ref := range col.BlockRefs {
+			if spanCount%ctxCheckInterval == 0 {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+			}
+			spanCount++
+			if i >= len(col.Uint64Values) {
+				continue
+			}
+			pk := packKey(ref.BlockIdx, ref.RowIdx)
+			bucketIdx, ok := keyToBucket[pk]
+			if !ok {
+				continue
+			}
+			seen[pk] = struct{}{}
+			v := float64(col.Uint64Values[i])
+			boundary := intrinsicHistogramBoundary(v, fieldName)
+			gid := groupIDMap[pk]
+			hk := histGroupIDKey{dims: gid, boundary: boundary, bucketIdx: bucketIdx}
+			histCounts[hk]++
+		}
+	}
+
+	// Absent-row pass: pks not seen → boundary-0.
+	if len(seen) < len(keyToBucket) {
+		for pk, bucketIdx := range keyToBucket {
+			if _, ok := seen[pk]; !ok {
+				gid := groupIDMap[pk]
+				hk := histGroupIDKey{dims: gid, boundary: 0, bucketIdx: bucketIdx}
+				histCounts[hk]++
+			}
+		}
+	}
+
+	// Emit: resolve IDs back to strings at series-emit time.
+	for hk, count := range histCounts {
+		gk := resolveGroupIDKey(hk.dims, dicts)
+		boundaryStr := strconv.FormatFloat(hk.boundary, 'g', -1, 64)
+		key := strconv.FormatInt(hk.bucketIdx, 10) + "\x00" + gk + "\x00" + boundaryStr
+		intrinsicGetOrCreateBucket(buckets, key).count += count
+	}
+	return nil
+}
+
+// streamAggGroupByID handles non-histogram aggregate functions (SUM, AVG, MIN, MAX,
+// QUANTILE, STDDEV) with group-by using the dict-ID fast path.
+// NOTE-074: Two-stage accumulation: hot loop accumulates into map[aggGroupIDKey]*aggBucketState
+// (no string allocation per span); resolveGroupIDKey is called only at emit time (O(unique groups)).
+func streamAggGroupByID(
+	ctx context.Context,
+	r *modules_reader.Reader,
+	agg vm.AggregateSpec,
+	keyToBucket map[uint32]int64,
+	groupIDMap map[uint32]groupIDKey,
+	dicts [][]string,
+	buckets map[string]*aggBucketState,
+) error {
+	aggVals, err := buildAggValsMap(r, agg.Field, keyToBucket)
+	if err != nil {
+		return err
+	}
+
+	// Accumulate into ID-keyed intermediate map — no string allocation per span.
+	idBuckets := make(map[aggGroupIDKey]*aggBucketState)
+	i := 0
+	for pk, bucketIdx := range keyToBucket {
+		if i%ctxCheckInterval == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+		i++
+		gid := groupIDMap[pk]
+		ak := aggGroupIDKey{dims: gid, bucketIdx: bucketIdx}
+		bucket := idBuckets[ak]
+		if bucket == nil {
+			bucket = &aggBucketState{min: math.MaxFloat64, max: -math.MaxFloat64}
+			idBuckets[ak] = bucket
+		}
+		if v, ok := aggVals[pk]; ok {
+			updateAggBucket(bucket, agg.Function, v)
+		}
+	}
+
+	// Emit: resolve IDs back to strings at series-emit time (O(unique groups)).
+	for ak, bucket := range idBuckets {
+		gk := resolveGroupIDKey(ak.dims, dicts)
+		compositeKey := strconv.FormatInt(ak.bucketIdx, 10) + "\x00" + gk
+		buckets[compositeKey] = bucket
 	}
 	return nil
 }
