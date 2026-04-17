@@ -18,9 +18,10 @@ import (
 	"github.com/grafana/blockpack/internal/vm"
 )
 
-// NOTE-070: compositeKey scratch-buffer pool — eliminates per-span string allocations in the
-// metrics accumulation hot loop. string([]byte) used as a map key does not allocate when the
-// compiler can prove the string doesn't escape the map index expression.
+// NOTE-070/NOTE-067: compositeKey scratch-buffer pool — eliminates per-span string allocations
+// in the metrics accumulation hot loop. string([]byte) used as a map key does not allocate when
+// the compiler can prove the string doesn't escape the map index expression. PR #230 extends
+// the pool's scope by also eliminating the intermediate strings.Join in the hot loop.
 
 // Pool cap guard constants for compositeKeyScratchPool.
 // compositeKeyScratchDefaultCap covers typical keys (3-digit bucket + NUL + service name + NUL + float boundary).
@@ -243,7 +244,8 @@ func traceAccumulateRow(
 	attrVals []string,
 ) {
 	// NOTE-054: clear attrVals at function entry so stale values from prior rows never
-	// survive an early return. strings.Join copies the joined string before reuse is safe.
+	// survive an early return. NOTE-067: scratch buffer appends attrVals in-place; clear
+	// is still required to prevent stale values appearing after an early return.
 	clear(attrVals)
 
 	tb := querySpec.TimeBucketing
@@ -291,29 +293,35 @@ func traceAccumulateRow(
 		}
 		// Missing column → empty string label (Tempo convention).
 	}
-	attrGroupKey := strings.Join(attrVals, "\x00")
-	// NOTE-033: HISTOGRAM embeds log2 bucket boundary as a 3rd "\x00" segment.
-	// Non-HISTOGRAM functions omit the 3rd segment (existing composite key format unchanged).
-	// NOTE-070: use pooled scratch buffer to build composite key without heap allocation.
+	// NOTE-067: scratch buffer eliminates 3 per-span allocs on map-hit (Join + FormatInt + concat).
+	// Pool holds *[]byte so the slice header survives the pool round-trip.
 	scratch := acquireCompositeKeyScratch()
+	defer releaseCompositeKeyScratch(scratch)
 	*scratch = strconv.AppendInt((*scratch)[:0], bucketIdx, 10)
-	*scratch = append(*scratch, '\x00')
-	*scratch = append(*scratch, attrGroupKey...)
+	*scratch = append(*scratch, '\x00') // always emit separator (matches current " + "\x00" + attrGroupKey")
+	for i, v := range attrVals {
+		if i > 0 {
+			*scratch = append(*scratch, '\x00')
+		}
+		*scratch = append(*scratch, v...)
+	}
+	// NOTE-033: HISTOGRAM embeds log2 bucket boundary as a 3rd "\x00" segment.
 	if querySpec.Aggregate.Function == vm.FuncNameHISTOGRAM {
 		histBoundary := traceHistogramBucket(block, rowIdx, querySpec.Aggregate.Field)
 		*scratch = append(*scratch, '\x00')
 		*scratch = strconv.AppendFloat(*scratch, histBoundary, 'g', -1, 64)
 	}
+
+	// Zero-alloc map lookup on hit — Go compiler elides string(*scratch) conversion when key does not escape.
 	bucket, exists := buckets[string(*scratch)]
 	if !exists {
-		compositeKey := string(*scratch) // allocate once, only on map miss
+		key := string(*scratch) // NOTE-067: intentional alloc — key is retained in map
 		bucket = &aggBucketState{
 			min: math.MaxFloat64,
 			max: -math.MaxFloat64,
 		}
-		buckets[compositeKey] = bucket
+		buckets[key] = bucket
 	}
-	releaseCompositeKeyScratch(scratch)
 
 	traceUpdateBucket(block, rowIdx, querySpec.Aggregate, bucket)
 }

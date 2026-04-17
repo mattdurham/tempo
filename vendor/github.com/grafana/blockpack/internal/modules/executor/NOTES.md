@@ -2293,3 +2293,18 @@ outRefs/outVals output slices, buckets map, reader internals).
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:mergeJoinFilteredRefsWithVals`
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:streamCountRateNoGroupBy`
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:executeTraceMetricsIntrinsic`
+
+---
+
+## NOTE-073: eliminate strings.Join in compositeKey construction (PR #230) (2026-04-16)
+*Added: 2026-04-16. Renumbered from NOTE-067 on perf-stack-local — NOTE-067 is taken locally by metricsColumnsAreIntrinsic. Upstream PR #230 retains NOTE-067 against origin/main.*
+
+**Decision:** Extend the pool pattern from NOTE-070/NOTE-071 (compositeKey pool from #228) to also eliminate the per-span `strings.Join(attrVals, "\x00")` call that #228 left in place. The attrVals are appended directly into the pooled scratch buffer with `\x00` separators between values, matching the Join output byte-for-byte.
+
+**Why:** Even after #228 pooled the final compositeKey buffer, `strings.Join` itself still allocated a fresh heap string per span for the intermediate attrGroupKey. For M8 (`{kind=server} | histogram_over_time(duration) by (resource.service.name)`), Pyroscope showed 85% GC CPU on dev-03 querier — the residual per-span allocation source.
+
+**Byte format invariant:** `'\x00'` separator emitted UNCONDITIONALLY after bucketIdx (matching `FormatInt + "\x00" + ""`); inter-value `'\x00'` only when `i > 0` (matching `strings.Join` semantics). Empty-groupBy produces `"N\x00"`, multi-groupBy produces `"N\x00v1\x00v2..."`. HISTOGRAM appends `'\x00' + AppendFloat`. Gate-tested by EX-CK-01 through EX-CK-07.
+
+**Benchmark result:** BENCH-EX-05 post-fix: ~325 allocs/op (down from pre-this-PR ~523). BENCH-EX-09 (HISTOGRAM variant, renumbered from BENCH-EX-08 on perf-stack-local): ~325 allocs/op on map-hit; 3 map-misses per iteration (one per cycling env value).
+
+**Back-ref:** `internal/modules/executor/metrics_trace.go:traceAccumulateRow`
