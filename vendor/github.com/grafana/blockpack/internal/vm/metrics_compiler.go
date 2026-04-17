@@ -46,24 +46,24 @@ func CompileTraceQLMetrics(query string, startTime, endTime int64) (*Program, *Q
 		return nil, nil, fmt.Errorf("failed to compile to QuerySpec: %w", err)
 	}
 
-	// Compile to VM Program with a match-all filter program for row scanning.
-	// Use extractTraceQLPredicates for block-level pruning (same path as filter queries).
-	// NOTE-070: also compile ColumnPredicate for block-scan row-level filtering.
-	// The intrinsic fast path uses program.Predicates directly; the block scan path uses
-	// program.ColumnPredicate. Without this, filters like {kind=server && sc>=400} that
-	// fall back to block scan (because BlockRefsFromIntrinsicTOC cannot evaluate range
-	// predicates on dict columns) return match-all results — effectively ignoring the filter.
-	program := compileMatchAllProgram()
+	// Compile to VM Program. When a filter is present, compile a real ColumnPredicate
+	// for row-level filtering (same as CompileTraceQLFilter). When no filter, use
+	// match-all so {} queries scan all rows.
+	// NOTE-071: ColumnPredicate must be compiled from the filter expression — FullScan()
+	// is only valid for match-all ({}) queries.
+	var program *Program
 	if metricsQuery.Filter != nil && metricsQuery.Filter.Expr != nil {
-		program.Predicates = extractTraceQLPredicates(metricsQuery.Filter.Expr)
-		compiler := &traceqlCompiler{program: program}
-		columnPredicate, compileErr := compiler.compileColumnPredicate(metricsQuery.Filter.Expr)
-		if compileErr != nil {
-			return nil, nil, fmt.Errorf("compile column predicate: %w", compileErr)
+		compiler := &traceqlCompiler{program: &Program{}}
+		cp, err := compiler.compileColumnPredicate(metricsQuery.Filter.Expr)
+		if err != nil {
+			return nil, nil, fmt.Errorf("compile column predicate: %w", err)
 		}
-		program.ColumnPredicate = columnPredicate
+		program = compiler.program
+		program.ColumnPredicate = cp
+		program.Predicates = extractTraceQLPredicates(metricsQuery.Filter.Expr)
+	} else {
+		program = compileMatchAllProgram()
 	}
-
 	return program, spec, nil
 }
 

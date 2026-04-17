@@ -18,10 +18,10 @@ import (
 	"github.com/grafana/blockpack/internal/vm"
 )
 
-// NOTE-070/NOTE-067: compositeKey scratch-buffer pool — eliminates per-span string allocations
+// NOTE-071/NOTE-073: compositeKey scratch-buffer pool — eliminates per-span string allocations
 // in the metrics accumulation hot loop. string([]byte) used as a map key does not allocate when
-// the compiler can prove the string doesn't escape the map index expression. PR #230 extends
-// the pool's scope by also eliminating the intermediate strings.Join in the hot loop.
+// the compiler can prove the string doesn't escape the map index expression. The pool also feeds
+// the strings.Join-elimination path below (appends attrVals directly into scratch).
 
 // Pool cap guard constants for compositeKeyScratchPool.
 // compositeKeyScratchDefaultCap covers typical keys (3-digit bucket + NUL + service name + NUL + float boundary).
@@ -315,7 +315,7 @@ func traceAccumulateRow(
 	// Zero-alloc map lookup on hit — Go compiler elides string(*scratch) conversion when key does not escape.
 	bucket, exists := buckets[string(*scratch)]
 	if !exists {
-		key := string(*scratch) // NOTE-067: intentional alloc — key is retained in map
+		key := string(*scratch) // NOTE-073: intentional alloc — key is retained in map
 		bucket = &aggBucketState{
 			min: math.MaxFloat64,
 			max: -math.MaxFloat64,

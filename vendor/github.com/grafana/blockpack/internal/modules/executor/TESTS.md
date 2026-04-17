@@ -882,6 +882,51 @@ Back-ref: `executor/stream_histogram_groupby_test.go:TestStreamHistogramGroupBy_
 
 ---
 
+### EX-ETM-21: TestTraceMetrics_FilterCorrectness_IntrinsicOnly
+
+**Purpose:** Verify that a metrics query with an intrinsic filter (`kind = server`)
+applied via the block scan path counts only matching spans.
+
+**Setup:** 3 server spans with `latency_ms=10`, 2 client spans with `latency_ms=10`,
+all in one time bucket.
+
+**Query:** `{ kind = server } | sum(span.latency_ms)` — the `sum()` on a non-intrinsic
+field forces the block scan path.
+
+**Assertions:**
+- `result.Series[0].Values[0] == 30.0` (server spans only, not 50.0 for all)
+- `result.BlocksScanned > 0` (block scan path confirmed)
+
+**Regression target:** Before the fix, `ColumnPredicate = FullScan()` makes sum return
+50.0 (all 5 spans × 10).
+
+---
+
+### EX-ETM-22: TestTraceMetrics_FilterCorrectness_CompoundFilter
+
+**Purpose:** Verify that a compound filter with a non-intrinsic range predicate
+(`kind = server && span.http.response.status_code >= 400`) counts only matching spans.
+This is the bug-report scenario: filtered count must be ≤ less-restrictive filter count.
+
+**Setup:** 5 spans: server+sc500, server+sc200, server+sc404, client+sc500, client+sc400.
+
+**Queries (run against same block):**
+- Query A: `{ kind = server && span.http.response.status_code >= 400 } | count_over_time()`
+- Query B: `{ kind = server } | count_over_time()`
+
+**Assertions:**
+- Query A result: 2 (spans with server+sc≥400)
+- Query B result: 3 (all server spans)
+- Query A count < Query B count
+- Query A: `result.BlocksScanned > 0` (compound filter with non-intrinsic field forces block scan)
+- Query B: no BlocksScanned assertion (intrinsic-only filter may use fast path)
+
+**Regression target:** Before the fix, Query A returns 5 (all spans, FullScan()) and
+Query B may return 3 via the intrinsic fast path — so filtered > less-restrictive, which
+is the reported bug.
+
+---
+
 ### EX-ETM-GKM-01: TestBuildGroupKeyMap_SingleGroupBy_Dict
 
 **Scenario:** `count_over_time() by (resource.service.name)` with a dict-encoded group-by
