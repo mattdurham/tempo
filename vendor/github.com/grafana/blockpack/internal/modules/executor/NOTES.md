@@ -2180,41 +2180,33 @@ Per-span work: one existing-string map lookup (`groupKeyMap[pk]`) + one array wr
 After the loop, populate `buckets` from non-zero (group, step) pairs only — at most
 `numGroups × numSteps` entries (e.g., 6 kinds × 360 steps = 2,160 for M5, vs 150M before).
 
-Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:streamCountRateGroupBy`
-
 ---
 
-## NOTE-070: metrics ColumnPredicate was match-all — filters silently ignored in block scan path (2026-04-16)
+## NOTE-070: Metrics Filter ColumnPredicate Bug and Fix
 *Added: 2026-04-16*
 
-**Bug:** `CompileTraceQLMetrics` created programs with `ColumnPredicate = FullScan()` (match-all).
-The filter expression was only compiled into `program.Predicates` for block-level pruning
-(bloom filters, range indexes). Row-level filtering in the block scan path was never applied.
+**Issue:** `CompileTraceQLMetrics` set `program.Predicates` (block-level pruning)
+but never compiled a real `ColumnPredicate` from the filter expression. The program
+always used `FullScan()` for the `ColumnPredicate`, so the block-scan path in
+`ExecuteTraceMetrics` accumulated all rows regardless of the filter.
 
-**Effect:** Any metrics query with a filter that falls back to the block scan path returned
-results identical to the no-filter case. Queries like `{kind=server && sc>=400} | rate()`
-showed the same series count as `{} | rate()` (~197 series) instead of the correct filtered
-count (~39 series from parquet), because `BlockRefsFromIntrinsicTOC` cannot evaluate range
-predicates on dict-format columns (`span.http.response.status_code` is stored as dict),
-forcing a fall-through to the block scan where the predicate was a no-op.
+**Fix:** When a filter is present, instantiate a `traceqlCompiler` and call
+`compileColumnPredicate(filter.Expr)`, exactly as `CompileTraceQLFilter` does. When no
+filter is present (`{}` queries), keep `compileMatchAllProgram()`.
 
-The intrinsic fast path was unaffected (it uses `program.Predicates` directly, not
-`program.ColumnPredicate`). Equality predicates on dict columns (e.g., `{kind=server}`,
-`{resource.service.name="grafana"}`) worked correctly through the intrinsic path. Only
-queries requiring block scan fallback — range predicates on dict columns — were broken.
+**Why not post-filter in `ExecuteTraceMetrics`?** The `filterRowSetByIntrinsicNodes`
+post-filter used in the search path only handles intrinsic columns. Non-intrinsic range
+predicates like `span.http.response.status_code >= 400` require column scan, which is
+already implemented in `compileColumnPredicate`. Re-implementing that at the executor
+level would duplicate the VM machinery.
 
-**Fix:** `CompileTraceQLMetrics` now also compiles the filter into `ColumnPredicate` via
-`traceqlCompiler.compileColumnPredicate`, matching the path used by `CompileTraceQLFilterWithOptions`.
-
-Back-ref: `internal/vm/metrics_compiler.go:CompileTraceQLMetrics`
+**Invariant:** `program.ColumnPredicate` must be a real predicate when a filter
+expression is present. The only valid `FullScan()` column predicate is for match-all
+(`{}`) queries.
 
 ---
 
 ## NOTE-071: compositeKey Scratch-Buffer Pool — Zero-Allocation Map Lookup (2026-04-16)
-
-(Renumbered from NOTE-070 to resolve collision with the ColumnPredicate fix above when merged
-onto perf-stack-local. Upstream PR grafana/blockpack#228 will keep NOTE-070; collision only
-exists on this local perf-stack-local branch.)
 
 **Problem:** `traceAccumulateRow`, `traceBuildDenseSeries`, and the histogram series builder each
 constructed a composite map key using `strconv.FormatInt(bucketIdx, 10) + "\x00" + attrGroupKey`,
@@ -2240,10 +2232,6 @@ Back-ref: `internal/modules/executor/metrics_trace.go:traceAccumulateRow`,
 
 ## NOTE-072: mergeJoinFilteredRefsWithVals — Merge-Join Replaces filteredKeys Map (2026-04-16)
 *Added: 2026-04-16*
-
-(Renumbered from NOTE-070 to resolve collision with the ColumnPredicate fix above when merged
-onto perf-stack-local. Upstream PR grafana/blockpack#229 will keep NOTE-070; collision only
-exists on this local perf-stack-local branch.)
 
 **Problem:** `executeTraceMetricsIntrinsic` (and `streamCountRateNoGroupBy`) used a
 `filteredKeys map[uint32]struct{}` to record which packed keys passed the predicate filter.
@@ -2296,15 +2284,26 @@ Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:executeTraceMetr
 
 ---
 
-## NOTE-073: eliminate strings.Join in compositeKey construction (PR #230) (2026-04-16)
-*Added: 2026-04-16. Renumbered from NOTE-067 on perf-stack-local — NOTE-067 is taken locally by metricsColumnsAreIntrinsic. Upstream PR #230 retains NOTE-067 against origin/main.*
+## NOTE-073: strings.Join eliminated in traceAccumulateRow compositeKey path
+*Added: 2026-04-16*
 
-**Decision:** Extend the pool pattern from NOTE-070/NOTE-071 (compositeKey pool from #228) to also eliminate the per-span `strings.Join(attrVals, "\x00")` call that #228 left in place. The attrVals are appended directly into the pooled scratch buffer with `\x00` separators between values, matching the Join output byte-for-byte.
+**Decision:** Extend the pool pattern from NOTE-071 (compositeKey pool from #228) by also
+eliminating the intermediate `strings.Join(attrVals, "\x00")` in `traceAccumulateRow`.
+attrVals are appended directly into the pooled scratch buffer with `\x00` separators.
 
-**Why:** Even after #228 pooled the final compositeKey buffer, `strings.Join` itself still allocated a fresh heap string per span for the intermediate attrGroupKey. For M8 (`{kind=server} | histogram_over_time(duration) by (resource.service.name)`), Pyroscope showed 85% GC CPU on dev-03 querier — the residual per-span allocation source.
+**Why:** After NOTE-071, the compositeKey buffer was pooled but `strings.Join` still
+allocated one heap string per span for the intermediate attrGroupKey. For M8 with 150M
+spans/query this was still ~150M allocations driving residual ~85% GC CPU on filtered
+histogram queries.
 
-**Byte format invariant:** `'\x00'` separator emitted UNCONDITIONALLY after bucketIdx (matching `FormatInt + "\x00" + ""`); inter-value `'\x00'` only when `i > 0` (matching `strings.Join` semantics). Empty-groupBy produces `"N\x00"`, multi-groupBy produces `"N\x00v1\x00v2..."`. HISTOGRAM appends `'\x00' + AppendFloat`. Gate-tested by EX-CK-01 through EX-CK-07.
+**Byte format invariant:** The byte sequence is identical to NOTE-071:
+- `'\x00'` separator after bucketIdx UNCONDITIONALLY (matches `FormatInt + "\x00" + ""`
+  for empty groupBy)
+- `'\x00'` between attrVals only when `i > 0` (matches `strings.Join` semantics)
+- HISTOGRAM appends `'\x00' + AppendFloat` as before
+Gate-tested by EX-CK-01 through EX-CK-07.
 
-**Benchmark result:** BENCH-EX-05 post-fix: ~325 allocs/op (down from pre-this-PR ~523). BENCH-EX-09 (HISTOGRAM variant, renumbered from BENCH-EX-08 on perf-stack-local): ~325 allocs/op on map-hit; 3 map-misses per iteration (one per cycling env value).
+**Benchmark result:** BENCH-EX-05 post-fix: ~325 allocs/op (down from pre-this-PR ~523).
+BENCH-EX-09 (HISTOGRAM variant) similar.
 
 **Back-ref:** `internal/modules/executor/metrics_trace.go:traceAccumulateRow`

@@ -102,8 +102,8 @@ go test -bench=BenchmarkTraceAccumulateRow_AllocCount -benchmem -count=3 ./inter
 History:
 - Pre-NOTE-054: ~452 allocs/op
 - After NOTE-054 (attrVals hoist, 2026-04-14): ~252 allocs/op
-- Pre-PR #228 / pre-PR #230 (intervening streamHistogramGroupBy + other additions): ~523 allocs/op
-- After NOTE-070 (compositeKey pool from #228) + NOTE-067 (strings.Join elimination from #230): ~325 allocs/op
+- Pre-#228 / pre-#230 (intervening streamHistogramGroupBy + other additions): ~523 allocs/op
+- After NOTE-071 (compositeKey pool) + NOTE-073 (strings.Join elimination): ~325 allocs/op
 
 Why 325 and not lower: this benchmark uses 200 spans all in bucket 0 with 3 cycling
 resource.env values, so there are 3 map-misses per `b.Loop()` iteration (not 1). The
@@ -117,7 +117,7 @@ Back-ref: `internal/modules/executor/prealloc_bench_test.go:BenchmarkTraceAccumu
 ---
 
 ## BENCH-EX-09: BenchmarkTraceAccumulateRow_HISTOGRAM_AllocCount
-*Added: 2026-04-16. Renumbered from BENCH-EX-08 on perf-stack-local to avoid collision with #229's BENCH-EX-08 (FilteredIntrinsic_AllocCount). Upstream PR #230 retains BENCH-EX-08.*
+*Added: 2026-04-16. Renumbered from BENCH-EX-08 during PR combination — #229 already took BENCH-EX-08 for BenchmarkTraceMetrics_FilteredIntrinsic_AllocCount.*
 
 Measures per-call allocations in the HISTOGRAM path of `traceAccumulateRow`. Uses 200
 spans with `span:duration`, cycling `resource.env` across 3 values, 1s step buckets,

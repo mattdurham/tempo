@@ -146,3 +146,19 @@ Back-ref: `internal/vm/bytecode.go:Program.NeedsColumnData`,
 **Rationale:** `DateBinInfo` was an exported struct that was never referenced outside of `vm.go` itself and was not anchored in `cmd/deadcode/main.go`. It was dead API surface — no callers exist in the codebase. Removing it shrinks the public surface of the `vm` package and eliminates a maintenance burden with no benefit.
 
 **If date-binning logic is needed in future:** Re-introduce a struct at that time with a concrete use case. Do not restore `DateBinInfo` as-is — the original design was never used.
+
+---
+
+## NOTE-071: CompileTraceQLMetrics Must Compile ColumnPredicate from Filter
+*Added: 2026-04-16*
+
+`CompileTraceQLMetrics` must compile a real `ColumnPredicate` from the filter
+expression when one is present — `FullScan()` is only valid for match-all (`{}`)
+queries. Without this, the block-scan path in `ExecuteTraceMetrics` accumulates
+all rows regardless of the filter, causing filtered queries to return more results
+than less-restrictive ones (definitively wrong behavior).
+
+Fix: when a filter is present, instantiate a `traceqlCompiler` and call
+`compileColumnPredicate(filter.Expr)`, exactly as `CompileTraceQLFilter` does.
+
+Back-ref: `internal/vm/metrics_compiler.go:CompileTraceQLMetrics`
