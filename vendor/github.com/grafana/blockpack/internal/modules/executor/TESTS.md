@@ -2088,6 +2088,24 @@ Back-ref: `internal/modules/executor/block_group_pipeline_test.go:TestBlockGroup
 
 ---
 
+## EX-ETM-INTR-25: out_of_range_rowidx_skipped — RowIdx bounds check prevents false positive
+
+**Scenario:** A `filteredRef` with `RowIdx` beyond its block's span count (block 0 has
+SpanCount=3, ref has RowIdx=3). Without the bounds check, `denseIdx = blkOffsets[0]+3 = 3`
+lands in block 1's address range, causing a false positive hit on `inRangeRefs` = [{BlockIdx:1,
+RowIdx:0}] (denseIdx=3).
+
+**Setup:** `blkOffsets=[0,3]`, `totalSpans=5`; filteredRefs = [{BlockIdx:0, RowIdx:3}];
+inRangeRefs = [{BlockIdx:1, RowIdx:0}]; inRangeVals = [42].
+
+**Assertions:**
+- `gotRefs` is empty — the malformed filteredRef is skipped, no false positive.
+- `gotVals` is empty.
+
+Back-ref: `internal/modules/executor/merge_join_test.go:TestBitmapIntersect_AdditionalCases/out_of_range_rowidx_skipped`
+
+---
+
 ### EXEC-TEST-POOL-001: compositeKey pool — zero allocations per map hit
 
 Verify that a metrics query against a block with multiple spans produces 0 allocations per
@@ -2098,49 +2116,163 @@ Back-ref: `internal/modules/executor/metrics_trace_pool_test.go:TestCompositeKey
 
 ---
 
-## EX-ETM-INTR-07: TestMergeJoinRefs_CorrectnessVsMap
+### EXEC-TEST-POOL-002: intersectBitmap pool — correct zero behavior on acquire
 
-**Scenario:** `mergeJoinFilteredRefsWithVals` produces identical results to the reference
-`filteredKeys map[uint32]struct{}` implementation for all input shapes, including empty
-inputs, no overlap, partial overlap, full overlap, and duplicate keys.
+Verifies that acquire+set+release+reacquire of the intersectBitmapPool produces all-zero
+words on the second acquire. Confirms the clear-on-acquire pattern prevents stale-bit bugs.
+Back-ref: `internal/modules/executor/metrics_trace_pool_test.go:TestIntersectBitmapPool_ZeroOnAcquire`
 
-**Setup:** Table-driven unit test in `internal/modules/executor/merge_join_test.go`.
-Tests use `packKeyVals` helper to construct parallel ref/val slices from `(blockIdx, rowIdx,
-val)` tuples. Both the merge-join output and the reference map output are compared for
-`outRefs` and `outVals` equality.
+---
 
-**Cases include:**
-- Empty filteredRefs → empty output
-- Empty inRangeRefs → empty output
-- No overlap between filteredRefs and inRangeRefs → empty output
-- Full overlap (identical ref sets) → all entries in output
-- Partial overlap (interleaved) → only joined entries
-- Duplicate packed keys in inRangeRefs handled (only `ri` advances on match; `fi` stays, so duplicate inRangeRefs entries with the same packKey are all emitted)
+## EX-ETM-INTR-07: TestMergeJoinRefs_CorrectnessVsMap (superseded by EX-ETM-INTR-14–19)
 
-**Assertions:** `outRefs` and `outVals` match reference implementation for every case; no
-panic; zero map allocations during join (verified by `b.ReportAllocs()` in BENCH-EX-08).
+**Scenario:** `mergeJoinFilteredRefsWithVals` produced identical results to the reference
+`filteredKeys map[uint32]struct{}` implementation. **This function was removed in NOTE-074.**
+Test file (`merge_join_test.go`) now tests `bitmapIntersectRefsWithVals` — see EX-ETM-INTR-14–19.
 
-Back-ref: `internal/modules/executor/merge_join_test.go:TestMergeJoinRefs_CorrectnessVsMap`
+Back-ref: `internal/modules/executor/merge_join_test.go` (now TestBitmapIntersectRefs_CorrectnessVsMap)
 
 ---
 
 ## EX-ETM-INTR-08: BenchmarkTraceMetrics_FilteredIntrinsic_AllocCount
 
 **Scenario:** Measures per-op allocations for `{ status = error } | rate()` on a 300-span
-single-block file (200 matching, 100 non-matching) after the NOTE-072 merge-join optimization.
+single-block file (200 matching, 100 non-matching) after the NOTE-074 bitmap-intersect optimization.
+*Updated: 2026-04-16 — formerly described merge-join (NOTE-072) alloc profile; now reflects bitmap path.*
 
-After the fix, no `map[uint32]struct{}` allocation should appear per benchmark iteration.
-Total allocs/op reflects only sort-support allocations (`slices.Clone` for filteredRefs,
-`[]refIdx` for the index) — both O(1) per file, not O(N) per span. See BENCH-EX-08.
+After the change, no `map[uint32]struct{}` allocation and no sort-support allocations
+(`slices.Clone` + `[]refIdx`) appear per benchmark iteration. All remaining allocations are
+O(1) per file: bitmap pool, outRefs/outVals output slices, buckets map, reader internals. See BENCH-EX-08.
 
 **Setup (outside timed loop):**
 - Write 300 spans: 200 with `status=error`, 100 with `status=ok`. `MaxBlockSpans=301` (single block).
 - Compile `{ status = error } | rate()` with 6 × 60s buckets.
 - Run with `b.ReportAllocs()`.
 
-**Assertions:** No `map[uint32]struct{}` allocation per iteration; allocs/op matches BENCH-EX-08 baseline (~76 allocs/op).
+**Assertions:** No sort-support or map allocations per iteration; allocs/op matches BENCH-EX-08 post-bitmap baseline (~74 allocs/op, NOTE-074).
 
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic_test.go:BenchmarkTraceMetrics_FilteredIntrinsic_AllocCount`
+---
+
+## EX-ETM-INTR-14: TestBitmapIntersectRefs_CorrectnessVsMap/empty_filteredRefs
+*Added: 2026-04-16 (NOTE-074)*
+
+**Scenario:** `bitmapIntersectRefsWithVals` with nil and empty filteredRefs → `nil, nil`.
+
+**Assertions:** `outRefs == nil`, `outVals == nil` for both nil and empty-slice inputs.
+
+Back-ref: `internal/modules/executor/merge_join_test.go:TestBitmapIntersectRefs_CorrectnessVsMap/empty_filteredRefs`
+
+---
+
+## EX-ETM-INTR-15: TestBitmapIntersectRefs_CorrectnessVsMap/empty_inRangeRefs
+*Added: 2026-04-16 (NOTE-074)*
+
+**Scenario:** filteredRefs populated, inRangeRefs nil/empty → `nil, nil`.
+
+**Assertions:** `outRefs == nil`, `outVals == nil`.
+
+Back-ref: `internal/modules/executor/merge_join_test.go:TestBitmapIntersectRefs_CorrectnessVsMap/empty_inRangeRefs`
+
+---
+
+## EX-ETM-INTR-16: TestBitmapIntersectRefs_CorrectnessVsMap/full_overlap
+*Added: 2026-04-16 (NOTE-074)*
+
+**Scenario:** filteredRefs == inRangeRefs → all entries returned; output set equals mapIntersect reference.
+
+Back-ref: `internal/modules/executor/merge_join_test.go:TestBitmapIntersectRefs_CorrectnessVsMap/full_overlap`
+
+---
+
+## EX-ETM-INTR-17: TestBitmapIntersectRefs_CorrectnessVsMap/no_overlap
+*Added: 2026-04-16 (NOTE-074)*
+
+**Scenario:** Disjoint filteredRefs and inRangeRefs → empty output.
+
+Back-ref: `internal/modules/executor/merge_join_test.go:TestBitmapIntersectRefs_CorrectnessVsMap/no_overlap`
+
+---
+
+## EX-ETM-INTR-18: TestBitmapIntersectRefs_CorrectnessVsMap/partial_overlap
+*Added: 2026-04-16 (NOTE-074)*
+
+**Scenario:** filteredRefs = {A,C,E}, inRangeRefs = {A,B,C,D} → output = {A,C}; output set equals mapIntersect reference.
+
+Back-ref: `internal/modules/executor/merge_join_test.go:TestBitmapIntersectRefs_CorrectnessVsMap/partial_overlap`
+
+---
+
+## EX-ETM-INTR-19: TestBitmapIntersectRefs_CorrectnessVsMap/pool_reuse_no_stale_bits
+*Added: 2026-04-16 (NOTE-074)*
+
+**Scenario:** Call bitmapIntersectRefsWithVals twice in sequence with different filteredRefs. Second call must not return refs that were only in first call's filteredRefs (stale bits from pool reuse).
+
+**Assertions:** Second call returns only its own intersection; no cross-contamination from first call's bitmap.
+
+Back-ref: `internal/modules/executor/merge_join_test.go:TestBitmapIntersectRefs_CorrectnessVsMap/pool_reuse_no_stale_bits`
+
+---
+
+## EX-ETM-INTR-20: TestBitmapIntersect_AdditionalCases/filteredRefs_unsorted_order
+*Added: 2026-04-16 (NOTE-074)*
+
+**Scenario:** `bitmapIntersectRefsWithVals` with filteredRefs in non-ascending packKey order.
+Bitmap is order-independent on filteredRefs — bit-set by packKey, not position.
+
+**Assertions:** Output set equals mapIntersect reference regardless of filteredRefs ordering.
+
+Back-ref: `internal/modules/executor/merge_join_test.go:TestBitmapIntersect_AdditionalCases/filteredRefs_unsorted_order`
+
+---
+
+## EX-ETM-INTR-21: TestBitmapIntersect_AdditionalCases/inRangeRefs_timestamp_order
+*Added: 2026-04-16 (NOTE-074)*
+
+**Scenario:** inRangeRefs in timestamp order (not packKey order), matching NOTE-042 invariant.
+Bitmap probe is order-independent on inRangeRefs — each entry tested by packKey bit, no sorting.
+
+**Assertions:** Output entries match the intersection; output preserves inRangeRefs order (timestamp order).
+
+Back-ref: `internal/modules/executor/merge_join_test.go:TestBitmapIntersect_AdditionalCases/inRangeRefs_timestamp_order`
+
+---
+
+## EX-ETM-INTR-22: TestBitmapIntersect_AdditionalCases/single_ref_overlap
+*Added: 2026-04-16 (NOTE-074)*
+
+**Scenario:** filteredRefs has exactly one entry that appears in inRangeRefs.
+
+**Assertions:** Output contains exactly that one entry.
+
+Back-ref: `internal/modules/executor/merge_join_test.go:TestBitmapIntersect_AdditionalCases/single_ref_overlap`
+
+---
+
+## EX-ETM-INTR-23: TestBitmapIntersect_AdditionalCases/duplicate_packkeys_in_inRange
+*Added: 2026-04-16 (NOTE-074)*
+
+**Scenario:** inRangeRefs contains two entries with the same packKey. Bitmap bit is idempotent
+on set; both inRangeRefs entries pass the bit-test.
+
+**Assertions:** Both duplicate entries are present in output — matches mapIntersect reference
+behavior (map lookup is also idempotent; both entries pass). NOTE-072 merge-join behavior was
+identical: `ri` advances on match, `fi` stays, so duplicate inRangeRefs entries were all emitted.
+
+Back-ref: `internal/modules/executor/merge_join_test.go:TestBitmapIntersect_AdditionalCases/duplicate_packkeys_in_inRange`
+
+---
+
+## EX-ETM-INTR-24: TestBitmapIntersect_AdditionalCases/filteredRefs_not_mutated
+*Added: 2026-04-16 (NOTE-074)*
+
+**Scenario:** `bitmapIntersectRefsWithVals` must not mutate the filteredRefs slice. Bitmap sets
+bits in the pooled `[]uint64` word slice, never touches filteredRefs. Contrast with the
+merge-join approach which cloned filteredRefs before sorting to avoid mutation.
+
+**Assertions:** filteredRefs slice is byte-identical before and after the call.
+
+Back-ref: `internal/modules/executor/merge_join_test.go:TestBitmapIntersect_AdditionalCases/filteredRefs_not_mutated`
 
 ---
 
