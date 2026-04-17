@@ -97,25 +97,43 @@ Measures per-call allocations in the `traceAccumulateRow` hot path by running
 go test -bench=BenchmarkTraceAccumulateRow_AllocCount -benchmem -count=3 ./internal/modules/executor/
 ```
 
-**Baseline (post-pool, 2026-04-16):** ~325 allocs/op — regression threshold.
-Before the prealloc change: +200 allocs/op from `attrVals := make([]string, len(groupBy))` per row.
-After prealloc: attrVals allocated once per block; `clear(attrVals)` at function entry eliminates per-row alloc (~252 allocs/op).
-After compositeKeyScratchPool (NOTE-070): pool introduced for composite key building. The increase
-from ~252 to ~325 allocs/op is due to streamHistogramGroupBy additions from a separate task, not the
-pool optimization. The pool eliminates per-span string allocations on map-hit paths; the net alloc
-increase is from other query-path additions unrelated to composite key pooling.
+**Baseline (post-compositeKey pool + Join elimination):** ~325 allocs/op — regression threshold.
 
-*Addendum (2026-04-16):* Observed baseline has drifted to ~523 allocs/op as of this date.
-The drift is not caused by this PR (`metrics_trace_intrinsic.go` merge-join change) — neither
-`metrics_trace.go` nor `prealloc_bench_test.go` were modified. The 252 baseline was measured
-2026-04-08 against an earlier codebase state; intervening changes to the block-scan and
-metrics paths (NOTE-057, NOTE-058, NOTE-066) have added allocations to the `ExecuteTraceMetrics`
-call stack. The 252 figure is no longer a valid regression threshold; the current observed
-~523 allocs/op should be treated as the working baseline until a dedicated re-baselining PR
-updates this entry.
+History:
+- Pre-NOTE-054: ~452 allocs/op
+- After NOTE-054 (attrVals hoist, 2026-04-14): ~252 allocs/op
+- Pre-PR #228 / pre-PR #230 (intervening streamHistogramGroupBy + other additions): ~523 allocs/op
+- After NOTE-070 (compositeKey pool from #228) + NOTE-067 (strings.Join elimination from #230): ~325 allocs/op
+
+Why 325 and not lower: this benchmark uses 200 spans all in bucket 0 with 3 cycling
+resource.env values, so there are 3 map-misses per `b.Loop()` iteration (not 1). The
+remaining ~322 allocs are per-call fixed overhead (block parsing, rowSet, series
+building). The BENCH-EX-09 HISTOGRAM variant (same setup) is the definitive map-hit
+zero-alloc regression guard — it isolates the per-span path.
 
 Back-ref: `internal/modules/executor/prealloc_bench_test.go:BenchmarkTraceAccumulateRow_AllocCount`,
           `internal/modules/executor/metrics_trace.go:traceAccumulateRow`
+
+---
+
+## BENCH-EX-09: BenchmarkTraceAccumulateRow_HISTOGRAM_AllocCount
+*Added: 2026-04-16. Renumbered from BENCH-EX-08 on perf-stack-local to avoid collision with #229's BENCH-EX-08 (FilteredIntrinsic_AllocCount). Upstream PR #230 retains BENCH-EX-08.*
+
+Measures per-call allocations in the HISTOGRAM path of `traceAccumulateRow`. Uses 200
+spans with `span:duration`, cycling `resource.env` across 3 values, 1s step buckets,
+HISTOGRAM function. All spans have identical duration (500µs), mapping to the same
+histogram bucket, so 3 map-misses per iteration (one per env value) and ~197 map-hits.
+
+**Target:** 0 allocs/op on map-hit. 1 alloc/op on map-miss (stored key).
+
+**Run command:**
+```
+go test -bench=BenchmarkTraceAccumulateRow_HISTOGRAM -benchmem -count=3 ./internal/modules/executor/
+```
+
+**Baseline (post-compositeKey pool):** ~325 allocs/op. Before fix: ~523 allocs/op (+198 from compositeKey allocs).
+
+**Back-ref:** `internal/modules/executor/prealloc_bench_test.go:BenchmarkTraceAccumulateRow_HISTOGRAM_AllocCount`
 
 ---
 

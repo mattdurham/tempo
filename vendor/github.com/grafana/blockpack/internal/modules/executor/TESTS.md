@@ -2096,3 +2096,68 @@ Total allocs/op reflects only sort-support allocations (`slices.Clone` for filte
 **Assertions:** No `map[uint32]struct{}` allocation per iteration; allocs/op matches BENCH-EX-08 baseline (~76 allocs/op).
 
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic_test.go:BenchmarkTraceMetrics_FilteredIntrinsic_AllocCount`
+
+---
+
+## EX-CK-01: TestTraceCompositeKey_EmptyGroupBy_NonHistogram
+*Added: 2026-04-16*
+
+**Scenario:** compositeKey byte-equivalence, empty groupBy, non-HISTOGRAM.
+**Assert:** old path (Join+concat) == new path (scratch buffer) == `"5\x00"`.
+Back-ref: `internal/modules/executor/metrics_trace_composite_key_test.go:TestTraceCompositeKey_EmptyGroupBy_NonHistogram`
+
+---
+
+## EX-CK-02: TestTraceCompositeKey_SingleGroupBy_NonHistogram
+*Added: 2026-04-16*
+
+**Scenario:** compositeKey byte-equivalence, single groupBy value, non-HISTOGRAM.
+**Assert:** old == new == `"3\x00server"`.
+Back-ref: `internal/modules/executor/metrics_trace_composite_key_test.go:TestTraceCompositeKey_SingleGroupBy_NonHistogram`
+
+---
+
+## EX-CK-03: TestTraceCompositeKey_MultiGroupBy_NonHistogram
+*Added: 2026-04-16*
+
+**Scenario:** compositeKey byte-equivalence, two groupBy values, non-HISTOGRAM.
+**Assert:** old == new == `"7\x00GET\x00200"`.
+Back-ref: `internal/modules/executor/metrics_trace_composite_key_test.go:TestTraceCompositeKey_MultiGroupBy_NonHistogram`
+
+---
+
+## EX-CK-04: TestTraceCompositeKey_EmptyGroupBy_Histogram
+*Added: 2026-04-16*
+
+**Scenario:** compositeKey byte-equivalence, empty groupBy, HISTOGRAM.
+**Assert:** old == new == `"2\x00\x000.5"`.
+Back-ref: `internal/modules/executor/metrics_trace_composite_key_test.go:TestTraceCompositeKey_EmptyGroupBy_Histogram`
+
+---
+
+## EX-CK-05: TestTraceCompositeKey_SingleGroupBy_Histogram
+*Added: 2026-04-16*
+
+**Scenario:** compositeKey byte-equivalence, single groupBy, HISTOGRAM.
+**Assert:** old == new == `"1\x00grpc\x001"`.
+Back-ref: `internal/modules/executor/metrics_trace_composite_key_test.go:TestTraceCompositeKey_SingleGroupBy_Histogram`
+
+---
+
+## EX-CK-06: TestTraceCompositeKey_MultiGroupBy_Histogram
+*Added: 2026-04-16*
+
+**Scenario:** compositeKey byte-equivalence, two groupBy values, HISTOGRAM.
+**Assert:** old == new == `"0\x00a\x00b\x002"`.
+Back-ref: `internal/modules/executor/metrics_trace_composite_key_test.go:TestTraceCompositeKey_MultiGroupBy_Histogram`
+
+---
+
+## EX-CK-07: TestTraceCompositeKey_HistogramRoundTrip
+*Added: 2026-04-16*
+
+**Scenario:** Build compositeKey with new scratch path, feed into `traceHistogramSeries`
+key parsing logic, verify attrGroupKey and histBoundary round-trip correctly.
+**Assert:** parsed `attrGroupKey` == `"grpc"`, parsed `histBoundary` == `"1"` (== 1.0 as float)
+for input `bucketIdx=1, attrVals=["grpc"], histBoundary=1.0`.
+Back-ref: `internal/modules/executor/metrics_trace_composite_key_test.go:TestTraceCompositeKey_HistogramRoundTrip`
