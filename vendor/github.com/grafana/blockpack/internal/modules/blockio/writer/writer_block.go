@@ -353,6 +353,10 @@ func (b *blockBuilder) feedDedicatedAttrValue(name string, val shared.AttrValue,
 	if _, ok := b.dedicatedCols[name]; !ok {
 		return
 	}
+	// TYPE LIMITATION: BOOL and FLOAT64 attributes are silently skipped here (no case
+	// matches) — the intrinsic accumulator does not yet support these types. See
+	// DedicatedColumn doc in config.go for user-facing warning. Adding support requires
+	// feedIntrinsicBool/feedIntrinsicFloat64 + matching reader decode paths. Follow-up.
 	switch baseColumnType(val.Type) {
 	case shared.ColumnTypeString:
 		b.feedIntrinsicString(name, shared.ColumnTypeString, val.Str, rowIdx)
