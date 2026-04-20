@@ -386,7 +386,8 @@ func accumulateIntrinsicBuckets(
 	}
 
 	// Try dict-ID fast path first (N ≤ 8 group-by dims, all intrinsic).
-	// NOTE-074: Falls back to string-keyed path for N > 8 or on any error.
+	// NOTE-074: Falls back to string-keyed path for N > 8 only (ok=false, nil error).
+	// Hard errors are returned directly — there is no error-triggered fallback.
 	// SPEC-ETM-13.1/13.2: transparent to callers — buckets output is byte-identical.
 	groupIDMap, dicts, ok, err := buildGroupIDMap(r, agg.GroupBy, keyToBucket)
 	if err != nil {
@@ -620,15 +621,22 @@ func scanIntrinsicColDictIDs(
 	switch col.Format {
 	case modules_shared.IntrinsicFormatDict:
 		for _, entry := range col.DictEntries {
+			// Only add this dict entry if at least one of its refs is in keyToBucket.
+			// This avoids allocating dict slots for values not present in the query window.
 			val := entry.Value
 			if val == "" {
 				val = strconv.FormatInt(entry.Int64Val, 10)
 			}
-			dictIdx := uint32(len(dict)) //nolint:gosec
-			dict = append(dict, val)
+			var dictIdx uint32
+			assigned := false
 			for _, ref := range entry.BlockRefs {
 				pk := packKey(ref.BlockIdx, ref.RowIdx)
 				if _, ok := keyToBucket[pk]; ok {
+					if !assigned {
+						dictIdx = uint32(len(dict)) //nolint:gosec
+						dict = append(dict, val)
+						assigned = true
+					}
 					dst[pk] = dictIdx
 				}
 			}
@@ -645,6 +653,11 @@ func scanIntrinsicColDictIDs(
 				val = strconv.FormatUint(col.Uint64Values[j], 10)
 			} else if j < len(col.BytesValues) {
 				val = string(col.BytesValues[j])
+			}
+			// Use absent-sentinel (index 0, "") for empty values so they map to
+			// the same groupIDKey slot as absent rows, not a separate dict entry.
+			if val == "" {
+				continue
 			}
 			id, exists := seen[val]
 			if !exists {
