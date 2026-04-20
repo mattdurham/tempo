@@ -916,3 +916,49 @@ Invoked when `QueryTraceQL` receives a `*traceqlparser.MetricsQuery` (e.g.
 
 Back-ref: `api.go:streamPipelineQuery`, `api.go:computeSpansetAggregate`,
 `api.go:getSpanFieldNumeric`, `api.go:compareThreshold`
+
+---
+
+## SPEC-ETM-13: Dict-ID Group Map Invariants
+*Added: 2026-04-17*
+
+- **SPEC-ETM-13.1:** When `len(agg.GroupBy) <= maxGroupByDimsFastPath (8)`, the intrinsic
+  fast path uses `buildGroupIDMap` to construct a `map[uint32]groupIDKey` instead of
+  `buildGroupKeyMap`. The dict-ID path is transparent to callers: `buckets` keys and series
+  labels are byte-identical to the string-keyed path.
+- **SPEC-ETM-13.2:** When `len(agg.GroupBy) > maxGroupByDimsFastPath`, the intrinsic fast
+  path falls back to `buildGroupKeyMap` and the string-keyed accumulation functions.
+- **SPEC-ETM-13.3:** Dict index 0 is always the empty-string sentinel in every dimension's
+  dict slice. Pks absent from a group-by column are assigned index 0, producing an empty
+  string label for that dimension — identical to the string-keyed path behavior.
+- **SPEC-ETM-13.4:** Histogram boundary values stored in `histGroupIDKey.boundary` are
+  always powers-of-2 or 0 (computed via `intrinsicHistogramBoundary`). Float64 map key
+  comparison is therefore safe — NaN cannot appear.
+
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:buildGroupIDMap`,
+          `internal/modules/executor/metrics_trace_intrinsic.go:accumulateIntrinsicBuckets`
+
+## SPEC-SCAN-1: StreamScanEqualAny Dict-Mask Fast Path Invariants
+*Added: 2026-04-17*
+
+- **SPEC-SCAN-1.1:** `StreamScanEqualAny` fires the dict-mask fast path when all values in
+  the query have the same kind (all string, all int64, or all float64) AND the column type
+  is String, Int64, Uint64, or Float64. Bool columns always use the generic rowEqual path
+  (NOTE-077: D=2 max dict, overhead exceeds savings). Mixed-kind value sets also fall through.
+- **SPEC-SCAN-1.2:** Results from the fast path are byte-identical to the generic
+  `scanWith`+`rowEqual` fallback for every (col-type, value-kind) combo. The fast path is
+  a pure performance optimization — it never changes which rows match.
+- **SPEC-SCAN-1.3:** String+float64 queries against string columns return 0 matches (fast path
+  returns immediately without scanning). This matches rowEqual's type-strict veto at line 84-89.
+- **SPEC-SCAN-1.4:** String+int64 queries use `strconv.ParseInt(s, 10, 64)` per dict entry,
+  identical to rowCompareString. Dict entries that fail ParseInt produce false (no match).
+- **SPEC-SCAN-1.5:** Uint64+int64 queries cast the query int64 to uint64 (`uint64(t)`)
+  before comparing. Negative int64 inputs produce large uint64 values — this matches
+  rowCompare line 117 exactly.
+- **SPEC-SCAN-1.6:** `col.EnsureDecoded()` must be called before accessing any XxxDict/XxxIdx
+  slice directly. Skipping this returns empty slices for lazily-registered columns (NOTE-077).
+- **SPEC-SCAN-1.7:** nilIntrinsicScan (SPEC-STREAM-10.1) runs before any fast-path dispatch.
+  The col==nil guard is unchanged; fast-path dispatch only runs after col != nil is confirmed.
+
+Back-ref: `internal/modules/executor/column_provider.go:StreamScanEqualAny`,
+          `internal/modules/executor/column_provider.go:dispatchDictFastPath`

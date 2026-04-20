@@ -23,6 +23,274 @@ func cmp3[T cmp.Ordered](a, b T) (int, bool) {
 	return cmp.Compare(a, b), true
 }
 
+// NOTE-077: valueKind classifies the Go type of query values for fast-path dispatch.
+type valueKind int
+
+const (
+	kindUnknown valueKind = iota
+	kindAllString
+	kindAllInt64
+	kindAllFloat64
+	kindAllBool
+	kindMixed
+)
+
+// classifyValueKind inspects values and returns the uniform kind, or kindMixed.
+// O(len(values)) with early exit on first mismatch.
+func classifyValueKind(values []any) valueKind {
+	if len(values) == 0 {
+		return kindUnknown
+	}
+	var kind valueKind
+	switch values[0].(type) {
+	case string:
+		kind = kindAllString
+	case int64:
+		kind = kindAllInt64
+	case float64:
+		kind = kindAllFloat64
+	case bool:
+		kind = kindAllBool
+	default:
+		return kindMixed
+	}
+	for _, v := range values[1:] {
+		switch v.(type) {
+		case string:
+			if kind != kindAllString {
+				return kindMixed
+			}
+		case int64:
+			if kind != kindAllInt64 {
+				return kindMixed
+			}
+		case float64:
+			if kind != kindAllFloat64 {
+				return kindMixed
+			}
+		case bool:
+			if kind != kindAllBool {
+				return kindMixed
+			}
+		default:
+			return kindMixed
+		}
+	}
+	return kind
+}
+
+// scanDictMaskRows scans col.SpanCount rows using the pre-built dictMatch mask.
+// Mirrors the loop body from scanStringDictFloat (NOTE-026) exactly.
+func scanDictMaskRows(col *modules_reader.Column, idx []uint32, dictMatch []bool, cb vm.RowCallback) int {
+	count := 0
+	for i := range col.SpanCount {
+		if !col.IsPresent(i) {
+			continue
+		}
+		if i >= len(idx) {
+			continue
+		}
+		di := int(idx[i])
+		if di < len(dictMatch) && dictMatch[di] {
+			if !cb(i) {
+				return count
+			}
+			count++
+		}
+	}
+	return count
+}
+
+// NOTE-077: dispatchDictFastPath dispatches to the per-type dict-mask helper.
+// Returns (n, true, err) when the fast path ran; (0, false, nil) to fall through to generic.
+func (p *blockColumnProvider) dispatchDictFastPath(
+	col *modules_reader.Column, values []any, vk valueKind, cb vm.RowCallback,
+) (int, bool, error) {
+	switch col.Type {
+	case modules_shared.ColumnTypeString, modules_shared.ColumnTypeRangeString:
+		n, err := p.scanStringDictEqualAny(col, values, vk, cb)
+		return n, true, err
+	case modules_shared.ColumnTypeInt64, modules_shared.ColumnTypeRangeInt64, modules_shared.ColumnTypeRangeDuration:
+		n, err := p.scanInt64DictEqualAny(col, values, vk, cb)
+		return n, true, err
+	case modules_shared.ColumnTypeUint64, modules_shared.ColumnTypeRangeUint64:
+		n, err := p.scanUint64DictEqualAny(col, values, vk, cb)
+		return n, true, err
+	case modules_shared.ColumnTypeFloat64, modules_shared.ColumnTypeRangeFloat64:
+		n, err := p.scanFloat64DictEqualAny(col, values, vk, cb)
+		return n, true, err
+	}
+	// NOTE-077: Bool columns are excluded from the fast path. D=2 max dict makes
+	// EnsureDecoded + make([]bool,2) + mask-build overhead exceed savings vs the
+	// direct rowCompareBool path in the generic loop. All other types fall through
+	// to generic (BytesInline, UUID, Bool).
+	return 0, false, nil
+}
+
+// NOTE-077: scanStringDictEqualAny handles string-column dict-mask fast path for
+// all-string, all-int64, and all-float64 value kinds.
+func (p *blockColumnProvider) scanStringDictEqualAny(
+	col *modules_reader.Column, values []any, vk valueKind, cb vm.RowCallback,
+) (int, error) {
+	col.EnsureDecoded()
+	switch vk {
+	case kindAllString:
+		// Map wins for string equality (hash vs linear).
+		wantSet := make(map[string]struct{}, len(values))
+		for _, v := range values {
+			wantSet[v.(string)] = struct{}{} //nolint:errcheck
+		}
+		dictMatch := make([]bool, len(col.StringDict))
+		for i, s := range col.StringDict {
+			if _, ok := wantSet[s]; ok {
+				dictMatch[i] = true
+			}
+		}
+		return scanDictMaskRows(col, col.StringIdx, dictMatch, cb), nil
+	case kindAllInt64:
+		// ParseInt per dict entry; linear scan targets.
+		targets := make([]int64, len(values))
+		for i, v := range values {
+			targets[i] = v.(int64) //nolint:errcheck
+		}
+		dictMatch := make([]bool, len(col.StringDict))
+		for i, s := range col.StringDict {
+			if parsed, err := strconv.ParseInt(s, 10, 64); err == nil {
+				for _, t := range targets {
+					if parsed == t {
+						dictMatch[i] = true
+						break
+					}
+				}
+			}
+		}
+		return scanDictMaskRows(col, col.StringIdx, dictMatch, cb), nil
+	case kindAllFloat64:
+		// rowEqual veto (line 84-89 of rowEqual): float64 vs string column → match nothing.
+		return 0, nil
+	}
+	return 0, nil
+}
+
+// NOTE-077: scanInt64DictEqualAny handles Int64/RangeInt64/RangeDuration columns.
+func (p *blockColumnProvider) scanInt64DictEqualAny(
+	col *modules_reader.Column, values []any, vk valueKind, cb vm.RowCallback,
+) (int, error) {
+	col.EnsureDecoded()
+	dictMatch := make([]bool, len(col.Int64Dict))
+	switch vk {
+	case kindAllInt64:
+		targets := make([]int64, len(values))
+		for i, v := range values {
+			targets[i] = v.(int64) //nolint:errcheck
+		}
+		for i, d := range col.Int64Dict {
+			for _, t := range targets {
+				if d == t {
+					dictMatch[i] = true
+					break
+				}
+			}
+		}
+	case kindAllFloat64:
+		targets := make([]float64, len(values))
+		for i, v := range values {
+			targets[i] = v.(float64) //nolint:errcheck
+		}
+		for i, d := range col.Int64Dict {
+			fd := float64(d)
+			for _, t := range targets {
+				if fd == t {
+					dictMatch[i] = true
+					break
+				}
+			}
+		}
+	default:
+		return 0, nil
+	}
+	return scanDictMaskRows(col, col.Int64Idx, dictMatch, cb), nil
+}
+
+// NOTE-077: scanUint64DictEqualAny handles Uint64/RangeUint64 columns.
+func (p *blockColumnProvider) scanUint64DictEqualAny(
+	col *modules_reader.Column, values []any, vk valueKind, cb vm.RowCallback,
+) (int, error) {
+	col.EnsureDecoded()
+	dictMatch := make([]bool, len(col.Uint64Dict))
+	switch vk {
+	case kindAllInt64:
+		targets := make([]uint64, len(values))
+		for i, v := range values {
+			targets[i] = uint64(v.(int64)) //nolint:errcheck,gosec
+		}
+		for i, d := range col.Uint64Dict {
+			for _, t := range targets {
+				if d == t {
+					dictMatch[i] = true
+					break
+				}
+			}
+		}
+	case kindAllFloat64:
+		targets := make([]float64, len(values))
+		for i, v := range values {
+			targets[i] = v.(float64) //nolint:errcheck
+		}
+		for i, d := range col.Uint64Dict {
+			fd := float64(d)
+			for _, t := range targets {
+				if fd == t {
+					dictMatch[i] = true
+					break
+				}
+			}
+		}
+	default:
+		return 0, nil
+	}
+	return scanDictMaskRows(col, col.Uint64Idx, dictMatch, cb), nil
+}
+
+// NOTE-077: scanFloat64DictEqualAny handles Float64/RangeFloat64 columns.
+func (p *blockColumnProvider) scanFloat64DictEqualAny(
+	col *modules_reader.Column, values []any, vk valueKind, cb vm.RowCallback,
+) (int, error) {
+	col.EnsureDecoded()
+	dictMatch := make([]bool, len(col.Float64Dict))
+	switch vk {
+	case kindAllFloat64:
+		targets := make([]float64, len(values))
+		for i, v := range values {
+			targets[i] = v.(float64) //nolint:errcheck
+		}
+		for i, d := range col.Float64Dict {
+			for _, t := range targets {
+				if d == t {
+					dictMatch[i] = true
+					break
+				}
+			}
+		}
+	case kindAllInt64:
+		targets := make([]float64, len(values))
+		for i, v := range values {
+			targets[i] = float64(v.(int64)) //nolint:errcheck
+		}
+		for i, d := range col.Float64Dict {
+			for _, t := range targets {
+				if d == t {
+					dictMatch[i] = true
+					break
+				}
+			}
+		}
+	default:
+		return 0, nil
+	}
+	return scanDictMaskRows(col, col.Float64Idx, dictMatch, cb), nil
+}
+
 // blockColumnProvider implements vm.ColumnDataProvider for a modules Block.
 type blockColumnProvider struct {
 	block *modules_reader.Block
@@ -292,46 +560,13 @@ func (p *blockColumnProvider) StreamScanEqualAny(column string, values []any, cb
 		return p.StreamScanEqual(column, values[0], cb)
 	}
 
-	// Dict fast-path for string columns: build a match mask over the dictionary once,
-	// then scan rows via StringIdx with a single bool lookup per row.
-	if col.Type == modules_shared.ColumnTypeString || col.Type == modules_shared.ColumnTypeRangeString {
-		col.EnsureDecoded()
-		// Build a set of wanted strings.
-		wantSet := make(map[string]struct{}, len(values))
-		for _, v := range values {
-			if s, ok := v.(string); ok {
-				wantSet[s] = struct{}{}
-			}
+	// NOTE-077: per-type dict-mask fast path for all dict-encoded column types.
+	// classifyValueKind must return a uniform kind to dispatch; mixed kinds fall through.
+	vk := classifyValueKind(values)
+	if vk != kindMixed && vk != kindUnknown {
+		if n, handled, err := p.dispatchDictFastPath(col, values, vk, cb); handled {
+			return n, err
 		}
-		if len(wantSet) == 0 {
-			// All values are non-string; no string column can match.
-			return 0, nil
-		}
-		// Build a per-dict-entry match mask.
-		dictMatch := make([]bool, len(col.StringDict))
-		for i, s := range col.StringDict {
-			if _, ok := wantSet[s]; ok {
-				dictMatch[i] = true
-			}
-		}
-		spanCount := col.SpanCount
-		count := 0
-		for i := range spanCount {
-			if !col.IsPresent(i) {
-				continue
-			}
-			if i >= len(col.StringIdx) {
-				continue
-			}
-			di := int(col.StringIdx[i])
-			if di < len(dictMatch) && dictMatch[di] {
-				if !cb(i) {
-					return count, nil
-				}
-				count++
-			}
-		}
-		return count, nil
 	}
 
 	// Generic fallback: one pass, checking each value per row.
