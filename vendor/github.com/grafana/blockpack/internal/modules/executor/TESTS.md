@@ -2275,9 +2275,155 @@ Back-ref: `internal/modules/executor/and_or_scope_test.go:TestANDMultiValueOR_Pa
 
 ---
 
-## EX-INT-21: TestANDMultiValueOR — failing shape with Limit=100 (fast path, NOTE-076)
+## EX-INT-21: TestANDMultiValueOR — failing shape with Limit=100 (NOTE-076)
 *Added: 2026-04-17*
 
 **Scenario:** `{resource.service.name="svc-a" && (span.http.method="GET" || span.http.method="POST")}` with `Limit=100`.
-**Assertions:** `len(results) == 2`. The fast path also calls `filterRowSetByIntrinsicNodes`; this confirms the bug affected both Limit=0 and Limit>0 paths and that the fix resolves both.
+**Assertions:** `len(results) == 2`. Confirms the NOTE-076 fix also holds for the `Limit>0` path, without implying that the mixed intrinsic fast path itself uses `filterRowSetByIntrinsicNodes`. For a single-block test file, the selectivity guard (`uniqueBlocks*2 > r.BlockCount()`) forces a fallback to the full block-scan path, which is where `filterRowSetByIntrinsicNodes` (and thus the bug) actually triggers.
 Back-ref: `internal/modules/executor/and_or_scope_test.go:TestANDMultiValueOR_IntrinsicAND_SpanAttrOR`
+## EX-ETM-GID-01: TestBuildGroupIDMap_SingleGroupBy_Dict
+*Added: 2026-04-17*
+
+**Scenario:** `buildGroupIDMap` returns correct per-service counts when the group-by column is dict-encoded (repeated values).
+
+**Setup:** 3 spans for svc-a, 2 for svc-b, 1 for svc-c written to a single block; equal service names trigger dict encoding. Query: `{ } | count_over_time() by (resource.service.name)`.
+
+**Assertions:** counts["svc-a"]==3, counts["svc-b"]==2, counts["svc-c"]==1; `result.BlocksScanned==0` (intrinsic fast path, no full-block reads).
+
+Back-ref: `internal/modules/executor/group_id_map_test.go:TestBuildGroupIDMap_SingleGroupBy_Dict`
+
+---
+
+## EX-ETM-GID-02: TestBuildGroupIDMap_SingleGroupBy_Flat
+*Added: 2026-04-17*
+
+**Scenario:** `buildGroupIDMap` handles flat-format intrinsic columns (distinct values, no dict encoding).
+
+**Setup:** 4 spans with distinct service names (alpha, beta, gamma, delta) → flat encoding. Query: `{ } | count_over_time() by (resource.service.name)`.
+
+**Assertions:** each service has count==1; `result.BlocksScanned==0`.
+
+Back-ref: `internal/modules/executor/group_id_map_test.go:TestBuildGroupIDMap_SingleGroupBy_Flat`
+
+---
+
+## EX-ETM-GID-03: TestBuildGroupIDMap_SingleGroupBy_AbsentPK
+*Added: 2026-04-17*
+
+**Scenario:** Spans absent from the group-by column are assigned the empty-string sentinel (dict index 0).
+
+**Setup:** 2 spans with service.name="svc-present", 2 spans with service.name="". Query: `{ } | count_over_time() by (resource.service.name)`.
+
+**Assertions:** total count across all series == 4 (both present and absent-service-name spans counted); `result.BlocksScanned==0`. Verifies that dict index 0 (sentinel) is always prepended and maps to "".
+
+Back-ref: `internal/modules/executor/group_id_map_test.go:TestBuildGroupIDMap_SingleGroupBy_AbsentPK`
+
+---
+
+## EX-ETM-GID-04: TestBuildGroupIDMap_SingleGroupBy_2TimeBuckets
+*Added: 2026-04-17*
+
+**Scenario:** Multi-time-bucket query (2 steps) with a single group-by dimension produces correct per-service per-bucket counts.
+
+**Setup:** 2 spans svc-a + 3 spans svc-b in bucket 0; 1 span svc-a + 2 spans svc-b in bucket 1. Step=30s. Query: `{ } | count_over_time() by (resource.service.name)`.
+
+**Assertions:** buckets[{svc-a,0}]==2, buckets[{svc-b,0}]==3, buckets[{svc-a,1}]==1, buckets[{svc-b,1}]==2; `result.BlocksScanned==0`.
+
+Back-ref: `internal/modules/executor/group_id_map_test.go:TestBuildGroupIDMap_SingleGroupBy_2TimeBuckets`
+
+---
+
+## EX-ETM-GID-05: TestBuildGroupIDMap_Fallback_MoreThan8Dims
+*Added: 2026-04-17*
+
+**Scenario:** `buildGroupIDMap` returns `ok == false` when called with more than `maxGroupByDimsFastPath` (8) group-by dimensions, signalling the caller to fall back to the string-keyed path.
+
+**Setup:** Call `buildGroupIDMap` directly with a `groupBy` slice of length 9 (one more than the `maxGroupByDimsFastPath = 8` constant defined at `metrics_trace_intrinsic.go:600`). A real reader and `keyToBucket` map are provided.
+
+**Assertions:** `ok == false`; returned `idMap` and `dicts` are both nil; no error; no panic. Verifies that the fallback threshold is enforced at the function boundary, not silently ignored.
+
+Back-ref: `internal/modules/executor/group_id_map_test.go:TestBuildGroupIDMap_Fallback_MoreThan8Dims`
+
+---
+
+## EX-ETM-GID-06: TestStreamCountRateGroupByID_MatchesStringPath
+*Added: 2026-04-17*
+
+**Scenario:** `streamCountRateGroupByID` produces byte-identical output to `streamCountRateGroupBy` for the same input data.
+
+**Setup:** 6 spans cycling 3 service names (svc-x, svc-y, svc-z, 2 each). Run the same `count_over_time() by (resource.service.name)` query against two independent readers over the same data.
+
+**Assertions:** `counts1 == counts2`; each service has count==2 in both results. Verifies the byte-identical output guarantee across both paths.
+
+Back-ref: `internal/modules/executor/group_id_map_test.go:TestStreamCountRateGroupByID_MatchesStringPath`
+
+---
+
+## EX-ETM-GID-07: TestStreamHistogramGroupByID_MatchesStringPath
+*Added: 2026-04-17*
+
+**Scenario:** `streamHistogramGroupByID` produces byte-identical output to `streamHistogramGroupBy` for the HISTOGRAM function.
+
+**Setup:** 6 spans cycling 3 service names and 2 durations (10ms, 100ms). Calls `streamHistogramGroupBy` and `streamHistogramGroupByID` directly with `span:duration` over two independent readers over the same data.
+
+**Assertions:** All bucket keys from the string-path result (`strBuckets`) exist in the ID-path result (`idBuckets`) with byte-identical count values; total count from both paths == 6. Verifies no spans are lost, duplicated, or key-format-diverged in the histogram path.
+
+Back-ref: `internal/modules/executor/group_id_map_test.go:TestStreamHistogramGroupByID_MatchesStringPath`
+
+---
+
+## EX-ETM-GID-08: TestBuildGroupIDMap_EmptyDict
+*Added: 2026-04-17*
+
+**Scenario:** Group-by column present in the intrinsic TOC but all spans have empty service.name — column has only the sentinel entry (dict index 0 = ""). No panic; empty-string bucket emitted for all spans.
+
+**Setup:** 3 spans all with service.name="". Query: `{ } | count_over_time() by (resource.service.name)`.
+
+**Assertions:** total count == 3; no panic; no error. Verifies that a dict with only the sentinel entry does not cause division-by-zero, out-of-bounds, or missing output.
+
+Back-ref: `internal/modules/executor/group_id_map_test.go:TestBuildGroupIDMap_EmptyDict`
+
+---
+
+## EX-ETM-GID-09: TestStreamAggGroupByID_MatchesStringPath
+*Added: 2026-04-17*
+
+**Scenario:** `streamAggGroupByID` produces byte-identical output to the string-keyed aggregate path for the SUM function with group-by.
+
+**Setup:** 6 spans cycling 3 service names (svc-d, svc-e, svc-f) and 3 durations (10ms, 20ms, 30ms). Calls the string-keyed inline loop (`buildGroupKeyMap` + `buildAggValsMap` + per-span loop) and `streamAggGroupByID` directly with `span:duration` SUM over two independent readers.
+
+**Assertions:** All bucket keys from the string-path result (`strBuckets`) exist in the ID-path result (`idBuckets`) with byte-identical count and sum values; total bucket count matches. Verifies that the two-stage accumulation in `streamAggGroupByID` produces the same output as the direct per-span string-keyed accumulation.
+
+Back-ref: `internal/modules/executor/group_id_map_test.go:TestStreamAggGroupByID_MatchesStringPath`
+
+## EX-CP-10: TestStreamScanEqualAny_PerTypeParity
+*Added: 2026-04-17*
+
+Table-driven parity test covering all 11 (col-type, value-kind) combos in SPEC-SCAN-1.
+For each combo: asserts fast-path result is byte-identical to generic rowEqual result,
+and asserts expected match count >= 1 (no trivially-empty-passing tests).
+Combos covered: String+string, String+int64, String+float64 (match-nothing), Int64+int64,
+Int64+float64, Uint64+int64, Uint64+float64, Float64+float64, Float64+int64, Bool+bool,
+Mixed kinds fallthrough.
+Back-ref: `internal/modules/executor/scan_equal_any_test.go:TestStreamScanEqualAny_PerTypeParity`
+
+## EX-CP-11: TestStreamScanEqualAny_StringInt64_NoParseMatch
+*Added: 2026-04-17*
+
+String dict entries that fail strconv.ParseInt ("N/A", "unknown") produce 0 matches and
+no panic. Fast path result must equal generic result (both 0 for these values).
+Back-ref: `internal/modules/executor/scan_equal_any_test.go:TestStreamScanEqualAny_StringInt64_NoParseMatch`
+
+## EX-CP-12: TestStreamScanEqualAny_MixedKindFallthrough
+*Added: 2026-04-17*
+
+Mixed []any{int64, string} values fall through to generic and return correct results.
+Ensures no silent-zero (PR #234 bug class).
+Back-ref: `internal/modules/executor/scan_equal_any_test.go:TestStreamScanEqualAny_MixedKindFallthrough`
+
+## EX-CP-13: TestStreamScanEqualAny_Uint64_NegativeInt64
+*Added: 2026-04-17*
+
+Negative int64 query against uint64 column: fast-path result equals generic result.
+Validates the uint64(int64) cast semantic matches rowCompare line 117.
+Back-ref: `internal/modules/executor/scan_equal_any_test.go:TestStreamScanEqualAny_Uint64_NegativeInt64`

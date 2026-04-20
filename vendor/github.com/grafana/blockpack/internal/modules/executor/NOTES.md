@@ -2338,3 +2338,107 @@ fast path (`Limit>0`) call `filterRowSetByIntrinsicNodes` and were both affected
 
 **Back-ref:** `internal/modules/executor/predicates.go:rowSatisfiesIntrinsicNodesOR`
 **Test:** `TestANDMultiValueOR_IntrinsicAND_SpanAttrOR` (EX-INT-14 through EX-INT-17, EX-INT-21)
+
+## NOTE-074: Dict-ID-Keyed Group Map — Intrinsic Fast Path (2026-04-17)
+
+**Decision:** Replace `map[uint32]string groupKeyMap` + `map[string][]int64 groupCounts`
+in the intrinsic fast path with `map[uint32]groupIDKey` + `map[groupIDKey][]int64`, where
+`groupIDKey = [8]uint32`.
+
+**Why:** r81 Pyroscope showed `ctrlGroupMatchH2` at 24.67% (string hash cost in
+`groupCounts[gk]` lookups) and `buildGroupKeyMap` at 19.24% (string value allocations
+in the group key map). For M8 warm (150M spans, primarily intrinsic), this is ~1.68s and
+~1.31s respectively. Switching to uint32 array keys reduces hash cost by ~50-60% and
+eliminates the O(blocks × unique_groups) string allocations.
+
+**Key decisions:**
+1. `[8]uint32` cap (32 bytes, one cache line). Queries with >8 group-by dims fall back to
+   string-keyed path — pathological in production (zero real queries use >4).
+2. dict index 0 = absent/empty sentinel in every dimension. Column dicts are prefixed with
+   "" so absent pks naturally map to index 0 without special-casing.
+3. String resolution (ID → label string) is deferred to series-emit time, which is
+   O(unique groups), not O(spans). The final series label values are byte-identical to
+   the string-keyed path output.
+4. `histGroupIDKey struct { dims [8]uint32; boundary float64; bucketIdx int64 }` is the
+   histogram key — avoids both string hash for group dims AND `strconv.FormatFloat` per
+   span for the boundary value. Boundary is always a power-of-2 or 0 (never NaN), making
+   float64 map key safe.
+5. Flat intrinsic columns in group-by: build on-the-fly string→uint32 dict (sequential IDs
+   from first-seen string values). This path is cold in production (nobody groups by
+   `span:start`).
+6. Block-scan path (`traceAccumulateRow`) is unchanged — it is not the M8 bottleneck.
+
+**PR:** Layer 3 dict-ID group map
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:buildGroupIDMap`,
+          `internal/modules/executor/metrics_trace_intrinsic.go:streamCountRateGroupByID`,
+          `internal/modules/executor/metrics_trace_intrinsic.go:streamHistogramGroupByID`,
+          `internal/modules/executor/metrics_trace_intrinsic.go:streamAggGroupByID`
+
+## NOTE-077: Per-Type Dict-Mask Fast Path for StreamScanEqualAny
+*Added: 2026-04-17*
+
+**Decision:** Extend the `StreamScanEqualAny` dict-mask fast path to dict-encoded column
+types Int64, Uint64, Float64, and the String+int64 coercion shape. Bool is excluded (see below).
+
+**Approach (Style A):** Per-type concrete helper functions dispatched via a type-switch in
+`dispatchDictFastPath`. Each helper calls `col.EnsureDecoded()`, pre-builds a `[]bool dictMatch`
+over the dict entries in O(D×nValues), then scans rows via `scanDictMaskRows` in O(N).
+No func-pointer dispatch in hot loops. Matches existing `scanStringDictFloat` pattern (NOTE-026).
+
+**Coercion invariants (byte-identical to rowEqual/rowCompare):**
+- String+float64: rowEqual veto (line 84-89) → fast path returns 0 immediately.
+- String+int64: uses `strconv.ParseInt(s, 10, 64)` identical to rowCompareString line 162-168.
+- Int64+float64: `float64(dictEntry)` promotion, identical to rowCompare line 109.
+- Uint64+int64: `uint64(queryInt64)` cast (//nolint:gosec), identical to rowCompare line 117.
+- Float64+int64: `float64(queryInt64)` promotion, identical to rowCompare line 142.
+- Mixed value kinds: `classifyValueKind` returns kindMixed → falls through to generic; no
+  silent-zero (the PR #234 bug class is avoided by detecting uniformity before dispatching).
+
+**Bool exclusion:** Bool columns are excluded from the fast path. D=2 max dict (false/true)
+makes EnsureDecoded + make([]bool,2) + mask-build overhead exceed savings vs the direct
+`rowCompareBool` path in the generic loop. Measured: 23µs (fast) vs 21µs (generic) — 1.08x
+SLOWER. Bool always falls through to generic. `kindAllBool` dispatches to no fast path.
+
+**EnsureDecoded requirement:** All helpers call `col.EnsureDecoded()` before accessing
+XxxDict/XxxIdx directly. Direct slice access bypasses per-row lazy decode; EnsureDecoded
+calls decodeNow() + expandDenseIdx() (same reasoning as scanStringDictFloat, NOTE-026).
+
+**Linear scan over map for numeric types:** For Int64/Uint64/Float64, linear scan over
+targets (1 ns primitive compare) beats map hash+probe (~30 ns) for nValues ≤ 30, which
+covers all practical query shapes. Map is kept for String+string (existing path).
+
+**Back-ref:** `internal/modules/executor/column_provider.go:dispatchDictFastPath`,
+             `internal/modules/executor/column_provider.go:scanStringDictEqualAny`,
+             `internal/modules/executor/column_provider.go:scanInt64DictEqualAny`,
+             `internal/modules/executor/column_provider.go:scanUint64DictEqualAny`,
+             `internal/modules/executor/column_provider.go:scanFloat64DictEqualAny`
+
+---
+
+## NOTE-075: StreamScanEqualAny — Mixed-Type Coercion Guard (2026-04-17)
+*Added: 2026-04-17*
+
+**Bug:** The original `StreamScanEqualAny` dict fast path for string columns built a
+`map[string]struct{} wantSet` by iterating all values and filtering to those that type-asserted
+to `string`. Non-string values (e.g. `int64`, `float64`) were silently dropped from `wantSet`.
+When the query contained any non-string value — such as `span.http.response.status_code` in `{200, 201}`
+where the column is string-encoded but the query values are `int64` — the fast path returned 0 matches
+without error, while the generic `rowEqual` path (correctly) found matches via `rowCompareString →
+strconv.ParseInt`. Queries that used a mix of int64/float64 values against string-typed columns
+always silently returned zero results.
+
+**Fix:** Classify the value slice with `allStrings bool` before entering the fast path. If any value
+is not a `string`, set `allStrings = false` and skip the dict fast path entirely, falling through to
+the generic `scanWith` + `rowEqual` loop. This makes the path selection conservative: the fast path
+only fires when every value is a string, guaranteeing the set-membership comparison is type-safe.
+The single-value `ScanEqual` path already handled int→string coercion correctly via `rowCompare`;
+the multi-value path now does too.
+
+**Why not coerce in the fast path:** Coercing int64 values into the string `wantSet` via ParseInt
+would require encoding the parsed integer back as a string for set membership. That is fragile
+(leading zeros, base variants, overflow). The correct path for coerced equality is per-dict-entry
+comparison via `strconv.ParseInt` — which is what NOTE-077 later implements as a first-class fast
+path for the String+int64 shape. NOTE-075 was the conservative guard; NOTE-077 is the full solution.
+
+**Back-ref:** `internal/modules/executor/column_provider.go:StreamScanEqualAny` (allStrings guard)
+**Commit:** 029d041 (coercion fix, this branch)

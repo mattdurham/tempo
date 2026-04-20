@@ -246,3 +246,109 @@ pressure (Pyroscope profile 2026-04-16).
 
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic_test.go:BenchmarkTraceMetrics_FilteredIntrinsic_AllocCount`
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:mergeJoinFilteredRefsWithVals` (NOTE-070)
+
+---
+
+## BENCH-EX-10: BenchmarkIntrinsicCountRateGroupBy_AllocCount
+*Added: 2026-04-17*
+
+Measures per-call allocations for `{ } | rate() by (resource.service.name)` on the
+dict-ID count/rate group-by fast path (`streamCountRateGroupByID`). Exercises
+`buildGroupIDMap` + `streamCountRateGroupByID` over 300 spans in a single block with
+3 cycling service names (3 distinct groups, ~100 spans per group).
+
+**Setup (outside timed loop):**
+- Write 300 spans with `MaxBlockSpans=301` (single block), cycling service.name across
+  `["svc-a", "svc-b", "svc-c"]`.
+- Compile `{ } | rate() by (resource.service.name)` with 1s buckets.
+- Open reader with in-memory provider.
+- Run with `b.ReportAllocs()`.
+
+**Run command:**
+```
+go test -bench='BenchmarkIntrinsicCountRateGroupBy_AllocCount' \
+    -benchmem -count=5 ./internal/modules/executor/
+```
+
+**Baseline (post-dict-ID fast path):** ~46 allocs/op (~34918 B/op) — regression threshold.
+End-to-end allocs include fixed per-call overhead (reader block parsing, result construction,
+context). Zero per-span string allocations in the `streamCountRateGroupByID` hot loop.
+
+**History:**
+- Before dict-ID fast path: string-keyed path hashed ~300 group strings per call.
+- After (this PR): `map[groupIDKey]` with `[8]uint32` key; string resolution deferred to
+  series-emit (O(unique groups), not O(spans)).
+
+Back-ref: `internal/modules/executor/intrinsic_group_id_bench_test.go:BenchmarkIntrinsicCountRateGroupBy_AllocCount`
+
+---
+
+## BENCH-EX-11: BenchmarkIntrinsicHistogramGroupBy_AllocCount
+*Added: 2026-04-17*
+
+Measures per-call allocations for `{ } | histogram_over_time(span:duration) by (resource.service.name)`
+on the dict-ID histogram group-by fast path (`streamHistogramGroupByID`). Exercises
+`buildGroupIDMap` + `streamHistogramGroupByID` over 300 spans in a single block with
+3 cycling service names. All spans have duration=500000ns mapping to the same histogram
+bucket — 3 unique composite keys (1 per service); 3 map-misses + ~297 map-hits per call.
+
+**Setup (outside timed loop):**
+- Write 300 spans with `MaxBlockSpans=301` (single block), cycling service.name across
+  `["svc-a", "svc-b", "svc-c"]`, all with span duration=500000ns.
+- Compile `{ } | histogram_over_time(span:duration) by (resource.service.name)` with 1s buckets.
+- Open reader with in-memory provider.
+- Run with `b.ReportAllocs()`.
+
+**Run command:**
+```
+go test -bench='BenchmarkIntrinsicHistogramGroupBy_AllocCount' \
+    -benchmem -count=5 ./internal/modules/executor/
+```
+
+**Baseline (post-dict-ID fast path):** ~55 allocs/op (~40394 B/op) — regression threshold.
+End-to-end allocs include fixed per-call overhead. Zero `strconv.FormatFloat` calls in the
+`streamHistogramGroupByID` hot loop — boundary stored as `float64` in `histGroupIDKey`.
+
+**History:**
+- Before dict-ID fast path: `FormatFloat` + string concat per span for boundary key;
+  string-keyed group map lookup.
+- After (this PR): `map[histGroupIDKey]` with `struct { dims [8]uint32; boundary float64;
+  bucketIdx int64 }` key; float64 comparison safe because boundary is always power-of-2 or
+  0 (SPEC-ETM-13.4).
+
+Back-ref: `internal/modules/executor/intrinsic_group_id_bench_test.go:BenchmarkIntrinsicHistogramGroupBy_AllocCount`
+
+## BENCH-EX-12: BenchmarkStreamScanEqualAny_ByType
+*Added: 2026-04-17*
+
+Per-type sub-benchmarks comparing fast-path vs forced-generic performance for each
+dict-encoded column type. Setup: 10K spans, D=8 dict entries cycling, nValues=5 query values.
+
+### Baseline Results (2026-04-17, 13th Gen Intel Core i5-13500)
+
+| Sub-benchmark | fast (ns/op) | generic (ns/op) | Speedup |
+|---|---|---|---|
+| String_string/fast | 6,963 | 99,040 | **14.2x** |
+| String_int64/fast | 6,879 | 132,701 | **19.3x** |
+| Int64_int64/fast | 6,453 | 77,688 | **12.0x** |
+| Int64_float64/fast | 6,352 | 85,410 | **13.4x** |
+| Float64_float64/fast | 6,296 | 87,477 | **13.9x** |
+| Float64_int64/fast | 6,274 | 87,356 | **13.9x** |
+| Bool_bool/fast | 22,794 | 21,230 | **~1x** (see note) |
+
+**Bool note:** Bool dict has D=2 entries max. The fast path builds a dictMatch mask of size 2
+and then scans N rows via BoolIdx — the overhead of EnsureDecoded and slice allocation
+nearly cancels the benefit of skipping per-row BoolValue() calls. For Bool, the fast path
+is a correctness extension (handles multiple bool values without O(N×nValues) blowup) rather
+than a performance win. The ≥5× gate applies to numeric types; Bool is exempt.
+
+Required performance gate: ≥5× speedup on each numeric type (String, Int64, Float64) vs generic baseline.
+All numeric types exceed 12× — gate passed.
+
+Run command:
+```
+go test -bench='BenchmarkStreamScanEqualAny_ByType' -benchmem -count=5 \
+    ./internal/modules/executor/
+```
+
+Back-ref: `internal/modules/executor/scan_equal_any_bench_test.go:BenchmarkStreamScanEqualAny_ByType`
