@@ -1154,20 +1154,28 @@ func rowSatisfiesIntrinsicNodes(nodes []vm.RangeNode, fields map[string]any) boo
 	return true
 }
 
-// rowSatisfiesIntrinsicNodesOR returns true when any child in the OR group
-// satisfies the intrinsic constraints for the given row.
+// NOTE-076: rowSatisfiesIntrinsicNodesOR returns true when any child in the OR group
+// satisfies the intrinsic constraints for the given row. When all children are
+// non-intrinsic leaves, returns true (pass-through) — the VM's ColumnPredicate has
+// already validated those predicates; this function only enforces intrinsic constraints.
 func rowSatisfiesIntrinsicNodesOR(nodes []vm.RangeNode, fields map[string]any) bool {
+	hadConstrainedChild := false
 	for _, n := range nodes {
 		if n.Column != "" {
 			_, isIntrinsic := traceIntrinsicColumns[n.Column]
 			if !isIntrinsic {
 				continue // non-intrinsic leaf: evaluated by ColumnPredicate; post-filter skips
 			}
+			hadConstrainedChild = true
 			if intrinsicLeafMatch(n, fields) {
 				return true
 			}
 			continue
 		}
+		// Composite child (AND or OR). Mark constrained so that if no child matches,
+		// we return false rather than pass-through — the composite may contain
+		// intrinsic constraints that failed.
+		hadConstrainedChild = true
 		if n.IsOR {
 			if rowSatisfiesIntrinsicNodesOR(n.Children, fields) {
 				return true
@@ -1178,7 +1186,7 @@ func rowSatisfiesIntrinsicNodesOR(nodes []vm.RangeNode, fields map[string]any) b
 			}
 		}
 	}
-	return false
+	return !hadConstrainedChild
 }
 
 // intrinsicLeafMatch evaluates a single leaf RangeNode against the per-row field map.

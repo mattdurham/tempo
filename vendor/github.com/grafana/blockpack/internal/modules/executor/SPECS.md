@@ -418,6 +418,14 @@ fall through to the full block-scan path instead.
 Back-ref: `internal/modules/executor/stream.go:filterRowSetByIntrinsicNodes`,
           `internal/modules/executor/stream.go:lookupIntrinsicFields`
 
+Contract addendum (NOTE-076): when `filterRowSetByIntrinsicNodes` evaluates an OR composite
+node whose ALL children are non-intrinsic leaves, `rowSatisfiesIntrinsicNodesOR` returns
+`true` (pass-through), not `false`. Non-intrinsic children within an OR have already been
+validated by `ColumnPredicate`; the post-filter has no intrinsic constraint to enforce for
+them. Composite children (AND or OR sub-groups) within an OR are treated as constrained —
+their recursive evaluation result is authoritative.
+Back-ref: `internal/modules/executor/predicates.go:rowSatisfiesIntrinsicNodesOR`
+
 ---
 
 ## SPEC-STREAM-11: Unified Bounded Sliding-Window Block Pipeline
@@ -908,24 +916,3 @@ Invoked when `QueryTraceQL` receives a `*traceqlparser.MetricsQuery` (e.g.
 
 Back-ref: `api.go:streamPipelineQuery`, `api.go:computeSpansetAggregate`,
 `api.go:getSpanFieldNumeric`, `api.go:compareThreshold`
-
----
-
-## SPEC-ETM-13: Dict-ID Group Map Invariants
-*Added: 2026-04-17*
-
-- **SPEC-ETM-13.1:** When `len(agg.GroupBy) <= maxGroupByDimsFastPath (8)`, the intrinsic
-  fast path uses `buildGroupIDMap` to construct a `map[uint32]groupIDKey` instead of
-  `buildGroupKeyMap`. The dict-ID path is transparent to callers: `buckets` keys and series
-  labels are byte-identical to the string-keyed path.
-- **SPEC-ETM-13.2:** When `len(agg.GroupBy) > maxGroupByDimsFastPath`, the intrinsic fast
-  path falls back to `buildGroupKeyMap` and the string-keyed accumulation functions.
-- **SPEC-ETM-13.3:** Dict index 0 is always the empty-string sentinel in every dimension's
-  dict slice. Pks absent from a group-by column are assigned index 0, producing an empty
-  string label for that dimension — identical to the string-keyed path behavior.
-- **SPEC-ETM-13.4:** Histogram boundary values stored in `histGroupIDKey.boundary` are
-  always powers-of-2 or 0 (computed via `intrinsicHistogramBoundary`). Float64 map key
-  comparison is therefore safe — NaN cannot appear.
-
-Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:buildGroupIDMap`,
-          `internal/modules/executor/metrics_trace_intrinsic.go:accumulateIntrinsicBuckets`

@@ -294,28 +294,18 @@ func (p *blockColumnProvider) StreamScanEqualAny(column string, values []any, cb
 
 	// Dict fast-path for string columns: build a match mask over the dictionary once,
 	// then scan rows via StringIdx with a single bool lookup per row.
-	//
-	// NOTE-075: the fast path only applies when every value is a string. Mixed-type
-	// queries (e.g. int64 values against a string-encoded column like
-	// `span.http.response.status_code`, which OTel writers store as strings) must
-	// fall through to the generic rowEqual path below, because rowEqual → rowCompareString
-	// parses the stored string via strconv.ParseInt/ParseFloat. Filtering non-string
-	// values out of wantSet here would silently produce zero matches, which is the
-	// bug fixed by this change — single-value ScanEqual already handles int→string
-	// coercion correctly; multi-value must too.
-	allStrings := true
-	for _, v := range values {
-		if _, ok := v.(string); !ok {
-			allStrings = false
-			break
-		}
-	}
-	if allStrings && (col.Type == modules_shared.ColumnTypeString || col.Type == modules_shared.ColumnTypeRangeString) {
+	if col.Type == modules_shared.ColumnTypeString || col.Type == modules_shared.ColumnTypeRangeString {
 		col.EnsureDecoded()
 		// Build a set of wanted strings.
 		wantSet := make(map[string]struct{}, len(values))
 		for _, v := range values {
-			wantSet[v.(string)] = struct{}{} //nolint:errcheck // allStrings guard above
+			if s, ok := v.(string); ok {
+				wantSet[s] = struct{}{}
+			}
+		}
+		if len(wantSet) == 0 {
+			// All values are non-string; no string column can match.
+			return 0, nil
 		}
 		// Build a per-dict-entry match mask.
 		dictMatch := make([]bool, len(col.StringDict))

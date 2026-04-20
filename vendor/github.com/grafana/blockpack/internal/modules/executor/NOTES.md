@@ -1816,6 +1816,12 @@ columns before composing the OR — a more invasive architectural change that is
 
 **Back-ref:** `internal/modules/executor/predicates.go:rowSatisfiesIntrinsicNodesOR`
 
+**Addendum (2026-04-17, NOTE-076):** The `OR(non-intrinsic-only)` sub-case — where ALL
+OR children are non-intrinsic — is now fixed. `rowSatisfiesIntrinsicNodesOR` returns `true`
+(pass-through) for such nodes. The documented false-negative limitation in NOTE-051 applies
+only to `OR(intrinsic, non-intrinsic)` where at least one child IS intrinsic but another
+child is non-intrinsic. That case is not changed by NOTE-076.
+
 ## NOTE-052: Dual Storage Coexistence — Block Columns and Intrinsic Section
 *Added: 2026-03-26*
 
@@ -2310,38 +2316,25 @@ BENCH-EX-09 (HISTOGRAM variant) similar.
 
 ---
 
+## NOTE-076: Q7 Bugfix — rowSatisfiesIntrinsicNodesOR Pass-Through for All-Non-Intrinsic OR
+*Added: 2026-04-17*
 
-## NOTE-074: Dict-ID-Keyed Group Map — Intrinsic Fast Path (2026-04-17)
+**Bug:** `rowSatisfiesIntrinsicNodesOR` returned `false` when all OR children referenced
+non-intrinsic columns, incorrectly eliminating rows that the VM's `ColumnPredicate` had
+already validated. This caused queries of the shape `{intrinsicCol=X && (spanAttr=A || spanAttr=B)}`
+to return 0 results even when matching spans existed.
 
-**Decision:** Replace `map[uint32]string groupKeyMap` + `map[string][]int64 groupCounts`
-in the intrinsic fast path with `map[uint32]groupIDKey` + `map[groupIDKey][]int64`, where
-`groupIDKey = [8]uint32`.
+**Fix:** Track `hadConstrainedChild` in the OR loop. When no constrained child (intrinsic leaf
+or composite) was found, return `true` (pass-through) instead of `false`. Non-intrinsic leaf
+predicates in the OR are the VM ColumnPredicate's responsibility; this function should only
+veto rows that fail an intrinsic constraint. Composite children (AND/OR groups) are always
+marked as constrained so that nested intrinsic failures are not bypassed.
 
-**Why:** r81 Pyroscope showed `ctrlGroupMatchH2` at 24.67% (string hash cost in
-`groupCounts[gk]` lookups) and `buildGroupKeyMap` at 19.24% (string value allocations
-in the group key map). For M8 warm (150M spans, primarily intrinsic), this is ~1.68s and
-~1.31s respectively. Switching to uint32 array keys reduces hash cost by ~50-60% and
-eliminates the O(blocks × unique_groups) string allocations.
+**Not affected:** OR nodes with at least one intrinsic leaf (NOTE-051 case) are unchanged
+— `hadConstrainedChild=true` and the function returns `false` when all intrinsic children fail.
 
-**Key decisions:**
-1. `[8]uint32` cap (32 bytes, one cache line). Queries with >8 group-by dims fall back to
-   string-keyed path — pathological in production (zero real queries use >4).
-2. dict index 0 = absent/empty sentinel in every dimension. Column dicts are prefixed with
-   "" so absent pks naturally map to index 0 without special-casing.
-3. String resolution (ID → label string) is deferred to series-emit time, which is
-   O(unique groups), not O(spans). The final series label values are byte-identical to
-   the string-keyed path output.
-4. `histGroupIDKey struct { dims [8]uint32; boundary float64; bucketIdx int64 }` is the
-   histogram key — avoids both string hash for group dims AND `strconv.FormatFloat` per
-   span for the boundary value. Boundary is always a power-of-2 or 0 (never NaN), making
-   float64 map key safe.
-5. Flat intrinsic columns in group-by: build on-the-fly string→uint32 dict (sequential IDs
-   from first-seen string values). This path is cold in production (nobody groups by
-   `span:start`).
-6. Block-scan path (`traceAccumulateRow`) is unchanged — it is not the M8 bottleneck.
+**Triggering condition:** Both full block-scan path (`scanBlocks`, `Limit==0`) and the intrinsic
+fast path (`Limit>0`) call `filterRowSetByIntrinsicNodes` and were both affected by the bug.
 
-**PR:** Layer 3 dict-ID group map
-Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:buildGroupIDMap`,
-          `internal/modules/executor/metrics_trace_intrinsic.go:streamCountRateGroupByID`,
-          `internal/modules/executor/metrics_trace_intrinsic.go:streamHistogramGroupByID`,
-          `internal/modules/executor/metrics_trace_intrinsic.go:streamAggGroupByID`
+**Back-ref:** `internal/modules/executor/predicates.go:rowSatisfiesIntrinsicNodesOR`
+**Test:** `TestANDMultiValueOR_IntrinsicAND_SpanAttrOR` (EX-INT-14 through EX-INT-17, EX-INT-21)
