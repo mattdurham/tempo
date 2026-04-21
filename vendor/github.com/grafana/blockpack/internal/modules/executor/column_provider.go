@@ -588,14 +588,22 @@ func (p *blockColumnProvider) ScanEqualAny(column string, values []any) (vm.RowS
 	})
 }
 
-// StreamScanNotEqual scans all rows and calls cb for each row where column does not equal value.
+// NOTE-078: absent user-attribute column returns 0 (not FullScan). Mirrors nilIntrinsicScan
+// guard pattern used by all other StreamScan* functions. Intrinsic columns absent from
+// block payload still return FullScan via nilIntrinsicScan (SPEC-STREAM-10.1).
 func (p *blockColumnProvider) StreamScanNotEqual(column string, value interface{}, cb vm.RowCallback) (int, error) {
 	col := p.lookupColumn(column)
+	if col == nil {
+		if n, handled, err := p.nilIntrinsicScan(column, cb); handled {
+			return n, err
+		}
+		return 0, nil
+	}
 	n := p.block.SpanCount()
 	count := 0
 	for i := range n {
 		// NotEqual includes null rows (they are not equal to anything).
-		present := col != nil && col.IsPresent(i)
+		present := col.IsPresent(i)
 		if !present {
 			if !cb(i) {
 				return count, nil
