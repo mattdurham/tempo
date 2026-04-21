@@ -2522,3 +2522,40 @@ trace (unavoidable) plus runtime overhead. String-key allocs are eliminated.
 
 **Back-ref:** `internal/modules/executor/stream_structural.go:resolveStructuralParentIndices`,
              `internal/modules/executor/stream_structural.go:evalStructuralMatches`
+
+---
+
+## NOTE-080: N-Node Structural Query Chains — Bitmask and Chain Evaluator
+*Added: 2026-04-21*
+
+**Decision:** Extended the structural query engine to support N-node chains (e.g., `A >> B >> C`).
+Changes are backward-compatible: 2-node queries route through the unchanged per-operator
+eval functions; N>2 chains route through `evalOpChain`.
+
+**Design:**
+- `StructuralQuery.Right` changed from `*FilterExpression` to `Expr`, allowing `*StructuralQuery`
+  as the right operand, enabling right-associative parsing of N-node chains.
+- `traceqlparser.FlattenChain(q)` recursively walks the right chain and returns
+  `[]*FilterExpression` (length N) and `[]StructuralOp` (length N-1).
+- `structuralSpanRec.nodeMatch uint8` replaces the old 2-field approach.
+  Bit i is set if the span matches program[i]. Supports up to 8 nodes.
+- `compileStructuralPrograms([]*FilterExpression)` compiles one `*vm.Program` per chain node.
+- `collectBlockStructuralSpanRecs` evaluates all N programs per block and tags each span
+  with the resulting `nodeMatch` bitmask via `computeNodeMatchForRow`.
+- `evalOpChain` + `evalOpChainStep` implement pairwise chain evaluation using an
+  intermediate `map[int]struct{}` match set. Each step: given the matched set for node i,
+  compute the matched set for node i+1 using `ops[i]`.
+- 2-node case: `nodeMatch & 0x01` = left (node 0), `nodeMatch & 0x02` = right (node 1) —
+  all existing per-op functions remain unchanged.
+
+**Rationale:** Parquet handles `A >> B >> C` natively; blockpack must match that behavior.
+The bitmask avoids heap allocations for N<=8 nodes (common case). The intermediate set
+approach for N>2 avoids a mega-evaluator and keeps each operator's semantics isolated.
+
+**Limitation:** N>8 nodes are rejected at runtime with an error (enforced in `ExecuteStructural`);
+no practical query uses 8+ levels. Negation operators in multi-node chains are also rejected
+at runtime rather than silently returning empty results.
+
+Back-ref: `internal/modules/executor/stream_structural.go:evalOpChain`,
+          `internal/modules/executor/stream_structural.go:evalOpChainStep`,
+          `internal/traceqlparser/parser.go:FlattenChain`

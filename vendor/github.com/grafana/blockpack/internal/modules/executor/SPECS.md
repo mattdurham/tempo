@@ -797,12 +797,16 @@ modules blockpack Reader. It is the counterpart to `Collect` for structural oper
 
 ### 11.2 Three-Phase Algorithm
 
-1. **Collect** — Scan all blocks. For each span, record spanID, parentID, and whether it
-   matches the left and/or right filter. Results are keyed by `[16]byte` trace ID.
+1. **Collect** — Scan all blocks. For each span, evaluate all N filter programs and record
+   a `nodeMatch uint8` bitmask (bit i set = span matches program[i]). Results are keyed by
+   `[16]byte` trace ID. See NOTE-080 for the bitmask design (max 8 nodes).
 2. **Resolve** — For each trace, build a `spanID→index` map and set each span's `parentIdx`
    field. `parentIdx = -1` means root (no known parent in this file).
-3. **Evaluate** — Apply the structural operator to each trace's span list. Emit matching
-   right-side spans as `SpanMatch` entries.
+3. **Evaluate** — Apply the structural operators to each trace's span list via
+   `applyStructuralOps`: 2-node queries route through the per-operator functions
+   (`evalOpDescendantStruct` etc.); N>2 chains route through `evalOpChain`, which uses
+   an intermediate match-set approach (left-to-right pairwise evaluation). Emit matching
+   terminal-node spans as `SpanMatch` entries.
 
 Back-ref: `internal/modules/executor/stream_structural.go:ExecuteStructural`
 
@@ -811,8 +815,8 @@ Back-ref: `internal/modules/executor/stream_structural.go:ExecuteStructural`
 - **SPEC-STRUCT-1:** Nil reader returns `&StructuralResult{}` with no error.
 - **SPEC-STRUCT-2:** All blocks are scanned — structural queries bypass bloom and range
   pruning because any block may contain spans from either side of the operator.
-- **SPEC-STRUCT-3:** A nil left or right `FilterExpression` in `StructuralQuery` compiles to
-  a nil program, which matches all rows (wildcard `{}`).
+- **SPEC-STRUCT-3:** A nil filter in any chain slot of `StructuralQuery` (left or any right
+  `Expr` node) compiles to a nil program, which matches all rows (wildcard `{}`).
 - **SPEC-STRUCT-4:** `Options.Limit > 0` caps the number of entries in `StructuralResult.Matches`.
   Matches are deduplicated per trace (a span may only appear once per trace result).
 - **SPEC-STRUCT-5:** `SpanMatch.SpanID` is an 8-byte raw slice. `SpanMatch.TraceID` is a
@@ -830,6 +834,19 @@ Back-ref: `internal/modules/executor/stream_structural.go:ExecuteStructural`
   Contrast with `>` (OpChild) which requires the direct parent to be leftMatch.
   All blocks are still scanned (SPEC-STRUCT-2 applies).
   Back-ref: `internal/modules/executor/stream_structural.go:evalOpNotChildStruct`
+
+- **SPEC-STRUCT-8:** N-node chain support — `ExecuteStructural` supports chains of N nodes
+  (e.g. `A >> B >> C`) via `FlattenChain` + `evalOpChain`. Two constraints are enforced at
+  runtime in `ExecuteStructural`:
+  1. **Max 8 nodes**: chains with more than 8 filter nodes return an error
+     (`"structural chain too long: N nodes (max 8)"`). This is required by the `nodeMatch
+     uint8` bitmask: `uint8(1) << i` overflows silently at i=8.
+  2. **Negation ops disallowed in chains**: if any op in a multi-step chain is
+     `OpNotSibling`, `OpNotDescendant`, or `OpNotChild`, `ExecuteStructural` returns an
+     error (`"negation operator X is not supported in multi-node chains"`). Single-step
+     queries (2-node, 1-op) continue to support negation operators unchanged.
+  Back-ref: `internal/modules/executor/stream_structural.go:ExecuteStructural`,
+            `internal/modules/executor/stream_structural.go:evalOpChain`
 
 ### 11.4 Structural Operators
 
