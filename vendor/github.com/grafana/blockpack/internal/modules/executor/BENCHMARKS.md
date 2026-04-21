@@ -352,3 +352,29 @@ go test -bench='BenchmarkStreamScanEqualAny_ByType' -benchmem -count=5 \
 ```
 
 Back-ref: `internal/modules/executor/scan_equal_any_bench_test.go:BenchmarkStreamScanEqualAny_ByType`
+
+## BENCH-EX-13: BenchmarkStructuralParentResolve_AllocCount
+*Added: 2026-04-17*
+
+Measures per-call allocations in `resolveStructuralParentIndices` over a 100-trace ×
+60-span workload (6000 spans total). Captures the string-alloc reduction from NOTE-078.
+
+**Setup:**
+- Build `map[[16]byte][]structuralSpanRec` with 100 traces, 60 spans each.
+- Each trace has a linear parent-child chain: span[i].parentID = span[i-1].spanID.
+- Clone is done with `b.StopTimer()` / `b.StartTimer()` so only `resolveStructuralParentIndices`
+  allocations are counted. The function nils parentID in-place, requiring a fresh clone each iteration.
+
+**Run command:**
+```
+go test -bench=BenchmarkStructuralParentResolve_AllocCount -benchmem -count=3 \
+    ./internal/modules/executor/
+```
+
+**Baseline (pre-fix, map[string]int):** ~12100 allocs/op (~1 alloc per span insert
+× 6000 spans + 100 map makes; lookup is optimized by the compiler but insert always allocates).
+
+**Baseline (post-fix, map[[8]byte]int):** ~300 allocs/op (100 map makes + runtime overhead,
+zero string allocs) — regression threshold is ≤ 400 allocs/op.
+
+**Back-ref:** `internal/modules/executor/structural_bench_test.go:BenchmarkStructuralParentResolve_AllocCount` (BENCH-EX-13)
