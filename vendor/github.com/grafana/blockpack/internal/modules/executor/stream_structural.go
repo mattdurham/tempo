@@ -14,12 +14,12 @@ import (
 )
 
 // structuralSpanRec records per-span data collected during a structural query scan.
+// nodeMatch bit i is set if the span matches program[i]; bit 0 = node 0 (left), bit 1 = node 1 (right).
 type structuralSpanRec struct {
-	spanID     []byte
-	parentID   []byte // nil after phase 2
-	parentIdx  int    // -1 = root; set during phase 2
-	leftMatch  bool
-	rightMatch bool
+	spanID    []byte
+	parentID  []byte // nil after phase 2
+	parentIdx int    // -1 = root; set during phase 2
+	nodeMatch uint8
 }
 
 // StructuralResult is the output of ExecuteStructural.
@@ -30,7 +30,7 @@ type StructuralResult struct {
 // ExecuteStructural executes a structural TraceQL query against a modules blockpack Reader.
 //
 // The algorithm runs in three phases:
-//  1. Collect span records (spanID, parentID, leftMatch, rightMatch) from every block.
+//  1. Collect span records (spanID, parentID, nodeMatch bitmask) from every block.
 //  2. Resolve parentID references to local indices within each trace.
 //  3. Evaluate the structural operator per trace; emit matching right-side spans.
 //
@@ -48,15 +48,32 @@ func ExecuteStructural(
 		return &StructuralResult{}, nil
 	}
 
-	leftProg, rightProg, err := compileStructuralFilterPrograms(q)
+	filters, ops := traceqlparser.FlattenChain(q)
+
+	// SPEC-STRUCT-8: Guard against chains that exceed the uint8 bitmask capacity.
+	const maxStructuralNodes = 8
+	if len(filters) > maxStructuralNodes {
+		return nil, fmt.Errorf("structural chain too long: %d nodes (max %d)", len(filters), maxStructuralNodes)
+	}
+
+	// SPEC-STRUCT-8: Negation operators have undefined semantics in multi-node chains;
+	// reject early rather than silently returning empty results.
+	if len(ops) > 1 {
+		for _, op := range ops {
+			if op == traceqlparser.OpNotSibling || op == traceqlparser.OpNotDescendant || op == traceqlparser.OpNotChild {
+				return nil, fmt.Errorf("negation operator %s is not supported in multi-node chains", op)
+			}
+		}
+	}
+
+	programs, err := compileStructuralPrograms(filters)
 	if err != nil {
 		return nil, err
 	}
 
 	traceSpans, err := collectAllStructuralSpans(
 		r,
-		leftProg,
-		rightProg,
+		programs,
 		opts.TimeRange,
 		opts.StartBlock,
 		opts.BlockCount,
@@ -68,35 +85,34 @@ func ExecuteStructural(
 	resolveStructuralParentIndices(traceSpans)
 
 	result := &StructuralResult{}
-	if err := evalStructuralMatches(traceSpans, q.Op, opts, result); err != nil {
+	if err := evalStructuralMatches(traceSpans, ops, opts, result); err != nil {
 		return nil, err
 	}
 	return result, nil
 }
 
-// compileStructuralFilterPrograms compiles the left and right filter expressions.
-// A nil FilterExpression compiles to a nil program (matches all rows).
-func compileStructuralFilterPrograms(q *traceqlparser.StructuralQuery) (left, right *vm.Program, err error) {
-	if q.Left != nil {
-		left, err = vm.CompileTraceQLFilter(q.Left)
-		if err != nil {
-			return nil, nil, fmt.Errorf("compile structural left filter: %w", err)
+// compileStructuralPrograms compiles each filter expression to a vm.Program.
+// A nil filter compiles to a nil program (matches all rows).
+func compileStructuralPrograms(filters []*traceqlparser.FilterExpression) ([]*vm.Program, error) {
+	programs := make([]*vm.Program, len(filters))
+	for i, f := range filters {
+		if f == nil {
+			continue
 		}
-	}
-	if q.Right != nil {
-		right, err = vm.CompileTraceQLFilter(q.Right)
+		p, err := vm.CompileTraceQLFilter(f)
 		if err != nil {
-			return nil, nil, fmt.Errorf("compile structural right filter: %w", err)
+			return nil, fmt.Errorf("compile structural node %d filter: %w", i, err)
 		}
+		programs[i] = p
 	}
-	return left, right, nil
+	return programs, nil
 }
 
 // collectAllStructuralSpans fetches blocks (optionally filtered by time range and sub-file
 // sharding) and accumulates per-trace span records. Returns a map keyed by [16]byte trace ID.
 func collectAllStructuralSpans(
 	r *modules_reader.Reader,
-	leftProg, rightProg *vm.Program,
+	programs []*vm.Program,
 	tr queryplanner.TimeRange,
 	startBlock, blockCount int,
 ) (map[[16]byte][]structuralSpanRec, error) {
@@ -131,7 +147,7 @@ func collectAllStructuralSpans(
 		if !ok {
 			continue
 		}
-		if err := collectBlockStructuralSpanRecs(r, blockIdx, raw, leftProg, rightProg, result); err != nil {
+		if err := collectBlockStructuralSpanRecs(r, blockIdx, raw, programs, result); err != nil {
 			return nil, err
 		}
 	}
@@ -143,26 +159,29 @@ func collectBlockStructuralSpanRecs(
 	r *modules_reader.Reader,
 	blockIdx int,
 	raw []byte,
-	leftProg, rightProg *vm.Program,
+	programs []*vm.Program,
 	result map[[16]byte][]structuralSpanRec,
 ) error {
 	meta := r.BlockMeta(blockIdx)
 
 	hasIntrinsic := r.HasIntrinsicSection()
 
-	// Union predicate columns from both programs.
+	// Union predicate columns from all programs.
 	// For files with an intrinsic section, identity columns (trace:id, span:id,
 	// span:parent_id) are served from the intrinsic section — omit from wantColumns.
 	// For legacy files (no intrinsic section), identity columns live in block payloads
 	// and must be decoded — include them in wantColumns.
-	wantColumns := ProgramWantColumns(leftProg)
-	if rightCols := ProgramWantColumns(rightProg); rightCols != nil {
+	var wantColumns map[string]struct{}
+	for _, prog := range programs {
+		cols := ProgramWantColumns(prog)
+		if cols == nil {
+			continue
+		}
 		if wantColumns == nil {
-			wantColumns = rightCols
-		} else {
-			for c := range rightCols {
-				wantColumns[c] = struct{}{}
-			}
+			wantColumns = make(map[string]struct{}, len(cols))
+		}
+		for c := range cols {
+			wantColumns[c] = struct{}{}
 		}
 	}
 	if !hasIntrinsic {
@@ -182,31 +201,16 @@ func collectBlockStructuralSpanRecs(
 	}
 
 	provider := newBlockColumnProvider(bwb.Block)
+	spanCount := bwb.Block.SpanCount()
 
-	// For files with an intrinsic section, strip intrinsic-column predicates before
-	// evaluating against block columns (they are absent from block payloads).
-	// For legacy files, intrinsic columns exist in block payloads — evaluate them
-	// directly via ColumnPredicate without stripping.
-	// userAttrProgram returns nil when all predicates are intrinsic → match-all.
-	var uapLeft, uapRight *vm.Program
-	if hasIntrinsic {
-		uapLeft = userAttrProgram(leftProg)
-		uapRight = userAttrProgram(rightProg)
-	} else {
-		uapLeft = leftProg
-		uapRight = rightProg
-	}
-
-	leftSet, err := evalStructuralProgram(uapLeft, provider, bwb.Block.SpanCount())
+	// Evaluate each program against block columns.
+	// For files with an intrinsic section, strip intrinsic-column predicates first.
+	sets, err := evaluateStructuralPrograms(programs, hasIntrinsic, provider, spanCount, blockIdx)
 	if err != nil {
-		return fmt.Errorf("structural left ColumnPredicate block %d: %w", blockIdx, err)
-	}
-	rightSet, err := evalStructuralProgram(uapRight, provider, bwb.Block.SpanCount())
-	if err != nil {
-		return fmt.Errorf("structural right ColumnPredicate block %d: %w", blockIdx, err)
+		return err
 	}
 
-	n := bwb.Block.SpanCount()
+	n := spanCount
 
 	// Collect intrinsic predicate nodes for post-filtering (intrinsic-section files only).
 	// For legacy files, ColumnPredicate already evaluated intrinsic columns from block payloads.
@@ -215,11 +219,9 @@ func collectBlockStructuralSpanRecs(
 		"span:id":        {},
 		"span:parent_id": {},
 	}
-	var leftIntrinsicNodes, rightIntrinsicNodes []vm.RangeNode
+	var nodesList [][]vm.RangeNode
 	if hasIntrinsic {
-		leftIntrinsicNodes, rightIntrinsicNodes = collectStructuralIntrinsicNodes(
-			leftProg, rightProg, intrinsicWant,
-		)
+		nodesList = collectStructuralIntrinsicNodes(programs, intrinsicWant)
 	}
 
 	// Resolve identity fields. For files with an intrinsic section, use lookupIntrinsicFields.
@@ -272,22 +274,13 @@ func collectBlockStructuralSpanRecs(
 			}
 		}
 
-		// Post-filter block-column matches against intrinsic predicate nodes.
-		// For legacy files (no intrinsic section), ColumnPredicate already evaluated
-		// intrinsic columns from block payloads; skip the post-filter.
-		leftMatch := leftSet.Contains(rowIdx)
-		rightMatch := rightSet.Contains(rowIdx)
-		if hasIntrinsic {
-			leftMatch = leftMatch && rowSatisfiesIntrinsicNodes(leftIntrinsicNodes, fields)
-			rightMatch = rightMatch && rowSatisfiesIntrinsicNodes(rightIntrinsicNodes, fields)
-		}
+		nodeMatch := computeNodeMatchForRow(sets, nodesList, hasIntrinsic, fields, rowIdx)
 
 		rec := structuralSpanRec{
-			spanID:     spanIDBytes,
-			parentID:   parentIDBytes,
-			parentIdx:  -1,
-			leftMatch:  leftMatch,
-			rightMatch: rightMatch,
+			spanID:    spanIDBytes,
+			parentID:  parentIDBytes,
+			parentIdx: -1,
+			nodeMatch: nodeMatch,
 		}
 		result[traceID] = append(result[traceID], rec)
 	}
@@ -303,20 +296,66 @@ func evalStructuralProgram(prog *vm.Program, provider vm.ColumnDataProvider, spa
 	return allMatchRowSet(spanCount), nil
 }
 
-// collectStructuralIntrinsicNodes collects intrinsic predicate nodes from both programs
-// into leftNodes and rightNodes, and adds their column names to want.
-func collectStructuralIntrinsicNodes(
-	leftProg, rightProg *vm.Program, want map[string]struct{},
-) (leftNodes, rightNodes []vm.RangeNode) {
-	if leftProg != nil && leftProg.Predicates != nil {
-		collectIntrinsicNodeColumns(leftProg.Predicates.Nodes, want)
-		leftNodes = leftProg.Predicates.Nodes
+// evaluateStructuralPrograms evaluates all N programs against the block column provider.
+func evaluateStructuralPrograms(
+	programs []*vm.Program,
+	hasIntrinsic bool,
+	provider vm.ColumnDataProvider,
+	spanCount, blockIdx int,
+) ([]vm.RowSet, error) {
+	sets := make([]vm.RowSet, len(programs))
+	for i, prog := range programs {
+		var uap *vm.Program
+		if hasIntrinsic {
+			uap = userAttrProgram(prog)
+		} else {
+			uap = prog
+		}
+		s, err := evalStructuralProgram(uap, provider, spanCount)
+		if err != nil {
+			return nil, fmt.Errorf("structural node %d ColumnPredicate block %d: %w", i, blockIdx, err)
+		}
+		sets[i] = s
 	}
-	if rightProg != nil && rightProg.Predicates != nil {
-		collectIntrinsicNodeColumns(rightProg.Predicates.Nodes, want)
-		rightNodes = rightProg.Predicates.Nodes
+	return sets, nil
+}
+
+// computeNodeMatchForRow computes the nodeMatch bitmask for a single row.
+// Bit i is set if sets[i] contains rowIdx and (if hasIntrinsic) the intrinsic nodes pass.
+func computeNodeMatchForRow(
+	sets []vm.RowSet,
+	nodesList [][]vm.RangeNode,
+	hasIntrinsic bool,
+	fields map[string]any,
+	rowIdx int,
+) uint8 {
+	var nodeMatch uint8
+	for i, s := range sets {
+		if !s.Contains(rowIdx) {
+			continue
+		}
+		passes := true
+		if hasIntrinsic && len(nodesList) > i && len(nodesList[i]) > 0 {
+			passes = rowSatisfiesIntrinsicNodes(nodesList[i], fields)
+		}
+		if passes {
+			nodeMatch |= 1 << uint(i) //nolint:gosec // safe: i bounded by len(programs) <= 8
+		}
 	}
-	return leftNodes, rightNodes
+	return nodeMatch
+}
+
+// collectStructuralIntrinsicNodes collects intrinsic predicate nodes from each program,
+// adds their column names to want, and returns a per-program node list.
+func collectStructuralIntrinsicNodes(programs []*vm.Program, want map[string]struct{}) [][]vm.RangeNode {
+	nodesList := make([][]vm.RangeNode, len(programs))
+	for i, prog := range programs {
+		if prog != nil && prog.Predicates != nil {
+			collectIntrinsicNodeColumns(prog.Predicates.Nodes, want)
+			nodesList[i] = prog.Predicates.Nodes
+		}
+	}
+	return nodesList
 }
 
 // identityFieldsFromBlockCols builds a per-row identity field map by reading
@@ -412,16 +451,16 @@ func resolveStructuralParentIndices(traceSpans map[[16]byte][]structuralSpanRec)
 	}
 }
 
-// evalStructuralMatches evaluates the structural operator for each trace and
-// appends matching right-side spans to result. Stops early if limit is reached.
+// evalStructuralMatches evaluates the structural operator(s) for each trace and
+// appends matching terminal spans to result. Stops early if limit is reached.
 func evalStructuralMatches(
 	traceSpans map[[16]byte][]structuralSpanRec,
-	op traceqlparser.StructuralOp,
+	ops []traceqlparser.StructuralOp,
 	opts Options,
 	result *StructuralResult,
 ) error {
 	for traceID, spans := range traceSpans {
-		rightIndices := applyStructuralOp(spans, op)
+		rightIndices := applyStructuralOps(spans, ops)
 
 		// NOTE-079: slices.Sort + dedup replaces map[int]struct{} — zero extra allocs.
 		// rightIndices is a fresh local slice from applyStructuralOp; sorting it is safe.
@@ -444,6 +483,19 @@ func evalStructuralMatches(
 		}
 	}
 	return nil
+}
+
+// applyStructuralOps dispatches to the appropriate evaluator based on chain length.
+// For a single op (2-node chain) it delegates to applyStructuralOp (unchanged path).
+// For N>1 ops it uses evalOpChain.
+func applyStructuralOps(spans []structuralSpanRec, ops []traceqlparser.StructuralOp) []int {
+	if len(ops) == 0 {
+		return nil
+	}
+	if len(ops) == 1 {
+		return applyStructuralOp(spans, ops[0])
+	}
+	return evalOpChain(spans, ops)
 }
 
 // applyStructuralOp returns the right-side span indices matched by the operator.
@@ -474,12 +526,12 @@ func applyStructuralOp(spans []structuralSpanRec, op traceqlparser.StructuralOp)
 func evalOpDescendantStruct(spans []structuralSpanRec) []int {
 	result := make([]int, 0, len(spans))
 	for ri, r := range spans {
-		if !r.rightMatch {
+		if r.nodeMatch&0x02 == 0 {
 			continue
 		}
 		cur := r.parentIdx
 		for cur >= 0 {
-			if spans[cur].leftMatch {
+			if spans[cur].nodeMatch&0x01 != 0 {
 				result = append(result, ri)
 				break
 			}
@@ -493,10 +545,10 @@ func evalOpDescendantStruct(spans []structuralSpanRec) []int {
 func evalOpChildStruct(spans []structuralSpanRec) []int {
 	result := make([]int, 0, len(spans))
 	for ri, r := range spans {
-		if !r.rightMatch || r.parentIdx < 0 {
+		if r.nodeMatch&0x02 == 0 || r.parentIdx < 0 {
 			continue
 		}
-		if spans[r.parentIdx].leftMatch {
+		if spans[r.parentIdx].nodeMatch&0x01 != 0 {
 			result = append(result, ri)
 		}
 	}
@@ -510,18 +562,18 @@ func evalOpChildStruct(spans []structuralSpanRec) []int {
 func evalOpSiblingStruct(spans []structuralSpanRec) []int {
 	leftCounts := make(map[int]int)
 	for _, sp := range spans {
-		if sp.leftMatch {
+		if sp.nodeMatch&0x01 != 0 {
 			leftCounts[sp.parentIdx]++
 		}
 	}
 	result := make([]int, 0, len(spans))
 	for ri, r := range spans {
-		if !r.rightMatch {
+		if r.nodeMatch&0x02 == 0 {
 			continue
 		}
 		cnt := leftCounts[r.parentIdx]
 		// Qualify if there is at least one left-match sibling OTHER than r itself.
-		if cnt > 1 || (cnt == 1 && !r.leftMatch) {
+		if cnt > 1 || (cnt == 1 && r.nodeMatch&0x01 == 0) {
 			result = append(result, ri)
 		}
 	}
@@ -532,12 +584,12 @@ func evalOpSiblingStruct(spans []structuralSpanRec) []int {
 func evalOpAncestorStruct(spans []structuralSpanRec) []int {
 	result := make([]int, 0, len(spans))
 	for _, l := range spans {
-		if !l.leftMatch {
+		if l.nodeMatch&0x01 == 0 {
 			continue
 		}
 		cur := l.parentIdx
 		for cur >= 0 {
-			if spans[cur].rightMatch {
+			if spans[cur].nodeMatch&0x02 != 0 {
 				result = append(result, cur)
 			}
 			cur = spans[cur].parentIdx
@@ -550,10 +602,10 @@ func evalOpAncestorStruct(spans []structuralSpanRec) []int {
 func evalOpParentStruct(spans []structuralSpanRec) []int {
 	result := make([]int, 0, len(spans))
 	for _, l := range spans {
-		if !l.leftMatch || l.parentIdx < 0 {
+		if l.nodeMatch&0x01 == 0 || l.parentIdx < 0 {
 			continue
 		}
-		if spans[l.parentIdx].rightMatch {
+		if spans[l.parentIdx].nodeMatch&0x02 != 0 {
 			result = append(result, l.parentIdx)
 		}
 	}
@@ -564,13 +616,13 @@ func evalOpParentStruct(spans []structuralSpanRec) []int {
 func evalOpNotSiblingStruct(spans []structuralSpanRec) []int {
 	leftParents := make(map[int]struct{})
 	for _, sp := range spans {
-		if sp.leftMatch {
+		if sp.nodeMatch&0x01 != 0 {
 			leftParents[sp.parentIdx] = struct{}{}
 		}
 	}
 	result := make([]int, 0, len(spans))
 	for ri, r := range spans {
-		if _, hasLeft := leftParents[r.parentIdx]; r.rightMatch && !hasLeft {
+		if _, hasLeft := leftParents[r.parentIdx]; r.nodeMatch&0x02 != 0 && !hasLeft {
 			result = append(result, ri)
 		}
 	}
@@ -582,13 +634,13 @@ func evalOpNotSiblingStruct(spans []structuralSpanRec) []int {
 func evalOpNotDescendantStruct(spans []structuralSpanRec) []int {
 	leftSet := make(map[int]struct{})
 	for i, sp := range spans {
-		if sp.leftMatch {
+		if sp.nodeMatch&0x01 != 0 {
 			leftSet[i] = struct{}{}
 		}
 	}
 	result := make([]int, 0, len(spans))
 	for ri, r := range spans {
-		if !r.rightMatch {
+		if r.nodeMatch&0x02 == 0 {
 			continue
 		}
 		isDescendant := false
@@ -612,12 +664,121 @@ func evalOpNotDescendantStruct(spans []structuralSpanRec) []int {
 func evalOpNotChildStruct(spans []structuralSpanRec) []int {
 	result := make([]int, 0, len(spans))
 	for ri, r := range spans {
-		if !r.rightMatch {
+		if r.nodeMatch&0x02 == 0 {
 			continue
 		}
-		if r.parentIdx < 0 || !spans[r.parentIdx].leftMatch {
+		if r.parentIdx < 0 || spans[r.parentIdx].nodeMatch&0x01 == 0 {
 			result = append(result, ri)
 		}
 	}
 	return result
+}
+
+// evalOpChain evaluates an N-node structural chain (N >= 3) using a left-to-right
+// intermediate-match-set approach.
+//
+// NOTE-080: pairwise chain evaluation via intermediate match sets; see NOTES.md.
+// For A OP0 B OP1 C:
+//  1. Build initial set: indices where nodeMatch bit 0 is set (node 0 matches).
+//  2. For each op, advance to the next node using evalOpChainStep.
+//  3. Return the final matched indices (terminal node).
+func evalOpChain(spans []structuralSpanRec, ops []traceqlparser.StructuralOp) []int {
+	prevSet := make(map[int]struct{}, len(spans))
+	for i, sp := range spans {
+		if sp.nodeMatch&0x01 != 0 {
+			prevSet[i] = struct{}{}
+		}
+	}
+
+	nodeIdx := 1
+	for _, op := range ops {
+		mask := uint8(1) << uint(nodeIdx) //nolint:gosec // safe: nodeIdx < 8, enforced by len(filters) > 8 guard in ExecuteStructural
+		prevSet = evalOpChainStep(spans, prevSet, op, mask)
+		if len(prevSet) == 0 {
+			return nil
+		}
+		nodeIdx++
+	}
+
+	result := make([]int, 0, len(prevSet))
+	for i := range prevSet {
+		result = append(result, i)
+	}
+	return result
+}
+
+// evalOpChainStep advances one step in the chain: given the set of "left" span indices
+// and an operator, returns the set of "right" span indices where the op holds and the
+// span has the target nodeMatch bit set.
+// NOTE-080: one step of evalOpChain; see NOTES.md.
+func evalOpChainStep(
+	spans []structuralSpanRec,
+	leftSet map[int]struct{},
+	op traceqlparser.StructuralOp,
+	rightMask uint8,
+) map[int]struct{} {
+	nextSet := make(map[int]struct{})
+	switch op {
+	case traceqlparser.OpDescendant:
+		for ri, r := range spans {
+			if r.nodeMatch&rightMask == 0 {
+				continue
+			}
+			cur := r.parentIdx
+			for cur >= 0 {
+				if _, ok := leftSet[cur]; ok {
+					nextSet[ri] = struct{}{}
+					break
+				}
+				cur = spans[cur].parentIdx
+			}
+		}
+	case traceqlparser.OpChild:
+		for ri, r := range spans {
+			if r.nodeMatch&rightMask == 0 || r.parentIdx < 0 {
+				continue
+			}
+			if _, ok := leftSet[r.parentIdx]; ok {
+				nextSet[ri] = struct{}{}
+			}
+		}
+	case traceqlparser.OpSibling:
+		// Use a count map (matching evalOpSiblingStruct) so that a span which is
+		// simultaneously in leftSet and matches rightMask can still qualify when
+		// there are 2+ left-match spans sharing the same parent.
+		leftParentCounts := make(map[int]int, len(leftSet))
+		for li := range leftSet {
+			leftParentCounts[spans[li].parentIdx]++
+		}
+		for ri, r := range spans {
+			if r.nodeMatch&rightMask == 0 {
+				continue
+			}
+			cnt := leftParentCounts[r.parentIdx]
+			_, isLeft := leftSet[ri]
+			if cnt > 1 || (cnt == 1 && !isLeft) {
+				nextSet[ri] = struct{}{}
+			}
+		}
+	case traceqlparser.OpAncestor:
+		for li := range leftSet {
+			cur := spans[li].parentIdx
+			for cur >= 0 {
+				if spans[cur].nodeMatch&rightMask != 0 {
+					nextSet[cur] = struct{}{}
+				}
+				cur = spans[cur].parentIdx
+			}
+		}
+	case traceqlparser.OpParent:
+		for li := range leftSet {
+			pi := spans[li].parentIdx
+			if pi >= 0 && spans[pi].nodeMatch&rightMask != 0 {
+				nextSet[pi] = struct{}{}
+			}
+		}
+	default:
+		// Negation operators in chains have undefined semantics; return empty set.
+	}
+	return nextSet
 }

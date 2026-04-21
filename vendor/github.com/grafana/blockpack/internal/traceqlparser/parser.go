@@ -200,15 +200,13 @@ func parseStructuralQuery(query string) (*StructuralQuery, error) {
 		return nil, fmt.Errorf("failed to parse right expression: %w", err)
 	}
 
-	// Convert the right expression to a FilterExpression
-	var right *FilterExpression
+	// Convert the right expression to an Expr (FilterExpression or StructuralQuery for chains).
+	var right Expr
 	switch r := rightExpr.(type) {
 	case *FilterExpression:
 		right = r
 	case *StructuralQuery:
-		// If the right side is also a structural query, we need to wrap it
-		// For now, return an error as we need to handle operator precedence properly
-		return nil, fmt.Errorf("nested structural queries require parentheses for clarity")
+		right = r
 	case nil:
 		right = nil
 	default:
@@ -243,6 +241,35 @@ func parseStructuralQuery(query string) (*StructuralQuery, error) {
 		Op:    op,
 		Right: right,
 	}, nil
+}
+
+// FlattenChain recursively flattens a right-associative StructuralQuery chain into
+// a filter slice and an operator slice. For A OP1 B OP2 C it returns:
+//
+//	filters = [A, B, C], ops = [OP1, OP2]
+//
+// len(ops) == len(filters)-1 always.
+// NOTE-080: enables N-node structural query chains; see executor/NOTES.md.
+func FlattenChain(q *StructuralQuery) ([]*FilterExpression, []StructuralOp) {
+	var filters []*FilterExpression
+	var ops []StructuralOp
+	cur := q
+	for {
+		filters = append(filters, cur.Left)
+		switch r := cur.Right.(type) {
+		case *StructuralQuery:
+			ops = append(ops, cur.Op)
+			cur = r
+		case *FilterExpression:
+			ops = append(ops, cur.Op)
+			filters = append(filters, r)
+			return filters, ops
+		default: // nil or unknown
+			ops = append(ops, cur.Op)
+			filters = append(filters, nil)
+			return filters, ops
+		}
+	}
 }
 
 // parseFilterExpression parses a TraceQL filter expression
@@ -719,6 +746,8 @@ type FilterExpression struct {
 	Expr Expr
 }
 
+func (*FilterExpression) exprNode() {}
+
 // MetricsQuery represents a TraceQL metrics query: { filter } | aggregate() by (fields)
 type MetricsQuery struct {
 	Filter   *FilterExpression // The filter part: { ... }
@@ -727,11 +756,14 @@ type MetricsQuery struct {
 
 // StructuralQuery represents a TraceQL structural query: { expr } OP { expr }
 // Examples: { .parent } >> { .child }, { true } ~ { false }
+// Right is Expr to support N-node chains: *FilterExpression or *StructuralQuery.
 type StructuralQuery struct {
-	Left  *FilterExpression // The left filter expression
-	Right *FilterExpression // The right filter expression
-	Op    StructuralOp      // The structural operator (>>, >, ~, <<, <, !~)
+	Left  *FilterExpression
+	Right Expr // *FilterExpression or *StructuralQuery for chained queries
+	Op    StructuralOp
 }
+
+func (*StructuralQuery) exprNode() {}
 
 // PipelineStage represents a pipeline operation
 type PipelineStage struct {

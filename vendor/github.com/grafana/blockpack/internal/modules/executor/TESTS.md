@@ -2584,3 +2584,20 @@ spans[1] has parentID pointing to the same 4-byte ID.
 **Assertions:** `spans[1].parentIdx == -1` (short span not in map; child is orphan).
 
 Back-ref: `internal/modules/executor/stream_structural_internal_test.go:TestResolveStructuralParentIndices_ShortSpanID`
+
+---
+
+## EX-ST-12: TestExecuteStructural_ThreeNodeChain
+*Added: 2026-04-21*
+
+**Scenario:** A 3-node `>>` chain `A >> B >> C` emits C where B is in C's ancestor chain and A is in B's ancestor chain.
+
+**Setup:** 4-span trace (root→child1→grandchild, root→child2). Query:
+`{ resource.service.name = "svc-root" } >> { resource.service.name = "svc-child" } >> { resource.service.name = "svc-leaf" }`.
+
+**Assertions:** Exactly 1 match — the grandchild span (0xCC). child2 does not match because
+while child2's parent (root/svc-root) matches node 0 and child2 (svc-child) matches node 1,
+there is no descendant of child2 that matches node 2 (svc-leaf). Only grandchild satisfies
+the full chain: root(svc-root) >> child1(svc-child) >> grandchild(svc-leaf).
+
+Back-ref: `internal/modules/executor/stream_structural_test.go:TestExecuteStructural_ThreeNodeChain`
