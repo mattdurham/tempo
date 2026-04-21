@@ -962,3 +962,21 @@ Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:buildGroupIDMap`
 
 Back-ref: `internal/modules/executor/column_provider.go:StreamScanEqualAny`,
           `internal/modules/executor/column_provider.go:dispatchDictFastPath`
+
+## SPEC-SCAN-2: StreamScanNotEqual — Absent Column Semantics
+*Added: 2026-04-17*
+
+- **SPEC-SCAN-2.1:** When `StreamScanNotEqual` is called for a column that is absent from
+  the block (`lookupColumn` returns nil) AND the column is not an intrinsic column, the
+  function returns `(0, nil)` immediately. An absent user-attribute column matches no rows
+  for any `!=` predicate.
+- **SPEC-SCAN-2.2:** When the absent column is an intrinsic column, `nilIntrinsicScan`
+  runs first (SPEC-STREAM-10.1). The result depends on whether the intrinsic is recognized:
+  a recognized absent intrinsic returns FullScan; an unrecognized name falls through to
+  `return 0, nil`.
+- **SPEC-SCAN-2.3:** When the column IS present (`col != nil`) but a specific row has no
+  value (`!col.IsPresent(i)`), that row IS included in the `!=` result (per-row null is
+  treated as "not equal to anything"). This is the existing per-row behavior; SPEC-SCAN-2
+  governs only the whole-column-absent case.
+
+Back-ref: `internal/modules/executor/column_provider.go:StreamScanNotEqual`

@@ -4,7 +4,6 @@ package executor
 
 import (
 	"fmt"
-	"slices"
 
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
 	modules_shared "github.com/grafana/blockpack/internal/modules/blockio/shared"
@@ -366,36 +365,23 @@ func (a *allMatchSet) ToSlice() []int {
 	return s
 }
 
-// NOTE-078: resolveStructuralParentIndices uses map[[8]byte]int, not map[string]int,
-// to eliminate per-span string allocations on both insert and lookup.
-// Span IDs are guaranteed 8 bytes by the OTel spec and enforced at write time
-// (writer.go:1002); [8]byte is a stack-allocated value type — no heap alloc for
-// map keys. The remaining one make() per trace is unavoidable.
+// resolveStructuralParentIndices walks each trace's span list, builds a spanID→index
+// map, and sets parentIdx for each span. parentID is cleared after resolution.
 func resolveStructuralParentIndices(traceSpans map[[16]byte][]structuralSpanRec) {
 	for traceID := range traceSpans {
 		spans := traceSpans[traceID]
-		// NOTE-078: [8]byte key — zero string allocations on insert or lookup.
-		byID := make(map[[8]byte]int, len(spans))
+		byID := make(map[string]int, len(spans))
 		for i, sp := range spans {
-			if len(sp.spanID) == 8 {
-				var key [8]byte
-				copy(key[:], sp.spanID)
-				byID[key] = i
+			if len(sp.spanID) > 0 {
+				byID[string(sp.spanID)] = i
 			}
 		}
 		for i := range spans {
-			switch {
-			case len(spans[i].parentID) == 0:
+			if len(spans[i].parentID) == 0 {
 				spans[i].parentIdx = -1
-			case len(spans[i].parentID) == 8:
-				var key [8]byte
-				copy(key[:], spans[i].parentID)
-				if idx, ok := byID[key]; ok {
-					spans[i].parentIdx = idx
-				} else {
-					spans[i].parentIdx = -1
-				}
-			default:
+			} else if idx, ok := byID[string(spans[i].parentID)]; ok {
+				spans[i].parentIdx = idx
+			} else {
 				spans[i].parentIdx = -1
 			}
 			spans[i].parentID = nil
@@ -415,15 +401,13 @@ func evalStructuralMatches(
 	for traceID, spans := range traceSpans {
 		rightIndices := applyStructuralOp(spans, op)
 
-		// NOTE-078: slices.Sort + dedup replaces map[int]struct{} — zero extra allocs.
-		// rightIndices is a fresh local slice from applyStructuralOp; sorting it is safe.
-		slices.Sort(rightIndices)
-		prev := -1
+		seen := make(map[int]struct{}, len(rightIndices))
 		for _, ri := range rightIndices {
-			if ri == prev {
+			if _, ok := seen[ri]; ok {
 				continue
 			}
-			prev = ri
+			seen[ri] = struct{}{}
+
 			tid := traceID // copy for addressability
 			match := SpanMatch{
 				TraceID: tid,
