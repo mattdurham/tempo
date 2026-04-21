@@ -4,6 +4,7 @@ package executor
 
 import (
 	"fmt"
+	"slices"
 
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
 	modules_shared "github.com/grafana/blockpack/internal/modules/blockio/shared"
@@ -365,23 +366,44 @@ func (a *allMatchSet) ToSlice() []int {
 	return s
 }
 
-// resolveStructuralParentIndices walks each trace's span list, builds a spanID→index
-// map, and sets parentIdx for each span. parentID is cleared after resolution.
+// NOTE-079: resolveStructuralParentIndices uses map[[8]byte]int, not map[string]int,
+// to eliminate per-span string allocations on both insert and lookup.
+// Span IDs are guaranteed 8 bytes by the OTel spec and enforced at write time
+// (writer.go:1002); [8]byte is a stack-allocated value type — no heap alloc for
+// map keys. The remaining one make() per trace is unavoidable.
+//
+// Behavioral note for non-8-byte span IDs: the len==8 guards below intentionally
+// skip any spanID or parentID that is not exactly 8 bytes. For those spans,
+// parentIdx is left as -1 (no parent found). This is an intentional scoping
+// decision: the OTel spec mandates 8-byte IDs and the blockpack writer rejects
+// non-conforming spans at ingest time. Legacy/corrupt spans with non-8-byte IDs
+// are extremely rare in practice and would have had unreliable parent resolution
+// even under the old map[string]int approach (since the key bytes would differ).
 func resolveStructuralParentIndices(traceSpans map[[16]byte][]structuralSpanRec) {
 	for traceID := range traceSpans {
 		spans := traceSpans[traceID]
-		byID := make(map[string]int, len(spans))
+		// NOTE-079: [8]byte key — zero string allocations on insert or lookup.
+		byID := make(map[[8]byte]int, len(spans))
 		for i, sp := range spans {
-			if len(sp.spanID) > 0 {
-				byID[string(sp.spanID)] = i
+			if len(sp.spanID) == 8 {
+				var key [8]byte
+				copy(key[:], sp.spanID)
+				byID[key] = i
 			}
 		}
 		for i := range spans {
-			if len(spans[i].parentID) == 0 {
+			switch {
+			case len(spans[i].parentID) == 0:
 				spans[i].parentIdx = -1
-			} else if idx, ok := byID[string(spans[i].parentID)]; ok {
-				spans[i].parentIdx = idx
-			} else {
+			case len(spans[i].parentID) == 8:
+				var key [8]byte
+				copy(key[:], spans[i].parentID)
+				if idx, ok := byID[key]; ok {
+					spans[i].parentIdx = idx
+				} else {
+					spans[i].parentIdx = -1
+				}
+			default:
 				spans[i].parentIdx = -1
 			}
 			spans[i].parentID = nil
@@ -401,13 +423,15 @@ func evalStructuralMatches(
 	for traceID, spans := range traceSpans {
 		rightIndices := applyStructuralOp(spans, op)
 
-		seen := make(map[int]struct{}, len(rightIndices))
+		// NOTE-079: slices.Sort + dedup replaces map[int]struct{} — zero extra allocs.
+		// rightIndices is a fresh local slice from applyStructuralOp; sorting it is safe.
+		slices.Sort(rightIndices)
+		prev := -1
 		for _, ri := range rightIndices {
-			if _, ok := seen[ri]; ok {
+			if ri == prev {
 				continue
 			}
-			seen[ri] = struct{}{}
-
+			prev = ri
 			tid := traceID // copy for addressability
 			match := SpanMatch{
 				TraceID: tid,

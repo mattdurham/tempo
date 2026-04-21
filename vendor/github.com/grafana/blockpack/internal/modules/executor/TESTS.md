@@ -2286,7 +2286,7 @@ Back-ref: `internal/modules/executor/and_or_scope_test.go:TestANDMultiValueOR_In
 *Added: 2026-04-17*
 
 **Scenario:** AND of two `!= ""` predicates on entirely absent user-attribute columns
-must return 0 results, not all spans. Regression test for NOTE-078.
+must return 0 results, not all spans. Regression test for NOTE-079.
 
 **Setup:** 3 spans with `span.http.method` and `resource.service.name` only — no
 `db.system`, no `rpc.service`. Single block. Query: `{ span.db.system != "" && span.rpc.service != "" }`.
@@ -2302,7 +2302,7 @@ Back-ref: `internal/modules/executor/executor_test.go:TestANDPredicateNotEqual_A
 *Added: 2026-04-17*
 
 **Scenario:** A single `!= ""` predicate on an entirely absent user-attribute column
-must return 0 results (not all spans). Regression test for NOTE-078.
+must return 0 results (not all spans). Regression test for NOTE-079.
 
 **Setup:** 5 spans with `span.http.method = "GET"` only — no `db.system`.
 Query: `{ span.db.system != "" }`.
@@ -2459,3 +2459,128 @@ Back-ref: `internal/modules/executor/scan_equal_any_test.go:TestStreamScanEqualA
 Negative int64 query against uint64 column: fast-path result equals generic result.
 Validates the uint64(int64) cast semantic matches rowCompare line 117.
 Back-ref: `internal/modules/executor/scan_equal_any_test.go:TestStreamScanEqualAny_Uint64_NegativeInt64`
+
+---
+
+## EX-STRUCT-INT-01: TestResolveStructuralParentIndices_RootSpan
+*Added: 2026-04-17*
+
+**Scenario:** A single span with nil parentID gets parentIdx=-1 after resolution. Verifies
+parentID is nil'd in-place by resolveStructuralParentIndices.
+
+**Setup:** 1-span trace with spanID=0xAA00000000000000 (8 bytes), parentID=nil.
+
+**Assertions:** `spans[0].parentIdx == -1`; `spans[0].parentID == nil`.
+
+Back-ref: `internal/modules/executor/stream_structural_internal_test.go:TestResolveStructuralParentIndices_RootSpan`
+
+---
+
+## EX-STRUCT-INT-02: TestResolveStructuralParentIndices_ChainResolution
+*Added: 2026-04-17*
+
+**Scenario:** root→child→grandchild chain resolves parentIdx to correct positional indices.
+All three spans have parentID nil'd after resolution.
+
+**Setup:** 3-span trace: root (no parent), child (parentID=rootID), grandchild (parentID=childID).
+All spanIDs are 8 bytes.
+
+**Assertions:** `spans[0].parentIdx == -1`; `spans[1].parentIdx == 0`; `spans[2].parentIdx == 1`.
+All parentIDs nil'd.
+
+Back-ref: `internal/modules/executor/stream_structural_internal_test.go:TestResolveStructuralParentIndices_ChainResolution`
+
+---
+
+## EX-STRUCT-INT-03: TestResolveStructuralParentIndices_UnknownParent
+*Added: 2026-04-17*
+
+**Scenario:** A span whose parentID does not appear in the trace's span set gets parentIdx=-1
+(orphan span — parent in a different file or block not present here).
+
+**Setup:** 1-span trace with parentID=0xFF00000000000000 (not present in trace).
+
+**Assertions:** `spans[0].parentIdx == -1`; `spans[0].parentID == nil`.
+
+Back-ref: `internal/modules/executor/stream_structural_internal_test.go:TestResolveStructuralParentIndices_UnknownParent`
+
+---
+
+## EX-STRUCT-INT-04: TestResolveStructuralParentIndices_DuplicateSpanID
+*Added: 2026-04-17*
+
+**Scenario:** When two spans share the same spanID, the second insert wins (last-writer-wins
+map semantics). A child referencing that spanID resolves to the second occurrence's index.
+NOTE-079: this behaviour is identical to the old map[string]int implementation.
+
+**Setup:** 3-span trace: spans[0] and spans[1] both have spanID=0xAA (8 bytes); spans[2] has
+parentID=0xAA. Spans[1] overwrites spans[0] in the map.
+
+**Assertions:** `spans[0].parentIdx == -1`; `spans[1].parentIdx == -1`; `spans[2].parentIdx == 1`.
+
+Back-ref: `internal/modules/executor/stream_structural_internal_test.go:TestResolveStructuralParentIndices_DuplicateSpanID`
+
+---
+
+## EX-STRUCT-INT-05: TestResolveStructuralParentIndices_MultiTrace
+*Added: 2026-04-17*
+
+**Scenario:** Two traces using the same raw spanID bytes resolve parentIdx independently
+within each trace. No cross-trace contamination through shared map state.
+
+**Setup:** traceA and traceB each have 2 spans with identical spanID/parentID bytes.
+
+**Assertions:** In both traces, spans[0].parentIdx==-1, spans[1].parentIdx==0. No cross-trace
+index bleeding.
+
+Back-ref: `internal/modules/executor/stream_structural_internal_test.go:TestResolveStructuralParentIndices_MultiTrace`
+
+---
+
+## EX-STRUCT-INT-06: TestEvalStructuralMatches_Dedup
+*Added: 2026-04-17*
+
+**Scenario:** When applyStructuralOp returns a right-side index multiple times (e.g. OpParent
+with two leftMatch children sharing the same parent), evalStructuralMatches deduplicates via
+sort+dedup-in-range so the parent appears exactly once in result.Matches. NOTE-079.
+
+**Setup:** 3-span trace: spans[0]=parent (rightMatch=true), spans[1]=child1 (leftMatch=true,
+parentIdx=0), spans[2]=child2 (leftMatch=true, parentIdx=0). OpParent query.
+
+**Assertions:** `len(result.Matches) == 1` (index 0 deduplicated from two identical emissions).
+
+Back-ref: `internal/modules/executor/stream_structural_internal_test.go:TestEvalStructuralMatches_Dedup`
+
+---
+
+## EX-STRUCT-INT-07: TestResolveStructuralParentIndices_ZeroStringAllocs
+*Added: 2026-04-17*
+
+**Scenario:** Allocation guard — resolveStructuralParentIndices produces at most numTraces+2
+allocations per call (one map make per trace, no string-key allocs). NOTE-079.
+Fails immediately if a future change reverts to map[string]int.
+
+**Setup:** 1 trace × 10 spans with linear parent chain. Pre-build 21 clones (to avoid
+measuring clone allocs). Use testing.AllocsPerRun over 20 rounds.
+
+**Assertions:** `allocs <= numTraces+2 (== 3)`. Pre-fix map[string]int would yield ~11 allocs
+(~1 insert alloc per span × 10 spans + 1 map make; Go 1.6+ optimizes away lookup allocs
+so only inserts allocate).
+
+Back-ref: `internal/modules/executor/stream_structural_internal_test.go:TestResolveStructuralParentIndices_ZeroStringAllocs`
+
+---
+
+## EX-STRUCT-INT-08: TestResolveStructuralParentIndices_ShortSpanID
+*Added: 2026-04-17*
+
+**Scenario:** A span with a non-8-byte spanID is NOT inserted into the map[[8]byte]int.
+A child referencing that short spanID gets parentIdx=-1. NOTE-079 guard: this test FAILS
+on map[string]int (which resolves 4-byte IDs via string match) and PASSES on map[[8]byte]int.
+
+**Setup:** 2-span trace: spans[0] has spanID=[]byte{0xAA,0xBB,0xCC,0xDD} (4 bytes);
+spans[1] has parentID pointing to the same 4-byte ID.
+
+**Assertions:** `spans[1].parentIdx == -1` (short span not in map; child is orphan).
+
+Back-ref: `internal/modules/executor/stream_structural_internal_test.go:TestResolveStructuralParentIndices_ShortSpanID`
