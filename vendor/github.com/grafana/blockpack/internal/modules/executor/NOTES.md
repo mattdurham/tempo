@@ -1155,6 +1155,7 @@ They are zero-initialized for log-metric buckets (no behavioral change for any l
 
 ## NOTE-034: ExecuteStructural — Three-Phase Structural Query Algorithm
 *Added: 2026-03-08*
+*(Phase 2 implementation superseded by NOTE-078, 2026-04-17: byID map changed from map[string]int to map[[8]byte]int to eliminate string heap allocations.)*
 
 `ExecuteStructural` ports the three-phase structural query algorithm from `api.go`
 (`streamStructuralQuery`) into the modules executor package.
@@ -2442,3 +2443,48 @@ path for the String+int64 shape. NOTE-075 was the conservative guard; NOTE-077 i
 
 **Back-ref:** `internal/modules/executor/column_provider.go:StreamScanEqualAny` (allStrings guard)
 **Commit:** 029d041 (coercion fix, this branch)
+
+---
+
+## NOTE-078: resolveStructuralParentIndices — `map[[8]byte]int` key to eliminate string allocs
+*Added: 2026-04-17*
+
+**Decision:** Changed `byID` from `map[string]int` to `map[[8]byte]int` in
+`resolveStructuralParentIndices`. Changed `seen map[int]struct{}` in `evalStructuralMatches`
+to `slices.Sort` + dedup-in-range.
+
+**Supersedes NOTE-034 Phase 2 rationale:** NOTE-034 claimed that `string([]byte)` map key
+"avoids allocating a persistent string" via Go compiler optimisation. This is true for MAP
+LOOKUPS but NOT for MAP INSERTS. The insert `byID[string(sp.spanID)] = i` always allocates
+a heap string. Profiler (Pyroscope, 2026-04-17) confirmed 1.80M alloc_objects (18.8% of
+total) attributable to this function.
+
+**Why `[8]byte` map key works:**
+- OTel spec mandates span IDs are exactly 8 bytes (trace.pb.go proto comment).
+- Blockpack writer enforces this at write time: `writer.go:1002` rejects any span with
+  non-8-byte spanID. Legacy files that predate this check are guarded by `len == 8` guards
+  in the new code — non-8-byte IDs are treated as "no parent found" (parentIdx = -1),
+  which is the same fallback as before.
+- `[8]byte` is a value type: the map key is stack-allocated and copied into the bucket
+  array. No heap allocation for key storage on insert OR lookup.
+- This pattern is already established in this file: `map[[16]byte][]structuralSpanRec` at
+  `collectAllStructuralSpans` line 127, and `[8]byte` span ID variables in
+  `stream_structural_test.go:34-37`.
+
+**Why not pool the map:** NOTE-034 deliberately avoided pooling to prevent clearing
+complexity. The map is now cheaper (value-key), making the make() per trace the only
+remaining alloc — acceptable given it is one allocation per trace (not per span).
+
+**Why sort+dedup for seen-map:** `rightIndices` is a freshly allocated local `[]int` from
+`applyStructuralOp`. Sorting it in-place (using already-imported `slices` package) costs
+O(N log N) where N is the number of right-matches per trace — typically small (< 20).
+This eliminates one `make(map[int]struct{})` per trace with any structural matches, at the
+cost of reordering right-match output. Output order is not contractually specified (no
+ORDER BY on structural queries).
+
+**Measured improvement (BENCH-EX-13):** `resolveStructuralParentIndices` itself: ~12200
+→ ~300 allocs/op (100 traces × 60 spans). The 300 remaining allocs are one map make per
+trace (unavoidable) plus runtime overhead. String-key allocs are eliminated.
+
+**Back-ref:** `internal/modules/executor/stream_structural.go:resolveStructuralParentIndices`,
+             `internal/modules/executor/stream_structural.go:evalStructuralMatches`
