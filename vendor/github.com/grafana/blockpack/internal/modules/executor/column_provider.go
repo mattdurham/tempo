@@ -591,6 +591,11 @@ func (p *blockColumnProvider) ScanEqualAny(column string, values []any) (vm.RowS
 // NOTE-078: absent user-attribute column returns 0 (not FullScan). Mirrors nilIntrinsicScan
 // guard pattern used by all other StreamScan* functions. Intrinsic columns absent from
 // block payload still return FullScan via nilIntrinsicScan (SPEC-STREAM-10.1).
+//
+// Per-row absent rows (column present in block but span lacks the attribute) are also
+// excluded from != results. SQL NULL semantics: NULL != anything evaluates to NULL/false,
+// so a span without the attribute does NOT match any != predicate. This matches parquet.
+// NOTE-078: SPEC-SCAN-2 governs both the column-absent and row-absent cases.
 func (p *blockColumnProvider) StreamScanNotEqual(column string, value interface{}, cb vm.RowCallback) (int, error) {
 	col := p.lookupColumn(column)
 	if col == nil {
@@ -602,13 +607,9 @@ func (p *blockColumnProvider) StreamScanNotEqual(column string, value interface{
 	n := p.block.SpanCount()
 	count := 0
 	for i := range n {
-		// NotEqual includes null rows (they are not equal to anything).
-		present := col.IsPresent(i)
-		if !present {
-			if !cb(i) {
-				return count, nil
-			}
-			count++
+		// Skip absent rows — a span without the attribute does not match != predicates.
+		// SQL NULL semantics: NULL != X is false/NULL, not true (SPEC-SCAN-2).
+		if !col.IsPresent(i) {
 			continue
 		}
 		if !rowEqual(col, i, value) {
