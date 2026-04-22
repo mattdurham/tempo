@@ -276,8 +276,11 @@ context). Zero per-span string allocations in the `streamCountRateGroupByID` hot
 
 **History:**
 - Before dict-ID fast path: string-keyed path hashed ~300 group strings per call.
-- After (this PR): `map[groupIDKey]` with `[8]uint32` key; string resolution deferred to
+- After (NOTE-074): `map[groupIDKey]` with `[8]uint32` key; string resolution deferred to
   series-emit (O(unique groups), not O(spans)).
+- After (NOTE-082): this benchmark exercises the N=1 fast path (`streamCountRateGroupByIDSingle`)
+  since group-by is single-dimension. Allocs/op unchanged (46) — fast path reduces map key
+  size from 32 to 4 bytes, improving throughput without changing allocation count.
 
 Back-ref: `internal/modules/executor/intrinsic_group_id_bench_test.go:BenchmarkIntrinsicCountRateGroupBy_AllocCount`
 
@@ -312,9 +315,12 @@ End-to-end allocs include fixed per-call overhead. Zero `strconv.FormatFloat` ca
 **History:**
 - Before dict-ID fast path: `FormatFloat` + string concat per span for boundary key;
   string-keyed group map lookup.
-- After (this PR): `map[histGroupIDKey]` with `struct { dims [8]uint32; boundary float64;
+- After (NOTE-074): `map[histGroupIDKey]` with `struct { dims [8]uint32; boundary float64;
   bucketIdx int64 }` key; float64 comparison safe because boundary is always power-of-2 or
   0 (SPEC-ETM-13.4).
+- After (NOTE-082): this benchmark exercises the N=1 fast path (`streamHistogramGroupByIDSingle`)
+  since group-by is single-dimension. Allocs/op unchanged (55) — fast path reduces map key
+  size from 48 to 24 bytes, improving throughput without changing allocation count.
 
 Back-ref: `internal/modules/executor/intrinsic_group_id_bench_test.go:BenchmarkIntrinsicHistogramGroupBy_AllocCount`
 
@@ -438,3 +444,27 @@ go test -bench=BenchmarkCollect_IntrinsicMaterialization -benchmem -count=3 ./in
 **What this measures:** With dual storage (block columns + intrinsic section), field access is O(1) per row. Without dual storage (PR #172 regression), each GetField triggered an O(N) scan through intrinsic column entries. The `ResultFields` sub-benchmark exercises the full materialization path with AllColumns=true.
 
 Back-ref: `internal/modules/executor/intrinsic_bench_test.go:BenchmarkCollect_IntrinsicMaterialization`
+
+---
+
+## BENCH-EX-16: BenchmarkIntrinsicCountRateGroupBy_AllocCount (N=1 path)
+*Added: 2026-04-22*
+
+NOTE-082 annotation: BENCH-EX-10 now implicitly exercises the N=1 fast path
+(`streamCountRateGroupByIDSingle`) because the query groups by a single dimension
+(`resource.service.name`). This entry documents the expected N=1 path alloc baseline
+explicitly.
+
+**Expected:** ≤46 allocs/op — same as BENCH-EX-10 baseline. The N=1 fast path reduces map
+key size (32→4 bytes) but does not change allocation count; throughput improvement is measured
+by ns/op, not allocs/op.
+
+**Run command:**
+```
+go test -bench='BenchmarkIntrinsicCountRateGroupBy_AllocCount' \
+    -benchmem -count=5 ./internal/modules/executor/
+```
+
+**Spec:** NOTE-082 — N=1 group-by fast path.
+
+Back-ref: `internal/modules/executor/intrinsic_group_id_bench_test.go:BenchmarkIntrinsicCountRateGroupBy_AllocCount`

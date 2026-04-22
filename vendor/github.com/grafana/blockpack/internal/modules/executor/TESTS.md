@@ -2741,3 +2741,78 @@ Back-ref: `internal/modules/executor/intrinsic_row_test.go:TestRowSatisfiesIntri
 - All rows: IntrinsicPresentSpanName, IntrinsicPresentServiceName, IntrinsicPresentSpanDuration bits clear.
 
 Back-ref: `internal/modules/executor/intrinsic_row_test.go:TestIdentityFieldsFromBlockColsTyped`
+
+---
+
+## EX-ETM-N1-01: TestStreamCountRateGroupByID_N1_ByteEquivalence
+*Added: 2026-04-22*
+
+**Scenario:** `streamCountRateGroupByID` with `len(dicts)==1` produces byte-identical output to the string-keyed path (`streamCountRateGroupBy`) for 6 spans × 3 service names across 2 time buckets.
+
+**Setup:** 6 spans cycling `["svc-a", "svc-b", "svc-c"]` — 3 in time bucket 0, 3 in time bucket 1. Calls `streamCountRateGroupBy` (string-keyed reference) and `streamCountRateGroupByID` (N=1 fast path) over identical data via independent readers.
+
+**Assertions:** Both produce the same bucket key set and count values (via `compareBuckets`). Verifies NOTE-082 output contract: N=1 uint32-keyed path is byte-identical to N>1 [8]uint32-keyed path for single-dimension group-by.
+
+**Spec invariants tested:** SPEC-ETM-13.1 (dict-ID fast path for N≤8 dims), NOTE-074 (byte-identical output contract).
+
+Back-ref: `internal/modules/executor/intrinsic_group_id_n1_test.go:TestStreamCountRateGroupByID_N1_ByteEquivalence`
+
+---
+
+## EX-ETM-N1-02: TestStreamCountRateGroupByID_N1_AbsentGroup
+*Added: 2026-04-22*
+
+**Scenario:** `streamCountRateGroupByID` with `len(dicts)==1` maps absent spans (`gid[0]==0`) to the empty-string group, byte-identical to the N>1 path.
+
+**Setup:** 4 spans — 2 with service.name="svc-present", 2 with service.name="" (absent sentinel). Calls both string-keyed and N=1 ID-keyed paths.
+
+**Assertions:** `compareBuckets` confirms byte-identical output. Explicit count check: `"0\x00svc-present"` bucket has count 2, `"0\x00"` bucket has count 2.
+
+**Spec invariants tested:** SPEC-ETM-13.3 (dict index 0 = empty-string sentinel).
+
+Back-ref: `internal/modules/executor/intrinsic_group_id_n1_test.go:TestStreamCountRateGroupByID_N1_AbsentGroup`
+
+---
+
+## EX-ETM-N1-03: TestStreamAggGroupByID_N1_ByteEquivalence
+*Added: 2026-04-22*
+
+**Scenario:** `streamAggGroupByID` with `len(dicts)==1` produces byte-identical output to the string-keyed aggregate path for SUM over `span:duration` with 6 spans × 3 service names across 2 time buckets.
+
+**Setup:** 6 spans cycling `["svc-d", "svc-e", "svc-f"]` and durations `[10ms, 20ms, 30ms]` — 3 in time bucket 0, 3 in time bucket 1. Calls inline string-keyed accumulation loop and `streamAggGroupByID` (N=1 path via `streamAggGroupByIDSingle`) over independent readers.
+
+**Assertions:** `compareBuckets` confirms byte-identical count and sum per bucket key.
+
+**Spec invariants tested:** SPEC-ETM-13.1 (dict-ID fast path), NOTE-082 (N=1 aggSingleGroupIDKey fast path).
+
+Back-ref: `internal/modules/executor/intrinsic_group_id_n1_test.go:TestStreamAggGroupByID_N1_ByteEquivalence`
+
+---
+
+## EX-ETM-N1-04: TestStreamHistogramGroupByID_N1_ByteEquivalence
+*Added: 2026-04-22*
+
+**Scenario:** `streamHistogramGroupByID` with `len(dicts)==1` produces byte-identical output to `streamHistogramGroupBy` (string-keyed) for 6 spans × 3 service names with two duration values (dict column encoding).
+
+**Setup:** 6 spans cycling `["svc-p", "svc-q", "svc-r"]` and durations `[10ms, 100ms]` — equal durations per service trigger dict column. Calls `streamHistogramGroupBy` (string-keyed reference) and `streamHistogramGroupByID` (N=1 path via `streamHistogramGroupByIDSingle`) over independent readers.
+
+**Assertions:** Bucket count and per-key counts identical; total bucket count == 6.
+
+**Spec invariants tested:** SPEC-ETM-13.4 (float64 boundary key is safe), NOTE-082 (histSingleGroupIDKey 24-byte key).
+
+Back-ref: `internal/modules/executor/intrinsic_group_id_n1_test.go:TestStreamHistogramGroupByID_N1_ByteEquivalence`
+
+---
+
+## EX-ETM-N1-05: TestStreamHistogramGroupByID_N1_AbsentColumn
+*Added: 2026-04-22*
+
+**Scenario:** `streamHistogramGroupByID` with nil histogram column and `len(dicts)==1` accumulates all spans into boundary-0 buckets, byte-identical to the string-keyed nil-column path.
+
+**Setup:** 4 spans with zero duration (triggers nil histogram column) cycling `["svc-nil-a", "svc-nil-b"]`. Calls `streamHistogramGroupBy` (string-keyed) and `streamHistogramGroupByID` (N=1 path via `streamHistogramGroupByIDSingle` nil-column branch) over independent readers.
+
+**Assertions:** Bucket count and per-key counts identical. All bucket keys have `__bucket` = `strconv.FormatFloat(0,'g',-1,64)`. End-to-end `ExecuteTraceMetrics` total count == 4.
+
+**Spec invariants tested:** SPEC-ETM-13.3 (absent sentinel), NOTE-082 (histSingleAbsentKey 16-byte key for nil-column path).
+
+Back-ref: `internal/modules/executor/intrinsic_group_id_n1_test.go:TestStreamHistogramGroupByID_N1_AbsentColumn`

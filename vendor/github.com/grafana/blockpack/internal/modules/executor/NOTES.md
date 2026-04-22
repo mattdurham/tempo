@@ -2594,3 +2594,37 @@ old map's `!ok` case. For bytes columns specifically, the getter returns `(nil, 
 **Back-ref:** `internal/modules/executor/stream_structural.go:collectBlockStructuralSpanRecs`
 **Back-ref:** `internal/modules/executor/stream_structural.go:computeNodeMatchForRow`
 **Back-ref:** `internal/modules/executor/predicates.go:rowSatisfiesIntrinsicNodesTyped`
+
+---
+
+## NOTE-082: N=1 group-by fast path — uint32 map key instead of [8]uint32 (2026-04-22)
+
+**Decision:** When `len(dicts)==1` (single group-by dimension), `streamCountRateGroupByID`,
+`streamAggGroupByID`, and `streamHistogramGroupByID` dispatch to helper functions
+(`streamCountRateGroupByIDSingle`, `streamAggGroupByIDSingle`, `streamHistogramGroupByIDSingle`) that use
+`uint32`/compact struct keys instead of `groupIDKey = [8]uint32` / `aggGroupIDKey` / `histGroupIDKey`.
+
+**Rationale:** For N=1, only `gid[0]` is ever non-zero. Using the full `[8]uint32` key wastes
+28 bytes of memcmp per map probe. Go's `mapaccess2_fast32` (for uint32 keys) is ~3x faster than
+the generic path taken for 32-byte array keys. The primary production queries (span:kind,
+span:status, resource.service.name) are all N=1. N>1 retains the existing [8]uint32 path.
+
+**Key type reductions:**
+- `streamCountRateGroupByIDSingle`: `uint32` (4 bytes) vs `groupIDKey = [8]uint32` (32 bytes)
+- `streamAggGroupByIDSingle`: `aggSingleGroupIDKey{bucketIdx int64, dictIdx uint32}` (16 bytes) vs `aggGroupIDKey` (40 bytes)
+- `streamHistogramGroupByIDSingle`: `histSingleGroupIDKey{dictIdx uint32, boundary float64, bucketIdx int64}` (24 bytes) vs `histGroupIDKey` (48 bytes)
+- nil-column path: `histSingleAbsentKey{bucketIdx int64, dictIdx uint32}` (16 bytes) vs `histGroupIDKey` (48 bytes)
+
+**Output contract:** Byte-identical to the N>1 path — `resolveGroupIDKey` is called with a
+zero-valued `[8]uint32` that has only `key[0]` set, which produces the same string as the N>1
+path for N=1 inputs.
+
+**Scope:** Only the three stream functions in `metrics_trace_intrinsic.go`. `buildGroupIDMap`
+and `resolveGroupIDKey` are unchanged.
+
+**Back-ref:** `internal/modules/executor/metrics_trace_intrinsic.go:streamCountRateGroupByID`
+**Back-ref:** `internal/modules/executor/metrics_trace_intrinsic.go:streamCountRateGroupByIDSingle`
+**Back-ref:** `internal/modules/executor/metrics_trace_intrinsic.go:streamAggGroupByID`
+**Back-ref:** `internal/modules/executor/metrics_trace_intrinsic.go:streamAggGroupByIDSingle`
+**Back-ref:** `internal/modules/executor/metrics_trace_intrinsic.go:streamHistogramGroupByID`
+**Back-ref:** `internal/modules/executor/metrics_trace_intrinsic.go:streamHistogramGroupByIDSingle`
