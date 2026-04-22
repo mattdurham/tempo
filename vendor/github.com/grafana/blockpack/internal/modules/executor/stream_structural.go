@@ -32,7 +32,7 @@ type StructuralResult struct {
 // The algorithm runs in three phases:
 //  1. Collect span records (spanID, parentID, nodeMatch bitmask) from every block.
 //  2. Resolve parentID references to local indices within each trace.
-//  3. Evaluate the structural operator per trace; emit matching right-side spans.
+//  3. Evaluate the structural operators per trace across the chain; emit matching terminal-node spans.
 //
 // All blocks are scanned — structural queries cannot use bloom or range pruning because
 // any block may contain spans from either side of the operator.
@@ -224,9 +224,10 @@ func collectBlockStructuralSpanRecs(
 		nodesList = collectStructuralIntrinsicNodes(programs, intrinsicWant)
 	}
 
-	// Resolve identity fields. For files with an intrinsic section, use lookupIntrinsicFields.
+	// Resolve identity fields. For files with an intrinsic section, use lookupIntrinsicFieldsTyped.
 	// For legacy files, read identity columns directly from decoded block columns.
-	var idFields []map[string]any
+	// NOTE-081: typed struct eliminates per-row map allocations in the structural hot path.
+	var idFields []intrinsicRowFields
 	if hasIntrinsic {
 		allRefs := make([]modules_shared.BlockRef, n)
 		for i := range n {
@@ -236,45 +237,33 @@ func collectBlockStructuralSpanRecs(
 			}
 		}
 		var intrinsicErr error
-		idFields, intrinsicErr = lookupIntrinsicFields(r, allRefs, intrinsicWant)
+		idFields, intrinsicErr = lookupIntrinsicFieldsTyped(r, allRefs, intrinsicWant)
 		if intrinsicErr != nil {
-			return fmt.Errorf("structural lookupIntrinsicFields block %d: %w", blockIdx, intrinsicErr)
+			return fmt.Errorf("structural lookupIntrinsicFieldsTyped block %d: %w", blockIdx, intrinsicErr)
 		}
 	} else {
-		idFields = identityFieldsFromBlockCols(bwb.Block, n)
+		idFields = identityFieldsFromBlockColsTyped(bwb.Block, n)
 	}
 
 	for rowIdx := range n {
-		fields := idFields[rowIdx]
-		if fields == nil {
+		row := &idFields[rowIdx]
+		if row.present&intrinsicPresentTraceID == 0 {
 			continue
 		}
-		tidRaw, ok := fields["trace:id"]
-		if !ok {
-			continue
-		}
-		tidBytes, ok := tidRaw.([]byte)
-		if !ok || len(tidBytes) != 16 {
-			continue
-		}
-		var traceID [16]byte
-		copy(traceID[:], tidBytes)
+		traceID := row.traceID
 
+		// storeTypedField already cloned spanID and parentID bytes; assign directly.
 		var spanIDBytes []byte
-		if sidRaw, ok2 := fields["span:id"]; ok2 {
-			if b, ok3 := sidRaw.([]byte); ok3 && len(b) > 0 {
-				spanIDBytes = append([]byte(nil), b...)
-			}
+		if row.present&intrinsicPresentSpanID != 0 && len(row.spanID) > 0 {
+			spanIDBytes = row.spanID
 		}
 
 		var parentIDBytes []byte
-		if pidRaw, ok2 := fields["span:parent_id"]; ok2 {
-			if b, ok3 := pidRaw.([]byte); ok3 && len(b) > 0 {
-				parentIDBytes = append([]byte(nil), b...)
-			}
+		if row.present&intrinsicPresentParentID != 0 && len(row.parentID) > 0 {
+			parentIDBytes = row.parentID
 		}
 
-		nodeMatch := computeNodeMatchForRow(sets, nodesList, hasIntrinsic, fields, rowIdx)
+		nodeMatch := computeNodeMatchForRow(sets, nodesList, hasIntrinsic, row, rowIdx)
 
 		rec := structuralSpanRec{
 			spanID:    spanIDBytes,
@@ -322,11 +311,12 @@ func evaluateStructuralPrograms(
 
 // computeNodeMatchForRow computes the nodeMatch bitmask for a single row.
 // Bit i is set if sets[i] contains rowIdx and (if hasIntrinsic) the intrinsic nodes pass.
+// NOTE-081: accepts *intrinsicRowFields (typed) to avoid per-row map allocations.
 func computeNodeMatchForRow(
 	sets []vm.RowSet,
 	nodesList [][]vm.RangeNode,
 	hasIntrinsic bool,
-	fields map[string]any,
+	row *intrinsicRowFields,
 	rowIdx int,
 ) uint8 {
 	var nodeMatch uint8
@@ -336,7 +326,7 @@ func computeNodeMatchForRow(
 		}
 		passes := true
 		if hasIntrinsic && len(nodesList) > i && len(nodesList[i]) > 0 {
-			passes = rowSatisfiesIntrinsicNodes(nodesList[i], fields)
+			passes = rowSatisfiesIntrinsicNodesTyped(nodesList[i], row)
 		}
 		if passes {
 			nodeMatch |= 1 << uint(i) //nolint:gosec // safe: i bounded by len(programs) <= 8
@@ -356,37 +346,6 @@ func collectStructuralIntrinsicNodes(programs []*vm.Program, want map[string]str
 		}
 	}
 	return nodesList
-}
-
-// identityFieldsFromBlockCols builds a per-row identity field map by reading
-// trace:id, span:id, and span:parent_id directly from block columns.
-// Used as a fallback for legacy files that have no intrinsic TOC section.
-func identityFieldsFromBlockCols(block *modules_reader.Block, n int) []map[string]any {
-	traceCol := block.GetColumn("trace:id")
-	spanCol := block.GetColumn("span:id")
-	parentCol := block.GetColumn("span:parent_id")
-	out := make([]map[string]any, n)
-	for rowIdx := range n {
-		fields := make(map[string]any, 3)
-		appendBytesField(fields, "trace:id", traceCol, rowIdx)
-		appendBytesField(fields, "span:id", spanCol, rowIdx)
-		appendBytesField(fields, "span:parent_id", parentCol, rowIdx)
-		if len(fields) > 0 {
-			out[rowIdx] = fields
-		}
-	}
-	return out
-}
-
-// appendBytesField reads a bytes value from col at rowIdx and stores a copy in fields[key].
-// No-ops when col is nil or the value is absent/empty.
-func appendBytesField(fields map[string]any, key string, col *modules_reader.Column, rowIdx int) {
-	if col == nil {
-		return
-	}
-	if v, ok := col.BytesValue(rowIdx); ok && len(v) > 0 {
-		fields[key] = append([]byte(nil), v...)
-	}
 }
 
 // allMatchSet is a RowSet that matches every row index in [0, n).
@@ -555,10 +514,10 @@ func evalOpChildStruct(spans []structuralSpanRec) []int {
 	return result
 }
 
-// evalOpSiblingStruct: R shares a parent with a leftMatch span (~), R != L.
-// A span qualifies as R if it has at least one left-matching sibling OTHER than itself.
-// Using a count map handles the case where R also matches L (both sides): it qualifies
-// when a distinct second left-matching span shares the same parent.
+// evalOpSiblingStruct: node 1 (nodeMatch&0x02) shares a parent with a node 0 (nodeMatch&0x01) span (~), R != L.
+// A span qualifies as R if it has at least one node-0-matching sibling OTHER than itself.
+// Using a count map handles the case where R also matches node 0 (both sides): it qualifies
+// when a distinct second node-0-matching span shares the same parent.
 func evalOpSiblingStruct(spans []structuralSpanRec) []int {
 	leftCounts := make(map[int]int)
 	for _, sp := range spans {
@@ -612,7 +571,8 @@ func evalOpParentStruct(spans []structuralSpanRec) []int {
 	return result
 }
 
-// evalOpNotSiblingStruct: R is rightMatch with no leftMatch sibling (!~).
+// evalOpNotSiblingStruct: a span with node 1 bit set (nodeMatch&0x02) qualifies when
+// no span with node 0 bit set (nodeMatch&0x01) shares its parent (!~).
 func evalOpNotSiblingStruct(spans []structuralSpanRec) []int {
 	leftParents := make(map[int]struct{})
 	for _, sp := range spans {
@@ -629,8 +589,9 @@ func evalOpNotSiblingStruct(spans []structuralSpanRec) []int {
 	return result
 }
 
-// SPEC-STRUCT-6: evalOpNotDescendantStruct: R is rightMatch but NOT a descendant of any leftMatch span (!>>).
-// Walk R's ancestor chain; if no ancestor is leftMatch, emit R.
+// SPEC-STRUCT-6: evalOpNotDescendantStruct: a span with node 1 bit set (nodeMatch&0x02) qualifies when
+// none of its ancestors has the node 0 bit set (nodeMatch&0x01) (!>>).
+// Walk the span's ancestor chain; if no ancestor carries node 0, emit the span.
 func evalOpNotDescendantStruct(spans []structuralSpanRec) []int {
 	leftSet := make(map[int]struct{})
 	for i, sp := range spans {
@@ -659,8 +620,9 @@ func evalOpNotDescendantStruct(spans []structuralSpanRec) []int {
 	return result
 }
 
-// SPEC-STRUCT-7: evalOpNotChildStruct: R is rightMatch but its direct parent is NOT leftMatch (!>).
-// R qualifies if it has no parent, or its parent is not leftMatch.
+// SPEC-STRUCT-7: evalOpNotChildStruct: a span with node 1 bit set (nodeMatch&0x02) qualifies when
+// its direct parent does not have the node 0 bit set (nodeMatch&0x01) (!>).
+// A span with no parent also qualifies.
 func evalOpNotChildStruct(spans []structuralSpanRec) []int {
 	result := make([]int, 0, len(spans))
 	for ri, r := range spans {

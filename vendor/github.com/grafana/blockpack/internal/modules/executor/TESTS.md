@@ -2601,3 +2601,143 @@ there is no descendant of child2 that matches node 2 (svc-leaf). Only grandchild
 the full chain: root(svc-root) >> child1(svc-child) >> grandchild(svc-leaf).
 
 Back-ref: `internal/modules/executor/stream_structural_test.go:TestExecuteStructural_ThreeNodeChain`
+
+---
+
+## EX-CP-14: TestIntrinsicRowFields_IdentityOnly
+*Added: 2026-04-21*
+
+**Scenario:** lookupIntrinsicFieldsTyped populates traceID, spanID, and parentID when wantCols contains only identity columns.
+
+**Setup:** 3-span 2-block file (span0/span2 in block 0 with no parent; span1 in block 1 with parent=span0).
+
+**Assertions:**
+- Block 0 rows: traceID present bit set, TraceID non-zero, parentID present bit clear.
+- Block 1 row 0: parentID present bit set, ParentID bytes non-empty.
+
+Back-ref: `internal/modules/executor/intrinsic_row_test.go:TestIntrinsicRowFields_IdentityOnly`
+
+---
+
+## EX-CP-15: TestIntrinsicRowFields_ExtraPredicateColumns
+*Added: 2026-04-21*
+
+**Scenario:** span:duration and resource.service.name are populated when included in wantCols.
+
+**Setup:** Same 3-span 2-block file; wantCols includes span:duration and resource.service.name.
+
+**Assertions:**
+- Block 0 rows: spanDuration present, span0 duration > span2 duration (200ms vs 50ms), serviceName="svc-a" for both.
+- Block 1 row 0: spanDuration present, serviceName="svc-b".
+
+Back-ref: `internal/modules/executor/intrinsic_row_test.go:TestIntrinsicRowFields_ExtraPredicateColumns`
+
+---
+
+## EX-CP-16: TestIntrinsicRowFields_AbsentField
+*Added: 2026-04-21*
+
+**Scenario:** A column NOT in wantCols has its present bit clear and a zero value.
+
+**Setup:** Same file; wantCols contains only identity columns (no span:kind or span:duration).
+
+**Assertions:** Block 0 rows: IntrinsicPresentSpanKind and IntrinsicPresentSpanDuration bits clear; SpanKind and SpanDuration both zero.
+
+Back-ref: `internal/modules/executor/intrinsic_row_test.go:TestIntrinsicRowFields_AbsentField`
+
+---
+
+## EX-CP-17: TestRowSatisfiesIntrinsicNodesTyped_EqualityMatch
+*Added: 2026-04-21*
+
+**Scenario:** Equality predicates on span:name, span:kind, and resource.service.name via rowSatisfiesIntrinsicNodesTyped.
+
+**Setup:** Same 3-span file; wantCols includes span:name, span:kind, resource.service.name. Block 0: span0 (svc-a, op-alpha, server), span2 (svc-a, op-gamma, internal). Block 1: span1 (svc-b, op-beta, client).
+
+**Assertions:**
+- span:name="op-alpha" → span0 true, span2 false.
+- resource.service.name="svc-a" → both block-0 rows true.
+- resource.service.name="svc-b" → span1 true, span0 false.
+- span:kind=server → span0 true, span2 false.
+
+Back-ref: `internal/modules/executor/intrinsic_row_test.go:TestRowSatisfiesIntrinsicNodesTyped_EqualityMatch`
+
+---
+
+## EX-CP-18: TestRowSatisfiesIntrinsicNodesTyped_RangeMatch
+*Added: 2026-04-21*
+
+**Scenario:** Range predicates on span:duration via rowSatisfiesIntrinsicNodesTyped.
+
+**Setup:** Same 3-span file; wantCols includes span:duration and span:start. Block 0: span0 (200ms), span2 (50ms). Block 1: span1 (100ms).
+
+**Assertions:**
+- duration>150ms → span0 true, span2 false.
+- duration>=200ms → span0 true, span2 false.
+- duration>=100ms → span1 true.
+
+Back-ref: `internal/modules/executor/intrinsic_row_test.go:TestRowSatisfiesIntrinsicNodesTyped_RangeMatch`
+
+---
+
+## EX-CP-19: TestRowSatisfiesIntrinsicNodesTyped_AbsentField
+*Added: 2026-04-21*
+
+**Scenario:** An absent field (present bit clear) satisfies only "is null" predicates and fails value/range predicates — matching old map behavior.
+
+**Setup:** Manually constructed row with only traceID present (spanDuration, spanName absent).
+
+**Assertions:**
+- duration>0 on row without duration present → false.
+- span:name="anything" on row without spanName present → false.
+- duration>0 on row with duration=200ms present → true.
+
+Back-ref: `internal/modules/executor/intrinsic_row_test.go:TestRowSatisfiesIntrinsicNodesTyped_AbsentField`
+
+---
+
+## EX-CP-20: TestRowSatisfiesIntrinsicNodesTyped_ORComposite
+*Added: 2026-04-21*
+
+**Scenario:** OR semantics match old rowSatisfiesIntrinsicNodes (map-based) behavior.
+
+**Setup:** Same 3-span file; wantCols includes span:name and resource.service.name.
+
+**Assertions:**
+- OR([svc-a match, svc-z fail]) → true for span0, span2; false for span1 (svc-b).
+- OR([svc-z fail, svc-b match]) → false for span0; true for span1.
+- Typed OR result matches map-based OR result for all 3 rows.
+
+Back-ref: `internal/modules/executor/intrinsic_row_test.go:TestRowSatisfiesIntrinsicNodesTyped_ORComposite`
+
+---
+
+## EX-CP-21: TestRowSatisfiesIntrinsicNodesORTyped_DirectOR
+*Added: 2026-04-21*
+
+**Scenario:** Directly exercises RowSatisfiesIntrinsicNodesORTypedForTest to verify OR-node semantics without round-trip through lookupIntrinsicFieldsTyped.
+
+**Setup:** Manually constructed row with spanName="op-alpha" and serviceName="svc-a" present.
+
+**Assertions:**
+- OR([span:name="op-alpha" match]) → true.
+- OR([span:name="op-beta" fail]) → false.
+- OR([resource.service.name="svc-a" match]) → true.
+- OR on row with absent spanName → false.
+
+Back-ref: `internal/modules/executor/intrinsic_row_test.go:TestRowSatisfiesIntrinsicNodesORTyped_DirectOR`
+
+---
+
+## EX-CP-22: TestIdentityFieldsFromBlockColsTyped
+*Added: 2026-04-21*
+
+**Scenario:** identityFieldsFromBlockColsTyped returns correct typed rows for a block with identity columns; non-identity fields are not populated.
+
+**Setup:** Same 3-span file; GetBlockWithBytes on block 0 with identity wantCols.
+
+**Assertions:**
+- All rows: traceID present bit set, TraceID non-zero.
+- All rows: IntrinsicPresentSpanName, IntrinsicPresentServiceName, IntrinsicPresentSpanDuration bits clear.
+
+Back-ref: `internal/modules/executor/intrinsic_row_test.go:TestIdentityFieldsFromBlockColsTyped`

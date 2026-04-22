@@ -2210,3 +2210,240 @@ func intrinsicFlatMatchRefs(
 	copy(result, col.BlockRefs[start:start+count])
 	return result
 }
+
+// rowSatisfiesIntrinsicNodesTyped evaluates intrinsic-column leaf nodes from the predicate
+// tree against a typed intrinsicRowFields row (structural hot path).
+// Only leaf nodes whose Column is in traceIntrinsicColumns are checked; composite nodes
+// preserve AND/OR semantics. Returns true when the row satisfies all constraints.
+func rowSatisfiesIntrinsicNodesTyped(nodes []vm.RangeNode, row *intrinsicRowFields) bool {
+	for _, n := range nodes {
+		if n.Column != "" {
+			if _, isIntrinsic := traceIntrinsicColumns[n.Column]; !isIntrinsic {
+				continue
+			}
+			if !intrinsicLeafMatchTyped(n, row) {
+				return false
+			}
+			continue
+		}
+		if n.IsOR {
+			if !rowSatisfiesIntrinsicNodesORTyped(n.Children, row) {
+				return false
+			}
+		} else {
+			if !rowSatisfiesIntrinsicNodesTyped(n.Children, row) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// rowSatisfiesIntrinsicNodesORTyped returns true when any child in the OR group
+// satisfies the intrinsic constraints for the typed row.
+func rowSatisfiesIntrinsicNodesORTyped(nodes []vm.RangeNode, row *intrinsicRowFields) bool {
+	hadConstrainedChild := false
+	for _, n := range nodes {
+		if n.Column != "" {
+			_, isIntrinsic := traceIntrinsicColumns[n.Column]
+			if !isIntrinsic {
+				continue
+			}
+			hadConstrainedChild = true
+			if intrinsicLeafMatchTyped(n, row) {
+				return true
+			}
+			continue
+		}
+		hadConstrainedChild = true
+		if n.IsOR {
+			if rowSatisfiesIntrinsicNodesORTyped(n.Children, row) {
+				return true
+			}
+		} else {
+			if rowSatisfiesIntrinsicNodesTyped(n.Children, row) {
+				return true
+			}
+		}
+	}
+	return !hadConstrainedChild
+}
+
+// intrinsicLeafMatchTyped evaluates a single leaf RangeNode against a typed row.
+// Uses type-group getter helpers to keep cyclomatic complexity low.
+func intrinsicLeafMatchTyped(n vm.RangeNode, row *intrinsicRowFields) bool {
+	// Try bytes-typed fields (trace:id, span:id, span:parent_id).
+	// Bytes getter returns (nil, true) for absent known bytes column — handled by matchIntrinsicBytesField.
+	if bval, present := intrinsicLeafGetBytesTyped(n.Column, row); present {
+		return matchIntrinsicBytesField(bval, n)
+	}
+	// Try uint64-typed fields (span:start, span:end, span:duration).
+	if uval, present := intrinsicLeafGetUint64Typed(n.Column, row); present {
+		if len(n.Values) > 0 {
+			for _, v := range n.Values {
+				if intrinsicValuesMatch(uval, v) {
+					return true
+				}
+			}
+			return false
+		}
+		if n.Min != nil || n.Max != nil {
+			return intrinsicRangeMatch(uval, n)
+		}
+		if n.Pattern != "" {
+			return false // pattern predicates are meaningless on numeric columns
+		}
+		return true
+	}
+	// Try int64-typed fields (span:kind, span:status).
+	if ival, present := intrinsicLeafGetInt64Typed(n.Column, row); present {
+		if len(n.Values) > 0 {
+			for _, v := range n.Values {
+				if intrinsicValuesMatch(ival, v) {
+					return true
+				}
+			}
+			return false
+		}
+		if n.Min != nil || n.Max != nil {
+			return intrinsicRangeMatch(ival, n)
+		}
+		if n.Pattern != "" {
+			return false // pattern predicates are meaningless on numeric columns
+		}
+		return true
+	}
+	// Try string-typed fields (span:name, resource.service.name, span:status_message).
+	if sval, present := intrinsicLeafGetStringTyped(n.Column, row); present {
+		if len(n.Values) > 0 {
+			for _, v := range n.Values {
+				if intrinsicValuesMatch(sval, v) {
+					return true
+				}
+			}
+			return false
+		}
+		if n.Min != nil || n.Max != nil {
+			return intrinsicRangeMatch(sval, n)
+		}
+		if n.Pattern != "" {
+			re, err := cachedRegexCompile(n.Pattern)
+			if err != nil {
+				return false
+			}
+			return re.MatchString(sval)
+		}
+		return true
+	}
+	// Column not in any type group (unknown intrinsic): absent-field logic.
+	return len(n.Values) == 0 && n.Min == nil && n.Max == nil && n.Pattern == ""
+}
+
+// matchIntrinsicBytesField evaluates a bytes field (nil = absent) against a predicate node.
+// Range (Min/Max) and pattern predicates are meaningless for bytes columns and return false
+// when bval is present, to avoid silently accepting unchecked constraints.
+func matchIntrinsicBytesField(bval []byte, n vm.RangeNode) bool {
+	if bval == nil {
+		return len(n.Values) == 0 && n.Min == nil && n.Max == nil && n.Pattern == ""
+	}
+	// Range or pattern constraints on a bytes column can never be satisfied.
+	if n.Min != nil || n.Max != nil || n.Pattern != "" {
+		return false
+	}
+	if len(n.Values) > 0 {
+		for _, v := range n.Values {
+			if intrinsicValuesMatch(bval, v) {
+				return true
+			}
+		}
+		return false
+	}
+	return true // present, no constraint → match-all
+}
+
+// intrinsicLeafGetBytesTyped returns the bytes value and ok=true for bytes-typed columns.
+// Returns nil bytes with ok=true when the field is known but absent (present-bit clear).
+// Returns ok=false when the column is not a bytes-typed intrinsic column.
+func intrinsicLeafGetBytesTyped(col string, row *intrinsicRowFields) ([]byte, bool) {
+	switch col {
+	case colNameTraceID:
+		if row.present&intrinsicPresentTraceID == 0 {
+			return nil, true
+		}
+		return row.traceID[:], true
+	case colNameSpanID:
+		if row.present&intrinsicPresentSpanID == 0 {
+			return nil, true
+		}
+		return row.spanID, true
+	case colNameParentID:
+		if row.present&intrinsicPresentParentID == 0 {
+			return nil, true
+		}
+		return row.parentID, true
+	}
+	return nil, false
+}
+
+// intrinsicLeafGetUint64Typed returns the uint64 value and ok=true for uint64 columns.
+// Returns ok=false when the column is absent or not a uint64 intrinsic column.
+func intrinsicLeafGetUint64Typed(col string, row *intrinsicRowFields) (uint64, bool) {
+	switch col {
+	case colNameSpanStart:
+		if row.present&intrinsicPresentSpanStart == 0 {
+			return 0, false
+		}
+		return row.spanStart, true
+	case colNameSpanEnd:
+		if row.present&intrinsicPresentSpanEnd == 0 {
+			return 0, false
+		}
+		return row.spanEnd, true
+	case colNameSpanDuration:
+		if row.present&intrinsicPresentSpanDuration == 0 {
+			return 0, false
+		}
+		return row.spanDuration, true
+	}
+	return 0, false
+}
+
+// intrinsicLeafGetInt64Typed returns the int64 value and ok=true for int64 columns.
+func intrinsicLeafGetInt64Typed(col string, row *intrinsicRowFields) (int64, bool) {
+	switch col {
+	case colNameSpanKind:
+		if row.present&intrinsicPresentSpanKind == 0 {
+			return 0, false
+		}
+		return row.spanKind, true
+	case colNameSpanStatus:
+		if row.present&intrinsicPresentSpanStatus == 0 {
+			return 0, false
+		}
+		return row.spanStatus, true
+	}
+	return 0, false
+}
+
+// intrinsicLeafGetStringTyped returns the string value and ok=true for string columns.
+// Returns ok=false when the column is absent or not a string intrinsic column.
+func intrinsicLeafGetStringTyped(col string, row *intrinsicRowFields) (string, bool) {
+	switch col {
+	case colNameSpanName:
+		if row.present&intrinsicPresentSpanName == 0 {
+			return "", false
+		}
+		return row.spanName, true
+	case colNameServiceName:
+		if row.present&intrinsicPresentServiceName == 0 {
+			return "", false
+		}
+		return row.serviceName, true
+	case colNameStatusMessage:
+		if row.present&intrinsicPresentStatusMessage == 0 {
+			return "", false
+		}
+		return row.statusMessage, true
+	}
+	return "", false
+}
