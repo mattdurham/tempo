@@ -281,6 +281,10 @@ context). Zero per-span string allocations in the `streamCountRateGroupByID` hot
 - After (NOTE-082): this benchmark exercises the N=1 fast path (`streamCountRateGroupByIDSingle`)
   since group-by is single-dimension. Allocs/op unchanged (46) — fast path reduces map key
   size from 32 to 4 bytes, improving throughput without changing allocation count.
+- After (NOTE-085): `streamCountRateGroupByIDSingle` now uses `[][]int64` slice accumulator
+  instead of `map[uint32][]int64`. Allocs/op expected to decrease (pre-allocated slices
+  replace per-group lazy map insertions); throughput improvement expected on M5 files (~150M
+  map probes eliminated per file).
 
 Back-ref: `internal/modules/executor/intrinsic_group_id_bench_test.go:BenchmarkIntrinsicCountRateGroupBy_AllocCount`
 

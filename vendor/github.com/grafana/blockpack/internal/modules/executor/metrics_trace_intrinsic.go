@@ -167,7 +167,7 @@ func executeTraceMetricsIntrinsic(
 		if len(keyToBucket) == 0 {
 			return &TraceMetricsResult{}, true, nil
 		}
-		if err := accumulateIntrinsicBuckets(ctx, r, keyToBucket, querySpec, buckets); err != nil {
+		if err := accumulateIntrinsicBuckets(ctx, r, keyToBucket, inRangeRefs, inRangeVals, querySpec, buckets); err != nil {
 			return nil, false, err
 		}
 	}
@@ -376,6 +376,8 @@ func accumulateIntrinsicBuckets(
 	ctx context.Context,
 	r *modules_reader.Reader,
 	keyToBucket map[uint32]int64,
+	inRangeRefs []modules_shared.BlockRef,
+	inRangeVals []uint64,
 	querySpec *vm.QuerySpec,
 	buckets map[string]*aggBucketState,
 ) error {
@@ -388,20 +390,39 @@ func accumulateIntrinsicBuckets(
 		return streamAggColumnNoGroupBy(r, agg, keyToBucket, buckets)
 	}
 
-	// NOTE-082: N=1 fast path — buildGroupIDMapSingle returns map[uint32]uint32 (pk → dictIdx),
-	// skipping the [8]uint32 wrapper so *Single helpers use mapaccess2_fast32 for the build phase too.
+	// NOTE-085: N=1 count/rate ref-slice path — zero map lookups in the hot accumulation loop.
+	// For dict-format columns, build a dictIdxForRef []uint32 parallel to inRangeRefs, then
+	// iterate refs sequentially (no map probes) to accumulate into [][]int64 by dictIdx.
+	if len(agg.GroupBy) == 1 && isCountRate {
+		tb := querySpec.TimeBucketing
+		numSteps := (tb.EndTime - tb.StartTime + tb.StepSizeNanos - 1) / tb.StepSizeNanos
+		if numSteps <= 0 {
+			return nil
+		}
+		col, err := r.GetIntrinsicColumn(agg.GroupBy[0])
+		if err != nil {
+			return err
+		}
+		if col == nil || col.Format == modules_shared.IntrinsicFormatDict {
+			dictIdxForRef, dict, buildErr := buildDictIdxForRefs(col, agg.GroupBy[0], inRangeRefs)
+			if buildErr != nil {
+				return buildErr
+			}
+			return streamCountRateByRefSlice(ctx, inRangeRefs, inRangeVals, dictIdxForRef, dict, numSteps, tb, buckets)
+		}
+		// Flat-format fallback: use existing two-pass path.
+		groupIDMap1, dict, ferr := buildGroupIDMapSingle(r, agg.GroupBy[0], keyToBucket)
+		if ferr != nil {
+			return ferr
+		}
+		return streamCountRateGroupByIDSingle(ctx, keyToBucket, groupIDMap1, dict, numSteps, buckets)
+	}
+
+	// NOTE-082: N=1 non-count/rate fast path.
 	if len(agg.GroupBy) == 1 {
 		groupIDMap1, dict, err := buildGroupIDMapSingle(r, agg.GroupBy[0], keyToBucket)
 		if err != nil {
 			return err
-		}
-		if isCountRate {
-			tb := querySpec.TimeBucketing
-			numSteps := (tb.EndTime - tb.StartTime + tb.StepSizeNanos - 1) / tb.StepSizeNanos
-			if numSteps <= 0 {
-				return nil
-			}
-			return streamCountRateGroupByIDSingle(ctx, keyToBucket, groupIDMap1, dict, numSteps, buckets)
 		}
 		if agg.Function == vm.FuncNameHISTOGRAM {
 			return streamHistogramGroupByIDSingle(ctx, r, agg.Field, keyToBucket, groupIDMap1, dict, buckets)
@@ -809,6 +830,126 @@ func buildGroupIDMapSingle(
 	return colMap, dict, nil
 }
 
+// buildDictIdxForRefs builds a []uint32 parallel to inRangeRefs by scanning the group-by
+// column's dict entries into a dense array indexed by packKey. packKey fits in ~4MB
+// (15 blocks × 65536 spans × 4 bytes), so all array ops are L3-cache-resident — far faster
+// than probing a 150M-entry hash map.
+// NOTE-085: replaces hash map ops with direct array access; zero map lookups in the hot path.
+func buildDictIdxForRefs(
+	col *modules_shared.IntrinsicColumn,
+	colName string,
+	inRangeRefs []modules_shared.BlockRef,
+) ([]uint32, []string, error) {
+	dictIdxForRef := make([]uint32, len(inRangeRefs))
+	dict := []string{""}
+	if col == nil || col.Format != modules_shared.IntrinsicFormatDict {
+		return dictIdxForRef, dict, nil
+	}
+
+	// Find the max packKey to size the dense array. packKey = (blockIdx<<16)|rowIdx.
+	var maxPK uint32
+	for _, ref := range inRangeRefs {
+		if pk := packKey(ref.BlockIdx, ref.RowIdx); pk > maxPK {
+			maxPK = pk
+		}
+	}
+	if maxPK == 0 {
+		return dictIdxForRef, dict, nil
+	}
+	// Dense array: dictByPK[pk] = dictIdx+1 (0 = absent sentinel).
+	dictByPK := make([]uint32, maxPK+1) //nolint:gosec
+
+	// Scan ALL dict entries → array writes (cache-friendly: array fits in L3).
+	for _, entry := range col.DictEntries {
+		val := entry.Value
+		if val == "" {
+			val = intrinsicInt64ColToString(colName, entry.Int64Val)
+		}
+		if val == "" {
+			continue
+		}
+		dictIdx := uint32(len(dict)) //nolint:gosec
+		dictAssigned := false
+		for _, ref := range entry.BlockRefs {
+			pk := packKey(ref.BlockIdx, ref.RowIdx)
+			if pk <= maxPK {
+				if !dictAssigned {
+					dict = append(dict, val)
+					dictAssigned = true
+				}
+				dictByPK[pk] = dictIdx + 1 // +1 so 0 means absent
+			}
+		}
+	}
+
+	// Single pass: array read per ref — zero hash map lookups.
+	for i, ref := range inRangeRefs {
+		pk := packKey(ref.BlockIdx, ref.RowIdx)
+		if raw := dictByPK[pk]; raw > 0 {
+			dictIdxForRef[i] = raw - 1
+		}
+		// else: absent, leave dictIdxForRef[i]=0 (empty-string group)
+	}
+	return dictIdxForRef, dict, nil
+}
+
+// streamCountRateByRefSlice accumulates count/rate into [][]int64 indexed by dictIdx,
+// iterating inRangeRefs sequentially with zero map lookups in the hot loop.
+// NOTE-085: replaces groupIDMap[pk] probe with direct array access dictIdxForRef[i].
+func streamCountRateByRefSlice(
+	ctx context.Context,
+	inRangeRefs []modules_shared.BlockRef,
+	inRangeVals []uint64,
+	dictIdxForRef []uint32,
+	dict []string,
+	numSteps int64,
+	tb vm.TimeBucketSpec,
+	buckets map[string]*aggBucketState,
+) error {
+	// Pre-allocate all count slices indexed by dictIdx.
+	groupCounts := make([][]int64, len(dict))
+	for i := range groupCounts {
+		groupCounts[i] = make([]int64, numSteps)
+	}
+	// Hot loop: zero map lookups — sequential array access only.
+	for i := range inRangeRefs {
+		if i%ctxCheckInterval == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+		bucketIdx := timeBucketIndex(int64(inRangeVals[i]), tb.StartTime, tb.StepSizeNanos) //nolint:gosec
+		if bucketIdx >= 0 && bucketIdx < numSteps {
+			groupCounts[dictIdxForRef[i]][bucketIdx]++
+		}
+	}
+	// Emit: resolve dictIdx → label string.
+	for dictIdx, counts := range groupCounts {
+		hasAny := false
+		for _, c := range counts {
+			if c > 0 {
+				hasAny = true
+				break
+			}
+		}
+		if !hasAny {
+			continue
+		}
+		gk := ""
+		if dictIdx < len(dict) { //nolint:gosec
+			gk = dict[dictIdx]
+		}
+		for bucketIdx, c := range counts {
+			if c == 0 {
+				continue
+			}
+			k := strconv.FormatInt(int64(bucketIdx), 10) + "\x00" + gk //nolint:gosec
+			intrinsicGetOrCreateBucket(buckets, k).count += c
+		}
+	}
+	return nil
+}
+
 // resolveGroupIDKey resolves a groupIDKey back to the composite string group key
 // using the per-dimension dicts. The format is identical to buildGroupKeyMap output:
 // values joined by "\x00" separators, matching traceBuildDenseSeries expectations.
@@ -1122,8 +1263,9 @@ func streamCountRateGroupByID(
 }
 
 // streamCountRateGroupByIDSingle is the N=1 helper for streamCountRateGroupByID.
-// Uses map[uint32][]int64 (gid[0] directly) instead of map[groupIDKey][]int64.
-// NOTE-082: eliminates 32-byte memcmp on [8]uint32 keys; Go uses mapaccess2_fast32 for uint32 keys.
+// Uses [][]int64 indexed by dictIdx instead of map[uint32][]int64.
+// NOTE-082: uint32 key (vs [8]uint32) reduced memcmp cost.
+// NOTE-085: slice accumulator eliminates groupCounts map probe (150M/file for M5).
 func streamCountRateGroupByIDSingle(
 	ctx context.Context,
 	keyToBucket map[uint32]int64,
@@ -1132,7 +1274,12 @@ func streamCountRateGroupByIDSingle(
 	numSteps int64,
 	buckets map[string]*aggBucketState,
 ) error {
-	groupCounts := make(map[uint32][]int64)
+	// NOTE-085: [][]int64 indexed by dictIdx — eliminates 150M map probes per M5 file.
+	// len(dict) is small (≤few thousand); pre-allocation cost is negligible vs span count.
+	groupCounts := make([][]int64, len(dict))
+	for i := range groupCounts {
+		groupCounts[i] = make([]int64, numSteps)
+	}
 	i := 0
 	for pk, bucketIdx := range keyToBucket {
 		if i%ctxCheckInterval == 0 {
@@ -1142,21 +1289,13 @@ func streamCountRateGroupByIDSingle(
 		}
 		i++
 		dictIdx := groupIDMap[pk]
-		counts := groupCounts[dictIdx]
-		if counts == nil {
-			counts = make([]int64, numSteps)
-			groupCounts[dictIdx] = counts
-		}
 		if bucketIdx >= 0 && bucketIdx < numSteps {
-			counts[bucketIdx]++
+			groupCounts[dictIdx][bucketIdx]++
 		}
 	}
 	// Resolve IDs back to strings at emit time. O(unique groups).
 	for dictIdx, counts := range groupCounts {
-		gk := ""
-		if int(dictIdx) < len(dict) {
-			gk = dict[dictIdx]
-		}
+		gk := dict[dictIdx]
 		for idx, c := range counts {
 			if c > 0 {
 				k := strconv.FormatInt(int64(idx), 10) + "\x00" + gk //nolint:gosec
