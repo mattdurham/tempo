@@ -2689,3 +2689,130 @@ The absent-sentinel (dictIdx=0 → dict[0]="") is handled correctly: `groupCount
 pre-allocated and accumulates absent spans, resolving to `""` at emit time.
 
 **Back-ref:** `internal/modules/executor/metrics_trace_intrinsic.go:streamCountRateGroupByIDSingle`
+
+---
+
+## NOTE-086: 3D slice accumulator in streamByRefSliceHistogram (2026-04-21)
+
+**Decision:** Replace `map[histSingleGroupIDKey]int64` with a pre-allocated 3D slice
+`groupCounts[groupIdx][boundaryIdx][timeIdx]` in `streamByRefSliceHistogram`. Add a
+pre-scan phase that builds `boundaryIdxForRef[]` by memoizing `intrinsicHistogramBoundary`
+via `boundaryCache map[float64]int16`.
+
+**Rationale:**
+The old hot loop called `intrinsicHistogramBoundary` (which includes `math.Pow` + `math.Log2`)
+for every span — up to 150M times per file. It also probed a 24-byte struct key into
+`map[histSingleGroupIDKey]int64` per span.
+
+The new approach:
+- **Pre-scan phase:** Iterates inRangeRefs once, calling `intrinsicHistogramBoundary` at most
+  `len(unique_boundaries)` times (≤30 for span:duration per block, memoized via
+  `boundaryCache`). Builds `boundaryIdxForRef[i]` (int16, 1-based, 0=absent).
+- **Hot loop:** Three array reads + one `int64` increment. Zero float math, zero hash maps.
+  `groupCounts[gIdx][bIdx][bucketIdx]++` where all indices are pre-resolved.
+
+3D array size for typical queries: 100 groups × 30 boundaries × 36 steps × 8 bytes = 864 KB.
+Fits in L3 cache. Pre-allocation cost is negligible vs the 150M span iterations.
+
+**Consequence:** `aggValsForRef`/`aggPresent` are now fetched by the caller
+(`accumulateIntrinsicBuckets`) for HISTOGRAM along with all other non-count/rate agg
+functions, eliminating the special-case `agg.Function != vm.FuncNameHISTOGRAM` branch.
+`streamByRefSlice` no longer needs `r *modules_reader.Reader` and its signature was trimmed.
+
+Two helpers extracted to keep cyclomatic complexity within limits:
+`streamByRefSliceHistogramAlloc` (3D slice allocation) and `streamByRefSliceHistogramEmit`
+(iterate groupCounts → composite string keys → buckets).
+
+**Back-ref:** `internal/modules/executor/metrics_trace_intrinsic.go:streamByRefSliceHistogram`
+
+*Addendum (2026-04-22):* NOTE-087 reversed the consequence — `streamByRefSlice` gained `r`, `dictByPK`,
+and `maxPK` back so the histogram branch can scan the column directly without
+`buildAggValsForRef`. See NOTE-087 below.
+
+---
+
+## NOTE-087: Direct aggregate column scan in streamByRefSliceHistogram (2026-04-22)
+
+*Added: 2026-04-22*
+
+**Decision:** Eliminate `buildAggValsForRef` from the HISTOGRAM branch of the N=1 group-by
+path. Instead, `streamByRefSliceHistogram` scans the aggregate intrinsic column directly,
+using dense array lookups (`bucketByPK`, `dictByPK`) for O(1) group and time-bucket resolution
+per ref. A `histSpanEntry` intermediate slice defers 3D accumulator allocation until all unique
+boundaries are known.
+
+**Rationale:**
+`buildAggValsForRef` (NOTE-086 caller) allocated:
+- `valByPK [maxPK+1]float64` — ~7.7 MB for a 15-block file (maxPK ≈ 983 040)
+- `hasByPK [maxPK+1]bool`   — ~1.9 MB
+- `aggValsForRef []float64`, `aggPresent []bool` — parallel to inRangeRefs (~150 M entries)
+
+Then it read those arrays back into the pre-scan loop inside `streamByRefSliceHistogram`,
+adding ~300 M extra array operations (write + read per in-range ref). These are pure overhead
+that the r99 baseline avoided by scanning columns directly.
+
+The new approach:
+- **Step 1:** Build `bucketByPK[maxPK+1]int64` from `inRangeRefs`/`inRangeVals` — one write
+  per in-range ref (same cost as the old per-ref loop in `buildAggValsForRef`).
+- **Step 2:** Scan the aggregate column once. For dict format, `getBoundaryIdx` is called once
+  per dict entry (≤30 for span:duration), not once per span. For flat format, it is called per
+  ref but uses the memoized cache (~30 entries, L1-resident). `seenByPK[maxPK+1]bool` tracks
+  absent spans.
+- **Step 3:** Absent-row pass over `inRangeRefs` using `seenByPK` — identical semantics to the
+  old path.
+- **Step 4:** Allocate 3D accumulator now that `numBoundaries` is final. Hot loop iterates the
+  `histSpanEntry` intermediate slice — 3 array reads + 1 increment, zero float math.
+
+**Consequence:**
+- `buildAggValsForRef` is no longer called for HISTOGRAM (still called for SUM/AVG/MIN/MAX/etc.).
+- `streamByRefSlice` signature gains `r *modules_reader.Reader`, `dictByPK []uint32`, `maxPK uint32`
+  (passed through to the HISTOGRAM branch only; ignored by COUNT/RATE and other agg branches).
+- `histSpanEntry` lifted to package scope so `streamByRefSliceHistogramScan` (extracted helper)
+  can share the type without a type alias.
+- Memory savings per file: ~9.6 MB (valByPK + hasByPK) + ~1.2 MB (aggValsForRef + aggPresent).
+- Operation savings per file: ~300 M array writes/reads eliminated.
+
+**Back-ref:** `internal/modules/executor/metrics_trace_intrinsic.go:streamByRefSliceHistogram`,
+`streamByRefSliceHistogramScan`
+
+*Addendum (2026-04-21):* NOTE-088 reversed the consequence — `histSpanEntry` intermediate slice
+and `streamByRefSliceHistogramScan` are deleted. The flat pre-allocated accumulator accumulates
+directly during the column scan with no second pass. See NOTE-088 below.
+
+---
+
+## NOTE-088: Flat pre-allocated accumulator in streamByRefSliceHistogram (2026-04-21)
+
+*Added: 2026-04-21*
+
+**Decision:** Replace the `histSpanEntry` intermediate slice in `streamByRefSliceHistogram` with
+a flat pre-allocated `groupCountsFlat []int64` accumulator sized using a fixed boundary cap
+(`histFlatStride = 64`). Accumulate directly during the column scan — single pass, no second loop.
+
+**Rationale:**
+The NOTE-087 approach eliminated `buildAggValsForRef` (saving ~10.8 MB) but introduced a new
+intermediate allocation: `entries []histSpanEntry` sized to `len(inRangeRefs)`. At 150 M in-range
+spans, `histSpanEntry` (10 bytes each) = 1.5 GB. The subsequent second-pass accumulation loop
+then wrote every entry into the 3D accumulator, totalling ~3 GB of memory traffic per file.
+
+By pre-allocating `groupCountsFlat` with a fixed boundary cap (`histFlatStride = 64`) before
+the column scan, we can accumulate inline during the scan:
+- No intermediate `histSpanEntry` slice — eliminates 1.5 GB allocation at 150 M spans.
+- No second accumulation pass — eliminates the second 1.5 GB read.
+- Flat layout `[gIdx * 64 * numSteps + bIdx * numSteps + timeIdx]` is cache-friendly and
+  requires only one `make` call vs. N×M `make` calls for the 3D slice-of-slices.
+- `histFlatStride = 64` covers all realistic log2 histogram boundaries for `span:duration`
+  (max ~46 distinct values) with headroom.
+
+**Consequence:**
+- `histSpanEntry` struct deleted — no longer needed.
+- `streamByRefSliceHistogramScan` (appended to entries) deleted and replaced by
+  `streamByRefSliceHistogramScanDict` (accumulates directly into flat array).
+- `streamByRefSliceHistogramAlloc` (3D slice allocator) deleted.
+- `streamByRefSliceHistogramEmit` (3D slice emitter) deleted and replaced by
+  `streamByRefSliceHistogramFlatEmit` (flat array emitter with same semantics).
+- `getBoundaryIdx` return type changed from `int16` to `int64` (matches flat index arithmetic).
+- All existing tests pass unchanged — `streamByRefSliceHistogram` signature is identical.
+
+**Back-ref:** `internal/modules/executor/metrics_trace_intrinsic.go:streamByRefSliceHistogram`,
+`streamByRefSliceHistogramScanDict`, `streamByRefSliceHistogramFlatEmit`
