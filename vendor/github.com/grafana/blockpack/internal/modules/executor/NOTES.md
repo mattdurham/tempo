@@ -2559,3 +2559,38 @@ at runtime rather than silently returning empty results.
 Back-ref: `internal/modules/executor/stream_structural.go:evalOpChain`,
           `internal/modules/executor/stream_structural.go:evalOpChainStep`,
           `internal/traceqlparser/parser.go:FlattenChain`
+
+---
+
+## NOTE-081: Typed struct replaces map[string]any in structural hot path (2026-04-21)
+
+**Problem:** `collectBlockStructuralSpanRecs` called `lookupIntrinsicFields` which allocated one
+`map[string]any` per span row. Pyroscope showed ~25GB allocated in production (20.97GB from the
+closure filling maps, 4.03GB from `make(map[string]any)`).
+
+**Decision:** Replace `[]map[string]any` row representation in the structural path with a single
+typed struct slice `[]intrinsicRowFields`. One `make([]intrinsicRowFields, N)` allocation covers
+all N rows instead of N `make(map[string]any)` allocations.
+
+**Design:**
+- `intrinsicRowFields` struct stores all 11 intrinsic columns with typed fields
+- `present` bitmask (uint16) tracks which fields are populated (replaces map key absence)
+- `lookupIntrinsicFieldsTyped` returns `[]intrinsicRowFields` (one allocation for N rows)
+- `identityFieldsFromBlockColsTyped` handles the legacy path (no intrinsic section)
+- `rowSatisfiesIntrinsicNodesTyped` / `rowSatisfiesIntrinsicNodesORTyped` evaluate predicates against
+  the typed struct using type-group getter helpers (`intrinsicLeafGetBytesTyped` etc.) to keep
+  cyclomatic complexity within the 30-limit
+- The old map-based `lookupIntrinsicFields` and `rowSatisfiesIntrinsicNodes` are retained unchanged
+  for the non-structural path (`filterRowSetByIntrinsicNodes`); only the structural path switches
+- `computeNodeMatchForRow` updated to accept `*intrinsicRowFields` and call
+  `rowSatisfiesIntrinsicNodesTyped` (NOTE-080 introduced this function; NOTE-081 typed it)
+
+**Absent-field behavior:** When a present bit is clear, the typed predicate evaluator returns
+`len(n.Values)==0 && n.Min==nil && n.Max==nil && n.Pattern==""` — the same "is null" logic as the
+old map's `!ok` case. For bytes columns specifically, the getter returns `(nil, true)` and
+`matchIntrinsicBytesField` handles nil as absent.
+
+**Back-ref:** `internal/modules/executor/intrinsic_row.go:lookupIntrinsicFieldsTyped`
+**Back-ref:** `internal/modules/executor/stream_structural.go:collectBlockStructuralSpanRecs`
+**Back-ref:** `internal/modules/executor/stream_structural.go:computeNodeMatchForRow`
+**Back-ref:** `internal/modules/executor/predicates.go:rowSatisfiesIntrinsicNodesTyped`

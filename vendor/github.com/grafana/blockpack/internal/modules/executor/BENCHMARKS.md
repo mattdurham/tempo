@@ -378,3 +378,63 @@ go test -bench=BenchmarkStructuralParentResolve_AllocCount -benchmem -count=3 \
 zero string allocs) — regression threshold is ≤ 400 allocs/op.
 
 **Back-ref:** `internal/modules/executor/structural_bench_test.go:BenchmarkStructuralParentResolve_AllocCount` (BENCH-EX-13)
+
+---
+
+## BENCH-EX-14: BenchmarkStructuralTypedRowLookup
+*Added: 2026-04-21*
+
+Measures per-row allocation reduction from replacing `[]map[string]any` with a typed
+`[]intrinsicRowFields` slice in the structural hot path (NOTE-081). Compares two
+sub-benchmarks: `Typed` (lookupIntrinsicFieldsTyped) and `Map` (lookupIntrinsicFields)
+over 100 refs pointing at block 0 of a 5000-span file.
+
+**Setup (outside timed loop):**
+- Write 5000 spans with `MaxBlockSpans=100` (≈50 blocks), 5 cycling service names, 3 span kinds.
+- Open reader with in-memory provider.
+- Build refs for 100 rows in block 0 with wantCols = {trace:id, span:id, span:parent_id}.
+- Run with `b.ReportAllocs()`.
+
+**Run command:**
+```
+go test -bench=BenchmarkStructuralTypedRowLookup -benchmem -count=5 ./internal/modules/executor/
+```
+
+**Baseline (post-typed-struct fix, NOTE-081):**
+- Typed: ~302 allocs/op — regression threshold.
+- Map: ~401 allocs/op (one map per row, before fix).
+- Speedup: 1.6–2× faster ns/op on the Typed path vs Map.
+
+Back-ref: `internal/modules/executor/intrinsic_bench_test.go:BenchmarkStructuralTypedRowLookup`
+
+---
+
+## BENCH-EX-15: BenchmarkCollect_IntrinsicMaterialization
+*Added: 2026-04-21*
+
+End-to-end benchmark guarding against the regression from PR #172 where intrinsic columns
+were removed from block payloads. Three sub-benchmarks exercise the intrinsic pre-filter
+and result materialization paths.
+
+**Setup (outside timed loop):**
+- Write 5000 spans with `MaxBlockSpans=100`, 5 cycling service names, 3 span kinds.
+- Open reader with in-memory provider.
+- Compile query per sub-benchmark (see below).
+- Run with `b.ReportAllocs()`.
+
+**Sub-benchmarks:**
+
+| Sub-benchmark | Query | Matching spans |
+|---|---|---|
+| `PureIntrinsic` | `{ resource.service.name = "auth-service" }` | ~1000 |
+| `MixedQuery` | `{ resource.service.name = "auth-service" && span:kind = server }` | ~333 |
+| `ResultFields` | same as PureIntrinsic with AllColumns=true | ~1000 |
+
+**Run command:**
+```
+go test -bench=BenchmarkCollect_IntrinsicMaterialization -benchmem -count=3 ./internal/modules/executor/
+```
+
+**What this measures:** With dual storage (block columns + intrinsic section), field access is O(1) per row. Without dual storage (PR #172 regression), each GetField triggered an O(N) scan through intrinsic column entries. The `ResultFields` sub-benchmark exercises the full materialization path with AllColumns=true.
+
+Back-ref: `internal/modules/executor/intrinsic_bench_test.go:BenchmarkCollect_IntrinsicMaterialization`
