@@ -2916,3 +2916,88 @@ White-box test: calls `buildGroupKeyMap` directly with N=1 (span:kind only) to e
 are human-readable on all code paths including N>8 string-keyed fallback).
 
 Back-ref: `internal/modules/executor/group_id_map_test.go:TestBuildGroupKeyMap_SpanKindEnumConversion`
+
+---
+
+## EX-ETM-N1-08: TestStreamByRefSliceHistogram_3D_ByteEquivalence
+*Added: 2026-04-21*
+
+**Scenario:** `streamByRefSliceHistogram` (flat pre-allocated accumulator, NOTE-088) produces
+byte-identical bucket output to `streamHistogramGroupBy` (string-keyed reference path) over 6
+spans with 3 service names and 2 distinct durations in 1 time bucket.
+
+**Setup:** 6 spans cycling over {svc-a, svc-b, svc-c} × {10ms, 100ms} durations.
+
+**Assertions:** Bucket keys and counts from the flat path exactly match the reference path.
+
+**Spec invariants tested:** NOTE-086 (accumulator is a drop-in replacement for map path),
+NOTE-088 (flat accumulator replaces histSpanEntry intermediate slice).
+
+*Addendum (2026-04-21):* Implementation changed from 3D slice-of-slices to flat pre-allocated
+`[]int64` (NOTE-088). Test asserts identical semantics — implementation detail not observable.
+
+Back-ref: `internal/modules/executor/intrinsic_hist_3d_test.go:TestStreamByRefSliceHistogram_3D_ByteEquivalence`
+
+---
+
+## EX-ETM-N1-09: TestStreamByRefSliceHistogram_3D_AbsentSpans
+*Added: 2026-04-21*
+
+**Scenario:** `streamByRefSliceHistogram` (3D accumulator) correctly accumulates spans with
+absent aggregate field (aggPresent[i]==false) into the boundary-0 bucket.
+
+**Setup:** 4 spans: 2 with span:duration=50ms (present), 2 with span:duration=0 (absent).
+
+**Assertions:** Bucket output matches the reference path; absent spans count in boundary-0 bucket.
+
+**Spec invariants tested:** NOTE-086 (boundaryIdx 0 = absent sentinel → boundary-0 at emit).
+
+Back-ref: `internal/modules/executor/intrinsic_hist_3d_test.go:TestStreamByRefSliceHistogram_3D_AbsentSpans`
+
+---
+
+## EX-ETM-N1-10: TestStreamByRefSliceHistogram_3D_AbsentColumn
+*Added: 2026-04-21*
+
+**Scenario:** `streamByRefSliceHistogram` (3D accumulator) handles a nil aggregate column
+(all spans absent from span:duration) identically to the reference path.
+
+**Setup:** 4 zero-duration spans so the writer omits span:duration entirely.
+
+**Assertions:** Bucket output matches the reference path; all spans count in boundary-0 bucket.
+
+**Spec invariants tested:** SPEC-ETM-13.3 (absent spans accumulate into boundary-0), NOTE-086.
+
+Back-ref: `internal/modules/executor/intrinsic_hist_3d_test.go:TestStreamByRefSliceHistogram_3D_AbsentColumn`
+
+---
+
+## EX-ETM-N1-11: TestStreamByRefSliceHistogram_3D_MultiBucket
+*Added: 2026-04-21*
+
+**Scenario:** `streamByRefSliceHistogram` (3D accumulator) correctly indexes the timeIdx
+dimension across multiple time buckets.
+
+**Setup:** 12 spans, 2 service names, 3 time buckets, 2 boundary values per group.
+
+**Assertions:** Bucket output matches the reference path across all 3 time buckets.
+
+**Spec invariants tested:** NOTE-086 (timeIdx dimension correctness).
+
+Back-ref: `internal/modules/executor/intrinsic_hist_3d_test.go:TestStreamByRefSliceHistogram_3D_MultiBucket`
+
+---
+
+## EX-ETM-N1-12: TestStreamByRefSliceHistogram_3D_SingleGroup
+*Added: 2026-04-21*
+
+**Scenario:** `streamByRefSliceHistogram` (3D accumulator) with a single group value (dict
+has sentinel + one entry) produces correct output.
+
+**Setup:** 5 spans all with service.name="only-svc" and span:duration=200ms.
+
+**Assertions:** Bucket output matches the reference path.
+
+**Spec invariants tested:** NOTE-086 (minimal dict case).
+
+Back-ref: `internal/modules/executor/intrinsic_hist_3d_test.go:TestStreamByRefSliceHistogram_3D_SingleGroup`
