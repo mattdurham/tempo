@@ -2629,3 +2629,24 @@ and `resolveGroupIDKey` are unchanged.
 **Back-ref:** `internal/modules/executor/metrics_trace_intrinsic.go:streamAggGroupByIDSingle`
 **Back-ref:** `internal/modules/executor/metrics_trace_intrinsic.go:streamHistogramGroupByID`
 **Back-ref:** `internal/modules/executor/metrics_trace_intrinsic.go:streamHistogramGroupByIDSingle`
+
+## NOTE-083: span:kind and span:status enum resolution at metrics emit time (2026-04-21)
+
+**Decision:** `scanIntrinsicColDictIDs` and `scanIntrinsicColVals` now accept a `colName string`
+parameter. When a dict entry has an empty `.Value` (regardless of `.Int64Val`), they call
+`intrinsicInt64ColToString(colName, v)` to convert the stored int64 to a human-readable OTel
+name instead of falling back to `strconv.FormatInt(v, 10)`.
+
+**Rationale:** `span:kind` and `span:status` are stored as int64 enum values in blockpack.
+Emitting "2" instead of "server" in metrics group-by output is incorrect from the user
+perspective. The fix is applied at emit time, requiring zero block-format or writer changes.
+Out-of-range values (e.g., kind=99 from a corrupt block) fall back to `strconv.FormatInt`,
+preserving the existing behavior for unknown values.
+
+**Mappings match** `spanKindToInt64` and `statusCodeToInt64` in `internal/vm/traceql_compiler.go`
+(the canonical OTel enum tables used by the query compiler).
+
+**Back-ref:** `internal/modules/executor/metrics_trace_intrinsic.go:intrinsicInt64ColToString`
+**Back-ref:** `internal/modules/executor/metrics_trace_intrinsic.go:scanIntrinsicColDictIDs`
+**Back-ref:** `internal/modules/executor/metrics_trace_intrinsic.go:scanIntrinsicColVals`
+**Back-ref:** `benchmark/trace_metrics_bench_test.go:traceMetricsQueries` (rate_by_span_kind, rate_by_span_status entries)

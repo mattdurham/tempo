@@ -951,9 +951,16 @@ Back-ref: `api.go:streamPipelineQuery`, `api.go:computeSpansetAggregate`,
 - **SPEC-ETM-13.4:** Histogram boundary values stored in `histGroupIDKey.boundary` and
   `histSingleGroupIDKey.boundary` are always powers-of-2 or 0 (computed via
   `intrinsicHistogramBoundary`). Float64 map key comparison is therefore safe — NaN cannot appear.
+- **SPEC-ETM-13.5:** For metrics queries with group-by on intrinsic enum columns (span:kind,
+  span:status), the series label values emitted must be OTel string names ("server", "client",
+  "ok", "error", etc.), never integer enum values (1, 2, 3, etc.). This applies to all code
+  paths: dict-ID fast path (N≤8), string-keyed fallback (N>8), and histogram accumulation.
 
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:buildGroupIDMap`,
           `internal/modules/executor/metrics_trace_intrinsic.go:accumulateIntrinsicBuckets`
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:intrinsicInt64ColToString`
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:scanIntrinsicColDictIDs`
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:scanIntrinsicColVals`
 
 ## SPEC-SCAN-1: StreamScanEqualAny Dict-Mask Fast Path Invariants
 *Added: 2026-04-17*

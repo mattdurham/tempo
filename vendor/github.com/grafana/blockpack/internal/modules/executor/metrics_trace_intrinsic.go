@@ -586,16 +586,51 @@ func streamAggColumnNoGroupBy(
 	return nil
 }
 
+// intrinsicInt64ColToString converts a stored int64 enum value to its canonical OTel string
+// name for span:kind and span:status columns. All other columns fall back to strconv.FormatInt
+// to preserve existing behavior.
+// NOTE-083: enum resolution at emit time — no data migration needed.
+func intrinsicInt64ColToString(colName string, v int64) string {
+	switch colName {
+	case colNameSpanKind:
+		switch v {
+		case 0:
+			return "unspecified"
+		case 1:
+			return "internal"
+		case 2:
+			return "server"
+		case 3:
+			return "client"
+		case 4:
+			return "producer"
+		case 5:
+			return "consumer"
+		}
+	case colNameSpanStatus:
+		switch v {
+		case 0:
+			// 0=unset: writer may omit status=0 entries but the fallback is still defined.
+			return "unset"
+		case 1:
+			return "ok"
+		case 2:
+			return "error"
+		}
+	}
+	return strconv.FormatInt(v, 10)
+}
+
 // scanIntrinsicColVals scans a single intrinsic column's dict/flat entries and writes
 // packKey → string value into dst for every ref that appears in keyToBucket.
 // Rows absent from the column are not written (callers handle absence as empty string).
-func scanIntrinsicColVals(col *modules_shared.IntrinsicColumn, keyToBucket map[uint32]int64, dst map[uint32]string) {
+func scanIntrinsicColVals(col *modules_shared.IntrinsicColumn, colName string, keyToBucket map[uint32]int64, dst map[uint32]string) {
 	switch col.Format {
 	case modules_shared.IntrinsicFormatDict:
 		for _, entry := range col.DictEntries {
 			val := entry.Value
 			if val == "" {
-				val = strconv.FormatInt(entry.Int64Val, 10)
+				val = intrinsicInt64ColToString(colName, entry.Int64Val)
 			}
 			for _, ref := range entry.BlockRefs {
 				pk := packKey(ref.BlockIdx, ref.RowIdx)
@@ -604,6 +639,9 @@ func scanIntrinsicColVals(col *modules_shared.IntrinsicColumn, keyToBucket map[u
 				}
 			}
 		}
+	// Flat-format columns (e.g. span:start, span:duration) store numeric values, not enums.
+	// intrinsicInt64ColToString is not applied here because flat values are always numeric,
+	// not OTel enum integers. Enum columns are always stored in dict format.
 	case modules_shared.IntrinsicFormatFlat:
 		for j, ref := range col.BlockRefs {
 			pk := packKey(ref.BlockIdx, ref.RowIdx)
@@ -642,6 +680,7 @@ type groupIDKey [maxGroupByDimsFastPath]uint32
 // NOTE-074: Dict-ID fast path scanner — called by buildGroupIDMap (task #6).
 func scanIntrinsicColDictIDs(
 	col *modules_shared.IntrinsicColumn,
+	colName string,
 	keyToBucket map[uint32]int64,
 	dst map[uint32]uint32,
 	dict []string,
@@ -653,7 +692,7 @@ func scanIntrinsicColDictIDs(
 			// This avoids allocating dict slots for values not present in the query window.
 			val := entry.Value
 			if val == "" {
-				val = strconv.FormatInt(entry.Int64Val, 10)
+				val = intrinsicInt64ColToString(colName, entry.Int64Val)
 			}
 			var dictIdx uint32
 			assigned := false
@@ -735,7 +774,7 @@ func buildGroupIDMap(
 			return nil, nil, false, err
 		}
 		if col != nil {
-			dict = scanIntrinsicColDictIDs(col, keyToBucket, colMap, dict)
+			dict = scanIntrinsicColDictIDs(col, colName, keyToBucket, colMap, dict)
 		}
 		// Apply dim i to each pk's key.
 		for pk, key := range out {
@@ -765,7 +804,7 @@ func buildGroupIDMapSingle(
 		return nil, nil, err
 	}
 	if col != nil {
-		dict = scanIntrinsicColDictIDs(col, keyToBucket, colMap, dict)
+		dict = scanIntrinsicColDictIDs(col, colName, keyToBucket, colMap, dict)
 	}
 	return colMap, dict, nil
 }
@@ -811,7 +850,7 @@ func buildGroupKeyMap(
 			return nil, err
 		}
 		if col != nil {
-			scanIntrinsicColVals(col, keyToBucket, out)
+			scanIntrinsicColVals(col, groupBy[0], keyToBucket, out)
 		}
 		// Fill absent pks with empty string (Tempo convention).
 		for pk := range keyToBucket {
@@ -832,7 +871,7 @@ func buildGroupKeyMap(
 			return nil, err
 		}
 		if col != nil {
-			scanIntrinsicColVals(col, keyToBucket, colVals)
+			scanIntrinsicColVals(col, colName, keyToBucket, colVals)
 		}
 
 		// Apply this column's values to out. Iterating keyToBucket ensures every in-range

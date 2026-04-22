@@ -2816,3 +2816,62 @@ Back-ref: `internal/modules/executor/intrinsic_group_id_n1_test.go:TestStreamHis
 **Spec invariants tested:** SPEC-ETM-13.3 (absent sentinel), NOTE-082 (histSingleAbsentKey 16-byte key for nil-column path, buildGroupIDMapSingle execution path).
 
 Back-ref: `internal/modules/executor/intrinsic_group_id_n1_test.go:TestStreamHistogramGroupByID_N1_AbsentColumn`
+
+---
+
+## EX-ETM-SK-01: TestTraceMetrics_Intrinsic_SpanKindGroupBy_LabelValues
+*Added: 2026-04-21*
+
+**Scenario:** `by (span:kind)` group-by emits human-readable names ("server", "client") not
+integer strings ("2", "3"), for both the N=1 dict-ID fast path and the N=2 multi-dim path.
+
+**Setup:** 3 spans: kinds [server, client, server]. Two queries: `{} | count_over_time() by (span:kind)`
+and `{} | count_over_time() by (span:kind, resource.service.name)`.
+
+**Assertions:** Buckets contain "server" and "client" label values (not exhaustive — only the
+two kinds written are verified). Integer strings "2" and "3" must not appear. Not all enum
+values are checked; the full set {"unspecified","internal","server","client","producer","consumer"}
+is defined by intrinsicInt64ColToString but only a subset is exercised by this test.
+
+**Spec invariants tested:** NOTE-083 (enum resolution at emit time), SPEC-ETM-13.2 (fast/slow
+path byte-parity — both paths must produce the same string values).
+
+Back-ref: `internal/modules/executor/intrinsic_span_kind_status_test.go:TestTraceMetrics_Intrinsic_SpanKindGroupBy_LabelValues`
+
+---
+
+## EX-ETM-SK-02: TestTraceMetrics_Intrinsic_SpanStatusGroupBy_LabelValues
+*Added: 2026-04-21*
+
+**Scenario:** `by (span:status)` group-by emits human-readable names ("ok", "error") not
+integer strings ("1", "2").
+
+**Setup:** 3 spans: statuses [ok, error, ok]. Two sub-tests run:
+- N=1 fast path: `{} | count_over_time() by (span:status)`
+- N=2 multi-dim path: `{} | count_over_time() by (span:status, resource.service.name)`
+
+**Assertions:** No bucket label contains a digit-only string for span:status. Values observed
+are within the set {"unset","ok","error"} (test data contains ok and error only).
+
+**Spec invariants tested:** NOTE-083 (enum resolution at emit time).
+
+Back-ref: `internal/modules/executor/intrinsic_span_kind_status_test.go:TestTraceMetrics_Intrinsic_SpanStatusGroupBy_LabelValues`
+
+---
+
+## EX-ETM-GID-10: TestBuildGroupKeyMap_SpanKindEnumConversion
+*Added: 2026-04-21*
+
+**Scenario:** `buildGroupKeyMap` (the N>8 string-keyed fallback) converts span:kind dict entries
+from int64 enum values to OTel string names via `scanIntrinsicColVals` → `intrinsicInt64ColToString`.
+White-box test: calls `buildGroupKeyMap` directly with N=1 (span:kind only) to exercise
+`scanIntrinsicColVals` without binary-column separator interference.
+
+**Setup:** 3 spans with kinds [server(2), client(3), server(2)].
+
+**Assertions:** `buildGroupKeyMap` result map values contain "server" and "client"; not "2" or "3".
+
+**Spec invariants tested:** NOTE-083 (enum resolution at emit time), SPEC-ETM-13.5 (enum labels
+are human-readable on all code paths including N>8 string-keyed fallback).
+
+Back-ref: `internal/modules/executor/group_id_map_test.go:TestBuildGroupKeyMap_SpanKindEnumConversion`
