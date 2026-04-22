@@ -2615,9 +2615,10 @@ span:status, resource.service.name) are all N=1. N>1 retains the existing [8]uin
 - `streamHistogramGroupByIDSingle`: `histSingleGroupIDKey{dictIdx uint32, boundary float64, bucketIdx int64}` (24 bytes) vs `histGroupIDKey` (48 bytes)
 - nil-column path: `histSingleAbsentKey{bucketIdx int64, dictIdx uint32}` (16 bytes) vs `histGroupIDKey` (48 bytes)
 
-**Output contract:** Byte-identical to the N>1 path — `resolveGroupIDKey` is called with a
-zero-valued `[8]uint32` that has only `key[0]` set, which produces the same string as the N>1
-path for N=1 inputs.
+**Output contract:** For N=1, the group key is `dict[dictIdx]` with a bounds-checked empty
+string fallback (if `int(dictIdx) >= len(dict)`, the key resolves to `""`), identical to what
+`resolveGroupIDKey({dictIdx,0,...}, [][]string{dict})` would produce. The `*Single` helpers
+resolve directly via `dict[dictIdx]`; `resolveGroupIDKey` is not called on the N=1 path.
 
 **Scope:** Only the three stream functions in `metrics_trace_intrinsic.go`. `buildGroupIDMap`
 and `resolveGroupIDKey` are unchanged.

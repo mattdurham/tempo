@@ -388,7 +388,32 @@ func accumulateIntrinsicBuckets(
 		return streamAggColumnNoGroupBy(r, agg, keyToBucket, buckets)
 	}
 
-	// Try dict-ID fast path first (N ≤ 8 group-by dims, all intrinsic).
+	// NOTE-082: N=1 fast path — buildGroupIDMapSingle returns map[uint32]uint32 (pk → dictIdx),
+	// skipping the [8]uint32 wrapper so *Single helpers use mapaccess2_fast32 for the build phase too.
+	if len(agg.GroupBy) == 1 {
+		groupIDMap1, dict, err := buildGroupIDMapSingle(r, agg.GroupBy[0], keyToBucket)
+		if err != nil {
+			return err
+		}
+		if isCountRate {
+			tb := querySpec.TimeBucketing
+			numSteps := (tb.EndTime - tb.StartTime + tb.StepSizeNanos - 1) / tb.StepSizeNanos
+			if numSteps <= 0 {
+				return nil
+			}
+			return streamCountRateGroupByIDSingle(ctx, keyToBucket, groupIDMap1, dict, numSteps, buckets)
+		}
+		if agg.Function == vm.FuncNameHISTOGRAM {
+			return streamHistogramGroupByIDSingle(ctx, r, agg.Field, keyToBucket, groupIDMap1, dict, buckets)
+		}
+		aggVals, err := buildAggValsMap(r, agg.Field, keyToBucket)
+		if err != nil {
+			return err
+		}
+		return streamAggGroupByIDSingle(ctx, keyToBucket, groupIDMap1, dict, agg, aggVals, buckets)
+	}
+
+	// Try dict-ID fast path for N > 1 dims (N ≤ 8 group-by dims, all intrinsic).
 	// NOTE-074: Falls back to string-keyed path for N > 8 only (ok=false, nil error).
 	// Hard errors are returned directly — there is no error-triggered fallback.
 	// SPEC-ETM-13.1/13.2: transparent to callers — buckets output is byte-identical.
@@ -687,34 +712,13 @@ func buildGroupIDMap(
 	groupBy []string,
 	keyToBucket map[uint32]int64,
 ) (map[uint32]groupIDKey, [][]string, bool, error) {
+	// NOTE-082: N=1 is handled by buildGroupIDMapSingle in accumulateIntrinsicBuckets
+	// before this function is called, so only N>1 cases reach here.
 	if len(groupBy) > maxGroupByDimsFastPath {
 		return nil, nil, false, nil
 	}
 
-	// Fast path: single group-by column — write directly to out via a flat pk→dictIdx map.
-	// NOTE-056-style optimization: skip the outer colMap intermediate for N=1.
-	if len(groupBy) == 1 {
-		dict := []string{""}
-		colMap := make(map[uint32]uint32, len(keyToBucket))
-		col, err := r.GetIntrinsicColumn(groupBy[0])
-		if err != nil {
-			return nil, nil, false, err
-		}
-		if col != nil {
-			dict = scanIntrinsicColDictIDs(col, keyToBucket, colMap, dict)
-		}
-		out := make(map[uint32]groupIDKey, len(keyToBucket))
-		for pk := range keyToBucket {
-			var key groupIDKey
-			if id, ok := colMap[pk]; ok {
-				key[0] = id
-			}
-			out[pk] = key
-		}
-		return out, [][]string{dict}, true, nil
-	}
-
-	// Multi-group-by path.
+	// Multi-group-by path (N ≥ 2).
 	out := make(map[uint32]groupIDKey, len(keyToBucket))
 	dicts := make([][]string, len(groupBy))
 
@@ -743,6 +747,27 @@ func buildGroupIDMap(
 		dicts[i] = dict
 	}
 	return out, dicts, true, nil
+}
+
+// buildGroupIDMapSingle builds a packKey → dictIdx map for the N=1 group-by fast path.
+// Returns map[uint32]uint32 (pk → single dict ID) instead of map[uint32]groupIDKey,
+// eliminating the [8]uint32 wrapper and its 32-byte memcmp overhead on every span.
+// NOTE-082: replaces buildGroupIDMap for N=1 — called from accumulateIntrinsicBuckets.
+func buildGroupIDMapSingle(
+	r *modules_reader.Reader,
+	colName string,
+	keyToBucket map[uint32]int64,
+) (map[uint32]uint32, []string, error) {
+	dict := []string{""}
+	colMap := make(map[uint32]uint32, len(keyToBucket))
+	col, err := r.GetIntrinsicColumn(colName)
+	if err != nil {
+		return nil, nil, err
+	}
+	if col != nil {
+		dict = scanIntrinsicColDictIDs(col, keyToBucket, colMap, dict)
+	}
+	return colMap, dict, nil
 }
 
 // resolveGroupIDKey resolves a groupIDKey back to the composite string group key
@@ -1012,7 +1037,7 @@ type histSingleAbsentKey struct {
 //
 // NOTE-074: Dict-ID fast path — see NOTES.md. dicts[i] maps dictIdx → string
 // for resolution at series-emit time.
-// NOTE-082: N=1 fast path dispatched to streamCountRateGroupByIDSingle when len(dicts)==1.
+// NOTE-082: N=1 dispatched via accumulateIntrinsicBuckets → buildGroupIDMapSingle before this is called.
 func streamCountRateGroupByID(
 	ctx context.Context,
 	keyToBucket map[uint32]int64,
@@ -1024,10 +1049,6 @@ func streamCountRateGroupByID(
 	numSteps := (tb.EndTime - tb.StartTime + tb.StepSizeNanos - 1) / tb.StepSizeNanos
 	if numSteps <= 0 {
 		return nil
-	}
-	// NOTE-082: N=1 fast path — gid[0] used directly as uint32 map key.
-	if len(dicts) == 1 {
-		return streamCountRateGroupByIDSingle(ctx, keyToBucket, groupIDMap, dicts[0], numSteps, buckets)
 	}
 	groupCounts := make(map[groupIDKey][]int64)
 	i := 0
@@ -1067,7 +1088,7 @@ func streamCountRateGroupByID(
 func streamCountRateGroupByIDSingle(
 	ctx context.Context,
 	keyToBucket map[uint32]int64,
-	groupIDMap map[uint32]groupIDKey,
+	groupIDMap map[uint32]uint32,
 	dict []string,
 	numSteps int64,
 	buckets map[string]*aggBucketState,
@@ -1081,7 +1102,7 @@ func streamCountRateGroupByIDSingle(
 			}
 		}
 		i++
-		dictIdx := groupIDMap[pk][0]
+		dictIdx := groupIDMap[pk]
 		counts := groupCounts[dictIdx]
 		if counts == nil {
 			counts = make([]int64, numSteps)
@@ -1114,7 +1135,7 @@ func streamCountRateGroupByIDSingle(
 // NOTE-074: Eliminates string hashing for group dims and FormatFloat+string
 // hashing for the histogram boundary. The boundary float64 is used directly as
 // part of the map key (safe: values are always powers-of-2 or 0, never NaN — SPEC-ETM-13.4).
-// NOTE-082: N=1 fast path dispatched to streamHistogramGroupByIDSingle when len(dicts)==1.
+// NOTE-082: N=1 dispatched via accumulateIntrinsicBuckets → buildGroupIDMapSingle before this is called.
 func streamHistogramGroupByID(
 	ctx context.Context,
 	r *modules_reader.Reader,
@@ -1124,11 +1145,6 @@ func streamHistogramGroupByID(
 	dicts [][]string,
 	buckets map[string]*aggBucketState,
 ) error {
-	// NOTE-082: N=1 fast path — histSingleGroupIDKey reduces key from 48 to 24 bytes.
-	if len(dicts) == 1 {
-		return streamHistogramGroupByIDSingle(ctx, r, fieldName, keyToBucket, groupIDMap, dicts[0], buckets)
-	}
-
 	col, err := r.GetIntrinsicColumn(fieldName)
 	if err != nil {
 		return err
@@ -1249,7 +1265,7 @@ func streamHistogramGroupByIDSingle(
 	r *modules_reader.Reader,
 	fieldName string,
 	keyToBucket map[uint32]int64,
-	groupIDMap map[uint32]groupIDKey,
+	groupIDMap map[uint32]uint32,
 	dict []string,
 	buckets map[string]*aggBucketState,
 ) error {
@@ -1268,7 +1284,7 @@ func streamHistogramGroupByIDSingle(
 				}
 			}
 			i++
-			hk := histSingleAbsentKey{dictIdx: groupIDMap[pk][0], bucketIdx: bucketIdx}
+			hk := histSingleAbsentKey{dictIdx: groupIDMap[pk], bucketIdx: bucketIdx}
 			absentCounts[hk]++
 		}
 		for hk, count := range absentCounts {
@@ -1313,7 +1329,7 @@ func streamHistogramGroupByIDSingle(
 					continue
 				}
 				seen[pk] = struct{}{}
-				hk := histSingleGroupIDKey{dictIdx: groupIDMap[pk][0], boundary: boundary, bucketIdx: bucketIdx}
+				hk := histSingleGroupIDKey{dictIdx: groupIDMap[pk], boundary: boundary, bucketIdx: bucketIdx}
 				histCounts[hk]++
 			}
 		}
@@ -1336,7 +1352,7 @@ func streamHistogramGroupByIDSingle(
 			seen[pk] = struct{}{}
 			v := float64(col.Uint64Values[i])
 			boundary := intrinsicHistogramBoundary(v, fieldName)
-			hk := histSingleGroupIDKey{dictIdx: groupIDMap[pk][0], boundary: boundary, bucketIdx: bucketIdx}
+			hk := histSingleGroupIDKey{dictIdx: groupIDMap[pk], boundary: boundary, bucketIdx: bucketIdx}
 			histCounts[hk]++
 		}
 	}
@@ -1345,7 +1361,7 @@ func streamHistogramGroupByIDSingle(
 	if len(seen) < len(keyToBucket) {
 		for pk, bucketIdx := range keyToBucket {
 			if _, ok := seen[pk]; !ok {
-				hk := histSingleGroupIDKey{dictIdx: groupIDMap[pk][0], boundary: 0, bucketIdx: bucketIdx}
+				hk := histSingleGroupIDKey{dictIdx: groupIDMap[pk], boundary: 0, bucketIdx: bucketIdx}
 				histCounts[hk]++
 			}
 		}
@@ -1368,7 +1384,7 @@ func streamHistogramGroupByIDSingle(
 // QUANTILE, STDDEV) with group-by using the dict-ID fast path.
 // NOTE-074: Two-stage accumulation: hot loop accumulates into map[aggGroupIDKey]*aggBucketState
 // (no string allocation per span); resolveGroupIDKey is called only at emit time (O(unique groups)).
-// NOTE-082: N=1 fast path dispatched to streamAggGroupByIDSingle when len(dicts)==1.
+// NOTE-082: N=1 dispatched via accumulateIntrinsicBuckets → buildGroupIDMapSingle before this is called.
 func streamAggGroupByID(
 	ctx context.Context,
 	r *modules_reader.Reader,
@@ -1381,11 +1397,6 @@ func streamAggGroupByID(
 	aggVals, err := buildAggValsMap(r, agg.Field, keyToBucket)
 	if err != nil {
 		return err
-	}
-
-	// NOTE-082: N=1 fast path — aggSingleGroupIDKey reduces key from 40 to 16 bytes.
-	if len(dicts) == 1 {
-		return streamAggGroupByIDSingle(ctx, keyToBucket, groupIDMap, dicts[0], agg, aggVals, buckets)
 	}
 
 	// Accumulate into ID-keyed intermediate map — no string allocation per span.
@@ -1425,7 +1436,7 @@ func streamAggGroupByID(
 func streamAggGroupByIDSingle(
 	ctx context.Context,
 	keyToBucket map[uint32]int64,
-	groupIDMap map[uint32]groupIDKey,
+	groupIDMap map[uint32]uint32,
 	dict []string,
 	agg vm.AggregateSpec,
 	aggVals map[uint32]float64,
@@ -1440,7 +1451,7 @@ func streamAggGroupByIDSingle(
 			}
 		}
 		i++
-		ak := aggSingleGroupIDKey{dictIdx: groupIDMap[pk][0], bucketIdx: bucketIdx}
+		ak := aggSingleGroupIDKey{dictIdx: groupIDMap[pk], bucketIdx: bucketIdx}
 		bucket := idBuckets[ak]
 		if bucket == nil {
 			bucket = &aggBucketState{min: math.MaxFloat64, max: -math.MaxFloat64}
