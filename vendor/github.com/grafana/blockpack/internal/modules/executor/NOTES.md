@@ -2650,3 +2650,42 @@ preserving the existing behavior for unknown values.
 **Back-ref:** `internal/modules/executor/metrics_trace_intrinsic.go:scanIntrinsicColDictIDs`
 **Back-ref:** `internal/modules/executor/metrics_trace_intrinsic.go:scanIntrinsicColVals`
 **Back-ref:** `benchmark/trace_metrics_bench_test.go:traceMetricsQueries` (rate_by_span_kind, rate_by_span_status entries)
+
+---
+
+## NOTE-084: perf-metrics-array-groupby Regression Post-Mortem (2026-04-21)
+
+**Decision:** The perf-metrics-array-groupby branch (r98) was reverted. It replaced the
+`keyToBucket` range loop with a `col.DictEntries` outer loop, which caused 20–35% regression.
+
+**Rationale:** Iterating `col.DictEntries` as the outer loop converted ~150M sequential
+`keyToBucket` range-iterations into ~150M random `keyToBucket[pk]` lookups (lookups by
+arbitrary pk values in dict-entry order). The cache-miss cost on 150M entries exceeded the
+savings from eliminating the groupCounts map probe. The keyToBucket range loop must remain
+the outer loop for any accumulator that touches the full span set.
+
+**Back-ref:** `internal/modules/executor/metrics_trace_intrinsic.go:streamCountRateGroupByIDSingle`
+
+---
+
+## NOTE-085: Slice accumulator in streamCountRateGroupByIDSingle (2026-04-21)
+
+**Decision:** Replace `groupCounts map[uint32][]int64` with `[][]int64` pre-allocated to
+`len(dict)` in `streamCountRateGroupByIDSingle`. Index into it directly via `dictIdx`.
+
+**Rationale:** `dictIdx` values from `groupIDMap` are dense integers in `[0, len(dict)-1]`
+(guaranteed by `scanIntrinsicColDictIDs` which assigns dictIdx = len(dict) before append).
+Direct slice indexing requires zero hash computation, zero collision probing, and zero
+bounds-check divergence compared to map access. For M5 queries (150M in-range spans,
+span:kind N≤6), this eliminates ~150M `mapaccess1_fast32` calls per file in the hot loop.
+
+The `keyToBucket` range loop is kept as the outer loop (unchanged from NOTE-082) — this
+avoids the random-access regression identified in NOTE-084.
+
+Pre-allocation cost: `len(dict) × numSteps × 8 bytes`. For span:kind (N=6, numSteps=360):
+~17 KB. For service.name (N=500, numSteps=360): ~1.4 MB. Acceptable for a single goroutine.
+
+The absent-sentinel (dictIdx=0 → dict[0]="") is handled correctly: `groupCounts[0]` is
+pre-allocated and accumulates absent spans, resolving to `""` at emit time.
+
+**Back-ref:** `internal/modules/executor/metrics_trace_intrinsic.go:streamCountRateGroupByIDSingle`

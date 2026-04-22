@@ -2819,6 +2819,47 @@ Back-ref: `internal/modules/executor/intrinsic_group_id_n1_test.go:TestStreamHis
 
 ---
 
+## EX-ETM-N1-06: TestStreamCountRateGroupByIDSingle_SliceAccum_ByteEquivalence
+*Added: 2026-04-21*
+
+**Scenario:** `streamCountRateGroupByIDSingle` with the slice accumulator (NOTE-085) and N=10
+groups must produce byte-identical output to the string-keyed path. Uses a larger dict than
+EX-ETM-N1-01 (10 service names vs 3) to verify pre-allocation correctness with non-trivial N.
+
+**Setup:** 20 spans cycling across 10 service names over 2 time buckets. Calls `streamCountRateGroupBy`
+(string-keyed reference) and `buildGroupIDMapSingle` + `streamCountRateGroupByIDSingle` (N=1 slice
+path) over independent readers.
+
+**Assertions:** `compareBuckets(t, strBuckets, idBuckets)` passes — bucket count, per-key counts identical.
+
+**Spec invariants tested:** NOTE-085 (slice accumulator byte-parity with string-keyed path).
+
+Back-ref: `internal/modules/executor/intrinsic_slice_accumulator_test.go:TestStreamCountRateGroupByIDSingle_SliceAccum_ByteEquivalence`
+
+---
+
+## EX-ETM-N1-07: TestStreamCountRateGroupByIDSingle_SliceAccum_AbsentSentinel
+*Added: 2026-04-21*
+
+**Scenario:** `streamCountRateGroupByIDSingle` with the slice accumulator (NOTE-085) must
+accumulate absent spans (dictIdx==0) into `groupCounts[0]` resolving to `""`, byte-identical to
+the string-keyed path. Mirrors EX-ETM-N1-02 but explicitly verifies the slice variant and
+the `"0\x00"` count == 2.
+
+**Setup:** 4 spans — 2 with `service.name="svc-x"`, 2 with `service.name=""` (absent). 1 time bucket.
+Calls `streamCountRateGroupBy` (string-keyed reference) and `buildGroupIDMapSingle` +
+`streamCountRateGroupByIDSingle` (N=1 slice path) over independent readers.
+
+**Assertions:** `compareBuckets(t, strBuckets, idBuckets)` passes. `"0\x00svc-x"` count == 2,
+`"0\x00"` count == 2.
+
+**Spec invariants tested:** SPEC-ETM-13.3 (dictIdx=0 empty-string sentinel), NOTE-085 (slice
+accumulator preserves absent-sentinel correctness).
+
+Back-ref: `internal/modules/executor/intrinsic_slice_accumulator_test.go:TestStreamCountRateGroupByIDSingle_SliceAccum_AbsentSentinel`
+
+---
+
 ## EX-ETM-SK-01: TestTraceMetrics_Intrinsic_SpanKindGroupBy_LabelValues
 *Added: 2026-04-21*
 
