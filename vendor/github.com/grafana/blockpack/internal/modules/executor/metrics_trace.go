@@ -464,7 +464,7 @@ func traceBuildDenseSeries(
 				if i < len(attrVals) {
 					val = attrVals[i]
 				}
-				labels = append(labels, TraceMetricLabel{Name: name, Value: val})
+				labels = append(labels, TraceMetricLabel{Name: intrinsicLabelName(name), Value: val})
 			}
 		}
 
@@ -559,6 +559,30 @@ func timeBucketIndex(ts, startTime, stepNanos int64) int64 {
 	return bkt
 }
 
+// intrinsicLabelName maps blockpack's internal column names to their Tempo-compatible
+// short label names. For example, "span:kind" → "kind", "span:status" → "status".
+// User attribute columns (e.g. "span.http.method") and resource.service.name are
+// returned unchanged.
+// NOTE-083: label name normalization at emit time — no data migration needed.
+func intrinsicLabelName(colName string) string {
+	switch colName {
+	case colNameSpanKind:
+		return "kind"
+	case colNameSpanStatus:
+		return "status"
+	case colNameSpanName:
+		return "name"
+	case colNameSpanDuration:
+		return "duration"
+	case colNameSpanStart:
+		return "start"
+	case colNameStatusMessage:
+		return "statusMessage"
+	default:
+		return colName
+	}
+}
+
 // traceLabelString builds a deterministic string key from a label slice for sorting.
 func traceLabelString(labels []TraceMetricLabel) string {
 	if len(labels) == 0 {
@@ -645,7 +669,7 @@ func traceHistogramSeries(
 				if i < len(attrVals) {
 					val = attrVals[i]
 				}
-				labels = append(labels, TraceMetricLabel{Name: name, Value: val})
+				labels = append(labels, TraceMetricLabel{Name: intrinsicLabelName(name), Value: val})
 			}
 		}
 		labels = append(labels, TraceMetricLabel{Name: "__bucket", Value: sk.bucketBoundary})
