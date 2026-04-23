@@ -325,6 +325,11 @@ End-to-end allocs include fixed per-call overhead. Zero `strconv.FormatFloat` ca
 - After (NOTE-082): this benchmark exercises the N=1 fast path (`streamHistogramGroupByIDSingle`)
   since group-by is single-dimension. Allocs/op unchanged (55) — fast path reduces map key
   size from 48 to 24 bytes, improving throughput without changing allocation count.
+- After (NOTE-085/087/088): `streamHistogramGroupByIDSingle` is no longer used for production
+  N=1 traffic. The N=1 histogram path now routes through `buildDictIdxForRefs` +
+  `streamByRefSliceHistogram` + `streamByRefSliceHistogramScanDict` (flat pre-allocated
+  accumulator, no intermediate slice). `streamHistogramGroupByIDSingle` is retained for
+  unit tests only.
 
 Back-ref: `internal/modules/executor/intrinsic_group_id_bench_test.go:BenchmarkIntrinsicHistogramGroupBy_AllocCount`
 
@@ -463,12 +468,19 @@ explicitly.
 key size (32→4 bytes) but does not change allocation count; throughput improvement is measured
 by ns/op, not allocs/op.
 
+**Note (NOTE-085):** `streamCountRateGroupByIDSingle` is no longer used for production N=1
+traffic. The N=1 count/rate path now routes through `buildDictIdxForRefs` +
+`streamByRefSliceCountRate` (slice accumulator, zero hash-map probes per span) or through
+`accumulateCountRateDirect` when `accumulateIntrinsicBucketsDirect` succeeds.
+`streamCountRateGroupByIDSingle` is retained for unit tests only. This benchmark now exercises
+the `streamByRefSliceCountRate` path.
+
 **Run command:**
 ```
 go test -bench='BenchmarkIntrinsicCountRateGroupBy_AllocCount' \
     -benchmem -count=5 ./internal/modules/executor/
 ```
 
-**Spec:** NOTE-082 — N=1 group-by fast path.
+**Spec:** NOTE-082, NOTE-085 — N=1 group-by fast path.
 
 Back-ref: `internal/modules/executor/intrinsic_group_id_bench_test.go:BenchmarkIntrinsicCountRateGroupBy_AllocCount`

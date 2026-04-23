@@ -151,10 +151,12 @@ func executeTraceMetricsIntrinsic(
 		if len(buckets) == 0 {
 			return &TraceMetricsResult{}, true, nil
 		}
-	case filteredRefs == nil && len(agg.GroupBy) == 1:
+	case filteredRefs == nil && len(agg.GroupBy) == 1 && isCountRate:
 		// NOTE-085: N=1 no-predicate direct path — build bucketByPK directly from
 		// the span:start slice without materializing inRangeRefs/inRangeVals/dictIdxForRef.
 		// Eliminates ~3GB of intermediate allocations per file.
+		// Gated on isCountRate: accumulateIntrinsicBucketsDirect only handles count/rate;
+		// histogram/agg functions fall through to accumulateIntrinsicBucketsViaKeyMap below.
 		ok, err := accumulateIntrinsicBucketsDirect(ctx, r, tsCol, lo, hi, querySpec, buckets)
 		if err != nil {
 			return nil, false, err
@@ -391,15 +393,17 @@ func streamCountRateGroupBy(
 //
 // Strategy matrix:
 //
+//	count/rate, N=1 group-by:     buildDictIdxForRefs + streamByRefSliceCountRate (NOTE-085)
+//	  → accumulateCountRateDirect fast path when accumulateIntrinsicBucketsDirect succeeds
 //	count/rate, N group-by (N≤8): buildGroupIDMap + streamCountRateGroupByID (NOTE-074 fast path)
-//	  → N=1: dispatches to streamCountRateGroupByIDSingle (NOTE-082 uint32 key)
 //	count/rate, N group-by (N>8): buildGroupKeyMap + streamCountRateGroupBy (string-keyed fallback)
 //	agg field,  no group-by:      stream aggregate column against keyToBucket (no aggVals map)
+//	agg field,  N=1 group-by (histogram): buildDictIdxForRefs + streamByRefSliceHistogram (NOTE-087/088)
+//	  → scans aggregate column via streamByRefSliceHistogramScanDict into flat pre-allocated array
 //	agg field,  N group-by (histogram, N≤8): buildGroupIDMap + streamHistogramGroupByID (NOTE-074)
-//	  → N=1: dispatches to streamHistogramGroupByIDSingle (NOTE-082 uint32 key)
 //	agg field,  N group-by (histogram, N>8): buildGroupKeyMap + streamHistogramGroupBy (fallback)
+//	agg field,  N=1 group-by (other): buildDictIdxForRefs + streamByRefSliceAgg (NOTE-085)
 //	agg field,  N group-by (other, N≤8):    buildGroupIDMap + streamAggGroupByID (NOTE-074)
-//	  → N=1: dispatches to streamAggGroupByIDSingle (NOTE-082 uint32 key)
 //	agg field,  N group-by (other, N>8):    buildGroupKeyMap + aggVals iteration (fallback)
 func accumulateIntrinsicBuckets(
 	ctx context.Context,
@@ -848,9 +852,9 @@ func buildGroupIDMapSingle(
 }
 
 // buildDictIdxForRefs builds a []uint32 parallel to inRangeRefs by scanning the group-by
-// column's dict entries into a dense array indexed by packKey. packKey fits in ~4MB
-// (15 blocks × 65536 spans × 4 bytes), so all array ops are L3-cache-resident — far faster
-// than probing a 150M-entry hash map.
+// column's dict entries into a dense array indexed by packKey. The array is bounded by
+// MaxSpans per file, so all array ops are L3-cache-resident — far faster than probing a
+// hash map for each span.
 // NOTE-085: replaces hash map ops with direct array access; zero map lookups in the hot path.
 // Returns dictIdxForRef (parallel to inRangeRefs), dict (string values), dictByPK (dense
 // packKey→dictIdx+1 array, 0=absent), and maxPK (upper bound of valid packKeys in inRangeRefs).
@@ -862,21 +866,26 @@ func buildDictIdxForRefs(
 ) (dictIdxForRef []uint32, dict []string, dictByPK []uint32, maxPK uint32, err error) {
 	dictIdxForRef = make([]uint32, len(inRangeRefs))
 	dict = []string{""}
-	if col == nil {
+
+	if len(inRangeRefs) == 0 {
 		return dictIdxForRef, dict, nil, 0, nil
 	}
 
 	// Find the max packKey to size the dense array. packKey = (blockIdx<<16)|rowIdx.
+	// Computed before the nil col check so callers always receive a properly-sized
+	// dictByPK (all zeros = all absent) even when the column is missing.
 	for _, ref := range inRangeRefs {
 		if pk := packKey(ref.BlockIdx, ref.RowIdx); pk > maxPK {
 			maxPK = pk
 		}
 	}
-	if maxPK == 0 {
-		return dictIdxForRef, dict, nil, 0, nil
-	}
 	// Dense array: dictByPK[pk] = dictIdx+1 (0 = absent sentinel).
 	dictByPK = make([]uint32, maxPK+1) //nolint:gosec
+
+	if col == nil {
+		// Column absent: all spans map to the empty-string group (dictByPK stays all zeros).
+		return dictIdxForRef, dict, dictByPK, maxPK, nil
+	}
 
 	switch col.Format {
 	case modules_shared.IntrinsicFormatDict:
@@ -893,6 +902,10 @@ func buildDictIdxForRefs(
 			dictAssigned := false
 			for _, ref := range entry.BlockRefs {
 				pk := packKey(ref.BlockIdx, ref.RowIdx)
+				// pk <= maxPK is intentional: pks from blocks outside the query time range are
+				// included but bucketByPK[pk] will be 0 for those, so they are skipped
+				// during accumulation and never contribute to any bucket. This may inflate
+				// the dict slightly but avoids a second pass over BlockRefs.
 				if pk <= maxPK {
 					if !dictAssigned {
 						dict = append(dict, val)
@@ -961,6 +974,10 @@ func accumulateIntrinsicBucketsDirect(
 		return true, nil
 	}
 
+	if lo >= hi {
+		return true, nil // no refs in time range
+	}
+
 	// Find maxPK from the time-range slice (single sequential scan, no array).
 	var maxPK uint32
 	for _, ref := range tsCol.BlockRefs[lo:hi] {
@@ -968,11 +985,9 @@ func accumulateIntrinsicBucketsDirect(
 			maxPK = pk
 		}
 	}
-	if maxPK == 0 {
-		return true, nil
-	}
 
 	// Build bucketByPK directly — no inRangeRefs materialized.
+	// Always allocate even when maxPK==0 (packKey=0 is a valid span key).
 	bucketByPK := make([]int64, maxPK+1) //nolint:gosec
 	inRangeCount := 0
 	for i, ref := range tsCol.BlockRefs[lo:hi] {
@@ -1027,8 +1042,8 @@ func accumulateIntrinsicBucketsDirect(
 	if isCountRate {
 		return true, accumulateCountRateDirect(ctx, groupByCol, dictByPK, bucketByPK, maxPK, inRangeCount, dict, numSteps, buckets)
 	}
-	// Histogram and general agg: fall back (those paths accept bucketByPK separately
-	// but require signature updates — handled in follow-up).
+	// Histogram and general agg: fall through to the streamByRefSlice path which
+	// handles both HISTOGRAM and other aggregate functions via buildDictIdxForRefs.
 	return false, nil
 }
 
@@ -1194,7 +1209,9 @@ func buildAggValsForRef(
 }
 
 // streamByRefSlice is the unified single-pass accumulator for all N=1 group-by aggregate
-// functions. Iterates inRangeRefs sequentially with zero map lookups in the hot loop.
+// functions. Iterates inRangeRefs sequentially with zero map lookups in the hot loop for
+// COUNT/RATE and HISTOGRAM branches. The general aggregate branch (streamByRefSliceAgg)
+// still probes an idBuckets map keyed by (dictIdx, bucket).
 // NOTE-085: replaces separate streamCountRateByRefSlice, streamAggGroupByIDSingle, and
 // streamHistogramGroupByIDSingle for the dict-format group-by path.
 // NOTE-087: r, dictByPK, maxPK added for the HISTOGRAM branch — streamByRefSliceHistogram now
@@ -1326,15 +1343,13 @@ func streamByRefSliceHistogram(
 
 	// Step 1: build bucketByPK from inRangeRefs — O(len(inRangeRefs)) array writes.
 	// bucketByPK[pk] = timeBucketIndex+1 so that 0 means "not in range".
-	var bucketByPK []int64
-	if maxPK > 0 {
-		bucketByPK = make([]int64, maxPK+1) //nolint:gosec
-		for i, ref := range inRangeRefs {
-			pk := packKey(ref.BlockIdx, ref.RowIdx)
-			bk := timeBucketIndex(int64(inRangeVals[i]), tb.StartTime, tb.StepSizeNanos) //nolint:gosec
-			if bk >= 0 && bk < numSteps {
-				bucketByPK[pk] = bk + 1 // +1: sentinel 0 = out of range
-			}
+	// Always allocate when inRangeRefs is non-empty: packKey=0 is a valid span key.
+	bucketByPK := make([]int64, maxPK+1) //nolint:gosec
+	for i, ref := range inRangeRefs {
+		pk := packKey(ref.BlockIdx, ref.RowIdx)
+		bk := timeBucketIndex(int64(inRangeVals[i]), tb.StartTime, tb.StepSizeNanos) //nolint:gosec
+		if bk >= 0 && bk < numSteps {
+			bucketByPK[pk] = bk + 1 // +1: sentinel 0 = out of range
 		}
 	}
 
@@ -1358,6 +1373,17 @@ func streamByRefSliceHistogram(
 		b := intrinsicHistogramBoundary(v, agg.Field)
 		idx, ok := boundaryCache[b]
 		if !ok {
+			// When boundary count reaches histFlatStride, return histFlatStride as a
+			// discard sentinel — not histFlatStride-1 (which is the last valid slot).
+			// streamByRefSliceHistogramScanDict guards with bIdx >= histFlatStride and
+			// skips those entries, so the flat accumulator is never overrun. The emit
+			// loop iterates up to len(boundaries) which is capped at histFlatStride,
+			// so no out-of-bounds access occurs there either.
+			if len(boundaries) >= histFlatStride {
+				idx = int64(histFlatStride) // 1-based cap; scanDict will discard this
+				boundaryCache[b] = idx
+				return idx
+			}
 			boundaries = append(boundaries, b)
 			idx = int64(len(boundaries)) // 1-based; 0 is absent sentinel
 			boundaryCache[b] = idx
@@ -1366,10 +1392,8 @@ func streamByRefSliceHistogram(
 	}
 
 	// seenByPK: dense absent-row tracking — avoids a hash set for len(inRangeRefs) pks.
-	var seenByPK []bool
-	if maxPK > 0 {
-		seenByPK = make([]bool, maxPK+1) //nolint:gosec
-	}
+	// Always allocate when inRangeRefs is non-empty: packKey=0 is a valid span key.
+	seenByPK := make([]bool, maxPK+1) //nolint:gosec
 
 	col, err := r.GetIntrinsicColumn(agg.Field)
 	if err != nil {
@@ -1383,9 +1407,11 @@ func streamByRefSliceHistogram(
 	}
 
 	// Absent-row pass: spans not seen in the aggregate column → bIdx=0 (boundary-0 sentinel).
+	// pk <= maxPK is always true here since bucketByPK is sized maxPK+1 and inRangeRefs
+	// was used to compute maxPK.
 	for _, ref := range inRangeRefs {
 		pk := packKey(ref.BlockIdx, ref.RowIdx)
-		if maxPK > 0 && pk <= maxPK && !seenByPK[pk] {
+		if !seenByPK[pk] {
 			bk := bucketByPK[pk]
 			if bk == 0 {
 				continue // out of range
@@ -1444,7 +1470,7 @@ func streamByRefSliceHistogramScanDict(
 				}
 				spanCount++
 				pk := packKey(ref.BlockIdx, ref.RowIdx)
-				if maxPK == 0 || pk > maxPK {
+				if pk > maxPK {
 					continue
 				}
 				bk := bucketByPK[pk]
@@ -1471,7 +1497,7 @@ func streamByRefSliceHistogramScanDict(
 				continue
 			}
 			pk := packKey(ref.BlockIdx, ref.RowIdx)
-			if maxPK == 0 || pk > maxPK {
+			if pk > maxPK {
 				continue
 			}
 			bk := bucketByPK[pk]
