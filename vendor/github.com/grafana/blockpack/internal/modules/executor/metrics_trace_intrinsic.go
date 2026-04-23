@@ -1408,11 +1408,10 @@ func accumulateAggDirectScanCol(
 		for _, entry := range col.DictEntries {
 			var fval float64
 			if entry.Value != "" {
-				v, parseErr := strconv.ParseFloat(entry.Value, 64)
-				if parseErr != nil {
-					continue
+				// Match buildAggValsForRef: parse failure keeps fval=0 and still marks spans present.
+				if v, parseErr := strconv.ParseFloat(entry.Value, 64); parseErr == nil {
+					fval = v
 				}
-				fval = v
 			} else {
 				fval = float64(entry.Int64Val)
 			}
