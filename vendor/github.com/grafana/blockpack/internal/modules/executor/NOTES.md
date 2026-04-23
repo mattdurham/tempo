@@ -2852,4 +2852,13 @@ matching `streamByRefSliceAgg`'s NaN-emit behavior. Column scan extracted to
 - 150 M hash ops per file eliminated for M9/M11/M15/M17 agg queries; 7.7 MB `valByPK` removed.
 
 **Back-ref:** `internal/modules/executor/metrics_trace_intrinsic.go:accumulateIntrinsicBucketsDirect`,
-`accumulateHistogramDirect`, `accumulateAggDirect`, `accumulateAggDirectScanCol`
+`accumulateHistogramDirect`, `accumulateAggDirect`, `accumulateAggDirectScanCol`,
+`accumulateHistogramDirectN0`
+
+*Addendum (2026-04-22):* Extended NOTE-089 to include the N=0 (no group-by) histogram direct path.
+`accumulateHistogramDirectN0` eliminates `inRangeRefs` materialization and the `keyToBucket` hash
+map for `{} | histogram_over_time(duration)` style queries. Dispatched from
+`executeTraceMetricsIntrinsic` before the N=1 case when `len(agg.GroupBy) == 0` and
+`agg.Function == FuncNameHISTOGRAM` with no predicates. Uses a single all-zero `dictByPK` slice
+(gIdx always resolves to 0) and reuses `streamByRefSliceHistogramScanDict` and
+`streamByRefSliceHistogramFlatEmit` — no new emit format.
