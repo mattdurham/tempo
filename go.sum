@@ -389,6 +389,8 @@ github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674 h1:JeSE6pjso5T
 github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674/go.mod h1:r4w70xmWCQKmi1ONH4KIaBptdivuRPyosB9RmPlGEwA=
 github.com/grafana/blockpack v0.0.0-20260422235401-a128f1a712a0 h1:gDDWwS3gX4OGNYWTDSi2jdLWRsCWmVITXVAQsCCvxFg=
 github.com/grafana/blockpack v0.0.0-20260422235401-a128f1a712a0/go.mod h1:mlv0W0IENnFxXlc9G13al19bm+txGP7sT0kFqUA9voo=
+github.com/grafana/blockpack v0.0.0-20260423011640-5bb76dec4681 h1:hw8jjB7WFgXQIN9SwagOSI3XnBr3HjMD3DgtNa4dhuE=
+github.com/grafana/blockpack v0.0.0-20260423011640-5bb76dec4681/go.mod h1:mlv0W0IENnFxXlc9G13al19bm+txGP7sT0kFqUA9voo=
 github.com/grafana/dskit v0.0.0-20251031165806-a6f15387939b h1:emF9smY95B6vesfGGJ+jG8Q7TKLrVB/Fw12ikahlZEo=
 github.com/grafana/dskit v0.0.0-20251031165806-a6f15387939b/go.mod h1:4att0nkXGqVtpAXofibCPjQlek1nYJcCnxOI94m7o1g=
 github.com/grafana/e2e v0.1.2-0.20251205060319-9884d3ffb1bf h1:YYTHGOeRDG0NHHZlx8MwftSTiBbezySKEacB2B3UWKs=

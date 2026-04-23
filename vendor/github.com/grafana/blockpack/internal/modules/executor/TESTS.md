@@ -3001,3 +3001,93 @@ has sentinel + one entry) produces correct output.
 **Spec invariants tested:** NOTE-086 (minimal dict case).
 
 Back-ref: `internal/modules/executor/intrinsic_hist_3d_test.go:TestStreamByRefSliceHistogram_3D_SingleGroup`
+
+---
+
+## EX-ETM-N1-13: TestAccumulateAggDirect_Sum_ByteEquivalence
+*Added: 2026-04-21*
+
+**Scenario:** `accumulateAggDirect` (SUM) must produce byte-identical output to `accumulateIntrinsicBucketsViaKeyMap` for the same spans.
+
+**Setup:** 6 spans across 3 service names (svc-a/b/c), 2 time buckets, `span:duration` as agg field. Durations cycle through 10ms/50ms/200ms.
+
+**Assertions:** Bucket count, sum fields match reference for every composite key.
+
+**Spec invariants tested:** NOTE-089 (direct agg path byte-equivalence), Risk 1 (emit key format).
+
+Back-ref: `internal/modules/executor/intrinsic_agg_direct_test.go:TestAccumulateAggDirect_Sum_ByteEquivalence`
+
+---
+
+## EX-ETM-N1-14: TestAccumulateAggDirect_Min_ByteEquivalence
+*Added: 2026-04-21*
+
+**Scenario:** `accumulateAggDirect` (MIN) must produce byte-identical output to reference path.
+
+**Setup:** Same 6-span block as EX-ETM-N1-13, FuncNameMIN.
+
+**Assertions:** min values match reference per (group, time-bucket) cell.
+
+**Spec invariants tested:** NOTE-089 (min accumulation correctness).
+
+Back-ref: `internal/modules/executor/intrinsic_agg_direct_test.go:TestAccumulateAggDirect_Min_ByteEquivalence`
+
+---
+
+## EX-ETM-N1-15: TestAccumulateAggDirect_Max_ByteEquivalence
+*Added: 2026-04-21*
+
+**Scenario:** `accumulateAggDirect` (MAX) must produce byte-identical output to reference path.
+
+**Setup:** Same 6-span block as EX-ETM-N1-13, FuncNameMAX.
+
+**Assertions:** max values match reference per (group, time-bucket) cell.
+
+**Spec invariants tested:** NOTE-089 (max accumulation correctness).
+
+Back-ref: `internal/modules/executor/intrinsic_agg_direct_test.go:TestAccumulateAggDirect_Max_ByteEquivalence`
+
+---
+
+## EX-ETM-N1-16: TestAccumulateAggDirect_AbsentAggField
+*Added: 2026-04-21*
+
+**Scenario:** `accumulateAggDirect` must handle absent agg field (nil column) identically to reference: each in-range span gets a count=0 bucket.
+
+**Setup:** 4 spans with zero duration → writer omits span:duration column entirely. service.name="svc-absent".
+
+**Assertions:** Bucket keys match reference; count=0 for all buckets.
+
+**Spec invariants tested:** NOTE-089 (absent-row pass via bucketByPK walk), Edge Case 1.
+
+Back-ref: `internal/modules/executor/intrinsic_agg_direct_test.go:TestAccumulateAggDirect_AbsentAggField`
+
+---
+
+## EX-ETM-N1-17: TestAccumulateAggDirect_MultiBucket
+*Added: 2026-04-21*
+
+**Scenario:** `accumulateAggDirect` (SUM) correctly accumulates spans across 3 time buckets.
+
+**Setup:** 12 spans across 2 service names (svc-p/svc-q), 3 time buckets, 2 duration values.
+
+**Assertions:** Bucket output matches reference for all (group, time) cells.
+
+**Spec invariants tested:** NOTE-089 (time-bucket index dimension in groupBuckets[][numSteps]).
+
+Back-ref: `internal/modules/executor/intrinsic_agg_direct_test.go:TestAccumulateAggDirect_MultiBucket`
+
+---
+
+## EX-ETM-N1-18: TestAccumulateHistogramDirect_ByteEquivalence
+*Added: 2026-04-21*
+
+**Scenario:** `accumulateHistogramDirect` must produce byte-identical output to `streamByRefSliceHistogram` (hist3DRunNew) for the same spans.
+
+**Setup:** 6 spans, 3 service names, 2 duration values (10ms/100ms), 1 time bucket. FuncNameHISTOGRAM.
+
+**Assertions:** Bucket counts match hist3DRunNew reference for every composite key.
+
+**Spec invariants tested:** NOTE-089 (histogram direct path as drop-in replacement), Risk 3 (absent sentinel stride index).
+
+Back-ref: `internal/modules/executor/intrinsic_agg_direct_test.go:TestAccumulateHistogramDirect_ByteEquivalence`
