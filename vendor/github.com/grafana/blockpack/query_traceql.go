@@ -269,6 +269,15 @@ func streamPipelineQuery(r *Reader, mq *traceqlparser.MetricsQuery, opts QueryOp
 // Pass 1: count spans per trace (O(N_distinct_traces) memory, no span content retained).
 // Pass 2: re-stream and emit only spans from qualifying traces.
 //
+// Ordering note: pass 2 emits spans in column-scan order (raw stream order from
+// streamFilterProgram), NOT grouped by trace. The general streamPipelineQuery path
+// groups spans by trace in first-seen order before emitting; this fast path deliberately
+// skips that buffering to preserve the O(N_distinct_traces) memory guarantee.
+// This is acceptable because the caller (Tempo) uses emitted spans only to fetch full
+// traces via FindTraceByID — it does not depend on trace-grouped emission order.
+// Buffering all pass-2 spans to restore grouped order would defeat the memory savings
+// that motivate this path (NOTE-092).
+//
 // Precondition: pipeline != nil && pipeline.HasThreshold must be true.
 // The caller (streamPipelineQuery) guards on HasThreshold before dispatching here.
 // The defensive check below ensures correctness if this invariant is ever violated.
@@ -347,7 +356,11 @@ func streamPipelineQueryCount(r *Reader, mq *traceqlparser.MetricsQuery, opts Qu
 	})
 	// Terminal signal to the caller. streamFilterProgram calls the inner callback (above)
 	// with (nil, false), not the outer fn — so this is the only fn(nil, false) the caller sees.
-	fn(nil, false)
+	// Only send the terminal signal when there was no error; on error the caller must not
+	// treat the stream as successfully completed.
+	if err == nil {
+		fn(nil, false)
+	}
 	return err
 }
 
