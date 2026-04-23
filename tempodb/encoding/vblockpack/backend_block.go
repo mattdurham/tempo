@@ -37,7 +37,7 @@ const (
 
 // metricsOpRe extracts the metric function name from a TraceQL metrics query.
 // For example: "{}|rate()" → "rate", "{...}|count_over_time() by (x)" → "count_over_time".
-var metricsOpRe = regexp.MustCompile(`\|(\w+)\(`)
+var metricsOpRe = regexp.MustCompile(`\|\s*(\w+)\s*\(`)
 
 // tempoReaderProvider implements blockpack.ReaderProvider directly against
 // Tempo's backend.Reader for a single fixed object (DataFileName).
