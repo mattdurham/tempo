@@ -2904,3 +2904,63 @@ not O(inRangeCount); for sparse blocks this is cheaper and avoids ref materialis
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:accumulateCountRateDirect`,
 `accumulateHistogramDirect`, `accumulateAggDirect`, `accumulateHistogramDirectN0`,
 `scanHistogramN0`
+
+---
+
+## NOTE-091: Structural Query Predicate Pruning — LHS Program for File-Level Bloom/Range (2026-04-22)
+
+**Context:** `ExecuteStructural` previously called `planner.Plan(nil, tr)` — no predicates,
+so no bloom or range pruning. For `{span.http.status_code="500"} >> {}` on a large file,
+this forced reading all internal blocks regardless of filter selectivity.
+
+**Decision:** Use the LHS filter program (first non-nil program from the structural chain)
+to drive `fileLevelReject` and `fileLevelBloomReject` directly with the LHS program's
+predicate nodes, enabling file-level bloom rejection and range pruning before calling
+`planner.Plan(nil, tr)` for block selection.
+
+**Safety:** Block-level pruning within a file is NOT safe for structural queries — a parent
+span may be in a different internal block than the child span. File-level rejection is safe:
+if the LHS filter guarantees no match in the entire file, no structural match is possible.
+Block selection therefore uses `planner.Plan(nil, tr)` (no predicate pruning), ensuring all
+blocks that survive file-level rejection are scanned.
+
+**Effect:** Files where the bloom filter guarantees no LHS-matching span are skipped entirely.
+This is equivalent to how tempodb's bloom filters skip entire blockpack objects — we now apply
+the same logic inside `ExecuteStructural`.
+
+**False negative risk:** Bloom filters have ~0.4% FPR. Accepted: same semantics as tempodb's
+existing bloom-based file selection.
+
+**Edge case:** When all programs are nil (e.g. `{} >> {}`), `firstNonNilProgram` returns nil
+and the inline fileLevelReject/fileLevelBloomReject check is skipped; the code falls through
+directly to `planner.Plan(nil, tr)`. Behavior is unchanged from before.
+
+Back-ref: `internal/modules/executor/stream_structural.go:collectAllStructuralSpans`,
+`internal/modules/executor/stream_structural.go:firstNonNilProgram`
+
+---
+
+## NOTE-092: Pipeline Query Streaming Count — Two-Pass to Avoid O(N_spans) Allocation (2026-04-22)
+
+**Context:** `streamPipelineQuery` accumulated all matching spans into `allSpans []SpanMatch`
+before grouping and aggregating. For `{} | count() > 5` on a large file with 500K+ spans,
+this caused 60s timeouts due to massive allocation and GC pressure.
+
+**Decision:** For `count`/`count_over_time` aggregates with a threshold, use a two-pass approach:
+- Pass 1: stream spans, accumulate per-trace integer counters only (no span content).
+- Filter qualifying trace IDs by threshold.
+- Pass 2: stream spans again, emit only spans from qualifying traces.
+
+Memory: O(N_distinct_traces) instead of O(N_spans). I/O: 2× (two full scans), which is
+acceptable because the alternative is OOM or timeout.
+
+For other aggregates (avg, min, max, sum) where span field values are needed, the general
+path with `allSpans` accumulation and `maxPipelineSpans` guard is retained.
+
+**Edge case — no qualifying traces:** When `qualified` map is empty after pass 1, `fn(nil, false)`
+is called immediately and pass 2 is skipped entirely.
+
+**Edge case — limit:** Pass 2 tracks a `limit` counter per the caller's `opts.Limit`; once
+exhausted, streaming stops early via the callback returning false.
+
+Back-ref: `query_traceql.go:streamPipelineQuery`, `query_traceql.go:streamPipelineQueryCount`

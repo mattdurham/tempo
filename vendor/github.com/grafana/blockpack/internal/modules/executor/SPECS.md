@@ -813,8 +813,11 @@ Back-ref: `internal/modules/executor/stream_structural.go:ExecuteStructural`
 ### 11.3 Invariants
 
 - **SPEC-STRUCT-1:** Nil reader returns `&StructuralResult{}` with no error.
-- **SPEC-STRUCT-2:** All blocks are scanned — structural queries bypass bloom and range
-  pruning because any block may contain spans from either side of the operator.
+- **SPEC-STRUCT-2:** File-level bloom and range pruning is applied using the LHS filter
+  predicates (NOTE-091). Within a file, all blocks are scanned — parent spans may be in
+  any internal block. Files where the LHS filter bloom-rejects are skipped entirely.
+  For `{} >> {}` (no predicates), behavior is unchanged: `planner.Plan(nil, tr)` is called
+  (time-range pruning only).
 - **SPEC-STRUCT-3:** A nil filter in any chain slot of `StructuralQuery` (left or any right
   `Expr` node) compiles to a nil program, which matches all rows (wildcard `{}`).
 - **SPEC-STRUCT-4:** `Options.Limit > 0` caps the number of entries in `StructuralResult.Matches`.

@@ -3124,3 +3124,120 @@ Back-ref: `internal/modules/executor/intrinsic_agg_direct_test.go:TestAccumulate
 **Spec invariants tested:** SPEC-ETM-14 N=0 histogram dispatch arm; NOTE-089 end-to-end wiring of `accumulateHistogramDirectN0` through `executeTraceMetricsIntrinsic`.
 
 Back-ref: `internal/modules/executor/intrinsic_agg_direct_test.go:TestAccumulateHistogramDirectN0_DispatchEndToEnd`
+
+---
+
+## EX-STRUCT-PRUNE-1: TestStructuralQuery_LHSPredicatePruning_BloomReject
+*Added: 2026-04-22*
+
+**Scenario:** A structural query with a selective LHS filter skips files that bloom-reject the LHS predicate.
+
+**Setup:** Two blockpack files written in-memory:
+- File A: contains a span with `span.http.status_code="500"` (LHS filter matches).
+- File B: contains only spans with `span.http.status_code="200"` (LHS filter does not match; bloom reject expected).
+
+Query: `{span.http.status_code="500"} >> {}` (child structural query).
+
+**Assertions:**
+- Result contains matches from File A only.
+- No spurious matches from File B are returned.
+- (Optional stats check): File B's blocks are not scanned if the Reader exposes block I/O counters.
+
+**Spec invariants tested:** SPEC-STRUCT-2 (file-level bloom pruning via NOTE-091), NOTE-091 (LHS program used for `planBlocks`).
+
+Back-ref: `internal/modules/executor/stream_structural_internal_test.go:TestCollectAllStructuralSpans_LHSProgramBloomRejectFile`
+
+---
+
+## EX-STRUCT-PRUNE-2: TestStructuralQuery_AllNilPrograms_NoChange
+*Added: 2026-04-22*
+
+**Scenario:** A `{} >> {}` query (both programs nil) falls back to the existing `planner.Plan(nil, tr)` behavior — no regression.
+
+**Setup:** One blockpack file with 3 parent-child span pairs. Query: `{} >> {}`.
+
+**Assertions:**
+- All 3 child spans are returned (wildcard match).
+- No error.
+
+**Spec invariants tested:** NOTE-091 (nil program edge case falls through to `planner.Plan(nil, tr)`).
+
+Back-ref: `internal/modules/executor/stream_structural_internal_test.go:TestCollectAllStructuralSpans_NilPrograms_ScansAll`
+
+---
+
+## EX-PA-COUNT-1: TestQueryTraceQL_Pipeline_Count_CorrectThreshold
+*Added: 2026-04-22*
+
+**Scenario:** `{} | count() > 2` returns only traces with >2 matching spans.
+
+**Setup:** 3 traces written to a blockpack file:
+- Trace 0: 1 span (does not qualify).
+- Trace 1: 2 spans (does not qualify).
+- Trace 2: 3 spans (qualifies).
+
+Query: `{} | count() > 2`.
+
+**Assertions:**
+- Only spans from Trace 2 are returned.
+- No spans from Trace 0 or Trace 1 are returned.
+- Total spans returned == 3.
+- Exactly 1 distinct trace ID in results.
+
+**Spec invariants tested:** NOTE-092 (two-pass streaming count), SPEC-PA-3 (count returns all spans), SPEC-PA-5 (grouping by TraceID).
+
+Back-ref: `api_test.go:TestQueryTraceQL_Pipeline_Count_CorrectThreshold`
+
+---
+
+## EX-PA-COUNT-2: TestQueryTraceQL_Pipeline_Count_WithLimit
+*Added: 2026-04-22*
+
+**Scenario:** `{} | count() > 2` with `opts.Limit = 2` returns at most 2 spans.
+
+**Setup:** 3 traces × 3 spans each (all traces qualify count() > 2). Query: `{} | count() > 2`, limit=2.
+
+**Assertions:**
+- At most 2 spans are returned (limit honored).
+- At least 1 span is returned (qualifying traces exist).
+- No error.
+
+**Spec invariants tested:** NOTE-092 (limit honored in pass 2 streaming), SPEC-PA-4 implicit (bounded emission).
+
+Back-ref: `api_test.go:TestQueryTraceQL_Pipeline_Count_WithLimit`
+
+---
+
+## EX-PA-COUNT-3: TestQueryTraceQL_Pipeline_Count_NoQualifyingTraces
+*Added: 2026-04-22*
+
+**Scenario:** `{} | count() > 5` where no trace has >5 spans returns empty result without executing pass 2.
+
+**Setup:** 5 traces × 1 span each. Query: `{} | count() > 5`.
+
+**Assertions:**
+- No spans returned (no trace has count > 5).
+- No error.
+
+**Spec invariants tested:** NOTE-092 (empty `qualified` map skips pass 2), SPEC-PA-4.
+
+Back-ref: `api_test.go:TestQueryTraceQL_Pipeline_Count_NoQualifyingTraces`
+
+---
+
+## EX-PA-COUNT-4: TestQueryTraceQL_Pipeline_NonCountAggregate_GeneralPath
+*Added: 2026-04-22*
+
+**Scenario:** `{span.latency_ms > 0} | avg(span.latency_ms) > 50` uses the general (non-streaming) path.
+
+**Setup:** 2 traces:
+- Trace A: 2 spans with latency_ms=100 (avg=100, qualifies).
+- Trace B: 2 spans with latency_ms=10 (avg=10, does not qualify).
+
+**Assertions:**
+- Only spans from Trace A are returned.
+- No error.
+
+**Spec invariants tested:** NOTE-092 (non-count aggregates use general path), SPEC-PA-1, SPEC-PA-2.
+
+Back-ref: `api_test.go:TestQueryTraceQL_Pipeline_NonCountAggregate_GeneralPath`
