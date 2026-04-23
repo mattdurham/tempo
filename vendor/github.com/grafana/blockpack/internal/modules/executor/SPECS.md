@@ -962,6 +962,38 @@ Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:intrinsicInt64Co
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:scanIntrinsicColDictIDs`
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:scanIntrinsicColVals`
 
+## SPEC-ETM-14: N=1 No-Predicate Direct Accumulation
+*Added: 2026-04-22*
+
+**N=1 no-predicate direct accumulation** — when a metrics query has exactly one group-by key,
+no span-level predicate filter, and the block is a dict-encoded intrinsic block, the executor
+dispatches through `accumulateIntrinsicBucketsDirect` which eliminates `inRangeRefs` and hash
+maps entirely.
+
+Dispatch conditions (all must hold):
+- `len(agg.GroupBy) == 1`
+- `len(predicates) == 0` (no TraceQL filter)
+- block is intrinsic-format (dict-encoded)
+
+Behavioral invariants:
+- **Byte-equivalence guarantee:** output is byte-identical to the hash-map-based path for all
+  supported function types (count, rate, sum, min, max, histogram).
+- **`inRangeCount == 0` early exit:** returns `(true, nil)` before any dict or agg column work
+  when no spans fall within the time range; the returned empty `buckets` map is correct.
+- **`numSteps <= 0` guard:** returns `(true, nil)` for degenerate time specs.
+- **Flat-format group-by fallback:** when the group-by column is flat-format (not dict-encoded),
+  returns `(false, nil)` to fall through to the general `executeTraceMetricsIntrinsicN` path.
+- **N>1 fallback:** queries with more than one group-by key reach the `default:` branch and
+  fall through to the full hash map accumulation path.
+
+Fallback: any condition not met falls through to the general `executeTraceMetricsIntrinsicN`
+path with full hash map accumulation.
+
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:accumulateIntrinsicBucketsDirect`,
+          `internal/modules/executor/metrics_trace_intrinsic.go:accumulateHistogramDirect`,
+          `internal/modules/executor/metrics_trace_intrinsic.go:accumulateAggDirect`,
+          `internal/modules/executor/metrics_trace_intrinsic.go:accumulateCountRateDirect`
+
 ## SPEC-SCAN-1: StreamScanEqualAny Dict-Mask Fast Path Invariants
 *Added: 2026-04-17*
 

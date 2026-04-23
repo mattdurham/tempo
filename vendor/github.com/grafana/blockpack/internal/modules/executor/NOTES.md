@@ -2816,3 +2816,40 @@ the column scan, we can accumulate inline during the scan:
 
 **Back-ref:** `internal/modules/executor/metrics_trace_intrinsic.go:streamByRefSliceHistogram`,
 `streamByRefSliceHistogramScanDict`, `streamByRefSliceHistogramFlatEmit`
+
+---
+
+## NOTE-089: Direct path extended to HISTOGRAM and general agg functions (2026-04-21)
+
+*Added: 2026-04-21*
+
+**Decision:** Remove the `&& isCountRate` gate at `executeTraceMetricsIntrinsic` and extend
+`accumulateIntrinsicBucketsDirect` to dispatch to two new functions: `accumulateHistogramDirect`
+(HISTOGRAM) and `accumulateAggDirect` (SUM/AVG/MIN/MAX/STDDEV/QUANTILE).
+
+**Rationale:**
+The direct path (NOTE-085) built `bucketByPK`/`dictByPK` arrays but then returned `(false, nil)`
+for non-count/rate functions, forcing a fallback to `accumulateIntrinsicBucketsViaKeyMap` which
+materializes `inRangeRefs`/`inRangeVals` (~3 GB) and calls `streamByRefSliceAgg` (150 M hash
+map probes per file for M9/M11/M15/M17 queries via `idBuckets map[aggKey]*aggBucketState`).
+
+`accumulateHistogramDirect`: receives the pre-built `bucketByPK` (already available in
+`accumulateIntrinsicBucketsDirect`) and passes it directly to `streamByRefSliceHistogramScanDict`,
+eliminating the redundant O(inRangeRefs) rebuild that `streamByRefSliceHistogram` performed.
+Absent-row pass walks `bucketByPK` directly (like `accumulateCountRateDirect`) — no `inRangeRefs`.
+
+`accumulateAggDirect`: allocates `[][]*aggBucketState` sized `[numGroups][numSteps]` (lazy nil
+pointers per cell). Scans the agg column directly using `dictByPK`/`bucketByPK` for O(1) group
+and time-bucket lookups — no hash map, no `buildAggValsForRef` (7.7 MB `valByPK` eliminated),
+no `inRangeRefs` scan. Absent-row pass walks `bucketByPK` to create count=0 bucket entries,
+matching `streamByRefSliceAgg`'s NaN-emit behavior. Column scan extracted to
+`accumulateAggDirectScanCol` to bound cyclomatic complexity.
+
+**Consequence:**
+- `&& isCountRate` gate removed; `accumulateIntrinsicBucketsDirect` now handles all N=1
+  no-predicate queries with dict-format group-by.
+- `streamByRefSliceAgg` and `buildAggValsForRef` remain as fallback for N>1 or flat group-by.
+- 150 M hash ops per file eliminated for M9/M11/M15/M17 agg queries; 7.7 MB `valByPK` removed.
+
+**Back-ref:** `internal/modules/executor/metrics_trace_intrinsic.go:accumulateIntrinsicBucketsDirect`,
+`accumulateHistogramDirect`, `accumulateAggDirect`, `accumulateAggDirectScanCol`

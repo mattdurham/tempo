@@ -151,12 +151,11 @@ func executeTraceMetricsIntrinsic(
 		if len(buckets) == 0 {
 			return &TraceMetricsResult{}, true, nil
 		}
-	case filteredRefs == nil && len(agg.GroupBy) == 1 && isCountRate:
+	case filteredRefs == nil && len(agg.GroupBy) == 1:
 		// NOTE-085: N=1 no-predicate direct path — build bucketByPK directly from
 		// the span:start slice without materializing inRangeRefs/inRangeVals/dictIdxForRef.
 		// Eliminates ~3GB of intermediate allocations per file.
-		// Gated on isCountRate: accumulateIntrinsicBucketsDirect only handles count/rate;
-		// histogram/agg functions fall through to accumulateIntrinsicBucketsViaKeyMap below.
+		// NOTE-089: extended to HISTOGRAM and all general agg functions (SUM/AVG/MIN/MAX/STDDEV/QUANTILE).
 		ok, err := accumulateIntrinsicBucketsDirect(ctx, r, tsCol, lo, hi, querySpec, buckets)
 		if err != nil {
 			return nil, false, err
@@ -399,10 +398,11 @@ func streamCountRateGroupBy(
 //	count/rate, N group-by (N>8): buildGroupKeyMap + streamCountRateGroupBy (string-keyed fallback)
 //	agg field,  no group-by:      stream aggregate column against keyToBucket (no aggVals map)
 //	agg field,  N=1 group-by (histogram): buildDictIdxForRefs + streamByRefSliceHistogram (NOTE-087/088)
-//	  → scans aggregate column via streamByRefSliceHistogramScanDict into flat pre-allocated array
+//	  → accumulateHistogramDirect fast path when accumulateIntrinsicBucketsDirect succeeds (NOTE-089)
 //	agg field,  N group-by (histogram, N≤8): buildGroupIDMap + streamHistogramGroupByID (NOTE-074)
 //	agg field,  N group-by (histogram, N>8): buildGroupKeyMap + streamHistogramGroupBy (fallback)
 //	agg field,  N=1 group-by (other): buildDictIdxForRefs + streamByRefSliceAgg (NOTE-085)
+//	  → accumulateAggDirect fast path when accumulateIntrinsicBucketsDirect succeeds (NOTE-089)
 //	agg field,  N group-by (other, N≤8):    buildGroupIDMap + streamAggGroupByID (NOTE-074)
 //	agg field,  N group-by (other, N>8):    buildGroupKeyMap + aggVals iteration (fallback)
 func accumulateIntrinsicBuckets(
@@ -1042,9 +1042,11 @@ func accumulateIntrinsicBucketsDirect(
 	if isCountRate {
 		return true, accumulateCountRateDirect(ctx, groupByCol, dictByPK, bucketByPK, maxPK, inRangeCount, dict, numSteps, buckets)
 	}
-	// Histogram and general agg: fall through to the streamByRefSlice path which
-	// handles both HISTOGRAM and other aggregate functions via buildDictIdxForRefs.
-	return false, nil
+	// NOTE-089: HISTOGRAM and general agg now handled by direct column scan.
+	if agg.Function == vm.FuncNameHISTOGRAM {
+		return true, accumulateHistogramDirect(ctx, r, agg, dictByPK, bucketByPK, maxPK, dict, numSteps, tb, buckets)
+	}
+	return true, accumulateAggDirect(ctx, r, agg, dictByPK, bucketByPK, maxPK, dict, numSteps, buckets)
 }
 
 // accumulateCountRateDirect scans the group-by dict entries directly and accumulates
@@ -1136,6 +1138,235 @@ func accumulateCountRateDirect(
 			}
 			k := strconv.FormatInt(int64(timeIdx), 10) + "\x00" + gk //nolint:gosec
 			intrinsicGetOrCreateBucket(buckets, k).count += c
+		}
+	}
+	return nil
+}
+
+// accumulateHistogramDirect is the direct-path HISTOGRAM accumulator for N=1 group-by queries.
+// Receives pre-built dictByPK and bucketByPK from accumulateIntrinsicBucketsDirect — avoids
+// rebuilding bucketByPK from inRangeRefs (eliminates O(inRangeCount) redundant array writes).
+// Absent-row pass walks bucketByPK directly, matching accumulateCountRateDirect's pattern.
+// NOTE-089: extends accumulateIntrinsicBucketsDirect to HISTOGRAM without inRangeRefs.
+func accumulateHistogramDirect(
+	ctx context.Context,
+	r *modules_reader.Reader,
+	agg vm.AggregateSpec,
+	dictByPK []uint32,
+	bucketByPK []int64,
+	maxPK uint32,
+	dict []string,
+	numSteps int64,
+	tb vm.TimeBucketSpec,
+	buckets map[string]*aggBucketState,
+) error {
+	numGroups := len(dict)
+	stride2 := numSteps
+	stride1 := int64(histFlatStride) * numSteps
+	groupCountsFlat := make([]int64, int64(numGroups)*stride1) //nolint:gosec
+
+	boundaryCache := make(map[float64]int64, 32)
+	boundaries := make([]float64, 0, 32)
+
+	getBoundaryIdx := func(v float64) int64 {
+		b := intrinsicHistogramBoundary(v, agg.Field)
+		idx, ok := boundaryCache[b]
+		if !ok {
+			if len(boundaries) >= histFlatStride {
+				idx = int64(histFlatStride)
+				boundaryCache[b] = idx
+				return idx
+			}
+			boundaries = append(boundaries, b)
+			idx = int64(len(boundaries))
+			boundaryCache[b] = idx
+		}
+		return idx
+	}
+
+	seenByPK := make([]bool, maxPK+1) //nolint:gosec
+
+	col, err := r.GetIntrinsicColumn(agg.Field)
+	if err != nil {
+		return err
+	}
+	if col != nil {
+		if err := streamByRefSliceHistogramScanDict(ctx, col, bucketByPK, dictByPK, maxPK, seenByPK, getBoundaryIdx, groupCountsFlat, stride1, stride2); err != nil {
+			return err
+		}
+	}
+
+	// Absent-row pass: walk bucketByPK directly (no inRangeRefs) — bIdx=0 sentinel.
+	for pk, bk := range bucketByPK {
+		if bk == 0 || seenByPK[pk] {
+			continue
+		}
+		var gIdx int64
+		if raw := dictByPK[pk]; raw > 0 {
+			gIdx = int64(raw - 1) //nolint:gosec
+		}
+		if gIdx >= int64(numGroups) { //nolint:gosec
+			continue
+		}
+		groupCountsFlat[gIdx*stride1+(bk-1)]++
+	}
+
+	return streamByRefSliceHistogramFlatEmit(groupCountsFlat, stride1, stride2, numGroups, dict, boundaries, buckets)
+}
+
+// accumulateAggDirect is the direct-path general agg accumulator (SUM/AVG/MIN/MAX/STDDEV/QUANTILE)
+// for N=1 group-by queries. Scans the agg column directly using dictByPK/bucketByPK dense arrays,
+// eliminating buildAggValsForRef (7.7 MB), inRangeRefs materialization, and the 150 M hash map
+// probes of streamByRefSliceAgg.
+// NOTE-089: implements direct agg accumulation matching accumulateCountRateDirect's pattern.
+func accumulateAggDirect(
+	ctx context.Context,
+	r *modules_reader.Reader,
+	agg vm.AggregateSpec,
+	dictByPK []uint32,
+	bucketByPK []int64,
+	maxPK uint32,
+	dict []string,
+	numSteps int64,
+	buckets map[string]*aggBucketState,
+) error {
+	numGroups := len(dict)
+	groupBuckets := make([][]*aggBucketState, numGroups)
+	for i := range groupBuckets {
+		groupBuckets[i] = make([]*aggBucketState, numSteps)
+	}
+	seenByPK := make([]bool, maxPK+1) //nolint:gosec
+
+	col, err := r.GetIntrinsicColumn(agg.Field)
+	if err != nil {
+		return err
+	}
+	if col != nil {
+		if err := accumulateAggDirectScanCol(ctx, col, agg.Function, dictByPK, bucketByPK, maxPK, numSteps, numGroups, groupBuckets, seenByPK); err != nil {
+			return err
+		}
+	}
+
+	// Absent-row pass: create count=0 bucket for in-range spans with no agg value,
+	// matching streamByRefSliceAgg's NaN-emit behavior.
+	for pk, bk := range bucketByPK {
+		if bk == 0 || seenByPK[pk] {
+			continue
+		}
+		var gIdx int
+		if raw := dictByPK[pk]; raw > 0 {
+			gIdx = int(raw - 1) //nolint:gosec
+		}
+		if gIdx < numGroups && groupBuckets[gIdx][bk-1] == nil {
+			groupBuckets[gIdx][bk-1] = &aggBucketState{min: math.MaxFloat64, max: -math.MaxFloat64}
+		}
+	}
+
+	for gIdx, row := range groupBuckets {
+		gk := ""
+		if gIdx < len(dict) {
+			gk = dict[gIdx]
+		}
+		for timeIdx, bucket := range row {
+			if bucket == nil {
+				continue
+			}
+			k := strconv.FormatInt(int64(timeIdx), 10) + "\x00" + gk //nolint:gosec
+			buckets[k] = bucket
+		}
+	}
+	return nil
+}
+
+// accumulateAggDirectScanCol scans an intrinsic column and accumulates directly into groupBuckets.
+// Extracted to keep accumulateAggDirect cyclomatic complexity bounded.
+// seenByPK[pk] is set true for every pk that appears in the column and is in time range.
+func accumulateAggDirectScanCol(
+	ctx context.Context,
+	col *modules_shared.IntrinsicColumn,
+	fn string,
+	dictByPK []uint32,
+	bucketByPK []int64,
+	maxPK uint32,
+	numSteps int64,
+	numGroups int,
+	groupBuckets [][]*aggBucketState,
+	seenByPK []bool,
+) error {
+	spanCount := 0
+	switch col.Format {
+	case modules_shared.IntrinsicFormatDict:
+		for _, entry := range col.DictEntries {
+			var fval float64
+			if entry.Value != "" {
+				v, parseErr := strconv.ParseFloat(entry.Value, 64)
+				if parseErr != nil {
+					continue
+				}
+				fval = v
+			} else {
+				fval = float64(entry.Int64Val)
+			}
+			for _, ref := range entry.BlockRefs {
+				if spanCount%ctxCheckInterval == 0 {
+					if err := ctx.Err(); err != nil {
+						return err
+					}
+				}
+				spanCount++
+				pk := packKey(ref.BlockIdx, ref.RowIdx)
+				if pk > maxPK {
+					continue
+				}
+				bk := bucketByPK[pk]
+				if bk == 0 {
+					continue
+				}
+				seenByPK[pk] = true
+				var gIdx int
+				if raw := dictByPK[pk]; raw > 0 {
+					gIdx = int(raw - 1) //nolint:gosec
+				}
+				if gIdx >= numGroups || bk-1 >= numSteps {
+					continue
+				}
+				if groupBuckets[gIdx][bk-1] == nil {
+					groupBuckets[gIdx][bk-1] = &aggBucketState{min: math.MaxFloat64, max: -math.MaxFloat64}
+				}
+				updateAggBucket(groupBuckets[gIdx][bk-1], fn, fval)
+			}
+		}
+	case modules_shared.IntrinsicFormatFlat:
+		for i, ref := range col.BlockRefs {
+			if spanCount%ctxCheckInterval == 0 {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+			}
+			spanCount++
+			if i >= len(col.Uint64Values) {
+				continue
+			}
+			pk := packKey(ref.BlockIdx, ref.RowIdx)
+			if pk > maxPK {
+				continue
+			}
+			bk := bucketByPK[pk]
+			if bk == 0 {
+				continue
+			}
+			seenByPK[pk] = true
+			var gIdx int
+			if raw := dictByPK[pk]; raw > 0 {
+				gIdx = int(raw - 1) //nolint:gosec
+			}
+			if gIdx >= numGroups || bk-1 >= numSteps {
+				continue
+			}
+			if groupBuckets[gIdx][bk-1] == nil {
+				groupBuckets[gIdx][bk-1] = &aggBucketState{min: math.MaxFloat64, max: -math.MaxFloat64}
+			}
+			updateAggBucket(groupBuckets[gIdx][bk-1], fn, float64(col.Uint64Values[i])) //nolint:gosec
 		}
 	}
 	return nil
