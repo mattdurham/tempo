@@ -479,3 +479,35 @@ avoidable S3 re-reads. Routing through `r.cache` eliminates these re-reads for h
 
 Back-ref: `internal/modules/blockio/reader/reader.go:Reader.ReadGroup`,
 `internal/modules/blockio/reader/reader.go:Reader.ReadBlocks`
+
+---
+
+## SPEC-ROOT-016: Single-Pass Processing — Only Load What You Use
+
+**Process data in a single pass. Never load data into an intermediate collection just to iterate it again.**
+
+**Rules:**
+
+- **One pass per data source.** When scanning a column or index, accumulate results immediately
+  as each entry is visited. Do not collect values into a slice and process them in a second loop.
+- **Pull only matching data.** Only fetch, decode, or allocate data that is actually needed for
+  the current query. If a dimension is absent (no group-by, no predicate, nil column), skip the
+  allocation entirely — do not allocate a zero-filled placeholder to satisfy a generic code path.
+- **Prefer dense arrays over hash maps for hot lookup paths.** For per-span lookups keyed by a
+  bounded integer, a pre-allocated array gives O(1) cache-friendly access. Hash maps have O(1)
+  amortized cost but cause cache misses at high element counts that dominate CPU. Use hash maps
+  only when the key space is unbounded or sparse.
+- **Allocate proportional to the actual problem size.** Size arrays to the number of distinct
+  values present in the data, not to a theoretical maximum.
+
+**Rationale:**
+
+Multi-pass designs that collect intermediate state compound allocation cost, increase GC pressure,
+and destroy CPU cache locality. In production at 150 M spans per query window, a single extra
+`[]BlockRef` allocation added 1.2 GB of heap; hash map probing in the accumulation hot path
+consumed 54% of query CPU. Single-pass dense-array designs eliminated both.
+
+**Enforcement:**
+
+Code review. When adding any new data-processing path, verify no intermediate collection is built
+solely to be iterated a second time.

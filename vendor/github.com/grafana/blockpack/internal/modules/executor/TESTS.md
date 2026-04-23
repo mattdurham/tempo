@@ -3054,7 +3054,7 @@ Back-ref: `internal/modules/executor/intrinsic_agg_direct_test.go:TestAccumulate
 
 **Scenario:** `accumulateAggDirect` must handle absent agg field (nil column) identically to reference: each in-range span gets a count=0 bucket.
 
-**Setup:** 4 spans with zero duration → writer omits span:duration column entirely. service.name="svc-absent".
+**Setup:** 4 spans with `span:absent` as aggregate field (a field never written to the block). `r.GetIntrinsicColumn("span:absent")` returns nil. service.name="svc-absent".
 
 **Assertions:** Bucket keys match reference; count=0 for all buckets.
 
@@ -3091,6 +3091,8 @@ Back-ref: `internal/modules/executor/intrinsic_agg_direct_test.go:TestAccumulate
 **Spec invariants tested:** NOTE-089 (histogram direct path as drop-in replacement), Risk 3 (absent sentinel stride index).
 
 Back-ref: `internal/modules/executor/intrinsic_agg_direct_test.go:TestAccumulateHistogramDirect_ByteEquivalence`
+
+---
 
 ## EX-ETM-N1-19: TestAccumulateHistogramDirectN0_ByteEquivalence
 *Added: 2026-04-22*

@@ -962,7 +962,7 @@ Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:intrinsicInt64Co
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:scanIntrinsicColDictIDs`
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:scanIntrinsicColVals`
 
-## SPEC-ETM-14: N=1 No-Predicate Direct Accumulation
+## SPEC-ETM-14: N=0/N=1 No-Predicate Direct Accumulation
 *Added: 2026-04-22*
 
 **N=1 no-predicate direct accumulation** — when a metrics query has exactly one group-by key,

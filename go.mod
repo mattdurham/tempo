@@ -79,7 +79,7 @@ require (
 	github.com/bytedance/sonic v1.15.0
 	github.com/evanphx/json-patch v5.9.11+incompatible
 	github.com/googleapis/gax-go/v2 v2.19.0
-	github.com/grafana/blockpack v0.0.0-20260423122301-7ce4b286764b
+	github.com/grafana/blockpack v0.0.0-20260423131415-30cc801fa12a
 	github.com/grafana/gomemcache v0.0.0-20251127154401-74f93547077b
 	github.com/grpc-ecosystem/go-grpc-middleware v1.4.0
 	github.com/hashicorp/golang-lru/v2 v2.0.7

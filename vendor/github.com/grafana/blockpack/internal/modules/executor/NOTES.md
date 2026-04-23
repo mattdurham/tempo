@@ -2859,6 +2859,48 @@ matching `streamByRefSliceAgg`'s NaN-emit behavior. Column scan extracted to
 `accumulateHistogramDirectN0` eliminates `inRangeRefs` materialization and the `keyToBucket` hash
 map for `{} | histogram_over_time(duration)` style queries. Dispatched from
 `executeTraceMetricsIntrinsic` before the N=1 case when `len(agg.GroupBy) == 0` and
-`agg.Function == FuncNameHISTOGRAM` with no predicates. Uses a single all-zero `dictByPK` slice
-(gIdx always resolves to 0) and reuses `streamByRefSliceHistogramScanDict` and
-`streamByRefSliceHistogramFlatEmit` — no new emit format.
+`agg.Function == FuncNameHISTOGRAM` with no predicates. Originally used an all-zeros `dictByPK`
+slice (gIdx always 0); replaced by `scanHistogramN0` which eliminates the 256 KB `dictByPK`
+allocation and per-span lookup entirely, closing the remaining ~1.5× gap vs parquet.
+
+---
+
+## NOTE-090: Canonical metrics accumulation pattern — single-pass dense arrays (2026-04-23)
+
+Summarises the design constraints that emerged across NOTE-085 through NOTE-089. Any future metrics
+accumulator in this package must follow all five rules:
+
+**Rule 1 — Never materialize `inRangeRefs`.**
+Build `bucketByPK[maxPK+1]int64` directly from `tsCol.BlockRefs[lo:hi]`. Materialising a
+`[]BlockRef` slice first and then iterating it a second time to accumulate was the original design
+and the root cause of multi-GB allocations at query time (1.2 GB for `inRangeRefs` alone at 150 M
+spans). The time-column ref slice is the only authoritative source of in-range span identity.
+
+**Rule 2 — Single pass per value column.**
+For each dict entry (or flat row), look up `bucketByPK[pk]` and `dictByPK[pk]` and write directly
+to the accumulator. Never collect refs into an intermediate slice and process them in a separate
+loop. Intermediate slices (`histSpanEntry`, `aggValsForRef`) were removed in NOTE-087/088 for
+exactly this reason.
+
+**Rule 3 — Dense arrays, not hash maps.**
+`bucketByPK[pk]` and `dictByPK[pk]` give O(1) cache-friendly array reads. The old `keyToBucket`
+and `groupKeyMap` hash maps caused 54% of metrics query CPU to be spent in `maps.ctrlGroup.matchH2`
+(hash probing). Dense arrays eliminate hash collision entirely and allow the CPU prefetcher to
+predict access patterns.
+
+**Rule 4 — Allocate proportional to the problem, not the maximum.**
+- Group arrays: size to `numGroups` (number of distinct group-by values), not `maxPK`.
+- `dictByPK`: only allocate when `numGroups > 1`. For N=0 (no group-by), gIdx is always 0 —
+  allocating and reading a zero-filled `dictByPK` wastes up to 256 KB per block and adds a
+  memory load per span. Use a specialised scanner (`scanHistogramN0`) instead.
+- `seenByPK`: size to `maxPK+1`; always needed for the absent-row pass.
+
+**Rule 5 — Absent-row pass walks `bucketByPK`, not refs.**
+After scanning the value column, walk `bucketByPK` and emit count=0 (or min/max sentinel) buckets
+for every pk where `bk != 0 && !seenByPK[pk]`. This handles spans that are in the time range but
+absent from the value column (e.g. a span with no `span:duration`). Walking `bucketByPK` is O(maxPK)
+not O(inRangeCount); for sparse blocks this is cheaper and avoids ref materialisation.
+
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:accumulateCountRateDirect`,
+`accumulateHistogramDirect`, `accumulateAggDirect`, `accumulateHistogramDirectN0`,
+`scanHistogramN0`
