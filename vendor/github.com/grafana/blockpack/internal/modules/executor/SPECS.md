@@ -985,6 +985,9 @@ Behavioral invariants:
   returns `(false, nil)` to fall through to the general `executeTraceMetricsIntrinsicN` path.
 - **N>1 fallback:** queries with more than one group-by key reach the `default:` branch and
   fall through to the full hash map accumulation path.
+- **N=0 histogram:** when `filteredRefs == nil`, `len(agg.GroupBy) == 0`, and `agg.Function == HISTOGRAM`,
+  the switch dispatches to `accumulateHistogramDirectN0`, which scans the histogram column without
+  materializing `inRangeRefs` or any group-key map — output is byte-identical to the reference no-group-by path.
 
 Fallback: any condition not met falls through to the general `executeTraceMetricsIntrinsicN`
 path with full hash map accumulation.
@@ -992,7 +995,8 @@ path with full hash map accumulation.
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:accumulateIntrinsicBucketsDirect`,
           `internal/modules/executor/metrics_trace_intrinsic.go:accumulateHistogramDirect`,
           `internal/modules/executor/metrics_trace_intrinsic.go:accumulateAggDirect`,
-          `internal/modules/executor/metrics_trace_intrinsic.go:accumulateCountRateDirect`
+          `internal/modules/executor/metrics_trace_intrinsic.go:accumulateCountRateDirect`,
+          `internal/modules/executor/metrics_trace_intrinsic.go:accumulateHistogramDirectN0`
 
 ## SPEC-SCAN-1: StreamScanEqualAny Dict-Mask Fast Path Invariants
 *Added: 2026-04-17*

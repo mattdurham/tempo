@@ -151,6 +151,17 @@ func executeTraceMetricsIntrinsic(
 		if len(buckets) == 0 {
 			return &TraceMetricsResult{}, true, nil
 		}
+	case filteredRefs == nil && len(agg.GroupBy) == 0 && agg.Function == vm.FuncNameHISTOGRAM:
+		// NOTE-089: N=0 no-predicate histogram direct path — build bucketByPK directly from
+		// the span:start slice, scan the histogram column with dense array lookups.
+		// Eliminates inRangeRefs materialization and keyToBucket hash map for
+		// {} | histogram_over_time(duration) style queries.
+		numSteps := (tb.EndTime - tb.StartTime + tb.StepSizeNanos - 1) / tb.StepSizeNanos
+		if numSteps > 0 {
+			if err := accumulateHistogramDirectN0(ctx, tb, agg, tsCol, numSteps, r, lo, hi, buckets); err != nil {
+				return nil, false, err
+			}
+		}
 	case filteredRefs == nil && len(agg.GroupBy) == 1:
 		// NOTE-085: N=1 no-predicate direct path — build bucketByPK directly from
 		// the span:start slice without materializing inRangeRefs/inRangeVals/dictIdxForRef.
@@ -1212,6 +1223,112 @@ func accumulateHistogramDirect(
 	}
 
 	return streamByRefSliceHistogramFlatEmit(groupCountsFlat, stride1, stride2, numGroups, dict, boundaries, buckets)
+}
+
+// accumulateHistogramDirectN0 is the direct-path HISTOGRAM accumulator for N=0 (no group-by) queries.
+// Eliminates inRangeRefs materialization by building bucketByPK directly from tsCol.BlockRefs[lo:hi]
+// and scanning the histogram agg column with a single dense array pass — no keyToBucket hash map.
+//
+// Layout: groupCountsFlat[bIdx*numSteps + (bk-1)] (single group, gIdx always 0).
+// bIdx=0 is the absent/boundary-0 sentinel; bIdx=1..N are actual boundaries.
+// stride1 = histFlatStride*numSteps (group stride, numGroups=1 so outer loop is trivial).
+// stride2 = numSteps (boundary stride).
+//
+// NOTE-089: extends the direct-path pattern (accumulateHistogramDirect) to N=0 histogram queries,
+// eliminating the streamAggColumnNoGroupBy map path for {} | histogram_over_time(duration).
+func accumulateHistogramDirectN0(
+	ctx context.Context,
+	tb vm.TimeBucketSpec,
+	agg vm.AggregateSpec,
+	tsCol *modules_shared.IntrinsicColumn,
+	numSteps int64,
+	r *modules_reader.Reader,
+	lo, hi int,
+	buckets map[string]*aggBucketState,
+) error {
+	if lo >= hi {
+		return nil
+	}
+
+	// Step 1: find maxPK from the time-range slice.
+	var maxPK uint32
+	for _, ref := range tsCol.BlockRefs[lo:hi] {
+		if pk := packKey(ref.BlockIdx, ref.RowIdx); pk > maxPK {
+			maxPK = pk
+		}
+	}
+
+	// Step 2: build bucketByPK directly — no inRangeRefs materialized.
+	// bucketByPK[pk] = timeBucketIndex+1; 0 = out of range (sentinel).
+	bucketByPK := make([]int64, maxPK+1) //nolint:gosec
+	for i, ref := range tsCol.BlockRefs[lo:hi] {
+		pk := packKey(ref.BlockIdx, ref.RowIdx)
+		bk := timeBucketIndex(int64(tsCol.Uint64Values[lo+i]), tb.StartTime, tb.StepSizeNanos) //nolint:gosec
+		if bk >= 0 && bk < numSteps {
+			bucketByPK[pk] = bk + 1
+		}
+	}
+
+	// Step 3: pre-allocate flat accumulator for 1 group.
+	// Layout: groupCountsFlat[bIdx*numSteps + timeIdx] (gIdx always 0).
+	stride2 := numSteps
+	stride1 := int64(histFlatStride) * numSteps
+	groupCountsFlat := make([]int64, stride1) //nolint:gosec
+
+	// Step 4: build boundary cache and getBoundaryIdx closure — same pattern as accumulateHistogramDirect.
+	boundaryCache := make(map[float64]int64, 32)
+	boundaries := make([]float64, 0, 32)
+
+	getBoundaryIdx := func(v float64) int64 {
+		b := intrinsicHistogramBoundary(v, agg.Field)
+		idx, ok := boundaryCache[b]
+		if !ok {
+			if len(boundaries) >= histFlatStride {
+				idx = int64(histFlatStride)
+				boundaryCache[b] = idx
+				return idx
+			}
+			boundaries = append(boundaries, b)
+			idx = int64(len(boundaries))
+			boundaryCache[b] = idx
+		}
+		return idx
+	}
+
+	seenByPK := make([]bool, maxPK+1) //nolint:gosec
+
+	// Step 5: scan the histogram agg column.
+	// N=0: all refs map to group 0 — pass a zero-filled dictByPK (gIdx always resolves to 0).
+	// stride1 for the single group is histFlatStride*numSteps; stride2 = numSteps.
+	col, err := r.GetIntrinsicColumn(agg.Field)
+	if err != nil {
+		return err
+	}
+	if col != nil {
+		// dictByPK is nil-equivalent: reuse a zero-length slice — packKey always resolves gIdx=0.
+		// Allocate a zero-filled slice of size maxPK+1 so streamByRefSliceHistogramScanDict can
+		// index into it safely (it reads dictByPK[pk] for pk <= maxPK).
+		dictByPK := make([]uint32, maxPK+1) //nolint:gosec
+		if err := streamByRefSliceHistogramScanDict(
+			ctx, col, bucketByPK, dictByPK, maxPK, seenByPK, getBoundaryIdx,
+			groupCountsFlat, stride1, stride2,
+		); err != nil {
+			return err
+		}
+	}
+
+	// Step 6: absent-row pass — walk bucketByPK for pks not seen in the agg column.
+	// bIdx=0 sentinel: groupCountsFlat[0*stride2 + (bk-1)] = groupCountsFlat[bk-1].
+	for pk, bk := range bucketByPK {
+		if bk == 0 || seenByPK[pk] {
+			continue
+		}
+		groupCountsFlat[bk-1]++
+	}
+
+	// Step 7: emit — single group, dict = [""], numGroups = 1.
+	dict := []string{""}
+	return streamByRefSliceHistogramFlatEmit(groupCountsFlat, stride1, stride2, 1, dict, boundaries, buckets)
 }
 
 // accumulateAggDirect is the direct-path general agg accumulator (SUM/AVG/MIN/MAX/STDDEV/QUANTILE)

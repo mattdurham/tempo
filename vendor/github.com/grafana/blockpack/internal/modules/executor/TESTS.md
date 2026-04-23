@@ -3091,3 +3091,34 @@ Back-ref: `internal/modules/executor/intrinsic_agg_direct_test.go:TestAccumulate
 **Spec invariants tested:** NOTE-089 (histogram direct path as drop-in replacement), Risk 3 (absent sentinel stride index).
 
 Back-ref: `internal/modules/executor/intrinsic_agg_direct_test.go:TestAccumulateHistogramDirect_ByteEquivalence`
+
+## EX-ETM-N1-19: TestAccumulateHistogramDirectN0_ByteEquivalence
+*Added: 2026-04-22*
+
+**Scenario:** `accumulateHistogramDirectN0` must produce byte-identical output to `accumulateIntrinsicBucketsViaKeyMap` (N=0 reference path via `streamAggColumnNoGroupBy`) for the same spans.
+
+**Setup:** 6 spans across 2 time buckets, 3 distinct duration values (10ms/50ms/200ms), no group-by. FuncNameHISTOGRAM, field=span:duration. Two time steps of 60s each.
+
+**Assertions:** Bucket counts from `n0HistRunNew` (direct N=0 path) match `n0HistRunReference` (keyToBucket reference) for every composite key `timeIdx\x00\x00boundary`.
+
+**Spec invariants tested:** NOTE-089 (N=0 histogram direct path eliminates inRangeRefs materialization), absence of group-key dimension in key format (gk="" matches reference double-NUL key).
+
+Back-ref: `internal/modules/executor/intrinsic_agg_direct_test.go:TestAccumulateHistogramDirectN0_ByteEquivalence`
+
+---
+
+## EX-ETM-N1-20: TestAccumulateHistogramDirectN0_DispatchEndToEnd
+*Added: 2026-04-22*
+
+**Scenario:** The N=0 histogram direct path must be exercised through the full dispatch switch in `executeTraceMetricsIntrinsic` (the arm `filteredRefs==nil && len(agg.GroupBy)==0 && HISTOGRAM`), not just by calling `accumulateHistogramDirectN0` directly.
+
+**Setup:** Same 6-span block as EX-ETM-N1-19 (3 durations, 2 time buckets). Query: `{ } | histogram_over_time(span.duration)` with no group-by, compiled via `vm.CompileTraceQLMetrics`.
+
+**Assertions:**
+- `ExecuteTraceMetrics` returns non-nil result with non-empty `Series`.
+- Total span count summed across all series values (excluding NaN) is positive.
+- Total count from the direct-call path (`n0HistRunNew`) equals total count from the dispatch path — byte-equivalent span counting.
+
+**Spec invariants tested:** SPEC-ETM-14 N=0 histogram dispatch arm; NOTE-089 end-to-end wiring of `accumulateHistogramDirectN0` through `executeTraceMetricsIntrinsic`.
+
+Back-ref: `internal/modules/executor/intrinsic_agg_direct_test.go:TestAccumulateHistogramDirectN0_DispatchEndToEnd`
