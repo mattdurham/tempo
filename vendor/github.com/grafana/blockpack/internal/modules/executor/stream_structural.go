@@ -34,8 +34,8 @@ type StructuralResult struct {
 //  2. Resolve parentID references to local indices within each trace.
 //  3. Evaluate the structural operators per trace across the chain; emit matching terminal-node spans.
 //
-// All blocks are scanned — structural queries cannot use bloom or range pruning because
-// any block may contain spans from either side of the operator.
+// File-level bloom and range pruning is applied using the LHS filter predicates (NOTE-091).
+// Within the file, all blocks are scanned — parent spans may be in any internal block.
 func ExecuteStructural(
 	r *modules_reader.Reader,
 	q *traceqlparser.StructuralQuery,
@@ -108,6 +108,16 @@ func compileStructuralPrograms(filters []*traceqlparser.FilterExpression) ([]*vm
 	return programs, nil
 }
 
+// firstNonNilProgram returns the first non-nil program from the slice, or nil if all are nil.
+func firstNonNilProgram(programs []*vm.Program) *vm.Program {
+	for _, p := range programs {
+		if p != nil {
+			return p
+		}
+	}
+	return nil
+}
+
 // collectAllStructuralSpans fetches blocks (optionally filtered by time range and sub-file
 // sharding) and accumulates per-trace span records. Returns a map keyed by [16]byte trace ID.
 func collectAllStructuralSpans(
@@ -117,7 +127,15 @@ func collectAllStructuralSpans(
 	startBlock, blockCount int,
 ) (map[[16]byte][]structuralSpanRec, error) {
 	planner := queryplanner.NewPlanner(r)
-	// Structural queries pass nil predicates (no value-based pruning) but do use time-range pruning.
+	// NOTE-091: Apply file-level bloom/range pruning using the LHS program predicates.
+	// Block-level pruning is intentionally skipped — parent spans may live in any internal
+	// block, so all blocks that survive file-level rejection must be scanned.
+	if lhsProgram := firstNonNilProgram(programs); lhsProgram != nil && lhsProgram.Predicates != nil {
+		nodes := lhsProgram.Predicates.Nodes
+		if fileLevelReject(r, nodes) || fileLevelBloomReject(r, nodes) {
+			return nil, nil
+		}
+	}
 	plan := planner.Plan(nil, tr)
 
 	// Sub-file sharding: restrict to assigned block range.

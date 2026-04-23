@@ -17,6 +17,9 @@ import (
 	"github.com/grafana/blockpack/internal/vm"
 )
 
+// noTraceIDKey is the sentinel trace ID used when a span has no trace ID set.
+const noTraceIDKey = "__no_trace_id__"
+
 // streamFilterQuery executes a TraceQL filter query against a modules-format reader.
 func streamFilterQuery(
 	r *Reader,
@@ -149,7 +152,15 @@ func emitAllSpans(allSpans []SpanMatch, limit int, fn spanMatchFn) {
 // ({filter} | aggregate() > threshold).
 // It runs the filter part, groups matching spans into spansets by trace ID, applies the
 // aggregate function per spanset, filters by threshold, and emits qualifying spans.
+// NOTE-092: For count/count_over_time with a threshold, dispatches to streamPipelineQueryCount
+// (two-pass streaming) to avoid O(N_spans) allocation.
 func streamPipelineQuery(r *Reader, mq *traceqlparser.MetricsQuery, opts QueryOptions, fn spanMatchFn) error {
+	pipeline := mq.Pipeline
+	if pipeline != nil && pipeline.HasThreshold &&
+		(pipeline.Aggregate.Name == "count" || pipeline.Aggregate.Name == "count_over_time") {
+		return streamPipelineQueryCount(r, mq, opts, fn)
+	}
+
 	// Compile and execute the filter part to get all matching spans.
 	program, compileErr := vm.CompileTraceQLFilter(mq.Filter)
 	if compileErr != nil {
@@ -181,8 +192,6 @@ func streamPipelineQuery(r *Reader, mq *traceqlparser.MetricsQuery, opts QueryOp
 		)
 	}
 
-	pipeline := mq.Pipeline
-
 	if pipeline == nil {
 		// No pipeline stages — emit all spans, respecting limit.
 		emitAllSpans(allSpans, opts.Limit, fn)
@@ -204,7 +213,7 @@ func streamPipelineQuery(r *Reader, mq *traceqlparser.MetricsQuery, opts QueryOp
 	for i, sp := range allSpans {
 		tid := sp.TraceID
 		if tid == "" {
-			tid = "__no_trace_id__"
+			tid = noTraceIDKey
 		}
 		ss, ok := traceGroups[tid]
 		if !ok {
@@ -253,6 +262,93 @@ func streamPipelineQuery(r *Reader, mq *traceqlparser.MetricsQuery, opts QueryOp
 
 	fn(nil, false)
 	return nil
+}
+
+// streamPipelineQueryCount implements the two-pass streaming count for
+// count/count_over_time pipeline queries with a threshold (NOTE-092).
+// Pass 1: count spans per trace (O(N_distinct_traces) memory, no span content retained).
+// Pass 2: re-stream and emit only spans from qualifying traces.
+//
+// Precondition: pipeline != nil && pipeline.HasThreshold must be true.
+// The caller (streamPipelineQuery) guards on HasThreshold before dispatching here.
+// The defensive check below ensures correctness if this invariant is ever violated.
+func streamPipelineQueryCount(r *Reader, mq *traceqlparser.MetricsQuery, opts QueryOptions, fn spanMatchFn) error {
+	pipeline := mq.Pipeline
+	if pipeline == nil || !pipeline.HasThreshold {
+		// Should not happen — caller guards on HasThreshold, but be defensive.
+		// Without a threshold, compareThreshold's zero-value BinaryOp returns false
+		// for all traces, silently producing empty results (SPEC-PA-6 regression).
+		// Fall back to the general path which handles no-threshold correctly (SPEC-PA-6).
+		return streamPipelineQuery(r, mq, opts, fn)
+	}
+
+	program, err := vm.CompileTraceQLFilter(mq.Filter)
+	if err != nil {
+		return fmt.Errorf("compile pipeline filter: %w", err)
+	}
+	filterOpts := opts
+	filterOpts.Limit = 0
+
+	// Pass 1: count spans per trace.
+	counts := make(map[string]int)
+	if _, pass1Err := streamFilterProgram(r, program, filterOpts, func(match *SpanMatch, more bool) bool {
+		if !more {
+			return false
+		}
+		tid := match.TraceID
+		if tid == "" {
+			tid = noTraceIDKey
+		}
+		counts[tid]++
+		return true
+	}); pass1Err != nil {
+		return pass1Err
+	}
+
+	// Find qualifying traces by threshold.
+	qualified := make(map[string]struct{}, len(counts))
+	for tid, cnt := range counts {
+		if compareThreshold(float64(cnt), pipeline.ThresholdOp, pipeline.ThresholdVal) {
+			qualified[tid] = struct{}{}
+		}
+	}
+	if len(qualified) == 0 {
+		fn(nil, false)
+		return nil
+	}
+
+	// Pass 2: emit spans from qualifying traces only.
+	limit := opts.Limit
+	_, err = streamFilterProgram(r, program, filterOpts, func(match *SpanMatch, more bool) bool {
+		if !more {
+			// streamFilterProgram calls this inner callback with (nil, false) as its
+			// terminal signal. The inner callback returns false here without forwarding
+			// to the outer fn — so there is no double-call of fn(nil, false).
+			// The outer fn(nil, false) below is the only terminal signal sent to the caller.
+			return false
+		}
+		tid := match.TraceID
+		if tid == "" {
+			tid = noTraceIDKey
+		}
+		if _, ok := qualified[tid]; !ok {
+			return true
+		}
+		if !fn(match, true) {
+			return false
+		}
+		if limit > 0 {
+			limit--
+			if limit == 0 {
+				return false
+			}
+		}
+		return true
+	})
+	// Terminal signal to the caller. streamFilterProgram calls the inner callback (above)
+	// with (nil, false), not the outer fn — so this is the only fn(nil, false) the caller sees.
+	fn(nil, false)
+	return err
 }
 
 // SPEC-PA-1, SPEC-PA-2, SPEC-PA-3: computeSpansetAggregate computes an aggregate value over a spanset.

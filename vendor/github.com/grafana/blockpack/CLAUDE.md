@@ -271,3 +271,4 @@ Additional guidance for specific workflows lives in `.agents/guidance/`. Read th
 | File | When to read |
 |---|---|
 | `.agents/guidance/code-review.md` | Before submitting or reviewing any PR — covers 10 recurring failure modes derived from Copilot review comments across 20 merged PRs |
+| `.agents/guidance/spec-knowledge-team.md` | Before writing or reviewing any code in a spec-driven module — spawn the spec-oracle agent at task start; route all spec/note/benchmark/test questions and writes through it |
