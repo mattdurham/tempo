@@ -2773,7 +2773,7 @@ The new approach:
 - Operation savings per file: ~300 M array writes/reads eliminated.
 
 **Back-ref:** `internal/modules/executor/metrics_trace_intrinsic.go:streamByRefSliceHistogram`,
-`streamByRefSliceHistogramScan`
+`streamByRefSliceHistogramScanDict`
 
 *Addendum (2026-04-21):* NOTE-088 reversed the consequence — `histSpanEntry` intermediate slice
 and `streamByRefSliceHistogramScan` are deleted. The flat pre-allocated accumulator accumulates
