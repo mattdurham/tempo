@@ -1297,22 +1297,14 @@ func accumulateHistogramDirectN0(
 
 	seenByPK := make([]bool, maxPK+1) //nolint:gosec
 
-	// Step 5: scan the histogram agg column.
-	// N=0: all refs map to group 0 — pass a zero-filled dictByPK (gIdx always resolves to 0).
-	// stride1 for the single group is histFlatStride*numSteps; stride2 = numSteps.
+	// Step 5: scan the histogram agg column using the N=0 specialized scanner.
+	// N=0: gIdx is always 0 — no dictByPK allocation or lookup needed.
 	col, err := r.GetIntrinsicColumn(agg.Field)
 	if err != nil {
 		return err
 	}
 	if col != nil {
-		// dictByPK is nil-equivalent: reuse a zero-length slice — packKey always resolves gIdx=0.
-		// Allocate a zero-filled slice of size maxPK+1 so streamByRefSliceHistogramScanDict can
-		// index into it safely (it reads dictByPK[pk] for pk <= maxPK).
-		dictByPK := make([]uint32, maxPK+1) //nolint:gosec
-		if err := streamByRefSliceHistogramScanDict(
-			ctx, col, bucketByPK, dictByPK, maxPK, seenByPK, getBoundaryIdx,
-			groupCountsFlat, stride1, stride2,
-		); err != nil {
+		if err := scanHistogramN0(ctx, col, bucketByPK, maxPK, seenByPK, getBoundaryIdx, groupCountsFlat, stride2); err != nil {
 			return err
 		}
 	}
@@ -1774,6 +1766,88 @@ func streamByRefSliceHistogram(
 	}
 
 	return streamByRefSliceHistogramFlatEmit(groupCountsFlat, stride1, stride2, numGroups, dict, boundaries, buckets)
+}
+
+// scanHistogramN0 is a specialized scanner for N=0 (no group-by) histogram accumulation.
+// Eliminates the dictByPK allocation and per-span lookup of streamByRefSliceHistogramScanDict —
+// gIdx is always 0, so groupCountsFlat[bIdx*stride2+(bk-1)] is the only write target.
+// NOTE-089: N=0 direct path — no dictByPK, no gIdx computation.
+func scanHistogramN0(
+	ctx context.Context,
+	col *modules_shared.IntrinsicColumn,
+	bucketByPK []int64,
+	maxPK uint32,
+	seenByPK []bool,
+	getBoundaryIdx func(float64) int64,
+	groupCountsFlat []int64,
+	stride2 int64,
+) error {
+	spanCount := 0
+	switch col.Format {
+	case modules_shared.IntrinsicFormatDict:
+		for _, entry := range col.DictEntries {
+			var v float64
+			if entry.Value != "" {
+				parsed, parseErr := strconv.ParseFloat(entry.Value, 64)
+				if parseErr != nil {
+					continue
+				}
+				v = parsed
+			} else {
+				v = float64(entry.Int64Val)
+			}
+			bIdx := getBoundaryIdx(v)
+			if bIdx >= int64(histFlatStride) {
+				continue
+			}
+			base := bIdx * stride2
+			for _, ref := range entry.BlockRefs {
+				if spanCount%ctxCheckInterval == 0 {
+					if err := ctx.Err(); err != nil {
+						return err
+					}
+				}
+				spanCount++
+				pk := packKey(ref.BlockIdx, ref.RowIdx)
+				if pk > maxPK {
+					continue
+				}
+				bk := bucketByPK[pk]
+				if bk == 0 {
+					continue
+				}
+				seenByPK[pk] = true
+				groupCountsFlat[base+(bk-1)]++
+			}
+		}
+	case modules_shared.IntrinsicFormatFlat:
+		for i, ref := range col.BlockRefs {
+			if spanCount%ctxCheckInterval == 0 {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+			}
+			spanCount++
+			if i >= len(col.Uint64Values) {
+				continue
+			}
+			pk := packKey(ref.BlockIdx, ref.RowIdx)
+			if pk > maxPK {
+				continue
+			}
+			bk := bucketByPK[pk]
+			if bk == 0 {
+				continue
+			}
+			bIdx := getBoundaryIdx(float64(col.Uint64Values[i]))
+			if bIdx >= int64(histFlatStride) {
+				continue
+			}
+			seenByPK[pk] = true
+			groupCountsFlat[bIdx*stride2+(bk-1)]++
+		}
+	}
+	return nil
 }
 
 // streamByRefSliceHistogramScanDict scans an intrinsic column (both dict and flat formats) and
