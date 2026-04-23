@@ -139,49 +139,11 @@ func executeTraceMetricsIntrinsic(
 	}
 
 	buckets := make(map[string]*aggBucketState)
-
-	switch {
-	case isCountRate && len(agg.GroupBy) == 0:
-		// Fast inline path for count/rate with no group-by: see streamCountRateNoGroupBy.
-		// NOTE-068: uses a flat []int64 slice instead of map[string]*aggBucketState in the
-		// hot loop to eliminate per-span string allocations and hash lookups.
-		if err := streamCountRateNoGroupBy(ctx, inRangeRefs, inRangeVals, tb, buckets); err != nil {
-			return nil, false, err
-		}
-		if len(buckets) == 0 {
-			return &TraceMetricsResult{}, true, nil
-		}
-	case filteredRefs == nil && len(agg.GroupBy) == 0 && agg.Function == vm.FuncNameHISTOGRAM:
-		// NOTE-089: N=0 no-predicate histogram direct path — build bucketByPK directly from
-		// the span:start slice, scan the histogram column with dense array lookups.
-		// Eliminates inRangeRefs materialization and keyToBucket hash map for
-		// {} | histogram_over_time(duration) style queries.
-		numSteps := (tb.EndTime - tb.StartTime + tb.StepSizeNanos - 1) / tb.StepSizeNanos
-		if numSteps > 0 {
-			if err := accumulateHistogramDirectN0(ctx, tb, agg, tsCol, numSteps, r, lo, hi, buckets); err != nil {
-				return nil, false, err
-			}
-		}
-	case filteredRefs == nil && len(agg.GroupBy) == 1:
-		// NOTE-085: N=1 no-predicate direct path — build bucketByPK directly from
-		// the span:start slice without materializing inRangeRefs/inRangeVals/dictIdxForRef.
-		// Eliminates ~3GB of intermediate allocations per file.
-		// NOTE-089: extended to HISTOGRAM and all general agg functions (SUM/AVG/MIN/MAX/STDDEV/QUANTILE).
-		ok, err := accumulateIntrinsicBucketsDirect(ctx, r, tsCol, lo, hi, querySpec, buckets)
-		if err != nil {
-			return nil, false, err
-		}
-		if !ok {
-			// Fall back: flat-format group-by or other edge case.
-			if err := accumulateIntrinsicBucketsViaKeyMap(ctx, r, inRangeRefs, inRangeVals, tb, querySpec, buckets); err != nil {
-				return nil, false, err
-			}
-		}
-	default:
-		// N>1 group-by or predicate-filtered: use keyToBucket map path.
-		if err := accumulateIntrinsicBucketsViaKeyMap(ctx, r, inRangeRefs, inRangeVals, tb, querySpec, buckets); err != nil {
-			return nil, false, err
-		}
+	if err := dispatchIntrinsicAccumulate(ctx, r, tsCol, lo, hi, filteredRefs, isCountRate, inRangeRefs, inRangeVals, querySpec, buckets); err != nil {
+		return nil, false, err
+	}
+	if isCountRate && len(agg.GroupBy) == 0 && len(buckets) == 0 {
+		return &TraceMetricsResult{}, true, nil
 	}
 
 	result := &TraceMetricsResult{}
@@ -191,6 +153,46 @@ func executeTraceMetricsIntrinsic(
 		result.Series = traceBuildDenseSeries(buckets, querySpec)
 	}
 	return result, true, nil
+}
+
+// dispatchIntrinsicAccumulate routes to the appropriate accumulation path based on query shape.
+// Extracted from executeTraceMetricsIntrinsic to keep cyclomatic complexity within gocyclo limit.
+// NOTE-089: direct paths (N=0 histogram, N=1) eliminate inRangeRefs materialization and hash maps.
+func dispatchIntrinsicAccumulate(
+	ctx context.Context,
+	r *modules_reader.Reader,
+	tsCol *modules_shared.IntrinsicColumn,
+	lo, hi int,
+	filteredRefs []modules_shared.BlockRef,
+	isCountRate bool,
+	inRangeRefs []modules_shared.BlockRef,
+	inRangeVals []uint64,
+	querySpec *vm.QuerySpec,
+	buckets map[string]*aggBucketState,
+) error {
+	agg := querySpec.Aggregate
+	tb := querySpec.TimeBucketing
+	switch {
+	case isCountRate && len(agg.GroupBy) == 0:
+		// NOTE-068: flat []int64 hot loop — no per-span string allocs or hash lookups.
+		return streamCountRateNoGroupBy(ctx, inRangeRefs, inRangeVals, tb, buckets)
+	case filteredRefs == nil && len(agg.GroupBy) == 0 && agg.Function == vm.FuncNameHISTOGRAM:
+		// NOTE-089: N=0 no-predicate histogram direct path.
+		numSteps := (tb.EndTime - tb.StartTime + tb.StepSizeNanos - 1) / tb.StepSizeNanos
+		if numSteps <= 0 {
+			return nil
+		}
+		return accumulateHistogramDirectN0(ctx, tb, agg, tsCol, numSteps, r, lo, hi, buckets)
+	case filteredRefs == nil && len(agg.GroupBy) == 1:
+		// NOTE-085/089: N=1 no-predicate direct path.
+		ok, err := accumulateIntrinsicBucketsDirect(ctx, r, tsCol, lo, hi, querySpec, buckets)
+		if err != nil || ok {
+			return err
+		}
+		return accumulateIntrinsicBucketsViaKeyMap(ctx, r, inRangeRefs, inRangeVals, tb, querySpec, buckets)
+	default:
+		return accumulateIntrinsicBucketsViaKeyMap(ctx, r, inRangeRefs, inRangeVals, tb, querySpec, buckets)
+	}
 }
 
 // accumulateIntrinsicBucketsViaKeyMap builds a packKey→timeBucketIndex map from
