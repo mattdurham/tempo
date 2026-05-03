@@ -67,6 +67,10 @@ func (m *mockOverrides) MaxCompactionRangeForTenant(_ string) time.Duration {
 	return m.maxCompactionWindow
 }
 
+func (m *mockOverrides) DedicatedColumnsForTenant(_ string) backend.DedicatedColumns {
+	return nil
+}
+
 func TestCompactionRoundtrip(t *testing.T) {
 	for _, enc := range encoding.AllEncodingsForWrites() {
 		version := enc.Version()
