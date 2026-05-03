@@ -291,8 +291,14 @@ func (rw *readerWriter) CompactWithConfig(ctx context.Context, blockMetas []*bac
 	compactionLevel := CompactionLevelForBlocks(blockMetas)
 	compactionLevelLabel := strconv.Itoa(int(compactionLevel))
 
+	// Use current per-tenant dedicated columns so compaction always re-indexes output
+	// blocks according to the live config, not the columns stored in input block metas.
+	blockCfg := *rw.cfg.Block
+	if dc := compactorOverrides.DedicatedColumnsForTenant(tenantID); len(dc) > 0 {
+		blockCfg.DedicatedColumns = dc
+	}
 	opts := common.CompactionOptions{
-		BlockConfig:      *rw.cfg.Block,
+		BlockConfig:      blockCfg,
 		OutputBlocks:     outputBlocks,
 		MaxBytesPerTrace: compactorOverrides.MaxBytesPerTraceForTenant(tenantID),
 		BytesWritten: func(compactionLevel, bytes int) {

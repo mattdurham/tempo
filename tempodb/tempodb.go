@@ -142,6 +142,7 @@ type CompactorOverrides interface {
 	CompactionDisabledForTenant(tenantID string) bool
 	MaxBytesPerTraceForTenant(tenantID string) int
 	MaxCompactionRangeForTenant(tenantID string) time.Duration
+	DedicatedColumnsForTenant(tenantID string) backend.DedicatedColumns
 }
 
 type WriteableBlock interface {
