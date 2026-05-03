@@ -599,9 +599,11 @@ func findByClause(input string) int {
 			parenDepth--
 		default:
 			if parenDepth == 0 {
-				// Check if we're at " by " (with spaces before and after)
-				if i > 0 && input[i] == 'b' && i+2 < len(input) && input[i:i+3] == "by " {
-					if input[i-1] == ' ' || input[i-1] == '\t' || input[i-1] == '\n' || input[i-1] == '\r' {
+				// Check if we're at " by " or " by(" (with space before, space or paren after)
+				if i > 0 && input[i] == 'b' && i+2 < len(input) && input[i:i+2] == "by" {
+					afterBy := input[i+2]
+					if (afterBy == ' ' || afterBy == '\t' || afterBy == '(') &&
+						(input[i-1] == ' ' || input[i-1] == '\t' || input[i-1] == '\n' || input[i-1] == '\r') {
 						return i - 1 // Return position of space before "by"
 					}
 				}

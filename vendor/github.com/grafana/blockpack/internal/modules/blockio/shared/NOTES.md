@@ -292,3 +292,128 @@ Back-ref: `internal/modules/blockio/shared/intrinsic_codec.go:AcquireIntrinsicBu
           `internal/modules/blockio/shared/intrinsic_codec.go:DecodePageTOC`,
           `internal/modules/blockio/shared/intrinsic_codec.go:DecodeFlatPage`,
           `internal/modules/blockio/shared/intrinsic_codec.go:decodeLegacyFlatBlob`
+
+---
+
+## NOTE-013: IntrinsicFormatXORBytes — Single Snappy Pass for Bytes Columns
+*Added: 2026-04-22*
+
+**Decision:** Added `IntrinsicFormatXORBytes uint8 = 0x03` to `constants.go`.
+When a flat bytes column has more than `IntrinsicPageSize` rows, the writer encodes all
+values with XOR-against-previous and compresses the entire payload in a single
+`snappy.Encode` call instead of one call per page.
+
+**Rationale:** Flat bytes columns (span:id, trace:id, span:parent_id) consist of
+random-looking byte IDs (8–16 bytes each). The existing paged format calls
+`snappy.Encode` once per page (10,000 rows), producing 226 calls for a 2.8M-row
+column. Each page has ~80KB of random bytes: snappy cannot compress within a page
+(no repeating patterns), but its frame overhead expands the output. Measured result:
+52.8 MB compressed from 26.4 MB uncompressed (2× inflation).
+
+XOR-against-previous produces deltas that are zero or near-zero in the high bytes for
+IDs with shared prefixes (e.g. span IDs from the same trace). A single snappy call
+over the full XOR payload achieves much better compression because it sees the global
+redundancy across all N rows. Even for fully random IDs, one snappy pass has no
+per-page frame overhead, so the worst case approaches raw uncompressed size.
+
+**Wire format:** Outer sentinel is unchanged (`IntrinsicPagedVersion = 0x02`). The TOC
+`Format` field is `0x03`. There is exactly one logical page in the TOC covering all N
+rows. Inside the single snappy blob: `(xor_len[4]+xor_bytes)×N` then `refs[N×refSize]`.
+The `xor_len` field is 4 bytes (uint32 LE) to match the existing `encodeXORBytes` convention.
+
+**NOTE-012 invariant preserved:** `decodeXORBytesPage` reconstructs each value into a
+freshly allocated `[]byte` (make+copy pattern). The `prev` pointer is set to the
+just-allocated copy, not to pool memory. This guarantees `BytesValues` entries are
+independent of the pool buffer and of each other.
+
+**ScanFlatColumnRefs:** Not affected. All scan functions already guard
+`colType == ColumnTypeBytes` and return nil. No change needed.
+
+Back-ref: `internal/modules/blockio/shared/constants.go:IntrinsicFormatXORBytes`,
+          `internal/modules/blockio/shared/intrinsic_codec.go:decodeXORBytesPage`,
+          `internal/modules/blockio/shared/intrinsic_codec.go:xorInvert`,
+          `internal/modules/blockio/writer/intrinsic_accum.go:encodeXORBytesIntrinsic`
+
+---
+
+## NOTE-014: IntrinsicFormatDeltaUint64 — Single Snappy Pass for uint64 Columns
+*Added: 2026-04-22*
+
+**Decision:** Added `IntrinsicFormatDeltaUint64 uint8 = 0x04` to `constants.go`.
+When a flat uint64 column has more than `IntrinsicPageSize` rows, the writer sorts values
+ascending, delta-encodes with unsigned uvarints, and compresses the entire payload in a
+single `snappy.Encode` call instead of the paged flat format.
+
+**Rationale:** The paged flat format resets the delta accumulator at every page boundary
+(10,000 rows), losing cross-page delta patterns. For `span:start` (globally sorted ascending
+after `sortFlatAccum`), a single-pass uvarint delta encoding + single snappy compression
+exploits the fact that all deltas are small positive integers across the entire column.
+Measured: nanosecond timestamps clustered in 100-row groups compress well below `N*8` raw
+bytes. Even for monotonically increasing spans, per-page delta resets waste the first value
+of every page as a full 8-byte varint.
+
+**Unsigned varint, not zigzag:** `binary.PutUvarint` is used (not `binary.PutVarint`).
+After ascending sort, all deltas are non-negative, so zigzag encoding doubles the cost
+(zigzag maps 1 → 2, 2 → 4, etc.). Unsigned uvarint encodes positive deltas in the minimum
+number of bytes.
+
+**Wire format:** Outer sentinel is unchanged (`IntrinsicPagedVersion = 0x02`). The TOC
+`Format` field is `0x04`. There is exactly one logical page in the TOC covering all N rows.
+Inside the single snappy blob: `uvarint(value[i] - value[i-1])` for each of the N sorted
+rows (value[-1] = 0), followed by `refs[N×refSize]`. No `values_len` prefix — the ref
+section begins immediately after all N uvarints (sequential decode locates the boundary).
+
+**Scan path:** `scanDeltaUint64PagedBlob` and `scanDeltaUint64PagedFiltered` are fully
+separate helpers that do NOT call `pageRefsStart` (which assumes a `values_len[4]` prefix).
+They decompress the page, read all uvarints to locate the refs boundary, then collect refs
+for values within the requested [lo, hi] range.
+
+**NOTE-012 invariant:** Not applicable — uint64 columns produce `Uint64Values` (value types),
+not byte slices, so no pool aliasing concern exists.
+
+Back-ref: `internal/modules/blockio/shared/constants.go:IntrinsicFormatDeltaUint64`,
+          `internal/modules/blockio/shared/intrinsic_codec.go:decodeDeltaUint64Page`,
+          `internal/modules/blockio/shared/intrinsic_codec.go:scanDeltaUint64PagedBlob`,
+          `internal/modules/blockio/shared/intrinsic_codec.go:scanDeltaUint64PagedFiltered`,
+          `internal/modules/blockio/writer/intrinsic_accum.go:encodeDeltaUint64Intrinsic`
+
+---
+
+## NOTE-015: Typed Accessor Methods for Zero-Alloc LookupRefFast (2026-04-28)
+*Added: 2026-04-28*
+
+**Decision:** Added `lookupRefIdx` (private), `LookupRefFastUint64`, `LookupRefFastInt64`,
+`LookupRefFastString`, and `LookupRefFastBytes` to `intrinsic_ref_index.go`.
+
+**Rationale:** `LookupRefFast` returns `(any, bool)`. Every call that returns a scalar
+(uint64, int64, string, []byte) boxes the value into an interface{}, allocating one heap
+object per call. At 10K spans × 11 columns × hundreds of blocks, this produced ~171M/120s
+alloc_objects (59.6% of total) in production profiling (Pyroscope 2026-04-28).
+
+**Design:** `lookupRefIdx` factors out the binary search (replaces the duplicated
+`slices.BinarySearchFunc` call that would otherwise appear in all four typed methods).
+The typed methods delegate to `lookupRefIdx` and then access the appropriate value array
+directly without any interface conversion. `LookupRef` (the O(N) linear scan, any-returning)
+was kept for compatibility; the typed accessors are preferred for hot paths.
+
+**Safety:**
+- `LookupRefFastBytes` returns a slice aliasing `col.BytesValues[idx]`. Per NOTE-012,
+  `BytesValues` entries are already independent copies (make+copy in `DecodeFlatPage` /
+  `decodeXORBytesPage`). Callers that need their own copy must clone explicitly.
+- `LookupRefFastString` returns `col.DictEntries[idx].Value` directly. Go strings are
+  immutable; aliasing is safe.
+- Goroutine safety is preserved: all typed accessors call `lookupRefIdx` which calls
+  `col.EnsureRefIndex()` (sync.Once internally).
+
+Back-ref: `internal/modules/blockio/shared/intrinsic_ref_index.go:lookupRefIdx`,
+          `internal/modules/blockio/shared/intrinsic_ref_index.go:LookupRefFastUint64`,
+          `internal/modules/blockio/shared/intrinsic_ref_index.go:LookupRefFastInt64`,
+          `internal/modules/blockio/shared/intrinsic_ref_index.go:LookupRefFastString`,
+          `internal/modules/blockio/shared/intrinsic_ref_index.go:LookupRefFastBytes`
+
+*Addendum (2026-04-28):* The four typed accessor methods (`LookupRefFastUint64`, `LookupRefFastInt64`,
+`LookupRefFastString`, `LookupRefFastBytes`) and the private `lookupRefIdx` were superseded and removed
+in the same session. The consolidated `LookupRefFast(packedRef uint32) (any, bool)` replaces all four,
+returning the concrete type directly via a format switch. Per NOTE-094 in executor/NOTES.md, the
+`[8]byte` value type for spanID/parentID eliminates the clone that `LookupRefFastBytes` previously required.
+The `BENCH-SHARED-001` benchmark targeting `LookupRefFastUint64` was also removed (see BENCHMARKS.md addendum).

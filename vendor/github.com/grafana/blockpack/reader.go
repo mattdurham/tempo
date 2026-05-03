@@ -370,7 +370,13 @@ func GetTraceByID(r *Reader, traceIDHex string) (results []SpanMatch, err error)
 		}
 
 		for _, rowIdx := range matchingRows {
-			fields := modules_blockio.NewSpanFieldsAdapterWithReader(bwb.Block, r, entry.BlockID, rowIdx)
+			fields := modules_blockio.NewSpanFieldsAdapterWithReader(
+				bwb.Block,
+				r,
+				entry.BlockID,
+				rowIdx,
+				nil,
+			)
 			// trace:id is known; extract span:id via intrinsic fallback map.
 			traceIDStr := hex.EncodeToString(traceID[:])
 			spanIDStr := ""

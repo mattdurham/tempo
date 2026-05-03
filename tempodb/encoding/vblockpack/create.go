@@ -85,11 +85,7 @@ func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.Blo
 		return nil, fmt.Errorf("failed to create blockpack writer: %w", err)
 	}
 
-	var (
-		traceCount int
-		minStart   = ^uint64(0)
-		maxStart   uint64
-	)
+	var traceCount int
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -105,21 +101,6 @@ func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.Blo
 		}
 		if tr == nil {
 			continue
-		}
-
-		// Track time range from span timestamps to populate meta without
-		// re-parsing the block bytes after writing.
-		for _, rs := range tr.ResourceSpans {
-			for _, ss := range rs.ScopeSpans {
-				for _, span := range ss.Spans {
-					if span.StartTimeUnixNano < minStart {
-						minStart = span.StartTimeUnixNano
-					}
-					if span.StartTimeUnixNano > maxStart {
-						maxStart = span.StartTimeUnixNano
-					}
-				}
-			}
 		}
 
 		if addErr := writer.AddTempoTrace(tr); addErr != nil {
@@ -146,10 +127,13 @@ func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.Blo
 	meta.TotalObjects = int64(traceCount)
 	meta.Size_ = uint64(size)
 	meta.TotalRecords = 1
-	if minStart != ^uint64(0) {
-		meta.StartTime = time.Unix(0, int64(minStart))
-		meta.EndTime = time.Unix(0, int64(maxStart))
-	}
+	// Do not set meta.StartTime/EndTime here — the caller (tenant_store.go)
+	// runs adjustTimeRangeForSlack after CreateBlock returns, which clamps the
+	// time range to the consume-cycle window. Overwriting here with raw span
+	// timestamps bypasses that clamping and produces blocks with wide time
+	// ranges that prevent compaction (blocks span multiple compaction windows).
+	// This matches vParquet4's CreateBlock which passes meta timestamps through
+	// unchanged (vparquet4/create.go:144-145).
 
 	blockUUID := uuid.UUID(meta.BlockID)
 	if err := to.StreamWriter(ctx, DataFileName, blockUUID, meta.TenantID, tmp, size); err != nil {

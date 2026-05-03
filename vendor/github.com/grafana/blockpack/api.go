@@ -20,6 +20,7 @@ import (
 	"math"
 
 	"github.com/grafana/blockpack/internal/logqlparser"
+	modules_blockio "github.com/grafana/blockpack/internal/modules/blockio"
 	modules_shared "github.com/grafana/blockpack/internal/modules/blockio/shared"
 	modules_executor "github.com/grafana/blockpack/internal/modules/executor"
 	modules_queryplanner "github.com/grafana/blockpack/internal/modules/queryplanner"
@@ -136,7 +137,7 @@ func ColumnNames(r *Reader) []string {
 //   - Pipeline queries: `{ filter } | aggregate() > threshold`
 //
 // For filter queries, each SpanMatch.Fields supports GetField and IterateFields.
-// For structural queries, SpanMatch.Fields is nil — only TraceID and SpanID are set.
+// For structural queries, SpanMatch.Fields is non-nil and backed by the intrinsic section.
 // Pipeline queries group matching spans into spansets, compute aggregates, and
 // filter by threshold before returning qualifying spans.
 func QueryTraceQL(
@@ -183,15 +184,26 @@ func QueryTraceQL(
 		var execResult *modules_executor.StructuralResult
 		execResult, err = modules_executor.ExecuteStructural(r, q, execOpts)
 		if err == nil {
+			// SPEC-ROOT-017: pass secondPassCols as wantCols to restrict intrinsic decoding
+			structuralWantCols := modules_executor.ComputeSecondPassCols(nil, opts.SelectColumns)
 			for i := range execResult.Matches {
 				m := &execResult.Matches[i]
+				rawAdapter := modules_blockio.NewSpanFieldsAdapterWithReader(m.Block, r, m.BlockIdx, m.RowIdx, structuralWantCols)
+				fields := rawAdapter
+				if len(opts.SelectColumns) > 0 {
+					fields = newFilteredSpanFields(rawAdapter, opts.SelectColumns)
+				}
 				match := &SpanMatch{
 					TraceID: hex.EncodeToString(m.TraceID[:]),
 					SpanID:  hex.EncodeToString(m.SpanID),
+					Fields:  fields,
 				}
 				if !collector(match, true) {
+					modules_blockio.ReleaseSpanFieldsAdapter(rawAdapter)
 					break
 				}
+				// NOTE-ALLOC-4: release after collector calls match.Clone().
+				modules_blockio.ReleaseSpanFieldsAdapter(rawAdapter)
 			}
 			collector(nil, false)
 		}

@@ -423,9 +423,16 @@ func (r *Reader) layoutIntrinsicSections() []FileLayoutSection {
 		if !ok {
 			continue
 		}
-		formatName := "flat"
-		if meta.Format == shared.IntrinsicFormatDict {
+		var formatName string
+		switch meta.Format {
+		case shared.IntrinsicFormatDict:
 			formatName = "dict"
+		case shared.IntrinsicFormatXORBytes:
+			formatName = "xor_bytes"
+		case shared.IntrinsicFormatDeltaUint64:
+			formatName = "delta_uint64"
+		default:
+			formatName = "flat"
 		}
 
 		blob, blobErr := r.GetIntrinsicColumnBlob(name)

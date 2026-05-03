@@ -1661,3 +1661,66 @@ requires cross-block data (KLL quantile estimation).
 structures that require cross-block data, follow the same accumulate-at-flush pattern.
 
 Back-ref: `internal/modules/blockio/writer/vector_index.go:vectorAccumulator`
+
+## NOTE-STRUCT-FIELDS-001: nil-block guard in modulesSpanFieldsAdapter
+*Added: 2026-04-28*
+
+**Decision:** Added a nil-block guard to `modulesLookupColumn` and to the `IterateFields`
+method of `modulesSpanFieldsAdapter`. When `a.block == nil`, `modulesLookupColumn` returns
+nil immediately; `IterateFields` skips `a.block.IterFields()` and sets `entries` to nil; the
+`needFallback` check in `IterateFields` sets `needFallback = true` immediately without calling
+`a.block.GetColumn`.
+
+**Why:** The structural query path constructs a `SpanFieldsAdapter` with a nil block (see
+NOTE-093 in executor/NOTES.md). When block is nil, all field access must go through the
+intrinsic section fallback (`loadIntrinsicCache`). Without nil-block guards, any access to
+`a.block.IterFields()` or `a.block.GetColumn(name)` would panic.
+
+**Behavior contract (nil block):** `GetField` falls through to intrinsic cache lookup for
+every field name. `IterateFields` emits only intrinsic section fields (no block column
+enumeration). For dual-storage files all standard fields (resource.service.name, span:kind,
+etc.) are present in the intrinsic section and are accessible through this path.
+
+**Back-ref:** `internal/modules/blockio/span_fields.go:modulesLookupColumn`,
+             `internal/modules/blockio/span_fields.go:IterateFields`
+
+---
+
+## NOTE-STRUCT-FIELDS-002: isDualStorage Per-Block Caching + wantCols in modulesSpanFieldsAdapter
+*Added: 2026-04-30*
+
+**Decision:** Added `isDualStorage bool` and `wantCols map[string]struct{}` fields to
+`modulesSpanFieldsAdapter`. `isDualStorage` is computed ONCE PER BLOCK by the block-processing
+loop caller (not per span, not per IterateFields call) via the exported `ComputeIsDualStorage`
+helper, then passed to `NewSpanFieldsAdapterWithReader`. `wantCols` restricts `loadIntrinsicCache`
+to only the named intrinsic columns.
+
+**Rationale:** `IterateFields` previously ran an O(N_intrinsics) loop over
+`r.IntrinsicColumnNames()` checking `block.GetColumn(name)` for each intrinsic column — on
+every call to `IterateFields` for every span. For a block with 1800 spans and 10 intrinsic
+columns, this is 18,000 `GetColumn` lookups per `IterateFields` invocation. Since the block's
+column set is fixed for its lifetime, this detection is invariant per block and should be
+computed once. `isDualStorage=true` short-circuits the fallback entirely for dual-storage files
+(PR #174+, the normal production case).
+
+**Reset contract:** `putSpanFieldsAdapter` sets `isDualStorage=false` and `wantCols=nil` before
+pool return. This ensures pool-reused adapters never inherit stale state from prior spans.
+
+**isDualStorage=false safety:** Defaulting to false is always safe. It causes `loadIntrinsicCache`
+to be called (the pre-existing behavior), which is correct but slower. The only cost of a false
+negative (false when true) is redundant work, not incorrect results.
+
+As of 2026-04-30, `wantCols` is non-nil at filter and log stream paths (`streamFilterProgram`,
+`streamLogProgram`), making `loadIntrinsicCache` column filtering active on those paths. Only
+`reader.go:GetTraceByID` and the structural result path with empty SelectColumns continue to pass
+`wantCols=nil`.
+
+Back-ref: `internal/modules/blockio/span_fields.go:modulesSpanFieldsAdapter`,
+`internal/modules/blockio/span_fields.go:ComputeIsDualStorage`,
+`internal/modules/blockio/span_fields.go:getSpanFieldsAdapterWithReader`,
+`internal/modules/blockio/span_fields.go:IterateFields`,
+`internal/modules/blockio/span_fields.go:loadIntrinsicCache`,
+`internal/modules/executor/predicates.go:ComputeSecondPassCols`,
+`query_traceql.go:streamFilterProgram`,
+`query_logql.go:streamLogProgram`,
+`reader.go:GetTraceByID`

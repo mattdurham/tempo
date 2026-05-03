@@ -107,6 +107,14 @@ func ExecuteTraceMetrics(
 		ctx = context.Background()
 	}
 
+	// Normalize short TraceQL intrinsic field names to full column names.
+	// The TraceQL parser produces "duration" but all column lookups expect "span:duration".
+	// Must happen before outputCols is built so metricsColumnsAreIntrinsic sees the correct name.
+	querySpec.Aggregate.Field = normalizeIntrinsicFieldName(querySpec.Aggregate.Field)
+	for i, g := range querySpec.Aggregate.GroupBy {
+		querySpec.Aggregate.GroupBy[i] = normalizeIntrinsicFieldName(g)
+	}
+
 	var tr queryplanner.TimeRange
 	if querySpec.TimeBucketing.Enabled {
 		tr = queryplanner.TimeRange{

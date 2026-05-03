@@ -1046,8 +1046,9 @@ func collectIntrinsicTopKKLL(
 	for _, bi := range blockOrder {
 		for _, ref := range blockRefs[uint16(bi)] { //nolint:gosec // bi is bounded by block count
 			packed := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx)
-			if val, ok := tsCol.LookupRefFast(packed); ok {
-				pairs = append(pairs, refTS{ref: ref, ts: val.(uint64)})
+			// NOTE-093: LookupRefFastUint64 avoids interface boxing of uint64 timestamp.
+			if ts, ok := tsCol.LookupRefFastUint64(packed); ok {
+				pairs = append(pairs, refTS{ref: ref, ts: ts})
 			}
 		}
 	}
@@ -1154,17 +1155,17 @@ func collectIntrinsicTopKScan(
 	if len(selected) > 0 && (opts.TimeRange.MinNano > 0 || opts.TimeRange.MaxNano > 0) {
 		tsCol, tsErr := r.GetIntrinsicColumn(opts.TimestampColumn)
 		if tsErr == nil && tsCol != nil && len(tsCol.Uint64Values) == len(tsCol.BlockRefs) {
-			// Use LookupRefFast: O(K log N) avoiding per-call allocations
+			// Use LookupRefFastUint64: O(K log N) avoiding per-call allocations
 			// vs the old O(N) map build over 3.3M entries.
-			// LookupRefFast calls EnsureRefIndex internally.
+			// LookupRefFastUint64 calls EnsureRefIndex internally.
 			filtered := selected[:0]
 			for _, ref := range selected {
 				packed := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx)
-				val, ok := tsCol.LookupRefFast(packed)
+				// NOTE-093: LookupRefFastUint64 avoids interface boxing of uint64 timestamp.
+				ts, ok := tsCol.LookupRefFastUint64(packed)
 				if !ok {
 					continue
 				}
-				ts := val.(uint64)
 				if opts.TimeRange.MinNano > 0 && ts < opts.TimeRange.MinNano {
 					continue
 				}
@@ -1424,7 +1425,7 @@ func filterRowSetByIntrinsicNodes(
 //
 // For each requested intrinsic column, GetIntrinsicColumn returns an objectcache-backed
 // column where EnsureRefIndex builds a sorted-by-ref lookup table once (O(N log N));
-// subsequent lookups use O(log N) binary search per selected ref via LookupRefFast.
+// subsequent lookups use O(log N) binary search per selected ref via typed accessors.
 // Total per column: O(M log N) for M target refs.
 //
 // SPEC-ROOT-010: I/O errors must not be silently swallowed. Returns an error if any
@@ -1444,12 +1445,27 @@ func lookupIntrinsicFields(
 	}
 
 	// lookupColumn populates result entries for one intrinsic column using O(log N)
-	// binary search. LookupRefFast calls EnsureRefIndex internally.
+	// typed accessors. EnsureRefIndex is called internally on first use.
 	lookupColumn := func(colName string, col *modules_shared.IntrinsicColumn) {
 		for i, ref := range selected {
 			packed := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx) //nolint:gosec
-			if val, ok := col.LookupRefFast(packed); ok {
-				result[i][colName] = val
+			switch colName {
+			case colNameSpanStart, colNameSpanEnd, colNameSpanDuration:
+				if v, ok := col.LookupRefFastUint64(packed); ok {
+					result[i][colName] = v
+				}
+			case colNameSpanName, colNameServiceName, colNameStatusMessage:
+				if v, ok := col.LookupRefFastString(packed); ok {
+					result[i][colName] = v
+				}
+			case colNameSpanKind, colNameSpanStatus:
+				if v, ok := col.LookupRefFastInt64(packed); ok {
+					result[i][colName] = v
+				}
+			case colNameTraceID, colNameSpanID, colNameParentID:
+				if v, ok := col.LookupRefFastBytes(packed); ok {
+					result[i][colName] = v
+				}
 			}
 		}
 	}

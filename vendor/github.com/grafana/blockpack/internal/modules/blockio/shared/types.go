@@ -288,7 +288,7 @@ type PagedIntrinsicTOC struct {
 	Pages         []PageMeta
 	BlockIdxWidth uint8
 	RowIdxWidth   uint8
-	Format        uint8 // IntrinsicFormatFlat or IntrinsicFormatDict
+	Format        uint8 // IntrinsicFormatFlat, IntrinsicFormatDict, IntrinsicFormatXORBytes, or IntrinsicFormatDeltaUint64
 	ColType       ColumnType
 }
 
@@ -304,5 +304,5 @@ type IntrinsicColMeta struct {
 	Length uint32     // byte length of the column data blob (snappy-compressed)
 	Count  uint32     // total number of rows stored (present rows only)
 	Type   ColumnType // ColumnTypeUint64, ColumnTypeBytes, ColumnTypeString, ColumnTypeInt64
-	Format uint8      // IntrinsicFormatFlat or IntrinsicFormatDict
+	Format uint8      // IntrinsicFormatFlat, IntrinsicFormatDict, IntrinsicFormatXORBytes, or IntrinsicFormatDeltaUint64
 }

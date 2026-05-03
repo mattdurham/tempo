@@ -4,8 +4,7 @@ package shared
 
 // This file provides O(log N) reverse-lookup helpers for IntrinsicColumn.
 // EnsureRefIndex builds a sorted index by packed ref once (sync.Once).
-// LookupRefFast performs binary search into that index.
-// LookupRef is the O(N) linear-scan fallback (for small/filtered result sets).
+// lookupRefIdx performs binary search into that index (used by typed accessors).
 
 import (
 	"cmp"
@@ -13,8 +12,8 @@ import (
 )
 
 // EnsureRefIndex builds a sorted-by-packed-ref lookup index into this column, enabling
-// O(log N) reverse lookup via LookupRefFast. Safe to call concurrently — the index is
-// built at most once (sync.Once). No-op if the index is already built or col is nil.
+// O(log N) reverse lookup via the typed accessor methods. Safe to call concurrently —
+// the index is built at most once (sync.Once). No-op if already built or col is nil.
 //
 // For flat columns: RefIndexEntry.Pos indexes into BlockRefs/Uint64Values/BytesValues.
 // For dict columns: RefIndexEntry.Pos is the DictEntries index.
@@ -24,7 +23,7 @@ func (col *IntrinsicColumn) EnsureRefIndex() {
 	}
 	col.refIndexOnce.Do(func() {
 		switch col.Format {
-		case IntrinsicFormatFlat:
+		case IntrinsicFormatFlat, IntrinsicFormatXORBytes, IntrinsicFormatDeltaUint64:
 			idx := make([]RefIndexEntry, len(col.BlockRefs))
 			for i, ref := range col.BlockRefs {
 				idx[i] = RefIndexEntry{
@@ -54,6 +53,87 @@ func (col *IntrinsicColumn) EnsureRefIndex() {
 	})
 }
 
+// lookupRefIdx returns the position index in the value arrays for packedRef,
+// or -1 if not found. Calls EnsureRefIndex internally.
+func (col *IntrinsicColumn) lookupRefIdx(packedRef uint32) int {
+	col.EnsureRefIndex()
+	if len(col.refIndex) == 0 {
+		return -1
+	}
+	pos, ok := slices.BinarySearchFunc(col.refIndex, packedRef, func(e RefIndexEntry, target uint32) int {
+		return cmp.Compare(e.Packed, target)
+	})
+	if !ok {
+		return -1
+	}
+	return int(col.refIndex[pos].Pos)
+}
+
+// LookupRefFastUint64 returns the uint64 value at packedRef for flat columns.
+// Returns (0, false) if not found or if the column has no Uint64Values at that index.
+// NOTE-015: zero-alloc typed accessor; eliminates interface boxing vs LookupRef.
+func (col *IntrinsicColumn) LookupRefFastUint64(packedRef uint32) (uint64, bool) {
+	if col == nil {
+		return 0, false
+	}
+	idx := col.lookupRefIdx(packedRef)
+	if idx < 0 || idx >= len(col.Uint64Values) {
+		return 0, false
+	}
+	return col.Uint64Values[idx], true
+}
+
+// LookupRefFastInt64 returns the int64 value at packedRef for dict int64 columns.
+// Returns (0, false) if not found or if the column type is not int64.
+// NOTE-015: zero-alloc typed accessor; eliminates interface boxing vs LookupRef.
+func (col *IntrinsicColumn) LookupRefFastInt64(packedRef uint32) (int64, bool) {
+	if col == nil {
+		return 0, false
+	}
+	idx := col.lookupRefIdx(packedRef)
+	if idx < 0 || col.Format != IntrinsicFormatDict || idx >= len(col.DictEntries) {
+		return 0, false
+	}
+	if col.Type != ColumnTypeInt64 && col.Type != ColumnTypeRangeInt64 {
+		return 0, false
+	}
+	return col.DictEntries[idx].Int64Val, true
+}
+
+// LookupRefFastString returns the string value at packedRef for dict string columns.
+// Returns ("", false) if not found or if the column is not a dict string column.
+// NOTE-015: zero-alloc typed accessor; eliminates interface boxing vs LookupRef.
+// The returned string aliases col.DictEntries[idx].Value — immutable in Go, safe to alias.
+func (col *IntrinsicColumn) LookupRefFastString(packedRef uint32) (string, bool) {
+	if col == nil {
+		return "", false
+	}
+	idx := col.lookupRefIdx(packedRef)
+	if idx < 0 || col.Format != IntrinsicFormatDict || idx >= len(col.DictEntries) {
+		return "", false
+	}
+	if col.Type == ColumnTypeInt64 || col.Type == ColumnTypeRangeInt64 {
+		return "", false
+	}
+	return col.DictEntries[idx].Value, true
+}
+
+// LookupRefFastBytes returns the []byte value at packedRef for flat bytes columns.
+// Returns (nil, false) if not found or if the column has no BytesValues at that index.
+// NOTE-015: zero-alloc typed accessor; eliminates interface boxing vs LookupRef.
+// NOTE-012: the returned slice aliases col.BytesValues[idx] which is already an independent
+// copy of any pool buffer. Callers that need their own copy must clone explicitly.
+func (col *IntrinsicColumn) LookupRefFastBytes(packedRef uint32) ([]byte, bool) {
+	if col == nil {
+		return nil, false
+	}
+	idx := col.lookupRefIdx(packedRef)
+	if idx < 0 || idx >= len(col.BytesValues) {
+		return nil, false
+	}
+	return col.BytesValues[idx], true
+}
+
 // LookupRefFast performs an O(log N) binary search for packedRef in col.refIndex.
 // Calls EnsureRefIndex internally (sync.Once, so subsequent calls are free);
 // callers no longer need a separate EnsureRefIndex call before LookupRefFast.
@@ -76,7 +156,7 @@ func (col *IntrinsicColumn) LookupRefFast(packedRef uint32) (val any, found bool
 	}
 	idx := int(col.refIndex[pos].Pos)
 	switch col.Format {
-	case IntrinsicFormatFlat:
+	case IntrinsicFormatFlat, IntrinsicFormatXORBytes, IntrinsicFormatDeltaUint64:
 		if idx < len(col.Uint64Values) {
 			return col.Uint64Values[idx], true
 		}
@@ -113,7 +193,7 @@ func (col *IntrinsicColumn) LookupRef(packedRef uint32) (val any, found bool) {
 		return nil, false
 	}
 	switch col.Format {
-	case IntrinsicFormatFlat:
+	case IntrinsicFormatFlat, IntrinsicFormatXORBytes, IntrinsicFormatDeltaUint64:
 		for i, ref := range col.BlockRefs {
 			packed := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx)
 			if packed != packedRef {

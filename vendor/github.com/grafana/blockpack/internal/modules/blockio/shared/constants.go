@@ -109,6 +109,18 @@ const (
 	IntrinsicFormatFlat    uint8 = 0x01 // flat array: delta-encoded uint64 or length-prefixed bytes
 	IntrinsicFormatDict    uint8 = 0x02 // dictionary (string or int64 enum columns)
 
+	// IntrinsicFormatXORBytes is the format byte for large flat bytes columns.
+	// Values are XOR-against-previous encoded; the entire payload is single-snappy-compressed.
+	// NOTE-013: this avoids N×IntrinsicPageSize independent snappy calls which inflate
+	// random-byte columns (span:id, trace:id) to 2× their uncompressed size.
+	IntrinsicFormatXORBytes uint8 = 0x03
+
+	// IntrinsicFormatDeltaUint64 is the format byte for large flat uint64 columns.
+	// Values are sorted ascending, delta-encoded with unsigned varints, and single-snappy-compressed.
+	// NOTE-014: mirrors the XORBytes single-pass snappy rationale for uint64 span:start/duration columns.
+	// Unsigned uvarint (not zigzag) is used because sorted ascending deltas are always non-negative.
+	IntrinsicFormatDeltaUint64 uint8 = 0x04
+
 	// IntrinsicPagedVersion is the sentinel byte that identifies a v2 paged column region.
 	// When the first byte of a column blob is 0x02 the blob is NOT snappy-compressed as a
 	// whole; instead it contains: sentinel[1] + toc_len[4 LE] + toc_blob[toc_len] + page blobs.
