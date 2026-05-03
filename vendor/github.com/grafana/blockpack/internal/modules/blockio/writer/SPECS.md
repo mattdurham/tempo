@@ -149,3 +149,32 @@ enumeration (see `span_fields.go:NOTE-ITER-1`) while still resolving them via `G
 
 Back-ref: `internal/modules/blockio/writer/writer_log_body.go:parseLogBody`,
           `internal/modules/blockio/writer/writer_log.go:362`
+
+---
+
+## SPEC-012: Intrinsic Column Encoding Dispatch
+*Added: 2026-04-22*
+
+`encodeColumn` in `intrinsic_accum.go` selects the encoding for each intrinsic accumulator
+column based on its type and row count:
+
+| Condition | Encoding |
+|---|---|
+| `len(c.bytesValues) > 0` AND `len(c.refs) > IntrinsicPageSize` | `encodeXORBytesIntrinsic` → `IntrinsicFormatXORBytes` (Format=0x03) |
+| `len(c.bytesValues) > 0` AND `len(c.refs) <= IntrinsicPageSize` | `encodeFlatColumn` → `IntrinsicFormatFlat` |
+| `len(c.bytesValues) == 0` AND `len(c.refs) > IntrinsicPageSize` (large uint64 flat column) | `encodeDeltaUint64Intrinsic` → `IntrinsicFormatDeltaUint64` (Format=0x04) |
+| `len(c.bytesValues) == 0` AND `len(c.refs) <= IntrinsicPageSize` (small numeric column) | `encodeFlatColumn` → `IntrinsicFormatFlat` |
+
+**Invariant:** The threshold `> IntrinsicPageSize` (strict greater-than) means a column with
+exactly `IntrinsicPageSize` rows uses the v1 non-paged flat path, not XOR or DeltaUint64 encoding.
+
+**Invariant:** `encodeXORBytesIntrinsic` requires `len(c.bytesValues) > 0`. If called with
+an empty accumulator, it falls back to `encodeFlatColumn`.
+
+**Invariant:** `encodeDeltaUint64Intrinsic` requires `len(c.uint64Values) > 0`. If called with
+an empty accumulator, it falls back to `encodeFlatColumn`. Values are sorted ascending before
+encoding; all deltas are non-negative. Min/Max stored as 8-byte LE binary (not decimal string).
+
+Back-ref: `internal/modules/blockio/writer/intrinsic_accum.go:encodeColumn`,
+          `internal/modules/blockio/writer/intrinsic_accum.go:encodeXORBytesIntrinsic`,
+          `internal/modules/blockio/writer/intrinsic_accum.go:encodeDeltaUint64Intrinsic`

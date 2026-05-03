@@ -62,10 +62,11 @@ func (e Encoding) CopyBlock(ctx context.Context, meta *backend.BlockMeta, from b
 		return fmt.Errorf("failed to read blockpack data: %w", err)
 	}
 
-	// Populate StartTime/EndTime from actual span timestamps in the block file.
-	// This ensures the copied block metadata reflects real span times rather than
-	// the flush time that may have been recorded when the block was originally created.
-	setBlockTimeRange(meta, data)
+	// Note: do not call setBlockTimeRange here. meta.StartTime/EndTime are set by
+	// the caller (adjustTimeRangeForSlack in tenant_store.go) to the ingest-time window,
+	// matching vParquet4 behavior. Overwriting with span timestamps here would bypass
+	// the clamping and produce wide time ranges that prevent compaction.
+	// Compaction (compactor.go) calls setBlockTimeRange explicitly on its output.
 
 	// Write to destination
 	if err := to.Write(ctx, DataFileName, blockID, meta.TenantID, data, nil); err != nil {

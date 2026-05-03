@@ -374,3 +374,37 @@ Back-ref: `internal/modules/blockio/writer/writer_block.go`,
 | `MaxMetadataSize` | 268,435,456 (256 MiB) | Max metadata section size (raised from 100 MiB 2026-03-06 for sketch data scaling) |
 
 Back-ref: `internal/modules/blockio/shared/constants.go`
+
+---
+
+## 9. Intrinsic Column Format Constants
+
+```go
+const (
+    IntrinsicFormatFlat        uint8 = 0x01 // numeric or bytes values stored inline
+    IntrinsicFormatDict        uint8 = 0x02 // dictionary-encoded string values
+    IntrinsicFormatXORBytes    uint8 = 0x03 // XOR-delta encoded bytes values (paged, single snappy pass)
+    IntrinsicFormatDeltaUint64 uint8 = 0x04 // delta uvarint encoded uint64 values (paged, single snappy pass)
+)
+```
+
+**Invariants:**
+- All code that switches on `IntrinsicFormatFlat` MUST also handle `IntrinsicFormatXORBytes`
+  and `IntrinsicFormatDeltaUint64`. After decode, `IntrinsicFormatXORBytes` columns expose
+  the same `BytesValues`/`BlockRefs` layout as flat columns; `IntrinsicFormatDeltaUint64`
+  columns expose the same `Uint64Values`/`BlockRefs` layout as flat uint64 columns — callers
+  treat them identically post-decode.
+- `IntrinsicFormatXORBytes` is only valid inside a paged blob (sentinel byte
+  `IntrinsicPagedVersion = 0x02`). It is never used in legacy (v1 non-paged) blobs.
+- `IntrinsicFormatDeltaUint64` is only valid inside a paged blob (sentinel byte
+  `IntrinsicPagedVersion = 0x02`). It is never used in legacy (v1 non-paged) blobs.
+- The decoder for `IntrinsicFormatXORBytes` (`decodeXORBytesPage`) enforces
+  `xorLen <= MaxBytesLen` per row to prevent large allocations from crafted blobs.
+- `IntrinsicFormatDeltaUint64` stores PageMeta Min/Max as 8-byte little-endian binary
+  (matching `encodeFlatPageBlob`); decimal string encoding is incorrect for this format.
+
+Back-ref: `internal/modules/blockio/shared/intrinsic_codec.go:decodePagedColumnBlob`,
+          `internal/modules/blockio/shared/intrinsic_codec.go:decodeXORBytesPage`,
+          `internal/modules/blockio/shared/intrinsic_codec.go:decodeDeltaUint64Page`,
+          `internal/modules/blockio/writer/intrinsic_accum.go:encodeXORBytesIntrinsic`,
+          `internal/modules/blockio/writer/intrinsic_accum.go:encodeDeltaUint64Intrinsic`

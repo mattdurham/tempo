@@ -79,6 +79,10 @@ func createFetchTestBlock(t *testing.T) (*blockpackBlock, *backend.BlockMeta) {
 
 	iter := &mockIterator{traces: traces, ids: ids}
 	meta := backend.NewBlockMeta("test-tenant", uuid.New(), VersionString)
+	// Simulate adjustTimeRangeForSlack: the block-builder sets StartTime/EndTime
+	// to the ingest-time window; CreateBlock no longer sets them from span timestamps.
+	meta.StartTime = time.Now().Add(-2 * time.Minute)
+	meta.EndTime = time.Now().Add(5 * time.Minute)
 	cfg := &common.BlockConfig{}
 
 	resultMeta, err := CreateBlock(ctx, cfg, meta, iter, r, w)
@@ -714,9 +718,9 @@ func TestFetch_SpansetMetadata(t *testing.T) {
 func TestFetch_TimeRangeSkip(t *testing.T) {
 	block, resultMeta := createFetchTestBlock(t)
 
-	// Sanity check: block has a real time range set by setBlockTimeRange.
-	require.False(t, resultMeta.StartTime.IsZero(), "block StartTime must be set by setBlockTimeRange")
-	require.False(t, resultMeta.EndTime.IsZero(), "block EndTime must be set by setBlockTimeRange")
+	// Sanity check: block has a time range set by the caller (simulating adjustTimeRangeForSlack).
+	require.False(t, resultMeta.StartTime.IsZero(), "block StartTime must be set before CreateBlock")
+	require.False(t, resultMeta.EndTime.IsZero(), "block EndTime must be set before CreateBlock")
 
 	ctx := context.Background()
 
@@ -948,6 +952,7 @@ func TestFetch_AllAttributesLimitedToQueryConditions(t *testing.T) {
 	}
 	resp, err := blk.Fetch(ctx, req, common.DefaultSearchOptions())
 	require.NoError(t, err)
+	defer resp.Results.Close()
 
 	ss, err := resp.Results.Next(ctx)
 	require.NoError(t, err)
@@ -994,6 +999,98 @@ func TestFetch_SetsAttributeMatched(t *testing.T) {
 		require.Equal(t, len(ss.Spans), n, "attributeMatched must equal span count")
 		require.Greater(t, n, 0, "span count must be > 0")
 	}
+}
+
+// TestFetch_StructuralQueryPopulatesRootServiceName is a FAILING test that reproduces:
+// structural TraceQL queries (>>) return RootServiceName="" because blockpack.QueryTraceQL
+// sets SpanMatch.Fields=nil for structural results, causing SpanMatchesMetadata to skip
+// all spans and return empty root metadata.
+//
+// Root cause: vendor/github.com/grafana/blockpack/spanmatch.go:271-273 skips nil-Fields spans.
+// Fix location: tempodb/encoding/vblockpack/backend_block.go:Fetch() — detect nil Fields,
+// issue a metadata re-query with "{}" + SelectColumns for the matched trace IDs.
+func TestFetch_StructuralQueryPopulatesRootServiceName(t *testing.T) {
+	t.Cleanup(blockpack.ClearReaderCaches)
+
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	rawR, rawW, _, err := local.New(&local.Config{Path: tmpDir})
+	require.NoError(t, err)
+	r := backend.NewReader(rawR)
+	w := backend.NewWriter(rawW)
+
+	traceID := []byte{0x30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x30}
+	rootSpanID := []byte{0x30, 0, 0, 0, 0, 0, 0, 0x01}
+	childSpanID := []byte{0x30, 0, 0, 0, 0, 0, 0, 0x02}
+	now := uint64(time.Now().UnixNano())
+
+	mkAttr := func(k, v string) *tempocommon.KeyValue {
+		return &tempocommon.KeyValue{Key: k, Value: &tempocommon.AnyValue{Value: &tempocommon.AnyValue_StringValue{StringValue: v}}}
+	}
+
+	trace := &tempopb.Trace{
+		ResourceSpans: []*tempotrace.ResourceSpans{{
+			Resource: &temporesource.Resource{
+				Attributes: []*tempocommon.KeyValue{mkAttr("service.name", "my-svc")},
+			},
+			ScopeSpans: []*tempotrace.ScopeSpans{{
+				Spans: []*tempotrace.Span{
+					{
+						TraceId:           traceID,
+						SpanId:            rootSpanID,
+						Name:              "root-op",
+						StartTimeUnixNano: now,
+						EndTimeUnixNano:   now + uint64(200*time.Millisecond),
+					},
+					{
+						TraceId:           traceID,
+						SpanId:            childSpanID,
+						ParentSpanId:      rootSpanID,
+						Name:              "child-op",
+						StartTimeUnixNano: now + uint64(10*time.Millisecond),
+						EndTimeUnixNano:   now + uint64(110*time.Millisecond),
+						Attributes:        []*tempocommon.KeyValue{mkAttr("db.system", "mysql")},
+					},
+				},
+			}},
+		}},
+	}
+
+	iter := &mockIterator{traces: []*tempopb.Trace{trace}, ids: [][]byte{traceID}}
+	meta := backend.NewBlockMeta("test-tenant", uuid.New(), VersionString)
+	cfg := &common.BlockConfig{}
+	resultMeta, err := CreateBlock(ctx, cfg, meta, iter, r, w)
+	require.NoError(t, err)
+
+	blk := newBackendBlock(resultMeta, r)
+
+	// Structural query: parent span must be in "my-svc", child must have db.system="mysql".
+	// blockpack.QueryTraceQL returns SpanMatch.Fields=nil for structural queries — this is the bug trigger.
+	structuralQuery := `{ resource.service.name = "my-svc" } >> { span.db.system = "mysql" }`
+	fetchCtx := common.WithOriginalTraceQLQuery(ctx, structuralQuery, false)
+
+	req := traceql.FetchSpansRequest{}
+	resp, err := blk.Fetch(fetchCtx, req, common.SearchOptions{})
+	require.NoError(t, err)
+	defer resp.Results.Close()
+
+	var spansets []*traceql.Spanset
+	for {
+		ss, err := resp.Results.Next(fetchCtx)
+		require.NoError(t, err)
+		if ss == nil {
+			break
+		}
+		spansets = append(spansets, ss)
+	}
+
+	require.Len(t, spansets, 1, "structural query must return exactly 1 spanset for the matching trace")
+	ss := spansets[0]
+
+	require.Equal(t, "my-svc", ss.RootServiceName,
+		"structural query must populate RootServiceName; nil Fields from blockpack.QueryTraceQL causes this to be empty")
+	require.Greater(t, ss.DurationNanos, uint64(0),
+		"structural query must populate DurationNanos; nil Fields causes this to be 0")
 }
 
 // TestFetch_SpanCapAtDefaultSpansPerSpanSet verifies that Fetch() caps the returned

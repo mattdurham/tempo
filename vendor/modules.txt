@@ -724,7 +724,7 @@ github.com/googleapis/gax-go/v2/iterator
 # github.com/gorilla/mux v1.8.1
 ## explicit; go 1.20
 github.com/gorilla/mux
-# github.com/grafana/blockpack v0.0.0-20260423154652-3f3540dd5a32
+# github.com/grafana/blockpack v0.0.0-20260423173939-274ce72a0fde => ../../blockpack
 ## explicit; go 1.26.0
 github.com/grafana/blockpack
 github.com/grafana/blockpack/internal/logqlparser
@@ -2633,3 +2633,4 @@ k8s.io/utils/clock
 # k8s.io/api => k8s.io/api v0.35.3
 # k8s.io/client-go => k8s.io/client-go v0.35.3
 # github.com/hashicorp/memberlist => github.com/grafana/memberlist v0.3.1-0.20251024160842-5cd332c2849a
+# github.com/grafana/blockpack => ../../blockpack

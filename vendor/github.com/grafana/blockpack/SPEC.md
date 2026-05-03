@@ -511,3 +511,58 @@ consumed 54% of query CPU. Single-pass dense-array designs eliminated both.
 
 Code review. When adding any new data-processing path, verify no intermediate collection is built
 solely to be iterated a second time.
+
+---
+
+## SPEC-ROOT-017: Column Threading Invariant — Propagate wantColumns End-to-End
+
+**Invariant:** The set of columns needed by a query must be threaded from compilation through
+every decode step. No subsystem may decode, load, or scan column data for columns absent from
+the query's needed set.
+
+**Rules:**
+
+- `ProgramWantColumns(program)` is the authoritative source of predicate column names at
+  compile time. It must be threaded into `ParseBlockFromBytes`, `SpanFieldsAdapter`, and
+  `loadIntrinsicCache`.
+- `secondPassCols` (computed in `computeColumnFilters`) augments `wantColumns` with output
+  columns (searchMetaCols, traceIntrinsicColumns, SelectColumns). It is the correct filter
+  for second-pass block decodes and for `loadIntrinsicCache` in result-materialization paths.
+- `loadIntrinsicCache` must skip any intrinsic column not in its `wantCols` parameter.
+  When `wantCols` is nil, all columns are loaded (match-all and GetTraceByID paths).
+- Per-block `isDualStorage` detection must be computed once per block, not once per
+  `IterateFields` call. The result is passed to the adapter constructor.
+- Stream paths (`streamFilterProgram`, `streamLogProgram`) must pass
+  `wantCols=ComputeSecondPassCols(program, selectColumns)`, computed once before the row loop.
+  The result may be nil for programs with no predicates and no SelectColumns; nil is valid and
+  means load-all.
+- Paths that need all fields (GetTraceByID) must pass `wantCols=nil`. The structural result
+  path passes `wantCols=ComputeSecondPassCols(nil, opts.SelectColumns)`, which is nil when
+  SelectColumns is empty (load-all) and non-nil when SelectColumns is provided. `nil` wantCols
+  is explicitly valid and means "load all intrinsic columns" — it is not a missing-value bug.
+- Callers passing non-nil wantCols for span:end synthesis must include both span:start and
+  span:duration in the set; omitting either suppresses span:end synthesis (the synthesis check
+  requires both keys present in intrinsicCache).
+
+**Rationale:**
+
+Decoding intrinsic columns not needed by a query wastes CPU and memory on every matched span.
+For queries against old-format files (pre-dual-storage), this is especially expensive because
+`loadIntrinsicCache` performs an O(N_refs) linear scan per column. The per-span dual-storage
+detection loop is also a hidden O(N_intrinsics) cost per span per `IterateFields` call.
+
+**Enforcement:**
+
+Code review. Any new `NewSpanFieldsAdapterWithReader` call site must document its `wantCols`
+and `isDualStorage` choice. `nil` wantCols is acceptable only for paths that need all fields.
+
+Back-ref: `internal/modules/blockio/span_fields.go:loadIntrinsicCache`,
+`internal/modules/blockio/span_fields.go:IterateFields`,
+`internal/modules/blockio/span_fields.go:NewSpanFieldsAdapterWithReader`,
+`internal/modules/executor/stream.go:computeColumnFilters`,
+`internal/modules/executor/predicates.go:ProgramWantColumns`,
+`internal/modules/executor/predicates.go:ComputeSecondPassCols`,
+`query_traceql.go:streamFilterProgram`,
+`query_logql.go:streamLogProgram`,
+`api.go:QueryTraceQL`,
+`reader.go:GetTraceByID`

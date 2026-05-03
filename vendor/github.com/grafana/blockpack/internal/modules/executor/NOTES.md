@@ -6,7 +6,8 @@ This document captures the non-obvious design decisions, rationale, and invarian
 ---
 
 ## 1. Responsibility Boundary
-*Added: 2026-02-10*
+
+_Added: 2026-02-10_
 
 The executor owns span-level evaluation. Block selection (which blocks to read) is
 delegated to `queryplanner`; raw I/O (coalescing, wire parsing) is delegated to
@@ -15,8 +16,9 @@ query.
 
 ---
 
-## 2. Collect Takes *reader.Reader, Not BlockIndexer
-*Added: 2026-02-10 (updated 2026-03-11: renamed Execute → Collect per NOTE-035)*
+## 2. Collect Takes \*reader.Reader, Not BlockIndexer
+
+_Added: 2026-02-10 (updated 2026-03-11: renamed Execute → Collect per NOTE-035)_
 
 **Decision:** `Collect` takes `*reader.Reader` directly rather than `queryplanner.BlockIndexer`.
 
@@ -32,7 +34,8 @@ works without a type assertion.
 ---
 
 ## 3. ColumnDataProvider for Modules Block
-*Added: 2026-02-10*
+
+_Added: 2026-02-10_
 
 **Decision:** The executor implements `vm.ColumnDataProvider` directly against
 `*reader.Block` (modules format) in `column_provider.go`, rather than converting to the
@@ -45,13 +48,15 @@ directly via `GetColumn`, making a direct implementation straightforward and all
 ---
 
 ## 4. RowSet Is Sorted by Construction
-*Added: 2026-02-10*
+
+_Added: 2026-02-10_
 
 **Decision:** `rowSet` maintains rows in ascending order. Stream scans iterate rows
 0..n-1 sequentially, so `Add` is called in ascending order. `ToSlice` returns the
 backing slice directly without re-sorting.
 
 **Rationale:** Sorted row indices are required for:
+
 - `Contains` (binary search, O(log n))
 - `Union/Intersect/Complement` (merge-style algorithms, O(n+m))
 - Deterministic output ordering
@@ -59,7 +64,8 @@ backing slice directly without re-sorting.
 ---
 
 ## 5. SpanMatch Contains Block and Row Indices
-*Added: 2026-02-10*
+
+_Added: 2026-02-10_
 
 **Decision:** `SpanMatch` includes `BlockIdx` and `RowIdx` in addition to `TraceID` and
 `SpanID`.
@@ -71,7 +77,8 @@ allows targeted column access via `ParseBlockFromBytes` + `GetColumn(name).Strin
 ---
 
 ## 6. Predicate Extraction and Dedicated Index Pruning
-*Added: 2026-02-25*
+
+_Added: 2026-02-25_
 
 **Decision:** The executor calls `BuildPredicates(r, program)` (in `predicates.go`),
 which extracts column names and encoded values from `program.Predicates` and builds
@@ -95,7 +102,8 @@ described above.
 ---
 
 ## 7. Integration Coverage via blockio/executor_test.go
-*Added: 2026-02-25*
+
+_Added: 2026-02-25_
 
 **As of the modules executor migration:** the primary integration tests for this
 executor live in `internal/modules/blockio/executor_test.go` (EX-01 through EX-07),
@@ -106,12 +114,14 @@ writer (`modules_blockio.NewWriterWithConfig`) → reader
 (`modules_reader.NewReaderFromProvider`) → this executor (`executor.Collect`).
 
 **Coverage provided by the blockio integration tests:**
+
 - `bloomPredicates` with real data (AND and OR query paths, EX-01, EX-03, EX-04, EX-06)
 - `Collect` empty-file short-circuit (EX-05)
 - Multi-block scanning with `BlocksScanned >= 2` assertion (EX-04)
 - Zero-match result (EX-02)
 
 `internal/modules/executor/executor_test.go` additionally covers:
+
 - `Options.Limit` early-exit (EX-08)
 - `SpanMatch.TraceID` / `SpanMatch.SpanID` field population (EX-09)
 - `statsOut.TotalBlocks` populated via CollectStats (EX-10)
@@ -119,7 +129,8 @@ writer (`modules_blockio.NewWriterWithConfig`) → reader
 ---
 
 ## 8. Signal-Aware Column Selection in spanMatchFromBlock
-*Added: 2026-03-02*
+
+_Added: 2026-03-02_
 
 **Decision:** `spanMatchFromBlock` receives the file's `SignalType` and uses different
 column names depending on whether the file holds trace or log data.
@@ -136,7 +147,8 @@ passed to `spanMatchFromBlock` to avoid repeated calls.
 ---
 
 ## 9. log. Column Scope in Unscoped Attribute Expansion
-*Added: 2026-03-02*
+
+_Added: 2026-03-02_
 
 **Decision:** Unscoped attribute expansion (e.g. `.level`) now expands to three column
 names: `resource.{attr}`, `span.{attr}`, and `log.{attr}`.
@@ -149,7 +161,8 @@ safe: a block is only pruned when none of the three columns is present.
 ---
 
 ## NOTE-010: BuildPredicates Consumes DedicatedRanges; encodeValue Handles Plain Column Types
-*Added: 2026-03-02 — superseded by NOTE-030 (2026-03-06)*
+
+_Added: 2026-03-02 — superseded by NOTE-030 (2026-03-06)_
 
 **Superseded:** The `DedicatedRanges` map no longer exists. Range predicates are now
 represented as `RangeNode{Min, Max}` in the `Nodes` tree and translated by `translateNode`.
@@ -172,13 +185,15 @@ string types. The `Range*` and plain variants produce identical wire encoding.
 ---
 
 ## NOTE-011: Regex Prefix Optimization for Range-Index Pruning
-*Added: 2026-03-03 — updated 2026-03-06 (NOTE-030)*
+
+_Added: 2026-03-03 — updated 2026-03-06 (NOTE-030)_
 
 **Decision:** `translateRegexNode` (formerly a loop over `DedicatedColumnsRegex` in
 `BuildPredicates`) analyzes regex patterns using `vm.AnalyzeRegex` and produces
 range-index predicates when the pattern has an extractable literal prefix.
 
 **Design:**
+
 1. `vm.AnalyzeRegex(pattern)` parses the regex syntax tree (via `regexp/syntax`) and
    extracts literal prefixes from optimizable patterns: `foo.*`, `^error`, `error|warn`.
 2. For optimizable patterns, `BuildPredicates` encodes each prefix as a `RangeString`
@@ -216,6 +231,7 @@ The range index stores original-case values and uses lexicographic comparison.
 would miss blocks containing other case variants (false negatives).
 
 Instead, `buildCaseInsensitiveRegexPredicate` generates an interval query:
+
 - Min key: `strings.ToUpper(prefix)` (e.g., `"DEBUG"`)
 - Max key: `strings.ToLower(prefix) + "\xff"` (e.g., `"debug\xff"`)
 
@@ -245,11 +261,13 @@ Back-ref: `internal/modules/executor/predicates.go:BuildPredicates`,
 ---
 
 ## NOTE-012: Stream vs Execute — Lazy Callback vs Eager Batch
-*Added: 2026-03-03* | *Historical — both `Stream` and `Execute` have been removed; see addendum below.*
+
+_Added: 2026-03-03_ | _Historical — both `Stream` and `Execute` have been removed; see addendum below._
 
 **Decision:** `Stream` was a separate method from `Execute` rather than a flag on `Options`.
 
 **Rationale:**
+
 - `Execute` returns `*Result` (batch `[]SpanMatch`). Callers like `tempoapi` expect a
   fully-materialized slice — adding callback plumbing to `Execute` would complicate its
   contract without benefit for those callers.
@@ -277,10 +295,12 @@ new executor→logqlparser import edge.
 ---
 
 ## Migration: Content migrated from internal/modules/logql/NOTES.md
-*Migrated: 2026-03-03 — package internal/modules/logql deleted; execution logic moved to executor*
+
+_Migrated: 2026-03-03 — package internal/modules/logql deleted; execution logic moved to executor_
 
 ## NOTE-001: Why a New Module Instead of Extending logqlparser
-*Added: 2026-03-03*
+
+_Added: 2026-03-03_
 
 **Decision:** The LogQL execution engine lived in `internal/modules/logql/`, not in
 `internal/logqlparser/`. It has now been merged into executor.
@@ -292,13 +312,15 @@ break the separation that exists between `internal/traceqlparser/` (parse only) 
 `internal/modules/executor/` (execute only).
 
 The architecture now mirrors the established TraceQL architecture:
+
 - TraceQL: `traceqlparser` (parse + compile) + `executor` (execute)
 - LogQL: `logqlparser` (parse + compile + Pipeline types) + `executor` (execute)
 
 ---
 
 ## NOTE-002: Per-Row Pipeline Execution, Not Column-Level
-*Added: 2026-03-03*
+
+_Added: 2026-03-03_
 
 **Decision:** Pipeline stages operate per matched row with signature
 `func(ts, line, labels) (line, labels, bool)`, not over entire columns.
@@ -315,7 +337,8 @@ row indices — keeping the hot path in the columnar scan and the post-filter in
 ---
 
 ## NOTE-003: Reuse vm.QuerySpec for Metrics, Not a New Bucketing System
-*Added: 2026-03-03*
+
+_Added: 2026-03-03_
 
 **Decision:** Metric aggregation in `metrics_log.go` reuses `vm.QuerySpec` for time
 bucketing. It does NOT call `executor.ExecuteMetrics`.
@@ -331,13 +354,15 @@ LogQL metrics needs to interpose the pipeline between block scan and bucket accu
 ---
 
 ## NOTE-004: Label Map Mutability and Caller Responsibility
-*Added: 2026-03-03*
+
+_Added: 2026-03-03_
 
 **Decision:** `Pipeline.Process` may mutate the `labels` map in place. The caller is
 responsible for copying the map if the original state is needed after the call.
 
 **Rationale:** Allocating a new map per row for every pipeline call would generate
 significant GC pressure at high log volumes. Mutation in place is safe because:
+
 1. Pipeline stages chain sequentially (no concurrent access to the same map).
 2. The engine constructs a fresh labels map per row from block columns.
 3. Callers that need the pre-pipeline state (unusual) can copy before calling Process.
@@ -345,7 +370,8 @@ significant GC pressure at high log volumes. Mutation in place is safe because:
 ---
 
 ## NOTE-005: Template Pre-Compilation for line_format
-*Added: 2026-03-03*
+
+_Added: 2026-03-03_
 
 **Decision:** `text/template` parsing for `| line_format "tmpl"` happens once at query
 compile time (`logqlparser/compile.go`), not per-row.
@@ -358,7 +384,8 @@ would dominate pipeline overhead. The compiled `*template.Template` is embedded 
 ---
 
 ## NOTE-006: UnwrapValueKey as Special Label
-*Added: 2026-03-03*
+
+_Added: 2026-03-03_
 
 **Decision:** `UnwrapStage` stores the extracted numeric value in the labels map under
 the key `"__unwrap_value__"` (constant `logqlparser.UnwrapValueKey`).
@@ -371,7 +398,8 @@ interface.
 ---
 
 ## NOTE-007: Silent Failure Policy for Parse Errors in Stages
-*Added: 2026-03-03*
+
+_Added: 2026-03-03_
 
 **Decision:** `JSONStage` and `LogfmtStage` do NOT drop rows when the log body is not
 valid JSON/logfmt. They keep the row with unmodified labels.
@@ -383,7 +411,8 @@ filters to handle the case explicitly.
 ---
 
 ## NOTE-008: Engine Does Not Modify the Reader
-*Added: 2026-03-03*
+
+_Added: 2026-03-03_
 
 **Decision:** `StreamLogs` and `ExecuteLogMetrics` take `*reader.Reader` as a parameter
 but never call writer-side methods. They are pure read paths.
@@ -391,7 +420,8 @@ but never call writer-side methods. They are pure read paths.
 ---
 
 ## NOTE-009: logqlparser Produces Everything Needed to Execute
-*Added: 2026-03-03*
+
+_Added: 2026-03-03_
 
 **Decision:** `logqlparser.CompilePipeline` produces `*logqlparser.Pipeline` alongside
 `*vm.Program`. The executor receives both and does not re-parse the query.
@@ -399,7 +429,8 @@ but never call writer-side methods. They are pure read paths.
 ---
 
 ## NOTE-064: Free Functions Instead of Engine Struct
-*Added: 2026-03-03*
+
+_Added: 2026-03-03_
 
 **Decision:** `StreamLogs` and `ExecuteLogMetrics` are package-level free functions, not
 methods on an `Engine` struct.
@@ -409,8 +440,9 @@ test, and reason about.
 
 ---
 
-## NOTE-065: Label Column Scoping — resource.* and log.* Prefixes Stripped
-*Added: 2026-03-03*
+## NOTE-065: Label Column Scoping — resource.\* and log.\* Prefixes Stripped
+
+_Added: 2026-03-03_
 
 **Decision:** `logReadLabels` strips the `resource.` and `log.` column name prefixes when
 building the per-row labels map. The label `resource.service.name` becomes `service.name`.
@@ -421,7 +453,8 @@ Loki semantics where resource-level attributes are exposed as first-class labels
 ---
 
 ## NOTE-014: Reuse NewColumnProvider, Not a Reimplemented Interface
-*Added: 2026-03-03 (migrated from internal/modules/logql/NOTES.md NOTE-012)*
+
+_Added: 2026-03-03 (migrated from internal/modules/logql/NOTES.md NOTE-012)_
 
 **Decision:** `ExecuteLogMetrics` and `StreamLogs` call `NewColumnProvider(block)` (now
 in the same package) to satisfy `vm.ColumnDataProvider`, rather than implementing the
@@ -430,7 +463,8 @@ interface again.
 ---
 
 ## NOTE-013: executor now imports logqlparser — new dependency edge
-*Added: 2026-03-03*
+
+_Added: 2026-03-03_
 
 **Decision:** `stream_log.go` and `metrics_log.go` import `logqlparser` for the
 `*logqlparser.Pipeline` type.
@@ -448,7 +482,8 @@ executor (execute). For LogQL: logqlparser (parse + compile + Pipeline types) + 
 ---
 
 ## NOTE-015: blockHasBodyParsed — parser-skip optimization for log queries
-*Added: 2026-03-04*
+
+_Added: 2026-03-04_
 
 **Decision:** `blockHasBodyParsed(block)` scans `block.Columns()` looking for any
 `log.*` key with `Type == ColumnTypeRangeString`. When the block has body-auto-parsed
@@ -481,7 +516,8 @@ Back-ref: `internal/modules/blockio/writer/column_types.go:stringColumnBuilder`
 ---
 
 ## NOTE-016: Three-Layer Regex Scan Optimization
-*Added: 2026-03-04*
+
+_Added: 2026-03-04_
 
 **Decision:** `ScanRegexFast` / `ScanRegexNotMatchFast` implement three compounding
 optimizations over the original `StreamScanRegex` path:
@@ -492,7 +528,7 @@ optimizations over the original `StreamScanRegex` path:
    scan loop.
 
 2. **Literal prefix pre-filter** — `vm.RegexPrefixes(pattern)` extracts literal substrings
-   that *must* appear in any matching string. `containsAnySubstring` checks these with
+   that _must_ appear in any matching string. `containsAnySubstring` checks these with
    `strings.Contains` before invoking the DFA/NFA engine. For patterns like `"error|warn"`,
    this eliminates the regex call entirely for the majority of rows that match neither
    prefix. Case-insensitive patterns (`(?i)`) are excluded from the pre-filter because
@@ -500,8 +536,8 @@ optimizations over the original `StreamScanRegex` path:
 
 3. **Flat batch string extraction** — `col.StringValues()` builds a `[]string` of length
    `SpanCount` in a single pass over `StringIdx/StringDict`. The scan loop then indexes
-   into this flat slice, eliminating the two-level dictionary dereference (`StringIdx[i]
-   → StringDict[di]`) on every iteration.
+   into this flat slice, eliminating the two-level dictionary dereference
+   (`StringIdx[i] → StringDict[di]`) on every iteration.
 
 4. **CI literal bypass (fold-contains)** — pure case-insensitive literal patterns like
    `(?i)error`, `(?i)error|warn` are detected at query-compile time via
@@ -533,7 +569,8 @@ Back-ref: `internal/modules/executor/column_provider.go:ScanRegexFast`,
 ---
 
 ## NOTE-SL-017: blockLabelSet and sync.Pool for Zero-Alloc Hot Path
-*Added: 2026-03-04*
+
+_Added: 2026-03-04_
 
 **Decision:** `StreamLogs`, `StreamLogsTopK`, and `ExecuteLogMetrics` use a `sync.Pool`
 of `*blockLabelSet` instead of building a `map[string]string` per row.
@@ -566,9 +603,11 @@ Back-ref: `internal/modules/executor/block_label_set.go:blockLabelSet`,
 ---
 
 ## NOTE-018: Two-Pass Column Decode for Non-Matching Block Elimination
-*Added: 2026-03-04*
+
+_Added: 2026-03-04_
 
 **Decision:** All executor code paths use a two-pass block parse strategy:
+
 1. **First pass** — `ParseBlockFromBytes` with `ProgramWantColumns(program)`, which decodes only the columns referenced by the query predicate (leaf columns from `Predicates.Nodes` tree, plus `Predicates.Columns` for negations/pushdown/log:body).
 2. **Predicate evaluation** — `program.ColumnPredicate` runs against the minimal block.
 3. **Early exit** — if `rowSet.Size() == 0`, skip this block entirely. No second parse.
@@ -586,11 +625,12 @@ are a small fraction of candidate blocks in typical trace/log queries.
 built from the first-pass block directly. No second parse is ever issued.
 
 **`ProgramWantColumns` must include ALL predicate column sources (updated 2026-03-06):**
+
 - Leaf `Column` values from the `Nodes` RangeNode tree (via `collectNodeColumns`)
 - `Columns []string` — negations, `log:body`, pushdown label-filter columns, and any
   column that needs row-level decode but produces no pruning node
-Omitting any source causes `ParseBlockFromBytes` to skip the column, resulting in
-false-empty predicate results (regression). See NOTE-030.
+  Omitting any source causes `ParseBlockFromBytes` to skip the column, resulting in
+  false-empty predicate results (regression). See NOTE-030.
 
 **When `wantColumns` is nil** (no predicates / match-all program), the first pass
 decodes all columns and no second pass is issued.
@@ -607,7 +647,8 @@ Back-ref: `internal/modules/executor/predicates.go:ProgramWantColumns`,
 ---
 
 ## NOTE-019: GetColumn O(1) via colCols Slice in blockLabelSet
-*Added: 2026-03-05*
+
+_Added: 2026-03-05_
 
 **Decision:** `buildBlockColMapsWithLogCache` resolves `*Column` pointers once per block into a
 parallel `colCols []*Column` slice alongside `colNames`. All four `block.GetColumn(colNames[idx])`
@@ -637,7 +678,8 @@ Back-ref: `internal/modules/executor/block_label_set.go:buildBlockColMapsWithLog
 ---
 
 ## NOTE-020: internStrings Reset Per Block to Bound Map Size
-*Added: 2026-03-05*
+
+_Added: 2026-03-05_
 
 **Decision:** `Reader.ResetInternStrings()` is called before the first-pass
 `ParseBlockFromBytes` in each log scan block loop (`logTopKScan`, `logCollectAll`,
@@ -666,7 +708,8 @@ Back-ref: `internal/modules/blockio/reader/reader.go:ResetInternStrings`,
 ---
 
 ## NOTE-021: Time Pre-Filter Before Second-Pass Decode
-*Added: 2026-03-05*
+
+_Added: 2026-03-05_
 
 **Decision:** `logTopKScan` and `logCollectAll` now apply the `opts.TimeRange` filter
 using the first-pass block BEFORE triggering the second-pass full decode.
@@ -702,7 +745,8 @@ Back-ref: `internal/modules/executor/stream_log_topk.go:logTopKScan`,
 ---
 
 ## NOTE-022: AddColumnsToBlock Replaces Second-Pass ParseBlockFromBytes
-*Added: 2026-03-05*
+
+_Added: 2026-03-05_
 
 **Decision:** The second-pass `r.ParseBlockFromBytes(bwb.RawBytes, nil, meta)` in
 `logTopKScan`, `logCollectAll`, and `StreamLogs` has been replaced with
@@ -747,7 +791,8 @@ Back-ref: `internal/modules/blockio/reader/reader.go:AddColumnsToBlock`,
 ---
 
 ## NOTE-023: opts.TimeRange Forwarded to planner.Plan in StreamLogsTopK
-*Added: 2026-03-05*
+
+_Added: 2026-03-05_
 
 **Decision:** `StreamLogsTopK` previously passed `queryplanner.TimeRange{}` to
 `planner.Plan`, disabling block-level time pruning entirely. It now passes
@@ -777,7 +822,8 @@ Back-ref: `internal/modules/executor/stream_log_topk.go:StreamLogsTopK`
 ---
 
 ## NOTE-024: Literal Alternation Detection Fixes Overly Wide Regex Interval
-*Added: 2026-03-05*
+
+_Added: 2026-03-05_
 
 **Problem:** Go's `regexp/syntax` parser factors common prefixes from alternations before
 `AnalyzeRegex` receives the parsed tree. For `"cluster-0|cluster-1"`, the parser produces
@@ -787,7 +833,7 @@ ALL cluster-X blocks — zero pruning for non-matching clusters like cluster-2, 
 
 **Fix:** `extractLiteralAlternatives(pattern string) []string` checks whether the raw
 pattern string is a pure OR of complete literal strings (splitting on `|`, verifying each
-part has no regex metacharacters: `` .*+?[]{}()^$\ ``). Called in the `len(analysis.Prefixes) == 1`
+part has no regex metacharacters: `.*+?[]{}()^$\`). Called in the `len(analysis.Prefixes) == 1`
 branch before emitting the interval. When it returns 2+ literals, those literals are used
 as point lookups (same as the existing multi-prefix path for patterns like `"error|warn|info"`
 which parse without common-prefix factoring). When it returns nil or a single literal, the
@@ -803,6 +849,7 @@ stores the actual string value. A lookup for `"cluster-0"` finds all blocks cont
 least one span with that exact attribute value.
 
 **Relationship to existing paths:**
+
 - `"prod|staging"` (no common prefix) → already uses the multi-prefix path
   (`len(analysis.Prefixes) == 2`) — unaffected by this change.
 - `"cluster-0|cluster-1"` (common prefix) → previously: wrong interval; now: point lookups.
@@ -815,7 +862,8 @@ Back-ref: `internal/modules/executor/predicates.go:BuildPredicates`,
 ---
 
 ## NOTE-025: AddColumnsToBlock Removed — Lazy Column Decode Handles All Columns
-*Added: 2026-03-05*
+
+_Added: 2026-03-05_
 
 **Decision:** Removed `r.AddColumnsToBlock(bwb, nil)` calls from `StreamLogs`,
 `StreamLogsTopK`, `logCollectAll`, and the second `ParseBlockFromBytes(raw, nil, meta)` call
@@ -830,6 +878,7 @@ This eliminates the 90+ eager zstd decompressions per block for non-predicate co
 reducing per-block decode cost from O(all columns) to O(predicate columns + accessed columns).
 
 **Estimated savings:** For T9/Q66 (1997 blocks, ~90 non-predicate columns per block):
+
 - Old: 1997 × 90 × zstd_decompress ≈ 0.87s
 - New: 1997 × 90 × presence_only + 1997 × ~15 × zstd_decompress ≈ 0.04s + 0.15s = 0.19s
 
@@ -847,7 +896,8 @@ Back-ref: `internal/modules/executor/stream_log.go:StreamLogs`,
 ---
 
 ## NOTE-026: Dictionary-Level Float Parse for Numeric String Column Scans
-*Added: 2026-03-05*
+
+_Added: 2026-03-05_
 
 **Decision:** `scanStringDictFloat` pre-parses the string dictionary of a `ColumnTypeRangeString`
 or `ColumnTypeString` column once per block, then uses boolean array lookups per row for numeric
@@ -865,11 +915,13 @@ with 2000 rows/block).
 **Optimization:** String columns use dictionary encoding (`StringDict []string` + `StringIdx []uint32`).
 The dictionary typically has O(hundreds) unique values even when `SpanCount` is in the thousands.
 `scanStringDictFloat`:
+
 1. Iterates `col.StringDict` once (O(dictSize), typically ~700 entries).
 2. Calls `strconv.ParseFloat` per dictionary entry — only those that survive are marked `matches[i] = true`.
 3. Scans rows using `col.StringIdx[i]` → `matches[di]` — O(1) bool lookup per row, zero ParseFloat calls.
 
 **Measured impact** (8-iteration benchmark, 1002-block scan):
+
 - Q87 (`env+gt4000`, 507 blocks): −22% CPU (308→240 cpuMs)
 - Q88 (`cluster+gt4000`, 482 blocks): −29% CPU (323→228 cpuMs)
 - Q86 (`env+gt4500`, 1002 blocks): −12% CPU (486→428 cpuMs)
@@ -887,7 +939,8 @@ Back-ref: `internal/modules/executor/column_provider.go:scanStringDictFloat`,
 ---
 
 ## NOTE-027: encodeValue TypeString Cross-Encoding for Numeric Range Index
-*Added: 2026-03-05*
+
+_Added: 2026-03-05_
 
 **Decision:** `encodeValue` now handles `vm.TypeString` for `ColumnTypeRangeInt64` and
 `ColumnTypeRangeFloat64`. When the string parses as the appropriate numeric type, the
@@ -910,7 +963,8 @@ Only improves pruning; never removes correct blocks.
 ---
 
 ## NOTE-029: Multi-Prefix Regex Path Must Use Full Literals, Not Go-Factored Partial Prefixes
-*Added: 2026-03-05*
+
+_Added: 2026-03-05_
 
 **Problem (T6/Q45 and T6/Q50 false-negative pruning):**
 
@@ -952,7 +1006,8 @@ into a common prefix — enters the `len == 1` branch). NOTE-029 fixes the multi
 ---
 
 ## NOTE-028: SearchMetaColumns — Scoped Second-Pass Decode for Trace Search
-*Added: 2026-03-05*
+
+_Added: 2026-03-05_
 
 **Decision:** `StreamOptions.AllColumns` controls the second-pass decode in `Stream()`.
 By default (`false`), the second pass decodes only `searchMetaColumns() ∪ wantColumns`
@@ -984,7 +1039,8 @@ payloads; identity values are fetched via `lookupIntrinsicFields`.
 ---
 
 ## NOTE-030: RangeNode Tree Replaces Flat QueryPredicates Maps
-*Added: 2026-03-06*
+
+_Added: 2026-03-06_
 
 **Decision:** `vm.QueryPredicates` was redesigned from a collection of flat maps
 (`DedicatedColumns`, `DedicatedRanges`, `UnscopedColumnNames`, `DedicatedColumnsRegex`,
@@ -1047,7 +1103,8 @@ risk removing blocks where some spans DO satisfy the predicate. Negations only g
 ---
 
 ## NOTE-031: Early-Skip Materialization in logTopKScan When Heap Is Full
-*Added: 2026-03-06*
+
+_Added: 2026-03-06_
 
 **Problem:** In `logTopKScan`, for every row that passes the pipeline filter, we previously
 called `labels.Materialize()` (creates `map[string]string`), `collectLogStringAttrs()`
@@ -1089,7 +1146,8 @@ and limit=1000). Expected ~30-40% CPU reduction for logfmt/numeric queries on la
 ---
 
 ## NOTE-032: aggBucketState Shared Between Log and Trace Metrics
-*Added: 2026-03-08*
+
+_Added: 2026-03-08_
 
 **Decision:** `aggBucketState` (defined in `metrics_log.go`) is reused by
 `metrics_trace.go` rather than duplicating the struct.
@@ -1110,7 +1168,8 @@ it is an internal accumulator, not part of the public API.
 ---
 
 ## NOTE-033: HISTOGRAM, QUANTILE, and STDDEV in ExecuteTraceMetrics
-*Added: 2026-03-08*
+
+_Added: 2026-03-08_
 
 **Decision:** Three previously unimplemented aggregate functions now work in
 `ExecuteTraceMetrics`. Each uses the existing block scan + `traceUpdateBucket` +
@@ -1142,7 +1201,7 @@ threaded through `traceRowValue`'s signature (mirroring `logRowValues`'s pattern
 Two new fields (`mean`, `m2`) are added to `aggBucketState` in `metrics_log.go`.
 They are zero-initialized for log-metric buckets (no behavioral change for any log path).
 `traceUpdateBucket` applies Welford's recurrence:
-  delta = v - mean; count++; mean += delta/count; m2 += delta*(v-mean)
+delta = v - mean; count++; mean += delta/count; m2 += delta\*(v-mean)
 `traceRowValue` emits `sqrt(m2/(count-1))` for sample stddev, or NaN when `count < 2`.
 
 **Back-ref:** `internal/modules/executor/metrics_trace.go:traceUpdateBucket`,
@@ -1154,8 +1213,9 @@ They are zero-initialized for log-metric buckets (no behavioral change for any l
 ---
 
 ## NOTE-034: ExecuteStructural — Three-Phase Structural Query Algorithm
-*Added: 2026-03-08*
-*(Phase 2 implementation superseded by NOTE-078, 2026-04-17: byID map changed from map[string]int to map[[8]byte]int to eliminate string heap allocations.)*
+
+_Added: 2026-03-08_
+_(Phase 2 implementation superseded by NOTE-078, 2026-04-17: byID map changed from map[string]int to map[[8]byte]int to eliminate string heap allocations.)_
 
 `ExecuteStructural` ports the three-phase structural query algorithm from `api.go`
 (`streamStructuralQuery`) into the modules executor package.
@@ -1185,13 +1245,15 @@ Back-ref: `internal/modules/executor/stream_structural.go`
 ---
 
 ## NOTE-035: Execute → Collect Migration and Sub-File Sharding
-*Added: 2026-03-11*
+
+_Added: 2026-03-11_
 
 **Decision:** The original `Execute` method (returning `*Result` with `[]SpanMatch`) has been
 replaced by `Collect` (returning `[]MatchedRow`). The `Stream` method has been merged into
 `Collect` — both now use the same lazy coalesced-group I/O path.
 
 **Rationale:**
+
 - `MatchedRow` carries a reference to the parsed `*Block`, allowing callers to extract
   arbitrary columns after collection (e.g., `SpanMatchFromRow`, `IterateFields`). The old
   `SpanMatch` required the executor to eagerly extract TraceID/SpanID during scan.
@@ -1212,10 +1274,12 @@ Back-ref: `internal/modules/executor/stream.go:Collect`
 ---
 
 ## NOTE-036: planBlocks Unification — Intrinsic TOC Pruning in All Query Paths
-*Added: 2026-03-14*
+
+_Added: 2026-03-14_
 
 **Decision:** All five query paths (Collect, ExecuteTraceMetrics, ExecuteLogMetrics,
 StreamLogs, CollectLogs) now use a shared `planBlocks` helper that runs:
+
 1. `BuildPredicates` — converts vm.Program predicates into planner predicates
 2. `PlanWithOptions` — range-index/fuse pruning and time range filtering
 3. `fileLevelReject` — O(1) file-level fast reject using KLL bucketMin/bucketMax boundaries
@@ -1242,18 +1306,20 @@ Back-ref: `internal/modules/executor/plan_blocks.go:planBlocks`,
 ---
 
 ## NOTE-037: LogAttrs — Flat Slice Struct Instead of map[string]string
-*Added: 2026-03-15*
+
+_Added: 2026-03-15_
 
 **Decision:** `LogEntry.LogAttrs` field changed from `map[string]string` to a new
 `LogAttrs` struct with parallel `Names []string` and `Values []string` slices.
 `collectLogStringAttrs` uses slice append instead of map insertion.
 
 **Rationale:** Per-row map allocation was a hot path. Most rows have zero or one
-log.* attribute (log.level, log.detected_level). A flat slice struct avoids the
+log.\* attribute (log.level, log.detected_level). A flat slice struct avoids the
 map header allocation (~8 bytes overhead) and internal hash-table bucket
 allocations entirely. For the common zero-attribute case, both slices remain nil.
 
 **Impact on callers:**
+
 - `logEntryFields.GetField`: linear scan over Names slice (typically 0–2 entries;
   faster than map lookup for such small N due to cache locality).
 - `logEntryFields.IterateFields`: iterate parallel slice indices.
@@ -1268,7 +1334,8 @@ Back-ref: `internal/modules/executor/stream_log.go:LogAttrs`,
 ---
 
 ## NOTE-059: cmp3 Generic Helper Reduces rowCompare Cyclomatic Complexity
-*Added: 2026-03-16*
+
+_Added: 2026-03-16_
 
 **Decision:** Introduced `cmp3[T cmp.Ordered](a, b T) (int, bool)` — a one-line wrapper
 around `cmp.Compare` — in `column_provider.go`. All repeated three-way `switch { case v < t:
@@ -1290,10 +1357,12 @@ Back-ref: `internal/modules/executor/column_provider.go:rowCompare`,
 ---
 
 ## NOTE-060: scanIntrinsicLeafRefs leaf.Values Loop Merged From Two Passes to One
-*Added: 2026-03-16*
+
+_Added: 2026-03-16_
 
 **Decision:** In `scanIntrinsicLeafRefs` (dict-format + exact-values branch), two sequential
 `for _, v := range leaf.Values` loops were merged into one. Previously:
+
 1. First loop: built `wantStr map[string]struct{}` and `wantInt map[int64]struct{}`
 2. Second loop: built `bloomKeys [][]byte`
 
@@ -1313,7 +1382,8 @@ Back-ref: `internal/modules/executor/predicates.go:scanIntrinsicLeafRefs`
 ---
 
 ## NOTE-061: logTopKEntry.ts Field Removed — Use entry.TimestampNanos Directly
-*Added: 2026-03-16*
+
+_Added: 2026-03-16_
 
 **Decision:** `logTopKEntry.ts uint64` has been removed. All heap comparisons
 (`logTopKHeap.Less`, `logTopKCanSkipBlock`, `logTopKInsert`, early-skip guard, sort closures
@@ -1331,7 +1401,8 @@ Back-ref: `internal/modules/executor/stream_log_topk.go:logTopKHeap.Less`,
 ---
 
 ## NOTE-062: iterateLogRows Extracts Shared Block-Iteration Boilerplate
-*Added: 2026-03-16*
+
+_Added: 2026-03-16_
 
 **Decision:** The ~130 lines of shared block-iteration boilerplate that was duplicated between
 `logTopKScan` and `logCollectAll` has been extracted into `iterateLogRows`. Both callers
@@ -1340,7 +1411,7 @@ are now ~15-line wrappers that pass their differing logic as callbacks:
 - `canSkipBlock func(meta shared.BlockMeta) bool` — `logTopKScan` passes heap-based block pruning;
   `logCollectAll` passes nil (never skip).
 - `fn func(ts uint64, entry LogEntry) bool` — `logTopKScan` passes the NOTE-031 early-skip guard
-  + heap insertion; `logCollectAll` passes a slice append.
+  - heap insertion; `logCollectAll` passes a slice append.
 
 **Rationale:** Both functions shared: `CoalescedGroups` + `blockToGroup`, `ReadGroup` loop,
 `ResetInternStrings` + `ParseBlockFromBytes`, `ColumnPredicate` evaluation, NOTE-021 time
@@ -1359,7 +1430,8 @@ Back-ref: `internal/modules/executor/stream_log_topk.go:iterateLogRows`,
 ---
 
 ## NOTE-038: Unified Intrinsic Pre-Filter — Partial-AND for Mixed Queries
-*Added: 2026-03-16*
+
+_Added: 2026-03-16_
 
 **Decision:** `collectFromIntrinsicRefs` is rewritten as a unified 4-case dispatcher
 replacing the separate `collectFromIntrinsicRefs` (plain) and `collectTopKFromIntrinsicRefs`
@@ -1392,12 +1464,12 @@ but correct.
 
 **4-case dispatch:**
 
-| ProgramIsIntrinsicOnly | TimestampColumn | Case | Block reads |
-|---|---|---|---|
-| true | empty | A | minimal (candidate blocks) |
-| true | set | B | zero (IntrinsicFields rows) |
-| false | empty | C | minimal (candidate blocks + ColumnPredicate) |
-| false | set | D | minimal (candidate blocks + ColumnPredicate + topK heap) |
+| ProgramIsIntrinsicOnly | TimestampColumn | Case | Block reads                                              |
+| ---------------------- | --------------- | ---- | -------------------------------------------------------- |
+| true                   | empty           | A    | minimal (candidate blocks)                               |
+| true                   | set             | B    | zero (IntrinsicFields rows)                              |
+| false                  | empty           | C    | minimal (candidate blocks + ColumnPredicate)             |
+| false                  | set             | D    | minimal (candidate blocks + ColumnPredicate + topK heap) |
 
 **Global top-K correctness for Case D:**
 The partial-AND pre-filter is a superset — it never excludes a row that satisfies all intrinsic
@@ -1426,7 +1498,8 @@ Back-ref: `internal/modules/executor/predicates.go:hasSomeIntrinsicPredicates`,
 ---
 
 ## NOTE-039: EX-INT-06 Comment Updated — Case C, Not True Fallback
-*Added: 2026-03-16*
+
+_Added: 2026-03-16_
 
 The comment in `TestIntrinsicFastPath_FallbackToBlockScan` previously said "fast path is
 not applicable" for the query `{ resource.service.name =~ "loki-.*" && span.http.method = "GET" }`.
@@ -1438,7 +1511,8 @@ set. The comment was updated to accurately describe Case C behaviour.
 ---
 
 ## NOTE-040: EX-INT-13 — True Non-Intrinsic-Only Fallback Path Test
-*Added: 2026-03-16*
+
+_Added: 2026-03-16_
 
 Added `TestCollect_NonIntrinsicOnly_FallsBackToBlockScan` (EX-INT-13) to exercise the true
 fallback path: a query with zero intrinsic leaves (e.g., `{ span.http.method = "GET" }`)
@@ -1449,7 +1523,8 @@ of the test spans have `http.method` set.
 ---
 
 ## NOTE-041: SPECS.md §4.2 MatchedRow — IntrinsicFields Field Added
-*Added: 2026-03-16*
+
+_Added: 2026-03-16_
 
 The `IntrinsicFields modules_shared.SpanFieldsProvider` field added to `MatchedRow` in the
 unified pre-filter implementation (NOTE-038) was absent from the §4.2 struct definition in
@@ -1460,7 +1535,8 @@ this change ensures the struct definition itself is also complete.
 ---
 
 ## NOTE-042: collectIntrinsicTopK Sort Path — Map Lookup Replaces O(N) Scan of Timestamp Blob
-*Added: 2026-03-16*
+
+_Added: 2026-03-16_
 
 **Decision:** In `collectIntrinsicTopK`'s sort path (M < sortScanThreshold), the O(N) scan
 of the timestamp blob via `ScanFlatColumnRefsFiltered` is replaced for small M by a
@@ -1482,6 +1558,7 @@ incorrect. The correct lookup is: build a `map[uint32]uint64` (packed-key → ti
 the decoded column's parallel `BlockRefs` and `Uint64Values` arrays, then look up each ref.
 
 **Performance characteristics:**
+
 - Map build: O(N) — same cost as the scan path but paid once per query.
 - Per-ref lookup: O(1) hash map (vs O(N/M) amortized for scan).
 - Sort: O(M log M) for M matching refs.
@@ -1500,7 +1577,8 @@ Back-ref: `internal/modules/executor/stream.go:collectIntrinsicTopK`
 ---
 
 ## NOTE-043: CollectStats ExecutionPath Telemetry and Fast-Path OnStats Wiring
-*Added: 2026-03-17*
+
+_Added: 2026-03-17_
 
 **Decision:** `CollectStats` gains four new fields to identify which of the eight
 execution paths ran for a given `Collect` call:
@@ -1537,14 +1615,15 @@ small M. Production code does not modify this variable.
 return and therefore never fires for the fast-path case.
 
 Back-ref: `internal/modules/executor/stream.go:CollectStats`,
-          `internal/modules/executor/stream.go:Collect`,
-          `internal/modules/executor/stream.go:collectFromIntrinsicRefs`,
-          `internal/modules/executor/stream.go:SortScanThreshold`
+`internal/modules/executor/stream.go:Collect`,
+`internal/modules/executor/stream.go:collectFromIntrinsicRefs`,
+`internal/modules/executor/stream.go:SortScanThreshold`
 
 ---
 
 ## NOTE-044: collectIntrinsicTopK KLL Path — Block-Level MaxStart Ordering
-*Added: 2026-03-17*
+
+_Added: 2026-03-17_
 
 **Decision:** In `collectIntrinsicTopK`'s small-M path (M < SortScanThreshold), replace the
 flat map-then-sort approach ("intrinsic-topk-sort") with a block-aware KLL path
@@ -1552,6 +1631,7 @@ flat map-then-sort approach ("intrinsic-topk-sort") with a block-aware KLL path
 `BlockMeta.MaxStart` DESC before collecting per-row timestamps.
 
 **What changed:**
+
 - M refs are grouped into `blockRefs[BlockIdx]` and unique block indices collected into
   `blockOrder []int`.
 - `blockOrder` is sorted by `r.BlockMeta(bi).MaxStart` DESC (largest MaxStart first — newest
@@ -1580,7 +1660,7 @@ for M < SortScanThreshold. The scan path "intrinsic-topk-scan" (M >= SortScanThr
 unchanged. `SPEC-STREAM-9` back-ref and SPECS.md §4.4 and §6.1 updated accordingly.
 
 Back-ref: `internal/modules/executor/stream.go:collectIntrinsicTopK`,
-          `internal/modules/executor/stream_perf_test.go:TestCollect_IntrinsicTopK_KLLPath`
+`internal/modules/executor/stream_perf_test.go:TestCollect_IntrinsicTopK_KLLPath`
 
 **Correction to NOTE-043 bullet list:** NOTE-043's `ExecutionPath` constant list
 (`intrinsic-topk-sort`) is retired by this note; the correct value is `intrinsic-topk-kll`
@@ -1590,18 +1670,21 @@ should be read as `"intrinsic-topk-kll" (Case B KLL path, M < SortScanThreshold)
 ---
 
 ## NOTE-045: File-Level Bloom Reject — Fuse8 and Compact Bloom for Equality Pruning
-*Added: 2026-03-20; updated: 2026-04-02 (CMS removed, bloom path documented)*
+
+_Added: 2026-03-20; updated: 2026-04-02 (CMS removed, bloom path documented)_
 
 `fileLevelBloomReject` in `plan_blocks.go` uses file-level bloom filters to reject a file
 entirely when a queried equality value is definitely absent from every block.
 
 **Two filter types:**
+
 - `resource.service.name` and other string columns: `FileBloom` (Fuse8 per column, FBLM section).
   `bloomRejectString` checks each value against the per-column Fuse8 filter in the `FileBloom`.
 - `trace:id`: compact per-file bloom via `r.MayContainTraceID`. `bloomRejectTraceID` checks
   each 16-byte trace ID value.
 
 **Call chain:**
+
 ```
 fileLevelBloomReject(r, nodes)
   └─ bloomRejectByEquality(r, fb, node)          // recursive over AND/OR tree
@@ -1610,11 +1693,13 @@ fileLevelBloomReject(r, nodes)
 ```
 
 **AND/OR semantics:**
+
 - AND node: reject if ANY child rejects (conservative).
 - OR node: reject only if ALL children reject (conservative).
 - Leaf: only equality predicates (Values non-empty, no Min/Max/Pattern).
 
 **Limitations:**
+
 - `FileBloom` only covers columns for which a Fuse8 filter was written (typically
   `resource.service.name` and high-cardinality string columns). Other columns pass through.
 - Both filter types have false positives (Fuse8 ~0.39% FPR, compact bloom also FPR > 0).
@@ -1627,11 +1712,12 @@ were removed when CMS was eliminated from the sketch system (2026-04-02; see que
 NOTE-018). File-level pruning is now exclusively bloom-based.
 
 Back-ref: `internal/modules/executor/plan_blocks.go:fileLevelBloomReject`,
-          `internal/modules/executor/plan_blocks.go:bloomRejectByEquality`,
-          `internal/modules/executor/plan_blocks.go:bloomRejectString`,
-          `internal/modules/executor/plan_blocks.go:bloomRejectTraceID`
+`internal/modules/executor/plan_blocks.go:bloomRejectByEquality`,
+`internal/modules/executor/plan_blocks.go:bloomRejectString`,
+`internal/modules/executor/plan_blocks.go:bloomRejectTraceID`
 
 ## NOTE-046: Zero-Block-Read Fast Path for ExecuteTraceMetrics
+
 **Date:** 2026-03-20
 
 `ExecuteTraceMetrics` previously called `r.ReadBlocks()` unconditionally — reading full block
@@ -1648,6 +1734,7 @@ any aggregate grouped by `resource.service.name` or `span:status`, `span:kind`, 
 `count by (span.http.status_code)`) — these fall through to the existing block-scan path.
 
 **Implementation:** `executeTraceMetricsIntrinsic` in `metrics_trace_intrinsic.go`.
+
 - No predicates (`{ }`) with group-by or aggregate field: builds `keyToBucket` (packKey → bucketIdx) by iterating `span:start` flat column. For count/rate with no group-by, span:start is streamed inline without allocating `keyToBucket`.
 - Intrinsic predicates: `BlockRefsFromIntrinsicTOC(r, program, 0)` filters refs before building `keyToBucket`.
 - count/rate, no group-by: streams `span:start` inline without `keyToBucket` (zero intermediate maps).
@@ -1660,8 +1747,9 @@ any aggregate grouped by `resource.service.name` or `span:status`, `span:kind`, 
 ---
 
 ## NOTE-047: Unified Field Population in collectIntrinsicPlain
+
 **Date:** 2026-03-23
-*Updated: 2026-03-29*
+_Updated: 2026-03-29_
 
 Case A (pure intrinsic + no sort) originally dispatched on `hasRangePredicate(program)` to
 choose between two sub-paths:
@@ -1688,6 +1776,7 @@ blobs for both range and equality predicates, keeping the code path uniform and 
 ---
 
 ## NOTE-048: Parallel Phase 1 Fetch in forEachBlockInGroups
+
 **Date:** 2026-03-24
 
 `forEachBlockInGroups` is split into two phases:
@@ -1716,7 +1805,8 @@ variable holds `bwb.RawBytes` alive through the `fn` call (NOTE-001 lazy decode 
 ---
 
 ## NOTE-049: scanBlocks Intern Map Pool and Clone Elimination
-*Added: 2026-03-25*
+
+_Added: 2026-03-25_
 
 **Problem:** `scanBlocks` called `r.ParseBlockFromBytes` twice per matching block (first pass
 for predicate evaluation + second pass to decode result columns). Each call allocated a fresh
@@ -1742,22 +1832,24 @@ during row emission, and they reference the intern map directly. Releasing befor
 sorting the backing slice directly is safe.
 
 **Lifetime contract for pooled intern maps:**
+
 1. Acquire: at block-iteration start in `scanBlocks`.
 2. Keep alive: through both `ParseBlockFromBytesWithIntern` calls AND all of `streamSortedRows`
    (where lazy `decodeNow()` calls may occur).
 3. Release: immediately after `streamSortedRows` returns (or on any early-exit error path).
 
 **Back-refs:** `stream.go:scanBlocks`,
-              `internal/modules/blockio/reader/column.go:AcquireInternMap`,
-              `internal/modules/blockio/reader/reader.go:ParseBlockFromBytesWithIntern`,
-              `internal/modules/blockio/reader/NOTES.md:NOTE-006`
+`internal/modules/blockio/reader/column.go:AcquireInternMap`,
+`internal/modules/blockio/reader/reader.go:ParseBlockFromBytesWithIntern`,
+`internal/modules/blockio/reader/NOTES.md:NOTE-006`
 
 ## NOTE-050: Intrinsic Columns — Stored Exclusively in Intrinsic TOC Section
-*Added: 2026-03-25*
 
-*Addendum (2026-03-25): Original entry claimed dual-storage (block columns AND intrinsic
+_Added: 2026-03-25_
+
+_Addendum (2026-03-25): Original entry claimed dual-storage (block columns AND intrinsic
 section). That was incorrect. Intrinsic columns are written ONLY to the intrinsic TOC
-section; `addPresent` calls for these columns were removed. This addendum corrects the record.*
+section; `addPresent` calls for these columns were removed. This addendum corrects the record._
 
 **Decision:** Intrinsic columns (trace:id, span:id, span:parent_id, span:name, span:kind,
 span:start, span:duration, span:status, span:status_message, resource.service.name) are
@@ -1766,11 +1858,13 @@ payloads. `ParseBlockFromBytes` returns nil columns for these names; this is han
 `nilIntrinsicScan` which produces FullScan results for AND intersection.
 
 **Rationale:**
+
 - The intrinsic section enables fast pre-filtering (bloom, min/max) and O(1) identity
   lookup via `lookupIntrinsicFields` without full block decodes.
 - Removing dual-storage eliminates redundant data in block payloads.
 
 **Consequences for executor:**
+
 - `searchMetaCols` no longer lists trace-signal intrinsic column names because those
   columns are served via the intrinsic section path (`lookupIntrinsicFields`) rather
   than through the `wantColumns` second-pass decode. Log-signal identity columns remain
@@ -1792,7 +1886,8 @@ payloads. `ParseBlockFromBytes` returns nil columns for these names; this is han
 `internal/modules/blockio/writer/writer_block.go:newBlockBuilder`
 
 ## NOTE-051: Mixed-OR Predicates — False-Negative Limitation for OR(intrinsic, non-intrinsic)
-*Added: 2026-03-25*
+
+_Added: 2026-03-25_
 
 **Decision:** The block-scan post-filter (`filterRowSetByIntrinsicNodes` /
 `rowSatisfiesIntrinsicNodesOR`) uses a conservative skip for non-intrinsic leaves in an
@@ -1808,6 +1903,7 @@ results. Fixing this correctly requires a two-pass approach that evaluates non-i
 columns before composing the OR — a more invasive architectural change that is deferred.
 
 **Consequences:**
+
 - Queries combining an intrinsic predicate with a non-intrinsic predicate under OR may drop
   rows that satisfy only the non-intrinsic branch during block-level scanning.
 - Impact is low: OR between intrinsic columns and user-attribute columns is uncommon in
@@ -1824,7 +1920,8 @@ only to `OR(intrinsic, non-intrinsic)` where at least one child IS intrinsic but
 child is non-intrinsic. That case is not changed by NOTE-076.
 
 ## NOTE-052: Dual Storage Coexistence — Block Columns and Intrinsic Section
-*Added: 2026-03-26*
+
+_Added: 2026-03-26_
 
 **Decision:** After the rollback of PR #172 (see writer NOTE-002), dual storage is in effect:
 intrinsic columns are present in BOTH block column payloads AND the intrinsic TOC section.
@@ -1857,7 +1954,8 @@ defence-in-depth should a future format version again omit intrinsic columns fro
 ---
 
 ## NOTE-053: Replace CollectStats/OnStats Callback with QueryStats Return Value
-*Added: 2026-03-30*
+
+_Added: 2026-03-30_
 
 **Decision:** Remove the `OnStats func(CollectStats)` callback from `CollectOptions` and
 the `CollectStats` struct entirely. Replace them with a `QueryStats` second return value
@@ -1871,12 +1969,14 @@ standard Go convention for enriched return types (`net/http` `Response`, `sql` `
 and makes the stats impossible to miss in call sites.
 
 **Design — QueryStats:**
+
 - `ExecutionPath string` — one of the 8 path constants (unchanged from CollectStats).
 - `TotalDuration time.Duration` — wall-clock duration for the full call.
 - `Steps []StepStats` — one entry per phase that ran. Steps are absent if the phase did
   not execute (e.g., no `"plan"` step on intrinsic fast paths).
 
 **Design — StepStats:**
+
 - `Name string` — phase name: `"plan"`, `"intrinsic"`, `"mixed-prefilter"`, `"block-scan"`.
 - `Duration time.Duration` — wall-clock for this phase.
 - `BytesRead int64` — raw bytes read from storage during this phase.
@@ -1894,15 +1994,16 @@ return. Callers that do not need stats use `_` for the second return. The `LogQu
 type (formerly in `api.go`) is removed; `QueryStats` covers both trace and log queries.
 
 Back-ref: `internal/modules/executor/query_stats.go:QueryStats`,
-          `internal/modules/executor/query_stats.go:StepStats`,
-          `internal/modules/executor/stream.go:Collect`,
-          `internal/modules/executor/stream_log_topk.go:CollectLogs`,
-          `api.go:QueryStats`, `api.go:StepStats`
+`internal/modules/executor/query_stats.go:StepStats`,
+`internal/modules/executor/stream.go:Collect`,
+`internal/modules/executor/stream_log_topk.go:CollectLogs`,
+`api.go:QueryStats`, `api.go:StepStats`
 
 ---
 
 ## NOTE-054: attrVals Scratch-Slice Reuse with clear()
-*Added: 2026-04-08*
+
+_Added: 2026-04-08_
 
 **Decision:** `attrVals []string` is allocated once per block (outer loop in
 `ExecuteTraceMetrics` and `ExecuteLogMetrics`) and passed as a scratch parameter to
@@ -1921,6 +2022,7 @@ metrics queries — from O(matched-rows) allocs to O(blocks) allocs for the scra
 For a 200-row single-block query with 1-element GroupBy, this removes 200 allocs/op.
 
 **Related changes in this PR:**
+
 - `blockOrder` / `blockRefs` in `collectIntrinsicTopKKLL` capped at `min(len(refs), 64)`
   instead of `len(refs)`. Distinct block count per query is typically far smaller than the
   total ref count; 64 is a safe upper bound for common block fan-out.
@@ -1929,14 +2031,15 @@ For a 200-row single-block query with 1-element GroupBy, this removes 200 allocs
   useful bound for span-level results).
 
 Back-ref: `internal/modules/executor/metrics_trace.go:traceAccumulateRow`,
-          `internal/modules/executor/metrics_log.go:logAccumulateRow`,
-          `internal/modules/executor/stream.go:collectIntrinsicTopKKLL`,
-          `internal/modules/executor/stream.go:Collect` (block-plain path)
+`internal/modules/executor/metrics_log.go:logAccumulateRow`,
+`internal/modules/executor/stream.go:collectIntrinsicTopKKLL`,
+`internal/modules/executor/stream.go:Collect` (block-plain path)
 
 ---
 
 ## NOTE-055: streamHistogramGroupBy — Dict Amortization for Histogram Group-By Path
-*Added: 2026-04-14*
+
+_Added: 2026-04-14_
 
 **Decision:** The `buildAggValsMap` + for-loop two-step in `accumulateIntrinsicBuckets`
 for `agg.Function == vm.FuncNameHISTOGRAM` is replaced by `streamHistogramGroupBy`,
@@ -1963,12 +2066,13 @@ bucket, matching `streamAggColumnNoGroupBy` and the block-scan path.
 `strconv.FormatInt(bucketIdx, 10) + "\x00" + groupKey + "\x00" + boundaryStr`
 
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:streamHistogramGroupBy`,
-          `internal/modules/executor/metrics_trace_intrinsic.go:accumulateIntrinsicBuckets`
+`internal/modules/executor/metrics_trace_intrinsic.go:accumulateIntrinsicBuckets`
 
 ---
 
 ## NOTE-056: buildGroupKeyMap Single-Group-By Fast Path — colVals Elimination (2026-04-14)
-*Added: 2026-04-14*
+
+_Added: 2026-04-14_
 
 **Decision:** Added a fast path in `buildGroupKeyMap` for `len(groupBy) == 1` that writes
 values directly into the output map, eliminating the `colVals` intermediate map allocation.
@@ -1993,7 +2097,8 @@ scan, matching the multi-column path's behavior of iterating `keyToBucket` for e
 ---
 
 ## NOTE-057: ExecuteTraceMetrics — Lazy CoalescedGroups I/O (M-20) (2026-04-15)
-*Added: 2026-04-15*
+
+_Added: 2026-04-15_
 
 **Decision:** Replaced the eager `r.ReadBlocks(plan.SelectedBlocks)` call in
 `ExecuteTraceMetrics` with a lazy `r.CoalescedGroups` / `r.ReadGroup` loop, mirroring
@@ -2026,7 +2131,8 @@ Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:buildGroupKeyMap
 ---
 
 ## NOTE-058: blockGroupPipeline — Unified Bounded Sliding-Window I/O
-*Added: 2026-04-15*
+
+_Added: 2026-04-15_
 
 **Decision:** Replace the five divergent block-read loops (`scanBlocks`, `forEachBlockInGroups`,
 `ExecuteTraceMetrics` sequential loop, `ExecuteLogMetrics` eager `ReadBlocks` call,
@@ -2035,6 +2141,7 @@ function. (`topKScanBlocks` was migrated to `blockGroupPipeline` in a follow-up 
 SPEC-STREAM-11 update.)
 
 **Rationale:**
+
 1. `scanBlocks` was lazy-sequential (one group at a time); `forEachBlockInGroups` was
    eager-parallel (all groups upfront); `ExecuteLogMetrics` used `ReadBlocks` (all upfront
    without group awareness). Three incompatible patterns for the same underlying operation.
@@ -2095,7 +2202,8 @@ with `ExecuteStructural`.
 ---
 
 ## NOTE-066: preFn gate in forEachBlockInGroups
-*Added: 2026-04-15*
+
+_Added: 2026-04-15_
 
 **Decision:** A nullable `preFn func(pb parsedBlock, candidates []int) bool` parameter was
 added to `forEachBlockInGroups`. When non-nil, it is called after the first-pass column
@@ -2119,7 +2227,8 @@ Back-ref: `internal/modules/executor/stream.go:forEachBlockInGroups`
 ---
 
 ## NOTE-067: metricsColumnsAreIntrinsic — Zero-I/O Fast-Path Existence Check (2026-04-16)
-*Added: 2026-04-16*
+
+_Added: 2026-04-16_
 
 **Problem:** `metricsColumnsAreIntrinsic` called `r.IntrinsicColumnMeta(col)` for each
 wanted column. For V14 files, `IntrinsicColumnMeta` triggers a lazy blob read when
@@ -2134,6 +2243,7 @@ verify the column exists, before deciding whether to use the intrinsic fast path
 needs — `Format/Type/Count` are not consulted here.
 
 **Rationale:** The cold-cache cost for a metrics query across 107 Tempo blocks was:
+
 - Before: 107 × N_columns GCS reads in `parseSectionsLazyV14` at open, plus N×107 in
   `metricsColumnsAreIntrinsic` if eager reads were removed.
 - After: 0 GCS reads at open, 0 GCS reads in the existence check. Only the actual column
@@ -2147,8 +2257,9 @@ Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:metricsColumnsAr
 
 ---
 
-## NOTE-068: count/rate no-group-by fast path — flat []int64 instead of map[string]*aggBucketState (2026-04-16)
-*Added: 2026-04-16*
+## NOTE-068: count/rate no-group-by fast path — flat []int64 instead of map[string]\*aggBucketState (2026-04-16)
+
+_Added: 2026-04-16_
 
 The original hot loop for `count/rate` with no group-by allocated a new string per span
 (`strconv.FormatInt(idx, 10) + "\x00"`) and did a `map[string]*aggBucketState` lookup on every
@@ -2156,6 +2267,7 @@ iteration. With ~1.4M spans/file × 107 files, M1 (`{} | rate()`) executed ~150M
 allocations and hash lookups per query.
 
 Pyroscope CPU profile (2026-04-16, 2-hour window) showed:
+
 - `maps.ctrlGroupMatchH2`: 23s self (14%) — Swiss-table map probing from these lookups
 - `runtime.gcBgMarkWorker` + `gcDrain`: ~46s (28%) — GC pressure from string allocations
 
@@ -2173,7 +2285,8 @@ Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:executeTraceMetr
 ---
 
 ## NOTE-069: count/rate group-by fast path — map[string][]int64 instead of per-span composite string (2026-04-16)
-*Added: 2026-04-16*
+
+_Added: 2026-04-16_
 
 The group-by count/rate loop in `accumulateIntrinsicBuckets` built a composite string key
 (`strconv.FormatInt(bucketIdx, 10) + "\x00" + groupKeyMap[pk]`) for every span in
@@ -2190,7 +2303,8 @@ After the loop, populate `buckets` from non-zero (group, step) pairs only — at
 ---
 
 ## NOTE-070: Metrics Filter ColumnPredicate Bug and Fix
-*Added: 2026-04-16*
+
+_Added: 2026-04-16_
 
 **Issue:** `CompileTraceQLMetrics` set `program.Predicates` (block-level pruning)
 but never compiled a real `ColumnPredicate` from the filter expression. The program
@@ -2238,7 +2352,8 @@ Back-ref: `internal/modules/executor/metrics_trace.go:traceAccumulateRow`,
 ---
 
 ## NOTE-072: mergeJoinFilteredRefsWithVals — Merge-Join Replaces filteredKeys Map (2026-04-16)
-*Added: 2026-04-16*
+
+_Added: 2026-04-16_
 
 **Problem:** `executeTraceMetricsIntrinsic` (and `streamCountRateNoGroupBy`) used a
 `filteredKeys map[uint32]struct{}` to record which packed keys passed the predicate filter.
@@ -2257,6 +2372,7 @@ Using it directly as one side of a packKey merge-join is incorrect and would pro
 or spurious results.
 
 **Implementation:**
+
 - `filteredRefs` is cloned via `slices.Clone` before sorting. `BlockRefsFromIntrinsicTOC`
   may return a sub-slice of a cached structure; sorting in-place would silently corrupt it.
 - `inRangeRefs` is NOT sorted in-place. A `[]refIdx` sorted index is built over the
@@ -2270,6 +2386,7 @@ and passed through to `accumulateIntrinsicBuckets` or iterated directly in
 `streamCountRateNoGroupBy`. They are O(1) per file, not O(N spans).
 
 **Call sites:**
+
 - `executeTraceMetricsIntrinsic` (`metrics_trace_intrinsic.go`): calls
   `mergeJoinFilteredRefsWithVals` after binary-search narrows `inRangeRefs`/`inRangeVals`,
   BEFORE dispatching to `streamCountRateNoGroupBy` (count/rate, no group-by) or the
@@ -2292,7 +2409,8 @@ Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:executeTraceMetr
 ---
 
 ## NOTE-073: strings.Join eliminated in traceAccumulateRow compositeKey path
-*Added: 2026-04-16*
+
+_Added: 2026-04-16_
 
 **Decision:** Extend the pool pattern from NOTE-071 (compositeKey pool from #228) by also
 eliminating the intermediate `strings.Join(attrVals, "\x00")` in `traceAccumulateRow`.
@@ -2304,11 +2422,12 @@ spans/query this was still ~150M allocations driving residual ~85% GC CPU on fil
 histogram queries.
 
 **Byte format invariant:** The byte sequence is identical to NOTE-071:
+
 - `'\x00'` separator after bucketIdx UNCONDITIONALLY (matches `FormatInt + "\x00" + ""`
   for empty groupBy)
 - `'\x00'` between attrVals only when `i > 0` (matches `strings.Join` semantics)
 - HISTOGRAM appends `'\x00' + AppendFloat` as before
-Gate-tested by EX-CK-01 through EX-CK-07.
+  Gate-tested by EX-CK-01 through EX-CK-07.
 
 **Benchmark result:** BENCH-EX-05 post-fix: ~325 allocs/op (down from pre-this-PR ~523).
 BENCH-EX-09 (HISTOGRAM variant) similar.
@@ -2318,7 +2437,8 @@ BENCH-EX-09 (HISTOGRAM variant) similar.
 ---
 
 ## NOTE-076: Q7 Bugfix — rowSatisfiesIntrinsicNodesOR Pass-Through for All-Non-Intrinsic OR
-*Added: 2026-04-17*
+
+_Added: 2026-04-17_
 
 **Bug:** `rowSatisfiesIntrinsicNodesOR` returned `false` when all OR children referenced
 non-intrinsic columns, incorrectly eliminating rows that the VM's `ColumnPredicate` had
@@ -2353,6 +2473,7 @@ in the group key map). For M8 warm (150M spans, primarily intrinsic), this is ~1
 eliminates the O(blocks × unique_groups) string allocations.
 
 **Key decisions:**
+
 1. `[8]uint32` cap (32 bytes, one cache line). Queries with >8 group-by dims fall back to
    string-keyed path — pathological in production (zero real queries use >4).
 2. dict index 0 = absent/empty sentinel in every dimension. Column dicts are prefixed with
@@ -2371,12 +2492,13 @@ eliminates the O(blocks × unique_groups) string allocations.
 
 **PR:** Layer 3 dict-ID group map
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:buildGroupIDMap`,
-          `internal/modules/executor/metrics_trace_intrinsic.go:streamCountRateGroupByID`,
-          `internal/modules/executor/metrics_trace_intrinsic.go:streamHistogramGroupByID`,
-          `internal/modules/executor/metrics_trace_intrinsic.go:streamAggGroupByID`
+`internal/modules/executor/metrics_trace_intrinsic.go:streamCountRateGroupByID`,
+`internal/modules/executor/metrics_trace_intrinsic.go:streamHistogramGroupByID`,
+`internal/modules/executor/metrics_trace_intrinsic.go:streamAggGroupByID`
 
 ## NOTE-077: Per-Type Dict-Mask Fast Path for StreamScanEqualAny
-*Added: 2026-04-17*
+
+_Added: 2026-04-17_
 
 **Decision:** Extend the `StreamScanEqualAny` dict-mask fast path to dict-encoded column
 types Int64, Uint64, Float64, and the String+int64 coercion shape. Bool is excluded (see below).
@@ -2387,6 +2509,7 @@ over the dict entries in O(D×nValues), then scans rows via `scanDictMaskRows` i
 No func-pointer dispatch in hot loops. Matches existing `scanStringDictFloat` pattern (NOTE-026).
 
 **Coercion invariants (byte-identical to rowEqual/rowCompare):**
+
 - String+float64: rowEqual veto (line 84-89) → fast path returns 0 immediately.
 - String+int64: uses `strconv.ParseInt(s, 10, 64)` identical to rowCompareString line 162-168.
 - Int64+float64: `float64(dictEntry)` promotion, identical to rowCompare line 109.
@@ -2409,15 +2532,16 @@ targets (1 ns primitive compare) beats map hash+probe (~30 ns) for nValues ≤ 3
 covers all practical query shapes. Map is kept for String+string (existing path).
 
 **Back-ref:** `internal/modules/executor/column_provider.go:dispatchDictFastPath`,
-             `internal/modules/executor/column_provider.go:scanStringDictEqualAny`,
-             `internal/modules/executor/column_provider.go:scanInt64DictEqualAny`,
-             `internal/modules/executor/column_provider.go:scanUint64DictEqualAny`,
-             `internal/modules/executor/column_provider.go:scanFloat64DictEqualAny`
+`internal/modules/executor/column_provider.go:scanStringDictEqualAny`,
+`internal/modules/executor/column_provider.go:scanInt64DictEqualAny`,
+`internal/modules/executor/column_provider.go:scanUint64DictEqualAny`,
+`internal/modules/executor/column_provider.go:scanFloat64DictEqualAny`
 
 ---
 
 ## NOTE-075: StreamScanEqualAny — Mixed-Type Coercion Guard (2026-04-17)
-*Added: 2026-04-17*
+
+_Added: 2026-04-17_
 
 **Bug:** The original `StreamScanEqualAny` dict fast path for string columns built a
 `map[string]struct{} wantSet` by iterating all values and filtering to those that type-asserted
@@ -2445,7 +2569,8 @@ path for the String+int64 shape. NOTE-075 was the conservative guard; NOTE-077 i
 **Commit:** 029d041 (coercion fix, this branch)
 
 ## NOTE-078: StreamScanNotEqual — Absent User-Attribute Column Returns 0, Not FullScan
-*Added: 2026-04-17*
+
+_Added: 2026-04-17_
 
 **Decision:** When `StreamScanNotEqual` is called for a user-attribute column that is entirely
 absent from the block (`lookupColumn` returns nil), return `0, nil` immediately (no matches).
@@ -2481,7 +2606,8 @@ not value) and are unaffected.
 ---
 
 ## NOTE-079: resolveStructuralParentIndices — `map[[8]byte]int` key to eliminate string allocs
-*Added: 2026-04-17*
+
+_Added: 2026-04-17_
 
 **Decision:** Changed `byID` from `map[string]int` to `map[[8]byte]int` in
 `resolveStructuralParentIndices`. Changed `seen map[int]struct{}` in `evalStructuralMatches`
@@ -2494,6 +2620,7 @@ a heap string. Profiler (Pyroscope, 2026-04-17) confirmed 1.80M alloc_objects (1
 total) attributable to this function.
 
 **Why `[8]byte` map key works:**
+
 - OTel spec mandates span IDs are exactly 8 bytes (trace.pb.go proto comment).
 - Blockpack writer enforces this at write time: `writer.go:1002` rejects any span with
   non-8-byte spanID. Legacy files that predate this check are guarded by `len == 8` guards
@@ -2521,18 +2648,20 @@ ORDER BY on structural queries).
 trace (unavoidable) plus runtime overhead. String-key allocs are eliminated.
 
 **Back-ref:** `internal/modules/executor/stream_structural.go:resolveStructuralParentIndices`,
-             `internal/modules/executor/stream_structural.go:evalStructuralMatches`
+`internal/modules/executor/stream_structural.go:evalStructuralMatches`
 
 ---
 
 ## NOTE-080: N-Node Structural Query Chains — Bitmask and Chain Evaluator
-*Added: 2026-04-21*
+
+_Added: 2026-04-21_
 
 **Decision:** Extended the structural query engine to support N-node chains (e.g., `A >> B >> C`).
 Changes are backward-compatible: 2-node queries route through the unchanged per-operator
 eval functions; N>2 chains route through `evalOpChain`.
 
 **Design:**
+
 - `StructuralQuery.Right` changed from `*FilterExpression` to `Expr`, allowing `*StructuralQuery`
   as the right operand, enabling right-associative parsing of N-node chains.
 - `traceqlparser.FlattenChain(q)` recursively walks the right chain and returns
@@ -2557,8 +2686,8 @@ no practical query uses 8+ levels. Negation operators in multi-node chains are a
 at runtime rather than silently returning empty results.
 
 Back-ref: `internal/modules/executor/stream_structural.go:evalOpChain`,
-          `internal/modules/executor/stream_structural.go:evalOpChainStep`,
-          `internal/traceqlparser/parser.go:FlattenChain`
+`internal/modules/executor/stream_structural.go:evalOpChainStep`,
+`internal/traceqlparser/parser.go:FlattenChain`
 
 ---
 
@@ -2573,6 +2702,7 @@ typed struct slice `[]intrinsicRowFields`. One `make([]intrinsicRowFields, N)` a
 all N rows instead of N `make(map[string]any)` allocations.
 
 **Design:**
+
 - `intrinsicRowFields` struct stores all 11 intrinsic columns with typed fields
 - `present` bitmask (uint16) tracks which fields are populated (replaces map key absence)
 - `lookupIntrinsicFieldsTyped` returns `[]intrinsicRowFields` (one allocation for N rows)
@@ -2610,6 +2740,7 @@ the generic path taken for 32-byte array keys. The primary production queries (s
 span:status, resource.service.name) are all N=1. N>1 retains the existing [8]uint32 path.
 
 **Key type reductions:**
+
 - `streamCountRateGroupByIDSingle`: `uint32` (4 bytes) vs `groupIDKey = [8]uint32` (32 bytes)
 - `streamAggGroupByIDSingle`: `aggSingleGroupIDKey{bucketIdx int64, dictIdx uint32}` (16 bytes) vs `aggGroupIDKey` (40 bytes)
 - `streamHistogramGroupByIDSingle`: `histSingleGroupIDKey{dictIdx uint32, boundary float64, bucketIdx int64}` (24 bytes) vs `histGroupIDKey` (48 bytes)
@@ -2705,6 +2836,7 @@ for every span — up to 150M times per file. It also probed a 24-byte struct ke
 `map[histSingleGroupIDKey]int64` per span.
 
 The new approach:
+
 - **Pre-scan phase:** Iterates inRangeRefs once, calling `intrinsicHistogramBoundary` at most
   `len(unique_boundaries)` times (≤30 for span:duration per block, memoized via
   `boundaryCache`). Builds `boundaryIdxForRef[i]` (int16, 1-based, 0=absent).
@@ -2725,7 +2857,7 @@ Two helpers extracted to keep cyclomatic complexity within limits:
 
 **Back-ref:** `internal/modules/executor/metrics_trace_intrinsic.go:streamByRefSliceHistogram`
 
-*Addendum (2026-04-22):* NOTE-087 reversed the consequence — `streamByRefSlice` gained `r`, `dictByPK`,
+_Addendum (2026-04-22):_ NOTE-087 reversed the consequence — `streamByRefSlice` gained `r`, `dictByPK`,
 and `maxPK` back so the histogram branch can scan the column directly without
 `buildAggValsForRef`. See NOTE-087 below.
 
@@ -2733,7 +2865,7 @@ and `maxPK` back so the histogram branch can scan the column directly without
 
 ## NOTE-087: Direct aggregate column scan in streamByRefSliceHistogram (2026-04-22)
 
-*Added: 2026-04-22*
+_Added: 2026-04-22_
 
 **Decision:** Eliminate `buildAggValsForRef` from the HISTOGRAM branch of the N=1 group-by
 path. Instead, `streamByRefSliceHistogram` scans the aggregate intrinsic column directly,
@@ -2743,8 +2875,9 @@ boundaries are known.
 
 **Rationale:**
 `buildAggValsForRef` (NOTE-086 caller) allocated:
+
 - `valByPK [maxPK+1]float64` — ~7.7 MB for a 15-block file (maxPK ≈ 983 040)
-- `hasByPK [maxPK+1]bool`   — ~1.9 MB
+- `hasByPK [maxPK+1]bool` — ~1.9 MB
 - `aggValsForRef []float64`, `aggPresent []bool` — parallel to inRangeRefs (~150 M entries)
 
 Then it read those arrays back into the pre-scan loop inside `streamByRefSliceHistogram`,
@@ -2752,6 +2885,7 @@ adding ~300 M extra array operations (write + read per in-range ref). These are 
 that the r99 baseline avoided by scanning columns directly.
 
 The new approach:
+
 - **Step 1:** Build `bucketByPK[maxPK+1]int64` from `inRangeRefs`/`inRangeVals` — one write
   per in-range ref (same cost as the old per-ref loop in `buildAggValsForRef`).
 - **Step 2:** Scan the aggregate column once. For dict format, `getBoundaryIdx` is called once
@@ -2764,6 +2898,7 @@ The new approach:
   `histSpanEntry` intermediate slice — 3 array reads + 1 increment, zero float math.
 
 **Consequence:**
+
 - `buildAggValsForRef` is no longer called for HISTOGRAM (still called for SUM/AVG/MIN/MAX/etc.).
 - `streamByRefSlice` signature gains `r *modules_reader.Reader`, `dictByPK []uint32`, `maxPK uint32`
   (passed through to the HISTOGRAM branch only; ignored by COUNT/RATE and other agg branches).
@@ -2775,7 +2910,7 @@ The new approach:
 **Back-ref:** `internal/modules/executor/metrics_trace_intrinsic.go:streamByRefSliceHistogram`,
 `streamByRefSliceHistogramScanDict`
 
-*Addendum (2026-04-21):* NOTE-088 reversed the consequence — `histSpanEntry` intermediate slice
+_Addendum (2026-04-21):_ NOTE-088 reversed the consequence — `histSpanEntry` intermediate slice
 and `streamByRefSliceHistogramScan` are deleted. The flat pre-allocated accumulator accumulates
 directly during the column scan with no second pass. See NOTE-088 below.
 
@@ -2783,7 +2918,7 @@ directly during the column scan with no second pass. See NOTE-088 below.
 
 ## NOTE-088: Flat pre-allocated accumulator in streamByRefSliceHistogram (2026-04-21)
 
-*Added: 2026-04-21*
+_Added: 2026-04-21_
 
 **Decision:** Replace the `histSpanEntry` intermediate slice in `streamByRefSliceHistogram` with
 a flat pre-allocated `groupCountsFlat []int64` accumulator sized using a fixed boundary cap
@@ -2797,6 +2932,7 @@ then wrote every entry into the 3D accumulator, totalling ~3 GB of memory traffi
 
 By pre-allocating `groupCountsFlat` with a fixed boundary cap (`histFlatStride = 64`) before
 the column scan, we can accumulate inline during the scan:
+
 - No intermediate `histSpanEntry` slice — eliminates 1.5 GB allocation at 150 M spans.
 - No second accumulation pass — eliminates the second 1.5 GB read.
 - Flat layout `[gIdx * 64 * numSteps + bIdx * numSteps + timeIdx]` is cache-friendly and
@@ -2805,6 +2941,7 @@ the column scan, we can accumulate inline during the scan:
   (max ~46 distinct values) with headroom.
 
 **Consequence:**
+
 - `histSpanEntry` struct deleted — no longer needed.
 - `streamByRefSliceHistogramScan` (appended to entries) deleted and replaced by
   `streamByRefSliceHistogramScanDict` (accumulates directly into flat array).
@@ -2821,7 +2958,7 @@ the column scan, we can accumulate inline during the scan:
 
 ## NOTE-089: Direct path extended to HISTOGRAM and general agg functions (2026-04-21)
 
-*Added: 2026-04-21*
+_Added: 2026-04-21_
 
 **Decision:** Remove the `&& isCountRate` gate at `executeTraceMetricsIntrinsic` and extend
 `accumulateIntrinsicBucketsDirect` to dispatch to two new functions: `accumulateHistogramDirect`
@@ -2846,6 +2983,7 @@ matching `streamByRefSliceAgg`'s NaN-emit behavior. Column scan extracted to
 `accumulateAggDirectScanCol` to bound cyclomatic complexity.
 
 **Consequence:**
+
 - `&& isCountRate` gate removed; `accumulateIntrinsicBucketsDirect` now handles all N=1
   no-predicate queries with dict-format group-by.
 - `streamByRefSliceAgg` and `buildAggValsForRef` remain as fallback for N>1 or flat group-by.
@@ -2855,7 +2993,7 @@ matching `streamByRefSliceAgg`'s NaN-emit behavior. Column scan extracted to
 `accumulateHistogramDirect`, `accumulateAggDirect`, `accumulateAggDirectScanCol`,
 `accumulateHistogramDirectN0`
 
-*Addendum (2026-04-22):* Extended NOTE-089 to include the N=0 (no group-by) histogram direct path.
+_Addendum (2026-04-22):_ Extended NOTE-089 to include the N=0 (no group-by) histogram direct path.
 `accumulateHistogramDirectN0` eliminates `inRangeRefs` materialization and the `keyToBucket` hash
 map for `{} | histogram_over_time(duration)` style queries. Dispatched from
 `executeTraceMetricsIntrinsic` before the N=1 case when `len(agg.GroupBy) == 0` and
@@ -2889,6 +3027,7 @@ and `groupKeyMap` hash maps caused 54% of metrics query CPU to be spent in `maps
 predict access patterns.
 
 **Rule 4 — Allocate proportional to the problem, not the maximum.**
+
 - Group arrays: size to `numGroups` (number of distinct group-by values), not `maxPK`.
 - `dictByPK`: only allocate when `numGroups > 1`. For N=0 (no group-by), gIdx is always 0 —
   allocating and reading a zero-filled `dictByPK` wastes up to 256 KB per block and adds a
@@ -2931,12 +3070,12 @@ the same logic inside `ExecuteStructural`.
 **False negative risk:** Bloom filters have ~0.4% FPR. Accepted: same semantics as tempodb's
 existing bloom-based file selection.
 
-**Edge case:** When all programs are nil (e.g. `{} >> {}`), `firstNonNilProgram` returns nil
-and the inline fileLevelReject/fileLevelBloomReject check is skipped; the code falls through
-directly to `planner.Plan(nil, tr)`. Behavior is unchanged from before.
+**Edge case:** When all programs are nil (e.g. `{} >> {}`), every iteration of the
+`for i, prog := range programs` loop skips the nil program check and no
+fileLevelReject/fileLevelBloomReject is issued; the code falls through directly to
+`planner.Plan(nil, tr)`. Behavior is unchanged from before.
 
-Back-ref: `internal/modules/executor/stream_structural.go:collectAllStructuralSpans`,
-`internal/modules/executor/stream_structural.go:firstNonNilProgram`
+Back-ref: `internal/modules/executor/stream_structural.go:collectAllStructuralSpans`
 
 ---
 
@@ -2947,6 +3086,7 @@ before grouping and aggregating. For `{} | count() > 5` on a large file with 500
 this caused 60s timeouts due to massive allocation and GC pressure.
 
 **Decision:** For `count`/`count_over_time` aggregates with a threshold, use a two-pass approach:
+
 - Pass 1: stream spans, accumulate per-trace integer counters only (no span content).
 - Filter qualifying trace IDs by threshold.
 - Pass 2: stream spans again, emit only spans from qualifying traces.
@@ -2964,3 +3104,256 @@ is called immediately and pass 2 is skipped entirely.
 exhausted, streaming stops early via the callback returning false.
 
 Back-ref: `query_traceql.go:streamPipelineQuery`, `query_traceql.go:streamPipelineQueryCount`
+
+## NOTE-093: Thread blockIdx/rowIdx through structuralSpanRec to enable Fields population
+
+_Added: 2026-04-28_
+
+**Decision:** Added `blockIdx int` and `rowIdx int` to `structuralSpanRec`. The rec-building
+loop (`collectBlockStructuralSpanRecs`) populates them from the `blockIdx` function parameter
+and the `rowIdx` loop variable. `evalStructuralMatches` copies them into the emitted
+`SpanMatch.BlockIdx` / `SpanMatch.RowIdx`. The conversion layer in `api.go` uses these to
+call `modules_blockio.NewSpanFieldsAdapterWithReader(nil, r, m.BlockIdx, m.RowIdx)` — passing
+`nil` for the block because structural queries do not retain decoded `*reader.Block` objects
+after phase 1.
+
+**Why nil block:** Structural phase 1 eagerly fetches all blocks via `FetchBlocks` (NOTE-034,
+SPEC-STREAM-11 exemption). Decoded blocks are local variables inside the phase-1 block loop
+and are discarded after `collectBlockStructuralSpanRecs` returns. Retaining a `*reader.Block`
+pointer in every `structuralSpanRec` for N spans would keep all decoded block column data live
+through phases 2 and 3 — a significant memory cost for no benefit. The `SpanFieldsAdapter`
+with a nil block falls through to the intrinsic section path via `loadIntrinsicCache`, which
+uses `reader.GetIntrinsicColumn` to resolve field values. The nil-block guard added to
+`span_fields.go` enables this.
+
+**Memory cost:** 16 bytes per `structuralSpanRec` (two `int` fields). For 100K spans: ~1.6 MB
+additional heap during phase 1. Acceptable.
+
+**Back-ref:** `internal/modules/executor/stream_structural.go:structuralSpanRec`,
+`internal/modules/executor/stream_structural.go:collectBlockStructuralSpanRecs`,
+`internal/modules/executor/stream_structural.go:evalStructuralMatches`,
+`api.go` (structural branch),
+`internal/modules/blockio/span_fields.go:GetField`,
+`internal/modules/blockio/span_fields.go:IterateFields`
+
+---
+
+## NOTE-094: populateTypedColumn — Typed Accessors (LookupRefFast) + [8]byte spanID/parentID (2026-04-28)
+
+_Added: 2026-04-28_
+
+**Decision:** Two optimizations applied together:
+
+**(1) `populateTypedColumn` rewritten to use `LookupRefFast` + `storeTypedField`** — the hot loop
+now calls `col.LookupRefFast(packed)` (returning `any`) and dispatches type-specifically in
+`storeTypedField`. The typed accessor methods (`LookupRefFastUint64` etc., NOTE-015) were removed
+from `intrinsic_ref_index.go`; `LookupRefFast` returns the concrete type directly via a format switch,
+eliminating the interface boxing that produced 171M/120s alloc_objects (59.6% of total, Pyroscope 2026-04-28).
+Updated `tsCol.LookupRef(packed) + val.(uint64)` callers in `stream.go` to use `LookupRefFast` + type assert.
+
+**(2) [8]byte fixed arrays for spanID/parentID** — changed `intrinsicRowFields.spanID`,
+`.parentID` and `structuralSpanRec.spanID`, `.parentID` from `[]byte` to `[8]byte`.
+`storeTypedField` previously called `append([]byte(nil), b...)` for each matched span for
+spanID and parentID — one heap allocation each. For structural queries with 1000 spans
+per block × identity columns × many blocks, this accounted for ~26M allocs.
+
+**[8]byte rationale:** `[8]byte` is a value type stored directly in the `[]intrinsicRowFields`
+slice — no separate heap allocation. `copy8()` helper writes 8 bytes into the already-allocated
+slice element; no clone needed.
+
+**Why [8]byte is safe:** `BytesValues` entries are independent copies (guaranteed by
+blockio/shared NOTE-012 — `DecodeFlatPage` uses make+copy before appending; and by NOTE-013 —
+`decodeXORBytesPage` similarly uses make+copy). The source slice does not alias pool memory.
+
+**Zero-value sentinel:** `[8]byte{}` (all zeros) replaces `nil` as the absent-ID sentinel.
+The `present` bitmask in `intrinsicRowFields` remains the canonical absent-indicator.
+For `structuralSpanRec`, `structuralSpanIDPresent` / `structuralParentIDPresent` bits are used.
+
+**present-bit guard in evalStructuralMatches:** Added a guard `if spans[ri].present&structuralSpanIDPresent == 0 { continue }`
+to avoid emitting zero-byte SpanIDs for absent spans.
+
+**API boundary:** `evalStructuralMatches` converts `spans[ri].spanID [8]byte` back to `[]byte`
+via `append([]byte(nil), spans[ri].spanID[:]...)` when building `SpanMatch.SpanID`. This
+allocation is per-match (O(matched spans)), not per-scanned span.
+
+**Betteralign:** After the type change, `[8]byte` (8 bytes) is smaller than the former `[]byte`
+(24-byte slice header). Struct field ordering was updated accordingly.
+
+Back-ref: `internal/modules/executor/intrinsic_row.go:populateTypedColumn`
+Back-ref: `internal/modules/executor/intrinsic_row.go:storeTypedField`
+Back-ref: `internal/modules/executor/intrinsic_row.go:intrinsicRowFields`
+Back-ref: `internal/modules/executor/stream_structural.go:structuralSpanRec`
+Back-ref: `internal/modules/executor/stream.go:collectIntrinsicTopKKLL`
+Back-ref: `internal/modules/executor/stream.go:collectIntrinsicTopKScan`
+Back-ref: `internal/modules/executor/predicates.go:intrinsicLeafGetBytesTyped`
+
+---
+
+## NOTE-095: All-Program File-Level Rejection for Structural Queries (2026-04-28)
+
+_Added: 2026-04-28_
+
+**Decision:** Extend `collectAllStructuralSpans` to apply `fileLevelReject` and
+`fileLevelBloomReject` for ALL chain programs, not just the first non-nil (LHS) program.
+If any program for which rejection is safe rejects the file, return nil immediately.
+
+**Safety:** File-level rejection is safe when the program corresponds to the RHS of any
+operator, or when it is the LHS of a non-negation operator. For the LHS program of a
+negation operator (!>>, !>, !~), file-level rejection on the LHS is NOT safe: if the LHS
+filter matches nothing in the file, all RHS spans trivially qualify for the negation
+(e.g. `{ ghost } !>> { svc }` → every svc span has no ghost ancestor → all svc spans match).
+Rejecting the file based on LHS absence would incorrectly return no results.
+
+**Helper:** `shouldRejectFileForProgram(ops, progIdx)` encodes this rule. `isNegationOp`
+identifies negation operators. Both are tagged NOTE-095 in code.
+
+**Performance:** Eliminates entire files where the RHS predicate (e.g. `db.system = "redis"`)
+guarantees no match — useful for OR structural queries where the RHS has high selectivity.
+
+Back-ref: `internal/modules/executor/stream_structural.go:collectAllStructuralSpans`
+Back-ref: `internal/modules/executor/stream_structural.go:shouldRejectFileForProgram`
+Back-ref: `internal/modules/executor/stream_structural.go:isNegationOp`
+
+---
+
+## NOTE-096: Trace Pre-Qualification Before Phase 3 (2026-04-28)
+
+_Added: 2026-04-28_
+
+**Decision:** In `evalStructuralMatches`, before calling `applyStructuralOps` for each trace,
+check that the trace has at least one span matching each required nodeMatch bit. If any
+required bit is absent, skip the trace entirely — no structural match is possible.
+
+**Implementation:** `traceCanMatch(spans, ops)` builds a `present` bitmask by OR-ing all
+span nodeMatch values. For non-negation operators, all node bits [0..N-1] must be present.
+For single-negation-op queries (!>>, !>, !~), only bit 1 (RHS) must be present — absent LHS
+means all RHS spans qualify (the negation holds vacuously), so requiring LHS bit present
+would incorrectly prune valid results.
+
+**Cost:** O(spans_per_trace) — one pass over the already-collected span slice. This replaces
+O(right_matches × depth) ancestor-chain walk cost for traces that cannot match.
+
+**Performance:** For OR structural queries where the LHS filter is selective (few traces have
+any LHS-matching span), this eliminates the majority of Phase 3 work.
+
+Back-ref: `internal/modules/executor/stream_structural.go:evalStructuralMatches`
+Back-ref: `internal/modules/executor/stream_structural.go:traceCanMatch`
+
+---
+
+## NOTE-097: Intrinsic TOC File-Level Rejection for Structural Queries (2026-04-28)
+
+_Added: 2026-04-28_
+
+**Decision:** Extend the existing bloom/range rejection loop in `collectAllStructuralSpans`
+to also call `BlocksFromIntrinsicTOC(r, prog)` for each eligible program. If the result
+is a non-nil empty slice (zero blocks survive), return `nil, nil` to skip the file.
+
+**Key semantics of `BlocksFromIntrinsicTOC` return values:**
+
+- `nil` → no intrinsic section, no intrinsic predicates, or all blocks survive: no file rejection.
+- `[]int{}` (non-nil empty) → zero blocks survive → entire file rejected.
+- `[]int{i, j, ...}` (non-empty) → block-level subset: NOT used for structural queries (NOTE-091).
+
+**Safety — negation operators:** `shouldRejectFileForProgram(ops, i)` already gates the call.
+For the LHS of a negation op (!>>, !>, !~), absent LHS means all RHS spans qualify vacuously —
+we must not skip the file based on LHS absence. The gate function returns false for this case,
+preventing false file rejection. No new safety logic is needed.
+
+**Safety — OR predicates:** `BlocksFromIntrinsicTOC` calls `collectIntrinsicLeaves` which
+handles same-column OR nodes via `mergeORIntrinsicLeaves`. If both branches reference the same
+intrinsic column with equality predicates, they are merged into a single leaf with unioned values.
+Mixed-column OR nodes are conservatively skipped (function returns nil). No false negatives.
+
+**Placement:** TOC check runs after bloom/range checks (cheaper checks first; TOC I/O is skipped
+for already-rejected files) and before `planner.Plan(nil, tr)` (block selection skipped for
+TOC-rejected files, saving the call entirely).
+
+**Performance:** Primary benefit is for range predicates on intrinsic columns (span:duration,
+span:start) where bloom filters (Fix 1) provide no pruning. Secondary benefit for equality
+predicates: TOC provides definitive block-by-block presence data vs. bloom FPR (~0.4%).
+Benchmark (BENCH-EX-18): TOC-rejected files execute ~36x faster than non-rejected files.
+
+Back-ref: `internal/modules/executor/stream_structural.go:collectAllStructuralSpans`
+
+---
+
+## NOTE-098: wantCols Threading into SpanFieldsAdapter for Selective Intrinsic Decode
+
+_Added: 2026-04-30_
+
+**Decision:** `NewSpanFieldsAdapterWithReader` now accepts `wantCols map[string]struct{}` and
+`isDualStorage bool` parameters. Call sites in `query_traceql.go`, `api.go`, and `reader.go`
+pass appropriate values.
+
+**Rationale:** Before this change, `loadIntrinsicCache` unconditionally decoded all intrinsic
+columns for every matched span on the backward-compat path (old files lacking dual storage).
+`IterateFields` ran an O(N_intrinsics) detection loop per call. Both costs are eliminated or
+bounded by this change.
+
+**Call-site decisions:**
+
+- `query_traceql.go:streamFilterProgram` — passes `isDualStorage=computeIsDualStorage(row.Block, r)`
+  and `wantCols=ComputeSecondPassCols(program, opts.SelectColumns)`, computed once before the row loop.
+- `query_logql.go:streamLogProgram` — passes `isDualStorage=computeIsDualStorage(row.Block, r)`
+  and `wantCols=ComputeSecondPassCols(program, nil)`. `LogQueryOptions` has no SelectColumns.
+- `api.go:QueryTraceQL` (structural path) — passes `isDualStorage=false,
+wantCols=ComputeSecondPassCols(nil, opts.SelectColumns)`. Nil program is correct at result time.
+  Block is nil for structural matches (NOTE-093); false is the correct safe default for isDualStorage.
+  When SelectColumns is empty, result is nil (load-all). When non-empty, restricts to selected
+  columns ∪ searchMetaCols ∪ traceIntrinsicColumns.
+- `reader.go:GetTraceByID` — passes `isDualStorage=computeIsDualStorage(bwb.Block, r), wantCols=nil`.
+  GetTraceByID requires all fields; nil wantCols is correct.
+
+**SPEC-ROOT-017** codifies this as a codebase-wide invariant.
+
+Back-ref: `internal/modules/blockio/span_fields.go:NewSpanFieldsAdapterWithReader`,
+`internal/modules/blockio/span_fields.go:loadIntrinsicCache`,
+`internal/modules/blockio/span_fields.go:IterateFields`,
+`internal/modules/executor/predicates.go:ComputeSecondPassCols`,
+`query_traceql.go:streamFilterProgram`,
+`query_logql.go:streamLogProgram`,
+`api.go:QueryTraceQL`,
+`reader.go:GetTraceByID`
+
+---
+
+## NOTE-099: Sorted-Slice BlockRef Union/Intersect — No Map Allocations
+
+_Added: 2026-05-02_
+
+**Problem:** Pyroscope CPU profiles on the dev-03 querier showed `unionBlockRefs` and
+`intersectBlockRefSets` (called from `collectFromIntrinsicRefs` via `evalNodeBlockRefs` and
+`evalNodeBlockRefsPartialAND`) consuming 20%+ of total CPU:
+
+- `maps.ctrlGroupMatchH2`: 11.85% self
+- `maps.ctrlGroup.matchH2`: 8.3% self
+- `mapassign_fast32`: 2.33% self
+
+All traced to `map[refKey]struct{}` allocations inside these two functions. The hot pattern
+is same-column OR queries: `(service.name="grafana" || service.name="faro")` where
+ref sets for OR branches are always **disjoint** (a span has exactly one value per column).
+
+**Solution:** Replace map-based union/intersect with sorted-slice merge operations:
+
+1. **Pack refs**: `uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx)` — fits in one word, gives
+   BlockIdx-major ordering.
+2. **Sort on entry**: each ref slice is sorted in-place (via `sortRefs`) before merge if not
+   already sorted (checked via O(N) `isSortedRefs` scan). Refs from `scanIntrinsicLeafRefs`
+   are not guaranteed to be sorted by packed value (flat columns are sorted by column value;
+   dict column refs are appended in block-processing order).
+3. **Union**: `unionSortedRefs` — O(M+N) two-pointer merge with dedup. Handles both
+   disjoint (same-column OR) and overlapping (cross-column OR) cases correctly.
+4. **Intersect**: `intersectSortedRefSets` — sorts sets by length, then pairwise two-pointer
+   intersection walk. O(total refs) with no allocations beyond the result slice.
+
+**Implementation:** `internal/modules/executor/sorted_refs.go` — all merge primitives.
+`predicates.go:unionBlockRefs` and `predicates.go:intersectBlockRefSets` now delegate to
+the sorted-slice implementations after sorting their inputs.
+
+**Invariant:** all slices passed to `unionSortedRefs` / `intersectSortedRefSets` must be
+sorted in ascending packed-ref order. The wrapper functions in `predicates.go` ensure this.
+
+Back-ref: `internal/modules/executor/sorted_refs.go`,
+`internal/modules/executor/predicates.go:unionBlockRefs`,
+`internal/modules/executor/predicates.go:intersectBlockRefSets`

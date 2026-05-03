@@ -324,3 +324,26 @@ overlap path. This applies to all range column types: RangeInt64, RangeUint64,
 RangeFloat64, RangeString.
 
 Back-ref: `internal/modules/blockio/writer/range_index.go:tryApplyExactValues`
+
+---
+
+## NOTE-39: encodeXORBytesIntrinsic — XOR Encoding for Large Bytes Intrinsic Columns
+*Added: 2026-04-22*
+
+**Decision:** `encodeColumn` now dispatches to `encodeXORBytesIntrinsic` when
+`len(c.bytesValues) > 0` (i.e., the column is a bytes type with > IntrinsicPageSize rows).
+
+**Rationale:** See shared/NOTES.md NOTE-013. The paged flat path produced 2× inflation for
+random-byte IDs. `encodeXORBytesIntrinsic` collapses all 226 snappy calls into one.
+
+**`xorBytesLen` reuse:** The `xorBytesLen` helper (encoding_xor.go:73) is called directly.
+It is already in the `writer` package. No duplication. `xorBytesLen` (not `xorBytes`) is
+required because it always produces exactly `len(a)` bytes, making `xor_data_len`
+self-describing at decode time. Using `xorBytes` instead would produce `max(len(a),len(b))`
+bytes, breaking the decoder's assumption that `xor_data_len == original value length`.
+
+**Non-paged bytes path unchanged:** Small bytes columns (≤ IntrinsicPageSize rows) continue
+to use `encodeFlatColumn`. The compression ratio problem only manifests at scale (> 1 page).
+
+Back-ref: `internal/modules/blockio/writer/intrinsic_accum.go:encodeXORBytesIntrinsic`,
+          `internal/modules/blockio/writer/intrinsic_accum.go:encodeColumn`

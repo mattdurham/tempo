@@ -16,3 +16,9 @@ used by both reader and writer. Key areas for benchmarking:
 
 When benchmarks are written, add BENCH-SHARED-* entries here following the format
 established in `internal/modules/blockio/BENCHMARKS.md`.
+
+---
+
+~~BENCH-SHARED-001: BenchmarkLookupRefFastUint64_ZeroAlloc~~ *(removed 2026-04-28)*
+The `LookupRefFastUint64` method and its benchmark were removed when the typed accessors were consolidated
+into a single `LookupRefFast(packedRef uint32) (any, bool)` (see NOTE-015 addendum in NOTES.md).

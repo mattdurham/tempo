@@ -241,7 +241,10 @@ func (a *intrinsicAccumulator) columnNames() []string {
 func (a *intrinsicAccumulator) encodeColumn(name string) ([]byte, error) {
 	if c, ok := a.flatCols[name]; ok {
 		if len(c.refs) > shared.IntrinsicPageSize {
-			return encodePagedFlatColumn(c)
+			if len(c.bytesValues) > 0 {
+				return encodeXORBytesIntrinsic(c)
+			}
+			return encodeDeltaUint64Intrinsic(c)
 		}
 		return encodeFlatColumn(c)
 	}
@@ -493,7 +496,7 @@ func (a *intrinsicAccumulator) computeMinMax(name string) (minVal, maxVal string
 //	per entry:
 //	  name_len[2 LE] + name
 //	  col_type[1]
-//	  format[1]      = IntrinsicFormatFlat or IntrinsicFormatDict
+//	  format[1]      = IntrinsicFormatFlat, IntrinsicFormatDict, IntrinsicFormatXORBytes, or IntrinsicFormatDeltaUint64
 //	  offset[8 LE]
 //	  length[4 LE]
 //	  count[4 LE]
@@ -674,6 +677,150 @@ func encodePagedFlatColumn(c *flatAccum) ([]byte, error) {
 	}
 
 	return assemblePagedBlob(tocBlob, pageBlobs), nil
+}
+
+// encodeXORBytesIntrinsic encodes a flat bytes accumulator using XOR-against-previous
+// encoding with a single snappy pass over the entire payload.
+//
+// NOTE-013: replaces encodePagedFlatColumn for bytes columns to eliminate N×IntrinsicPageSize
+// independent snappy calls, which inflate random-byte IDs to 2× uncompressed size.
+//
+// Wire format (inside the paged blob):
+//
+//	sentinel[1] = IntrinsicPagedVersion (0x02)
+//	toc_len[4 LE]
+//	toc_blob[toc_len]  — snappy(PagedIntrinsicTOC{Format=IntrinsicFormatXORBytes, Pages=[1 entry]})
+//	xor_snappy_blob[pages[0].Length]  — snappy(xor_payload + refs)
+//
+// XOR payload (inside xor_snappy_blob):
+//
+//	for each sorted row i:
+//	  xor_data_len[4 LE] + xor_data
+//	refs[N × refSize]  — after all values
+func encodeXORBytesIntrinsic(c *flatAccum) ([]byte, error) {
+	if len(c.bytesValues) == 0 {
+		// Guard against direct callers; production dispatch in encodeColumn always
+		// checks len(c.bytesValues) > 0 before calling this function.
+		return encodeFlatColumn(c)
+	}
+	sortFlatAccum(c)
+	n := len(c.refs)
+	blockW, rowW := refWidths(c.refs)
+
+	// Build XOR payload: values section + refs section in one buffer.
+	// We XOR each value against the previous using the length of the current value,
+	// so xor_data_len == len(original_value) and roundtrip is unambiguous.
+	var xorBuf bytes.Buffer
+	var tmp4 [4]byte
+	var prev []byte
+	for _, v := range c.bytesValues {
+		xored := xorBytesLen(v, prev)
+		binary.LittleEndian.PutUint32(tmp4[:], uint32(len(xored))) //nolint:gosec
+		xorBuf.Write(tmp4[:])
+		xorBuf.Write(xored)
+		prev = v // v is already a copy (feedBytes makes a copy at feed time)
+	}
+	for _, ref := range c.refs {
+		writeRef(&xorBuf, ref, blockW, rowW)
+	}
+
+	// Single snappy pass over the complete payload.
+	snappyBlob := snappy.Encode(nil, xorBuf.Bytes())
+
+	// TOC has one logical page covering all rows (min/max from sorted order).
+	minVal := string(c.bytesValues[0])
+	maxVal := string(c.bytesValues[n-1])
+	pages := []shared.PageMeta{{
+		Offset:   0,
+		Length:   uint32(len(snappyBlob)), //nolint:gosec
+		RowCount: uint32(n),               //nolint:gosec
+		Min:      minVal,
+		Max:      maxVal,
+	}}
+
+	toc := shared.PagedIntrinsicTOC{
+		Pages:         pages,
+		BlockIdxWidth: blockW,
+		RowIdxWidth:   rowW,
+		Format:        shared.IntrinsicFormatXORBytes,
+		ColType:       c.colType,
+	}
+	tocBlob, err := shared.EncodePageTOC(toc)
+	if err != nil {
+		return nil, err
+	}
+
+	return assemblePagedBlob(tocBlob, [][]byte{snappyBlob}), nil
+}
+
+// encodeDeltaUint64Intrinsic encodes a flat uint64 accumulator using delta + uvarint encoding
+// with a single snappy pass over the entire payload.
+//
+// NOTE-014: replaces encodePagedFlatColumn for large uint64 columns to eliminate per-page
+// delta resets. Sorting ascending before encoding ensures all deltas are non-negative,
+// making unsigned uvarint (not zigzag) the optimal choice.
+//
+// Wire format:
+//
+//	sentinel[1] = IntrinsicPagedVersion (0x02)
+//	toc_len[4 LE]
+//	toc_blob[toc_len]  — snappy(PagedIntrinsicTOC{Format=IntrinsicFormatDeltaUint64, Pages=[1 entry]})
+//	delta_snappy_blob[pages[0].Length]  — snappy(uvarint_delta_payload + refs)
+//
+// Delta payload (inside delta_snappy_blob):
+//
+//	for each sorted row i:
+//	  uvarint(value[i] - value[i-1])  // value[-1] = 0
+//	refs[N × refSize]  — after all values
+func encodeDeltaUint64Intrinsic(c *flatAccum) ([]byte, error) {
+	if len(c.uint64Values) == 0 {
+		return encodeFlatColumn(c)
+	}
+	sortFlatAccum(c)
+	n := len(c.refs)
+	blockW, rowW := refWidths(c.refs)
+
+	var deltaBuf bytes.Buffer
+	var varintTmp [10]byte
+	var prev uint64
+	for _, v := range c.uint64Values {
+		nb := binary.PutUvarint(varintTmp[:], v-prev)
+		deltaBuf.Write(varintTmp[:nb])
+		prev = v
+	}
+	for _, ref := range c.refs {
+		writeRef(&deltaBuf, ref, blockW, rowW)
+	}
+
+	snappyBlob := snappy.Encode(nil, deltaBuf.Bytes())
+
+	// Store min/max as 8-byte LE binary, matching encodeFlatPageBlob pattern.
+	var tmp8 [8]byte
+	binary.LittleEndian.PutUint64(tmp8[:], c.uint64Values[0])
+	minVal := string(tmp8[:])
+	binary.LittleEndian.PutUint64(tmp8[:], c.uint64Values[n-1])
+	maxVal := string(tmp8[:])
+	pages := []shared.PageMeta{{
+		Offset:   0,
+		Length:   uint32(len(snappyBlob)), //nolint:gosec
+		RowCount: uint32(n),               //nolint:gosec
+		Min:      minVal,
+		Max:      maxVal,
+	}}
+
+	toc := shared.PagedIntrinsicTOC{
+		Pages:         pages,
+		BlockIdxWidth: blockW,
+		RowIdxWidth:   rowW,
+		Format:        shared.IntrinsicFormatDeltaUint64,
+		ColType:       c.colType,
+	}
+	tocBlob, err := shared.EncodePageTOC(toc)
+	if err != nil {
+		return nil, err
+	}
+
+	return assemblePagedBlob(tocBlob, [][]byte{snappyBlob}), nil
 }
 
 // encodeDictPageBlob encodes a range of dict entries into a snappy-compressed page blob
