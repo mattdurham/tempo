@@ -33,7 +33,7 @@ type compactBlockEntry struct {
 //
 // Returns an error if data is too short, has a bad magic number, or has an unsupported version.
 // Also returns an error if the trace index portion is less than 5 bytes.
-func splitV14CompactSection(data []byte) (header []byte, traceIndex []byte, err error) {
+func splitV14CompactSection(data []byte) (header, traceIndex []byte, err error) {
 	if len(data) < 9 {
 		return nil, nil, fmt.Errorf("v14 compact section: too short (%d bytes)", len(data))
 	}

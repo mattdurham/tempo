@@ -32,9 +32,9 @@ type ColumnDataProvider interface {
 	ScanGreaterThanOrEqual(column string, value any) (RowSet, error)
 	ScanIsNull(column string) (RowSet, error)
 	ScanIsNotNull(column string) (RowSet, error)
-	ScanRegex(column string, pattern string) (RowSet, error)
-	ScanRegexNotMatch(column string, pattern string) (RowSet, error)
-	ScanContains(column string, substring string) (RowSet, error)
+	ScanRegex(column, pattern string) (RowSet, error)
+	ScanRegexNotMatch(column, pattern string) (RowSet, error)
+	ScanContains(column, substring string) (RowSet, error)
 	// ScanRegexFast accepts a pre-compiled regexp and optional literal prefixes.
 	// Two calling conventions:
 	//   - re != nil: standard path. prefixes (if non-nil) are used as a fast-path
@@ -56,9 +56,9 @@ type ColumnDataProvider interface {
 	StreamScanGreaterThanOrEqual(column string, value any, callback RowCallback) (int, error)
 	StreamScanIsNull(column string, callback RowCallback) (int, error)
 	StreamScanIsNotNull(column string, callback RowCallback) (int, error)
-	StreamScanRegex(column string, pattern string, callback RowCallback) (int, error)
-	StreamScanRegexNotMatch(column string, pattern string, callback RowCallback) (int, error)
-	StreamScanContains(column string, substring string, callback RowCallback) (int, error)
+	StreamScanRegex(column, pattern string, callback RowCallback) (int, error)
+	StreamScanRegexNotMatch(column, pattern string, callback RowCallback) (int, error)
+	StreamScanContains(column, substring string, callback RowCallback) (int, error)
 	StreamFullScan(callback RowCallback) (int, error)
 
 	// Set operations on row sets

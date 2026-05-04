@@ -281,7 +281,7 @@ func refWidths(refs []shared.BlockRef) (blockW, rowW uint8) {
 	if maxRow > math.MaxUint8 {
 		rowW = 2
 	}
-	return
+	return blockW, rowW
 }
 
 // dictRefWidths computes the minimum byte widths for blockIdx and rowIdx fields
@@ -306,7 +306,7 @@ func dictRefWidths(entries []dictEntry) (blockW, rowW uint8) {
 	if maxRow > math.MaxUint8 {
 		rowW = 2
 	}
-	return
+	return blockW, rowW
 }
 
 // sortDictEntries sorts c.entries in ascending order by value.

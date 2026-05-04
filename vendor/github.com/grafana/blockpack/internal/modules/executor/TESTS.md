@@ -3598,3 +3598,31 @@ span:start and span:duration must be present for span:end synthesis); ComputeSec
 contract (nil program + non-empty selectColumns → non-nil result with selectColumns ∪ traceIntrinsicColumns).
 
 Back-ref: `internal/modules/executor/compute_second_pass_cols_test.go:TestComputeSecondPassCols_SelectColumnsOnly`
+
+---
+
+## EX-ST-22: TestLookupIntrinsicFieldsTypedForBlock_MatchesTyped
+
+*Added: 2026-05-04*
+
+**Scenario:** For a 200-span, 2-block file (`MaxBlockSpans=100`), `lookupIntrinsicFieldsTypedForBlock`
+output matches `lookupIntrinsicFieldsTyped` output exactly for every field and present bit.
+Verifies the NOTE-100 optimization produces identical results to the original code path.
+
+**Setup:**
+- Write 200 spans across 2 blocks with all intrinsic fields set (traceID, spanID, parentID,
+  span:name, resource.service.name, span:kind, span:start, span:end, span:duration).
+- For each block (0, 1): call both `LookupIntrinsicFieldsTypedForTest` and
+  `LookupIntrinsicFieldsTypedForBlockForTest`.
+
+**Assertions:**
+- `len(result) == spanCount` for both variants.
+- Every row: `Present`, `TraceID`, `SpanID`, `ParentID`, `SpanName`, `ServiceName`,
+  `SpanStart`, `SpanEnd`, `SpanDuration`, `SpanKind`, `SpanStatus`, `StatusMessage` all equal.
+
+**Additional tests in the same file:**
+- `_AllCols`: 50 spans, single block, nil wantCols (all 11 columns). Full parity check.
+- `_EmptyColumn`: file with never-written column (span:status_message) → present bit clear, no panic.
+- `_MultiBlock_AllMatch`: 500 spans, 10 blocks. No cross-block bleed.
+
+Back-ref: `internal/modules/executor/intrinsic_row_block_test.go`

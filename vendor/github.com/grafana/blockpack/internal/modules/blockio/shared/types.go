@@ -138,6 +138,82 @@ type SectionDirectory struct {
 	SignalType  uint8
 }
 
+// ToCKey is the lookup key in a V8 unified Table of Contents.
+// Struct equality is used for map lookups — no custom hash needed.
+// Fields are ordered for minimal struct padding (string header first, then scalar fields).
+type ToCKey struct {
+	Name    string
+	Type    uint32
+	SubType uint32
+}
+
+// ToCEntry is one record in the V8 unified ToC blob.
+// Wire format: type[4 LE] + subtype[4 LE] + name_len[2 LE] + name[name_len] + offset[8 LE] + length[4 LE]
+// Minimum wire size (name=""): 4+4+2+0+8+4 = 22 bytes.
+type ToCEntry struct {
+	Key    ToCKey
+	Offset uint64
+	Length uint32
+}
+
+// ToCEntryMinWireSize is the wire size of a ToCEntry with Name="".
+// type[4]+subtype[4]+name_len[2]+offset[8]+length[4] = 22 bytes.
+const ToCEntryMinWireSize = 22
+
+// ToCBlobHeaderSize is the fixed prefix of the decompressed ToC blob before entries.
+// entry_count[4 LE] + signal_type[1] + reserved[3] = 8 bytes.
+const ToCBlobHeaderSize = 8
+
+// WireSize returns the on-wire byte count for this ToCEntry.
+func (e ToCEntry) WireSize() int {
+	return ToCEntryMinWireSize + len(e.Key.Name)
+}
+
+// Marshal serializes e to a newly allocated byte slice of length e.WireSize().
+func (e ToCEntry) Marshal() []byte {
+	buf := make([]byte, e.WireSize())
+	e.MarshalInto(buf)
+	return buf
+}
+
+// MarshalInto serializes e into dst.
+// dst must be at least e.WireSize() bytes long.
+func (e ToCEntry) MarshalInto(dst []byte) {
+	binary.LittleEndian.PutUint32(dst[0:], e.Key.Type)
+	binary.LittleEndian.PutUint32(dst[4:], e.Key.SubType)
+	binary.LittleEndian.PutUint16(dst[8:], uint16(len(e.Key.Name))) //nolint:gosec // bounded by MaxNameLen (1024), fits in uint16
+	copy(dst[10:], e.Key.Name)
+	off := 10 + len(e.Key.Name)
+	binary.LittleEndian.PutUint64(dst[off:], e.Offset)
+	binary.LittleEndian.PutUint32(dst[off+8:], e.Length)
+}
+
+// UnmarshalToCEntry parses one ToCEntry from data[0:].
+// Returns the entry and the number of bytes consumed from data.
+func UnmarshalToCEntry(data []byte) (ToCEntry, int, error) {
+	const minHeader = 10 // type[4]+subtype[4]+name_len[2]
+	if len(data) < minHeader {
+		return ToCEntry{}, 0, fmt.Errorf("UnmarshalToCEntry: need at least %d bytes, got %d", minHeader, len(data))
+	}
+	tocType := binary.LittleEndian.Uint32(data[0:])
+	subType := binary.LittleEndian.Uint32(data[4:])
+	nameLen := int(binary.LittleEndian.Uint16(data[8:]))
+	if nameLen > MaxNameLen {
+		return ToCEntry{}, 0, fmt.Errorf("UnmarshalToCEntry: name_len %d exceeds MaxNameLen %d", nameLen, MaxNameLen)
+	}
+	need := minHeader + nameLen + 8 + 4 // name + offset[8] + length[4]
+	if len(data) < need {
+		return ToCEntry{}, 0, fmt.Errorf("UnmarshalToCEntry: need %d bytes, got %d", need, len(data))
+	}
+	name := string(data[minHeader : minHeader+nameLen])
+	off := minHeader + nameLen
+	return ToCEntry{
+		Key:    ToCKey{Type: tocType, SubType: subType, Name: name},
+		Offset: binary.LittleEndian.Uint64(data[off:]),
+		Length: binary.LittleEndian.Uint32(data[off+8:]),
+	}, need, nil
+}
+
 // ColumnType is the logical column type (0–13); values 14–255 are reserved.
 type ColumnType uint8
 

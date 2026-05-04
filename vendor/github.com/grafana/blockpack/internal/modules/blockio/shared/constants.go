@@ -16,14 +16,29 @@ const (
 	// is applied per-column by the block writer.
 	VersionBlockEncV3 uint8 = 3
 
-	// FooterV7Version is the footer format version for the V14 section-directory footer (18 bytes).
-	// magic[4]+version[2]+dir_offset[8]+dir_len[4] = 18 bytes.
-	// Version 7 was chosen because agentic already uses 5 (46-byte vector footer) and 6 (58-byte compact-traces footer).
-	FooterV7Version uint16 = 7
+	// FooterV8Version is the footer format version for V8 files (unified ToC footer).
+	// Same 18-byte layout as V7; distinguished by version=8.
+	FooterV8Version uint16 = 8
 
-	// FooterV7Size is the total size of the V14 section-directory footer in bytes:
-	// magic[4]+version[2]+dir_offset[8]+dir_len[4] = 18 bytes.
-	FooterV7Size uint = 18
+	// FooterV8Size is the total size of the V8 footer in bytes (identical to V7).
+	// magic[4]+version[2]+toc_offset[8]+toc_length[4] = 18 bytes.
+	FooterV8Size uint = 18
+
+	// ToCEntry Type constants — section class in the V8 unified Table of Contents.
+	ToCTypeMetadata uint32 = 1 // file-level metadata sections
+	ToCTypeIndex    uint32 = 2 // file-level index structures
+	ToCTypeBlock    uint32 = 3 // raw block data blobs (reserved; not used in V8 initial)
+
+	// ToCEntry SubType constants for ToCTypeMetadata (Type=1).
+	ToCSubTypeRange     uint32 = 1 // per-column range index blob
+	ToCSubTypeSketch    uint32 = 2 // per-column KLL/sketch blob
+	ToCSubTypeBloom     uint32 = 3 // file-level bloom filter blob
+	ToCSubTypeIntrinsic uint32 = 4 // per-column intrinsic column blob
+	ToCSubTypeTrace     uint32 = 5 // compact trace index blob
+	ToCSubTypeTS        uint32 = 6 // timestamp index blob
+
+	// ToCEntry SubType constants for ToCTypeIndex (Type=2).
+	ToCSubTypeBlockIndex uint32 = 7 // block offset table
 
 	// BlockHeaderV14Size is the total size of the V14 block header in bytes:
 	// magic[4]+version[1]+reserved[3]+span_count[4]+column_count[4]+reserved2[8] = 24 bytes.

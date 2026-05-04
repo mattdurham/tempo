@@ -737,3 +737,33 @@ indicates a map allocation was re-introduced in the ref-merge path.
 Back-ref: `internal/modules/executor/sorted_refs.go`,
 `internal/modules/executor/predicates.go:unionBlockRefs`,
 `internal/modules/executor/predicates.go:intersectBlockRefSets`
+
+---
+
+## BENCH-EX-20: BenchmarkPopulateTypedColumnForBlock
+
+*Added: 2026-05-04*
+
+**Purpose:** Verify that `lookupIntrinsicFieldsTypedForBlock` (NOTE-100) provides a substantial
+ns/op improvement over `lookupIntrinsicFieldsTyped` for the structural hot path.
+
+**What it measures:**
+- `_ForBlock`: `lookupIntrinsicFieldsTypedForBlock(blockIdx=0, spanCount=1000)`
+- `_Typed`: `lookupIntrinsicFieldsTyped(allRefs_1000, wantCols)` [existing code path]
+
+**Setup:** 50K spans across 50 blocks (MaxBlockSpans=1000), cycling service names + span names
++ all column types. `wantCols = {trace:id, span:id, span:parent_id}` (structural identity columns).
+
+**Expected outcome (NOTE-100):**
+- `_ForBlock` ≥ 10× faster ns/op than `_Typed` for N=1000 spans.
+- Zero additional allocations per call in `_ForBlock` vs `_Typed`.
+- Measured: ~10× ns/op improvement (30µs vs 292µs), ~540× fewer allocs (5 vs 2700).
+
+**Run:**
+```
+go test -run='^$' -bench=BenchmarkPopulateTypedColumnForBlock -benchmem -count=5 \
+    ./internal/modules/executor/
+```
+
+Back-ref: `internal/modules/executor/intrinsic_row_block_bench_test.go`,
+`internal/modules/executor/intrinsic_row_block.go:lookupIntrinsicFieldsTypedForBlock`

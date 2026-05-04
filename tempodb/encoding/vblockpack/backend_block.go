@@ -92,10 +92,11 @@ var (
 	blockpackCache     blockpack.Cache
 	blockpackCacheOnce sync.Once
 	blockpackCacheCfg  struct {
-		filePath         string
-		fileMaxBytes     int64
-		memServers       []string
-		memoryCacheBytes int64
+		filePath             string
+		fileMaxBytes         int64
+		memServers           []string
+		metadataMemServers   []string
+		memoryCacheBytes     int64
 	}
 )
 
@@ -104,11 +105,19 @@ var (
 // Later calls update the struct under the mutex but have no effect on the
 // already-initialized cache. All callers should set the same config.
 func ConfigureCache(filePath string, fileMaxBytes int64, memServers []string, memoryCacheBytes int64) {
+	ConfigureCacheTiered(filePath, fileMaxBytes, memServers, nil, memoryCacheBytes)
+}
+
+// ConfigureCacheTiered sets the cache configuration with separate metadata and data memcache tiers.
+// When metadataMemServers is non-empty, metadata (ToC, bloom, range index, intrinsic columns) and
+// block data use separate remote cache instances — matching parquet's parquet-footer vs parquet-page split.
+func ConfigureCacheTiered(filePath string, fileMaxBytes int64, dataMemServers, metadataMemServers []string, memoryCacheBytes int64) {
 	blockpackCacheMu.Lock()
 	defer blockpackCacheMu.Unlock()
 	blockpackCacheCfg.filePath = filePath
 	blockpackCacheCfg.fileMaxBytes = fileMaxBytes
-	blockpackCacheCfg.memServers = memServers
+	blockpackCacheCfg.memServers = dataMemServers
+	blockpackCacheCfg.metadataMemServers = metadataMemServers
 	blockpackCacheCfg.memoryCacheBytes = memoryCacheBytes
 }
 
@@ -155,8 +164,33 @@ func getCache() blockpack.Cache {
 			}
 		}
 
-		// Tier 3: remote memcache (largest, slowest).
-		if len(cfg.memServers) > 0 {
+		// Tier 3: remote memcache.
+		// When metadataMemServers is configured, split into two separate remote caches:
+		// - metadata cache: ToC, bloom, range index, intrinsic columns (small, hot)
+		// - data cache: raw block bytes (large, warm via pod-local disk/memory)
+		if len(cfg.metadataMemServers) > 0 && len(cfg.memServers) > 0 {
+			// Tiered: build separate metadata and data remote caches.
+			// WrapRegistererWith adds a constant "tier" label so both MemCache instances
+			// can share the same metric names without a duplicate-registration panic.
+			metaRemote, err := blockpack.OpenMemCache(blockpack.MemCacheConfig{
+				Servers:    cfg.metadataMemServers,
+				Enabled:    true,
+				Registerer: prometheus.WrapRegistererWith(prometheus.Labels{"tier": "metadata"}, prometheus.DefaultRegisterer),
+			})
+			dataRemote, err2 := blockpack.OpenMemCache(blockpack.MemCacheConfig{
+				Servers:    cfg.memServers,
+				Enabled:    true,
+				Registerer: prometheus.WrapRegistererWith(prometheus.Labels{"tier": "data"}, prometheus.DefaultRegisterer),
+			})
+			if err == nil && err2 == nil && metaRemote != nil && dataRemote != nil {
+				// Build per-tier chains: memory+disk+metaRemote for metadata, memory+disk+dataRemote for data.
+				metaChain := blockpack.NewChainedCache(append(tiers, metaRemote)...)
+				dataChain := blockpack.NewChainedCache(append(tiers, dataRemote)...)
+				blockpackCache = blockpack.NewTieredCache(metaChain, dataChain)
+				return
+			}
+		} else if len(cfg.memServers) > 0 {
+			// Single remote cache (original behaviour).
 			remote, err := blockpack.OpenMemCache(blockpack.MemCacheConfig{
 				Servers:    cfg.memServers,
 				Enabled:    true,
@@ -569,7 +603,15 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 	}
 	var fetchErr error
 	var matches []blockpack.SpanMatch
-	matches, _, fetchErr = blockpack.QueryTraceQL(r, query, queryOpts)
+	var qs blockpack.QueryStats
+	matches, qs, fetchErr = blockpack.QueryTraceQL(r, query, queryOpts)
+	if len(qs.Steps) > 0 {
+		args := []any{"query", query, "path", qs.ExecutionPath, "total", qs.TotalDuration}
+		for _, step := range qs.Steps {
+			args = append(args, step.Name+"_dur", step.Duration, step.Name+"_io", step.IOOps, step.Name+"_bytes", step.BytesRead)
+		}
+		slog.Info("vblockpack query stats", args...)
+	}
 	if fetchErr == nil {
 		for i := range matches {
 			match := &matches[i]

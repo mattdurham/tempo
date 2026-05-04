@@ -120,9 +120,15 @@ type BlockpackConfig struct {
 	// traces), improving GPU throughput. Defaults to 24000 (~8192 tokens) when 0.
 	EmbeddingMaxTextLength int `yaml:"embedding_max_text_length"`
 
-	// MemCacheServers is a list of memcache server addresses (e.g. ["memcached-01:11211"]).
-	// Leave empty to disable the remote memcache tier.
+	// MemCacheServers is a list of memcache server addresses for raw block data
+	// (ToCTypeBlock entries — large, primarily benefits pod-local disk/memory cache).
+	// Leave empty to disable the remote memcache tier for block data.
 	MemCacheServers []string `yaml:"memcache_servers"`
+	// MetadataMemCacheServers is a list of memcache server addresses for metadata
+	// (ToC blob, bloom, range index, intrinsic columns — small, high value in shared remote cache).
+	// When set, metadata and block data use separate cache tiers (TieredCache).
+	// When empty, all data shares the same cache tier (MemCacheServers).
+	MetadataMemCacheServers []string `yaml:"metadata_memcache_servers"`
 
 	// MemoryCacheBytes is the size of the in-process LRU memory cache (default: 256MB).
 	// 256 MB in-process LRU cache is always on; set to 0 to disable.

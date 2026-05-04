@@ -175,6 +175,45 @@ func (col *IntrinsicColumn) LookupRefFast(packedRef uint32) (val any, found bool
 	return nil, false
 }
 
+// BlockRefRange returns the subslice of refIndex whose entries belong to blockIdx.
+// Calls EnsureRefIndex internally (sync.Once, idempotent). Returns nil if col is nil
+// or no entries exist for blockIdx.
+//
+// The returned slice is a direct alias of col.refIndex[start:end] — it is valid as
+// long as col is alive. Do not append to it.
+//
+// NOTE-016: O(log(B×N)) to find the block boundary — one binary search to start, then
+// a linear walk. For flat/XORBytes/DeltaUint64 columns, Pos indexes BytesValues or
+// Uint64Values. For dict columns, Pos indexes DictEntries. This is the O(1)-per-entry
+// building block for the structural scatter (NOTE-100 in executor/NOTES.md).
+func (col *IntrinsicColumn) BlockRefRange(blockIdx uint16) []RefIndexEntry {
+	if col == nil {
+		return nil
+	}
+	col.EnsureRefIndex()
+	if len(col.refIndex) == 0 {
+		return nil
+	}
+	loKey := uint32(blockIdx) << 16
+	// Binary search for the first entry with Packed >= loKey (= blockIdx<<16|0).
+	start, _ := slices.BinarySearchFunc(col.refIndex, loKey, func(e RefIndexEntry, target uint32) int {
+		return cmp.Compare(e.Packed, target)
+	})
+	// Linear walk: all same-blockIdx entries are contiguous because blockIdx occupies
+	// the high 16 bits of Packed, so they sort together after EnsureRefIndex.
+	// Using walk (not a second binary search for end) avoids overflow at blockIdx=0xFFFF:
+	// (0xFFFF+1)<<16 would overflow uint32 to 0. The walk is cache-friendly for the
+	// N_in_block entries that are sequentially laid out in the refIndex slice.
+	end := start
+	for end < len(col.refIndex) && col.refIndex[end].Packed>>16 == uint32(blockIdx) {
+		end++
+	}
+	if start == end {
+		return nil
+	}
+	return col.refIndex[start:end]
+}
+
 // LookupRef searches for a packed ref (blockIdx<<16|rowIdx) in the column and returns
 // the associated value and true when found, or (nil, false) when not found.
 //
