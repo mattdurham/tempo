@@ -2075,7 +2075,7 @@ func scanIntrinsicLeafRefs(
 // extractFlatRangeBounds converts a RangeNode's Min/Max into inclusive uint64 bounds
 // suitable for ScanFlatColumnRefs. Returns ok=false if the bounds cannot be encoded
 // or the constraint is empty (e.g. > MaxUint64, < 0).
-func extractFlatRangeBounds(leaf vm.RangeNode) (lo, hi uint64, hasLo, hasHi bool, ok bool) {
+func extractFlatRangeBounds(leaf vm.RangeNode) (lo, hi uint64, hasLo, hasHi, ok bool) {
 	if leaf.Min != nil {
 		v, encOK := valueToUint64(*leaf.Min)
 		if !encOK {

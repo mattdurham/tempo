@@ -417,3 +417,57 @@ in the same session. The consolidated `LookupRefFast(packedRef uint32) (any, boo
 returning the concrete type directly via a format switch. Per NOTE-094 in executor/NOTES.md, the
 `[8]byte` value type for spanID/parentID eliminates the clone that `LookupRefFastBytes` previously required.
 The `BENCH-SHARED-001` benchmark targeting `LookupRefFastUint64` was also removed (see BENCHMARKS.md addendum).
+
+---
+
+## NOTE-V8-001: ToCEntry and V8 Footer Design
+
+**Context:** FooterV8 (version=8) uses the same 18-byte layout as FooterV7 but distinguishes
+itself by the version field. The ToC blob it points to is a snappy-compressed stream of
+`entry_count[4] + signal_type[1] + reserved[3] + []ToCEntry`.
+
+**ToCEntry name_len[2]:** `name_len` is encoded as uint16 LE. With `MaxNameLen=1024`, the
+maximum name is 1024 bytes, well within uint16 range (65535). The `MarshalInto` method uses
+a `//nolint:gosec` annotation acknowledging this is safe given the MaxNameLen constraint.
+
+**ToCEntryMinWireSize:** 22 bytes (type[4]+subtype[4]+name_len[2]+offset[8]+length[4]).
+File-level sections (bloom, trace index, TS index, block index) use Name="" (empty).
+Per-column sections (range, sketch, intrinsic) use Name=colName.
+
+**ToCBlobHeaderSize:** 8 bytes (entry_count[4]+signal_type[1]+reserved[3]).
+
+**Constants:** `FooterV8Version=8`, `FooterV8Size=18`, `ToCTypeMetadata=1`, `ToCTypeIndex=2`,
+`ToCTypeBlock=3` (reserved), `ToCSubTypeRange=1`..`ToCSubTypeBlockIndex=7`.
+
+Back-ref: `internal/modules/blockio/shared/constants.go:FooterV8Version`,
+          `internal/modules/blockio/shared/types.go:ToCEntry`,
+          `internal/modules/blockio/shared/types.go:UnmarshalToCEntry`
+
+---
+
+## NOTE-016: BlockRefRange — O(log N) Block-Boundary Find
+
+_Added: 2026-05-04_
+
+**Context:** The structural query executor calls `lookupIntrinsicFieldsTypedForBlock` once
+per block per query. To scatter column values into a per-row result slice without N binary
+searches, it needs the subslice of `refIndex` that belongs to a single blockIdx.
+
+**Decision:** Add `BlockRefRange(blockIdx uint16) []RefIndexEntry` to `*IntrinsicColumn`.
+
+**Why here (not in executor):** `refIndex` is unexported in the `shared` package. This is the
+minimal accessor surface: one binary search to find start, then a linear walk for end.
+The returned slice aliases `col.refIndex[start:end]` — no allocation.
+
+**Why linear walk for end (not second binary search):** Avoids overflow at `blockIdx=0xFFFF`:
+`(0xFFFF+1)<<16` would overflow uint32 to 0, producing an incorrect upper bound. The linear
+walk condition `Packed>>16 == uint32(blockIdx)` is safe for all blockIdx values. For the
+N_in_block entries that are sequentially laid out in refIndex, the walk is cache-friendly.
+
+**Correctness invariant:** All entries for a single blockIdx are **contiguous** in refIndex
+after `EnsureRefIndex` sorts by Packed. Because `Packed = blockIdx<<16 | rowIdx`, all entries
+with the same blockIdx cluster together when sorted ascending.
+
+**Caller:** `executor.populateTypedColumnForBlock` (NOTE-100 in executor/NOTES.md).
+
+Back-ref: `internal/modules/blockio/shared/intrinsic_ref_index.go:BlockRefRange`

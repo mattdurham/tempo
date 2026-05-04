@@ -457,7 +457,7 @@ func (c *FileCache) pathFor(key string) string {
 // Using os.CreateTemp (rather than a deterministic "<path>.tmp") avoids a race
 // where two goroutines writing the same key would clobber each other's temp file.
 // Format: [4B magic][4B keyLen LE][key][value]
-func writeFile(path string, key string, value []byte) error {
+func writeFile(path, key string, value []byte) error {
 	// Enforce the same key-length constraint that readFileHeader validates,
 	// so entries written now won't be rejected as corrupt on the next restart.
 	if len(key) == 0 || len(key) > maxCacheKeyLen {

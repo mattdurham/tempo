@@ -250,10 +250,11 @@ func New(cfg *Config, cacheProvider cache.Provider, logger gkLog.Logger) (Reader
 	// exceeds the S3 latency savings. The disk cache helps more with real S3 (50-100ms RTT).
 	if cfg.Block != nil {
 		bp := cfg.Block.Blockpack
-		vblockpack.ConfigureCache(
+		vblockpack.ConfigureCacheTiered(
 			bp.FileCachePath,
 			bp.FileCacheMaxBytes,
 			bp.MemCacheServers,
+			bp.MetadataMemCacheServers,
 			bp.MemoryCacheBytes,
 		)
 	}

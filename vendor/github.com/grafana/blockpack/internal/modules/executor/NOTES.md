@@ -3357,3 +3357,48 @@ sorted in ascending packed-ref order. The wrapper functions in `predicates.go` e
 Back-ref: `internal/modules/executor/sorted_refs.go`,
 `internal/modules/executor/predicates.go:unionBlockRefs`,
 `internal/modules/executor/predicates.go:intersectBlockRefSets`
+
+---
+
+## NOTE-100: Block-Boundary Scatter for Structural Hot Path
+
+_Added: 2026-05-04_
+
+**Problem:** Pyroscope CPU profiles on the dev-03 querier showed `LookupRefFast` (37%),
+`BinarySearchFunc` (14%), and `storeTypedField` (12%) = 63% of structural query CPU
+concentrated in `collectBlockStructuralSpanRecs` → `lookupIntrinsicFieldsTyped`.
+
+The bottleneck: for each block with N spans and K intrinsic columns, `lookupIntrinsicFieldsTyped`
+performed O(K × N × log(B×N)) binary searches (one per column per span) and allocated a
+`[]BlockRef` of length N on every block call. Also, `LookupRefFast` → `storeTypedField`
+boxes each value into `any`, incurring interface allocations.
+
+**Solution:** Add `lookupIntrinsicFieldsTypedForBlock` + `populateTypedColumnForBlock` to
+the executor, backed by `BlockRefRange` in `shared`.
+
+Key observations that make this safe:
+1. In the structural path, `allRefs` is always blockIdx=constant, rowIdx=0..N-1 — exactly the
+   entries for one block in the refIndex.
+2. Because `Packed = blockIdx<<16 | rowIdx` and refIndex is sorted by Packed, all entries for
+   a single blockIdx are **contiguous** in refIndex.
+3. One binary search finds the start; a linear walk finds the end: O(log(B×N) + N_in_block).
+4. Scatter the results directly into `[]intrinsicRowFields` using typed field writes — no boxing.
+
+**Complexity:** O(K × (log(B×N) + N)) vs O(K × N × log(B×N)) per block.
+For N=1000 spans and B×N=50000 entries: ~16 searches vs ~16000 searches per column.
+
+**Secondary gains:**
+- Eliminates `make([]BlockRef, N)` allocation per block call.
+- Outer column-switch in `populateTypedColumnForBlock` eliminates per-row interface boxing
+  from `LookupRefFast` / `storeTypedField` (12% CPU).
+- Benchmark (BENCH-EX-20): ~10× ns/op improvement, ~540× fewer allocations per call.
+
+**Implementation:**
+- `shared/intrinsic_ref_index.go:BlockRefRange` — O(log N) block range finder. (NOTE-016)
+- `executor/intrinsic_row_block.go:populateTypedColumnForBlock` — typed scatter per column.
+- `executor/intrinsic_row_block.go:lookupIntrinsicFieldsTypedForBlock` — drop-in replacement.
+- `executor/stream_structural.go:collectBlockStructuralSpanRecs` — uses new function.
+
+Back-ref: `internal/modules/executor/intrinsic_row_block.go`,
+`internal/modules/blockio/shared/intrinsic_ref_index.go:BlockRefRange`,
+`internal/modules/executor/stream_structural.go:collectBlockStructuralSpanRecs`

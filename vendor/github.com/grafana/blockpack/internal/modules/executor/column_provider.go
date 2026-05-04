@@ -756,7 +756,7 @@ func (p *blockColumnProvider) StreamScanIsNotNull(column string, cb vm.RowCallba
 }
 
 // StreamScanRegex scans all rows and calls cb for each row where column matches pattern.
-func (p *blockColumnProvider) StreamScanRegex(column string, pattern string, cb vm.RowCallback) (int, error) {
+func (p *blockColumnProvider) StreamScanRegex(column, pattern string, cb vm.RowCallback) (int, error) {
 	col := p.lookupColumn(column)
 	if col == nil {
 		// Only FullScan for string-typed intrinsic columns (regex requires string values).
@@ -813,7 +813,7 @@ func (p *blockColumnProvider) StreamScanRegexNotMatch(
 }
 
 // StreamScanContains scans all rows and calls cb for each row where column contains substring.
-func (p *blockColumnProvider) StreamScanContains(column string, substring string, cb vm.RowCallback) (int, error) {
+func (p *blockColumnProvider) StreamScanContains(column, substring string, cb vm.RowCallback) (int, error) {
 	col := p.lookupColumn(column)
 	if col == nil {
 		// Only FullScan for string-typed intrinsic columns (contains requires string values).
@@ -1061,21 +1061,21 @@ func (p *blockColumnProvider) ScanIsNotNull(column string) (vm.RowSet, error) {
 }
 
 // ScanRegex returns a RowSet of all rows where column matches pattern.
-func (p *blockColumnProvider) ScanRegex(column string, pattern string) (vm.RowSet, error) {
+func (p *blockColumnProvider) ScanRegex(column, pattern string) (vm.RowSet, error) {
 	return collectStream(p.block.SpanCount(), func(cb vm.RowCallback) (int, error) {
 		return p.StreamScanRegex(column, pattern, cb)
 	})
 }
 
 // ScanRegexNotMatch returns a RowSet of all rows where column does not match pattern.
-func (p *blockColumnProvider) ScanRegexNotMatch(column string, pattern string) (vm.RowSet, error) {
+func (p *blockColumnProvider) ScanRegexNotMatch(column, pattern string) (vm.RowSet, error) {
 	return collectStream(p.block.SpanCount(), func(cb vm.RowCallback) (int, error) {
 		return p.StreamScanRegexNotMatch(column, pattern, cb)
 	})
 }
 
 // ScanContains returns a RowSet of all rows where column contains substring.
-func (p *blockColumnProvider) ScanContains(column string, substring string) (vm.RowSet, error) {
+func (p *blockColumnProvider) ScanContains(column, substring string) (vm.RowSet, error) {
 	return collectStream(p.block.SpanCount(), func(cb vm.RowCallback) (int, error) {
 		return p.StreamScanContains(column, substring, cb)
 	})

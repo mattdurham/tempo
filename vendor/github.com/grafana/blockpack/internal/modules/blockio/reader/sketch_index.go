@@ -428,3 +428,46 @@ func skipColumnFuse(data []byte, pos int, name string, presentCount int) (int, e
 	}
 	return pos, nil
 }
+
+// parseOneColumnSketchBlob parses a per-column sketch blob emitted by writeOneColumnSketchBlob.
+// Wire: num_blocks[4 LE] + presence[ceil(n/8)] + distinct[n×4] + topk_k[1] + topk + bloom_size[2] + bloom.
+// Returns nil, nil if data is empty or too short.
+func parseOneColumnSketchBlob(data []byte) (*columnSketchData, error) {
+	if len(data) < 4 {
+		return nil, nil
+	}
+	rawBlocks := binary.LittleEndian.Uint32(data[0:])
+	if rawBlocks > uint32(shared.MaxBlocks) { //nolint:gosec
+		return nil, fmt.Errorf("parseOneColumnSketchBlob: numBlocks %d exceeds limit", rawBlocks)
+	}
+	numBlocks := int(rawBlocks)
+	presenceBytes := (numBlocks + 7) / 8
+	pos := 4
+
+	cd := &columnSketchData{numBlocks: numBlocks}
+
+	var err error
+	var presentCount int
+	pos, presentCount, err = parseColumnPresence(data, pos, "", numBlocks, presenceBytes, cd)
+	if err != nil {
+		return nil, fmt.Errorf("parseOneColumnSketchBlob: presence: %w", err)
+	}
+
+	pos, err = parseColumnDistinct(data, pos, "", numBlocks, cd)
+	if err != nil {
+		return nil, fmt.Errorf("parseOneColumnSketchBlob: distinct: %w", err)
+	}
+
+	pos, err = parseColumnTopK(data, pos, "", presentCount, cd)
+	if err != nil {
+		return nil, fmt.Errorf("parseOneColumnSketchBlob: topk: %w", err)
+	}
+
+	pos, err = parseColumnBloom(data, pos, "", presentCount, cd)
+	if err != nil {
+		return nil, fmt.Errorf("parseOneColumnSketchBlob: bloom: %w", err)
+	}
+
+	_ = pos
+	return cd, nil
+}

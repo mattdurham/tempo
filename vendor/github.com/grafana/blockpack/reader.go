@@ -20,6 +20,7 @@ import (
 	modules_memcache "github.com/grafana/blockpack/internal/modules/memcache"
 	modules_memorycache "github.com/grafana/blockpack/internal/modules/memorycache"
 	modules_rw "github.com/grafana/blockpack/internal/modules/rw"
+	modules_tieredcache "github.com/grafana/blockpack/internal/modules/tieredcache"
 	vm "github.com/grafana/blockpack/internal/vm"
 )
 
@@ -189,6 +190,53 @@ type ChainedCache = modules_chaincache.ChainedCache
 //	reader, _ := blockpack.NewReaderWithCache(provider, fileID, chain)
 func NewChainedCache(tiers ...Cache) *ChainedCache {
 	return modules_chaincache.New(tiers...)
+}
+
+// TieredCache routes cache operations to one of two sub-caches based on key content:
+//   - Raw block data keys (*/block/<decimal-integer>) → dataCache
+//   - Metadata keys (footer, header, sections, trace index, etc.) → metadataCache
+//
+// This enables separate storage strategies for large infrequently-reused block data
+// (e.g. pod-local memcache) and small frequently-reused metadata (e.g. shared remote memcache).
+// Construct one with NewTieredCache.
+type TieredCache = modules_tieredcache.TieredCache
+
+// NewTieredCache creates a TieredCache routing metadata keys to metadataCache and
+// raw block data keys to dataCache. Use NewChainedCache to compose each sub-cache
+// from individual tiers (MemoryCache, FileCache, MemCache).
+//
+// The shared MemoryCache and FileCache tiers may safely be passed to both chains —
+// their Close methods are no-ops, so double-close on TieredCache.Close() is safe.
+//
+// Example — separate remote caches for metadata and data:
+//
+//	mem, _        := blockpack.NewMemoryCache(blockpack.MemoryCacheConfig{MaxBytes: 256 << 20})
+//	disk, _       := blockpack.OpenFileCache(blockpack.FileCacheConfig{Path: "/var/cache/bp", MaxBytes: 10 << 30, Enabled: true})
+//	metaRemote, _ := blockpack.OpenMemCache(blockpack.MemCacheConfig{Servers: []string{"shared-meta:11211"}, Enabled: true})
+//	dataRemote, _ := blockpack.OpenMemCache(blockpack.MemCacheConfig{Servers: []string{"pod-local-data:11211"}, Enabled: true})
+//
+//	tiered := blockpack.NewTieredCache(
+//	    blockpack.NewChainedCache(mem, disk, metaRemote), // metadata: shared remote
+//	    blockpack.NewChainedCache(mem, disk, dataRemote), // data: pod-local
+//	)
+//	reader, _ := blockpack.NewReaderWithCache(provider, fileID, tiered)
+func NewTieredCache(metadataCache, dataCache Cache) *TieredCache {
+	return modules_tieredcache.New(metadataCache, dataCache)
+}
+
+// NewTieredCacheWithRegisterer creates a TieredCache like NewTieredCache but also
+// registers Prometheus counters with reg:
+//   - blockpack_tiered_cache_requests_total{tier, operation, result}
+//   - blockpack_tiered_cache_bytes_total{tier, operation}
+//
+// Pass prometheus.DefaultRegisterer to publish metrics to the default registry.
+// Pass a prometheus.WrapRegistererWith result to add constant labels.
+func NewTieredCacheWithRegisterer(metadataCache, dataCache Cache, reg prometheus.Registerer) *TieredCache {
+	return modules_tieredcache.NewTieredCacheWithConfig(modules_tieredcache.Config{
+		Metadata:   metadataCache,
+		Data:       dataCache,
+		Registerer: reg,
+	})
 }
 
 // Signal type constants for blockpack file discrimination.

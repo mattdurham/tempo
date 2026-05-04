@@ -76,27 +76,23 @@ type rangeIndexMeta struct {
 }
 
 // readFooter reads the footer from the end of the file.
-// Supports v3 (22 bytes), v4 (34 bytes), v5 (46 bytes), v6 (58 bytes), and v7 (18 bytes, V14 section-directory format) footer formats.
-// v4 adds intrinsicIndexOffset[8] + intrinsicIndexLen[4] after the v3 fields.
-// v5 adds vectorIndexOffset[8] + vectorIndexLen[4] after the v4 fields.
-// v6 adds compactTracesOffset[8] + compactTracesLen[4] after the v5 fields (split compact format).
-// v7 is the V14 section-directory footer: magic[4]+version[2]+dir_offset[8]+dir_len[4] = 18 bytes.
+// For 18-byte magic footers: V8 only — rejects any other version (including V7) with an error.
+// Legacy v3 (22 bytes), v4 (34 bytes), v5 (46 bytes), and v6 (58 bytes) are handled
+// via the legacy path when the 18-byte magic check yields no match.
 //
-// Detection strategy: try v7 first (magic check), then v6, then v5, then v4, then v3.
+// Detection strategy: read the last 18 bytes once; if magic matches, version must be
+// exactly V8. Falls through to legacy v3/v4/v5/v6 detection when magic is absent.
 func (r *Reader) readFooter() error {
-	if r.fileSize < int64(shared.FooterV7Size) {
+	if r.fileSize < int64(shared.FooterV8Size) {
 		return fmt.Errorf("file too small for footer: %d bytes", r.fileSize)
 	}
 
 	cacheKey := r.fileID + "/footer"
 
-	// Try V7 first (18 bytes): magic[4]+version[2]+dir_offset[8]+dir_len[4].
-	// V14 files always end with this footer. The magic+version check makes detection reliable.
-	isV7, err := r.tryReadFooterV7(cacheKey)
-	if err != nil {
+	// Read the last 18 bytes once; use them for both V8 and V7 detection (same size, same offset).
+	if ok, err := r.tryReadFooterMagic18(cacheKey); err != nil {
 		return err
-	}
-	if isV7 {
+	} else if ok {
 		return nil
 	}
 
@@ -107,17 +103,18 @@ func (r *Reader) readFooter() error {
 	return r.readFooterLegacy(cacheKey)
 }
 
-// tryReadFooterV7 attempts to read a V7 footer from the last 18 bytes of the file.
-// Returns true and populates r.footerVersion/r.v7DirOffset/r.v7DirLen on success.
-func (r *Reader) tryReadFooterV7(cacheKey string) (bool, error) {
-	off := r.fileSize - int64(shared.FooterV7Size)
-	buf, err := r.cache.GetOrFetch(cacheKey+"/v7", func() ([]byte, error) {
-		b := make([]byte, shared.FooterV7Size)
+// tryReadFooterMagic18 reads the last 18 bytes and checks for a V8 footer.
+// If magic matches but version != V8, an error is returned (V7 is not supported).
+// Returns (false, nil) when magic is absent, allowing legacy detection to proceed.
+func (r *Reader) tryReadFooterMagic18(cacheKey string) (bool, error) {
+	off := r.fileSize - int64(shared.FooterV8Size) // 18-byte footer
+	buf, err := r.cache.GetOrFetch(cacheKey+"/v78", func() ([]byte, error) {
+		b := make([]byte, shared.FooterV8Size)
 		n, readErr := r.provider.ReadAt(b, off, rw.DataTypeFooter)
 		if readErr != nil {
 			return nil, fmt.Errorf("readFooter: %w", readErr)
 		}
-		if n != int(shared.FooterV7Size) {
+		if n != int(shared.FooterV8Size) {
 			return nil, fmt.Errorf("readFooter: short read: %d bytes", n)
 		}
 		return b, nil
@@ -126,15 +123,21 @@ func (r *Reader) tryReadFooterV7(cacheKey string) (bool, error) {
 		return false, fmt.Errorf("readFooter: %w", err)
 	}
 	magic := binary.LittleEndian.Uint32(buf[0:])
-	ver := binary.LittleEndian.Uint16(buf[footerV7OffVersion:])
-	if magic != shared.MagicNumber || ver != shared.FooterV7Version {
+	if magic != shared.MagicNumber {
 		return false, nil
 	}
-	r.footerVersion = shared.FooterV7Version
-	r.v7DirOffset = binary.LittleEndian.Uint64(buf[footerV7OffDirOff:])
-	r.v7DirLen = binary.LittleEndian.Uint32(buf[footerV7OffDirLen:])
+	ver := binary.LittleEndian.Uint16(buf[footerV7OffVersion:])
+	if ver != shared.FooterV8Version {
+		return false, fmt.Errorf("readFooter: unsupported footer version %d", ver)
+	}
+	r.footerVersion = shared.FooterV8Version
+	r.v8ToCOffset = binary.LittleEndian.Uint64(buf[footerV7OffDirOff:])
+	r.v8ToCLen = binary.LittleEndian.Uint32(buf[footerV7OffDirLen:])
 	return true, nil
 }
+
+// Note: tryReadFooterV7 is superseded by tryReadFooterMagic18, which reads the same
+// 18 bytes once and dispatches to both V7 and V8 detection in a single I/O.
 
 // readFooterLegacy handles V3/V4/V5/V6 footer detection for non-V7 files.
 func (r *Reader) readFooterLegacy(cacheKey string) error {
@@ -350,104 +353,6 @@ func (r *Reader) readFooterV3(cacheKey string) error {
 	return r.applyLegacyFooterCommon(buf)
 }
 
-// readSectionDirectory reads and decodes the V14 section directory.
-// Called after readFooter() when footerVersion == FooterV7Version.
-// Returns a SectionDirectory with TypeEntries and NameEntries populated.
-// Decompressed bytes are cached via r.cache (key: fileID+"/v14/sec-dir/dec") so repeated
-// reader creation for the same file avoids the GCS round-trip on warm cache.
-func (r *Reader) readSectionDirectory() (shared.SectionDirectory, error) {
-	if r.v7DirLen == 0 {
-		return shared.SectionDirectory{
-			TypeEntries: make(map[uint8]shared.DirEntryType),
-			NameEntries: make(map[string]shared.DirEntryName),
-		}, nil
-	}
-
-	cacheKey := r.fileID + "/v14/sec-dir/dec"
-	raw, err := r.cache.GetOrFetch(cacheKey, func() ([]byte, error) {
-		compressed, readErr := r.readRange(
-			r.v7DirOffset,
-			uint64(r.v7DirLen),
-			rw.DataTypeMetadata,
-		) //nolint:gosec // safe: v7DirLen is a file offset length, fits in uint64
-		if readErr != nil {
-			return nil, readErr
-		}
-		return decodeBoundedSnappy(compressed)
-	})
-	if err != nil {
-		return shared.SectionDirectory{}, fmt.Errorf("readSectionDirectory: %w", err)
-	}
-
-	if len(raw) < 4 {
-		return shared.SectionDirectory{}, fmt.Errorf(
-			"readSectionDirectory: too short for entry_count: %d bytes",
-			len(raw),
-		)
-	}
-
-	entryCount := binary.LittleEndian.Uint32(raw[0:])
-	pos := 4
-
-	dir := shared.SectionDirectory{
-		TypeEntries: make(
-			map[uint8]shared.DirEntryType,
-			int(entryCount),
-		), //nolint:gosec // safe: entryCount is a small count
-		NameEntries: make(map[string]shared.DirEntryName),
-	}
-
-	for i := range entryCount {
-		if pos >= len(raw) {
-			return shared.SectionDirectory{}, fmt.Errorf("readSectionDirectory: entry[%d]: truncated", i)
-		}
-		kind := raw[pos]
-		pos++
-		switch kind {
-		case shared.DirEntryKindType:
-			e, parseErr := shared.UnmarshalDirEntryType(raw[pos:])
-			if parseErr != nil {
-				return shared.SectionDirectory{}, fmt.Errorf(
-					"readSectionDirectory: entry[%d] type-keyed: %w",
-					i,
-					parseErr,
-				)
-			}
-			pos += shared.DirEntryTypeWireSize - 1 // -1 for the kind byte already consumed
-			dir.TypeEntries[e.SectionType] = e
-		case shared.DirEntryKindName:
-			e, n, parseErr := shared.UnmarshalDirEntryName(raw[pos:])
-			if parseErr != nil {
-				return shared.SectionDirectory{}, fmt.Errorf(
-					"readSectionDirectory: entry[%d] name-keyed: %w",
-					i,
-					parseErr,
-				)
-			}
-			pos += n
-			dir.NameEntries[e.Name] = e
-		case shared.DirEntryKindSignal:
-			// DirEntryKindSignal: signal_type[1] — 1 byte payload after the kind byte.
-			if pos >= len(raw) {
-				return shared.SectionDirectory{}, fmt.Errorf(
-					"readSectionDirectory: entry[%d] signal-kind: truncated",
-					i,
-				)
-			}
-			dir.SignalType = raw[pos]
-			pos++
-		default:
-			return shared.SectionDirectory{}, fmt.Errorf(
-				"readSectionDirectory: entry[%d]: unknown kind 0x%02x",
-				i,
-				kind,
-			)
-		}
-	}
-
-	return dir, nil
-}
-
 // decodeBoundedSnappy snappy-decodes compressed, rejecting inputs whose
 // decoded size would exceed MaxMetadataSize (decompression-bomb guard).
 func decodeBoundedSnappy(compressed []byte) ([]byte, error) {
@@ -459,68 +364,6 @@ func decodeBoundedSnappy(compressed []byte) ([]byte, error) {
 		return nil, fmt.Errorf("snappy decoded size %d exceeds MaxMetadataSize %d", decodedLen, shared.MaxMetadataSize)
 	}
 	return snappy.Decode(nil, compressed)
-}
-
-// parseSectionsLazyV14 initializes the V14 reader by reading only the block index section
-// at open time. All other sections (range index, trace index, TS index, sketch index,
-// file bloom) are deferred: each is read and snappy-decoded on first access via the
-// corresponding ensureV14*Section method.
-//
-// NOTE: Only SectionBlockIndex is mandatory at open time — every block-access method
-// (ReadBlockRaw, GetBlockWithBytes, ReadBlocks, …) requires r.blockMetas to be populated.
-// The remaining sections are consulted only by specific query paths, so deferring their
-// I/O avoids reading megabytes of metadata that a given query may never use.
-//
-// NOTE: Was previously named "parseSectionsLazyV14" but did not actually defer per-section I/O.
-func (r *Reader) parseSectionsLazyV14() error {
-	// Signal type is stored in the section directory as a DirEntryKindSignal entry.
-	// Default to trace if not present (for backward compatibility with old V14 files).
-	if r.sectionDir.SignalType != 0 {
-		r.signalType = r.sectionDir.SignalType
-	} else {
-		r.signalType = shared.SignalTypeTrace
-	}
-	r.fileVersion = shared.VersionBlockV14
-
-	// SectionBlockIndex (0x01): block_count[4] + entries.
-	// Read eagerly — blockMetas is required by all block-access methods.
-	blockIdxRaw, err := r.readV14Section(shared.SectionBlockIndex)
-	if err != nil {
-		return fmt.Errorf("parseSectionsLazyV14: block_index: %w", err)
-	}
-	if len(blockIdxRaw) >= 4 {
-		blockCount := int(binary.LittleEndian.Uint32(blockIdxRaw[0:]))
-		metas, _, parseErr := parseBlockIndex(blockIdxRaw[4:], blockCount)
-		if parseErr != nil {
-			return fmt.Errorf("parseSectionsLazyV14: block_index parse: %w", parseErr)
-		}
-		r.blockMetas = metas
-	}
-
-	// SectionRangeIndex (0x02), SectionTraceIndex (0x03), SectionTSIndex (0x04),
-	// SectionSketchIndex (0x05), SectionFileBloom (0x06): deferred to first access.
-	// See ensureV14RangeSection, ensureV14TraceSection, ensureV14TSSection,
-	// ensureV14SketchSection, ensureV14BloomSection.
-
-	// Name-keyed entries: one per intrinsic column blob.
-	// Each blob on disk is snappy-compressed; the reader snappy-decodes it in GetIntrinsicColumn.
-	// NOTE-016: Offset and Length are populated from the section directory at open time (zero I/O).
-	// Format/Type/Count are populated lazily on first IntrinsicColumnMeta call (one blob read per
-	// column, cached). This avoids reading all N intrinsic blobs at open time when a query only
-	// needs a subset (e.g. the metrics fast path needs only span:start and possibly one group-by
-	// column — not all N columns in the file).
-	if len(r.sectionDir.NameEntries) > 0 {
-		r.intrinsicIndex = make(map[string]shared.IntrinsicColMeta, len(r.sectionDir.NameEntries))
-		for name, e := range r.sectionDir.NameEntries {
-			r.intrinsicIndex[name] = shared.IntrinsicColMeta{
-				Name:   name,
-				Offset: e.Offset,
-				Length: e.CompressedLen,
-			}
-		}
-	}
-
-	return nil
 }
 
 // readV14Section reads and snappy-decodes one type-keyed section from the section directory.
@@ -547,10 +390,200 @@ func (r *Reader) readV14Section(sectionType uint8) ([]byte, error) {
 	return raw, err
 }
 
+// parseV8ToCBlob reads, decompresses, and parses the V8 unified ToC blob.
+// Returns a map of ToCKey → ToCEntry and the file's signal type.
+func (r *Reader) parseV8ToCBlob() (map[shared.ToCKey]shared.ToCEntry, uint8, error) {
+	if r.v8ToCLen == 0 {
+		return make(map[shared.ToCKey]shared.ToCEntry), shared.SignalTypeTrace, nil
+	}
+	cacheKey := r.fileID + "/v8/toc/dec"
+	raw, err := r.cache.GetOrFetch(cacheKey, func() ([]byte, error) {
+		compressed, readErr := r.readRange(r.v8ToCOffset, uint64(r.v8ToCLen), rw.DataTypeMetadata) //nolint:gosec
+		if readErr != nil {
+			return nil, readErr
+		}
+		return decodeBoundedSnappy(compressed)
+	})
+	if err != nil {
+		return nil, 0, fmt.Errorf("parseV8ToCBlob: %w", err)
+	}
+
+	if len(raw) < shared.ToCBlobHeaderSize {
+		return nil, 0, fmt.Errorf("parseV8ToCBlob: blob too short: %d bytes", len(raw))
+	}
+	entryCount := binary.LittleEndian.Uint32(raw[0:])
+	signalType := raw[4] // signal_type[1]; reserved[3] at raw[5:8]
+	if signalType == 0 {
+		signalType = shared.SignalTypeTrace
+	}
+	pos := shared.ToCBlobHeaderSize
+
+	tocMap := make(map[shared.ToCKey]shared.ToCEntry, int(entryCount)) //nolint:gosec
+	for i := range entryCount {
+		e, n, parseErr := shared.UnmarshalToCEntry(raw[pos:])
+		if parseErr != nil {
+			return nil, 0, fmt.Errorf("parseV8ToCBlob: entry[%d]: %w", i, parseErr)
+		}
+		pos += n
+		tocMap[e.Key] = e
+	}
+	return tocMap, signalType, nil
+}
+
+// fetchToCSection reads and snappy-decodes the section identified by key from the V8 ToC.
+// Returns (nil, nil) when key is absent from r.tocMap (graceful degradation).
+// Results are cached via r.cache.
+func (r *Reader) fetchToCSection(key shared.ToCKey) ([]byte, error) {
+	e, ok := r.tocMap[key]
+	if !ok {
+		return nil, nil
+	}
+	cacheKey := fmt.Sprintf("%s\x00v8\x00%d\x00%d\x00%s", r.fileID, key.Type, key.SubType, key.Name)
+	raw, err := r.cache.GetOrFetch(cacheKey, func() ([]byte, error) {
+		compressed, readErr := r.readRange(e.Offset, uint64(e.Length), rw.DataTypeMetadata) //nolint:gosec
+		if readErr != nil {
+			return nil, fmt.Errorf("fetchToCSection(%v): read: %w", key, readErr)
+		}
+		dec, decErr := decodeBoundedSnappy(compressed)
+		if decErr != nil {
+			return nil, fmt.Errorf("fetchToCSection(%v): snappy: %w", key, decErr)
+		}
+		return dec, nil
+	})
+	return raw, err
+}
+
+// parseSectionsV8 initializes the V8 reader by:
+// 1. Parsing the ToC blob to build r.tocMap.
+// 2. Eagerly loading the block index (required by all block-access methods).
+// 3. Populating r.intrinsicIndex from intrinsic ToCEntries (zero I/O; offsets only).
+func (r *Reader) parseSectionsV8() error {
+	tocMap, signalType, err := r.parseV8ToCBlob()
+	if err != nil {
+		return fmt.Errorf("parseSectionsV8: ToC: %w", err)
+	}
+	r.tocMap = tocMap
+	r.signalType = signalType
+	r.fileVersion = shared.VersionBlockV14 // block format is still V14; reuse block parser
+
+	// Block index: eager (required by all block-access methods).
+	blockIdxRaw, err := r.fetchToCSection(shared.ToCKey{
+		Type:    shared.ToCTypeIndex,
+		SubType: shared.ToCSubTypeBlockIndex,
+	})
+	if err != nil {
+		return fmt.Errorf("parseSectionsV8: block_index: %w", err)
+	}
+	if len(blockIdxRaw) >= 4 {
+		blockCount := int(binary.LittleEndian.Uint32(blockIdxRaw[0:]))
+		metas, _, parseErr := parseBlockIndex(blockIdxRaw[4:], blockCount)
+		if parseErr != nil {
+			return fmt.Errorf("parseSectionsV8: block_index parse: %w", parseErr)
+		}
+		r.blockMetas = metas
+	}
+
+	// Intrinsic index: zero I/O — record offsets from ToC.
+	for key, e := range r.tocMap {
+		if key.Type == shared.ToCTypeMetadata && key.SubType == shared.ToCSubTypeIntrinsic {
+			if r.intrinsicIndex == nil {
+				r.intrinsicIndex = make(map[string]shared.IntrinsicColMeta)
+			}
+			r.intrinsicIndex[key.Name] = shared.IntrinsicColMeta{
+				Name:   key.Name,
+				Offset: e.Offset,
+				Length: e.Length,
+			}
+		}
+	}
+
+	return nil
+}
+
+// ensureV8TraceSection lazily loads the V8 compact trace index on first call.
+func (r *Reader) ensureV8TraceSection() error {
+	r.v8TraceOnce.Do(func() {
+		raw, err := r.fetchToCSection(shared.ToCKey{Type: shared.ToCTypeMetadata, SubType: shared.ToCSubTypeTrace})
+		if err != nil {
+			r.v8TraceErr = fmt.Errorf("ensureV8TraceSection: %w", err)
+			return
+		}
+		if len(raw) == 0 {
+			return
+		}
+		header, traceIdxBytes, splitErr := splitV14CompactSection(raw)
+		if splitErr != nil {
+			r.v8TraceErr = fmt.Errorf("ensureV8TraceSection: split: %w", splitErr)
+			return
+		}
+		if parseErr := r.parseCompactIndexBytesV14Header(header); parseErr != nil {
+			r.v8TraceErr = fmt.Errorf("ensureV8TraceSection: parse: %w", parseErr)
+			return
+		}
+		if traceIdxBytes != nil && r.compactParsed != nil {
+			r.compactParsed.traceIndexRaw = append([]byte(nil), traceIdxBytes...)
+		}
+	})
+	return r.v8TraceErr
+}
+
+// ensureV8TSSection lazily loads the V8 timestamp index on first call.
+func (r *Reader) ensureV8TSSection() error {
+	r.v8TSOnce.Do(func() {
+		raw, err := r.fetchToCSection(shared.ToCKey{Type: shared.ToCTypeMetadata, SubType: shared.ToCSubTypeTS})
+		if err != nil {
+			r.v8TSErr = fmt.Errorf("ensureV8TSSection: %w", err)
+			return
+		}
+		if len(raw) == 0 {
+			return
+		}
+		rawEntries, tsCount, _, tsErr := parseTSIndex(raw)
+		if tsErr != nil {
+			r.v8TSErr = fmt.Errorf("ensureV8TSSection: parse: %w", tsErr)
+			return
+		}
+		r.tsRaw = rawEntries
+		r.tsCount = tsCount
+	})
+	return r.v8TSErr
+}
+
+// ensureV8BloomSection lazily loads the V8 file bloom filter on first call.
+func (r *Reader) ensureV8BloomSection() error {
+	r.v8BloomOnce.Do(func() {
+		raw, err := r.fetchToCSection(shared.ToCKey{Type: shared.ToCTypeMetadata, SubType: shared.ToCSubTypeBloom})
+		if err != nil {
+			r.v8BloomErr = fmt.Errorf("ensureV8BloomSection: %w", err)
+			return
+		}
+		if len(raw) == 0 {
+			return
+		}
+		fb, _, fbErr := parseFileBloomSection(raw)
+		if fbErr != nil {
+			r.v8BloomErr = fmt.Errorf("ensureV8BloomSection: parse: %w", fbErr)
+			return
+		}
+		if fb != nil {
+			r.fileBloomRaw = raw
+			r.fileBloomParsed = fb
+		}
+	})
+	return r.v8BloomErr
+}
+
 // ensureV14RangeSection lazily loads the V14 range index section on first call.
 // Populates r.rangeOffsets and r.metadataBytes (which ensureRangeColumnParsed indexes into).
 // No-op for non-V14 files (rangeOffsets is already populated by parseV5MetadataLazy).
+// ensureV14RangeSection lazily loads the V14 range index section on first call.
+// Populates r.rangeOffsets and r.metadataBytes (which ensureRangeColumnParsed indexes into).
+// No-op for non-V14 files and V8 files (rangeOffsets is already populated by parseV5MetadataLazy).
 func (r *Reader) ensureV14RangeSection() error {
+	if r.footerVersion == shared.FooterV8Version {
+		// V8 files use per-column blobs; no monolithic range section to load.
+		return nil
+	}
 	if r.fileVersion != shared.VersionBlockV14 {
 		return nil
 	}
@@ -593,6 +626,9 @@ func (r *Reader) ensureV14RangeSection() error {
 //   - Phase 1 header: fileID+"/v14/compact-header"
 //   - Phase 2 trace index bytes: fileID+"/compact-trace-index" (shared with V3/V4 lean path)
 func (r *Reader) ensureV14TraceSection() error {
+	if r.footerVersion == shared.FooterV8Version {
+		return r.ensureV8TraceSection()
+	}
 	if r.fileVersion != shared.VersionBlockV14 {
 		return nil
 	}
@@ -673,6 +709,9 @@ func (r *Reader) ensureV14TraceSection() error {
 // Populates r.tsRaw and r.tsCount so BlocksInTimeRange works.
 // No-op for non-V14 files (tsRaw/tsCount are populated by parseV5MetadataLazy).
 func (r *Reader) ensureV14TSSection() error {
+	if r.footerVersion == shared.FooterV8Version {
+		return r.ensureV8TSSection()
+	}
 	if r.fileVersion != shared.VersionBlockV14 {
 		return nil
 	}
@@ -700,6 +739,10 @@ func (r *Reader) ensureV14TSSection() error {
 // Populates r.sketchIdx so ColumnSketch and FileSketchSummary work.
 // No-op for non-V14 files (sketchIdx is populated by parseV5MetadataLazy).
 func (r *Reader) ensureV14SketchSection() error {
+	if r.footerVersion == shared.FooterV8Version {
+		// V8 files use per-column sketch blobs; handled directly in ColumnSketch.
+		return nil
+	}
 	if r.fileVersion != shared.VersionBlockV14 {
 		return nil
 	}
@@ -723,6 +766,9 @@ func (r *Reader) ensureV14SketchSection() error {
 // Populates r.fileBloomRaw and r.fileBloomParsed so FileBloom and FileBloomRaw work.
 // No-op for non-V14 files (fileBloomRaw/fileBloomParsed are populated by parseV5MetadataLazy).
 func (r *Reader) ensureV14BloomSection() error {
+	if r.footerVersion == shared.FooterV8Version {
+		return r.ensureV8BloomSection()
+	}
 	if r.fileVersion != shared.VersionBlockV14 {
 		return nil
 	}

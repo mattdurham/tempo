@@ -88,7 +88,7 @@ func parseBlockHeader(data []byte) (blockHeader, error) {
 //	name_len[2] + name[name_len] + col_type[1] + data_offset[8] + compressed_len[4] + uncompressed_len[4]
 //
 // Returns entries and the new offset after the last entry.
-func parseColumnMetadataArray(data []byte, offset int, colCount int) ([]colMetaEntry, int, error) {
+func parseColumnMetadataArray(data []byte, offset, colCount int) ([]colMetaEntry, int, error) {
 	entries := make([]colMetaEntry, 0, colCount)
 	pos := offset
 

@@ -142,7 +142,7 @@ func computeColumnFilters(program *vm.Program, opts CollectOptions) (wantColumns
 	}
 	// NOTE-028: secondPassCols is nil when AllColumns=true or there is no column filter.
 	if wantColumns == nil || opts.AllColumns {
-		return
+		return wantColumns, secondPassCols
 	}
 	searchCols := searchMetaCols
 	secondPassCols = make(map[string]struct{}, len(searchCols)+len(wantColumns)+len(opts.SelectColumns)+2)
@@ -165,7 +165,7 @@ func computeColumnFilters(program *vm.Program, opts CollectOptions) (wantColumns
 	if opts.TimestampColumn != "" {
 		secondPassCols[opts.TimestampColumn] = struct{}{}
 	}
-	return
+	return wantColumns, secondPassCols
 }
 
 // Collect executes program against all blocks in r and returns matched rows.
@@ -227,7 +227,8 @@ func Collect(
 			return rows, fastQS, err
 		}
 		// SPEC-ROOT-010: slog.Warn when intrinsic fast path falls through to block scan.
-		slog.Warn("intrinsic fast path fell through to full block scan",
+		slog.Warn(
+			"intrinsic fast path fell through to full block scan",
 			"execution_path", ExecPathIntrinsicNeedBlock,
 			"total_blocks", r.BlockCount(),
 		)
@@ -1127,7 +1128,8 @@ func collectIntrinsicTopKScan(
 		endBlock = startBlock + opts.BlockCount
 	}
 	scanCount := 0
-	selected := modules_shared.ScanFlatColumnRefsFiltered(tsBlob, backward, limit,
+	selected := modules_shared.ScanFlatColumnRefsFiltered(
+		tsBlob, backward, limit,
 		func(ref modules_shared.BlockRef) bool {
 			scanCount++
 			bi := int(ref.BlockIdx)
@@ -1221,7 +1223,8 @@ func collectMixedPlain(
 	var mixedPlainRowSet vm.RowSet
 	var mixedPlainPreFnErr error
 	// Coalesce all candidate blocks for efficient batch I/O.
-	err := forEachBlockInGroups(r, blockOrder, blockCandidates, wantColumns, secondPassCols, "collectMixedPlain",
+	err := forEachBlockInGroups(
+		r, blockOrder, blockCandidates, wantColumns, secondPassCols, "collectMixedPlain",
 		func(pb parsedBlock, candidateRows []int) bool {
 			// Re-evaluate the full predicate on the first-pass block to gate second-pass decode.
 			provider := newBlockColumnProvider(pb.Block)
@@ -1311,7 +1314,8 @@ func collectMixedTopK(
 	var mixedTopKRowSet vm.RowSet
 	var mixedTopKPreFnErr error
 	// Coalesce all candidate blocks for efficient batch I/O.
-	if err := forEachBlockInGroups(r, blockOrder, blockCandidates, wantColumns, secondPassCols, "collectMixedTopK",
+	if err := forEachBlockInGroups(
+		r, blockOrder, blockCandidates, wantColumns, secondPassCols, "collectMixedTopK",
 		func(pb parsedBlock, candidateRows []int) bool {
 			// Re-evaluate the full predicate on the first-pass block to gate second-pass decode.
 			provider := newBlockColumnProvider(pb.Block)

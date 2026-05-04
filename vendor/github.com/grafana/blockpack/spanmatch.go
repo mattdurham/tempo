@@ -257,7 +257,7 @@ func (m *SpanMatch) SpanAttr(name string) (any, bool) {
 // the span with the minimum span:start is used as a proxy for name and service.
 func SpanMatchesMetadata(spans []SpanMatch) (rootName, rootService string, startNano, durationNano uint64) {
 	if len(spans) == 0 {
-		return
+		return rootName, rootService, startNano, durationNano
 	}
 
 	const maxUint64 = ^uint64(0)
@@ -326,7 +326,7 @@ func SpanMatchesMetadata(spans []SpanMatch) (rootName, rootService string, start
 	} else if maxEnd > minStart {
 		durationNano = maxEnd - minStart
 	}
-	return
+	return rootName, rootService, startNano, durationNano
 }
 
 // SpanMatchesServiceStats builds a per-service span and error count map from a slice

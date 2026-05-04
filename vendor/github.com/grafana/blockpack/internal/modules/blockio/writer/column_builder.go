@@ -15,7 +15,7 @@ type columnBuilder interface {
 	addInt64(val int64, present bool)
 	addUint64(val uint64, present bool)
 	addFloat64(val float64, present bool)
-	addBool(val bool, present bool)
+	addBool(val, present bool)
 	addBytes(val []byte, present bool)
 	// addVectorF32 stores a float32 vector for the current row.
 	// Non-vector builders implement this as a no-op.

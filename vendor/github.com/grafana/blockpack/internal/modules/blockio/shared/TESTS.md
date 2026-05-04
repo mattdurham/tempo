@@ -250,3 +250,35 @@ Back-ref: `intrinsic_pool_test.go:TestDecodeFlatPage_BytesAreCopied`
 - Both RLE codecs must cover round-trip, empty, and error paths.
 - `IsPresent` out-of-bounds must be covered (returns false, no panic).
 - `AggressiveCoalesceConfig` values must be asserted to catch accidental changes.
+
+---
+
+### SHARED-29: TestBlockRefRange_Flat
+*Added: 2026-05-04*
+
+**Scenario:** Flat column with 3 entries across 3 different blocks (blockIdx 0, 1, 2).
+Call `BlockRefRange(0)` → returns exactly 1 entry for blockIdx=0. Repeat for blockIdx=1, 2.
+Call `BlockRefRange(99)` → nil/empty (not present).
+
+**Assertions:**
+- `len(entries) == 1` for blockIdx 0, 1, 2.
+- `entries[0].Packed >> 16 == blockIdx` for each.
+- `entries[0].Pos` matches the flat-column position index (format-agnostic).
+- `BlockRefRange(99)` returns 0 entries.
+
+Back-ref: `internal/modules/blockio/shared/intrinsic_ref_index_block_test.go:TestBlockRefRange_Flat`
+
+---
+
+### SHARED-30: TestBlockRefRange_Dict
+*Added: 2026-05-04*
+
+**Scenario:** Dict column with 2 entries sharing blockIdx=0 (both map to dict entry 0 = "alpha"),
+1 entry on blockIdx=1 (maps to dict entry 1 = "beta").
+Call `BlockRefRange(0)` → 2 entries. Call `BlockRefRange(1)` → 1 entry.
+
+**Assertions:**
+- `len(entries) == 2` for blockIdx=0; both have `Packed>>16 == 0` and `Pos == 0`.
+- `len(entries) == 1` for blockIdx=1; entry has `Packed>>16 == 1` and `Pos == 1`.
+
+Back-ref: `internal/modules/blockio/shared/intrinsic_ref_index_block_test.go:TestBlockRefRange_Dict`

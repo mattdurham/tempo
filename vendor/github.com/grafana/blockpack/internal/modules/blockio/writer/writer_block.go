@@ -929,7 +929,7 @@ func (b *blockBuilder) applySpanStatus(col *modules_reader.Column, srcRowIdx, ds
 // This is the native columnar path used by the compaction writer — it bypasses
 // all OTLP proto objects, reading typed values directly from decoded columns and
 // writing them into the destination block via addPresent.
-func (b *blockBuilder) addRowFromBlock(srcBlock *modules_reader.Block, srcRowIdx int, dstRowIdx int) {
+func (b *blockBuilder) addRowFromBlock(srcBlock *modules_reader.Block, srcRowIdx, dstRowIdx int) {
 	var traceID [16]byte
 	var spanStart, spanEnd uint64
 	traceIDFound := false
@@ -1033,7 +1033,7 @@ func (b *blockBuilder) addRowFromBlock(srcBlock *modules_reader.Block, srcRowIdx
 // derives missing duration, updates min/max start/traceID, and increments spanCount.
 func (b *blockBuilder) finalizeRowBookkeeping(
 	dstRowIdx int, traceID [16]byte, traceIDFound bool,
-	spanStart uint64, spanStartFound bool, spanEnd uint64, spanEndFound bool, durationFound bool,
+	spanStart uint64, spanStartFound bool, spanEnd uint64, spanEndFound, durationFound bool,
 ) {
 	// Derive duration from start+end if source block lacked span:duration.
 	if !durationFound && spanStartFound && spanEndFound {
@@ -1590,7 +1590,8 @@ func (b *blockBuilder) finalize(blockVersion uint8) ([]byte, error) {
 
 // appendUint32LE appends a uint32 in little-endian byte order to buf.
 func appendUint32LE(buf []byte, v uint32) []byte {
-	return append(buf,
+	return append(
+		buf,
 		byte(v),     //nolint:gosec // safe: truncating uint32 bytes for LE encoding
 		byte(v>>8),  //nolint:gosec // safe: truncating uint32 bytes for LE encoding
 		byte(v>>16), //nolint:gosec // safe: truncating uint32 bytes for LE encoding

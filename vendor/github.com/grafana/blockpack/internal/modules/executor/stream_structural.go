@@ -7,7 +7,6 @@ import (
 	"slices"
 
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
-	modules_shared "github.com/grafana/blockpack/internal/modules/blockio/shared"
 	"github.com/grafana/blockpack/internal/modules/queryplanner"
 	"github.com/grafana/blockpack/internal/traceqlparser"
 	"github.com/grafana/blockpack/internal/vm"
@@ -295,22 +294,17 @@ func collectBlockStructuralSpanRecs(
 		nodesList = collectStructuralIntrinsicNodes(programs, intrinsicWant)
 	}
 
-	// Resolve identity fields. For files with an intrinsic section, use lookupIntrinsicFieldsTyped.
+	// Resolve identity fields. For files with an intrinsic section, use
+	// lookupIntrinsicFieldsTypedForBlock (NOTE-100): one binary search per column instead
+	// of one per span, eliminating the allRefs allocation and O(N×log(B×N)) binary searches.
 	// For legacy files, read identity columns directly from decoded block columns.
 	// NOTE-081: typed struct eliminates per-row map allocations in the structural hot path.
 	var idFields []intrinsicRowFields
 	if hasIntrinsic {
-		allRefs := make([]modules_shared.BlockRef, n)
-		for i := range n {
-			allRefs[i] = modules_shared.BlockRef{
-				BlockIdx: uint16(blockIdx), //nolint:gosec // safe: blockIdx bounded by file block count (<65535)
-				RowIdx:   uint16(i),        //nolint:gosec // safe: i bounded by SpanCount (<65535)
-			}
-		}
 		var intrinsicErr error
-		idFields, intrinsicErr = lookupIntrinsicFieldsTyped(r, allRefs, intrinsicWant)
+		idFields, intrinsicErr = lookupIntrinsicFieldsTypedForBlock(r, uint16(blockIdx), n, intrinsicWant) //nolint:gosec // safe: blockIdx bounded by file block count (<65535)
 		if intrinsicErr != nil {
-			return fmt.Errorf("structural lookupIntrinsicFieldsTyped block %d: %w", blockIdx, intrinsicErr)
+			return fmt.Errorf("structural lookupIntrinsicFieldsTypedForBlock block %d: %w", blockIdx, intrinsicErr)
 		}
 	} else {
 		idFields = identityFieldsFromBlockColsTyped(bwb.Block, n)
