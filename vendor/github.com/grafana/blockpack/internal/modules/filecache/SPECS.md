@@ -59,3 +59,22 @@ independently (OS filesystem handles concurrency). Concurrent fetches for the sa
 uncached key are deduplicated via `singleflight`.
 
 Back-ref: `internal/modules/filecache/filecache.go:FileCache`
+
+## SPEC-FC-006: FileCache Duration Histogram
+
+When `Config.Registerer` is non-nil, `Open` registers:
+
+- `blockpack_cache_operation_duration_seconds` (native HistogramVec,
+  labels: `tier`, `operation`, `result`)
+  — `tier="disk"`, `operation` ∈ {"get", "put"}, `result` ∈ {"hit", "miss", "ok"}.
+  `NativeHistogramBucketFactor=1.1`, `NativeHistogramMaxBucketNumber=100`.
+
+This metric is shared by memorycache ("memory") and memcache ("remote") under the same
+metric name; each package registers with a different `tier` label value. All three packages
+use `registerOrReuse`-style helpers so the same `Registerer` can be passed to all three
+without `AlreadyRegisteredError`.
+
+Pre-resolved observers (`durGetHit`, `durGetMiss`, `durPutOk`) are set once at Open time.
+The hot path calls `observer.Observe(elapsed)` directly — 0-alloc after bucket stabilization.
+
+Back-ref: `internal/modules/filecache/filecache.go:Open`

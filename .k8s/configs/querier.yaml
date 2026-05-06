@@ -101,6 +101,8 @@ storage:
                 embedding_batch_size: 128
                 memcache_servers:
                     - memcached-01.tempo-dev-test-03.svc.cluster.local:11211
+                metadata_memcache_servers:
+                    - memcached-blockpack-page-01.tempo-dev-test-03.svc.cluster.local:11211
                 file_cache_path: /var/tempo/blockpack-cache
                 file_cache_max_bytes: 8589934592  # 8 GiB (80% of 10 GiB emptyDir)
             version: vblockpack

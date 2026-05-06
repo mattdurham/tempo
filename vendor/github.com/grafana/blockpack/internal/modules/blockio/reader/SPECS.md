@@ -341,17 +341,17 @@ I/O cost of reading the full SectionTraceIndex blob on every `BlocksForTraceID` 
 
 `ensureV14TraceSection` (called at most once per Reader via `v14TraceOnce`):
 
-1. Probes `cache.GetOrFetch(fileID+"/v14/compact-header", ...)` to obtain the cached
+1. Probes `r.cache.GetOrFetchBloom(fileID, true, ...)` to obtain the cached
    header bytes.
-   - **Cold-miss path:** The `GetOrFetch` closure runs; invokes `readV14Section(SectionTraceIndex)`
+   - **Cold-miss path:** The `GetOrFetchBloom` closure runs; invokes `readV14Section(SectionTraceIndex)`
      to fetch and decompress the full section blob, passes it to `splitV14CompactSection` to
      locate the header/trace-index split, copies and returns the header bytes, and captures
      `traceIdxBytes` from the split result. No provider I/O occurs for subsequent calls.
-   - **Warm-hit path:** The `GetOrFetch` closure does NOT run; `readV14Section` is never
-     called. `traceIdxBytes` remains nil after `GetOrFetch` returns.
+   - **Warm-hit path:** The `GetOrFetchBloom` closure does NOT run; `readV14Section` is never
+     called. `traceIdxBytes` remains nil after `GetOrFetchBloom` returns.
 2. Passes the header bytes to `parseCompactIndexBytesV14Header` to parse the bloom filter
    and block table from the header.
-3. The header is cached under `fileID+"/v14/compact-header"` by the `GetOrFetch` call.
+3. The header is cached under `fileID+"/v14/compact-header"` by the `GetOrFetchBloom` call.
 4. Calls `parseCompactIndexBytesV14Header(header)` which sets:
    - `r.compactParsed.blockTable` — file offsets for each internal block.
    - `r.compactParsed.traceIDBloom` — the trace ID bloom filter bytes.
@@ -359,7 +359,7 @@ I/O cost of reading the full SectionTraceIndex blob on every `BlocksForTraceID` 
 5. Also populates `r.blockMetas` if not already set.
 6. On a cold cache miss, also pre-populates `compactParsed.traceIndexRaw` from the same
    read (the trace index sub-slice is already in memory after `splitV14CompactSection`)
-   (NOTE-014). On a warm cache hit, probes `r.cache.Get` for the section blob
+   (NOTE-014). On a warm cache hit, probes `r.cache.GetV14Section` for the section blob
    (`fileID+"/v14/sec/03/dec"`). If the blob is in-memory, splits it to pre-populate
    `traceIndexRaw` (zero I/O). If the blob was evicted, leaves `traceIndexRaw` nil —
    `ensureTraceIndexRaw` will fetch it on the first bloom hit (NOTE-015).
@@ -376,7 +376,7 @@ remains nil and phase 2 (`ensureTraceIndexRaw`) fetches it on the first bloom hi
 `ensureTraceIndexRaw` (called via `traceIndexOnce`):
 
 1. Detects `compactParsed.isV14TraceSection == true`.
-2. Fetches the trace index bytes via `cache.GetOrFetch(fileID+"/compact-trace-index", ...)`.
+2. Fetches the trace index bytes via `r.cache.GetOrFetchTraceIndex(fileID, false, ...)`.
    The fetch function re-invokes `readV14Section(SectionTraceIndex)` (the full decompressed
    blob is cached by `readV14Section` under `fileID+"/v14/sec/03/dec"`), then calls
    `splitV14CompactSection` and returns the trace index sub-slice copied into a fresh buffer.
@@ -388,6 +388,13 @@ remains nil and phase 2 (`ensureTraceIndexRaw`) fetches it on the first bloom hi
 network round-trip after the first call.
 
 ### Cache Key Mapping
+
+**Note (as of 2026-05-05):** The reader uses `sectioncache.SectionCache` internally.
+The table below documents keys used in the V14 compact trace section paths.
+`FilecacheAdapter` in `internal/modules/sectioncache/sectioncache.go` is the authoritative
+source of truth for all key formats. When adding new cache operations, add a typed method
+to `sectioncache.SectionCache`, implement it in `FilecacheAdapter` and `TypedTieredCache`,
+and add a routing test in `typed_test.go`.
 
 | Cache key                          | Contents                                    | Written by                  |
 |------------------------------------|---------------------------------------------|-----------------------------|
@@ -417,10 +424,10 @@ Back-ref: `internal/modules/blockio/reader/trace_index.go:splitV14CompactSection
 **Invariant:** `ReadGroup` and `ReadBlocks` must never call `ReadCoalescedBlocks` or
 `provider.ReadAt` without first checking `r.cache`. The canonical implementation:
 
-1. For each `blockID` in the group, probe `r.cache.Get(fileID+"/block/"+blockID)`.
+1. For each `blockIdx` in the group, probe `r.cache.GetBlockColumns(fileID, blockIdx)`.
 2. If all blocks hit: return the cached slices — zero S3 I/O.
 3. On any miss: call `ReadCoalescedBlocks` for the full group, store every fetched block via
-   `r.cache.Put(fileID+"/block/"+blockID, data)`, then return.
+   `r.cache.CacheBlockColumns(fileID, blockIdx, data)`, then return.
 
 The `r.fileID == ""` guard bypasses the cache (no stable key) — callers that construct a
 `Reader` without a fileID explicitly opt out of block-level caching.
@@ -436,3 +443,18 @@ next read re-fetches from S3 — degraded performance but not incorrect behavior
 
 Back-ref: `internal/modules/blockio/reader/reader.go:Reader.ReadGroup`,
 `internal/modules/blockio/reader/reader.go:Reader.ReadBlocks`
+
+---
+
+## SPEC-RDR-012: r.cache must be non-nil SectionCache
+
+`Reader.cache` must always be a non-nil `sectioncache.SectionCache`. The constructor
+ensures this by normalizing `opts.Cache`:
+- `opts.Cache == nil` → `sectioncache.NopSectionCache`
+- `opts.Cache` is assigned directly as `r.cache`
+
+The block cache methods used in `ReadGroup` are `r.cache.GetBlockColumns` and
+`r.cache.CacheBlockColumns`. The key format is documented in `FilecacheAdapter`;
+typed implementations reconstruct it internally.
+
+Back-ref: `internal/modules/blockio/reader/reader.go:Reader.ReadGroup`

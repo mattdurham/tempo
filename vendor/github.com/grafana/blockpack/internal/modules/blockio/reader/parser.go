@@ -87,10 +87,8 @@ func (r *Reader) readFooter() error {
 		return fmt.Errorf("file too small for footer: %d bytes", r.fileSize)
 	}
 
-	cacheKey := r.fileID + "/footer"
-
 	// Read the last 18 bytes once; use them for both V8 and V7 detection (same size, same offset).
-	if ok, err := r.tryReadFooterMagic18(cacheKey); err != nil {
+	if ok, err := r.tryReadFooterMagic18(); err != nil {
 		return err
 	} else if ok {
 		return nil
@@ -100,15 +98,15 @@ func (r *Reader) readFooter() error {
 		return fmt.Errorf("file too small for v3/v4/v5/v6 footer: %d bytes", r.fileSize)
 	}
 
-	return r.readFooterLegacy(cacheKey)
+	return r.readFooterLegacy()
 }
 
 // tryReadFooterMagic18 reads the last 18 bytes and checks for a V8 footer.
 // If magic matches but version != V8, an error is returned (V7 is not supported).
 // Returns (false, nil) when magic is absent, allowing legacy detection to proceed.
-func (r *Reader) tryReadFooterMagic18(cacheKey string) (bool, error) {
+func (r *Reader) tryReadFooterMagic18() (bool, error) {
 	off := r.fileSize - int64(shared.FooterV8Size) // 18-byte footer
-	buf, err := r.cache.GetOrFetch(cacheKey+"/v78", func() ([]byte, error) {
+	buf, err := r.cache.GetOrFetchFooter(r.fileID, "/v78", func() ([]byte, error) {
 		b := make([]byte, shared.FooterV8Size)
 		n, readErr := r.provider.ReadAt(b, off, rw.DataTypeFooter)
 		if readErr != nil {
@@ -140,11 +138,11 @@ func (r *Reader) tryReadFooterMagic18(cacheKey string) (bool, error) {
 // 18 bytes once and dispatches to both V7 and V8 detection in a single I/O.
 
 // readFooterLegacy handles V3/V4/V5/V6 footer detection for non-V7 files.
-func (r *Reader) readFooterLegacy(cacheKey string) error {
+func (r *Reader) readFooterLegacy() error {
 	// Try v6 first: only possible if file is large enough.
 	// V6 contains V5 at offset (FooterV6Size - FooterV5Size) = 12.
 	if r.fileSize >= int64(shared.FooterV6Size) {
-		if ok, err := r.tryReadFooterV6(cacheKey); err != nil {
+		if ok, err := r.tryReadFooterV6(); err != nil {
 			return err
 		} else if ok {
 			return nil
@@ -154,7 +152,7 @@ func (r *Reader) readFooterLegacy(cacheKey string) error {
 	// Try v5: only possible if file is large enough (and too small for v6).
 	// V5 contains V4 at offset (FooterV5Size - FooterV4Size) = 12.
 	if r.fileSize >= int64(shared.FooterV5Size) {
-		if ok, err := r.tryReadFooterV5(cacheKey); err != nil {
+		if ok, err := r.tryReadFooterV5(); err != nil {
 			return err
 		} else if ok {
 			return nil
@@ -163,7 +161,7 @@ func (r *Reader) readFooterLegacy(cacheKey string) error {
 
 	// Try v4: only possible if file is large enough (and file is too small for v5).
 	if r.fileSize >= int64(shared.FooterV4Size) {
-		if ok, err := r.tryReadFooterV4(cacheKey); err != nil {
+		if ok, err := r.tryReadFooterV4(); err != nil {
 			return err
 		} else if ok {
 			return nil
@@ -171,7 +169,7 @@ func (r *Reader) readFooterLegacy(cacheKey string) error {
 	}
 
 	// Fall back to V3.
-	return r.readFooterV3(cacheKey)
+	return r.readFooterV3()
 }
 
 // Legacy footer field byte offsets within the footer buffer.
@@ -225,10 +223,10 @@ func (r *Reader) applyLegacyFooterCommon(buf []byte) error {
 }
 
 // tryReadFooterV6 attempts to detect and parse a V6 (or embedded V5) footer.
-func (r *Reader) tryReadFooterV6(cacheKey string) (bool, error) {
+func (r *Reader) tryReadFooterV6() (bool, error) {
 	const v5InV6Off = int(shared.FooterV6Size - shared.FooterV5Size) // = 12
 	off := r.fileSize - int64(shared.FooterV6Size)
-	buf, err := r.cache.GetOrFetch(cacheKey+"/v6", func() ([]byte, error) {
+	buf, err := r.cache.GetOrFetchFooter(r.fileID, "/v6", func() ([]byte, error) {
 		b := make([]byte, shared.FooterV6Size)
 		n, readErr := r.provider.ReadAt(b, off, rw.DataTypeFooter)
 		if readErr != nil {
@@ -266,10 +264,10 @@ func (r *Reader) tryReadFooterV6(cacheKey string) (bool, error) {
 }
 
 // tryReadFooterV5 attempts to detect and parse a V5 (or embedded V4) footer.
-func (r *Reader) tryReadFooterV5(cacheKey string) (bool, error) {
+func (r *Reader) tryReadFooterV5() (bool, error) {
 	const v4InV5Off = int(shared.FooterV5Size - shared.FooterV4Size) // = 12
 	off := r.fileSize - int64(shared.FooterV5Size)
-	buf, err := r.cache.GetOrFetch(cacheKey+"/v5", func() ([]byte, error) {
+	buf, err := r.cache.GetOrFetchFooter(r.fileID, "/v5", func() ([]byte, error) {
 		b := make([]byte, shared.FooterV5Size)
 		n, readErr := r.provider.ReadAt(b, off, rw.DataTypeFooter)
 		if readErr != nil {
@@ -303,9 +301,9 @@ func (r *Reader) tryReadFooterV5(cacheKey string) (bool, error) {
 }
 
 // tryReadFooterV4 attempts to detect and parse a standalone V4 footer.
-func (r *Reader) tryReadFooterV4(cacheKey string) (bool, error) {
+func (r *Reader) tryReadFooterV4() (bool, error) {
 	off := r.fileSize - int64(shared.FooterV4Size)
-	buf, err := r.cache.GetOrFetch(cacheKey+"/v4", func() ([]byte, error) {
+	buf, err := r.cache.GetOrFetchFooter(r.fileID, "/v4", func() ([]byte, error) {
 		b := make([]byte, shared.FooterV4Size)
 		n, readErr := r.provider.ReadAt(b, off, rw.DataTypeFooter)
 		if readErr != nil {
@@ -329,9 +327,9 @@ func (r *Reader) tryReadFooterV4(cacheKey string) (bool, error) {
 }
 
 // readFooterV3 reads and parses a V3 footer (the minimum supported format).
-func (r *Reader) readFooterV3(cacheKey string) error {
+func (r *Reader) readFooterV3() error {
 	off := r.fileSize - int64(shared.FooterV3Size)
-	buf, err := r.cache.GetOrFetch(cacheKey, func() ([]byte, error) {
+	buf, err := r.cache.GetOrFetchFooter(r.fileID, "", func() ([]byte, error) {
 		b := make([]byte, shared.FooterV3Size)
 		n, readErr := r.provider.ReadAt(b, off, rw.DataTypeFooter)
 		if readErr != nil {
@@ -375,8 +373,7 @@ func (r *Reader) readV14Section(sectionType uint8) ([]byte, error) {
 	if !ok {
 		return nil, nil
 	}
-	cacheKey := fmt.Sprintf("%s/v14/sec/%02x/dec", r.fileID, sectionType)
-	raw, err := r.cache.GetOrFetch(cacheKey, func() ([]byte, error) {
+	raw, err := r.cache.GetOrFetchV14Section(r.fileID, sectionType, func() ([]byte, error) {
 		compressed, readErr := r.readRange(e.Offset, uint64(e.CompressedLen), rw.DataTypeMetadata) //nolint:gosec
 		if readErr != nil {
 			return nil, fmt.Errorf("section 0x%02X read: %w", sectionType, readErr)
@@ -396,8 +393,7 @@ func (r *Reader) parseV8ToCBlob() (map[shared.ToCKey]shared.ToCEntry, uint8, err
 	if r.v8ToCLen == 0 {
 		return make(map[shared.ToCKey]shared.ToCEntry), shared.SignalTypeTrace, nil
 	}
-	cacheKey := r.fileID + "/v8/toc/dec"
-	raw, err := r.cache.GetOrFetch(cacheKey, func() ([]byte, error) {
+	raw, err := r.cache.GetOrFetchV8TOC(r.fileID, func() ([]byte, error) {
 		compressed, readErr := r.readRange(r.v8ToCOffset, uint64(r.v8ToCLen), rw.DataTypeMetadata) //nolint:gosec
 		if readErr != nil {
 			return nil, readErr
@@ -438,8 +434,7 @@ func (r *Reader) fetchToCSection(key shared.ToCKey) ([]byte, error) {
 	if !ok {
 		return nil, nil
 	}
-	cacheKey := fmt.Sprintf("%s\x00v8\x00%d\x00%d\x00%s", r.fileID, key.Type, key.SubType, key.Name)
-	raw, err := r.cache.GetOrFetch(cacheKey, func() ([]byte, error) {
+	raw, err := r.cache.GetOrFetchV8Section(r.fileID, key.Type, key.SubType, key.Name, func() ([]byte, error) {
 		compressed, readErr := r.readRange(e.Offset, uint64(e.Length), rw.DataTypeMetadata) //nolint:gosec
 		if readErr != nil {
 			return nil, fmt.Errorf("fetchToCSection(%v): read: %w", key, readErr)
@@ -575,10 +570,8 @@ func (r *Reader) ensureV8BloomSection() error {
 
 // ensureV14RangeSection lazily loads the V14 range index section on first call.
 // Populates r.rangeOffsets and r.metadataBytes (which ensureRangeColumnParsed indexes into).
-// No-op for non-V14 files (rangeOffsets is already populated by parseV5MetadataLazy).
-// ensureV14RangeSection lazily loads the V14 range index section on first call.
-// Populates r.rangeOffsets and r.metadataBytes (which ensureRangeColumnParsed indexes into).
 // No-op for non-V14 files and V8 files (rangeOffsets is already populated by parseV5MetadataLazy).
+// No-op for V3/V4/V5 files without a V14 section directory.
 func (r *Reader) ensureV14RangeSection() error {
 	if r.footerVersion == shared.FooterV8Version {
 		// V8 files use per-column blobs; no monolithic range section to load.
@@ -637,13 +630,11 @@ func (r *Reader) ensureV14TraceSection() error {
 		// pre-populate traceIndexRaw from the same read to avoid a second I/O in
 		// ensureTraceIndexRaw on bloom hit.
 		// Cache key for the small header: separate from "/v14/sec/03/dec" (the full section).
-		headerKey := r.fileID + "/v14/compact-header"
-
 		// Read the full section once and split both halves. We store traceIdx directly on
 		// compactParsed after parseCompactIndexBytesV14Header sets it up, so ensureTraceIndexRaw
 		// finds traceIndexRaw already populated and skips its own provider read.
 		var traceIdxBytes []byte
-		headerBytes, err := r.cache.GetOrFetch(headerKey, func() ([]byte, error) {
+		headerBytes, err := r.cache.GetOrFetchBloom(r.fileID, true, func() ([]byte, error) {
 			raw, readErr := r.readV14Section(shared.SectionTraceIndex)
 			if readErr != nil {
 				return nil, readErr
@@ -688,8 +679,7 @@ func (r *Reader) ensureV14TraceSection() error {
 		// ensureTraceIndexRaw will perform the provider read on the first actual bloom hit,
 		// preserving phase-2 laziness.
 		if traceIdxBytes == nil && r.fileID != "" {
-			sectionKey := fmt.Sprintf("%s/v14/sec/%02x/dec", r.fileID, shared.SectionTraceIndex)
-			if cached, ok, _ := r.cache.Get(sectionKey); ok && len(cached) > 0 {
+			if cached, ok, _ := r.cache.GetV14Section(r.fileID, shared.SectionTraceIndex); ok && len(cached) > 0 {
 				// Error intentionally discarded: this is opportunistic pre-population on cache hit.
 				// ensureTraceIndexRaw (called on the first bloom hit) is the authoritative error path.
 				_, traceIdxBytes, _ = splitV14CompactSection(cached)
@@ -797,9 +787,7 @@ func (r *Reader) ensureV14BloomSection() error {
 // readHeader reads the 22-byte file header at footer.headerOffset.
 // Layout: magic[4] + version[1] + metadataOffset[8] + metadataLen[8] + signalType[1].
 func (r *Reader) readHeader() error {
-	cacheKey := r.fileID + "/header"
-
-	buf, err := r.cache.GetOrFetch(cacheKey, func() ([]byte, error) {
+	buf, err := r.cache.GetOrFetchHeader(r.fileID, func() ([]byte, error) {
 		b := make([]byte, shared.FileHeaderV13Size)
 		n, readErr := r.provider.ReadAt(
 			b,
@@ -869,8 +857,7 @@ func (r *Reader) parseV5MetadataLazy() error {
 	// NOTE-PERF: We cache the *decompressed* metadata bytes under a distinct key
 	// ("/metadata/dec") so snappy.Decode runs only on a cache miss, not on every
 	// Reader creation.
-	cacheKey := r.fileID + "/metadata/dec"
-	data, err := r.cache.GetOrFetch(cacheKey, func() ([]byte, error) {
+	data, err := r.cache.GetOrFetchMetadata(r.fileID, func() ([]byte, error) {
 		compressed, readErr := r.readRange(r.metadataOffset, r.metadataLen, rw.DataTypeMetadata)
 		if readErr != nil {
 			return nil, readErr
