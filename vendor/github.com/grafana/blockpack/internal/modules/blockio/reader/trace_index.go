@@ -428,8 +428,7 @@ func (r *Reader) ensureCompactHeaderParsed() error {
 	// phase1Len = bloom_bytes_field(4) + bloom_data + block_table
 	// For version 1 (no bloom): just the block_table portion after the 9-byte header.
 	need := bloomBytes + blockCount*12
-	cacheKey := r.fileID + "/compact-header"
-	bodyData, err := r.cache.GetOrFetch(cacheKey, func() ([]byte, error) {
+	bodyData, err := r.cache.GetOrFetchBloom(r.fileID, false, func() ([]byte, error) {
 		bodyOffset := r.compactOffset + uint64( //nolint:gosec // pos is small, fits in uint64
 			pos,
 		)
@@ -503,8 +502,7 @@ func (r *Reader) ensureCompactHeaderParsed() error {
 // The trace index is stored separately and located via compactTracesOffset/compactTracesLen.
 func (r *Reader) ensureCompactHeaderParsedV3() error {
 	// Read the entire compact header section (raw, uncompressed, small — ~15 MB max).
-	cacheKey := r.fileID + "/compact-header"
-	data, err := r.cache.GetOrFetch(cacheKey, func() ([]byte, error) {
+	data, err := r.cache.GetOrFetchBloom(r.fileID, false, func() ([]byte, error) {
 		return r.readRange(r.compactOffset, uint64(r.compactLen), rw.DataTypeTraceBloomFilter) //nolint:gosec
 	})
 	if err != nil {
@@ -615,8 +613,7 @@ func (r *Reader) ensureTraceIndexRaw() error {
 	}
 
 	r.compactParsed.traceIndexOnce.Do(func() {
-		cacheKey := r.fileID + "/compact-trace-index"
-		data, err := r.cache.GetOrFetch(cacheKey, func() ([]byte, error) {
+		data, err := r.cache.GetOrFetchTraceIndex(r.fileID, false, func() ([]byte, error) {
 			if r.compactParsed.isV14TraceSection {
 				// V14: re-read the full trace section and extract trace index bytes.
 				raw, readErr := r.readV14Section(shared.SectionTraceIndex)
@@ -688,13 +685,24 @@ func (r *Reader) ensureTraceIndexRaw() error {
 // ensureCompactIndexParsed lazily parses the compact trace index.
 // Supports version 1 (no bloom), version 2 (with trace ID bloom filter), and
 // version 3 (v6 footer split format: bloom header uncompressed, trace index snappy-compressed).
+// SPEC-ROOT-001: guarded by compactParsedOnce to prevent concurrent write to r.compactParsed.
 func (r *Reader) ensureCompactIndexParsed() error {
-	if r.compactParsed != nil {
-		return nil
-	}
-
 	if r.compactLen == 0 {
 		return fmt.Errorf("compact index: not present")
+	}
+	r.compactParsedOnce.Do(func() {
+		r.compactParsedErr = r.initCompactIndex()
+	})
+	return r.compactParsedErr
+}
+
+// initCompactIndex performs the actual initialization of r.compactParsed.
+// Must only be called from inside r.compactParsedOnce.Do.
+func (r *Reader) initCompactIndex() error {
+	// No-op if already initialized by the constructor path (ensureCompactHeaderParsed,
+	// parseCompactIndexBytesV14Header, or ensureCompactHeaderParsedV3).
+	if r.compactParsed != nil {
+		return nil
 	}
 
 	// V3 split format (footer V6): parse the compact header section then eagerly fetch
@@ -708,9 +716,7 @@ func (r *Reader) ensureCompactIndexParsed() error {
 	}
 
 	// V1/V2 legacy format.
-	cacheKey := r.fileID + "/compact"
-
-	data, err := r.cache.GetOrFetch(cacheKey, func() ([]byte, error) {
+	data, err := r.cache.GetOrFetchTraceIndex(r.fileID, true, func() ([]byte, error) {
 		return r.readRange(r.compactOffset, uint64(r.compactLen), rw.DataTypeTraceBloomFilter)
 	})
 	if err != nil {

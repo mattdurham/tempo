@@ -20,6 +20,7 @@ import (
 	modules_memcache "github.com/grafana/blockpack/internal/modules/memcache"
 	modules_memorycache "github.com/grafana/blockpack/internal/modules/memorycache"
 	modules_rw "github.com/grafana/blockpack/internal/modules/rw"
+	modules_sectioncache "github.com/grafana/blockpack/internal/modules/sectioncache"
 	modules_tieredcache "github.com/grafana/blockpack/internal/modules/tieredcache"
 	vm "github.com/grafana/blockpack/internal/vm"
 )
@@ -192,50 +193,57 @@ func NewChainedCache(tiers ...Cache) *ChainedCache {
 	return modules_chaincache.New(tiers...)
 }
 
-// TieredCache routes cache operations to one of two sub-caches based on key content:
-//   - Raw block data keys (*/block/<decimal-integer>) → dataCache
-//   - Metadata keys (footer, header, sections, trace index, etc.) → metadataCache
-//
-// This enables separate storage strategies for large infrequently-reused block data
-// (e.g. pod-local memcache) and small frequently-reused metadata (e.g. shared remote memcache).
-// Construct one with NewTieredCache.
-type TieredCache = modules_tieredcache.TieredCache
+// TypedConfig holds one cache per section type for TypedTieredCache.
+// Use DefaultTypedConfig for the recommended tier mapping, or set each field individually.
+type TypedConfig = modules_tieredcache.TypedConfig
 
-// NewTieredCache creates a TieredCache routing metadata keys to metadataCache and
-// raw block data keys to dataCache. Use NewChainedCache to compose each sub-cache
-// from individual tiers (MemoryCache, FileCache, MemCache).
+// TypedTieredCache routes cache operations to one of seven sub-caches based on
+// section type (Footer, TOC, Bloom, Metadata, TraceIdx, Block, Intrinsic).
+// It implements sectioncache.SectionCache via typed method dispatch — no key parsing.
+// Prefer this over the deprecated NewTieredCache binary router.
+type TypedTieredCache = modules_tieredcache.TypedTieredCache
+
+// DefaultTypedConfig returns a TypedConfig with the recommended tier mapping:
+//   - mem: Footer, TOC, Bloom, Block, Intrinsic (low-latency, high-reuse small blobs)
+//   - disk: Metadata, TraceIdx (large blobs; disk round-trip acceptable)
 //
-// The shared MemoryCache and FileCache tiers may safely be passed to both chains —
-// their Close methods are no-ops, so double-close on TieredCache.Close() is safe.
+// Example:
 //
-// Example — separate remote caches for metadata and data:
-//
-//	mem, _        := blockpack.NewMemoryCache(blockpack.MemoryCacheConfig{MaxBytes: 256 << 20})
-//	disk, _       := blockpack.OpenFileCache(blockpack.FileCacheConfig{Path: "/var/cache/bp", MaxBytes: 10 << 30, Enabled: true})
-//	metaRemote, _ := blockpack.OpenMemCache(blockpack.MemCacheConfig{Servers: []string{"shared-meta:11211"}, Enabled: true})
-//	dataRemote, _ := blockpack.OpenMemCache(blockpack.MemCacheConfig{Servers: []string{"pod-local-data:11211"}, Enabled: true})
-//
-//	tiered := blockpack.NewTieredCache(
-//	    blockpack.NewChainedCache(mem, disk, metaRemote), // metadata: shared remote
-//	    blockpack.NewChainedCache(mem, disk, dataRemote), // data: pod-local
-//	)
+//	mem, _  := blockpack.NewMemoryCache(blockpack.MemoryCacheConfig{MaxBytes: 256 << 20})
+//	disk, _ := blockpack.OpenFileCache(blockpack.FileCacheConfig{Path: "/var/cache/bp", MaxBytes: 10 << 30, Enabled: true})
+//	tiered  := blockpack.NewTypedTieredCache(blockpack.DefaultTypedConfig(mem, disk))
 //	reader, _ := blockpack.NewReaderWithCache(provider, fileID, tiered)
-func NewTieredCache(metadataCache, dataCache Cache) *TieredCache {
-	return modules_tieredcache.New(metadataCache, dataCache)
+func DefaultTypedConfig(mem, disk Cache) TypedConfig {
+	return modules_tieredcache.DefaultTypedConfig(mem, disk)
 }
 
-// NewTieredCacheWithRegisterer creates a TieredCache like NewTieredCache but also
-// registers Prometheus counters with reg:
-//   - blockpack_tiered_cache_requests_total{tier, operation, result}
-//   - blockpack_tiered_cache_bytes_total{tier, operation}
-//
-// Pass prometheus.DefaultRegisterer to publish metrics to the default registry.
-// Pass a prometheus.WrapRegistererWith result to add constant labels.
-func NewTieredCacheWithRegisterer(metadataCache, dataCache Cache, reg prometheus.Registerer) *TieredCache {
-	return modules_tieredcache.NewTieredCacheWithConfig(modules_tieredcache.Config{
-		Metadata:   metadataCache,
-		Data:       dataCache,
-		Registerer: reg,
+// NewTypedTieredCache constructs a TypedTieredCache from cfg.
+// Nil sub-cache fields are normalized to NopCache.
+func NewTypedTieredCache(cfg TypedConfig) *TypedTieredCache {
+	return modules_tieredcache.NewTypedTieredCache(cfg)
+}
+
+// SectionCache is the typed cache interface used internally by Reader.
+// TypedTieredCache implements this interface. Pass a *TypedTieredCache directly
+// to NewReaderWithSectionCache / NewLeanReaderWithSectionCache to bypass
+// the FilecacheAdapter wrapping layer used by NewReaderWithCache.
+type SectionCache = modules_sectioncache.SectionCache
+
+// NewReaderWithSectionCache creates a Reader using a SectionCache directly.
+// Use this when passing a *TypedTieredCache to avoid the FilecacheAdapter wrapper.
+func NewReaderWithSectionCache(provider ReaderProvider, fileID string, sc SectionCache) (*Reader, error) {
+	return modules_reader.NewReaderFromProviderWithOptions(provider, modules_reader.Options{
+		Cache:  sc,
+		FileID: fileID,
+	})
+}
+
+// NewLeanReaderWithSectionCache creates a lean Reader using a SectionCache directly.
+// Use this when passing a *TypedTieredCache to avoid the FilecacheAdapter wrapper.
+func NewLeanReaderWithSectionCache(provider ReaderProvider, fileID string, sc SectionCache) (*Reader, error) {
+	return modules_reader.NewLeanReaderFromProviderWithOptions(provider, modules_reader.Options{
+		Cache:  sc,
+		FileID: fileID,
 	})
 }
 
@@ -272,8 +280,12 @@ func NewReaderFromProvider(provider ReaderProvider) (*Reader, error) {
 // A nil cache falls back to uncached reads. cache may be any Cache implementation:
 // FileCache, MemoryCache, MemCache, or a ChainedCache.
 func NewReaderWithCache(provider ReaderProvider, fileID string, cache Cache) (*Reader, error) {
+	var sc modules_sectioncache.SectionCache
+	if cache != nil {
+		sc = modules_sectioncache.NewFilecacheAdapter(cache)
+	}
 	return modules_reader.NewReaderFromProviderWithOptions(provider, modules_reader.Options{
-		Cache:  cache,
+		Cache:  sc,
 		FileID: fileID,
 	})
 }
@@ -292,8 +304,12 @@ func NewLeanReaderFromProvider(provider ReaderProvider) (*Reader, error) {
 // but caches footer and section reads. fileID must uniquely identify the file within the cache namespace.
 // cache may be any Cache implementation: FileCache, MemoryCache, MemCache, or ChainedCache.
 func NewLeanReaderWithCache(provider ReaderProvider, fileID string, cache Cache) (*Reader, error) {
+	var sc modules_sectioncache.SectionCache
+	if cache != nil {
+		sc = modules_sectioncache.NewFilecacheAdapter(cache)
+	}
 	return modules_reader.NewLeanReaderFromProviderWithOptions(provider, modules_reader.Options{
-		Cache:  cache,
+		Cache:  sc,
 		FileID: fileID,
 	})
 }

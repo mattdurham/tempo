@@ -21,6 +21,7 @@ import (
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
 	modules_embedder "github.com/grafana/blockpack/internal/modules/embedder"
 	modules_rw "github.com/grafana/blockpack/internal/modules/rw"
+	modules_sectioncache "github.com/grafana/blockpack/internal/modules/sectioncache"
 	"github.com/grafana/blockpack/internal/otlpconvert"
 	"github.com/grafana/blockpack/internal/s3provider"
 	vm "github.com/grafana/blockpack/internal/vm"
@@ -207,8 +208,12 @@ func GetBlockMetaWithCache(path string, storage Storage, cache *FileCache) (meta
 	}()
 
 	provider := &storageReaderProvider{storage: storage, path: path}
+	var sc modules_sectioncache.SectionCache
+	if cache != nil {
+		sc = modules_sectioncache.NewFilecacheAdapter(cache)
+	}
 	r, readerErr := modules_reader.NewReaderFromProviderWithOptions(provider, modules_reader.Options{
-		Cache:  cache,
+		Cache:  sc,
 		FileID: path,
 	})
 	if readerErr != nil {

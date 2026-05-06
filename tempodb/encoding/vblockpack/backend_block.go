@@ -84,19 +84,19 @@ func (p *tempoReaderProvider) ReadAt(buf []byte, off int64, _ blockpack.DataType
 // metadata/sketches/intrinsic columns at a higher level.
 func ConfigureLRU(_ int64) {}
 
-// blockpackCache is the process-level multi-tier cache for blockpack block bytes.
-// It is built once via getCache() and may be a ChainedCache (MemoryCache → FileCache → MemCache)
-// or nil if no caching is configured. A nil Cache is safe — all reads fall through to the provider.
+// blockpackCache is the process-level TypedTieredCache for blockpack section reads.
+// It is built once via getCache() using NewTypedTieredCache. A nil SectionCache is safe —
+// all reads fall through to the provider.
 var (
 	blockpackCacheMu   sync.Mutex
-	blockpackCache     blockpack.Cache
+	blockpackCache     blockpack.SectionCache
 	blockpackCacheOnce sync.Once
 	blockpackCacheCfg  struct {
-		filePath             string
-		fileMaxBytes         int64
-		memServers           []string
-		metadataMemServers   []string
-		memoryCacheBytes     int64
+		filePath           string
+		fileMaxBytes       int64
+		memServers         []string
+		metadataMemServers []string
+		memoryCacheBytes   int64
 	}
 )
 
@@ -127,51 +127,47 @@ func ConfigureFileCache(path string, maxBytes int64) {
 	ConfigureCache(path, maxBytes, nil, 0)
 }
 
-// getCache initializes (once) the process-level multi-tier cache and returns it.
-// The chain order is: MemoryCache → FileCache → MemCache (fastest-first).
+// getCache initializes (once) the process-level TypedTieredCache and returns it.
+// Routing: Footer/TOC/Bloom/Block/Intrinsic → mem+metaRemote; Metadata/TraceIdx → disk+dataRemote.
 // Returns nil if no tiers could be configured.
-func getCache() blockpack.Cache {
+func getCache() blockpack.SectionCache {
 	blockpackCacheOnce.Do(func() {
 		// Snapshot config under lock to avoid a data race with ConfigureCache.
 		blockpackCacheMu.Lock()
 		cfg := blockpackCacheCfg
 		blockpackCacheMu.Unlock()
 
-		var tiers []blockpack.Cache
+		var mem blockpack.Cache
+		var disk blockpack.Cache
 
-		// Tier 1: in-process LRU memory cache (fastest).
-		// 256 MB in-process LRU cache is always on; set to 0 to disable.
+		// In-process LRU memory cache.
 		if cfg.memoryCacheBytes > 0 {
-			mem, err := blockpack.NewMemoryCache(blockpack.MemoryCacheConfig{
+			m, err := blockpack.NewMemoryCache(blockpack.MemoryCacheConfig{
 				MaxBytes:   cfg.memoryCacheBytes,
 				Registerer: prometheus.DefaultRegisterer,
 			})
-			if err == nil && mem != nil {
-				tiers = append(tiers, mem)
+			if err == nil && m != nil {
+				mem = m
 			}
 		}
 
-		// Tier 2: disk-backed file cache.
+		// Disk-backed file cache — used for large sections (Metadata, TraceIdx).
 		if cfg.filePath != "" && cfg.fileMaxBytes > 0 {
-			disk, err := blockpack.OpenFileCache(blockpack.FileCacheConfig{
+			d, err := blockpack.OpenFileCache(blockpack.FileCacheConfig{
 				Enabled:    true,
 				Path:       cfg.filePath,
 				MaxBytes:   cfg.fileMaxBytes,
 				Registerer: prometheus.DefaultRegisterer,
 			})
-			if err == nil && disk != nil {
-				tiers = append(tiers, disk)
+			if err == nil && d != nil {
+				disk = d
 			}
 		}
 
-		// Tier 3: remote memcache.
-		// When metadataMemServers is configured, split into two separate remote caches:
-		// - metadata cache: ToC, bloom, range index, intrinsic columns (small, hot)
-		// - data cache: raw block bytes (large, warm via pod-local disk/memory)
+		// Build TypedTieredCache: routes each section type to the appropriate sub-cache.
+		// When metadata+data memcache servers are both configured, remote caches are added
+		// to the hot (mem) and warm (disk) chains respectively.
 		if len(cfg.metadataMemServers) > 0 && len(cfg.memServers) > 0 {
-			// Tiered: build separate metadata and data remote caches.
-			// WrapRegistererWith adds a constant "tier" label so both MemCache instances
-			// can share the same metric names without a duplicate-registration panic.
 			metaRemote, err := blockpack.OpenMemCache(blockpack.MemCacheConfig{
 				Servers:    cfg.metadataMemServers,
 				Enabled:    true,
@@ -183,29 +179,45 @@ func getCache() blockpack.Cache {
 				Registerer: prometheus.WrapRegistererWith(prometheus.Labels{"tier": "data"}, prometheus.DefaultRegisterer),
 			})
 			if err == nil && err2 == nil && metaRemote != nil && dataRemote != nil {
-				// Build per-tier chains: memory+disk+metaRemote for metadata, memory+disk+dataRemote for data.
-				metaChain := blockpack.NewChainedCache(append(tiers, metaRemote)...)
-				dataChain := blockpack.NewChainedCache(append(tiers, dataRemote)...)
-				blockpackCache = blockpack.NewTieredCache(metaChain, dataChain)
+				// hot: mem+metaRemote for footer/toc/bloom/block/intrinsic
+				// warm: disk+dataRemote for metadata/traceIdx
+				hot := blockpack.NewChainedCache(nonNil(mem, metaRemote)...)
+				warm := blockpack.NewChainedCache(nonNil(disk, dataRemote)...)
+				cfg2 := blockpack.DefaultTypedConfig(hot, warm); cfg2.Registerer = prometheus.DefaultRegisterer; blockpackCache = blockpack.NewTypedTieredCache(cfg2)
 				return
 			}
-		} else if len(cfg.memServers) > 0 {
-			// Single remote cache (original behaviour).
-			remote, err := blockpack.OpenMemCache(blockpack.MemCacheConfig{
+		}
+
+		// Fallback: single remote or local-only cache via DefaultTypedConfig.
+		var remote blockpack.Cache
+		if len(cfg.memServers) > 0 {
+			r, err := blockpack.OpenMemCache(blockpack.MemCacheConfig{
 				Servers:    cfg.memServers,
 				Enabled:    true,
 				Registerer: prometheus.DefaultRegisterer,
 			})
-			if err == nil && remote != nil {
-				tiers = append(tiers, remote)
+			if err == nil && r != nil {
+				remote = r
 			}
 		}
-
-		if len(tiers) > 0 {
-			blockpackCache = blockpack.NewChainedCache(tiers...)
+		hot := blockpack.NewChainedCache(nonNil(mem, remote)...)
+		warm := blockpack.NewChainedCache(nonNil(disk, remote)...)
+		if hot != nil || warm != nil {
+			cfg2 := blockpack.DefaultTypedConfig(hot, warm); cfg2.Registerer = prometheus.DefaultRegisterer; blockpackCache = blockpack.NewTypedTieredCache(cfg2)
 		}
 	})
 	return blockpackCache
+}
+
+// nonNil returns a slice of the non-nil caches from the arguments.
+func nonNil(caches ...blockpack.Cache) []blockpack.Cache {
+	out := make([]blockpack.Cache, 0, len(caches))
+	for _, c := range caches {
+		if c != nil {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 type blockpackBlock struct {
@@ -238,7 +250,7 @@ func (b *blockpackBlock) newReaderProvider() blockpack.ReaderProvider {
 // Each call returns a new Reader — Reader is not safe for concurrent use.
 func (b *blockpackBlock) newReader() (*blockpack.Reader, error) {
 	fileID := b.meta.TenantID + "/" + b.meta.BlockID.String()
-	return blockpack.NewReaderWithCache(b.newReaderProvider(), fileID, getCache())
+	return blockpack.NewReaderWithSectionCache(b.newReaderProvider(), fileID, getCache())
 }
 
 // executeQuery creates a reader and executes a TraceQL query, returning all matching spans.
@@ -349,7 +361,7 @@ func (b *blockpackBlock) FindTraceByID(_ context.Context, id common.ID, _ common
 	}
 
 	fileID := b.meta.TenantID + "/" + b.meta.BlockID.String()
-	r, err := blockpack.NewLeanReaderWithCache(b.newReaderProvider(), fileID, getCache())
+	r, err := blockpack.NewLeanReaderWithSectionCache(b.newReaderProvider(), fileID, getCache())
 	if err != nil {
 		return nil, fmt.Errorf("failed to create blockpack lean reader: %w", err)
 	}
