@@ -1,6 +1,7 @@
 ## main / unreleased
 
 * [ENHANCEMENT] jsonnet: add `autoscaling_prometheus_url` and `autoscaling_prometheus_tenant` top-level config fields for KEDA autoscaling. Setting `autoscaling_prometheus_tenant` sends an `X-Scope-OrgID` header on all Prometheus trigger requests, which is required when the backend is a multi-tenant system such as Grafana Mimir. [#7099](https://github.com/grafana/tempo/pull/7099) (@zachfi)
+* [FEATURE] Make individual AST transformations skippable via config and query hints [#7012](https://github.com/grafana/tempo/pull/7012) (@stoewer)
 
 # v3.0.0-rc.1
 
