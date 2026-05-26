@@ -29,22 +29,34 @@ tempo-cli command [subcommand] -h
 
 ## Run Tempo CLI
 
-Tempo CLI is currently available as source code.
+Tempo CLI is available as source code and as a Docker image.
 
-To build Tempo CLI, you need a working Go installation and a build environment.
-You can compile it to a native binary and execute normally, or you can execute it using the `go run` command.
-You can also package it as a binary in a Docker container using `make docker-tempo-cli`.
-
-Example:
+### Run with Docker (published image)
 
 ```bash
-./tempo-cli [arguments...]
+docker run --rm grafana/tempo-cli [arguments...]
+```
+
+### Run directly with `go run`
+
+```bash
 go run ./cmd/tempo-cli [arguments...]
 ```
 
+### Build and run a local binary
+
+To build a local binary, you need a working Go installation and build environment.
+
+```bash
+make tempo-cli
+./bin/$(go env GOOS)/tempo-cli-$(go env GOARCH) [arguments...]
+```
+
+### Build and run a local Docker image
+
 ```bash
 make docker-tempo-cli
-docker run docker.io/grafana/tempo-cli [arguments...]
+docker run --rm tempo-cli [arguments...]
 ```
 
 ## Backend options
@@ -82,6 +94,7 @@ Arguments:
 Options:
 
 - `--org-id <value>` Organization ID (for use in multi-tenant setup).
+- `--header <key=value>` Extra HTTP header to send with the request. Can be specified multiple times.
 - `--v1` use v1 API (use /api/traces endpoint to fetch traces, default: /api/v2/traces).
 
 Example:
@@ -89,6 +102,14 @@ Example:
 ```bash
 tempo-cli query api trace-id http://tempo:3200 f1cfe82a8eef933b
 ```
+
+Example with a custom authentication header:
+
+```bash
+tempo-cli query api trace-id http://tempo:3200 f1cfe82a8eef933b --header "X-TOKEN=<API_TOKEN>"
+```
+
+Replace _`<API_TOKEN>`_ with your authentication token.
 
 ### Search
 
@@ -108,6 +129,7 @@ Arguments:
 Options:
 
 - `--org-id <value>` Organization ID (for use in multi-tenant setup).
+- `--header <key=value>` Extra header to send with the request (as gRPC metadata when using `--use-grpc`). Can be specified multiple times.
 - `--use-grpc` Use GRPC streaming
 - `--spss <value>` Number of spans to return for each spanset
 - `--limit <value>` Number of results to return
@@ -136,6 +158,12 @@ Example using GRPC streaming with organization ID:
 tempo-cli query api search --use-grpc --org-id my-org localhost:3200 '{span.http.status_code >= 400}' now-1h now
 ```
 
+Example with a custom authentication header over GRPC:
+
+```bash
+tempo-cli query api search --use-grpc --header "X-TOKEN=<API_TOKEN>" localhost:9095 '{status = error}' now-1h now
+```
+
 ### Search tags
 
 Call the Tempo API and search attribute names.
@@ -153,6 +181,7 @@ Arguments:
 Options:
 
 - `--org-id <value>` Organization ID (for use in multi-tenant setup).
+- `--header <key=value>` Extra header to send with the request (as gRPC metadata when using `--use-grpc`). Can be specified multiple times.
 - `--use-grpc` Use GRPC streaming
 - `--path-prefix <value>` String to prefix search paths with
 - `--secure` Use HTTPS or gRPC with TLS
@@ -197,6 +226,7 @@ Arguments:
 Options:
 
 - `--org-id <value>` Organization ID (for use in multi-tenant setup).
+- `--header <key=value>` Extra header to send with the request (as gRPC metadata when using `--use-grpc`). Can be specified multiple times.
 - `--query <value>` TraceQL query to filter attribute results by.
 - `--use-grpc` Use GRPC streaming
 - `--path-prefix <value>` String to prefix search paths with
@@ -236,6 +266,7 @@ Arguments:
 Options:
 
 - `--org-id <value>` Organization ID (for use in multi-tenant setup).
+- `--header <key=value>` Extra header to send with the request (as gRPC metadata when using `--use-grpc`). Can be specified multiple times.
 - `--use-grpc` Use GRPC streaming
 - `--instant` Perform an instant query instead of a range query.
 - `--path-prefix <value>` String to prefix search paths with
@@ -500,6 +531,10 @@ of dedicated columns.
 
 ### Convert vParquet3 to vParquet4
 
+{{< admonition type="warning" >}}
+`vParquet3` is deprecated. Convert any remaining vParquet3 blocks to vParquet4 or later before upgrading to Tempo 3.0.
+{{< /admonition >}}
+
 ```bash
 tempo-cli parquet convert-3to4 <in file> [<out path>] [<list of dedicated columns>]
 ```
@@ -622,6 +657,52 @@ tempo-cli migrate overrides-per-tenant overrides.yaml -d migrated-overrides.yaml
 - Fields set to Go zero values (`false`, `0`, `""`) may be silently dropped due to `omitempty` tags. Compare against your original config to ensure nothing is lost.
 - Secret values (for example, `remote_write_headers`) are masked as `<secret>` in the output. You must manually restore the original values.
 - Some struct fields without `omitempty` may appear with zero values (for example, `exclude: null`) that were not in your original config.
+{{< /admonition >}}
+
+## Migrate config command
+
+Migrate a Tempo 2.x configuration file to a valid 3.0 configuration. The command removes obsolete configuration sections (such as `ingester`, `ingester_client`, and `compactor`), adds Kafka ingest configuration for microservices mode, disables compaction in overrides for parallel operation during migration, and strips the removed `local-blocks` metrics-generator processor.
+
+The tool works at the YAML map level rather than rewriting the file from fully decoded Tempo structs, so environment variable references like `${VAR}` are preserved. 
+Top-level sections that are not recognized by the Tempo 3.0 configuration are dropped from the output. 
+Unknown nested keys normally cause validation to fail, but validation is best-effort when the configuration contains `${VAR}` placeholders where non-string types are expected, which may let unknown nested keys through.
+
+```bash
+tempo-cli migrate config [options] <config-file>
+```
+
+Arguments:
+
+- `config-file` Path to the 2.x Tempo configuration file.
+
+Options:
+
+- `--kafka-address <address>` Kafka broker address. Required when running in microservices mode.
+- `--kafka-topic <topic>` Kafka topic name. Defaults to `tempo`.
+- `--mode <monolithic|microservices>` Override automatic deployment mode detection. By default, the mode is detected from the `target` field (`all` or absent means monolithic, any other value means microservices).
+
+The migrated configuration is printed to `stdout`. Warnings are printed to `stderr`.
+
+### Examples
+
+Monolithic mode (no Kafka flags needed):
+
+```bash
+tempo-cli migrate config old-config.yaml > new-config.yaml
+```
+
+Microservices mode:
+
+```bash
+tempo-cli migrate config --kafka-address=kafka:9092 --kafka-topic=tempo-traces old-config.yaml > new-config.yaml
+```
+
+{{< admonition type="warning" >}}
+- The output is a starting point for your 3.0 configuration. Always review it before deploying.
+- If your configuration uses legacy (flat) overrides, you must run `tempo-cli migrate overrides-config` first.
+- If your configuration references an external per-tenant overrides file (`per_tenant_override_config`), you must manually add `compaction_disabled: true` for each tenant in that file.
+- YAML comments and key ordering from the original file are not preserved.
+- Remove `compaction_disabled: true` from overrides after fully decommissioning your 2.x deployment.
 {{< /admonition >}}
 
 ## Analyse block
@@ -817,4 +898,57 @@ Drop multiple traces:
 
 ```bash
 tempo-cli rewrite-blocks drop-traces --drop-trace --backend=local --bucket=./cmd/tempo-cli/test-data/ single-tenant 04d5f549746c96e4f3daed6202571db2,111fa1850042aea83c17cd7e674210b8
+```
+
+## Redact traces
+
+Remove traces containing personally identifiable information or other sensitive data from object storage without waiting for retention to expire.
+
+The `redact` command submits a redaction request to the [backend scheduler](/docs/tempo/<TEMPO_VERSION>/reference-tempo-architecture/components/compaction/#backend-scheduler). 
+The scheduler creates jobs that rewrite affected blocks in object storage to remove the specified traces. 
+Unlike [`drop-traces`](#drop-traces-by-id), which operates directly on object storage from the CLI, `redact` delegates the work to the backend scheduler over gRPC.
+
+```bash
+tempo-cli redact --tenant=<TENANT_ID> --trace-id=<TRACE_ID> [--trace-id=<TRACE_ID> ...] <scheduler-address>
+```
+
+Arguments:
+
+- `scheduler-address` The backend scheduler gRPC address (`host:port`).
+
+Options:
+
+- `--tenant <value>` **(required)** Tenant ID.
+- `--trace-id <value>` **(required)** Trace ID to redact, in hex format. Specify multiple times to redact several traces in one request.
+- `--tls` Use TLS for the gRPC connection (default: `false`).
+- `--tls-server-name <value>` Override the TLS server name (SNI).
+- `--tls-ca <value>` Path to a PEM-encoded CA certificate file.
+
+On success, the command prints the batch ID and the number of jobs created:
+
+```
+batch_id:     <BATCH_ID>
+jobs_created: <COUNT>
+```
+
+Monitor job progress through the [`/status/backendscheduler`](/docs/tempo/<TEMPO_VERSION>/api_docs/#backend-scheduler-job-status) endpoint.
+
+### Examples
+
+Redact a single trace:
+
+```bash
+tempo-cli redact --tenant=my-tenant --trace-id=931281e2a09876de16e15f45ff86283d localhost:9095
+```
+
+Redact multiple traces in one request:
+
+```bash
+tempo-cli redact --tenant=my-tenant --trace-id=931281e2a09876de16e15f45ff86283d --trace-id=00000000000000000000000000000001 localhost:9095
+```
+
+With TLS and a custom CA:
+
+```bash
+tempo-cli redact --tenant=my-tenant --trace-id=931281e2a09876de16e15f45ff86283d --tls --tls-ca=/path/to/ca.pem scheduler.example.com:9095
 ```

@@ -10,14 +10,17 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"os"
 	"path"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/go-kit/log"
+	"github.com/gogo/protobuf/proto"
 	"github.com/google/uuid"
 	"github.com/grafana/dskit/kv/consul"
 	"github.com/grafana/dskit/ring"
@@ -77,7 +80,7 @@ func TestInstanceSearch(t *testing.T) {
 	checkEqual(t, ids, sr)
 
 	// Test after completing a block
-	err = i.completeBlock(t.Context(), blockID)
+	_, err = i.completeBlock(t.Context(), blockID)
 	require.NoError(t, err)
 
 	sr, err = i.Search(t.Context(), req)
@@ -112,7 +115,9 @@ func TestInstanceSearchTraceQL(t *testing.T) {
 			assert.Len(t, sr.Traces, 0)
 
 			// Test after appending to WAL
-			require.NoError(t, i.cutIdleTraces(t.Context(), true))
+			drained, cutErr := i.cutIdleTraces(t.Context(), true)
+			require.NoError(t, cutErr)
+			require.True(t, drained, "should drain live traces in one iteration")
 
 			sr, err = i.Search(t.Context(), req)
 			assert.NoError(t, err)
@@ -130,7 +135,7 @@ func TestInstanceSearchTraceQL(t *testing.T) {
 			checkEqual(t, ids, sr)
 
 			// Test after completing a block
-			err = i.completeBlock(t.Context(), blockID)
+			_, err = i.completeBlock(t.Context(), blockID)
 			require.NoError(t, err)
 
 			sr, err = i.Search(t.Context(), req)
@@ -192,7 +197,7 @@ func TestInstanceSearchWithStartAndEnd(t *testing.T) {
 	searchAndAssert(req)
 
 	// Test after completing a block
-	err = i.completeBlock(t.Context(), blockID)
+	_, err = i.completeBlock(t.Context(), blockID)
 	require.NoError(t, err)
 	searchAndAssert(req)
 
@@ -237,10 +242,68 @@ func TestInstanceSearchTags(t *testing.T) {
 	testSearchTagsAndValues(t, userCtx, i, tagKey, expectedTagValues)
 
 	// Test after completing a block
-	err = i.completeBlock(t.Context(), blockID)
+	_, err = i.completeBlock(t.Context(), blockID)
 	require.NoError(t, err)
 
 	testSearchTagsAndValues(t, userCtx, i, tagKey, expectedTagValues)
+
+	err = services.StopAndAwaitTerminated(t.Context(), ls)
+	require.NoError(t, err)
+}
+
+func TestSearchTagValuesV2DiskCache(t *testing.T) {
+	i, ls := defaultInstance(t)
+
+	tagKey := foo
+	tagValue := bar
+
+	// Write traces and cut to a complete block
+	_, _, _, _ = writeTracesForSearch(t, i, "", tagKey, tagValue, true, false)
+
+	blockID, err := i.cutBlocks(t.Context(), true)
+	require.NoError(t, err)
+	require.NotEqual(t, uuid.Nil, blockID)
+
+	_, err = i.completeBlock(t.Context(), blockID)
+	require.NoError(t, err)
+
+	userCtx := user.InjectOrgID(t.Context(), testTenantID)
+	req := &tempopb.SearchTagValuesRequest{TagName: "." + tagKey}
+
+	// First query: cache miss, should populate cache
+	resp1, err := i.SearchTagValuesV2(userCtx, req)
+	require.NoError(t, err)
+	require.NotEmpty(t, resp1.TagValues)
+
+	// Verify cache was written on the complete block
+	var block *LocalBlock
+	for _, b := range i.blocks.Load().completeBlocks {
+		block = b
+		break
+	}
+	require.NotNil(t, block)
+
+	limit := i.overrides.MaxBytesPerTagValuesQuery(testTenantID)
+	cacheKey := searchTagValuesV2CacheKey(req, limit, "cache_search_tagvaluesv2")
+	cacheData, err := block.GetDiskCache(t.Context(), cacheKey)
+	require.NoError(t, err)
+	require.NotEmpty(t, cacheData, "disk cache should have been populated after first query")
+
+	// Second query: should hit cache and return same results with lower inspected bytes
+	resp2, err := i.SearchTagValuesV2(userCtx, req)
+	require.NoError(t, err)
+
+	// Cache hit should inspect significantly fewer bytes than the original search
+	require.Less(t, resp2.Metrics.InspectedBytes, resp1.Metrics.InspectedBytes,
+		"cache hit should inspect fewer bytes than cache miss")
+
+	// Sort both for stable comparison
+	sort.Slice(resp1.TagValues, func(a, b int) bool { return resp1.TagValues[a].Value < resp1.TagValues[b].Value })
+	sort.Slice(resp2.TagValues, func(a, b int) bool { return resp2.TagValues[a].Value < resp2.TagValues[b].Value })
+	require.Equal(t, len(resp1.TagValues), len(resp2.TagValues))
+	for idx := range resp1.TagValues {
+		require.Equal(t, resp1.TagValues[idx].Value, resp2.TagValues[idx].Value)
+	}
 
 	err = services.StopAndAwaitTerminated(t.Context(), ls)
 	require.NoError(t, err)
@@ -476,11 +539,12 @@ func TestSearchTagsV2Limits(t *testing.T) {
 					Ids:    [][]byte{id},
 				}
 				instance.pushBytes(t.Context(), time.Now(), req)
-				err = instance.cutIdleTraces(t.Context(), true)
+				drained, err := instance.cutIdleTraces(t.Context(), true)
 				require.NoError(t, err)
+				require.True(t, drained, "should drain live traces in one iteration")
 				blockID, err := instance.cutBlocks(t.Context(), true)
 				require.NoError(t, err)
-				err = instance.completeBlock(ctx, blockID)
+				_, err = instance.completeBlock(ctx, blockID)
 				require.NoError(t, err)
 			}
 			expectedTags := len(uniqueKeys)
@@ -593,7 +657,7 @@ func liveStoreWithConfig(t testing.TB, cfg Config) (*LiveStore, error) {
 	logger := test.NewTestingLogger(t)
 
 	// Use fake Kafka cluster for testing
-	liveStore, err := New(cfg, limits, logger, reg, true) // singlePartition = true for testing
+	liveStore, err := New(cfg, limits, noopCompleteBlockFlusher{}, logger, reg)
 	if err != nil {
 		return nil, err
 	}
@@ -698,8 +762,9 @@ func writeTracesForSearch(t *testing.T, i *instance, spanName, tagKey, tagValue 
 	}
 
 	// traces have to be cut to show up in searches
-	err := i.cutIdleTraces(t.Context(), true)
+	drained, err := i.cutIdleTraces(t.Context(), true)
 	require.NoError(t, err)
+	require.True(t, drained, "should drain live traces in one iteration")
 
 	return ids, expectedTagValues, expectedEventTagValues, expectedLinkTagValues
 }
@@ -751,15 +816,16 @@ func TestInstanceSearchDoesNotRace(t *testing.T) {
 	})
 
 	concurrent(func() {
-		err := i.cutIdleTraces(t.Context(), true)
+		drained, err := i.cutIdleTraces(t.Context(), true)
 		require.NoError(t, err, "error cutting complete traces")
+		require.True(t, drained, "should drain live traces in one iteration")
 	})
 
 	concurrent(func() {
 		// Cut wal, complete
 		blockID, _ := i.cutBlocks(t.Context(), true)
 		if blockID != uuid.Nil {
-			err := i.completeBlock(t.Context(), blockID)
+			_, err := i.completeBlock(t.Context(), blockID)
 			require.NoError(t, err)
 		}
 	})
@@ -839,8 +905,9 @@ func TestInstanceSearchMetrics(t *testing.T) {
 	require.Equal(t, uint64(0), m.InspectedBytes)  // we don't search live traces
 
 	// Test after appending to WAL
-	err := i.cutIdleTraces(t.Context(), true)
+	drained, err := i.cutIdleTraces(t.Context(), true)
 	require.NoError(t, err)
+	require.True(t, drained, "should drain live traces in one iteration")
 	m = search()
 	require.Less(t, numBytes, m.InspectedBytes)
 
@@ -851,7 +918,7 @@ func TestInstanceSearchMetrics(t *testing.T) {
 	require.Less(t, numBytes, m.InspectedBytes)
 
 	// Test after completing a block
-	err = i.completeBlock(t.Context(), blockID)
+	_, err = i.completeBlock(t.Context(), blockID)
 	require.NoError(t, err)
 	m = search()
 	require.Less(t, numBytes, m.InspectedBytes)
@@ -886,7 +953,7 @@ func TestInstanceFindByTraceID(t *testing.T) {
 	require.NotNil(t, resp.Trace)
 
 	// Test 3: Complete block (moves to completeBlocks)
-	err = i.completeBlock(t.Context(), blockID)
+	_, err = i.completeBlock(t.Context(), blockID)
 	require.NoError(t, err)
 
 	// Verify we can find traces from completed blocks
@@ -946,8 +1013,9 @@ func TestInstanceFindByTraceIDWithSizeLimits(t *testing.T) {
 	i.pushBytes(ctx, time.Now(), req)
 
 	// Cut to ensure we can find it
-	err = i.cutIdleTraces(t.Context(), true)
+	drained, err := i.cutIdleTraces(t.Context(), true)
 	require.NoError(t, err)
+	require.True(t, drained, "should drain live traces in one iteration")
 
 	// and request it back
 	resp, err := i.FindByTraceID(t.Context(), traceID, false)
@@ -977,6 +1045,66 @@ func TestInstanceFindByTraceIDWithSizeLimits(t *testing.T) {
 	resp, err = i.FindByTraceID(t.Context(), traceID, true)
 	require.NoError(t, err)
 	require.NotNil(t, resp.Trace) // can't validate the trace b/c its a subset of the original trace. as long as its non-nil, we're good
+}
+
+func TestIterateBlocksRecoversPanic(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		populate func(t *testing.T, i *instance)
+	}{
+		{
+			name: "head block",
+			populate: func(t *testing.T, i *instance) {
+				_, _, _, _ = writeTracesForSearch(t, i, "", foo, bar, false, false)
+			},
+		},
+		{
+			name: "wal block",
+			populate: func(t *testing.T, i *instance) {
+				_, _, _, _ = writeTracesForSearch(t, i, "", foo, bar, false, false)
+				blockID, err := i.cutBlocks(t.Context(), true)
+				require.NoError(t, err)
+				require.NotEqual(t, uuid.Nil, blockID)
+				i.blocksMtx.Lock()
+				i.blocks.Store(i.blocks.Load().withHeadBlock(nil))
+				i.blocksMtx.Unlock()
+			},
+		},
+		{
+			name: "complete block",
+			populate: func(t *testing.T, i *instance) {
+				_, _, _, _ = writeTracesForSearch(t, i, "", foo, bar, false, false)
+				blockID, err := i.cutBlocks(t.Context(), true)
+				require.NoError(t, err)
+				require.NotEqual(t, uuid.Nil, blockID)
+				_, err = i.completeBlock(t.Context(), blockID)
+				require.NoError(t, err)
+				i.blocksMtx.Lock()
+				i.blocks.Store(i.blocks.Load().withHeadBlock(nil))
+				i.blocksMtx.Unlock()
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			i, ls := defaultInstanceAndTmpDir(t)
+			defer func() {
+				err := services.StopAndAwaitTerminated(t.Context(), ls)
+				if err != nil && !errors.Is(err, context.Canceled) {
+					require.NoError(t, err)
+				}
+			}()
+
+			tc.populate(t, i)
+
+			panicFn := func(_ context.Context, _ *backend.BlockMeta, _ block) error {
+				panic("simulated parquet ByteArray panic")
+			}
+
+			err := i.iterateBlocks(t.Context(), time.Unix(0, 0), time.Unix(0, 0), panicFn)
+			require.Error(t, err, "iterateBlocks should return an error rather than crash on panic")
+			require.Contains(t, err.Error(), "panic")
+		})
+	}
 }
 
 func TestIncludeBlock(t *testing.T) {
@@ -1080,7 +1208,9 @@ func TestLiveStoreQueryRange(t *testing.T) {
 	mover, err := overrides.NewOverrides(overrides.Config{}, nil, prometheus.DefaultRegisterer)
 	require.NoError(t, err)
 	// Create instance
-	inst, err := newInstance(tenant, cfg, w, encoding.DefaultEncoding(), mover, log.NewNopLogger())
+	lifecycle, err := newCompleteBlockLifecycle(cfg, noopCompleteBlockFlusher{}, log.NewNopLogger())
+	require.NoError(t, err)
+	inst, err := newInstance(tenant, cfg, w, encoding.DefaultEncoding(), lifecycle, mover, log.NewNopLogger())
 	require.NoError(t, err)
 
 	// Create test spans
@@ -1147,8 +1277,9 @@ func TestLiveStoreQueryRange(t *testing.T) {
 	inst.pushBytes(t.Context(), now, pushReq)
 
 	// Force block creation by cutting traces and blocks
-	err = inst.cutIdleTraces(t.Context(), true)
+	drained, err := inst.cutIdleTraces(t.Context(), true)
 	require.NoError(t, err)
+	require.True(t, drained, "should drain live traces in one iteration")
 
 	blockID, err := inst.cutBlocks(t.Context(), true)
 	require.NoError(t, err)
@@ -1156,20 +1287,18 @@ func TestLiveStoreQueryRange(t *testing.T) {
 
 	// Complete the block
 	ctx := t.Context()
-	err = inst.completeBlock(ctx, blockID)
+	_, err = inst.completeBlock(ctx, blockID)
 	require.NoError(t, err)
 
 	// Wait a bit to ensure block is ready
 	time.Sleep(100 * time.Millisecond)
 
 	// Get the completed block for testing
-	inst.blocksMtx.RLock()
 	var block *LocalBlock
-	for _, b := range inst.completeBlocks {
+	for _, b := range inst.blocks.Load().completeBlocks {
 		block = b
 		break
 	}
-	inst.blocksMtx.RUnlock()
 
 	require.NotNil(t, block, "block should have been created and completed")
 
@@ -1261,4 +1390,132 @@ func TestLiveStoreQueryRange(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestQueryRangeToleratesCorruptCache(t *testing.T) {
+	i, ls := defaultInstance(t)
+	writeTracesForSearch(t, i, "", foo, bar, true, false)
+
+	blockID, err := i.cutBlocks(t.Context(), true)
+	require.NoError(t, err)
+	_, err = i.completeBlock(t.Context(), blockID)
+	require.NoError(t, err)
+
+	var block *LocalBlock
+	for _, b := range i.blocks.Load().completeBlocks {
+		block = b
+		break
+	}
+	require.NotNil(t, block)
+
+	req := &tempopb.QueryRangeRequest{
+		Query:     "{} | count_over_time()",
+		Start:     uint64(block.BlockMeta().StartTime.Add(-time.Minute).UnixNano()),
+		End:       uint64(block.BlockMeta().EndTime.Add(time.Minute).UnixNano()),
+		Step:      uint64(time.Second),
+		MaxSeries: 10,
+	}
+
+	first, err := i.QueryRange(t.Context(), req)
+	require.NoError(t, err)
+
+	blockDir := path.Join(i.wal.GetFilepath(), "blocks", i.tenantID, block.BlockMeta().BlockID.String())
+	cacheFile := findCacheFile(t, blockDir)
+	require.NoError(t, os.WriteFile(cacheFile, []byte("garbage"), 0o600))
+
+	second, err := i.QueryRange(t.Context(), req)
+	require.NoError(t, err)
+	require.Equal(t, len(first.Series), len(second.Series))
+
+	cached, err := os.ReadFile(cacheFile)
+	require.NoError(t, err)
+	var healed tempopb.QueryRangeResponse
+	require.NoError(t, proto.Unmarshal(cached, &healed))
+
+	require.NoError(t, services.StopAndAwaitTerminated(t.Context(), ls))
+}
+
+func TestQueryRangeReportsInspectedBytes(t *testing.T) {
+	i, ls := defaultInstance(t)
+	writeTracesForSearch(t, i, "", foo, bar, true, false)
+
+	blockID, err := i.cutBlocks(t.Context(), true)
+	require.NoError(t, err)
+
+	// At this point the data is in a WAL block (not yet completed).
+	now := time.Now()
+	walReq := &tempopb.QueryRangeRequest{
+		Query:     "{} | count_over_time()",
+		Start:     uint64(now.Add(-time.Minute).UnixNano()),
+		End:       uint64(now.Add(time.Minute).UnixNano()),
+		Step:      uint64(time.Second),
+		MaxSeries: 10,
+	}
+	walResp, err := i.QueryRange(t.Context(), walReq)
+	require.NoError(t, err)
+	require.NotNil(t, walResp.Metrics, "QueryRange should populate Metrics for WAL blocks")
+	require.Greater(t, walResp.Metrics.InspectedBytes, uint64(0),
+		"WAL-block QueryRange should report scanned bytes")
+
+	// Complete the block to exercise the complete-block path.
+	_, err = i.completeBlock(t.Context(), blockID)
+	require.NoError(t, err)
+
+	var block *LocalBlock
+	for _, b := range i.blocks.Load().completeBlocks {
+		block = b
+		break
+	}
+	require.NotNil(t, block)
+
+	req := &tempopb.QueryRangeRequest{
+		Query:     "{} | count_over_time()",
+		Start:     uint64(block.BlockMeta().StartTime.Add(-time.Minute).UnixNano()),
+		End:       uint64(block.BlockMeta().EndTime.Add(time.Minute).UnixNano()),
+		Step:      uint64(time.Second),
+		MaxSeries: 10,
+	}
+
+	// First call: cache miss, the parquet block is scanned.
+	first, err := i.QueryRange(t.Context(), req)
+	require.NoError(t, err)
+	require.NotNil(t, first.Metrics, "QueryRange should populate Metrics")
+	require.Greater(t, first.Metrics.InspectedBytes, uint64(0),
+		"cache-miss QueryRange should report scanned bytes")
+
+	// Second call: cache hit, no parquet read so we expect zero bytes.
+	second, err := i.QueryRange(t.Context(), req)
+	require.NoError(t, err)
+	require.NotNil(t, second.Metrics)
+	require.Equal(t, uint64(0), second.Metrics.InspectedBytes,
+		"cache-hit QueryRange should not report scanned bytes")
+
+	require.NoError(t, services.StopAndAwaitTerminated(t.Context(), ls))
+}
+
+func TestQueryRangeCacheName_StableForSameRequest(t *testing.T) {
+	req := tempopb.QueryRangeRequest{
+		Query: "{} | count_over_time()",
+		Start: 1_000_000_000,
+		End:   2_000_000_000,
+		Step:  uint64(time.Second),
+	}
+	require.Equal(t, queryRangeCacheName(req), queryRangeCacheName(req))
+
+	other := req
+	other.End = 3_000_000_000
+	require.NotEqual(t, queryRangeCacheName(req), queryRangeCacheName(other))
+}
+
+func findCacheFile(t *testing.T, blockDir string) string {
+	t.Helper()
+	entries, err := os.ReadDir(blockDir)
+	require.NoError(t, err)
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "cache_query_range_") {
+			return path.Join(blockDir, e.Name())
+		}
+	}
+	t.Fatalf("no cache_query_range_*.buf file found in %s", blockDir)
+	return ""
 }

@@ -85,7 +85,7 @@ type Writer interface {
 type IterateObjectCallback func(id common.ID, obj []byte) bool
 
 type Reader interface {
-	Find(ctx context.Context, tenantID string, id common.ID, blockStart string, blockEnd string, timeStart int64, timeEnd int64, opts common.SearchOptions) ([]*tempopb.TraceByIDResponse, []error, error)
+	Find(ctx context.Context, tenantID string, id common.ID, blockStart string, blockEnd string, timeStart, timeEnd time.Time, opts common.SearchOptions) ([]*tempopb.TraceByIDResponse, []error, error)
 	Search(ctx context.Context, meta *backend.BlockMeta, req *tempopb.SearchRequest, opts common.SearchOptions) (*tempopb.SearchResponse, error)
 	SearchTags(ctx context.Context, meta *backend.BlockMeta, req *tempopb.SearchTagsBlockRequest, opts common.SearchOptions) (*tempopb.SearchTagsV2Response, error)
 	SearchTagValues(ctx context.Context, meta *backend.BlockMeta, req *tempopb.SearchTagValuesBlockRequest, opts common.SearchOptions) (*tempopb.SearchTagValuesResponse, error)
@@ -156,6 +156,8 @@ type readerWriter struct {
 	r backend.Reader
 	w backend.Writer
 	c backend.Compactor
+
+	cacheProvider cache.Provider
 
 	wal  *wal.WAL
 	pool *pool.Pool
@@ -232,6 +234,7 @@ func New(cfg *Config, cacheProvider cache.Provider, logger gkLog.Logger) (Reader
 		c:                       c,
 		r:                       r,
 		w:                       w,
+		cacheProvider:           cacheProvider,
 		cfg:                     cfg,
 		logger:                  logger,
 		pool:                    pool.NewPool(cfg.Pool),
@@ -289,7 +292,7 @@ func (rw *readerWriter) CompleteBlockWithBackend(ctx context.Context, block comm
 		return nil, fmt.Errorf("error flushing wal block: %w", err)
 	}
 
-	iter, err := block.Iterator()
+	iter, err := block.Iterator(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -354,7 +357,7 @@ func (rw *readerWriter) Tenants() []string {
 	return rw.blocklist.Tenants()
 }
 
-func (rw *readerWriter) Find(ctx context.Context, tenantID string, id common.ID, blockStart string, blockEnd string, timeStart int64, timeEnd int64, opts common.SearchOptions) ([]*tempopb.TraceByIDResponse, []error, error) {
+func (rw *readerWriter) Find(ctx context.Context, tenantID string, id common.ID, blockStart string, blockEnd string, timeStart, timeEnd time.Time, opts common.SearchOptions) ([]*tempopb.TraceByIDResponse, []error, error) {
 	// tracing instrumentation
 	logger := log.WithContext(ctx, log.Logger)
 	ctx, span := tracer.Start(ctx, "store.Find")
@@ -384,25 +387,15 @@ func (rw *readerWriter) Find(ctx context.Context, tenantID string, id common.ID,
 	blocksSearched := 0
 	compactedBlocksSearched := 0
 
-	// Pre-convert timeStart/timeEnd from Unix seconds to time.Time once to avoid
-	// calling time.Time.Unix() per block inside includeBlock (hot path with many blocks).
-	var timeStartT, timeEndT time.Time
-	if timeStart != 0 {
-		timeStartT = time.Unix(timeStart, 0)
-	}
-	if timeEnd != 0 {
-		timeEndT = time.Unix(timeEnd, 0)
-	}
-
 	for _, b := range blocklist {
-		if includeBlock(b, id, blockStartBytes, blockEndBytes, timeStartT, timeEndT, opts.RF1After) {
+		if includeBlock(b, id, blockStartBytes, blockEndBytes, timeStart, timeEnd, opts.RF1After) {
 			copiedBlocklist = append(copiedBlocklist, b)
 			blocksSearched++
 		}
 	}
 	compactedLookback := time.Now().Add(-(2 * rw.cfg.BlocklistPoll))
 	for _, c := range compactedBlocklist {
-		if includeCompactedBlock(c, id, blockStartBytes, blockEndBytes, compactedLookback, timeStartT, timeEndT, opts.RF1After) {
+		if includeCompactedBlock(c, id, blockStartBytes, blockEndBytes, compactedLookback, timeStart, timeEnd, opts.RF1After) {
 			copiedBlocklist = append(copiedBlocklist, &c.BlockMeta)
 			compactedBlocksSearched++
 		}
@@ -897,12 +890,7 @@ func includeBlock(b *backend.BlockMeta, _ common.ID, blockStart, blockEnd []byte
 		return false
 	}
 
-	if rf1After.IsZero() {
-		return b.ReplicationFactor == backend.DefaultReplicationFactor
-	}
-
-	return (b.StartTime.Before(rf1After) && b.ReplicationFactor == backend.DefaultReplicationFactor) ||
-		(b.StartTime.After(rf1After) && b.ReplicationFactor == backend.MetricsGeneratorReplicationFactor)
+	return true
 }
 
 // if block is compacted within lookback period, and is within shard ranges, include it in search

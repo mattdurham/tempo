@@ -13,6 +13,7 @@ import (
 	"github.com/prometheus/common/config"
 
 	"github.com/grafana/tempo/modules/overrides/histograms"
+	"github.com/grafana/tempo/pkg/traceql"
 	"github.com/grafana/tempo/pkg/util/listtomap"
 	"github.com/grafana/tempo/tempodb/backend"
 
@@ -161,8 +162,9 @@ type MetricsGeneratorOverrides struct {
 
 type ReadOverrides struct {
 	// Querier and Ingester enforced overrides.
-	MaxBytesPerTagValuesQuery  int `yaml:"max_bytes_per_tag_values_query,omitempty" json:"max_bytes_per_tag_values_query,omitempty"`
-	MaxBlocksPerTagValuesQuery int `yaml:"max_blocks_per_tag_values_query,omitempty" json:"max_blocks_per_tag_values_query,omitempty"`
+	MaxBytesPerTagValuesQuery     int `yaml:"max_bytes_per_tag_values_query,omitempty" json:"max_bytes_per_tag_values_query,omitempty"`
+	MaxBlocksPerTagValuesQuery    int `yaml:"max_blocks_per_tag_values_query,omitempty" json:"max_blocks_per_tag_values_query,omitempty"`
+	MaxConditionGroupsPerTagQuery int `yaml:"max_condition_groups_per_tag_query,omitempty" json:"max_condition_groups_per_tag_query,omitempty"`
 
 	// QueryFrontend enforced overrides
 	MaxSearchDuration  model.Duration `yaml:"max_search_duration,omitempty" json:"max_search_duration,omitempty"`
@@ -173,6 +175,10 @@ type ReadOverrides struct {
 	// LeftPadTraceIDs left-pads trace IDs in search responses to 32 hex characters with zeros.
 	// This produces W3C/OpenTelemetry compliant trace IDs (32-hex-character lowercase strings).
 	LeftPadTraceIDs bool `yaml:"left_pad_trace_ids,omitempty" json:"left_pad_trace_ids,omitempty"`
+
+	// MetricsSpanOnlyFetch, when set, enables or disables the new fetch layer by default for TraceQL metrics queries
+	// for this tenant.  When not set, then the default behavior is used. Maybe be overridden by query hints.
+	MetricsSpanOnlyFetch *bool `yaml:"metrics_spanonly_fetch,omitempty" json:"metrics_spanonly_fetch,omitempty"`
 }
 
 type CompactionOverrides struct {
@@ -369,10 +375,12 @@ func (c *Config) RegisterFlagsAndApplyDefaults(f *flag.FlagSet) {
 	c.Defaults.MetricsGenerator.GenerateNativeHistograms = histograms.HistogramMethodClassic
 
 	// Distributor LegacyOverrides
-	c.Defaults.Ingestion.RetryInfoEnabled = true // enabled in overrides by default but it's disabled with RetryAfterOnResourceExhausted = 0
+	// enabled in overrides by default, only takes effect when
+	// distributor.retry_after_on_resource_exhausted is greater than 0.cluster level default is 5s.
+	c.Defaults.Ingestion.RetryInfoEnabled = true
 	f.StringVar(&c.Defaults.Ingestion.RateStrategy, "distributor.rate-limit-strategy", "local", "Whether the various ingestion rate limits should be applied individually to each distributor instance (local), or evenly shared across the cluster (global).")
-	f.IntVar(&c.Defaults.Ingestion.RateLimitBytes, "distributor.ingestion-rate-limit-bytes", 15e6, "Per-user ingestion rate limit in bytes per second.")
-	f.IntVar(&c.Defaults.Ingestion.BurstSizeBytes, "distributor.ingestion-burst-size-bytes", 20e6, "Per-user ingestion burst size in bytes. Should be set to the expected size (in bytes) of a single push request.")
+	f.IntVar(&c.Defaults.Ingestion.RateLimitBytes, "distributor.ingestion-rate-limit-bytes", 30e6, "Per-user ingestion rate limit in bytes per second.")
+	f.IntVar(&c.Defaults.Ingestion.BurstSizeBytes, "distributor.ingestion-burst-size-bytes", 30e6, "Per-user ingestion burst size in bytes. Should be set to the expected size (in bytes) of a single push request.")
 
 	// Ingester limits
 	f.IntVar(&c.Defaults.Ingestion.MaxLocalTracesPerUser, "ingester.max-traces-per-user", 10e3, "Maximum number of active traces per user, per ingester. 0 to disable.")
@@ -382,6 +390,7 @@ func (c *Config) RegisterFlagsAndApplyDefaults(f *flag.FlagSet) {
 	// Querier limits
 	f.IntVar(&c.Defaults.Read.MaxBytesPerTagValuesQuery, "querier.max-bytes-per-tag-values-query", 10e5, "Maximum size of response for a tag-values query. Used mainly to limit large the number of values associated with a particular tag")
 	f.IntVar(&c.Defaults.Read.MaxBlocksPerTagValuesQuery, "querier.max-blocks-per-tag-values-query", 0, "Maximum number of blocks to query for a tag-values query. 0 to disable.")
+	f.IntVar(&c.Defaults.Read.MaxConditionGroupsPerTagQuery, "querier.max-condition-groups-per-tag-query", traceql.DefaultMaxConditionGroupsPerTagQuery, "Maximum number of OR-expanded condition groups allowed in a tag search query. Queries that expand beyond this limit will be rejected.")
 
 	// Generator - NativeHistograms config
 	f.Float64Var(&c.Defaults.MetricsGenerator.NativeHistogramBucketFactor, "metrics-generator.native-histogram-bucket-factor", 1.1, "The growth factor between buckets for native histograms.")

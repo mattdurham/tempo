@@ -89,12 +89,12 @@ func (s *MCPServer) handleSearch(ctx context.Context, request mcp.CallToolReques
 		endEpoch = endTS.Unix()
 	}
 
-	parsed, err := traceql.Parse(query)
+	parsed, err := traceql.ParseNoOptimizations(query)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("query parse error. Consult TraceQL docs tools: %v", err)), nil
 	}
 
-	if parsed.MetricsPipeline != nil || parsed.MetricsSecondStage != nil {
+	if len(parsed.BatchSpanProcessor) > 0 || len(parsed.SeriesProcessor) > 0 {
 		return mcp.NewToolResultError("TraceQL metrics query received on traceql-search tool. Use the traceql-metrics-instant or traceql-metrics-range tool instead"), nil
 	}
 
@@ -153,12 +153,12 @@ func (s *MCPServer) handleInstantQuery(ctx context.Context, request mcp.CallTool
 		endEpochNanos = endTS.UnixNano()
 	}
 
-	parsed, err := traceql.Parse(query)
+	parsed, err := traceql.ParseNoOptimizations(query)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("query parse error. Consult TraceQL docs tools: %v", err)), nil
 	}
 
-	if parsed.MetricsPipeline == nil {
+	if len(parsed.BatchSpanProcessor) == 0 {
 		return mcp.NewToolResultError("TraceQL search query received on instant query tool. Use the traceql-search tool instead"), nil
 	}
 
@@ -213,12 +213,12 @@ func (s *MCPServer) handleRangeQuery(ctx context.Context, request mcp.CallToolRe
 		endEpochNanos = endTS.UnixNano()
 	}
 
-	parsed, err := traceql.Parse(query)
+	parsed, err := traceql.ParseNoOptimizations(query)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("query parse error. Consult TraceQL docs tools: %v", err)), nil
 	}
 
-	if parsed.MetricsPipeline == nil {
+	if len(parsed.BatchSpanProcessor) == 0 {
 		return mcp.NewToolResultError("TraceQL search query received on range query tool. Use the traceql-search tool instead"), nil
 	}
 
@@ -298,10 +298,10 @@ func (s *MCPServer) handleGetAttributeValues(ctx context.Context, request mcp.Ca
 	}
 
 	query := request.GetString("filter-query", "")
-	if query != "" {
-		extractedReq := traceql.ExtractFetchRequest(query)
-		if extractedReq == nil || !extractedReq.AllConditions {
-			return mcp.NewToolResultError("filter-query invalid. It can only have one spanset and only &&'ed conditions like { <cond> && <cond> && ... }"), nil
+	if !traceql.IsEmptyQuery(query) {
+		conditionGroups, _ := traceql.ExtractConditionGroups(query, traceql.DefaultMaxConditionGroupsPerTagQuery)
+		if len(conditionGroups) == 0 {
+			return mcp.NewToolResultError("filter-query invalid. It must have a single spanset filter with &&/|| conditions like { <cond> && <cond> } or { <cond> || <cond> }"), nil
 		}
 	}
 

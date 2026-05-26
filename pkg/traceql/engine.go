@@ -19,6 +19,8 @@ const (
 	DefaultSpansPerSpanSet int = 3
 )
 
+var ErrMathNotSupported = errors.New("math expressions not supported")
+
 type SpansetFilterFunc func(input []*Spanset) (result []*Spanset, err error)
 
 type Engine struct{}
@@ -27,51 +29,72 @@ func NewEngine() *Engine {
 	return &Engine{}
 }
 
-func Compile(query string) (*RootExpr, SpansetFilterFunc, firstStageElement, secondStageElement, *FetchSpansRequest, error) {
-	expr, err := Parse(query)
+// Compile parses and compiles a TraceQL query. Options specific to metrics queries are ignored. It does not support math expressions.
+func Compile(query string, opts ...CompileOption) (*RootExpr, Pipeline, SpansetFilterFunc, *FetchSpansRequest, error) {
+	expr, err := Parse(query, opts...)
 	if err != nil {
-		return nil, nil, nil, nil, nil, err
+		return nil, Pipeline{}, nil, nil, err
 	}
-
-	req := &FetchSpansRequest{
-		AllConditions: true,
-	}
-	expr.extractConditions(req)
-
 	err = expr.validate()
 	if err != nil {
-		return nil, nil, nil, nil, nil, err
+		return nil, Pipeline{}, nil, nil, err
 	}
-
-	return expr, expr.Pipeline.evaluate, expr.MetricsPipeline, expr.MetricsSecondStage, req, nil
+	p, ok := expr.SinglePipeline()
+	if !ok {
+		return nil, Pipeline{}, nil, nil, ErrMathNotSupported
+	}
+	req := FetchSpansRequest{AllConditions: true}
+	requests := expr.extractConditions(req)
+	if len(requests) != 1 { // should never happen, but just in case
+		return nil, Pipeline{}, nil, nil, ErrMathNotSupported
+	}
+	for _, v := range requests {
+		req = v
+	}
+	return expr, p, p.evaluate, &req, nil
 }
 
-func (e *Engine) ExecuteSearch(ctx context.Context, searchReq *tempopb.SearchRequest, fetcher SpansetFetcher, allowUnsafeQueryHints bool) (*tempopb.SearchResponse, error) {
+// CompileFetchSpanRequests parses a query and returns per-sub-query FetchSpansRequests.
+// This supports both plain spanset queries and math expressions (multiple sub-queries).
+func CompileFetchSpanRequests(query string, opts ...CompileOption) (*RootExpr, map[string]FetchSpansRequest, error) {
+	expr, err := Parse(query, opts...)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := expr.validate(); err != nil {
+		return nil, nil, err
+	}
+	return expr, expr.extractConditions(FetchSpansRequest{AllConditions: true}), nil
+}
+
+// ExecuteSearch executes a search query. Options control AST optimization and hint behavior.
+func (e *Engine) ExecuteSearch(ctx context.Context, searchReq *tempopb.SearchRequest, fetcher SpansetFetcher, opts ...CompileOption) (*tempopb.SearchResponse, error) {
 	ctx, span := tracer.Start(ctx, "traceql.Engine.ExecuteSearch")
 	defer span.End()
 
-	rootExpr, _, _, _, fetchSpansRequest, err := Compile(searchReq.Query)
+	cfg := applyCompileOptions(opts...)
+	rootExpr, pipeline, eval, fetchSpansRequest, err := Compile(searchReq.Query, opts...)
 	if err != nil {
 		return nil, err
 	}
 
 	// Check for performance testing hints
-	if returnIn, ok := rootExpr.Hints.GetDuration(HintDebugReturnIn, allowUnsafeQueryHints); ok {
+	if returnIn, ok := rootExpr.Hints.GetDuration(HintDebugReturnIn, cfg.allowUnsafeHints); ok {
 		var stdDev time.Duration
-		if stdDevDuration, ok := rootExpr.Hints.GetDuration(HintDebugStdDev, allowUnsafeQueryHints); ok {
+		if stdDevDuration, ok := rootExpr.Hints.GetDuration(HintDebugStdDev, cfg.allowUnsafeHints); ok {
 			stdDev = stdDevDuration
 		}
 		simulateLatency(returnIn, stdDev)
 
 		var probability float64
-		if p, ok := rootExpr.Hints.GetFloat(HintDebugDataFactor, allowUnsafeQueryHints); ok {
+		if p, ok := rootExpr.Hints.GetFloat(HintDebugDataFactor, cfg.allowUnsafeHints); ok {
 			probability = p
 		}
 		return generateFakeSearchResponse(probability), nil
 	}
 
 	var mostRecent, ok bool
-	if mostRecent, ok = rootExpr.Hints.GetBool(HintMostRecent, allowUnsafeQueryHints); !ok {
+	if mostRecent, ok = rootExpr.Hints.GetBool(HintMostRecent, cfg.allowUnsafeHints); !ok {
 		mostRecent = false
 	}
 
@@ -85,7 +108,7 @@ func (e *Engine) ExecuteSearch(ctx context.Context, searchReq *tempopb.SearchReq
 	fetchSpansRequest.StartTimeUnixNanos = unixSecToNano(searchReq.Start)
 	fetchSpansRequest.EndTimeUnixNanos = unixSecToNano(searchReq.End)
 
-	span.SetAttributes(attribute.String("pipeline", rootExpr.Pipeline.String()))
+	span.SetAttributes(attribute.String("pipeline", pipeline.String()))
 	span.SetAttributes(attribute.String("fetchSpansRequest", fmt.Sprint(fetchSpansRequest)))
 
 	// calculate search meta conditions.
@@ -95,11 +118,11 @@ func (e *Engine) ExecuteSearch(ctx context.Context, searchReq *tempopb.SearchReq
 	spansetsEvaluated := 0
 	// set up the expression evaluation as a filter to reduce data pulled
 	fetchSpansRequest.SecondPass = func(inSS *Spanset) ([]*Spanset, error) {
-		if len(inSS.Spans) == 0 {
+		if inSS == nil || len(inSS.Spans) == 0 {
 			return nil, nil
 		}
 
-		evalSS, err := rootExpr.Pipeline.evaluate([]*Spanset{inSS})
+		evalSS, err := eval([]*Spanset{inSS})
 		if err != nil {
 			span.RecordError(err, trace.WithAttributes(attribute.String("msg", "pipeline.evaluate")))
 			return nil, err
@@ -185,35 +208,83 @@ func (e *Engine) ExecuteSearch(ctx context.Context, searchReq *tempopb.SearchReq
 func (e *Engine) ExecuteTagValues(
 	ctx context.Context,
 	tag Attribute,
-	conditions []Condition,
+	conditionGroups [][]Condition,
 	cb FetchTagValuesCallback,
 	fetcher TagValuesFetcher,
+	maxConditionGroups int,
 ) error {
 	ctx, span := tracer.Start(ctx, "traceql.Engine.ExecuteTagValues")
 	defer span.End()
 
-	// If the tag we are fetching is already filtered in the query, then this is a noop.
-	// I.e. we are autocompleting resource.service.name and the query was {resource.service.name="foo"}
-	for _, c := range conditions {
-		if c.Attribute == tag && c.Op == OpEqual {
-			if len(c.Operands) > 0 {
-				cb(c.Operands[0])
+	if maxConditionGroups <= 0 {
+		maxConditionGroups = DefaultMaxConditionGroupsPerTagQuery
+	}
+
+	if len(conditionGroups) == 0 {
+		return fetcher.Fetch(ctx, FetchTagValuesRequest{
+			ConditionGroups: nil,
+			TagName:         tag,
+		}, cb)
+	}
+
+	finalConditionGroups := make([][]Condition, 0, len(conditionGroups))
+	for _, group := range conditionGroups {
+		skip := false
+		for _, c := range group {
+			if c.Attribute == tag && c.Op == OpEqual {
+				if len(c.Operands) > 0 {
+					if cb(c.Operands[0]) {
+						return nil // callback signalled stop (limit reached)
+					}
+				}
+				skip = true
+				break
 			}
-			return nil
+		}
+		if !skip {
+			groupCopy := make([]Condition, len(group))
+			copy(groupCopy, group)
+			finalConditionGroups = append(finalConditionGroups, groupCopy)
 		}
 	}
 
-	// Copy conditions to avoid mutating the caller's slice.
-	allConditions := make([]Condition, len(conditions)+1)
-	copy(allConditions, conditions)
-	allConditions[len(conditions)] = Condition{
-		Attribute: tag,
-		Op:        OpNone,
+	if len(finalConditionGroups) == 0 {
+		return nil
+	}
+
+	if tag.Scope == AttributeScopeNone && tag.Intrinsic == IntrinsicNone {
+		if (len(finalConditionGroups) * 2) > maxConditionGroups {
+			return fmt.Errorf("%w (limit: %d). Reduce the number of OR conditions in the query", ErrMaxConditionGroupsPerTagQueryReached, maxConditionGroups)
+		}
+		finalGroupOne := make([][]Condition, len(finalConditionGroups))
+		finalGroupTwo := make([][]Condition, len(finalConditionGroups))
+		for i := range finalConditionGroups {
+			tagResource := tag
+			tagResource.Scope = AttributeScopeResource
+			tagSpan := tag
+			tagSpan.Scope = AttributeScopeSpan
+			finalGroupOne[i] = append(append([]Condition(nil), finalConditionGroups[i]...), Condition{
+				Attribute: tagResource,
+				Op:        OpNone,
+			})
+			finalGroupTwo[i] = append(append([]Condition(nil), finalConditionGroups[i]...), Condition{
+				Attribute: tagSpan,
+				Op:        OpNone,
+			})
+		}
+		finalConditionGroups = append(append([][]Condition(nil), finalGroupOne...), finalGroupTwo...)
+	} else {
+		for i := range finalConditionGroups {
+			finalConditionGroups[i] = append(finalConditionGroups[i], Condition{
+				Attribute: tag,
+				Op:        OpNone,
+			})
+		}
 	}
 
 	autocompleteReq := FetchTagValuesRequest{
-		Conditions: allConditions,
-		TagName:    tag,
+		ConditionGroups: finalConditionGroups,
+		TagName:         tag,
 	}
 
 	span.SetAttributes(attribute.String("autocompleteReq", fmt.Sprint(autocompleteReq)))
@@ -224,7 +295,7 @@ func (e *Engine) ExecuteTagValues(
 func (e *Engine) ExecuteTagNames(
 	ctx context.Context,
 	scope AttributeScope,
-	conditions []Condition,
+	conditionGroups [][]Condition,
 	cb FetchTagsCallback,
 	fetcher TagNamesFetcher,
 ) error {
@@ -232,8 +303,8 @@ func (e *Engine) ExecuteTagNames(
 	defer span.End()
 
 	autocompleteReq := FetchTagsRequest{
-		Conditions: conditions,
-		Scope:      scope,
+		ConditionGroups: conditionGroups,
+		Scope:           scope,
 	}
 
 	span.SetAttributes(attribute.String("autocompleteReq", fmt.Sprint(autocompleteReq)))

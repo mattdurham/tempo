@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"testing"
 	"time"
@@ -35,7 +36,9 @@ func testEvaluator(t *testing.T, tc evalTC) {
 				cloneIn[i].Spans = append([]Span(nil), tc.input[i].Spans...)
 			}
 
-			actual, err := ast.Pipeline.evaluate(tc.input)
+			pipeline, ok := ast.SinglePipeline()
+			require.True(t, ok)
+			actual, err := pipeline.evaluate(tc.input)
 			require.NoError(t, err)
 
 			// sort expected/actual spansets. grouping requires this b/c map iteration makes the output
@@ -1259,7 +1262,9 @@ func TestSpansetOperationEvaluateArrayUnsupported(t *testing.T) {
 				cloneIn[i].Spans = append([]Span(nil), tc.input[i].Spans...)
 			}
 
-			_, err = ast.Pipeline.evaluate(tc.input)
+			pipeline, ok := ast.SinglePipeline()
+			require.True(t, ok)
+			_, err = pipeline.evaluate(tc.input)
 			require.Error(t, err, errors.ErrUnsupported)
 		})
 	}
@@ -2213,7 +2218,9 @@ func TestNotParentWithEmptyLHS(t *testing.T) {
 	ast, err := Parse(query)
 	require.NoError(t, err)
 
-	out, err := ast.Pipeline.evaluate(ss)
+	pipeline, ok := ast.SinglePipeline()
+	require.True(t, ok)
+	out, err := pipeline.evaluate(ss)
 	require.NoError(t, err)
 
 	// Expect the RHS span to be returned because no LHS parent exists (negated parent)
@@ -2222,6 +2229,53 @@ func TestNotParentWithEmptyLHS(t *testing.T) {
 	nameStatic, _ := out[0].Spans[0].AttributeFor(IntrinsicNameAttribute)
 	expected := NewStaticString("list-articles")
 	require.True(t, nameStatic.Equals(&expected))
+}
+
+func TestIntPow(t *testing.T) {
+	intInf := int(math.Inf(+1)) // actual value depends on the platform
+	tests := []struct {
+		name string
+		base int
+		exp  int
+		want int
+	}{
+		{"(-1)^0", -1, 0, 1},
+		{"(-1)^1", -1, 1, -1},
+		{"(-1)^2", -1, 2, 1},
+		{"(-1)^3", -1, 3, -1},
+		{"(-123)^3", -123, 3, -1860867},
+		{"0^0", 0, 0, 1},
+		{"0^1", 0, 1, 0},
+		{"1^0", 1, 0, 1},
+		{"2^2", 2, 2, 4},
+		{"2^10", 2, 10, 1024},
+		{"3^3", 3, 3, 27},
+		{"7^3", 7, 3, 343},
+		{"3^7", 3, 7, 2187},
+		{"5^5", 5, 5, 3125},
+		{"7^7", 7, 7, 823543},
+		{"negative base", -2, 3, -8},
+		{"negative exponent rounds toward zero", 10, -1, 0},
+		{"negative exponent for one", 1, -3, 1},
+		{"negative exponent for negative one", -1, -3, -1},
+		{"large exponent", 2, 62, 1 << 62},
+		// These cases would hang with a naive O(n) loop.
+		// They must complete near-instantly or go test -timeout will kill them.
+		{"100 ^ 100", 100, 100, intInf},
+		{"maxint32 ^ 2", math.MaxInt32, 2, 4611686014132420608},
+		{"2 ^ maxint32", 2, math.MaxInt32, intInf},
+		{"maxint32 ^ maxint32", math.MaxInt32, math.MaxInt32, intInf},
+		{"maxint64 ^ 2", math.MaxInt64, 2, intInf},
+		{"2 ^ maxint64", 2, math.MaxInt64, intInf},
+		{"maxint64 ^ maxint64", math.MaxInt64, math.MaxInt64, intInf},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := intPow(tc.base, tc.exp)
+			require.Equal(t, tc.want, got)
+		})
+	}
 }
 
 func TestIntDivisionByZero(t *testing.T) {
@@ -2244,8 +2298,10 @@ func TestIntDivisionByZero(t *testing.T) {
 			ast, err := Parse(tc.query)
 			require.NoError(t, err)
 
+			pipeline, ok := ast.SinglePipeline()
+			require.True(t, ok)
 			require.NotPanics(t, func() {
-				_, err = ast.Pipeline.evaluate(tc.input)
+				_, err = pipeline.evaluate(tc.input)
 			})
 			require.Error(t, err)
 		})
@@ -2272,9 +2328,11 @@ func TestFloatDivisionByZero(t *testing.T) {
 			ast, err := Parse(tc.query)
 			require.NoError(t, err)
 
+			pipeline, ok := ast.SinglePipeline()
+			require.True(t, ok)
 			var result []*Spanset
 			require.NotPanics(t, func() {
-				result, err = ast.Pipeline.evaluate(tc.input)
+				result, err = pipeline.evaluate(tc.input)
 			})
 			require.NoError(t, err)
 			require.Empty(t, result, "found spans?")

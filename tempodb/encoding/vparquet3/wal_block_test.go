@@ -107,7 +107,7 @@ func TestPartialReplay(t *testing.T) {
 	require.ErrorContains(t, warning, "invalid magic footer of parquet file")
 
 	// Verify we iterate only the records from the first flush
-	iter, err := w2.Iterator()
+	iter, err := w2.Iterator(context.Background())
 	require.NoError(t, err)
 
 	gotCount := 0
@@ -232,7 +232,7 @@ func TestWalBlockFindTraceByID(t *testing.T) {
 
 func TestWalBlockIterator(t *testing.T) {
 	testWalBlock(t, func(w *walBlock, ids []common.ID, trs []*tempopb.Trace) {
-		iter, err := w.Iterator()
+		iter, err := w.Iterator(context.Background())
 		require.NoError(t, err)
 
 		count := 0
@@ -266,7 +266,7 @@ func TestWalBlockIterator(t *testing.T) {
 func TestRowIterator(t *testing.T) {
 	testWalBlock(t, func(w *walBlock, _ []common.ID, _ []*tempopb.Trace) {
 		for _, f := range w.flushed {
-			ri, err := f.rowIterator()
+			ri, err := f.rowIterator(context.Background())
 			require.NoError(t, err)
 
 			var lastID []byte
@@ -291,6 +291,37 @@ func TestRowIterator(t *testing.T) {
 				lastID = append([]byte(nil), id...)
 			}
 		}
+	})
+}
+
+func TestIteratorContextCancelled(t *testing.T) {
+	t.Run("already cancelled", func(t *testing.T) {
+		testWalBlock(t, func(w *walBlock, _ []common.ID, _ []*tempopb.Trace) {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+
+			_, err := w.Iterator(ctx)
+			require.Error(t, err)
+			require.ErrorIs(t, err, context.Canceled)
+		})
+	})
+
+	t.Run("cancelled after creation", func(t *testing.T) {
+		testWalBlock(t, func(w *walBlock, _ []common.ID, _ []*tempopb.Trace) {
+			ctx, cancel := context.WithCancel(context.Background())
+
+			iter, err := w.Iterator(ctx)
+			require.NoError(t, err)
+			defer iter.Close()
+
+			// Cancel the context after iterator creation. Subsequent Next calls
+			// go through walReaderAt.ReadAt which checks ctx.Err().
+			cancel()
+
+			_, _, err = iter.Next(ctx)
+			require.Error(t, err)
+			require.ErrorIs(t, err, context.Canceled)
+		})
 	})
 }
 
@@ -336,7 +367,7 @@ func TestWalBlockRaceConditionCheck(t *testing.T) {
 	readers := map[string]func(){
 		"FindTraceByID": func() { _, _ = w.FindTraceByID(ctx, id, opts) },
 		"Search":        func() { _, _ = w.Search(ctx, &tempopb.SearchRequest{}, opts) },
-		"Iterator":      func() { _, _ = w.Iterator() },
+		"Iterator":      func() { _, _ = w.Iterator(ctx) },
 		"DataLength":    func() { _ = w.DataLength() },
 		"SearchTags": func() {
 			_ = w.SearchTags(ctx, traceql.AttributeScopeSpan, func(string, traceql.AttributeScope) {}, func(uint64) {}, opts)
@@ -353,6 +384,7 @@ func TestWalBlockRaceConditionCheck(t *testing.T) {
 		"FetchTagNames": func() {
 			_ = w.FetchTagNames(ctx, traceql.FetchTagsRequest{}, func(string, traceql.AttributeScope) bool { return false }, func(uint64) {}, opts)
 		},
+		"MetaSnapshot": func() { _ = w.MetaSnapshot() },
 	}
 
 	for _, read := range readers {
@@ -366,6 +398,58 @@ func TestWalBlockRaceConditionCheck(t *testing.T) {
 	}
 
 	wg.Wait()
+}
+
+func TestWalBlockMetaSnapshot(t *testing.T) {
+	meta := backend.NewBlockMeta("fake", uuid.New(), VersionString)
+	w, err := createWALBlock(meta, t.TempDir(), model.CurrentEncoding, 0)
+	require.NoError(t, err)
+
+	snap0 := w.MetaSnapshot()
+	require.NotSame(t, w.BlockMeta(), snap0, "MetaSnapshot must return a fresh allocation, not the live meta pointer")
+	require.Equal(t, int64(0), snap0.TotalObjects)
+
+	id := test.ValidTraceID(nil)
+	tr := test.MakeTrace(10, id)
+	trace.SortTrace(tr)
+	require.NoError(t, w.AppendTrace(id, tr, 100, 200, false))
+
+	snap1 := w.MetaSnapshot()
+	require.NotSame(t, snap0, snap1, "successive MetaSnapshot calls must return distinct pointers")
+	require.Equal(t, int64(1), snap1.TotalObjects)
+	require.Equal(t, w.BlockMeta().StartTime, snap1.StartTime)
+	require.Equal(t, w.BlockMeta().EndTime, snap1.EndTime)
+
+	snap1.TotalObjects = 9999
+	require.Equal(t, int64(1), w.BlockMeta().TotalObjects)
+}
+
+func TestWalBlockTombstone(t *testing.T) {
+	meta := backend.NewBlockMeta("fake", uuid.New(), VersionString)
+	w, err := createWALBlock(meta, t.TempDir(), model.CurrentEncoding, 0)
+	require.NoError(t, err)
+
+	id := test.ValidTraceID(nil)
+	tr := test.MakeTrace(10, id)
+	trace.SortTrace(tr)
+	require.NoError(t, w.AppendTrace(id, tr, 100, 200, false))
+	require.NoError(t, w.Flush())
+
+	metaPath := filepath.Join(w.walPath(), backend.MetaName)
+	deletedPath := filepath.Join(w.walPath(), backend.DeletedMetaName)
+
+	_, err = os.Stat(metaPath)
+	require.NoError(t, err, "meta.json should exist after Flush")
+
+	require.NoError(t, w.Tombstone())
+
+	_, err = os.Stat(metaPath)
+	assert.True(t, os.IsNotExist(err), "meta.json should be renamed away")
+	_, err = os.Stat(deletedPath)
+	assert.NoError(t, err, "meta.deleted.json should be present")
+
+	// Idempotent: a second Tombstone (meta.json is gone) returns nil.
+	require.NoError(t, w.Tombstone(), "Tombstone must be idempotent when meta.json is missing")
 }
 
 func testWalBlock(t *testing.T, f func(w *walBlock, ids []common.ID, trs []*tempopb.Trace)) {

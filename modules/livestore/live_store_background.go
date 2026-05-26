@@ -13,6 +13,7 @@ import (
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/encoding"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	oteltrace "go.opentelemetry.io/otel/trace"
 )
 
@@ -37,12 +38,13 @@ func (o *completeOp) Key() string { return o.tenantID + "/" + o.blockID.String()
 func (o *completeOp) Priority() int64 { return -o.at.Unix() }
 
 func (o *completeOp) backoff() time.Duration {
+	current := o.bo
 	o.bo *= 2
 	if o.bo > o.maxBackoff {
 		o.bo = o.maxBackoff
 	}
 
-	return o.bo
+	return current
 }
 
 func (s *LiveStore) startAllBackgroundProcesses() {
@@ -51,6 +53,7 @@ func (s *LiveStore) startAllBackgroundProcesses() {
 		return
 	}
 
+	s.completeBlockLifecycle.start(s.ctx)
 	close(s.startupComplete)
 }
 
@@ -58,6 +61,7 @@ func (s *LiveStore) stopAllBackgroundProcesses() {
 	s.cancel()              // this will cause the per tenant background processes to complete
 	s.completeQueues.Stop() // this will cause the global complete loop by preventing additional enqueues
 	s.wg.Wait()
+	s.completeBlockLifecycle.stop()
 }
 
 func (s *LiveStore) runInBackground(fn func()) {
@@ -76,8 +80,12 @@ func (s *LiveStore) runInBackground(fn func()) {
 }
 
 func (s *LiveStore) globalCompleteLoop(idx int) {
+	level.Info(s.logger).Log("msg", "starting completing loop", "index", idx)
+	defer func() {
+		level.Info(s.logger).Log("msg", "shutdown completing loop", "index", idx)
+	}()
 	for {
-		op := s.completeQueues.Dequeue(idx)
+		op := s.completeQueues.Dequeue()
 		if op == nil {
 			return // queue is closed
 		}
@@ -110,20 +118,49 @@ func (s *LiveStore) processCompleteOp(op *completeOp) error {
 	if err != nil {
 		level.Error(s.logger).Log("msg", "failed to retrieve instance for completion", "tenant", op.tenantID, "err", err)
 		observeFailedOp(op)
+		span.SetStatus(codes.Error, err.Error())
 		span.RecordError(err)
 		return err
 	}
 
-	err = inst.completeBlock(ctx, op.blockID)
-	metricCompletionDuration.Observe(time.Since(start).Seconds())
-
-	if err == nil {
-		metricBlocksCompleted.Inc()
+	// If the context is cancelled (shutdown), abandon the completion. The WAL block remains on
+	// disk and will be re-enqueued by reloadBlocks() on next startup.
+	if ctx.Err() != nil {
+		level.Info(s.logger).Log("msg", "abandoning WAL block completion on shutdown, will replay on restart", "tenant", op.tenantID, "block", op.blockID)
 		s.completeQueues.Clear(op)
 		return nil
 	}
 
-	level.Error(s.logger).Log("msg", "failed to complete block", "tenant", op.tenantID, "block", op.blockID, "err", err)
+	completeBlock, err := inst.completeBlock(ctx, op.blockID)
+	if err != nil {
+		metricCompletionDuration.Observe(time.Since(start).Seconds())
+		s.retryCompleteOp(op, span, "failed to complete block", err)
+		return nil
+	}
+
+	if completeBlock == nil {
+		// completeBlock only returns a block when this call converts a WAL block.
+		// On a retry after lifecycle handling fails, the WAL block may already be
+		// gone while the completed block is still present in inst.completeBlocks.
+		completeBlock = inst.blocks.Load().completeBlocks[op.blockID]
+	}
+
+	if completeBlock != nil {
+		if err := s.completeBlockLifecycle.onCompletedBlock(ctx, op.tenantID, completeBlock); err != nil {
+			metricCompletionDuration.Observe(time.Since(start).Seconds())
+			s.retryCompleteOp(op, span, "failed to apply complete block lifecycle", err)
+			return nil
+		}
+	}
+
+	metricCompletionDuration.Observe(time.Since(start).Seconds())
+	metricBlocksCompleted.Inc()
+	s.completeQueues.Clear(op)
+	return nil
+}
+
+func (s *LiveStore) retryCompleteOp(op *completeOp, span oteltrace.Span, msg string, err error) {
+	level.Error(s.logger).Log("msg", msg, "tenant", op.tenantID, "block", op.blockID, "err", err)
 	observeFailedOp(op)
 	span.RecordError(err)
 
@@ -139,29 +176,55 @@ func (s *LiveStore) processCompleteOp(op *completeOp) error {
 			_ = level.Error(s.logger).Log("msg", "failed to requeue block for flushing", "tenant", op.tenantID, "block", op.blockID, "err", err)
 		}
 	}()
-
-	return nil // do not exit global loop
 }
 
-func (s *LiveStore) perTenantCutToWalLoop(instance *instance) {
-	// ticker
-	ticker := time.NewTicker(s.cfg.InstanceFlushPeriod)
-	defer ticker.Stop()
+func (s *LiveStore) startPerTenantCutToWalLoop(inst *instance) {
+	s.cutToWalWg.Add(1)
+	go func() {
+		defer s.cutToWalWg.Done()
 
-	for {
+		// Wait for startup to finish; also listen on cutToWalStop so we can
+		// exit if shutdown happens before startup completes.
 		select {
-		case <-ticker.C:
-			s.cutOneInstanceToWal(s.ctx, instance, false)
-		case <-s.ctx.Done():
+		case <-s.startupComplete:
+		case <-s.cutToWalStop:
 			return
 		}
-	}
+
+		ticker := time.NewTicker(s.cfg.InstanceFlushPeriod)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				s.cutOneInstanceToWal(s.ctx, inst, false)
+			case <-s.cutToWalStop:
+				return
+			case <-s.ctx.Done():
+				return
+			}
+		}
+	}()
+}
+
+func (s *LiveStore) stopAllCutToWalLoops() {
+	close(s.cutToWalStop)
+	s.cutToWalWg.Wait()
 }
 
 func (s *LiveStore) perTenantCleanupLoop(inst *instance) {
 	// ticker
 	ticker := time.NewTicker(s.cfg.InstanceCleanupPeriod)
 	defer ticker.Stop()
+
+	// Reclaim at a fraction of the grace window so blocks are deleted
+	// soon after expiry, not at the next InstanceCleanupPeriod tick.
+	reclaimInterval := s.cfg.BlockReclaimGrace / 4
+	if reclaimInterval < time.Second {
+		reclaimInterval = time.Second
+	}
+	reclaimTicker := time.NewTicker(reclaimInterval)
+	defer reclaimTicker.Stop()
 
 	for {
 		select {
@@ -170,6 +233,15 @@ func (s *LiveStore) perTenantCleanupLoop(inst *instance) {
 			err := inst.deleteOldBlocks()
 			if err != nil {
 				level.Error(s.logger).Log("msg", "failed to delete old blocks", "err", err)
+			}
+		case <-reclaimTicker.C:
+			for _, r := range inst.reclaim.reclaim() {
+				if r.Err != nil {
+					level.Error(s.logger).Log("msg", "reclaim failed", "tenant", r.Tenant, "block_id", r.BlockID.String(), "block_type", r.BlockType, "err", r.Err)
+					continue
+				}
+				metricBlocksClearedTotal.WithLabelValues(r.BlockType).Inc()
+				level.Info(s.logger).Log("msg", "reclaimed block", "tenant", r.Tenant, "block_id", r.BlockID.String(), "block_type", r.BlockType)
 			}
 		case <-s.ctx.Done():
 			return
@@ -231,6 +303,19 @@ func observeFailedOp(op *completeOp) {
 }
 
 func (s *LiveStore) reloadBlocks() error {
+	// Reclaim tombstoned blocks left by an unclean shutdown before
+	// reloading, so they don't get scanned as live.
+	if n, err := s.wal.ClearTombstonedBlocks(); err != nil {
+		level.Warn(s.logger).Log("msg", "failed to clear tombstoned wal blocks at startup", "err", err)
+	} else if n > 0 {
+		level.Info(s.logger).Log("msg", "cleared tombstoned wal blocks at startup", "count", n)
+	}
+	if n, err := s.wal.LocalBackend().ClearTombstonedBlocks(); err != nil {
+		level.Warn(s.logger).Log("msg", "failed to clear tombstoned complete blocks at startup", "err", err)
+	} else if n > 0 {
+		level.Info(s.logger).Log("msg", "cleared tombstoned complete blocks at startup", "count", n)
+	}
+
 	// ------------------------------------
 	// wal blocks
 	// ------------------------------------
@@ -253,14 +338,14 @@ func (s *LiveStore) reloadBlocks() error {
 			defer inst.blocksMtx.Unlock()
 
 			level.Info(s.logger).Log("msg", "reloaded wal block", "block", meta.BlockID.String())
-			inst.walBlocks[(uuid.UUID)(meta.BlockID)] = blk
+			inst.blocks.Store(inst.blocks.Load().withWALBlockAdded((uuid.UUID)(meta.BlockID), blk))
 
-			level.Info(s.logger).Log("msg", "queueing replayed wal block for completion", "block", meta.BlockID.String())
+			level.Info(s.logger).Log("msg", "queueing replayed wal block for completion", "block", meta.BlockID.String(), "size", blk.DataLength())
 			if err := s.enqueueCompleteOp(meta.TenantID, uuid.UUID(meta.BlockID), true); err != nil {
 				return fmt.Errorf("failed to enqueue wal block for completion for tenant %s: %w", meta.TenantID, err)
 			}
 
-			level.Info(s.logger).Log("msg", "reloaded wal blocks", "tenant", inst.tenantID, "count", len(inst.walBlocks))
+			level.Info(s.logger).Log("msg", "reloaded wal blocks", "tenant", inst.tenantID, "count", len(inst.blocks.Load().walBlocks))
 
 			return nil
 		}()
@@ -269,9 +354,13 @@ func (s *LiveStore) reloadBlocks() error {
 		}
 	}
 
+	level.Info(s.logger).Log("msg", "wal blocks to complete at startup", "count", len(walBlocks))
+
 	// ------------------------------------
 	// Complete blocks
 	// ------------------------------------
+	level.Info(s.logger).Log("msg", "reloading completed blocks")
+
 	var (
 		ctx = s.ctx
 		l   = s.wal.LocalBackend()
@@ -344,10 +433,16 @@ func (s *LiveStore) reloadBlocks() error {
 			}
 
 			inst.blocksMtx.Lock()
-			inst.completeBlocks[id] = lb
+			inst.blocks.Store(inst.blocks.Load().withCompleteBlockAdded(id, lb))
 			inst.blocksMtx.Unlock()
+
+			if err := s.completeBlockLifecycle.onReloadedBlock(ctx, tenant, lb); err != nil {
+				return fmt.Errorf("failed to apply complete block lifecycle to reloaded block %s in tenant %s: %w", id.String(), tenant, err)
+			}
 		}
 	}
+
+	level.Info(s.logger).Log("msg", "done reloading completed blocks")
 
 	return nil
 }

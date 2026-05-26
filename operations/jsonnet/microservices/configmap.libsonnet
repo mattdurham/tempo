@@ -48,13 +48,22 @@
     },
   },
 
-  tempo_distributor_config:: $.tempo_config {
+  tempo_ingest_config:: {
+    ingest: {
+      kafka: {
+        address: $._config.kafka_address,
+        topic: $._config.kafka_topic,
+      },
+    },
+  },
+
+  tempo_distributor_config:: $.tempo_config + $.tempo_ingest_config {
     distributor+: {
       receivers+: $._config.distributor.receivers,
     },
   },
 
-  tempo_metrics_generator_config:: $.tempo_config {
+  tempo_metrics_generator_config:: $.tempo_config + $.tempo_ingest_config {
     metrics_generator+: {
       storage+: {
         path: '/var/tempo/generator_wal',
@@ -79,8 +88,19 @@
   },
 
   tempo_query_frontend_config:: $.tempo_config {},
-  tempo_block_builder_config:: $.tempo_config {},
-  tempo_live_store_config:: $.tempo_config {
+  tempo_block_builder_config:: $.tempo_config + $.tempo_ingest_config + (
+    // Inject partitions_per_instance whenever block-builder KEDA is active so that the
+    // dynamic replica count stays coupled to the partition assignment math.
+    if $._config.block_builder.keda.enabled then
+      assert $._config.block_builder.partitions_per_instance > 0 : 'block_builder.partitions_per_instance must be > 0';
+      {
+        block_builder+: {
+          partitions_per_instance: $._config.block_builder.partitions_per_instance,
+        },
+      }
+    else {}
+  ),
+  tempo_live_store_config:: $.tempo_config + $.tempo_ingest_config {
     live_store: {
       partition_ring: {
         delete_inactive_partition_after: $._config.live_store.downscale_delay,

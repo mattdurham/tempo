@@ -29,8 +29,8 @@
     // This feature modifies the block-builder StatefulSet which cannot be altered, so if it already exists it has to be deleted and re-applied again in order to be enabled.
     block_builder_concurrent_rollout_enabled: false,
     // Maximum number of unavailable replicas during a block-builder rollout when using block_builder_concurrent_rollout_enabled feature.
-    // Computed from block-builder replicas by default, but can also be specified as percentage, for example "25%".
-    block_builder_max_unavailable: $.tempo_block_builder_statefulset.spec.replicas,
+    // Defaults to 100% since block-builder pods are independent (each owns distinct Kafka partitions).
+    block_builder_max_unavailable: '100%',
 
     // disable tempo-query by default
     tempo_query: {
@@ -82,6 +82,11 @@
       ephemeral_storage_request_size: error 'Must specify a generator ephemeral_storage_request size',
       ephemeral_storage_limit_size: error 'Must specify a metrics generator ephemeral_storage_limit size',
       replicas: 0,
+      // deployment_max_unavailable: max unavailable during rolling update (default 1).
+      // Accepts an integer or a percentage string, e.g. deployment_max_unavailable: '25%'.
+      // Rolling (1): 2 rebalances per pod. All-at-once (replicas): fewer total rebalances;
+      // first new pod briefly holds all partitions until others rejoin.
+      deployment_max_unavailable: 1,
       resources: {
         requests: {
           cpu: '500m',
@@ -178,6 +183,8 @@
     gossip_ring_port: 7946,
     backend: error 'Must specify a backend',  // gcs|s3
     bucket: error 'Must specify a bucket',
+    kafka_address: error 'Must specify a kafka address',
+    kafka_topic: error 'Must specify a kafka topic',
 
     overrides_configmap_name: 'tempo-overrides',
     overrides+:: {

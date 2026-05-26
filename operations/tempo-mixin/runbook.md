@@ -274,6 +274,48 @@ This alert fires when a Kafka partition in a consumer group is lagging behind th
 - Metric/query: `increase(kube_pod_container_status_restarts_total{container=~"metrics-generator|block-builder|live-store"}[10m])`
 - Log query: `{container=~"metrics-generator|block-builder|live-store"}`
 
+## TempoLiveStoreSingleMemberLagHigh
+
+This alert fires when a single owner of a live-store partition has been lagging for an extended period. At this threshold, normal replay-on-startup cannot explain the lag — a single member is genuinely stuck. Other zones can still serve reads for the partition, so this is an operational concern rather than an immediate read outage.
+
+See [TempoPartitionLag](#TempoPartitionLag) for general Kafka lag troubleshooting.
+
+### How to investigate
+
+1. Identify which pod owns the lagging partition and whether it has recently restarted.
+
+2. **If the pod recently restarted**, it may be replaying. If the node is over-scheduled with many live-store pods, replay can be abnormally slow due to resource contention. As each pod finishes replaying it frees resources for the remaining ones — this is partially self-healing. To speed recovery, delete a few pods so they reschedule onto less-loaded nodes.
+
+3. **If the pod has not restarted recently**, it is genuinely stuck. Check for Kafka issues specific to one broker or partition (e.g. a single-partition leader re-election).
+
+### How to fix
+
+- **Over-scheduled node:** wait for self-healing, or delete a few lagging pods to spread them across less-loaded nodes.
+- **Stuck pod:** restart it.
+- **Kafka partition issue:** check the partition ring for skew and consider rebalancing.
+
+## TempoLiveStoreAllMembersLagging
+
+This alert fires when **all** owners of a live-store partition are lagging simultaneously. Unlike [TempoLiveStoreSingleMemberLagHigh](#TempoLiveStoreSingleMemberLagHigh) — where other zones can still serve reads — this means no zone can serve the affected partition. **This is a partial read outage.**
+
+A genuine issue looks like one or more specific partitions showing constant, sustained lag while others recover. Transient spikes across all partitions during a rollout are normal and should clear; a single partition staying flat is the signal that something is wrong.
+
+See [TempoPartitionLag](#TempoPartitionLag) for general Kafka lag troubleshooting.
+
+### How to investigate
+
+1. Check whether all live-store pods restarted around the same time (coordinated rollout, node failure, or zone-wide issue).
+
+2. If pods restarted together, check whether any nodes are over-scheduled — if multiple pods land on the same node, simultaneous replay can exhaust node resources and cause all of them to lag together. This is partially self-healing as pods finish replaying and free resources.
+
+3. Check for Kafka broker issues — a partition leader election or broker restart can cause all consumers in a group to lag briefly before recovering.
+
+### How to fix
+
+- **Coordinated restart / node over-scheduling:** wait for self-healing, or delete a few pods to spread them across less-loaded nodes.
+- **Kafka root cause:** investigate broker health and partition leadership.
+- **Persistent stall:** restart affected pods and monitor lag recovery.
+
 ## TempoBlockBuildersPartitionsMismatch
 
 This alert fires when more than one active or inactive partition has been unowned by a block-builder for more than 10 minutes.
@@ -403,6 +445,53 @@ This alert means that the tenant's cost attribution is not working or is incorre
 - Metric/query: `sum by (tenant, reason) (rate(tempo_distributor_usage_tracker_errors_total[5m]))`
 - Metric/query: `sum by (tenant, reason) (increase(tempo_distributor_usage_tracker_errors_total[1h]))`
 - Log query: `{container="distributor"} |= "failed to collect usage tracker metric"`
+
+## TempoDistributorKafkaProduceFailing
+
+The distributor writes incoming trace records to Kafka before they are picked up by live-stores and
+block-builders. This alert fires when more than 0.1% of those produce attempts are failing, sustained
+for 5 minutes. Failed records are dropped on the write path, so this is a direct ingest-data-loss
+signal.
+
+This alert is intended as a **fast leading indicator**. The request-latency / write SLO burn-rate
+alerts only fire once the failures propagate back to `cortex-gw` as gRPC errors or as requests slower
+than the SLO bucket. With small-but-sustained failure rates the cortex-gw signal can take hours to
+cross the SLO burn threshold; this alert fires from the producer side in minutes.
+
+### Failure reasons
+
+The `tempo_distributor_produce_failures_total` metric carries a `reason` label set by
+`pkg/ingest/writer_client.go::produceErrReason`:
+
+- `timeout` -- `context.DeadlineExceeded` or `kgo.ErrRecordTimeout`. Kafka did not ack the record
+  before the deadline. Most common real failure mode. Look at Kafka broker / Warpstream agent health.
+- `buffer-full` -- `kgo.ErrMaxBuffered`. The Kafka client's in-memory buffer reached its byte limit.
+  The producer is unable to flush fast enough; usually a downstream Kafka slowdown.
+- `record-too-large` -- `kerr.MessageTooLarge`. A single record exceeded the topic's max message size.
+  Usually points at a misbehaving tenant sending oversized spans/batches.
+- `canceled` -- `context.Canceled`. The source comments state this should never happen; investigate
+  immediately.
+- `other` -- anything else not matched above. Inspect distributor logs for the underlying error.
+- `cancelled-before-producing` -- the caller cancelled before the record was handed to the Kafka
+  client. This is a caller-side cancellation, not a producer problem, and is **excluded** from the
+  alert expression.
+
+### How to investigate
+
+1. Break the failure rate down by reason to identify the failure mode:
+   `sum by (cluster, namespace, reason) (rate(tempo_distributor_produce_failures_total[5m]))`.
+2. Check Kafka / Warpstream agent and controlplane health (latency, error rates, restarts, OOMKills).
+3. Check distributor pod health and resource saturation -- a slow distributor can cause `timeout`
+   even when Kafka is healthy.
+4. Compare against the produce rate and write latency to confirm whether the issue is throughput
+   (broker slow) or capacity (client buffer full).
+
+### Quick checks
+- Metric/query: `sum by (cluster, namespace, reason) (rate(tempo_distributor_produce_failures_total[5m]))`
+- Metric/query: `sum by (cluster, namespace, reason) (rate(tempo_distributor_produce_failures_total[5m])) / ignoring(reason) group_left sum by (cluster, namespace) (rate(tempo_distributor_produce_records_total[5m]))`
+- Metric/query: `histogram_quantile(0.99, sum by (le) (rate(tempo_distributor_kafka_write_latency_seconds_bucket[5m])))`
+- Metric/query: `tempo_distributor_buffered_produce_bytes / tempo_distributor_buffered_produce_bytes_limit`
+- Log query: `{container="distributor"} |~ "failed to produce|kafka"`
 
 ## TempoMetricsGeneratorProcessorUpdatesFailing
 

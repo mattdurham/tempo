@@ -76,13 +76,13 @@ Tanka requires the current context for your Kubernetes environment.
 
 ## Install libraries
 
-Install the `k.libsonnet`, Jsonnet, and Memcachd libraries.
+Install the `k.libsonnet`, Jsonnet, and Memcached libraries.
 
-1. Install `k.libsonnet` for your version of Kubernetes:
+1. Install `k.libsonnet` for your version of Kubernetes. Set `K8S_VERSION` to match your cluster's minor version (for example, `1.32`):
 
    ```bash
    mkdir -p lib
-   export K8S_VERSION=1.25
+   export K8S_VERSION=1.32
    jb install github.com/jsonnet-libs/k8s-libsonnet/${K8S_VERSION}@main
    cat <<EOF > lib/k.libsonnet
    import 'github.com/jsonnet-libs/k8s-libsonnet/${K8S_VERSION}/main.libsonnet'
@@ -167,10 +167,10 @@ Install the `k.libsonnet`, Jsonnet, and Memcachd libraries.
                - --console-address
                - ':9001'
              env:
-               # Minio access key and secret key
-               - name: MINIO_ACCESS_KEY
+               # MinIO root credentials
+               - name: MINIO_ROOT_USER
                  value: 'minio'
-               - name: MINIO_SECRET_KEY
+               - name: MINIO_ROOT_PASSWORD
                  value: 'minio123'
              ports:
                - containerPort: 9000
@@ -226,10 +226,9 @@ Install the `k.libsonnet`, Jsonnet, and Memcachd libraries.
    local containerPort = k.core.v1.containerPort;
 
    tempo {
-       _images+:: {
-           tempo: 'grafana/tempo:latest',
-           tempo_query: 'grafana/tempo-query:latest',
-       },
+    _images+:: {
+          tempo: 'grafana/tempo:latest',
+      },
 
        tempo_distributor_container+:: container.withPorts([
                containerPort.new('jaeger-grpc', 14250),
@@ -329,7 +328,11 @@ Install the `k.libsonnet`, Jsonnet, and Memcachd libraries.
                 },
             },
             overrides+: {
-                metrics_generator_processors: ['service-graphs', 'span-metrics'],
+                defaults+: {
+                    metrics_generator+: {
+                        processors: ['service-graphs', 'span-metrics'],
+                    },
+                },
             },
         },
     }
@@ -346,7 +349,7 @@ In the preceding configuration, [metrics generation](/docs/tempo/<TEMPO_VERSION>
 If you'd like to remote write these metrics onto a Prometheus compatible instance (such as Grafana Cloud metrics or a Mimir instance), you'll need to include the configuration block below in the `metrics_generator` section of the `tempo_config` block above (this assumes basic auth is required, if not then remove the `basic_auth` section).
 You can find the details for your Grafana Cloud metrics instance for your Grafana Cloud account by using the [Cloud Portal](/docs/grafana-cloud/account-management/cloud-portal/).
 
-````jsonnet
+```jsonnet
 storage+: {
     remote_write: [
         {
@@ -364,6 +367,74 @@ storage+: {
 {{< admonition type="note" >}}
 Enabling metrics generation and remote writing them to Grafana Cloud Metrics produces extra active series that could potentially impact your billing. For more information on billing, refer to [Billing and usage](/docs/grafana-cloud/billing-and-usage/). For more information on metrics generation, refer the [Metrics-generator documentation](/docs/tempo/<TEMPO_VERSION>/metrics-from-traces/metrics-generator/).
 {{< /admonition >}}
+
+### Optional: Enable KEDA autoscaling
+
+The microservices Jsonnet library includes optional KEDA-based horizontal autoscaling for distributor, metrics-generator, backend-worker, live-store, and block-builder components. All KEDA scalers are disabled by default (`enabled: false`), and you enable each component independently under `_config.<component>.keda`.
+
+Before you enable this option, make sure your cluster has the KEDA operator and CRDs installed.
+
+The following example enables all supported KEDA scalers. Set `autoscaling_prometheus_url` to the address of your Prometheus-compatible backend. If your backend is a multi-tenant system such as Grafana Mimir, also set `autoscaling_prometheus_tenant` to your tenant ID so that KEDA sends the `X-Scope-OrgID` header on every scrape request:
+
+```jsonnet
+_config+:: {
+  autoscaling_prometheus_url: 'http://prometheus-operated.monitoring.svc.cluster.local:9090',
+  // autoscaling_prometheus_tenant: 'my-tenant',  // Required for multi-tenant backends (e.g. Grafana Mimir)
+  distributor+: {
+    keda+: {
+      enabled: true,
+      min_replicas: 2,
+      max_replicas: 200,
+      target_cpu: '330m',
+    },
+  },
+  metrics_generator+: {
+    keda+: {
+      enabled: true,
+      min_replicas: 1,
+      max_replicas: 200,
+      target_cpu: '500m',
+    },
+  },
+  backend_worker+: {
+    keda+: {
+      enabled: true,
+      min_replicas: 3,
+      max_replicas: 200,
+      threshold: 200,
+    },
+  },
+  live_store+: {
+    keda+: {
+      enabled: true,
+      min_replicas: 1,
+      max_replicas: 200,
+      // window_seconds: 1800,           // retention window; >= complete_block_timeout + query_backend_after
+      // bytes_per_replica: 16800000000, // ~16 GiB at 10 MB/s per pod over 30m
+    },
+  },
+  block_builder+: {
+    keda+: {
+      enabled: true,
+      // scaling controls how block-builder replicas track live-store:
+      //   'rollout-operator' (default): rollout-operator mirrors live-store zone-a replicas
+      //     directly to block-builder. Faster on both scale-up and scale-down.
+      //     Requires live_store.keda.enabled=true. rollout_operator_replica_template_access_enabled
+      //     is set automatically.
+      //   'keda': a dedicated KEDA ScaledObject uses a kubernetes-workload trigger counting
+      //     live-store zone-a pods. Works with or without live-store KEDA. Reaction time is
+      //     bounded by KEDA's polling cycle and stabilization windows.
+      // scaling: 'rollout-operator',
+    },
+  },
+},
+```
+
+Tempo uses these trigger types when KEDA is enabled: CPU for distributor and metrics-generator, Prometheus for backend-worker and live-store.
+
+Block-builder autoscaling is configured independently under `_config.block_builder.keda`. The default approach (`scaling: 'rollout-operator'`) uses the rollout-operator to mirror the live-store zone-a replica count directly to block-builder. This is the faster approach on both scale-up and scale-down: block-builder reacts as soon as the ReplicaTemplate changes, which is the same signal zone-a responds to. Block-builder intentionally stays alive through the live-store drain window so that in-flight partition data is not lost before it is written to the backend. This approach requires `live_store.keda.enabled=true`; `rollout_operator_replica_template_access_enabled` is set automatically.
+
+Alternatively, set `scaling: 'keda'` to use a dedicated KEDA ScaledObject (kubernetes-workload trigger) that counts live-store zone-a pods. This approach works with or without live-store KEDA enabled. Because KEDA must observe pod counts through its polling cycle and apply stabilization windows before acting, reaction time is longer than the rollout-operator approach — on scale-up, block-builder only reacts after new zone-a pods are running and counted; on scale-down, block-builder only reacts after zone-a pods have fully terminated. The block-builder KEDA defaults use aggressive scaling windows to minimize this delay. The value of `_config.block_builder.partitions_per_instance` (default: `1`) is injected into the block-builder config when block-builder KEDA is active under either approach.
 
 ### Optional: Reduce component system requirements
 
@@ -419,7 +490,7 @@ The Tempo instance will now accept the two configured trace protocols (OTLP gRPC
 - OTLP gRPC: `4317`
 - Jaeger gRPC: `14250`
 
-You can query Tempo using the `query-frontend.tempo.svc.cluster.local` service on port `3200` for Tempo queries or port `16686` or `16687` for Jaeger type queries.
+You can query Tempo using the `query-frontend.tempo.svc.cluster.local` service on port `3200`.
 
 Now that you've configured a Tempo cluster, you'll need to validate your deployment.
 Refer to the [Validate Kubernetes deployment using a test application](/docs/tempo/<TEMPO_VERSION>/set-up-for-tracing/setup-tempo/test/set-up-test-app/) for instructions.

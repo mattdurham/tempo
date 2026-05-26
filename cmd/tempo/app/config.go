@@ -3,6 +3,7 @@ package app
 import (
 	"flag"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/grafana/dskit/flagext"
@@ -23,6 +24,7 @@ import (
 	"github.com/grafana/tempo/modules/storage"
 	"github.com/grafana/tempo/pkg/ingest"
 	internalserver "github.com/grafana/tempo/pkg/server"
+	"github.com/grafana/tempo/pkg/traceql"
 	"github.com/grafana/tempo/pkg/usagestats"
 	"github.com/grafana/tempo/pkg/util"
 	"github.com/grafana/tempo/tempodb"
@@ -46,7 +48,7 @@ type Config struct {
 	StreamOverHTTPEnabled  bool          `yaml:"stream_over_http_enabled,omitempty"`
 	HTTPAPIPrefix          string        `yaml:"http_api_prefix"`
 	EnableGoRuntimeMetrics bool          `yaml:"enable_go_runtime_metrics,omitempty"`
-	PartitionRingLiveStore bool          `yaml:"partition_ring_live_store,omitempty"` // todo: remove after rhythm migration
+	SpanProfiling          bool          `yaml:"span_profiling,omitempty"`
 
 	Memory                 MemoryConfig                   `yaml:"memory,omitempty"`
 	Server                 server.Config                  `yaml:"server,omitempty"`
@@ -81,7 +83,6 @@ func NewDefaultConfig() *Config {
 func (c *Config) RegisterFlagsAndApplyDefaults(prefix string, f *flag.FlagSet) {
 	c.Target = SingleBinary
 	c.StreamOverHTTPEnabled = false
-	c.PartitionRingLiveStore = false
 
 	// Memory settings
 	c.Memory = MemoryConfig{
@@ -96,6 +97,7 @@ func (c *Config) RegisterFlagsAndApplyDefaults(prefix string, f *flag.FlagSet) {
 	f.StringVar(&c.HTTPAPIPrefix, "http-api-prefix", "", "String prefix for all http api endpoints.")
 	f.BoolVar(&c.EnableGoRuntimeMetrics, "enable-go-runtime-metrics", false, "Set to true to enable all Go runtime metrics")
 	f.DurationVar(&c.ShutdownDelay, "shutdown-delay", 0, "How long to wait between SIGTERM and shutdown. After receiving SIGTERM, Tempo will report not-ready status via /ready endpoint.")
+	f.BoolVar(&c.SpanProfiling, "span-profiling", false, "Set to true to enable span profiling (pyroscope pprof labels on OTel spans).")
 
 	// Server settings
 	flagext.DefaultValues(&c.Server)
@@ -148,7 +150,7 @@ func (c *Config) RegisterFlagsAndApplyDefaults(prefix string, f *flag.FlagSet) {
 	c.Ingest.RegisterFlagsAndApplyDefaults(util.PrefixConfig(prefix, "ingest"), f)
 	c.BlockBuilder.RegisterFlagsAndApplyDefaults(util.PrefixConfig(prefix, "block-builder"), f)
 	c.Querier.RegisterFlagsAndApplyDefaults(util.PrefixConfig(prefix, "querier"), f)
-	c.Frontend.RegisterFlagsAndApplyDefaults(util.PrefixConfig(prefix, "frontend"), f)
+	c.Frontend.RegisterFlagsAndApplyDefaults(util.PrefixConfig(prefix, "query-frontend"), f)
 	c.StorageConfig.RegisterFlagsAndApplyDefaults(util.PrefixConfig(prefix, "storage"), f)
 	c.UsageReport.RegisterFlagsAndApplyDefaults(util.PrefixConfig(prefix, "reporting"), f)
 	c.CacheProvider.RegisterFlagsAndApplyDefaults(util.PrefixConfig(prefix, "cache"), f)
@@ -237,6 +239,22 @@ func (c *Config) CheckConfig() []ConfigWarning {
 
 	if len(c.BlockBuilder.AssignedPartitionsMap) > 0 && c.BlockBuilder.PartitionsPerInstance > 0 {
 		warnings = append(warnings, warnPartitionAssigmentCollision)
+	}
+
+	for _, name := range c.Frontend.SkipASTTransformations {
+		if !traceql.IsValidTransformationName(name) {
+			warnings = append(warnings, ConfigWarning{
+				Message: fmt.Sprintf("unknown AST transformation %q in query_frontend.skip_ast_transformations", name),
+				Explain: "valid transformation names are: " + strings.Join(traceql.KnownTransformationNames(), ", "),
+			})
+		}
+	}
+
+	if !c.Frontend.RF1After.IsZero() {
+		warnings = append(warnings, ConfigWarning{
+			Message: "query_frontend.rf1_after is deprecated and will be removed in a future release.",
+			Explain: "Non-metric query paths now query all blocks regardless of replication factor. This setting is ignored.",
+		})
 	}
 
 	return warnings

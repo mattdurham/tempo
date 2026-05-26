@@ -181,9 +181,8 @@ func TestOne(t *testing.T) {
 			Step:  uint64(1 * time.Second),
 		}
 	)
-	eval, err := traceql.NewEngine().CompileMetricsQueryRange(req, 1, false)
+	fetchSpansRequest, err := traceql.ExtractFetchSpansRequest(q)
 	require.NoError(t, err)
-	fetchSpansRequest := eval.FetchSpansRequest()
 
 	spanOnly, err := b.FetchSpans(ctx, fetchSpansRequest, common.DefaultSearchOptions())
 	require.NoError(t, err, "search request:", req)
@@ -428,7 +427,7 @@ func TestBackendNilValueBlockSearchTraceQL(t *testing.T) {
 											String02: []string{"dedicated-span-attr-value-2"},
 											String03: []string{"dedicated-span-attr-value-3"},
 											String04: []string{"dedicated-span-attr-value-4"},
-											String05: []string{"dedicated-span-attr-value-5"},
+											String05: []string{test.DedicatedBlobTestString()},
 										},
 										Attrs: []Attribute{
 											// BUG - at least one generic attr is required to satisfy
@@ -563,6 +562,9 @@ func searchesThatMatch(t *testing.T, traceIDText string) []struct {
 	name string
 	req  traceql.FetchSpansRequest
 } {
+	blobSpan5 := test.DedicatedBlobTestString()
+	blobSpan5Eq := fmt.Sprintf(`{span.dedicated.span.5 = "%s"}`, blobSpan5)
+	blobSpan5Re := fmt.Sprintf(`{span.dedicated.span.5 =~ "^B{%d}$"}`, test.DedicatedBlobTestSize)
 	return []struct {
 		name string
 		req  traceql.FetchSpansRequest
@@ -639,8 +641,8 @@ func searchesThatMatch(t *testing.T, traceIDText string) []struct {
 		{"span.dedicated.span.2", traceql.MustExtractFetchSpansRequestWithMetadata(`{span.dedicated.span.2 = "dedicated-span-attr-value-2"}`)},
 		{"span.dedicated.span.4", traceql.MustExtractFetchSpansRequestWithMetadata(`{span.dedicated.span.4 = "dedicated-span-attr-value-4"}`)},
 		// Blob attributes
-		{"span.dedicated.span.5", traceql.MustExtractFetchSpansRequestWithMetadata(`{span.dedicated.span.5 = "dedicated-span-attr-value-5"}`)},
-		{"span.dedicated.span.5", traceql.MustExtractFetchSpansRequestWithMetadata(`{span.dedicated.span.5 =~ "dedicated-span-attr-value-5"}`)},
+		{"span.dedicated.span.5", traceql.MustExtractFetchSpansRequestWithMetadata(blobSpan5Eq)},
+		{"span.dedicated.span.5", traceql.MustExtractFetchSpansRequestWithMetadata(blobSpan5Re)},
 		{"span.dedicated.span.5", traceql.MustExtractFetchSpansRequestWithMetadata(`{span.dedicated.span.5 != ""}`)},
 		{"span.dedicated.span.5", traceql.MustExtractFetchSpansRequestWithMetadata(`{span.dedicated.span.5 != "asdf"}`)},
 		{"span.dedicated.span.5", traceql.MustExtractFetchSpansRequestWithMetadata(`{span.dedicated.span.5 > ""}`)},
@@ -1196,7 +1198,7 @@ func fullyPopulatedTestTraceWithOption(id common.ID, parentIDTest bool) *Trace {
 									String02: []string{"dedicated-span-attr-value-2"},
 									String03: []string{"dedicated-span-attr-value-3"},
 									String04: []string{"dedicated-span-attr-value-4"},
-									String05: []string{"dedicated-span-attr-value-5"},
+									String05: []string{test.DedicatedBlobTestString()},
 								},
 							},
 						},
@@ -1441,7 +1443,7 @@ func TestBackendBlockSelectAll(t *testing.T) {
 
 	b := makeBackendBlockWithTraces(t, traces)
 
-	_, eval, _, _, req, err := traceql.Compile("{}")
+	_, _, eval, req, err := traceql.Compile("{}")
 	require.NoError(t, err)
 	req.SecondPass = func(inSS *traceql.Spanset) ([]*traceql.Spanset, error) { return eval([]*traceql.Spanset{inSS}) }
 	req.SecondPassSelectAll = true
@@ -1697,7 +1699,7 @@ func BenchmarkBackendBlockTraceQL(b *testing.B) {
 					},
 				)
 
-				resp, err := e.ExecuteSearch(ctx, &tempopb.SearchRequest{Query: tc.query}, f, false)
+				resp, err := e.ExecuteSearch(ctx, &tempopb.SearchRequest{Query: tc.query}, f)
 				require.NoError(b, err)
 				require.NotNil(b, resp)
 
@@ -1783,7 +1785,7 @@ func BenchmarkIterators(b *testing.B) {
 func BenchmarkBackendBlockQueryRange(b *testing.B) {
 	testCases := []string{
 		"{} | rate()",
-		"{} | rate() with(new=true)",
+		"{} | rate() with(spanonly_fetch=false)",
 		"{} | rate() with(sample=true)",
 		"{} | rate() by (span.http.status_code)",
 		"{} | rate() by (resource.service.name)",
@@ -1799,6 +1801,12 @@ func BenchmarkBackendBlockQueryRange(b *testing.B) {
 		"{} | min_over_time(duration) by (span.http.status_code)",
 		"{ name != nil } | compare({status=error})",
 		"{} > {} | rate() by (name)", // structural
+
+		// Math operations
+		"({} | rate()) + ({} | rate())",
+		"({} | rate()) - ({} | rate())",
+		"({} | rate()) * ({} | rate())",
+		"({} | rate()) / ({} | count_over_time())",
 
 		// This is useful for sampler debugging
 		// {} | rate() with(sample=true,debug=true,info=true)
@@ -1835,7 +1843,7 @@ func BenchmarkBackendBlockQueryRange(b *testing.B) {
 				Exemplars: 2,
 			}
 
-			eval, err := e.CompileMetricsQueryRange(req, 0, false)
+			eval, err := e.CompileMetricsQueryRange(req, traceql.WithUnsafeHints(true))
 			require.NoError(b, err)
 
 			b.ResetTimer()
@@ -1920,6 +1928,12 @@ func TestSamplingError(t *testing.T) {
 		"{nestedSetParent<0 && true} | histogram_over_time(duration)",
 		`{nestedSetParent<0 && resource.service.name="gme-alertmanager" && resource.service.namespace != nil} | rate() by(resource.service.namespace)`,
 		"{true && true && resource.service.name != nil} | rate() by(resource.service.name)",*/
+
+		// Math operations
+		"({} | rate()) + ({} | rate())",
+		"({} | rate()) - ({} | rate())",
+		"({} | rate()) * ({} | rate())",
+		"({} | rate()) / ({} | count_over_time())",
 	}
 
 	options := []string{
@@ -1961,7 +1975,7 @@ func TestSamplingError(t *testing.T) {
 			Exemplars: 2,
 		}
 
-		eval, err := e.CompileMetricsQueryRange(req, 0, false)
+		eval, err := e.CompileMetricsQueryRange(req)
 		require.NoError(t, err)
 
 		err = eval.Do(ctx, f, st, end, int(req.MaxSeries))

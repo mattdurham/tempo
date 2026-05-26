@@ -94,6 +94,14 @@ max_search_duration: 5m
 	assert.Equal(t, limitsYAML, limitsJSON)
 }
 
+func TestConfig_DefaultIngestionLimits(t *testing.T) {
+	cfg := Config{}
+	cfg.RegisterFlagsAndApplyDefaults(flag.NewFlagSet("test", flag.ContinueOnError))
+
+	assert.Equal(t, 30_000_000, cfg.Defaults.Ingestion.RateLimitBytes)
+	assert.Equal(t, 30_000_000, cfg.Defaults.Ingestion.BurstSizeBytes)
+}
+
 func TestConfig_legacy(t *testing.T) {
 	legacyRawYaml := `
 ingestion_rate_strategy: local
@@ -270,7 +278,7 @@ func TestOverrides_AssertUserConfigurableOverridesAreASubsetOfRuntimeOverrides(t
 		},
 		MetricsGenerator: client.LimitsMetricsGenerator{
 			CollectionInterval: &client.Duration{Duration: 5 * time.Minute},
-			Processors:         map[string]struct{}{"service-graphs": {}},
+			Processors:         &listtomap.ListToMap{"service-graphs": {}},
 		},
 	}
 
@@ -458,12 +466,14 @@ func generateTestLegacyOverrides() LegacyOverrides {
 		CompactionDisabled: true,
 		CompactionWindow:   model.Duration(4 * time.Hour),
 
-		MaxBytesPerTagValuesQuery:  1000,
-		MaxBlocksPerTagValuesQuery: 100,
+		MaxBytesPerTagValuesQuery:     1000,
+		MaxBlocksPerTagValuesQuery:    100,
+		MaxConditionGroupsPerTagQuery: 5,
 
-		MaxSearchDuration:  model.Duration(10 * time.Minute),
-		MaxMetricsDuration: model.Duration(30 * time.Minute),
-		UnsafeQueryHints:   true,
+		MaxSearchDuration:    model.Duration(10 * time.Minute),
+		MaxMetricsDuration:   model.Duration(30 * time.Minute),
+		UnsafeQueryHints:     true,
+		MetricsSpanOnlyFetch: boolPtr(true),
 
 		MaxBytesPerTrace: 10 * 1024 * 1024,
 

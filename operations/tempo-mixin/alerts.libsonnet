@@ -227,12 +227,12 @@
               severity: 'warning',
             },
             annotations: {
-              message: 'Tempo ingest partition {{ $labels.partition }} for live store {{ $labels.group }} is lagging by more than %d seconds in {{ $labels.%s }}/{{ $labels.namespace }}.' % [$._config.alerts.live_store_partition_lag_critical_seconds, $._config.per_cluster_label],
+              message: 'Tempo ingest partition {{ $labels.partition }} for live store {{ $labels.group }} is lagging by {{ $value | humanizeDuration }} (threshold: %ds) in {{ $labels.%s }}/{{ $labels.namespace }}.' % [$._config.alerts.live_store_partition_lag_warning_seconds, $._config.per_cluster_label],
               runbook_url: 'https://github.com/grafana/tempo/tree/main/operations/tempo-mixin/runbook.md#TempoPartitionLag',
             },
           },
           {
-            alert: 'TempoLiveStorePartitionLagCritical',
+            alert: 'TempoLiveStoreSingleMemberLagHigh',
             expr: |||
               max by (%s, partition, group) (avg_over_time(tempo_ingest_group_partition_lag_seconds{namespace=~"%s", container=~"%s"}[6m])) > %d
             ||| % [$._config.group_by_cluster, $._config.namespace, $._config.jobs.live_store, $._config.alerts.live_store_partition_lag_critical_seconds],
@@ -241,8 +241,22 @@
               severity: 'critical',
             },
             annotations: {
-              message: 'Tempo ingest partition {{ $labels.partition }} for live store group {{ $labels.group }} is lagging by more than %d seconds in {{ $labels.%s }}/{{ $labels.namespace }}.' % [$._config.alerts.live_store_partition_lag_critical_seconds, $._config.per_cluster_label],
-              runbook_url: 'https://github.com/grafana/tempo/tree/main/operations/tempo-mixin/runbook.md#TempoPartitionLag',
+              message: 'A single Tempo live-store owner of partition {{ $labels.partition }} (group {{ $labels.group }}) is lagging by {{ $value | humanizeDuration }} (threshold: %ds) in {{ $labels.%s }}/{{ $labels.namespace }}.' % [$._config.alerts.live_store_partition_lag_critical_seconds, $._config.per_cluster_label],
+              runbook_url: 'https://github.com/grafana/tempo/tree/main/operations/tempo-mixin/runbook.md#TempoLiveStoreSingleMemberLagHigh',
+            },
+          },
+          {
+            alert: 'TempoLiveStoreAllMembersLagging',
+            expr: |||
+              min by (%s, partition) (avg_over_time(tempo_ingest_group_partition_lag_seconds{namespace=~"%s", container=~"%s"}[6m])) > %d
+            ||| % [$._config.group_by_cluster, $._config.namespace, $._config.jobs.live_store, $._config.alerts.live_store_all_members_lag_seconds],
+            'for': '2m',
+            labels: {
+              severity: 'critical',
+            },
+            annotations: {
+              message: 'All owners of Tempo live-store partition {{ $labels.partition }} are lagging by {{ $value | humanizeDuration }} in {{ $labels.%s }}/{{ $labels.namespace }}. This is a partial read outage.' % [$._config.per_cluster_label],
+              runbook_url: 'https://github.com/grafana/tempo/tree/main/operations/tempo-mixin/runbook.md#TempoLiveStoreAllMembersLagging',
             },
           },
           {
@@ -424,6 +438,37 @@
             annotations: {
               message: 'Tempo distributor usage tracker errors for tenant {{ $labels.tenant }} in {{ $labels.cluster }}/{{ $labels.namespace }} (reason: {{ $labels.reason }}).',
               runbook_url: 'https://github.com/grafana/tempo/tree/main/operations/tempo-mixin/runbook.md#TempoDistributorUsageTrackerErrors',
+            },
+          },
+          {
+            // Distributors produce trace records to Kafka. If a non-trivial fraction of records fail
+            // to produce, traces are dropped on the write path. This alert is a fast leading
+            // indicator for write path issues: the request-latency / SLO burn alerts only fire once
+            // the failures cascade back to cortex-gw as gRPC errors or >2.5s requests, which can
+            // take hours when the error rate is small but sustained.
+            //
+            // The 'cancelled-before-producing' reason is excluded because it is a caller-side
+            // cancellation (upstream context done) rather than a Kafka/producer problem.
+            alert: 'TempoDistributorKafkaProduceFailing',
+            expr: |||
+              sum by (%s) (rate(tempo_distributor_produce_failures_total{namespace=~"%s", reason!="cancelled-before-producing"}[5m]))
+              /
+              sum by (%s) (rate(tempo_distributor_produce_records_total{namespace=~"%s"}[5m]))
+              > %s
+            ||| % [
+              $._config.group_by_cluster,
+              $._config.namespace,
+              $._config.group_by_cluster,
+              $._config.namespace,
+              $._config.alerts.distributor_kafka_produce_failure_ratio,
+            ],
+            'for': '5m',
+            labels: {
+              severity: 'critical',
+            },
+            annotations: {
+              message: '{{ $value | humanizePercentage }} of distributor -> Kafka record produces are failing in {{ $labels.cluster }}/{{ $labels.namespace }}.',
+              runbook_url: 'https://github.com/grafana/tempo/tree/main/operations/tempo-mixin/runbook.md#TempoDistributorKafkaProduceFailing',
             },
           },
           {
