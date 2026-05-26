@@ -3241,3 +3241,388 @@ Back-ref: `api_test.go:TestQueryTraceQL_Pipeline_Count_NoQualifyingTraces`
 **Spec invariants tested:** NOTE-092 (non-count aggregates use general path), SPEC-PA-1, SPEC-PA-2.
 
 Back-ref: `api_test.go:TestQueryTraceQL_Pipeline_NonCountAggregate_GeneralPath`
+
+---
+
+## EX-ST-13: TestExecuteStructural_ChainTooLong
+*Added: 2026-04-28*
+
+**Scenario:** A structural chain with more than 8 nodes is rejected with an error.
+
+**Setup:** Build a 9-node `>>` chain: `{} >> {} >> {} >> {} >> {} >> {} >> {} >> {} >> {}`. Call `ExecuteStructural`.
+
+**Assertion:** `ExecuteStructural` returns a non-nil error. The uint8 bitmask (`nodeMatch`) can only represent 8 nodes; a 9th node would overflow silently.
+
+**Spec invariants tested:** SPEC-STRUCT-8.
+
+Back-ref: `internal/modules/executor/stream_structural_test.go:TestExecuteStructural_ChainTooLong`
+
+---
+
+## EX-ST-14: TestExecuteStructural_NegationOpInMultiNodeChain
+*Added: 2026-04-28*
+
+**Scenario:** Negation operators (OpNotSibling `!~`, OpNotDescendant `!>>`, OpNotChild `!>`) are rejected when they appear in a multi-node chain (N > 2 nodes).
+
+**Setup:** Three table-driven cases:
+- `{} !~ {} ~ {}` (OpNotSibling in chain)
+- `{} !>> {} >> {}` (OpNotDescendant in chain)
+- `{} !> {} > {}` (OpNotChild in chain)
+
+Each is parsed and passed to `ExecuteStructural`.
+
+**Assertion:** Each case returns a non-nil error. Single-step (2-node, 1-op) negation queries are unaffected.
+
+**Spec invariants tested:** SPEC-STRUCT-8.
+
+Back-ref: `internal/modules/executor/stream_structural_test.go:TestExecuteStructural_NegationOpInMultiNodeChain`
+
+---
+
+## EX-ST-15: TestExecuteStructural_PopulatesBlockIdxRowIdx
+*Added: 2026-04-28*
+
+**Scenario:** `ExecuteStructural` populates `BlockIdx` and `RowIdx` on matched terminal spans so that the conversion layer can construct a `SpanFieldsAdapter` backed by the reader's intrinsic section.
+
+**Setup:** Write a structural trace (root with service `svc-root`, child with `svc-leaf`). Query: `{ resource.service.name = "svc-root" } >> { resource.service.name = "svc-leaf" }`. Call `ExecuteStructural`.
+
+**Assertions:**
+- Exactly 1 match is returned.
+- `m.BlockIdx >= 0` and `m.RowIdx >= 0`.
+- At least one of `BlockIdx` or `RowIdx` is non-zero (the grandchild span is not the first span written, so it cannot be at block 0 row 0).
+
+**Spec invariants tested:** SPEC-STRUCT-5 (BlockIdx/RowIdx are now populated), NOTE-093.
+
+Back-ref: `internal/modules/executor/stream_structural_test.go:TestExecuteStructural_PopulatesBlockIdxRowIdx`
+
+---
+
+## EX-ST-16: TestExecuteStructural_AllProgramFileRejection_OR_LHS
+*Added: 2026-04-28*
+
+**Scenario:** NOTE-095 all-program file rejection does not produce false negatives for positive
+>> queries with an OR on the LHS.
+
+**Setup:** Write two traces: trace A (svc-alpha → svc-beta), trace B (svc-gamma standalone).
+Query: `{ resource.service.name = "svc-alpha" || resource.service.name = "svc-gamma" } >> { resource.service.name = "svc-beta" }`.
+
+**Assertions:**
+- Exactly 1 match is returned: svc-beta (descendant of svc-alpha).
+- The OR LHS does not cause the file to be skipped.
+
+**Spec invariants tested:** NOTE-095 (all-program file rejection, positive operator safety).
+
+Back-ref: `internal/modules/executor/stream_structural_test.go:TestExecuteStructural_AllProgramFileRejection_OR_LHS`
+
+---
+
+## EX-ST-17: TestExecuteStructural_NegationOp_LHSAbsent_DoesNotSkipFile
+*Added: 2026-04-28*
+
+**Scenario:** NOTE-095 — for a negation op (!>>), the LHS program being absent from the file
+must NOT cause the file to be skipped. Absent LHS means all RHS spans trivially qualify.
+
+**Setup:** Use the standard structural trace (writeStructuralTrace). Query:
+`{ resource.service.name = "nonexistent" } !>> {}`. The LHS filter matches no spans.
+
+**Assertions:**
+- result.Matches is non-empty (all spans qualify — no "nonexistent" ancestor for any span).
+- File must not have been rejected due to absent LHS predicate.
+
+**Spec invariants tested:** NOTE-095 (`shouldRejectFileForProgram` returns false for LHS of negation op).
+
+Back-ref: `internal/modules/executor/stream_structural_test.go:TestExecuteStructural_NegationOp_LHSAbsent_DoesNotSkipFile`
+
+---
+
+## EX-ST-18: TestExecuteStructural_TracePreQual_SingleSpanTrace
+*Added: 2026-04-28*
+
+**Scenario:** NOTE-096 trace pre-qualification — a single-span trace with only a root span
+(nodeMatch bit 0 set, bit 1 not set) is correctly pruned by `traceCanMatch` for >>. The full
+parent-child trace in the same file still produces a match.
+
+**Setup:** Write two traces: trace A (svc-alpha → svc-beta), trace B (svc-gamma standalone).
+Query: `{ resource.service.name = "svc-alpha" } >> { resource.service.name = "svc-beta" }`.
+
+**Assertions:**
+- Exactly 1 match: svc-beta from trace A.
+- svc-gamma trace produces no match (single span, no RHS bit).
+
+**Spec invariants tested:** NOTE-096 (`traceCanMatch` requires all node bits for non-negation ops).
+
+Back-ref: `internal/modules/executor/stream_structural_test.go:TestExecuteStructural_TracePreQual_SingleSpanTrace`
+
+---
+
+## EX-ST-19: TestExecuteStructural_TracePreQual_NegationOp_NoLHS
+*Added: 2026-04-28*
+
+**Scenario:** NOTE-096 — for !>> with a trace that has RHS-matching spans but no LHS-matching
+spans, `traceCanMatch` must return true (only RHS bit 1 required). The RHS spans qualify
+because no LHS ancestor exists.
+
+**Setup:** Use the standard structural trace (writeStructuralTrace). Query:
+`{ resource.service.name = "ghost" } !>> {}`. LHS matches nothing; RHS ({}) matches all spans.
+
+**Assertions:**
+- Exactly 4 matches returned (all spans qualify — no "ghost" ancestor for any span).
+- traceCanMatch must not prune this trace (bit 1 present via {} matching all spans).
+
+**Spec invariants tested:** NOTE-096 (`traceCanMatch` requires only bit 1 for single negation op).
+
+Back-ref: `internal/modules/executor/stream_structural_test.go:TestExecuteStructural_TracePreQual_NegationOp_NoLHS`
+
+---
+
+## EX-ST-17b: TestExecuteStructural_NegationOp_NotChild_LHSAbsent_DoesNotSkipFile
+*Added: 2026-04-28*
+
+**Scenario:** NOTE-095 — for a negation op (!>), the LHS program being absent from the file
+must NOT cause the file to be skipped. Mirrors EX-ST-17 for OpNotChild.
+
+**Setup:** Use the standard structural trace (writeStructuralTrace). Query:
+`{ resource.service.name = "nonexistent" } !> {}`. The LHS filter matches no spans.
+
+**Assertions:**
+- result.Matches is non-empty (all spans qualify — no "nonexistent" direct parent for any span).
+- File must not have been rejected due to absent LHS predicate.
+
+**Spec invariants tested:** NOTE-095 (`shouldRejectFileForProgram` returns false for LHS of !>).
+
+Back-ref: `internal/modules/executor/stream_structural_test.go:TestExecuteStructural_NegationOp_NotChild_LHSAbsent_DoesNotSkipFile`
+
+---
+
+## EX-ST-17c: TestExecuteStructural_NegationOp_NotSibling_LHSAbsent_DoesNotSkipFile
+*Added: 2026-04-28*
+
+**Scenario:** NOTE-095 — for a negation op (!~), the LHS program being absent from the file
+must NOT cause the file to be skipped. Mirrors EX-ST-17 for OpNotSibling.
+
+**Setup:** Use the standard structural trace (writeStructuralTrace). Query:
+`{ resource.service.name = "nonexistent" } !~ {}`. The LHS filter matches no spans.
+
+**Assertions:**
+- result.Matches is non-empty (all spans qualify — no "nonexistent" sibling for any span).
+- File must not have been rejected due to absent LHS predicate.
+
+**Spec invariants tested:** NOTE-095 (`shouldRejectFileForProgram` returns false for LHS of !~).
+
+Back-ref: `internal/modules/executor/stream_structural_test.go:TestExecuteStructural_NegationOp_NotSibling_LHSAbsent_DoesNotSkipFile`
+
+---
+
+## EX-ST-19b: TestExecuteStructural_TracePreQual_NegationOp_NotChild_NoLHS
+*Added: 2026-04-28*
+
+**Scenario:** NOTE-096 — for !> with a trace that has RHS-matching spans but no LHS-matching
+spans, `traceCanMatch` must return true (only RHS bit 1 required). Mirrors EX-ST-19 for OpNotChild.
+
+**Setup:** Use the standard structural trace (writeStructuralTrace). Query:
+`{ resource.service.name = "ghost" } !> {}`. LHS matches nothing; RHS ({}) matches all spans.
+
+**Assertions:**
+- Exactly 4 matches returned (all spans qualify — no "ghost" direct parent for any span).
+- traceCanMatch must not prune this trace (bit 1 present via {} matching all spans).
+
+**Spec invariants tested:** NOTE-096 (`traceCanMatch` requires only bit 1 for single negation op).
+
+Back-ref: `internal/modules/executor/stream_structural_test.go:TestExecuteStructural_TracePreQual_NegationOp_NotChild_NoLHS`
+
+---
+
+## EX-ST-19c: TestExecuteStructural_TracePreQual_NegationOp_NotSibling_NoLHS
+*Added: 2026-04-28*
+
+**Scenario:** NOTE-096 — for !~ with a trace that has RHS-matching spans but no LHS-matching
+spans, `traceCanMatch` must return true (only RHS bit 1 required). Mirrors EX-ST-19 for OpNotSibling.
+
+**Setup:** Use the standard structural trace (writeStructuralTrace). Query:
+`{ resource.service.name = "ghost" } !~ {}`. LHS matches nothing; RHS ({}) matches all spans.
+
+**Assertions:**
+- Exactly 4 matches returned (all spans qualify — no "ghost" sibling for any span).
+- traceCanMatch must not prune this trace (bit 1 present via {} matching all spans).
+
+**Spec invariants tested:** NOTE-096 (`traceCanMatch` requires only bit 1 for single negation op).
+
+Back-ref: `internal/modules/executor/stream_structural_test.go:TestExecuteStructural_TracePreQual_NegationOp_NotSibling_NoLHS`
+
+---
+
+## EX-ST-20: TestExecuteStructural_TOCFileRejection
+*Added: 2026-04-28*
+
+**Scenario:** NOTE-097 — a file containing only "svc-b" spans is queried for
+`{ resource.service.name = "svc-a" } >> { resource.service.name = "db" }`. Neither service
+exists in the file. Programs are checked in order: program[0] ("svc-a") is checked first and
+triggers file rejection — program[1] ("db") is never evaluated. `BlocksFromIntrinsicTOC`
+returns a non-nil empty slice for "svc-a" and the file is rejected before any block is fetched.
+
+**Setup:** `writeStructuralSingleService(t, "svc-b", 10)` — 10 root spans all with svc-b.
+Query: `{ resource.service.name = "svc-a" } >> { resource.service.name = "db" }`.
+
+**Assertions:**
+- Zero matches returned (file rejected at TOC or bloom — no svc-a or db spans anywhere).
+
+**Spec invariants tested:** NOTE-097 (non-nil empty TOC result → file rejected); SPEC-STRUCT-2
+(TOC as third rejection mechanism alongside bloom and range).
+
+Back-ref: `internal/modules/executor/stream_structural_test.go:TestExecuteStructural_TOCFileRejection`
+
+---
+
+## EX-ST-21: TestExecuteStructural_TOCNegationSafety
+*Added: 2026-04-28*
+
+**Scenario:** NOTE-097 — negation-op safety: a file containing only "svc" spans is queried
+for `{ resource.service.name = "ghost" } !>> { resource.service.name = "svc" }`. "ghost" has
+zero blocks in the TOC, but `shouldRejectFileForProgram` returns false for program[0] (LHS of
+!>>), so the TOC check is skipped for "ghost". The RHS program ("svc") is present — file is
+not rejected. All "svc" spans qualify because none has a "ghost" ancestor.
+
+**Setup:** `writeStructuralSingleService(t, "svc", 5)` — 5 root spans all with svc.
+Query: `{ resource.service.name = "ghost" } !>> { resource.service.name = "svc" }`.
+
+**Assertions:**
+- result.Matches is non-empty (all "svc" spans returned; absent LHS must NOT cause file rejection).
+
+**Spec invariants tested:** NOTE-097 (LHS of negation op is skipped by shouldRejectFileForProgram);
+NOTE-095 (negation-op safety gate); SPEC-STRUCT-2 (safety gate preserved for TOC check).
+
+Back-ref: `internal/modules/executor/stream_structural_test.go:TestExecuteStructural_TOCNegationSafety`
+
+---
+
+## EX-ST-21b: TestExecuteStructural_TOCNegationSafety_NotChild
+*Added: 2026-04-30*
+
+**Scenario:** NOTE-097 — negation-op safety for !> (OpNotChild): a file containing only "svc"
+spans is queried for `{ resource.service.name = "ghost" } !> { resource.service.name = "svc" }`.
+"ghost" has zero blocks in the TOC, but `shouldRejectFileForProgram` returns false for program[0]
+(LHS of !>), so the TOC check is skipped for "ghost". All "svc" spans qualify because none has a
+"ghost" direct parent.
+
+**Setup:** `writeStructuralSingleService(t, "svc", 5)` — 5 root spans all with svc.
+Query: `{ resource.service.name = "ghost" } !> { resource.service.name = "svc" }`.
+
+**Assertions:**
+- result.Matches is non-empty (all "svc" spans returned; absent LHS must NOT cause file rejection).
+
+**Spec invariants tested:** NOTE-097 (LHS of negation op is skipped by shouldRejectFileForProgram);
+NOTE-095 (negation-op safety gate); SPEC-STRUCT-2 (safety gate preserved for TOC check).
+
+Back-ref: `internal/modules/executor/stream_structural_test.go:TestExecuteStructural_TOCNegationSafety_NotChild`
+
+---
+
+## EX-ST-21c: TestExecuteStructural_TOCNegationSafety_NotSibling
+*Added: 2026-04-30*
+
+**Scenario:** NOTE-097 — negation-op safety for !~ (OpNotSibling): a file containing only "svc"
+spans is queried for `{ resource.service.name = "ghost" } !~ { resource.service.name = "svc" }`.
+"ghost" has zero blocks in the TOC, but `shouldRejectFileForProgram` returns false for program[0]
+(LHS of !~), so the TOC check is skipped for "ghost". All "svc" spans qualify because none has a
+"ghost" sibling.
+
+**Setup:** `writeStructuralSingleService(t, "svc", 5)` — 5 root spans all with svc.
+Query: `{ resource.service.name = "ghost" } !~ { resource.service.name = "svc" }`.
+
+**Assertions:**
+- result.Matches is non-empty (all "svc" spans returned; absent LHS must NOT cause file rejection).
+
+**Spec invariants tested:** NOTE-097 (LHS of negation op is skipped by shouldRejectFileForProgram);
+NOTE-095 (negation-op safety gate); SPEC-STRUCT-2 (safety gate preserved for TOC check).
+
+Back-ref: `internal/modules/executor/stream_structural_test.go:TestExecuteStructural_TOCNegationSafety_NotSibling`
+
+---
+
+## EX-CSP-01: TestComputeSecondPassCols_NonNilWhenProgramHasPredicates
+*Added: 2026-04-30*
+
+**Scenario:** `ComputeSecondPassCols` with a compiled filter program returns a non-nil column set
+that includes `traceIntrinsicColumns` entries.
+
+**Setup:** Compile `{ span.http.url = "test" }` via `vm.CompileTraceQLFilter`. Call
+`executor.ComputeSecondPassCols(program, nil)`.
+
+**Assertions:**
+- result is non-nil
+- result contains `"span:start"` (traceIntrinsicColumns)
+- result contains `"trace:id"` (traceIntrinsicColumns)
+
+**Spec invariants tested:** SPEC-ROOT-017 (secondPassCols always includes traceIntrinsicColumns
+in non-nil result); ComputeSecondPassCols contract (non-nil program with predicates → non-nil result).
+
+Back-ref: `internal/modules/executor/compute_second_pass_cols_test.go:TestComputeSecondPassCols_NonNilWhenProgramHasPredicates`
+
+---
+
+## EX-CSP-02: TestComputeSecondPassCols_NilProgramNilSelectColumns
+*Added: 2026-04-30*
+
+**Scenario:** `ComputeSecondPassCols(nil, nil)` returns nil — no program and no SelectColumns
+means no column filtering is needed (load-all path).
+
+**Setup:** Call `executor.ComputeSecondPassCols(nil, nil)`.
+
+**Assertions:**
+- result is nil
+
+**Spec invariants tested:** SPEC-ROOT-017 (nil wantCols is valid and means load-all);
+ComputeSecondPassCols contract (nil program + nil selectColumns → nil result).
+
+Back-ref: `internal/modules/executor/compute_second_pass_cols_test.go:TestComputeSecondPassCols_NilProgramNilSelectColumns`
+
+---
+
+## EX-CSP-03: TestComputeSecondPassCols_SelectColumnsOnly
+*Added: 2026-04-30*
+
+**Scenario:** `ComputeSecondPassCols(nil, cols)` with SelectColumns but no program returns a non-nil
+column set containing both the requested columns and the mandatory traceIntrinsicColumns entries.
+
+**Setup:** Call `executor.ComputeSecondPassCols(nil, []string{"span.http.url"})`.
+
+**Assertions:**
+- result is non-nil
+- result contains `"span.http.url"` (the requested SelectColumn)
+- result contains `"span:start"` (traceIntrinsicColumns — always present in non-nil result)
+- result contains `"trace:id"` (traceIntrinsicColumns — always present in non-nil result)
+- result contains `"span:duration"` (traceIntrinsicColumns — required for span:end synthesis)
+
+**Spec invariants tested:** SPEC-ROOT-017 (non-nil result always includes traceIntrinsicColumns;
+span:start and span:duration must be present for span:end synthesis); ComputeSecondPassCols
+contract (nil program + non-empty selectColumns → non-nil result with selectColumns ∪ traceIntrinsicColumns).
+
+Back-ref: `internal/modules/executor/compute_second_pass_cols_test.go:TestComputeSecondPassCols_SelectColumnsOnly`
+
+---
+
+## EX-ST-22: TestLookupIntrinsicFieldsTypedForBlock_MatchesTyped
+
+*Added: 2026-05-04*
+
+**Scenario:** For a 200-span, 2-block file (`MaxBlockSpans=100`), `lookupIntrinsicFieldsTypedForBlock`
+output matches `lookupIntrinsicFieldsTyped` output exactly for every field and present bit.
+Verifies the NOTE-100 optimization produces identical results to the original code path.
+
+**Setup:**
+- Write 200 spans across 2 blocks with all intrinsic fields set (traceID, spanID, parentID,
+  span:name, resource.service.name, span:kind, span:start, span:end, span:duration).
+- For each block (0, 1): call both `LookupIntrinsicFieldsTypedForTest` and
+  `LookupIntrinsicFieldsTypedForBlockForTest`.
+
+**Assertions:**
+- `len(result) == spanCount` for both variants.
+- Every row: `Present`, `TraceID`, `SpanID`, `ParentID`, `SpanName`, `ServiceName`,
+  `SpanStart`, `SpanEnd`, `SpanDuration`, `SpanKind`, `SpanStatus`, `StatusMessage` all equal.
+
+**Additional tests in the same file:**
+- `_AllCols`: 50 spans, single block, nil wantCols (all 11 columns). Full parity check.
+- `_EmptyColumn`: file with never-written column (span:status_message) → present bit clear, no panic.
+- `_MultiBlock_AllMatch`: 500 spans, 10 blocks. No cross-block bleed.
+
+Back-ref: `internal/modules/executor/intrinsic_row_block_test.go`

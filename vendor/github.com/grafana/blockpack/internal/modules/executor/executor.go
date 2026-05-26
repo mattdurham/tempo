@@ -25,10 +25,11 @@ import (
 
 // SpanMatch is a span that matched the query.
 type SpanMatch struct {
-	SpanID   []byte   // 8-byte span ID
-	BlockIdx int      // block index within the file
-	RowIdx   int      // row (span) index within the block
-	TraceID  [16]byte // 16-byte trace ID
+	Block    *modules_reader.Block // block containing this span; populated by structural executor
+	SpanID   []byte                // 8-byte span ID
+	BlockIdx int                   // block index within the file
+	RowIdx   int                   // row (span) index within the block
+	TraceID  [16]byte              // 16-byte trace ID
 }
 
 // Options controls query execution behavior.

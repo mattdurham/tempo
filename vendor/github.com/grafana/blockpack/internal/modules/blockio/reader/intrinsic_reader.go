@@ -39,8 +39,14 @@ func (r *Reader) parseIntrinsicTOC() error {
 		tocKey := r.fileID + "/intrinsic/toc"
 		if cached := parsedIntrinsicTOCCache.Get(tocKey); cached != nil {
 			r.tocPin = cached // keep weak cache entry alive for lifetime of this Reader
-			// r.intrinsicIndex aliases cached.entries — map is immutable after construction.
-			r.intrinsicIndex = cached.entries
+			// Copy the map so each Reader owns its own copy.
+			// IntrinsicColumnMeta writes to r.intrinsicIndex[name] (Format/Type lazy fill);
+			// aliasing the shared cache map would cause a concurrent map write panic.
+			// SPEC-ROOT-001: copy prevents concurrent map write across Readers for the same file.
+			r.intrinsicIndex = make(map[string]shared.IntrinsicColMeta, len(cached.entries))
+			for k, v := range cached.entries {
+				r.intrinsicIndex[k] = v
+			}
 			return nil
 		}
 	}
@@ -151,8 +157,7 @@ func (r *Reader) GetIntrinsicColumnBlob(name string) ([]byte, error) {
 	if !ok {
 		return nil, nil
 	}
-	cacheKey := fmt.Sprintf("%s/intrinsic/%s", r.fileID, name)
-	blob, err := r.cache.GetOrFetch(cacheKey, func() ([]byte, error) {
+	blob, err := r.cache.GetOrFetchIntrinsic(r.fileID, name, func() ([]byte, error) {
 		return r.readRange(meta.Offset, uint64(meta.Length), rw.DataTypeMetadata)
 	})
 	if err != nil {
@@ -207,8 +212,7 @@ func (r *Reader) GetIntrinsicColumn(name string) (*shared.IntrinsicColumn, error
 		}
 	}
 
-	cacheKey := fmt.Sprintf("%s/intrinsic/%s", r.fileID, name)
-	blob, err := r.cache.GetOrFetch(cacheKey, func() ([]byte, error) {
+	blob, err := r.cache.GetOrFetchIntrinsic(r.fileID, name, func() ([]byte, error) {
 		return r.readRange(meta.Offset, uint64(meta.Length), rw.DataTypeMetadata)
 	})
 	if err != nil {

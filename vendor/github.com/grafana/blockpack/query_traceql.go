@@ -88,6 +88,8 @@ func streamFilterProgram(r *Reader, program *vm.Program, opts QueryOptions, fn s
 			spanIDByRef = buildIntrinsicBytesMap(r, "span:id")
 		}
 	}
+	// SPEC-ROOT-017: pass secondPassCols as wantCols to restrict intrinsic decoding
+	wantCols := modules_executor.ComputeSecondPassCols(program, opts.SelectColumns)
 	for _, row := range rows {
 		var fields SpanFieldsProvider
 		var traceIDHex, spanIDHex string
@@ -102,7 +104,10 @@ func streamFilterProgram(r *Reader, program *vm.Program, opts QueryOptions, fn s
 				spanIDHex = hexEncodeField(v)
 			}
 		} else {
-			rawAdapter = modules_blockio.NewSpanFieldsAdapterWithReader(row.Block, r, row.BlockIdx, row.RowIdx)
+			rawAdapter = modules_blockio.NewSpanFieldsAdapterWithReader(
+				row.Block, r, row.BlockIdx, row.RowIdx,
+				wantCols,
+			)
 			fields = rawAdapter
 			// For dual-storage blocks, trace:id and span:id are in block columns — extractIDs
 			// will find them there without using the fallback maps. Build maps lazily only on

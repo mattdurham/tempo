@@ -432,7 +432,7 @@ func buildFloat64Dict(values []float64, present []bool) (entries []float64, inde
 }
 
 // buildBoolDict returns deduplicated entries (as uint8: 0/1) and per-present-row indexes.
-func buildBoolDict(values []bool, present []bool) (entries []uint8, indexes []uint32) {
+func buildBoolDict(values, present []bool) (entries []uint8, indexes []uint32) {
 	var hasFalse, hasTrue bool
 
 	for i, p := range present {

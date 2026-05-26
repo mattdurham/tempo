@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/singleflight"
@@ -44,9 +45,14 @@ type MemoryCache struct {
 	requests  *prometheus.CounterVec
 	bytes     *prometheus.CounterVec
 	evictions *prometheus.CounterVec
-	maxBytes  int64
-	curBytes  int64
-	mu        sync.Mutex
+	// Pre-resolved histogram observers for 0-alloc hot path.
+	// Each is nil when Registerer is not configured.
+	durGetHit  prometheus.Observer
+	durGetMiss prometheus.Observer
+	durPutOk   prometheus.Observer
+	maxBytes   int64
+	curBytes   int64
+	mu         sync.Mutex
 }
 
 // New creates a MemoryCache with the given byte capacity.
@@ -72,6 +78,20 @@ func New(cfg Config) (*MemoryCache, error) {
 			Name: "blockpack_cache_evictions_total",
 			Help: "Total number of cache evictions by tier.",
 		}, []string{"tier"}))
+		h := registerOrReuseHistogram(cfg.Registerer, prometheus.NewHistogramVec(
+			prometheus.HistogramOpts{
+				Name:                            "blockpack_cache_operation_duration_seconds",
+				Help:                            "Duration of cache Get and Put operations by tier, operation, and result.",
+				NativeHistogramBucketFactor:     1.1,
+				NativeHistogramMaxBucketNumber:  100,
+				NativeHistogramMinResetDuration: 15 * time.Minute,
+			},
+			[]string{"tier", "operation", "result"},
+		))
+		// Pre-resolve label combinations for 0-alloc hot path.
+		c.durGetHit = h.WithLabelValues("memory", "get", "hit")
+		c.durGetMiss = h.WithLabelValues("memory", "get", "miss")
+		c.durPutOk = h.WithLabelValues("memory", "put", "ok")
 	}
 	return c, nil
 }
@@ -95,11 +115,36 @@ func registerOrReuse(reg prometheus.Registerer, cv *prometheus.CounterVec) *prom
 	return cv
 }
 
+// registerOrReuseHistogram registers a HistogramVec with the given Registerer.
+// If the metric is already registered (AlreadyRegisteredError), it returns the
+// previously registered collector instead of panicking.
+func registerOrReuseHistogram(
+	reg prometheus.Registerer,
+	hv *prometheus.HistogramVec,
+) *prometheus.HistogramVec {
+	err := reg.Register(hv)
+	if err == nil {
+		return hv
+	}
+	var are prometheus.AlreadyRegisteredError
+	if errors.As(err, &are) {
+		if existing, ok := are.ExistingCollector.(*prometheus.HistogramVec); ok {
+			return existing
+		}
+	}
+	return hv
+}
+
 // Get returns the cached bytes for key, or (nil, false, nil) on a miss.
 // The returned slice is read-only; callers must not modify it.
 func (c *MemoryCache) Get(key string) ([]byte, bool, error) {
 	if c == nil {
 		return nil, false, nil
+	}
+
+	var start time.Time
+	if c.durGetHit != nil {
+		start = time.Now()
 	}
 
 	c.mu.Lock()
@@ -108,6 +153,9 @@ func (c *MemoryCache) Get(key string) ([]byte, bool, error) {
 		c.mu.Unlock()
 		if c.requests != nil {
 			c.requests.WithLabelValues("memory", "miss").Inc()
+		}
+		if c.durGetMiss != nil {
+			c.durGetMiss.Observe(time.Since(start).Seconds())
 		}
 		return nil, false, nil
 	}
@@ -120,6 +168,9 @@ func (c *MemoryCache) Get(key string) ([]byte, bool, error) {
 	if c.bytes != nil {
 		c.bytes.WithLabelValues("memory").Add(float64(len(src)))
 	}
+	if c.durGetHit != nil {
+		c.durGetHit.Observe(time.Since(start).Seconds())
+	}
 	return src, true, nil
 }
 
@@ -129,6 +180,10 @@ func (c *MemoryCache) Get(key string) ([]byte, bool, error) {
 func (c *MemoryCache) Put(key string, value []byte) error {
 	if c == nil {
 		return nil
+	}
+	var start time.Time
+	if c.durPutOk != nil {
+		start = time.Now()
 	}
 	needed := int64(len(value))
 	if needed > c.maxBytes {
@@ -152,6 +207,9 @@ func (c *MemoryCache) Put(key string, value []byte) error {
 	elem := c.lru.PushBack(e)
 	c.index[key] = elem
 	c.curBytes += needed
+	if c.durPutOk != nil {
+		c.durPutOk.Observe(time.Since(start).Seconds())
+	}
 	return nil
 }
 

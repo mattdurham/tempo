@@ -25,6 +25,25 @@ import (
 // Large enough to bound overhead; small enough to bound cancellation latency.
 const ctxCheckInterval = 100_000
 
+// normalizeIntrinsicFieldName maps Tempo's short TraceQL field names to blockpack's
+// internal intrinsic column names. The TraceQL parser produces short names (e.g. "duration")
+// but GetIntrinsicColumn expects the full column name (e.g. "span:duration").
+// This is the inverse of intrinsicLabelName in metrics_trace.go.
+func normalizeIntrinsicFieldName(field string) string {
+	switch field {
+	case "duration":
+		return colNameSpanDuration
+	case "kind":
+		return colNameSpanKind
+	case "status":
+		return colNameSpanStatus
+	case "name":
+		return colNameSpanName
+	default:
+		return field
+	}
+}
+
 // metricsColumnsAreIntrinsic reports whether all columns in wantColumns are available
 // in this file's intrinsic section, enabling the zero-block-read fast path.
 // It checks the file's actual TOC metadata directly, so both standard intrinsic columns
@@ -106,7 +125,11 @@ func executeTraceMetricsIntrinsic(
 		return &TraceMetricsResult{}, true, nil
 	}
 
+	// Field names are already normalized by ExecuteTraceMetrics before this function is called.
 	agg := querySpec.Aggregate
+	// Normalize short TraceQL field names to full intrinsic column names before any lookups.
+	// The TraceQL parser produces "duration" but GetIntrinsicColumn expects "span:duration".
+	agg.Field = normalizeIntrinsicFieldName(agg.Field)
 	isCountRate := agg.Function == vm.FuncNameCOUNT || agg.Function == vm.FuncNameRATE
 
 	// span:start is a flat (sorted ascending) column. Validate the column before use:
@@ -465,7 +488,22 @@ func accumulateIntrinsicBuckets(
 				return avErr
 			}
 		}
-		return streamByRefSlice(ctx, r, inRangeRefs, inRangeVals, dictIdxForRef, dict, agg, aggValsForRef, aggPresent, dictByPK, maxPK, numSteps, tb, buckets)
+		return streamByRefSlice(
+			ctx,
+			r,
+			inRangeRefs,
+			inRangeVals,
+			dictIdxForRef,
+			dict,
+			agg,
+			aggValsForRef,
+			aggPresent,
+			dictByPK,
+			maxPK,
+			numSteps,
+			tb,
+			buckets,
+		)
 	}
 
 	// Try dict-ID fast path for N > 1 dims (N ≤ 8 group-by dims, all intrinsic).
@@ -679,7 +717,12 @@ func intrinsicInt64ColToString(colName string, v int64) string {
 // scanIntrinsicColVals scans a single intrinsic column's dict/flat entries and writes
 // packKey → string value into dst for every ref that appears in keyToBucket.
 // Rows absent from the column are not written (callers handle absence as empty string).
-func scanIntrinsicColVals(col *modules_shared.IntrinsicColumn, colName string, keyToBucket map[uint32]int64, dst map[uint32]string) {
+func scanIntrinsicColVals(
+	col *modules_shared.IntrinsicColumn,
+	colName string,
+	keyToBucket map[uint32]int64,
+	dst map[uint32]string,
+) {
 	switch col.Format {
 	case modules_shared.IntrinsicFormatDict:
 		for _, entry := range col.DictEntries {
@@ -694,10 +737,13 @@ func scanIntrinsicColVals(col *modules_shared.IntrinsicColumn, colName string, k
 				}
 			}
 		}
-	// Flat-format columns (e.g. span:start, span:duration) store numeric values, not enums.
-	// intrinsicInt64ColToString is not applied here because flat values are always numeric,
-	// not OTel enum integers. Enum columns are always stored in dict format.
-	case modules_shared.IntrinsicFormatFlat:
+	// Flat-format, XOR-bytes-format, and DeltaUint64-format columns expose the same
+	// Uint64Values/BytesValues layout after decode. XOR-decoded bytes columns (e.g. span:id,
+	// trace:id with > IntrinsicPageSize rows) and DeltaUint64 columns (e.g. span:start,
+	// span:duration) must be handled identically to flat columns here.
+	case modules_shared.IntrinsicFormatFlat,
+		modules_shared.IntrinsicFormatXORBytes,
+		modules_shared.IntrinsicFormatDeltaUint64:
 		for j, ref := range col.BlockRefs {
 			pk := packKey(ref.BlockIdx, ref.RowIdx)
 			if _, ok := keyToBucket[pk]; !ok {
@@ -763,7 +809,13 @@ func scanIntrinsicColDictIDs(
 				}
 			}
 		}
-	case modules_shared.IntrinsicFormatFlat:
+	// Flat-format, XOR-bytes-format, and DeltaUint64-format columns expose the same
+	// Uint64Values/BytesValues layout after decode. XOR-decoded bytes columns (e.g. span:id,
+	// trace:id with > IntrinsicPageSize rows) and DeltaUint64 columns (e.g. span:start,
+	// span:duration) must be handled identically to flat columns here.
+	case modules_shared.IntrinsicFormatFlat,
+		modules_shared.IntrinsicFormatXORBytes,
+		modules_shared.IntrinsicFormatDeltaUint64:
 		seen := make(map[string]uint32)
 		for j, ref := range col.BlockRefs {
 			pk := packKey(ref.BlockIdx, ref.RowIdx)
@@ -1053,7 +1105,17 @@ func accumulateIntrinsicBucketsDirect(
 	}
 
 	if isCountRate {
-		return true, accumulateCountRateDirect(ctx, groupByCol, dictByPK, bucketByPK, maxPK, inRangeCount, dict, numSteps, buckets)
+		return true, accumulateCountRateDirect(
+			ctx,
+			groupByCol,
+			dictByPK,
+			bucketByPK,
+			maxPK,
+			inRangeCount,
+			dict,
+			numSteps,
+			buckets,
+		)
 	}
 	// NOTE-089: HISTOGRAM and general agg now handled by direct column scan.
 	if agg.Function == vm.FuncNameHISTOGRAM {
@@ -1580,9 +1642,33 @@ func streamByRefSlice(
 		// NOTE-087: streamByRefSliceHistogram now scans the aggregate column directly via r,
 		// using dictByPK for O(1) group lookups and a bucketByPK dense array for O(1) time-bucket
 		// lookups. buildAggValsForRef (7.7MB valByPK + 300M extra array ops) is eliminated.
-		return streamByRefSliceHistogram(ctx, r, inRangeRefs, inRangeVals, dictByPK, maxPK, dict, agg, numSteps, tb, buckets)
+		return streamByRefSliceHistogram(
+			ctx,
+			r,
+			inRangeRefs,
+			inRangeVals,
+			dictByPK,
+			maxPK,
+			dict,
+			agg,
+			numSteps,
+			tb,
+			buckets,
+		)
 	default:
-		return streamByRefSliceAgg(ctx, inRangeRefs, inRangeVals, dictIdxForRef, dict, agg, aggValsForRef, aggPresent, numSteps, tb, buckets)
+		return streamByRefSliceAgg(
+			ctx,
+			inRangeRefs,
+			inRangeVals,
+			dictIdxForRef,
+			dict,
+			agg,
+			aggValsForRef,
+			aggPresent,
+			numSteps,
+			tb,
+			buckets,
+		)
 	}
 }
 

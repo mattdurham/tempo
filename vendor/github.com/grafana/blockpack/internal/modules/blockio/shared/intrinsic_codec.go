@@ -475,7 +475,8 @@ func decodePagedColumnBlob(blob []byte) (*IntrinsicColumn, error) {
 		totalRows += int(pm.RowCount)
 	}
 	merged := &IntrinsicColumn{Type: toc.ColType, Format: toc.Format}
-	if toc.Format == IntrinsicFormatFlat {
+	if toc.Format == IntrinsicFormatFlat || toc.Format == IntrinsicFormatXORBytes ||
+		toc.Format == IntrinsicFormatDeltaUint64 {
 		merged.Uint64Values = make([]uint64, 0, totalRows)
 		merged.BytesValues = make([][]byte, 0, totalRows)
 		merged.BlockRefs = make([]BlockRef, 0, totalRows)
@@ -504,9 +505,14 @@ func decodePagedColumnBlob(blob []byte) (*IntrinsicColumn, error) {
 		*pageBuf = pageRaw // update pool buffer pointer (snappy may have reallocated)
 
 		var page *IntrinsicColumn
-		if toc.Format == IntrinsicFormatFlat {
+		switch toc.Format {
+		case IntrinsicFormatFlat:
 			page, err = DecodeFlatPage(pageRaw, blockW, rowW, int(pm.RowCount), toc.ColType)
-		} else {
+		case IntrinsicFormatXORBytes:
+			page, err = decodeXORBytesPage(pageRaw, blockW, rowW, int(pm.RowCount))
+		case IntrinsicFormatDeltaUint64:
+			page, err = decodeDeltaUint64Page(pageRaw, blockW, rowW, int(pm.RowCount))
+		default:
 			page, err = DecodeDictPage(pageRaw, blockW, rowW, toc.ColType)
 		}
 		if err != nil {
@@ -779,6 +785,121 @@ func decodeVariableWidthRef(raw []byte, pos, blockW, rowW int) (BlockRef, int, e
 		pos += 2
 	}
 	return BlockRef{BlockIdx: blockIdx, RowIdx: rowIdx}, pos, nil
+}
+
+// decodeXORBytesPage decodes a single XOR-encoded bytes page blob (already snappy-decoded).
+//
+// Wire format (see encodeXORBytesIntrinsic):
+//
+//	for each row i:
+//	  xor_data_len[4 LE] + xor_data
+//	refs[rowCount × refSize]
+//
+// NOTE-013: BytesValues must be independent copies (NOTE-012 invariant) — they cannot alias
+// the pageBuf pool buffer that decodePagedColumnBlob reuses across page decodes.
+func decodeXORBytesPage(raw []byte, blockW, rowW, rowCount int) (*IntrinsicColumn, error) {
+	col := &IntrinsicColumn{
+		Type:        ColumnTypeBytes,
+		Format:      IntrinsicFormatXORBytes,
+		BytesValues: make([][]byte, 0, rowCount),
+		BlockRefs:   make([]BlockRef, 0, rowCount),
+	}
+
+	pos := 0
+	var prev []byte
+	for range rowCount {
+		if pos+4 > len(raw) {
+			return nil, fmt.Errorf("decodeXORBytesPage: truncated at xor_data_len")
+		}
+		xorLen := int(binary.LittleEndian.Uint32(raw[pos:]))
+		pos += 4
+		if xorLen > MaxBytesLen {
+			return nil, fmt.Errorf("decodeXORBytesPage: xorLen %d exceeds MaxBytesLen", xorLen)
+		}
+		if pos+xorLen > len(raw) {
+			return nil, fmt.Errorf("decodeXORBytesPage: truncated at xor_data (len=%d)", xorLen)
+		}
+		xorData := raw[pos : pos+xorLen]
+		pos += xorLen
+
+		reconstructed := xorInvert(xorData, prev)
+
+		// NOTE-012: make an independent copy — raw aliases the pool buffer.
+		v := make([]byte, len(reconstructed))
+		copy(v, reconstructed)
+		col.BytesValues = append(col.BytesValues, v)
+		prev = v // prev must not alias pool buffer; v is already a copy
+	}
+
+	// Refs section: rowCount × refSize bytes after all values.
+	for range rowCount {
+		ref, newPos, err := decodeVariableWidthRef(raw, pos, blockW, rowW)
+		if err != nil {
+			return nil, fmt.Errorf("decodeXORBytesPage refs: %w", err)
+		}
+		col.BlockRefs = append(col.BlockRefs, ref)
+		pos = newPos
+	}
+	col.Count = uint32(rowCount) //nolint:gosec
+	return col, nil
+}
+
+// decodeDeltaUint64Page decodes a snappy-compressed delta uint64 page blob (already snappy-decoded).
+//
+// Wire format (see encodeDeltaUint64Intrinsic):
+//
+//	for each row i:
+//	  uvarint(value[i] - value[i-1])  // value[-1] = 0; all deltas >= 0 (sorted ascending)
+//	refs[rowCount × refSize]  — after all varints
+//
+// NOTE-014: no values_len prefix. Row count comes from the TOC RowCount field.
+// Do NOT call pageRefsStart here — that function assumes a values_len[4] prefix.
+func decodeDeltaUint64Page(raw []byte, blockW, rowW, rowCount int) (*IntrinsicColumn, error) {
+	col := &IntrinsicColumn{
+		Type:         ColumnTypeUint64,
+		Format:       IntrinsicFormatDeltaUint64,
+		Uint64Values: make([]uint64, 0, rowCount),
+		BlockRefs:    make([]BlockRef, 0, rowCount),
+	}
+
+	pos := 0
+	var acc uint64
+	for range rowCount {
+		delta, n := binary.Uvarint(raw[pos:])
+		if n <= 0 {
+			return nil, fmt.Errorf("decodeDeltaUint64Page: truncated at uvarint row %d", len(col.Uint64Values))
+		}
+		acc += delta
+		col.Uint64Values = append(col.Uint64Values, acc)
+		pos += n
+	}
+
+	for range rowCount {
+		ref, newPos, err := decodeVariableWidthRef(raw, pos, blockW, rowW)
+		if err != nil {
+			return nil, fmt.Errorf("decodeDeltaUint64Page refs: %w", err)
+		}
+		col.BlockRefs = append(col.BlockRefs, ref)
+		pos = newPos
+	}
+	col.Count = uint32(rowCount) //nolint:gosec
+	return col, nil
+}
+
+// xorInvert reconstructs the original value by XOR-inverting xored against prev.
+// Since xorBytesLen always produces len(a) bytes, xor_data_len == original value length.
+// The result is always len(xored) bytes.
+func xorInvert(xored, prev []byte) []byte {
+	result := make([]byte, len(xored))
+	minLen := min(len(xored), len(prev))
+	for i := range minLen {
+		result[i] = xored[i] ^ prev[i]
+	}
+	if len(xored) > len(prev) {
+		copy(result[minLen:], xored[minLen:])
+	}
+	// if len(prev) > len(xored): trailing bytes of prev are not part of the result
+	return result
 }
 
 // --- Raw-byte scanning functions ---
@@ -1090,7 +1211,16 @@ func findRangeBoundaries(
 // scanFlatPagedBlob handles v2 paged flat column blobs for range scan.
 func scanFlatPagedBlob(blob []byte, lo, hi uint64, hasLo, hasHi bool, maxRefs int) []BlockRef {
 	toc, pos, ok := parsePagedBlobHeader(blob)
-	if !ok || toc.Format != IntrinsicFormatFlat || toc.ColType == ColumnTypeBytes {
+	if !ok || toc.ColType == ColumnTypeBytes {
+		return nil
+	}
+	if toc.Format == IntrinsicFormatDict {
+		return nil
+	}
+	if toc.Format == IntrinsicFormatDeltaUint64 {
+		return scanDeltaUint64PagedBlob(blob, toc, pos, lo, hi, hasLo, hasHi, maxRefs)
+	}
+	if toc.Format != IntrinsicFormatFlat {
 		return nil
 	}
 
@@ -1156,7 +1286,16 @@ func scanFlatPagedBlob(blob []byte, lo, hi uint64, hasLo, hasHi bool, maxRefs in
 // When filter is nil, all refs are accepted (equivalent to the former scanFlatPagedTopK fast path).
 func scanFlatPagedFiltered(blob []byte, backward bool, limit int, filter func(BlockRef) bool) []BlockRef {
 	toc, pos, ok := parsePagedBlobHeader(blob)
-	if !ok || toc.Format != IntrinsicFormatFlat || toc.ColType == ColumnTypeBytes {
+	if !ok || toc.ColType == ColumnTypeBytes {
+		return nil
+	}
+	if toc.Format == IntrinsicFormatDict {
+		return nil
+	}
+	if toc.Format == IntrinsicFormatDeltaUint64 {
+		return scanDeltaUint64PagedFiltered(blob, toc, pos, backward, limit, filter)
+	}
+	if toc.Format != IntrinsicFormatFlat {
 		return nil
 	}
 
@@ -1197,6 +1336,175 @@ func scanFlatPagedFiltered(blob []byte, backward bool, limit int, filter func(Bl
 					break
 				}
 				refPos := refsStart + i*refSize
+				if refPos+refSize > len(pageRaw) {
+					break
+				}
+				ref := decodeRef(pageRaw, refPos, blockW, rowW)
+				if filter == nil || filter(ref) {
+					result = append(result, ref)
+				}
+			}
+		}
+		return true
+	}
+
+	if backward {
+		for i := len(toc.Pages) - 1; i >= 0; i-- {
+			if len(result) >= limit {
+				break
+			}
+			if !scanPage(toc.Pages[i]) {
+				return nil
+			}
+		}
+	} else {
+		for _, pm := range toc.Pages {
+			if len(result) >= limit {
+				break
+			}
+			if !scanPage(pm) {
+				return nil
+			}
+		}
+	}
+	return result
+}
+
+// scanDeltaUint64PagedBlob handles range scan for IntrinsicFormatDeltaUint64 paged blobs.
+// It decodes the single page's uvarint stream sequentially to reconstruct absolute values,
+// then collects refs where value is within [lo, hi].
+//
+// NOTE-014: must NOT call pageRefsStart — DeltaUint64 pages have no values_len prefix.
+func scanDeltaUint64PagedBlob(
+	blob []byte,
+	toc PagedIntrinsicTOC,
+	pos int,
+	lo, hi uint64,
+	hasLo, hasHi bool,
+	maxRefs int,
+) []BlockRef {
+	if len(toc.Pages) == 0 {
+		return nil
+	}
+	blockW := int(toc.BlockIdxWidth)
+	rowW := int(toc.RowIdxWidth)
+	// BUG-13 fix: reject invalid width values from corrupt blobs.
+	if (blockW != 1 && blockW != 2) || (rowW != 1 && rowW != 2) {
+		return nil
+	}
+	refSize := blockW + rowW
+
+	var result []BlockRef
+	for _, pm := range toc.Pages {
+		pageStart := pos + int(pm.Offset)
+		pageEnd := pageStart + int(pm.Length)
+		if pageEnd > len(blob) {
+			return nil
+		}
+		pageRaw, decErr := decodeBoundedSnappyColumn(blob[pageStart:pageEnd])
+		if decErr != nil {
+			slog.Debug("intrinsic_codec: snappy decode failed", "err", decErr)
+			return nil
+		}
+
+		rowCount := int(pm.RowCount)
+		// Decode all uvarint values first to find where refs section begins.
+		values := make([]uint64, rowCount)
+		p := 0
+		var acc uint64
+		for i := range rowCount {
+			delta, n := binary.Uvarint(pageRaw[p:])
+			if n <= 0 {
+				return nil
+			}
+			acc += delta
+			values[i] = acc
+			p += n
+		}
+		// refs section starts at p.
+		for i, v := range values {
+			if hasLo && v < lo {
+				continue
+			}
+			if hasHi && v > hi {
+				continue
+			}
+			refPos := p + i*refSize
+			if refPos+refSize > len(pageRaw) {
+				break
+			}
+			result = append(result, decodeRef(pageRaw, refPos, blockW, rowW))
+			if maxRefs > 0 && len(result) >= maxRefs {
+				return result
+			}
+		}
+	}
+	return result
+}
+
+// scanDeltaUint64PagedFiltered handles filtered scan for IntrinsicFormatDeltaUint64 paged blobs.
+// Decodes the uvarint stream to reconstruct absolute values, collects refs matching filter.
+//
+// NOTE-014: must NOT call pageRefsStart — DeltaUint64 pages have no values_len prefix.
+func scanDeltaUint64PagedFiltered(
+	blob []byte,
+	toc PagedIntrinsicTOC,
+	pos int,
+	backward bool,
+	limit int,
+	filter func(BlockRef) bool,
+) []BlockRef {
+	if len(toc.Pages) == 0 {
+		return nil
+	}
+	blockW := int(toc.BlockIdxWidth)
+	rowW := int(toc.RowIdxWidth)
+	// BUG-13 fix: reject invalid width values from corrupt blobs.
+	if (blockW != 1 && blockW != 2) || (rowW != 1 && rowW != 2) {
+		return nil
+	}
+	refSize := blockW + rowW
+
+	result := make([]BlockRef, 0, limit)
+
+	scanPage := func(pm PageMeta) bool {
+		pageStart := pos + int(pm.Offset)
+		pageEnd := pageStart + int(pm.Length)
+		if pageEnd > len(blob) {
+			return false
+		}
+		pageRaw, decErr := decodeBoundedSnappyColumn(blob[pageStart:pageEnd])
+		if decErr != nil {
+			slog.Debug("intrinsic_codec: snappy decode failed", "err", decErr)
+			return false
+		}
+		rowCount := int(pm.RowCount)
+		p := 0
+		for range rowCount {
+			_, n := binary.Uvarint(pageRaw[p:])
+			if n <= 0 {
+				return false
+			}
+			p += n
+		}
+		// p is now the start of the refs section.
+		if backward {
+			for i := rowCount - 1; i >= 0 && len(result) < limit; i-- {
+				refPos := p + i*refSize
+				if refPos+refSize > len(pageRaw) {
+					continue
+				}
+				ref := decodeRef(pageRaw, refPos, blockW, rowW)
+				if filter == nil || filter(ref) {
+					result = append(result, ref)
+				}
+			}
+		} else {
+			for i := range rowCount {
+				if len(result) >= limit {
+					break
+				}
+				refPos := p + i*refSize
 				if refPos+refSize > len(pageRaw) {
 					break
 				}

@@ -176,7 +176,7 @@ func internString(b []byte, ctx *decodeCtx) string {
 
 // decodePresenceRLEFromSlice reads rle_len[4] + rle_data starting at pos.
 // Returns decoded presence bitset, new position, present count, and any error.
-func decodePresenceRLEFromSlice(data []byte, pos int, nBits int) ([]byte, int, int, error) {
+func decodePresenceRLEFromSlice(data []byte, pos, nBits int) ([]byte, int, int, error) {
 	if pos+4 > len(data) {
 		return nil, pos, 0, fmt.Errorf("presence_rle: need 4 bytes for rle_len at pos %d, have %d", pos, len(data))
 	}
@@ -202,7 +202,7 @@ func decodePresenceRLEFromSlice(data []byte, pos int, nBits int) ([]byte, int, i
 
 // readIndexArray reads count index values of indexWidth bytes each from data[pos:].
 // indexWidth must be 1, 2, or 4.
-func readIndexArray(data []byte, pos int, count int, indexWidth uint8) ([]uint32, int, error) {
+func readIndexArray(data []byte, pos, count int, indexWidth uint8) ([]uint32, int, error) {
 	if count == 0 {
 		return nil, pos, nil
 	}

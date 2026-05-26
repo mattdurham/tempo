@@ -25,7 +25,6 @@ package writer
 import (
 	"encoding/binary"
 	"math"
-	"slices"
 	"sync"
 
 	"github.com/grafana/blockpack/internal/modules/sketch"
@@ -118,114 +117,100 @@ func (bs blockSketchSet) add(col, key string) {
 	cs.bloom.Add(fp)
 }
 
-// writeSketchIndexSection serializes the sketch index for all blocks in column-major format.
-// Returns (nil, nil) when sketchIdx is empty (no blocks).
-func writeSketchIndexSection(sketchIdx []blockSketchSet) ([]byte, error) {
+// writeOneColumnSketchBlob serializes sketch data for one column across all blocks.
+// Returns nil, nil if the column has no sketch data in any block.
+//
+// Wire format (per-column, no name field):
+//
+//	num_blocks[4 LE]
+//	presence[ceil(num_blocks/8) bytes]   // 1 bit per block; bit i set if block i has this column
+//	distinct_count[num_blocks × 4 LE uint32]
+//	topk_k[1] = 20
+//	per present block: entry_count[1] + entries (fp[8 LE] + count[2 LE])
+//	bloom_size[2 LE] = 2048
+//	per present block: bloom_data[bloom_size]
+func writeOneColumnSketchBlob(colName string, sketchIdx []blockSketchSet) ([]byte, error) {
 	numBlocks := len(sketchIdx)
 	if numBlocks == 0 {
 		return nil, nil
 	}
-
-	// Collect ALL unique column names across ALL blocks, sorted for determinism.
-	colSet := make(map[string]struct{}, 64)
+	// Check if any block has this column.
+	hasData := false
 	for _, bs := range sketchIdx {
-		for name := range bs {
-			colSet[name] = struct{}{}
+		if _, ok := bs[colName]; ok {
+			hasData = true
+			break
 		}
 	}
-	colNames := make([]string, 0, len(colSet))
-	for name := range colSet {
-		colNames = append(colNames, name)
+	if !hasData {
+		return nil, nil
 	}
-	slices.Sort(colNames)
-	numColumns := len(colNames)
 
 	presenceBytes := (numBlocks + 7) / 8
-
-	// Pre-allocate buffer: header + estimated per-column data.
 	buf := make(
 		[]byte,
 		0,
-		12+numColumns*(64+presenceBytes+numBlocks*4+1+numBlocks*(1+20*10)+2+numBlocks*sketch.SketchBloomBytes),
+		4+presenceBytes+numBlocks*4+1+numBlocks*(1+sketch.TopKSize*10)+2+numBlocks*sketch.SketchBloomBytes,
 	)
 
-	// magic[4 LE]
-	var tmp4 [4]byte
-	binary.LittleEndian.PutUint32(tmp4[:], sketchSectionMagic)
-	buf = append(buf, tmp4[:]...)
-
 	// num_blocks[4 LE]
+	var tmp4 [4]byte
 	binary.LittleEndian.PutUint32(tmp4[:], uint32(numBlocks)) //nolint:gosec // safe: block count bounded
 	buf = append(buf, tmp4[:]...)
 
-	// num_columns[4 LE]
-	binary.LittleEndian.PutUint32(tmp4[:], uint32(numColumns)) //nolint:gosec // safe: column count bounded
-	buf = append(buf, tmp4[:]...)
+	// Build presence bitset.
+	presence := make([]byte, presenceBytes)
+	for blockIdx, bs := range sketchIdx {
+		if _, ok := bs[colName]; ok {
+			presence[blockIdx/8] |= 1 << uint(blockIdx%8)
+		}
+	}
+	buf = append(buf, presence...)
 
+	// distinct_count[num_blocks × 4 LE uint32]
+	for _, bs := range sketchIdx {
+		cs := bs[colName]
+		var card uint32
+		if cs != nil {
+			card = uint32(cs.hll.Cardinality()) //nolint:gosec
+		}
+		binary.LittleEndian.PutUint32(tmp4[:], card)
+		buf = append(buf, tmp4[:]...)
+	}
+
+	// topk_k[1] = 20
+	buf = append(buf, byte(sketch.TopKSize))
+
+	// Per present block: topk_entry_count[1] + entries (fp[8 LE uint64] + count[2 LE uint16]).
+	var tmp8 [8]byte
 	var tmp2 [2]byte
-
-	for _, name := range colNames {
-		// col_name_len[2 LE] + col_name[N]
-		binary.LittleEndian.PutUint16(tmp2[:], uint16(len(name))) //nolint:gosec // safe: name length bounded
-		buf = append(buf, tmp2[:]...)
-		buf = append(buf, name...)
-
-		// Build presence bitset: bit i = 1 if block i has this column.
-		presence := make([]byte, presenceBytes)
-		for blockIdx, bs := range sketchIdx {
-			if _, ok := bs[name]; ok {
-				wordIdx := blockIdx / 8
-				bitIdx := uint(blockIdx % 8)
-				presence[wordIdx] |= 1 << bitIdx
-			}
+	for _, bs := range sketchIdx {
+		cs := bs[colName]
+		if cs == nil {
+			continue
 		}
-		buf = append(buf, presence...)
-
-		// distinct_count[num_blocks × 4 LE uint32]: HLL.Cardinality() per block, 0 for absent.
-		for _, bs := range sketchIdx {
-			cs := bs[name]
-			var card uint32
-			if cs != nil {
-				card = uint32(cs.hll.Cardinality()) //nolint:gosec // safe: cardinality fits uint32
-			}
-			binary.LittleEndian.PutUint32(tmp4[:], card)
-			buf = append(buf, tmp4[:]...)
+		entries := cs.topk.Entries()
+		buf = append(buf, byte(len(entries))) //nolint:gosec // bounded by TopKSize (20)
+		for _, e := range entries {
+			binary.LittleEndian.PutUint64(tmp8[:], e.FP)
+			buf = append(buf, tmp8[:]...)
+			uint16Count := uint16(min(e.Count, math.MaxUint16)) //nolint:gosec
+			binary.LittleEndian.PutUint16(tmp2[:], uint16Count)
+			buf = append(buf, tmp2[:]...)
 		}
+	}
 
-		// topk_k[1] = 20
-		buf = append(buf, byte(sketch.TopKSize))
+	// bloom_size[2 LE]
+	binary.LittleEndian.PutUint16(tmp2[:], uint16(sketch.SketchBloomBytes)) //nolint:gosec
+	buf = append(buf, tmp2[:]...)
 
-		// Per present block: topk_entry_count[1] + entries (fp[8 LE uint64] + count[2 LE uint16]).
-		var tmp8 [8]byte
-		for _, bs := range sketchIdx {
-			cs := bs[name]
-			if cs == nil {
-				continue
-			}
-			entries := cs.topk.Entries()
-			buf = append(buf, byte(len(entries))) //nolint:gosec // safe: entries len bounded by TopKSize (20)
-			for _, e := range entries {
-				// e.FP is the HashForFuse fingerprint computed at Add() time — no re-hash needed.
-				binary.LittleEndian.PutUint64(tmp8[:], e.FP)
-				buf = append(buf, tmp8[:]...)
-				uint16Count := uint16(min(e.Count, math.MaxUint16)) //nolint:gosec // saturate: count bounded to uint16
-				binary.LittleEndian.PutUint16(tmp2[:], uint16Count)
-				buf = append(buf, tmp2[:]...)
-			}
+	// Per present block: bloom_data[bloom_size].
+	for _, bs := range sketchIdx {
+		cs := bs[colName]
+		if cs == nil {
+			continue
 		}
-
-		// bloom_size[2 LE]: fixed size for all present blocks in this column.
-		binary.LittleEndian.PutUint16(tmp2[:], uint16(sketch.SketchBloomBytes)) //nolint:gosec // safe: 2048 fits uint16
-		buf = append(buf, tmp2[:]...)
-
-		// Per present block: bloom_data[bloom_size].
-		for _, bs := range sketchIdx {
-			cs := bs[name]
-			if cs == nil {
-				continue
-			}
-			buf = append(buf, cs.bloom.Marshal()...)
-		}
+		buf = append(buf, cs.bloom.Marshal()...)
 	}
 
 	return buf, nil

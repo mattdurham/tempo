@@ -142,7 +142,7 @@ func computeColumnFilters(program *vm.Program, opts CollectOptions) (wantColumns
 	}
 	// NOTE-028: secondPassCols is nil when AllColumns=true or there is no column filter.
 	if wantColumns == nil || opts.AllColumns {
-		return
+		return wantColumns, secondPassCols
 	}
 	searchCols := searchMetaCols
 	secondPassCols = make(map[string]struct{}, len(searchCols)+len(wantColumns)+len(opts.SelectColumns)+2)
@@ -165,7 +165,7 @@ func computeColumnFilters(program *vm.Program, opts CollectOptions) (wantColumns
 	if opts.TimestampColumn != "" {
 		secondPassCols[opts.TimestampColumn] = struct{}{}
 	}
-	return
+	return wantColumns, secondPassCols
 }
 
 // Collect executes program against all blocks in r and returns matched rows.
@@ -227,7 +227,8 @@ func Collect(
 			return rows, fastQS, err
 		}
 		// SPEC-ROOT-010: slog.Warn when intrinsic fast path falls through to block scan.
-		slog.Warn("intrinsic fast path fell through to full block scan",
+		slog.Warn(
+			"intrinsic fast path fell through to full block scan",
 			"execution_path", ExecPathIntrinsicNeedBlock,
 			"total_blocks", r.BlockCount(),
 		)
@@ -1046,8 +1047,9 @@ func collectIntrinsicTopKKLL(
 	for _, bi := range blockOrder {
 		for _, ref := range blockRefs[uint16(bi)] { //nolint:gosec // bi is bounded by block count
 			packed := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx)
-			if val, ok := tsCol.LookupRefFast(packed); ok {
-				pairs = append(pairs, refTS{ref: ref, ts: val.(uint64)})
+			// NOTE-093: LookupRefFastUint64 avoids interface boxing of uint64 timestamp.
+			if ts, ok := tsCol.LookupRefFastUint64(packed); ok {
+				pairs = append(pairs, refTS{ref: ref, ts: ts})
 			}
 		}
 	}
@@ -1126,7 +1128,8 @@ func collectIntrinsicTopKScan(
 		endBlock = startBlock + opts.BlockCount
 	}
 	scanCount := 0
-	selected := modules_shared.ScanFlatColumnRefsFiltered(tsBlob, backward, limit,
+	selected := modules_shared.ScanFlatColumnRefsFiltered(
+		tsBlob, backward, limit,
 		func(ref modules_shared.BlockRef) bool {
 			scanCount++
 			bi := int(ref.BlockIdx)
@@ -1154,17 +1157,17 @@ func collectIntrinsicTopKScan(
 	if len(selected) > 0 && (opts.TimeRange.MinNano > 0 || opts.TimeRange.MaxNano > 0) {
 		tsCol, tsErr := r.GetIntrinsicColumn(opts.TimestampColumn)
 		if tsErr == nil && tsCol != nil && len(tsCol.Uint64Values) == len(tsCol.BlockRefs) {
-			// Use LookupRefFast: O(K log N) avoiding per-call allocations
+			// Use LookupRefFastUint64: O(K log N) avoiding per-call allocations
 			// vs the old O(N) map build over 3.3M entries.
-			// LookupRefFast calls EnsureRefIndex internally.
+			// LookupRefFastUint64 calls EnsureRefIndex internally.
 			filtered := selected[:0]
 			for _, ref := range selected {
 				packed := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx)
-				val, ok := tsCol.LookupRefFast(packed)
+				// NOTE-093: LookupRefFastUint64 avoids interface boxing of uint64 timestamp.
+				ts, ok := tsCol.LookupRefFastUint64(packed)
 				if !ok {
 					continue
 				}
-				ts := val.(uint64)
 				if opts.TimeRange.MinNano > 0 && ts < opts.TimeRange.MinNano {
 					continue
 				}
@@ -1220,7 +1223,8 @@ func collectMixedPlain(
 	var mixedPlainRowSet vm.RowSet
 	var mixedPlainPreFnErr error
 	// Coalesce all candidate blocks for efficient batch I/O.
-	err := forEachBlockInGroups(r, blockOrder, blockCandidates, wantColumns, secondPassCols, "collectMixedPlain",
+	err := forEachBlockInGroups(
+		r, blockOrder, blockCandidates, wantColumns, secondPassCols, "collectMixedPlain",
 		func(pb parsedBlock, candidateRows []int) bool {
 			// Re-evaluate the full predicate on the first-pass block to gate second-pass decode.
 			provider := newBlockColumnProvider(pb.Block)
@@ -1310,7 +1314,8 @@ func collectMixedTopK(
 	var mixedTopKRowSet vm.RowSet
 	var mixedTopKPreFnErr error
 	// Coalesce all candidate blocks for efficient batch I/O.
-	if err := forEachBlockInGroups(r, blockOrder, blockCandidates, wantColumns, secondPassCols, "collectMixedTopK",
+	if err := forEachBlockInGroups(
+		r, blockOrder, blockCandidates, wantColumns, secondPassCols, "collectMixedTopK",
 		func(pb parsedBlock, candidateRows []int) bool {
 			// Re-evaluate the full predicate on the first-pass block to gate second-pass decode.
 			provider := newBlockColumnProvider(pb.Block)
@@ -1424,7 +1429,7 @@ func filterRowSetByIntrinsicNodes(
 //
 // For each requested intrinsic column, GetIntrinsicColumn returns an objectcache-backed
 // column where EnsureRefIndex builds a sorted-by-ref lookup table once (O(N log N));
-// subsequent lookups use O(log N) binary search per selected ref via LookupRefFast.
+// subsequent lookups use O(log N) binary search per selected ref via typed accessors.
 // Total per column: O(M log N) for M target refs.
 //
 // SPEC-ROOT-010: I/O errors must not be silently swallowed. Returns an error if any
@@ -1444,12 +1449,27 @@ func lookupIntrinsicFields(
 	}
 
 	// lookupColumn populates result entries for one intrinsic column using O(log N)
-	// binary search. LookupRefFast calls EnsureRefIndex internally.
+	// typed accessors. EnsureRefIndex is called internally on first use.
 	lookupColumn := func(colName string, col *modules_shared.IntrinsicColumn) {
 		for i, ref := range selected {
 			packed := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx) //nolint:gosec
-			if val, ok := col.LookupRefFast(packed); ok {
-				result[i][colName] = val
+			switch colName {
+			case colNameSpanStart, colNameSpanEnd, colNameSpanDuration:
+				if v, ok := col.LookupRefFastUint64(packed); ok {
+					result[i][colName] = v
+				}
+			case colNameSpanName, colNameServiceName, colNameStatusMessage:
+				if v, ok := col.LookupRefFastString(packed); ok {
+					result[i][colName] = v
+				}
+			case colNameSpanKind, colNameSpanStatus:
+				if v, ok := col.LookupRefFastInt64(packed); ok {
+					result[i][colName] = v
+				}
+			case colNameTraceID, colNameSpanID, colNameParentID:
+				if v, ok := col.LookupRefFastBytes(packed); ok {
+					result[i][colName] = v
+				}
 			}
 		}
 	}

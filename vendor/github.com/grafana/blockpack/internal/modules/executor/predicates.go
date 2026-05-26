@@ -1015,6 +1015,15 @@ func ProgramWantColumns(program *vm.Program, extra ...string) map[string]struct{
 	return cols
 }
 
+// ComputeSecondPassCols returns the column set needed for result materialization.
+// It is the correct wantCols value for NewSpanFieldsAdapterWithReader at stream call sites.
+// SPEC-ROOT-017: secondPassCols is the correct filter for second-pass block decodes.
+// NOTE-098: always includes traceIntrinsicColumns so span:end synthesis works.
+func ComputeSecondPassCols(program *vm.Program, selectColumns []string) map[string]struct{} {
+	_, secondPassCols := computeColumnFilters(program, CollectOptions{SelectColumns: selectColumns})
+	return secondPassCols
+}
+
 // collectNodeColumns recursively walks a RangeNode slice and adds all leaf Column
 // values to the cols set.
 func collectNodeColumns(nodes []vm.RangeNode, cols map[string]struct{}) {
@@ -1685,79 +1694,39 @@ func countIntrinsicLeaves(node vm.RangeNode) int {
 }
 
 // unionBlockRefs merges two BlockRef slices, deduplicating by (BlockIdx, RowIdx).
+// NOTE-099: uses sorted-slice merge (see sorted_refs.go) to eliminate map allocations.
+// Each input is sorted in-place if not already sorted before merging.
 func unionBlockRefs(a, b []modules_shared.BlockRef) []modules_shared.BlockRef {
-	type refKey struct{ blockIdx, rowIdx uint16 }
-	seen := make(map[refKey]struct{}, len(a)+len(b))
-	result := make([]modules_shared.BlockRef, 0, len(a)+len(b))
-	for _, ref := range a {
-		k := refKey{ref.BlockIdx, ref.RowIdx}
-		if _, ok := seen[k]; !ok {
-			seen[k] = struct{}{}
-			result = append(result, ref)
-		}
+	if !isSortedRefs(a) {
+		sortRefs(a)
 	}
-	for _, ref := range b {
-		k := refKey{ref.BlockIdx, ref.RowIdx}
-		if _, ok := seen[k]; !ok {
-			seen[k] = struct{}{}
-			result = append(result, ref)
-		}
+	if !isSortedRefs(b) {
+		sortRefs(b)
 	}
-	return result
+	return unionSortedRefs(a, b)
 }
 
 // intersectBlockRefSets intersects multiple BlockRef slices, returning only refs
-// present in all sets. Uses smallest-first strategy for efficiency.
+// present in all sets. Uses smallest-first sorted-slice merge strategy.
+// NOTE-099: replaces map-based intersection with O(M+N) sorted walk (see sorted_refs.go).
+// Each set is sorted in-place if not already sorted before intersection.
 func intersectBlockRefSets(sets [][]modules_shared.BlockRef, limit int) []modules_shared.BlockRef {
-	if len(sets) == 0 {
+	switch len(sets) {
+	case 0:
 		return nil
-	}
-	if len(sets) == 1 {
+	case 1:
+		// Fast path: single set, no intersection needed — just apply limit.
 		if limit > 0 && len(sets[0]) > limit {
 			return sets[0][:limit]
 		}
 		return sets[0]
 	}
-
-	// Intersect: start from smallest set, check membership in others.
-	// Sort sets by size ascending for efficiency.
-	slices.SortFunc(sets, func(a, b []modules_shared.BlockRef) int {
-		return len(a) - len(b)
-	})
-
-	// Build lookup sets for all but the first (smallest).
-	type refKey struct{ blockIdx, rowIdx uint16 }
-	lookups := make([]map[refKey]struct{}, len(sets)-1)
-	for i, s := range sets[1:] {
-		m := make(map[refKey]struct{}, len(s))
-		for _, ref := range s {
-			m[refKey{ref.BlockIdx, ref.RowIdx}] = struct{}{}
-		}
-		lookups[i] = m
-	}
-
-	resCap := len(sets[0])
-	if limit > 0 && limit < resCap {
-		resCap = limit
-	}
-	result := make([]modules_shared.BlockRef, 0, resCap)
-	for _, ref := range sets[0] {
-		k := refKey{ref.BlockIdx, ref.RowIdx}
-		inAll := true
-		for _, lk := range lookups {
-			if _, ok := lk[k]; !ok {
-				inAll = false
-				break
-			}
-		}
-		if inAll {
-			result = append(result, ref)
-			if limit > 0 && len(result) >= limit {
-				break
-			}
+	for i, s := range sets {
+		if !isSortedRefs(s) {
+			sortRefs(sets[i])
 		}
 	}
-	return result
+	return intersectSortedRefSets(sets, limit)
 }
 
 // evalNodeBlockRefs recursively evaluates a RangeNode tree against intrinsic column blobs.
@@ -2106,7 +2075,7 @@ func scanIntrinsicLeafRefs(
 // extractFlatRangeBounds converts a RangeNode's Min/Max into inclusive uint64 bounds
 // suitable for ScanFlatColumnRefs. Returns ok=false if the bounds cannot be encoded
 // or the constraint is empty (e.g. > MaxUint64, < 0).
-func extractFlatRangeBounds(leaf vm.RangeNode) (lo, hi uint64, hasLo, hasHi bool, ok bool) {
+func extractFlatRangeBounds(leaf vm.RangeNode) (lo, hi uint64, hasLo, hasHi, ok bool) {
 	if leaf.Min != nil {
 		v, encOK := valueToUint64(*leaf.Min)
 		if !encOK {
@@ -2271,6 +2240,14 @@ func rowSatisfiesIntrinsicNodesORTyped(nodes []vm.RangeNode, row *intrinsicRowFi
 
 // intrinsicLeafMatchTyped evaluates a single leaf RangeNode against a typed row.
 // Uses type-group getter helpers to keep cyclomatic complexity low.
+//
+// Absent-field conventions used by the getter helpers:
+//   - bytes fields (intrinsicLeafGetBytesTyped): return (nil, true) for absent — the ok=true
+//     signals "this is a bytes column" while nil signals "field absent in this row".
+//   - scalar fields (intrinsicLeafGetUint64Typed, intrinsicLeafGetInt64Typed): return (0, false)
+//     for absent — ok=false signals "absent or not a scalar column".
+//
+// Both conventions are correct; callers must apply the right one per field type.
 func intrinsicLeafMatchTyped(n vm.RangeNode, row *intrinsicRowFields) bool {
 	// Try bytes-typed fields (trace:id, span:id, span:parent_id).
 	// Bytes getter returns (nil, true) for absent known bytes column — handled by matchIntrinsicBytesField.
@@ -2364,6 +2341,7 @@ func matchIntrinsicBytesField(bval []byte, n vm.RangeNode) bool {
 // intrinsicLeafGetBytesTyped returns the bytes value and ok=true for bytes-typed columns.
 // Returns nil bytes with ok=true when the field is known but absent (present-bit clear).
 // Returns ok=false when the column is not a bytes-typed intrinsic column.
+// NOTE: returned slice aliases the struct's inline array — do not retain or write into it.
 func intrinsicLeafGetBytesTyped(col string, row *intrinsicRowFields) ([]byte, bool) {
 	switch col {
 	case colNameTraceID:
@@ -2375,12 +2353,12 @@ func intrinsicLeafGetBytesTyped(col string, row *intrinsicRowFields) ([]byte, bo
 		if row.present&intrinsicPresentSpanID == 0 {
 			return nil, true
 		}
-		return row.spanID, true
+		return row.spanID[:], true
 	case colNameParentID:
 		if row.present&intrinsicPresentParentID == 0 {
 			return nil, true
 		}
-		return row.parentID, true
+		return row.parentID[:], true
 	}
 	return nil, false
 }

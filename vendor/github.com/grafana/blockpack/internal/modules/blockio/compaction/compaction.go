@@ -43,7 +43,7 @@ func buildDedupeIndex(r *modules_reader.Reader, blockIdx int) map[uint16]blockID
 		if err != nil || col == nil {
 			continue
 		}
-		if col.Format != modules_shared.IntrinsicFormatFlat {
+		if col.Format != modules_shared.IntrinsicFormatFlat && col.Format != modules_shared.IntrinsicFormatXORBytes {
 			continue
 		}
 		for i, ref := range col.BlockRefs {

@@ -138,6 +138,8 @@ func streamLogProgram(r *Reader, program *vm.Program, opts LogQueryOptions, fn s
 	// GetIntrinsicColumn is cached after first load so this is cheap on subsequent calls.
 	logTraceIDByRef := buildIntrinsicBytesMap(r, "trace:id")
 	logSpanIDByRef := buildIntrinsicBytesMap(r, "span:id")
+	// SPEC-ROOT-017: pass secondPassCols as wantCols to restrict intrinsic decoding
+	wantCols := modules_executor.ComputeSecondPassCols(program, nil)
 	for _, row := range rows {
 		var fields SpanFieldsProvider
 		var traceIDHex, spanIDHex string
@@ -151,7 +153,10 @@ func streamLogProgram(r *Reader, program *vm.Program, opts LogQueryOptions, fn s
 				spanIDHex = hexEncodeField(v)
 			}
 		} else {
-			rawAdapter = modules_blockio.NewSpanFieldsAdapterWithReader(row.Block, r, row.BlockIdx, row.RowIdx)
+			rawAdapter = modules_blockio.NewSpanFieldsAdapterWithReader(
+				row.Block, r, row.BlockIdx, row.RowIdx,
+				wantCols,
+			)
 			fields = rawAdapter
 			traceIDHex, spanIDHex = extractIDs(row.Block, row.RowIdx, row.BlockIdx, logTraceIDByRef, logSpanIDByRef)
 		}

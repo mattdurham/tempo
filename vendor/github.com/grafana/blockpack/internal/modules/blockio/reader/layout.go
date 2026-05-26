@@ -125,8 +125,8 @@ type FileBloomColumnInfo struct {
 // Logical sections (IsLogical=true) describe sub-structure within the decompressed
 // metadata buffer; their Offset is relative to that buffer, not the physical file.
 func (r *Reader) FileLayout() (*FileLayoutReport, error) {
-	if r.footerVersion == shared.FooterV7Version {
-		return r.fileLayoutV14()
+	if r.footerVersion == shared.FooterV8Version {
+		return r.fileLayoutV8()
 	}
 
 	const headerSize = int64(22) // magic[4] + version[1] + metadataOffset[8] + metadataLen[8] + signalType[1]
@@ -228,63 +228,67 @@ func (r *Reader) FileLayout() (*FileLayoutReport, error) {
 	}, nil
 }
 
-// fileLayoutV14 builds the FileLayoutReport for V14 (FooterV7) files.
-// V14 layout: blocks + sections (type-keyed + name-keyed) + section_directory + footer.
-// There is no file_header or metadata.compressed blob in V14.
-func (r *Reader) fileLayoutV14() (*FileLayoutReport, error) {
-	sections := make([]FileLayoutSection, 0, 16)
+// fileLayoutV8 builds the FileLayoutReport for V8 (unified ToC) files.
+// V8 layout: blocks + per-section blobs + ToC blob + footer.
+func (r *Reader) fileLayoutV8() (*FileLayoutReport, error) {
+	sections := make([]FileLayoutSection, 0, 16+len(r.tocMap)+len(r.blockMetas)*3)
 
 	// Footer: last 18 bytes.
-	footerSize := int64(shared.FooterV7Size) //nolint:gosec
+	footerSize := int64(shared.FooterV8Size) //nolint:gosec
 	sections = append(sections, FileLayoutSection{
 		Section:        "footer",
 		Offset:         r.fileSize - footerSize,
 		CompressedSize: footerSize,
 	})
 
-	// Section directory: snappy-compressed blob at v7DirOffset.
-	sections = append(sections, FileLayoutSection{
-		Section:        "section_directory",
-		Offset:         int64(r.v7DirOffset), //nolint:gosec
-		CompressedSize: int64(r.v7DirLen),    //nolint:gosec
-	})
-
-	// Type-keyed sections from the section directory.
-	sectionNames := map[uint8]string{
-		shared.SectionBlockIndex:  "block_index",
-		shared.SectionRangeIndex:  "range_index",
-		shared.SectionTraceIndex:  "trace_index",
-		shared.SectionTSIndex:     "ts_index",
-		shared.SectionSketchIndex: "sketch_index",
-		shared.SectionFileBloom:   "file_bloom",
-	}
-	for sType, e := range r.sectionDir.TypeEntries {
-		name, ok := sectionNames[sType]
-		if !ok {
-			name = fmt.Sprintf("section.0x%02X", sType)
-		}
+	// ToC blob.
+	if r.v8ToCLen > 0 {
 		sections = append(sections, FileLayoutSection{
-			Section:        "section." + name,
-			Offset:         int64(e.Offset),        //nolint:gosec
-			CompressedSize: int64(e.CompressedLen), //nolint:gosec
+			Section:        "toc",
+			Offset:         int64(r.v8ToCOffset), //nolint:gosec
+			CompressedSize: int64(r.v8ToCLen),    //nolint:gosec
 		})
 	}
 
-	// Name-keyed entries: one intrinsic column blob per entry.
-	// Read each blob to detect paged format and emit per-page sections.
-	for name, e := range r.sectionDir.NameEntries {
-		pageSections, err := r.layoutIntrinsicColumnV14(name, e)
-		if err != nil || len(pageSections) == 0 {
-			// Fallback: emit as single section.
+	// ToC entries: each is a snappy-compressed blob (or pre-compressed for intrinsic).
+	for key, e := range r.tocMap {
+		var sectionName string
+		var colType string
+		switch {
+		case key.Type == shared.ToCTypeIndex && key.SubType == shared.ToCSubTypeBlockIndex:
+			sectionName = "section.block_index"
+		case key.Type == shared.ToCTypeMetadata && key.SubType == shared.ToCSubTypeRange:
+			sectionName = "section.range_index[" + key.Name + "]"
+			if ct, ok := r.RangeColumnType(key.Name); ok {
+				colType = columnTypeName(ct)
+			}
+		case key.Type == shared.ToCTypeMetadata && key.SubType == shared.ToCSubTypeSketch:
+			sectionName = "section.sketch_index[" + key.Name + "]"
+			// Don't set colType for sketch blobs — column type not available without parsing.
 			sections = append(sections, FileLayoutSection{
-				Section:        "intrinsic.column[" + name + "]",
-				ColumnName:     name,
-				Offset:         int64(e.Offset),        //nolint:gosec
-				CompressedSize: int64(e.CompressedLen), //nolint:gosec
+				Section:        sectionName,
+				Offset:         int64(e.Offset), //nolint:gosec
+				CompressedSize: int64(e.Length), //nolint:gosec
 			})
-		} else {
-			sections = append(sections, pageSections...)
+			continue
+		case key.Type == shared.ToCTypeMetadata && key.SubType == shared.ToCSubTypeTrace:
+			sectionName = "section.trace_index"
+		case key.Type == shared.ToCTypeMetadata && key.SubType == shared.ToCSubTypeTS:
+			sectionName = "section.ts_index"
+		case key.Type == shared.ToCTypeMetadata && key.SubType == shared.ToCSubTypeBloom:
+			sectionName = "section.file_bloom"
+		case key.Type == shared.ToCTypeMetadata && key.SubType == shared.ToCSubTypeIntrinsic:
+			sectionName = "intrinsic.column[" + key.Name + "]"
+		default:
+			sectionName = fmt.Sprintf("section.type%d.subtype%d[%s]", key.Type, key.SubType, key.Name)
 		}
+		sections = append(sections, FileLayoutSection{
+			Section:        sectionName,
+			ColumnName:     key.Name,
+			ColumnType:     colType,
+			Offset:         int64(e.Offset), //nolint:gosec
+			CompressedSize: int64(e.Length), //nolint:gosec
+		})
 	}
 
 	// Blocks.
@@ -324,94 +328,6 @@ func (r *Reader) fileLayoutV14() (*FileLayoutReport, error) {
 	}, nil
 }
 
-// layoutIntrinsicColumnV14 reads a V14 name-keyed intrinsic column blob and, if it is
-// in paged format, returns one physical section per page plus a page_toc header section.
-// For non-paged blobs, returns nil so the caller emits a single section instead.
-func (r *Reader) layoutIntrinsicColumnV14(colName string, e shared.DirEntryName) ([]FileLayoutSection, error) {
-	// GetIntrinsicColumnBlob returns raw (snappy-compressed) bytes for V14 files.
-	// We need the decompressed bytes to check for paged format.
-	rawBlob, err := r.GetIntrinsicColumnBlob(colName)
-	if err != nil || len(rawBlob) == 0 {
-		return nil, err
-	}
-
-	// For V14 files, blobs on disk are snappy-compressed; decompress to inspect content.
-	// Check decoded size before decompressing to guard against decompression bombs.
-	blob := rawBlob
-	if decodedLen, lenErr := snappy.DecodedLen(rawBlob); lenErr == nil && decodedLen <= shared.MaxBlockSize {
-		if dec, decErr := snappy.Decode(nil, rawBlob); decErr == nil {
-			blob = dec
-		}
-		// On decode error: treat as non-paged (not snappy-compressed for V14).
-	}
-	// If decoded size exceeds MaxBlockSize or DecodedLen fails, treat as non-paged.
-
-	// Non-paged blob: let caller emit the simple section.
-	if len(blob) == 0 || blob[0] != shared.IntrinsicPagedVersion {
-		return nil, nil
-	}
-
-	// Paged format: blob[1:5] = toc_len[4], then toc_blob, then page blobs.
-	if len(blob) < 5 {
-		return nil, nil
-	}
-	tocLen := int(binary.LittleEndian.Uint32(blob[1:5]))
-	if 5+tocLen > len(blob) {
-		return nil, nil
-	}
-
-	ptoc, tocErr := shared.DecodePageTOC(blob[5 : 5+tocLen])
-	if tocErr != nil {
-		return nil, tocErr
-	}
-	if len(ptoc.Pages) == 0 {
-		return nil, nil
-	}
-
-	// The blob on disk is snappy-compressed, stored at e.Offset with e.CompressedLen bytes.
-	// The uncompressed paged blob has: sentinel[1] + toc_len[4] + toc_blob[tocLen] + pages.
-	// page absolute offsets are relative to the compressed blob start on disk —
-	// however the paged TOC stores offsets relative to the start of the first page blob
-	// within the uncompressed blob. For layout purposes, we emit logical sections.
-	headerLen := int64(1) + 4 + int64(tocLen) //nolint:gosec
-
-	sections := make([]FileLayoutSection, 0, 1+len(ptoc.Pages))
-
-	// Emit the TOC header as a logical section (describes uncompressed blob sub-structure).
-	// Offset=0: the header occupies bytes [0, headerLen) within the uncompressed blob.
-	sections = append(sections, FileLayoutSection{
-		Section:        "intrinsic.column[" + colName + "].page_toc",
-		ColumnName:     colName,
-		Offset:         0, // relative to uncompressed blob; header starts at byte 0
-		CompressedSize: headerLen,
-		IsLogical:      true,
-	})
-
-	// Emit per-page sections as logical sections.
-	for pageIdx, pm := range ptoc.Pages {
-		pageOffset := headerLen + int64(pm.Offset) //nolint:gosec
-		sections = append(sections, FileLayoutSection{
-			Section:        fmt.Sprintf("intrinsic.column[%s].page[%d]", colName, pageIdx),
-			ColumnName:     colName,
-			Offset:         pageOffset,
-			CompressedSize: int64(pm.Length), //nolint:gosec
-			RowCount:       int(pm.RowCount), //nolint:gosec
-			IsLogical:      true,
-		})
-	}
-
-	// Emit the compressed blob on disk as a single physical section that accounts for the bytes.
-	sections = append(sections, FileLayoutSection{
-		Section:          "intrinsic.column[" + colName + "]",
-		ColumnName:       colName,
-		Offset:           int64(e.Offset),        //nolint:gosec
-		CompressedSize:   int64(e.CompressedLen), //nolint:gosec
-		UncompressedSize: int64(len(blob)),       //nolint:gosec
-	})
-
-	return sections, nil
-}
-
 // layoutIntrinsicSections returns FileLayoutSection entries for all intrinsic columns
 // in legacy (V4/V5/V6 footer) files. It handles both flat and paged column formats.
 func (r *Reader) layoutIntrinsicSections() []FileLayoutSection {
@@ -423,9 +339,16 @@ func (r *Reader) layoutIntrinsicSections() []FileLayoutSection {
 		if !ok {
 			continue
 		}
-		formatName := "flat"
-		if meta.Format == shared.IntrinsicFormatDict {
+		var formatName string
+		switch meta.Format {
+		case shared.IntrinsicFormatDict:
 			formatName = "dict"
+		case shared.IntrinsicFormatXORBytes:
+			formatName = "xor_bytes"
+		case shared.IntrinsicFormatDeltaUint64:
+			formatName = "delta_uint64"
+		default:
+			formatName = "flat"
 		}
 
 		blob, blobErr := r.GetIntrinsicColumnBlob(name)

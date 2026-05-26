@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"slices"
 
+	"github.com/grafana/blockpack/internal/modules/blockio/shared"
 	"github.com/grafana/blockpack/internal/modules/sketch"
 )
 
@@ -66,7 +67,16 @@ type FileSketchSummary struct {
 // from sketchIdx when the cache entry has been reclaimed.
 // Returns nil when the file has no sketch section (old format — degrade gracefully).
 func (r *Reader) FileSketchSummary() *FileSketchSummary {
-	_ = r.ensureV14SketchSection()
+	// For V8 files, populate r.sketchIdx by loading all per-column sketch blobs from the ToC.
+	if r.footerVersion == shared.FooterV8Version {
+		for key := range r.tocMap {
+			if key.Type == shared.ToCTypeMetadata && key.SubType == shared.ToCSubTypeSketch {
+				_ = r.ColumnSketch(key.Name) // populates r.sketchIdx as a side effect
+			}
+		}
+	} else {
+		_ = r.ensureV14SketchSection()
+	}
 	if r.sketchIdx == nil {
 		return nil
 	}

@@ -813,18 +813,29 @@ Back-ref: `internal/modules/executor/stream_structural.go:ExecuteStructural`
 ### 11.3 Invariants
 
 - **SPEC-STRUCT-1:** Nil reader returns `&StructuralResult{}` with no error.
-- **SPEC-STRUCT-2:** File-level bloom and range pruning is applied using the LHS filter
-  predicates (NOTE-091). Within a file, all blocks are scanned — parent spans may be in
-  any internal block. Files where the LHS filter bloom-rejects are skipped entirely.
-  For `{} >> {}` (no predicates), behavior is unchanged: `planner.Plan(nil, tr)` is called
+- **SPEC-STRUCT-2:** File-level bloom, range, and intrinsic TOC pruning is applied for ALL
+  programs where safe (NOTE-091, NOTE-095, NOTE-097). Safety is determined by
+  `shouldRejectFileForProgram`: for the LHS program (index 0) of a negation op (!>>, !>, !~),
+  absent LHS means all RHS spans trivially qualify, so file-level rejection is NOT safe and is
+  skipped. For all other programs (positive ops, or any RHS program), absent predicate matches
+  imply no output, so file-level rejection is safe. Within a file, all blocks are scanned —
+  parent spans may be in any internal block. Additionally, intrinsic TOC file-level rejection
+  (NOTE-097) is applied in the same loop: `BlocksFromIntrinsicTOC` is called for each eligible
+  program; if it returns a non-nil empty slice (zero blocks in the file contain matching spans),
+  the file is rejected before block selection. Block-level TOC pruning (non-empty return from
+  `BlocksFromIntrinsicTOC`) is intentionally not applied to preserve NOTE-091 safety. For
+  `{} >> {}` (no predicates), behavior is unchanged: `planner.Plan(nil, tr)` is called
   (time-range pruning only).
 - **SPEC-STRUCT-3:** A nil filter in any chain slot of `StructuralQuery` (left or any right
   `Expr` node) compiles to a nil program, which matches all rows (wildcard `{}`).
 - **SPEC-STRUCT-4:** `Options.Limit > 0` caps the number of entries in `StructuralResult.Matches`.
   Matches are deduplicated per trace (a span may only appear once per trace result).
 - **SPEC-STRUCT-5:** `SpanMatch.SpanID` is an 8-byte raw slice. `SpanMatch.TraceID` is a
-  `[16]byte` value. `BlockIdx` and `RowIdx` are zero (structural queries aggregate across
-  blocks; per-block row positions are not meaningful in the result).
+  `[16]byte` value. `BlockIdx` and `RowIdx` are populated with the originating block index
+  and row index within that block for the matched terminal span. These values are used by
+  the conversion layer (`api.go`) to construct a `SpanFieldsAdapter` backed by the reader's
+  intrinsic section. `BlockIdx` and `RowIdx` are both zero only for spans that happened to
+  be in block 0 at row 0; callers must not assume zero means "not set".
 
 - **SPEC-STRUCT-6:** `OpNotDescendant (!>>)` — a rightMatch span R passes if NO span in
   R's ancestor chain is a leftMatch. Root spans (parentIdx == -1) have an empty ancestor
@@ -1043,3 +1054,59 @@ Back-ref: `internal/modules/executor/column_provider.go:StreamScanEqualAny`,
   governs only the whole-column-absent case.
 
 Back-ref: `internal/modules/executor/column_provider.go:StreamScanNotEqual`
+
+---
+
+## SPEC-CSP-01: ComputeSecondPassCols — Column Set for Result Materialization
+*Added: 2026-04-30*
+
+```go
+func ComputeSecondPassCols(program *vm.Program, selectColumns []string) map[string]struct{}
+```
+
+`ComputeSecondPassCols` returns the set of column names needed for result materialization
+at `NewSpanFieldsAdapterWithReader` call sites. It is the exported complement of the
+internal `computeColumnFilters` second-pass output.
+
+### Inputs
+
+- `program *vm.Program` — compiled TraceQL filter program. May be nil (structural path,
+  log path). When non-nil and has predicates, predicate columns are included in the result.
+- `selectColumns []string` — caller-requested output columns (`opts.SelectColumns`). May be
+  nil or empty. When non-empty, these columns are included in the result alongside
+  traceIntrinsicColumns.
+
+### Output
+
+- Returns `map[string]struct{}` (`secondPassCols`) or nil.
+- Non-nil when either `program` has predicates or `selectColumns` is non-empty.
+- Nil when both `program` is nil (or has no predicates) and `selectColumns` is empty;
+  nil is valid and means "load all intrinsic columns" at the call site.
+
+### Invariants
+
+- **traceIntrinsicColumns always present in non-nil result:** when the return value is
+  non-nil, it always includes all entries from `traceIntrinsicColumns` (which contains
+  `span:start`, `span:duration`, `trace:id`, `span:id`, and others). This satisfies
+  SPEC-ROOT-017's span:end synthesis requirement — both `span:start` and `span:duration`
+  are always available for synthesis when `wantCols` is non-nil.
+- **searchMetaCols always present in non-nil result:** `searchMetaCols` entries are
+  included in every non-nil result alongside predicate and select columns.
+- **Pure function:** no I/O, no side effects. Safe to call before a row loop and reuse
+  the result for every row in the loop.
+- **Correct wantCols for stream paths:** the return value is the correct `wantCols`
+  argument for `NewSpanFieldsAdapterWithReader` at `streamFilterProgram`,
+  `streamLogProgram`, and the `QueryTraceQL` structural result path (SPEC-ROOT-017).
+
+### Call-site pattern
+
+```go
+// SPEC-ROOT-017: pass secondPassCols as wantCols to restrict intrinsic decoding
+wantCols := executor.ComputeSecondPassCols(program, opts.SelectColumns)
+for _, row := range rows {
+    adapter := blockio.NewSpanFieldsAdapterWithReader(..., wantCols)
+    ...
+}
+```
+
+Back-ref: `internal/modules/executor/predicates.go:ComputeSecondPassCols`

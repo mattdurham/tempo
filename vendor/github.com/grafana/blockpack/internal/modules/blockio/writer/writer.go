@@ -3,7 +3,6 @@ package writer
 // NOTE: Any changes to this file must be reflected in the corresponding specs.md or NOTES.md.
 
 import (
-	"bytes"
 	"fmt"
 	"io"
 	"runtime"
@@ -12,7 +11,6 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
-	"github.com/golang/snappy"
 	"github.com/grafana/tempo/pkg/tempopb"
 	logsv1 "go.opentelemetry.io/proto/otlp/logs/v1"
 	tracev1 "go.opentelemetry.io/proto/otlp/trace/v1"
@@ -41,16 +39,16 @@ type Writer struct {
 
 	// sketchIdx accumulates per-block sketch sets across all blocks.
 	// Indexed parallel to blockMetas: sketchIdx[i] is the sketch for block i.
-	// Consumed at Flush() by writeV14Sections.
+	// Consumed at Flush() by writeV8Sections.
 	sketchIdx []blockSketchSet
 
 	// intrinsicAccum accumulates file-level columnar data for intrinsic columns.
 	// Fed row-by-row during block building via blockBuilder.intrinsicAccum.
-	// Consumed at Flush() by writeV14Sections to produce the V7 footer intrinsic columns.
+	// Consumed at Flush() by writeV8Sections.
 	intrinsicAccum *intrinsicAccumulator
 
 	// fileBloomSvcNames accumulates unique service names for file-level bloom construction.
-	// Fed from flushBlocks and flushLogBlocks; consumed at Flush by writeV14Sections.
+	// Fed from flushBlocks and flushLogBlocks; consumed at Flush by writeV8Sections.
 	fileBloomSvcNames map[string]struct{}
 
 	// addRowIntrinsicCache caches per-block intrinsic indexes built during AddRowFromReader
@@ -450,9 +448,9 @@ func (w *Writer) Flush() (int64, error) {
 	// and max), so no re-scan is needed here.
 	applyRangeBuckets(w.rangeIdx, defaultRangeBuckets)
 
-	// 3–8. Write V14 sections + Footer V7.
-	if err := w.writeV14Sections(); err != nil {
-		return w.out.total, fmt.Errorf("writer: write V14 sections: %w", err)
+	// 3–8. Write V8 sections + Footer.
+	if err := w.writeV8Sections(); err != nil {
+		return w.out.total, fmt.Errorf("writer: write V8 sections: %w", err)
 	}
 
 	total := w.out.total
@@ -498,158 +496,12 @@ func (w *Writer) Flush() (int64, error) {
 	return total, nil
 }
 
-// writeEmptyFile writes a minimal valid V14 blockpack file with zero blocks.
+// writeEmptyFile writes a minimal valid blockpack file with zero blocks.
 func (w *Writer) writeEmptyFile() (int64, error) {
-	if err := w.writeV14Sections(); err != nil {
+	if err := w.writeV8Sections(); err != nil {
 		return w.out.total, err
 	}
 	return w.out.total, nil
-}
-
-// writeV14Sections writes all V14 metadata sections, section directory, and Footer V7.
-//
-// Type-keyed sections (each snappy-compressed independently):
-//   - SectionBlockIndex  (0x01): block index
-//   - SectionRangeIndex  (0x02): range column index
-//   - SectionTraceIndex  (0x03): compact trace index (same format as V13 compact index)
-//   - SectionTSIndex     (0x04): timestamp index
-//   - SectionSketchIndex (0x05): sketch index
-//   - SectionFileBloom   (0x06): file-level bloom filter
-//
-// Name-keyed entries (DirEntryName, one per file-level intrinsic column blob) are written
-// after the type-keyed sections. Each intrinsic column blob is snappy-compressed independently.
-//
-// After all sections: writes snappy-compressed section directory + Footer V7.
-func (w *Writer) writeV14Sections() error {
-	var typeEntries []shared.DirEntryType
-	var nameEntries []shared.DirEntryName
-
-	// Helper: compress raw bytes, write, record a type-keyed DirEntryType.
-	writeSection := func(sectionType uint8, raw []byte) error {
-		compressed := snappy.Encode(nil, raw)
-		offset := uint64(w.out.total) //nolint:gosec
-		if _, err := w.out.Write(compressed); err != nil {
-			return fmt.Errorf("section 0x%02X write: %w", sectionType, err)
-		}
-		typeEntries = append(typeEntries, shared.DirEntryType{
-			SectionType:   sectionType,
-			Offset:        offset,
-			CompressedLen: uint32(len(compressed)), //nolint:gosec // safe: section size fits uint32
-		})
-		return nil
-	}
-
-	// SectionBlockIndex (0x01).
-	blockIdxRaw, err := writeBlockIndexSection(nil, w.blockMetas)
-	if err != nil {
-		return fmt.Errorf("block_index: %w", err)
-	}
-	if err = writeSection(shared.SectionBlockIndex, blockIdxRaw); err != nil {
-		return err
-	}
-
-	// SectionRangeIndex (0x02).
-	rangeIdxRaw, err := writeRangeIndexSection(nil, w.rangeIdx)
-	if err != nil {
-		return fmt.Errorf("range_index: %w", err)
-	}
-	if err = writeSection(shared.SectionRangeIndex, rangeIdxRaw); err != nil {
-		return err
-	}
-
-	// SectionTraceIndex (0x03): compact trace index (same binary format as V13 compact section).
-	var compactBuf bytes.Buffer
-	if _, err = writeCompactTraceIndex(&compactBuf, w.blockMetas, w.traceIndex); err != nil {
-		return fmt.Errorf("trace_index: %w", err)
-	}
-	if err = writeSection(shared.SectionTraceIndex, compactBuf.Bytes()); err != nil {
-		return err
-	}
-
-	// SectionTSIndex (0x04): timestamp index.
-	tsRaw := writeTSIndexSection(w.blockMetas)
-	if err = writeSection(shared.SectionTSIndex, tsRaw); err != nil {
-		return err
-	}
-
-	// SectionSketchIndex (0x05): sketch index (may be empty).
-	if len(w.sketchIdx) > 0 {
-		sketchRaw, sketchErr := writeSketchIndexSection(w.sketchIdx)
-		if sketchErr != nil {
-			return fmt.Errorf("sketch_index: %w", sketchErr)
-		}
-		if err = writeSection(shared.SectionSketchIndex, sketchRaw); err != nil {
-			return err
-		}
-	}
-
-	// SectionFileBloom (0x06): file-level bloom filter (may be empty).
-	if len(w.fileBloomSvcNames) > 0 {
-		bloomRaw, bloomErr := writeFileBloomSection(w.fileBloomSvcNames)
-		if bloomErr != nil {
-			return fmt.Errorf("file_bloom: %w", bloomErr)
-		}
-		if err = writeSection(shared.SectionFileBloom, bloomRaw); err != nil {
-			return err
-		}
-	}
-
-	// File-level intrinsic column blobs: each column is one snappy-compressed blob
-	// with a name-keyed DirEntryName in the section directory.
-	a := w.intrinsicAccum
-	if a != nil && !a.overCap() {
-		for _, name := range a.columnNames() {
-			blob, encErr := a.encodeColumn(name)
-			if encErr != nil {
-				return fmt.Errorf("intrinsic column %q encode: %w", name, encErr)
-			}
-			if len(blob) == 0 {
-				continue
-			}
-			// blob is already snappy-compressed by encodeColumn/encodePagedXxxColumn.
-			// Do NOT re-compress; store directly so GetIntrinsicColumnBlob returns
-			// a valid snappy stream that DecodeIntrinsicColumnBlob can decode.
-			colOffset := uint64(w.out.total) //nolint:gosec
-			if _, writeErr := w.out.Write(blob); writeErr != nil {
-				return fmt.Errorf("intrinsic column %q write: %w", name, writeErr)
-			}
-			nameEntries = append(nameEntries, shared.DirEntryName{
-				Name:          name,
-				Offset:        colOffset,
-				CompressedLen: uint32(len(blob)), //nolint:gosec // bounded by MaxIntrinsicRows
-			})
-		}
-	}
-
-	// Build + write section directory (snappy-compressed).
-	// entry_count[4] + signal-kind entry (2 bytes) + type-keyed entries (14 bytes each) + name-keyed entries (variable).
-	// Always include signal_type as a DirEntryKindSignal entry (kind=0x02, signal_type=1 byte).
-	signalType := w.signalType
-	if signalType == 0 {
-		signalType = shared.SignalTypeTrace
-	}
-	const signalEntryCount = 1 // one DirEntryKindSignal entry
-	totalEntries := signalEntryCount + len(typeEntries) + len(nameEntries)
-	dirRaw := make([]byte, 0, 4+2+totalEntries*shared.DirEntryTypeWireSize)
-	dirRaw = appendUint32LE(dirRaw, uint32(totalEntries)) //nolint:gosec // safe: section count is small
-	// Signal-kind entry: entry_kind[1]=0x02 + signal_type[1]
-	dirRaw = append(dirRaw, shared.DirEntryKindSignal, signalType)
-	for _, e := range typeEntries {
-		dirRaw = append(dirRaw, e.Marshal()...)
-	}
-	for _, e := range nameEntries {
-		dirRaw = append(dirRaw, e.Marshal()...)
-	}
-
-	compressedDir := snappy.Encode(nil, dirRaw)
-	dirOffset := uint64(w.out.total) //nolint:gosec
-	if _, err = w.out.Write(compressedDir); err != nil {
-		return fmt.Errorf("section directory write: %w", err)
-	}
-	dirLen := uint32(len(compressedDir)) //nolint:gosec // safe: directory size fits uint32
-
-	// Write Footer V7 (V14 section-directory footer).
-	return writeFooterV7(&w.out, dirOffset, dirLen)
 }
 
 // flushBlocks sorts w.pending, builds all blocks concurrently, writes payloads and

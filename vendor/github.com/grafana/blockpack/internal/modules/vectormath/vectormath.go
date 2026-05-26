@@ -118,7 +118,7 @@ func trainSubspace(subvecs [][]float32, numCentroids, subvecDim, iters int, rng 
 
 // assignVectors assigns each subvector to its nearest centroid.
 // Returns true if any assignment changed.
-func assignVectors(subvecs [][]float32, centroids [][]float32, assignments []int) bool {
+func assignVectors(subvecs, centroids [][]float32, assignments []int) bool {
 	changed := false
 	for i, v := range subvecs {
 		best := nearestCentroid(v, centroids)

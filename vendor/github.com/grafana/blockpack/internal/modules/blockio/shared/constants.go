@@ -16,14 +16,29 @@ const (
 	// is applied per-column by the block writer.
 	VersionBlockEncV3 uint8 = 3
 
-	// FooterV7Version is the footer format version for the V14 section-directory footer (18 bytes).
-	// magic[4]+version[2]+dir_offset[8]+dir_len[4] = 18 bytes.
-	// Version 7 was chosen because agentic already uses 5 (46-byte vector footer) and 6 (58-byte compact-traces footer).
-	FooterV7Version uint16 = 7
+	// FooterV8Version is the footer format version for V8 files (unified ToC footer).
+	// Same 18-byte layout as V7; distinguished by version=8.
+	FooterV8Version uint16 = 8
 
-	// FooterV7Size is the total size of the V14 section-directory footer in bytes:
-	// magic[4]+version[2]+dir_offset[8]+dir_len[4] = 18 bytes.
-	FooterV7Size uint = 18
+	// FooterV8Size is the total size of the V8 footer in bytes (identical to V7).
+	// magic[4]+version[2]+toc_offset[8]+toc_length[4] = 18 bytes.
+	FooterV8Size uint = 18
+
+	// ToCEntry Type constants — section class in the V8 unified Table of Contents.
+	ToCTypeMetadata uint32 = 1 // file-level metadata sections
+	ToCTypeIndex    uint32 = 2 // file-level index structures
+	ToCTypeBlock    uint32 = 3 // raw block data blobs (reserved; not used in V8 initial)
+
+	// ToCEntry SubType constants for ToCTypeMetadata (Type=1).
+	ToCSubTypeRange     uint32 = 1 // per-column range index blob
+	ToCSubTypeSketch    uint32 = 2 // per-column KLL/sketch blob
+	ToCSubTypeBloom     uint32 = 3 // file-level bloom filter blob
+	ToCSubTypeIntrinsic uint32 = 4 // per-column intrinsic column blob
+	ToCSubTypeTrace     uint32 = 5 // compact trace index blob
+	ToCSubTypeTS        uint32 = 6 // timestamp index blob
+
+	// ToCEntry SubType constants for ToCTypeIndex (Type=2).
+	ToCSubTypeBlockIndex uint32 = 7 // block offset table
 
 	// BlockHeaderV14Size is the total size of the V14 block header in bytes:
 	// magic[4]+version[1]+reserved[3]+span_count[4]+column_count[4]+reserved2[8] = 24 bytes.
@@ -108,6 +123,18 @@ const (
 	IntrinsicFormatVersion uint8 = 0x01 // first byte of each intrinsic column blob
 	IntrinsicFormatFlat    uint8 = 0x01 // flat array: delta-encoded uint64 or length-prefixed bytes
 	IntrinsicFormatDict    uint8 = 0x02 // dictionary (string or int64 enum columns)
+
+	// IntrinsicFormatXORBytes is the format byte for large flat bytes columns.
+	// Values are XOR-against-previous encoded; the entire payload is single-snappy-compressed.
+	// NOTE-013: this avoids N×IntrinsicPageSize independent snappy calls which inflate
+	// random-byte columns (span:id, trace:id) to 2× their uncompressed size.
+	IntrinsicFormatXORBytes uint8 = 0x03
+
+	// IntrinsicFormatDeltaUint64 is the format byte for large flat uint64 columns.
+	// Values are sorted ascending, delta-encoded with unsigned varints, and single-snappy-compressed.
+	// NOTE-014: mirrors the XORBytes single-pass snappy rationale for uint64 span:start/duration columns.
+	// Unsigned uvarint (not zigzag) is used because sorted ascending deltas are always non-negative.
+	IntrinsicFormatDeltaUint64 uint8 = 0x04
 
 	// IntrinsicPagedVersion is the sentinel byte that identifies a v2 paged column region.
 	// When the first byte of a column blob is 0x02 the blob is NOT snappy-compressed as a

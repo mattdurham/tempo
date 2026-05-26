@@ -1,15 +1,15 @@
 package reader
 
-import "github.com/grafana/blockpack/internal/modules/filecache"
+import "github.com/grafana/blockpack/internal/modules/sectioncache"
 
 // Options configures a Reader at construction time.
 type Options struct {
 	// Cache, if non-nil, enables caching for footer, header, metadata,
-	// compact index, and block reads. A nil Cache disables caching.
-	// Any filecache.Cache implementation is accepted: FileCache (disk),
-	// memorycache.MemoryCache (in-process), memcache.MemCache (remote),
-	// or chaincache.ChainedCache (multi-tier).
-	Cache filecache.Cache
+	// compact index, and block reads.
+	// If nil, a NopSectionCache is used (all reads are cache misses; writes are discarded).
+	// Any sectioncache.SectionCache implementation is accepted: TypedTieredCache,
+	// or a FilecacheAdapter wrapping a filecache.Cache implementation.
+	Cache sectioncache.SectionCache
 
 	// FileID is the unique identifier for this file within the cache namespace.
 	// Typically the file path or object storage key (e.g. "/data/blocks/abc.blockpack").

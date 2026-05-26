@@ -40,6 +40,30 @@ func (r *Reader) ensureRangeColumnParsed(colName string) error {
 		return nil
 	}
 
+	// V8: fetch per-column blob directly from ToC (no monolithic range section).
+	if r.footerVersion == shared.FooterV8Version {
+		data, err := r.fetchToCSection(shared.ToCKey{
+			Type:    shared.ToCTypeMetadata,
+			SubType: shared.ToCSubTypeRange,
+			Name:    colName,
+		})
+		if err != nil {
+			return fmt.Errorf("range index V8: column %q: %w", colName, err)
+		}
+		if data == nil {
+			return fmt.Errorf("range index: column %q not found", colName)
+		}
+		_, idx, _, parseErr := parseRangeColumnBlobV8(data)
+		if parseErr != nil {
+			return fmt.Errorf("range index V8: column %q: %w", colName, parseErr)
+		}
+		if r.rangeParsed == nil {
+			r.rangeParsed = make(map[string]parsedRangeIndex)
+		}
+		r.rangeParsed[colName] = idx
+		return nil
+	}
+
 	// For V14 files, the range section bytes are loaded lazily on first access.
 	if err := r.ensureV14RangeSection(); err != nil {
 		return err
@@ -70,6 +94,17 @@ func (r *Reader) ensureRangeColumnParsed(colName string) error {
 
 	r.rangeParsed[colName] = idx
 	return nil
+}
+
+// parseRangeColumnBlobV8 parses a per-column range blob emitted by writeOneColumnRangeBlob.
+// Wire: col_type[1] + bucket_metadata + value_count[4] + value_entries (no name prefix).
+// The name is NOT in the blob; it comes from ToCEntry.Key.Name.
+// Reuses parseRangeColumnEntry by prepending a dummy name_len[2]=0.
+func parseRangeColumnBlobV8(data []byte) (string, parsedRangeIndex, int, error) {
+	// Prepend name_len[2]=0 so parseRangeColumnEntry's name-parsing reads an empty name.
+	synthetic := make([]byte, 2+len(data))
+	copy(synthetic[2:], data)
+	return parseRangeColumnEntry(synthetic, 0)
 }
 
 // parseRangeColumnEntry parses one RangeColumnEntry from data[pos:].
