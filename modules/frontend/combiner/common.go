@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/bits"
 	"net/http"
 	"strings"
 	"sync"
@@ -43,6 +44,9 @@ type genericCombiner[T TResponse] struct {
 	finalize func(T) (T, error)
 	diff     func(T) (T, error)
 	quit     func(T) bool
+
+	// Segment one response into smaller ones, that fit within the given max size.
+	segment func(T, int) []T
 
 	// Used to determine the response code and when to stop
 	httpStatusCode int
@@ -163,6 +167,14 @@ func (c *genericCombiner[T]) HTTPFinal() (*http.Response, error) {
 
 	final, err := c.finalize(c.current)
 	if err != nil {
+		if errors.Is(err, ErrTraceHidden) {
+			c.httpStatusCode = http.StatusNotFound
+			return &http.Response{
+				StatusCode: http.StatusNotFound,
+				Body:       http.NoBody,
+				Header:     http.Header{},
+			}, nil
+		}
 		return nil, err
 	}
 
@@ -193,6 +205,9 @@ func (c *genericCombiner[T]) GRPCFinal() (T, error) {
 
 	final, err := c.finalize(c.current)
 	if err != nil {
+		if errors.Is(err, ErrTraceHidden) {
+			return empty, status.Error(codes.NotFound, ErrTraceHidden.Error())
+		}
 		return empty, err
 	}
 
@@ -219,6 +234,18 @@ func (c *genericCombiner[T]) GRPCDiff() (T, error) {
 	// clone the diff to prevent race conditions with marshalling this data
 	diffClone := proto.Clone(diff)
 	return diffClone.(T), nil
+}
+
+func (c *genericCombiner[T]) GRPCSegment(response T, maxSize int) ([]T, error) {
+	c.mu.Lock()
+	segment := c.segment
+	c.mu.Unlock()
+
+	if segment == nil {
+		return nil, fmt.Errorf("grpc response segmentation not supported for response type:  %T", response)
+	}
+
+	return segment(response, maxSize), nil
 }
 
 func (c *genericCombiner[T]) erroredResponse() (*http.Response, error) {
@@ -316,12 +343,35 @@ func (c *genericCombiner[T]) internalMarshalAs(final T) ([]byte, string, error) 
 	return bodyBytes, contentType, err
 }
 
+// ErrTraceHidden is returned by TraceRedactor.RedactTraceAttributes when a trace is hidden
+// by access policy
+var ErrTraceHidden = errors.New("trace hidden by access policy")
+
+// TraceRedactor is applied to a fully assembled trace before it is returned to
+// the caller. When ErrTraceHidden is returned, the caller should receive a 404 response.
 type TraceRedactor interface {
-	RedactTraceAttributes(t *tempopb.Trace)
+	RedactTraceAttributes(t *tempopb.Trace) error
 }
 
 // unsafeStringToBytes converts a string to []byte without allocation.
 // The returned byte slice must not be modified.
 func unsafeStringToBytes(s string) []byte {
 	return unsafe.Slice(unsafe.StringData(s), len(s))
+}
+
+// protoStringSize returns the size in bytes of a string in a repeated string field.
+// Size is 1 byte for the field number, the string content itself, and then the string length encoded as varint.
+func protoStringSize(s string) int {
+	l := len(s)
+	// Calculation copied from sovTempo in tempopb.
+	varIntSize := (bits.Len64(uint64(l)|1) + 6) / 7
+	return 1 + l + varIntSize
+}
+
+// protoSizeMath returns the full size in bytes including overhead to store an entry in a proto slice.
+// It accounts for the field number, the length of the item itself, and then the length encoded as a varint.
+func protoSizeMath(item proto.Message) (n int) {
+	sz := proto.Size(item)
+	varIntSize := (bits.Len64(uint64(sz)|1) + 6) / 7
+	return 1 + sz + varIntSize
 }

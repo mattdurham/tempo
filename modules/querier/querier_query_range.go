@@ -65,12 +65,10 @@ func (q *Querier) queryBlock(ctx context.Context, req *tempopb.QueryRangeRequest
 	}
 
 	meta := &backend.BlockMeta{
-		Version:   req.Version,
-		TenantID:  tenantID,
-		StartTime: time.Unix(0, int64(req.Start)),
-		EndTime:   time.Unix(0, int64(req.End)),
-		// IndexPageSize:    req.IndexPageSize,
-		// TotalRecords:     req.TotalRecords,
+		Version:          req.Version,
+		TenantID:         tenantID,
+		StartTime:        time.Unix(0, int64(req.Start)),
+		EndTime:          time.Unix(0, int64(req.End)),
 		BlockID:          blockID,
 		Size_:            req.Size_,
 		FooterSize:       req.FooterSize,
@@ -81,16 +79,32 @@ func (q *Querier) queryBlock(ctx context.Context, req *tempopb.QueryRangeRequest
 	opts.StartPage = int(req.StartPage)
 	opts.TotalPages = int(req.PagesToSearch)
 
-	unsafe := q.limits.UnsafeQueryHints(tenantID)
-
-	expr, err := traceql.Parse(req.Query)
+	// Parse without optimizations to read hints; optimizations are applied by CompileMetricsQueryRange.
+	expr, err := traceql.ParseNoOptimizations(req.Query)
 	if err != nil {
 		return nil, err
 	}
 
-	timeOverlapCutoff := q.cfg.Metrics.TimeOverlapCutoff
+	var compileOpts []traceql.CompileOption
+
+	unsafe := q.limits.UnsafeQueryHints(tenantID)
+	if unsafe {
+		compileOpts = append(compileOpts, traceql.WithUnsafeHints(true))
+	}
+	for _, name := range req.SkipASTTransformations {
+		compileOpts = append(compileOpts, traceql.WithSkipOptimization(name))
+	}
+
 	if v, ok := expr.Hints.GetFloat(traceql.HintTimeOverlapCutoff, unsafe); ok && v >= 0 && v <= 1.0 {
-		timeOverlapCutoff = v
+		// Use valid hint from query.
+		compileOpts = append(compileOpts, traceql.WithTimeOverlapCutoff(v))
+	} else {
+		// Use default.
+		compileOpts = append(compileOpts, traceql.WithTimeOverlapCutoff(q.cfg.Metrics.TimeOverlapCutoff))
+	}
+
+	if p := q.limits.MetricsSpanOnlyFetch(tenantID); p != nil {
+		compileOpts = append(compileOpts, traceql.WithSpanOnlyFetch(*p))
 	}
 
 	// Use the block's native metrics path when available (e.g. blockpack's
@@ -100,7 +114,7 @@ func (q *Querier) queryBlock(ctx context.Context, req *tempopb.QueryRangeRequest
 		return resp, nativeErr
 	}
 
-	eval, err := traceql.NewEngine().CompileMetricsQueryRange(req, timeOverlapCutoff, unsafe)
+	eval, err := traceql.NewEngine().CompileMetricsQueryRange(req, compileOpts...)
 	if err != nil {
 		return nil, err
 	}

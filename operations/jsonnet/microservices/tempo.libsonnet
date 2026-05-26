@@ -15,6 +15,7 @@
 (import 'vertical-pod-autoscaler.libsonnet') +
 (import 'pod-disruption-budget.libsonnet') +
 (import 'rollout-operator/rollout-operator.libsonnet') +
+(import 'autoscaling.libsonnet') +
 
 {
   local k = import 'ksonnet-util/kausal.libsonnet',

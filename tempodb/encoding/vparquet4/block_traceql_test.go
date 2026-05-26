@@ -420,7 +420,7 @@ func TestBackendNilValueBlockSearchTraceQL(t *testing.T) {
 											String02: ptr("dedicated-span-attr-value-2"),
 											String03: ptr("dedicated-span-attr-value-3"),
 											String04: ptr("dedicated-span-attr-value-4"),
-											String05: ptr("dedicated-span-attr-value-5"),
+											String05: ptr(test.DedicatedBlobTestString()),
 										},
 										Attrs: []Attribute{
 											// BUG - at least one generic attr is required to satisfy
@@ -1151,7 +1151,7 @@ func fullyPopulatedTestTraceWithOption(id common.ID, parentIDTest bool) *Trace {
 									String02: ptr("dedicated-span-attr-value-2"),
 									String03: ptr("dedicated-span-attr-value-3"),
 									String04: ptr("dedicated-span-attr-value-4"),
-									String05: ptr("dedicated-span-attr-value-5"),
+									String05: ptr(test.DedicatedBlobTestString()),
 								},
 							},
 						},
@@ -1253,7 +1253,7 @@ func TestBackendBlockSelectAll(t *testing.T) {
 
 	b := makeBackendBlockWithTraces(t, traces)
 
-	_, eval, _, _, req, err := traceql.Compile("{}")
+	_, _, eval, req, err := traceql.Compile("{}")
 	require.NoError(t, err)
 	req.SecondPass = func(inSS *traceql.Spanset) ([]*traceql.Spanset, error) { return eval([]*traceql.Spanset{inSS}) }
 	req.SecondPassSelectAll = true
@@ -1515,7 +1515,7 @@ func BenchmarkBackendBlockTraceQL(b *testing.B) {
 
 				resp, err := e.ExecuteSearch(ctx, &tempopb.SearchRequest{Query: tc.query}, traceql.NewSpansetFetcherWrapper(func(ctx context.Context, req traceql.FetchSpansRequest) (traceql.FetchSpansResponse, error) {
 					return block.Fetch(ctx, req, opts)
-				}), false)
+				}))
 				require.NoError(b, err)
 				require.NotNil(b, resp)
 
@@ -1605,6 +1605,12 @@ func BenchmarkBackendBlockQueryRange(b *testing.B) {
 		"{ name != nil } | compare({status=error})",
 		"{} > {} | rate() by (name)", // structural
 
+		// Math operations
+		"({} | rate()) + ({} | rate())",
+		"({} | rate()) - ({} | rate())",
+		"({} | rate()) * ({} | rate())",
+		"({} | rate()) / ({} | count_over_time())",
+
 		// This is useful for sampler debugging
 		// {} | rate() with(sample=true,debug=true,info=true)
 	}
@@ -1640,7 +1646,7 @@ func BenchmarkBackendBlockQueryRange(b *testing.B) {
 				Exemplars: 2,
 			}
 
-			eval, err := e.CompileMetricsQueryRange(req, 0, false)
+			eval, err := e.CompileMetricsQueryRange(req)
 			require.NoError(b, err)
 
 			b.ResetTimer()
@@ -1678,6 +1684,9 @@ func TestSamplingError(t *testing.T) {
 		"{nestedSetParent<0 && true} | histogram_over_time(duration)",
 		`{nestedSetParent<0 && resource.service.name="gme-alertmanager" && resource.service.namespace != nil} | rate() by(resource.service.namespace)`,
 		"{true && true && resource.service.name != nil} | rate() by(resource.service.name)",*/
+
+		// Math operations
+		"({} | rate()) + ({} | rate())",
 	}
 
 	options := []string{
@@ -1714,7 +1723,7 @@ func TestSamplingError(t *testing.T) {
 			Exemplars: 2,
 		}
 
-		eval, err := e.CompileMetricsQueryRange(req, 0, false)
+		eval, err := e.CompileMetricsQueryRange(req)
 		require.NoError(t, err)
 
 		err = eval.Do(ctx, f, st, end, int(req.MaxSeries))

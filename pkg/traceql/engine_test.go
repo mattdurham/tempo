@@ -103,7 +103,7 @@ func TestEngine_Execute(t *testing.T) {
 			},
 		},
 	}
-	response, err := e.ExecuteSearch(context.Background(), req, &spanSetFetcher, false)
+	response, err := e.ExecuteSearch(context.Background(), req, &spanSetFetcher)
 
 	require.NoError(t, err)
 
@@ -384,7 +384,11 @@ func (m *MockAutocompleteFetcher) Fetch(ctx context.Context, req FetchTagValuesR
 			continue
 		}
 
-		evalSS, _ := rootExpr.Pipeline.evaluate([]*Spanset{spanset})
+		pipeline, ok := rootExpr.SinglePipeline()
+		if !ok {
+			return ErrMathNotSupported
+		}
+		evalSS, _ := pipeline.evaluate([]*Spanset{spanset})
 
 		for _, ss := range evalSS {
 			for _, s := range ss.Spans {
@@ -535,21 +539,21 @@ func TestExamplesInEngine(t *testing.T) {
 
 	for _, q := range queries.Valid {
 		t.Run("valid - "+q, func(t *testing.T) {
-			_, _, _, _, _, err := Compile(q)
+			_, _, err := CompileFetchSpanRequests(q)
 			require.NoError(t, err)
 		})
 	}
 
 	for _, q := range queries.ParseFails {
 		t.Run("parse fails - "+q, func(t *testing.T) {
-			_, _, _, _, _, err := Compile(q)
+			_, _, err := CompileFetchSpanRequests(q)
 			require.Error(t, err)
 		})
 	}
 
 	for _, q := range queries.ValidateFails {
 		t.Run("validate fails - "+q, func(t *testing.T) {
-			_, _, _, _, _, err := Compile(q)
+			_, _, err := CompileFetchSpanRequests(q)
 			require.Error(t, err)
 			var unErr *unsupportedError
 			require.False(t, errors.As(err, &unErr))
@@ -558,7 +562,7 @@ func TestExamplesInEngine(t *testing.T) {
 
 	for _, q := range queries.Unsupported {
 		t.Run("unsupported - "+q, func(t *testing.T) {
-			_, _, _, _, _, err := Compile(q)
+			_, _, err := CompileFetchSpanRequests(q)
 			require.Error(t, err)
 			var unErr *unsupportedError
 			require.True(t, errors.As(err, &unErr))
@@ -702,11 +706,7 @@ func TestExecuteTagValues(t *testing.T) {
 			distinctValues := collector.NewDistinctValue(100_000, 0, 0, func(v tempopb.TagValue) int { return len(v.Type) + len(v.Value) })
 
 			// Derive conditions from the query, just like callers do
-			extractedReq := ExtractFetchRequest(tc.query)
-			var conditions []Condition
-			if extractedReq != nil {
-				conditions = extractedReq.Conditions
-			}
+			conditionGroups, _ := ExtractConditionGroups(tc.query, DefaultMaxConditionGroupsPerTagQuery)
 
 			// The mock fetcher needs a parseable query for its internal evaluation
 			fetcherQuery := tc.query
@@ -716,7 +716,7 @@ func TestExecuteTagValues(t *testing.T) {
 
 			tag, err := ParseIdentifier(tc.attribute)
 			assert.NoError(t, err)
-			assert.NoError(t, e.ExecuteTagValues(context.Background(), tag, conditions, MakeCollectTagValueFunc(distinctValues.Collect), mockSpansetFetcher(fetcherQuery)))
+			assert.NoError(t, e.ExecuteTagValues(context.Background(), tag, conditionGroups, MakeCollectTagValueFunc(distinctValues.Collect), mockSpansetFetcher(fetcherQuery), DefaultMaxConditionGroupsPerTagQuery))
 			values := distinctValues.Values()
 			sort.Slice(values, func(i, j int) bool {
 				return values[i].Value < values[j].Value

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -10,7 +11,7 @@ import (
 	"github.com/grafana/tempo/modules/overrides/histograms"
 	"github.com/grafana/tempo/modules/overrides/userconfigurable/client"
 	"github.com/grafana/tempo/pkg/httpclient"
-	jsoniter "github.com/json-iterator/go"
+	"github.com/grafana/tempo/pkg/util/listtomap"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -57,7 +58,7 @@ func TestOverridesWithObjectStorage(t *testing.T) {
 		updatedLimits := &client.Limits{
 			MetricsGenerator: client.LimitsMetricsGenerator{
 				DisableCollection: nil,
-				Processors:        map[string]struct{}{"span-metrics": {}},
+				Processors:        &listtomap.ListToMap{"span-metrics": {}},
 			},
 		}
 
@@ -309,7 +310,7 @@ func TestOverridesAPI_POST(t *testing.T) {
 			// update with correct version
 			updatedLimits := &client.Limits{
 				MetricsGenerator: client.LimitsMetricsGenerator{
-					Processors: map[string]struct{}{"span-metrics": {}},
+					Processors: &listtomap.ListToMap{"span-metrics": {}},
 				},
 			}
 			newEtag, err := apiClient.SetOverrides(updatedLimits, setEtag)
@@ -369,7 +370,7 @@ func TestOverridesAPI_PATCH(t *testing.T) {
 			initialLimits := &client.Limits{
 				MetricsGenerator: client.LimitsMetricsGenerator{
 					DisableCollection: boolPtr(true),
-					Processors:        map[string]struct{}{"span-metrics": {}},
+					Processors:        &listtomap.ListToMap{"span-metrics": {}},
 				},
 			}
 			_, _, err := apiClient.PatchOverrides(initialLimits)
@@ -563,7 +564,7 @@ func TestOverridesAPI_PATCH(t *testing.T) {
 					DisableCollection:              boolPtr(true),
 					GenerateNativeHistograms:       histogramModePtr(histograms.HistogramMethodNative),
 					NativeHistogramMaxBucketNumber: uint32Ptr(200),
-					Processors:                     map[string]struct{}{"span-metrics": {}},
+					Processors:                     &listtomap.ListToMap{"span-metrics": {}},
 					Processor: client.LimitsMetricsGeneratorProcessor{
 						SpanMetrics: client.LimitsMetricsGeneratorProcessorSpanMetrics{
 							EnableInstanceLabel: boolPtr(false),
@@ -788,7 +789,7 @@ func TestOverridesAPI_SpanNameSanitization(t *testing.T) {
 func printLimits(limits *client.Limits, version string) {
 	var str string
 	if limits != nil {
-		bytes, err := jsoniter.Marshal(limits)
+		bytes, err := json.Marshal(limits)
 		if err == nil {
 			str = string(bytes)
 		}

@@ -21,7 +21,7 @@ GORELEASER := $(GOPATH)/bin/goreleaser
 LOKI_BUILD_IMAGE ?= grafana/loki-build-image:0.35.0
 # https://hub.docker.com/repository/docker/grafana/tempo-ci-tools/
 # built by: .github/workflows/docker-ci-tools.yml
-TEMPO_CI_TOOLS_IMAGE ?= grafana/tempo-ci-tools:main-8340a1d49
+TEMPO_CI_TOOLS_IMAGE ?= grafana/tempo-ci-tools:main-2c55cd0-20260421-172344
 DOCS_IMAGE ?= grafana/docs-base:latest
 
 # More exclusions can be added similar with: -not -path './testbed/*'
@@ -76,7 +76,7 @@ ifeq ($(UNAME), Darwin)
     SED_OPTS := ''
 endif
 
-FILES_TO_FMT=$(shell find . -type d \( -path ./vendor -o -path ./tools/vendor -o -path ./opentelemetry-proto -o -path ./vendor-fix \) -prune -o -name '*.go' -not -name "*.pb.go" -not -name '*.y.go' -not -name '*.gen.go' -print)
+FILES_TO_FMT=$(shell find . -type d \( -path ./vendor -o -path ./tools/vendor -o -path ./opentelemetry-proto -o -path ./vendor-fix -o -path ./.claude \) -prune -o -name '*.go' -not -name "*.pb.go" -not -name '*.y.go' -not -name '*.gen.go' -print)
 FILES_TO_JSONNETFMT=$(shell find ./operations/jsonnet ./operations/tempo-mixin ./example -type f \( -name '*.libsonnet' -o -name '*.jsonnet' \) -not -path "*/vendor/*" -print)
 
 ##@ Building

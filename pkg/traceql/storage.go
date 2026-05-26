@@ -278,8 +278,8 @@ type SpansetFetcher interface {
 type FetchTagValuesCallback func(static Static) bool
 
 type FetchTagValuesRequest struct {
-	Conditions []Condition
-	TagName    Attribute
+	ConditionGroups [][]Condition
+	TagName         Attribute
 	// TODO: Add start and end time?
 }
 
@@ -324,8 +324,13 @@ func ExtractFetchSpansRequest(query string) (FetchSpansRequest, error) {
 	req := FetchSpansRequest{
 		AllConditions: true,
 	}
-
-	ast.Pipeline.extractConditions(&req)
+	requests := ast.extractConditions(req)
+	if len(requests) != 1 {
+		return FetchSpansRequest{}, ErrMathNotSupported
+	}
+	for _, v := range requests {
+		req = v
+	}
 	return req, nil
 }
 
@@ -361,8 +366,8 @@ func (s SpansetFetcherWrapper) FetchSpans(ctx context.Context, request FetchSpan
 type FetchTagsCallback func(tag string, scope AttributeScope) bool
 
 type FetchTagsRequest struct {
-	Conditions []Condition
-	Scope      AttributeScope
+	ConditionGroups [][]Condition
+	Scope           AttributeScope
 	// TODO: Add start and end time?
 }
 

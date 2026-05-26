@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/grafana/tempo/tempodb/encoding/vparquet4"
+	"github.com/grafana/tempo/tempodb/encoding/vparquet5"
 
 	"github.com/go-kit/log"
 	"github.com/golang/protobuf/proto" //nolint:all
@@ -116,7 +117,7 @@ func TestDB(t *testing.T) {
 
 	// read
 	for i, id := range ids {
-		bFound, failedBlocks, err := r.Find(ctx, testTenantID, id, BlockIDMin, BlockIDMax, 0, 0, common.DefaultSearchOptions())
+		bFound, failedBlocks, err := r.Find(ctx, testTenantID, id, BlockIDMin, BlockIDMax, time.Time{}, time.Time{}, common.DefaultSearchOptions())
 		assert.NoError(t, err)
 		assert.Nil(t, failedBlocks)
 		assert.True(t, proto.Equal(bFound[0].Trace, reqs[i]))
@@ -172,7 +173,7 @@ func TestBlockSharding(t *testing.T) {
 	// check if it respects the blockstart/blockend params - case1: hit
 	blockStart := uuid.MustParse(BlockIDMin).String()
 	blockEnd := uuid.MustParse(BlockIDMax).String()
-	bFound, failedBlocks, err := r.Find(ctx, testTenantID, id, blockStart, blockEnd, 0, 0, common.DefaultSearchOptions())
+	bFound, failedBlocks, err := r.Find(ctx, testTenantID, id, blockStart, blockEnd, time.Time{}, time.Time{}, common.DefaultSearchOptions())
 	assert.NoError(t, err)
 	assert.Nil(t, failedBlocks)
 	assert.Greater(t, len(bFound), 0)
@@ -182,7 +183,7 @@ func TestBlockSharding(t *testing.T) {
 	// check if it respects the blockstart/blockend params - case2: miss
 	blockStart = uuid.MustParse(BlockIDMin).String()
 	blockEnd = uuid.MustParse(BlockIDMin).String()
-	bFound, failedBlocks, err = r.Find(ctx, testTenantID, id, blockStart, blockEnd, 0, 0, common.DefaultSearchOptions())
+	bFound, failedBlocks, err = r.Find(ctx, testTenantID, id, blockStart, blockEnd, time.Time{}, time.Time{}, common.DefaultSearchOptions())
 	assert.NoError(t, err)
 	assert.Nil(t, failedBlocks)
 	assert.Len(t, bFound, 0)
@@ -191,7 +192,7 @@ func TestBlockSharding(t *testing.T) {
 func TestNilOnUnknownTenantID(t *testing.T) {
 	r, _, _, _ := testConfig(t, 0)
 
-	buff, failedBlocks, err := r.Find(context.Background(), "unknown", []byte{0x01}, BlockIDMin, BlockIDMax, 0, 0, common.DefaultSearchOptions())
+	buff, failedBlocks, err := r.Find(context.Background(), "unknown", []byte{0x01}, BlockIDMin, BlockIDMax, time.Time{}, time.Time{}, common.DefaultSearchOptions())
 	assert.Nil(t, buff)
 	assert.Nil(t, err)
 	assert.Nil(t, failedBlocks)
@@ -261,8 +262,8 @@ func TestIncludeBlock(t *testing.T) {
 		searchID   common.ID
 		blockStart uuid.UUID
 		blockEnd   uuid.UUID
-		start      int64
-		end        int64
+		start      time.Time
+		end        time.Time
 		meta       *backend.BlockMeta
 		expected   bool
 	}{
@@ -275,8 +276,6 @@ func TestIncludeBlock(t *testing.T) {
 			meta: &backend.BlockMeta{
 				BlockID: backend.MustParse("50000000-0000-0000-0000-000000000000"),
 			},
-			start:    0,
-			end:      0,
 			expected: true,
 		},
 		{
@@ -287,8 +286,6 @@ func TestIncludeBlock(t *testing.T) {
 			meta: &backend.BlockMeta{
 				BlockID: backend.MustParse("50000000-0000-0000-0000-000000000000"),
 			},
-			start:    0,
-			end:      0,
 			expected: true,
 		},
 		{
@@ -299,8 +296,6 @@ func TestIncludeBlock(t *testing.T) {
 			meta: &backend.BlockMeta{
 				BlockID: backend.MustParse("50000000-0000-0000-0000-000000000000"),
 			},
-			start:    0,
-			end:      0,
 			expected: true,
 		},
 		{
@@ -311,8 +306,6 @@ func TestIncludeBlock(t *testing.T) {
 			meta: &backend.BlockMeta{
 				BlockID: backend.MustParse("50000000-0000-0000-0000-000000000000"),
 			},
-			start:    0,
-			end:      0,
 			expected: true,
 		},
 		{
@@ -325,8 +318,8 @@ func TestIncludeBlock(t *testing.T) {
 				StartTime: time.Unix(10000, 0),
 				EndTime:   time.Unix(20000, 0),
 			},
-			start:    10000,
-			end:      20000,
+			start:    time.Unix(10000, 0),
+			end:      time.Unix(20000, 0),
 			expected: true,
 		},
 		{
@@ -339,8 +332,8 @@ func TestIncludeBlock(t *testing.T) {
 				StartTime: time.Unix(1650285326, 0),
 				EndTime:   time.Unix(1650288990, 0),
 			},
-			start:    10000,
-			end:      20000,
+			start:    time.Unix(10000, 0),
+			end:      time.Unix(20000, 0),
 			expected: false,
 		},
 		{
@@ -351,8 +344,6 @@ func TestIncludeBlock(t *testing.T) {
 			meta: &backend.BlockMeta{
 				BlockID: backend.MustParse("50000000-0000-0000-0000-000000000000"),
 			},
-			start:    0,
-			end:      0,
 			expected: true,
 		},
 		// excludes
@@ -411,14 +402,7 @@ func TestIncludeBlock(t *testing.T) {
 			e, err := tc.blockEnd.MarshalBinary()
 			require.NoError(t, err)
 
-			var startT, endT time.Time
-			if tc.start != 0 {
-				startT = time.Unix(tc.start, 0)
-			}
-			if tc.end != 0 {
-				endT = time.Unix(tc.end, 0)
-			}
-			assert.Equal(t, tc.expected, includeBlock(tc.meta, tc.searchID, s, e, startT, endT, time.Time{}))
+			assert.Equal(t, tc.expected, includeBlock(tc.meta, tc.searchID, s, e, tc.start, tc.end, time.Time{}))
 		})
 	}
 }
@@ -431,8 +415,8 @@ func TestIncludeCompactedBlock(t *testing.T) {
 		blockStart uuid.UUID
 		blockEnd   uuid.UUID
 		meta       *backend.CompactedBlockMeta
-		start      int64
-		end        int64
+		start      time.Time
+		end        time.Time
 		expected   bool
 	}{
 		{
@@ -440,8 +424,6 @@ func TestIncludeCompactedBlock(t *testing.T) {
 			searchID:   []byte{0x05},
 			blockStart: uuid.MustParse(BlockIDMin),
 			blockEnd:   uuid.MustParse(BlockIDMax),
-			start:      0,
-			end:        0,
 			meta: &backend.CompactedBlockMeta{
 				BlockMeta: backend.BlockMeta{
 					BlockID: backend.MustParse("50000000-0000-0000-0000-000000000000"),
@@ -455,8 +437,6 @@ func TestIncludeCompactedBlock(t *testing.T) {
 			searchID:   []byte{0x05},
 			blockStart: uuid.MustParse(BlockIDMin),
 			blockEnd:   uuid.MustParse(BlockIDMax),
-			start:      0,
-			end:        0,
 			meta: &backend.CompactedBlockMeta{
 				BlockMeta: backend.BlockMeta{
 					BlockID: backend.MustParse("50000000-0000-0000-0000-000000000000"),
@@ -470,8 +450,6 @@ func TestIncludeCompactedBlock(t *testing.T) {
 			searchID:   []byte{0x05},
 			blockStart: uuid.MustParse("40000000-0000-0000-0000-000000000000"),
 			blockEnd:   uuid.MustParse("50000000-0000-0000-0000-000000000000"),
-			start:      0,
-			end:        0,
 			meta: &backend.CompactedBlockMeta{
 				BlockMeta: backend.BlockMeta{
 					BlockID: backend.MustParse("51000000-0000-0000-0000-000000000000"),
@@ -490,14 +468,7 @@ func TestIncludeCompactedBlock(t *testing.T) {
 			require.NoError(t, err)
 
 			lookback := time.Now().Add(-(2 * blocklistPoll))
-			var startT, endT time.Time
-			if tc.start != 0 {
-				startT = time.Unix(tc.start, 0)
-			}
-			if tc.end != 0 {
-				endT = time.Unix(tc.end, 0)
-			}
-			assert.Equal(t, tc.expected, includeCompactedBlock(tc.meta, tc.searchID, s, e, lookback, startT, endT, time.Time{}))
+			assert.Equal(t, tc.expected, includeCompactedBlock(tc.meta, tc.searchID, s, e, lookback, tc.start, tc.end, time.Time{}))
 		})
 	}
 }
@@ -548,7 +519,7 @@ func TestSearchCompactedBlocks(t *testing.T) {
 
 	// read
 	for i, id := range ids {
-		bFound, failedBlocks, err := r.Find(ctx, testTenantID, id, blockID, blockID, 0, 0, common.DefaultSearchOptions())
+		bFound, failedBlocks, err := r.Find(ctx, testTenantID, id, blockID, blockID, time.Time{}, time.Time{}, common.DefaultSearchOptions())
 		require.NoError(t, err)
 		require.Nil(t, failedBlocks)
 		require.True(t, proto.Equal(bFound[0].Trace, reqs[i]))
@@ -573,7 +544,7 @@ func TestSearchCompactedBlocks(t *testing.T) {
 
 	// find should succeed with old block range
 	for i, id := range ids {
-		bFound, failedBlocks, err := r.Find(ctx, testTenantID, id, blockID, blockID, 0, 0, common.DefaultSearchOptions())
+		bFound, failedBlocks, err := r.Find(ctx, testTenantID, id, blockID, blockID, time.Time{}, time.Time{}, common.DefaultSearchOptions())
 		require.NoError(t, err)
 		require.Nil(t, failedBlocks)
 		require.True(t, proto.Equal(bFound[0].Trace, reqs[i]))
@@ -601,9 +572,12 @@ func testCompleteBlock(t *testing.T, from, to string) {
 	rw := w.(*readerWriter)
 	rw.cfg.Block.Version = to // now set it back so we cut blocks in the "to" format
 
-	blockID := uuid.New()
-
-	meta := backend.NewBlockMeta(testTenantID, blockID, from)
+	meta := &backend.BlockMeta{
+		Version:          from,
+		BlockID:          backend.UUID(uuid.New()),
+		TenantID:         testTenantID,
+		DedicatedColumns: test.MakeDedicatedColumns(),
+	}
 	block, err := wal.NewBlock(meta, model.CurrentEncoding)
 	require.NoError(t, err, "unexpected error creating block")
 	require.Equal(t, block.BlockMeta().Version, from)
@@ -614,9 +588,14 @@ func testCompleteBlock(t *testing.T, from, to string) {
 	reqs := make([]*tempopb.Trace, 0, numMsgs)
 	ids := make([][]byte, 0, numMsgs)
 	for i := 0; i < numMsgs; i++ {
-		id := test.ValidTraceID(nil)
-		req := test.MakeTrace(rand.Int()%10, id)
-		trace.SortTrace(req)
+		var (
+			id  = test.ValidTraceID(nil)
+			req = test.MakeTrace(rand.Int()%10, id)
+		)
+
+		// Populate data using the same dedicated columns as configured on the block above.
+		test.AddRandomDedicatedAttributes(req)
+
 		writeTraceToWal(t, block, dec, id, req, 0, 0)
 		reqs = append(reqs, req)
 		ids = append(ids, id)
@@ -631,10 +610,16 @@ func testCompleteBlock(t *testing.T, from, to string) {
 		found, err := complete.FindTraceByID(context.TODO(), id, common.DefaultSearchOptions())
 		require.NoError(t, err)
 		require.NotNil(t, found)
-		trace.SortTrace(found.Trace)
+
+		// Sort expected and actual before comparing.
+		trace.SortTraceAndAttributes(reqs[i])
+		trace.SortTraceAndAttributes(found.Trace)
+
+		// After sorting, the completed block should round-trip the trace exactly.
 		require.True(t, proto.Equal(found.Trace, reqs[i]))
-		vparquet4 := vparquet4.Encoding{}.Version()
-		if to == vparquet4 {
+
+		// Check metrics for certain encodings.
+		if to == vparquet4.VersionString || to == vparquet5.VersionString {
 			require.Greater(t, found.Metrics.InspectedBytes, uint64(100000))
 		}
 	}
