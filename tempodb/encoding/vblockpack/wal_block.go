@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -42,6 +43,27 @@ func createWALBlock(meta *backend.BlockMeta, filepath string, ingestionSlack tim
 // BlockMeta returns the block metadata
 func (w *walBlock) BlockMeta() *backend.BlockMeta {
 	return w.meta
+}
+
+// MetaSnapshot returns a freshly-allocated copy of the block's BlockMeta.
+func (w *walBlock) MetaSnapshot() *backend.BlockMeta {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	out := *w.meta
+	return &out
+}
+
+// Tombstone marks the block deleted by renaming meta.json to tombstone.json.
+func (w *walBlock) Tombstone() error {
+	from := filepath.Join(w.path, backend.MetaName)
+	to := filepath.Join(w.path, backend.DeletedMetaName)
+	if err := os.Rename(from, to); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to tombstone wal block %s: %w", w.meta.BlockID, err)
+	}
+	return nil
 }
 
 // Append appends a trace (as bytes) to the WAL block
@@ -159,7 +181,7 @@ func (w *walBlock) DataLength() uint64 {
 }
 
 // Iterator returns an iterator over all traces in the WAL
-func (w *walBlock) Iterator() (common.Iterator, error) {
+func (w *walBlock) Iterator(_ context.Context) (common.Iterator, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
