@@ -508,6 +508,31 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 		query = orig
 	}
 
+	// Compile the TraceQL query once before opening the reader. Compilation is pure
+	// AST → bytecode work and does not require a Reader. Pre-compiling avoids
+	// re-building the regex DFA (coregex.CompileWithConfig) for each blockpack file —
+	// Tempo issues one Fetch call per file, so compiling once here positions
+	// the API for future per-request program caching.
+	// Pass the embedder so VECTOR_AI() queries compile with the correct embedder baked
+	// in; without it, compileVectorAI returns a no-match predicate (not an error) and
+	// the pre-compiled program silently returns zero spans for VECTOR_AI queries.
+	// Fallback to the string-based QueryTraceQL path when compilation fails (e.g.
+	// structural or pipeline queries that reach Fetch — those are not filter expressions
+	// and CompileTraceQL returns an error for them).
+	//
+	// NOTE-049: compile-once design; SPEC-VM-001: *Program is immutable and reusable.
+	embedder := getProcessEmbedder(configuredEmbedURL)
+	var compiledProgram *blockpack.Program
+	compileOpts := blockpack.QueryOptions{}
+	if embedder != nil {
+		compileOpts.Embedder = embedder
+	}
+	if prog, compileErr := blockpack.CompileTraceQL(query, compileOpts); compileErr == nil {
+		compiledProgram = prog
+	} else {
+		slog.Debug("vblockpack CompileTraceQL: falling back to string API", "query", query, "err", compileErr)
+	}
+
 	// Open the reader once. newReaderProvider wraps the S3 backend in SharedLRUProvider so
 	// footer, compact trace index, and metadata reads are served from the process-level LRU
 	// cache after the first request. Each Fetch call gets its own *Reader (single-goroutine
@@ -610,13 +635,19 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 		// would scan only 1 internal block out of potentially hundreds. Blockpack files
 		// are already one job per file at the Tempo level, so scan all internal blocks.
 	}
-	if e := getProcessEmbedder(configuredEmbedURL); e != nil {
-		queryOpts.Embedder = e
+	if embedder != nil {
+		queryOpts.Embedder = embedder
 	}
 	var fetchErr error
 	var matches []blockpack.SpanMatch
 	var qs blockpack.QueryStats
-	matches, qs, fetchErr = blockpack.QueryTraceQL(r, query, queryOpts)
+	// Use the pre-compiled program when available (NOTE-049: compile-once for regex DFA reuse).
+	// Fall back to the string-based path when compilation failed (structural/pipeline queries).
+	if compiledProgram != nil {
+		matches, qs, fetchErr = blockpack.QueryTraceQLWithProgram(r, compiledProgram, queryOpts)
+	} else {
+		matches, qs, fetchErr = blockpack.QueryTraceQL(r, query, queryOpts)
+	}
 	if len(qs.Steps) > 0 {
 		args := []any{"query", query, "path", qs.ExecutionPath, "total", qs.TotalDuration}
 		for _, step := range qs.Steps {

@@ -126,6 +126,85 @@ func ColumnNames(r *Reader) []string {
 	return r.ColumnNames()
 }
 
+// Program is a compiled TraceQL filter program. It is safe to reuse across
+// multiple QueryTraceQLWithProgram calls concurrently. Programs are immutable
+// after creation. Use CompileTraceQL to create a Program; use
+// QueryTraceQLWithProgram to execute it.
+//
+// SPEC-VM-001: A *Program is safe to reuse concurrently across multiple
+// QueryTraceQLWithProgram calls. Callers need no external synchronization.
+type Program = vm.Program
+
+// CompileTraceQL parses and compiles a TraceQL filter expression to a *Program.
+// The returned Program is safe to reuse across multiple QueryTraceQLWithProgram
+// calls — compile once, query many times.
+//
+// Only filter expressions are supported (e.g., `{ span.http.method = "GET" }`).
+// Structural queries (A >> B) and pipeline queries (filter | aggregate > threshold)
+// return an error — use QueryTraceQL for those query types.
+//
+// SPEC-VM-001: The returned *Program is immutable after creation; no external
+// synchronization is required for concurrent QueryTraceQLWithProgram calls.
+func CompileTraceQL(traceqlQuery string, opts QueryOptions) (*Program, error) {
+	parsed, err := traceqlparser.ParseTraceQL(traceqlQuery)
+	if err != nil {
+		return nil, fmt.Errorf("parse TraceQL: %w", err)
+	}
+	fe, ok := parsed.(*traceqlparser.FilterExpression)
+	if !ok {
+		return nil, fmt.Errorf(
+			"CompileTraceQL: only filter expressions are supported, got %T",
+			parsed,
+		)
+	}
+	if opts.Embedder != nil || opts.Limit != 0 {
+		return vm.CompileTraceQLFilterWithOptions(fe, vm.CompileOptions{
+			Embedder: opts.Embedder,
+			Limit:    opts.Limit,
+		})
+	}
+	return vm.CompileTraceQLFilter(fe)
+}
+
+// QueryTraceQLWithProgram executes a pre-compiled TraceQL filter program against
+// a modules-format blockpack file. Use CompileTraceQL to build the program once
+// and reuse it across multiple *Reader instances to avoid repeated parse and
+// DFA-construction cost.
+//
+// Nil-safety: returns an error immediately for nil r or nil program.
+// Panic safety: internal panics are recovered and returned as errors.
+//
+// SPEC-VM-001: Program immutability and safe reuse.
+func QueryTraceQLWithProgram(
+	r *Reader,
+	program *Program,
+	opts QueryOptions,
+) (results []SpanMatch, stats QueryStats, err error) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			err = fmt.Errorf("internal error in QueryTraceQLWithProgram: %v", rec)
+		}
+	}()
+	if r == nil {
+		return nil, QueryStats{}, fmt.Errorf("QueryTraceQLWithProgram: reader cannot be nil")
+	}
+	if program == nil {
+		return nil, QueryStats{}, fmt.Errorf("QueryTraceQLWithProgram: program cannot be nil")
+	}
+	if shardErr := validateQueryOptions(opts); shardErr != nil {
+		return nil, QueryStats{}, fmt.Errorf("QueryTraceQLWithProgram: %w", shardErr)
+	}
+	collector := func(match *SpanMatch, more bool) bool {
+		if !more {
+			return false
+		}
+		results = append(results, match.Clone())
+		return true
+	}
+	stats, err = streamFilterProgram(r, program, opts, collector)
+	return results, stats, err
+}
+
 // QueryTraceQL executes a TraceQL query against a modules-format blockpack file
 // and returns all matching spans along with per-phase execution statistics.
 // QueryStats is populated for filter queries; structural and pipeline queries
