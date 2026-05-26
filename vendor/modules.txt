@@ -1752,9 +1752,6 @@ github.com/viterin/vek/vek32
 # github.com/willf/bitset v1.1.11
 ## explicit; go 1.14
 github.com/willf/bitset
-# github.com/willf/bloom v2.0.3+incompatible
-## explicit
-github.com/willf/bloom
 # github.com/wk8/go-ordered-map/v2 v2.1.8
 ## explicit; go 1.18
 github.com/wk8/go-ordered-map/v2

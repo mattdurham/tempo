@@ -943,9 +943,12 @@ func columnNameToAttribute(colName string) (traceql.Attribute, bool) {
 
 // FetchTagValues implements the Searcher interface
 func (b *blockpackBlock) FetchTagValues(ctx context.Context, req traceql.FetchTagValuesRequest, cb traceql.FetchTagValuesCallback, mcb common.MetricsCallback, opts common.SearchOptions) error {
-	// Build TraceQL query from conditions
-	// If no conditions, match all spans
-	query := conditionsToTraceQL(req.Conditions, true) // Use AND for multiple conditions
+	// Flatten ConditionGroups and build TraceQL query.
+	var valConditions []traceql.Condition
+	for _, group := range req.ConditionGroups {
+		valConditions = append(valConditions, group...)
+	}
+	query := conditionsToTraceQL(valConditions, true) // Use AND for multiple conditions
 
 	// Execute TraceQL query using public API
 	matches, err := b.executeQuery(query, blockpack.QueryOptions{})
@@ -979,9 +982,14 @@ func (b *blockpackBlock) FetchTagValues(ctx context.Context, req traceql.FetchTa
 
 // FetchTagNames implements the Searcher interface
 func (b *blockpackBlock) FetchTagNames(ctx context.Context, req traceql.FetchTagsRequest, cb traceql.FetchTagsCallback, _ common.MetricsCallback, _ common.SearchOptions) error {
+	// Flatten ConditionGroups into a single conditions slice for the query.
+	var flatConditions []traceql.Condition
+	for _, group := range req.ConditionGroups {
+		flatConditions = append(flatConditions, group...)
+	}
 	// If conditions are specified, execute query to filter spans first
-	if len(req.Conditions) > 0 {
-		query := conditionsToTraceQL(req.Conditions, true)
+	if len(flatConditions) > 0 {
+		query := conditionsToTraceQL(flatConditions, true)
 
 		// Execute TraceQL query using public API
 		matches, err := b.executeQuery(query, blockpack.QueryOptions{})

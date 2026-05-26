@@ -67,7 +67,6 @@ overrides:
     ingestion_rate_strategy: global
     metrics_generator_native_histogram_max_bucket_number: 60
     per_tenant_override_config: /overrides/overrides.yaml
-partition_ring_live_store: true
 querier:
     frontend_worker:
         frontend_address: query-frontend-discovery.tempo-dev-test-03.svc.cluster.local.:9095

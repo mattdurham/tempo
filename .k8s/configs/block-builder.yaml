@@ -6,7 +6,6 @@ block_builder:
 distributor: {}
 http_api_prefix: /tempo
 ingest:
-    enabled: true
     kafka:
         address: warpstream-agent-read.tempo-dev-test-03.svc.cluster.local.:9092
         client_id: warpstream_partition_assignment_strategy=equal_spread,warpstream_proxy_target=proxy-consume
@@ -29,7 +28,6 @@ overrides:
     ingestion_rate_strategy: global
     metrics_generator_native_histogram_max_bucket_number: 60
     per_tenant_override_config: /overrides/overrides.yaml
-partition_ring_live_store: true
 server:
     grpc_server_max_recv_msg_size: 1.572864e+07
     grpc_server_max_send_msg_size: 1.572864e+07

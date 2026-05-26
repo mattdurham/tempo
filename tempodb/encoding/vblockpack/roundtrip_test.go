@@ -49,7 +49,7 @@ func TestWALToBackend_Iterator(t *testing.T) {
 	require.NoError(t, wal.Flush())
 
 	// Iterator must return the trace even after Flush() set writer=nil.
-	iter, err := wal.Iterator()
+	iter, err := wal.Iterator(ctx)
 	require.NoError(t, err)
 	defer iter.Close()
 
@@ -73,7 +73,7 @@ func TestWALToBackend_Iterator(t *testing.T) {
 	require.NoError(t, wal2.AppendTrace(nil, tr, startSec, startSec+1, false))
 	require.NoError(t, wal2.Flush())
 
-	iter2, err := wal2.Iterator()
+	iter2, err := wal2.Iterator(ctx)
 	require.NoError(t, err)
 
 	blockMeta, err := CreateBlock(ctx, &common.BlockConfig{}, wal2Meta, iter2, r, w)
