@@ -20,6 +20,8 @@ import (
 	modules_memcache "github.com/grafana/blockpack/internal/modules/memcache"
 	modules_memorycache "github.com/grafana/blockpack/internal/modules/memorycache"
 	modules_rw "github.com/grafana/blockpack/internal/modules/rw"
+	modules_sectioncache "github.com/grafana/blockpack/internal/modules/sectioncache"
+	modules_tieredcache "github.com/grafana/blockpack/internal/modules/tieredcache"
 	vm "github.com/grafana/blockpack/internal/vm"
 )
 
@@ -191,6 +193,60 @@ func NewChainedCache(tiers ...Cache) *ChainedCache {
 	return modules_chaincache.New(tiers...)
 }
 
+// TypedConfig holds one cache per section type for TypedTieredCache.
+// Use DefaultTypedConfig for the recommended tier mapping, or set each field individually.
+type TypedConfig = modules_tieredcache.TypedConfig
+
+// TypedTieredCache routes cache operations to one of seven sub-caches based on
+// section type (Footer, TOC, Bloom, Metadata, TraceIdx, Block, Intrinsic).
+// It implements sectioncache.SectionCache via typed method dispatch — no key parsing.
+// Prefer this over the deprecated NewTieredCache binary router.
+type TypedTieredCache = modules_tieredcache.TypedTieredCache
+
+// DefaultTypedConfig returns a TypedConfig with the recommended tier mapping:
+//   - mem: Footer, TOC, Bloom, Block, Intrinsic (low-latency, high-reuse small blobs)
+//   - disk: Metadata, TraceIdx (large blobs; disk round-trip acceptable)
+//
+// Example:
+//
+//	mem, _  := blockpack.NewMemoryCache(blockpack.MemoryCacheConfig{MaxBytes: 256 << 20})
+//	disk, _ := blockpack.OpenFileCache(blockpack.FileCacheConfig{Path: "/var/cache/bp", MaxBytes: 10 << 30, Enabled: true})
+//	tiered  := blockpack.NewTypedTieredCache(blockpack.DefaultTypedConfig(mem, disk))
+//	reader, _ := blockpack.NewReaderWithCache(provider, fileID, tiered)
+func DefaultTypedConfig(mem, disk Cache) TypedConfig {
+	return modules_tieredcache.DefaultTypedConfig(mem, disk)
+}
+
+// NewTypedTieredCache constructs a TypedTieredCache from cfg.
+// Nil sub-cache fields are normalized to NopCache.
+func NewTypedTieredCache(cfg TypedConfig) *TypedTieredCache {
+	return modules_tieredcache.NewTypedTieredCache(cfg)
+}
+
+// SectionCache is the typed cache interface used internally by Reader.
+// TypedTieredCache implements this interface. Pass a *TypedTieredCache directly
+// to NewReaderWithSectionCache / NewLeanReaderWithSectionCache to bypass
+// the FilecacheAdapter wrapping layer used by NewReaderWithCache.
+type SectionCache = modules_sectioncache.SectionCache
+
+// NewReaderWithSectionCache creates a Reader using a SectionCache directly.
+// Use this when passing a *TypedTieredCache to avoid the FilecacheAdapter wrapper.
+func NewReaderWithSectionCache(provider ReaderProvider, fileID string, sc SectionCache) (*Reader, error) {
+	return modules_reader.NewReaderFromProviderWithOptions(provider, modules_reader.Options{
+		Cache:  sc,
+		FileID: fileID,
+	})
+}
+
+// NewLeanReaderWithSectionCache creates a lean Reader using a SectionCache directly.
+// Use this when passing a *TypedTieredCache to avoid the FilecacheAdapter wrapper.
+func NewLeanReaderWithSectionCache(provider ReaderProvider, fileID string, sc SectionCache) (*Reader, error) {
+	return modules_reader.NewLeanReaderFromProviderWithOptions(provider, modules_reader.Options{
+		Cache:  sc,
+		FileID: fileID,
+	})
+}
+
 // Signal type constants for blockpack file discrimination.
 // SignalTypeLog is returned by Reader.SignalType() for log blockpack files.
 // SignalTypeTrace is the default for trace blockpack files (version < 12).
@@ -224,8 +280,12 @@ func NewReaderFromProvider(provider ReaderProvider) (*Reader, error) {
 // A nil cache falls back to uncached reads. cache may be any Cache implementation:
 // FileCache, MemoryCache, MemCache, or a ChainedCache.
 func NewReaderWithCache(provider ReaderProvider, fileID string, cache Cache) (*Reader, error) {
+	var sc modules_sectioncache.SectionCache
+	if cache != nil {
+		sc = modules_sectioncache.NewFilecacheAdapter(cache)
+	}
 	return modules_reader.NewReaderFromProviderWithOptions(provider, modules_reader.Options{
-		Cache:  cache,
+		Cache:  sc,
 		FileID: fileID,
 	})
 }
@@ -244,8 +304,12 @@ func NewLeanReaderFromProvider(provider ReaderProvider) (*Reader, error) {
 // but caches footer and section reads. fileID must uniquely identify the file within the cache namespace.
 // cache may be any Cache implementation: FileCache, MemoryCache, MemCache, or ChainedCache.
 func NewLeanReaderWithCache(provider ReaderProvider, fileID string, cache Cache) (*Reader, error) {
+	var sc modules_sectioncache.SectionCache
+	if cache != nil {
+		sc = modules_sectioncache.NewFilecacheAdapter(cache)
+	}
 	return modules_reader.NewLeanReaderFromProviderWithOptions(provider, modules_reader.Options{
-		Cache:  cache,
+		Cache:  sc,
 		FileID: fileID,
 	})
 }
@@ -370,7 +434,13 @@ func GetTraceByID(r *Reader, traceIDHex string) (results []SpanMatch, err error)
 		}
 
 		for _, rowIdx := range matchingRows {
-			fields := modules_blockio.NewSpanFieldsAdapterWithReader(bwb.Block, r, entry.BlockID, rowIdx)
+			fields := modules_blockio.NewSpanFieldsAdapterWithReader(
+				bwb.Block,
+				r,
+				entry.BlockID,
+				rowIdx,
+				nil,
+			)
 			// trace:id is known; extract span:id via intrinsic fallback map.
 			traceIDStr := hex.EncodeToString(traceID[:])
 			spanIDStr := ""

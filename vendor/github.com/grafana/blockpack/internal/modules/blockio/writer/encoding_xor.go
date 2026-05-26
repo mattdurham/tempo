@@ -67,6 +67,22 @@ func encodeXORBytes(kind uint8, values [][]byte, present []bool, nRows int) ([]b
 	return buf, nil
 }
 
+// xorBytesLen XORs a against b producing exactly len(a) bytes.
+// Unlike xorBytes, the result length always equals len(a), making the wire format
+// self-describing: xor_data_len == original value length.
+func xorBytesLen(a, b []byte) []byte {
+	result := make([]byte, len(a))
+	minLen := min(len(a), len(b))
+	for i := range minLen {
+		result[i] = a[i] ^ b[i]
+	}
+	if len(a) > len(b) {
+		copy(result[minLen:], a[minLen:])
+	}
+	// if len(b) > len(a): trailing bytes of b are simply not included
+	return result
+}
+
 // xorBytes returns a XOR b byte-by-byte. If lengths differ, XOR up to min length;
 // the remainder of the longer slice is appended unchanged.
 func xorBytes(a, b []byte) []byte {

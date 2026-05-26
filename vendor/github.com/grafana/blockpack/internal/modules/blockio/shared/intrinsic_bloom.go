@@ -51,7 +51,7 @@ func intrinsicBloomHashes(key []byte) (h1, h2 uint64) {
 
 // AddIntrinsicToBloom adds key to the bloom filter using FNV-1a double-hashing.
 // No-op for nil or empty bloom slices.
-func AddIntrinsicToBloom(bloom []byte, key []byte) {
+func AddIntrinsicToBloom(bloom, key []byte) {
 	if len(bloom) == 0 {
 		return
 	}
@@ -65,7 +65,7 @@ func AddIntrinsicToBloom(bloom []byte, key []byte) {
 
 // TestIntrinsicBloom returns false only if key is definitely absent from the filter.
 // Returns true for nil or empty bloom (vacuous — no false negatives).
-func TestIntrinsicBloom(bloom []byte, key []byte) bool {
+func TestIntrinsicBloom(bloom, key []byte) bool {
 	if len(bloom) == 0 {
 		return true
 	}

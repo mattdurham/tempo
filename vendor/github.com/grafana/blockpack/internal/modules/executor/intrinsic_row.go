@@ -26,24 +26,40 @@ const (
 	colNameSpanStatus    = "span:status"
 )
 
+// spanIDByteLen is the fixed OTel spec byte length for span IDs (W3C TraceContext, 8 bytes).
+const spanIDByteLen = 8
+
+// traceIDByteLen is the fixed OTel spec byte length for trace IDs (W3C TraceContext, 16 bytes).
+const traceIDByteLen = 16
+
+// copy8 copies b into dst if len(b) == spanIDByteLen. Returns true if copied.
+func copy8(dst *[8]byte, b []byte) bool {
+	if len(b) != spanIDByteLen {
+		return false
+	}
+	copy(dst[:], b)
+	return true
+}
+
 // intrinsicRowFields holds per-row data for all 11 trace intrinsic columns.
 // Used by the structural hot path to eliminate per-row map allocations.
 // A single []intrinsicRowFields slice replaces []map[string]any (one alloc for N rows).
-// Fields are ordered per betteralign output: strings first (16-byte headers), then slices (24-byte headers),
-// then 8-byte scalars (uint64, int64), then smaller scalars (uint16), then fixed-size arrays ([16]byte).
+// Fields are ordered per betteralign output: strings first (16-byte headers), then 8-byte scalars
+// (uint64, int64), then [8]byte fixed arrays, then smaller scalars (uint16), then [16]byte arrays.
+// NOTE-093: [8]byte eliminates clone; [8]byte{} is the zero value; the present bitmask (field: present) is the authoritative absent indicator.
 type intrinsicRowFields struct {
 	spanName      string   // span:name (dict string)
 	serviceName   string   // resource.service.name (dict string)
 	statusMessage string   // span:status_message (dict string)
-	spanID        []byte   // span:id (variable-length []byte, nil if absent)
-	parentID      []byte   // span:parent_id (variable-length []byte, nil if absent)
 	spanStart     uint64   // span:start (flat uint64 nanoseconds)
 	spanEnd       uint64   // span:end (synthesized flat uint64 nanoseconds)
 	spanDuration  uint64   // span:duration (flat uint64 nanoseconds)
 	spanKind      int64    // span:kind (dict int64)
 	spanStatus    int64    // span:status (dict int64)
+	spanID        [8]byte  // span:id ([8]byte value type; [8]byte{} if absent — see present bitmask)
+	parentID      [8]byte  // span:parent_id ([8]byte value type; [8]byte{} if absent — see present bitmask)
 	present       uint16   // bitmask: which fields were populated
-	traceID       [16]byte // trace:id (always []byte, always 16 bytes)
+	traceID       [16]byte // trace:id ([16]byte value type, always 16 bytes)
 }
 
 // Bitmask constants for intrinsicRowFields.present (one per field).
@@ -132,18 +148,20 @@ func populateTypedColumn(
 func storeTypedField(colName string, val any, row *intrinsicRowFields) {
 	switch colName {
 	case colNameTraceID:
-		if b, ok := val.([]byte); ok && len(b) == 16 {
+		if b, ok := val.([]byte); ok && len(b) == traceIDByteLen {
 			copy(row.traceID[:], b)
 			row.present |= intrinsicPresentTraceID
 		}
 	case colNameSpanID:
-		if b, ok := val.([]byte); ok && len(b) > 0 {
-			row.spanID = append([]byte(nil), b...)
+		// NOTE-093: [8]byte eliminates clone; blockio/shared NOTE-012 guarantees BytesValues are independent copies.
+		// Non-spanIDByteLen values silently skipped per NOTE-093 (OTel spec forbids non-8-byte span IDs).
+		if b, ok := val.([]byte); ok && copy8(&row.spanID, b) {
 			row.present |= intrinsicPresentSpanID
 		}
 	case colNameParentID:
-		if b, ok := val.([]byte); ok && len(b) > 0 {
-			row.parentID = append([]byte(nil), b...)
+		// NOTE-093: [8]byte eliminates clone; blockio/shared NOTE-012 guarantees BytesValues are independent copies.
+		// Non-spanIDByteLen values silently skipped per NOTE-093 (OTel spec forbids non-8-byte span IDs).
+		if b, ok := val.([]byte); ok && copy8(&row.parentID, b) {
 			row.present |= intrinsicPresentParentID
 		}
 	case colNameSpanName:
@@ -200,20 +218,20 @@ func identityFieldsFromBlockColsTyped(block *modules_reader.Block, n int) []intr
 	for rowIdx := range n {
 		row := &result[rowIdx]
 		if traceCol != nil {
-			if v, ok := traceCol.BytesValue(rowIdx); ok && len(v) == 16 {
+			if v, ok := traceCol.BytesValue(rowIdx); ok && len(v) == traceIDByteLen {
 				copy(row.traceID[:], v)
 				row.present |= intrinsicPresentTraceID
 			}
 		}
 		if spanCol != nil {
-			if v, ok := spanCol.BytesValue(rowIdx); ok && len(v) > 0 {
-				row.spanID = append([]byte(nil), v...)
+			// NOTE-093: [8]byte eliminates clone; copy8 enforces OTel spec spanIDByteLen requirement.
+			if v, ok := spanCol.BytesValue(rowIdx); ok && copy8(&row.spanID, v) {
 				row.present |= intrinsicPresentSpanID
 			}
 		}
 		if parentCol != nil {
-			if v, ok := parentCol.BytesValue(rowIdx); ok && len(v) > 0 {
-				row.parentID = append([]byte(nil), v...)
+			// NOTE-093: [8]byte eliminates clone; copy8 enforces OTel spec spanIDByteLen requirement.
+			if v, ok := parentCol.BytesValue(rowIdx); ok && copy8(&row.parentID, v) {
 				row.present |= intrinsicPresentParentID
 			}
 		}

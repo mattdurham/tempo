@@ -147,7 +147,9 @@ func (twbs *timeWindowBlockSelector) BlocksToCompact() ([]*backend.BlockMeta, st
 
 				if twbs.entries[i].group == twbs.entries[j].group &&
 					twbs.entries[i].meta.Version == twbs.entries[j].meta.Version && // update after parquet: only compact blocks of the same version
-					twbs.entries[i].meta.DedicatedColumnsHash() == twbs.entries[j].meta.DedicatedColumnsHash() && // update after vParquet3: only compact blocks of the same dedicated columns
+					// blockpack is column-name-keyed and handles mixed dedicated columns natively;
+					// the DedicatedColumnsHash constraint is a parquet schema requirement only.
+					(twbs.entries[i].meta.Version == "vblockpack" || twbs.entries[i].meta.DedicatedColumnsHash() == twbs.entries[j].meta.DedicatedColumnsHash()) &&
 					len(stripe) <= twbs.MaxInputBlocks &&
 					totalObjects(stripe) <= twbs.MaxCompactionObjects &&
 					totalSize(stripe) <= twbs.MaxBlockBytes {

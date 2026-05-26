@@ -38,7 +38,7 @@ const (
 //   - the magic number does not match (not a TS index section, e.g. old file format).
 //
 // Returns a non-nil error only when the magic matches but the data is malformed.
-func parseTSIndex(data []byte) (rawEntries []byte, entryCount int, consumed int, err error) {
+func parseTSIndex(data []byte) (rawEntries []byte, entryCount, consumed int, err error) {
 	if len(data) < tsIndexHeaderSize {
 		return nil, 0, 0, nil // graceful: old file, no TS index
 	}

@@ -22,7 +22,8 @@ var (
 func getVectorZstdEncoder() *zstd.Encoder {
 	vectorZstdEncOnce.Do(func() {
 		var err error
-		vectorZstdEnc, err = zstd.NewWriter(nil,
+		vectorZstdEnc, err = zstd.NewWriter(
+			nil,
 			zstd.WithEncoderLevel(zstd.SpeedDefault),
 			zstd.WithEncoderConcurrency(1),
 		)
@@ -93,7 +94,7 @@ func (b *vectorF32ColumnBuilder) addString(_ string, _ bool)   {}
 func (b *vectorF32ColumnBuilder) addInt64(_ int64, _ bool)     {}
 func (b *vectorF32ColumnBuilder) addUint64(_ uint64, _ bool)   {}
 func (b *vectorF32ColumnBuilder) addFloat64(_ float64, _ bool) {}
-func (b *vectorF32ColumnBuilder) addBool(_ bool, _ bool)       {}
+func (b *vectorF32ColumnBuilder) addBool(_, _ bool)            {}
 func (b *vectorF32ColumnBuilder) addBytes(_ []byte, _ bool)    {}
 
 func (b *vectorF32ColumnBuilder) rowCount() int { return len(b.values) }

@@ -511,3 +511,157 @@ consumed 54% of query CPU. Single-pass dense-array designs eliminated both.
 
 Code review. When adding any new data-processing path, verify no intermediate collection is built
 solely to be iterated a second time.
+
+---
+
+## SPEC-ROOT-017: Column Threading Invariant — Propagate wantColumns End-to-End
+
+**Invariant:** The set of columns needed by a query must be threaded from compilation through
+every decode step. No subsystem may decode, load, or scan column data for columns absent from
+the query's needed set.
+
+**Rules:**
+
+- `ProgramWantColumns(program)` is the authoritative source of predicate column names at
+  compile time. It must be threaded into `ParseBlockFromBytes`, `SpanFieldsAdapter`, and
+  `loadIntrinsicCache`.
+- `secondPassCols` (computed in `computeColumnFilters`) augments `wantColumns` with output
+  columns (searchMetaCols, traceIntrinsicColumns, SelectColumns). It is the correct filter
+  for second-pass block decodes and for `loadIntrinsicCache` in result-materialization paths.
+- `loadIntrinsicCache` must skip any intrinsic column not in its `wantCols` parameter.
+  When `wantCols` is nil, all columns are loaded (match-all and GetTraceByID paths).
+- Per-block `isDualStorage` detection must be computed once per block, not once per
+  `IterateFields` call. The result is passed to the adapter constructor.
+- Stream paths (`streamFilterProgram`, `streamLogProgram`) must pass
+  `wantCols=ComputeSecondPassCols(program, selectColumns)`, computed once before the row loop.
+  The result may be nil for programs with no predicates and no SelectColumns; nil is valid and
+  means load-all.
+- Paths that need all fields (GetTraceByID) must pass `wantCols=nil`. The structural result
+  path passes `wantCols=ComputeSecondPassCols(nil, opts.SelectColumns)`, which is nil when
+  SelectColumns is empty (load-all) and non-nil when SelectColumns is provided. `nil` wantCols
+  is explicitly valid and means "load all intrinsic columns" — it is not a missing-value bug.
+- Callers passing non-nil wantCols for span:end synthesis must include both span:start and
+  span:duration in the set; omitting either suppresses span:end synthesis (the synthesis check
+  requires both keys present in intrinsicCache).
+
+**Rationale:**
+
+Decoding intrinsic columns not needed by a query wastes CPU and memory on every matched span.
+For queries against old-format files (pre-dual-storage), this is especially expensive because
+`loadIntrinsicCache` performs an O(N_refs) linear scan per column. The per-span dual-storage
+detection loop is also a hidden O(N_intrinsics) cost per span per `IterateFields` call.
+
+**Enforcement:**
+
+Code review. Any new `NewSpanFieldsAdapterWithReader` call site must document its `wantCols`
+and `isDualStorage` choice. `nil` wantCols is acceptable only for paths that need all fields.
+
+Back-ref: `internal/modules/blockio/span_fields.go:loadIntrinsicCache`,
+`internal/modules/blockio/span_fields.go:IterateFields`,
+`internal/modules/blockio/span_fields.go:NewSpanFieldsAdapterWithReader`,
+`internal/modules/executor/stream.go:computeColumnFilters`,
+`internal/modules/executor/predicates.go:ProgramWantColumns`,
+`internal/modules/executor/predicates.go:ComputeSecondPassCols`,
+`query_traceql.go:streamFilterProgram`,
+`query_logql.go:streamLogProgram`,
+`api.go:QueryTraceQL`,
+`reader.go:GetTraceByID`
+
+---
+
+## SPEC-FORMAT-001: All Metadata Sections Must Be ToC-Driven for Selective Decoding
+
+**Invariant:** Every metadata section that contains per-column data MUST be stored as an
+individual entry in the unified Table of Contents (ToC), addressable by a typed
+`(Type, SubType, Name)` key. Monolithic blobs that pack all columns together are
+forbidden for new file format versions.
+
+**Rationale:** A monolithic section blob requires:
+1. Full S3/object-storage fetch of all column data (regardless of query selectivity)
+2. Full snappy decompression of all column data on every access
+3. GC pressure from large allocations that are mostly unused
+
+For a query touching 2 columns out of 200, a monolithic range index requires decoding
+~200x more data than necessary.
+
+**Wire format — Footer V8:**
+
+Footer V8 is 18 bytes (identical layout to Footer V7; distinguished by `version=8`):
+```
+magic[4]=0xC011FEA1 · version[2]=8 · toc_offset[8] · toc_length[4]
+```
+The footer points to a snappy-compressed Table of Contents blob.
+
+**Wire format — ToC blob (after snappy decompression):**
+```
+entry_count[4 LE] · signal_type[1] · reserved[3] · ToCEntry[entry_count]
+```
+
+**Wire format — ToCEntry (variable length):**
+```
+type[4 LE] · subtype[4 LE] · name_len[2 LE] · name[name_len] · offset[8 LE] · length[4 LE]
+```
+Minimum entry size (name=""): 22 bytes. Maximum name length: `MaxNameLen` (1024 bytes).
+
+**Type and SubType constants:**
+```
+ToCTypeMetadata = 1   // file-level metadata sections
+ToCTypeIndex    = 2   // file-level index structures
+ToCTypeBlock    = 3   // raw block data blobs (reserved; not used in V8)
+
+// SubTypes for ToCTypeMetadata (Type=1)
+ToCSubTypeRange     = 1   // per-column range index
+ToCSubTypeSketch    = 2   // per-column KLL/sketch
+ToCSubTypeBloom     = 3   // file-level bloom filter
+ToCSubTypeIntrinsic = 4   // per-column intrinsic blob
+ToCSubTypeTrace     = 5   // compact trace index
+ToCSubTypeTS        = 6   // timestamp index
+
+// SubTypes for ToCTypeIndex (Type=2)
+ToCSubTypeBlockIndex = 7  // block offset table
+```
+
+**Lookup key:** readers build `map[ToCKey]{Offset, Length}` where
+`ToCKey = struct{ Type, SubType uint32; Name string }`.
+
+**Example entries:**
+```
+(1, 1, "resource.service.name") → per-column range index blob
+(1, 2, "resource.service.name") → per-column KLL/sketch blob
+(1, 3, "")                      → file-level bloom filter blob
+(1, 4, "resource.service.name") → per-column intrinsic blob
+(1, 5, "")                      → compact trace index blob
+(1, 6, "")                      → timestamp index blob
+(2, 7, "")                      → block index blob
+```
+
+**Sections to convert:** `SectionRangeIndex` (0x02) and `SectionSketchIndex` (0x05)
+are currently monolithic blobs in V14 (Footer V7) files and MUST be represented as
+individual per-column ToCEntry records in V8 files.
+
+**Version support:** V8 is the only supported 18-byte magic footer version. The reader
+rejects any file whose magic matches but whose version field is not 8 (including V7).
+Legacy V3/V4/V5/V6 files (non-18-byte footers) remain readable via the legacy path.
+Old readers that pre-date V8 will fail on V8 files; readers must be upgraded before
+V8 writers are deployed.
+
+**Enforcement:** Any new multi-column metadata section added without individual ToCEntry
+records will be rejected in code review. Existing sections (`SectionRangeIndex`,
+`SectionSketchIndex`) must be per-column in V8 files.
+
+Back-ref: `internal/modules/blockio/shared/constants.go` (FooterV8Version, ToCType*,
+ToCSubType* constants to be added)
+Back-ref: `internal/modules/blockio/shared/types.go` (ToCEntry, ToCKey structs to be
+added)
+Back-ref: `internal/modules/blockio/writer/writer.go:writeV14Sections` (replaced by
+`writeV8Sections` emitting `[]ToCEntry` and Footer V8)
+Back-ref: `internal/modules/blockio/writer/metadata.go:writeFooterV7` (parallel
+`writeFooterV8` function to be added)
+Back-ref: `internal/modules/blockio/reader/parser.go:tryReadFooterV7` (parallel
+`tryReadFooterV8` to be added)
+Back-ref: `internal/modules/blockio/reader/parser.go:parseSectionsLazyV14` (parallel
+`parseSectionsV8` using ToC map)
+Back-ref: `internal/modules/blockio/reader/parser.go:scanRangeIndexOffsets` (replaced
+by direct ToC key lookup)
+Back-ref: `internal/modules/blockio/reader/sketch_index.go:parseSketchIndexSection`
+(replaced by per-column ToC-keyed lazy load)

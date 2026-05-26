@@ -509,6 +509,13 @@ func (w *BackendWorker) MaxCompactionRangeForTenant(tenantID string) time.Durati
 	return w.overrides.MaxCompactionRange(tenantID)
 }
 
+// DedicatedColumnsForTenant implements CompactorOverrides.
+// Returns the current per-tenant dedicated columns so compaction always re-indexes
+// output blocks according to the live config rather than copying from input blocks.
+func (w *BackendWorker) DedicatedColumnsForTenant(tenantID string) backend.DedicatedColumns {
+	return w.overrides.DedicatedColumns(tenantID)
+}
+
 func (w *BackendWorker) callSchedulerWithBackoff(ctx context.Context, f func(context.Context) error) error {
 	var (
 		b   = backoff.New(ctx, w.cfg.Backoff)

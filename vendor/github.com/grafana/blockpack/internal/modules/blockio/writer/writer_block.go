@@ -342,15 +342,33 @@ func (b *blockBuilder) feedIntrinsicBytes(name string, colType shared.ColumnType
 	}
 }
 
+// hardcodedIntrinsicCols mirrors the columns that vParquet4 stores as first-class
+// schema fields (HttpMethod, HttpUrl, HttpStatusCode on spans; Cluster, Namespace,
+// Pod, Container, k8s.* on resources). These are always written to the intrinsic
+// section regardless of the per-tenant dedicated columns config, ensuring the metrics
+// fast path works without requiring an explicit override.
+//
+//nolint:gochecknoglobals
+var hardcodedIntrinsicCols = map[string]struct{}{
+	// span — mirrors vParquet4 Span static dedicated columns
+	"span.http.method":      {},
+	"span.http.url":         {},
+	"span.http.status_code": {},
+	// resource — mirrors vParquet4 Resource static dedicated columns (k8s.*)
+	"resource.k8s.cluster.name":   {},
+	"resource.k8s.namespace.name": {},
+	"resource.k8s.pod.name":       {},
+	"resource.k8s.container.name": {},
+}
+
 // feedDedicatedAttrValue feeds val to the intrinsic accumulator when name is in
-// the dedicated columns set. Called from attribute loops after addPresent so that
-// dedicated attributes land in both the block column and the intrinsic section.
-// No-op when dedicatedCols is nil or name is not in the set.
+// the dedicated columns set OR the hardcoded always-intrinsic set.
+// Called from attribute loops after addPresent so that dedicated attributes land
+// in both the block column and the intrinsic section.
 func (b *blockBuilder) feedDedicatedAttrValue(name string, val shared.AttrValue, rowIdx int) {
-	if b.dedicatedCols == nil {
-		return
-	}
-	if _, ok := b.dedicatedCols[name]; !ok {
+	_, isHardcoded := hardcodedIntrinsicCols[name]
+	_, isDedicated := b.dedicatedCols[name]
+	if !isHardcoded && !isDedicated {
 		return
 	}
 	// TYPE LIMITATION: BOOL and FLOAT64 attributes are silently skipped here (no case
@@ -911,7 +929,7 @@ func (b *blockBuilder) applySpanStatus(col *modules_reader.Column, srcRowIdx, ds
 // This is the native columnar path used by the compaction writer — it bypasses
 // all OTLP proto objects, reading typed values directly from decoded columns and
 // writing them into the destination block via addPresent.
-func (b *blockBuilder) addRowFromBlock(srcBlock *modules_reader.Block, srcRowIdx int, dstRowIdx int) {
+func (b *blockBuilder) addRowFromBlock(srcBlock *modules_reader.Block, srcRowIdx, dstRowIdx int) {
 	var traceID [16]byte
 	var spanStart, spanEnd uint64
 	traceIDFound := false
@@ -1015,7 +1033,7 @@ func (b *blockBuilder) addRowFromBlock(srcBlock *modules_reader.Block, srcRowIdx
 // derives missing duration, updates min/max start/traceID, and increments spanCount.
 func (b *blockBuilder) finalizeRowBookkeeping(
 	dstRowIdx int, traceID [16]byte, traceIDFound bool,
-	spanStart uint64, spanStartFound bool, spanEnd uint64, spanEndFound bool, durationFound bool,
+	spanStart uint64, spanStartFound bool, spanEnd uint64, spanEndFound, durationFound bool,
 ) {
 	// Derive duration from start+end if source block lacked span:duration.
 	if !durationFound && spanStartFound && spanEndFound {
@@ -1094,7 +1112,7 @@ func buildIntrinsicBlockIndex(r *modules_reader.Reader, srcBlockIdx int) intrins
 			continue
 		}
 		switch col.Format {
-		case shared.IntrinsicFormatFlat:
+		case shared.IntrinsicFormatFlat, shared.IntrinsicFormatXORBytes, shared.IntrinsicFormatDeltaUint64:
 			for i, ref := range col.BlockRefs {
 				if int(ref.BlockIdx) != srcBlockIdx {
 					continue
@@ -1572,7 +1590,8 @@ func (b *blockBuilder) finalize(blockVersion uint8) ([]byte, error) {
 
 // appendUint32LE appends a uint32 in little-endian byte order to buf.
 func appendUint32LE(buf []byte, v uint32) []byte {
-	return append(buf,
+	return append(
+		buf,
 		byte(v),     //nolint:gosec // safe: truncating uint32 bytes for LE encoding
 		byte(v>>8),  //nolint:gosec // safe: truncating uint32 bytes for LE encoding
 		byte(v>>16), //nolint:gosec // safe: truncating uint32 bytes for LE encoding

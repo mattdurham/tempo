@@ -48,7 +48,7 @@ func (b *stringColumnBuilder) addString(val string, present bool) {
 func (b *stringColumnBuilder) addInt64(_ int64, _ bool)         {}
 func (b *stringColumnBuilder) addUint64(_ uint64, _ bool)       {}
 func (b *stringColumnBuilder) addFloat64(_ float64, _ bool)     {}
-func (b *stringColumnBuilder) addBool(_ bool, _ bool)           {}
+func (b *stringColumnBuilder) addBool(_, _ bool)                {}
 func (b *stringColumnBuilder) addBytes(_ []byte, _ bool)        {}
 func (b *stringColumnBuilder) addVectorF32(_ []float32, _ bool) {}
 
@@ -152,7 +152,7 @@ func (b *int64ColumnBuilder) prepare(nRows int) {
 func (b *int64ColumnBuilder) addString(_ string, _ bool)       {}
 func (b *int64ColumnBuilder) addUint64(_ uint64, _ bool)       {}
 func (b *int64ColumnBuilder) addFloat64(_ float64, _ bool)     {}
-func (b *int64ColumnBuilder) addBool(_ bool, _ bool)           {}
+func (b *int64ColumnBuilder) addBool(_, _ bool)                {}
 func (b *int64ColumnBuilder) addBytes(_ []byte, _ bool)        {}
 func (b *int64ColumnBuilder) addVectorF32(_ []float32, _ bool) {}
 
@@ -233,7 +233,7 @@ func (b *uint64ColumnBuilder) prepare(nRows int) {
 func (b *uint64ColumnBuilder) addString(_ string, _ bool)       {}
 func (b *uint64ColumnBuilder) addInt64(_ int64, _ bool)         {}
 func (b *uint64ColumnBuilder) addFloat64(_ float64, _ bool)     {}
-func (b *uint64ColumnBuilder) addBool(_ bool, _ bool)           {}
+func (b *uint64ColumnBuilder) addBool(_, _ bool)                {}
 func (b *uint64ColumnBuilder) addBytes(_ []byte, _ bool)        {}
 func (b *uint64ColumnBuilder) addVectorF32(_ []float32, _ bool) {}
 
@@ -374,7 +374,7 @@ func (b *float64ColumnBuilder) prepare(nRows int) {
 func (b *float64ColumnBuilder) addString(_ string, _ bool)       {}
 func (b *float64ColumnBuilder) addInt64(_ int64, _ bool)         {}
 func (b *float64ColumnBuilder) addUint64(_ uint64, _ bool)       {}
-func (b *float64ColumnBuilder) addBool(_ bool, _ bool)           {}
+func (b *float64ColumnBuilder) addBool(_, _ bool)                {}
 func (b *float64ColumnBuilder) addBytes(_ []byte, _ bool)        {}
 func (b *float64ColumnBuilder) addVectorF32(_ []float32, _ bool) {}
 
@@ -451,7 +451,7 @@ func (b *boolColumnBuilder) addFloat64(_ float64, _ bool)     {}
 func (b *boolColumnBuilder) addBytes(_ []byte, _ bool)        {}
 func (b *boolColumnBuilder) addVectorF32(_ []float32, _ bool) {}
 
-func (b *boolColumnBuilder) addBool(val bool, present bool) {
+func (b *boolColumnBuilder) addBool(val, present bool) {
 	b.values = append(b.values, val)
 	b.present = append(b.present, present)
 }
@@ -525,7 +525,7 @@ func (b *bytesColumnBuilder) addString(_ string, _ bool)       {}
 func (b *bytesColumnBuilder) addInt64(_ int64, _ bool)         {}
 func (b *bytesColumnBuilder) addUint64(_ uint64, _ bool)       {}
 func (b *bytesColumnBuilder) addFloat64(_ float64, _ bool)     {}
-func (b *bytesColumnBuilder) addBool(_ bool, _ bool)           {}
+func (b *bytesColumnBuilder) addBool(_, _ bool)                {}
 func (b *bytesColumnBuilder) addVectorF32(_ []float32, _ bool) {}
 
 func (b *bytesColumnBuilder) addBytes(val []byte, present bool) {

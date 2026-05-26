@@ -708,3 +708,39 @@ calls for the same column-file pair are cache hits.
 
 Back-ref: `internal/modules/blockio/reader/parser.go:parseSectionsLazyV14`,
 `internal/modules/blockio/reader/intrinsic_reader.go:HasIntrinsicColumn`
+
+---
+
+## NOTE-V8-003: V8 selective fetch and per-column I/O
+
+**Context:** V8 files use per-column range/sketch blobs. `ensureRangeColumnParsed` and
+`ColumnSketch` detect `footerVersion == FooterV8Version` and call `fetchToCSection` with
+`ToCKey{ToCTypeMetadata, ToCSubTypeRange/Sketch, colName}`. Only the requested column's
+blob is read — no other column's data is fetched.
+
+**fetchToCSection caching:** Cache keys use null-byte separators
+(`fileID\x00v8\x00type\x00subtype\x00name`) because OTEL attribute names can contain
+slashes but not null bytes. This avoids cache key collisions between columns like
+`"http/method"` and `"http"` + `"/method"`.
+
+**Footer detection:** `tryReadFooterMagic18` reads the last 18 bytes once, shared between
+V8 (version=8) and V7 (version=7) detection. This preserves the `TestLeanReader_ThreeIO`
+invariant (exactly 3 I/Os: footer+dir+block_index for V7 files).
+
+**V8 sketch concurrency:** `ColumnSketch` acquires `sketchIdxMu` (sync.Mutex) to guard
+concurrent per-column fetch+store. V14 uses `sync.Once` inside `ensureV14SketchSection`
+which serializes all sketch accesses. V8 uses a per-Reader mutex to allow concurrent
+fetches of different columns while preventing double-write.
+
+**Intrinsic access (V8):** `parseSectionsV8` populates `r.intrinsicIndex` from
+`ToCSubTypeIntrinsic` ToCEntries at open time (zero I/O — offsets only). The existing
+`GetIntrinsicColumnBlob` path reads `r.intrinsicIndex[name].Offset/Length` and calls
+`r.provider.ReadAt` then `snappy.Decode` — unchanged for V8.
+
+Back-ref: `internal/modules/blockio/reader/parser.go:parseSectionsV8`,
+          `internal/modules/blockio/reader/parser.go:fetchToCSection`,
+          `internal/modules/blockio/reader/parser.go:tryReadFooterMagic18`,
+          `internal/modules/blockio/reader/range_index.go:ensureRangeColumnParsed`,
+          `internal/modules/blockio/reader/range_index.go:parseRangeColumnBlobV8`,
+          `internal/modules/blockio/reader/sketch_index.go:parseOneColumnSketchBlob`,
+          `internal/modules/blockio/reader/reader.go:ColumnSketch`

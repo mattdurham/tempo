@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"time"
 
 	gomemcache "github.com/grafana/gomemcache/memcache"
 	"github.com/prometheus/client_golang/prometheus"
@@ -48,11 +49,16 @@ type Config struct {
 //
 // A nil *MemCache is safe to use: all operations become pass-throughs.
 type MemCache struct {
-	group      singleflight.Group
-	c          client
-	requests   *prometheus.CounterVec
-	bytes      *prometheus.CounterVec
-	errs       *prometheus.CounterVec
+	group    singleflight.Group
+	c        client
+	requests *prometheus.CounterVec
+	bytes    *prometheus.CounterVec
+	errs     *prometheus.CounterVec
+	// Pre-resolved histogram observers for 0-alloc hot path.
+	// Each is nil when Registerer is not configured.
+	durGetHit  prometheus.Observer
+	durGetMiss prometheus.Observer
+	durPutOk   prometheus.Observer
 	expiration int32
 }
 
@@ -82,6 +88,20 @@ func Open(cfg Config) (*MemCache, error) {
 			Name: "blockpack_cache_errors_total",
 			Help: "Total number of cache errors by tier.",
 		}, []string{"tier"}))
+		h := memcacheRegisterOrReuseHistogram(cfg.Registerer, prometheus.NewHistogramVec(
+			prometheus.HistogramOpts{
+				Name:                            "blockpack_cache_operation_duration_seconds",
+				Help:                            "Duration of cache Get and Put operations by tier, operation, and result.",
+				NativeHistogramBucketFactor:     1.1,
+				NativeHistogramMaxBucketNumber:  100,
+				NativeHistogramMinResetDuration: 15 * time.Minute,
+			},
+			[]string{"tier", "operation", "result"},
+		))
+		// Pre-resolve label combinations for 0-alloc hot path.
+		m.durGetHit = h.WithLabelValues("remote", "get", "hit")
+		m.durGetMiss = h.WithLabelValues("remote", "get", "miss")
+		m.durPutOk = h.WithLabelValues("remote", "put", "ok")
 	}
 	return m, nil
 }
@@ -103,6 +123,26 @@ func memcacheRegisterOrReuse(reg prometheus.Registerer, cv *prometheus.CounterVe
 	return cv
 }
 
+// memcacheRegisterOrReuseHistogram registers a HistogramVec with the given Registerer.
+// If the metric is already registered (AlreadyRegisteredError), it returns the
+// previously registered collector instead of panicking.
+func memcacheRegisterOrReuseHistogram(
+	reg prometheus.Registerer,
+	hv *prometheus.HistogramVec,
+) *prometheus.HistogramVec {
+	err := reg.Register(hv)
+	if err == nil {
+		return hv
+	}
+	var are prometheus.AlreadyRegisteredError
+	if errors.As(err, &are) {
+		if existing, ok := are.ExistingCollector.(*prometheus.HistogramVec); ok {
+			return existing
+		}
+	}
+	return hv
+}
+
 // memcacheKey converts an arbitrary blockpack cache key into a valid
 // memcache key (SHA-256 hex, always 64 chars, no spaces or control chars).
 func memcacheKey(key string) string {
@@ -117,10 +157,17 @@ func (m *MemCache) Get(key string) ([]byte, bool, error) {
 	if m == nil {
 		return nil, false, nil
 	}
+	var start time.Time
+	if m.durGetHit != nil {
+		start = time.Now()
+	}
 	item, err := m.c.Get(memcacheKey(key))
 	if errors.Is(err, gomemcache.ErrCacheMiss) {
 		if m.requests != nil {
 			m.requests.WithLabelValues("remote", "miss").Inc()
+		}
+		if m.durGetMiss != nil {
+			m.durGetMiss.Observe(time.Since(start).Seconds())
 		}
 		return nil, false, nil
 	}
@@ -140,6 +187,9 @@ func (m *MemCache) Get(key string) ([]byte, bool, error) {
 	if m.bytes != nil {
 		m.bytes.WithLabelValues("remote").Add(float64(len(out)))
 	}
+	if m.durGetHit != nil {
+		m.durGetHit.Observe(time.Since(start).Seconds())
+	}
 	return out, true, nil
 }
 
@@ -150,11 +200,18 @@ func (m *MemCache) Put(key string, value []byte) error {
 	if m == nil {
 		return nil
 	}
+	var start time.Time
+	if m.durPutOk != nil {
+		start = time.Now()
+	}
 	_ = m.c.Set(&gomemcache.Item{
 		Key:        memcacheKey(key),
 		Value:      value,
 		Expiration: m.expiration,
 	})
+	if m.durPutOk != nil {
+		m.durPutOk.Observe(time.Since(start).Seconds())
+	}
 	return nil
 }
 

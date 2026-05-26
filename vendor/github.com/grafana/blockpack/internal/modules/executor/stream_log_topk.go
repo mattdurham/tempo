@@ -484,7 +484,8 @@ func logTopKScan(
 	buf *logTopKHeap,
 	backward bool,
 ) (int, int, int64, error) {
-	return iterateLogRows(r, program, wantColumns, pipeline, opts, plan,
+	return iterateLogRows(
+		r, program, wantColumns, pipeline, opts, plan,
 		func(meta shared.BlockMeta) bool {
 			return logTopKCanSkipBlock(buf, opts.Limit, backward, meta)
 		},
@@ -516,7 +517,8 @@ func logCollectAll(
 	plan *queryplanner.Plan,
 	all *[]LogEntry,
 ) (int, int, int64, error) {
-	return iterateLogRows(r, program, wantColumns, pipeline, opts, plan,
+	return iterateLogRows(
+		r, program, wantColumns, pipeline, opts, plan,
 		nil, // no block-level skip for collect-all
 		nil, // no per-row skip for collect-all
 		func(_ uint64, entry LogEntry) bool {

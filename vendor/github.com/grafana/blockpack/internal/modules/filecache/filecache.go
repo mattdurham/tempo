@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/singleflight"
@@ -72,11 +73,16 @@ type FileCache struct {
 	bytes     *prometheus.CounterVec
 	evictions *prometheus.CounterVec
 	errs      *prometheus.CounterVec
-	dir       string
-	maxBytes  int64
-	curBytes  int64
-	seq       uint64 // monotonic insertion counter for FIFO ordering
-	mu        sync.Mutex
+	// Pre-resolved histogram observers for 0-alloc hot path.
+	// Each is nil when Registerer is not configured.
+	durGetHit  prometheus.Observer
+	durGetMiss prometheus.Observer
+	durPutOk   prometheus.Observer
+	dir        string
+	maxBytes   int64
+	curBytes   int64
+	seq        uint64 // monotonic insertion counter for FIFO ordering
+	mu         sync.Mutex
 }
 
 // Open opens (or creates) a FileCache rooted at cfg.Path.
@@ -119,6 +125,20 @@ func Open(cfg Config) (*FileCache, error) {
 			Name: "blockpack_cache_errors_total",
 			Help: "Total number of cache errors by tier.",
 		}, []string{"tier"}))
+		h := filecacheRegisterOrReuseHistogram(cfg.Registerer, prometheus.NewHistogramVec(
+			prometheus.HistogramOpts{
+				Name:                            "blockpack_cache_operation_duration_seconds",
+				Help:                            "Duration of cache Get and Put operations by tier, operation, and result.",
+				NativeHistogramBucketFactor:     1.1,
+				NativeHistogramMaxBucketNumber:  100,
+				NativeHistogramMinResetDuration: 15 * time.Minute,
+			},
+			[]string{"tier", "operation", "result"},
+		))
+		// Pre-resolve label combinations for 0-alloc hot path.
+		c.durGetHit = h.WithLabelValues("disk", "get", "hit")
+		c.durGetMiss = h.WithLabelValues("disk", "get", "miss")
+		c.durPutOk = h.WithLabelValues("disk", "put", "ok")
 	}
 
 	// Rebuild in-memory index by walking existing cache files.
@@ -144,6 +164,26 @@ func filecacheRegisterOrReuse(reg prometheus.Registerer, cv *prometheus.CounterV
 		}
 	}
 	return cv
+}
+
+// filecacheRegisterOrReuseHistogram registers a HistogramVec with the given Registerer.
+// If the metric is already registered (AlreadyRegisteredError), it returns the
+// previously registered collector instead of panicking.
+func filecacheRegisterOrReuseHistogram(
+	reg prometheus.Registerer,
+	hv *prometheus.HistogramVec,
+) *prometheus.HistogramVec {
+	err := reg.Register(hv)
+	if err == nil {
+		return hv
+	}
+	var are prometheus.AlreadyRegisteredError
+	if errors.As(err, &are) {
+		if existing, ok := are.ExistingCollector.(*prometheus.HistogramVec); ok {
+			return existing
+		}
+	}
+	return hv
 }
 
 // loadCandidate is a transient struct used during load to collect entries before
@@ -252,12 +292,20 @@ func (c *FileCache) Get(key string) ([]byte, bool, error) {
 		return nil, false, nil
 	}
 
+	var start time.Time
+	if c.durGetHit != nil {
+		start = time.Now()
+	}
+
 	c.mu.Lock()
 	e, ok := c.index[key]
 	c.mu.Unlock()
 	if !ok {
 		if c.requests != nil {
 			c.requests.WithLabelValues("disk", "miss").Inc()
+		}
+		if c.durGetMiss != nil {
+			c.durGetMiss.Observe(time.Since(start).Seconds())
 		}
 		return nil, false, nil
 	}
@@ -282,6 +330,9 @@ func (c *FileCache) Get(key string) ([]byte, bool, error) {
 		if c.errs != nil {
 			c.errs.WithLabelValues("disk").Inc()
 		}
+		if c.durGetMiss != nil {
+			c.durGetMiss.Observe(time.Since(start).Seconds())
+		}
 		return nil, false, nil
 	}
 	if c.requests != nil {
@@ -289,6 +340,9 @@ func (c *FileCache) Get(key string) ([]byte, bool, error) {
 	}
 	if c.bytes != nil {
 		c.bytes.WithLabelValues("disk").Add(float64(len(val)))
+	}
+	if c.durGetHit != nil {
+		c.durGetHit.Observe(time.Since(start).Seconds())
 	}
 	return val, true, nil
 }
@@ -302,6 +356,11 @@ func (c *FileCache) Get(key string) ([]byte, bool, error) {
 func (c *FileCache) Put(key string, value []byte) error {
 	if c == nil {
 		return nil
+	}
+
+	var start time.Time
+	if c.durPutOk != nil {
+		start = time.Now()
 	}
 
 	needed := int64(len(key) + len(value))
@@ -346,6 +405,9 @@ func (c *FileCache) Put(key string, value []byte) error {
 	c.seq++
 	c.index[key] = &entry{filename: filename, key: key, size: needed, order: c.seq}
 	c.curBytes += needed
+	if c.durPutOk != nil {
+		c.durPutOk.Observe(time.Since(start).Seconds())
+	}
 	return nil
 }
 
@@ -457,7 +519,7 @@ func (c *FileCache) pathFor(key string) string {
 // Using os.CreateTemp (rather than a deterministic "<path>.tmp") avoids a race
 // where two goroutines writing the same key would clobber each other's temp file.
 // Format: [4B magic][4B keyLen LE][key][value]
-func writeFile(path string, key string, value []byte) error {
+func writeFile(path, key string, value []byte) error {
 	// Enforce the same key-length constraint that readFileHeader validates,
 	// so entries written now won't be rejected as corrupt on the next restart.
 	if len(key) == 0 || len(key) > maxCacheKeyLen {

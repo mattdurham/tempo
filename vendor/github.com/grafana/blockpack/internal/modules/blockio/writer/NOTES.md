@@ -324,3 +324,58 @@ overlap path. This applies to all range column types: RangeInt64, RangeUint64,
 RangeFloat64, RangeString.
 
 Back-ref: `internal/modules/blockio/writer/range_index.go:tryApplyExactValues`
+
+---
+
+## NOTE-39: encodeXORBytesIntrinsic — XOR Encoding for Large Bytes Intrinsic Columns
+*Added: 2026-04-22*
+
+**Decision:** `encodeColumn` now dispatches to `encodeXORBytesIntrinsic` when
+`len(c.bytesValues) > 0` (i.e., the column is a bytes type with > IntrinsicPageSize rows).
+
+**Rationale:** See shared/NOTES.md NOTE-013. The paged flat path produced 2× inflation for
+random-byte IDs. `encodeXORBytesIntrinsic` collapses all 226 snappy calls into one.
+
+**`xorBytesLen` reuse:** The `xorBytesLen` helper (encoding_xor.go:73) is called directly.
+It is already in the `writer` package. No duplication. `xorBytesLen` (not `xorBytes`) is
+required because it always produces exactly `len(a)` bytes, making `xor_data_len`
+self-describing at decode time. Using `xorBytes` instead would produce `max(len(a),len(b))`
+bytes, breaking the decoder's assumption that `xor_data_len == original value length`.
+
+**Non-paged bytes path unchanged:** Small bytes columns (≤ IntrinsicPageSize rows) continue
+to use `encodeFlatColumn`. The compression ratio problem only manifests at scale (> 1 page).
+
+Back-ref: `internal/modules/blockio/writer/intrinsic_accum.go:encodeXORBytesIntrinsic`,
+          `internal/modules/blockio/writer/intrinsic_accum.go:encodeColumn`
+
+---
+
+## NOTE-V8-002: writeV8Sections — per-column blobs and unified ToC
+
+**Context:** `Flush()` unconditionally calls `writeV8Sections()`. V8 replaces the monolithic
+`SectionRangeIndex` and `SectionSketchIndex` blobs with per-column blobs — one ToCEntry per
+column per section type.
+
+**Per-column range blobs:** `writeOneColumnRangeBlob(cd)` serializes one column's range data
+without the `col_name_len[2]+col_name` prefix present in the V14 monolithic range section.
+The blob starts at `col_type[1]` followed by bucket metadata and value entries.
+Returns nil if `cd.values` is empty (column has no bucket entries — not indexed).
+
+**Per-column sketch blobs:** `writeOneColumnSketchBlob(colName, sketchIdx)` writes a
+self-contained blob: `num_blocks[4]+presence[ceil(n/8)]+distinct[n*4]+topk+bloom`.
+The `num_blocks[4]` prefix makes the blob self-describing — the reader does not need
+global state to decode presence bits.
+
+**Intrinsic blobs (already compressed):** Intrinsic blobs from `intrinsicAccum.encodeColumn()`
+are already snappy-compressed. They are written directly to disk (NOT passed through
+`writeToCEntry` which would double-compress). The corresponding ToCEntries record their
+offsets directly. `fetchToCSection` calls `decodeBoundedSnappy` on fetch, so on-disk
+blobs must be snappy-compressed exactly once.
+
+**V8 is unconditional:** All files are written with V8 footer and per-column ToCEntries.
+There is no fallback to V7 footer or monolithic section layout.
+
+Back-ref: `internal/modules/blockio/writer/writer.go:writeV8Sections`,
+          `internal/modules/blockio/writer/metadata.go:writeFooterV8`,
+          `internal/modules/blockio/writer/metadata.go:writeOneColumnRangeBlob`,
+          `internal/modules/blockio/writer/sketch_index.go:writeOneColumnSketchBlob`

@@ -12,7 +12,7 @@ import (
 // Falls back to intrinsic section lookup maps when block columns are absent
 // (intrinsic-only storage after dual-storage removal).
 func extractIDs(
-	block *modules_reader.Block, rowIdx int, blockIdx int,
+	block *modules_reader.Block, rowIdx, blockIdx int,
 	traceIDByRef, spanIDByRef map[uint32][]byte,
 ) (traceID, spanID string) {
 	if block != nil {

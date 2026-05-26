@@ -12,9 +12,9 @@ import (
 	"sync"
 
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
-	"github.com/grafana/blockpack/internal/modules/filecache"
 	"github.com/grafana/blockpack/internal/modules/queryplanner"
 	"github.com/grafana/blockpack/internal/modules/rw"
+	"github.com/grafana/blockpack/internal/modules/sectioncache"
 )
 
 // footerRaw holds the raw footer fields while readFooter is executing.
@@ -70,14 +70,10 @@ type Reader struct {
 	provider rw.ReaderProvider
 	// vectorIndexErr holds any error from lazy vector index parsing.
 	vectorIndexErr error
-	// cache is the cache used for footer/header/metadata/block reads.
-	// Never nil: defaults to filecache.NopCache when no cache is configured.
-	cache filecache.Cache
-
-	// sectionDir holds the decoded V14 section directory.
-	// Populated by readSectionDirectory() during NewReaderFromProvider for V14 files.
-	// Both maps are nil for V3/V4/V5/V6 footer files.
-	sectionDir shared.SectionDirectory
+	// cache is the typed cache used for footer/header/metadata/block reads.
+	// Never nil: defaults to sectioncache.NopSectionCache when no cache is configured.
+	// Assigned directly from Options.Cache; nil is normalized to NopSectionCache.
+	cache sectioncache.SectionCache
 
 	// v14 lazy section errors — set inside the corresponding sync.Once.Do and read after.
 	v14RangeErr  error
@@ -85,6 +81,13 @@ type Reader struct {
 	v14TSErr     error
 	v14SketchErr error
 	v14BloomErr  error
+
+	v8TraceErr error
+	v8TSErr    error
+	v8BloomErr error
+
+	// compactParsedErr holds any error from compactParsedOnce initialization.
+	compactParsedErr error
 
 	traceIndex map[[16]byte][]uint16
 
@@ -122,6 +125,15 @@ type Reader struct {
 
 	// vectorIndexParsed is the lazily parsed VectorIndex. Access via VectorIndex().
 	vectorIndexParsed *VectorIndex
+
+	// tocMap is the decoded unified ToC for V8 files.
+	// Nil for V7/V6/V5/V4/V3 footer files.
+	tocMap map[shared.ToCKey]shared.ToCEntry
+
+	// sectionDir holds the V14 section directory for legacy V14 files.
+	// Always zero-valued for V8 files (V8 uses tocMap instead).
+	// Kept for use by readV14Section, which is called from ensureV14* closures.
+	sectionDir shared.SectionDirectory
 
 	fileID string
 
@@ -175,9 +187,14 @@ type Reader struct {
 	// Both are 0 for v3/v4 footer files or files with no vector index section.
 	vectorIndexOffset uint64
 
-	// V7 footer fields (FooterV7Version = 7, V14 section-directory files only).
-	// v7DirOffset and v7DirLen point to the snappy-compressed section directory.
-	v7DirOffset uint64
+	// V8 footer fields (FooterV8Version = 8, unified ToC files only).
+	// v8ToCOffset and v8ToCLen point to the snappy-compressed unified ToC blob.
+	v8ToCOffset uint64
+
+	// V8 lazy section errors and sync.Once guards (mirror of v14 ones).
+	v8TraceOnce sync.Once
+	v8TSOnce    sync.Once
+	v8BloomOnce sync.Once
 
 	fileBloomOnce sync.Once
 
@@ -194,6 +211,17 @@ type Reader struct {
 	v14SketchOnce sync.Once
 	v14BloomOnce  sync.Once
 
+	// traceIndexOnce guards initialization of r.traceIndex from r.traceIndexRaw.
+	// SPEC-ROOT-001: prevents concurrent map write (r.traceIndex) from causing a fatal panic.
+	traceIndexOnce sync.Once
+
+	// compactParsedOnce guards initialization of r.compactParsed for non-V14 compact index files.
+	// SPEC-ROOT-001: prevents concurrent assignment to r.compactParsed.
+	compactParsedOnce sync.Once
+
+	// sketchIdxMu guards concurrent V8 per-column sketch fetches.
+	sketchIdxMu sync.Mutex
+
 	compactLen uint32
 
 	// compactTracesLen is parsed from the v6 footer; see compactTracesOffset.
@@ -204,7 +232,7 @@ type Reader struct {
 	// vectorIndexLen is parsed from the agentic v5 footer.
 	vectorIndexLen uint32
 
-	v7DirLen uint32
+	v8ToCLen uint32
 
 	footerVersion uint16
 	fileVersion   uint8
@@ -232,13 +260,13 @@ func NewReaderFromProviderWithOptions(provider rw.ReaderProvider, opts Options) 
 		return nil, fmt.Errorf("NewReaderFromProvider: Size: %w", err)
 	}
 
-	cache := opts.Cache
-	if cache == nil {
-		cache = filecache.NopCache
+	sc := opts.Cache
+	if sc == nil {
+		sc = sectioncache.NopSectionCache
 	}
 	r := &Reader{
 		provider: provider,
-		cache:    cache,
+		cache:    sc,
 		fileID:   opts.FileID,
 		fileSize: size,
 	}
@@ -247,14 +275,9 @@ func NewReaderFromProviderWithOptions(provider rw.ReaderProvider, opts Options) 
 		return nil, fmt.Errorf("NewReaderFromProvider: %w", err)
 	}
 
-	if r.footerVersion == shared.FooterV7Version {
-		// V14 file: read section directory + parse sections from it.
-		r.sectionDir, err = r.readSectionDirectory()
-		if err != nil {
-			return nil, fmt.Errorf("NewReaderFromProvider: section directory: %w", err)
-		}
-		if err = r.parseSectionsLazyV14(); err != nil {
-			return nil, fmt.Errorf("NewReaderFromProvider: %w", err)
+	if r.footerVersion == shared.FooterV8Version {
+		if err = r.parseSectionsV8(); err != nil {
+			return nil, fmt.Errorf("NewReaderFromProvider: V8 sections: %w", err)
 		}
 		return r, nil
 	}
@@ -294,13 +317,13 @@ func NewLeanReaderFromProviderWithOptions(provider rw.ReaderProvider, opts Optio
 		return nil, fmt.Errorf("NewLeanReaderFromProvider: Size: %w", err)
 	}
 
-	leanCache := opts.Cache
-	if leanCache == nil {
-		leanCache = filecache.NopCache
+	sc := opts.Cache
+	if sc == nil {
+		sc = sectioncache.NopSectionCache
 	}
 	r := &Reader{
 		provider: provider,
-		cache:    leanCache,
+		cache:    sc,
 		fileID:   opts.FileID,
 		fileSize: size,
 	}
@@ -310,16 +333,10 @@ func NewLeanReaderFromProviderWithOptions(provider rw.ReaderProvider, opts Optio
 		return nil, fmt.Errorf("NewLeanReaderFromProvider: footer: %w", err)
 	}
 
-	// NOTE-M-16: V14 files (FooterV7Version) use a section directory rather than the legacy
-	// 22-byte file header, so readHeader() is skipped. The enc_version field inside each V14
-	// column blob is validated lazily at first block decode — see readColumnEncoding in column.go.
-	if r.footerVersion == shared.FooterV7Version {
-		r.sectionDir, err = r.readSectionDirectory()
-		if err != nil {
-			return nil, fmt.Errorf("NewLeanReaderFromProvider: section directory: %w", err)
-		}
-		if err = r.parseSectionsLazyV14(); err != nil {
-			return nil, fmt.Errorf("NewLeanReaderFromProvider: %w", err)
+	// V8 files use a unified ToC.
+	if r.footerVersion == shared.FooterV8Version {
+		if err = r.parseSectionsV8(); err != nil {
+			return nil, fmt.Errorf("NewLeanReaderFromProvider: V8 sections: %w", err)
 		}
 		return r, nil
 	}
@@ -366,15 +383,18 @@ func (r *Reader) TraceCount() int {
 
 // ensureTraceIndex parses the trace block index from raw bytes if not yet parsed.
 // No-op if already parsed or no raw bytes are available.
+// SPEC-ROOT-001: guarded by traceIndexOnce to prevent concurrent map write panics.
 func (r *Reader) ensureTraceIndex() {
-	if r.traceIndex != nil || len(r.traceIndexRaw) == 0 {
-		return
-	}
-	idx, _, err := parseTraceBlockIndex(r.traceIndexRaw)
-	if err == nil {
-		r.traceIndex = idx
-	}
-	r.traceIndexRaw = nil // free raw bytes after parsing
+	r.traceIndexOnce.Do(func() {
+		if len(r.traceIndexRaw) == 0 {
+			return
+		}
+		idx, _, err := parseTraceBlockIndex(r.traceIndexRaw)
+		if err == nil {
+			r.traceIndex = idx
+		}
+		r.traceIndexRaw = nil // free raw bytes after parsing
+	})
 }
 
 // SignalType returns the signal type stored in the file header.
@@ -395,6 +415,45 @@ func (r *Reader) BlockMeta(blockIdx int) shared.BlockMeta {
 // no sketch section was written or the column was not sketched.
 // Implements queryplanner.BlockIndexer.
 func (r *Reader) ColumnSketch(col string) queryplanner.ColumnSketch {
+	if r.footerVersion == shared.FooterV8Version {
+		// Check in-memory cache first (no lock needed for read-only check when nil is ok).
+		r.sketchIdxMu.Lock()
+		if r.sketchIdx != nil {
+			if cd := r.sketchIdx.columns[col]; cd != nil {
+				r.sketchIdxMu.Unlock()
+				return cd
+			}
+		}
+		r.sketchIdxMu.Unlock()
+
+		// Fetch per-column blob from ToC.
+		data, err := r.fetchToCSection(shared.ToCKey{
+			Type:    shared.ToCTypeMetadata,
+			SubType: shared.ToCSubTypeSketch,
+			Name:    col,
+		})
+		if err != nil || data == nil {
+			return nil
+		}
+		cd, parseErr := parseOneColumnSketchBlob(data)
+		if parseErr != nil || cd == nil {
+			return nil
+		}
+		// Store in sketch cache.
+		r.sketchIdxMu.Lock()
+		if r.sketchIdx == nil {
+			r.sketchIdx = &sketchIndex{
+				numBlocks: r.BlockCount(),
+				columns:   make(map[string]*columnSketchData),
+			}
+		}
+		if r.sketchIdx.columns[col] == nil {
+			r.sketchIdx.columns[col] = cd
+		}
+		r.sketchIdxMu.Unlock()
+		return cd
+	}
+
 	_ = r.ensureV14SketchSection()
 	if r.sketchIdx == nil {
 		return nil
@@ -509,16 +568,28 @@ func (r *Reader) BlocksForRangeInterval(
 // ColumnNames returns all column names known to this reader — the union of
 // range-indexed columns (rangeOffsets) and sketch columns (sketchIdx).
 func (r *Reader) ColumnNames() []string {
-	// Ensure both V14 lazy sections are loaded before scanning.
-	_ = r.ensureV14RangeSection()
-	_ = r.ensureV14SketchSection()
 	seen := make(map[string]struct{})
-	for col := range r.rangeOffsets {
-		seen[col] = struct{}{}
-	}
-	if r.sketchIdx != nil {
-		for col := range r.sketchIdx.columns {
+
+	if r.footerVersion == shared.FooterV8Version {
+		// V8: column names are in tocMap as ToCTypeMetadata entries with Name set.
+		for key := range r.tocMap {
+			if key.Type == shared.ToCTypeMetadata &&
+				(key.SubType == shared.ToCSubTypeRange || key.SubType == shared.ToCSubTypeSketch) &&
+				key.Name != "" {
+				seen[key.Name] = struct{}{}
+			}
+		}
+	} else {
+		// V14 and older: load lazy sections then scan rangeOffsets + sketchIdx.
+		_ = r.ensureV14RangeSection()
+		_ = r.ensureV14SketchSection()
+		for col := range r.rangeOffsets {
 			seen[col] = struct{}{}
+		}
+		if r.sketchIdx != nil {
+			for col := range r.sketchIdx.columns {
+				seen[col] = struct{}{}
+			}
 		}
 	}
 	out := make([]string, 0, len(seen))
@@ -531,6 +602,16 @@ func (r *Reader) ColumnNames() []string {
 
 // RangeColumnType returns the ColumnType for a range-indexed column, if it exists.
 func (r *Reader) RangeColumnType(colName string) (shared.ColumnType, bool) {
+	// V8: per-column blobs; try parsing to get the type.
+	if r.footerVersion == shared.FooterV8Version {
+		if err := r.ensureRangeColumnParsed(colName); err != nil {
+			return 0, false
+		}
+		if idx, ok := r.rangeParsed[colName]; ok {
+			return idx.colType, true
+		}
+		return 0, false
+	}
 	_ = r.ensureV14RangeSection()
 	meta, ok := r.rangeOffsets[colName]
 	if !ok {
@@ -636,7 +717,7 @@ func (r *Reader) ReadGroup(cr shared.CoalescedRead) (map[int][]byte, error) {
 	result := make(map[int][]byte, len(cr.BlockIDs))
 	allHit := true
 	for _, blockID := range cr.BlockIDs {
-		val, ok, err := r.cache.Get(fmt.Sprintf("%s/block/%d", r.fileID, blockID))
+		val, ok, err := r.cache.GetBlockColumns(r.fileID, blockID)
 		if err != nil {
 			return nil, fmt.Errorf("ReadGroup: cache get block %d: %w", blockID, err)
 		}
@@ -656,7 +737,7 @@ func (r *Reader) ReadGroup(cr shared.CoalescedRead) (map[int][]byte, error) {
 		return nil, err
 	}
 	for blockID, data := range fetched {
-		_ = r.cache.Put(fmt.Sprintf("%s/block/%d", r.fileID, blockID), data)
+		_ = r.cache.CacheBlockColumns(r.fileID, blockID, data) // cache write failure is non-fatal
 		result[blockID] = data
 	}
 	return result, nil
