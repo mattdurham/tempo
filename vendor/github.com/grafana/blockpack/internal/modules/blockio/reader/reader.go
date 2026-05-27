@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
-	"reflect"
 	"slices"
 	"sort"
 	"sync"
@@ -19,6 +18,11 @@ import (
 )
 
 // footerRaw holds the raw footer fields while readFooter is executing.
+type footerRaw struct {
+	headerOffset  uint64
+	compactOffset uint64
+	compactLen    uint32
+}
 
 // compactTraceIndex holds the parsed compact trace index section.
 // NOTE-PERF-COMPACT: traceIndexRaw stores the raw trace-index bytes in-place (a sub-slice of the
@@ -38,23 +42,28 @@ import (
 // V14 stores the compact section as a single snappy-compressed blob, so a direct range read is
 // not available — the full blob must be fetched, split, and the trace index portion extracted.
 // ensureTraceIndexRaw uses isV14TraceSection to select the correct fetch path.
+type compactTraceIndex struct {
+	// traceIndexFetchErr holds any error from the lazy fetch so callers can surface it.
+	traceIndexFetchErr error
+	traceIndexRaw      []byte // raw trace-index bytes; scanned in-place by scanTraceIndexRaw
+	blockTable         []compactBlockEntry
+	traceIDBloom       []byte // nil for version-1 compact indexes (no bloom); vacuous true on lookup
 
-// traceIndexFetchErr holds any error from the lazy fetch so callers can surface it.
+	// traceIndexOffset and traceIndexLen locate the trace-index bytes within the file.
+	// Used by ensureTraceIndexRaw to lazily fetch them on first bloom hit.
+	// Both are zero when traceIndexRaw is already populated (full compact read path).
+	traceIndexOffset uint64
+	traceIndexLen    uint64
 
-// raw trace-index bytes; scanned in-place by scanTraceIndexRaw
+	// isV14TraceSection signals that this compactTraceIndex was populated from a V14 file's
+	// SectionTraceIndex compact blob (via parseCompactIndexBytesV14Header). When true,
+	// ensureTraceIndexRaw re-reads the full V14 section and extracts the trace index bytes
+	// via splitV14CompactSection, instead of using traceIndexOffset/traceIndexLen.
+	isV14TraceSection bool
 
-// nil for version-1 compact indexes (no bloom); vacuous true on lookup
-
-// traceIndexOffset and traceIndexLen locate the trace-index bytes within the file.
-// Used by ensureTraceIndexRaw to lazily fetch them on first bloom hit.
-// Both are zero when traceIndexRaw is already populated (full compact read path).
-
-// isV14TraceSection signals that this compactTraceIndex was populated from a V14 file's
-// SectionTraceIndex compact blob (via parseCompactIndexBytesV14Header). When true,
-// ensureTraceIndexRaw re-reads the full V14 section and extracts the trace index bytes
-// via splitV14CompactSection, instead of using traceIndexOffset/traceIndexLen.
-
-// traceIndexOnce guards the lazy fetch of traceIndexRaw.
+	// traceIndexOnce guards the lazy fetch of traceIndexRaw.
+	traceIndexOnce sync.Once
+}
 
 // Reader reads and decodes a blockpack file.
 type Reader struct {
@@ -253,7 +262,7 @@ func NewReaderFromProviderWithOptions(provider rw.ReaderProvider, opts Options) 
 	}
 
 	sc := opts.Cache
-	if sc == nil || reflect.ValueOf(sc).IsNil() {
+	if sc == nil {
 		sc = sectioncache.NopSectionCache
 	}
 	r := &Reader{
@@ -310,7 +319,7 @@ func NewLeanReaderFromProviderWithOptions(provider rw.ReaderProvider, opts Optio
 	}
 
 	sc := opts.Cache
-	if sc == nil || reflect.ValueOf(sc).IsNil() {
+	if sc == nil {
 		sc = sectioncache.NopSectionCache
 	}
 	r := &Reader{
@@ -618,6 +627,14 @@ func (r *Reader) RangeColumnType(colName string) (shared.ColumnType, bool) {
 // typed boundary values. For RangeString, StringBounds holds them. For
 // RangeBytes, BytesBounds holds them. For numeric types (Int64/Uint64/Duration),
 // BucketMin/BucketMax are sufficient for file-level fast reject.
+type RangeBoundaries struct {
+	Float64Bounds []float64
+	StringBounds  []string
+	BytesBounds   [][]byte
+	BucketMin     int64
+	BucketMax     int64
+	ColType       shared.ColumnType
+}
 
 // RangeColumnBoundaries returns the parsed boundaries for a range-indexed column.
 // Returns nil if the column is not range-indexed or an error occurs during parsing.
@@ -773,6 +790,9 @@ func (r *Reader) HasTraceIndex() bool {
 }
 
 // TraceEntry is a single trace-block reference.
+type TraceEntry struct {
+	BlockID int
+}
 
 // TraceEntries returns the block IDs containing spans for the given trace ID.
 // Falls back to the compact trace index when the main index is empty (lean reader path).
