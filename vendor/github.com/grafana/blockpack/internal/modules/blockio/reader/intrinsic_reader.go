@@ -188,11 +188,15 @@ func (r *Reader) GetIntrinsicColumn(name string) (*shared.IntrinsicColumn, error
 		return nil, nil
 	}
 
+	// Fast path: check per-Reader cache under read lock.
+	r.intrinsicMu.RLock()
 	if r.intrinsicDecoded != nil {
 		if cached, ok := r.intrinsicDecoded[name]; ok {
+			r.intrinsicMu.RUnlock()
 			return cached, nil
 		}
 	}
+	r.intrinsicMu.RUnlock()
 
 	// Check process-level cache first — decoded IntrinsicColumn value fields are immutable
 	// once written; refIndex is a derived, concurrency-safe cache built under sync.Once, so
@@ -204,14 +208,17 @@ func (r *Reader) GetIntrinsicColumn(name string) (*shared.IntrinsicColumn, error
 	if useProcessCache {
 		procKey := r.fileID + "/intrinsic/" + name
 		if col := parsedIntrinsicCache.Get(procKey); col != nil {
+			r.intrinsicMu.Lock()
 			if r.intrinsicDecoded == nil {
 				r.intrinsicDecoded = make(map[string]*shared.IntrinsicColumn)
 			}
 			r.intrinsicDecoded[name] = col
+			r.intrinsicMu.Unlock()
 			return col, nil
 		}
 	}
 
+	// I/O and decoding done without holding the lock.
 	blob, err := r.cache.GetOrFetchIntrinsic(r.fileID, name, func() ([]byte, error) {
 		return r.readRange(meta.Offset, uint64(meta.Length), rw.DataTypeMetadata)
 	})
@@ -231,21 +238,31 @@ func (r *Reader) GetIntrinsicColumn(name string) (*shared.IntrinsicColumn, error
 		}
 	}
 
+	// Store under write lock. Double-check: another goroutine may have decoded it
+	// concurrently while we were doing I/O — prefer its result if present.
+	r.intrinsicMu.Lock()
 	if r.intrinsicDecoded == nil {
 		r.intrinsicDecoded = make(map[string]*shared.IntrinsicColumn)
+	} else if existing, ok := r.intrinsicDecoded[name]; ok {
+		r.intrinsicMu.Unlock()
+		return existing, nil
 	}
 	r.intrinsicDecoded[name] = col
+	r.intrinsicMu.Unlock()
 	return col, nil
 }
 
 // synthesizeSpanEnd builds a span:end intrinsic column from span:start + span:duration.
 // The result is cached like any other intrinsic column.
 func (r *Reader) synthesizeSpanEnd() (*shared.IntrinsicColumn, error) {
+	r.intrinsicMu.RLock()
 	if r.intrinsicDecoded != nil {
 		if cached, ok := r.intrinsicDecoded["span:end"]; ok {
+			r.intrinsicMu.RUnlock()
 			return cached, nil
 		}
 	}
+	r.intrinsicMu.RUnlock()
 
 	startCol, err := r.GetIntrinsicColumn("span:start")
 	if err != nil || startCol == nil {
@@ -288,10 +305,15 @@ func (r *Reader) synthesizeSpanEnd() (*shared.IntrinsicColumn, error) {
 	}
 	col.Count = uint32(len(col.BlockRefs)) //nolint:gosec
 
+	r.intrinsicMu.Lock()
 	if r.intrinsicDecoded == nil {
 		r.intrinsicDecoded = make(map[string]*shared.IntrinsicColumn)
+	} else if existing, ok := r.intrinsicDecoded["span:end"]; ok {
+		r.intrinsicMu.Unlock()
+		return existing, nil
 	}
 	r.intrinsicDecoded["span:end"] = col
+	r.intrinsicMu.Unlock()
 	return col, nil
 }
 
