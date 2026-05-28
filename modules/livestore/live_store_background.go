@@ -408,7 +408,13 @@ func (s *LiveStore) reloadBlocks() error {
 
 			blk, err := encoding.OpenBlock(meta, r)
 			if err != nil {
-				return fmt.Errorf("failed to open block %s in tenant %s: %w", id.String(), tenant, err)
+				// Unrecognized block version (e.g. from a previous deployment) — clear and continue
+				// rather than hard-failing startup, which prevents the live-store from ever coming up.
+				level.Warn(s.logger).Log("msg", "dropping unrecognized completed block during replay", "block", id.String(), "tenant", tenant, "err", err)
+				if clearErr := l.ClearBlock(id, tenant); clearErr != nil {
+					level.Error(s.logger).Log("msg", "failed to clear unrecognized block during replay", "block", id.String(), "err", clearErr)
+				}
+				continue
 			}
 
 			err = blk.Validate(ctx)
