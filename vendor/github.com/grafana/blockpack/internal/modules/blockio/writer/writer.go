@@ -483,6 +483,10 @@ func (w *Writer) Flush() (int64, error) {
 	// Reset intrinsic accumulator for reuse.
 	w.intrinsicAccum = newIntrinsicAccumulator()
 
+	// Clear addRowIntrinsicCache to release *reader.Reader pointers pinned as map keys.
+	// Without this, every Reader used via AddRowFromReader survives across Flush cycles.
+	w.addRowIntrinsicCache = nil
+
 	// Reset file-level bloom service names.
 	for k := range w.fileBloomSvcNames {
 		delete(w.fileBloomSvcNames, k)
@@ -953,10 +957,8 @@ func (w *Writer) AddRowFromReader(block *reader.Block, rowIdx int, srcReader *re
 	}
 	if len(traceBytes) != 16 && srcReader != nil {
 		idx := w.getOrBuildAddRowIndex(srcReader, srcBlockIdx)
-		if idx != nil {
-			if v, ok := idx[uint16(rowIdx)]["trace:id"]; ok { //nolint:gosec // rowIdx bounded by SpanCount (≤65535)
-				traceBytes, _ = v.([]byte)
-			}
+		if idx != nil && rowIdx < idx.rowCount && idx.traceID != nil {
+			traceBytes = idx.traceID[rowIdx]
 		}
 	}
 	if len(traceBytes) != 16 {
@@ -973,10 +975,8 @@ func (w *Writer) AddRowFromReader(block *reader.Block, rowIdx int, srcReader *re
 	}
 	if svcName == "" && srcReader != nil {
 		idx := w.getOrBuildAddRowIndex(srcReader, srcBlockIdx)
-		if idx != nil {
-			if v, ok := idx[uint16(rowIdx)][svcNameColumnName]; ok { //nolint:gosec // rowIdx bounded by SpanCount (≤65535)
-				svcName, _ = v.(string)
-			}
+		if idx != nil && rowIdx < idx.rowCount && idx.svcName != nil {
+			svcName = idx.svcName[rowIdx]
 		}
 	}
 
