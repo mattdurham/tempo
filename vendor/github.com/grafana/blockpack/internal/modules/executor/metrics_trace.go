@@ -212,13 +212,11 @@ func ExecuteTraceMetrics(
 				provider := newBlockColumnProvider(bwb.Block)
 				rowSet, evalErr := program.ColumnPredicate(provider)
 				if evalErr != nil {
-					releaseBlockColumnProvider(provider)
 					modules_reader.ReleaseInternMap(internPtr)
 					return fmt.Errorf("ColumnPredicate block %d: %w", blockIdx, evalErr)
 				}
 
 				if rowSet.Size() == 0 {
-					releaseBlockColumnProvider(provider)
 					modules_reader.ReleaseInternMap(internPtr)
 					continue
 				}
@@ -231,7 +229,6 @@ func ExecuteTraceMetrics(
 					// provider was used above; bwb is safe to reassign — provider must not be used after this point
 					bwb, parseErr = r.ParseBlockFromBytesReusing(bwb.RawBytes, outputCols, meta, intern, bwb.Block)
 					if parseErr != nil {
-						releaseBlockColumnProvider(provider)
 						modules_reader.ReleaseInternMap(internPtr)
 						return fmt.Errorf("ParseBlockFromBytes (second pass) block %d: %w", blockIdx, parseErr)
 					}
@@ -246,7 +243,6 @@ func ExecuteTraceMetrics(
 				for _, rowIdx := range rowSet.ToSlice() {
 					traceAccumulateRow(r, blockIdx, bwb.Block, rowIdx, querySpec, buckets, attrVals)
 				}
-				releaseBlockColumnProvider(provider)
 				// NOTE-108: release after all lazy decodes in traceAccumulateRow are complete.
 				modules_reader.ReleaseInternMap(internPtr)
 			}

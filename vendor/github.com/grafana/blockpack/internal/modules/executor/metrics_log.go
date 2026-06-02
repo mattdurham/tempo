@@ -137,13 +137,11 @@ func ExecuteLogMetrics(
 				provider := newBlockColumnProvider(bwb.Block)
 				rowSet, evalErr := program.ColumnPredicate(provider)
 				if evalErr != nil {
-					releaseBlockColumnProvider(provider)
 					modules_reader.ReleaseInternMap(internPtr)
 					return fmt.Errorf("ColumnPredicate block %d: %w", blockIdx, evalErr)
 				}
 
 				if rowSet.Size() == 0 {
-					releaseBlockColumnProvider(provider)
 					modules_reader.ReleaseInternMap(internPtr)
 					continue
 				}
