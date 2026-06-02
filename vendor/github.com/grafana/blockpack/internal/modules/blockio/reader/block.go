@@ -369,9 +369,34 @@ type Block struct {
 	// BuildIterFields. When non-nil, IterateFields uses this slice directly — zero allocs.
 	// NOTE-049: see blockio/NOTES.md §49.
 	iterFields []ColIterEntry
-	meta       shared.BlockMeta
-	spanCount  int
+	// copySlice is the pre-computed full column copy slice, built by BuildCopySlice.
+	// NOTE-050: eliminates per-row map iteration in addRowFromBlock.
+	copySlice []ColumnCopyEntry
+	meta      shared.BlockMeta
+	spanCount int
 }
+
+// ColumnCopyEntry carries a column and its full key for use by addRowFromBlock.
+// NOTE-050: unlike ColIterEntry (name-deduplicated), ColumnCopyEntry preserves all
+// typed variants so the copy path can dispatch on both name and type.
+type ColumnCopyEntry struct {
+	Col *Column
+	Key shared.ColumnKey
+}
+
+// BuildCopySlice pre-computes the full column copy slice for use by addRowFromBlock.
+// Call after BuildIterFields. Includes ALL (Key, Col) pairs — no deduplication.
+func (b *Block) BuildCopySlice() {
+	entries := make([]ColumnCopyEntry, 0, len(b.columns))
+	for k, col := range b.columns {
+		entries = append(entries, ColumnCopyEntry{Key: k, Col: col})
+	}
+	b.copySlice = entries
+}
+
+// CopySlice returns the pre-computed full column copy slice built by BuildCopySlice.
+// Returns nil if BuildCopySlice has not been called — callers must fall back to Columns().
+func (b *Block) CopySlice() []ColumnCopyEntry { return b.copySlice }
 
 // newBlockForParsing creates a Block with an empty columns map, for use with AddColumnsToBlock.
 // Call buildNameIndex after all columns have been added.
