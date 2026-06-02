@@ -124,22 +124,31 @@ func ExecuteLogMetrics(
 				delete(groupRaw, blockIdx)
 
 				meta := r.BlockMeta(blockIdx)
-				bwb, parseErr := r.ParseBlockFromBytes(raw, wantColumns, meta)
+				// NOTE-109: pooled intern map — eliminates per-block make(map[string]string).
+				internPtr := modules_reader.AcquireInternMap()
+				// intern and *internPtr share the same backing map; intern is passed to ParseBlockFromBytesWithIntern below
+				intern := *internPtr
+				bwb, parseErr := r.ParseBlockFromBytesWithIntern(raw, wantColumns, meta, intern)
 				if parseErr != nil {
+					modules_reader.ReleaseInternMap(internPtr)
 					return fmt.Errorf("ParseBlockFromBytes block %d: %w", blockIdx, parseErr)
 				}
 
 				provider := newBlockColumnProvider(bwb.Block)
 				rowSet, evalErr := program.ColumnPredicate(provider)
 				if evalErr != nil {
+					releaseBlockColumnProvider(provider)
+					modules_reader.ReleaseInternMap(internPtr)
 					return fmt.Errorf("ColumnPredicate block %d: %w", blockIdx, evalErr)
 				}
 
 				if rowSet.Size() == 0 {
+					releaseBlockColumnProvider(provider)
+					modules_reader.ReleaseInternMap(internPtr)
 					continue
 				}
 
-				// NOTE-001: Columns registered by ParseBlockFromBytes hold compressed bytes only;
+				// reader/NOTE-001: Columns registered by ParseBlockFromBytesWithIntern hold compressed bytes only;
 				// no decode happens at registration. Full decode is deferred to first accessor call
 				// via ensureDecompressed() + decodeNow().
 
@@ -165,6 +174,8 @@ func ExecuteLogMetrics(
 						attrVals,
 					)
 				}
+				releaseBlockColumnProvider(provider)
+				modules_reader.ReleaseInternMap(internPtr) // NOTE-109: release after all lazy decodes
 			}
 			return nil
 		},

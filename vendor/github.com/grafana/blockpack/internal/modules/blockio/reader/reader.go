@@ -783,6 +783,23 @@ func (r *Reader) ParseBlockFromBytesWithIntern(
 	return &BlockWithBytes{Block: blk, RawBytes: rawBytes}, nil
 }
 
+// ParseBlockFromBytesReusing parses a Block from raw bytes using a caller-supplied
+// intern map and an optional prevBlock for column struct reuse.
+// NOTE-108: used by ExecuteTraceMetrics second-pass decode.
+func (r *Reader) ParseBlockFromBytesReusing(
+	rawBytes []byte,
+	wantColumns map[string]struct{},
+	meta shared.BlockMeta,
+	intern map[string]string,
+	prevBlock *Block,
+) (*BlockWithBytes, error) {
+	blk, err := parseBlockColumnsReuse(rawBytes, wantColumns, prevBlock, meta, intern)
+	if err != nil {
+		return nil, fmt.Errorf("ParseBlockFromBytesReusing: %w", err)
+	}
+	return &BlockWithBytes{Block: blk, RawBytes: rawBytes}, nil
+}
+
 // HasTraceIndex reports whether the reader has a populated trace block index.
 func (r *Reader) HasTraceIndex() bool {
 	r.ensureTraceIndex()

@@ -194,27 +194,45 @@ func ExecuteTraceMetrics(
 				delete(groupRaw, blockIdx)
 
 				meta := r.BlockMeta(blockIdx)
+
+				// NOTE-108: pooled intern map held alive through both parse passes and row loop.
+				// Lazy column decodes fire during traceAccumulateRow (rowSet.ToSlice() iteration)
+				// and reference the intern map. Release after all lazy decodes complete.
+				internPtr := modules_reader.AcquireInternMap()
+				// intern and *internPtr share the same backing map; intern is passed to ParseBlockFromBytesWithIntern below
+				intern := *internPtr
+
 				// First pass: decode predicate columns only.
-				bwb, parseErr := r.ParseBlockFromBytes(raw, predicateCols, meta)
+				bwb, parseErr := r.ParseBlockFromBytesWithIntern(raw, predicateCols, meta, intern)
 				if parseErr != nil {
+					modules_reader.ReleaseInternMap(internPtr)
 					return fmt.Errorf("ParseBlockFromBytes block %d: %w", blockIdx, parseErr)
 				}
 
 				provider := newBlockColumnProvider(bwb.Block)
 				rowSet, evalErr := program.ColumnPredicate(provider)
 				if evalErr != nil {
+					releaseBlockColumnProvider(provider)
+					modules_reader.ReleaseInternMap(internPtr)
 					return fmt.Errorf("ColumnPredicate block %d: %w", blockIdx, evalErr)
 				}
 
 				if rowSet.Size() == 0 {
+					releaseBlockColumnProvider(provider)
+					modules_reader.ReleaseInternMap(internPtr)
 					continue
 				}
 
 				// Second pass: decode metric output columns (span:start, aggregate field,
 				// GroupBy columns) only for blocks with matching rows. NOTE-018.
+				// NOTE-108: pass bwb.Block as prevBlock so parseBlockColumnsReuse reuses the
+				// column map allocation from the first pass instead of allocating a new one.
 				if predicateCols != nil {
-					bwb, parseErr = r.ParseBlockFromBytes(bwb.RawBytes, outputCols, meta)
+					// provider was used above; bwb is safe to reassign — provider must not be used after this point
+					bwb, parseErr = r.ParseBlockFromBytesReusing(bwb.RawBytes, outputCols, meta, intern, bwb.Block)
 					if parseErr != nil {
+						releaseBlockColumnProvider(provider)
+						modules_reader.ReleaseInternMap(internPtr)
 						return fmt.Errorf("ParseBlockFromBytes (second pass) block %d: %w", blockIdx, parseErr)
 					}
 				}
@@ -228,6 +246,9 @@ func ExecuteTraceMetrics(
 				for _, rowIdx := range rowSet.ToSlice() {
 					traceAccumulateRow(r, blockIdx, bwb.Block, rowIdx, querySpec, buckets, attrVals)
 				}
+				releaseBlockColumnProvider(provider)
+				// NOTE-108: release after all lazy decodes in traceAccumulateRow are complete.
+				modules_reader.ReleaseInternMap(internPtr)
 			}
 			return nil
 		},
