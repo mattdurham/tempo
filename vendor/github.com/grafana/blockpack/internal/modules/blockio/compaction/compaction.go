@@ -43,23 +43,25 @@ func buildDedupeIndex(r *modules_reader.Reader, blockIdx int) map[uint16]blockID
 		if err != nil || col == nil {
 			continue
 		}
+		// Dict-encoded intrinsic columns do not store BytesValues; identity columns (trace:id, span:id) use Flat/XORBytes only.
 		if col.Format != modules_shared.IntrinsicFormatFlat && col.Format != modules_shared.IntrinsicFormatXORBytes {
 			continue
 		}
-		for i, ref := range col.BlockRefs {
-			if int(ref.BlockIdx) != blockIdx {
+		// NOTE-038: BlockRefRange returns only entries for this block — O(log N) binary search
+		// to locate the slice, then O(N_in_block) linear walk. Replaces O(N_total) filter scan.
+		entries := col.BlockRefRange(uint16(blockIdx)) //nolint:gosec // blockIdx bounded by reader block count
+		for _, entry := range entries {
+			rowIdx := uint16(entry.Packed) //nolint:gosec // low 16 bits = rowIdx; Packed = blockIdx<<16|rowIdx
+			if entry.Pos < 0 || int(entry.Pos) >= len(col.BytesValues) {
 				continue
 			}
-			if i >= len(col.BytesValues) {
-				continue
-			}
-			entry := out[ref.RowIdx]
+			e := out[rowIdx]
 			if colName == "trace:id" {
-				entry.traceID = col.BytesValues[i]
+				e.traceID = col.BytesValues[entry.Pos]
 			} else {
-				entry.spanID = col.BytesValues[i]
+				e.spanID = col.BytesValues[entry.Pos]
 			}
-			out[ref.RowIdx] = entry
+			out[rowIdx] = e
 		}
 	}
 	return out
@@ -219,6 +221,17 @@ func (s *compactionState) processBlock(r *modules_reader.Reader, blockIdx int, b
 	// Build intrinsic ID index once per block; O(N) over intrinsic columns.
 	// dedupeKey uses this for O(1) per-row lookups instead of O(N) linear scans.
 	idIndex := buildDedupeIndex(r, blockIdx)
+
+	// NOTE-039: Pre-decode identity columns once before the row loop to eliminate per-row
+	// sync.Once.Do overhead in IsPresent. EnsureDecoded is idempotent (sync.Once);
+	// for v4 files where these columns don't exist in the block payload, this is a no-op.
+	if col := block.GetColumn("trace:id"); col != nil {
+		col.EnsureDecoded()
+	}
+	if col := block.GetColumn("span:id"); col != nil {
+		col.EnsureDecoded()
+	}
+
 	for rowIdx := range block.SpanCount() {
 		if err := s.addSpanFromBlock(r, blockIdx, block, rowIdx, idIndex); err != nil {
 			return fmt.Errorf("row %d: %w", rowIdx, err)
