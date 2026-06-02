@@ -172,7 +172,6 @@ func ExecuteLogMetrics(
 						attrVals,
 					)
 				}
-				releaseBlockColumnProvider(provider)
 				modules_reader.ReleaseInternMap(internPtr) // NOTE-109: release after all lazy decodes
 			}
 			return nil
