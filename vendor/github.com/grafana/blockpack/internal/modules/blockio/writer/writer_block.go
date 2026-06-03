@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math"
 	"slices"
+	"unsafe"
 
 	"github.com/golang/snappy"
 	tempotrace "github.com/grafana/tempo/pkg/tempopb/trace/v1"
@@ -107,10 +108,13 @@ type blockBuilder struct {
 // within a single block. The key encoding matches encodeRangeKey (8-byte LE for
 // numeric types, raw string/bytes for string/bytes types).
 type blockColMinMax struct {
-	colName string
-	minKey  string // encoded minimum value key for this block
-	maxKey  string // encoded maximum value key for this block
-	colType shared.ColumnType
+	colName   string
+	minKey    string // encoded minimum value key for this block
+	maxKey    string // encoded maximum value key for this block
+	numMinKey [8]byte
+	numMaxKey [8]byte
+	isNum     bool
+	colType   shared.ColumnType
 }
 
 // builtBlock holds the outputs of buildBlock: the serialized payload and all
@@ -213,11 +217,27 @@ func buildBlock(
 		}
 	}
 
+	// Pre-build per-srcBlock destination column slice to eliminate per-row map lookups.
+	// NOTE-40: mirrors the intrinsicIndexCache pre-build pattern above. Built in a single
+	// pre-pass loop so interleaved rows from multiple source blocks (after sortPending) each
+	// get an O(1) map lookup instead of a single-entry cache miss on every block boundary.
+	dstColsCache := make(map[*modules_reader.Block][]dstColEntry)
+	for i := range pending {
+		ps := &pending[i]
+		if ps.srcBlock == nil {
+			continue
+		}
+		b := ps.srcBlock
+		if _, ok := dstColsCache[b]; !ok {
+			dstColsCache[b] = buildDstCols(bb, b)
+		}
+	}
+
 	for rowIdx := range pending {
 		ps := &pending[rowIdx]
 		switch {
 		case ps.srcBlock != nil:
-			bb.addRowFromBlock(ps.srcBlock, ps.srcRowIdx, rowIdx)
+			bb.addRowFromBlock(ps.srcBlock, ps.srcRowIdx, rowIdx, dstColsCache[ps.srcBlock])
 			if ps.srcReader != nil {
 				k := readerBlockKey{ps.srcReader, ps.srcBlockIdx}
 				// feedIntrinsicsFromIndex is only needed for v4+ blocks that store
@@ -312,6 +332,52 @@ func (b *blockBuilder) addColumn(name string, typ shared.ColumnType) columnBuild
 	cb.prepare(b.spanHint)
 	b.columns[key] = cb
 	return cb
+}
+
+// dstColEntry pairs a source column with its pre-resolved destination columnBuilder.
+// Built once per source block by buildDstCols before the row loop in buildBlock.
+// NOTE-40: eliminates per-row b.columns map lookup for dynamic attribute columns.
+type dstColEntry struct {
+	cb       columnBuilder // nil when addColumn returned nil (type conflict — skip this column)
+	col      *modules_reader.Column
+	colKey   shared.ColumnKey
+	baseType shared.ColumnType
+}
+
+// buildDstCols pre-resolves destination columnBuilders for all dynamic attribute columns
+// in srcBlock. Called once per source block before the row loop in buildBlock.
+// NOTE-40: the returned slice is iterated per-row by addRowFromBlock, replacing the
+// per-row b.columns map lookup with a linear slice scan.
+//
+// Excluded from the returned slice:
+//   - Intrinsic columns (handled by named cases in addRowFromBlock's switch)
+//   - ColumnTypeVectorF32 (handled by addVectorPresent)
+func buildDstCols(b *blockBuilder, srcBlock *modules_reader.Block) []dstColEntry {
+	cols := srcBlock.Columns()
+	entries := make([]dstColEntry, 0, len(cols))
+	for colKey, col := range cols {
+		// Skip intrinsic columns — handled by named cases in addRowFromBlock.
+		switch colKey.Name {
+		case traceIDColumnName, spanIDColumnName, spanParentIDColumnName,
+			spanNameColumnName, spanKindColumnName, spanStartColumnName,
+			spanEndColumnName, spanDurationColumnName, spanStatusColumnName,
+			spanStatusMsgColumnName, svcNameColumnName:
+			continue
+		}
+		baseType := baseColumnType(colKey.Type)
+		// Skip vector columns — handled by addVectorPresent.
+		if baseType == shared.ColumnTypeVectorF32 {
+			continue
+		}
+		cb := b.addColumn(colKey.Name, baseType)
+		entries = append(entries, dstColEntry{
+			col:      col,
+			colKey:   colKey,
+			baseType: baseType,
+			cb:       cb,
+		})
+	}
+	return entries
 }
 
 // feedIntrinsicUint64 feeds a uint64 value to the intrinsic accumulator if present.
@@ -929,7 +995,10 @@ func (b *blockBuilder) applySpanStatus(col *modules_reader.Column, srcRowIdx, ds
 // This is the native columnar path used by the compaction writer — it bypasses
 // all OTLP proto objects, reading typed values directly from decoded columns and
 // writing them into the destination block via addPresent.
-func (b *blockBuilder) addRowFromBlock(srcBlock *modules_reader.Block, srcRowIdx, dstRowIdx int) {
+// dstCols is pre-built by buildDstCols before the row loop (NOTE-40).
+func (b *blockBuilder) addRowFromBlock(
+	srcBlock *modules_reader.Block, srcRowIdx, dstRowIdx int, dstCols []dstColEntry,
+) {
 	var traceID [16]byte
 	var spanStart, spanEnd uint64
 	traceIDFound := false
@@ -937,13 +1006,13 @@ func (b *blockBuilder) addRowFromBlock(srcBlock *modules_reader.Block, srcRowIdx
 	spanEndFound := false
 	durationFound := false
 
+	// Outer loop handles only intrinsic and vector columns. Dynamic attribute columns
+	// are handled exclusively by applyDynAttrCols below (NOTE-40). The IsPresent guard
+	// is intentionally omitted here: intrinsic apply* helpers check the value internally,
+	// and dynamic attrs are skipped via continue before any IsPresent call, eliminating
+	// the redundant double-IsPresent that previously existed when the outer loop ran
+	// IsPresent on every column including those later re-checked in applyDynAttrCols.
 	for colKey, col := range srcBlock.Columns() {
-		if !col.IsPresent(srcRowIdx) {
-			continue
-		}
-
-		baseType := baseColumnType(col.Type)
-
 		switch colKey.Name {
 		case traceIDColumnName:
 			traceID, traceIDFound = b.applyTraceID(col, srcRowIdx, dstRowIdx)
@@ -1008,25 +1077,47 @@ func (b *blockBuilder) addRowFromBlock(srcBlock *modules_reader.Block, srcRowIdx
 		}
 
 		// Vector columns: use addVectorPresent instead of addPresent.
-		if baseType == shared.ColumnTypeVectorF32 {
-			if bv, ok := col.BytesValue(srcRowIdx); ok && len(bv) > 0 && len(bv)%4 == 0 {
-				b.addVectorPresent(dstRowIdx, colKey.Name, bytesToFloat32LE(bv))
+		if baseType := baseColumnType(col.Type); baseType == shared.ColumnTypeVectorF32 {
+			if col.IsPresent(srcRowIdx) {
+				if bv, ok := col.BytesValue(srcRowIdx); ok && len(bv) > 0 && len(bv)%4 == 0 {
+					b.addVectorPresent(dstRowIdx, colKey.Name, bytesToFloat32LE(bv))
+				}
 			}
 			continue
 		}
 
-		// Dynamic attribute columns: read typed value and call addPresent to write to block column.
-		val, ok := readDynAttrValue(col, srcRowIdx, baseType)
-		if !ok {
-			continue
-		}
-		b.addPresent(dstRowIdx, colKey.Name, baseType, val)
+		// Dynamic attribute columns: handled exclusively by applyDynAttrCols below (NOTE-40).
+		// Do NOT call IsPresent or addPresent here — applyDynAttrCols owns these columns.
 	}
+
+	// Dynamic attribute columns: iterate pre-resolved dstCols to avoid per-row map lookups.
+	// NOTE-40: dstCols pre-built by buildDstCols before the row loop.
+	b.applyDynAttrCols(dstCols, srcRowIdx, dstRowIdx)
 
 	b.finalizeRowBookkeeping(
 		dstRowIdx, traceID, traceIDFound,
 		spanStart, spanStartFound, spanEnd, spanEndFound, durationFound,
 	)
+}
+
+// applyDynAttrCols iterates pre-resolved dstCols for dynamic attribute columns,
+// calling addPresentDirect for each present value. Extracted to keep addRowFromBlock
+// within cyclomatic complexity limits (NOTE-40).
+func (b *blockBuilder) applyDynAttrCols(dstCols []dstColEntry, srcRowIdx, dstRowIdx int) {
+	for i := range dstCols {
+		dc := &dstCols[i]
+		if !dc.col.IsPresent(srcRowIdx) {
+			continue
+		}
+		if dc.cb == nil {
+			continue // type conflict recorded at pre-build time; skip
+		}
+		val, ok := readDynAttrValue(dc.col, srcRowIdx, dc.baseType)
+		if !ok {
+			continue
+		}
+		b.addPresentDirect(dc.cb, dstRowIdx, dc.colKey.Name, dc.baseType, val)
+	}
 }
 
 // finalizeRowBookkeeping handles post-column-copy bookkeeping for addRowFromBlock:
@@ -1537,6 +1628,70 @@ func (b *blockBuilder) updateMinMax(name string, typ shared.ColumnType, key stri
 	b.colSketches.add(name, key)
 }
 
+// numKeyLess compares two 8-byte LE-encoded numeric keys based on the column type.
+func numKeyLess(typ shared.ColumnType, a, b [8]byte) bool {
+	switch typ {
+	case shared.ColumnTypeInt64, shared.ColumnTypeRangeInt64, shared.ColumnTypeRangeDuration:
+		//nolint:gosec // G115: safe reinterpreting uint64 bits as int64
+		return int64(binary.LittleEndian.Uint64(a[:])) < int64(binary.LittleEndian.Uint64(b[:]))
+	case shared.ColumnTypeFloat64, shared.ColumnTypeRangeFloat64:
+		av := math.Float64frombits(binary.LittleEndian.Uint64(a[:]))
+		bv := math.Float64frombits(binary.LittleEndian.Uint64(b[:]))
+		if math.IsNaN(av) {
+			return false
+		}
+		if math.IsNaN(bv) {
+			return true
+		}
+		return av < bv
+	default: // uint64 and others: unsigned comparison
+		return binary.LittleEndian.Uint64(a[:]) < binary.LittleEndian.Uint64(b[:])
+	}
+}
+
+// updateMinMaxNum updates the per-block min/max for a numeric (int64/uint64/float64)
+// column using an [8]byte LE-encoded key. Avoids the string([]byte) allocation that
+// encodeRangeKey would otherwise cause on every span.
+func (b *blockBuilder) updateMinMaxNum(name string, typ shared.ColumnType, key [8]byte) {
+	if mm, ok := b.colMinMax[name]; ok {
+		if numKeyLess(typ, key, mm.numMinKey) {
+			mm.numMinKey = key
+		}
+		if numKeyLess(typ, mm.numMaxKey, key) {
+			mm.numMaxKey = key
+		}
+	} else {
+		b.colMinMax[name] = &blockColMinMax{
+			colName:   name,
+			numMinKey: key,
+			numMaxKey: key,
+			isNum:     true,
+			colType:   typ,
+		}
+	}
+	b.colSketches.add(name, unsafe.String(&key[0], 8)) //nolint:gosec // G103: zero-copy string view; key does not escape
+}
+
+// updateMinMaxFromAttr feeds a typed AttrValue into the per-block min/max tracker.
+func (b *blockBuilder) updateMinMaxFromAttr(name string, typ shared.ColumnType, val shared.AttrValue) {
+	var tmp [8]byte
+	switch typ {
+	case shared.ColumnTypeInt64, shared.ColumnTypeRangeInt64, shared.ColumnTypeRangeDuration:
+		binary.LittleEndian.PutUint64(tmp[:], uint64(val.Int)) //nolint:gosec
+		b.updateMinMaxNum(name, typ, tmp)
+	case shared.ColumnTypeUint64, shared.ColumnTypeRangeUint64:
+		binary.LittleEndian.PutUint64(tmp[:], val.Uint)
+		b.updateMinMaxNum(name, typ, tmp)
+	case shared.ColumnTypeFloat64, shared.ColumnTypeRangeFloat64:
+		binary.LittleEndian.PutUint64(tmp[:], math.Float64bits(val.Float))
+		b.updateMinMaxNum(name, typ, tmp)
+	default:
+		if key := encodeRangeKey(typ, val); key != "" {
+			b.updateMinMax(name, typ, key)
+		}
+	}
+}
+
 // rangeKeyLess returns true when encoded key a is strictly less than encoded key b,
 // using type-aware comparison. For numeric types (int64/uint64/float64), the 8-byte
 // LE encoding is decoded to its native type before comparison. For string/bytes the
@@ -1577,12 +1732,70 @@ func rangeKeyLess(typ shared.ColumnType, a, b string) bool {
 // addPresent writes a present (non-null) attribute value to the named column
 // at the given row index and feeds the range index. Uses direct indexed writes
 // into pre-allocated slices, avoiding append and null-filling entirely.
+//
+//nolint:dupl // intentional; addPresentDirect is the fast-path mirror that omits the addColumn call
 func (b *blockBuilder) addPresent(rowIdx int, name string, typ shared.ColumnType, val shared.AttrValue) {
 	cb := b.addColumn(name, typ)
 	if cb == nil {
 		return // type conflict with an existing same-named column; skip this value
 	}
-	switch typ {
+	switch typ { //nolint:dupl // addPresentDirect is an intentional fast-path mirror; same type-switch by design
+	case shared.ColumnTypeString, shared.ColumnTypeRangeString:
+		scb := cb.(*stringColumnBuilder)
+		s := val.Str
+		if len(s) > shared.MaxStringLen {
+			s = s[:shared.MaxStringLen]
+		}
+		scb.values[rowIdx] = s
+		scb.present[rowIdx] = true
+	case shared.ColumnTypeInt64, shared.ColumnTypeRangeInt64, shared.ColumnTypeRangeDuration:
+		icb := cb.(*int64ColumnBuilder)
+		icb.values[rowIdx] = val.Int
+		icb.present[rowIdx] = true
+	case shared.ColumnTypeUint64, shared.ColumnTypeRangeUint64:
+		ucb := cb.(*uint64ColumnBuilder)
+		ucb.values[rowIdx] = val.Uint
+		ucb.present[rowIdx] = true
+		ucb.trackMinMax(val.Uint)
+	case shared.ColumnTypeFloat64, shared.ColumnTypeRangeFloat64:
+		fcb := cb.(*float64ColumnBuilder)
+		fcb.values[rowIdx] = val.Float
+		fcb.present[rowIdx] = true
+	case shared.ColumnTypeBool:
+		bcb := cb.(*boolColumnBuilder)
+		bcb.values[rowIdx] = val.Bool
+		bcb.present[rowIdx] = true
+	default: // bytes / rangebytes
+		bcb := cb.(*bytesColumnBuilder)
+		bv := val.Bytes
+		if len(bv) > shared.MaxBytesLen {
+			bv = bv[:shared.MaxBytesLen]
+		}
+		bcb.values[rowIdx] = bv
+		bcb.present[rowIdx] = true
+	}
+
+	// Feed range column index.
+	// Excluded: trace:id (unique per trace, not useful for block pruning)
+	//           Bool (no Range* equivalent; cardinality is always ≤2)
+	if name != traceIDColumnName && typ != shared.ColumnTypeBool {
+		b.updateMinMaxFromAttr(name, typ, val)
+	}
+}
+
+// addPresentDirect writes a typed value for a pre-resolved columnBuilder.
+// It is the fast-path counterpart to addPresent: the addColumn lookup has already
+// been performed by buildDstCols; this function only does the type-switch write.
+// NOTE-40: called by addRowFromBlock for dynamic attribute columns.
+//
+//nolint:dupl // intentional fast-path mirror of addPresent; omits addColumn call by design
+func (b *blockBuilder) addPresentDirect(
+	cb columnBuilder, rowIdx int, name string, typ shared.ColumnType, val shared.AttrValue,
+) {
+	if cb == nil {
+		return
+	}
+	switch typ { //nolint:dupl // intentional mirror of addPresent's type-switch; omits addColumn by design
 	case shared.ColumnTypeString, shared.ColumnTypeRangeString:
 		scb := cb.(*stringColumnBuilder)
 		s := val.Str

@@ -111,7 +111,6 @@ type Reader struct {
 	// intrinsicDecoded caches fully decoded intrinsic columns by name.
 	// Populated lazily by GetIntrinsicColumn. Protected by intrinsicMu.
 	intrinsicDecoded map[string]*shared.IntrinsicColumn
-	intrinsicMu      sync.RWMutex
 
 	// metaPin holds a reference to the *parsedMetadata retrieved from the process-level
 	// cache, ensuring the pointer remains valid for the lifetime of this Reader.
@@ -191,6 +190,8 @@ type Reader struct {
 	// V8 footer fields (FooterV8Version = 8, unified ToC files only).
 	// v8ToCOffset and v8ToCLen point to the snappy-compressed unified ToC blob.
 	v8ToCOffset uint64
+
+	intrinsicMu sync.RWMutex
 
 	// V8 lazy section errors and sync.Once guards (mirror of v14 ones).
 	v8TraceOnce sync.Once
