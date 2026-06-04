@@ -41,7 +41,7 @@ type tenantStore struct {
 	overrides        Overrides
 	enc              encoding.VersionedEncoding
 	wal              *wal.WAL
-	noCompactBlockIDs []backend.UUID
+	noCompactBlockID *backend.UUID
 
 	liveTraces *livetraces.LiveTraces[[]byte]
 }
@@ -183,7 +183,7 @@ func (s *tenantStore) Flush(ctx context.Context, r tempodb.Reader, w tempodb.Wri
 		return err
 	}
 	level.Info(s.logger).Log("msg", "WriteBlock complete", "tenant", s.tenantID, "elapsed", time.Since(writeStart), "blockid", newMeta.BlockID)
-	s.noCompactBlockIDs = append(s.noCompactBlockIDs, newMeta.BlockID)
+	s.noCompactBlockID = &newMeta.BlockID
 	span.AddEvent("wrote block to backend", trace.WithAttributes(attribute.String("block_id", newMeta.BlockID.String())))
 
 	metricBlockBuilderFlushedBlocks.WithLabelValues(s.tenantID).Inc()
@@ -205,19 +205,14 @@ func (s *tenantStore) Flush(ctx context.Context, r tempodb.Reader, w tempodb.Wri
 }
 
 func (s *tenantStore) AllowCompaction(ctx context.Context, w tempodb.Writer) error {
-	for _, id := range s.noCompactBlockIDs {
-		if err := w.DeleteNoCompactFlag(ctx, s.tenantID, id); err != nil {
-			return err
-		}
+	if s.noCompactBlockID == nil {
+		return nil
 	}
-	s.noCompactBlockIDs = nil
+	if err := w.DeleteNoCompactFlag(ctx, s.tenantID, *s.noCompactBlockID); err != nil {
+		return err
+	}
+	s.noCompactBlockID = nil
 	return nil
-}
-
-// isFull returns true when the accumulated liveTraces proto bytes have reached
-// maxBytes. Used by the partition writer to cut a block mid-cycle.
-func (s *tenantStore) isFull(maxBytes uint64) bool {
-	return maxBytes > 0 && s.liveTraces.Size() >= maxBytes
 }
 
 // Adjust the time range based on when the record was added to the partition, factoring in slack and cycle duration.

@@ -108,27 +108,6 @@ func (p *writer) flush(ctx context.Context, r tempodb.Reader, w tempodb.Writer, 
 	return g.Wait()
 }
 
-// flushFullTenants flushes any tenant whose accumulated liveTraces proto bytes
-// exceed MaxBlockBytes, producing a mid-cycle block. This keeps L0 block sizes
-// near the configured limit rather than growing for the full consume cycle.
-func (p *writer) flushFullTenants(ctx context.Context, r tempodb.Reader, w tempodb.Writer, c tempodb.Compactor) error {
-	p.mtx.Lock()
-	full := make([]*tenantStore, 0)
-	for _, i := range p.m {
-		if i.isFull(p.blockCfg.MaxBlockBytes) {
-			full = append(full, i)
-		}
-	}
-	p.mtx.Unlock()
-
-	for _, i := range full {
-		if err := i.Flush(ctx, r, w, c); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func (p *writer) allowCompaction(ctx context.Context, w tempodb.Writer) {
 	ctx, span := tracer.Start(
 		ctx, "writer.allowCompaction",
