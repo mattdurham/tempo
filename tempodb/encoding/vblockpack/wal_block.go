@@ -168,16 +168,24 @@ func (w *walBlock) Flush() error {
 	return nil
 }
 
-// DataLength returns the current data length
+// DataLength returns the estimated size of accumulated WAL data in bytes.
+// Used by block-builder to decide when to cut a new block (max_block_bytes).
+//
+// We cannot use w.writer.CurrentSize() because the blockpack writer clears its
+// pending-span buffer after each internal flush (every ~10k spans), causing
+// CurrentSize() to reset to 0. That made DataLength() report 0 throughout
+// ingestion, so block-builder never cut on size and blocks grew to 3 minutes
+// of data (~400-500k spans) instead of the configured 100 MB limit.
+//
+// Instead we derive size from meta.TotalObjects (span count), which is
+// monotonically increasing and already tracked by AppendTrace via ObjectAdded.
+// The constant matches observed on-disk bytes/span for vblockpack L0 blocks.
 func (w *walBlock) DataLength() uint64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	if w.writer == nil {
-		return 0
-	}
-
-	return uint64(w.writer.CurrentSize())
+	const estimatedBytesPerSpan = 1024
+	return uint64(w.meta.TotalObjects) * estimatedBytesPerSpan
 }
 
 // Iterator returns an iterator over all traces in the WAL
