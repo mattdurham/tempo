@@ -59,14 +59,18 @@ func (c *Compactor) Compact(ctx context.Context, l log.Logger, r backend.Reader,
 
 	first := inputs[0]
 
-	// Build one ReaderProvider per input block.
+	// Pre-download each input block in full before compaction begins.
+	// tempoBlockProvider.ReadAt previously issued one S3 ranged GET per column
+	// section, generating hundreds of per-column requests per job (50-100ms each).
+	// Downloading the full block once matches how queries work (GetBlockWithBytes)
+	// and reduces S3 request count from O(blocks×columns) to O(blocks).
 	providers := make([]blockpack.ReaderProvider, len(inputs))
 	for i, m := range inputs {
-		providers[i] = &tempoBlockProvider{
-			reader:   r,
-			blockID:  uuid.UUID(m.BlockID),
-			tenantID: m.TenantID,
+		data, err := r.Read(ctx, DataFileName, uuid.UUID(m.BlockID), m.TenantID, nil)
+		if err != nil {
+			return nil, fmt.Errorf("read block %s for compaction: %w", m.BlockID, err)
 		}
+		providers[i] = &memoryBlockProvider{data: data}
 	}
 
 	// WritableStorage receives the compacted output files.
@@ -123,44 +127,31 @@ func (c *Compactor) Compact(ctx context.Context, l log.Logger, r backend.Reader,
 	return out.metas, nil
 }
 
-// tempoBlockProvider implements blockpack.ReaderProvider for a single backend block.
-// Size and ReadAt delegate to the backend reader.
-// Delete is a no-op: the caller (tempodb/compactor.go) handles input block deletion
-// via markCompacted after Compact returns.
-type tempoBlockProvider struct {
-	reader   backend.Reader
-	blockID  uuid.UUID
-	tenantID string
+// memoryBlockProvider implements blockpack.ReaderProvider using pre-downloaded block bytes.
+// ReadAt is served entirely from memory — no per-column S3 requests during compaction.
+type memoryBlockProvider struct {
+	data []byte
 }
 
-func (p *tempoBlockProvider) Size() (int64, error) {
-	rc, size, err := p.reader.StreamReader(context.Background(), DataFileName, p.blockID, p.tenantID)
-	if err != nil {
-		return 0, err
-	}
-	_ = rc.Close()
-	return size, nil
+func (p *memoryBlockProvider) Size() (int64, error) {
+	return int64(len(p.data)), nil
 }
 
-func (p *tempoBlockProvider) ReadAt(buf []byte, off int64, _ blockpack.DataType) (int, error) {
+func (p *memoryBlockProvider) ReadAt(buf []byte, off int64, _ blockpack.DataType) (int, error) {
 	if off < 0 {
 		return 0, fmt.Errorf("negative offset: %d", off)
 	}
-	err := p.reader.ReadRange(context.Background(), DataFileName, p.blockID, p.tenantID, uint64(off), buf, nil)
-	if err != nil {
-		size, sizeErr := p.Size()
-		if sizeErr == nil && off >= size {
-			return 0, io.EOF
-		}
-		return 0, err
+	if off >= int64(len(p.data)) {
+		return 0, io.EOF
 	}
-	return len(buf), nil
+	n := copy(buf, p.data[off:])
+	if n < len(buf) {
+		return n, io.EOF
+	}
+	return n, nil
 }
 
-// Delete is a no-op. Input block lifecycle is managed by the outer compaction loop.
-func (p *tempoBlockProvider) Delete() error {
-	return nil
-}
+func (p *memoryBlockProvider) Delete() error { return nil }
 
 // tempoOutputStorage implements blockpack.WritableStorage.
 // Each call to Put() writes one output blockpack file as a new block in the backend.
