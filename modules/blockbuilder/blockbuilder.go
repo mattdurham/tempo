@@ -443,6 +443,16 @@ outer:
 				return time.Time{}, commitOffsetAtEnd, err
 			}
 
+			// Mid-cycle size cutting: only when processing live data (not backlog replay).
+			// During replay, cycles complete instantly and each cycle would produce many
+			// tiny blocks. We skip cutting if the cycle's end time is more than 2 cycle
+			// durations in the past, which means we're replaying historical data.
+			if end.After(time.Now().Add(-2 * dur)) {
+				if err := writer.flushFullTenants(ctx, b.reader, b.writer, b.compactor); err != nil {
+					return time.Time{}, commitOffsetAtEnd, err
+				}
+			}
+
 			processedRecords++
 			lastRec = rec
 			consumedBytes += recordSizeBytes
