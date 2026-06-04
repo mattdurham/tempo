@@ -442,6 +442,9 @@ outer:
 			if err != nil {
 				return time.Time{}, commitOffsetAtEnd, err
 			}
+			if err := writer.flushFullTenants(ctx, b.reader, b.writer, b.compactor); err != nil {
+				return time.Time{}, commitOffsetAtEnd, err
+			}
 
 			processedRecords++
 			lastRec = rec
