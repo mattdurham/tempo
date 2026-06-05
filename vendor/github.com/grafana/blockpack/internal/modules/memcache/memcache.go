@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"time"
 
 	gomemcache "github.com/grafana/gomemcache/memcache"
@@ -62,6 +63,32 @@ type MemCache struct {
 	expiration int32
 }
 
+// expandServers resolves each host:port entry to all IPs returned by DNS,
+// returning individual IP:port entries. This ensures that Kubernetes headless
+// services with multiple pod IPs are all added to the consistent hash ring
+// at startup — gomemcache.New resolves each entry via net.ResolveTCPAddr
+// which returns only one IP per hostname.
+// On DNS failure for a server the original entry is kept as a fallback.
+func expandServers(servers []string) []string {
+	expanded := make([]string, 0, len(servers))
+	for _, server := range servers {
+		host, port, err := net.SplitHostPort(server)
+		if err != nil {
+			expanded = append(expanded, server)
+			continue
+		}
+		addrs, err := net.LookupHost(host)
+		if err != nil || len(addrs) == 0 {
+			expanded = append(expanded, server)
+			continue
+		}
+		for _, addr := range addrs {
+			expanded = append(expanded, net.JoinHostPort(addr, port))
+		}
+	}
+	return expanded
+}
+
 // Open creates a MemCache connecting to cfg.Servers.
 // Returns (nil, nil) when cfg.Enabled is false.
 func Open(cfg Config) (*MemCache, error) {
@@ -72,7 +99,7 @@ func Open(cfg Config) (*MemCache, error) {
 		return nil, fmt.Errorf("memcache: at least one server address required")
 	}
 	m := &MemCache{
-		c:          gomemcache.New(cfg.Servers...),
+		c:          gomemcache.New(expandServers(cfg.Servers)...),
 		expiration: cfg.Expiration,
 	}
 	if cfg.Registerer != nil {
