@@ -28,6 +28,16 @@ import (
 // AGENT: Reader types - these provide access to blockpack data.
 // Do not expose any internal reader implementation details.
 
+// WantColumns controls which columns ParseBlockFromBytes eagerly decodes.
+// Use WantAll() to load all columns, or WantOnly(cols) for query-plan-driven selection.
+type WantColumns = modules_reader.WantColumns
+
+// WantAll returns a WantColumns that eagerly decodes every column.
+func WantAll() WantColumns { return modules_reader.WantAll() }
+
+// WantOnly returns a WantColumns that eagerly decodes only the named columns.
+func WantOnly(cols map[string]struct{}) WantColumns { return modules_reader.WantOnly(cols) }
+
 // Reader reads modules-format blockpack files and provides query execution.
 // This is a thin type alias for the internal modules reader.
 type Reader = modules_reader.Reader
@@ -411,7 +421,7 @@ func GetTraceByID(r *Reader, traceIDHex string) (results []SpanMatch, err error)
 		if !ok {
 			return nil, fmt.Errorf("GetTraceByID: block %d missing from coalesced read", entry.BlockID)
 		}
-		bwb, blockErr := r.ParseBlockFromBytes(raw, nil, r.BlockMeta(entry.BlockID))
+		bwb, blockErr := r.ParseBlockFromBytes(raw, modules_reader.WantAll(), r.BlockMeta(entry.BlockID))
 		if blockErr != nil {
 			return nil, fmt.Errorf("GetTraceByID: block %d: %w", entry.BlockID, blockErr)
 		}

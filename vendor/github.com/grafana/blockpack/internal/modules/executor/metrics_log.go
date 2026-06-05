@@ -108,7 +108,7 @@ func ExecuteLogMetrics(
 
 	// TODO: propagate caller context (NOTE-058: ExecuteLogMetrics does not yet accept context.Context).
 	_, _, _, pipelineErr := blockGroupPipeline(
-		context.Background(), r, groups, defaultPipelineWorkers,
+		context.Background(), r, groups, defaultPipelineWorkers, wantColumns,
 		func(groupIdx int, groupRaw map[int][]byte) error {
 			for _, blockIdx := range groups[groupIdx].BlockIDs {
 				raw, ok := groupRaw[blockIdx]
@@ -128,7 +128,7 @@ func ExecuteLogMetrics(
 				internPtr := modules_reader.AcquireInternMap()
 				// intern and *internPtr share the same backing map; intern is passed to ParseBlockFromBytesWithIntern below
 				intern := *internPtr
-				bwb, parseErr := r.ParseBlockFromBytesWithIntern(raw, wantColumns, meta, intern)
+				bwb, parseErr := r.ParseBlockFromBytesWithIntern(raw, modules_reader.WantOnly(wantColumns), meta, intern)
 				if parseErr != nil {
 					modules_reader.ReleaseInternMap(internPtr)
 					return fmt.Errorf("ParseBlockFromBytes block %d: %w", blockIdx, parseErr)

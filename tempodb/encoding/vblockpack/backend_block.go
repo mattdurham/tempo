@@ -1086,7 +1086,7 @@ func (b *blockpackBlock) FetchTagNames(ctx context.Context, req traceql.FetchTag
 				if !ok {
 					continue
 				}
-				bwb, err := bpr.ParseBlockFromBytes(raw, nil, bpr.BlockMeta(blockIdx))
+				bwb, err := bpr.ParseBlockFromBytes(raw, blockpack.WantAll(), bpr.BlockMeta(blockIdx))
 				if err != nil {
 					return fmt.Errorf("failed to parse block %d: %w", blockIdx, err)
 				}

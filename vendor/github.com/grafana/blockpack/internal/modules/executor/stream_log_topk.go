@@ -408,7 +408,7 @@ func iterateLogRows(
 		delete(fetched, blockIdx)
 
 		r.ResetInternStrings()
-		bwb, err := r.ParseBlockFromBytes(raw, wantColumns, meta)
+		bwb, err := r.ParseBlockFromBytes(raw, modules_reader.WantOnly(wantColumns), meta)
 		if err != nil {
 			return fetchedGroups, fetchCount, bytesRead, fmt.Errorf(
 				"CollectLogs ParseBlockFromBytes block %d: %w",

@@ -208,7 +208,7 @@ func topKScanBlocks(
 			delete(groupRaw, blockIdx)
 
 			r.ResetInternStrings()
-			bwb, parseErr := r.ParseBlockFromBytes(raw, wantColumns, meta)
+			bwb, parseErr := r.ParseBlockFromBytes(raw, modules_reader.WantOnly(wantColumns), meta)
 			if parseErr != nil {
 				return fmt.Errorf("ParseBlockFromBytes block %d: %w", blockIdx, parseErr)
 			}
@@ -225,7 +225,7 @@ func topKScanBlocks(
 			// Second pass: decode result columns for blocks with at least one match.
 			// NOTE-018: secondPassCols is pre-computed by computeColumnFilters.
 			if wantColumns != nil {
-				bwb, parseErr = r.ParseBlockFromBytes(bwb.RawBytes, secondPassCols, meta)
+				bwb, parseErr = r.ParseBlockFromBytes(bwb.RawBytes, modules_reader.WantOnly(secondPassCols), meta)
 				if parseErr != nil {
 					return fmt.Errorf("ParseBlockFromBytes (second pass) block %d: %w", blockIdx, parseErr)
 				}
@@ -245,8 +245,16 @@ func topKScanBlocks(
 
 	// SPEC-STREAM-11: concurrent I/O via blockGroupPipeline; processGroup called sequentially.
 	// TODO: propagate caller context (NOTE-058: Collect does not yet accept context.Context).
+	// Pass union of wantColumns + secondPassCols so filterBlockColumns retains all needed data.
+	allCols := make(map[string]struct{}, len(wantColumns)+len(secondPassCols))
+	for k := range wantColumns {
+		allCols[k] = struct{}{}
+	}
+	for k := range secondPassCols {
+		allCols[k] = struct{}{}
+	}
 	fetchedGroups, _, bytesRead, err := blockGroupPipeline(
-		context.Background(), r, groups, defaultPipelineWorkers, processGroup,
+		context.Background(), r, groups, defaultPipelineWorkers, allCols, processGroup,
 	)
 	return fetchedGroups, processedBlocks, bytesRead, err
 }

@@ -65,6 +65,36 @@ type compactTraceIndex struct {
 	traceIndexOnce sync.Once
 }
 
+// WantColumns specifies which columns to eagerly decode when parsing a block.
+// Use WantAll() to load every column, or WantOnly(cols) for query-driven selection.
+// A zero value (All=false, Columns=nil) is equivalent to WantOnly(empty) — no eager decodes.
+type WantColumns struct {
+	// All loads every column eagerly. Use only when the full column set is genuinely
+	// required (e.g. tag-name enumeration, compaction, export). For query paths, set
+	// Columns to the specific columns the query references.
+	All bool
+	// Columns is the set of column names to eagerly decode. Ignored when All is true.
+	Columns map[string]struct{}
+}
+
+// WantAll returns a WantColumns that eagerly decodes every column in the block.
+// Use only when all columns are genuinely needed — loading unused columns causes
+// 300MB+ memory spikes per block in the query path.
+func WantAll() WantColumns { return WantColumns{All: true} }
+
+// WantOnly returns a WantColumns that eagerly decodes only the named columns.
+// All other columns are registered lazily at zero decode cost.
+func WantOnly(cols map[string]struct{}) WantColumns { return WantColumns{Columns: cols} }
+
+// toInternalMap converts WantColumns to the internal nullable map used by parseBlockColumnsReuse.
+// Returns nil (load all) when All=true, the column map otherwise.
+func (w WantColumns) toInternalMap() map[string]struct{} {
+	if w.All {
+		return nil
+	}
+	return w.Columns
+}
+
 // Reader reads and decodes a blockpack file.
 type Reader struct {
 	provider rw.ReaderProvider
@@ -749,14 +779,17 @@ func (r *Reader) ReadGroup(cr shared.CoalescedRead) (map[int][]byte, error) {
 // wantColumns nil = all columns.
 // Each call allocates its own fresh intern map; ResetInternStrings is a no-op and
 // no cross-call intern reuse occurs.
+// ParseBlockFromBytes parses a Block from raw bytes.
+// want controls which columns are eagerly decoded — use WantAll() or WantOnly(cols).
+// Passing WantOnly with a query-derived column set avoids 300MB+ memory spikes from
+// loading unused columns; WantAll() is for cases where every column is needed.
 func (r *Reader) ParseBlockFromBytes(
 	rawBytes []byte,
-	wantColumns map[string]struct{},
+	want WantColumns,
 	meta shared.BlockMeta,
 ) (*BlockWithBytes, error) {
 	localIntern := make(map[string]string)
-
-	blk, err := parseBlockColumnsReuse(rawBytes, wantColumns, nil, meta, localIntern)
+	blk, err := parseBlockColumnsReuse(rawBytes, want.toInternalMap(), nil, meta, localIntern)
 	if err != nil {
 		return nil, fmt.Errorf("ParseBlockFromBytes: %w", err)
 	}
@@ -773,11 +806,11 @@ func (r *Reader) ParseBlockFromBytes(
 // + second parse) before being returned to the pool.
 func (r *Reader) ParseBlockFromBytesWithIntern(
 	rawBytes []byte,
-	wantColumns map[string]struct{},
+	want WantColumns,
 	meta shared.BlockMeta,
 	intern map[string]string,
 ) (*BlockWithBytes, error) {
-	blk, err := parseBlockColumnsReuse(rawBytes, wantColumns, nil, meta, intern)
+	blk, err := parseBlockColumnsReuse(rawBytes, want.toInternalMap(), nil, meta, intern)
 	if err != nil {
 		return nil, fmt.Errorf("ParseBlockFromBytesWithIntern: %w", err)
 	}
@@ -1071,7 +1104,7 @@ func (r *Reader) GetBlockWithBytes(
 	if err != nil {
 		return nil, err
 	}
-	bwb, err := r.ParseBlockFromBytes(raw, wantColumns, r.BlockMeta(blockIdx))
+	bwb, err := r.ParseBlockFromBytes(raw, WantOnly(wantColumns), r.BlockMeta(blockIdx))
 	if err != nil {
 		return nil, err
 	}

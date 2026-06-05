@@ -419,7 +419,7 @@ func scanBlocks(
 			internPtr := modules_reader.AcquireInternMap()
 			intern := *internPtr
 
-			bwb, parseErr := r.ParseBlockFromBytesWithIntern(raw, wantColumns, meta, intern)
+			bwb, parseErr := r.ParseBlockFromBytesWithIntern(raw, modules_reader.WantOnly(wantColumns), meta, intern)
 			if parseErr != nil {
 				modules_reader.ReleaseInternMap(internPtr)
 				return fmt.Errorf("ParseBlockFromBytes block %d: %w", blockIdx, parseErr)
@@ -466,7 +466,7 @@ func scanBlocks(
 			// NOTE-018: Second pass — decode result columns now that we know this block has matches.
 			// NOTE-028: secondPassCols is pre-computed above (searchMetaColumns ∪ wantColumns, or nil for all).
 			if wantColumns != nil {
-				bwb, parseErr = r.ParseBlockFromBytesWithIntern(bwb.RawBytes, secondPassCols, meta, intern)
+				bwb, parseErr = r.ParseBlockFromBytesWithIntern(bwb.RawBytes, modules_reader.WantOnly(secondPassCols), meta, intern)
 				if parseErr != nil {
 					modules_reader.ReleaseInternMap(internPtr)
 					return fmt.Errorf("ParseBlockFromBytes (second pass) block %d: %w", blockIdx, parseErr)
@@ -514,9 +514,21 @@ func scanBlocks(
 		return nil
 	}
 
+	// Pass union of wantColumns ∪ secondPassCols so FilterBlockColumns retains bytes for
+	// both the first pass (predicate) and second pass (output columns).
+	var filterCols map[string]struct{}
+	if wantColumns != nil || secondPassCols != nil {
+		filterCols = make(map[string]struct{}, len(wantColumns)+len(secondPassCols))
+		for k := range wantColumns {
+			filterCols[k] = struct{}{}
+		}
+		for k := range secondPassCols {
+			filterCols[k] = struct{}{}
+		}
+	}
 	// SPEC-STREAM-11: concurrent I/O via blockGroupPipeline; processGroup called sequentially.
 	// TODO: propagate caller context (NOTE-058: Collect does not yet accept context.Context).
-	return blockGroupPipeline(context.Background(), r, groups, defaultPipelineWorkers, processGroup)
+	return blockGroupPipeline(context.Background(), r, groups, defaultPipelineWorkers, filterCols, processGroup)
 }
 
 // streamSortedRows sorts rows by timestamp (when tsCol is non-nil) or reverses them
@@ -795,7 +807,7 @@ func forEachBlockInGroups(
 			candidateRows := blockCandidates[blockIdx]
 			meta := r.BlockMeta(blockIdx)
 			r.ResetInternStrings()
-			bwb, parseErr := r.ParseBlockFromBytes(raw, wantColumns, meta)
+			bwb, parseErr := r.ParseBlockFromBytes(raw, modules_reader.WantOnly(wantColumns), meta)
 			if parseErr != nil {
 				return fmt.Errorf("%s ParseBlockFromBytes block %d: %w", callerName, blockIdx, parseErr)
 			}
@@ -810,7 +822,7 @@ func forEachBlockInGroups(
 			// M-18: Skip second parse when candidateRows is empty — no rows passed the first-pass
 			// predicate, so decoding additional columns would produce no output for this block.
 			if wantColumns != nil && len(candidateRows) > 0 {
-				bwb, parseErr = r.ParseBlockFromBytes(bwb.RawBytes, secondPassCols, meta)
+				bwb, parseErr = r.ParseBlockFromBytes(bwb.RawBytes, modules_reader.WantOnly(secondPassCols), meta)
 				if parseErr != nil {
 					return fmt.Errorf("%s second pass block %d: %w", callerName, blockIdx, parseErr)
 				}
@@ -829,9 +841,19 @@ func forEachBlockInGroups(
 		return nil
 	}
 
+	var filterCols map[string]struct{}
+	if wantColumns != nil || secondPassCols != nil {
+		filterCols = make(map[string]struct{}, len(wantColumns)+len(secondPassCols))
+		for k := range wantColumns {
+			filterCols[k] = struct{}{}
+		}
+		for k := range secondPassCols {
+			filterCols[k] = struct{}{}
+		}
+	}
 	// SPEC-STREAM-11: concurrent I/O via blockGroupPipeline; processGroup called sequentially.
 	// TODO: propagate caller context (NOTE-058: forEachBlockInGroups callers do not yet accept context.Context).
-	_, _, _, err := blockGroupPipeline(context.Background(), r, groups, defaultPipelineWorkers, processGroup)
+	_, _, _, err := blockGroupPipeline(context.Background(), r, groups, defaultPipelineWorkers, filterCols, processGroup)
 	return err
 }
 

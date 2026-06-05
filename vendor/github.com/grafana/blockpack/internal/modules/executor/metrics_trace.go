@@ -178,7 +178,7 @@ func ExecuteTraceMetrics(
 
 	groupBy := querySpec.Aggregate.GroupBy
 	_, _, _, pipelineErr := blockGroupPipeline(
-		ctx, r, groups, defaultPipelineWorkers,
+		ctx, r, groups, defaultPipelineWorkers, outputCols,
 		func(groupIdx int, groupRaw map[int][]byte) error {
 			for _, blockIdx := range groups[groupIdx].BlockIDs {
 				raw, ok := groupRaw[blockIdx]
@@ -203,7 +203,7 @@ func ExecuteTraceMetrics(
 				intern := *internPtr
 
 				// First pass: decode predicate columns only.
-				bwb, parseErr := r.ParseBlockFromBytesWithIntern(raw, predicateCols, meta, intern)
+				bwb, parseErr := r.ParseBlockFromBytesWithIntern(raw, modules_reader.WantOnly(predicateCols), meta, intern)
 				if parseErr != nil {
 					modules_reader.ReleaseInternMap(internPtr)
 					return fmt.Errorf("ParseBlockFromBytes block %d: %w", blockIdx, parseErr)

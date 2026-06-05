@@ -264,7 +264,7 @@ func collectBlockStructuralSpanRecs(
 
 	// NOTE-020: Reset intern strings before each block parse to bound per-reader memory growth.
 	r.ResetInternStrings()
-	bwb, err := r.ParseBlockFromBytes(raw, wantColumns, meta)
+	bwb, err := r.ParseBlockFromBytes(raw, modules_reader.WantOnly(wantColumns), meta)
 	if err != nil {
 		return fmt.Errorf("structural ParseBlockFromBytes block %d: %w", blockIdx, err)
 	}
