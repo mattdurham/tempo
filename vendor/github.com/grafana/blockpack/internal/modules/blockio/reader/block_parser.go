@@ -145,6 +145,13 @@ func parseColumnMetadataArray(data []byte, offset, colCount int) ([]colMetaEntry
 // wantColumns: if non-nil, only decode columns in this set.
 // prevBlock: if non-nil and same column set, reuse Column allocations.
 // intern is the caller's per-reader string intern table; if nil a new map is used.
+// decompBufPool holds temporary snappy decompression buffers.
+// Each column decode in parseBlockColumnsReuse decompresses into this buffer and immediately
+// calls readColumnEncoding, which fully copies all decoded data (Present bitmap, Dict entries,
+// Idx arrays) out of the buffer. No Column field sub-slices the decompressed bytes, so the
+// buffer is safe to reuse for the next column in the same parse call.
+var decompBufPool = sync.Pool{New: func() any { b := make([]byte, 0, 256<<10); return &b }}
+
 func parseBlockColumnsReuse(
 	rawBytes []byte,
 	wantColumns map[string]struct{},
@@ -156,6 +163,15 @@ func parseBlockColumnsReuse(
 		intern = make(map[string]string)
 	}
 	ctx := &decodeCtx{intern: intern}
+
+	// Acquire a reusable decompression buffer for all columns in this block.
+	// Returned to the pool after all columns are decoded.
+	decompBufPtr := decompBufPool.Get().(*[]byte)
+	decompBuf := (*decompBufPtr)[:0]
+	defer func() {
+		*decompBufPtr = decompBuf[:0]
+		decompBufPool.Put(decompBufPtr)
+	}()
 	hdr, err := parseBlockHeader(rawBytes)
 	if err != nil {
 		return nil, fmt.Errorf("parseBlock: %w", err)
@@ -205,8 +221,10 @@ func parseBlockColumnsReuse(
 
 		// SPEC-V14-001: each column blob is snappy-compressed; decompress before decode.
 		// SPEC-ROOT-012: decompressV14ColumnData guards against decompression-bomb OOM.
+		// Reuse decompBuf across columns: all decoders copy data out (Present bitmap,
+		// Dict values, Idx arrays), so colData is safe to overwrite after readColumnEncoding.
 		var decErr error
-		colData, decErr = decompressV14ColumnData(m.name, colData, m.uncompressedLen)
+		colData, decompBuf, decErr = decompressV14ColumnDataInto(decompBuf, m.name, colData, m.uncompressedLen)
 		if decErr != nil {
 			return nil, fmt.Errorf("parseBlock: %w", decErr)
 		}
@@ -349,6 +367,41 @@ func decompressV14ColumnData(name string, data []byte, uncompressedLen uint32) (
 		)
 	}
 	return decompressed, nil
+}
+
+// decompressV14ColumnDataInto is like decompressV14ColumnData but decompresses into dst,
+// growing it as needed. Returns the decoded slice (sub-slice of grown dst) and the grown dst.
+// The caller must not use colData after dst is reused for the next column.
+func decompressV14ColumnDataInto(dst []byte, name string, data []byte, uncompressedLen uint32) (colData []byte, grownDst []byte, err error) {
+	if uncompressedLen > uint32(shared.MaxBlockSize) { //nolint:gosec
+		return nil, dst, fmt.Errorf("col %q: uncompressed_len %d exceeds MaxBlockSize", name, uncompressedLen)
+	}
+	frameLen, lenErr := snappy.DecodedLen(data)
+	if lenErr != nil {
+		return nil, dst, fmt.Errorf("col %q: snappy frame header: %w", name, lenErr)
+	}
+	if frameLen > shared.MaxBlockSize {
+		return nil, dst, fmt.Errorf("col %q: snappy frame claims %d bytes, exceeds MaxBlockSize", name, frameLen)
+	}
+	// Grow dst to hold the decompressed data if needed — avoids a new allocation when buf is large enough.
+	if cap(dst) < frameLen {
+		dst = make([]byte, 0, frameLen)
+	}
+	decoded, decErr := snappy.Decode(dst[:0], data)
+	if decErr != nil {
+		return nil, dst, fmt.Errorf("col %q snappy decode: %w", name, decErr)
+	}
+	if uint32(len(decoded)) != uncompressedLen { //nolint:gosec
+		return nil, dst, fmt.Errorf(
+			"col %q: decoded length %d does not match uncompressed_len %d",
+			name, len(decoded), uncompressedLen,
+		)
+	}
+	// Return decoded as colData and decoded[:0] as the new decompBuf.
+	// If snappy reused dst's backing array, decoded[:0] retains its full capacity.
+	// If snappy allocated a new buffer, decoded[:0] carries that buffer's capacity forward.
+	// Either way, the next column's Decode call reuses whatever buffer was just used.
+	return decoded, decoded[:0], nil
 }
 
 // resetColumn zeroes a Column's value fields while retaining the allocation.
