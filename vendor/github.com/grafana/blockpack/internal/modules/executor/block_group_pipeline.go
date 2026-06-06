@@ -9,7 +9,6 @@ import (
 	"runtime/debug"
 	"sync"
 
-	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
 	modules_shared "github.com/grafana/blockpack/internal/modules/blockio/shared"
 )
 
@@ -19,13 +18,10 @@ import (
 // SPEC-STREAM-11: ReadGroup must be safe for concurrent calls; BlockMeta is read-only.
 type blockGroupReader interface {
 	ReadGroup(cr modules_shared.CoalescedRead) (map[int][]byte, error)
+	// ReadGroupColumnar downloads only bytes for wantColumns, routing through the section cache.
+	// Falls back to ReadGroup when wantColumns is nil or fileID is empty.
+	ReadGroupColumnar(cr modules_shared.CoalescedRead, wantColumns map[string]struct{}) (map[int][]byte, error)
 	BlockMeta(blockIdx int) modules_shared.BlockMeta
-}
-
-// filterBlockColumns creates a sparse buffer retaining only header + metadata + wanted columns.
-// Delegates to the reader package which owns the block header/column parsing logic.
-func filterBlockColumns(raw []byte, wantColumns map[string]struct{}) ([]byte, error) {
-	return modules_reader.FilterBlockColumns(raw, wantColumns)
 }
 
 // defaultPipelineWorkers is the number of concurrent ReadGroup goroutines.
@@ -131,19 +127,10 @@ func blockGroupPipeline(
 			}()
 			for gi := range jobs {
 				currentGi = gi
-				data, readErr := r.ReadGroup(groups[gi])
-				if readErr == nil && wantColumns != nil {
-					// Filter each block's raw bytes to only the wanted columns.
-					// ReadGroup already cached the full bytes; now discard the unused
-					// column data to reduce peak memory from ~300KB/block to ~30KB/block.
-					for blockIdx, raw := range data {
-						filtered, ferr := filterBlockColumns(raw, wantColumns)
-						if ferr == nil {
-							data[blockIdx] = filtered
-						}
-						// On filter error, keep full raw bytes (safe fallback).
-					}
-				}
+				// Use columnar reads for query paths (wantColumns non-nil): only downloads
+				// bytes for the columns the query actually needs, routed through the section
+				// cache. Falls back to ReadGroup (full download) when wantColumns is nil.
+				data, readErr := r.ReadGroupColumnar(groups[gi], wantColumns)
 				gr := groupResult{groupIdx: gi, data: data, err: readErr}
 				if readErr == nil {
 					gr.blockCount = len(groups[gi].BlockIDs)
