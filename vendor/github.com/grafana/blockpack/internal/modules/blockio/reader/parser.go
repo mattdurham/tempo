@@ -58,6 +58,18 @@ type parsedMetadata struct {
 	tsCount       int
 }
 
+// SetIntrinsicCacheBytes sets the byte budget for the process-level intrinsic column
+// cache. Must be called before the first GetIntrinsicColumn call.
+// Pass 0 to revert to the default (20% of GOMEMLIMIT, or 256 MiB fallback).
+//
+// Callers should set a budget appropriate for the process role:
+//   - Queriers: 256-512 MiB (decoded intrinsic columns are short-lived per query)
+//   - Backend workers: default (compaction benefits from larger cache)
+func SetIntrinsicCacheBytes(n int64) {
+	parsedIntrinsicCache.SetMaxBytes(n)
+	parsedIntrinsicTOCCache.SetMaxBytes(n / 4) // ToC is much smaller
+}
+
 // ClearCaches resets all process-level caches. Intended for testing.
 func ClearCaches() {
 	parsedSketchCache.Clear()

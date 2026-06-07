@@ -24,9 +24,20 @@ import (
 	modules_shared "github.com/grafana/blockpack/internal/modules/blockio/shared"
 	modules_executor "github.com/grafana/blockpack/internal/modules/executor"
 	modules_queryplanner "github.com/grafana/blockpack/internal/modules/queryplanner"
+	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
 	"github.com/grafana/blockpack/internal/traceqlparser"
 	"github.com/grafana/blockpack/internal/vm"
 )
+
+// SetIntrinsicCacheBytes sets the byte budget for the process-level decoded intrinsic
+// column cache (trace:id, span:id, span:duration etc.). Must be called before the first
+// query. Pass 0 to use the default (20% of GOMEMLIMIT, or 256 MiB).
+//
+// Querier processes should set this to 256-512 MiB. The default 20% of GOMEMLIMIT is
+// generous for compaction workers but excessive for queriers with large memory limits.
+func SetIntrinsicCacheBytes(n int64) {
+	modules_reader.SetIntrinsicCacheBytes(n)
+}
 
 // AGENT: Query execution - this is the main public API for querying.
 // Keep this minimal - just TraceQL filter query function.
