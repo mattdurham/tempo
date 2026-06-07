@@ -13,10 +13,6 @@ import (
 // modulesSpanFieldsAdapter implements executor.SpanFieldsProvider for a single
 // row within a modules-format block. Field access reads directly from block column
 // data — the block payload is the sole authoritative source for all fields.
-type modulesSpanFieldsAdapter struct {
-	block  *modules_reader.Block
-	rowIdx int
-}
 
 // modulesSpanFieldsAdapterPool recycles *modulesSpanFieldsAdapter to avoid
 // per-span heap allocation. Use getSpanFieldsAdapter / putSpanFieldsAdapter.

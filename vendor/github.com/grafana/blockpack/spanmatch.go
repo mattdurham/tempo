@@ -15,10 +15,6 @@ type SpanMatch struct {
 
 // kvField is a name-value pair used in materializedSpanFields.
 // NOTE-ALLOC-2: slice-backed materialization avoids map allocation in Clone.
-type kvField struct {
-	Value any
-	Name  string
-}
 
 // kvFieldSlicePool recycles []kvField backing arrays to reduce Clone allocations.
 // NOTE-ALLOC-2: pool holds *[]kvField so Reset clears slice length without losing capacity.
@@ -59,9 +55,6 @@ func (m *SpanMatch) Clone() SpanMatch {
 // materializedSpanFields is a heap-allocated slice-backed SpanFieldsProvider
 // returned by SpanMatch.Clone(). Safe to hold beyond the callback lifetime.
 // NOTE-ALLOC-2: uses []kvField instead of map[string]any to avoid map overhead.
-type materializedSpanFields struct {
-	fields []kvField
-}
 
 // GetField is an O(n) linear scan. For typical span field counts (10–30),
 // this is faster than a map lookup due to cache locality.
@@ -85,10 +78,6 @@ func (m *materializedSpanFields) IterateFields(fn func(name string, value any) b
 
 // filteredSpanFields wraps a SpanFieldsProvider and limits GetField / IterateFields
 // to a caller-specified column allowlist. Used to implement QueryOptions.SelectColumns.
-type filteredSpanFields struct {
-	inner   SpanFieldsProvider
-	allowed map[string]struct{}
-}
 
 func newFilteredSpanFields(inner SpanFieldsProvider, cols []string) *filteredSpanFields {
 	m := make(map[string]struct{}, len(cols))
@@ -351,10 +340,6 @@ func SpanMatchesServiceStats(spans []SpanMatch) map[string]ServiceStats {
 }
 
 // ServiceStats holds per-service span and error counts for a trace.
-type ServiceStats struct {
-	SpanCount  uint32
-	ErrorCount uint32
-}
 
 // =============================================================================
 // Column naming helpers

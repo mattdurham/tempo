@@ -30,15 +30,12 @@ var blockLabelSetPool = &sync.Pool{ //nolint:gochecknoglobals
 
 // blockLabelSet is a LabelSet backed by block columns.
 // NOTE-SL-017: hot-path implementation; reused across rows via resetForRow.
-type blockLabelSet struct {
-	block    *modules_reader.Block
-	colMap   map[string]int           // label name (e.g. "service.name") → index into colNames
-	overlay  map[string]string        // nil until first Set; allocated lazily
-	deleted  map[string]bool          // nil until first Delete; allocated lazily
-	colNames []string                 // original column names (e.g. "resource.service.name"); indexed by colMap values
-	colCols  []*modules_reader.Column // parallel to colNames; resolved once per block
-	rowIdx   int
-}
+
+// label name (e.g. "service.name") → index into colNames
+// nil until first Set; allocated lazily
+// nil until first Delete; allocated lazily
+// original column names (e.g. "resource.service.name"); indexed by colMap values
+// parallel to colNames; resolved once per block
 
 // resetForRow resets the labelset for a new row in the same block.
 // Clears overlay and deleted maps in-place (preserves allocations for reuse).

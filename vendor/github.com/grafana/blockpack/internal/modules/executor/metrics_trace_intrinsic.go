@@ -1051,6 +1051,18 @@ func accumulateIntrinsicBucketsDirect(
 		}
 	}
 
+	// NOTE-090: guard against oversized dense arrays from sparse block layouts.
+	// packKey space is 32-bit (blockIdx<<16|rowIdx), so a file with many blocks and
+	// few rows per block can produce maxPK far exceeding the actual span count.
+	// bucketByPK (int64) + dictByPK (uint32) + seenByPK (bool) = 13 bytes/entry:
+	// 16M entries costs ~208MB, which is acceptable. Beyond that, the keyMap
+	// fallback (accumulateIntrinsicBucketsViaKeyMap) uses actual span count and
+	// is far more memory-efficient.
+	const maxDirectArrayEntries = 16_000_000
+	if int64(maxPK)+1 > maxDirectArrayEntries { //nolint:gosec
+		return false, nil
+	}
+
 	// Build bucketByPK directly — no inRangeRefs materialized.
 	// Always allocate even when maxPK==0 (packKey=0 is a valid span key).
 	bucketByPK := make([]int64, maxPK+1) //nolint:gosec
@@ -2341,43 +2353,21 @@ func streamHistogramGroupBy(
 // Replaces the composite string key used in streamHistogramGroupBy.
 // boundary is always a power-of-2 or 0 (never NaN), so float64 comparison is safe.
 // SPEC-ETM-13.4: float64 boundary key is safe because intrinsicHistogramBoundary never returns NaN.
-type histGroupIDKey struct {
-	dims      groupIDKey
-	boundary  float64
-	bucketIdx int64
-}
 
 // aggGroupIDKey is the map key for dict-ID keyed non-histogram aggregate group-by.
 // NOTE-074: Accumulates SUM/AVG/MIN/MAX/QUANTILE/STDDEV keyed by (groupIDKey, bucketIdx);
 // resolves to string at emit time (O(unique groups), not O(spans)).
-type aggGroupIDKey struct {
-	dims      groupIDKey
-	bucketIdx int64
-}
 
 // histSingleGroupIDKey is the map key for the N=1 dict-ID histogram group-by fast path.
 // Replaces histGroupIDKey for single-dimension queries, reducing key size from 48 to 24 bytes.
 // NOTE-082: N=1 fast path — smaller key means faster hash and less memcmp.
 // SPEC-ETM-13.4: float64 boundary key is safe (same invariant as histGroupIDKey).
-type histSingleGroupIDKey struct {
-	dictIdx   uint32
-	boundary  float64
-	bucketIdx int64
-}
 
 // aggSingleGroupIDKey is the map key for the N=1 dict-ID aggregate group-by fast path.
 // NOTE-082: N=1 fast path — 16 bytes vs 40 bytes for aggGroupIDKey.
-type aggSingleGroupIDKey struct {
-	bucketIdx int64
-	dictIdx   uint32
-}
 
 // histSingleAbsentKey is the map key for the N=1 nil-column histogram group-by fast path.
 // NOTE-082: N=1 fast path — 16 bytes vs 48 bytes for histGroupIDKey.
-type histSingleAbsentKey struct {
-	bucketIdx int64
-	dictIdx   uint32
-}
 
 // streamCountRateGroupByID is the dict-ID variant of streamCountRateGroupBy.
 // Uses map[groupIDKey][]int64 instead of map[string][]int64 for groupCounts,

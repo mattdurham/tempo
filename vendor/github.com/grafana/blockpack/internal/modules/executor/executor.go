@@ -20,33 +20,29 @@ import (
 
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
 	modules_shared "github.com/grafana/blockpack/internal/modules/blockio/shared"
-	"github.com/grafana/blockpack/internal/modules/queryplanner"
 )
 
 // SpanMatch is a span that matched the query.
-type SpanMatch struct {
-	Block    *modules_reader.Block // block containing this span; populated by structural executor
-	SpanID   []byte                // 8-byte span ID
-	BlockIdx int                   // block index within the file
-	RowIdx   int                   // row (span) index within the block
-	TraceID  [16]byte              // 16-byte trace ID
-}
+
+// block containing this span; populated by structural executor
+// 8-byte span ID
+// block index within the file
+// row (span) index within the block
+// 16-byte trace ID
 
 // Options controls query execution behavior.
-type Options struct {
-	// TimeRange constrains block scanning to blocks whose time window overlaps this range.
-	// A zero-value TimeRange disables time pruning.
-	TimeRange queryplanner.TimeRange
-	// Limit caps the number of returned matches. 0 means no limit.
-	Limit int
-	// StartBlock is the first internal block index to include (0-based, inclusive).
-	// Used by the frontend sharder to partition a single file across multiple jobs.
-	// 0 with BlockCount==0 means scan all blocks (no sub-file sharding).
-	StartBlock int
-	// BlockCount is the number of internal blocks to include starting from StartBlock.
-	// 0 means no sub-file sharding (scan all blocks selected by the planner).
-	BlockCount int
-}
+
+// TimeRange constrains block scanning to blocks whose time window overlaps this range.
+// A zero-value TimeRange disables time pruning.
+
+// Limit caps the number of returned matches. 0 means no limit.
+
+// StartBlock is the first internal block index to include (0-based, inclusive).
+// Used by the frontend sharder to partition a single file across multiple jobs.
+// 0 with BlockCount==0 means scan all blocks (no sub-file sharding).
+
+// BlockCount is the number of internal blocks to include starting from StartBlock.
+// 0 means no sub-file sharding (scan all blocks selected by the planner).
 
 // SpanMatchFromRow extracts a SpanMatch from a MatchedRow by reading the appropriate
 // trace and span identity columns for the given signal type. For trace signals it

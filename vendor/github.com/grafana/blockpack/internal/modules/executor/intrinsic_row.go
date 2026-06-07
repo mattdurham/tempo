@@ -47,20 +47,19 @@ func copy8(dst *[8]byte, b []byte) bool {
 // Fields are ordered per betteralign output: strings first (16-byte headers), then 8-byte scalars
 // (uint64, int64), then [8]byte fixed arrays, then smaller scalars (uint16), then [16]byte arrays.
 // NOTE-093: [8]byte eliminates clone; [8]byte{} is the zero value; the present bitmask (field: present) is the authoritative absent indicator.
-type intrinsicRowFields struct {
-	spanName      string   // span:name (dict string)
-	serviceName   string   // resource.service.name (dict string)
-	statusMessage string   // span:status_message (dict string)
-	spanStart     uint64   // span:start (flat uint64 nanoseconds)
-	spanEnd       uint64   // span:end (synthesized flat uint64 nanoseconds)
-	spanDuration  uint64   // span:duration (flat uint64 nanoseconds)
-	spanKind      int64    // span:kind (dict int64)
-	spanStatus    int64    // span:status (dict int64)
-	spanID        [8]byte  // span:id ([8]byte value type; [8]byte{} if absent — see present bitmask)
-	parentID      [8]byte  // span:parent_id ([8]byte value type; [8]byte{} if absent — see present bitmask)
-	present       uint16   // bitmask: which fields were populated
-	traceID       [16]byte // trace:id ([16]byte value type, always 16 bytes)
-}
+
+// span:name (dict string)
+// resource.service.name (dict string)
+// span:status_message (dict string)
+// span:start (flat uint64 nanoseconds)
+// span:end (synthesized flat uint64 nanoseconds)
+// span:duration (flat uint64 nanoseconds)
+// span:kind (dict int64)
+// span:status (dict int64)
+// span:id ([8]byte value type; [8]byte{} if absent — see present bitmask)
+// span:parent_id ([8]byte value type; [8]byte{} if absent — see present bitmask)
+// bitmask: which fields were populated
+// trace:id ([16]byte value type, always 16 bytes)
 
 // Bitmask constants for intrinsicRowFields.present (one per field).
 const (

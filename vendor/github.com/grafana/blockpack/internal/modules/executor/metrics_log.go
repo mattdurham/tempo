@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"unsafe"
 
 	"github.com/grafana/blockpack/internal/logqlparser"
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
@@ -18,18 +19,13 @@ import (
 // LogMetricsResult is the output of ExecuteLogMetrics.
 // SPEC-ELM-1: Nil reader returns empty LogMetricsResult with no error.
 // SPEC-ELM-2: Nil querySpec returns an error.
-type LogMetricsResult struct {
-	Rows          []LogMetricsRow // dense time-series rows
-	BytesRead     int64           // total raw bytes read
-	BlocksScanned int             // blocks parsed and evaluated
-}
+
+// dense time-series rows
+// total raw bytes read
+// blocks parsed and evaluated
 
 // LogMetricsRow is one row in the aggregation grid.
 // GroupKey[0] is the 0-indexed time-bucket number; GroupKey[1..] are group-by label values.
-type LogMetricsRow struct {
-	Values   map[string]float64
-	GroupKey []string
-}
 
 // logMetricsFunc constants map LogQL function names to their internal representation.
 const (
@@ -47,15 +43,11 @@ const (
 // aggBucketState holds accumulation state for a single time bucket.
 // SPEC-ELM-6: quantile_over_time requires collecting all values for post-scan percentile computation.
 // NOTE-033: mean and m2 support Welford online stddev for trace metrics (zero-init is safe for log metrics).
-type aggBucketState struct {
-	values []float64 // collected values for quantile_over_time; nil for other functions
-	sum    float64
-	count  int64
-	min    float64
-	max    float64
-	mean   float64 // Welford running mean (trace STDDEV only; zero for log metrics)
-	m2     float64 // Welford sum of squared deviations (trace STDDEV only; zero for log metrics)
-}
+
+// collected values for quantile_over_time; nil for other functions
+
+// Welford running mean (trace STDDEV only; zero for log metrics)
+// Welford sum of squared deviations (trace STDDEV only; zero for log metrics)
 
 // ExecuteLogMetrics runs a LogQL metric query against a blockpack log file.
 // SPEC-ELM-1 through SPEC-ELM-6: For each matched row, applies pipeline stages, then
@@ -124,29 +116,24 @@ func ExecuteLogMetrics(
 				delete(groupRaw, blockIdx)
 
 				meta := r.BlockMeta(blockIdx)
-				// NOTE-109: pooled intern map — eliminates per-block make(map[string]string).
-				internPtr := modules_reader.AcquireInternMap()
-				// intern and *internPtr share the same backing map; intern is passed to ParseBlockFromBytesWithIntern below
-				intern := *internPtr
-				bwb, parseErr := r.ParseBlockFromBytesWithIntern(raw, modules_reader.WantOnly(wantColumns), meta, intern)
+				bwb, parseErr := r.ParseBlockFromBytes(raw, modules_reader.WantOnly(wantColumns), meta)
 				if parseErr != nil {
-					modules_reader.ReleaseInternMap(internPtr)
 					return fmt.Errorf("ParseBlockFromBytes block %d: %w", blockIdx, parseErr)
 				}
 
-				provider := newBlockColumnProvider(bwb.Block)
+				provider := acquireBlockColumnProvider(bwb.Block)
 				rowSet, evalErr := program.ColumnPredicate(provider)
 				if evalErr != nil {
-					modules_reader.ReleaseInternMap(internPtr)
+					releaseBlockColumnProvider(provider)
 					return fmt.Errorf("ColumnPredicate block %d: %w", blockIdx, evalErr)
 				}
 
 				if rowSet.Size() == 0 {
-					modules_reader.ReleaseInternMap(internPtr)
+					releaseBlockColumnProvider(provider)
 					continue
 				}
 
-				// reader/NOTE-001: Columns registered by ParseBlockFromBytesWithIntern hold compressed bytes only;
+				// NOTE-001: Columns registered by ParseBlockFromBytes hold compressed bytes only;
 				// no decode happens at registration. Full decode is deferred to first accessor call
 				// via ensureDecompressed() + decodeNow().
 
@@ -172,7 +159,7 @@ func ExecuteLogMetrics(
 						attrVals,
 					)
 				}
-				modules_reader.ReleaseInternMap(internPtr) // NOTE-109: release after all lazy decodes
+				releaseBlockColumnProvider(provider)
 			}
 			return nil
 		},
@@ -252,22 +239,60 @@ func logAccumulateRow(
 	}
 
 	bucketIdx := (tsNanos - tb.StartTime) / tb.StepSizeNanos
-	bucketIdxStr := strconv.FormatInt(bucketIdx, 10)
 
 	// Build the group key from group-by label values.
 	for i, lbl := range groupBy {
 		attrVals[i] = labels.Get(lbl)
 	}
-	attrGroupKey := strings.Join(attrVals, "\x00")
-	compositeKey := bucketIdxStr + "\x00" + attrGroupKey
 
-	bucket, exists := buckets[compositeKey]
-	if !exists {
-		bucket = &aggBucketState{
-			min: math.MaxFloat64,
-			max: -math.MaxFloat64,
+	// NOTE-106: use a stack-local buffer to avoid 2-3 heap allocs per row for the common
+	// case where the bucket already exists. unsafe.String is valid only while buf is live
+	// (duration of this function call). lookupKey must not be stored, returned, or passed
+	// to a goroutine. On insert, string(buf[:n]) copies to the heap — alloc only on miss.
+	// Falls back to the original string path when the key exceeds logKeyHeapFallback bytes.
+	var buf [logKeyBufSize]byte
+	n := len(strconv.AppendInt(buf[:0], bucketIdx, 10))
+	if n < len(buf) {
+		buf[n] = 0
+		n++
+	}
+	truncated := false
+	for i, v := range attrVals {
+		copied := copy(buf[n:], v)
+		if copied < len(v) {
+			truncated = true
 		}
-		buckets[compositeKey] = bucket
+		n += copied
+		if i < len(attrVals)-1 && n < len(buf) {
+			buf[n] = 0
+			n++
+		}
+	}
+
+	var bucket *aggBucketState
+	var exists bool
+	if truncated || n > logKeyHeapFallback {
+		// Fallback: key too long for stack buffer — use original heap-allocated path.
+		compositeKey := strconv.FormatInt(bucketIdx, 10) + "\x00" + strings.Join(attrVals, "\x00")
+		bucket, exists = buckets[compositeKey]
+		if !exists {
+			bucket = &aggBucketState{
+				min: math.MaxFloat64,
+				max: -math.MaxFloat64,
+			}
+			buckets[compositeKey] = bucket
+		}
+	} else {
+		lookupKey := unsafe.String(&buf[0], n) //nolint:gosec // NOTE-106: buf is stack-local, lookupKey used only for map lookup within this function call
+		bucket, exists = buckets[lookupKey]
+		if !exists {
+			realKey := string(buf[:n]) // heap copy only on insert
+			bucket = &aggBucketState{
+				min: math.MaxFloat64,
+				max: -math.MaxFloat64,
+			}
+			buckets[realKey] = bucket
+		}
 	}
 
 	logUpdateBucket(labels, line, funcName, bucket)

@@ -16,13 +16,6 @@ import (
 // *modules_reader.Reader satisfies this interface.
 //
 // SPEC-STREAM-11: ReadGroup must be safe for concurrent calls; BlockMeta is read-only.
-type blockGroupReader interface {
-	ReadGroup(cr modules_shared.CoalescedRead) (map[int][]byte, error)
-	// ReadGroupColumnar downloads only bytes for wantColumns, routing through the section cache.
-	// Falls back to ReadGroup when wantColumns is nil or fileID is empty.
-	ReadGroupColumnar(cr modules_shared.CoalescedRead, wantColumns map[string]struct{}) (map[int][]byte, error)
-	BlockMeta(blockIdx int) modules_shared.BlockMeta
-}
 
 // defaultPipelineWorkers is the number of concurrent ReadGroup goroutines.
 // NOTE-058: W=8 is chosen for I/O latency hiding, not CPU utilization.
@@ -34,13 +27,6 @@ type blockGroupReader interface {
 const defaultPipelineWorkers = 8
 
 // groupResult carries the output of one ReadGroup call from a worker goroutine to the consumer.
-type groupResult struct {
-	err        error
-	data       map[int][]byte
-	groupIdx   int
-	blockCount int
-	byteCount  int64
-}
 
 // blockGroupPipeline dispatches ReadGroup calls concurrently across workerCount goroutines
 // and feeds completed groups to a sequential parse+process goroutine via a bounded channel.

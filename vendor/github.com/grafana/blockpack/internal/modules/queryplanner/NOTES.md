@@ -552,3 +552,128 @@ start with the smallest set, this empty-result short-circuit triggers as early a
 set intersection is commutative and associative. All existing correctness tests pass unchanged.
 
 **Back-ref:** `internal/modules/queryplanner/selection.go:intersectBySelectivity`
+
+---
+
+## NOTE-020: Lazy/Opt-In explainPlan — EnableExplain Flag in PlanOptions
+*Added: 2026-05-15*
+
+**Decision:** Add `EnableExplain bool` to `PlanOptions`. When false (zero-value default),
+`explainPlan` is skipped entirely inside `planInternal`. The executor's `planBlocks`
+leaves `EnableExplain` unset; callers that need the explain string must opt in explicitly.
+
+**Rationale:** pprof showed explainPlan accountable for ~63% of queryplanner allocs/op
+(strings.Builder + fmt.Sprintf + slice allocations unconditionally on every Plan call).
+The explain output is observability data — only useful in debug contexts. Making it opt-in
+reduces production allocs by ~60% with zero behaviour change to block selection.
+
+**Consequence:** `plan.Explain` is "" by default. Callers that consume `plan.Explain`
+(e.g. via QueryStats.Steps[0].Metadata["explain"]) must pass `EnableExplain: true`.
+File-level reject explanations (`plan.Explain = "file-level reject: ..."` in plan_blocks.go)
+remain unconditional — they are cheap single string assignments and carry important
+observability for fast-path file rejection.
+
+**Back-ref:** `internal/modules/queryplanner/planner.go:planInternal`
+
+---
+
+## NOTE-021: blockSet Replaces map[int]struct{} in selection.go
+*Added: 2026-05-15*
+
+**Decision:** `leafBlockSet`, `blockSetForPred`, and `intersectBySelectivity` use `blockSet`
+(the existing dense bitset in blockset.go) instead of `map[int]struct{}`. Return semantics
+change to `(blockSet, bool)` / `(blockSet, bool, error)` where bool=false means unconstrained
+(no index coverage), replacing the nil-map convention.
+
+**Rationale:** For a 32-block file the bitset is 8 bytes (1 uint64 word) vs multiple bucket
+allocations for a Go map. Bitwise AND (blockSet.and) replaces map-iteration intersection.
+Per-predicate map allocations (the second-largest source of queryplanner allocs per pprof)
+are eliminated.
+
+**Consequence:** All callers within selection.go and explain.go now pass blockCount int.
+The nil-map = unconstrained invariant is preserved via the bool return. Selection test
+helpers updated to use blockSet assertion patterns.
+
+**Back-ref:** `internal/modules/queryplanner/selection.go:leafBlockSet`,
+`internal/modules/queryplanner/selection.go:intersectBySelectivity`,
+`internal/modules/queryplanner/selection.go:blockSetForPred`,
+`internal/modules/queryplanner/selection.go:pruneByIndexAll`
+
+---
+
+## NOTE-022: Per-Block Scalar Accessors — DistinctAt, TopKMatchAt, FuseContainsAt
+*Added: 2026-05-15*
+
+**Decision:** Add `DistinctAt(blockIdx int) uint32`, `TopKMatchAt(valFP uint64, blockIdx int) uint16`,
+and `FuseContainsAt(valHash uint64, blockIdx int) bool` to the `ColumnSketch` interface.
+Rewrite `scoreBlocksForPred` and `pruneByFusePred` to use these per-block scalar accessors
+instead of the bulk slice-returning `Distinct()`, `TopKMatch()`, and `FuseContains()` methods.
+
+**Rationale:** The bulk methods allocate a fresh slice on every call — `make([]uint32, numBlocks)`,
+`make([]uint16, numBlocks)`, `make([]bool, numBlocks)` — purely to carry data to the caller's
+iteration loop. The per-block accessors expose the same data without any allocation: `DistinctAt`
+reads directly from `distinctRaw`; `TopKMatchAt` scans `topkFP[presentIdx]`; `FuseContainsAt`
+calls `sketch.BloomContains` directly. Combined: -3 allocs/op.
+
+**Consequence:** Callers that need all blocks at once (e.g., explain output, layout tools) continue
+to use the bulk slice-returning methods. New callers that iterate `candidates.iter(...)` must use
+the scalar accessors. `presentMap` is guaranteed sorted ascending by `parseColumnPresence` — the
+early-exit `break` in `TopKMatchAt` and `FuseContainsAt` is safe.
+
+**Back-ref:** `internal/modules/queryplanner/column_sketch.go:ColumnSketch`,
+`internal/modules/blockio/reader/sketch_index.go:DistinctAt,TopKMatchAt,FuseContainsAt`
+
+---
+
+## NOTE-023: []float64 Replaces map[int]float64 for Plan.BlockScores
+*Added: 2026-05-15*
+
+**Decision:** `scoreBlocks` now returns `[]float64` (length = blockCount, indexed by blockIdx)
+instead of `map[int]float64`. `Plan.BlockScores` changes type accordingly. `setToSortedByScore`
+accepts `[]float64`. Access pattern changes from map lookup `scores[blockIdx]` to direct
+slice index `scores[blockIdx]` with bounds-check.
+
+**Rationale:** For N=4 blocks, a Go map with 1 scored entry requires a map header (~104 B) and
+at least one bucket alloc from the `scores[blockIdx] +=` operation — 2 allocs total. A `[]float64`
+of len=4 is 32 bytes (single allocation) with O(1) direct access. `scoreBlocks` adds a `blockCount`
+parameter (available as `total` in `planInternal`) to allocate the correct length.
+
+**Score semantics:** `scores[i] == 0.0` means the block was not scored (no sketch data or not a
+candidate). This is indistinguishable from a scored block with score exactly 0 — but a score of
+exactly 0 only occurs when both `freq` and `card` are 0, which cannot happen (card is clamped to ≥1).
+
+**Consequence:** All callers that previously tested `_, ok := plan.BlockScores[b]` (map presence
+check) must now test `b < len(plan.BlockScores) && plan.BlockScores[b] > 0` (slice bounds + zero check).
+
+**Back-ref:** `internal/modules/queryplanner/scoring.go:scoreBlocks`,
+`internal/modules/queryplanner/planner.go:Plan.BlockScores,setToSortedByScore`
+
+---
+
+## NOTE-024: Stack Pre-Alloc for sets[] + Insertion Sort Replaces sort.Slice
+*Added: 2026-05-15*
+
+**Decision:** Two changes to `selection.go`:
+1. `pruneByIndexAll` and `blockSetForPred` (AND branch): replace `var sets []blockSet` with
+   `var setsArr [8]blockSet; sets := setsArr[:0]`. For ≤8 constrained predicates (virtually all
+   real queries), the backing array is stack-allocated — no heap alloc for the slice header.
+2. `intersectBySelectivity`: replace `sort.Slice(sets, func(...))` with `insertionSortBlockSets(sets)`.
+   For N≤8 (99th-percentile case), insertion sort avoids the closure overhead entirely.
+
+**Rationale:** Escape analysis shows `sets` backing array escapes to heap via `append`. The stack
+pre-alloc `[8]blockSet` avoids the first heap alloc for ≤8 elements (typical case). For `sort.Slice`,
+the Go toolchain does not always eliminate closure allocations; insertion sort is simpler and avoids
+any closure overhead for small N (≤8 is O(N²) but with N≤8 this is at most 56 comparisons).
+
+**Combined impact:** -2 allocs/op (backing array + sort overhead).
+
+**Consequence:** `import "sort"` removed from `selection.go`. Complexity preserved: `insertionSortBlockSets`
+has cyclomatic complexity 3 (well under 30).
+
+**Back-ref:** `internal/modules/queryplanner/selection.go:pruneByIndexAll,blockSetForPred,intersectBySelectivity,insertionSortBlockSets`
+
+*Addendum (2026-05-16):* Added n > 8 fallback to `sort.Slice` in `insertionSortBlockSets`. For ≤8
+sets (virtually all real queries), insertion sort avoids the closure allocation entirely. For >8 sets
+(rare, deep predicate trees with many constrained children), falling back to `sort.Slice` avoids
+O(n²) cost with the per-comparison `count()` calls. Re-added `import "sort"` to `selection.go` to
+support the fallback path.

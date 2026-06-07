@@ -63,60 +63,52 @@ func filterRefsByShardRange(refs []modules_shared.BlockRef, opts CollectOptions)
 }
 
 // CollectOptions configures collect execution for both trace and log signals.
-type CollectOptions struct {
-	// TimestampColumn is the column for per-row time filtering.
-	// Empty string disables per-row filtering (trace mode).
-	// "log:timestamp" enables per-row filtering (log mode).
-	TimestampColumn string
-	// SelectColumns limits which output columns are decoded from block blobs.
-	// nil or empty means all columns are returned (no projection applied).
-	// A nil slice and a non-nil empty slice are equivalent: both mean all columns are returned.
-	// Two-path strategy (see stream.go Collect for implementation):
-	//   - No predicate columns (e.g. "{}"): SelectColumns becomes the sole first-pass filter,
-	//     preventing all other columns from being decoded on every scanned block.
-	//   - Predicate columns present: SelectColumns is deferred to the second parse pass so
-	//     output-only columns are only decoded for blocks that match the filter, not for every
-	//     scanned block. Predicate columns are always included regardless of this list.
-	// NOTE: When AllColumns=true, SelectColumns has no effect (see AllColumns doc above).
-	SelectColumns []string
-	TimeRange     queryplanner.TimeRange
-	// Limit caps the number of returned rows. 0 means no limit (return all matches).
-	// Negative values are treated as 0 (unlimited) — the executor does not validate sign.
-	Limit int
-	// StartBlock is the first internal block index to include (0-based, inclusive).
-	// Used by the frontend sharder to partition a single file across multiple jobs.
-	// 0 with BlockCount==0 means scan all blocks (no sub-file sharding).
-	StartBlock int
-	// BlockCount is the number of internal blocks to include starting from StartBlock.
-	// 0 means no sub-file sharding (scan all blocks selected by the planner).
-	BlockCount int
-	// Direction controls block traversal order. Default (zero value) is Forward.
-	Direction queryplanner.Direction
-	// NOTE-028: AllColumns controls second-pass decode scope.
-	// false (default): second pass decodes searchMetaColumns ∪ wantColumns (predicate columns).
-	// true: second pass decodes all columns. Only needed when the callback calls IterateFields()
-	// to enumerate every attribute. Search queries never need this.
-	// NOTE: When AllColumns=true, computeColumnFilters returns early after computing wantColumns
-	// (predicate columns only) and sets secondPassCols=nil. A nil secondPassCols causes the second
-	// parse pass to decode all columns unconditionally. For queries with predicate columns,
-	// SelectColumns is NOT in wantColumns (it would normally be deferred to secondPassCols), so
-	// output-only columns are not pre-decoded in the first pass either. Net effect: AllColumns=true
-	// guarantees full column availability after the second pass; SelectColumns has no influence.
-	AllColumns bool
-}
+
+// TimestampColumn is the column for per-row time filtering.
+// Empty string disables per-row filtering (trace mode).
+// "log:timestamp" enables per-row filtering (log mode).
+
+// SelectColumns limits which output columns are decoded from block blobs.
+// nil or empty means all columns are returned (no projection applied).
+// A nil slice and a non-nil empty slice are equivalent: both mean all columns are returned.
+// Two-path strategy (see stream.go Collect for implementation):
+//   - No predicate columns (e.g. "{}"): SelectColumns becomes the sole first-pass filter,
+//     preventing all other columns from being decoded on every scanned block.
+//   - Predicate columns present: SelectColumns is deferred to the second parse pass so
+//     output-only columns are only decoded for blocks that match the filter, not for every
+//     scanned block. Predicate columns are always included regardless of this list.
+// NOTE: When AllColumns=true, SelectColumns has no effect (see AllColumns doc above).
+
+// Limit caps the number of returned rows. 0 means no limit (return all matches).
+// Negative values are treated as 0 (unlimited) — the executor does not validate sign.
+
+// StartBlock is the first internal block index to include (0-based, inclusive).
+// Used by the frontend sharder to partition a single file across multiple jobs.
+// 0 with BlockCount==0 means scan all blocks (no sub-file sharding).
+
+// BlockCount is the number of internal blocks to include starting from StartBlock.
+// 0 means no sub-file sharding (scan all blocks selected by the planner).
+
+// Direction controls block traversal order. Default (zero value) is Forward.
+
+// NOTE-028: AllColumns controls second-pass decode scope.
+// false (default): second pass decodes searchMetaColumns ∪ wantColumns (predicate columns).
+// true: second pass decodes all columns. Only needed when the callback calls IterateFields()
+// to enumerate every attribute. Search queries never need this.
+// NOTE: When AllColumns=true, computeColumnFilters returns early after computing wantColumns
+// (predicate columns only) and sets secondPassCols=nil. A nil secondPassCols causes the second
+// parse pass to decode all columns unconditionally. For queries with predicate columns,
+// SelectColumns is NOT in wantColumns (it would normally be deferred to secondPassCols), so
+// output-only columns are not pre-decoded in the first pass either. Net effect: AllColumns=true
+// guarantees full column availability after the second pass; SelectColumns has no influence.
 
 // MatchedRow holds a single row result from Collect.
-type MatchedRow struct {
-	Block *modules_reader.Block
-	// IntrinsicFields is set when the result was produced by the intrinsic fast path
-	// without reading full blocks. The caller should use this for field lookups
-	// when Block is nil.
-	IntrinsicFields modules_shared.SpanFieldsProvider
-	// Score is the cosine similarity for VECTOR() queries. Zero for non-vector queries.
-	Score    float32
-	BlockIdx int
-	RowIdx   int
-}
+
+// IntrinsicFields is set when the result was produced by the intrinsic fast path
+// without reading full blocks. The caller should use this for field lookups
+// when Block is nil.
+
+// Score is the cosine similarity for VECTOR() queries. Zero for non-vector queries.
 
 // Collect selects candidate blocks via queryplanner and evaluates program.ColumnPredicate
 // against each block's spans, collecting all matched rows into a slice.
@@ -378,19 +370,29 @@ func scanBlocks(
 	groups []modules_shared.CoalescedRead,
 	results *[]MatchedRow,
 ) (int, int, int64, error) {
-	// Pre-build a blockToGroup map and a groupToBlocks index (maintaining selectedBlocks order)
+	// Pre-build a blockToGroup index and a groupToBlocks index (maintaining selectedBlocks order)
 	// so processGroup iterates only the ~N/G blocks relevant to its group rather than all N.
 	// This restores O(N) total work across all groups (O(N/G) per group × G groups).
-	blockToGroup := make(map[int]int, len(selectedBlocks))
+	// NOTE-105: flat []int replaces map[int]int — block IDs are bounded by r.BlockCount().
+	blockCount := r.BlockCount()
+	blockToGroupSlice := make([]int, blockCount)
+	for i := range blockToGroupSlice {
+		blockToGroupSlice[i] = -1
+	}
 	for gi, g := range groups {
 		for _, bi := range g.BlockIDs {
-			blockToGroup[bi] = gi
+			if bi < blockCount {
+				blockToGroupSlice[bi] = gi
+			}
 		}
 	}
 	groupToBlocks := make([][]int, len(groups))
 	for _, bi := range selectedBlocks {
-		gi, ok := blockToGroup[bi]
-		if !ok {
+		if bi >= blockCount {
+			continue
+		}
+		gi := blockToGroupSlice[bi]
+		if gi == -1 {
 			continue
 		}
 		groupToBlocks[gi] = append(groupToBlocks[gi], bi)
@@ -425,7 +427,8 @@ func scanBlocks(
 				return fmt.Errorf("ParseBlockFromBytes block %d: %w", blockIdx, parseErr)
 			}
 
-			provider := newBlockColumnProvider(bwb.Block)
+			// NOTE-102: use pooled provider to avoid per-block heap allocation.
+			provider := acquireBlockColumnProvider(bwb.Block)
 			// Only strip intrinsic predicates when the file has an intrinsic section.
 			// Log files do not have an intrinsic section; their block columns still hold
 			// all label values and ColumnPredicate must evaluate them directly.
@@ -442,11 +445,13 @@ func scanBlocks(
 				rowSet, evalErr = program.ColumnPredicate(provider)
 			}
 			if evalErr != nil {
+				releaseBlockColumnProvider(provider)
 				modules_reader.ReleaseInternMap(internPtr)
 				return fmt.Errorf("ColumnPredicate block %d: %w", blockIdx, evalErr)
 			}
 
 			if rowSet.Size() == 0 {
+				releaseBlockColumnProvider(provider)
 				modules_reader.ReleaseInternMap(internPtr)
 				continue
 			}
@@ -458,6 +463,7 @@ func scanBlocks(
 			if len(intrNodes) > 0 && r.HasIntrinsicSection() {
 				rowSet = filterRowSetByIntrinsicNodes(r, blockIdx, rowSet, intrNodes)
 				if rowSet.Size() == 0 {
+					releaseBlockColumnProvider(provider)
 					modules_reader.ReleaseInternMap(internPtr)
 					continue
 				}
@@ -466,8 +472,14 @@ func scanBlocks(
 			// NOTE-018: Second pass — decode result columns now that we know this block has matches.
 			// NOTE-028: secondPassCols is pre-computed above (searchMetaColumns ∪ wantColumns, or nil for all).
 			if wantColumns != nil {
-				bwb, parseErr = r.ParseBlockFromBytesWithIntern(bwb.RawBytes, modules_reader.WantOnly(secondPassCols), meta, intern)
+				bwb, parseErr = r.ParseBlockFromBytesWithIntern(
+					bwb.RawBytes,
+					modules_reader.WantOnly(secondPassCols),
+					meta,
+					intern,
+				)
 				if parseErr != nil {
+					releaseBlockColumnProvider(provider)
 					modules_reader.ReleaseInternMap(internPtr)
 					return fmt.Errorf("ParseBlockFromBytes (second pass) block %d: %w", blockIdx, parseErr)
 				}
@@ -478,6 +490,7 @@ func scanBlocks(
 			// Non-vector queries take the streamSortedRows path unchanged.
 			if program.VectorScorer != nil {
 				scoredRows := applyVectorScorerToBlock(bwb.Block, program, rowSet)
+				releaseBlockColumnProvider(provider)
 				modules_reader.ReleaseInternMap(internPtr)
 				for _, sr := range scoredRows {
 					*results = append(*results, MatchedRow{
@@ -496,6 +509,8 @@ func scanBlocks(
 			// is never accessed again (no Contains calls) after this point in scanBlocks.
 			// If rowSet reuse is added in future, restore slices.Clone here to preserve the
 			// ascending-sorted invariant required by rowSet.Contains.
+			// NOTE-107: rows may point into p.scratch; provider must not be released until after
+			// streamSortedRows completes, so that no concurrent goroutine can overwrite p.scratch.
 			rows := rowSet.ToSlice()
 
 			// SPEC-STREAM-5: Sort rows by per-row timestamp when TimestampColumn is set.
@@ -505,6 +520,7 @@ func scanBlocks(
 			}
 
 			stop := streamSortedRows(bwb.Block, blockIdx, rows, tsCol, opts, results)
+			releaseBlockColumnProvider(provider)
 			// Release intern map after all lazy decodes in streamSortedRows are complete.
 			modules_reader.ReleaseInternMap(internPtr)
 			if stop {
@@ -743,10 +759,6 @@ func collectFromIntrinsicRefs(
 }
 
 // parsedBlock holds the result of the two-pass parse for one block.
-type parsedBlock struct {
-	Block    *modules_reader.Block
-	BlockIdx int
-}
 
 // groupRefsByBlock converts a slice of BlockRefs into a stable block traversal order
 // and a map from block index to row indices. The order preserves first-seen block order.
@@ -853,7 +865,14 @@ func forEachBlockInGroups(
 	}
 	// SPEC-STREAM-11: concurrent I/O via blockGroupPipeline; processGroup called sequentially.
 	// TODO: propagate caller context (NOTE-058: forEachBlockInGroups callers do not yet accept context.Context).
-	_, _, _, err := blockGroupPipeline(context.Background(), r, groups, defaultPipelineWorkers, filterCols, processGroup)
+	_, _, _, err := blockGroupPipeline(
+		context.Background(),
+		r,
+		groups,
+		defaultPipelineWorkers,
+		filterCols,
+		processGroup,
+	)
 	return err
 }
 
@@ -1240,35 +1259,46 @@ func collectMixedPlain(
 		resultsCap = opts.Limit
 	}
 	results := make([]MatchedRow, 0, resultsCap)
-	// rowSet and preFnErr are shared between preFn (which evaluates the predicate) and fn
+	// rowSet, provider, and preFnErr are shared between preFn (which evaluates the predicate) and fn
 	// (which intersects). processGroup is called sequentially so no lock is needed.
+	// provider is released in fn (after rowSet is fully consumed) when fn is called, or in preFn
+	// when fn is skipped (Size()==0), to prevent the scratch-backing race.
 	var mixedPlainRowSet vm.RowSet
 	var mixedPlainPreFnErr error
+	var mixedPlainProvider *blockColumnProvider
 	// Coalesce all candidate blocks for efficient batch I/O.
 	err := forEachBlockInGroups(
 		r, blockOrder, blockCandidates, wantColumns, secondPassCols, "collectMixedPlain",
 		func(pb parsedBlock, candidateRows []int) bool {
 			// Re-evaluate the full predicate on the first-pass block to gate second-pass decode.
-			provider := newBlockColumnProvider(pb.Block)
+			// NOTE-102: use pooled provider to avoid per-block heap allocation.
+			mixedPlainProvider = acquireBlockColumnProvider(pb.Block)
 			mixedPlainPreFnErr = nil
 			if r.HasIntrinsicSection() {
 				uap := userAttrProgram(program)
 				if uap == nil {
-					mixedPlainRowSet = provider.FullScan()
+					mixedPlainRowSet = mixedPlainProvider.FullScan()
 				} else {
-					mixedPlainRowSet, mixedPlainPreFnErr = uap.ColumnPredicate(provider)
+					mixedPlainRowSet, mixedPlainPreFnErr = uap.ColumnPredicate(mixedPlainProvider)
 				}
 			} else {
-				mixedPlainRowSet, mixedPlainPreFnErr = program.ColumnPredicate(provider)
+				mixedPlainRowSet, mixedPlainPreFnErr = program.ColumnPredicate(mixedPlainProvider)
 			}
 			if mixedPlainPreFnErr != nil {
 				// Treat evaluation errors conservatively: allow fn to run so it can
 				// surface the error with full block context.
 				return true
 			}
-			return mixedPlainRowSet.Size() > 0
+			if mixedPlainRowSet.Size() == 0 {
+				// fn will not be called — release provider here before returning false.
+				releaseBlockColumnProvider(mixedPlainProvider)
+				return false
+			}
+			return true
 		},
 		func(pb parsedBlock, candidateRows []int) error {
+			// fn is called only when preFn returned true; release provider after consuming rowSet.
+			defer releaseBlockColumnProvider(mixedPlainProvider)
 			if mixedPlainPreFnErr != nil {
 				return fmt.Errorf("collectMixedPlain ColumnPredicate block %d: %w", pb.BlockIdx, mixedPlainPreFnErr)
 			}
@@ -1332,46 +1362,60 @@ func collectMixedTopK(
 
 	buf := &topKHeap{entries: make([]topKEntry, 0, opts.Limit), backward: backward}
 
-	// rowSet and preFnErr are shared between preFn and fn; processGroup is sequential so no lock needed.
+	// rowSet, provider, and preFnErr are shared between preFn and fn; processGroup is sequential so no lock needed.
+	// provider is released in fn (after rowSet is fully consumed) when fn is called, or in preFn
+	// when fn is skipped (Size()==0), to prevent the scratch-backing race.
 	var mixedTopKRowSet vm.RowSet
 	var mixedTopKPreFnErr error
+	var mixedTopKProvider *blockColumnProvider
 	// Coalesce all candidate blocks for efficient batch I/O.
 	if err := forEachBlockInGroups(
 		r, blockOrder, blockCandidates, wantColumns, secondPassCols, "collectMixedTopK",
 		func(pb parsedBlock, candidateRows []int) bool {
 			// Re-evaluate the full predicate on the first-pass block to gate second-pass decode.
-			provider := newBlockColumnProvider(pb.Block)
+			// NOTE-102: use pooled provider to avoid per-block heap allocation.
+			mixedTopKProvider = acquireBlockColumnProvider(pb.Block)
 			mixedTopKPreFnErr = nil
 			if r.HasIntrinsicSection() {
 				uap := userAttrProgram(program)
 				if uap == nil {
-					mixedTopKRowSet = provider.FullScan()
+					mixedTopKRowSet = mixedTopKProvider.FullScan()
 				} else {
-					mixedTopKRowSet, mixedTopKPreFnErr = uap.ColumnPredicate(provider)
+					mixedTopKRowSet, mixedTopKPreFnErr = uap.ColumnPredicate(mixedTopKProvider)
 				}
 			} else {
-				mixedTopKRowSet, mixedTopKPreFnErr = program.ColumnPredicate(provider)
+				mixedTopKRowSet, mixedTopKPreFnErr = program.ColumnPredicate(mixedTopKProvider)
 			}
 			if mixedTopKPreFnErr != nil {
 				// Treat evaluation errors conservatively: allow fn to run so it can
 				// surface the error with full block context.
 				return true
 			}
-			return mixedTopKRowSet.Size() > 0
+			if mixedTopKRowSet.Size() == 0 {
+				// fn will not be called — release provider here before returning false.
+				releaseBlockColumnProvider(mixedTopKProvider)
+				return false
+			}
+			return true
 		},
 		func(pb parsedBlock, candidateRows []int) error {
+			// fn is called only when preFn returned true; release provider after consuming rowSet.
+			defer releaseBlockColumnProvider(mixedTopKProvider)
 			if mixedTopKPreFnErr != nil {
 				return fmt.Errorf("collectMixedTopK ColumnPredicate block %d: %w", pb.BlockIdx, mixedTopKPreFnErr)
 			}
 			// mixedTopKRowSet was set by preFn; we arrive here only when Size() > 0.
 			// Collect rows that pass both the pre-filter and full predicate.
-			qualifying := make([]int, 0, len(candidateRows))
+			// NOTE-101: use pooled scratch slice to avoid per-block allocation.
+			qualifyingPtr := acquireRowIndexScratch()
+			qualifying := (*qualifyingPtr)[:0]
 			for _, rowIdx := range candidateRows {
 				if mixedTopKRowSet.Contains(rowIdx) {
 					qualifying = append(qualifying, rowIdx)
 				}
 			}
 			if len(qualifying) == 0 {
+				releaseRowIndexScratch(qualifyingPtr)
 				return nil
 			}
 
@@ -1384,6 +1428,8 @@ func collectMixedTopK(
 			} else {
 				topKScanRows(buf, opts.Limit, backward, pb.Block, pb.BlockIdx, tsCol, opts.TimeRange, qualifying)
 			}
+			*qualifyingPtr = qualifying // write back grown slice so pool retains the post-grow backing array
+			releaseRowIndexScratch(qualifyingPtr)
 			return nil
 		},
 	); err != nil {
@@ -1411,7 +1457,14 @@ func filterRowSetByIntrinsicNodes(
 		return rowSet
 	}
 	// Build BlockRef slice for the candidate rows.
-	refs := make([]modules_shared.BlockRef, len(rows))
+	// NOTE-104: stack pre-alloc for ≤refsStackPreallocSize rows avoids a heap allocation in the common case.
+	var refsArr [refsStackPreallocSize]modules_shared.BlockRef
+	var refs []modules_shared.BlockRef
+	if len(rows) <= refsStackPreallocSize {
+		refs = refsArr[:len(rows)]
+	} else {
+		refs = make([]modules_shared.BlockRef, len(rows))
+	}
 	for i, rowIdx := range rows {
 		refs[i] = modules_shared.BlockRef{
 			BlockIdx: uint16(blockIdx), //nolint:gosec // bounded by file block count
@@ -1424,11 +1477,13 @@ func filterRowSetByIntrinsicNodes(
 	if len(want) == 0 {
 		return rowSet // no intrinsic columns in nodes
 	}
-	fields, err := lookupIntrinsicFields(r, refs, want)
+	// NOTE-104: use typed lookup — returns []intrinsicRowFields (value structs) instead of
+	// []map[string]any, eliminating N heap-allocated maps for N candidate rows.
+	fields, err := lookupIntrinsicFieldsTyped(r, refs, want)
 	if err != nil {
 		// I/O error reading intrinsic columns: conservative fallback — return all
 		// candidates unpruned rather than incorrectly excluding matches.
-		slog.Error("filterRowSetByIntrinsicNodes: lookupIntrinsicFields failed, skipping intrinsic filter",
+		slog.Error("filterRowSetByIntrinsicNodes: lookupIntrinsicFieldsTyped failed, skipping intrinsic filter",
 			"err", err)
 		return rowSet
 	}
@@ -1436,7 +1491,7 @@ func filterRowSetByIntrinsicNodes(
 	// treated as "absent" and fail the predicate (absent value != any predicate value).
 	filtered := newRowSetWithCap(len(rows))
 	for i, rowIdx := range rows {
-		if rowSatisfiesIntrinsicNodes(nodes, fields[i]) {
+		if rowSatisfiesIntrinsicNodesTyped(nodes, &fields[i]) {
 			filtered.Add(rowIdx)
 		}
 	}

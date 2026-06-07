@@ -14,6 +14,7 @@ package reader
 import (
 	"encoding/binary"
 	"fmt"
+	"sort"
 
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
 	"github.com/grafana/blockpack/internal/modules/queryplanner"
@@ -38,31 +39,24 @@ var _ queryplanner.ColumnSketch = (*columnSketchData)(nil)
 
 // columnSketchData holds parsed column-major sketch data for one column across all blocks.
 // Bloom data is stored as a zero-copy sub-slice of the metadata buffer; no copy is made at parse time.
-type columnSketchData struct {
-	presence   []uint64   // bitset: 1 bit per block
-	topkFP     [][]uint64 // [presentIdx][entries] fingerprints
-	topkCount  [][]uint16 // [presentIdx][entries] counts
-	presentMap []int      // presentMap[i] = blockIdx of the i-th present block
 
-	// NOTE-PERF-SKETCH: distinctRaw stores raw 4-byte-per-block distinct counts as a zero-copy
-	// sub-slice of the metadata buffer. Distinct() decodes on demand, eliminating make([]uint32,
-	// numBlocks) per column at parse time. distinctAt() provides single-block access used by
-	// layout and file_sketch_summary.
-	distinctRaw []byte // numBlocks×4 LE uint32s; zero-copy sub-slice of metadataBytes
+// bitset: 1 bit per block
+// [presentIdx][entries] fingerprints
+// [presentIdx][entries] counts
+// presentMap[i] = blockIdx of the i-th present block
 
-	// Bloom filters: raw byte slices into the metadata buffer, one per present block.
-	// Zero-copy: slices reference the decompressed metadata buffer retained by the Reader.
-	// Nil/empty for blocks parsed from legacy fuse-format files (FuseContains returns true).
-	bloom [][]byte // [presentIdx] each slice is exactly sketch.SketchBloomBytes bytes
+// NOTE-PERF-SKETCH: distinctRaw stores raw 4-byte-per-block distinct counts as a zero-copy
+// sub-slice of the metadata buffer. Distinct() decodes on demand, eliminating make([]uint32,
+// numBlocks) per column at parse time. distinctAt() provides single-block access used by
+// layout and file_sketch_summary.
+// numBlocks×4 LE uint32s; zero-copy sub-slice of metadataBytes
 
-	numBlocks int
-}
+// Bloom filters: raw byte slices into the metadata buffer, one per present block.
+// Zero-copy: slices reference the decompressed metadata buffer retained by the Reader.
+// Nil/empty for blocks parsed from legacy fuse-format files (FuseContains returns true).
+// [presentIdx] each slice is exactly sketch.SketchBloomBytes bytes
 
 // sketchIndex holds all column sketch data for the file.
-type sketchIndex struct {
-	columns   map[string]*columnSketchData
-	numBlocks int
-}
 
 // SizeBytes returns the estimated in-memory size of this sketchIndex for LRU cache budgeting.
 // Counts owned heap allocations (topkFP, topkCount, presentMap, presence) plus the bloom and
@@ -121,6 +115,74 @@ func (cd *columnSketchData) distinctAt(blockIdx int) uint32 {
 		return 0
 	}
 	return binary.LittleEndian.Uint32(cd.distinctRaw[offset:])
+}
+
+// presentIdxFor returns the present-index for blockIdx using binary search.
+// presentMap is always sorted ascending by blockIdx (see parseColumnPresence).
+// Returns (i, true) when blockIdx is found at presentMap[i]; (0, false) otherwise.
+// O(log presentCount).
+func (cd *columnSketchData) presentIdxFor(blockIdx int) (int, bool) {
+	n := len(cd.presentMap)
+	i := sort.Search(n, func(i int) bool {
+		return cd.presentMap[i] >= blockIdx
+	})
+	if i < n && cd.presentMap[i] == blockIdx {
+		return i, true
+	}
+	return 0, false
+}
+
+// DistinctAt returns the distinct count for blockIdx via the ColumnSketch interface.
+// Delegates to the private distinctAt method for zero-allocation per-block scoring.
+// Returns 0 when blockIdx < 0 or out of range.
+// NOTE-022: scalar accessor — no slice allocation.
+func (cd *columnSketchData) DistinctAt(blockIdx int) uint32 {
+	if blockIdx < 0 {
+		return 0
+	}
+	return cd.distinctAt(blockIdx)
+}
+
+// TopKMatchAt returns the TopK count for valFP at blockIdx.
+// Uses binary search over presentMap — O(log presentCount + K).
+// Returns 0 if blockIdx < 0, has no topk data, or valFP is not in top-K.
+// presentMap is always sorted ascending (built in blockIdx order by parseColumnPresence).
+// NOTE-022: scalar accessor — no slice allocation.
+func (cd *columnSketchData) TopKMatchAt(valFP uint64, blockIdx int) uint16 {
+	if blockIdx < 0 {
+		return 0
+	}
+	pi, ok := cd.presentIdxFor(blockIdx)
+	if !ok {
+		return 0
+	}
+	for j, fp := range cd.topkFP[pi] {
+		if fp == valFP {
+			return cd.topkCount[pi][j]
+		}
+	}
+	return 0
+}
+
+// FuseContainsAt returns whether the bloom filter for blockIdx indicates valHash may be present.
+// Uses binary search over presentMap — O(log presentCount).
+// Returns false when blockIdx < 0 or column is absent from that block.
+// Returns true (conservative) for present blocks without bloom data.
+// presentMap is always sorted ascending (built in blockIdx order by parseColumnPresence).
+// NOTE-022: scalar accessor — no slice allocation.
+func (cd *columnSketchData) FuseContainsAt(valHash uint64, blockIdx int) bool {
+	if blockIdx < 0 {
+		return false
+	}
+	pi, ok := cd.presentIdxFor(blockIdx)
+	if !ok {
+		// blockIdx not in presentMap — column absent from block; value cannot be present.
+		return false
+	}
+	if pi >= len(cd.bloom) || cd.bloom[pi] == nil {
+		return true // conservative: no bloom data for this block
+	}
+	return sketch.BloomContains(cd.bloom[pi], valHash)
 }
 
 // TopKMatch returns the TopK count for valFP per block (0 if not in top-K or absent).

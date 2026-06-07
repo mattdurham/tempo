@@ -5,18 +5,12 @@ package shared
 import (
 	"encoding/binary"
 	"fmt"
-	"sync"
 )
 
 // DirEntryType describes a type-keyed entry in the V14 section directory.
 // Used for the 6 fixed file-level sections (block index, range index, etc.).
 // Wire format: entry_kind[1]=0x00 + section_type[1] + offset[8] + compressed_len[4] = 14 bytes.
 // Fields are ordered for minimal struct padding (string header first, then scalar fields).
-type DirEntryType struct {
-	Offset        uint64
-	CompressedLen uint32
-	SectionType   uint8
-}
 
 // DirEntryTypeWireSize is the fixed on-wire size of one type-keyed directory entry.
 // entry_kind[1]+section_type[1]+offset[8]+compressed_len[4] = 14 bytes.
@@ -65,11 +59,6 @@ const (
 // Used for file-level intrinsic column blobs (one entry per column).
 // Wire format: entry_kind[1]=0x01 + name_len[2] + name + offset[8] + compressed_len[4] = 15+len(name) bytes.
 // Fields are ordered for minimal struct padding (string header first, then scalar fields).
-type DirEntryName struct {
-	Name          string
-	Offset        uint64
-	CompressedLen uint32
-}
 
 // WireSize returns the variable on-wire size of this name-keyed directory entry.
 // entry_kind[1]+name_len[2]+name+offset[8]+compressed_len[4] = 15+len(name) bytes.
@@ -132,29 +121,14 @@ func UnmarshalDirEntryName(data []byte) (DirEntryName, int, error) {
 // NameEntries maps intrinsic column name to its name-keyed entry.
 // SignalType holds the file's signal type (SignalTypeTrace=0x01, SignalTypeLog=0x02).
 // Defaults to 0 (unknown) if no DirEntryKindSignal entry is present.
-type SectionDirectory struct {
-	TypeEntries map[uint8]DirEntryType
-	NameEntries map[string]DirEntryName
-	SignalType  uint8
-}
 
 // ToCKey is the lookup key in a V8 unified Table of Contents.
 // Struct equality is used for map lookups — no custom hash needed.
 // Fields are ordered for minimal struct padding (string header first, then scalar fields).
-type ToCKey struct {
-	Name    string
-	Type    uint32
-	SubType uint32
-}
 
 // ToCEntry is one record in the V8 unified ToC blob.
 // Wire format: type[4 LE] + subtype[4 LE] + name_len[2 LE] + name[name_len] + offset[8 LE] + length[4 LE]
 // Minimum wire size (name=""): 4+4+2+0+8+4 = 22 bytes.
-type ToCEntry struct {
-	Key    ToCKey
-	Offset uint64
-	Length uint32
-}
 
 // ToCEntryMinWireSize is the wire size of a ToCEntry with Name="".
 // type[4]+subtype[4]+name_len[2]+offset[8]+length[4] = 22 bytes.
@@ -181,7 +155,10 @@ func (e ToCEntry) Marshal() []byte {
 func (e ToCEntry) MarshalInto(dst []byte) {
 	binary.LittleEndian.PutUint32(dst[0:], e.Key.Type)
 	binary.LittleEndian.PutUint32(dst[4:], e.Key.SubType)
-	binary.LittleEndian.PutUint16(dst[8:], uint16(len(e.Key.Name))) //nolint:gosec // bounded by MaxNameLen (1024), fits in uint16
+	binary.LittleEndian.PutUint16(
+		dst[8:],
+		uint16(len(e.Key.Name)), //nolint:gosec // bounded by MaxNameLen (1024), fits in uint16
+	)
 	copy(dst[10:], e.Key.Name)
 	off := 10 + len(e.Key.Name)
 	binary.LittleEndian.PutUint64(dst[off:], e.Offset)
@@ -242,35 +219,12 @@ type BlockKind uint8
 const BlockKindLeaf BlockKind = 0
 
 // BlockMeta holds the parsed block index entry.
-type BlockMeta struct {
-	Offset     uint64
-	Length     uint64
-	MinStart   uint64
-	MaxStart   uint64
-	SpanCount  uint32
-	MinTraceID [16]byte
-	MaxTraceID [16]byte
-	Kind       BlockKind
-}
 
 // AttrValue is a typed attribute value.
-type AttrValue struct {
-	Str   string
-	Bytes []byte
-	Int   int64
-	Uint  uint64
-	Float float64
-	Bool  bool
-	Type  ColumnType
-}
 
 // AttrKV is a key-value pair for span, resource, or scope attributes.
 // Using a slice of AttrKV instead of map[string]AttrValue eliminates per-span map
 // allocations (map headers + hash buckets), reducing GC scan work significantly.
-type AttrKV struct {
-	Key string
-	Val AttrValue
-}
 
 // ColumnKey is a composite key for a column: the combination of name and type
 // uniquely identifies a column within type-aware column maps (for example,
@@ -279,43 +233,27 @@ type AttrKV struct {
 // and int64 on another); using ColumnKey in these maps prevents silent data loss.
 // Note: some indices (e.g. bloom filter, range index) remain name-only intentionally
 // — they are used for block-level pruning where false positives are acceptable.
-type ColumnKey struct {
-	Name string
-	Type ColumnType
-}
 
 // RangeValueKey is a string key used in the range index.
 type RangeValueKey = string
 
 // BlockRef is a (blockIdx, rowIdx) pair identifying one row's location in a blockpack file.
 // Used in IntrinsicColumn to map sorted column values back to their source rows.
-type BlockRef struct {
-	BlockIdx uint16
-	RowIdx   uint16
-}
 
 // IntrinsicColumn is the decoded result of reading one intrinsic column blob.
 // Returned by GetIntrinsicColumn on a Reader.
-type IntrinsicColumn struct {
-	Name string
-	// For flat columns (IntrinsicFormatFlat):
-	Uint64Values []uint64   // non-nil for ColumnTypeUint64
-	BytesValues  [][]byte   // non-nil for ColumnTypeBytes
-	BlockRefs    []BlockRef // parallel to Uint64Values / BytesValues; sorted by VALUE
-	// For dict columns (IntrinsicFormatDict):
-	DictEntries []IntrinsicDictEntry
 
-	// refIndex is a sorted-by-packed-ref lookup table for O(log N) reverse lookup.
-	// Built lazily by EnsureRefIndex on first reverse-lookup call.
-	// For flat: Pos indexes into BlockRefs/Uint64Values/BytesValues.
-	// For dict: Pos is the DictEntries index.
-	// Thread safety: built under refIndexOnce; safe for concurrent reads after that.
-	refIndex     []RefIndexEntry
-	refIndexOnce sync.Once
-	Count        uint32
-	Type         ColumnType
-	Format       uint8
-}
+// For flat columns (IntrinsicFormatFlat):
+// non-nil for ColumnTypeUint64
+// non-nil for ColumnTypeBytes
+// parallel to Uint64Values / BytesValues; sorted by VALUE
+// For dict columns (IntrinsicFormatDict):
+
+// refIndex is a sorted-by-packed-ref lookup table for O(log N) reverse lookup.
+// Built lazily by EnsureRefIndex on first reverse-lookup call.
+// For flat: Pos indexes into BlockRefs/Uint64Values/BytesValues.
+// For dict: Pos is the DictEntries index.
+// Thread safety: built under refIndexOnce; safe for concurrent reads after that.
 
 // SizeBytes returns an estimate of the in-memory size of this column for LRU cache budgeting.
 func (col *IntrinsicColumn) SizeBytes() int64 {
@@ -333,52 +271,43 @@ func (col *IntrinsicColumn) SizeBytes() int64 {
 
 // RefIndexEntry is one entry in IntrinsicColumn.refIndex.
 // Enables O(log N) reverse lookup from packed ref to column value.
-type RefIndexEntry struct {
-	Packed uint32 // blockIdx<<16 | rowIdx
-	Pos    int32  // index into BlockRefs/values (flat) or DictEntries (dict)
-}
+
+// blockIdx<<16 | rowIdx
+// index into BlockRefs/values (flat) or DictEntries (dict)
 
 // IntrinsicDictEntry is one entry in a decoded dictionary intrinsic column.
-type IntrinsicDictEntry struct {
-	Value     string // string representation (for Int64: decimal string)
-	BlockRefs []BlockRef
-	Int64Val  int64 // set for Int64 type
-}
+
+// string representation (for Int64: decimal string)
+
+// set for Int64 type
 
 // PageMeta describes one page in a paged (v2) intrinsic column.
 // All page blobs are stored contiguously after the page TOC blob in the on-disk region.
-type PageMeta struct {
-	// Pointer fields first for better GC scan alignment.
-	Min   string // encoded min value (same encoding as IntrinsicColMeta)
-	Max   string // encoded max value
-	Bloom []byte // bloom filter bytes; nil for flat columns
-	// Scalar fields.
-	Offset   uint32 // byte offset of this page blob relative to first page blob start
-	Length   uint32 // compressed page blob size in bytes
-	RowCount uint32 // number of records in this page
-}
+
+// Pointer fields first for better GC scan alignment.
+// encoded min value (same encoding as IntrinsicColMeta)
+// encoded max value
+// bloom filter bytes; nil for flat columns
+// Scalar fields.
+// byte offset of this page blob relative to first page blob start
+// compressed page blob size in bytes
+// number of records in this page
 
 // PagedIntrinsicTOC holds the page index (table of contents) for one v2 paged column.
 // It is decoded from the snappy-compressed TOC blob that precedes the page blobs.
-type PagedIntrinsicTOC struct {
-	Pages         []PageMeta
-	BlockIdxWidth uint8
-	RowIdxWidth   uint8
-	Format        uint8 // IntrinsicFormatFlat, IntrinsicFormatDict, IntrinsicFormatXORBytes, or IntrinsicFormatDeltaUint64
-	ColType       ColumnType
-}
+
+// IntrinsicFormatFlat, IntrinsicFormatDict, IntrinsicFormatXORBytes, or IntrinsicFormatDeltaUint64
 
 // IntrinsicColMeta is one entry in the intrinsic column TOC (table of contents).
 // Each entry records the location and summary statistics for one intrinsic column blob.
-type IntrinsicColMeta struct {
-	// Pointer fields first for better GC scan alignment.
-	Name string // column name (e.g. "span:duration", "span:name")
-	Min  string // encoded lower boundary value (8-byte LE for numeric, raw string for string/bytes)
-	Max  string // encoded upper boundary value
-	// Scalar fields.
-	Offset uint64     // absolute file offset of the column data blob
-	Length uint32     // byte length of the column data blob (snappy-compressed)
-	Count  uint32     // total number of rows stored (present rows only)
-	Type   ColumnType // ColumnTypeUint64, ColumnTypeBytes, ColumnTypeString, ColumnTypeInt64
-	Format uint8      // IntrinsicFormatFlat, IntrinsicFormatDict, IntrinsicFormatXORBytes, or IntrinsicFormatDeltaUint64
-}
+
+// Pointer fields first for better GC scan alignment.
+// column name (e.g. "span:duration", "span:name")
+// encoded lower boundary value (8-byte LE for numeric, raw string for string/bytes)
+// encoded upper boundary value
+// Scalar fields.
+// absolute file offset of the column data blob
+// byte length of the column data blob (snappy-compressed)
+// total number of rows stored (present rows only)
+// ColumnTypeUint64, ColumnTypeBytes, ColumnTypeString, ColumnTypeInt64
+// IntrinsicFormatFlat, IntrinsicFormatDict, IntrinsicFormatXORBytes, or IntrinsicFormatDeltaUint64

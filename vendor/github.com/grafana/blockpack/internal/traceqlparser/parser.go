@@ -744,57 +744,33 @@ type parser struct {
 }
 
 // FilterExpression represents the root of a TraceQL filter AST
-type FilterExpression struct {
-	Expr Expr
-}
 
 func (*FilterExpression) exprNode() {}
 
 // MetricsQuery represents a TraceQL metrics query: { filter } | aggregate() by (fields)
-type MetricsQuery struct {
-	Filter   *FilterExpression // The filter part: { ... }
-	Pipeline *PipelineStage    // The pipeline part: | aggregate() by (...)
-}
+
+// The filter part: { ... }
+// The pipeline part: | aggregate() by (...)
 
 // StructuralQuery represents a TraceQL structural query: { expr } OP { expr }
 // Examples: { .parent } >> { .child }, { true } ~ { false }
 // Right is Expr to support N-node chains: *FilterExpression or *StructuralQuery.
-type StructuralQuery struct {
-	Left  *FilterExpression
-	Right Expr // *FilterExpression or *StructuralQuery for chained queries
-	Op    StructuralOp
-}
+
+// *FilterExpression or *StructuralQuery for chained queries
 
 func (*StructuralQuery) exprNode() {}
 
 // PipelineStage represents a pipeline operation
-type PipelineStage struct {
-	ThresholdVal interface{}
-	Aggregate    AggregateFunc
-	By           []string
-	Select       []string
-	ThresholdOp  BinaryOp
-	HasThreshold bool
-}
 
 // AggregateFunc represents a TraceQL aggregate function
-type AggregateFunc struct {
-	Name     string  // rate, count_over_time, avg, min, max, quantile_over_time, sum, histogram_over_time, stddev
-	Field    string  // Field to aggregate (empty for count)
-	Quantile float64 // For quantile_over_time (0-1)
-}
+
+// rate, count_over_time, avg, min, max, quantile_over_time, sum, histogram_over_time, stddev
+// Field to aggregate (empty for count)
+// For quantile_over_time (0-1)
 
 // Expr represents any expression node
-type Expr interface {
-	exprNode()
-}
 
 // BinaryExpr represents binary operations (AND, OR, comparisons)
-type BinaryExpr struct {
-	Left  Expr
-	Right Expr
-	Op    BinaryOp
-}
 
 func (BinaryExpr) exprNode() {}
 
@@ -855,20 +831,16 @@ func (op StructuralOp) String() string {
 }
 
 // FieldExpr represents an attribute or intrinsic field reference
-type FieldExpr struct {
-	// Scope: "", "span", "resource", "event", "link", "instrumentation", "trace"
-	Scope string
-	// Name: field name (e.g., "http.status_code", "name", "duration")
-	Name string
-}
+
+// Scope: "", "span", "resource", "event", "link", "instrumentation", "trace"
+
+// Name: field name (e.g., "http.status_code", "name", "duration")
 
 func (FieldExpr) exprNode() {}
 
 // LiteralExpr represents a literal value
-type LiteralExpr struct {
-	Value interface{} // string, int64, float64, bool, duration, or status/kind enum
-	Type  LiteralType
-}
+
+// string, int64, float64, bool, duration, or status/kind enum
 
 func (LiteralExpr) exprNode() {}
 
@@ -891,11 +863,10 @@ const (
 // VECTOR_AI("query text") — embeds the provided text and searches for similar spans.
 // VECTOR_AI("query text", {"key": "value"}) — with optional KV context.
 // VECTOR_ALL() — ranks all spans by similarity to their own auto-assembled embedding.
-type VectorExpr struct {
-	KVPairs   map[string]string // optional: {"key": "value"} embedding context (VECTOR_AI only)
-	QueryText string            // the natural language query text (VECTOR_AI only)
-	Mode      VectorMode        // VectorModeAI or VectorModeAll
-}
+
+// optional: {"key": "value"} embedding context (VECTOR_AI only)
+// the natural language query text (VECTOR_AI only)
+// VectorModeAI or VectorModeAll
 
 func (VectorExpr) exprNode() {}
 

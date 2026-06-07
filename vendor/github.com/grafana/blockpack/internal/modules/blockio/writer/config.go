@@ -13,12 +13,10 @@ import (
 type TextEmbedder = shared.TextEmbedder
 
 // EmbeddingFieldConfig describes one span field to include in auto-embedding text.
-type EmbeddingFieldConfig struct {
-	// Name is the column name (e.g. "span.name", "resource.service.name").
-	Name string
-	// Weight controls ordering: "primary" (first, plain text), "context" (key=value), "secondary" (last).
-	Weight string
-}
+
+// Name is the column name (e.g. "span.name", "resource.service.name").
+
+// Weight controls ordering: "primary" (first, plain text), "context" (key=value), "secondary" (last).
 
 // DedicatedColumn describes one attribute column to be written into the intrinsic section
 // in addition to the standard block columns. Dedicated columns enable the zero-block-read
@@ -34,9 +32,6 @@ type EmbeddingFieldConfig struct {
 // is returned, but the column will not actually be intrinsic and will fall back to the
 // generic attribute KV scan path. If you configure a dedicated column and don't see the
 // expected speedup, check the attribute's wire type. BOOL/FLOAT64 support is a follow-up.
-type DedicatedColumn struct {
-	Name string
-}
 
 // Config holds configuration parameters for a blockpack writer instance.
 // Field order is optimized for struct alignment (betteralign).

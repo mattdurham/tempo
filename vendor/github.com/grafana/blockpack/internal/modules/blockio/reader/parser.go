@@ -42,21 +42,11 @@ var parsedIntrinsicTOCCache objectcache.Cache[intrinsicTOC]
 
 // intrinsicTOC wraps the intrinsic column TOC map to give it stable pointer identity
 // for objectcache.Cache. A named struct is more ergonomic than *map[K]V from the cache.
-type intrinsicTOC struct {
-	entries map[string]shared.IntrinsicColMeta
-}
 
 // parsedMetadata holds all parsed results from parseV5MetadataLazy.
-type parsedMetadata struct {
-	sketchIdx     *sketchIndex
-	metadataBytes []byte
-	blockMetas    []shared.BlockMeta
-	rangeOffsets  map[string]rangeIndexMeta
-	traceIndexRaw []byte
-	tsRaw         []byte // zero-copy sub-slice of metadataBytes; see NOTE-PERF-TS
-	fileBloomRaw  []byte // raw FileBloom section bytes; nil for old files
-	tsCount       int
-}
+
+// zero-copy sub-slice of metadataBytes; see NOTE-PERF-TS
+// raw FileBloom section bytes; nil for old files
 
 // SetIntrinsicCacheBytes sets the byte budget for the process-level intrinsic column
 // cache. Must be called before the first GetIntrinsicColumn call.
@@ -81,11 +71,6 @@ func ClearCaches() {
 
 // rangeIndexMeta records the byte range within metadataBytes for a
 // range column index entry (lazy parsing).
-type rangeIndexMeta struct {
-	typ    shared.ColumnType
-	offset int
-	length int
-}
 
 // readFooter reads the footer from the end of the file.
 // For 18-byte magic footers: V8 only — rejects any other version (including V7) with an error.

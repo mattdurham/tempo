@@ -8,7 +8,6 @@ package rw
 import (
 	"container/list"
 	"io"
-	"sync"
 )
 
 const numCacheTiers = 4
@@ -28,18 +27,10 @@ func dataTypeTier(dt DataType) int {
 }
 
 // cacheKey uniquely identifies a cached byte range within a named reader.
-type cacheKey struct {
-	readerID string
-	offset   int64
-	length   int // BUG-15 fix: was int32; changed to int to prevent silent truncation for buffers > math.MaxInt32
-}
+
+// BUG-15 fix: was int32; changed to int to prevent silent truncation for buffers > math.MaxInt32
 
 // lruEntry holds one cached range and its tier.
-type lruEntry struct {
-	data []byte
-	key  cacheKey
-	tier int
-}
 
 // SharedLRUCache is a byte-bounded, priority-tiered LRU cache safe for concurrent use.
 // It is designed to be shared across multiple SharedLRUProvider instances (one per file).
@@ -47,14 +38,8 @@ type lruEntry struct {
 // Eviction policy: when adding a new entry would exceed maxBytes, entries are removed
 // starting from the lowest-priority tier (tier 3, DataTypeBlock) and working up to
 // higher-priority tiers. Within a tier, the least-recently-used entry is removed first.
-type SharedLRUCache struct {
-	// lists[0] = highest priority (Footer/Header), lists[3] = lowest (Block).
-	lists    [numCacheTiers]*list.List
-	index    map[cacheKey]*list.Element
-	maxBytes int64
-	curBytes int64
-	mu       sync.Mutex
-}
+
+// lists[0] = highest priority (Footer/Header), lists[3] = lowest (Block).
 
 // NewSharedLRUCache creates a SharedLRUCache with the given total byte capacity.
 func NewSharedLRUCache(maxBytes int64) *SharedLRUCache {
@@ -142,11 +127,6 @@ func (c *SharedLRUCache) evictLocked(needed int64) {
 // SharedLRUProvider wraps a ReaderProvider and routes all reads through a SharedLRUCache.
 // Multiple SharedLRUProvider instances can share the same *SharedLRUCache.
 // All methods are safe for concurrent use.
-type SharedLRUProvider struct {
-	underlying ReaderProvider
-	cache      *SharedLRUCache
-	readerID   string
-}
 
 // NewSharedLRUProvider creates a SharedLRUProvider that caches reads in cache.
 // readerID must uniquely identify the underlying reader within the cache namespace

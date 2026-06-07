@@ -19,9 +19,6 @@ import (
 // SPEC-SK-12: no false negatives.
 // SPEC-SK-13: ~0.39% false positive rate.
 // NOTE-SK-05: chosen over bloom for lower FPR and cache-friendly lookups.
-type BinaryFuse8 struct {
-	inner *xorfilter.BinaryFuse8
-}
 
 // NewBinaryFuse8 builds a BinaryFuse8 from the given uint64 keys.
 // Duplicate keys are removed before construction (SPEC-SK-16, Edge Case 5).

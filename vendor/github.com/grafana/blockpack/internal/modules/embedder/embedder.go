@@ -43,34 +43,30 @@ const (
 )
 
 // EmbeddingField describes one span field to include in the embedding text.
-type EmbeddingField struct {
-	// Name is the column name to read (e.g. "span.name", "resource.service.name").
-	Name string
-	// Weight controls inclusion order: "primary", "context", "secondary".
-	Weight string
-}
+
+// Name is the column name to read (e.g. "span.name", "resource.service.name").
+
+// Weight controls inclusion order: "primary", "context", "secondary".
 
 // Config configures an Embedder instance backed by yzma (llama.cpp).
-type Config struct {
-	// LibPath is the absolute path to the llama.cpp shared library (e.g. "/usr/lib/libllama.so").
-	LibPath string
-	// ModelPath is the absolute path to the GGUF model file.
-	// If empty, DefaultModelPath() is used (~/.blockpack/models/nomic-embed-text-v1.5.Q8_0.gguf).
-	ModelPath string
-	// ModelURL is the URL to download the model from when AutoDownload is true.
-	// Default: DefaultModelURL (HuggingFace nomic-embed-text-v1.5 Q8_0 GGUF).
-	ModelURL string
-	// Fields defines which span fields to include and their ordering weight.
-	Fields []EmbeddingField
-	// BatchSize is the number of tokens per inference batch (default: 512).
-	BatchSize int
-	// MaxTextLength is the maximum character length of assembled text (default: 2048).
-	MaxTextLength int
-	// AutoDownload enables automatic model download on first use.
-	// When true and ModelPath doesn't exist, the model is downloaded from ModelURL.
-	// Default: true when ModelPath is empty.
-	AutoDownload bool
-}
+
+// LibPath is the absolute path to the llama.cpp shared library (e.g. "/usr/lib/libllama.so").
+
+// ModelPath is the absolute path to the GGUF model file.
+// If empty, DefaultModelPath() is used (~/.blockpack/models/nomic-embed-text-v1.5.Q8_0.gguf).
+
+// ModelURL is the URL to download the model from when AutoDownload is true.
+// Default: DefaultModelURL (HuggingFace nomic-embed-text-v1.5 Q8_0 GGUF).
+
+// Fields defines which span fields to include and their ordering weight.
+
+// BatchSize is the number of tokens per inference batch (default: 512).
+
+// MaxTextLength is the maximum character length of assembled text (default: 2048).
+
+// AutoDownload enables automatic model download on first use.
+// When true and ModelPath doesn't exist, the model is downloaded from ModelURL.
+// Default: true when ModelPath is empty.
 
 // Embedder provides text-to-vector embedding via a pluggable Backend.
 // Create with New (yzma/llama.cpp) or NewWithBackend (custom backend).

@@ -24,20 +24,13 @@ const (
 // nodeMatch bit i is set if the span matches program[i]; bit 0 = node 0 (left), bit 1 = node 1 (right).
 // NOTE-093: spanID/parentID are [8]byte value types stored in slice elements — no per-span allocation.
 // present bitmask tracks which fields are valid (not relying on zero-value sentinel).
-type structuralSpanRec struct {
-	spanID    [8]byte
-	parentID  [8]byte // zeroed after phase 2; present bit cleared
-	parentIdx int     // -1 = root; set during phase 2
-	blockIdx  int
-	rowIdx    int
-	nodeMatch uint8
-	present   uint8 // bitmask: structuralSpanIDPresent, structuralParentIDPresent
-}
+
+// zeroed after phase 2; present bit cleared
+// -1 = root; set during phase 2
+
+// bitmask: structuralSpanIDPresent, structuralParentIDPresent
 
 // StructuralResult is the output of ExecuteStructural.
-type StructuralResult struct {
-	Matches []SpanMatch
-}
 
 // ExecuteStructural executes a structural TraceQL query against a modules blockpack Reader.
 //
@@ -156,32 +149,43 @@ func collectAllStructuralSpans(
 	tr queryplanner.TimeRange,
 	startBlock, blockCount int,
 ) (map[[16]byte][]structuralSpanRec, map[int]*modules_reader.Block, error) {
-	planner := queryplanner.NewPlanner(r)
-	// NOTE-091, NOTE-095: Apply file-level bloom/range pruning for ALL programs where safe.
-	// Block-level pruning is intentionally skipped — parent spans may live in any internal
-	// block, so all blocks that survive file-level rejection must be scanned.
+	// NOTE-091: Each structural node is a regular filter program with an added relationship
+	// constraint. Block selection uses planBlocks per program — the same bloom/range/intrinsic-TOC
+	// pruning as plain filter queries — and the selected block sets are unioned.
+	// Any block absent from every program's selected set has no spans matching any node.
+	// Limitation: intermediate ancestor spans that do not match any node predicate but are
+	// required to link a descendant to an ancestor may reside in a pruned block, causing false
+	// negatives for multi-block traces. This is acceptable in the common case where all spans
+	// of a trace reside within a single internal block. See NOTE-091 in NOTES.md.
+	//
+	// Negation-LHS programs (shouldRejectFileForProgram=false) use planBlocks(nil, tr, opts)
+	// so the time range is still applied but no predicate pruning is attempted for that node.
+	unionSet := make(map[int]struct{})
 	for i, prog := range programs {
-		if prog == nil || prog.Predicates == nil {
-			continue
-		}
+		var p *queryplanner.Plan
 		if !shouldRejectFileForProgram(ops, i) {
-			continue
+			// Negation LHS — absent LHS means all RHS spans qualify; use time-range-only plan.
+			p = planBlocks(r, nil, tr, queryplanner.PlanOptions{})
+		} else {
+			p = planBlocks(r, prog, tr, queryplanner.PlanOptions{})
 		}
-		nodes := prog.Predicates.Nodes
-		if fileLevelReject(r, nodes) || fileLevelBloomReject(r, nodes) {
+		if len(p.SelectedBlocks) == 0 && shouldRejectFileForProgram(ops, i) {
+			// planBlocks rejected the file entirely for this non-negation program —
+			// no structural match is possible (the node cannot match any span in this file).
 			return nil, nil, nil
 		}
-		// NOTE-097: Intrinsic TOC file-level rejection. If the TOC reports zero blocks contain
-		// matching spans for this program, the entire file has no qualifying spans — skip it.
-		// Non-nil empty slice = zero blocks survive (definitive rejection).
-		// Nil = no TOC info or all blocks survive (cannot reject).
-		// Block-level subset (non-empty slice) is intentionally ignored — NOTE-091 forbids
-		// block-level pruning on the structural path because parent spans may be in any block.
-		if tocBlocks := BlocksFromIntrinsicTOC(r, prog); tocBlocks != nil && len(tocBlocks) == 0 {
-			return nil, nil, nil
+		for _, bi := range p.SelectedBlocks {
+			unionSet[bi] = struct{}{}
 		}
 	}
-	plan := planner.Plan(nil, tr)
+
+	selectedBlocks := make([]int, 0, len(unionSet))
+	for bi := range unionSet {
+		selectedBlocks = append(selectedBlocks, bi)
+	}
+	slices.Sort(selectedBlocks)
+
+	plan := &queryplanner.Plan{SelectedBlocks: selectedBlocks}
 
 	// Sub-file sharding: restrict to assigned block range.
 	if blockCount > 0 {
@@ -199,7 +203,8 @@ func collectAllStructuralSpans(
 		return nil, nil, nil
 	}
 
-	rawBlocks, err := planner.FetchBlocks(plan)
+	fetcher := queryplanner.NewPlanner(r)
+	rawBlocks, err := fetcher.FetchBlocks(plan)
 	if err != nil {
 		return nil, nil, fmt.Errorf("structural FetchBlocks: %w", err)
 	}
@@ -270,13 +275,14 @@ func collectBlockStructuralSpanRecs(
 	}
 
 	parsedBlocks[blockIdx] = bwb.Block
-	provider := newBlockColumnProvider(bwb.Block)
+	provider := acquireBlockColumnProvider(bwb.Block)
 	spanCount := bwb.Block.SpanCount()
 
 	// Evaluate each program against block columns.
 	// For files with an intrinsic section, strip intrinsic-column predicates first.
 	sets, err := evaluateStructuralPrograms(programs, hasIntrinsic, provider, spanCount, blockIdx)
 	if err != nil {
+		releaseBlockColumnProvider(provider)
 		return err
 	}
 
@@ -302,7 +308,12 @@ func collectBlockStructuralSpanRecs(
 	var idFields []intrinsicRowFields
 	if hasIntrinsic {
 		var intrinsicErr error
-		idFields, intrinsicErr = lookupIntrinsicFieldsTypedForBlock(r, uint16(blockIdx), n, intrinsicWant) //nolint:gosec // safe: blockIdx bounded by file block count (<65535)
+		idFields, intrinsicErr = lookupIntrinsicFieldsTypedForBlock(
+			r,
+			uint16(blockIdx), //nolint:gosec // safe: blockIdx bounded by file block count (<65535)
+			n,
+			intrinsicWant,
+		)
 		if intrinsicErr != nil {
 			return fmt.Errorf("structural lookupIntrinsicFieldsTypedForBlock block %d: %w", blockIdx, intrinsicErr)
 		}
@@ -333,6 +344,10 @@ func collectBlockStructuralSpanRecs(
 		rec.nodeMatch = computeNodeMatchForRow(sets, nodesList, hasIntrinsic, row, rowIdx)
 		result[traceID] = append(result[traceID], rec)
 	}
+	// Release after the row loop: sets may contain scratch-backed rowSets (single-predicate programs).
+	// Releasing earlier would allow pool reuse to overwrite p.scratch before computeNodeMatchForRow
+	// reads it via s.Contains().
+	releaseBlockColumnProvider(provider)
 	return nil
 }
 
@@ -407,9 +422,6 @@ func collectStructuralIntrinsicNodes(programs []*vm.Program, want map[string]str
 	}
 	return nodesList
 }
-
-// allMatchSet is a RowSet that matches every row index in [0, n).
-type allMatchSet struct{ n int }
 
 func allMatchRowSet(n int) vm.RowSet       { return &allMatchSet{n: n} }
 func (a *allMatchSet) Add(_ int)           {}

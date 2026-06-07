@@ -4,14 +4,9 @@ package rw
 
 import (
 	"io"
-	"sync"
 )
 
 // cachedRange is one cached contiguous byte range.
-type cachedRange struct {
-	data   []byte
-	offset int64
-}
 
 // RangeCachingProvider wraps a ReaderProvider with sub-range caching.
 // If a requested range is fully contained within a cached range, the bytes are
@@ -23,11 +18,6 @@ type cachedRange struct {
 // use: create one instance per open file, read, and discard. Do NOT reuse a
 // RangeCachingProvider across multiple files or after the underlying storage
 // has changed. See rw/NOTES.md §5.
-type RangeCachingProvider struct {
-	underlying ReaderProvider
-	cache      []cachedRange
-	mu         sync.RWMutex
-}
 
 // NewRangeCachingProvider wraps underlying with range caching.
 func NewRangeCachingProvider(underlying ReaderProvider) *RangeCachingProvider {

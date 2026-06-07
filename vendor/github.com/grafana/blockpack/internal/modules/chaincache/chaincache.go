@@ -18,14 +18,9 @@ import (
 	"fmt"
 
 	"github.com/grafana/blockpack/internal/modules/filecache"
-	"golang.org/x/sync/singleflight"
 )
 
 // ChainedCache is a multi-tier filecache.Cache. It is safe for concurrent use.
-type ChainedCache struct {
-	group singleflight.Group
-	tiers []filecache.Cache
-}
 
 // New creates a ChainedCache from the given tiers ordered fastest-first.
 // The recommended order is: memorycache → filecache → memcache.

@@ -983,6 +983,25 @@ func ProgramWantColumns(program *vm.Program, extra ...string) map[string]struct{
 	if program == nil || program.Predicates == nil {
 		return nil
 	}
+	// NOTE-103: fast path — return pre-computed set when available and no extra columns needed.
+	// WantColumns is populated at compile time by ComputeWantColumns (program.go).
+	// When extra is non-empty (e.g. identity columns like trace:id, span:id added by callers),
+	// copy the cached set and merge extra into the copy — O(cached-set-size + extra) rather
+	// than O(predicate-tree). Never modify program.WantColumns directly (it is read-only after
+	// compilation and shared across callers).
+	if program.WantColumns != nil && len(extra) == 0 {
+		return program.WantColumns
+	}
+	if program.WantColumns != nil && len(extra) > 0 {
+		merged := make(map[string]struct{}, len(program.WantColumns)+len(extra))
+		for k := range program.WantColumns {
+			merged[k] = struct{}{}
+		}
+		for _, e := range extra {
+			merged[e] = struct{}{}
+		}
+		return merged
+	}
 	p := program.Predicates
 	if len(p.Nodes) == 0 && len(p.Columns) == 0 && len(extra) == 0 {
 		return nil

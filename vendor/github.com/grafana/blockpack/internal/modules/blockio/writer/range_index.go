@@ -14,11 +14,9 @@ import (
 
 // blockRange records the [min, max] encoded key range for one column in one block.
 // Used to populate range index buckets by range-overlap at Flush time.
-type blockRange struct {
-	minKey  string // encoded minimum observed value in this block
-	maxKey  string // encoded maximum observed value in this block
-	blockID uint32
-}
+
+// encoded minimum observed value in this block
+// encoded maximum observed value in this block
 
 // rangeColumnData holds accumulated per-block min/max ranges and the KLL sketch
 // for one range column. At Flush time the KLL provides bucket boundaries; the
@@ -26,24 +24,18 @@ type blockRange struct {
 //
 // Field order: slices first (largest), then pointer, then int64s, then small
 // types (betteralign).
-type rangeColumnData struct {
-	values map[string][]uint32 // bucket key → sorted block IDs (populated by applyRangeBuckets)
-	// kllInt64, kllUint64, kllFloat64, kllStr, kllBytes hold the KLL sketch for
-	// this column. Exactly one is non-nil depending on colType.
-	kllInt64      *KLL[int64]
-	kllUint64     *KLL[uint64]
-	kllFloat64    *KLL[float64]
-	kllStr        *KLLString
-	kllBytes      *KLLBytes
-	blocks        []blockRange // per-block [min, max] ranges; O(blocks × columns)
-	boundaries    []int64      // KLL quantile boundaries as int64 bits (empty for String/Bytes)
-	float64Bounds []float64    // type-specific boundaries for RangeFloat64 (nil otherwise)
-	stringBounds  []string     // type-specific boundaries for RangeString (nil otherwise)
-	bytesBounds   [][]byte     // type-specific boundaries for RangeBytes (nil otherwise)
-	bucketMin     int64        // bucket_min as int64 bits
-	bucketMax     int64        // bucket_max as int64 bits
-	colType       shared.ColumnType
-}
+
+// bucket key → sorted block IDs (populated by applyRangeBuckets)
+// kllInt64, kllUint64, kllFloat64, kllStr, kllBytes hold the KLL sketch for
+// this column. Exactly one is non-nil depending on colType.
+
+// per-block [min, max] ranges; O(blocks × columns)
+// KLL quantile boundaries as int64 bits (empty for String/Bytes)
+// type-specific boundaries for RangeFloat64 (nil otherwise)
+// type-specific boundaries for RangeString (nil otherwise)
+// type-specific boundaries for RangeBytes (nil otherwise)
+// bucket_min as int64 bits
+// bucket_max as int64 bits
 
 // rangeIndex is the final nested map after log deduplication.
 // map[colName]*rangeColumnData
@@ -94,10 +86,19 @@ func newRangeColumnData(colType shared.ColumnType) *rangeColumnData {
 // addBlockRangeToColumn feeds the block's min and max encoded keys into the
 // column's KLL sketch and records a blockRange entry.
 func addBlockRangeToColumn(cd *rangeColumnData, mm *blockColMinMax, bid uint32) {
+	// For numeric columns, mm.isNum is set and numMinKey/numMaxKey hold [8]byte values.
+	// Convert to string once here (per block, not per span) to populate blockRange.
+	minKey := mm.minKey
+	maxKey := mm.maxKey
+	if mm.isNum {
+		minKey = string(mm.numMinKey[:])
+		maxKey = string(mm.numMaxKey[:])
+	}
+
 	// Append blockRange entry.
 	cd.blocks = append(cd.blocks, blockRange{
-		minKey:  mm.minKey,
-		maxKey:  mm.maxKey,
+		minKey:  minKey,
+		maxKey:  maxKey,
 		blockID: bid,
 	})
 
@@ -107,31 +108,44 @@ func addBlockRangeToColumn(cd *rangeColumnData, mm *blockColMinMax, bid uint32) 
 	// cd.colType is always a Range* type (guaranteed by newRangeColumnData).
 	switch cd.colType {
 	case shared.ColumnTypeRangeInt64, shared.ColumnTypeRangeDuration:
-		if cd.kllInt64 != nil && len(mm.minKey) >= 8 && len(mm.maxKey) >= 8 {
-			minV := int64(binary.LittleEndian.Uint64([]byte(mm.minKey))) //nolint:gosec
-			maxV := int64(binary.LittleEndian.Uint64([]byte(mm.maxKey))) //nolint:gosec
-			cd.kllInt64.Add(minV)
-			cd.kllInt64.Add(maxV)
+		if cd.kllInt64 != nil {
+			if mm.isNum {
+				cd.kllInt64.Add(int64(binary.LittleEndian.Uint64(mm.numMinKey[:]))) //nolint:gosec
+				cd.kllInt64.Add(int64(binary.LittleEndian.Uint64(mm.numMaxKey[:]))) //nolint:gosec
+			} else if len(minKey) >= 8 && len(maxKey) >= 8 {
+				cd.kllInt64.Add(int64(binary.LittleEndian.Uint64([]byte(minKey)))) //nolint:gosec
+				cd.kllInt64.Add(int64(binary.LittleEndian.Uint64([]byte(maxKey)))) //nolint:gosec
+			}
 		}
 	case shared.ColumnTypeRangeUint64:
-		if cd.kllUint64 != nil && len(mm.minKey) >= 8 && len(mm.maxKey) >= 8 {
-			cd.kllUint64.Add(binary.LittleEndian.Uint64([]byte(mm.minKey)))
-			cd.kllUint64.Add(binary.LittleEndian.Uint64([]byte(mm.maxKey)))
+		if cd.kllUint64 != nil {
+			if mm.isNum {
+				cd.kllUint64.Add(binary.LittleEndian.Uint64(mm.numMinKey[:]))
+				cd.kllUint64.Add(binary.LittleEndian.Uint64(mm.numMaxKey[:]))
+			} else if len(minKey) >= 8 && len(maxKey) >= 8 {
+				cd.kllUint64.Add(binary.LittleEndian.Uint64([]byte(minKey)))
+				cd.kllUint64.Add(binary.LittleEndian.Uint64([]byte(maxKey)))
+			}
 		}
 	case shared.ColumnTypeRangeFloat64:
-		if cd.kllFloat64 != nil && len(mm.minKey) >= 8 && len(mm.maxKey) >= 8 {
-			cd.kllFloat64.Add(math.Float64frombits(binary.LittleEndian.Uint64([]byte(mm.minKey))))
-			cd.kllFloat64.Add(math.Float64frombits(binary.LittleEndian.Uint64([]byte(mm.maxKey))))
+		if cd.kllFloat64 != nil {
+			if mm.isNum {
+				cd.kllFloat64.Add(math.Float64frombits(binary.LittleEndian.Uint64(mm.numMinKey[:])))
+				cd.kllFloat64.Add(math.Float64frombits(binary.LittleEndian.Uint64(mm.numMaxKey[:])))
+			} else if len(minKey) >= 8 && len(maxKey) >= 8 {
+				cd.kllFloat64.Add(math.Float64frombits(binary.LittleEndian.Uint64([]byte(minKey))))
+				cd.kllFloat64.Add(math.Float64frombits(binary.LittleEndian.Uint64([]byte(maxKey))))
+			}
 		}
 	case shared.ColumnTypeRangeString:
 		if cd.kllStr != nil {
-			cd.kllStr.Add(mm.minKey)
-			cd.kllStr.Add(mm.maxKey)
+			cd.kllStr.Add(minKey)
+			cd.kllStr.Add(maxKey)
 		}
 	case shared.ColumnTypeRangeBytes:
 		if cd.kllBytes != nil {
-			cd.kllBytes.Add([]byte(mm.minKey))
-			cd.kllBytes.Add([]byte(mm.maxKey))
+			cd.kllBytes.Add([]byte(minKey))
+			cd.kllBytes.Add([]byte(maxKey))
 		}
 	}
 }
@@ -165,27 +179,6 @@ func encodeRangeKey(typ shared.ColumnType, val shared.AttrValue) string {
 	default:
 		return ""
 	}
-}
-
-// encodeInt64BoundaryKey returns the 8-byte LE encoding of an int64 boundary value as a string key.
-func encodeInt64BoundaryKey(v int64) string {
-	var tmp [8]byte
-	binary.LittleEndian.PutUint64(tmp[:], uint64(v)) //nolint:gosec // safe: reinterpreting int64 bits as uint64
-	return string(tmp[:])
-}
-
-// encodeUint64BoundaryKey returns the 8-byte LE encoding of a uint64 boundary value as a string key.
-func encodeUint64BoundaryKey(v uint64) string {
-	var tmp [8]byte
-	binary.LittleEndian.PutUint64(tmp[:], v)
-	return string(tmp[:])
-}
-
-// encodeFloat64BoundaryKey returns the 8-byte LE IEEE-754 bits encoding of a float64 boundary as a string key.
-func encodeFloat64BoundaryKey(v float64) string {
-	var tmp [8]byte
-	binary.LittleEndian.PutUint64(tmp[:], math.Float64bits(v))
-	return string(tmp[:])
 }
 
 // findBucket returns the bucket index for v given the sorted boundaries.
@@ -425,7 +418,8 @@ func applyOverlapInt64(cd *rangeColumnData, nBuckets int) {
 	cd.bucketMin = bounds[0]
 	cd.bucketMax = bounds[len(bounds)-1]
 
-	cd.values = make(map[string][]uint32, len(bounds))
+	// Use [8]byte keys to avoid per-boundary string allocation.
+	cd.numValues = make(map[[8]byte][]uint32, len(bounds))
 	for _, br := range cd.blocks {
 		if len(br.minKey) < 8 || len(br.maxKey) < 8 {
 			continue
@@ -438,8 +432,9 @@ func applyOverlapInt64(cd *rangeColumnData, nBuckets int) {
 		lo := int(findBucketInt64(minV, bounds))
 		hi := int(findBucketInt64(maxV, bounds))
 		for i := lo; i <= hi; i++ {
-			bk := encodeInt64BoundaryKey(bounds[i])
-			cd.values[bk] = appendUniqueBlockID(cd.values[bk], br.blockID)
+			var bk [8]byte
+			binary.LittleEndian.PutUint64(bk[:], uint64(bounds[i])) //nolint:gosec
+			cd.numValues[bk] = appendUniqueBlockID(cd.numValues[bk], br.blockID)
 		}
 	}
 }
@@ -457,7 +452,8 @@ func applyOverlapUint64(cd *rangeColumnData, nBuckets int) {
 	cd.bucketMin = int64(bounds[0])             //nolint:gosec
 	cd.bucketMax = int64(bounds[len(bounds)-1]) //nolint:gosec
 
-	cd.values = make(map[string][]uint32, len(bounds))
+	// Use [8]byte keys to avoid per-boundary string allocation.
+	cd.numValues = make(map[[8]byte][]uint32, len(bounds))
 	for _, br := range cd.blocks {
 		if len(br.minKey) < 8 || len(br.maxKey) < 8 {
 			continue
@@ -470,8 +466,9 @@ func applyOverlapUint64(cd *rangeColumnData, nBuckets int) {
 		lo := int(findBucketUint64(minV, bounds))
 		hi := int(findBucketUint64(maxV, bounds))
 		for i := lo; i <= hi; i++ {
-			bk := encodeUint64BoundaryKey(bounds[i])
-			cd.values[bk] = appendUniqueBlockID(cd.values[bk], br.blockID)
+			var bk [8]byte
+			binary.LittleEndian.PutUint64(bk[:], bounds[i])
+			cd.numValues[bk] = appendUniqueBlockID(cd.numValues[bk], br.blockID)
 		}
 	}
 }
@@ -490,7 +487,8 @@ func applyOverlapFloat64(cd *rangeColumnData, nBuckets int) {
 	cd.bucketMin = int64(math.Float64bits(bounds[0]))             //nolint:gosec
 	cd.bucketMax = int64(math.Float64bits(bounds[len(bounds)-1])) //nolint:gosec
 
-	cd.values = make(map[string][]uint32, len(bounds))
+	// Use [8]byte keys to avoid per-boundary string allocation.
+	cd.numValues = make(map[[8]byte][]uint32, len(bounds))
 	for _, br := range cd.blocks {
 		if len(br.minKey) < 8 || len(br.maxKey) < 8 {
 			continue
@@ -506,8 +504,9 @@ func applyOverlapFloat64(cd *rangeColumnData, nBuckets int) {
 		lo := int(findBucketFloat64(minV, bounds))
 		hi := int(findBucketFloat64(maxV, bounds))
 		for i := lo; i <= hi; i++ {
-			bk := encodeFloat64BoundaryKey(bounds[i])
-			cd.values[bk] = appendUniqueBlockID(cd.values[bk], br.blockID)
+			var bk [8]byte
+			binary.LittleEndian.PutUint64(bk[:], math.Float64bits(bounds[i]))
+			cd.numValues[bk] = appendUniqueBlockID(cd.numValues[bk], br.blockID)
 		}
 	}
 }

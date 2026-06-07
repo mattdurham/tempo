@@ -87,11 +87,6 @@ func releaseBlockSketchSet(bs blockSketchSet) {
 // colSketch holds sketch accumulators for one column within one block.
 // bloom is updated incrementally at add() time, eliminating the need to
 // accumulate a keys slice for BinaryFuse8 construction.
-type colSketch struct {
-	hll   *sketch.HyperLogLog
-	topk  *sketch.TopK
-	bloom *sketch.SketchBloom
-}
 
 // blockSketchSet maps column name → colSketch for one block.
 type blockSketchSet map[string]*colSketch

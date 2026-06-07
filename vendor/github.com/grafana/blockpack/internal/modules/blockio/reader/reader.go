@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"reflect"
 	"slices"
 	"sort"
 	"sync"
@@ -18,11 +19,6 @@ import (
 )
 
 // footerRaw holds the raw footer fields while readFooter is executing.
-type footerRaw struct {
-	headerOffset  uint64
-	compactOffset uint64
-	compactLen    uint32
-}
 
 // compactTraceIndex holds the parsed compact trace index section.
 // NOTE-PERF-COMPACT: traceIndexRaw stores the raw trace-index bytes in-place (a sub-slice of the
@@ -42,39 +38,34 @@ type footerRaw struct {
 // V14 stores the compact section as a single snappy-compressed blob, so a direct range read is
 // not available — the full blob must be fetched, split, and the trace index portion extracted.
 // ensureTraceIndexRaw uses isV14TraceSection to select the correct fetch path.
-type compactTraceIndex struct {
-	// traceIndexFetchErr holds any error from the lazy fetch so callers can surface it.
-	traceIndexFetchErr error
-	traceIndexRaw      []byte // raw trace-index bytes; scanned in-place by scanTraceIndexRaw
-	blockTable         []compactBlockEntry
-	traceIDBloom       []byte // nil for version-1 compact indexes (no bloom); vacuous true on lookup
 
-	// traceIndexOffset and traceIndexLen locate the trace-index bytes within the file.
-	// Used by ensureTraceIndexRaw to lazily fetch them on first bloom hit.
-	// Both are zero when traceIndexRaw is already populated (full compact read path).
-	traceIndexOffset uint64
-	traceIndexLen    uint64
+// traceIndexFetchErr holds any error from the lazy fetch so callers can surface it.
 
-	// isV14TraceSection signals that this compactTraceIndex was populated from a V14 file's
-	// SectionTraceIndex compact blob (via parseCompactIndexBytesV14Header). When true,
-	// ensureTraceIndexRaw re-reads the full V14 section and extracts the trace index bytes
-	// via splitV14CompactSection, instead of using traceIndexOffset/traceIndexLen.
-	isV14TraceSection bool
+// raw trace-index bytes; scanned in-place by scanTraceIndexRaw
 
-	// traceIndexOnce guards the lazy fetch of traceIndexRaw.
-	traceIndexOnce sync.Once
-}
+// nil for version-1 compact indexes (no bloom); vacuous true on lookup
+
+// traceIndexOffset and traceIndexLen locate the trace-index bytes within the file.
+// Used by ensureTraceIndexRaw to lazily fetch them on first bloom hit.
+// Both are zero when traceIndexRaw is already populated (full compact read path).
+
+// isV14TraceSection signals that this compactTraceIndex was populated from a V14 file's
+// SectionTraceIndex compact blob (via parseCompactIndexBytesV14Header). When true,
+// ensureTraceIndexRaw re-reads the full V14 section and extracts the trace index bytes
+// via splitV14CompactSection, instead of using traceIndexOffset/traceIndexLen.
+
+// traceIndexOnce guards the lazy fetch of traceIndexRaw.
 
 // WantColumns specifies which columns to eagerly decode when parsing a block.
 // Use WantAll() to load every column, or WantOnly(cols) for query-driven selection.
 // A zero value (All=false, Columns=nil) is equivalent to WantOnly(empty) — no eager decodes.
 type WantColumns struct {
+	// Columns is the set of column names to eagerly decode. Ignored when All is true.
+	Columns map[string]struct{}
 	// All loads every column eagerly. Use only when the full column set is genuinely
 	// required (e.g. tag-name enumeration, compaction, export). For query paths, set
 	// Columns to the specific columns the query references.
 	All bool
-	// Columns is the set of column names to eagerly decode. Ignored when All is true.
-	Columns map[string]struct{}
 }
 
 // WantAll returns a WantColumns that eagerly decodes every column in the block.
@@ -293,7 +284,7 @@ func NewReaderFromProviderWithOptions(provider rw.ReaderProvider, opts Options) 
 	}
 
 	sc := opts.Cache
-	if sc == nil {
+	if sc == nil || reflect.ValueOf(sc).IsNil() {
 		sc = sectioncache.NopSectionCache
 	}
 	r := &Reader{
@@ -350,7 +341,7 @@ func NewLeanReaderFromProviderWithOptions(provider rw.ReaderProvider, opts Optio
 	}
 
 	sc := opts.Cache
-	if sc == nil {
+	if sc == nil || reflect.ValueOf(sc).IsNil() {
 		sc = sectioncache.NopSectionCache
 	}
 	r := &Reader{
@@ -658,14 +649,6 @@ func (r *Reader) RangeColumnType(colName string) (shared.ColumnType, bool) {
 // typed boundary values. For RangeString, StringBounds holds them. For
 // RangeBytes, BytesBounds holds them. For numeric types (Int64/Uint64/Duration),
 // BucketMin/BucketMax are sufficient for file-level fast reject.
-type RangeBoundaries struct {
-	Float64Bounds []float64
-	StringBounds  []string
-	BytesBounds   [][]byte
-	BucketMin     int64
-	BucketMax     int64
-	ColType       shared.ColumnType
-}
 
 // RangeColumnBoundaries returns the parsed boundaries for a range-indexed column.
 // Returns nil if the column is not range-indexed or an error occurs during parsing.
@@ -817,23 +800,6 @@ func (r *Reader) ParseBlockFromBytesWithIntern(
 	return &BlockWithBytes{Block: blk, RawBytes: rawBytes}, nil
 }
 
-// ParseBlockFromBytesReusing parses a Block from raw bytes using a caller-supplied
-// intern map and an optional prevBlock for column struct reuse.
-// NOTE-108: used by ExecuteTraceMetrics second-pass decode.
-func (r *Reader) ParseBlockFromBytesReusing(
-	rawBytes []byte,
-	wantColumns map[string]struct{},
-	meta shared.BlockMeta,
-	intern map[string]string,
-	prevBlock *Block,
-) (*BlockWithBytes, error) {
-	blk, err := parseBlockColumnsReuse(rawBytes, wantColumns, prevBlock, meta, intern)
-	if err != nil {
-		return nil, fmt.Errorf("ParseBlockFromBytesReusing: %w", err)
-	}
-	return &BlockWithBytes{Block: blk, RawBytes: rawBytes}, nil
-}
-
 // HasTraceIndex reports whether the reader has a populated trace block index.
 func (r *Reader) HasTraceIndex() bool {
 	r.ensureTraceIndex()
@@ -841,9 +807,6 @@ func (r *Reader) HasTraceIndex() bool {
 }
 
 // TraceEntry is a single trace-block reference.
-type TraceEntry struct {
-	BlockID int
-}
 
 // TraceEntries returns the block IDs containing spans for the given trace ID.
 // Falls back to the compact trace index when the main index is empty (lean reader path).

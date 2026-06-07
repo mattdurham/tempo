@@ -13,14 +13,13 @@ import (
 
 // Codebook is a trained PQ codebook.
 // numSubvecs is the number of subvectors; each subspace has numCentroids centroids of dimension Dim/numSubvecs.
-type Codebook struct {
-	// Centroids[m] is a flat row-major float32 slice of length numCentroids*subvecDim.
-	// Centroid k in subspace m starts at index k*subvecDim.
-	Centroids [][]float32
-	M         int // number of subvectors (subspaces)
-	K         int // number of centroids per subspace
-	Dim       int // full vector dimension
-}
+
+// Centroids[m] is a flat row-major float32 slice of length numCentroids*subvecDim.
+// Centroid k in subspace m starts at index k*subvecDim.
+
+// number of subvectors (subspaces)
+// number of centroids per subspace
+// full vector dimension
 
 // SubvecDim returns the dimension of each subvector.
 func (cb *Codebook) SubvecDim() int { return cb.Dim / cb.M }

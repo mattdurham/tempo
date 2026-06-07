@@ -21,25 +21,21 @@ const (
 )
 
 // vectorBlockEntry records per-block data for the vector index.
-type vectorBlockEntry struct {
-	centroid    []float32   // mean of all vectors in this block
-	pqCodes     [][]byte    // one M-byte PQ code per present vector in block order (set by build)
-	vectors     [][]float32 // raw vectors for PQ encoding; cleared after build() to free memory
-	vectorCount int
-}
+
+// mean of all vectors in this block
+// one M-byte PQ code per present vector in block order (set by build)
+// raw vectors for PQ encoding; cleared after build() to free memory
 
 // vectorAccumulator accumulates per-block centroids and all vector data for PQ training.
 // Fed during block build (one accumulateBlock call per block); consumed once at Flush.
 // rng is per-instance to avoid data races when multiple Writers operate concurrently.
 // Per-block raw vectors are stored in vectorBlockEntry.vectors; no global allVectors slice is kept.
-type vectorAccumulator struct {
-	//nolint:gosec
-	rng            *rand.Rand // per-instance rng for reservoir sampling (lazy-initialized)
-	blocks         []vectorBlockEntry
-	trainingSample [][]float32 // reservoir-sampled vectors for PQ training (capped at maxTrainingSamples)
-	dim            int         // set on first accumulateBlock; 0 = no vectors yet
-	totalVectors   int
-}
+
+//nolint:gosec
+// per-instance rng for reservoir sampling (lazy-initialized)
+
+// reservoir-sampled vectors for PQ training (capped at maxTrainingSamples)
+// set on first accumulateBlock; 0 = no vectors yet
 
 // newVectorAccumulator creates a vectorAccumulator with a per-instance rng.
 // dim is the expected vector dimension (may be 0 if not yet known).

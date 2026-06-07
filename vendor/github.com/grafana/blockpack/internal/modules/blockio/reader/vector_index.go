@@ -13,14 +13,11 @@ import (
 
 // VectorIndex holds the parsed vector index for one blockpack file.
 // All fields are read-only after construction; safe for concurrent reads.
-type VectorIndex struct {
-	FileCentroid   []float32   // mean of all block centroids
-	BlockCentroids [][]float32 // one centroid per block, parallel to reader.blockMetas
-	BlockVecCounts []int       // number of vectors per block
-	PQCodes        [][][]byte  // per-block PQ codes: PQCodes[blockIdx][rowIdx] is an M-byte code
-	Codebook       vectormath.Codebook
-	Dim            int
-}
+
+// mean of all block centroids
+// one centroid per block, parallel to reader.blockMetas
+// number of vectors per block
+// per-block PQ codes: PQCodes[blockIdx][rowIdx] is an M-byte code
 
 // FileCentroidDistance returns the cosine distance from query to the file centroid.
 func (vi *VectorIndex) FileCentroidDistance(query []float32) float32 {

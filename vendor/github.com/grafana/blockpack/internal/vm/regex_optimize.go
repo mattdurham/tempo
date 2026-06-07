@@ -9,22 +9,18 @@ import (
 
 // RegexAnalysis is the result of analyzing a regex pattern for range-index optimization.
 // When non-nil, the pattern can be converted to prefix-based range lookups.
-type RegexAnalysis struct {
-	// Prefixes are the literal prefix strings extracted from the pattern.
-	// For simple patterns like "foo.*" this is ["foo"].
-	// For alternations like "error|warn" this is ["error", "warn"].
-	Prefixes []string
 
-	// CaseInsensitive is true when the pattern uses (?i) flag.
-	// The caller must handle case-folding for range lookups.
-	CaseInsensitive bool
+// Prefixes are the literal prefix strings extracted from the pattern.
+// For simple patterns like "foo.*" this is ["foo"].
+// For alternations like "error|warn" this is ["error", "warn"].
 
-	// IsLiteralContains is true when the pattern is equivalent to strings.Contains
-	// (or strings.Contains(strings.ToLower(v), prefix) for CaseInsensitive).
-	// True for pure literals and alternations of literals with no anchors.
-	// When true, the regex engine can be bypassed entirely.
-	IsLiteralContains bool
-}
+// CaseInsensitive is true when the pattern uses (?i) flag.
+// The caller must handle case-folding for range lookups.
+
+// IsLiteralContains is true when the pattern is equivalent to strings.Contains
+// (or strings.Contains(strings.ToLower(v), prefix) for CaseInsensitive).
+// True for pure literals and alternations of literals with no anchors.
+// When true, the regex engine can be bypassed entirely.
 
 // RegexPrefixes extracts literal prefixes from a pattern for use as a scan pre-filter.
 // Returns nil for case-insensitive patterns (strings.Contains is case-sensitive and

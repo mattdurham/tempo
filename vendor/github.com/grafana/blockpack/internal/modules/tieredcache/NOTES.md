@@ -22,16 +22,15 @@ misclassified. Only the trailing segment determines routing. For example:
 - `"s3://bucket/block/data/footer"` — last `/block/` tail is `"data/footer"` (not digits → false)
 - `"s3://bucket/key/block/42"` — last `/block/` tail is `"42"` (all digits → true)
 
-## NOTE-TC-004: Key Classification Stability
+## NOTE-TC-004: Section Routing via SectionCache Methods (not key classification)
+*Updated: 2026-05-06*
 
-The block data key format (`fileID+"/block/"+blockIdx`) is generated in exactly one place in
-the reader (`reader.go:ReadGroup`, SPEC-011). Any new block-data key format must be classified
-in `tieredcache_test.go:TestIsBlockDataKey` (for TieredCache binary router) and
-`typed_test.go:TestClassifyCacheKey` (for TypedTieredCache N-way router) before merging.
-These tests serve as the classification registry, ensuring routing is reviewed explicitly for
-every new key format. Failing to update the classifier causes the key to route to
-`SectionTypeOther` (metadata fallback) — not a panic, but a mis-routing that defeats the
-purpose of typed cache budgets.
+TypedTieredCache implements sectioncache.SectionCache via typed method dispatch — there is
+no string key parsing at query time. Each method (GetOrFetchFooter, GetOrFetchBloom, etc.)
+routes directly to the correct sub-cache. This replaces the old string-based classifyCacheKey
+approach that was present in the binary TieredCache and is no longer used.
+
+Back-ref: typed.go
 
 ## NOTE-TC-005: TieredCache Preserved for Backward Compat; TypedTieredCache is Preferred
 

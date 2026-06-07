@@ -16,10 +16,6 @@ const fileBloomMinLen = 9 // magic[4] + version[1] + col_count[4]
 
 // FileBloom holds parsed file-level bloom filters for fast per-file rejection.
 // Obtain from Reader.FileBloom() or ParseFileBloom.
-type FileBloom struct {
-	columns map[string]*sketch.BinaryFuse8
-	raw     []byte
-}
 
 // MayContainString returns false only when val is definitely absent from column col.
 // Returns true (conservative) when the column is not tracked or has no filter.

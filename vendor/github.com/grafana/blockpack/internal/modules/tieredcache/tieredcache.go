@@ -16,11 +16,8 @@ import (
 )
 
 // Config holds the configuration for a TieredCache.
-type Config struct {
-	Metadata   filecache.Cache
-	Data       filecache.Cache
-	Registerer prometheus.Registerer // optional; nil = no metrics
-}
+
+// optional; nil = no metrics
 
 // TieredCache routes filecache.Cache operations to one of two sub-caches:
 //   - block data keys (*/block/<digits>) → data

@@ -61,6 +61,7 @@ func CompileTraceQLMetrics(query string, startTime, endTime int64) (*Program, *Q
 		program = compiler.program
 		program.ColumnPredicate = cp
 		program.Predicates = extractTraceQLPredicates(metricsQuery.Filter.Expr)
+		program.ComputeWantColumns()
 	} else {
 		program = compileMatchAllProgram()
 	}

@@ -20,10 +20,6 @@ import (
 
 // blockIDPair holds the pre-fetched trace:id and span:id for a single row.
 // Built once per block by buildDedupeIndex; looked up O(1) by dedupeKey.
-type blockIDPair struct {
-	traceID []byte
-	spanID  []byte
-}
 
 // buildDedupeIndex builds a per-row deduplication index for the given (reader, blockIdx) pair.
 // Iterates the trace:id and span:id intrinsic columns once (O(N)), eliminating the
@@ -43,47 +39,43 @@ func buildDedupeIndex(r *modules_reader.Reader, blockIdx int) map[uint16]blockID
 		if err != nil || col == nil {
 			continue
 		}
-		// Dict-encoded intrinsic columns do not store BytesValues; identity columns (trace:id, span:id) use Flat/XORBytes only.
 		if col.Format != modules_shared.IntrinsicFormatFlat && col.Format != modules_shared.IntrinsicFormatXORBytes {
 			continue
 		}
-		// NOTE-038: BlockRefRange returns only entries for this block — O(log N) binary search
-		// to locate the slice, then O(N_in_block) linear walk. Replaces O(N_total) filter scan.
-		entries := col.BlockRefRange(uint16(blockIdx)) //nolint:gosec // blockIdx bounded by reader block count
-		for _, entry := range entries {
-			rowIdx := uint16(entry.Packed) //nolint:gosec // low 16 bits = rowIdx; Packed = blockIdx<<16|rowIdx
-			if entry.Pos < 0 || int(entry.Pos) >= len(col.BytesValues) {
+		for i, ref := range col.BlockRefs {
+			if int(ref.BlockIdx) != blockIdx {
 				continue
 			}
-			e := out[rowIdx]
-			if colName == "trace:id" {
-				e.traceID = col.BytesValues[entry.Pos]
-			} else {
-				e.spanID = col.BytesValues[entry.Pos]
+			if i >= len(col.BytesValues) {
+				continue
 			}
-			out[rowIdx] = e
+			entry := out[ref.RowIdx]
+			if colName == "trace:id" {
+				entry.traceID = col.BytesValues[i]
+			} else {
+				entry.spanID = col.BytesValues[i]
+			}
+			out[ref.RowIdx] = entry
 		}
 	}
 	return out
 }
 
 // Config configures the compaction operation.
-type Config struct {
-	// StagingDir is a local directory for staging output files.
-	// If empty, os.TempDir() is used.
-	StagingDir string
-	// DedicatedColumns lists attribute columns to be written into the intrinsic section
-	// of output blocks, enabling the zero-block-read fast path for metrics queries.
-	// When non-empty, these columns are passed to each output Writer created during
-	// compaction. See writer.DedicatedColumn for documentation on the Name format.
-	DedicatedColumns []modules_blockio.DedicatedColumn
-	// MaxOutputFileSize is the maximum size in bytes of each output file (estimated).
-	// Zero means no size limit.
-	MaxOutputFileSize int64
-	// MaxSpansPerBlock controls how many spans are written per block.
-	// Defaults to 2000 if zero.
-	MaxSpansPerBlock int
-}
+
+// StagingDir is a local directory for staging output files.
+// If empty, os.TempDir() is used.
+
+// DedicatedColumns lists attribute columns to be written into the intrinsic section
+// of output blocks, enabling the zero-block-read fast path for metrics queries.
+// When non-empty, these columns are passed to each output Writer created during
+// compaction. See writer.DedicatedColumn for documentation on the Name format.
+
+// MaxOutputFileSize is the maximum size in bytes of each output file (estimated).
+// Zero means no size limit.
+
+// MaxSpansPerBlock controls how many spans are written per block.
+// Defaults to 2000 if zero.
 
 // OutputStorage provides write access for pushing output files.
 //
@@ -94,30 +86,14 @@ type Config struct {
 // single-method fake. Using blockpack.WritableStorage here would pull in Delete,
 // which compaction has no reason to call and which would widen the contract
 // unnecessarily.
-type OutputStorage interface {
-	Put(path string, data []byte) error
-}
 
 // writerState holds an active output writer and its accumulated span count.
 //
 //nolint:govet // Field order optimized for readability
-type writerState struct {
-	w         *modules_blockio.Writer
-	buf       *bytes.Buffer
-	spanCount int
-}
 
 // compactionState holds mutable state during a single CompactBlocks call.
-type compactionState struct {
-	current      *writerState
-	stagingDir   string
-	stagedFiles  []string
-	seenSpans    map[[24]byte]struct{}
-	cfg          Config
-	maxSpans     int
-	outputSeq    int
-	droppedSpans int64 // spans dropped due to missing trace:id or span:id
-}
+
+// spans dropped due to missing trace:id or span:id
 
 // CompactBlocks reads input blockpack providers, merges spans, deduplicates them,
 // and writes compacted output to outputStorage.
@@ -221,17 +197,6 @@ func (s *compactionState) processBlock(r *modules_reader.Reader, blockIdx int, b
 	// Build intrinsic ID index once per block; O(N) over intrinsic columns.
 	// dedupeKey uses this for O(1) per-row lookups instead of O(N) linear scans.
 	idIndex := buildDedupeIndex(r, blockIdx)
-
-	// NOTE-039: Pre-decode identity columns once before the row loop to eliminate per-row
-	// sync.Once.Do overhead in IsPresent. EnsureDecoded is idempotent (sync.Once);
-	// for v4 files where these columns don't exist in the block payload, this is a no-op.
-	if col := block.GetColumn("trace:id"); col != nil {
-		col.EnsureDecoded()
-	}
-	if col := block.GetColumn("span:id"); col != nil {
-		col.EnsureDecoded()
-	}
-
 	for rowIdx := range block.SpanCount() {
 		if err := s.addSpanFromBlock(r, blockIdx, block, rowIdx, idIndex); err != nil {
 			return fmt.Errorf("row %d: %w", rowIdx, err)

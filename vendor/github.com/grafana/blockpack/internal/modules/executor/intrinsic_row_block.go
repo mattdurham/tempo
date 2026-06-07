@@ -131,7 +131,9 @@ func scatterTraceID(
 	result []intrinsicRowFields,
 ) {
 	for _, e := range entries {
-		rowIdx := int(uint16(e.Packed)) //nolint:gosec // low 16 bits of Packed are the rowIdx (blockIdx in high 16 bits)
+		rowIdx := int(
+			uint16(e.Packed), //nolint:gosec // low 16 bits are rowIdx; blockIdx in high 16 bits
+		) //nolint:gosec // low 16 bits of Packed are the rowIdx (blockIdx in high 16 bits)
 		if rowIdx >= len(result) {
 			continue
 		}
@@ -155,7 +157,9 @@ func scatterSpanID(
 	result []intrinsicRowFields,
 ) {
 	for _, e := range entries {
-		rowIdx := int(uint16(e.Packed)) //nolint:gosec // low 16 bits of Packed are the rowIdx (blockIdx in high 16 bits)
+		rowIdx := int(
+			uint16(e.Packed), //nolint:gosec // low 16 bits are rowIdx; blockIdx in high 16 bits
+		) //nolint:gosec // low 16 bits of Packed are the rowIdx (blockIdx in high 16 bits)
 		if rowIdx >= len(result) {
 			continue
 		}
@@ -177,7 +181,9 @@ func scatterParentID(
 	result []intrinsicRowFields,
 ) {
 	for _, e := range entries {
-		rowIdx := int(uint16(e.Packed)) //nolint:gosec // low 16 bits of Packed are the rowIdx (blockIdx in high 16 bits)
+		rowIdx := int(
+			uint16(e.Packed), //nolint:gosec // low 16 bits are rowIdx; blockIdx in high 16 bits
+		) //nolint:gosec // low 16 bits of Packed are the rowIdx (blockIdx in high 16 bits)
 		if rowIdx >= len(result) {
 			continue
 		}
@@ -200,7 +206,9 @@ func scatterUint64Field(
 	set func(*intrinsicRowFields, uint64),
 ) {
 	for _, e := range entries {
-		rowIdx := int(uint16(e.Packed)) //nolint:gosec // low 16 bits of Packed are the rowIdx (blockIdx in high 16 bits)
+		rowIdx := int(
+			uint16(e.Packed), //nolint:gosec // low 16 bits are rowIdx; blockIdx in high 16 bits
+		) //nolint:gosec // low 16 bits of Packed are the rowIdx (blockIdx in high 16 bits)
 		if rowIdx >= len(result) {
 			continue
 		}
@@ -222,7 +230,9 @@ func scatterDictStringField(
 	set func(*intrinsicRowFields, string),
 ) {
 	for _, e := range entries {
-		rowIdx := int(uint16(e.Packed)) //nolint:gosec // low 16 bits of Packed are the rowIdx (blockIdx in high 16 bits)
+		rowIdx := int(
+			uint16(e.Packed), //nolint:gosec // low 16 bits are rowIdx; blockIdx in high 16 bits
+		) //nolint:gosec // low 16 bits of Packed are the rowIdx (blockIdx in high 16 bits)
 		if rowIdx >= len(result) {
 			continue
 		}
@@ -244,7 +254,9 @@ func scatterDictInt64Field(
 	set func(*intrinsicRowFields, int64),
 ) {
 	for _, e := range entries {
-		rowIdx := int(uint16(e.Packed)) //nolint:gosec // low 16 bits of Packed are the rowIdx (blockIdx in high 16 bits)
+		rowIdx := int(
+			uint16(e.Packed), //nolint:gosec // low 16 bits are rowIdx; blockIdx in high 16 bits
+		) //nolint:gosec // low 16 bits of Packed are the rowIdx (blockIdx in high 16 bits)
 		if rowIdx >= len(result) {
 			continue
 		}

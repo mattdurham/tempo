@@ -7,71 +7,49 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"math"
-	"sync"
-	"sync/atomic"
 
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
 )
 
 // Column holds a decoded column ready for query evaluation.
-type Column struct {
-	internMap map[string]string // per-column intern map for lazy decode
-	Name      string
 
-	// Dictionary fields — MUST be heap-allocated (never arena) per NOTES §10.
-	StringDict  []string
-	StringIdx   []uint32
-	Int64Dict   []int64
-	Int64Idx    []uint32
-	Uint64Dict  []uint64
-	Uint64Idx   []uint32
-	Float64Dict []float64
-	Float64Idx  []uint32
-	BoolDict    []uint8
-	BoolIdx     []uint32
-	BytesDict   [][]byte
-	BytesIdx    []uint32
+// per-column intern map for lazy decode
 
-	// Inline bytes (kinds 3/4) — no dictionary.
-	BytesInline [][]byte
+// Dictionary fields — MUST be heap-allocated (never arena) per NOTES §10.
 
-	// Presence bitset — MAY be arena-allocated.
-	Present []byte
+// Inline bytes (kinds 3/4) — no dictionary.
 
-	// NOTE-001: Lazy decode fields — rawEncoding holds decompressed column bytes.
-	// For eagerly-decoded columns: rawEncoding is nil (already decoded into Dict/Idx slices).
-	// For V14 lazily-registered columns: compressedEncoding holds the pending bytes until
-	// ensureDecompressed() runs on first access, populating rawEncoding; then decodeNow()
-	// consumes rawEncoding and clears it. rawEncoding is valid only inside decodeOnce.Do.
-	rawEncoding []byte
+// Presence bitset — MAY be arena-allocated.
 
-	// compressedEncoding holds the snappy-compressed column blob for V14 lazy columns.
-	// It is a zero-copy sub-slice of the block's rawBytes and is nil after decompression.
-	// SPEC-V14-002: decompression is deferred to first column access (ensureDecompressed).
-	compressedEncoding []byte
+// NOTE-001: Lazy decode fields — rawEncoding holds decompressed column bytes.
+// For eagerly-decoded columns: rawEncoding is nil (already decoded into Dict/Idx slices).
+// For V14 lazily-registered columns: compressedEncoding holds the pending bytes until
+// ensureDecompressed() runs on first access, populating rawEncoding; then decodeNow()
+// consumes rawEncoding and clears it. rawEncoding is valid only inside decodeOnce.Do.
 
-	// sparseDictIdx holds the raw sparse dict indexes before the dense Idx slice is built.
-	// Non-nil means expandDenseIdx() has not been called yet (lazy dense expansion).
-	// Set by decodeDictKind2Sparse / decodeRLEIndexes; cleared after first value access.
-	// NOTE-PERF-1: sparse dict columns (kind 2 / kind 7 RLE) defer the O(spanCount)
-	// expandSparseIndexes allocation until the column is first accessed, avoiding
-	// allocation for columns that are decoded but never read (e.g. early block exit).
-	sparseDictIdx []uint32
+// compressedEncoding holds the snappy-compressed column blob for V14 lazy columns.
+// It is a zero-copy sub-slice of the block's rawBytes and is nil after decompression.
+// SPEC-V14-002: decompression is deferred to first column access (ensureDecompressed).
 
-	// Total span count this column covers (including nulls).
-	SpanCount      int
-	decodeOnce     sync.Once   // ensures decodeNow runs at most once, safe for concurrent callers
-	denseOnce      sync.Once   // ensures expandDenseIdx runs at most once
-	decompressOnce sync.Once   // ensures ensureDecompressed runs at most once
-	decoded        atomic.Bool // true after decodeNow completes; the ONLY cross-goroutine signal
-	// NOTE-CONC-001: rawEncoding and compressedEncoding must ONLY be read/written inside their
-	// respective Once closures (decodeOnce and decompressOnce). The outer fast-path check uses
-	// decoded.Load() — an atomic read — to avoid races between concurrent accessors.
-	// IsPresent calls decodeNow (via decodeOnce) rather than a separate presenceOnce to
-	// eliminate the rawEncoding race that existed when presenceOnce and decodeOnce were independent.
-	uncompressedLen uint32 // V14 lazy only: expected decompressed size for SPEC-ROOT-012 bomb guard
-	Type            shared.ColumnType
-}
+// sparseDictIdx holds the raw sparse dict indexes before the dense Idx slice is built.
+// Non-nil means expandDenseIdx() has not been called yet (lazy dense expansion).
+// Set by decodeDictKind2Sparse / decodeRLEIndexes; cleared after first value access.
+// NOTE-PERF-1: sparse dict columns (kind 2 / kind 7 RLE) defer the O(spanCount)
+// expandSparseIndexes allocation until the column is first accessed, avoiding
+// allocation for columns that are decoded but never read (e.g. early block exit).
+
+// Total span count this column covers (including nulls).
+
+// ensures decodeNow runs at most once, safe for concurrent callers
+// ensures expandDenseIdx runs at most once
+// ensures ensureDecompressed runs at most once
+// true after decodeNow completes; the ONLY cross-goroutine signal
+// NOTE-CONC-001: rawEncoding and compressedEncoding must ONLY be read/written inside their
+// respective Once closures (decodeOnce and decompressOnce). The outer fast-path check uses
+// decoded.Load() — an atomic read — to avoid races between concurrent accessors.
+// IsPresent calls decodeNow (via decodeOnce) rather than a separate presenceOnce to
+// eliminate the rawEncoding race that existed when presenceOnce and decodeOnce were independent.
+// V14 lazy only: expected decompressed size for SPEC-ROOT-012 bomb guard
 
 // IsDecoded reports whether this column's values have been fully decoded.
 // NOTE-001: returns false when decodeNow has not yet completed (column is lazily registered).
@@ -348,10 +326,6 @@ func (c *Column) VectorF32Value(idx int) ([]float32, bool) {
 // ColIterEntry is a single entry in the pre-computed deduplicated column iteration list.
 // Built once by BuildIterFields after all columns are registered.
 // NOTE-049: Pre-computed column iteration order eliminates the per-span seen-map alloc.
-type ColIterEntry struct {
-	Col  *Column
-	Name string
-}
 
 // Block holds decoded columns for a single block.
 type Block struct {
@@ -369,34 +343,9 @@ type Block struct {
 	// BuildIterFields. When non-nil, IterateFields uses this slice directly — zero allocs.
 	// NOTE-049: see blockio/NOTES.md §49.
 	iterFields []ColIterEntry
-	// copySlice is the pre-computed full column copy slice, built by BuildCopySlice.
-	// NOTE-050: eliminates per-row map iteration in addRowFromBlock.
-	copySlice []ColumnCopyEntry
-	meta      shared.BlockMeta
-	spanCount int
+	meta       shared.BlockMeta
+	spanCount  int
 }
-
-// ColumnCopyEntry carries a column and its full key for use by addRowFromBlock.
-// NOTE-050: unlike ColIterEntry (name-deduplicated), ColumnCopyEntry preserves all
-// typed variants so the copy path can dispatch on both name and type.
-type ColumnCopyEntry struct {
-	Col *Column
-	Key shared.ColumnKey
-}
-
-// BuildCopySlice pre-computes the full column copy slice for use by addRowFromBlock.
-// Call after BuildIterFields. Includes ALL (Key, Col) pairs — no deduplication.
-func (b *Block) BuildCopySlice() {
-	entries := make([]ColumnCopyEntry, 0, len(b.columns))
-	for k, col := range b.columns {
-		entries = append(entries, ColumnCopyEntry{Key: k, Col: col})
-	}
-	b.copySlice = entries
-}
-
-// CopySlice returns the pre-computed full column copy slice built by BuildCopySlice.
-// Returns nil if BuildCopySlice has not been called — callers must fall back to Columns().
-func (b *Block) CopySlice() []ColumnCopyEntry { return b.copySlice }
 
 // newBlockForParsing creates a Block with an empty columns map, for use with AddColumnsToBlock.
 // Call buildNameIndex after all columns have been added.
@@ -486,7 +435,3 @@ func (b *Block) Columns() map[shared.ColumnKey]*Column { return b.columns }
 func (b *Block) Meta() shared.BlockMeta { return b.meta }
 
 // BlockWithBytes bundles a decoded Block with its raw bytes for AddColumnsToBlock.
-type BlockWithBytes struct {
-	Block    *Block
-	RawBytes []byte
-}

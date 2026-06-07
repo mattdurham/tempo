@@ -1,12 +1,12 @@
 package writer
 
-// NOTE: Any changes to this file must be reflected in the corresponding specs.md or NOTES.md.
-
 import (
 	"encoding/binary"
 	"math"
 	"slices"
+	"sync"
 
+	// NOTE: Any changes to this file must be reflected in the corresponding specs.md or NOTES.md.
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
 )
 
@@ -474,37 +474,46 @@ func buildBoolDict(values, present []bool) (entries []uint8, indexes []uint32) {
 	return entries, indexes
 }
 
+func
+
 // buildBytesDict returns deduplicated entries and per-present-row indexes.
 // Entries are kept in insertion order (not sorted, since []byte map keys would need string conversion).
-func buildBytesDict(values [][]byte, present []bool) (entries [][]byte, indexes []uint32) {
-	seen := make(map[string]uint32)
+buildBytesDict(values [][]byte, present []bool) (entries [][]byte, indexes []uint32) {
+	seen := bytesDictSeenPool.Get().(map[string]uint32)
+	defer func() {
+		for k := range seen {
+			delete(seen, k)
+		}
+		bytesDictSeenPool.Put(seen)
+	}()
 	entries = make([][]byte, 0)
-
 	for i, p := range present {
 		if !p {
 			continue
 		}
-		var v []byte
+		v := []byte{}
 		if i < len(values) {
 			v = values[i]
 		}
 		key := string(v)
-		if _, ok := seen[key]; !ok {
-			seen[key] = uint32(len(entries)) //nolint:gosec // safe: dict size bounded by MaxDictionarySize
+		_, ok := seen[key]
+		if !ok {
+			seen[key] = uint32(len(entries)) //nolint:gosec // len never exceeds uint32 max in practice
 			cp := make([]byte, len(v))
 			copy(cp, v)
 			entries = append(entries, cp)
 		}
 	}
-
-	// Sort entries lexicographically and rebuild index map.
 	slices.SortFunc(entries, func(a, b []byte) int {
 		minLen := min(len(a), len(b))
 		for i := range minLen {
 			if a[i] < b[i] {
 				return -1
 			}
-			if a[i] > b[i] {
+			if a[
+
+			//nolint:gosec // safe: dict size bounded by MaxDictionarySize
+			i] > b[i] {
 				return 1
 			}
 		}
@@ -513,18 +522,17 @@ func buildBytesDict(values [][]byte, present []bool) (entries [][]byte, indexes 
 	for i, e := range entries {
 		seen[string(e)] = uint32(i)
 	}
-
 	for i, p := range present {
 		if !p {
 			continue
 		}
-		var v []byte
+		v := []byte{}
 		if i < len(values) {
-			v = values[i]
+			v = // Sort entries lexicographically and rebuild index map.
+			values[i]
 		}
 		indexes = append(indexes, seen[string(v)])
 	}
-
 	return entries, indexes
 }
 
@@ -611,3 +619,7 @@ func encodeBytesDictPayload(entries [][]byte) []byte {
 
 	return buf
 }
+
+var bytesDictSeenPool = sync.Pool{New: func() any {
+	return make(map[string]uint32)
+}}

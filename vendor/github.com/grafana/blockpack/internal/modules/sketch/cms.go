@@ -31,9 +31,6 @@ const (
 // SPEC-SK-06: Add never panics.
 // SPEC-SK-07: Estimate returns 0 for unseen values.
 // SPEC-SK-08: Estimate >= actual count (over-estimate guarantee).
-type CountMinSketch struct {
-	rows [cmsD][cmsW]uint16
-}
 
 // NewCountMinSketch creates an empty CMS.
 func NewCountMinSketch() *CountMinSketch {

@@ -37,9 +37,6 @@ type LabelSet interface {
 
 // mapLabelSet is a LabelSet backed by a plain map[string]string.
 // Used for the non-pre-parsed block fallback path and in tests.
-type mapLabelSet struct {
-	m map[string]string
-}
 
 // NewMapLabelSet wraps an existing map as a LabelSet. The LabelSet takes ownership;
 // callers must not modify m after this call. A nil m is treated as empty.

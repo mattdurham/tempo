@@ -8,13 +8,8 @@ import (
 
 // ---- stringColumnBuilder ----
 
-type stringColumnBuilder struct {
-	colName        string
-	values         []string
-	present        []bool
-	typ            shared.ColumnType // ColumnTypeString or ColumnTypeRangeString; preserved in colType()
-	detectedAsUUID bool              // set by buildData when all values are valid UUIDs
-}
+// ColumnTypeString or ColumnTypeRangeString; preserved in colType()
+// set by buildData when all values are valid UUIDs
 
 func (b *stringColumnBuilder) resetForReuse(colName string) {
 	clear(b.values)  // zero string headers so GC can collect string data
@@ -124,11 +119,6 @@ func (b *stringColumnBuilder) buildData() ([]byte, error) {
 
 // ---- int64ColumnBuilder ----
 
-type int64ColumnBuilder struct {
-	values  []int64
-	present []bool
-}
-
 func (b *int64ColumnBuilder) resetForReuse(_ string) {
 	clear(b.present)
 	b.values = b.values[:0]
@@ -196,15 +186,6 @@ func (b *int64ColumnBuilder) buildData() ([]byte, error) {
 }
 
 // ---- uint64ColumnBuilder ----
-
-type uint64ColumnBuilder struct {
-	colName string
-	values  []uint64
-	present []bool
-	minVal  uint64
-	maxVal  uint64
-	hasVals bool
-}
 
 func (b *uint64ColumnBuilder) resetForReuse(colName string) {
 	clear(b.present)
@@ -346,11 +327,6 @@ func cheapCardinalityUint64(values []uint64, present []bool) int {
 
 // ---- float64ColumnBuilder ----
 
-type float64ColumnBuilder struct {
-	values  []float64
-	present []bool
-}
-
 func (b *float64ColumnBuilder) resetForReuse(_ string) {
 	clear(b.present)
 	b.values = b.values[:0]
@@ -419,11 +395,6 @@ func (b *float64ColumnBuilder) buildData() ([]byte, error) {
 
 // ---- boolColumnBuilder ----
 
-type boolColumnBuilder struct {
-	values  []bool
-	present []bool
-}
-
 func (b *boolColumnBuilder) resetForReuse(_ string) {
 	clear(b.present)
 	b.values = b.values[:0]
@@ -491,12 +462,6 @@ func (b *boolColumnBuilder) buildData() ([]byte, error) {
 }
 
 // ---- bytesColumnBuilder ----
-
-type bytesColumnBuilder struct {
-	colName string
-	values  [][]byte
-	present []bool
-}
 
 func (b *bytesColumnBuilder) resetForReuse(colName string) {
 	clear(b.values)  // zero []byte headers so GC can collect byte data

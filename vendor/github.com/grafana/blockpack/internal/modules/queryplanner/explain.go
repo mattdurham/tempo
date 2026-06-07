@@ -32,7 +32,7 @@ func explainPlan(r BlockIndexer, predicates []Predicate, plan *Plan, timeBlocks 
 	// --- Section 1: Predicate tree ---
 	parts := make([]string, 0, len(predicates)+1)
 	for _, pred := range predicates {
-		parts = append(parts, explainPred(r, pred))
+		parts = append(parts, explainPred(r, pred, plan.TotalBlocks))
 	}
 	if timeBlocks != nil {
 		parts = append(parts, fmt.Sprintf("ts:%s", formatBlockList(timeBlocks)))
@@ -76,9 +76,9 @@ func explainPlan(r BlockIndexer, predicates []Predicate, plan *Plan, timeBlocks 
 }
 
 // explainPred recursively builds the ASCII representation for a single predicate node.
-func explainPred(r BlockIndexer, pred Predicate) string {
+func explainPred(r BlockIndexer, pred Predicate, blockCount int) string {
 	if len(pred.Children) == 0 {
-		return explainLeaf(r, pred)
+		return explainLeaf(r, pred, blockCount)
 	}
 
 	op := "&&"
@@ -88,7 +88,7 @@ func explainPred(r BlockIndexer, pred Predicate) string {
 
 	parts := make([]string, 0, len(pred.Children))
 	for _, child := range pred.Children {
-		parts = append(parts, explainPred(r, child))
+		parts = append(parts, explainPred(r, child, blockCount))
 	}
 
 	return "(" + strings.Join(parts, " "+op+" ") + ")"
@@ -96,7 +96,7 @@ func explainPred(r BlockIndexer, pred Predicate) string {
 
 // explainLeaf builds the ASCII representation for a leaf predicate, showing
 // the column name and the block set returned by the range index.
-func explainLeaf(r BlockIndexer, pred Predicate) string {
+func explainLeaf(r BlockIndexer, pred Predicate, blockCount int) string {
 	col := "?"
 	if len(pred.Columns) > 0 {
 		col = pred.Columns[0]
@@ -105,18 +105,16 @@ func explainLeaf(r BlockIndexer, pred Predicate) string {
 		}
 	}
 
-	set, err := leafBlockSet(r, pred)
+	set, constrained, err := leafBlockSet(r, pred, blockCount)
 	if err != nil {
 		return fmt.Sprintf("%s=err(%v)", col, err)
 	}
-	if set == nil {
+	if !constrained {
 		return fmt.Sprintf("%s=[]", col)
 	}
 
-	blocks := make([]int, 0, len(set))
-	for b := range set {
-		blocks = append(blocks, b)
-	}
+	var blocks []int
+	set.iter(func(b int) { blocks = append(blocks, b) })
 	slices.Sort(blocks)
 	return fmt.Sprintf("%s=%s", col, formatBlockList(blocks))
 }
@@ -133,7 +131,9 @@ func explainBlockPriority(sb *strings.Builder, r BlockIndexer, plan *Plan, predi
 	}
 	blocks := make([]scoredBlock, 0, len(plan.BlockScores))
 	for b, s := range plan.BlockScores {
-		blocks = append(blocks, scoredBlock{b, s})
+		if s > 0 {
+			blocks = append(blocks, scoredBlock{b, s})
+		}
 	}
 	slices.SortFunc(blocks, func(a, b scoredBlock) int {
 		if a.score != b.score {
@@ -155,9 +155,10 @@ func explainBlockPriority(sb *strings.Builder, r BlockIndexer, plan *Plan, predi
 	}
 
 	// Also note unscored blocks (survived pruning but no sketch data to score).
+	// NOTE-023: BlockScores is []float64; 0.0 means unscored (score cannot be exactly 0 for scored blocks).
 	var unscored []int
 	for _, b := range plan.SelectedBlocks {
-		if _, ok := plan.BlockScores[b]; !ok {
+		if b >= len(plan.BlockScores) || plan.BlockScores[b] == 0 {
 			unscored = append(unscored, b)
 		}
 	}

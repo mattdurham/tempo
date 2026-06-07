@@ -5,10 +5,6 @@ package rw
 import "time"
 
 // latencyProvider injects artificial latency before each read (for testing).
-type latencyProvider struct {
-	underlying ReaderProvider
-	latency    time.Duration
-}
 
 func (l *latencyProvider) Size() (int64, error) {
 	return l.underlying.Size()
@@ -27,10 +23,6 @@ func (l *latencyProvider) ReadAt(p []byte, off int64, dt DataType) (int, error) 
 //
 // Holds the tracker separately for stats access.
 // All methods are safe for concurrent use.
-type DefaultProvider struct {
-	cache   *RangeCachingProvider
-	tracker *TrackingReaderProvider
-}
 
 // NewDefaultProvider creates a DefaultProvider wrapping underlying.
 func NewDefaultProvider(underlying ReaderProvider) *DefaultProvider {

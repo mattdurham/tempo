@@ -312,8 +312,12 @@ func writeFooterV8(w io.Writer, tocOffset uint64, tocLen uint32) error {
 // writeOneColumnRangeBlob serializes the range data for a single column.
 // The returned bytes do NOT include the column name (the ToCEntry.Key.Name carries it).
 // Wire format: col_type[1] + bucket_metadata + value_count[4] + value_entries[...].
-// Returns nil, nil if cd has no bucket entries (cd.values is empty).
+// Returns nil, nil if cd has no bucket entries (cd.values and cd.numValues are both empty).
 func writeOneColumnRangeBlob(cd *rangeColumnData) ([]byte, error) {
+	// Numeric columns (int64/uint64/float64) use numValues; string/bytes use values.
+	if len(cd.numValues) > 0 {
+		return writeOneColumnRangeBlobNum(cd)
+	}
 	if len(cd.values) == 0 {
 		return nil, nil
 	}
@@ -330,13 +334,54 @@ func writeOneColumnRangeBlob(cd *rangeColumnData) ([]byte, error) {
 
 	// value_count[4 LE]
 	var tmp4 [4]byte
-	binary.LittleEndian.PutUint32(tmp4[:], uint32(len(keys))) //nolint:gosec // safe: value count bounded by MaxDictionarySize
+	binary.LittleEndian.PutUint32(
+		tmp4[:],
+		uint32(len(keys)), //nolint:gosec // safe: value count bounded by MaxDictionarySize
+	)
 	buf.Write(tmp4[:])
 
 	for _, key := range keys {
 		blockIDs := cd.values[key]
 		writeRangeValueKey(&buf, cd.colType, key)
-		binary.LittleEndian.PutUint32(tmp4[:], uint32(len(blockIDs))) //nolint:gosec // safe: block ID count bounded by MaxBlocks
+		binary.LittleEndian.PutUint32(
+			tmp4[:],
+			uint32(len(blockIDs)), //nolint:gosec // safe: block ID count bounded by MaxBlocks
+		)
+		buf.Write(tmp4[:])
+		for _, bid := range blockIDs {
+			binary.LittleEndian.PutUint32(tmp4[:], bid)
+			buf.Write(tmp4[:])
+		}
+	}
+	return buf.Bytes(), nil
+}
+
+// writeOneColumnRangeBlobNum serializes range data for numeric columns that store
+// bucket entries in numValues ([8]byte keys) rather than values (string keys).
+// Wire format is identical to writeOneColumnRangeBlob.
+func writeOneColumnRangeBlobNum(cd *rangeColumnData) ([]byte, error) {
+	var buf bytes.Buffer
+	buf.WriteByte(byte(cd.colType))
+	writeRangeBucketMeta(&buf, cd)
+
+	// Sort keys for deterministic output by converting to strings.
+	keys := make([][8]byte, 0, len(cd.numValues))
+	for k := range cd.numValues {
+		keys = append(keys, k)
+	}
+	slices.SortFunc(keys, func(a, b [8]byte) int {
+		return bytes.Compare(a[:], b[:])
+	})
+
+	// value_count[4 LE]
+	var tmp4 [4]byte
+	binary.LittleEndian.PutUint32(tmp4[:], uint32(len(keys))) //nolint:gosec
+	buf.Write(tmp4[:])
+
+	for _, bk := range keys {
+		blockIDs := cd.numValues[bk]
+		writeRangeValueKey(&buf, cd.colType, string(bk[:]))
+		binary.LittleEndian.PutUint32(tmp4[:], uint32(len(blockIDs))) //nolint:gosec
 		buf.Write(tmp4[:])
 		for _, bid := range blockIDs {
 			binary.LittleEndian.PutUint32(tmp4[:], bid)

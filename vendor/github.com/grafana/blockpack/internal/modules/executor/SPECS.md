@@ -813,19 +813,16 @@ Back-ref: `internal/modules/executor/stream_structural.go:ExecuteStructural`
 ### 11.3 Invariants
 
 - **SPEC-STRUCT-1:** Nil reader returns `&StructuralResult{}` with no error.
-- **SPEC-STRUCT-2:** File-level bloom, range, and intrinsic TOC pruning is applied for ALL
-  programs where safe (NOTE-091, NOTE-095, NOTE-097). Safety is determined by
-  `shouldRejectFileForProgram`: for the LHS program (index 0) of a negation op (!>>, !>, !~),
-  absent LHS means all RHS spans trivially qualify, so file-level rejection is NOT safe and is
-  skipped. For all other programs (positive ops, or any RHS program), absent predicate matches
-  imply no output, so file-level rejection is safe. Within a file, all blocks are scanned —
-  parent spans may be in any internal block. Additionally, intrinsic TOC file-level rejection
-  (NOTE-097) is applied in the same loop: `BlocksFromIntrinsicTOC` is called for each eligible
-  program; if it returns a non-nil empty slice (zero blocks in the file contain matching spans),
-  the file is rejected before block selection. Block-level TOC pruning (non-empty return from
-  `BlocksFromIntrinsicTOC`) is intentionally not applied to preserve NOTE-091 safety. For
-  `{} >> {}` (no predicates), behavior is unchanged: `planner.Plan(nil, tr)` is called
-  (time-range pruning only).
+- **SPEC-STRUCT-2:** Block selection uses `planBlocks(r, prog, tr, opts)` per structural
+  node — the same bloom, range-index, intrinsic-TOC, and TS-index pruning as plain filter
+  queries (NOTE-091). The selected block sets are unioned across all programs. Any block
+  absent from every program's set has no spans matching any structural node and is skipped.
+  Safety: `shouldRejectFileForProgram` gates per-program pruning — LHS of negation ops
+  (`!>>`, `!>`, `!~`) use `planBlocks(nil, tr, opts)` (time-range only, no predicate pruning).
+  Known limitation: intermediate ancestor spans in pruned blocks can cause false negatives
+  for multi-block traces; acceptable for typical workloads where traces fit in one block.
+  For `{} >> {}` (nil predicates), `planBlocks(nil, tr, opts)` is called per program,
+  selecting all time-range-matching blocks — behavior identical to the pre-NOTE-091 path.
 - **SPEC-STRUCT-3:** A nil filter in any chain slot of `StructuralQuery` (left or any right
   `Expr` node) compiles to a nil program, which matches all rows (wildcard `{}`).
 - **SPEC-STRUCT-4:** `Options.Limit > 0` caps the number of entries in `StructuralResult.Matches`.
@@ -840,13 +837,13 @@ Back-ref: `internal/modules/executor/stream_structural.go:ExecuteStructural`
 - **SPEC-STRUCT-6:** `OpNotDescendant (!>>)` — a rightMatch span R passes if NO span in
   R's ancestor chain is a leftMatch. Root spans (parentIdx == -1) have an empty ancestor
   chain and always pass. Contrast with `>>` (OpDescendant) which requires at least one
-  ancestor to be leftMatch. All blocks are still scanned (SPEC-STRUCT-2 applies).
+  ancestor to be leftMatch. Block selection uses planBlocks per program with the union of selected blocks (SPEC-STRUCT-2).
   Back-ref: `internal/modules/executor/stream_structural.go:evalOpNotDescendantStruct`
 
 - **SPEC-STRUCT-7:** `OpNotChild (!>)` — a rightMatch span R passes if R has no parent
   (parentIdx == -1) or R's direct parent is not a leftMatch. Root spans trivially pass.
   Contrast with `>` (OpChild) which requires the direct parent to be leftMatch.
-  All blocks are still scanned (SPEC-STRUCT-2 applies).
+  Block selection uses planBlocks per program with the union of selected blocks (SPEC-STRUCT-2).
   Back-ref: `internal/modules/executor/stream_structural.go:evalOpNotChildStruct`
 
 - **SPEC-STRUCT-8:** N-node chain support — `ExecuteStructural` supports chains of N nodes

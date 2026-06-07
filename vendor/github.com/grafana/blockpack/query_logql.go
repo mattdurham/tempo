@@ -69,12 +69,6 @@ func streamLogQLWithPipeline(
 // the log pipeline path (streamLogQLWithPipeline) materializes only the fields that
 // downstream consumers (the LokiConverter) actually need. Callers requiring full
 // column access should use QueryTraceQL or the streamFilterProgram path instead.
-type logEntryFields struct {
-	lokiLabels string
-	line       string
-	logAttrs   modules_executor.LogAttrs
-	timestamp  uint64
-}
 
 func (f *logEntryFields) GetField(name string) (any, bool) {
 	switch name {

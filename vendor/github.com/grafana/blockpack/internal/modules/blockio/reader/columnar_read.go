@@ -45,46 +45,6 @@ func (r *Reader) ReadGroupColumnar(cr shared.CoalescedRead, wantColumns map[stri
 	}
 	// No cache key: full download (original ReadGroup behavior).
 	return ReadCoalescedBlocks(r.provider, []shared.CoalescedRead{cr})
-
-	type blockResult struct {
-		err      error  // pointer fields first: type+value ptrs (offsets 0,8)
-		data     []byte // backing ptr (offset 16), len+cap non-ptrs (24,32)
-		blockIdx int    // non-ptr (offset 40) — last pointer is at 16, scan = 24 bytes
-	}
-
-	results := make([]blockResult, len(cr.BlockIDs))
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, runtime.NumCPU())
-
-	for j, blockIdx := range cr.BlockIDs {
-		sem <- struct{}{} // acquire slot before launching goroutine
-		wg.Add(1)
-		go func(j, blockIdx int) {
-			defer wg.Done()
-			defer func() { <-sem }() // release slot
-			defer func() {
-				if r := recover(); r != nil {
-					// SPEC-ROOT-010: panics indicate bugs; log with context before swallowing.
-					slog.Error("ReadGroupColumnar: goroutine panic",
-						"block_idx", blockIdx, "panic", r,
-						"stack", string(debug.Stack()))
-					results[j] = blockResult{blockIdx: blockIdx, err: fmt.Errorf("readBlockColumnar: panic: %v", r)}
-				}
-			}()
-			data, err := r.readBlockColumnar(cr.BlockOffsets[j], cr.BlockLengths[j], wantColumns)
-			results[j] = blockResult{blockIdx: blockIdx, data: data, err: err}
-		}(j, blockIdx)
-	}
-	wg.Wait()
-
-	out := make(map[int][]byte, len(cr.BlockIDs))
-	for _, res := range results {
-		if res.err != nil {
-			return nil, res.err
-		}
-		out[res.blockIdx] = res.data
-	}
-	return out, nil
 }
 
 // FilterBlockColumns creates a sparse buffer retaining only the block header, column
@@ -94,6 +54,57 @@ func (r *Reader) ReadGroupColumnar(cr shared.CoalescedRead, wantColumns map[stri
 //
 // Used by blockGroupPipeline to shed unused column bytes after ReadGroup downloads the
 // full coalesced group — reduces querier peak memory from ~10GB to ~500MB for typical
+// 3-hour histogram queries without issuing additional S3 requests.
+//
+// Returns raw unchanged on any parse error (safe fallback).
+func FilterBlockColumns(raw []byte, wantColumns map[string]struct{}) ([]byte, error) {
+	if len(wantColumns) == 0 {
+		return raw, nil
+	}
+	hdr, err := parseBlockHeader(raw)
+	if err != nil {
+		return raw, nil //nolint:nilerr // intentional: fallback to full bytes on parse error
+	}
+	metas, tocEnd, err := parseColumnMetadataArray(raw, int(shared.BlockHeaderV14Size), int(hdr.columnCount))
+	if err != nil {
+		return raw, nil //nolint:nilerr // intentional: fallback to full bytes on parse error
+	}
+
+	// Compute sparse buffer size: header + metadata + wanted column extents.
+	bufSize := int64(tocEnd) //nolint:gosec
+	for _, m := range metas {
+		if _, ok := wantColumns[m.name]; !ok || m.compressedLen == 0 {
+			continue
+		}
+		colEnd := int64(m.dataOffset) + int64(m.compressedLen) //nolint:gosec
+		if colEnd > int64(len(raw)) {
+			continue // out of bounds guard
+		}
+		if colEnd > bufSize {
+			bufSize = colEnd
+		}
+	}
+
+	if bufSize >= int64(len(raw)) {
+		return raw, nil // no savings — return original
+	}
+
+	assembled := make([]byte, bufSize)
+	copy(assembled, raw[:tocEnd])
+	for _, m := range metas {
+		if _, ok := wantColumns[m.name]; !ok || m.compressedLen == 0 {
+			continue
+		}
+		colStart := int64(m.dataOffset)  //nolint:gosec
+		colLen := int64(m.compressedLen) //nolint:gosec
+		if colStart+colLen > int64(len(raw)) {
+			continue
+		}
+		copy(assembled[colStart:colStart+colLen], raw[colStart:colStart+colLen])
+	}
+	return assembled, nil
+}
+
 // sectionTypeBlockToc and sectionTypeBlockCol are section cache key namespaces for
 // raw internal block bytes. They don't overlap with V8 ToC entry types.
 const (
@@ -112,7 +123,10 @@ const (
 // allocates bytes for unwanted columns.
 //
 // Falls back to ReadGroup when fileID is empty (no stable cache key) or wantColumns is nil.
-func (r *Reader) ReadGroupColumnarCached(cr shared.CoalescedRead, wantColumns map[string]struct{}) (map[int][]byte, error) {
+func (r *Reader) ReadGroupColumnarCached(
+	cr shared.CoalescedRead,
+	wantColumns map[string]struct{},
+) (map[int][]byte, error) {
 	if wantColumns == nil || r.fileID == "" {
 		return r.ReadGroup(cr) // WantAll or no cache key: full download
 	}
@@ -137,8 +151,10 @@ func (r *Reader) ReadGroupColumnarCached(cr shared.CoalescedRead, wantColumns ma
 				if rec := recover(); rec != nil {
 					slog.Error("ReadGroupColumnarCached: panic", "block_idx", blockIdx,
 						"panic", rec, "stack", string(debug.Stack()))
-					results[j] = blockResult{blockIdx: blockIdx,
-						err: fmt.Errorf("block %d panic: %v", blockIdx, rec)}
+					results[j] = blockResult{
+						blockIdx: blockIdx,
+						err:      fmt.Errorf("block %d panic: %v", blockIdx, rec),
+					}
 				}
 			}()
 			// Reuse readBlockColumnar's logic but route through the section cache.
@@ -161,7 +177,11 @@ func (r *Reader) ReadGroupColumnarCached(cr shared.CoalescedRead, wantColumns ma
 // readBlockColumnarWithCache is readBlockColumnar extended with section cache routing.
 // Phase 1 (ToC) and Phase 2 (column reads) both go through r.cache so repeated queries
 // pay zero S3 cost. Falls back to the full block read on ToC parse errors.
-func (r *Reader) readBlockColumnarWithCache(blockOff, blockLen int64, blockIdx int, wantColumns map[string]struct{}) ([]byte, error) {
+func (r *Reader) readBlockColumnarWithCache(
+	blockOff, blockLen int64,
+	blockIdx int,
+	wantColumns map[string]struct{},
+) ([]byte, error) {
 	subType := uint32(blockIdx) //nolint:gosec
 
 	// Phase 1: ToC — cached.
@@ -232,108 +252,28 @@ func (r *Reader) readBlockColumnarWithCache(blockOff, blockLen int64, blockIdx i
 			continue
 		}
 
-		colBytes, fetchErr := r.cache.GetOrFetchV8Section(r.fileID, sectionTypeBlockCol, subType, m.name, func() ([]byte, error) {
-			if colStart+colLen <= int64(len(toc)) {
-				cp := make([]byte, colLen)
-				copy(cp, toc[colStart:colStart+colLen])
-				return cp, nil
-			}
-			buf := make([]byte, colLen)
-			if _, readErr := r.provider.ReadAt(buf, blockOff+colStart, rw.DataTypeBlock); readErr != nil {
-				return nil, fmt.Errorf("col %q: %w", m.name, readErr)
-			}
-			return buf, nil
-		})
+		colBytes, fetchErr := r.cache.GetOrFetchV8Section(
+			r.fileID,
+			sectionTypeBlockCol,
+			subType,
+			m.name,
+			func() ([]byte, error) {
+				if colStart+colLen <= int64(len(toc)) {
+					cp := make([]byte, colLen)
+					copy(cp, toc[colStart:colStart+colLen])
+					return cp, nil
+				}
+				buf := make([]byte, colLen)
+				if _, readErr := r.provider.ReadAt(buf, blockOff+colStart, rw.DataTypeBlock); readErr != nil {
+					return nil, fmt.Errorf("col %q: %w", m.name, readErr)
+				}
+				return buf, nil
+			},
+		)
 		if fetchErr != nil {
 			return nil, fmt.Errorf("block %d col %q: %w", blockIdx, m.name, fetchErr)
 		}
 		copy(assembled[colStart:colStart+colLen], colBytes)
-	}
-
-	return assembled, nil
-}
-
-// readBlockColumnar reads only the wanted column bytes from a single internal block.
-//
-// Phase 1: read the first tocHintBytes from blockOff — covers header + column metadata.
-// Phase 2: for each wanted column, issue a targeted ReadAt at (blockOff + col.dataOffset).
-//
-// The result is a sparse buffer of size max(col.dataOffset + col.compressedLen) for all
-// wanted columns. The header and column metadata occupy [0:tocEnd]. Wanted column
-// bytes are at their original offsets. All other positions are zero — they are never
-// accessed by parseBlockColumnsReuse when wantColumns is set.
-//
-// Falls back to reading the full block when the column metadata array spans past
-// tocHintBytes (i.e. the block has more columns than fit in the initial read). Header
-// parse errors (bad magic, unsupported version) are returned as errors — callers
-// should fall back to ReadGroup for those cases.
-func (r *Reader) readBlockColumnar(blockOff, blockLen int64, wantColumns map[string]struct{}) ([]byte, error) {
-	// Phase 1: read TOC.
-	tocSize := min(blockLen, tocHintBytes)
-	toc := make([]byte, tocSize)
-	if _, err := r.provider.ReadAt(toc, blockOff, rw.DataTypeBlock); err != nil {
-		return nil, fmt.Errorf("readBlockColumnar: toc: %w", err)
-	}
-
-	hdr, err := parseBlockHeader(toc)
-	if err != nil {
-		return nil, fmt.Errorf("readBlockColumnar: header: %w", err)
-	}
-
-	metas, tocEnd, err := parseColumnMetadataArray(toc, int(shared.BlockHeaderV14Size), int(hdr.columnCount))
-	if err != nil {
-		// Metadata spills past tocHintBytes — fall back to full block read.
-		full := make([]byte, blockLen)
-		if _, ferr := r.provider.ReadAt(full, blockOff, rw.DataTypeBlock); ferr != nil {
-			return nil, fmt.Errorf("readBlockColumnar: fallback: %w", ferr)
-		}
-		return full, nil
-	}
-
-	// Compute the sparse buffer size: from 0 to the end of the last wanted column.
-	// Clamp each column range to blockLen to guard against corrupt/malicious TOC
-	// entries that could drive arbitrarily large allocations (SPEC-005d).
-	bufSize := int64(tocEnd) //nolint:gosec
-	for _, m := range metas {
-		if _, ok := wantColumns[m.name]; !ok || m.compressedLen == 0 {
-			continue
-		}
-		colEnd := int64(m.dataOffset) + int64(m.compressedLen) //nolint:gosec
-		if colEnd > blockLen {
-			// TOC offset/length out of bounds — skip this column entry.
-			continue
-		}
-		if colEnd > bufSize {
-			bufSize = colEnd
-		}
-	}
-
-	// Assemble sparse buffer: copy header + column metadata, leave column gaps zeroed.
-	assembled := make([]byte, int(bufSize)) //nolint:gosec // bounded by blockLen < MaxBlockSize
-	copy(assembled, toc[:tocEnd])
-
-	// Phase 2: targeted range reads for each wanted column.
-	for _, m := range metas {
-		if _, ok := wantColumns[m.name]; !ok || m.compressedLen == 0 {
-			continue
-		}
-		colStart := int64(m.dataOffset)  //nolint:gosec
-		colLen := int64(m.compressedLen) //nolint:gosec
-
-		// If the column data falls within the already-read TOC buffer, copy from there.
-		if colStart+colLen <= int64(len(toc)) {
-			copy(
-				assembled[int(colStart):],
-				toc[int(colStart):int(colStart)+int(colLen)],
-			) //nolint:gosec // bounded by blockLen < MaxBlockSize
-			continue
-		}
-
-		// Issue targeted range read from storage.
-		dst := assembled[int(colStart) : int(colStart)+int(colLen)] //nolint:gosec // bounded by blockLen < MaxBlockSize
-		if _, err := r.provider.ReadAt(dst, blockOff+colStart, rw.DataTypeBlock); err != nil {
-			return nil, fmt.Errorf("readBlockColumnar: column %q: %w", m.name, err)
-		}
 	}
 
 	return assembled, nil

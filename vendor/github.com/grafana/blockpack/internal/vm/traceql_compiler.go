@@ -56,21 +56,20 @@ func CompileTraceQLFilter(filter *traceqlparser.FilterExpression) (*Program, err
 
 	// Extract predicates for block-level pruning and span hints
 	compiler.program.Predicates = extractTraceQLPredicates(filter.Expr)
+	compiler.program.ComputeWantColumns()
 
 	return compiler.program, nil
 }
 
 // CompileOptions carries optional context for CompileTraceQLFilterWithOptions.
-type CompileOptions struct {
-	// Embedder is required when the filter contains a VECTOR_AI() predicate.
-	// If nil and the filter uses VECTOR_AI(), compilation returns an error.
-	// Any type implementing TextEmbedder (defined in bytecode.go) is accepted —
-	// this keeps the VM decoupled from the concrete embedder implementation.
-	Embedder TextEmbedder
-	// Limit is the maximum number of vector results to return. 0 means DefaultVectorLimit.
-	// Maps directly to Program.VectorLimit for VECTOR_AI/VECTOR_ALL queries.
-	Limit int
-}
+
+// Embedder is required when the filter contains a VECTOR_AI() predicate.
+// If nil and the filter uses VECTOR_AI(), compilation returns an error.
+// Any type implementing TextEmbedder (defined in bytecode.go) is accepted —
+// this keeps the VM decoupled from the concrete embedder implementation.
+
+// Limit is the maximum number of vector results to return. 0 means DefaultVectorLimit.
+// Maps directly to Program.VectorLimit for VECTOR_AI/VECTOR_ALL queries.
 
 // CompileTraceQLFilterWithOptions compiles a TraceQL FilterExpression with optional
 // CompileOptions. When the filter contains a VECTOR() predicate, opts.Embedder must
@@ -97,14 +96,9 @@ func CompileTraceQLFilterWithOptions(filter *traceqlparser.FilterExpression, opt
 	if compiler.program.HasVector && len(compiler.program.QueryVector) > 0 {
 		populateVectorNodes(compiler.program.Predicates, compiler.program.QueryVector)
 	}
+	compiler.program.ComputeWantColumns()
 
 	return compiler.program, nil
-}
-
-type traceqlCompiler struct {
-	program  *Program
-	embedder TextEmbedder
-	opts     CompileOptions
 }
 
 // normalizeAttributePath converts TraceQL attribute paths to canonical column names.

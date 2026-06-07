@@ -6,20 +6,12 @@ package embedder
 
 import (
 	"fmt"
-	"sync"
 
 	"github.com/hybridgroup/yzma/pkg/llama"
 )
 
 // yzmaBackend implements Backend using the yzma llama.cpp Go bindings.
 // It requires a loaded llama.cpp shared library and a GGUF model file.
-type yzmaBackend struct {
-	mu    sync.Mutex
-	model llama.Model
-	lctx  llama.Context
-	vocab llama.Vocab
-	nEmbd int32
-}
 
 // newYzmaBackend loads the llama.cpp library and GGUF model, initializing an embedding context.
 func newYzmaBackend(cfg Config) (*yzmaBackend, error) {

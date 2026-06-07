@@ -37,11 +37,6 @@ func returnToPool(p *[]byte) {
 }
 
 // blockExtent is an internal tuple used during coalescing.
-type blockExtent struct {
-	offset   int64
-	length   int64
-	blockIdx int
-}
 
 // CoalesceBlocks merges adjacent block extents using cfg.
 // blockOrder lists block indices to read (need not be sorted).

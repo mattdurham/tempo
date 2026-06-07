@@ -29,10 +29,8 @@ const (
 )
 
 // TopKEntry holds one value's fingerprint and its approximate count.
-type TopKEntry struct {
-	FP    uint64 // hash fingerprint of the original key (via HashForFuse)
-	Count uint32
-}
+
+// hash fingerprint of the original key (via HashForFuse)
 
 // TopK tracks the top-K most frequent values using the Space-Saving algorithm.
 // The internal array is fixed at TopKSize entries. When full, the entry with

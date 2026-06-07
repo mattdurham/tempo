@@ -744,3 +744,20 @@ Back-ref: `internal/modules/blockio/reader/parser.go:parseSectionsV8`,
           `internal/modules/blockio/reader/range_index.go:parseRangeColumnBlobV8`,
           `internal/modules/blockio/reader/sketch_index.go:parseOneColumnSketchBlob`,
           `internal/modules/blockio/reader/reader.go:ColumnSketch`
+
+---
+
+## NOTE-022-reader: DistinctAt, TopKMatchAt, FuseContainsAt — Zero-Allocation Sketch Accessors
+*Added: 2026-05-15*
+
+**Decision:** Add `DistinctAt`, `TopKMatchAt`, and `FuseContainsAt` to `columnSketchData` to
+satisfy the updated `queryplanner.ColumnSketch` interface (NOTE-022 in queryplanner/NOTES.md).
+
+- `DistinctAt` delegates to the existing private `distinctAt` method (reads `distinctRaw` directly).
+- `TopKMatchAt` scans `topkFP[presentIdx]` for the block's entry — O(K) where K ≤ 20.
+- `FuseContainsAt` scans `presentMap` to find the block's bloom slice and calls `sketch.BloomContains`.
+
+Both `TopKMatchAt` and `FuseContainsAt` use an early-exit `break` on `bIdx > blockIdx` because
+`presentMap` is always sorted ascending (built in blockIdx order by `parseColumnPresence`).
+
+**Back-ref:** `internal/modules/blockio/reader/sketch_index.go:DistinctAt,TopKMatchAt,FuseContainsAt`

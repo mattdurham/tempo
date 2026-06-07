@@ -18,10 +18,6 @@ import (
 // Names and Values are parallel slices; Names[i] is the full column name (e.g.
 // "log.detected_level") and Values[i] is the corresponding string value.
 // Both slices are nil when no log.* attributes are present for the row.
-type LogAttrs struct {
-	Names  []string
-	Values []string
-}
 
 // Len returns the number of log.* attributes.
 func (a LogAttrs) Len() int { return len(a.Names) }
@@ -32,18 +28,14 @@ func (a LogAttrs) Len() int { return len(a.Names) }
 // stream selector string, e.g. `{service_name="api", env="prod"}`). It is the only
 // resource-label field callers need; building a full map[string]string per row was
 // wasteful because consumers only ever read this one key.
-type LogEntry struct {
-	// LokiLabels is the value of resource.__loki_labels__ for this row.
-	LokiLabels string
-	Line       string
-	// LogAttrs holds log.* ColumnTypeString column values as parallel name/value slices
-	// (e.g. Names=["log.detected_level"], Values=["info"]). These are original LogRecord
-	// attributes and must be exposed with the "log." prefix intact so callers (e.g.
-	// extractStructuredMetadata) can distinguish them from pipeline-derived labels.
-	// Both slices are nil when none present.
-	LogAttrs       LogAttrs
-	TimestampNanos uint64
-}
+
+// LokiLabels is the value of resource.__loki_labels__ for this row.
+
+// LogAttrs holds log.* ColumnTypeString column values as parallel name/value slices
+// (e.g. Names=["log.detected_level"], Values=["info"]). These are original LogRecord
+// attributes and must be exposed with the "log." prefix intact so callers (e.g.
+// extractStructuredMetadata) can distinguish them from pipeline-derived labels.
+// Both slices are nil when none present.
 
 // maxLogPreallocRows is the pre-allocation cap for log result slices; actual results can exceed this.
 const maxLogPreallocRows = 4096

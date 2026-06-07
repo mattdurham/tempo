@@ -10,8 +10,6 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/prometheus/client_golang/prometheus"
-
 	modules_blockio "github.com/grafana/blockpack/internal/modules/blockio"
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
 	modules_shared "github.com/grafana/blockpack/internal/modules/blockio/shared"
@@ -100,21 +98,17 @@ type Cache = modules_filecache.Cache
 type FileCache = modules_filecache.FileCache
 
 // FileCacheConfig configures a disk-backed FileCache.
-type FileCacheConfig struct {
-	// Registerer is an optional Prometheus registerer.
-	// When non-nil, cache metrics are registered and incremented on cache operations.
-	Registerer prometheus.Registerer
-	// Path is the directory path used for cache storage.
-	Path string
 
-	// MaxBytes is the maximum total bytes stored on disk.
-	// Oldest entries (FIFO) are evicted when the limit is exceeded.
-	MaxBytes int64
+// Registerer is an optional Prometheus registerer.
+// When non-nil, cache metrics are registered and incremented on cache operations.
 
-	// Enabled controls whether the cache is active.
-	// When false, OpenFileCache returns (nil, nil) and readers skip all caching.
-	Enabled bool
-}
+// Path is the directory path used for cache storage.
+
+// MaxBytes is the maximum total bytes stored on disk.
+// Oldest entries (FIFO) are evicted when the limit is exceeded.
+
+// Enabled controls whether the cache is active.
+// When false, OpenFileCache returns (nil, nil) and readers skip all caching.
 
 // OpenFileCache opens (or creates) a FileCache with the given configuration.
 // Returns (nil, nil) when cfg.Enabled is false.
@@ -134,14 +128,12 @@ func OpenFileCache(cfg FileCacheConfig) (*FileCache, error) {
 type MemoryCache = modules_memorycache.MemoryCache
 
 // MemoryCacheConfig configures an in-process MemoryCache.
-type MemoryCacheConfig struct {
-	// Registerer is an optional Prometheus registerer.
-	// When non-nil, cache metrics are registered and incremented on cache operations.
-	Registerer prometheus.Registerer
-	// MaxBytes is the maximum total bytes the cache may hold.
-	// Required and must be positive.
-	MaxBytes int64
-}
+
+// Registerer is an optional Prometheus registerer.
+// When non-nil, cache metrics are registered and incremented on cache operations.
+
+// MaxBytes is the maximum total bytes the cache may hold.
+// Required and must be positive.
 
 // NewMemoryCache creates an in-process LRU cache with the given byte capacity.
 func NewMemoryCache(cfg MemoryCacheConfig) (*MemoryCache, error) {
@@ -158,20 +150,20 @@ func NewMemoryCache(cfg MemoryCacheConfig) (*MemoryCache, error) {
 type MemCache = modules_memcache.MemCache
 
 // MemCacheConfig configures a remote MemCache.
-type MemCacheConfig struct {
-	// Registerer is an optional Prometheus registerer.
-	// When non-nil, cache metrics are registered and incremented on cache operations.
-	Registerer prometheus.Registerer
-	// Servers is the list of memcache server addresses (host:port).
-	Servers []string
 
-	// Expiration is the TTL in seconds for stored items. 0 = no expiration.
-	Expiration int32
+// Registerer is an optional Prometheus registerer.
+// When non-nil, cache metrics are registered and incremented on cache operations.
 
-	// Enabled controls whether the cache is active.
-	// When false, OpenMemCache returns (nil, nil).
-	Enabled bool
-}
+// TierLabel overrides the "tier" Prometheus label (default "remote").
+// Set distinct values when opening multiple MemCache instances with the
+// same Registerer to avoid label collisions.
+
+// Servers is the list of memcache server addresses (host:port).
+
+// Expiration is the TTL in seconds for stored items. 0 = no expiration.
+
+// Enabled controls whether the cache is active.
+// When false, OpenMemCache returns (nil, nil).
 
 // OpenMemCache creates a MemCache connecting to the configured servers.
 // Returns (nil, nil) when cfg.Enabled is false.
@@ -182,6 +174,7 @@ func OpenMemCache(cfg MemCacheConfig) (*MemCache, error) {
 		Expiration: cfg.Expiration,
 		Enabled:    cfg.Enabled,
 		Registerer: cfg.Registerer,
+		TierLabel:  cfg.TierLabel,
 	})
 }
 
@@ -272,10 +265,6 @@ type ReaderProvider = modules_rw.ReaderProvider
 // CloseableReaderProvider extends ReaderProvider with resource cleanup.
 // Implementations that hold open file descriptors or network connections
 // should implement Close to release them.
-type CloseableReaderProvider interface {
-	ReaderProvider
-	Close() error
-}
 
 // AGENT: Reader constructors - minimal set needed for creating readers.
 

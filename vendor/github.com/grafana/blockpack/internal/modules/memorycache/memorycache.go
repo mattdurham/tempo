@@ -19,20 +19,14 @@ import (
 )
 
 // Config configures a MemoryCache.
-type Config struct {
-	// Registerer is an optional Prometheus registerer.
-	// When non-nil, cache metrics are registered and incremented.
-	Registerer prometheus.Registerer
-	// MaxBytes is the maximum total bytes the cache may hold.
-	// Required and must be positive.
-	MaxBytes int64
-}
+
+// Registerer is an optional Prometheus registerer.
+// When non-nil, cache metrics are registered and incremented.
+
+// MaxBytes is the maximum total bytes the cache may hold.
+// Required and must be positive.
 
 // entry is one record in the LRU list.
-type entry struct {
-	key  string
-	data []byte
-}
 
 // MemoryCache is an in-memory, byte-bounded LRU cache safe for concurrent use.
 // It implements filecache.Cache.

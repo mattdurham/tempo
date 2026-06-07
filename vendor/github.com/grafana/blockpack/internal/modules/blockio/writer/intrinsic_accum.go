@@ -17,34 +17,16 @@ import (
 // flatAccum accumulates values for a flat intrinsic column (uint64 or bytes).
 // All appended rows are stored in parallel arrays (values + refs).
 // At flush time, rows are sorted by value before encoding.
-type flatAccum struct {
-	uint64Values []uint64
-	bytesValues  [][]byte
-	refs         []shared.BlockRef
-	colType      shared.ColumnType
-}
 
 // dictEntry holds one unique string/int64 value and all block refs for that value.
-type dictEntry struct {
-	strVal   string
-	refs     []shared.BlockRef
-	int64Val int64
-}
 
 // dictAccum accumulates values for a dictionary intrinsic column (string or int64).
 // Deduplicates values via an index map; collects all refs per unique value.
-type dictAccum struct {
-	index   map[string]int // encoded value → index in entries
-	entries []dictEntry
-	colType shared.ColumnType
-}
+
+// encoded value → index in entries
 
 // intrinsicAccumulator holds per-column accumulators for a file being written.
 // One instance lives on Writer; fed row-by-row during block building.
-type intrinsicAccumulator struct {
-	flatCols map[string]*flatAccum
-	dictCols map[string]*dictAccum
-}
 
 // newIntrinsicAccumulator creates an empty accumulator.
 func newIntrinsicAccumulator() *intrinsicAccumulator {
@@ -54,11 +36,13 @@ func newIntrinsicAccumulator() *intrinsicAccumulator {
 	}
 }
 
+func
+
 // merge appends all rows from other into the receiver.
 // Column types are taken from other when a column is new to the receiver.
 // No sorting is performed here; sorting happens at encodeColumn time.
 // Safe to call with an empty other accumulator (no-op).
-func (a *intrinsicAccumulator) merge(other *intrinsicAccumulator) {
+(a *intrinsicAccumulator) merge(other *intrinsicAccumulator) {
 	for name, src := range other.flatCols {
 		dst, ok := a.flatCols[name]
 		if !ok {
@@ -72,39 +56,49 @@ func (a *intrinsicAccumulator) merge(other *intrinsicAccumulator) {
 	for name, src := range other.dictCols {
 		dst, ok := a.dictCols[name]
 		if !ok {
-			// New column: create a fresh dictAccum with empty entries and index.
-			// Entries are populated by the per-entry merge loop below, not copied wholesale.
 			dst = &dictAccum{
-				index:   make(map[string]int, len(src.index)),
-				entries: make([]dictEntry, 0, len(src.entries)),
-				colType: src.colType,
+				index:    make(map[string]int, len(src.index)),
+				numIndex: make(map[[8]byte]int),
+				entries:  make([]dictEntry, 0, len(src.entries)),
+				colType:  src.colType,
 			}
 			a.dictCols[name] = dst
 		}
-		// Merge entries: for each entry in src, find or create a matching entry in dst.
 		isInt64 := src.colType == shared.ColumnTypeInt64 || src.colType == shared.ColumnTypeRangeInt64
 		for _, srcEntry := range src.entries {
-			var key string
+			tmp := [8]byte{}
 			if isInt64 {
-				var tmp [8]byte
-				binary.LittleEndian.PutUint64(tmp[:], uint64(srcEntry.int64Val)) //nolint:gosec
-				key = string(tmp[:])
+				binary.LittleEndian.PutUint64(
+					tmp[:],
+					uint64(srcEntry.int64Val), //nolint:gosec // reinterpreting int64 bits as uint64 for binary encoding
+				)
+				idx, exists := dst.numIndex[tmp]
+				if !exists {
+					idx = len(dst.entries)
+					dst.numIndex[tmp] = idx
+					dst.entries = append(dst.entries, dictEntry{strVal: srcEntry.strVal, int64Val: srcEntry.int64Val})
+				}
+				dst.entries[idx].refs = append(dst.entries[idx].refs, srcEntry.refs...)
 			} else {
-				key = srcEntry.strVal
+				key := srcEntry.strVal
+				idx, exists := dst.index[key]
+				if !exists {
+					idx = len(dst.entries)
+					dst.index[key] = idx
+					dst.entries = append(dst.entries, dictEntry{strVal: srcEntry.strVal, int64Val: srcEntry.int64Val})
+				}
+				dst.entries[idx].refs = append(dst.entries[idx].refs, srcEntry.refs...)
 			}
-			idx, exists := dst.index[key]
-			if !exists {
-				idx = len(dst.entries)
-				dst.index[key] = idx
-				dst.entries = append(dst.entries, dictEntry{
-					strVal:   srcEntry.strVal,
-					int64Val: srcEntry.int64Val,
-				})
-			}
-			dst.entries[idx].refs = append(dst.entries[idx].refs, srcEntry.refs...)
 		}
 	}
 }
+
+// New column: create a fresh dictAccum with empty entries and index.
+// Entries are populated by the per-entry merge loop below, not copied wholesale.
+
+// Merge entries: for each entry in src, find or create a matching entry in dst.
+
+//nolint:gosec
 
 // overCap reports whether any single column exceeds MaxIntrinsicRows.
 func (a *intrinsicAccumulator) overCap() bool {
@@ -180,7 +174,7 @@ func (a *intrinsicAccumulator) feedString(
 	}
 	c, ok := a.dictCols[name]
 	if !ok {
-		c = &dictAccum{index: make(map[string]int), colType: colType}
+		c = &dictAccum{index: make(map[string]int), numIndex: make(map[[8]byte]int), colType: colType}
 		a.dictCols[name] = c
 	}
 	idx, exists := c.index[val]
@@ -195,33 +189,33 @@ func (a *intrinsicAccumulator) feedString(
 	})
 }
 
+func
+
 // feedInt64 adds one int64 value (span:kind, span:status) to the named dict column.
-func (a *intrinsicAccumulator) feedInt64(
-	name string,
-	colType shared.ColumnType,
-	val int64,
-	blockIdx uint16,
-	rowIdx int,
-) {
+(a *intrinsicAccumulator) feedInt64(name string, colType shared.ColumnType, val int64, blockIdx uint16, rowIdx int) {
 	c, ok := a.dictCols[name]
 	if !ok {
-		c = &dictAccum{index: make(map[string]int), colType: colType}
+		c = &dictAccum{index: make(map[string]int), numIndex: make(map[[8]byte]int), colType: colType}
 		a.dictCols[name] = c
 	}
-	var tmp [8]byte
-	binary.LittleEndian.PutUint64(tmp[:], uint64(val)) //nolint:gosec
-	key := string(tmp[:])
-	idx, exists := c.index[key]
+	tmp := [8]byte{}
+	binary.LittleEndian.PutUint64(
+		tmp[:],
+		uint64(val), //nolint:gosec // reinterpreting int64 bits as uint64 for binary encoding
+	)
+	idx, exists := c.numIndex[tmp]
 	if !exists {
 		idx = len(c.entries)
-		c.index[key] = idx
+		c.numIndex[tmp] = idx
 		c.entries = append(c.entries, dictEntry{int64Val: val})
 	}
-	c.entries[idx].refs = append(c.entries[idx].refs, shared.BlockRef{
-		BlockIdx: blockIdx,
-		RowIdx:   uint16(rowIdx), //nolint:gosec
-	})
+	c.entries[
+
+	//nolint:gosec
+	idx].refs = append(c.entries[idx].refs, shared.BlockRef{BlockIdx: blockIdx, RowIdx: uint16(rowIdx)})
 }
+
+//nolint:gosec
 
 // columnNames returns all accumulated column names (flat + dict), sorted.
 func (a *intrinsicAccumulator) columnNames() []string {

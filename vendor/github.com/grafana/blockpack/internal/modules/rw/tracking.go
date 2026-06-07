@@ -2,15 +2,8 @@ package rw
 
 // NOTE: Any changes to this file must be reflected in the corresponding SPECS.md or NOTES.md.
 
-import "sync/atomic"
-
 // TrackingReaderProvider wraps a ReaderProvider and counts I/O calls and bytes.
 // All methods are safe for concurrent use.
-type TrackingReaderProvider struct {
-	underlying ReaderProvider
-	ioOps      atomic.Int64
-	bytesRead  atomic.Int64
-}
 
 // NewTrackingReaderProvider wraps underlying with I/O tracking.
 func NewTrackingReaderProvider(underlying ReaderProvider) *TrackingReaderProvider {

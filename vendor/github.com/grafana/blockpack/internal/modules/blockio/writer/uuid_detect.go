@@ -93,9 +93,6 @@ func shouldStoreAsUUID(values []string) bool {
 }
 
 // uuidParseError is the error type returned by uuidToBytes for invalid input.
-type uuidParseError struct {
-	input string
-}
 
 func (e *uuidParseError) Error() string {
 	return "invalid UUID: " + e.input

@@ -20,25 +20,23 @@ const defaultHTTPTimeout = 120 * time.Second
 const sendBatchMaxRetries = 5
 
 // HTTPConfig configures the HTTP embedding backend.
-type HTTPConfig struct {
-	// ServerURL is the base URL of the embed-server (e.g. "http://localhost:8765").
-	// Supports both TEI (HuggingFace Text Embeddings Inference) and custom servers.
-	ServerURL string
-	// Fields defines which span fields to include and their ordering weight.
-	Fields []EmbeddingField
-	// MaxTextLength is the maximum character length of assembled text (default: 24000).
-	MaxTextLength int
-	// Timeout is the HTTP request timeout. Defaults to 120s if zero.
-	Timeout time.Duration
-	// MaxBatchSize is the maximum number of texts to send in a single POST /embed request.
-	// 0 (or negative) defaults to 32 via NewHTTP, matching TEI's typical per-request limit.
-	// Increase this value for servers with higher token budgets; decrease it for smaller limits.
-	MaxBatchSize int
-	// MaxConcurrentBatches is the maximum number of batch requests to issue concurrently.
-	// When > 1, EmbedBatch sends multiple chunks in parallel, distributing load across
-	// multiple embed-server pods. Defaults to 4 when set to 0 via NewHTTP.
-	MaxConcurrentBatches int
-}
+
+// ServerURL is the base URL of the embed-server (e.g. "http://localhost:8765").
+// Supports both TEI (HuggingFace Text Embeddings Inference) and custom servers.
+
+// Fields defines which span fields to include and their ordering weight.
+
+// MaxTextLength is the maximum character length of assembled text (default: 24000).
+
+// Timeout is the HTTP request timeout. Defaults to 120s if zero.
+
+// MaxBatchSize is the maximum number of texts to send in a single POST /embed request.
+// 0 (or negative) defaults to 32 via NewHTTP, matching TEI's typical per-request limit.
+// Increase this value for servers with higher token budgets; decrease it for smaller limits.
+
+// MaxConcurrentBatches is the maximum number of batch requests to issue concurrently.
+// When > 1, EmbedBatch sends multiple chunks in parallel, distributing load across
+// multiple embed-server pods. Defaults to 4 when set to 0 via NewHTTP.
 
 const (
 	defaultMaxBatchSize         = 32   // TEI default max_batch_tokens / typical per-request limit
@@ -49,19 +47,11 @@ const (
 // httpBackend implements Backend by forwarding requests to an embedding server over HTTP.
 // Supports the TEI protocol: POST /embed with {"inputs": [...], "normalize": true}
 // Response: [[float, ...], ...] — flat array of vectors.
-type httpBackend struct {
-	client               *http.Client
-	serverURL            string
-	dim                  int
-	maxBatchSize         int // max texts per request; 0 means no chunking
-	maxConcurrentBatches int // max parallel requests; 1 means sequential
-}
+
+// max texts per request; 0 means no chunking
+// max parallel requests; 1 means sequential
 
 // teiRequest is the JSON request body for TEI's POST /embed.
-type teiRequest struct {
-	Inputs    []string `json:"inputs"`
-	Normalize bool     `json:"normalize"`
-}
 
 // NewHTTP creates an Embedder backed by an HTTP embedding server (TEI or compatible).
 // It sends a probe request on construction to determine Dim().
@@ -263,10 +253,6 @@ func (b *httpBackend) sendBatch(texts []string) ([][]float32, error) {
 }
 
 // httpStatusError is returned by doPost when the server returns a non-200 HTTP status.
-type httpStatusError struct {
-	body   string
-	status int
-}
 
 func (e *httpStatusError) Error() string {
 	return fmt.Sprintf("HTTP %d — %s", e.status, e.body)

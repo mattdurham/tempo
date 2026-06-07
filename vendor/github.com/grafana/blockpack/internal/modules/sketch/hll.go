@@ -32,9 +32,6 @@ const (
 // SPEC-SK-01: Add never panics.
 // SPEC-SK-02: Cardinality() == 0 when empty.
 // SPEC-SK-03: Marshal() == 16 bytes.
-type HyperLogLog struct {
-	regs [hllM]uint8
-}
 
 // NewHyperLogLog creates an empty HLL.
 func NewHyperLogLog() *HyperLogLog {

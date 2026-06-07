@@ -14,24 +14,17 @@ import (
 
 // rangeEntry is one range entry in the range column index (SPECS §5.2.1).
 // lower is the encoded lower boundary key (SPECS §5.2.1).
-type rangeEntry struct {
-	lower    string
-	blockIDs []uint32
-}
 
 // parsedRangeIndex holds the parsed result for one column's range index.
 // entries is sorted in ascending value order by lower boundary (SPECS §5.2.1).
 // bucketMin and bucketMax hold the global min/max across all blocks for the column
 // (stored in the wire format bucket metadata). For RangeString/RangeBytes they are 0.
-type parsedRangeIndex struct {
-	entries          []rangeEntry
-	float64BoundsRaw []byte   // NOTE-PERF-RANGE: zero-copy sub-slice of metadataBytes; decoded on demand in RangeColumnBoundaries
-	stringBounds     []string // decoded for RangeString; nil otherwise
-	bytesBounds      [][]byte // decoded for RangeBytes; nil otherwise
-	bucketMin        int64    // global min as int64 bits; 0 for String/Bytes
-	bucketMax        int64    // global max as int64 bits; 0 for String/Bytes
-	colType          shared.ColumnType
-}
+
+// NOTE-PERF-RANGE: zero-copy sub-slice of metadataBytes; decoded on demand in RangeColumnBoundaries
+// decoded for RangeString; nil otherwise
+// decoded for RangeBytes; nil otherwise
+// global min as int64 bits; 0 for String/Bytes
+// global max as int64 bits; 0 for String/Bytes
 
 // ensureRangeColumnParsed parses the range index for colName if not already done.
 // Caches result in r.rangeParsed.

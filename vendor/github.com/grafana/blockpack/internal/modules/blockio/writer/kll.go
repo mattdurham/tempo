@@ -242,12 +242,8 @@ func (sk *KLL[T]) Boundaries(nBuckets int) []T {
 }
 
 // KLLBytes is a KLL sketch for []byte values using lexicographic ordering.
-type KLLBytes struct {
-	levels [][][]byte
-	k      int
-	n      int
-	rng    uint64 // per-instance xorshift64 state; never zero after init
-}
+
+// per-instance xorshift64 state; never zero after init
 
 // NewKLLBytes creates a new KLLBytes sketch.
 func NewKLLBytes() *KLLBytes {
@@ -391,9 +387,6 @@ func (sk *KLLBytes) Boundaries(nBuckets int) [][]byte {
 }
 
 // KLLString wraps KLL[string] for API compatibility with the range index builder.
-type KLLString struct {
-	inner *KLL[string]
-}
 
 // NewKLLString creates a new KLLString sketch.
 func NewKLLString() *KLLString {

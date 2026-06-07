@@ -50,10 +50,9 @@ func getVectorZstdEncoder() *zstd.Encoder {
 // This enables prepare(nRows) to pre-allocate the slice and setVectorAt(rowIdx, vec)
 // to write directly by index, which is required because the embedding column is not
 // written for every span (unlike string/int columns which are written sequentially).
-type vectorF32ColumnBuilder struct {
-	values [][]float32 // len == nRows; nil entry means absent
-	dim    int         // set on first setVectorAt call
-}
+
+// len == nRows; nil entry means absent
+// set on first setVectorAt call
 
 // setVectorAt marks row rowIdx as present with the given vector.
 // If rowIdx >= len(values), the slice is extended with nil entries.

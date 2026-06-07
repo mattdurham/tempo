@@ -13,10 +13,6 @@ import (
 )
 
 // v8SectionWriter accumulates ToCEntries while writing V8 section blobs.
-type v8SectionWriter struct {
-	out     *countingWriter
-	entries []shared.ToCEntry
-}
 
 // writeToCEntry snappy-compresses raw, writes it, and appends a ToCEntry.
 func (sw *v8SectionWriter) writeToCEntry(key shared.ToCKey, raw []byte) error {
@@ -85,7 +81,7 @@ func (w *Writer) writeV8ColumnBlobs(sw *v8SectionWriter) error {
 func (w *Writer) writeV8RangeBlobs(sw *v8SectionWriter) error {
 	colNames := make([]string, 0, len(w.rangeIdx))
 	for name, cd := range w.rangeIdx {
-		if len(cd.values) > 0 {
+		if len(cd.values) > 0 || len(cd.numValues) > 0 {
 			colNames = append(colNames, name)
 		}
 	}

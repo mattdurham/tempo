@@ -74,24 +74,6 @@ func BuildTempoTraces(traces []*tracev1.TracesData) ([]*tempopb.Trace, []common.
 	return tempoTraces, traceIDs, nil
 }
 
-type traceBuilder struct {
-	resources    map[string]*resourceBuilder
-	resourceKeys []string
-}
-
-type resourceBuilder struct {
-	resource  *temporesource.Resource
-	schemaURL string
-	scopes    map[string]*scopeBuilder
-	scopeKeys []string
-}
-
-type scopeBuilder struct {
-	scope     *tempocommon.InstrumentationScope
-	schemaURL string
-	spans     []*tempotrace.Span
-}
-
 func newTraceBuilder() *traceBuilder {
 	return &traceBuilder{
 		resources: make(map[string]*resourceBuilder),

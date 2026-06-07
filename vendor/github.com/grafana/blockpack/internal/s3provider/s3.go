@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"sync"
 
 	minio "github.com/minio/minio-go/v7"
 
@@ -20,16 +19,6 @@ import (
 
 // MinIOProvider implements rw.ReaderProvider backed by a single MinIO/S3 object.
 // All methods are safe for concurrent use.
-type MinIOProvider struct {
-	sizeErr error
-	client  *minio.Client
-	bucket  string
-	object  string
-
-	size int64
-
-	once sync.Once
-}
 
 // NewMinIOProvider returns a MinIOProvider for the given MinIO client, bucket,
 // and object path.  The client is not contacted until the first call to Size or

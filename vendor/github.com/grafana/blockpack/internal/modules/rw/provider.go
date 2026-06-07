@@ -28,7 +28,3 @@ const (
 // All implementations must be safe for concurrent use.
 // Size returns the total size of the storage in bytes.
 // ReadAt is pread-style: offset-based and safe for concurrent use.
-type ReaderProvider interface {
-	Size() (int64, error)
-	ReadAt(p []byte, off int64, dataType DataType) (int, error)
-}

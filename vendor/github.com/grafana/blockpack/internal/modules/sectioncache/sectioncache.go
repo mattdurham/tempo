@@ -10,6 +10,7 @@ package sectioncache
 
 import (
 	"fmt"
+	"reflect"
 
 	"github.com/grafana/blockpack/internal/modules/filecache"
 )
@@ -94,7 +95,6 @@ type SectionCache interface {
 
 // nopSectionCache is a SectionCache that never stores anything. All GetOrFetch
 // calls invoke their fetch functions; Get returns (nil, false, nil); Cache is a no-op.
-type nopSectionCache struct{}
 
 // NopSectionCache is a SectionCache that never stores anything and always
 // calls the fetch function. Use it as a drop-in when no cache is desired.
@@ -161,14 +161,11 @@ func (nopSectionCache) Close() error {
 // FilecacheAdapter wraps a filecache.Cache to implement SectionCache.
 // It reconstructs the legacy key format for each typed method call.
 // This is the backward-compat bridge for callers using filecache.Cache.
-type FilecacheAdapter struct {
-	cache filecache.Cache
-}
 
 // NewFilecacheAdapter wraps c in a FilecacheAdapter.
 // If c is nil, filecache.NopCache is used.
 func NewFilecacheAdapter(c filecache.Cache) *FilecacheAdapter {
-	if c == nil {
+	if c == nil || (reflect.ValueOf(c).Kind() == reflect.Ptr && reflect.ValueOf(c).IsNil()) {
 		c = filecache.NopCache
 	}
 	return &FilecacheAdapter{cache: c}

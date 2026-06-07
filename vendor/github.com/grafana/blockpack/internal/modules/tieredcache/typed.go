@@ -45,39 +45,37 @@ const (
 // tieredcache.NewTypedTieredCache(tieredcache.DefaultTypedConfig(mem, disk)).
 // TieredCache (binary router) is preserved for backward compat but TypedTieredCache
 // is the preferred implementation for new deployments.
-type TypedConfig struct {
-	// Footer caches footer variants (/footer/*) and header blobs (/header).
-	// Typically a small MemoryCache (footers are 18–58 bytes; effectively infinite budget).
-	Footer filecache.Cache
-	// TOC caches V8 ToC descriptor blobs (/v8/toc/dec) and V8 column section blobs.
-	// Typically a medium MemoryCache (blobs are 10–50 KB each).
-	TOC filecache.Cache
-	// Bloom caches compact-header blobs (all variants: /compact-header, /v14/compact-header).
-	// Each blob contains the bloom filter AND the block table for the file; actual stored
-	// size can exceed 15 MiB per file for large files with many blocks.
-	// Size this budget to at least 2 × maxBlobSize × maxConcurrentFiles to avoid
-	// evicting active entries during concurrent FindTraceByID workloads.
-	Bloom filecache.Cache
-	// Metadata caches /metadata/dec blobs and V14 generic sections (/v14/sec/*).
-	// Typically a disk-backed FileCache (~45 MB per entry; tolerate disk round-trip).
-	Metadata filecache.Cache
-	// TraceIdx caches trace index sections (/compact-trace-index, /compact).
-	// Typically a disk-backed FileCache (~50 MB per entry; accessed only on bloom hit).
-	TraceIdx filecache.Cache
-	// Block caches raw block column bytes (/block/<N>).
-	// Should be a MemoryCache: block reads are latency-critical (SPEC-ROOT-015).
-	Block filecache.Cache
-	// Intrinsic caches intrinsic per-column blobs (/intrinsic/<name>).
-	// Typically a MemoryCache (variable size; isolated to avoid evicting footer/bloom).
-	Intrinsic filecache.Cache
-	// Registerer is an optional Prometheus registerer.
-	// When non-nil, TypedTieredCache metrics are registered on construction:
-	//   - blockpack_typed_cache_requests_total (labels: section, result)
-	//   - blockpack_typed_cache_fetch_duration_seconds (labels: section, result)
-	//
-	// Nil means no metrics. Consistent with filecache.Config.Registerer.
-	Registerer prometheus.Registerer
-}
+
+// Footer caches footer variants (/footer/*) and header blobs (/header).
+// Typically a small MemoryCache (footers are 18–58 bytes; effectively infinite budget).
+
+// TOC caches V8 ToC descriptor blobs (/v8/toc/dec) and V8 column section blobs.
+// Typically a medium MemoryCache (blobs are 10–50 KB each).
+
+// Bloom caches compact-header blobs (all variants: /compact-header, /v14/compact-header).
+// Each blob contains the bloom filter AND the block table for the file; actual stored
+// size can exceed 15 MiB per file for large files with many blocks.
+// Size this budget to at least 2 × maxBlobSize × maxConcurrentFiles to avoid
+// evicting active entries during concurrent FindTraceByID workloads.
+
+// Metadata caches /metadata/dec blobs and V14 generic sections (/v14/sec/*).
+// Typically a disk-backed FileCache (~45 MB per entry; tolerate disk round-trip).
+
+// TraceIdx caches trace index sections (/compact-trace-index, /compact).
+// Typically a disk-backed FileCache (~50 MB per entry; accessed only on bloom hit).
+
+// Block caches raw block column bytes (/block/<N>).
+// Should be a MemoryCache: block reads are latency-critical (SPEC-ROOT-015).
+
+// Intrinsic caches intrinsic per-column blobs (/intrinsic/<name>).
+// Typically a MemoryCache (variable size; isolated to avoid evicting footer/bloom).
+
+// Registerer is an optional Prometheus registerer.
+// When non-nil, TypedTieredCache metrics are registered on construction:
+//   - blockpack_typed_cache_requests_total (labels: section, result)
+//   - blockpack_typed_cache_fetch_duration_seconds (labels: section, result)
+//
+// Nil means no metrics. Consistent with filecache.Config.Registerer.
 
 // DefaultTypedConfig returns a TypedConfig with the recommended tier mapping:
 //   - mem: Footer, TOC, Bloom, Block, Intrinsic (low-latency, high-reuse)
@@ -135,25 +133,17 @@ var resultLabel = [3]string{idxHit: "hit", idxMiss: "miss", idxError: "error"}
 //
 // SPEC-TC-002: each key maps to exactly one sub-cache; no key routes to two simultaneously.
 // SPEC-TC-005: thread safety fully delegated to sub-caches; no mutable state post-construction.
-type TypedTieredCache struct {
-	// footer handles both footer blobs (/footer/*) and the fixed-size header blob (/header).
-	footer    filecache.Cache
-	toc       filecache.Cache
-	bloom     filecache.Cache
-	metadata  filecache.Cache
-	traceIdx  filecache.Cache
-	block     filecache.Cache
-	intrinsic filecache.Cache
-	// sectionRequests is a pre-registered CounterVec (labels: section, result).
-	// nil when no Registerer was provided.
-	sectionRequests *prometheus.CounterVec
-	// Pre-resolved counters indexed by [sectionIdx][resultIdx]. Zero-alloc hot path.
-	// Nil entries when no Registerer was provided.
-	sectionCounters [numSections][3]prometheus.Counter
-	// Pre-resolved histogram observers indexed by [sectionIdx][resultIdx].
-	// Nil entries when no Registerer was provided.
-	sectionObs [numSections][3]prometheus.Observer
-}
+
+// footer handles both footer blobs (/footer/*) and the fixed-size header blob (/header).
+
+// sectionRequests is a pre-registered CounterVec (labels: section, result).
+// nil when no Registerer was provided.
+
+// Pre-resolved counters indexed by [sectionIdx][resultIdx]. Zero-alloc hot path.
+// Nil entries when no Registerer was provided.
+
+// Pre-resolved histogram observers indexed by [sectionIdx][resultIdx].
+// Nil entries when no Registerer was provided.
 
 // typedRegisterOrReuseCounter registers a CounterVec with the given Registerer.
 // If the metric is already registered (AlreadyRegisteredError), it returns the

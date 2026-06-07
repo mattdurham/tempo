@@ -12,15 +12,11 @@ import (
 
 // tsIndexEntry holds a single entry in the per-file timestamp index.
 // One entry per block, sorted by minTS ascending.
-type tsIndexEntry struct {
-	minTS uint64
-	// maxTS is the maximum span *start* time for this block (BlockMeta.MaxStart).
-	// This is the latest start timestamp in the block, NOT the latest end timestamp.
-	// Used for overlap: a block overlaps [queryMin, queryMax] when
-	//   maxTS >= queryMin && minTS <= queryMax.
-	maxTS   uint64
-	blockID uint32
-}
+
+// maxTS is the maximum span *start* time for this block (BlockMeta.MaxStart).
+// This is the latest start timestamp in the block, NOT the latest end timestamp.
+// Used for overlap: a block overlaps [queryMin, queryMax] when
+//   maxTS >= queryMin && minTS <= queryMax.
 
 // writeTSIndexSection serializes the per-file TS index for the given block metas.
 //

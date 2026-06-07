@@ -13,21 +13,11 @@ import (
 )
 
 // blockHeader holds the parsed block header fields.
-type blockHeader struct {
-	magic       uint32
-	version     uint8
-	spanCount   uint32
-	columnCount uint32
-}
 
 // colMetaEntry holds one parsed column metadata entry.
-type colMetaEntry struct {
-	name            string
-	colType         shared.ColumnType
-	dataOffset      uint64
-	compressedLen   uint32 // snappy-compressed byte length on disk
-	uncompressedLen uint32 // raw byte length after snappy decompress
-}
+
+// snappy-compressed byte length on disk
+// raw byte length after snappy decompress
 
 // Block header field offsets (M-28a).
 // Wire format: magic[4]+version[1]+reserved[3]+span_count[4]+column_count[4]+reserved2[8] = 24 bytes.
@@ -372,7 +362,12 @@ func decompressV14ColumnData(name string, data []byte, uncompressedLen uint32) (
 // decompressV14ColumnDataInto is like decompressV14ColumnData but decompresses into dst,
 // growing it as needed. Returns the decoded slice (sub-slice of grown dst) and the grown dst.
 // The caller must not use colData after dst is reused for the next column.
-func decompressV14ColumnDataInto(dst []byte, name string, data []byte, uncompressedLen uint32) (colData []byte, grownDst []byte, err error) {
+func decompressV14ColumnDataInto(
+	dst []byte,
+	name string,
+	data []byte,
+	uncompressedLen uint32,
+) (colData []byte, grownDst []byte, err error) {
 	if uncompressedLen > uint32(shared.MaxBlockSize) { //nolint:gosec
 		return nil, dst, fmt.Errorf("col %q: uncompressed_len %d exceeds MaxBlockSize", name, uncompressedLen)
 	}

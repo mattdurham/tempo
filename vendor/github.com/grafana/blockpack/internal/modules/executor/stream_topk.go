@@ -17,22 +17,13 @@ import (
 )
 
 // topKEntry holds one candidate result buffered during a StreamTopK scan.
-type topKEntry struct {
-	block    *modules_reader.Block
-	ts       uint64
-	blockIdx int
-	rowIdx   int
-}
 
 // topKHeap implements heap.Interface.
 // backward=true → min-heap (root = oldest entry, evicted first when full).
 // backward=false → max-heap (root = newest entry, evicted first when full).
-type topKHeap struct {
-	entries  []topKEntry
-	backward bool
-}
 
 func (h *topKHeap) Len() int { return len(h.entries) }
+
 func (h *topKHeap) Swap(i, j int) {
 	h.entries[i], h.entries[j] = h.entries[j], h.entries[i]
 }
@@ -173,16 +164,26 @@ func topKScanBlocks(
 	// Build group→selected-blocks index in plan.SelectedBlocks order within each group.
 	// This ensures processGroup iterates only the ~N/G blocks relevant to its group,
 	// matching the O(N) total-work guarantee of the scanBlocks pipeline path.
-	blockToGroup := make(map[int]int, len(plan.SelectedBlocks))
+	// NOTE-105: flat []int replaces map[int]int — block IDs are bounded by r.BlockCount().
+	blockCount := r.BlockCount()
+	blockToGroupSlice := make([]int, blockCount)
+	for i := range blockToGroupSlice {
+		blockToGroupSlice[i] = -1
+	}
 	for gi, g := range groups {
 		for _, bi := range g.BlockIDs {
-			blockToGroup[bi] = gi
+			if bi < blockCount {
+				blockToGroupSlice[bi] = gi
+			}
 		}
 	}
 	groupToBlocks := make([][]int, len(groups))
 	for _, bi := range plan.SelectedBlocks {
-		gi, ok := blockToGroup[bi]
-		if !ok {
+		if bi >= blockCount {
+			continue
+		}
+		gi := blockToGroupSlice[bi]
+		if gi == -1 {
 			continue
 		}
 		groupToBlocks[gi] = append(groupToBlocks[gi], bi)
@@ -213,12 +214,14 @@ func topKScanBlocks(
 				return fmt.Errorf("ParseBlockFromBytes block %d: %w", blockIdx, parseErr)
 			}
 
-			provider := newBlockColumnProvider(bwb.Block)
+			provider := acquireBlockColumnProvider(bwb.Block)
 			rowSet, evalErr := program.ColumnPredicate(provider)
 			if evalErr != nil {
+				releaseBlockColumnProvider(provider)
 				return fmt.Errorf("ColumnPredicate block %d: %w", blockIdx, evalErr)
 			}
 			if rowSet.Size() == 0 {
+				releaseBlockColumnProvider(provider)
 				continue
 			}
 
@@ -227,6 +230,7 @@ func topKScanBlocks(
 			if wantColumns != nil {
 				bwb, parseErr = r.ParseBlockFromBytes(bwb.RawBytes, modules_reader.WantOnly(secondPassCols), meta)
 				if parseErr != nil {
+					releaseBlockColumnProvider(provider)
 					return fmt.Errorf("ParseBlockFromBytes (second pass) block %d: %w", blockIdx, parseErr)
 				}
 			}
@@ -239,6 +243,7 @@ func topKScanBlocks(
 			} else {
 				topKScanRows(buf, opts.Limit, backward, bwb.Block, blockIdx, tsCol, opts.TimeRange, rowSet.ToSlice())
 			}
+			releaseBlockColumnProvider(provider)
 		}
 		return nil
 	}

@@ -36,30 +36,24 @@ import (
 const fileSketchSummaryMagic = uint32(0x46534B55) // "FSKU" — bumped to invalidate CMS-containing caches
 
 // FileColumnSketch holds file-level aggregated sketch data for one column.
-type FileColumnSketch struct {
-	// TopK holds the top-K most frequent values across all blocks, merged by fingerprint.
-	// Entries are sorted by count descending.
-	TopK []FileTopKEntry
 
-	// TotalDistinct is the sum of per-block HLL cardinalities.
-	// This is an over-estimate when the same value appears in multiple blocks,
-	// but useful for selectivity hints.
-	TotalDistinct uint32
-}
+// TopK holds the top-K most frequent values across all blocks, merged by fingerprint.
+// Entries are sorted by count descending.
+
+// TotalDistinct is the sum of per-block HLL cardinalities.
+// This is an over-estimate when the same value appears in multiple blocks,
+// but useful for selectivity hints.
 
 // FileTopKEntry is one entry in the file-level TopK list.
-type FileTopKEntry struct {
-	FP    uint64 // value fingerprint (sketch.HashForFuse)
-	Count uint32 // aggregate count across all blocks
-}
+
+// value fingerprint (sketch.HashForFuse)
+// aggregate count across all blocks
 
 // FileSketchSummary is the file-level aggregation of per-block sketch data.
 // Computed lazily on first call to Reader.FileSketchSummary().
-type FileSketchSummary struct {
-	// Columns maps column name to aggregated sketch data.
-	// Nil when the file has no sketch section (old format).
-	Columns map[string]*FileColumnSketch
-}
+
+// Columns maps column name to aggregated sketch data.
+// Nil when the file has no sketch section (old format).
 
 // FileSketchSummary returns the file-level aggregated sketch summary.
 // The result is computed once per file across all queries using the process-level

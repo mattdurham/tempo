@@ -27,7 +27,6 @@ type Cache interface {
 
 // nopCache is a no-op Cache that always delegates to the fetch function and
 // never stores anything. Used internally when no cache is configured.
-type nopCache struct{}
 
 func (nopCache) Get(_ string) ([]byte, bool, error) { return nil, false, nil }
 func (nopCache) Put(_ string, _ []byte) error       { return nil }

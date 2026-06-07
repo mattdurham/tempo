@@ -16,108 +16,67 @@ import (
 )
 
 // FileLayoutReport is the top-level result of AnalyzeFileLayout.
-type FileLayoutReport struct {
-	Sections    []FileLayoutSection `json:"sections"`
-	RangeIndex  []RangeIndexColumn  `json:"range_index,omitempty"`
-	SketchIndex *SketchIndexInfo    `json:"sketch_index,omitempty"`
-	// FileBloom summarizes the file-level bloom filter section, if present.
-	FileBloom       *FileBloomInfo `json:"file_bloom,omitempty"`
-	BlockSpanCounts []uint32       `json:"block_span_counts,omitempty"`
-	FileSize        int64          `json:"file_size"`
-	TotalSpans      int64          `json:"total_spans"`
-	BlockCount      int            `json:"block_count"`
-	FileVersion     uint8          `json:"file_version"`
-}
+
+// FileBloom summarizes the file-level bloom filter section, if present.
 
 // SketchIndexInfo summarizes the sketch index stored in the file.
-type SketchIndexInfo struct {
-	// Blocks holds one summary per block (parallel to FileLayoutReport.BlockSpanCounts).
-	Blocks []BlockSketchSummary `json:"blocks"`
-	// TotalBytes is the actual computed uncompressed size of the sketch section.
-	TotalBytes int `json:"total_bytes"`
-	// HeaderBytes is the fixed 12-byte sketch section header (magic + num_blocks + num_columns).
-	HeaderBytes int `json:"header_bytes"`
-	// SketchedBlockCount is the number of blocks that have at least one sketched column.
-	SketchedBlockCount int `json:"sketched_block_count"`
-}
+
+// Blocks holds one summary per block (parallel to FileLayoutReport.BlockSpanCounts).
+
+// TotalBytes is the actual computed uncompressed size of the sketch section.
+
+// HeaderBytes is the fixed 12-byte sketch section header (magic + num_blocks + num_columns).
+
+// SketchedBlockCount is the number of blocks that have at least one sketched column.
 
 // BlockSketchSummary holds per-column sketch statistics for one block.
-type BlockSketchSummary struct {
-	// Columns holds sketch stats for each column that has sketch data in this block.
-	Columns []ColumnSketchStat `json:"columns"`
-}
+
+// Columns holds sketch stats for each column that has sketch data in this block.
 
 // ColumnSketchStat holds sketch statistics for one column in one block.
-type ColumnSketchStat struct {
-	ColumnName string `json:"column_name"`
-	// HLLCardinality is the estimated number of distinct values (HyperLogLog).
-	HLLCardinality uint64 `json:"hll_cardinality"`
-	// FuseBytes is the byte size of the membership filter (SketchBloom for SKTE/SKTD, absent for legacy SKTC).
-	FuseBytes int `json:"fuse_bytes,omitempty"`
-	// TopKCount is the number of TopK entries for this column (0 if none).
-	TopKCount int `json:"top_k_count,omitempty"`
-	// TopKBytes is the actual byte size of the TopK entries for this column in this
-	// block (1 + len(entries) × 10 bytes).
-	TopKBytes int `json:"top_k_bytes,omitempty"`
-}
+
+// HLLCardinality is the estimated number of distinct values (HyperLogLog).
+
+// FuseBytes is the byte size of the membership filter (SketchBloom for SKTE/SKTD, absent for legacy SKTC).
+
+// TopKCount is the number of TopK entries for this column (0 if none).
+
+// TopKBytes is the actual byte size of the TopK entries for this column in this
+// block (1 + len(entries) × 10 bytes).
 
 // RangeIndexColumn describes the pruning index for one column.
-type RangeIndexColumn struct {
-	ColumnName string `json:"column_name"`
-	ColumnType string `json:"column_type"`
-	// BucketMin is the global minimum value across all blocks for this column.
-	BucketMin string `json:"bucket_min,omitempty"`
-	// BucketMax is the global maximum value across all blocks for this column.
-	BucketMax string             `json:"bucket_max,omitempty"`
-	Buckets   []RangeIndexBucket `json:"buckets"`
-}
+
+// BucketMin is the global minimum value across all blocks for this column.
+
+// BucketMax is the global maximum value across all blocks for this column.
 
 // RangeIndexBucket is one entry in a column's range index: the lower boundary
 // of a value bucket and the set of block indexes that cover it.
-type RangeIndexBucket struct {
-	Start string `json:"start"`
-	// End is the upper boundary of this bucket (exclusive). For the last bucket this
-	// equals BucketMax of the column. Empty string for string/bytes columns where the
-	// upper bound is not encoded.
-	End      string   `json:"end,omitempty"`
-	BlockIDs []uint32 `json:"block_ids"`
-}
+
+// End is the upper boundary of this bucket (exclusive). For the last bucket this
+// equals BucketMax of the column. Empty string for string/bytes columns where the
+// upper bound is not encoded.
 
 // FileLayoutSection describes one contiguous byte range in a blockpack file.
-type FileLayoutSection struct {
-	Section    string `json:"section"`
-	ColumnName string `json:"column_name,omitempty"`
-	ColumnType string `json:"column_type,omitempty"`
-	Encoding   string `json:"encoding,omitempty"`
-	// MinValue is the minimum value of this page (human-readable string).
-	MinValue string `json:"min_value,omitempty"`
-	// MaxValue is the maximum value of this page (human-readable string).
-	MaxValue         string `json:"max_value,omitempty"`
-	Offset           int64  `json:"offset"`
-	CompressedSize   int64  `json:"compressed_size"`
-	UncompressedSize int64  `json:"uncompressed_size,omitempty"`
-	BlockIndex       int    `json:"block_index,omitempty"`
-	// RowCount is the number of records in this page (intrinsic paged columns only).
-	RowCount int `json:"row_count,omitempty"`
-	// IsLogical is true for V12 metadata sub-sections whose Offset is relative to
-	// the start of the decompressed metadata buffer, not a physical file offset.
-	IsLogical bool `json:"is_logical,omitempty"`
-}
+
+// MinValue is the minimum value of this page (human-readable string).
+
+// MaxValue is the maximum value of this page (human-readable string).
+
+// RowCount is the number of records in this page (intrinsic paged columns only).
+
+// IsLogical is true for V12 metadata sub-sections whose Offset is relative to
+// the start of the decompressed metadata buffer, not a physical file offset.
 
 // FileBloomInfo summarizes the file-level bloom filter section (FBLM).
-type FileBloomInfo struct {
-	// Columns holds per-column name and filter size.
-	Columns []FileBloomColumnInfo `json:"columns"`
-	// TotalBytes is the total uncompressed byte size of the FBLM section.
-	TotalBytes int `json:"total_bytes"`
-}
+
+// Columns holds per-column name and filter size.
+
+// TotalBytes is the total uncompressed byte size of the FBLM section.
 
 // FileBloomColumnInfo describes one column's entry in the file bloom section.
-type FileBloomColumnInfo struct {
-	ColumnName string `json:"column_name"`
-	// FuseBytes is the byte size of the BinaryFuse8 filter for this column.
-	FuseBytes int `json:"fuse_bytes"`
-}
+
+// FuseBytes is the byte size of the BinaryFuse8 filter for this column.
 
 // FileLayout computes a byte-level layout of the blockpack file, returning a report
 // that accounts for every byte. The returned Sections slice is sorted by Offset ascending.

@@ -17,9 +17,6 @@ import (
 // simpleRowSet is a lightweight RowSet for collecting per-row filter results.
 // It avoids the O(n) allocation of FullScan()+Complement() when building
 // result sets incrementally.
-type simpleRowSet struct {
-	rows map[int]struct{}
-}
 
 func newSimpleRowSet() *simpleRowSet {
 	return &simpleRowSet{rows: make(map[int]struct{})}
@@ -101,10 +98,12 @@ func Compile(sel *LogSelector) (*vm.Program, error) {
 	// Also extract QueryPredicates for block-level pruning.
 	queryPreds := extractPredicates(sel)
 
-	return &vm.Program{
+	prog := &vm.Program{
 		ColumnPredicate: combined,
 		Predicates:      queryPreds,
-	}, nil
+	}
+	prog.ComputeWantColumns()
+	return prog, nil
 }
 
 // compileMatcherPredicate compiles a label matcher to a ColumnPredicate.
@@ -517,6 +516,7 @@ func CompileAll(sel *LogSelector) (*vm.Program, *Pipeline, error) {
 		ColumnPredicate: combined,
 		Predicates:      queryPreds,
 	}
+	program.ComputeWantColumns()
 
 	// Compile the pipeline, skipping only pre-parser pushed-down stages.
 	pipeline, err := compilePipelineSkipping(sel.Pipeline, skip)
@@ -528,11 +528,8 @@ func CompileAll(sel *LogSelector) (*vm.Program, *Pipeline, error) {
 }
 
 // lineFilterMatcher evaluates a single line filter against a log body string.
-type lineFilterMatcher struct {
-	filterFn func(body string) bool
-	compiled *regexp.Regexp // non-nil for regex/not-regex filters
-	pattern  string
-}
+
+// non-nil for regex/not-regex filters
 
 // compileLineFilterMatchers compiles line filters into per-row matchers.
 func compileLineFilterMatchers(filters []LineFilter) ([]lineFilterMatcher, error) {

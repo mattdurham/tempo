@@ -24,11 +24,6 @@ import (
 )
 
 // pendingLogRow holds a reconstructed log record with its sort key for global re-sorting.
-type pendingLogRow struct {
-	ld         *logsv1.LogsData
-	minHashSig [4]uint64
-	timestamp  uint64
-}
 
 // CompactLogFile reads a log-signal blockpack file, globally re-sorts all rows by
 // (minHash[0..3], timestamp), and writes a new file to output. The MinHash is
@@ -328,11 +323,9 @@ func CompactLogFileBytes(input []byte, cfg Config) ([]byte, error) {
 }
 
 // bytesProvider implements modules_rw.ReaderProvider over a byte slice.
-type bytesProvider struct {
-	data []byte
-}
 
 func (p *bytesProvider) Size() (int64, error) { return int64(len(p.data)), nil }
+
 func (p *bytesProvider) ReadAt(buf []byte, off int64, _ modules_rw.DataType) (int, error) {
 	if off < 0 || off >= int64(len(p.data)) {
 		return 0, io.EOF

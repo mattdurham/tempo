@@ -2,10 +2,8 @@
 package vm
 
 // Value represents a runtime value in the VM
-type Value struct {
-	Data any // int64, float64, string, bool, []byte, []Value, or nil
-	Type ValueType
-}
+
+// int64, float64, string, bool, []byte, []Value, or nil
 
 // ValueType represents the runtime type of a value in the VM.
 type ValueType byte
@@ -64,45 +62,37 @@ const (
 //
 // Unscoped attribute predicates (e.g. .service.name = "bob") are expanded at compile
 // time into OR composites covering resource.*, span.*, and log.* scoped children.
-type RangeNode struct {
-	Min *Value // interval lower bound (nil = no lower bound)
-	Max *Value // interval upper bound (nil = no upper bound)
 
-	// Leaf fields — set when len(Children) == 0.
-	Column  string // fully-scoped column (e.g. "resource.service.name", "span:duration")
-	Pattern string // regex pattern for prefix-based range pruning
+// interval lower bound (nil = no lower bound)
+// interval upper bound (nil = no upper bound)
 
-	Values   []Value // equality lookup values; multiple values are OR'd
-	Children []RangeNode
+// Leaf fields — set when len(Children) == 0.
+// fully-scoped column (e.g. "resource.service.name", "span:duration")
+// regex pattern for prefix-based range pruning
 
-	// QueryVector is non-nil for VECTOR() ranking predicates.
-	// When set, planBlocks uses centroid distance to prune entire files/blocks.
-	QueryVector []float32
+// equality lookup values; multiple values are OR'd
 
-	// VectorThreshold is the minimum cosine similarity for centroid pruning.
-	// Only meaningful when QueryVector is non-nil.
-	VectorThreshold float32
+// QueryVector is non-nil for VECTOR() ranking predicates.
+// When set, planBlocks uses centroid distance to prune entire files/blocks.
 
-	// MinInclusive is true when Min comes from >= (>= x) rather than > (> x).
-	// Used by the intrinsic flat-column scan to decide inclusive vs exclusive lower bound.
-	MinInclusive bool
-	// MaxInclusive is true when Max comes from <= (<= x) rather than < (< x).
-	MaxInclusive bool
-	// Composite fields — set when len(Children) > 0.
-	IsOR bool
-}
+// VectorThreshold is the minimum cosine similarity for centroid pruning.
+// Only meaningful when QueryVector is non-nil.
+
+// MinInclusive is true when Min comes from >= (>= x) rather than > (> x).
+// Used by the intrinsic flat-column scan to decide inclusive vs exclusive lower bound.
+
+// MaxInclusive is true when Max comes from <= (<= x) rather than < (< x).
+
+// Composite fields — set when len(Children) > 0.
 
 // QueryPredicates holds block-level pruning predicates extracted from a compiled query.
-type QueryPredicates struct {
-	// Nodes is the top-level AND-combined list of pruning predicates.
-	// Each node is either a leaf (Column + values/range/pattern) or a composite (IsOR + Children).
-	Nodes []RangeNode
 
-	// Columns lists every attribute column accessed by the query.
-	// Used by ProgramWantColumns to select columns for the first-pass block decode.
-	// Includes columns from negation predicates that cannot appear in Nodes.
-	Columns []string
-}
+// Nodes is the top-level AND-combined list of pruning predicates.
+// Each node is either a leaf (Column + values/range/pattern) or a composite (IsOR + Children).
+
+// Columns lists every attribute column accessed by the query.
+// Used by ProgramWantColumns to select columns for the first-pass block decode.
+// Includes columns from negation predicates that cannot appear in Nodes.
 
 // TextEmbedder is the interface for converting text to embedding vectors.
 // This keeps the VM decoupled from the embedder implementation — callers provide
@@ -115,15 +105,8 @@ type QueryPredicates struct {
 //
 // NOTE: Do not widen this interface to include EmbedBatch without updating all
 // callers — the narrow surface is part of the public API contract.
-type TextEmbedder interface {
-	Embed(text string) ([]float32, error)
-}
 
 // ScoredRow holds a row index and its cosine similarity score from vector scoring.
-type ScoredRow struct {
-	RowIdx int
-	Score  float32
-}
 
 // VectorScorer is a compiled vector-scoring closure that runs AFTER traditional
 // predicates have produced a candidate RowSet. It accepts a point-lookup accessor
@@ -145,30 +128,26 @@ func (p *Program) NeedsColumnData() bool {
 }
 
 // Program represents a compiled TraceQL or SQL expression
-type Program struct {
-	// ColumnPredicate filters rows using bulk column scans (fast)
-	ColumnPredicate          ColumnPredicate          // Direct column-scan execution closure for WHERE clause
-	StreamingColumnPredicate StreamingColumnPredicate // Streaming version for aggregation (avoids RowSet)
-	Predicates               *QueryPredicates         // Extracted predicates for block-level pruning
 
-	// VectorScorer is set when the query contains a VECTOR_AI() or VECTOR_ALL() predicate.
-	// It runs after ColumnPredicate produces candidates, scoring only those rows.
-	// When nil, no vector scoring is applied.
-	VectorScorer VectorScorer
+// ColumnPredicate filters rows using bulk column scans (fast)
+// Direct column-scan execution closure for WHERE clause
+// Streaming version for aggregation (avoids RowSet)
+// Extracted predicates for block-level pruning
 
-	OriginalQuery string // Original TraceQL query (optional, for debugging)
+// VectorScorer is set when the query contains a VECTOR_AI() or VECTOR_ALL() predicate.
+// It runs after ColumnPredicate produces candidates, scoring only those rows.
+// When nil, no vector scoring is applied.
 
-	// VectorColumn is the block column name that VectorScorer reads via point lookup.
-	// "__embedding__" for VECTOR_AI, "__embedding_all__" for VECTOR_ALL.
-	VectorColumn string
+// Original TraceQL query (optional, for debugging)
 
-	// Vector search fields — non-zero when the query contains a VECTOR() predicate.
-	// QueryVector is pre-computed from the VECTOR() query text at compile time.
-	QueryVector []float32
-	// VectorLimit is the top-K result count (default: DefaultVectorLimit).
-	VectorLimit int
-	// HasVector is true when the query contains a VECTOR_AI() or VECTOR_ALL() predicate.
-	HasVector bool
-	// VectorAll is true for VECTOR_ALL() — ranks by stored all-fields embedding (no query vector needed).
-	VectorAll bool
-}
+// VectorColumn is the block column name that VectorScorer reads via point lookup.
+// "__embedding__" for VECTOR_AI, "__embedding_all__" for VECTOR_ALL.
+
+// Vector search fields — non-zero when the query contains a VECTOR() predicate.
+// QueryVector is pre-computed from the VECTOR() query text at compile time.
+
+// VectorLimit is the top-K result count (default: DefaultVectorLimit).
+
+// HasVector is true when the query contains a VECTOR_AI() or VECTOR_ALL() predicate.
+
+// VectorAll is true for VECTOR_ALL() — ranks by stored all-fields embedding (no query vector needed).

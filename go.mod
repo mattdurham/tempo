@@ -460,6 +460,7 @@ require (
 )
 
 replace (
+	github.com/grafana/blockpack => ../blockpack
 	k8s.io/api => k8s.io/api v0.36.0
 	k8s.io/client-go => k8s.io/client-go v0.36.0
 )

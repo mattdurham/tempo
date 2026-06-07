@@ -26,19 +26,10 @@ const defaultMaxBytesNoGOMEMLIMIT = 256 << 20 // 256 MiB
 
 // Sizer is implemented by cached values that can report their in-memory size.
 // If a value does not implement Sizer, a default of 1 MB per entry is used.
-type Sizer interface {
-	SizeBytes() int64
-}
 
 const defaultEntrySize int64 = 1 << 20 // 1 MB fallback
 
 // entry is a doubly-linked list node for LRU tracking.
-type entry[V any] struct {
-	val        *V
-	prev, next *entry[V]
-	key        string
-	sizeBytes  int64
-}
 
 // Cache is a generic in-memory cache with strong references and LRU eviction.
 // The byte budget defaults to 20% of GOMEMLIMIT when the env var is set, or

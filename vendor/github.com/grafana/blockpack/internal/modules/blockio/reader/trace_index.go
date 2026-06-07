@@ -18,10 +18,6 @@ const (
 )
 
 // compactBlockEntry holds file location for one block as stored in the compact block table.
-type compactBlockEntry struct {
-	fileOffset uint64
-	fileLength uint32
-}
 
 // splitV14CompactSection splits a V14 compact trace section blob into its two logical parts:
 // the "header" (magic + version + block_count + optional bloom + block_table) and the

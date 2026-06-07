@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"math"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 
 	"github.com/klauspost/compress/zstd"
@@ -149,10 +150,9 @@ func readRawSegment(data []byte, pos int) ([]byte, int, error) {
 // decodeCtx bundles per-parse and per-reader state threaded through column decoders.
 // intern is the owning Reader's string intern table and must not be nil.
 // scratch is used only by the vectorF32 decoder path (zstd-compressed float data).
-type decodeCtx struct {
-	intern  map[string]string // per-reader string intern map, single-goroutine only
-	scratch *[]byte           // reusable zstd output buffer for vectorF32 decoder; may be nil
-}
+
+// per-reader string intern map, single-goroutine only
+// reusable zstd output buffer for vectorF32 decoder; may be nil
 
 // internString looks up b in ctx.intern and returns the interned string.
 // On the first occurrence a heap copy is made and stored; subsequent calls with
@@ -1302,4 +1302,34 @@ func decodeVectorF32(data []byte, spanCount int, ctx *decodeCtx) (*Column, error
 	}
 
 	return col, nil
+}
+
+// Column is a blockpack data type.
+type Column struct {
+	internMap          map[string]string
+	Name               string
+	StringDict         []string
+	StringIdx          []uint32
+	Int64Dict          []int64
+	Int64Idx           []uint32
+	Uint64Dict         []uint64
+	Uint64Idx          []uint32
+	Float64Dict        []float64
+	Float64Idx         []uint32
+	BoolDict           []uint8
+	BoolIdx            []uint32
+	BytesDict          [][]byte
+	BytesIdx           []uint32
+	BytesInline        [][]byte
+	Present            []byte
+	rawEncoding        []byte
+	compressedEncoding []byte
+	sparseDictIdx      []uint32
+	SpanCount          int
+	decodeOnce         sync.Once
+	denseOnce          sync.Once
+	decompressOnce     sync.Once
+	decoded            atomic.Bool
+	uncompressedLen    uint32
+	Type               shared.ColumnType
 }

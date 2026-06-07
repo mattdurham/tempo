@@ -54,19 +54,10 @@ type Storage interface {
 }
 
 // WritableStorage extends Storage with write and delete capability.
-type WritableStorage interface {
-	Storage
-	// Put writes data to the given path, creating or overwriting the file.
-	Put(path string, data []byte) error
-	// Delete removes the file at the given path.
-	Delete(path string) error
-}
 
-// storageReaderProvider adapts a Storage + path to modules_rw.ReaderProvider.
-type storageReaderProvider struct {
-	storage Storage
-	path    string
-}
+// Put writes data to the given path, creating or overwriting the file.
+
+// Delete removes the file at the given path.
 
 func (p *storageReaderProvider) Size() (int64, error) {
 	return p.storage.Size(p.path)
@@ -82,9 +73,6 @@ func NewFileStorage(baseDir string) WritableStorage {
 }
 
 // folderStorageWrapper implements WritableStorage using the local filesystem.
-type folderStorageWrapper struct {
-	baseDir string
-}
 
 // safePath joins baseDir and path and verifies the result stays within baseDir.
 // It returns an error for absolute paths, paths with ".." components that escape
@@ -169,14 +157,13 @@ func NewMinIOProvider(client *minio.Client, bucket, object string) *MinIOProvide
 
 // BlockMeta contains metadata about a blockpack file for block selection.
 // Tempo uses this information to determine which files to query based on time range overlap.
-type BlockMeta struct {
-	MinStartNanos uint64 // Earliest span start time (unix nanos)
-	MaxStartNanos uint64 // Latest span start time (unix nanos)
-	TotalSpans    int    // Total number of spans across all blocks
-	TotalTraces   int    // Total number of unique traces (from trace index)
-	BlockCount    int    // Number of blocks in the file
-	Size          int64  // File size in bytes
-}
+
+// Earliest span start time (unix nanos)
+// Latest span start time (unix nanos)
+// Total number of spans across all blocks
+// Total number of unique traces (from trace index)
+// Number of blocks in the file
+// File size in bytes
 
 // GetBlockMeta returns metadata about a blockpack file including time range,
 // span/trace counts, and file size. This is used by Tempo for block selection
@@ -253,17 +240,9 @@ func GetBlockMetaWithCache(path string, storage Storage, cache *FileCache) (meta
 }
 
 // fileEntry holds a path, its resolved metadata, and whether metadata resolution failed.
-type fileEntry struct {
-	path   string
-	meta   BlockMeta
-	failed bool
-}
 
 // FilePlan holds an ordered list of blockpack files with their resolved metadata,
 // intended for use by query planners that need file-level priority ordering.
-type FilePlan struct {
-	files []fileEntry
-}
 
 // PlanFiles resolves BlockMeta for each path and returns a FilePlan.
 // Paths that fail metadata resolution are retained in the plan with failed=true
@@ -349,19 +328,6 @@ func (p *FilePlan) Between(minNanos, maxNanos uint64) []string {
 }
 
 // AGENT: Conversion functions - convert from other formats into blockpack.
-
-// ConvertProtoToBlockpack reads an OTLP protobuf-encoded TracesData file and writes
-// blockpack-formatted trace data to output.
-// The input file must contain a single wire-encoded tracev1.TracesData protobuf message.
-// maxSpansPerBlock controls block granularity (0 uses the default of 2000).
-func ConvertProtoToBlockpack(inputPath string, output io.Writer, maxSpansPerBlock int) (err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("internal error in ConvertProtoToBlockpack: %v", r)
-		}
-	}()
-	return otlpconvert.ConvertFromProtoFile(inputPath, output, maxSpansPerBlock)
-}
 
 // ConvertLogsProtoToBlockpack reads an OTLP protobuf-encoded LogsData file and writes
 // a blockpack log file to output.

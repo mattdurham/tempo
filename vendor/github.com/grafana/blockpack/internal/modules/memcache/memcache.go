@@ -22,28 +22,21 @@ import (
 
 // client is the subset of gomemcache.Client we use, allowing the
 // implementation to be tested without a real memcache server.
-type client interface {
-	Get(key string, opts ...gomemcache.Option) (*gomemcache.Item, error)
-	Set(item *gomemcache.Item) error
-	Close()
-}
 
 // Config configures a MemCache.
-type Config struct {
-	// Registerer is an optional Prometheus registerer.
-	// When non-nil, cache metrics are registered and incremented.
-	Registerer prometheus.Registerer
-	// Servers is the list of memcache server addresses (host:port).
-	Servers []string
 
-	// Expiration is the TTL in seconds for stored items.
-	// 0 means no expiration.
-	Expiration int32
+// Registerer is an optional Prometheus registerer.
+// When non-nil, cache metrics are registered and incremented.
 
-	// Enabled controls whether the cache is active.
-	// If false, Open returns (nil, nil) and all operations become no-ops.
-	Enabled bool
-}
+// TierLabel overrides the "tier" Prometheus label value (default "remote").
+
+// Servers is the list of memcache server addresses (host:port).
+
+// Expiration is the TTL in seconds for stored items.
+// 0 means no expiration.
+
+// Enabled controls whether the cache is active.
+// If false, Open returns (nil, nil) and all operations become no-ops.
 
 // MemCache is a remote memcache-backed cache that implements filecache.Cache.
 // It is safe for concurrent use.
@@ -60,6 +53,7 @@ type MemCache struct {
 	durGetHit  prometheus.Observer
 	durGetMiss prometheus.Observer
 	durPutOk   prometheus.Observer
+	tierLabel  string
 	expiration int32
 }
 
@@ -98,9 +92,14 @@ func Open(cfg Config) (*MemCache, error) {
 	if len(cfg.Servers) == 0 {
 		return nil, fmt.Errorf("memcache: at least one server address required")
 	}
+	tl := cfg.TierLabel
+	if tl == "" {
+		tl = "remote"
+	}
 	m := &MemCache{
 		c:          gomemcache.New(expandServers(cfg.Servers)...),
 		expiration: cfg.Expiration,
+		tierLabel:  tl,
 	}
 	if cfg.Registerer != nil {
 		m.requests = memcacheRegisterOrReuse(cfg.Registerer, prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -126,9 +125,14 @@ func Open(cfg Config) (*MemCache, error) {
 			[]string{"tier", "operation", "result"},
 		))
 		// Pre-resolve label combinations for 0-alloc hot path.
-		m.durGetHit = h.WithLabelValues("remote", "get", "hit")
-		m.durGetMiss = h.WithLabelValues("remote", "get", "miss")
-		m.durPutOk = h.WithLabelValues("remote", "put", "ok")
+		tl := cfg.TierLabel
+		if tl == "" {
+			tl = "remote"
+		}
+		m.tierLabel = tl
+		m.durGetHit = h.WithLabelValues(tl, "get", "hit")
+		m.durGetMiss = h.WithLabelValues(tl, "get", "miss")
+		m.durPutOk = h.WithLabelValues(tl, "put", "ok")
 	}
 	return m, nil
 }
@@ -191,7 +195,7 @@ func (m *MemCache) Get(key string) ([]byte, bool, error) {
 	item, err := m.c.Get(memcacheKey(key))
 	if errors.Is(err, gomemcache.ErrCacheMiss) {
 		if m.requests != nil {
-			m.requests.WithLabelValues("remote", "miss").Inc()
+			m.requests.WithLabelValues(m.tierLabel, "miss").Inc()
 		}
 		if m.durGetMiss != nil {
 			m.durGetMiss.Observe(time.Since(start).Seconds())
@@ -202,17 +206,17 @@ func (m *MemCache) Get(key string) ([]byte, bool, error) {
 		// Treat transient errors (connection loss, server unavailable) as misses.
 		// Memcache is a best-effort cache; the caller falls back to the underlying reader.
 		if m.errs != nil {
-			m.errs.WithLabelValues("remote").Inc()
+			m.errs.WithLabelValues(m.tierLabel).Inc()
 		}
 		return nil, false, nil //nolint:nilerr
 	}
 	out := make([]byte, len(item.Value))
 	copy(out, item.Value)
 	if m.requests != nil {
-		m.requests.WithLabelValues("remote", "hit").Inc()
+		m.requests.WithLabelValues(m.tierLabel, "hit").Inc()
 	}
 	if m.bytes != nil {
-		m.bytes.WithLabelValues("remote").Add(float64(len(out)))
+		m.bytes.WithLabelValues(m.tierLabel).Add(float64(len(out)))
 	}
 	if m.durGetHit != nil {
 		m.durGetHit.Observe(time.Since(start).Seconds())

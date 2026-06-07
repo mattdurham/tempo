@@ -782,7 +782,7 @@ github.com/googleapis/gax-go/v2/iterator
 # github.com/gorilla/mux v1.8.1
 ## explicit; go 1.20
 github.com/gorilla/mux
-# github.com/grafana/blockpack v0.0.0-20260424144840-8ef903b46b32
+# github.com/grafana/blockpack v0.0.0-20260424144840-8ef903b46b32 => ../blockpack
 ## explicit; go 1.26.0
 github.com/grafana/blockpack
 github.com/grafana/blockpack/internal/logqlparser
@@ -1751,7 +1751,6 @@ github.com/viterin/vek/internal/functions
 github.com/viterin/vek/vek32
 # github.com/willf/bitset v1.1.11
 ## explicit; go 1.14
-github.com/willf/bitset
 # github.com/wk8/go-ordered-map/v2 v2.1.8
 ## explicit; go 1.18
 github.com/wk8/go-ordered-map/v2
@@ -2819,6 +2818,7 @@ sigs.k8s.io/structured-merge-diff/v6/value
 # sigs.k8s.io/yaml v1.6.0
 ## explicit; go 1.22
 sigs.k8s.io/yaml
+# github.com/grafana/blockpack => ../blockpack
 # k8s.io/api => k8s.io/api v0.36.0
 # k8s.io/client-go => k8s.io/client-go v0.36.0
 # github.com/hashicorp/memberlist => github.com/grafana/memberlist v0.3.1-0.20260410132335-4887d8e8d493

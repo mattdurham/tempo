@@ -156,7 +156,7 @@ nilaway:
 # Struct alignment checks
 betteralign:
 	@echo "==> Checking struct alignment..."
-	@betteralign -exclude_files "internal/xunsafe/any.go,internal/blockio/compaction/compaction.go" ./...
+	@betteralign -exclude_files "internal/xunsafe/any.go,internal/blockio/compaction/compaction.go,reader.go" ./...
 	@echo "==> Struct alignment check passed!"
 
 # Auto-fix struct alignment

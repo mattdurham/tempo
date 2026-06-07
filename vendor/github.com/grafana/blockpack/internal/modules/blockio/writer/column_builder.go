@@ -10,31 +10,20 @@ import (
 // columnBuilder accumulates values for one column and encodes them to the wire format.
 // Each method corresponds to one value type; implementations ignore types that don't
 // match the column's declared type. The present flag distinguishes null from non-null rows.
-type columnBuilder interface {
-	addString(val string, present bool)
-	addInt64(val int64, present bool)
-	addUint64(val uint64, present bool)
-	addFloat64(val float64, present bool)
-	addBool(val, present bool)
-	addBytes(val []byte, present bool)
-	// addVectorF32 stores a float32 vector for the current row.
-	// Non-vector builders implement this as a no-op.
-	addVectorF32(val []float32, present bool)
-	rowCount() int
-	nullCount() int
-	colType() shared.ColumnType
-	// buildData returns the wire-format column blob:
-	// enc_version[1]=3 + encoding_kind[1] + payload (per SPECS §8.4, V14).
-	// Internal sub-segments are raw bytes (no zstd); outer snappy is applied by the block writer.
-	buildData() ([]byte, error)
-	// resetForReuse clears accumulated values (preserving slice capacity) so the
-	// builder can be reused for the next block without re-allocation.
-	resetForReuse(colName string)
-	// prepare extends value and present slices to exactly nRows with zero/false values.
-	// After prepare, rowCount() == nRows and all rows are null. Present rows are then
-	// set via indexed writes, eliminating append-based null-filling entirely.
-	prepare(nRows int)
-}
+
+// addVectorF32 stores a float32 vector for the current row.
+// Non-vector builders implement this as a no-op.
+
+// buildData returns the wire-format column blob:
+// enc_version[1]=3 + encoding_kind[1] + payload (per SPECS §8.4, V14).
+// Internal sub-segments are raw bytes (no zstd); outer snappy is applied by the block writer.
+
+// resetForReuse clears accumulated values (preserving slice capacity) so the
+// builder can be reused for the next block without re-allocation.
+
+// prepare extends value and present slices to exactly nRows with zero/false values.
+// After prepare, rowCount() == nRows and all rows are null. Present rows are then
+// set via indexed writes, eliminating append-based null-filling entirely.
 
 // newColumnBuilder creates the appropriate columnBuilder for the given column type and name.
 // initCap is the initial capacity for the value and present slices; pass 0 to use the

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 
 	regexp "github.com/coregx/coregex"
 
@@ -292,12 +293,43 @@ func (p *blockColumnProvider) scanFloat64DictEqualAny(
 }
 
 // blockColumnProvider implements vm.ColumnDataProvider for a modules Block.
-type blockColumnProvider struct {
-	block *modules_reader.Block
+
+const (
+	scratchInitialCap     = 256 // initial capacity for blockColumnProvider scratch buffer
+	refsStackPreallocSize = 64  // stack pre-alloc threshold for filterRowSetByIntrinsicNodes refs
+	logKeyBufSize         = 512 // stack buffer size for logAccumulateRow composite key
+	logKeyHeapFallback    = 400 // fall back to heap when key exceeds this length
+)
+
+// blockColumnProviderPool pools *blockColumnProvider to avoid one heap allocation per
+// block in all scan paths.
+//
+// NOTE-102: p.block must be nil'd before returning to pool to prevent GC retention of
+// decoded block data. Use acquireBlockColumnProvider / releaseBlockColumnProvider.
+
+//nolint:gochecknoglobals
+var blockColumnProviderPool = &sync.Pool{
+	New: func() any {
+		return &blockColumnProvider{scratch: make([]int, 0, scratchInitialCap)}
+	},
 }
 
-func newBlockColumnProvider(block *modules_reader.Block) *blockColumnProvider {
-	return &blockColumnProvider{block: block}
+func acquireBlockColumnProvider(block *modules_reader.Block) *blockColumnProvider {
+	//nolint:forcetypeassert
+	p := blockColumnProviderPool.Get().(*blockColumnProvider)
+	p.block = block
+	return p
+}
+
+func releaseBlockColumnProvider(p *blockColumnProvider) {
+	p.block = nil             // prevent GC retention of decoded block data
+	p.scratch = p.scratch[:0] // reset length, retain capacity for reuse
+	// INVARIANT: scratchInUse is reset here (not in acquireBlockColumnProvider) — every
+	// ColumnPredicate evaluation gets exactly one scratch-backed rowSet (the first Scan* call).
+	// Caller must not invoke releaseBlockColumnProvider until all reads of scratch-backed
+	// rowSets are complete.
+	p.scratchInUse = false
+	blockColumnProviderPool.Put(p)
 }
 
 // lookupColumn finds a column by its fully-qualified name.
@@ -583,7 +615,7 @@ func (p *blockColumnProvider) StreamScanEqualAny(column string, values []any, cb
 
 // ScanEqualAny returns a RowSet of all rows where column equals any of the given values.
 func (p *blockColumnProvider) ScanEqualAny(column string, values []any) (vm.RowSet, error) {
-	return collectStream(p.block.SpanCount(), func(cb vm.RowCallback) (int, error) {
+	return p.collectStreamInto(func(cb vm.RowCallback) (int, error) {
 		return p.StreamScanEqualAny(column, values, cb)
 	})
 }
@@ -956,7 +988,7 @@ func (p *blockColumnProvider) ScanRegexFast(column string, re *regexp.Regexp, pr
 		}
 		return &rowSet{}, nil
 	}
-	return collectStream(p.block.SpanCount(), func(cb vm.RowCallback) (int, error) {
+	return p.collectStreamInto(func(cb vm.RowCallback) (int, error) {
 		return p.streamScanRegexFast(col, re, prefixes, cb)
 	})
 }
@@ -972,7 +1004,7 @@ func (p *blockColumnProvider) ScanRegexNotMatchFast(
 		// No column → all rows are absent → all satisfy NOT MATCH.
 		return p.FullScan(), nil
 	}
-	return collectStream(p.block.SpanCount(), func(cb vm.RowCallback) (int, error) {
+	return p.collectStreamInto(func(cb vm.RowCallback) (int, error) {
 		return p.streamScanRegexNotMatchFast(col, re, prefixes, cb)
 	})
 }
@@ -992,91 +1024,113 @@ func (p *blockColumnProvider) StreamFullScan(cb vm.RowCallback) (int, error) {
 
 // --- Scan methods (collect into RowSet) ---
 
-func collectStream(hint int, fn func(cb vm.RowCallback) (int, error)) (vm.RowSet, error) {
-	rs := newRowSetWithCap(hint)
+// collectStreamInto is like the former collectStream free function but reuses p.scratch as the backing slice
+// when scratch is not already borrowed by a prior Scan* call in the same ColumnPredicate
+// evaluation. For compound predicates (AND/OR), the VM calls multiple Scan* methods
+// sequentially; only the first call gets the scratch — subsequent calls fall back to
+// heap allocation to avoid clobbering the first result.
+// NOTE-107: When scratch is used, the returned rowSet borrows p.scratch. It is valid only
+// until releaseBlockColumnProvider(p) is called. Callers must not retain past that point.
+func (p *blockColumnProvider) collectStreamInto(fn func(cb vm.RowCallback) (int, error)) (vm.RowSet, error) {
+	if p.scratchInUse {
+		// Scratch is already borrowed by an earlier Scan* call within this ColumnPredicate
+		// evaluation — fall back to heap allocation to avoid clobbering the earlier result.
+		rs := &rowSet{}
+		_, err := fn(func(rowIdx int) bool {
+			rs.rows = append(rs.rows, rowIdx)
+			return true
+		})
+		if err != nil {
+			return nil, err
+		}
+		return rs, nil
+	}
+	p.scratch = p.scratch[:0]
+	p.scratchInUse = true
 	_, err := fn(func(rowIdx int) bool {
-		rs.Add(rowIdx)
+		p.scratch = append(p.scratch, rowIdx)
 		return true
 	})
 	if err != nil {
+		p.scratchInUse = false
 		return nil, err
 	}
-	return rs, nil
+	return &rowSet{rows: p.scratch}, nil
 }
 
 // ScanEqual returns a RowSet of all rows where column equals value.
 func (p *blockColumnProvider) ScanEqual(column string, value interface{}) (vm.RowSet, error) {
-	return collectStream(p.block.SpanCount(), func(cb vm.RowCallback) (int, error) {
+	return p.collectStreamInto(func(cb vm.RowCallback) (int, error) {
 		return p.StreamScanEqual(column, value, cb)
 	})
 }
 
 // ScanNotEqual returns a RowSet of all rows where column does not equal value.
 func (p *blockColumnProvider) ScanNotEqual(column string, value interface{}) (vm.RowSet, error) {
-	return collectStream(p.block.SpanCount(), func(cb vm.RowCallback) (int, error) {
+	return p.collectStreamInto(func(cb vm.RowCallback) (int, error) {
 		return p.StreamScanNotEqual(column, value, cb)
 	})
 }
 
 // ScanLessThan returns a RowSet of all rows where column < value.
 func (p *blockColumnProvider) ScanLessThan(column string, value interface{}) (vm.RowSet, error) {
-	return collectStream(p.block.SpanCount(), func(cb vm.RowCallback) (int, error) {
+	return p.collectStreamInto(func(cb vm.RowCallback) (int, error) {
 		return p.StreamScanLessThan(column, value, cb)
 	})
 }
 
 // ScanLessThanOrEqual returns a RowSet of all rows where column <= value.
 func (p *blockColumnProvider) ScanLessThanOrEqual(column string, value interface{}) (vm.RowSet, error) {
-	return collectStream(p.block.SpanCount(), func(cb vm.RowCallback) (int, error) {
+	return p.collectStreamInto(func(cb vm.RowCallback) (int, error) {
 		return p.StreamScanLessThanOrEqual(column, value, cb)
 	})
 }
 
 // ScanGreaterThan returns a RowSet of all rows where column > value.
 func (p *blockColumnProvider) ScanGreaterThan(column string, value interface{}) (vm.RowSet, error) {
-	return collectStream(p.block.SpanCount(), func(cb vm.RowCallback) (int, error) {
+	return p.collectStreamInto(func(cb vm.RowCallback) (int, error) {
 		return p.StreamScanGreaterThan(column, value, cb)
 	})
 }
 
 // ScanGreaterThanOrEqual returns a RowSet of all rows where column >= value.
 func (p *blockColumnProvider) ScanGreaterThanOrEqual(column string, value interface{}) (vm.RowSet, error) {
-	return collectStream(p.block.SpanCount(), func(cb vm.RowCallback) (int, error) {
+	return p.collectStreamInto(func(cb vm.RowCallback) (int, error) {
 		return p.StreamScanGreaterThanOrEqual(column, value, cb)
 	})
 }
 
 // ScanIsNull returns a RowSet of all rows where column is null.
 func (p *blockColumnProvider) ScanIsNull(column string) (vm.RowSet, error) {
-	return collectStream(p.block.SpanCount(), func(cb vm.RowCallback) (int, error) {
+	return p.collectStreamInto(func(cb vm.RowCallback) (int, error) {
 		return p.StreamScanIsNull(column, cb)
 	})
 }
 
 // ScanIsNotNull returns a RowSet of all rows where column is not null.
 func (p *blockColumnProvider) ScanIsNotNull(column string) (vm.RowSet, error) {
-	return collectStream(p.block.SpanCount(), func(cb vm.RowCallback) (int, error) {
+	return p.collectStreamInto(func(cb vm.RowCallback) (int, error) {
 		return p.StreamScanIsNotNull(column, cb)
 	})
 }
 
 // ScanRegex returns a RowSet of all rows where column matches pattern.
 func (p *blockColumnProvider) ScanRegex(column, pattern string) (vm.RowSet, error) {
-	return collectStream(p.block.SpanCount(), func(cb vm.RowCallback) (int, error) {
+	return p.collectStreamInto(func(cb vm.RowCallback) (int, error) {
 		return p.StreamScanRegex(column, pattern, cb)
 	})
 }
 
 // ScanRegexNotMatch returns a RowSet of all rows where column does not match pattern.
 func (p *blockColumnProvider) ScanRegexNotMatch(column, pattern string) (vm.RowSet, error) {
-	return collectStream(p.block.SpanCount(), func(cb vm.RowCallback) (int, error) {
+	return p.collectStreamInto(func(cb vm.RowCallback) (int, error) {
 		return p.StreamScanRegexNotMatch(column, pattern, cb)
 	})
 }
 
 // ScanContains returns a RowSet of all rows where column contains substring.
 func (p *blockColumnProvider) ScanContains(column, substring string) (vm.RowSet, error) {
-	return collectStream(p.block.SpanCount(), func(cb vm.RowCallback) (int, error) {
+	return p.collectStreamInto(func(cb vm.RowCallback) (int, error) {
 		return p.StreamScanContains(column, substring, cb)
 	})
 }
@@ -1084,6 +1138,8 @@ func (p *blockColumnProvider) ScanContains(column, substring string) (vm.RowSet,
 // --- Set operations ---
 
 // FullScan returns a RowSet containing all row indices [0, SpanCount).
+// FullScan does not use collectStreamInto and does not interact with scratchInUse.
+// The returned rowSet owns its own backing slice independently.
 func (p *blockColumnProvider) FullScan() vm.RowSet {
 	n := p.block.SpanCount()
 	rs := &rowSet{rows: make([]int, n)}

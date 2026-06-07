@@ -3046,34 +3046,42 @@ Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:accumulateCountR
 
 ---
 
-## NOTE-091: Structural Query Predicate Pruning — LHS Program for File-Level Bloom/Range (2026-04-22)
+## NOTE-091: Structural Query Block Selection via planBlocks (2026-04-22, updated 2026-05-06, 2026-05-07)
 
 **Context:** `ExecuteStructural` previously called `planner.Plan(nil, tr)` — no predicates,
-so no bloom or range pruning. For `{span.http.status_code="500"} >> {}` on a large file,
-this forced reading all internal blocks regardless of filter selectivity.
+so no bloom, range, or intrinsic-TOC pruning fired. Only the TS index applied. For
+`{span.http.status_code="500"} >> {}` on a large file this forced scanning every block.
 
-**Decision:** Use the LHS filter program (first non-nil program from the structural chain)
-to drive `fileLevelReject` and `fileLevelBloomReject` directly with the LHS program's
-predicate nodes, enabling file-level bloom rejection and range pruning before calling
-`planner.Plan(nil, tr)` for block selection.
+**Decision (2026-04-22/2026-05-06):** Apply file-level bloom/range rejection per program.
 
-**Safety:** Block-level pruning within a file is NOT safe for structural queries — a parent
-span may be in a different internal block than the child span. File-level rejection is safe:
-if the LHS filter guarantees no match in the entire file, no structural match is possible.
-Block selection therefore uses `planner.Plan(nil, tr)` (no predicate pruning), ensuring all
-blocks that survive file-level rejection are scanned.
+**Decision (2026-05-07): planBlocks per structural node.** Each structural node is a regular
+filter program with an added relationship constraint (isChild, isParent, isAdjacent, etc.).
+Block selection now calls `planBlocks(r, prog, tr, opts)` per program — the same bloom,
+range-index, intrinsic-TOC, and TS-index pruning as plain filter queries — and unions the
+selected block sets across all programs.
 
-**Effect:** Files where the bloom filter guarantees no LHS-matching span are skipped entirely.
-This is equivalent to how tempodb's bloom filters skip entire blockpack objects — we now apply
-the same logic inside `ExecuteStructural`.
+Any block absent from every program's selected set has no spans matching any structural
+node. Because structural matches require spans from matching nodes, such a block cannot
+contribute to any match.
 
-**False negative risk:** Bloom filters have ~0.4% FPR. Accepted: same semantics as tempodb's
-existing bloom-based file selection.
+**Limitation (multi-block traces):** Intermediate ancestor spans that do not match any
+program predicate but are needed to link a descendant to an ancestor may live in a pruned
+block, causing false negatives for that specific trace. This is acceptable for typical
+workloads where individual traces fit within a single internal block.
 
-**Edge case:** When all programs are nil (e.g. `{} >> {}`), every iteration of the
-`for i, prog := range programs` loop skips the nil program check and no
-fileLevelReject/fileLevelBloomReject is issued; the code falls through directly to
-`planner.Plan(nil, tr)`. Behavior is unchanged from before.
+**Negation-LHS programs** (`shouldRejectFileForProgram=false`) use `planBlocks(nil, tr, opts)`
+so time-range pruning still applies but no predicate pruning is attempted.
+
+**Why improvements to planBlocks propagate automatically:** Structural queries share the
+same block-selection code path as plain filter queries. Any new index type or pruning
+strategy added to `planBlocks` benefits structural queries without duplication.
+
+**File-level rejection safety:** Bloom filters have ~0.4% FPR. Accepted: same semantics as
+tempodb's existing bloom-based file selection.
+
+**Edge case:** When all programs are nil (e.g. `{} >> {}`), `planBlocks(nil, tr, opts)`
+is called for each program, selecting all blocks in the time range — identical to the
+pre-NOTE-091 behavior.
 
 Back-ref: `internal/modules/executor/stream_structural.go:collectAllStructuralSpans`
 
@@ -3253,7 +3261,8 @@ is a non-nil empty slice (zero blocks survive), return `nil, nil` to skip the fi
 
 - `nil` → no intrinsic section, no intrinsic predicates, or all blocks survive: no file rejection.
 - `[]int{}` (non-nil empty) → zero blocks survive → entire file rejected.
-- `[]int{i, j, ...}` (non-empty) → block-level subset: NOT used for structural queries (NOTE-091).
+- `[]int{i, j, ...}` (non-empty) → block-level subset: accumulated into the union across programs
+  and used for block-level union pruning after planning (see NOTE-091 updated 2026-05-06).
 
 **Safety — negation operators:** `shouldRejectFileForProgram(ops, i)` already gates the call.
 For the LHS of a negation op (!>>, !>, !~), absent LHS means all RHS spans qualify vacuously —
@@ -3402,3 +3411,91 @@ For N=1000 spans and B×N=50000 entries: ~16 searches vs ~16000 searches per col
 Back-ref: `internal/modules/executor/intrinsic_row_block.go`,
 `internal/modules/blockio/shared/intrinsic_ref_index.go:BlockRefRange`,
 `internal/modules/executor/stream_structural.go:collectBlockStructuralSpanRecs`
+
+## NOTE-101: rowIndexScratchPool — Per-Block Scratch Slice Pool for Log Hot Path
+*Added: 2026-05-15*
+**Decision:** Add `rowIndexScratchPool sync.Pool` of `*[]int` in stream_log_topk.go.
+`filterRowsByTimeRange` and `collectMixedTopK` (stream.go) use `acquireRowIndexScratch` /
+`releaseRowIndexScratch` to avoid per-block `make([]int, 0, N)` allocations.
+**Rationale:** pprof showed `filterRowsByTimeRange`'s `kept := make([]int, 0, len(rows))`
+and `collectMixedTopK`'s `qualifying := make([]int, 0, len(candidateRows))` are per-block
+allocations in every log query with a time range. The pool eliminates them.
+**Cap guard:** Pool items with `cap > 65536` are replaced on return with
+`make([]int, 0, 256)` to bound pool memory (~512 KiB max per pooled item, 65536 int64 elements × 8 bytes). Matches the
+pattern established by compositeKeyScratchPool (NOTE-071).
+**Lifetime invariant:** Scratch is released after the per-block closure returns and
+before the next block starts. It must not escape to callers.
+Back-ref: `internal/modules/executor/stream_log_topk.go:acquireRowIndexScratch`,
+`internal/modules/executor/stream.go:collectMixedTopK`
+
+## NOTE-102: blockColumnProviderPool — Pool for Per-Block Column Provider Struct
+*Added: 2026-05-15*
+**Decision:** Add `blockColumnProviderPool sync.Pool` of `*blockColumnProvider` in
+column_provider.go. `acquireBlockColumnProvider(block)` / `releaseBlockColumnProvider(p)`
+replace `newBlockColumnProvider(block)` at all call sites in the executor package.
+**Rationale:** pprof showed `newBlockColumnProvider` at 1.01% of allocs — one per block
+in all scan paths. The struct is trivial (single *Block pointer); the pool eliminates this.
+**GC safety invariant:** `p.block` is set to nil before returning to pool. This prevents
+the pool from retaining stale references to decoded block column data beyond the block's
+processing lifetime.
+**Lifetime invariant:** The provider is not used after the per-block closure returns.
+All ColumnPredicate calls complete before releaseBlockColumnProvider is called.
+**Migrated call sites:**
+- `internal/modules/executor/stream.go:scanBlocks`
+- `internal/modules/executor/stream.go:collectMixedPlain`
+- `internal/modules/executor/stream.go:collectMixedTopK`
+- `internal/modules/executor/stream_topk.go:topKScanBlocks`
+- `internal/modules/executor/stream_log_topk.go:logCollectAll`
+- `internal/modules/executor/metrics_trace.go`
+- `internal/modules/executor/metrics_log.go`
+- `internal/modules/executor/stream_structural.go`
+Back-ref: `internal/modules/executor/column_provider.go:acquireBlockColumnProvider`
+
+## NOTE-103: WantColumns cache on vm.Program — compile-time column set
+*Added: 2026-05-23*
+**Decision:** Add `WantColumns map[string]struct{}` field to `vm.Program`. Populated once at compile time by `program.ComputeWantColumns()` (called at the end of `CompileTraceQLFilter`, `CompileTraceQLFilterWithOptions`, the metrics compiler, `logqlparser.Compile`, and `logqlparser.CompileAll`). `ProgramWantColumns` returns this cached map directly when `len(extra) == 0`. When `len(extra) > 0`, `ProgramWantColumns` copies the cached set and merges extra — O(cached-set-size + extra) — rather than re-walking the predicate tree. `ProgramWantColumns` is called from 6 distinct locations across the executor package (computeColumnFilters, ExecuteLogMetrics, stream_log.go, stream_log_topk.go, metrics_trace.go, predicates.go:ComputeSecondPassCols).
+**Rationale:** `ProgramWantColumns` was called once per file and once per second-pass decode, walking the `RangeNode` tree and building a new `map[string]struct{}` each time. For 10 000 files per query, this was 10 000 map allocations + tree walks. Since `Program` is immutable after compilation, the column set never changes — caching it eliminates all per-file allocs on the hot path.
+**Immutability invariant:** `WantColumns` is written once at compile time and never modified after that. Callers must not mutate the returned map. When extra columns are needed (`len(extra) > 0`), `ProgramWantColumns` returns a fresh copy.
+**Legacy programs:** Programs constructed manually (e.g. in tests, or via the `compileMatchAllProgram` path) have `WantColumns == nil`. `ProgramWantColumns` still falls through to the tree-walk path, so behaviour is unchanged for those callers.
+**LogQL programs:** `logqlparser.Compile` and `logqlparser.CompileAll` also call `ComputeWantColumns()` so LogQL programs benefit from the same compile-time cache.
+Back-ref: `internal/vm/program.go:ComputeWantColumns`, `internal/modules/executor/predicates.go:ProgramWantColumns`
+
+## NOTE-104: filterRowSetByIntrinsicNodes wired to typed lookup — eliminates N map allocs per block
+*Added: 2026-05-23*
+**Decision:** Replace `lookupIntrinsicFields` / `rowSatisfiesIntrinsicNodes` with `lookupIntrinsicFieldsTyped` / `rowSatisfiesIntrinsicNodesTyped` in `filterRowSetByIntrinsicNodes`. Also replace `make([]BlockRef, len(rows))` with a stack-allocated `[64]modules_shared.BlockRef` backing array for the common case of ≤64 candidate rows.
+**Rationale:** `lookupIntrinsicFields` returned `[]map[string]any` — N heap-allocated maps for N candidate rows. `lookupIntrinsicFieldsTyped` (added in NOTE-081 for the structural hot path) returns `[]intrinsicRowFields`, a slice of value structs with no interior pointers. For a trace query with 100 candidate rows per block and 1000 blocks, this eliminates 100 000 map allocations. The stack pre-alloc for `refs` eliminates one `[]BlockRef` heap alloc per block for the typical small-row-set case (≤64 rows).
+**Stack pre-alloc invariant:** `refsArr` is stack-allocated and lives for the duration of `filterRowSetByIntrinsicNodes`. `lookupIntrinsicFieldsTyped` only reads `refs` during the call and does not retain the slice.
+**Consequence:** `filterRowSetByIntrinsicNodes` now uses the same typed path as the structural hot path. The typed variants were already validated against the structural path; no new test coverage is required.
+Back-ref: `internal/modules/executor/stream.go:filterRowSetByIntrinsicNodes`, `internal/modules/executor/intrinsic_row.go:lookupIntrinsicFieldsTyped`, `internal/modules/executor/predicates.go:rowSatisfiesIntrinsicNodesTyped`
+
+## NOTE-105: flat []int replaces map[int]int for blockToGroup in scan functions
+*Added: 2026-05-23*
+**Decision:** Replace `blockToGroup map[int]int` with `blockToGroupSlice []int` (indexed by block ID, sentinel -1 for absent) in `scanBlocks`, `topKScanBlocks`, and `iterateLogRows`.
+**Rationale:** Block IDs are bounded by `r.BlockCount()`, making a flat slice a valid O(1) replacement for the map. A map with capacity hint still allocates a hash table bucket array and carries per-entry overhead; a flat int slice does not. For typical files with <10 000 blocks the slice is ≤80 KiB. Eliminates one `map[int]int` alloc per file per query across all three scan paths.
+**Bounds invariant:** All block IDs written and read are guarded by `bi < blockCount` / `blockIdx < blockCount`. The planner guarantees block IDs are in `[0, blockCount)` by construction; the check is a safety net.
+**Consequence:** Memory for `blockToGroupSlice` is proportional to `r.BlockCount()`, not to `len(selectedBlocks)`. For very sparse selections this uses slightly more memory than the original map, but the allocation savings dominate in practice.
+Back-ref: `internal/modules/executor/stream.go:scanBlocks`, `internal/modules/executor/stream_topk.go:topKScanBlocks`, `internal/modules/executor/stream_log_topk.go:iterateLogRows`
+
+## NOTE-106: unsafe.String stack-buffer for logAccumulateRow composite key lookup
+*Added: 2026-05-23*
+**Decision:** In `logAccumulateRow`, build the composite bucket key (`bucketIdx + "\x00" + attrVals joined by "\x00"`) into a 512-byte stack-local `[512]byte` array and use `unsafe.String(&buf[0], n)` for the map lookup. On insert (cache miss), `string(buf[:n])` copies to the heap. Falls back to the original string-concatenation path when `n > 400` bytes. The bucket index integer is written via `strconv.AppendInt(buf[:0], bucketIdx, 10)` — appending directly into the stack buffer with no intermediate heap allocation.
+**Rationale:** The original path called `strconv.FormatInt` (heap), `strings.Join` (heap), and `+` concatenation (heap) — 2–3 string allocations per row even when the bucket already exists. For a log metrics query over a high-cardinality file with 10 000 matching rows, this eliminated ~20 000–30 000 string allocations in the lookup-hit common case. Using `strconv.AppendInt(buf[:0], ...)` instead of `strconv.AppendInt(nil, ...)` + copy eliminates the one remaining intermediate heap allocation.
+**unsafe.String lifetime contract:** `lookupKey` is valid only for the duration of `logAccumulateRow`. It is used solely in the `buckets[lookupKey]` map lookup before the function returns. It is never stored in a map, returned to callers, or passed to a goroutine. The `buf` array is stack-allocated and outlives `lookupKey`. This satisfies the `unsafe.String` requirement that the pointer remain valid for the string's lifetime.
+**Fallback threshold (n > 400):** Keys longer than 400 bytes indicate very long label values. Rather than truncating silently (which would produce wrong bucket keys), the code falls back to the original heap path. 400 bytes is conservative — typical keys are <100 bytes.
+Back-ref: `internal/modules/executor/metrics_log.go:logAccumulateRow`
+
+## NOTE-107: scratch []int on blockColumnProvider — borrowed rowSet backing for Scan* methods
+*Added: 2026-05-23*
+**Decision:** Add `scratch []int` and `scratchInUse bool` fields to `blockColumnProvider`. `collectStreamInto` (a new method replacing the former `collectStream` free function in all 14 `Scan*` methods) reuses `p.scratch` for the first Scan* call within a `ColumnPredicate` evaluation, avoiding one `*rowSet` struct alloc and one `[]int` backing-slice alloc. Subsequent Scan* calls within the same `ColumnPredicate` evaluation (compound AND/OR predicates) detect `scratchInUse=true` and fall back to heap allocation to avoid clobbering the first result. `releaseBlockColumnProvider` resets both `scratch` (length to 0, capacity retained) and `scratchInUse`.
+**Rationale:** pprof showed `newRowSetWithCap` contributing allocs in every Scan* path. For single-predicate queries (the common case), the scratch eliminates one `[]int` alloc per block. For compound predicates only the first scan reuses scratch; the rest fall back to heap — still a net improvement. The `blockColumnProviderPool` is bounded by `defaultPipelineWorkers` (a fixed constant, not block count or file count), so scratch growth is O(workers), not O(blocks). Pool `New` pre-allocates `make([]int, 0, 256)` to avoid first-use alloc.
+**Lifetime invariant:** The rowSet returned by the first `collectStreamInto` call borrows `p.scratch` as its backing array. `releaseBlockColumnProvider(p)` must be called AFTER all reads of the rowSet are complete (`rowSet.Size()`, `rowSet.ToSlice()`, `rowSet.Contains()`). Releasing early and re-acquiring the same pooled provider (from any goroutine) would reset `p.scratch[:0]` and overwrite the backing array the rowSet still references. All call sites follow the pattern: acquire → ColumnPredicate → consume rowSet fully → release.
+**Call-site audit (all callers confirmed safe):**
+- `stream.go:scanBlocks` — release after `rowSet.ToSlice()` at the final consumer point. SAFE.
+- `stream.go:collectMixedPlain` — provider shared between preFn and fn; released at end of fn after `mixedPlainRowSet.Contains()`. When preFn returns false (Size()==0), fn is skipped and provider is released in preFn. SAFE.
+- `stream.go:collectMixedTopK` — same preFn/fn pattern as collectMixedPlain. SAFE.
+- `stream_topk.go:topKScanBlocks` — release after `rowSet.ToSlice()` at lines 242/244. SAFE.
+- `stream_log_topk.go:iterateLogRows` — release after `processLogRows` returns. `rowSet.ToSlice()` may be backed by `cp.scratch`; releasing earlier would let a concurrent pool user clobber the backing array (which is also aliased by `keptByTime` when the time-range filter is a no-op). SAFE.
+- `metrics_log.go` — release after `rowSet.ToSlice()` loop completes. SAFE.
+- `metrics_trace.go` — release after `rowSet.ToSlice()` loop completes. SAFE.
+- `stream_structural.go:processBlock` — release after the row loop that calls `computeNodeMatchForRow` (which reads sets[i].Contains()). SAFE.
+Back-ref: `internal/modules/executor/column_provider.go:collectStreamInto`

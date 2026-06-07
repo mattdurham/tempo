@@ -20,60 +20,46 @@ package queryplanner
 import (
 	"cmp"
 	"slices"
-
-	"github.com/grafana/blockpack/internal/modules/blockio/shared"
 )
 
 // BlockIndexer is the interface queryplanner requires from its storage backend.
 // reader.Reader satisfies this interface; any alternative backend may also implement it.
-type BlockIndexer interface {
-	// BlockCount returns the total number of blocks in the file.
-	BlockCount() int
 
-	// BlockMeta returns the metadata for the block at blockIdx.
-	// Called for every candidate block during bloom-filter pruning.
-	BlockMeta(blockIdx int) shared.BlockMeta
+// BlockCount returns the total number of blocks in the file.
 
-	// ReadBlocks reads raw bytes for the given block indices using aggressive
-	// coalescing. Returns a map from block index to raw byte slice.
-	ReadBlocks(blockIndices []int) (map[int][]byte, error)
+// BlockMeta returns the metadata for the block at blockIdx.
+// Called for every candidate block during bloom-filter pruning.
 
-	// RangeColumnType returns the ColumnType for a range-indexed column, if indexed.
-	// Returns (0, false) when the column has no range index.
-	RangeColumnType(col string) (shared.ColumnType, bool)
+// ReadBlocks reads raw bytes for the given block indices using aggressive
+// coalescing. Returns a map from block index to raw byte slice.
 
-	// BlocksForRange returns the sorted block indices that may contain the
-	// given query value for the named column. queryValue must be wire-encoded
-	// (8-byte LE for numeric types, raw string for string/bytes).
-	// Returns nil (no error) when the value is below all stored lower boundaries.
-	BlocksForRange(col string, queryValue shared.RangeValueKey) ([]int, error)
+// RangeColumnType returns the ColumnType for a range-indexed column, if indexed.
+// Returns (0, false) when the column has no range index.
 
-	// BlocksForRangeInterval returns block indices from all buckets whose lower
-	// boundary falls within [minKey, maxKey]. This is useful for case-insensitive
-	// prefix lookups where the query spans a range of lexicographic values
-	// (e.g., "DEBUG" to "debug"). Returns nil when no buckets overlap the interval.
-	BlocksForRangeInterval(col string, minKey, maxKey shared.RangeValueKey) ([]int, error)
+// BlocksForRange returns the sorted block indices that may contain the
+// given query value for the named column. queryValue must be wire-encoded
+// (8-byte LE for numeric types, raw string for string/bytes).
+// Returns nil (no error) when the value is below all stored lower boundaries.
 
-	// BlocksInTimeRange returns block indices whose timestamp window overlaps
-	// [minNano, maxNano] using the per-file TS index (O(log n) binary search).
-	// Returns nil when the TS index is absent (old files); callers must fall back
-	// to a full BlockMeta scan in that case.
-	// The returned slice is sorted in ascending blockID order.
-	BlocksInTimeRange(minNano, maxNano uint64) []int
+// BlocksForRangeInterval returns block indices from all buckets whose lower
+// boundary falls within [minKey, maxKey]. This is useful for case-insensitive
+// prefix lookups where the query spans a range of lexicographic values
+// (e.g., "DEBUG" to "debug"). Returns nil when no buckets overlap the interval.
 
-	// ColumnSketch returns bulk per-block sketch data for the named column.
-	// Returns nil when no sketch data is available (old files or column not sketched).
-	// The returned ColumnSketch has methods returning slices indexed by block number.
-	ColumnSketch(col string) ColumnSketch
-}
+// BlocksInTimeRange returns block indices whose timestamp window overlaps
+// [minNano, maxNano] using the per-file TS index (O(log n) binary search).
+// Returns nil when the TS index is absent (old files); callers must fall back
+// to a full BlockMeta scan in that case.
+// The returned slice is sorted in ascending blockID order.
+
+// ColumnSketch returns bulk per-block sketch data for the named column.
+// Returns nil when no sketch data is available (old files or column not sketched).
+// The returned ColumnSketch has methods returning slices indexed by block number.
 
 // SketchEvictor is an optional interface that a BlockIndexer may implement.
 // When Plan() determines that all blocks in a file have been pruned, it calls
 // EvictSketch() to release the sketch section from the process-level cache,
 // preventing unbounded memory growth during wide time-range queries.
-type SketchEvictor interface {
-	EvictSketch()
-}
 
 // LogicalOp specifies the boolean operator used to combine a Predicate's children.
 type LogicalOp uint8
@@ -129,44 +115,36 @@ const (
 //	    {Op: LogicalOR, Children: []Predicate{{Columns: ["A"]}, {Columns: ["B"]}}},
 //	    {Op: LogicalOR, Children: []Predicate{{Columns: ["C"]}, {Columns: ["D"]}}},
 //	}
-type Predicate struct {
-	// Columns holds one or more column names combined with OR for bloom pruning.
-	// Used only in leaf nodes (len(Children) == 0). An empty slice is a no-op.
-	Columns []string
 
-	// Values holds wire-encoded query values for range index lookup.
-	// Used only in leaf nodes. When non-empty and Columns has exactly one entry,
-	// the planner unions BlocksForRange results for each value.
-	Values []string
+// Columns holds one or more column names combined with OR for bloom pruning.
+// Used only in leaf nodes (len(Children) == 0). An empty slice is a no-op.
 
-	// Children makes this a composite node. When non-empty, Columns/Values/ColType/
-	// IntervalMatch are ignored and Op controls how the children's block sets combine.
-	Children []Predicate
+// Values holds wire-encoded query values for range index lookup.
+// Used only in leaf nodes. When non-empty and Columns has exactly one entry,
+// the planner unions BlocksForRange results for each value.
 
-	// ColType is informational: callers use it when wire-encoding Values before passing
-	// them in. The planner does not inspect ColType internally — it calls RangeColumnType
-	// to determine the indexed type. Used only in leaf nodes when Values is non-empty.
-	ColType shared.ColumnType
+// Children makes this a composite node. When non-empty, Columns/Values/ColType/
+// IntervalMatch are ignored and Op controls how the children's block sets combine.
 
-	// IntervalMatch changes how Values is interpreted for range-index pruning.
-	// When false (default), Values are individual point lookups unioned together.
-	// When true, Values must have exactly 2 elements: Values[0] is the min key and
-	// Values[1] is the max key. All buckets whose lower boundary falls within
-	// [min, max] are included.
-	IntervalMatch bool
+// ColType is informational: callers use it when wire-encoding Values before passing
+// them in. The planner does not inspect ColType internally — it calls RangeColumnType
+// to determine the indexed type. Used only in leaf nodes when Values is non-empty.
 
-	// Op specifies how Children are combined. Ignored when len(Children) == 0.
-	// LogicalAND (default): block must satisfy all children.
-	// LogicalOR: block must satisfy at least one child.
-	Op LogicalOp
-}
+// IntervalMatch changes how Values is interpreted for range-index pruning.
+// When false (default), Values are individual point lookups unioned together.
+// When true, Values must have exactly 2 elements: Values[0] is the min key and
+// Values[1] is the max key. All buckets whose lower boundary falls within
+// [min, max] are included.
+
+// Op specifies how Children are combined. Ignored when len(Children) == 0.
+// LogicalAND (default): block must satisfy all children.
+// LogicalOR: block must satisfy at least one child.
 
 // TimeRange is an optional time window for block-level pruning.
 // A zero-value TimeRange (both fields 0) disables time-range pruning.
-type TimeRange struct {
-	MinNano uint64 // inclusive lower bound (Unix nanoseconds); 0 means no lower bound
-	MaxNano uint64 // inclusive upper bound (Unix nanoseconds); 0 means no upper bound
-}
+
+// inclusive lower bound (Unix nanoseconds); 0 means no lower bound
+// inclusive upper bound (Unix nanoseconds); 0 means no upper bound
 
 // Direction controls the order of blocks in Plan.SelectedBlocks.
 type Direction uint8
@@ -180,52 +158,54 @@ const (
 
 // PlanOptions are additional planning parameters that do not affect block selection
 // but do affect block ordering and the Limit hint stored in the plan.
-type PlanOptions struct {
-	// Direction controls block ordering in SelectedBlocks. Default (zero) is Forward.
-	Direction Direction
-	// Limit is an informational hint for the executor: stop after collecting this many
-	// results. 0 means no limit. Stored in Plan.Limit; the executor uses it for early
-	// termination when iterating SelectedBlocks in the plan's direction.
-	Limit int
-}
+
+// Limit is an informational hint for the executor: stop after collecting this many
+// results. 0 means no limit. Stored in Plan.Limit; the executor uses it for early
+// termination when iterating SelectedBlocks in the plan's direction.
+
+// Direction controls block ordering in SelectedBlocks. Default (zero) is Forward.
+
+// EnableExplain controls whether Plan.Explain is populated.
+// When false (the default), explainPlan is skipped entirely — no strings.Builder,
+// fmt.Sprintf, or slice allocations are incurred.
+// Set to true in debug/observability contexts where the explain output is consumed.
+//
+// NOTE-020: explain is opt-in to eliminate ~63% of queryplanner allocs in production.
 
 // Plan is the output of a planning step: the block indices to read.
-type Plan struct {
-	// BlockScores holds the per-block selectivity score (freq/max(cardinality,1)).
-	// Higher scores mean more selective (fewer distinct values = more useful for pruning).
-	// Only populated when sketch data is available.
-	BlockScores map[int]float64
 
-	// Explain is an ASCII trace of how the predicate tree resolved to block sets.
-	// Always populated when predicates are present. Example:
-	//   (resource.service.name=[0,1,2] || span.service.name=nil) => [0,1,2]
-	//   AND resource.env=[1,2,3]
-	//   => [1,2]
-	Explain string
+// BlockScores holds the per-block selectivity score (freq/max(cardinality,1)).
+// Indexed by block index; score 0.0 means the block was not scored or has no data.
+// Length == TotalBlocks when populated; nil when no sketch data is available.
+// NOTE-023: []float64 replaces map[int]float64 — direct index access, 2 fewer allocs/op.
 
-	// SelectedBlocks is a sorted slice of block indices to fetch.
-	SelectedBlocks []int
+// Explain is an ASCII trace of how the predicate tree resolved to block sets.
+// Empty by default. Populated only when PlanOptions.EnableExplain is true.
+// File-level reject strings (set in plan_blocks.go) are always populated
+// regardless of EnableExplain. See NOTE-020.
+//
+// BEHAVIOR CHANGE (NOTE-020): prior to this opt-in flag, Explain was always
+// populated. Callers using Plan() or PlanWithOptions({}) without EnableExplain:true
+// will now receive "". Production callers in stream.go and stream_log_topk.go store
+// plan.Explain in QueryStats metadata — receiving "" is acceptable there (the field
+// is informational). Pass EnableExplain:true in debug or observability contexts
+// where the explain string is actually consumed.
 
-	// TotalBlocks is the total number of blocks in the file.
-	TotalBlocks int
+// SelectedBlocks is a sorted slice of block indices to fetch.
 
-	// PrunedByIndex is the number of blocks eliminated by range index lookups.
-	PrunedByIndex int
+// TotalBlocks is the total number of blocks in the file.
 
-	// PrunedByTime is the number of blocks eliminated by time-range comparison.
-	PrunedByTime int
+// PrunedByIndex is the number of blocks eliminated by range index lookups.
 
-	// PrunedByFuse is the number of blocks eliminated by BinaryFuse8 membership checks.
-	PrunedByFuse int
+// PrunedByTime is the number of blocks eliminated by time-range comparison.
 
-	// Limit is the early-termination hint passed via PlanOptions.
-	// 0 means no limit (all selected blocks should be scanned).
-	Limit int
+// PrunedByFuse is the number of blocks eliminated by BinaryFuse8 membership checks.
 
-	// Direction is the ordering applied to SelectedBlocks (Forward or Backward).
-	// Set by PlanWithOptions; always Forward when Plan() is called directly.
-	Direction Direction
-}
+// Limit is the early-termination hint passed via PlanOptions.
+// 0 means no limit (all selected blocks should be scanned).
+
+// Direction is the ordering applied to SelectedBlocks (Forward or Backward).
+// Set by PlanWithOptions; always Forward when Plan() is called directly.
 
 // Planner selects candidate blocks for a query.
 // It never performs I/O itself; I/O is delegated to the BlockIndexer via FetchBlocks.
@@ -247,7 +227,35 @@ func NewPlanner(r BlockIndexer) *Planner {
 // if all of its columns are definitely absent. When Values is non-empty, a range
 // index lookup further narrows the candidates. Multiple predicates are ANDed:
 // a block must survive every predicate. With no predicates, all blocks are selected.
+//
+// Plan always produces Plan.Explain == "". Use PlanWithOptions with EnableExplain: true
+// to populate the explain string. NOTE-020.
 func (p *Planner) Plan(predicates []Predicate, timeRange TimeRange) *Plan {
+	return p.planInternal(predicates, timeRange, false)
+}
+
+// PlanWithOptions is like Plan but accepts PlanOptions to control block ordering,
+// Limit hint, and whether to populate Plan.Explain. NOTE-020.
+//
+// When opts.Direction == Backward, SelectedBlocks is reversed in-place (descending order).
+// The executor iterates SelectedBlocks sequentially; reversing here gives newest-first
+// block traversal at zero additional cost.
+func (p *Planner) PlanWithOptions(predicates []Predicate, timeRange TimeRange, opts PlanOptions) *Plan {
+	plan := p.planInternal(predicates, timeRange, opts.EnableExplain)
+	plan.Direction = opts.Direction
+	plan.Limit = opts.Limit
+	if opts.Direction == Backward {
+		for i, j := 0, len(plan.SelectedBlocks)-1; i < j; i, j = i+1, j-1 {
+			plan.SelectedBlocks[i], plan.SelectedBlocks[j] = plan.SelectedBlocks[j], plan.SelectedBlocks[i]
+		}
+	}
+	return plan
+}
+
+// planInternal is the core planning implementation. Both Plan and PlanWithOptions delegate here.
+// enableExplain gates all explain allocations (strings.Builder, fmt.Sprintf, slices).
+// Direction, Limit, and other PlanOptions fields are applied by PlanWithOptions after this returns.
+func (p *Planner) planInternal(predicates []Predicate, timeRange TimeRange, enableExplain bool) *Plan {
 	total := p.r.BlockCount()
 	plan := &Plan{TotalBlocks: total}
 
@@ -294,9 +302,10 @@ func (p *Planner) Plan(predicates []Predicate, timeRange TimeRange) *Plan {
 		}
 	}
 
-	// Snapshot time-surviving blocks for explain output.
+	// Snapshot time-surviving blocks for explain output (only when explain is enabled).
+	// NOTE-020: skip this allocation when enableExplain is false.
 	var timeBlocks []int
-	if plan.PrunedByTime > 0 {
+	if enableExplain && plan.PrunedByTime > 0 {
 		timeBlocks = make([]int, 0, candidates.count())
 		candidates.iter(func(b int) {
 			timeBlocks = append(timeBlocks, b)
@@ -306,12 +315,16 @@ func (p *Planner) Plan(predicates []Predicate, timeRange TimeRange) *Plan {
 
 	if len(predicates) == 0 {
 		plan.SelectedBlocks = setToSortedByScore(candidates, p.r, nil)
-		explainPlan(p.r, predicates, plan, timeBlocks)
+		if enableExplain {
+			explainPlan(p.r, predicates, plan, timeBlocks)
+		}
 		return plan
 	}
 
 	// Stage 1: Range index pruning — recursive tree evaluation, top-level predicates AND-combined.
-	pruned, err := pruneByIndexAll(p.r, candidates, predicates)
+	// Pass total (the actual block count from BlockIndexer.BlockCount()) rather than
+	// candidates.numBlocks() (which returns len*64 — bitset capacity, not block count).
+	pruned, err := pruneByIndexAll(p.r, candidates, predicates, total)
 	if err == nil {
 		plan.PrunedByIndex += pruned
 	}
@@ -327,33 +340,19 @@ func (p *Planner) Plan(predicates []Predicate, timeRange TimeRange) *Plan {
 			ev.EvictSketch()
 		}
 		plan.SelectedBlocks = nil
-		explainPlan(p.r, predicates, plan, timeBlocks)
+		if enableExplain {
+			explainPlan(p.r, predicates, plan, timeBlocks)
+		}
 		return plan
 	}
 
 	// Stage 3: Score remaining blocks for selectivity (freq/max(cardinality,1)).
 	// NOTE-014: Higher score = fewer distinct values relative to query frequency.
-	plan.BlockScores = scoreBlocks(p.r, candidates, predicates)
+	plan.BlockScores = scoreBlocks(p.r, candidates, predicates, total)
 
 	plan.SelectedBlocks = setToSortedByScore(candidates, p.r, plan.BlockScores)
-	explainPlan(p.r, predicates, plan, timeBlocks)
-	return plan
-}
-
-// PlanWithOptions is like Plan but accepts PlanOptions to control block ordering and
-// stores a Limit hint in the returned Plan.
-//
-// When opts.Direction == Backward, SelectedBlocks is reversed in-place (descending order).
-// The executor iterates SelectedBlocks sequentially; reversing here gives newest-first
-// block traversal at zero additional cost.
-func (p *Planner) PlanWithOptions(predicates []Predicate, timeRange TimeRange, opts PlanOptions) *Plan {
-	plan := p.Plan(predicates, timeRange)
-	plan.Direction = opts.Direction
-	plan.Limit = opts.Limit
-	if opts.Direction == Backward {
-		for i, j := 0, len(plan.SelectedBlocks)-1; i < j; i, j = i+1, j-1 {
-			plan.SelectedBlocks[i], plan.SelectedBlocks[j] = plan.SelectedBlocks[j], plan.SelectedBlocks[i]
-		}
+	if enableExplain {
+		explainPlan(p.r, predicates, plan, timeBlocks)
 	}
 	return plan
 }
@@ -371,7 +370,7 @@ func (p *Planner) FetchBlocks(plan *Plan) (map[int][]byte, error) {
 // This improves early termination for limited queries: the executor is more likely to
 // find matches in the first few blocks.
 // Block index is used as a final tiebreaker for stable ordering.
-func setToSortedByScore(s blockSet, r BlockIndexer, scores map[int]float64) []int {
+func setToSortedByScore(s blockSet, r BlockIndexer, scores []float64) []int {
 	out := make([]int, 0, s.count())
 	s.iter(func(k int) {
 		out = append(out, k)
@@ -383,8 +382,15 @@ func setToSortedByScore(s blockSet, r BlockIndexer, scores map[int]float64) []in
 			return n
 		}
 		// Secondary: higher score first (descending).
+		// NOTE-023: direct slice index; block indices are bounded by len(scores) == blockCount.
 		if len(scores) > 0 {
-			sa, sb := scores[a], scores[b]
+			var sa, sb float64
+			if a < len(scores) {
+				sa = scores[a]
+			}
+			if b < len(scores) {
+				sb = scores[b]
+			}
 			if n := cmp.Compare(sb, sa); n != 0 { // note: sb before sa for descending
 				return n
 			}

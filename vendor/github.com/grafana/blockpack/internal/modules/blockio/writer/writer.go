@@ -4,7 +4,6 @@ package writer
 
 import (
 	"fmt"
-	"io"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -114,10 +113,6 @@ type Writer struct {
 // countingWriter wraps io.Writer and tracks total bytes written.
 // This is needed because io.Writer has no built-in byte count; Flush() returns
 // the total bytes written as its first return value.
-type countingWriter struct {
-	w     io.Writer
-	total int64
-}
 
 func (cw *countingWriter) Write(p []byte) (int, error) {
 	n, err := cw.w.Write(p)
@@ -482,10 +477,6 @@ func (w *Writer) Flush() (int64, error) {
 
 	// Reset intrinsic accumulator for reuse.
 	w.intrinsicAccum = newIntrinsicAccumulator()
-
-	// Clear addRowIntrinsicCache to release *reader.Reader pointers pinned as map keys.
-	// Without this, every Reader used via AddRowFromReader survives across Flush cycles.
-	w.addRowIntrinsicCache = nil
 
 	// Reset file-level bloom service names.
 	for k := range w.fileBloomSvcNames {
@@ -920,10 +911,6 @@ func (w *Writer) AddRow(block *reader.Block, rowIdx int) error {
 
 // addRowCacheKey identifies a unique (reader, blockIdx) pair for the AddRowFromReader
 // per-block intrinsic index cache.
-type addRowCacheKey struct {
-	r        *reader.Reader
-	blockIdx int
-}
 
 // AddRowFromReader adds one row from the source block at rowIdx, reading required
 // identity fields (trace:id, span:id, span:start) from the source reader's intrinsic
@@ -957,8 +944,10 @@ func (w *Writer) AddRowFromReader(block *reader.Block, rowIdx int, srcReader *re
 	}
 	if len(traceBytes) != 16 && srcReader != nil {
 		idx := w.getOrBuildAddRowIndex(srcReader, srcBlockIdx)
-		if idx != nil && rowIdx < idx.rowCount && idx.traceID != nil {
-			traceBytes = idx.traceID[rowIdx]
+		if idx != nil {
+			if v, ok := idx[uint16(rowIdx)]["trace:id"]; ok { //nolint:gosec // rowIdx bounded by SpanCount (≤65535)
+				traceBytes, _ = v.([]byte)
+			}
 		}
 	}
 	if len(traceBytes) != 16 {
@@ -975,8 +964,10 @@ func (w *Writer) AddRowFromReader(block *reader.Block, rowIdx int, srcReader *re
 	}
 	if svcName == "" && srcReader != nil {
 		idx := w.getOrBuildAddRowIndex(srcReader, srcBlockIdx)
-		if idx != nil && rowIdx < idx.rowCount && idx.svcName != nil {
-			svcName = idx.svcName[rowIdx]
+		if idx != nil {
+			if v, ok := idx[uint16(rowIdx)][svcNameColumnName]; ok { //nolint:gosec // rowIdx bounded by SpanCount (≤65535)
+				svcName, _ = v.(string)
+			}
 		}
 	}
 

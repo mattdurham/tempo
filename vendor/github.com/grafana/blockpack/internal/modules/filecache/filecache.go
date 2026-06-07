@@ -36,29 +36,21 @@ const (
 )
 
 // Config configures the file cache.
-type Config struct {
-	// Registerer is an optional Prometheus registerer.
-	// When non-nil, cache metrics are registered and incremented.
-	Registerer prometheus.Registerer
-	// Path is the directory that will hold the cache files.
-	Path string
 
-	// MaxBytes is the maximum total logical payload bytes (sum of key+value sizes).
-	// When exceeded, the oldest entries are evicted until under the limit.
-	MaxBytes int64
+// Registerer is an optional Prometheus registerer.
+// When non-nil, cache metrics are registered and incremented.
 
-	// Enabled controls whether the cache is active.
-	// If false, Open returns (nil, nil) and all cache operations are no-ops.
-	Enabled bool
-}
+// Path is the directory that will hold the cache files.
+
+// MaxBytes is the maximum total logical payload bytes (sum of key+value sizes).
+// When exceeded, the oldest entries are evicted until under the limit.
+
+// Enabled controls whether the cache is active.
+// If false, Open returns (nil, nil) and all cache operations are no-ops.
 
 // entry is one in-memory record for a cached file.
-type entry struct {
-	filename string
-	key      string
-	order    uint64
-	size     int64 // len(key) + len(value)
-}
+
+// len(key) + len(value)
 
 // FileCache is a disk-backed, size-bounded byte cache.
 // It is safe for concurrent use across any number of goroutines.
@@ -188,12 +180,8 @@ func filecacheRegisterOrReuseHistogram(
 
 // loadCandidate is a transient struct used during load to collect entries before
 // assigning monotonic order counters.
-type loadCandidate struct {
-	path  string
-	key   string
-	size  int64
-	mtime int64 // UnixNano; used only for sorting
-}
+
+// UnixNano; used only for sorting
 
 // load scans dir and rebuilds the in-memory index from existing cache files.
 // FIFO ordering after restart is approximated by file mtime: entries are

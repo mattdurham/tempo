@@ -15,16 +15,9 @@
 //	sum by (label) (count_over_time(...))
 package logqlparser
 
-import "time"
-
 // LogSelector is the root AST node for a LogQL filter query.
 // It contains label matchers, an optional chain of line filters,
 // and an optional pipeline of post-filter stages.
-type LogSelector struct {
-	Matchers    []LabelMatcher
-	LineFilters []LineFilter
-	Pipeline    []PipelineStage
-}
 
 // MatchType identifies the type of label match operation.
 type MatchType int
@@ -38,11 +31,6 @@ const (
 )
 
 // LabelMatcher matches a single label against a value or regex pattern.
-type LabelMatcher struct {
-	Name  string
-	Value string
-	Type  MatchType
-}
 
 // FilterType identifies the type of line filter operation.
 type FilterType int
@@ -56,10 +44,6 @@ const (
 )
 
 // LineFilter filters log lines by substring match or regex.
-type LineFilter struct {
-	Pattern string
-	Type    FilterType
-}
 
 // PipelineStageType identifies the kind of pipeline stage.
 type PipelineStageType int
@@ -82,12 +66,6 @@ const (
 // OrFilters holds additional label filters combined with OR logic (e.g.,
 // | level="error" or level="warn"). The primary LabelFilter is the first
 // condition; OrFilters are alternatives that also satisfy the stage.
-type PipelineStage struct {
-	LabelFilter *LabelFilter
-	OrFilters   []*LabelFilter
-	Params      []string
-	Type        PipelineStageType
-}
 
 // FilterOp identifies the comparison operator used in label filter stages.
 type FilterOp int
@@ -105,39 +83,31 @@ const (
 )
 
 // LabelFilter is the predicate for a StageLabelFilter pipeline stage.
-type LabelFilter struct {
-	Name  string   // label name to test
-	Value string   // comparison value or regex pattern
-	Op    FilterOp // comparison operation
-}
+
+// label name to test
+// comparison value or regex pattern
+// comparison operation
 
 // MetricExpr represents a LogQL range-vector metric expression such as
 // count_over_time({selector} | pipeline [5m]).
-type MetricExpr struct {
-	Selector      *LogSelector    // the inner log selector
-	Function      string          // count_over_time, rate, bytes_rate, bytes_over_time, sum_over_time, etc.
-	Unwrap        string          // optional | unwrap field name (empty if not present)
-	Pipeline      []PipelineStage // optional pipeline stages before the range
-	RangeDuration time.Duration   // range interval (e.g., [5m])
-}
+
+// the inner log selector
+// count_over_time, rate, bytes_rate, bytes_over_time, sum_over_time, etc.
+// optional | unwrap field name (empty if not present)
+// optional pipeline stages before the range
+// range interval (e.g., [5m])
 
 // VectorAggExpr represents a LogQL vector aggregation over a metric expression,
 // such as sum by (label) (count_over_time(...)).
-type VectorAggExpr struct {
-	Inner   *MetricExpr // the inner metric expression
-	Op      string      // sum, avg, min, max, topk, bottomk
-	GroupBy []string    // labels to group by (from "by (l1, l2)")
-	Without []string    // labels to exclude (from "without (l1, l2)")
-	Param   int         // k value for topk/bottomk; 0 otherwise
-}
+
+// the inner metric expression
+// sum, avg, min, max, topk, bottomk
+// labels to group by (from "by (l1, l2)")
+// labels to exclude (from "without (l1, l2)")
+// k value for topk/bottomk; 0 otherwise
 
 // LogQuery is the top-level union type representing any parsed LogQL query.
 // Exactly one of Selector, Metric, or VectorAgg is non-nil.
 //   - Selector: a plain log stream query (filter + pipeline)
 //   - Metric: a range-vector metric expression
 //   - VectorAgg: a vector aggregation over a metric expression
-type LogQuery struct {
-	Selector  *LogSelector
-	Metric    *MetricExpr
-	VectorAgg *VectorAggExpr
-}

@@ -7,9 +7,9 @@ import (
 	"math"
 	"slices"
 	"strconv"
+	"unsafe"
 
 	commonv1 "go.opentelemetry.io/proto/otlp/common/v1"
-	logsv1 "go.opentelemetry.io/proto/otlp/logs/v1"
 
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
 )
@@ -20,48 +20,28 @@ import (
 //
 // Size: ~88 bytes (3 pointer fields + sort keys).
 // The proto fields are kept alive by w.logProtoRoots for the duration of the flush cycle.
-type pendingLogRecord struct {
-	rl         *logsv1.ResourceLogs // proto pointer; kept alive by w.logProtoRoots
-	sl         *logsv1.ScopeLogs    // proto pointer; kept alive by w.logProtoRoots
-	record     *logsv1.LogRecord    // proto pointer; kept alive by w.logProtoRoots
-	svcName    string               // sort key (primary); zero-copy reference into proto
-	minHashSig [4]uint64            // sort key (secondary)
-	timestamp  uint64               // sort key (tertiary): TimeUnixNano
-}
+
+// proto pointer; kept alive by w.logProtoRoots
+// proto pointer; kept alive by w.logProtoRoots
+// proto pointer; kept alive by w.logProtoRoots
+// sort key (primary); zero-copy reference into proto
+// sort key (secondary)
+// sort key (tertiary): TimeUnixNano
 
 // logBlockBuilder manages construction of a single log block.
 // Mirrors blockBuilder but with log-specific intrinsic columns and no traceRows map.
-type logBlockBuilder struct {
-	// Intrinsic column builders (log-specific, pre-created for O(1) write).
-	colTimestamp         *uint64ColumnBuilder
-	colObservedTimestamp *uint64ColumnBuilder
-	colBody              *stringColumnBuilder
-	colSeverityNumber    *int64ColumnBuilder
-	colSeverityText      *stringColumnBuilder
-	colTraceID           *bytesColumnBuilder
-	colSpanID            *bytesColumnBuilder
-	colFlags             *uint64ColumnBuilder
 
-	columns          map[shared.ColumnKey]columnBuilder
-	logColNames      map[string]string // log attribute key → "log.{key}" (cache)
-	resourceColNames map[string]string // resource attribute key → "resource.{key}" (cache)
-	scopeColNames    map[string]string // scope attribute key → "scope.{key}" (cache)
+// Intrinsic column builders (log-specific, pre-created for O(1) write).
 
-	colMinMax        map[string]*blockColMinMax
-	colNumericMinMax map[string]*blockColMinMax // int64-encoded min/max for all-numeric string cols
-	colFloatMinMax   map[string]*blockColMinMax // float64-encoded min/max for all-float string cols
-	colNonNumeric    map[string]bool            // true if any non-empty value failed int64 parse
-	colNonFloat      map[string]bool            // true if any non-empty value failed float64 parse
-	// colSketches accumulates HLL, TopK, and fuse keys per column for this log block.
-	colSketches blockSketchSet
+// log attribute key → "log.{key}" (cache)
+// resource attribute key → "resource.{key}" (cache)
+// scope attribute key → "scope.{key}" (cache)
 
-	sparseColumns []columnBuilder
-
-	recordCount int
-	recordHint  int
-	minStart    uint64
-	maxStart    uint64
-}
+// int64-encoded min/max for all-numeric string cols
+// float64-encoded min/max for all-float string cols
+// true if any non-empty value failed int64 parse
+// true if any non-empty value failed float64 parse
+// colSketches accumulates HLL, TopK, and fuse keys per column for this log block.
 
 // newLogBlockBuilder creates an empty log block builder.
 // recordHint is the expected number of log records; used to pre-allocate slices.
@@ -224,6 +204,52 @@ func (b *logBlockBuilder) updateLogMinMax(name string, typ shared.ColumnType, ke
 	b.colSketches.add(name, key)
 }
 
+// updateLogMinMaxNum updates the per-block min/max for a numeric log column using
+// an [8]byte LE-encoded key, avoiding the string([]byte) allocation per log record.
+func (b *logBlockBuilder) updateLogMinMaxNum(name string, typ shared.ColumnType, key [8]byte) {
+	if mm, ok := b.colMinMax[name]; ok {
+		if numKeyLess(typ, key, mm.numMinKey) {
+			mm.numMinKey = key
+		}
+		if numKeyLess(typ, mm.numMaxKey, key) {
+			mm.numMaxKey = key
+		}
+	} else {
+		b.colMinMax[name] = &blockColMinMax{
+			colName:   name,
+			numMinKey: key,
+			numMaxKey: key,
+			isNum:     true,
+			colType:   typ,
+		}
+	}
+	b.colSketches.add(
+		name,
+		unsafe.String(&key[0], 8), //nolint:gosec // G103: intentional zero-copy string view; key does not escape
+	)
+}
+
+// updateLogMinMaxFromAttr feeds a typed AttrValue into the per-block min/max tracker.
+// For numeric types uses updateLogMinMaxNum to avoid string([]byte) allocation per record.
+func (b *logBlockBuilder) updateLogMinMaxFromAttr(name string, typ shared.ColumnType, val shared.AttrValue) {
+	var tmp [8]byte
+	switch typ {
+	case shared.ColumnTypeInt64, shared.ColumnTypeRangeInt64, shared.ColumnTypeRangeDuration:
+		binary.LittleEndian.PutUint64(tmp[:], uint64(val.Int)) //nolint:gosec
+		b.updateLogMinMaxNum(name, typ, tmp)
+	case shared.ColumnTypeUint64, shared.ColumnTypeRangeUint64:
+		binary.LittleEndian.PutUint64(tmp[:], val.Uint)
+		b.updateLogMinMaxNum(name, typ, tmp)
+	case shared.ColumnTypeFloat64, shared.ColumnTypeRangeFloat64:
+		binary.LittleEndian.PutUint64(tmp[:], math.Float64bits(val.Float))
+		b.updateLogMinMaxNum(name, typ, tmp)
+	default:
+		if key := encodeRangeKey(typ, val); key != "" {
+			b.updateLogMinMax(name, typ, key)
+		}
+	}
+}
+
 // updateNumericMinMax tracks int64 min/max for a string column being evaluated
 // for numeric range index promotion. Keys are 8-byte LE-encoded (same wire
 // format as native int64 columns) so addBlockRangeToColumn can decode them.
@@ -231,22 +257,22 @@ func (b *logBlockBuilder) updateLogMinMax(name string, typ shared.ColumnType, ke
 func (b *logBlockBuilder) updateNumericMinMax(name string, n int64) {
 	var tmp [8]byte
 	binary.LittleEndian.PutUint64(tmp[:], uint64(n)) //nolint:gosec // safe: reinterpreting int64 bits
-	key := string(tmp[:])
 	if mm, ok := b.colNumericMinMax[name]; ok {
-		existingMin := int64(binary.LittleEndian.Uint64([]byte(mm.minKey))) //nolint:gosec
-		existingMax := int64(binary.LittleEndian.Uint64([]byte(mm.maxKey))) //nolint:gosec
+		existingMin := int64(binary.LittleEndian.Uint64(mm.numMinKey[:])) //nolint:gosec
+		existingMax := int64(binary.LittleEndian.Uint64(mm.numMaxKey[:])) //nolint:gosec
 		if n < existingMin {
-			mm.minKey = key
+			mm.numMinKey = tmp
 		}
 		if n > existingMax {
-			mm.maxKey = key
+			mm.numMaxKey = tmp
 		}
 	} else {
 		b.colNumericMinMax[name] = &blockColMinMax{
-			colName: name,
-			minKey:  key,
-			maxKey:  key,
-			colType: shared.ColumnTypeRangeInt64,
+			colName:   name,
+			numMinKey: tmp,
+			numMaxKey: tmp,
+			isNum:     true,
+			colType:   shared.ColumnTypeRangeInt64,
 		}
 	}
 }
@@ -257,22 +283,22 @@ func (b *logBlockBuilder) updateNumericMinMax(name string, n int64) {
 func (b *logBlockBuilder) updateFloatMinMax(name string, f float64) {
 	var tmp [8]byte
 	binary.LittleEndian.PutUint64(tmp[:], math.Float64bits(f))
-	key := string(tmp[:])
 	if mm, ok := b.colFloatMinMax[name]; ok {
-		existingMin := math.Float64frombits(binary.LittleEndian.Uint64([]byte(mm.minKey)))
-		existingMax := math.Float64frombits(binary.LittleEndian.Uint64([]byte(mm.maxKey)))
+		existingMin := math.Float64frombits(binary.LittleEndian.Uint64(mm.numMinKey[:]))
+		existingMax := math.Float64frombits(binary.LittleEndian.Uint64(mm.numMaxKey[:]))
 		if f < existingMin {
-			mm.minKey = key
+			mm.numMinKey = tmp
 		}
 		if f > existingMax {
-			mm.maxKey = key
+			mm.numMaxKey = tmp
 		}
 	} else {
 		b.colFloatMinMax[name] = &blockColMinMax{
-			colName: name,
-			minKey:  key,
-			maxKey:  key,
-			colType: shared.ColumnTypeRangeFloat64,
+			colName:   name,
+			numMinKey: tmp,
+			numMaxKey: tmp,
+			isNum:     true,
+			colType:   shared.ColumnTypeRangeFloat64,
 		}
 	}
 }
@@ -298,9 +324,7 @@ func (b *logBlockBuilder) addLogPresent(name string, typ shared.ColumnType, val 
 	// Feed range column index. Excluded: Bool, logTraceIDColumnName, logSpanIDColumnName
 	// (IDs are unique per record; not useful for block pruning).
 	if name != logTraceIDColumnName && name != logSpanIDColumnName && typ != shared.ColumnTypeBool {
-		if key := encodeRangeKey(typ, val); key != "" {
-			b.updateLogMinMax(name, typ, key)
-		}
+		b.updateLogMinMaxFromAttr(name, typ, val)
 	}
 	// NOTE-040: attempt numeric promotion for string columns.
 	// Only string types carry string-encoded values; skip empty strings (null fills).
@@ -337,7 +361,7 @@ func (b *logBlockBuilder) addLogRecordFromProto(plr *pendingLogRecord, rowIdx in
 	{
 		var tmp [8]byte
 		binary.LittleEndian.PutUint64(tmp[:], record.TimeUnixNano)
-		b.updateLogMinMax(logTimestampColumnName, shared.ColumnTypeUint64, string(tmp[:]))
+		b.updateLogMinMaxNum(logTimestampColumnName, shared.ColumnTypeUint64, tmp)
 	}
 	// Task T-TS-3: implied timestamp sketch — 1-second bucket granularity.
 	if record.TimeUnixNano > 0 {
@@ -349,7 +373,7 @@ func (b *logBlockBuilder) addLogRecordFromProto(plr *pendingLogRecord, rowIdx in
 	{
 		var tmp [8]byte
 		binary.LittleEndian.PutUint64(tmp[:], record.ObservedTimeUnixNano)
-		b.updateLogMinMax(logObservedTimestampColumnName, shared.ColumnTypeUint64, string(tmp[:]))
+		b.updateLogMinMaxNum(logObservedTimestampColumnName, shared.ColumnTypeUint64, tmp)
 	}
 
 	// log:body — present when Body is non-nil; absent (present=false) when nil.
@@ -380,7 +404,7 @@ func (b *logBlockBuilder) addLogRecordFromProto(plr *pendingLogRecord, rowIdx in
 	if sevNumPresent {
 		var tmp [8]byte
 		binary.LittleEndian.PutUint64(tmp[:], uint64(sevNum)) //nolint:gosec // safe: reinterpreting int64 bits
-		b.updateLogMinMax(logSeverityNumberColumnName, shared.ColumnTypeInt64, string(tmp[:]))
+		b.updateLogMinMaxNum(logSeverityNumberColumnName, shared.ColumnTypeInt64, tmp)
 	}
 
 	// log:severity_text — always written (null when empty).
@@ -406,7 +430,7 @@ func (b *logBlockBuilder) addLogRecordFromProto(plr *pendingLogRecord, rowIdx in
 	if flagsPresent {
 		var tmp [8]byte
 		binary.LittleEndian.PutUint64(tmp[:], flags)
-		b.updateLogMinMax(logFlagsColumnName, shared.ColumnTypeUint64, string(tmp[:]))
+		b.updateLogMinMaxNum(logFlagsColumnName, shared.ColumnTypeUint64, tmp)
 	}
 
 	// --- Resource attributes ---

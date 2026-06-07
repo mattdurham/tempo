@@ -4,14 +4,6 @@ package vm
 
 // AggBucket holds aggregation state for a single group.
 // A JSON-friendly payload used to exist but was removed; this is the sole bucket struct.
-type AggBucket struct {
-	GroupKey GroupKey
-	Sum      float64
-	Count    int64
-	Rate     float64
-	Min      float64
-	Max      float64
-}
 
 // Merge combines another AggBucket into this one.
 // This is used to merge aggregation results from multiple files.
@@ -83,6 +75,5 @@ func MergeAggregationResults(results ...map[string]*AggBucket) map[string]*AggBu
 }
 
 // GroupKey represents a unique combination of group-by field values
-type GroupKey struct {
-	Values []Value // Ordered by GROUP BY fields in query; read-only after construction — shared by shallow-copied AggBuckets.
-}
+
+// Ordered by GROUP BY fields in query; read-only after construction — shared by shallow-copied AggBuckets.

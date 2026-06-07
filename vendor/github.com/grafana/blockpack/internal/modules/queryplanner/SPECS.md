@@ -45,16 +45,40 @@ return slices indexed by block number. Used by Stage 2 (Fuse pruning) and Stage 
 
 ```go
 type ColumnSketch interface {
-    Presence() []uint64             // bitset: 1 bit per block (1 = column present)
-    Distinct() []uint32             // HLL cardinality per block (0 for absent blocks)
-    TopKMatch(valFP uint64) []uint16  // TopK count per block (0 if not in top-K or absent)
-    FuseContains(valHash uint64) []bool // fuse membership per block (true = may be present)
+    // Bulk methods — return slices indexed by block number (length = BlockCount()).
+    Presence() []uint64                  // bitset: 1 bit per block (1 = column present)
+    Distinct() []uint32                  // HLL cardinality per block (0 for absent blocks)
+    TopKMatch(valFP uint64) []uint16     // TopK count per block (0 if not in top-K or absent)
+    FuseContains(valHash uint64) []bool  // fuse membership per block (true = may be present)
+
+    // Scalar accessors — zero-allocation per-block lookups for scoring/pruning hot paths.
+    // NOTE-022: eliminates per-call slice allocation from bulk methods in candidates.iter loops.
+    DistinctAt(blockIdx int) uint32                       // HLL cardinality for blockIdx; 0 if absent or blockIdx < 0. O(log presentCount).
+    TopKMatchAt(valFP uint64, blockIdx int) uint16        // TopK count for valFP at blockIdx; 0 if absent, blockIdx < 0, or no match. O(log presentCount + K).
+    FuseContainsAt(valHash uint64, blockIdx int) bool     // bloom membership for blockIdx; false if absent or blockIdx < 0; true (conservative) if no bloom data. O(log presentCount).
 }
 ```
 
-All methods return slices of length `BlockCount()`. For blocks where the column is absent,
+All bulk methods return slices of length `BlockCount()`. For blocks where the column is absent,
 `Distinct` returns 0, `TopKMatch` returns 0, and `FuseContains` returns true (conservative —
 no false negatives).
+
+### Scalar accessors
+
+`DistinctAt`, `TopKMatchAt`, and `FuseContainsAt` provide the same data as the bulk methods
+without allocating a slice. They are intended for hot-path use inside `candidates.iter` loops
+where the bulk methods would allocate a fresh slice per predicate evaluation.
+
+- **`DistinctAt(blockIdx int) uint32`**: returns `Distinct()[blockIdx]`. Returns 0 when
+  `blockIdx < 0`, `blockIdx >= BlockCount()`, or the column is absent from that block.
+- **`TopKMatchAt(valFP uint64, blockIdx int) uint16`**: returns `TopKMatch(valFP)[blockIdx]`.
+  Returns 0 when `blockIdx < 0`, out of range, or `valFP` is not in the top-K for that block.
+- **`FuseContainsAt(valHash uint64, blockIdx int) bool`**: returns `FuseContains(valHash)[blockIdx]`.
+  Returns false when `blockIdx < 0` or the column is absent from that block. Returns true
+  (conservative) when the block has no bloom data.
+
+All three use binary search over `presentMap` — O(log presentCount) lookup, O(K) additional
+for `TopKMatchAt` where K is the number of top-K entries per block (≤ 20).
 
 ---
 
@@ -155,8 +179,9 @@ Leaf pruning uses the range-index stage:
 **Range stage (optional):** when `len(Values) > 0` and `len(Columns) == 1`, the planner
 looks up the range index. Point lookups union `BlocksForRange` results across all values.
 Interval lookups (`IntervalMatch == true`) call `BlocksForRangeInterval(Values[0], Values[1])`.
-The planner returns a non-nil empty map when the index was consulted but found no matches
-(so AND-combined callers prune all candidates); nil means the column is not indexed.
+The planner returns `(blockSet, true)` with an all-zero blockSet when the index was
+consulted but found no matches (so AND-combined callers prune all candidates); `(nil, false)`
+means the column is not indexed.
 
 `Values` must be wire-encoded per the range-index format:
 - String / RangeString: raw string bytes
@@ -176,14 +201,15 @@ When `Children` is non-empty, `Op` specifies how the children's block sets combi
 
 Leaf fields (`Columns`, `Values`, `IntervalMatch`, `ColType`) are ignored for composite nodes.
 
-**OR skip-nil semantics:** unconstrained (nil) OR children are skipped — they represent
-columns with no range index (treated as empty set). The OR node returns nil (unconstrained)
+**OR skip-unconstrained semantics:** unconstrained (`bool=false`) OR children are skipped —
+they represent columns with no range index. The OR node returns `(nil, false)` (unconstrained)
 only when ALL children are unconstrained. This enables pruning on scopes that DO have range
 indexes, e.g. unscoped `.attr` expanded to `OR(resource.attr, span.attr, log.attr)` where
 only `resource.attr` has an index still prunes using that index. See NOTE-012.
 
-**AND conservatism:** unconstrained AND children are skipped; the intersection is taken only
-over indexed children. If no AND children are indexed, the AND node is unconstrained.
+**AND conservatism:** unconstrained (`bool=false`) AND children are skipped; the intersection
+is taken only over indexed children via `intersectBySelectivity`. If no AND children are
+indexed, the AND node is unconstrained (`bool=false`).
 
 ### 3.3 Top-level predicate list
 
@@ -214,7 +240,7 @@ type Plan struct {
     PrunedByIndex  int
     PrunedByTime   int
     PrunedByFuse   int
-    BlockScores    map[int]float64
+    BlockScores    []float64
     Explain        string
     Direction      Direction  // ordering of SelectedBlocks; set by PlanWithOptions (default Forward)
     Limit          int        // early-termination hint (0 = no limit); set by PlanWithOptions
@@ -253,14 +279,23 @@ top-level predicate. `PrunedByFuse` is 0 when no sketch data is available.
 
 ### 4.6 BlockScores
 
-Per-block selectivity score: `freq / max(cardinality, 1)`. Higher scores indicate more
-selective blocks (fewer distinct values relative to query frequency). Only populated when
-sketch data is available and at least one block remains after pruning. Nil otherwise.
+`[]float64` slice of length `TotalBlocks`, indexed by block number. Each element holds the
+per-block selectivity score: `freq / max(cardinality, 1)`. Higher scores indicate more
+selective blocks (fewer distinct values relative to query frequency).
+
+- `0.0` means the block was not scored (no sketch data matched for that block, or block was
+  pruned before scoring). Because the score formula uses `freq/max(card,1)` and `freq > 0`
+  whenever a TopK match exists, any scored block has score strictly `> 0`; `0.0` reliably
+  signals "unscored".
+- Nil when no sketch data is available for any queried column, or no blocks remain after
+  pruning.
 
 ### 4.7 Explain
 
-ASCII trace of how the predicate tree resolved to block sets. Always populated when
-predicates are present. Format:
+ASCII trace of how the predicate tree resolved to block sets. Empty string by default.
+Only populated when `PlanOptions.EnableExplain == true` is passed to `PlanWithOptions`.
+File-level reject explanations (set in `plan_blocks.go`) are always populated regardless
+of `EnableExplain`. See NOTE-020. Format:
 ```
 (resource.service.name=[0,1,2] || span.service.name=nil) => [0,1,2]
 AND resource.env=[1,2,3]
@@ -311,19 +346,25 @@ When `TotalBlocks == 0`, `SelectedBlocks` is `nil` and `PrunedByIndex` is 0.
 `pruneByIndexAll` evaluates the top-level predicate list (AND-combined) via range index.
 Each predicate's block set is computed recursively (`blockSetForPred`):
 
-- **Leaf:** returns the block set from `leafBlockSet` — non-nil when indexed (possibly empty
-  if no blocks matched), nil when the column has no range index or no values are provided.
-- **OR node:** unions children's block sets, skipping unconstrained (nil) children. Returns
-  nil (unconstrained) only when ALL children are unconstrained. This lets partially-indexed
-  OR composites (e.g. unscoped `.attr` expanded to resource/span/log scopes where only some
-  scopes have a range index) still prune using the indexed children.
-- **AND node:** intersects children's block sets, skipping unconstrained (nil) children.
+- **Leaf:** returns `(blockSet, bool)` from `leafBlockSet` — `bool=true` when the range
+  index was consulted (constrained), `bool=false` when the column has no range index or no
+  values are provided (unconstrained). An all-zero `blockSet` with `bool=true` means the
+  index was consulted but found no matching blocks.
+- **OR node:** unions children's block sets, skipping unconstrained (`bool=false`) children.
+  Returns `(nil, false)` (unconstrained) only when ALL children are unconstrained. This lets
+  partially-indexed OR composites (e.g. unscoped `.attr` expanded to resource/span/log scopes
+  where only some scopes have a range index) still prune using the indexed children.
+- **AND node:** intersects children's block sets, skipping unconstrained (`bool=false`)
+  children via `intersectBySelectivity`.
 
-The top-level AND combines block sets via intersection. Candidates are then pruned to this
-intersection. `PrunedByIndex` counts the eliminated blocks.
+`pruneByIndexAll` collects all constrained block sets from the top-level AND predicates and
+intersects them. Candidates are then pruned to this intersection. `PrunedByIndex` counts the
+eliminated blocks. When no predicate returns a constrained set, `pruneByIndexAll` returns
+`(0, nil)` and no index pruning is applied.
 
-**Empty vs nil:** a non-nil empty set means "index consulted, no blocks matched" and prunes
-all candidates (for AND). Nil means "no index coverage — skip this predicate conservatively".
+**Empty vs unconstrained (`bool=false`):** an all-zero `blockSet` with `bool=true` means
+"index consulted, no blocks matched" and prunes all candidates (for AND). `bool=false` means
+"no index coverage — skip this predicate conservatively".
 
 ### 5.3b BinaryFuse8 pruning stage (Stage 2)
 
@@ -331,8 +372,8 @@ all candidates (for AND). Nil means "no index coverage — skip this predicate c
 blocks where the fuse filter definitively excludes all queried values for every AND-combined
 top-level predicate.
 
-- For each predicate leaf, `cs.FuseContains(hash)` is called once per value — returns a
-  `[]bool` slice of length `BlockCount()`.
+- For each predicate leaf, `cs.FuseContainsAt(hash, blockIdx)` is called once per block per
+  value — zero allocation, O(log presentCount) per call.
 - A block is pruned if it passes no predicate's fuse check (AND semantics).
 - Interval predicates and non-single-column predicates are skipped (conservative pass).
 - Returns `PrunedByFuse` count.
@@ -345,8 +386,8 @@ does contain the queried value will always pass the fuse check (SPEC-SK-12).
 `scoreBlocks` computes a selectivity score for each surviving block:
 `score = sum_over_predicates(freq / max(cardinality, 1))`
 
-- `cardinality` = `cs.Distinct()[blockIdx]` (HLL estimate)
-- `freq` = `cs.TopKMatch(valFP)[blockIdx]` (TopK count; 0 if value is not in top-K for that block)
+- `cardinality` = `cs.DistinctAt(blockIdx)` (HLL estimate; zero allocation)
+- `freq` = `cs.TopKMatchAt(valFP, blockIdx)` (TopK count; zero allocation; 0 if value is not in top-K for that block)
 
 Higher score = more selective (fewer distinct values relative to query frequency). Stored in
 `Plan.BlockScores`. Nil when no sketch data is available.
@@ -398,15 +439,27 @@ const (
 )
 
 type PlanOptions struct {
-    Direction Direction
-    Limit     int
+    Direction     Direction
+    Limit         int
+    EnableExplain bool // when true, Plan.Explain is populated; false (default) = empty string
 }
 ```
 
-`PlanWithOptions(predicates, timeRange, opts)` calls `Plan(predicates, timeRange)` and
-then applies `opts`:
+Both `Plan(predicates, timeRange)` and `PlanWithOptions(predicates, timeRange, opts)` delegate
+to the internal `planInternal(predicates, timeRange, enableExplain bool)` function. `Plan()` calls
+`planInternal` with `enableExplain=false` (no explain).
+`PlanWithOptions` passes `opts.EnableExplain` to `planInternal`. After `planInternal` returns,
+`PlanWithOptions`:
 - Sets `plan.Direction = opts.Direction` and `plan.Limit = opts.Limit`.
 - When `opts.Direction == Backward`, reverses `plan.SelectedBlocks` in-place.
+
+Inside `planInternal`:
+- When `enableExplain == true`, populates `plan.Explain` with the predicate trace.
+- Direction, Limit, and other PlanOptions fields are NOT consulted inside planInternal.
+
+**Invariant:** When `EnableExplain` is false (the default), `plan.Explain` is always the
+empty string for predicate-level explain output. File-level reject strings (set in
+`plan_blocks.go`) are unconditional. See NOTE-020.
 
 The `Plan` struct has these fields (see §4 for full documentation):
 
@@ -417,7 +470,7 @@ type Plan struct {
     PrunedByIndex  int
     PrunedByTime   int
     PrunedByFuse   int
-    BlockScores    map[int]float64
+    BlockScores    []float64
     Explain        string
     Direction      Direction  // ordering of SelectedBlocks; set by PlanWithOptions
     Limit          int        // early-termination hint (0 = no limit)

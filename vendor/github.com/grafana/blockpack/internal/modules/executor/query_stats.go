@@ -2,8 +2,6 @@ package executor
 
 // NOTE: Any changes to this file must be reflected in the corresponding SPECS.md or NOTES.md.
 
-import "time"
-
 // ExecutionPath constants identify which code path ran in a query.
 const (
 	ExecPathBlockPlain         = "block-plain"
@@ -41,11 +39,6 @@ const (
 //
 // Steps contains one entry per phase that actually ran. Phases that were
 // skipped (e.g. intrinsic paths always skip the block-scan phase) are absent.
-type QueryStats struct {
-	ExecutionPath string
-	Steps         []StepStats
-	TotalDuration time.Duration
-}
 
 // Explain returns the block-pruning explanation string from the "plan" step,
 // or "" if the plan step is absent or has no explain value.
@@ -79,10 +72,6 @@ func (qs QueryStats) SelectedBlocks() int {
 // BytesRead is an approximation: sum of BlockMeta.Length for blocks fetched
 // in this phase (logical block bytes, not wire bytes).
 // IOOps counts ReadGroup calls issued in this phase.
-type StepStats struct {
-	Metadata  map[string]any // flexible per-step key/value metadata
-	Name      string         // "plan", "bloom", "intrinsic", "mixed-prefilter", "block-scan"
-	Duration  time.Duration
-	BytesRead int64
-	IOOps     int
-}
+
+// flexible per-step key/value metadata
+// "plan", "bloom", "intrinsic", "mixed-prefilter", "block-scan"

@@ -9,57 +9,41 @@ import (
 
 // QuerySpec is the canonical intermediate representation for metric queries.
 // TraceQL metrics queries compile to QuerySpec for semantic matching and query routing.
-type QuerySpec struct {
-	Filter        FilterSpec
-	Aggregate     AggregateSpec
-	TimeBucketing TimeBucketSpec
-}
 
 // FilterSpec represents the filter conditions for a query.
-type FilterSpec struct {
-	// AttributeEquals maps attribute paths to lists of acceptable values (OR semantics)
-	// e.g., "span:status" -> ["ok", "error"]
-	AttributeEquals map[string][]any
 
-	// AttributeRanges maps attribute paths to range specifications
-	// e.g., "span:duration" -> {MinValue: 100000000, MaxValue: 500000000}
-	AttributeRanges map[string]*RangeSpec
+// AttributeEquals maps attribute paths to lists of acceptable values (OR semantics)
+// e.g., "span:status" -> ["ok", "error"]
 
-	// IsMatchAll indicates if this filter matches all spans (no predicates)
-	IsMatchAll bool
-}
+// AttributeRanges maps attribute paths to range specifications
+// e.g., "span:duration" -> {MinValue: 100000000, MaxValue: 500000000}
+
+// IsMatchAll indicates if this filter matches all spans (no predicates)
 
 // RangeSpec represents a range constraint on an attribute.
-type RangeSpec struct {
-	MinValue     any  // Minimum value (nil means unbounded)
-	MaxValue     any  // Maximum value (nil means unbounded)
-	MinInclusive bool // Whether minimum is inclusive (>= vs >)
-	MaxInclusive bool // Whether maximum is inclusive (<= vs <)
-}
+
+// Minimum value (nil means unbounded)
+// Maximum value (nil means unbounded)
+// Whether minimum is inclusive (>= vs >)
+// Whether maximum is inclusive (<= vs <)
 
 // AggregateSpec represents the aggregation function and grouping.
-type AggregateSpec struct {
-	// Function is the aggregate function name (uppercase canonical form)
-	// Valid values: COUNT, AVG, MIN, MAX, SUM, QUANTILE, RATE, HISTOGRAM, STDDEV
-	Function string
 
-	// Field is the attribute path to aggregate (empty for COUNT and RATE)
-	Field string
+// Function is the aggregate function name (uppercase canonical form)
+// Valid values: COUNT, AVG, MIN, MAX, SUM, QUANTILE, RATE, HISTOGRAM, STDDEV
 
-	// GroupBy is the list of attribute paths to group by (sorted for canonicalization)
-	GroupBy []string
+// Field is the attribute path to aggregate (empty for COUNT and RATE)
 
-	// Quantile is the quantile value (0-1) for QUANTILE function
-	Quantile float64
-}
+// GroupBy is the list of attribute paths to group by (sorted for canonicalization)
+
+// Quantile is the quantile value (0-1) for QUANTILE function
 
 // TimeBucketSpec represents time bucketing configuration.
-type TimeBucketSpec struct {
-	Enabled       bool  // Whether time bucketing is enabled
-	StartTime     int64 // Start time in nanoseconds (Unix epoch)
-	EndTime       int64 // End time in nanoseconds (Unix epoch)
-	StepSizeNanos int64 // Time bucket step size in nanoseconds
-}
+
+// Whether time bucketing is enabled
+// Start time in nanoseconds (Unix epoch)
+// End time in nanoseconds (Unix epoch)
+// Time bucket step size in nanoseconds
 
 // Normalize converts the QuerySpec to canonical form in place for consistent matching.
 func (qs *QuerySpec) Normalize() {

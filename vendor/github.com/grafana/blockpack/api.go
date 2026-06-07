@@ -21,10 +21,10 @@ import (
 
 	"github.com/grafana/blockpack/internal/logqlparser"
 	modules_blockio "github.com/grafana/blockpack/internal/modules/blockio"
+	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
 	modules_shared "github.com/grafana/blockpack/internal/modules/blockio/shared"
 	modules_executor "github.com/grafana/blockpack/internal/modules/executor"
 	modules_queryplanner "github.com/grafana/blockpack/internal/modules/queryplanner"
-	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
 	"github.com/grafana/blockpack/internal/traceqlparser"
 	"github.com/grafana/blockpack/internal/vm"
 )
@@ -54,44 +54,42 @@ type QueryStats = modules_executor.QueryStats
 type StepStats = modules_executor.StepStats
 
 // QueryOptions configures query execution.
-type QueryOptions struct {
-	// Embedder enables VECTOR_AI() predicates in TraceQL filter queries. When non-nil,
-	// a VECTOR_AI("query text") expression is embedded at compile time and matched against
-	// spans by cosine similarity. If nil and the query contains VECTOR_AI(), QueryTraceQL
-	// returns an error. Any type implementing vm.TextEmbedder is accepted — this keeps
-	// blockpack decoupled from the concrete embedder implementation.
-	// VECTOR_ALL() does not require an Embedder.
-	Embedder vm.TextEmbedder
-	// SelectColumns limits which column names appear in SpanMatch.Fields.
-	// When non-empty, only columns whose names are present in this slice are
-	// returned by GetField and IterateFields. nil or empty means all columns
-	// are returned (no projection applied).
-	// A nil slice and a non-nil empty slice are equivalent: both mean all columns are returned.
-	SelectColumns []string
-	// StartNano is the inclusive lower bound for block-level time pruning (unix nanoseconds).
-	// Internal blocks whose span:start range ends before StartNano are skipped entirely.
-	// 0 means no lower bound.
-	StartNano uint64
-	// EndNano is the inclusive upper bound for block-level time pruning (unix nanoseconds).
-	// Internal blocks whose span:start range begins after EndNano are skipped entirely.
-	// 0 means no upper bound.
-	EndNano uint64
-	// Limit is the maximum number of spans to return (0 = unlimited).
-	// Negative values are treated as 0 (unlimited) — the executor does not validate sign.
-	Limit int
-	// StartBlock is the first internal block index to scan (0-based, inclusive).
-	// Used by the frontend sharder to partition a single blockpack file into
-	// multiple sub-file jobs. 0 means start from the first block.
-	StartBlock int
-	// BlockCount is the number of internal blocks to scan starting from StartBlock.
-	// 0 means scan all blocks (no sub-file sharding).
-	BlockCount int
-	// MostRecent controls block traversal order. Always use keyed struct literals:
-	// QueryOptions{Limit: 10, MostRecent: true}.
-	// Uses Backward direction with span:start timestamp sorting. For intrinsic-only queries,
-	// top-K selection uses only the intrinsic column blobs (no full block I/O).
-	MostRecent bool
-}
+
+// Embedder enables VECTOR_AI() predicates in TraceQL filter queries. When non-nil,
+// a VECTOR_AI("query text") expression is embedded at compile time and matched against
+// spans by cosine similarity. If nil and the query contains VECTOR_AI(), QueryTraceQL
+// returns an error. Any type implementing vm.TextEmbedder is accepted — this keeps
+// blockpack decoupled from the concrete embedder implementation.
+// VECTOR_ALL() does not require an Embedder.
+
+// SelectColumns limits which column names appear in SpanMatch.Fields.
+// When non-empty, only columns whose names are present in this slice are
+// returned by GetField and IterateFields. nil or empty means all columns
+// are returned (no projection applied).
+// A nil slice and a non-nil empty slice are equivalent: both mean all columns are returned.
+
+// StartNano is the inclusive lower bound for block-level time pruning (unix nanoseconds).
+// Internal blocks whose span:start range ends before StartNano are skipped entirely.
+// 0 means no lower bound.
+
+// EndNano is the inclusive upper bound for block-level time pruning (unix nanoseconds).
+// Internal blocks whose span:start range begins after EndNano are skipped entirely.
+// 0 means no upper bound.
+
+// Limit is the maximum number of spans to return (0 = unlimited).
+// Negative values are treated as 0 (unlimited) — the executor does not validate sign.
+
+// StartBlock is the first internal block index to scan (0-based, inclusive).
+// Used by the frontend sharder to partition a single blockpack file into
+// multiple sub-file jobs. 0 means start from the first block.
+
+// BlockCount is the number of internal blocks to scan starting from StartBlock.
+// 0 means scan all blocks (no sub-file sharding).
+
+// MostRecent controls block traversal order. Always use keyed struct literals:
+// QueryOptions{Limit: 10, MostRecent: true}.
+// Uses Backward direction with span:start timestamp sorting. For intrinsic-only queries,
+// top-K selection uses only the intrinsic column blobs (no full block I/O).
 
 // validateQueryOptions checks that sharding and time range parameters are valid.
 func validateQueryOptions(opts QueryOptions) error {
@@ -309,12 +307,11 @@ func QueryTraceQL(
 }
 
 // LogQueryOptions configures log query execution.
-type LogQueryOptions struct {
-	StartNano uint64 // Inclusive start (unix nanos); 0 = no lower bound.
-	EndNano   uint64 // Inclusive end (unix nanos); 0 = no upper bound.
-	Limit     int    // Max matches; 0 = unlimited.
-	Forward   bool   // If true, traverse forward (oldest first). Default is backward (newest first).
-}
+
+// Inclusive start (unix nanos); 0 = no lower bound.
+// Inclusive end (unix nanos); 0 = no upper bound.
+// Max matches; 0 = unlimited.
+// If true, traverse forward (oldest first). Default is backward (newest first).
 
 // QueryLogQL executes a LogQL filter query against a blockpack log file
 // and returns all matching log records.
@@ -381,21 +378,19 @@ type LogMetricsResult = modules_executor.LogMetricsResult
 type LogMetricsRow = modules_executor.LogMetricsRow
 
 // LogMetricOptions configures a LogQL metrics query.
-type LogMetricOptions struct {
-	// GroupBy lists label names to group the time series by.
-	GroupBy []string
-	// StartNano is the inclusive start of the query time window (unix nanoseconds).
-	// Zero means the Unix epoch (1970-01-01 00:00:00 UTC), NOT "no lower bound".
-	// Contrast with QueryOptions.StartNano (uint64) where 0 is treated as unbounded.
-	StartNano int64
-	// EndNano is the exclusive end of the query time window (unix nanoseconds).
-	// Zero means the Unix epoch (1970-01-01 00:00:00 UTC), NOT "no upper bound".
-	// Contrast with QueryOptions.EndNano (uint64) where 0 is treated as unbounded.
-	EndNano int64
-	// StepNano is the time bucket step size in nanoseconds (default: 60 seconds).
-	// Values <= 0 are treated as the default (60 seconds). Negative values are not an error.
-	StepNano int64
-}
+
+// GroupBy lists label names to group the time series by.
+
+// StartNano is the inclusive start of the query time window (unix nanoseconds).
+// Zero means the Unix epoch (1970-01-01 00:00:00 UTC), NOT "no lower bound".
+// Contrast with QueryOptions.StartNano (uint64) where 0 is treated as unbounded.
+
+// EndNano is the exclusive end of the query time window (unix nanoseconds).
+// Zero means the Unix epoch (1970-01-01 00:00:00 UTC), NOT "no upper bound".
+// Contrast with QueryOptions.EndNano (uint64) where 0 is treated as unbounded.
+
+// StepNano is the time bucket step size in nanoseconds (default: 60 seconds).
+// Values <= 0 are treated as the default (60 seconds). Negative values are not an error.
 
 // ExecuteMetricsLogQL executes a LogQL metric query against a blockpack log file and
 // returns dense time-bucketed results.
@@ -497,23 +492,21 @@ type TraceTimeSeries = modules_executor.TraceTimeSeries
 type TraceMetricLabel = modules_executor.TraceMetricLabel
 
 // TraceMetricOptions configures a TraceQL metrics query.
-type TraceMetricOptions struct {
-	// StartNano is the approximate start of the query time window (unix nanoseconds).
-	// Internally aligned down to the nearest StepNano boundary before query execution.
-	// The effective interval is right-closed: spans at exactly alignedStart are excluded.
-	// Zero means the Unix epoch (1970-01-01 00:00:00 UTC), NOT "no lower bound".
-	// Contrast with QueryOptions.StartNano (uint64) where 0 is treated as unbounded.
-	StartNano int64
-	// EndNano is the approximate end of the query time window (unix nanoseconds).
-	// Internally aligned up to the nearest StepNano boundary before query execution.
-	// The effective interval is right-closed: spans at exactly alignedEnd are included.
-	// Zero means the Unix epoch (1970-01-01 00:00:00 UTC), NOT "no upper bound".
-	// Contrast with QueryOptions.EndNano (uint64) where 0 is treated as unbounded.
-	EndNano int64
-	// StepNano is the time bucket step size in nanoseconds (default: 60 seconds).
-	// Values <= 0 are treated as the default (60 seconds). Negative values are not an error.
-	StepNano int64
-}
+
+// StartNano is the approximate start of the query time window (unix nanoseconds).
+// Internally aligned down to the nearest StepNano boundary before query execution.
+// The effective interval is right-closed: spans at exactly alignedStart are excluded.
+// Zero means the Unix epoch (1970-01-01 00:00:00 UTC), NOT "no lower bound".
+// Contrast with QueryOptions.StartNano (uint64) where 0 is treated as unbounded.
+
+// EndNano is the approximate end of the query time window (unix nanoseconds).
+// Internally aligned up to the nearest StepNano boundary before query execution.
+// The effective interval is right-closed: spans at exactly alignedEnd are included.
+// Zero means the Unix epoch (1970-01-01 00:00:00 UTC), NOT "no upper bound".
+// Contrast with QueryOptions.EndNano (uint64) where 0 is treated as unbounded.
+
+// StepNano is the time bucket step size in nanoseconds (default: 60 seconds).
+// Values <= 0 are treated as the default (60 seconds). Negative values are not an error.
 
 // ExecuteMetricsTraceQL executes a TraceQL metrics query against a blockpack trace file
 // and returns dense time-bucketed results.

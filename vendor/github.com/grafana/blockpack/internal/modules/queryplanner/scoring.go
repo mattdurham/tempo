@@ -85,13 +85,13 @@ func pruneByFusePred(r BlockIndexer, candidates, saved blockSet, pred Predicate)
 		return
 	}
 
-	// Fetch the full fuse result slice once per value; scan candidates.
+	// Use per-block scalar accessor to avoid allocating a []bool slice per value.
 	// Block passes if ANY queried value is possibly present.
+	// NOTE-022: FuseContainsAt replaces FuseContains bulk fetch — 1 alloc/pred eliminated.
 	for _, val := range pred.Values {
 		h := sketch.HashForFuse(val)
-		fuseResults := cs.FuseContains(h)
 		candidates.iter(func(blockIdx int) {
-			if blockIdx < len(fuseResults) && fuseResults[blockIdx] {
+			if cs.FuseContainsAt(h, blockIdx) {
 				saved.set(blockIdx)
 			}
 		})
@@ -104,14 +104,15 @@ func pruneByFusePred(r BlockIndexer, candidates, saved blockSet, pred Predicate)
 // score = sum(freq_i) / max(cardinality, 1)
 //
 // Higher score means more selective (fewer distinct values relative to frequency).
-// Only populated when sketch data is available; returns nil when no predicates or
-// no sketch data.
+// Returns a []float64 of length blockCount indexed by blockIdx (0.0 = unscored).
+// Returns nil when no predicates, no candidates, or no sketch data produced any scores.
 // NOTE-014: score = freq/max(card,1).
-func scoreBlocks(r BlockIndexer, candidates blockSet, predicates []Predicate) map[int]float64 {
+// NOTE-023: []float64 replaces map[int]float64 — 2 fewer allocs/op.
+func scoreBlocks(r BlockIndexer, candidates blockSet, predicates []Predicate, blockCount int) []float64 {
 	if len(predicates) == 0 || candidates.count() == 0 {
 		return nil
 	}
-	scores := make(map[int]float64, candidates.count())
+	scores := make([]float64, blockCount)
 	anyScored := false
 	for _, pred := range predicates {
 		scoreBlocksForPred(r, candidates, pred, scores)
@@ -129,8 +130,9 @@ func scoreBlocks(r BlockIndexer, candidates blockSet, predicates []Predicate) ma
 }
 
 // scoreBlocksForPred accumulates score contributions from one predicate into scores[].
-// Uses bulk slice fetches: Distinct(), TopKMatch() called once per value.
-func scoreBlocksForPred(r BlockIndexer, candidates blockSet, pred Predicate, scores map[int]float64) {
+// NOTE-022: Uses DistinctAt and TopKMatchAt (zero-allocation per-block scalar accessors)
+// instead of Distinct() / TopKMatch() bulk slice fetches, eliminating 2 allocs/pred.
+func scoreBlocksForPred(r BlockIndexer, candidates blockSet, pred Predicate, scores []float64) {
 	if len(pred.Children) > 0 {
 		for _, child := range pred.Children {
 			scoreBlocksForPred(r, candidates, child, scores)
@@ -148,25 +150,17 @@ func scoreBlocksForPred(r BlockIndexer, candidates blockSet, pred Predicate, sco
 		return
 	}
 
-	distinct := cs.Distinct()
-
 	for _, val := range pred.Values {
-		// Try TopK (Space-Saving approximate upper-bound count via FP lookup) — bulk fetch.
 		valFP := sketch.HashForFuse(val)
-		topkCounts := cs.TopKMatch(valFP)
-
 		candidates.iter(func(blockIdx int) {
-			if blockIdx >= len(distinct) {
+			if blockIdx >= len(scores) {
 				return
 			}
-			card := float64(distinct[blockIdx])
+			card := float64(cs.DistinctAt(blockIdx))
 			if card < 1 {
 				card = 1
 			}
-			var freq float64
-			if blockIdx < len(topkCounts) && topkCounts[blockIdx] > 0 {
-				freq = float64(topkCounts[blockIdx])
-			}
+			freq := float64(cs.TopKMatchAt(valFP, blockIdx))
 			if freq > 0 {
 				scores[blockIdx] += freq / card
 			}
