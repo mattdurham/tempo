@@ -3669,3 +3669,22 @@ accidental activation for vector queries.
 **Applies to:** trace queries (TimestampColumn == "span:start") and log queries (log:timestamp)
 with an intrinsic section.
 Back-ref: `internal/modules/executor/stream.go:collectMatchAllTopK,isMatchAllProgram`
+
+## NOTE-128: mergeJoinFilteredRefsWithVals — idxPacked and filteredPKs pooled
+*Added: 2026-06-08*
+**Decision:** Replace `make([]uint64, len(inRangeRefs))` (`idxPacked`) and
+`make([]uint32, len(filteredRefs))` (`filteredPKs`) in `mergeJoinFilteredRefsWithVals`
+with `acquireCompactUint64` / `releaseCompactUint64` and `acquireCompactUint32` /
+`releaseCompactUint32` respectively.
+**Rationale:** `mergeJoinFilteredRefsWithVals` is called for every block in the M8
+predicate-filtered path (`hasPreds=true`, `span.kind=server`). At N=7.2M in-range refs
+(typical large production file), `idxPacked` costs ~57 MB per call and `filteredPKs`
+costs ~15 MB per call. NOTE-125 pooled the structurally identical `pkOrder` scratch array
+in the compact-path functions but missed `idxPacked` in `mergeJoinFilteredRefsWithVals`.
+Both arrays are pure scratch (fully overwritten before any read, never returned to callers)
+so they can share the existing `compactUint64Pool` and `compactUint32Pool` without adding
+new pool variables. `idxPacked` skips `clear()` (matching `pkOrder` acquire semantics —
+fully overwritten before `slices.Sort`). Both are released inline before `return` (not
+via `defer`) to free 57+15 MB as early as possible. For a 400-block M8 query: eliminates
+400 × (57+15) MB = 28.8 GB of short-lived allocations per query goroutine.
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:mergeJoinFilteredRefsWithVals`

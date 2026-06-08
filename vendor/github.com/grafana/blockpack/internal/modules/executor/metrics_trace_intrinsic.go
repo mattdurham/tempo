@@ -56,8 +56,10 @@ var compactUint32Pool sync.Pool
 // NOTE-125: ~29 MB per call at n=7.2 M. See compactUint32Pool.
 var compactInt32Pool sync.Pool
 
-// compactUint64Pool pools []uint64 for pkOrder (sort scratch) in unfiltered compact-path functions.
+// compactUint64Pool pools []uint64 for pkOrder (sort scratch) in unfiltered compact-path functions
+// and for idxPacked (sort scratch) in mergeJoinFilteredRefsWithVals.
 // NOTE-125: ~57 MB per call at n=7.2 M; released immediately after sort inside block scope.
+// NOTE-128: idxPacked ~57 MB per call at n=7.2 M in mergeJoinFilteredRefsWithVals.
 var compactUint64Pool sync.Pool
 
 // compactFloat64Pool pools []float64 for aggValByPos in agg compact-path functions.
@@ -1478,7 +1480,7 @@ func mergeJoinFilteredRefsWithVals(
 	// Build a sorted []uint32 of filteredRefs packKeys — cheaper than cloning BlockRef
 	// (same 4 bytes/entry but avoids SortFunc closure; packKey is pre-computed so the
 	// merge comparison below avoids recomputing it per comparison step).
-	filteredPKs := make([]uint32, len(filteredRefs))
+	filteredPKs := acquireCompactUint32(len(filteredRefs)) // NOTE-128: ~15 MB at F=3.75 M; pooled to eliminate GC pressure
 	for i, ref := range filteredRefs {
 		filteredPKs[i] = packKey(ref.BlockIdx, ref.RowIdx)
 	}
@@ -1489,7 +1491,7 @@ func mergeJoinFilteredRefsWithVals(
 	// half the size of refIdx{uint32,int} (8 vs 12 bytes/entry). Both fit in uint32:
 	// maxPK < 2^32, len(inRangeRefs) < 2^32. slices.Sort (no closure) is also faster
 	// than SortFunc on the struct form.
-	idxPacked := make([]uint64, len(inRangeRefs))
+	idxPacked := acquireCompactUint64(len(inRangeRefs)) // NOTE-128: ~57 MB at N=7.2 M; pooled. No clear needed — fully overwritten before slices.Sort.
 	for i, ref := range inRangeRefs {
 		idxPacked[i] = uint64(packKey(ref.BlockIdx, ref.RowIdx))<<32 | uint64(uint32(i)) //nolint:gosec
 	}
@@ -1512,6 +1514,8 @@ func mergeJoinFilteredRefsWithVals(
 			outVals = append(outVals, inRangeVals[pos])
 		}
 	}
+	releaseCompactUint64(idxPacked)
+	releaseCompactUint32(filteredPKs)
 	return outRefs, outVals
 }
 
