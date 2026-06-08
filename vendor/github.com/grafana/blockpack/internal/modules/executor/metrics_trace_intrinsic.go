@@ -422,7 +422,20 @@ func dispatchIntrinsicAccumulate(
 		if agg.Function != vm.FuncNameHISTOGRAM {
 			return streamAggN1Compact(ctx, r, tsCol, lo, hi, querySpec, buckets)
 		}
-		return accumulateIntrinsicBucketsViaKeyMap(ctx, r, inRangeRefs, inRangeVals, tb, querySpec, buckets)
+		// NOTE-132: compact fallback for no-predicate N=1 histogram — avoids the ~3 GB
+		// keyToBucket map[uint32]int64 allocation inside accumulateIntrinsicBucketsViaKeyMap
+		// for large files where accumulateIntrinsicBucketsDirect returned false (maxPK >
+		// maxDirectArrayEntries). streamHistogramN1Compact is already the canonical compact
+		// histogram path (NOTE-092, NOTE-114); the only omission was not wiring it here.
+		numSteps := (tb.EndTime - tb.StartTime + tb.StepSizeNanos - 1) / tb.StepSizeNanos
+		if numSteps <= 0 {
+			return nil
+		}
+		groupByCol, colErr := r.GetIntrinsicColumn(agg.GroupBy[0])
+		if colErr != nil {
+			return colErr
+		}
+		return streamHistogramN1Compact(ctx, r, inRangeRefs, inRangeVals, groupByCol, agg, numSteps, tb, buckets)
 	case filteredRefs != nil && len(agg.GroupBy) == 1 && isCountRate:
 		// NOTE-110: predicate-filtered N=1 count/rate compact path.
 		// inRangeRefs is already packKey-sorted from mergeJoinFilteredRefsWithVals — skip the
