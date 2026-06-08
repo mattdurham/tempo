@@ -3688,3 +3688,35 @@ fully overwritten before `slices.Sort`). Both are released inline before `return
 via `defer`) to free 57+15 MB as early as possible. For a 400-block M8 query: eliminates
 400 × (57+15) MB = 28.8 GB of short-lived allocations per query goroutine.
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:mergeJoinFilteredRefsWithVals`
+
+## NOTE-129: direct-path dense arrays pooled — bucketByPK, seenByPK, dictByPK
+*Added: 2026-06-08*
+**Decision:** Pool the direct-path dense arrays `bucketByPK []int16`, `seenByPK []bool`,
+and `dictByPK []uint32` allocated in direct-path accumulation functions using two new
+pools (`directInt16Pool`, `directBoolPool`) and the existing `compactUint32Pool`.
+**Affected sites (9 total):**
+- `buildDictIdxForRefs` line ~2229: `dictByPK []uint32` via `acquireCompactUint32`; release
+  owned by `dispatchIntrinsicAccumulate` caller with size guard (cap <= 16_000_001).
+- `accumulateIntrinsicBucketsDirect` line ~2370: `bucketByPK []int16` via `acquireDirectInt16` + defer.
+- `accumulateIntrinsicBucketsDirect` line ~2410: `dictByPK []uint32` via `acquireCompactUint32` + defer (conditional).
+- `accumulateHistogramDirect` line ~2619: `seenByPK []bool` via `acquireDirectBool` + inline release before emit.
+- `accumulateHistogramDirectN0` line ~2682: `bucketByPK []int16` via `acquireDirectInt16` + inline release before emit.
+- `accumulateHistogramDirectN0` line ~2718: `seenByPK []bool` via `acquireDirectBool` + inline release before emit.
+- `accumulateAggDirect` line ~2769: `seenByPK []bool` via `acquireDirectBool` + defer.
+- `streamByRefSliceHistogram` line ~3191: `bucketByPK []int16` via `acquireDirectInt16` + inline release before emit.
+- `streamByRefSliceHistogram` line ~3248: `seenByPK []bool` via `acquireDirectBool` + inline release before emit.
+**Rationale:** Per-block allocations for M8 histogram queries (400 blocks):
+- `bucketByPK []int16`: 32 MB × 400 = 12.8 GB per query
+- `seenByPK []bool`: 16 MB × 400 = 6.4 GB per query
+- `dictByPK []uint32`: 64 MB × 400 = 25.6 GB per query (histogram/agg paths)
+Total eliminated: up to 44.8 GB of short-lived allocations per M8 histogram query.
+Expected improvement: 15-25% for M8 histogram, 10-20% for M4 rate (bucketByPK only).
+**Pool design:** `acquireDirectInt16`/`acquireDirectBool` follow the identical pattern to
+`acquireCompactUint32`/`acquireCompactBool` (NOTE-125): capacity-check reslice + `clear`.
+`clear` is mandatory for all three types — zero-sentinel semantics require unwritten PKs to
+stay at their zero value. Release returns `[:cap(s)]` for reuse at different sizes.
+**Correctness:** `clear` in acquire covers both: (a) PKs not written in this call that must
+remain 0 for sentinel checks, and (b) stale values from the previous pool user.
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:buildDictIdxForRefs,
+accumulateIntrinsicBucketsDirect,accumulateHistogramDirect,accumulateHistogramDirectN0,
+accumulateAggDirect,streamByRefSliceHistogram`

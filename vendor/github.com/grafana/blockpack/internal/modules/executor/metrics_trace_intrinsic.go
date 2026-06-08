@@ -146,6 +146,44 @@ func releaseCompactBool(s []bool) {
 	compactBoolPool.Put(s[:cap(s)]) //nolint:staticcheck // SA6002: slice is pointer-sized
 }
 
+// NOTE-129: directInt16Pool pools []int16 for bucketByPK in direct-path accumulation.
+// ~32 MB per call at maxPK=16M entries. Mirrors compactBoolPool but sized by maxPK.
+var directInt16Pool sync.Pool
+
+// NOTE-129: directBoolPool pools []bool for seenByPK in direct-path accumulation.
+// ~16 MB per call at maxPK=16M entries.
+var directBoolPool sync.Pool
+
+func acquireDirectInt16(n int) []int16 {
+	if v := directInt16Pool.Get(); v != nil {
+		if s, ok := v.([]int16); ok && cap(s) >= n {
+			s = s[:n]
+			clear(s)
+			return s
+		}
+	}
+	return make([]int16, n)
+}
+
+func releaseDirectInt16(s []int16) {
+	directInt16Pool.Put(s[:cap(s)]) //nolint:staticcheck // SA6002: slice is pointer-sized
+}
+
+func acquireDirectBool(n int) []bool {
+	if v := directBoolPool.Get(); v != nil {
+		if s, ok := v.([]bool); ok && cap(s) >= n {
+			s = s[:n]
+			clear(s)
+			return s
+		}
+	}
+	return make([]bool, n)
+}
+
+func releaseDirectBool(s []bool) {
+	directBoolPool.Put(s[:cap(s)]) //nolint:staticcheck // SA6002: slice is pointer-sized
+}
+
 // ctxCheckInterval is how often (in spans) to check for context cancellation in hot loops.
 // Large enough to bound overhead; small enough to bound cancellation latency.
 const ctxCheckInterval = 100_000
@@ -1480,7 +1518,9 @@ func mergeJoinFilteredRefsWithVals(
 	// Build a sorted []uint32 of filteredRefs packKeys — cheaper than cloning BlockRef
 	// (same 4 bytes/entry but avoids SortFunc closure; packKey is pre-computed so the
 	// merge comparison below avoids recomputing it per comparison step).
-	filteredPKs := acquireCompactUint32(len(filteredRefs)) // NOTE-128: ~15 MB at F=3.75 M; pooled to eliminate GC pressure
+	filteredPKs := acquireCompactUint32(
+		len(filteredRefs),
+	) // NOTE-128: ~15 MB at F=3.75 M; pooled to eliminate GC pressure
 	for i, ref := range filteredRefs {
 		filteredPKs[i] = packKey(ref.BlockIdx, ref.RowIdx)
 	}
@@ -1491,7 +1531,9 @@ func mergeJoinFilteredRefsWithVals(
 	// half the size of refIdx{uint32,int} (8 vs 12 bytes/entry). Both fit in uint32:
 	// maxPK < 2^32, len(inRangeRefs) < 2^32. slices.Sort (no closure) is also faster
 	// than SortFunc on the struct form.
-	idxPacked := acquireCompactUint64(len(inRangeRefs)) // NOTE-128: ~57 MB at N=7.2 M; pooled. No clear needed — fully overwritten before slices.Sort.
+	idxPacked := acquireCompactUint64(
+		len(inRangeRefs),
+	) // NOTE-128: ~57 MB at N=7.2 M; pooled. No clear needed — fully overwritten before slices.Sort.
 	for i, ref := range inRangeRefs {
 		idxPacked[i] = uint64(packKey(ref.BlockIdx, ref.RowIdx))<<32 | uint64(uint32(i)) //nolint:gosec
 	}
@@ -1753,6 +1795,12 @@ func accumulateIntrinsicBuckets(
 		dictIdxForRef, dict, dictByPK, maxPK, buildErr := buildDictIdxForRefs(groupByCol, agg.GroupBy[0], inRangeRefs)
 		if buildErr != nil {
 			return buildErr
+		}
+		// NOTE-129: release dictByPK back to the pool when dispatchIntrinsicAccumulate returns.
+		// Size guard (16_000_001 = maxDirectArrayEntries+1) avoids caching an oversized slice
+		// from large-maxPK non-direct-path calls.
+		if dictByPK != nil && cap(dictByPK) <= 16_000_001 {
+			defer releaseCompactUint32(dictByPK)
 		}
 		var aggValsForRef []float64
 		var aggPresent []bool
@@ -2226,7 +2274,7 @@ func buildDictIdxForRefs(
 		}
 	}
 	// Dense array: dictByPK[pk] = dictIdx+1 (0 = absent sentinel).
-	dictByPK = make([]uint32, maxPK+1) //nolint:gosec
+	dictByPK = acquireCompactUint32(int(maxPK) + 1) //nolint:gosec // NOTE-129
 
 	if col == nil {
 		// Column absent: all spans map to the empty-string group (dictByPK stays all zeros).
@@ -2367,7 +2415,8 @@ func accumulateIntrinsicBucketsDirect(
 	// NOTE-091: stepCounts[bk] tracks total in-range spans per time bucket.
 	// Used by accumulateCountRateDirect to compute absent-group counts in
 	// O(numSteps×numGroups) instead of O(maxPK), and eliminates seenByPK.
-	bucketByPK := make([]int16, maxPK+1) //nolint:gosec
+	bucketByPK := acquireDirectInt16(int(maxPK) + 1) // NOTE-129
+	defer releaseDirectInt16(bucketByPK)
 	stepCounts := make([]int64, numSteps)
 	inRangeCount := 0
 	minPK := maxPK // minPK of in-range refs; used as lower-bound in column scans
@@ -2407,7 +2456,8 @@ func accumulateIntrinsicBucketsDirect(
 	dict := []string{""}
 	var dictByPK []uint32
 	if !isCountRate {
-		dictByPK = make([]uint32, maxPK+1) //nolint:gosec
+		dictByPK = acquireCompactUint32(int(maxPK) + 1) // NOTE-129
+		defer releaseCompactUint32(dictByPK)
 	}
 	entryGIdx := make([]uint32, len(groupByCol.DictEntries))
 	for i, entry := range groupByCol.DictEntries {
@@ -2616,10 +2666,11 @@ func accumulateHistogramDirect(
 		return idx
 	}
 
-	seenByPK := make([]bool, maxPK+1) //nolint:gosec
+	seenByPK := acquireDirectBool(int(maxPK) + 1) // NOTE-129
 
 	if col != nil {
 		if err := streamByRefSliceHistogramScanDict(ctx, col, bucketByPK, dictByPK, maxPK, seenByPK, getBoundaryIdx, groupCountsFlat, stride1, stride2, actualStride); err != nil {
+			releaseDirectBool(seenByPK)
 			return err
 		}
 	}
@@ -2640,6 +2691,8 @@ func accumulateHistogramDirect(
 		groupCountsFlat[gIdx*stride1+(bk-1)]++
 	}
 
+	// NOTE-129: release seenByPK before emit — frees 16 MB before non-trivial emit work.
+	releaseDirectBool(seenByPK)
 	return streamByRefSliceHistogramFlatEmit(groupCountsFlat, stride1, stride2, numGroups, dict, boundaries, buckets)
 }
 
@@ -2679,7 +2732,7 @@ func accumulateHistogramDirectN0(
 	// Step 2: build bucketByPK directly — no inRangeRefs materialized.
 	// bucketByPK[pk] = timeBucketIndex+1; 0 = out of range (sentinel).
 	// NOTE-115: int16 stores bk+1 ≤ numSteps ≤ 1440; saves 75% vs int64 (8→2 bytes/entry).
-	bucketByPK := make([]int16, maxPK+1) //nolint:gosec
+	bucketByPK := acquireDirectInt16(int(maxPK) + 1) // NOTE-129
 	for i, ref := range tsCol.BlockRefs[lo:hi] {
 		pk := packKey(ref.BlockIdx, ref.RowIdx)
 		bk := timeBucketIndex(int64(tsCol.Uint64Values[lo+i]), tb.StartTime, tb.StepSizeNanos) //nolint:gosec
@@ -2715,16 +2768,20 @@ func accumulateHistogramDirectN0(
 		return idx
 	}
 
-	seenByPK := make([]bool, maxPK+1) //nolint:gosec
+	seenByPK := acquireDirectBool(int(maxPK) + 1) // NOTE-129
 
 	// Step 5: scan the histogram agg column using the N=0 specialized scanner.
 	// N=0: gIdx is always 0 — no dictByPK allocation or lookup needed.
 	col, err := r.GetIntrinsicColumn(agg.Field)
 	if err != nil {
+		releaseDirectInt16(bucketByPK)
+		releaseDirectBool(seenByPK)
 		return err
 	}
 	if col != nil {
 		if err := scanHistogramN0(ctx, col, bucketByPK, maxPK, seenByPK, getBoundaryIdx, groupCountsFlat, stride2); err != nil {
+			releaseDirectInt16(bucketByPK)
+			releaseDirectBool(seenByPK)
 			return err
 		}
 	}
@@ -2739,6 +2796,9 @@ func accumulateHistogramDirectN0(
 		groupCountsFlat[bk-1]++
 	}
 
+	// NOTE-129: release before emit — frees 32+16 MB before non-trivial emit work.
+	releaseDirectInt16(bucketByPK)
+	releaseDirectBool(seenByPK)
 	// Step 7: emit — single group, dict = [""], numGroups = 1.
 	dict := []string{""}
 	return streamByRefSliceHistogramFlatEmit(groupCountsFlat, stride1, stride2, 1, dict, boundaries, buckets)
@@ -2766,7 +2826,8 @@ func accumulateAggDirect(
 	for i := range groupBuckets {
 		groupBuckets[i] = make([]*aggBucketState, numSteps)
 	}
-	seenByPK := make([]bool, maxPK+1) //nolint:gosec
+	seenByPK := acquireDirectBool(int(maxPK) + 1) // NOTE-129
+	defer releaseDirectBool(seenByPK)
 
 	col, err := r.GetIntrinsicColumn(agg.Field)
 	if err != nil {
@@ -3188,7 +3249,7 @@ func streamByRefSliceHistogram(
 	// bucketByPK[pk] = timeBucketIndex+1 so that 0 means "not in range".
 	// Always allocate when inRangeRefs is non-empty: packKey=0 is a valid span key.
 	// NOTE-115: int16 stores bk+1 ≤ numSteps ≤ 1440; saves 75% vs int64 (8→2 bytes/entry).
-	bucketByPK := make([]int16, maxPK+1) //nolint:gosec
+	bucketByPK := acquireDirectInt16(int(maxPK) + 1) // NOTE-129
 	for i, ref := range inRangeRefs {
 		pk := packKey(ref.BlockIdx, ref.RowIdx)
 		bk := timeBucketIndex(int64(inRangeVals[i]), tb.StartTime, tb.StepSizeNanos) //nolint:gosec
@@ -3200,6 +3261,7 @@ func streamByRefSliceHistogram(
 	// Step 2: fetch col early so we can pre-scan boundary count before allocating.
 	col, err := r.GetIntrinsicColumn(agg.Field)
 	if err != nil {
+		releaseDirectInt16(bucketByPK)
 		return err
 	}
 
@@ -3245,10 +3307,12 @@ func streamByRefSliceHistogram(
 
 	// seenByPK: dense absent-row tracking — avoids a hash set for len(inRangeRefs) pks.
 	// Always allocate when inRangeRefs is non-empty: packKey=0 is a valid span key.
-	seenByPK := make([]bool, maxPK+1) //nolint:gosec
+	seenByPK := acquireDirectBool(int(maxPK) + 1) // NOTE-129
 
 	if col != nil {
 		if err := streamByRefSliceHistogramScanDict(ctx, col, bucketByPK, dictByPK, maxPK, seenByPK, getBoundaryIdx, groupCountsFlat, stride1, stride2, actualStride); err != nil {
+			releaseDirectInt16(bucketByPK)
+			releaseDirectBool(seenByPK)
 			return err
 		}
 	}
@@ -3272,6 +3336,9 @@ func streamByRefSliceHistogram(
 		}
 	}
 
+	// NOTE-129: release before emit — frees 32+16 MB before non-trivial emit work.
+	releaseDirectInt16(bucketByPK)
+	releaseDirectBool(seenByPK)
 	return streamByRefSliceHistogramFlatEmit(groupCountsFlat, stride1, stride2, numGroups, dict, boundaries, buckets)
 }
 
