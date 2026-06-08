@@ -56,10 +56,12 @@ var compactUint32Pool sync.Pool
 // NOTE-125: ~29 MB per call at n=7.2 M. See compactUint32Pool.
 var compactInt32Pool sync.Pool
 
-// compactUint64Pool pools []uint64 for pkOrder (sort scratch) in unfiltered compact-path functions
-// and for idxPacked (sort scratch) in mergeJoinFilteredRefsWithVals.
+// compactUint64Pool pools []uint64 for pkOrder (sort scratch) in unfiltered compact-path functions,
+// for idxPacked (sort scratch) in mergeJoinFilteredRefsWithVals, and for pkBitset (pre-filter)
+// in scanAggColHistogramCompact.
 // NOTE-125: ~57 MB per call at n=7.2 M; released immediately after sort inside block scope.
 // NOTE-128: idxPacked ~57 MB per call at n=7.2 M in mergeJoinFilteredRefsWithVals.
+// NOTE-134: pkBitset ~2 MB per block at maxPK=16M; requires clear() on acquire (zero-sentinel bits).
 var compactUint64Pool sync.Pool
 
 // compactFloat64Pool pools []float64 for aggValByPos in agg compact-path functions.
@@ -105,8 +107,9 @@ func releaseCompactInt32(s []int32) {
 }
 
 // acquireCompactUint64 returns a []uint64 of length n from the pool.
-// Note: no clear is performed because all callers (pkOrder sort scratch) fully overwrite
-// every element before reading. Skipping clear saves ~57 MB × zeroing cost per call.
+// Note: no clear is performed here — most callers (pkOrder, idxPacked sort scratch) fully
+// overwrite every element before reading. Callers that use zero as a sentinel (e.g. pkBitset
+// in scanAggColHistogramCompact, NOTE-134) must call clear(s) themselves after acquire.
 func acquireCompactUint64(n int) []uint64 {
 	if v := compactUint64Pool.Get(); v != nil {
 		if s, ok := v.([]uint64); ok && cap(s) >= n {
@@ -687,7 +690,10 @@ func scanAggColHistogramCompact( //nolint:gocyclo
 		// only for DeltaUint64 (small Flat files don't need it; binary search is fast).
 		var pkBitset []uint64
 		if col.Format == modules_shared.IntrinsicFormatDeltaUint64 && maxPK > 0 {
-			pkBitset = make([]uint64, (maxPK>>6)+1) //nolint:gosec
+			n := int((maxPK >> 6) + 1) //nolint:gosec
+			pkBitset = acquireCompactUint64(n)
+			defer releaseCompactUint64(pkBitset) // NOTE-134: defer covers ctx-cancel early return at line 703
+			clear(pkBitset)                      // NOTE-134: zero-sentinel — must clear stale pool bits before setting
 			for _, pk := range sortedPKs {
 				pkBitset[pk>>6] |= uint64(1) << (pk & 63)
 			}

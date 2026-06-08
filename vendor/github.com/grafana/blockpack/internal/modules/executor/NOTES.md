@@ -3786,3 +3786,22 @@ baseline ~10500ms after r131). Files in the [4M, 8M) maxPK band (which represent
 common production file size) now avoid the DRAM-bound random-access inner loop.
 See NOTE-131 for original threshold rationale.
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:directAggExceedsL3Threshold`
+
+## NOTE-134: scanAggColHistogramCompact pkBitset pooled — 800MB per M8 query eliminated
+*Added: 2026-06-08*
+**Decision:** Replace `make([]uint64, (maxPK>>6)+1)` for `pkBitset` in
+`scanAggColHistogramCompact` with `acquireCompactUint64(n)` + `clear(pkBitset)`,
+released inline at the end of the `IntrinsicFormatDeltaUint64` case block.
+**Rationale:** `pkBitset` is a 2MB scratch buffer allocated once per block for M8 histogram
+queries routed to the DeltaUint64 path. At 400 blocks × 2MB, this is 800MB of short-lived
+heap per query. `compactUint64Pool` already pools `[]uint64` (NOTE-125/128/130); this extends
+the same pool to cover `pkBitset`.
+**Clear requirement:** `pkBitset` uses zero bits as the "absent" sentinel. Stale set bits
+from a previous pool user would cause false-negative pre-filters, silently skipping valid
+refs and producing wrong results. `clear(pkBitset)` is mandatory after acquire.
+`acquireCompactUint64` is not modified; caller performs `clear` explicitly.
+**Release placement:** Inline at end of the Flat/DeltaUint64 case block, guarded by
+`if pkBitset != nil` to handle the Flat sub-path where the bitset is never allocated.
+**Expected impact:** Eliminates 800MB of short-lived allocations per M8 histogram query;
+reduces GC trigger frequency and pause time for warm repeated queries.
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:scanAggColHistogramCompact`
