@@ -58,10 +58,10 @@ var compactInt32Pool sync.Pool
 
 // compactUint64Pool pools []uint64 for pkOrder (sort scratch) in unfiltered compact-path functions,
 // for idxPacked (sort scratch) in mergeJoinFilteredRefsWithVals, and for pkBitset (pre-filter)
-// in scanAggColHistogramCompact.
+// in scanAggColHistogramCompact and scanGroupByColCompact.
 // NOTE-125: ~57 MB per call at n=7.2 M; released immediately after sort inside block scope.
 // NOTE-128: idxPacked ~57 MB per call at n=7.2 M in mergeJoinFilteredRefsWithVals.
-// NOTE-134: pkBitset ~2 MB per block at maxPK=16M; requires clear() on acquire (zero-sentinel bits).
+// NOTE-134/135: pkBitset ~2 MB per block at maxPK=16M; requires clear() on acquire (zero-sentinel bits).
 var compactUint64Pool sync.Pool
 
 // compactFloat64Pool pools []float64 for aggValByPos in agg compact-path functions.
@@ -109,7 +109,7 @@ func releaseCompactInt32(s []int32) {
 // acquireCompactUint64 returns a []uint64 of length n from the pool.
 // Note: no clear is performed here — most callers (pkOrder, idxPacked sort scratch) fully
 // overwrite every element before reading. Callers that use zero as a sentinel (e.g. pkBitset
-// in scanAggColHistogramCompact, NOTE-134) must call clear(s) themselves after acquire.
+// in scanAggColHistogramCompact and scanGroupByColCompact, NOTE-134/135) must call clear(s) themselves after acquire.
 func acquireCompactUint64(n int) []uint64 {
 	if v := compactUint64Pool.Get(); v != nil {
 		if s, ok := v.([]uint64); ok && cap(s) >= n {
@@ -552,6 +552,21 @@ func scanGroupByColCompact(
 	// when a file covers more time than the query window (M_total >> N).
 	minPK, maxPK := sortedPKs[0], sortedPKs[len(sortedPKs)-1]
 
+	// NOTE-135: build pkBitset from sortedPKs to pre-filter Dict refs before interpolation search.
+	// Dict refs within an entry are not packKey-sorted; ~50% fail searchSortedUint32 at 50% selectivity.
+	// A 2MB bitset (one bit per packKey) replaces ~3.6M failed interpolation searches per block.
+	// See NOTE-123/134 for the same pattern in scanAggColHistogramCompact DeltaUint64 path.
+	var pkBitset []uint64
+	if maxPK > 0 {
+		n := int((maxPK >> 6) + 1) //nolint:gosec
+		pkBitset = acquireCompactUint64(n)
+		defer releaseCompactUint64(pkBitset)
+		clear(pkBitset) // NOTE-135: zero-sentinel — must clear stale pool bits before setting
+		for _, pk := range sortedPKs {
+			pkBitset[pk>>6] |= uint64(1) << (pk & 63)
+		}
+	}
+
 	switch col.Format {
 	case modules_shared.IntrinsicFormatDict:
 		for _, entry := range col.DictEntries {
@@ -568,6 +583,9 @@ func scanGroupByColCompact(
 				pk := packKey(ref.BlockIdx, ref.RowIdx)
 				if pk < minPK || pk > maxPK {
 					continue
+				}
+				if len(pkBitset) > 0 && pkBitset[pk>>6]&(uint64(1)<<(pk&63)) == 0 {
+					continue // NOTE-135: fast pre-filter: pk not in sortedPKs
 				}
 				pos, found := searchSortedUint32(sortedPKs, pk)
 				if !found {
@@ -639,6 +657,18 @@ func scanAggColHistogramCompact( //nolint:gocyclo
 	spanCount := 0
 	switch col.Format {
 	case modules_shared.IntrinsicFormatDict:
+		// NOTE-135: pkBitset pre-filter for Dict refs — same pattern as DeltaUint64 case (NOTE-123/134).
+		// Dict refs within an entry are not packKey-sorted; ~50% fail searchSortedUint32 at 50% selectivity.
+		var pkBitset []uint64
+		if maxPK > 0 {
+			n := int((maxPK >> 6) + 1) //nolint:gosec
+			pkBitset = acquireCompactUint64(n)
+			defer releaseCompactUint64(pkBitset) // defer covers ctx-cancel early returns
+			clear(pkBitset)                      // NOTE-135: zero-sentinel — must clear stale pool bits
+			for _, pk := range sortedPKs {
+				pkBitset[pk>>6] |= uint64(1) << (pk & 63)
+			}
+		}
 		for _, entry := range col.DictEntries {
 			var v float64
 			if entry.Value != "" {
@@ -664,6 +694,9 @@ func scanAggColHistogramCompact( //nolint:gocyclo
 				pk := packKey(ref.BlockIdx, ref.RowIdx)
 				if pk < minPK || pk > maxPK {
 					continue
+				}
+				if len(pkBitset) > 0 && pkBitset[pk>>6]&(uint64(1)<<(pk&63)) == 0 {
+					continue // NOTE-135: fast pre-filter: pk not in sortedPKs
 				}
 				pos, found := searchSortedUint32(sortedPKs, pk)
 				if !found {

@@ -3805,3 +3805,32 @@ refs and producing wrong results. `clear(pkBitset)` is mandatory after acquire.
 **Expected impact:** Eliminates 800MB of short-lived allocations per M8 histogram query;
 reduces GC trigger frequency and pause time for warm repeated queries.
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:scanAggColHistogramCompact`
+
+## NOTE-135: Bitset pre-filter in scanGroupByColCompact and scanAggColHistogramCompact Dict paths
+*Added: 2026-06-08*
+**Decision:** Add a pkBitset pre-filter to the `IntrinsicFormatDict` case in both
+`scanGroupByColCompact` and `scanAggColHistogramCompact`, using the same pool and pattern
+as NOTE-123/134 (DeltaUint64 case in `scanAggColHistogramCompact`).
+**Rationale:** The Dict inner loop iterates all `entry.BlockRefs` for each DictEntry and
+calls `searchSortedUint32` (interpolation search, 3–5 probes) per ref. Dict refs within an
+entry are not packKey-sorted, so there is no spatial locality with `sortedPKs`. At 50%
+selectivity (M8: `kind=server` group by `resource.service.name`), ~50% of in-range Dict refs
+fail the interpolation search — an estimated 3.6M failed lookups per block. Each costs
+~15–20ns (3–5 cache-missing probes on a 3.75M-entry array). A 2MB bitset pre-filter
+(one bit per packKey up to maxPK, L3-resident) eliminates these at ~2ns per rejected ref.
+**Math:** 3.6M refs × 13–18ns saved × 400 blocks ≈ 18–28 seconds per M8 query. The
+bitset build costs: N/64 uint64 writes + N index writes = ~3.75M writes ≈ 1µs per block,
+negligible.
+**Correctness:** False positives (bit set for a pk not in sortedPKs) are impossible by
+construction. False negatives (bit cleared for a pk in sortedPKs) are impossible if
+`clear(pkBitset)` is called before setting bits. The `searchSortedUint32` call is still
+present as the authoritative check — the bitset is a pre-filter only.
+**Clear requirement:** Same as NOTE-134. `clear(pkBitset)` is mandatory; `acquireCompactUint64`
+does not clear.
+**Two independent bitsets:** `scanAggColHistogramCompact` now has two pkBitset defers — one
+for Dict (NOTE-135) and one for DeltaUint64 (NOTE-134). Both use the same pool; both are
+released on function exit. Release order (LIFO) does not matter for pool puts.
+**Expected impact:** 5–12% M8 improvement (M8 = histogram group-by with predicate). Minor
+benefit to M4/M7 (those call `scanGroupByColCompact` for the group-by column scan).
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:scanGroupByColCompact`,
+`internal/modules/executor/metrics_trace_intrinsic.go:scanAggColHistogramCompact`
