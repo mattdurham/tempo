@@ -2382,6 +2382,23 @@ func buildDictIdxForRefs(
 	return dictIdxForRef, dict, dictByPK, maxPK, nil
 }
 
+// directAggExceedsL3Threshold reports whether the direct path should be skipped because
+// its working array would exceed L3 cache capacity, causing DRAM-bound random access.
+//
+// NOTE-117: non-histogram agg (max/min/sum/avg) uses dictByPK (uint32, 4 bytes/entry).
+// Threshold 4M: dictByPK = 16MB ≤ typical L3 → direct OK; beyond → compact preferred.
+//
+// NOTE-131: count/rate uses bucketByPK (int16, 2 bytes/entry).
+// Threshold 8M: bucketByPK = 16MB ≤ typical L3 (24-30MB) → direct OK; beyond → compact.
+func directAggExceedsL3Threshold(isCountRate bool, fn string, maxPK uint32) bool {
+	const maxDirectAggEntries = 4_000_000
+	const maxDirectCountRateEntries = 8_000_000
+	if isCountRate {
+		return int64(maxPK)+1 > maxDirectCountRateEntries //nolint:gosec
+	}
+	return fn != vm.FuncNameHISTOGRAM && int64(maxPK)+1 > maxDirectAggEntries //nolint:gosec
+}
+
 // accumulateIntrinsicBucketsDirect is the no-predicate N=1 fast path.
 // Builds bucketByPK directly from the span:start column slice [lo, hi] without
 // materializing inRangeRefs/inRangeVals/dictIdxForRef. Returns (true, nil) on
@@ -2429,19 +2446,8 @@ func accumulateIntrinsicBucketsDirect(
 		return false, nil
 	}
 
-	// NOTE-117: for non-histogram agg functions (max/min/sum/avg), dictByPK costs
-	// (maxPK+1)×4 bytes — 16MB at 4M entries, 64MB at 16M entries. When maxPK > 4M,
-	// dictByPK exceeds a typical L3 cache (24MB), causing DRAM-level cache misses on
-	// every dictByPK[pk] lookup in accumulateAggDirectScanCol. The compact path
-	// (streamAggN1Compact) uses sortedPKs (n×4 bytes) which is much smaller: 4MB for
-	// n=1M in-range refs (fits in L2). Binary search in L2/L3 is faster than random
-	// DRAM reads into a 16-64MB dictByPK array.
-	//
-	// Threshold 4M: dictByPK = 16MB ≤ typical L3 → direct path OK.
-	//              dictByPK > 16MB → compact path preferred.
-	// count/rate is unaffected: it uses entryGIdx (not dictByPK) and has lower memory cost.
-	const maxDirectAggEntries = 4_000_000
-	if !isCountRate && agg.Function != vm.FuncNameHISTOGRAM && int64(maxPK)+1 > maxDirectAggEntries { //nolint:gosec
+	// NOTE-117/NOTE-131: route to compact path when dictByPK or bucketByPK exceeds L3.
+	if directAggExceedsL3Threshold(isCountRate, agg.Function, maxPK) {
 		return false, nil
 	}
 

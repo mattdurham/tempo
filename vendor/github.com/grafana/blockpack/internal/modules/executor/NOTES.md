@@ -3739,3 +3739,12 @@ function exits early (empty inputs) so the call site needs no nil check.
 New pool: `compactBlockRefPool` (mirrors `compactUint64Pool` but for `[]modules_shared.BlockRef`).
 No `clear()` on acquire — callers use `[:0]+append`, so all positions are overwritten before read.
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:mergeJoinFilteredRefsWithVals`
+
+## NOTE-131: maxDirectCountRateEntries = 8M — compact path for count/rate when bucketByPK > L3 cache
+*Added: 2026-06-08*
+**Decision:** In `accumulateIntrinsicBucketsDirect`, add a threshold `maxDirectCountRateEntries = 8_000_000` for count/rate. When `maxPK > 8M`, return `false` to trigger `streamCountRateN1Compact` instead of proceeding with `accumulateCountRateDirect`.
+**Rationale:** `bucketByPK` is `[]int16` (NOTE-115), costing `(maxPK+1)×2` bytes — 16MB at 8M entries, 32MB at 16M entries. The access pattern in `accumulateCountRateDirect` is random (one lookup per span ref in the group-by dict scan, scattered across 32MB), causing L3 thrashing and DRAM fetches at 300M+ probes per file. The compact path (`streamCountRateN1Compact`, NOTE-108) uses `sortedPKs` sized to n×4 bytes (n = in-range refs, not maxPK); for M4 with 3.5M in-range refs, `sortedPKs` = 14MB (L3-resident). Binary search in a 14MB L3-resident array is faster than random DRAM reads into 32MB `bucketByPK`. Previously, count/rate was excluded from the `maxDirectAggEntries` guard (NOTE-117) because it avoids `dictByPK` allocation — but `bucketByPK` itself is the bottleneck at high maxPK.
+**Threshold 8M:** `bucketByPK` = 16MB ≤ typical L3 (24-30MB) → direct path OK. Beyond 8M entries, the 16MB+ `bucketByPK` competes with `groupCountsFlat` (3-4MB) and the group-by column data for L3 capacity, causing evictions. The compact path's `sortedPKs` scales with n (in-range refs), not maxPK, so it stays L3-resident even on large files.
+**Invariant:** `streamCountRateN1Compact` produces identical results to `accumulateCountRateDirect` — same absent-row semantics, same bucket emission (NOTE-108). This is a pure dispatch optimization, not a correctness change. A wrong threshold only affects performance.
+**Impact:** M4 `{} | rate() by (resource.service.name)` on large production files (maxPK ≈ 16M): estimated 60-70% reduction (13728ms → ~4000-5500ms) by eliminating DRAM-bound random reads from the hot accumulation loop.
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:accumulateIntrinsicBucketsDirect`
