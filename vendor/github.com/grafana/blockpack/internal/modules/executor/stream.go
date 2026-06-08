@@ -204,6 +204,22 @@ func Collect(
 	// For pure intrinsic + unsorted (Case A): reads only candidate blocks (not all blocks).
 	// For mixed queries (Cases C/D): candidate blocks read, VM ColumnPredicate re-evaluates.
 	//
+	// NOTE-127: Match-all + limit fast path for queries with no predicates (e.g. "{}").
+	// hasSomeIntrinsicPredicates returns false for match-all programs (no Nodes/Columns),
+	// so they previously fell through to the full block scan. When the file has an intrinsic
+	// section and a timestamp sort with a limit, read only the timestamp blob (cached) and
+	// extract the top-N refs without decoding values. Then hydrate only the blocks containing
+	// those rows — typically 1-3 blocks vs all blocks for the full scan path.
+	if isMatchAllProgram(program) && opts.Limit > 0 && opts.TimestampColumn != "" &&
+		r.HasIntrinsicSection() {
+		rows, fastQS, err := collectMatchAllTopK(r, opts, wantColumns, secondPassCols)
+		if err != errNeedBlockScan {
+			fastQS.TotalDuration = time.Since(queryStart)
+			return rows, fastQS, err
+		}
+		// Fall through to full block scan if fast path is not applicable.
+	}
+
 	// NOTE-038: 4-case dispatch inside collectFromIntrinsicRefs based on
 	// (ProgramIsIntrinsicOnly × opts.TimestampColumn != "").
 	// errNeedBlockScan signals the pre-filter is not applicable; fall through to full scan.
@@ -651,6 +667,160 @@ func collectWithBloomCheck(
 		return nil, qs, nil
 	}
 	return collectFromIntrinsicRefs(r, program, opts, wantColumns, secondPassCols, &qs)
+}
+
+// isMatchAllProgram reports whether the program is a match-all query (no predicates).
+// A match-all program has a non-nil Predicates with empty Nodes and Columns.
+// nil Predicates is also match-all (no filter compiled at all).
+// NOTE-127: used to gate the match-all + limit fast path.
+func isMatchAllProgram(program *vm.Program) bool {
+	if program == nil {
+		return true
+	}
+	if program.HasVector {
+		return false
+	}
+	if program.Predicates == nil {
+		return true
+	}
+	return len(program.Predicates.Nodes) == 0 && len(program.Predicates.Columns) == 0
+}
+
+// collectMatchAllTopK handles the match-all + limit + timestamp-sort fast path.
+// Reads only the timestamp column blob (cached) and extracts the top-N BlockRefs
+// without decoding values via ScanFlatColumnTopKRefs. Then fetches only the blocks
+// containing those rows.
+//
+// Returns errNeedBlockScan when the blob is unavailable or ScanFlatColumnTopKRefs
+// returns nil (unsupported blob format).
+// NOTE-127: Case E — match-all + sort + limit.
+func collectMatchAllTopK(
+	r *modules_reader.Reader,
+	opts CollectOptions,
+	wantColumns map[string]struct{},
+	secondPassCols map[string]struct{},
+) ([]MatchedRow, QueryStats, error) {
+	var qs QueryStats
+	qs.ExecutionPath = ExecPathMatchAllTopK
+	stepStart := time.Now()
+
+	backward := opts.Direction == queryplanner.Backward
+	limit := opts.Limit
+
+	tsBlob, tsBlobErr := r.GetIntrinsicColumnBlob(opts.TimestampColumn)
+	if tsBlobErr != nil || tsBlob == nil {
+		qs.ExecutionPath = ExecPathIntrinsicNeedBlock
+		return nil, qs, errNeedBlockScan
+	}
+
+	refs := modules_shared.ScanFlatColumnTopKRefs(tsBlob, limit, backward)
+	if refs == nil {
+		qs.ExecutionPath = ExecPathIntrinsicNeedBlock
+		return nil, qs, errNeedBlockScan
+	}
+
+	// Apply sub-file shard filtering.
+	refs = filterRefsByShardRange(refs, opts)
+
+	if len(refs) == 0 {
+		qs.Steps = append(qs.Steps, StepStats{
+			Name:     stepNameIntrinsic,
+			Duration: time.Since(stepStart),
+			Metadata: map[string]any{"selected_blocks": 0},
+		})
+		return nil, qs, nil
+	}
+
+	// Apply time-range post-filter: ScanFlatColumnTopKRefs does not filter by time range.
+	// Copies the same pattern as collectIntrinsicTopKScan (lines 1198-1222).
+	if opts.TimeRange.MinNano > 0 || opts.TimeRange.MaxNano > 0 {
+		tsCol, tsErr := r.GetIntrinsicColumn(opts.TimestampColumn)
+		if tsErr == nil && tsCol != nil && len(tsCol.Uint64Values) == len(tsCol.BlockRefs) {
+			filtered := refs[:0]
+			for _, ref := range refs {
+				packed := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx)
+				ts, ok := tsCol.LookupRefFastUint64(packed)
+				if !ok {
+					continue
+				}
+				if opts.TimeRange.MinNano > 0 && ts < opts.TimeRange.MinNano {
+					continue
+				}
+				if opts.TimeRange.MaxNano > 0 && ts > opts.TimeRange.MaxNano {
+					continue
+				}
+				filtered = append(filtered, ref)
+			}
+			refs = filtered
+		}
+	}
+
+	if len(refs) == 0 {
+		qs.Steps = append(qs.Steps, StepStats{
+			Name:     stepNameIntrinsic,
+			Duration: time.Since(stepStart),
+			Metadata: map[string]any{"selected_blocks": 0},
+		})
+		return nil, qs, nil
+	}
+
+	// Hydrate: fetch only the blocks containing the matched refs.
+	selectedBlocks := countUniqueBlockIdxs(refs)
+	slices.SortFunc(refs, blockRefCompare)
+	blockOrder, blockCandidates := groupRefsByBlock(refs)
+	results := make([]MatchedRow, 0, len(refs))
+	hydrateErr := forEachBlockInGroups(
+		r,
+		blockOrder,
+		blockCandidates,
+		wantColumns,
+		secondPassCols,
+		"collectMatchAllTopK",
+		nil,
+		func(pb parsedBlock, candidateRows []int) error {
+			for _, rowIdx := range candidateRows {
+				results = append(results, MatchedRow{
+					Block:    pb.Block,
+					BlockIdx: pb.BlockIdx,
+					RowIdx:   rowIdx,
+				})
+			}
+			return nil
+		},
+	)
+	if hydrateErr != nil {
+		return nil, qs, hydrateErr
+	}
+
+	// Re-sort by timestamp: forEachBlockInGroups re-orders rows by (BlockIdx, RowIdx),
+	// destroying the newest-first ordering from ScanFlatColumnTopKRefs.
+	// Mirrors collectIntrinsicTopK lines 1149-1172.
+	if opts.TimestampColumn != "" && len(results) > 1 {
+		slices.SortStableFunc(results, func(a, b MatchedRow) int {
+			var tsA, tsB uint64
+			if a.Block != nil {
+				if col := a.Block.GetColumn(opts.TimestampColumn); col != nil {
+					tsA, _ = col.Uint64Value(a.RowIdx)
+				}
+			}
+			if b.Block != nil {
+				if col := b.Block.GetColumn(opts.TimestampColumn); col != nil {
+					tsB, _ = col.Uint64Value(b.RowIdx)
+				}
+			}
+			if backward {
+				return cmp.Compare(tsB, tsA)
+			}
+			return cmp.Compare(tsA, tsB)
+		})
+	}
+
+	qs.Steps = append(qs.Steps, StepStats{
+		Name:     stepNameIntrinsic,
+		Duration: time.Since(stepStart),
+		Metadata: map[string]any{"selected_blocks": selectedBlocks},
+	})
+	return results, qs, nil
 }
 
 // NOTE-038: The partial-AND pre-filter for mixed queries is a superset; ColumnPredicate

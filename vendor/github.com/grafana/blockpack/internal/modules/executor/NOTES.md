@@ -3650,3 +3650,22 @@ Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:streamCountRateN
 **Decision:** Change `blockColumnProvider.FullScan()` to return `allMatchRowSet(n)` instead of allocating and filling `[]int{0..N}` eagerly.
 **Rationale:** Q1 `{}` (match-all) calls `FullScan()` once per block. For a 400-block query, this produced 400 × `make([]int, spanCount)` allocations before any guard checks. The `allMatchSet` sentinel satisfies `Size()`, `IsEmpty()`, and `Contains()` in O(1) with zero allocation; `ToSlice()` defers the `make` until materialisation is actually required. `collectMixedPlain` and `collectMixedTopK` call only `Contains()` — eliminating the allocation entirely on those paths. NOTE-107 scratch-lifetime invariant is unaffected.
 Back-ref: `internal/modules/executor/column_provider.go:FullScan`
+
+## NOTE-127: Match-all + limit fast path — ScanFlatColumnTopKRefs
+*Added: 2026-06-08*
+**Decision:** Add `collectMatchAllTopK` gated by `isMatchAllProgram` in `Collect`.
+For `{}` with `MostRecent=true, Limit=N`, instead of `topKScanBlocks` (reads all blocks),
+read only the `TimestampColumn` intrinsic blob (cached in `parsedIntrinsicCache`) and call
+`ScanFlatColumnTopKRefs` to extract the top-N refs without decoding values. Then fetch only
+the ~1-3 blocks containing those rows via `forEachBlockInGroups`.
+**Why:** `hasSomeIntrinsicPredicates` returns false for match-all programs (no Nodes), so they
+previously bypassed the intrinsic fast path entirely. `ScanFlatColumnTopKRefs` was effectively
+unused on the match-all path — this wires it into production.
+**Execution path:** `ExecPathMatchAllTopK = "match-all-topk"`.
+**Fallback:** returns `errNeedBlockScan` if `GetIntrinsicColumnBlob` fails or `ScanFlatColumnTopKRefs`
+returns nil (unsupported blob format). Full block scan proceeds normally in that case.
+**Vector guard:** `isMatchAllProgram` returns false when `program.HasVector == true`, preventing
+accidental activation for vector queries.
+**Applies to:** trace queries (TimestampColumn == "span:start") and log queries (log:timestamp)
+with an intrinsic section.
+Back-ref: `internal/modules/executor/stream.go:collectMatchAllTopK,isMatchAllProgram`

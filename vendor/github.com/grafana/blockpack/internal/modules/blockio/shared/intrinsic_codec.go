@@ -1370,11 +1370,52 @@ func scanFlatPagedFiltered(blob []byte, backward bool, limit int, filter func(Bl
 	return result
 }
 
+// scanDeltaUint64PageRange performs a single-pass uvarint scan to find the matching
+// range [startIdx, endIdx) and the refs-section byte offset p.
+// NOTE-017: no allocation — values are never materialized as a slice.
+// DeltaUint64 values are monotonically non-decreasing (deltas >= 0), so early
+// termination on acc > hi is correct. Returns ok=false on decode error.
+func scanDeltaUint64PageRange(
+	pageRaw []byte,
+	rowCount int,
+	lo, hi uint64,
+	hasLo, hasHi bool,
+) (startIdx, endIdx, p int, ok bool) {
+	startIdx = -1
+	endIdx = rowCount
+	var acc uint64
+	for i := range rowCount {
+		delta, n := binary.Uvarint(pageRaw[p:])
+		if n <= 0 {
+			return 0, 0, 0, false
+		}
+		acc += delta
+		p += n
+		if startIdx < 0 && (!hasLo || acc >= lo) {
+			startIdx = i
+		}
+		if hasHi && acc > hi {
+			endIdx = i
+			// Advance p to refs section start: scan remaining uvarints.
+			for j := i + 1; j < rowCount; j++ {
+				_, n = binary.Uvarint(pageRaw[p:])
+				if n <= 0 {
+					return 0, 0, 0, false
+				}
+				p += n
+			}
+			break
+		}
+	}
+	return startIdx, endIdx, p, true
+}
+
 // scanDeltaUint64PagedBlob handles range scan for IntrinsicFormatDeltaUint64 paged blobs.
-// It decodes the single page's uvarint stream sequentially to reconstruct absolute values,
-// then collects refs where value is within [lo, hi].
+// It decodes the uvarint stream in a single pass via scanDeltaUint64PageRange, finding
+// startIdx and endIdx for the matching range [lo, hi], then reads only refs in that range.
 //
 // NOTE-014: must NOT call pageRefsStart — DeltaUint64 pages have no values_len prefix.
+// NOTE-017: single-pass streaming decode eliminates make([]uint64, rowCount) allocation.
 func scanDeltaUint64PagedBlob(
 	blob []byte,
 	toc PagedIntrinsicTOC,
@@ -1396,6 +1437,19 @@ func scanDeltaUint64PagedBlob(
 
 	var result []BlockRef
 	for _, pm := range toc.Pages {
+		// NOTE-017: min/max page skip — mirrors scanFlatPagedBlob lines 1233-1243.
+		// encodeDeltaUint64Intrinsic writes Min/Max into PageMeta; the reader was not using them.
+		if len(pm.Min) == 8 && len(pm.Max) == 8 {
+			pageMin := binary.LittleEndian.Uint64([]byte(pm.Min))
+			pageMax := binary.LittleEndian.Uint64([]byte(pm.Max))
+			if hasLo && pageMax < lo {
+				continue
+			}
+			if hasHi && pageMin > hi {
+				continue
+			}
+		}
+
 		pageStart := pos + int(pm.Offset)
 		pageEnd := pageStart + int(pm.Length)
 		if pageEnd > len(blob) {
@@ -1407,36 +1461,28 @@ func scanDeltaUint64PagedBlob(
 			return nil
 		}
 
-		rowCount := int(pm.RowCount)
-		// Decode all uvarint values first to find where refs section begins.
-		values := make([]uint64, rowCount)
-		p := 0
-		var acc uint64
-		for i := range rowCount {
-			delta, n := binary.Uvarint(pageRaw[p:])
-			if n <= 0 {
-				return nil
-			}
-			acc += delta
-			values[i] = acc
-			p += n
+		startIdx, endIdx, p, ok := scanDeltaUint64PageRange(pageRaw, int(pm.RowCount), lo, hi, hasLo, hasHi)
+		if !ok {
+			return nil
 		}
 		// refs section starts at p.
-		for i, v := range values {
-			if hasLo && v < lo {
-				continue
-			}
-			if hasHi && v > hi {
-				continue
-			}
-			refPos := p + i*refSize
+		if startIdx < 0 || startIdx >= endIdx {
+			continue
+		}
+		count := endIdx - startIdx
+		if maxRefs > 0 && len(result)+count > maxRefs {
+			count = maxRefs - len(result)
+		}
+		refPos := p + startIdx*refSize
+		for range count {
 			if refPos+refSize > len(pageRaw) {
 				break
 			}
 			result = append(result, decodeRef(pageRaw, refPos, blockW, rowW))
-			if maxRefs > 0 && len(result) >= maxRefs {
-				return result
-			}
+			refPos += refSize
+		}
+		if maxRefs > 0 && len(result) >= maxRefs {
+			return result
 		}
 	}
 	return result

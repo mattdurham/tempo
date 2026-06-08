@@ -433,7 +433,7 @@ func searchSortedUint32(s []uint32, pk uint32) (int, bool) {
 			return -1, false
 		}
 		// Interpolate position — all operands are uint64 to prevent overflow.
-		pos := lo + int(uint64(hi-lo)*uint64(pk-s[lo])/uint64(s[hi]-s[lo]))
+		pos := lo + int(uint64(hi-lo)*uint64(pk-s[lo])/uint64(s[hi]-s[lo])) //nolint:gosec
 		if s[pos] == pk {
 			return pos, true
 		}
@@ -538,7 +538,7 @@ func scanGroupByColCompact(
 
 // scanAggColHistogramCompact is the compact-path equivalent of streamByRefSliceHistogramScanDict.
 // Uses binary search over sortedPKs instead of a dense bucketByPK array.
-func scanAggColHistogramCompact(
+func scanAggColHistogramCompact( //nolint:gocyclo
 	ctx context.Context,
 	col *modules_shared.IntrinsicColumn,
 	sortedPKs []uint32,

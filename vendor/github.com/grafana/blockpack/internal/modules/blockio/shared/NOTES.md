@@ -471,3 +471,25 @@ with the same blockIdx cluster together when sorted ascending.
 **Caller:** `executor.populateTypedColumnForBlock` (NOTE-100 in executor/NOTES.md).
 
 Back-ref: `internal/modules/blockio/shared/intrinsic_ref_index.go:BlockRefRange`
+
+---
+
+## NOTE-017: scanDeltaUint64PagedBlob — single-pass streaming decode + min/max page skip
+*Added: 2026-06-08*
+
+**Decision:** Replace two-pass decode (allocate `[]uint64`, fill all values, scan) with
+single-pass streaming decode that tracks `startIdx`/`endIdx` while advancing `p` through
+the uvarint stream, then reads only refs in the matching range.
+
+**Allocation eliminated:** `make([]uint64, rowCount)` — 60MB for 7.5M-span production files.
+
+**Min/max page skip:** Added the same `pm.Min`/`pm.Max` guard as `scanFlatPagedBlob`
+(lines 1233-1243). The writer stores these in `PageMeta` (`intrinsic_accum.go`); the reader
+was not using them for DeltaUint64 pages. Enables O(pages) skip for selective range predicates.
+
+**Correctness invariant:** When `endIdx` is found before all uvarints are consumed, the inner
+advance loop must complete the remaining uvarint scan to position `p` at the refs section start.
+`refPos = p + startIdx*refSize` depends on `p` being exact. DeltaUint64 values are monotonically
+non-decreasing (deltas >= 0), so early termination on `acc > hi` is safe.
+
+Back-ref: `internal/modules/blockio/shared/intrinsic_codec.go:scanDeltaUint64PagedBlob`

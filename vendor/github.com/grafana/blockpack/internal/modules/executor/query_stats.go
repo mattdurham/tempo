@@ -10,6 +10,7 @@ const (
 	ExecPathIntrinsicPlain     = "intrinsic-plain"
 	ExecPathIntrinsicTopKKLL   = "intrinsic-topk-kll"
 	ExecPathIntrinsicTopKScan  = "intrinsic-topk-scan"
+	ExecPathMatchAllTopK       = "match-all-topk"
 	ExecPathMixedPlain         = "mixed-plain"
 	ExecPathMixedTopK          = "mixed-topk"
 	ExecPathBloomRejected      = "bloom-rejected"
