@@ -182,10 +182,12 @@ func (r *Reader) readBlockColumnarWithCache(
 	blockIdx int,
 	wantColumns map[string]struct{},
 ) ([]byte, error) {
-	subType := uint32(blockIdx) //nolint:gosec
+	// Encode blockIdx in the name field so subType=0 always, avoiding accidental
+	// collision with ToCSubTypeBloom(3), ToCSubTypeIntrinsic(4), ToCSubTypeTrace(5).
+	tocKey := fmt.Sprintf("%d", blockIdx)
 
 	// Phase 1: ToC — cached.
-	toc, err := r.cache.GetOrFetchV8Section(r.fileID, sectionTypeBlockToc, subType, "", func() ([]byte, error) {
+	toc, err := r.cache.GetOrFetchV8Section(r.fileID, sectionTypeBlockToc, 0, tocKey, func() ([]byte, error) {
 		tocSize := min(blockLen, tocHintBytes)
 		buf := make([]byte, tocSize)
 		if _, readErr := r.provider.ReadAt(buf, blockOff, rw.DataTypeMetadata); readErr != nil {
@@ -255,8 +257,8 @@ func (r *Reader) readBlockColumnarWithCache(
 		colBytes, fetchErr := r.cache.GetOrFetchV8Section(
 			r.fileID,
 			sectionTypeBlockCol,
-			subType,
-			m.name,
+			0,
+			fmt.Sprintf("%d/%s", blockIdx, m.name),
 			func() ([]byte, error) {
 				if colStart+colLen <= int64(len(toc)) {
 					cp := make([]byte, colLen)
