@@ -3756,3 +3756,33 @@ Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:accumulateIntrin
 **Correctness:** `streamHistogramN1Compact` is already battle-tested on this input shape via `accumulateIntrinsicBuckets` (line 1827, NOTE-092). `inRangeRefs`/`inRangeVals` from the no-predicate path are timestamp-ordered (not packKey-sorted), which is handled correctly — `streamHistogramN1Compact` performs its own pkOrder sort at line 1427–1431. The `groupByCol` nil check inside `streamHistogramN1Compact` (line 999 equivalent) handles missing columns safely. `numSteps <= 0` guard is added to match the pattern used by `streamAggN1Compact` (line 955) and `streamCountRateN1Compact` (line 752).
 **Impact:** M8 `{span.kind = server} | histogram_over_time(duration) by (resource.service.name)` — for files where `accumulateIntrinsicBucketsDirect` returns false (maxPK > maxDirectAggEntries = 4M), eliminates the 3 GB `keyToBucket` allocation per goroutine per file. At 400 files × 8 goroutines, this removes up to 9.6 TB of heap churn, reducing GC pause time and peak RSS.
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:dispatchIntrinsicAccumulate`
+
+## NOTE-133: maxDirectCountRateEntries lowered 8M → 4M — tighter L3 budget for co-resident arrays
+*Added: 2026-06-08*
+**Decision:** Lower `maxDirectCountRateEntries` from `8_000_000` to `4_000_000` in
+`directAggExceedsL3Threshold`. Files with maxPK in [4M, 8M) now route to
+`streamCountRateN1Compact` instead of `accumulateCountRateDirect`.
+**Rationale:** NOTE-131 justified 8M on the assumption that `bucketByPK` (16MB) fits
+in L3 (24–30MB). That analysis did not account for the two co-resident working sets
+present during the same accumulation loop: `groupCountsFlat` (3–4MB for ~280 groups ×
+1440 steps, pooled but in active use) and the group-by column blob (~0.5–2MB per file,
+held in the reader cache). The effective L3 budget for `bucketByPK` is therefore ~20MB,
+not 24MB. At 8M entries, `bucketByPK` = 16MB already causes L3 competition and
+eviction-driven DRAM reads on the random-access inner loop of `accumulateCountRateDirect`.
+At 4M entries, `bucketByPK` = 8MB — comfortably L3-resident alongside both co-residents.
+Production files with maxPK in [4M, 8M) (the typical range for 2000 rows/block × 2–4
+block layers) now take the compact path: `sortedPKs` at n×4 bytes (n = in-range refs,
+typically 3–3.5M) = 12–14MB, also L3-resident. Binary search over a 14MB L3-resident
+array is faster than random probes into a 16MB `bucketByPK` that is competing with
+co-residents for L3 ways.
+**Threshold alignment:** 4M matches `maxDirectAggEntries` (NOTE-117), making the direct
+path boundary uniform across all function types (count/rate, agg, histogram). The
+previous 8M was the outlier; this corrects it.
+**Invariant preserved (NOTE-131):** `streamCountRateN1Compact` produces identical
+results to `accumulateCountRateDirect`. A wrong threshold only affects performance, never
+correctness. The change is safe to revert if production profiling shows no improvement.
+**Expected impact:** 15–25% improvement on M4 (`{} | rate() by (resource.service.name)`,
+baseline ~10500ms after r131). Files in the [4M, 8M) maxPK band (which represent the
+common production file size) now avoid the DRAM-bound random-access inner loop.
+See NOTE-131 for original threshold rationale.
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:directAggExceedsL3Threshold`

@@ -2401,11 +2401,11 @@ func buildDictIdxForRefs(
 // NOTE-117: non-histogram agg (max/min/sum/avg) uses dictByPK (uint32, 4 bytes/entry).
 // Threshold 4M: dictByPK = 16MB ≤ typical L3 → direct OK; beyond → compact preferred.
 //
-// NOTE-131: count/rate uses bucketByPK (int16, 2 bytes/entry).
-// Threshold 8M: bucketByPK = 16MB ≤ typical L3 (24-30MB) → direct OK; beyond → compact.
+// NOTE-133: count/rate uses bucketByPK (int16, 2 bytes/entry).
+// Threshold 4M: bucketByPK = 8MB ≤ L3 alongside co-residents → direct OK; beyond → compact.
 func directAggExceedsL3Threshold(isCountRate bool, fn string, maxPK uint32) bool {
 	const maxDirectAggEntries = 4_000_000
-	const maxDirectCountRateEntries = 8_000_000
+	const maxDirectCountRateEntries = 4_000_000
 	if isCountRate {
 		return int64(maxPK)+1 > maxDirectCountRateEntries //nolint:gosec
 	}
