@@ -3720,3 +3720,22 @@ remain 0 for sentinel checks, and (b) stale values from the previous pool user.
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:buildDictIdxForRefs,
 accumulateIntrinsicBucketsDirect,accumulateHistogramDirect,accumulateHistogramDirectN0,
 accumulateAggDirect,streamByRefSliceHistogram`
+
+## NOTE-130: mergeJoinFilteredRefsWithVals — outRefs and outVals pooled
+*Added: 2026-06-08*
+**Decision:** Replace `make([]modules_shared.BlockRef, 0, outCap)` (`outRefs`) and
+`make([]uint64, 0, outCap)` (`outVals`) in `mergeJoinFilteredRefsWithVals` with
+`acquireCompactBlockRef` / `releaseCompactBlockRef` and the existing `acquireCompactUint64`
+/ `releaseCompactUint64` respectively. Adds `release func()` as a third return value;
+the single call site (`executeTraceMetricsIntrinsic`) releases after `dispatchIntrinsicAccumulate` returns.
+**Rationale:** Extends NOTE-128 (which pooled idxPacked/filteredPKs in the same function)
+to cover the output slices. At outCap ≈ 3.5M (F ≤ N/2 at 50% selectivity for `span.kind=server`),
+`outRefs` costs ~14 MB per call and `outVals` costs ~28 MB per call. For a 400-block M8 query:
+eliminates 400 × 42 MB = 16.8 GB of short-lived allocations per query. Unlike idxPacked/filteredPKs
+(which are pure scratch released before return), outRefs/outVals are returned to the caller and
+consumed by `dispatchIntrinsicAccumulate`. The `release func()` return value delegates cleanup to
+the call site, which is the only consumer of these slices. A no-op closure is returned when the
+function exits early (empty inputs) so the call site needs no nil check.
+New pool: `compactBlockRefPool` (mirrors `compactUint64Pool` but for `[]modules_shared.BlockRef`).
+No `clear()` on acquire — callers use `[:0]+append`, so all positions are overwritten before read.
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:mergeJoinFilteredRefsWithVals`

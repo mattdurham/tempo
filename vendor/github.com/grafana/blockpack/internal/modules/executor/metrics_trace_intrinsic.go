@@ -70,6 +70,10 @@ var compactFloat64Pool sync.Pool
 // NOTE-125: ~7 MB per call at n=7.2 M (agg and histogram paths only). See compactUint32Pool.
 var compactBoolPool sync.Pool
 
+// compactBlockRefPool pools []modules_shared.BlockRef for outRefs in mergeJoinFilteredRefsWithVals.
+// NOTE-130: ~14 MB per call at outCap=3.5 M; pooled to eliminate GC pressure.
+var compactBlockRefPool sync.Pool
+
 func acquireCompactUint32(n int) []uint32 {
 	if v := compactUint32Pool.Get(); v != nil {
 		if s, ok := v.([]uint32); ok && cap(s) >= n {
@@ -144,6 +148,22 @@ func acquireCompactBool(n int) []bool {
 
 func releaseCompactBool(s []bool) {
 	compactBoolPool.Put(s[:cap(s)]) //nolint:staticcheck // SA6002: slice is pointer-sized
+}
+
+// acquireCompactBlockRef returns a []modules_shared.BlockRef of length n from the pool.
+// No clear is performed — callers use [:0]+append, fully overwriting before read.
+// NOTE-130: output buffers for mergeJoinFilteredRefsWithVals; see also acquireCompactUint64.
+func acquireCompactBlockRef(n int) []modules_shared.BlockRef {
+	if v := compactBlockRefPool.Get(); v != nil {
+		if s, ok := v.([]modules_shared.BlockRef); ok && cap(s) >= n {
+			return s[:n]
+		}
+	}
+	return make([]modules_shared.BlockRef, n)
+}
+
+func releaseCompactBlockRef(s []modules_shared.BlockRef) {
+	compactBlockRefPool.Put(s[:cap(s)]) //nolint:staticcheck // SA6002: slice is pointer-sized
 }
 
 // NOTE-129: directInt16Pool pools []int16 for bucketByPK in direct-path accumulation.
@@ -327,7 +347,13 @@ func executeTraceMetricsIntrinsic(
 		if isCountRate && len(agg.GroupBy) == 0 && len(filteredRefs)*4 <= n {
 			return streamCountRateN0HashFilter(ctx, tsCol, lo, hi, filteredRefs, tb, querySpec)
 		}
-		inRangeRefs, inRangeVals = mergeJoinFilteredRefsWithVals(filteredRefs, inRangeRefs, inRangeVals)
+		var releaseFiltered func()
+		inRangeRefs, inRangeVals, releaseFiltered = mergeJoinFilteredRefsWithVals(
+			filteredRefs,
+			inRangeRefs,
+			inRangeVals,
+		)
+		defer releaseFiltered()
 		if len(inRangeRefs) == 0 {
 			return &TraceMetricsResult{}, true, nil
 		}
@@ -1506,13 +1532,16 @@ func streamHistogramN1Compact(
 //   - inRangeRefs is NOT sorted in-place (it is a sub-slice of a shared intrinsic
 //     column). A sorted index ([]refIdx) is built over original positions so that
 //     inRangeVals alignment is preserved.
+//
+// NOTE-130: outRefs/outVals are pooled. Caller must invoke release() after consuming the slices.
 func mergeJoinFilteredRefsWithVals(
 	filteredRefs []modules_shared.BlockRef,
 	inRangeRefs []modules_shared.BlockRef,
 	inRangeVals []uint64,
-) (outRefs []modules_shared.BlockRef, outVals []uint64) {
+) (outRefs []modules_shared.BlockRef, outVals []uint64, release func()) {
+	release = func() {}
 	if len(filteredRefs) == 0 || len(inRangeRefs) == 0 {
-		return nil, nil
+		return nil, nil, release
 	}
 
 	// Build a sorted []uint32 of filteredRefs packKeys — cheaper than cloning BlockRef
@@ -1540,8 +1569,14 @@ func mergeJoinFilteredRefsWithVals(
 	slices.Sort(idxPacked)
 
 	outCap := min(len(filteredPKs), len(idxPacked))
-	outRefs = make([]modules_shared.BlockRef, 0, outCap)
-	outVals = make([]uint64, 0, outCap)
+	outRefsBacking := acquireCompactBlockRef(outCap) // NOTE-130: ~14 MB at outCap=3.5M; pooled
+	outValsBacking := acquireCompactUint64(outCap)   // NOTE-130: ~28 MB at outCap=3.5M; reuses compactUint64Pool
+	outRefs = outRefsBacking[:0]
+	outVals = outValsBacking[:0]
+	release = func() {
+		releaseCompactBlockRef(outRefsBacking)
+		releaseCompactUint64(outValsBacking)
+	}
 
 	fi := 0
 	for _, packed := range idxPacked {
@@ -1558,7 +1593,7 @@ func mergeJoinFilteredRefsWithVals(
 	}
 	releaseCompactUint64(idxPacked)
 	releaseCompactUint32(filteredPKs)
-	return outRefs, outVals
+	return outRefs, outVals, release
 }
 
 // intrinsicGetOrCreateBucket returns the bucket for compositeKey, creating it if absent.
