@@ -3834,3 +3834,77 @@ released on function exit. Release order (LIFO) does not matter for pool puts.
 benefit to M4/M7 (those call `scanGroupByColCompact` for the group-by column scan).
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:scanGroupByColCompact`,
 `internal/modules/executor/metrics_trace_intrinsic.go:scanAggColHistogramCompact`
+
+## NOTE-136: streamCountRateN0HashFilter — replace filteredPKs map with pkBitset
+*Added: 2026-06-08*
+**Decision:** Replace `make(map[uint32]struct{}, len(filteredRefs))` + map lookup in
+`streamCountRateN0HashFilter` with the pkBitset pattern (same as NOTE-134/135).
+Build `pkBitset` from `filteredRefs` packKeys (not from `sortedPKs`), then use the
+bitset check `pkBitset[pk>>6]&(uint64(1)<<(pk&63))==0` as the membership test in the
+sequential `tsCol` scan.
+**Rationale:** `filteredPKs` map[uint32]struct{} allocates ~24B/entry. For M2-style queries
+(`{service.name="grafana"} | rate()`) with 500K filtered refs, this is ~12 MB per file.
+At 400 files per query, this totals ~4.8 GB of short-lived heap allocations per query,
+generating significant GC pressure. A bitset at `(maxPK>>6)+1` uint64s is ~2 MB per file
+(for maxPK=16M), 6x smaller, pool-reusable, and eliminates map GC overhead entirely.
+**Queries affected:** Only N=0 no-group-by count/rate with selective predicate (M2 pattern).
+M6/M9 (N=1 group-by) and M8 (histogram) never enter this function.
+**maxPK source:** Computed from filteredRefs. Single O(F) pass; F ≤ N/4 so always cheap.
+**Clear requirement:** Same as NOTE-134/135. `clear(pkBitset)` mandatory after acquire.
+**Edge case — maxPK==0:** Guard is `len(filteredRefs) > 0` (not `maxPK > 0`) to correctly
+handle packKey=0 (blockIdx=0, rowIdx=0). When maxPK=0, bitset size is 1 uint64 (8 bytes).
+**Expected impact:** 15-25% improvement for M2-style queries.
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:streamCountRateN0HashFilter`
+
+## NOTE-139: scanAggColHistogramCompact — POPCNT rank index replaces searchSortedUint32 in DeltaUint64/Flat scan
+*Added: 2026-06-08*
+**Decision:** After building `pkBitset` from `sortedPKs` in the `IntrinsicFormatFlat /
+IntrinsicFormatDeltaUint64` case of `scanAggColHistogramCompact`, also build a parallel
+`rankPrefix []uint32` where `rankPrefix[i]` = cumulative popcount of `pkBitset[0..i-1]`.
+In the scan loop, replace `searchSortedUint32(sortedPKs, pk)` with the O(1) formula:
+`pos = int(rankPrefix[word] + uint32(bits.OnesCount64(pkBitset[word] & ((1<<bit)-1))))`
+where `word = pk>>6`, `bit = pk&63`. The pkBitset membership check (`pkBitset[word]&(1<<bit)!=0`)
+guarantees pk is present — no `found` check needed.
+**Rationale:** With NOTE-122 interpolation search (~5 probes), the DeltaUint64 scan costs
+3.75M × 5 × ~10ns ≈ 187ms per block. At 50 blocks/goroutine: ~9.4s per M8 query on this
+path alone. The O(1) rank reduces to 3.75M × ~4ns = 15ms per block → ~0.75s total: ~12x
+faster on the DeltaUint64 path. Expected M8 warm improvement: ~30%.
+**Build cost:** O(maxPK/64) ≈ 250K iterations per block, ~0.5µs. Total for 400 blocks: 0.2ms.
+**Memory:** `rankPrefix` is `(maxPK>>6)+2` uint32s ≈ 1 MB at maxPK=16M, pooled via
+`compactUint32Pool` (NOTE-125). No new pool needed. Peak per-goroutine: +1 MB vs existing 28 MB.
+**`math/bits` import:** `bits.OnesCount64` compiles to a single POPCNT instruction on AMD64/ARM64.
+Import `"math/bits"` added to `metrics_trace_intrinsic.go`.
+**Guard change:** pkBitset/rankPrefix build guard changed from
+`col.Format == IntrinsicFormatDeltaUint64 && maxPK > 0` to `len(sortedPKs) > 0`
+(NOTE-136 pattern) to correctly handle packKey=0 (maxPK=0) and both column formats.
+**Dict path:** Left with searchSortedUint32 + NOTE-135 bitset pre-filter. Dict is not the
+M8 CPU bottleneck (span:duration is DeltaUint64 on large files). Rank extension to Dict
+and scanGroupByColCompact deferred to NOTE-140.
+**Validated by:** `TestRankIndexCorrectness` — exhaustive formula check against searchSortedUint32
+for boundary cases (pk=0, bit=0, bit=63, word boundary, dense, sparse).
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:scanAggColHistogramCompact`
+
+## NOTE-140: POPCNT rank index extended to Dict paths in scanGroupByColCompact and scanAggColHistogramCompact
+*Added: 2026-06-08*
+**Decision:** Extend NOTE-139's POPCNT rank approach to the remaining `searchSortedUint32`
+call sites in Dict and Flat/XORBytes/DeltaUint64 paths: `scanGroupByColCompact` (Dict case,
+Flat/XORBytes/DeltaUint64 case) and `scanAggColHistogramCompact` Dict case. In each function,
+build `rankPrefix []uint32` alongside the existing `pkBitset []uint64` using the same O(maxPK/64)
+sweep. Replace all `searchSortedUint32(sortedPKs, pk)` calls in the inner loops with:
+`r = rankPrefix[word] + uint32(bits.OnesCount64(pkBitset[word] & ((1<<bit)-1)))`, `pos = int(r)`.
+Also adds a bitset pre-filter to the Flat/XORBytes/DeltaUint64 case of `scanGroupByColCompact`
+(which previously had no pre-filter).
+**Rationale:** `resource.service.name` is IntrinsicFormatDict with ~200 entries and ~18750 refs
+each. At 50% selectivity: 1.875M rank lookups × 46ns saved (binary search → O(1)) ≈ 86ms per
+block. At 400 blocks / 8 goroutines = 50 blocks per goroutine: ~4.3s saved on M4/M8/M9.
+Expected: 10–20% M4 improvement, 5–15% M8/M9 improvement.
+**No signature changes:** rankPrefix built independently inside each function (same as pkBitset).
+Avoids touching 5 `scanGroupByColCompact` call sites and 3 `scanAggColHistogramCompact` call sites.
+**Guard:** `scanGroupByColCompact` guard changed from `maxPK > 0` to `len(sortedPKs) > 0` to
+align with NOTE-139 pattern and correctly handle packKey=0 edge case.
+**Pool:** `acquireCompactUint32(n+1)` / `defer releaseCompactUint32` — same pool as NOTE-139.
+Per-goroutine overhead +1 MB (sequential calls, only one rankPrefix alive at a time per function).
+**Out of scope:** `scanAggColCompact` (min/max/sum/avg), which has no pkBitset today — NOTE-141.
+**Validated by:** `TestRankIndexCorrectness` (existing) + `go test ./internal/modules/executor/...`
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:scanGroupByColCompact`,
+`internal/modules/executor/metrics_trace_intrinsic.go:scanAggColHistogramCompact`

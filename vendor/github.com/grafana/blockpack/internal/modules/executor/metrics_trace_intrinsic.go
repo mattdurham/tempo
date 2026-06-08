@@ -10,6 +10,7 @@ package executor
 import (
 	"context"
 	"math"
+	"math/bits"
 	"slices"
 	"sort"
 	"strconv"
@@ -552,12 +553,13 @@ func scanGroupByColCompact(
 	// when a file covers more time than the query window (M_total >> N).
 	minPK, maxPK := sortedPKs[0], sortedPKs[len(sortedPKs)-1]
 
-	// NOTE-135: build pkBitset from sortedPKs to pre-filter Dict refs before interpolation search.
-	// Dict refs within an entry are not packKey-sorted; ~50% fail searchSortedUint32 at 50% selectivity.
-	// A 2MB bitset (one bit per packKey) replaces ~3.6M failed interpolation searches per block.
-	// See NOTE-123/134 for the same pattern in scanAggColHistogramCompact DeltaUint64 path.
+	// NOTE-135/140: build pkBitset + POPCNT rank index from sortedPKs.
+	// Dict refs are not packKey-sorted; ~50% fail the pre-filter at 50% selectivity.
+	// NOTE-140: rankPrefix[i] = cumulative popcount of pkBitset[0..i-1], enabling O(1) rank
+	// lookup to replace searchSortedUint32 in both Dict and Flat/DeltaUint64 inner loops.
 	var pkBitset []uint64
-	if maxPK > 0 {
+	var rankPrefix []uint32
+	if len(sortedPKs) > 0 {
 		n := int((maxPK >> 6) + 1) //nolint:gosec
 		pkBitset = acquireCompactUint64(n)
 		defer releaseCompactUint64(pkBitset)
@@ -565,6 +567,16 @@ func scanGroupByColCompact(
 		for _, pk := range sortedPKs {
 			pkBitset[pk>>6] |= uint64(1) << (pk & 63)
 		}
+		// NOTE-140: POPCNT rank index. Build cost: O(maxPK/64) ≈ 250K iterations at maxPK=16M → ~0.5µs.
+		rankPrefix = acquireCompactUint32(n + 1)
+		defer releaseCompactUint32(rankPrefix)
+		// acquireCompactUint32 calls clear() internally (NOTE-125 pool semantics).
+		var cum uint32
+		for i, w := range pkBitset {
+			rankPrefix[i] = cum
+			cum += uint32(bits.OnesCount64(w)) //nolint:gosec
+		}
+		rankPrefix[len(pkBitset)] = cum
 	}
 
 	switch col.Format {
@@ -584,13 +596,14 @@ func scanGroupByColCompact(
 				if pk < minPK || pk > maxPK {
 					continue
 				}
-				if len(pkBitset) > 0 && pkBitset[pk>>6]&(uint64(1)<<(pk&63)) == 0 {
-					continue // NOTE-135: fast pre-filter: pk not in sortedPKs
+				word := pk >> 6
+				bit := pk & 63
+				if len(pkBitset) > 0 && pkBitset[word]&(uint64(1)<<bit) == 0 {
+					continue // NOTE-135/140: fast pre-filter: pk not in sortedPKs
 				}
-				pos, found := searchSortedUint32(sortedPKs, pk)
-				if !found {
-					continue
-				}
+				// NOTE-140: O(1) rank replaces O(log n) searchSortedUint32.
+				r := rankPrefix[word] + uint32(bits.OnesCount64(pkBitset[word]&((uint64(1)<<bit)-1))) //nolint:gosec
+				pos := int(r)                                                                         //nolint:gosec
 				if !dictAssigned {
 					idx, ok := valToIdx[val]
 					if !ok {
@@ -612,10 +625,13 @@ func scanGroupByColCompact(
 			if pk < minPK || pk > maxPK {
 				continue
 			}
-			pos, found := searchSortedUint32(sortedPKs, pk)
-			if !found {
-				continue
+			word := pk >> 6
+			bit := pk & 63
+			if len(pkBitset) > 0 && pkBitset[word]&(uint64(1)<<bit) == 0 {
+				continue // NOTE-140: bitset pre-filter before rank lookup
 			}
+			// NOTE-140: O(1) rank replaces O(log n) searchSortedUint32.
+			pos := int(rankPrefix[word] + uint32(bits.OnesCount64(pkBitset[word]&((uint64(1)<<bit)-1)))) //nolint:gosec
 			var val string
 			if i < len(col.Uint64Values) {
 				val = strconv.FormatUint(col.Uint64Values[i], 10)
@@ -660,14 +676,24 @@ func scanAggColHistogramCompact( //nolint:gocyclo
 		// NOTE-135: pkBitset pre-filter for Dict refs — same pattern as DeltaUint64 case (NOTE-123/134).
 		// Dict refs within an entry are not packKey-sorted; ~50% fail searchSortedUint32 at 50% selectivity.
 		var pkBitset []uint64
-		if maxPK > 0 {
+		var rankPrefix []uint32
+		if len(sortedPKs) > 0 {
 			n := int((maxPK >> 6) + 1) //nolint:gosec
 			pkBitset = acquireCompactUint64(n)
 			defer releaseCompactUint64(pkBitset) // defer covers ctx-cancel early returns
-			clear(pkBitset)                      // NOTE-135: zero-sentinel — must clear stale pool bits
+			clear(pkBitset)                      // NOTE-140: zero-sentinel — must clear stale pool bits
 			for _, pk := range sortedPKs {
 				pkBitset[pk>>6] |= uint64(1) << (pk & 63)
 			}
+			// NOTE-140: POPCNT rank index mirrors NOTE-139 DeltaUint64 build above.
+			rankPrefix = acquireCompactUint32(n + 1)
+			defer releaseCompactUint32(rankPrefix)
+			var cum uint32
+			for i, w := range pkBitset {
+				rankPrefix[i] = cum
+				cum += uint32(bits.OnesCount64(w)) //nolint:gosec
+			}
+			rankPrefix[len(pkBitset)] = cum
 		}
 		for _, entry := range col.DictEntries {
 			var v float64
@@ -695,13 +721,14 @@ func scanAggColHistogramCompact( //nolint:gocyclo
 				if pk < minPK || pk > maxPK {
 					continue
 				}
-				if len(pkBitset) > 0 && pkBitset[pk>>6]&(uint64(1)<<(pk&63)) == 0 {
-					continue // NOTE-135: fast pre-filter: pk not in sortedPKs
+				word := pk >> 6
+				bit := pk & 63
+				if len(pkBitset) > 0 && pkBitset[word]&(uint64(1)<<bit) == 0 {
+					continue // NOTE-135/140: fast pre-filter: pk not in sortedPKs
 				}
-				pos, found := searchSortedUint32(sortedPKs, pk)
-				if !found {
-					continue
-				}
+				// NOTE-140: O(1) rank replaces O(log n) searchSortedUint32.
+				r := rankPrefix[word] + uint32(bits.OnesCount64(pkBitset[word]&((uint64(1)<<bit)-1))) //nolint:gosec
+				pos := int(r)                                                                         //nolint:gosec
 				bk := timeBucketByPos[pos]
 				if bk == 0 {
 					continue
@@ -718,11 +745,12 @@ func scanAggColHistogramCompact( //nolint:gocyclo
 		modules_shared.IntrinsicFormatDeltaUint64:
 		// NOTE-123: DeltaUint64 re-enabled with bitset pre-filter. DeltaUint64 refs are sorted
 		// by VALUE (ascending), so binary search in sortedPKs has no locality benefit. A 2MB
-		// bitset (one bit per packKey up to maxPK) pre-filters ~50% of refs at 50% selectivity
-		// before the interpolation search, keeping most lookups L3-resident. Bitset is built
-		// only for DeltaUint64 (small Flat files don't need it; binary search is fast).
+		// bitset (one bit per packKey up to maxPK) pre-filters ~50% of refs at 50% selectivity.
+		// NOTE-139: pkBitset is now built for both DeltaUint64 and Flat (guard: len(sortedPKs)>0).
+		// The POPCNT rank index (rankPrefix) replaces searchSortedUint32 entirely in the scan loop.
 		var pkBitset []uint64
-		if col.Format == modules_shared.IntrinsicFormatDeltaUint64 && maxPK > 0 {
+		var rankPrefix []uint32
+		if len(sortedPKs) > 0 {
 			n := int((maxPK >> 6) + 1) //nolint:gosec
 			pkBitset = acquireCompactUint64(n)
 			defer releaseCompactUint64(pkBitset) // NOTE-134: defer covers ctx-cancel early return at line 703
@@ -730,6 +758,18 @@ func scanAggColHistogramCompact( //nolint:gocyclo
 			for _, pk := range sortedPKs {
 				pkBitset[pk>>6] |= uint64(1) << (pk & 63)
 			}
+			// NOTE-139: POPCNT rank index. rankPrefix[i] = cumulative popcount of pkBitset[0..i-1].
+			// Rank(pk) = rankPrefix[pk>>6] + OnesCount64(pkBitset[pk>>6] & ((1<<(pk&63))-1)).
+			// Build cost: O(maxPK/64) ≈ 250K iterations at maxPK=16M → ~0.5µs per block.
+			rankPrefix = acquireCompactUint32(n + 1)
+			defer releaseCompactUint32(rankPrefix)
+			// acquireCompactUint32 calls clear() internally (NOTE-125 pool semantics).
+			var cum uint32
+			for i, w := range pkBitset {
+				rankPrefix[i] = cum
+				cum += uint32(bits.OnesCount64(w)) //nolint:gosec
+			}
+			rankPrefix[len(pkBitset)] = cum
 		}
 		for i, ref := range col.BlockRefs {
 			if spanCount%ctxCheckInterval == 0 {
@@ -745,13 +785,14 @@ func scanAggColHistogramCompact( //nolint:gocyclo
 			if pk < minPK || pk > maxPK {
 				continue
 			}
-			if len(pkBitset) > 0 && pkBitset[pk>>6]&(uint64(1)<<(pk&63)) == 0 {
-				continue // fast pre-filter: pk not in sortedPKs
+			word := pk >> 6
+			bit := pk & 63
+			if pkBitset[word]&(uint64(1)<<bit) == 0 {
+				continue // NOTE-139: bitset pre-filter; non-members skip rank lookup
 			}
-			pos, found := searchSortedUint32(sortedPKs, pk)
-			if !found {
-				continue
-			}
+			// NOTE-139: O(1) rank replaces O(log n) searchSortedUint32.
+			// pkBitset membership confirmed above; pos is the exact index in sortedPKs.
+			pos := int(rankPrefix[word] + uint32(bits.OnesCount64(pkBitset[word]&((uint64(1)<<bit)-1)))) //nolint:gosec
 			bk := timeBucketByPos[pos]
 			if bk == 0 {
 				continue
@@ -1727,15 +1768,30 @@ func streamCountRateN0HashFilter(
 		return &TraceMetricsResult{}, true, nil
 	}
 
-	// Build hash set of filtered packKeys. With F ≤ N/4 (selectivity constraint), the
-	// hash map fits in L3 cache; subsequent lookups are L3 hits (~10 ns each).
-	filteredPKs := make(map[uint32]struct{}, len(filteredRefs))
+	// NOTE-136: Replace filteredPKs map with pkBitset from filteredRefs.
+	// map[uint32]struct{} at 24B/entry costs ~12 MB for 500K refs; a bitset costs 2 MB at
+	// maxPK=16M — same pattern as NOTE-134/135 in scanAggColHistogramCompact/scanGroupByColCompact.
+	var maxPK uint32
 	for _, ref := range filteredRefs {
-		filteredPKs[packKey(ref.BlockIdx, ref.RowIdx)] = struct{}{}
+		if pk := packKey(ref.BlockIdx, ref.RowIdx); pk > maxPK {
+			maxPK = pk
+		}
+	}
+	var pkBitset []uint64
+	// len(filteredRefs) > 0 is guaranteed by the early-return above; guard handles maxPK=0 edge
+	if len(filteredRefs) > 0 {
+		n := int((maxPK >> 6) + 1) //nolint:gosec
+		pkBitset = acquireCompactUint64(n)
+		defer releaseCompactUint64(pkBitset)
+		clear(pkBitset) // NOTE-136: zero-sentinel — must clear stale pool bits before setting
+		for _, ref := range filteredRefs {
+			pk := packKey(ref.BlockIdx, ref.RowIdx)
+			pkBitset[pk>>6] |= uint64(1) << (pk & 63)
+		}
 	}
 
-	// Sequential scan of tsCol[lo:hi]: for each in-range span, check membership
-	// in filteredPKs and accumulate its time bucket.
+	// Sequential scan of tsCol[lo:hi]: for each in-range span, check bitset membership
+	// and accumulate its time bucket. NOTE-136: bitset replaces map lookup (~2ns vs ~10ns).
 	counts := make([]int64, numSteps)
 	for i, ref := range tsCol.BlockRefs[lo:hi] {
 		if i%ctxCheckInterval == 0 {
@@ -1744,8 +1800,8 @@ func streamCountRateN0HashFilter(
 			}
 		}
 		pk := packKey(ref.BlockIdx, ref.RowIdx)
-		if _, ok := filteredPKs[pk]; !ok {
-			continue
+		if pk > maxPK || pkBitset[pk>>6]&(uint64(1)<<(pk&63)) == 0 {
+			continue // NOTE-136: fast bitset pre-filter: pk not in filteredRefs
 		}
 		ts := int64(tsCol.Uint64Values[lo+i]) //nolint:gosec
 		bk := timeBucketIndex(ts, tb.StartTime, tb.StepSizeNanos)
