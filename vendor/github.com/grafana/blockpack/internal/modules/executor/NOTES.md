@@ -3499,3 +3499,148 @@ Back-ref: `internal/modules/executor/metrics_log.go:logAccumulateRow`
 - `metrics_trace.go` — release after `rowSet.ToSlice()` loop completes. SAFE.
 - `stream_structural.go:processBlock` — release after the row loop that calls `computeNodeMatchForRow` (which reads sets[i].Contains()). SAFE.
 Back-ref: `internal/modules/executor/column_provider.go:collectStreamInto`
+
+## NOTE-108: streamCountRateN1Compact — compact fallback for N=1 count/rate to avoid 4 GB allocations
+*Added: 2026-06-07*
+**Decision:** When `accumulateIntrinsicBucketsDirect` fails for N=1 count/rate queries (maxPK > 16 M, i.e. large production files), route to a new `streamCountRateN1Compact` function instead of `accumulateIntrinsicBucketsViaKeyMap`.
+**Rationale:** `accumulateIntrinsicBucketsViaKeyMap` builds a `map[uint32]int64` with one entry per in-range span (150 M entries ≈ 3 GB for a 24h dataset), then `buildDictIdxForRefs` allocates a dense `[]uint32` of size `maxPK+1` (up to ~944 MB). For a 13 GiB GOMEMLIMIT querier processing multiple files concurrently, these allocations trigger GC storms and OOM pod restarts. `streamCountRateN1Compact` replaces both with sorted packKey arrays (sortedPKs + timeBucketByPos + dictIdxByPos ≈ 116 MB), reducing peak memory ~35×.
+**Approach:** Sort the n in-range refs by packKey once (O(n log n)), then scan the group-by column with `scanGroupByColCompact` (binary search, O(total_refs × log n)) to build `dictIdxByPos`. Accumulate via a sequential pass over all n positions into a flat `[]int64` accumulator. Cache-friendly: `dictIdxByPos` and `timeBucketByPos` are accessed sequentially; `groupCountsFlat[gIdx*numSteps + bk-1]` accesses a fixed numSteps-element subarray for each run of same-group positions.
+**Queries affected:** M4 `{} | rate() by (resource.service.name)`, M5 `{} | rate() by (span.kind)`, and any no-predicate N=1 count/rate query on files where maxPK > 16 M.
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:streamCountRateN1Compact`
+
+## NOTE-110: streamCountRateN1CompactFromRefs — predicate-filtered N=1 count/rate compact path
+*Added: 2026-06-07*
+**Decision:** For predicate-filtered N=1 count/rate queries (filteredRefs != nil, len(GroupBy)==1), route to a new `streamCountRateN1CompactFromRefs` instead of `accumulateIntrinsicBucketsViaKeyMap`.
+**Rationale:** The `accumulateIntrinsicBucketsViaKeyMap` path allocates a `keyToBucket map[uint32]int64` (~24 bytes/entry × 75 M filtered refs ≈ 1.8 GB), then `buildDictIdxForRefs` allocates a dense `dictByPK []uint32` of size maxPK+1 (~64 MB) and `dictIdxForRef []uint32` (n × 4 bytes = ~300 MB). Total ~2 GB per goroutine per file, causing GC pressure. The compact path replaces all of these with `sortedPKs` (n × 4 = 300 MB) and `timeBucketByPos` (n × 8 = 600 MB) + binary search via `scanGroupByColCompact`.
+**Key insight:** `inRangeRefs` produced by `mergeJoinFilteredRefsWithVals` is already sorted by packKey (the merge iterates `idx` in ascending packKey order). `streamCountRateN1CompactFromRefs` exploits this by building `sortedPKs` in a single O(n) pass — no `pkOrder` allocation or O(n log n) sort, unlike `streamCountRateN1Compact` for the unfiltered path.
+**Approach:** Extract a shared `streamCountRateN1CompactCore(sortedPKs, timeBucketByPos, ...)` called by both the filtered and unfiltered compact paths. The filtered path builds sortedPKs from pre-sorted inRangeRefs; the unfiltered path sorts tsCol refs first.
+**Measured improvement:** M6 `{span.kind=server} | rate() by (span.http.request.method)`: 58724ms → 34348ms (-41%) cold cache. Also helps M9-style queries (predicate N=1 rate by service.name).
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:streamCountRateN1CompactFromRefs,streamCountRateN1CompactCore`
+
+## NOTE-111: mergeJoinFilteredRefsWithVals — packed uint64 idx, uint32 filteredPKs
+*Added: 2026-06-08*
+**Decision:** Replace `[]refIdx{uint32, int}` (12 bytes/entry) with packed `[]uint64` (pk in high 32 bits, original index in low 32 bits — 8 bytes/entry) in `mergeJoinFilteredRefsWithVals`. Also replace `slices.Clone(filteredRefs)+SortFunc` with `[]uint32 filteredPKs + slices.Sort`.
+**Rationale:** idx array is 86 MB for 7.5M refs × 12 bytes. Packing to uint64 saves 33% (57 MB). Matches the pkOrder uint64 packing optimization used in `streamCountRateN1Compact` (r121). Also: `slices.Sort` on `[]uint64` avoids the closure allocation overhead of `SortFunc`; `filteredPKs []uint32` avoids recomputing `packKey()` during each comparison step.
+**Queries affected:** All predicate-filtered metrics queries (M2, M6, M9, M10).
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:mergeJoinFilteredRefsWithVals`
+
+## NOTE-112: streamAggN1CompactFromRefs — predicate-filtered N=1 agg compact path
+*Added: 2026-06-08*
+**Decision:** For predicate-filtered N=1 general agg queries (filteredRefs != nil, GroupBy len 1, not count/rate or histogram), route to `streamAggN1CompactFromRefs` instead of `accumulateIntrinsicBucketsViaKeyMap`.
+**Rationale:** `accumulateIntrinsicBucketsViaKeyMap` for 3.75M filtered refs allocates keyToBucket (~90MB) + dictByPK (~64MB) + dictIdxForRef (~15MB) + aggVals (~30MB) + aggPresent (~4MB) ≈ 203MB. The compact path allocates sortedPKs (~15MB) + timeBucketByPos (~30MB) + dictIdxByPos (~15MB) + aggValByPos (~30MB) + aggPresentByPos (~4MB) ≈ 94MB — 54% reduction.
+**Key insight:** inRangeRefs from mergeJoinFilteredRefsWithVals is pre-sorted by packKey, so sortedPKs is built O(n) without the pkOrder sort used by streamAggN1Compact.
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:streamAggN1CompactFromRefs`
+
+## NOTE-113: streamCountRateN0HashFilter — hash-filter for N=0 predicate count/rate
+*Added: 2026-06-08*
+**Decision:** For N=0 count/rate with a selective predicate (F ≤ N/4), bypass `mergeJoinFilteredRefsWithVals` entirely and hash-filter `tsCol[lo:hi]` directly.
+**Rationale:** `streamCountRateNoGroupBy` does not need refs in sorted order, so `mergeJoinFilteredRefsWithVals` (O(N log N + F log F) sort) is wasted work. The hash-filter approach: (1) build `map[uint32]struct{}` from filteredRefs (F entries, O(F)); (2) scan tsCol[lo:hi] sequentially checking hash set (O(N)). At 25% selectivity (F ≤ N/4), the hash map (F × ~20 bytes) fits in L3 cache, making hash lookups fast (~10 ns) vs sorting N = O(N log N).
+**Threshold F ≤ N/4:** For M2 (service.name = "grafana", F ≈ 500K, N = 7.5M, 6.7% selectivity), hash map ≈ 10 MB < L3 cache (30 MB). For M6 (span.kind = server, F ≈ 3.75M = 50%), hash map ≈ 75 MB >> L3 — mergeJoin is preferred.
+**Measured improvement:** M2 `{service.name = "grafana"} | rate()`: 19871ms → 10269ms (-48%).
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:streamCountRateN0HashFilter`
+
+## NOTE-114: streamHistogramN1CompactFromRefs — predicate-filtered N=1 histogram compact path
+*Added: 2026-06-08*
+**Decision:** For predicate-filtered N=1 histogram queries (filteredRefs != nil, GroupBy len 1, histogram), route to `streamHistogramN1CompactFromRefs` instead of `accumulateIntrinsicBucketsViaKeyMap` → `streamHistogramN1Compact`.
+**Rationale:** The old path allocated `keyToBucket map[uint32]int64` (~90MB for 3.75M filtered refs) in `accumulateIntrinsicBucketsViaKeyMap`, then `streamHistogramN1Compact` allocated `pkOrder []uint64` (~30MB, freed early) + the binary-search compact arrays. Total peak: ~248MB per goroutine. The new path skips both intermediates: since `inRangeRefs` from `mergeJoinFilteredRefsWithVals` is already packKey-sorted, `sortedPKs` and `timeBucketByPos` are built in O(n) without pkOrder allocation or sort. Also eliminates the O(n log n) sort that `streamHistogramN1Compact` performs unnecessarily for pre-sorted filtered refs.
+**Memory profile** (3.75M filtered refs, 280 groups, 1440 steps, ~20 boundaries):
+- keyMap path: keyToBucket(~90MB) + pkOrder(~30MB) + sortedPKs(~15MB) + timeBucketByPos(~30MB) + dictIdxByPos(~15MB) + seenByPos(~4MB) + groupCountsFlat(~64MB) ≈ 248MB
+- compact path (this): sortedPKs(~15MB) + timeBucketByPos(~30MB) + dictIdxByPos(~15MB) + seenByPos(~4MB) + groupCountsFlat(~64MB) ≈ 128MB (48% reduction)
+**Queries affected:** M8 `{span.kind = server} | histogram_over_time(duration) by (resource.service.name)`.
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:streamHistogramN1CompactFromRefs`
+
+## NOTE-119: accumulateCountRateDirect — flat groupCountsFlat replaces [][]int64
+*Added: 2026-06-08*
+**Decision:** Replace `groupCounts := make([][]int64, numGroups)` (numGroups+1 allocations) with `groupCountsFlat := make([]int64, numGroups*numSteps)` (single allocation) in `accumulateCountRateDirect`.
+**Rationale:** The 2D slice pattern (`groupCounts[gIdx][bk-1]++`) requires loading the inner slice header (pointer + len + cap) from `groupCounts[gIdx]` before accessing the element. For numGroups=276 groups, this is 276 inner slice allocations plus one outer slice. The flat array layout (index = `gIdx*numSteps + bk - 1`) replaces the pointer load with one multiply, which is faster (~3 cycles) than a potential cache miss. The contiguous layout also enables better compiler vectorization of the emit loop. Memory is identical (276×1440×8 = 3.2MB either way). The base `base := gIdx * numSteps` hoist eliminates the repeated multiply inside the inner loop.
+**Invariant:** `groupCountsFlat[gIdx*numSteps + bk - 1]` stores the same count as `groupCounts[gIdx][bk-1]` (bk is 1-based from bucketByPK). Absent-row pass and emit loop access in 0-based form (`groupCountsFlat[gIdx*numSteps + bk]` for bk=0..numSteps-1), consistent with stepCounts indexing.
+**Impact:** Eliminates numGroups=276 small allocations per file (×24 goroutines × ~N files = thousands of objects removed from GC). Theoretical hot-loop savings: removes 1 memory load (inner slice pointer) per in-range span, replaced by 1 multiply. For 150M spans per file at ~3-cycle multiply vs ~4-cycle L1 load: marginal, but correct and cleaner.
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:accumulateCountRateDirect`
+
+## NOTE-118: timeBucketIndex — one division replaces two (div + mod)
+*Added: 2026-06-08*
+**Decision:** Replace `offset/stepNanos + (offset%stepNanos==0 ? bkt-- : 0)` with `(offset-1)/stepNanos`.
+**Rationale:** The original formula calls `DIVQ` twice (once for quotient, once for modulo) or once if the compiler fuses them but still evaluates two operands. The simplified formula is algebraically equivalent for all `offset > 0` (which all callers guarantee via binary-search `lo/hi`). `(k*s + r - 1)/s = k-1` when `r=0` (boundary case); `= k` when `0 < r < s` (interior case). Single `DIVQ` saves one division per call. With 150M calls per file for M1/M3 (`streamCountRateNoGroupBy`) and ~15ns per division at 3.5 GHz: savings up to 2.25s per goroutine.
+**Invariant:** All callers use binary-search to ensure `ts > startTime` (i.e., `offset > 0`). If this invariant were violated and `offset = 0`, the simplified formula returns `-1/stepNanos = 0` (Go truncates toward zero), while the original returns `-1`. Both versions are wrong in this case, but the invariant prevents it.
+Back-ref: `internal/modules/executor/metrics_trace.go:timeBucketIndex`
+
+## NOTE-117: maxDirectAggEntries = 4M — compact path for agg when dictByPK > L3 cache
+*Added: 2026-06-08*
+**Decision:** In `accumulateIntrinsicBucketsDirect`, add a threshold `maxDirectAggEntries = 4_000_000` for non-histogram agg functions. When `maxPK > 4M`, return `false` to trigger `streamAggN1Compact` instead of proceeding with `dictByPK` allocation.
+**Rationale:** `dictByPK` costs `(maxPK+1)×4` bytes: 16MB at 4M entries, 64MB at 16M entries. When `maxPK > 4M`, dictByPK exceeds typical L3 cache (24MB), causing DRAM-level cache misses on every `dictByPK[pk]` read in the `accumulateAggDirectScanCol` hot loop (150M lookups per file). The compact path (`streamAggN1Compact`) uses `sortedPKs` sized to n×4 bytes (n = in-range refs, not maxPK); for a file with 1M in-range refs, `sortedPKs` = 4MB (L2-resident). Binary search in L2 (4ns × 20 comparisons = 80ns) is faster than DRAM lookup (100ns) when n ≪ maxPK. Count/rate is unaffected (uses `entryGIdx`, not `dictByPK`, so the entire 64MB allocation is avoided for that path already). Histogram is unaffected (has its own direct path using `accumulateHistogramDirect`).
+**Invariant:** The compact path fallback (`streamAggN1Compact`) produces identical results to the direct path — same absent-row semantics, same bucket emission. This change is a pure dispatch optimization, not a correctness change.
+**Impact:** M7 `{} | max_over_time(duration) by (resource.service.name)` and similar non-histogram agg queries on large files benefit by eliminating the 64MB dictByPK DRAM bottleneck.
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:accumulateIntrinsicBucketsDirect`
+
+## NOTE-116: timeBucketByPos []int32 — 50% memory reduction for compact-path arrays
+*Added: 2026-06-08*
+**Decision:** Change `timeBucketByPos` from `[]int64` to `[]int32` in all compact-path accumulation functions: `streamCountRateN1Compact`, `streamCountRateN1CompactFromRefs`, `streamCountRateN1CompactCore` (signature), `streamAggN1Compact`, `streamAggN1CompactFromRefs`, `streamHistogramN1Compact`, `streamHistogramN1CompactFromRefs`, and `scanAggColHistogramCompact` (signature). Update all arithmetic sites to use `int64(bk)-1` where mixed with int64 operands.
+**Rationale:** `timeBucketByPos[pos]` stores `timeBucketIndex+1` (sentinel: 0=absent) or `1..numSteps`. Using int64 (8 bytes/entry) was unnecessarily wide — int32 (max 2.1B) safely covers any practical numSteps. Companion to NOTE-115 which reduced `bucketByPK` from int64→int16 for the direct path; this applies the same principle to the compact path. For 7.2M in-range refs: timeBucketByPos 57MB → 29MB (50% reduction). For 3.75M filtered refs: 30MB → 15MB. The reduction decreases GC pressure from concurrent goroutines processing multiple files.
+**Invariant:** `bk+1 ≤ numSteps+1`. int32 max is ~2.1B; numSteps is `(EndTime−StartTime)/StepSizeNanos`, at most a few hundred thousand for any practical query. No overflow possible. All read sites use `bk` directly as an integer (Go accepts int32 as slice index and for arithmetic with explicit int64 cast where mixed).
+**Impact:** Compact-path queries: M4 `{} | rate() by (service.name)`, M6 `{span.kind=server} | rate() by (http.method)`, M7 `{} | max_over_time(duration) by (service.name)`, M8 histogram queries.
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:streamCountRateN1CompactCore,streamAggN1Compact,streamHistogramN1Compact`
+
+## NOTE-122: searchSortedUint32 — interpolation search replaces binary search
+*Added: 2026-06-08*
+**Decision:** Replace the binary search in `searchSortedUint32` with interpolation search. The function signature and semantics are unchanged; callers need no updates.
+**Rationale:** Compact-path scan functions (`scanGroupByColCompact`, `scanAggColCompact`, `scanAggColHistogramCompact`) call `searchSortedUint32` O(N) times per file, where N is the number of column refs (7.5M for a 24h file). Binary search is O(log n) ≈ 22 comparisons for n=3.75M sorted PKs. Interpolation search is O(log log n) ≈ 4-5 comparisons average when the keys are uniformly distributed. PackKeys (`blockIdx<<16|rowIdx`) are approximately uniformly distributed across the 0..maxPK range when spans are distributed evenly across blocks — a reasonable assumption for production blockpack files written by multiple block-builders. The formula `lo + (hi-lo)*(pk-s[lo])/(s[hi]-s[lo])` uses uint64 arithmetic to prevent overflow. Falls back to standard comparison when `pk < s[lo]` or `pk > s[hi]` (out-of-range refs, already handled by the minPK/maxPK guards before this call in most callers).
+**Expected speedup:** 22/4.5 ≈ 5x fewer comparisons per lookup. For M8 which does two full scans of 7.5M column refs per file (service.name + duration), this reduces lookup cost by ~5x, potentially bringing warm M8 from >120s to ~30-50s. M4, M6, M7 also benefit proportionally.
+**Invariant:** Interpolation search is a correct subset of binary search — it narrows the search window using an interpolated position rather than the midpoint. Correctness is preserved: when the key is present, the function returns its index; when absent, it returns -1, false. The linear fallback at the end handles the edge case where the window converges but `s[lo] == pk` (the standard binary search termination condition).
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:searchSortedUint32`
+
+## NOTE-121: scanAggColHistogramCompact — bitset pre-filter for DeltaUint64 binary search
+*Added: 2026-06-08*
+**Decision:** For `IntrinsicFormatDeltaUint64` columns in `scanAggColHistogramCompact`, build a bitset of size `(maxPK>>6)+1` uint64s (2MB at maxPK=16M) from `sortedPKs` before the column scan, then use `pkBitset[pk>>6] & (1<<(pk&63))` to pre-filter refs before the expensive binary search. Bitset is skipped for `IntrinsicFormatFlat` (small files, < 10K rows).
+**Rationale:** `IntrinsicFormatDeltaUint64` (used when rows > 10K, i.e., all production 24h files) stores refs sorted by VALUE (duration), not by packKey. This means consecutive `BlockRefs` entries have unrelated PKs — there is no locality to exploit for binary search in `sortedPKs` (15MB, 3.75M filtered refs). With 8 concurrent goroutines, each goroutine's 15MB `sortedPKs` competes in the shared L3 cache (30MB), causing DRAM-level misses (~20ns). For M8 at 50% selectivity (span.kind=server), ~50% of 7.5M duration refs are absent from `sortedPKs`. Without the bitset, all 7.5M refs incur binary-search cost. With the bitset (2MB, fits in L2), ~3.75M non-matching refs are rejected in ~5ns each, avoiding ~half the binary searches. The bitset build (O(n) over 3.75M sortedPKs) costs ~20ms per file — negligible.
+**Math** (50% selectivity, 8 goroutines, 66 files): Binary search only: 7.5M × 22 × 20ns = 3300ms/file × 66/8 = 27.2s additional. Bitset + filtered search: (7.5M × 5ns) + (3.75M × 22 × 10ns) = 38ms + 825ms = 863ms/file × 66/8 = 7.1s additional. Net saving: ~20s per M8 query.
+**Invariant:** Bitset pre-filter is conservative (no false negatives): if `pkBitset[pk>>6] & (1<<(pk&63)) == 0`, pk is guaranteed absent from `sortedPKs`. If bit=1, we still verify with `searchSortedUint32` (no false positives propagate to accumulation).
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:scanAggColHistogramCompact`
+
+## NOTE-120: IntrinsicFormatDeltaUint64 — histogram/agg scan functions handle large files
+*Added: 2026-06-08*
+**Decision:** Add `IntrinsicFormatDeltaUint64` to the format switch in `scanAggColHistogramCompact`, `countIntrinsicHistogramBoundaries`, and `streamAggColumnNoGroupBy`. The code body is identical to the `IntrinsicFormatFlat` case — just widen the `case` clause.
+**Rationale:** When a flat column exceeds `IntrinsicPageSize = 10_000` rows, the writer switches from `encodeFlatColumn` to `encodeDeltaUint64Intrinsic` (NOTE-014). This resets the on-disk format byte from `IntrinsicFormatFlat (0x01)` to `IntrinsicFormatDeltaUint64 (0x04)`. Production 24h blockpack files always exceed 10K rows for `span:duration`, so `GetIntrinsicColumn("span:duration")` returns a column with `Format = IntrinsicFormatDeltaUint64`. The three functions above only matched `IntrinsicFormatFlat`, silently skipping all duration values on large files. The effect on M8: `countIntrinsicHistogramBoundaries` returned 0 → `actualStride = 1` → single histogram bucket; `scanAggColHistogramCompact` skipped all 7.5M duration refs → all spans ended up in the absent-row pass → all counts in boundary-0 bucket regardless of actual duration. The histogram appeared to work (correct group/time structure) but all duration values were collapsed into boundary 0.
+**Invariant:** After decode, `IntrinsicFormatDeltaUint64` columns expose the same `Uint64Values` (sorted ascending) and parallel `BlockRefs` layout as `IntrinsicFormatFlat`. The ascending sort means BlockRefs are in value order (not packKey order), so binary search in `sortedPKs` is still required — there is no locality exploit available.
+**Impact:** M8 `{span.kind = server} | histogram_over_time(duration) by (resource.service.name)` now returns correct histogram distributions. Computation adds `O(N_duration × log n_filtered)` binary searches per file (7.5M × log(3.75M) ≈ 165M comparisons; ~2s per file at L3 hit rate). Net M8 warm time: ~62s + ~2s overhead ≈ 64s (measured in prior session). Also fixes `{} | max_over_time(duration)` style N=0 agg queries on large files.
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:scanAggColHistogramCompact,countIntrinsicHistogramBoundaries,streamAggColumnNoGroupBy`
+
+## NOTE-115: bucketByPK []int16 — 75% memory reduction for direct-path arrays
+*Added: 2026-06-08*
+**Decision:** Change `bucketByPK` from `[]int64` to `[]int16` in all direct-path accumulation functions: `accumulateIntrinsicBucketsDirect`, `accumulateHistogramDirectN0`, and `streamByRefSliceHistogram`. Update all 6 function signatures that pass `bucketByPK` and all 12+ read/write/iterate sites.
+**Rationale:** `bucketByPK[pk]` stores `timeBucketIndex+1` (sentinel: 0=absent) or `1..numSteps`. `numSteps` ≤ 1440 (24h/60s) fits in int16 (max 32767). Using int64 (8 bytes/entry) wasted 6 bytes/entry. With 16M entries at the `maxDirectArrayEntries` limit: 128MB (int64) → 32MB (int16), a 75% reduction. For `histogram/agg` paths that also allocate `dictByPK`: combined reduction from 192MB → 96MB. The smaller array significantly improves L3 cache hit rate for the `bucketByPK[pk]` random-access pattern (7.5M accesses per file), reducing cache miss latency.
+**Invariant:** `bk+1 ≤ numSteps+1 ≤ 1441`. `int16` max is 32767. No overflow possible. All read sites convert `int64(bucketByPK[pk])` for arithmetic; range-iterate sites use `for pk, bk16 := range bucketByPK { bk := int64(bk16) }`. No semantic change — only memory layout.
+**Impact:** Direct-path queries affected: M1 `{} | rate()`, M4 `{} | rate() by (service.name)`, M5 `{} | rate() by (span.kind)`, M7 `{} | max_over_time(duration) by (service.name)`, and histogram N=0/N=1 variants.
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:accumulateIntrinsicBucketsDirect,accumulateHistogramDirectN0,streamByRefSliceHistogram`
+
+## NOTE-123: DeltaUint64 histogram scan — re-enabled with monotonic boundary detection
+*Added: 2026-06-08*
+**Decision:** Re-enable `IntrinsicFormatDeltaUint64` in `scanAggColHistogramCompact` (restoring NOTE-121 bitset pre-filter) and add a new DeltaUint64 case in `countIntrinsicHistogramBoundaries` using monotonic boundary-change detection.
+**Rationale for revert of revert:** The previous revert (43caa8b8) was done in a session with heavy system instability (concurrent agents, Karpenter reshuffling). The HTTP500 attributed to "too slow" was actually OOM from `countIntrinsicHistogramBoundaries` returning `histFlatStride=64` (early exit) → `actualStride=65` → `groupCountsFlat=280×65×1440×8=209MB per goroutine × 8=1.67GB`. With the monotonic optimization, `countIntrinsicHistogramBoundaries` correctly returns the actual count (~20 for production durations 100μs-30s) → `groupCountsFlat=280×21×1440×8=67MB`, within GOMEMLIMIT=13GiB.
+**Monotonic optimization:** DeltaUint64 values are sorted ascending. `intrinsicHistogramBoundary` is monotonically non-decreasing (pow(2, floor(log2(v/1e9)))). So boundary transitions can be detected by comparing consecutive values: O(numBoundaries) map insertions instead of O(numValues). For 7.5M values with 20 transitions: only 20 map lookups (vs 7.5M for the old Flat case code).
+**scanAggColHistogramCompact DeltaUint64:** Restores the bitset pre-filter (NOTE-121). Bitset build from sortedPKs + check on each DeltaUint64 ref reduces binary searches by 50% at 50% selectivity. Combined with interpolation search (NOTE-122, already in place), DeltaUint64 scan cost: (7.5M × 5ns bitset) + (3.75M × 5 probes × 4ns search) ≈ 113ms per large file — acceptable.
+**Queries fixed:** M8 `{span.kind = server} | histogram_over_time(duration) by (resource.service.name)` now returns correct histogram distributions. Before this fix, DeltaUint64 refs were skipped → all spans in boundary-0 (wrong). M8 warm 1h: 823ms (returns real histogram data). M8 24h cold: ~245s (I/O dominated).
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:scanAggColHistogramCompact,countIntrinsicHistogramBoundaries`
+
+## NOTE-124: groupCountsFlatPool — per-block flat accumulator array pooled to reduce GC pressure
+*Added: 2026-06-08*
+**Decision:** Pool the `numGroups × numSteps` (and `numGroups × stride1 × stride2`) `[]int64` flat accumulation arrays used by `streamCountRateN1CompactCore`, `streamHistogramN1CompactFromRefs`, `streamHistogramN1Compact`, and `accumulateCountRateDirect` using a `sync.Pool` (var `groupCountsFlatPool`) with `acquireGroupCountsFlat`/`releaseGroupCountsFlat` helpers.
+**Rationale:** Warm multi-block queries process 100–400 blocks sequentially per goroutine. Each block allocates a `numGroups × numSteps × 8` byte array — ranging from 3.2 MB (rate, 281 groups, 1440 steps) to 67 MB (histogram, 281 groups, 20 boundaries, 1440 steps). Without pooling, 400 blocks × 67 MB = 26.8 GB of short-lived allocations per query, saturating the GC's tricolor marking bandwidth and causing stop-the-world pauses. The pool eliminates these allocations on the hot path; the GC collects pooled items at each cycle, so no permanent memory growth occurs. The `clear` in `acquireGroupCountsFlat` costs ~8 MB × 1 ns ≈ 8 ms but is required since the accumulator starts at zero and is never fully written.
+**Acquire semantics:** If the pooled slice has sufficient capacity, reslice to `[:n]` and `clear`. Otherwise allocate fresh. Return full-capacity slice (`[:cap(s)]`) to pool on release so subsequent callers with smaller `n` can reuse without reallocation.
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:groupCountsFlatPool,acquireGroupCountsFlat,releaseGroupCountsFlat`
+
+## NOTE-125: compact-path per-block arrays pooled — sortedPKs, pkOrder, timeBucketByPos, dictIdxByPos, aggValByPos, aggPresentByPos, seenByPos
+*Added: 2026-06-08*
+**Decision:** Pool all per-block arrays allocated by compact-path functions (`streamCountRateN1Compact`, `streamCountRateN1CompactFromRefs`, `streamCountRateN1CompactCore`, `streamAggN1Compact`, `streamAggN1CompactFromRefs`, `streamHistogramN1Compact`, `streamHistogramN1CompactFromRefs`) using five typed `sync.Pool` vars with acquire/release helpers.
+**Rationale:** At n=7.2 M in-range refs (typical large production file):
+- `sortedPKs []uint32`: 28 MB per call, 6 allocation sites
+- `timeBucketByPos []int32`: 29 MB per call, 6 allocation sites
+- `pkOrder []uint64`: 57 MB per call (freed early after sort), 3 allocation sites
+- `dictIdxByPos []uint32`: 28 MB per call, 7 allocation sites (including core)
+- `aggValByPos []float64`: 57 MB per call, 4 allocation sites
+- `aggPresentByPos []bool`: 7 MB per call, 4 allocation sites
+- `seenByPos []bool`: 7 MB per call, 2 allocation sites
+
+A 400-block query allocates: (28+29+57+28) × 400 × (count/rate) ≈ 57 GB of short-lived arrays per query, all in the multi-MB range — each one triggering a GC mark-sweep pass. Pooling these arrays eliminates the steady-state allocation pressure for warm queries, reducing GC CPU from ~15% to ~2% of query time.
+**Pool design:** Five pools covering `[]uint32` (sortedPKs and dictIdxByPos share one pool — same type, same size), `[]int32` (timeBucketByPos), `[]uint64` (pkOrder), `[]float64` (aggValByPos), `[]bool` (aggPresentByPos and seenByPos). Acquire uses capacity-check reslice + `clear`; pkOrder acquire skips `clear` because callers fully overwrite before reading. Release returns `[:cap(s)]` so the next caller with different n can reuse. pkOrder is released at the end of its block scope (not via defer) to free 57 MB before the downstream `GetIntrinsicColumn` I/O calls.
+**Correctness:** `timeBucketByPos`, `dictIdxByPos`, `aggPresentByPos`, `seenByPos` rely on zero-sentinel semantics (0 = absent/out-of-range). `clear` in acquire ensures these are reset. `sortedPKs` is fully overwritten by callers; `clear` is applied for safety and pattern consistency. `pkOrder` is fully overwritten; no `clear` needed.
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:streamCountRateN1Compact,streamCountRateN1CompactFromRefs,streamCountRateN1CompactCore,streamAggN1Compact,streamAggN1CompactFromRefs,streamHistogramN1Compact,streamHistogramN1CompactFromRefs`

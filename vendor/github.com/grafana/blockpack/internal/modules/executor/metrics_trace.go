@@ -561,16 +561,16 @@ func traceRowValue(bucket *aggBucketState, funcName string, stepSec, quantile fl
 }
 
 // timeBucketIndex returns the right-closed bucket index for ts within (startTime, endTime].
-// Precondition: ts > startTime (caller must range-check before calling).
+// Precondition: ts > startTime (caller must range-check before calling; all callers
+// use binary-search lo/hi to guarantee this invariant — see NOTE-118).
 // Intervals: (startTime, startTime+step], (startTime+step, startTime+2*step], …
 // A span at exactly startTime+N*step belongs to bucket N-1 (previous bucket).
+//
+// NOTE-118: (offset-1)/stepNanos is algebraically equivalent to the original two-division
+// formula (offset/stepNanos with bkt-- when offset%stepNanos==0) for all offset>0.
+// Uses one DIVQ instead of two: ~2x fewer division cycles for hot loops (M1/M3 150M calls).
 func timeBucketIndex(ts, startTime, stepNanos int64) int64 {
-	offset := ts - startTime
-	bkt := offset / stepNanos
-	if offset%stepNanos == 0 {
-		bkt--
-	}
-	return bkt
+	return (ts - startTime - 1) / stepNanos
 }
 
 // intrinsicLabelName maps blockpack's internal column names to their Tempo-compatible
