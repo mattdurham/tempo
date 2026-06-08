@@ -1140,13 +1140,9 @@ func (p *blockColumnProvider) ScanContains(column, substring string) (vm.RowSet,
 // FullScan returns a RowSet containing all row indices [0, SpanCount).
 // FullScan does not use collectStreamInto and does not interact with scratchInUse.
 // The returned rowSet owns its own backing slice independently.
+// NOTE-126
 func (p *blockColumnProvider) FullScan() vm.RowSet {
-	n := p.block.SpanCount()
-	rs := &rowSet{rows: make([]int, n)}
-	for i := range n {
-		rs.rows[i] = i
-	}
-	return rs
+	return allMatchRowSet(p.block.SpanCount())
 }
 
 // Union returns a RowSet that is the union of a and b (sorted, deduplicated).
