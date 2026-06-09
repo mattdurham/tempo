@@ -4039,16 +4039,87 @@ under `go test -race`. The filtered tests fail before the C1 filter fix and pass
 
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:scanAggColHistogramCompact,scanAggColHistogramShard,buildFrozenBoundaryIdx,histRefPassPos`
 
-## NOTE-144: executeTraceMetricsIntrinsic prefetches its intrinsic columns concurrently (M8)
+## NOTE-148: scanGroupByColCompact Dict path parallelized across min(NumCPU, 8) workers (M4/M6/M9/M10)
+*Added: 2026-06-09*
 
-Before the serial `GetIntrinsicColumn` chain (span:start → predicate cols → group-by → agg
-field), `executeTraceMetricsIntrinsic` now calls `r.PrefetchIntrinsicColumns(...)` with the
-column set computed by `intrinsicPrefetchColumns`: span:start (always); the normalized agg.Field
-unless the function is count/rate; agg.GroupBy verbatim; and intrinsic predicate columns via the
-existing `collectIntrinsicNodeColumns`. This collapses the ~4 serial object-storage GETs per block
-into one concurrent round, warming the Reader cache so the existing serial calls become cache hits.
-The prefetch is best-effort and byte-identical on failure; it attacks the I/O-latency bottleneck
-(selectgo wait), orthogonal to the CPU-scan work in NOTE-133..143. Implementation and concurrency
-rationale: reader NOTES.md NOTE-144.
-Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:intrinsicPrefetchColumns`,
-`internal/modules/executor/metrics_trace_intrinsic.go:executeTraceMetricsIntrinsic`
+**Decision:** Shard the Dict-format group-by scan in `scanGroupByColCompact` across
+`min(runtime.NumCPU(), histParallelWorkers)` goroutines. The rate-by-group queries
+(`{...} | rate() by (resource.service.name | span.http.request.method)` — M4/M6/M9/M10) group by
+low-cardinality columns: a handful of `DictEntries` but millions of `BlockRefs`. NOTE-143 only
+parallelizes the histogram scan, and its Dict path gates on *entry count* (≥65536 entries), so a
+245-service column never parallelized anywhere before this. The work here is in the REFS, so we shard
+the per-ref inner loop by ref count, not entry count.
+
+**Structure (driver = `scanGroupByColCompact`, helper = `scanGroupByColCompactDictParallel`):** the
+driver builds the read-only `pkBitset`/`rankPrefix` POPCNT index once (shared) and extracts the serial
+body into `scanGroupByColCompactSerial`.
+  - **Phase A (parallel):** workers take contiguous `DictEntries` ranges balanced by *cumulative ref
+    count* (even-count chunking would hand one ref-heavy entry to one worker). For each owned entry
+    with a non-empty value, write `entryIdx+1` into `dictIdxByPos[pos]` for every passing ref and
+    record `entryPassed[e]`.
+  - **Phase B (serial, O(numEntries)+O(n)):** build the group `dict` in entry order and translate the
+    `entryIdx+1` markers in `dictIdxByPos` to the final `dictIdx+1`.
+
+**Why race-free without per-worker copies + reduction (unlike NOTE-143):** each in-range span
+position is owned by exactly one ref (a span has one value per column), so the `dictIdxByPos[pos]`
+writes are disjoint across workers — no accumulator to reduce. Contiguous entry ranges mean each entry
+is owned by one worker, so the per-entry `entryPassed[e]` writes are disjoint too. `pkBitset`,
+`rankPrefix`, `col.DictEntries`, `intrinsicInt64ColToString`, and `packKey` are all read-only/pure.
+
+**Why output is byte-identical:** the serial path assigns dict indices in first-passing-ref encounter
+order; since it iterates `DictEntries` sequentially and assigns on the first passing ref, that order
+IS entry order — exactly what Phase B reproduces. Only entries with a passing ref get a slot (Phase B
+skips `!entryPassed`), so fully-filtered groups never enlarge `groupCountsFlat` — important for the
+OOM-sensitive histogram group-by callers (`streamHistogramN1Compact*`). Proven by
+`intrinsic_groupby_parallel_test.go`: full, filtered (~2/3 refs rejected), int64-value, and 3-group
+ref-heavy-skew cases all assert `dict` AND `dictIdxByPos` are byte-identical to the serial path under
+`go test -race`, plus a dispatcher test through the public `scanGroupByColCompact`.
+
+**Gate — totalRefs ≥ 2·len(sortedPKs):** the per-ref work is memory-bandwidth-bound (range/bitset
+filter + one array write), NOT CPU-bound like NOTE-143's per-value `Log2`/`Pow` boundary math.
+Parallelism only pays when the column walks meaningfully more refs than it writes — i.e. the file
+spans more time than the query window (a 2h window over a ~24h file walks ~12× the in-range refs). At
+full coverage (totalRefs ≈ n) the goroutine + per-position-write contention + the O(n) translation
+pass make it a net regression, so the driver stays serial. The Flat path stays serial unconditionally
+(Flat group-by is high-cardinality and rare).
+
+**Measurement (microbench, authoritative for a parallelism change — cluster wall-clock is I/O/cache
+bound):** `BenchmarkScanGroupByColCompact` on 20 cores, 250 groups × 12000 refs (3M total):
+full-coverage stays serial (4.6 ms serial vs 5.8 ms if forced parallel — gated out); wide-file
+2×→2.0×, 4×→1.8×, 12×→2.7× faster (5.65 ms → 2.10 ms at 12×).
+
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:scanGroupByColCompact,scanGroupByColCompactSerial,scanGroupByColCompactDictParallel`
+
+## NOTE-149: unfiltered N=0 count/rate via boundary binary search, not per-span loop (M1)
+*Added: 2026-06-09*
+
+**Decision:** For the unfiltered `{} | rate()` shape (no predicate, no group-by — M1), replace
+`streamCountRateNoGroupBy`'s O(N) per-span `timeBucketIndex` loop (~150M iterations for M1, NOTE-068)
+with `streamCountRateNoGroupBySorted`: one `sort.Search` per bucket boundary, O(numSteps·log N).
+
+**Why it is correct:** `span:start` is a flat ascending-sorted intrinsic column (the same property
+the lo/hi `sort.Search` range-narrowing in `executeTraceMetricsIntrinsic` already relies on), and
+`timeBucketIndex(ts)=(ts-StartTime-1)/step` is monotonically non-decreasing in `ts`. So in-range
+timestamps fall into contiguous, non-overlapping runs — one run per bucket. The count for bucket `b`
+is the number of timestamps in `(StartTime+b·step, StartTime+(b+1)·step]`; the inclusive upper bound
+is `StartTime+(b+1)·step`, and `val > boundary` places `val==boundary` into bucket `b` (right-closed),
+matching `timeBucketIndex` exactly. A single `sort.Search` over the remaining sorted tail finds each
+run boundary; `prev` advances monotonically so the searches shrink. Callers guarantee every value is
+in `(StartTime, EndTime]` via the lo/hi binary search, so all timestamps land in `[0,numSteps)` with
+no clamping.
+
+**Why gated on `filteredRefs == nil`:** the predicate-filtered N=0 path receives its values from
+`mergeJoinFilteredRefsWithVals`, which sorts by **packKey**, not timestamp — so its `inRangeVals` is
+NOT time-sorted and must keep the linear `streamCountRateNoGroupBy` loop. The selective-filter case is
+already handled earlier by `streamCountRateN0HashFilter` (NOTE-113/136). Dispatch added in
+`dispatchIntrinsicAccumulate`; `streamCountRateNoGroupBy` is retained for the filtered path.
+
+**Measurement (microbench, authoritative — cluster wall-clock is I/O/cache bound):**
+`BenchmarkStreamCountRateNoGroupBy_SortedVsLoop` (5M spans, 240 buckets, 20 cores):
+loop 12.65 ms/op, 134 allocs → sorted 0.54 µs/op, 14 allocs (−99.996% time). At M1's ~150M spans
+the eliminated per-file count CPU is ~hundreds of ms; the boundary search is microseconds regardless
+of span count. `intrinsic_groupby_parallel_test.go::TestStreamCountRateNoGroupBySorted_Equivalence`
+asserts byte-identical per-bucket counts vs the legacy loop across dense, sparse-with-empty-buckets,
+single-span, empty, and final-bucket-only inputs.
+
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:streamCountRateNoGroupBySorted,dispatchIntrinsicAccumulate`

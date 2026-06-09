@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 
 	"github.com/golang/snappy"
 )
@@ -63,6 +64,34 @@ func ReleaseIntrinsicBuf(bp *[]byte) {
 		*bp = (*bp)[:0]
 	}
 	intrinsicBufPool.Put(bp)
+}
+
+// NOTE-151: pool the cross-page dict-dedup map. decodePagedColumnBlob built a fresh
+// map[string]int sized valueCount*numPages on every dict-column decode (appendDictPage).
+// Dict columns repeat their distinct value set on every page, so the map only ever holds
+// ~valueCount distinct keys — valueCount*numPages was a ~numPages× over-allocation thrown
+// away per call. Group-by columns (resource.service.name, span.http.request.method) are
+// dict-encoded and decoded once per block per goroutine on M4/M6/M9/M10, so this allocated
+// and GC'd one oversized map per block. A cleared pooled map starts at its warmed capacity
+// (the real distinct count) — no per-call allocation, no rehash in steady state.
+const dictIdxMapMaxEntries = 1 << 16 // drop pathologically large pooled maps back to GC
+
+var dictIdxMapPool = &sync.Pool{
+	New: func() any { return make(map[string]int, 256) },
+}
+
+// acquireDictIdxMap returns a cleared pooled map[string]int for cross-page dict dedup.
+func acquireDictIdxMap() map[string]int { return dictIdxMapPool.Get().(map[string]int) }
+
+// releaseDictIdxMap clears m and returns it to the pool. A map that grew past
+// dictIdxMapMaxEntries (a high-cardinality outlier) is dropped so the pool never pins a
+// huge backing array; the next Get allocates a fresh small map.
+func releaseDictIdxMap(m map[string]int) {
+	if len(m) > dictIdxMapMaxEntries {
+		return
+	}
+	clear(m)
+	dictIdxMapPool.Put(m)
 }
 
 // DecodeTOC decompresses a TOC blob and parses it into a slice of IntrinsicColMeta.
@@ -312,65 +341,77 @@ func DecodePageTOC(blob []byte) (PagedIntrinsicTOC, error) {
 //
 // For bytes columns: length-prefixed bytes[rowCount] + refs[rowCount × refSize].
 func DecodeFlatPage(raw []byte, blockW, rowW, rowCount int, colType ColumnType) (*IntrinsicColumn, error) {
+	col := &IntrinsicColumn{Type: colType, Format: IntrinsicFormatFlat}
+	if colType == ColumnTypeBytes {
+		col.BytesValues = make([][]byte, 0, rowCount)
+	} else {
+		col.Uint64Values = make([]uint64, 0, rowCount)
+	}
+	col.BlockRefs = make([]BlockRef, 0, rowCount)
+	if err := appendFlatPage(raw, blockW, rowW, rowCount, colType, col); err != nil {
+		return nil, err
+	}
+	return col, nil
+}
+
+// appendFlatPage decodes a flat page blob and appends its values and refs directly
+// into dst's (caller-pre-sized) slices, avoiding a per-page intermediate column.
+// NOTE-145.
+func appendFlatPage(raw []byte, blockW, rowW, rowCount int, colType ColumnType, dst *IntrinsicColumn) error {
 	isBytes := colType == ColumnTypeBytes
 	refSize := blockW + rowW
 	pos := 0
 
-	col := &IntrinsicColumn{Type: colType, Format: IntrinsicFormatFlat}
-
 	if isBytes {
-		col.BytesValues = make([][]byte, 0, rowCount)
 		for range rowCount {
 			if pos+2 > len(raw) {
-				return nil, fmt.Errorf("DecodeFlatPage: truncated at bytes len")
+				return fmt.Errorf("DecodeFlatPage: truncated at bytes len")
 			}
 			vLen := int(binary.LittleEndian.Uint16(raw[pos:]))
 			pos += 2
 			if pos+vLen > len(raw) {
-				return nil, fmt.Errorf("DecodeFlatPage: truncated at bytes value")
+				return fmt.Errorf("DecodeFlatPage: truncated at bytes value")
 			}
 			// NOTE-012: copy BytesValues so the pool buffer can be safely reused.
 			v := make([]byte, vLen)
 			copy(v, raw[pos:pos+vLen])
-			col.BytesValues = append(col.BytesValues, v)
+			dst.BytesValues = append(dst.BytesValues, v)
 			pos += vLen
 		}
 	} else {
 		// Varint delta encoding: values_len[4 LE] + varint deltas.
 		if pos+4 > len(raw) {
-			return nil, fmt.Errorf("DecodeFlatPage: truncated at values_len")
+			return fmt.Errorf("DecodeFlatPage: truncated at values_len")
 		}
 		valuesLen := int(binary.LittleEndian.Uint32(raw[pos:]))
 		pos += 4
 
-		col.Uint64Values = make([]uint64, 0, rowCount)
 		var acc uint64
 		valEnd := pos + valuesLen
 		for range rowCount {
 			if pos >= valEnd {
-				return nil, fmt.Errorf("DecodeFlatPage: truncated at varint value")
+				return fmt.Errorf("DecodeFlatPage: truncated at varint value")
 			}
 			delta, n := binary.Uvarint(raw[pos:valEnd])
 			if n <= 0 {
-				return nil, fmt.Errorf("DecodeFlatPage: invalid varint at pos %d", pos)
+				return fmt.Errorf("DecodeFlatPage: invalid varint at pos %d", pos)
 			}
 			acc += delta
-			col.Uint64Values = append(col.Uint64Values, acc)
+			dst.Uint64Values = append(dst.Uint64Values, acc)
 			pos += n
 		}
 		pos = valEnd // ensure we're at refs start
 	}
 
-	col.BlockRefs = make([]BlockRef, 0, rowCount)
 	for range rowCount {
 		if pos+refSize > len(raw) {
-			return nil, fmt.Errorf("DecodeFlatPage: truncated at refs")
+			return fmt.Errorf("DecodeFlatPage: truncated at refs")
 		}
-		col.BlockRefs = append(col.BlockRefs, decodeRef(raw, pos, blockW, rowW))
+		dst.BlockRefs = append(dst.BlockRefs, decodeRef(raw, pos, blockW, rowW))
 		pos += refSize
 	}
-	col.Count = uint32(rowCount) //nolint:gosec
-	return col, nil
+	dst.Count += uint32(rowCount) //nolint:gosec
+	return nil
 }
 
 // DecodeDictPage decodes a dict page blob (no header — format info comes from the TOC).
@@ -436,6 +477,201 @@ func DecodeDictPage(raw []byte, blockW, rowW int, colType ColumnType) (*Intrinsi
 	return col, nil
 }
 
+// forEachDictPageValue walks the value records of one dict page, invoking fn once per value
+// with the value's bytes (nil for an int64/empty value), its int64 payload, and the byte
+// offset+count of its ref block within raw. It does NOT decode the refs — callers decide
+// whether to count (pass 1) or materialize (pass 2). Sharing one parser keeps the two
+// decodeDictPagesArena passes byte-identical by construction (NOTE-152).
+func forEachDictPageValue(
+	raw []byte, refSize int, isInt64 bool,
+	fn func(valBytes []byte, int64Val int64, refStart, refCount int) error,
+) error {
+	pos := 0
+	if pos+4 > len(raw) {
+		return fmt.Errorf("dict page: too short")
+	}
+	valueCount := int(binary.LittleEndian.Uint32(raw[pos:]))
+	pos += 4
+
+	for range valueCount {
+		if pos+2 > len(raw) {
+			return fmt.Errorf("dict page: truncated at value_len")
+		}
+		vLen := int(binary.LittleEndian.Uint16(raw[pos:]))
+		pos += 2
+
+		var int64Val int64
+		var valBytes []byte
+		if isInt64 && vLen == 0 {
+			if pos+8 > len(raw) {
+				return fmt.Errorf("dict page: truncated at int64 value")
+			}
+			int64Val = int64(binary.LittleEndian.Uint64(raw[pos:])) //nolint:gosec
+			pos += 8
+		} else {
+			if pos+vLen > len(raw) {
+				return fmt.Errorf("dict page: truncated at string value")
+			}
+			valBytes = raw[pos : pos+vLen]
+			pos += vLen
+		}
+
+		if pos+4 > len(raw) {
+			return fmt.Errorf("dict page: truncated at ref_count")
+		}
+		refCount := int(binary.LittleEndian.Uint32(raw[pos:]))
+		pos += 4
+		if refCount < 0 || refCount > (len(raw)-pos)/refSize {
+			return fmt.Errorf("dict page: truncated at refs")
+		}
+		if err := fn(valBytes, int64Val, pos, refCount); err != nil {
+			return err
+		}
+		pos += refCount * refSize
+	}
+	return nil
+}
+
+// decodeDictPagesArena decodes all pages of a multi-page dict column into merged using a
+// single contiguous BlockRefs arena (NOTE-152). Multi-page group-by columns (e.g.
+// resource.service.name) repeat their distinct value set on every page, so the legacy
+// appendDictPage extended each duplicate entry's BlockRefs with slices.Grow once per page —
+// geometric reallocation that, summed over ~100 pages, allocated ~2.5x the final ref bytes
+// as transient garbage (13.5% of querier alloc_space, the single largest leaf — pprof
+// 2026-06-09). Two passes eliminate it: pass 1 sums each value's ref count across all pages
+// (header-only walk, refs skipped); then one arena of exactly totalRefs BlockRefs is carved
+// into per-entry sub-slices; pass 2 fills each entry's exact-capacity sub-slice, so no append
+// ever reallocates. Entry order, Value/Int64Val, and per-entry ref order are byte-identical
+// to the legacy path (entries created in first-appearance order; refs appended in page order).
+//
+// Pages are decompressed twice (once per pass) into the pooled buffer — querier CPU is
+// I/O-latency bound with headroom (mission profile: 33% CPU), so trading a second snappy pass
+// for ~zero retained over-allocation and far less GC pressure is favorable, and avoids holding
+// every decompressed page in memory at once (OOM-sensitive; GOMEMLIMIT=13GiB).
+func decodeDictPagesArena(
+	blob []byte, pageDataStart int, toc PagedIntrinsicTOC,
+	blockW, rowW int, merged *IntrinsicColumn,
+) error {
+	isInt64 := toc.ColType == ColumnTypeInt64 || toc.ColType == ColumnTypeRangeInt64
+	refSize := blockW + rowW
+	if refSize <= 0 {
+		return fmt.Errorf("decodeDictPagesArena: invalid ref size %d", refSize)
+	}
+
+	// NOTE-151: pooled, cleared dedup map (retains warmed capacity, no per-call alloc).
+	idx := acquireDictIdxMap()
+	defer releaseDictIdxMap(idx)
+
+	// NOTE-012: pooled snappy decode buffer reused across both passes and all pages.
+	pageBuf := AcquireIntrinsicBuf()
+	defer ReleaseIntrinsicBuf(pageBuf)
+
+	decodePage := func(i int, pm PageMeta) ([]byte, error) {
+		pageStart := pageDataStart + int(pm.Offset)
+		pageEnd := pageStart + int(pm.Length)
+		if pageEnd > len(blob) {
+			return nil, fmt.Errorf("decodeDictPagesArena: page %d out of bounds (offset=%d len=%d blobLen=%d)",
+				i, pm.Offset, pm.Length, len(blob))
+		}
+		pageRaw, decErr := snappy.Decode(*pageBuf, blob[pageStart:pageEnd])
+		if decErr != nil {
+			return nil, fmt.Errorf("decodeDictPagesArena: page %d snappy: %w", i, decErr)
+		}
+		*pageBuf = pageRaw
+		return pageRaw, nil
+	}
+
+	// Pass 1: materialize entries (Value/Int64Val) in first-appearance order and sum each
+	// entry's total ref count across all pages. refTotals is parallel to merged.DictEntries.
+	merged.DictEntries = merged.DictEntries[:0]
+	refTotals := make([]int, 0, 64)
+	var keyScratch []byte
+	for i, pm := range toc.Pages {
+		pageRaw, err := decodePage(i, pm)
+		if err != nil {
+			return err
+		}
+		err = forEachDictPageValue(pageRaw, refSize, isInt64,
+			func(valBytes []byte, int64Val int64, _, refCount int) error {
+				if len(valBytes) > 0 {
+					if j, ok := idx[string(valBytes)]; ok {
+						refTotals[j] += refCount
+						return nil
+					}
+					newIdx := len(merged.DictEntries)
+					merged.DictEntries = append(merged.DictEntries,
+						IntrinsicDictEntry{Value: string(valBytes), Int64Val: int64Val})
+					idx[merged.DictEntries[newIdx].Value] = newIdx // reuse kept string, no 2nd alloc
+					refTotals = append(refTotals, refCount)
+					return nil
+				}
+				keyScratch = append(keyScratch[:0], 0)
+				keyScratch = binary.LittleEndian.AppendUint64(keyScratch, uint64(int64Val)) //nolint:gosec
+				if j, ok := idx[string(keyScratch)]; ok {
+					refTotals[j] += refCount
+					return nil
+				}
+				newIdx := len(merged.DictEntries)
+				merged.DictEntries = append(merged.DictEntries, IntrinsicDictEntry{Int64Val: int64Val})
+				idx[string(keyScratch)] = newIdx
+				refTotals = append(refTotals, refCount)
+				return nil
+			})
+		if err != nil {
+			return err
+		}
+	}
+	if len(merged.DictEntries) == 0 {
+		return nil
+	}
+
+	// Carve one contiguous arena into per-entry sub-slices of exact capacity (len 0, cap
+	// refTotals[j]). Exact cap means a later append on any entry reallocates rather than
+	// overwriting its neighbor — same safety contract as the NOTE-150 value/ref arenas.
+	total := 0
+	for _, c := range refTotals {
+		total += c
+	}
+	arena := make([]BlockRef, total)
+	off := 0
+	for j := range merged.DictEntries {
+		c := refTotals[j]
+		merged.DictEntries[j].BlockRefs = arena[off : off : off+c]
+		off += c
+	}
+
+	// Pass 2: decode each value's refs into its entry's exact-capacity sub-slice. Appends
+	// happen in page order (same as legacy), so per-entry ref order is byte-identical.
+	for i, pm := range toc.Pages {
+		pageRaw, err := decodePage(i, pm)
+		if err != nil {
+			return err
+		}
+		err = forEachDictPageValue(pageRaw, refSize, isInt64,
+			func(valBytes []byte, int64Val int64, refStart, refCount int) error {
+				var j int
+				if len(valBytes) > 0 {
+					j = idx[string(valBytes)]
+				} else {
+					keyScratch = append(keyScratch[:0], 0)
+					keyScratch = binary.LittleEndian.AppendUint64(keyScratch, uint64(int64Val)) //nolint:gosec
+					j = idx[string(keyScratch)]
+				}
+				e := &merged.DictEntries[j]
+				p := refStart
+				for range refCount {
+					e.BlockRefs = append(e.BlockRefs, decodeRef(pageRaw, p, blockW, rowW))
+					p += refSize
+				}
+				return nil
+			})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // decodePagedColumnBlob decodes a v2 paged column blob into a merged IntrinsicColumn.
 // blob[0] must already be verified to be IntrinsicPagedVersion (0x02).
 //
@@ -475,16 +711,46 @@ func decodePagedColumnBlob(blob []byte) (*IntrinsicColumn, error) {
 		totalRows += int(pm.RowCount)
 	}
 	merged := &IntrinsicColumn{Type: toc.ColType, Format: toc.Format}
+	// NOTE-145: pre-size only the value slice this column type actually uses (a column
+	// is uint64 OR bytes, never both) — the old code allocated a full totalRows-sized
+	// slice for the unused type on every flat/xor/delta column.
 	if toc.Format == IntrinsicFormatFlat || toc.Format == IntrinsicFormatXORBytes ||
 		toc.Format == IntrinsicFormatDeltaUint64 {
-		merged.Uint64Values = make([]uint64, 0, totalRows)
-		merged.BytesValues = make([][]byte, 0, totalRows)
+		if toc.ColType == ColumnTypeBytes {
+			merged.BytesValues = make([][]byte, 0, totalRows)
+		} else {
+			merged.Uint64Values = make([]uint64, 0, totalRows)
+		}
 		merged.BlockRefs = make([]BlockRef, 0, totalRows)
 	}
 
-	// For dict columns, maintain the value→index map across page merges so we
-	// don't rebuild it from scratch on each call (O(N²) → O(N) total).
-	var dictIdx map[string]int
+	// NOTE-150: Flat/XOR/Delta pages are self-contained (delta acc and XOR prev reset to
+	// zero/nil at the start of every page — see appendDeltaUint64Page/appendXORBytesPage),
+	// so they decode independently of each other. For multiple sizable pages, decode them
+	// in parallel: each page writes into a disjoint, capacity-capped sub-slice of merged's
+	// pre-sized backing arrays, so there is no cross-goroutine aliasing or reduction step.
+	// Dict pages share dictIdx (cross-page value dedup) and stay on the serial path below.
+	// span:start (Delta, hundreds of pages on real files) and trace:id/span:id (XORBytes)
+	// are the hot decode targets — ~27% of querier allocs and the residual cost of M1.
+	if isParallelPageDecodeFormat(toc.Format) && len(toc.Pages) >= 2 &&
+		totalRows >= parallelPageDecodeMinRows {
+		if err = decodePagesParallel(blob, pos, toc, blockW, rowW, totalRows, merged); err != nil {
+			return nil, err
+		}
+		return merged, nil
+	}
+
+	// NOTE-152: dict columns decode through a single contiguous BlockRefs arena (two passes:
+	// count, then fill exact-capacity per-entry sub-slices) instead of growing each duplicate
+	// entry's refs page by page. This eliminates the slices.Grow geometric reallocation that
+	// was the largest single querier alloc_space leaf (13.5%, pprof 2026-06-09). Supersedes the
+	// per-page appendDictPage merge (NOTE-146) and its pooled dedup map (NOTE-151, reused here).
+	if toc.Format == IntrinsicFormatDict {
+		if err = decodeDictPagesArena(blob, pos, toc, blockW, rowW, merged); err != nil {
+			return nil, err
+		}
+		return merged, nil
+	}
 
 	// NOTE-012: reuse a pooled decode buffer across page decodes.
 	pageBuf := AcquireIntrinsicBuf()
@@ -504,47 +770,169 @@ func decodePagedColumnBlob(blob []byte) (*IntrinsicColumn, error) {
 		}
 		*pageBuf = pageRaw // update pool buffer pointer (snappy may have reallocated)
 
-		var page *IntrinsicColumn
+		// NOTE-145: Flat/XOR/Delta pages decode directly into merged's pre-allocated
+		// slices — the append helpers skip the per-page *IntrinsicColumn struct and
+		// intermediate slices that the old code allocated only to copy-and-discard.
+		// Reached only for single-page or sub-threshold columns (the parallel path above
+		// handles the multi-page case); dict is handled by the arena path above.
 		switch toc.Format {
 		case IntrinsicFormatFlat:
-			page, err = DecodeFlatPage(pageRaw, blockW, rowW, int(pm.RowCount), toc.ColType)
+			err = appendFlatPage(pageRaw, blockW, rowW, int(pm.RowCount), toc.ColType, merged)
 		case IntrinsicFormatXORBytes:
-			page, err = decodeXORBytesPage(pageRaw, blockW, rowW, int(pm.RowCount))
+			err = appendXORBytesPage(pageRaw, blockW, rowW, int(pm.RowCount), merged)
 		case IntrinsicFormatDeltaUint64:
-			page, err = decodeDeltaUint64Page(pageRaw, blockW, rowW, int(pm.RowCount))
+			err = appendDeltaUint64Page(pageRaw, blockW, rowW, int(pm.RowCount), merged)
 		default:
-			page, err = DecodeDictPage(pageRaw, blockW, rowW, toc.ColType)
+			return nil, fmt.Errorf("decodePagedColumnBlob: page %d: unknown format %d", i, toc.Format)
 		}
 		if err != nil {
 			return nil, fmt.Errorf("decodePagedColumnBlob: page %d: %w", i, err)
 		}
-
-		// Flat merge: simple appends into pre-allocated slices.
-		merged.Uint64Values = append(merged.Uint64Values, page.Uint64Values...)
-		merged.BytesValues = append(merged.BytesValues, page.BytesValues...)
-		merged.BlockRefs = append(merged.BlockRefs, page.BlockRefs...)
-		merged.Count += page.Count
-
-		// Dict merge: use persistent idx map to avoid O(N²) rebuild.
-		if len(page.DictEntries) > 0 {
-			if dictIdx == nil {
-				dictIdx = make(map[string]int, len(page.DictEntries)*len(toc.Pages))
-			}
-			for _, e := range page.DictEntries {
-				key := e.Value
-				if key == "" {
-					key = "\x00" + string(binary.LittleEndian.AppendUint64(nil, uint64(e.Int64Val))) //nolint:gosec
-				}
-				if j, ok := dictIdx[key]; ok {
-					merged.DictEntries[j].BlockRefs = append(merged.DictEntries[j].BlockRefs, e.BlockRefs...)
-				} else {
-					dictIdx[key] = len(merged.DictEntries)
-					merged.DictEntries = append(merged.DictEntries, e)
-				}
-			}
-		}
 	}
 	return merged, nil
+}
+
+// NOTE-150: parallel page-decode tuning.
+const (
+	// parallelPageDecodeMinRows gates the parallel path: only worth the goroutine spawn
+	// overhead once there are at least two full pages of work. IntrinsicPageSize=10_000.
+	parallelPageDecodeMinRows = 2 * IntrinsicPageSize
+	// maxPageDecodeWorkers caps fan-out so a single column decode cannot monopolize all
+	// cores (a querier runs many concurrent block/file decodes). Matches the W=8 cap used
+	// by the I/O pipeline (NOTE-058) and the group-by scan (NOTE-143).
+	maxPageDecodeWorkers = 8
+)
+
+// isParallelPageDecodeFormat reports whether a paged format's pages decode independently
+// (no cross-page state), making them safe to decode concurrently. NOTE-150.
+func isParallelPageDecodeFormat(format uint8) bool {
+	return format == IntrinsicFormatFlat || format == IntrinsicFormatXORBytes ||
+		format == IntrinsicFormatDeltaUint64
+}
+
+// decodePagesParallel decodes the pages of a Flat/XOR/Delta paged column concurrently into
+// merged. Each page i writes its values/refs into the disjoint backing region
+// [rowOffset_i, rowOffset_i+RowCount_i) via capacity-capped sub-slices, so the existing
+// append* helpers reuse unchanged while every goroutine touches a distinct memory range.
+//
+// pageDataStart is the offset in blob of the first page blob (== pos after the TOC).
+// merged's value and ref slices must already be allocated with cap == totalRows (done by
+// decodePagedColumnBlob for these formats). NOTE-150.
+func decodePagesParallel(
+	blob []byte,
+	pageDataStart int,
+	toc PagedIntrinsicTOC,
+	blockW, rowW, totalRows int,
+	merged *IntrinsicColumn,
+) error {
+	// rowOffsets[i] = first output row index for page i (cumulative RowCount).
+	rowOffsets := make([]int, len(toc.Pages))
+	acc := 0
+	for i, pm := range toc.Pages {
+		rowOffsets[i] = acc
+		acc += int(pm.RowCount)
+	}
+
+	// Expose the full backing arrays so per-page capped sub-slices land in the right slot.
+	// The append helpers fill [off:off+RowCount); the union covers [0:totalRows) exactly.
+	isBytes := toc.ColType == ColumnTypeBytes
+	if isBytes {
+		merged.BytesValues = merged.BytesValues[:totalRows]
+	} else {
+		merged.Uint64Values = merged.Uint64Values[:totalRows]
+	}
+	merged.BlockRefs = merged.BlockRefs[:totalRows]
+
+	workers := min(len(toc.Pages), maxPageDecodeWorkers)
+
+	var (
+		next     atomic.Int64 // next page index to claim (work-stealing for balanced load)
+		mu       sync.Mutex
+		firstErr error
+		wg       sync.WaitGroup
+	)
+	setErr := func(e error) {
+		mu.Lock()
+		if firstErr == nil {
+			firstErr = e
+		}
+		mu.Unlock()
+	}
+	hasErr := func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return firstErr != nil
+	}
+
+	wg.Add(workers)
+	for range workers {
+		go func() {
+			defer wg.Done()
+			// SPEC-ROOT-001: a worker panic must not crash the process.
+			defer func() {
+				if rec := recover(); rec != nil {
+					setErr(fmt.Errorf("decodePagesParallel: worker panic: %v", rec))
+				}
+			}()
+			pageBuf := AcquireIntrinsicBuf()
+			defer ReleaseIntrinsicBuf(pageBuf)
+
+			for {
+				i := int(next.Add(1)) - 1
+				if i >= len(toc.Pages) || hasErr() {
+					return
+				}
+				pm := toc.Pages[i]
+				pageStart := pageDataStart + int(pm.Offset)
+				pageEnd := pageStart + int(pm.Length)
+				if pageEnd > len(blob) || pageStart < 0 {
+					setErr(fmt.Errorf("decodePagesParallel: page %d out of bounds "+
+						"(offset=%d len=%d blobLen=%d)", i, pm.Offset, pm.Length, len(blob)))
+					return
+				}
+				pageRaw, decErr := snappy.Decode(*pageBuf, blob[pageStart:pageEnd])
+				if decErr != nil {
+					setErr(fmt.Errorf("decodePagesParallel: page %d snappy: %w", i, decErr))
+					return
+				}
+				*pageBuf = pageRaw // snappy may have reallocated the buffer
+
+				off := rowOffsets[i]
+				rc := int(pm.RowCount)
+				// slot aliases merged's disjoint [off:off+rc) region with len 0, cap rc.
+				// The append helpers fill exactly rc entries — never exceeding cap, so they
+				// stay within this goroutine's region and never reallocate or alias others.
+				slot := &IntrinsicColumn{Type: toc.ColType, Format: toc.Format}
+				if isBytes {
+					slot.BytesValues = merged.BytesValues[off : off : off+rc]
+				} else {
+					slot.Uint64Values = merged.Uint64Values[off : off : off+rc]
+				}
+				slot.BlockRefs = merged.BlockRefs[off : off : off+rc]
+
+				var aerr error
+				switch toc.Format {
+				case IntrinsicFormatFlat:
+					aerr = appendFlatPage(pageRaw, blockW, rowW, rc, toc.ColType, slot)
+				case IntrinsicFormatXORBytes:
+					aerr = appendXORBytesPage(pageRaw, blockW, rowW, rc, slot)
+				case IntrinsicFormatDeltaUint64:
+					aerr = appendDeltaUint64Page(pageRaw, blockW, rowW, rc, slot)
+				}
+				if aerr != nil {
+					setErr(fmt.Errorf("decodePagesParallel: page %d: %w", i, aerr))
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	if firstErr != nil {
+		return firstErr
+	}
+	merged.Count = uint32(totalRows) //nolint:gosec
+	return nil
 }
 
 // PeekIntrinsicBlobHeader reads the format, column type, and row count from a V14
@@ -787,7 +1175,8 @@ func decodeVariableWidthRef(raw []byte, pos, blockW, rowW int) (BlockRef, int, e
 	return BlockRef{BlockIdx: blockIdx, RowIdx: rowIdx}, pos, nil
 }
 
-// decodeXORBytesPage decodes a single XOR-encoded bytes page blob (already snappy-decoded).
+// appendXORBytesPage decodes a single XOR-encoded bytes page blob (already snappy-decoded)
+// and appends its values and refs directly into dst. NOTE-145.
 //
 // Wire format (see encodeXORBytesIntrinsic):
 //
@@ -797,54 +1186,57 @@ func decodeVariableWidthRef(raw []byte, pos, blockW, rowW int) (BlockRef, int, e
 //
 // NOTE-013: BytesValues must be independent copies (NOTE-012 invariant) — they cannot alias
 // the pageBuf pool buffer that decodePagedColumnBlob reuses across page decodes.
-func decodeXORBytesPage(raw []byte, blockW, rowW, rowCount int) (*IntrinsicColumn, error) {
-	col := &IntrinsicColumn{
-		Type:        ColumnTypeBytes,
-		Format:      IntrinsicFormatXORBytes,
-		BytesValues: make([][]byte, 0, rowCount),
-		BlockRefs:   make([]BlockRef, 0, rowCount),
+func appendXORBytesPage(raw []byte, blockW, rowW, rowCount int, dst *IntrinsicColumn) error {
+	// NOTE-147: reconstruct all values into one page-sized arena instead of one
+	// make([]byte) per value. xorInvert previously allocated a fresh slice per row
+	// (~one alloc/value = the dominant cost on this path, ~27% of querier allocs per
+	// Pyroscope). A cheap pre-scan over the length prefixes sizes the arena exactly,
+	// so the whole page's values share a single allocation with zero waste. Each value
+	// is a non-overlapping subslice; the arena is never reallocated, so prev (which
+	// points into it) stays valid across iterations. The arena is freshly allocated and
+	// never aliases the pool buffer (raw), preserving NOTE-012/NOTE-013.
+	valBytes, err := xorBytesPageValueSize(raw, rowCount)
+	if err != nil {
+		return err
 	}
+	arena := make([]byte, valBytes)
+	arenaOff := 0
 
 	pos := 0
 	var prev []byte
 	for range rowCount {
-		if pos+4 > len(raw) {
-			return nil, fmt.Errorf("decodeXORBytesPage: truncated at xor_data_len")
-		}
 		xorLen := int(binary.LittleEndian.Uint32(raw[pos:]))
 		pos += 4
-		if xorLen > MaxBytesLen {
-			return nil, fmt.Errorf("decodeXORBytesPage: xorLen %d exceeds MaxBytesLen", xorLen)
-		}
-		if pos+xorLen > len(raw) {
-			return nil, fmt.Errorf("decodeXORBytesPage: truncated at xor_data (len=%d)", xorLen)
-		}
 		xorData := raw[pos : pos+xorLen]
 		pos += xorLen
 
-		reconstructed := xorInvert(xorData, prev)
-
-		// NOTE-012: make an independent copy — raw aliases the pool buffer.
-		v := make([]byte, len(reconstructed))
-		copy(v, reconstructed)
-		col.BytesValues = append(col.BytesValues, v)
-		prev = v // prev must not alias pool buffer; v is already a copy
+		// Carve xorLen bytes out of the arena. Capacity is capped (three-index slice) so a
+		// stray append on a kept value can never corrupt the next value's backing.
+		reconstructed := arena[arenaOff : arenaOff+xorLen : arenaOff+xorLen]
+		arenaOff += xorLen
+		xorInvertInto(reconstructed, xorData, prev)
+		dst.BytesValues = append(dst.BytesValues, reconstructed)
+		prev = reconstructed
 	}
 
-	// Refs section: rowCount × refSize bytes after all values.
+	// Refs section: rowCount × refSize bytes after all values. The decode loop above has
+	// advanced pos to exactly valBytes + 4*rowCount = the refs start (validated by the
+	// pre-scan), so no bounds re-check is needed here.
 	for range rowCount {
 		ref, newPos, err := decodeVariableWidthRef(raw, pos, blockW, rowW)
 		if err != nil {
-			return nil, fmt.Errorf("decodeXORBytesPage refs: %w", err)
+			return fmt.Errorf("decodeXORBytesPage refs: %w", err)
 		}
-		col.BlockRefs = append(col.BlockRefs, ref)
+		dst.BlockRefs = append(dst.BlockRefs, ref)
 		pos = newPos
 	}
-	col.Count = uint32(rowCount) //nolint:gosec
-	return col, nil
+	dst.Count += uint32(rowCount) //nolint:gosec
+	return nil
 }
 
-// decodeDeltaUint64Page decodes a snappy-compressed delta uint64 page blob (already snappy-decoded).
+// appendDeltaUint64Page decodes a snappy-decoded delta uint64 page blob and appends its
+// values and refs directly into dst. Deltas are page-local (acc starts at 0 each page),
+// so appending produces the same absolute values regardless of dst's prior contents. NOTE-145.
 //
 // Wire format (see encodeDeltaUint64Intrinsic):
 //
@@ -854,52 +1246,68 @@ func decodeXORBytesPage(raw []byte, blockW, rowW, rowCount int) (*IntrinsicColum
 //
 // NOTE-014: no values_len prefix. Row count comes from the TOC RowCount field.
 // Do NOT call pageRefsStart here — that function assumes a values_len[4] prefix.
-func decodeDeltaUint64Page(raw []byte, blockW, rowW, rowCount int) (*IntrinsicColumn, error) {
-	col := &IntrinsicColumn{
-		Type:         ColumnTypeUint64,
-		Format:       IntrinsicFormatDeltaUint64,
-		Uint64Values: make([]uint64, 0, rowCount),
-		BlockRefs:    make([]BlockRef, 0, rowCount),
-	}
-
+func appendDeltaUint64Page(raw []byte, blockW, rowW, rowCount int, dst *IntrinsicColumn) error {
 	pos := 0
 	var acc uint64
-	for range rowCount {
+	for r := range rowCount {
 		delta, n := binary.Uvarint(raw[pos:])
 		if n <= 0 {
-			return nil, fmt.Errorf("decodeDeltaUint64Page: truncated at uvarint row %d", len(col.Uint64Values))
+			return fmt.Errorf("decodeDeltaUint64Page: truncated at uvarint row %d", r)
 		}
 		acc += delta
-		col.Uint64Values = append(col.Uint64Values, acc)
+		dst.Uint64Values = append(dst.Uint64Values, acc)
 		pos += n
 	}
 
 	for range rowCount {
 		ref, newPos, err := decodeVariableWidthRef(raw, pos, blockW, rowW)
 		if err != nil {
-			return nil, fmt.Errorf("decodeDeltaUint64Page refs: %w", err)
+			return fmt.Errorf("decodeDeltaUint64Page refs: %w", err)
 		}
-		col.BlockRefs = append(col.BlockRefs, ref)
+		dst.BlockRefs = append(dst.BlockRefs, ref)
 		pos = newPos
 	}
-	col.Count = uint32(rowCount) //nolint:gosec
-	return col, nil
+	dst.Count += uint32(rowCount) //nolint:gosec
+	return nil
 }
 
-// xorInvert reconstructs the original value by XOR-inverting xored against prev.
-// Since xorBytesLen always produces len(a) bytes, xor_data_len == original value length.
-// The result is always len(xored) bytes.
-func xorInvert(xored, prev []byte) []byte {
-	result := make([]byte, len(xored))
+// xorBytesPageValueSize walks the rowCount length-prefixed values of an XOR-bytes page,
+// returning the total reconstructed value bytes. It performs all truncation/bounds
+// validation up front (NOTE-147) so the decode loop can size its arena exactly and then
+// trust the layout. It reads only the 4-byte length prefixes — the value payloads are
+// skipped, so the scan is near-free.
+func xorBytesPageValueSize(raw []byte, rowCount int) (totalValBytes int, err error) {
+	pos := 0
+	for range rowCount {
+		if pos+4 > len(raw) {
+			return 0, fmt.Errorf("decodeXORBytesPage: truncated at xor_data_len")
+		}
+		xorLen := int(binary.LittleEndian.Uint32(raw[pos:]))
+		pos += 4
+		if xorLen > MaxBytesLen {
+			return 0, fmt.Errorf("decodeXORBytesPage: xorLen %d exceeds MaxBytesLen", xorLen)
+		}
+		if pos+xorLen > len(raw) {
+			return 0, fmt.Errorf("decodeXORBytesPage: truncated at xor_data (len=%d)", xorLen)
+		}
+		pos += xorLen
+		totalValBytes += xorLen
+	}
+	return totalValBytes, nil
+}
+
+// xorInvertInto reconstructs the original value by XOR-inverting xored against prev,
+// writing the result into dst (which must be len(xored) bytes). Since xorBytesLen always
+// produces len(a) bytes, xor_data_len == original value length == len(dst). NOTE-147.
+func xorInvertInto(dst, xored, prev []byte) {
 	minLen := min(len(xored), len(prev))
 	for i := range minLen {
-		result[i] = xored[i] ^ prev[i]
+		dst[i] = xored[i] ^ prev[i]
 	}
 	if len(xored) > len(prev) {
-		copy(result[minLen:], xored[minLen:])
+		copy(dst[minLen:], xored[minLen:])
 	}
 	// if len(prev) > len(xored): trailing bytes of prev are not part of the result
-	return result
 }
 
 // --- Raw-byte scanning functions ---

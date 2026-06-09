@@ -283,41 +283,6 @@ func metricsColumnsAreIntrinsic(r *modules_reader.Reader, wantColumns map[string
 // NOTE-046: fast path is applicable when all wantColumns are intrinsic AND either:
 //   - program has no filter predicates (match-all { }): enumerate via span:start flat column.
 //   - program has only intrinsic predicates: BlockRefsFromIntrinsicTOC evaluates them.
-//
-// intrinsicPrefetchColumns returns the deduplicated set of intrinsic column names that
-// executeTraceMetricsIntrinsic will read for this query: span:start (always), the normalized
-// aggregate field (unless count/rate), the group-by columns, and any intrinsic predicate
-// columns. Names are advisory — PrefetchIntrinsicColumns ignores absent columns — so each
-// name is the exact value the subsequent serial GetIntrinsicColumn calls will request.
-// NOTE-144: drives the concurrent prefetch that collapses the serial per-column GETs.
-func intrinsicPrefetchColumns(program *vm.Program, querySpec *vm.QuerySpec) []string {
-	names := make([]string, 0, 4)
-	add := func(n string) {
-		if n == "" || n == colNameSpanEnd || n == "count" {
-			return
-		}
-		if !slices.Contains(names, n) {
-			names = append(names, n)
-		}
-	}
-	add(colNameSpanStart)
-	agg := querySpec.Aggregate
-	if agg.Function != vm.FuncNameCOUNT && agg.Function != vm.FuncNameRATE {
-		add(normalizeIntrinsicFieldName(agg.Field))
-	}
-	for _, g := range agg.GroupBy {
-		add(g)
-	}
-	if program != nil && program.Predicates != nil && len(program.Predicates.Nodes) > 0 {
-		preds := make(map[string]struct{}, 4)
-		collectIntrinsicNodeColumns(program.Predicates.Nodes, preds)
-		for c := range preds {
-			add(c)
-		}
-	}
-	return names
-}
-
 func executeTraceMetricsIntrinsic(
 	ctx context.Context,
 	r *modules_reader.Reader,
@@ -332,11 +297,6 @@ func executeTraceMetricsIntrinsic(
 	if err := ctx.Err(); err != nil {
 		return nil, false, err
 	}
-
-	// NOTE-144: collapse the serial per-column intrinsic GETs (span:start, predicate cols,
-	// group-by, agg field) into one concurrent prefetch round. Best-effort — the lazy
-	// GetIntrinsicColumn calls below still run and produce identical results on any miss/error.
-	r.PrefetchIntrinsicColumns(intrinsicPrefetchColumns(program, querySpec))
 
 	tsCol, err := r.GetIntrinsicColumn("span:start")
 	if err != nil {
@@ -449,6 +409,12 @@ func dispatchIntrinsicAccumulate(
 	tb := querySpec.TimeBucketing
 	switch {
 	case isCountRate && len(agg.GroupBy) == 0:
+		if filteredRefs == nil {
+			// NOTE-149: unfiltered → inRangeVals is timestamp-sorted (tsVals[lo:hi]); count
+			// per bucket via boundary binary search (O(numSteps·log N)) instead of the O(N)
+			// per-span loop. The filtered path below is packKey-sorted, not time-sorted.
+			return streamCountRateNoGroupBySorted(ctx, inRangeVals, tb, buckets)
+		}
 		// NOTE-068: flat []int64 hot loop — no per-span string allocs or hash lookups.
 		return streamCountRateNoGroupBy(ctx, inRangeRefs, inRangeVals, tb, buckets)
 	case filteredRefs == nil && len(agg.GroupBy) == 0 && agg.Function == vm.FuncNameHISTOGRAM:
@@ -603,32 +569,74 @@ func scanGroupByColCompact(
 	// when a file covers more time than the query window (M_total >> N).
 	minPK, maxPK := sortedPKs[0], sortedPKs[len(sortedPKs)-1]
 
-	// NOTE-135/140: build pkBitset + POPCNT rank index from sortedPKs.
+	// NOTE-135/140: build pkBitset + POPCNT rank index from sortedPKs (shared read-only).
 	// Dict refs are not packKey-sorted; ~50% fail the pre-filter at 50% selectivity.
 	// NOTE-140: rankPrefix[i] = cumulative popcount of pkBitset[0..i-1], enabling O(1) rank
 	// lookup to replace searchSortedUint32 in both Dict and Flat/DeltaUint64 inner loops.
-	var pkBitset []uint64
-	var rankPrefix []uint32
-	if len(sortedPKs) > 0 {
-		n := int((maxPK >> 6) + 1) //nolint:gosec
-		pkBitset = acquireCompactUint64(n)
-		defer releaseCompactUint64(pkBitset)
-		clear(pkBitset) // NOTE-135: zero-sentinel — must clear stale pool bits before setting
-		for _, pk := range sortedPKs {
-			pkBitset[pk>>6] |= uint64(1) << (pk & 63)
+	n := int((maxPK >> 6) + 1) //nolint:gosec
+	pkBitset := acquireCompactUint64(n)
+	defer releaseCompactUint64(pkBitset)
+	clear(pkBitset) // NOTE-135: zero-sentinel — must clear stale pool bits before setting
+	for _, pk := range sortedPKs {
+		pkBitset[pk>>6] |= uint64(1) << (pk & 63)
+	}
+	// NOTE-140: POPCNT rank index. Build cost: O(maxPK/64) ≈ 250K iterations at maxPK=16M → ~0.5µs.
+	rankPrefix := acquireCompactUint32(n + 1)
+	defer releaseCompactUint32(rankPrefix)
+	// acquireCompactUint32 calls clear() internally (NOTE-125 pool semantics).
+	var cum uint32
+	for i, w := range pkBitset {
+		rankPrefix[i] = cum
+		cum += uint32(bits.OnesCount64(w)) //nolint:gosec
+	}
+	rankPrefix[len(pkBitset)] = cum
+
+	// NOTE-148: parallelize the Dict per-ref inner loop — the bulk of the scan cost — across
+	// min(NumCPU, histParallelWorkers) workers. The M4/M6/M9/M10 rate-by-group queries group by
+	// low-cardinality columns (resource.service.name, http.request.method): few DictEntries but
+	// millions of refs, so the work is in the REFS — shard by ref count (NOT entry count, unlike the
+	// histogram Dict path in NOTE-143 whose work IS per-entry). Output (dict + dictIdxByPos) is
+	// byte-identical to the serial path. The Flat path stays serial: Flat group-by is high-cardinality
+	// and rare.
+	//
+	// Gate on totalRefs >= 2*len(sortedPKs): the per-ref work is memory-bandwidth-bound (filter +
+	// array write), not CPU-bound like the histogram boundary math, so parallelism only pays when the
+	// column walks meaningfully more refs than it writes — i.e. the file spans more time than the
+	// query window (a 2h window over a ~24h file walks ~12x the in-range refs). At full coverage
+	// (totalRefs ≈ n) the goroutine + per-position-write contention + translation pass make it a
+	// regression, so we stay serial. Microbench (BenchmarkScanGroupByColCompact): 2x→2.0x, 4x→1.8x,
+	// 12x→2.7x faster; full-coverage stays serial.
+	if col.Format == modules_shared.IntrinsicFormatDict &&
+		len(sortedPKs) >= histParallelMinItems && len(col.DictEntries) >= 2 {
+		w := min(runtime.NumCPU(), histParallelWorkers)
+		totalRefs := 0
+		for i := range col.DictEntries {
+			totalRefs += len(col.DictEntries[i].BlockRefs)
 		}
-		// NOTE-140: POPCNT rank index. Build cost: O(maxPK/64) ≈ 250K iterations at maxPK=16M → ~0.5µs.
-		rankPrefix = acquireCompactUint32(n + 1)
-		defer releaseCompactUint32(rankPrefix)
-		// acquireCompactUint32 calls clear() internally (NOTE-125 pool semantics).
-		var cum uint32
-		for i, w := range pkBitset {
-			rankPrefix[i] = cum
-			cum += uint32(bits.OnesCount64(w)) //nolint:gosec
+		if w > 1 && totalRefs >= 2*len(sortedPKs) {
+			scanGroupByColCompactDictParallel(
+				col, colName, minPK, maxPK, pkBitset, rankPrefix, dict, valToIdx, dictIdxByPos, w,
+			)
+			return
 		}
-		rankPrefix[len(pkBitset)] = cum
 	}
 
+	scanGroupByColCompactSerial(col, colName, minPK, maxPK, pkBitset, rankPrefix, dict, valToIdx, dictIdxByPos)
+}
+
+// scanGroupByColCompactSerial is the single-threaded body of scanGroupByColCompact. pkBitset and
+// rankPrefix are the shared read-only POPCNT index over sortedPKs (NOTE-135/140). This is the
+// byte-identical pre-NOTE-148 path; the parallel Dict path reproduces its output exactly.
+func scanGroupByColCompactSerial(
+	col *modules_shared.IntrinsicColumn,
+	colName string,
+	minPK, maxPK uint32,
+	pkBitset []uint64,
+	rankPrefix []uint32,
+	dict *[]string,
+	valToIdx map[string]uint32,
+	dictIdxByPos []uint32,
+) {
 	switch col.Format {
 	case modules_shared.IntrinsicFormatDict:
 		for _, entry := range col.DictEntries {
@@ -698,6 +706,130 @@ func scanGroupByColCompact(
 				valToIdx[val] = idx
 			}
 			dictIdxByPos[pos] = idx + 1
+		}
+	}
+}
+
+// scanGroupByColCompactDictParallel is the parallel Dict-format path for scanGroupByColCompact
+// (NOTE-148). It parallelizes the per-ref inner loop — the bulk of the scan cost — across `workers`
+// goroutines while keeping dict construction serial, so the output (dict + dictIdxByPos) is
+// byte-identical to scanGroupByColCompactSerial.
+//
+// Why it is race-free without per-worker copies + reduction: each in-range span position is owned
+// by exactly one ref (a span has a single value per column), so the dictIdxByPos[pos] writes are
+// disjoint across workers. Workers take contiguous DictEntries ranges balanced by cumulative ref
+// count, so each entry is owned by exactly one worker — the per-entry entryPassed[] writes are
+// disjoint too. pkBitset, rankPrefix, and col.DictEntries are read-only. intrinsicInt64ColToString
+// and packKey are pure.
+//
+//   - Phase A (parallel): for each owned entry with a non-empty value, write entryIdx+1 into
+//     dictIdxByPos[pos] for every passing ref (pk in range + bitset member) and record entryPassed.
+//   - Phase B (serial, O(numEntries)+O(n)): build dict in entry order — identical to the serial
+//     path's first-passing-ref order, since it iterates entries in order and assigns on first pass —
+//     then translate the temporary entryIdx+1 markers in dictIdxByPos to the final dictIdx+1.
+func scanGroupByColCompactDictParallel(
+	col *modules_shared.IntrinsicColumn,
+	colName string,
+	minPK, maxPK uint32,
+	pkBitset []uint64,
+	rankPrefix []uint32,
+	dict *[]string,
+	valToIdx map[string]uint32,
+	dictIdxByPos []uint32,
+	workers int,
+) {
+	entries := col.DictEntries
+	numEntries := len(entries)
+
+	// Cumulative ref counts for ref-balanced contiguous entry sharding.
+	cumRefs := make([]int, numEntries+1)
+	for i := range entries {
+		cumRefs[i+1] = cumRefs[i] + len(entries[i].BlockRefs)
+	}
+	totalRefs := cumRefs[numEntries]
+
+	entryPassed := make([]bool, numEntries)
+
+	// Phase A: parallel per-ref writes. Contiguous entry ranges balanced by cumulative ref count
+	// (low-cardinality dicts have a few ref-heavy entries; even-count chunking would leave one
+	// worker doing most of the work). Each range is owned by exactly one worker.
+	var wg sync.WaitGroup
+	prev := 0
+	for wk := 0; wk < workers && prev < numEntries; wk++ {
+		end := numEntries
+		if wk < workers-1 {
+			target := totalRefs * (wk + 1) / workers
+			end = prev
+			for end < numEntries && cumRefs[end+1] <= target {
+				end++
+			}
+			if end <= prev {
+				end = prev + 1 // guarantee forward progress for an oversized entry
+			}
+		}
+		wg.Add(1)
+		go func(lo, hi int) {
+			defer wg.Done()
+			for e := lo; e < hi; e++ {
+				entry := &entries[e]
+				val := entry.Value
+				if val == "" {
+					val = intrinsicInt64ColToString(colName, entry.Int64Val)
+				}
+				if val == "" {
+					continue // matches serial: empty values are skipped entirely
+				}
+				passed := false
+				marker := uint32(e + 1) //nolint:gosec // entryIdx+1, bounded by numEntries
+				for _, ref := range entry.BlockRefs {
+					pk := packKey(ref.BlockIdx, ref.RowIdx)
+					if pk < minPK || pk > maxPK {
+						continue
+					}
+					word := pk >> 6
+					bit := pk & 63
+					if pkBitset[word]&(uint64(1)<<bit) == 0 {
+						continue
+					}
+					// NOTE-140: O(1) rank replaces O(log n) searchSortedUint32.
+					lowerBits := bits.OnesCount64(pkBitset[word] & ((uint64(1) << bit) - 1))
+					rank := rankPrefix[word] + uint32(lowerBits) //nolint:gosec
+					dictIdxByPos[int(rank)] = marker
+					passed = true
+				}
+				entryPassed[e] = passed
+			}
+		}(prev, end)
+		prev = end
+	}
+	wg.Wait()
+
+	// Phase B (serial): build the dict in entry order — byte-identical to the serial path, whose
+	// first-passing-ref encounter order IS entry order (it iterates DictEntries sequentially). Only
+	// entries with a passing ref get a slot, so fully-filtered groups never enlarge groupCountsFlat.
+	entryFinalIdx := make([]uint32, numEntries)
+	for e := range entries {
+		if !entryPassed[e] {
+			continue
+		}
+		entry := &entries[e]
+		val := entry.Value
+		if val == "" {
+			val = intrinsicInt64ColToString(colName, entry.Int64Val)
+		}
+		// val != "" is guaranteed: entryPassed[e] is only set for non-empty values.
+		idx, ok := valToIdx[val]
+		if !ok {
+			idx = uint32(len(*dict)) //nolint:gosec
+			*dict = append(*dict, val)
+			valToIdx[val] = idx
+		}
+		entryFinalIdx[e] = idx + 1
+	}
+	// Translate entryIdx+1 markers to final dictIdx+1. Positions left 0 by Phase A stay absent.
+	for pos := range dictIdxByPos {
+		if v := dictIdxByPos[pos]; v > 0 {
+			dictIdxByPos[pos] = entryFinalIdx[v-1]
 		}
 	}
 }
@@ -2028,6 +2160,55 @@ func streamCountRateNoGroupBy(
 			key := strconv.FormatInt(int64(idx), 10) + "\x00" //nolint:gosec
 			intrinsicGetOrCreateBucket(buckets, key).count = c
 		}
+	}
+	return nil
+}
+
+// streamCountRateNoGroupBySorted is the O(numSteps · log N) fast path for the unfiltered
+// N=0 count/rate query (e.g. M1 `{} | rate()`). It replaces streamCountRateNoGroupBy's
+// O(N) per-span timeBucketIndex loop (~150M iterations for M1, NOTE-068) with one binary
+// search per bucket boundary.
+//
+// NOTE-149: span:start is a flat ascending-sorted column (types.go) and timeBucketIndex is
+// monotonically non-decreasing in ts, so the in-range timestamps fall into contiguous,
+// non-overlapping runs — one run per bucket. The count for bucket b is therefore the number
+// of timestamps in (StartTime+b·step, StartTime+(b+1)·step], which a single sort.Search over
+// the remaining sorted tail finds directly. Only valid when the input is timestamp-sorted:
+// the predicate-filtered path receives packKey-sorted refs from mergeJoinFilteredRefsWithVals
+// and must keep the linear loop; this is dispatched only when filteredRefs == nil.
+//
+// Boundary derivation: timeBucketIndex(ts)=(ts-StartTime-1)/step, so idx==b ⟺
+// StartTime+b·step < ts ≤ StartTime+(b+1)·step. The upper bound (inclusive) for bucket b is
+// StartTime+(b+1)·step; `val > boundary` places val==boundary into bucket b (right-closed),
+// matching streamCountRateNoGroupBy exactly. Callers guarantee every val ∈ (StartTime,EndTime]
+// via the lo/hi binary search, so all timestamps land in [0,numSteps) with no clamping needed.
+func streamCountRateNoGroupBySorted(
+	ctx context.Context,
+	sortedVals []uint64,
+	tb vm.TimeBucketSpec,
+	buckets map[string]*aggBucketState,
+) error {
+	numSteps := (tb.EndTime - tb.StartTime + tb.StepSizeNanos - 1) / tb.StepSizeNanos
+	if numSteps <= 0 {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	n := len(sortedVals)
+	prev := 0 // first index not yet assigned to a bucket
+	for b := int64(0); b < numSteps && prev < n; b++ {
+		boundary := tb.StartTime + (b+1)*tb.StepSizeNanos
+		tail := sortedVals[prev:]
+		// First offset in tail whose value exceeds the bucket's inclusive upper bound.
+		off := sort.Search(len(tail), func(i int) bool {
+			return int64(tail[i]) > boundary //nolint:gosec
+		})
+		if off > 0 {
+			key := strconv.FormatInt(b, 10) + "\x00"
+			intrinsicGetOrCreateBucket(buckets, key).count = int64(off)
+		}
+		prev += off
 	}
 	return nil
 }

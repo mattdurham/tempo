@@ -493,3 +493,231 @@ advance loop must complete the remaining uvarint scan to position `p` at the ref
 non-decreasing (deltas >= 0), so early termination on `acc > hi` is safe.
 
 Back-ref: `internal/modules/blockio/shared/intrinsic_codec.go:scanDeltaUint64PagedBlob`
+
+## NOTE-145: decodePagedColumnBlob — decode pages directly into merged, drop dead value slice
+*Added: 2026-06-09*
+
+**Problem:** `decodePagedColumnBlob` allocated more than necessary on every paged column decode
+(`DecodeIntrinsicColumnBlob` was ~27% of querier allocations per Pyroscope):
+
+1. **Dead value slice.** `merged` pre-allocated *both* `Uint64Values` and `BytesValues` to
+   `totalRows` for flat/xor/delta columns, but a column is uint64 OR bytes, never both — one
+   full `totalRows`-sized slice was allocated and never written.
+2. **Per-page intermediate column.** Each page was decoded into a fresh `*IntrinsicColumn` with
+   its own `rowCount`-sized `Uint64Values`/`BytesValues`/`BlockRefs`, then copy-appended into
+   `merged` and discarded. For a single-page column this duplicated the entire column
+   (struct + slices + a full element copy).
+
+**Decision:** Pre-size only the value slice the column type actually uses, and decode
+flat/xor/delta pages *directly into* `merged`'s pre-allocated slices via append helpers
+(`appendFlatPage`, `appendXORBytesPage`, `appendDeltaUint64Page`). The exported single-page
+entry points (`DecodeFlatPage`, `DecodeDictPage`) are unchanged; the unexported wrappers
+`decodeXORBytesPage`/`decodeDeltaUint64Page` were folded into their append variants. Dict still
+materializes a page struct (`appendDictPage`) because the merge dedups entries by value.
+
+**Correctness:** Byte-identical output. Delta `acc` and XOR `prev` reset per page (page-local),
+so appending into a non-empty `merged` produces the same absolute values as decode-then-copy.
+`merged.Count` accumulates identically (dict pages contribute 0, as before). Covered by the
+existing multi-page roundtrip tests (`TestDeltaUint64LargeColumnRoundtrip` N=15k spans two
+pages; the large XOR-bytes roundtrip) and reader paged-column tests, all green under `-race`.
+
+**Bonus alloc removed:** the XOR path made a redundant `make+copy` of each value even though
+`xorInvert` already returns a fresh, non-aliasing buffer — now appended directly.
+
+Back-ref: `internal/modules/blockio/shared/intrinsic_codec.go:decodePagedColumnBlob`
+
+## NOTE-146: appendDictPage — decode dict pages directly into merged, skip duplicate-entry allocs
+*Added: 2026-06-09*
+
+**Problem:** NOTE-145 left the dict path materializing a throwaway `*IntrinsicColumn` per page
+(via `DecodeDictPage`) then merging it into `merged`. For multi-page group-by columns (e.g.
+`resource.service.name`) the distinct value set repeats on every page, so every entry after
+page 0 is a *duplicate*. The old merge, per duplicate entry, allocated a `BlockRefs` slice and
+a `Value`-string copy inside `DecodeDictPage` — then immediately discarded both after copying
+the refs into the existing merged entry. Each page also allocated a `*IntrinsicColumn` struct
+and a `DictEntries` slice header that were discarded.
+
+**Decision:** Parse the dict page inline in `appendDictPage` (no intermediate column). For a
+value already present in `merged`, decode its refs straight onto the existing entry's
+`BlockRefs` via `slices.Grow` — no per-entry slice, no `Value` copy. Only genuinely new values
+allocate (and those allocations are kept in `merged`, so they are not waste). The dedup-map
+probe is zero-alloc: `idx[string(window)]` for non-empty values, a reused `keyScratch` buffer
+for the synthetic `"\x00"+int64` key of empty-string / int64 values.
+
+**Correctness:** Byte-identical merge. The dedup key construction is unchanged from NOTE-145
+(non-empty Value keys on its bytes; empty Value keys on the synthetic int64 form), so entry
+identity, encounter-order, and ref order all match. `DecodeDictPage` stays exported and
+unchanged for the single-page public API and tests. A `refSize <= 0` guard (and an
+overflow-safe `refCount` bound) keeps corrupt blobs to an error rather than a panic — the old
+per-iteration `pos+refSize > len(raw)` check was implicitly panic-safe; the new
+`refCount > (len(raw)-pos)/refSize` bound divides, so the guard is required.
+
+**Measurement (microbench, authoritative for alloc changes — cluster wall-clock is I/O/cache
+bound):** `BenchmarkDecodeIntrinsicColumnBlob_Dict` (6 values × 30k spans = 3 pages):
+38 → 31 allocs/op (-18%), bytes flat (~166 KB — the kept 30k×4-byte merged refs dominate).
+Delta (8 allocs) and XORBytes (30009 allocs) unchanged — no regression on the other paths.
+
+Back-ref: `internal/modules/blockio/shared/intrinsic_codec.go:appendDictPage`
+
+## NOTE-147: appendXORBytesPage — reconstruct values into one page-sized arena, not one alloc/value
+*Added: 2026-06-09*
+
+**Problem:** After NOTE-145/146, the XOR-bytes decode path was the largest remaining allocator
+in `DecodeIntrinsicColumnBlob` (Pyroscope: that function ≈ 27% of querier allocs). `xorInvert`
+did `make([]byte, len(xored))` once *per row* — one heap allocation for every value. For a
+10k-row page that is 10k tiny allocations; the alloc-guard microbench measured **30009 allocs/op**
+for a 3-page span:id column. Allocation *count* (the `alloc_objects` axis) drives GC sweep cost
+and pacing, so this dominated the path's GC pressure even though each value is small.
+
+**Decision:** Reconstruct all of a page's values into a single page-sized byte **arena** and hand
+each value out as a non-overlapping subslice. A cheap pre-scan (`xorBytesPageValueSize`) walks only
+the 4-byte length prefixes — skipping the payloads — to sum the exact total value bytes, so the
+arena is allocated once at the exact size (zero waste, no chunking). The decode loop then carves
+`arena[off:off+xorLen:off+xorLen]` per value (three-index slice caps capacity, so a stray append on
+a kept value cannot corrupt the next value's backing) and XOR-inverts into it via the new in-place
+`xorInvertInto`. `xorInvert` (alloc-and-return) is replaced by `xorInvertInto` (write-into-dst);
+the old allocating wrapper is removed since `appendXORBytesPage` was its only caller.
+
+**Correctness:** Byte-identical reconstruction. The arena is never reallocated once carved, so
+`prev` (which points into it) stays a valid, stable backing across iterations — same invariant the
+old per-value slices provided. The arena is freshly allocated and never aliases the `pageBuf` pool
+buffer (`raw`), preserving NOTE-012/NOTE-013. All truncation/`MaxBytesLen` bounds validation moved
+into the pre-scan up front, so the decode loop reads at positions the pre-scan already proved valid
+(no per-row bounds re-check needed). Covered by `TestXORBytesVariableLengthRoundtrip` (N=12k = 2
+pages, interleaved 8/12/16-byte values — exercises arena carving of mixed sizes and both
+length-mismatch branches of `xorInvertInto` across a page boundary), `TestXORBytesLargeColumnRoundtrip`,
+and `TestXORBytesExactlyPageSize`, all green under `-race`.
+
+**Measurement (microbench, authoritative for alloc changes — cluster wall-clock is I/O/cache
+bound):** `BenchmarkDecodeIntrinsicColumnBlob_XORBytes` (16-byte values × 30k spans = 3 pages):
+**30009 → 10 allocs/op (-99.97%)**; B/op flat (1,989,570 → 1,992,798, +0.16% — the contiguous arena
+holds the same value bytes the per-value slices did). Delta (8 allocs) and Dict (31 allocs)
+unchanged — no regression on the other decode paths.
+
+Back-ref: `internal/modules/blockio/shared/intrinsic_codec.go:appendXORBytesPage`
+
+## NOTE-150: decodePagesParallel — decode independent paged columns concurrently
+*Added: 2026-06-09*
+
+**Problem:** `DecodeIntrinsicColumnBlob` (Pyroscope: ≈27% of querier allocs, and the residual
+cost of `{} | rate()`/M1 after NOTE-149 made its scan 0.54µs) decoded a paged column's pages
+**serially** — one snappy-decode + value/ref decode per page on a single goroutine. For a real
+file, `span:start` (Delta) and `trace:id`/`span:id` (XORBytes) are hundreds of pages of ~10k rows
+each (`IntrinsicPageSize`), so this is a long single-threaded loop while the querier (per the
+mission Pyroscope, ~33% CPU, I/O-latency bound) has spare cores.
+
+**Decision:** Decode the pages of the self-contained formats (Flat / DeltaUint64 / XORBytes) in
+parallel across up to `maxPageDecodeWorkers`=8 workers (`decodePagesParallel`). These formats are
+page-independent: `appendDeltaUint64Page`/`appendFlatPage` reset their delta accumulator to 0 at
+the start of every page and `appendXORBytesPage` resets `prev` to nil, so a page's absolute values
+depend on nothing outside the page. Dict stays serial — it dedups values into a shared `dictIdx`
+map across pages (cross-page state), so it is excluded by `isParallelPageDecodeFormat`.
+
+The merged value/ref slices are already pre-sized to `cap == totalRows` (NOTE-145). Each page `i`
+is handed a **disjoint, capacity-capped** sub-slice — `merged.Uint64Values[off:off:off+rc]` (len 0,
+cap rc) and the matching `BlockRefs`/`BytesValues` slot — where `off` is the cumulative RowCount of
+prior pages. The existing `append*` helpers are reused **unchanged**: appending exactly `rc` entries
+fills `[off, off+rc)` and the three-index cap guarantees a goroutine can never grow past its slot or
+touch another's region. The union of all slots is `[0, totalRows)` exactly, so after the workers
+join, `merged.{values,BlockRefs}[:totalRows]` is the fully-populated column in page order. Workers
+claim pages via an atomic counter (work-stealing → balanced load even when XOR pages vary in size),
+each holds its own pooled snappy buffer (`AcquireIntrinsicBuf`), and a panic recover per worker
+upholds SPEC-ROOT-001. Gated on `len(pages) >= 2 && totalRows >= 2*IntrinsicPageSize` so tiny
+columns keep the zero-overhead serial path.
+
+**Correctness:** Output is byte-identical to the serial loop — disjoint writes, no reduction, page
+order preserved by `off`. Verified directly against known source data (not just serial parity) in
+`intrinsic_parallel_decode_test.go` for Delta, Flat-uint64, and XORBytes across even pages, uneven
+pages, a tiny-tail page (`{20001,5}`), single-page (serial), and under-threshold multi-page (serial)
+layouts — all green under `-race` (the race detector confirms the per-page slots never alias).
+
+**Measurement (microbench, authoritative for a parallelism change — cluster wall-clock is
+I/O/cache bound with the page-cache memcached crashlooping, NOTE-143/148/149 precedent):**
+`BenchmarkDecodePagedColumn{Delta,XORBytes}` (1M rows, 100 pages), serial-vs-parallel A/B at
+GOMAXPROCS=8, count=6, min: Delta **9.9ms → 2.2ms (4.5×)**, XORBytes **31ms → 8ms (3.9×)**. B/op
+flat; +~16 allocs/op total (per-worker snappy buffers + slot structs + goroutine setup), not per row.
+
+Back-ref: `internal/modules/blockio/shared/intrinsic_codec.go:decodePagesParallel`
+
+## NOTE-151: pool the cross-page dict-dedup map in decodePagedColumnBlob
+*Added: 2026-06-09*
+
+**Problem:** Dict is the one paged format NOTE-150 left serial because it dedups values into a
+shared `dictIdx map[string]int` across pages. `appendDictPage` built that map lazily, sized
+`valueCount*numPages` — but a dict column **repeats the same distinct value set on every page**
+(that is *why* it is dict-encoded), so the map only ever holds ≈`valueCount` keys. For a
+group-by column like `resource.service.name` (~245 values) on a real ~100-page file, the map was
+sized for ~24,500 entries while ~245 were used: a ~100× over-allocation (~870 KB backing array)
+allocated and GC'd **once per block per goroutine** on every M4/M6/M9/M10 `rate() by (...)` query.
+Decode is ≈27% of querier allocs (mission Pyroscope, priority #3).
+
+**Decision:** Acquire the dedup map from a `sync.Pool` (`acquireDictIdxMap`), used only for the
+Dict format, released (cleared) on return. A cleared map retains its grown backing capacity, so
+after warm-up it already holds the real distinct count — no per-call allocation and no rehash in
+steady state. `releaseDictIdxMap` drops any map that grew past `dictIdxMapMaxEntries`=65536 (a
+high-cardinality outlier) so the pool never pins a huge array. `appendDictPage` keeps its lazy
+`make` as a fallback for a nil map (no current caller passes nil for Dict).
+
+**Correctness:** Pure allocation change — the dedup keying, first-encounter dict order, and
+in-place ref-merge are untouched. `TestDecodePagedColumnDictEquivalence` builds multi-page dict
+blobs (values repeated per page, group-by shape) and asserts the merged dict order and per-value
+refs match known source, **decoding each blob twice** to exercise a reused (cleared) pooled map;
+green under `-race`.
+
+**Measurement (microbench A/B, pool on vs forced-off, GOMAXPROCS=1, count=6, min;
+`BenchmarkDecodePagedColumnDict` = 245 values × 100 pages ≈ 980k refs, the service.name shape):**
+time **5.81ms → 4.88ms (−16%)**, **−874 KB/op** (the eliminated oversized map, exactly
+`245*100*~36 B`), **−63 allocs/op**. Cluster wall-clock is I/O/cache bound (page-cache memcached
+crashlooping) so the microbench is authoritative (NOTE-143/148/149/150 precedent).
+
+Back-ref: `internal/modules/blockio/shared/intrinsic_codec.go:decodePagedColumnBlob,appendDictPage,acquireDictIdxMap,releaseDictIdxMap`
+
+## NOTE-152: dict column decode via a single contiguous BlockRefs arena (two-pass)
+*Added: 2026-06-09*
+
+**Problem:** A multi-page dict column repeats its distinct value set on every page (NOTE-151),
+so after page 0 every value is a duplicate whose refs are spread across all pages. The
+`appendDictPage` merge (NOTE-146) extended each existing entry's `BlockRefs` with
+`slices.Grow(e.BlockRefs, refCount)` **once per page**. `slices.Grow` grows geometrically, so an
+entry appearing on ~100 pages reallocated its backing array ~log₂(pages) times, and the summed
+discarded intermediates came to ≈2.5× the final ref bytes. On a querier `alloc_space` profile
+during M8 (`histogram_over_time(duration) by (resource.service.name)`) this single line —
+`slices.Grow[[]BlockRef]` from `appendDictPage` — was **13.5% of all allocated bytes, the largest
+single leaf** (pprof 2026-06-09; cum `decodePagedColumnBlob` 27%, matching the mission's priority-#3
+"DecodeIntrinsicColumnBlob is 27% of querier allocs").
+
+**Decision:** `decodeDictPagesArena` replaces the per-page grow with two passes over the pages:
+1. **Count** — walk every page's value records header-only (refs skipped via
+   `forEachDictPageValue`), materializing each `DictEntry` (`Value`/`Int64Val`) in first-appearance
+   order and summing its total ref count across all pages into `refTotals[]` (parallel to
+   `DictEntries`).
+2. **Fill** — allocate **one** `[]BlockRef` arena of exactly `Σ refTotals` and carve it into
+   per-entry sub-slices of exact capacity (`arena[off:off:off+c]`, len 0 cap c). A second walk
+   appends each value's refs into its entry's sub-slice; because cap is exact, **no append ever
+   reallocates**.
+
+Pages are snappy-decoded **twice** (once per pass) into the pooled `IntrinsicBuf`. The querier is
+I/O-latency bound with CPU headroom (mission profile: 33% CPU), so trading a second decompress for
+≈zero retained over-allocation and far less GC churn is favorable — and it avoids holding every
+decompressed page in memory at once (OOM-sensitive; `GOMEMLIMIT=13GiB`, prior OOM history).
+
+**Why byte-identical:** entries are created in first-appearance order (page order, value order
+within page) — exactly as `appendDictPage` did; the dedup key construction is unchanged (non-empty
+`Value` keys on its bytes; empty/int64 keys on the synthetic `"\x00"`+LE(int64) form) and shared
+between both passes via `forEachDictPageValue`; refs are appended in page order so each entry's ref
+sequence matches the old in-place merge. Exact-capacity sub-slices share one backing array but a
+later append on any entry reallocates (len==cap) rather than overwriting its neighbor — the same
+arena safety contract as the NOTE-150 value/ref slices. Supersedes `appendDictPage` (removed) and
+reuses the NOTE-151 pooled dedup map.
+
+**Measurement (microbench A/B, HEAD vs change, GOMAXPROCS=1, count=6, min;
+`BenchmarkDecodePagedColumnDict` = 245 values × 100 pages ≈ 980k refs, the service.name shape):**
+time **4.87ms → 3.49ms (−28%)**, **B/op 14.37MB → 4.02MB (−72%)**, **allocs/op 2704 → 262 (−90%)**.
+The residual 4.02MB ≈ the arena itself (980k refs × 4B) — essentially all transient decode garbage
+removed. Faster despite the extra decompress because eliminating ~2440 small per-page regrow allocs
+and the GC pressure outweighs the second snappy pass. `TestDecodePagedColumnDictEquivalence`
+(multi-page, values-repeat-per-page, decoded twice) stays green under `-race`. Cluster wall-clock is
+I/O/cache bound (page-cache memcached crashlooping) so the microbench is authoritative
+(NOTE-143/148/149/150/151 precedent).
+
+Back-ref: `internal/modules/blockio/shared/intrinsic_codec.go:decodePagedColumnBlob,decodeDictPagesArena,forEachDictPageValue`
