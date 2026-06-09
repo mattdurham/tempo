@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"slices"
 
+	"golang.org/x/sync/errgroup"
+
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
 	"github.com/grafana/blockpack/internal/modules/rw"
 )
@@ -250,6 +252,109 @@ func (r *Reader) GetIntrinsicColumn(name string) (*shared.IntrinsicColumn, error
 	r.intrinsicDecoded[name] = col
 	r.intrinsicMu.Unlock()
 	return col, nil
+}
+
+// PrefetchIntrinsicColumns warms the per-Reader and process-level caches for the given
+// intrinsic column names by issuing their backing-store reads CONCURRENTLY in one round,
+// instead of the serial one-GET-per-column pattern of repeated GetIntrinsicColumn calls.
+// This collapses N serial object-storage round-trips into a single concurrent round, which
+// is the dominant cost on the I/O-bound intrinsic metrics fast path.
+//
+// Best-effort and advisory: names absent from the TOC, span:end (synthesized), already-decoded
+// columns, and any per-column read/decode error are silently skipped. After this returns,
+// subsequent GetIntrinsicColumn / GetIntrinsicColumnBlob calls for the prefetched names hit
+// cache and issue no further I/O. On total failure the caller's normal lazy path still produces
+// correct, byte-identical results — the GET count and bytes are unchanged (GetOrFetchIntrinsic
+// dedups), only their serialization differs.
+//
+// Concurrency: only the independent readRange I/O and decode run in worker goroutines, each
+// writing solely to its own local result; r.cache.GetOrFetchIntrinsic and parsedIntrinsicCache
+// are process-safe (already shared across Readers/blocks). Writes to r.intrinsicDecoded are
+// serialized under r.intrinsicMu via storeDecodedIntrinsic, mirroring GetIntrinsicColumn. The
+// "NOT safe for concurrent use" r.intrinsicIndex TOC map is only READ, and only via a snapshot
+// taken on the calling goroutine before fan-out — workers never touch it.
+// NOTE-144: concurrent intrinsic-column prefetch for the I/O-bound metrics fast path.
+func (r *Reader) PrefetchIntrinsicColumns(names []string) {
+	if r.intrinsicIndex == nil || len(names) == 0 {
+		return
+	}
+
+	type job struct {
+		name string
+		meta shared.IntrinsicColMeta
+	}
+	jobs := make([]job, 0, len(names))
+	r.intrinsicMu.RLock()
+	for _, name := range names {
+		if name == "" || name == "span:end" {
+			continue // span:end is synthesized, not stored.
+		}
+		meta, ok := r.intrinsicIndex[name]
+		if !ok {
+			continue // absent from TOC — lazy path will return nil, same as today.
+		}
+		if r.intrinsicDecoded != nil {
+			if _, done := r.intrinsicDecoded[name]; done {
+				continue // already decoded — no I/O needed.
+			}
+		}
+		jobs = append(jobs, job{name: name, meta: meta})
+	}
+	r.intrinsicMu.RUnlock()
+	if len(jobs) == 0 {
+		return
+	}
+
+	useProcessCache := r.fileID != ""
+
+	var g errgroup.Group
+	g.SetLimit(min(len(jobs), 8))
+
+	for _, j := range jobs {
+		g.Go(func() error {
+			// Decoded process-cache hit: adopt it into the per-Reader cache, no I/O.
+			if useProcessCache {
+				if col := parsedIntrinsicCache.Get(r.fileID + "/intrinsic/" + j.name); col != nil {
+					r.storeDecodedIntrinsic(j.name, col)
+					return nil
+				}
+			}
+			// Concurrent I/O. GetOrFetchIntrinsic is process-safe and dedups against r.cache,
+			// so this issues at most one S3 GET per column and warms the blob cache for the
+			// predicate path's GetIntrinsicColumnBlob too.
+			blob, err := r.cache.GetOrFetchIntrinsic(r.fileID, j.name, func() ([]byte, error) {
+				return r.readRange(j.meta.Offset, uint64(j.meta.Length), rw.DataTypeMetadata)
+			})
+			if err != nil || len(blob) == 0 {
+				return nil //nolint:nilerr // best-effort prefetch; lazy path handles the miss
+			}
+			col, derr := shared.DecodeIntrinsicColumnBlob(blob)
+			if derr != nil {
+				return nil //nolint:nilerr // best-effort prefetch
+			}
+			col.Name = j.name
+			if useProcessCache {
+				_ = parsedIntrinsicCache.Put(r.fileID+"/intrinsic/"+j.name, col)
+			}
+			r.storeDecodedIntrinsic(j.name, col)
+			return nil
+		})
+	}
+	_ = g.Wait() // best-effort: workers never return non-nil; nothing to propagate.
+}
+
+// storeDecodedIntrinsic stores a decoded column into the per-Reader cache under intrinsicMu,
+// preferring an existing entry if another goroutine stored one first (matches GetIntrinsicColumn).
+func (r *Reader) storeDecodedIntrinsic(name string, col *shared.IntrinsicColumn) {
+	r.intrinsicMu.Lock()
+	if r.intrinsicDecoded == nil {
+		r.intrinsicDecoded = make(map[string]*shared.IntrinsicColumn)
+	} else if _, ok := r.intrinsicDecoded[name]; ok {
+		r.intrinsicMu.Unlock()
+		return
+	}
+	r.intrinsicDecoded[name] = col
+	r.intrinsicMu.Unlock()
 }
 
 // synthesizeSpanEnd builds a span:end intrinsic column from span:start + span:duration.

@@ -3965,3 +3965,90 @@ Keys are byte-identical to the previous format (`timeIdx\x00gk\x00boundaryStr`),
 alter the scan path (NOTE-114/135/139/140), the absent-row pass (NOTE-088 bIdx=0 sentinel), the
 `discardStride` clamp, the `groupCountsFlat` flat layout (NOTE-124), or boundary math.
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:streamByRefSliceHistogramFlatEmit`
+
+## NOTE-143: scanAggColHistogramCompact parallelized across min(NumCPU,8) workers (M8)
+*Added: 2026-06-09*
+
+**Decision:** Shard the histogram aggregate-column scan in `scanAggColHistogramCompact` across
+`min(runtime.NumCPU(), 8)` goroutines. The shared, immutable post-build inputs
+(`col.DictEntries`/`col.BlockRefs`/`col.Uint64Values`, `sortedPKs`, `timeBucketByPos`,
+`dictIdxByPos`, and the `pkBitset`+`rankPrefix` POPCNT index from NOTE-139/140) are read
+concurrently. The two written structures — `groupCountsFlat` (NOTE-124 pool) and `seenByPos`
+(NOTE-125 pool) — get a private per-worker copy from those same pools, then are sum-reduced (`+=`)
+and OR-reduced after `wg.Wait()`. The driver builds `pkBitset`/`rankPrefix` ONCE and shares them
+read-only, eliminating the duplicate per-branch build that existed in the Dict and Flat/Delta arms.
+
+**Why safe:** NOTE-048's "ParseBlockFromBytes not goroutine-safe on the same *Reader" covers block
+*decode*; this scan touches no Reader parse state — the intrinsic column is already materialized
+and cached read-only. Every loop input is immutable after build; only the two accumulators are
+written, and they are per-worker.
+
+The one mutable shared state is the caller's `getBoundaryIdx` closure, which appends to a shared
+`boundaryCache`/`boundaries` and assigns boundary indices in first-encounter order (the `boundaries`
+slice is read by the emit step, so the order is load-bearing — this is a correctness hazard, not
+just a -race hazard). In the parallel path the driver runs `buildFrozenBoundaryIdx` SERIALLY before
+any goroutine starts: it walks the column in legacy scan order **applying the SAME per-row filters
+the scan applies** (pk range + pkBitset membership via the shared `histRefPassPos` helper, then
+`timeBucketByPos[pos] != 0`) and drives the original closure ONLY for rows that pass — so the
+caller's `boundaries`/`boundaryCache` end up identical to a serial run (emit unchanged), then
+snapshots a frozen `map[float64]int64`. Workers use a read-only lookup over that frozen map — no
+concurrent map write, clean under -race, and (since pre-warm visits every PASSING value the scan
+will reach) it never falls back, so every `bIdx` equals the legacy closure's. Hence parallel output
+== serial output. **The filter is load-bearing (C1):** a serial scan appends to `boundaries[]` in
+first-encounter order of PASSING rows only; recording boundaries for filtered-out rows would corrupt
+that order and produce wrong M8 output for every real filtered query (e.g. `{span.kind=server}`
+restricts via `sortedPKs`/`pkBitset`). To keep the pre-warm's pk/pos computation byte-identical to
+the scan's, both call the shared `histRefPassPos` helper so they cannot drift.
+
+**Pre-warm cost:** `buildFrozenBoundaryIdx` must not negate the parallel win with a serial O(N)
+transcendental pass (`intrinsicHistogramBoundary` is Log2+Floor+Pow). For DeltaUint64 it applies the
+proven monotonic technique from `countIntrinsicHistogramBoundaries` (NOTE-123), now over PASSING rows
+only: the column is value-sorted ascending and the boundary function is monotonic non-decreasing, so
+among the (still ascending) passing rows the boundary is non-decreasing — `getBoundaryIdx` is driven
+only when a passing row's boundary differs from the previously-recorded passing row's boundary
+(~numBoundaries calls, not N). `getBoundaryIdx` is idempotent for an already-seen boundary, so this
+yields a `boundaries[]` slice byte-identical to driving the closure on every passing row. The Flat
+arm is NOT value-sorted, so it walks every PASSING value in order to preserve first-encounter
+ordering exactly. The Dict arm is left unfiltered: the legacy Dict scan calls `getBoundaryIdx` once
+per ENTRY before its inner ref loop, unconditionally, so recording per-entry in order is already
+faithful (and Dict entries are few — cheap).
+
+**Serial fallback (no fast-path regression):** when `NumCPU<=1` or `numItems < 65536`
+(`histParallelMinItems`) the function runs the legacy single-threaded shard inline
+(`scanAggColHistogramShard` over the full range), writing directly into the caller's
+`groupCountsFlat`/`seenByPos` and using the original `getBoundaryIdx` closure — byte-identical to
+the pre-NOTE-143 path.
+
+**Regression confinement:** only M8 (`histogram_over_time`) reaches this function — its sole two
+callers are `streamHistogramN1CompactFromRefs` and `streamHistogramN1Compact`. Rate (M9/M10) uses
+`streamCountRateN1Compact*` → `scanGroupByColCompact`; general agg / M4 uses `scanAggColCompact`
+(NOTE-141). Neither touches `scanAggColHistogramCompact`, so they are structurally unaffected.
+
+**Signature:** added trailing `fieldName string` (callers pass `agg.Field`) so the parallel path can
+build the read-only boundary lookup via `intrinsicHistogramBoundary`. No behavior widening.
+
+**Worker count:** `min(NumCPU, 8)` — 8 mirrors `defaultPipelineWorkers` (NOTE-058) as the cap. This
+scan is CPU-bound, and the intrinsic path is otherwise single-threaded, so workers consume idle
+cores rather than oversubscribing.
+
+**Validated by:** `TestHistParallelEquivalence_DeltaUint64/_Flat/_Dict` (all-pass inputs) and
+`..._DeltaUint64_Filtered/_Flat_Filtered/_Dict_Filtered` (a meaningful fraction of rows filtered out
+via pks absent from `sortedPKs` and `timeBucketByPos[pos]==0`) — all force the parallel path
+(numItems ≥ 65536) and assert parallel == serial for groupCountsFlat, seenByPos, AND boundaries,
+under `go test -race`. The filtered tests fail before the C1 filter fix and pass after.
+
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:scanAggColHistogramCompact,scanAggColHistogramShard,buildFrozenBoundaryIdx,histRefPassPos`
+
+## NOTE-144: executeTraceMetricsIntrinsic prefetches its intrinsic columns concurrently (M8)
+
+Before the serial `GetIntrinsicColumn` chain (span:start → predicate cols → group-by → agg
+field), `executeTraceMetricsIntrinsic` now calls `r.PrefetchIntrinsicColumns(...)` with the
+column set computed by `intrinsicPrefetchColumns`: span:start (always); the normalized agg.Field
+unless the function is count/rate; agg.GroupBy verbatim; and intrinsic predicate columns via the
+existing `collectIntrinsicNodeColumns`. This collapses the ~4 serial object-storage GETs per block
+into one concurrent round, warming the Reader cache so the existing serial calls become cache hits.
+The prefetch is best-effort and byte-identical on failure; it attacks the I/O-latency bottleneck
+(selectgo wait), orthogonal to the CPU-scan work in NOTE-133..143. Implementation and concurrency
+rationale: reader NOTES.md NOTE-144.
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:intrinsicPrefetchColumns`,
+`internal/modules/executor/metrics_trace_intrinsic.go:executeTraceMetricsIntrinsic`

@@ -11,6 +11,7 @@ import (
 	"context"
 	"math"
 	"math/bits"
+	"runtime"
 	"slices"
 	"sort"
 	"strconv"
@@ -212,6 +213,15 @@ func releaseDirectBool(s []bool) {
 // Large enough to bound overhead; small enough to bound cancellation latency.
 const ctxCheckInterval = 100_000
 
+// NOTE-143: parallel histogram scan tunables.
+// histParallelWorkers caps the worker count; mirrors defaultPipelineWorkers (NOTE-058).
+// histParallelMinItems is the size guard below which the goroutine+reduce overhead exceeds
+// the scan cost, so the scan runs single-threaded (byte-identical to the pre-NOTE-143 path).
+const (
+	histParallelWorkers  = 8
+	histParallelMinItems = 1 << 16 // 65536
+)
+
 // normalizeIntrinsicFieldName maps Tempo's short TraceQL field names to blockpack's
 // internal intrinsic column names. The TraceQL parser produces short names (e.g. "duration")
 // but GetIntrinsicColumn expects the full column name (e.g. "span:duration").
@@ -273,6 +283,41 @@ func metricsColumnsAreIntrinsic(r *modules_reader.Reader, wantColumns map[string
 // NOTE-046: fast path is applicable when all wantColumns are intrinsic AND either:
 //   - program has no filter predicates (match-all { }): enumerate via span:start flat column.
 //   - program has only intrinsic predicates: BlockRefsFromIntrinsicTOC evaluates them.
+//
+// intrinsicPrefetchColumns returns the deduplicated set of intrinsic column names that
+// executeTraceMetricsIntrinsic will read for this query: span:start (always), the normalized
+// aggregate field (unless count/rate), the group-by columns, and any intrinsic predicate
+// columns. Names are advisory — PrefetchIntrinsicColumns ignores absent columns — so each
+// name is the exact value the subsequent serial GetIntrinsicColumn calls will request.
+// NOTE-144: drives the concurrent prefetch that collapses the serial per-column GETs.
+func intrinsicPrefetchColumns(program *vm.Program, querySpec *vm.QuerySpec) []string {
+	names := make([]string, 0, 4)
+	add := func(n string) {
+		if n == "" || n == colNameSpanEnd || n == "count" {
+			return
+		}
+		if !slices.Contains(names, n) {
+			names = append(names, n)
+		}
+	}
+	add(colNameSpanStart)
+	agg := querySpec.Aggregate
+	if agg.Function != vm.FuncNameCOUNT && agg.Function != vm.FuncNameRATE {
+		add(normalizeIntrinsicFieldName(agg.Field))
+	}
+	for _, g := range agg.GroupBy {
+		add(g)
+	}
+	if program != nil && program.Predicates != nil && len(program.Predicates.Nodes) > 0 {
+		preds := make(map[string]struct{}, 4)
+		collectIntrinsicNodeColumns(program.Predicates.Nodes, preds)
+		for c := range preds {
+			add(c)
+		}
+	}
+	return names
+}
+
 func executeTraceMetricsIntrinsic(
 	ctx context.Context,
 	r *modules_reader.Reader,
@@ -287,6 +332,11 @@ func executeTraceMetricsIntrinsic(
 	if err := ctx.Err(); err != nil {
 		return nil, false, err
 	}
+
+	// NOTE-144: collapse the serial per-column intrinsic GETs (span:start, predicate cols,
+	// group-by, agg field) into one concurrent prefetch round. Best-effort — the lazy
+	// GetIntrinsicColumn calls below still run and produce identical results on any miss/error.
+	r.PrefetchIntrinsicColumns(intrinsicPrefetchColumns(program, querySpec))
 
 	tsCol, err := r.GetIntrinsicColumn("span:start")
 	if err != nil {
@@ -653,7 +703,16 @@ func scanGroupByColCompact(
 }
 
 // scanAggColHistogramCompact is the compact-path equivalent of streamByRefSliceHistogramScanDict.
-// Uses binary search over sortedPKs instead of a dense bucketByPK array.
+// Uses a pkBitset + POPCNT rank index over sortedPKs instead of a dense bucketByPK array.
+//
+// NOTE-143: parallelized across min(runtime.NumCPU(), 8) workers. The driver builds the read-only
+// pkBitset/rankPrefix ONCE (was rebuilt per Dict and Flat/Delta branch) and shares it across
+// workers; each worker gets a private pooled groupCountsFlat/seenByPos that are sum/OR-reduced
+// into the caller's arrays after wg.Wait(). The caller's getBoundaryIdx closure is a correctness
+// hazard (it assigns boundary indices in first-encounter order and the resulting boundaries slice
+// is read by emit), so the driver serially pre-warms a frozen read-only boundary lookup
+// (buildFrozenBoundaryIdx) before any goroutine starts. A serial fallback keeps small inputs and
+// single-core machines byte-identical to the pre-NOTE-143 path.
 func scanAggColHistogramCompact( //nolint:gocyclo
 	ctx context.Context,
 	col *modules_shared.IntrinsicColumn,
@@ -665,37 +724,175 @@ func scanAggColHistogramCompact( //nolint:gocyclo
 	groupCountsFlat []int64,
 	stride1, stride2 int64,
 	discardStride int64,
+	fieldName string, // NOTE-143: callers pass agg.Field; used to rebuild boundaries for worker reads
 ) error {
 	if len(sortedPKs) == 0 {
 		return nil
 	}
 	minPK, maxPK := sortedPKs[0], sortedPKs[len(sortedPKs)-1]
+
+	// NOTE-143: build pkBitset + POPCNT rankPrefix ONCE (was rebuilt per branch at the old
+	// 678-697 / 751-773). Pure function of sortedPKs → identical for every worker; shared read-only.
+	// NOTE-134/140: zero-bit membership sentinel — must clear stale pool bits before setting.
+	nWords := int((maxPK >> 6) + 1) //nolint:gosec
+	pkBitset := acquireCompactUint64(nWords)
+	defer releaseCompactUint64(pkBitset)
+	clear(pkBitset)
+	for _, pk := range sortedPKs {
+		pkBitset[pk>>6] |= uint64(1) << (pk & 63)
+	}
+	rankPrefix := acquireCompactUint32(nWords + 1)
+	defer releaseCompactUint32(rankPrefix)
+	var cum uint32
+	for i, w := range pkBitset {
+		rankPrefix[i] = cum
+		cum += uint32(bits.OnesCount64(w)) //nolint:gosec
+	}
+	rankPrefix[len(pkBitset)] = cum
+
+	var numItems int
+	switch col.Format {
+	case modules_shared.IntrinsicFormatDict:
+		numItems = len(col.DictEntries)
+	case modules_shared.IntrinsicFormatFlat, modules_shared.IntrinsicFormatDeltaUint64:
+		numItems = len(col.BlockRefs)
+	default:
+		return nil
+	}
+
+	w := runtime.NumCPU()
+	if w > histParallelWorkers {
+		w = histParallelWorkers
+	}
+
+	// NOTE-143: serial fallback — byte-identical to the pre-NOTE-143 path. Writes directly into
+	// the caller's groupCountsFlat/seenByPos over the full range using the ORIGINAL closure.
+	if w <= 1 || numItems < histParallelMinItems {
+		return scanAggColHistogramShard(ctx, col, 0, numItems, minPK, maxPK,
+			pkBitset, rankPrefix, timeBucketByPos, dictIdxByPos, seenByPos,
+			getBoundaryIdx, groupCountsFlat, stride1, stride2, discardStride)
+	}
+
+	// NOTE-143: parallel path. Serial pre-warm so workers do pure read-only boundary lookups, and
+	// so the caller's boundaries[] ends up identical to a serial run (emit is byte-identical). The
+	// pre-warm applies the SAME row filters the scan applies, so it visits exactly the rows the
+	// workers will reach (passing the pk-range/bitset/time-bucket filter), in scan order.
+	frozen := buildFrozenBoundaryIdx(
+		col, fieldName, getBoundaryIdx, minPK, maxPK, pkBitset, rankPrefix, timeBucketByPos,
+	)
+	roBoundary := func(v float64) int64 {
+		b := intrinsicHistogramBoundary(v, fieldName)
+		if idx, ok := frozen[b]; ok {
+			return idx
+		}
+		return discardStride // unreachable: pre-warm visited every value the scan will reach
+	}
+
+	chunk := (numItems + w - 1) / w
+	var wg sync.WaitGroup
+	errs := make([]error, w)
+	privGCF := make([][]int64, w)
+	privSeen := make([][]bool, w)
+	for k := range w {
+		start := k * chunk
+		if start >= numItems {
+			break
+		}
+		end := start + chunk
+		if end > numItems {
+			end = numItems
+		}
+		gcf := acquireGroupCountsFlat(int64(len(groupCountsFlat))) // zeroed by pool
+		seen := acquireCompactBool(len(seenByPos))                 // zeroed by pool
+		privGCF[k] = gcf
+		privSeen[k] = seen
+		wg.Add(1)
+		go func(k, start, end int, gcf []int64, seen []bool) {
+			defer wg.Done()
+			errs[k] = scanAggColHistogramShard(ctx, col, start, end, minPK, maxPK,
+				pkBitset, rankPrefix, timeBucketByPos, dictIdxByPos, seen,
+				roBoundary, gcf, stride1, stride2, discardStride)
+		}(k, start, end, gcf, seen)
+	}
+	wg.Wait()
+
+	// NOTE-143: reduce — sum groupCountsFlat (+=), OR seenByPos; release worker buffers.
+	// Collect the first worker error (caller treats a non-nil error as fatal and discards the
+	// partial result, matching the legacy ctx-cancel mid-scan semantics).
+	var firstErr error
+	for k := range w {
+		if privGCF[k] == nil {
+			continue
+		}
+		if errs[k] != nil && firstErr == nil {
+			firstErr = errs[k]
+		}
+		for i, v := range privGCF[k] {
+			groupCountsFlat[i] += v
+		}
+		for i, s := range privSeen[k] {
+			if s {
+				seenByPos[i] = true
+			}
+		}
+		releaseGroupCountsFlat(privGCF[k])
+		releaseCompactBool(privSeen[k])
+	}
+	return firstErr
+}
+
+// histRefPassPos applies the Flat/Delta scan's per-ref membership filter EXACTLY (pk range +
+// pkBitset membership) and returns the POPCNT rank position. ok is false when the ref is filtered
+// out (pk out of range or not a member of sortedPKs). The expressions here are the single source of
+// truth shared by the scan loop in scanAggColHistogramShard AND the pre-warm in
+// buildFrozenBoundaryIdx, so the two can never drift (NOTE-143).
+//
+// The caller is still responsible for the timeBucketByPos[pos] != 0 check (it needs pos to do so).
+func histRefPassPos(
+	ref modules_shared.BlockRef,
+	minPK, maxPK uint32,
+	pkBitset []uint64,
+	rankPrefix []uint32,
+) (int, bool) {
+	pk := packKey(ref.BlockIdx, ref.RowIdx)
+	if pk < minPK || pk > maxPK {
+		return 0, false
+	}
+	word := pk >> 6
+	bit := pk & 63
+	if pkBitset[word]&(uint64(1)<<bit) == 0 {
+		return 0, false // NOTE-139: bitset pre-filter; non-members skip rank lookup
+	}
+	// NOTE-139: O(1) rank replaces O(log n) searchSortedUint32. Membership confirmed above.
+	pos := int(rankPrefix[word] + uint32(bits.OnesCount64(pkBitset[word]&((uint64(1)<<bit)-1)))) //nolint:gosec
+	return pos, true
+}
+
+// scanAggColHistogramShard scans col.DictEntries[start:end] (Dict) or col.BlockRefs[start:end)
+// (Flat/Delta), writing into the supplied (possibly per-worker private) groupCountsFlat/seenByPos.
+// minPK/maxPK/pkBitset/rankPrefix are built once by the driver and shared read-only.
+// NOTE-143: extracted verbatim from scanAggColHistogramCompact for parallel sharding.
+func scanAggColHistogramShard( //nolint:gocyclo
+	ctx context.Context,
+	col *modules_shared.IntrinsicColumn,
+	start, end int,
+	minPK, maxPK uint32,
+	pkBitset []uint64,
+	rankPrefix []uint32,
+	timeBucketByPos []int32,
+	dictIdxByPos []uint32,
+	seenByPos []bool,
+	getBoundaryIdx func(float64) int64,
+	groupCountsFlat []int64,
+	stride1, stride2 int64,
+	discardStride int64,
+) error {
 	spanCount := 0
 	switch col.Format {
 	case modules_shared.IntrinsicFormatDict:
-		// NOTE-135: pkBitset pre-filter for Dict refs — same pattern as DeltaUint64 case (NOTE-123/134).
-		// Dict refs within an entry are not packKey-sorted; ~50% fail searchSortedUint32 at 50% selectivity.
-		var pkBitset []uint64
-		var rankPrefix []uint32
-		if len(sortedPKs) > 0 {
-			n := int((maxPK >> 6) + 1) //nolint:gosec
-			pkBitset = acquireCompactUint64(n)
-			defer releaseCompactUint64(pkBitset) // defer covers ctx-cancel early returns
-			clear(pkBitset)                      // NOTE-140: zero-sentinel — must clear stale pool bits
-			for _, pk := range sortedPKs {
-				pkBitset[pk>>6] |= uint64(1) << (pk & 63)
-			}
-			// NOTE-140: POPCNT rank index mirrors NOTE-139 DeltaUint64 build above.
-			rankPrefix = acquireCompactUint32(n + 1)
-			defer releaseCompactUint32(rankPrefix)
-			var cum uint32
-			for i, w := range pkBitset {
-				rankPrefix[i] = cum
-				cum += uint32(bits.OnesCount64(w)) //nolint:gosec
-			}
-			rankPrefix[len(pkBitset)] = cum
-		}
-		for _, entry := range col.DictEntries {
+		// NOTE-135/140: Dict refs are not packKey-sorted; the pkBitset pre-filter + POPCNT rank
+		// replace searchSortedUint32. Build hoisted to the driver (NOTE-143).
+		for _, entry := range col.DictEntries[start:end] {
 			var v float64
 			if entry.Value != "" {
 				parsed, parseErr := strconv.ParseFloat(entry.Value, 64)
@@ -743,35 +940,10 @@ func scanAggColHistogramCompact( //nolint:gocyclo
 		}
 	case modules_shared.IntrinsicFormatFlat,
 		modules_shared.IntrinsicFormatDeltaUint64:
-		// NOTE-123: DeltaUint64 re-enabled with bitset pre-filter. DeltaUint64 refs are sorted
-		// by VALUE (ascending), so binary search in sortedPKs has no locality benefit. A 2MB
-		// bitset (one bit per packKey up to maxPK) pre-filters ~50% of refs at 50% selectivity.
-		// NOTE-139: pkBitset is now built for both DeltaUint64 and Flat (guard: len(sortedPKs)>0).
-		// The POPCNT rank index (rankPrefix) replaces searchSortedUint32 entirely in the scan loop.
-		var pkBitset []uint64
-		var rankPrefix []uint32
-		if len(sortedPKs) > 0 {
-			n := int((maxPK >> 6) + 1) //nolint:gosec
-			pkBitset = acquireCompactUint64(n)
-			defer releaseCompactUint64(pkBitset) // NOTE-134: defer covers ctx-cancel early return at line 703
-			clear(pkBitset)                      // NOTE-134: zero-sentinel — must clear stale pool bits before setting
-			for _, pk := range sortedPKs {
-				pkBitset[pk>>6] |= uint64(1) << (pk & 63)
-			}
-			// NOTE-139: POPCNT rank index. rankPrefix[i] = cumulative popcount of pkBitset[0..i-1].
-			// Rank(pk) = rankPrefix[pk>>6] + OnesCount64(pkBitset[pk>>6] & ((1<<(pk&63))-1)).
-			// Build cost: O(maxPK/64) ≈ 250K iterations at maxPK=16M → ~0.5µs per block.
-			rankPrefix = acquireCompactUint32(n + 1)
-			defer releaseCompactUint32(rankPrefix)
-			// acquireCompactUint32 calls clear() internally (NOTE-125 pool semantics).
-			var cum uint32
-			for i, w := range pkBitset {
-				rankPrefix[i] = cum
-				cum += uint32(bits.OnesCount64(w)) //nolint:gosec
-			}
-			rankPrefix[len(pkBitset)] = cum
-		}
-		for i, ref := range col.BlockRefs {
+		// NOTE-123/139: DeltaUint64 refs are value-sorted; pkBitset + POPCNT rank replace
+		// searchSortedUint32. The i < len(Uint64Values) guard is preserved. Build hoisted (NOTE-143).
+		for i := start; i < end; i++ {
+			ref := col.BlockRefs[i]
 			if spanCount%ctxCheckInterval == 0 {
 				if err := ctx.Err(); err != nil {
 					return err
@@ -781,18 +953,10 @@ func scanAggColHistogramCompact( //nolint:gocyclo
 			if i >= len(col.Uint64Values) {
 				continue
 			}
-			pk := packKey(ref.BlockIdx, ref.RowIdx)
-			if pk < minPK || pk > maxPK {
+			pos, ok := histRefPassPos(ref, minPK, maxPK, pkBitset, rankPrefix)
+			if !ok {
 				continue
 			}
-			word := pk >> 6
-			bit := pk & 63
-			if pkBitset[word]&(uint64(1)<<bit) == 0 {
-				continue // NOTE-139: bitset pre-filter; non-members skip rank lookup
-			}
-			// NOTE-139: O(1) rank replaces O(log n) searchSortedUint32.
-			// pkBitset membership confirmed above; pos is the exact index in sortedPKs.
-			pos := int(rankPrefix[word] + uint32(bits.OnesCount64(pkBitset[word]&((uint64(1)<<bit)-1)))) //nolint:gosec
 			bk := timeBucketByPos[pos]
 			if bk == 0 {
 				continue
@@ -810,6 +974,94 @@ func scanAggColHistogramCompact( //nolint:gocyclo
 		}
 	}
 	return nil
+}
+
+// buildFrozenBoundaryIdx walks the column in legacy scan order, applying the SAME per-row filters
+// the scan applies (pk range + pkBitset membership via histRefPassPos, then timeBucketByPos[pos]!=0),
+// driving the caller's original getBoundaryIdx closure ONLY for rows that pass — so the caller's
+// boundaryCache/boundaries end up exactly as a serial scan would leave them (emit reads boundaries
+// afterward). It then returns a private frozen copy of the boundary→index mapping for race-free
+// read-only worker lookups.
+//
+// The filter is load-bearing: a serial scan appends to boundaries[] in first-encounter order of
+// PASSING rows only; recording boundaries for filtered-out rows would corrupt that order and produce
+// wrong M8 output for any real filtered query (NOTE-143).
+//
+// Dict: the legacy Dict scan calls getBoundaryIdx once per ENTRY before its inner ref loop,
+// unconditionally (whether or not any ref in the entry passes), so recording on every entry in order
+// is already faithful — no filtering is applied to the Dict arm.
+func buildFrozenBoundaryIdx(
+	col *modules_shared.IntrinsicColumn,
+	fieldName string,
+	getBoundaryIdx func(float64) int64,
+	minPK, maxPK uint32,
+	pkBitset []uint64,
+	rankPrefix []uint32,
+	timeBucketByPos []int32,
+) map[float64]int64 {
+	frozen := make(map[float64]int64, 64)
+	record := func(v float64) {
+		idx := getBoundaryIdx(v) // mutates caller's boundaryCache/boundaries (serial, single-threaded)
+		frozen[intrinsicHistogramBoundary(v, fieldName)] = idx
+	}
+	switch col.Format {
+	case modules_shared.IntrinsicFormatDict:
+		// Dict entries are walked in order (≤ a few hundred); the legacy scan records per-entry
+		// unconditionally, so this is faithful without filtering. Cheap, simple in-order walk.
+		for _, entry := range col.DictEntries {
+			var v float64
+			if entry.Value != "" {
+				parsed, err := strconv.ParseFloat(entry.Value, 64)
+				if err != nil {
+					continue
+				}
+				v = parsed
+			} else {
+				v = float64(entry.Int64Val)
+			}
+			record(v)
+		}
+	case modules_shared.IntrinsicFormatDeltaUint64:
+		// NOTE-123/143: DeltaUint64 values are value-sorted ascending and intrinsicHistogramBoundary
+		// is monotonic non-decreasing. Apply the SAME per-ref filter the scan does; among PASSING rows
+		// (still ascending in value) the boundary is non-decreasing, so record only when a passing
+		// row's boundary differs from the previously-recorded passing row's boundary. getBoundaryIdx
+		// is idempotent for an already-seen boundary, so this yields a boundaries[] slice byte-identical
+		// to driving the closure on every passing row — with O(numBoundaries) transcendental calls.
+		var prevBoundary float64
+		first := true
+		for i := range col.BlockRefs {
+			if i >= len(col.Uint64Values) {
+				break
+			}
+			pos, ok := histRefPassPos(col.BlockRefs[i], minPK, maxPK, pkBitset, rankPrefix)
+			if !ok || timeBucketByPos[pos] == 0 {
+				continue
+			}
+			v := float64(col.Uint64Values[i])
+			b := intrinsicHistogramBoundary(v, fieldName)
+			if first || b != prevBoundary {
+				record(v)
+				prevBoundary = b
+				first = false
+			}
+		}
+	case modules_shared.IntrinsicFormatFlat:
+		// NOTE-143: Flat values are NOT guaranteed value-sorted, so the monotonic shortcut does not
+		// apply — walk every PASSING value in BlockRefs/Uint64Values order (the order and filter the
+		// scan visits them with) so the first-encounter index assignment matches the legacy serial scan.
+		for i := range col.BlockRefs {
+			if i >= len(col.Uint64Values) {
+				break
+			}
+			pos, ok := histRefPassPos(col.BlockRefs[i], minPK, maxPK, pkBitset, rankPrefix)
+			if !ok || timeBucketByPos[pos] == 0 {
+				continue
+			}
+			record(float64(col.Uint64Values[i]))
+		}
+	}
+	return frozen
 }
 
 // streamCountRateN1Compact is the compact-memory fallback for count/rate N=1 group-by
@@ -1385,7 +1637,7 @@ func streamHistogramN1CompactFromRefs(
 	if aggCol != nil {
 		if err := scanAggColHistogramCompact(
 			ctx, aggCol, sortedPKs, timeBucketByPos, dictIdxByPos, seenByPos,
-			getBoundaryIdx, groupCountsFlat, stride1, stride2, actualStride,
+			getBoundaryIdx, groupCountsFlat, stride1, stride2, actualStride, agg.Field,
 		); err != nil {
 			return err
 		}
@@ -1620,7 +1872,7 @@ func streamHistogramN1Compact(
 	seenByPos := acquireCompactBool(n)
 	defer releaseCompactBool(seenByPos)
 	if aggCol != nil {
-		if err := scanAggColHistogramCompact(ctx, aggCol, sortedPKs, timeBucketByPos, dictIdxByPos, seenByPos, getBoundaryIdx, groupCountsFlat, stride1, stride2, actualStride); err != nil {
+		if err := scanAggColHistogramCompact(ctx, aggCol, sortedPKs, timeBucketByPos, dictIdxByPos, seenByPos, getBoundaryIdx, groupCountsFlat, stride1, stride2, actualStride, agg.Field); err != nil {
 			return err
 		}
 	}
