@@ -3908,3 +3908,60 @@ Per-goroutine overhead +1 MB (sequential calls, only one rankPrefix alive at a t
 **Validated by:** `TestRankIndexCorrectness` (existing) + `go test ./internal/modules/executor/...`
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:scanGroupByColCompact`,
 `internal/modules/executor/metrics_trace_intrinsic.go:scanAggColHistogramCompact`
+
+## NOTE-141: scanAggColCompact — POPCNT rank index + pkBitset pre-filter replaces searchSortedUint32
+*Added: 2026-06-08*
+**Decision:** Apply the NOTE-139/140 pattern to `scanAggColCompact` (min/max/sum/avg-by-group
+aggregate scan), the last `searchSortedUint32` caller on the hot metrics path. Build
+`pkBitset []uint64` + `rankPrefix []uint32` from `sortedPKs` once (O(maxPK/64) sweep) at the
+top of the function, then in both the Dict and Flat/DeltaUint64 inner loops pre-filter
+non-member refs with `pkBitset[pk>>6]&(1<<(pk&63))==0` and replace
+`searchSortedUint32(sortedPKs, pk)` with the O(1) rank formula
+`pos = int(rankPrefix[pk>>6] + uint32(bits.OnesCount64(pkBitset[pk>>6] & ((1<<(pk&63))-1))))`.
+**Rationale:** The live Pyroscope profile (querier process_cpu, 19:00–20:00Z) shows
+`scanAggColCompact`'s `searchSortedUint32` is the #2 CPU node at ~24.8% of total querier CPU —
+the single biggest remaining search-bound sink after NOTE-139/140 removed it from
+`scanGroupByColCompact` and `scanAggColHistogramCompact`. The aggregate column refs (Flat/DeltaUint64
+sorted by value, Dict refs unsorted within an entry) have no locality with `sortedPKs`, so binary
+search costs 3–5 cache-missing probes per ref; the bitset rejects non-members at ~2ns and the rank
+lookup is O(1). NOTE-140 turned the identical swap into M4 -72% / M9 -89%.
+**Write semantics preserved:** This function has NO `bk==0`/`seen` logic (unlike
+`scanAggColHistogramCompact`); it only writes `aggValByPos[pos]=fval` and
+`aggPresentByPos[pos]=true`. Parse failures still mark present with fval=0 (Dict case computes
+`fval` before the ref loop, unchanged). The bitset pre-filter rejects exactly the refs the old
+`searchSortedUint32` returned `found=false` for; for found refs the rank `pos` equals the binary-search
+`pos` (`TestRankIndexCorrectness`), so all writes are byte-identical.
+**No signature change:** `pkBitset`/`rankPrefix` built inside the function (same as NOTE-140);
+both call sites (lines 1110, 1236) unchanged.
+**Pools / clear:** `acquireCompactUint64(n)` + `defer releaseCompactUint64` for pkBitset (with
+mandatory `clear(pkBitset)` — zero-bit membership sentinel, acquireCompactUint64 does not clear);
+`acquireCompactUint32(n+1)` + `defer releaseCompactUint32` for rankPrefix (cleared internally).
+Both defers cover the single normal return — this function has no ctx-cancel mid-loop return.
+**Validated by:** `TestRankIndexCorrectness` (existing — covers the formula) +
+`go test ./internal/modules/executor/...`.
+**Expected impact:** M7 (`max_over_time by svc`, 16.5s baseline) -40–70%, plus all
+min/max/sum/avg-by-group queries that route through `scanAggColCompact`. Directly attacks the
+#2 profile node.
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:scanAggColCompact`
+
+## NOTE-142: histogram flat-emit reuses pooled []byte composite-key scratch
+**Date:** 2026-06-08
+
+`streamByRefSliceHistogramFlatEmit` built the composite key with `strconv.FormatInt(timeIdx,10)`
++ a 3-way string concat per non-zero cell. For M8
+(`{span.kind=server} | histogram_over_time(duration) by (resource.service.name)`) this is hundreds of
+millions of short-lived string allocations across ~400 files (≈1583 active series × up to 1440 steps),
+GC-bound and warm-cache-insensitive — the dominant cost of the 157s M8 baseline.
+
+Replaced with a pooled `*[]byte` scratch (`acquireCompositeKeyScratch`, NOTE-067) built via
+`strconv.AppendInt` + `append`. The map lookup uses `buckets[string(*scratch)]` so the conversion is
+elided on hit, and the key string is allocated only on a genuine map miss (NOTE-073). The
+`intrinsicGetOrCreateBucket` helper is inlined here because it takes a `string` (which would force a
+per-cell allocation, defeating the optimization); the inlined miss-path matches the helper's exact
+`aggBucketState{min: math.MaxFloat64, max: -math.MaxFloat64}` initialization.
+
+Keys are byte-identical to the previous format (`timeIdx\x00gk\x00boundaryStr`), so
+`traceHistogramSeries` parsing (metrics_trace.go:617) and all bucket counts are unchanged. Does NOT
+alter the scan path (NOTE-114/135/139/140), the absent-row pass (NOTE-088 bIdx=0 sentinel), the
+`discardStride` clamp, the `groupCountsFlat` flat layout (NOTE-124), or boundary math.
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:streamByRefSliceHistogramFlatEmit`

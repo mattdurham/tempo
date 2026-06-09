@@ -1413,7 +1413,7 @@ func streamHistogramN1CompactFromRefs(
 }
 
 // scanAggColCompact scans an intrinsic column and populates aggValByPos/aggPresentByPos for each
-// packKey that appears in sortedPKs (sorted ascending), using binary search.
+// packKey that appears in sortedPKs (sorted ascending), using a POPCNT rank index (NOTE-141).
 // Matches buildAggValsForRef semantics: for dict parse failures, fval=0 but present=true.
 func scanAggColCompact(
 	col *modules_shared.IntrinsicColumn,
@@ -1425,6 +1425,35 @@ func scanAggColCompact(
 		return
 	}
 	minPK, maxPK := sortedPKs[0], sortedPKs[len(sortedPKs)-1]
+
+	// NOTE-141: build pkBitset + POPCNT rank index from sortedPKs, mirroring NOTE-139/140
+	// in scanGroupByColCompact / scanAggColHistogramCompact. Replaces searchSortedUint32 in
+	// both the Dict and Flat/DeltaUint64 inner loops with an O(1) rank lookup, and pre-filters
+	// non-member refs with the bitset before any rank work.
+	var pkBitset []uint64
+	var rankPrefix []uint32
+	if len(sortedPKs) > 0 {
+		n := int((maxPK >> 6) + 1) //nolint:gosec
+		pkBitset = acquireCompactUint64(n)
+		defer releaseCompactUint64(pkBitset)
+		clear(
+			pkBitset,
+		) // NOTE-141: zero-sentinel — acquireCompactUint64 does NOT clear; stale bits would false-positive the pre-filter and corrupt rankPrefix
+		for _, pk := range sortedPKs {
+			pkBitset[pk>>6] |= uint64(1) << (pk & 63)
+		}
+		// NOTE-141: POPCNT rank index. rankPrefix[i] = cumulative popcount of pkBitset[0..i-1].
+		// Build cost: O(maxPK/64) ≈ 250K iterations at maxPK=16M → ~0.5µs per block.
+		rankPrefix = acquireCompactUint32(n + 1)
+		defer releaseCompactUint32(rankPrefix)
+		// acquireCompactUint32 calls clear() internally (NOTE-125 pool semantics).
+		var cum uint32
+		for i, w := range pkBitset {
+			rankPrefix[i] = cum
+			cum += uint32(bits.OnesCount64(w)) //nolint:gosec
+		}
+		rankPrefix[len(pkBitset)] = cum
+	}
 
 	switch col.Format {
 	case modules_shared.IntrinsicFormatDict:
@@ -1443,10 +1472,14 @@ func scanAggColCompact(
 				if pk < minPK || pk > maxPK {
 					continue
 				}
-				pos, found := searchSortedUint32(sortedPKs, pk)
-				if !found {
-					continue
+				word := pk >> 6
+				bit := pk & 63
+				if pkBitset[word]&(uint64(1)<<bit) == 0 {
+					continue // NOTE-141: bitset pre-filter — pk not in sortedPKs
 				}
+				// NOTE-141: O(1) rank replaces O(log n) searchSortedUint32.
+				r := rankPrefix[word] + uint32(bits.OnesCount64(pkBitset[word]&((uint64(1)<<bit)-1))) //nolint:gosec
+				pos := int(r)                                                                         //nolint:gosec
 				aggValByPos[pos] = fval
 				aggPresentByPos[pos] = true
 			}
@@ -1461,11 +1494,14 @@ func scanAggColCompact(
 			if pk < minPK || pk > maxPK {
 				continue
 			}
-			pos, found := searchSortedUint32(sortedPKs, pk)
-			if !found {
-				continue
+			word := pk >> 6
+			bit := pk & 63
+			if pkBitset[word]&(uint64(1)<<bit) == 0 {
+				continue // NOTE-141: bitset pre-filter — pk not in sortedPKs
 			}
-			aggValByPos[pos] = float64(col.Uint64Values[i]) //nolint:gosec
+			// NOTE-141: O(1) rank replaces O(log n) searchSortedUint32.
+			pos := int(rankPrefix[word] + uint32(bits.OnesCount64(pkBitset[word]&((uint64(1)<<bit)-1)))) //nolint:gosec
+			aggValByPos[pos] = float64(col.Uint64Values[i])                                              //nolint:gosec
 			aggPresentByPos[pos] = true
 		}
 	}
@@ -3678,7 +3714,14 @@ func streamByRefSliceHistogramFlatEmit(
 	boundaries []float64,
 	buckets map[string]*aggBucketState,
 ) error {
-	numBoundaries := int64(len(boundaries)) + 1             // +1 for absent sentinel at bIdx=0
+	numBoundaries := int64(len(boundaries)) + 1 // +1 for absent sentinel at bIdx=0
+	// NOTE-142: reuse a pooled []byte scratch to build the composite key with strconv.AppendInt
+	// instead of FormatInt + a 3-way string concat per non-zero cell. The key bytes are identical
+	// (timeIdx\x00gk\x00boundaryStr), so traceHistogramSeries parsing and all bucket counts are
+	// unchanged; only the genuine map-miss path allocates the retained key string. Mirrors the
+	// callback emitter pattern (NOTE-067/073) in metrics_trace.go.
+	scratch := acquireCompositeKeyScratch()
+	defer releaseCompositeKeyScratch(scratch)
 	for gIdx := int64(0); gIdx < int64(numGroups); gIdx++ { //nolint:gosec
 		gk := ""
 		if int(gIdx) < len(dict) { //nolint:gosec
@@ -3696,8 +3739,24 @@ func streamByRefSliceHistogramFlatEmit(
 				if count == 0 {
 					continue
 				}
-				k := strconv.FormatInt(timeIdx, 10) + "\x00" + gk + "\x00" + boundaryStr
-				intrinsicGetOrCreateBucket(buckets, k).count += count
+				// Build "timeIdx\x00gk\x00boundaryStr" into the reused buffer — byte-identical to
+				// strconv.FormatInt(timeIdx,10) + "\x00" + gk + "\x00" + boundaryStr.
+				*scratch = strconv.AppendInt((*scratch)[:0], timeIdx, 10)
+				*scratch = append(*scratch, '\x00')
+				*scratch = append(*scratch, gk...)
+				*scratch = append(*scratch, '\x00')
+				*scratch = append(*scratch, boundaryStr...)
+				// Zero-alloc lookup on hit; Go elides string(*scratch) when the key does not escape.
+				b, exists := buckets[string(*scratch)]
+				if !exists {
+					k := string(*scratch) // NOTE-073: intentional alloc — key retained in map
+					b = &aggBucketState{
+						min: math.MaxFloat64,
+						max: -math.MaxFloat64,
+					}
+					buckets[k] = b
+				}
+				b.count += count
 			}
 		}
 	}
