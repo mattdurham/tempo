@@ -93,6 +93,22 @@ func releaseCompactUint32(s []uint32) {
 	compactUint32Pool.Put(s[:cap(s)]) //nolint:staticcheck // SA6002: slice is pointer-sized
 }
 
+// acquireCompactUint32NoClear returns a []uint32 of length n from the pool WITHOUT zeroing
+// it. NOTE-164: the sortedPKs buffers in streamCountRateN1Compact /
+// streamCountRateN1CompactFromRefs / streamHistogramN1CompactFromRefs are written for every
+// index [0,n) (one packKey per in-range ref) before any read, so the clear() in
+// acquireCompactUint32 is pure waste — ~28 MB of zeroing per file at n≈7.2 M on the warm
+// M6/M8/M9 rate-by/histogram scan path. Only callers that fully overwrite [0:n) before reading
+// may use this; sentinel-using buffers (dictIdxByPos, rankPrefix) must keep acquireCompactUint32.
+func acquireCompactUint32NoClear(n int) []uint32 {
+	if v := compactUint32Pool.Get(); v != nil {
+		if s, ok := v.([]uint32); ok && cap(s) >= n {
+			return s[:n]
+		}
+	}
+	return make([]uint32, n)
+}
+
 func acquireCompactInt32(n int) []int32 {
 	if v := compactInt32Pool.Get(); v != nil {
 		if s, ok := v.([]int32); ok && cap(s) >= n {
@@ -1236,7 +1252,7 @@ func streamCountRateN1Compact(
 	// Block scope limits pkOrder lifetime so it can be GC'd before the group-column I/O below.
 	// NOTE-125: pool to avoid per-block allocations of sortedPKs (~28 MB) and
 	// timeBucketByPos (~29 MB) at n=7.2 M.
-	sortedPKs := acquireCompactUint32(n)
+	sortedPKs := acquireCompactUint32NoClear(n)
 	defer releaseCompactUint32(sortedPKs)
 	timeBucketByPos := acquireCompactInt32(n) // 0 = out of range; 1..numSteps = bucket+1 (NOTE-116)
 	defer releaseCompactInt32(timeBucketByPos)
@@ -1296,7 +1312,7 @@ func streamCountRateN1CompactFromRefs(
 	// sortedPKs and timeBucketByPos in a single O(n) pass without allocating pkOrder.
 	// NOTE-125: pool to avoid per-block allocations of sortedPKs (~28 MB) and
 	// timeBucketByPos (~29 MB) at n=7.2 M.
-	sortedPKs := acquireCompactUint32(n)
+	sortedPKs := acquireCompactUint32NoClear(n)
 	defer releaseCompactUint32(sortedPKs)
 	timeBucketByPos := acquireCompactInt32(n) // 0 = out of range; 1..numSteps = bucket+1 (NOTE-116)
 	defer releaseCompactInt32(timeBucketByPos)
@@ -1438,7 +1454,7 @@ func streamAggN1Compact(
 	// Block scope limits pkOrder lifetime so it can be GC'd before the column I/O below.
 	// NOTE-125: pool to avoid per-block allocations of sortedPKs (~28 MB) and
 	// timeBucketByPos (~29 MB) at n=7.2 M.
-	sortedPKs := acquireCompactUint32(n)
+	sortedPKs := acquireCompactUint32NoClear(n)
 	defer releaseCompactUint32(sortedPKs)
 	timeBucketByPos := acquireCompactInt32(n) // 0 = out of range; 1..numSteps = bucket+1 (NOTE-116)
 	defer releaseCompactInt32(timeBucketByPos)
@@ -1580,7 +1596,7 @@ func streamAggN1CompactFromRefs(
 
 	// inRangeRefs is already packKey-sorted from mergeJoinFilteredRefsWithVals.
 	// NOTE-125: pool to avoid per-block allocations (~28 MB sortedPKs, ~29 MB timeBucketByPos).
-	sortedPKs := acquireCompactUint32(n)
+	sortedPKs := acquireCompactUint32NoClear(n)
 	defer releaseCompactUint32(sortedPKs)
 	timeBucketByPos := acquireCompactInt32(n) // 0 = out of range; 1..numSteps = bucket+1 (NOTE-116)
 	defer releaseCompactInt32(timeBucketByPos)
@@ -1702,7 +1718,7 @@ func streamHistogramN1CompactFromRefs(
 	// inRangeRefs is already packKey-sorted from mergeJoinFilteredRefsWithVals.
 	// Build sortedPKs and timeBucketByPos in O(n) without pkOrder alloc or sort.
 	// NOTE-125: pool to avoid per-block allocations (~28 MB sortedPKs, ~29 MB timeBucketByPos).
-	sortedPKs := acquireCompactUint32(n)
+	sortedPKs := acquireCompactUint32NoClear(n)
 	defer releaseCompactUint32(sortedPKs)
 	timeBucketByPos := acquireCompactInt32(n) // 0 = out of range; 1..numSteps = bucket+1 (NOTE-116)
 	defer releaseCompactInt32(timeBucketByPos)
@@ -1929,7 +1945,7 @@ func streamHistogramN1Compact(
 	// Block scope limits pkOrder lifetime so it can be GC'd before the group-column I/O below.
 	// NOTE-125: pool to avoid per-block allocations of sortedPKs (~28 MB) and
 	// timeBucketByPos (~29 MB) at n=7.2 M.
-	sortedPKs := acquireCompactUint32(n)
+	sortedPKs := acquireCompactUint32NoClear(n)
 	defer releaseCompactUint32(sortedPKs)
 	timeBucketByPos := acquireCompactInt32(n) // sentinel 0 = out of range; 1..numSteps = bucket+1 (NOTE-116)
 	defer releaseCompactInt32(timeBucketByPos)

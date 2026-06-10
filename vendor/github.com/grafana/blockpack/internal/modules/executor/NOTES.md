@@ -4231,3 +4231,33 @@ suite under `-race`.
 
 Back-ref: `internal/modules/executor/metrics_trace.go:blockMetricsCols,resolveBlockMetricsCols,
 traceAccumulateRow,traceUpdateBucket,traceHistogramBucket,traceFieldFloat64Col`
+
+---
+
+## NOTE-164: skip clear() on fully-overwritten sortedPKs pool buffers (2026-06-10)
+
+The compact N=1 paths (`streamCountRateN1Compact`, `streamCountRateN1CompactFromRefs`,
+`streamHistogramN1CompactFromRefs`, `streamAggN1Compact`, `streamAggN1CompactFromRefs`, and
+the predicate-filtered N=1 count/rate path) each acquire a pooled `sortedPKs []uint32` of
+length `n` (= in-range ref count, ~7.2 M on the warm M6/M8/M9 rate-by/histogram scan path) via
+`acquireCompactUint32(n)`. That helper unconditionally `clear()`s the slice on acquire (pool
+semantics for sentinel-using buffers, NOTE-125). But every one of these `sortedPKs` buffers is
+written for EVERY index `[0,n)` — one `packKey` per ref — before any read, so the clear is pure
+waste: ~28 MB of zeroing per file per query, repeated on every block-group, on the CPU-bound
+metrics scan path (KEY FINDING: queriers peg ~5 cores on heavy metrics).
+
+**Change.** Added `acquireCompactUint32NoClear(n)` (same pool, no `clear()`) and switched the
+six `sortedPKs := acquireCompactUint32(n)` sites to it. Sentinel-using buffers from the same
+pool (`dictIdxByPos`, `rankPrefix`, `entryGIdx`) keep `acquireCompactUint32` because they rely
+on the zero value as an "absent" marker and are only partially written.
+
+**Correctness.** Byte-identical output: each `sortedPKs[i]` is assigned in a loop that covers
+all `i ∈ [0,n)` (either `for i, ref := range inRangeRefs` with `len==n`, or
+`for i, packed := range pkOrder` with `len(pkOrder)==n`) before the buffer is read by
+`scanGroupByColCompact` / `streamCountRateN1CompactCore` / the histogram scan. No stale pool
+data can leak because no index is left unwritten. `releaseCompactUint32` is unchanged, so the
+returned buffer re-enters the same pool. Verified by the full executor suite under `-race`.
+
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:acquireCompactUint32NoClear,
+streamCountRateN1Compact,streamCountRateN1CompactFromRefs,streamHistogramN1CompactFromRefs,
+streamAggN1Compact,streamAggN1CompactFromRefs`
