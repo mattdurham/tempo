@@ -4123,3 +4123,44 @@ asserts byte-identical per-bucket counts vs the legacy loop across dense, sparse
 single-span, empty, and final-bucket-only inputs.
 
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:streamCountRateNoGroupBySorted,dispatchIntrinsicAccumulate`
+
+## NOTE-156: numeric dict-mask fast path for range comparisons (M9 status_code predicate)
+*Added: 2026-06-09*
+
+**Decision:** Range comparisons (`>`, `>=`, `<`, `<=`) on dict-encoded NUMERIC attribute columns
+(Uint64/Int64/Float64 + Range variants) now evaluate the comparison once per DISTINCT dictionary
+entry to build a `[]bool` mask, then scan rows with a single `Idx[i]` lookup + mask check —
+mirroring the existing `scanStringDictFloat` string-dict fast path (NOTE-022). Previously these went
+through `scanWith`→`rowCompare`, which re-ran a per-row interface type-switch (`value.(type)` ×
+`col.Type` switch) plus an indirect `cond` closure call for EVERY row.
+
+**Why this is the M9 hot path:** M9 = `{span.kind=server && span.http.response.status_code >= 400}
+| rate() by (resource.service.name)`. `span.kind` is intrinsic (cheap); the `status_code >= 400`
+arm is an attribute-column range scan executed over every span of every block that the planner
+selects (queriers peg ~5 cores, 90s+ timeouts — confirmed CPU-bound, not I/O). `status_code` is a
+low-cardinality numeric column (a handful of codes: 200, 301, 404, 500, …), so the dict mask is ~6
+entries: the scan collapses from N interface comparisons to len(Dict) comparisons + N cheap index
+lookups.
+
+**Structure:** `scanNumericDict(col, value, keep, cb) (count, handled)` dispatches on `col.Type`,
+builds the per-type mask via `cmpSign(dictVal, threshold)` (the sign half of `cmp3`), then
+`scanNumericDictMask` runs the row loop. Wired into all four `StreamScan{Greater,Less}Than[OrEqual]`
+after their existing string-dict fast path; `handled==false` (unsupported type or value kind not
+comparable to the column) falls back to the legacy `scanWith`+`rowCompare` path unchanged.
+
+**Why byte-identical:** `cmpSign` reproduces `rowCompare`'s exact per-type cross-comparison arms
+(int64/uint64/float64, same `uint64(int64)` and `float64()` conversions). The row loop reproduces
+`scanStringDictFloat`'s `IsPresent` + bounds-guarded `Idx`/`Dict` access, which is exactly what
+`col.Uint64Value`/`Int64Value`/`Float64Value` (used by `rowCompare`) do internally. A `value` kind
+not handled by a column's arms (e.g. a string threshold vs an int column) leaves the mask
+unbuilt and returns `handled=false` → fall back → `rowCompare` returns `ok=false` for every row →
+zero matches, same as before. Verified by `scan_numeric_dict_test.go` (int + float columns, int64 &
+float64 thresholds, all 4 operators, present/absent rows, and the cross-type-skip case) asserting
+identical sorted matched rows vs the legacy `scanWith`+`rowCompare` reference loop, under `-race`.
+
+**Measurement (microbench):** `BenchmarkScanNumericDict_GTE` — 100k spans, 6 distinct codes,
+float64(400) threshold: fast path 6.4 µs/op vs legacy loop ~20 µs/op (~3.1× faster), 0 allocs both
+(the ~6-entry mask does not escape). On M9 the predicate column is scanned for every selected block,
+so the per-block predicate-pass CPU drops proportionally.
+
+Back-ref: `internal/modules/executor/column_provider.go:scanNumericDict,scanNumericDictMask,cmpSign,StreamScanGreaterThanOrEqual,StreamScanGreaterThan,StreamScanLessThan,StreamScanLessThanOrEqual`

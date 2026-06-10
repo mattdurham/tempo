@@ -24,6 +24,12 @@ func cmp3[T cmp.Ordered](a, b T) (int, bool) {
 	return cmp.Compare(a, b), true
 }
 
+// cmpSign returns just the comparison sign (-1, 0, +1) of a vs b. Used by the numeric
+// dict-mask fast path (NOTE-156) where the always-true ok bit of cmp3 is not needed.
+func cmpSign[T cmp.Ordered](a, b T) int {
+	return cmp.Compare(a, b)
+}
+
 // NOTE-077: valueKind classifies the Go type of query values for fast-path dispatch.
 type valueKind int
 
@@ -539,6 +545,132 @@ func scanStringDictFloat(
 	return count
 }
 
+// NOTE-156: scanNumericDict is the numeric-column analogue of scanStringDictFloat. Numeric
+// columns (Uint64/Int64/Float64 and their Range variants) are dict-encoded: a small Dict of
+// distinct values + a per-row Idx into it. For a range comparison (>, >=, <, <=) the per-row
+// loop in scanWith→rowCompare re-evaluated the comparison (with interface type-switch + indirect
+// closure call) for EVERY row. Instead we evaluate the comparison once per DISTINCT dict entry to
+// build a bool mask, then per-row do a single Idx lookup + mask check. For low-cardinality numeric
+// attributes like span.http.response.status_code (a handful of codes: 200, 404, 500, …) this turns
+// N interface comparisons into len(Dict) comparisons + N cheap index lookups — the dominant
+// per-block CPU on the M9 predicate path (status_code>=400 over millions of spans/block).
+//
+// Returns (count, true) when it handled the column; (0, false) when the column is not a supported
+// dict-encoded numeric type, or the value kind is not comparable to it (caller falls back to
+// scanWith+rowCompare). keep maps the comparison sign to a match: keep is called as
+// keep(cmpSign(dictVal, threshold)), so e.g. GTE passes func(s int) bool { return s >= 0 } —
+// matching rowCompare's `cmp >= 0` where cmp = compare(colVal, value).
+func scanNumericDict(
+	col *modules_reader.Column,
+	value interface{},
+	keep func(sign int) bool,
+	cb vm.RowCallback,
+) (int, bool) {
+	col.EnsureDecoded()
+	// Build the dict→bool mask for the column's concrete numeric type. cmpSign(dictVal, threshold)
+	// reproduces rowCompare's per-type comparison exactly (same int64/uint64/float64 cross-type
+	// arms), so the mask is byte-identical to evaluating rowCompare per row.
+	switch col.Type {
+	case modules_shared.ColumnTypeUint64, modules_shared.ColumnTypeRangeUint64:
+		dict := col.Uint64Dict
+		idx := col.Uint64Idx
+		if dict == nil || idx == nil {
+			return 0, false
+		}
+		matches := make([]bool, len(dict))
+		ok := false
+		for i, dv := range dict {
+			switch t := value.(type) {
+			case int64:
+				matches[i] = keep(cmpSign(dv, uint64(t))) //nolint:gosec
+				ok = true
+			case float64:
+				matches[i] = keep(cmpSign(float64(dv), t))
+				ok = true
+			}
+		}
+		if !ok {
+			return 0, false // value kind not comparable to this column → fall back
+		}
+		return scanNumericDictMask(col, idx, matches, cb), true
+	case modules_shared.ColumnTypeInt64, modules_shared.ColumnTypeRangeInt64, modules_shared.ColumnTypeRangeDuration:
+		dict := col.Int64Dict
+		idx := col.Int64Idx
+		if dict == nil || idx == nil {
+			return 0, false
+		}
+		matches := make([]bool, len(dict))
+		ok := false
+		for i, dv := range dict {
+			switch t := value.(type) {
+			case int64:
+				matches[i] = keep(cmpSign(dv, t))
+				ok = true
+			case float64:
+				matches[i] = keep(cmpSign(float64(dv), t))
+				ok = true
+			}
+		}
+		if !ok {
+			return 0, false
+		}
+		return scanNumericDictMask(col, idx, matches, cb), true
+	case modules_shared.ColumnTypeFloat64, modules_shared.ColumnTypeRangeFloat64:
+		dict := col.Float64Dict
+		idx := col.Float64Idx
+		if dict == nil || idx == nil {
+			return 0, false
+		}
+		matches := make([]bool, len(dict))
+		ok := false
+		for i, dv := range dict {
+			switch t := value.(type) {
+			case float64:
+				matches[i] = keep(cmpSign(dv, t))
+				ok = true
+			case int64:
+				matches[i] = keep(cmpSign(dv, float64(t)))
+				ok = true
+			}
+		}
+		if !ok {
+			return 0, false
+		}
+		return scanNumericDictMask(col, idx, matches, cb), true
+	default:
+		return 0, false
+	}
+}
+
+// scanNumericDictMask iterates rows, applying the precomputed dict mask. idx[i] is the dict
+// index for row i; a present row matches iff matches[idx[i]]. Mirrors the row loop of
+// scanStringDictFloat (same IsPresent + bounds-guarded index + cb semantics).
+func scanNumericDictMask(
+	col *modules_reader.Column,
+	idx []uint32,
+	matches []bool,
+	cb vm.RowCallback,
+) int {
+	spanCount := col.SpanCount
+	count := 0
+	for i := range spanCount {
+		if !col.IsPresent(i) {
+			continue
+		}
+		if i >= len(idx) {
+			continue
+		}
+		di := int(idx[i])
+		if di < len(matches) && matches[di] {
+			if !cb(i) {
+				return count
+			}
+			count++
+		}
+	}
+	return count
+}
+
 // scanWith iterates all rows 0..n-1, calls cond for each, and calls cb for rows where cond returns true.
 func (p *blockColumnProvider) scanWith(col *modules_reader.Column, cond func(i int) bool, cb vm.RowCallback) int {
 	n := p.block.SpanCount()
@@ -672,6 +804,10 @@ func (p *blockColumnProvider) StreamScanLessThan(column string, value interface{
 			return scanStringDictFloat(col, f, func(v, t float64) bool { return v < t }, cb), nil
 		}
 	}
+	// NOTE-156: numeric dict-mask fast path.
+	if n, handled := scanNumericDict(col, value, func(s int) bool { return s < 0 }, cb); handled {
+		return n, nil
+	}
 	n := p.scanWith(col, func(i int) bool {
 		cmp, ok := rowCompare(col, i, value)
 		return ok && cmp < 0
@@ -698,6 +834,10 @@ func (p *blockColumnProvider) StreamScanLessThanOrEqual(
 		case modules_shared.ColumnTypeRangeString, modules_shared.ColumnTypeString:
 			return scanStringDictFloat(col, f, func(v, t float64) bool { return v <= t }, cb), nil
 		}
+	}
+	// NOTE-156: numeric dict-mask fast path.
+	if n, handled := scanNumericDict(col, value, func(s int) bool { return s <= 0 }, cb); handled {
+		return n, nil
 	}
 	n := p.scanWith(col, func(i int) bool {
 		cmp, ok := rowCompare(col, i, value)
@@ -726,6 +866,10 @@ func (p *blockColumnProvider) StreamScanGreaterThan(
 			return scanStringDictFloat(col, f, func(v, t float64) bool { return v > t }, cb), nil
 		}
 	}
+	// NOTE-156: numeric dict-mask fast path.
+	if n, handled := scanNumericDict(col, value, func(s int) bool { return s > 0 }, cb); handled {
+		return n, nil
+	}
 	n := p.scanWith(col, func(i int) bool {
 		cmp, ok := rowCompare(col, i, value)
 		return ok && cmp > 0
@@ -752,6 +896,10 @@ func (p *blockColumnProvider) StreamScanGreaterThanOrEqual(
 		case modules_shared.ColumnTypeRangeString, modules_shared.ColumnTypeString:
 			return scanStringDictFloat(col, f, func(v, t float64) bool { return v >= t }, cb), nil
 		}
+	}
+	// NOTE-156: numeric dict-mask fast path (status_code>=400 etc.).
+	if n, handled := scanNumericDict(col, value, func(s int) bool { return s >= 0 }, cb); handled {
+		return n, nil
 	}
 	n := p.scanWith(col, func(i int) bool {
 		cmp, ok := rowCompare(col, i, value)
