@@ -83,6 +83,37 @@ func expandServers(servers []string) []string {
 	return expanded
 }
 
+// memcacheMaxIdleConns is the per-server idle-connection pool size for the
+// remote memcache client.
+//
+// NOTE-162: gomemcache defaults MaxIdleConns to 2. A single heavy metrics
+// query (e.g. M1/M4 {} | rate()) fans out into hundreds of concurrent block
+// page / TOC / intrinsic cache lookups, each of which calls Client.Get. With
+// only 2 idle connections per server the pool is instantly exhausted, so every
+// additional concurrent Get dials a brand-new TCP connection and discards it
+// after use. A querier CPU profile (2026-06-10) confirmed this is the dominant
+// cost: ~66% of querier CPU was in memcache (*Client).dial -> net.Dialer ->
+// kernel __inet_hash_connect / __inet_check_established / tcp_twsk_unique
+// (ephemeral-port + TIME_WAIT-reuse churn) plus TLS re-handshake crypto, while
+// the executor scan/decode path was <2%. Sizing the idle pool above peak
+// parallel requests lets connections be reused instead of re-dialed.
+const memcacheMaxIdleConns = 512
+
+// newPooledClient builds a gomemcache client with an idle-connection pool deep
+// enough to survive a heavy metrics query's concurrent cache fan-out, instead
+// of the default 2 (NOTE-162). MinIdleConnsHeadroomPercentage is set negative
+// so idle connections are never proactively closed between queries — the
+// background reaper closing the pool down to 2 between bursts is exactly what
+// forces the re-dial storm on the next query.
+func newPooledClient(servers []string) *gomemcache.Client {
+	ss := new(gomemcache.ServerList)
+	_ = ss.SetServers(servers...)
+	c := gomemcache.NewFromSelector(ss)
+	c.MaxIdleConns = memcacheMaxIdleConns
+	c.MinIdleConnsHeadroomPercentage = -1
+	return c
+}
+
 // Open creates a MemCache connecting to cfg.Servers.
 // Returns (nil, nil) when cfg.Enabled is false.
 func Open(cfg Config) (*MemCache, error) {
@@ -97,7 +128,7 @@ func Open(cfg Config) (*MemCache, error) {
 		tl = "remote"
 	}
 	m := &MemCache{
-		c:          gomemcache.New(expandServers(cfg.Servers)...),
+		c:          newPooledClient(expandServers(cfg.Servers)),
 		expiration: cfg.Expiration,
 		tierLabel:  tl,
 	}
