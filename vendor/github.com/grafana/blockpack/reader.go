@@ -31,9 +31,11 @@ import (
 type WantColumns = modules_reader.WantColumns
 
 // WantAll returns a WantColumns that eagerly decodes every column.
+// Used by tempo's backend_block.go via the blockpack public API.
 func WantAll() WantColumns { return modules_reader.WantAll() }
 
 // WantOnly returns a WantColumns that eagerly decodes only the named columns.
+// Used by tempo's backend_block.go via the blockpack public API.
 func WantOnly(cols map[string]struct{}) WantColumns { return modules_reader.WantOnly(cols) }
 
 // Reader reads modules-format blockpack files and provides query execution.
@@ -218,6 +220,21 @@ type TypedTieredCache = modules_tieredcache.TypedTieredCache
 //	reader, _ := blockpack.NewReaderWithCache(provider, fileID, tiered)
 func DefaultTypedConfig(mem, disk Cache) TypedConfig {
 	return modules_tieredcache.DefaultTypedConfig(mem, disk)
+}
+
+// TwoTierTypedConfig returns a TypedConfig that splits caching across two remote caches:
+//   - meta: Footer, TOC, Bloom, Metadata, TraceIdx, Intrinsic — small, high-reuse entries
+//     that benefit from a shared cache with low eviction pressure (e.g. memcached-01).
+//   - page: Block — large column-page blobs cached separately to prevent small metadata
+//     entries from being evicted by large page data (e.g. memcached-blockpack-page-01).
+//
+// Example:
+//
+//	meta, _ := blockpack.OpenMemCache(blockpack.MemCacheConfig{Addresses: []string{"memcached-01:11211"}})
+//	page, _ := blockpack.OpenMemCache(blockpack.MemCacheConfig{Addresses: []string{"memcached-blockpack-page-01:11211"}})
+//	tiered  := blockpack.NewTypedTieredCache(blockpack.TwoTierTypedConfig(meta, page))
+func TwoTierTypedConfig(meta, page Cache) TypedConfig {
+	return modules_tieredcache.TwoTierTypedConfig(meta, page)
 }
 
 // NewTypedTieredCache constructs a TypedTieredCache from cfg.

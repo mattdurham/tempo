@@ -185,11 +185,12 @@ func getCache() blockpack.SectionCache {
 				Registerer: prometheus.WrapRegistererWith(prometheus.Labels{"tier": "data"}, prometheus.DefaultRegisterer),
 			})
 			if err == nil && err2 == nil && metaRemote != nil && dataRemote != nil {
-				// hot: mem+metaRemote for footer/toc/bloom/block/intrinsic
-				// warm: disk+dataRemote for metadata/traceIdx
-				hot := blockpack.NewChainedCache(nonNil(mem, metaRemote)...)
-				warm := blockpack.NewChainedCache(nonNil(disk, dataRemote)...)
-				cfg2 := blockpack.DefaultTypedConfig(hot, warm); cfg2.Registerer = prometheus.DefaultRegisterer; blockpackCache = blockpack.NewTypedTieredCache(cfg2)
+				// Split by entry size: small metadata entries (Footer/TOC/Bloom/Metadata/TraceIdx/Intrinsic)
+				// go to metaRemote (memcached-01) to keep hit rate high; large column-page blobs (Block)
+				// go to dataRemote (memcached-blockpack-page-01) so page evictions don't displace metadata.
+				metaChain := blockpack.NewChainedCache(nonNil(mem, metaRemote)...)
+				pageChain := blockpack.NewChainedCache(nonNil(disk, dataRemote)...)
+				cfg2 := blockpack.TwoTierTypedConfig(metaChain, pageChain); cfg2.Registerer = prometheus.DefaultRegisterer; blockpackCache = blockpack.NewTypedTieredCache(cfg2)
 				return
 			}
 		}

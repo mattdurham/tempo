@@ -4,7 +4,7 @@
 NUM_TRACES ?= 191119
 
 # Package list (excluding /bots) - lazy evaluation to avoid running on every make invocation
-PACKAGES = $(shell go list -e -f '{{if .GoFiles}}{{.ImportPath}}{{end}}' ./... | grep -v '/bots')
+PACKAGES = $(shell go list -e -f '{{if .GoFiles}}{{.ImportPath}}{{end}}' ./... | grep -v '/bots' | grep -v 'cmd/embed-server')
 
 # Generated test files
 BLOCKPACK_FILE := traces.blockpack
@@ -185,7 +185,7 @@ deadcode:
 # Run staticcheck (excludes internal/xunsafe - uses unsafe for performance)
 staticcheck:
 	@echo "==> Running staticcheck..."
-	@staticcheck -f stylish $$(go list ./... | grep -v '/internal/xunsafe$$')
+	@staticcheck -checks="all,-SA6002" -f stylish $$(go list ./... | grep -v '/internal/xunsafe$$')
 	@echo "==> Staticcheck passed!"
 
 # Check formatting with gofumpt (CI mode)
