@@ -25,13 +25,29 @@ func (col *IntrinsicColumn) EnsureRefIndex() {
 		switch col.Format {
 		case IntrinsicFormatFlat, IntrinsicFormatXORBytes, IntrinsicFormatDeltaUint64:
 			idx := make([]RefIndexEntry, len(col.BlockRefs))
+			// NOTE-168: build Packed keys and detect ascending order in the same pass.
+			// Flat/XOR/Delta refs are emitted in row order; within a single block RowIdx
+			// rises monotonically, so the packed key (BlockIdx<<16|RowIdx) is already
+			// sorted for the dominant single-block decode case. When that holds we skip
+			// the O(N log N) closure-driven slices.SortFunc entirely — the comparator
+			// closure (cmp.Compare on Packed) was reached via slices.partitionCmpFunc and
+			// showed up as a residual CPU sink on the EnsureRefIndex path after NOTE-167.
+			sorted := true
+			var prev uint32
 			for i, ref := range col.BlockRefs {
+				p := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx) //nolint:gosec
 				idx[i] = RefIndexEntry{
-					Packed: uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx), //nolint:gosec
-					Pos:    int32(i),                                      //nolint:gosec
+					Packed: p,
+					Pos:    int32(i), //nolint:gosec
 				}
+				if i > 0 && p < prev {
+					sorted = false
+				}
+				prev = p
 			}
-			slices.SortFunc(idx, func(a, b RefIndexEntry) int { return cmp.Compare(a.Packed, b.Packed) })
+			if !sorted {
+				slices.SortFunc(idx, func(a, b RefIndexEntry) int { return cmp.Compare(a.Packed, b.Packed) })
+			}
 			col.refIndex = idx
 		case IntrinsicFormatDict:
 			total := 0
@@ -39,15 +55,31 @@ func (col *IntrinsicColumn) EnsureRefIndex() {
 				total += len(e.BlockRefs)
 			}
 			idx := make([]RefIndexEntry, 0, total)
+			// NOTE-168: same ascending-order detection for the dict path. Each dict entry's
+			// BlockRefs are emitted in row order, but entries interleave across the column,
+			// so the concatenation is rarely globally sorted — the check is a cheap O(N)
+			// scan that costs one comparison per entry and only skips the sort when it is
+			// genuinely already ordered (e.g. single-value dict columns).
+			sorted := true
+			var prev uint32
+			first := true
 			for entryIdx, entry := range col.DictEntries {
 				for _, ref := range entry.BlockRefs {
+					p := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx) //nolint:gosec
 					idx = append(idx, RefIndexEntry{
-						Packed: uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx), //nolint:gosec
-						Pos:    int32(entryIdx),                               //nolint:gosec
+						Packed: p,
+						Pos:    int32(entryIdx), //nolint:gosec
 					})
+					if !first && p < prev {
+						sorted = false
+					}
+					prev = p
+					first = false
 				}
 			}
-			slices.SortFunc(idx, func(a, b RefIndexEntry) int { return cmp.Compare(a.Packed, b.Packed) })
+			if !sorted {
+				slices.SortFunc(idx, func(a, b RefIndexEntry) int { return cmp.Compare(a.Packed, b.Packed) })
+			}
 			col.refIndex = idx
 		}
 	})

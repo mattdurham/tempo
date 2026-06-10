@@ -752,3 +752,36 @@ check covers the whole run; the inner loops read the same byte offsets and produ
 caller's pre-sized backing (NOTE-145/152), so no extra allocation is introduced.
 
 Back-ref: `internal/modules/blockio/shared/intrinsic_codec.go:appendVariableWidthRefs,appendDeltaUint64Page,appendXORBytesPage,DecodeIntrinsicColumnBlob,decodeLegacyDictBlob`
+
+---
+
+## NOTE-168: EnsureRefIndex — skip the sort when packed refs are already ascending
+
+*Added: 2026-06-10*
+
+`IntrinsicColumn.EnsureRefIndex` builds a sorted-by-`Packed`-ref lookup table once (sync.Once)
+for O(log N) reverse lookup. It did this with an unconditional
+`slices.SortFunc(idx, func(a,b) { cmp.Compare(a.Packed, b.Packed) })`. After NOTE-167 retired the
+merge-join `sort.Search`, the residual sort cost on this path surfaced in the querier CPU profile
+(reached via `slices.partitionCmpFunc` / `slices.partitionOrdered`, driven by the per-comparison
+comparator closure).
+
+**Key invariant:** for `IntrinsicFormatFlat` / `IntrinsicFormatXORBytes` / `IntrinsicFormatDeltaUint64`
+columns, `BlockRefs` is emitted in row order during decode (`appendVariableWidthRefs`). Within a
+single block `RowIdx` rises monotonically and `BlockIdx` is constant, so the packed key
+(`BlockIdx<<16 | RowIdx`) is already in ascending order for the dominant single-block decode case
+(`span:start`, `trace:id`, `span:id` on M1/M4). Multi-block merged columns keep `BlockIdx` in the
+high 16 bits, so they too stay ascending whenever blocks are appended in index order.
+
+**Fix:** build the `RefIndexEntry` keys and detect ascending order in the **same pass** (one extra
+`p < prev` comparison per entry, no allocation). When the keys are already monotonic, skip
+`slices.SortFunc` entirely — the result is identical because the input is already the sorted output.
+When not monotonic (e.g. interleaved dict entries, out-of-order block merges), fall back to the
+existing `slices.SortFunc`, so correctness is unchanged for every input.
+
+**Why correct:** the slice content (`{Packed, Pos}` pairs) is identical to the old code; only the
+sort is conditionally skipped, and only when a single O(N) scan has proven the slice is already in
+the exact order `slices.SortFunc` would produce. Binary-search consumers (`lookupRefIdx`,
+`BlockRefRange`, `LookupRefFast*`) see the same sorted index in both branches.
+
+Back-ref: `internal/modules/blockio/shared/intrinsic_ref_index.go:EnsureRefIndex`
