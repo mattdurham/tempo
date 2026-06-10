@@ -1078,13 +1078,8 @@ func decodeLegacyFlatBlob(raw []byte, pos int, colType ColumnType, rowCount int,
 	}
 	// Refs parallel to values, using variable-width encoding.
 	col.BlockRefs = make([]BlockRef, 0, rowCount)
-	for range rowCount {
-		ref, newPos, err := decodeVariableWidthRef(raw, pos, blockW, rowW)
-		if err != nil {
-			return fmt.Errorf("DecodeIntrinsicColumnBlob: truncated at refs")
-		}
-		col.BlockRefs = append(col.BlockRefs, ref)
-		pos = newPos
+	if _, err := appendVariableWidthRefs(raw, pos, blockW, rowW, rowCount, &col.BlockRefs); err != nil {
+		return fmt.Errorf("DecodeIntrinsicColumnBlob: truncated at refs")
 	}
 	return nil
 }
@@ -1130,49 +1125,78 @@ func decodeLegacyDictBlob(raw []byte, pos int, colType ColumnType, rowCount int,
 		refCount := int(binary.LittleEndian.Uint32(raw[pos:]))
 		pos += 4
 		entry.BlockRefs = make([]BlockRef, 0, refCount)
-		for range refCount {
-			ref, newPos, err := decodeVariableWidthRef(raw, pos, blockW, rowW)
-			if err != nil {
-				return fmt.Errorf("DecodeIntrinsicColumnBlob: truncated at dict refs")
-			}
-			entry.BlockRefs = append(entry.BlockRefs, ref)
-			pos = newPos
+		newPos, err := appendVariableWidthRefs(raw, pos, blockW, rowW, refCount, &entry.BlockRefs)
+		if err != nil {
+			return fmt.Errorf("DecodeIntrinsicColumnBlob: truncated at dict refs")
 		}
+		pos = newPos
 		col.DictEntries = append(col.DictEntries, entry)
 	}
 	return nil
 }
 
-// decodeVariableWidthRef decodes a single BlockRef using variable-width block/row index encoding.
-// Returns the decoded ref, updated position, and any bounds error.
-func decodeVariableWidthRef(raw []byte, pos, blockW, rowW int) (BlockRef, int, error) {
-	// BUG-13 fix: blockW and rowW must each be 1 or 2 — any other value
-	// indicates a corrupt column header. Reject early rather than producing
-	// silently wrong BlockRef values.
+// appendVariableWidthRefs decodes a contiguous run of `count` variable-width
+// BlockRefs starting at raw[pos] and appends them to *dst, returning the new
+// position after the last ref.
+//
+// NOTE-163: this is the batch form of decodeVariableWidthRef, which was called
+// once per row across all four intrinsic decode paths (appendDeltaUint64Page,
+// appendXORBytesPage, the v1 flat/delta tail, and the v1 legacy dict tail). The
+// per-call form re-validated blockW/rowW and re-derived refSize on every single
+// row, and the (blockW==1?:) / (rowW==1?:) width branches were re-evaluated per
+// row even though both widths are constant for the entire page. A querier CPU
+// profile (2026-06-10) showed decodeVariableWidthRef at ~0.44% self time on the
+// hot delta/XOR decode paths (span:start, trace:id, span:id), which dominate the
+// residual M1/M4 decode cost. Hoisting the width validation + bounds check out of
+// the loop and specialising the inner loop per width combination removes those
+// redundant per-row branches; the four combinations are unrolled by hand so the
+// compiler emits a flat copy-and-advance loop with no per-iteration width test.
+//
+// The total refs section is exactly count*(blockW+rowW) bytes, so a single
+// up-front bounds check replaces count separate checks. Behavior is identical to
+// calling decodeVariableWidthRef count times.
+func appendVariableWidthRefs(raw []byte, pos, blockW, rowW, count int, dst *[]BlockRef) (int, error) {
 	if (blockW != 1 && blockW != 2) || (rowW != 1 && rowW != 2) {
-		return BlockRef{}, pos, fmt.Errorf("invalid ref width: blockW=%d rowW=%d", blockW, rowW)
+		return pos, fmt.Errorf("invalid ref width: blockW=%d rowW=%d", blockW, rowW)
 	}
 	refSize := blockW + rowW
-	if pos+refSize > len(raw) {
-		return BlockRef{}, pos, fmt.Errorf("truncated ref")
+	end := pos + count*refSize
+	if end > len(raw) {
+		return pos, fmt.Errorf("truncated ref")
 	}
-	var blockIdx uint16
-	if blockW == 1 {
-		blockIdx = uint16(raw[pos])
-		pos++
-	} else {
-		blockIdx = binary.LittleEndian.Uint16(raw[pos:])
-		pos += 2
+	refs := *dst
+	switch {
+	case blockW == 1 && rowW == 1:
+		for ; pos < end; pos += 2 {
+			refs = append(refs, BlockRef{
+				BlockIdx: uint16(raw[pos]),
+				RowIdx:   uint16(raw[pos+1]),
+			})
+		}
+	case blockW == 1 && rowW == 2:
+		for ; pos < end; pos += 3 {
+			refs = append(refs, BlockRef{
+				BlockIdx: uint16(raw[pos]),
+				RowIdx:   binary.LittleEndian.Uint16(raw[pos+1:]),
+			})
+		}
+	case blockW == 2 && rowW == 1:
+		for ; pos < end; pos += 3 {
+			refs = append(refs, BlockRef{
+				BlockIdx: binary.LittleEndian.Uint16(raw[pos:]),
+				RowIdx:   uint16(raw[pos+2]),
+			})
+		}
+	default: // blockW == 2 && rowW == 2
+		for ; pos < end; pos += 4 {
+			refs = append(refs, BlockRef{
+				BlockIdx: binary.LittleEndian.Uint16(raw[pos:]),
+				RowIdx:   binary.LittleEndian.Uint16(raw[pos+2:]),
+			})
+		}
 	}
-	var rowIdx uint16
-	if rowW == 1 {
-		rowIdx = uint16(raw[pos])
-		pos++
-	} else {
-		rowIdx = binary.LittleEndian.Uint16(raw[pos:])
-		pos += 2
-	}
-	return BlockRef{BlockIdx: blockIdx, RowIdx: rowIdx}, pos, nil
+	*dst = refs
+	return pos, nil
 }
 
 // appendXORBytesPage decodes a single XOR-encoded bytes page blob (already snappy-decoded)
@@ -1222,13 +1246,8 @@ func appendXORBytesPage(raw []byte, blockW, rowW, rowCount int, dst *IntrinsicCo
 	// Refs section: rowCount × refSize bytes after all values. The decode loop above has
 	// advanced pos to exactly valBytes + 4*rowCount = the refs start (validated by the
 	// pre-scan), so no bounds re-check is needed here.
-	for range rowCount {
-		ref, newPos, err := decodeVariableWidthRef(raw, pos, blockW, rowW)
-		if err != nil {
-			return fmt.Errorf("decodeXORBytesPage refs: %w", err)
-		}
-		dst.BlockRefs = append(dst.BlockRefs, ref)
-		pos = newPos
+	if _, err := appendVariableWidthRefs(raw, pos, blockW, rowW, rowCount, &dst.BlockRefs); err != nil {
+		return fmt.Errorf("decodeXORBytesPage refs: %w", err)
 	}
 	dst.Count += uint32(rowCount) //nolint:gosec
 	return nil
@@ -1259,13 +1278,8 @@ func appendDeltaUint64Page(raw []byte, blockW, rowW, rowCount int, dst *Intrinsi
 		pos += n
 	}
 
-	for range rowCount {
-		ref, newPos, err := decodeVariableWidthRef(raw, pos, blockW, rowW)
-		if err != nil {
-			return fmt.Errorf("decodeDeltaUint64Page refs: %w", err)
-		}
-		dst.BlockRefs = append(dst.BlockRefs, ref)
-		pos = newPos
+	if _, err := appendVariableWidthRefs(raw, pos, blockW, rowW, rowCount, &dst.BlockRefs); err != nil {
+		return fmt.Errorf("decodeDeltaUint64Page refs: %w", err)
 	}
 	dst.Count += uint32(rowCount) //nolint:gosec
 	return nil

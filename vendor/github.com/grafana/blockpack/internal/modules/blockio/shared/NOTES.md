@@ -721,3 +721,34 @@ I/O/cache bound (page-cache memcached crashlooping) so the microbench is authori
 (NOTE-143/148/149/150/151 precedent).
 
 Back-ref: `internal/modules/blockio/shared/intrinsic_codec.go:decodePagedColumnBlob,decodeDictPagesArena,forEachDictPageValue`
+
+---
+
+## NOTE-163: batch variable-width ref decode (appendVariableWidthRefs)
+
+**Problem:** `decodeVariableWidthRef` was called once per row across all four intrinsic
+ref-decode loops — `appendDeltaUint64Page` (span:start, hundreds of pages), `appendXORBytesPage`
+(trace:id / span:id), the v1 flat/delta tail in `DecodeIntrinsicColumnBlob`, and the v1 legacy
+dict tail in `decodeLegacyDictBlob`. Each call:
+- re-validated `blockW`/`rowW` (BUG-13 guard) even though both are page-constant,
+- re-derived `refSize`,
+- re-evaluated the `blockW==1?` / `rowW==1?` width branches per row,
+- did a per-row `pos+refSize > len(raw)` bounds check.
+
+A querier CPU profile (2026-06-10) put `decodeVariableWidthRef` at ~0.44% self time on the hot
+delta/XOR decode paths, which carry the residual M1/M4 decode cost (~27% of querier allocs are on
+`DecodeIntrinsicColumnBlob`).
+
+**Fix:** `appendVariableWidthRefs(raw, pos, blockW, rowW, count, *[]BlockRef)` validates widths
+once, does a single up-front bounds check (`pos + count*refSize`), then dispatches on the width
+combination **once** and runs a tight unrolled copy-and-advance loop per combination. The four
+combinations (1+1, 1+2, 2+1, 2+2) each get a flat loop with no per-iteration width test. Behavior
+is byte-identical to calling `decodeVariableWidthRef` `count` times; the single-ref form is removed
+(its only remaining users were tests, which now exercise the batch form's BUG-13 validation).
+
+**Why correct:** the refs section is exactly `count*(blockW+rowW)` contiguous bytes, so one bounds
+check covers the whole run; the inner loops read the same byte offsets and produce the same
+`BlockRef{BlockIdx, RowIdx}` values as the old per-row branch ladder. The slice is grown via the
+caller's pre-sized backing (NOTE-145/152), so no extra allocation is introduced.
+
+Back-ref: `internal/modules/blockio/shared/intrinsic_codec.go:appendVariableWidthRefs,appendDeltaUint64Page,appendXORBytesPage,DecodeIntrinsicColumnBlob,decodeLegacyDictBlob`
