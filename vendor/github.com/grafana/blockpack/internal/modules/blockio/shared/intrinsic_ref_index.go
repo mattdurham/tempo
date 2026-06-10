@@ -11,6 +11,54 @@ import (
 	"slices"
 )
 
+// radixSortRefIndex sorts idx in ascending Packed order using an LSD radix sort over the
+// 32-bit Packed key (NOTE-174). This replaces the comparator-closure-driven
+// slices.SortFunc(cmp.Compare(a.Packed, b.Packed)) used on the unsorted fallback path
+// (interleaved multi-value dict columns, out-of-order block merges). The querier CPU
+// profile showed that fallback reaching slices.pdqsortCmpFunc / slices.partitionCmpFunc —
+// the per-comparison comparator closure was ~5% of querier CPU on group-by histogram and
+// rate-by queries. A radix sort is O(N) over a fixed 4-byte key with no comparator
+// indirection, so it removes the comparison-sort cost entirely.
+//
+// Four counting passes (one per byte, least significant first) produce a stable ascending
+// order on the full 32-bit key. The result is byte-for-byte identical to slices.SortFunc
+// because both order solely by Packed; ties keep an arbitrary-but-consistent order, which
+// the binary-search consumers (lookupRefIdx, BlockRefRange, LookupRefFast*) do not depend on.
+func radixSortRefIndex(idx []RefIndexEntry) {
+	const radixBits = 8
+	const radixSize = 1 << radixBits
+	const radixMask = radixSize - 1
+	n := len(idx)
+	if n < 2 {
+		return
+	}
+	buf := make([]RefIndexEntry, n)
+	src, dst := idx, buf
+	var counts [radixSize]int
+	for shift := 0; shift < 32; shift += radixBits {
+		for i := range counts {
+			counts[i] = 0
+		}
+		for i := range src {
+			counts[(src[i].Packed>>shift)&radixMask]++
+		}
+		// Prefix sum: counts[b] becomes the start offset of bucket b in dst.
+		sum := 0
+		for b := range counts {
+			c := counts[b]
+			counts[b] = sum
+			sum += c
+		}
+		for i := range src {
+			b := (src[i].Packed >> shift) & radixMask
+			dst[counts[b]] = src[i]
+			counts[b]++
+		}
+		src, dst = dst, src
+	}
+	// After 4 (even) passes src == idx, so no final copy is needed.
+}
+
 // EnsureRefIndex builds a sorted-by-packed-ref lookup index into this column, enabling
 // O(log N) reverse lookup via the typed accessor methods. Safe to call concurrently —
 // the index is built at most once (sync.Once). No-op if already built or col is nil.
@@ -46,7 +94,7 @@ func (col *IntrinsicColumn) EnsureRefIndex() {
 				prev = p
 			}
 			if !sorted {
-				slices.SortFunc(idx, func(a, b RefIndexEntry) int { return cmp.Compare(a.Packed, b.Packed) })
+				radixSortRefIndex(idx)
 			}
 			col.refIndex = idx
 		case IntrinsicFormatDict:
@@ -78,7 +126,7 @@ func (col *IntrinsicColumn) EnsureRefIndex() {
 				}
 			}
 			if !sorted {
-				slices.SortFunc(idx, func(a, b RefIndexEntry) int { return cmp.Compare(a.Packed, b.Packed) })
+				radixSortRefIndex(idx)
 			}
 			col.refIndex = idx
 		}

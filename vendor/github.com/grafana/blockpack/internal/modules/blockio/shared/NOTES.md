@@ -786,6 +786,41 @@ the exact order `slices.SortFunc` would produce. Binary-search consumers (`looku
 
 Back-ref: `internal/modules/blockio/shared/intrinsic_ref_index.go:EnsureRefIndex`
 
+## NOTE-174: EnsureRefIndex — LSD radix sort for the unsorted fallback
+
+*Added: 2026-06-10*
+
+NOTE-168 made `EnsureRefIndex` skip the sort when the packed-ref keys are already ascending
+(the single-block flat/delta case). The residual cost is the *fallback* path taken when the
+keys are **not** monotonic — interleaved multi-value dict columns (the dominant case for
+`rate() by (...)` / `histogram_over_time(...) by (...)` group-by queries, where each dict
+entry's row-sorted `BlockRefs` are concatenated across entries) and out-of-order block
+merges. That fallback called
+`slices.SortFunc(idx, func(a,b){ cmp.Compare(a.Packed,b.Packed) })`.
+
+**Problem:** a fresh querier CPU profile (2026-06-10, 30m) attributed ~5.1% of total querier
+CPU to `EnsureRefIndex.func1` reaching `slices.pdqsortCmpFunc` / `slices.partitionCmpFunc`.
+The cost is the per-comparison comparator **closure indirection** of `SortFunc` on top of the
+O(N log N) comparison count — `pdqsortCmpFunc` was measurably more expensive than the
+closure-free `pdqsortOrdered` in the same profile.
+
+**Fix:** `radixSortRefIndex` — an LSD radix sort over the fixed 32-bit `Packed` key (4
+counting passes of 256 buckets, least-significant byte first). O(N) with no comparator
+indirection, so it removes the comparison-sort cost entirely. One scratch buffer is allocated
+per call; since the index is built at most once per column under `sync.Once`, the allocation
+is amortized away and far cheaper than the repeated closure calls it replaces.
+
+**Why correct:** both the radix sort and `slices.SortFunc` order solely by `Packed`. Four
+(even) passes leave the result back in the original slice (no final copy). Ties on `Packed`
+keep an arbitrary-but-consistent order; the binary-search consumers (`lookupRefIdx`,
+`BlockRefRange`, `LookupRefFast*`) locate by `Packed` only and never depend on tie order.
+Verified Packed-order-identical to `slices.SortFunc` over 2000 random trials plus edge cases
+(empty, single, all-equal, sorted, reverse-sorted, extreme 0/0x80000000/0xFFFFFFFF keys);
+`go test -race ./blockio/shared` and `./executor` green. Microbench (20k interleaved entries):
+1680µs SortFunc → 489µs radix = 3.4x faster.
+
+Back-ref: `internal/modules/blockio/shared/intrinsic_ref_index.go:radixSortRefIndex`
+
 ## NOTE-169: appendDeltaUint64Page — single-byte uvarint fast path, index-based store
 
 *Added: 2026-06-10*
