@@ -12,10 +12,12 @@ package reader
 // zero (never accessed by parseBlockColumnsReuse when wantColumns is set).
 
 import (
+	"cmp"
 	"fmt"
 	"log/slog"
 	"runtime"
 	"runtime/debug"
+	"slices"
 	"sync"
 
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
@@ -33,6 +35,14 @@ const tocHintBytes = 4096
 // column-metadata array overflows the current read (NOTE-154). Real trace blocks
 // routinely carry hundreds of attribute columns whose metadata exceeds tocHintBytes.
 const tocGrowthFactor = 4
+
+// colCoalesceMaxGap is the largest run of unwanted bytes that may be folded into a single
+// coalesced Phase-2 cold read (NOTE-173). Adjacent wanted columns separated by at most this
+// many bytes are read in one provider call rather than two. The dominant cold-path cost is
+// per-read connection establishment, not transferred bytes, so tolerating a modest gap to
+// save a round-trip is a net win; the cap stops two distant columns from pulling a huge
+// span of unrelated data through the backend.
+const colCoalesceMaxGap = 64 * 1024
 
 // ReadGroupColumnar fetches only the bytes for wantColumns within each block in cr.
 //
@@ -266,7 +276,16 @@ func (r *Reader) readBlockColumnarWithCache(
 	assembled := make([]byte, bufSize)
 	copy(assembled, toc[:min(int64(len(toc)), int64(tocEnd))]) //nolint:gosec
 
-	// Phase 2: one cached fetch per needed column.
+	// NOTE-173: Phase-2 coalesced cold fetch. Previously every wanted column that missed
+	// the section cache issued its own r.provider.ReadAt — one ranged GET per column. A
+	// heavy metrics query touches dozens of small columns across hundreds of cold blocks,
+	// and each ReadAt acquires/establishes a backend (S3) connection. A querier CPU
+	// profile is dominated by connection setup (kernel __inet_hash_connect /
+	// __inet_check_established + TLS handshake crypto), i.e. round-trip count, not bytes.
+	// planColdRuns groups the cold columns into a few coalesced runs read once each.
+	runs := r.planColdRuns(metas, wantColumns, blockLen, int64(len(toc)))
+
+	// Phase 2: one cached fetch per needed column; cold misses share the coalesced read.
 	for _, m := range metas {
 		if _, ok := wantColumns[m.name]; !ok || m.compressedLen == 0 {
 			continue
@@ -289,11 +308,13 @@ func (r *Reader) readBlockColumnarWithCache(
 					copy(cp, toc[colStart:colStart+colLen])
 					return cp, nil
 				}
-				buf := make([]byte, colLen)
-				if _, readErr := r.provider.ReadAt(buf, blockOff+colStart, rw.DataTypeBlock); readErr != nil {
-					return nil, fmt.Errorf("col %q: %w", m.name, readErr)
+				rn, err := runs.ensure(r, blockOff, colStart)
+				if err != nil {
+					return nil, fmt.Errorf("col %q: %w", m.name, err)
 				}
-				return buf, nil
+				cp := make([]byte, colLen)
+				copy(cp, rn.buf[colStart-rn.start:colStart-rn.start+colLen])
+				return cp, nil
 			},
 		)
 		if fetchErr != nil {
@@ -303,6 +324,83 @@ func (r *Reader) readBlockColumnarWithCache(
 	}
 
 	return assembled, nil
+}
+
+// coldRun is one coalesced byte span of cold (cache-missing) column data within a block,
+// read from the provider once and shared by every column that falls inside it (NOTE-173).
+// Field order is chosen to minimize the GC pointer-scan range (fieldalignment).
+type coldRun struct {
+	err   error
+	buf   []byte // populated on first cold miss within the run
+	start int64  // file-relative offset of the run
+	end   int64  // exclusive
+}
+
+// coldRuns is the set of coalesced cold-read runs for one block, sorted ascending by start.
+type coldRuns []coldRun
+
+// planColdRuns builds the coalesced cold-read runs for a block: it collects the (start,end)
+// ranges of every wanted column whose data lies past the already-cached ToC, sorts them by
+// start, and merges ranges separated by at most colCoalesceMaxGap unwanted bytes into runs.
+// Sorting makes run construction independent of the metadata array's column ordering, so
+// coldRuns.ensure always finds a run that fully covers any cold column's range. Columns that
+// fit within the ToC, fall outside the block, or are absent are skipped.
+func (r *Reader) planColdRuns(
+	metas []colMetaEntry,
+	wantColumns map[string]struct{},
+	blockLen, tocLen int64,
+) coldRuns {
+	type byteRange struct{ start, end int64 }
+	var ranges []byteRange
+	for _, m := range metas {
+		if _, ok := wantColumns[m.name]; !ok || m.compressedLen == 0 {
+			continue
+		}
+		colStart := int64(m.dataOffset)  //nolint:gosec
+		colLen := int64(m.compressedLen) //nolint:gosec
+		if colStart+colLen > blockLen {
+			continue
+		}
+		// Only columns whose data extends past the cached ToC require a provider read.
+		if colStart+colLen <= tocLen {
+			continue
+		}
+		ranges = append(ranges, byteRange{start: colStart, end: colStart + colLen})
+	}
+	slices.SortFunc(ranges, func(a, b byteRange) int { return cmp.Compare(a.start, b.start) })
+	var runs coldRuns
+	for _, rg := range ranges {
+		if n := len(runs); n > 0 && rg.start-runs[n-1].end <= colCoalesceMaxGap {
+			// Merge into the current run (handles overlap and small gaps).
+			if rg.end > runs[n-1].end {
+				runs[n-1].end = rg.end
+			}
+			continue
+		}
+		runs = append(runs, coldRun{start: rg.start, end: rg.end})
+	}
+	return runs
+}
+
+// ensure reads (once) the coalesced run containing offset colStart and returns it. The first
+// missing column in a run triggers its provider read; subsequent misses in the same run reuse
+// the buffer. blockOff is the block's file-relative base offset.
+func (runs coldRuns) ensure(r *Reader, blockOff, colStart int64) (*coldRun, error) {
+	for i := range runs {
+		if colStart >= runs[i].start && colStart < runs[i].end {
+			rn := &runs[i]
+			if rn.buf == nil && rn.err == nil {
+				buf := make([]byte, rn.end-rn.start)
+				if _, readErr := r.provider.ReadAt(buf, blockOff+rn.start, rw.DataTypeBlock); readErr != nil {
+					rn.err = readErr
+				} else {
+					rn.buf = buf
+				}
+			}
+			return rn, rn.err
+		}
+	}
+	return nil, fmt.Errorf("no coalesced run covers offset %d", colStart)
 }
 
 // readSufficientToC reads the block ToC (header + column-metadata array) starting at

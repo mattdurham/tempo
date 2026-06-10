@@ -858,3 +858,37 @@ sibling blocks' results from being lost when one block panicked, which is moot w
 block (a genuine panic now propagates up the call stack exactly as it would have when only one
 block was being read). Output map shape is byte-for-byte identical to the parallel path's output
 for a one-element `cr.BlockIDs`.
+
+## NOTE-173: coalesced Phase-2 cold column reads in readBlockColumnarWithCache — 2026-06-10
+
+**Decision:** `readBlockColumnarWithCache` Phase 2 (SPEC-005) issued one `r.provider.ReadAt`
+per wanted column that missed the section cache — i.e. one ranged backend (S3) GET per cold
+column. A heavy metrics query touches dozens of small columns across hundreds of cold blocks,
+so cold blocks produced dozens of tiny reads each. A querier CPU profile (2026-06-10,
+dev-test-03) is dominated by *connection establishment*, not transferred bytes: kernel
+`__inet_hash_connect` (~6.5%), `__inet_check_established` (~12.6%), `tcp_twsk_unique`, plus TLS
+handshake crypto (`bigmod`/`mlkem`/`edwards25519`/`gcmAesDec`) and `Syscall6` (~19%). That is
+the per-read round-trip / connection cost — the classic "fewer fetches, not cheaper compute"
+lever the prior status.log entries kept identifying as the only thing that moves wall-clock.
+
+**Mechanism:** `planColdRuns` gathers the `(start,end)` ranges of every wanted column whose
+data lies past the already-cached ToC, sorts them by offset, and merges ranges separated by at
+most `colCoalesceMaxGap` (64 KiB) unwanted bytes into a small set of coalesced runs. Each run is
+read from the provider exactly once, lazily, on the first cold-miss fetch closure that lands in
+it (`coldRuns.ensure`); every column in that run then slices its compressed blob out of the
+shared buffer. The cap stops two distant columns from pulling a huge span of unrelated data.
+
+**Safety / cache semantics unchanged:** per-column section-cache granularity is preserved — the
+`GetOrFetchV8Section` key is still `blockIdx/colName`, so warm queries still pay one cache hit
+per column and **never** trigger a coalesced provider read (a fully-warm block issues zero
+reads, exactly as before). Only the cold path is affected: N small `ReadAt`s become a handful of
+larger ones. The assembled buffer is byte-for-byte identical — each column's bytes still land at
+their original absolute offset. Sorting the ranges makes run construction independent of the
+metadata array's column ordering, so `ensure` always finds a run that fully covers a column.
+
+**Verification:** existing reader + executor suites pass under `-race`, including
+`TestReadGroupColumnar`, `TestReadGroup_IOFailure`, and `TestNOTE154_AdaptiveToCReadsAllColumns`
+(which asserts the columnar Phase-2 path is taken and provider read-bytes stay far below the full
+block size — still true: coalescing reads the wanted-column span plus small gaps, not the block).
+`make precommit` fully green (gofumpt, golines, golangci-lint incl gocyclo + fieldalignment,
+deadcode, staticcheck).
