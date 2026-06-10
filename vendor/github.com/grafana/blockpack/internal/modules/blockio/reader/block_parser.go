@@ -142,6 +142,51 @@ func parseColumnMetadataArray(data []byte, offset, colCount int) ([]colMetaEntry
 // buffer is safe to reuse for the next column in the same parse call.
 var decompBufPool = sync.Pool{New: func() any { b := make([]byte, 0, 256<<10); return &b }}
 
+// NOTE-153: lazyColumnStore (NOTE-002) is a per-block []Column arena sized to the column count,
+// allocated fresh on every WantOnly parse. A 2026-06-09 querier alloc_space profile showed this
+// single make([]Column, 0, len(metas)) as the largest allocator (~21% / 29 GB) on the metrics
+// block-scan path (attribute group-by queries, e.g. M6 rate() by span.http.request.method): the
+// arena holds Column structs for *non-wanted* columns that exist only so a caller *could* lazily
+// decode them, but the two-pass WantOnly path only ever touches wanted columns (plus a lazy
+// span:start on v3 files, decoded inside the row loop). Pool the backing array; the caller returns
+// it via Block.ReleaseLazyColumnStore once the block is fully scanned. Entries are zeroed on
+// release so retained compressedEncoding sub-slices (which alias rawBytes) cannot keep large block
+// buffers alive through the pool, and any lazily-decoded slices are dropped for GC.
+var lazyColumnStorePool = sync.Pool{New: func() any { s := make([]Column, 0, 64); return &s }}
+
+// acquireLazyColumnStore returns a pooled *[]Column whose slice has length 0 and capacity ≥ n.
+func acquireLazyColumnStore(n int) *[]Column {
+	p, _ := lazyColumnStorePool.Get().(*[]Column)
+	if cap(*p) < n {
+		*p = make([]Column, 0, n)
+	} else {
+		*p = (*p)[:0]
+	}
+	return p
+}
+
+// ReleaseLazyColumnStore returns the block's lazy-column arena to the shared pool.
+//
+// NOTE-153 SAFETY: call only after the block is fully consumed — i.e. after every row has been
+// scanned and no lazy (non-wanted) column will be accessed again. Eagerly-decoded (wanted)
+// columns are unaffected: their decoded data is owned by Column structs that the columns map
+// references directly, not by this arena (the arena holds only lazily-registered columns).
+// Entries are zeroed before Put so the pool retains no references to rawBytes (via
+// compressedEncoding) or to any lazily-decoded dict/idx slices. Idempotent; nil-safe.
+func (b *Block) ReleaseLazyColumnStore() {
+	if b == nil || b.lazyStorePtr == nil {
+		return
+	}
+	s := *b.lazyStorePtr
+	for i := range s {
+		s[i] = Column{}
+	}
+	*b.lazyStorePtr = s[:0]
+	lazyColumnStorePool.Put(b.lazyStorePtr)
+	b.lazyStorePtr = nil
+	b.lazyColumnStore = nil
+}
+
 func parseBlockColumnsReuse(
 	rawBytes []byte,
 	wantColumns map[string]struct{},
@@ -268,8 +313,10 @@ func parseBlockColumnsReuse(
 	// replaces N individual *Column heap allocations. Pointers into the slice are stable
 	// because capacity is fixed upfront and append never reallocates.
 	var lazyStore []Column
+	var lazyStorePtr *[]Column // NOTE-153: pool handle, returned via ReleaseLazyColumnStore
 	if wantColumns != nil {
-		lazyStore = make([]Column, 0, len(metas))
+		lazyStorePtr = acquireLazyColumnStore(len(metas))
+		lazyStore = *lazyStorePtr
 		for _, m := range metas {
 			if _, wanted := wantColumns[m.name]; wanted {
 				continue // already eagerly decoded
@@ -316,12 +363,16 @@ func parseBlockColumnsReuse(
 			// Safe: cap was set to len(metas) and we append ≤ len(metas) items, so no realloc.
 			columns[key] = &lazyStore[len(lazyStore)-1]
 		}
+		// NOTE-153: write the (possibly grown) slice header back to the pool handle so the
+		// pooled backing array — and the &lazyStore[i] pointers stored in columns — stay valid.
+		*lazyStorePtr = lazyStore
 	}
 
 	blk := &Block{
 		spanCount:       spanCount,
 		columns:         columns,
 		lazyColumnStore: lazyStore,
+		lazyStorePtr:    lazyStorePtr,
 		meta:            meta,
 	}
 	blk.buildNameIndex()

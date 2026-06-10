@@ -761,3 +761,43 @@ Both `TopKMatchAt` and `FuseContainsAt` use an early-exit `break` on `bIdx > blo
 `presentMap` is always sorted ascending (built in blockIdx order by `parseColumnPresence`).
 
 **Back-ref:** `internal/modules/blockio/reader/sketch_index.go:DistinctAt,TopKMatchAt,FuseContainsAt`
+
+---
+
+## NOTE-153: pool the WantOnly lazy-column arena (lazyColumnStore) — 2026-06-09
+
+**Decision:** `parseBlockColumnsReuse` registers every *non-wanted* column of a block into a
+per-block `[]Column` arena (`lazyColumnStore`, NOTE-002) so a caller *could* later lazily decode
+one. On the WantOnly path this arena is `make([]Column, 0, len(metas))` on every parse. A querier
+`alloc_space` profile (2026-06-09, dev-test-03) showed this single allocation as the largest
+allocator on the metrics block-scan path — **~21% / 29 GB**, `block_parser.go` line for the
+`make([]Column…)` — dominated by attribute group-by queries (e.g. M6
+`{span.kind=server} | rate() by (span.http.request.method)`), whose group-by column is a V14
+block column (not intrinsic) so they go through `ParseBlockFromBytes` + `traceAccumulateRow`.
+
+The arena's entries are pure overhead for that path: the two-pass WantOnly scan only ever touches
+*wanted* columns (predicate pass → predicateCols, output pass → outputCols), plus a possible lazy
+`span:start` on v3 files which is decoded **inside** the row loop. So the arena can be returned to
+a `sync.Pool` once the block is fully scanned.
+
+**Mechanism:**
+- `lazyColumnStorePool` (`sync.Pool` of `*[]Column`) + `acquireLazyColumnStore(n)` (len 0, cap ≥ n).
+- `Block.lazyStorePtr` holds the pool handle; nil when the arena was not pooled (WantAll path
+  registers no lazy columns, so `wantColumns == nil` skips the block entirely).
+- `(*Block).ReleaseLazyColumnStore()` zeroes every `Column` in the arena before `Put`, so the pool
+  retains no reference to `rawBytes` (via `compressedEncoding` sub-slices) nor to any
+  lazily-decoded dict/idx slices. Idempotent and nil-safe.
+- Callers: `metrics_trace.go` releases after each block in both the single-pass (`predicateCols==nil`)
+  and two-pass paths (first/predicate block after `releaseBlockColumnProvider`; second/output block
+  after the accumulate loop; rejected `Size()==0` and error paths too).
+
+**Safety:** release happens only after the block is fully consumed and after the column provider
+(which references the block's eager columns) is released. Other WantOnly callers that do not release
+simply fall back to `Pool.New` (a fresh alloc) — no correctness dependency on releasing.
+
+**Verification:** `BenchmarkParseBlockWantOnly_LazyStorePool` (200-span block): NoRelease
+40.5 KB/op, 35 allocs/op → WithRelease 7.7 KB/op, 33 allocs/op (**−81% bytes/op**, ~2× faster).
+`TestNOTE153_LazyStorePoolReuseCorrect` parses two files with different lazy-column values through
+the WantOnly path, releases the first arena, then parses the second (reusing the pooled arena) and
+asserts each decodes to its own values — catches stale `compressedEncoding`/dict aliasing across
+pool reuse. Full reader + executor suites pass under `-race`.

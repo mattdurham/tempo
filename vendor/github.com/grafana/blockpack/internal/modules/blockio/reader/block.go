@@ -339,6 +339,11 @@ type Block struct {
 	// Pointers into this slice (stored in columns map) are stable because the slice
 	// is sized to exact capacity before any appends — no reallocation ever occurs.
 	lazyColumnStore []Column
+	// NOTE-153: lazyStorePtr is the pool handle for lazyColumnStore's backing array. When
+	// parseBlockColumnsReuse sourced lazyColumnStore from lazyColumnStorePool, this holds the
+	// *[]Column so ReleaseLazyColumnStore can return it. nil when the arena was not pooled
+	// (e.g. WantAll path, where no lazy columns are registered).
+	lazyStorePtr *[]Column
 	// iterFields is the pre-computed deduplicated column iteration list, built by
 	// BuildIterFields. When non-nil, IterateFields uses this slice directly — zero allocs.
 	// NOTE-049: see blockio/NOTES.md §49.

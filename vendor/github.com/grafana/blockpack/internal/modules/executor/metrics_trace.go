@@ -196,6 +196,9 @@ func ExecuteTraceMetrics(
 					for rowIdx := range int(meta.SpanCount) {
 						traceAccumulateRow(r, blockIdx, bwb.Block, rowIdx, querySpec, buckets, attrVals)
 					}
+					// NOTE-153: block fully scanned (incl. any lazy span:start decode above);
+					// return the lazy-column arena to the pool.
+					bwb.Block.ReleaseLazyColumnStore()
 					continue
 				}
 
@@ -204,16 +207,21 @@ func ExecuteTraceMetrics(
 				if parseErr != nil {
 					return fmt.Errorf("ParseBlockFromBytes block %d: %w", blockIdx, parseErr)
 				}
+				// NOTE-153: the predicate-pass block's lazy-column arena is independent of the
+				// output-pass block created below; release it once the predicate is evaluated.
+				firstBlock := bwb.Block
 
 				provider := acquireBlockColumnProvider(bwb.Block)
 				rowSet, evalErr := program.ColumnPredicate(provider)
 				if evalErr != nil {
 					releaseBlockColumnProvider(provider)
+					firstBlock.ReleaseLazyColumnStore()
 					return fmt.Errorf("ColumnPredicate block %d: %w", blockIdx, evalErr)
 				}
 
 				if rowSet.Size() == 0 {
 					releaseBlockColumnProvider(provider)
+					firstBlock.ReleaseLazyColumnStore()
 					continue
 				}
 
@@ -221,6 +229,7 @@ func ExecuteTraceMetrics(
 				bwb, parseErr = r.ParseBlockFromBytes(bwb.RawBytes, modules_reader.WantOnly(outputCols), meta)
 				if parseErr != nil {
 					releaseBlockColumnProvider(provider)
+					firstBlock.ReleaseLazyColumnStore()
 					return fmt.Errorf("ParseBlockFromBytes (second pass) block %d: %w", blockIdx, parseErr)
 				}
 
@@ -234,6 +243,9 @@ func ExecuteTraceMetrics(
 					traceAccumulateRow(r, blockIdx, bwb.Block, rowIdx, querySpec, buckets, attrVals)
 				}
 				releaseBlockColumnProvider(provider)
+				// NOTE-153: both passes fully consumed — return their lazy-column arenas.
+				firstBlock.ReleaseLazyColumnStore()
+				bwb.Block.ReleaseLazyColumnStore()
 			}
 			return nil
 		},
