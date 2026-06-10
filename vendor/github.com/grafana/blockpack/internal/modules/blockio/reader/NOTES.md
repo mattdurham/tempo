@@ -801,3 +801,34 @@ simply fall back to `Pool.New` (a fresh alloc) — no correctness dependency on 
 the WantOnly path, releases the first arena, then parses the second (reusing the pooled arena) and
 asserts each decodes to its own values — catches stale `compressedEncoding`/dict aliasing across
 pool reuse. Full reader + executor suites pass under `-race`.
+
+## NOTE-154: adaptive Phase-1 ToC read — stop the full-block fallback — 2026-06-09
+
+**Decision:** `readBlockColumnarWithCache` (SPEC-005 columnar Phase-1) read a fixed `tocHintBytes`
+(4 KiB) to obtain the block header + column-metadata array, then parsed the metadata to learn each
+wanted column's `(dataOffset, compressedLen)` for the targeted Phase-2 reads. 4 KiB covers only
+~120 columns. Real OTel trace blocks carry **hundreds** of attribute columns, so for essentially
+every block `parseColumnMetadataArray` returned a "short for …" truncation error and the code fell
+back to `make([]byte, blockLen)` + a **full block read** (`columnar_read.go:214`). A querier
+`alloc_space` profile (2026-06-09, dev-test-03) showed that single fallback `make` as the **#1
+allocator: ~546 MB / 18.5%** of alloc_space — versus only ~91 MB on the proper assembled-buffer
+line (`:242`), i.e. the columnar cache was being bypassed on the common path.
+
+**Mechanism:** `readSufficientToC(blockOff, blockLen)` reads the ToC starting at `tocHintBytes` and
+**grows the read geometrically** (`tocGrowthFactor = 4`) until `parseColumnMetadataArray` succeeds
+or the whole block has been read, then returns that buffer. It runs *inside* the
+`GetOrFetchV8Section` fetch closure, so the **correctly-sized ToC is what gets cached**: warm queries
+pay one cache hit + one successful parse — no growth loop, no full-block read. The outer header- and
+metadata-error fallbacks remain as final safety nets for genuine corruption (now rare).
+
+**Safety:** byte-for-byte identical assembled buffer to before (Phase-2 logic unchanged); the only
+change is that Phase 1 now reliably delivers the full metadata array. On cold miss the metadata is
+parsed twice (once in the closure to size the read, once by the caller) — CPU-only, negligible, and
+the querier is I/O-bound with 33% CPU headroom. `min(blockLen, …)` caps every read at the block
+size, so small blocks still read once and the growth loop always terminates.
+
+**Verification:** `TestNOTE154_AdaptiveToCReadsAllColumns` builds a block with enough columns to
+overflow `tocHintBytes`, reads it through `ReadGroupColumnar`, and asserts the wanted columns decode
+correctly (i.e. the columnar Phase-2 path is taken, not the full-block fallback) and that a
+provider read-byte counter stays far below the full block size. Full reader + executor suites pass
+under `-race`.

@@ -29,6 +29,11 @@ import (
 //	100 columns × 34 bytes = ~3400 bytes → fits comfortably in 4096.
 const tocHintBytes = 4096
 
+// tocGrowthFactor is the geometric growth applied to the Phase-1 ToC read when the
+// column-metadata array overflows the current read (NOTE-154). Real trace blocks
+// routinely carry hundreds of attribute columns whose metadata exceeds tocHintBytes.
+const tocGrowthFactor = 4
+
 // ReadGroupColumnar fetches only the bytes for wantColumns within each block in cr.
 //
 // When the reader has a fileID and section cache, all reads route through the cache
@@ -186,14 +191,14 @@ func (r *Reader) readBlockColumnarWithCache(
 	// collision with ToCSubTypeBloom(3), ToCSubTypeIntrinsic(4), ToCSubTypeTrace(5).
 	tocKey := fmt.Sprintf("%d", blockIdx)
 
-	// Phase 1: ToC — cached.
+	// Phase 1: ToC — cached. NOTE-154: read a ToC large enough to hold the full
+	// column-metadata array. Trace blocks routinely have hundreds of columns whose
+	// metadata overflows a fixed 4 KiB hint; the previous code then fell back to a
+	// full block read (the #1 querier allocator, ~18% of alloc_space), defeating the
+	// columnar cache. The correctly-sized ToC is what gets cached, so warm queries
+	// pay one cache hit and one successful parse — no growth, no full-block read.
 	toc, err := r.cache.GetOrFetchV8Section(r.fileID, sectionTypeBlockToc, 0, tocKey, func() ([]byte, error) {
-		tocSize := min(blockLen, tocHintBytes)
-		buf := make([]byte, tocSize)
-		if _, readErr := r.provider.ReadAt(buf, blockOff, rw.DataTypeMetadata); readErr != nil {
-			return nil, fmt.Errorf("toc read: %w", readErr)
-		}
-		return buf, nil
+		return r.readSufficientToC(blockOff, blockLen)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("block %d toc: %w", blockIdx, err)
@@ -279,4 +284,33 @@ func (r *Reader) readBlockColumnarWithCache(
 	}
 
 	return assembled, nil
+}
+
+// readSufficientToC reads the block ToC (header + column-metadata array) starting at
+// blockOff, growing the read geometrically until the full metadata array is covered or
+// the entire block has been read (NOTE-154). Returning a ToC that contains the whole
+// metadata array lets readBlockColumnarWithCache take the columnar Phase-2 path instead
+// of falling back to a full block read. The returned buffer is cached by the caller, so
+// the growth/parse cost is paid once per block on a cold miss and never on warm queries.
+func (r *Reader) readSufficientToC(blockOff, blockLen int64) ([]byte, error) {
+	size := min(blockLen, int64(tocHintBytes))
+	for {
+		buf := make([]byte, size)
+		if _, err := r.provider.ReadAt(buf, blockOff, rw.DataTypeMetadata); err != nil {
+			return nil, fmt.Errorf("toc read: %w", err)
+		}
+		if size >= blockLen {
+			// Whole block already read; the outer parse handles any genuine corruption.
+			return buf, nil
+		}
+		hdr, err := parseBlockHeader(buf)
+		if err != nil {
+			// Header error: let the outer fallback handle it (full block read).
+			return buf, nil //nolint:nilerr // intentional: defer corruption handling to caller
+		}
+		if _, _, err := parseColumnMetadataArray(buf, int(shared.BlockHeaderV14Size), int(hdr.columnCount)); err == nil {
+			return buf, nil // metadata array fully covered
+		}
+		size = min(blockLen, size*tocGrowthFactor)
+	}
 }

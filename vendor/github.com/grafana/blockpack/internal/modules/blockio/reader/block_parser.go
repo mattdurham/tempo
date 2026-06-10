@@ -334,8 +334,15 @@ func parseBlockColumnsReuse(
 			start := int(m.dataOffset)          //nolint:gosec
 			end := start + int(m.compressedLen) //nolint:gosec
 			if start < 0 || end > len(rawBytes) {
-				// SPEC-ROOT-010: log the skip so operators can detect corrupt/malicious data.
-				slog.Warn("block_parser: lazy column offset out of range — skipping",
+				// NOTE-154: this loop only runs on the WantOnly path, where the buffer is
+				// usually a columnar-assembled buffer (SPEC-005) containing only the ToC and
+				// the *wanted* columns. A non-wanted column sitting beyond the buffer is the
+				// expected, normal result of that optimization — not corruption — so this is
+				// logged at Debug, not Warn. (At Warn it flooded the querier ~50k lines/h/pod
+				// and the per-skip slog formatting was itself hot-path overhead.) Genuine
+				// corruption surfaces on the eager-decode path for wanted columns and during
+				// header/metadata parsing.
+				slog.Debug("block_parser: lazy column offset out of range — skipping",
 					"column", m.name, "start", start, "end", end,
 					"block_size", len(rawBytes))
 				continue
