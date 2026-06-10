@@ -832,3 +832,29 @@ overflow `tocHintBytes`, reads it through `ReadGroupColumnar`, and asserts the w
 correctly (i.e. the columnar Phase-2 path is taken, not the full-block fallback) and that a
 provider read-byte counter stays far below the full block size. Full reader + executor suites pass
 under `-race`.
+
+## NOTE-170: single-block inline fast path in ReadGroupColumnarCached — 2026-06-10
+
+**Decision:** `ReadGroupColumnarCached` (SPEC-005 columnar read) always set up parallel
+machinery — a `results` slice, a `sync.WaitGroup`, a `runtime.NumCPU()`-sized semaphore
+channel, and one goroutine per block — before reading the wanted column bytes for each block
+in `cr.BlockIDs`. But query-frontend shards **one block per querier call** (confirmed
+2026-06-09: `blockGroupPipeline` always receives a single group, its worker concurrency never
+fires), so `cr.BlockIDs` almost always has length 1. For that dominant case the parallel setup
+is pure per-read overhead — a goroutine spawn, a channel send/recv pair, and a `wg.Wait` futex —
+on the **universal** block-read path hit by every query (Q1–Q10, M1–M9). A 2026-06-10 querier
+CPU profile showed kernel scheduler/lock cost (`_raw_spin_lock` + `queued_spin_lock_slowpath`
+≈ 6% combined, plus `runtime.futex`/`startm`/`wakep` traffic) as a top non-blockpack sink,
+consistent with per-block goroutine churn.
+
+**Mechanism:** when `len(cr.BlockIDs) == 1`, read that single block inline on the calling
+goroutine via `readBlockColumnarWithCache` and return `map[int][]byte{blockIdx: data}`. No
+goroutine, no channel, no WaitGroup, no results slice. The multi-block parallel path is
+unchanged and still used whenever a coalesced read genuinely spans multiple blocks.
+
+**Safety:** identical error semantics — `readBlockColumnarWithCache` returns an error (it does
+not panic on bad input); the per-goroutine `recover()` in the parallel path existed only to keep
+sibling blocks' results from being lost when one block panicked, which is moot with a single
+block (a genuine panic now propagates up the call stack exactly as it would have when only one
+block was being read). Output map shape is byte-for-byte identical to the parallel path's output
+for a one-element `cr.BlockIDs`.

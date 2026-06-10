@@ -136,6 +136,25 @@ func (r *Reader) ReadGroupColumnarCached(
 		return r.ReadGroup(cr) // WantAll or no cache key: full download
 	}
 
+	// NOTE-170: single-block fast path. query-frontend shards one block per querier
+	// call, so cr.BlockIDs almost always has length 1. The general path below spawns a
+	// goroutine, a semaphore channel, a WaitGroup, and a results slice per call — pure
+	// per-read scheduler/alloc overhead (goroutine spawn + channel send/recv + wg.Wait
+	// futex) on the universal block-read path for every query. Reading the single block
+	// inline on the calling goroutine removes that overhead entirely and keeps the same
+	// panic-safety contract: readBlockColumnarWithCache returns an error rather than
+	// crashing the querier, and a genuine panic propagates up exactly as a single-block
+	// run would (the goroutine recover() only existed to keep other parallel blocks
+	// from being lost — irrelevant with one block).
+	if len(cr.BlockIDs) == 1 {
+		blockIdx := cr.BlockIDs[0]
+		data, err := r.readBlockColumnarWithCache(cr.BlockOffsets[0], cr.BlockLengths[0], blockIdx, wantColumns)
+		if err != nil {
+			return nil, err
+		}
+		return map[int][]byte{blockIdx: data}, nil
+	}
+
 	type blockResult struct {
 		err      error
 		data     []byte
