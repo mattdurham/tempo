@@ -4320,3 +4320,36 @@ merge_join_test.go (order-insensitive set equality vs reference map intersect + 
 output assertion, shuffled/duplicate inputs) under `-race`.
 **Queries affected:** Same merge-join path as NOTE-166 (M6, M9, M10 and predicated `... by (...)`).
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:mergeJoinFilteredRefsWithVals`
+
+## NOTE-175: pkOrder / matched — closure-free LSD radix sort by packKey
+*Added: 2026-06-10*
+**Decision:** Replace `slices.Sort(pkOrder)` (3 call sites in the compact N=1 count/rate and
+duration/histogram group-by scan paths: `streamCountRateN1Compact` and its variants) and
+`slices.Sort(matched)` (the merge-join matched-subset reorder in
+`mergeJoinFilteredRefsWithVals`) with `radixSortByPackKey` (new file `radix_pkorder.go`). Each
+element is a packed `uint64` of `packKey<<32 | idx`; ordering is by the **high 32 bits**
+(packKey) only, with the low-32 position index travelling alongside the key. The radix sort runs
+4 LSD counting passes over those 4 key bytes (starting at bit 32), drawing its scratch buffer
+from `compactUint64Pool` (the same pool that backs `pkOrder`), so the only extra cost is one
+pooled acquire/release amortized across blocks. Four (even) passes leave the result in the input
+slice — no copy-back.
+**Rationale:** `slices.Sort` on `[]uint64` dispatches to the comparison-based `pdqsortOrdered`
+(O(N log N)). On the CONFIRMED-CPU-BOUND queriers, the full N-element `pkOrder` array reaches up
+to ~7.2 M entries on group-by/histogram queries (M6/M8), making this sort a large per-block self
+cost. This applies the identical closure-free radix technique already profile-proven on the
+ref-index unsorted fallback (NOTE-174, `blockio/shared.radixSortRefIndex`), which dropped that
+sort path ~5.1pp → ~0.55pp of querier CPU. Microbench at N=2²⁰: `slices.Sort` 76.3 ms/op →
+radix 8.5 ms/op (**~9x**), 1 (pooled) alloc.
+**Correctness:** Ordering is by packKey alone; entries with equal packKey keep an
+arbitrary-but-consistent relative order — exactly as with the prior non-stable `slices.Sort`. The
+consumers (`streamCountRateN1CompactCore` via `scanGroupByColCompact`, and the merge-join output
+assembly) iterate the sorted slice positionally and binary-search packKeys; they do not depend on
+within-packKey tie order. Each element's low-32 index is preserved alongside its key, so the
+`sortedPKs`/`timeBucketByPos` pair (built from `pkOrder[i]`) and the merge-join `inRangeRefs[pos]`
+lookup remain consistent. Verified in `radix_pkorder_test.go`: permutation equality vs the input
+multiset, ascending-by-packKey invariant, and key-projection equality vs `slices.Sort` over random
+inputs (sizes 0..5000), heavy-duplicate keys, and 32-bit extremes (0, 0x7FFFFFFF, 0x80000000,
+0xFFFFFFFF) under `-race`.
+**Queries affected:** Compact group-by count/rate and histogram_over_time group-by (M6, M8) plus
+the predicate-filtered merge-join path (M6/M9/M10 and `... by (...)`).
+Back-ref: `internal/modules/executor/radix_pkorder.go`, `metrics_trace_intrinsic.go`

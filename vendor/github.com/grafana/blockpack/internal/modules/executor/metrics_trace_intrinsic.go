@@ -1265,7 +1265,8 @@ func streamCountRateN1Compact(
 		for i, ref := range tsCol.BlockRefs[lo:hi] {
 			pkOrder[i] = uint64(packKey(ref.BlockIdx, ref.RowIdx))<<32 | uint64(uint32(i)) //nolint:gosec
 		}
-		slices.Sort(pkOrder)
+		// NOTE-175: radix sort by packKey (high 32 bits) — closure-free O(N) vs slices.Sort O(N log N).
+		radixSortByPackKey(pkOrder)
 		for i, packed := range pkOrder {
 			sortedPKs[i] = uint32(packed >> 32)
 			relIdx := int(uint32(packed))                                                               //nolint:gosec
@@ -1466,7 +1467,8 @@ func streamAggN1Compact(
 		for i, ref := range tsCol.BlockRefs[lo:hi] {
 			pkOrder[i] = uint64(packKey(ref.BlockIdx, ref.RowIdx))<<32 | uint64(uint32(i)) //nolint:gosec
 		}
-		slices.Sort(pkOrder)
+		// NOTE-175: radix sort by packKey (high 32 bits) — closure-free O(N) vs slices.Sort O(N log N).
+		radixSortByPackKey(pkOrder)
 		for i, packed := range pkOrder {
 			sortedPKs[i] = uint32(packed >> 32)
 			relIdx := int(uint32(packed))                                                               //nolint:gosec
@@ -1957,7 +1959,8 @@ func streamHistogramN1Compact(
 		for i, ref := range inRangeRefs {
 			pkOrder[i] = uint64(packKey(ref.BlockIdx, ref.RowIdx))<<32 | uint64(uint32(i)) //nolint:gosec
 		}
-		slices.Sort(pkOrder)
+		// NOTE-175: radix sort by packKey (high 32 bits) — closure-free O(N) vs slices.Sort O(N log N).
+		radixSortByPackKey(pkOrder)
 		for i, packed := range pkOrder {
 			sortedPKs[i] = uint32(packed >> 32)
 			relIdx := int(uint32(packed))                                                     //nolint:gosec
@@ -2136,7 +2139,8 @@ func mergeJoinFilteredRefsWithVals(
 	matched = matched[:m]
 	// Restore packKey-sorted output order. M is the match count (≤ F ≪ N), so this sort is
 	// far cheaper than sorting the full N-element in-range array.
-	slices.Sort(matched)
+	// NOTE-175: radix sort by packKey (high 32 bits) over the matched subset.
+	radixSortByPackKey(matched)
 
 	outRefsBacking := acquireCompactBlockRef(m) // NOTE-130: pooled
 	outValsBacking := acquireCompactUint64(m)   // NOTE-130: pooled; reuses compactUint64Pool
