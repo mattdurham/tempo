@@ -4291,3 +4291,32 @@ packKey-sorted-output assertion) under `-race`.
 (M6, M9, M10 and any `... by (...)` with a predicate that is not the N=0 hash-filter fast
 path of NOTE-113).
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:mergeJoinFilteredRefsWithVals`
+
+## NOTE-167: mergeJoinFilteredRefsWithVals — replace per-survivor sort.Search with bitset bit-test
+*Added: 2026-06-10*
+**Decision:** Replace NOTE-166's per-in-range-ref `sort.Search(filteredPKs, ...)` membership
+probe with an O(1) presence-bitset bit-test. Before walking `inRangeRefs`, build a `[]uint64`
+bitset over the sorted `filteredPKs` (one bit per packKey, indexed by `pk`, with the array
+offset by `baseWord = flo>>6` so it spans only the active `[flo, fhi]` packKey range). For each
+in-range ref, after the existing `[flo, fhi]` range gate, test membership with a single
+`pkBitset[(pk>>6)-baseWord] & (1<<(pk&63)) != 0` — one word load + shift + mask + AND. `filteredPKs`
+is released early (right after the bitset is built); the bitset is acquired/released from
+`compactUint64Pool` like the other compact-path scratch.
+**Rationale:** A 2026-06-10 querier CPU profile (taken AFTER NOTE-166 landed) attributed
+`sort.Search` at **4.93% of total querier CPU** — the single largest blockpack-reachable
+self-cost — plus `slices.partitionCmpFunc` (3.56%) and `slices.partitionOrdered` (1.26%), all
+reached via this function. The closure-based `sort.Search` does ~log2(F) (~22 at F=3.75 M)
+indirect-call probes per survivor; the bitset replaces that whole loop with a single O(1)
+memory access. This is the identical `pkBitset` technique already proven on the group-by and
+histogram compact scans (`scanGroupByColCompact` NOTE-135/140, `scanAggColHistogramCompact`).
+**Correctness:** Output (ref,val) set is unchanged: a ref is emitted iff its packKey is present
+in `filteredPKs`, which the bitset encodes exactly (bit set ⟺ packKey present). The `[flo, fhi]`
+range gate is preserved and only skips packKeys the bitset would also reject (they map outside
+the encoded range). The bitset offset (`baseWord = flo>>6`) is exact because every set bit's
+word index `pk>>6 >= flo>>6 = baseWord`, so `(pk>>6)-baseWord >= 0` for all in-range refs that
+pass the gate, and `(fhi>>6)-baseWord` is the last valid word index (allocated). Output remains
+packKey-sorted: `matched` is still sorted by its high 32 bits before emission. Verified by
+merge_join_test.go (order-insensitive set equality vs reference map intersect + packKey-sorted
+output assertion, shuffled/duplicate inputs) under `-race`.
+**Queries affected:** Same merge-join path as NOTE-166 (M6, M9, M10 and predicated `... by (...)`).
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:mergeJoinFilteredRefsWithVals`

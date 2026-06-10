@@ -2087,34 +2087,52 @@ func mergeJoinFilteredRefsWithVals(
 
 	// NOTE-166: probe-then-sort-matches. The former implementation built a packed
 	// []uint64 index over ALL N in-range refs (idxPacked, ~57 MB at N=7.2 M) and ran
-	// slices.Sort over that full array — an O(N log N) sort that a 2026-06-09 querier CPU
-	// profile attributed (via slices.partitionOrdered/insertionSortOrdered reached
-	// exclusively from this function) at ~12% of total querier CPU and the single largest
-	// blockpack-attributable self-cost. Instead, walk inRangeRefs in natural order and
-	// binary-search each packKey against the already-sorted (and usually much smaller)
-	// filteredPKs. Matches are collected as packed (pk<<32 | pos) into matched[]; only the
-	// MATCHED subset (M ≤ F ≪ N) is sorted to restore the packKey-sorted output invariant
-	// that downstream compact paths (NOTE-110/112/114) depend on. Net: the O(N log N) sort
-	// of the large in-range array becomes an O(N log F) probe + O(M log M) sort, and the
-	// ~57 MB idxPacked allocation is replaced by an M-sized buffer.
-	matched := acquireCompactUint64(len(inRangeRefs)) // cap N; trimmed to M below. Pooled.
-	m := 0
+	// slices.Sort over that full array — an O(N log N) sort. NOTE-166 replaced that with a
+	// per-survivor binary search of filteredPKs, then sorted only the matched subset.
+	//
+	// NOTE-167: replace NOTE-166's per-survivor sort.Search with an O(1) membership bit-test.
+	// A 2026-06-10 querier CPU profile (post-NOTE-166) attributed sort.Search at ~4.93% of
+	// TOTAL querier CPU — now the single largest self-cost — reached via this function's
+	// per-in-range-ref probe of filteredPKs. The closure-based sort.Search performs ~log2(F)
+	// (~22 at F=3.75 M) indirect-call probes per survivor. Instead, build a presence bitset
+	// over filteredPKs (one bit per packKey, indexed by pk; ~maxPK/64 words) plus the [flo,fhi]
+	// range gate, then test membership with a single shift+mask+AND per in-range ref — O(1),
+	// branch-light, no closure call, no log2(F) probes. This is the same pkBitset technique
+	// already proven on the group-by/histogram compact scan (scanGroupByColCompact NOTE-135/140
+	// and scanAggColHistogramCompact). The bitset spans only the [flo, fhi] packKey range
+	// (offset by flo>>6 so unused low words are not allocated). filteredPKs is no longer needed
+	// after the bitset is built, so it is released early.
 	flo := filteredPKs[0]
 	fhi := filteredPKs[len(filteredPKs)-1]
+	// Bitset indexed by (pk - baseWord*64); word baseWord covers flo, so it spans only the
+	// active range. nWords = (fhi>>6) - (flo>>6) + 1.
+	baseWord := int(flo >> 6) //nolint:gosec
+	nWords := int(fhi>>6) - baseWord + 1
+	pkBitset := acquireCompactUint64(nWords) // pooled
+	clear(pkBitset)                          // zero-sentinel — must clear stale pool bits before setting
+	for _, pk := range filteredPKs {
+		w := int(pk>>6) - baseWord //nolint:gosec
+		pkBitset[w] |= uint64(1) << (pk & 63)
+	}
+	releaseCompactUint32(filteredPKs)
+
+	matched := acquireCompactUint64(len(inRangeRefs)) // cap N; trimmed to M below. Pooled.
+	m := 0
 	for i, ref := range inRangeRefs {
 		pk := packKey(ref.BlockIdx, ref.RowIdx)
-		// Skip the binary search entirely for packKeys outside [flo, fhi]; the merge-join
+		// Skip the bit-test entirely for packKeys outside [flo, fhi]; the merge-join
 		// frequently sees in-range refs whose blocks were pruned away by the predicate.
 		if pk < flo || pk > fhi {
 			continue
 		}
-		// sort.Search finds the first filteredPKs index >= pk; a match requires equality.
-		j := sort.Search(len(filteredPKs), func(k int) bool { return filteredPKs[k] >= pk })
-		if j < len(filteredPKs) && filteredPKs[j] == pk {
+		// O(1) membership: a single word fetch + shift + mask, no closure / no log2(F) probes.
+		w := int(pk>>6) - baseWord //nolint:gosec
+		if pkBitset[w]&(uint64(1)<<(pk&63)) != 0 {
 			matched[m] = uint64(pk)<<32 | uint64(uint32(i)) //nolint:gosec
 			m++
 		}
 	}
+	releaseCompactUint64(pkBitset)
 	matched = matched[:m]
 	// Restore packKey-sorted output order. M is the match count (≤ F ≪ N), so this sort is
 	// far cheaper than sorting the full N-element in-range array.
@@ -2135,7 +2153,6 @@ func mergeJoinFilteredRefsWithVals(
 		outVals = append(outVals, inRangeVals[pos])
 	}
 	releaseCompactUint64(matched)
-	releaseCompactUint32(filteredPKs)
 	return outRefs, outVals, release
 }
 
