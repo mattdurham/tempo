@@ -2510,7 +2510,7 @@ func accumulateIntrinsicBuckets(
 // For HISTOGRAM: spans with an absent or non-positive aggregate field are counted into
 // the boundary-0 bucket, matching the block-scan path (traceHistogramBucket returns 0
 // for absent/non-positive values and the span is still counted).
-// For other aggregates: spans with an absent field are skipped, matching traceFieldFloat64
+// For other aggregates: spans with an absent field are skipped, matching traceFieldFloat64Col
 // which returns (0, false) for absent columns.
 func streamAggColumnNoGroupBy(
 	r *modules_reader.Reader,

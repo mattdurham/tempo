@@ -195,8 +195,10 @@ func ExecuteTraceMetrics(
 					attrVals := make([]string, len(groupBy)) // NOTE-054
 					// NOTE-159: one composite-key scratch buffer per block, reused across rows.
 					scratch := acquireCompositeKeyScratch()
+					// NOTE-160: resolve span:start/GroupBy/field columns once per block.
+					cols := resolveBlockMetricsCols(bwb.Block, querySpec)
 					for rowIdx := range int(meta.SpanCount) {
-						traceAccumulateRow(r, blockIdx, bwb.Block, rowIdx, querySpec, buckets, attrVals, scratch)
+						traceAccumulateRow(r, blockIdx, bwb.Block, rowIdx, querySpec, buckets, attrVals, scratch, &cols)
 					}
 					releaseCompositeKeyScratch(scratch)
 					// NOTE-153: block fully scanned (incl. any lazy span:start decode above);
@@ -244,8 +246,10 @@ func ExecuteTraceMetrics(
 				) // NOTE-054: per-block scratch; cleared at top of traceAccumulateRow
 				// NOTE-159: one composite-key scratch buffer per block, reused across rows.
 				scratch := acquireCompositeKeyScratch()
+				// NOTE-160: resolve span:start/GroupBy/field columns once per block.
+				cols := resolveBlockMetricsCols(bwb.Block, querySpec)
 				for _, rowIdx := range rowSet.ToSlice() {
-					traceAccumulateRow(r, blockIdx, bwb.Block, rowIdx, querySpec, buckets, attrVals, scratch)
+					traceAccumulateRow(r, blockIdx, bwb.Block, rowIdx, querySpec, buckets, attrVals, scratch, &cols)
 				}
 				releaseCompositeKeyScratch(scratch)
 				releaseBlockColumnProvider(provider)
@@ -270,6 +274,58 @@ func ExecuteTraceMetrics(
 	return result, nil
 }
 
+// blockMetricsCols holds the per-block resolved column pointers for the metrics
+// group-by hot path. NOTE-160: GetColumn is a string-keyed map lookup whose result is
+// constant for every row in a block. The old traceAccumulateRow resolved span:start, each
+// GroupBy attribute column, and the aggregate field column on EVERY span via GetColumn —
+// O(rows × (2 + numGroupBy)) map lookups per block. Resolving them once per block and
+// passing the pointers in collapses that to O(2 + numGroupBy) lookups per block, removing
+// the repeated string hashing from the tight per-row loop (M4/M6/M8).
+type blockMetricsCols struct {
+	// tsCol is the span:start block column, or nil to fall back to the intrinsic section.
+	tsCol *modules_reader.Column
+	// fieldCol is the resolved aggregate field column (SUM/AVG/MIN/MAX/QUANTILE/STDDEV/
+	// HISTOGRAM), or nil. COUNT/RATE have no field and leave this nil.
+	fieldCol *modules_reader.Column
+	// groupByCols[i] is the resolved column for querySpec.Aggregate.GroupBy[i], or nil.
+	groupByCols []*modules_reader.Column
+	// useIntrinsicTS is true when span:start lives only in the intrinsic section (v4 files);
+	// when set, IntrinsicUint64At is used with the reader.
+	useIntrinsicTS bool
+}
+
+// resolveBlockMetricsCols resolves all per-block column pointers once for the row loop.
+// NOTE-160: called once per block by the ExecuteTraceMetrics caller loops, replacing the
+// per-row GetColumn lookups inside traceAccumulateRow.
+func resolveBlockMetricsCols(block *modules_reader.Block, querySpec *vm.QuerySpec) blockMetricsCols {
+	var c blockMetricsCols
+
+	// span:start resolution (block-column-first, intrinsic-section fallback). PATTERN shared
+	// across compaction/writer/executor: v3 files store identity columns in block payloads;
+	// v4 files store them exclusively in the intrinsic section.
+	if tsCol := block.GetColumn("span:start"); tsCol != nil {
+		c.tsCol = tsCol
+	} else {
+		c.useIntrinsicTS = true
+	}
+
+	groupBy := querySpec.Aggregate.GroupBy
+	if len(groupBy) > 0 {
+		c.groupByCols = make([]*modules_reader.Column, len(groupBy))
+		for i, attr := range groupBy {
+			c.groupByCols[i] = block.GetColumn(attr)
+		}
+	}
+
+	// Aggregate field column (used by traceUpdateBucket/traceHistogramBucket). COUNT/RATE
+	// have an empty Field, so this stays nil and the per-row value path is skipped.
+	if querySpec.Aggregate.Field != "" {
+		c.fieldCol = block.GetColumn(querySpec.Aggregate.Field)
+	}
+
+	return c
+}
+
 // traceAccumulateRow accumulates one span's contribution into the buckets map.
 // attrVals is a scratch slice of len(querySpec.Aggregate.GroupBy) reused across calls.
 // NOTE-159: scratch is a per-block composite-key buffer owned by the caller. It is
@@ -278,6 +334,8 @@ func ExecuteTraceMetrics(
 // sync.Pool Get + one Put + one defer from the per-span hot path (M4/M6/M8). The buffer
 // is always truncated to [:0] before each key build below, so no stale bytes leak between
 // rows.
+// NOTE-160: cols holds the per-block resolved column pointers (span:start, GroupBy, field),
+// resolved once by resolveBlockMetricsCols — no GetColumn map lookups occur per row here.
 func traceAccumulateRow(
 	r *modules_reader.Reader,
 	blockIdx int,
@@ -287,6 +345,7 @@ func traceAccumulateRow(
 	buckets map[string]*aggBucketState,
 	attrVals []string,
 	scratch *[]byte,
+	cols *blockMetricsCols,
 ) {
 	// NOTE-054: clear attrVals at function entry so stale values from prior rows never
 	// survive an early return. NOTE-067: scratch buffer appends attrVals in-place; clear
@@ -298,26 +357,22 @@ func traceAccumulateRow(
 		return
 	}
 
-	// Read span:start for time bucketing (SPEC-ETM-7).
-	// PATTERN: block-column-first with intrinsic-section fallback (shared across
-	// compaction/compaction.go, writer/writer.go, executor/executor.go, metrics_trace.go).
-	// v3 files store identity columns in block payloads; v4 files store them exclusively
-	// in the intrinsic section. Try the block column first for backwards compat.
-	// span:start is stored in the intrinsic section; fall back to block column for legacy files.
+	// Read span:start for time bucketing (SPEC-ETM-7). NOTE-160: column resolved per-block.
 	var tsNanos int64
-	if tsCol := block.GetColumn("span:start"); tsCol != nil {
-		tsVal, ok := tsCol.Uint64Value(rowIdx)
+	switch {
+	case cols.tsCol != nil:
+		tsVal, ok := cols.tsCol.Uint64Value(rowIdx)
 		if !ok {
 			return
 		}
 		tsNanos = int64(tsVal) //nolint:gosec
-	} else if r != nil {
+	case cols.useIntrinsicTS && r != nil:
 		tsVal, ok := r.IntrinsicUint64At("span:start", blockIdx, rowIdx)
 		if !ok {
 			return
 		}
 		tsNanos = int64(tsVal) //nolint:gosec
-	} else {
+	default:
 		return
 	}
 
@@ -329,10 +384,8 @@ func traceAccumulateRow(
 
 	bucketIdx := timeBucketIndex(tsNanos, tb.StartTime, tb.StepSizeNanos)
 
-	// Build group key from GroupBy attributes (SPEC-ETM-8).
-	groupBy := querySpec.Aggregate.GroupBy
-	for i, attr := range groupBy {
-		col := block.GetColumn(attr)
+	// Build group key from GroupBy attributes (SPEC-ETM-8). NOTE-160: columns resolved per-block.
+	for i, col := range cols.groupByCols {
 		if col != nil {
 			attrVals[i] = metricsColumnString(col, rowIdx)
 		}
@@ -349,8 +402,9 @@ func traceAccumulateRow(
 		*scratch = append(*scratch, v...)
 	}
 	// NOTE-033: HISTOGRAM embeds log2 bucket boundary as a 3rd "\x00" segment.
+	// NOTE-160: field column resolved per-block (cols.fieldCol).
 	if querySpec.Aggregate.Function == vm.FuncNameHISTOGRAM {
-		histBoundary := traceHistogramBucket(block, rowIdx, querySpec.Aggregate.Field)
+		histBoundary := traceHistogramBucket(cols.fieldCol, rowIdx, querySpec.Aggregate.Field)
 		*scratch = append(*scratch, '\x00')
 		*scratch = strconv.AppendFloat(*scratch, histBoundary, 'g', -1, 64)
 	}
@@ -366,12 +420,14 @@ func traceAccumulateRow(
 		buckets[key] = bucket
 	}
 
-	traceUpdateBucket(block, rowIdx, querySpec.Aggregate, bucket)
+	// NOTE-160: field column resolved per-block (cols.fieldCol).
+	traceUpdateBucket(cols.fieldCol, rowIdx, querySpec.Aggregate, bucket)
 }
 
 // traceUpdateBucket accumulates one span's value into a bucket based on the aggregate function.
+// NOTE-160: fieldCol is the per-block resolved aggregate field column (nil for COUNT/RATE).
 func traceUpdateBucket(
-	block *modules_reader.Block,
+	fieldCol *modules_reader.Column,
 	rowIdx int,
 	agg vm.AggregateSpec,
 	bucket *aggBucketState,
@@ -380,13 +436,13 @@ func traceUpdateBucket(
 	case vm.FuncNameCOUNT, vm.FuncNameRATE:
 		bucket.count++
 	case vm.FuncNameSUM, vm.FuncNameAVG:
-		v, ok := traceFieldFloat64(block, rowIdx, agg.Field)
+		v, ok := traceFieldFloat64Col(fieldCol, rowIdx)
 		if ok {
 			bucket.count++
 			bucket.sum += v
 		}
 	case vm.FuncNameMIN:
-		v, ok := traceFieldFloat64(block, rowIdx, agg.Field)
+		v, ok := traceFieldFloat64Col(fieldCol, rowIdx)
 		if ok {
 			// count tracks rows with a valid numeric field (not update count);
 			// traceRowValue uses count==0 as the NaN sentinel for "no data in bucket".
@@ -396,7 +452,7 @@ func traceUpdateBucket(
 			}
 		}
 	case vm.FuncNameMAX:
-		v, ok := traceFieldFloat64(block, rowIdx, agg.Field)
+		v, ok := traceFieldFloat64Col(fieldCol, rowIdx)
 		if ok {
 			// count tracks rows with a valid numeric field (not update count);
 			// traceRowValue uses count==0 as the NaN sentinel for "no data in bucket".
@@ -406,13 +462,13 @@ func traceUpdateBucket(
 			}
 		}
 	case vm.FuncNameQUANTILE:
-		v, ok := traceFieldFloat64(block, rowIdx, agg.Field)
+		v, ok := traceFieldFloat64Col(fieldCol, rowIdx)
 		if ok {
 			bucket.count++
 			bucket.values = append(bucket.values, v)
 		}
 	case vm.FuncNameSTDDEV:
-		v, ok := traceFieldFloat64(block, rowIdx, agg.Field)
+		v, ok := traceFieldFloat64Col(fieldCol, rowIdx)
 		if ok {
 			// Welford's online algorithm for sample variance. NOTE-033.
 			bucket.count++
@@ -431,8 +487,10 @@ func traceUpdateBucket(
 // For other numeric fields, uses the absolute value directly.
 // Returns 0 if v <= 0 or the field is absent/non-numeric.
 // NOTE-033: log2 buckets span latency distributions across orders of magnitude.
-func traceHistogramBucket(block *modules_reader.Block, rowIdx int, fieldName string) float64 {
-	v, ok := traceFieldFloat64(block, rowIdx, fieldName)
+// NOTE-160: fieldCol is the per-block resolved field column; fieldName is retained only
+// for the span:duration ns→s special case.
+func traceHistogramBucket(fieldCol *modules_reader.Column, rowIdx int, fieldName string) float64 {
+	v, ok := traceFieldFloat64Col(fieldCol, rowIdx)
 	if !ok || v <= 0 {
 		return 0
 	}
@@ -446,11 +504,12 @@ func traceHistogramBucket(block *modules_reader.Block, rowIdx int, fieldName str
 	return math.Pow(2, math.Floor(math.Log2(math.Abs(v))))
 }
 
-// traceFieldFloat64 reads a numeric field value from a span column.
+// traceFieldFloat64Col reads a numeric field value from a pre-resolved span column.
 // Returns (0, false) when the column is absent, not present for this row, or non-numeric.
 // SPEC-ETM-8: Non-numeric columns (string, bool, bytes) are silently skipped.
-func traceFieldFloat64(block *modules_reader.Block, rowIdx int, fieldName string) (float64, bool) {
-	col := block.GetColumn(fieldName)
+// NOTE-160: takes a resolved *Column (resolved once per block) instead of a block + name,
+// removing the per-row GetColumn map lookup from the aggregate value path.
+func traceFieldFloat64Col(col *modules_reader.Column, rowIdx int) (float64, bool) {
 	if col == nil {
 		return 0, false
 	}

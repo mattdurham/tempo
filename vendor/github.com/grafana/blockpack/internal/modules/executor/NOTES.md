@@ -4200,3 +4200,34 @@ encoding (NOTE-033). Verified by the full executor suite under `-race` (incl.
 
 Back-ref: `internal/modules/executor/block_label_set.go:metricsColumnString`,
 `internal/modules/executor/metrics_trace.go:traceAccumulateRow,ExecuteTraceMetrics`
+
+## NOTE-160: hoist per-block column resolution out of the metrics per-row loop (2026-06-10)
+
+`traceAccumulateRow` resolved its columns via `block.GetColumn(name)` — a string-keyed map
+lookup — on EVERY span: once for `span:start`, once per `GroupBy` attribute, and once for the
+aggregate field (inside `traceUpdateBucket`/`traceHistogramBucket` via `traceFieldFloat64`).
+The resolved `*Column` pointers are constant for every row in a block, so this was
+O(rows × (2 + numGroupBy)) redundant map lookups + string hashing per block on the CPU-bound
+metrics group-by path (M4/M6/M8; KEY FINDING 2: queriers peg ~5 cores on heavy metrics).
+
+**Change.** Added `blockMetricsCols` (resolved span:start col + intrinsic-fallback flag,
+`groupByCols[]`, aggregate `fieldCol`) and `resolveBlockMetricsCols`, called ONCE per block by
+both `ExecuteTraceMetrics` caller loops (the `predicateCols==nil` single-pass path and the
+two-pass matched-row path). `traceAccumulateRow` now takes `*blockMetricsCols` and reads the
+pre-resolved pointers — zero `GetColumn` calls per row. The span:start block-column-first /
+intrinsic-section-fallback PATTERN is preserved: `tsCol != nil` → use the block column;
+otherwise `useIntrinsicTS` → `r.IntrinsicUint64At`. `traceFieldFloat64` was renamed to
+`traceFieldFloat64Col` and now takes a resolved `*Column` instead of `block + fieldName`;
+`traceHistogramBucket` and `traceUpdateBucket` likewise take the resolved `fieldCol`
+(`fieldName` retained in `traceHistogramBucket` only for the `span:duration` ns→s special case).
+
+**Correctness.** Byte-identical output: the field column is resolved from the same
+`querySpec.Aggregate.Field` the old code passed to `GetColumn`; `fieldCol == nil` reproduces the
+old "column absent → skip" behavior; absent rows still return `ok=false` via the typed
+accessors; COUNT/RATE leave `fieldCol` nil (empty `Field`) and never touch the value path. Key
+format (NOTE-067/073) and HISTOGRAM 3rd-segment (NOTE-033) unchanged. `groupByCols` is allocated
+once per block (cheap relative to the per-row lookups it removes). Verified by the full executor
+suite under `-race`.
+
+Back-ref: `internal/modules/executor/metrics_trace.go:blockMetricsCols,resolveBlockMetricsCols,
+traceAccumulateRow,traceUpdateBucket,traceHistogramBucket,traceFieldFloat64Col`
