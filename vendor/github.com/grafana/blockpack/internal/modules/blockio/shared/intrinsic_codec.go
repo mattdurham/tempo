@@ -544,10 +544,13 @@ func forEachDictPageValue(
 // ever reallocates. Entry order, Value/Int64Val, and per-entry ref order are byte-identical
 // to the legacy path (entries created in first-appearance order; refs appended in page order).
 //
-// Pages are decompressed twice (once per pass) into the pooled buffer — querier CPU is
-// I/O-latency bound with headroom (mission profile: 33% CPU), so trading a second snappy pass
-// for ~zero retained over-allocation and far less GC pressure is favorable, and avoids holding
-// every decompressed page in memory at once (OOM-sensitive; GOMEMLIMIT=13GiB).
+// NOTE-171: pass-1 retains each decompressed page in a pooled buffer (up to a 4 MiB total
+// budget) and pass 2 reuses it, so each page is snappy-decoded once in the common case.
+// The earlier double-decode (NOTE-152) traded a second snappy pass to bound memory under
+// "I/O-bound, CPU headroom" assumptions; the 2026-06-10 profile shows the querier is now
+// CPU-bound (~5 cores pegged, snappy.Decode on the M4 group-by hot path), so the second
+// decode is wasted work. Pages past the retain budget fall back to re-decoding in pass 2,
+// preserving the bounded-memory guarantee under GOMEMLIMIT.
 func decodeDictPagesArena(
 	blob []byte, pageDataStart int, toc PagedIntrinsicTOC,
 	blockW, rowW int, merged *IntrinsicColumn,
@@ -562,22 +565,76 @@ func decodeDictPagesArena(
 	idx := acquireDictIdxMap()
 	defer releaseDictIdxMap(idx)
 
-	// NOTE-012: pooled snappy decode buffer reused across both passes and all pages.
-	pageBuf := AcquireIntrinsicBuf()
-	defer ReleaseIntrinsicBuf(pageBuf)
+	// NOTE-171: single-decode page retention. The legacy two-pass design (NOTE-152)
+	// snappy-decompressed every page TWICE — once in the sizing pass, once in the fill
+	// pass — to avoid holding all decompressed pages in memory at once. The 2026-06-10
+	// querier CPU profile shows the cluster is now CPU-bound (~5 cores pegged on heavy
+	// metrics; snappy.Decode + decodeDictPagesArena are on the M4 group-by hot path),
+	// so the redundant second decompression is real wasted work. Here we retain each
+	// page's decompressed bytes from pass 1 in pooled buffers and reuse them in pass 2,
+	// eliminating the second snappy decode — but only while the total retained size stays
+	// under retainBudget. Past the budget we release that page's buffer and re-decode it
+	// in pass 2 (the old behavior), preserving the bounded-memory guarantee under
+	// GOMEMLIMIT. retained[i]==nil means "re-decode page i in pass 2".
+	const retainBudget = intrinsicBufMaxCap // 4 MiB total decompressed bytes retained
 
-	decodePage := func(i int, pm PageMeta) ([]byte, error) {
+	// scratchBuf is the fallback decode buffer for pages that were not retained (over
+	// budget). NOTE-012: pooled, reused across all such pages in pass 2.
+	scratchBuf := AcquireIntrinsicBuf()
+	defer ReleaseIntrinsicBuf(scratchBuf)
+
+	retained := make([]*[]byte, len(toc.Pages))
+	defer func() {
+		for _, bp := range retained {
+			if bp != nil {
+				ReleaseIntrinsicBuf(bp)
+			}
+		}
+	}()
+	retainedBytes := 0
+
+	// decodePass1 decodes page i and, when under budget, retains its decompressed bytes
+	// in a pooled buffer for reuse in pass 2.
+	decodePass1 := func(i int, pm PageMeta) ([]byte, error) {
 		pageStart := pageDataStart + int(pm.Offset)
 		pageEnd := pageStart + int(pm.Length)
 		if pageEnd > len(blob) {
 			return nil, fmt.Errorf("decodeDictPagesArena: page %d out of bounds (offset=%d len=%d blobLen=%d)",
 				i, pm.Offset, pm.Length, len(blob))
 		}
-		pageRaw, decErr := snappy.Decode(*pageBuf, blob[pageStart:pageEnd])
+		bp := AcquireIntrinsicBuf()
+		pageRaw, decErr := snappy.Decode(*bp, blob[pageStart:pageEnd])
+		if decErr != nil {
+			ReleaseIntrinsicBuf(bp)
+			return nil, fmt.Errorf("decodeDictPagesArena: page %d snappy: %w", i, decErr)
+		}
+		*bp = pageRaw
+		if retainedBytes+len(pageRaw) <= retainBudget {
+			retained[i] = bp
+			retainedBytes += len(pageRaw)
+		} else {
+			ReleaseIntrinsicBuf(bp)
+		}
+		return pageRaw, nil
+	}
+
+	// decodePass2 returns page i's decompressed bytes, reusing the buffer retained in
+	// pass 1 when available, otherwise re-decoding into scratchBuf.
+	decodePass2 := func(i int, pm PageMeta) ([]byte, error) {
+		if retained[i] != nil {
+			return *retained[i], nil
+		}
+		pageStart := pageDataStart + int(pm.Offset)
+		pageEnd := pageStart + int(pm.Length)
+		if pageEnd > len(blob) {
+			return nil, fmt.Errorf("decodeDictPagesArena: page %d out of bounds (offset=%d len=%d blobLen=%d)",
+				i, pm.Offset, pm.Length, len(blob))
+		}
+		pageRaw, decErr := snappy.Decode(*scratchBuf, blob[pageStart:pageEnd])
 		if decErr != nil {
 			return nil, fmt.Errorf("decodeDictPagesArena: page %d snappy: %w", i, decErr)
 		}
-		*pageBuf = pageRaw
+		*scratchBuf = pageRaw
 		return pageRaw, nil
 	}
 
@@ -587,7 +644,7 @@ func decodeDictPagesArena(
 	refTotals := make([]int, 0, 64)
 	var keyScratch []byte
 	for i, pm := range toc.Pages {
-		pageRaw, err := decodePage(i, pm)
+		pageRaw, err := decodePass1(i, pm)
 		if err != nil {
 			return err
 		}
@@ -643,7 +700,7 @@ func decodeDictPagesArena(
 	// Pass 2: decode each value's refs into its entry's exact-capacity sub-slice. Appends
 	// happen in page order (same as legacy), so per-entry ref order is byte-identical.
 	for i, pm := range toc.Pages {
-		pageRaw, err := decodePage(i, pm)
+		pageRaw, err := decodePass2(i, pm)
 		if err != nil {
 			return err
 		}

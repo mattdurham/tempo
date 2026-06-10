@@ -820,3 +820,35 @@ unchanged (`appendVariableWidthRefs`). Verified bit-identical to the old append/
 correct ref reconstruction; `go test -race ./blockio/shared` and `./executor` green.
 
 Back-ref: `internal/modules/blockio/shared/intrinsic_codec.go:appendDeltaUint64Page`
+
+---
+
+## NOTE-171: decodeDictPagesArena — single page decode via budgeted page retention
+*Added: 2026-06-10*
+
+**Problem:** `decodeDictPagesArena` (NOTE-152) snappy-decompresses every page **twice** — once
+in the sizing pass (pass 1) and once in the fill pass (pass 2). NOTE-152 deliberately accepted the
+redundant second decompress to keep memory bounded, under the then-current assumption that the
+querier was I/O-latency bound with CPU headroom (the old "33% CPU" profile). The 2026-06-10 querier
+CPU profile shows the opposite: queriers peg ~5 cores on heavy metrics queries, and `snappy.Decode`
+inside `decodeDictPagesArena` is on the M4 (`rate() by (resource.service.name)`) group-by hot path.
+The second decode is now wasted CPU on a CPU-bound path.
+
+**Decision:** Retain each page's decompressed bytes from pass 1 in a pooled `IntrinsicBuf` and reuse
+it in pass 2, decoding each page **once** in the common case. Retention is capped by a 4 MiB total
+budget (`retainBudget = intrinsicBufMaxCap`): once the sum of retained decompressed bytes would
+exceed the budget, that page's buffer is released and the page is re-decoded in pass 2 into a single
+shared scratch buffer (the old behavior). `retained[i] == nil` is the sentinel for "re-decode page
+i". This preserves the bounded-memory guarantee under `GOMEMLIMIT=13GiB` — at most ~4 MiB of
+decompressed pages plus one scratch buffer are held at once — while eliminating the second snappy
+decode for the overwhelmingly common case of small dict columns that fit the budget.
+
+**Why correct / byte-identical:** Output is independent of whether a page was retained or re-decoded
+— the decompressed bytes are identical either way, and `forEachDictPageValue` / `decodeRef` produce
+the same entries and refs. `decodeRef` returns a `BlockRef` **value** (no aliasing into the page
+buffer), and `DictEntry.Value` strings are created via `string(valBytes)` (a copy), so reusing or
+releasing page buffers after each pass cannot corrupt live column data. Entry order, per-entry ref
+order, and the exact-capacity arena contract from NOTE-152 are all unchanged. All retained buffers
+are returned to the pool via a deferred cleanup.
+
+Back-ref: `internal/modules/blockio/shared/intrinsic_codec.go:decodeDictPagesArena`
