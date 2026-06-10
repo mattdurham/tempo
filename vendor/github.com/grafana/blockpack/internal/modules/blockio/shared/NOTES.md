@@ -785,3 +785,38 @@ the exact order `slices.SortFunc` would produce. Binary-search consumers (`looku
 `BlockRefRange`, `LookupRefFast*`) see the same sorted index in both branches.
 
 Back-ref: `internal/modules/blockio/shared/intrinsic_ref_index.go:EnsureRefIndex`
+
+## NOTE-169: appendDeltaUint64Page — single-byte uvarint fast path, index-based store
+
+*Added: 2026-06-10*
+
+`appendDeltaUint64Page` decodes a delta-uint64 page (span:start and other sorted-uint64 intrinsic
+columns) by accumulating per-row uvarint deltas. After NOTE-168 retired the EnsureRefIndex sort,
+the querier CPU profile flagged `appendDeltaUint64Page` (~2.1% self time) as the residual decode
+cost of the unfiltered rate path (M1/M4 — `{} | rate()` and `{} | rate() by (...)`), which scans
+every block's span:start column.
+
+**Problem:** the loop called `binary.Uvarint(raw[pos:])` per row. Even inlined, that re-creates a
+slice header each iteration and runs its generic continuation-bit shift loop, and the result was
+appended one value at a time. Delta-sorted columns overwhelmingly produce deltas `< 128` (one byte),
+so the generic decoder did far more work than the common case needs.
+
+**Fix:**
+- **Single-byte fast path:** test `raw[pos] < 0x80` first; if so the delta is the byte value itself
+  — a plain load + add + `pos++`, no re-slice, no loop. Only when the continuation bit is set do we
+  fall back to `binary.Uvarint(raw[pos:])` for the multi-byte case (identical decode).
+- **Index-based store:** pre-extend `dst.Uint64Values` by `rowCount` once (within existing capacity
+  — callers pre-size to `totalRows`, NOTE-145/150 — else a single `append(make(...))` grow) and
+  write each value by index, removing the per-row append cap check. The pre-extend respects the
+  three-index capacity-capped slots used by `decodePagesParallel` (cap == rc, base == 0), so it
+  fills exactly the worker's disjoint `[off:off+rc)` region and never reallocates or aliases
+  another worker's slot.
+
+**Why correct:** the single-byte branch is exactly `binary.Uvarint`'s output when the leading byte
+has no continuation bit (`acc += b`); the multi-byte branch delegates to `binary.Uvarint` unchanged.
+The truncation error (`pos >= len(raw)`) is raised before any out-of-range read. Refs decode is
+unchanged (`appendVariableWidthRefs`). Verified bit-identical to the old append/Uvarint form over
+2000 random trials mixing small (1-byte) and large (multi-byte) deltas across both branches and
+correct ref reconstruction; `go test -race ./blockio/shared` and `./executor` green.
+
+Back-ref: `internal/modules/blockio/shared/intrinsic_codec.go:appendDeltaUint64Page`

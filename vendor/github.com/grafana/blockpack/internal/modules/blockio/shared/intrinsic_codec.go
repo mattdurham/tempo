@@ -1266,17 +1266,48 @@ func appendXORBytesPage(raw []byte, blockW, rowW, rowCount int, dst *IntrinsicCo
 // NOTE-014: no values_len prefix. Row count comes from the TOC RowCount field.
 // Do NOT call pageRefsStart here — that function assumes a values_len[4] prefix.
 func appendDeltaUint64Page(raw []byte, blockW, rowW, rowCount int, dst *IntrinsicColumn) error {
-	pos := 0
-	var acc uint64
-	for r := range rowCount {
-		delta, n := binary.Uvarint(raw[pos:])
-		if n <= 0 {
-			return fmt.Errorf("decodeDeltaUint64Page: truncated at uvarint row %d", r)
-		}
-		acc += delta
-		dst.Uint64Values = append(dst.Uint64Values, acc)
-		pos += n
+	// NOTE-169: index-based varint decode with a single-byte fast path, writing into
+	// a pre-extended slice region instead of per-row append. Delta-sorted uint64 columns
+	// (span:start, hundreds of pages of ~10k rows each) overwhelmingly produce deltas < 128
+	// (one byte), so the common case is a plain byte load + index store with no re-slice,
+	// no append cap check, and no generic 10-iteration shift loop. binary.Uvarint(raw[pos:])
+	// allocated a fresh slice header and ran its full continuation-bit loop on every row;
+	// this fuses the 1-byte case and only falls back to the multi-byte shift loop when the
+	// continuation bit is actually set. appendDeltaUint64Page was ~2.1% of querier CPU
+	// (profile 2026-06-10) and is the residual decode cost of the unfiltered rate path (M1/M4).
+	vals := dst.Uint64Values
+	base := len(vals)
+	// Pre-extend by rowCount within existing capacity (callers pre-size to totalRows,
+	// NOTE-145/150). When capacity is short (rare single-page direct callers) Go grows once.
+	if cap(vals)-base >= rowCount {
+		vals = vals[:base+rowCount]
+	} else {
+		vals = append(vals, make([]uint64, rowCount)...)
 	}
+
+	pos := 0
+	n := len(raw)
+	var acc uint64
+	for i := range rowCount {
+		if pos >= n {
+			return fmt.Errorf("decodeDeltaUint64Page: truncated at uvarint row %d", i)
+		}
+		b := raw[pos]
+		if b < 0x80 {
+			// Single-byte delta (the overwhelmingly common case).
+			acc += uint64(b)
+			pos++
+		} else {
+			delta, w := binary.Uvarint(raw[pos:])
+			if w <= 0 {
+				return fmt.Errorf("decodeDeltaUint64Page: truncated at uvarint row %d", i)
+			}
+			acc += delta
+			pos += w
+		}
+		vals[base+i] = acc
+	}
+	dst.Uint64Values = vals
 
 	if _, err := appendVariableWidthRefs(raw, pos, blockW, rowW, rowCount, &dst.BlockRefs); err != nil {
 		return fmt.Errorf("decodeDeltaUint64Page refs: %w", err)
