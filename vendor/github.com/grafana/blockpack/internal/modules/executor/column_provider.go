@@ -545,7 +545,7 @@ func scanStringDictFloat(
 	return count
 }
 
-// NOTE-156: scanNumericDict is the numeric-column analogue of scanStringDictFloat. Numeric
+// NOTE-156: scanNumericDict is the numeric-column analog of scanStringDictFloat. Numeric
 // columns (Uint64/Int64/Float64 and their Range variants) are dict-encoded: a small Dict of
 // distinct values + a per-row Idx into it. For a range comparison (>, >=, <, <=) the per-row
 // loop in scanWith→rowCompare re-evaluated the comparison (with interface type-switch + indirect

@@ -193,9 +193,12 @@ func ExecuteTraceMetrics(
 					}
 					result.BlocksScanned++
 					attrVals := make([]string, len(groupBy)) // NOTE-054
+					// NOTE-159: one composite-key scratch buffer per block, reused across rows.
+					scratch := acquireCompositeKeyScratch()
 					for rowIdx := range int(meta.SpanCount) {
-						traceAccumulateRow(r, blockIdx, bwb.Block, rowIdx, querySpec, buckets, attrVals)
+						traceAccumulateRow(r, blockIdx, bwb.Block, rowIdx, querySpec, buckets, attrVals, scratch)
 					}
+					releaseCompositeKeyScratch(scratch)
 					// NOTE-153: block fully scanned (incl. any lazy span:start decode above);
 					// return the lazy-column arena to the pool.
 					bwb.Block.ReleaseLazyColumnStore()
@@ -239,9 +242,12 @@ func ExecuteTraceMetrics(
 					[]string,
 					len(groupBy),
 				) // NOTE-054: per-block scratch; cleared at top of traceAccumulateRow
+				// NOTE-159: one composite-key scratch buffer per block, reused across rows.
+				scratch := acquireCompositeKeyScratch()
 				for _, rowIdx := range rowSet.ToSlice() {
-					traceAccumulateRow(r, blockIdx, bwb.Block, rowIdx, querySpec, buckets, attrVals)
+					traceAccumulateRow(r, blockIdx, bwb.Block, rowIdx, querySpec, buckets, attrVals, scratch)
 				}
+				releaseCompositeKeyScratch(scratch)
 				releaseBlockColumnProvider(provider)
 				// NOTE-153: both passes fully consumed — return their lazy-column arenas.
 				firstBlock.ReleaseLazyColumnStore()
@@ -266,6 +272,12 @@ func ExecuteTraceMetrics(
 
 // traceAccumulateRow accumulates one span's contribution into the buckets map.
 // attrVals is a scratch slice of len(querySpec.Aggregate.GroupBy) reused across calls.
+// NOTE-159: scratch is a per-block composite-key buffer owned by the caller. It is
+// acquired once per block from compositeKeyScratchPool (not per row) and reused across
+// every row in the block, then released after the block's row loop. This removes one
+// sync.Pool Get + one Put + one defer from the per-span hot path (M4/M6/M8). The buffer
+// is always truncated to [:0] before each key build below, so no stale bytes leak between
+// rows.
 func traceAccumulateRow(
 	r *modules_reader.Reader,
 	blockIdx int,
@@ -274,6 +286,7 @@ func traceAccumulateRow(
 	querySpec *vm.QuerySpec,
 	buckets map[string]*aggBucketState,
 	attrVals []string,
+	scratch *[]byte,
 ) {
 	// NOTE-054: clear attrVals at function entry so stale values from prior rows never
 	// survive an early return. NOTE-067: scratch buffer appends attrVals in-place; clear
@@ -326,9 +339,7 @@ func traceAccumulateRow(
 		// Missing column → empty string label (Tempo convention).
 	}
 	// NOTE-067: scratch buffer eliminates 3 per-span allocs on map-hit (Join + FormatInt + concat).
-	// Pool holds *[]byte so the slice header survives the pool round-trip.
-	scratch := acquireCompositeKeyScratch()
-	defer releaseCompositeKeyScratch(scratch)
+	// NOTE-159: scratch is now caller-owned (acquired once per block, not per row); reset to [:0].
 	*scratch = strconv.AppendInt((*scratch)[:0], bucketIdx, 10)
 	*scratch = append(*scratch, '\x00') // always emit separator (matches current " + "\x00" + attrGroupKey")
 	for i, v := range attrVals {

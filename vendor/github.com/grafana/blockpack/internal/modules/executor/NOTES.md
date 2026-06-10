@@ -4164,3 +4164,39 @@ float64(400) threshold: fast path 6.4 µs/op vs legacy loop ~20 µs/op (~3.1× f
 so the per-block predicate-pass CPU drops proportionally.
 
 Back-ref: `internal/modules/executor/column_provider.go:scanNumericDict,scanNumericDictMask,cmpSign,StreamScanGreaterThanOrEqual,StreamScanGreaterThan,StreamScanLessThan,StreamScanLessThanOrEqual`
+
+## NOTE-159: per-row redundant-work removal on the metrics group-by hot path (2026-06-10)
+
+Two small, byte-identical CPU reductions on `traceAccumulateRow` — the per-span loop body
+for attribute-column group-by metrics (M4 `{}|rate() by(resource.service.name)`, M6
+`{span.kind=server}|rate() by(span.http.request.method)`, M8 histogram by service). This path
+is CPU-bound on the cluster (KEY FINDING 2, 2026-06-09: queriers peg ~5 cores on heavy metrics,
+the earlier "33% CPU / 90% I/O wait" was a light window).
+
+**Change 1 — drop the redundant `IsPresent` in `metricsColumnString`** (`block_label_set.go`).
+The function previously opened with `if col == nil || !col.IsPresent(rowIdx)`. Every typed
+accessor it then calls (`StringValue`/`Int64Value`/`Uint64Value`/`Float64Value`/`BoolValue`/
+`BytesValue`) already runs `needsDecode()` (atomic load) + `expandDenseIdx()` (sync.Once
+fast-path) + `IsPresent(idx)` (presence-bitmap read) internally and returns `ok=false` for absent
+rows — which yields the same empty-string label. So the leading `IsPresent` doubled all three
+on every span. Dropped it; kept only the `col == nil` guard (must precede the `col.Type` read).
+Byte-identical: absent rows still return `""` (accessor `ok=false` → final `return ""`);
+unhandled types (e.g. UUID, vector) still return `""` (fall through the switch), exactly as the
+old `!IsPresent`→`""` and "type not in switch"→`""` arms did.
+
+**Change 2 — hoist the composite-key scratch buffer to per-block** (`metrics_trace.go`).
+`traceAccumulateRow` did `scratch := acquireCompositeKeyScratch(); defer releaseCompositeKeyScratch(scratch)`
+on **every row** — one `sync.Pool` Get + one Put + one `defer` per span. The buffer is now
+acquired once per block by the two caller loops (the `predicateCols==nil` single-pass path and
+the two-pass matched-row path) and passed in as a parameter, reused across all rows, released
+after the block's row loop. `traceAccumulateRow` resets it with `(*scratch)[:0]` before each key
+build, so no stale bytes leak between rows; all early returns occur before scratch is touched.
+Alloc behavior is unchanged (still 0 allocs/row on map-hit, 1 stored-key alloc on map-miss,
+NOTE-073); the win is removing per-row Pool/defer overhead from the tight loop.
+
+Both changes preserve the exact key format (NOTE-067/NOTE-073) and HISTOGRAM 3rd-segment
+encoding (NOTE-033). Verified by the full executor suite under `-race` (incl.
+`metrics_trace_test.go`, `metrics_trace_composite_key_test.go`, `metrics_trace_pool_test.go`).
+
+Back-ref: `internal/modules/executor/block_label_set.go:metricsColumnString`,
+`internal/modules/executor/metrics_trace.go:traceAccumulateRow,ExecuteTraceMetrics`

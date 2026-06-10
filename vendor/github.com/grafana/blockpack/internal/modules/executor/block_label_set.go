@@ -256,7 +256,15 @@ func (b *blockLabelSet) Materialize() map[string]string {
 
 // metricsColumnString converts any column type to its string representation.
 func metricsColumnString(col *modules_reader.Column, rowIdx int) string {
-	if col == nil || !col.IsPresent(rowIdx) {
+	// NOTE-159: the leading IsPresent guard was redundant. Every typed accessor below
+	// (StringValue/Int64Value/Uint64Value/Float64Value/BoolValue/BytesValue) already runs
+	// needsDecode() + expandDenseIdx() + IsPresent(idx) internally and returns ok=false for
+	// absent rows. Calling IsPresent here first duplicated all three (atomic load, sync.Once
+	// fast-path, presence-bitmap read) on every span — doubling that work on the metrics
+	// group-by hot path (M4/M6/M8 traceAccumulateRow). The accessor's ok=false already yields
+	// the empty-string label for absent rows, so the guard is dropped; only the nil check
+	// (which must precede the col.Type read) remains.
+	if col == nil {
 		return ""
 	}
 	switch col.Type {
