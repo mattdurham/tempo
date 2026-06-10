@@ -4261,3 +4261,33 @@ returned buffer re-enters the same pool. Verified by the full executor suite und
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:acquireCompactUint32NoClear,
 streamCountRateN1Compact,streamCountRateN1CompactFromRefs,streamHistogramN1CompactFromRefs,
 streamAggN1Compact,streamAggN1CompactFromRefs`
+
+## NOTE-166: mergeJoinFilteredRefsWithVals — probe-then-sort-matches (drop O(N log N) sort)
+*Added: 2026-06-10*
+**Decision:** Replace the full-array packed-index sort in `mergeJoinFilteredRefsWithVals`
+(NOTE-111/128: build `idxPacked []uint64` over all N in-range refs, then `slices.Sort` it,
+then two-pointer-merge against the sorted `filteredPKs`) with a probe-then-sort-matches
+strategy: walk `inRangeRefs` in natural order, range-gate each packKey against
+`[filteredPKs[0], filteredPKs[last]]`, binary-search survivors against the already-sorted
+`filteredPKs`, and collect only matches as packed `(pk<<32 | pos)` into `matched[]`. Sort
+ONLY the matched subset (M ≤ F ≪ N) to restore the packKey-sorted output invariant that
+downstream compact paths (NOTE-110/112/114) rely on (they build `sortedPKs` in O(n)).
+**Rationale:** A 2026-06-09 querier CPU profile attributed `slices.partitionOrdered` +
+`insertionSortOrdered` + `partitionCmpFunc` + `cmp.Less` — reached exclusively via this
+function — at ~12% of total querier CPU, the single largest blockpack-attributable
+self-cost. The dominant term was sorting the large N in-range array. The new form is
+O(N log F) probe + O(M log M) sort instead of O(N log N); for the common selective case
+M ≪ N so the sort cost collapses. The ~57 MB `idxPacked` allocation is replaced by an
+M-sized matched buffer (still pooled via compactUint64Pool). The profile was also dominated
+by GC (gcDrain/scanObject/markroot/wbBufFlush), so removing the 57 MB allocation directly
+reduces GC CPU on the hot path.
+**Correctness:** Output (ref,val) set is identical to the former merge-join: a ref is emitted
+iff its packKey appears in filteredRefs. The `[flo, fhi]` range gate only skips packKeys that
+binary search would reject anyway (filteredPKs is sorted). Output remains packKey-sorted
+because `matched` is sorted by its high 32 bits (pk) before emission. Verified by
+merge_join_test.go (order-insensitive set equality vs a reference map intersect AND
+packKey-sorted-output assertion) under `-race`.
+**Queries affected:** All predicate-filtered metrics queries that take the merge-join path
+(M6, M9, M10 and any `... by (...)` with a predicate that is not the N=0 hash-filter fast
+path of NOTE-113).
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:mergeJoinFilteredRefsWithVals`

@@ -2054,13 +2054,14 @@ func streamHistogramN1Compact(
 //
 // Sort invariant: inRangeRefs is timestamp-sorted (types.go:228), not packKey-sorted.
 // filteredRefs order is unspecified (intersectBlockRefSets may return any order).
-// Both must be sorted by packKey before the two-pointer walk.
+// The returned outRefs/outVals are packKey-sorted (NOTE-166): downstream compact paths
+// (NOTE-110/112/114) build sortedPKs in O(n) assuming this order.
 //
 // Mutation rules:
-//   - filteredRefs is cloned before sorting (caller's slice is not modified).
+//   - filteredRefs is copied into a sorted []uint32 of packKeys (caller's slice is not modified).
 //   - inRangeRefs is NOT sorted in-place (it is a sub-slice of a shared intrinsic
-//     column). A sorted index ([]refIdx) is built over original positions so that
-//     inRangeVals alignment is preserved.
+//     column). Matches are collected as packed (pk<<32 | pos) and only that subset is
+//     sorted, so inRangeVals alignment is preserved via the recorded positions.
 //
 // NOTE-130: outRefs/outVals are pooled. Caller must invoke release() after consuming the slices.
 func mergeJoinFilteredRefsWithVals(
@@ -2075,7 +2076,7 @@ func mergeJoinFilteredRefsWithVals(
 
 	// Build a sorted []uint32 of filteredRefs packKeys — cheaper than cloning BlockRef
 	// (same 4 bytes/entry but avoids SortFunc closure; packKey is pre-computed so the
-	// merge comparison below avoids recomputing it per comparison step).
+	// probe below avoids recomputing it per step).
 	filteredPKs := acquireCompactUint32(
 		len(filteredRefs),
 	) // NOTE-128: ~15 MB at F=3.75 M; pooled to eliminate GC pressure
@@ -2084,22 +2085,43 @@ func mergeJoinFilteredRefsWithVals(
 	}
 	slices.Sort(filteredPKs)
 
-	// Build a sorted index over inRangeRefs by packKey.
-	// NOTE-111: pack pk (high 32 bits) and relative index (low 32 bits) into uint64 —
-	// half the size of refIdx{uint32,int} (8 vs 12 bytes/entry). Both fit in uint32:
-	// maxPK < 2^32, len(inRangeRefs) < 2^32. slices.Sort (no closure) is also faster
-	// than SortFunc on the struct form.
-	idxPacked := acquireCompactUint64(
-		len(inRangeRefs),
-	) // NOTE-128: ~57 MB at N=7.2 M; pooled. No clear needed — fully overwritten before slices.Sort.
+	// NOTE-166: probe-then-sort-matches. The former implementation built a packed
+	// []uint64 index over ALL N in-range refs (idxPacked, ~57 MB at N=7.2 M) and ran
+	// slices.Sort over that full array — an O(N log N) sort that a 2026-06-09 querier CPU
+	// profile attributed (via slices.partitionOrdered/insertionSortOrdered reached
+	// exclusively from this function) at ~12% of total querier CPU and the single largest
+	// blockpack-attributable self-cost. Instead, walk inRangeRefs in natural order and
+	// binary-search each packKey against the already-sorted (and usually much smaller)
+	// filteredPKs. Matches are collected as packed (pk<<32 | pos) into matched[]; only the
+	// MATCHED subset (M ≤ F ≪ N) is sorted to restore the packKey-sorted output invariant
+	// that downstream compact paths (NOTE-110/112/114) depend on. Net: the O(N log N) sort
+	// of the large in-range array becomes an O(N log F) probe + O(M log M) sort, and the
+	// ~57 MB idxPacked allocation is replaced by an M-sized buffer.
+	matched := acquireCompactUint64(len(inRangeRefs)) // cap N; trimmed to M below. Pooled.
+	m := 0
+	flo := filteredPKs[0]
+	fhi := filteredPKs[len(filteredPKs)-1]
 	for i, ref := range inRangeRefs {
-		idxPacked[i] = uint64(packKey(ref.BlockIdx, ref.RowIdx))<<32 | uint64(uint32(i)) //nolint:gosec
+		pk := packKey(ref.BlockIdx, ref.RowIdx)
+		// Skip the binary search entirely for packKeys outside [flo, fhi]; the merge-join
+		// frequently sees in-range refs whose blocks were pruned away by the predicate.
+		if pk < flo || pk > fhi {
+			continue
+		}
+		// sort.Search finds the first filteredPKs index >= pk; a match requires equality.
+		j := sort.Search(len(filteredPKs), func(k int) bool { return filteredPKs[k] >= pk })
+		if j < len(filteredPKs) && filteredPKs[j] == pk {
+			matched[m] = uint64(pk)<<32 | uint64(uint32(i)) //nolint:gosec
+			m++
+		}
 	}
-	slices.Sort(idxPacked)
+	matched = matched[:m]
+	// Restore packKey-sorted output order. M is the match count (≤ F ≪ N), so this sort is
+	// far cheaper than sorting the full N-element in-range array.
+	slices.Sort(matched)
 
-	outCap := min(len(filteredPKs), len(idxPacked))
-	outRefsBacking := acquireCompactBlockRef(outCap) // NOTE-130: ~14 MB at outCap=3.5M; pooled
-	outValsBacking := acquireCompactUint64(outCap)   // NOTE-130: ~28 MB at outCap=3.5M; reuses compactUint64Pool
+	outRefsBacking := acquireCompactBlockRef(m) // NOTE-130: pooled
+	outValsBacking := acquireCompactUint64(m)   // NOTE-130: pooled; reuses compactUint64Pool
 	outRefs = outRefsBacking[:0]
 	outVals = outValsBacking[:0]
 	release = func() {
@@ -2107,20 +2129,12 @@ func mergeJoinFilteredRefsWithVals(
 		releaseCompactUint64(outValsBacking)
 	}
 
-	fi := 0
-	for _, packed := range idxPacked {
-		pk := uint32(packed >> 32)
+	for _, packed := range matched {
 		pos := int(uint32(packed)) //nolint:gosec
-		// Advance filteredPKs pointer past any keys smaller than pk.
-		for fi < len(filteredPKs) && filteredPKs[fi] < pk {
-			fi++
-		}
-		if fi < len(filteredPKs) && filteredPKs[fi] == pk {
-			outRefs = append(outRefs, inRangeRefs[pos])
-			outVals = append(outVals, inRangeVals[pos])
-		}
+		outRefs = append(outRefs, inRangeRefs[pos])
+		outVals = append(outVals, inRangeVals[pos])
 	}
-	releaseCompactUint64(idxPacked)
+	releaseCompactUint64(matched)
 	releaseCompactUint32(filteredPKs)
 	return outRefs, outVals, release
 }
