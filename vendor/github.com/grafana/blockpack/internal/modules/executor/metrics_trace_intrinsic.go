@@ -99,7 +99,9 @@ func releaseCompactUint32(s []uint32) {
 // index [0,n) (one packKey per in-range ref) before any read, so the clear() in
 // acquireCompactUint32 is pure waste — ~28 MB of zeroing per file at n≈7.2 M on the warm
 // M6/M8/M9 rate-by/histogram scan path. Only callers that fully overwrite [0:n) before reading
-// may use this; sentinel-using buffers (dictIdxByPos, rankPrefix) must keep acquireCompactUint32.
+// may use this; sentinel-using buffers (dictIdxByPos) must keep acquireCompactUint32. NOTE-195
+// migrated rankPrefix to this NoClear variant once its build loop was confirmed to write all
+// n+1 elements before any read.
 func acquireCompactUint32NoClear(n int) []uint32 {
 	if v := compactUint32Pool.Get(); v != nil {
 		if s, ok := v.([]uint32); ok && cap(s) >= n {
@@ -597,9 +599,13 @@ func scanGroupByColCompact(
 		pkBitset[pk>>6] |= uint64(1) << (pk & 63)
 	}
 	// NOTE-140: POPCNT rank index. Build cost: O(maxPK/64) ≈ 250K iterations at maxPK=16M → ~0.5µs.
-	rankPrefix := acquireCompactUint32(n + 1)
+	// NOTE-195: rankPrefix is fully overwritten before any read — the loop writes
+	// rankPrefix[0:len(pkBitset)] (== [0:n)) and the trailing assignment writes
+	// rankPrefix[len(pkBitset)] (== [n]), covering all n+1 elements. The clear() inside
+	// acquireCompactUint32 is therefore pure waste here (~1 MB zeroed per call at maxPK=16M,
+	// on the M4/M6/M9 group-by scan path), so use the NoClear variant.
+	rankPrefix := acquireCompactUint32NoClear(n + 1)
 	defer releaseCompactUint32(rankPrefix)
-	// acquireCompactUint32 calls clear() internally (NOTE-125 pool semantics).
 	var cum uint32
 	for i, w := range pkBitset {
 		rankPrefix[i] = cum
@@ -890,7 +896,8 @@ func scanAggColHistogramCompact( //nolint:gocyclo
 	for _, pk := range sortedPKs {
 		pkBitset[pk>>6] |= uint64(1) << (pk & 63)
 	}
-	rankPrefix := acquireCompactUint32(nWords + 1)
+	// NOTE-195: fully overwritten before read (see scanGroupByColCompact) — skip the clear.
+	rankPrefix := acquireCompactUint32NoClear(nWords + 1)
 	defer releaseCompactUint32(rankPrefix)
 	var cum uint32
 	for i, w := range pkBitset {
@@ -1864,9 +1871,9 @@ func scanAggColCompact(
 		}
 		// NOTE-141: POPCNT rank index. rankPrefix[i] = cumulative popcount of pkBitset[0..i-1].
 		// Build cost: O(maxPK/64) ≈ 250K iterations at maxPK=16M → ~0.5µs per block.
-		rankPrefix = acquireCompactUint32(n + 1)
+		// NOTE-195: fully overwritten before read (see scanGroupByColCompact) — skip the clear.
+		rankPrefix = acquireCompactUint32NoClear(n + 1)
 		defer releaseCompactUint32(rankPrefix)
-		// acquireCompactUint32 calls clear() internally (NOTE-125 pool semantics).
 		var cum uint32
 		for i, w := range pkBitset {
 			rankPrefix[i] = cum

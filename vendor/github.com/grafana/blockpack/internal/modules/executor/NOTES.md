@@ -4484,3 +4484,26 @@ argument is the same one NOTE-166/167 already rely on for the bitset membership 
 **Queries affected:** Predicate-filtered merge-join path — M6, M9, M10, and any `... by (...)` with a
 predicate.
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:mergeJoinFilteredRefsWithVals`
+
+## NOTE-195 — rankPrefix POPCNT index uses the NoClear pool variant
+**What:** All three POPCNT `rankPrefix` build sites (scanGroupByColCompact for N=1 rate-by,
+scanAggColHistogramCompact for histograms, and the predicate-filtered histogram driver) now acquire
+their `rankPrefix` buffer via `acquireCompactUint32NoClear(n+1)` instead of `acquireCompactUint32(n+1)`,
+skipping the pool's internal `clear()`.
+**Rationale:** `rankPrefix` is the prefix-sum of `pkBitset`'s per-word popcounts. Its build loop is
+`for i, w := range pkBitset { rankPrefix[i] = cum; cum += popcount(w) }` followed by
+`rankPrefix[len(pkBitset)] = cum`. Because the buffer is sized to `len(pkBitset)+1` (== n+1) and
+`len(pkBitset) == n`, every index `[0, n]` — i.e. all n+1 elements — is written before `rankPrefix`
+is ever read by the scan inner loops. The `clear()` inside `acquireCompactUint32` was therefore pure
+waste: it zeroes a buffer that is immediately fully overwritten. `n = (maxPK>>6)+1` is the packKey
+bitset word count (~250 K at maxPK=16 M), so the skipped clear is ~1 MB of zeroing per call on the
+hot M4/M6/M9/M8 group-by/histogram scan path. This is the same fully-overwritten-before-read argument
+NOTE-164 used to introduce `acquireCompactUint32NoClear` for the `sortedPKs` buffers; the original
+NOTE-164 comment conservatively excluded `rankPrefix` ("sentinel-using"), but `rankPrefix` carries no
+sentinel — every slot is written deterministically by the build loop — so it qualifies.
+**Correctness:** `pkBitset` keeps its explicit `clear()` (it IS a zero-bit membership sentinel and is
+only partially set by the `pk>>6` writes). Only `rankPrefix` changed. Output of every scan path is
+byte-identical: the rank values are a pure function of the fully-built `pkBitset` and are computed the
+same way regardless of the buffer's prior contents.
+**Queries affected:** All group-by/histogram scan paths — M4, M6, M8, M9, M10.
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:scanGroupByColCompact,scanAggColHistogramCompact`
