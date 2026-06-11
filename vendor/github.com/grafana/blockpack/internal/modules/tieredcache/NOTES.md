@@ -145,3 +145,21 @@ suites green under `-race`.
 
 Back-ref: `internal/modules/sectioncache/keys.go:V8SectionKeyFast`,
 `internal/modules/tieredcache/typed.go` (4 key builds).
+
+## NOTE-197 — batch per-file intrinsic column fetch (GetMultiIntrinsic)
+
+A metrics/search query touches several intrinsic columns per file (span:start + every
+predicate-leaf column + each group-by column). Each was previously resolved by its own
+`GetOrFetchIntrinsic`, i.e. one memcache round-trip (and under pool pressure one connection
+acquisition) per column. A querier CPU profile (2026-06-11) is dominated by kernel networking
+(`__nft_rbtree_lookup` ~23%, `sch_direct_xmit`/`veth_xmit`/`nf_hook_slow` tx softirq path) on
+these round-trips — not by decode. `GetMultiIntrinsic` collapses the per-file intrinsic fan-out
+into a single pipelined `GetMulti` (same lever NOTE-179/185 applied to V8 block columns). It
+re-keys hits by input name without a reverse-lookup map (NOTE-188 pattern) and returns
+`(nil,false,nil)` when the intrinsic sub-cache lacks batch support so callers fall back to
+per-name fetches. Misses fall through to the existing per-name path, so the result is identical.
+
+**Verification:** `go build ./...` clean; tieredcache + reader + executor suites green under `-race`.
+
+Back-ref: `internal/modules/tieredcache/typed.go:GetMultiIntrinsic`,
+`internal/modules/blockio/reader/intrinsic_reader.go:PrefetchIntrinsicColumns`.

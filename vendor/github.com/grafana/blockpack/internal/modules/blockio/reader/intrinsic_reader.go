@@ -166,6 +166,91 @@ func (r *Reader) GetIntrinsicColumnBlob(name string) ([]byte, error) {
 	return blob, nil
 }
 
+// intrinsicBatchFetcher is the optional interface a section cache may implement to
+// batch-fetch several intrinsic column blobs for one file in a single round-trip.
+// TypedTieredCache.GetMultiIntrinsic implements it; caches that don't are simply not
+// prefetched (each column resolves through its own GetOrFetchIntrinsic instead).
+type intrinsicBatchFetcher interface {
+	GetMultiIntrinsic(fileID string, names []string) (map[string][]byte, bool, error)
+}
+
+// PrefetchIntrinsicColumns batch-fetches the named intrinsic column blobs in ONE
+// pipelined cache round-trip, decodes each hit, and populates the per-Reader and
+// process-level decoded-column caches so subsequent GetIntrinsicColumn calls for
+// those names return from cache with no further memcache traffic.
+//
+// NOTE-197: a metrics/search query reads several intrinsic columns per file (every
+// predicate-leaf column + each group-by column + span:start). Resolving them one at a
+// time via GetIntrinsicColumn issued one memcache round-trip per column; the querier
+// CPU profile is dominated by kernel networking on those round-trips. Prefetching the
+// whole per-file working set in a single GetMulti collapses N round-trips into one —
+// the same lever NOTE-179/185 applied to V8 block columns. Columns already decoded
+// (per-Reader or process cache) are skipped, and names that miss the batch fall through
+// to the normal per-name path on their first GetIntrinsicColumn, so the result is
+// identical to never prefetching. Best-effort: any decode/cache error on an individual
+// column is ignored here (the per-name path will surface it on access).
+//
+// NOT safe for concurrent use with GetIntrinsicColumn on the same Reader.
+func (r *Reader) PrefetchIntrinsicColumns(names []string) {
+	if r.intrinsicIndex == nil || len(names) == 0 {
+		return
+	}
+	bf, ok := r.cache.(intrinsicBatchFetcher)
+	if !ok {
+		return
+	}
+
+	// Collect names that are present in this file and not already decoded.
+	want := make([]string, 0, len(names))
+	r.intrinsicMu.RLock()
+	for _, name := range names {
+		if _, present := r.intrinsicIndex[name]; !present {
+			continue
+		}
+		if r.intrinsicDecoded != nil {
+			if _, done := r.intrinsicDecoded[name]; done {
+				continue
+			}
+		}
+		want = append(want, name)
+	}
+	r.intrinsicMu.RUnlock()
+	if len(want) == 0 {
+		return
+	}
+
+	hits, supported, err := bf.GetMultiIntrinsic(r.fileID, want)
+	if err != nil || !supported || len(hits) == 0 {
+		return
+	}
+
+	useProcessCache := r.fileID != ""
+	for name, blob := range hits {
+		if blob == nil {
+			continue
+		}
+		col, decErr := shared.DecodeIntrinsicColumnBlob(blob)
+		if decErr != nil || col == nil {
+			continue // per-name path will re-fetch and surface the error on access
+		}
+		col.Name = name
+
+		if useProcessCache {
+			// Best-effort process-cache population; ignore Put errors (e.g. size cap).
+			_ = parsedIntrinsicCache.Put(r.fileID+"/intrinsic/"+name, col)
+		}
+
+		r.intrinsicMu.Lock()
+		if r.intrinsicDecoded == nil {
+			r.intrinsicDecoded = make(map[string]*shared.IntrinsicColumn)
+		}
+		if _, done := r.intrinsicDecoded[name]; !done {
+			r.intrinsicDecoded[name] = col
+		}
+		r.intrinsicMu.Unlock()
+	}
+}
+
 // GetIntrinsicColumn returns the decoded intrinsic column for the given name,
 // or nil if the file has no intrinsic section or the column is not present.
 // The column blob is read and decoded on first call; subsequent calls return the

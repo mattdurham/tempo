@@ -681,6 +681,55 @@ func (t *TypedTieredCache) GetOrFetchIntrinsic(
 	return val, err
 }
 
+// GetMultiIntrinsic batch-fetches intrinsic per-column blobs for fileID in ONE
+// pipelined GetMulti, returning a map keyed by the input column names. Names absent
+// from the result missed the cache and must be fetched + cached by the caller via
+// GetOrFetchIntrinsic. Returns (nil, false, nil) when the intrinsic sub-cache does
+// not support batch fetch, signaling the caller to fall back to per-name fetches.
+//
+// NOTE-197: a metrics/search query touches several intrinsic columns per file
+// (every predicate leaf column + each group-by column + span:start), and each was
+// previously resolved by its own GetOrFetchIntrinsic — i.e. one memcache round-trip
+// (and, under pool pressure, one connection acquisition) per column. The querier CPU
+// profile is dominated by kernel networking (netfilter rbtree lookup + tx softirq) on
+// these round-trips, not by decode. Collapsing the per-file intrinsic column fan-out
+// into a single GetMulti — the same lever NOTE-179/185 applied to V8 block columns —
+// cuts the packet/round-trip count proportionally to the number of columns the query
+// reads. Misses fall back to the existing per-name path, so the result is identical.
+func (t *TypedTieredCache) GetMultiIntrinsic(
+	fileID string,
+	names []string,
+) (map[string][]byte, bool, error) {
+	bg, ok := t.intrinsic.(sectionBatchGetter)
+	if !ok {
+		return nil, false, nil
+	}
+
+	var start time.Time
+	if t.sectionRequests != nil {
+		start = time.Now()
+	}
+	keys := make([]string, len(names))
+	for i, name := range names {
+		keys[i] = sectioncache.IntrinsicKey(fileID, name)
+	}
+	hits, err := bg.GetMulti(keys)
+	if err != nil {
+		t.observeSection(idxIntrinsic, start, false, err)
+		return nil, true, err
+	}
+	// Re-key by input name without a reverse-lookup map: keys[i] is the full cache
+	// key for names[i] (index-aligned), so probe hits directly (NOTE-188 pattern).
+	out := make(map[string][]byte, len(hits))
+	for i, name := range names {
+		if val, found := hits[keys[i]]; found {
+			out[name] = val
+		}
+	}
+	t.observeSection(idxIntrinsic, start, false, nil)
+	return out, true, nil
+}
+
 // Close closes all sub-caches. Deduplicates by pointer to avoid double-closing
 // shared instances (e.g. DefaultTypedConfig assigns the same mem to 5 fields).
 // Safe to call on a nil *TypedTieredCache.

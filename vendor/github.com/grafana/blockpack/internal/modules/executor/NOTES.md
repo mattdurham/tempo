@@ -4507,3 +4507,17 @@ byte-identical: the rank values are a pure function of the fully-built `pkBitset
 same way regardless of the buffer's prior contents.
 **Queries affected:** All group-by/histogram scan paths — M4, M6, M8, M9, M10.
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:scanGroupByColCompact,scanAggColHistogramCompact`
+
+## NOTE-197 — prefetch intrinsic working set before per-column scans
+
+`executeTraceMetricsIntrinsic` now calls `prefetchIntrinsicWorkingSet` immediately after the
+intrinsic-eligibility check, before the first `GetIntrinsicColumn`. It collects the union of
+span:start, the aggregate field, every group-by column, and every predicate-leaf intrinsic
+column (all normalized to full intrinsic names via normalizeIntrinsicFieldName), then issues one
+batched `Reader.PrefetchIntrinsicColumns` so the subsequent per-column reads (predicate filter +
+group-by) are served from cache with no per-column memcache round-trip. This attacks the kernel
+networking cost (the dominant querier CPU sink per the 2026-06-11 profile) by cutting the per-file
+intrinsic round-trip count, not the per-row decode cost.
+**Queries affected:** all intrinsic metrics paths reading >1 intrinsic column — M4, M6, M8, M9.
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:prefetchIntrinsicWorkingSet,executeTraceMetricsIntrinsic`,
+`internal/modules/blockio/reader/intrinsic_reader.go:PrefetchIntrinsicColumns`.

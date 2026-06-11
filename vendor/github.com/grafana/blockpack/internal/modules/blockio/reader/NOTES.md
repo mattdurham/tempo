@@ -1098,3 +1098,22 @@ under `-race`.
 Back-ref: `internal/modules/blockio/reader/columnar_read.go:colSectionName`,
 `readBlockColumnarWithCache`, `fetchTocAndColumnsCombined`, `fetchColumnsBatched`,
 `fetchColumnInto`.
+
+## NOTE-197 — PrefetchIntrinsicColumns warms the per-file intrinsic working set in one round-trip
+
+`PrefetchIntrinsicColumns(names)` batch-fetches the named intrinsic column blobs via the
+optional `intrinsicBatchFetcher` (TypedTieredCache.GetMultiIntrinsic), decodes each hit, and
+populates both the per-Reader `intrinsicDecoded` map and the process-level `parsedIntrinsicCache`.
+Subsequent `GetIntrinsicColumn` calls for those names then return from the per-Reader cache with
+zero memcache traffic, and `GetIntrinsicColumnBlob` (raw-scan predicate path) hits the in-process
+chaincache tier the batch wrote back into. Names not present in the file or already decoded are
+skipped; names that miss the batch fall through to the normal per-name path. Decode/cache errors
+on an individual column are ignored here (the per-name path surfaces them on access). NOT safe
+for concurrent use with GetIntrinsicColumn on the same Reader (callers invoke it synchronously
+on the same goroutine that then scans).
+
+**Verification:** reader + tieredcache + executor suites green under `-race`.
+
+Back-ref: `internal/modules/blockio/reader/intrinsic_reader.go:PrefetchIntrinsicColumns`,
+`internal/modules/tieredcache/typed.go:GetMultiIntrinsic`,
+`internal/modules/executor/metrics_trace_intrinsic.go:prefetchIntrinsicWorkingSet`.

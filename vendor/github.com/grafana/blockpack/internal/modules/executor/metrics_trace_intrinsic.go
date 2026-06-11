@@ -316,6 +316,15 @@ func executeTraceMetricsIntrinsic(
 		return nil, false, err
 	}
 
+	// NOTE-197: prefetch the whole per-file intrinsic working set in one cache
+	// round-trip before the per-column GetIntrinsicColumn calls below. The query reads
+	// span:start, every predicate-leaf intrinsic column, and each group-by column; each
+	// would otherwise resolve through its own memcache fetch. Batching collapses those
+	// N round-trips into one. Names not present in the file or already decoded are
+	// skipped inside PrefetchIntrinsicColumns, and any miss falls through to the normal
+	// per-name path, so behavior is unchanged.
+	prefetchIntrinsicWorkingSet(r, program, querySpec)
+
 	tsCol, err := r.GetIntrinsicColumn("span:start")
 	if err != nil {
 		return nil, false, err
@@ -406,6 +415,45 @@ func executeTraceMetricsIntrinsic(
 		result.Series = traceBuildDenseSeries(buckets, querySpec)
 	}
 	return result, true, nil
+}
+
+// prefetchIntrinsicWorkingSet batch-loads the intrinsic columns this metrics query will
+// read — span:start, the aggregate field, every group-by column, and every predicate-leaf
+// intrinsic column — in a single cache round-trip via Reader.PrefetchIntrinsicColumns.
+// Column names are normalized to their full intrinsic form (e.g. "duration" -> "span:duration").
+// NOTE-197.
+func prefetchIntrinsicWorkingSet(r *modules_reader.Reader, program *vm.Program, querySpec *vm.QuerySpec) {
+	seen := make(map[string]struct{}, 8)
+	names := make([]string, 0, 8)
+	add := func(field string) {
+		name := normalizeIntrinsicFieldName(field)
+		if name == "" {
+			return
+		}
+		if _, dup := seen[name]; dup {
+			return
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+
+	add("span:start")
+	add(querySpec.Aggregate.Field)
+	for _, g := range querySpec.Aggregate.GroupBy {
+		add(g)
+	}
+	if program != nil && program.Predicates != nil {
+		predCols := make(map[string]struct{}, len(program.Predicates.Columns))
+		collectNodeColumns(program.Predicates.Nodes, predCols)
+		for _, c := range program.Predicates.Columns {
+			predCols[c] = struct{}{}
+		}
+		for c := range predCols {
+			add(c)
+		}
+	}
+
+	r.PrefetchIntrinsicColumns(names)
 }
 
 // dispatchIntrinsicAccumulate routes to the appropriate accumulation path based on query shape.
