@@ -90,3 +90,30 @@ block-read path issue one pipelined memcache request per block instead of one co
 Get per column (~28% of querier CPU in `gomemcache.(*Client).dial`).
 
 Back-ref: `internal/modules/tieredcache/typed.go:GetMultiV8Section`
+
+## NOTE-188: Index-Aligned Batch Re-Keying — No Reverse-Lookup Map
+*Added: 2026-06-11*
+
+**Problem:** `GetMultiV8Section` and `GetMultiV8SectionMixed` each built a reverse-lookup
+map (`keyToName` / `keyToReq`: full-cache-key -> input name/V8SectionKey) purely to re-key
+the `GetMulti` result back from full cache-key strings to the caller's input identifiers.
+These methods run once per block per query on the warm read path (NOTE-185/179: query-frontend
+shards one block per querier call, so a heavy metrics query over hundreds of blocks calls them
+hundreds of times), so the per-batch map allocation + hashing is pure GC pressure on the
+universal hot path.
+
+**Fix:** the `keys` slice is already built index-aligned with the inputs (`keys[i]` is the full
+cache key for `names[i]` / `reqs[i]`). So instead of populating a reverse map and iterating the
+result map, walk the inputs and probe `hits[keys[i]]` directly. The output map is byte-identical
+(same name/key -> blob entries) but one map allocation per batch is eliminated and the result is
+built with a single ordered pass over the (small) input slice rather than a range over the result
+map plus a map lookup.
+
+**Correctness:** `keys[i]` is computed from input `i` in the same loop, so the (key, input) pairing
+is exact; a missing key simply isn't in `hits` and is skipped, identical to the old "found" guard.
+No behavior change for hits, misses, batch-unsupported (nil,false,nil), or error paths.
+
+**Verification:** `go build ./...` clean; tieredcache + reader suites green under `-race`.
+
+Back-ref: `internal/modules/tieredcache/typed.go:GetMultiV8Section`,
+`internal/modules/tieredcache/typed.go:GetMultiV8SectionMixed`

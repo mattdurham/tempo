@@ -430,20 +430,21 @@ func (t *TypedTieredCache) GetMultiV8Section(
 		start = time.Now()
 	}
 	keys := make([]string, len(names))
-	keyToName := make(map[string]string, len(names))
 	for i, name := range names {
-		key := fmt.Sprintf("%s\x00v8\x00%d\x00%d\x00%s", fileID, tocType, subType, name)
-		keys[i] = key
-		keyToName[key] = name
+		keys[i] = fmt.Sprintf("%s\x00v8\x00%d\x00%d\x00%s", fileID, tocType, subType, name)
 	}
 	hits, err := bg.GetMulti(keys)
 	if err != nil {
 		t.observeSection(sectionIdx, start, false, err)
 		return nil, true, err
 	}
+	// NOTE-188: re-key the hits by input name without a reverse-lookup map. `keys[i]`
+	// is the full cache key for `names[i]` (index-aligned by construction), so we walk
+	// the inputs and probe `hits` directly. Avoids the per-batch keyToName map alloc on
+	// the warm read path (one batch per block per query, NOTE-185/179).
 	out := make(map[string][]byte, len(hits))
-	for key, val := range hits {
-		if name, found := keyToName[key]; found {
+	for i, name := range names {
+		if val, found := hits[keys[i]]; found {
 			out[name] = val
 		}
 	}
@@ -499,20 +500,21 @@ func (t *TypedTieredCache) GetMultiV8SectionMixed(
 		start = time.Now()
 	}
 	keys := make([]string, len(reqs))
-	keyToReq := make(map[string]shared.V8SectionKey, len(reqs))
 	for i, rq := range reqs {
-		key := fmt.Sprintf("%s\x00v8\x00%d\x00%d\x00%s", fileID, rq.TocType, rq.SubType, rq.Name)
-		keys[i] = key
-		keyToReq[key] = rq
+		keys[i] = fmt.Sprintf("%s\x00v8\x00%d\x00%d\x00%s", fileID, rq.TocType, rq.SubType, rq.Name)
 	}
 	hits, err := bg.GetMulti(keys)
 	if err != nil {
 		t.observeSection(sectionIdx, start, false, err)
 		return nil, true, err
 	}
+	// NOTE-188: re-key the hits by input V8SectionKey without a reverse-lookup map.
+	// `keys[i]` is the full cache key for `reqs[i]` (index-aligned by construction), so
+	// we walk the inputs and probe `hits` directly. Avoids the per-batch keyToReq map
+	// alloc on the warm read path (one batch per block per query, NOTE-185).
 	out := make(map[shared.V8SectionKey][]byte, len(hits))
-	for key, val := range hits {
-		if rq, found := keyToReq[key]; found {
+	for i, rq := range reqs {
+		if val, found := hits[keys[i]]; found {
 			out[rq] = val
 		}
 	}

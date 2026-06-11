@@ -424,17 +424,20 @@ func (r *Reader) fetchTocAndColumnsCombined(
 	blockIdx int,
 	wantColumns map[string]struct{},
 ) (toc []byte, colHits map[string][]byte) {
+	// NOTE-188: reqs[0] is the ToC; reqs[1:] are the wanted columns, index-aligned with
+	// colNames so the batch response can be re-keyed by bare column name WITHOUT a
+	// reverse-lookup (V8SectionKey -> name) map. This batch runs once per block per query
+	// on the warm read path (NOTE-185), so eliminating the per-block map allocation matters.
 	reqs := make([]shared.V8SectionKey, 0, len(wantColumns)+1)
 	reqs = append(reqs, shared.V8SectionKey{TocType: sectionTypeBlockToc, SubType: 0, Name: tocKey})
-	colName := make(map[shared.V8SectionKey]string, len(wantColumns))
+	colNames := make([]string, 0, len(wantColumns))
 	for name := range wantColumns {
-		k := shared.V8SectionKey{
+		reqs = append(reqs, shared.V8SectionKey{
 			TocType: sectionTypeBlockCol,
 			SubType: 0,
 			Name:    fmt.Sprintf("%d/%s", blockIdx, name),
-		}
-		reqs = append(reqs, k)
-		colName[k] = name
+		})
+		colNames = append(colNames, name)
 	}
 
 	hits, ok, err := mf.GetMultiV8SectionMixed(r.fileID, reqs)
@@ -443,16 +446,16 @@ func (r *Reader) fetchTocAndColumnsCombined(
 		return nil, nil
 	}
 
-	tocReq := shared.V8SectionKey{TocType: sectionTypeBlockToc, SubType: 0, Name: tocKey}
-	toc = hits[tocReq]
+	toc = hits[reqs[0]]
 	if toc == nil {
 		// ToC missed — without it we cannot place columns; let the caller's
 		// GetOrFetch resolve the ToC (and Phase-2 resolves columns the usual way).
 		return nil, nil
 	}
 	colHits = make(map[string][]byte, len(hits))
-	for k, blob := range hits {
-		if name, isCol := colName[k]; isCol {
+	for i, name := range colNames {
+		// reqs[i+1] is the column request whose bare name is colNames[i].
+		if blob, found := hits[reqs[i+1]]; found {
 			colHits[name] = blob
 		}
 	}

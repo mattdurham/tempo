@@ -1046,3 +1046,29 @@ cold multi-column path); executor suite green under `-race`.
 
 Back-ref: `internal/modules/blockio/reader/columnar_read.go:readBlockColumnarWithCache`,
 `internal/modules/blockio/reader/columnar_read.go:planColdRuns`
+
+## NOTE-188: Index-Aligned Column Re-Keying in fetchTocAndColumnsCombined
+*Added: 2026-06-11*
+
+**Problem:** `fetchTocAndColumnsCombined` built a `colName` map (V8SectionKey -> bare column
+name) solely to translate the combined ToC+columns batch response back into the `colHits`
+(name -> blob) map the caller probes by `m.name`. This combined batch runs once per block per
+query on the warm read path (NOTE-185: query-frontend shards one block per querier call), so the
+per-block `colName` map allocation + hashing is wasted GC pressure on the universal hot path.
+
+**Fix:** the request slice is built deterministically as `[toc, col0, col1, ...]`, so keeping a
+parallel `colNames []string` index-aligned with `reqs[1:]` lets the response be re-keyed by bare
+name via `hits[reqs[i+1]]` with no reverse map. The ToC is `hits[reqs[0]]` directly (dropping the
+separately-reconstructed `tocReq`). A single small slice replaces a map; one allocation removed
+per warm block read.
+
+**Correctness:** `reqs[i+1]` is the column request whose name is `colNames[i]` by construction
+(both appended in lockstep in the same loop), so the (request, name) pairing is exact. Columns
+that miss the batch are absent from `hits` and skipped, identical to the old `isCol` guard. The
+returned `colHits` map is byte-identical to before. ToC-miss / batch-unsupported fallbacks
+unchanged (still return nil,nil so the caller's two-phase path resolves them).
+
+**Verification:** `go build ./...` clean; reader suite green under `-race`
+(`TestReader_CombinedTocColumnFetch_WarmIdentical` exercises warm + cold paths).
+
+Back-ref: `internal/modules/blockio/reader/columnar_read.go:fetchTocAndColumnsCombined`
