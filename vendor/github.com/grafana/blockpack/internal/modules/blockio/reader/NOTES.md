@@ -892,3 +892,33 @@ metadata array's column ordering, so `ensure` always finds a run that fully cove
 block size — still true: coalescing reads the wanted-column span plus small gaps, not the block).
 `make precommit` fully green (gofumpt, golines, golangci-lint incl gocyclo + fieldalignment,
 deadcode, staticcheck).
+
+## NOTE-177: concurrent Phase-2 column fetches in readBlockColumnarWithCache — 2026-06-10
+
+**Problem:** Phase 2 of `readBlockColumnarWithCache` resolved each wanted column serially via
+its own `GetOrFetchV8Section(blockIdx/colName)`. On the warm steady-state path every column is
+a cache hit, but each hit is an independent round-trip (the querier CPU profile attributes ~21%
+to `MemCache.Get` and a similar slice to `FileCache` disk read+copy). A heavy metrics query
+(e.g. `{...} | rate() by (...)`) touches many small columns per block, so these N round-trips
+stack their latency end-to-end. query-frontend shards one block per querier call, so the
+block-level pipeline never parallelises this — the serial per-column fetch is the warm-path
+wall-clock cost, not per-row decode/compute (the recurring status.log conclusion: VOLUME/RTT,
+not cheaper compute, is what moves wall-clock).
+
+**Mechanism:** the wanted columns are collected once, then fetched concurrently with a bounded
+worker fan-out (`min(numCols, NumCPU)`). Each column writes its compressed blob into a DISJOINT
+region of the pre-allocated `assembled` buffer — column extents never overlap — so the per-column
+work is embarrassingly parallel and data-race-free. Fanning the N cache round-trips out collapses
+their stacked latency into ~1 RTT of wall-clock per block. A single (or zero) wanted column skips
+the fan-out machinery and resolves inline (`fetchColumnInto` with a nil runMu).
+
+**Safety:** the cold path (`coldRuns.ensure`) lazily populates shared run buffers and is therefore
+serialized under `runMu`; both the `ensure` call and the subsequent `copy` out of `rn.buf` happen
+inside the locked region of the fetch closure, so no cold buffer is read before it is fully
+populated. Warm queries never reach the cold path, so `runMu` is uncontended in steady state. The
+section-cache key (`blockIdx/colName`) and per-column granularity are unchanged, and the assembled
+buffer is byte-for-byte identical to the serial version (each column lands at its absolute offset).
+
+**Verification:** reader + executor suites pass under `-race` (including `TestReadGroupColumnar`,
+`TestReadGroup_IOFailure`, `TestNOTE154_AdaptiveToCReadsAllColumns`). The disjoint-region writes
+and per-column `cp` allocations give the race detector nothing to flag.

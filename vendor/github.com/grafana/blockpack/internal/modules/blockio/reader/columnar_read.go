@@ -285,7 +285,17 @@ func (r *Reader) readBlockColumnarWithCache(
 	// planColdRuns groups the cold columns into a few coalesced runs read once each.
 	runs := r.planColdRuns(metas, wantColumns, blockLen, int64(len(toc)))
 
-	// Phase 2: one cached fetch per needed column; cold misses share the coalesced read.
+	// NOTE-177: Phase-2 column fetches issued concurrently. Each wanted column resolves
+	// through an independent GetOrFetchV8Section keyed by blockIdx/colName, and writes its
+	// compressed blob into a DISJOINT region of `assembled` (column extents never overlap),
+	// so the per-column work is embarrassingly parallel and data-race-free. On the warm
+	// steady-state path every column is a cache hit, and the dominant cost is the per-column
+	// cache round-trip (the querier CPU profile attributes ~21% to MemCache.Get; FileCache
+	// disk reads + copies are similarly per-call). Serially these N round-trips stack their
+	// latency; fanning them out collapses N RTTs into ~1 RTT of wall-clock per block. The
+	// cold path (coldRuns.ensure) mutates shared run state and is therefore serialized under
+	// runMu; warm queries never reach it, so the mutex is never contended in steady state.
+	cols := make([]colMetaEntry, 0, len(metas))
 	for _, m := range metas {
 		if _, ok := wantColumns[m.name]; !ok || m.compressedLen == 0 {
 			continue
@@ -296,34 +306,94 @@ func (r *Reader) readBlockColumnarWithCache(
 			// Should not reach here (handled above), but guard defensively.
 			continue
 		}
+		cols = append(cols, m)
+	}
 
-		colBytes, fetchErr := r.cache.GetOrFetchV8Section(
-			r.fileID,
-			sectionTypeBlockCol,
-			0,
-			fmt.Sprintf("%d/%s", blockIdx, m.name),
-			func() ([]byte, error) {
-				if colStart+colLen <= int64(len(toc)) {
-					cp := make([]byte, colLen)
-					copy(cp, toc[colStart:colStart+colLen])
-					return cp, nil
-				}
-				rn, err := runs.ensure(r, blockOff, colStart)
-				if err != nil {
-					return nil, fmt.Errorf("col %q: %w", m.name, err)
-				}
-				cp := make([]byte, colLen)
-				copy(cp, rn.buf[colStart-rn.start:colStart-rn.start+colLen])
-				return cp, nil
-			},
-		)
-		if fetchErr != nil {
-			return nil, fmt.Errorf("block %d col %q: %w", blockIdx, m.name, fetchErr)
+	if len(cols) <= 1 {
+		// Single (or zero) wanted column: the fan-out machinery is pure overhead. Resolve inline.
+		for _, m := range cols {
+			if err := r.fetchColumnInto(assembled, toc, runs, nil, blockOff, blockIdx, m); err != nil {
+				return nil, err
+			}
 		}
-		copy(assembled[colStart:colStart+colLen], colBytes)
+		return assembled, nil
+	}
+
+	var (
+		runMu    sync.Mutex
+		wg       sync.WaitGroup
+		firstErr error
+		errMu    sync.Mutex
+	)
+	workers := min(len(cols), runtime.NumCPU())
+	sem := make(chan struct{}, workers)
+	for _, m := range cols {
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(m colMetaEntry) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if err := r.fetchColumnInto(assembled, toc, runs, &runMu, blockOff, blockIdx, m); err != nil {
+				errMu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				errMu.Unlock()
+			}
+		}(m)
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return nil, firstErr
 	}
 
 	return assembled, nil
+}
+
+// fetchColumnInto resolves one wanted column through the section cache and copies its
+// compressed blob into its disjoint region of assembled. Cold-path provider reads
+// (coldRuns.ensure) mutate shared run state and are serialized under runMu; runMu may be
+// nil on the single-column inline path where no concurrency is in flight. NOTE-177.
+func (r *Reader) fetchColumnInto(
+	assembled, toc []byte,
+	runs coldRuns,
+	runMu *sync.Mutex,
+	blockOff int64,
+	blockIdx int,
+	m colMetaEntry,
+) error {
+	colStart := int64(m.dataOffset)  //nolint:gosec
+	colLen := int64(m.compressedLen) //nolint:gosec
+
+	colBytes, fetchErr := r.cache.GetOrFetchV8Section(
+		r.fileID,
+		sectionTypeBlockCol,
+		0,
+		fmt.Sprintf("%d/%s", blockIdx, m.name),
+		func() ([]byte, error) {
+			if colStart+colLen <= int64(len(toc)) {
+				cp := make([]byte, colLen)
+				copy(cp, toc[colStart:colStart+colLen])
+				return cp, nil
+			}
+			if runMu != nil {
+				runMu.Lock()
+				defer runMu.Unlock()
+			}
+			rn, err := runs.ensure(r, blockOff, colStart)
+			if err != nil {
+				return nil, fmt.Errorf("col %q: %w", m.name, err)
+			}
+			cp := make([]byte, colLen)
+			copy(cp, rn.buf[colStart-rn.start:colStart-rn.start+colLen])
+			return cp, nil
+		},
+	)
+	if fetchErr != nil {
+		return fmt.Errorf("block %d col %q: %w", blockIdx, m.name, fetchErr)
+	}
+	copy(assembled[colStart:colStart+colLen], colBytes)
+	return nil
 }
 
 // coldRun is one coalesced byte span of cold (cache-missing) column data within a block,
