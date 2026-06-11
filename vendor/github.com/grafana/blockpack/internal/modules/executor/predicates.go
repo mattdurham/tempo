@@ -1055,6 +1055,40 @@ func collectNodeColumns(nodes []vm.RangeNode, cols map[string]struct{}) {
 	}
 }
 
+// prefetchPredicateLeafColumns batch-loads, in a single cache round-trip, the intrinsic
+// column blobs that the per-leaf scans of an intrinsic-only / partial-AND ref collection
+// will read. Without it, each leaf's scanIntrinsicLeafRefs issues its own
+// GetIntrinsicColumnBlob round-trip; a multi-leaf search predicate (e.g. several
+// AND/OR conditions) therefore pays one memcache round-trip per leaf. Reader.
+// PrefetchIntrinsicColumns collapses them into one GetMulti and writes the hits back
+// into the in-process cache tier so the subsequent GetIntrinsicColumnBlob calls are
+// served locally. Names not present in the file's intrinsic index (e.g. user-attribute
+// leaves in a mixed query) are filtered out by PrefetchIntrinsicColumns, and any name
+// that misses the batch falls through to its normal per-name fetch — the result is
+// identical to never prefetching.
+//
+// NOTE-198: the search counterpart of the metrics prefetch (NOTE-197). The querier CPU
+// profile is dominated by kernel networking on per-column cache round-trips, so cutting
+// the per-file round-trip count on the multi-leaf search path is the same network lever.
+func prefetchPredicateLeafColumns(r *modules_reader.Reader, nodes []vm.RangeNode) {
+	cols := make(map[string]struct{}, 8)
+	collectNodeColumns(nodes, cols)
+	if len(cols) <= 1 {
+		// 0 leaves → nothing to fetch; 1 leaf → the single per-name fetch is already
+		// minimal, batching would add map/slice overhead for no round-trip saving.
+		return
+	}
+	// Use the leaf column names verbatim — scanIntrinsicLeafRefs reads each leaf's blob
+	// via GetIntrinsicColumnBlob(node.Column), so prefetching the same key is what makes
+	// that read a local hit. PrefetchIntrinsicColumns filters to names present in the
+	// file's intrinsic index, so non-intrinsic leaves are dropped.
+	names := make([]string, 0, len(cols))
+	for c := range cols {
+		names = append(names, c)
+	}
+	r.PrefetchIntrinsicColumns(names)
+}
+
 // userAttrProgram returns a shallow copy of p with all RangeNode leaf nodes
 // whose Column is in traceIntrinsicColumns removed. Used by the block scan
 // path so intrinsic predicates (already satisfied by the intrinsic pre-filter)
@@ -1928,6 +1962,11 @@ func BlockRefsFromIntrinsicTOC(r *modules_reader.Reader, program *vm.Program, li
 	}
 	overFetch := computeOverFetch(limit, len(program.Predicates.Nodes), totalLeaves)
 
+	// NOTE-198: batch-load every intrinsic predicate-leaf column blob in one cache
+	// round-trip before the per-leaf scans below (each scanIntrinsicLeafRefs would
+	// otherwise issue its own GetIntrinsicColumnBlob round-trip).
+	prefetchPredicateLeafColumns(r, program.Predicates.Nodes)
+
 	// Evaluate each top-level node and intersect (top-level = AND-combined).
 	var topSets [][]modules_shared.BlockRef
 	for _, node := range program.Predicates.Nodes {
@@ -1974,6 +2013,11 @@ func blockRefsFromIntrinsicPartial(r *modules_reader.Reader, program *vm.Program
 		return nil
 	}
 	overFetch := computeOverFetch(limit, len(program.Predicates.Nodes), totalLeaves)
+
+	// NOTE-198: batch-load intrinsic predicate-leaf column blobs in one round-trip
+	// (see BlockRefsFromIntrinsicTOC). Non-intrinsic leaves are filtered out by
+	// PrefetchIntrinsicColumns (it only fetches names present in the intrinsic index).
+	prefetchPredicateLeafColumns(r, program.Predicates.Nodes)
 
 	// Evaluate each top-level node with partial-AND semantics.
 	// Unevaluable top-level nodes are skipped (not failures).

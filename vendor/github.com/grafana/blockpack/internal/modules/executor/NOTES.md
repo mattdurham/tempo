@@ -4521,3 +4521,22 @@ intrinsic round-trip count, not the per-row decode cost.
 **Queries affected:** all intrinsic metrics paths reading >1 intrinsic column — M4, M6, M8, M9.
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:prefetchIntrinsicWorkingSet,executeTraceMetricsIntrinsic`,
 `internal/modules/blockio/reader/intrinsic_reader.go:PrefetchIntrinsicColumns`.
+
+## NOTE-198 — prefetch predicate-leaf column blobs before per-leaf intrinsic scans (search)
+
+The search-side intrinsic pre-filter (`BlockRefsFromIntrinsicTOC` and
+`blockRefsFromIntrinsicPartial`) evaluates each predicate leaf via `scanIntrinsicLeafRefs`,
+which reads that leaf's blob with its own `GetIntrinsicColumnBlob` call. A multi-leaf query
+(several AND/OR conditions) therefore pays one memcache round-trip per leaf. `prefetchPredicateLeafColumns`
+collects the union of leaf column names (`collectNodeColumns`) and, when there is more than one,
+issues a single `Reader.PrefetchIntrinsicColumns` (one `GetMulti`) before the per-leaf scans. The
+batch's hits are written back into the in-process cache tier (ChainedCache.GetMulti → writeBack), so
+the subsequent `GetIntrinsicColumnBlob(node.Column)` calls are served locally with no further
+round-trip. Leaf names are passed verbatim (the same key the scan uses); names absent from the file's
+intrinsic index — e.g. user-attribute leaves in a mixed query — are dropped by PrefetchIntrinsicColumns,
+and any name that misses the batch falls through to its normal per-name fetch, so the result is byte-identical
+to never prefetching. Single-leaf queries are skipped (one fetch is already minimal). This is the search
+counterpart of the metrics-side NOTE-197, attacking the same kernel-networking round-trip cost.
+**Queries affected:** intrinsic-only and mixed search queries with >1 intrinsic predicate leaf — Q9, Q10.
+Back-ref: `internal/modules/executor/predicates.go:prefetchPredicateLeafColumns,BlockRefsFromIntrinsicTOC,blockRefsFromIntrinsicPartial`,
+`internal/modules/blockio/reader/intrinsic_reader.go:PrefetchIntrinsicColumns`.
