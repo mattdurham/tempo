@@ -21,10 +21,20 @@ package executor
 // they do not depend on within-packKey tie order, exactly as with the prior non-stable
 // slices.Sort. Each element's low-32 index is preserved alongside its key.
 //
-// Four counting passes (one byte each, least significant byte of the key first) over the
-// 32-bit key leave the result in the original slice (4 is even, so src==s after the final
-// pass — no copy-back). The scratch buffer is drawn from compactUint64Pool (the same pool that
+// Up to four counting passes (one byte each, least significant byte of the key first) over
+// the 32-bit key. The scratch buffer is drawn from compactUint64Pool (the same pool that
 // backs pkOrder), so the only extra cost is one pooled acquire/release amortized across blocks.
+//
+// NOTE-193: skip leading-zero key-byte passes by key magnitude, mirroring the magnitude-skip
+// already proven on the ref-index radix sort (NOTE-190, blockio/shared.radixSortRefIndex).
+// The sort key is packKey = BlockIdx<<16 | RowIdx held in the high 32 bits. query-frontend
+// shards to one block per querier call (mission 2026-06-09), so BlockIdx is 0 (or a tiny
+// single-block value) in the dominant case — the top two key bytes are then identically zero
+// and their passes are pure identity reorderings. A single O(N) OR-scan of the key bytes bounds
+// how many passes are actually significant; for the single-block N=1 count/rate path (M1/M4/M9)
+// this halves the four-pass cost to two. With an odd number of significant passes the sorted
+// data lands in the scratch buffer, so a final copy-back into s is needed (the prior fixed
+// four-pass form was always even and relied on src==s after the last pass).
 func radixSortByPackKey(s []uint64) {
 	const radixBits = 8
 	const radixSize = 1 << radixBits
@@ -37,12 +47,32 @@ func radixSortByPackKey(s []uint64) {
 	if n < 2 {
 		return
 	}
+
+	// One O(N) scan ORing the high-32-bit keys; the highest set key bit bounds how many byte
+	// passes are significant. Leading zero key bytes are skipped (identity passes).
+	var keyOr uint32
+	for i := range s {
+		keyOr |= uint32(s[i] >> keyShiftBase) //nolint:gosec
+	}
+	if keyOr == 0 {
+		// All keys equal 0 — already trivially sorted by key (tie order is arbitrary).
+		return
+	}
+	// maxByte is the index (0..3) of the highest non-zero key byte.
+	maxByte := 0
+	for b := 0; b < 4; b++ {
+		if (keyOr>>(b*radixBits))&radixMask != 0 {
+			maxByte = b
+		}
+	}
+
 	buf := acquireCompactUint64(n)
 	defer releaseCompactUint64(buf)
 
 	src, dst := s, buf
+	passes := 0
 	var counts [radixSize]int
-	for byteIdx := 0; byteIdx < 4; byteIdx++ {
+	for byteIdx := 0; byteIdx <= maxByte; byteIdx++ {
 		shift := keyShiftBase + byteIdx*radixBits
 		for i := range counts {
 			counts[i] = 0
@@ -63,6 +93,11 @@ func radixSortByPackKey(s []uint64) {
 			counts[b]++
 		}
 		src, dst = dst, src
+		passes++
 	}
-	// After 4 (even) passes src == s, so no final copy is needed.
+	// After an even number of passes src == s; after an odd number the sorted data is in buf
+	// (now referenced by src), so copy it back so the result always lands in s.
+	if passes%2 == 1 {
+		copy(s, src)
+	}
 }

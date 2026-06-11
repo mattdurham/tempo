@@ -4434,3 +4434,29 @@ inputs (sizes 0..5000), heavy-duplicate keys, and 32-bit extremes (0, 0x7FFFFFFF
 **Queries affected:** Compact group-by count/rate and histogram_over_time group-by (M6, M8) plus
 the predicate-filtered merge-join path (M6/M9/M10 and `... by (...)`).
 Back-ref: `internal/modules/executor/radix_pkorder.go`, `metrics_trace_intrinsic.go`
+
+## NOTE-193: radixSortByPackKey — skip leading-zero key-byte passes by magnitude
+*Added: 2026-06-11*
+**Decision:** Apply the magnitude-skip already proven on the ref-index radix sort (NOTE-190,
+`blockio/shared.radixSortRefIndex`) to `radixSortByPackKey`. A single O(N) scan ORs the high-32-bit
+sort keys; the highest set key bit bounds how many LSD byte passes are significant, so leading-zero
+key bytes are skipped as identity passes. The fixed four-pass form always ran all four byte passes
+even when the top key bytes were uniformly zero.
+**Rationale:** The sort key is `packKey = BlockIdx<<16 | RowIdx`. query-frontend shards to one block
+per querier call (mission 2026-06-09), so `BlockIdx` is 0 (or a tiny single-block value) in the
+dominant case and the top two packKey bytes are identically zero. For that case the four-pass sort
+collapses to two passes — halving the per-block sort cost on the compact N=1 count/rate path
+(`radixSortByPackKey` was ~0.38% querier self-time, profile 2026-06-11). When `keyOr==0` (all keys
+zero, e.g. a single-row single-block shard) the slice is already trivially sorted by key and no pass
+runs at all.
+**Correctness:** Ordering and tie behavior are unchanged from NOTE-175 (by packKey only,
+arbitrary-but-consistent within equal keys). The number of executed passes is now data-dependent:
+with an **odd** number of significant passes the sorted data ends up in the pooled scratch buffer,
+so a final `copy(s, src)` lands it back in `s` — the prior form was always even (4 passes) and
+relied on `src==s` after the last pass with no copy-back. The OR-scan and copy-back mirror
+`radixSortRefIndex` exactly. Verified by the existing `radix_pkorder_test.go` (permutation equality,
+ascending-by-packKey invariant, key-projection equality vs `slices.Sort`, 32-bit extremes incl. all
+keys zero and all keys 0xFFFFFFFF) under `-race`.
+**Queries affected:** Same as NOTE-175 — compact group-by count/rate and histogram_over_time
+group-by (M1/M4/M6/M8/M9) plus the predicate-filtered merge-join path.
+Back-ref: `internal/modules/executor/radix_pkorder.go`
