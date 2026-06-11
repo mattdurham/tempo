@@ -887,3 +887,38 @@ order, and the exact-capacity arena contract from NOTE-152 are all unchanged. Al
 are returned to the pool via a deferred cleanup.
 
 Back-ref: `internal/modules/blockio/shared/intrinsic_codec.go:decodeDictPagesArena`
+
+---
+
+## NOTE-186: index-based ref store into pre-extended slices (two ref-decode sites)
+*Added: 2026-06-11*
+
+Both per-page ref-decode loops appended `BlockRef`s one at a time into a slice whose backing
+capacity the caller already guarantees, paying a bounds-vs-cap check and a length update per ref.
+A querier CPU profile (2026-06-09) attributed ~1.4% self time to `appendVariableWidthRefs` (the
+delta/xor/flat ref section) and ~1.35% to the `decodeDictPagesArena` pass-2 ref closure (the dict
+group-by ref fill, on the M4 `rate() by (...)` hot path) — together ~2.7% of the ref-decode surface.
+
+**Fix:** mirror the NOTE-169 value-side store discipline at both sites. Pre-extend the destination
+slice by the number of refs about to be written, then write each ref by index.
+
+- **`appendVariableWidthRefs`:** callers always guarantee capacity — the serial path pre-sizes
+  `BlockRefs` to `totalRows` (`decodePagedColumnBlob`, NOTE-145) and the parallel path hands each
+  page a capacity-capped sub-slice `[off:off:off+rc]` (`decodePagesParallel`, NOTE-150), so
+  `cap-len >= count` always holds and the slice is never reallocated. A `make`-backed growing append
+  guards the (currently unreachable) short-capacity caller.
+- **`decodeDictPagesArena` pass 2:** each entry's `BlockRefs` is carved with exact capacity
+  `refTotals[j]` (`arena[off:off:off+c]`), and the summed `refCount` across all page occurrences of
+  an entry equals that capacity (the same sum computed in pass 1). Extending by `refCount` per
+  occurrence therefore never exceeds cap and never reallocates, preserving the exact-capacity arena
+  contract from NOTE-152 (a stray future append still reallocates rather than clobbering a neighbor).
+
+**Why correct:** the index-written `BlockRef` values are byte-identical to the appended ones — only
+the store mechanism changed, not the decode of `BlockIdx`/`RowIdx`. Page order (hence per-entry ref
+order) is unchanged. The `end > len(raw)` truncation check in `appendVariableWidthRefs` is unchanged
+and still runs before any read. Verified bit-identical across all four ref-width combinations, the
+parallel sub-slice path, and dict ref reconstruction; `go test -race ./blockio/shared` and
+`./executor` green, including the paged-column equivalence suites.
+
+Back-ref: `internal/modules/blockio/shared/intrinsic_codec.go:appendVariableWidthRefs`,
+`internal/modules/blockio/shared/intrinsic_codec.go:decodeDictPagesArena`

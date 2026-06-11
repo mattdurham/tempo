@@ -714,10 +714,21 @@ func decodeDictPagesArena(
 					keyScratch = binary.LittleEndian.AppendUint64(keyScratch, uint64(int64Val)) //nolint:gosec
 					j = idx[string(keyScratch)]
 				}
+				// NOTE-186: index-based ref store into the entry's pre-sized arena
+				// sub-slice instead of a per-ref append. Each entry's BlockRefs was
+				// carved with exact capacity refTotals[j] (arena[off:off:off+c]) and the
+				// per-occurrence append paid a bounds-vs-cap check per ref. The summed
+				// refCount across all page occurrences of an entry equals its capacity
+				// (refTotals is the same sum computed in pass 1), so extending by refCount
+				// here never exceeds cap and never reallocates — keeping the exact-capacity
+				// arena contract (a stray future append would still reallocate, not clobber
+				// a neighbor). Per-entry ref order is unchanged (page order preserved).
 				e := &merged.DictEntries[j]
+				base := len(e.BlockRefs)
+				e.BlockRefs = e.BlockRefs[:base+refCount]
 				p := refStart
-				for range refCount {
-					e.BlockRefs = append(e.BlockRefs, decodeRef(pageRaw, p, blockW, rowW))
+				for k := range refCount {
+					e.BlockRefs[base+k] = decodeRef(pageRaw, p, blockW, rowW)
 					p += refSize
 				}
 				return nil
@@ -1221,35 +1232,56 @@ func appendVariableWidthRefs(raw []byte, pos, blockW, rowW, count int, dst *[]Bl
 	if end > len(raw) {
 		return pos, fmt.Errorf("truncated ref")
 	}
+	// NOTE-186: index-based ref store into a pre-extended slice region instead of a
+	// per-row append. appendVariableWidthRefs runs once per page after every delta/xor
+	// page decode (~1.4% of querier CPU, profile 2026-06-09) and its per-row append paid
+	// a bounds-vs-cap check and a length update on every BlockRef even though callers
+	// guarantee capacity: the serial path pre-sizes BlockRefs to totalRows
+	// (decodePagedColumnBlob, NOTE-145), and the parallel path hands each page a
+	// capacity-capped sub-slice [off:off:off+rc] (decodePagesParallel, NOTE-150). So
+	// cap(refs)-len(refs) >= count always holds; we extend the slice once and write each
+	// ref by index, mirroring the NOTE-169 store discipline on the value side. The rare
+	// short-capacity caller (none in the current tree) is handled by a single growing
+	// append before the index loop.
 	refs := *dst
+	base := len(refs)
+	if cap(refs)-base >= count {
+		refs = refs[:base+count]
+	} else {
+		refs = append(refs, make([]BlockRef, count)...)
+	}
 	switch {
 	case blockW == 1 && rowW == 1:
-		for ; pos < end; pos += 2 {
-			refs = append(refs, BlockRef{
+		for i := 0; pos < end; pos += 2 {
+			refs[base+i] = BlockRef{
 				BlockIdx: uint16(raw[pos]),
 				RowIdx:   uint16(raw[pos+1]),
-			})
+			}
+			i++
 		}
 	case blockW == 1 && rowW == 2:
-		for ; pos < end; pos += 3 {
-			refs = append(refs, BlockRef{
+		for i := 0; pos < end; pos += 3 {
+			refs[base+i] = BlockRef{
 				BlockIdx: uint16(raw[pos]),
 				RowIdx:   binary.LittleEndian.Uint16(raw[pos+1:]),
-			})
+			}
+			i++
 		}
 	case blockW == 2 && rowW == 1:
-		for ; pos < end; pos += 3 {
-			refs = append(refs, BlockRef{
+		for i := 0; pos < end; pos += 3 {
+			refs[base+i] = BlockRef{
 				BlockIdx: binary.LittleEndian.Uint16(raw[pos:]),
 				RowIdx:   uint16(raw[pos+2]),
-			})
+			}
+			i++
 		}
 	default: // blockW == 2 && rowW == 2
-		for ; pos < end; pos += 4 {
-			refs = append(refs, BlockRef{
+		for i := 0; pos < end; pos += 4 {
+			refs[base+i] = BlockRef{
 				BlockIdx: binary.LittleEndian.Uint16(raw[pos:]),
 				RowIdx:   binary.LittleEndian.Uint16(raw[pos+2:]),
-			})
+			}
+			i++
 		}
 	}
 	*dst = refs
