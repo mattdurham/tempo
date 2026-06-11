@@ -821,6 +821,39 @@ Verified Packed-order-identical to `slices.SortFunc` over 2000 random trials plu
 
 Back-ref: `internal/modules/blockio/shared/intrinsic_ref_index.go:radixSortRefIndex`
 
+## NOTE-192: radixSortRefIndex — pool the scratch double-buffer (drop per-call zeroing alloc)
+
+*Added: 2026-06-11*
+
+`radixSortRefIndex` allocates an n-element double-buffer (`make([]RefIndexEntry, n)`) for its
+LSD passes. `RefIndexEntry` is pointer-free, so `make` zeroes n*8 bytes via
+`runtime.memclrNoHeapPointers`. A querier CPU profile (2026-06-11) attributed ~2.86% self-time to
+`memclrNoHeapPointers` — the single largest blockpack-attributable cost — and ~2.35% to
+`radixSortRefIndex` itself, on the M8/M9/Q9–Q10 intrinsic-decode and M4 dict group-by sort paths
+where `EnsureRefIndex` runs once per column per block.
+
+**The zeroing is pure waste.** The first radix pass scatters every source element into a distinct
+destination slot, so all n slots are unconditionally written before any are read; the buffer's
+prior contents never affect the result. The buffer is local scratch that never escapes the
+function — the sorted output is always landed back into the caller's `idx` (directly when the pass
+count is even, via `copy(idx, src)` when odd). Replacing the per-call `make` with a `sync.Pool`-backed,
+non-zeroed buffer (`getRadixBuf`/`putRadixBuf`) removes both the allocation and the memclr while
+producing a byte-for-byte identical sort.
+
+**Why a pool is safe here:** unlike the assembled-read buffer (NOTE-153 aliasing risk), nothing
+references the scratch buffer after `radixSortRefIndex` returns, so there is no lifetime-extension
+or aliasing hazard. `sync.Pool` is concurrency-safe, which matters because `EnsureRefIndex` (the
+sole caller) runs concurrently across columns/blocks. A `radixBufCap` (1Mi entries = 8 MiB) guard
+drops pathologically large buffers on `Put` so the pool's resident footprint stays bounded (same
+discipline as the intern/lazy-column pools).
+
+**Verified:** `TestRadixSortRefIndexMatchesSortFunc` / `…ByteSkip` / `…EdgeCases` green;
+`go test -race ./blockio/shared` and `./executor` green. `BenchmarkRadixSortRefIndex` now reports
+0 allocs/op (was 1 alloc/op + n*8-byte zeroing) across all three key-magnitude cases, byte-identical
+ordering.
+
+Back-ref: `internal/modules/blockio/shared/intrinsic_ref_index.go:radixSortRefIndex`
+
 ## NOTE-190: radixSortRefIndex — bound the pass count by key magnitude (skip leading-zero bytes)
 
 *Added: 2026-06-11*

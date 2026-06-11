@@ -9,7 +9,50 @@ package shared
 import (
 	"cmp"
 	"slices"
+	"sync"
 )
+
+// NOTE-192: pool the radix-sort scratch buffer to remove a per-call zeroing allocation.
+// radixSortRefIndex needs an n-element double-buffer for its LSD passes. `make([]RefIndexEntry, n)`
+// allocates AND zeroes n*8 bytes via runtime.memclrNoHeapPointers, which a querier CPU profile
+// (2026-06-11) showed as the single largest blockpack-attributable cost (memclrNoHeapPointers ~2.86%,
+// and radixSortRefIndex itself ~2.35% self-time on the M8/M9/Q9-Q10 intrinsic-decode and dict
+// group-by sort path). The zeroing is pure waste: the very first radix pass scatters every source
+// element into a distinct destination slot, so all n slots are unconditionally overwritten before
+// any are read — the buffer's prior contents are irrelevant. The buffer is local scratch that never
+// escapes the function (the sorted result is always landed back into `idx`), so a pooled,
+// non-zeroed buffer is byte-for-byte equivalent and aliasing-free. sync.Pool is concurrency-safe,
+// which matters because EnsureRefIndex (the sole caller) runs concurrently across columns/blocks.
+var radixBufPool = sync.Pool{
+	New: func() any {
+		s := make([]RefIndexEntry, 0)
+		return &s
+	},
+}
+
+// radixBufCap bounds the backing array kept in the pool. A pathologically large block could grow
+// the scratch buffer far beyond steady-state need; returning such a buffer would pin a large
+// allocation. Buffers larger than this are dropped on Put so the pool's resident footprint stays
+// bounded (mirrors the cap-guard discipline used for the intern/lazy-column pools).
+const radixBufCap = 1 << 20 // 1Mi RefIndexEntry = 8 MiB
+
+func getRadixBuf(n int) *[]RefIndexEntry {
+	bp := radixBufPool.Get().(*[]RefIndexEntry)
+	if cap(*bp) < n {
+		*bp = make([]RefIndexEntry, n)
+	} else {
+		*bp = (*bp)[:n]
+	}
+	return bp
+}
+
+func putRadixBuf(bp *[]RefIndexEntry) {
+	if cap(*bp) > radixBufCap {
+		return // drop oversized buffer; let it be GC'd
+	}
+	*bp = (*bp)[:0]
+	radixBufPool.Put(bp)
+}
 
 // radixSortRefIndex sorts idx in ascending Packed order using an LSD radix sort over the
 // 32-bit Packed key (NOTE-174). This replaces the comparator-closure-driven
@@ -63,7 +106,11 @@ func radixSortRefIndex(idx []RefIndexEntry) {
 		return
 	}
 
-	buf := make([]RefIndexEntry, n)
+	// NOTE-192: pooled, non-zeroed scratch double-buffer. The first radix pass overwrites
+	// every slot before any read, so the buffer's prior contents are irrelevant.
+	bufPtr := getRadixBuf(n)
+	defer putRadixBuf(bufPtr)
+	buf := *bufPtr
 	src, dst := idx, buf
 	passes := 0
 	var counts [radixSize]int
