@@ -4460,3 +4460,27 @@ keys zero and all keys 0xFFFFFFFF) under `-race`.
 **Queries affected:** Same as NOTE-175 — compact group-by count/rate and histogram_over_time
 group-by (M1/M4/M6/M8/M9) plus the predicate-filtered merge-join path.
 Back-ref: `internal/modules/executor/radix_pkorder.go`
+
+## NOTE-194: mergeJoinFilteredRefsWithVals — size `matched` to F, not N
+*Added: 2026-06-11*
+**Decision:** Size the `matched` packed-position scratch buffer to `min(N, F)` (F = len(filteredRefs),
+N = len(inRangeRefs)) instead of unconditionally to N. A matched entry is an in-range ref whose
+packKey is present in the predicate-filtered set, so the match count m is bounded by both the number
+of in-range refs and the number of distinct filtered packKeys. Within a block group's intrinsic scan
+inRangeRefs are per-span (distinct BlockIdx/RowIdx, hence distinct packKeys), so each match consumes a
+distinct filtered packKey and m ≤ min(N, F).
+**Rationale:** On the predicate-filtered metrics path (M6/M9/M10 and any `... by (...)` carrying a
+predicate) F ≪ N: `filteredRefs` is just the predicate survivors while `inRangeRefs` spans every
+span in the time window for the value column (e.g. span:duration). The old `acquireCompactUint64(N)`
+allocated a buffer proportional to the full in-range population (NOTE-128: ~57 MB at N=7.2 M) of which
+only m ≤ F entries were ever written. `mergeJoinFilteredRefsWithVals` drove ~2.4 GB of querier
+alloc_space through this acquire (profile 2026-06-11). Sizing to F removes that excess: the pooled
+buffer now matches the work actually done, cutting GC pressure on the heavy filtered group-by path.
+**Correctness:** Output is byte-identical to the prior sizing. A defensive grow guard (when m reaches
+the F-sized buffer's length) reallocates to the strict upper bound N and copies forward, so even if a
+future caller passed inRangeRefs with duplicate packKeys (violating m ≤ F) no match is dropped — the
+common path (unique packKeys, m ≤ F) never triggers the guard. The packKey bijection and uniqueness
+argument is the same one NOTE-166/167 already rely on for the bitset membership test.
+**Queries affected:** Predicate-filtered merge-join path — M6, M9, M10, and any `... by (...)` with a
+predicate.
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:mergeJoinFilteredRefsWithVals`

@@ -2124,7 +2124,22 @@ func mergeJoinFilteredRefsWithVals(
 	}
 	releaseCompactUint32(filteredPKs)
 
-	matched := acquireCompactUint64(len(inRangeRefs)) // cap N; trimmed to M below. Pooled.
+	// NOTE-194: size `matched` to F (=len(filteredRefs)) rather than N (=len(inRangeRefs)).
+	// A matched entry is an in-range ref whose packKey is present in the filtered set. Within a
+	// block group's intrinsic scan inRangeRefs are per-span (distinct blockIdx/rowIdx, hence
+	// distinct packKeys), and each match's packKey is a member of filteredPKs (F distinct keys),
+	// so the match count m satisfies m ≤ min(N, F). On the predicate-filtered metrics path
+	// (M6/M9/M10 and any `... by (...)` with a predicate) F ≪ N — span:duration's in-range set
+	// spans every matching-time span while filteredRefs is just the predicate survivors — so
+	// sizing to F instead of N collapses a multi-MB pooled allocation (NOTE-128: ~57 MB at
+	// N=7.2 M) to F entries. The defensive grow guard below keeps the result correct even if a
+	// future caller ever passed inRangeRefs containing duplicate packKeys (m > F): we grow rather
+	// than drop matches, so output is byte-identical to the prior len(inRangeRefs) sizing.
+	matchedCap := len(filteredRefs)
+	if matchedCap > len(inRangeRefs) {
+		matchedCap = len(inRangeRefs)
+	}
+	matched := acquireCompactUint64(matchedCap) // cap min(N,F); trimmed to m below. Pooled.
 	m := 0
 	for i, ref := range inRangeRefs {
 		pk := packKey(ref.BlockIdx, ref.RowIdx)
@@ -2136,6 +2151,14 @@ func mergeJoinFilteredRefsWithVals(
 		// O(1) membership: a single word fetch + shift + mask, no closure / no log2(F) probes.
 		w := int(pk>>6) - baseWord //nolint:gosec
 		if pkBitset[w]&(uint64(1)<<(pk&63)) != 0 {
+			if m == len(matched) {
+				// Defensive: only reachable if inRangeRefs held duplicate packKeys (m > min(N,F)).
+				// Grow to N (the strict upper bound) so no match is ever dropped.
+				grown := acquireCompactUint64(len(inRangeRefs))
+				copy(grown, matched[:m])
+				releaseCompactUint64(matched)
+				matched = grown
+			}
 			matched[m] = uint64(pk)<<32 | uint64(uint32(i)) //nolint:gosec
 			m++
 		}
