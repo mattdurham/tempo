@@ -111,11 +111,16 @@ default budget 20% of GOMEMLIMIT):
 | `parsedSketchCache`       | `fileID+"/sketch"`               | `*sketchIndex`            |
 | `parsedIntrinsicCache`    | `fileID+"/intrinsic/"+colName`   | `*shared.IntrinsicColumn` |
 | `parsedIntrinsicTOCCache` | `fileID+"/intrinsic/toc"`        | `*intrinsicTOC`           |
+| `parsedV8ColumnCache`     | `fileID+"/v8col/"+blockOffset+"/"+colName+"/"+colType` | `*Column` (decoded snapshot) |
 
 **Invariants:**
 - Cache operations are only performed when `r.fileID != ""` (prevents cross-file
   collisions when no FileID is set).
-- `ClearCaches()` calls `.Clear()` on all four instances.
+- `ClearCaches()` calls `.Clear()` on all five instances.
+- `parsedV8ColumnCache` snapshots are immutable decoded slices; the per-query `Column`
+  copies the slice headers and keeps its own `sync.Once` / `sparseDictIdx`, so lazy dense
+  expansion (NOTE-PERF-1) builds a fresh per-query `Idx` and never mutates the shared
+  snapshot. The block byte offset within the file uniquely identifies an (immutable) block.
 - Entries are evicted only by LRU pressure or `ClearCaches()`. The GC does not
   reclaim cached values; this is intentional to avoid the 50x re-parse regression
   from the previous weak-pointer design (see NOTE-003 addendum 2026-03-29, NOTE-OC-001).

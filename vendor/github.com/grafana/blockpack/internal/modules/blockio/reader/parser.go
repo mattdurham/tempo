@@ -30,6 +30,17 @@ var parsedSketchSummaryCache objectcache.Cache[FileSketchSummary]
 // SPEC-OC-003, NOTE-003 (reader NOTES.md)
 var parsedIntrinsicCache objectcache.Cache[shared.IntrinsicColumn]
 
+// parsedV8ColumnCache caches fully decoded V8 block Column snapshots by
+// fileID+"/v8col/"+blockOffset+"/"+colName+"/"+colType. Strong references: entries
+// persist until Clear is called. NOTE-200: a Reader is created fresh per query (per
+// block per querier call), so the per-block decode of wanted V8 columns — snappy
+// decompress + readColumnEncoding (dict/idx build, radix sort) — was rerun on every
+// warm query even when a prior query already decoded the same column from the same
+// on-disk block. This process-level cache holds the immutable decoded slices so the
+// warm path copies them into the per-query Column instead of re-decoding.
+// SPEC-OC-003, NOTE-200 (reader NOTES.md)
+var parsedV8ColumnCache objectcache.Cache[Column]
+
 // parsedMetadataCache caches the fully parsed metadata result by fileID.
 // Strong references: entries persist until Clear is called.
 // SPEC-OC-003, NOTE-003 (reader NOTES.md)
@@ -58,6 +69,7 @@ var parsedIntrinsicTOCCache objectcache.Cache[intrinsicTOC]
 func SetIntrinsicCacheBytes(n int64) {
 	parsedIntrinsicCache.SetMaxBytes(n)
 	parsedIntrinsicTOCCache.SetMaxBytes(n / 4) // ToC is much smaller
+	parsedV8ColumnCache.SetMaxBytes(n)         // NOTE-200: same budget as intrinsic columns
 }
 
 // ClearCaches resets all process-level caches. Intended for testing.
@@ -67,6 +79,7 @@ func ClearCaches() {
 	parsedIntrinsicCache.Clear()
 	parsedMetadataCache.Clear()
 	parsedIntrinsicTOCCache.Clear()
+	parsedV8ColumnCache.Clear()
 }
 
 // rangeIndexMeta records the byte range within metadataBytes for a

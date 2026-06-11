@@ -1144,3 +1144,52 @@ are immutable decoded columns; a miss falls through to the unchanged batch path.
 **Verification:** reader + tieredcache + executor suites green under `-race`; `go build ./...`.
 
 Back-ref: `internal/modules/blockio/reader/intrinsic_reader.go:PrefetchIntrinsicColumns`.
+
+## NOTE-200 — Process-level cache of decoded V8 block columns
+*Added: 2026-06-11*
+
+**Problem:** NOTE-199 eliminated redundant re-decode of *intrinsic* columns on the warm
+path by consulting the process-level `parsedIntrinsicCache`. The analogous V8 *block*
+columns had no such cache. A Reader is created fresh per query (per block per querier call,
+NOTE-170/185), and `parseBlockColumnsReuse` re-ran the full per-column decode —
+snappy decompress + `readColumnEncoding` (dict/idx build, RLE/delta page expansion, radix
+sort) — for every wanted block column on every warm query, even when a prior query already
+decoded the exact same column from the exact same on-disk block. A 2026-06-11 querier CPU
+profile attributed ~8% of self-time to this decode path (`decodeDictPagesArena`,
+`appendDeltaUint64Page`, `appendVariableWidthRefs`, snappy decode, `radixSortRefIndex`),
+re-paid on every request that scans block-level attribute columns.
+
+**Fix:** add `parsedV8ColumnCache objectcache.Cache[Column]`, keyed by
+`fileID + "/v8col/" + blockOffset + "/" + colName + "/" + colType`. The block's byte offset
+within the file (`meta.Offset`) uniquely identifies an immutable block (files are immutable
+once written; compaction creates new fileIDs), so the key resolves to exactly one decoded
+column. In `parseBlockColumnsReuse`'s eager-decode loop:
+- a cache HIT copies the immutable decoded slices into the per-query `Column` via
+  `copyDecodedColumnInto` and skips decompress + decode entirely;
+- a cache MISS decodes as before, then stores an immutable snapshot
+  (`snapshotDecodedColumn`) sharing the freshly-decoded slices.
+
+`fileID` is threaded into `parseBlockColumnsReuse` from the two `Reader` parse entry points
+(`ParseBlockFromBytes`, `ParseBlockFromBytesWithIntern`); the cache is bypassed when
+`fileID == ""` (test callers, mirroring the other process caches). `SetIntrinsicCacheBytes`
+sizes it on the same budget as the intrinsic cache, and `ClearCaches` clears it.
+
+**Correctness:** the snapshot holds only the immutable decoded slices (`StringDict`/`Idx`,
+`Int64Dict`/`Idx`, …, `Present`, `sparseDictIdx`). These are never mutated in place: the
+per-query `Column` keeps its own zero-valued `sync.Once`/`atomic.Bool`, so the lazy dense
+expansion of NOTE-PERF-1 (`expandDenseIdx`) runs per query, reads the shared `sparseDictIdx`
+read-only, and assigns a *new* dense `Idx` slice on the per-query column — it never writes
+into the shared snapshot. Interned strings are independently heap-allocated and safe to
+share across queries. The production parse path always passes `prevBlock == nil`, so the
+column-reuse (`resetColumn`) branch is never reached with a cached snapshot. `Column.SizeBytes`
+estimates the snapshot's footprint for LRU budgeting.
+
+**Verification:** `go build ./...` clean; reader + executor suites green under `-race`. New
+`TestParsedV8ColumnCache_WarmEqualsCold` asserts a warm parse hits the cache (no new entries)
+and produces per-row values byte-identical to a cold decode across all four block-column
+types; `TestParsedV8ColumnCache_DifferentFileIDs` asserts cross-file isolation.
+
+Back-ref: `internal/modules/blockio/reader/parser.go:parsedV8ColumnCache`,
+`internal/modules/blockio/reader/block_parser.go:parseBlockColumnsReuse`,
+`v8ColumnCacheKey`, `snapshotDecodedColumn`, `copyDecodedColumnInto`,
+`internal/modules/blockio/reader/block.go:Column.SizeBytes`.

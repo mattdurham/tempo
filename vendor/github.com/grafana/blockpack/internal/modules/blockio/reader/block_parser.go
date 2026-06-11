@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"sync"
 
 	"github.com/golang/snappy"
@@ -193,6 +194,7 @@ func parseBlockColumnsReuse(
 	prevBlock *Block,
 	meta shared.BlockMeta,
 	intern map[string]string,
+	fileID string,
 ) (*Block, error) {
 	if intern == nil {
 		intern = make(map[string]string)
@@ -243,6 +245,35 @@ func parseBlockColumnsReuse(
 			continue
 		}
 
+		key := shared.ColumnKey{Name: m.name, Type: m.colType}
+		var col *Column
+		if existing, ok := columns[key]; ok {
+			col = existing
+		} else {
+			col = &Column{}
+		}
+
+		col.Name = m.name
+		col.Type = m.colType
+
+		// NOTE-200: consult the process-level decoded-column cache before snappy
+		// decompress + readColumnEncoding. A Reader is created fresh per query (per block
+		// per querier call), so the same on-disk block's wanted columns were re-decoded on
+		// every warm query. The cache key is keyed on the block's stable byte offset within
+		// the file plus the column name+type. On a hit we copy the immutable decoded slices
+		// into the per-query col (which keeps its own fresh sync.Once / sparseDictIdx so the
+		// lazy dense expansion of NOTE-PERF-1 runs per query and never mutates the shared
+		// snapshot). On a miss we decode and store a snapshot.
+		v8Key := ""
+		if fileID != "" {
+			v8Key = v8ColumnCacheKey(fileID, meta.Offset, m.name, m.colType)
+			if cached := parsedV8ColumnCache.Get(v8Key); cached != nil {
+				copyDecodedColumnInto(col, cached)
+				columns[key] = col
+				continue
+			}
+		}
+
 		start := int(m.dataOffset)          //nolint:gosec // safe: dataOffset bounded by block size < MaxBlockSize
 		end := start + int(m.compressedLen) //nolint:gosec // safe: compressedLen bounded by block size < MaxBlockSize
 		if start < 0 || end > len(rawBytes) {
@@ -263,17 +294,6 @@ func parseBlockColumnsReuse(
 		if decErr != nil {
 			return nil, fmt.Errorf("parseBlock: %w", decErr)
 		}
-
-		key := shared.ColumnKey{Name: m.name, Type: m.colType}
-		var col *Column
-		if existing, ok := columns[key]; ok {
-			col = existing
-		} else {
-			col = &Column{}
-		}
-
-		col.Name = m.name
-		col.Type = m.colType
 
 		decoded, err := readColumnEncoding(colData, spanCount, m.colType, ctx)
 		if err != nil {
@@ -298,6 +318,16 @@ func parseBlockColumnsReuse(
 		col.SpanCount = decoded.SpanCount
 		col.sparseDictIdx = decoded.sparseDictIdx // NOTE-PERF-1: lazy dense expansion
 		col.decoded.Store(true)                   // NOTE-CONC-001: mark eagerly decoded so needsDecode() is false
+
+		// NOTE-200: store an immutable snapshot of the decoded slices for reuse by later
+		// queries on the same block. The snapshot shares the freshly-decoded slices (they
+		// are never mutated in place — dense expansion builds a new Idx slice on the
+		// per-query col, leaving the snapshot's sparseDictIdx intact). Put is a no-op on
+		// caches that have not been sized; LRU evicts under the configured byte budget.
+		if v8Key != "" {
+			snap := snapshotDecodedColumn(decoded, m.name, m.colType)
+			_ = parsedV8ColumnCache.Put(v8Key, snap)
+		}
 
 		columns[key] = col
 	}
@@ -386,6 +416,67 @@ func parseBlockColumnsReuse(
 	blk.BuildIterFields()
 
 	return blk, nil
+}
+
+// v8ColumnCacheKey builds the parsedV8ColumnCache key for one block column. The block's
+// byte offset within the file is stable across queries and uniquely identifies the block,
+// so (fileID, offset, name, type) keys exactly one decoded column. NOTE-200.
+func v8ColumnCacheKey(fileID string, blockOffset uint64, name string, colType shared.ColumnType) string {
+	return fileID + "/v8col/" +
+		strconv.FormatUint(blockOffset, 10) + "/" +
+		name + "/" +
+		strconv.Itoa(int(colType))
+}
+
+// snapshotDecodedColumn builds an immutable cache snapshot holding only the decoded slices
+// of src (which readColumnEncoding allocated fresh for this parse). The snapshot shares
+// those slices; they are read-only after decode — dense expansion (NOTE-PERF-1) builds a new
+// Idx on the per-query Column and never overwrites sparseDictIdx in place. NOTE-200.
+func snapshotDecodedColumn(src *Column, name string, colType shared.ColumnType) *Column {
+	return &Column{
+		Name:          name,
+		Type:          colType,
+		StringDict:    src.StringDict,
+		StringIdx:     src.StringIdx,
+		Int64Dict:     src.Int64Dict,
+		Int64Idx:      src.Int64Idx,
+		Uint64Dict:    src.Uint64Dict,
+		Uint64Idx:     src.Uint64Idx,
+		Float64Dict:   src.Float64Dict,
+		Float64Idx:    src.Float64Idx,
+		BoolDict:      src.BoolDict,
+		BoolIdx:       src.BoolIdx,
+		BytesDict:     src.BytesDict,
+		BytesIdx:      src.BytesIdx,
+		BytesInline:   src.BytesInline,
+		Present:       src.Present,
+		SpanCount:     src.SpanCount,
+		sparseDictIdx: src.sparseDictIdx,
+	}
+}
+
+// copyDecodedColumnInto copies the immutable decoded slices from a cache snapshot into the
+// per-query Column dst, marking it fully decoded. dst keeps its own zero-valued sync.Once /
+// atomic state, so the lazy dense expansion (NOTE-PERF-1) runs independently per query and
+// the shared snapshot's sparseDictIdx is never mutated. NOTE-200.
+func copyDecodedColumnInto(dst, snap *Column) {
+	dst.StringDict = snap.StringDict
+	dst.StringIdx = snap.StringIdx
+	dst.Int64Dict = snap.Int64Dict
+	dst.Int64Idx = snap.Int64Idx
+	dst.Uint64Dict = snap.Uint64Dict
+	dst.Uint64Idx = snap.Uint64Idx
+	dst.Float64Dict = snap.Float64Dict
+	dst.Float64Idx = snap.Float64Idx
+	dst.BoolDict = snap.BoolDict
+	dst.BoolIdx = snap.BoolIdx
+	dst.BytesDict = snap.BytesDict
+	dst.BytesIdx = snap.BytesIdx
+	dst.BytesInline = snap.BytesInline
+	dst.Present = snap.Present
+	dst.SpanCount = snap.SpanCount
+	dst.sparseDictIdx = snap.sparseDictIdx // NOTE-PERF-1: per-query col gets its own dense Idx
+	dst.decoded.Store(true)                // NOTE-CONC-001: mark eagerly decoded
 }
 
 // decompressV14ColumnData applies SPEC-ROOT-012 guards and snappy-decompresses a V14 column blob.

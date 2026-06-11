@@ -63,6 +63,29 @@ func (c *Column) IsDecoded() bool { return c.decoded.Load() }
 // NOTE-CONC-001: reads decoded atomically — the only safe cross-goroutine check.
 func (c *Column) needsDecode() bool { return !c.decoded.Load() }
 
+// SizeBytes returns an estimate of the in-memory size of this column's decoded data
+// for objectcache LRU budgeting (NOTE-200). Only the immutable decoded slices that the
+// process-level parsedV8ColumnCache shares across queries are counted; the per-query
+// mutable scratch (rawEncoding/compressedEncoding/intern/sync.Once) is not cached.
+func (c *Column) SizeBytes() int64 {
+	n := int64(len(c.StringIdx)+len(c.Int64Idx)+len(c.Uint64Idx)+
+		len(c.Float64Idx)+len(c.BoolIdx)+len(c.BytesIdx)) * 4
+	n += int64(len(c.sparseDictIdx)) * 4
+	n += int64(len(c.Present))
+	n += int64(len(c.Int64Dict)+len(c.Uint64Dict)+len(c.Float64Dict)) * 8
+	n += int64(len(c.BoolDict))
+	for _, s := range c.StringDict {
+		n += int64(len(s)) + 16 // string header + bytes
+	}
+	for _, b := range c.BytesDict {
+		n += int64(len(b)) + 24 // slice header + bytes
+	}
+	for _, b := range c.BytesInline {
+		n += int64(len(b)) + 24
+	}
+	return n
+}
+
 // EnsureDecoded triggers full decode if this column was lazily registered.
 // Per-row value accessors (StringValue, Int64Value, etc.) call decodeNow automatically,
 // so EnsureDecoded is only needed by callers that access the underlying slices directly

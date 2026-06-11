@@ -772,7 +772,7 @@ func (r *Reader) ParseBlockFromBytes(
 	meta shared.BlockMeta,
 ) (*BlockWithBytes, error) {
 	localIntern := make(map[string]string)
-	blk, err := parseBlockColumnsReuse(rawBytes, want.toInternalMap(), nil, meta, localIntern)
+	blk, err := parseBlockColumnsReuse(rawBytes, want.toInternalMap(), nil, meta, localIntern, r.fileID)
 	if err != nil {
 		return nil, fmt.Errorf("ParseBlockFromBytes: %w", err)
 	}
@@ -793,7 +793,7 @@ func (r *Reader) ParseBlockFromBytesWithIntern(
 	meta shared.BlockMeta,
 	intern map[string]string,
 ) (*BlockWithBytes, error) {
-	blk, err := parseBlockColumnsReuse(rawBytes, want.toInternalMap(), nil, meta, intern)
+	blk, err := parseBlockColumnsReuse(rawBytes, want.toInternalMap(), nil, meta, intern, r.fileID)
 	if err != nil {
 		return nil, fmt.Errorf("ParseBlockFromBytesWithIntern: %w", err)
 	}
