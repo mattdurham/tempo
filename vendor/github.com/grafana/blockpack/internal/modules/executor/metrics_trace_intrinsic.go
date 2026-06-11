@@ -3859,10 +3859,17 @@ func streamByRefSliceCountRate(
 	tb vm.TimeBucketSpec,
 	buckets map[string]*aggBucketState,
 ) error {
-	groupCounts := make([][]int64, len(dict))
-	for i := range groupCounts {
-		groupCounts[i] = make([]int64, numSteps)
-	}
+	// NOTE-202: single contiguous pooled accumulator [groupCounts[dictIdx*numSteps+bucketIdx]]
+	// instead of one make([]int64, numSteps) per dict entry. The per-entry slice form paid
+	// len(dict) separate heap allocations per file (the row-emission fallback fires on the
+	// predicate-filtered N=1 group-by path when maxPK exceeds the direct-array L3 threshold —
+	// M6/M9-class queries) and scattered the per-group counters across the heap, hurting the
+	// emit-time scan's cache locality. The flat array is reused from groupCountsFlatPool
+	// (NOTE-124, already proven on the direct path) so warm queries pay zero allocation, and
+	// the [base+bk] indexing matches accumulateCountRateDirect's contiguous layout.
+	numGroups := int64(len(dict)) //nolint:gosec
+	groupCounts := acquireGroupCountsFlat(numGroups * numSteps)
+	defer releaseGroupCountsFlat(groupCounts)
 	for i := range inRangeRefs {
 		if i%ctxCheckInterval == 0 {
 			if err := ctx.Err(); err != nil {
@@ -3871,13 +3878,14 @@ func streamByRefSliceCountRate(
 		}
 		bucketIdx := timeBucketIndex(int64(inRangeVals[i]), tb.StartTime, tb.StepSizeNanos) //nolint:gosec
 		if bucketIdx >= 0 && bucketIdx < numSteps {
-			groupCounts[dictIdxForRef[i]][bucketIdx]++
+			groupCounts[int64(dictIdxForRef[i])*numSteps+bucketIdx]++
 		}
 	}
-	for dictIdx, counts := range groupCounts {
+	for dictIdx := int64(0); dictIdx < numGroups; dictIdx++ {
+		base := dictIdx * numSteps
 		hasAny := false
-		for _, c := range counts {
-			if c > 0 {
+		for bk := int64(0); bk < numSteps; bk++ {
+			if groupCounts[base+bk] > 0 {
 				hasAny = true
 				break
 			}
@@ -3885,15 +3893,13 @@ func streamByRefSliceCountRate(
 		if !hasAny {
 			continue
 		}
-		gk := ""
-		if dictIdx < len(dict) { //nolint:gosec
-			gk = dict[dictIdx]
-		}
-		for bucketIdx, c := range counts {
+		gk := dict[dictIdx]
+		for bk := int64(0); bk < numSteps; bk++ {
+			c := groupCounts[base+bk]
 			if c == 0 {
 				continue
 			}
-			k := strconv.FormatInt(int64(bucketIdx), 10) + "\x00" + gk //nolint:gosec
+			k := strconv.FormatInt(bk, 10) + "\x00" + gk //nolint:gosec
 			intrinsicGetOrCreateBucket(buckets, k).count += c
 		}
 	}
@@ -4684,12 +4690,14 @@ func streamCountRateGroupByIDSingle(
 	numSteps int64,
 	buckets map[string]*aggBucketState,
 ) error {
-	// NOTE-085: [][]int64 indexed by dictIdx — eliminates 150M map probes per M5 file.
-	// len(dict) is small (≤few thousand); pre-allocation cost is negligible vs span count.
-	groupCounts := make([][]int64, len(dict))
-	for i := range groupCounts {
-		groupCounts[i] = make([]int64, numSteps)
-	}
+	// NOTE-085: slice accumulator indexed by dictIdx — eliminates 150M map probes per M5 file.
+	// NOTE-202: single contiguous pooled flat array [dictIdx*numSteps+bucketIdx] instead of
+	// one make([]int64, numSteps) per dict entry — collapses len(dict) heap allocations into
+	// one pooled reuse (groupCountsFlatPool, NOTE-124) and keeps the per-group counters
+	// contiguous for the emit-time scan, matching accumulateCountRateDirect's layout.
+	numGroups := int64(len(dict)) //nolint:gosec
+	groupCounts := acquireGroupCountsFlat(numGroups * numSteps)
+	defer releaseGroupCountsFlat(groupCounts)
 	i := 0
 	for pk, bucketIdx := range keyToBucket {
 		if i%ctxCheckInterval == 0 {
@@ -4698,17 +4706,18 @@ func streamCountRateGroupByIDSingle(
 			}
 		}
 		i++
-		dictIdx := groupIDMap[pk]
+		dictIdx := int64(groupIDMap[pk]) //nolint:gosec
 		if bucketIdx >= 0 && bucketIdx < numSteps {
-			groupCounts[dictIdx][bucketIdx]++
+			groupCounts[dictIdx*numSteps+bucketIdx]++
 		}
 	}
 	// Resolve IDs back to strings at emit time. O(unique groups).
-	for dictIdx, counts := range groupCounts {
+	for dictIdx := int64(0); dictIdx < numGroups; dictIdx++ {
 		gk := dict[dictIdx]
-		for idx, c := range counts {
-			if c > 0 {
-				k := strconv.FormatInt(int64(idx), 10) + "\x00" + gk //nolint:gosec
+		base := dictIdx * numSteps
+		for bk := int64(0); bk < numSteps; bk++ {
+			if c := groupCounts[base+bk]; c > 0 {
+				k := strconv.FormatInt(bk, 10) + "\x00" + gk //nolint:gosec
 				intrinsicGetOrCreateBucket(buckets, k).count = c
 			}
 		}

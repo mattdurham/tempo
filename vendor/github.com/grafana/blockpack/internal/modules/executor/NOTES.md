@@ -4540,3 +4540,29 @@ counterpart of the metrics-side NOTE-197, attacking the same kernel-networking r
 **Queries affected:** intrinsic-only and mixed search queries with >1 intrinsic predicate leaf — Q9, Q10.
 Back-ref: `internal/modules/executor/predicates.go:prefetchPredicateLeafColumns,BlockRefsFromIntrinsicTOC,blockRefsFromIntrinsicPartial`,
 `internal/modules/blockio/reader/intrinsic_reader.go:PrefetchIntrinsicColumns`.
+
+## NOTE-202 — fallback N=1 count/rate group-by uses one pooled contiguous accumulator
+
+The N=1 count/rate group-by row-emission fallback paths (`streamByRefSliceCountRate`,
+reached when the no-predicate direct path is skipped because maxPK exceeds the L3 direct-array
+threshold — predicate-filtered M6/M9-class queries; and `streamCountRateGroupByIDSingle`, the
+N=1 dict-ID fallback) allocated their per-group counters as `make([][]int64, len(dict))` plus a
+separate `make([]int64, numSteps)` for *every* dict entry. That paid `len(dict)` distinct heap
+allocations per file on the warm path and scattered the per-group counters across the heap, so the
+emit-time scan over all groups chased pointers through unrelated cache lines.
+
+Both now accumulate into a single contiguous `[]int64` of `len(dict)*numSteps` taken from
+`groupCountsFlatPool` (the same pool NOTE-124 introduced for the direct path), indexed as
+`groupCounts[dictIdx*numSteps+bucketIdx]`. This collapses `len(dict)` allocations into one pooled
+reuse (zero allocation on warm queries — the pool's backing array is cleared and handed back),
+and lays the counters out contiguously so the emit scan walks memory sequentially — the identical
+layout `accumulateCountRateDirect` already uses. Output is byte-for-byte unchanged: the per-entry
+slice `groupCounts[g][b]` maps exactly to flat index `g*numSteps+b`, the emit order (group ascending,
+then bucket ascending) is preserved, and `streamByRefSliceCountRate`'s `count +=` vs
+`streamCountRateGroupByIDSingle`'s `count =` bucket-write semantics are each preserved.
+No benchmark-specific constants — a pure allocation/locality restructuring of the group-by
+accumulator on the fallback path.
+**Queries affected:** N=1 count/rate group-by queries whose maxPK exceeds the direct-path L3
+threshold (predicate-filtered service/method group-bys) — M6/M9-class.
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:streamByRefSliceCountRate,streamCountRateGroupByIDSingle`,
+pool: `acquireGroupCountsFlat/releaseGroupCountsFlat` (NOTE-124).
