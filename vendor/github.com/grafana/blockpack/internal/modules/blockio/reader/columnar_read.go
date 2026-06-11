@@ -296,15 +296,6 @@ func (r *Reader) readBlockColumnarWithCache(
 	assembled := make([]byte, bufSize)
 	copy(assembled, toc[:min(int64(len(toc)), int64(tocEnd))]) //nolint:gosec
 
-	// NOTE-173: Phase-2 coalesced cold fetch. Previously every wanted column that missed
-	// the section cache issued its own r.provider.ReadAt — one ranged GET per column. A
-	// heavy metrics query touches dozens of small columns across hundreds of cold blocks,
-	// and each ReadAt acquires/establishes a backend (S3) connection. A querier CPU
-	// profile is dominated by connection setup (kernel __inet_hash_connect /
-	// __inet_check_established + TLS handshake crypto), i.e. round-trip count, not bytes.
-	// planColdRuns groups the cold columns into a few coalesced runs read once each.
-	runs := r.planColdRuns(metas, wantColumns, blockLen, int64(len(toc)))
-
 	// Phase-2 column fetches. Each wanted column's compressed blob is cached as an
 	// independent section keyed by blockIdx/colName and written into a DISJOINT region
 	// of `assembled` (column extents never overlap).
@@ -330,6 +321,18 @@ func (r *Reader) readBlockColumnarWithCache(
 		}
 		cols = append(cols, m)
 	}
+
+	// NOTE-187: lazily plan cold runs only when there is at least one cold miss to
+	// resolve. On the warm steady-state path (the production state we optimize for) the
+	// combined ToC+columns GetMulti above satisfies every wanted column, so `cols` is
+	// empty and the coalesced cold-run plan is never consulted. Computing it eagerly on
+	// every warm block read paid an O(wanted-columns) scan plus a slices.SortFunc and a
+	// `ranges` slice allocation for a result that was thrown away — wasted CPU and GC
+	// pressure on the universal hot path. planColdRunsLazy returns a nil plan when there
+	// are no cold misses, so warm reads do no planning work and the single/zero-column
+	// branch below never calls into `runs`. On the cold path it is the exact same plan as
+	// before (over the full `metas`/`wantColumns`), preserving NOTE-173's coalesce.
+	runs := r.planColdRunsLazy(cols, metas, wantColumns, blockLen, int64(len(toc)))
 
 	if len(cols) <= 1 {
 		// Single (or zero) wanted column: the fan-out machinery is pure overhead. Resolve inline.
@@ -584,6 +587,30 @@ type coldRuns []coldRun
 // Sorting makes run construction independent of the metadata array's column ordering, so
 // coldRuns.ensure always finds a run that fully covers any cold column's range. Columns that
 // fit within the ToC, fall outside the block, or are absent are skipped.
+// planColdRunsLazy returns the coalesced cold-run plan only when there is at least one
+// cold miss to resolve (NOTE-187). cols is the list of wanted columns that missed the
+// section cache; when it is empty (the warm steady-state path) no provider read is
+// needed and a nil plan is returned without scanning/sorting. When cols is non-empty the
+// returned plan is identical to a direct planColdRuns call over the full metadata.
+func (r *Reader) planColdRunsLazy(
+	cols []colMetaEntry,
+	metas []colMetaEntry,
+	wantColumns map[string]struct{},
+	blockLen, tocLen int64,
+) coldRuns {
+	if len(cols) == 0 {
+		return nil
+	}
+	// NOTE-173: Phase-2 coalesced cold fetch. Previously every wanted column that missed
+	// the section cache issued its own r.provider.ReadAt — one ranged GET per column. A
+	// heavy metrics query touches dozens of small columns across hundreds of cold blocks,
+	// and each ReadAt acquires/establishes a backend (S3) connection. A querier CPU profile
+	// is dominated by connection setup (kernel __inet_hash_connect / __inet_check_established
+	// + TLS handshake crypto), i.e. round-trip count, not bytes. planColdRuns groups the cold
+	// columns into a few coalesced runs read once each.
+	return r.planColdRuns(metas, wantColumns, blockLen, tocLen)
+}
+
 func (r *Reader) planColdRuns(
 	metas []colMetaEntry,
 	wantColumns map[string]struct{},

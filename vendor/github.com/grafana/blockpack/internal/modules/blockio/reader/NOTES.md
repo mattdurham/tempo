@@ -1011,3 +1011,38 @@ Back-ref: `internal/modules/blockio/reader/columnar_read.go:readBlockColumnarWit
 `internal/modules/blockio/reader/columnar_read.go:fetchTocAndColumnsCombined`,
 `internal/modules/tieredcache/typed.go:GetMultiV8SectionMixed`,
 `internal/modules/blockio/shared/v8sectionkey.go:V8SectionKey`
+
+## NOTE-187: Lazily Plan Cold Runs Only When a Cold Miss Exists
+*Added: 2026-06-11*
+
+**Problem:** `readBlockColumnarWithCache` called `r.planColdRuns(metas, wantColumns, …)`
+*eagerly* on every block read, immediately after sizing the assembled buffer and BEFORE the
+`cols` (cold-miss) list was built. `planColdRuns` does an O(wanted-columns) scan, allocates a
+`ranges` slice, and runs a `slices.SortFunc` over it to coalesce the columns that extend past the
+cached ToC into a few merged byte ranges. But after NOTE-185 the warm steady-state path — the
+production state we optimise for — satisfies *every* wanted column from the combined ToC+columns
+`GetMulti`, so the `cols` list comes out **empty** and the resulting `runs` plan is never consulted:
+the single/zero-column branch iterates an empty `cols`, and the batched branch is only reached when
+`len(cols) > 1`. The cold-run plan was pure wasted CPU + GC pressure on the universal warm hot path
+(query-frontend shards one block per querier call, NOTE-170, so this runs once per block per query
+over hundreds of blocks).
+
+**Fix:** move the `planColdRuns` call to *after* the `cols` list is built and gate it behind
+`len(cols) > 0`. `runs` is declared as a nil `coldRuns` (a slice type, so nil is a valid empty plan)
+and only populated when there is at least one genuine cold miss to resolve. On the warm path `cols`
+is empty, so `runs` stays nil and neither `fetchColumnInto` nor `fetchColumnsBatched` is ever invoked
+with it — the plan is never built. On the cold path `len(cols) > 0` guarantees `runs` is the exact
+same coalesced plan as before (computed over the full `metas`/`wantColumns`, unchanged), so the
+round-trip-collapsing coalesce of NOTE-173 still applies identically.
+
+**Correctness:** `runs` is consumed only by `fetchColumnInto` / `fetchColumnsBatched`, both of which
+are reached only inside `for _, m := range cols { … }` (single/zero-column branch) or under
+`len(cols) > 1` (batched branch) — every consumption site is dominated by `len(cols) > 0`, so a nil
+`runs` is never dereferenced. The assembled bytes are byte-for-byte identical to the eager version.
+
+**Verification:** `go build ./...` clean; reader suite green
+(`TestReader_CombinedTocColumnFetch_WarmIdentical` exercises the warm zero-cold-miss path and the
+cold multi-column path); executor suite green under `-race`.
+
+Back-ref: `internal/modules/blockio/reader/columnar_read.go:readBlockColumnarWithCache`,
+`internal/modules/blockio/reader/columnar_read.go:planColdRuns`
