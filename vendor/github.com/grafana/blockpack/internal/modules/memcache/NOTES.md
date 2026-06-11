@@ -34,6 +34,45 @@ Back-ref: `internal/modules/memcache/memcache.go:newPooledClient`
 
 ---
 
+## NOTE-196: Socket timeout high enough to keep slow-but-healthy conns pooled
+*Added: 2026-06-11*
+
+**Decision:** Set `Timeout = ConnectTimeout = 5s` on the pooled gomemcache client
+(`newPooledClient`) instead of leaving them at the library default of 100ms.
+
+**Why:** This is the second half of the dial/handshake storm NOTE-162 only
+partially fixed. A querier CPU profile (2026-06-11, `gcx process_cpu`) STILL
+showed ~43% of querier CPU in the connection-establishment path —
+`internal/runtime/syscall.Syscall6` (~30%) plus kernel `__inet_hash_connect`,
+`__inet_check_established`, `tcp_twsk_unique` (ephemeral-port allocation +
+TIME_WAIT reuse churn) and TLS GCM re-handshake crypto (`gcmAesDec`,
+`addMulVVW2048`) — even though the 512-conn idle pool from NOTE-162 was deployed.
+
+The mechanism: under a heavy metrics fan-out (M4/M9 issue hundreds of concurrent
+`GetMulti`) memcache servers intermittently respond in >100ms. gomemcache's read
+deadline (`netTimeout()` = `Timeout`, default 100ms) then fires and the read
+returns a `net.Error` timeout. `condRelease` treats anything that is not a
+`resumableError` (cache miss / CAS conflict / not-stored / malformed key) as a
+broken connection and calls `cn.nc.Close()` — so every transiently-slow response
+*permanently destroys* a pooled connection. The pool drains faster than it refills
+and the next request must dial a fresh TCP connection + redo the TLS handshake,
+re-triggering the exact storm NOTE-162's deep pool was meant to stop.
+
+Raising the socket timeout to 5s keeps transiently-slow-but-healthy connections in
+the pool (they are reused, not re-dialed) while staying far below the query-level
+timeout (bench uses 30s), so a genuinely dead connection is still reaped promptly
+relative to the query budget. This is a structural fix to the connection lifecycle,
+not a per-query knob; it benefits every cache-backed read path equally.
+
+**How to apply:** Set `Timeout` and `ConnectTimeout` on the client built by
+`newPooledClient`. `ConnectTimeout` falls back to `Timeout` when zero, but is set
+explicitly for clarity. Pair with NOTE-162's deep idle pool — the deep pool is
+necessary but not sufficient; without the timeout fix the pool keeps draining.
+
+Back-ref: `internal/modules/memcache/memcache.go:newPooledClient`
+
+---
+
 ## NOTE-MC-001: Transient Errors as Misses
 *Added: 2026-04-14*
 

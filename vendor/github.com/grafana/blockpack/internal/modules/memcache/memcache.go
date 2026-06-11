@@ -100,18 +100,44 @@ func expandServers(servers []string) []string {
 // parallel requests lets connections be reused instead of re-dialed.
 const memcacheMaxIdleConns = 512
 
+// memcacheSocketTimeout is the per-operation socket read/write timeout for the
+// remote memcache client.
+//
+// NOTE-196: gomemcache defaults Timeout (and ConnectTimeout, which falls back to
+// Timeout) to 100ms. That value is the second half of the dial/handshake storm
+// NOTE-162 only partially fixed. A querier CPU profile (2026-06-11) still showed
+// ~43% of querier CPU in the connection-establishment path — Syscall6 (~30%) plus
+// kernel __inet_hash_connect / __inet_check_established / tcp_twsk_unique
+// (ephemeral-port + TIME_WAIT reuse) and TLS GCM re-handshake crypto — despite the
+// deep 512-conn idle pool. The mechanism: under a heavy metrics fan-out (M4/M9
+// issue hundreds of concurrent GetMulti) memcache servers intermittently respond
+// in >100ms. A 100ms socket timeout makes the read return a net.Error timeout,
+// which is NOT a resumableError, so gomemcache's condRelease CLOSES the connection
+// (cn.nc.Close()) instead of returning it to the pool. Every transient slow
+// response therefore permanently destroys a pooled connection, draining the pool
+// faster than it can refill and forcing a fresh TCP dial + TLS handshake on the
+// next request — re-triggering the exact storm NOTE-162's deep pool was meant to
+// stop. Raising the socket timeout well above the transient-slowness window (but
+// still far below the query-level timeout) keeps transiently-slow-but-healthy
+// connections in the pool, so they are reused instead of re-dialed.
+const memcacheSocketTimeout = 5 * time.Second
+
 // newPooledClient builds a gomemcache client with an idle-connection pool deep
 // enough to survive a heavy metrics query's concurrent cache fan-out, instead
-// of the default 2 (NOTE-162). MinIdleConnsHeadroomPercentage is set negative
-// so idle connections are never proactively closed between queries — the
-// background reaper closing the pool down to 2 between bursts is exactly what
-// forces the re-dial storm on the next query.
+// of the default 2 (NOTE-162), and with a socket timeout high enough that a
+// transiently slow response does not destroy a pooled connection (NOTE-196).
+// MinIdleConnsHeadroomPercentage is set negative so idle connections are never
+// proactively closed between queries — the background reaper closing the pool
+// down to 2 between bursts is exactly what forces the re-dial storm on the next
+// query.
 func newPooledClient(servers []string) *gomemcache.Client {
 	ss := new(gomemcache.ServerList)
 	_ = ss.SetServers(servers...)
 	c := gomemcache.NewFromSelector(ss)
 	c.MaxIdleConns = memcacheMaxIdleConns
 	c.MinIdleConnsHeadroomPercentage = -1
+	c.Timeout = memcacheSocketTimeout
+	c.ConnectTimeout = memcacheSocketTimeout
 	return c
 }
 
