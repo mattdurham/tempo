@@ -821,6 +821,34 @@ Verified Packed-order-identical to `slices.SortFunc` over 2000 random trials plu
 
 Back-ref: `internal/modules/blockio/shared/intrinsic_ref_index.go:radixSortRefIndex`
 
+## NOTE-190: radixSortRefIndex — bound the pass count by key magnitude (skip leading-zero bytes)
+
+*Added: 2026-06-11*
+
+NOTE-174's `radixSortRefIndex` always ran all four byte passes over the 32-bit `Packed` key
+(`BlockIdx<<16 | RowIdx`). A querier CPU profile (2026-06-11, 30m) still showed it at ~0.71%
+self time — the top blockpack symbol on the group-by histogram/rate path. Most of the upper
+two byte passes (shift 16/24) are degenerate: `RowIdx` is always 16-bit and `BlockIdx` is
+typically small, so the high bytes are frequently all-zero. A zero-valued byte position is an
+*identity* radix pass (every key lands in bucket 0) that still costs a full O(N) count plus an
+O(N) scatter.
+
+**Fix:** OR all keys in one O(N) prescan, find the highest non-zero byte, and run radix passes
+only up to that byte. Keys confined to the low 16 bits (the dominant single-block / RowIdx-only
+case) now run 2 passes instead of 4. When all keys are 0 the slice is already trivially sorted
+and zero passes run.
+
+**Why correct:** skipping a leading-zero byte position is a no-op permutation, so the remaining
+passes produce the identical ascending order on `Packed`. The variable pass count changes the
+output buffer parity, so after an odd number of passes the sorted data (now in `buf`) is copied
+back into `idx`; after an even count it is already in `idx`. Verified Packed-order-identical to
+`slices.SortFunc` across the existing 2000-trial random test, the edge-case table, and a new
+byte-skip test sweeping max key magnitudes of 1/2/3/4 significant bytes (500 trials each);
+`go test -race ./blockio/shared` and `./executor` green. Microbench (50k entries): full-32bit
+549µs, low-24bit 430µs (−22%), low-16bit 310µs (−43%).
+
+Back-ref: `internal/modules/blockio/shared/intrinsic_ref_index.go:radixSortRefIndex`
+
 ## NOTE-169: appendDeltaUint64Page — single-byte uvarint fast path, index-based store
 
 *Added: 2026-06-10*

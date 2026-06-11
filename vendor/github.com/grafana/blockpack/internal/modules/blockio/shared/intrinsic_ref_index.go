@@ -20,10 +20,23 @@ import (
 // rate-by queries. A radix sort is O(N) over a fixed 4-byte key with no comparator
 // indirection, so it removes the comparison-sort cost entirely.
 //
-// Four counting passes (one per byte, least significant first) produce a stable ascending
-// order on the full 32-bit key. The result is byte-for-byte identical to slices.SortFunc
-// because both order solely by Packed; ties keep an arbitrary-but-consistent order, which
-// the binary-search consumers (lookupRefIdx, BlockRefRange, LookupRefFast*) do not depend on.
+// Up to four counting passes (one per byte, least significant first) produce a stable
+// ascending order on the full 32-bit key. The result is byte-for-byte identical to
+// slices.SortFunc because both order solely by Packed; ties keep an arbitrary-but-consistent
+// order, which the binary-search consumers (lookupRefIdx, BlockRefRange, LookupRefFast*) do
+// not depend on.
+//
+// NOTE-190: bound the pass count by the maximum key magnitude instead of always running all
+// four byte passes. The Packed key is BlockIdx<<16 | RowIdx; on the unsorted dict fallback
+// path the keys merge refs across the blocks in a query, but RowIdx is always 16-bit and
+// BlockIdx is typically small, so the two high bytes (shift 16/24) are frequently all-zero.
+// A zero-valued byte position is a degenerate radix pass: every key lands in bucket 0, so the
+// pass is an identity permutation that still costs a full O(N) count + O(N) scatter. By taking
+// the OR of every key once (one O(N) pass that the count pass would do anyway) we learn the
+// highest non-zero byte and skip the leading zero passes entirely. This is a standard radix
+// byte-skip — purely a function of the data's value range, not of any particular column or
+// query shape. The buffer parity is handled below: when an odd number of passes ran, the
+// sorted data is in buf and is copied back into idx so the result always lands in idx.
 func radixSortRefIndex(idx []RefIndexEntry) {
 	const radixBits = 8
 	const radixSize = 1 << radixBits
@@ -32,10 +45,29 @@ func radixSortRefIndex(idx []RefIndexEntry) {
 	if n < 2 {
 		return
 	}
+	// One O(N) scan to find the OR of all keys; its highest set bit bounds how many byte
+	// passes are actually significant. Leading zero bytes are skipped (identity passes).
+	var keyOr uint32
+	for i := range idx {
+		keyOr |= idx[i].Packed
+	}
+	// maxShift is the start shift of the highest non-zero byte. keyOr==0 means all keys are
+	// equal to 0; the slice is already trivially sorted, so no passes are needed.
+	maxShift := 0
+	for s := 0; s < 32; s += radixBits {
+		if (keyOr>>s)&radixMask != 0 {
+			maxShift = s
+		}
+	}
+	if keyOr == 0 {
+		return
+	}
+
 	buf := make([]RefIndexEntry, n)
 	src, dst := idx, buf
+	passes := 0
 	var counts [radixSize]int
-	for shift := 0; shift < 32; shift += radixBits {
+	for shift := 0; shift <= maxShift; shift += radixBits {
 		for i := range counts {
 			counts[i] = 0
 		}
@@ -55,8 +87,13 @@ func radixSortRefIndex(idx []RefIndexEntry) {
 			counts[b]++
 		}
 		src, dst = dst, src
+		passes++
 	}
-	// After 4 (even) passes src == idx, so no final copy is needed.
+	// After an even number of passes src == idx; after an odd number the sorted data is in
+	// buf (now referenced by src), so copy it back so the result always lands in idx.
+	if passes%2 == 1 {
+		copy(idx, src)
+	}
 }
 
 // EnsureRefIndex builds a sorted-by-packed-ref lookup index into this column, enabling
