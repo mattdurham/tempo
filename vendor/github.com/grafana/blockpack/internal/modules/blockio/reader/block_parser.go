@@ -389,6 +389,13 @@ func parseBlockColumnsReuse(
 				continue
 			}
 
+			// NOTE-201: precompute the process-cache key for the deferred-decode path so
+			// decodeNow can consult/populate parsedV8ColumnCache on first access. Empty when
+			// no stable fileID is available — decodeNow then decodes without caching.
+			lazyKey := ""
+			if fileID != "" {
+				lazyKey = v8ColumnCacheKey(fileID, meta.Offset, m.name, m.colType)
+			}
 			lazyStore = append(lazyStore, Column{
 				Name:               m.name,
 				Type:               m.colType,
@@ -396,6 +403,7 @@ func parseBlockColumnsReuse(
 				compressedEncoding: rawBytes[start:end], // zero-copy sub-slice; decompressed on first access
 				uncompressedLen:    m.uncompressedLen,
 				internMap:          nil, // nil → internString skips map; safe for concurrent lazy decode
+				v8CacheKey:         lazyKey,
 			})
 			// Safe: cap was set to len(metas) and we append ≤ len(metas) items, so no realloc.
 			columns[key] = &lazyStore[len(lazyStore)-1]
@@ -575,6 +583,7 @@ func resetColumn(col *Column) {
 	col.uncompressedLen = 0
 	col.internMap = nil
 	col.sparseDictIdx = nil // NOTE-PERF-1: clear deferred dense expansion
+	col.v8CacheKey = ""     // NOTE-201: clear stale lazy-decode cache key on reuse
 	col.decodeOnce = sync.Once{}
 	col.denseOnce = sync.Once{}
 	col.decompressOnce = sync.Once{}

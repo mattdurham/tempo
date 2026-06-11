@@ -316,6 +316,42 @@ func (c *Column) ensureDecompressed() {
 // NOTE-CONC-001: no outer rawEncoding check — that read would race with the write inside
 // the closure. decodeOnce.Do is idempotent: the inner guard handles the already-done case.
 func (c *Column) decodeNow() {
+	// NOTE-201: consult the process-level decoded-column cache BEFORE decompressing.
+	// The lazy path defers snappy + readColumnEncoding to first access; without this check the
+	// identical on-disk block column is re-decoded on every warm query that filters/scans it
+	// lazily (e.g. high-cardinality intrinsic group-bys, predicate-filtered block columns that
+	// were not in the eager wantColumns set). On a hit we copy the immutable decoded slices in
+	// and skip decompression entirely. The per-query Column keeps its own fresh denseOnce /
+	// sparseDictIdx so NOTE-PERF-1 dense expansion runs per query and never mutates the snapshot.
+	if c.v8CacheKey != "" {
+		if cached := parsedV8ColumnCache.Get(c.v8CacheKey); cached != nil {
+			c.decodeOnce.Do(func() {
+				if c.Present == nil {
+					c.Present = cached.Present
+				}
+				c.StringDict = cached.StringDict
+				c.StringIdx = cached.StringIdx
+				c.Int64Dict = cached.Int64Dict
+				c.Int64Idx = cached.Int64Idx
+				c.Uint64Dict = cached.Uint64Dict
+				c.Uint64Idx = cached.Uint64Idx
+				c.Float64Dict = cached.Float64Dict
+				c.Float64Idx = cached.Float64Idx
+				c.BoolDict = cached.BoolDict
+				c.BoolIdx = cached.BoolIdx
+				c.BytesDict = cached.BytesDict
+				c.BytesIdx = cached.BytesIdx
+				c.BytesInline = cached.BytesInline
+				c.sparseDictIdx = cached.sparseDictIdx
+				c.rawEncoding = nil
+				c.compressedEncoding = nil
+				c.internMap = nil
+				c.decoded.Store(true)
+			})
+			return
+		}
+	}
+
 	c.ensureDecompressed()
 	c.decodeOnce.Do(func() {
 		if c.rawEncoding == nil {
@@ -354,6 +390,17 @@ func (c *Column) decodeNow() {
 		c.BytesIdx = dec.BytesIdx
 		c.BytesInline = dec.BytesInline
 		c.sparseDictIdx = dec.sparseDictIdx
+
+		// NOTE-201: store a snapshot of the freshly decoded slices so subsequent warm
+		// queries that lazily access the identical on-disk block column skip the decode.
+		// dec was allocated fresh by readColumnEncoding; the snapshot shares those read-only
+		// slices (dense expansion builds a new Idx on the per-query col, never mutating these).
+		if c.v8CacheKey != "" {
+			snap := snapshotDecodedColumn(dec, c.Name, c.Type)
+			snap.Present = c.Present
+			snap.SpanCount = c.SpanCount
+			_ = parsedV8ColumnCache.Put(c.v8CacheKey, snap)
+		}
 
 		c.rawEncoding = nil
 		c.internMap = nil
@@ -1306,8 +1353,14 @@ func decodeVectorF32(data []byte, spanCount int, ctx *decodeCtx) (*Column, error
 
 // Column is a blockpack data type.
 type Column struct {
-	internMap          map[string]string
-	Name               string
+	internMap map[string]string
+	Name      string
+	// NOTE-201: process-cache key for the lazy (deferred) decode path. Populated by the
+	// lazy-registration loop in parseBlockColumnsReuse when a stable fileID is available.
+	// decodeNow consults parsedV8ColumnCache on this key before doing snappy+readColumnEncoding
+	// and stores a snapshot on miss, extending NOTE-200's eager-loop reuse to first-access decode.
+	// Empty when no stable key is available (no fileID) — decode proceeds without cache.
+	v8CacheKey         string
 	StringDict         []string
 	StringIdx          []uint32
 	Int64Dict          []int64

@@ -1193,3 +1193,44 @@ Back-ref: `internal/modules/blockio/reader/parser.go:parsedV8ColumnCache`,
 `internal/modules/blockio/reader/block_parser.go:parseBlockColumnsReuse`,
 `v8ColumnCacheKey`, `snapshotDecodedColumn`, `copyDecodedColumnInto`,
 `internal/modules/blockio/reader/block.go:Column.SizeBytes`.
+
+## NOTE-201 — Extend V8 decoded-column cache to the lazy (deferred) decode path
+*Added: 2026-06-11*
+
+**Problem:** NOTE-200 cached decoded V8 block columns, but only the *eager* loop in
+`parseBlockColumnsReuse` consulted and populated `parsedV8ColumnCache`. Columns NOT in the
+query's `wantColumns` set are registered lazily (NOTE-001) with `compressedEncoding` pointing
+into `rawBytes` and no immediate decode; their snappy decompress + `readColumnEncoding` is
+deferred to first access via `Column.decodeNow`. That deferred decode never touched the cache,
+so any column reached lazily on the warm path — e.g. a predicate-filtered block column outside
+the eager want set, or a column accessed only during row emission — was re-decoded from scratch
+on every warm query, exactly the redundant-decode cost NOTE-200 eliminated for the eager path.
+
+**Fix:** carry the same `v8ColumnCacheKey` on the lazy `Column` and have `decodeNow` use it:
+- the lazy-registration loop computes `v8CacheKey` (empty when `fileID == ""`) and stores it on
+  the registered `Column` alongside `compressedEncoding`;
+- `decodeNow` consults `parsedV8ColumnCache` on `v8CacheKey` *before* `ensureDecompressed`; on a
+  HIT it copies the immutable decoded slices into the per-query column and skips decompress +
+  decode entirely; on a MISS it decodes as before, then stores a snapshot
+  (`snapshotDecodedColumn`, with the column's own `Present`/`SpanCount`).
+- `resetColumn` clears `v8CacheKey` so a reused `Column` (the `prevBlock` column-reuse branch)
+  never carries a stale key.
+
+**Correctness:** identical sharing model to NOTE-200 — the snapshot holds only immutable decoded
+slices; the per-query column keeps its own zero-valued `denseOnce`/`sparseDictIdx`, so
+NOTE-PERF-1 dense expansion runs per query and never mutates the shared snapshot. The cache
+copy runs inside `decodeOnce.Do`, preserving the single-decode guarantee for concurrent lazy
+accessors (NOTE-CONC-001). The lazy `Column` literal leaves `Present == nil`, so the
+`if c.Present == nil` copy matches the original `decodeNow` semantics. Lazy columns sourced from
+the `lazyColumnStorePool` are zeroed on release and freshly re-initialised per parse via the
+struct literal, so `v8CacheKey` is never stale on the pooled path.
+
+**Verification:** `go build ./...` clean; reader + executor suites green under `-race`. New
+`TestParsedV8ColumnCache_LazyWarmEqualsCold` parses with an eager want set that excludes two
+columns, forces their lazy decode via `EnsureDecoded`, asserts the cache grows (lazy MISS
+populated it), then asserts a warm reader's lazy access HITS the cache (no new entries) and
+yields per-row values byte-identical to the cold lazy decode.
+
+Back-ref: `internal/modules/blockio/reader/column.go:Column.decodeNow`,
+`Column.v8CacheKey`, `internal/modules/blockio/reader/block_parser.go:parseBlockColumnsReuse`
+(lazy-registration loop), `resetColumn`.
