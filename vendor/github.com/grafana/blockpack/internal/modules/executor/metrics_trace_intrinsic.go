@@ -873,6 +873,7 @@ func scanAggColHistogramCompact( //nolint:gocyclo
 	stride1, stride2 int64,
 	discardStride int64,
 	fieldName string, // NOTE-143: callers pass agg.Field; used to rebuild boundaries for worker reads
+	roBoundary func(float64) int64, // NOTE-182: race-free per-row lookup for parallel workers; nil → frozen-map fallback
 ) error {
 	if len(sortedPKs) == 0 {
 		return nil
@@ -925,15 +926,28 @@ func scanAggColHistogramCompact( //nolint:gocyclo
 	// so the caller's boundaries[] ends up identical to a serial run (emit is byte-identical). The
 	// pre-warm applies the SAME row filters the scan applies, so it visits exactly the rows the
 	// workers will reach (passing the pk-range/bitset/time-bucket filter), in scan order.
-	frozen := buildFrozenBoundaryIdx(
-		col, fieldName, getBoundaryIdx, minPK, maxPK, pkBitset, rankPrefix, timeBucketByPos,
-	)
-	roBoundary := func(v float64) int64 {
-		b := intrinsicHistogramBoundary(v, fieldName)
-		if idx, ok := frozen[b]; ok {
-			return idx
+	// NOTE-182: when the driver supplies a race-free read-only lookup (the boundaryIndexer's
+	// exponent-keyed lookup), use it directly — it shares the pre-warmed dense table and needs
+	// no per-row float64 hashing. The pre-warm below (getBoundaryIdx == bi.index) populates that
+	// table. Callers without a boundaryIndexer (the parity test) pass nil and fall back to the
+	// legacy frozen map[float64]int64 rebuilt from the closure.
+	if roBoundary == nil {
+		frozen := buildFrozenBoundaryIdx(
+			col, fieldName, getBoundaryIdx, minPK, maxPK, pkBitset, rankPrefix, timeBucketByPos,
+		)
+		roBoundary = func(v float64) int64 {
+			b := intrinsicHistogramBoundary(v, fieldName)
+			if idx, ok := frozen[b]; ok {
+				return idx
+			}
+			return discardStride // unreachable: pre-warm visited every value the scan will reach
 		}
-		return discardStride // unreachable: pre-warm visited every value the scan will reach
+	} else {
+		// Serial pre-warm using getBoundaryIdx (bi.index) so bi.boundaries ends up identical to a
+		// serial run and bi.lookup sees every assigned exponent slot before any worker reads it.
+		prewarmBoundaries(col, fieldName, minPK, maxPK, pkBitset, rankPrefix, timeBucketByPos, func(v float64) {
+			getBoundaryIdx(v)
+		})
 	}
 
 	chunk := (numItems + w - 1) / w
@@ -1148,10 +1162,28 @@ func buildFrozenBoundaryIdx(
 	timeBucketByPos []int32,
 ) map[float64]int64 {
 	frozen := make(map[float64]int64, 64)
-	record := func(v float64) {
-		idx := getBoundaryIdx(v) // mutates caller's boundaryCache/boundaries (serial, single-threaded)
-		frozen[intrinsicHistogramBoundary(v, fieldName)] = idx
-	}
+	prewarmBoundaries(col, fieldName, minPK, maxPK, pkBitset, rankPrefix, timeBucketByPos,
+		func(v float64) {
+			idx := getBoundaryIdx(v) // mutates caller's boundaryCache/boundaries (serial, single-threaded)
+			frozen[intrinsicHistogramBoundary(v, fieldName)] = idx
+		})
+	return frozen
+}
+
+// prewarmBoundaries walks the column in legacy scan order applying the SAME per-row filters
+// the scan applies, invoking record(v) for exactly the rows (in the order) a serial scan would
+// record a boundary for (NOTE-143). Extracted from buildFrozenBoundaryIdx so the boundaryIndexer
+// fast path (NOTE-182) can pre-warm its dense exponent table without also building the legacy
+// float64 frozen map.
+func prewarmBoundaries(
+	col *modules_shared.IntrinsicColumn,
+	fieldName string,
+	minPK, maxPK uint32,
+	pkBitset []uint64,
+	rankPrefix []uint32,
+	timeBucketByPos []int32,
+	record func(v float64),
+) {
 	switch col.Format {
 	case modules_shared.IntrinsicFormatDict:
 		// Dict entries are walked in order (≤ a few hundred); the legacy scan records per-entry
@@ -1209,7 +1241,6 @@ func buildFrozenBoundaryIdx(
 			record(float64(col.Uint64Values[i]))
 		}
 	}
-	return frozen
 }
 
 // streamCountRateN1Compact is the compact-memory fallback for count/rate N=1 group-by
@@ -1763,23 +1794,9 @@ func streamHistogramN1CompactFromRefs(
 	groupCountsFlat := acquireGroupCountsFlat(int64(numGroups) * stride1) //nolint:gosec
 	defer releaseGroupCountsFlat(groupCountsFlat)
 
-	boundaryCache := make(map[float64]int64, 32)
-	boundaries := make([]float64, 0, int(actualStride))
-	getBoundaryIdx := func(v float64) int64 {
-		b := intrinsicHistogramBoundary(v, agg.Field)
-		idx, ok := boundaryCache[b]
-		if !ok {
-			if int64(len(boundaries)) >= actualStride-1 {
-				idx = actualStride
-				boundaryCache[b] = idx
-				return idx
-			}
-			boundaries = append(boundaries, b)
-			idx = int64(len(boundaries))
-			boundaryCache[b] = idx
-		}
-		return idx
-	}
+	// NOTE-182: exponent-indexed boundary lookup replaces the per-row map[float64]int64.
+	bi := newBoundaryIndexer(agg.Field, actualStride)
+	getBoundaryIdx := bi.index
 
 	// NOTE-125: pool seenByPos (~7 MB at n=7.2 M).
 	seenByPos := acquireCompactBool(n)
@@ -1787,11 +1804,12 @@ func streamHistogramN1CompactFromRefs(
 	if aggCol != nil {
 		if err := scanAggColHistogramCompact(
 			ctx, aggCol, sortedPKs, timeBucketByPos, dictIdxByPos, seenByPos,
-			getBoundaryIdx, groupCountsFlat, stride1, stride2, actualStride, agg.Field,
+			getBoundaryIdx, groupCountsFlat, stride1, stride2, actualStride, agg.Field, bi.lookup,
 		); err != nil {
 			return err
 		}
 	}
+	boundaries := bi.boundaries
 
 	// Absent-row pass: positions not seen in the aggregate column → boundary-0 bucket.
 	for pos, seen := range seenByPos {
@@ -2001,32 +2019,19 @@ func streamHistogramN1Compact(
 	groupCountsFlat := acquireGroupCountsFlat(int64(numGroups) * stride1) //nolint:gosec
 	defer releaseGroupCountsFlat(groupCountsFlat)
 
-	boundaryCache := make(map[float64]int64, 32)
-	boundaries := make([]float64, 0, int(actualStride))
-	getBoundaryIdx := func(v float64) int64 {
-		b := intrinsicHistogramBoundary(v, agg.Field)
-		idx, ok := boundaryCache[b]
-		if !ok {
-			if int64(len(boundaries)) >= actualStride-1 {
-				idx = actualStride // discard sentinel
-				boundaryCache[b] = idx
-				return idx
-			}
-			boundaries = append(boundaries, b)
-			idx = int64(len(boundaries))
-			boundaryCache[b] = idx
-		}
-		return idx
-	}
+	// NOTE-182: exponent-indexed boundary lookup replaces the per-row map[float64]int64.
+	bi := newBoundaryIndexer(agg.Field, actualStride)
+	getBoundaryIdx := bi.index
 
 	// NOTE-125: pool seenByPos (~7 MB at n=7.2 M).
 	seenByPos := acquireCompactBool(n)
 	defer releaseCompactBool(seenByPos)
 	if aggCol != nil {
-		if err := scanAggColHistogramCompact(ctx, aggCol, sortedPKs, timeBucketByPos, dictIdxByPos, seenByPos, getBoundaryIdx, groupCountsFlat, stride1, stride2, actualStride, agg.Field); err != nil {
+		if err := scanAggColHistogramCompact(ctx, aggCol, sortedPKs, timeBucketByPos, dictIdxByPos, seenByPos, getBoundaryIdx, groupCountsFlat, stride1, stride2, actualStride, agg.Field, bi.lookup); err != nil {
 			return err
 		}
 	}
+	boundaries := bi.boundaries
 
 	// Absent-row pass: positions not seen in the aggregate column → bIdx=0 sentinel.
 	for pos, seen := range seenByPos {
@@ -5025,6 +5030,127 @@ func updateAggBucket(bucket *aggBucketState, fn string, v float64) {
 func pow2Floor(v float64) float64 {
 	_, exp := math.Frexp(v)
 	return math.Ldexp(1, exp-1)
+}
+
+// boundaryIndexer maps a histogram-cell value to a dense first-encounter boundary
+// index, replacing the per-row map[float64]int64 lookup in the histogram scan hot loop.
+//
+// NOTE-182: a CPU profile (process_cpu, 30m) attributed ~14% of total querier CPU to the
+// histogram aggregation scan (scanAggColHistogramShard 5.6% + buildFrozenBoundaryIdx 3.8% +
+// histRefPassPos 2.3% + scanAggColHistogramCompact 1.2%). Inside the per-ref hot loop the
+// getBoundaryIdx closure hashed a float64 boundary through a map[float64]int64 on EVERY
+// passing row. The boundary is always either 0 (for v<=0) or an exact power of two
+// 2**(exp-1) where exp comes from math.Frexp(v) (NOTE-181). The binary exponent is therefore
+// a perfect dense integer key: this indexer keeps a slice indexed by (exp-expBase) instead
+// of hashing the float, collapsing the per-row hash+probe to a single bounds-checked array
+// read. First-encounter ordering of boundaries[] (load-bearing per NOTE-143: the emit step
+// reads boundaries in append order) and the actualStride-1 overflow/discard sentinel are
+// preserved byte-for-byte.
+type boundaryIndexer struct {
+	boundaries  []float64 // first-encounter order; read by the emit step (NOTE-143)
+	byExp       []int64   // dense index by (exp-expBase); 0 means "unassigned"
+	zeroIdx     int64     // assigned index for the boundary-0 cell, 0 until first seen
+	maxStride   int64     // actualStride: at most maxStride-1 distinct boundaries before discard
+	discardIdx  int64     // sentinel index returned once maxStride-1 boundaries are recorded
+	expBase     int       // exponent of byExp[0]
+	zeroSeen    bool
+	scaleByNano bool // span:duration values are divided by 1e9 before pow2Floor (NOTE-181)
+}
+
+// newBoundaryIndexer builds an indexer for one histogram field. fieldName selects the
+// duration scaling; actualStride bounds the number of recordable boundaries.
+func newBoundaryIndexer(fieldName string, actualStride int64) *boundaryIndexer {
+	// float64 binary exponents span roughly [-1074, 1024]; size the dense table to cover
+	// that whole range so any value maps without a second allocation. The table is int64
+	// per slot (~17 KiB) — negligible and built once per scan, not per row.
+	const expLo, expHi = -1075, 1025
+	return &boundaryIndexer{
+		boundaries:  make([]float64, 0, int(actualStride)),
+		byExp:       make([]int64, expHi-expLo),
+		expBase:     expLo,
+		maxStride:   actualStride,
+		discardIdx:  actualStride,
+		scaleByNano: fieldName == colNameSpanDuration,
+	}
+}
+
+// index returns the dense first-encounter boundary index for v, mirroring the exact
+// semantics of the former getBoundaryIdx closure (boundary 0 for v<=0; otherwise the
+// power-of-two boundary keyed by exponent; discard sentinel once maxStride-1 boundaries
+// are recorded). Single math.Frexp per call — no transcendental, no float64 hashing.
+func (bi *boundaryIndexer) index(v float64) int64 {
+	// Mirror intrinsicHistogramBoundary exactly: the original value is tested <= 0 FIRST
+	// (negatives and zero map to the boundary-0 cell regardless of field), then duration
+	// values are scaled by 1e9; the math.Abs in the plain branch is dead since v > 0 here.
+	if v <= 0 {
+		if !bi.zeroSeen {
+			bi.zeroIdx = bi.record(0)
+			bi.zeroSeen = true
+		}
+		return bi.zeroIdx
+	}
+	if bi.scaleByNano {
+		v /= 1e9
+		if v <= 0 {
+			if !bi.zeroSeen {
+				bi.zeroIdx = bi.record(0)
+				bi.zeroSeen = true
+			}
+			return bi.zeroIdx
+		}
+	}
+	_, exp := math.Frexp(v)
+	slot := exp - bi.expBase
+	// byExp slots hold the assigned index (>0) or the discard sentinel (== maxStride) once
+	// seen; only an unassigned slot (== 0) triggers a record() call, matching the former
+	// closure where boundaryCache memoized both real indices and the overflow sentinel.
+	if idx := bi.byExp[slot]; idx != 0 {
+		return idx
+	}
+	idx := bi.record(math.Ldexp(1, exp-1))
+	bi.byExp[slot] = idx
+	return idx
+}
+
+// record assigns the next first-encounter index for boundary b, appending to boundaries[]
+// unless the maxStride-1 cap is reached (then it returns the discard sentinel without
+// appending), matching the former closure's overflow branch exactly.
+func (bi *boundaryIndexer) record(b float64) int64 {
+	if int64(len(bi.boundaries)) >= bi.maxStride-1 {
+		return bi.discardIdx
+	}
+	bi.boundaries = append(bi.boundaries, b)
+	return int64(len(bi.boundaries))
+}
+
+// lookup is the read-only counterpart of index used by parallel workers after a serial
+// pre-warm has populated byExp/zeroIdx (NOTE-143). It performs the same exponent decode
+// but never mutates indexer state, so it is safe to call concurrently from every worker.
+// The pre-warm visits exactly the rows the workers reach, so a slot is always assigned;
+// an unassigned slot returns the discard sentinel (the former roBoundary's unreachable
+// fallback), never corrupting shared state.
+func (bi *boundaryIndexer) lookup(v float64) int64 {
+	if v <= 0 {
+		if bi.zeroSeen {
+			return bi.zeroIdx
+		}
+		return bi.discardIdx
+	}
+	if bi.scaleByNano {
+		v /= 1e9
+		if v <= 0 {
+			if bi.zeroSeen {
+				return bi.zeroIdx
+			}
+			return bi.discardIdx
+		}
+	}
+	_, exp := math.Frexp(v)
+	slot := exp - bi.expBase
+	if idx := bi.byExp[slot]; idx != 0 {
+		return idx
+	}
+	return bi.discardIdx
 }
 
 // intrinsicHistogramBoundary computes the log2 lower-boundary for a histogram cell.

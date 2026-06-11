@@ -5,6 +5,48 @@ This document captures the non-obvious design decisions, rationale, and invarian
 
 ---
 
+## NOTE-182: boundaryIndexer — exponent-indexed boundary lookup, no per-row float64 hashing
+*Added: 2026-06-11*
+
+**Decision:** Replace the per-row `getBoundaryIdx` closure — a `map[float64]int64` keyed
+by the histogram boundary value — used by every histogram aggregation scan
+(`scanAggColHistogramCompact`/`Shard`) with a `boundaryIndexer` that keys on the boundary's
+*binary exponent* via a dense `[]int64` slice instead of hashing the float. The boundary is
+always either `0` (for `v <= 0`) or an exact power of two `2**(exp-1)` where `exp` comes from
+the single `math.Frexp(v)` already implied by NOTE-181's `pow2Floor`. The exponent is therefore
+a perfect dense integer key: `bi.index(v)` decodes the exponent and does one bounds-checked
+array read/write instead of a float64 hash + map probe. A read-only `bi.lookup(v)` variant
+serves the parallel workers after a serial pre-warm (NOTE-143) populates the dense table, so
+the workers no longer rebuild or probe the legacy `frozen map[float64]int64` either.
+
+**Rationale:** A 2026-06-11 querier CPU profile (gcx, process_cpu, 30m) attributed ~14% of
+total querier CPU to the histogram aggregation scan: `scanAggColHistogramShard` 5.63%,
+`buildFrozenBoundaryIdx` 3.78%, `histRefPassPos` 2.29%, `scanAggColHistogramCompact` 1.16%.
+The dominant remaining per-row cost inside `scanAggColHistogramShard` (after NOTE-181 removed
+the transcendentals) was the float64 map lookup performed for *every passing row* — float
+hashing plus a probe. Replacing it with an exponent-indexed array read removes the hash and
+the map entirely from the hot loop, a general algorithmic improvement on the boundary domain
+(powers of two), not a workload-specific shortcut.
+
+**Correctness:** `bi.index` mirrors the former closure exactly — the original value is tested
+`<= 0` FIRST (negatives and zero map to the boundary-0 cell regardless of field, since
+`intrinsicHistogramBoundary` returns 0 before its dead `math.Abs`), span:duration values are
+then scaled by `1e9`, the `actualStride-1` overflow/discard sentinel and the first-encounter
+append order of `boundaries[]` (load-bearing for the emit step, NOTE-143) are preserved
+byte-for-byte. `bi.lookup` never mutates indexer state, so it is race-free across the parallel
+workers; the serial pre-warm visits exactly the rows the workers reach, so every read hits an
+assigned exponent slot. The dense table spans the full float64 exponent range
+`[-1075, 1025)`, so any finite value (incl. denormals, ±Inf→exp 0, NaN→exp 0) indexes in
+bounds. Verified bit-exact against a verbatim copy of the pre-NOTE-182 closure
+(`TestBoundaryIndexerParity`) over thousands of values per (field, stride): zeros, negatives,
+exact powers of two, the full ns-duration range, denormals, and repeats — for both `index` and
+`lookup`, including matching `boundaries[]` value and order. `go test -race ./executor` green.
+
+**Queries affected:** All `histogram_over_time` queries routed through the intrinsic compact
+histogram scan (M8 and group-by histograms).
+
+---
+
 ## NOTE-181: pow2Floor — branch-free power-of-2 floor for histogram boundaries
 *Added: 2026-06-10*
 
