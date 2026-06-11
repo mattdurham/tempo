@@ -723,13 +723,24 @@ func decodeDictPagesArena(
 				// here never exceeds cap and never reallocates — keeping the exact-capacity
 				// arena contract (a stray future append would still reallocate, not clobber
 				// a neighbor). Per-entry ref order is unchanged (page order preserved).
+				//
+				// NOTE-204: decode the contiguous refCount-ref run via appendVariableWidthRefs
+				// (NOTE-163) instead of a per-ref decodeRef loop. decodeRef re-evaluated the
+				// blockW==1 / rowW==1 width branches on EVERY ref even though both widths are
+				// constant for the whole column; appendVariableWidthRefs hoists the width
+				// dispatch out of the loop (one specialised branch-free copy loop per width
+				// combination) and does a single up-front bounds check for the whole run.
+				// The dict arena's high-cardinality group-by columns (e.g. M4's rate-by-service
+				// path) decode millions of refs through this loop — decodeRef was ~0.6% of
+				// querier self-time (profile 2026-06-11). appendVariableWidthRefs writes by
+				// index into the entry's pre-sized BlockRefs (cap == refTotals[j] >= the running
+				// total), so the exact-capacity arena contract and page-order ref layout are
+				// preserved byte-for-byte.
 				e := &merged.DictEntries[j]
-				base := len(e.BlockRefs)
-				e.BlockRefs = e.BlockRefs[:base+refCount]
-				p := refStart
-				for k := range refCount {
-					e.BlockRefs[base+k] = decodeRef(pageRaw, p, blockW, rowW)
-					p += refSize
+				if _, refErr := appendVariableWidthRefs(
+					pageRaw, refStart, blockW, rowW, refCount, &e.BlockRefs,
+				); refErr != nil {
+					return fmt.Errorf("decodeDictPagesArena: page %d refs: %w", i, refErr)
 				}
 				return nil
 			})

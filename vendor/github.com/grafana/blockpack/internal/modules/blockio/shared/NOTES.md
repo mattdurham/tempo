@@ -951,6 +951,41 @@ Back-ref: `internal/modules/blockio/shared/intrinsic_codec.go:decodeDictPagesAre
 
 ---
 
+## NOTE-204: decodeDictPagesArena pass-2 reuses appendVariableWidthRefs (hoist per-ref width dispatch)
+*Added: 2026-06-11*
+
+NOTE-186 made the `decodeDictPagesArena` pass-2 ref fill write `BlockRef`s by index into each
+entry's exact-capacity arena sub-slice, but it still decoded each ref with a per-ref
+`decodeRef(pageRaw, p, blockW, rowW)` call. `decodeRef` re-evaluates the `blockW == 1` and
+`rowW == 1` width branches on **every** ref, even though both widths are constant for the entire
+column. This is the exact per-row width-branch redundancy that NOTE-163 eliminated for the
+flat/xor/delta ref sections via `appendVariableWidthRefs` — the dict arena path never got that
+treatment because its refs were thought of as scattered per-entry.
+
+**Observation:** within a single value's page occurrence, the `refCount` refs are contiguous in
+`pageRaw` starting at `refStart` (the offset `forEachDictPageValue` hands the callback). So a whole
+occurrence's run can be decoded by one `appendVariableWidthRefs(pageRaw, refStart, blockW, rowW,
+refCount, &e.BlockRefs)` call, which hoists the width dispatch out of the loop (one branch-free
+copy-and-advance loop per width combination) and does a single up-front bounds check for the run.
+
+**Why correct:** `appendVariableWidthRefs` already implements the NOTE-186 index-store discipline
+(pre-extend, write by index) into a caller-guaranteed-capacity slice; each entry's `BlockRefs` is
+carved with exact capacity `refTotals[j]` and the summed `refCount` across occurrences equals that
+capacity, so `cap-len >= refCount` always holds and the slice is never reallocated — the
+exact-capacity arena contract (NOTE-152) and page-order ref layout are preserved byte-for-byte. The
+decoded `BlockIdx`/`RowIdx` values are identical to `decodeRef`'s (same little-endian reads per
+width). `forEachDictPageValue` already validates `refCount <= (len(raw)-pos)/refSize` before the
+callback, and `appendVariableWidthRefs`'s own `end > len(raw)` check is an equivalent guard.
+
+**Rationale:** a 2026-06-11 querier CPU profile attributed ~0.6% self-time to `decodeRef` on the
+high-cardinality dict group-by decode path (e.g. M4 `rate() by (...)`, millions of refs through
+this loop). Removing the per-ref width test on that path is a general decode improvement on the
+constant-width ref layout, not a workload-specific shortcut.
+
+Back-ref: `internal/modules/blockio/shared/intrinsic_codec.go:decodeDictPagesArena`
+
+---
+
 ## NOTE-186: index-based ref store into pre-extended slices (two ref-decode sites)
 *Added: 2026-06-11*
 
