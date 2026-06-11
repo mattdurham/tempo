@@ -12,7 +12,6 @@ import (
 	"math"
 	"math/bits"
 	"runtime"
-	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -2137,16 +2136,36 @@ func mergeJoinFilteredRefsWithVals(
 		return nil, nil, release
 	}
 
-	// Build a sorted []uint32 of filteredRefs packKeys — cheaper than cloning BlockRef
-	// (same 4 bytes/entry but avoids SortFunc closure; packKey is pre-computed so the
-	// probe below avoids recomputing it per step).
+	// Build a []uint32 of filteredRefs packKeys — cheaper than cloning BlockRef
+	// (same 4 bytes/entry; packKey is pre-computed so the bitset build below avoids
+	// recomputing it per entry).
+	//
+	// NOTE-203: drop the slices.Sort(filteredPKs). The only consumers of filteredPKs are
+	// (a) the [flo, fhi] range gate, which needs the min and max packKey, and (b) the
+	// bit-set build loop, which sets one bit per packKey and is order-independent. The
+	// former O(N log N) sort existed solely so flo/fhi could be read from the first/last
+	// element of the sorted slice. min/max is an O(N) reduction, so we fold it into the
+	// same pass that computes the packKeys — removing the comparison sort entirely (the
+	// querier CPU profile attributed ~1.6% self-time to mergeJoinFilteredRefsWithVals, of
+	// which slices.Sort over the F-element filtered set is the dominant component on the
+	// predicate-filtered metrics path). The bitset and every downstream consumer are
+	// byte-for-byte identical: bit membership does not depend on the order filteredPKs was
+	// produced in, and flo/fhi are the same min/max either way.
 	filteredPKs := acquireCompactUint32(
 		len(filteredRefs),
 	) // NOTE-128: ~15 MB at F=3.75 M; pooled to eliminate GC pressure
+	flo := packKey(filteredRefs[0].BlockIdx, filteredRefs[0].RowIdx)
+	fhi := flo
 	for i, ref := range filteredRefs {
-		filteredPKs[i] = packKey(ref.BlockIdx, ref.RowIdx)
+		pk := packKey(ref.BlockIdx, ref.RowIdx)
+		filteredPKs[i] = pk
+		if pk < flo {
+			flo = pk
+		}
+		if pk > fhi {
+			fhi = pk
+		}
 	}
-	slices.Sort(filteredPKs)
 
 	// NOTE-166: probe-then-sort-matches. The former implementation built a packed
 	// []uint64 index over ALL N in-range refs (idxPacked, ~57 MB at N=7.2 M) and ran
@@ -2164,9 +2183,8 @@ func mergeJoinFilteredRefsWithVals(
 	// already proven on the group-by/histogram compact scan (scanGroupByColCompact NOTE-135/140
 	// and scanAggColHistogramCompact). The bitset spans only the [flo, fhi] packKey range
 	// (offset by flo>>6 so unused low words are not allocated). filteredPKs is no longer needed
-	// after the bitset is built, so it is released early.
-	flo := filteredPKs[0]
-	fhi := filteredPKs[len(filteredPKs)-1]
+	// after the bitset is built, so it is released early. flo/fhi were computed in the
+	// packKey build pass above (NOTE-203) rather than read from a now-removed sorted slice.
 	// Bitset indexed by (pk - baseWord*64); word baseWord covers flo, so it spans only the
 	// active range. nWords = (fhi>>6) - (flo>>6) + 1.
 	baseWord := int(flo >> 6) //nolint:gosec

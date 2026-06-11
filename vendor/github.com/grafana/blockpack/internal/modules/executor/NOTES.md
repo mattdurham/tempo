@@ -4566,3 +4566,26 @@ accumulator on the fallback path.
 threshold (predicate-filtered service/method group-bys) — M6/M9-class.
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:streamByRefSliceCountRate,streamCountRateGroupByIDSingle`,
 pool: `acquireGroupCountsFlat/releaseGroupCountsFlat` (NOTE-124).
+
+## NOTE-203 — mergeJoinFilteredRefsWithVals: drop slices.Sort, fold min/max into the build pass
+
+`mergeJoinFilteredRefsWithVals` built a `[]uint32` of the filtered refs' packKeys and ran a full
+`slices.Sort` over it. The sort's only purpose was to read `flo = filteredPKs[0]` and
+`fhi = filteredPKs[len-1]` — the min and max packKey that define the `[flo, fhi]` range gate
+guarding the membership bit-set. Every other consumer of `filteredPKs` is order-independent: the
+bit-set build loop (NOTE-167) sets one bit per packKey regardless of order, and `filteredPKs` is
+released immediately afterwards.
+
+min/max is an O(N) reduction, so it is now computed in the same single pass that derives the
+packKeys, and the `slices.Sort` is removed entirely. This replaces an O(N log N) comparison sort
+over the F-element filtered set with O(N) on every invocation of the predicate-filtered metrics
+merge-join path. The querier CPU profile (2026-06-11) attributed ~1.6% self-time to
+`mergeJoinFilteredRefsWithVals`, of which the sort over `filteredPKs` is the dominant component on
+predicate-filtered group-by queries (M6/M9/M10 and any `... by (...)` with a predicate).
+
+Output is byte-for-byte identical: bit-set membership does not depend on the order in which
+`filteredPKs` was produced, and `flo`/`fhi` are the same min/max values whether read from a sorted
+slice or computed by reduction. No benchmark-specific constants — a pure algorithmic O(N log N) → O(N)
+reduction.
+**Queries affected:** predicate-filtered count/rate group-by and merge-join metrics queries — M6, M9, M10.
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:mergeJoinFilteredRefsWithVals`.
