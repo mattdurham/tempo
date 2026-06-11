@@ -1117,3 +1117,30 @@ on the same goroutine that then scans).
 Back-ref: `internal/modules/blockio/reader/intrinsic_reader.go:PrefetchIntrinsicColumns`,
 `internal/modules/tieredcache/typed.go:GetMultiIntrinsic`,
 `internal/modules/executor/metrics_trace_intrinsic.go:prefetchIntrinsicWorkingSet`.
+
+## NOTE-199 — PrefetchIntrinsicColumns consults the process cache before fetch + decode
+
+The NOTE-197 prefetch collected its `want` set by skipping only columns already in the
+per-Reader `intrinsicDecoded` map. But a Reader is created fresh per query (per block per
+querier call, NOTE-170/185), so that map is always empty at prefetch time — even when a
+prior query's Reader on the same file already decoded the working-set columns into the
+strong-reference process-level `parsedIntrinsicCache`. The result was a redundant
+`GetMultiIntrinsic` round-trip AND a redundant `DecodeIntrinsicColumnBlob` on every warm
+query for columns that were already decoded process-wide. For high-cardinality group-by
+dicts (the dominant cost of `rate()`/`histogram_over_time` by a large attribute column —
+`DecodeIntrinsicColumnBlob` is ~27% of querier alloc_space) this re-decoded the single most
+expensive column on every request.
+
+The fix consults `parsedIntrinsicCache.Get` during `want` collection: a process-cache hit
+hydrates the per-Reader `intrinsicDecoded` map directly and drops the name from `want`, so
+the column is neither re-fetched nor re-decoded; the subsequent `GetIntrinsicColumn` returns
+the shared decoded value. The collection loop takes the write lock (not the read lock) since
+it now mutates `intrinsicDecoded`; this is safe because `PrefetchIntrinsicColumns` is invoked
+synchronously on the scanning goroutine and is documented as not concurrency-safe with
+`GetIntrinsicColumn` on the same Reader. The duplicate `useProcessCache` local further down
+the function is hoisted to the collection loop. Byte-identical results: process-cache values
+are immutable decoded columns; a miss falls through to the unchanged batch path.
+
+**Verification:** reader + tieredcache + executor suites green under `-race`; `go build ./...`.
+
+Back-ref: `internal/modules/blockio/reader/intrinsic_reader.go:PrefetchIntrinsicColumns`.

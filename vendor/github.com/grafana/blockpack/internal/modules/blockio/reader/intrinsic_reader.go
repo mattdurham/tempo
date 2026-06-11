@@ -201,8 +201,19 @@ func (r *Reader) PrefetchIntrinsicColumns(names []string) {
 	}
 
 	// Collect names that are present in this file and not already decoded.
+	//
+	// NOTE-199: also consult the process-level parsedIntrinsicCache here, not just the
+	// per-Reader intrinsicDecoded map. On a warm cluster a prior query's Reader on the
+	// same file has already decoded the working-set columns into the strong-reference
+	// process cache; without this check the prefetch re-requested them via GetMultiIntrinsic
+	// (a wasted memcache round-trip) AND re-ran DecodeIntrinsicColumnBlob — the single most
+	// expensive step for high-cardinality group-by dicts (e.g. the rate()-by-service-name
+	// path, ~27% of querier alloc_space). Hydrating the per-Reader map from the process
+	// cache hit skips both: the column drops out of `want` so it is neither fetched nor
+	// re-decoded, and the subsequent GetIntrinsicColumn returns the shared decoded value.
+	useProcessCache := r.fileID != ""
 	want := make([]string, 0, len(names))
-	r.intrinsicMu.RLock()
+	r.intrinsicMu.Lock()
 	for _, name := range names {
 		if _, present := r.intrinsicIndex[name]; !present {
 			continue
@@ -212,9 +223,18 @@ func (r *Reader) PrefetchIntrinsicColumns(names []string) {
 				continue
 			}
 		}
+		if useProcessCache {
+			if col := parsedIntrinsicCache.Get(r.fileID + "/intrinsic/" + name); col != nil {
+				if r.intrinsicDecoded == nil {
+					r.intrinsicDecoded = make(map[string]*shared.IntrinsicColumn)
+				}
+				r.intrinsicDecoded[name] = col
+				continue
+			}
+		}
 		want = append(want, name)
 	}
-	r.intrinsicMu.RUnlock()
+	r.intrinsicMu.Unlock()
 	if len(want) == 0 {
 		return
 	}
@@ -224,7 +244,6 @@ func (r *Reader) PrefetchIntrinsicColumns(names []string) {
 		return
 	}
 
-	useProcessCache := r.fileID != ""
 	for name, blob := range hits {
 		if blob == nil {
 			continue
