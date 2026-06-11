@@ -499,9 +499,10 @@ func traceHistogramBucket(fieldCol *modules_reader.Column, rowIdx int, fieldName
 		if vSec <= 0 {
 			return 0
 		}
-		return math.Pow(2, math.Floor(math.Log2(vSec)))
+		// NOTE-181: branch-free power-of-2 floor, see pow2Floor.
+		return pow2Floor(vSec)
 	}
-	return math.Pow(2, math.Floor(math.Log2(math.Abs(v))))
+	return pow2Floor(math.Abs(v))
 }
 
 // traceFieldFloat64Col reads a numeric field value from a pre-resolved span column.

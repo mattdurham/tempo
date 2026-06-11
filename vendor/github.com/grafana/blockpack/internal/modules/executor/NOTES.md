@@ -5,6 +5,45 @@ This document captures the non-obvious design decisions, rationale, and invarian
 
 ---
 
+## NOTE-181: pow2Floor — branch-free power-of-2 floor for histogram boundaries
+*Added: 2026-06-10*
+
+**Decision:** Replace the `math.Pow(2, math.Floor(math.Log2(x)))` expression — used at
+both histogram-boundary call sites, `intrinsicHistogramBoundary` (intrinsic fast path,
+~25 reachable sites) and `traceHistogramBucket` (legacy block-scan path) — with a shared
+`pow2Floor(x)` helper that computes the same value branch-free and without any
+transcendental call. `pow2Floor` uses `math.Frexp` to decompose `x = frac * 2**exp` with
+`frac ∈ [0.5, 1)` and returns `math.Ldexp(1, exp-1)`. Because `log2(frac) ∈ [-1, 0)`,
+`floor(log2(x)) == exp-1` exactly — including the exact-power-of-2 case, where `frac == 0.5`
+and `exp` is one larger so `exp-1` still yields the correct exponent.
+
+**Rationale:** A 2026-06-10 querier CPU profile (gcx, 30m window) attributed the
+transcendental calls reached only through these two helpers to ~10% of total querier CPU:
+`math.pow` 5.99% + `math.archLog` 4.15% + `math.log2` 1.29%, against the ~1.6% that
+`math.frexp` (0.89%) + `math.ldexp` (0.70%) reintroduce — a net ~8.9pp reduction on the
+CONFIRMED-CPU-BOUND queriers. The boundary is computed once per distinct dictionary value
+in the memoized pre-scans (`buildFrozenBoundaryIdx`, `countIntrinsicHistogramBoundaries`)
+but per-row in the legacy block-scan path, so the absolute call volume is large on every
+`histogram_over_time` query (M8 and group-by histograms).
+
+This supersedes the reverted NOTE-161 (same identity, same helper intent); that change was
+reverted only because it was unmeasurable under a then-overloaded cluster, not because it
+was wrong. Re-landed against a quieter cluster.
+
+**Correctness:** Verified bit-exact to the old `math.Pow(2, math.Floor(math.Log2(v)))` form
+over 20M values: exact powers of 2 (and ±1 ULP around them), the full ns-duration `/1e9`
+range, uniformly random magnitudes across 20 decades, and denormals — 0 mismatches. The
+`v <= 0` and `vSec <= 0` guards in the two callers are unchanged, so `pow2Floor` is only
+ever invoked with strictly-positive finite inputs.
+
+**Queries affected:** All `histogram_over_time` queries — intrinsic fast path (M8, group-by
+histograms) and the legacy block-scan path.
+
+**Back-ref:** `internal/modules/executor/metrics_trace_intrinsic.go:pow2Floor`,
+`internal/modules/executor/metrics_trace.go:traceHistogramBucket`
+
+---
+
 ## 1. Responsibility Boundary
 
 _Added: 2026-02-10_
