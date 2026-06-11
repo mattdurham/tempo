@@ -117,3 +117,31 @@ No behavior change for hits, misses, batch-unsupported (nil,false,nil), or error
 
 Back-ref: `internal/modules/tieredcache/typed.go:GetMultiV8Section`,
 `internal/modules/tieredcache/typed.go:GetMultiV8SectionMixed`
+
+## NOTE-189: Fast V8 Section Key Build — strconv Concatenation, No fmt.Sprintf
+*Added: 2026-06-11*
+
+**Problem:** the four V8-section cache key builds in `TypedTieredCache`
+(`GetOrFetchV8Section`, `GetMultiV8Section`, `GetMultiV8SectionMixed`, `PutV8Section`)
+all used `fmt.Sprintf("%s\x00v8\x00%d\x00%d\x00%s", fileID, tocType, subType, name)`.
+The two batch methods build one such key per wanted column, and the batch path itself
+runs once per block per query on the warm read path (NOTE-185/179: query-frontend shards
+one block per querier call, so a heavy metrics query over hundreds of blocks builds tens
+of thousands of these keys). `fmt.Sprintf` boxes the two `uint32` args into `interface{}`,
+runs the format-verb scanner via reflection, and copies its internal `[]byte` to a string —
+all avoidable for a fixed concatenation.
+
+**Fix:** route all four builds through `sectioncache.V8SectionKeyFast`, which uses
+`strconv.Itoa` + a pre-sized `strings.Builder` to produce a byte-identical key in one
+allocation with no reflection or interface boxing.
+
+**Correctness:** `strconv.Itoa(int(x))` for the two `uint32` values is identical to `%d`
+for all values in range (block sub-type / toc-type are small non-negative ints), and the
+literal separators are byte-for-byte the same. Output is byte-identical to the prior
+`fmt.Sprintf`, so cache keys are unchanged and warm hits are preserved.
+
+**Verification:** `go build ./...` clean; tieredcache + reader + sectioncache + executor
+suites green under `-race`.
+
+Back-ref: `internal/modules/sectioncache/keys.go:V8SectionKeyFast`,
+`internal/modules/tieredcache/typed.go` (4 key builds).

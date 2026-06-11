@@ -1072,3 +1072,29 @@ unchanged (still return nil,nil so the caller's two-phase path resolves them).
 (`TestReader_CombinedTocColumnFetch_WarmIdentical` exercises warm + cold paths).
 
 Back-ref: `internal/modules/blockio/reader/columnar_read.go:fetchTocAndColumnsCombined`
+
+## NOTE-189: Fast Per-Column Section Name Build — No Throwaway fmt.Sprintf
+*Added: 2026-06-11*
+
+**Problem:** the warm block read built each wanted column's section name with
+`fmt.Sprintf("%d/%s", blockIdx, name)` at three sites (`fetchTocAndColumnsCombined`,
+`fetchColumnsBatched`, `fetchColumnInto`) and the ToC key with `fmt.Sprintf("%d", blockIdx)`.
+This intermediate "blockIdx/name" string is only an input to the full V8 cache key built
+downstream (see NOTE-189 in tieredcache), so it is a pure throwaway allocation — and it is
+built once per wanted column per block per query on the universal warm path. `fmt.Sprintf`
+also boxes `blockIdx` into `interface{}` and runs the format scanner.
+
+**Fix:** `strconv.Itoa(blockIdx)` once per block (reused across the column loop), and a
+trivial `colSectionName(blockIdxStr, name) = blockIdxStr + "/" + name` concatenation per
+column. `fetchTocAndColumnsCombined` now takes the precomputed `blockIdxStr` directly.
+
+**Correctness:** `strconv.Itoa` matches `%d` for the non-negative `blockIdx`; the "/" and
+the resulting "blockIdx/name" string are byte-identical to the prior `fmt.Sprintf`, so the
+cache keys (and warm hits) are unchanged. fmt is still used for error wrapping elsewhere.
+
+**Verification:** `go build ./...` clean; reader + tieredcache + executor suites green
+under `-race`.
+
+Back-ref: `internal/modules/blockio/reader/columnar_read.go:colSectionName`,
+`readBlockColumnarWithCache`, `fetchTocAndColumnsCombined`, `fetchColumnsBatched`,
+`fetchColumnInto`.

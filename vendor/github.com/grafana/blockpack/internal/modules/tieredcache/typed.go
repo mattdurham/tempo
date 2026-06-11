@@ -369,7 +369,7 @@ func (t *TypedTieredCache) GetOrFetchV8Section(
 	if t.sectionRequests != nil {
 		start = time.Now()
 	}
-	key := fmt.Sprintf("%s\x00v8\x00%d\x00%d\x00%s", fileID, tocType, subType, name)
+	key := sectioncache.V8SectionKeyFast(fileID, tocType, subType, name)
 	fetchCalled := false
 	var val []byte
 	var err error
@@ -431,7 +431,7 @@ func (t *TypedTieredCache) GetMultiV8Section(
 	}
 	keys := make([]string, len(names))
 	for i, name := range names {
-		keys[i] = fmt.Sprintf("%s\x00v8\x00%d\x00%d\x00%s", fileID, tocType, subType, name)
+		keys[i] = sectioncache.V8SectionKeyFast(fileID, tocType, subType, name)
 	}
 	hits, err := bg.GetMulti(keys)
 	if err != nil {
@@ -501,7 +501,7 @@ func (t *TypedTieredCache) GetMultiV8SectionMixed(
 	}
 	keys := make([]string, len(reqs))
 	for i, rq := range reqs {
-		keys[i] = fmt.Sprintf("%s\x00v8\x00%d\x00%d\x00%s", fileID, rq.TocType, rq.SubType, rq.Name)
+		keys[i] = sectioncache.V8SectionKeyFast(fileID, rq.TocType, rq.SubType, rq.Name)
 	}
 	hits, err := bg.GetMulti(keys)
 	if err != nil {
@@ -540,7 +540,7 @@ func (t *TypedTieredCache) PutV8Section(
 	default:
 		sub = t.toc
 	}
-	key := fmt.Sprintf("%s\x00v8\x00%d\x00%d\x00%s", fileID, tocType, subType, name)
+	key := sectioncache.V8SectionKeyFast(fileID, tocType, subType, name)
 	return sub.Put(key, value)
 }
 

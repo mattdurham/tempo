@@ -18,6 +18,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"slices"
+	"strconv"
 	"sync"
 
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
@@ -218,7 +219,10 @@ func (r *Reader) readBlockColumnarWithCache(
 ) ([]byte, error) {
 	// Encode blockIdx in the name field so subType=0 always, avoiding accidental
 	// collision with ToCSubTypeBloom(3), ToCSubTypeIntrinsic(4), ToCSubTypeTrace(5).
-	tocKey := fmt.Sprintf("%d", blockIdx)
+	// NOTE-189: strconv.Itoa instead of fmt.Sprintf — this runs once per block per
+	// query on the warm read path.
+	blockIdxStr := strconv.Itoa(blockIdx)
+	tocKey := blockIdxStr
 
 	// NOTE-185: warm-path single round-trip. The ToC and every wanted column live in
 	// the same memcache sub-cache, and a wanted column's section key (blockIdx/name)
@@ -235,7 +239,7 @@ func (r *Reader) readBlockColumnarWithCache(
 		err     error
 	)
 	if mf, ok := r.cache.(sectionMixedFetcher); ok && len(wantColumns) > 0 {
-		toc, preHits = r.fetchTocAndColumnsCombined(mf, tocKey, blockIdx, wantColumns)
+		toc, preHits = r.fetchTocAndColumnsCombined(mf, tocKey, blockIdxStr, wantColumns)
 	}
 
 	// Phase 1: ToC — cached. NOTE-154: read a ToC large enough to hold the full
@@ -412,6 +416,17 @@ type sectionMixedFetcher interface {
 	GetMultiV8SectionMixed(fileID string, reqs []shared.V8SectionKey) (map[shared.V8SectionKey][]byte, bool, error)
 }
 
+// colSectionName builds the per-column section name "blockIdx/name" using string
+// concatenation instead of fmt.Sprintf. blockIdxStr is precomputed once per block
+// (strconv.Itoa) and reused across the column loop, so each column pays one
+// concatenation rather than a fmt.Sprintf with its reflection + interface boxing.
+// NOTE-189: this name is later embedded in the full V8 cache key; building it
+// cheaply here removes the throwaway-intermediate allocation on the warm read path
+// (once per wanted column per block per query).
+func colSectionName(blockIdxStr, name string) string {
+	return blockIdxStr + "/" + name
+}
+
 // fetchTocAndColumnsCombined issues ONE pipelined GetMulti for the block's ToC key
 // plus every wanted column's section key (NOTE-185). It returns the ToC blob (nil if
 // the ToC missed the batch — caller then falls back to the per-block GetOrFetch) and a
@@ -421,7 +436,7 @@ type sectionMixedFetcher interface {
 func (r *Reader) fetchTocAndColumnsCombined(
 	mf sectionMixedFetcher,
 	tocKey string,
-	blockIdx int,
+	blockIdxStr string,
 	wantColumns map[string]struct{},
 ) (toc []byte, colHits map[string][]byte) {
 	// NOTE-188: reqs[0] is the ToC; reqs[1:] are the wanted columns, index-aligned with
@@ -435,7 +450,7 @@ func (r *Reader) fetchTocAndColumnsCombined(
 		reqs = append(reqs, shared.V8SectionKey{
 			TocType: sectionTypeBlockCol,
 			SubType: 0,
-			Name:    fmt.Sprintf("%d/%s", blockIdx, name),
+			Name:    colSectionName(blockIdxStr, name),
 		})
 		colNames = append(colNames, name)
 	}
@@ -474,10 +489,11 @@ func (r *Reader) fetchColumnsBatched(
 	blockIdx int,
 	cols []colMetaEntry,
 ) error {
+	blockIdxStr := strconv.Itoa(blockIdx)
 	names := make([]string, len(cols))
 	colByName := make(map[string]colMetaEntry, len(cols))
 	for i, m := range cols {
-		name := fmt.Sprintf("%d/%s", blockIdx, m.name)
+		name := colSectionName(blockIdxStr, m.name)
 		names[i] = name
 		colByName[name] = m
 	}
@@ -544,7 +560,7 @@ func (r *Reader) fetchColumnInto(
 		r.fileID,
 		sectionTypeBlockCol,
 		0,
-		fmt.Sprintf("%d/%s", blockIdx, m.name),
+		colSectionName(strconv.Itoa(blockIdx), m.name),
 		func() ([]byte, error) {
 			if colStart+colLen <= int64(len(toc)) {
 				cp := make([]byte, colLen)
