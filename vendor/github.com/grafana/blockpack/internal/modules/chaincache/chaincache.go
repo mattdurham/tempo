@@ -53,6 +53,76 @@ func (c *ChainedCache) Get(key string) ([]byte, bool, error) {
 	return nil, false, nil
 }
 
+// batchGetter is an optional interface a tier may implement to fetch many keys
+// in one round-trip (NOTE-179). The memcache tier implements it via GetMulti,
+// which pipelines all keys over a single connection per server.
+type batchGetter interface {
+	GetMulti(keys []string) (map[string][]byte, error)
+}
+
+// GetMulti fetches many keys, returning a map of hit keys to values. It first
+// probes the faster tiers per key (cheap in-process / local lookups), then
+// batches every key still missing into ONE GetMulti against the first tier that
+// supports batch fetching (the memcache tier). Hits found in a slower tier are
+// written back to the faster tiers that missed. Keys absent from the result
+// missed every tier and must be fetched from the provider by the caller.
+//
+// NOTE-179: the per-column block read path previously issued one GetOrFetch —
+// and thus one memcache connection acquisition — per column, fanned out
+// concurrently, which exhausted the idle pool and forced a dial per column
+// (~28% of querier CPU in (*Client).dial). Batching the memcache misses into a
+// single pipelined request collapses that dial storm.
+func (c *ChainedCache) GetMulti(keys []string) (map[string][]byte, error) {
+	if len(keys) == 0 {
+		return nil, nil
+	}
+	out := make(map[string][]byte, len(keys))
+	// Copy so the in-place filtering below never mutates the caller's slice.
+	remaining := make([]string, len(keys))
+	copy(remaining, keys)
+
+	for i, tier := range c.tiers {
+		if len(remaining) == 0 {
+			break
+		}
+		if bg, ok := tier.(batchGetter); ok {
+			// Batch-capable tier: one round-trip for all remaining keys.
+			hits, err := bg.GetMulti(remaining)
+			if err != nil {
+				return nil, err
+			}
+			next := remaining[:0]
+			for _, k := range remaining {
+				if v, found := hits[k]; found {
+					out[k] = v
+					c.writeBack(k, v, i)
+				} else {
+					next = append(next, k)
+				}
+			}
+			remaining = next
+			continue
+		}
+		// Non-batch tier: probe each remaining key individually. These tiers are
+		// in-process or local-disk, so per-key lookups carry no connection cost.
+		next := remaining[:0]
+		for _, k := range remaining {
+			v, found, err := tier.Get(k)
+			if err != nil {
+				return nil, err
+			}
+			if found {
+				out[k] = v
+				c.writeBack(k, v, i)
+			} else {
+				next = append(next, k)
+			}
+		}
+		remaining = next
+	}
+	return out, nil
+}
+
 // Put stores key→value in every tier.
 func (c *ChainedCache) Put(key string, value []byte) error {
 	var errs []error

@@ -398,6 +398,92 @@ func (t *TypedTieredCache) GetOrFetchV8Section(
 	return val, err
 }
 
+// sectionBatchGetter is the optional interface a sub-cache tier may implement to
+// fetch many keys in one round-trip (NOTE-179). chaincache.ChainedCache provides
+// it; nil/non-batch tiers fall back to per-key GetOrFetchV8Section.
+type sectionBatchGetter interface {
+	GetMulti(keys []string) (map[string][]byte, error)
+}
+
+// GetMultiV8Section batch-fetches V8 per-column/per-index blobs that all share the
+// same (tocType, subType) routing, returning a map keyed by the input names. Names
+// absent from the result missed the cache and must be fetched + Put by the caller.
+// Returns (nil, false, nil) when the routed sub-cache does not support batch fetch,
+// signaling the caller to fall back to per-name GetOrFetchV8Section.
+//
+// NOTE-179: collapses the per-column section-cache fan-out (one GetOrFetch, and
+// thus one memcache connection acquisition, per column) into a single pipelined
+// GetMulti — the dominant ~28%-of-CPU (*Client).dial cost on the warm read path.
+func (t *TypedTieredCache) GetMultiV8Section(
+	fileID string,
+	tocType, subType uint32,
+	names []string,
+) (map[string][]byte, bool, error) {
+	var sub filecache.Cache
+	var sectionIdx int
+	switch subType {
+	case shared.ToCSubTypeBloom, shared.ToCSubTypeTrace:
+		sub, sectionIdx = t.bloom, idxBloom
+	case shared.ToCSubTypeIntrinsic:
+		sub, sectionIdx = t.intrinsic, idxIntrinsic
+	default:
+		sub, sectionIdx = t.toc, idxTOC
+	}
+	bg, ok := sub.(sectionBatchGetter)
+	if !ok {
+		return nil, false, nil
+	}
+
+	var start time.Time
+	if t.sectionRequests != nil {
+		start = time.Now()
+	}
+	keys := make([]string, len(names))
+	keyToName := make(map[string]string, len(names))
+	for i, name := range names {
+		key := fmt.Sprintf("%s\x00v8\x00%d\x00%d\x00%s", fileID, tocType, subType, name)
+		keys[i] = key
+		keyToName[key] = name
+	}
+	hits, err := bg.GetMulti(keys)
+	if err != nil {
+		t.observeSection(sectionIdx, start, false, err)
+		return nil, true, err
+	}
+	out := make(map[string][]byte, len(hits))
+	for key, val := range hits {
+		if name, found := keyToName[key]; found {
+			out[name] = val
+		}
+	}
+	// Record one batched-fetch observation; per-name hit/miss accounting is
+	// approximate at the batch level (the section metrics are coarse counters).
+	t.observeSection(sectionIdx, start, false, nil)
+	return out, true, nil
+}
+
+// PutV8Section stores a single V8 per-column/per-index blob under the same key
+// scheme used by GetOrFetchV8Section / GetMultiV8Section, so a batch caller can
+// write back the names that missed the batch fetch (NOTE-179).
+func (t *TypedTieredCache) PutV8Section(
+	fileID string,
+	tocType, subType uint32,
+	name string,
+	value []byte,
+) error {
+	var sub filecache.Cache
+	switch subType {
+	case shared.ToCSubTypeBloom, shared.ToCSubTypeTrace:
+		sub = t.bloom
+	case shared.ToCSubTypeIntrinsic:
+		sub = t.intrinsic
+	default:
+		sub = t.toc
+	}
+	key := fmt.Sprintf("%s\x00v8\x00%d\x00%d\x00%s", fileID, tocType, subType, name)
+	return sub.Put(key, value)
+}
+
 // GetOrFetchV14Section fetches or caches a V14 decompressed generic section blob.
 func (t *TypedTieredCache) GetOrFetchV14Section(
 	fileID string,

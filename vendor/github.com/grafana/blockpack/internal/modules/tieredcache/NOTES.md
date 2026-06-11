@@ -79,3 +79,14 @@ Operators with large bloom filters should provide a dedicated, larger `MemoryCac
 via `TypedConfig{Bloom: bigMemCache, ...}` rather than relying on `DefaultTypedConfig`.
 
 Back-ref: `internal/modules/tieredcache/typed.go:DefaultTypedConfig`
+
+## NOTE-179: GetMultiV8Section / PutV8Section batched per-column fetch
+
+`GetMultiV8Section` batch-fetches V8 per-column blobs that share one (tocType, subType) routing,
+returning a map keyed by the input names and reporting `false` when the routed sub-cache does not
+support batch fetch (so the caller falls back to per-name `GetOrFetchV8Section`). `PutV8Section`
+writes back the names that missed the batch under the same key scheme. Together they let the
+block-read path issue one pipelined memcache request per block instead of one connection-dialing
+Get per column (~28% of querier CPU in `gomemcache.(*Client).dial`).
+
+Back-ref: `internal/modules/tieredcache/typed.go:GetMultiV8Section`

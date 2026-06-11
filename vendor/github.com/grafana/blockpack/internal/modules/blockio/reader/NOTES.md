@@ -922,3 +922,41 @@ buffer is byte-for-byte identical to the serial version (each column lands at it
 **Verification:** reader + executor suites pass under `-race` (including `TestReadGroupColumnar`,
 `TestReadGroup_IOFailure`, `TestNOTE154_AdaptiveToCReadsAllColumns`). The disjoint-region writes
 and per-column `cp` allocations give the race detector nothing to flag.
+
+## NOTE-179: batched per-column section fetch (GetMultiV8Section) — 2026-06-10
+
+**Problem:** Phase 2 of `readBlockColumnarWithCache` resolved each wanted column through its
+own `GetOrFetchV8Section(blockIdx/colName)`. NOTE-177 fanned those out concurrently to collapse
+their stacked round-trip latency, but a fresh querier CPU profile (gcx, 30m, quiet cluster)
+showed the dominant cost was NOT per-row compute (all blockpack scan/decode frames < 0.65%
+self-CPU) — it was `gomemcache.(*Client).dial` at **28.5% cumulative** (`getConn` 28.8%, with
+`getFreeConn` only 0.08%). The concurrent per-column fan-out issued N simultaneous memcache Gets;
+each needs its own connection, and the burst exhausted the idle pool so almost every Get *dialed*
+a fresh connection (plus the kernel `__inet_check_established` / `__inet_hash_connect` / TCP
+TIME-WAIT-reuse churn that dominated the rest of the profile). The fan-out optimised latency but
+multiplied the connection-establishment CPU that is the real warm-path bottleneck.
+
+**Mechanism:** when the section cache implements `sectionBatchFetcher`, all wanted columns for a
+block are fetched in ONE `GetMultiV8Section` call. `gomemcache.GetMulti` groups the (hashed) keys
+per server and pipelines them over a SINGLE connection per server, collapsing N connection
+acquisitions into one while keeping the single-RTT latency the fan-out provided.
+`tieredcache.TypedTieredCache.GetMultiV8Section` routes the batch to the sub-cache for the
+section type; `chaincache.ChainedCache.GetMulti` probes the fast in-process / local-disk tiers
+per key (no connection cost) and batches the remaining misses into the memcache tier's
+`MemCache.GetMulti`. Columns that miss the batch are read from the cached ToC or a coalesced
+cold run (NOTE-173), written back via `PutV8Section`, and copied into `assembled` — rare on the
+warm steady-state path. The assembled buffer is byte-for-byte identical to the fan-out version
+(each column lands at its absolute offset). When the cache lacks batch support the code falls
+back to the NOTE-177 concurrent fan-out unchanged.
+
+**Safety:** `fetchColumnsBatched` runs on a single goroutine, so the cold path (`coldRuns.ensure`,
+which mutates shared run buffers) needs no lock. All returned blobs are independent copies
+(MemCache copies on the way out; the cold/ToC fallback copies into a fresh `cp`), so no buffer
+aliases the cache. Per-key hit/miss accounting at the batch tier is approximate (the section
+metrics are coarse counters); correctness is unaffected.
+
+**Verification:** reader + executor suites pass under `-race`. New unit tests cover
+`MemCache.GetMulti` (hits/misses/copy-safety/transient-error-as-miss/nil-receiver),
+`ChainedCache.GetMulti` (single batched round-trip to the batch tier + per-key fallback +
+writeback + no input mutation), and `TypedTieredCache.GetMultiV8Section` (batch hit + PutV8Section
+writeback + no-batch-support fallback).

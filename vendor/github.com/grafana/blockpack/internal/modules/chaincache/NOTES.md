@@ -34,3 +34,15 @@ traverse all tier misses before one wins and fetches.
 not redundant even if the fetch function is slow.
 
 Back-ref: `internal/modules/chaincache/chaincache.go:GetOrFetch`
+
+## NOTE-179: GetMulti tier-aware batched fetch
+
+`ChainedCache.GetMulti(keys)` probes the fast in-process / local-disk tiers per key (no
+connection cost) and batches every key still missing into ONE `GetMulti` against the first tier
+implementing `batchGetter` (the memcache tier). Slower-tier hits are written back to the faster
+tiers that missed; total misses are returned absent so the caller fetches them from the provider.
+This collapses the per-column memcache connection storm (~28% querier CPU in `(*Client).dial`)
+into a single pipelined round-trip. The input slice is copied before in-place filtering, so the
+caller's slice is never mutated.
+
+Back-ref: `internal/modules/chaincache/chaincache.go:GetMulti`

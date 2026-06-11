@@ -285,16 +285,9 @@ func (r *Reader) readBlockColumnarWithCache(
 	// planColdRuns groups the cold columns into a few coalesced runs read once each.
 	runs := r.planColdRuns(metas, wantColumns, blockLen, int64(len(toc)))
 
-	// NOTE-177: Phase-2 column fetches issued concurrently. Each wanted column resolves
-	// through an independent GetOrFetchV8Section keyed by blockIdx/colName, and writes its
-	// compressed blob into a DISJOINT region of `assembled` (column extents never overlap),
-	// so the per-column work is embarrassingly parallel and data-race-free. On the warm
-	// steady-state path every column is a cache hit, and the dominant cost is the per-column
-	// cache round-trip (the querier CPU profile attributes ~21% to MemCache.Get; FileCache
-	// disk reads + copies are similarly per-call). Serially these N round-trips stack their
-	// latency; fanning them out collapses N RTTs into ~1 RTT of wall-clock per block. The
-	// cold path (coldRuns.ensure) mutates shared run state and is therefore serialized under
-	// runMu; warm queries never reach it, so the mutex is never contended in steady state.
+	// Phase-2 column fetches. Each wanted column's compressed blob is cached as an
+	// independent section keyed by blockIdx/colName and written into a DISJOINT region
+	// of `assembled` (column extents never overlap).
 	cols := make([]colMetaEntry, 0, len(metas))
 	for _, m := range metas {
 		if _, ok := wantColumns[m.name]; !ok || m.compressedLen == 0 {
@@ -315,6 +308,25 @@ func (r *Reader) readBlockColumnarWithCache(
 			if err := r.fetchColumnInto(assembled, toc, runs, nil, blockOff, blockIdx, m); err != nil {
 				return nil, err
 			}
+		}
+		return assembled, nil
+	}
+
+	// NOTE-179: batch the multi-column section-cache fetch into ONE pipelined request.
+	// Previously (NOTE-177) every wanted column resolved through its own GetOrFetchV8Section,
+	// fanned out concurrently — but each Get is an independent memcache round-trip, and a
+	// querier CPU profile attributed ~28% of CPU to memcache (*Client).dial because the
+	// concurrent per-column fan-out exhausted the idle pool and forced a fresh dial (plus
+	// TLS/TCP setup) per column. gomemcache.GetMulti groups all keys per server and pipelines
+	// them over a SINGLE connection, collapsing N dials into ~1 while keeping the single-RTT
+	// latency the fan-out provided. When the section cache supports batch fetch we issue one
+	// GetMulti for all wanted columns; any columns that miss are resolved (and written back)
+	// individually below — rare on the warm steady-state path. The assembled buffer is
+	// byte-for-byte identical to the serial/fan-out version (each column lands at its absolute
+	// offset). When the cache lacks batch support we fall back to the concurrent fan-out.
+	if bg, ok := r.cache.(sectionBatchFetcher); ok {
+		if err := r.fetchColumnsBatched(bg, assembled, toc, runs, blockOff, blockIdx, cols); err != nil {
+			return nil, err
 		}
 		return assembled, nil
 	}
@@ -348,6 +360,79 @@ func (r *Reader) readBlockColumnarWithCache(
 	}
 
 	return assembled, nil
+}
+
+// sectionBatchFetcher is the optional interface a section cache may implement to
+// fetch many V8 per-column blobs in one batched (pipelined) request and to write
+// back individual blobs that missed the batch (NOTE-179). tieredcache.TypedTieredCache
+// implements it; nil/non-batch caches make readBlockColumnarWithCache fall back to the
+// concurrent per-column fan-out.
+type sectionBatchFetcher interface {
+	GetMultiV8Section(fileID string, tocType, subType uint32, names []string) (map[string][]byte, bool, error)
+	PutV8Section(fileID string, tocType, subType uint32, name string, value []byte) error
+}
+
+// fetchColumnsBatched resolves all wanted columns for one block with a single batched
+// section-cache fetch, copying each hit into its disjoint region of assembled. Columns
+// that miss the batch are read from the (cached ToC or coalesced cold) source and written
+// back to the cache individually, then copied in. NOTE-179.
+func (r *Reader) fetchColumnsBatched(
+	bg sectionBatchFetcher,
+	assembled, toc []byte,
+	runs coldRuns,
+	blockOff int64,
+	blockIdx int,
+	cols []colMetaEntry,
+) error {
+	names := make([]string, len(cols))
+	colByName := make(map[string]colMetaEntry, len(cols))
+	for i, m := range cols {
+		name := fmt.Sprintf("%d/%s", blockIdx, m.name)
+		names[i] = name
+		colByName[name] = m
+	}
+
+	hits, ok, err := bg.GetMultiV8Section(r.fileID, sectionTypeBlockCol, 0, names)
+	if err != nil {
+		return fmt.Errorf("block %d batch cols: %w", blockIdx, err)
+	}
+	if !ok {
+		// Cache reported no batch support after the type assertion (shouldn't happen);
+		// resolve every column individually as a safe fallback.
+		for _, m := range cols {
+			if ferr := r.fetchColumnInto(assembled, toc, runs, nil, blockOff, blockIdx, m); ferr != nil {
+				return ferr
+			}
+		}
+		return nil
+	}
+
+	for name, m := range colByName {
+		colStart := int64(m.dataOffset)  //nolint:gosec
+		colLen := int64(m.compressedLen) //nolint:gosec
+		if blob, found := hits[name]; found {
+			copy(assembled[colStart:colStart+colLen], blob)
+			continue
+		}
+		// Miss: read the compressed blob from the cached ToC or a coalesced cold run,
+		// write it back to the cache, then copy into assembled. The cold path mutates
+		// shared run state but is single-goroutine here (no fan-out), so no lock needed.
+		var blob []byte
+		if colStart+colLen <= int64(len(toc)) {
+			blob = toc[colStart : colStart+colLen]
+		} else {
+			rn, rerr := runs.ensure(r, blockOff, colStart)
+			if rerr != nil {
+				return fmt.Errorf("block %d col %q: %w", blockIdx, m.name, rerr)
+			}
+			blob = rn.buf[colStart-rn.start : colStart-rn.start+colLen]
+		}
+		cp := make([]byte, colLen)
+		copy(cp, blob)
+		_ = bg.PutV8Section(r.fileID, sectionTypeBlockCol, 0, name, cp)
+		copy(assembled[colStart:colStart+colLen], cp)
+	}
+	return nil
 }
 
 // fetchColumnInto resolves one wanted column through the section cache and copies its

@@ -8,6 +8,7 @@
 package memcache
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -253,6 +254,74 @@ func (m *MemCache) Get(key string) ([]byte, bool, error) {
 		m.durGetHit.Observe(time.Since(start).Seconds())
 	}
 	return out, true, nil
+}
+
+// GetMulti fetches many keys in a single batched request and returns a map of
+// the original (unhashed) keys that hit to their independently-copied values.
+// Missing keys are simply absent from the result. Transient errors are treated
+// as a total miss (empty map, nil error) so an unavailable memcache server never
+// breaks the read path, exactly like Get.
+//
+// NOTE-179: gomemcache.GetMulti groups the (hashed) keys per server and
+// pipelines them over a SINGLE connection per server. A heavy query that touches
+// many small block columns previously issued one Get — and thus one connection
+// acquisition — per column; a querier CPU profile attributed ~28% of CPU to
+// memcache (*Client).dial because the concurrent per-column fan-out exhausted the
+// idle pool and forced fresh dials. Collapsing those N round-trips into one
+// batched request removes the dial storm and keeps the single-RTT latency.
+func (m *MemCache) GetMulti(keys []string) (map[string][]byte, error) {
+	if m == nil || len(keys) == 0 {
+		return nil, nil
+	}
+	var start time.Time
+	if m.durGetHit != nil {
+		start = time.Now()
+	}
+	// Map hashed memcache keys back to their original keys for the result.
+	hashed := make([]string, len(keys))
+	origByHashed := make(map[string]string, len(keys))
+	for i, k := range keys {
+		h := memcacheKey(k)
+		hashed[i] = h
+		origByHashed[h] = k
+	}
+	items, err := m.c.GetMulti(context.Background(), hashed)
+	if err != nil {
+		// Treat transient errors as a total miss; the caller re-fetches the
+		// missing keys from the underlying provider, exactly like Get.
+		if m.errs != nil {
+			m.errs.WithLabelValues(m.tierLabel).Inc()
+		}
+		return nil, nil //nolint:nilerr
+	}
+	out := make(map[string][]byte, len(items))
+	var hitBytes int
+	for h, item := range items {
+		orig, ok := origByHashed[h]
+		if !ok {
+			continue
+		}
+		cp := make([]byte, len(item.Value))
+		copy(cp, item.Value)
+		out[orig] = cp
+		hitBytes += len(cp)
+	}
+	if m.requests != nil {
+		hits := len(out)
+		if hits > 0 {
+			m.requests.WithLabelValues(m.tierLabel, "hit").Add(float64(hits))
+		}
+		if misses := len(keys) - hits; misses > 0 {
+			m.requests.WithLabelValues(m.tierLabel, "miss").Add(float64(misses))
+		}
+	}
+	if m.bytes != nil && hitBytes > 0 {
+		m.bytes.WithLabelValues(m.tierLabel).Add(float64(hitBytes))
+	}
+	if m.durGetHit != nil {
+		m.durGetHit.Observe(time.Since(start).Seconds())
+	}
+	return out, nil
 }
 
 // Put stores key→value in memcache. Non-fatal errors (e.g. connection loss)

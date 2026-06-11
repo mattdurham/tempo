@@ -67,3 +67,13 @@ metric on `AlreadyRegisteredError` so that instantiating multiple caches does no
 the same `registerOrReuse` pattern.
 
 Back-ref: `internal/modules/memcache/memcache.go:memcacheRegisterOrReuse`
+
+## NOTE-179: GetMulti batched fetch
+
+`MemCache.GetMulti(keys)` wraps `gomemcache.GetMulti`, which groups the hashed keys per server
+and pipelines them over a SINGLE connection per server. The per-column block-read path (NOTE-179
+in blockio/reader) uses it to collapse the N-per-block per-column Gets — each of which forced a
+fresh `(*Client).dial` (~28% of querier CPU) under the concurrent fan-out — into one request.
+Transient errors and the nil receiver are treated as a total miss, identical to `Get`.
+
+Back-ref: `internal/modules/memcache/memcache.go:GetMulti`
