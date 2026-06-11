@@ -220,17 +220,37 @@ func (r *Reader) readBlockColumnarWithCache(
 	// collision with ToCSubTypeBloom(3), ToCSubTypeIntrinsic(4), ToCSubTypeTrace(5).
 	tocKey := fmt.Sprintf("%d", blockIdx)
 
+	// NOTE-185: warm-path single round-trip. The ToC and every wanted column live in
+	// the same memcache sub-cache, and a wanted column's section key (blockIdx/name)
+	// is derivable from the column NAME alone — no ToC decode needed first. So instead
+	// of Phase-1 ToC GetOrFetch (round-trip #1) followed by Phase-2 column GetMulti
+	// (round-trip #2) we request the ToC key AND all wanted column keys in ONE
+	// pipelined GetMulti. The ToC blob from the result supplies the offsets that place
+	// each column blob in the assembled buffer; column hits skip Phase-2 entirely.
+	// Misses (cold blocks, evicted entries) fall through to the existing fetch paths,
+	// so the result is byte-for-byte identical to the two-phase version.
+	var (
+		toc     []byte
+		preHits map[string][]byte // column name -> compressed blob, from the combined batch
+		err     error
+	)
+	if mf, ok := r.cache.(sectionMixedFetcher); ok && len(wantColumns) > 0 {
+		toc, preHits = r.fetchTocAndColumnsCombined(mf, tocKey, blockIdx, wantColumns)
+	}
+
 	// Phase 1: ToC — cached. NOTE-154: read a ToC large enough to hold the full
 	// column-metadata array. Trace blocks routinely have hundreds of columns whose
 	// metadata overflows a fixed 4 KiB hint; the previous code then fell back to a
 	// full block read (the #1 querier allocator, ~18% of alloc_space), defeating the
 	// columnar cache. The correctly-sized ToC is what gets cached, so warm queries
 	// pay one cache hit and one successful parse — no growth, no full-block read.
-	toc, err := r.cache.GetOrFetchV8Section(r.fileID, sectionTypeBlockToc, 0, tocKey, func() ([]byte, error) {
-		return r.readSufficientToC(blockOff, blockLen)
-	})
-	if err != nil {
-		return nil, fmt.Errorf("block %d toc: %w", blockIdx, err)
+	if toc == nil {
+		toc, err = r.cache.GetOrFetchV8Section(r.fileID, sectionTypeBlockToc, 0, tocKey, func() ([]byte, error) {
+			return r.readSufficientToC(blockOff, blockLen)
+		})
+		if err != nil {
+			return nil, fmt.Errorf("block %d toc: %w", blockIdx, err)
+		}
 	}
 
 	hdr, err := parseBlockHeader(toc)
@@ -288,6 +308,11 @@ func (r *Reader) readBlockColumnarWithCache(
 	// Phase-2 column fetches. Each wanted column's compressed blob is cached as an
 	// independent section keyed by blockIdx/colName and written into a DISJOINT region
 	// of `assembled` (column extents never overlap).
+	//
+	// NOTE-185: columns already returned by the combined ToC+columns batch above are
+	// copied straight into their disjoint region here and excluded from `cols`, so the
+	// warm path issues NO further memcache round-trip — Phase-2 is fully satisfied by
+	// the single combined GetMulti. Only true misses fall into `cols` for resolution.
 	cols := make([]colMetaEntry, 0, len(metas))
 	for _, m := range metas {
 		if _, ok := wantColumns[m.name]; !ok || m.compressedLen == 0 {
@@ -297,6 +322,10 @@ func (r *Reader) readBlockColumnarWithCache(
 		colLen := int64(m.compressedLen) //nolint:gosec
 		if colStart+colLen > blockLen {
 			// Should not reach here (handled above), but guard defensively.
+			continue
+		}
+		if blob, hit := preHits[m.name]; hit && int64(len(blob)) == colLen {
+			copy(assembled[colStart:colStart+colLen], blob)
 			continue
 		}
 		cols = append(cols, m)
@@ -370,6 +399,61 @@ func (r *Reader) readBlockColumnarWithCache(
 type sectionBatchFetcher interface {
 	GetMultiV8Section(fileID string, tocType, subType uint32, names []string) (map[string][]byte, bool, error)
 	PutV8Section(fileID string, tocType, subType uint32, name string, value []byte) error
+}
+
+// sectionMixedFetcher is the optional interface a section cache may implement to
+// batch-fetch keys spanning more than one tocType in a single round-trip — used by
+// readBlockColumnarWithCache to request a block's ToC and all its wanted columns
+// together (NOTE-185). tieredcache.TypedTieredCache implements it.
+type sectionMixedFetcher interface {
+	GetMultiV8SectionMixed(fileID string, reqs []shared.V8SectionKey) (map[shared.V8SectionKey][]byte, bool, error)
+}
+
+// fetchTocAndColumnsCombined issues ONE pipelined GetMulti for the block's ToC key
+// plus every wanted column's section key (NOTE-185). It returns the ToC blob (nil if
+// the ToC missed the batch — caller then falls back to the per-block GetOrFetch) and a
+// map of column name -> compressed blob for the columns that hit. Column keys are built
+// from blockIdx + name, which is known before the ToC is decoded, so the whole warm
+// read collapses to a single memcache round-trip.
+func (r *Reader) fetchTocAndColumnsCombined(
+	mf sectionMixedFetcher,
+	tocKey string,
+	blockIdx int,
+	wantColumns map[string]struct{},
+) (toc []byte, colHits map[string][]byte) {
+	reqs := make([]shared.V8SectionKey, 0, len(wantColumns)+1)
+	reqs = append(reqs, shared.V8SectionKey{TocType: sectionTypeBlockToc, SubType: 0, Name: tocKey})
+	colName := make(map[shared.V8SectionKey]string, len(wantColumns))
+	for name := range wantColumns {
+		k := shared.V8SectionKey{
+			TocType: sectionTypeBlockCol,
+			SubType: 0,
+			Name:    fmt.Sprintf("%d/%s", blockIdx, name),
+		}
+		reqs = append(reqs, k)
+		colName[k] = name
+	}
+
+	hits, ok, err := mf.GetMultiV8SectionMixed(r.fileID, reqs)
+	if err != nil || !ok {
+		// Batch unsupported or errored: caller falls back to the two-phase path.
+		return nil, nil
+	}
+
+	tocReq := shared.V8SectionKey{TocType: sectionTypeBlockToc, SubType: 0, Name: tocKey}
+	toc = hits[tocReq]
+	if toc == nil {
+		// ToC missed — without it we cannot place columns; let the caller's
+		// GetOrFetch resolve the ToC (and Phase-2 resolves columns the usual way).
+		return nil, nil
+	}
+	colHits = make(map[string][]byte, len(hits))
+	for k, blob := range hits {
+		if name, isCol := colName[k]; isCol {
+			colHits[name] = blob
+		}
+	}
+	return toc, colHits
 }
 
 // fetchColumnsBatched resolves all wanted columns for one block with a single batched

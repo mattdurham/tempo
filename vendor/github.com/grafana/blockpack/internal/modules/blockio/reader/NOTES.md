@@ -960,3 +960,54 @@ metrics are coarse counters); correctness is unaffected.
 `ChainedCache.GetMulti` (single batched round-trip to the batch tier + per-key fallback +
 writeback + no input mutation), and `TypedTieredCache.GetMultiV8Section` (batch hit + PutV8Section
 writeback + no-batch-support fallback).
+
+---
+
+## NOTE-185: Combined ToC + Columns Single Round-Trip on the Warm Block Read
+*Added: 2026-06-11*
+
+**Problem:** Even after NOTE-179 collapsed the per-column fan-out into one `GetMultiV8Section`,
+each warm block read still paid TWO sequential memcache round-trips: Phase-1 fetched the block's
+ToC via `GetOrFetchV8Section` (round-trip #1), and only *then* — once the column offsets were
+known — Phase-2 batched the columns via `GetMultiV8Section` (round-trip #2). query-frontend shards
+ONE block per querier call (NOTE-170), so a heavy metrics query over hundreds of blocks pays
+hundreds of *extra* sequential round-trips that exist purely because the column fetch was thought
+to depend on the ToC. The dominant querier cost on the warm path is round-trip count, not bytes
+or compute (NOTE-173/179 profiling: `(*Client).dial`, TLS/TCP setup, `Syscall6`).
+
+**Key insight:** a wanted column's section key is `blockIdx/<column-name>`, and the caller already
+holds every wanted column NAME (the `wantColumns` set) *before* the ToC is decoded. The ToC is only
+needed to learn each column's byte OFFSET — i.e. *where* to place an already-fetched blob in the
+assembled buffer, not *which* keys to request. So the ToC key and all wanted column keys can be
+requested together in ONE pipelined `GetMulti`.
+
+**Mechanism:** `readBlockColumnarWithCache` first calls `fetchTocAndColumnsCombined`, which issues a
+single `GetMultiV8SectionMixed` for the ToC key (tocType `sectionTypeBlockToc`) plus one key per
+wanted column (tocType `sectionTypeBlockCol`). All these keys route to the same `toc` sub-cache, so
+one `MemCache.GetMulti` over a single pipelined connection serves them. The ToC blob from the result
+drives header/metadata parsing exactly as before; column blobs that hit are copied straight into
+their disjoint region of `assembled` and excluded from Phase-2's `cols` list, so the warm path issues
+NO second memcache round-trip. `shared.V8SectionKey` (in the shared package, to avoid a
+reader→tieredcache import cycle) carries the per-key `(TocType, SubType, Name)` routing;
+`TypedTieredCache.GetMultiV8SectionMixed` batches keys spanning multiple tocTypes that all route to
+one tier.
+
+**Fallbacks (byte-identical):** if the ToC misses the combined batch we cannot place columns, so we
+fall back to the existing Phase-1 `GetOrFetchV8Section` (which also resolves a cold ToC) and Phase-2
+column resolution unchanged. Individual column misses simply remain in `cols` and are resolved by the
+existing batched / inline / fan-out paths (cold runs + writeback). A blob whose length does not match
+the ToC-reported `compressedLen` is treated as a miss (defensive). When the cache implements neither
+`sectionMixedFetcher` nor `sectionBatchFetcher` the original two-phase code runs verbatim. Every blob
+copied from the combined batch is the cache's own copy (`MemCache` copies on the way out), so no buffer
+aliases the cache, and the assembled bytes are byte-for-byte identical to the two-phase output.
+
+**Verification:** reader + tieredcache + executor suites pass under `-race`. New
+`TestReader_CombinedTocColumnFetch_WarmIdentical` builds a multi-column block, reads it cold (populating
+the cache), then reads it warm and asserts (a) ZERO provider I/O on the warm read — proving the combined
+batch fully satisfied both phases — and (b) the warm assembled bytes are byte-identical to the cold
+two-phase bytes and decode each wanted column correctly.
+
+Back-ref: `internal/modules/blockio/reader/columnar_read.go:readBlockColumnarWithCache`,
+`internal/modules/blockio/reader/columnar_read.go:fetchTocAndColumnsCombined`,
+`internal/modules/tieredcache/typed.go:GetMultiV8SectionMixed`,
+`internal/modules/blockio/shared/v8sectionkey.go:V8SectionKey`

@@ -419,16 +419,7 @@ func (t *TypedTieredCache) GetMultiV8Section(
 	tocType, subType uint32,
 	names []string,
 ) (map[string][]byte, bool, error) {
-	var sub filecache.Cache
-	var sectionIdx int
-	switch subType {
-	case shared.ToCSubTypeBloom, shared.ToCSubTypeTrace:
-		sub, sectionIdx = t.bloom, idxBloom
-	case shared.ToCSubTypeIntrinsic:
-		sub, sectionIdx = t.intrinsic, idxIntrinsic
-	default:
-		sub, sectionIdx = t.toc, idxTOC
-	}
+	sub, sectionIdx := t.routeV8(subType)
 	bg, ok := sub.(sectionBatchGetter)
 	if !ok {
 		return nil, false, nil
@@ -458,6 +449,73 @@ func (t *TypedTieredCache) GetMultiV8Section(
 	}
 	// Record one batched-fetch observation; per-name hit/miss accounting is
 	// approximate at the batch level (the section metrics are coarse counters).
+	t.observeSection(sectionIdx, start, false, nil)
+	return out, true, nil
+}
+
+// routeV8 maps a (tocType, subType) to the sub-cache tier and metric index used
+// by every V8-section method. Routing depends only on subType today; tocType is
+// part of the cache key, not the routing decision.
+func (t *TypedTieredCache) routeV8(subType uint32) (filecache.Cache, int) {
+	switch subType {
+	case shared.ToCSubTypeBloom, shared.ToCSubTypeTrace:
+		return t.bloom, idxBloom
+	case shared.ToCSubTypeIntrinsic:
+		return t.intrinsic, idxIntrinsic
+	default:
+		return t.toc, idxTOC
+	}
+}
+
+// GetMultiV8SectionMixed batch-fetches V8 section blobs whose keys may span
+// different tocTypes, returning a map keyed by each requested V8SectionKey.
+// Keys absent from the result missed the cache. Returns (nil, false, nil) when
+// the sub-cache does not support batch fetch, signaling the caller to fall back
+// to per-key GetOrFetchV8Section.
+//
+// All requested keys MUST route to the same sub-cache (same subType class); the
+// caller groups them. NOTE-185: collapses the warm block-read path's two
+// sequential memcache round-trips — Phase-1 ToC GetOrFetch followed by Phase-2
+// column GetMulti — into ONE pipelined request. The column section keys are
+// derivable from blockIdx + wanted column NAMES without first decoding the ToC,
+// so the ToC key and every wanted column key can be requested together; the ToC
+// blob in the result still supplies the offsets that place each column blob in
+// the assembled buffer.
+func (t *TypedTieredCache) GetMultiV8SectionMixed(
+	fileID string,
+	reqs []shared.V8SectionKey,
+) (map[shared.V8SectionKey][]byte, bool, error) {
+	if len(reqs) == 0 {
+		return nil, true, nil
+	}
+	sub, sectionIdx := t.routeV8(reqs[0].SubType)
+	bg, ok := sub.(sectionBatchGetter)
+	if !ok {
+		return nil, false, nil
+	}
+
+	var start time.Time
+	if t.sectionRequests != nil {
+		start = time.Now()
+	}
+	keys := make([]string, len(reqs))
+	keyToReq := make(map[string]shared.V8SectionKey, len(reqs))
+	for i, rq := range reqs {
+		key := fmt.Sprintf("%s\x00v8\x00%d\x00%d\x00%s", fileID, rq.TocType, rq.SubType, rq.Name)
+		keys[i] = key
+		keyToReq[key] = rq
+	}
+	hits, err := bg.GetMulti(keys)
+	if err != nil {
+		t.observeSection(sectionIdx, start, false, err)
+		return nil, true, err
+	}
+	out := make(map[shared.V8SectionKey][]byte, len(hits))
+	for key, val := range hits {
+		if rq, found := keyToReq[key]; found {
+			out[rq] = val
+		}
+	}
 	t.observeSection(sectionIdx, start, false, nil)
 	return out, true, nil
 }
