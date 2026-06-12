@@ -1271,3 +1271,43 @@ and after `ReleaseLazyColumnStore` has zeroed every `compressedEncoding` referen
 
 Back-ref: `columnar_read.go:readBlockColumnarWithCache` (assembled buffer),
 `metrics_trace.go` / `metrics_log.go` (release call sites), NOTE-153 (parallel lifetime hook).
+
+## NOTE-209: pool the lazy-column decompression buffer — 2026-06-11
+
+**Decision:** A lazily-registered V14 column (SPEC-V14-002) defers snappy decompression to
+first access via `Column.ensureDecompressed`, which called `decompressV14ColumnData` →
+`snappy.Decode(nil, data)`. That allocated a **fresh** decompressed buffer per lazy column
+decode, stored it in `c.rawEncoding`, and `decodeNow` nilled it after `readColumnEncoding`.
+This fires on every warm query that touches a deferred column (predicate-filtered block
+columns not in the eager wantColumns set, high-cardinality intrinsic group-bys, search
+second-pass output columns). A 2026-06-11 querier CPU profile showed `runtime.memmove` (2.84%)
+and `runtime.memclrNoHeapPointers` (2.37%) high on the warm path — the eager parse path
+(`parseBlockColumnsReuse`) already reuses a pooled `decompBuf` across columns, but the lazy
+path did not, so its per-column decompress was pure GC churn.
+
+**Mechanism:** `ensureDecompressed` now draws the decompression destination from the existing
+`decompBufPool` via `decompressV14ColumnDataInto((*bp)[:0], …)` (the same pooled-grow helper
+the eager path uses), stores the pool handle in a new `Column.decompPooledPtr` field, and
+`decodeNow` calls `releaseDecompPooled()` after `readColumnEncoding` to return the backing
+array to the pool. On a decompression error the handle is `Put` back immediately so a failed
+decode never leaks a pooled buffer.
+
+**Safety (why recycling is correct):** identical to the eager-path invariant documented in
+`parseBlockColumnsReuse`: every column decoder (`decodeDictionary`, `decodeInlineBytes`,
+`decodeXORBytes`, …) **copies all decoded data out** — `Present` bitmap, `Dict` values, `Idx`
+arrays, and `BytesInline`/`BytesDict` are fresh `make`+`copy`d slices that never alias the
+input `data`. So once `readColumnEncoding` returns, `rawEncoding` (which aliases the pooled
+buffer) is dead and the buffer can be recycled. `releaseDecompPooled` clears `rawEncoding`
+before/with the `Put` so the alias is never read after recycling.
+
+**Concurrency:** `decompPooledPtr` is written exactly once, inside `decompressOnce.Do`
+(happens-before all callers via `sync.Once`), and read/cleared exactly once, inside the
+single goroutine that wins `decodeOnce.Do`. `decodeNow` always runs `ensureDecompressed()`
+(which blocks until decompression completes) before entering `decodeOnce.Do`, so the field is
+fully visible. `decompPooledPtr != nil` implies `rawEncoding != nil` (it is only set on the
+success branch), so the early `rawEncoding == nil` decode branch has nothing to release.
+Verified race-free under `go test -race` (incl. the concurrent-IsPresent stress test, x5).
+
+Back-ref: `column.go:ensureDecompressed`/`decodeNow`/`releaseDecompPooled`,
+`block_parser.go:decompressV14ColumnDataInto` (pooled-grow helper) + the "decoders copy data
+out" invariant comment, NOTE-208 (assembled-buffer pool, sibling alloc reduction).

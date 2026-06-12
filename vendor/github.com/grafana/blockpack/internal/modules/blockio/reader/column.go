@@ -292,19 +292,46 @@ func (c *Column) ensureDecompressed() {
 		if c.compressedEncoding == nil {
 			return // not a V14 lazy column or already handled
 		}
-		decompressed, err := decompressV14ColumnData(c.Name, c.compressedEncoding, c.uncompressedLen)
+		// NOTE-209: decompress into a pooled buffer instead of allocating a fresh slice
+		// per lazy column. The decompressed bytes (rawEncoding) live only until decodeNow's
+		// readColumnEncoding has copied every decoded slice out; decodeNow then returns the
+		// buffer via releaseDecompPooled. decompressV14ColumnDataInto grows the buffer when
+		// the pooled capacity is too small (recorded as a fresh allocation carried in the
+		// pool handle, so the release still recycles whatever buffer ended up holding the
+		// data). On error the handle is returned immediately so a failed decode never leaks
+		// a pooled buffer.
+		bp := decompBufPool.Get().(*[]byte)
+		decompressed, grown, err := decompressV14ColumnDataInto(
+			(*bp)[:0], c.Name, c.compressedEncoding, c.uncompressedLen,
+		)
 		if err != nil {
 			// SPEC-ROOT-010: log decompression failures; silent skips hide data corruption.
 			slog.Warn("block_parser: V14 lazy column decompression failed",
 				"column", c.Name, "err", err,
 				"uncompressed_len", c.uncompressedLen,
 				"max_block_size", shared.MaxBlockSize)
+			*bp = grown[:0]
+			decompBufPool.Put(bp)
 		} else {
 			c.rawEncoding = decompressed
+			*bp = grown[:0]
+			c.decompPooledPtr = bp
 		}
 		c.compressedEncoding = nil
 		c.uncompressedLen = 0
 	})
+}
+
+// releaseDecompPooled returns the transient lazy-decode decompression buffer (if any) to
+// decompBufPool and clears rawEncoding. NOTE-209: safe to call only after readColumnEncoding
+// has copied every decoded slice out of rawEncoding (the "decoders copy data out" invariant);
+// after this call rawEncoding must not be read again. Idempotent: a nil handle is a no-op.
+func (c *Column) releaseDecompPooled() {
+	if c.decompPooledPtr != nil {
+		decompBufPool.Put(c.decompPooledPtr)
+		c.decompPooledPtr = nil
+	}
+	c.rawEncoding = nil
 }
 
 // decodeNow performs full decode of this column from rawEncoding.
@@ -367,7 +394,7 @@ func (c *Column) decodeNow() {
 			// SPEC-ROOT-010: log decode errors; silent drops hide data corruption.
 			slog.Warn("column decode failed", "column", c.Name, "type", c.Type, "err", err)
 			c.Present = []byte{} // corrupt data → treat all spans as absent
-			c.rawEncoding = nil
+			c.releaseDecompPooled()
 			c.internMap = nil
 			c.decoded.Store(true)
 			return
@@ -402,7 +429,9 @@ func (c *Column) decodeNow() {
 			_ = parsedV8ColumnCache.Put(c.v8CacheKey, snap)
 		}
 
-		c.rawEncoding = nil
+		// NOTE-209: readColumnEncoding has copied every decoded slice out of rawEncoding,
+		// so the pooled decompression buffer can be recycled now.
+		c.releaseDecompPooled()
 		c.internMap = nil
 		c.decoded.Store(true)
 	})
@@ -1377,12 +1406,20 @@ type Column struct {
 	Present            []byte
 	rawEncoding        []byte
 	compressedEncoding []byte
-	sparseDictIdx      []uint32
-	SpanCount          int
-	decodeOnce         sync.Once
-	denseOnce          sync.Once
-	decompressOnce     sync.Once
-	decoded            atomic.Bool
-	uncompressedLen    uint32
-	Type               shared.ColumnType
+	// NOTE-209: pool handle for the transient lazy-decode decompression buffer. When the
+	// lazy path decompresses compressedEncoding it draws the destination buffer from
+	// decompBufPool; decodeNow returns it to the pool after readColumnEncoding has copied
+	// every decoded slice out (the documented "decoders copy data out" invariant), so the
+	// per-lazy-column snappy.Decode(nil, …) allocation is eliminated on the warm scan path.
+	// nil when decompression allocated outside the pool (e.g. pool buffer too small was grown)
+	// or the column was not decompressed via the pooled path.
+	decompPooledPtr *[]byte
+	sparseDictIdx   []uint32
+	SpanCount       int
+	decodeOnce      sync.Once
+	denseOnce       sync.Once
+	decompressOnce  sync.Once
+	decoded         atomic.Bool
+	uncompressedLen uint32
+	Type            shared.ColumnType
 }
