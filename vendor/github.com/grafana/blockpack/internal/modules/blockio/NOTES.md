@@ -1724,3 +1724,46 @@ Back-ref: `internal/modules/blockio/span_fields.go:modulesSpanFieldsAdapter`,
 `query_traceql.go:streamFilterProgram`,
 `query_logql.go:streamLogProgram`,
 `reader.go:GetTraceByID`
+
+## NOTE-LEGACY-REMOVAL — FooterV3–V6 and V13 legacy format support removed (2026-06-12)
+
+*Added: 2026-06-12*
+
+**Decision:** All reader, parser, layout, and constant code for legacy file formats
+predating FooterV8 / V14 blocks was removed. All production blocks were rewritten
+in the week of 2026-06-09.
+
+**Formats removed:**
+- FooterV3/V4/V5/V6 — footer cascade detection (`readFooterLegacy`)
+- V13 file header — `readHeader()` and all V13 file header parsing
+- VersionBlockV12 — pre-V14 block format (enc_version=2)
+- `CompactIndexVersion` (v1, no bloom) — superseded by `CompactIndexVersion2`
+- `TraceIndexFmtVersion` (v1 trace index with per-block span indices) — still
+  parsed for V8-embedded trace sections for compatibility; removed from scanner
+
+**Safety rationale:**
+1. All production blocks were rewritten in the past week.
+2. Compaction already did not handle legacy formats (confirmed: zero legacy
+   references in `internal/modules/blockio/compaction/`).
+3. Files with no V8 footer magic now return a clear error:
+   "only FooterV8 files are supported (legacy V3–V6 formats were removed 2026-06-12)".
+
+**Code deleted:**
+- `reader/parser.go`: `readFooterLegacy`, `tryReadFooterV6/V5/V4`, `readFooterV3`,
+  `applyLegacyFooterCommon`, `readHeader`, `parseV5MetadataLazy`, `skipColumnIndex`,
+  `scanRangeIndexOffsets`, `skipTypedBoundaries`, `skipRangeValueEntry`,
+  `ensureV14RangeSection` (~500 lines total)
+- `reader/layout.go`: `layoutIntrinsicSections`, `layoutBlock`, `layoutMetadata`,
+  `layoutMetadataRangeIndex`, `formatIntrinsicBound` (~200 lines)
+- `reader/sketch_index.go`: `parseSketchIndexSection`, `skipColumnCMS`,
+  `skipColumnFuse` (~150 lines)
+- `reader/footerraw.go`, `reader/parsedmetadata.go`, `reader/intrinsictoc.go`,
+  `reader/rangeindexmeta.go` — entire files deleted
+- `shared/constants.go`: `VersionV13`, `FooterV3/V4/V5/V6Version/Size`,
+  `FileHeaderV13Size` — all legacy constants removed
+- `reader/reader.go`: `footerVersion` field, `v14*Err`/`v14*Once` fields,
+  `metadataBytes`, `rangeOffsets`, `headerOffset`, etc. — ~20 struct fields removed
+
+Back-ref: `internal/modules/blockio/reader/parser.go:readFooter`,
+          `internal/modules/blockio/reader/reader.go:NewReaderFromProvider`,
+          `internal/modules/blockio/shared/constants.go`

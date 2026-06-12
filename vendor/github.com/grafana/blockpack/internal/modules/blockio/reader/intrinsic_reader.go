@@ -25,56 +25,9 @@ func (r *Reader) EnsureIntrinsicTOC() error {
 // NOTE-003: the parsed TOC map is cached in parsedIntrinsicTOCCache (strong references,
 // entries persist until Clear) to avoid re-decoding the blob on every NewReaderFromProvider call.
 func (r *Reader) parseIntrinsicTOC() error {
-	// V4+ footers include an intrinsic section. V3 does not.
-	// V7 (V14 section-directory) uses the section directory for intrinsics, not this path.
-	isV4Plus := r.footerVersion == shared.FooterV4Version ||
-		r.footerVersion == shared.FooterV5Version ||
-		r.footerVersion == shared.FooterV6Version
-	if !isV4Plus || r.intrinsicIndexLen == 0 {
-		return nil
-	}
-
-	// Check process-level TOC cache first.
-	if r.fileID != "" {
-		tocKey := r.fileID + "/intrinsic/toc"
-		if cached := parsedIntrinsicTOCCache.Get(tocKey); cached != nil {
-			r.tocPin = cached // keep weak cache entry alive for lifetime of this Reader
-			// Copy the map so each Reader owns its own copy.
-			// IntrinsicColumnMeta writes to r.intrinsicIndex[name] (Format/Type lazy fill);
-			// aliasing the shared cache map would cause a concurrent map write panic.
-			// SPEC-ROOT-001: copy prevents concurrent map write across Readers for the same file.
-			r.intrinsicIndex = make(map[string]shared.IntrinsicColMeta, len(cached.entries))
-			for k, v := range cached.entries {
-				r.intrinsicIndex[k] = v
-			}
-			return nil
-		}
-	}
-
-	blob, err := r.readRange(r.intrinsicIndexOffset, uint64(r.intrinsicIndexLen), rw.DataTypeMetadata)
-	if err != nil {
-		return fmt.Errorf("parseIntrinsicTOC: read: %w", err)
-	}
-
-	entries, err := shared.DecodeTOC(blob)
-	if err != nil {
-		return fmt.Errorf("parseIntrinsicTOC: decode: %w", err)
-	}
-
-	r.intrinsicIndex = make(map[string]shared.IntrinsicColMeta, len(entries))
-	for _, e := range entries {
-		r.intrinsicIndex[e.Name] = e
-	}
-
-	// Store parsed TOC in process-level cache.
-	if r.fileID != "" {
-		toc := &intrinsicTOC{entries: r.intrinsicIndex}
-		if err := parsedIntrinsicTOCCache.Put(r.fileID+"/intrinsic/toc", toc); err != nil {
-			return fmt.Errorf("parseIntrinsicTOC: cache: %w", err)
-		}
-		r.tocPin = toc // keep weak cache entry alive for lifetime of this Reader
-	}
-
+	// No-op: V8 files use the section directory for intrinsics, not this path.
+	// Legacy V4/V5/V6 formats (which used a separate intrinsic TOC blob) were
+	// removed 2026-06-12. This function is retained for call-site compatibility.
 	return nil
 }
 

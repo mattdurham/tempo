@@ -704,3 +704,33 @@ Back-ref: `writer/bytes_cost_select.go`, `writer/column_types.go:bytesColumnBuil
           `writer/encoding_select.go:isIDColumn,isURLColumn`,
           `shared/column_classify.go:SemanticBytesOverride,semanticBytesOverrides`,
           SPEC-006, NOTE-AP-001, NOTE-217, NOTE-V14-002.
+
+## NOTE-222 — Data-driven Delta encoding for int64 columns (2026-06-12)
+
+*Added: 2026-06-12*
+
+**Decision:** `int64ColumnBuilder.buildData()` now runs a cheap cardinality estimate
+(`cheapCardinalityInt64`, capped at 4 — same pattern as `cheapCardinalityUint64`) and
+calls `shouldUseDeltaInt64(minVal, maxVal, cardinality)` before falling through to
+Dictionary. When the column is Delta-eligible it follows the same path as `uint64`:
+`encodeDeltaUint64` → `encodeDeltaUint64BitPacked` → `encodeDeltaUint64Paged`.
+
+**Sign-extension invariant:** `shouldUseDeltaInt64` computes the range as
+`uint64(maxVal - minVal)` — unsigned subtraction on the signed bit pattern, always
+correct when `maxVal >= minVal` (guaranteed by the builder's min/max tracking).
+When encoding, values are cast to `[]uint64` (bit-pattern-preserving); offsets are
+`uint64(v) - uint64(base)`, always non-negative since `base = min(present values)`.
+The reader reconstructs int64 values via `int64(base + offset)` using `colType`
+(see `isDeltaInt64ColType` + `promoteToInt64Dict` in `reader/column.go`).
+
+**Why this matters:** `ColumnTypeRangeDuration` (span duration, DB query time,
+HTTP response time from numeric-string promotion via NOTE-40) and `ColumnTypeRangeInt64`
+have the same quasi-monotonic, narrow-range-within-block profile as `span:start`
+(uint64). Delta encoding wins significantly over Dictionary for these columns.
+No new kinds are needed — kinds 5/22/23 already exist and the reader already decodes
+them; only colType routing was missing.
+
+Back-ref: `internal/modules/blockio/writer/column_types.go:int64ColumnBuilder.buildData`,
+          `internal/modules/blockio/writer/encoding_select.go:shouldUseDeltaInt64`,
+          `internal/modules/blockio/reader/column.go:isDeltaInt64ColType`,
+          `internal/modules/blockio/reader/column.go:promoteToInt64Dict`

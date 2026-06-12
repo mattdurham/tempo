@@ -642,41 +642,59 @@ encoding_kind     uint8    // See §9
 All encodings begin with the 2-byte Column Encoding Header (§8.3). The encoding_kind byte
 determines the remainder of the wire format.
 
-### Encoding Kind Table
+### Encoding Kind Registry
 
-| Kind | Value | Name | Applicable Types |
-|------|-------|------|-----------------|
-| 1  | Dictionary | All types | Default |
-| 2  | SparseDictionary | All types | >50% nulls |
-| 3  | InlineBytes | Bytes | bytes columns |
-| 4  | SparseInlineBytes | Bytes | bytes + >50% nulls |
-| 5  | DeltaUint64 | Uint64 | timestamps, monotonic data |
-| 6  | RLEIndexes | All types | low-cardinality |
-| 7  | SparseRLEIndexes | All types | low-cardinality + >50% nulls |
-| 8  | XORBytes | Bytes | ID columns (span:id, etc.) |
-| 9  | SparseXORBytes | Bytes | ID columns + >50% nulls |
-| 10 | PrefixBytes | Bytes | URL/path columns |
-| 11 | SparsePrefixBytes | Bytes | URL/path columns + >50% nulls |
-| 12 | DeltaDictionary | Bytes | trace:id (sorted, sequential) |
-| 13 | SparseDeltaDictionary | Bytes | trace:id + >50% nulls |
-| 14 | VectorF32 | VectorF32 | embedding vectors |
-| 15 | DictionaryAllPresent | All types | fully-present dictionary column |
-| 16 | InlineBytesAllPresent | Bytes | fully-present inline bytes (reader-only) |
-| 17 | DeltaUint64AllPresent | Uint64 | fully-present timestamps/monotonic |
-| 18 | RLEIndexesAllPresent | All types | fully-present low-cardinality |
-| 19 | XORBytesAllPresent | Bytes | fully-present ID columns |
-| 20 | PrefixBytesAllPresent | Bytes | fully-present URL/path columns |
-| 21 | DeltaDictionaryAllPresent | Bytes | fully-present trace:id |
-| 22 | DeltaUint64BitPacked | Uint64 | timestamps/monotonic with non-byte-aligned offset range |
-| 23 | DeltaUint64BitPackedAllPresent | Uint64 | fully-present, as kind 22 |
-| 24 | XORBytesUniform | Bytes | ID columns where every present value has one length |
-| 25 | SparseXORBytesUniform | Bytes | as kind 24, >50% nulls |
-| 26 | InlineBytesUniform | Bytes | uniform-length inline bytes (reader-only) |
-| 27 | SparseInlineBytesUniform | Bytes | as kind 26, >50% nulls (reader-only) |
-| 28 | XORBytesUniformAllPresent | Bytes | fully-present uniform-length ID columns |
-| 39 | DeltaUint64Paged | Uint64 | bursty-then-trickle timestamps spanning multiple pages |
-| 40 | GorillaFloat64 | Float64 | high-cardinality, value-correlated floats (NOTE-40 numeric-string sweet spot) |
-| 41 | GorillaFloat64AllPresent | Float64 | fully-present, as kind 40 |
+**This is the canonical kind-number registry. All allocations go here.**
+`shared/constants.go` mirrors this table; the two must stay in sync.
+
+| Kind | Constant | Status | Applicable Types / Notes |
+|------|---|---|---|
+| 1  | `KindDictionary` | landed | All types — default |
+| 2  | `KindSparseDictionary` | landed | All types — >50% nulls |
+| 3  | `KindInlineBytes` | landed | Bytes |
+| 4  | `KindSparseInlineBytes` | landed | Bytes + >50% nulls |
+| 5  | `KindDeltaUint64` | landed | Uint64 — timestamps, monotonic data |
+| 6  | `KindRLEIndexes` | landed | All types — low cardinality |
+| 7  | `KindSparseRLEIndexes` | landed | All types — low cardinality + >50% nulls |
+| 8  | `KindXORBytes` | landed | Bytes — ID columns (span:id, etc.) |
+| 9  | `KindSparseXORBytes` | landed | Bytes — ID columns + >50% nulls |
+| 10 | `KindPrefixBytes` | landed | Bytes — URL/path columns |
+| 11 | `KindSparsePrefixBytes` | landed | Bytes — URL/path columns + >50% nulls |
+| 12 | `KindDeltaDictionary` | landed | Bytes — trace:id (sorted, sequential) |
+| 13 | `KindSparseDeltaDictionary` | landed | Bytes — trace:id + >50% nulls |
+| 14 | `KindVectorF32` | landed | Float32 vectors |
+| 15 | `KindDictionaryAllPresent` | landed | All types — fully-present dictionary column |
+| 16 | `KindInlineBytesAllPresent` | landed | Bytes — fully-present inline bytes |
+| 17 | `KindDeltaUint64AllPresent` | landed | Uint64 — fully-present timestamps/monotonic |
+| 18 | `KindRLEIndexesAllPresent` | landed | All types — fully-present low-cardinality |
+| 19 | `KindXORBytesAllPresent` | landed | Bytes — fully-present ID columns |
+| 20 | `KindPrefixBytesAllPresent` | landed | Bytes — fully-present URL/path columns |
+| 21 | `KindDeltaDictionaryAllPresent` | landed | Bytes — fully-present trace:id |
+| 22 | `KindDeltaUint64BitPacked` | landed | Uint64 — timestamps/monotonic with non-byte-aligned offset range |
+| 23 | `KindDeltaUint64BitPackedAllPresent` | landed | Uint64 — fully-present, as kind 22 |
+| 24 | `KindXORBytesUniform` | landed | Bytes — ID columns where every present value has the same length |
+| 25 | `KindSparseXORBytesUniform` | landed | Bytes — as kind 24, >50% nulls |
+| 26 | `KindInlineBytesUniform` | landed | Bytes — uniform-length inline bytes |
+| 27 | `KindSparseInlineBytesUniform` | landed | Bytes — as kind 26, >50% nulls |
+| 28 | `KindXORBytesUniformAllPresent` | landed | Bytes — fully-present uniform-length ID columns |
+| 29–38 | — | unallocated | |
+| 39 | `KindDeltaUint64Paged` | landed | Uint64 — bursty-then-trickle timestamps, per-page bit-width |
+| 40 | `KindGorillaFloat64` | landed | Float64 — high-cardinality value-correlated floats |
+| 41 | `KindGorillaFloat64AllPresent` | landed | Float64 — fully-present, as kind 40 |
+| 42+ | — | unallocated | Next sequential number(s) claimed by the implementing PR |
+
+#### Allocation rules
+
+1. **Single source of truth.** This table is the only place where kind numbers are allocated. `shared/constants.go` mirrors this table; the two must stay in sync.
+2. **Sequential allocation.** New kinds claim the next unused number(s). No reserving ranges in advance.
+3. **Claim at PR-merge time, not at design time.** Issues and design docs reference encodings by **constant name**, not by number. The implementing PR picks the next available number and adds it here.
+4. **No holes.** If a proposed kind is dropped, do not skip its number — the next PR takes it. (Exception: the 29–38 gap exists because kinds 39–41 were allocated before 29–38 were filled; new kinds start at 42.)
+5. **Dense + sparse pairs use consecutive numbers.** Dense at `N`, sparse at `N+1`.
+6. **Documenting a new kind** requires: a `landed` row in this table, a §9 wire-format subsection, the constant in `shared/constants.go`, and a dispatch arm in `reader/column.go:readColumnEncoding` (skill `814c1630`).
+
+#### Proposed kinds (open issues — numbers assigned at PR-merge)
+
+No open proposals — all format issues (#325–#333) are closed and landed. Next kind number is **42**.
 
 ### 9.0 AllPresent Encoding Kinds (kinds 15–21)
 
@@ -695,6 +713,7 @@ all-absent column is represented by omitting the column from the block TOC, so i
 Selection is gated by the writer flag `Config.DisableAllPresentEncoding` (default: AllPresent
 on). New kind IDs are additive — `enc_version` is unchanged and old readers reject unknown kinds.
 See writer NOTE-AP-001 / reader NOTE-AP-001.
+
 
 ### 9.1 Presence RLE
 

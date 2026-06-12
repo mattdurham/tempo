@@ -284,11 +284,11 @@ func readColumnEncoding(data []byte, spanCount int, colType shared.ColumnType, c
 	case shared.KindInlineBytes, shared.KindSparseInlineBytes:
 		return decodeInlineBytes(data[2:], baseKind, spanCount, allPresent)
 	case shared.KindDeltaUint64:
-		return decodeDeltaUint64(data[2:], spanCount, ctx, allPresent)
+		return decodeDeltaUint64(data[2:], spanCount, colType, ctx, allPresent)
 	case shared.KindDeltaUint64BitPacked:
-		return decodeDeltaUint64BitPacked(data[2:], spanCount, allPresent)
+		return decodeDeltaUint64BitPacked(data[2:], spanCount, colType, allPresent)
 	case shared.KindDeltaUint64Paged:
-		return decodeDeltaUint64Paged(data[2:], spanCount)
+		return decodeDeltaUint64Paged(data[2:], spanCount, colType)
 	case shared.KindRLEIndexes, shared.KindSparseRLEIndexes:
 		return decodeRLEIndexes(data[2:], baseKind, spanCount, colType, ctx, allPresent)
 	case shared.KindXORBytes, shared.KindSparseXORBytes:
@@ -785,7 +785,28 @@ func decodeInlineBytes(data []byte, kind uint8, spanCount int, allPresent bool) 
 
 // decodeDeltaUint64 decodes kind 5 (DeltaUint64).
 // data starts after enc_version + kind bytes.
-func decodeDeltaUint64(data []byte, spanCount int, ctx *decodeCtx, allPresent bool) (*Column, error) {
+// isDeltaInt64ColType returns true for column types that store signed int64 values via
+// the delta uint64 encoders (NOTE-222). The bit patterns are identical; only the
+// interpretation (and the output field — Int64Dict vs Uint64Dict) differs.
+func isDeltaInt64ColType(ct shared.ColumnType) bool {
+	return ct == shared.ColumnTypeInt64 ||
+		ct == shared.ColumnTypeRangeInt64 ||
+		ct == shared.ColumnTypeRangeDuration
+}
+
+// promoteToInt64Dict reinterprets a uint64 dict as int64 in-place and moves it to
+// col.Int64Dict, sharing the Idx slice. Used by delta decoders for signed int64 columns.
+func promoteToInt64Dict(col *Column) {
+	col.Int64Dict = make([]int64, len(col.Uint64Dict))
+	for i, v := range col.Uint64Dict {
+		col.Int64Dict[i] = int64(v) //nolint:gosec // bit-pattern reinterpret; NOTE-222
+	}
+	col.Int64Idx = col.Uint64Idx
+	col.Uint64Dict = nil
+	col.Uint64Idx = nil
+}
+
+func decodeDeltaUint64(data []byte, spanCount int, colType shared.ColumnType, ctx *decodeCtx, allPresent bool) (*Column, error) {
 	col := &Column{SpanCount: spanCount}
 
 	if len(data) < 4 {
@@ -870,6 +891,12 @@ func decodeDeltaUint64(data []byte, spanCount int, ctx *decodeCtx, allPresent bo
 		}
 	}
 
+	// NOTE-222: if the column type is a signed int64 family, reinterpret the uint64 bit
+	// patterns as int64 and move to Int64Dict/Int64Idx so the executor finds them correctly.
+	if isDeltaInt64ColType(colType) {
+		promoteToInt64Dict(col)
+	}
+
 	return col, nil
 }
 
@@ -878,7 +905,7 @@ func decodeDeltaUint64(data []byte, spanCount int, ctx *decodeCtx, allPresent bo
 //
 // Wire: span_count[4] + presence + base[8] + bit_width[1] + packed_len[4] + packed_offsets.
 // Offsets are an LSB-first bit stream of presentCount values, each bit_width bits wide.
-func decodeDeltaUint64BitPacked(data []byte, spanCount int, allPresent bool) (*Column, error) {
+func decodeDeltaUint64BitPacked(data []byte, spanCount int, colType shared.ColumnType, allPresent bool) (*Column, error) {
 	col := &Column{SpanCount: spanCount}
 
 	if len(data) < 4 {
@@ -949,6 +976,11 @@ func decodeDeltaUint64BitPacked(data []byte, spanCount int, allPresent bool) (*C
 			col.Uint64Idx[i] = uint32(dictIdx) //nolint:gosec
 			dictIdx++
 		}
+	}
+
+	// NOTE-222: signed int64 columns stored via the uint64 delta encoder.
+	if isDeltaInt64ColType(colType) {
+		promoteToInt64Dict(col)
 	}
 
 	return col, nil
@@ -1130,7 +1162,7 @@ const deltaPageSizeReader = 1024
 //
 // Each page holds up to deltaPageSize present rows, packed LSB-first at the page's own bit_width
 // over the page's own base. There is no AllPresent variant: the presence segment is always read.
-func decodeDeltaUint64Paged(data []byte, spanCount int) (*Column, error) {
+func decodeDeltaUint64Paged(data []byte, spanCount int, colType shared.ColumnType) (*Column, error) {
 	col := &Column{SpanCount: spanCount}
 
 	if len(data) < 4 {
@@ -1257,6 +1289,11 @@ func decodeDeltaUint64Paged(data []byte, spanCount int) (*Column, error) {
 
 	for pi, row := range presentRowIdx {
 		col.Uint64Idx[row] = uint32(pi) //nolint:gosec
+	}
+
+	// NOTE-222: signed int64 columns stored via the uint64 paged delta encoder.
+	if isDeltaInt64ColType(colType) {
+		promoteToInt64Dict(col)
 	}
 
 	return col, nil

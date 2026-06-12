@@ -84,111 +84,10 @@ import (
 // Logical sections (IsLogical=true) describe sub-structure within the decompressed
 // metadata buffer; their Offset is relative to that buffer, not the physical file.
 func (r *Reader) FileLayout() (*FileLayoutReport, error) {
-	if r.footerVersion == shared.FooterV8Version {
-		return r.fileLayoutV8()
-	}
-
-	const headerSize = int64(22) // magic[4] + version[1] + metadataOffset[8] + metadataLen[8] + signalType[1]
-	footerSize := int64(shared.FooterV3Size)
-	switch r.footerVersion {
-	case shared.FooterV4Version:
-		footerSize = int64(shared.FooterV4Size)
-	case shared.FooterV5Version:
-		footerSize = int64(shared.FooterV5Size)
-	case shared.FooterV6Version:
-		footerSize = int64(shared.FooterV6Size)
-	}
-
-	var sections []FileLayoutSection
-
-	// Footer: last 22 bytes.
-	sections = append(sections, FileLayoutSection{
-		Section:        "footer",
-		Offset:         r.fileSize - footerSize,
-		CompressedSize: footerSize,
-	})
-
-	// File header: 22 bytes at r.headerOffset.
-	sections = append(sections, FileLayoutSection{
-		Section:        "file_header",
-		Offset:         int64(r.headerOffset), //nolint:gosec
-		CompressedSize: headerSize,
-	})
-
-	// Blocks.
-	for blockIdx, meta := range r.blockMetas {
-		blockSections, err := r.layoutBlock(blockIdx, meta)
-		if err != nil {
-			return nil, fmt.Errorf("block %d layout: %w", blockIdx, err)
-		}
-
-		sections = append(sections, blockSections...)
-	}
-
-	// Metadata sub-sections.
-	metaSections, err := r.layoutMetadata()
-	if err != nil {
-		return nil, fmt.Errorf("metadata layout: %w", err)
-	}
-
-	sections = append(sections, metaSections...)
-
-	// Compact trace index (if present).
-	if r.compactLen > 0 {
-		sections = append(sections, FileLayoutSection{
-			Section:        "compact_trace_index",
-			Offset:         int64(r.compactOffset), //nolint:gosec
-			CompressedSize: int64(r.compactLen),    //nolint:gosec
-		})
-	}
-	// V6: separate compact traces section (snappy-compressed trace index).
-	if r.compactTracesLen > 0 {
-		sections = append(sections, FileLayoutSection{
-			Section:        "compact_trace_index_traces",
-			Offset:         int64(r.compactTracesOffset), //nolint:gosec
-			CompressedSize: int64(r.compactTracesLen),    //nolint:gosec
-		})
-	}
-
-	// Intrinsic section (v4+ footer): per-column blobs + TOC.
-	isV4Plus := r.footerVersion == shared.FooterV4Version ||
-		r.footerVersion == shared.FooterV5Version ||
-		r.footerVersion == shared.FooterV6Version
-	// V7 is V14 section-directory format — handled by fileLayoutV14 above, never reaches here.
-	if isV4Plus && r.intrinsicIndexLen > 0 {
-		sections = append(sections, r.layoutIntrinsicSections()...)
-	}
-
-	slices.SortFunc(sections, func(a, b FileLayoutSection) int {
-		return cmp.Compare(a.Offset, b.Offset)
-	})
-
-	rangeIndex := r.buildRangeIndex()
-	sketchIndex := r.buildSketchIndexInfo()
-	fileBloom := r.buildFileBloomInfo()
-
-	spanCounts := make([]uint32, len(r.blockMetas))
-	var totalSpans int64
-	for i, m := range r.blockMetas {
-		spanCounts[i] = m.SpanCount
-		totalSpans += int64(m.SpanCount) //nolint:gosec
-	}
-
-	return &FileLayoutReport{
-		FileSize:        r.fileSize,
-		FileVersion:     r.fileVersion,
-		BlockCount:      len(r.blockMetas),
-		TotalSpans:      totalSpans,
-		BlockSpanCounts: spanCounts,
-		Sections:        sections,
-		RangeIndex:      rangeIndex,
-		SketchIndex:     sketchIndex,
-		FileBloom:       fileBloom,
-	}, nil
+	return r.fileLayoutV8()
 }
 
 // fileLayoutV8 builds the FileLayoutReport for V8 (unified ToC) files.
-// V8 layout: blocks + per-section blobs + ToC blob + footer.
 func (r *Reader) fileLayoutV8() (*FileLayoutReport, error) {
 	sections := make([]FileLayoutSection, 0, 16+len(r.tocMap)+len(r.blockMetas)*3)
 
@@ -287,109 +186,6 @@ func (r *Reader) fileLayoutV8() (*FileLayoutReport, error) {
 	}, nil
 }
 
-// layoutIntrinsicSections returns FileLayoutSection entries for all intrinsic columns
-// in legacy (V4/V5/V6 footer) files. It handles both flat and paged column formats.
-func (r *Reader) layoutIntrinsicSections() []FileLayoutSection {
-	var sections []FileLayoutSection
-	var columnsEnd int64
-
-	for _, name := range r.IntrinsicColumnNames() {
-		meta, ok := r.IntrinsicColumnMeta(name)
-		if !ok {
-			continue
-		}
-		var formatName string
-		switch meta.Format {
-		case shared.IntrinsicFormatDict:
-			formatName = "dict"
-		case shared.IntrinsicFormatXORBytes:
-			formatName = "xor_bytes"
-		case shared.IntrinsicFormatDeltaUint64:
-			formatName = "delta_uint64"
-		default:
-			formatName = "flat"
-		}
-
-		blob, blobErr := r.GetIntrinsicColumnBlob(name)
-		isPaged := blobErr == nil && len(blob) > 0 && blob[0] == shared.IntrinsicPagedVersion
-
-		pagedEmitted := false
-		if isPaged && len(blob) >= 5 {
-			tocLen := int(binary.LittleEndian.Uint32(blob[1:5]))
-			if 5+tocLen <= len(blob) {
-				ptoc, tocErr := shared.DecodePageTOC(blob[5 : 5+tocLen])
-				if tocErr == nil && len(ptoc.Pages) > 0 {
-					headerLen := int64(1) + 4 + int64(tocLen)            //nolint:gosec
-					firstPageAbsOffset := int64(meta.Offset) + headerLen //nolint:gosec
-					sections = append(sections, FileLayoutSection{
-						Section:        "intrinsic.column[" + name + "].page_toc",
-						ColumnName:     name,
-						ColumnType:     columnTypeName(meta.Type),
-						Offset:         int64(meta.Offset), //nolint:gosec
-						CompressedSize: headerLen,
-					})
-					if end := int64(meta.Offset) + headerLen; end > columnsEnd { //nolint:gosec
-						columnsEnd = end
-					}
-					for pageIdx, pm := range ptoc.Pages {
-						pageAbsOffset := firstPageAbsOffset + int64(pm.Offset) //nolint:gosec
-						sections = append(sections, FileLayoutSection{
-							Section:        fmt.Sprintf("intrinsic.column[%s].page[%d]", name, pageIdx),
-							ColumnName:     name,
-							ColumnType:     columnTypeName(meta.Type),
-							Encoding:       fmt.Sprintf("%s/paged", formatName),
-							Offset:         pageAbsOffset,
-							CompressedSize: int64(pm.Length), //nolint:gosec
-							RowCount:       int(pm.RowCount), //nolint:gosec
-							MinValue:       formatIntrinsicBound(meta.Type, pm.Min),
-							MaxValue:       formatIntrinsicBound(meta.Type, pm.Max),
-						})
-						if end := pageAbsOffset + int64(pm.Length); end > columnsEnd { //nolint:gosec
-							columnsEnd = end
-						}
-					}
-					pagedEmitted = true
-				}
-			}
-		}
-
-		if !pagedEmitted {
-			if isPaged {
-				formatName += "/paged"
-			}
-			sections = append(sections, FileLayoutSection{
-				Section:        "intrinsic.column[" + name + "]",
-				ColumnName:     name,
-				ColumnType:     columnTypeName(meta.Type),
-				Encoding:       formatName,
-				Offset:         int64(meta.Offset), //nolint:gosec
-				CompressedSize: int64(meta.Length), //nolint:gosec
-			})
-			if end := int64(meta.Offset) + int64(meta.Length); end > columnsEnd { //nolint:gosec
-				columnsEnd = end
-			}
-		}
-	}
-
-	// TOC blob: from end of last column blob to end of intrinsic index region.
-	tocStart := columnsEnd
-	if tocStart == 0 {
-		tocStart = int64(r.intrinsicIndexOffset) //nolint:gosec
-	}
-	tocEnd := int64(r.intrinsicIndexOffset) + int64(r.intrinsicIndexLen) //nolint:gosec
-	if tocEnd > tocStart {
-		sections = append(sections, FileLayoutSection{
-			Section:        "intrinsic.toc",
-			Offset:         tocStart,
-			CompressedSize: tocEnd - tocStart,
-		})
-	}
-	return sections
-}
-
-// layoutBlockV14 returns FileLayoutSection entries for one V14 block.
-// Column blobs are snappy-compressed on disk; the encoding kind is extracted by
-// snappy-decoding the first 2 bytes of each blob.
 func (r *Reader) layoutBlockV14(blockIdx int, meta shared.BlockMeta) ([]FileLayoutSection, error) {
 	raw, err := r.ReadBlockRaw(blockIdx)
 	if err != nil {
@@ -552,14 +348,20 @@ func (r *Reader) buildSketchIndexInfo() *SketchIndexInfo {
 
 // buildRangeIndex parses every column's range index and returns the result sorted by column name.
 func (r *Reader) buildRangeIndex() []RangeIndexColumn {
-	_ = r.ensureV14RangeSection()
-	if len(r.rangeOffsets) == 0 {
+	// Collect range column names from the V8 ToC.
+	var rangeNames []string
+	for key := range r.tocMap {
+		if key.Type == shared.ToCTypeMetadata && key.SubType == shared.ToCSubTypeRange && key.Name != "" {
+			rangeNames = append(rangeNames, key.Name)
+		}
+	}
+	if len(rangeNames) == 0 {
 		return nil
 	}
 
-	cols := make([]RangeIndexColumn, 0, len(r.rangeOffsets))
+	cols := make([]RangeIndexColumn, 0, len(rangeNames))
 
-	for colName := range r.rangeOffsets {
+	for _, colName := range rangeNames {
 		if err := r.ensureRangeColumnParsed(colName); err != nil {
 			continue
 		}
@@ -636,126 +438,6 @@ func formatRangeKey(colType shared.ColumnType, key string) string {
 	}
 }
 
-// layoutBlock returns FileLayoutSection entries for one block.
-func (r *Reader) layoutBlock(blockIdx int, meta shared.BlockMeta) ([]FileLayoutSection, error) {
-	raw, err := r.ReadBlockRaw(blockIdx)
-	if err != nil {
-		return nil, fmt.Errorf("ReadBlockRaw: %w", err)
-	}
-
-	hdr, err := parseBlockHeader(raw)
-	if err != nil {
-		return nil, fmt.Errorf("parseBlockHeader: %w", err)
-	}
-
-	metas, colMetaEndPos, err := parseColumnMetadataArray(raw, 24, int(hdr.columnCount), hdr.version)
-	if err != nil {
-		return nil, fmt.Errorf("parseColumnMetadataArray: %w", err)
-	}
-
-	prefix := fmt.Sprintf("block[%d]", blockIdx)
-	base := int64(meta.Offset) //nolint:gosec
-	sections := make([]FileLayoutSection, 0, 3+len(metas)*2)
-
-	// Block header: always 24 bytes.
-	sections = append(sections, FileLayoutSection{
-		Section:        prefix + ".header",
-		Offset:         base,
-		CompressedSize: 24,
-		BlockIndex:     blockIdx,
-	})
-
-	// Column metadata array: bytes [24, colMetaEndPos).
-	if colMetaSize := int64(colMetaEndPos - 24); colMetaSize > 0 {
-		sections = append(sections, FileLayoutSection{
-			Section:        prefix + ".column_metadata",
-			Offset:         base + 24,
-			CompressedSize: colMetaSize,
-			BlockIndex:     blockIdx,
-		})
-	}
-
-	// Per-column data.
-	for _, m := range metas {
-		colType := columnTypeName(m.colType)
-
-		if m.compressedLen > 0 {
-			start := int(m.dataOffset) //nolint:gosec
-			var encKind string
-			if start+1 < len(raw) {
-				encKind = encodingKindName(raw[start+1])
-			}
-
-			sections = append(sections, FileLayoutSection{
-				Section:        prefix + ".column[" + m.name + "].data",
-				ColumnName:     m.name,
-				ColumnType:     colType,
-				Encoding:       encKind,
-				Offset:         base + int64(m.dataOffset), //nolint:gosec
-				CompressedSize: int64(m.compressedLen),     //nolint:gosec
-				BlockIndex:     blockIdx,
-			})
-		}
-	}
-
-	return sections, nil
-}
-
-// layoutMetadata returns FileLayoutSection entries for the metadata section.
-//
-// All V12 metadata is a single snappy-compressed blob. The physical section
-// (metadata.compressed) accounts for r.metadataLen compressed bytes, preserving
-// the byte invariant. Logical sub-sections (IsLogical: true) describe the
-// decompressed content without adding to the physical byte count.
-func (r *Reader) layoutMetadata() ([]FileLayoutSection, error) {
-	if len(r.metadataBytes) < 8 {
-		return nil, fmt.Errorf("metadataBytes too short: need at least 8 bytes, have %d", len(r.metadataBytes))
-	}
-
-	base := int64(r.metadataOffset) //nolint:gosec
-
-	sections := make([]FileLayoutSection, 0, 1+len(r.rangeOffsets))
-	sections = append(sections, FileLayoutSection{
-		Section:          "metadata.compressed",
-		Offset:           base,
-		CompressedSize:   int64(r.metadataLen),        //nolint:gosec
-		UncompressedSize: int64(len(r.metadataBytes)), //nolint:gosec
-	})
-
-	// Logical sub-sections within the decompressed metadata buffer.
-	sections = append(sections, r.layoutMetadataRangeIndex()...)
-
-	return sections, nil
-}
-
-// layoutMetadataRangeIndex returns logical FileLayoutSection entries for each
-// range-indexed column within the decompressed metadata buffer.
-func (r *Reader) layoutMetadataRangeIndex() []FileLayoutSection {
-	_ = r.ensureV14RangeSection()
-	if len(r.rangeOffsets) == 0 {
-		return nil
-	}
-	sections := make([]FileLayoutSection, 0, len(r.rangeOffsets))
-	for colName, dMeta := range r.rangeOffsets {
-		sections = append(sections, FileLayoutSection{
-			Section:        "metadata.range_index.column[" + colName + "]",
-			ColumnName:     colName,
-			ColumnType:     columnTypeName(dMeta.typ),
-			Offset:         int64(dMeta.offset), //nolint:gosec
-			CompressedSize: int64(dMeta.length), //nolint:gosec
-			IsLogical:      true,
-		})
-	}
-	return sections
-}
-
-// buildFileBloomInfo builds a FileBloomInfo summary from the reader's raw file-bloom data.
-// Returns nil when no FileBloom section is present.
-//
-// This re-walks the raw FBLM wire format to extract per-column fuse filter byte sizes,
-// which are not retained by parseFileBloomSection (it only keeps the unmarshalled filters).
-// The raw bytes have already been validated by parseFileBloomSection during file open, so
-// magic/version checks here are defensive guards, not primary validation.
 func (r *Reader) buildFileBloomInfo() *FileBloomInfo {
 	_ = r.ensureV14BloomSection()
 	raw := r.fileBloomRaw
@@ -815,27 +497,6 @@ func (r *Reader) buildFileBloomInfo() *FileBloomInfo {
 
 // formatIntrinsicBound decodes an encoded intrinsic column boundary to a human-readable string.
 // For ColumnTypeUint64 (span:duration, span:start) the bound is an 8-byte LE uint64.
-// For ColumnTypeInt64 the bound is an 8-byte LE int64.
-// For string/bytes types the bound is the raw string.
-func formatIntrinsicBound(colType shared.ColumnType, bound string) string {
-	if len(bound) == 0 {
-		return ""
-	}
-	switch colType {
-	case shared.ColumnTypeUint64:
-		if len(bound) >= 8 {
-			v := binary.LittleEndian.Uint64([]byte(bound))
-			return fmt.Sprintf("%d", v)
-		}
-	case shared.ColumnTypeInt64:
-		if len(bound) >= 8 {
-			v := int64(binary.LittleEndian.Uint64([]byte(bound))) //nolint:gosec
-			return fmt.Sprintf("%d", v)
-		}
-	}
-	return bound
-}
-
 // columnTypeNames maps ColumnType values to their string names for layout reporting.
 var columnTypeNames = map[shared.ColumnType]string{ //nolint:gochecknoglobals
 	shared.ColumnTypeString:        "String",
@@ -854,7 +515,6 @@ var columnTypeNames = map[shared.ColumnType]string{ //nolint:gochecknoglobals
 	shared.ColumnTypeVectorF32:     "VectorF32",
 }
 
-// columnTypeName maps a ColumnType to its string name for layout reporting.
 func columnTypeName(t shared.ColumnType) string {
 	if name, ok := columnTypeNames[t]; ok {
 		return name

@@ -123,6 +123,9 @@ func (b *int64ColumnBuilder) resetForReuse(_ string) {
 	clear(b.present)
 	b.values = b.values[:0]
 	b.present = b.present[:0]
+	b.minVal = 0
+	b.maxVal = 0
+	b.hasVals = false
 }
 
 func (b *int64ColumnBuilder) prepare(nRows int) {
@@ -149,6 +152,20 @@ func (b *int64ColumnBuilder) addVectorF32(_ []float32, _ bool) {}
 func (b *int64ColumnBuilder) addInt64(val int64, present bool) {
 	b.values = append(b.values, val)
 	b.present = append(b.present, present)
+	if present {
+		if !b.hasVals {
+			b.minVal = val
+			b.maxVal = val
+			b.hasVals = true
+		} else {
+			if val < b.minVal {
+				b.minVal = val
+			}
+			if val > b.maxVal {
+				b.maxVal = val
+			}
+		}
+	}
 }
 
 func (b *int64ColumnBuilder) rowCount() int { return len(b.values) }
@@ -167,6 +184,35 @@ func (b *int64ColumnBuilder) colType() shared.ColumnType { return shared.ColumnT
 
 func (b *int64ColumnBuilder) buildData() ([]byte, error) {
 	nRows := len(b.values)
+
+	// NOTE-222: data-driven delta selection for int64, mirroring the uint64 path.
+	// ColumnTypeRangeDuration (span duration, DB query time) and ColumnTypeRangeInt64
+	// (numeric-string promoted fields via NOTE-40) are quasi-monotonic with a narrow range
+	// within a block — the signed equivalent of span:start. Delta encoding wins
+	// significantly over Dictionary for these column populations.
+	if b.hasVals {
+		cardinality := cheapCardinalityInt64(b.values, b.present)
+		if shouldUseDeltaInt64(b.minVal, b.maxVal, cardinality) {
+			// Cast values to []uint64 (bit-pattern-preserving) for the delta encoders.
+			// Offsets (v − base) are always non-negative since base = min(present values).
+			// The reader reconstructs int64 values via int64(base + offset) using colType.
+			uint64Vals := make([]uint64, len(b.values)) //nolint:gosec // bounded by MaxBlockSpans
+			for i, v := range b.values {
+				uint64Vals[i] = uint64(v) //nolint:gosec // bit-pattern cast; sign preserved via colType
+			}
+			base, maxOffset, presentCount := deltaBaseAndMaxOffset(uint64Vals, b.present, nRows)
+			if presentCount >= pagedDeltaMinPages*deltaPageSize {
+				presentValues, _ := collectPresentValues(uint64Vals, b.present, nRows)
+				if shouldUsePagedDelta(presentValues, base, maxOffset) {
+					return encodeDeltaUint64Paged(uint64Vals, b.present, nRows)
+				}
+			}
+			if shouldUseBitPackedDelta(maxOffset, presentCount) {
+				return encodeDeltaUint64BitPacked(uint64Vals, b.present, nRows)
+			}
+			return encodeDeltaUint64(uint64Vals, b.present, nRows)
+		}
+	}
 
 	nullRatio := 0.0
 	if nRows > 0 {
@@ -316,6 +362,33 @@ func (b *uint64ColumnBuilder) buildData() ([]byte, error) {
 
 // cheapCardinalityUint64 counts distinct present values up to a cap of 4.
 // This is enough for shouldUseDeltaEncoding which only checks >2 and >3.
+// cheapCardinalityInt64 counts distinct present int64 values up to a cap of 4.
+// Same pattern as cheapCardinalityUint64; used for the int64 delta selection decision.
+func cheapCardinalityInt64(values []int64, present []bool) int {
+	var distinct [4]int64
+	count := 0
+	for i, v := range values {
+		if i >= len(present) || !present[i] {
+			continue
+		}
+		found := false
+		for j := range count {
+			if distinct[j] == v {
+				found = true
+				break
+			}
+		}
+		if !found {
+			if count == 4 {
+				return 4
+			}
+			distinct[count] = v
+			count++
+		}
+	}
+	return count
+}
+
 func cheapCardinalityUint64(values []uint64, present []bool) int {
 	var distinct [4]uint64
 	count := 0

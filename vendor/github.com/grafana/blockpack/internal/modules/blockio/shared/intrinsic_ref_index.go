@@ -174,6 +174,84 @@ func radixSortRefIndex(idx []RefIndexEntry) {
 	}
 }
 
+// radixSortRefIndexLow16 sorts idx in ascending Packed order assuming every entry's Packed
+// key shares the same high-16 bits (single-block decode: all refs have one BlockIdx). With a
+// constant high half the ordering is fully determined by the low-16 RowIdx, so only the two
+// low bytes need radix passes regardless of how large the (constant) BlockIdx is. This is the
+// case radixSortRefIndex's NOTE-190 byte-skip cannot reach on its own: keyOr skips only
+// all-zero byte positions, but a single-block column with BlockIdx>0 has non-zero — yet
+// constant — high bytes, so the generic path would run up to four passes (two of them pure
+// identity permutations over the constant high half). NOTE-228.
+//
+// Sorting only the low 16 bits is correct because a constant high half is order-preserving:
+// for any a,b sharing it, a.Packed < b.Packed iff (a.Packed&0xFFFF) < (b.Packed&0xFFFF). The
+// caller guarantees the single-block invariant (all high-16 equal); this routine never reads
+// the high bits, so it is byte-for-byte identical to a full sort on such input. Mechanics are
+// the NOTE-205 fused-histogram two-pass LSD radix over the low two bytes, with the NOTE-190
+// byte-skip still applied to the low half (a single-byte RowIdx range runs only one pass).
+func radixSortRefIndexLow16(idx []RefIndexEntry) {
+	const radixBits = 8
+	const radixSize = 1 << radixBits
+	const radixMask = radixSize - 1
+	n := len(idx)
+	if n < 2 {
+		return
+	}
+	// Pass 1's count scan doubles as the low-half OR scan (NOTE-190 byte-skip over 16 bits).
+	var lowOr uint32
+	var hist [2][radixSize]int
+	for i := range idx {
+		k := idx[i].Packed & 0xFFFF
+		lowOr |= k
+		hist[0][k&radixMask]++
+	}
+	if lowOr == 0 {
+		return // all RowIdx==0 (single row, or already trivially ordered)
+	}
+	// Run a second (high byte of the low half) pass only when RowIdx exceeds 8 bits.
+	maxByte := 0
+	if lowOr>>radixBits != 0 {
+		maxByte = 1
+	}
+	bufPtr := getRadixBuf(n)
+	defer putRadixBuf(bufPtr)
+	buf := *bufPtr
+	src, dst := idx, buf
+	passes := 0
+	for b := 0; b <= maxByte; b++ {
+		shift := b * radixBits
+		counts := &hist[b]
+		sum := 0
+		for c := range counts {
+			cnt := counts[c]
+			counts[c] = sum
+			sum += cnt
+		}
+		if b < maxByte && b+1 < len(hist) {
+			next := &hist[b+1] //nolint:gosec // b+1<len(hist) guarded above; bound is static
+			nextShift := shift + radixBits
+			for i := range src {
+				k := src[i].Packed
+				bucket := (k >> shift) & radixMask
+				dst[counts[bucket]] = src[i]
+				counts[bucket]++
+				next[(k>>nextShift)&radixMask]++
+			}
+		} else {
+			for i := range src {
+				bucket := (src[i].Packed >> shift) & radixMask
+				dst[counts[bucket]] = src[i]
+				counts[bucket]++
+			}
+		}
+		src, dst = dst, src
+		passes++
+	}
+	if passes%2 == 1 {
+		copy(idx, src)
+	}
+}
+
 // scatterDictRefIndexDense sorts idx in place assuming it is a single-block dense RowIdx
 // permutation: every entry's Packed key shares the same high-16 BlockIdx and the low-16
 // RowIdx values are exactly the contiguous range [minRow, minRow+len(idx)). It scatters each
@@ -232,20 +310,38 @@ func (col *IntrinsicColumn) EnsureRefIndex() {
 			// the O(N log N) closure-driven slices.SortFunc entirely — the comparator
 			// closure (cmp.Compare on Packed) was reached via slices.partitionCmpFunc and
 			// showed up as a residual CPU sink on the EnsureRefIndex path after NOTE-167.
+			// NOTE-228: also track whether all refs share one high-16 BlockIdx
+			// (single-block decode — the dominant query-frontend shard shape). When they
+			// do, the unsorted fallback only needs to sort the low-16 RowIdx, so route it
+			// to radixSortRefIndexLow16 (≤2 passes) instead of the general radixSortRefIndex
+			// (up to 4 passes when BlockIdx>0 makes the high bytes non-zero but constant).
 			sorted := true
+			singleBlock := true
 			var prev uint32
+			var hi16 uint32
 			for i, ref := range col.BlockRefs {
 				p := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx) //nolint:gosec
 				idx[i] = RefIndexEntry{
 					Packed: p,
 					Pos:    int32(i), //nolint:gosec
 				}
-				if i > 0 && p < prev {
-					sorted = false
+				if i == 0 {
+					hi16 = p >> 16
+				} else {
+					if p < prev {
+						sorted = false
+					}
+					if p>>16 != hi16 {
+						singleBlock = false
+					}
 				}
 				prev = p
 			}
-			if !sorted {
+			switch {
+			case sorted:
+			case singleBlock:
+				radixSortRefIndexLow16(idx)
+			default:
 				radixSortRefIndex(idx)
 			}
 			col.refIndex = idx
@@ -314,10 +410,17 @@ func (col *IntrinsicColumn) EnsureRefIndex() {
 				// NOTE-226: dense single-block permutation — scatter by RowIdx rank into a
 				// fresh buffer. scatterDictRefIndexDense verifies density (no gap/dup) as it
 				// writes; if the permutation is not actually dense it returns false and we
-				// fall back to radixSortRefIndex on the original append order.
+				// fall back to the low-16 sort (NOTE-228) on the original append order —
+				// this branch is guarded by singleBlock so the high-16 is constant.
 				if !scatterDictRefIndexDense(idx, minRow) {
-					radixSortRefIndex(idx)
+					radixSortRefIndexLow16(idx)
 				}
+			case singleBlock:
+				// NOTE-228: single block but the RowIdx permutation is not the dense
+				// contiguous range (an optional/sparse dict column — the attribute is
+				// present on only some spans). RowIdx is still unique per row and the
+				// high-16 BlockIdx is constant, so only the low-16 needs sorting.
+				radixSortRefIndexLow16(idx)
 			default:
 				radixSortRefIndex(idx)
 			}

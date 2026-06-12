@@ -96,13 +96,6 @@ type Reader struct {
 	// Assigned directly from Options.Cache; nil is normalized to NopSectionCache.
 	cache sectioncache.SectionCache
 
-	// v14 lazy section errors — set inside the corresponding sync.Once.Do and read after.
-	v14RangeErr  error
-	v14TraceErr  error
-	v14TSErr     error
-	v14SketchErr error
-	v14BloomErr  error
-
 	v8TraceErr error
 	v8TSErr    error
 	v8BloomErr error
@@ -113,7 +106,6 @@ type Reader struct {
 	traceIndex map[[16]byte][]uint16
 
 	// Range index — lazy.
-	rangeOffsets  map[string]rangeIndexMeta
 	rangeParsed   map[string]parsedRangeIndex
 	compactParsed *compactTraceIndex
 
@@ -148,27 +140,16 @@ type Reader struct {
 	// preDecodedMu.
 	preDecodedColumns map[preDecodedKey]*Column
 
-	// metaPin holds a reference to the *parsedMetadata retrieved from the process-level
-	// cache, ensuring the pointer remains valid for the lifetime of this Reader.
-	metaPin *parsedMetadata
-
-	// tocPin holds a reference to the *intrinsicTOC retrieved from the process-level
-	// cache, ensuring the pointer remains valid for the lifetime of this Reader.
-	tocPin *intrinsicTOC
-
 	// fileBloomParsed is the lazily parsed FileBloom section. Access via FileBloom().
 	fileBloomParsed *FileBloom
 
 	// vectorIndexParsed is the lazily parsed VectorIndex. Access via VectorIndex().
 	vectorIndexParsed *VectorIndex
 
-	// tocMap is the decoded unified ToC for V8 files.
-	// Nil for V7/V6/V5/V4/V3 footer files.
+	// tocMap is the decoded unified ToC (V8 format).
 	tocMap map[shared.ToCKey]shared.ToCEntry
 
-	// sectionDir holds the V14 section directory for legacy V14 files.
-	// Always zero-valued for V8 files (V8 uses tocMap instead).
-	// Kept for use by readV14Section, which is called from ensureV14* closures.
+	// sectionDir holds the section directory; unused post-V8 but retained for readV14Section.
 	sectionDir shared.SectionDirectory
 
 	fileID string
@@ -188,39 +169,16 @@ type Reader struct {
 	tsRaw []byte
 
 	// Parsed during NewReaderFromProvider.
-	blockMetas    []shared.BlockMeta
-	metadataBytes []byte
+	blockMetas []shared.BlockMeta
 
 	// fileBloomRaw holds the raw bytes of the FileBloom section, for caller caching.
 	// Nil for files written before the FileBloom section was introduced.
 	fileBloomRaw []byte
 
-	footerFields footerRaw
-
 	tsCount int
 
 	fileSize int64
 
-	// Compact trace index (v3 footer only).
-	compactOffset uint64
-
-	// compactTracesOffset and compactTracesLen are parsed from the v6 footer.
-	// When non-zero, the compact section is split: compact_offset/compact_len holds the
-	// uncompressed bloom+block_table header, and compactTracesOffset/compactTracesLen holds
-	// the snappy-compressed trace index (v3 split format).
-	compactTracesOffset uint64
-
-	// File header fields (populated in readHeader).
-	headerOffset   uint64
-	metadataOffset uint64
-	metadataLen    uint64
-
-	// intrinsicIndexOffset and intrinsicIndexLen are parsed from the v4 footer.
-	// Both are 0 for v3 footer files or files with no intrinsic section.
-	intrinsicIndexOffset uint64
-
-	// vectorIndexOffset and vectorIndexLen are parsed from the agentic v5 footer.
-	// Both are 0 for v3/v4 footer files or files with no vector index section.
 	vectorIndexOffset uint64
 
 	// V8 footer fields (FooterV8Version = 8, unified ToC files only).
@@ -241,14 +199,6 @@ type Reader struct {
 	// vectorIndexOnce guards lazy parsing of the vector index section.
 	vectorIndexOnce sync.Once
 
-	// v14 lazy section loaders — each fires at most once per Reader for V14 files.
-	// Non-V14 readers leave these zero-valued; the ensure* helpers are no-ops for them.
-	v14RangeOnce  sync.Once
-	v14TraceOnce  sync.Once
-	v14TSOnce     sync.Once
-	v14SketchOnce sync.Once
-	v14BloomOnce  sync.Once
-
 	// traceIndexOnce guards initialization of r.traceIndex from r.traceIndexRaw.
 	// SPEC-ROOT-001: prevents concurrent map write (r.traceIndex) from causing a fatal panic.
 	traceIndexOnce sync.Once
@@ -266,23 +216,23 @@ type Reader struct {
 	// can race the parse of group N. NOTE-212.
 	preDecodedMu sync.Mutex
 
-	compactLen uint32
-
-	// compactTracesLen is parsed from the v6 footer; see compactTracesOffset.
-	compactTracesLen uint32
-
-	intrinsicIndexLen uint32
+	// compactOffset/Len and compactTracesOffset/Len: legacy fields, always 0 for V8.
+	// Retained because trace_index.go's initCompactIndex reads compactTracesLen for V6 compat.
+	compactOffset       uint64
+	compactTracesOffset uint64
+	compactLen          uint32
+	compactTracesLen    uint32
+	intrinsicIndexLen   uint32
 
 	// vectorIndexLen is parsed from the agentic v5 footer.
 	vectorIndexLen uint32
 
 	v8ToCLen uint32
 
-	footerVersion uint16
-	fileVersion   uint8
+	fileVersion uint8
 
-	// signalType is parsed from the V12 file header signal_type byte.
-	// Defaults to shared.SignalTypeTrace (0x01) for older files.
+	// signalType is set from the V8 ToC signal_type byte.
+	// Defaults to shared.SignalTypeTrace (0x01) when the field is absent.
 	signalType uint8
 }
 
@@ -319,25 +269,9 @@ func NewReaderFromProviderWithOptions(provider rw.ReaderProvider, opts Options) 
 		return nil, fmt.Errorf("NewReaderFromProvider: %w", err)
 	}
 
-	if r.footerVersion == shared.FooterV8Version {
-		if err = r.parseSectionsV8(); err != nil {
-			return nil, fmt.Errorf("NewReaderFromProvider: V8 sections: %w", err)
-		}
-		return r, nil
+	if err = r.parseSectionsV8(); err != nil {
+		return nil, fmt.Errorf("NewReaderFromProvider: V8 sections: %w", err)
 	}
-
-	if err = r.readHeader(); err != nil {
-		return nil, fmt.Errorf("NewReaderFromProvider: %w", err)
-	}
-
-	if err = r.parseV5MetadataLazy(); err != nil {
-		return nil, fmt.Errorf("NewReaderFromProvider: %w", err)
-	}
-
-	if err = r.parseIntrinsicTOC(); err != nil {
-		return nil, fmt.Errorf("NewReaderFromProvider: %w", err)
-	}
-
 	return r, nil
 }
 
@@ -377,29 +311,9 @@ func NewLeanReaderFromProviderWithOptions(provider rw.ReaderProvider, opts Optio
 		return nil, fmt.Errorf("NewLeanReaderFromProvider: footer: %w", err)
 	}
 
-	// V8 files use a unified ToC.
-	if r.footerVersion == shared.FooterV8Version {
-		if err = r.parseSectionsV8(); err != nil {
-			return nil, fmt.Errorf("NewLeanReaderFromProvider: V8 sections: %w", err)
-		}
-		return r, nil
+	if err = r.parseSectionsV8(); err != nil {
+		return nil, fmt.Errorf("NewLeanReaderFromProvider: V8 sections: %w", err)
 	}
-
-	// V3/V4 files: fall back to full reader when there is no compact section.
-	if r.compactLen == 0 {
-		return NewReaderFromProviderWithOptions(provider, opts)
-	}
-
-	// I/O #2: read header to validate V13 and extract signal type.
-	if err = r.readHeader(); err != nil {
-		return nil, fmt.Errorf("NewLeanReaderFromProvider: header: %w", err)
-	}
-
-	// I/O #3: read bloom filter + block table only (lazy trace index — fetched on bloom hit).
-	if err = r.ensureCompactHeaderParsed(); err != nil {
-		return nil, fmt.Errorf("NewLeanReaderFromProvider: compact index: %w", err)
-	}
-
 	return r, nil
 }
 
@@ -459,53 +373,41 @@ func (r *Reader) BlockMeta(blockIdx int) shared.BlockMeta {
 // no sketch section was written or the column was not sketched.
 // Implements queryplanner.BlockIndexer.
 func (r *Reader) ColumnSketch(col string) queryplanner.ColumnSketch {
-	if r.footerVersion == shared.FooterV8Version {
-		// Check in-memory cache first (no lock needed for read-only check when nil is ok).
-		r.sketchIdxMu.Lock()
-		if r.sketchIdx != nil {
-			if cd := r.sketchIdx.columns[col]; cd != nil {
-				r.sketchIdxMu.Unlock()
-				return cd
-			}
+	// Check in-memory cache first.
+	r.sketchIdxMu.Lock()
+	if r.sketchIdx != nil {
+		if cd := r.sketchIdx.columns[col]; cd != nil {
+			r.sketchIdxMu.Unlock()
+			return cd
 		}
-		r.sketchIdxMu.Unlock()
-
-		// Fetch per-column blob from ToC.
-		data, err := r.fetchToCSection(shared.ToCKey{
-			Type:    shared.ToCTypeMetadata,
-			SubType: shared.ToCSubTypeSketch,
-			Name:    col,
-		})
-		if err != nil || data == nil {
-			return nil
-		}
-		cd, parseErr := parseOneColumnSketchBlob(data)
-		if parseErr != nil || cd == nil {
-			return nil
-		}
-		// Store in sketch cache.
-		r.sketchIdxMu.Lock()
-		if r.sketchIdx == nil {
-			r.sketchIdx = &sketchIndex{
-				numBlocks: r.BlockCount(),
-				columns:   make(map[string]*columnSketchData),
-			}
-		}
-		if r.sketchIdx.columns[col] == nil {
-			r.sketchIdx.columns[col] = cd
-		}
-		r.sketchIdxMu.Unlock()
-		return cd
 	}
+	r.sketchIdxMu.Unlock()
 
-	_ = r.ensureV14SketchSection()
+	// Fetch per-column blob from ToC.
+	data, err := r.fetchToCSection(shared.ToCKey{
+		Type:    shared.ToCTypeMetadata,
+		SubType: shared.ToCSubTypeSketch,
+		Name:    col,
+	})
+	if err != nil || data == nil {
+		return nil
+	}
+	cd, parseErr := parseOneColumnSketchBlob(data)
+	if parseErr != nil || cd == nil {
+		return nil
+	}
+	// Store in sketch cache.
+	r.sketchIdxMu.Lock()
 	if r.sketchIdx == nil {
-		return nil
+		r.sketchIdx = &sketchIndex{
+			numBlocks: r.BlockCount(),
+			columns:   make(map[string]*columnSketchData),
+		}
 	}
-	cd := r.sketchIdx.columns[col]
-	if cd == nil {
-		return nil
+	if r.sketchIdx.columns[col] == nil {
+		r.sketchIdx.columns[col] = cd
 	}
+	r.sketchIdxMu.Unlock()
 	return cd
 }
 
@@ -613,27 +515,11 @@ func (r *Reader) BlocksForRangeInterval(
 // range-indexed columns (rangeOffsets) and sketch columns (sketchIdx).
 func (r *Reader) ColumnNames() []string {
 	seen := make(map[string]struct{})
-
-	if r.footerVersion == shared.FooterV8Version {
-		// V8: column names are in tocMap as ToCTypeMetadata entries with Name set.
-		for key := range r.tocMap {
-			if key.Type == shared.ToCTypeMetadata &&
-				(key.SubType == shared.ToCSubTypeRange || key.SubType == shared.ToCSubTypeSketch) &&
-				key.Name != "" {
-				seen[key.Name] = struct{}{}
-			}
-		}
-	} else {
-		// V14 and older: load lazy sections then scan rangeOffsets + sketchIdx.
-		_ = r.ensureV14RangeSection()
-		_ = r.ensureV14SketchSection()
-		for col := range r.rangeOffsets {
-			seen[col] = struct{}{}
-		}
-		if r.sketchIdx != nil {
-			for col := range r.sketchIdx.columns {
-				seen[col] = struct{}{}
-			}
+	for key := range r.tocMap {
+		if key.Type == shared.ToCTypeMetadata &&
+			(key.SubType == shared.ToCSubTypeRange || key.SubType == shared.ToCSubTypeSketch) &&
+			key.Name != "" {
+			seen[key.Name] = struct{}{}
 		}
 	}
 	out := make([]string, 0, len(seen))
@@ -646,22 +532,13 @@ func (r *Reader) ColumnNames() []string {
 
 // RangeColumnType returns the ColumnType for a range-indexed column, if it exists.
 func (r *Reader) RangeColumnType(colName string) (shared.ColumnType, bool) {
-	// V8: per-column blobs; try parsing to get the type.
-	if r.footerVersion == shared.FooterV8Version {
-		if err := r.ensureRangeColumnParsed(colName); err != nil {
-			return 0, false
-		}
-		if idx, ok := r.rangeParsed[colName]; ok {
-			return idx.colType, true
-		}
+	if err := r.ensureRangeColumnParsed(colName); err != nil {
 		return 0, false
 	}
-	_ = r.ensureV14RangeSection()
-	meta, ok := r.rangeOffsets[colName]
-	if !ok {
-		return 0, false
+	if idx, ok := r.rangeParsed[colName]; ok {
+		return idx.colType, true
 	}
-	return meta.typ, true
+	return 0, false
 }
 
 // RangeBoundaries exposes the file-level value range for a range-indexed column.
@@ -967,10 +844,10 @@ func (r *Reader) MayContainTraceID(traceID [16]byte) bool {
 	return shared.TestTraceIDBloom(r.compactParsed.traceIDBloom, traceID)
 }
 
-// FooterVersion returns the version number parsed from the file footer.
-// Returns 3, 4, or 5 depending on the file format version.
+// FooterVersion returns the footer version. Always returns FooterV8Version;
+// legacy formats (V3–V6) were removed 2026-06-12.
 func (r *Reader) FooterVersion() uint16 {
-	return r.footerVersion
+	return shared.FooterV8Version
 }
 
 // VectorIndexRaw reads the raw vector index section bytes (for caller caching).

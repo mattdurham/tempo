@@ -1082,3 +1082,40 @@ because it is reused we stamp every slot's `Pos` with an `unclaimed` sentinel (`
 `entryIdx`) before scattering so a stale buffer cannot be mistaken for a written slot.
 
 Back-ref: `internal/modules/blockio/shared/intrinsic_ref_index.go:scatterDictRefIndexDense`
+
+---
+
+## NOTE-228: EnsureRefIndex single-block fallback — sort only the low-16 RowIdx
+*Added: 2026-06-12*
+
+`radixSortRefIndex` (NOTE-174/190/192/205) is the largest blockpack-attributable self-time frame
+in querier CPU profiles (~2.68%, profile 2026-06-12). Its NOTE-190 byte-skip skips only **all-zero**
+byte positions of the 32-bit `Packed` key (`BlockIdx<<16 | RowIdx`). The dominant decode shape is a
+**single block** (query-frontend shards one block per querier call), so every ref shares one
+`BlockIdx`. When that `BlockIdx` is **0** the two high bytes are zero and byte-skip already drops
+them — but when `BlockIdx > 0` the high bytes are non-zero **yet constant**, so the general sort
+runs up to four passes, two of which are pure identity permutations over the constant high half.
+
+**Optimization:** `radixSortRefIndexLow16` sorts assuming a constant high-16 (caller-guaranteed
+single-block). A constant high half is order-preserving — for `a,b` sharing it,
+`a.Packed < b.Packed` iff `(a.Packed&0xFFFF) < (b.Packed&0xFFFF)` — so only the low two bytes need
+radix passes, at most two (and one when RowIdx fits in a byte). It is the same NOTE-205
+fused-histogram LSD radix, narrowed to the low half with the NOTE-190 byte-skip still applied
+inside that half.
+
+**Where it routes (all single-block, high-16 constant):**
+- Flat/XOR/Delta path: the build scan now tracks `singleBlock` alongside the NOTE-168 `sorted`
+  flag; the unsorted-but-single-block case goes to the low-16 sorter instead of the full sort.
+- Dict path: the NOTE-226 dense scatter's *failure* fallback and the **single-block sparse**
+  (`default`-was) case both go to the low-16 sorter. The sparse case (an optional dict column
+  present on only some spans → RowIdx gaps, so `total != maxRow-minRow+1`) previously paid the
+  full four-pass sort even though RowIdx is unique per row and the BlockIdx is constant.
+- Genuine **multi-block** merges still use the full `radixSortRefIndex` (high-16 varies).
+
+**Safety:** the routine never reads the high bits, so on single-block input (which the callers
+verify by tracking `singleBlock` during the build scan) its output is byte-for-byte identical to a
+full sort — the high half contributes nothing to the comparison. Multi-block inputs never reach it.
+`TestRadixSortRefIndexLow16_EqualsGeneral` asserts equality against `radixSortRefIndex` across
+single-byte/multi-byte/duplicate/reverse RowIdx with both zero and non-zero constant BlockIdx.
+
+Back-ref: `internal/modules/blockio/shared/intrinsic_ref_index.go:radixSortRefIndexLow16`

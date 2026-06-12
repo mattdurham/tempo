@@ -86,24 +86,23 @@ const (
 	// Exactly one such entry is written per V14 file to identify the signal type.
 	DirEntryKindSignal uint8 = 0x02
 
-	// Preserved for backward compatibility with existing reader code during V14 migration.
-	// These will be removed once the reader/writer are fully migrated to V14.
-	VersionV13      uint8  = 13 // V13: snappy-compressed metadata, signal_type byte
-	VersionBlockV12 uint8  = 12 // V12: 24-byte block header, no per-column snappy
-	FooterV3Version uint16 = 3
-	FooterV3Size    uint   = 22
+	// ColumnEncodingVersion is the enc_version byte used by the VectorF32 encoder.
+	// VectorF32 uses enc_version=2 for historical reasons; all other column encodings use VersionBlockEncV3.
+	ColumnEncodingVersion uint8 = 2
 
-	// FileHeaderV13Size is the size in bytes of the V13 file header.
-	// Wire format: magic[4] + version[1] + metadataOffset[8] + metadataLen[8] + signalType[1] = 22 bytes.
-	FileHeaderV13Size uint = 22
+	// VersionBlockV12 is the minimum block version that uses the compact TOC entry format.
+	// Retained as a wire-format threshold constant; the V12 block format is no longer written.
+	VersionBlockV12 uint8 = 12
 
 	SignalTypeTrace uint8 = 0x01 // file contains OTEL trace spans
 	SignalTypeLog   uint8 = 0x02 // file contains OTEL log records
 
-	ColumnEncodingVersion uint8 = 2
-	CompactIndexVersion   uint8 = 1
-	TraceIndexFmtVersion  uint8 = 0x01
+	TraceIndexFmtVersion  uint8 = 0x01 // v1: block IDs + per-block span indices (legacy wire, still parsed in V8 files)
 	TraceIndexFmtVersion2 uint8 = 0x02 // v2: block IDs only — no per-block span indices
+
+	// CompactIndexVersion is the legacy compact index version (no trace ID bloom).
+	// Still encountered in V8 trace sections written before CompactIndexVersion2 was introduced.
+	CompactIndexVersion uint8 = 1
 
 	TSIndexMagic   uint32 = 0xC011FEED // per-file timestamp index section
 	TSIndexVersion uint8  = 1
@@ -136,9 +135,6 @@ const (
 
 // Intrinsic columns section constants.
 const (
-	FooterV4Version uint16 = 4
-	FooterV4Size    uint   = 34 // version[2]+headerOffset[8]+compactOffset[8]+compactLen[4]+intrinsicIndexOffset[8]+intrinsicIndexLen[4]
-
 	IntrinsicFormatVersion uint8 = 0x01 // first byte of each intrinsic column blob
 	IntrinsicFormatFlat    uint8 = 0x01 // flat array: delta-encoded uint64 or length-prefixed bytes
 	IntrinsicFormatDict    uint8 = 0x02 // dictionary (string or int64 enum columns)
@@ -177,19 +173,6 @@ const (
 	// VectorIndexMagic is the magic number for the vector index section. "VECI" in ASCII.
 	VectorIndexMagic   uint32 = 0x56454349
 	VectorIndexVersion uint8  = 0x01
-
-	// FooterV5Version extends V4 with vectorIndexOffset[8] + vectorIndexLen[4] = 12 extra bytes.
-	// V5 total: 34 (V4) + 12 = 46 bytes.
-	FooterV5Version uint16 = 5
-	FooterV5Size    uint   = 46 // version[2]+headerOffset[8]+compactOffset[8]+compactLen[4]+intrinsicOffset[8]+intrinsicLen[4]+vectorOffset[8]+vectorLen[4]
-
-	// FooterV6Version extends V5 with compactTracesOffset[8] + compactTracesLen[4] = 12 extra bytes.
-	// V6 total: 46 (V5) + 12 = 58 bytes.
-	// When compactTracesLen > 0, the compact section is split into two pieces:
-	//   - compact_offset / compact_len:        raw (uncompressed) bloom header + block table (v3 format)
-	//   - compactTracesOffset / compactTracesLen: snappy-compressed trace index
-	FooterV6Version uint16 = 6
-	FooterV6Size    uint   = 58 // version[2]+headerOffset[8]+compactOffset[8]+compactLen[4]+intrinsicOffset[8]+intrinsicLen[4]+vectorOffset[8]+vectorLen[4]+compactTracesOffset[8]+compactTracesLen[4]
 )
 
 // Paged-column TOC and compact trace index constants.

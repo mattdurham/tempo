@@ -33,58 +33,25 @@ func (r *Reader) ensureRangeColumnParsed(colName string) error {
 		return nil
 	}
 
-	// V8: fetch per-column blob directly from ToC (no monolithic range section).
-	if r.footerVersion == shared.FooterV8Version {
-		data, err := r.fetchToCSection(shared.ToCKey{
-			Type:    shared.ToCTypeMetadata,
-			SubType: shared.ToCSubTypeRange,
-			Name:    colName,
-		})
-		if err != nil {
-			return fmt.Errorf("range index V8: column %q: %w", colName, err)
-		}
-		if data == nil {
-			return fmt.Errorf("range index: column %q not found", colName)
-		}
-		_, idx, _, parseErr := parseRangeColumnBlobV8(data)
-		if parseErr != nil {
-			return fmt.Errorf("range index V8: column %q: %w", colName, parseErr)
-		}
-		if r.rangeParsed == nil {
-			r.rangeParsed = make(map[string]parsedRangeIndex)
-		}
-		r.rangeParsed[colName] = idx
-		return nil
-	}
-
-	// For V14 files, the range section bytes are loaded lazily on first access.
-	if err := r.ensureV14RangeSection(); err != nil {
-		return err
-	}
-
-	meta, ok := r.rangeOffsets[colName]
-	if !ok {
-		return fmt.Errorf("range index: column %q not found", colName)
-	}
-
-	end := meta.offset + meta.length
-	if end > len(r.metadataBytes) {
-		return fmt.Errorf(
-			"range index: column %q slice [%d:%d] out of range (metadata %d bytes)",
-			colName, meta.offset, end, len(r.metadataBytes),
-		)
-	}
-
-	entryData := r.metadataBytes[meta.offset:end]
-	_, idx, _, err := parseRangeColumnEntry(entryData, 0)
+	// Fetch per-column blob directly from ToC.
+	data, err := r.fetchToCSection(shared.ToCKey{
+		Type:    shared.ToCTypeMetadata,
+		SubType: shared.ToCSubTypeRange,
+		Name:    colName,
+	})
 	if err != nil {
 		return fmt.Errorf("range index: column %q: %w", colName, err)
 	}
-
+	if data == nil {
+		return fmt.Errorf("range index: column %q not found", colName)
+	}
+	_, idx, _, parseErr := parseRangeColumnBlobV8(data)
+	if parseErr != nil {
+		return fmt.Errorf("range index: column %q: %w", colName, parseErr)
+	}
 	if r.rangeParsed == nil {
 		r.rangeParsed = make(map[string]parsedRangeIndex)
 	}
-
 	r.rangeParsed[colName] = idx
 	return nil
 }

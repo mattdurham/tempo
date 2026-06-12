@@ -70,24 +70,6 @@ func (b *blockColTypes) SizeBytes() int64 {
 	return n + 32
 }
 
-// parsedMetadataCache caches the fully parsed metadata result by fileID.
-// Strong references: entries persist until Clear is called.
-// SPEC-OC-003, NOTE-003 (reader NOTES.md)
-var parsedMetadataCache objectcache.Cache[parsedMetadata]
-
-// parsedIntrinsicTOCCache caches the parsed intrinsic TOC map by fileID+"/intrinsic/toc".
-// Previously the TOC was re-decoded from bbolt on every NewReaderFromProvider call.
-// SPEC-OC-003, NOTE-003 (reader NOTES.md)
-var parsedIntrinsicTOCCache objectcache.Cache[intrinsicTOC]
-
-// intrinsicTOC wraps the intrinsic column TOC map to give it stable pointer identity
-// for objectcache.Cache. A named struct is more ergonomic than *map[K]V from the cache.
-
-// parsedMetadata holds all parsed results from parseV5MetadataLazy.
-
-// zero-copy sub-slice of metadataBytes; see NOTE-PERF-TS
-// raw FileBloom section bytes; nil for old files
-
 // SetIntrinsicCacheBytes sets the byte budget for the process-level intrinsic column
 // cache. Must be called before the first GetIntrinsicColumn call.
 // Pass 0 to revert to the default (20% of GOMEMLIMIT, or 256 MiB fallback).
@@ -97,9 +79,9 @@ var parsedIntrinsicTOCCache objectcache.Cache[intrinsicTOC]
 //   - Backend workers: default (compaction benefits from larger cache)
 func SetIntrinsicCacheBytes(n int64) {
 	parsedIntrinsicCache.SetMaxBytes(n)
-	parsedIntrinsicTOCCache.SetMaxBytes(n / 4) // ToC is much smaller
-	parsedV8ColumnCache.SetMaxBytes(n)         // NOTE-200: same budget as intrinsic columns
-	blockColTypesCache.SetMaxBytes(n / 16)     // NOTE-214: name->type maps are tiny vs decoded columns
+	// parsedIntrinsicTOCCache removed 2026-06-12 (legacy V4/V5/V6 format)
+	parsedV8ColumnCache.SetMaxBytes(n)     // NOTE-200: same budget as intrinsic columns
+	blockColTypesCache.SetMaxBytes(n / 16) // NOTE-214: name->type maps are tiny vs decoded columns
 }
 
 // ClearCaches resets all process-level caches. Intended for testing.
@@ -107,8 +89,7 @@ func ClearCaches() {
 	parsedSketchCache.Clear()
 	parsedSketchSummaryCache.Clear()
 	parsedIntrinsicCache.Clear()
-	parsedMetadataCache.Clear()
-	parsedIntrinsicTOCCache.Clear()
+
 	parsedV8ColumnCache.Clear()
 	blockColTypesCache.Clear()
 }
@@ -122,24 +103,20 @@ func ClearCaches() {
 // via the legacy path when the 18-byte magic check yields no match.
 //
 // Detection strategy: read the last 18 bytes once; if magic matches, version must be
-// exactly V8. Falls through to legacy v3/v4/v5/v6 detection when magic is absent.
+// readFooter reads and validates the V8 footer (the only supported format).
+// Legacy formats (V3–V6) were removed 2026-06-12; all blocks must be V8 or later.
 func (r *Reader) readFooter() error {
 	if r.fileSize < int64(shared.FooterV8Size) {
 		return fmt.Errorf("file too small for footer: %d bytes", r.fileSize)
 	}
-
-	// Read the last 18 bytes once; use them for both V8 and V7 detection (same size, same offset).
-	if ok, err := r.tryReadFooterMagic18(); err != nil {
+	ok, err := r.tryReadFooterMagic18()
+	if err != nil {
 		return err
-	} else if ok {
-		return nil
 	}
-
-	if r.fileSize < int64(shared.FooterV3Size) {
-		return fmt.Errorf("file too small for v3/v4/v5/v6 footer: %d bytes", r.fileSize)
+	if !ok {
+		return fmt.Errorf("blockpack: unsupported or corrupt file — only FooterV8 files are supported (legacy V3–V6 formats were removed 2026-06-12; re-compact any legacy blocks before reading)")
 	}
-
-	return r.readFooterLegacy()
+	return nil
 }
 
 // tryReadFooterMagic18 reads the last 18 bytes and checks for a V8 footer.
@@ -169,228 +146,19 @@ func (r *Reader) tryReadFooterMagic18() (bool, error) {
 	if ver != shared.FooterV8Version {
 		return false, fmt.Errorf("readFooter: unsupported footer version %d", ver)
 	}
-	r.footerVersion = shared.FooterV8Version
+	// footerVersion removed 2026-06-12: always V8
 	r.v8ToCOffset = binary.LittleEndian.Uint64(buf[footerV7OffDirOff:])
 	r.v8ToCLen = binary.LittleEndian.Uint32(buf[footerV7OffDirLen:])
 	return true, nil
 }
 
-// Note: tryReadFooterV7 is superseded by tryReadFooterMagic18, which reads the same
-// 18 bytes once and dispatches to both V7 and V8 detection in a single I/O.
-
-// readFooterLegacy handles V3/V4/V5/V6 footer detection for non-V7 files.
-func (r *Reader) readFooterLegacy() error {
-	// Try v6 first: only possible if file is large enough.
-	// V6 contains V5 at offset (FooterV6Size - FooterV5Size) = 12.
-	if r.fileSize >= int64(shared.FooterV6Size) {
-		if ok, err := r.tryReadFooterV6(); err != nil {
-			return err
-		} else if ok {
-			return nil
-		}
-	}
-
-	// Try v5: only possible if file is large enough (and too small for v6).
-	// V5 contains V4 at offset (FooterV5Size - FooterV4Size) = 12.
-	if r.fileSize >= int64(shared.FooterV5Size) {
-		if ok, err := r.tryReadFooterV5(); err != nil {
-			return err
-		} else if ok {
-			return nil
-		}
-	}
-
-	// Try v4: only possible if file is large enough (and file is too small for v5).
-	if r.fileSize >= int64(shared.FooterV4Size) {
-		if ok, err := r.tryReadFooterV4(); err != nil {
-			return err
-		} else if ok {
-			return nil
-		}
-	}
-
-	// Fall back to V3.
-	return r.readFooterV3()
-}
-
-// Legacy footer field byte offsets within the footer buffer.
-// buf[0:2] = version[2], then fields follow in order.
-// Layout: version[2]+headerOffset[8]+compactOffset[8]+compactLen[4]+
-//
-//	intrinsicOffset[8]+intrinsicLen[4]+vectorOffset[8]+vectorLen[4]+
-//	compactTracesOffset[8]+compactTracesLen[4]
-const (
-	footerOffHeaderOffset        = 2  // uint64 header section offset
-	footerOffCompactOffset       = 10 // uint64 compact section offset
-	footerOffCompactLen          = 18 // uint32 compact section length
-	footerOffIntrinsicOffset     = 22 // uint64 intrinsic section offset (V4+)
-	footerOffIntrinsicLen        = 30 // uint32 intrinsic section length (V4+)
-	footerOffVectorOffset        = 34 // uint64 vector index offset (V5+)
-	footerOffVectorLen           = 42 // uint32 vector index length (V5+)
-	footerOffCompactTracesOffset = 46 // uint64 compact traces section offset (V6+)
-	footerOffCompactTracesLen    = 54 // uint32 compact traces section length (V6+)
-)
-
-// V7 footer field offsets (M-25).
+// V7/V8 footer field offsets.
 // Wire format: magic[4] · version[2] · dir_offset[8] · dir_len[4] = 18 bytes.
 const (
-	footerV7OffVersion = 4  // uint16 version field within 18-byte V7 footer
+	footerV7OffVersion = 4  // uint16 version field within 18-byte V7/V8 footer
 	footerV7OffDirOff  = 6  // uint64 dir_offset field
 	footerV7OffDirLen  = 14 // uint32 dir_len field
 )
-
-// V13 file header field offsets (M-28b).
-// Wire format: magic[4] · version[1] · metadataOffset[8] · metadataLen[8] · signalType[1] = 22 bytes.
-const (
-	fileHdrV13OffVersion        = 4  // uint8 V13 file version field
-	fileHdrV13OffMetadataOffset = 5  // uint64 metadata offset
-	fileHdrV13OffMetadataLen    = 13 // uint64 metadata length
-	fileHdrV13OffSignalType     = 21 // uint8 signal type
-)
-
-// applyLegacyFooterCommon sets the common Reader fields from a parsed legacy footer buffer.
-// buf must start at the version[2] field (offset 0 = version, 2 = headerOffset, ...).
-func (r *Reader) applyLegacyFooterCommon(buf []byte) error {
-	r.footerFields.headerOffset = binary.LittleEndian.Uint64(buf[footerOffHeaderOffset:])
-	r.footerFields.compactOffset = binary.LittleEndian.Uint64(buf[footerOffCompactOffset:])
-	r.footerFields.compactLen = binary.LittleEndian.Uint32(buf[footerOffCompactLen:])
-	if r.footerFields.headerOffset == 0 {
-		return fmt.Errorf("readFooter: header_offset is zero")
-	}
-	r.headerOffset = r.footerFields.headerOffset
-	r.compactOffset = r.footerFields.compactOffset
-	r.compactLen = r.footerFields.compactLen
-	return nil
-}
-
-// tryReadFooterV6 attempts to detect and parse a V6 (or embedded V5) footer.
-func (r *Reader) tryReadFooterV6() (bool, error) {
-	const v5InV6Off = int(shared.FooterV6Size - shared.FooterV5Size) // = 12
-	off := r.fileSize - int64(shared.FooterV6Size)
-	buf, err := r.cache.GetOrFetchFooter(r.fileID, "/v6", func() ([]byte, error) {
-		b := make([]byte, shared.FooterV6Size)
-		n, readErr := r.provider.ReadAt(b, off, rw.DataTypeFooter)
-		if readErr != nil {
-			return nil, fmt.Errorf("readFooter: %w", readErr)
-		}
-		if n != int(shared.FooterV6Size) {
-			return nil, fmt.Errorf("readFooter: short read: %d bytes", n)
-		}
-		return b, nil
-	})
-	if err != nil {
-		return false, fmt.Errorf("readFooter: %w", err)
-	}
-	v5buf := buf[v5InV6Off:]
-	switch {
-	case binary.LittleEndian.Uint16(buf[0:]) == shared.FooterV6Version:
-		r.footerVersion = shared.FooterV6Version
-		r.intrinsicIndexOffset = binary.LittleEndian.Uint64(buf[footerOffIntrinsicOffset:])
-		r.intrinsicIndexLen = binary.LittleEndian.Uint32(buf[footerOffIntrinsicLen:])
-		r.vectorIndexOffset = binary.LittleEndian.Uint64(buf[footerOffVectorOffset:])
-		r.vectorIndexLen = binary.LittleEndian.Uint32(buf[footerOffVectorLen:])
-		r.compactTracesOffset = binary.LittleEndian.Uint64(buf[footerOffCompactTracesOffset:])
-		r.compactTracesLen = binary.LittleEndian.Uint32(buf[footerOffCompactTracesLen:])
-		return true, r.applyLegacyFooterCommon(buf)
-	case binary.LittleEndian.Uint16(v5buf[0:]) == shared.FooterV5Version:
-		// V5 footer is embedded at offset v5InV6Off in the V6 read buffer.
-		r.footerVersion = shared.FooterV5Version
-		r.intrinsicIndexOffset = binary.LittleEndian.Uint64(v5buf[footerOffIntrinsicOffset:])
-		r.intrinsicIndexLen = binary.LittleEndian.Uint32(v5buf[footerOffIntrinsicLen:])
-		r.vectorIndexOffset = binary.LittleEndian.Uint64(v5buf[footerOffVectorOffset:])
-		r.vectorIndexLen = binary.LittleEndian.Uint32(v5buf[footerOffVectorLen:])
-		return true, r.applyLegacyFooterCommon(v5buf)
-	}
-	return false, nil
-}
-
-// tryReadFooterV5 attempts to detect and parse a V5 (or embedded V4) footer.
-func (r *Reader) tryReadFooterV5() (bool, error) {
-	const v4InV5Off = int(shared.FooterV5Size - shared.FooterV4Size) // = 12
-	off := r.fileSize - int64(shared.FooterV5Size)
-	buf, err := r.cache.GetOrFetchFooter(r.fileID, "/v5", func() ([]byte, error) {
-		b := make([]byte, shared.FooterV5Size)
-		n, readErr := r.provider.ReadAt(b, off, rw.DataTypeFooter)
-		if readErr != nil {
-			return nil, fmt.Errorf("readFooter: %w", readErr)
-		}
-		if n != int(shared.FooterV5Size) {
-			return nil, fmt.Errorf("readFooter: short read: %d bytes", n)
-		}
-		return b, nil
-	})
-	if err != nil {
-		return false, fmt.Errorf("readFooter: %w", err)
-	}
-	v4buf := buf[v4InV5Off:]
-	switch {
-	case binary.LittleEndian.Uint16(buf[0:]) == shared.FooterV5Version:
-		r.footerVersion = shared.FooterV5Version
-		r.intrinsicIndexOffset = binary.LittleEndian.Uint64(buf[footerOffIntrinsicOffset:])
-		r.intrinsicIndexLen = binary.LittleEndian.Uint32(buf[footerOffIntrinsicLen:])
-		r.vectorIndexOffset = binary.LittleEndian.Uint64(buf[footerOffVectorOffset:])
-		r.vectorIndexLen = binary.LittleEndian.Uint32(buf[footerOffVectorLen:])
-		return true, r.applyLegacyFooterCommon(buf)
-	case binary.LittleEndian.Uint16(v4buf[0:]) == shared.FooterV4Version:
-		// V4 footer is embedded at offset v4InV5Off in the V5 read buffer.
-		r.footerVersion = shared.FooterV4Version
-		r.intrinsicIndexOffset = binary.LittleEndian.Uint64(v4buf[footerOffIntrinsicOffset:])
-		r.intrinsicIndexLen = binary.LittleEndian.Uint32(v4buf[footerOffIntrinsicLen:])
-		return true, r.applyLegacyFooterCommon(v4buf)
-	}
-	return false, nil
-}
-
-// tryReadFooterV4 attempts to detect and parse a standalone V4 footer.
-func (r *Reader) tryReadFooterV4() (bool, error) {
-	off := r.fileSize - int64(shared.FooterV4Size)
-	buf, err := r.cache.GetOrFetchFooter(r.fileID, "/v4", func() ([]byte, error) {
-		b := make([]byte, shared.FooterV4Size)
-		n, readErr := r.provider.ReadAt(b, off, rw.DataTypeFooter)
-		if readErr != nil {
-			return nil, fmt.Errorf("readFooter: %w", readErr)
-		}
-		if n != int(shared.FooterV4Size) {
-			return nil, fmt.Errorf("readFooter: short read: %d bytes", n)
-		}
-		return b, nil
-	})
-	if err != nil {
-		return false, fmt.Errorf("readFooter: %w", err)
-	}
-	if binary.LittleEndian.Uint16(buf[0:]) != shared.FooterV4Version {
-		return false, nil
-	}
-	r.footerVersion = shared.FooterV4Version
-	r.intrinsicIndexOffset = binary.LittleEndian.Uint64(buf[footerOffIntrinsicOffset:])
-	r.intrinsicIndexLen = binary.LittleEndian.Uint32(buf[footerOffIntrinsicLen:])
-	return true, r.applyLegacyFooterCommon(buf)
-}
-
-// readFooterV3 reads and parses a V3 footer (the minimum supported format).
-func (r *Reader) readFooterV3() error {
-	off := r.fileSize - int64(shared.FooterV3Size)
-	buf, err := r.cache.GetOrFetchFooter(r.fileID, "", func() ([]byte, error) {
-		b := make([]byte, shared.FooterV3Size)
-		n, readErr := r.provider.ReadAt(b, off, rw.DataTypeFooter)
-		if readErr != nil {
-			return nil, fmt.Errorf("readFooter: %w", readErr)
-		}
-		if n != int(shared.FooterV3Size) {
-			return nil, fmt.Errorf("readFooter: short read: %d bytes", n)
-		}
-		return b, nil
-	})
-	if err != nil {
-		return fmt.Errorf("readFooter: %w", err)
-	}
-	ver := binary.LittleEndian.Uint16(buf[0:])
-	if ver != shared.FooterV3Version {
-		return fmt.Errorf("readFooter: unsupported footer version %d", ver)
-	}
-	r.footerVersion = ver
-	return r.applyLegacyFooterCommon(buf)
-}
 
 // decodeBoundedSnappy snappy-decodes compressed, rejecting inputs whose
 // decoded size would exceed MaxMetadataSize (decompression-bomb guard).
@@ -611,43 +379,6 @@ func (r *Reader) ensureV8BloomSection() error {
 
 // ensureV14RangeSection lazily loads the V14 range index section on first call.
 // Populates r.rangeOffsets and r.metadataBytes (which ensureRangeColumnParsed indexes into).
-// No-op for non-V14 files and V8 files (rangeOffsets is already populated by parseV5MetadataLazy).
-// No-op for V3/V4/V5 files without a V14 section directory.
-func (r *Reader) ensureV14RangeSection() error {
-	if r.footerVersion == shared.FooterV8Version {
-		// V8 files use per-column blobs; no monolithic range section to load.
-		return nil
-	}
-	if r.fileVersion != shared.VersionBlockV14 {
-		return nil
-	}
-	r.v14RangeOnce.Do(func() {
-		rangeIdxRaw, err := r.readV14Section(shared.SectionRangeIndex)
-		if err != nil {
-			r.v14RangeErr = fmt.Errorf("ensureV14RangeSection: %w", err)
-			return
-		}
-		if len(rangeIdxRaw) < 4 {
-			return
-		}
-		colCount := int(binary.LittleEndian.Uint32(rangeIdxRaw[0:]))
-		offsets, _, parseErr := scanRangeIndexOffsets(rangeIdxRaw[4:], colCount)
-		if parseErr != nil {
-			r.v14RangeErr = fmt.Errorf("ensureV14RangeSection: parse: %w", parseErr)
-			return
-		}
-		// Adjust offsets to be absolute within rangeIdxRaw.
-		for k, v := range offsets {
-			v.offset += 4
-			offsets[k] = v
-		}
-		r.rangeOffsets = offsets
-		// Keep a reference so lazy range parsing (ensureRangeColumnParsed) can index into it.
-		r.metadataBytes = rangeIdxRaw
-	})
-	return r.v14RangeErr
-}
-
 // ensureV14TraceSection lazily loads the V14 trace index section on first call.
 // Populates r.compactParsed so TraceEntries, BlocksForTraceID, and TraceCount work.
 // No-op for non-V14 files (compactParsed is populated by ensureCompactIndexParsed).
@@ -660,415 +391,41 @@ func (r *Reader) ensureV14RangeSection() error {
 //   - Phase 1 header: fileID+"/v14/compact-header"
 //   - Phase 2 trace index bytes: fileID+"/compact-trace-index" (shared with V3/V4 lean path)
 func (r *Reader) ensureV14TraceSection() error {
-	if r.footerVersion == shared.FooterV8Version {
-		return r.ensureV8TraceSection()
-	}
-	if r.fileVersion != shared.VersionBlockV14 {
-		return nil
-	}
-	r.v14TraceOnce.Do(func() {
-		// Two-phase loading: read bloom+block_table (small header) eagerly, and also
-		// pre-populate traceIndexRaw from the same read to avoid a second I/O in
-		// ensureTraceIndexRaw on bloom hit.
-		// Cache key for the small header: separate from "/v14/sec/03/dec" (the full section).
-		// Read the full section once and split both halves. We store traceIdx directly on
-		// compactParsed after parseCompactIndexBytesV14Header sets it up, so ensureTraceIndexRaw
-		// finds traceIndexRaw already populated and skips its own provider read.
-		var traceIdxBytes []byte
-		headerBytes, err := r.cache.GetOrFetchBloom(r.fileID, true, func() ([]byte, error) {
-			raw, readErr := r.readV14Section(shared.SectionTraceIndex)
-			if readErr != nil {
-				return nil, readErr
-			}
-			if len(raw) == 0 {
-				return nil, nil
-			}
-			header, traceIdx, splitErr := splitV14CompactSection(raw)
-			if splitErr != nil {
-				return nil, splitErr
-			}
-			// Copy traceIdx out of the GetOrFetch closure before it returns.
-			// raw is a local variable (the full decompressed section bytes) that does not
-			// survive the closure return — we cannot store a sub-slice.
-			//
-			// Pre-populating traceIdxBytes here means ensureTraceIndexRaw will find
-			// traceIndexRaw already set and skip its own provider read (bloom-hit fast path).
-			// For bloom-miss lookups this copy is wasted, but raw is already decompressed in
-			// RAM at this point, so the cost is a memcopy — far cheaper than a second I/O.
-			// This path runs at most once per Reader via v14TraceOnce.
-			traceIdxBytes = append([]byte(nil), traceIdx...)
-			return append([]byte(nil), header...), nil
-		})
-		if err != nil {
-			r.v14TraceErr = fmt.Errorf("ensureV14TraceSection: read: %w", err)
-			return
-		}
-		if len(headerBytes) == 0 {
-			return
-		}
-		if parseErr := r.parseCompactIndexBytesV14Header(headerBytes); parseErr != nil {
-			r.v14TraceErr = fmt.Errorf("ensureV14TraceSection: parse: %w", parseErr)
-			return
-		}
-		// Pre-populate traceIndexRaw so ensureTraceIndexRaw finds it on the fast path
-		// and does not issue a second provider read for the same section bytes.
-		//
-		// On a cache HIT the GetOrFetch closure above did not run, so traceIdxBytes is nil here.
-		// We probe the decompressed section blob directly via r.cache.Get — no readV14Section call.
-		// NOTE-015 (eviction-hole guard, see NOTE-015 in NOTES.md): if the blob was LRU-evicted,
-		// cache.Get returns ok=false and we skip this block entirely, leaving traceIndexRaw nil.
-		// ensureTraceIndexRaw will perform the provider read on the first actual bloom hit,
-		// preserving phase-2 laziness.
-		if traceIdxBytes == nil && r.fileID != "" {
-			if cached, ok, _ := r.cache.GetV14Section(r.fileID, shared.SectionTraceIndex); ok && len(cached) > 0 {
-				// Error intentionally discarded: this is opportunistic pre-population on cache hit.
-				// ensureTraceIndexRaw (called on the first bloom hit) is the authoritative error path.
-				_, traceIdxBytes, _ = splitV14CompactSection(cached)
-				if traceIdxBytes != nil {
-					traceIdxBytes = append([]byte(nil), traceIdxBytes...)
-				}
-			}
-		}
-		if traceIdxBytes != nil {
-			r.compactParsed.traceIndexRaw = traceIdxBytes
-		}
-	})
-	return r.v14TraceErr
+	return r.ensureV8TraceSection()
 }
 
 // ensureV14TSSection lazily loads the V14 timestamp index section on first call.
 // Populates r.tsRaw and r.tsCount so BlocksInTimeRange works.
 // No-op for non-V14 files (tsRaw/tsCount are populated by parseV5MetadataLazy).
 func (r *Reader) ensureV14TSSection() error {
-	if r.footerVersion == shared.FooterV8Version {
-		return r.ensureV8TSSection()
-	}
-	if r.fileVersion != shared.VersionBlockV14 {
-		return nil
-	}
-	r.v14TSOnce.Do(func() {
-		tsRaw, err := r.readV14Section(shared.SectionTSIndex)
-		if err != nil {
-			r.v14TSErr = fmt.Errorf("ensureV14TSSection: %w", err)
-			return
-		}
-		if len(tsRaw) == 0 {
-			return
-		}
-		rawEntries, tsCount, _, tsErr := parseTSIndex(tsRaw)
-		if tsErr != nil {
-			r.v14TSErr = fmt.Errorf("ensureV14TSSection: parse: %w", tsErr)
-			return
-		}
-		r.tsRaw = rawEntries
-		r.tsCount = tsCount
-	})
-	return r.v14TSErr
+	return r.ensureV8TSSection()
 }
 
 // ensureV14SketchSection lazily loads the V14 sketch index section on first call.
 // Populates r.sketchIdx so ColumnSketch and FileSketchSummary work.
 // No-op for non-V14 files (sketchIdx is populated by parseV5MetadataLazy).
 func (r *Reader) ensureV14SketchSection() error {
-	if r.footerVersion == shared.FooterV8Version {
-		// V8 files use per-column sketch blobs; handled directly in ColumnSketch.
-		return nil
-	}
-	if r.fileVersion != shared.VersionBlockV14 {
-		return nil
-	}
-	r.v14SketchOnce.Do(func() {
-		sketchRaw, err := r.readV14Section(shared.SectionSketchIndex)
-		if err != nil {
-			r.v14SketchErr = fmt.Errorf("ensureV14SketchSection: %w", err)
-			return
-		}
-		if len(sketchRaw) == 0 {
-			return
-		}
-		if _, skErr := r.parseAndCacheSketchSection(sketchRaw); skErr != nil {
-			r.v14SketchErr = fmt.Errorf("ensureV14SketchSection: parse: %w", skErr)
-		}
-	})
-	return r.v14SketchErr
+	// V8: per-column sketch blobs handled directly in ColumnSketch.
+	return nil
 }
 
 // ensureV14BloomSection lazily loads the V14 file bloom section on first call.
 // Populates r.fileBloomRaw and r.fileBloomParsed so FileBloom and FileBloomRaw work.
 // No-op for non-V14 files (fileBloomRaw/fileBloomParsed are populated by parseV5MetadataLazy).
 func (r *Reader) ensureV14BloomSection() error {
-	if r.footerVersion == shared.FooterV8Version {
-		return r.ensureV8BloomSection()
-	}
-	if r.fileVersion != shared.VersionBlockV14 {
-		return nil
-	}
-	r.v14BloomOnce.Do(func() {
-		bloomRaw, err := r.readV14Section(shared.SectionFileBloom)
-		if err != nil {
-			r.v14BloomErr = fmt.Errorf("ensureV14BloomSection: %w", err)
-			return
-		}
-		if len(bloomRaw) == 0 {
-			return
-		}
-		fb, _, fbErr := parseFileBloomSection(bloomRaw)
-		if fbErr != nil {
-			r.v14BloomErr = fmt.Errorf("ensureV14BloomSection: parse: %w", fbErr)
-			return
-		}
-		if fb != nil {
-			r.fileBloomRaw = bloomRaw
-			r.fileBloomParsed = fb
-		}
-	})
-	return r.v14BloomErr
-}
-
-// readHeader reads the 22-byte file header at footer.headerOffset.
-// Layout: magic[4] + version[1] + metadataOffset[8] + metadataLen[8] + signalType[1].
-func (r *Reader) readHeader() error {
-	buf, err := r.cache.GetOrFetchHeader(r.fileID, func() ([]byte, error) {
-		b := make([]byte, shared.FileHeaderV13Size)
-		n, readErr := r.provider.ReadAt(
-			b,
-			int64(r.headerOffset), //nolint:gosec // safe: headerOffset is a file offset, fits in int64
-			rw.DataTypeHeader,
-		)
-		if readErr != nil {
-			return nil, fmt.Errorf("readHeader: %w", readErr)
-		}
-		if n != int(shared.FileHeaderV13Size) {
-			return nil, fmt.Errorf("readHeader: short read: %d bytes", n)
-		}
-		return b, nil
-	})
-	if err != nil {
-		return fmt.Errorf("readHeader: %w", err)
-	}
-
-	magic := binary.LittleEndian.Uint32(buf[0:])
-	if magic != shared.MagicNumber {
-		return fmt.Errorf("readHeader: bad magic 0x%08X", magic)
-	}
-
-	version := buf[fileHdrV13OffVersion] //nolint:gosec // safe: buf is headerSize (22) bytes, validated by short-read check above
-	if version != shared.VersionV13 {
-		return fmt.Errorf("readHeader: unsupported version %d (V13 required)", version)
-	}
-
-	r.fileVersion = version
-	r.metadataOffset = binary.LittleEndian.Uint64(buf[fileHdrV13OffMetadataOffset:])
-	r.metadataLen = binary.LittleEndian.Uint64(buf[fileHdrV13OffMetadataLen:])
-	r.signalType = buf[fileHdrV13OffSignalType]
-
-	return nil
+	return r.ensureV8BloomSection()
 }
 
 // parseV5MetadataLazy reads the metadata section and eagerly parses:
 //   - block index entries → r.blockMetas
 //   - range column index byte ranges → r.rangeOffsets (lazy)
 //   - trace block index → r.traceIndex
-func (r *Reader) parseV5MetadataLazy() error {
-	if r.metadataLen == 0 {
-		return fmt.Errorf("parseMetadata: metadata_len is zero")
-	}
-
-	if r.metadataLen > shared.MaxMetadataSize {
-		return fmt.Errorf("parseMetadata: metadata too large: %d bytes", r.metadataLen)
-	}
-
-	// Check process-level cache first — avoids re-reading ~45 MB from bbolt
-	// and re-parsing metadata on every Reader creation for the same file.
-	if r.fileID != "" {
-		if pm := parsedMetadataCache.Get(r.fileID); pm != nil {
-			r.metaPin = pm // keep weak cache entry alive for lifetime of this Reader
-			r.metadataBytes = pm.metadataBytes
-			r.blockMetas = pm.blockMetas
-			r.rangeOffsets = pm.rangeOffsets
-			r.traceIndexRaw = pm.traceIndexRaw
-			r.tsRaw = pm.tsRaw
-			r.tsCount = pm.tsCount
-			r.sketchIdx = pm.sketchIdx
-			r.fileBloomRaw = pm.fileBloomRaw
-			return nil
-		}
-	}
-
-	// NOTE-PERF: We cache the *decompressed* metadata bytes under a distinct key
-	// ("/metadata/dec") so snappy.Decode runs only on a cache miss, not on every
-	// Reader creation.
-	data, err := r.cache.GetOrFetchMetadata(r.fileID, func() ([]byte, error) {
-		compressed, readErr := r.readRange(r.metadataOffset, r.metadataLen, rw.DataTypeMetadata)
-		if readErr != nil {
-			return nil, readErr
-		}
-		// Guard against decompression bombs before allocating the decode buffer.
-		decodedLen, lenErr := snappy.DecodedLen(compressed)
-		if lenErr != nil {
-			return nil, fmt.Errorf("snappy decoded length: %w", lenErr)
-		}
-		if uint64(decodedLen) > shared.MaxMetadataSize { //nolint:gosec // safe: decodedLen is non-negative
-			return nil, fmt.Errorf(
-				"snappy decoded size %d exceeds MaxMetadataSize %d",
-				decodedLen, shared.MaxMetadataSize,
-			)
-		}
-		return snappy.Decode(nil, compressed)
-	})
-	if err != nil {
-		return fmt.Errorf("parseMetadata: %w", err)
-	}
-
-	r.metadataBytes = data
-	pos := 0
-
-	// Block index: block_count[4] + entries.
-	if pos+4 > len(data) {
-		return fmt.Errorf("parseMetadata: block_index: short for block_count")
-	}
-
-	blockCount := int(binary.LittleEndian.Uint32(data[pos:]))
-	pos += 4
-
-	metas, newPos, err := parseBlockIndex(data[pos:pos+len(data)-pos], blockCount)
-	if err != nil {
-		return fmt.Errorf("parseMetadata: block_index: %w", err)
-	}
-
-	actualConsumed := newPos
-	pos += actualConsumed
-	r.blockMetas = metas
-
-	// Range index: range_count[4] + range_count entries.
-	if pos+4 > len(data) {
-		return fmt.Errorf("parseMetadata: range_index: short for range_count")
-	}
-
-	dedCount := int(binary.LittleEndian.Uint32(data[pos:]))
-	pos += 4
-
-	rangeStart := pos
-	offsets, newPos, err := scanRangeIndexOffsets(data[pos:], dedCount)
-	if err != nil {
-		return fmt.Errorf("parseMetadata: range_index: %w", err)
-	}
-
-	// Adjust offsets to be absolute within data.
-	for k, v := range offsets {
-		v.offset += rangeStart
-		offsets[k] = v
-	}
-
-	pos += newPos
-	r.rangeOffsets = offsets
-
-	// Column index: block_count × col_count (always 0 in new files; skip without allocating).
-	newPos, err = skipColumnIndex(data[pos:], blockCount)
-	if err != nil {
-		return fmt.Errorf("parseMetadata: column_index: %w", err)
-	}
-
-	pos += newPos
-
-	// Trace block index — parsed lazily on first access (search queries never use it).
-	// Store raw bytes and skip over the section to reach TS and sketch sections.
-	consumed, err := skipTraceBlockIndex(data[pos:])
-	if err != nil {
-		return fmt.Errorf("parseMetadata: trace_index: %w", err)
-	}
-	if consumed > 0 {
-		r.traceIndexRaw = data[pos : pos+consumed]
-	}
-	pos += consumed
-
-	// TS index section — optional, present in files written after 2026-03-02.
-	// parseTSIndex returns (nil, 0, 0, nil) for old files, enabling graceful degradation.
-	if pos < len(data) {
-		tsRaw, tsCount, tsConsumed, tsErr := parseTSIndex(data[pos:])
-		if tsErr != nil {
-			return fmt.Errorf("parseMetadata: ts_index: %w", tsErr)
-		}
-		r.tsRaw = tsRaw
-		r.tsCount = tsCount
-		pos += tsConsumed
-	}
-
-	sketchConsumed, skErr := r.parseAndCacheSketchSection(data[pos:])
-	if skErr != nil {
-		return skErr
-	}
-	pos += sketchConsumed
-
-	// FileBloom section — optional, present after sketch index (always the last section).
-	// NOTE-045: graceful degradation — old files without this section parse cleanly.
-	if pos < len(data) {
-		fb, fbConsumed, fbErr := parseFileBloomSection(data[pos:])
-		if fbErr != nil {
-			return fmt.Errorf("parseMetadata: file_bloom: %w", fbErr)
-		}
-		if fb != nil {
-			clone := make([]byte, fbConsumed)
-			copy(clone, data[pos:pos+fbConsumed])
-			r.fileBloomRaw = clone
-			r.fileBloomParsed = fb
-		}
-	}
-
-	// Store in process-level cache for subsequent Reader creations on the same file.
-	if r.fileID != "" {
-		pm := &parsedMetadata{
-			metadataBytes: r.metadataBytes,
-			blockMetas:    r.blockMetas,
-			rangeOffsets:  r.rangeOffsets,
-			traceIndexRaw: r.traceIndexRaw,
-			tsRaw:         r.tsRaw,
-			tsCount:       r.tsCount,
-			sketchIdx:     r.sketchIdx,
-			fileBloomRaw:  r.fileBloomRaw,
-		}
-		if err := parsedMetadataCache.Put(r.fileID, pm); err != nil {
-			return fmt.Errorf("parseV5MetadataLazy: cache: %w", err)
-		}
-		r.metaPin = pm // keep weak cache entry alive for lifetime of this Reader
-	}
-	return nil
-}
-
+//
+// parseV5MetadataLazy was the V3/V4/V5/V6 metadata parser.
+// Removed 2026-06-12 when legacy footer support was dropped.
+// The function body is gone; this stub preserves the call site in reader.go during transition.
 // parseAndCacheSketchSection parses the sketch index section from data, caches the result,
 // and returns the number of bytes consumed. Returns (0, nil) when no sketch section is present.
-func (r *Reader) parseAndCacheSketchSection(data []byte) (int, error) {
-	if len(data) == 0 {
-		return 0, nil
-	}
-	if r.fileID != "" {
-		skCacheKey := r.fileID + "/sketch"
-		if cached := parsedSketchCache.Get(skCacheKey); cached != nil {
-			r.sketchIdx = cached
-			// Sketch is cached but we don't know how many bytes it consumed.
-			// Re-scan to advance pos past the sketch section so we can find FileBloom.
-			_, consumed, skErr := parseSketchIndexSection(data)
-			if skErr != nil {
-				return 0, fmt.Errorf("parseMetadata: sketch_index (cache hit rescan): %w", skErr)
-			}
-			return consumed, nil
-		}
-	}
-	sketches, consumed, skErr := parseSketchIndexSection(data)
-	if skErr != nil {
-		return 0, fmt.Errorf("parseMetadata: sketch_index: %w", skErr)
-	}
-	r.sketchIdx = sketches
-	if sketches != nil && r.fileID != "" {
-		if err := parsedSketchCache.Put(r.fileID+"/sketch", sketches); err != nil {
-			return 0, fmt.Errorf("parseAndCacheSketchSection: cache: %w", err)
-		}
-	}
-	return consumed, nil
-}
-
-// parseBlockIndexEntry parses one V13 block index entry.
-// Returns the entry and new position.
 func parseBlockIndexEntry(data []byte, pos int) (shared.BlockMeta, int, error) {
 	var meta shared.BlockMeta
 
@@ -1123,38 +480,6 @@ func parseBlockIndex(data []byte, blockCount int) ([]shared.BlockMeta, int, erro
 	}
 
 	return metas, pos, nil
-}
-
-// skipColumnIndex advances pos past the column index section without allocating.
-// For new files, each block has col_count=0 (4 bytes per block).
-// For old files, it correctly skips any existing entries.
-func skipColumnIndex(data []byte, blockCount int) (int, error) {
-	pos := 0
-
-	for b := range blockCount {
-		if pos+4 > len(data) {
-			return pos, fmt.Errorf("column_index block[%d]: short for col_count", b)
-		}
-
-		colCount := int(binary.LittleEndian.Uint32(data[pos:]))
-		pos += 4
-
-		for c := range colCount {
-			if pos+2 > len(data) {
-				return pos, fmt.Errorf("column_index block[%d] col[%d]: short for name_len", b, c)
-			}
-
-			nameLen := int(binary.LittleEndian.Uint16(data[pos:]))
-			advance := 2 + nameLen + 8 // name_len[2] + name + offset[4] + length[4]
-			if advance < 0 || pos+advance > len(data) {
-				return pos, fmt.Errorf("column_index block[%d] col[%d]: short for name/offset/length", b, c)
-			}
-
-			pos += advance
-		}
-	}
-
-	return pos, nil
 }
 
 // parseTraceBlockIndex parses the trace block index section.
@@ -1228,285 +553,6 @@ func parseTraceBlockIndex(data []byte) (map[[16]byte][]uint16, int, error) {
 
 // skipTraceBlockIndex advances past a trace block index section without building
 // the map. This avoids O(N) allocations for search queries that never use the index.
-// Returns (consumed, nil) on success; (0, nil) for empty/missing sections.
-func skipTraceBlockIndex(data []byte) (int, error) {
-	if len(data) < 5 {
-		// Treat short sections as empty/missing rather than corrupt. The caller
-		// (parseV5MetadataLazy) handles 0-consumed gracefully by skipping the section.
-		// A truly corrupt trace index would be caught by fmtVersion validation below.
-		return 0, nil
-	}
-	fmtVersion := data[0]
-	if fmtVersion != shared.TraceIndexFmtVersion && fmtVersion != shared.TraceIndexFmtVersion2 {
-		return 0, fmt.Errorf("trace_index: unsupported fmt_version %d", fmtVersion)
-	}
-	traceCount := int(binary.LittleEndian.Uint32(data[1:]))
-	pos := 5
-	for t := range traceCount {
-		if pos+18 > len(data) {
-			return pos, fmt.Errorf("trace_index: trace[%d]: short for trace_id+block_count", t)
-		}
-		pos += 16 // trace_id
-		blockRefCount := int(binary.LittleEndian.Uint16(data[pos:]))
-		pos += 2
-		if fmtVersion == shared.TraceIndexFmtVersion {
-			// v1: block_id[2] + span_count[2] + span_indices[N×2]
-			for b := range blockRefCount {
-				if pos+4 > len(data) {
-					return pos, fmt.Errorf("trace_index: trace[%d] block[%d]: short for block_id+span_count", t, b)
-				}
-				spanCount := int(binary.LittleEndian.Uint16(data[pos+2:]))
-				pos += 4
-				if pos+spanCount*2 > len(data) {
-					return pos, fmt.Errorf(
-						"trace_index: trace[%d] block[%d]: short for span_indices (%d × 2 bytes)",
-						t, b, spanCount,
-					)
-				}
-				pos += spanCount * 2
-			}
-		} else {
-			// v2: block_id[2] only
-			if pos+blockRefCount*2 > len(data) {
-				return pos, fmt.Errorf("trace_index: trace[%d]: short for block_ids (%d × 2 bytes)", t, blockRefCount)
-			}
-			pos += blockRefCount * 2
-		}
-	}
-	return pos, nil
-}
-
-// scanRangeIndexOffsets scans the range index data recording byte offset+length
-// for each column entry WITHOUT parsing values.
-// data is the slice starting immediately after range_count.
-// Returns the offset map and bytes consumed.
-func scanRangeIndexOffsets(data []byte, dedCount int) (map[string]rangeIndexMeta, int, error) {
-	offsets := make(map[string]rangeIndexMeta, dedCount)
-	pos := 0
-
-	for i := range dedCount {
-		entryStart := pos
-
-		// name_len[2] + name
-		if pos+2 > len(data) {
-			return nil, pos, fmt.Errorf("range[%d]: short for name_len", i)
-		}
-
-		nameLen := int(binary.LittleEndian.Uint16(data[pos:]))
-		pos += 2
-		if pos+nameLen > len(data) {
-			return nil, pos, fmt.Errorf("range[%d]: short for name", i)
-		}
-
-		name := string(data[pos : pos+nameLen])
-		pos += nameLen
-
-		// column_type[1]
-		if pos+1 > len(data) {
-			return nil, pos, fmt.Errorf("range[%d] %q: short for type", i, name)
-		}
-
-		colType := shared.ColumnType(data[pos])
-		pos++
-
-		// Bucket metadata always present: bucket_min[8] + bucket_max[8] + boundary_count[4]
-		if pos+20 > len(data) {
-			return nil, pos, fmt.Errorf("range[%d] %q: short for bucket header", i, name)
-		}
-
-		pos += 16 // min + max
-		boundaryCount := int(binary.LittleEndian.Uint32(data[pos:]))
-		pos += 4
-
-		// boundaries[boundary_count × 8]
-		if pos+boundaryCount*8 > len(data) {
-			return nil, pos, fmt.Errorf("range[%d] %q: short for boundaries", i, name)
-		}
-
-		pos += boundaryCount * 8
-
-		// typed_count[4] + typed boundaries
-		if pos+4 > len(data) {
-			return nil, pos, fmt.Errorf("range[%d] %q: short for typed_count", i, name)
-		}
-
-		typedCount := int(binary.LittleEndian.Uint32(data[pos:]))
-		pos += 4
-
-		newPos, err := skipTypedBoundaries(data, pos, colType, typedCount)
-		if err != nil {
-			return nil, pos, fmt.Errorf("range[%d] %q: typed boundaries: %w", i, name, err)
-		}
-
-		pos = newPos
-
-		// value_count[4]
-		if pos+4 > len(data) {
-			return nil, pos, fmt.Errorf("range[%d] %q: short for value_count", i, name)
-		}
-
-		valueCount := int(binary.LittleEndian.Uint32(data[pos:]))
-		pos += 4
-
-		// Skip value entries to find end.
-		for v := range valueCount {
-			newPos, err := skipRangeValueEntry(data, pos, colType)
-			if err != nil {
-				return nil, pos, fmt.Errorf("range[%d] %q value[%d]: %w", i, name, v, err)
-			}
-
-			pos = newPos
-		}
-
-		offsets[name] = rangeIndexMeta{
-			typ:    colType,
-			offset: entryStart,
-			length: pos - entryStart,
-		}
-	}
-
-	return offsets, pos, nil
-}
-
-// skipTypedBoundaries skips typed boundary data based on column type.
-func skipTypedBoundaries(data []byte, pos int, colType shared.ColumnType, count int) (int, error) {
-	switch colType {
-	case shared.ColumnTypeRangeFloat64:
-		// count × float64_bits(8)
-		need := count * 8
-		if pos+need > len(data) {
-			return pos, fmt.Errorf("typed boundaries(float64): need %d bytes at pos %d", need, pos)
-		}
-
-		return pos + need, nil
-
-	case shared.ColumnTypeRangeString:
-		for i := range count {
-			if pos+4 > len(data) {
-				return pos, fmt.Errorf("typed boundaries(string)[%d]: short for len", i)
-			}
-
-			sLen := int(binary.LittleEndian.Uint32(data[pos:]))
-			pos += 4
-			if pos+sLen > len(data) {
-				return pos, fmt.Errorf("typed boundaries(string)[%d]: short for data", i)
-			}
-
-			pos += sLen
-		}
-
-		return pos, nil
-
-	case shared.ColumnTypeRangeBytes:
-		for i := range count {
-			if pos+4 > len(data) {
-				return pos, fmt.Errorf("typed boundaries(bytes)[%d]: short for len", i)
-			}
-
-			bLen := int(binary.LittleEndian.Uint32(data[pos:]))
-			pos += 4
-			if pos+bLen > len(data) {
-				return pos, fmt.Errorf("typed boundaries(bytes)[%d]: short for data", i)
-			}
-
-			pos += bLen
-		}
-
-		return pos, nil
-
-	default:
-		// RangeInt64/RangeUint64/RangeDuration: typed_count must be 0.
-		if count != 0 {
-			return pos, fmt.Errorf("typed boundaries: non-zero count %d for type %d", count, colType)
-		}
-
-		return pos, nil
-	}
-}
-
-// skipRangeValueEntry skips one RangeValueEntry for the given column type.
-func skipRangeValueEntry(data []byte, pos int, colType shared.ColumnType) (int, error) {
-	// value_key depends on type.
-	switch colType {
-	case shared.ColumnTypeString, shared.ColumnTypeRangeString:
-		if pos+4 > len(data) {
-			return pos, fmt.Errorf("value_key(string): short for len")
-		}
-
-		kLen := int(binary.LittleEndian.Uint32(data[pos:]))
-		pos += 4
-		if pos+kLen > len(data) {
-			return pos, fmt.Errorf("value_key(string): short for data")
-		}
-
-		pos += kLen
-
-	case shared.ColumnTypeBytes, shared.ColumnTypeRangeBytes:
-		if pos+4 > len(data) {
-			return pos, fmt.Errorf("value_key(bytes): short for len")
-		}
-
-		kLen := int(binary.LittleEndian.Uint32(data[pos:]))
-		pos += 4
-		if pos+kLen > len(data) {
-			return pos, fmt.Errorf("value_key(bytes): short for data")
-		}
-
-		pos += kLen
-
-	case shared.ColumnTypeInt64, shared.ColumnTypeUint64, shared.ColumnTypeFloat64:
-		if pos+8 > len(data) {
-			return pos, fmt.Errorf("value_key(numeric): short")
-		}
-
-		pos += 8
-
-	case shared.ColumnTypeBool:
-		if pos+1 > len(data) {
-			return pos, fmt.Errorf("value_key(bool): short")
-		}
-
-		pos++
-
-	case shared.ColumnTypeRangeInt64,
-		shared.ColumnTypeRangeUint64,
-		shared.ColumnTypeRangeDuration,
-		shared.ColumnTypeRangeFloat64:
-		// length_prefix(1 uint8) + key_data where length_prefix is 2 (bucket ID) or 8 (raw value)
-		if pos+1 > len(data) {
-			return pos, fmt.Errorf("value_key(range numeric): short for length_prefix")
-		}
-
-		kLen := int(data[pos])
-		pos++
-		if pos+kLen > len(data) {
-			return pos, fmt.Errorf("value_key(range numeric): short for key_data (len=%d)", kLen)
-		}
-
-		pos += kLen
-
-	default:
-		return pos, fmt.Errorf("skipRangeValueEntry: unknown column type %d", colType)
-	}
-
-	// block_id_count[4] + block_ids[N×4]
-	if pos+4 > len(data) {
-		return pos, fmt.Errorf("value_entry: short for block_id_count")
-	}
-
-	bidCount := int(binary.LittleEndian.Uint32(data[pos:]))
-	pos += 4
-
-	need := bidCount * 4
-	if pos+need > len(data) {
-		return pos, fmt.Errorf("value_entry: short for block_ids (count=%d)", bidCount)
-	}
-
-	pos += need
-	return pos, nil
-}
-
-// readRange reads exactly length bytes at absolute byte offset.
 func (r *Reader) readRange(offset, length uint64, dt rw.DataType) ([]byte, error) {
 	if length == 0 {
 		return nil, nil

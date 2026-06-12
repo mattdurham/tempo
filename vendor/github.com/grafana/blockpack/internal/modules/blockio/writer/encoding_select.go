@@ -31,6 +31,29 @@ func isURLColumn(name string) bool {
 		strings.HasSuffix(name, ".target")
 }
 
+// shouldUseDeltaInt64 returns true when DeltaUint64 beats dictionary for int64.
+// The range is computed as uint64(maxVal - minVal) — unsigned subtraction on the signed
+// bit pattern, which is always correct when maxVal >= minVal (guaranteed by the builder).
+// Delegates to shouldUseDeltaEncoding with the correct unsigned range.
+func shouldUseDeltaInt64(minVal, maxVal int64, cardinality int) bool {
+	if maxVal < minVal {
+		return false
+	}
+	// uint64(maxVal - minVal) is safe: maxVal >= minVal so the signed subtraction is
+	// non-negative, and the cast preserves the exact magnitude.
+	rangeVal := uint64(maxVal - minVal) //nolint:gosec // subtraction always non-negative; cast is safe
+	switch {
+	case rangeVal <= deltaRangeThreshold16:
+		return true
+	case rangeVal <= deltaRangeThreshold32 && cardinality > deltaCardinalityThreshold:
+		return true
+	case cardinality > 2:
+		return true
+	default:
+		return false
+	}
+}
+
 // shouldUseDeltaEncoding returns true when DeltaUint64 beats dictionary for uint64.
 // Rules from NOTES §6:
 //   - range ≤ 65535 → always delta

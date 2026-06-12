@@ -21,19 +21,6 @@ import (
 	"github.com/grafana/blockpack/internal/modules/sketch"
 )
 
-const (
-	sketchSectionMagicNoCMS  = uint32(0x534B5445) // "SKTE" — bloom only, no CMS (current)
-	sketchSectionMagicBloom  = uint32(0x534B5444) // "SKTD" — bloom + CMS (skip CMS bytes)
-	sketchSectionMagicLegacy = uint32(0x534B5443) // "SKTC" — fuse variant (old, read-only)
-)
-
-// Sketch index section header field offsets (M-29).
-// Header layout: magic[4]+numBlocks[4]+numColumns[4] = 12 bytes.
-const (
-	sketchHdrNumBlocksOff  = 4 // byte offset of numBlocks uint32 field
-	sketchHdrNumColumnsOff = 8 // byte offset of numColumns uint32 field
-)
-
 // Ensure columnSketchData satisfies queryplanner.ColumnSketch at compile time.
 var _ queryplanner.ColumnSketch = (*columnSketchData)(nil)
 
@@ -225,98 +212,8 @@ func (cd *columnSketchData) FuseContains(valHash uint64) []bool {
 //   - 0x534B5444 ("SKTD"): bloom + CMS — CMS bytes skipped, bloom parsed per block.
 //   - 0x534B5443 ("SKTC"): legacy fuse-based format — fuse bytes skipped; bloom left nil
 //     so FuseContains returns true (conservative, no pruning for old blocks).
-func parseSketchIndexSection(data []byte) (*sketchIndex, int, error) {
-	if len(data) < 12 {
-		return nil, 0, nil // too short for magic+num_blocks+num_columns
-	}
-	magic := binary.LittleEndian.Uint32(data[0:])
-	isNoCMS := magic == sketchSectionMagicNoCMS
-	isBloom := magic == sketchSectionMagicBloom
-	isLegacy := magic == sketchSectionMagicLegacy
-	if !isNoCMS && !isBloom && !isLegacy {
-		return nil, 0, nil // not a sketch section — old file format, degrade gracefully
-	}
-
-	// hasCMS is true for old formats (SKTD, SKTC) that contain CMS bytes in the stream.
-	hasCMS := isBloom || isLegacy
-
-	rawBlocks := binary.LittleEndian.Uint32(data[sketchHdrNumBlocksOff:])
-	rawColumns := binary.LittleEndian.Uint32(data[sketchHdrNumColumnsOff:])
-	pos := 12
-
-	// Validate as uint32 before converting to int to avoid wrap-around on 32-bit platforms.
-	if rawBlocks > uint32(shared.MaxBlocks) || rawColumns > uint32(shared.MaxColumns) {
-		return nil, 0, fmt.Errorf(
-			"sketch index: numBlocks %d or numColumns %d exceeds limits (%d/%d)",
-			rawBlocks, rawColumns, shared.MaxBlocks, shared.MaxColumns,
-		)
-	}
-	numBlocks := int(rawBlocks)
-	numColumns := int(rawColumns)
-
-	presenceBytes := (numBlocks + 7) / 8
-
-	idx := &sketchIndex{
-		numBlocks: numBlocks,
-		columns:   make(map[string]*columnSketchData, numColumns),
-	}
-
-	for colI := range numColumns {
-		// col_name_len[2 LE] + col_name[N]
-		if pos+2 > len(data) {
-			return nil, 0, fmt.Errorf("sketch_index: col %d: too short for name_len", colI)
-		}
-		nameLen := int(binary.LittleEndian.Uint16(data[pos:]))
-		pos += 2
-		if pos+nameLen > len(data) {
-			return nil, 0, fmt.Errorf("sketch_index: col %d: name_len %d exceeds data", colI, nameLen)
-		}
-		name := string(data[pos : pos+nameLen])
-		pos += nameLen
-
-		cd := &columnSketchData{numBlocks: numBlocks}
-
-		var err error
-		var presentCount int
-		pos, presentCount, err = parseColumnPresence(data, pos, name, numBlocks, presenceBytes, cd)
-		if err != nil {
-			return nil, 0, err
-		}
-
-		pos, err = parseColumnDistinct(data, pos, name, numBlocks, cd)
-		if err != nil {
-			return nil, 0, err
-		}
-
-		pos, err = parseColumnTopK(data, pos, name, presentCount, cd)
-		if err != nil {
-			return nil, 0, err
-		}
-
-		if hasCMS {
-			pos, err = skipColumnCMS(data, pos, name, presentCount)
-			if err != nil {
-				return nil, 0, err
-			}
-		}
-
-		if isNoCMS || isBloom {
-			pos, err = parseColumnBloom(data, pos, name, presentCount, cd)
-		} else {
-			pos, err = skipColumnFuse(data, pos, name, presentCount)
-		}
-		if err != nil {
-			return nil, 0, err
-		}
-
-		idx.columns[name] = cd
-	}
-
-	return idx, pos, nil
-}
-
-// parseColumnPresence parses the presence bitset and builds presentMap.
-// Returns (newPos, presentCount, error).
+//
+// Returns nil, nil if data is empty or too short.
 func parseColumnPresence(
 	data []byte,
 	pos int,
@@ -413,42 +310,6 @@ func parseColumnTopK(data []byte, pos int, name string, presentCount int, cd *co
 // skipColumnCMS advances pos past CMS bytes without any allocation.
 // Used when reading old "SKTD" or "SKTC" files that contain CMS data.
 // Size math is done in uint64 to prevent int overflow on corrupt inputs.
-func skipColumnCMS(data []byte, pos int, name string, presentCount int) (int, error) {
-	// cms_depth[1]
-	if pos >= len(data) {
-		return pos, fmt.Errorf("sketch_index: col %q: missing cms_depth", name)
-	}
-	cmsDepth := int(data[pos])
-	pos++
-	if cmsDepth == 0 {
-		return pos, fmt.Errorf("sketch_index: col %q: invalid cms_depth=0", name)
-	}
-
-	// cms_width[2 LE]
-	if pos+2 > len(data) {
-		return pos, fmt.Errorf("sketch_index: col %q: missing cms_width", name)
-	}
-	cmsWidth := int(binary.LittleEndian.Uint16(data[pos:]))
-	pos += 2
-	if cmsWidth == 0 {
-		return pos, fmt.Errorf("sketch_index: col %q: invalid cms_width=0", name)
-	}
-
-	// Use uint64 to avoid int overflow on corrupt/large depth*width*presentCount values.
-	//nolint:gosec // G115: conversions to uint64 are intentional to prevent overflow
-	totalCMS64 := uint64(presentCount) * uint64(cmsDepth) * uint64(cmsWidth) * 2
-	remaining := uint64(len(data) - pos) //nolint:gosec // G115: len-pos is non-negative; validated above
-	if totalCMS64 > remaining {
-		return pos, fmt.Errorf("sketch_index: col %q: too short for CMS data", name)
-	}
-	pos += int(totalCMS64) //nolint:gosec // safe: validated against remaining data length above
-	return pos, nil
-}
-
-// parseColumnBloom parses bloom_size[2 LE] and per-present-block bloom_data[bloom_size].
-// Bloom data is stored as zero-copy slices into the existing metadata buffer — no allocation.
-// The Reader retains the full decompressed metadata buffer, so these slices remain valid
-// for the lifetime of the Reader.
 func parseColumnBloom(data []byte, pos int, name string, presentCount int, cd *columnSketchData) (int, error) {
 	// bloom_size[2 LE]: the fixed byte size for all blocks in this column.
 	if pos+2 > len(data) {
@@ -474,26 +335,6 @@ func parseColumnBloom(data []byte, pos int, name string, presentCount int, cd *c
 // skipColumnFuse advances pos past the legacy fuse section without storing data.
 // Used when reading old "SKTC" files; bloom is left nil so FuseContains returns true.
 // fuseLen is validated as uint32 against remaining data to prevent int overflow.
-func skipColumnFuse(data []byte, pos int, name string, presentCount int) (int, error) {
-	for pi := range presentCount {
-		if pos+4 > len(data) {
-			return pos, fmt.Errorf("sketch_index: col %q: present block %d: too short for fuse_len", name, pi)
-		}
-		fuseLen := binary.LittleEndian.Uint32(data[pos:])
-		pos += 4
-		if fuseLen > 0 {
-			if uint64(fuseLen) > uint64(len(data)-pos) { //nolint:gosec // G115: intentional promotion to uint64
-				return pos, fmt.Errorf("sketch_index: col %q: present block %d: fuse data too short", name, pi)
-			}
-			pos += int(fuseLen) //nolint:gosec // safe: validated against remaining data length above
-		}
-	}
-	return pos, nil
-}
-
-// parseOneColumnSketchBlob parses a per-column sketch blob emitted by writeOneColumnSketchBlob.
-// Wire: num_blocks[4 LE] + presence[ceil(n/8)] + distinct[n×4] + topk_k[1] + topk + bloom_size[2] + bloom.
-// Returns nil, nil if data is empty or too short.
 func parseOneColumnSketchBlob(data []byte) (*columnSketchData, error) {
 	if len(data) < 4 {
 		return nil, nil
