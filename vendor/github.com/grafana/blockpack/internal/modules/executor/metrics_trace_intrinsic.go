@@ -927,6 +927,7 @@ func scanAggColHistogramCompact( //nolint:gocyclo
 	discardStride int64,
 	fieldName string, // NOTE-143: callers pass agg.Field; used to rebuild boundaries for worker reads
 	roBoundary func(float64) int64, // NOTE-182: race-free per-row lookup for parallel workers; nil → frozen-map fallback
+	bi *boundaryIndexer, // NOTE-210: the indexer behind getBoundaryIdx/roBoundary; nil → no value-sorted pre-warm fast path
 ) error {
 	if len(sortedPKs) == 0 {
 		return nil
@@ -985,7 +986,8 @@ func scanAggColHistogramCompact( //nolint:gocyclo
 	// no per-row float64 hashing. The pre-warm below (getBoundaryIdx == bi.index) populates that
 	// table. Callers without a boundaryIndexer (the parity test) pass nil and fall back to the
 	// legacy frozen map[float64]int64 rebuilt from the closure.
-	if roBoundary == nil {
+	switch {
+	case roBoundary == nil:
 		frozen := buildFrozenBoundaryIdx(
 			col, fieldName, getBoundaryIdx, minPK, maxPK, pkBitset, rankPrefix, timeBucketByPos,
 		)
@@ -996,7 +998,15 @@ func scanAggColHistogramCompact( //nolint:gocyclo
 			}
 			return discardStride // unreachable: pre-warm visited every value the scan will reach
 		}
-	} else {
+	case bi != nil &&
+		col.Format == modules_shared.IntrinsicFormatDeltaUint64 && len(col.Uint64Values) > 0:
+		// NOTE-210: DeltaUint64 Uint64Values are value-sorted ascending, so the boundary set is
+		// exactly the boundaries spanned by [first, last]. Pre-warm directly from that range in
+		// O(numBoundaries) — no O(numRows) serial walk, no per-row filter — instead of
+		// prewarmBoundaries. See prewarmSortedAscending for the correctness argument (the recorded
+		// superset only adds zero-count boundary slots the emit step skips).
+		bi.prewarmSortedAscending(col.Uint64Values)
+	default:
 		// Serial pre-warm using getBoundaryIdx (bi.index) so bi.boundaries ends up identical to a
 		// serial run and bi.lookup sees every assigned exponent slot before any worker reads it.
 		prewarmBoundaries(col, fieldName, minPK, maxPK, pkBitset, rankPrefix, timeBucketByPos, func(v float64) {
@@ -1858,7 +1868,7 @@ func streamHistogramN1CompactFromRefs(
 	if aggCol != nil {
 		if err := scanAggColHistogramCompact(
 			ctx, aggCol, sortedPKs, timeBucketByPos, dictIdxByPos, seenByPos,
-			getBoundaryIdx, groupCountsFlat, stride1, stride2, actualStride, agg.Field, bi.lookup,
+			getBoundaryIdx, groupCountsFlat, stride1, stride2, actualStride, agg.Field, bi.lookup, bi,
 		); err != nil {
 			return err
 		}
@@ -2081,7 +2091,7 @@ func streamHistogramN1Compact(
 	seenByPos := acquireCompactBool(n)
 	defer releaseCompactBool(seenByPos)
 	if aggCol != nil {
-		if err := scanAggColHistogramCompact(ctx, aggCol, sortedPKs, timeBucketByPos, dictIdxByPos, seenByPos, getBoundaryIdx, groupCountsFlat, stride1, stride2, actualStride, agg.Field, bi.lookup); err != nil {
+		if err := scanAggColHistogramCompact(ctx, aggCol, sortedPKs, timeBucketByPos, dictIdxByPos, seenByPos, getBoundaryIdx, groupCountsFlat, stride1, stride2, actualStride, agg.Field, bi.lookup, bi); err != nil {
 			return err
 		}
 	}
@@ -5226,6 +5236,91 @@ func (bi *boundaryIndexer) record(b float64) int64 {
 	}
 	bi.boundaries = append(bi.boundaries, b)
 	return int64(len(bi.boundaries))
+}
+
+// prewarmSortedAscending populates byExp/boundaries directly from a value-sorted-ascending
+// column's value range, WITHOUT walking the column's rows.
+//
+// NOTE-210: the parallel histogram scan requires a serial pre-warm so that bi.lookup (the
+// race-free read path the workers call) sees every boundary slot already assigned and so that
+// boundaries[] (read by the emit step) is in first-encounter order (NOTE-143/182). For a
+// DeltaUint64 column that pre-warm was a full O(numRows) serial walk (prewarmBoundaries) that
+// re-ran histRefPassPos per row purely to discover which boundaries appear — duplicating the
+// per-row filter work the parallel workers then repeat (profile 2026-06-11: prewarmBoundaries
+// 1.74% + the duplicated histRefPassPos cost). But DeltaUint64 Uint64Values are sorted
+// ascending and intrinsicHistogramBoundary is monotone non-decreasing, so the set of boundaries
+// that can appear is exactly the boundaries spanned by [minVal, maxVal] — enumerable in
+// ascending order in O(numBoundaries) by stepping the binary exponent, with no row scan and no
+// per-row filter. The filtered full-walk records a SUBSET of these boundaries in the same
+// ascending order; pre-recording the full superset only assigns dense indices to a few boundaries
+// no passing row reaches. Those slots receive zero counts in groupCountsFlat and the emit step
+// skips zero-count cells (streamByRefSliceHistogramFlatEmit), so the emitted series are
+// byte-identical. record() honors the same maxStride-1 discard cap as the row walk. The result
+// is self-consistent: workers index counts via bi.lookup and emit reads boundaries[] — both off
+// the same pre-populated table.
+//
+// vals is the value-sorted-ascending Uint64Values slice; the boundary range is taken from its
+// smallest POSITIVE value (found by binary search — O(log n), not O(n)) up to its largest value.
+// index()'s own <=0 and 1e9 scaling are mirrored here so the recorded boundaries match index()
+// exactly for every value the scan will reach.
+//
+// Correctness depends on the recorded set being a SUPERSET of the boundaries the scan reaches:
+// bi.lookup returns the discard sentinel for any exponent slot left unassigned by this pre-warm,
+// so a row whose boundary was NOT pre-recorded would be wrongly discarded. Bounding the
+// enumeration by the actual [minPositive, max] value range (not an arbitrary low like 1 ns)
+// guarantees every positive value the scan reaches has its exponent slot assigned, while
+// pre-recording a few interior boundaries no passing row reaches only adds zero-count cells the
+// emit step skips.
+func (bi *boundaryIndexer) prewarmSortedAscending(vals []uint64) {
+	if len(vals) == 0 {
+		return
+	}
+	// Mirror index(): v<=0 (only u==0 for uint64) maps to the boundary-0 cell. The first value is
+	// the minimum (sorted ascending), so a leading zero means the boundary-0 cell is reachable.
+	if vals[0] == 0 {
+		bi.index(0)
+	}
+	maxVal := vals[len(vals)-1]
+	if maxVal == 0 {
+		return // all zeros: only the boundary-0 cell, already recorded above
+	}
+	// Smallest POSITIVE value = first index with vals[i] > 0 (binary search over the sorted slice).
+	firstPos := sort.Search(len(vals), func(i int) bool { return vals[i] > 0 })
+	if firstPos >= len(vals) {
+		return // no positive values (unreachable given maxVal > 0, but defensive)
+	}
+	// Decode the post-scaling exponent of the smallest positive and the largest value exactly as
+	// index() does (scale by 1e9 for duration first), then drive index() once per exponent across
+	// [loExp, hiExp] in ascending order. Iterating the exponent directly — rather than doubling a
+	// float boundary — guarantees the slot assigned here is byte-identical to the slot index()/lookup()
+	// decode for any value with that exponent (no float round-trip drift), so every value the scan
+	// reaches finds its slot assigned.
+	loV := float64(vals[firstPos])
+	hiV := float64(maxVal)
+	if bi.scaleByNano {
+		loV /= 1e9
+		hiV /= 1e9
+	}
+	if loV <= 0 || hiV <= 0 {
+		return
+	}
+	_, loExp := math.Frexp(loV)
+	_, hiExp := math.Frexp(hiV)
+	for exp := loExp; exp <= hiExp; exp++ {
+		// boundary for this exponent = 2**(exp-1) (NOTE-181/182). Feed index() a value with this
+		// exponent: for duration, multiply back by 1e9 so index()'s own /1e9 recovers it; the
+		// Frexp result is identical regardless of the 1e9 round-trip because index() decodes the
+		// exponent of the SAME float it computes here.
+		b := math.Ldexp(1, exp-1)
+		if bi.scaleByNano {
+			bi.index(b * 1e9)
+		} else {
+			bi.index(b)
+		}
+		if int64(len(bi.boundaries)) >= bi.maxStride-1 {
+			break // discard cap reached; further exponents map to the sentinel anyway
+		}
+	}
 }
 
 // lookup is the read-only counterpart of index used by parallel workers after a serial

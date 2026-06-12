@@ -5,6 +5,46 @@ This document captures the non-obvious design decisions, rationale, and invarian
 
 ---
 
+## NOTE-210: prewarmSortedAscending — data-free histogram boundary pre-warm for value-sorted columns
+*Added: 2026-06-11*
+
+**Decision:** Replace the full O(numRows) serial pre-warm walk (`prewarmBoundaries`) with a
+data-free O(numBoundaries) range enumeration (`boundaryIndexer.prewarmSortedAscending`) for
+DeltaUint64 (value-sorted-ascending) columns on the parallel histogram path
+(`scanAggColHistogramCompact`). The parallel scan needs a serial pre-warm so that `bi.lookup`
+(the race-free worker read path) finds every reachable boundary's exponent slot already assigned
+and so `bi.boundaries` is in ascending first-encounter order (NOTE-143/182). That pre-warm
+previously re-ran `histRefPassPos` for every row — duplicating the per-row pk-range/bitset/time
+filter the parallel workers then repeat — purely to discover which boundaries appear.
+
+**Rationale:** A 2026-06-11 querier CPU profile (gcx, process_cpu, 30m) attributed ~7.5% of
+querier CPU to the histogram scan, of which `prewarmBoundaries` was 1.74% self-time plus the
+duplicated `histRefPassPos` cost. DeltaUint64 `Uint64Values` are sorted ascending and
+`intrinsicHistogramBoundary` is monotone non-decreasing, so the set of boundaries the scan can
+reach is exactly the boundaries spanned by `[minPositive, max]` — enumerable by stepping the
+binary exponent with no row scan and no per-row filter. The smallest positive value is found by
+`sort.Search` (O(log n)) over the sorted slice.
+
+**Correctness:** `bi.lookup` returns the discard sentinel for any exponent slot left unassigned,
+so the pre-warm MUST record a SUPERSET of the boundaries the scan reaches — guaranteed by
+bounding the enumeration with the actual `[minPositive, max]` value range (not an arbitrary low).
+Pre-recording a few interior boundaries no passing row reaches only adds zero-count
+`groupCountsFlat` cells, which `streamByRefSliceHistogramFlatEmit` skips, so emitted series are
+byte-identical. The enumeration iterates the exponent directly (`math.Frexp` of the scaled
+endpoints, then `math.Ldexp(1, exp-1)` per exponent) rather than doubling a float, so the slot
+assigned matches `index`/`lookup`'s exponent decode with no float round-trip drift; the
+`b*1e9` round-trip for span:duration recovers the exact exponent real ns values decode to
+(verified 0 mismatches across the full ns range). `record()`'s `maxStride-1` discard cap is
+honored identically. `TestHistParallelIndexedEquivalence_DeltaUint64` (unfiltered + filtered ×
+span:duration + a plain numeric field) asserts the indexed fast path is emit-identical to the
+serial scan via a boundary-VALUE-keyed canonical projection (dense indices may differ; emitted
+cells must not). `go test -race ./executor` green, `make precommit` fully green.
+
+**Queries affected:** `histogram_over_time` over a value-sorted intrinsic column (e.g. M8 and
+duration histograms) where the parallel path fires (numItems ≥ histParallelMinItems, NumCPU > 1).
+
+---
+
 ## NOTE-182: boundaryIndexer — exponent-indexed boundary lookup, no per-row float64 hashing
 *Added: 2026-06-11*
 
