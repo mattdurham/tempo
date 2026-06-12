@@ -1537,3 +1537,25 @@ remains decodable for forward compatibility and any external producer.
 
 Back-ref: `reader/column.go:decodeXORBytesUniform,decodeInlineBytesUniform`,
           `reader/layout.go:encodingKindNames`, writer NOTE-217, SPECS §9.3.1, §9.5.1.
+
+## NOTE-218: decode per-page DeltaUint64 (kind 39)
+
+`decodeDeltaUint64Paged` (`column.go`) decodes the per-page delta variant added by writer
+NOTE-218 (SPECS §9.4.2). After the presence segment it reads `page_count[2]`, then a page index
+of `page_count × (page_first_row[4] + page_base[8] + page_bit_width[1] + page_payload_bytes[4])`,
+then the concatenated per-page payloads. Each page holds up to `deltaPageSizeReader` (1024) present
+rows; the last page holds the remainder. The per-page row count is **not** on the wire — it is
+derived from the global present-row ordering and the fixed page size, which is why
+`deltaPageSizeReader` MUST equal the writer's `deltaPageSize`. Each page's offsets are unpacked
+via `readBitsLE` (shared with kind 22) and rebased on that page's `page_base`.
+
+`page_first_row` is a redundant integrity field: the decoder validates it against the actual first
+present row of the page (computed from the presence bitset) and rejects a mismatch. `page_bit_width`
+is validated `≤ 64` and each page's payload length is bounds-checked against
+`ceil(page_rows × bit_width / 8)`. A page with `bit_width == 0` (all values equal its base) carries
+no payload bytes. There is no AllPresent variant — kind 39 always carries the presence-RLE segment
+— so `readColumnEncoding` dispatches it directly without `shared.BaseKindFor` remapping.
+
+Back-ref: `reader/column.go:decodeDeltaUint64Paged`/`deltaPageSizeReader`/`readBitsLE`,
+          `reader/layout.go:encodingKindNames`, `shared/constants.go` (kind 39),
+          writer NOTE-218, SPECS §9.4.2.

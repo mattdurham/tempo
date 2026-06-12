@@ -277,10 +277,19 @@ func (b *uint64ColumnBuilder) buildData() ([]byte, error) {
 	if b.hasVals {
 		cardinality := cheapCardinalityUint64(b.values, b.present)
 		if shouldUseDeltaEncoding(b.minVal, b.maxVal, cardinality) {
-			// NOTE-215: prefer the bit-packed delta form (kind 22) when it saves a meaningful
-			// fraction of the byte-width payload and there are enough present rows to amortize
-			// the header; otherwise fall back to the byte-width form (kind 5).
-			_, maxOffset, presentCount := deltaBaseAndMaxOffset(b.values, b.present, nRows)
+			// NOTE-218: prefer the per-page delta form (kind 39) when the column spans
+			// multiple pages and per-page bit-width adaptation saves a meaningful fraction of
+			// the column-wide bit-packed payload (bursty-then-trickle timestamps).
+			// NOTE-215: otherwise prefer the bit-packed delta form (kind 22) when it saves a
+			// meaningful fraction of the byte-width payload and there are enough present rows
+			// to amortize the header; otherwise fall back to the byte-width form (kind 5).
+			base, maxOffset, presentCount := deltaBaseAndMaxOffset(b.values, b.present, nRows)
+			if presentCount >= pagedDeltaMinPages*deltaPageSize {
+				presentValues, _ := collectPresentValues(b.values, b.present, nRows)
+				if shouldUsePagedDelta(presentValues, base, maxOffset) {
+					return encodeDeltaUint64Paged(b.values, b.present, nRows)
+				}
+			}
 			if shouldUseBitPackedDelta(maxOffset, presentCount) {
 				return encodeDeltaUint64BitPacked(b.values, b.present, nRows)
 			}

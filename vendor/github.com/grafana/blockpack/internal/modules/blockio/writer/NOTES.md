@@ -503,3 +503,50 @@ Back-ref: `shared/constants.go` (kinds 24/25/26/27/28 + AllPresent maps),
           `writer/constants.go:uniformBytesEncodingEnabled`, `writer/config.go:DisableUniformBytes`,
           `reader/column.go:decodeXORBytesUniform,decodeInlineBytesUniform`,
           SPECS §9.3.1, §9.5.1, SPEC-006, NOTE-AP-001, NOTE-007.
+
+## NOTE-218: per-page DeltaUint64 (kind 39)
+
+`encodeDeltaUint64BitPacked` (NOTE-215, kind 22) picks one column-wide `bit_width` from the
+global max offset. Real OTLP ingest is often bursty-then-trickle: a tight burst of spans (small
+offsets) followed by a sparse trickle (large offsets). One column-wide width is inflated by the
+trickle's large offsets, wasting bits on every burst offset. NOTE-218 adds
+`encodeDeltaUint64Paged` (`encoding_delta_paged.go`, kind 39): the present rows are split into
+fixed-size pages (`deltaPageSize` = 1024 present rows) and each page picks its own `page_base` +
+`page_bit_width`, so the burst pages pack narrow and only the trickle page pays the wide width.
+Wire format and selection rule: SPECS §9.4.2, SPEC-006.
+
+**Selection (`shouldUsePagedDelta`):** chosen over kind 22/5 only when the column spans at least
+`pagedDeltaMinPages` (2) pages AND the simulated per-page packed-bit sum is at least 12.5%
+(`pagedDeltaMinSavedBitFraction`) smaller than the column-wide bit-packed payload. The check runs
+**before** the NOTE-215/kind-5 decisions in `uint64ColumnBuilder.buildData`. At the default
+`defaultMaxBlockSpans = 2000` most blocks span <2 pages and stay on kind 22/5 — the win triggers
+intentionally only for larger blocks with bimodal timestamp distributions.
+
+**Why DeltaUint64 only?** Per-page width selection helps only encodings whose payload density is
+locality-sensitive. Dictionary/PrefixBytes win from a *global* dict (per-page metadata on dict
+indexes adds no skip — dict-index order ≠ value order, and the index array is already ~1 B/row).
+RLEIndexes already encodes locality; paging fragments runs. XORBytes is local by construction.
+Delta is the only kind whose `base + max_offset` is region-sensitive. This is one new kind only;
+Dictionary stays untouched.
+
+**No sparse/AllPresent variant.** The gain is the per-page width adaptation, not the presence
+layout, so kind 39 always emits the presence-RLE segment.
+
+**Page size is duplicated in the reader.** The wire format does not store per-page row counts —
+the reader (`deltaPageSizeReader`) derives page boundaries from the same fixed `deltaPageSize`.
+The two constants MUST stay in sync; changing one side corrupts decode.
+
+**Rollout flag:** `Config.DisablePagedDelta` (default false → per-page on) forces the single-page
+forms, mirroring the NOTE-215 atomic-bool pattern (`constants.go:pagedDeltaEncodingEnabled`).
+
+**Backwards compatibility:** new kind ID only; no `enc_version` bump. Old readers reject the
+unknown kind at `reader/column.go:readColumnEncoding`. Compaction is transparent — it reads
+decoded values via the reader API and re-encodes via the writer, so the new kind needs no
+compaction code.
+
+Back-ref: `shared/constants.go` (kind 39 KindDeltaUint64Paged),
+          `writer/encoding_delta_paged.go:encodeDeltaUint64Paged,shouldUsePagedDelta`,
+          `writer/column_types.go:uint64ColumnBuilder.buildData`,
+          `writer/constants.go:pagedDeltaEncodingEnabled`, `writer/config.go:DisablePagedDelta`,
+          `reader/column.go:decodeDeltaUint64Paged,deltaPageSizeReader`,
+          SPECS §9.4.2, SPEC-006, NOTE-215, NOTE-007.

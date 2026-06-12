@@ -134,6 +134,29 @@ These thresholds are deliberately conservative. At the default `defaultMaxBlockS
 `span:start` columns commonly hit a ~36-bit offset range (≈60 s window in ns), which kind 5
 rounds up to 8 bytes — exactly the case condition 1 captures. Reading is unaffected by the flag.
 
+**Per-page DeltaUint64 selection (NOTE-218):** when a uint64 column has been chosen for delta
+encoding (per `shouldUseDeltaEncoding`) and `Config.DisablePagedDelta` is false, the writer
+prefers the per-page variant (kind 39 — SPECS §9.4.2) over the single-page bit-packed (kind 22)
+or byte-width (kind 5) forms when **both** of:
+
+1. **Multi-page:** `presentCount ≥ pagedDeltaMinPages × deltaPageSize` (2 × 1024 = 2048). With
+   fewer present rows than two pages there is no per-page region to adapt, so the single-page
+   forms are kept.
+2. **Density savings:** the simulated sum of per-page packed bits (each page's
+   `bits.Len64(page_max_offset) × page_rows`) is at least `1/pagedDeltaMinSavedBitFraction`
+   (12.5%) smaller than the column-wide bit-packed payload (`bits.Len64(column_max_offset) ×
+   presentCount`). Otherwise the per-page headers (17 B/page) are not worth the saving and the
+   writer falls through to kind 22.
+
+This is the per-page generalization of the bit-packing in §9.4.1. Its win is real but
+locality-dependent: at the default `defaultMaxBlockSpans = 2000` most blocks span fewer than two
+pages and stay on kind 22/5; the per-page form triggers when blocks grow toward `MaxBlockSpans`
+and the intra-block timestamp distribution is genuinely bimodal (bursty-then-trickle). Selection
+is checked **before** the bit-packed (NOTE-215) and byte-width (kind 5) decisions in
+`uint64ColumnBuilder.buildData`. The page-size constant is duplicated in the reader
+(`deltaPageSizeReader`) because the wire format derives page boundaries from it rather than
+storing per-page row counts — the two MUST stay in sync. Reading is unaffected by the flag.
+
 **Uniform-length XOR selection (NOTE-217):** when a bytes column is chosen for XOR encoding
 (per `isIDColumn`) and `Config.DisableUniformBytes` is false, the writer prefers the uniform
 variant (kind 24, sparse 25, AllPresent 28 — SPECS §9.5.1) over the variable form (kinds 8/9/19)

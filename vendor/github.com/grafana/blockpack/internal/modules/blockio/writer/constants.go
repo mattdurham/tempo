@@ -51,6 +51,27 @@ func bitPackedDeltaEnabled() bool {
 	return bitPackedDeltaEncodingEnabled.Load()
 }
 
+// pagedDeltaEncodingEnabled is the process-level rollout toggle for the per-page DeltaUint64
+// encoding kind (NOTE-218). It defaults to true. NewWriterWithConfig sets it from
+// Config.DisablePagedDelta. Atomic for the same reason as bitPackedDeltaEncodingEnabled:
+// a deploy-level constant in practice, atomic access just removes the data race between
+// per-block encoder goroutines and a concurrent writer construction.
+var pagedDeltaEncodingEnabled atomic.Bool //nolint:gochecknoglobals // process-level rollout flag
+
+func init() { //nolint:gochecknoinits // one-time default for the rollout flag
+	pagedDeltaEncodingEnabled.Store(true)
+}
+
+// setPagedDeltaEnabled sets the process-level per-page DeltaUint64 rollout flag.
+func setPagedDeltaEnabled(v bool) {
+	pagedDeltaEncodingEnabled.Store(v)
+}
+
+// pagedDeltaEnabled reports whether per-page DeltaUint64 selection is active.
+func pagedDeltaEnabled() bool {
+	return pagedDeltaEncodingEnabled.Load()
+}
+
 // uniformBytesEncodingEnabled is the process-level rollout toggle for the uniform-length
 // XORBytes encoding kinds (NOTE-217). It defaults to true. NewWriterWithConfig sets it from
 // Config.DisableUniformBytes. Atomic for the same reason as allPresentEncodingEnabled.
@@ -105,6 +126,9 @@ const (
 	KindXORBytesUniform           = shared.KindXORBytesUniform
 	KindSparseXORBytesUniform     = shared.KindSparseXORBytesUniform
 	KindXORBytesUniformAllPresent = shared.KindXORBytesUniformAllPresent
+
+	// Per-page DeltaUint64 kind — re-exported from shared (NOTE-218).
+	KindDeltaUint64Paged = shared.KindDeltaUint64Paged
 )
 
 // Trace intrinsic column name constants — aliases to canonical definitions in shared.

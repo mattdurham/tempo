@@ -287,6 +287,8 @@ func readColumnEncoding(data []byte, spanCount int, colType shared.ColumnType, c
 		return decodeDeltaUint64(data[2:], spanCount, ctx, allPresent)
 	case shared.KindDeltaUint64BitPacked:
 		return decodeDeltaUint64BitPacked(data[2:], spanCount, allPresent)
+	case shared.KindDeltaUint64Paged:
+		return decodeDeltaUint64Paged(data[2:], spanCount)
 	case shared.KindRLEIndexes, shared.KindSparseRLEIndexes:
 		return decodeRLEIndexes(data[2:], baseKind, spanCount, colType, ctx, allPresent)
 	case shared.KindXORBytes, shared.KindSparseXORBytes:
@@ -945,6 +947,154 @@ func decodeDeltaUint64BitPacked(data []byte, spanCount int, allPresent bool) (*C
 			col.Uint64Idx[i] = uint32(dictIdx) //nolint:gosec
 			dictIdx++
 		}
+	}
+
+	return col, nil
+}
+
+// deltaPageSizeReader is the number of present rows per page in the per-page DeltaUint64
+// encoding (kind 39, NOTE-218). It MUST match the writer's deltaPageSize: the wire format does
+// not store the per-page row count (it is derived from the global page ordering), so the reader
+// reconstructs page boundaries from this constant. Changing it on only one side corrupts decode.
+const deltaPageSizeReader = 1024
+
+// decodeDeltaUint64Paged decodes kind 39 (DeltaUint64Paged, NOTE-218).
+// data starts after enc_version + kind bytes.
+//
+// Wire: span_count[4] + presence + page_count[2]
+//
+//   - page_count × (page_first_row[4] + page_base[8] + page_bit_width[1] + page_payload_bytes[4])
+//   - page_count × page_payload
+//
+// Each page holds up to deltaPageSize present rows, packed LSB-first at the page's own bit_width
+// over the page's own base. There is no AllPresent variant: the presence segment is always read.
+func decodeDeltaUint64Paged(data []byte, spanCount int) (*Column, error) {
+	col := &Column{SpanCount: spanCount}
+
+	if len(data) < 4 {
+		return nil, fmt.Errorf("delta_uint64_paged: data too short")
+	}
+
+	storedSpanCount := int(binary.LittleEndian.Uint32(data[0:]))
+	pos := 4
+
+	if storedSpanCount != spanCount {
+		return nil, fmt.Errorf("delta_uint64_paged: span_count %d != spanCount %d", storedSpanCount, spanCount)
+	}
+
+	present, newPos, presentCount, err := decodePresenceRLEFromSlice(data, pos, spanCount)
+	if err != nil {
+		return nil, fmt.Errorf("delta_uint64_paged: %w", err)
+	}
+	pos = newPos
+	col.Present = present
+
+	if pos+2 > len(data) {
+		return nil, fmt.Errorf("delta_uint64_paged: missing page_count at pos %d", pos)
+	}
+	pageCount := int(binary.LittleEndian.Uint16(data[pos:]))
+	pos += 2
+
+	// Read the page index.
+	type pageHeader struct {
+		base         uint64
+		firstRow     int
+		payloadBytes int
+		bitWidth     uint8
+	}
+	headers := make([]pageHeader, pageCount)
+	for p := range pageCount {
+		if pos+17 > len(data) {
+			return nil, fmt.Errorf("delta_uint64_paged: truncated page index at page %d", p)
+		}
+		fr := binary.LittleEndian.Uint32(data[pos:])
+		pos += 4
+		base := binary.LittleEndian.Uint64(data[pos:])
+		pos += 8
+		bw := data[pos]
+		pos++
+		pb := int(binary.LittleEndian.Uint32(data[pos:]))
+		pos += 4
+
+		if bw > 64 {
+			return nil, fmt.Errorf("delta_uint64_paged: page %d invalid bit_width %d", p, bw)
+		}
+		headers[p] = pageHeader{
+			firstRow:     int(fr),
+			base:         base,
+			bitWidth:     bw,
+			payloadBytes: pb,
+		}
+	}
+
+	col.Uint64Dict = make([]uint64, presentCount)
+	col.Uint64Idx = make([]uint32, spanCount)
+
+	// Precompute the present-row indices so each page's stored page_first_row can be validated
+	// against the actual first present row of that page (integrity check).
+	presentRowIdx := make([]int, 0, presentCount)
+	for i := range spanCount {
+		if shared.IsPresent(present, i) {
+			presentRowIdx = append(presentRowIdx, i)
+		}
+	}
+
+	// Stream each page's payload directly into the dict.
+	dictIdx := 0
+	for p := range pageCount {
+		hdr := headers[p]
+		pageRows := deltaPageSizeReader
+		remaining := presentCount - dictIdx
+		if pageRows > remaining {
+			pageRows = remaining
+		}
+
+		if pageRows > 0 && hdr.firstRow != presentRowIdx[dictIdx] {
+			return nil, fmt.Errorf(
+				"delta_uint64_paged: page %d first_row %d != actual %d",
+				p, hdr.firstRow, presentRowIdx[dictIdx],
+			)
+		}
+
+		if pos+hdr.payloadBytes > len(data) {
+			return nil, fmt.Errorf("delta_uint64_paged: page %d payload truncated", p)
+		}
+		payload := data[pos : pos+hdr.payloadBytes]
+		pos += hdr.payloadBytes
+
+		if hdr.bitWidth == 0 {
+			for i := 0; i < pageRows; i++ {
+				col.Uint64Dict[dictIdx] = hdr.base
+				dictIdx++
+			}
+			continue
+		}
+
+		need := (pageRows*int(hdr.bitWidth) + 7) / 8
+		if len(payload) < need {
+			return nil, fmt.Errorf(
+				"delta_uint64_paged: page %d offsets: need %d bytes, got %d",
+				p, need, len(payload),
+			)
+		}
+		bitPos := 0
+		for i := 0; i < pageRows; i++ {
+			off := readBitsLE(payload, bitPos, hdr.bitWidth)
+			col.Uint64Dict[dictIdx] = hdr.base + off
+			bitPos += int(hdr.bitWidth)
+			dictIdx++
+		}
+	}
+
+	if dictIdx != presentCount {
+		return nil, fmt.Errorf(
+			"delta_uint64_paged: decoded %d present values, expected %d",
+			dictIdx, presentCount,
+		)
+	}
+
+	for pi, row := range presentRowIdx {
+		col.Uint64Idx[row] = uint32(pi) //nolint:gosec
 	}
 
 	return col, nil

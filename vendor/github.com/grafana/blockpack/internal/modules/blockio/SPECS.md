@@ -674,6 +674,7 @@ determines the remainder of the wire format.
 | 26 | InlineBytesUniform | Bytes | uniform-length inline bytes (reader-only) |
 | 27 | SparseInlineBytesUniform | Bytes | as kind 26, >50% nulls (reader-only) |
 | 28 | XORBytesUniformAllPresent | Bytes | fully-present uniform-length ID columns |
+| 39 | DeltaUint64Paged | Uint64 | bursty-then-trickle timestamps spanning multiple pages |
 
 ### 9.0 AllPresent Encoding Kinds (kinds 15–21)
 
@@ -852,6 +853,58 @@ All-zero offsets (`bit_width == 0`) keep kind 5/17 (it already stores no payload
 gated by the writer flag `Config.DisableBitPackedDelta` (default: bit-packed on). New kind IDs
 are additive — `enc_version` is unchanged and old readers reject unknown kinds (NOTE-007
 precedent). Kind 23 is the AllPresent variant (§9.0): it omits the `presence_rle` segment.
+
+#### 9.4.2 Per-Page Delta Uint64 (kind 39 — NOTE-218)
+
+A per-page variant of §9.4.1 that splits the present rows into fixed-size pages (`deltaPageSize`
+= 1024 present rows each) and lets every page choose its own `page_base` + `page_bit_width`.
+This is the only locality-sensitive density win for Delta beyond §9.4.1: when a block's timestamps
+are bursty-then-trickle (a tight burst followed by a sparse trickle), a single column-wide
+`bit_width` is inflated by the trickle's large offsets, wasting bits on every burst offset. Per
+page, each region packs only the bits its local range needs.
+
+```
+span_count     uint32 LE
+presence_rle   [see §9.1]            // rle_len(4) + rle_data — always present (no AllPresent variant)
+page_count     uint16 LE
+page_index     page_count × {
+  page_first_row     uint32 LE       // row index of the first present row in this page
+  page_base          uint64 LE       // minimum present value within this page (absolute)
+  page_bit_width     uint8           // bits per offset within this page: 0 .. 64
+  page_payload_bytes uint32 LE       // ceil(page_rows * page_bit_width / 8); 0 when bit_width == 0
+}
+page_payloads  page_count × [page_payload_bytes]byte   // concatenated, in page order
+```
+
+Each page holds up to `deltaPageSize` present rows; the last page holds the remainder. The
+per-page row count is **not** stored — the reader derives it from the global present-row ordering
+and the fixed `deltaPageSize` (which the reader and writer share as a compile-time constant). Each
+page's offsets are an LSB-first bit stream identical in layout to §9.4.1, but rebased on
+`page_base`. Reconstructed value for present row j in page p = `page_base[p] + offset`.
+`page_first_row` is a redundant integrity field the reader validates against the actual first
+present row of the page. Payloads are raw (not zstd); the per-column outer snappy applies as for
+kind 5.
+
+There is **no** sparse or AllPresent variant: the gain is the per-page width adaptation, not the
+presence layout, so kind 39 always emits the `presence_rle` segment.
+
+**Selection (SPEC-006):** the writer chooses kind 39 over kind 22/5 only when **both**:
+1. the column spans at least `pagedDeltaMinPages` (2) pages of present rows — i.e.
+   `present_count ≥ 2 × deltaPageSize` — and
+2. the simulated sum of per-page packed bits is at least `1/pagedDeltaMinSavedBitFraction` (12.5%)
+   smaller than the column-wide bit-packed payload (`column_wide_bit_width × present_count`).
+
+If neither condition holds the writer falls through to kind 22 (§9.4.1) or kind 5 (§9.4).
+Selection is gated by the writer flag `Config.DisablePagedDelta` (default: per-page on). The new
+kind ID is additive — `enc_version` is unchanged and old readers reject the unknown kind at
+`readColumnEncoding` (NOTE-007 precedent).
+
+**Why DeltaUint64 only** (and not Dictionary/XOR/Prefix): per-page width selection only helps
+encodings whose payload density depends on the *local* value distribution. Dictionary and
+PrefixBytes derive their win from a *global* dict shared across all rows — paging the index array
+(already ~1 B/row) buys nothing because dict-index order ≠ value order. RLEIndexes already encodes
+locality; paging would fragment runs. XORBytes is already local by construction. Delta is the only
+kind whose `base + max_offset` is region-sensitive, so it is the only one this format pages.
 
 ### 9.5 XOR Bytes (kinds 8, 9)
 

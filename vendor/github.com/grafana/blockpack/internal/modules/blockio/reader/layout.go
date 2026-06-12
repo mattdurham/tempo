@@ -898,6 +898,9 @@ var encodingKindNames = map[uint8]string{ //nolint:gochecknoglobals
 	shared.KindInlineBytesUniform:        "InlineBytesUniform",
 	shared.KindSparseInlineBytesUniform:  "SparseInlineBytesUniform",
 	shared.KindXORBytesUniformAllPresent: "XORBytesUniformAllPresent",
+
+	// Per-page DeltaUint64 kind (NOTE-218).
+	shared.KindDeltaUint64Paged: "DeltaUint64Paged",
 }
 
 // encodingKindName maps the encoding kind byte (byte 1 of each column data blob) to its name.

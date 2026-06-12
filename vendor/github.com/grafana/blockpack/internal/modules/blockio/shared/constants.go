@@ -267,6 +267,18 @@ const (
 	KindSparseInlineBytesUniform uint8 = 27
 
 	KindXORBytesUniformAllPresent uint8 = 28
+
+	// KindDeltaUint64Paged (kind 39, NOTE-218, SPECS §9.4.2) is a per-page variant of
+	// KindDeltaUint64BitPacked. Instead of one column-wide base + bit_width, the present rows
+	// are split into fixed-size pages (deltaPageSize rows each) and each page picks its own
+	// base + bit_width. This wins on bursty-then-trickle timestamp distributions where a single
+	// column-wide bit_width is inflated by a small number of large offsets — each page packs
+	// only the bits its local range needs. There is no sparse or AllPresent variant: the gain is
+	// in the per-page width adaptation, not the presence layout.
+	//
+	// Old readers reject this unknown kind at readColumnEncoding (no enc_version bump —
+	// additive format evolution, NOTE-007 precedent).
+	KindDeltaUint64Paged uint8 = 39
 )
 
 // AllPresentKindFor maps a base dense encoding kind to its AllPresent variant. Returns
