@@ -1234,3 +1234,40 @@ yields per-row values byte-identical to the cold lazy decode.
 Back-ref: `internal/modules/blockio/reader/column.go:Column.decodeNow`,
 `Column.v8CacheKey`, `internal/modules/blockio/reader/block_parser.go:parseBlockColumnsReuse`
 (lazy-registration loop), `resetColumn`.
+
+## NOTE-208: pool the assembled columnar read buffer — 2026-06-11
+
+**Decision:** `readBlockColumnarWithCache` (SPEC-005 columnar Phase-2) builds an "assembled"
+sparse buffer with `make([]byte, bufSize)` — one per block per query, sized to span the ToC
+prefix plus the furthest wanted column's extent (often most of the block). It is the largest
+single allocation on the warm metrics block-scan path (M-queries), and a 2026-06-11 querier
+CPU profile showed heavy GC/runtime traffic (`runtime.growslice`/`roundupsize`/`wbBufFlush`/
+`findObject`, futex/scheduler churn) consistent with churning these large buffers each block.
+Prior alloc profiles also attributed the columnar assembled-buffer line as a top allocator.
+
+**Mechanism:** `assembledBufPool` (`sync.Pool` of `*[]byte`) recycles the backing arrays.
+- `acquireAssembledBuffer(n)` returns a slice of exactly length `n` from a pooled array of
+  sufficient capacity, else a fresh `make`. The returned bytes are **not zeroed**.
+- `(*Reader).ReleaseRawBuffer(buf)` returns the backing array to the pool once the block
+  parsed from it is fully consumed. Buffers larger than `assembledBufMaxPooledCap` (16 MiB)
+  are dropped so a rare oversized block cannot pin a huge array in the pool.
+- Callers: `metrics_trace.go` and `metrics_log.go` release after each block is fully scanned
+  (single-pass success, two-pass success, and predicate-reject early-exit). Other callers
+  that do not release simply let the buffer be GC'd — no correctness dependency on releasing
+  (identical contract to NOTE-153's `ReleaseLazyColumnStore`).
+
+**Safety (why a dirty reused buffer is correct):** `parseBlockColumnsReuse` reads bytes ONLY
+inside (a) the ToC prefix `[0, tocEnd)` and (b) each WANTED column's exact
+`[dataOffset, dataOffset+compressedLen)` extent — both of which `readBlockColumnarWithCache`
+fully overwrites via `copy` before returning. It never reads the gaps between columns, so
+stale bytes left there by a prior block are never observed. The original `make` zero-filled
+the gaps, but the gaps are dead — that zeroing was pure overhead.
+
+**Lifetime:** the buffer is sub-sliced zero-copy into `Column.compressedEncoding` (lazy
+decode), so it must stay live until the block is fully consumed — the same lifetime point as
+NOTE-153's lazyColumnStore. In the trace two-pass path the buffer is shared by both passes
+(`ParseBlockFromBytes(bwb.RawBytes, …)`), so release happens only after both passes complete
+and after `ReleaseLazyColumnStore` has zeroed every `compressedEncoding` reference.
+
+Back-ref: `columnar_read.go:readBlockColumnarWithCache` (assembled buffer),
+`metrics_trace.go` / `metrics_log.go` (release call sites), NOTE-153 (parallel lifetime hook).

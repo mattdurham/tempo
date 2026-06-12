@@ -130,6 +130,8 @@ func ExecuteLogMetrics(
 
 				if rowSet.Size() == 0 {
 					releaseBlockColumnProvider(provider)
+					// NOTE-208: block rejected by the predicate; recycle the read buffer.
+					r.ReleaseRawBuffer(raw)
 					continue
 				}
 
@@ -160,6 +162,8 @@ func ExecuteLogMetrics(
 					)
 				}
 				releaseBlockColumnProvider(provider)
+				// NOTE-208: block fully scanned; recycle the read buffer.
+				r.ReleaseRawBuffer(raw)
 			}
 			return nil
 		},

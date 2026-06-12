@@ -204,6 +204,9 @@ func ExecuteTraceMetrics(
 					// NOTE-153: block fully scanned (incl. any lazy span:start decode above);
 					// return the lazy-column arena to the pool.
 					bwb.Block.ReleaseLazyColumnStore()
+					// NOTE-208: the assembled read buffer is no longer referenced (all lazy
+					// column sub-slices were decoded above); recycle its backing array.
+					r.ReleaseRawBuffer(raw)
 					continue
 				}
 
@@ -227,6 +230,9 @@ func ExecuteTraceMetrics(
 				if rowSet.Size() == 0 {
 					releaseBlockColumnProvider(provider)
 					firstBlock.ReleaseLazyColumnStore()
+					// NOTE-208: block rejected by the predicate; the buffer is dead (no
+					// second pass, no row scan). Recycle its backing array.
+					r.ReleaseRawBuffer(raw)
 					continue
 				}
 
@@ -256,6 +262,9 @@ func ExecuteTraceMetrics(
 				// NOTE-153: both passes fully consumed — return their lazy-column arenas.
 				firstBlock.ReleaseLazyColumnStore()
 				bwb.Block.ReleaseLazyColumnStore()
+				// NOTE-208: both passes parsed from the same `raw` buffer are fully
+				// consumed; recycle its backing array.
+				r.ReleaseRawBuffer(raw)
 			}
 			return nil
 		},

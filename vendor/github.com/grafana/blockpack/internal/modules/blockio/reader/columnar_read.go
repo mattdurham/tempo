@@ -25,6 +25,67 @@ import (
 	"github.com/grafana/blockpack/internal/modules/rw"
 )
 
+// NOTE-208: the assembled sparse buffer (make([]byte, bufSize) in
+// readBlockColumnarWithCache) is the largest single allocation on the warm metrics
+// block-scan path — one per block per query, sized to span the ToC plus the furthest
+// wanted column (often most of the block). A querier CPU profile showed heavy GC/runtime
+// traffic (growslice/roundupsize/wbBufFlush/findObject) consistent with churning these
+// large buffers, and prior alloc profiles attributed the columnar assembled-buffer line
+// as a top allocator. This pool recycles those backing arrays across blocks.
+//
+// SAFETY (why a dirty reused buffer is correct): parseBlockColumnsReuse only reads bytes
+// inside (a) the ToC prefix [0,tocEnd) and (b) each WANTED column's exact
+// [dataOffset, dataOffset+compressedLen) extent — both of which readBlockColumnarWithCache
+// fully overwrites via copy before returning. It never reads the gaps between columns, so
+// stale bytes left there from a prior block are never observed. (The original make([]byte)
+// zero-filled the gaps; that zeroing was pure overhead — the gaps are dead.)
+//
+// LIFETIME: the buffer is returned to the caller and ParseBlockFromBytes sub-slices it
+// zero-copy into Column.compressedEncoding (lazy decode). It is therefore live until the
+// block is fully consumed — the same lifetime point as NOTE-153's lazyColumnStore. Callers
+// release it via Reader.ReleaseRawBuffer once the block (both passes, any lazy decode) is
+// done. Callers that do not release simply let the buffer be GC'd: no correctness
+// dependency on releasing (identical contract to NOTE-153).
+var assembledBufPool = sync.Pool{New: func() any { b := make([]byte, 0); return &b }} //nolint:gochecknoglobals
+
+// assembledBufMaxPooledCap caps the backing capacity retained by the pool. Buffers larger
+// than this (rare oversized blocks) are not returned to the pool, so a single huge block
+// cannot pin a large array in the pool indefinitely.
+const assembledBufMaxPooledCap = 16 << 20 // 16 MiB
+
+// acquireAssembledBuffer returns a []byte of exactly length n, drawn from the pool when a
+// backing array of sufficient capacity is available, otherwise freshly allocated. The
+// returned slice's contents are NOT zeroed — callers must overwrite every byte they read
+// (the ToC prefix and each wanted column extent); see NOTE-208 safety note.
+func acquireAssembledBuffer(n int64) []byte {
+	bp := assembledBufPool.Get().(*[]byte)
+	b := *bp
+	if int64(cap(b)) >= n {
+		*bp = b[:0] // detach the slice header from the pool handle before reuse
+		return b[:n]
+	}
+	// Pooled array too small: allocate a fresh one. The undersized handle is dropped
+	// (its backing array will be GC'd) rather than returned, avoiding pool churn.
+	return make([]byte, n)
+}
+
+// ReleaseRawBuffer returns an assembled block buffer to the pool for reuse. It is safe to
+// call with a buffer obtained from ReadGroupColumnar/ReadGroupColumnarCached once the block
+// parsed from it is fully consumed (after every row is scanned and any lazy column decode
+// has completed). Calling with nil, an empty slice, or a buffer that did not come from the
+// pool is harmless — the latter simply seeds the pool with a usable backing array. Buffers
+// whose capacity exceeds assembledBufMaxPooledCap are dropped to bound pool memory.
+//
+// NOTE-208: mirrors NOTE-153's ReleaseLazyColumnStore lifetime contract. Releasing is an
+// optimization only; never releasing leaks nothing (the buffer is GC'd as before).
+func (r *Reader) ReleaseRawBuffer(buf []byte) {
+	if cap(buf) == 0 || cap(buf) > assembledBufMaxPooledCap {
+		return
+	}
+	b := buf[:0]
+	assembledBufPool.Put(&b)
+}
+
 // tocHintBytes is the initial read size for Phase 1.
 // Covers the 24-byte block header plus column metadata for up to ~100 columns:
 //
@@ -297,7 +358,11 @@ func (r *Reader) readBlockColumnarWithCache(
 		}
 	}
 
-	assembled := make([]byte, bufSize)
+	// NOTE-208: draw the assembled buffer from a pool instead of make([]byte, bufSize).
+	// The buffer is not zeroed; the copies below fully overwrite the only regions the
+	// parser ever reads (the ToC prefix and each wanted column extent). The caller
+	// recycles it via Reader.ReleaseRawBuffer once the parsed block is fully consumed.
+	assembled := acquireAssembledBuffer(bufSize)
 	copy(assembled, toc[:min(int64(len(toc)), int64(tocEnd))]) //nolint:gosec
 
 	// Phase-2 column fetches. Each wanted column's compressed blob is cached as an
