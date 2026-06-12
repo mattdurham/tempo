@@ -389,6 +389,18 @@ func (r *Reader) readBlockColumnarWithCache(
 		if r.stashPreDecodedColumn(blockOff, m) {
 			continue
 		}
+		// NOTE-234: the column's DECODED snapshot is NOT cached (the NOTE-212 stash above
+		// failed), but its COMPRESSED blob came back from the combined ToC+columns GetMulti.
+		// Stash that blob on the Reader and let the parser decode straight from it, skipping
+		// both the copy into the assembled buffer and that column's contribution to bufSize.
+		// Previously the blob was copied into assembled[colStart:colEnd] only for the parser
+		// to sub-slice it right back out and snappy-decode — a pure warm-path memmove plus
+		// the buffer region it forced the assembled buffer to span. (length must match
+		// compressedLen exactly, the same guard the copy path used.)
+		if blob, hit := preHits[m.name]; hit && int64(len(blob)) == int64(m.compressedLen) { //nolint:gosec
+			r.stashPreCompressedColumn(blockOff, m, blob)
+			continue
+		}
 		keepCols = append(keepCols, m)
 		if colEnd > bufSize {
 			bufSize = colEnd
@@ -406,20 +418,13 @@ func (r *Reader) readBlockColumnarWithCache(
 	// independent section keyed by blockIdx/colName and written into a DISJOINT region
 	// of `assembled` (column extents never overlap).
 	//
-	// NOTE-185: columns already returned by the combined ToC+columns batch above are
-	// copied straight into their disjoint region here and excluded from `cols`, so the
-	// warm path issues NO further memcache round-trip — Phase-2 is fully satisfied by
-	// the single combined GetMulti. Only true misses fall into `cols` for resolution.
-	cols := make([]colMetaEntry, 0, len(keepCols))
-	for _, m := range keepCols {
-		colStart := int64(m.dataOffset)  //nolint:gosec
-		colLen := int64(m.compressedLen) //nolint:gosec
-		if blob, hit := preHits[m.name]; hit && int64(len(blob)) == colLen {
-			copy(assembled[colStart:colStart+colLen], blob)
-			continue
-		}
-		cols = append(cols, m)
-	}
+	// NOTE-185: columns returned by the combined ToC+columns batch above are satisfied
+	// without any further memcache round-trip. NOTE-234: such a column is now stashed in
+	// r.preCompressedColumns during the sizing pass and excluded from keepCols entirely —
+	// the parser decodes straight from the stashed blob, so no copy into the assembled
+	// buffer happens here. keepCols therefore contains only true misses, which fall into
+	// `cols` for individual resolution below.
+	cols := keepCols
 
 	// NOTE-187: lazily plan cold runs only when there is at least one cold miss to
 	// resolve. On the warm steady-state path (the production state we optimize for) the
@@ -530,6 +535,23 @@ func (r *Reader) stashPreDecodedColumn(blockOff int64, m colMetaEntry) bool {
 	r.preDecodedColumns[preDecodedKey{blockOffset: uint64(blockOff), name: m.name, colType: m.colType}] = snap //nolint:gosec
 	r.preDecodedMu.Unlock()
 	return true
+}
+
+// stashPreCompressedColumn records column m's compressed blob (from the combined
+// ToC+columns GetMulti) on the Reader so the parser can decode straight from it instead of
+// the assembled buffer (NOTE-234). blob aliases the memcache GetMulti result, which the
+// section cache owns for the Reader's lifetime; the parser copies all data out during decode,
+// so no longer-lived alias is created. The column's TRUE (name, type) keys the stash so the
+// parser's preCompressedLookup matches (the cache and parser key on type, and one block can
+// carry the same name with different types). preDecodedMu is shared with preDecodedColumns
+// because ReadGroupColumnar runs concurrently across blockGroupPipeline workers on one Reader.
+func (r *Reader) stashPreCompressedColumn(blockOff int64, m colMetaEntry, blob []byte) {
+	r.preDecodedMu.Lock()
+	if r.preCompressedColumns == nil {
+		r.preCompressedColumns = make(map[preDecodedKey][]byte)
+	}
+	r.preCompressedColumns[preDecodedKey{blockOffset: uint64(blockOff), name: m.name, colType: m.colType}] = blob //nolint:gosec
+	r.preDecodedMu.Unlock()
 }
 
 // prunePreDecodedFromFetch consults the cached per-block name->colType mapping (NOTE-214)

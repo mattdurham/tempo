@@ -806,7 +806,13 @@ func promoteToInt64Dict(col *Column) {
 	col.Uint64Idx = nil
 }
 
-func decodeDeltaUint64(data []byte, spanCount int, colType shared.ColumnType, ctx *decodeCtx, allPresent bool) (*Column, error) {
+func decodeDeltaUint64(
+	data []byte,
+	spanCount int,
+	colType shared.ColumnType,
+	ctx *decodeCtx,
+	allPresent bool,
+) (*Column, error) {
 	col := &Column{SpanCount: spanCount}
 
 	if len(data) < 4 {
@@ -905,7 +911,12 @@ func decodeDeltaUint64(data []byte, spanCount int, colType shared.ColumnType, ct
 //
 // Wire: span_count[4] + presence + base[8] + bit_width[1] + packed_len[4] + packed_offsets.
 // Offsets are an LSB-first bit stream of presentCount values, each bit_width bits wide.
-func decodeDeltaUint64BitPacked(data []byte, spanCount int, colType shared.ColumnType, allPresent bool) (*Column, error) {
+func decodeDeltaUint64BitPacked(
+	data []byte,
+	spanCount int,
+	colType shared.ColumnType,
+	allPresent bool,
+) (*Column, error) {
 	col := &Column{SpanCount: spanCount}
 
 	if len(data) < 4 {

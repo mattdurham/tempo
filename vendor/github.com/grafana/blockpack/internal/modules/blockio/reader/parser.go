@@ -114,7 +114,9 @@ func (r *Reader) readFooter() error {
 		return err
 	}
 	if !ok {
-		return fmt.Errorf("blockpack: unsupported or corrupt file — only FooterV8 files are supported (legacy V3–V6 formats were removed 2026-06-12; re-compact any legacy blocks before reading)")
+		return fmt.Errorf(
+			"blockpack: unsupported or corrupt file — only FooterV8 files are supported (legacy V3–V6 formats were removed 2026-06-12; re-compact any legacy blocks before reading)",
+		)
 	}
 	return nil
 }

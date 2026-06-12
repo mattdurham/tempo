@@ -15,6 +15,41 @@ import (
 
 // blockHeader holds the parsed block header fields.
 
+// resolveColumnData returns the (still-compressed unless inline) bytes for column m. It
+// prefers, in order: the inline blob carried in the TOC entry (NOTE-220, no outer snappy);
+// a reader-stashed compressed blob from the combined ToC+columns GetMulti whose decoded
+// snapshot was not cached (NOTE-234) — in which case the assembled buffer's extent for this
+// column was never written and must not be read; and finally the column's extent in rawBytes
+// (the assembled buffer). Callers snappy-decompress the result unless m.inlineData != nil.
+func resolveColumnData(
+	rawBytes []byte,
+	meta shared.BlockMeta,
+	m colMetaEntry,
+	preCompressedLookup func(preDecodedKey) []byte,
+) ([]byte, error) {
+	if m.inlineData != nil {
+		return m.inlineData, nil
+	}
+	if preCompressedLookup != nil {
+		if blob := preCompressedLookup(
+			preDecodedKey{blockOffset: meta.Offset, name: m.name, colType: m.colType},
+		); blob != nil {
+			return blob, nil
+		}
+	}
+	start := int(m.dataOffset) //nolint:gosec // safe: dataOffset bounded by block size < MaxBlockSize
+	end := start + int(
+		m.compressedLen,
+	) //nolint:gosec // safe: compressedLen bounded by block size < MaxBlockSize
+	if start < 0 || end > len(rawBytes) {
+		return nil, fmt.Errorf(
+			"parseBlock: col %q data offset %d len %d out of range (block %d bytes)",
+			m.name, m.dataOffset, m.compressedLen, len(rawBytes),
+		)
+	}
+	return rawBytes[start:end], nil
+}
+
 // colMetaEntry holds one parsed column metadata entry.
 
 // snappy-compressed byte length on disk
@@ -242,6 +277,7 @@ func parseBlockColumnsReuse(
 	intern map[string]string,
 	fileID string,
 	preDecodedLookup func(preDecodedKey) *Column,
+	preCompressedLookup func(preDecodedKey) []byte,
 ) (*Block, error) {
 	if intern == nil {
 		intern = make(map[string]string)
@@ -340,22 +376,11 @@ func parseBlockColumnsReuse(
 			}
 		}
 
-		var colData []byte
-		if m.inlineData != nil {
-			// NOTE-220: inline column — raw blob is stored directly in the TOC entry, no
-			// offset indirection and no outer snappy. Decode directly from inlineData.
-			colData = m.inlineData
-		} else {
-			start := int(m.dataOffset)          //nolint:gosec // safe: dataOffset bounded by block size < MaxBlockSize
-			end := start + int(m.compressedLen) //nolint:gosec // safe: compressedLen bounded by block size < MaxBlockSize
-			if start < 0 || end > len(rawBytes) {
-				return nil, fmt.Errorf(
-					"parseBlock: col %q data offset %d len %d out of range (block %d bytes)",
-					m.name, m.dataOffset, m.compressedLen, len(rawBytes),
-				)
-			}
-
-			colData = rawBytes[start:end]
+		colData, cdErr := resolveColumnData(rawBytes, meta, m, preCompressedLookup)
+		if cdErr != nil {
+			return nil, cdErr
+		}
+		if m.inlineData == nil {
 
 			// SPEC-V14-001: each column blob is snappy-compressed; decompress before decode.
 			// SPEC-ROOT-012: decompressV14ColumnData guards against decompression-bomb OOM.

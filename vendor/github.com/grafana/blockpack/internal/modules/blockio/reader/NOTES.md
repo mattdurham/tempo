@@ -1644,3 +1644,48 @@ amortized over the whole call and hoisting buys nothing.
 
 Back-ref: `reader/block.go:PresenceView`, `executor/column_provider.go:presentAt` and the
 converted stream-scan loops.
+
+## NOTE-234 — decode memcache-hit columns straight from the stashed compressed blob (skip the assembled-buffer copy)
+
+**Context:** On the warm columnar read path the combined ToC+columns GetMulti (NOTE-185)
+returns each wanted column's COMPRESSED blob from the section cache (memcache). NOTE-212/214
+already short-circuit columns whose DECODED snapshot is in the process-level
+parsedV8ColumnCache (NOTE-200): their compressed blob is neither fetched nor copied, and the
+parser serves them from the stashed live snapshot. But a column whose compressed blob is in
+the shared section cache yet whose decoded snapshot was LRU-evicted from the per-process
+decoded cache (a routine steady state — the section cache is shared/memcache, the decoded
+cache is per-pod) still fell through to the copy path: its blob was `copy()`d into the
+assembled buffer, the buffer was sized to span it, and the parser then sub-sliced the very
+same bytes back out (`rawBytes[dataOffset:...]`) to snappy-decode. The copy and the buffer
+region it forced were pure warm-path memmove/allocation volume — the standing lever in
+status.log (reduce warm-path copy/allocation, not per-row compute).
+
+**What:** `readBlockColumnarWithCache` now stashes such a column's compressed blob on the
+Reader (`preCompressedColumns`, keyed by block offset + name + type, guarded by the existing
+`preDecodedMu`) during the SINGLE sizing pass (NOTE-213), excluding it from both `keepCols`
+and `bufSize` — exactly the treatment NOTE-212/213 give pre-decoded columns. `parseBlockColumnsReuse`
+takes a new `preCompressedLookup func(preDecodedKey) []byte`; when it returns a blob for a
+column, the parser uses it directly as `colData` (then snappy-decompresses + decodes as
+usual) instead of reading the assembled buffer. The blob aliases the section-cache GetMulti
+result, which the cache owns for the Reader's lifetime (one querier call); every decoder
+copies its data out (Present bitmap, dict values, idx arrays), so no longer-lived alias is
+created. The Phase-2 keepCols loop drops its old preHits-copy branch (those columns are now
+stashed and never enter keepCols), so on the fully-section-warm path the assembled buffer
+shrinks to just the ToC prefix and no per-column memmove runs.
+
+**Correctness:** identical to NOTE-212's argument. A stashed column's assembled-buffer extent
+is never written nor read, so the buffer need not span it; the parser consumes the live blob
+without a re-probe (no eviction race). The length guard (`len(blob) == compressedLen`) mirrors
+the old copy path. Verified by `TestReader_PreCompressedColumns_DecodeFromStashedBlob`: stash
+each column's real compressed blob, corrupt every assembled-buffer byte past the ToC prefix,
+and assert the parse still returns the cold ground-truth values — proving the stashed extents
+are never read from the buffer. Cold reads are unaffected: on a cold block the section cache
+misses, so preHits is empty, nothing is stashed, and keepCols/buffer are byte-for-byte the
+pre-NOTE-234 path.
+
+**Queries affected:** every warm metrics/search query whose wanted columns are section-cache-warm
+but decoded-cache-cold — the common state after process-cache eviction on a busy querier.
+
+Back-ref: `reader/columnar_read.go:readBlockColumnarWithCache,stashPreCompressedColumn`,
+`reader/reader.go:preCompressedLookup`, `reader/block_parser.go:parseBlockColumnsReuse`,
+field `reader/reader.go:Reader.preCompressedColumns`.
