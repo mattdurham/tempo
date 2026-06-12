@@ -174,6 +174,43 @@ func radixSortRefIndex(idx []RefIndexEntry) {
 	}
 }
 
+// scatterDictRefIndexDense sorts idx in place assuming it is a single-block dense RowIdx
+// permutation: every entry's Packed key shares the same high-16 BlockIdx and the low-16
+// RowIdx values are exactly the contiguous range [minRow, minRow+len(idx)). It scatters each
+// element into its rank slot (rowIdx-minRow) of a pooled scratch buffer, then copies the
+// sorted result back into idx. Density is verified while scattering: a slot is claimed at
+// most once (collision => not a permutation) and every rank must fall in range; if either
+// invariant is violated the function reports false WITHOUT mutating idx so the caller can
+// fall back to the general radix sort. The pooled buffer is the same non-zeroed scratch used
+// by radixSortRefIndex (NOTE-192); we mark claimed slots with a sentinel Pos so a stale
+// buffer cannot be mistaken for a written slot. NOTE-226.
+func scatterDictRefIndexDense(idx []RefIndexEntry, minRow uint32) bool {
+	n := len(idx)
+	if n < 2 {
+		return true
+	}
+	bufPtr := getRadixBuf(n)
+	buf := *bufPtr
+	const unclaimed = int32(-1)
+	for i := range buf {
+		buf[i].Pos = unclaimed
+	}
+	ok := true
+	for i := range idx {
+		rank := int((idx[i].Packed & 0xFFFF) - minRow)
+		if rank < 0 || rank >= n || buf[rank].Pos != unclaimed {
+			ok = false
+			break
+		}
+		buf[rank] = idx[i]
+	}
+	if ok {
+		copy(idx, buf)
+	}
+	putRadixBuf(bufPtr)
+	return ok
+}
+
 // EnsureRefIndex builds a sorted-by-packed-ref lookup index into this column, enabling
 // O(log N) reverse lookup via the typed accessor methods. Safe to call concurrently —
 // the index is built at most once (sync.Once). No-op if already built or col is nil.
@@ -223,8 +260,24 @@ func (col *IntrinsicColumn) EnsureRefIndex() {
 			// so the concatenation is rarely globally sorted — the check is a cheap O(N)
 			// scan that costs one comparison per entry and only skips the sort when it is
 			// genuinely already ordered (e.g. single-value dict columns).
+			//
+			// NOTE-226: dense single-block scatter sort. The dominant decode case is a single
+			// block (query-frontend shards to 1 block per querier call), so every ref shares
+			// the same BlockIdx and the Packed key differs only in the low-16 RowIdx. A dict
+			// column assigns each present row exactly one entry, so the RowIdx values across
+			// all entries form a permutation; when the column is fully present they are the
+			// dense range [minRow, maxRow] with total == maxRow-minRow+1. In that case the
+			// sorted index is a pure rank scatter — idx[rowIdx-minRow] = {Packed, entryIdx} —
+			// which is O(N) with no histograms, no double buffer, and no comparison passes,
+			// replacing radixSortRefIndex (the single largest blockpack self-time frame,
+			// ~2.88%, profile 2026-06-12) on the hot path. We detect eligibility (single block
+			// + dense permutation) during the build scan and only scatter when proven dense;
+			// any high-16 variation, out-of-range row, gap, or duplicate falls back to the
+			// general append + radix path, so the output is byte-for-byte identical.
 			sorted := true
+			singleBlock := true
 			var prev uint32
+			var hi16, minRow, maxRow uint32
 			first := true
 			for entryIdx, entry := range col.DictEntries {
 				for _, ref := range entry.BlockRefs {
@@ -233,14 +286,39 @@ func (col *IntrinsicColumn) EnsureRefIndex() {
 						Packed: p,
 						Pos:    int32(entryIdx), //nolint:gosec
 					})
-					if !first && p < prev {
-						sorted = false
+					if first {
+						hi16 = p >> 16
+						minRow = p & 0xFFFF
+						maxRow = minRow
+					} else {
+						if p < prev {
+							sorted = false
+						}
+						if p>>16 != hi16 {
+							singleBlock = false
+						}
+						if r := p & 0xFFFF; r < minRow {
+							minRow = r
+						} else if r > maxRow {
+							maxRow = r
+						}
 					}
 					prev = p
 					first = false
 				}
 			}
-			if !sorted {
+			switch {
+			case sorted:
+				// already globally ordered (e.g. single-value dict columns)
+			case singleBlock && uint32(total) == maxRow-minRow+1:
+				// NOTE-226: dense single-block permutation — scatter by RowIdx rank into a
+				// fresh buffer. scatterDictRefIndexDense verifies density (no gap/dup) as it
+				// writes; if the permutation is not actually dense it returns false and we
+				// fall back to radixSortRefIndex on the original append order.
+				if !scatterDictRefIndexDense(idx, minRow) {
+					radixSortRefIndex(idx)
+				}
+			default:
 				radixSortRefIndex(idx)
 			}
 			col.refIndex = idx

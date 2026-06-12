@@ -1049,3 +1049,36 @@ ranges; microbench (`BenchmarkRadixSortRefIndex`) shows full32bit ~441µs→~328
 the 16-bit case flat.
 
 Back-ref: `internal/modules/blockio/shared/intrinsic_ref_index.go:radixSortRefIndex`
+
+---
+
+## NOTE-226: EnsureRefIndex dict path — dense single-block rank scatter
+*Added: 2026-06-12*
+
+The dict-format branch of `EnsureRefIndex` concatenates every dict entry's `BlockRefs` into one
+index then `radixSortRefIndex`es it by Packed key (`BlockIdx<<16 | RowIdx`). A querier CPU profile
+(2026-06-12) showed `radixSortRefIndex` as the single largest blockpack-attributable self-time
+frame (~2.88%), reached almost entirely from this dict build (interleaved multi-value dict columns
+are never globally ordered, so the NOTE-168 sorted check rarely fires).
+
+**Optimization:** the dominant decode case is a *single block* — query-frontend shards to one block
+per querier call, so every ref shares the same high-16 `BlockIdx`. A dict column assigns each
+*present* row exactly one entry, so the low-16 `RowIdx` values across all entries form a
+permutation; when the column is fully present that permutation is the **dense** contiguous range
+`[minRow, maxRow]` with `total == maxRow-minRow+1`. For a dense single-block permutation the sorted
+index is a pure **rank scatter**: `out[rowIdx-minRow] = {Packed, entryIdx}`, an O(N) single pass
+with no histograms, no prefix sums, no multi-pass double-buffering — strictly cheaper than the LSD
+radix sort.
+
+**Eligibility & safety:** the build scan now also tracks `singleBlock` (all Packed share the same
+high-16), `minRow`, `maxRow`. We take the scatter path only when `singleBlock && total ==
+maxRow-minRow+1`. `scatterDictRefIndexDense` then *verifies density while scattering*: it claims
+each rank slot at most once (a collision => duplicate RowIdx => not a permutation) and requires
+every rank in `[0,n)`; on any violation it returns false WITHOUT mutating `idx`, and the caller
+falls back to `radixSortRefIndex` on the original append order. So sparse/optional columns,
+multi-block merges, and any non-dense layout are byte-for-byte identical to the prior behavior.
+The scratch buffer is the same pooled non-zeroed scratch as `radixSortRefIndex` (NOTE-192);
+because it is reused we stamp every slot's `Pos` with an `unclaimed` sentinel (`-1`, never a valid
+`entryIdx`) before scattering so a stale buffer cannot be mistaken for a written slot.
+
+Back-ref: `internal/modules/blockio/shared/intrinsic_ref_index.go:scatterDictRefIndexDense`
