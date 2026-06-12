@@ -1018,3 +1018,34 @@ parallel sub-slice path, and dict ref reconstruction; `go test -race ./blockio/s
 
 Back-ref: `internal/modules/blockio/shared/intrinsic_codec.go:appendVariableWidthRefs`,
 `internal/modules/blockio/shared/intrinsic_codec.go:decodeDictPagesArena`
+
+## NOTE-205: radixSortRefIndex — fuse each pass's count scan into the prior pass's scatter
+
+**Problem:** The LSD radix sort in `radixSortRefIndex` read every element of `idx` more times than
+necessary. The classic loop ran one O(N) scan to OR all keys (for the NOTE-190 byte-skip bound),
+then per byte pass ran a *second* O(N) count scan to build that pass's histogram, then the
+unavoidable O(N) scatter scan. Total source reads: `(2·passes+1)·N`. On the unsorted dict/merge
+fallback path `radixSortRefIndex` was ~2.35% of querier self-time (profile 2026-06-11).
+
+**Fix:** "Look-ahead histograms." The scatter of pass `k` already reads every `src[i].Packed`, so
+it tallies pass `k+1`'s histogram in the same scan. The only standalone count scan is the first one,
+which doubles as the OR scan (it tallies the lowest byte's histogram while ORing all keys). Source
+reads drop from `(2·passes+1)·N` to `(passes+1)·N`. Crucially the look-ahead only computes
+histograms for passes that will actually run (bounded by `maxByte` from the NOTE-190 byte-skip), so
+the dominant 2-pass (16-bit key) case never pays to tally a byte it won't use — an earlier variant
+that eagerly tallied all four byte histograms in the OR scan regressed the 16-bit case and was
+rejected by microbench before this form was chosen.
+
+**Why correct:** Purely a reorganization of *when* the counts are tallied. The prefix-sum, scatter
+order, pass count, byte-skip (NOTE-190), and odd-pass copy-back (NOTE-192 pooled buffer) are
+unchanged. The histogram for byte `b+1` tallied during pass `b`'s scatter counts
+`(src[i].Packed>>(8(b+1)))&0xFF` over the elements being scattered; since the scatter only permutes
+elements (never alters `Packed`), that multiset is identical to the elements pass `b+1` will read,
+so the tally equals what the old standalone count scan would have produced. Intermediate all-zero
+bytes still run as degenerate identity passes exactly as before (the loop steps `b` consecutively
+0..maxByte). Output is byte-for-byte identical to the prior form and to `slices.SortFunc`. The
+existing equivalence + byte-skip + edge-case suites verify this across 1–4 significant-byte key
+ranges; microbench (`BenchmarkRadixSortRefIndex`) shows full32bit ~441µs→~328µs (~26% faster) with
+the 16-bit case flat.
+
+Back-ref: `internal/modules/blockio/shared/intrinsic_ref_index.go:radixSortRefIndex`

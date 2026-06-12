@@ -80,31 +80,51 @@ func putRadixBuf(bp *[]RefIndexEntry) {
 // byte-skip — purely a function of the data's value range, not of any particular column or
 // query shape. The buffer parity is handled below: when an odd number of passes ran, the
 // sorted data is in buf and is copied back into idx so the result always lands in idx.
+//
+// NOTE-205: fuse each pass's count scan into the prior pass's scatter scan ("look-ahead
+// histograms"), so the only standalone count scan is the first one (which doubles as the
+// NOTE-190 OR scan). The classic LSD loop read N elements (2·passes+1) times: one OR scan
+// plus one count scan and one scatter scan per pass. The scatter of pass k already reads every
+// src[i].Packed, so it can tally pass k+1's histogram for free in the same pass. That removes
+// the standalone count scan from passes 2..P, cutting source reads from (2·passes+1)·N to
+// (passes+1)·N. Critically the work is bounded by the *actual* number of significant passes
+// (NOTE-190 byte-skip), so the dominant 2-pass (16-bit key) case never pays to tally bytes it
+// won't use — only histograms for passes that will run are computed. radixSortRefIndex was
+// ~2.35% of querier self-time on the unsorted dict/merge fallback path (profile 2026-06-11).
+// Purely a reorganization of when counts are tallied; the prefix-sum, scatter order, pass
+// count, and odd-pass copy-back are unchanged, so output is byte-for-byte identical.
 func radixSortRefIndex(idx []RefIndexEntry) {
 	const radixBits = 8
 	const radixSize = 1 << radixBits
 	const radixMask = radixSize - 1
+	const numBytes = 32 / radixBits
 	n := len(idx)
 	if n < 2 {
 		return
 	}
-	// One O(N) scan to find the OR of all keys; its highest set bit bounds how many byte
-	// passes are actually significant. Leading zero bytes are skipped (identity passes).
+
+	// Pass 1's count scan doubles as the OR scan: it tallies the lowest byte's histogram while
+	// ORing all keys to learn the highest significant byte (NOTE-190 byte-skip bound).
 	var keyOr uint32
+	var hist [numBytes][radixSize]int
 	for i := range idx {
-		keyOr |= idx[i].Packed
+		k := idx[i].Packed
+		keyOr |= k
+		hist[0][k&radixMask]++
 	}
-	// maxShift is the start shift of the highest non-zero byte. keyOr==0 means all keys are
-	// equal to 0; the slice is already trivially sorted, so no passes are needed.
+	// keyOr==0 means all keys are 0; the slice is already trivially sorted, no passes needed.
+	if keyOr == 0 {
+		return
+	}
+	// maxShift is the start shift of the highest non-zero byte. Passes run at byte positions
+	// 0..maxByte; histograms for higher (all-zero) bytes are never computed or consumed.
 	maxShift := 0
 	for s := 0; s < 32; s += radixBits {
 		if (keyOr>>s)&radixMask != 0 {
 			maxShift = s
 		}
 	}
-	if keyOr == 0 {
-		return
-	}
+	maxByte := maxShift / radixBits
 
 	// NOTE-192: pooled, non-zeroed scratch double-buffer. The first radix pass overwrites
 	// every slot before any read, so the buffer's prior contents are irrelevant.
@@ -113,25 +133,36 @@ func radixSortRefIndex(idx []RefIndexEntry) {
 	buf := *bufPtr
 	src, dst := idx, buf
 	passes := 0
-	var counts [radixSize]int
-	for shift := 0; shift <= maxShift; shift += radixBits {
-		for i := range counts {
-			counts[i] = 0
-		}
-		for i := range src {
-			counts[(src[i].Packed>>shift)&radixMask]++
-		}
-		// Prefix sum: counts[b] becomes the start offset of bucket b in dst.
+	for b := 0; b <= maxByte; b++ {
+		shift := b * radixBits
+		counts := &hist[b]
+		// Prefix sum: counts[c] becomes the start offset of bucket c in dst.
 		sum := 0
-		for b := range counts {
-			c := counts[b]
-			counts[b] = sum
-			sum += c
+		for c := range counts {
+			cnt := counts[c]
+			counts[c] = sum
+			sum += cnt
 		}
-		for i := range src {
-			b := (src[i].Packed >> shift) & radixMask
-			dst[counts[b]] = src[i]
-			counts[b]++
+		// Scatter into dst by this byte. When a further pass follows, tally its histogram in
+		// the same scan (look-ahead) so it needs no standalone count pass. maxByte < numBytes
+		// always (it derives from a byte position within the 32-bit key), so b < maxByte gives
+		// b+1 < numBytes; the explicit numBytes guard makes the array bound statically provable.
+		if b < maxByte && b+1 < numBytes {
+			next := &hist[b+1] //nolint:gosec // b+1<numBytes guarded above; bound is static
+			nextShift := shift + radixBits
+			for i := range src {
+				k := src[i].Packed
+				bucket := (k >> shift) & radixMask
+				dst[counts[bucket]] = src[i]
+				counts[bucket]++
+				next[(k>>nextShift)&radixMask]++
+			}
+		} else {
+			for i := range src {
+				bucket := (src[i].Packed >> shift) & radixMask
+				dst[counts[bucket]] = src[i]
+				counts[bucket]++
+			}
 		}
 		src, dst = dst, src
 		passes++
