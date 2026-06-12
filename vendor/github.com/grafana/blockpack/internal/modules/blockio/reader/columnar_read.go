@@ -329,7 +329,21 @@ func (r *Reader) readBlockColumnarWithCache(
 		return r.readFullBlockFallback(blockOff, blockLen, blockIdx)
 	}
 
+	// NOTE-213: a SINGLE pass over metas both (a) detects already-decoded columns
+	// (stashing their live snapshot and excluding them entirely) and (b) sizes the
+	// assembled buffer to span ONLY the columns that still need their compressed bytes
+	// copied in. Previously bufSize was computed over ALL wanted columns before the
+	// NOTE-212 skip loop ran, so a fully-warm wide query (every wanted column already in
+	// parsedV8ColumnCache) still acquired a buffer sized to the furthest wanted column —
+	// often most of the block — only to write the ToC prefix into it and never touch the
+	// column extents. Folding the skip detection into the sizing pass lets that buffer
+	// shrink to just the ToC prefix on the fully-warm path, the dominant remaining
+	// assembled-buffer allocation/copy cost the prior notes targeted.
+	//
+	// keepCols collects the wanted columns NOT served from the decoded cache. bufSize
+	// grows only for those, so unwanted and pre-decoded columns never inflate it.
 	bufSize := int64(tocEnd) //nolint:gosec
+	keepCols := make([]colMetaEntry, 0, len(metas))
 	for _, m := range metas {
 		if _, ok := wantColumns[m.name]; !ok || m.compressedLen == 0 {
 			continue
@@ -341,6 +355,19 @@ func (r *Reader) readBlockColumnarWithCache(
 			// can access all column data safely.
 			return r.readFullBlockFallback(blockOff, blockLen, blockIdx)
 		}
+		// NOTE-212: if this column's DECODED snapshot is already in the process-level
+		// parsedV8ColumnCache (NOTE-200), the parser will serve it from there and never
+		// read rawBytes[m.dataOffset:colEnd]. Copying the compressed blob into the
+		// assembled buffer would be pure dead work — and on a wide warm metrics query that
+		// per-column memmove (plus the assembled-buffer churn) is the dominant warm-path
+		// CPU/GC cost. Stash the LIVE snapshot pointer on the Reader and skip the copy; the
+		// parser consumes it from r.preDecodedColumns (no re-probe, no eviction race).
+		// Pre-decoded columns are also excluded from bufSize (NOTE-213): their extent is
+		// never written nor read, so the buffer need not span them.
+		if r.stashPreDecodedColumn(blockOff, m) {
+			continue
+		}
+		keepCols = append(keepCols, m)
 		if colEnd > bufSize {
 			bufSize = colEnd
 		}
@@ -348,12 +375,12 @@ func (r *Reader) readBlockColumnarWithCache(
 
 	// NOTE-208: draw the assembled buffer from a pool instead of make([]byte, bufSize).
 	// The buffer is not zeroed; the copies below fully overwrite the only regions the
-	// parser ever reads (the ToC prefix and each wanted column extent). The caller
+	// parser ever reads (the ToC prefix and each kept column extent). The caller
 	// recycles it via Reader.ReleaseRawBuffer once the parsed block is fully consumed.
 	assembled := acquireAssembledBuffer(bufSize)
 	copy(assembled, toc[:min(int64(len(toc)), int64(tocEnd))]) //nolint:gosec
 
-	// Phase-2 column fetches. Each wanted column's compressed blob is cached as an
+	// Phase-2 column fetches. Each kept column's compressed blob is cached as an
 	// independent section keyed by blockIdx/colName and written into a DISJOINT region
 	// of `assembled` (column extents never overlap).
 	//
@@ -361,27 +388,10 @@ func (r *Reader) readBlockColumnarWithCache(
 	// copied straight into their disjoint region here and excluded from `cols`, so the
 	// warm path issues NO further memcache round-trip — Phase-2 is fully satisfied by
 	// the single combined GetMulti. Only true misses fall into `cols` for resolution.
-	cols := make([]colMetaEntry, 0, len(metas))
-	for _, m := range metas {
-		if _, ok := wantColumns[m.name]; !ok || m.compressedLen == 0 {
-			continue
-		}
+	cols := make([]colMetaEntry, 0, len(keepCols))
+	for _, m := range keepCols {
 		colStart := int64(m.dataOffset)  //nolint:gosec
 		colLen := int64(m.compressedLen) //nolint:gosec
-		if colStart+colLen > blockLen {
-			// Should not reach here (handled above), but guard defensively.
-			continue
-		}
-		// NOTE-212: if this column's DECODED snapshot is already in the process-level
-		// parsedV8ColumnCache (NOTE-200), the parser will serve it from there and never
-		// read rawBytes[colStart:colStart+colLen]. Copying the compressed blob into the
-		// assembled buffer would be pure dead work — and on a wide warm metrics query that
-		// per-column memmove (plus the assembled-buffer churn) is the dominant warm-path
-		// CPU/GC cost. Stash the LIVE snapshot pointer on the Reader and skip the copy; the
-		// parser consumes it from r.preDecodedColumns (no re-probe, no eviction race).
-		if r.stashPreDecodedColumn(blockOff, m) {
-			continue
-		}
 		if blob, hit := preHits[m.name]; hit && int64(len(blob)) == colLen {
 			copy(assembled[colStart:colStart+colLen], blob)
 			continue

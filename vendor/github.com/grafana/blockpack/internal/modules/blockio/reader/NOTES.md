@@ -1375,3 +1375,42 @@ Back-ref: `columnar_read.go:readBlockColumnarWithCache` (the skip), `reader.go:R
 `block_parser.go:parseBlockColumnsReuse` (`preDecoded` param + `preDecodedKey`), NOTE-200
 (decoded-column cache this reads), NOTE-208 (assembled-buffer pool this avoids touching),
 NOTE-185 (combined ToC+columns fetch whose copy this elides).
+
+## NOTE-213: size the assembled buffer to span only NON-pre-decoded columns — 2026-06-11
+
+**Decision:** `readBlockColumnarWithCache` previously computed the assembled-buffer size
+(`bufSize`) in a first pass over `metas` that spanned the furthest WANTED column, then ran a
+SECOND pass (NOTE-212) that skipped columns already present in `parsedV8ColumnCache`. On the
+fully-warm wide path (e.g. `rate() by (...)`, predicate-filtered `rate by` — M4/M9) every wanted
+column's decoded snapshot is cached, so the parser never reads any column extent — yet the
+buffer was still sized to the furthest wanted column (often most of the block), acquired from
+the NOTE-208 pool, and had only its ToC prefix written into it. That over-sized acquire is the
+dominant remaining assembled-buffer allocation/copy cost the standing "reduce copy/decode
+VOLUME" target (NOTE-208/209/210/212) points at.
+
+**Mechanism:** fold the NOTE-212 skip detection into the sizing pass. A single loop over `metas`
+now: validates the column extent against `blockLen` (full-block fallback unchanged), calls
+`stashPreDecodedColumn` and `continue`s on a decoded-cache hit (excluding the column from both
+the buffer size and the copy list), and otherwise appends to `keepCols` and grows `bufSize` to
+that column's end. The buffer is then acquired at this reduced `bufSize`; on the fully-warm path
+where every wanted column is pre-decoded, `bufSize == tocEnd` and only the ToC prefix is
+allocated/copied. The Phase-2 copy loop iterates `keepCols` (no second `stashPreDecodedColumn`
+call, no redundant `wantColumns`/extent re-check) and `cols` is the subset that also missed the
+combined GetMulti.
+
+**Correctness:** `fetchColumnInto` writes only `assembled[colStart:colEnd]` for a column drawn
+from `cols ⊆ keepCols`, and `bufSize` spans every `keepCols` extent, so no cold-path write ever
+lands beyond the (possibly shrunk) buffer. `planColdRuns` still plans over the full
+`metas`/`wantColumns`; a pre-decoded column is by definition a decoded-cache hit, which on a
+COLD block never happens, so on the cold path `keepCols` equals the full wanted set and the
+buffer/plan are byte-for-byte identical to before — the fold only changes the warm path where
+there are no cold misses. The buffer is never zeroed; the parser reads only the ToC prefix and
+each kept column extent, all fully overwritten (NOTE-208 safety contract preserved).
+
+**Verified:** `go test -race ./blockio/reader ./executor` green, incl.
+`TestReader_PreDecodedColumns_SkipCopyStillCorrect` (corrupts every column-data byte, asserts
+the parse still returns cold ground-truth), `TestParsedV8ColumnCache_WarmEqualsCold`,
+`TestReader_CombinedTocColumnFetch_WarmIdentical`.
+
+Back-ref: `columnar_read.go:readBlockColumnarWithCache`, NOTE-212 (the per-column skip this
+folds into sizing), NOTE-208 (the pool whose acquire this shrinks), NOTE-185 (combined fetch).
