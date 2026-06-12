@@ -35,10 +35,23 @@ package executor
 // this halves the four-pass cost to two. With an odd number of significant passes the sorted
 // data lands in the scratch buffer, so a final copy-back into s is needed (the prior fixed
 // four-pass form was always even and relied on src==s after the last pass).
+//
+// NOTE-206: fuse each pass's count scan into the prior pass's scatter scan ("look-ahead
+// histograms"), the same reorganization proven on the ref-index radix sort (NOTE-205,
+// blockio/shared.radixSortRefIndex). The classic LSD loop read every element (2·passes+1)
+// times: one OR scan, then one count scan plus one scatter scan per pass. The scatter of
+// pass k already reads every src[i] key, so it now tallies pass k+1's histogram for free in
+// the same pass. The only standalone count scan is the first byte's, which doubles as the
+// NOTE-193 OR scan. Source reads drop from (2·passes+1)·N to (passes+1)·N. Work stays bounded
+// by the actual significant-pass count (NOTE-193 byte-skip), so the dominant 2-pass
+// single-block case (BlockIdx==0, packKey==RowIdx) never tallies a byte it will not use.
+// Pure reorganization of when counts are tallied — prefix sum, scatter order, pass count, and
+// odd-pass copy-back are unchanged, so the output is byte-for-byte identical.
 func radixSortByPackKey(s []uint64) {
 	const radixBits = 8
 	const radixSize = 1 << radixBits
 	const radixMask = radixSize - 1
+	const numBytes = 32 / radixBits
 	// keyShiftBase is the bit offset of the LOW byte of the packKey within the uint64.
 	// packKey occupies the high 32 bits, so its least-significant byte starts at bit 32.
 	const keyShiftBase = 32
@@ -48,11 +61,14 @@ func radixSortByPackKey(s []uint64) {
 		return
 	}
 
-	// One O(N) scan ORing the high-32-bit keys; the highest set key bit bounds how many byte
-	// passes are significant. Leading zero key bytes are skipped (identity passes).
+	// Pass 0's count scan doubles as the OR scan: it tallies the lowest key byte's histogram
+	// while ORing all high-32-bit keys to learn the highest significant byte (NOTE-193).
 	var keyOr uint32
+	var hist [numBytes][radixSize]int
 	for i := range s {
-		keyOr |= uint32(s[i] >> keyShiftBase) //nolint:gosec
+		k := uint32(s[i] >> keyShiftBase) //nolint:gosec
+		keyOr |= k
+		hist[0][k&radixMask]++
 	}
 	if keyOr == 0 {
 		// All keys equal 0 — already trivially sorted by key (tie order is arbitrary).
@@ -60,7 +76,7 @@ func radixSortByPackKey(s []uint64) {
 	}
 	// maxByte is the index (0..3) of the highest non-zero key byte.
 	maxByte := 0
-	for b := 0; b < 4; b++ {
+	for b := 0; b < numBytes; b++ {
 		if (keyOr>>(b*radixBits))&radixMask != 0 {
 			maxByte = b
 		}
@@ -71,15 +87,9 @@ func radixSortByPackKey(s []uint64) {
 
 	src, dst := s, buf
 	passes := 0
-	var counts [radixSize]int
 	for byteIdx := 0; byteIdx <= maxByte; byteIdx++ {
 		shift := keyShiftBase + byteIdx*radixBits
-		for i := range counts {
-			counts[i] = 0
-		}
-		for i := range src {
-			counts[(src[i]>>shift)&radixMask]++
-		}
+		counts := &hist[byteIdx]
 		// Prefix sum: counts[b] becomes the start offset of bucket b in dst.
 		sum := 0
 		for b := range counts {
@@ -87,10 +97,26 @@ func radixSortByPackKey(s []uint64) {
 			counts[b] = sum
 			sum += c
 		}
-		for i := range src {
-			b := (src[i] >> shift) & radixMask
-			dst[counts[b]] = src[i]
-			counts[b]++
+		// Scatter into dst by this byte. When a further pass follows, tally its histogram in
+		// the same scan (look-ahead) so it needs no standalone count pass. maxByte < numBytes
+		// always (it is a byte index within the 32-bit key), so byteIdx < maxByte gives
+		// byteIdx+1 < numBytes; the explicit numBytes guard makes the array bound static.
+		if byteIdx < maxByte && byteIdx+1 < numBytes {
+			next := &hist[byteIdx+1] //nolint:gosec // byteIdx+1<numBytes guarded above; static bound
+			nextShift := shift + radixBits
+			for i := range src {
+				k := src[i]
+				b := (k >> shift) & radixMask
+				dst[counts[b]] = k
+				counts[b]++
+				next[(k>>nextShift)&radixMask]++
+			}
+		} else {
+			for i := range src {
+				b := (src[i] >> shift) & radixMask
+				dst[counts[b]] = src[i]
+				counts[b]++
+			}
 		}
 		src, dst = dst, src
 		passes++

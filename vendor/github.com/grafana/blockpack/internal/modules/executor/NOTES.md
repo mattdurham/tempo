@@ -4589,3 +4589,27 @@ slice or computed by reduction. No benchmark-specific constants — a pure algor
 reduction.
 **Queries affected:** predicate-filtered count/rate group-by and merge-join metrics queries — M6, M9, M10.
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:mergeJoinFilteredRefsWithVals`.
+
+## NOTE-206 — radixSortByPackKey: fuse count scan into prior pass scatter (look-ahead histograms)
+
+`radixSortByPackKey` (the LSD radix sort over the high-32-bit packKey on the N=1 count/rate,
+duration/histogram, and merge-join matched-subset reorder paths) ran the classic LSD loop: one
+O(N) OR scan to bound the significant byte count (NOTE-193), then for each byte pass one O(N)
+count scan plus one O(N) scatter scan. That read every element `(2·passes+1)` times.
+
+The scatter of pass k already reads every `src[i]` key, so it now tallies pass k+1's histogram
+for free in the same scan ("look-ahead histograms"). The only standalone count scan is the
+lowest byte's, which doubles as the NOTE-193 OR scan (tallies byte-0's histogram while ORing all
+keys). Source reads drop from `(2·passes+1)·N` to `(passes+1)·N`. Work stays bounded by the
+*actual* significant-pass count, so the dominant 2-pass single-block case (BlockIdx==0,
+packKey==RowIdx) never tallies a byte it will not use.
+
+This is the identical reorganization already profile-proven on the ref-index radix sort
+(NOTE-205, `blockio/shared.radixSortRefIndex`). It is a pure restructuring of *when* counts are
+tallied: the prefix sum, scatter order, pass count, and odd-pass copy-back are all unchanged, so
+the output is byte-for-byte identical to the prior form and to `slices.Sort` projected onto the
+key. No benchmark-specific constants — a general radix reorganization independent of column or
+query shape.
+**Queries affected:** N=1 count/rate (M1/M4/M9), duration/histogram group-by (M8), and the
+merge-join matched-subset reorder (Q9/Q10-class), wherever `pkOrder` is large enough to dominate.
+Back-ref: `internal/modules/executor/radix_pkorder.go:radixSortByPackKey`.
