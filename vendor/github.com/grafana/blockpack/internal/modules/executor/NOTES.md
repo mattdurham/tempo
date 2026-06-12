@@ -42,6 +42,43 @@ Back-refs: `streamCountRateN1Compact`, `scanGroupByColCompact` in
 
 ---
 
+## NOTE-225: drop the radix sort in streamHistogramN1Compact — extend NOTE-223/224 to histograms
+*Added: 2026-06-12*
+
+**Decision:** Apply the NOTE-223/224 sort-elimination to `streamHistogramN1Compact`, the
+compact-memory N=1 group-by path for `histogram_over_time(...) by (single group)` queries (the M8
+benchmark). It previously packed each in-range ref into a `pkOrder` uint64 (~57 MB at n≈7.2 M),
+`radixSortByPackKey`'d it, then walked the sorted array to fill `sortedPKs[i]`/`timeBucketByPos[i]`
+(`i == sorted position`), before handing `sortedPKs` to `scanGroupByColCompact` and
+`scanAggColHistogramCompact`.
+
+**Rationale:** identical to NOTE-223/224. Both downstream scans consume the packKeys only as a
+`minPK`/`maxPK` range, a `pkBitset` membership set, and a POPCNT `rankPrefix` index; the position
+they assign a ref (`histRefPassPos`) is its **rank** in the bitset, which equals its sorted
+position because in-range span packKeys are distinct. The sort existed purely so
+`sorted-array-index == rank`. Replaced with the same one-pass set+maxPK fill, bitset+rankPrefix
+build, and rank-scatter of `timeBucketByPos` used by `streamCountRateN1Compact` — factored into the
+new `scatterTimeBucketsByRank` helper shared by `fillPKSetAndTimeBuckets` (column,lo,hi form) and
+the new `fillPKSetAndTimeBucketsFromRefs` (the histogram path's separate inRangeRefs/inRangeVals
+slices). `radixSortByPackKey` is still used by the merge-join reorder, so it stays live.
+
+**Generalization required for correctness:** `scanAggColHistogramCompact` previously read
+`sortedPKs[0]`/`sortedPKs[len-1]` for `minPK`/`maxPK`. It now derives them with an O(N) scan, so it
+is correct for an *unsorted* input. Strict generalization: the predicate-filtered caller
+`streamHistogramN1CompactFromRefs` still passes a sorted slice (from `mergeJoinFilteredRefsWithVals`),
+and a scan over a sorted slice yields the same min/max, so its behavior is byte-identical. The
+rank-scatter writes every `timeBucketByPos` slot exactly once (rank is a bijection onto `[0, n)` over
+distinct packKeys); out-of-window rows leave the pooled `int32` slot at the cleared 0 sentinel, and
+the downstream absent-row pass and emit are unchanged.
+
+**Queries affected:** N=1 histogram group-by queries
+(`{...} | histogram_over_time(duration) by (single group)`, e.g. M8), wherever
+`accumulateIntrinsicBuckets` takes the compact histogram path on large files.
+Back-refs: `streamHistogramN1Compact`, `scanAggColHistogramCompact`, `scatterTimeBucketsByRank`,
+`fillPKSetAndTimeBucketsFromRefs` in `internal/modules/executor/metrics_trace_intrinsic.go`.
+
+---
+
 ## NOTE-224: drop the radix sort in streamAggN1Compact — extend NOTE-223 to general aggregates
 *Added: 2026-06-12*
 
