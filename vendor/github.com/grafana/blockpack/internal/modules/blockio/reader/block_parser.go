@@ -454,6 +454,13 @@ type preDecodedKey struct {
 	colType     shared.ColumnType
 }
 
+// blockColTypesCacheKey builds the blockColTypesCache key for one block. The block's byte
+// offset within the file is stable across queries and uniquely identifies the block, so
+// (fileID, offset) keys exactly one block's name->type mapping. NOTE-214.
+func blockColTypesCacheKey(fileID string, blockOffset uint64) string {
+	return fileID + "/v8coltypes/" + strconv.FormatUint(blockOffset, 10)
+}
+
 // v8ColumnCacheKey builds the parsedV8ColumnCache key for one block column. The block's
 // byte offset within the file is stable across queries and uniquely identifies the block,
 // so (fileID, offset, name, type) keys exactly one decoded column. NOTE-200.

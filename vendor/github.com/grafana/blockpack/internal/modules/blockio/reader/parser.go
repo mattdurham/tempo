@@ -41,6 +41,35 @@ var parsedIntrinsicCache objectcache.Cache[shared.IntrinsicColumn]
 // SPEC-OC-003, NOTE-200 (reader NOTES.md)
 var parsedV8ColumnCache objectcache.Cache[Column]
 
+// blockColTypesCache caches the per-block name->colType mapping by
+// fileID+"/v8coltypes/"+blockOffset. NOTE-214: the combined ToC+columns GetMulti
+// (NOTE-185) requests the compressed blob of EVERY wanted column, but on the warm path
+// many of those columns already have a decoded snapshot in parsedV8ColumnCache and the
+// fetched blob is discarded (NOTE-212/213 skip the copy). The blob can only be probed
+// against parsedV8ColumnCache by its (name, type) key, and the type is not known until
+// the ToC is decoded — which happens AFTER the GetMulti. Caching the name->type mapping
+// at first ToC parse lets the warm path probe parsedV8ColumnCache BEFORE building the
+// GetMulti and drop already-decoded columns from the request, cutting the wasted memcache
+// Get traffic (the MemCache.Get CPU sink the standing target points at).
+// SPEC-OC-003, NOTE-214 (reader NOTES.md)
+var blockColTypesCache objectcache.Cache[blockColTypes]
+
+// blockColTypes maps a block's column names to the column type(s) present under that name.
+// One block can carry the same name with different types, so the value is a small slice.
+// Wrapped in a named struct for stable pointer identity in objectcache.Cache.
+type blockColTypes struct {
+	byName map[string][]shared.ColumnType
+}
+
+// SizeBytes estimates the in-memory size of the mapping for objectcache LRU budgeting.
+func (b *blockColTypes) SizeBytes() int64 {
+	n := int64(0)
+	for name, types := range b.byName {
+		n += int64(len(name)) + int64(len(types)) + 16 // key bytes + type bytes + per-entry overhead
+	}
+	return n + 32
+}
+
 // parsedMetadataCache caches the fully parsed metadata result by fileID.
 // Strong references: entries persist until Clear is called.
 // SPEC-OC-003, NOTE-003 (reader NOTES.md)
@@ -70,6 +99,7 @@ func SetIntrinsicCacheBytes(n int64) {
 	parsedIntrinsicCache.SetMaxBytes(n)
 	parsedIntrinsicTOCCache.SetMaxBytes(n / 4) // ToC is much smaller
 	parsedV8ColumnCache.SetMaxBytes(n)         // NOTE-200: same budget as intrinsic columns
+	blockColTypesCache.SetMaxBytes(n / 16)     // NOTE-214: name->type maps are tiny vs decoded columns
 }
 
 // ClearCaches resets all process-level caches. Intended for testing.
@@ -80,6 +110,7 @@ func ClearCaches() {
 	parsedMetadataCache.Clear()
 	parsedIntrinsicTOCCache.Clear()
 	parsedV8ColumnCache.Clear()
+	blockColTypesCache.Clear()
 }
 
 // rangeIndexMeta records the byte range within metadataBytes for a

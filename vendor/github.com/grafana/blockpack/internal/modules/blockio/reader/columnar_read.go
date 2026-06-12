@@ -300,7 +300,15 @@ func (r *Reader) readBlockColumnarWithCache(
 		err     error
 	)
 	if mf, ok := r.cache.(sectionMixedFetcher); ok && len(wantColumns) > 0 {
-		toc, preHits = r.fetchTocAndColumnsCombined(mf, tocKey, blockIdxStr, wantColumns)
+		// NOTE-214: prune already-decoded columns from the combined fetch. The cached
+		// per-block name->colType mapping (populated at first ToC parse) lets us probe
+		// parsedV8ColumnCache before building the GetMulti and stash the LIVE snapshot
+		// of any column already decoded, so its compressed blob is never requested from
+		// memcache. The sizing pass below (NOTE-213) finds it already stashed and excludes
+		// it from the buffer/copy. On the first query against a block (colTypes-cache miss)
+		// fetchCols == wantColumns and everything is fetched as before.
+		fetchCols := r.prunePreDecodedFromFetch(blockOff, wantColumns)
+		toc, preHits = r.fetchTocAndColumnsCombined(mf, tocKey, blockIdxStr, fetchCols)
 	}
 
 	// Phase 1: ToC — cached. NOTE-154: read a ToC large enough to hold the full
@@ -328,6 +336,10 @@ func (r *Reader) readBlockColumnarWithCache(
 	if err != nil {
 		return r.readFullBlockFallback(blockOff, blockLen, blockIdx)
 	}
+
+	// NOTE-214: record this block's name->colType mapping so a subsequent warm query can
+	// prune already-decoded columns from the combined fetch before the ToC is parsed.
+	r.cacheBlockColTypes(blockOff, metas)
 
 	// NOTE-213: a SINGLE pass over metas both (a) detects already-decoded columns
 	// (stashing their live snapshot and excluding them entirely) and (b) sizes the
@@ -508,6 +520,75 @@ func (r *Reader) stashPreDecodedColumn(blockOff int64, m colMetaEntry) bool {
 	r.preDecodedColumns[preDecodedKey{blockOffset: uint64(blockOff), name: m.name, colType: m.colType}] = snap //nolint:gosec
 	r.preDecodedMu.Unlock()
 	return true
+}
+
+// prunePreDecodedFromFetch consults the cached per-block name->colType mapping (NOTE-214)
+// to drop already-decoded columns from the combined ToC+columns GetMulti. For each wanted
+// column whose type is known from the cached mapping AND whose decoded snapshot is present
+// in parsedV8ColumnCache, it stashes the LIVE snapshot (same mechanism as the NOTE-212
+// sizing-pass skip) and removes the column from the fetch set, so its compressed blob is
+// never requested from memcache. Returns the pruned wantColumns set to pass to the combined
+// fetch. The returned set aliases wantColumns when nothing was pruned (no allocation on the
+// cold/cache-miss path); otherwise it is a fresh map. On a colTypes-cache miss it returns
+// wantColumns unchanged, so the first query against a block fetches everything (and the
+// mapping is populated after the ToC parse for subsequent queries).
+//
+// Correctness mirrors stashPreDecodedColumn: the LIVE snapshot pointer is held on the
+// Reader so the parser consumes it without a re-probe (no eviction race), and the column's
+// TRUE (name, type) keys the stash so the parser's preDecodedLookup matches. A column that
+// is pruned here is byte-for-byte equivalent to one skipped by the sizing pass — the parser
+// serves it from r.preDecodedColumns and never touches the (now-unfetched) compressed bytes.
+func (r *Reader) prunePreDecodedFromFetch(blockOff int64, wantColumns map[string]struct{}) map[string]struct{} {
+	if r.fileID == "" {
+		return wantColumns
+	}
+	ct := blockColTypesCache.Get(blockColTypesCacheKey(r.fileID, uint64(blockOff))) //nolint:gosec
+	if ct == nil {
+		return wantColumns
+	}
+	var pruned map[string]struct{}
+	for name := range wantColumns {
+		types, ok := ct.byName[name]
+		if !ok {
+			continue
+		}
+		for _, t := range types {
+			if r.stashPreDecodedColumn(blockOff, colMetaEntry{name: name, colType: t}) {
+				if pruned == nil {
+					// Lazily clone wantColumns only when at least one column is pruned.
+					pruned = make(map[string]struct{}, len(wantColumns))
+					for n := range wantColumns {
+						pruned[n] = struct{}{}
+					}
+				}
+				delete(pruned, name)
+				break
+			}
+		}
+	}
+	if pruned == nil {
+		return wantColumns
+	}
+	return pruned
+}
+
+// cacheBlockColTypes records the block's name->colType mapping in blockColTypesCache so a
+// subsequent warm query can prune already-decoded columns from the combined fetch BEFORE the
+// ToC is parsed (NOTE-214). Idempotent: a Put over the same key replaces an equivalent map.
+// No-op when there is no fileID. Called once per block read after parseColumnMetadataArray.
+func (r *Reader) cacheBlockColTypes(blockOff int64, metas []colMetaEntry) {
+	if r.fileID == "" || len(metas) == 0 {
+		return
+	}
+	key := blockColTypesCacheKey(r.fileID, uint64(blockOff)) //nolint:gosec
+	if blockColTypesCache.Get(key) != nil {
+		return // already cached for this block
+	}
+	byName := make(map[string][]shared.ColumnType, len(metas))
+	for _, m := range metas {
+		byName[m.name] = append(byName[m.name], m.colType)
+	}
+	_ = blockColTypesCache.Put(key, &blockColTypes{byName: byName})
 }
 
 // sectionBatchFetcher is the optional interface a section cache may implement to

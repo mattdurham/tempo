@@ -1414,3 +1414,47 @@ the parse still returns cold ground-truth), `TestParsedV8ColumnCache_WarmEqualsC
 
 Back-ref: `columnar_read.go:readBlockColumnarWithCache`, NOTE-212 (the per-column skip this
 folds into sizing), NOTE-208 (the pool whose acquire this shrinks), NOTE-185 (combined fetch).
+
+## NOTE-214: prune already-decoded columns from the combined fetch via a cached name->type map — 2026-06-11
+
+**Decision:** The combined ToC+columns GetMulti (NOTE-185) requested the compressed blob of
+EVERY wanted column, but on the warm path many of those columns already have a decoded snapshot
+in `parsedV8ColumnCache` (NOTE-200) and the fetched blob is discarded — NOTE-212/213 skip copying
+it into the assembled buffer. That blob fetch is pure wasted memcache `Get` traffic (the
+`MemCache.Get` CPU sink the standing target — carried as the NEXT TARGET across NOTE-212/213 —
+points at). A blob can only be probed against `parsedV8ColumnCache` by its `(name, type)` key, and
+the type is not known until the ToC is decoded, which happens AFTER the GetMulti — so the fetch
+could not be pruned upfront.
+
+**Mechanism:** a process-level `blockColTypesCache objectcache.Cache[blockColTypes]` keyed by
+`fileID/v8coltypes/blockOffset` records each block's `name -> []colType` mapping. It is populated
+once per block read in `readBlockColumnarWithCache` right after `parseColumnMetadataArray` succeeds
+(`cacheBlockColTypes`). Before building the combined fetch, `prunePreDecodedFromFetch` consults this
+mapping: for each wanted column whose type is known AND whose decoded snapshot is present in
+`parsedV8ColumnCache`, it stashes the LIVE snapshot via the existing `stashPreDecodedColumn`
+mechanism and drops the column from the fetch set. The pruned set is passed to
+`fetchTocAndColumnsCombined`, so the pruned columns' compressed blobs are never requested. The
+sizing pass (NOTE-213) then finds them already stashed and excludes them from the buffer/copy, and
+the parser serves them from `r.preDecodedColumns` (NOTE-212) without reading the now-unfetched bytes.
+
+**Correctness:** identical to the NOTE-212 sizing-pass skip — the LIVE snapshot pointer is held on
+the Reader so the parser consumes it without a re-probe (no LRU-eviction race), keyed on the TRUE
+`(name, type)`. `prunePreDecodedFromFetch` clones `wantColumns` only when at least one column is
+pruned (no allocation on the cold/cache-miss path) and returns it unchanged otherwise; the ORIGINAL
+`wantColumns` still flows to the sizing pass and `planColdRunsLazy`, so a pruned column is detected
+and skipped there exactly as a sizing-pass-skipped column would be. On the first query against a
+block the colTypes cache misses, `fetchCols == wantColumns`, and everything is fetched as before —
+the mapping is populated after the ToC parse for subsequent queries, so the change only affects the
+warm path. `blockColTypesCache` is thread-safe (process-level) and `stashPreDecodedColumn` locks
+`preDecodedMu`, so the prune is race-free across concurrent `blockGroupPipeline` workers.
+
+**Verified:** `go test -race ./blockio/reader ./executor` green, incl. new
+`TestReader_PrunePreDecodedFromFetch_NoBlobFetch` (warms the process caches, then asserts a warm
+read prunes every wanted column — zero provider I/O — and returns the cold ground-truth values),
+plus `TestReader_PreDecodedColumns_SkipCopyStillCorrect`, `TestParsedV8ColumnCache_WarmEqualsCold`,
+`TestReader_CombinedTocColumnFetch_WarmIdentical` unchanged-green.
+
+Back-ref: `columnar_read.go:prunePreDecodedFromFetch`/`cacheBlockColTypes`,
+`parser.go:blockColTypesCache`, `block_parser.go:blockColTypesCacheKey`, NOTE-185 (the combined
+fetch this prunes), NOTE-200 (the decoded cache it probes), NOTE-212/213 (the copy/sizing skip it
+extends to the fetch itself).
