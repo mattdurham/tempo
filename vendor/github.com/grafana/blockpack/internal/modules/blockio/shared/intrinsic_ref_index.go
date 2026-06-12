@@ -627,6 +627,20 @@ func (col *IntrinsicColumn) BlockRefRange(blockIdx uint16) []RefIndexEntry {
 	if len(col.refIndex) == 0 {
 		return nil
 	}
+	// NOTE-231: dense single-block fast path. When markDenseIfContiguous set col.refDense
+	// the index is a gapless single-block permutation whose entries all share refDenseHi16
+	// as their high-16 BlockIdx. The block range is therefore the WHOLE index when blockIdx
+	// matches refDenseHi16, and empty otherwise — answerable with one uint16 compare instead
+	// of the slices.BinarySearchFunc + cmp.Compare comparator closure below. The dominant
+	// querier decode is exactly this dense single-block shape, so this removes the comparator
+	// closure (the per-call CPU sink that NOTE-229 eliminated for point lookups) from the
+	// range path too. Sparse/multi-block columns keep the binary search unchanged.
+	if col.refDense {
+		if uint32(blockIdx) != col.refDenseHi16 {
+			return nil
+		}
+		return col.refIndex
+	}
 	loKey := uint32(blockIdx) << 16
 	// Binary search for the first entry with Packed >= loKey (= blockIdx<<16|0).
 	start, _ := slices.BinarySearchFunc(col.refIndex, loKey, func(e RefIndexEntry, target uint32) int {

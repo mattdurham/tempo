@@ -1154,9 +1154,37 @@ attribute → RowIdx gap), multi-block (high-16 varies), or otherwise non-contig
 not set `refDense` and lookups keep using the binary search unchanged. `LookupRefFast` (the
 `any`-returning variant) was refactored to delegate to `lookupRefIdx`, removing its duplicated
 comparator closure so the dense path applies uniformly. `BlockRefRange` (a range, not a point
-query) keeps its binary search. `TestDenseLookup_EqualsBinarySearch` probes every in- and
+query) is extended to the dense fast path in NOTE-231. `TestDenseLookup_EqualsBinarySearch` probes every in- and
 out-of-range RowIdx plus a wrong BlockIdx and asserts the dense path matches the binary search
 exactly; `TestDenseLookup_NotSetWhenSparse` confirms a RowIdx gap disables the flag and keeps
 lookups correct.
 
 Back-ref: `internal/modules/blockio/shared/intrinsic_ref_index.go:markDenseIfContiguous`
+
+## NOTE-231: O(1) dense range — extend the dense fast path to BlockRefRange
+
+**Context:** NOTE-229 added the `col.refDense` fast path for point reverse lookups
+(`lookupRefIdx` / `LookupRefFast*`), eliminating the `slices.BinarySearchFunc` +
+`cmp.Compare` comparator closure for the dominant dense single-block decode. `BlockRefRange`
+— the per-block range scan used by the structural scatter (NOTE-016 / NOTE-100) — was left on
+the binary search even when the very same `refDense` flag was set, so it kept paying the
+comparator-closure cost on every range call.
+
+**Optimization:** when `col.refDense` holds, the built `refIndex` is a gapless single-block
+permutation whose entries all share `refDenseHi16` as their high-16 BlockIdx. The block range
+is therefore the *whole* index when `blockIdx == refDenseHi16`, and *empty* otherwise.
+`BlockRefRange` now answers this with a single `uint16` compare (`return col.refIndex` or
+`nil`) before falling through to the binary-search body. Sparse/multi-block/non-contiguous
+columns (where `refDense` is unset) keep the binary search unchanged.
+
+**Safety:** `refDense`, `refDenseHi16`, and `refDenseMin` are written only inside the
+`EnsureRefIndex` `sync.Once` body and published together with `refIndex` (NOTE-192
+happens-before), so the concurrent callers see a consistent snapshot. The dense range is
+exhaustive — every entry in a dense index belongs to the single `refDenseHi16` block — so the
+fast path returns byte-identical results to the binary search:
+`TestBlockRefRange_DenseEqualsBinarySearch` builds a dense single-block column (non-zero
+BlockIdx, non-zero minRow), asserts the dense flag fired, and compares `BlockRefRange` against
+an independent binary-search reference for the matching BlockIdx and for neighboring wrong
+BlockIdx values (which must be empty) plus the 0 and 0xFFFF edges.
+
+Back-ref: `internal/modules/blockio/shared/intrinsic_ref_index.go:BlockRefRange`
