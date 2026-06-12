@@ -1494,3 +1494,29 @@ payload holds at least `ceil(present_count * bit_width / 8)` bytes before unpack
 
 Back-ref: `reader/column.go:decodeDeltaUint64BitPacked`/`readBitsLE`, `shared/constants.go`,
           writer NOTE-215, SPECS §9.4.1.
+
+## NOTE-216: hoist per-entry bounds check out of fixed-width dict decode loops
+
+Issue #330 proposed new `KindDictionaryFixed`/`KindSparseDictionaryFixed` kinds to remove
+"redundant per-entry length framing" from numeric/bool dictionary payloads. On inspection the
+premise did not hold: the Int64/Uint64/Float64/Bool dict payloads are **already** fixed-width and
+unframed on the wire — `count[4] + N×width`, with no per-entry length prefix (only the
+String/Bytes/UUID payloads carry a per-entry `len[4]`). A new fixed-width kind would therefore be
+byte-for-byte identical to the existing `KindDictionary` payload for those types: zero wire
+savings, a redundant kind, and a dead writer branch. We did not add the kinds.
+
+What was genuinely improvable was the decode hot loop the issue points at (memory cbe72ea1). The
+old `decodeDictBody` loop performed a per-entry bounds check (`if pos+8 > len(dictBytes)`) and a
+per-entry `append` for every fixed-width slot. NOTE-216 hoists the bounds check out of the loop:
+validate the full payload length once up front (`pos + entryCnt*width <= len(dictBytes)`), allocate
+the destination slice at exact length, then run a tight strided read with no per-iteration branch.
+The bool case collapses to a single `copy` of the contiguous entry run. The up-front check happens
+before the `make`, so a corrupt/oversized `entryCnt` is rejected without over-allocating or reading
+out of bounds (covered by TestDictFixedWidth_TruncatedPayloadRejected).
+
+No wire format change, no enc_version bump, no new kind: the decode is a pure read-path refactor.
+String/Bytes/UUID variable-width payloads keep their per-entry length read (genuinely variable, no
+hoist possible).
+
+Back-ref: `reader/column.go:decodeDictBody`, `reader/dict_fixed_width_test.go`, issue #330,
+          memory cbe72ea1 (warm-path decode hotspot), skill 814c1630 (boundary tests).

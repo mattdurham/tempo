@@ -485,51 +485,56 @@ func decodeDictBody(dictBytes []byte, col *Column, ctx *decodeCtx) error {
 		}
 
 	case shared.ColumnTypeInt64, shared.ColumnTypeRangeInt64, shared.ColumnTypeRangeDuration:
-		col.Int64Dict = make([]int64, 0, entryCnt)
-		for range entryCnt {
-			if pos+8 > len(dictBytes) {
-				return fmt.Errorf("dict body(int64): short at entry")
-			}
+		// NOTE-216: fixed-width 8B entries are already unframed on the wire
+		// (count[4] + N×8, no per-entry length). Validate the full payload
+		// length once up front, then read with a tight strided loop — no
+		// per-entry bounds branch and no per-entry length read.
+		if pos+entryCnt*8 > len(dictBytes) {
+			return fmt.Errorf("dict body(int64): payload short for %d entries", entryCnt)
+		}
 
-			v := int64(binary.LittleEndian.Uint64(dictBytes[pos:])) //nolint:gosec
+		col.Int64Dict = make([]int64, entryCnt)
+		for i := range entryCnt {
+			//nolint:gosec // reinterpreting uint64 bits as int64
+			col.Int64Dict[i] = int64(binary.LittleEndian.Uint64(dictBytes[pos:]))
 			pos += 8
-			col.Int64Dict = append(col.Int64Dict, v)
 		}
 
 	case shared.ColumnTypeUint64, shared.ColumnTypeRangeUint64:
-		col.Uint64Dict = make([]uint64, 0, entryCnt)
-		for range entryCnt {
-			if pos+8 > len(dictBytes) {
-				return fmt.Errorf("dict body(uint64): short at entry")
-			}
+		// NOTE-216: see Int64 case.
+		if pos+entryCnt*8 > len(dictBytes) {
+			return fmt.Errorf("dict body(uint64): payload short for %d entries", entryCnt)
+		}
 
-			v := binary.LittleEndian.Uint64(dictBytes[pos:])
+		col.Uint64Dict = make([]uint64, entryCnt)
+		for i := range entryCnt {
+			col.Uint64Dict[i] = binary.LittleEndian.Uint64(dictBytes[pos:])
 			pos += 8
-			col.Uint64Dict = append(col.Uint64Dict, v)
 		}
 
 	case shared.ColumnTypeFloat64, shared.ColumnTypeRangeFloat64:
-		col.Float64Dict = make([]float64, 0, entryCnt)
-		for range entryCnt {
-			if pos+8 > len(dictBytes) {
-				return fmt.Errorf("dict body(float64): short at entry")
-			}
+		// NOTE-216: see Int64 case.
+		if pos+entryCnt*8 > len(dictBytes) {
+			return fmt.Errorf("dict body(float64): payload short for %d entries", entryCnt)
+		}
 
+		col.Float64Dict = make([]float64, entryCnt)
+		for i := range entryCnt {
 			bits := binary.LittleEndian.Uint64(dictBytes[pos:])
 			pos += 8
-			col.Float64Dict = append(col.Float64Dict, math.Float64frombits(bits))
+			col.Float64Dict[i] = math.Float64frombits(bits)
 		}
 
 	case shared.ColumnTypeBool:
-		col.BoolDict = make([]uint8, 0, entryCnt)
-		for range entryCnt {
-			if pos+1 > len(dictBytes) {
-				return fmt.Errorf("dict body(bool): short at entry")
-			}
-
-			col.BoolDict = append(col.BoolDict, dictBytes[pos])
-			pos++
+		// NOTE-216: 1B entries are unframed (count[4] + N×1). Validate once,
+		// then copy the contiguous run in a single operation.
+		if pos+entryCnt > len(dictBytes) {
+			return fmt.Errorf("dict body(bool): payload short for %d entries", entryCnt)
 		}
+
+		col.BoolDict = make([]uint8, entryCnt)
+		// pos is not read after this case (the dict body ends here), so no advance needed.
+		copy(col.BoolDict, dictBytes[pos:pos+entryCnt])
 
 	case shared.ColumnTypeBytes, shared.ColumnTypeRangeBytes, shared.ColumnTypeUUID:
 		col.BytesDict = make([][]byte, 0, entryCnt)
