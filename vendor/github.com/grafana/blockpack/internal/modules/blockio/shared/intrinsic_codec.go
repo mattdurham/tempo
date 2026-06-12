@@ -1261,42 +1261,63 @@ func appendVariableWidthRefs(raw []byte, pos, blockW, rowW, count int, dst *[]Bl
 	} else {
 		refs = append(refs, make([]BlockRef, count)...)
 	}
+	// NOTE-236: hoist all bounds checks out of the per-ref scatter loops. The previous
+	// `for i := 0; pos < end; pos += stride { refs[base+i] = ...; i++ }` form could not be
+	// bounds-check-eliminated: the compiler could prove neither that refs[base+i] was in
+	// range nor that raw[pos], raw[pos+1], ... were, so every BlockRef store and every
+	// source byte load paid an IsInBounds/IsSliceInBounds check (appendVariableWidthRefs was
+	// ~1.2% of querier self-time, profile 2026-06-12, the second-largest blockpack frame on
+	// the M1/M4 flat/delta decode path). Reslicing the destination to exactly the count slots
+	// (out := refs[base : base+count]) lets the compiler discharge the store check from the
+	// loop bound (i < count), and taking a tight source window src := raw[pos:end] of length
+	// count*refSize lets it discharge every src[i*refSize+k] read from the same bound. The
+	// indexed `for i := range count` form makes both lengths statically related to i, so the
+	// loop bodies become check-free byte loads + a single struct store.
+	out := refs[base : base+count]
+	src := raw[pos:end] // len(src) == count*refSize, validated above
 	switch {
 	case blockW == 1 && rowW == 1:
-		for i := 0; pos < end; pos += 2 {
-			refs[base+i] = BlockRef{
-				BlockIdx: uint16(raw[pos]),
-				RowIdx:   uint16(raw[pos+1]),
+		for i := range out {
+			// Consuming src by exactly refSize each iteration keeps len(src) ==
+			// (count-i)*refSize, so s[0..refSize-1] are provably in range and the
+			// compiler discharges the loads with no per-row bounds check.
+			s := src[:2:2]
+			src = src[2:]
+			out[i] = BlockRef{
+				BlockIdx: uint16(s[0]),
+				RowIdx:   uint16(s[1]),
 			}
-			i++
 		}
 	case blockW == 1 && rowW == 2:
-		for i := 0; pos < end; pos += 3 {
-			refs[base+i] = BlockRef{
-				BlockIdx: uint16(raw[pos]),
-				RowIdx:   binary.LittleEndian.Uint16(raw[pos+1:]),
+		for i := range out {
+			s := src[:3:3]
+			src = src[3:]
+			out[i] = BlockRef{
+				BlockIdx: uint16(s[0]),
+				RowIdx:   binary.LittleEndian.Uint16(s[1:]),
 			}
-			i++
 		}
 	case blockW == 2 && rowW == 1:
-		for i := 0; pos < end; pos += 3 {
-			refs[base+i] = BlockRef{
-				BlockIdx: binary.LittleEndian.Uint16(raw[pos:]),
-				RowIdx:   uint16(raw[pos+2]),
+		for i := range out {
+			s := src[:3:3]
+			src = src[3:]
+			out[i] = BlockRef{
+				BlockIdx: binary.LittleEndian.Uint16(s),
+				RowIdx:   uint16(s[2]),
 			}
-			i++
 		}
 	default: // blockW == 2 && rowW == 2
-		for i := 0; pos < end; pos += 4 {
-			refs[base+i] = BlockRef{
-				BlockIdx: binary.LittleEndian.Uint16(raw[pos:]),
-				RowIdx:   binary.LittleEndian.Uint16(raw[pos+2:]),
+		for i := range out {
+			s := src[:4:4]
+			src = src[4:]
+			out[i] = BlockRef{
+				BlockIdx: binary.LittleEndian.Uint16(s),
+				RowIdx:   binary.LittleEndian.Uint16(s[2:]),
 			}
-			i++
 		}
 	}
 	*dst = refs
-	return pos, nil
+	return end, nil
 }
 
 // appendXORBytesPage decodes a single XOR-encoded bytes page blob (already snappy-decoded)

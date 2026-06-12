@@ -1222,3 +1222,41 @@ key magnitudes and asserts identical output to the self-counting wrappers; the e
 `TestRadixSortRefIndexMatchesSortFunc` / `ByteSkip` / `EdgeCases` still cover the wrappers.
 
 Back-ref: `internal/modules/blockio/shared/intrinsic_ref_index.go:EnsureRefIndex`
+
+## NOTE-236: appendVariableWidthRefs — hoist bounds checks out of the scatter loops
+
+`appendVariableWidthRefs` decodes the per-row `BlockRef{BlockIdx,RowIdx}` section that follows
+every Flat/XOR/Delta page's value section (and the dict arena's ref fill). A 2026-06-12 querier
+CPU profile put it at ~1.2% self-time — the second-largest blockpack frame on the M1/M4
+flat/delta decode path, right behind `appendDeltaUint64Page`.
+
+The old loops were written as `for i := 0; pos < end; pos += stride { refs[base+i] = ...; i++ }`.
+That form defeats bounds-check elimination: the compiler can prove neither that `refs[base+i]`
+is in range (the index is incremented separately from the `pos < end` condition) nor that the
+source reads `raw[pos]`, `raw[pos+1]`, ... are, so every iteration paid an `IsInBounds` on the
+destination store and one or two `IsSliceInBounds`/`IsInBounds` on the source loads
+(`-d=ssa/check_bce/debug=1` confirmed 4-5 checks per row).
+
+**Change:** reslice the destination to exactly the `count` slots once
+(`out := refs[base : base+count]`) and take a tight source window once
+(`src := raw[pos:end]`, length `count*refSize`, already validated). The scatter loops now
+`for i := range out` and *consume* `src` by exactly `refSize` bytes per iteration
+(`s := src[:refSize:refSize]; src = src[refSize:]`). With `len(src)` shrinking by `refSize`
+each step the compiler proves every `s[k]` (and the `binary.LittleEndian.Uint16` sub-slice)
+is in range, so the individual byte loads become check-free — only the two slice-window
+operations retain a (cheaper) `IsSliceInBounds`. The store `out[i]` is discharged from the
+`i < count` loop bound.
+
+The function now returns `end` (== `pos + count*refSize`) directly instead of the post-loop
+`pos`; these are identical (the loop consumed exactly `count*refSize` bytes), so all callers
+that chain on the return value (`appendDeltaUint64Page`, `appendXORBytesPage`,
+`appendFlatPage`) see the same position.
+
+**Safety / why byte-identical:** the wire layout and width semantics are unchanged — only the
+iteration shape moved. `BenchmarkAppendVariableWidthRefs` shows ~20-25% faster on the dominant
+single-block `blockW=1,rowW=2` case (median ~12.7µs → ~9.1µs, 0 allocs).
+`TestAppendVariableWidthRefs_AllWidths` decodes every (blockW,rowW) combination — including
+boundary values 0/255/256/65535 and a non-zero starting `pos` and a pre-populated destination —
+and asserts both the decoded refs and the returned position are byte-for-byte correct.
+
+Back-ref: `internal/modules/blockio/shared/intrinsic_codec.go:appendVariableWidthRefs`
