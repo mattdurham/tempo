@@ -425,3 +425,40 @@ Back-ref: `shared/constants.go` (kinds + `AllPresentKindFor`/`BaseKindFor`/`IsAl
           `shared/presence_rle.go:AllPresentBitset`,
           `writer/encoding_presence.go`, `writer/encoding_{delta,xor,prefix,dict}.go`,
           `reader/column.go:readColumnEncoding`/`decodePresenceMaybe`, NOTE-007.
+
+## NOTE-215: bit-packed DeltaUint64 (kinds 22/23)
+
+`encodeDeltaUint64` (kind 5) snaps every offset to a byte width (1/2/4/8 bytes). Real ingest
+commonly produces offset ranges that fall just above a byte boundary — most notably `span:start`,
+whose ~60 s window in ns needs ~36 bits but rounds up to a full 8-byte width, wasting 28 bits per
+offset. NOTE-215 adds `encodeDeltaUint64BitPacked` (`encoding_delta_bitpacked.go`): one
+`bit_width` (0–64) chosen as `bits.Len64(maxOffset)`, then every offset packed into a contiguous
+LSB-first bit stream (`writeBitsLE`). Wire format and selection rule: SPECS §9.4.1, SPEC-006.
+
+**Why DeltaUint64 only?** Bit-width selection only helps encodings whose payload density depends
+on the *local* value range. Dictionary's win is the global dict (indexes are already tiny); RLE
+already encodes locality; XOR/Prefix are local by construction. Delta is the single density-
+sensitive integer encoding, so it is the only kind that gains from packing at the bit level.
+
+**Selection** (`shouldUseBitPackedDelta`, called from `uint64ColumnBuilder.buildData` after
+`shouldUseDeltaEncoding`): emit kind 22/23 only when bit packing saves ≥ `bitPackedDeltaMinSavedBits`
+(4) bits per offset versus the kind-5 byte width AND there are ≥ `bitPackedDeltaMinPresent` (64)
+present rows to amortize the fixed header. All-zero offsets (`bit_width == 0`) keep kind 5 (no
+payload either way). `base` and `maxOffset` are computed once via the shared
+`deltaBaseAndMaxOffset` helper so both delta encoders agree on the same base/range.
+
+**AllPresent composition:** a fully-present bit-packed column selects kind 23 via
+`selectAllPresent` + `shared.AllPresentKindFor` (NOTE-AP-001), omitting the presence-RLE segment.
+
+**Rollout flag:** `Config.DisableBitPackedDelta` (default false → bit-packed on) forces the
+legacy kind-5 form, mirroring the NOTE-AP-001 atomic-bool pattern
+(`constants.go:bitPackedDeltaEncodingEnabled`).
+
+**Backwards compatibility:** new kind IDs only; no `enc_version` bump. Old readers reject unknown
+kinds at `reader/column.go:readColumnEncoding`. Compaction is transparent — it reads decoded
+values via the reader API and re-encodes via the writer, so the new kind needs no compaction code.
+
+Back-ref: `shared/constants.go` (kinds 22/23 + AllPresent maps),
+          `writer/encoding_delta_bitpacked.go`, `writer/encoding_delta.go:deltaBaseAndMaxOffset`,
+          `writer/column_types.go:buildData`, `reader/column.go:decodeDeltaUint64BitPacked`,
+          SPECS §9.4.1, SPEC-006, NOTE-AP-001, NOTE-007.

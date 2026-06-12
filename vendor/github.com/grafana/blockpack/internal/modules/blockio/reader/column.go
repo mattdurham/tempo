@@ -285,6 +285,8 @@ func readColumnEncoding(data []byte, spanCount int, colType shared.ColumnType, c
 		return decodeInlineBytes(data[2:], baseKind, spanCount, allPresent)
 	case shared.KindDeltaUint64:
 		return decodeDeltaUint64(data[2:], spanCount, ctx, allPresent)
+	case shared.KindDeltaUint64BitPacked:
+		return decodeDeltaUint64BitPacked(data[2:], spanCount, allPresent)
 	case shared.KindRLEIndexes, shared.KindSparseRLEIndexes:
 		return decodeRLEIndexes(data[2:], baseKind, spanCount, colType, ctx, allPresent)
 	case shared.KindXORBytes, shared.KindSparseXORBytes:
@@ -856,6 +858,110 @@ func decodeDeltaUint64(data []byte, spanCount int, ctx *decodeCtx, allPresent bo
 	}
 
 	return col, nil
+}
+
+// decodeDeltaUint64BitPacked decodes kind 22 (DeltaUint64BitPacked, NOTE-215).
+// data starts after enc_version + kind bytes.
+//
+// Wire: span_count[4] + presence + base[8] + bit_width[1] + packed_len[4] + packed_offsets.
+// Offsets are an LSB-first bit stream of presentCount values, each bit_width bits wide.
+func decodeDeltaUint64BitPacked(data []byte, spanCount int, allPresent bool) (*Column, error) {
+	col := &Column{SpanCount: spanCount}
+
+	if len(data) < 4 {
+		return nil, fmt.Errorf("delta_uint64_bitpacked: data too short")
+	}
+
+	storedSpanCount := int(binary.LittleEndian.Uint32(data[0:]))
+	pos := 4
+
+	if storedSpanCount != spanCount {
+		return nil, fmt.Errorf("delta_uint64_bitpacked: span_count %d != spanCount %d", storedSpanCount, spanCount)
+	}
+
+	present, newPos, presentCount, err := decodePresenceMaybe(data, pos, spanCount, allPresent)
+	if err != nil {
+		return nil, fmt.Errorf("delta_uint64_bitpacked: %w", err)
+	}
+
+	pos = newPos
+	col.Present = present
+
+	// base[8] + bit_width[1]
+	if pos+9 > len(data) {
+		return nil, fmt.Errorf("delta_uint64_bitpacked: missing base/bit_width at pos %d", pos)
+	}
+
+	base := binary.LittleEndian.Uint64(data[pos:])
+	pos += 8
+	bitWidth := data[pos]
+	pos++
+
+	if bitWidth > 64 {
+		return nil, fmt.Errorf("delta_uint64_bitpacked: invalid bit_width %d", bitWidth)
+	}
+
+	col.Uint64Dict = make([]uint64, presentCount)
+	col.Uint64Idx = make([]uint32, spanCount)
+
+	// packed_len[4] + packed_offsets — always present (zero-length when bit_width==0).
+	packed, _, err := readRawSegment(data, pos)
+	if err != nil {
+		return nil, fmt.Errorf("delta_uint64_bitpacked: offsets: %w", err)
+	}
+
+	if bitWidth == 0 {
+		for i := range presentCount {
+			col.Uint64Dict[i] = base
+		}
+	} else {
+		need := (presentCount*int(bitWidth) + 7) / 8
+		if len(packed) < need {
+			return nil, fmt.Errorf(
+				"delta_uint64_bitpacked: offsets: need %d bytes, got %d",
+				need, len(packed),
+			)
+		}
+		bitPos := 0
+		for i := range presentCount {
+			off := readBitsLE(packed, bitPos, bitWidth)
+			col.Uint64Dict[i] = base + off
+			bitPos += int(bitWidth)
+		}
+	}
+
+	dictIdx := 0
+	for i := range spanCount {
+		if shared.IsPresent(present, i) {
+			col.Uint64Idx[i] = uint32(dictIdx) //nolint:gosec
+			dictIdx++
+		}
+	}
+
+	return col, nil
+}
+
+// readBitsLE reads width bits (1..64) from src starting at bit offset bitPos, LSB-first within
+// each byte — the inverse of the writer's writeBitsLE. src must hold at least bitPos+width bits.
+func readBitsLE(src []byte, bitPos int, width uint8) uint64 {
+	var v uint64
+	read := 0
+	remaining := int(width)
+	for remaining > 0 {
+		byteIdx := bitPos >> 3
+		bitOff := bitPos & 7
+		n := 8 - bitOff
+		if n > remaining {
+			n = remaining
+		}
+		mask := uint64(1)<<uint(n) - 1
+		chunk := (uint64(src[byteIdx]) >> uint(bitOff)) & mask
+		v |= chunk << uint(read)
+		read += n
+		bitPos += n
+		remaining -= n
+	}
+	return v
 }
 
 // decodeRLEIndexes decodes kind 6/7 (RLEIndexes/SparseRLEIndexes).

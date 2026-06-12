@@ -667,6 +667,8 @@ determines the remainder of the wire format.
 | 19 | XORBytesAllPresent | Bytes | fully-present ID columns |
 | 20 | PrefixBytesAllPresent | Bytes | fully-present URL/path columns |
 | 21 | DeltaDictionaryAllPresent | Bytes | fully-present trace:id |
+| 22 | DeltaUint64BitPacked | Uint64 | timestamps/monotonic with non-byte-aligned offset range |
+| 23 | DeltaUint64BitPackedAllPresent | Uint64 | fully-present, as kind 22 |
 
 ### 9.0 AllPresent Encoding Kinds (kinds 15–21)
 
@@ -796,6 +798,40 @@ offsets_zstd   [offset_len]byte  // zstd-compressed offset array
 
 After decompress, offsets are `width` bytes each for every present row in order.
 Reconstructed value = `base_value + offset`.
+
+#### 9.4.1 Bit-Packed Delta Uint64 (kinds 22, 23 — NOTE-215)
+
+A bit-packed variant of §9.4 that replaces the byte-width offset array (1/2/4/8 bytes per
+offset) with a single `bit_width` (0–64 bits) chosen as the minimum number of bits needed to
+represent the largest offset, then packs every offset into a contiguous LSB-first bit stream.
+This is the **only** locality-sensitive density win for Delta: when the offset range needs, e.g.,
+36 bits, kind 5 snaps to `width=8` (64 bits) and wastes 28 bits per offset; kind 22 stores
+exactly 36.
+
+```
+span_count     uint32 LE
+presence_rle   [see §9.1]       // rle_len(4) + rle_data   — omitted for kind 23 (AllPresent)
+base_value     uint64 LE        // Minimum present value in block (absolute)
+bit_width      uint8            // Bits per offset: 0 (all offsets zero) .. 64
+packed_len     uint32 LE        // ceil(present_count * bit_width / 8); 0 when bit_width == 0
+packed_offsets [packed_len]byte // LSB-first bit stream of present_count offsets, each bit_width bits
+```
+
+Bit packing is **LSB-first**: offset `j`'s least-significant bit occupies the lowest unused bit
+of the stream, spanning byte boundaries as needed. Offsets are stored for present rows in order.
+Reconstructed value = `base_value + offset`. The `packed_offsets` array is raw (not zstd);
+the per-column outer snappy applies as for kind 5.
+
+**Selection (SPEC-006):** the writer chooses kind 22/23 over kind 5/17 only when **both**:
+1. bit packing saves at least `bitPackedDeltaMinSavedBits` (4) bits per offset versus the byte
+   width — i.e. `byte_width*8 − bit_width ≥ 4` — and
+2. there are at least `bitPackedDeltaMinPresent` (64) present rows to amortize the fixed
+   per-column header (`base[8] + bit_width[1] + packed_len[4]`).
+
+All-zero offsets (`bit_width == 0`) keep kind 5/17 (it already stores no payload). Selection is
+gated by the writer flag `Config.DisableBitPackedDelta` (default: bit-packed on). New kind IDs
+are additive — `enc_version` is unchanged and old readers reject unknown kinds (NOTE-007
+precedent). Kind 23 is the AllPresent variant (§9.0): it omits the `presence_rle` segment.
 
 ### 9.5 XOR Bytes (kinds 8, 9)
 

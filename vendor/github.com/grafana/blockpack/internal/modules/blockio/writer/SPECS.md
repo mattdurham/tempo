@@ -115,6 +115,25 @@ presence-RLE segment is omitted (the kind byte signals full presence). Sparse ki
 and zero-row columns never select an AllPresent variant. Reading is unaffected by the flag —
 readers accept both forms (SPECS §9.0).
 
+**Bit-packed DeltaUint64 selection (NOTE-215):** when a uint64 column has been chosen for delta
+encoding (per `shouldUseDeltaEncoding`) and `Config.DisableBitPackedDelta` is false, the writer
+prefers the bit-packed variant (kind 22, AllPresent kind 23 — SPECS §9.4.1) over the byte-width
+form (kind 5/17) when **both** of:
+
+1. **Width savings:** `byte_width*8 − bit_width ≥ bitPackedDeltaMinSavedBits` (4 bits ≈ 12.5% of
+   a 1-byte width). Here `byte_width` is the kind-5 byte width (1/2/4/8) and `bit_width` is
+   `bits.Len64(maxOffset)`. The win is largest when the offset range falls just above a byte
+   boundary (e.g. a ~36-bit range snaps kind 5 to 8 bytes / 64 bits).
+2. **Amortization:** `presentCount ≥ bitPackedDeltaMinPresent` (64), so the fixed per-column
+   header (`base[8] + bit_width[1] + packed_len[4]`) is small relative to the packed payload.
+
+All-zero offsets (`bit_width == 0`) keep kind 5/17 — that form already stores no payload. The
+AllPresent layering (NOTE-AP-001) composes: a fully-present bit-packed column emits kind 23.
+
+These thresholds are deliberately conservative. At the default `defaultMaxBlockSpans = 2000`,
+`span:start` columns commonly hit a ~36-bit offset range (≈60 s window in ns), which kind 5
+rounds up to 8 bytes — exactly the case condition 1 captures. Reading is unaffected by the flag.
+
 ---
 
 ## SPEC-007: Block Size and Count Limits

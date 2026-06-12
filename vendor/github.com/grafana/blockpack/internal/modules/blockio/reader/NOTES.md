@@ -1478,3 +1478,19 @@ the existing `decodePresenceRLEFromSlice` path; both forms decode to identical c
 Back-ref: `reader/column.go:readColumnEncoding`/`decodePresenceMaybe`,
           `shared/presence_rle.go:AllPresentBitset`, `shared/constants.go:BaseKindFor`,
           writer NOTE-AP-001.
+
+## NOTE-215: decode bit-packed DeltaUint64 (kinds 22/23)
+
+`decodeDeltaUint64BitPacked` (`column.go`) decodes the bit-packed delta variant added by writer
+NOTE-215 (SPECS §9.4.1). It mirrors `decodeDeltaUint64` (kind 5) but reads a single `bit_width`
+(0–64) and unpacks each present offset from an LSB-first bit stream via `readBitsLE` (the inverse
+of the writer's `writeBitsLE`). `readColumnEncoding` dispatches kind 22 here; the AllPresent
+variant (kind 23) maps back via `shared.BaseKindFor` and synthesizes a fully-present presence
+vector with `decodePresenceMaybe` (no presence bytes read).
+
+The packed array is always length-prefixed (`readRawSegment`), zero-length when `bit_width == 0`
+(every present value equals base). The decoder validates `bit_width ≤ 64` and that the packed
+payload holds at least `ceil(present_count * bit_width / 8)` bytes before unpacking.
+
+Back-ref: `reader/column.go:decodeDeltaUint64BitPacked`/`readBitsLE`, `shared/constants.go`,
+          writer NOTE-215, SPECS §9.4.1.

@@ -227,6 +227,20 @@ const (
 	KindXORBytesAllPresent        uint8 = 19
 	KindPrefixBytesAllPresent     uint8 = 20
 	KindDeltaDictionaryAllPresent uint8 = 21
+
+	// KindDeltaUint64BitPacked (kind 22, NOTE-215, SPECS §9.4) is a bit-packed variant of
+	// KindDeltaUint64. Instead of snapping each offset to a byte width (1/2/4/8 bytes), it
+	// stores a single bit_width (0..64) chosen as the minimum number of bits needed to
+	// represent the largest offset, then packs every offset into a contiguous LSB-first bit
+	// stream. This is selected only when bit packing saves a meaningful fraction of the
+	// byte-width payload AND the column has enough present rows to amortize the per-column
+	// header (see SPEC-006). Old readers reject this unknown kind at readColumnEncoding (no
+	// enc_version bump — additive format evolution, NOTE-007 precedent).
+	//
+	// KindDeltaUint64BitPackedAllPresent (kind 23) is its fully-present variant that omits
+	// the presence_rle segment entirely (NOTE-AP-001).
+	KindDeltaUint64BitPacked           uint8 = 22
+	KindDeltaUint64BitPackedAllPresent uint8 = 23
 )
 
 // AllPresentKindFor maps a base dense encoding kind to its AllPresent variant. Returns
@@ -249,6 +263,8 @@ func AllPresentKindFor(kind uint8) (uint8, bool) {
 		return KindPrefixBytesAllPresent, true
 	case KindDeltaDictionary:
 		return KindDeltaDictionaryAllPresent, true
+	case KindDeltaUint64BitPacked:
+		return KindDeltaUint64BitPackedAllPresent, true
 	default:
 		return kind, false
 	}
@@ -273,6 +289,8 @@ func BaseKindFor(kind uint8) (uint8, bool) {
 		return KindPrefixBytes, true
 	case KindDeltaDictionaryAllPresent:
 		return KindDeltaDictionary, true
+	case KindDeltaUint64BitPackedAllPresent:
+		return KindDeltaUint64BitPacked, true
 	default:
 		return kind, false
 	}
@@ -289,7 +307,8 @@ func IsAllPresentKind(kind uint8) bool {
 		KindRLEIndexesAllPresent,
 		KindXORBytesAllPresent,
 		KindPrefixBytesAllPresent,
-		KindDeltaDictionaryAllPresent:
+		KindDeltaDictionaryAllPresent,
+		KindDeltaUint64BitPackedAllPresent:
 		return true
 	default:
 		return false

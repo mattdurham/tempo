@@ -94,4 +94,14 @@ type Config struct {
 	//
 	// Reading is unaffected by this flag — readers always accept both forms.
 	DisableAllPresentEncoding bool
+
+	// DisableBitPackedDelta turns off selection of the bit-packed DeltaUint64 encoding kind
+	// (NOTE-215). When false (the default), uint64 columns chosen for delta encoding are
+	// written using the bit-packed variant whenever it saves a meaningful fraction of the
+	// byte-width payload (see SPEC-006). Set to true during rollout to force the legacy
+	// byte-width form (kind 5), so a writer can be deployed ahead of readers that understand
+	// the new kind.
+	//
+	// Reading is unaffected by this flag — readers always accept both forms.
+	DisableBitPackedDelta bool
 }

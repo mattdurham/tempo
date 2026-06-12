@@ -30,6 +30,27 @@ func allPresentEnabled() bool {
 	return allPresentEncodingEnabled.Load()
 }
 
+// bitPackedDeltaEnabled is the process-level rollout toggle for the bit-packed DeltaUint64
+// encoding kind (NOTE-215). It defaults to true. NewWriterWithConfig sets it from
+// Config.DisableBitPackedDelta. Atomic for the same reason as allPresentEncodingEnabled:
+// a deploy-level constant in practice, atomic access just removes the data race between
+// per-block encoder goroutines and a concurrent writer construction.
+var bitPackedDeltaEncodingEnabled atomic.Bool //nolint:gochecknoglobals // process-level rollout flag
+
+func init() { //nolint:gochecknoinits // one-time default for the rollout flag
+	bitPackedDeltaEncodingEnabled.Store(true)
+}
+
+// setBitPackedDeltaEnabled sets the process-level bit-packed DeltaUint64 rollout flag.
+func setBitPackedDeltaEnabled(v bool) {
+	bitPackedDeltaEncodingEnabled.Store(v)
+}
+
+// bitPackedDeltaEnabled reports whether bit-packed DeltaUint64 selection is active.
+func bitPackedDeltaEnabled() bool {
+	return bitPackedDeltaEncodingEnabled.Load()
+}
+
 // Encoding kind constants per SPECS §9 — canonical definitions live in shared.Kind*.
 // These aliases are preserved so writer-internal code continues to compile unchanged.
 const (
@@ -56,6 +77,10 @@ const (
 	KindXORBytesAllPresent        = shared.KindXORBytesAllPresent
 	KindPrefixBytesAllPresent     = shared.KindPrefixBytesAllPresent
 	KindDeltaDictionaryAllPresent = shared.KindDeltaDictionaryAllPresent
+
+	// Bit-packed DeltaUint64 kinds — re-exported from shared (NOTE-215).
+	KindDeltaUint64BitPacked           = shared.KindDeltaUint64BitPacked
+	KindDeltaUint64BitPackedAllPresent = shared.KindDeltaUint64BitPackedAllPresent
 )
 
 // Trace intrinsic column name constants — aliases to canonical definitions in shared.

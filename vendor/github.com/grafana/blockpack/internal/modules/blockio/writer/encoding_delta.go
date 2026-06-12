@@ -34,41 +34,7 @@ func encodeDeltaUint64(values []uint64, present []bool, nRows int) ([]byte, erro
 	}
 
 	// Compute base (min of present values) and maxOffset.
-	var base uint64
-	var maxOffset uint64
-	hasAny := false
-
-	for i := range nRows {
-		if i >= len(present) || !present[i] {
-			continue
-		}
-		var v uint64
-		if i < len(values) {
-			v = values[i]
-		}
-		if !hasAny {
-			base = v
-			hasAny = true
-		} else if v < base {
-			base = v
-		}
-	}
-
-	if hasAny {
-		for i := range nRows {
-			if i >= len(present) || !present[i] {
-				continue
-			}
-			var v uint64
-			if i < len(values) {
-				v = values[i]
-			}
-			offset := v - base
-			if offset > maxOffset {
-				maxOffset = offset
-			}
-		}
-	}
+	base, maxOffset, _ := deltaBaseAndMaxOffset(values, present, nRows)
 
 	width := pickDeltaWidth(maxOffset)
 
@@ -105,6 +71,48 @@ func encodeDeltaUint64(values []uint64, present []bool, nRows int) ([]byte, erro
 	buf = append(buf, offsetBuf...)
 
 	return buf, nil
+}
+
+// deltaBaseAndMaxOffset computes the base (minimum present value) and the maximum offset
+// (max present value − base) over all present rows, plus the count of present rows. Shared by
+// the byte-width (kind 5) and bit-packed (kind 22) delta encoders so each selection path agrees
+// on the same base/range. Returns base=0, maxOffset=0, presentCount=0 when no row is present.
+func deltaBaseAndMaxOffset(values []uint64, present []bool, nRows int) (base, maxOffset uint64, presentCount int) {
+	hasAny := false
+	for i := range nRows {
+		if i >= len(present) || !present[i] {
+			continue
+		}
+		var v uint64
+		if i < len(values) {
+			v = values[i]
+		}
+		presentCount++
+		if !hasAny {
+			base = v
+			hasAny = true
+		} else if v < base {
+			base = v
+		}
+	}
+
+	if hasAny {
+		for i := range nRows {
+			if i >= len(present) || !present[i] {
+				continue
+			}
+			var v uint64
+			if i < len(values) {
+				v = values[i]
+			}
+			offset := v - base
+			if offset > maxOffset {
+				maxOffset = offset
+			}
+		}
+	}
+
+	return base, maxOffset, presentCount
 }
 
 // pickDeltaWidth returns the minimum byte width needed to represent maxOffset.
