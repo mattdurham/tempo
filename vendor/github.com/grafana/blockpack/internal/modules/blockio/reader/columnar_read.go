@@ -321,20 +321,12 @@ func (r *Reader) readBlockColumnarWithCache(
 	hdr, err := parseBlockHeader(toc)
 	if err != nil {
 		// Fallback: full block read (same as readBlockColumnar's fallback).
-		full := make([]byte, blockLen)
-		if _, ferr := r.provider.ReadAt(full, blockOff, rw.DataTypeBlock); ferr != nil {
-			return nil, fmt.Errorf("block %d fallback: %w", blockIdx, ferr)
-		}
-		return full, nil
+		return r.readFullBlockFallback(blockOff, blockLen, blockIdx)
 	}
 
 	metas, tocEnd, err := parseColumnMetadataArray(toc, int(shared.BlockHeaderV14Size), int(hdr.columnCount))
 	if err != nil {
-		full := make([]byte, blockLen)
-		if _, ferr := r.provider.ReadAt(full, blockOff, rw.DataTypeBlock); ferr != nil {
-			return nil, fmt.Errorf("block %d fallback: %w", blockIdx, ferr)
-		}
-		return full, nil
+		return r.readFullBlockFallback(blockOff, blockLen, blockIdx)
 	}
 
 	bufSize := int64(tocEnd) //nolint:gosec
@@ -347,11 +339,7 @@ func (r *Reader) readBlockColumnarWithCache(
 			// A wanted column's data extends beyond blockLen — the reported block length
 			// may be approximate. Fall back to reading the full block so ParseBlockFromBytes
 			// can access all column data safely.
-			full := make([]byte, blockLen)
-			if _, ferr := r.provider.ReadAt(full, blockOff, rw.DataTypeBlock); ferr != nil {
-				return nil, fmt.Errorf("block %d full fallback: %w", blockIdx, ferr)
-			}
-			return full, nil
+			return r.readFullBlockFallback(blockOff, blockLen, blockIdx)
 		}
 		if colEnd > bufSize {
 			bufSize = colEnd
@@ -382,6 +370,16 @@ func (r *Reader) readBlockColumnarWithCache(
 		colLen := int64(m.compressedLen) //nolint:gosec
 		if colStart+colLen > blockLen {
 			// Should not reach here (handled above), but guard defensively.
+			continue
+		}
+		// NOTE-212: if this column's DECODED snapshot is already in the process-level
+		// parsedV8ColumnCache (NOTE-200), the parser will serve it from there and never
+		// read rawBytes[colStart:colStart+colLen]. Copying the compressed blob into the
+		// assembled buffer would be pure dead work — and on a wide warm metrics query that
+		// per-column memmove (plus the assembled-buffer churn) is the dominant warm-path
+		// CPU/GC cost. Stash the LIVE snapshot pointer on the Reader and skip the copy; the
+		// parser consumes it from r.preDecodedColumns (no re-probe, no eviction race).
+		if r.stashPreDecodedColumn(blockOff, m) {
 			continue
 		}
 		if blob, hit := preHits[m.name]; hit && int64(len(blob)) == colLen {
@@ -461,6 +459,45 @@ func (r *Reader) readBlockColumnarWithCache(
 	}
 
 	return assembled, nil
+}
+
+// readFullBlockFallback reads the entire block from the provider. It is the shared
+// fallback for readBlockColumnarWithCache when the cached ToC cannot be parsed or a wanted
+// column's reported extent overruns the block length — in those cases ParseBlockFromBytes
+// must be able to access every column, so the columnar sub-read optimization is abandoned
+// for this block and the full block bytes are returned.
+func (r *Reader) readFullBlockFallback(blockOff, blockLen int64, blockIdx int) ([]byte, error) {
+	full := make([]byte, blockLen)
+	if _, ferr := r.provider.ReadAt(full, blockOff, rw.DataTypeBlock); ferr != nil {
+		return nil, fmt.Errorf("block %d fallback: %w", blockIdx, ferr)
+	}
+	return full, nil
+}
+
+// stashPreDecodedColumn probes the process-level parsedV8ColumnCache (NOTE-200) for column
+// m of the block at blockOff. On a hit it stashes the LIVE decoded snapshot in
+// r.preDecodedColumns and returns true, signaling readBlockColumnarWithCache to SKIP
+// copying the column's compressed blob into the assembled buffer (the parser will serve it
+// from the stashed snapshot and never read those bytes — NOTE-212). Returns false when there
+// is no fileID or the snapshot is absent, so the caller falls through to the copy path. The
+// column's TRUE (name, type) is used because the cache and parser key on type, and one block
+// can carry the same name with different types. preDecodedMu guards the map because
+// ReadGroupColumnar runs concurrently across blockGroupPipeline workers on the same *Reader.
+func (r *Reader) stashPreDecodedColumn(blockOff int64, m colMetaEntry) bool {
+	if r.fileID == "" {
+		return false
+	}
+	snap := parsedV8ColumnCache.Get(v8ColumnCacheKey(r.fileID, uint64(blockOff), m.name, m.colType)) //nolint:gosec
+	if snap == nil {
+		return false
+	}
+	r.preDecodedMu.Lock()
+	if r.preDecodedColumns == nil {
+		r.preDecodedColumns = make(map[preDecodedKey]*Column)
+	}
+	r.preDecodedColumns[preDecodedKey{blockOffset: uint64(blockOff), name: m.name, colType: m.colType}] = snap //nolint:gosec
+	r.preDecodedMu.Unlock()
+	return true
 }
 
 // sectionBatchFetcher is the optional interface a section cache may implement to

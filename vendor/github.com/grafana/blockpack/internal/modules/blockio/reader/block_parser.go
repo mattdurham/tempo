@@ -195,6 +195,7 @@ func parseBlockColumnsReuse(
 	meta shared.BlockMeta,
 	intern map[string]string,
 	fileID string,
+	preDecodedLookup func(preDecodedKey) *Column,
 ) (*Block, error) {
 	if intern == nil {
 		intern = make(map[string]string)
@@ -255,6 +256,23 @@ func parseBlockColumnsReuse(
 
 		col.Name = m.name
 		col.Type = m.colType
+
+		// NOTE-212: a reader-pre-resolved decoded snapshot takes priority over both the
+		// process cache and the compressed bytes. readBlockColumnarWithCache observed this
+		// column's decoded snapshot already present in parsedV8ColumnCache and therefore
+		// SKIPPED copying its compressed blob into the assembled buffer — so rawBytes for
+		// this column's extent are NOT valid here. The live snapshot it stashed must be
+		// used. Holding the live pointer (rather than re-probing parsedV8ColumnCache)
+		// closes the eviction race: the snapshot cannot be LRU-evicted while the Reader
+		// retains it, so we never fall through to decompressing stale assembled bytes. The
+		// lookup is nil when nothing was pre-resolved (the common path pays no lock/call).
+		if preDecodedLookup != nil {
+			if snap := preDecodedLookup(preDecodedKey{blockOffset: meta.Offset, name: m.name, colType: m.colType}); snap != nil {
+				copyDecodedColumnInto(col, snap)
+				columns[key] = col
+				continue
+			}
+		}
 
 		// NOTE-200: consult the process-level decoded-column cache before snappy
 		// decompress + readColumnEncoding. A Reader is created fresh per query (per block
@@ -424,6 +442,16 @@ func parseBlockColumnsReuse(
 	blk.BuildIterFields()
 
 	return blk, nil
+}
+
+// preDecodedKey identifies one decoded column by its block's stable byte offset within
+// the file plus the column's name and type. NOTE-212: Reader.preDecodedColumns is keyed
+// by this so the parser can look up a reader-pre-resolved decoded snapshot without
+// reconstructing the longer string parsedV8ColumnCache key.
+type preDecodedKey struct {
+	name        string
+	blockOffset uint64
+	colType     shared.ColumnType
 }
 
 // v8ColumnCacheKey builds the parsedV8ColumnCache key for one block column. The block's

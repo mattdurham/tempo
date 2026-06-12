@@ -133,6 +133,21 @@ type Reader struct {
 	// Populated lazily by GetIntrinsicColumn. Protected by intrinsicMu.
 	intrinsicDecoded map[string]*shared.IntrinsicColumn
 
+	// preDecodedColumns holds LIVE decoded-column snapshots that
+	// readBlockColumnarWithCache observed already present in the process-level
+	// parsedV8ColumnCache (NOTE-200) at read time, keyed by (block offset, name, type).
+	// NOTE-212: when a wanted column's decoded snapshot is already cached, the reader skips
+	// copying its compressed blob into the assembled buffer (the warm-path memmove) because
+	// the parser satisfies it from the decoded cache and never reads the compressed bytes.
+	// Storing the LIVE pointer lets the parser consume it without re-probing the cache,
+	// closing the eviction race a bare probe-then-skip would open (the snapshot could be
+	// LRU-evicted between the reader's check and the parser's lookup, leaving the parser to
+	// decompress stale assembled-buffer bytes). The map holds strong references for the
+	// Reader's lifetime (one querier call), so its entries cannot be evicted out from under
+	// the parse. Nil until the first hit on the warm columnar read path. Guarded by
+	// preDecodedMu.
+	preDecodedColumns map[preDecodedKey]*Column
+
 	// metaPin holds a reference to the *parsedMetadata retrieved from the process-level
 	// cache, ensuring the pointer remains valid for the lifetime of this Reader.
 	metaPin *parsedMetadata
@@ -244,6 +259,12 @@ type Reader struct {
 
 	// sketchIdxMu guards concurrent V8 per-column sketch fetches.
 	sketchIdxMu sync.Mutex
+
+	// preDecodedMu guards preDecodedColumns. ReadGroupColumnar (which populates it) runs
+	// concurrently across blockGroupPipeline workers on the same *Reader, while the parse
+	// (which reads it) runs on the sequential consumer goroutine — and a read of group N+1
+	// can race the parse of group N. NOTE-212.
+	preDecodedMu sync.Mutex
 
 	compactLen uint32
 
@@ -772,7 +793,15 @@ func (r *Reader) ParseBlockFromBytes(
 	meta shared.BlockMeta,
 ) (*BlockWithBytes, error) {
 	localIntern := make(map[string]string)
-	blk, err := parseBlockColumnsReuse(rawBytes, want.toInternalMap(), nil, meta, localIntern, r.fileID)
+	blk, err := parseBlockColumnsReuse(
+		rawBytes,
+		want.toInternalMap(),
+		nil,
+		meta,
+		localIntern,
+		r.fileID,
+		r.preDecodedLookup(),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("ParseBlockFromBytes: %w", err)
 	}
@@ -793,11 +822,37 @@ func (r *Reader) ParseBlockFromBytesWithIntern(
 	meta shared.BlockMeta,
 	intern map[string]string,
 ) (*BlockWithBytes, error) {
-	blk, err := parseBlockColumnsReuse(rawBytes, want.toInternalMap(), nil, meta, intern, r.fileID)
+	blk, err := parseBlockColumnsReuse(
+		rawBytes,
+		want.toInternalMap(),
+		nil,
+		meta,
+		intern,
+		r.fileID,
+		r.preDecodedLookup(),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("ParseBlockFromBytesWithIntern: %w", err)
 	}
 	return &BlockWithBytes{Block: blk, RawBytes: rawBytes}, nil
+}
+
+// preDecodedLookup returns a function that resolves a reader-pre-resolved decoded-column
+// snapshot under preDecodedMu (NOTE-212), or nil when no columns were pre-resolved so the
+// parser pays no lock or call on the common path. The lock is required because reads of
+// later groups (which populate the map) run concurrently with the parse of earlier groups.
+func (r *Reader) preDecodedLookup() func(preDecodedKey) *Column {
+	r.preDecodedMu.Lock()
+	empty := len(r.preDecodedColumns) == 0
+	r.preDecodedMu.Unlock()
+	if empty {
+		return nil
+	}
+	return func(k preDecodedKey) *Column {
+		r.preDecodedMu.Lock()
+		defer r.preDecodedMu.Unlock()
+		return r.preDecodedColumns[k]
+	}
 }
 
 // HasTraceIndex reports whether the reader has a populated trace block index.

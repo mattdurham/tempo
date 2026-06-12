@@ -1311,3 +1311,67 @@ Verified race-free under `go test -race` (incl. the concurrent-IsPresent stress 
 Back-ref: `column.go:ensureDecompressed`/`decodeNow`/`releaseDecompPooled`,
 `block_parser.go:decompressV14ColumnDataInto` (pooled-grow helper) + the "decoders copy data
 out" invariant comment, NOTE-208 (assembled-buffer pool, sibling alloc reduction).
+
+## NOTE-212: skip the assembled-buffer copy for already-decoded columns — 2026-06-11
+
+**Decision:** On the warm columnar read path, `readBlockColumnarWithCache` fetched every
+wanted column's *compressed* blob from the memcache section cache (`preHits`) and
+`copy`-ed it into the per-block assembled buffer at the column's absolute ToC offset, so
+`parseBlockColumnsReuse` could read `rawBytes[start:end]`. But that parser FIRST consults
+the process-level `parsedV8ColumnCache` (NOTE-200), which holds the fully-DECODED column
+snapshot keyed by `(fileID, blockOffset, name, type)`. On the fully-warm steady state that
+decoded cache hits for the wanted columns, so the parser `continue`s and NEVER reads the
+compressed bytes — making the per-column `copy` into the assembled buffer pure dead work.
+On a wide metrics query (e.g. `rate() by (...)`, predicate-filtered `rate by`) that warm-path
+per-column memmove (plus the assembled-buffer alloc/churn it feeds) is the dominant remaining
+warm CPU/GC cost — prior CPU profiles attributed `runtime.memmove` + `runtime.memclrNoHeapPointers`
+~5-7% combined and the cache/assembled-buffer path as the top sink (status.log carries this as
+the standing "reduce decode/copy VOLUME, not per-row compute" target across NOTE-208/209/210).
+
+**Mechanism:** In the assembled-buffer fill loop, before copying a wanted column's `preHits`
+blob, probe `parsedV8ColumnCache.Get(v8ColumnCacheKey(fileID, blockOff, name, type))`. On a
+hit, stash the **live** snapshot pointer in a new per-Reader `preDecodedColumns`
+map (keyed by `preDecodedKey{blockOffset,name,colType}`) and `continue` — skipping both the
+memcache→assembled copy AND queuing the column for cold resolution. `parseBlockColumnsReuse`
+gains a `preDecodedLookup func(preDecodedKey) *Column` parameter (built by both
+`ParseBlockFromBytes` and `ParseBlockFromBytesWithIntern` via `r.preDecodedLookup()`); it
+checks that lookup FIRST, before the existing `parsedV8ColumnCache.Get`, and
+`copyDecodedColumnInto`s the snapshot when present.
+
+**Concurrency:** `ReadGroupColumnar` (which populates `preDecodedColumns`) is called from
+`blockGroupPipeline` worker goroutines CONCURRENTLY on the same `*Reader`, while the parse runs
+on the sequential consumer goroutine — and a read of group N+1 can run while group N is parsed.
+A `preDecodedMu sync.Mutex` guards every map access (the stash write and the lookup read).
+`preDecodedLookup()` returns `nil` when the map is empty so the common path (no pre-resolved
+columns) pays no lock or per-column call; the lookup closure itself locks per call but the map
+is tiny and accessed at most once per wanted column per block, so it is effectively uncontended
+off the heavy fan-out path. (In production query-frontend shards 1 block/querier-call, so the
+fan-out and thus contention never actually fire — but the lock keeps the general multi-group
+path race-free under `go test -race`.)
+
+**Safety (why this is race-free, not a probe-then-skip TOCTOU):** the naive form — reader
+probes the cache, skips the copy, parser re-probes — opens an eviction race: the snapshot can
+be LRU-evicted between the two probes, leaving the parser to decompress stale assembled-buffer
+bytes (garbage → snappy error or, worse, wrong data). We close that window by storing the LIVE
+`*Column` the reader observed. `objectcache.Cache.Get` returns a strong pointer; the Reader
+(one per querier call) retains it in `preDecodedColumns` for its whole lifetime, so the parse
+consumes the exact snapshot the reader saw — independent of any concurrent LRU eviction. The
+key uses the column's TRUE `(name, type)` because the cache/parser key on type and one block
+can carry the same name with different types. `blockOff` (from `cr.BlockOffsets[j]`) equals
+`r.BlockMeta(blockIdx).Offset` (both flow from `metas[bi].Offset` via `CoalesceBlocks`), so the
+reader's stash key and the parser's lookup key are identical. The assembled buffer still always
+holds the ToC prefix (header + metadata) the parser reads to locate columns; only the
+already-decoded column DATA extents are left unwritten, and those are never read.
+
+**Verified:** `TestReader_PreDecodedColumns_SkipCopyStillCorrect` warms both caches, confirms a
+fresh Reader pre-resolves every wanted column (`preDecodedColumns` fully populated), then
+CORRUPTS every column-data byte of the assembled buffer (restoring only the ToC prefix) and
+asserts the parse still returns the cold ground-truth per-row values — proving the skipped
+extents are never read and the snapshots drive the result. `go test -race` green for
+`./blockio/reader` + `./executor`, NOTE-200 warm==cold and NOTE-185 combined-fetch tests
+still pass.
+
+Back-ref: `columnar_read.go:readBlockColumnarWithCache` (the skip), `reader.go:Reader.preDecodedColumns`,
+`block_parser.go:parseBlockColumnsReuse` (`preDecoded` param + `preDecodedKey`), NOTE-200
+(decoded-column cache this reads), NOTE-208 (assembled-buffer pool this avoids touching),
+NOTE-185 (combined ToC+columns fetch whose copy this elides).
