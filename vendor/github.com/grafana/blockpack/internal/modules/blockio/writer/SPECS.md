@@ -107,6 +107,26 @@ Each column is encoded with the best-fit encoding selected at flush time:
 **Invariant:** The encoding with the smallest serialized size is chosen. All encodings
 produce byte-identical output for the same input across writer versions (format stability).
 
+**Bytes-column selection (NOTE-221, issue #333):** the bytes column path uses a two-tier
+data-driven selector (`bytes_cost_select.go`) instead of the legacy name-suffix dispatch
+(`isIDColumn`/`isURLColumn`):
+
+1. **Tier 1 — semantic overrides.** `shared.SemanticBytesOverride(name)` pins a family for a small
+   allow-list of **intrinsic** columns where the encoding is known a-priori: `trace:id` /
+   `log:trace_id` → DeltaDictionary (sorted 16-byte IDs); `span:id` / `span:parent_id` /
+   `log:span_id` → XOR (fixed-width IDs with shared high-order bits). User attribute names never
+   match. Adding an entry requires a >10% win over the cost path for that column.
+2. **Tier 2 — cost-based selection.** `gatherBytesStats` runs a single streaming pass (cap-N
+   distinct estimate, common-prefix fold, uniform-length detection, total bytes); the estimators
+   `estimateDictBytesCost` / `estimateXORBytesCost` / `estimatePrefixBytesCost` rank the candidate
+   families by estimated wire bytes and the cheapest wins.
+
+The demoted name heuristics (`isIDColumn`/`isURLColumn`) break only near-ties — when the runner-up
+estimate is within 5% (`bytesCostTiebreakFraction`) of the winner. They can never override a clear
+cost winner, so the legacy failure modes (`customer.duration_id`→XOR, `config.file.path`→Prefix)
+no longer occur. DeltaDictionary is not a cost candidate (its index-stream win requires sorted +
+clustered indexes, established only via the override table). No wire-format change — selection only.
+
 **AllPresent selection (NOTE-AP-001):** when a column is fully present
 (`presentCount == nRows`, `nRows > 0`) and `Config.DisableAllPresentEncoding` is false, the
 writer emits the AllPresent variant of the chosen dense kind (`shared.AllPresentKindFor`):

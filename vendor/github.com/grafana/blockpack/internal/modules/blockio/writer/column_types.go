@@ -549,27 +549,33 @@ func (b *bytesColumnBuilder) buildData() ([]byte, error) {
 	}
 	sparse := nullRatio > sparseNullRatioThreshold
 
-	switch {
-	case b.colName == traceIDColumnName:
+	// NOTE-221 (issue #333): two-tier data-driven selector. gatherBytesStats does the single
+	// streaming pass; pickBytesEncoding applies the semantic-override allow-list (intrinsic
+	// columns) then a cost estimate over candidate families, with the demoted name-suffix
+	// heuristics surviving only as a near-tie tiebreak inside pickBytesEncoding.
+	st := gatherBytesStats(b.values, b.present, nRows)
+	switch pickBytesEncoding(b.colName, st) {
+	case bytesEncDeltaDictionary:
 		if sparse {
 			return encodeDeltaDictionaryKind(KindSparseDeltaDictionary, b.values, b.present, nRows)
 		}
 		return encodeDeltaDictionaryKind(KindDeltaDictionary, b.values, b.present, nRows)
 
-	case isIDColumn(b.colName):
+	case bytesEncXOR:
 		if sparse {
 			return encodeXORBytes(KindSparseXORBytes, b.values, b.present, nRows)
 		}
 		return encodeXORBytes(KindXORBytes, b.values, b.present, nRows)
 
-	case isURLColumn(b.colName):
+	case bytesEncPrefix:
 		if sparse {
 			return encodePrefixBytes(KindSparsePrefixBytes, b.values, b.present, nRows)
 		}
 		return encodePrefixBytes(KindPrefixBytes, b.values, b.present, nRows)
 
+	case bytesEncDictionary:
+		fallthrough
 	default:
-		// Array columns and all others: dictionary encoding.
 		if sparse {
 			return encodeDictionaryKind(
 				KindSparseDictionary, shared.ColumnTypeBytes, b.values, b.present, nRows,

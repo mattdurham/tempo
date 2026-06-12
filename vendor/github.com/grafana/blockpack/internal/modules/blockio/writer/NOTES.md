@@ -657,3 +657,50 @@ Back-ref: `shared/constants.go` (VersionBlockV15, ColFlagInline, ColInlineMaxLen
           `writer/config.go:EnableInlineColumns`, `writer/writer.go:NewWriterWithConfig`,
           `reader/colmetaentry.go`, `reader/block_parser.go:parseColumnMetadataArray,parseBlockColumnsReuse`,
           `reader/reader.go:AddColumnsToBlock`, SPECS §12.2.1, NOTE-39, NOTE-V14-001, NOTE-007.
+
+## NOTE-221 — data-driven encoding selector for the bytes column path (issue #333)
+
+The legacy bytes selector (`encoding_select.go:isIDColumn/isURLColumn`, dispatched in
+`bytesColumnBuilder.buildData`) chose the encoding purely from the column NAME suffix with **zero
+inspection of the actual values**. Two concrete failure modes:
+
+1. `isIDColumn("customer.duration_id")` → forced XOR onto a duration value because the name ends
+   in `_id`. The suffix lied about the value shape.
+2. `isURLColumn("config.file.path")` → forced Prefix onto paths with no shared prefix across rows,
+   so the prefix dictionary stored a single empty prefix and every row paid the indirection.
+
+NOTE-221 replaces the name-suffix dispatch with a two-tier system (`bytes_cost_select.go`):
+
+**Tier 1 — semantic overrides.** A small, deliberate allow-list (`shared.semanticBytesOverrides`,
+queried via `shared.SemanticBytesOverride`) of **intrinsic** columns whose best encoding is known
+a-priori: `trace:id`/`log:trace_id` → DeltaDictionary (sorted 16-byte IDs), `span:id`/
+`span:parent_id`/`log:span_id` → XOR (fixed-width IDs with shared high-order bits). Only intrinsic
+names are eligible — user attribute names never match (`SemanticBytesOverride("attr.trace:id")`
+returns `SemanticBytesNone`). Each entry carries a `reason` justification; the issue requires a
+>10% win over the cost path before an entry is added.
+
+**Tier 2 — cost-based selection.** `gatherBytesStats` does a single streaming pass over the present
+values (alloc-free: cap-N FNV fingerprint distinct estimator, common-prefix fold, uniform-length
+detector, total bytes). Pure estimators (`estimateDictBytesCost`/`estimateXORBytesCost`/
+`estimatePrefixBytesCost`) rank candidate families by estimated wire bytes; the cheapest wins.
+
+**Demoted name heuristics.** `isIDColumn`/`isURLColumn` survive only as a near-tie tiebreak
+(`nameSuffixHint`): they break the decision toward XOR/Prefix only when the runner-up's estimate is
+within `bytesCostTiebreakFraction` (5%) of the winner AND the hint targets one of the two
+contenders. They can never override a clear cost winner — fixing both failure modes above.
+
+**DeltaDictionary is NOT a cost candidate.** Its only edge over plain Dictionary is a delta-coded
+index stream, which shrinks bytes only when the dictionary is sorted AND the per-row indexes are
+clustered — a property the streaming stats can't cheaply establish. Crediting it unconditionally
+made it spuriously beat Dictionary on unsorted low-cardinality columns. It is reachable only via
+the semantic-override table, where sortedness is known a-priori.
+
+The sparse/dense and AllPresent/uniform variants are still derived downstream by the encoders
+(NOTE-AP-001, NOTE-217); the selector only picks the encoding *family*. No wire-format change, no
+`enc_version`/block-version bump — this is purely a writer-side selection change, transparent to
+readers and compaction.
+
+Back-ref: `writer/bytes_cost_select.go`, `writer/column_types.go:bytesColumnBuilder.buildData`,
+          `writer/encoding_select.go:isIDColumn,isURLColumn`,
+          `shared/column_classify.go:SemanticBytesOverride,semanticBytesOverrides`,
+          SPEC-006, NOTE-AP-001, NOTE-217, NOTE-V14-002.
