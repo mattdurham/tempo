@@ -136,4 +136,15 @@ type Config struct {
 	//
 	// Reading is unaffected by this flag — readers always accept both forms.
 	DisableGorillaFloat64 bool
+
+	// EnableInlineColumns turns ON V15 inline-column TOC entries (NOTE-220). When true the
+	// writer emits VersionBlockV15 blocks and stores tiny columns (whose raw blob is strictly
+	// smaller inline than the offset+snappy form) directly in the TOC entry, skipping the
+	// offset indirection and the per-column outer snappy. When false (the DEFAULT) the writer
+	// emits VersionBlockV14 blocks exactly as before.
+	//
+	// Unlike the Disable* flags this defaults to OFF because V15 is a block-format version
+	// bump: V14-only readers cannot read a V15 block, so a writer emitting V15 must be deployed
+	// AFTER readers understand V15. Readers in this codebase accept both V14 and V15.
+	EnableInlineColumns bool
 }

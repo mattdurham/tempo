@@ -607,3 +607,53 @@ Back-ref: `shared/constants.go` (kinds 40/41 KindGorillaFloat64[AllPresent]),
           `writer/constants.go:gorillaFloat64EncodingEnabled`, `writer/config.go:DisableGorillaFloat64`,
           `reader/column.go:decodeGorillaFloat64,decodeGorillaStream`,
           SPECS §9.8, SPEC-006, NOTE-40, NOTE-215, NOTE-AP-001, NOTE-007.
+
+---
+
+## NOTE-220 — V15 inline tiny columns in the block TOC
+
+For tiny columns (low-cardinality intrinsics after RLE/dict, short-tail attributes) the per-column
+framing dominates the payload: a V14 TOC entry's offset tail is `data_offset[8] + compressed_len[4]
++ uncompressed_len[4]` = 16 bytes, plus the per-column outer snappy framing (~5 B), plus the data
+itself (often < 16 B). For such columns the framing is larger than the payload and the snappy
+round-trip is pure overhead.
+
+**Format (SPEC §12.2.1).** V15 (`VersionBlockV15` = 15) keeps the V14 24-byte block header
+unchanged and adds a per-column `flags[1]` byte after `col_type`. When `ColFlagInline` (0x01) is
+set, the column's raw blob follows as `inline_len[1] (≤ ColInlineMaxLen=255) + inline_data` — no
+`data_offset`, no `compressed_len`, no data-section blob, and no outer snappy.
+
+**Writer selection (`writer_block.go:finalize`).** After `buildData()` + outer-snappy, the writer
+compares the inline tail cost `1 + len(raw)` against the non-inline cost `16 + len(compressed)`
+(the shared `flags[1]` cancels). It marks the column inline when `1 + len(raw) < 16 +
+len(compressed)` AND `len(raw) ≤ ColInlineMaxLen`. So inline is chosen only when it is strictly
+smaller on the wire. Inline columns contribute nothing to the data section and do not advance the
+running data offset; the TOC-size and write loops branch on `bl.inline`.
+
+**Reader (`block_parser.go:parseColumnMetadataArray`).** Branches on `hdr.version`. V15 reads the
+`flags` byte; on inline it slices `inline_data` straight out of the TOC bytes into
+`colMetaEntry.inlineData` and uses it as the already-decompressed raw blob (no offset chase, no
+snappy). The eager-decode and `AddColumnsToBlock` paths decode directly from `inlineData`. The
+lazy-registration loop sets `Column.rawEncoding` directly so `ensureDecompressed` is a no-op and
+`decodeNow` decodes straight from the inline bytes — inline columns skip the defer-decompression
+machinery entirely (the "column exists?" fast path of NOTE-39 becomes a direct slice).
+
+**`readSufficientToC`** grows the cold ToC read until `parseColumnMetadataArray` succeeds, which
+now requires the inline bytes to be present, so the cached ToC always covers inline data. The
+columnar assembled-buffer paths copy the full ToC prefix (`raw[:tocEnd]`, which includes inline
+data) and skip `compressedLen == 0` columns from the per-column blob fetch — wanted inline columns
+are served from the copied TOC prefix with zero extra fetch.
+
+**Rollout flag:** `Config.EnableInlineColumns` (default **false** → V14). Unlike the NOTE-215/217/
+218/219 Disable* flags this defaults OFF because V15 is a block-format version bump: a V14-only
+reader cannot read a V15 block, so the writer must be deployed AFTER readers understand V15.
+Process-level atomic `constants.go:inlineColumnsEnabled`; `emittedBlockVersion()` returns V15 when
+set. Readers accept both V14 and V15. Compaction reads V14/V15 transparently and emits the
+configured output version.
+
+Back-ref: `shared/constants.go` (VersionBlockV15, ColFlagInline, ColInlineMaxLen),
+          `writer/writer_block.go:finalize`, `writer/writer_log.go:buildLogBlock`,
+          `writer/constants.go:inlineColumnsEnabled,emittedBlockVersion`,
+          `writer/config.go:EnableInlineColumns`, `writer/writer.go:NewWriterWithConfig`,
+          `reader/colmetaentry.go`, `reader/block_parser.go:parseColumnMetadataArray,parseBlockColumnsReuse`,
+          `reader/reader.go:AddColumnsToBlock`, SPECS §12.2.1, NOTE-39, NOTE-V14-001, NOTE-007.

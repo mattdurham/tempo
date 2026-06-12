@@ -401,7 +401,7 @@ func (r *Reader) layoutBlockV14(blockIdx int, meta shared.BlockMeta) ([]FileLayo
 		return nil, fmt.Errorf("parseBlockHeader: %w", err)
 	}
 
-	metas, colMetaEndPos, err := parseColumnMetadataArray(raw, 24, int(hdr.columnCount))
+	metas, colMetaEndPos, err := parseColumnMetadataArray(raw, 24, int(hdr.columnCount), hdr.version)
 	if err != nil {
 		return nil, fmt.Errorf("parseColumnMetadataArray: %w", err)
 	}
@@ -648,7 +648,7 @@ func (r *Reader) layoutBlock(blockIdx int, meta shared.BlockMeta) ([]FileLayoutS
 		return nil, fmt.Errorf("parseBlockHeader: %w", err)
 	}
 
-	metas, colMetaEndPos, err := parseColumnMetadataArray(raw, 24, int(hdr.columnCount))
+	metas, colMetaEndPos, err := parseColumnMetadataArray(raw, 24, int(hdr.columnCount), hdr.version)
 	if err != nil {
 		return nil, fmt.Errorf("parseColumnMetadataArray: %w", err)
 	}

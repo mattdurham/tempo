@@ -147,6 +147,9 @@ func NewWriterWithConfig(cfg Config) (*Writer, error) {
 	// NOTE-219: apply the Gorilla-XOR Float64 rollout flag. Default is enabled; setting
 	// Config.DisableGorillaFloat64 forces the Dictionary form (kinds 1/2) for float columns.
 	setGorillaFloat64Enabled(!cfg.DisableGorillaFloat64)
+	// NOTE-220: apply the V15 inline-column rollout flag. Default is DISABLED (V14 blocks);
+	// setting Config.EnableInlineColumns emits V15 blocks with inline tiny columns.
+	setInlineColumnsEnabled(cfg.EnableInlineColumns)
 	// Default auto-flush at 5× block size. Caps live proto memory to one batch of
 	// 5 blocks while preserving enough lookahead for MinHash sort quality.
 	if cfg.MaxBufferedSpans == 0 {
@@ -607,7 +610,7 @@ func (w *Writer) flushBlocks() error {
 			built, bb, err := buildBlock(
 				s.spans,
 				bb,
-				shared.VersionBlockV14,
+				emittedBlockVersion(),
 				localAccum,
 				s.blockID,
 				blockVecs,

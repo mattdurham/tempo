@@ -11,6 +11,25 @@ const (
 	// It is distinct from FooterV7Version (the file-level footer version).
 	VersionBlockV14 uint8 = 14
 
+	// VersionBlockV15 is the version byte at offset 4 in the 24-byte block header for
+	// blocks that use the V15 column TOC. V15 adds a per-column flags byte (NOTE-220);
+	// when ColFlagInline is set the column's raw (un-snappy) blob follows the flags byte
+	// inline in the TOC entry instead of being addressed by data_offset/compressed_len.
+	// The block header layout is identical to V14 (24 bytes); only the per-column TOC
+	// entry layout differs. V14 readers continue working on V14 files unchanged.
+	VersionBlockV15 uint8 = 15
+
+	// ColFlagInline is the V15 column TOC flag bit indicating the column's raw blob is
+	// stored inline directly after the flags byte (no offset indirection, no outer
+	// snappy). Inline payload length is bounded by ColInlineMaxLen.
+	ColFlagInline uint8 = 0x01
+
+	// ColInlineMaxLen is the maximum byte length of an inline column payload (NOTE-220).
+	// The inline length is encoded in a single byte, so the hard cap is 255; the writer
+	// only chooses inline when it is strictly smaller than the non-inline encoding, which
+	// is well under this cap for tiny low-cardinality columns.
+	ColInlineMaxLen = 255
+
 	// VersionBlockEncV3 is the enc_version byte inside each V14 column blob.
 	// V3 columns use raw (uncompressed) internal sub-segments; the outer snappy
 	// is applied per-column by the block writer.

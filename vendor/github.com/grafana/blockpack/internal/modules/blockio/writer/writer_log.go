@@ -596,7 +596,7 @@ func buildLogBlock(pending []pendingLogRecord) (builtBlock, error) {
 			bb.colMinMax[name] = fmm
 		}
 	}
-	payload, err := bb.finalize(shared.VersionBlockV14)
+	payload, err := bb.finalize(emittedBlockVersion())
 	if err != nil {
 		return builtBlock{}, err
 	}

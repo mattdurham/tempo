@@ -142,7 +142,12 @@ func FilterBlockColumns(raw []byte, wantColumns map[string]struct{}) ([]byte, er
 	if err != nil {
 		return raw, nil //nolint:nilerr // intentional: fallback to full bytes on parse error
 	}
-	metas, tocEnd, err := parseColumnMetadataArray(raw, int(shared.BlockHeaderV14Size), int(hdr.columnCount))
+	metas, tocEnd, err := parseColumnMetadataArray(
+		raw,
+		int(shared.BlockHeaderV14Size),
+		int(hdr.columnCount),
+		hdr.version,
+	)
 	if err != nil {
 		return raw, nil //nolint:nilerr // intentional: fallback to full bytes on parse error
 	}
@@ -332,7 +337,12 @@ func (r *Reader) readBlockColumnarWithCache(
 		return r.readFullBlockFallback(blockOff, blockLen, blockIdx)
 	}
 
-	metas, tocEnd, err := parseColumnMetadataArray(toc, int(shared.BlockHeaderV14Size), int(hdr.columnCount))
+	metas, tocEnd, err := parseColumnMetadataArray(
+		toc,
+		int(shared.BlockHeaderV14Size),
+		int(hdr.columnCount),
+		hdr.version,
+	)
 	if err != nil {
 		return r.readFullBlockFallback(blockOff, blockLen, blockIdx)
 	}
@@ -903,7 +913,7 @@ func (r *Reader) readSufficientToC(blockOff, blockLen int64) ([]byte, error) {
 			// Header error: let the outer fallback handle it (full block read).
 			return buf, nil //nolint:nilerr // intentional: defer corruption handling to caller
 		}
-		if _, _, err := parseColumnMetadataArray(buf, int(shared.BlockHeaderV14Size), int(hdr.columnCount)); err == nil {
+		if _, _, err := parseColumnMetadataArray(buf, int(shared.BlockHeaderV14Size), int(hdr.columnCount), hdr.version); err == nil {
 			return buf, nil // metadata array fully covered
 		}
 		size = min(blockLen, size*tocGrowthFactor)

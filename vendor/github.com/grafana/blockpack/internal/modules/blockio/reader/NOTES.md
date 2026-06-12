@@ -1584,3 +1584,37 @@ presence is synthesized rather than read. There is no sparse variant.
 Back-ref: `reader/column.go:decodeGorillaFloat64,decodeGorillaStream,readBitsLE`,
           `reader/layout.go:encodingKindNames`, `shared/constants.go` (kinds 40/41),
           writer NOTE-219, SPECS §9.8.
+
+---
+
+## NOTE-220 — V15 inline tiny columns (reader side)
+
+V15 (`VersionBlockV15` = 15) keeps the V14 block header unchanged but adds a per-column `flags[1]`
+byte after `col_type` in the TOC entry. When `ColFlagInline` (0x01) is set the column's raw
+(un-snappy) blob is stored inline as `inline_len[1] + inline_data` directly in the TOC entry — no
+`data_offset`/`compressed_len` and no data-section blob (writer NOTE-220, SPECS §12.2.1).
+
+`parseBlockHeader` now accepts both V14 and V15. `parseColumnMetadataArray` takes the block version
+and branches: for V15 it reads the flags byte, and on inline it slices `inline_data` straight out
+of the passed-in TOC bytes into `colMetaEntry.inlineData`. Both `compressedLen` and `dataOffset`
+are zero for an inline entry, so the "trace-level column" skip (`compressedLen == 0`) is widened to
+`compressedLen == 0 && inlineData == nil` everywhere it appears (eager loop, lazy-registration
+loop, `AddColumnsToBlock`).
+
+Inline columns bypass two expensive operations: the offset chase into `rawBytes` and the per-column
+snappy decompress. The eager-decode path uses `inlineData` directly as the decompressed
+`readColumnEncoding` input. The lazy-registration path sets `Column.rawEncoding = m.inlineData`
+directly (no `compressedEncoding`, no `v8CacheKey`) so `ensureDecompressed` is a no-op and
+`decodeNow` decodes straight from the inline bytes on first access.
+
+`readSufficientToC` grows the cold ToC read until `parseColumnMetadataArray` succeeds — which now
+requires the inline bytes present — so the cached ToC always covers inline data. The columnar
+assembled-buffer paths copy the full ToC prefix (`raw[:tocEnd]`, inline data included) and skip
+`compressedLen == 0` columns from the per-column blob fetch, so a wanted inline column is served
+from the copied prefix with zero extra fetch.
+
+Back-ref: `reader/colmetaentry.go:inlineData`,
+          `reader/block_parser.go:parseBlockHeader,parseColumnMetadataArray,parseBlockColumnsReuse`,
+          `reader/reader.go:AddColumnsToBlock`, `reader/columnar_read.go:readSufficientToC`,
+          `reader/column.go:ensureDecompressed,decodeNow`, `shared/constants.go` (VersionBlockV15,
+          ColFlagInline, ColInlineMaxLen), writer NOTE-220, SPECS §12.2.1, NOTE-39.

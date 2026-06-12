@@ -1363,6 +1363,51 @@ Column classification (intrinsic vs attribute) is still available via
 `shared.IsIntrinsicColumn(name)` for query-level filtering, but is not encoded in the
 block wire format. See §12.7 for the classification rule and query filtering implications.
 
+### 12.2.1 V15 Column TOC Entry (inline tiny columns, NOTE-220)
+
+V15 is a block-format version bump (`version` byte = 15, `VersionBlockV15`). The block header
+layout is **identical** to V14 (24 bytes); only the per-column TOC entry differs. V15 adds a
+`flags[1]` byte after `col_type`. When the `ColFlagInline` (0x01) bit is set, the column's raw
+(un-snappy) blob is stored inline directly in the TOC entry, skipping the offset indirection and
+the per-column outer snappy.
+
+**V15 Column TOC entry:**
+
+```
+name_len[2] + name[name_len] + col_type[1] + flags[1]
++ if flags & ColFlagInline == 0:  data_offset[8] + compressed_len[4] + uncompressed_len[4]
++ if flags & ColFlagInline == 1:  inline_len[1] (≤ ColInlineMaxLen=255) + inline_data[inline_len]
+```
+
+| Field | Type | Bytes | Description |
+|---|---|---|---|
+| name_len | uint16 LE | 2 | Column name length in bytes |
+| name | bytes | N | Column name (UTF-8) |
+| col_type | uint8 | 1 | ColumnType enum |
+| flags | uint8 | 1 | Bit 0 (ColFlagInline) = inline; other bits reserved (must be 0) |
+| *(non-inline)* data_offset | uint64 LE | 8 | Offset of column blob from block start |
+| *(non-inline)* compressed_len | uint32 LE | 4 | Byte length of snappy blob on disk |
+| *(non-inline)* uncompressed_len | uint32 LE | 4 | Byte length after snappy decompress |
+| *(inline)* inline_len | uint8 | 1 | Byte length of inline_data (≤ 255) |
+| *(inline)* inline_data | bytes | inline_len | Raw column blob (un-snappy), decoded directly |
+
+**Writer selection.** For each column the writer computes both the inline tail cost (`1 +
+len(raw)`) and the non-inline cost (`16 + len(snappy(raw))` = 16-byte TOC tail + the compressed
+blob in the data section; the shared `flags[1]` byte cancels). The column is stored inline when
+`1 + len(raw) < 16 + len(compressed)` **and** `len(raw) ≤ ColInlineMaxLen`. Inline columns have
+no data-section blob and do not advance the running data offset.
+
+**Reader.** `parseColumnMetadataArray` branches on `hdr.version`. For an inline column it slices
+`inline_data` directly out of the TOC bytes and uses it as the raw (already-decompressed) column
+blob — no offset chase, no snappy decompress. Inline columns also skip the lazy
+defer-decompression machinery: the lazy-registration loop sets `rawEncoding` directly so
+`ensureDecompressed` is a no-op and `decodeNow` decodes straight from the inline bytes.
+
+**Rollout.** Emission of V15 is gated by `writer.Config.EnableInlineColumns` (default OFF — the
+writer keeps emitting V14). V15 is a version bump that V14-only readers cannot read, so the writer
+must be deployed AFTER readers understand V15. Readers in this codebase accept both V14 and V15.
+Compaction reads V14/V15 inputs transparently and always emits the configured output version.
+
 ### 12.3 V14 Column Blob Format (enc_version=3)
 
 Each column blob on disk = `snappy.Encode(rawBlob)`. After decompression:

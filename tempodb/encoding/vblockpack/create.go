@@ -52,6 +52,11 @@ func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.Blo
 	writerCfg := blockpack.WriterConfig{
 		OutputStream:  tmp,
 		MaxBlockSpans: cfg.Blockpack.MaxSpansPerBlock,
+		// blockpack NOTE-220: emit V15 blocks with inline tiny columns. The reader accepts
+		// both V14 and V15, and this binary's reader was updated in the same change, so it
+		// is safe to enable here. Tiny low-cardinality columns are stored inline in the TOC
+		// entry, skipping the offset indirection and per-column outer snappy.
+		EnableInlineColumns: true,
 	}
 	// Pass embedder to blockpack writer — it handles field assembly and embedding internally.
 	// Must guard against nil *Embedder assigned to interface (Go nil interface trap).

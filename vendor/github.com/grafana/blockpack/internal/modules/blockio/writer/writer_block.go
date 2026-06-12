@@ -1498,28 +1498,46 @@ func (b *blockBuilder) finalize(blockVersion uint8) ([]byte, error) {
 
 	// Build column data blobs.
 	// SPEC-V14-001: for V14 blocks, each blob is snappy-compressed (outer per-column snappy).
+	// NOTE-220: for V15 blocks a column may instead be marked inline, in which case its raw
+	// (un-snappy) blob is stored directly in the TOC entry and dataBlob is empty.
 	type colBlob struct {
 		name            string
-		dataBlob        []byte // on-disk bytes (snappy-compressed for V14, raw for earlier)
+		dataBlob        []byte // on-disk bytes (snappy-compressed for V14+, raw for earlier)
+		rawBlob         []byte // V15 inline: raw bytes stored in the TOC entry
+		uncompressedLen uint32 // V14+ only: original raw byte length before snappy
 		typ             shared.ColumnType
-		uncompressedLen uint32 // V14 only: original raw byte length before snappy
+		inline          bool // V15 only: stored inline in the TOC entry
 	}
 	blobs := make([]colBlob, 0, colCount)
 
+	v14OrV15 := blockVersion == shared.VersionBlockV14 || blockVersion == shared.VersionBlockV15
 	for _, e := range entries {
 		raw, err := e.cb.buildData()
 		if err != nil {
 			return nil, fmt.Errorf("finalize column %q (type %v): %w", e.key.Name, e.key.Type, err)
 		}
-		if blockVersion == shared.VersionBlockV14 {
+		if v14OrV15 {
 			// SPEC-V14-001: outer snappy per column — no internal zstd (enc_version=3).
 			compressed := snappy.Encode(nil, raw)
-			blobs = append(blobs, colBlob{
+			bl := colBlob{
 				name:            e.key.Name,
 				typ:             e.cb.colType(),
 				dataBlob:        compressed,
 				uncompressedLen: uint32(len(raw)), //nolint:gosec // safe: raw blob bounded by block size
-			})
+			}
+			// NOTE-220: for V15, choose inline when it is strictly smaller on the wire.
+			// Non-inline costs 16 B of TOC tail (offset[8]+clen[4]+ulen[4]) PLUS the
+			// compressed blob in the data section. Inline costs 1 B of inline_len PLUS the
+			// raw blob in the TOC. The shared flags byte cancels. Inline wins when
+			//   1 + len(raw) < 16 + len(compressed)   and   len(raw) <= ColInlineMaxLen.
+			if blockVersion == shared.VersionBlockV15 &&
+				len(raw) <= shared.ColInlineMaxLen &&
+				1+len(raw) < 16+len(compressed) {
+				bl.inline = true
+				bl.rawBlob = raw
+				bl.dataBlob = nil
+			}
+			blobs = append(blobs, bl)
 		} else {
 			blobs = append(blobs, colBlob{
 				name:     e.key.Name,
@@ -1547,9 +1565,23 @@ func (b *blockBuilder) finalize(blockVersion uint8) ([]byte, error) {
 	if blockVersion < shared.VersionBlockV12 {
 		statsFieldSize = 16 // stats_offset[8] + stats_len[8]
 	}
+	// V15 adds a per-column flags[1] byte after col_type (NOTE-220).
+	flagsFieldSize := 0
+	if blockVersion == shared.VersionBlockV15 {
+		flagsFieldSize = 1
+	}
 	colMetaSize := 0
 	for _, bl := range blobs {
-		colMetaSize += 2 + len(bl.name) + 1 + 8 + 8 + statsFieldSize
+		// Common prefix: name_len[2] + name + col_type[1] (+ flags[1] for V15).
+		colMetaSize += 2 + len(bl.name) + 1 + flagsFieldSize
+		if bl.inline {
+			// NOTE-220: inline tail = inline_len[1] + inline_data[len(rawBlob)].
+			colMetaSize += 1 + len(bl.rawBlob)
+		} else {
+			// Offset-addressed tail = data_offset[8] + (compressed_len[4]+uncompressed_len[4]
+			// for V14/V15, or data_len[8]+stats stubs for earlier).
+			colMetaSize += 8 + 8 + statsFieldSize
+		}
 	}
 
 	// Data section starts immediately after column metadata (no stats section).
@@ -1599,13 +1631,32 @@ func (b *blockBuilder) finalize(blockVersion uint8) ([]byte, error) {
 		payload = append(payload, bl.name...)
 		// col_type[1]
 		payload = append(payload, byte(bl.typ))
-		// data_offset[8 LE]
-		payload = appendUint64LE(payload, dataOff)
-		if blockVersion == shared.VersionBlockV14 {
+
+		switch blockVersion {
+		case shared.VersionBlockV15:
+			// SPEC-V15-001 (NOTE-220): flags[1] then either inline or offset tail.
+			if bl.inline {
+				payload = append(payload, shared.ColFlagInline)
+				// inline_len[1] + inline_data[inline_len]
+				payload = append(payload, byte(len(bl.rawBlob))) //nolint:gosec // safe: len(rawBlob) ≤ ColInlineMaxLen
+				payload = append(payload, bl.rawBlob...)
+				// No data-section blob; curDataOff unchanged.
+				continue
+			}
+			payload = append(payload, 0) // flags: no inline
+			// data_offset[8 LE] + compressed_len[4 LE] + uncompressed_len[4 LE]
+			payload = appendUint64LE(payload, dataOff)
+			payload = appendUint32LE(payload, uint32(dataLen)) //nolint:gosec // safe: blob bounded by block size
+			payload = appendUint32LE(payload, bl.uncompressedLen)
+		case shared.VersionBlockV14:
+			// data_offset[8 LE]
+			payload = appendUint64LE(payload, dataOff)
 			// SPEC-V14-001: compressed_len[4 LE] + uncompressed_len[4 LE]
 			payload = appendUint32LE(payload, uint32(dataLen)) //nolint:gosec // safe: blob bounded by block size
 			payload = appendUint32LE(payload, bl.uncompressedLen)
-		} else {
+		default:
+			// data_offset[8 LE]
+			payload = appendUint64LE(payload, dataOff)
 			// data_len[8 LE]
 			payload = appendUint64LE(payload, dataLen)
 			// stats_offset[8 LE] + stats_len[8 LE] — omitted in VersionBlockV12+ (always were 0)

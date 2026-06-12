@@ -1029,7 +1029,7 @@ func (r *Reader) AddColumnsToBlock(bwb *BlockWithBytes, addColumns map[string]st
 	spanCount := int(hdr.spanCount)
 	colCount := int(hdr.columnCount)
 
-	metas, _, err := parseColumnMetadataArray(bwb.RawBytes, 24, colCount)
+	metas, _, err := parseColumnMetadataArray(bwb.RawBytes, 24, colCount, hdr.version)
 	if err != nil {
 		return fmt.Errorf("AddColumnsToBlock: column metadata: %w", err)
 	}
@@ -1055,17 +1055,8 @@ func (r *Reader) AddColumnsToBlock(bwb *BlockWithBytes, addColumns map[string]st
 			continue
 		}
 
-		if m.compressedLen == 0 {
+		if m.compressedLen == 0 && m.inlineData == nil {
 			continue
-		}
-
-		start := int(m.dataOffset)          //nolint:gosec // safe: dataOffset bounded by block size < MaxBlockSize
-		end := start + int(m.compressedLen) //nolint:gosec // safe: compressedLen bounded by block size < MaxBlockSize
-		if start < 0 || end > len(bwb.RawBytes) {
-			return fmt.Errorf(
-				"AddColumnsToBlock: col %q data offset %d len %d out of range",
-				m.name, m.dataOffset, m.compressedLen,
-			)
 		}
 
 		col := &Column{
@@ -1073,11 +1064,26 @@ func (r *Reader) AddColumnsToBlock(bwb *BlockWithBytes, addColumns map[string]st
 			Type: m.colType,
 		}
 
-		// SPEC-V14-001: column blobs are snappy-compressed; decompress before decode.
-		// SPEC-ROOT-012: decompressV14ColumnData guards against decompression-bomb OOM.
-		colData, err := decompressV14ColumnData(m.name, bwb.RawBytes[start:end], m.uncompressedLen)
-		if err != nil {
-			return fmt.Errorf("AddColumnsToBlock: %w", err)
+		var colData []byte
+		if m.inlineData != nil {
+			// NOTE-220: inline column — raw blob in the TOC entry, no offset/snappy.
+			colData = m.inlineData
+		} else {
+			start := int(m.dataOffset)          //nolint:gosec // safe: dataOffset bounded by block size < MaxBlockSize
+			end := start + int(m.compressedLen) //nolint:gosec // safe: compressedLen bounded by block size < MaxBlockSize
+			if start < 0 || end > len(bwb.RawBytes) {
+				return fmt.Errorf(
+					"AddColumnsToBlock: col %q data offset %d len %d out of range",
+					m.name, m.dataOffset, m.compressedLen,
+				)
+			}
+
+			// SPEC-V14-001: column blobs are snappy-compressed; decompress before decode.
+			// SPEC-ROOT-012: decompressV14ColumnData guards against decompression-bomb OOM.
+			colData, err = decompressV14ColumnData(m.name, bwb.RawBytes[start:end], m.uncompressedLen)
+			if err != nil {
+				return fmt.Errorf("AddColumnsToBlock: %w", err)
+			}
 		}
 
 		decoded, err := readColumnEncoding(colData, spanCount, m.colType, ctx)

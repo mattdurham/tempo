@@ -112,6 +112,35 @@ func gorillaFloat64Enabled() bool {
 	return gorillaFloat64EncodingEnabled.Load()
 }
 
+// inlineColumnsEnabled is the process-level rollout toggle for V15 inline-column TOC
+// entries (NOTE-220). It defaults to false because V15 is a block-format version bump
+// that V14-only readers cannot read; a writer must be deployed AFTER readers understand
+// V15. When true, NewWriterWithConfig emits VersionBlockV15 blocks and tiny columns whose
+// raw blob is strictly smaller inline are stored directly in the TOC entry. Atomic for the
+// same reason as allPresentEncodingEnabled: a deploy-level constant in practice, atomic
+// access just removes the data race between per-block encoder goroutines and a concurrent
+// writer construction.
+var inlineColumnsEnabled atomic.Bool //nolint:gochecknoglobals // process-level rollout flag
+
+// setInlineColumnsEnabled sets the process-level V15 inline-column rollout flag.
+func setInlineColumnsEnabled(v bool) {
+	inlineColumnsEnabled.Store(v)
+}
+
+// inlineColumnsActive reports whether V15 inline-column emission is active.
+func inlineColumnsActive() bool {
+	return inlineColumnsEnabled.Load()
+}
+
+// emittedBlockVersion returns the block-header version the writer should emit. V15 when the
+// inline-column rollout flag is set (NOTE-220), V14 otherwise.
+func emittedBlockVersion() uint8 {
+	if inlineColumnsActive() {
+		return shared.VersionBlockV15
+	}
+	return shared.VersionBlockV14
+}
+
 // Encoding kind constants per SPECS §9 — canonical definitions live in shared.Kind*.
 // These aliases are preserved so writer-internal code continues to compile unchanged.
 const (
