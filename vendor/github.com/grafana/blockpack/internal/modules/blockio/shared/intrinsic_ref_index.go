@@ -289,6 +289,60 @@ func scatterDictRefIndexDense(idx []RefIndexEntry, minRow uint32) bool {
 	return ok
 }
 
+// markDenseIfContiguous inspects the freshly-built (sorted) refIndex and enables the
+// NOTE-229 O(1) reverse-lookup fast path when the index is a dense contiguous single-block
+// RowIdx permutation: every entry shares one high-16 BlockIdx and the low-16 RowIdx values
+// are exactly [minRow, minRow+n). In that case refIndex[k].Packed == hi16<<16 | (minRow+k)
+// for all k, so a lookup of packedRef maps directly to rank = (packedRef&0xFFFF)-minRow with
+// no binary search. The check is a single O(N) scan over the already-built index; it never
+// mutates the index and only sets the col.refDense fields, which are published together with
+// refIndex under the EnsureRefIndex sync.Once. It is purely a function of the data's ref
+// shape (the dominant single-block dense decode), not of any query or column identity.
+func (col *IntrinsicColumn) markDenseIfContiguous() {
+	idx := col.refIndex
+	n := len(idx)
+	if n == 0 {
+		return
+	}
+	hi16 := idx[0].Packed >> 16
+	minRow := idx[0].Packed & 0xFFFF
+	// A dense permutation of n rows occupies exactly [minRow, minRow+n) within the 16-bit
+	// RowIdx space; reject up front if that range would overflow 16 bits.
+	if int(minRow)+n > 1<<16 {
+		return
+	}
+	want := idx[0].Packed
+	for k := range idx {
+		if idx[k].Packed != want {
+			return
+		}
+		want++
+	}
+	col.refDense = true
+	col.refDenseHi16 = hi16
+	col.refDenseMin = minRow
+}
+
+// denseLookupPos returns the value-array position for packedRef using the NOTE-229 dense
+// fast path, or (-1, false) when the fast path does not apply. When col.refDense holds, the
+// index is a dense contiguous single-block permutation, so rank = (RowIdx-minRow) is the
+// position directly — provided the high-16 matches and the rank is in range. A packedRef that
+// fails either guard genuinely is not in the index (the dense range is exhaustive), so a
+// false ok with a valid index means "not found" without any further search.
+func (col *IntrinsicColumn) denseLookupPos(packedRef uint32) (pos int, ok bool) {
+	if !col.refDense {
+		return -1, false
+	}
+	if packedRef>>16 != col.refDenseHi16 {
+		return -1, true
+	}
+	rank := int((packedRef & 0xFFFF) - col.refDenseMin)
+	if rank < 0 || rank >= len(col.refIndex) {
+		return -1, true
+	}
+	return int(col.refIndex[rank].Pos), true
+}
+
 // EnsureRefIndex builds a sorted-by-packed-ref lookup index into this column, enabling
 // O(log N) reverse lookup via the typed accessor methods. Safe to call concurrently —
 // the index is built at most once (sync.Once). No-op if already built or col is nil.
@@ -345,6 +399,7 @@ func (col *IntrinsicColumn) EnsureRefIndex() {
 				radixSortRefIndex(idx)
 			}
 			col.refIndex = idx
+			col.markDenseIfContiguous()
 		case IntrinsicFormatDict:
 			total := 0
 			for _, e := range col.DictEntries {
@@ -425,6 +480,7 @@ func (col *IntrinsicColumn) EnsureRefIndex() {
 				radixSortRefIndex(idx)
 			}
 			col.refIndex = idx
+			col.markDenseIfContiguous()
 		}
 	})
 }
@@ -435,6 +491,12 @@ func (col *IntrinsicColumn) lookupRefIdx(packedRef uint32) int {
 	col.EnsureRefIndex()
 	if len(col.refIndex) == 0 {
 		return -1
+	}
+	// NOTE-229: O(1) dense fast path. When the index is a dense contiguous single-block
+	// permutation the position is rank arithmetic; a fast-path miss is a genuine not-found
+	// (the dense range is exhaustive), so there is no fall-through to the binary search.
+	if dpos, ok := col.denseLookupPos(packedRef); ok {
+		return dpos
 	}
 	pos, ok := slices.BinarySearchFunc(col.refIndex, packedRef, func(e RefIndexEntry, target uint32) int {
 		return cmp.Compare(e.Packed, target)
@@ -520,17 +582,12 @@ func (col *IntrinsicColumn) LookupRefFast(packedRef uint32) (val any, found bool
 	if col == nil {
 		return nil, false
 	}
-	col.EnsureRefIndex()
-	if len(col.refIndex) == 0 {
+	// lookupRefIdx (NOTE-229) handles EnsureRefIndex, the O(1) dense fast path, and the
+	// binary-search fallback; it returns -1 when the ref is absent.
+	idx := col.lookupRefIdx(packedRef)
+	if idx < 0 {
 		return nil, false
 	}
-	pos, ok := slices.BinarySearchFunc(col.refIndex, packedRef, func(e RefIndexEntry, target uint32) int {
-		return cmp.Compare(e.Packed, target)
-	})
-	if !ok {
-		return nil, false
-	}
-	idx := int(col.refIndex[pos].Pos)
 	switch col.Format {
 	case IntrinsicFormatFlat, IntrinsicFormatXORBytes, IntrinsicFormatDeltaUint64:
 		if idx < len(col.Uint64Values) {

@@ -1119,3 +1119,44 @@ full sort — the high half contributes nothing to the comparison. Multi-block i
 single-byte/multi-byte/duplicate/reverse RowIdx with both zero and non-zero constant BlockIdx.
 
 Back-ref: `internal/modules/blockio/shared/intrinsic_ref_index.go:radixSortRefIndexLow16`
+
+---
+
+## NOTE-229: O(1) dense reverse lookup — skip the binary search on contiguous single-block indexes
+*Added: 2026-06-12*
+
+`lookupRefIdx` (and the typed `LookupRefFast*` accessors built on it) answered every reverse
+ref→position lookup with `slices.BinarySearchFunc` plus a `cmp.Compare` comparator closure. On
+group-by rate/histogram and trace-assembly queries that lookup runs once per row per probed
+column, and the comparator closure showed up alongside `mapaccess2_faststr` as a residual
+per-row CPU cost in querier profiles.
+
+**Observation:** the dominant decode shape is a single block (query-frontend shards one block per
+querier call), and for a fully-present column every row appears exactly once, so the built
+`refIndex` is a **dense contiguous** ascending run: `refIndex[k].Packed == hi16<<16 | (minRow+k)`
+for all `k`. NOTE-226's dense scatter already produces exactly this layout for dict columns, and
+the NOTE-168 "already sorted" flat path produces it whenever the refs are emitted in row order
+with no gaps.
+
+**Optimization:** `markDenseIfContiguous` runs one O(N) scan over the freshly-built (sorted)
+index inside the `EnsureRefIndex` `sync.Once` body. If every entry's `Packed` equals
+`idx[0].Packed + k` (i.e. constant high-16 and a gapless `[minRow, minRow+n)` RowIdx run) it sets
+`col.refDense`, `col.refDenseHi16`, and `col.refDenseMin`. A subsequent `lookupRefIdx` then maps
+`packedRef` directly: `rank = (packedRef&0xFFFF) - minRow`, validating the high-16 and the range.
+Because the dense range is **exhaustive**, a fast-path guard failure is a genuine not-found — there
+is no fall-through to the binary search, so a present ref costs one subtraction + one bounds check
++ one indexed load, and an absent ref costs even less.
+
+**Safety:** the fields are written only inside the `sync.Once` body and published together with
+`refIndex` under the Once's happens-before, so the concurrent `EnsureRefIndex` callers
+(NOTE-192) see a consistent (refIndex, refDense*) pair. When the column is sparse (optional
+attribute → RowIdx gap), multi-block (high-16 varies), or otherwise non-contiguous, the scan does
+not set `refDense` and lookups keep using the binary search unchanged. `LookupRefFast` (the
+`any`-returning variant) was refactored to delegate to `lookupRefIdx`, removing its duplicated
+comparator closure so the dense path applies uniformly. `BlockRefRange` (a range, not a point
+query) keeps its binary search. `TestDenseLookup_EqualsBinarySearch` probes every in- and
+out-of-range RowIdx plus a wrong BlockIdx and asserts the dense path matches the binary search
+exactly; `TestDenseLookup_NotSetWhenSparse` confirms a RowIdx gap disables the flag and keeps
+lookups correct.
+
+Back-ref: `internal/modules/blockio/shared/intrinsic_ref_index.go:markDenseIfContiguous`
