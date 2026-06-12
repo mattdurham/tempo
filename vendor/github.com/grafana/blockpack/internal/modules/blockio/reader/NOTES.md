@@ -1618,3 +1618,29 @@ Back-ref: `reader/colmetaentry.go:inlineData`,
           `reader/reader.go:AddColumnsToBlock`, `reader/columnar_read.go:readSufficientToC`,
           `reader/column.go:ensureDecompressed,decodeNow`, `shared/constants.go` (VersionBlockV15,
           ColFlagInline, ColInlineMaxLen), writer NOTE-220, SPECS §12.2.1, NOTE-39.
+
+## NOTE-222: PresenceView — hoist the per-row IsPresent atomic out of scan loops
+*Added: 2026-06-12*
+
+**Problem:** `Column.IsPresent(idx)` performs an atomic `decoded.Load()` (via `needsDecode`)
+on EVERY call. The atomic is load-bearing for the cross-goroutine happens-before chain from
+`decodeNow`'s `sync.Once` write to a reader of `c.Present` (NOTE-CONC-001). But in a scan over
+`SpanCount` rows the column is decoded exactly once — on the first `IsPresent` — so every
+subsequent row paid an atomic load purely to re-confirm a state that cannot change for the
+duration of the scan. A querier CPU profile (2026-06-12) showed `Column.IsPresent` at ~7% of
+blockpack self-time, dominated by the per-row presence checks in the executor's
+`column_provider.go` stream-scan loops (dict-mask, regex, !=, is-null, is-not-null).
+
+**Solution:** `PresenceView()` establishes the decode happens-before chain ONCE (it goes
+through `needsDecode`/`decodeNow` exactly like `IsPresent`) and returns the column's stable,
+immutable `Present` bitmap (`nil` = all spans present). Scan loops call it once before the
+loop and then bit-test inline via `shared.IsPresent` (executor helper `presentAt`), eliminating
+the per-row atomic. After `decodeNow` returns, `Present` is part of the shared decoded snapshot
+and never mutates, so repeated non-atomic reads within one scan are race-free.
+
+Semantically identical to a per-row `IsPresent`: nil bitmap → present, else the bit. Single
+non-loop callsites (metrics_trace, stream_log_topk) keep `IsPresent` — there the atomic is
+amortized over the whole call and hoisting buys nothing.
+
+Back-ref: `reader/block.go:PresenceView`, `executor/column_provider.go:presentAt` and the
+converted stream-scan loops.

@@ -129,6 +129,30 @@ func (c *Column) IsPresent(idx int) bool {
 	return shared.IsPresent(p, idx)
 }
 
+// PresenceView ensures the column is decoded and returns its raw presence bitmap.
+// A nil result means every span is present (no presence bitmap was stored). The
+// returned slice is the column's immutable decoded Present bitmap and must not be
+// mutated by callers — test bits with shared.IsPresent.
+//
+// NOTE-222: hoist the per-row IsPresent atomic out of tight scan loops. IsPresent(idx)
+// performs an atomic decoded.Load() (via needsDecode) on EVERY call so that a concurrent
+// decodeNow write is observed with the correct happens-before ordering. In a scan over
+// SpanCount rows the column is decoded exactly once — on the first IsPresent — yet the
+// atomic load was paid on every subsequent row. A querier CPU profile (2026-06-12) showed
+// Column.IsPresent at ~7% of blockpack self-time, dominated by these per-row scans in
+// column_provider.go. PresenceView establishes the decode happens-before chain ONCE
+// (it goes through needsDecode/decodeNow just like IsPresent) and hands the caller the
+// stable Present bitmap, so the loop can bit-test inline with no further atomics. After
+// decodeNow returns, Present is immutable for the lifetime of the column (it is part of
+// the shared decoded snapshot), so reading it repeatedly without re-loading the atomic is
+// race-free for the duration of a single scan.
+func (c *Column) PresenceView() []byte {
+	if c.needsDecode() {
+		c.decodeNow()
+	}
+	return c.Present
+}
+
 // StringValue returns the string value at idx and whether it is present.
 // For ColumnTypeUUID columns, the 16-byte binary value is formatted as a UUID string
 // (e.g. "213085fc-b15b-45fc-8fa0-d448d4a246be"), preserving the original string representation.

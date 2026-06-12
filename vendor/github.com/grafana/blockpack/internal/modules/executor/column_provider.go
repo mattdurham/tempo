@@ -17,6 +17,18 @@ import (
 	"github.com/grafana/blockpack/internal/vm"
 )
 
+// presentAt tests whether row idx is present given a presence bitmap hoisted once via
+// Column.PresenceView (NOTE-222). A nil bitmap means every span is present, mirroring
+// Column.IsPresent's nil-Present semantics — but without the per-row atomic decoded.Load()
+// that IsPresent pays on every call. Callers must obtain present from col.PresenceView()
+// BEFORE the scan loop (which establishes the decode happens-before chain once).
+func presentAt(present []byte, idx int) bool {
+	if present == nil {
+		return true
+	}
+	return modules_shared.IsPresent(present, idx)
+}
+
 // cmp3 returns cmp.Compare(a, b) and true. Wraps cmp.Compare to match rowCompare's (int, bool) signature.
 // NOTE-059: reduces rowCompare cyclomatic complexity from 40 to ~20 by replacing repeated
 // three-way switch blocks with a single generic call.
@@ -90,8 +102,9 @@ func classifyValueKind(values []any) valueKind {
 // Mirrors the loop body from scanStringDictFloat (NOTE-026) exactly.
 func scanDictMaskRows(col *modules_reader.Column, idx []uint32, dictMatch []bool, cb vm.RowCallback) int {
 	count := 0
+	present := col.PresenceView()
 	for i := range col.SpanCount {
-		if !col.IsPresent(i) {
+		if !presentAt(present, i) {
 			continue
 		}
 		if i >= len(idx) {
@@ -527,8 +540,9 @@ func scanStringDictFloat(
 	}
 	spanCount := col.SpanCount
 	count := 0
+	present := col.PresenceView()
 	for i := range spanCount {
-		if !col.IsPresent(i) {
+		if !presentAt(present, i) {
 			continue
 		}
 		if i >= len(col.StringIdx) {
@@ -653,8 +667,9 @@ func scanNumericDictMask(
 ) int {
 	spanCount := col.SpanCount
 	count := 0
+	present := col.PresenceView()
 	for i := range spanCount {
-		if !col.IsPresent(i) {
+		if !presentAt(present, i) {
 			continue
 		}
 		if i >= len(idx) {
@@ -772,10 +787,11 @@ func (p *blockColumnProvider) StreamScanNotEqual(column string, value interface{
 	}
 	n := p.block.SpanCount()
 	count := 0
+	present := col.PresenceView()
 	for i := range n {
 		// Skip absent rows — a span without the attribute does not match != predicates.
 		// SQL NULL semantics: NULL != X is false/NULL, not true (SPEC-SCAN-2).
-		if !col.IsPresent(i) {
+		if !presentAt(present, i) {
 			continue
 		}
 		if !rowEqual(col, i, value) {
@@ -913,8 +929,12 @@ func (p *blockColumnProvider) StreamScanIsNull(column string, cb vm.RowCallback)
 	col := p.lookupColumn(column)
 	n := p.block.SpanCount()
 	count := 0
+	var present []byte
+	if col != nil {
+		present = col.PresenceView()
+	}
 	for i := range n {
-		isNull := col == nil || !col.IsPresent(i)
+		isNull := col == nil || !presentAt(present, i)
 		if isNull {
 			if !cb(i) {
 				return count, nil
@@ -931,7 +951,8 @@ func (p *blockColumnProvider) StreamScanIsNotNull(column string, cb vm.RowCallba
 	if col == nil {
 		return 0, nil
 	}
-	n := p.scanWith(col, func(i int) bool { return col.IsPresent(i) }, cb)
+	present := col.PresenceView()
+	n := p.scanWith(col, func(i int) bool { return presentAt(present, i) }, cb)
 	return n, nil
 }
 
@@ -950,8 +971,9 @@ func (p *blockColumnProvider) StreamScanRegex(column, pattern string, cb vm.RowC
 	if err != nil {
 		return 0, fmt.Errorf("invalid regex %q: %w", pattern, err)
 	}
+	present := col.PresenceView()
 	n := p.scanWith(col, func(i int) bool {
-		if !col.IsPresent(i) {
+		if !presentAt(present, i) {
 			return false
 		}
 		if v, ok := col.StringValue(i); ok {
@@ -975,9 +997,13 @@ func (p *blockColumnProvider) StreamScanRegexNotMatch(
 	}
 	n := p.block.SpanCount()
 	count := 0
+	var present []byte
+	if col != nil {
+		present = col.PresenceView()
+	}
 	for i := range n {
 		var matches bool
-		if col != nil && col.IsPresent(i) {
+		if col != nil && presentAt(present, i) {
 			if v, ok := col.StringValue(i); ok {
 				matches = re.MatchString(v)
 			}
@@ -1003,8 +1029,9 @@ func (p *blockColumnProvider) StreamScanContains(column, substring string, cb vm
 		}
 		return 0, nil
 	}
+	present := col.PresenceView()
 	n := p.scanWith(col, func(i int) bool {
-		if !col.IsPresent(i) {
+		if !presentAt(present, i) {
 			return false
 		}
 		if v, ok := col.StringValue(i); ok {
@@ -1039,11 +1066,12 @@ func (p *blockColumnProvider) streamScanRegexFast(
 		return 0, nil
 	}
 	values := col.StringValues()
+	present := col.PresenceView()
 	count := 0
 	if re == nil {
 		// CI fold-contains path: prefixes are pre-lowercased by AnalyzeRegex.
 		for i, v := range values {
-			if v == "" && !col.IsPresent(i) {
+			if v == "" && !presentAt(present, i) {
 				continue
 			}
 			if containsAnySubstring(strings.ToLower(v), prefixes) {
@@ -1056,7 +1084,7 @@ func (p *blockColumnProvider) streamScanRegexFast(
 		return count, nil
 	}
 	for i, v := range values {
-		if v == "" && !col.IsPresent(i) {
+		if v == "" && !presentAt(present, i) {
 			continue // absent row
 		}
 		// Prefix pre-filter: skip regex if no prefix matches (safe — no false negatives).
@@ -1092,11 +1120,12 @@ func (p *blockColumnProvider) streamScanRegexNotMatchFast(
 		return count, nil
 	}
 	values := col.StringValues()
+	present := col.PresenceView()
 	if re == nil {
 		// CI fold-contains path: prefixes are pre-lowercased by AnalyzeRegex.
 		for i := range n {
 			v := values[i]
-			absent := v == "" && !col.IsPresent(i)
+			absent := v == "" && !presentAt(present, i)
 			matches := !absent && containsAnySubstring(strings.ToLower(v), prefixes)
 			if !matches {
 				if !cb(i) {
@@ -1109,7 +1138,7 @@ func (p *blockColumnProvider) streamScanRegexNotMatchFast(
 	}
 	for i := range n {
 		v := values[i]
-		absent := v == "" && !col.IsPresent(i)
+		absent := v == "" && !presentAt(present, i)
 		// Absent rows do not match regex → they satisfy NOT MATCH.
 		matches := !absent && re.MatchString(v)
 		if !matches {
