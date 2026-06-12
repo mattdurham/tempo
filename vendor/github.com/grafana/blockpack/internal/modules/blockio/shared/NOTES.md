@@ -1260,3 +1260,29 @@ boundary values 0/255/256/65535 and a non-zero starting `pos` and a pre-populate
 and asserts both the decoded refs and the returned position are byte-for-byte correct.
 
 Back-ref: `internal/modules/blockio/shared/intrinsic_codec.go:appendVariableWidthRefs`
+
+## NOTE-237: xorInvertInto — word-wide XOR via crypto/subtle.XORBytes
+
+`xorInvertInto` reconstructs each XOR-bytes column value by XOR-ing the stored delta against
+the previous value. It runs once per row on the XOR-bytes decode path that backs the 8-byte
+`span:id` and 16-byte `trace:id` columns (`appendXORBytesPage`, ~0.33% querier self-time plus
+this helper at ~0.14%, profile 2026-06-12).
+
+The old form was a scalar per-byte loop `for i := range minLen { dst[i] = xored[i] ^ prev[i] }`.
+Each iteration paid three bounds checks (`dst[i]`, `xored[i]`, `prev[i]`) — 24 for an 8-byte
+span ID, 48 for a 16-byte trace ID — and processed one byte per step.
+
+**Change:** XOR the overlapping prefix with `crypto/subtle.XORBytes(dst[:minLen],
+xored[:minLen], prev[:minLen])`. That stdlib routine hoists the bounds check to a single
+length argument and XORs 8 bytes per step (word-wide, with an assembly fast path on amd64),
+so the 16-byte case drops from ~6.3ns to ~4.27ns (~-33%) in a microbench. The non-overlapping
+tail (when `xored` is longer than `prev` — the first row of a page, where `prev` resets to
+nil) keeps the plain `copy`, byte-for-byte identical to before.
+
+**Safety / why byte-identical:** XOR is commutative and the operation is unchanged — only the
+iteration width moved into the stdlib. A length-sweep equivalence test (lengths
+0/1/7/8/15/16/17/32 against prev lengths 0/1/8/16/equal/longer) confirms the result matches
+the old scalar loop for every combination, including the `len(prev) > len(xored)` case where
+prev's trailing bytes are intentionally dropped.
+
+Back-ref: `internal/modules/blockio/shared/intrinsic_codec.go:xorInvertInto`
