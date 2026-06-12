@@ -1188,3 +1188,37 @@ an independent binary-search reference for the matching BlockIdx and for neighbo
 BlockIdx values (which must be empty) plus the 0 and 0xFFFF edges.
 
 Back-ref: `internal/modules/blockio/shared/intrinsic_ref_index.go:BlockRefRange`
+
+## NOTE-235: EnsureRefIndex — fuse the radix first-count pass into the build scan
+
+**Context:** A querier CPU profile (2026-06-12) attributed ~2.48% of total CPU to
+`radixSortRefIndex` (the largest single blockpack frame) and a further ~0.84% to the
+`EnsureRefIndex.func1` build closure. Both functions scan every `RefIndexEntry` once:
+`EnsureRefIndex` builds the `Packed` key and detects sorted / single-block shape, and then the
+radix sorter re-scanned the same N entries from scratch to tally its lowest-byte histogram
+(`hist[0]`) and the `keyOr` byte-skip fold before any scatter ran. That is a redundant full
+N-element pass over data the build loop has already touched.
+
+**Optimization:** the `EnsureRefIndex` build loops (flat and dict) now accumulate the
+lowest-byte histogram `hist0[Packed&0xFF]++` and the `keyOr |= Packed` fold inline — a single
+array increment and OR per ref they already iterate. The two radix sorters are split into a
+thin self-counting wrapper (`radixSortRefIndex`, `radixSortRefIndexLow16`, kept for the
+standalone test/bench callers) and a *prepared* core (`radixSortRefIndexPrepared`,
+`radixSortRefIndexLow16Prepared`) that takes the pre-built `hist0`/`keyOr` and skips its own
+first count scan entirely. The lowest byte of `Packed` equals the lowest byte of
+`Packed&0xFFFF`, so ONE accumulated `hist0` seeds both the generic and the low-16 sorter;
+`lowOr` is just `keyOr&0xFFFF`. The radix digit width is hoisted to the package const
+`radixBitsRefIndex` so the prepared functions can size their `[1<<radixBitsRefIndex]int`
+histogram parameter from it.
+
+**Safety:** the prepared sorters require `hist0` to be EXACTLY the lowest-byte histogram of
+`idx` and `keyOr`/`lowOr` the OR-fold of every key; the build loops compute precisely these over
+the same `idx` they pass, so the result is byte-for-byte identical to the self-counting path.
+The dict dense-scatter branch (NOTE-226) ignores the accumulators; its low-16 *fallback*
+(`scatterDictRefIndexDense` returns false WITHOUT mutating `idx`) runs on the unchanged build
+order, so the accumulated histogram still matches. `TestRadixSortRefIndexPreparedEqualsSelfCounting`
+feeds the prepared sorters a build-loop-computed histogram across single-block and multi-block
+key magnitudes and asserts identical output to the self-counting wrappers; the existing
+`TestRadixSortRefIndexMatchesSortFunc` / `ByteSkip` / `EdgeCases` still cover the wrappers.
+
+Back-ref: `internal/modules/blockio/shared/intrinsic_ref_index.go:EnsureRefIndex`

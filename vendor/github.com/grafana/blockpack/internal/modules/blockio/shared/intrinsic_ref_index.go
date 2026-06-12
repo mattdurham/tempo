@@ -36,6 +36,13 @@ var radixBufPool = sync.Pool{
 // bounded (mirrors the cap-guard discipline used for the intern/lazy-column pools).
 const radixBufCap = 1 << 20 // 1Mi RefIndexEntry = 8 MiB
 
+// radixBitsRefIndex is the radix digit width (bits per LSD pass) shared by the ref-index radix
+// sorters. NOTE-235: hoisted to a package const so radixSortRefIndexPrepared can declare its
+// pre-built first-histogram parameter as a [1<<radixBitsRefIndex]int array whose size is tied to
+// the digit width (a 256-bucket byte histogram). Changing this single value resizes every pass
+// histogram consistently.
+const radixBitsRefIndex = 8
+
 func getRadixBuf(n int) *[]RefIndexEntry {
 	bp := radixBufPool.Get().(*[]RefIndexEntry)
 	if cap(*bp) < n {
@@ -94,10 +101,8 @@ func putRadixBuf(bp *[]RefIndexEntry) {
 // Purely a reorganization of when counts are tallied; the prefix-sum, scatter order, pass
 // count, and odd-pass copy-back are unchanged, so output is byte-for-byte identical.
 func radixSortRefIndex(idx []RefIndexEntry) {
-	const radixBits = 8
-	const radixSize = 1 << radixBits
+	const radixSize = 1 << radixBitsRefIndex
 	const radixMask = radixSize - 1
-	const numBytes = 32 / radixBits
 	n := len(idx)
 	if n < 2 {
 		return
@@ -106,16 +111,42 @@ func radixSortRefIndex(idx []RefIndexEntry) {
 	// Pass 1's count scan doubles as the OR scan: it tallies the lowest byte's histogram while
 	// ORing all keys to learn the highest significant byte (NOTE-190 byte-skip bound).
 	var keyOr uint32
-	var hist [numBytes][radixSize]int
+	var hist0 [radixSize]int
 	for i := range idx {
 		k := idx[i].Packed
 		keyOr |= k
-		hist[0][k&radixMask]++
+		hist0[k&radixMask]++
+	}
+	radixSortRefIndexPrepared(idx, keyOr, &hist0)
+}
+
+// radixSortRefIndexPrepared sorts idx in ascending Packed order given a PRE-COMPUTED first
+// (lowest-byte) histogram and key OR-fold. NOTE-235: EnsureRefIndex's build loop already
+// scans every ref once to compute the Packed key and detect sorted/single-block shape (the
+// ~0.84% EnsureRefIndex.func1 self-time, profile 2026-06-12). radixSortRefIndex then re-scanned
+// the same N entries to tally hist[0] and keyOr before any scatter ran — a second full pass over
+// the index. By accumulating hist0[k&0xFF]++ and keyOr|=k INSIDE the build loop (a cheap byte
+// store + or per ref it already touches) and handing them here, the dedicated first count pass
+// is eliminated entirely. The generic path runs up to three byte-scatter passes on multi-block
+// indexes (the ~2.48% radixSortRefIndex self-time — the single largest blockpack frame), so
+// removing one full N-element count scan is a measurable fraction of that cost. hist0 must be
+// EXACTLY the lowest-byte histogram of idx and keyOr the OR-fold of every idx[i].Packed; the
+// result is byte-for-byte identical to a self-counting radixSortRefIndex.
+func radixSortRefIndexPrepared(idx []RefIndexEntry, keyOr uint32, hist0 *[1 << radixBitsRefIndex]int) {
+	const radixBits = radixBitsRefIndex
+	const radixSize = 1 << radixBits
+	const radixMask = radixSize - 1
+	const numBytes = 32 / radixBits
+	n := len(idx)
+	if n < 2 {
+		return
 	}
 	// keyOr==0 means all keys are 0; the slice is already trivially sorted, no passes needed.
 	if keyOr == 0 {
 		return
 	}
+	var hist [numBytes][radixSize]int
+	hist[0] = *hist0
 	// maxShift is the start shift of the highest non-zero byte. Passes run at byte positions
 	// 0..maxByte; histograms for higher (all-zero) bytes are never computed or consumed.
 	maxShift := 0
@@ -190,8 +221,7 @@ func radixSortRefIndex(idx []RefIndexEntry) {
 // the NOTE-205 fused-histogram two-pass LSD radix over the low two bytes, with the NOTE-190
 // byte-skip still applied to the low half (a single-byte RowIdx range runs only one pass).
 func radixSortRefIndexLow16(idx []RefIndexEntry) {
-	const radixBits = 8
-	const radixSize = 1 << radixBits
+	const radixSize = 1 << radixBitsRefIndex
 	const radixMask = radixSize - 1
 	n := len(idx)
 	if n < 2 {
@@ -199,15 +229,37 @@ func radixSortRefIndexLow16(idx []RefIndexEntry) {
 	}
 	// Pass 1's count scan doubles as the low-half OR scan (NOTE-190 byte-skip over 16 bits).
 	var lowOr uint32
-	var hist [2][radixSize]int
+	var hist0 [radixSize]int
 	for i := range idx {
 		k := idx[i].Packed & 0xFFFF
 		lowOr |= k
-		hist[0][k&radixMask]++
+		hist0[k&radixMask]++
+	}
+	radixSortRefIndexLow16Prepared(idx, lowOr, &hist0)
+}
+
+// radixSortRefIndexLow16Prepared sorts idx in ascending Packed order over the low-16 RowIdx
+// (single-block invariant: constant high-16), given the PRE-COMPUTED lowest-byte histogram and
+// low-16 OR-fold. NOTE-235: the lowest byte of Packed and the lowest byte of (Packed&0xFFFF) are
+// identical, so the SAME hist0 the EnsureRefIndex build loop accumulates for the generic sorter
+// also seeds this one; lowOr is just keyOr&0xFFFF. The single-block fallback (NOTE-228) is a
+// frequent EnsureRefIndex outcome, so eliminating its dedicated first count scan removes a full
+// N-element pass here too. hist0 must be EXACTLY the lowest-byte histogram of idx and lowOr the
+// OR-fold of every idx[i].Packed&0xFFFF; the result is byte-for-byte identical to a self-counting
+// radixSortRefIndexLow16.
+func radixSortRefIndexLow16Prepared(idx []RefIndexEntry, lowOr uint32, hist0 *[1 << radixBitsRefIndex]int) {
+	const radixBits = radixBitsRefIndex
+	const radixSize = 1 << radixBits
+	const radixMask = radixSize - 1
+	n := len(idx)
+	if n < 2 {
+		return
 	}
 	if lowOr == 0 {
 		return // all RowIdx==0 (single row, or already trivially ordered)
 	}
+	var hist [2][radixSize]int
+	hist[0] = *hist0
 	// Run a second (high byte of the low half) pass only when RowIdx exceeds 8 bits.
 	maxByte := 0
 	if lowOr>>radixBits != 0 {
@@ -369,16 +421,21 @@ func (col *IntrinsicColumn) EnsureRefIndex() {
 			// do, the unsorted fallback only needs to sort the low-16 RowIdx, so route it
 			// to radixSortRefIndexLow16 (≤2 passes) instead of the general radixSortRefIndex
 			// (up to 4 passes when BlockIdx>0 makes the high bytes non-zero but constant).
+			// NOTE-235: accumulate the lowest-byte radix histogram and the key OR-fold in
+			// this same build scan so the chosen radix sorter skips its own first count pass.
 			sorted := true
 			singleBlock := true
 			var prev uint32
-			var hi16 uint32
+			var hi16, keyOr uint32
+			var hist0 [1 << radixBitsRefIndex]int
 			for i, ref := range col.BlockRefs {
 				p := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx) //nolint:gosec
 				idx[i] = RefIndexEntry{
 					Packed: p,
 					Pos:    int32(i), //nolint:gosec
 				}
+				keyOr |= p
+				hist0[p&((1<<radixBitsRefIndex)-1)]++
 				if i == 0 {
 					hi16 = p >> 16
 				} else {
@@ -394,9 +451,9 @@ func (col *IntrinsicColumn) EnsureRefIndex() {
 			switch {
 			case sorted:
 			case singleBlock:
-				radixSortRefIndexLow16(idx)
+				radixSortRefIndexLow16Prepared(idx, keyOr&0xFFFF, &hist0)
 			default:
-				radixSortRefIndex(idx)
+				radixSortRefIndexPrepared(idx, keyOr, &hist0)
 			}
 			col.refIndex = idx
 			col.markDenseIfContiguous()
@@ -425,10 +482,15 @@ func (col *IntrinsicColumn) EnsureRefIndex() {
 			// + dense permutation) during the build scan and only scatter when proven dense;
 			// any high-16 variation, out-of-range row, gap, or duplicate falls back to the
 			// general append + radix path, so the output is byte-for-byte identical.
+			// NOTE-235: accumulate the lowest-byte radix histogram and the key OR-fold in
+			// this same build scan so the non-dense radix branches skip their first count pass.
+			// The dense rank-scatter branch (NOTE-226) ignores them; the per-ref array store is
+			// negligible against the existing memory-bound append.
 			sorted := true
 			singleBlock := true
 			var prev uint32
-			var hi16, minRow, maxRow uint32
+			var hi16, minRow, maxRow, keyOr uint32
+			var hist0 [1 << radixBitsRefIndex]int
 			first := true
 			for entryIdx, entry := range col.DictEntries {
 				for _, ref := range entry.BlockRefs {
@@ -437,6 +499,8 @@ func (col *IntrinsicColumn) EnsureRefIndex() {
 						Packed: p,
 						Pos:    int32(entryIdx), //nolint:gosec
 					})
+					keyOr |= p
+					hist0[p&((1<<radixBitsRefIndex)-1)]++
 					if first {
 						hi16 = p >> 16
 						minRow = p & 0xFFFF
@@ -468,16 +532,16 @@ func (col *IntrinsicColumn) EnsureRefIndex() {
 				// fall back to the low-16 sort (NOTE-228) on the original append order —
 				// this branch is guarded by singleBlock so the high-16 is constant.
 				if !scatterDictRefIndexDense(idx, minRow) {
-					radixSortRefIndexLow16(idx)
+					radixSortRefIndexLow16Prepared(idx, keyOr&0xFFFF, &hist0)
 				}
 			case singleBlock:
 				// NOTE-228: single block but the RowIdx permutation is not the dense
 				// contiguous range (an optional/sparse dict column — the attribute is
 				// present on only some spans). RowIdx is still unique per row and the
 				// high-16 BlockIdx is constant, so only the low-16 needs sorting.
-				radixSortRefIndexLow16(idx)
+				radixSortRefIndexLow16Prepared(idx, keyOr&0xFFFF, &hist0)
 			default:
-				radixSortRefIndex(idx)
+				radixSortRefIndexPrepared(idx, keyOr, &hist0)
 			}
 			col.refIndex = idx
 			col.markDenseIfContiguous()
