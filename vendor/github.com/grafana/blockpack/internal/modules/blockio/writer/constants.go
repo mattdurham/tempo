@@ -91,6 +91,27 @@ func uniformBytesEnabled() bool {
 	return uniformBytesEncodingEnabled.Load()
 }
 
+// gorillaFloat64EncodingEnabled is the process-level rollout toggle for the Gorilla-XOR Float64
+// encoding kinds (NOTE-219). It defaults to true. NewWriterWithConfig sets it from
+// Config.DisableGorillaFloat64. Atomic for the same reason as allPresentEncodingEnabled:
+// a deploy-level constant in practice, atomic access just removes the data race between
+// per-block encoder goroutines and a concurrent writer construction.
+var gorillaFloat64EncodingEnabled atomic.Bool //nolint:gochecknoglobals // process-level rollout flag
+
+func init() { //nolint:gochecknoinits // one-time default for the rollout flag
+	gorillaFloat64EncodingEnabled.Store(true)
+}
+
+// setGorillaFloat64Enabled sets the process-level Gorilla-XOR Float64 rollout flag.
+func setGorillaFloat64Enabled(v bool) {
+	gorillaFloat64EncodingEnabled.Store(v)
+}
+
+// gorillaFloat64Enabled reports whether Gorilla-XOR Float64 selection is active.
+func gorillaFloat64Enabled() bool {
+	return gorillaFloat64EncodingEnabled.Load()
+}
+
 // Encoding kind constants per SPECS §9 — canonical definitions live in shared.Kind*.
 // These aliases are preserved so writer-internal code continues to compile unchanged.
 const (
@@ -129,6 +150,10 @@ const (
 
 	// Per-page DeltaUint64 kind — re-exported from shared (NOTE-218).
 	KindDeltaUint64Paged = shared.KindDeltaUint64Paged
+
+	// Gorilla Float64 kinds — re-exported from shared (NOTE-219).
+	KindGorillaFloat64           = shared.KindGorillaFloat64
+	KindGorillaFloat64AllPresent = shared.KindGorillaFloat64AllPresent
 )
 
 // Trace intrinsic column name constants — aliases to canonical definitions in shared.

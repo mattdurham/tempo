@@ -301,6 +301,8 @@ func readColumnEncoding(data []byte, spanCount int, colType shared.ColumnType, c
 		return decodePrefixBytes(data[2:], baseKind, spanCount, ctx, allPresent)
 	case shared.KindDeltaDictionary, shared.KindSparseDeltaDictionary:
 		return decodeDeltaDictionary(data[2:], baseKind, spanCount, ctx, allPresent)
+	case shared.KindGorillaFloat64:
+		return decodeGorillaFloat64(data[2:], spanCount, allPresent)
 	default:
 		return nil, fmt.Errorf("column encoding: unknown kind %d", kind)
 	}
@@ -950,6 +952,166 @@ func decodeDeltaUint64BitPacked(data []byte, spanCount int, allPresent bool) (*C
 	}
 
 	return col, nil
+}
+
+// decodeGorillaFloat64 decodes kind 40 (GorillaFloat64, NOTE-219, SPECS §9.8).
+// data starts after enc_version + kind bytes. allPresent signals the kind-41 AllPresent
+// variant whose presence_rle segment is omitted.
+//
+// Wire: span_count[4] + presence(maybe) + stream_bit_len[8] + stream_len[4] + stream_bytes.
+//
+// The decoded present values are stored as a flat Float64Dict (one entry per present row) with
+// an identity-by-present Float64Idx — the same dense layout decodeDeltaUint64BitPacked uses for
+// uint64. Each present value is reconstructed by XOR-folding the Gorilla stream against the
+// running predecessor; the exact IEEE-754 bit pattern is preserved (NaN payloads, ±0.0).
+func decodeGorillaFloat64(data []byte, spanCount int, allPresent bool) (*Column, error) {
+	col := &Column{SpanCount: spanCount}
+
+	if len(data) < 4 {
+		return nil, fmt.Errorf("gorilla_float64: data too short")
+	}
+
+	storedSpanCount := int(binary.LittleEndian.Uint32(data[0:]))
+	pos := 4
+
+	if storedSpanCount != spanCount {
+		return nil, fmt.Errorf("gorilla_float64: span_count %d != spanCount %d", storedSpanCount, spanCount)
+	}
+
+	present, newPos, presentCount, err := decodePresenceMaybe(data, pos, spanCount, allPresent)
+	if err != nil {
+		return nil, fmt.Errorf("gorilla_float64: %w", err)
+	}
+	pos = newPos
+	col.Present = present
+
+	if pos+8 > len(data) {
+		return nil, fmt.Errorf("gorilla_float64: missing stream_bit_len at pos %d", pos)
+	}
+	streamBitLen := binary.LittleEndian.Uint64(data[pos:])
+	pos += 8
+
+	stream, _, err := readRawSegment(data, pos)
+	if err != nil {
+		return nil, fmt.Errorf("gorilla_float64: stream: %w", err)
+	}
+	if uint64(len(stream))*8 < streamBitLen {
+		return nil, fmt.Errorf(
+			"gorilla_float64: stream %d bytes too short for bit_len %d",
+			len(stream), streamBitLen,
+		)
+	}
+
+	col.Float64Dict = make([]float64, presentCount)
+	col.Float64Idx = make([]uint32, spanCount)
+
+	if err := decodeGorillaStream(stream, streamBitLen, col.Float64Dict); err != nil {
+		return nil, fmt.Errorf("gorilla_float64: %w", err)
+	}
+
+	dictIdx := 0
+	for i := range spanCount {
+		if shared.IsPresent(present, i) {
+			col.Float64Idx[i] = uint32(dictIdx) //nolint:gosec
+			dictIdx++
+		}
+	}
+
+	return col, nil
+}
+
+// decodeGorillaStream unpacks the Gorilla-XOR bit stream into out (len == present count). It is
+// the exact inverse of the writer's encodeGorillaFloat64 stream loop. streamBitLen bounds the
+// readable bits so trailing zero padding in the final byte is never misread as a control bit.
+func decodeGorillaStream(stream []byte, streamBitLen uint64, out []float64) error {
+	if len(out) == 0 {
+		return nil
+	}
+
+	bitPos := 0
+	readBit := func() (uint64, error) {
+		if uint64(bitPos)+1 > streamBitLen { //nolint:gosec // bitPos >= 0
+			return 0, fmt.Errorf("stream underrun at bit %d", bitPos)
+		}
+		b := readBitsLE(stream, bitPos, 1)
+		bitPos++
+		return b, nil
+	}
+	readN := func(width uint8) (uint64, error) {
+		if uint64(bitPos)+uint64(width) > streamBitLen { //nolint:gosec // bitPos >= 0
+			return 0, fmt.Errorf("stream underrun reading %d bits at %d", width, bitPos)
+		}
+		v := readBitsLE(stream, bitPos, width)
+		bitPos += int(width)
+		return v, nil
+	}
+
+	// First value is stored verbatim as a 64-bit word.
+	firstBits, err := readN(64)
+	if err != nil {
+		return err
+	}
+	out[0] = math.Float64frombits(firstBits)
+	prevBits := firstBits
+
+	var prevLeading, prevTrailing uint8
+	for i := 1; i < len(out); i++ {
+		ctrl, err := readBit()
+		if err != nil {
+			return err
+		}
+		if ctrl == 0 {
+			out[i] = math.Float64frombits(prevBits)
+			continue
+		}
+		block, err := readBit()
+		if err != nil {
+			return err
+		}
+		if block == 0 {
+			// Reuse previous window.
+			meaningfulLen := 64 - int(prevLeading) - int(prevTrailing)
+			if meaningfulLen < 1 || meaningfulLen > 64 {
+				return fmt.Errorf("invalid reused window len %d at value %d", meaningfulLen, i)
+			}
+			m, mErr := readN(uint8(meaningfulLen)) //nolint:gosec // 1..64
+			if mErr != nil {
+				return mErr
+			}
+			xor := m << uint(prevTrailing)
+			curBits := prevBits ^ xor
+			out[i] = math.Float64frombits(curBits)
+			prevBits = curBits
+			continue
+		}
+		// New window: leading[5] + meaningful_len_minus_1[6] + meaningful[len].
+		leadingV, err := readN(5)
+		if err != nil {
+			return err
+		}
+		lenV, err := readN(6)
+		if err != nil {
+			return err
+		}
+		leading := uint8(leadingV)                      //nolint:gosec // 0..31
+		meaningfulLen := int(lenV) + 1                  //nolint:gosec // lenV 0..63 -> 1..64
+		trailing := 64 - leading - uint8(meaningfulLen) //nolint:gosec // bounded below
+		if int(leading)+meaningfulLen > 64 {
+			return fmt.Errorf("invalid new window leading=%d len=%d at value %d", leading, meaningfulLen, i)
+		}
+		m, mErr := readN(uint8(meaningfulLen)) //nolint:gosec // 1..64
+		if mErr != nil {
+			return mErr
+		}
+		xor := m << uint(trailing)
+		curBits := prevBits ^ xor
+		out[i] = math.Float64frombits(curBits)
+		prevBits = curBits
+		prevLeading = leading
+		prevTrailing = trailing
+	}
+
+	return nil
 }
 
 // deltaPageSizeReader is the number of present rows per page in the per-page DeltaUint64

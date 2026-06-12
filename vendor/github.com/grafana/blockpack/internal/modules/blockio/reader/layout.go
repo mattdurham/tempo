@@ -901,6 +901,10 @@ var encodingKindNames = map[uint8]string{ //nolint:gochecknoglobals
 
 	// Per-page DeltaUint64 kind (NOTE-218).
 	shared.KindDeltaUint64Paged: "DeltaUint64Paged",
+
+	// Gorilla-XOR Float64 kinds (NOTE-219).
+	shared.KindGorillaFloat64:           "GorillaFloat64",
+	shared.KindGorillaFloat64AllPresent: "GorillaFloat64AllPresent",
 }
 
 // encodingKindName maps the encoding kind byte (byte 1 of each column data blob) to its name.

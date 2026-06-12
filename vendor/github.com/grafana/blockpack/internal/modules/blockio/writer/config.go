@@ -125,4 +125,15 @@ type Config struct {
 	//
 	// Reading is unaffected by this flag — readers always accept both forms.
 	DisableUniformBytes bool
+
+	// DisableGorillaFloat64 turns off selection of the Gorilla-XOR Float64 encoding kinds
+	// (NOTE-219). When false (the default), high-cardinality, value-correlated float64 columns
+	// are written using the Gorilla-XOR variant (kinds 40/41) instead of the Dictionary path
+	// (kinds 1/2) which provides no real deduplication for such columns (see SPEC-006). Low-
+	// cardinality float columns stay on Dictionary+RLE regardless of this flag. Set to true
+	// during rollout to force the Dictionary form for every float column, so a writer can be
+	// deployed ahead of readers that understand the new kinds.
+	//
+	// Reading is unaffected by this flag — readers always accept both forms.
+	DisableGorillaFloat64 bool
 }

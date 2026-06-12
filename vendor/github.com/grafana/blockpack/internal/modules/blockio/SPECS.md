@@ -675,6 +675,8 @@ determines the remainder of the wire format.
 | 27 | SparseInlineBytesUniform | Bytes | as kind 26, >50% nulls (reader-only) |
 | 28 | XORBytesUniformAllPresent | Bytes | fully-present uniform-length ID columns |
 | 39 | DeltaUint64Paged | Uint64 | bursty-then-trickle timestamps spanning multiple pages |
+| 40 | GorillaFloat64 | Float64 | high-cardinality, value-correlated floats (NOTE-40 numeric-string sweet spot) |
+| 41 | GorillaFloat64AllPresent | Float64 | fully-present, as kind 40 |
 
 ### 9.0 AllPresent Encoding Kinds (kinds 15–21)
 
@@ -1019,6 +1021,64 @@ delta_data_zstd [delta_len]byte  // zstd-compressed delta-encoded index array
 
 Decode: accumulate deltas starting from 0. `index[i] = prev + delta[i]`. Result must be in
 `[0, dict_size)`.
+
+### 9.8 Gorilla Float64 (kinds 40, 41 — NOTE-219)
+
+A Gorilla-XOR encoding (Pelkonen et al., *Gorilla*, VLDB 2015) for **high-cardinality,
+value-correlated** Float64 / RangeFloat64 columns — the column population where the Dictionary
+path (kinds 1/2) provides no real deduplication and just pays raw-value + index overhead. The
+primary target is the `ColumnTypeRangeFloat64` columns created by numeric-string promotion
+(NOTE-40): body-parsed log fields like `latency_ms="423.7"` where each row is a distinct,
+adjacency-correlated value. **Low-cardinality float columns deliberately stay on Dictionary+RLE**
+— the selection rule (SPEC-006 / below) excludes them because Dictionary already gives ~1–2 B/val
+there and Gorilla would regress them.
+
+```
+span_count     uint32 LE
+presence_rle   [see §9.1]            // rle_len(4) + rle_data — omitted for kind 41 (AllPresent)
+stream_bit_len uint64 LE            // total meaningful bit count of the bit stream
+stream_len     uint32 LE
+stream_bytes   [stream_len]byte     // LSB-first Gorilla bit stream
+```
+
+**Bit stream** (present values in row order, LSB-first via the same primitive as §9.4.1):
+
+- The first present value is stored verbatim as a 64-bit IEEE-754 word.
+- Each subsequent present value `v` is XORed against its predecessor (`xor = bits(v) ^
+  bits(prev)`):
+  - `xor == 0` → emit control bit `0`. (Value equals predecessor.)
+  - `xor != 0` → emit control bit `1`, then a block-reuse bit:
+    - `0` → the meaningful bits fit inside the previous `(leading, trailing)` window: emit
+      `meaningful[prevLen]` where `prevLen = 64 - prevLeading - prevTrailing`.
+    - `1` → new window: emit `leading[5] + (meaningful_len - 1)[6] + meaningful[meaningful_len]`,
+      where `leading = clamp(LeadingZeros64(xor), max 31)`, `trailing = TrailingZeros64(xor)`,
+      and `meaningful_len = 64 - leading - trailing`.
+
+`leading` is clamped at 31 so it fits in 5 bits (standard Gorilla). `meaningful_len` is stored as
+`len-1` in 6 bits (range 1..64 → 0..63). The decoder reconstructs `trailing = 64 - leading -
+meaningful_len` for new windows. `stream_bit_len` bounds the readable bits so trailing zero
+padding in the final byte is never misread as a control bit.
+
+The encoding is **exact** for every IEEE-754 bit pattern — NaN payloads (quiet/signaling, any
+sign), ±Inf, ±0.0, and denormals all round-trip because the algorithm operates on raw 64-bit
+words, never on float arithmetic.
+
+**Selection (SPEC-006):** the writer chooses kind 40/41 over the Dictionary path only when **all**:
+
+1. The rollout flag is enabled (`Config.DisableGorillaFloat64 == false`, NOTE-007 pattern).
+2. `present_count >= 64` (amortizes the fixed `stream_bit_len[8] + first_value[8]` header).
+3. `distinct_present_values > max(64, present_count / 4)` — the **critical two-population guard**.
+   This routes only columns whose values are mostly distinct (where the dictionary cannot dedup);
+   low-cardinality columns (e.g. 4 sampling ratios across millions of rows) fall below the
+   threshold and stay on Dictionary. Widening this rule without re-running the threshold sweep
+   risks regressing the low-cardinality population — see writer/NOTES.md NOTE-219.
+
+The decision is **purely data-driven** (cardinality vs present-row count), never name- or
+type-based, so it generalizes across the whole float column population.
+
+Kind 41 is the AllPresent variant (§9.0): it omits the `presence_rle` segment. There is no sparse
+(>50% nulls) variant — high-cardinality float columns are overwhelmingly fully present after
+numeric-string promotion, and the dense kind already handles interleaved nulls via presence-RLE.
 
 ---
 

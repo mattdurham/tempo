@@ -550,3 +550,60 @@ Back-ref: `shared/constants.go` (kind 39 KindDeltaUint64Paged),
           `writer/constants.go:pagedDeltaEncodingEnabled`, `writer/config.go:DisablePagedDelta`,
           `reader/column.go:decodeDeltaUint64Paged,deltaPageSizeReader`,
           SPECS §9.4.2, SPEC-006, NOTE-215, NOTE-007.
+
+## NOTE-219: Gorilla-XOR Float64 (kinds 40/41)
+
+`float64ColumnBuilder.buildData` previously routed every float column to the Dictionary path
+(kinds 1/2, RLE-upgraded for tiny dicts). That is correct for **low-cardinality** floats but
+wasteful for **high-cardinality, value-correlated** floats — the `ColumnTypeRangeFloat64` columns
+created by numeric-string promotion (NOTE-40), e.g. body-parsed `latency_ms="423.7"`. For those
+the dictionary stores ~one entry per row (no real dedup) and pays ~13 B/val after snappy, while
+the values are quasi-monotonic and would compress to ~2–3 B/val under Gorilla-XOR (Pelkonen et
+al., VLDB 2015). NOTE-219 adds `encodeGorillaFloat64` (`encoding_gorilla.go`, kind 40, AllPresent
+kind 41): the first present value is stored verbatim, each subsequent value is XORed against its
+predecessor and the meaningful bits packed LSB-first (reusing `writeBitsLE` from NOTE-215). Wire
+format and selection rule: SPECS §9.8, SPEC-006.
+
+**Two-population analysis — DO NOT widen the guard naively.** The float column population splits:
+
+- **Low-cardinality** (HTTP sampling ratios `0.0/0.1/0.5/1.0`, rounded utilization gauges, TLS
+  versions as floats, health-check percentages): the dict has ≤16 entries; Dictionary+RLE gives
+  ~1–2 B/val (sometimes 50× compression). **Gorilla would REGRESS these to ~2–3 B/val.** They MUST
+  stay on Dictionary.
+- **High-cardinality correlated** (NOTE-40 numeric-string-promoted latencies/durations,
+  high-precision OTLP attrs, metric observation values): mostly distinct, adjacency-correlated.
+  Dictionary cannot help; Gorilla wins 4–6×.
+
+`shouldUseGorillaFloat64` separates them with a purely data-driven rule (never name/type-based, so
+it generalizes): `presentCount ≥ 64` AND `distinctPresentValues > max(64, presentCount/4)`. The
+cardinality is counted on the raw IEEE-754 bit pattern (`float64PresenceAndCardinality`), so
+-0.0/+0.0 and distinct NaN payloads count separately — matching the encoder's exact-roundtrip
+contract. **Widening this guard (e.g. to `cardinality > 16`) without re-running the threshold
+sweep across traces/logs/metrics would capture the low-cardinality population and regress it.**
+
+**Exactness.** The encoder operates on raw 64-bit words, never float arithmetic, so every IEEE-754
+value round-trips exactly: NaN (quiet/signaling, any payload, any sign), ±Inf, ±0.0, and denormals.
+`leading` is clamped to 31 (5-bit field, standard Gorilla); `meaningful_len` is stored as `len-1`
+in 6 bits; the decoder reconstructs `trailing = 64 - leading - meaningful_len`. `stream_bit_len`
+bounds the readable bits so trailing zero padding in the last byte is never read as a control bit.
+
+**No sparse variant.** High-cardinality float columns are overwhelmingly fully present after
+numeric-string promotion; the dense kind already carries interleaved nulls via presence-RLE, and
+the AllPresent layering (NOTE-AP-001) emits kind 41 for the common fully-present case. Sparse
+(>50% nulls) high-cardinality floats are rare enough not to justify a fourth kind.
+
+**Rollout flag:** `Config.DisableGorillaFloat64` (default false → Gorilla on) forces the Dictionary
+form for every float column, mirroring the NOTE-215/217/218 atomic-bool pattern
+(`constants.go:gorillaFloat64EncodingEnabled`).
+
+**Backwards compatibility:** new kind IDs (40/41) only; no `enc_version` bump. Old readers reject
+the unknown kinds at `reader/column.go:readColumnEncoding`. Compaction is transparent — it reads
+decoded values via the reader API and re-encodes via the writer, re-evaluating selection on the
+re-encoded column population, so the new kinds need no compaction code.
+
+Back-ref: `shared/constants.go` (kinds 40/41 KindGorillaFloat64[AllPresent]),
+          `writer/encoding_gorilla.go:encodeGorillaFloat64,shouldUseGorillaFloat64,float64PresenceAndCardinality`,
+          `writer/column_types.go:float64ColumnBuilder.buildData`,
+          `writer/constants.go:gorillaFloat64EncodingEnabled`, `writer/config.go:DisableGorillaFloat64`,
+          `reader/column.go:decodeGorillaFloat64,decodeGorillaStream`,
+          SPECS §9.8, SPEC-006, NOTE-40, NOTE-215, NOTE-AP-001, NOTE-007.

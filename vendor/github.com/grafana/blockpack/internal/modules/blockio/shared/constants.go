@@ -279,6 +279,17 @@ const (
 	// Old readers reject this unknown kind at readColumnEncoding (no enc_version bump —
 	// additive format evolution, NOTE-007 precedent).
 	KindDeltaUint64Paged uint8 = 39
+
+	// KindGorillaFloat64 (kind 40, NOTE-219, SPECS §9.8) is a Gorilla-XOR encoding for
+	// high-cardinality, value-correlated Float64 / RangeFloat64 columns where the Dictionary
+	// path (kinds 1/2) provides no actual deduplication and just pays raw-value + index
+	// overhead. Each present value is XORed against its predecessor and the meaningful bits of
+	// the XOR result are packed LSB-first (Pelkonen et al., VLDB 2015). Low-cardinality float
+	// columns deliberately stay on Dictionary+RLE — see the two-population analysis in
+	// writer/NOTES.md NOTE-219. KindGorillaFloat64AllPresent (kind 41) is its fully-present
+	// variant that omits the presence_rle segment (NOTE-AP-001).
+	KindGorillaFloat64           uint8 = 40
+	KindGorillaFloat64AllPresent uint8 = 41
 )
 
 // AllPresentKindFor maps a base dense encoding kind to its AllPresent variant. Returns
@@ -305,6 +316,8 @@ func AllPresentKindFor(kind uint8) (uint8, bool) {
 		return KindDeltaUint64BitPackedAllPresent, true
 	case KindXORBytesUniform:
 		return KindXORBytesUniformAllPresent, true
+	case KindGorillaFloat64:
+		return KindGorillaFloat64AllPresent, true
 	default:
 		return kind, false
 	}
@@ -333,6 +346,8 @@ func BaseKindFor(kind uint8) (uint8, bool) {
 		return KindDeltaUint64BitPacked, true
 	case KindXORBytesUniformAllPresent:
 		return KindXORBytesUniform, true
+	case KindGorillaFloat64AllPresent:
+		return KindGorillaFloat64, true
 	default:
 		return kind, false
 	}
@@ -351,7 +366,8 @@ func IsAllPresentKind(kind uint8) bool {
 		KindPrefixBytesAllPresent,
 		KindDeltaDictionaryAllPresent,
 		KindDeltaUint64BitPackedAllPresent,
-		KindXORBytesUniformAllPresent:
+		KindXORBytesUniformAllPresent,
+		KindGorillaFloat64AllPresent:
 		return true
 	default:
 		return false

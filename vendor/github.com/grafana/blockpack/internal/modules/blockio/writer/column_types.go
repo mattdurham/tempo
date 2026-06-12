@@ -398,6 +398,16 @@ func (b *float64ColumnBuilder) buildData() ([]byte, error) {
 	}
 	sparse := nullRatio > sparseNullRatioThreshold
 
+	// NOTE-219: high-cardinality, value-correlated float columns gain nothing from the
+	// Dictionary path (which provides no real dedup and pays raw-value + index overhead).
+	// Route those through Gorilla-XOR. Low-cardinality float columns deliberately stay on
+	// Dictionary+RLE — the cardinality guard in shouldUseGorillaFloat64 enforces this. The
+	// check is data-driven (cardinality vs present rows), so it generalizes across both the
+	// dense and sparse cases; the encoder picks the AllPresent variant (kind 41) internally.
+	if shouldUseGorillaFloat64(b.values, b.present, nRows) {
+		return encodeGorillaFloat64(b.values, b.present, nRows)
+	}
+
 	// encodeDictionaryKind auto-upgrades to RLE when dictionary size ≤ rleCardinalityThreshold.
 	if sparse {
 		return encodeDictionaryKind(

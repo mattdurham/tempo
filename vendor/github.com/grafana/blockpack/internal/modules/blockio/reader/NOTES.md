@@ -1559,3 +1559,28 @@ no payload bytes. There is no AllPresent variant — kind 39 always carries the 
 Back-ref: `reader/column.go:decodeDeltaUint64Paged`/`deltaPageSizeReader`/`readBitsLE`,
           `reader/layout.go:encodingKindNames`, `shared/constants.go` (kind 39),
           writer NOTE-218, SPECS §9.4.2.
+
+## NOTE-219: decode Gorilla-XOR Float64 (kinds 40/41)
+
+`decodeGorillaFloat64` (`column.go`) decodes the Gorilla-XOR float variant added by writer
+NOTE-219 (SPECS §9.8). After the presence segment it reads `stream_bit_len[8]` then the
+`stream_len[4] + stream_bytes` raw segment, and unpacks the bit stream via `decodeGorillaStream`
+(the exact inverse of the writer loop). The decoded present values are stored as a flat
+`Float64Dict` (one entry per present row) with an identity-by-present `Float64Idx` — the same
+dense layout `decodeDeltaUint64BitPacked` uses for uint64, so the existing `Float64Value`
+accessor works unchanged.
+
+The stream is read LSB-first with `readBitsLE` (shared with kind 22). `stream_bit_len` bounds
+every read: `decodeGorillaStream` refuses to read past it, so trailing zero padding in the final
+byte is never misinterpreted as a control bit, and a truncated stream is rejected rather than read
+out of bounds. New windows store `leading[5]` (clamped to 31) and `meaningful_len-1[6]`; the
+decoder reconstructs `trailing = 64 - leading - meaningful_len` and validates `leading +
+meaningful_len ≤ 64`. Each value is reconstructed by XOR-folding against the running predecessor
+on the raw 64-bit word, so NaN payloads, ±Inf, ±0.0, and denormals round-trip exactly.
+
+Kind 41 is the AllPresent variant: `readColumnEncoding` maps it back via `shared.BaseKindFor` and
+presence is synthesized rather than read. There is no sparse variant.
+
+Back-ref: `reader/column.go:decodeGorillaFloat64,decodeGorillaStream,readBitsLE`,
+          `reader/layout.go:encodingKindNames`, `shared/constants.go` (kinds 40/41),
+          writer NOTE-219, SPECS §9.8.

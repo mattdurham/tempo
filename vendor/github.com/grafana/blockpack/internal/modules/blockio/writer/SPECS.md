@@ -100,6 +100,7 @@ Each column is encoded with the best-fit encoding selected at flush time:
 |---|---|
 | String / dict | DictEncoding, PrefixEncoding, InlineEncoding |
 | Int64 / uint64 | DeltaEncoding, XOREncoding, InlineEncoding |
+| Float64 | DictEncoding (low cardinality), GorillaFloat64 (high cardinality, NOTE-219) |
 | Float32 vector | VectorEncoding (flat IEEE 754 LE) |
 | Bytes | InlineEncoding |
 
@@ -173,6 +174,36 @@ building the payload. The uniform payload drops the per-row `val_len[4]` prefix 
 bytes for 8/16-byte IDs) and removes the per-row `appendUint32LE` from the encode loop. The
 AllPresent layering (NOTE-AP-001) composes: a fully-present uniform column emits kind 28. New kind
 IDs are additive — no `enc_version` bump. Reading is unaffected by the flag.
+
+**Gorilla Float64 selection (NOTE-219):** float64 columns route to the Gorilla-XOR variant
+(kind 40, AllPresent kind 41 — SPECS §9.8) instead of the Dictionary path (kinds 1/2) when
+`Config.DisableGorillaFloat64` is false and **all** of:
+
+1. **Amortization:** `presentCount ≥ gorillaMinPresent` (64), so the fixed per-column header
+   (`stream_bit_len[8] + first_value[8]`) is small relative to the packed payload.
+2. **High cardinality:** `distinct_present_values > max(gorillaCardinalityFloor (64),
+   presentCount / gorillaCardinalityFloorFraction (4))`. This is the **two-population guard**.
+
+Rationale — the float column population splits in two (see NOTE-219):
+
+- **Low-cardinality floats** (HTTP sampling ratios `0.0/0.1/0.5/1.0`, rounded utilization gauges,
+  TLS versions encoded as floats): the dictionary has ≤16 entries and Dictionary+RLE gives
+  ~1–2 B/val. Gorilla would regress these to ~2–3 B/val. The cardinality guard keeps them on
+  Dictionary — this is a deliberate exclusion, **not** an oversight.
+- **High-cardinality correlated floats** (NOTE-40 numeric-string-promoted `latency_ms`,
+  `duration_seconds`): mostly-distinct, adjacency-correlated. The dictionary provides no real
+  dedup and pays ~13 B/val after snappy; Gorilla gives ~2–3 B/val (4–6×).
+
+The decision is **purely data-driven** (distinct count vs present rows), computed in a single pass
+over the present values (`float64PresenceAndCardinality`), never name- or type-based — so it
+generalizes across the whole float population (raw `ColumnTypeFloat64` and promoted
+`ColumnTypeRangeFloat64` alike). Selection runs **before** the Dictionary/sparse decision in
+`float64ColumnBuilder.buildData`. There is no sparse (>50% nulls) Gorilla variant — high-cardinality
+float columns are overwhelmingly fully present after promotion, and the dense kind handles
+interleaved nulls via presence-RLE. The AllPresent layering (NOTE-AP-001) composes: a fully-present
+Gorilla column emits kind 41. New kind IDs are additive — no `enc_version` bump. Reading is
+unaffected by the flag. **Widening the cardinality guard without re-running the threshold sweep
+across traces/logs/metrics risks regressing the low-cardinality population.**
 
 ---
 

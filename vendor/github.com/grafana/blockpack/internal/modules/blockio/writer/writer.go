@@ -144,6 +144,9 @@ func NewWriterWithConfig(cfg Config) (*Writer, error) {
 	// NOTE-217: apply the uniform-length XORBytes rollout flag. Default is enabled; setting
 	// Config.DisableUniformBytes forces the legacy variable-length form (kinds 8/9/19).
 	setUniformBytesEnabled(!cfg.DisableUniformBytes)
+	// NOTE-219: apply the Gorilla-XOR Float64 rollout flag. Default is enabled; setting
+	// Config.DisableGorillaFloat64 forces the Dictionary form (kinds 1/2) for float columns.
+	setGorillaFloat64Enabled(!cfg.DisableGorillaFloat64)
 	// Default auto-flush at 5× block size. Caps live proto memory to one batch of
 	// 5 blocks while preserving enough lookahead for MinHash sort quality.
 	if cfg.MaxBufferedSpans == 0 {
