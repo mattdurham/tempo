@@ -5,6 +5,43 @@ This document captures the non-obvious design decisions, rationale, and invarian
 
 ---
 
+## NOTE-223: drop the radix sort in streamCountRateN1Compact — rank is order-independent
+*Added: 2026-06-12*
+
+**Decision:** Remove the `radixSortByPackKey` pass from `streamCountRateN1Compact` (the N=1
+count/rate group-by path: M4 `{} | rate() by (...)`, M6, and the unfiltered N=1 case). The
+function previously packed each in-range ref into a `pkOrder` uint64 (`packKey<<32 | relIdx`),
+radix-sorted the whole N-element array by packKey, then walked the sorted array to populate
+`sortedPKs[i]` and `timeBucketByPos[i]` (with `i == sorted position`). The sorted array was then
+handed to `streamCountRateN1CompactCore` → `scanGroupByColCompact`.
+
+**Rationale:** `scanGroupByColCompact` (and the histogram analog) never depend on the *order* of
+their packKey input. They consume it as (a) a `minPK`/`maxPK` range, (b) a `pkBitset` membership
+set, and (c) a POPCNT `rankPrefix` index. The position assigned to a ref is its **rank** in the
+bitset — `rankPrefix[word] + popcount(bitset[word] & ((1<<bit)-1))` — which equals its sorted
+position because in-range span packKeys are distinct (one entry per span). So the sort existed
+purely to make `sorted-array-index == rank`; the rank can instead be computed directly from a
+bitset built over the *unsorted* refs. The N-element radix pass (`radixSortByPackKey`, profiled at
+~7% querier self-time on the rate-by-group path) is replaced by: one O(N) pass to fill the packKey
+set + min/max, an O(maxPK/64) bitset+rankPrefix build, and one O(N) scatter that writes each ref's
+time bucket to its rank slot. `radixSortByPackKey` remains in use by the general-agg N=1 path
+(`streamAggN1Compact`), the histogram compact path, and the merge-join reorder, so it is not dead.
+
+**Generalization required for correctness:** `scanGroupByColCompact` (and only it; the histogram
+path keeps its sorted callers) previously read `sortedPKs[0]`/`sortedPKs[len-1]` for `minPK`/`maxPK`.
+It now derives min/max with an O(N) scan so it is correct for an *unsorted* input. This is a strict
+generalization — for the merge-join callers that still pass a sorted slice, a scan yields the same
+min/max, so their behavior is byte-identical. The scatter in `streamCountRateN1Compact` writes every
+`timeBucketByPos` slot exactly once (rank is a bijection onto `[0, n)` over distinct packKeys),
+matching the prior sorted walk's full coverage; out-of-window rows leave the pooled `int32` slot at
+the cleared 0 sentinel, identical to before.
+
+**Queries affected:** M4/M6 and any unfiltered N=1 `rate()`/`count_over_time` by a single group.
+Back-refs: `streamCountRateN1Compact`, `scanGroupByColCompact` in
+`internal/modules/executor/metrics_trace_intrinsic.go`.
+
+---
+
 ## NOTE-210: prewarmSortedAscending — data-free histogram boundary pre-warm for value-sorted columns
 *Added: 2026-06-11*
 

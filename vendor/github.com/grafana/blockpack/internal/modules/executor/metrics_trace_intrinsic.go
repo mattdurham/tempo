@@ -628,14 +628,25 @@ func scanGroupByColCompact(
 	if len(sortedPKs) == 0 {
 		return
 	}
-	// Pre-compute the packKey range of in-range refs. Any column ref outside
-	// [minPK, maxPK] is guaranteed absent from sortedPKs — skip binary search.
-	// This is O(1) vs O(log N) per ref, saving the bulk of binary-search cost
-	// when a file covers more time than the query window (M_total >> N).
-	minPK, maxPK := sortedPKs[0], sortedPKs[len(sortedPKs)-1]
+	// NOTE-223: this function only uses the in-range packKeys as a membership SET plus a
+	// POPCNT rank index — the position assigned to each ref is its rank in the bitset, which
+	// is order-independent. So the input slice need NOT be sorted; min/max are derived by an
+	// O(N) scan rather than reading [0]/[len-1]. This lets streamCountRateN1Compact drop its
+	// O(N) radixSortByPackKey pass (~7% querier self-time on M4) — the sort produced a sorted
+	// array used solely to feed this set. Callers that already pass a sorted slice (the
+	// merge-join paths) are unaffected: a scan over a sorted slice yields the same min/max.
+	minPK, maxPK := sortedPKs[0], sortedPKs[0]
+	for _, pk := range sortedPKs {
+		if pk < minPK {
+			minPK = pk
+		}
+		if pk > maxPK {
+			maxPK = pk
+		}
+	}
 
-	// NOTE-135/140: build pkBitset + POPCNT rank index from sortedPKs (shared read-only).
-	// Dict refs are not packKey-sorted; ~50% fail the pre-filter at 50% selectivity.
+	// NOTE-135/140: build pkBitset + POPCNT rank index from the in-range packKeys (shared
+	// read-only). Dict refs are not packKey-sorted; ~50% fail the pre-filter at 50% selectivity.
 	// NOTE-140: rankPrefix[i] = cumulative popcount of pkBitset[0..i-1], enabling O(1) rank
 	// lookup to replace searchSortedUint32 in both Dict and Flat/DeltaUint64 inner loops.
 	n := int((maxPK >> 6) + 1) //nolint:gosec
@@ -1342,38 +1353,67 @@ func streamCountRateN1Compact(
 	}
 	n := hi - lo
 
-	// Sort the in-range refs by packKey for binary search.
-	// tsCol.BlockRefs[lo:hi] is timestamp-sorted (flat column), not packKey-sorted.
-	// Block scope limits pkOrder lifetime so it can be GC'd before the group-column I/O below.
-	// NOTE-125: pool to avoid per-block allocations of sortedPKs (~28 MB) and
+	// NOTE-223: the in-range refs no longer need to be packKey-SORTED. streamCountRateN1CompactCore
+	// (via scanGroupByColCompact) consumes them only as a membership SET and a POPCNT rank index;
+	// the position assigned to a ref is its rank in the pkBitset, which is order-independent. The
+	// old code radix-sorted an N-element pkOrder array (~7% querier self-time on M4) PURELY so the
+	// sorted-array index would coincide with that rank, then walked the sorted array to populate
+	// timeBucketByPos[i] (i == rank). Instead build pkBitset + rankPrefix directly from the
+	// timestamp-sorted refs in one O(N) pass and scatter each ref's time bucket to its rank slot —
+	// no sort. The pkPos/sortedPKs slices and radixSortByPackKey pass are eliminated on this path.
+	//
+	// NOTE-125: pool to avoid per-block allocations of the packKey set (~28 MB) and
 	// timeBucketByPos (~29 MB) at n=7.2 M.
-	sortedPKs := acquireCompactUint32NoClear(n)
-	defer releaseCompactUint32(sortedPKs)
+	pkSet := acquireCompactUint32NoClear(n)
+	defer releaseCompactUint32(pkSet)
 	timeBucketByPos := acquireCompactInt32(n) // 0 = out of range; 1..numSteps = bucket+1 (NOTE-116)
 	defer releaseCompactInt32(timeBucketByPos)
-	{
-		// Pack pk (high 32 bits) and relative index within tsCol.BlockRefs[lo:hi] (low 32 bits).
-		// uint64 is half the size of pkPos{uint32,int} (8 vs 16 bytes/entry), halving sort array
-		// memory and moving less data per swap — measurable for n in the millions.
-		// NOTE-125: pool pkOrder (~57 MB) — fully overwritten before use, so no clear needed.
-		pkOrder := acquireCompactUint64(n)
-		for i, ref := range tsCol.BlockRefs[lo:hi] {
-			pkOrder[i] = uint64(packKey(ref.BlockIdx, ref.RowIdx))<<32 | uint64(uint32(i)) //nolint:gosec
+
+	inRefs := tsCol.BlockRefs[lo:hi]
+	minPK, maxPK := uint32(0), uint32(0)
+	for i, ref := range inRefs {
+		pk := packKey(ref.BlockIdx, ref.RowIdx)
+		pkSet[i] = pk
+		if i == 0 || pk < minPK {
+			minPK = pk
 		}
-		// NOTE-175: radix sort by packKey (high 32 bits) — closure-free O(N) vs slices.Sort O(N log N).
-		radixSortByPackKey(pkOrder)
-		for i, packed := range pkOrder {
-			sortedPKs[i] = uint32(packed >> 32)
-			relIdx := int(uint32(packed))                                                               //nolint:gosec
-			bk := timeBucketIndex(int64(tsCol.Uint64Values[lo+relIdx]), tb.StartTime, tb.StepSizeNanos) //nolint:gosec
-			if bk >= 0 && bk < numSteps {
-				timeBucketByPos[i] = int32(bk + 1) //nolint:gosec
-			}
+		if i == 0 || pk > maxPK {
+			maxPK = pk
 		}
-		releaseCompactUint64(pkOrder)
 	}
 
-	return streamCountRateN1CompactCore(ctx, r, sortedPKs, timeBucketByPos, agg.GroupBy[0], numSteps, buckets)
+	// pkBitset membership + POPCNT rank index over the in-range packKeys (NOTE-135/140). Built once
+	// here so each ref's rank (== its sorted position, since packKeys are distinct) can index
+	// timeBucketByPos; scanGroupByColCompact rebuilds the same index internally from pkSet.
+	nWords := int((maxPK >> 6) + 1) //nolint:gosec
+	pkBitset := acquireCompactUint64(nWords)
+	clear(pkBitset)
+	for _, pk := range pkSet {
+		pkBitset[pk>>6] |= uint64(1) << (pk & 63)
+	}
+	rankPrefix := acquireCompactUint32NoClear(nWords + 1)
+	var cum uint32
+	for i, w := range pkBitset {
+		rankPrefix[i] = cum
+		cum += uint32(bits.OnesCount64(w)) //nolint:gosec
+	}
+	rankPrefix[len(pkBitset)] = cum
+
+	// Scatter each in-range ref's time bucket into its rank slot. Refs are distinct packKeys,
+	// so rank is a bijection onto [0, n) — every timeBucketByPos slot is written exactly once.
+	for i, pk := range pkSet {
+		word := pk >> 6
+		bit := pk & 63
+		pos := int(rankPrefix[word] + uint32(bits.OnesCount64(pkBitset[word]&((uint64(1)<<bit)-1)))) //nolint:gosec
+		bk := timeBucketIndex(int64(tsCol.Uint64Values[lo+i]), tb.StartTime, tb.StepSizeNanos)       //nolint:gosec
+		if bk >= 0 && bk < numSteps {
+			timeBucketByPos[pos] = int32(bk + 1) //nolint:gosec
+		}
+	}
+	releaseCompactUint32(rankPrefix)
+	releaseCompactUint64(pkBitset)
+
+	return streamCountRateN1CompactCore(ctx, r, pkSet, timeBucketByPos, agg.GroupBy[0], numSteps, buckets)
 }
 
 // streamCountRateN1CompactFromRefs is the predicate-filtered compact path for N=1 count/rate.
