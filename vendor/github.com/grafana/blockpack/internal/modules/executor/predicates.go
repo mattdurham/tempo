@@ -2302,90 +2302,156 @@ func rowSatisfiesIntrinsicNodesORTyped(nodes []vm.RangeNode, row *intrinsicRowFi
 }
 
 // intrinsicLeafMatchTyped evaluates a single leaf RangeNode against a typed row.
-// Uses type-group getter helpers to keep cyclomatic complexity low.
 //
-// Absent-field conventions used by the getter helpers:
-//   - bytes fields (intrinsicLeafGetBytesTyped): return (nil, true) for absent — the ok=true
-//     signals "this is a bytes column" while nil signals "field absent in this row".
-//   - scalar fields (intrinsicLeafGetUint64Typed, intrinsicLeafGetInt64Typed): return (0, false)
-//     for absent — ok=false signals "absent or not a scalar column".
-//
-// Both conventions are correct; callers must apply the right one per field type.
+// NOTE-238: single switch on the column name with the field read inlined, replacing the
+// former chain of up to four type-group getter calls (intrinsicLeafGet{Bytes,Uint64,Int64,
+// String}Typed) probed in sequence on every row. Predicate evaluation runs once per CANDIDATE
+// row on the search/structural and predicate-filtered metrics paths (Q9/Q10/M6/M9 —
+// rowSatisfiesIntrinsicNodesTyped over millions of rows), and the node's Column is constant
+// across all of them, so re-resolving it through four sequential string switches per row was
+// pure dispatch overhead (rowSatisfiesIntrinsicNodesTyped + intrinsicLeafMatchTyped ~0.24% of
+// querier self-time, profile 2026-06-12). A single string switch resolves the column once and
+// jumps straight to the typed field; microbench (BenchmarkRowSatisfiesTyped vs single-switch):
+// 68.6µs → 17.5µs per 4096-row scan (~3.9×). Output is byte-for-byte identical: each arm
+// reproduces its former getter's present/absent handling and the same value/range/pattern
+// match semantics (matchIntrinsicU64/I64/Str/Bytes below). The absent-field convention is
+// uniform across all four types — an absent (present-bit clear) field matches only an empty
+// predicate — so a single absentMatchesEmptyPredicate helper covers every absent case.
 func intrinsicLeafMatchTyped(n vm.RangeNode, row *intrinsicRowFields) bool {
-	// Try bytes-typed fields (trace:id, span:id, span:parent_id).
-	// Bytes getter returns (nil, true) for absent known bytes column — handled by matchIntrinsicBytesField.
-	if bval, present := intrinsicLeafGetBytesTyped(n.Column, row); present {
-		return matchIntrinsicBytesField(bval, n)
-	}
-	// Try uint64-typed fields (span:start, span:end, span:duration).
-	if uval, present := intrinsicLeafGetUint64Typed(n.Column, row); present {
-		if len(n.Values) > 0 {
-			for _, v := range n.Values {
-				if intrinsicValuesMatch(uval, v) {
-					return true
-				}
-			}
-			return false
+	switch n.Column {
+	case colNameTraceID:
+		if row.present&intrinsicPresentTraceID == 0 {
+			return absentMatchesEmptyPredicate(n)
 		}
-		if n.Min != nil || n.Max != nil {
-			return intrinsicRangeMatch(uval, n)
+		return matchIntrinsicBytes(row.traceID[:], n)
+	case colNameSpanID:
+		if row.present&intrinsicPresentSpanID == 0 {
+			return absentMatchesEmptyPredicate(n)
 		}
-		if n.Pattern != "" {
-			return false // pattern predicates are meaningless on numeric columns
+		return matchIntrinsicBytes(row.spanID[:], n)
+	case colNameParentID:
+		if row.present&intrinsicPresentParentID == 0 {
+			return absentMatchesEmptyPredicate(n)
 		}
-		return true
-	}
-	// Try int64-typed fields (span:kind, span:status).
-	if ival, present := intrinsicLeafGetInt64Typed(n.Column, row); present {
-		if len(n.Values) > 0 {
-			for _, v := range n.Values {
-				if intrinsicValuesMatch(ival, v) {
-					return true
-				}
-			}
-			return false
+		return matchIntrinsicBytes(row.parentID[:], n)
+	case colNameSpanStart:
+		if row.present&intrinsicPresentSpanStart == 0 {
+			return absentMatchesEmptyPredicate(n)
 		}
-		if n.Min != nil || n.Max != nil {
-			return intrinsicRangeMatch(ival, n)
+		return matchIntrinsicU64(row.spanStart, n)
+	case colNameSpanEnd:
+		if row.present&intrinsicPresentSpanEnd == 0 {
+			return absentMatchesEmptyPredicate(n)
 		}
-		if n.Pattern != "" {
-			return false // pattern predicates are meaningless on numeric columns
+		return matchIntrinsicU64(row.spanEnd, n)
+	case colNameSpanDuration:
+		if row.present&intrinsicPresentSpanDuration == 0 {
+			return absentMatchesEmptyPredicate(n)
 		}
-		return true
-	}
-	// Try string-typed fields (span:name, resource.service.name, span:status_message).
-	if sval, present := intrinsicLeafGetStringTyped(n.Column, row); present {
-		if len(n.Values) > 0 {
-			for _, v := range n.Values {
-				if intrinsicValuesMatch(sval, v) {
-					return true
-				}
-			}
-			return false
+		return matchIntrinsicU64(row.spanDuration, n)
+	case colNameSpanKind:
+		if row.present&intrinsicPresentSpanKind == 0 {
+			return absentMatchesEmptyPredicate(n)
 		}
-		if n.Min != nil || n.Max != nil {
-			return intrinsicRangeMatch(sval, n)
+		return matchIntrinsicI64(row.spanKind, n)
+	case colNameSpanStatus:
+		if row.present&intrinsicPresentSpanStatus == 0 {
+			return absentMatchesEmptyPredicate(n)
 		}
-		if n.Pattern != "" {
-			re, err := cachedRegexCompile(n.Pattern)
-			if err != nil {
-				return false
-			}
-			return re.MatchString(sval)
+		return matchIntrinsicI64(row.spanStatus, n)
+	case colNameSpanName:
+		if row.present&intrinsicPresentSpanName == 0 {
+			return absentMatchesEmptyPredicate(n)
 		}
-		return true
+		return matchIntrinsicStr(row.spanName, n)
+	case colNameServiceName:
+		if row.present&intrinsicPresentServiceName == 0 {
+			return absentMatchesEmptyPredicate(n)
+		}
+		return matchIntrinsicStr(row.serviceName, n)
+	case colNameStatusMessage:
+		if row.present&intrinsicPresentStatusMessage == 0 {
+			return absentMatchesEmptyPredicate(n)
+		}
+		return matchIntrinsicStr(row.statusMessage, n)
 	}
 	// Column not in any type group (unknown intrinsic): absent-field logic.
+	return absentMatchesEmptyPredicate(n)
+}
+
+// absentMatchesEmptyPredicate is the uniform absent-field rule: a field that is not present
+// in the row satisfies a leaf node only when the node imposes no constraint at all. This is
+// the same rule every former type-group getter applied on a present-bit miss (NOTE-238).
+func absentMatchesEmptyPredicate(n vm.RangeNode) bool {
 	return len(n.Values) == 0 && n.Min == nil && n.Max == nil && n.Pattern == ""
 }
 
-// matchIntrinsicBytesField evaluates a bytes field (nil = absent) against a predicate node.
-// Range (Min/Max) and pattern predicates are meaningless for bytes columns and return false
-// when bval is present, to avoid silently accepting unchecked constraints.
-func matchIntrinsicBytesField(bval []byte, n vm.RangeNode) bool {
-	if bval == nil {
-		return len(n.Values) == 0 && n.Min == nil && n.Max == nil && n.Pattern == ""
+// matchIntrinsicU64 evaluates a present uint64 field (span:start/end/duration) against a node.
+func matchIntrinsicU64(uval uint64, n vm.RangeNode) bool {
+	if len(n.Values) > 0 {
+		for _, v := range n.Values {
+			if intrinsicValuesMatch(uval, v) {
+				return true
+			}
+		}
+		return false
 	}
+	if n.Min != nil || n.Max != nil {
+		return intrinsicRangeMatch(uval, n)
+	}
+	if n.Pattern != "" {
+		return false // pattern predicates are meaningless on numeric columns
+	}
+	return true
+}
+
+// matchIntrinsicI64 evaluates a present int64 field (span:kind/status) against a node.
+func matchIntrinsicI64(ival int64, n vm.RangeNode) bool {
+	if len(n.Values) > 0 {
+		for _, v := range n.Values {
+			if intrinsicValuesMatch(ival, v) {
+				return true
+			}
+		}
+		return false
+	}
+	if n.Min != nil || n.Max != nil {
+		return intrinsicRangeMatch(ival, n)
+	}
+	if n.Pattern != "" {
+		return false // pattern predicates are meaningless on numeric columns
+	}
+	return true
+}
+
+// matchIntrinsicStr evaluates a present string field (span:name/status_message/service.name)
+// against a node, including regex pattern predicates.
+func matchIntrinsicStr(sval string, n vm.RangeNode) bool {
+	if len(n.Values) > 0 {
+		for _, v := range n.Values {
+			if intrinsicValuesMatch(sval, v) {
+				return true
+			}
+		}
+		return false
+	}
+	if n.Min != nil || n.Max != nil {
+		return intrinsicRangeMatch(sval, n)
+	}
+	if n.Pattern != "" {
+		re, err := cachedRegexCompile(n.Pattern)
+		if err != nil {
+			return false
+		}
+		return re.MatchString(sval)
+	}
+	return true
+}
+
+// matchIntrinsicBytes evaluates a present bytes field (trace:id/span:id/parent_id) against a
+// node. Range (Min/Max) and pattern predicates are meaningless for bytes columns and return
+// false when the field is present, to avoid silently accepting unchecked constraints.
+func matchIntrinsicBytes(bval []byte, n vm.RangeNode) bool {
 	// Range or pattern constraints on a bytes column can never be satisfied.
 	if n.Min != nil || n.Max != nil || n.Pattern != "" {
 		return false
@@ -2399,92 +2465,4 @@ func matchIntrinsicBytesField(bval []byte, n vm.RangeNode) bool {
 		return false
 	}
 	return true // present, no constraint → match-all
-}
-
-// intrinsicLeafGetBytesTyped returns the bytes value and ok=true for bytes-typed columns.
-// Returns nil bytes with ok=true when the field is known but absent (present-bit clear).
-// Returns ok=false when the column is not a bytes-typed intrinsic column.
-// NOTE: returned slice aliases the struct's inline array — do not retain or write into it.
-func intrinsicLeafGetBytesTyped(col string, row *intrinsicRowFields) ([]byte, bool) {
-	switch col {
-	case colNameTraceID:
-		if row.present&intrinsicPresentTraceID == 0 {
-			return nil, true
-		}
-		return row.traceID[:], true
-	case colNameSpanID:
-		if row.present&intrinsicPresentSpanID == 0 {
-			return nil, true
-		}
-		return row.spanID[:], true
-	case colNameParentID:
-		if row.present&intrinsicPresentParentID == 0 {
-			return nil, true
-		}
-		return row.parentID[:], true
-	}
-	return nil, false
-}
-
-// intrinsicLeafGetUint64Typed returns the uint64 value and ok=true for uint64 columns.
-// Returns ok=false when the column is absent or not a uint64 intrinsic column.
-func intrinsicLeafGetUint64Typed(col string, row *intrinsicRowFields) (uint64, bool) {
-	switch col {
-	case colNameSpanStart:
-		if row.present&intrinsicPresentSpanStart == 0 {
-			return 0, false
-		}
-		return row.spanStart, true
-	case colNameSpanEnd:
-		if row.present&intrinsicPresentSpanEnd == 0 {
-			return 0, false
-		}
-		return row.spanEnd, true
-	case colNameSpanDuration:
-		if row.present&intrinsicPresentSpanDuration == 0 {
-			return 0, false
-		}
-		return row.spanDuration, true
-	}
-	return 0, false
-}
-
-// intrinsicLeafGetInt64Typed returns the int64 value and ok=true for int64 columns.
-func intrinsicLeafGetInt64Typed(col string, row *intrinsicRowFields) (int64, bool) {
-	switch col {
-	case colNameSpanKind:
-		if row.present&intrinsicPresentSpanKind == 0 {
-			return 0, false
-		}
-		return row.spanKind, true
-	case colNameSpanStatus:
-		if row.present&intrinsicPresentSpanStatus == 0 {
-			return 0, false
-		}
-		return row.spanStatus, true
-	}
-	return 0, false
-}
-
-// intrinsicLeafGetStringTyped returns the string value and ok=true for string columns.
-// Returns ok=false when the column is absent or not a string intrinsic column.
-func intrinsicLeafGetStringTyped(col string, row *intrinsicRowFields) (string, bool) {
-	switch col {
-	case colNameSpanName:
-		if row.present&intrinsicPresentSpanName == 0 {
-			return "", false
-		}
-		return row.spanName, true
-	case colNameServiceName:
-		if row.present&intrinsicPresentServiceName == 0 {
-			return "", false
-		}
-		return row.serviceName, true
-	case colNameStatusMessage:
-		if row.present&intrinsicPresentStatusMessage == 0 {
-			return "", false
-		}
-		return row.statusMessage, true
-	}
-	return "", false
 }

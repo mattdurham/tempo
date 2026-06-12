@@ -4761,3 +4761,39 @@ query shape.
 **Queries affected:** N=1 count/rate (M1/M4/M9), duration/histogram group-by (M8), and the
 merge-join matched-subset reorder (Q9/Q10-class), wherever `pkOrder` is large enough to dominate.
 Back-ref: `internal/modules/executor/radix_pkorder.go:radixSortByPackKey`.
+
+## NOTE-238 — intrinsicLeafMatchTyped: single column switch instead of chained type-group getters
+
+`intrinsicLeafMatchTyped` evaluates one predicate leaf against a typed `intrinsicRowFields`
+row. It runs once per CANDIDATE row on the search/structural and predicate-filtered metrics
+paths — `rowSatisfiesIntrinsicNodesTyped` (and its OR variant) walk the predicate tree per
+row over millions of rows for `{...}`-filtered queries and `>>`/`>` structural chains
+(Q9/Q10/M6/M9). The leaf's `Column` is *constant* across every row in a scan, yet the former
+implementation re-resolved it on every row by probing up to four type-group getters in
+sequence — `intrinsicLeafGet{Bytes,Uint64,Int64,String}Typed`, each a `switch col` returning
+`(value, ok)` — so a single int64 leaf (e.g. `span:kind`) paid a bytes switch + a uint64
+switch + an int64 switch before reaching its field. `rowSatisfiesIntrinsicNodesTyped` +
+`intrinsicLeafMatchTyped` measured ~0.24% of querier self-time (profile 2026-06-12) on a code
+shape that is dominated by string-switch dispatch, not by the actual comparison.
+
+The rewrite collapses the four chained getters into one `switch n.Column` whose arm reads the
+correct field inline and dispatches to a per-type match helper (`matchIntrinsicU64/I64/Str/
+Bytes`). The column is resolved once, the field is read with no getter-call indirection, and
+the per-type value/range/pattern logic is unchanged. Microbench (`BenchmarkRowSatisfiesTyped`
+4096-row scan, `span:kind` value match): **68.6µs → 17.5µs, ~3.9×**.
+
+**Correctness:** byte-for-byte equivalent to the prior chained form. The four former getters
+applied a uniform absent-field rule — a field whose present-bit is clear matches only an empty
+predicate (`len(Values)==0 && Min==nil && Max==nil && Pattern==""`) — which the bytes getter
+expressed as `matchIntrinsicBytesField(nil, n)` and the scalar/string getters expressed by
+falling through to the "unknown intrinsic" tail; the rewrite makes this rule explicit and
+shared (`absentMatchesEmptyPredicate`). Range/pattern-on-bytes still returns false on a present
+bytes field; pattern-on-numeric still returns false; string pattern still compiles via
+`cachedRegexCompile`. `TestIntrinsicLeafMatchTyped_EquivalentToReference` pins this against a
+kept re-implementation of the old chained-getter logic across all 11 intrinsic columns + an
+unknown column, present and absent, over value/range/pattern/empty predicate shapes. The dead
+getters and `matchIntrinsicBytesField` (no other callers) were deleted. No benchmark-specific
+constants — a general dispatch restructuring over the fixed intrinsic column set.
+**Queries affected:** predicate-filtered search (Q2/Q5/Q9/Q10) and predicate-filtered metrics
+(M6/M9), wherever a `{...}` filter has intrinsic-column leaves evaluated per candidate row.
+Back-ref: `internal/modules/executor/predicates.go:intrinsicLeafMatchTyped`.
