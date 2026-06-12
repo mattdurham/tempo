@@ -887,6 +887,17 @@ var encodingKindNames = map[uint8]string{ //nolint:gochecknoglobals
 	shared.KindXORBytesAllPresent:        "XORBytesAllPresent",
 	shared.KindPrefixBytesAllPresent:     "PrefixBytesAllPresent",
 	shared.KindDeltaDictionaryAllPresent: "DeltaDictionaryAllPresent",
+
+	// Bit-packed DeltaUint64 kinds (NOTE-215).
+	shared.KindDeltaUint64BitPacked:           "DeltaUint64BitPacked",
+	shared.KindDeltaUint64BitPackedAllPresent: "DeltaUint64BitPackedAllPresent",
+
+	// Uniform-length byte-column kinds (NOTE-217).
+	shared.KindXORBytesUniform:           "XORBytesUniform",
+	shared.KindSparseXORBytesUniform:     "SparseXORBytesUniform",
+	shared.KindInlineBytesUniform:        "InlineBytesUniform",
+	shared.KindSparseInlineBytesUniform:  "SparseInlineBytesUniform",
+	shared.KindXORBytesUniformAllPresent: "XORBytesUniformAllPresent",
 }
 
 // encodingKindName maps the encoding kind byte (byte 1 of each column data blob) to its name.

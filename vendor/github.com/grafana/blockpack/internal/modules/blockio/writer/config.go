@@ -104,4 +104,14 @@ type Config struct {
 	//
 	// Reading is unaffected by this flag — readers always accept both forms.
 	DisableBitPackedDelta bool
+
+	// DisableUniformBytes turns off selection of the uniform-length XORBytes encoding kinds
+	// (NOTE-217). When false (the default), XOR-encoded byte columns whose present values
+	// all share the same byte length are written using the uniform variant that drops the
+	// per-row len[4] prefix (kinds 24/25/28). Set to true during rollout to force the legacy
+	// variable-length form (kinds 8/9/19), so a writer can be deployed ahead of readers that
+	// understand the new kinds.
+	//
+	// Reading is unaffected by this flag — readers always accept both forms.
+	DisableUniformBytes bool
 }

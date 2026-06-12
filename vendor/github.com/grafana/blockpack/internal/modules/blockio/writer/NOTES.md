@@ -462,3 +462,44 @@ Back-ref: `shared/constants.go` (kinds 22/23 + AllPresent maps),
           `writer/encoding_delta_bitpacked.go`, `writer/encoding_delta.go:deltaBaseAndMaxOffset`,
           `writer/column_types.go:buildData`, `reader/column.go:decodeDeltaUint64BitPacked`,
           SPECS §9.4.1, SPEC-006, NOTE-AP-001, NOTE-007.
+
+## NOTE-217: uniform-length XORBytes (kinds 24/25/28)
+
+`encodeXORBytes` (kinds 8/9) writes `val_len[4] + xor_bytes` per present row. For ID columns
+where every present value shares one length (span:id=8B, trace:id=16B, UUIDs=16B), that per-row
+length prefix is pure overhead — 50% of the wire bytes for an 8-byte ID. NOTE-217 adds a
+uniform-length variant: `uniformValueLen` (`encoding_xor.go`) checks, in a single pass over the
+present rows, whether `presentCount > 1` and every present value has the same non-zero length;
+if so `encodeXORBytesUniform` writes one `uniform_len[4]` after the presence segment, then packs
+the XOR payload as a fixed-width array with no per-row length prefix. Wire format and selection
+rule: SPECS §9.5.1, SPEC-006.
+
+**Why XORBytes (and not the variable case generically)?** The win is the dropped per-row length
+prefix plus the removed per-row `appendUint32LE` in the encode loop and per-row length read in the
+decode loop. It only applies when lengths are actually equal — exactly the ID-column case XOR
+already targets. Mismatched lengths, single-value, or zero-length columns fall through to kinds
+8/9/19 unchanged.
+
+**AllPresent composition:** a fully-present uniform column selects kind 28 via `selectAllPresent`
++ `shared.AllPresentKindFor` (NOTE-AP-001), omitting the presence-RLE segment. There is no sparse
+AllPresent (a contradiction) and no `present_count` field for kind 25 — like kinds 8/9 the decoder
+walks the presence bitset directly.
+
+**InlineBytes uniform (kinds 26/27) is reader-only.** The current writer never selects the
+InlineBytes family (all bytes columns go to XORBytes/PrefixBytes/Dictionary), so there is no
+`encodeInlineBytesUniform` — adding one would be dead code. The reader still decodes kinds 26/27
+(`reader/column.go:decodeInlineBytesUniform`) for forward compatibility and any external producer.
+
+**Rollout flag:** `Config.DisableUniformBytes` (default false → uniform on) forces the legacy
+variable-length form, mirroring the NOTE-AP-001 atomic-bool pattern
+(`constants.go:uniformBytesEncodingEnabled`).
+
+**Backwards compatibility:** new kind IDs only; no `enc_version` bump. Old readers reject unknown
+kinds at `reader/column.go:readColumnEncoding`. Compaction is transparent — it reads decoded
+values via the reader API and re-encodes via the writer, so the new kinds need no compaction code.
+
+Back-ref: `shared/constants.go` (kinds 24/25/26/27/28 + AllPresent maps),
+          `writer/encoding_xor.go:uniformValueLen,encodeXORBytesUniform`,
+          `writer/constants.go:uniformBytesEncodingEnabled`, `writer/config.go:DisableUniformBytes`,
+          `reader/column.go:decodeXORBytesUniform,decodeInlineBytesUniform`,
+          SPECS §9.3.1, §9.5.1, SPEC-006, NOTE-AP-001, NOTE-007.

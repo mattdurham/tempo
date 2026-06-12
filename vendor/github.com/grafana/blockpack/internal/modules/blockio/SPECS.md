@@ -669,6 +669,11 @@ determines the remainder of the wire format.
 | 21 | DeltaDictionaryAllPresent | Bytes | fully-present trace:id |
 | 22 | DeltaUint64BitPacked | Uint64 | timestamps/monotonic with non-byte-aligned offset range |
 | 23 | DeltaUint64BitPackedAllPresent | Uint64 | fully-present, as kind 22 |
+| 24 | XORBytesUniform | Bytes | ID columns where every present value has one length |
+| 25 | SparseXORBytesUniform | Bytes | as kind 24, >50% nulls |
+| 26 | InlineBytesUniform | Bytes | uniform-length inline bytes (reader-only) |
+| 27 | SparseInlineBytesUniform | Bytes | as kind 26, >50% nulls (reader-only) |
+| 28 | XORBytesUniformAllPresent | Bytes | fully-present uniform-length ID columns |
 
 ### 9.0 AllPresent Encoding Kinds (kinds 15–21)
 
@@ -778,6 +783,21 @@ present_count  uint32 LE
 [present_count × (len(4 LE uint32) + byte_data)]   // Only present rows
 ```
 
+#### 9.3.1 Uniform Inline Bytes (kinds 26, 27 — NOTE-217, reader-only)
+
+When every present value shares the same byte length, the per-row `len[4]` prefix is dropped
+and the payload becomes a packed fixed-width array. A single `uniform_len[4 LE]` is written once
+after the presence segment. These kinds are **reader-only** — the current writer never selects
+the InlineBytes family (all bytes columns go to XORBytes/PrefixBytes/Dictionary) — but they
+remain decodable for forward compatibility and any future or external producer.
+
+```
+row_count      uint32 LE
+presence_rle   [see §9.1]       // omitted for any AllPresent composition
+uniform_len    uint32 LE        // length of each present value (> 0)
+packed_payload [present_count × uniform_len]byte   // raw bytes, present rows in order
+```
+
 ### 9.4 Delta Uint64 (kind 5)
 
 Stores uint64 values as offsets from a base value (minimum). Applied to timestamp and
@@ -855,6 +875,34 @@ Decode: `value[i] = xor_bytes[i] XOR value[i-1]` (byte-wise, up to min length; e
 bytes appended as-is).
 
 Sparse variant (kind 9) is identical — sparseness is encoded entirely in the presence bitset.
+
+#### 9.5.1 Uniform XOR Bytes (kinds 24, 25, 28 — NOTE-217)
+
+When every present value shares the same byte length (extremely common for ID columns:
+`span:id`=8B, `trace:id`=16B, UUIDs=16B), the per-row `val_len[4]` prefix is dropped and the XOR
+payload becomes a packed fixed-width array. A single `uniform_len[4 LE]` is written once after
+the presence segment. This saves the per-row length prefix (−33% to −50% wire bytes for 8/16-byte
+IDs) and removes the per-row `appendUint32LE` from the encode loop and the per-row length read
+from the decode loop.
+
+```
+span_count     uint32 LE
+presence_rle   [see §9.1]       // omitted for kind 28 (AllPresent)
+uniform_len    uint32 LE        // length of each present value (> 0)
+packed_payload [present_count × uniform_len]byte   // XOR bytes, present rows in order
+```
+
+The XOR computation is identical to §9.5 (`value[i] = xor_bytes[i] XOR value[i-1]`); because all
+present values share `uniform_len`, each XOR result is exactly `uniform_len` bytes. The payload is
+raw (not zstd); the per-column outer snappy applies as for kinds 8/9. Like kinds 8/9, there is no
+`present_count` field for the sparse kind (25) — the decoder walks the presence bitset directly.
+
+**Selection (SPEC-006):** the writer chooses the uniform kind over kinds 8/9/19 only when
+`present_count > 1` AND every present value has the same non-zero length. A single present value,
+mismatched lengths, or zero-length values fall through to the variable form. Selection is gated by
+the writer flag `Config.DisableUniformBytes` (default: uniform on). New kind IDs are additive —
+`enc_version` is unchanged and old readers reject unknown kinds (NOTE-007 precedent). Kind 28 is
+the AllPresent composition (§9.0): it omits the `presence_rle` segment.
 
 ### 9.6 Prefix Bytes (kinds 10, 11)
 

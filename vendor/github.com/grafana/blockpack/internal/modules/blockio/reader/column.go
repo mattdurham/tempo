@@ -291,6 +291,10 @@ func readColumnEncoding(data []byte, spanCount int, colType shared.ColumnType, c
 		return decodeRLEIndexes(data[2:], baseKind, spanCount, colType, ctx, allPresent)
 	case shared.KindXORBytes, shared.KindSparseXORBytes:
 		return decodeXORBytes(data[2:], baseKind, spanCount, ctx, allPresent)
+	case shared.KindXORBytesUniform, shared.KindSparseXORBytesUniform:
+		return decodeXORBytesUniform(data[2:], baseKind, spanCount, allPresent)
+	case shared.KindInlineBytesUniform, shared.KindSparseInlineBytesUniform:
+		return decodeInlineBytesUniform(data[2:], baseKind, spanCount, allPresent)
 	case shared.KindPrefixBytes, shared.KindSparsePrefixBytes:
 		return decodePrefixBytes(data[2:], baseKind, spanCount, ctx, allPresent)
 	case shared.KindDeltaDictionary, shared.KindSparseDeltaDictionary:
@@ -1148,6 +1152,136 @@ func decodeXORBytes(data []byte, kind uint8, spanCount int, ctx *decodeCtx, allP
 
 		col.BytesInline[presentRow] = result
 		prev = result
+	}
+
+	return col, nil
+}
+
+// decodeXORBytesUniform decodes the uniform-length XOR kinds (24/25/28, NOTE-217).
+// data starts after enc_version + kind bytes. The wire format drops the per-row len[4]
+// prefix: a single uniform_len[4 LE] follows the presence segment, then nPresent ×
+// uniform_len packed XOR bytes. allPresent signals the AllPresent variant (presence segment
+// omitted).
+func decodeXORBytesUniform(data []byte, kind uint8, spanCount int, allPresent bool) (*Column, error) {
+	col := &Column{SpanCount: spanCount}
+
+	if len(data) < 4 {
+		return nil, fmt.Errorf("xor_bytes_uniform: data too short")
+	}
+
+	storedSpanCount := int(binary.LittleEndian.Uint32(data[0:]))
+	pos := 4
+	if storedSpanCount != spanCount {
+		return nil, fmt.Errorf("xor_bytes_uniform: span_count %d != spanCount %d", storedSpanCount, spanCount)
+	}
+
+	present, newPos, presentCount, err := decodePresenceMaybe(data, pos, spanCount, allPresent)
+	if err != nil {
+		return nil, fmt.Errorf("xor_bytes_uniform: %w", err)
+	}
+	pos = newPos
+	col.Present = present
+	_ = kind // sparse/dense distinction handled entirely by presence bitset
+
+	if pos+4 > len(data) {
+		return nil, fmt.Errorf("xor_bytes_uniform: missing uniform_len")
+	}
+	uniformLen := int(binary.LittleEndian.Uint32(data[pos:]))
+	pos += 4
+	if uniformLen <= 0 {
+		return nil, fmt.Errorf("xor_bytes_uniform: invalid uniform_len %d", uniformLen)
+	}
+
+	payload := data[pos:]
+	if len(payload) < presentCount*uniformLen {
+		return nil, fmt.Errorf(
+			"xor_bytes_uniform: payload short: have %d need %d",
+			len(payload), presentCount*uniformLen,
+		)
+	}
+
+	col.BytesInline = make([][]byte, spanCount)
+	var prev []byte
+	xPos := 0
+
+	presRowsBuf := acquirePresentRowsScratch()
+	defer releasePresentRowsScratch(presRowsBuf)
+	presentRows := collectPresentRowsInto(present, presentCount, spanCount, presRowsBuf)
+	for _, presentRow := range presentRows {
+		xorVal := payload[xPos : xPos+uniformLen]
+		xPos += uniformLen
+
+		// All values share uniformLen, so XOR against prev is a straight uniformLen-byte loop.
+		result := make([]byte, uniformLen)
+		for i := range uniformLen {
+			if i < len(prev) {
+				result[i] = xorVal[i] ^ prev[i]
+			} else {
+				result[i] = xorVal[i]
+			}
+		}
+
+		col.BytesInline[presentRow] = result
+		prev = result
+	}
+
+	return col, nil
+}
+
+// decodeInlineBytesUniform decodes the uniform-length InlineBytes kinds (26/27, NOTE-217).
+// data starts after enc_version + kind bytes. These kinds are reader-only (the current writer
+// never selects the InlineBytes family); they remain decodable for forward compatibility.
+// The wire format mirrors the variable InlineBytes layout but replaces the per-row len[4]
+// prefix with a single uniform_len[4 LE] header, then nPresent × uniform_len raw bytes.
+func decodeInlineBytesUniform(data []byte, kind uint8, spanCount int, allPresent bool) (*Column, error) {
+	col := &Column{SpanCount: spanCount}
+
+	if len(data) < 4 {
+		return nil, fmt.Errorf("inline_bytes_uniform: data too short")
+	}
+
+	rowCount := int(binary.LittleEndian.Uint32(data[0:]))
+	pos := 4
+	if rowCount != spanCount {
+		return nil, fmt.Errorf("inline_bytes_uniform: row_count %d != spanCount %d", rowCount, spanCount)
+	}
+
+	present, newPos, presentCount, err := decodePresenceMaybe(data, pos, spanCount, allPresent)
+	if err != nil {
+		return nil, fmt.Errorf("inline_bytes_uniform: %w", err)
+	}
+	pos = newPos
+	col.Present = present
+	_ = kind // sparse/dense distinction handled entirely by presence bitset
+
+	if pos+4 > len(data) {
+		return nil, fmt.Errorf("inline_bytes_uniform: missing uniform_len")
+	}
+	uniformLen := int(binary.LittleEndian.Uint32(data[pos:]))
+	pos += 4
+	if uniformLen <= 0 {
+		return nil, fmt.Errorf("inline_bytes_uniform: invalid uniform_len %d", uniformLen)
+	}
+
+	payload := data[pos:]
+	if len(payload) < presentCount*uniformLen {
+		return nil, fmt.Errorf(
+			"inline_bytes_uniform: payload short: have %d need %d",
+			len(payload), presentCount*uniformLen,
+		)
+	}
+
+	col.BytesInline = make([][]byte, spanCount)
+	xPos := 0
+
+	presRowsBuf := acquirePresentRowsScratch()
+	defer releasePresentRowsScratch(presRowsBuf)
+	presentRows := collectPresentRowsInto(present, presentCount, spanCount, presRowsBuf)
+	for _, presentRow := range presentRows {
+		b := make([]byte, uniformLen)
+		copy(b, payload[xPos:xPos+uniformLen])
+		col.BytesInline[presentRow] = b
+		xPos += uniformLen
 	}
 
 	return col, nil

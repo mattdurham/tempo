@@ -138,6 +138,9 @@ func NewWriterWithConfig(cfg Config) (*Writer, error) {
 	// NOTE-215: apply the bit-packed DeltaUint64 rollout flag. Default is enabled; setting
 	// Config.DisableBitPackedDelta forces the legacy byte-width form (kind 5).
 	setBitPackedDeltaEnabled(!cfg.DisableBitPackedDelta)
+	// NOTE-217: apply the uniform-length XORBytes rollout flag. Default is enabled; setting
+	// Config.DisableUniformBytes forces the legacy variable-length form (kinds 8/9/19).
+	setUniformBytesEnabled(!cfg.DisableUniformBytes)
 	// Default auto-flush at 5× block size. Caps live proto memory to one batch of
 	// 5 blocks while preserving enough lookahead for MinHash sort quality.
 	if cfg.MaxBufferedSpans == 0 {

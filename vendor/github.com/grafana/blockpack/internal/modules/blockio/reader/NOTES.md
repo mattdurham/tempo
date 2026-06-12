@@ -1520,3 +1520,20 @@ hoist possible).
 
 Back-ref: `reader/column.go:decodeDictBody`, `reader/dict_fixed_width_test.go`, issue #330,
           memory cbe72ea1 (warm-path decode hotspot), skill 814c1630 (boundary tests).
+
+## NOTE-217: decode uniform-length byte columns (kinds 24/25/26/27/28)
+
+`readColumnEncoding` dispatches the uniform-length byte kinds to `decodeXORBytesUniform`
+(24/25/28) and `decodeInlineBytesUniform` (26/27), the read side of writer NOTE-217 (SPECS
+§9.3.1, §9.5.1). Both read a single `uniform_len[4]` after the presence segment, then slice the
+packed `present_count × uniform_len` payload — no per-row length read. The XOR decoder applies
+the standard XOR-against-previous reconstruction over the fixed-width slices; the Inline decoder
+copies each `uniform_len`-byte slice directly. AllPresent (kind 28) maps back via
+`shared.BaseKindFor`, so presence is synthesized rather than read. Sparse kinds carry no
+`present_count` field — presence is taken entirely from the bitset (matching kinds 8/9).
+
+InlineBytes uniform (26/27) is reader-only — the writer never emits the InlineBytes family — but
+remains decodable for forward compatibility and any external producer.
+
+Back-ref: `reader/column.go:decodeXORBytesUniform,decodeInlineBytesUniform`,
+          `reader/layout.go:encodingKindNames`, writer NOTE-217, SPECS §9.3.1, §9.5.1.

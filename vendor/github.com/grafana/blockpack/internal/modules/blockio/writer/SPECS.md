@@ -134,6 +134,23 @@ These thresholds are deliberately conservative. At the default `defaultMaxBlockS
 `span:start` columns commonly hit a ~36-bit offset range (≈60 s window in ns), which kind 5
 rounds up to 8 bytes — exactly the case condition 1 captures. Reading is unaffected by the flag.
 
+**Uniform-length XOR selection (NOTE-217):** when a bytes column is chosen for XOR encoding
+(per `isIDColumn`) and `Config.DisableUniformBytes` is false, the writer prefers the uniform
+variant (kind 24, sparse 25, AllPresent 28 — SPECS §9.5.1) over the variable form (kinds 8/9/19)
+when **both** of:
+
+1. **More than one present value:** `presentCount > 1`. A single present value gains nothing —
+   its `len[4]` prefix is paid once either way, and the uniform header adds `uniform_len[4]`.
+2. **All present values share one non-zero length:** a single pass over present rows checks every
+   value's `len(v)` equals the first present value's length, and that length is `> 0`.
+
+Zero-length values, mismatched lengths, or fewer than two present rows fall through to kinds
+8/9/19. The check is `uniformValueLen` (`encoding_xor.go`), run once inside `encodeXORBytes` before
+building the payload. The uniform payload drops the per-row `val_len[4]` prefix (−33% to −50% wire
+bytes for 8/16-byte IDs) and removes the per-row `appendUint32LE` from the encode loop. The
+AllPresent layering (NOTE-AP-001) composes: a fully-present uniform column emits kind 28. New kind
+IDs are additive — no `enc_version` bump. Reading is unaffected by the flag.
+
 ---
 
 ## SPEC-007: Block Size and Count Limits

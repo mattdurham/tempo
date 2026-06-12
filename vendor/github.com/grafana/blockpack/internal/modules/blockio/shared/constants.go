@@ -241,6 +241,32 @@ const (
 	// the presence_rle segment entirely (NOTE-AP-001).
 	KindDeltaUint64BitPacked           uint8 = 22
 	KindDeltaUint64BitPackedAllPresent uint8 = 23
+
+	// Uniform-length byte-column kinds (NOTE-217, SPECS §9.3/§9.5). When every present
+	// value in an XORBytes or InlineBytes column shares the same byte length (extremely
+	// common for ID columns: span:id=8B, trace:id=16B, UUIDs=16B), the per-row len[4]
+	// prefix is dropped and the payload becomes a packed fixed-width array. A single
+	// uniform_len[4 LE] is written once after the presence segment, followed by
+	// nPresent × uniform_len payload bytes. This saves the per-row length prefix
+	// (−33% to −50% wire bytes for 8/16-byte IDs) and removes the per-row appendUint32LE
+	// from the encode loop and the per-row length read from the decode loop.
+	//
+	// KindXORBytesUniform (24) is the dense XOR variant; KindSparseXORBytesUniform (25)
+	// is its sparse form (present_count[4] follows the presence segment, mirroring the
+	// non-uniform sparse layout). KindInlineBytesUniform (26) / KindSparseInlineBytesUniform
+	// (27) are the reader-only InlineBytes counterparts (the current writer never selects
+	// the InlineBytes family — they remain decodable for forward compatibility and for any
+	// future writer or external producer). KindXORBytesUniformAllPresent (28) composes the
+	// uniform layout with NOTE-AP-001 (fully-present, presence segment omitted).
+	//
+	// Old readers reject these unknown kinds at readColumnEncoding (no enc_version bump —
+	// additive format evolution, NOTE-007 precedent).
+	KindXORBytesUniform          uint8 = 24
+	KindSparseXORBytesUniform    uint8 = 25
+	KindInlineBytesUniform       uint8 = 26
+	KindSparseInlineBytesUniform uint8 = 27
+
+	KindXORBytesUniformAllPresent uint8 = 28
 )
 
 // AllPresentKindFor maps a base dense encoding kind to its AllPresent variant. Returns
@@ -265,6 +291,8 @@ func AllPresentKindFor(kind uint8) (uint8, bool) {
 		return KindDeltaDictionaryAllPresent, true
 	case KindDeltaUint64BitPacked:
 		return KindDeltaUint64BitPackedAllPresent, true
+	case KindXORBytesUniform:
+		return KindXORBytesUniformAllPresent, true
 	default:
 		return kind, false
 	}
@@ -291,6 +319,8 @@ func BaseKindFor(kind uint8) (uint8, bool) {
 		return KindDeltaDictionary, true
 	case KindDeltaUint64BitPackedAllPresent:
 		return KindDeltaUint64BitPacked, true
+	case KindXORBytesUniformAllPresent:
+		return KindXORBytesUniform, true
 	default:
 		return kind, false
 	}
@@ -308,7 +338,8 @@ func IsAllPresentKind(kind uint8) bool {
 		KindXORBytesAllPresent,
 		KindPrefixBytesAllPresent,
 		KindDeltaDictionaryAllPresent,
-		KindDeltaUint64BitPackedAllPresent:
+		KindDeltaUint64BitPackedAllPresent,
+		KindXORBytesUniformAllPresent:
 		return true
 	default:
 		return false

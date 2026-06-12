@@ -51,6 +51,25 @@ func bitPackedDeltaEnabled() bool {
 	return bitPackedDeltaEncodingEnabled.Load()
 }
 
+// uniformBytesEncodingEnabled is the process-level rollout toggle for the uniform-length
+// XORBytes encoding kinds (NOTE-217). It defaults to true. NewWriterWithConfig sets it from
+// Config.DisableUniformBytes. Atomic for the same reason as allPresentEncodingEnabled.
+var uniformBytesEncodingEnabled atomic.Bool //nolint:gochecknoglobals // process-level rollout flag
+
+func init() { //nolint:gochecknoinits // one-time default for the rollout flag
+	uniformBytesEncodingEnabled.Store(true)
+}
+
+// setUniformBytesEnabled sets the process-level uniform-length XORBytes rollout flag.
+func setUniformBytesEnabled(v bool) {
+	uniformBytesEncodingEnabled.Store(v)
+}
+
+// uniformBytesEnabled reports whether uniform-length XORBytes selection is active.
+func uniformBytesEnabled() bool {
+	return uniformBytesEncodingEnabled.Load()
+}
+
 // Encoding kind constants per SPECS §9 — canonical definitions live in shared.Kind*.
 // These aliases are preserved so writer-internal code continues to compile unchanged.
 const (
@@ -81,6 +100,11 @@ const (
 	// Bit-packed DeltaUint64 kinds — re-exported from shared (NOTE-215).
 	KindDeltaUint64BitPacked           = shared.KindDeltaUint64BitPacked
 	KindDeltaUint64BitPackedAllPresent = shared.KindDeltaUint64BitPackedAllPresent
+
+	// Uniform-length byte-column kinds — re-exported from shared (NOTE-217).
+	KindXORBytesUniform           = shared.KindXORBytesUniform
+	KindSparseXORBytesUniform     = shared.KindSparseXORBytesUniform
+	KindXORBytesUniformAllPresent = shared.KindXORBytesUniformAllPresent
 )
 
 // Trace intrinsic column name constants — aliases to canonical definitions in shared.
