@@ -1,8 +1,34 @@
 package writer
 
-import "github.com/grafana/blockpack/internal/modules/blockio/shared"
+import (
+	"sync/atomic"
+
+	"github.com/grafana/blockpack/internal/modules/blockio/shared"
+)
 
 // NOTE: Any changes to this file must be reflected in the corresponding specs.md or NOTES.md.
+
+// allPresentEncodingEnabled is the process-level rollout toggle for AllPresent encoding
+// kinds (NOTE-AP-001). It defaults to true (compact AllPresent form selected for fully-present
+// dense columns). NewWriterWithConfig sets it from Config.DisableAllPresentEncoding. It is an
+// atomic.Bool because the encoders (which run on per-block goroutines) read it while a new
+// writer construction may write it; the value is a deploy-level constant in practice, so the
+// rare write/read overlap is benign — atomic access just removes the data race.
+var allPresentEncodingEnabled atomic.Bool //nolint:gochecknoglobals // process-level rollout flag
+
+func init() { //nolint:gochecknoinits // one-time default for the rollout flag
+	allPresentEncodingEnabled.Store(true)
+}
+
+// setAllPresentEncodingEnabled sets the process-level AllPresent rollout flag.
+func setAllPresentEncodingEnabled(v bool) {
+	allPresentEncodingEnabled.Store(v)
+}
+
+// allPresentEnabled reports whether AllPresent encoding selection is active.
+func allPresentEnabled() bool {
+	return allPresentEncodingEnabled.Load()
+}
 
 // Encoding kind constants per SPECS §9 — canonical definitions live in shared.Kind*.
 // These aliases are preserved so writer-internal code continues to compile unchanged.
@@ -21,6 +47,15 @@ const (
 	KindDeltaDictionary       = shared.KindDeltaDictionary
 	KindSparseDeltaDictionary = shared.KindSparseDeltaDictionary
 	KindVectorF32             = shared.KindVectorF32
+
+	// AllPresent encoding kinds — re-exported from shared (NOTE-AP-001).
+	KindDictionaryAllPresent      = shared.KindDictionaryAllPresent
+	KindInlineBytesAllPresent     = shared.KindInlineBytesAllPresent
+	KindDeltaUint64AllPresent     = shared.KindDeltaUint64AllPresent
+	KindRLEIndexesAllPresent      = shared.KindRLEIndexesAllPresent
+	KindXORBytesAllPresent        = shared.KindXORBytesAllPresent
+	KindPrefixBytesAllPresent     = shared.KindPrefixBytesAllPresent
+	KindDeltaDictionaryAllPresent = shared.KindDeltaDictionaryAllPresent
 )
 
 // Trace intrinsic column name constants — aliases to canonical definitions in shared.

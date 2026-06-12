@@ -212,7 +212,89 @@ const (
 	KindDeltaDictionary       uint8 = 12
 	KindSparseDeltaDictionary uint8 = 13
 	KindVectorF32             uint8 = 14 // flat float32 array, per-row presence RLE, LE byte order
+
+	// AllPresent encoding kinds (NOTE-AP-001, SPECS §9.x). Each is wire-identical to its
+	// base dense kind EXCEPT the presence_rle_len[4] + presence_rle_data segment is omitted
+	// entirely — the kind byte itself signals "every row is present". They are selected by the
+	// writer only when presentCount == nRows (a fully-dense column). There are no sparse
+	// AllPresent variants (sparse-with-all-present is a contradiction). Old readers reject these
+	// unknown kinds at readColumnEncoding; no enc_version bump (additive format evolution,
+	// NOTE-007 precedent).
+	KindDictionaryAllPresent      uint8 = 15
+	KindInlineBytesAllPresent     uint8 = 16
+	KindDeltaUint64AllPresent     uint8 = 17
+	KindRLEIndexesAllPresent      uint8 = 18
+	KindXORBytesAllPresent        uint8 = 19
+	KindPrefixBytesAllPresent     uint8 = 20
+	KindDeltaDictionaryAllPresent uint8 = 21
 )
+
+// AllPresentKindFor maps a base dense encoding kind to its AllPresent variant. Returns
+// (variant, true) when an AllPresent form exists, or (kind, false) for kinds with no
+// AllPresent variant (sparse kinds, VectorF32, and the already-special inline kinds).
+// The writer consults this only when a column is fully present (presentCount == nRows).
+func AllPresentKindFor(kind uint8) (uint8, bool) {
+	switch kind {
+	case KindDictionary:
+		return KindDictionaryAllPresent, true
+	case KindInlineBytes:
+		return KindInlineBytesAllPresent, true
+	case KindDeltaUint64:
+		return KindDeltaUint64AllPresent, true
+	case KindRLEIndexes:
+		return KindRLEIndexesAllPresent, true
+	case KindXORBytes:
+		return KindXORBytesAllPresent, true
+	case KindPrefixBytes:
+		return KindPrefixBytesAllPresent, true
+	case KindDeltaDictionary:
+		return KindDeltaDictionaryAllPresent, true
+	default:
+		return kind, false
+	}
+}
+
+// BaseKindFor maps an AllPresent variant back to its base dense kind, so reader dispatch
+// can reuse the existing decoder logic. Returns (base, true) for AllPresent variants, or
+// (kind, false) otherwise.
+func BaseKindFor(kind uint8) (uint8, bool) {
+	switch kind {
+	case KindDictionaryAllPresent:
+		return KindDictionary, true
+	case KindInlineBytesAllPresent:
+		return KindInlineBytes, true
+	case KindDeltaUint64AllPresent:
+		return KindDeltaUint64, true
+	case KindRLEIndexesAllPresent:
+		return KindRLEIndexes, true
+	case KindXORBytesAllPresent:
+		return KindXORBytes, true
+	case KindPrefixBytesAllPresent:
+		return KindPrefixBytes, true
+	case KindDeltaDictionaryAllPresent:
+		return KindDeltaDictionary, true
+	default:
+		return kind, false
+	}
+}
+
+// IsAllPresentKind returns true if kind is one of the AllPresent encoding variants whose
+// wire format omits the presence_rle segment entirely. Used by both writer and reader to
+// branch the presence section.
+func IsAllPresentKind(kind uint8) bool {
+	switch kind {
+	case KindDictionaryAllPresent,
+		KindInlineBytesAllPresent,
+		KindDeltaUint64AllPresent,
+		KindRLEIndexesAllPresent,
+		KindXORBytesAllPresent,
+		KindPrefixBytesAllPresent,
+		KindDeltaDictionaryAllPresent:
+		return true
+	default:
+		return false
+	}
+}
 
 // Trace intrinsic column name constants — canonical colon-form names used across writer, reader, and vm packages.
 const (

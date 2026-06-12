@@ -878,6 +878,15 @@ var encodingKindNames = map[uint8]string{ //nolint:gochecknoglobals
 	shared.KindDeltaDictionary:       "DeltaDictionary",
 	shared.KindSparseDeltaDictionary: "SparseDeltaDictionary",
 	shared.KindVectorF32:             "VectorF32",
+
+	// AllPresent encoding kinds (NOTE-AP-001).
+	shared.KindDictionaryAllPresent:      "DictionaryAllPresent",
+	shared.KindInlineBytesAllPresent:     "InlineBytesAllPresent",
+	shared.KindDeltaUint64AllPresent:     "DeltaUint64AllPresent",
+	shared.KindRLEIndexesAllPresent:      "RLEIndexesAllPresent",
+	shared.KindXORBytesAllPresent:        "XORBytesAllPresent",
+	shared.KindPrefixBytesAllPresent:     "PrefixBytesAllPresent",
+	shared.KindDeltaDictionaryAllPresent: "DeltaDictionaryAllPresent",
 }
 
 // encodingKindName maps the encoding kind byte (byte 1 of each column data blob) to its name.

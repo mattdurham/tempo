@@ -16,20 +16,21 @@ import (
 //	+ presence_rle_len[4 LE] + presence_rle_data
 //	+ base[8 LE] + width[1]
 //	  if width > 0: offset_data_len[4 LE] + raw_offsets  (no zstd — outer snappy per column)
+//
+// NOTE-AP-001: when every row is present, kind KindDeltaUint64AllPresent is emitted and the
+// presence_rle_len[4] + presence_rle_data segment is omitted entirely.
 func encodeDeltaUint64(values []uint64, present []bool, nRows int) ([]byte, error) {
-	// Build presence bitset.
-	bitsetLen := (nRows + 7) / 8
-	bitset := make([]byte, bitsetLen)
+	bitset, presentCount := buildPresenceBitset(present, nRows)
 
-	for i := range nRows {
-		if i < len(present) && present[i] {
-			bitset[i/8] |= 1 << uint(i%8)
+	kind, allPresent := selectAllPresent(KindDeltaUint64, presentCount, nRows)
+
+	var rleData []byte
+	if !allPresent {
+		var err error
+		rleData, err = shared.EncodePresenceRLE(bitset, nRows)
+		if err != nil {
+			return nil, err
 		}
-	}
-
-	rleData, err := shared.EncodePresenceRLE(bitset, nRows)
-	if err != nil {
-		return nil, err
 	}
 
 	// Compute base (min of present values) and maxOffset.
@@ -72,10 +73,9 @@ func encodeDeltaUint64(values []uint64, present []bool, nRows int) ([]byte, erro
 	width := pickDeltaWidth(maxOffset)
 
 	buf := make([]byte, 0, 2+4+4+len(rleData)+8+1+4+nRows*int(width)+1)
-	buf = append(buf, shared.VersionBlockEncV3, KindDeltaUint64)
-	buf = appendUint32LE(buf, uint32(nRows))        //nolint:gosec // safe: nRows bounded by MaxBlockSpans (65535)
-	buf = appendUint32LE(buf, uint32(len(rleData))) //nolint:gosec // safe: rle data bounded by block size
-	buf = append(buf, rleData...)
+	buf = append(buf, shared.VersionBlockEncV3, kind)
+	buf = appendUint32LE(buf, uint32(nRows)) //nolint:gosec // safe: nRows bounded by MaxBlockSpans (65535)
+	buf = appendPresenceSegment(buf, rleData, allPresent)
 
 	var baseBytes [8]byte
 	binary.LittleEndian.PutUint64(baseBytes[:], base)

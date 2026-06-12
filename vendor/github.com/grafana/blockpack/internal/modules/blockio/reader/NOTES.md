@@ -1458,3 +1458,23 @@ Back-ref: `columnar_read.go:prunePreDecodedFromFetch`/`cacheBlockColTypes`,
 `parser.go:blockColTypesCache`, `block_parser.go:blockColTypesCacheKey`, NOTE-185 (the combined
 fetch this prunes), NOTE-200 (the decoded cache it probes), NOTE-212/213 (the copy/sizing skip it
 extends to the fetch itself).
+
+## NOTE-AP-001: AllPresent encoding kinds — free presence on the decode path
+
+The writer (writer NOTE-AP-001) emits AllPresent encoding kinds (15–21) for fully-present dense
+columns. Each is wire-identical to its base dense kind except the
+`presence_rle_len[4] + presence_rle_data` segment is omitted.
+
+`readColumnEncoding` maps an AllPresent kind back to its base kind via `shared.BaseKindFor` and
+passes an `allPresent bool` to the relevant `decode*` function. The shared
+`decodePresenceMaybe(data, pos, nBits, allPresent)` helper short-circuits the presence read: when
+`allPresent` is true it returns `shared.AllPresentBitset(nBits)` (an all-ones bitset) at the
+unchanged position, consuming zero bytes. All downstream index/value logic is unchanged because the
+base dense decoders already read a full `rowCount`-length index array independent of presence.
+
+Old files (and files written with `DisableAllPresentEncoding`) continue to use the base kinds and
+the existing `decodePresenceRLEFromSlice` path; both forms decode to identical columns.
+
+Back-ref: `reader/column.go:readColumnEncoding`/`decodePresenceMaybe`,
+          `shared/presence_rle.go:AllPresentBitset`, `shared/constants.go:BaseKindFor`,
+          writer NOTE-AP-001.

@@ -85,4 +85,13 @@ type Config struct {
 	// When > 0, vectors encountered during block building are accumulated and a V5 footer
 	// is written at Flush time. Typical value: 768 (nomic-embed-text-v1.5).
 	VectorDimension int
+
+	// DisableAllPresentEncoding turns off selection of the AllPresent encoding kinds
+	// (NOTE-AP-001). When false (the default), fully-present dense columns are written
+	// using the compact AllPresent variant that omits the presence_rle segment. Set to
+	// true during rollout to force the legacy presence-RLE form for every column, so a
+	// writer can be deployed ahead of readers that understand the new kinds.
+	//
+	// Reading is unaffected by this flag — readers always accept both forms.
+	DisableAllPresentEncoding bool
 }

@@ -659,6 +659,32 @@ determines the remainder of the wire format.
 | 11 | SparsePrefixBytes | Bytes | URL/path columns + >50% nulls |
 | 12 | DeltaDictionary | Bytes | trace:id (sorted, sequential) |
 | 13 | SparseDeltaDictionary | Bytes | trace:id + >50% nulls |
+| 14 | VectorF32 | VectorF32 | embedding vectors |
+| 15 | DictionaryAllPresent | All types | fully-present dictionary column |
+| 16 | InlineBytesAllPresent | Bytes | fully-present inline bytes (reader-only) |
+| 17 | DeltaUint64AllPresent | Uint64 | fully-present timestamps/monotonic |
+| 18 | RLEIndexesAllPresent | All types | fully-present low-cardinality |
+| 19 | XORBytesAllPresent | Bytes | fully-present ID columns |
+| 20 | PrefixBytesAllPresent | Bytes | fully-present URL/path columns |
+| 21 | DeltaDictionaryAllPresent | Bytes | fully-present trace:id |
+
+### 9.0 AllPresent Encoding Kinds (kinds 15–21)
+
+Kinds 15–21 are the **AllPresent** variants of the dense kinds 1, 3, 5, 6, 8, 10, and 12
+respectively. Each is selected by the writer only when a column is fully present
+(`presentCount == span_count`), so a per-row presence bitset would be all-ones.
+
+The wire format of each AllPresent kind is **byte-for-byte identical to its base dense kind
+except the `presence_rle_len[4] + presence_rle_data` segment (§9.1) is omitted entirely**. The
+kind byte itself signals "every row is present"; the decoder synthesizes an all-ones presence
+vector of `span_count` bits without reading any presence bytes.
+
+There are no sparse AllPresent variants (sparse-with-all-present is a contradiction). An
+all-absent column is represented by omitting the column from the block TOC, so it needs no kind.
+
+Selection is gated by the writer flag `Config.DisableAllPresentEncoding` (default: AllPresent
+on). New kind IDs are additive — `enc_version` is unchanged and old readers reject unknown kinds.
+See writer NOTE-AP-001 / reader NOTE-AP-001.
 
 ### 9.1 Presence RLE
 

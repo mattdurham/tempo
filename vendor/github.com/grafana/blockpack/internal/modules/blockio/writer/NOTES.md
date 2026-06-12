@@ -379,3 +379,49 @@ Back-ref: `internal/modules/blockio/writer/writer.go:writeV8Sections`,
           `internal/modules/blockio/writer/metadata.go:writeFooterV8`,
           `internal/modules/blockio/writer/metadata.go:writeOneColumnRangeBlob`,
           `internal/modules/blockio/writer/sketch_index.go:writeOneColumnSketchBlob`
+
+## NOTE-AP-001: AllPresent encoding kinds — skip presence-RLE for fully-present columns
+
+For a fully-present dense column (every row has a value), the per-row presence bitset is
+all-ones and its RLE encoding is pure overhead: ~`nRows/8` bytes plus the per-column RLE
+encode cost. Intrinsic columns such as `span:id`, `span:start`, and `trace:id` are always
+100% present, so this overhead is paid on every block for every such column.
+
+**Change:** seven new "AllPresent" encoding kinds (15–21, defined in `shared/constants.go`),
+one per dense encoding family:
+
+- `KindDictionaryAllPresent` (15)
+- `KindInlineBytesAllPresent` (16) — reader-only; the writer never emits InlineBytes
+- `KindDeltaUint64AllPresent` (17)
+- `KindRLEIndexesAllPresent` (18)
+- `KindXORBytesAllPresent` (19)
+- `KindPrefixBytesAllPresent` (20)
+- `KindDeltaDictionaryAllPresent` (21)
+
+Each AllPresent kind is **wire-identical to its base dense kind except the
+`presence_rle_len[4] + presence_rle_data` segment is omitted entirely**. The kind byte itself
+signals "every row is present." There are no sparse AllPresent variants — sparse-with-all-present
+is a contradiction.
+
+**Selection** (`encoding_presence.go:selectAllPresent`): each encoder counts `presentCount`
+during the existing presence-bitset build. When `presentCount == nRows` (and `nRows > 0`), it
+emits the AllPresent variant via `shared.AllPresentKindFor` and skips both the
+`EncodePresenceRLE` call and the presence segment (`appendPresenceSegment` becomes a no-op).
+Low-cardinality dictionary columns that auto-upgrade to RLE select `KindRLEIndexesAllPresent`.
+
+**Rollout flag:** `Config.DisableAllPresentEncoding` (default false → AllPresent on) forces the
+legacy presence-RLE form for every column, so a writer can be deployed ahead of readers that
+understand the new kinds (NOTE-007 additive-evolution precedent). The flag is applied to a
+process-level `atomic.Bool` (`constants.go:allPresentEncodingEnabled`) because the encoders run
+on per-block goroutines; in practice the value is a deploy-level constant.
+
+**Backwards compatibility:** new kind IDs only; no `enc_version` bump. Old readers reject unknown
+kinds at `reader/column.go:readColumnEncoding`. New readers map AllPresent kinds back to their
+base kind via `shared.BaseKindFor` and synthesize a fully-present presence vector with
+`shared.AllPresentBitset` (no byte reads). Reading is unaffected by the writer flag — readers
+always accept both forms.
+
+Back-ref: `shared/constants.go` (kinds + `AllPresentKindFor`/`BaseKindFor`/`IsAllPresentKind`),
+          `shared/presence_rle.go:AllPresentBitset`,
+          `writer/encoding_presence.go`, `writer/encoding_{delta,xor,prefix,dict}.go`,
+          `reader/column.go:readColumnEncoding`/`decodePresenceMaybe`, NOTE-007.

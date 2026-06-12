@@ -132,6 +132,9 @@ func NewWriterWithConfig(cfg Config) (*Writer, error) {
 	if cfg.MaxBlockSpans == 0 {
 		cfg.MaxBlockSpans = defaultMaxBlockSpans
 	}
+	// NOTE-AP-001: apply the AllPresent encoding rollout flag. Default is enabled; setting
+	// Config.DisableAllPresentEncoding forces the legacy presence-RLE form for every column.
+	setAllPresentEncodingEnabled(!cfg.DisableAllPresentEncoding)
 	// Default auto-flush at 5× block size. Caps live proto memory to one batch of
 	// 5 blocks while preserving enough lookahead for MinHash sort quality.
 	if cfg.MaxBufferedSpans == 0 {

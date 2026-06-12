@@ -163,3 +163,26 @@ func IsPresent(present []byte, idx int) bool {
 
 	return present[byteIdx]&(1<<uint(idx%8)) != 0 //nolint:gosec // safe: idx%8 is always 0-7
 }
+
+// AllPresentBitset returns a freshly allocated ceil(nBits/8)-byte presence bitset with every
+// one of the first nBits bits set. Used by the reader's AllPresent decode path (NOTE-AP-001)
+// to synthesize a fully-present presence vector without reading any presence_rle bytes from
+// the wire, since AllPresent column kinds omit the presence segment entirely.
+func AllPresentBitset(nBits int) []byte {
+	if nBits <= 0 {
+		return nil
+	}
+
+	out := make([]byte, (nBits+7)/8)
+	for i := range out {
+		out[i] = 0xFF
+	}
+
+	// Clear bits beyond nBits in the final byte so CountPresent / IsPresent are exact.
+	rem := nBits % 8
+	if rem != 0 {
+		out[len(out)-1] = byte((1 << uint(rem)) - 1)
+	}
+
+	return out
+}

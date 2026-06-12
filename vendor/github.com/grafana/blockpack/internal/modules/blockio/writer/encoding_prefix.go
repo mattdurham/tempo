@@ -25,25 +25,26 @@ import (
 // Suffix data payload (for each present row):
 //
 //	prefix_idx[prefix_index_width bytes LE] + suffix_len[4 LE] + suffix_bytes
+//
+// NOTE-AP-001: for the dense kind (KindPrefixBytes) when every row is present,
+// KindPrefixBytesAllPresent is emitted and the presence_rle segment is omitted.
 func encodePrefixBytes(
 	kind uint8,
 	values [][]byte,
 	present []bool,
 	nRows int,
 ) ([]byte, error) {
-	// Build presence bitset.
-	bitsetLen := (nRows + 7) / 8
-	bitset := make([]byte, bitsetLen)
+	bitset, presentCount := buildPresenceBitset(present, nRows)
 
-	for i := range nRows {
-		if i < len(present) && present[i] {
-			bitset[i/8] |= 1 << uint(i%8)
+	kind, allPresent := selectAllPresent(kind, presentCount, nRows)
+
+	var rleData []byte
+	if !allPresent {
+		var err error
+		rleData, err = shared.EncodePresenceRLE(bitset, nRows)
+		if err != nil {
+			return nil, err
 		}
-	}
-
-	rleData, err := shared.EncodePresenceRLE(bitset, nRows)
-	if err != nil {
-		return nil, err
 	}
 
 	// Collect present values for dictionary building.
@@ -90,9 +91,8 @@ func encodePrefixBytes(
 	// V14: both dict and suffix are raw (no zstd). Outer snappy applied per-column by block writer.
 	buf := make([]byte, 0, 2+4+4+len(rleData)+4+len(dictPayload)+4+len(suffixPayload))
 	buf = append(buf, shared.VersionBlockEncV3, kind)
-	buf = appendUint32LE(buf, uint32(nRows))        //nolint:gosec // safe: nRows bounded by MaxBlockSpans (65535)
-	buf = appendUint32LE(buf, uint32(len(rleData))) //nolint:gosec // safe: rle data bounded by block size
-	buf = append(buf, rleData...)
+	buf = appendUint32LE(buf, uint32(nRows)) //nolint:gosec // safe: nRows bounded by MaxBlockSpans (65535)
+	buf = appendPresenceSegment(buf, rleData, allPresent)
 	buf = appendUint32LE(buf, uint32(len(dictPayload))) //nolint:gosec // safe: raw data bounded by block size
 	buf = append(buf, dictPayload...)
 	buf = appendUint32LE(

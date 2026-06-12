@@ -103,20 +103,20 @@ func encodeDictionaryKind(
 	indexWidth := pickIndexWidth(len(indexes))
 
 	// Build presence bitset.
-	bitsetLen := (nRows + 7) / 8
-	bitset := make([]byte, bitsetLen)
-	presentCount := 0
+	bitset, presentCount := buildPresenceBitset(present, nRows)
 
-	for i := range nRows {
-		if i < len(present) && present[i] {
-			bitset[i/8] |= 1 << uint(i%8)
-			presentCount++
+	// NOTE-AP-001: pick the AllPresent variant for the (possibly RLE-upgraded) dense kind.
+	// baseKind drives the dense/RLE branching below; kind is the byte actually emitted.
+	baseKind := kind
+	kind, allPresent := selectAllPresent(kind, presentCount, nRows)
+
+	var rleData []byte
+	if !allPresent {
+		var err error
+		rleData, err = shared.EncodePresenceRLE(bitset, nRows)
+		if err != nil {
+			return nil, err
 		}
-	}
-
-	rleData, err := shared.EncodePresenceRLE(bitset, nRows)
-	if err != nil {
-		return nil, err
 	}
 
 	// For sparse kinds (2, 7), indexes covers only present rows.
@@ -124,7 +124,7 @@ func encodeDictionaryKind(
 	// The indexes slice from buildXxxDict already contains only present-row indexes.
 	// For dense, we need full-row indexes (null rows get index 0).
 	var fullIndexes []uint32
-	if kind == KindDictionary || kind == KindRLEIndexes {
+	if baseKind == KindDictionary || baseKind == KindRLEIndexes {
 		// Dense: build full row indexes — null rows point to index 0.
 		fullIndexes = make([]uint32, nRows)
 		pi := 0
@@ -150,11 +150,10 @@ func encodeDictionaryKind(
 		uint32(len(dictPayload)), //nolint:gosec // safe: dict size bounded by MaxDictionarySize
 	)
 	buf = append(buf, dictPayload...)
-	buf = appendUint32LE(buf, uint32(nRows))        //nolint:gosec // safe: nRows bounded by MaxBlockSpans (65535)
-	buf = appendUint32LE(buf, uint32(len(rleData))) //nolint:gosec // safe: rle data bounded by block size
-	buf = append(buf, rleData...)
+	buf = appendUint32LE(buf, uint32(nRows)) //nolint:gosec // safe: nRows bounded by MaxBlockSpans (65535)
+	buf = appendPresenceSegment(buf, rleData, allPresent)
 
-	if kind == KindRLEIndexes || kind == KindSparseRLEIndexes {
+	if baseKind == KindRLEIndexes || baseKind == KindSparseRLEIndexes {
 		// RLE index encoding.
 		rleIndexData, err := shared.EncodeIndexRLE(fullIndexes)
 		if err != nil {
@@ -168,7 +167,7 @@ func encodeDictionaryKind(
 		buf = append(buf, rleIndexData...)
 	} else {
 		// Raw index array.
-		if kind == KindSparseDictionary {
+		if baseKind == KindSparseDictionary {
 			buf = appendUint32LE(buf, uint32(len(fullIndexes))) //nolint:gosec // safe: index count bounded by MaxBlockSpans
 		}
 		for _, idx := range fullIndexes {
@@ -203,27 +202,27 @@ func encodeDeltaDictionaryKind(
 	dictPayload := encodeBytesDictPayload(entries)
 
 	// Build presence bitset.
-	bitsetLen := (nRows + 7) / 8
-	bitset := make([]byte, bitsetLen)
-	presentCount := 0
+	bitset, presentCount := buildPresenceBitset(present, nRows)
 
-	for i := range nRows {
-		if i < len(present) && present[i] {
-			bitset[i/8] |= 1 << uint(i%8)
-			presentCount++
+	// NOTE-AP-001: pick the AllPresent variant for the dense delta-dictionary kind.
+	// baseKind drives the dense/sparse branching; kind is the byte actually emitted.
+	baseKind := kind
+	kind, allPresent := selectAllPresent(kind, presentCount, nRows)
+
+	var rleData []byte
+	if !allPresent {
+		var err error
+		rleData, err = shared.EncodePresenceRLE(bitset, nRows)
+		if err != nil {
+			return nil, err
 		}
-	}
-
-	rleData, err := shared.EncodePresenceRLE(bitset, nRows)
-	if err != nil {
-		return nil, err
 	}
 
 	// Build delta index array.
 	// Dense (kind 12): one delta per row (including null rows).
 	// Sparse (kind 13): one delta per present row only.
 	var deltaRows []uint32
-	if kind == KindDeltaDictionary {
+	if baseKind == KindDeltaDictionary {
 		// Dense: full row delta stream.
 		fullIndexes := make([]uint32, nRows)
 		pi := 0
@@ -264,9 +263,8 @@ func encodeDeltaDictionaryKind(
 		uint32(len(dictPayload)), //nolint:gosec // safe: dict size bounded by MaxDictionarySize
 	)
 	buf = append(buf, dictPayload...)
-	buf = appendUint32LE(buf, uint32(nRows))        //nolint:gosec // safe: nRows bounded by MaxBlockSpans (65535)
-	buf = appendUint32LE(buf, uint32(len(rleData))) //nolint:gosec // safe: rle data bounded by block size
-	buf = append(buf, rleData...)
+	buf = appendUint32LE(buf, uint32(nRows)) //nolint:gosec // safe: nRows bounded by MaxBlockSpans (65535)
+	buf = appendPresenceSegment(buf, rleData, allPresent)
 	buf = appendUint32LE(
 		buf,
 		uint32(len(deltaData)), //nolint:gosec // safe: delta data bounded by block size

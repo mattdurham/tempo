@@ -106,6 +106,15 @@ Each column is encoded with the best-fit encoding selected at flush time:
 **Invariant:** The encoding with the smallest serialized size is chosen. All encodings
 produce byte-identical output for the same input across writer versions (format stability).
 
+**AllPresent selection (NOTE-AP-001):** when a column is fully present
+(`presentCount == nRows`, `nRows > 0`) and `Config.DisableAllPresentEncoding` is false, the
+writer emits the AllPresent variant of the chosen dense kind (`shared.AllPresentKindFor`):
+Dictionary→15, InlineBytes→16, DeltaUint64→17, RLEIndexes→18, XORBytes→19, PrefixBytes→20,
+DeltaDictionary→21. The AllPresent wire format is identical to its base kind except the
+presence-RLE segment is omitted (the kind byte signals full presence). Sparse kinds, VectorF32,
+and zero-row columns never select an AllPresent variant. Reading is unaffected by the flag —
+readers accept both forms (SPECS §9.0).
+
 ---
 
 ## SPEC-007: Block Size and Count Limits

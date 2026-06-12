@@ -200,6 +200,17 @@ func decodePresenceRLEFromSlice(data []byte, pos, nBits int) ([]byte, int, int, 
 	return present, pos + rleLen, presentCount, nil
 }
 
+// decodePresenceMaybe reads the presence section starting at pos, or — when allPresent is true
+// (an AllPresent encoding kind, NOTE-AP-001) — synthesizes a fully-present presence bitset
+// without consuming any bytes. Returns the presence bitset, the new position (unchanged when
+// allPresent), and the present count (== nBits when allPresent).
+func decodePresenceMaybe(data []byte, pos, nBits int, allPresent bool) ([]byte, int, int, error) {
+	if allPresent {
+		return shared.AllPresentBitset(nBits), pos, nBits, nil
+	}
+	return decodePresenceRLEFromSlice(data, pos, nBits)
+}
+
 // readIndexArray reads count index values of indexWidth bytes each from data[pos:].
 // indexWidth must be 1, 2, or 4.
 func readIndexArray(data []byte, pos, count int, indexWidth uint8) ([]uint32, int, error) {
@@ -261,21 +272,27 @@ func readColumnEncoding(data []byte, spanCount int, colType shared.ColumnType, c
 
 	kind := data[1]
 
-	switch kind {
+	// NOTE-AP-001: AllPresent kinds are wire-identical to their base dense kind except they
+	// omit the presence_rle segment. Map them back to the base kind for dispatch and signal
+	// the decoders to synthesize a fully-present presence vector instead of reading the (absent)
+	// presence bytes.
+	baseKind, allPresent := shared.BaseKindFor(kind)
+
+	switch baseKind {
 	case shared.KindDictionary, shared.KindSparseDictionary:
-		return decodeDictionary(data[2:], kind, spanCount, colType, ctx)
+		return decodeDictionary(data[2:], baseKind, spanCount, colType, ctx, allPresent)
 	case shared.KindInlineBytes, shared.KindSparseInlineBytes:
-		return decodeInlineBytes(data[2:], kind, spanCount)
+		return decodeInlineBytes(data[2:], baseKind, spanCount, allPresent)
 	case shared.KindDeltaUint64:
-		return decodeDeltaUint64(data[2:], spanCount, ctx)
+		return decodeDeltaUint64(data[2:], spanCount, ctx, allPresent)
 	case shared.KindRLEIndexes, shared.KindSparseRLEIndexes:
-		return decodeRLEIndexes(data[2:], kind, spanCount, colType, ctx)
+		return decodeRLEIndexes(data[2:], baseKind, spanCount, colType, ctx, allPresent)
 	case shared.KindXORBytes, shared.KindSparseXORBytes:
-		return decodeXORBytes(data[2:], kind, spanCount, ctx)
+		return decodeXORBytes(data[2:], baseKind, spanCount, ctx, allPresent)
 	case shared.KindPrefixBytes, shared.KindSparsePrefixBytes:
-		return decodePrefixBytes(data[2:], kind, spanCount, ctx)
+		return decodePrefixBytes(data[2:], baseKind, spanCount, ctx, allPresent)
 	case shared.KindDeltaDictionary, shared.KindSparseDeltaDictionary:
-		return decodeDeltaDictionary(data[2:], kind, spanCount, ctx)
+		return decodeDeltaDictionary(data[2:], baseKind, spanCount, ctx, allPresent)
 	default:
 		return nil, fmt.Errorf("column encoding: unknown kind %d", kind)
 	}
@@ -546,6 +563,7 @@ func decodeDictionary(
 	spanCount int,
 	colType shared.ColumnType,
 	ctx *decodeCtx,
+	allPresent bool,
 ) (*Column, error) {
 	col := &Column{SpanCount: spanCount, Type: colType}
 
@@ -581,7 +599,7 @@ func decodeDictionary(
 	}
 
 	// presence_rle[4+N]
-	present, newPos, presentCount, err := decodePresenceRLEFromSlice(data, pos, spanCount)
+	present, newPos, presentCount, err := decodePresenceMaybe(data, pos, spanCount, allPresent)
 	if err != nil {
 		return nil, fmt.Errorf("dictionary: %w", err)
 	}
@@ -661,7 +679,7 @@ func expandSparseIndexes(sparse []uint32, present []byte, spanCount int) []uint3
 
 // decodeInlineBytes decodes kind 3/4 (InlineBytes/SparseInlineBytes).
 // data starts after enc_version + kind bytes.
-func decodeInlineBytes(data []byte, kind uint8, spanCount int) (*Column, error) {
+func decodeInlineBytes(data []byte, kind uint8, spanCount int, allPresent bool) (*Column, error) {
 	col := &Column{SpanCount: spanCount}
 
 	if len(data) < 4 {
@@ -675,7 +693,7 @@ func decodeInlineBytes(data []byte, kind uint8, spanCount int) (*Column, error) 
 		return nil, fmt.Errorf("inline_bytes: row_count %d != spanCount %d", rowCount, spanCount)
 	}
 
-	present, newPos, presentCount, err := decodePresenceRLEFromSlice(data, pos, spanCount)
+	present, newPos, presentCount, err := decodePresenceMaybe(data, pos, spanCount, allPresent)
 	if err != nil {
 		return nil, fmt.Errorf("inline_bytes: %w", err)
 	}
@@ -752,7 +770,7 @@ func decodeInlineBytes(data []byte, kind uint8, spanCount int) (*Column, error) 
 
 // decodeDeltaUint64 decodes kind 5 (DeltaUint64).
 // data starts after enc_version + kind bytes.
-func decodeDeltaUint64(data []byte, spanCount int, ctx *decodeCtx) (*Column, error) {
+func decodeDeltaUint64(data []byte, spanCount int, ctx *decodeCtx, allPresent bool) (*Column, error) {
 	col := &Column{SpanCount: spanCount}
 
 	if len(data) < 4 {
@@ -766,7 +784,7 @@ func decodeDeltaUint64(data []byte, spanCount int, ctx *decodeCtx) (*Column, err
 		return nil, fmt.Errorf("delta_uint64: span_count %d != spanCount %d", storedSpanCount, spanCount)
 	}
 
-	present, newPos, presentCount, err := decodePresenceRLEFromSlice(data, pos, spanCount)
+	present, newPos, presentCount, err := decodePresenceMaybe(data, pos, spanCount, allPresent)
 	if err != nil {
 		return nil, fmt.Errorf("delta_uint64: %w", err)
 	}
@@ -848,6 +866,7 @@ func decodeRLEIndexes(
 	spanCount int,
 	colType shared.ColumnType,
 	ctx *decodeCtx,
+	allPresent bool,
 ) (*Column, error) {
 	col := &Column{SpanCount: spanCount, Type: colType}
 
@@ -883,7 +902,7 @@ func decodeRLEIndexes(
 	}
 
 	// presence_rle[4+N]
-	present, newPos, presentCount, err := decodePresenceRLEFromSlice(data, pos, spanCount)
+	present, newPos, presentCount, err := decodePresenceMaybe(data, pos, spanCount, allPresent)
 	if err != nil {
 		return nil, fmt.Errorf("rle_indexes: %w", err)
 	}
@@ -947,7 +966,7 @@ func decodeRLEIndexes(
 
 // decodeXORBytes decodes kind 8/9 (XORBytes/SparseXORBytes).
 // data starts after enc_version + kind bytes.
-func decodeXORBytes(data []byte, kind uint8, spanCount int, ctx *decodeCtx) (*Column, error) {
+func decodeXORBytes(data []byte, kind uint8, spanCount int, ctx *decodeCtx, allPresent bool) (*Column, error) {
 	col := &Column{SpanCount: spanCount}
 
 	if len(data) < 4 {
@@ -961,7 +980,7 @@ func decodeXORBytes(data []byte, kind uint8, spanCount int, ctx *decodeCtx) (*Co
 		return nil, fmt.Errorf("xor_bytes: span_count %d != spanCount %d", storedSpanCount, spanCount)
 	}
 
-	present, newPos, presentCount, err := decodePresenceRLEFromSlice(data, pos, spanCount)
+	present, newPos, presentCount, err := decodePresenceMaybe(data, pos, spanCount, allPresent)
 	if err != nil {
 		return nil, fmt.Errorf("xor_bytes: %w", err)
 	}
@@ -1042,7 +1061,7 @@ func collectPresentRowsInto(present []byte, _ /*presentCount*/, spanCount int, b
 
 // decodePrefixBytes decodes kind 10/11 (PrefixBytes/SparsePrefixBytes).
 // data starts after enc_version + kind bytes.
-func decodePrefixBytes(data []byte, kind uint8, spanCount int, ctx *decodeCtx) (*Column, error) {
+func decodePrefixBytes(data []byte, kind uint8, spanCount int, ctx *decodeCtx, allPresent bool) (*Column, error) {
 	col := &Column{SpanCount: spanCount}
 
 	if len(data) < 4 {
@@ -1056,7 +1075,7 @@ func decodePrefixBytes(data []byte, kind uint8, spanCount int, ctx *decodeCtx) (
 		return nil, fmt.Errorf("prefix_bytes: span_count %d != spanCount %d", storedSpanCount, spanCount)
 	}
 
-	present, newPos, presentCount, err := decodePresenceRLEFromSlice(data, pos, spanCount)
+	present, newPos, presentCount, err := decodePresenceMaybe(data, pos, spanCount, allPresent)
 	if err != nil {
 		return nil, fmt.Errorf("prefix_bytes: %w", err)
 	}
@@ -1179,7 +1198,7 @@ func decodePrefixBytes(data []byte, kind uint8, spanCount int, ctx *decodeCtx) (
 
 // decodeDeltaDictionary decodes kind 12/13 (DeltaDictionary/SparseDeltaDictionary).
 // data starts after enc_version + kind bytes.
-func decodeDeltaDictionary(data []byte, kind uint8, spanCount int, ctx *decodeCtx) (*Column, error) {
+func decodeDeltaDictionary(data []byte, kind uint8, spanCount int, ctx *decodeCtx, allPresent bool) (*Column, error) {
 	col := &Column{SpanCount: spanCount}
 
 	if len(data) < 1 {
@@ -1216,7 +1235,7 @@ func decodeDeltaDictionary(data []byte, kind uint8, spanCount int, ctx *decodeCt
 	}
 
 	// presence_rle[4+N]
-	present, newPos, presentCount, err := decodePresenceRLEFromSlice(data, pos, spanCount)
+	present, newPos, presentCount, err := decodePresenceMaybe(data, pos, spanCount, allPresent)
 	if err != nil {
 		return nil, fmt.Errorf("delta_dict: %w", err)
 	}
