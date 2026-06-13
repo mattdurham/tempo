@@ -2055,3 +2055,38 @@ alongside the existing single-entry `TestScanTraceIndexRaw_V1`. `go test -race .
 green.
 
 Back-ref: `reader/trace_index.go:buildTraceIdxSamples`.
+
+### NOTE-275: eliminate per-entry bounds checks in the buildTraceIdxSamples walk — 2026-06-09
+
+After NOTE-268/270 inlined the v2 and v1 entry walks, `buildTraceIdxSamples` remained the top
+blockpack-controllable querier CPU hotspot: the 2026-06-09 process_cpu profile put it at ~2.9%
+self-time, an order of magnitude above the next blockpack function (everything else <0.25%). It
+runs once per distinct trace-index section on bloom-hit trace-resolution queries (Q5/Q7/Q9/M6/M9)
+and walks every entry to record its byte offset in the dense index (NOTE-267).
+
+**Mechanism:** the per-entry `block_ref_count` read was written as
+`binary.LittleEndian.Uint16(data[pos+16:])` (and `span_count` as `…(data[p+2:])` per block ref
+in v1). The compiler lowered each of those to TWO bounds checks — an `IsSliceInBounds` for the
+`data[pos+16:]` reslice plus an `IsInBounds` for the 2-byte `Uint16` load — because the loop
+guard compared `pos+18` against a copied length `n := len(data)` rather than against `data`
+itself, so the bound-derivation chain could not reach the indexed loads. Replaced with a
+three-index reslice of the just-validated extent (`hdr := data[pos : pos+18 : pos+18]`, and
+`ref := data[p : p+4 : p+4]` in the v1 inner loop) and decoded the two count bytes by direct
+constant index (`int(hdr[16]) | int(hdr[17])<<8`). The guards now compare against `len(data)`
+directly. Verified via `-d=ssa/check_bce/debug=1`: the per-byte `IsInBounds` loads are fully
+discharged; only the single `IsSliceInBounds` for the reslice remains per entry (down from two
+checks per count read).
+
+**Result:** a 50k-entry v2 section microbench (`BenchmarkBuildTraceIdxSamples`) drops from a
+median ~300 µs/op to ~121 µs/op (min 173→110 µs), ~1 alloc/op unchanged (the `offsets` slice is
+genuine output). General per-entry bounds-check removal, no benchmark-specific constants.
+
+**Correctness:** byte-for-byte identical offsets and identical malformed detection — the
+`pos+18 > len(data)` / `p+4 > len(data)` / `pos > len(data)` / `p > len(data)` guards are the
+same comparisons as before (only `n` is inlined back to `len(data)`), and the count bytes are
+the same two bytes read in the same little-endian order. Covered by the existing
+`TestScanTraceIndexRaw_*`, `TestScanTraceIndexRaw_V1MultiEntry`, and
+`TestScanTraceIndexRaw_ProcessCacheWarmEqualsCold`. `go test -race ./blockio/reader ./executor`
+green.
+
+Back-ref: `reader/trace_index.go:buildTraceIdxSamples`.

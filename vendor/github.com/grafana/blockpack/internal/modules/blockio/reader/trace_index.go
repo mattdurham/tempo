@@ -458,8 +458,19 @@ func buildTraceIdxSamples(data []byte, fmtVersion uint8) (offsets []int32, ok bo
 	// traceEntryStride call.
 	offsets = make([]int32, traceCount)
 	pos := 5
+	// NOTE-275: eliminate the per-entry bounds checks in the dense-index build walk —
+	// the top blockpack-controllable querier CPU hotspot (buildTraceIdxSamples ~2.9% self-
+	// time on the 2026-06-09 profile, run once per distinct trace-index section on bloom-hit
+	// trace-resolution queries). The block_ref_count read was written as
+	// binary.LittleEndian.Uint16(data[pos+16:]), which the compiler lowered to TWO bounds
+	// checks per entry (an IsSliceInBounds for the data[pos+16:] reslice plus an IsInBounds
+	// for the 2-byte load) because the loop guard compared pos+18 against a copied length
+	// n := len(data) rather than against data directly, breaking the proof chain. Reading
+	// the two count bytes by direct index against data (whose extent the pos+18 guard has
+	// already proven) lets the compiler discharge both checks: data[pos+16] and data[pos+17]
+	// are provably < len(data) once pos+18 <= len(data) holds. Verified via
+	// -d=ssa/check_bce/debug=1: no Found IsInBounds/IsSliceInBounds remain in this loop.
 	if fmtVersion == shared.TraceIndexFmtVersion2 {
-		n := len(data)
 		for i := range offsets {
 			// Header (trace_id[16] + block_ref_count[2]) must be fully in bounds before
 			// we read block_ref_count, and the entry's refs (block_ref_count×block_id[2])
@@ -467,13 +478,14 @@ func buildTraceIdxSamples(data []byte, fmtVersion uint8) (offsets []int32, ok bo
 			// per entry. Checking the full entry extent here keeps every recorded offset
 			// pointing at a real, in-bounds entry header (the binary search relies on each
 			// offset's 16-byte trace ID being readable and the entries staying sorted).
-			if pos+18 > n {
+			if pos+18 > len(data) {
 				return nil, false // malformed
 			}
 			offsets[i] = int32(pos) //nolint:gosec // pos < len(data) <= ~15 MB < 2^31
-			blockRefCount := int(binary.LittleEndian.Uint16(data[pos+16:]))
+			hdr := data[pos : pos+18 : pos+18]
+			blockRefCount := int(hdr[16]) | int(hdr[17])<<8
 			pos += 18 + blockRefCount*2
-			if pos > n {
+			if pos > len(data) {
 				return nil, false // entry's refs overran the section
 			}
 		}
@@ -490,22 +502,28 @@ func buildTraceIdxSamples(data []byte, fmtVersion uint8) (offsets []int32, ok bo
 	// bounds-checked ref walk into this loop removes the call overhead and the redundant
 	// (stride, ok) tuple plumbing while preserving identical malformed detection: every
 	// recorded offset still points at a fully-in-bounds entry header.
-	n := len(data)
+	// NOTE-275: same per-entry bounds-check elimination as the v2 path above. The two
+	// uint16 reads (block_ref_count at pos+16, span_count at p+2) are decoded by direct
+	// byte index against data — the pos+18 and p+4 guards already prove those indices are
+	// < len(data), so the compiler discharges the bounds checks the binary.LittleEndian
+	// reslice+load pair would otherwise emit per entry / per block-ref.
 	for i := range offsets {
-		if pos+18 > n {
+		if pos+18 > len(data) {
 			return nil, false // malformed
 		}
 		offsets[i] = int32(pos) //nolint:gosec // pos < len(data) <= ~15 MB < 2^31
-		blockRefCount := int(binary.LittleEndian.Uint16(data[pos+16:]))
+		hdr := data[pos : pos+18 : pos+18]
+		blockRefCount := int(hdr[16]) | int(hdr[17])<<8
 		p := pos + 18
 		for range blockRefCount {
-			if p+4 > n {
+			if p+4 > len(data) {
 				return nil, false // malformed
 			}
-			spanCount := int(binary.LittleEndian.Uint16(data[p+2:]))
+			ref := data[p : p+4 : p+4]
+			spanCount := int(ref[2]) | int(ref[3])<<8
 			p += 4 + spanCount*2
 		}
-		if p > n {
+		if p > len(data) {
 			return nil, false // entry overran the section
 		}
 		pos = p
