@@ -711,7 +711,10 @@ func decodeDictPagesArena(
 	for _, c := range refTotals {
 		total += c
 	}
-	arena := make([]BlockRef, total)
+	// NOTE-258: the arena is carved into exact-capacity per-entry sub-slices that pass 2
+	// fills completely (the summed refCount equals total), so every BlockRef slot is written
+	// before any read — skip the memclr (BlockRef is pointer-free, GC-safe unscanned).
+	arena := makeNoZeroBlockRef(total)
 	off := 0
 	for j := range merged.DictEntries {
 		c := refTotals[j]
@@ -818,11 +821,14 @@ func decodePagedColumnBlob(blob []byte) (*IntrinsicColumn, error) {
 	if toc.Format == IntrinsicFormatFlat || toc.Format == IntrinsicFormatXORBytes ||
 		toc.Format == IntrinsicFormatDeltaUint64 {
 		if toc.ColType == ColumnTypeBytes {
+			// []byte elements carry pointers — must be zeroed (NOTE-258).
 			merged.BytesValues = make([][]byte, 0, totalRows)
 		} else {
-			merged.Uint64Values = make([]uint64, 0, totalRows)
+			// NOTE-258: pointer-free, fully overwritten by the page decode — skip the memclr.
+			merged.Uint64Values = makeNoZeroUint64(totalRows)[:0]
 		}
-		merged.BlockRefs = make([]BlockRef, 0, totalRows)
+		// NOTE-258: BlockRef is pointer-free and every slot is written by the decode.
+		merged.BlockRefs = makeNoZeroBlockRef(totalRows)[:0]
 	}
 
 	// NOTE-150: Flat/XOR/Delta pages are self-contained (delta acc and XOR prev reset to

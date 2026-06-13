@@ -1504,3 +1504,41 @@ decoded across hundreds of pages per block.
 Back-ref: `internal/modules/blockio/shared/intrinsic_codec.go:appendDeltaUint64Page`;
 NOTE-169 (single-byte varint fast path), NOTE-236 (the same BCE reslice on the ref side),
 NOTE-186 (index-based ref store).
+
+## NOTE-258: unzeroed backing-array allocation for full-overwrite, pointer-free decode slices
+
+**Problem:** `decodePagedColumnBlob` pre-sizes the merged column's backing arrays to the exact
+total row count and the page-decode loop then writes **every** slot before the column is
+observed. The `make()` for those arrays nonetheless memclr-zeroes the whole span, even though
+the zeros are immediately overwritten. `runtime.memclrNoHeapPointersChunked` was the #2 runtime
+self-time frame on the M1/M4 unfiltered-rate path (~2.4% of querier CPU, profile 2026-06-09) —
+pure waste. The two arenas affected:
+- `Uint64Values` / `BlockRefs` in the flat/XOR/delta pre-size block (filled by the per-page
+  append helpers; the parallel path reslices to `[:totalRows]` and the serial path appends in
+  page order — the union covers `[0:totalRows)` exactly).
+- The dict `arena := make([]BlockRef, total)` (`decodeDictPagesArena`), carved into
+  exact-capacity per-entry sub-slices that pass 2 fills completely (the summed `refCount`
+  equals `total`).
+
+**Fix:** `makeNoZeroUint64` / `makeNoZeroBlockRef` (`unzeroed_alloc.go`) allocate via
+`runtime.mallocgc` with `needzero=false`, skipping the clear. The flat/XOR/delta block uses
+`makeNoZeroUint64(totalRows)[:0]` / `makeNoZeroBlockRef(totalRows)[:0]` (len 0, cap totalRows —
+identical to the prior `make([]T, 0, totalRows)` shape, just unzeroed); the dict arena uses
+`makeNoZeroBlockRef(total)` directly.
+
+**Correctness / safety:** Sound ONLY because both element types are pointer-free (`uint64`;
+`BlockRef` is `{uint16,uint16}`), so the GC never scans the contents — uninitialised bytes can
+never be misread as a heap pointer — AND every slot is written before any read. The
+`[][]byte` (BytesValues) slice carries pointers and is intentionally left on the zeroing
+`make()` path. Equivalence tests (`TestDecodePagedColumn{Delta,FlatUint64,XORBytes,Dict}Equivalence`)
+pass under `-race`, proving the decode output is byte-identical and no garbage leaks.
+
+**Microbenchmark:** `BenchmarkDecodePagedColumnDelta` ~2.75–3.20ms → ~1.46–1.68ms/op
+(~45% faster), allocs 82–84 → 77–78/op. Dict ~flat (its arena is a smaller fraction of total).
+
+**Queries affected:** every query that decodes a paged flat/XOR/delta or dict intrinsic column
+— the unfiltered/wide rate path (M1/M4) most heavily.
+
+Back-ref: `internal/modules/blockio/shared/unzeroed_alloc.go`,
+`intrinsic_codec.go:decodePagedColumnBlob`, `decodeDictPagesArena`;
+NOTE-145/150 (pre-sized arenas), NOTE-152 (dict arena), NOTE-256 (delta decode BCE).
