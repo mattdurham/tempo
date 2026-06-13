@@ -1662,16 +1662,37 @@ func scanDictPageRaw(
 			pos += skip
 			continue
 		}
-		for range refCount {
-			if pos+refSize > len(pageRaw) {
-				return result, true
-			}
-			result = append(result, decodeRef(pageRaw, pos, blockW, rowW))
-			pos += refSize
-			if maxRefs > 0 && len(result) >= maxRefs {
-				return result, true
+		// NOTE-278: decode the matched value's entire ref run in one batch via
+		// appendVariableWidthRefs instead of a per-ref decodeRef + append loop. The
+		// matched-refs inner loop paid a per-ref slice bounds check, a per-ref append
+		// cap check, a per-ref maxRefs comparison, and (in decodeRef) a per-ref
+		// blockW/rowW width branch — exactly the redundant per-row work that NOTE-236
+		// hoisted out of the page-decode ref scatter. Low-cardinality predicate columns
+		// (e.g. an attribute with a handful of distinct values matched across thousands
+		// of spans — the dominant search/metrics predicate shape) produce a single
+		// matched dict entry with a very large refCount, so this run is the bulk of the
+		// scan's work. appendVariableWidthRefs validates the full run's bounds once and
+		// emits a check-free width-specialised copy loop.
+		take := refCount
+		if maxRefs > 0 {
+			if remaining := maxRefs - len(result); remaining < take {
+				take = remaining
 			}
 		}
+		newPos, refErr := appendVariableWidthRefs(pageRaw, pos, blockW, rowW, take, &result)
+		if refErr != nil {
+			// A short final run (page truncated mid-refs) is tolerated by the legacy
+			// loop, which returned the refs decoded so far; preserve that by reporting
+			// success with whatever was collected.
+			return result, true
+		}
+		if maxRefs > 0 && len(result) >= maxRefs {
+			// Cap hit (take may be < refCount); the remaining refs of this run are
+			// skipped — the caller stops at maxRefs so position need not advance.
+			return result, true
+		}
+		// take == refCount here (no cap), so newPos is the end of the full run.
+		pos = newPos
 	}
 	return result, true
 }
@@ -1826,18 +1847,23 @@ func ScanDictColumnRefs(
 			continue
 		}
 
-		// Decode only matching value's refs.
-		for range refCount {
-			if pos+refSize > len(raw) {
-				return nil
-			}
-			ref := decodeRef(raw, pos, blockW, rowW)
-			pos += refSize
-			result = append(result, ref)
-			if maxRefs > 0 && len(result) >= maxRefs {
-				return result
+		// NOTE-278: batch-decode the matched value's ref run (see scanDictPageRaw for
+		// rationale) rather than a per-ref decodeRef + append loop.
+		take := refCount
+		if maxRefs > 0 {
+			if remaining := maxRefs - len(result); remaining < take {
+				take = remaining
 			}
 		}
+		newPos, refErr := appendVariableWidthRefs(raw, pos, blockW, rowW, take, &result)
+		if refErr != nil {
+			return nil
+		}
+		if maxRefs > 0 && len(result) >= maxRefs {
+			return result
+		}
+		// take == refCount here (no cap), so newPos is the end of the full run.
+		pos = newPos
 	}
 	return result
 }

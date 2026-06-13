@@ -1761,3 +1761,39 @@ search, M6/M9 predicate-filtered rate-by).
 Back-ref: `shared/intrinsic_codec.go:scanDictPageRaw`, `scanDictPagedBlob`,
 `ScanDictColumnRefs`, `ScanDictColumnRefsWithBloom`; `executor/predicates.go:scanIntrinsicLeafRefs`;
 `shared/shared_test.go:BenchmarkScanDictColumnRefs_MultiPage`.
+
+## NOTE-278: batch-decode the matched dict entry's ref run (no per-ref scatter loop)
+
+**Problem:** when a dict predicate matched a value, `scanDictPageRaw` (v2 paged) and the v1
+body of `ScanDictColumnRefs` collected that value's refs with a per-ref loop:
+`for range refCount { boundsCheck; result = append(result, decodeRef(...)); pos += refSize;
+maxRefsCheck }`. Every ref paid a slice bounds check on the source read, an append cap/length
+check, a `maxRefs` comparison, and a `blockW`/`rowW` width branch inside `decodeRef`. This is
+the exact redundant per-row work that NOTE-236 hoisted out of the page-decode ref scatter
+(`appendVariableWidthRefs`). The matched run is the *bulk* of the scan's work for the dominant
+predicate shape — a low-cardinality attribute column where a handful of distinct values are
+matched across thousands of spans (one matched dict entry with a very large `refCount`).
+The geometric `append` growth of `result` also produced O(log n) reallocations per matched run.
+
+**Fix:** decode the matched entry's whole ref run in one call to `appendVariableWidthRefs`,
+which validates the run's bounds once, extends `result` once, and emits a check-free
+width-specialised copy loop. `maxRefs` is honoured by capping `take = min(refCount, maxRefs -
+len(result))` before the call and returning once the cap is reached (the remaining refs of the
+run are skipped — the caller stops at `maxRefs`, so the read position need not advance past the
+prefix). When `take == refCount` (no cap) the returned `newPos` is the end of the full run.
+
+**Verification:** `go test -race ./blockio/shared ./executor` green (incl.
+`TestScanDictColumnRefs_*` and the new `TestScanDictColumnRefs_MaxRefsCap`, which asserts the
+v1 and v2 paths return exactly `maxRefs` refs as a prefix of the matched run, and that a cap
+equal to the run length returns the full run). New `BenchmarkScanDictColumnRefs_DenseMatch`
+(8 pages × 3 distinct values, matched value carries 3000 refs/page): **21 → 7 allocs/op
+(-67%)**, 371 KB → 360 KB/op, steady-state ~72 µs vs old ~95 µs/op. Scan results are
+byte-identical (same refs, same order).
+
+**Queries affected:** every search/metrics query whose predicate matches a low-cardinality
+dict (string-keyed) intrinsic column via `scanIntrinsicLeafRefs` — the matched-run decode is
+where these scans spend the bulk of their CPU and allocations.
+
+Back-ref: `shared/intrinsic_codec.go:scanDictPageRaw`, `ScanDictColumnRefs`;
+`shared/shared_test.go:BenchmarkScanDictColumnRefs_DenseMatch`,
+`TestScanDictColumnRefs_MaxRefsCap`.
