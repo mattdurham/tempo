@@ -4797,3 +4797,30 @@ constants — a general dispatch restructuring over the fixed intrinsic column s
 **Queries affected:** predicate-filtered search (Q2/Q5/Q9/Q10) and predicate-filtered metrics
 (M6/M9), wherever a `{...}` filter has intrinsic-column leaves evaluated per candidate row.
 Back-ref: `internal/modules/executor/predicates.go:intrinsicLeafMatchTyped`.
+
+## NOTE-245: precompute per-timestep composite-key prefixes in group-by emit loops
+
+The group-by rate/agg emit loops build a composite map key per occupied (group, timestep) cell
+as `strconv.FormatInt(bk, 10) + "\x00" + gk` inside a `numGroups × numSteps` double loop. The
+timestep portion (`FormatInt(bk) + "\x00"`) is identical across all groups, so the integer
+formatting + intermediate string allocation was repeated up to `numGroups` times for each of
+the `numSteps` distinct bucket indices. For a rate-by query like M4/M9 (~248 groups × ~120
+steps over the bench window) that is ~30K `FormatInt`+concat calls when only ~120 distinct
+prefixes exist.
+
+`timeBucketKeyPrefixes(numSteps)` builds the `numSteps` prefix strings once per emit; the emit
+loop then concatenates `prefix + gk` (the trailing `+gk` concat is unavoidable — the composite
+key embeds the per-group value, which differs per group). Applied to the four group-by emit
+loops: `streamCountRateN1CompactCore` (M4/M6 rate-by, unfiltered), `streamCountRateN1CompactFromRefs`
+(predicate-filtered N=1 count/rate emit), `streamAggN1CompactFromRefs` (predicate-filtered N=1
+general agg), and `accumulateAggDirect` (dense direct N=1 agg). The histogram emit paths use a
+distinct key shape (`FormatInt(bk)+"\x00\x00"+FormatFloat(boundary)`) and are out of scope here.
+
+**Correctness:** byte-for-byte equivalent. `timeBucketKeyPrefixes(numSteps)[i]` equals the
+former `strconv.FormatInt(int64(i), 10) + "\x00"` for every `i ∈ [0, numSteps)`, and every emit
+loop iterates `timeIdx`/`bk` over exactly `[0, numSteps)` (the `row` slices and `groupCountsFlat`
+strides are sized to `numSteps`). The resulting map key is identical, so the emitted buckets and
+their downstream series are unchanged. No benchmark-specific constants — a general string-build
+hoist over the timestep dimension.
+**Queries affected:** group-by rate/agg metrics (M4, M6, M9) emit. Back-ref:
+`internal/modules/executor/metrics_trace_intrinsic.go:timeBucketKeyPrefixes`.

@@ -1596,6 +1596,8 @@ func streamCountRateN1CompactCore(
 	}
 
 	// Emit non-zero entries to buckets.
+	// NOTE-245: precompute per-timestep key prefixes once instead of re-formatting bk per cell.
+	keyPrefixes := timeBucketKeyPrefixes(numSteps)
 	for gIdx := range numGroups {
 		gk := dict[gIdx]
 		base := gIdx * numSteps
@@ -1614,7 +1616,7 @@ func streamCountRateN1CompactCore(
 			if c == 0 {
 				continue
 			}
-			k := strconv.FormatInt(bk, 10) + "\x00" + gk
+			k := keyPrefixes[bk] + gk
 			intrinsicGetOrCreateBucket(buckets, k).count += c
 		}
 	}
@@ -1744,6 +1746,8 @@ func streamAggN1Compact(
 	}
 
 	// Emit.
+	// NOTE-245: precompute per-timestep key prefixes once instead of re-formatting timeIdx per cell.
+	keyPrefixes := timeBucketKeyPrefixes(numSteps)
 	for gIdx, row := range groupBuckets {
 		gk := ""
 		if gIdx < len(dict) {
@@ -1753,7 +1757,7 @@ func streamAggN1Compact(
 			if bucket == nil {
 				continue
 			}
-			k := strconv.FormatInt(int64(timeIdx), 10) + "\x00" + gk //nolint:gosec
+			k := keyPrefixes[timeIdx] + gk
 			buckets[k] = bucket
 		}
 	}
@@ -1867,6 +1871,8 @@ func streamAggN1CompactFromRefs(
 		}
 	}
 
+	// NOTE-245: precompute per-timestep key prefixes once instead of re-formatting timeIdx per cell.
+	keyPrefixes := timeBucketKeyPrefixes(numSteps)
 	for gIdx, row := range groupBuckets {
 		gk := ""
 		if gIdx < len(dict) {
@@ -1876,7 +1882,7 @@ func streamAggN1CompactFromRefs(
 			if bucket == nil {
 				continue
 			}
-			k := strconv.FormatInt(int64(timeIdx), 10) + "\x00" + gk //nolint:gosec
+			k := keyPrefixes[timeIdx] + gk
 			buckets[k] = bucket
 		}
 	}
@@ -2376,6 +2382,27 @@ func mergeJoinFilteredRefsWithVals(
 }
 
 // intrinsicGetOrCreateBucket returns the bucket for compositeKey, creating it if absent.
+// timeBucketKeyPrefixes returns a slice of length numSteps whose element i is
+// strconv.FormatInt(i, 10) + "\x00" — the per-timestep prefix of an intrinsic composite
+// bucket key (the full key is prefix + groupKey). NOTE-245: the group-by rate/agg emit loops
+// (streamCountRateN1CompactCore, streamCountRateN1CompactFromRefs, streamAggN1CompactFromRefs)
+// build a key for every occupied (group, timestep) cell as
+// strconv.FormatInt(bk, 10) + "\x00" + gk inside a numGroups×numSteps double loop. The
+// timestep portion is identical across all groups, so FormatInt was recomputed (and its
+// result string re-allocated) up to numGroups times for each of the numSteps distinct bucket
+// indices — e.g. ~248 groups × ~120 steps ≈ 30K FormatInt+concat for M4/M9 when only ~120
+// distinct prefixes exist. Precomputing the prefixes once (numSteps FormatInt calls) and
+// concatenating prefix+gk in the emit loop removes the redundant integer formatting; the +gk
+// concat is unavoidable (the composite key embeds the group value). The returned slice is
+// caller-owned scratch built once per emit.
+func timeBucketKeyPrefixes(numSteps int64) []string {
+	prefixes := make([]string, numSteps)
+	for i := range numSteps {
+		prefixes[i] = strconv.FormatInt(i, 10) + "\x00"
+	}
+	return prefixes
+}
+
 func intrinsicGetOrCreateBucket(buckets map[string]*aggBucketState, compositeKey string) *aggBucketState {
 	b, exists := buckets[compositeKey]
 	if !exists {
@@ -3740,6 +3767,8 @@ func accumulateAggDirect(
 		}
 	}
 
+	// NOTE-245: precompute per-timestep key prefixes once instead of re-formatting timeIdx per cell.
+	keyPrefixes := timeBucketKeyPrefixes(numSteps)
 	for gIdx, row := range groupBuckets {
 		gk := ""
 		if gIdx < len(dict) {
@@ -3749,7 +3778,7 @@ func accumulateAggDirect(
 			if bucket == nil {
 				continue
 			}
-			k := strconv.FormatInt(int64(timeIdx), 10) + "\x00" + gk //nolint:gosec
+			k := keyPrefixes[timeIdx] + gk
 			buckets[k] = bucket
 		}
 	}
