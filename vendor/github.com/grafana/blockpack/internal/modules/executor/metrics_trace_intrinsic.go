@@ -8,10 +8,12 @@ package executor
 // See also NOTE-055 for the streamHistogramGroupBy dict-amortization extension.
 
 import (
+	"cmp"
 	"context"
 	"math"
 	"math/bits"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -399,8 +401,18 @@ func executeTraceMetricsIntrinsic(
 		}
 	}
 
+	// NOTE-247: for the single-dimension count/rate group-by case, the dense per-(group,
+	// step) accumulator produced by dispatchIntrinsicAccumulate IS the final series grid.
+	// Supply a direct series sink so the count/rate emit paths skip the string `buckets`
+	// map and the traceBuildDenseSeries re-parse entirely (see emitFlatCountRateSeries).
+	// On the intrinsic path the map is never shared across blocks, so this is always safe.
+	var seriesSink *[]TraceTimeSeries
+	if isCountRate && len(agg.GroupBy) == 1 {
+		seriesSink = &[]TraceTimeSeries{}
+	}
+
 	buckets := make(map[string]*aggBucketState)
-	if err := dispatchIntrinsicAccumulate(ctx, r, tsCol, lo, hi, filteredRefs, isCountRate, inRangeRefs, inRangeVals, querySpec, buckets); err != nil {
+	if err := dispatchIntrinsicAccumulate(ctx, r, tsCol, lo, hi, filteredRefs, isCountRate, inRangeRefs, inRangeVals, querySpec, buckets, seriesSink); err != nil {
 		return nil, false, err
 	}
 	if isCountRate && len(agg.GroupBy) == 0 && len(buckets) == 0 {
@@ -408,9 +420,12 @@ func executeTraceMetricsIntrinsic(
 	}
 
 	result := &TraceMetricsResult{}
-	if querySpec.Aggregate.Function == vm.FuncNameHISTOGRAM {
+	switch {
+	case seriesSink != nil:
+		result.Series = finalizeCountRateSeries(*seriesSink)
+	case querySpec.Aggregate.Function == vm.FuncNameHISTOGRAM:
 		result.Series = traceHistogramSeries(buckets, querySpec)
-	} else {
+	default:
 		result.Series = traceBuildDenseSeries(buckets, querySpec)
 	}
 	return result, true, nil
@@ -469,6 +484,7 @@ func dispatchIntrinsicAccumulate(
 	inRangeVals []uint64,
 	querySpec *vm.QuerySpec,
 	buckets map[string]*aggBucketState,
+	seriesSink *[]TraceTimeSeries, // NOTE-247: non-nil for count/rate N=1 → emit series directly
 ) error {
 	agg := querySpec.Aggregate
 	tb := querySpec.TimeBucketing
@@ -491,7 +507,7 @@ func dispatchIntrinsicAccumulate(
 		return accumulateHistogramDirectN0(ctx, tb, agg, tsCol, numSteps, r, lo, hi, buckets)
 	case filteredRefs == nil && len(agg.GroupBy) == 1:
 		// NOTE-085/089: N=1 no-predicate direct path.
-		ok, err := accumulateIntrinsicBucketsDirect(ctx, r, tsCol, lo, hi, querySpec, buckets)
+		ok, err := accumulateIntrinsicBucketsDirect(ctx, r, tsCol, lo, hi, querySpec, buckets, seriesSink)
 		if err != nil || ok {
 			return err
 		}
@@ -499,7 +515,7 @@ func dispatchIntrinsicAccumulate(
 		// (keyToBucket hash map + dictByPK dense array) that accumulateIntrinsicBucketsViaKeyMap
 		// produces for large production files where maxPK > maxDirectArrayEntries.
 		if isCountRate {
-			return streamCountRateN1Compact(ctx, r, tsCol, lo, hi, querySpec, buckets)
+			return streamCountRateN1Compact(ctx, r, tsCol, lo, hi, querySpec, buckets, seriesSink)
 		}
 		// NOTE-109: compact fallback for general agg (max/min/sum/avg etc.) — avoids ~3.4 GB
 		// allocations (keyToBucket hash map + dictByPK + valByPK + hasByPK dense arrays)
@@ -527,7 +543,7 @@ func dispatchIntrinsicAccumulate(
 		// O(n log n) pkOrder sort used by streamCountRateN1Compact and replace the
 		// keyToBucket hash map + buildDictIdxForRefs dense arrays with compact binary search.
 		// Reduces peak memory from ~1.5 GB to ~0.8 GB per goroutine per file.
-		return streamCountRateN1CompactFromRefs(ctx, r, inRangeRefs, inRangeVals, querySpec, buckets)
+		return streamCountRateN1CompactFromRefs(ctx, r, inRangeRefs, inRangeVals, querySpec, buckets, seriesSink)
 	case filteredRefs != nil && len(agg.GroupBy) == 1 && !isCountRate && agg.Function != vm.FuncNameHISTOGRAM:
 		// NOTE-112: predicate-filtered N=1 agg compact path (min/max/sum/avg/etc.).
 		// Same principle as NOTE-110: inRangeRefs is pre-sorted, so skip pkOrder sort.
@@ -1458,6 +1474,7 @@ func streamCountRateN1Compact(
 	lo, hi int,
 	querySpec *vm.QuerySpec,
 	buckets map[string]*aggBucketState,
+	seriesSink *[]TraceTimeSeries, // NOTE-247
 ) error {
 	agg := querySpec.Aggregate
 	tb := querySpec.TimeBucketing
@@ -1485,7 +1502,18 @@ func streamCountRateN1Compact(
 
 	fillPKSetAndTimeBuckets(tsCol, lo, hi, &tb, numSteps, pkSet, timeBucketByPos)
 
-	return streamCountRateN1CompactCore(ctx, r, pkSet, timeBucketByPos, agg.GroupBy[0], numSteps, buckets)
+	return streamCountRateN1CompactCore(
+		ctx,
+		r,
+		pkSet,
+		timeBucketByPos,
+		agg.GroupBy[0],
+		numSteps,
+		buckets,
+		seriesSink,
+		agg.Function == vm.FuncNameRATE,
+		float64(tb.StepSizeNanos)/1e9,
+	)
 }
 
 // streamCountRateN1CompactFromRefs is the predicate-filtered compact path for N=1 count/rate.
@@ -1507,6 +1535,7 @@ func streamCountRateN1CompactFromRefs(
 	inRangeVals []uint64,
 	querySpec *vm.QuerySpec,
 	buckets map[string]*aggBucketState,
+	seriesSink *[]TraceTimeSeries, // NOTE-247
 ) error {
 	agg := querySpec.Aggregate
 	tb := querySpec.TimeBucketing
@@ -1531,7 +1560,18 @@ func streamCountRateN1CompactFromRefs(
 			timeBucketByPos[i] = int32(bk + 1) //nolint:gosec
 		}
 	}
-	return streamCountRateN1CompactCore(ctx, r, sortedPKs, timeBucketByPos, agg.GroupBy[0], numSteps, buckets)
+	return streamCountRateN1CompactCore(
+		ctx,
+		r,
+		sortedPKs,
+		timeBucketByPos,
+		agg.GroupBy[0],
+		numSteps,
+		buckets,
+		seriesSink,
+		agg.Function == vm.FuncNameRATE,
+		float64(tb.StepSizeNanos)/1e9,
+	)
 }
 
 // streamCountRateN1CompactCore is the shared accumulation core for compact N=1 count/rate paths.
@@ -1547,6 +1587,9 @@ func streamCountRateN1CompactCore(
 	groupByColName string,
 	numSteps int64,
 	buckets map[string]*aggBucketState,
+	seriesSink *[]TraceTimeSeries, // NOTE-247
+	isRate bool,
+	stepSec float64,
 ) error {
 	n := len(sortedPKs)
 
@@ -1593,6 +1636,14 @@ func streamCountRateN1CompactCore(
 			gIdx = int64(raw - 1) //nolint:gosec
 		}
 		groupCountsFlat[gIdx*numSteps+int64(bk)-1]++ //nolint:gosec
+	}
+
+	// NOTE-247: when a direct series sink is supplied, emit straight from the dense array
+	// (one series per non-empty group) and skip the string `buckets` map + the
+	// traceBuildDenseSeries re-parse.
+	if seriesSink != nil {
+		emitFlatCountRateSeries(seriesSink, groupCountsFlat, numGroups, numSteps, dict, groupByColName, isRate, stepSec)
+		return nil
 	}
 
 	// Emit non-zero entries to buckets.
@@ -2401,6 +2452,87 @@ func timeBucketKeyPrefixes(numSteps int64) []string {
 		prefixes[i] = strconv.FormatInt(i, 10) + "\x00"
 	}
 	return prefixes
+}
+
+// emitFlatCountRateSeries builds TraceTimeSeries directly from a dense
+// groupCountsFlat array (layout groupCountsFlat[gIdx*numSteps+bk]) and a single
+// group-by dimension's dict, appending one series per non-empty group to *sink.
+//
+// NOTE-247: the single-dimension intrinsic count/rate group-by emit paths
+// (accumulateCountRateDirect, and streamCountRateN1CompactCore behind both
+// streamCountRateN1Compact and streamCountRateN1CompactFromRefs) formerly funneled their
+// dense per-(group, step) counts into the string-keyed `buckets` map via
+// FormatInt(bk)+"\x00"+gk, after which
+// traceBuildDenseSeries re-parsed every composite key (IndexByte + ParseInt) and
+// scattered the values back into a per-group dense slice — the exact (gIdx, bk) shape
+// the dense array already had. That round-trip cost one hash insert + one string concat
+// per occupied cell on emit, then one hash lookup + one ParseInt per cell on the rebuild,
+// purely to serialize and immediately deserialize the integer step index. Because
+// executeTraceMetricsIntrinsic accumulates per file and consumes the result immediately
+// (the map is never shared across blocks on the intrinsic path), the series can be built
+// straight from the dense array: the group label is dict[gIdx] and Values is the row
+// groupCountsFlat[gIdx*numSteps : (gIdx+1)*numSteps] scaled to COUNT/RATE semantics
+// (traceRowValue: count for COUNT, count/stepSec for RATE; both yield 0 for empty cells).
+// No string map, no key formatting, no re-parse. Output series are byte-identical to the
+// buckets→traceBuildDenseSeries path; the caller sorts the combined sink once at the end.
+func emitFlatCountRateSeries(
+	sink *[]TraceTimeSeries,
+	groupCountsFlat []int64,
+	numGroups, numSteps int64,
+	dict []string,
+	groupByName string,
+	isRate bool,
+	stepSec float64,
+) {
+	labelName := intrinsicLabelName(groupByName)
+	for gIdx := int64(0); gIdx < numGroups; gIdx++ {
+		base := gIdx * numSteps
+		hasAny := false
+		for bk := int64(0); bk < numSteps; bk++ {
+			if groupCountsFlat[base+bk] != 0 {
+				hasAny = true
+				break
+			}
+		}
+		if !hasAny {
+			continue
+		}
+		gk := ""
+		if gIdx < int64(len(dict)) { //nolint:gosec
+			gk = dict[gIdx]
+		}
+		values := make([]float64, numSteps)
+		for bk := int64(0); bk < numSteps; bk++ {
+			c := groupCountsFlat[base+bk]
+			if c == 0 {
+				continue
+			}
+			if isRate {
+				if stepSec > 0 {
+					values[bk] = float64(c) / stepSec
+				}
+			} else {
+				values[bk] = float64(c)
+			}
+		}
+		*sink = append(*sink, TraceTimeSeries{
+			Labels: []TraceMetricLabel{{Name: labelName, Value: gk}},
+			Values: values,
+		})
+	}
+}
+
+// finalizeCountRateSeries sorts the directly-built count/rate series by label string for
+// deterministic output, matching traceBuildDenseSeries' final SortFunc (SPEC-ETM-11). It
+// returns nil for an empty input so callers see the same nil-result behavior. NOTE-247.
+func finalizeCountRateSeries(series []TraceTimeSeries) []TraceTimeSeries {
+	if len(series) == 0 {
+		return nil
+	}
+	slices.SortFunc(series, func(a, b TraceTimeSeries) int {
+		return cmp.Compare(traceLabelString(a.Labels), traceLabelString(b.Labels))
+	})
+	return series
 }
 
 func intrinsicGetOrCreateBucket(buckets map[string]*aggBucketState, compositeKey string) *aggBucketState {
@@ -3281,6 +3413,7 @@ func accumulateIntrinsicBucketsDirect(
 	lo, hi int,
 	querySpec *vm.QuerySpec,
 	buckets map[string]*aggBucketState,
+	seriesSink *[]TraceTimeSeries, // NOTE-247
 ) (bool, error) {
 	agg := querySpec.Aggregate
 	isCountRate := agg.Function == vm.FuncNameCOUNT || agg.Function == vm.FuncNameRATE
@@ -3409,6 +3542,10 @@ func accumulateIntrinsicBucketsDirect(
 			dict,
 			numSteps,
 			buckets,
+			seriesSink,
+			agg.Function == vm.FuncNameRATE,
+			float64(tb.StepSizeNanos)/1e9,
+			agg.GroupBy[0],
 		)
 	}
 	// NOTE-089: HISTOGRAM and general agg now handled by direct column scan.
@@ -3439,6 +3576,10 @@ func accumulateCountRateDirect(
 	dict []string,
 	numSteps int64,
 	buckets map[string]*aggBucketState,
+	seriesSink *[]TraceTimeSeries, // NOTE-247
+	isRate bool,
+	stepSec float64,
+	groupByName string,
 ) error {
 	numGroups := int64(len(dict)) //nolint:gosec
 	// NOTE-119/124: flat 2D pooled array — eliminates per-block allocation of
@@ -3492,6 +3633,12 @@ func accumulateCountRateDirect(
 				groupCountsFlat[bk] += absentAtBk
 			}
 		}
+	}
+
+	// NOTE-247: direct series emit when a sink is supplied (skips the string map + re-parse).
+	if seriesSink != nil {
+		emitFlatCountRateSeries(seriesSink, groupCountsFlat, numGroups, numSteps, dict, groupByName, isRate, stepSec)
+		return nil
 	}
 
 	// Emit.

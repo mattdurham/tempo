@@ -4857,3 +4857,41 @@ benchmark-specific constants — a general algorithmic change from dense probing
 **Queries affected:** all group-by trace metrics series build (M4, M6, M9 rate-by; M8 histogram).
 Back-ref: `internal/modules/executor/metrics_trace.go:traceBuildDenseSeries`,
 `internal/modules/executor/metrics_trace.go:traceHistogramSeries`.
+
+## NOTE-247: direct dense-array → series emit for single-dim count/rate group-by (skip the string map round-trip)
+
+The single-dimension intrinsic count/rate group-by emit paths — `accumulateCountRateDirect`
+(no-predicate direct, M4 `{} | rate() by (...)`), `streamCountRateN1CompactCore` (the shared core
+behind `streamCountRateN1Compact` / `streamCountRateN1CompactFromRefs`, the compact and
+predicate-filtered N=1 count/rate paths, M9 `{pred} | rate() by (...)`) — accumulate their result
+into a dense `groupCountsFlat[gIdx*numSteps+bk]` array whose layout IS the final series grid:
+group `gIdx` maps to `dict[gIdx]`, timestep `bk` to series value index `bk`. Each path then
+serialized that grid into the string-keyed `buckets map[string]*aggBucketState` via
+`FormatInt(bk,10) + "\x00" + gk` per occupied cell, and `traceBuildDenseSeries` immediately
+deserialized it back (`IndexByte` + `ParseInt` per cell, hash lookup, scatter into a per-group
+dense slice). The composite key existed only to carry the integer step index out of the dense
+array and parse it straight back in — one hash insert + one string concat per occupied cell on
+emit, then one hash lookup + one ParseInt per cell on rebuild, for zero semantic gain.
+
+`executeTraceMetricsIntrinsic` runs **per file** and consumes its result immediately; the
+`buckets` map is never shared across blocks on the intrinsic path (cross-block coalescing happens
+in `metrics_trace.go`'s block-scan path, NOTE-246, not here). So for the count/rate N=1 case the
+driver now passes a `*[]TraceTimeSeries` sink down through `dispatchIntrinsicAccumulate`; when the
+sink is non-nil the emit functions call `emitFlatCountRateSeries`, which walks the dense array
+once and appends one `TraceTimeSeries{Labels:[{intrinsicLabelName(groupBy[0]), dict[gIdx]}],
+Values: row scaled to COUNT/RATE}` per non-empty group — no string map, no key formatting, no
+re-parse. The driver then sorts the collected series once (`finalizeCountRateSeries`, identical
+final `SortFunc` over the label string, SPEC-ETM-11) and skips `traceBuildDenseSeries` entirely.
+
+**Scope/fallback:** the sink is supplied only for `isCountRate && len(GroupBy) == 1`. All N=1
+count/rate dispatch branches (direct, compact, predicate-filtered-compact) thread and honor it;
+when the sink is nil (every other query shape, and any future caller) the functions emit into
+`buckets` exactly as before, so the change is transparent to histogram, agg, N=0, and N>1 paths.
+Value semantics match `traceRowValue`: COUNT = count, RATE = count/stepSec, both 0 for empty
+cells; the absent-row pass (group 0 / `dict[0]==""`) emits a series with empty label value, just
+as `traceBuildDenseSeries` does. No benchmark-specific constants — a general structural change
+removing a serialize/deserialize round-trip on the hottest non-histogram group-by emit path.
+**Queries affected:** M4 (`{} | rate() by`), M9 (`{pred} | rate() by`), and any count/rate by a
+single dimension. Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:emitFlatCountRateSeries`,
+`finalizeCountRateSeries`, `accumulateCountRateDirect`, `streamCountRateN1CompactCore`,
+`executeTraceMetricsIntrinsic`.
