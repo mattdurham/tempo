@@ -1843,3 +1843,50 @@ intrinsic column — the group-by aggregation path (`rate()/histogram_over_time 
 high-cardinality dict columns decode the most occurrences (M4/M6/M8/M9).
 
 Back-ref: `shared/intrinsic_codec.go:decodeDictPagesArena`, `dictOccIdxPool`.
+
+## NOTE-282: zero-copy per-page Min/Max/Bloom on the search-path TOC decode
+
+**Problem:** Every paged-column predicate scan (`scanDictPagedBlob`, `scanFlatPagedBlob`,
+`scanFlatPagedFiltered`, and the delegated `scanDeltaUint64Paged*`) parsed the page TOC via
+`parsePagedBlobHeader → DecodePageTOC`, the *stats-bearing* decode. That decode materialized
+two `string(raw[...])` copies (per-page Min and Max) plus a `make([]byte)+copy` for the Bloom
+filter **on every page** — on a hundreds-of-page Delta/dict column that is ~200+ allocations
+per scanned column, purely transient. The copies existed only because `DecodePageTOC` decoded
+the TOC into a pooled scratch buffer it released (`defer ReleaseIntrinsicBuf`) before returning,
+so the returned Min/Max/Bloom could not be allowed to alias the scratch.
+
+But the scanners consume every Min/Max/Bloom *strictly within their own scan loop* — `Min`/`Max`
+feed `leUint64FromString` for range-skip, `Bloom` feeds `TestIntrinsicBloom` for bloom-skip —
+and never retain the TOC past the loop. So the copies are pure waste on the scan path.
+
+**Fix:** add `DecodePageTOCInto(blob, *bp)` (and `parsePagedBlobHeaderInto`) which decode the
+TOC into the **caller-owned** pooled buffer `*bp` and alias each page's Min/Max as `unsafe.String`
+over that buffer and Bloom as a capped sub-slice. Each scanner now acquires its own `tocBuf`,
+holds it for the full scan (`defer ReleaseIntrinsicBuf(tocBuf)` after the loop), and passes the
+resulting `toc` down to any delegated delta scan (which reads the same aliased stats while the
+buffer is still alive). The per-page Min/Max/Bloom copies collapse to a single allocation (the
+`[]PageMeta` slice). The shared field-parsing logic is factored into `parsePageTOCFields(raw,
+mode)` with a `pageStatsMode` selecting none / copy / zero-copy, so `DecodePageTOCNoStats`
+(decode-only callers — NOTE-274) and the exported copy-mode `DecodePageTOC` (used by external
+callers/tests that may retain the TOC past a scratch release) are unchanged.
+
+**Why correct:** the `tocBuf` outlives every Min/Max/Bloom read — it is released only by the
+scanner's `defer`, after the scan loop (and after any delegated delta scan that reads the same
+`toc`) completes. The per-page snappy decode inside the loop uses a *separate* pooled buffer
+(`pageBuf`), a distinct `Get()` instance, so it can never overwrite `tocBuf`. Zero-length Min/Max
+yield an empty `unsafe.String` (valid) and are gated by the `len(pm.Min) == 8` range check, so a
+short stat simply does not match. Cold/decode-only paths are byte-identical (they never touched
+stats). General; no benchmark-specific constants.
+
+**Verification:** `go test -race ./blockio/shared ./blockio/reader ./executor` green. Microbench
+of the isolated TOC decode on a 100-page column: `DecodePageTOC` (copy) 201 allocs/op @ ~10.0µs
+→ `DecodePageTOCInto` 1 alloc/op @ ~7.8µs (-99.5% allocs, -22% time), matching
+`DecodePageTOCNoStats`. The exported copy-path benchmark is unchanged (still 201 allocs — that
+path is intentionally retained for retaining callers).
+
+**Queries affected:** every paged-column predicate scan — numeric range scans (`duration > x`),
+and any dict/flat intrinsic predicate scan over a multi-page column. Removes ~2×pages+blooms
+transient allocations per scanned column from the warm search path.
+
+Back-ref: `shared/intrinsic_codec.go:DecodePageTOCInto`, `parsePagedBlobHeaderInto`,
+`parsePageTOCFields`, `scanDictPagedBlob`, `scanFlatPagedBlob`, `scanFlatPagedFiltered`.
