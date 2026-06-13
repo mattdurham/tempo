@@ -41,31 +41,75 @@ var parsedIntrinsicCache objectcache.Cache[shared.IntrinsicColumn]
 // SPEC-OC-003, NOTE-200 (reader NOTES.md)
 var parsedV8ColumnCache objectcache.Cache[Column]
 
-// blockColTypesCache caches the per-block name->colType mapping by
+// blockColTypesCache caches the per-block parsed ToC (column-metadata array + tocEnd) by
 // fileID+"/v8coltypes/"+blockOffset. NOTE-214: the combined ToC+columns GetMulti
 // (NOTE-185) requests the compressed blob of EVERY wanted column, but on the warm path
 // many of those columns already have a decoded snapshot in parsedV8ColumnCache and the
 // fetched blob is discarded (NOTE-212/213 skip the copy). The blob can only be probed
 // against parsedV8ColumnCache by its (name, type) key, and the type is not known until
-// the ToC is decoded — which happens AFTER the GetMulti. Caching the name->type mapping
-// at first ToC parse lets the warm path probe parsedV8ColumnCache BEFORE building the
-// GetMulti and drop already-decoded columns from the request, cutting the wasted memcache
-// Get traffic (the MemCache.Get CPU sink the standing target points at).
-// SPEC-OC-003, NOTE-214 (reader NOTES.md)
+// the ToC is decoded — which happens AFTER the GetMulti. Caching the parsed ToC at first
+// parse lets the warm path probe parsedV8ColumnCache BEFORE building the GetMulti and drop
+// already-decoded columns from the request, cutting the wasted memcache Get traffic (the
+// MemCache.Get CPU sink the standing target points at).
+//
+// NOTE-241: the cache now retains the full parsed []colMetaEntry + tocEnd, not just the
+// name->type mapping. parseColumnMetadataArray ran on EVERY warm block read — re-decoding
+// hundreds of column-metadata entries from the ToC bytes and allocating one string(name)
+// per column plus the entries slice, all of which are deterministic for a given block. On
+// the fully-warm wide path the parse result is consumed only by the NOTE-213 sizing loop
+// (which finds every column pre-decoded) and then discarded, so the parse is pure
+// per-query allocation/CPU. Caching the parsed metas lets a warm read skip
+// parseBlockHeader + parseColumnMetadataArray entirely and reuse the shared (read-only)
+// slice. Inline columns' inlineData sub-slices the transient ToC buffer, so they are
+// deep-copied into the cached entry to avoid aliasing memcache-owned bytes.
+// SPEC-OC-003, NOTE-214/241 (reader NOTES.md)
 var blockColTypesCache objectcache.Cache[blockColTypes]
 
-// blockColTypes maps a block's column names to the column type(s) present under that name.
-// One block can carry the same name with different types, so the value is a small slice.
+// blockColTypes holds a block's fully-parsed ToC: the column-metadata array (in wire order)
+// and the byte offset one past the last metadata entry (tocEnd). The cached metas slice is
+// treated as READ-ONLY by all readers — it is shared across queries, so no consumer may
+// mutate an entry or the slice. One block can carry the same name with multiple types; the
+// per-name type lookup used by NOTE-214 pruning is derived from metas on demand (typesFor).
 // Wrapped in a named struct for stable pointer identity in objectcache.Cache.
 type blockColTypes struct {
-	byName map[string][]shared.ColumnType
+	metas  []colMetaEntry
+	tocEnd int
 }
 
-// SizeBytes estimates the in-memory size of the mapping for objectcache LRU budgeting.
+// typesFor returns the column type(s) present under name across this block's ToC. One block
+// can carry the same name with different types (rare), so the result may hold several types.
+// Allocation-free in the common single-type case (returns a one-element view via the small
+// fixed-size buffer); callers must not retain the returned slice past the next typesFor call
+// on the same buffer.
+func (b *blockColTypes) typesFor(name string, buf *[4]shared.ColumnType) []shared.ColumnType {
+	n := 0
+	for i := range b.metas {
+		if b.metas[i].name != name {
+			continue
+		}
+		if n < len(buf) {
+			buf[n] = b.metas[i].colType
+		}
+		n++
+	}
+	if n == 0 {
+		return nil
+	}
+	if n > len(buf) {
+		n = len(buf) // defensive cap; a name with >4 types is not expected
+	}
+	return buf[:n]
+}
+
+// SizeBytes estimates the in-memory size of the parsed ToC for objectcache LRU budgeting.
 func (b *blockColTypes) SizeBytes() int64 {
 	n := int64(0)
-	for name, types := range b.byName {
-		n += int64(len(name)) + int64(len(types)) + 16 // key bytes + type bytes + per-entry overhead
+	for i := range b.metas {
+		n += int64(
+			len(b.metas[i].name),
+		) + int64(
+			len(b.metas[i].inlineData),
+		) + 48 // name + inline bytes + struct overhead
 	}
 	return n + 32
 }

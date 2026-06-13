@@ -331,25 +331,38 @@ func (r *Reader) readBlockColumnarWithCache(
 		}
 	}
 
-	hdr, err := parseBlockHeader(toc)
-	if err != nil {
-		// Fallback: full block read (same as readBlockColumnar's fallback).
-		return r.readFullBlockFallback(blockOff, blockLen, blockIdx)
-	}
-
-	metas, tocEnd, err := parseColumnMetadataArray(
-		toc,
-		int(shared.BlockHeaderV14Size),
-		int(hdr.columnCount),
-		hdr.version,
+	// NOTE-241: reuse the per-block parsed ToC if it was cached by an earlier read. The
+	// metas + tocEnd are deterministic for a block, so re-running parseBlockHeader +
+	// parseColumnMetadataArray on every warm read — allocating one string(name) per column
+	// plus the entries slice — is pure per-query waste. On a hit we skip both parses and use
+	// the shared read-only metas. On a miss we parse, cache, and proceed as before. The
+	// fetched ToC bytes are still needed (for the assembled-buffer prefix copy + parser), so
+	// only the parse is elided, not the fetch.
+	var (
+		metas  []colMetaEntry
+		tocEnd int
 	)
-	if err != nil {
-		return r.readFullBlockFallback(blockOff, blockLen, blockIdx)
+	if cached := r.getCachedBlockToc(blockOff); cached != nil {
+		metas, tocEnd = cached.metas, cached.tocEnd
+	} else {
+		hdr, hdrErr := parseBlockHeader(toc)
+		if hdrErr != nil {
+			// Fallback: full block read (same as readBlockColumnar's fallback).
+			return r.readFullBlockFallback(blockOff, blockLen, blockIdx)
+		}
+		metas, tocEnd, err = parseColumnMetadataArray(
+			toc,
+			int(shared.BlockHeaderV14Size),
+			int(hdr.columnCount),
+			hdr.version,
+		)
+		if err != nil {
+			return r.readFullBlockFallback(blockOff, blockLen, blockIdx)
+		}
+		// NOTE-214/241: record this block's parsed ToC so a subsequent warm query can both
+		// prune already-decoded columns from the combined fetch and skip this parse.
+		r.cacheBlockColTypes(blockOff, metas, tocEnd)
 	}
-
-	// NOTE-214: record this block's name->colType mapping so a subsequent warm query can
-	// prune already-decoded columns from the combined fetch before the ToC is parsed.
-	r.cacheBlockColTypes(blockOff, metas)
 
 	// NOTE-213: a SINGLE pass over metas both (a) detects already-decoded columns
 	// (stashing their live snapshot and excluding them entirely) and (b) sizes the
@@ -579,9 +592,10 @@ func (r *Reader) prunePreDecodedFromFetch(blockOff int64, wantColumns map[string
 		return wantColumns
 	}
 	var pruned map[string]struct{}
+	var typeBuf [4]shared.ColumnType
 	for name := range wantColumns {
-		types, ok := ct.byName[name]
-		if !ok {
+		types := ct.typesFor(name, &typeBuf)
+		if len(types) == 0 {
 			continue
 		}
 		for _, t := range types {
@@ -604,11 +618,26 @@ func (r *Reader) prunePreDecodedFromFetch(blockOff int64, wantColumns map[string
 	return pruned
 }
 
-// cacheBlockColTypes records the block's name->colType mapping in blockColTypesCache so a
-// subsequent warm query can prune already-decoded columns from the combined fetch BEFORE the
-// ToC is parsed (NOTE-214). Idempotent: a Put over the same key replaces an equivalent map.
-// No-op when there is no fileID. Called once per block read after parseColumnMetadataArray.
-func (r *Reader) cacheBlockColTypes(blockOff int64, metas []colMetaEntry) {
+// getCachedBlockToc returns the block's previously-parsed ToC (metas + tocEnd) if present.
+// The returned metas slice is READ-ONLY and shared across queries — callers must not mutate
+// it. Returns nil on a miss or when there is no fileID. NOTE-241.
+func (r *Reader) getCachedBlockToc(blockOff int64) *blockColTypes {
+	if r.fileID == "" {
+		return nil
+	}
+	return blockColTypesCache.Get(blockColTypesCacheKey(r.fileID, uint64(blockOff))) //nolint:gosec
+}
+
+// cacheBlockColTypes records the block's fully-parsed ToC (metas + tocEnd) in
+// blockColTypesCache so a subsequent warm query can both prune already-decoded columns from
+// the combined fetch BEFORE re-parsing (NOTE-214) and skip parseColumnMetadataArray entirely
+// (NOTE-241). Idempotent: a no-op if the block is already cached. No-op when there is no
+// fileID. Called once per block read after parseColumnMetadataArray.
+//
+// The cached metas are shared read-only across queries, so any inline column's inlineData —
+// which sub-slices the transient ToC buffer — is deep-copied into a private backing array to
+// avoid aliasing memcache-owned bytes that may be recycled after this read.
+func (r *Reader) cacheBlockColTypes(blockOff int64, metas []colMetaEntry, tocEnd int) {
 	if r.fileID == "" || len(metas) == 0 {
 		return
 	}
@@ -616,11 +645,17 @@ func (r *Reader) cacheBlockColTypes(blockOff int64, metas []colMetaEntry) {
 	if blockColTypesCache.Get(key) != nil {
 		return // already cached for this block
 	}
-	byName := make(map[string][]shared.ColumnType, len(metas))
-	for _, m := range metas {
-		byName[m.name] = append(byName[m.name], m.colType)
+	cached := make([]colMetaEntry, len(metas))
+	copy(cached, metas)
+	for i := range cached {
+		if cached[i].inlineData != nil {
+			// Deep-copy inline bytes: the source aliases the transient ToC buffer.
+			b := make([]byte, len(cached[i].inlineData))
+			copy(b, cached[i].inlineData)
+			cached[i].inlineData = b
+		}
 	}
-	_ = blockColTypesCache.Put(key, &blockColTypes{byName: byName})
+	_ = blockColTypesCache.Put(key, &blockColTypes{metas: cached, tocEnd: tocEnd})
 }
 
 // sectionBatchFetcher is the optional interface a section cache may implement to

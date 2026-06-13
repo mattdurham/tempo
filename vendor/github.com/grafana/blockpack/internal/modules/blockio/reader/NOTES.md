@@ -1459,6 +1459,51 @@ Back-ref: `columnar_read.go:prunePreDecodedFromFetch`/`cacheBlockColTypes`,
 fetch this prunes), NOTE-200 (the decoded cache it probes), NOTE-212/213 (the copy/sizing skip it
 extends to the fetch itself).
 
+## NOTE-241: cache the parsed block ToC (metas + tocEnd), not just name->type — 2026-06-12
+
+**Decision:** `readBlockColumnarWithCache` ran `parseBlockHeader` + `parseColumnMetadataArray` on
+EVERY warm block read. Trace blocks routinely carry hundreds of columns, and the parse allocates
+one `string(name)` per column (a heap copy out of the ToC byte buffer) plus the `[]colMetaEntry`
+entries slice — all deterministic for a given block, so re-deriving them per query is pure
+per-query allocation/CPU. On the fully-warm wide path (M4/M9 `rate() by (...)`, predicate-filtered
+`rate by`) the parsed metas are consumed only by the NOTE-213 sizing loop — which finds every
+wanted column already pre-decoded and copies nothing — and then discarded. The standing lever
+across NOTE-208/212/213/214 is "reduce warm-path allocation/copy VOLUME": this removes the metas
+re-parse from that volume.
+
+**Mechanism:** `blockColTypesCache` (introduced as a name->type map by NOTE-214) now retains the
+full parsed ToC: `blockColTypes{metas []colMetaEntry; tocEnd int}`. `cacheBlockColTypes` stores the
+metas (already populated once per block right after the first successful parse) and tocEnd;
+`readBlockColumnarWithCache` first probes `getCachedBlockToc(blockOff)` and, on a hit, uses the
+shared metas + tocEnd and SKIPS both parses. On a miss it parses, caches, and proceeds as before.
+The NOTE-214 prune lookup is now served by `blockColTypes.typesFor(name, &buf)`, which scans the
+cached metas (O(metas) per wanted column; wantColumns is tiny — 1–3 columns for metrics queries —
+so this is a few hundred comparisons, far cheaper than the parse it replaces) using a stack
+`[4]ColumnType` buffer so the common single-type case allocates nothing.
+
+**Correctness:** the cached metas slice is shared READ-ONLY across queries; every consumer
+(the NOTE-213 sizing loop, `planColdRunsLazy`/`planColdRuns`) only reads `m.name`/`m.colType`/
+offsets and copies entries by value into a fresh `keepCols` slice — no consumer mutates an entry
+or the slice. The one aliasing hazard is V15 inline columns, whose `inlineData` sub-slices the
+transient ToC byte buffer (which is memcache-owned and may be recycled after the read); so
+`cacheBlockColTypes` deep-copies `inlineData` into a private backing array before caching. The
+fetched ToC BYTES are still required (the assembled-buffer prefix copy + the parser read them), so
+only the parse is elided, not the fetch — the assembled buffer and parser output are byte-identical
+to a fresh-parse read. First read of a block misses the cache and parses exactly as before; the
+cache is process-level thread-safe and the metas are immutable once cached, so concurrent
+`blockGroupPipeline` workers share them race-free.
+
+**Verified:** `go test -race ./blockio/reader ./blockio/shared ./executor` green, incl.
+`TestParsedV8ColumnCache_WarmEqualsCold`, `TestParsedV8ColumnCache_LazyWarmEqualsCold`,
+`TestReader_CombinedTocColumnFetch_WarmIdentical`, `TestReader_PreDecodedColumns_SkipCopyStillCorrect`,
+`TestReader_PrunePreDecodedFromFetch_NoBlobFetch` — the warm-path equivalence + prune suite — all
+unchanged-green, confirming the cached-metas warm read returns identical values and prunes
+identically to a fresh parse.
+
+Back-ref: `columnar_read.go:getCachedBlockToc`/`cacheBlockColTypes`, `parser.go:blockColTypes`/
+`typesFor`, NOTE-214 (the colTypes cache this extends), NOTE-213 (the sizing loop that consumes
+the metas), NOTE-200 (the decoded cache the prune probes).
+
 ## NOTE-AP-001: AllPresent encoding kinds — free presence on the decode path
 
 The writer (writer NOTE-AP-001) emits AllPresent encoding kinds (15–21) for fully-present dense
