@@ -65,6 +65,35 @@ var parsedV8ColumnCache objectcache.Cache[Column]
 // SPEC-OC-003, NOTE-214/241 (reader NOTES.md)
 var blockColTypesCache objectcache.Cache[blockColTypes]
 
+// parsedTraceSparseCache caches the sparse trace-index offset index (the NOTE-260
+// traceIdxSamples slice) by fileID+"/tracesparse/"+len(traceIndexRaw). NOTE-265: a Reader
+// (and thus its compactTraceIndex) is created fresh per query, so the O(traceCount) walk
+// that builds traceIdxSamples — calling traceEntryStride on every entry — was rerun on
+// every bloom-hit lookup against the same on-disk trace-index section. The 2026-06-09/13
+// querier profiles showed traceEntryStride at ~1.77% and the ensureTraceIdxSamples build
+// closure at ~0.99% self-time, all of it this repeated rebuild. The samples reference only
+// byte OFFSETS into traceIndexRaw plus a copied [16]byte trace ID (no aliasing of the raw
+// bytes), and the section's layout is fully determined by its length, so the built index
+// is safe to share across Readers for the same fileID+length. Strong references: entries
+// persist until Clear is called.
+// SPEC-OC-003, NOTE-265 (reader NOTES.md)
+var parsedTraceSparseCache objectcache.Cache[traceSparseIndex]
+
+// traceSparseIndex wraps the cached sparse offset index so it has a stable pointer identity
+// for objectcache.Cache. ok records whether the build succeeded; a build that hit a
+// malformed entry caches ok=false so the lookup falls back to a full linear scan without
+// re-attempting (and re-failing) the walk on every query.
+type traceSparseIndex struct {
+	samples []traceIdxSample
+	ok      bool
+}
+
+// SizeBytes estimates the in-memory size of the sparse index for objectcache LRU budgeting.
+func (t *traceSparseIndex) SizeBytes() int64 {
+	// Each traceIdxSample is [16]byte + int offset = 24 bytes.
+	return int64(len(t.samples))*24 + 16
+}
+
 // blockColTypes holds a block's fully-parsed ToC: the column-metadata array (in wire order)
 // and the byte offset one past the last metadata entry (tocEnd). The cached metas slice is
 // treated as READ-ONLY by all readers — it is shared across queries, so no consumer may
@@ -124,8 +153,9 @@ func (b *blockColTypes) SizeBytes() int64 {
 func SetIntrinsicCacheBytes(n int64) {
 	parsedIntrinsicCache.SetMaxBytes(n)
 	// parsedIntrinsicTOCCache removed 2026-06-12 (legacy V4/V5/V6 format)
-	parsedV8ColumnCache.SetMaxBytes(n)     // NOTE-200: same budget as intrinsic columns
-	blockColTypesCache.SetMaxBytes(n / 16) // NOTE-214: name->type maps are tiny vs decoded columns
+	parsedV8ColumnCache.SetMaxBytes(n)         // NOTE-200: same budget as intrinsic columns
+	blockColTypesCache.SetMaxBytes(n / 16)     // NOTE-214: name->type maps are tiny vs decoded columns
+	parsedTraceSparseCache.SetMaxBytes(n / 16) // NOTE-265: sparse trace-index samples are tiny
 }
 
 // ClearCaches resets all process-level caches. Intended for testing.
@@ -136,6 +166,7 @@ func ClearCaches() {
 
 	parsedV8ColumnCache.Clear()
 	blockColTypesCache.Clear()
+	parsedTraceSparseCache.Clear()
 }
 
 // rangeIndexMeta records the byte range within metadataBytes for a

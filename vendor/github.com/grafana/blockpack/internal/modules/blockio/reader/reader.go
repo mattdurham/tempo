@@ -785,7 +785,7 @@ func (r *Reader) TraceEntries(traceID [16]byte) []TraceEntry {
 	if !ok && r.compactParsed != nil {
 		// Ensure trace index bytes are loaded (lazy for lean readers; no-op for full readers).
 		_ = r.ensureTraceIndexRaw()
-		blockIDs = r.compactParsed.scanTraceIndexRaw(traceID)
+		blockIDs = r.compactParsed.scanTraceIndexRaw(r.fileID, traceID)
 		ok = blockIDs != nil
 	}
 	if !ok {

@@ -1925,3 +1925,38 @@ ascending early-exit point, and the sample floor are all unchanged. Verified `go
 ./blockio/reader ./executor` green incl. the NOTE-260 `trace_index_sparse_test.go` cases.
 
 Back-ref: `reader/trace_index.go:scanTraceIndexRaw`, `:traceIDLess`.
+
+## NOTE-265: cache the sparse trace-index samples in a process-level cache keyed by fileID — 2026-06-13
+
+**Decision:** NOTE-260 built a sparse offset index (`traceIdxSamples`) over the sorted
+compact trace-index table so trace-ID lookups binary-search to a single stride window
+instead of an O(traceCount) linear walk. But that index lived on the per-Reader
+`compactTraceIndex` behind a per-instance `sync.Once`, and a Reader is created fresh per
+query (per block per querier call). So the O(traceCount) walk that *builds* the sparse
+index — calling `traceEntryStride` on every entry — was rerun on every bloom-hit lookup
+against the same on-disk trace-index section. The 2026-06-09/13 querier CPU profiles showed
+`traceEntryStride` at ~1.77% self-time and the `ensureTraceIdxSamples` build closure at
+~0.99%, all of it this repeated rebuild — the largest blockpack-controllable CPU sink after
+`snappy.decode` (already buffer-reuse-optimized in NOTE-262/263).
+
+**Mechanism:** a new process-level `parsedTraceSparseCache objectcache.Cache[traceSparseIndex]`
+(same pattern as `parsedV8ColumnCache`/`blockColTypesCache`) keyed by
+`fileID + "/tracesparse/" + len(traceIndexRaw)`. The build is factored out of the
+`sync.Once` closure into a free function `buildTraceIdxSamples` returning `(samples, ok)`.
+`ensureTraceIdxSamples` now takes the `fileID`, probes the cache first, and on a miss builds
+once and stores the result (including a malformed `ok=false` build, so it is not retried per
+query). `scanTraceIndexRaw` threads `r.fileID` through from both callsites (`BlocksForTraceID`,
+`TraceEntries`). When `fileID == ""` (lean readers with no stable ID) the cache is bypassed
+and behaviour is identical to NOTE-260.
+
+**Correctness:** the cached `traceIdxSamples` reference only copied `[16]byte` trace IDs and
+integer byte OFFSETS into `traceIndexRaw` — they do not alias the raw bytes, so sharing them
+across Readers (whose `traceIndexRaw` is itself the NOTE-257 aliased cached blob, identical
+for the same section) is safe. The section layout is fully determined by its byte length, so
+the length-keyed cache never returns a stale index for a different section. The build is
+byte-for-byte the old `sync.Once` body. `go test -race ./blockio/reader ./executor` green
+incl. the NOTE-260 sparse-index tests (`TestScanTraceIndexRaw_SparseMatchesLinear`, `_V1`,
+`_EmptyAndTiny`), which exercise both formats and the empty/tiny paths.
+
+Back-ref: `reader/trace_index.go:scanTraceIndexRaw`, `:ensureTraceIdxSamples`,
+`:buildTraceIdxSamples`; `reader/parser.go:parsedTraceSparseCache`, `:traceSparseIndex`.

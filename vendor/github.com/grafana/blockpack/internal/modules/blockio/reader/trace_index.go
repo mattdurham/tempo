@@ -5,6 +5,7 @@ package reader
 import (
 	"encoding/binary"
 	"fmt"
+	"strconv"
 
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
 	"github.com/grafana/blockpack/internal/modules/rw"
@@ -229,7 +230,7 @@ func (r *Reader) BlocksForTraceIDCompact(traceID [16]byte) []int {
 		return nil
 	}
 
-	blockIDs := r.compactParsed.scanTraceIndexRaw(traceID)
+	blockIDs := r.compactParsed.scanTraceIndexRaw(r.fileID, traceID)
 	if blockIDs == nil {
 		return nil
 	}
@@ -322,7 +323,7 @@ func decodeTraceEntryBlocks(data []byte, pos int, fmtVersion uint8) []uint16 {
 // instead of O(n). Builds the sparse index once per compactTraceIndex under a sync.Once.
 // NOTE-PERF-COMPACT: still does NOT parse the table into a map; the sparse index holds at
 // most n/stride samples and all block-list allocation is deferred to a confirmed hit.
-func (ci *compactTraceIndex) scanTraceIndexRaw(traceID [16]byte) []uint16 {
+func (ci *compactTraceIndex) scanTraceIndexRaw(fileID string, traceID [16]byte) []uint16 {
 	data := ci.traceIndexRaw
 	if len(data) < 5 {
 		return nil
@@ -333,7 +334,7 @@ func (ci *compactTraceIndex) scanTraceIndexRaw(traceID [16]byte) []uint16 {
 		return nil
 	}
 
-	ci.ensureTraceIdxSamples(fmtVersion)
+	ci.ensureTraceIdxSamples(fileID, fmtVersion)
 
 	// Determine the byte offset to begin the linear scan from. With a usable sparse index
 	// this is the largest sample whose trace ID is <= traceID; otherwise scan from the start.
@@ -402,38 +403,73 @@ func traceIDLess(a, b [16]byte) bool {
 	return binary.BigEndian.Uint64(a[8:16]) < binary.BigEndian.Uint64(b[8:16])
 }
 
-// ensureTraceIdxSamples builds the sparse offset index (traceIdxSamples) once. On any
-// malformed entry it leaves traceIdxSampleOK false so the caller falls back to a full
-// linear scan from the start of the table.
-func (ci *compactTraceIndex) ensureTraceIdxSamples(fmtVersion uint8) {
+// ensureTraceIdxSamples builds the sparse offset index (traceIdxSamples) once per
+// compactTraceIndex. On any malformed entry it leaves traceIdxSampleOK false so the caller
+// falls back to a full linear scan from the start of the table.
+//
+// NOTE-265: the built index is also stashed in the process-level parsedTraceSparseCache
+// keyed by fileID+length, so a subsequent Reader for the same on-disk trace-index section
+// reuses the result instead of re-walking the whole table. A Reader (and thus its
+// compactTraceIndex) is created fresh per query, so the O(traceCount) walk — calling
+// traceEntryStride on every entry — was rerun on every bloom-hit lookup against the same
+// section. The 2026-06-09/13 querier profiles showed traceEntryStride at ~1.77% and this
+// build closure at ~0.99% self-time, all of it this repeated rebuild. The samples reference
+// only byte OFFSETS into traceIndexRaw plus a copied [16]byte trace ID (no aliasing of the
+// raw bytes), and the section's layout is fully determined by its length, so the result is
+// safe to share across Readers for the same fileID+length. A failed/malformed build is
+// cached too (ok=false) so it is not retried per query.
+func (ci *compactTraceIndex) ensureTraceIdxSamples(fileID string, fmtVersion uint8) {
 	ci.traceIdxIndexOnce.Do(func() {
 		data := ci.traceIndexRaw
-		traceCount := int(binary.LittleEndian.Uint32(data[1:]))
-		if traceCount == 0 {
-			ci.traceIdxSampleOK = true
-			return
+
+		var cacheKey string
+		if fileID != "" {
+			cacheKey = fileID + "/tracesparse/" + strconv.Itoa(len(data))
+			if cached := parsedTraceSparseCache.Get(cacheKey); cached != nil {
+				ci.traceIdxSamples = cached.samples
+				ci.traceIdxSampleOK = cached.ok
+				return
+			}
 		}
-		samples := make([]traceIdxSample, 0, traceCount/traceIdxSampleStride+1)
-		pos := 5
-		for i := range traceCount {
-			if pos+18 > len(data) {
-				return // malformed: leave traceIdxSampleOK false
-			}
-			if i%traceIdxSampleStride == 0 {
-				samples = append(samples, traceIdxSample{
-					traceID: *(*[16]byte)(data[pos : pos+16]),
-					offset:  pos,
-				})
-			}
-			stride, ok := traceEntryStride(data, pos, fmtVersion)
-			if !ok {
-				return // malformed
-			}
-			pos += stride
-		}
+
+		samples, ok := buildTraceIdxSamples(data, fmtVersion)
 		ci.traceIdxSamples = samples
-		ci.traceIdxSampleOK = true
+		ci.traceIdxSampleOK = ok
+
+		if cacheKey != "" {
+			_ = parsedTraceSparseCache.Put(cacheKey, &traceSparseIndex{samples: samples, ok: ok})
+		}
 	})
+}
+
+// buildTraceIdxSamples walks the raw trace-index table once, recording a sample
+// (trace ID + byte offset) every traceIdxSampleStride entries. Returns ok=false on a
+// malformed entry (the caller then falls back to a full linear scan). The returned samples
+// reference only copied trace IDs and byte offsets, so they do not alias data.
+func buildTraceIdxSamples(data []byte, fmtVersion uint8) (samples []traceIdxSample, ok bool) {
+	traceCount := int(binary.LittleEndian.Uint32(data[1:]))
+	if traceCount == 0 {
+		return nil, true
+	}
+	samples = make([]traceIdxSample, 0, traceCount/traceIdxSampleStride+1)
+	pos := 5
+	for i := range traceCount {
+		if pos+18 > len(data) {
+			return nil, false // malformed
+		}
+		if i%traceIdxSampleStride == 0 {
+			samples = append(samples, traceIdxSample{
+				traceID: *(*[16]byte)(data[pos : pos+16]),
+				offset:  pos,
+			})
+		}
+		stride, strideOK := traceEntryStride(data, pos, fmtVersion)
+		if !strideOK {
+			return nil, false // malformed
+		}
+		pos += stride
+	}
+	return samples, true
 }
 
 // ensureCompactHeaderParsedV3 reads the v3 split compact header section (raw, uncompressed).
