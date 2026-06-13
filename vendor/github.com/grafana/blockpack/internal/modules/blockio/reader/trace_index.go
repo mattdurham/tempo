@@ -352,16 +352,23 @@ func (ci *compactTraceIndex) scanTraceIndexRaw(fileID string, traceID [16]byte) 
 	// O(traceCount) build walk (~2.3% querier self-time, 2026-06-09 profile) re-runs far
 	// less often. Entries are sorted ascending by trace ID, so the sample preceding the
 	// window's first entry is a strict lower bound on the window's trace IDs.
-	if ci.traceIdxSampleOK && len(ci.traceIdxOffsets) > 0 {
+	if ci.traceIdxSampleOK && len(ci.traceIdxOffsets) > 0 &&
+		len(ci.traceIdxSampleIDs) == 2*len(ci.traceIdxOffsets) {
 		offs := ci.traceIdxOffsets
+		// NOTE-289: binary search over the cache-resident sample trace IDs (ids[2k]=hi,
+		// ids[2k+1]=lo), parallel to offs[k]. Probing this small slice avoids chasing
+		// log2(len(offs)) random offsets back into the cold, per-query-fetched
+		// traceIndexRaw section — each such probe was a likely cache miss. ids has exactly
+		// 2×len(offs) elements (built in lockstep, guarded above), so ids[2*mid+1] is in
+		// bounds.
+		ids := ci.traceIdxSampleIDs
 		// Binary search for the last sample whose trace ID is <= target; the matching
 		// entry, if present, lies in [that sample, the next sample).
 		lo, hi := 0, len(offs)
 		for lo < hi {
 			mid := int(uint(lo+hi) >> 1)
-			pos := int(offs[mid])
-			entryHi := binary.BigEndian.Uint64(data[pos : pos+8])
-			entryLo := binary.BigEndian.Uint64(data[pos+8 : pos+16])
+			entryHi := ids[2*mid]
+			entryLo := ids[2*mid+1]
 			if entryHi < targetHi || (entryHi == targetHi && entryLo <= targetLo) {
 				lo = mid + 1
 			} else {
@@ -451,17 +458,19 @@ func (ci *compactTraceIndex) ensureTraceIdxSamples(fileID string, fmtVersion uin
 			cacheKey = fileID + "/tracesparse/" + strconv.Itoa(len(data))
 			if cached := parsedTraceSparseCache.Get(cacheKey); cached != nil {
 				ci.traceIdxOffsets = cached.offsets
+				ci.traceIdxSampleIDs = cached.sampleIDs
 				ci.traceIdxSampleOK = cached.ok
 				return
 			}
 		}
 
-		offsets, ok := buildTraceIdxSamples(data, fmtVersion)
+		offsets, sampleIDs, ok := buildTraceIdxSamples(data, fmtVersion)
 		ci.traceIdxOffsets = offsets
+		ci.traceIdxSampleIDs = sampleIDs
 		ci.traceIdxSampleOK = ok
 
 		if cacheKey != "" {
-			_ = parsedTraceSparseCache.Put(cacheKey, &traceSparseIndex{offsets: offsets, ok: ok})
+			_ = parsedTraceSparseCache.Put(cacheKey, &traceSparseIndex{offsets: offsets, sampleIDs: sampleIDs, ok: ok})
 		}
 	})
 }
@@ -472,10 +481,15 @@ func (ci *compactTraceIndex) ensureTraceIdxSamples(fileID string, fmtVersion uin
 // full linear scan). The returned offsets are plain int32 byte positions into data, so they
 // do not alias the raw bytes. Offsets fit in int32: the trace-index section is at most
 // ~15 MB (well under 2^31).
-func buildTraceIdxSamples(data []byte, fmtVersion uint8) (offsets []int32, ok bool) {
+//
+// NOTE-289: also returns sampleIDs — each sample's 16-byte trace ID as a big-endian uint64
+// pair (hi at 2k, lo at 2k+1), captured for free at the sample's offset during the walk so
+// the warm-path binary search probes this small cache-resident slice instead of the cold
+// section. len(sampleIDs) == 2*len(offsets) on success.
+func buildTraceIdxSamples(data []byte, fmtVersion uint8) (offsets []int32, sampleIDs []uint64, ok bool) {
 	traceCount := int(binary.LittleEndian.Uint32(data[1:]))
 	if traceCount == 0 {
-		return nil, true
+		return nil, nil, true
 	}
 	// NOTE-279: store a SPARSE sample of entry offsets — one offset per
 	// traceIdxSampleStride entries (always including entry 0) — instead of the NOTE-267
@@ -492,6 +506,7 @@ func buildTraceIdxSamples(data []byte, fmtVersion uint8) (offsets []int32, ok bo
 	// The number of samples is ceil(traceCount / stride).
 	numSamples := (traceCount + traceIdxSampleStride - 1) / traceIdxSampleStride
 	offsets = make([]int32, 0, numSamples)
+	sampleIDs = make([]uint64, 0, numSamples*2)
 	pos := 5
 	// NOTE-275: read the two count bytes by direct index against data so the compiler can
 	// discharge the per-entry bounds checks (verified via -d=ssa/check_bce/debug=1: the
@@ -505,47 +520,57 @@ func buildTraceIdxSamples(data []byte, fmtVersion uint8) (offsets []int32, ok bo
 			// offset pointing at a real, in-bounds entry header (the binary search relies on
 			// each sampled offset's 16-byte trace ID being readable and entries sorted).
 			if pos+18 > len(data) {
-				return nil, false // malformed
-			}
-			if i%traceIdxSampleStride == 0 {
-				offsets = append(offsets, int32(pos)) //nolint:gosec // pos < len(data) <= ~15 MB < 2^31
+				return nil, nil, false // malformed
 			}
 			hdr := data[pos : pos+18 : pos+18]
+			if i%traceIdxSampleStride == 0 {
+				offsets = append(offsets, int32(pos)) //nolint:gosec // pos < len(data) <= ~15 MB < 2^31
+				// NOTE-289: capture the sample's trace ID (big-endian uint64 pair) while
+				// hdr is already in hand, so the warm-path binary search reads it from the
+				// small cache-resident sampleIDs slice instead of the cold section.
+				sampleIDs = append(sampleIDs,
+					binary.BigEndian.Uint64(hdr[0:8]),
+					binary.BigEndian.Uint64(hdr[8:16]))
+			}
 			blockRefCount := int(hdr[16]) | int(hdr[17])<<8
 			pos += 18 + blockRefCount*2
 			if pos > len(data) {
-				return nil, false // entry's refs overran the section
+				return nil, nil, false // entry's refs overran the section
 			}
 		}
-		return offsets, true
+		return offsets, sampleIDs, true
 	}
 	// NOTE-270: inline the v1 (variable-stride: per-ref block_id[2]+span_count[2]+
 	// span_indices[span_count×2]) entry walk directly here, mirroring the v2 path above.
 	// Production V8 files still embed the legacy v1 trace-index layout.
 	for i := range traceCount {
 		if pos+18 > len(data) {
-			return nil, false // malformed
-		}
-		if i%traceIdxSampleStride == 0 {
-			offsets = append(offsets, int32(pos)) //nolint:gosec // pos < len(data) <= ~15 MB < 2^31
+			return nil, nil, false // malformed
 		}
 		hdr := data[pos : pos+18 : pos+18]
+		if i%traceIdxSampleStride == 0 {
+			offsets = append(offsets, int32(pos)) //nolint:gosec // pos < len(data) <= ~15 MB < 2^31
+			// NOTE-289: capture the sample's trace ID while hdr is in hand.
+			sampleIDs = append(sampleIDs,
+				binary.BigEndian.Uint64(hdr[0:8]),
+				binary.BigEndian.Uint64(hdr[8:16]))
+		}
 		blockRefCount := int(hdr[16]) | int(hdr[17])<<8
 		p := pos + 18
 		for range blockRefCount {
 			if p+4 > len(data) {
-				return nil, false // malformed
+				return nil, nil, false // malformed
 			}
 			ref := data[p : p+4 : p+4]
 			spanCount := int(ref[2]) | int(ref[3])<<8
 			p += 4 + spanCount*2
 		}
 		if p > len(data) {
-			return nil, false // entry overran the section
+			return nil, nil, false // entry overran the section
 		}
 		pos = p
 	}
-	return offsets, true
+	return offsets, sampleIDs, true
 }
 
 // traceIdxSampleStride is the number of trace-index entries represented by each stored

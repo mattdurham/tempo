@@ -2128,3 +2128,49 @@ green. General sampling factor, no benchmark-specific constants.
 
 Back-ref: `reader/trace_index.go:buildTraceIdxSamples`,
 `reader/trace_index.go:scanTraceIndexRaw`, `reader/compacttraceindex.go:traceIdxOffsets`.
+
+### NOTE-289: cache sample trace IDs alongside offsets so the warm-path binary search is cache-resident — 2026-06-13
+
+**Decision:** NOTE-279's sparse offset index makes a trace-ID lookup binary-search a small
+slice of `int32` byte offsets (one per `traceIdxSampleStride` entries), then linear-walk one
+bounded window. NOTE-265 caches that offset index process-wide keyed by `fileID + len`, so in
+the warm steady state the O(traceCount) build does **not** run — `ensureTraceIdxSamples` is a
+cache hit. But `scanTraceIndexRaw`'s binary search still read each probe's 16-byte trace ID
+*from `traceIndexRaw`*: `binary.BigEndian.Uint64(data[offs[mid]:])`. `traceIndexRaw` is
+re-fetched from memcache per query (a fresh Reader per block per querier call), so it is
+**cold** in the CPU cache, and the binary search's `log2(len(offs))` probes are scattered
+random offsets across the multi-MB section — each a likely L2/L3 miss. `buildTraceIdxSamples`
+plus `scanTraceIndexRaw` were the #1 blockpack-controllable querier self-time on the
+bloom-hit trace-by-ID path (~3% on 2026-06-13).
+
+**Mechanism:** `buildTraceIdxSamples` now also returns `sampleIDs []uint64` — each sample's
+trace ID as a big-endian `(hi, lo)` pair (`ids[2k]`, `ids[2k+1]`, parallel to `offsets[k]`),
+captured **for free** at the sample's offset during the build walk (the bytes are already in
+the `hdr` slice). It is cached in `traceSparseIndex` alongside `offsets` and plumbed onto
+`compactTraceIndex.traceIdxSampleIDs`. `scanTraceIndexRaw`'s binary search now reads
+`ids[2*mid]`/`ids[2*mid+1]` from this small (`≈2×len(offs)×8` byte), cache-resident slice
+instead of chasing random offsets into the cold section — removing the per-probe cache miss.
+The bounded window walk (after the search picks a floor sample) still reads from `data`, but
+that is one contiguous, sequential window of ≤`traceIdxSampleStride` entries, not scattered
+probes.
+
+**Correctness:** `sampleIDs` is built in lockstep with `offsets` (both appended at the same
+sampled entries in the same order), so `len(sampleIDs) == 2*len(offsets)` on success; the
+scan guards on exactly that equality before indexing, falling back to the linear scan
+otherwise. The IDs are plain `uint64` copies of bytes already validated in-bounds by the walk
+— they do not alias `traceIndexRaw` and are safe to share across Readers exactly as the
+offsets are (NOTE-265). The binary search is the same lower-bound over the writer's ascending
+trace-ID order; reading the ID from the cache vs. from `data` is value-identical because the
+cached pair was copied verbatim from `data[offs[k]:offs[k]+16]`. A malformed build still
+returns `ok=false` (caches the failure) and the lookup falls back to the full linear scan.
+
+**Cost:** the cold, once-per-section build now also writes ≈`2×numSamples×8` bytes
+(`numSamples = ceil(traceCount/stride)`, so `stride×` smaller than the entry count) and uses
+a second allocation. This is paid once per section then amortised to ~0 by the NOTE-265
+process cache; the warm-path lookup — which runs on every query — is what loses the random
+cold-section reads. `SizeBytes` accounts for the extra 16 bytes/sample so the cache budget
+stays honest.
+
+Back-ref: `reader/trace_index.go:buildTraceIdxSamples`,
+`reader/trace_index.go:scanTraceIndexRaw`, `reader/compacttraceindex.go:traceIdxSampleIDs`,
+`reader/parser.go:traceSparseIndex`.

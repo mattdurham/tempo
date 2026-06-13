@@ -85,14 +85,20 @@ var parsedTraceSparseCache objectcache.Cache[traceSparseIndex]
 // re-attempting (and re-failing) the walk on every query.
 type traceSparseIndex struct {
 	offsets []int32
-	ok      bool
+	// NOTE-289: sampleIDs holds each sample's 16-byte trace ID as a big-endian uint64
+	// pair (hi at 2k, lo at 2k+1), parallel to offsets[k]. Captured for free during the
+	// build walk so the warm-path binary search probes this cache-resident slice instead
+	// of chasing random offsets into the cold, per-query-fetched traceIndexRaw section.
+	sampleIDs []uint64
+	ok        bool
 }
 
 // SizeBytes estimates the in-memory size of the sparse index for objectcache LRU budgeting.
 func (t *traceSparseIndex) SizeBytes() int64 {
-	// Each sample is one int32 byte offset = 4 bytes (NOTE-279: one sample per
-	// traceIdxSampleStride entries, so this is ~stride× smaller than a dense index).
-	return int64(len(t.offsets))*4 + 16
+	// Each sample is one int32 byte offset (4 bytes) + two uint64 trace-ID halves
+	// (16 bytes) = 20 bytes (NOTE-279/289: one sample per traceIdxSampleStride entries,
+	// so this is still ~stride× smaller than a dense per-entry index).
+	return int64(len(t.offsets))*4 + int64(len(t.sampleIDs))*8 + 16
 }
 
 // blockColTypes holds a block's fully-parsed ToC: the column-metadata array (in wire order)
