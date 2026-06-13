@@ -1774,6 +1774,7 @@ func streamAggN1Compact(
 
 	// Accumulate into groupBuckets[gIdx][bk-1].
 	groupBuckets := makeGroupBuckets(numGroups, numSteps) // NOTE-272
+	var arena bucketArena                                 // NOTE-276
 
 	spanCount := 0
 	for pos := range n {
@@ -1795,7 +1796,9 @@ func streamAggN1Compact(
 			continue
 		}
 		if groupBuckets[gIdx][bk-1] == nil {
-			groupBuckets[gIdx][bk-1] = &aggBucketState{min: math.MaxFloat64, max: -math.MaxFloat64}
+			b := arena.alloc()
+			b.min, b.max = math.MaxFloat64, -math.MaxFloat64
+			groupBuckets[gIdx][bk-1] = b
 		}
 		if aggPresentByPos[pos] {
 			updateAggBucket(groupBuckets[gIdx][bk-1], agg.Function, aggValByPos[pos])
@@ -1898,6 +1901,7 @@ func streamAggN1CompactFromRefs(
 	}
 
 	groupBuckets := makeGroupBuckets(numGroups, numSteps) // NOTE-272
+	var arena bucketArena                                 // NOTE-276
 
 	spanCount := 0
 	for pos := range n {
@@ -1919,7 +1923,9 @@ func streamAggN1CompactFromRefs(
 			continue
 		}
 		if groupBuckets[gIdx][bk-1] == nil {
-			groupBuckets[gIdx][bk-1] = &aggBucketState{min: math.MaxFloat64, max: -math.MaxFloat64}
+			b := arena.alloc()
+			b.min, b.max = math.MaxFloat64, -math.MaxFloat64
+			groupBuckets[gIdx][bk-1] = b
 		}
 		if aggPresentByPos[pos] {
 			updateAggBucket(groupBuckets[gIdx][bk-1], agg.Function, aggValByPos[pos])
@@ -3923,6 +3929,7 @@ func accumulateAggDirect(
 ) error {
 	numGroups := len(dict)
 	groupBuckets := makeGroupBuckets(numGroups, numSteps) // NOTE-272
+	var arena bucketArena                                 // NOTE-276
 	seenByPK := acquireDirectBool(int(maxPK) + 1)         // NOTE-129
 	defer releaseDirectBool(seenByPK)
 
@@ -3931,7 +3938,7 @@ func accumulateAggDirect(
 		return err
 	}
 	if col != nil {
-		if err := accumulateAggDirectScanCol(ctx, col, agg.Function, dictByPK, bucketByPK, minPK, maxPK, numSteps, numGroups, groupBuckets, seenByPK); err != nil {
+		if err := accumulateAggDirectScanCol(ctx, col, agg.Function, dictByPK, bucketByPK, minPK, maxPK, numSteps, numGroups, groupBuckets, &arena, seenByPK); err != nil {
 			return err
 		}
 	}
@@ -3949,7 +3956,9 @@ func accumulateAggDirect(
 			gIdx = int(raw - 1) //nolint:gosec
 		}
 		if gIdx < numGroups && groupBuckets[gIdx][bk-1] == nil {
-			groupBuckets[gIdx][bk-1] = &aggBucketState{min: math.MaxFloat64, max: -math.MaxFloat64}
+			b := arena.alloc()
+			b.min, b.max = math.MaxFloat64, -math.MaxFloat64
+			groupBuckets[gIdx][bk-1] = b
 		}
 	}
 
@@ -3985,6 +3994,7 @@ func accumulateAggDirectScanCol(
 	numSteps int64,
 	numGroups int,
 	groupBuckets [][]*aggBucketState,
+	arena *bucketArena,
 	seenByPK []bool,
 ) error {
 	spanCount := 0
@@ -4024,7 +4034,9 @@ func accumulateAggDirectScanCol(
 					continue
 				}
 				if groupBuckets[gIdx][bk-1] == nil {
-					groupBuckets[gIdx][bk-1] = &aggBucketState{min: math.MaxFloat64, max: -math.MaxFloat64}
+					b := arena.alloc()
+					b.min, b.max = math.MaxFloat64, -math.MaxFloat64
+					groupBuckets[gIdx][bk-1] = b
 				}
 				updateAggBucket(groupBuckets[gIdx][bk-1], fn, fval)
 			}
@@ -4057,7 +4069,9 @@ func accumulateAggDirectScanCol(
 				continue
 			}
 			if groupBuckets[gIdx][bk-1] == nil {
-				groupBuckets[gIdx][bk-1] = &aggBucketState{min: math.MaxFloat64, max: -math.MaxFloat64}
+				b := arena.alloc()
+				b.min, b.max = math.MaxFloat64, -math.MaxFloat64
+				groupBuckets[gIdx][bk-1] = b
 			}
 			updateAggBucket(groupBuckets[gIdx][bk-1], fn, float64(col.Uint64Values[i])) //nolint:gosec
 		}

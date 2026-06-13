@@ -5066,3 +5066,29 @@ allocations), 1,467,623 → 1,463,160 B/op; wall-clock within noise (~3.5 ms). F
 counts the saved allocations are few and the change is neutral — never a regression.
 Back-ref: `aggbucketstate.go:makeGroupBuckets`, three call sites in
 `metrics_trace_intrinsic.go`. Bench: `intrinsic_group_id_bench_test.go`.
+
+## NOTE-276: arena-allocate the per-cell aggBucketState on group-by accumulation
+
+`makeGroupBuckets` (NOTE-272) collapsed the matrix *scaffold* to two allocations, but every
+*occupied* `(group, timestep)` cell still materialised its accumulator with an individual
+`&aggBucketState{min: MaxFloat64, max: -MaxFloat64}` on first write. On a high-cardinality
+group-by spanning a wide window that is thousands of separate ~80-byte heap objects per
+query — each one a distinct object the GC must scan — and is the dominant residual alloc/GC
+source on the count/rate-by, general-agg-by and direct-scan-by intrinsic paths.
+
+`bucketArena.alloc()` vends each newly-occupied bucket from a single growing
+`[]aggBucketState` slab and returns `&slab[len-1]`. The slab is **never grown in place once
+vended from**: when the current slab fills (`len == cap`), the arena allocates a fresh slab
+and continues there, so a pointer handed out earlier always remains valid (it points into a
+slab that stays reachable through that pointer). This collapses N per-cell allocations into
+`ceil(N/arenaSlabCap)` slab allocations — amortised ~one allocation per `arenaSlabCap`
+occupied cells.
+
+**Correctness:** each vended bucket is a zero-valued slab element (identical to a fresh
+`&aggBucketState{}`); the caller sets `min`/`max` exactly as before. The emit walk and the
+downstream `buckets` map hold these interior pointers and keep the slabs alive for the
+per-query result lifetime, so there is no dangling reference. The nil-until-first-write cell
+contract is unchanged: the matrix pointer slot is still nil until `alloc()` fills it. No
+benchmark-specific constants. Threaded `*bucketArena` through `accumulateAggDirectScanCol`.
+Back-ref: `aggbucketstate.go:bucketArena`, five matrix-cell sites in
+`metrics_trace_intrinsic.go`. Bench: `BenchmarkIntrinsicMaxGroupBy_HighCard`.
