@@ -1606,7 +1606,7 @@ func scanDictPageRaw(
 	pageRaw []byte,
 	blockW, rowW int,
 	colType ColumnType,
-	matchFn func(value string, int64Val int64, isInt64 bool) bool,
+	matchFn func(valueBytes []byte, int64Val int64, isInt64 bool) bool,
 	maxRefs int,
 	result []BlockRef,
 ) ([]BlockRef, bool) {
@@ -1627,7 +1627,12 @@ func scanDictPageRaw(
 		vLen := int(binary.LittleEndian.Uint16(pageRaw[pos:]))
 		pos += 2
 
-		var strVal string
+		// NOTE-277: pass the value as a sub-slice of pageRaw (no string allocation).
+		// The dict scan allocated one string(pageRaw[...]) per entry on every page on
+		// every predicate scan — even for non-matching entries — only to hand it to a
+		// matchFn that does a map lookup or regex match, both of which accept []byte
+		// without copying (string(b) map index and re.Match are non-allocating).
+		var valBytes []byte
 		var i64Val int64
 		if isInt64 && vLen == 0 {
 			if pos+8 > len(pageRaw) {
@@ -1639,7 +1644,7 @@ func scanDictPageRaw(
 			if pos+vLen > len(pageRaw) {
 				return result, false
 			}
-			strVal = string(pageRaw[pos : pos+vLen])
+			valBytes = pageRaw[pos : pos+vLen]
 			pos += vLen
 		}
 
@@ -1649,7 +1654,7 @@ func scanDictPageRaw(
 		refCount := int(binary.LittleEndian.Uint32(pageRaw[pos:]))
 		pos += 4
 
-		if !matchFn(strVal, i64Val, isInt64) {
+		if !matchFn(valBytes, i64Val, isInt64) {
 			skip := refCount * refSize
 			if skip/refSize != refCount || pos+skip > len(pageRaw) {
 				return result, false // corrupt refCount
@@ -1674,7 +1679,7 @@ func scanDictPageRaw(
 // scanDictPagedBlob handles v2 paged dict column blobs for ScanDictColumnRefs.
 func scanDictPagedBlob(
 	blob []byte,
-	matchFn func(value string, int64Val int64, isInt64 bool) bool,
+	matchFn func(valueBytes []byte, int64Val int64, isInt64 bool) bool,
 	bloomKeys [][]byte,
 	maxRefs int,
 ) []BlockRef {
@@ -1738,7 +1743,7 @@ func scanDictPagedBlob(
 // allowing callers to distinguish "not applicable" from "no matches" (empty slice).
 func ScanDictColumnRefs(
 	blob []byte,
-	matchFn func(value string, int64Val int64, isInt64 bool) bool,
+	matchFn func(valueBytes []byte, int64Val int64, isInt64 bool) bool,
 	maxRefs int,
 ) []BlockRef {
 	// v2 paged format.
@@ -1788,8 +1793,8 @@ func ScanDictColumnRefs(
 		vLen := int(binary.LittleEndian.Uint16(raw[pos:]))
 		pos += 2
 
-		// Read value.
-		var strVal string
+		// Read value. NOTE-277: pass the value as a sub-slice of raw (no string copy).
+		var valBytes []byte
 		var i64Val int64
 		if isInt64 && vLen == 0 {
 			if pos+8 > len(raw) {
@@ -1801,7 +1806,7 @@ func ScanDictColumnRefs(
 			if pos+vLen > len(raw) {
 				return nil
 			}
-			strVal = string(raw[pos : pos+vLen])
+			valBytes = raw[pos : pos+vLen]
 			pos += vLen
 		}
 
@@ -1811,7 +1816,7 @@ func ScanDictColumnRefs(
 		refCount := int(binary.LittleEndian.Uint32(raw[pos:]))
 		pos += 4
 
-		if !matchFn(strVal, i64Val, isInt64) {
+		if !matchFn(valBytes, i64Val, isInt64) {
 			// Skip all refs for this value — no struct allocation.
 			skip := refCount * refSize
 			if skip/refSize != refCount || pos+skip > len(raw) {
@@ -1842,7 +1847,7 @@ func ScanDictColumnRefs(
 // For v1 monolithic blobs, bloomKeys is ignored.
 func ScanDictColumnRefsWithBloom(
 	blob []byte,
-	matchFn func(value string, int64Val int64, isInt64 bool) bool,
+	matchFn func(valueBytes []byte, int64Val int64, isInt64 bool) bool,
 	bloomKeys [][]byte,
 	maxRefs int,
 ) []BlockRef {

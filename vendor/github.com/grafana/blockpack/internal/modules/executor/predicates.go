@@ -2067,12 +2067,17 @@ func scanIntrinsicLeafRefs(
 			if err != nil {
 				return nil // invalid regex — skip fast path
 			}
-			return modules_shared.ScanDictColumnRefsWithBloom(blob, func(value string, _ int64, isInt64 bool) bool {
-				if isInt64 {
-					return false // int64 dict entries are not string-matchable
-				}
-				return re.MatchString(value)
-			}, nil, maxRefs)
+			return modules_shared.ScanDictColumnRefsWithBloom(
+				blob,
+				func(valueBytes []byte, _ int64, isInt64 bool) bool {
+					if isInt64 {
+						return false // int64 dict entries are not string-matchable
+					}
+					return re.Match(valueBytes)
+				},
+				nil,
+				maxRefs,
+			)
 		}
 		// Build match sets and bloom keys in one pass.
 		// NOTE-060: merged from two sequential loops — identical switch structure, no ordering dependency.
@@ -2102,14 +2107,21 @@ func scanIntrinsicLeafRefs(
 				}
 			}
 		}
-		return modules_shared.ScanDictColumnRefsWithBloom(blob, func(value string, int64Val int64, isInt64 bool) bool {
-			if isInt64 {
-				_, ok := wantInt[int64Val]
+		return modules_shared.ScanDictColumnRefsWithBloom(
+			blob,
+			func(valueBytes []byte, int64Val int64, isInt64 bool) bool {
+				if isInt64 {
+					_, ok := wantInt[int64Val]
+					return ok
+				}
+				// string(valueBytes) as a map index is special-cased by the compiler to
+				// avoid allocating a string for the lookup (NOTE-277).
+				_, ok := wantStr[string(valueBytes)]
 				return ok
-			}
-			_, ok := wantStr[value]
-			return ok
-		}, bloomKeys, maxRefs)
+			},
+			bloomKeys,
+			maxRefs,
+		)
 	}
 
 	// Flat column — extract range bounds.

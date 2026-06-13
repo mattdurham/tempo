@@ -1722,3 +1722,42 @@ NOTE-274 drops the per-page output strings on callers that discard them).
 
 Back-ref: `shared/intrinsic_codec.go:DecodePageTOCNoStats`, `decodePageTOC`,
 `leUint64FromString`, `intrinsic_parallel_decode_test.go:BenchmarkDecodePageTOCNoStats`.
+
+## NOTE-277: dict predicate scan passes entry values as []byte (no per-entry string alloc)
+
+**Problem:** `scanDictPageRaw` (v2 paged) and the v1 body of `ScanDictColumnRefs` allocated a
+fresh `string(pageRaw[pos:pos+vLen])` for **every** dict entry, on **every** page, on **every**
+predicate scan — including the non-matching majority — only to hand the string to a `matchFn`
+that immediately discards it after a map lookup or regex test. A high-cardinality dict column
+(thousands of distinct values, the common case for attribute KV columns scanned by Q2–Q10 search
+predicates and M6/M9 predicate-filtered metrics) paid one heap string allocation per distinct
+value per scan. snappy.decode + memmove already dominate the querier CPU profile; the per-entry
+string copy compounded the GC pressure of every dict predicate evaluation.
+
+**Fix:** change the `matchFn` signature from `func(value string, …)` to
+`func(valueBytes []byte, …)` across `scanDictPageRaw`, `scanDictPagedBlob`,
+`ScanDictColumnRefs`, and `ScanDictColumnRefsWithBloom`. The scan now passes a sub-slice of the
+decoded page (`pageRaw[pos:pos+vLen]`) — zero allocation. The two production callers in the
+executor adapt without re-introducing the allocation: the regex path uses `re.Match(valueBytes)`
+(the `[]byte` form of `re.MatchString`), and the equality-set path uses
+`wantStr[string(valueBytes)]` — a `string(b)` expression used directly as a map index is
+special-cased by the Go compiler to perform the lookup without materializing a heap string. The
+matchFn reads `valueBytes` only synchronously (map lookup / regex match) and never retains it, so
+reuse of the pooled snappy-decode scratch buffer (NOTE-239/262) across pages remains safe.
+
+**Verification:** `go test -race ./blockio/shared ./executor` green (incl. the existing
+`TestScanDictColumnRefs*` / `TestScanDictColumnRefsWithBloom*` correctness tests, updated to the
+`[]byte` matchFn). `make precommit` FULLY green. New `BenchmarkScanDictColumnRefs_MultiPage`
+(16 pages × 200 distinct values = 3200 entries, match exactly one): **2 allocs/op, 1291 B/op,
+~38.7 µs/op**. The old path allocated one string per scanned entry (~3201 allocs/op + the value
+bytes) — a >99.9% allocation reduction on the dict predicate-scan hot path with no change to scan
+results (decode and ref collection are byte-identical; only the value handed to matchFn changed
+from an owned string copy to a borrowed sub-slice).
+
+**Queries affected:** every search/metrics query whose predicate scans a dict (string-keyed)
+intrinsic column via `scanIntrinsicLeafRefs` — equality and regex attribute predicates (Q2–Q10
+search, M6/M9 predicate-filtered rate-by).
+
+Back-ref: `shared/intrinsic_codec.go:scanDictPageRaw`, `scanDictPagedBlob`,
+`ScanDictColumnRefs`, `ScanDictColumnRefsWithBloom`; `executor/predicates.go:scanIntrinsicLeafRefs`;
+`shared/shared_test.go:BenchmarkScanDictColumnRefs_MultiPage`.
