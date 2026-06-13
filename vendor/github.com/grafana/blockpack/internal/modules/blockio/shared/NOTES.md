@@ -1286,3 +1286,40 @@ the old scalar loop for every combination, including the `len(prev) > len(xored)
 prev's trailing bytes are intentionally dropped.
 
 Back-ref: `internal/modules/blockio/shared/intrinsic_codec.go:xorInvertInto`
+
+## NOTE-239: pooled snappy scratch across pages in the search-path scan loops
+
+**Issue:** the five v2 paged search-scan functions — `scanDictPagedBlob`, `scanFlatPagedBlob`,
+`scanFlatPagedFiltered`, `scanDeltaUint64PagedBlob`, `scanDeltaUint64PagedFiltered` — decoded each
+page with `decodeBoundedSnappyColumn`, which calls `snappy.Decode(nil, compressed)` and so allocates
+a **fresh heap buffer for every page** on every search-column scan. These are on the Q1–Q10 search
+hot path (one scan per column per block, hundreds of pages on wide trace columns), and the decoded
+page (`pageRaw`) is consumed entirely within the loop iteration: refs are copied out via `decodeRef`
+into the `result` slice, and `scanDictPageRaw` copies each matching value with `string(pageRaw[...])`
+before advancing. Nothing retains a reference to `pageRaw` past the iteration — the textbook case for
+a reused scratch buffer, exactly the discipline `decodePagedColumnBlob` already uses (NOTE-012) with
+`AcquireIntrinsicBuf`/`ReleaseIntrinsicBuf`.
+
+**Change:** added `decodeBoundedSnappyColumnInto(compressed, scratch)` — `decodeBoundedSnappyColumn`
+with a caller-supplied scratch passed to `snappy.Decode(scratch, ...)` (the MaxBlockSize
+decompression-bomb guard is identical). Each of the five scan loops now acquires one pooled buffer
+(`AcquireIntrinsicBuf`, `defer ReleaseIntrinsicBuf`) and decodes every page into it, updating the
+pool pointer (`*pageBuf = pageRaw`) after each decode because snappy reallocates when a page's decoded
+size exceeds the buffer's capacity — same pattern as `decodePagedColumnBlob`.
+
+**Safety / why output-identical:** byte-for-byte identical scan output — only the decode scratch's
+backing array changed. `pageRaw` is never retained across iterations: all refs are decoded into
+`result` and all matched dict values are independent `string(...)` copies within the same iteration,
+so reusing the buffer on the next page cannot corrupt live results. Each scan function uses exactly
+one pooled buffer and the value is consumed before the next decode, so there is no aliasing between
+pages. The remaining whole-blob (v1 single-blob) callsites are left on `decodeBoundedSnappyColumn`:
+they decode once per call (no per-page loop) and may retain the decoded slice for column
+materialization, so pooling there is neither a win nor safe.
+
+**Verified:** `go test -race ./blockio/shared ./blockio/reader ./executor` green. Microbench
+`BenchmarkScanFlatColumnRefs_MultiPage` (64 pages × 250 rows): 213→151 allocs/op (-62, ≈ one saved
+allocation per page) and 329594→283024 B/op (-46 KB), with ns/op also improving (~138µs→~125µs) from
+the reduced GC scavenging — confirming the pooling is a strict win, not a trade.
+
+Back-ref: `internal/modules/blockio/shared/intrinsic_codec.go:decodeBoundedSnappyColumnInto`,
+the five `scan*Paged*` functions, NOTE-012 (`AcquireIntrinsicBuf` pool this reuses).

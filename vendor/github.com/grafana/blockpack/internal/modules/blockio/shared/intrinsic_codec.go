@@ -33,6 +33,27 @@ func decodeBoundedSnappyColumn(compressed []byte) ([]byte, error) {
 	return snappy.Decode(nil, compressed)
 }
 
+// decodeBoundedSnappyColumnInto is decodeBoundedSnappyColumn with a caller-supplied scratch
+// buffer (NOTE-239). The decoded page is written into *scratch when it fits, reusing the
+// pooled backing array across pages instead of allocating a fresh buffer per page via
+// snappy.Decode(nil, ...). snappy may reallocate when the decoded size exceeds the buffer's
+// capacity, so the caller must update its pool pointer with the returned slice. The MaxBlockSize
+// decompression-bomb guard is applied identically to decodeBoundedSnappyColumn.
+//
+// Callers must treat the returned slice as valid only until the next decode into the same
+// scratch (the search-path scan loops copy out BlockRefs / string values per page before
+// advancing), exactly as decodePagedColumnBlob already does with its AcquireIntrinsicBuf pool.
+func decodeBoundedSnappyColumnInto(compressed []byte, scratch []byte) ([]byte, error) {
+	decodedLen, lenErr := snappy.DecodedLen(compressed)
+	if lenErr != nil {
+		return nil, fmt.Errorf("snappy decoded length: %w", lenErr)
+	}
+	if decodedLen > MaxBlockSize {
+		return nil, fmt.Errorf("snappy decoded size %d exceeds MaxBlockSize %d", decodedLen, MaxBlockSize)
+	}
+	return snappy.Decode(scratch, compressed)
+}
+
 // NOTE-012: Snappy decode buffer pool — 64KB default cap, 4MB cap guard.
 // AcquireIntrinsicBuf / ReleaseIntrinsicBuf are used in decodePagedColumnBlob
 // to reuse decode scratch buffers across calls, avoiding per-page allocations
@@ -1574,6 +1595,12 @@ func scanDictPagedBlob(
 	blockW := int(toc.BlockIdxWidth)
 	rowW := int(toc.RowIdxWidth)
 
+	// NOTE-239: reuse a pooled snappy-decode scratch buffer across pages. scanDictPageRaw
+	// copies out matching values (string(...)) and BlockRef structs before the loop advances,
+	// so pageRaw need not outlive the iteration.
+	pageBuf := AcquireIntrinsicBuf()
+	defer ReleaseIntrinsicBuf(pageBuf)
+
 	var result []BlockRef
 	for _, pm := range toc.Pages {
 		// Bloom-filter skip: if bloom keys provided and none pass the bloom, skip page.
@@ -1595,11 +1622,12 @@ func scanDictPagedBlob(
 		if pageEnd > len(blob) {
 			return nil
 		}
-		pageRaw, decErr := decodeBoundedSnappyColumn(blob[pageStart:pageEnd])
+		pageRaw, decErr := decodeBoundedSnappyColumnInto(blob[pageStart:pageEnd], *pageBuf)
 		if decErr != nil {
 			slog.Debug("intrinsic_codec: snappy decode failed", "err", decErr)
 			return nil
 		}
+		*pageBuf = pageRaw // snappy may have reallocated; keep the pool pointer current
 		var ok bool
 		result, ok = scanDictPageRaw(pageRaw, blockW, rowW, toc.ColType, matchFn, maxRefs, result)
 		if !ok {
@@ -1809,6 +1837,11 @@ func scanFlatPagedBlob(blob []byte, lo, hi uint64, hasLo, hasHi bool, maxRefs in
 	rowW := int(toc.RowIdxWidth)
 	refSize := blockW + rowW
 
+	// NOTE-239: pooled snappy scratch reused across pages. decodeRef copies each ref into
+	// result, so pageRaw is not retained past the iteration.
+	pageBuf := AcquireIntrinsicBuf()
+	defer ReleaseIntrinsicBuf(pageBuf)
+
 	var result []BlockRef
 	for _, pm := range toc.Pages {
 		// Min/max skip: if page range doesn't overlap [lo, hi], skip page.
@@ -1828,11 +1861,12 @@ func scanFlatPagedBlob(blob []byte, lo, hi uint64, hasLo, hasHi bool, maxRefs in
 		if pageEnd > len(blob) {
 			return nil
 		}
-		pageRaw, decErr := decodeBoundedSnappyColumn(blob[pageStart:pageEnd])
+		pageRaw, decErr := decodeBoundedSnappyColumnInto(blob[pageStart:pageEnd], *pageBuf)
 		if decErr != nil {
 			slog.Debug("intrinsic_codec: snappy decode failed", "err", decErr)
 			return nil
 		}
+		*pageBuf = pageRaw // snappy may have reallocated; keep the pool pointer current
 
 		rowCount := int(pm.RowCount)
 		refsStart := pageRefsStart(pageRaw)
@@ -1886,17 +1920,23 @@ func scanFlatPagedFiltered(blob []byte, backward bool, limit int, filter func(Bl
 
 	result := make([]BlockRef, 0, limit)
 
+	// NOTE-239: pooled snappy scratch reused across pages. decodeRef copies each ref into
+	// result, so pageRaw is not retained past the closure call.
+	pageBuf := AcquireIntrinsicBuf()
+	defer ReleaseIntrinsicBuf(pageBuf)
+
 	scanPage := func(pm PageMeta) bool {
 		pageStart := pos + int(pm.Offset)
 		pageEnd := pageStart + int(pm.Length)
 		if pageEnd > len(blob) {
 			return false
 		}
-		pageRaw, decErr := decodeBoundedSnappyColumn(blob[pageStart:pageEnd])
+		pageRaw, decErr := decodeBoundedSnappyColumnInto(blob[pageStart:pageEnd], *pageBuf)
 		if decErr != nil {
 			slog.Debug("intrinsic_codec: snappy decode failed", "err", decErr)
 			return false
 		}
+		*pageBuf = pageRaw // snappy may have reallocated; keep the pool pointer current
 		rowCount := int(pm.RowCount)
 		refsStart := pageRefsStart(pageRaw)
 
@@ -2016,6 +2056,11 @@ func scanDeltaUint64PagedBlob(
 	}
 	refSize := blockW + rowW
 
+	// NOTE-239: pooled snappy scratch reused across pages. decodeRef copies each ref into
+	// result, so pageRaw is not retained past the iteration.
+	pageBuf := AcquireIntrinsicBuf()
+	defer ReleaseIntrinsicBuf(pageBuf)
+
 	var result []BlockRef
 	for _, pm := range toc.Pages {
 		// NOTE-017: min/max page skip — mirrors scanFlatPagedBlob lines 1233-1243.
@@ -2036,11 +2081,12 @@ func scanDeltaUint64PagedBlob(
 		if pageEnd > len(blob) {
 			return nil
 		}
-		pageRaw, decErr := decodeBoundedSnappyColumn(blob[pageStart:pageEnd])
+		pageRaw, decErr := decodeBoundedSnappyColumnInto(blob[pageStart:pageEnd], *pageBuf)
 		if decErr != nil {
 			slog.Debug("intrinsic_codec: snappy decode failed", "err", decErr)
 			return nil
 		}
+		*pageBuf = pageRaw // snappy may have reallocated; keep the pool pointer current
 
 		startIdx, endIdx, p, ok := scanDeltaUint64PageRange(pageRaw, int(pm.RowCount), lo, hi, hasLo, hasHi)
 		if !ok {
@@ -2094,17 +2140,23 @@ func scanDeltaUint64PagedFiltered(
 
 	result := make([]BlockRef, 0, limit)
 
+	// NOTE-239: pooled snappy scratch reused across pages. decodeRef copies each ref into
+	// result, so pageRaw is not retained past the closure call.
+	pageBuf := AcquireIntrinsicBuf()
+	defer ReleaseIntrinsicBuf(pageBuf)
+
 	scanPage := func(pm PageMeta) bool {
 		pageStart := pos + int(pm.Offset)
 		pageEnd := pageStart + int(pm.Length)
 		if pageEnd > len(blob) {
 			return false
 		}
-		pageRaw, decErr := decodeBoundedSnappyColumn(blob[pageStart:pageEnd])
+		pageRaw, decErr := decodeBoundedSnappyColumnInto(blob[pageStart:pageEnd], *pageBuf)
 		if decErr != nil {
 			slog.Debug("intrinsic_codec: snappy decode failed", "err", decErr)
 			return false
 		}
+		*pageBuf = pageRaw // snappy may have reallocated; keep the pool pointer current
 		rowCount := int(pm.RowCount)
 		p := 0
 		for range rowCount {
