@@ -4921,3 +4921,35 @@ removing a serialize/deserialize round-trip on the hottest non-histogram group-b
 single dimension. Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:emitFlatCountRateSeries`,
 `finalizeCountRateSeries`, `accumulateCountRateDirect`, `streamCountRateN1CompactCore`,
 `executeTraceMetricsIntrinsic`.
+
+## NOTE-250: tighten the intrinsic metrics scan inner loops (branch-free exponent + AND-mask ctx check)
+
+Two general per-ref kernel substitutions on the intrinsic metrics scan hot loops, neither tied
+to any benchmark constant.
+
+**(a) Branch-free IEEE-754 exponent.** `pow2Floor`, `boundaryIndexer.index`, and
+`boundaryIndexer.lookup` derived a histogram cell's binary exponent from `math.Frexp(v)`. On the
+M8 histogram aggregation scan that exponent is computed once per passing ref (`lookup` is the
+per-row kernel the parallel workers call; `index` the serial analogue), a path NOTE-182 measured
+among the top querier CPU sinks. `math.Frexp` is not inlined and front-loads branches for
+NaN/Inf/zero/subnormal inputs that never occur here: both callers test `v <= 0` (and re-test
+after the 1e9 nano scaling) BEFORE the Frexp call, so `v` is always positive finite at that
+point. `frexpExpPos(v)` extracts the biased-exponent field directly: for a normal positive
+double `v = mantissa * 2**(unbiasedExp-52)`, Frexp's returned exponent is
+`unbiasedExp+1 == be-1022` where `be` is the 11-bit biased-exponent field. The only non-normal
+positive case reachable past the `v<=0` guard is a subnormal (`be == 0`), which falls back to
+`math.Frexp` so the result is bit-identical to the old form for every input.
+
+**(b) AND-mask context-cancellation throttle.** Every intrinsic metrics scan loop polls
+`ctx.Err()` once per `ctxCheckInterval` refs via `n % ctxCheckInterval == 0`. The Go compiler
+compiles `%const` on a signed int into a magic-multiply + rotate + compare; since the throttle
+period is not correctness-relevant (it only bounds cancellation-poll frequency) we round
+`ctxCheckInterval` to the nearest power of two (2**17) and test `n & ctxCheckMask == 0` — a single
+AND. All counters fed to the test are non-negative (`range` indices or a `spanCount` that starts
+at 0 and only increments), so the AND is exactly equal to the former modulo.
+
+Both changes are kernel substitutions across the count/rate, agg, and histogram intrinsic scan
+loops — no benchmark-specific constants. **Queries affected:** M1/M4/M6/M9 (count/rate scan
+loops, AND-mask) and M8 (histogram boundary lookup + scan loops, both).
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:frexpExpPos`, `pow2Floor`,
+`boundaryIndexer.index`, `boundaryIndexer.lookup`, `ctxCheckInterval`, `ctxCheckMask`.

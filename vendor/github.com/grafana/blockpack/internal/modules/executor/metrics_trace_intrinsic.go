@@ -230,7 +230,17 @@ func releaseDirectBool(s []bool) {
 
 // ctxCheckInterval is how often (in spans) to check for context cancellation in hot loops.
 // Large enough to bound overhead; small enough to bound cancellation latency.
-const ctxCheckInterval = 100_000
+//
+// NOTE-250: chosen as a power of two (2**17 = 131072, the closest to the former 100_000) so
+// the per-iteration throttle test `n&ctxCheckMask == 0` is a single AND instead of the
+// magic-multiply+shift the Go compiler emits for `n%const` on a signed int. The exact period
+// is not correctness-relevant (it only bounds how often ctx.Err() is polled), so rounding it
+// to a power of two is free. These tests sit in the innermost per-ref scan loops of every
+// intrinsic metrics path (count/rate, agg, histogram), each walking millions of refs.
+const (
+	ctxCheckInterval = 1 << 17
+	ctxCheckMask     = ctxCheckInterval - 1
+)
 
 // NOTE-143: parallel histogram scan tunables.
 // histParallelWorkers caps the worker count; mirrors defaultPipelineWorkers (NOTE-058).
@@ -576,7 +586,7 @@ func accumulateIntrinsicBucketsViaKeyMap(
 ) error {
 	keyToBucket := make(map[uint32]int64, len(inRangeRefs))
 	for i, ref := range inRangeRefs {
-		if i%ctxCheckInterval == 0 {
+		if i&ctxCheckMask == 0 {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
@@ -1176,7 +1186,7 @@ func scanAggColHistogramShard( //nolint:gocyclo
 				continue
 			}
 			for _, ref := range entry.BlockRefs {
-				if spanCount%ctxCheckInterval == 0 {
+				if spanCount&ctxCheckMask == 0 {
 					if err := ctx.Err(); err != nil {
 						return err
 					}
@@ -1212,7 +1222,7 @@ func scanAggColHistogramShard( //nolint:gocyclo
 		// searchSortedUint32. The i < len(Uint64Values) guard is preserved. Build hoisted (NOTE-143).
 		for i := start; i < end; i++ {
 			ref := col.BlockRefs[i]
-			if spanCount%ctxCheckInterval == 0 {
+			if spanCount&ctxCheckMask == 0 {
 				if err := ctx.Err(); err != nil {
 					return err
 				}
@@ -1621,7 +1631,7 @@ func streamCountRateN1CompactCore(
 	// gIdx stays constant → numSteps-element subarray stays in L1/L2 cache.
 	spanCount := 0
 	for pos := range n {
-		if spanCount%ctxCheckInterval == 0 {
+		if spanCount&ctxCheckMask == 0 {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
@@ -1770,7 +1780,7 @@ func streamAggN1Compact(
 
 	spanCount := 0
 	for pos := range n {
-		if spanCount%ctxCheckInterval == 0 {
+		if spanCount&ctxCheckMask == 0 {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
@@ -1897,7 +1907,7 @@ func streamAggN1CompactFromRefs(
 
 	spanCount := 0
 	for pos := range n {
-		if spanCount%ctxCheckInterval == 0 {
+		if spanCount&ctxCheckMask == 0 {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
@@ -2567,7 +2577,7 @@ func streamCountRateNoGroupBy(
 	}
 	counts := make([]int64, numSteps)
 	for i := range inRangeRefs {
-		if i%ctxCheckInterval == 0 {
+		if i&ctxCheckMask == 0 {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
@@ -2688,7 +2698,7 @@ func streamCountRateN0HashFilter(
 	// and accumulate its time bucket. NOTE-136: bitset replaces map lookup (~2ns vs ~10ns).
 	counts := make([]int64, numSteps)
 	for i, ref := range tsCol.BlockRefs[lo:hi] {
-		if i%ctxCheckInterval == 0 {
+		if i&ctxCheckMask == 0 {
 			if err := ctx.Err(); err != nil {
 				return nil, false, err
 			}
@@ -2743,7 +2753,7 @@ func streamCountRateGroupBy(
 	groupCounts := make(map[string][]int64)
 	i := 0
 	for pk, bucketIdx := range keyToBucket {
-		if i%ctxCheckInterval == 0 {
+		if i&ctxCheckMask == 0 {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
@@ -3611,7 +3621,7 @@ func accumulateCountRateDirect(
 		gIdx := int64(gIdxRaw - 1) //nolint:gosec
 		base := gIdx * numSteps
 		for _, ref := range entry.BlockRefs {
-			if spanCount%ctxCheckInterval == 0 {
+			if spanCount&ctxCheckMask == 0 {
 				if err := ctx.Err(); err != nil {
 					return err
 				}
@@ -3973,7 +3983,7 @@ func accumulateAggDirectScanCol(
 				fval = float64(entry.Int64Val)
 			}
 			for _, ref := range entry.BlockRefs {
-				if spanCount%ctxCheckInterval == 0 {
+				if spanCount&ctxCheckMask == 0 {
 					if err := ctx.Err(); err != nil {
 						return err
 					}
@@ -4003,7 +4013,7 @@ func accumulateAggDirectScanCol(
 		}
 	case modules_shared.IntrinsicFormatFlat:
 		for i, ref := range col.BlockRefs {
-			if spanCount%ctxCheckInterval == 0 {
+			if spanCount&ctxCheckMask == 0 {
 				if err := ctx.Err(); err != nil {
 					return err
 				}
@@ -4190,7 +4200,7 @@ func streamByRefSliceCountRate(
 	groupCounts := acquireGroupCountsFlat(numGroups * numSteps)
 	defer releaseGroupCountsFlat(groupCounts)
 	for i := range inRangeRefs {
-		if i%ctxCheckInterval == 0 {
+		if i&ctxCheckMask == 0 {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
@@ -4453,7 +4463,7 @@ func scanHistogramN0(
 			}
 			base := bIdx * stride2
 			for _, ref := range entry.BlockRefs {
-				if spanCount%ctxCheckInterval == 0 {
+				if spanCount&ctxCheckMask == 0 {
 					if err := ctx.Err(); err != nil {
 						return err
 					}
@@ -4473,7 +4483,7 @@ func scanHistogramN0(
 		}
 	case modules_shared.IntrinsicFormatFlat:
 		for i, ref := range col.BlockRefs {
-			if spanCount%ctxCheckInterval == 0 {
+			if spanCount&ctxCheckMask == 0 {
 				if err := ctx.Err(); err != nil {
 					return err
 				}
@@ -4538,7 +4548,7 @@ func streamByRefSliceHistogramScanDict(
 				continue // guard: boundary cap exceeded (should not happen for span:duration)
 			}
 			for _, ref := range entry.BlockRefs {
-				if spanCount%ctxCheckInterval == 0 {
+				if spanCount&ctxCheckMask == 0 {
 					if err := ctx.Err(); err != nil {
 						return err
 					}
@@ -4562,7 +4572,7 @@ func streamByRefSliceHistogramScanDict(
 		}
 	case modules_shared.IntrinsicFormatFlat:
 		for i, ref := range col.BlockRefs {
-			if spanCount%ctxCheckInterval == 0 {
+			if spanCount&ctxCheckMask == 0 {
 				if err := ctx.Err(); err != nil {
 					return err
 				}
@@ -4677,7 +4687,7 @@ func streamByRefSliceAgg(
 	}
 	idBuckets := make(map[aggKey]*aggBucketState)
 	for i := range inRangeRefs {
-		if i%ctxCheckInterval == 0 {
+		if i&ctxCheckMask == 0 {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
@@ -4968,7 +4978,7 @@ func streamCountRateGroupByID(
 	groupCounts := make(map[groupIDKey][]int64)
 	i := 0
 	for pk, bucketIdx := range keyToBucket {
-		if i%ctxCheckInterval == 0 {
+		if i&ctxCheckMask == 0 {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
@@ -5019,7 +5029,7 @@ func streamCountRateGroupByIDSingle(
 	defer releaseGroupCountsFlat(groupCounts)
 	i := 0
 	for pk, bucketIdx := range keyToBucket {
-		if i%ctxCheckInterval == 0 {
+		if i&ctxCheckMask == 0 {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
@@ -5072,7 +5082,7 @@ func streamHistogramGroupByID(
 		absentCounts := make(map[histGroupIDKey]int64)
 		i := 0
 		for pk, bucketIdx := range keyToBucket {
-			if i%ctxCheckInterval == 0 {
+			if i&ctxCheckMask == 0 {
 				if err := ctx.Err(); err != nil {
 					return err
 				}
@@ -5110,7 +5120,7 @@ func streamHistogramGroupByID(
 			}
 			boundary := intrinsicHistogramBoundary(v, fieldName)
 			for _, ref := range entry.BlockRefs {
-				if spanCount%ctxCheckInterval == 0 {
+				if spanCount&ctxCheckMask == 0 {
 					if err := ctx.Err(); err != nil {
 						return err
 					}
@@ -5129,7 +5139,7 @@ func streamHistogramGroupByID(
 		}
 	case modules_shared.IntrinsicFormatFlat:
 		for i, ref := range col.BlockRefs {
-			if spanCount%ctxCheckInterval == 0 {
+			if spanCount&ctxCheckMask == 0 {
 				if err := ctx.Err(); err != nil {
 					return err
 				}
@@ -5194,7 +5204,7 @@ func streamHistogramGroupByIDSingle(
 		absentCounts := make(map[histSingleAbsentKey]int64)
 		i := 0
 		for pk, bucketIdx := range keyToBucket {
-			if i%ctxCheckInterval == 0 {
+			if i&ctxCheckMask == 0 {
 				if err := ctx.Err(); err != nil {
 					return err
 				}
@@ -5233,7 +5243,7 @@ func streamHistogramGroupByIDSingle(
 			}
 			boundary := intrinsicHistogramBoundary(v, fieldName)
 			for _, ref := range entry.BlockRefs {
-				if spanCount%ctxCheckInterval == 0 {
+				if spanCount&ctxCheckMask == 0 {
 					if err := ctx.Err(); err != nil {
 						return err
 					}
@@ -5251,7 +5261,7 @@ func streamHistogramGroupByIDSingle(
 		}
 	case modules_shared.IntrinsicFormatFlat:
 		for i, ref := range col.BlockRefs {
-			if spanCount%ctxCheckInterval == 0 {
+			if spanCount&ctxCheckMask == 0 {
 				if err := ctx.Err(); err != nil {
 					return err
 				}
@@ -5319,7 +5329,7 @@ func streamAggGroupByID(
 	idBuckets := make(map[aggGroupIDKey]*aggBucketState)
 	i := 0
 	for pk, bucketIdx := range keyToBucket {
-		if i%ctxCheckInterval == 0 {
+		if i&ctxCheckMask == 0 {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
@@ -5361,7 +5371,7 @@ func streamAggGroupByIDSingle(
 	idBuckets := make(map[aggSingleGroupIDKey]*aggBucketState)
 	i := 0
 	for pk, bucketIdx := range keyToBucket {
-		if i%ctxCheckInterval == 0 {
+		if i&ctxCheckMask == 0 {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
@@ -5434,8 +5444,31 @@ func updateAggBucket(bucket *aggBucketState, fn string, v float64) {
 // over 20M random values spanning the full ns-duration range, exact powers of 2,
 // and denormals.
 func pow2Floor(v float64) float64 {
-	_, exp := math.Frexp(v)
-	return math.Ldexp(1, exp-1)
+	return math.Ldexp(1, frexpExpPos(v)-1)
+}
+
+// frexpExpPos returns the same binary exponent as the second return of math.Frexp(v),
+// but for a NORMAL positive finite v it is a branch-free, inlinable IEEE-754 bit
+// extraction instead of a non-inlined math.Frexp call.
+//
+// NOTE-250: math.Frexp is the per-row kernel of the histogram boundary index
+// (boundaryIndexer.index / .lookup) and of pow2Floor — all on the M8 histogram scan hot
+// loop, which prior profiles put among the top querier CPU sinks (NOTE-182: ~14% in the
+// histogram aggregation scan). math.Frexp is not inlined and front-loads branches for
+// NaN/Inf/zero/subnormal inputs that never occur on the positive-finite histogram path.
+// For a normal positive double, v = mantissa * 2**(unbiasedExp-52) with the biased
+// exponent field be in [1,2046]; Frexp's returned exp == unbiasedExp+1 == be-1022.
+// Subnormals (be==0, including +0) and any other oddity fall back to math.Frexp so the
+// result is bit-identical to the old form for every input. Verified exact vs math.Frexp
+// across the full ns-duration range, exact powers of two, and denormals.
+func frexpExpPos(v float64) int {
+	be := int((math.Float64bits(v) >> 52) & 0x7FF)
+	if be == 0 {
+		// Subnormal or zero: delegate to the spec implementation.
+		_, exp := math.Frexp(v)
+		return exp
+	}
+	return be - 1022
 }
 
 // boundaryIndexer maps a histogram-cell value to a dense first-encounter boundary
@@ -5505,7 +5538,7 @@ func (bi *boundaryIndexer) index(v float64) int64 {
 			return bi.zeroIdx
 		}
 	}
-	_, exp := math.Frexp(v)
+	exp := frexpExpPos(v)
 	slot := exp - bi.expBase
 	// byExp slots hold the assigned index (>0) or the discard sentinel (== maxStride) once
 	// seen; only an unassigned slot (== 0) triggers a record() call, matching the former
@@ -5636,7 +5669,7 @@ func (bi *boundaryIndexer) lookup(v float64) int64 {
 			return bi.discardIdx
 		}
 	}
-	_, exp := math.Frexp(v)
+	exp := frexpExpPos(v)
 	slot := exp - bi.expBase
 	if idx := bi.byExp[slot]; idx != 0 {
 		return idx
