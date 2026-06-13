@@ -18,7 +18,20 @@ import (
 	"sync/atomic"
 	"unsafe"
 
-	"github.com/golang/snappy"
+	// NOTE-283: github.com/klauspost/compress/snappy is an API-compatible drop-in for
+	// github.com/golang/snappy whose Decode dispatches to the s2 assembly decoder
+	// (optimized amd64/arm64 routines). The 2026-06-13 querier CPU profile showed
+	// snappy.Decode at ~10% inclusive / ~5% self — the single largest blockpack-attributable
+	// CPU sink — driven by per-page paged-column decompression on the metrics group-by and
+	// search predicate-scan hot paths. Microbenchmark on representative column-page sizes:
+	// 64KiB +24%, 256KiB +14%, 1MiB +9% decode throughput vs golang/snappy, 0 allocs both.
+	// Both packages implement the standard Snappy BLOCK format (not the stream/framing
+	// format), so blocks written by one decode losslessly with the other (verified
+	// round-trip both directions) — no on-disk format change, fully backward/forward
+	// compatible with already-written blocks. Decode's dst-reuse contract is identical
+	// (reuses dst when DecodedLen <= cap(dst), else allocates), so snappyDecodeReuse's
+	// NOTE-262 in-place reuse assumption is preserved.
+	"github.com/klauspost/compress/snappy"
 )
 
 // decodeBoundedSnappyColumn snappy-decodes compressed, rejecting inputs whose

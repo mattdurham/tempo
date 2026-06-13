@@ -1890,3 +1890,35 @@ transient allocations per scanned column from the warm search path.
 
 Back-ref: `shared/intrinsic_codec.go:DecodePageTOCInto`, `parsePagedBlobHeaderInto`,
 `parsePageTOCFields`, `scanDictPagedBlob`, `scanFlatPagedBlob`, `scanFlatPagedFiltered`.
+
+## NOTE-283: swap golang/snappy → klauspost/compress/snappy (faster s2 decoder)
+
+**Change:** Replace `github.com/golang/snappy` with the API-compatible drop-in
+`github.com/klauspost/compress/snappy` for all column/page/section encode+decode in the
+read and write paths (`intrinsic_codec.go`, `reader/parser.go`, `reader/block_parser.go`,
+`reader/layout.go`, `writer/intrinsic_accum.go`, `writer/v8_sections.go`,
+`writer/writer_block.go`). The klauspost package re-exports `Decode`/`DecodedLen`/`Encode`/
+`MaxEncodedLen` with identical signatures and dispatches `Decode` to the s2 assembly decoder.
+
+**Why:** The 2026-06-13 querier CPU profile showed `snappy.decode` at ~5% self / ~10%
+inclusive — the single largest blockpack-attributable CPU sink — driven by per-page paged
+column decompression on the metrics group-by (M4/M8/M9) and search predicate-scan hot paths.
+This is pure decode CPU; no allocation involved (both decoders are 0-alloc when dst is
+pre-sized). A faster decoder is a direct, general CPU reduction on every warm query.
+
+**Why correct / safe:** Both packages implement the *standard Snappy block format* (not the
+stream/framing format), so blocks are losslessly cross-compatible: a block written by one
+decodes identically with the other, in both directions (verified by a round-trip test over
+sizes 0..300KB before removing it). No on-disk format change — already-written blocks are
+fully backward/forward compatible. `Decode`'s dst-reuse contract is identical (reuses `dst`
+when `DecodedLen <= cap(dst)`, else allocates a fresh slice), so the NOTE-262
+`snappyDecodeReuse` in-place reuse assumption is preserved. The `MaxBlockSize`
+decompression-bomb guard (`DecodedLen` pre-check) is unaffected.
+
+**Verification:** Microbenchmark on representative column-page sizes (mixed dict-like +
+random, matching real column pages): vs golang/snappy decode throughput +24% @ 64KiB,
++14% @ 256KiB, +9% @ 1MiB, 0 allocs both. `go test -race ./blockio/shared ./blockio/reader
+./blockio/writer ./executor` green (cross-decoder round-trips pass since the test files still
+import golang/snappy to encode while production decodes with klauspost).
+
+Back-ref: `shared/intrinsic_codec.go` import block (NOTE-283 comment).

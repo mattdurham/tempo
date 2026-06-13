@@ -10,7 +10,7 @@ import (
 	"slices"
 	"time"
 
-	"github.com/golang/snappy"
+	"github.com/klauspost/compress/snappy"
 
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
 )

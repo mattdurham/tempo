@@ -11,8 +11,8 @@ import (
 	"slices"
 	"unsafe"
 
-	"github.com/golang/snappy"
 	tempotrace "github.com/grafana/tempo/pkg/tempopb/trace/v1"
+	"github.com/klauspost/compress/snappy"
 	commonv1 "go.opentelemetry.io/proto/otlp/common/v1"
 
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"

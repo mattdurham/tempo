@@ -9,8 +9,8 @@ import (
 	"strconv"
 	"sync"
 
-	"github.com/golang/snappy"
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
+	"github.com/klauspost/compress/snappy"
 )
 
 // blockHeader holds the parsed block header fields.
