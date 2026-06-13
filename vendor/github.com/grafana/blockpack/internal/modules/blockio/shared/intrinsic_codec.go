@@ -271,7 +271,19 @@ func EncodePageTOC(toc PagedIntrinsicTOC) ([]byte, error) {
 
 // DecodePageTOC decompresses a page TOC blob and parses it into a PagedIntrinsicTOC.
 func DecodePageTOC(blob []byte) (PagedIntrinsicTOC, error) {
-	raw, err := decodeBoundedSnappyColumn(blob)
+	// NOTE-273: decode the TOC blob into a pooled scratch buffer instead of a fresh
+	// snappy.Decode(nil, …) allocation. DecodePageTOC runs once per paged-column decode
+	// (decodePagedColumnBlob and the search-path header parsers) and was the last hot-path
+	// caller still routing through decodeBoundedSnappyColumn, which always took snappy's
+	// make([]byte, dLen) branch. Every field DecodePageTOC reads out of the decoded buffer
+	// is copied before return — Min/Max via string(raw[…]) (which allocates a fresh copy)
+	// and Bloom via make+copy — so nothing aliases the scratch and it is safe to release
+	// back to intrinsicBufPool. snappyDecodeReuse (NOTE-262) reuses the pooled backing array
+	// in place whenever the decoded TOC fits, eliminating the per-decode TOC allocation and
+	// its memclr, and carries the same MaxBlockSize decompression-bomb guard.
+	bp := AcquireIntrinsicBuf()
+	defer ReleaseIntrinsicBuf(bp)
+	raw, err := snappyDecodeReuse(bp, blob)
 	if err != nil {
 		return PagedIntrinsicTOC{}, fmt.Errorf("DecodePageTOC: snappy: %w", err)
 	}

@@ -1644,3 +1644,42 @@ and independent of NOTE-258/259 (nil-dst paths).
 Back-ref: `shared/intrinsic_codec.go:snappyDecodeReuse`, `scanDictPagedBlob`,
 `scanFlatPagedBlob`, `scanFlatPagedFiltered`, `scanDeltaUint64PagedBlob`,
 `scanDeltaUint64PagedFiltered`.
+
+## NOTE-273: pool the page-TOC snappy decode buffer in DecodePageTOC
+
+**Problem:** `DecodePageTOC` was the last hot-path caller still routing its snappy
+decompress through `decodeBoundedSnappyColumn`, which calls `snappy.Decode(nil, blob)` and
+therefore always allocates a fresh `make([]byte, dLen)` buffer (plus its memclr) per call.
+`DecodePageTOC` runs **once per paged-column decode** — in `decodePagedColumnBlob` (the M1/M4
+metrics decode path) and in the search-path header parsers `PeekIntrinsicBlobHeader` and
+`parsePagedBlobHeader` (Q1–Q10 column scans). A query touching many columns across many
+blocks pays this allocation thousands of times. NOTE-262/263 already eliminated the same
+defect on the page-blob and scanner decode paths via the pooled `snappyDecodeReuse`, but the
+TOC decode was missed.
+
+**Fix:** acquire a pooled scratch buffer (`AcquireIntrinsicBuf` / `defer ReleaseIntrinsicBuf`)
+and decode the TOC via `snappyDecodeReuse(bp, blob)`, which hands snappy `(*bp)[:cap(*bp)]` so
+a warmed pooled buffer is reused in place (no alloc, no memclr) whenever the decoded TOC fits,
+and updates `*bp` if snappy reallocates for an oversized TOC. This is safe because every field
+`DecodePageTOC` reads out of the decoded buffer is copied before return: `Min`/`Max` via
+`string(raw[…])` (which allocates a fresh string copy) and `Bloom` via `make+copy`. Nothing in
+the returned `PagedIntrinsicTOC` aliases the scratch, so it is released back to the pool. The
+`MaxBlockSize` decompression-bomb guard is preserved (`snappyDecodeReuse` carries it). No
+nesting hazard: in `decodePagedColumnBlob` the TOC decode completes and releases its buffer
+before the per-page `AcquireIntrinsicBuf` loop begins, and `sync.Pool` hands distinct buffers
+to distinct `Acquire` calls regardless.
+
+**Verification:** `go build ./...`, `go test -race ./blockio/shared ./blockio/reader
+./executor` green. New `BenchmarkDecodePageTOC` (100-page Delta TOC): 2 allocs/op 10240 B/op
+→ 1 alloc/op 8197 B/op (-50% allocs, -20% bytes; the eliminated alloc is the snappy decode
+buffer, the residual 1 alloc is the returned `[]PageMeta` slice which is genuine output). The
+existing `BenchmarkDecodePagedColumn{Dict,Delta,XORBytes}` each drop ~1 alloc/op (the per-call
+TOC decode). Decode result is byte-identical: `snappyDecodeReuse` reslices to `[:dLen]`
+whether it reuses or allocates, and the bomb guard rejects only blobs the old path rejected.
+
+**Queries affected:** every query that decodes a paged intrinsic column — M1/M4/M6/M8/M9
+metrics decode (decodePagedColumnBlob) and Q1–Q10 search column scans (PeekIntrinsicBlobHeader,
+parsePagedBlobHeader). Stacks directly on NOTE-262/263 (same defect class, disjoint callsite).
+
+Back-ref: `shared/intrinsic_codec.go:DecodePageTOC`, `snappyDecodeReuse`,
+`intrinsic_parallel_decode_test.go:BenchmarkDecodePageTOC`.
