@@ -440,13 +440,25 @@ func (a *allMatchSet) ToSlice() []int {
 // to eliminate per-span string allocations on both insert and lookup.
 // Span IDs are [8]byte value types (NOTE-093); the present bitmask (structuralSpanIDPresent /
 // structuralParentIDPresent) is the authoritative absent indicator — not the zero value.
-// The remaining one make() per trace is unavoidable.
+//
+// NOTE-271: reuse ONE byID map across all traces instead of make()-ing a fresh map per
+// trace. The previous per-trace make(map[[8]byte]int, len(spans)) was one heap allocation
+// (plus the bucket array) for every trace in the result — on a structural query (>>) that
+// matches many small traces (the measured Q9 workload) this was N map allocations driving
+// GC pressure on the structural hot path. The map is span-ID → row-index scoped strictly
+// within a single trace's parent resolution: it is fully built then fully read before the
+// next trace, so clear()-ing it between traces (Go's clear is a cheap bucket reset that
+// retains the backing array) gives identical semantics with a single amortized allocation
+// that grows to the largest trace's span count. The clear runs at the TOP of each trace so
+// the very first iteration starts empty regardless of pool reuse.
 func resolveStructuralParentIndices(traceSpans map[[16]byte][]structuralSpanRec) {
+	byID := make(map[[8]byte]int)
 	for traceID := range traceSpans {
 		spans := traceSpans[traceID]
 		// NOTE-079, NOTE-093: [8]byte map key — zero string allocations on insert or lookup.
 		// Use present bits (not zero-value sentinel) to distinguish absent from all-zero IDs.
-		byID := make(map[[8]byte]int, len(spans))
+		// NOTE-271: clear (not re-make) so the prior trace's entries do not leak in.
+		clear(byID)
 		for i, sp := range spans {
 			if sp.present&structuralSpanIDPresent != 0 {
 				byID[sp.spanID] = i

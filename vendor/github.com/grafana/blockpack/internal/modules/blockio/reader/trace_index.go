@@ -479,16 +479,36 @@ func buildTraceIdxSamples(data []byte, fmtVersion uint8) (offsets []int32, ok bo
 		}
 		return offsets, true
 	}
+	// NOTE-270: inline the v1 (variable-stride: per-ref block_id[2]+span_count[2]+
+	// span_indices[span_count×2]) entry walk directly here, mirroring the v2 fast path
+	// above. Production V8 files still embed the legacy v1 trace-index layout, so the
+	// previous code took the per-entry traceEntryStride function-call path — which the
+	// 2026-06-13 querier CPU profile showed at ~9.6s self-time (alongside this builder's
+	// ~15.5s) on bloom-hit trace-resolution queries. traceEntryStride is non-inlinable
+	// (it loops over refs and returns two values), so it forced a call + return per entry
+	// across millions of entries each time a section was first touched. Folding the same
+	// bounds-checked ref walk into this loop removes the call overhead and the redundant
+	// (stride, ok) tuple plumbing while preserving identical malformed detection: every
+	// recorded offset still points at a fully-in-bounds entry header.
+	n := len(data)
 	for i := range offsets {
-		if pos+18 > len(data) {
+		if pos+18 > n {
 			return nil, false // malformed
 		}
 		offsets[i] = int32(pos) //nolint:gosec // pos < len(data) <= ~15 MB < 2^31
-		stride, strideOK := traceEntryStride(data, pos, fmtVersion)
-		if !strideOK {
-			return nil, false // malformed
+		blockRefCount := int(binary.LittleEndian.Uint16(data[pos+16:]))
+		p := pos + 18
+		for range blockRefCount {
+			if p+4 > n {
+				return nil, false // malformed
+			}
+			spanCount := int(binary.LittleEndian.Uint16(data[p+2:]))
+			p += 4 + spanCount*2
 		}
-		pos += stride
+		if p > n {
+			return nil, false // entry overran the section
+		}
+		pos = p
 	}
 	return offsets, true
 }

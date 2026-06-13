@@ -4998,3 +4998,37 @@ No benchmark-specific constants — a general structural reduction in zeroing vo
 footprint, and gather cache-miss rate on the most common metrics group-by shape.
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:accumulateIntrinsicBucketsDirect`,
 `accumulateCountRateDirect`. Test: `TestAccumulateCountRateDirect_MultiBlock_RebaseByteEquivalence`.
+
+### NOTE-271: reuse one span-ID map across traces in resolveStructuralParentIndices
+
+`resolveStructuralParentIndices` resolves each span's `parentIdx` (the row index of its parent
+span within the same trace) by building a `map[[8]byte]int` of span-ID → row-index, then looking
+up each span's parent ID. It previously `make`-d a fresh map **per trace**. On a structural query
+(the `>>` / `<<` ancestor-descendant operators, e.g. the measured Q9
+`{span.kind=server} >> {span.kind=client && ...}`) the `traceSpans` map holds one entry per
+matched trace — typically MANY small traces — so the per-trace `make` was one heap allocation
+(map header + bucket array) per trace, all on the structural hot path after the block scan.
+
+**Mechanism:** the byID map is scoped strictly within a single trace's resolution — it is fully
+populated from that trace's spans, then fully read to set `parentIdx`, before the loop advances to
+the next trace. So a single map reused across iterations with `clear()` at the top of each trace
+is semantically identical: `clear` is a cheap bucket reset that retains the backing array, so the
+map grows once to the largest trace's span count and every later trace reuses that capacity. This
+turns N per-trace allocations into one amortized allocation. The `clear` runs BEFORE the populate
+loop so the first iteration starts empty regardless of any prior state.
+
+**Correctness:** byte-identical parent resolution. The present-bit gating
+(`structuralSpanIDPresent` / `structuralParentIDPresent`) is unchanged — an absent span ID is
+never inserted and an absent parent ID is never looked up, exactly as before — and `clear` between
+traces guarantees no cross-trace key leakage (a span ID from trace A can never resolve a parent in
+trace B). General: no benchmark-specific constants; a pure allocation-count reduction proportional
+to the number of matched traces.
+
+**Measured (microbench, 200 traces × 200 spans, where the per-trace map escapes to heap):**
+980800 B/op · 600 allocs/op · ~1.35 ms/op → 9352 B/op · 11 allocs/op · ~0.77 ms/op (−99% bytes,
+−98% allocs, −43% time). For *small* traces (few spans each — Q9's typical shape) the Go compiler
+already stack/fast-path-allocates the small `make(map, len)`, so the prior code reported 0 allocs
+and this change is neutral (still 0 allocs) — never a regression. The win materializes on traces
+large enough for the byID map to escape (~50+ spans), the worst case for the old per-trace make.
+Back-ref: `internal/modules/executor/stream_structural.go:resolveStructuralParentIndices`.
+Test: `stream_structural_internal_test.go:TestResolveStructuralParentIndices_MultiTraceNoLeak`.

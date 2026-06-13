@@ -2025,3 +2025,33 @@ would have. `go test -race ./blockio/reader ./executor` green incl. the NOTE-260
 tests and `TestScanTraceIndexRaw_ProcessCacheWarmEqualsCold`.
 
 Back-ref: `reader/trace_index.go:buildTraceIdxSamples`.
+
+### NOTE-270: inline the v1 variable-stride entry walk in buildTraceIdxSamples — 2026-06-13
+
+NOTE-268 specialised only the v2 entry walk; the v1 (legacy `TraceIndexFmtVersion`) path in
+`buildTraceIdxSamples` still called the non-inlinable `traceEntryStride` once per entry. The
+2026-06-13 querier CPU profile showed the production V8 files embed the **v1** trace-index
+layout (per-ref `block_id[2] + span_count[2] + span_indices[span_count×2]`): `traceEntryStride`
+was ~9.6s self-time and `buildTraceIdxSamples` ~15.5s — the largest blockpack-controllable CPU
+sink after `snappy.decode`. The v2 fast path NOTE-268 added was never reached for these files,
+so the per-entry call + (stride, ok) tuple return ran across every entry each time a section
+was first touched on a bloom-hit trace-resolution query (Q5/Q7/Q9/M6/M9).
+
+**Mechanism:** fold the same ref walk `traceEntryStride` performs into the build loop directly,
+mirroring the NOTE-268 v2 specialisation: read `block_ref_count`, then for each ref read
+`span_count` at `p+2` and advance `p += 4 + spanCount*2`, recording `pos` before the walk. This
+removes the per-entry function call and the redundant `(stride, ok)` plumbing, and (like NOTE-268)
+keeps the `offsets` slice pre-sized to `traceCount` with store-by-index so the loop bound
+discharges the cap/length bookkeeping. `traceEntryStride` is retained — it is still the
+linear-scan fallback in `scanTraceIndexRaw` when the dense index build returns `ok=false`.
+
+**Correctness:** byte-for-byte identical offsets to the prior `traceEntryStride`-driven walk —
+the inlined loop checks the exact same bounds (`pos+18 > n` before the header read, `p+4 > n`
+before each ref's `span_count`, `p > n` after the last ref), so a malformed entry still returns
+`ok=false` and the lookup falls back to the unchanged linear scan. Covered by the new
+`TestScanTraceIndexRaw_V1MultiEntry` (multi-entry v1 section with varying block_ref_count and
+per-ref span_count to vary the stride; asserts every trace resolves correctly plus a miss),
+alongside the existing single-entry `TestScanTraceIndexRaw_V1`. `go test -race ./blockio/reader`
+green.
+
+Back-ref: `reader/trace_index.go:buildTraceIdxSamples`.
