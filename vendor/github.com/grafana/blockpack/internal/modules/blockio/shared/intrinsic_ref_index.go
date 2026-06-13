@@ -61,6 +61,59 @@ func putRadixBuf(bp *[]RefIndexEntry) {
 	radixBufPool.Put(bp)
 }
 
+// NOTE-253: generation-stamped claim buffer for the dense-scatter density checks. Both
+// scatterDictRefIndexDense and scatterDictRefIndexMultiBlockDense need to detect, while
+// scattering, whether any output slot is written twice (a duplicate (block,row) => the
+// permutation is not dense). They previously did this by pre-clearing the entire pooled
+// scratch buffer to a -1 sentinel Pos (a full O(N) strided write) before every scatter, then
+// checking `buf[slot].Pos != unclaimed` per write. On the proven-dense path the scatter
+// writes every one of the n slots exactly once, so the pre-clear is pure overhead that scales
+// with n on the dominant decode path. A generation-stamped claim array removes it: each slot
+// carries the generation token of the call that last claimed it, so "claimed this call" is
+// `claim[slot] == gen` with NO per-call clear. We bump gen once per scatter; only when gen
+// would wrap to 0 (every ~4 billion scatters) do we pay a one-time O(N) reset of the resident
+// buffer, keeping the clear amortized to O(1) per call. The claim buffer is sized to the
+// scatter length and pooled independently of the value double-buffer; sync.Pool makes it
+// concurrency-safe across the EnsureRefIndex calls that run in parallel over columns/blocks.
+type claimBuf struct {
+	gen   []uint32
+	token uint32
+}
+
+var claimBufPool = sync.Pool{
+	New: func() any { return &claimBuf{} },
+}
+
+// getClaimBuf returns a claim buffer of length >= n together with the generation token that
+// marks "claimed by this call". The buffer's gen entries are NOT cleared: any slot whose
+// stored token differs from the returned token is treated as unclaimed. The token is advanced
+// per acquisition; on the rare wrap to 0 the resident buffer is reset to 0 once so that a
+// stale 0 from an old call cannot be mistaken for the fresh token.
+func getClaimBuf(n int) (*claimBuf, uint32) {
+	cb := claimBufPool.Get().(*claimBuf)
+	if cap(cb.gen) < n {
+		cb.gen = make([]uint32, n)
+	} else {
+		cb.gen = cb.gen[:n]
+	}
+	cb.token++
+	if cb.token == 0 {
+		// Wrapped: every prior stamp must be invalidated so it cannot equal the new token.
+		for i := range cb.gen {
+			cb.gen[i] = 0
+		}
+		cb.token = 1
+	}
+	return cb, cb.token
+}
+
+func putClaimBuf(cb *claimBuf) {
+	if cap(cb.gen) > radixBufCap {
+		return // drop oversized buffer; let it be GC'd
+	}
+	claimBufPool.Put(cb)
+}
+
 // radixSortRefIndex sorts idx in ascending Packed order using an LSD radix sort over the
 // 32-bit Packed key (NOTE-174). This replaces the comparator-closure-driven
 // slices.SortFunc(cmp.Compare(a.Packed, b.Packed)) used on the unsorted fallback path
@@ -312,8 +365,9 @@ func radixSortRefIndexLow16Prepared(idx []RefIndexEntry, lowOr uint32, hist0 *[1
 // most once (collision => not a permutation) and every rank must fall in range; if either
 // invariant is violated the function reports false WITHOUT mutating idx so the caller can
 // fall back to the general radix sort. The pooled buffer is the same non-zeroed scratch used
-// by radixSortRefIndex (NOTE-192); we mark claimed slots with a sentinel Pos so a stale
-// buffer cannot be mistaken for a written slot. NOTE-226.
+// by radixSortRefIndex (NOTE-192); claimed slots are detected via a generation-stamped claim
+// array (NOTE-253) so a stale buffer cannot be mistaken for a written slot without paying an
+// O(N) pre-clear. NOTE-226.
 func scatterDictRefIndexDense(idx []RefIndexEntry, minRow uint32) bool {
 	n := len(idx)
 	if n < 2 {
@@ -321,22 +375,23 @@ func scatterDictRefIndexDense(idx []RefIndexEntry, minRow uint32) bool {
 	}
 	bufPtr := getRadixBuf(n)
 	buf := *bufPtr
-	const unclaimed = int32(-1)
-	for i := range buf {
-		buf[i].Pos = unclaimed
-	}
+	// NOTE-253: generation-stamped claim detection replaces the O(N) sentinel pre-clear.
+	cb, token := getClaimBuf(n)
+	gen := cb.gen
 	ok := true
 	for i := range idx {
 		rank := int((idx[i].Packed & 0xFFFF) - minRow)
-		if rank < 0 || rank >= n || buf[rank].Pos != unclaimed {
+		if rank < 0 || rank >= n || gen[rank] == token {
 			ok = false
 			break
 		}
+		gen[rank] = token
 		buf[rank] = idx[i]
 	}
 	if ok {
 		copy(idx, buf)
 	}
+	putClaimBuf(cb)
 	putRadixBuf(bufPtr)
 	return ok
 }
@@ -412,10 +467,9 @@ func scatterDictRefIndexMultiBlockDense(idx []RefIndexEntry, minBlk, maxBlk uint
 
 	bufPtr := getRadixBuf(n)
 	buf := *bufPtr
-	const unclaimed = int32(-1)
-	for i := range buf {
-		buf[i].Pos = unclaimed
-	}
+	// NOTE-253: generation-stamped claim detection replaces the O(N) sentinel pre-clear.
+	cb, token := getClaimBuf(n)
+	gen := cb.gen
 	ok := true
 	for i := range idx {
 		b := int(idx[i].Packed>>16) - int(minBlk)
@@ -428,15 +482,17 @@ func scatterDictRefIndexMultiBlockDense(idx []RefIndexEntry, minBlk, maxBlk uint
 			break
 		}
 		slot := offsets[b] + rank
-		if buf[slot].Pos != unclaimed {
+		if gen[slot] == token {
 			ok = false
 			break
 		}
+		gen[slot] = token
 		buf[slot] = idx[i]
 	}
 	if ok {
 		copy(idx, buf)
 	}
+	putClaimBuf(cb)
 	putRadixBuf(bufPtr)
 	return ok
 }

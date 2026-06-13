@@ -1422,3 +1422,45 @@ existing `TestDenseLookup_EqualsBinarySearch` / `TestDenseLookup_NotSetWhenSpars
 Back-ref: `internal/modules/blockio/shared/intrinsic_ref_index.go:EnsureRefIndex`,
 `setRefDense`, `markDenseIfContiguous`; NOTE-226 (dict dense scatter), NOTE-228 (single-block
 low-16), NOTE-229 (dense fast path), NOTE-235 (fused build/radix first pass).
+
+## NOTE-253: dense-scatter density check — generation-stamped claims instead of an O(N) pre-clear
+
+`scatterDictRefIndexDense` and `scatterDictRefIndexMultiBlockDense` both detect, while scattering,
+whether any output slot is written twice (a duplicate (block,row) means the permutation is not
+dense, so they must fall back to the general radix sort). They previously did this by pre-clearing
+the entire pooled scratch buffer to a `-1` sentinel `Pos` — a full O(N) strided write over the
+`RefIndexEntry` buffer — before every scatter, then testing `buf[slot].Pos != unclaimed` per write.
+On the **proven-dense** path (the dominant single-block / fully-present-merge decode shape) the
+scatter then writes every one of the `n` slots exactly once, so that pre-clear is pure overhead
+that scales with `n` on the hot path. This was the standing NEXT TARGET from NOTE-252.
+
+**Change:** a generation-stamped claim array (`claimBuf{gen []uint32, token uint32}`, pooled
+independently of the value double-buffer). `getClaimBuf(n)` returns a length-`n` `gen` slice and a
+per-call `token`; "slot claimed by this call" is `gen[slot] == token`. The scatter stamps
+`gen[slot] = token` instead of relying on a sentinel. **No per-call clear is needed** — a stale
+stamp from a prior call holds an older token, so it never matches the current one. The token is
+advanced once per acquisition; only when it would wrap to 0 (every ~4 billion scatters) do we pay a
+one-time O(N) reset of the resident `gen` buffer and restart at token 1. The amortized clear cost is
+therefore O(1) per call instead of O(N). The value scatter and copy-back are otherwise unchanged.
+
+**Safety / why output-identical:** the collision semantics are identical — a slot is rejected iff it
+was already written *in this call*, which `gen[slot] == token` captures exactly (a fresh buffer has
+all-zero `gen` and token>=1; a reused buffer's stale stamps are strictly older tokens). On the wrap
+to 0 we explicitly zero `gen` and set token=1 so no stale 0 can be mistaken for the fresh token. On
+any rejection the function returns false WITHOUT mutating `idx` (the value scatter writes `buf`, not
+`idx`; `idx` is touched only by the final `copy` on success), so a genuinely sparse/non-contiguous
+input is byte-for-byte identical to the general radix sort, exactly as before. `sync.Pool` keeps the
+claim buffer concurrency-safe across the parallel EnsureRefIndex calls.
+
+**Verified:** `go test -race ./blockio/shared ./blockio/reader ./executor` green, incl. the new
+`TestScatterDictRefIndexDense_ReusedClaimBufNoStale` (dirties the pooled buffer with a rejected
+duplicate scatter, then runs eight dense out-of-order scatters that reuse it, asserting each lands
+the dense range [0,n) at the correct rank — a stale claim would spuriously reject or corrupt order)
+and the existing `TestScatterDictRefIndexDense_RejectsDuplicate`,
+`TestScatterDictRefIndexMultiBlockDense_RejectsDuplicate`,
+`TestEnsureRefIndex_DictDenseScatterEqualsRadix`,
+`TestEnsureRefIndex_DictMultiBlockDenseEqualsRadix`.
+
+Back-ref: `internal/modules/blockio/shared/intrinsic_ref_index.go:scatterDictRefIndexDense`,
+`scatterDictRefIndexMultiBlockDense`, `getClaimBuf`/`putClaimBuf`; NOTE-192 (pooled scratch),
+NOTE-226 (dict dense scatter), NOTE-240 (multi-block dense scatter), NOTE-252 (proven-dense skip).
