@@ -3512,6 +3512,14 @@ func accumulateIntrinsicBucketsDirect(
 		if val == "" {
 			continue
 		}
+		// NOTE-249: count/rate (dictByPK == nil) only needs entryGIdx[i] — a per-entry flag of
+		// "has any ref ≤ maxPK" — because accumulateCountRateDirect re-walks every entry's
+		// BlockRefs itself (the per-span bucket lookup is keyed off entryGIdx, not dictByPK). So
+		// once this entry has been assigned a gIdx there is no remaining work for the count/rate
+		// path: the only reason to keep scanning refs is to populate dictByPK, which is nil here.
+		// Breaking turns this first pass from O(total spans) into O(num dict entries) for
+		// count/rate. The histogram/agg paths (dictByPK != nil) must visit every ref to fill the
+		// dense dictByPK, so they scan in full — unchanged.
 		dictIdx := uint32(len(dict)) //nolint:gosec
 		assigned := false
 		for _, ref := range entry.BlockRefs {
@@ -3521,6 +3529,9 @@ func accumulateIntrinsicBucketsDirect(
 					dict = append(dict, val)
 					entryGIdx[i] = dictIdx + 1
 					assigned = true
+					if dictByPK == nil {
+						break
+					}
 				}
 				if dictByPK != nil {
 					dictByPK[pk] = dictIdx + 1

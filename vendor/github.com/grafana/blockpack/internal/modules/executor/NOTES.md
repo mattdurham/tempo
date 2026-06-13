@@ -5,6 +5,32 @@ This document captures the non-obvious design decisions, rationale, and invarian
 
 ---
 
+## NOTE-249: early-break the count/rate entryGIdx build — first pass becomes O(dict entries)
+
+`accumulateIntrinsicBucketsDirect` builds a per-dict-entry first pass that, for every
+`groupByCol.DictEntries` entry, walks ALL of that entry's `BlockRefs` to (a) assign the entry a
+group index (`entryGIdx[i]`) the first time it sees a ref ≤ `maxPK`, and (b) populate the dense
+`dictByPK[pk]` packKey→group array. `dictByPK` is **only** allocated for the histogram/agg paths
+(NOTE-091: count/rate uses `entryGIdx` exclusively and leaves `dictByPK == nil`).
+
+For the count/rate path the loop therefore did redundant work: after the first ref ≤ `maxPK`
+assigns `entryGIdx[i]`, every subsequent ref in the entry only re-tested `pk <= maxPK` and hit the
+`if dictByPK != nil` guard — which is false — so it accumulated nothing. The downstream
+`accumulateCountRateDirect` re-walks every entry's `BlockRefs` itself (its per-span bucket lookup
+is keyed off `entryGIdx`, not `dictByPK`), so the first pass never needed to visit more than the
+first matching ref per entry on the count/rate path. `break`ing as soon as the entry is assigned
+(when `dictByPK == nil`) turns this first pass from O(total spans in the group-by column) into
+O(num dict entries) for count/rate.
+
+The biggest win is the no-predicate `{} | rate() by (...)` shape (M4), where every entry's refs
+are all ≤ `maxPK` so the entry is assigned on its first ref — the inner loop collapses to one
+iteration per entry instead of one per span. The histogram and agg paths (`dictByPK != nil`) must
+still visit every ref to fill the dense `dictByPK`, so they do NOT break and scan in full —
+behavior and output are byte-identical to before. No benchmark-specific constants; a general
+algorithmic reduction. Validated by the existing N=1 count/rate equivalence tests
+(`TestAccumulateCountRateDirect_*` / dispatch end-to-end) which still pass with `-race`. Back-ref:
+`internal/modules/executor/metrics_trace_intrinsic.go:accumulateIntrinsicBucketsDirect`.
+
 ## NOTE-223: drop the radix sort in streamCountRateN1Compact — rank is order-independent
 *Added: 2026-06-12*
 
