@@ -1376,3 +1376,49 @@ append): scatter ~275µs vs general radix ~525µs (≈1.9×), 1 alloc/op.
 
 Back-ref: `internal/modules/blockio/shared/intrinsic_ref_index.go:scatterDictRefIndexMultiBlockDense`,
 NOTE-226 (single-block dense scatter), NOTE-192 (pooled radix scratch).
+
+## NOTE-252: EnsureRefIndex — skip the markDenseIfContiguous re-scan when density is already proven
+
+**Context:** After every `EnsureRefIndex` build, `markDenseIfContiguous` ran a full O(N) scan over
+the just-sorted `refIndex` to decide whether to enable the NOTE-229 O(1) dense reverse-lookup fast
+path (`col.refDense` + `refDenseHi16` + `refDenseMin`). On the dominant single-block decode shape
+(the query-frontend shards to 1 block per querier call, so nearly every warm column is a dense
+single-block permutation) this scan re-derives a fact the build already established:
+
+- **Flat / XOR / Delta path:** the build scan tracks `singleBlock` (all refs share one high-16
+  BlockIdx) and now also `minRow`/`maxRow`. Within a single block RowIdx is unique per row (refs are
+  emitted in row order), so a single-block index whose RowIdx span equals its length
+  (`maxRow-minRow+1 == n`) is — by pigeonhole — exactly the dense contiguous range
+  `[minRow, minRow+n)`. That is the precise condition `markDenseIfContiguous` re-verifies.
+- **Dict path:** `scatterDictRefIndexDense` returning true (NOTE-226) *proves* the index is the
+  dense contiguous single-block permutation `[minRow, minRow+total)` under one high-16 (`hi16`) —
+  again exactly the `markDenseIfContiguous` condition.
+
+**Change:** factored the dense-field assignment out of `markDenseIfContiguous` into `setRefDense`.
+When the build path has already proven the dense single-block shape it calls `setRefDense(hi16,
+minRow)` directly and **skips** `markDenseIfContiguous`; otherwise it falls back to the full scan
+unchanged. This removes one full O(N) pass over `refIndex` per column build on the warm single-block
+path — the path that fires on essentially every warm metrics/search query under the current shard
+shape. `radixSortRefIndexPrepared` + `EnsureRefIndex.func1` were the single largest blockpack frame
+group in the 2026-06-13 querier CPU profile; the post-sort dense re-scan was part of that group.
+
+**Safety / why output-identical:** `setRefDense` sets the same three fields
+`markDenseIfContiguous` would set. The flat shortcut fires only when `singleBlock && n>0 &&
+maxRow-minRow+1==n`, which is logically equivalent to "dense contiguous single-block permutation"
+given per-row unique RowIdx (pigeonhole). The dict shortcut fires only when
+`scatterDictRefIndexDense` returned true, which the function only does after verifying density (no
+gap/dup) while scattering. In every other case (`sorted`, `singleBlock`-non-dense, multi-block,
+gapped) the code still calls `markDenseIfContiguous`, so its behavior is byte-for-byte unchanged.
+The `minRow`/`maxRow` flat-path additions are cheap arithmetic in a loop that already touches every
+ref; no extra pass.
+
+**Verified:** `go test -race ./blockio/shared` green, incl. new
+`TestEnsureRefIndex_ProvenDenseMatchesScan` (asserts the proven shortcut records the SAME
+`refDense`/`refDenseHi16`/`refDenseMin` an independent full re-scan — `refDenseGroundTruth` — would,
+across in-order/out-of-order/non-zero-block/non-zero-minRow flat and dict-dense-scatter inputs, plus
+a gapped column that must NOT fire and a binary-search lookup cross-check at every row) and the
+existing `TestDenseLookup_EqualsBinarySearch` / `TestDenseLookup_NotSetWhenSparse`.
+
+Back-ref: `internal/modules/blockio/shared/intrinsic_ref_index.go:EnsureRefIndex`,
+`setRefDense`, `markDenseIfContiguous`; NOTE-226 (dict dense scatter), NOTE-228 (single-block
+low-16), NOTE-229 (dense fast path), NOTE-235 (fused build/radix first pass).
