@@ -341,6 +341,106 @@ func scatterDictRefIndexDense(idx []RefIndexEntry, minRow uint32) bool {
 	return ok
 }
 
+// scatterDictRefIndexMultiBlockDense sorts idx in place when it is a block-bucketed dense
+// permutation: the high-16 BlockIdx values form the contiguous range [minBlk, maxBlk], and
+// within each block the low-16 RowIdx values are a dense permutation [blockMin, blockMin+cnt).
+// This is the sorted shape of a merge of fully-present dict columns — the dominant multi-block
+// decode case, which would otherwise pay the general four-pass radix (radixSortRefIndexPrepared,
+// the largest blockpack self-time frame in querier CPU profiles). The sorted index is then a
+// pure rank scatter: a block's run starts at the prefix-sum of all preceding blocks' counts,
+// and within that run each ref lands at (rowIdx - blockMin) — strictly O(N), no histograms over
+// the full key, no double-buffer multi-pass.
+//
+// Two linear passes over idx, plus O(numBlocks) bookkeeping:
+//  1. count refs per block and capture each block's min row;
+//  2. build prefix offsets (rejecting any empty block — a gap in the contiguous range means the
+//     merge is not block-dense), then scatter into a pooled scratch buffer, placing each ref at
+//     offsets[b] + (rowIdx - blockMin[b]) and claiming each global slot at most once.
+//
+// Density is verified WHILE scattering exactly as scatterDictRefIndexDense does: a slot collision
+// rejects a duplicate (block,row), and a per-block rank >= that block's ref count rejects a RowIdx
+// beyond the dense run (an in-block gap). On ANY violation — empty block, in-block gap, duplicate
+// row, or span overflow — it returns false WITHOUT mutating idx so the caller falls back to the
+// general radix sort, keeping the output byte-for-byte identical. In a dense permutation every
+// (block,row) is unique, so the Packed ordering is total (no ties) and the scatter yields exactly
+// the sorted order. The caller guarantees minBlk<=maxBlk via the build scan. NOTE-240.
+func scatterDictRefIndexMultiBlockDense(idx []RefIndexEntry, minBlk, maxBlk uint32) bool {
+	n := len(idx)
+	if n < 2 {
+		return true
+	}
+	// numBlocks must be small enough to allocate a per-block table cheaply; a pathological
+	// block span (e.g. minBlk=0, maxBlk huge) is rejected so we never allocate O(blockSpan)
+	// memory for a handful of refs. The span can be at most n blocks for a dense permutation
+	// anyway (each block holds >=1 ref), so reject up front when it exceeds n.
+	span := uint64(maxBlk) - uint64(minBlk) + 1
+	if span > uint64(n) {
+		return false
+	}
+	numBlocks := int(span) //nolint:gosec // span <= uint64(n) checked above; n is a slice len, fits int
+
+	// Pass 1: per-block ref count, min row, and (computed below) prefix offset. The three
+	// per-block tables share one backing allocation (counts | blkMin | offsets) to keep the
+	// scatter to a single small heap allocation regardless of block span.
+	const noMin = uint32(1) << 16
+	tables := make([]uint32, 3*numBlocks)
+	counts := tables[:numBlocks]
+	blkMin := tables[numBlocks : 2*numBlocks]
+	offsets := tables[2*numBlocks : 3*numBlocks]
+	for i := range blkMin {
+		blkMin[i] = noMin
+	}
+	for i := range idx {
+		b := int(idx[i].Packed>>16) - int(minBlk)
+		// b is in [0,numBlocks) because every Packed's high-16 is in [minBlk,maxBlk].
+		counts[b]++
+		if r := idx[i].Packed & 0xFFFF; r < blkMin[b] {
+			blkMin[b] = r
+		}
+	}
+
+	// Build prefix offsets and reject any empty block (a gap in the contiguous range means the
+	// merge is not block-dense). offsets[b] is the start slot of block b's run in the output.
+	var off uint32
+	for b := 0; b < numBlocks; b++ {
+		if counts[b] == 0 {
+			return false
+		}
+		offsets[b] = off
+		off += counts[b]
+	}
+
+	bufPtr := getRadixBuf(n)
+	buf := *bufPtr
+	const unclaimed = int32(-1)
+	for i := range buf {
+		buf[i].Pos = unclaimed
+	}
+	ok := true
+	for i := range idx {
+		b := int(idx[i].Packed>>16) - int(minBlk)
+		// row >= blkMin[b] always holds (blkMin[b] is the per-block minimum from pass 1), so
+		// rank is non-negative. A rank >= the block's ref count means a RowIdx beyond the dense
+		// run — i.e. a gap — so the block is not a dense permutation; reject.
+		rank := (idx[i].Packed & 0xFFFF) - blkMin[b]
+		if rank >= counts[b] {
+			ok = false
+			break
+		}
+		slot := offsets[b] + rank
+		if buf[slot].Pos != unclaimed {
+			ok = false
+			break
+		}
+		buf[slot] = idx[i]
+	}
+	if ok {
+		copy(idx, buf)
+	}
+	putRadixBuf(bufPtr)
+	return ok
+}
+
 // markDenseIfContiguous inspects the freshly-built (sorted) refIndex and enables the
 // NOTE-229 O(1) reverse-lookup fast path when the index is a dense contiguous single-block
 // RowIdx permutation: every entry shares one high-16 BlockIdx and the low-16 RowIdx values
@@ -486,10 +586,20 @@ func (col *IntrinsicColumn) EnsureRefIndex() {
 			// this same build scan so the non-dense radix branches skip their first count pass.
 			// The dense rank-scatter branch (NOTE-226) ignores them; the per-ref array store is
 			// negligible against the existing memory-bound append.
+			// NOTE-240: also track the block-index span (minBlk/maxBlk). When the column
+			// spans multiple blocks (singleBlock==false) the dense single-block scatter
+			// (NOTE-226) and the low-16 sort (NOTE-228) cannot fire, so a merged dict column
+			// falls all the way to the general four-pass radix. But a merge of fully-present
+			// blocks is still a *block-bucketed* dense permutation: the blocks are a
+			// contiguous range and within each block the RowIdx values are a dense
+			// permutation, so the sorted index is a per-block rank scatter. We record the
+			// block span here so scatterDictRefIndexMultiBlockDense can attempt that O(N)
+			// scatter before paying the general sort.
 			sorted := true
 			singleBlock := true
 			var prev uint32
 			var hi16, minRow, maxRow, keyOr uint32
+			var minBlk, maxBlk uint32
 			var hist0 [1 << radixBitsRefIndex]int
 			first := true
 			for entryIdx, entry := range col.DictEntries {
@@ -501,16 +611,24 @@ func (col *IntrinsicColumn) EnsureRefIndex() {
 					})
 					keyOr |= p
 					hist0[p&((1<<radixBitsRefIndex)-1)]++
+					b := p >> 16
 					if first {
-						hi16 = p >> 16
+						hi16 = b
+						minBlk = b
+						maxBlk = b
 						minRow = p & 0xFFFF
 						maxRow = minRow
 					} else {
 						if p < prev {
 							sorted = false
 						}
-						if p>>16 != hi16 {
+						if b != hi16 {
 							singleBlock = false
+						}
+						if b < minBlk {
+							minBlk = b
+						} else if b > maxBlk {
+							maxBlk = b
 						}
 						if r := p & 0xFFFF; r < minRow {
 							minRow = r
@@ -541,7 +659,15 @@ func (col *IntrinsicColumn) EnsureRefIndex() {
 				// high-16 BlockIdx is constant, so only the low-16 needs sorting.
 				radixSortRefIndexLow16Prepared(idx, keyOr&0xFFFF, &hist0)
 			default:
-				radixSortRefIndexPrepared(idx, keyOr, &hist0)
+				// NOTE-240: multi-block merge. Attempt the block-bucketed dense scatter
+				// (each block's rows a dense permutation, blocks a contiguous range) before
+				// the general four-pass radix. scatterDictRefIndexMultiBlockDense verifies
+				// every density invariant while it works and reports false (without mutating
+				// idx) on any gap/duplicate/overflow, so a genuinely sparse or non-contiguous
+				// merge is byte-for-byte identical to the general sort.
+				if !scatterDictRefIndexMultiBlockDense(idx, minBlk, maxBlk) {
+					radixSortRefIndexPrepared(idx, keyOr, &hist0)
+				}
 			}
 			col.refIndex = idx
 			col.markDenseIfContiguous()

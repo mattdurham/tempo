@@ -1323,3 +1323,56 @@ the reduced GC scavenging — confirming the pooling is a strict win, not a trad
 
 Back-ref: `internal/modules/blockio/shared/intrinsic_codec.go:decodeBoundedSnappyColumnInto`,
 the five `scan*Paged*` functions, NOTE-012 (`AcquireIntrinsicBuf` pool this reuses).
+
+---
+
+## NOTE-240: EnsureRefIndex dict path — block-bucketed multi-block dense rank scatter
+*Added: 2026-06-12*
+
+NOTE-226 added a dense rank scatter for the **single-block** dict path (every ref shares one
+high-16 BlockIdx; the low-16 RowIdx values are a dense permutation). NOTE-228 narrowed the
+remaining single-block fallback to a low-16-only sort. Genuine **multi-block** dict merges,
+however, still fell all the way to the general four-pass `radixSortRefIndexPrepared` — which a
+querier CPU profile (2026-06-12) confirmed is still the largest blockpack-attributable self-time
+frame (~2.56% self-time, reached from the dict `EnsureRefIndex` build). The flat/XOR/Delta path
+never reaches the general radix (its multi-block append stays globally monotonic, so the NOTE-168
+`sorted` check fires); only the dict multi-block merge does, because dict entries interleave.
+
+**Observation:** a merge of *fully-present* dict columns is a **block-bucketed dense permutation**.
+The blocks form a contiguous range `[minBlk, maxBlk]`, and within each block the present rows are a
+dense permutation `[blockMin, blockMin+blockCount)`. The sorted index is therefore a per-block rank
+scatter: block `b`'s sorted run begins at the prefix-sum of all preceding blocks' ref counts, and
+within that run each ref lands at `rowIdx - blockMin[b]`. That is strictly O(N) — no histogram over
+the full 32-bit key, no multi-pass double-buffer — versus the four LSD passes the general radix runs
+when the high bytes are non-zero and varying.
+
+**`scatterDictRefIndexMultiBlockDense`** does two linear passes plus O(numBlocks) bookkeeping:
+1. per-block ref count and per-block min row (one scan; `b = (Packed>>16) - minBlk` is in range
+   because every high-16 is in `[minBlk,maxBlk]`, tracked by the build scan);
+2. build prefix offsets — **rejecting any empty block** (a gap in the block range ⇒ not block-dense);
+   then scatter into a pooled non-zeroed scratch buffer (the same NOTE-192 pool), placing each ref at
+   `offsets[b] + (rowIdx - blockMin[b])` and **claiming each slot at most once** (a collision ⇒
+   duplicate `(block,row)` ⇒ not a permutation). A rank `>= counts[b]` means a RowIdx beyond the
+   dense run (an in-block gap), also rejected.
+
+The three per-block tables (`counts | blkMin | offsets`) share **one** backing allocation, so the
+scatter adds a single small heap allocation regardless of block span. The block span is rejected up
+front when `maxBlk-minBlk+1 > n` (a dense permutation has ≥1 ref per block, so the span can never
+exceed `n`), which also bounds that allocation.
+
+**Safety / why output-identical:** in a dense permutation every `(block,row)` is unique, so there are
+no ties — the Packed ordering is total and the scatter produces exactly the sorted order. On **any**
+violation (empty block, in-block gap, duplicate row, span overflow) the function returns false
+WITHOUT mutating `idx`, and the caller falls back to `radixSortRefIndexPrepared` on the original
+append order — byte-for-byte identical to prior behavior for sparse/optional/non-contiguous merges.
+The scatter is taken only on the `default` (multi-block) branch, so single-block routing (NOTE-226 /
+NOTE-228) is unchanged. Tests: `TestEnsureRefIndex_DictMultiBlockDenseEqualsRadix` (dense merge with
+differing per-block min rows), `...MultiBlockSparseFallsBack` (in-block gap),
+`...MultiBlockGapBlockFallsBack` (a missing block), `TestScatterDictRefIndexMultiBlockDense_RejectsDuplicate`.
+
+**Verified:** `go test -race ./blockio/shared ./blockio/reader ./executor` green. Microbench
+`BenchmarkMultiBlockDenseScatter` (32 blocks × 2000 dense rows = 64K refs, block-then-shuffled-row
+append): scatter ~275µs vs general radix ~525µs (≈1.9×), 1 alloc/op.
+
+Back-ref: `internal/modules/blockio/shared/intrinsic_ref_index.go:scatterDictRefIndexMultiBlockDense`,
+NOTE-226 (single-block dense scatter), NOTE-192 (pooled radix scratch).
