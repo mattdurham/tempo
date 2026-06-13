@@ -638,10 +638,21 @@ func (r *Reader) getCachedBlockToc(blockOff int64) *blockColTypes {
 // which sub-slices the transient ToC buffer — is deep-copied into a private backing array to
 // avoid aliasing memcache-owned bytes that may be recycled after this read.
 func (r *Reader) cacheBlockColTypes(blockOff int64, metas []colMetaEntry, tocEnd int) {
-	if r.fileID == "" || len(metas) == 0 {
+	cacheParsedBlockColTypes(r.fileID, uint64(blockOff), metas, tocEnd) //nolint:gosec
+}
+
+// cacheParsedBlockColTypes stores the block's fully-parsed ToC (metas + tocEnd) in
+// blockColTypesCache, keyed by fileID+blockOffset. Idempotent: a no-op if already cached or
+// when fileID is empty / metas is empty. Shared by the columnar-read path (NOTE-241) and the
+// parser (NOTE-242) so both populate the same cache on a first parse and either may serve a
+// later warm read from it. The cached metas are shared READ-ONLY across queries, so any inline
+// column's inlineData — which sub-slices the transient ToC buffer — is deep-copied into a private
+// backing array to avoid aliasing memcache-owned bytes that may be recycled after this read.
+func cacheParsedBlockColTypes(fileID string, blockOff uint64, metas []colMetaEntry, tocEnd int) {
+	if fileID == "" || len(metas) == 0 {
 		return
 	}
-	key := blockColTypesCacheKey(r.fileID, uint64(blockOff)) //nolint:gosec
+	key := blockColTypesCacheKey(fileID, blockOff)
 	if blockColTypesCache.Get(key) != nil {
 		return // already cached for this block
 	}

@@ -1504,6 +1504,48 @@ Back-ref: `columnar_read.go:getCachedBlockToc`/`cacheBlockColTypes`, `parser.go:
 `typesFor`, NOTE-214 (the colTypes cache this extends), NOTE-213 (the sizing loop that consumes
 the metas), NOTE-200 (the decoded cache the prune probes).
 
+## NOTE-242: reuse the cached parsed ToC inside the parser too (skip the SECOND re-parse) — 2026-06-12
+
+**Decision:** NOTE-241 cached the parsed `[]colMetaEntry` so `readBlockColumnarWithCache` could skip
+`parseColumnMetadataArray` on a warm read. But that elided only ONE of the TWO per-query parses of
+the same ToC: `parseBlockColumnsReuse` (called by `ParseBlockFromBytes`/`...WithIntern` right after
+the columnar read, on the SAME block) still re-ran `parseBlockHeader` + `parseColumnMetadataArray`
+unconditionally — re-decoding hundreds of metadata entries and allocating one `string(name)` per
+column plus the entries slice all over again. So for trace blocks with hundreds of columns the
+identical, deterministic ToC parse ran twice per warm query (once in the reader's sizing/prune pass,
+once in the parser). NOTE-241's NEXT-TARGET line called this out. NOTE-242 closes it: the parser now
+probes the same `blockColTypesCache` and, on a hit, reuses the shared READ-ONLY metas.
+
+**Mechanism:** factored `cacheBlockColTypes`'s body into a package-level `cacheParsedBlockColTypes(
+fileID, blockOff, metas, tocEnd)` (the Reader method now delegates to it). `parseBlockColumnsReuse`
+still parses the 24-byte header (cheap, alloc-free — needed for `spanCount`/`columnCount`), then
+probes `blockColTypesCache.Get(blockColTypesCacheKey(fileID, meta.Offset))`. On a hit it reuses
+`cached.metas` and skips `parseColumnMetadataArray`; on a miss it parses, caches via
+`cacheParsedBlockColTypes`, and proceeds. Both the reader and the parser now populate AND serve from
+the one shared cache, so whichever touches a block first warms it for the other.
+
+**Correctness:** `meta.Offset` is the block's stable byte offset — the exact key the reader uses
+(`blockOff`) and the same offset the parser already uses for `v8ColumnCacheKey`/`preDecodedKey`, so
+reader-cached and parser-cached entries collide on the same key (intended). The parser only READS
+`metas` (`m.name`/`m.colType`/`m.dataOffset`/`m.compressedLen`/`m.uncompressedLen`/`m.inlineData`) —
+verified no use site mutates an entry or the slice — so sharing the immutable cached slice is
+race-free across concurrent block-group workers. V15 inline columns' `inlineData` aliasing is handled
+by `cacheParsedBlockColTypes`'s deep-copy (carried over from NOTE-241), so a cached inline column's
+bytes outlive the recycled ToC/assembled buffer; `resolveColumnData` returns that private copy
+unchanged. `dataOffset` is an ABSOLUTE block offset, identical whether the metas came from a fresh
+parse, a fallback full-block read, or a columnar assembled buffer, so the reused metas address the
+same bytes in any `rawBytes` the parser is handed. On a cold read (cache miss / empty fileID) the
+parse runs exactly as before — byte-for-byte identical output.
+
+**Verified:** `go test -race ./blockio/reader ./executor` green incl. the warm-path equivalence +
+prune suite (`TestParsedV8ColumnCache_WarmEqualsCold`, `_LazyWarmEqualsCold`,
+`TestReader_CombinedTocColumnFetch_WarmIdentical`, `_PreDecodedColumns_SkipCopyStillCorrect`,
+`_PrunePreDecodedFromFetch_NoBlobFetch`) — unchanged-green, confirming the parser's cached-metas read
+returns identical values to a fresh parse.
+
+Back-ref: `block_parser.go:parseBlockColumnsReuse`, `columnar_read.go:cacheParsedBlockColTypes`/
+`cacheBlockColTypes`, NOTE-241 (the cache + reader-side skip this extends to the parser).
+
 ## NOTE-AP-001: AllPresent encoding kinds — free presence on the decode path
 
 The writer (writer NOTE-AP-001) emits AllPresent encoding kinds (15–21) for fully-present dense

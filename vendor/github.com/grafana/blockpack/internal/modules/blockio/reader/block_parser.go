@@ -269,6 +269,32 @@ func (b *Block) ReleaseLazyColumnStore() {
 	b.lazyColumnStore = nil
 }
 
+// resolveBlockColMetas returns the block's column-metadata array, reusing the per-block parsed
+// ToC cached by NOTE-241/242 (blockColTypesCache) when present and parsing + caching it otherwise.
+// On a hit the returned slice is the shared READ-ONLY cached metas; callers must not mutate it (the
+// parser only reads entries). On a miss it parses parseColumnMetadataArray from rawBytes at offset 24
+// and caches the result keyed by fileID+blockOff so a later warm read (reader or parser) skips the
+// re-parse. fileID == "" disables the cache, parsing on every call as before. NOTE-242.
+func resolveBlockColMetas(
+	rawBytes []byte,
+	fileID string,
+	blockOff uint64,
+	colCount int,
+	blockVersion uint8,
+) ([]colMetaEntry, error) {
+	if fileID != "" {
+		if cached := blockColTypesCache.Get(blockColTypesCacheKey(fileID, blockOff)); cached != nil {
+			return cached.metas, nil
+		}
+	}
+	metas, tocEnd, err := parseColumnMetadataArray(rawBytes, 24, colCount, blockVersion)
+	if err != nil {
+		return nil, fmt.Errorf("parseBlock: column metadata: %w", err)
+	}
+	cacheParsedBlockColTypes(fileID, blockOff, metas, tocEnd)
+	return metas, nil
+}
+
 func parseBlockColumnsReuse(
 	rawBytes []byte,
 	wantColumns map[string]struct{},
@@ -300,9 +326,20 @@ func parseBlockColumnsReuse(
 	spanCount := int(hdr.spanCount)
 	colCount := int(hdr.columnCount)
 
-	metas, _, err := parseColumnMetadataArray(rawBytes, 24, colCount, hdr.version)
+	// NOTE-242: reuse the per-block parsed column-metadata array if an earlier read cached
+	// it (blockColTypesCache, populated at first ToC parse by NOTE-241). parseColumnMetadataArray
+	// re-decodes every metadata entry from the ToC bytes and allocates one string(name) per
+	// column plus the entries slice — all deterministic for a given block. NOTE-241 cached this
+	// exact slice for the columnar-read sizing/prune pass but the parser still re-parsed it on
+	// every warm block read, so for trace blocks with hundreds of columns the same allocation ran
+	// twice per query. Probing the cache here elides the parser's copy of that work too; on a hit
+	// the shared READ-ONLY metas are reused (the parser never mutates an entry — verified all use
+	// sites read m.name/m.colType/m.dataOffset/etc. only). The header is still parsed (cheap,
+	// alloc-free) for spanCount/columnCount. On a miss (cold block, no fileID) we parse + cache as
+	// before, so the result is byte-for-byte identical.
+	metas, err := resolveBlockColMetas(rawBytes, fileID, meta.Offset, colCount, hdr.version)
 	if err != nil {
-		return nil, fmt.Errorf("parseBlock: column metadata: %w", err)
+		return nil, err
 	}
 
 	var columns map[shared.ColumnKey]*Column
