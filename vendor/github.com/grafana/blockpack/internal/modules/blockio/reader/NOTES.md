@@ -1996,3 +1996,32 @@ budgeted through `traceSparseIndex.SizeBytes` (now `len*4 + 16`).
 
 Back-ref: `reader/trace_index.go:scanTraceIndexRaw`, `:buildTraceIdxSamples`;
 `reader/compacttraceindex.go:traceIdxOffsets`; `reader/parser.go:traceSparseIndex`.
+
+### NOTE-268: inline the v2 fixed-stride entry walk in buildTraceIdxSamples
+
+`buildTraceIdxSamples` (the once-per-section dense-offset-index build behind NOTE-267) called
+the non-inlinable `traceEntryStride` once per trace entry and `append`-ed each offset into a
+growing slice. On the 2026-06-13 querier profile this build was the largest blockpack-controllable
+CPU sink after `snappy.decode`: `traceEntryStride` ~1.79% + `buildTraceIdxSamples` ~0.91% self-time
+(~2.7% combined), all paid the first time a bloom-hit trace-resolution query (Q5/Q7/Q9/M6/M9)
+touches a section before the NOTE-265 process cache is warm for it.
+
+**Mechanism:** the v2 wire format (`TraceIndexFmtVersion2`, the current writer format) has a
+fixed-shape entry — `trace_id[16] + block_ref_count[2] + block_ref_count×block_id[2]` — so its
+stride is `18 + blockRefCount*2`, computable inline with a single `Uint16` load. Specialising the
+walk loop for v2 (a) drops the per-entry function call into `traceEntryStride`, and (b) pre-extends
+`offsets` to exactly `traceCount` and stores by index, so the store check is discharged from the
+`for i := range offsets` loop bound rather than paying an append cap-check + length update per entry.
+The v1 legacy format (variable-stride entries with per-block span indices) keeps the generic
+`traceEntryStride` call on the unchanged fallback loop.
+
+**Correctness:** byte-for-byte identical offsets to the prior `traceEntryStride`-driven walk. The
+v2 fast path validates the full entry extent per iteration — the 18-byte header bound before reading
+`block_ref_count`, then `pos > n` after advancing past the refs — exactly the two bounds
+`traceEntryStride` checked (`pos+18 > len(data)` and `p > len(data)`), so a malformed entry still
+returns `ok=false` and the lookup falls back to the unchanged linear scan from the table start.
+Pre-sizing to `traceCount` allocates the same total bytes the `make([]int32, 0, traceCount)` + grow
+would have. `go test -race ./blockio/reader ./executor` green incl. the NOTE-260/267 sparse-index
+tests and `TestScanTraceIndexRaw_ProcessCacheWarmEqualsCold`.
+
+Back-ref: `reader/trace_index.go:buildTraceIdxSamples`.

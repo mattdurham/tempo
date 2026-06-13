@@ -353,18 +353,16 @@ func (ci *compactTraceIndex) scanTraceIndexRaw(fileID string, traceID [16]byte) 
 			pos := int(offs[mid])
 			entryHi := binary.BigEndian.Uint64(data[pos : pos+8])
 			entryLo := binary.BigEndian.Uint64(data[pos+8 : pos+16])
-			if entryHi == targetHi {
-				if entryLo == targetLo {
-					return decodeTraceEntryBlocks(data, pos, fmtVersion)
-				}
-				if entryLo < targetLo {
-					lo = mid + 1
-				} else {
-					hi = mid
-				}
-			} else if entryHi < targetHi {
+			switch {
+			case entryHi < targetHi:
 				lo = mid + 1
-			} else {
+			case entryHi > targetHi:
+				hi = mid
+			case entryLo == targetLo:
+				return decodeTraceEntryBlocks(data, pos, fmtVersion)
+			case entryLo < targetLo:
+				lo = mid + 1
+			default:
 				hi = mid
 			}
 		}
@@ -445,13 +443,47 @@ func buildTraceIdxSamples(data []byte, fmtVersion uint8) (offsets []int32, ok bo
 	if traceCount == 0 {
 		return nil, true
 	}
-	offsets = make([]int32, 0, traceCount)
+	// NOTE-268: pre-extend the offsets slice to exactly traceCount and store by index
+	// instead of append, and inline the v2 (block-IDs-only) per-entry stride directly
+	// into the walk loop rather than calling the non-inlinable traceEntryStride per entry.
+	// This build runs once per distinct trace-index section (amortized across Readers by
+	// the NOTE-265 process cache) but was still ~2.7% combined querier self-time on the
+	// 2026-06-13 profile (buildTraceIdxSamples ~0.91% + the traceEntryStride it called per
+	// entry ~1.79%) — a real CPU sink on bloom-hit trace-resolution queries (Q5/Q7/Q9/M6/M9)
+	// whenever a section is first touched. The v2 layout (the current writer format) has a
+	// fixed-shape entry — trace_id[16] + block_ref_count[2] + block_ref_count×block_id[2] —
+	// so its stride is 18+blockRefCount*2 with a single bounds check per entry, with no
+	// function-call overhead and the offsets store discharged from the loop bound. v1
+	// (legacy variable-stride entries with per-block span indices) keeps the generic
+	// traceEntryStride call.
+	offsets = make([]int32, traceCount)
 	pos := 5
-	for range traceCount {
+	if fmtVersion == shared.TraceIndexFmtVersion2 {
+		n := len(data)
+		for i := range offsets {
+			// Header (trace_id[16] + block_ref_count[2]) must be fully in bounds before
+			// we read block_ref_count, and the entry's refs (block_ref_count×block_id[2])
+			// must not overrun the section — the same validation traceEntryStride performed
+			// per entry. Checking the full entry extent here keeps every recorded offset
+			// pointing at a real, in-bounds entry header (the binary search relies on each
+			// offset's 16-byte trace ID being readable and the entries staying sorted).
+			if pos+18 > n {
+				return nil, false // malformed
+			}
+			offsets[i] = int32(pos) //nolint:gosec // pos < len(data) <= ~15 MB < 2^31
+			blockRefCount := int(binary.LittleEndian.Uint16(data[pos+16:]))
+			pos += 18 + blockRefCount*2
+			if pos > n {
+				return nil, false // entry's refs overran the section
+			}
+		}
+		return offsets, true
+	}
+	for i := range offsets {
 		if pos+18 > len(data) {
 			return nil, false // malformed
 		}
-		offsets = append(offsets, int32(pos)) //nolint:gosec // pos < len(data) <= ~15 MB < 2^31
+		offsets[i] = int32(pos) //nolint:gosec // pos < len(data) <= ~15 MB < 2^31
 		stride, strideOK := traceEntryStride(data, pos, fmtVersion)
 		if !strideOK {
 			return nil, false // malformed
