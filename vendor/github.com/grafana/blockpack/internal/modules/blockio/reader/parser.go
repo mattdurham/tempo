@@ -84,14 +84,14 @@ var parsedTraceSparseCache objectcache.Cache[traceSparseIndex]
 // malformed entry caches ok=false so the lookup falls back to a full linear scan without
 // re-attempting (and re-failing) the walk on every query.
 type traceSparseIndex struct {
-	samples []traceIdxSample
+	offsets []int32
 	ok      bool
 }
 
 // SizeBytes estimates the in-memory size of the sparse index for objectcache LRU budgeting.
 func (t *traceSparseIndex) SizeBytes() int64 {
-	// Each traceIdxSample is [16]byte + int offset = 24 bytes.
-	return int64(len(t.samples))*24 + 16
+	// Each entry is one int32 byte offset = 4 bytes.
+	return int64(len(t.offsets))*4 + 16
 }
 
 // blockColTypes holds a block's fully-parsed ToC: the column-metadata array (in wire order)

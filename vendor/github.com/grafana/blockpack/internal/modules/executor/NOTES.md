@@ -4953,3 +4953,21 @@ loops — no benchmark-specific constants. **Queries affected:** M1/M4/M6/M9 (co
 loops, AND-mask) and M8 (histogram boundary lookup + scan loops, both).
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:frexpExpPos`, `pow2Floor`,
 `boundaryIndexer.index`, `boundaryIndexer.lookup`, `ctxCheckInterval`, `ctxCheckMask`.
+
+## NOTE-266: hoist per-boundary string formatting out of the group loop in the histogram flat emit
+
+`streamByRefSliceHistogramFlatEmit` walks the flat histogram accumulator as a triple loop over
+(group, boundary, timeStep) and builds the composite map key `timeIdx\x00gk\x00boundaryStr` per
+non-zero cell. The boundary string `strconv.FormatFloat(boundary, 'g', -1, 64)` depends only on
+the boundary index `bIdx`, never on the group or time index, yet it was computed inside the
+group loop — recomputing the same `numBoundaries` conversions once per group. For group-by
+histogram queries with many output series this is `O(numGroups*numBoundaries)` redundant
+FormatFloat calls.
+
+Precompute the boundary strings once into a `[]string` indexed by `bIdx` before the group loop,
+then index it in the inner loop. The emitted map keys are byte-identical (same FormatFloat
+output, same key layout), so all bucket counts and the downstream `traceHistogramSeries` parsing
+are unchanged. This is `O(numBoundaries)` FormatFloat calls total. General to any group-by
+histogram_over_time query; no benchmark-specific constants.
+
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:streamByRefSliceHistogramFlatEmit`.

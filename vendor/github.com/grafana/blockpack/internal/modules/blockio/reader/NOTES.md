@@ -1960,3 +1960,39 @@ incl. the NOTE-260 sparse-index tests (`TestScanTraceIndexRaw_SparseMatchesLinea
 
 Back-ref: `reader/trace_index.go:scanTraceIndexRaw`, `:ensureTraceIdxSamples`,
 `:buildTraceIdxSamples`; `reader/parser.go:parsedTraceSparseCache`, `:traceSparseIndex`.
+
+### NOTE-267: dense per-entry offset index for trace-ID lookups (replaces NOTE-260 sparse window scan)
+
+**What:** `scanTraceIndexRaw` now binary-searches a *dense* offset index that records the
+byte offset of EVERY trace entry (`traceIdxOffsets []int32`), reading each probe's 16-byte
+trace ID directly from `traceIndexRaw`. The previous NOTE-260 design stored a sample every
+`traceIdxSampleStride` (64) entries, binary-searched the samples to bound the scan to one
+stride window, then strode *linearly* through up to 64 entries calling `traceEntryStride`
+per entry to advance. `traceEntryStride` (a per-block-ref / per-span-count walk on the v1
+layout) was ~2% querier self-time on the 2026-06-13 profile — entirely this per-lookup
+striding.
+
+**Mechanism:** the build pass (`buildTraceIdxSamples`) already calls `traceEntryStride` once
+per entry to walk the variable-stride table, so recording every offset instead of every 64th
+adds no build cost — it just keeps the offsets it was already computing. The lookup then
+becomes a pure O(log n) binary search: each probe is two 8-byte big-endian loads + integer
+compares (NOTE-261 uint64-pair comparison), **zero** `traceEntryStride` calls. The
+process-level `parsedTraceSparseCache` (NOTE-265) amortises the one-time build across Readers
+for the same `fileID + length`, so the dense walk runs at most once per section.
+
+**Correctness:** offsets are plain `int32` byte positions into `traceIndexRaw` (the section
+is ≤ ~15 MB, well under 2^31), so they do not alias the raw bytes and are safe to share
+across Readers exactly as the NOTE-260/265 samples were. The binary search is a standard
+lower-bound over the writer's ascending trace-ID order; a malformed build leaves
+`traceIdxSampleOK == false` and the lookup falls back to the unchanged linear scan from the
+table start. `traceIDLess` (only used by the old sample binary search) and the
+`traceIdxSample` struct + `traceIdxSampleStride` const are deleted (dead). `go test -race
+./blockio/reader ./executor` green incl. the sparse-index tests (now asserting on
+`traceIdxOffsets`) and `TestScanTraceIndexRaw_ProcessCacheWarmEqualsCold`.
+
+**Memory:** 4 bytes/entry (one int32) vs the old ~0.375 bytes/entry (24-byte sample / 64).
+For 100k traces this is ~400 KB vs ~37 KB per cached section — a small, bounded increase
+budgeted through `traceSparseIndex.SizeBytes` (now `len*4 + 16`).
+
+Back-ref: `reader/trace_index.go:scanTraceIndexRaw`, `:buildTraceIdxSamples`;
+`reader/compacttraceindex.go:traceIdxOffsets`; `reader/parser.go:traceSparseIndex`.

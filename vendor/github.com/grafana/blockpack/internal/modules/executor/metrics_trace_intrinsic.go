@@ -4624,17 +4624,28 @@ func streamByRefSliceHistogramFlatEmit(
 	// callback emitter pattern (NOTE-067/073) in metrics_trace.go.
 	scratch := acquireCompositeKeyScratch()
 	defer releaseCompositeKeyScratch(scratch)
+	// NOTE-266: the per-boundary string only depends on bIdx, not on gIdx or timeIdx, yet the
+	// previous form recomputed strconv.FormatFloat inside the gIdx loop — i.e. once per group
+	// for every boundary, redundantly redoing the same numBoundaries conversions numGroups
+	// times. Hoist it to a single pass keyed by bIdx so each boundary string is formatted
+	// exactly once (O(numBoundaries) instead of O(numGroups*numBoundaries) FormatFloat calls).
+	// The map keys produced are byte-identical, so all bucket counts and downstream parsing
+	// are unchanged.
+	boundaryStrs := make([]string, numBoundaries)
+	for bIdx := int64(0); bIdx < numBoundaries; bIdx++ {
+		var boundary float64
+		if bIdx > 0 && int(bIdx-1) < len(boundaries) { //nolint:gosec
+			boundary = boundaries[bIdx-1]
+		}
+		boundaryStrs[bIdx] = strconv.FormatFloat(boundary, 'g', -1, 64)
+	}
 	for gIdx := int64(0); gIdx < int64(numGroups); gIdx++ { //nolint:gosec
 		gk := ""
 		if int(gIdx) < len(dict) { //nolint:gosec
 			gk = dict[gIdx]
 		}
 		for bIdx := int64(0); bIdx < numBoundaries; bIdx++ {
-			var boundary float64
-			if bIdx > 0 && int(bIdx-1) < len(boundaries) { //nolint:gosec
-				boundary = boundaries[bIdx-1]
-			}
-			boundaryStr := strconv.FormatFloat(boundary, 'g', -1, 64)
+			boundaryStr := boundaryStrs[bIdx]
 			base := gIdx*stride1 + bIdx*stride2
 			for timeIdx := int64(0); timeIdx < stride2; timeIdx++ {
 				count := groupCountsFlat[base+timeIdx]
