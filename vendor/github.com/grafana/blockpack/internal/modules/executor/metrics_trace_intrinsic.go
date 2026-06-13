@@ -3437,12 +3437,34 @@ func accumulateIntrinsicBucketsDirect(
 		return true, nil // no refs in time range
 	}
 
-	// Find maxPK from the time-range slice (single sequential scan, no array).
+	// Find min/max packKey from the time-range slice (single sequential scan, no array).
+	// NOTE-269: also track the minimum packKey so the count/rate path can rebase the dense
+	// bucketByPK array to span only [minSlicePK, maxPK] instead of [0, maxPK]. A blockpack file may
+	// hold several blocks; packKey = (blockIdx<<16)|rowIdx, so any block with blockIdx>0 puts
+	// a (blockIdx<<16) dead prefix in front of the live keys — wasted zeroing on every pooled
+	// acquire and a sparse gather array that thrashes cache during the per-ref bucket lookup.
 	var maxPK uint32
+	minSlicePK := ^uint32(0)
 	for _, ref := range tsCol.BlockRefs[lo:hi] {
-		if pk := packKey(ref.BlockIdx, ref.RowIdx); pk > maxPK {
+		pk := packKey(ref.BlockIdx, ref.RowIdx)
+		if pk > maxPK {
 			maxPK = pk
 		}
+		if pk < minSlicePK {
+			minSlicePK = pk
+		}
+	}
+
+	// NOTE-269: rebase the dense pk-indexed arrays for the count/rate path. For count/rate the
+	// only pk-keyed structure is bucketByPK and every access in this function and in
+	// accumulateCountRateDirect is guarded by [minPK, maxPK], so we can subtract a constant
+	// pkOffset from every index and size the array to span just [pkOffset, maxPK]. The
+	// histogram/agg paths share several pk-indexed dense arrays (dictByPK, seenByPK) and
+	// pass maxPK into helper scanners that index by raw pk, so they keep pkOffset==0 and are
+	// byte-identical to before.
+	var pkOffset uint32
+	if isCountRate {
+		pkOffset = minSlicePK
 	}
 
 	// NOTE-090: guard against oversized dense arrays from sparse block layouts.
@@ -3454,22 +3476,25 @@ func accumulateIntrinsicBucketsDirect(
 	// is far more memory-efficient.
 	// NOTE-115: bucketByPK stores bk+1 (1..numSteps ≤ 1440) or 0 (absent). numSteps ≤ 1440
 	// fits in int16 (max 32767), so int16 saves 75% vs int64 with identical semantics.
+	// NOTE-269: span is maxPK-pkOffset, so count/rate is capped on the rebased (live) span.
+	span := maxPK - pkOffset
 	const maxDirectArrayEntries = 16_000_000
-	if int64(maxPK)+1 > maxDirectArrayEntries { //nolint:gosec
+	if int64(span)+1 > maxDirectArrayEntries { //nolint:gosec
 		return false, nil
 	}
 
 	// NOTE-117/NOTE-131: route to compact path when dictByPK or bucketByPK exceeds L3.
-	if directAggExceedsL3Threshold(isCountRate, agg.Function, maxPK) {
+	if directAggExceedsL3Threshold(isCountRate, agg.Function, span) {
 		return false, nil
 	}
 
 	// Build bucketByPK directly — no inRangeRefs materialized.
-	// Always allocate even when maxPK==0 (packKey=0 is a valid span key).
+	// Always allocate even when span==0 (a single live packKey is valid).
 	// NOTE-091: stepCounts[bk] tracks total in-range spans per time bucket.
 	// Used by accumulateCountRateDirect to compute absent-group counts in
 	// O(numSteps×numGroups) instead of O(maxPK), and eliminates seenByPK.
-	bucketByPK := acquireDirectInt16(int(maxPK) + 1) // NOTE-129
+	// NOTE-269: bucketByPK is indexed by (pk - pkOffset) for count/rate (pkOffset==0 otherwise).
+	bucketByPK := acquireDirectInt16(int(span) + 1) // NOTE-129
 	defer releaseDirectInt16(bucketByPK)
 	stepCounts := make([]int64, numSteps)
 	inRangeCount := 0
@@ -3481,7 +3506,7 @@ func accumulateIntrinsicBucketsDirect(
 		}
 		bk := timeBucketIndex(int64(tsCol.Uint64Values[lo+i]), tb.StartTime, tb.StepSizeNanos) //nolint:gosec
 		if bk >= 0 && bk < numSteps {
-			bucketByPK[pk] = int16(bk + 1) //nolint:gosec // bk+1 ≤ numSteps ≤ 1440, fits int16
+			bucketByPK[pk-pkOffset] = int16(bk + 1) //nolint:gosec // bk+1 ≤ numSteps ≤ 1440, fits int16
 			stepCounts[bk]++
 			inRangeCount++
 			if pk < minPK {
@@ -3556,6 +3581,7 @@ func accumulateIntrinsicBucketsDirect(
 			groupByCol,
 			entryGIdx,
 			bucketByPK,
+			pkOffset,
 			minPK,
 			maxPK,
 			inRangeCount,
@@ -3590,6 +3616,7 @@ func accumulateCountRateDirect(
 	groupByCol *modules_shared.IntrinsicColumn,
 	entryGIdx []uint32,
 	bucketByPK []int16,
+	pkOffset uint32, // NOTE-269: bucketByPK is indexed by (pk - pkOffset)
 	minPK uint32,
 	maxPK uint32,
 	inRangeCount int,
@@ -3631,7 +3658,7 @@ func accumulateCountRateDirect(
 			if pk < minPK || pk > maxPK {
 				continue
 			}
-			bk := int64(bucketByPK[pk])
+			bk := int64(bucketByPK[pk-pkOffset]) // NOTE-269: rebased index
 			if bk == 0 {
 				continue
 			}

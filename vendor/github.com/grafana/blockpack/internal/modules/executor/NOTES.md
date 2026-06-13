@@ -4971,3 +4971,30 @@ are unchanged. This is `O(numBoundaries)` FormatFloat calls total. General to an
 histogram_over_time query; no benchmark-specific constants.
 
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:streamByRefSliceHistogramFlatEmit`.
+
+## NOTE-269: rebase the count/rate direct-path bucketByPK array to span only [minPK, maxPK]
+
+`accumulateIntrinsicBucketsDirect` sizes its dense `bucketByPK` (an `int16` keyed by
+`packKey = (blockIdx<<16)|rowIdx`) to `maxPK+1` over the time-range slice. A blockpack file
+may contain several internal blocks, so any block with `blockIdx>0` puts a `blockIdx<<16`
+dead prefix in front of the live keys: the prefix is zeroed on every pooled `acquireDirectInt16`
+and is never read, and the live keys sit at a high, sparse offset that thrashes cache during the
+per-ref `bucketByPK[pk]` gather in `accumulateCountRateDirect` (the M4/M9 hot loop — `{} | rate()
+by` and `{pred} | rate() by` walk every span ref).
+
+For the count/rate path the ONLY pk-keyed structure is `bucketByPK`, and every access in both
+`accumulateIntrinsicBucketsDirect` and `accumulateCountRateDirect` is guarded by `[minPK, maxPK]`.
+So we track the minimum packKey (`minSlicePK`) in the same single sequential scan that already
+finds `maxPK`, set `pkOffset = minSlicePK`, size the array to `maxPK - pkOffset + 1`, and index
+it by `pk - pkOffset` everywhere. The oversize cap (`maxDirectArrayEntries`) and the L3-threshold
+check (`directAggExceedsL3Threshold`) now operate on the rebased `span = maxPK - pkOffset`, so a
+file whose live keys fit but whose raw `maxPK` exceeded the cap can now stay on the fast direct
+path instead of falling back to the compact keymap. Output is byte-identical (the rebase is a
+pure index shift; the in-range guards are unchanged). The histogram/agg paths share several
+pk-indexed dense arrays (`dictByPK`, `seenByPK`) and pass `maxPK` into helper scanners that index
+by raw pk, so they keep `pkOffset==0` and remain byte-identical to before.
+
+No benchmark-specific constants — a general structural reduction in zeroing volume, memory
+footprint, and gather cache-miss rate on the most common metrics group-by shape.
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:accumulateIntrinsicBucketsDirect`,
+`accumulateCountRateDirect`. Test: `TestAccumulateCountRateDirect_MultiBlock_RebaseByteEquivalence`.
