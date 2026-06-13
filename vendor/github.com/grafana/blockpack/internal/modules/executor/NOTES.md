@@ -5032,3 +5032,37 @@ and this change is neutral (still 0 allocs) — never a regression. The win mate
 large enough for the byID map to escape (~50+ spans), the worst case for the old per-trace make.
 Back-ref: `internal/modules/executor/stream_structural.go:resolveStructuralParentIndices`.
 Test: `stream_structural_internal_test.go:TestResolveStructuralParentIndices_MultiTraceNoLeak`.
+
+## NOTE-272: flat-backed groupBuckets matrix for high-cardinality intrinsic group-by aggregation
+
+The general-aggregate (min/max/sum/avg) intrinsic group-by accumulation paths —
+`streamAggN1Compact`, `streamAggN1CompactFromRefs`, and `accumulateAggDirect` in
+`metrics_trace_intrinsic.go` — materialise a `numGroups × numSteps` matrix of
+`*aggBucketState` to hold the per-(group, timestep) accumulator. The previous form
+allocated this matrix as `numGroups + 1` separate heap allocations: one outer
+`make([][]*aggBucketState, numGroups)` plus one `make([]*aggBucketState, numSteps)` per
+group row. On a high-cardinality group-by (hundreds–thousands of distinct group values, the
+shape of `... by (<high-card attr>)`) that is `numGroups` individual allocations per query
+whose only purpose is to carve the same `numGroups*numSteps` pointer slots.
+
+`makeGroupBuckets` (in `aggbucketstate.go`) allocates one flat backing
+`[]*aggBucketState` of `numGroups*numSteps` and reslices each row as a capacity-capped
+`flat[off:off+numSteps:off+numSteps]` window, collapsing the matrix to **two** allocations
+regardless of group count. Indexing (`groupBuckets[gIdx][bk-1]`) and the nil-cell emit walk
+are byte-for-byte unchanged: each row is a `[0:numSteps]` window into the flat array, so
+reads/writes land in the same logical cell. The backing is a `[]*aggBucketState`, so every
+pointer slot is zero-initialised, preserving the "nil until first write" cell contract the
+accumulation and emit loops rely on. The capacity cap means a stray future append on a row
+reallocates rather than clobbering the neighbouring row's storage (same safety contract as
+the NOTE-150 value/ref arenas).
+
+**Correctness:** identical series output — same cells, same nil-skip emit, same key
+formatting (NOTE-245 prefixes). No benchmark-specific constants; a pure allocation-count
+reduction proportional to the group count.
+
+**Measured (microbench `BenchmarkIntrinsicMaxGroupBy_HighCard`, 800 groups × many steps):**
+~25,619 → ~24,821 allocs/op (≈ −800 allocs/op, exactly the eliminated per-row slice
+allocations), 1,467,623 → 1,463,160 B/op; wall-clock within noise (~3.5 ms). For low group
+counts the saved allocations are few and the change is neutral — never a regression.
+Back-ref: `aggbucketstate.go:makeGroupBuckets`, three call sites in
+`metrics_trace_intrinsic.go`. Bench: `intrinsic_group_id_bench_test.go`.

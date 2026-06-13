@@ -1773,10 +1773,7 @@ func streamAggN1Compact(
 	}
 
 	// Accumulate into groupBuckets[gIdx][bk-1].
-	groupBuckets := make([][]*aggBucketState, numGroups)
-	for i := range groupBuckets {
-		groupBuckets[i] = make([]*aggBucketState, numSteps)
-	}
+	groupBuckets := makeGroupBuckets(numGroups, numSteps) // NOTE-272
 
 	spanCount := 0
 	for pos := range n {
@@ -1900,10 +1897,7 @@ func streamAggN1CompactFromRefs(
 		}
 	}
 
-	groupBuckets := make([][]*aggBucketState, numGroups)
-	for i := range groupBuckets {
-		groupBuckets[i] = make([]*aggBucketState, numSteps)
-	}
+	groupBuckets := makeGroupBuckets(numGroups, numSteps) // NOTE-272
 
 	spanCount := 0
 	for pos := range n {
@@ -3928,11 +3922,8 @@ func accumulateAggDirect(
 	buckets map[string]*aggBucketState,
 ) error {
 	numGroups := len(dict)
-	groupBuckets := make([][]*aggBucketState, numGroups)
-	for i := range groupBuckets {
-		groupBuckets[i] = make([]*aggBucketState, numSteps)
-	}
-	seenByPK := acquireDirectBool(int(maxPK) + 1) // NOTE-129
+	groupBuckets := makeGroupBuckets(numGroups, numSteps) // NOTE-272
+	seenByPK := acquireDirectBool(int(maxPK) + 1)         // NOTE-129
 	defer releaseDirectBool(seenByPK)
 
 	col, err := r.GetIntrinsicColumn(agg.Field)
