@@ -514,8 +514,15 @@ func (r *Reader) ensureTraceIndexRaw() error {
 			)
 			return
 		}
-		// Copy bytes so the slice is owned by this reader, not the cache buffer.
-		r.compactParsed.traceIndexRaw = append([]byte(nil), rawData...)
+		// NOTE-257: hold the trace-index bytes in place rather than copying into a fresh
+		// allocation. rawData is either fresh snappy output (V3 path: decodeBoundedSnappy
+		// allocates and owns it) or the cache-owned blob from GetOrFetchTraceIndex
+		// (V1/V2/V14), whose fetch closure already produced an independent copy. Both are
+		// immutable for the lifetime this reader needs — the cache never mutates a stored
+		// blob (MemoryCache returns its backing array under a no-modify contract and only
+		// drops the reference on eviction) — and scanTraceIndexRaw only READS the bytes,
+		// so aliasing is safe and saves a full memmove of the tens-of-MB trace index.
+		r.compactParsed.traceIndexRaw = rawData
 	})
 
 	return r.compactParsed.traceIndexFetchErr

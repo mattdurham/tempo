@@ -371,7 +371,19 @@ func (r *Reader) ensureV8TraceSection() error {
 			return
 		}
 		if traceIdxBytes != nil && r.compactParsed != nil {
-			r.compactParsed.traceIndexRaw = append([]byte(nil), traceIdxBytes...)
+			// NOTE-257: hold the trace-index bytes in place (a sub-slice of the cached
+			// compact-section blob) instead of copying them into a fresh allocation. The
+			// V14 trace index is tens of MB; the old append([]byte(nil), ...) was a full
+			// memmove of that whole extent on every Reader that does a FindTraceByID
+			// (the dominant memmove on the Q8/trace-lookup path, profile 2026-06-13).
+			// The blob returned by fetchToCSection -> GetOrFetchV8Section is owned and
+			// never mutated by the cache: MemoryCache.Get hands back the same backing
+			// array it stored under a "caller must not modify after Put" contract, and
+			// eviction merely drops the reference (no buffer reuse). scanTraceIndexRaw
+			// only ever READS traceIndexRaw, so aliasing the cache blob is safe — Go's GC
+			// keeps the backing array alive through this sub-slice even after the cache
+			// evicts its own reference.
+			r.compactParsed.traceIndexRaw = traceIdxBytes
 		}
 	})
 	return r.v8TraceErr

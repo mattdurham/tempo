@@ -1819,3 +1819,32 @@ behaviour — they trigger the same build on first enumeration, just deferred to
 Back-ref: `reader/block.go:Block.iterFieldsOnce,buildIterFields,IterFields,resetIterFields`,
 `reader/block_parser.go:parseBlockColumnsReuse`, `reader/reader.go:AddColumnsToBlock`,
 `blockio/span_fields.go:modulesSpanFieldsAdapter.IterateFields`.
+
+## NOTE-257: Alias the cached trace-index blob instead of copying it per Reader
+
+**Problem:** Both the eager V14 path (`ensureV8TraceSection`) and the lazy path
+(`ensureTraceIndexRaw`) stored the trace index via `append([]byte(nil), bytes...)` — a full
+copy of the entire trace index (tens of MB on real files) into a fresh allocation on every
+Reader that performs a `FindTraceByID`. That copy was the dominant `runtime.memmove` on the
+trace-lookup path (~1.9 GB of memmove on the Q8 window, CPU profile 2026-06-13) and a
+matching large allocation + GC-scan cost.
+
+**Fix:** Hold the trace-index bytes in place. In both paths the source bytes are already
+either (a) a sub-slice of a cache-owned blob (`fetchToCSection`/`GetOrFetchTraceIndex`, whose
+fetch closures produce the independent copy when needed) or (b) fresh `decodeBoundedSnappy`
+output owned by this call. Assign that slice directly to `traceIndexRaw`.
+
+**Correctness:** The cache never mutates a stored blob — `MemoryCache.Get` returns the same
+backing array it stored under a documented "caller must not modify after Put" contract, and
+eviction merely drops the cache's own reference (no buffer reuse). `scanTraceIndexRaw` only
+ever READS `traceIndexRaw` (linear scan, no writes), so aliasing the cache blob is safe: Go's
+GC keeps the backing array alive through this sub-slice even after the cache evicts its
+reference. `splitV14CompactSection` returns `data[pos:]` (a sub-slice), so the V14 alias
+chains back to the immutable cached compact-section blob. Verified `go test -race
+./blockio/reader` green (trace-index scan/lookup suite unchanged).
+
+**Queries affected:** every trace-by-ID lookup (Q8 and any `FindTraceByID`) on V14 files —
+drops one tens-of-MB copy + allocation per Reader from the hot lookup path.
+
+Back-ref: `reader/parser.go:ensureV8TraceSection`, `reader/trace_index.go:ensureTraceIndexRaw`,
+`reader/trace_index.go:scanTraceIndexRaw`, `reader/compacttraceindex.go:traceIndexRaw`.
