@@ -269,8 +269,40 @@ func EncodePageTOC(toc PagedIntrinsicTOC) ([]byte, error) {
 	return snappy.Encode(nil, buf.Bytes()), nil
 }
 
-// DecodePageTOC decompresses a page TOC blob and parses it into a PagedIntrinsicTOC.
+// leUint64FromString reads a little-endian uint64 from the first 8 bytes of s without the
+// allocation that []byte(s) would incur. Callers guarantee len(s) == 8 (NOTE-274). The
+// PageMeta Min/Max range bytes are exactly 8 bytes for uint64 columns.
+func leUint64FromString(s string) uint64 {
+	_ = s[7] // bounds-check hint
+	return uint64(s[0]) | uint64(s[1])<<8 | uint64(s[2])<<16 | uint64(s[3])<<24 |
+		uint64(s[4])<<32 | uint64(s[5])<<40 | uint64(s[6])<<48 | uint64(s[7])<<56
+}
+
+// DecodePageTOC decompresses a page TOC blob and parses it into a PagedIntrinsicTOC,
+// including each page's Min/Max range bytes and Bloom filter. Use this on the scan paths
+// (parsePagedBlobHeader) that consult those per-page stats for min/max and bloom page skip.
 func DecodePageTOC(blob []byte) (PagedIntrinsicTOC, error) {
+	return decodePageTOC(blob, true)
+}
+
+// DecodePageTOCNoStats is the lighter variant of DecodePageTOC for callers that only read the
+// header (format/colType/widths) and per-page Offset/Length/RowCount and never consult a page's
+// Min/Max/Bloom. It advances past those fields without materializing the per-page Min/Max
+// string copies or the Bloom make+copy.
+//
+// NOTE-274: the full-column decode path (decodePagedColumnBlob) and the header-only peek
+// (PeekIntrinsicBlobHeader) never touch Min/Max/Bloom — only the predicate-pruning scan paths
+// do. On a Delta span:start column (hundreds of pages on real files, the hot M1/M4/M8/M9 decode
+// target) the old shared DecodePageTOC allocated two Min/Max strings per page that were
+// immediately discarded. Skipping them removes those per-page allocations from the decode path.
+func DecodePageTOCNoStats(blob []byte) (PagedIntrinsicTOC, error) {
+	return decodePageTOC(blob, false)
+}
+
+// decodePageTOC decompresses a page TOC blob and parses it into a PagedIntrinsicTOC. When
+// withPageStats is false the per-page Min/Max strings and Bloom slices are left zero (their
+// encoded bytes are skipped without allocation) — see DecodePageTOCNoStats.
+func decodePageTOC(blob []byte, withPageStats bool) (PagedIntrinsicTOC, error) {
 	// NOTE-273: decode the TOC blob into a pooled scratch buffer instead of a fresh
 	// snappy.Decode(nil, …) allocation. DecodePageTOC runs once per paged-column decode
 	// (decodePagedColumnBlob and the search-path header parsers) and was the last hot-path
@@ -336,7 +368,10 @@ func DecodePageTOC(blob []byte) (PagedIntrinsicTOC, error) {
 		if pos+minLen > len(raw) {
 			return PagedIntrinsicTOC{}, fmt.Errorf("DecodePageTOC: truncated at min value")
 		}
-		minVal := string(raw[pos : pos+minLen])
+		var minVal string
+		if withPageStats {
+			minVal = string(raw[pos : pos+minLen])
+		}
 		pos += minLen
 
 		if pos+2 > len(raw) {
@@ -347,7 +382,10 @@ func DecodePageTOC(blob []byte) (PagedIntrinsicTOC, error) {
 		if pos+maxLen > len(raw) {
 			return PagedIntrinsicTOC{}, fmt.Errorf("DecodePageTOC: truncated at max value")
 		}
-		maxVal := string(raw[pos : pos+maxLen])
+		var maxVal string
+		if withPageStats {
+			maxVal = string(raw[pos : pos+maxLen])
+		}
 		pos += maxLen
 
 		if pos+2 > len(raw) {
@@ -360,8 +398,10 @@ func DecodePageTOC(blob []byte) (PagedIntrinsicTOC, error) {
 			if pos+bloomLen > len(raw) {
 				return PagedIntrinsicTOC{}, fmt.Errorf("DecodePageTOC: truncated at bloom")
 			}
-			bloom = make([]byte, bloomLen)
-			copy(bloom, raw[pos:pos+bloomLen])
+			if withPageStats {
+				bloom = make([]byte, bloomLen)
+				copy(bloom, raw[pos:pos+bloomLen])
+			}
 			pos += bloomLen
 		}
 
@@ -827,7 +867,10 @@ func decodePagedColumnBlob(blob []byte) (*IntrinsicColumn, error) {
 	if pos+tocLen > len(blob) {
 		return nil, fmt.Errorf("decodePagedColumnBlob: truncated at toc_blob")
 	}
-	toc, err := DecodePageTOC(blob[pos : pos+tocLen])
+	// NOTE-274: the full-column decode never reads any page's Min/Max/Bloom — those are only
+	// consulted by the predicate-pruning scan paths (parsePagedBlobHeader). Skip materializing
+	// the per-page Min/Max string copies (a Delta span:start column has hundreds of pages).
+	toc, err := DecodePageTOCNoStats(blob[pos : pos+tocLen])
 	if err != nil {
 		return nil, fmt.Errorf("decodePagedColumnBlob: %w", err)
 	}
@@ -1091,7 +1134,8 @@ func PeekIntrinsicBlobHeader(blob []byte) (format uint8, colType ColumnType, cou
 		if len(blob) < 5+tocLen {
 			return 0, 0, 0, fmt.Errorf("PeekIntrinsicBlobHeader: paged toc truncated")
 		}
-		toc, tocErr := DecodePageTOC(blob[5 : 5+tocLen])
+		// NOTE-274: the header peek reads only format/colType/count, never Min/Max/Bloom.
+		toc, tocErr := DecodePageTOCNoStats(blob[5 : 5+tocLen])
 		if tocErr != nil {
 			return 0, 0, 0, fmt.Errorf("PeekIntrinsicBlobHeader: %w", tocErr)
 		}
@@ -1892,8 +1936,8 @@ func scanFlatPagedBlob(blob []byte, lo, hi uint64, hasLo, hasHi bool, maxRefs in
 	for _, pm := range toc.Pages {
 		// Min/max skip: if page range doesn't overlap [lo, hi], skip page.
 		if len(pm.Min) == 8 && len(pm.Max) == 8 {
-			pageMin := binary.LittleEndian.Uint64([]byte(pm.Min))
-			pageMax := binary.LittleEndian.Uint64([]byte(pm.Max))
+			pageMin := leUint64FromString(pm.Min) // NOTE-274: avoid []byte(...) copy
+			pageMax := leUint64FromString(pm.Max)
 			if hasLo && pageMax < lo {
 				continue
 			}
@@ -2110,8 +2154,8 @@ func scanDeltaUint64PagedBlob(
 		// NOTE-017: min/max page skip — mirrors scanFlatPagedBlob lines 1233-1243.
 		// encodeDeltaUint64Intrinsic writes Min/Max into PageMeta; the reader was not using them.
 		if len(pm.Min) == 8 && len(pm.Max) == 8 {
-			pageMin := binary.LittleEndian.Uint64([]byte(pm.Min))
-			pageMax := binary.LittleEndian.Uint64([]byte(pm.Max))
+			pageMin := leUint64FromString(pm.Min) // NOTE-274: avoid []byte(...) copy
+			pageMax := leUint64FromString(pm.Max)
 			if hasLo && pageMax < lo {
 				continue
 			}

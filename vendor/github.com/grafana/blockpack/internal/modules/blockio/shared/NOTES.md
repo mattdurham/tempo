@@ -1683,3 +1683,42 @@ parsePagedBlobHeader). Stacks directly on NOTE-262/263 (same defect class, disjo
 
 Back-ref: `shared/intrinsic_codec.go:DecodePageTOC`, `snappyDecodeReuse`,
 `intrinsic_parallel_decode_test.go:BenchmarkDecodePageTOC`.
+
+## NOTE-274: skip per-page Min/Max/Bloom materialization on the no-stats TOC decode paths
+
+**Problem:** `DecodePageTOC` allocated a fresh `Min` and `Max` string (`string(raw[…])`) plus a
+`Bloom` `make+copy` for **every page** in the TOC, regardless of whether the caller would ever
+read those per-page stats. On a Delta `span:start` column — hundreds of pages on real files, and
+the hot decode target for M1/M4/M8/M9 — that is hundreds of string allocations per column per
+block, all immediately discarded. Of the three callers, only the predicate-pruning scan path
+(`parsePagedBlobHeader`, feeding `scanFlatPagedBlob`/`scanDeltaUint64PagedBlob`/`scanDictPagedBlob`)
+ever consults a page's Min/Max/Bloom. The full-column decode (`decodePagedColumnBlob`) and the
+header peek (`PeekIntrinsicBlobHeader`) read only format/colType/widths and per-page
+Offset/Length/RowCount.
+
+**Fix:** split `DecodePageTOC` into a `decodePageTOC(blob, withPageStats bool)` core. The public
+`DecodePageTOC` keeps full behavior (`withPageStats=true`, used by the scan path). A new
+`DecodePageTOCNoStats` (`withPageStats=false`) leaves each page's `Min`/`Max`/`Bloom` zero — it
+advances `pos` past their encoded bytes without the `string(…)`/`make+copy` allocations.
+`decodePagedColumnBlob` and `PeekIntrinsicBlobHeader` now call `DecodePageTOCNoStats`. Also
+replaced `binary.LittleEndian.Uint64([]byte(pm.Min))` (which allocates a byte slice from the
+string each call) with a non-allocating `leUint64FromString` in the two scan-path min/max page
+skips; both callsites are already guarded by `len(pm.Min) == 8`, so the `s[7]` bounds-check hint
+is safe.
+
+**Verification:** `go build ./...`; `go test -race ./blockio/shared ./blockio/reader ./executor`
+green. Made `buildDeltaBlob` populate realistic 8-byte LE per-page Min/Max (matching
+`encodeDeltaUint64Intrinsic`) so the TOC benchmarks exercise the materialization. On a 100-page
+Delta TOC: `BenchmarkDecodePageTOC` 201 allocs/op 9796 B/op 10566 ns/op vs
+`BenchmarkDecodePageTOCNoStats` **1 alloc/op 8196 B/op 7242 ns/op** (−99.5% allocs, −16% bytes,
+−31% time on the no-stats path — the path `decodePagedColumnBlob`/`PeekIntrinsicBlobHeader` now
+take). Cold/warm decode results are byte-identical: the no-stats path only nulls fields the
+decode/peek callers never read, and the scan path is unchanged.
+
+**Queries affected:** every query that decodes a paged intrinsic column — M1/M4/M6/M8/M9 metrics
+decode (`decodePagedColumnBlob`) and Q1–Q10 search header peeks (`PeekIntrinsicBlobHeader`).
+Stacks on NOTE-273 (same function, disjoint allocation: NOTE-273 pooled the snappy scratch,
+NOTE-274 drops the per-page output strings on callers that discard them).
+
+Back-ref: `shared/intrinsic_codec.go:DecodePageTOCNoStats`, `decodePageTOC`,
+`leUint64FromString`, `intrinsic_parallel_decode_test.go:BenchmarkDecodePageTOCNoStats`.
