@@ -21,6 +21,7 @@ import (
 	modules_sectioncache "github.com/grafana/blockpack/internal/modules/sectioncache"
 	modules_tieredcache "github.com/grafana/blockpack/internal/modules/tieredcache"
 	vm "github.com/grafana/blockpack/internal/vm"
+	"golang.org/x/sync/errgroup"
 )
 
 // AGENT: Reader types - these provide access to blockpack data.
@@ -375,28 +376,55 @@ func GetTraceByID(r *Reader, traceIDHex string) (results []SpanMatch, err error)
 		blockIDs[i] = e.BlockID
 		matchingBlockSet[e.BlockID] = true
 	}
-	rawMap := make(map[int][]byte, len(entries))
-	for _, group := range r.CoalescedGroups(blockIDs) {
-		groupRaw, fetchErr := r.ReadGroup(group)
-		if fetchErr != nil {
-			return nil, fmt.Errorf("GetTraceByID: read group: %w", fetchErr)
-		}
-		for bi, raw := range groupRaw {
-			rawMap[bi] = raw
-		}
-	}
+	// NOTE-290: the block-blob fetch (CoalescedGroups → ReadGroup) and the intrinsic
+	// trace:id column load (EnsureIntrinsicTOC → GetIntrinsicColumn) are fully
+	// independent — neither result feeds the other. Run them concurrently so the
+	// per-trace cost is one I/O round-trip (max of the two) instead of two serial
+	// round-trips. On warm cache this saves a memcache RTT; on cold cache an S3 RTT.
+	//
+	// Concurrency safety: the two goroutines touch disjoint Reader state. ReadGroup
+	// reads/writes only the concurrency-safe tieredcache and the provider (whose ReadAt
+	// is already exercised concurrently by block scans). GetIntrinsicColumn guards its
+	// per-Reader decoded-column cache with r.intrinsicMu. Neither path mutates the
+	// intrinsicIndex TOC map here (EnsureIntrinsicTOC is a no-op for V8 files and
+	// IntrinsicColumnMeta is not called on this path).
+	var rawMap map[int][]byte
+	var intrinsicTraceCol *modules_shared.IntrinsicColumn
+	var g errgroup.Group
 
-	// Ensure the intrinsic TOC is loaded — lean readers skip this at open time.
-	// Required because trace:id is now stored exclusively in the intrinsic section.
-	if err := r.EnsureIntrinsicTOC(); err != nil {
-		return nil, fmt.Errorf("GetTraceByID: load intrinsic TOC: %w", err)
-	}
+	g.Go(func() error {
+		fetched := make(map[int][]byte, len(entries))
+		for _, group := range r.CoalescedGroups(blockIDs) {
+			groupRaw, fetchErr := r.ReadGroup(group)
+			if fetchErr != nil {
+				return fmt.Errorf("GetTraceByID: read group: %w", fetchErr)
+			}
+			for bi, raw := range groupRaw {
+				fetched[bi] = raw
+			}
+		}
+		rawMap = fetched
+		return nil
+	})
 
-	// Build intrinsic trace:id lookup to find (blockID, rowIdx) pairs.
-	// After dual-storage removal, trace:id is only in the intrinsic section.
-	intrinsicTraceCol, traceColErr := r.GetIntrinsicColumn("trace:id")
-	if traceColErr != nil {
-		return nil, fmt.Errorf("GetTraceByID: load intrinsic trace:id: %w", traceColErr)
+	g.Go(func() error {
+		// Ensure the intrinsic TOC is loaded — lean readers skip this at open time.
+		// Required because trace:id is now stored exclusively in the intrinsic section.
+		if tocErr := r.EnsureIntrinsicTOC(); tocErr != nil {
+			return fmt.Errorf("GetTraceByID: load intrinsic TOC: %w", tocErr)
+		}
+		// Build intrinsic trace:id lookup to find (blockID, rowIdx) pairs.
+		// After dual-storage removal, trace:id is only in the intrinsic section.
+		col, traceColErr := r.GetIntrinsicColumn("trace:id")
+		if traceColErr != nil {
+			return fmt.Errorf("GetTraceByID: load intrinsic trace:id: %w", traceColErr)
+		}
+		intrinsicTraceCol = col
+		return nil
+	})
+
+	if waitErr := g.Wait(); waitErr != nil {
+		return nil, waitErr
 	}
 
 	// rowsByBlock maps blockID → []rowIdx for rows matching traceID.

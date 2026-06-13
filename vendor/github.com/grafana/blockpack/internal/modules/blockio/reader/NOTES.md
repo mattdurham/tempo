@@ -2174,3 +2174,32 @@ stays honest.
 Back-ref: `reader/trace_index.go:buildTraceIdxSamples`,
 `reader/trace_index.go:scanTraceIndexRaw`, `reader/compacttraceindex.go:traceIdxSampleIDs`,
 `reader/parser.go:traceSparseIndex`.
+
+### NOTE-290: GetTraceByID overlaps the block-blob fetch with the intrinsic trace:id column load — 2026-06-13
+
+`GetTraceByID` (in the top-level `blockpack` package, `reader.go`) previously ran two
+independent I/O operations serially:
+
+1. block-blob fetch: `CoalescedGroups(blockIDs)` → `ReadGroup(group)` → `rawMap`
+2. intrinsic trace:id load: `EnsureIntrinsicTOC()` → `GetIntrinsicColumn("trace:id")`
+
+Neither result feeds the other — (1) hydrates the raw block bytes that are decoded later;
+(2) builds the `(blockID, rowIdx)` match set. Running them serially wasted one full I/O
+round-trip per trace lookup (a memcache RTT on warm cache, an S3 RTT on cold). They now
+run concurrently under an `errgroup.Group`; the per-trace I/O cost is the max of the two
+legs rather than their sum.
+
+**Concurrency safety:** the two goroutines touch disjoint Reader state.
+- `ReadGroup` reads/writes only the concurrency-safe `tieredcache` and the provider, whose
+  `ReadAt` is already exercised concurrently by block scans. The result is written into a
+  goroutine-local `fetched` map, then published to `rawMap` before `g.Wait()` — the only
+  reader of `rawMap` runs after the wait, so there is no concurrent map access.
+- `GetIntrinsicColumn` guards its per-Reader decoded-column cache (`r.intrinsicDecoded`)
+  with `r.intrinsicMu`. It does not mutate the `intrinsicIndex` TOC map on this path
+  (`EnsureIntrinsicTOC` is a no-op for V8 files, and `IntrinsicColumnMeta`'s lazy header
+  peek is not called here — only a plain `r.intrinsicIndex[name]` read).
+
+Pure latency reduction; no extra CPU beyond one goroutine. The metrics query path is
+unaffected (trace-by-ID is a separate entry point).
+
+Back-ref: `reader.go:GetTraceByID`.
