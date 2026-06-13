@@ -1025,7 +1025,11 @@ func (r *Reader) AddColumnsToBlock(bwb *BlockWithBytes, addColumns map[string]st
 	}
 
 	bwb.Block.buildNameIndex()
-	bwb.Block.BuildIterFields()
+	// NOTE-243: AddColumnsToBlock mutates the columns map after the initial parse (the
+	// second-pass decode). Reset the lazy iterFields so the next IterFields() rebuilds from
+	// the now-complete column set. The once is reset (not eagerly rebuilt) so a metrics-style
+	// caller that never enumerates fields still pays nothing.
+	bwb.Block.resetIterFields()
 
 	return nil
 }

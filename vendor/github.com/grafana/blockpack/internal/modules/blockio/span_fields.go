@@ -167,41 +167,20 @@ func (a *modulesSpanFieldsAdapter) GetField(name string) (any, bool) {
 // They are derivable from log:body and should not appear as explicit attributes in
 // enumeration. GetField() still resolves them for direct lookups.
 func (a *modulesSpanFieldsAdapter) IterateFields(fn func(name string, value any) bool) {
-	var entries []modules_reader.ColIterEntry
-	if a.block != nil {
-		entries = a.block.IterFields()
+	if a.block == nil {
+		return
 	}
-	seen := make(map[string]struct{}, len(entries))
-	// NOTE-049: Use pre-computed deduplicated slice when available — zero allocs.
-	if entries != nil {
-		for i := range entries {
-			v, ok := modulesGetValue(entries[i].Col, a.rowIdx)
-			if !ok {
-				continue
-			}
-			seen[entries[i].Name] = struct{}{}
-			if !fn(entries[i].Name, v) {
-				return
-			}
+	// NOTE-049/NOTE-243: IterFields() returns the pre-computed deduplicated slice, built
+	// lazily on this first call. Entries are already deduplicated by name, so iteration is
+	// fully allocation-free (no per-call seen map).
+	entries := a.block.IterFields()
+	for i := range entries {
+		v, ok := modulesGetValue(entries[i].Col, a.rowIdx)
+		if !ok {
+			continue
 		}
-	} else if a.block != nil {
-		// Fallback: block was parsed without BuildIterFields (tests, compaction, AddColumnsToBlock).
-		for key, col := range a.block.Columns() {
-			// NOTE-ITER-1: skip body-parsed auto-columns; they are not original attributes.
-			if key.Type == modules_shared.ColumnTypeRangeString {
-				continue
-			}
-			if _, already := seen[key.Name]; already {
-				continue
-			}
-			v, ok := modulesGetValue(col, a.rowIdx)
-			if !ok {
-				continue
-			}
-			seen[key.Name] = struct{}{}
-			if !fn(key.Name, v) {
-				return
-			}
+		if !fn(entries[i].Name, v) {
+			return
 		}
 	}
 	// Intrinsic fallback removed — block payload is the authoritative source for all paths.

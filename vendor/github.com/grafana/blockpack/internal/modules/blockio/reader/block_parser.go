@@ -517,7 +517,8 @@ func parseBlockColumnsReuse(
 		meta:            meta,
 	}
 	blk.buildNameIndex()
-	blk.BuildIterFields()
+	// NOTE-243: iterFields is now built lazily on first IterFields() call, so the parser
+	// no longer eagerly walks all columns here. Metrics queries never enumerate fields.
 
 	return blk, nil
 }

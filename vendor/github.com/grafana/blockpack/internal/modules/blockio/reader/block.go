@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"math"
+	"sync"
 
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
 )
@@ -371,7 +372,7 @@ func (c *Column) VectorF32Value(idx int) ([]float32, bool) {
 }
 
 // ColIterEntry is a single entry in the pre-computed deduplicated column iteration list.
-// Built once by BuildIterFields after all columns are registered.
+// Built lazily on first IterFields() call (NOTE-243) from the registered column set.
 // NOTE-049: Pre-computed column iteration order eliminates the per-span seen-map alloc.
 
 // Block holds decoded columns for a single block.
@@ -394,9 +395,14 @@ type Block struct {
 	// iterFields is the pre-computed deduplicated column iteration list, built by
 	// BuildIterFields. When non-nil, IterateFields uses this slice directly — zero allocs.
 	// NOTE-049: see blockio/NOTES.md §49.
-	iterFields []ColIterEntry
-	meta       shared.BlockMeta
-	spanCount  int
+	// NOTE-243: built lazily on first IterFields() call (guarded by iterFieldsOnce) so
+	// metrics queries — which only access named columns and never enumerate attributes —
+	// pay no O(colCount) build/alloc per block. Search/filter queries trigger the build
+	// on their first per-row IterateFields call.
+	iterFields     []ColIterEntry
+	iterFieldsOnce sync.Once
+	meta           shared.BlockMeta
+	spanCount      int
 }
 
 // newBlockForParsing creates a Block with an empty columns map, for use with AddColumnsToBlock.
@@ -420,12 +426,11 @@ func (b *Block) buildNameIndex() {
 	}
 }
 
-// BuildIterFields pre-computes a deduplicated column iteration slice for use by
-// modulesSpanFieldsAdapter.IterateFields. Called once after all columns are added.
-// After this call, IterateFields on any adapter for this block is allocation-free.
+// buildIterFields pre-computes a deduplicated column iteration slice for use by
+// modulesSpanFieldsAdapter.IterateFields. After this call, IterateFields on any adapter
+// for this block is allocation-free.
 // NOTE-049: Eliminates the per-span make(map[string]struct{}) in IterateFields.
-// Idempotent — calling twice rebuilds from the current column set.
-func (b *Block) BuildIterFields() {
+func (b *Block) buildIterFields() {
 	seen := make(map[string]struct{}, len(b.columns))
 	entries := make([]ColIterEntry, 0, len(b.columns))
 	for key := range b.columns {
@@ -448,9 +453,25 @@ func (b *Block) BuildIterFields() {
 	b.iterFields = entries
 }
 
-// IterFields returns the pre-computed deduplicated column list built by BuildIterFields.
-// Returns nil if BuildIterFields has not been called.
-func (b *Block) IterFields() []ColIterEntry { return b.iterFields }
+// resetIterFields discards any previously-built iterFields and resets the lazy-build
+// guard so the next IterFields() rebuilds from the current column set. Used after a
+// post-parse mutation of the columns map (e.g. AddColumnsToBlock's second-pass decode).
+// NOTE-243: callers must ensure no concurrent IterFields() is in flight when resetting —
+// in practice AddColumnsToBlock runs between scan passes, not during a per-row scan.
+func (b *Block) resetIterFields() {
+	b.iterFields = nil
+	b.iterFieldsOnce = sync.Once{}
+}
+
+// IterFields returns the deduplicated column iteration list, building it lazily on the
+// first call (NOTE-243). Metrics queries that only access named columns never call this,
+// so they pay no O(colCount) build/alloc per block; search/filter queries trigger the
+// build on their first per-row IterateFields call. The sync.Once makes the lazy build
+// safe under concurrent per-row IterateFields calls on the same block.
+func (b *Block) IterFields() []ColIterEntry {
+	b.iterFieldsOnce.Do(b.buildIterFields)
+	return b.iterFields
+}
 
 // SpanCount returns the number of spans in the block.
 func (b *Block) SpanCount() int { return b.spanCount }

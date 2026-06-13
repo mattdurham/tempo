@@ -1776,3 +1776,46 @@ but decoded-cache-cold — the common state after process-cache eviction on a bu
 Back-ref: `reader/columnar_read.go:readBlockColumnarWithCache,stashPreCompressedColumn`,
 `reader/reader.go:preCompressedLookup`, `reader/block_parser.go:parseBlockColumnsReuse`,
 field `reader/reader.go:Reader.preCompressedColumns`.
+
+## NOTE-243: Lazy `iterFields` build — skip per-block field-enumeration prep on metrics queries
+
+**Problem:** `Block.BuildIterFields` was called eagerly at the end of every block parse
+(`parseBlockColumnsReuse`) and after every `AddColumnsToBlock`. It walks the entire
+`columns` map (every typed column variant) to produce a deduplicated `[]ColIterEntry`,
+allocating a `seen` map and an `entries` slice both sized to `len(columns)`. For wide trace
+blocks (hundreds of columns) this is real per-query, per-block O(colCount) work — yet only
+`modulesSpanFieldsAdapter.IterateFields` consumes the result, and that is called **only** by
+search/filter queries that enumerate every attribute. Metrics queries (`rate()`,
+`histogram_over_time`, group-by) access columns by name via `GetColumn` and never call
+`IterateFields`, so they paid the full build + two allocations on every block for nothing.
+
+**Fix:** Build `iterFields` lazily on the first `IterFields()` call, guarded by a
+`sync.Once` on the `Block` (`iterFieldsOnce`). The eager `BuildIterFields` calls in the
+parser and `AddColumnsToBlock` are removed; the former exported method is now the unexported
+`buildIterFields` invoked through the once. `AddColumnsToBlock` mutates the columns map after
+the initial parse (the second-pass decode), so it calls `resetIterFields` to discard any
+slice built in the first pass and reset the once — the rebuild still only happens if a later
+`IterateFields` call demands it.
+
+**Correctness / concurrency:** A fresh `Block` (and therefore a fresh `iterFieldsOnce`) is
+allocated by every `parseBlockColumnsReuse`, so reused `prevBlock.columns` maps never carry a
+stale once. The `sync.Once` makes the first lazy build safe under concurrent per-row
+`IterateFields` calls on one block. `resetIterFields` replaces the once and is only invoked
+between sequential scan passes (`AddColumnsToBlock` runs after the first-pass scan completes
+and before the second-pass scan starts), never concurrently with an in-flight `IterFields`.
+Verified `go test -race ./blockio ./blockio/reader ./executor` green, including the
+field-enumeration alloc/dedup suite (which now triggers the lazy build via `IterFields()`).
+
+**Adapter cleanup:** `IterFields()` now always returns a non-nil (possibly empty) slice, so
+the adapter's nil-fallback branch in `span_fields.go` (which re-walked `Columns()` and used
+its own `seen` map) was dead and is removed. Entries are already deduplicated by name, so the
+adapter no longer allocates a per-call `seen` map either — `IterateFields` is now fully
+allocation-free on the iteration itself.
+
+**Queries affected:** every metrics query (M1/M4/M6/M8/M9 and group-by histograms) skips the
+per-block iterFields build + two allocations entirely. Search/filter queries are unchanged in
+behaviour — they trigger the same build on first enumeration, just deferred to the scan.
+
+Back-ref: `reader/block.go:Block.iterFieldsOnce,buildIterFields,IterFields,resetIterFields`,
+`reader/block_parser.go:parseBlockColumnsReuse`, `reader/reader.go:AddColumnsToBlock`,
+`blockio/span_fields.go:modulesSpanFieldsAdapter.IterateFields`.
