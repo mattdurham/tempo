@@ -22,7 +22,8 @@ import (
 
 // compactTraceIndex holds the parsed compact trace index section.
 // NOTE-PERF-COMPACT: traceIndexRaw stores the raw trace-index bytes in-place (a sub-slice of the
-// cached compact-index buffer) rather than a pre-built map. scanTraceIndexRaw scans them linearly
+// cached compact-index buffer) rather than a pre-built map. scanTraceIndexRaw locates the entry
+// via a lazily-built sparse offset index (NOTE-260, binary search + bounded window scan)
 // on each lookup, eliminating O(traceCount) map + []uint16 allocations that were the #1 production
 // allocator (top alloc_objects site in production profiling). Allocation on hit is one small []uint16 per lookup — far cheaper
 // than materializing every trace's block list at parse time.
@@ -784,7 +785,7 @@ func (r *Reader) TraceEntries(traceID [16]byte) []TraceEntry {
 	if !ok && r.compactParsed != nil {
 		// Ensure trace index bytes are loaded (lazy for lean readers; no-op for full readers).
 		_ = r.ensureTraceIndexRaw()
-		blockIDs = scanTraceIndexRaw(r.compactParsed.traceIndexRaw, traceID)
+		blockIDs = r.compactParsed.scanTraceIndexRaw(traceID)
 		ok = blockIDs != nil
 	}
 	if !ok {

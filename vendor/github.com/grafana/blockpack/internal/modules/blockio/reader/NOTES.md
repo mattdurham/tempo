@@ -1848,3 +1848,80 @@ drops one tens-of-MB copy + allocation per Reader from the hot lookup path.
 
 Back-ref: `reader/parser.go:ensureV8TraceSection`, `reader/trace_index.go:ensureTraceIndexRaw`,
 `reader/trace_index.go:scanTraceIndexRaw`, `reader/compacttraceindex.go:traceIndexRaw`.
+
+---
+
+## NOTE-260: binary-search the sorted compact trace index via a sparse offset index — 2026-06-13
+
+**Problem:** `scanTraceIndexRaw` was a full O(traceCount) linear scan over the compact
+trace-index table on every trace-by-ID lookup (Q8 / `FindTraceByID` / `TraceEntries`). The
+gcx querier CPU profile (2026-06-13) showed it as the #1 blockpack self-time frame at 2.96%.
+The bloom filter (NOTE-36) gates *true* misses, so the scan only ran on true hits and bloom
+false positives — but on a hit it walked on average traceCount/2 entries (16-byte ID compare
++ stride decode per entry), and a file can hold ~100k traces.
+
+**Fix:** The writer (`writeTraceBlockIndexSection`) sorts trace entries ascending by trace ID,
+so the table is binary-searchable — except entries are variable-stride (block_ref_count varies),
+so the raw bytes can't be indexed by position. Build a *sparse* offset index lazily on the
+first scan: walk the table once recording `(traceID, byteOffset)` for every
+`traceIdxSampleStride` (64) entries into `compactTraceIndex.traceIdxSamples`. Each lookup
+binary-searches the samples for the last sample with `traceID <= target`, then linear-scans
+at most one stride window (≤64 entries) from that offset, early-exiting as soon as an entry's
+sorted ID exceeds the target. Lookup is now O(log(n/64) + 64) instead of O(n). The sparse
+index is built once per `compactTraceIndex` under a `sync.Once`; on any malformed entry the
+builder bails and leaves `traceIdxSampleOK` false so the scan falls back to a full linear
+walk from the table start (identical to the old behaviour).
+
+**Memory:** `traceIdxSamples` holds at most `traceCount/64` entries of 24 bytes each
+(~37 KB for 100k traces) — bounded and built once, *not* a per-trace map. This respects
+NOTE-PERF-COMPACT: no `map[[16]byte][]uint16` is materialized and all block-list allocation
+stays deferred to a confirmed hit (`decodeTraceEntryBlocks` allocates exactly one `[]uint16`).
+
+**Shared helpers:** stride/payload decoding is factored into `traceEntryStride` (entry byte
+length + in-bounds check) and `decodeTraceEntryBlocks` (one-shot block-ID decode), used by
+both the builder and the scan so v1/v2 layout logic lives in one place. `traceIDLess`
+gives the big-endian lexicographic order matching the writer's `bytes.Compare` sort
+(NOTE-261: compares the two 16-byte IDs as big-endian uint64 pairs, not byte by byte).
+
+**Correctness:** the sparse index only stores offsets/IDs that already exist in `traceIndexRaw`
+(read-only, no mutation); the binary search picks the floor sample so the target, if present,
+is guaranteed to be at or after that offset and before the next sample. Sorted early-exit is
+safe because the writer's ascending sort is the same order `traceIDLess` implements. v1
+(legacy) and v2 both go through the same path; v1 is still parsed correctly via the
+fmtVersion-keyed stride. Verified `go test -race ./blockio/reader ./executor` green.
+
+**Queries affected:** every trace-by-ID lookup on a bloom-hit. Worst case (true hit deep in a
+large table, or a false positive) drops from a full-table walk to log + 64-entry window.
+
+Back-ref: `reader/trace_index.go:scanTraceIndexRaw`, `:ensureTraceIdxSamples`,
+`:traceEntryStride`, `:decodeTraceEntryBlocks`, `reader/compacttraceindex.go:traceIdxSample`.
+
+## NOTE-261: compare trace IDs as big-endian uint64 pairs in scanTraceIndexRaw — 2026-06-13
+
+**Decision:** `scanTraceIndexRaw` is the inner-loop primitive of the NOTE-260 bounded
+sparse-index trace-by-ID scan and was ~3.2% querier self-time on the 2026-06-13 CPU
+profile (the #1 blockpack self-time function). Each iteration of the bounded linear scan
+copied the entry's 16 bytes into a `[16]byte` (`entryID := *(*[16]byte)(...)`), did an
+array `==` compare, then on inequality called `bytesLessTraceID` — a byte-by-byte loop
+over all 16 bytes — for the ascending-sort early-exit. That is up to two passes over the
+16 bytes per non-matching entry plus the stack copy.
+
+**Mechanism:** A 16-byte trace ID compares lexicographically (big-endian byte order)
+identically to comparing its high then low big-endian `uint64` halves. The scan now
+pre-decodes the target once (`targetHi`/`targetLo`) before the loop and reads each entry's
+ID as two `binary.BigEndian.Uint64` loads straight out of `data` (no `[16]byte` copy). A
+single 3-way branch combines the hit (`==`), the ascending early-exit (`target < entry`),
+and continue cases:
+- `entryHi == targetHi`: compare low halves — equal → hit; `targetLo < entryLo` → early-exit.
+- `targetHi < entryHi`: early-exit.
+- otherwise: advance.
+`bytesLessTraceID` is replaced by `traceIDLess`, which does the same uint64-pair comparison
+and is now used by the sparse-sample binary search too (`!traceIDLess(traceID, sample)` is
+exactly `sample <= traceID`, replacing the old `bytesLessTraceID(...) || ... == ...`).
+
+**Correctness:** big-endian uint64-pair comparison is bit-for-bit equivalent to
+`bytes.Compare` on the same 16 bytes (the writer's sort order), so the matched entry, the
+ascending early-exit point, and the sample floor are all unchanged. Verified `go test -race
+./blockio/reader ./executor` green incl. the NOTE-260 `trace_index_sparse_test.go` cases.
+
+Back-ref: `reader/trace_index.go:scanTraceIndexRaw`, `:traceIDLess`.

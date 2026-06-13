@@ -229,7 +229,7 @@ func (r *Reader) BlocksForTraceIDCompact(traceID [16]byte) []int {
 		return nil
 	}
 
-	blockIDs := scanTraceIndexRaw(r.compactParsed.traceIndexRaw, traceID)
+	blockIDs := r.compactParsed.scanTraceIndexRaw(traceID)
 	if blockIDs == nil {
 		return nil
 	}
@@ -253,13 +253,77 @@ func blockIDsToInts(blockIDs []uint16) []int {
 	return blocks
 }
 
-// scanTraceIndexRaw searches raw trace-index bytes for traceID without building a map.
+// traceEntryStride returns the byte length of the trace entry that begins at data[pos]
+// (trace_id[16] + block_ref_count[2] + per-ref payload), and whether the entry is fully
+// in bounds. fmtVersion selects the per-ref payload layout (v1: block_id[2]+span_count[2]+
+// span_indices[N×2]; v2: block_id[2]). Used by both the sparse-index builder and the scan.
+func traceEntryStride(data []byte, pos int, fmtVersion uint8) (stride int, ok bool) {
+	if pos+18 > len(data) {
+		return 0, false
+	}
+	blockRefCount := int(binary.LittleEndian.Uint16(data[pos+16:]))
+	p := pos + 18
+	if fmtVersion == shared.TraceIndexFmtVersion {
+		for range blockRefCount {
+			if p+4 > len(data) {
+				return 0, false
+			}
+			spanCount := int(binary.LittleEndian.Uint16(data[p+2:]))
+			p += 4 + spanCount*2
+		}
+		if p > len(data) {
+			return 0, false
+		}
+	} else {
+		p += blockRefCount * 2
+		if p > len(data) {
+			return 0, false
+		}
+	}
+	return p - pos, true
+}
+
+// decodeTraceEntryBlocks decodes the block-ID list for the trace entry that begins at
+// data[pos]. fmtVersion selects the per-ref payload layout. Allocates exactly one
+// []uint16. Caller has already confirmed the trace ID at pos matches.
+func decodeTraceEntryBlocks(data []byte, pos int, fmtVersion uint8) []uint16 {
+	blockRefCount := int(binary.LittleEndian.Uint16(data[pos+16:]))
+	p := pos + 18
+	blockIDs := make([]uint16, 0, blockRefCount)
+	if fmtVersion == shared.TraceIndexFmtVersion {
+		for range blockRefCount {
+			if p+4 > len(data) {
+				return blockIDs
+			}
+			blockIDs = append(blockIDs, binary.LittleEndian.Uint16(data[p:]))
+			spanCount := int(binary.LittleEndian.Uint16(data[p+2:]))
+			p += 4 + spanCount*2
+		}
+		return blockIDs
+	}
+	for range blockRefCount {
+		if p+2 > len(data) {
+			return blockIDs
+		}
+		blockIDs = append(blockIDs, binary.LittleEndian.Uint16(data[p:]))
+		p += 2
+	}
+	return blockIDs
+}
+
+// scanTraceIndexRaw searches the raw trace-index bytes for traceID without building a map.
 // Supports fmt_version 1 (v1: with per-block span indices) and 2 (v2: block IDs only).
 // Returns the block IDs for the matching trace, or nil if not found.
 // Zero allocations on miss; one small []uint16 allocation on hit.
-// NOTE-PERF-COMPACT: called by BlocksForTraceIDCompact and TraceEntries in place of a
-// map lookup. Eliminates O(traceCount) map+slice allocations from parseTraceBlockIndex.
-func scanTraceIndexRaw(data []byte, traceID [16]byte) []uint16 {
+//
+// NOTE-260: the writer sorts trace entries ascending by trace ID, so this builds a sparse
+// offset index (traceIdxSamples) on first call and binary-searches it to bound the linear
+// scan to a single traceIdxSampleStride window — O(log(n/stride) + stride) per lookup
+// instead of O(n). Builds the sparse index once per compactTraceIndex under a sync.Once.
+// NOTE-PERF-COMPACT: still does NOT parse the table into a map; the sparse index holds at
+// most n/stride samples and all block-list allocation is deferred to a confirmed hit.
+func (ci *compactTraceIndex) scanTraceIndexRaw(traceID [16]byte) []uint16 {
+	data := ci.traceIndexRaw
 	if len(data) < 5 {
 		return nil
 	}
@@ -269,70 +333,107 @@ func scanTraceIndexRaw(data []byte, traceID [16]byte) []uint16 {
 		return nil
 	}
 
-	traceCount := int(binary.LittleEndian.Uint32(data[1:]))
-	pos := 5
+	ci.ensureTraceIdxSamples(fmtVersion)
 
-	for range traceCount {
-		if pos+18 > len(data) {
+	// Determine the byte offset to begin the linear scan from. With a usable sparse index
+	// this is the largest sample whose trace ID is <= traceID; otherwise scan from the start.
+	pos := 5
+	if ci.traceIdxSampleOK && len(ci.traceIdxSamples) > 0 {
+		samples := ci.traceIdxSamples
+		// Find the last sample with traceID <= target via binary search.
+		lo, hi := 0, len(samples)
+		for lo < hi {
+			mid := int(uint(lo+hi) >> 1)
+			if !traceIDLess(traceID, samples[mid].traceID) {
+				lo = mid + 1
+			} else {
+				hi = mid
+			}
+		}
+		if lo == 0 {
+			// target precedes the first sampled trace ID; it cannot be present.
 			return nil
 		}
+		pos = samples[lo-1].offset
+	}
 
-		// Compare trace ID in-place — no allocation.
-		match := *(*[16]byte)(data[pos : pos+16]) == traceID
-		pos += 16
+	// NOTE-261: pre-decode the 16-byte target as a big-endian uint64 pair and compare
+	// each entry's ID the same way. A trace ID compares lexicographically (big-endian
+	// byte order) identically to comparing its high then low big-endian uint64 halves,
+	// so the per-entry comparison is two 8-byte loads + at most two integer compares
+	// instead of the old byte-by-byte loop in bytesLessTraceID plus a separate [16]byte
+	// equality copy. This is the inner-loop primitive of the bounded sparse-index scan
+	// (scanTraceIndexRaw was ~3.2% querier self-time on the 2026-06-13 profile).
+	targetHi := binary.BigEndian.Uint64(traceID[0:8])
+	targetLo := binary.BigEndian.Uint64(traceID[8:16])
 
-		blockRefCount := int(binary.LittleEndian.Uint16(data[pos:]))
-		pos += 2
-
-		if fmtVersion == shared.TraceIndexFmtVersion {
-			// v1: block_id[2] + span_count[2] + span_indices[N×2]
-			if match {
-				blockIDs := make([]uint16, 0, blockRefCount)
-				for range blockRefCount {
-					if pos+4 > len(data) {
-						return nil
-					}
-					blockID := binary.LittleEndian.Uint16(data[pos:])
-					spanCount := int(binary.LittleEndian.Uint16(data[pos+2:]))
-					pos += 4
-					if pos+spanCount*2 > len(data) {
-						return nil
-					}
-					pos += spanCount * 2
-					blockIDs = append(blockIDs, blockID)
-				}
-				return blockIDs
+	for pos < len(data) {
+		stride, ok := traceEntryStride(data, pos, fmtVersion)
+		if !ok {
+			return nil
+		}
+		entryHi := binary.BigEndian.Uint64(data[pos : pos+8])
+		entryLo := binary.BigEndian.Uint64(data[pos+8 : pos+16])
+		if entryHi == targetHi {
+			if entryLo == targetLo {
+				return decodeTraceEntryBlocks(data, pos, fmtVersion)
 			}
-			// Skip this trace's block entries without allocating.
-			for range blockRefCount {
-				if pos+4 > len(data) {
-					return nil
-				}
-				spanCount := int(binary.LittleEndian.Uint16(data[pos+2:]))
-				pos += 4
-				if pos+spanCount*2 > len(data) {
-					return nil
-				}
-				pos += spanCount * 2
-			}
-		} else {
-			// v2: block_id[2] only — fixed stride per block ref.
-			need := blockRefCount * 2
-			if pos+need > len(data) {
+			if targetLo < entryLo {
+				// Entries are sorted ascending; target would have appeared by now.
 				return nil
 			}
-			if match {
-				blockIDs := make([]uint16, blockRefCount)
-				for i := range blockRefCount {
-					blockIDs[i] = binary.LittleEndian.Uint16(data[pos+i*2:])
-				}
-				return blockIDs
-			}
-			pos += need
+		} else if targetHi < entryHi {
+			return nil
 		}
+		pos += stride
 	}
 
 	return nil
+}
+
+// traceIDLess reports whether a < b in lexicographic (big-endian) byte order, comparing
+// the two 16-byte IDs as big-endian uint64 pairs rather than byte by byte.
+func traceIDLess(a, b [16]byte) bool {
+	ahi := binary.BigEndian.Uint64(a[0:8])
+	bhi := binary.BigEndian.Uint64(b[0:8])
+	if ahi != bhi {
+		return ahi < bhi
+	}
+	return binary.BigEndian.Uint64(a[8:16]) < binary.BigEndian.Uint64(b[8:16])
+}
+
+// ensureTraceIdxSamples builds the sparse offset index (traceIdxSamples) once. On any
+// malformed entry it leaves traceIdxSampleOK false so the caller falls back to a full
+// linear scan from the start of the table.
+func (ci *compactTraceIndex) ensureTraceIdxSamples(fmtVersion uint8) {
+	ci.traceIdxIndexOnce.Do(func() {
+		data := ci.traceIndexRaw
+		traceCount := int(binary.LittleEndian.Uint32(data[1:]))
+		if traceCount == 0 {
+			ci.traceIdxSampleOK = true
+			return
+		}
+		samples := make([]traceIdxSample, 0, traceCount/traceIdxSampleStride+1)
+		pos := 5
+		for i := range traceCount {
+			if pos+18 > len(data) {
+				return // malformed: leave traceIdxSampleOK false
+			}
+			if i%traceIdxSampleStride == 0 {
+				samples = append(samples, traceIdxSample{
+					traceID: *(*[16]byte)(data[pos : pos+16]),
+					offset:  pos,
+				})
+			}
+			stride, ok := traceEntryStride(data, pos, fmtVersion)
+			if !ok {
+				return // malformed
+			}
+			pos += stride
+		}
+		ci.traceIdxSamples = samples
+		ci.traceIdxSampleOK = true
+	})
 }
 
 // ensureCompactHeaderParsedV3 reads the v3 split compact header section (raw, uncompressed).
