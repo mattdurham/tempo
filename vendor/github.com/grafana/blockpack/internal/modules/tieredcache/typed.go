@@ -419,6 +419,23 @@ func (t *TypedTieredCache) GetMultiV8Section(
 	tocType, subType uint32,
 	names []string,
 ) (map[string][]byte, bool, error) {
+	return batchGetV8Section(t, subType, names, func(name string) string {
+		return sectioncache.V8SectionKeyFast(fileID, tocType, subType, name)
+	})
+}
+
+// batchGetV8Section is the shared body of GetMultiV8Section / GetMultiV8SectionMixed
+// (NOTE-337): route by subType, bail if the tier is not a sectionBatchGetter, build the
+// cache keys via keyFor, GetMulti, then re-key the hits back onto the input slice by
+// index (NOTE-188 — keys[i] is the full key for reqs[i], so no reverse-lookup map).
+// K is the caller's per-request identity (column name, or V8SectionKey) that the
+// returned map is keyed by.
+func batchGetV8Section[K comparable](
+	t *TypedTieredCache,
+	subType uint32,
+	reqs []K,
+	keyFor func(K) string,
+) (map[K][]byte, bool, error) {
 	sub, sectionIdx := t.routeV8(subType)
 	bg, ok := sub.(sectionBatchGetter)
 	if !ok {
@@ -429,26 +446,22 @@ func (t *TypedTieredCache) GetMultiV8Section(
 	if t.sectionRequests != nil {
 		start = time.Now()
 	}
-	keys := make([]string, len(names))
-	for i, name := range names {
-		keys[i] = sectioncache.V8SectionKeyFast(fileID, tocType, subType, name)
+	keys := make([]string, len(reqs))
+	for i, rq := range reqs {
+		keys[i] = keyFor(rq)
 	}
 	hits, err := bg.GetMulti(keys)
 	if err != nil {
 		t.observeSection(sectionIdx, start, false, err)
 		return nil, true, err
 	}
-	// NOTE-188: re-key the hits by input name without a reverse-lookup map. `keys[i]`
-	// is the full cache key for `names[i]` (index-aligned by construction), so we walk
-	// the inputs and probe `hits` directly. Avoids the per-batch keyToName map alloc on
-	// the warm read path (one batch per block per query, NOTE-185/179).
-	out := make(map[string][]byte, len(hits))
-	for i, name := range names {
+	out := make(map[K][]byte, len(hits))
+	for i, rq := range reqs {
 		if val, found := hits[keys[i]]; found {
-			out[name] = val
+			out[rq] = val
 		}
 	}
-	// Record one batched-fetch observation; per-name hit/miss accounting is
+	// Record one batched-fetch observation; per-key hit/miss accounting is
 	// approximate at the batch level (the section metrics are coarse counters).
 	t.observeSection(sectionIdx, start, false, nil)
 	return out, true, nil
@@ -489,37 +502,9 @@ func (t *TypedTieredCache) GetMultiV8SectionMixed(
 	if len(reqs) == 0 {
 		return nil, true, nil
 	}
-	sub, sectionIdx := t.routeV8(reqs[0].SubType)
-	bg, ok := sub.(sectionBatchGetter)
-	if !ok {
-		return nil, false, nil
-	}
-
-	var start time.Time
-	if t.sectionRequests != nil {
-		start = time.Now()
-	}
-	keys := make([]string, len(reqs))
-	for i, rq := range reqs {
-		keys[i] = sectioncache.V8SectionKeyFast(fileID, rq.TocType, rq.SubType, rq.Name)
-	}
-	hits, err := bg.GetMulti(keys)
-	if err != nil {
-		t.observeSection(sectionIdx, start, false, err)
-		return nil, true, err
-	}
-	// NOTE-188: re-key the hits by input V8SectionKey without a reverse-lookup map.
-	// `keys[i]` is the full cache key for `reqs[i]` (index-aligned by construction), so
-	// we walk the inputs and probe `hits` directly. Avoids the per-batch keyToReq map
-	// alloc on the warm read path (one batch per block per query, NOTE-185).
-	out := make(map[shared.V8SectionKey][]byte, len(hits))
-	for i, rq := range reqs {
-		if val, found := hits[keys[i]]; found {
-			out[rq] = val
-		}
-	}
-	t.observeSection(sectionIdx, start, false, nil)
-	return out, true, nil
+	return batchGetV8Section(t, reqs[0].SubType, reqs, func(rq shared.V8SectionKey) string {
+		return sectioncache.V8SectionKeyFast(fileID, rq.TocType, rq.SubType, rq.Name)
+	})
 }
 
 // PutV8Section stores a single V8 per-column/per-index blob under the same key
@@ -531,15 +516,7 @@ func (t *TypedTieredCache) PutV8Section(
 	name string,
 	value []byte,
 ) error {
-	var sub filecache.Cache
-	switch subType {
-	case shared.ToCSubTypeBloom, shared.ToCSubTypeTrace:
-		sub = t.bloom
-	case shared.ToCSubTypeIntrinsic:
-		sub = t.intrinsic
-	default:
-		sub = t.toc
-	}
+	sub, _ := t.routeV8(subType)
 	key := sectioncache.V8SectionKeyFast(fileID, tocType, subType, name)
 	return sub.Put(key, value)
 }

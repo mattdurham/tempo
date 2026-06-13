@@ -1432,6 +1432,33 @@ func fillPKSetAndTimeBucketsFromRefs(
 	scatterTimeBucketsByRank(pkSet, maxPK, vals, tb, numSteps, timeBucketByPos)
 }
 
+// fillPKSetAndTimeBucketsFromPreSortedRefs is the pre-sorted-slice companion to
+// fillPKSetAndTimeBuckets / fillPKSetAndTimeBucketsFromRefs, used by the predicate-filtered
+// compact paths (count/rate, agg, histogram) whose refs arrive already packKey-sorted from
+// mergeJoinFilteredRefsWithVals (NOTE-114/166). Because the refs are pre-sorted, each ref's
+// downstream rank equals its slice index, so there is no need to build a pkBitset + POPCNT
+// rank index and scatter buckets by rank: sortedPKs[i] is filled directly from refs[i] and
+// timeBucketByPos[i] from vals[i] in one O(n) pass. NOTE-337.
+//
+// sortedPKs and timeBucketByPos must each be length n == len(refs); timeBucketByPos must be
+// zero-cleared (0 = out of range, 1..numSteps = bucket+1, NOTE-116).
+func fillPKSetAndTimeBucketsFromPreSortedRefs(
+	refs []modules_shared.BlockRef,
+	vals []uint64,
+	tb *vm.TimeBucketSpec,
+	numSteps int64,
+	sortedPKs []uint32,
+	timeBucketByPos []int32,
+) {
+	for i, ref := range refs {
+		sortedPKs[i] = packKey(ref.BlockIdx, ref.RowIdx)
+		bk := timeBucketIndex(int64(vals[i]), tb.StartTime, tb.StepSizeNanos) //nolint:gosec
+		if bk >= 0 && bk < numSteps {
+			timeBucketByPos[i] = int32(bk + 1) //nolint:gosec
+		}
+	}
+}
+
 // scatterTimeBucketsByRank builds a pkBitset membership set + POPCNT rank index over the
 // already-populated pkSet (length n, distinct in-range packKeys, maxPK is their maximum), then
 // scatters each ref's time bucket into its rank slot of timeBucketByPos. The rank a ref receives
@@ -1561,13 +1588,7 @@ func streamCountRateN1CompactFromRefs(
 	defer releaseCompactUint32(sortedPKs)
 	timeBucketByPos := acquireCompactInt32(n) // 0 = out of range; 1..numSteps = bucket+1 (NOTE-116)
 	defer releaseCompactInt32(timeBucketByPos)
-	for i, ref := range inRangeRefs {
-		sortedPKs[i] = packKey(ref.BlockIdx, ref.RowIdx)
-		bk := timeBucketIndex(int64(inRangeVals[i]), tb.StartTime, tb.StepSizeNanos) //nolint:gosec
-		if bk >= 0 && bk < numSteps {
-			timeBucketByPos[i] = int32(bk + 1) //nolint:gosec
-		}
-	}
+	fillPKSetAndTimeBucketsFromPreSortedRefs(inRangeRefs, inRangeVals, &tb, numSteps, sortedPKs, timeBucketByPos)
 	return streamCountRateN1CompactCore(
 		ctx,
 		r,
@@ -1737,6 +1758,27 @@ func streamAggN1Compact(
 
 	fillPKSetAndTimeBuckets(tsCol, lo, hi, &tb, numSteps, pkSet, timeBucketByPos)
 
+	return streamAggN1CompactCore(ctx, r, pkSet, timeBucketByPos, agg, numSteps, buckets)
+}
+
+// streamAggN1CompactCore is the shared accumulation core for the compact N=1 general-agg paths.
+// Receives sortedPKs (the in-range packKeys, position-aligned with timeBucketByPos) and
+// timeBucketByPos (0 = out-of-range sentinel), scans the group-by and aggregate columns via the
+// POPCNT rank index, accumulates min/max/sum/etc. into per-(group, step) buckets, and writes the
+// non-empty buckets into the caller's map. Called by streamAggN1Compact (after building the set
+// from tsCol refs, NOTE-224) and streamAggN1CompactFromRefs (with pre-sorted filtered refs from
+// mergeJoinFilteredRefsWithVals, NOTE-112). NOTE-337.
+func streamAggN1CompactCore(
+	ctx context.Context,
+	r *modules_reader.Reader,
+	sortedPKs []uint32,
+	timeBucketByPos []int32,
+	agg vm.AggregateSpec,
+	numSteps int64,
+	buckets map[string]*aggBucketState,
+) error {
+	n := len(sortedPKs)
+
 	// Get the group-by column.
 	groupByCol, err := r.GetIntrinsicColumn(agg.GroupBy[0])
 	if err != nil {
@@ -1750,7 +1792,7 @@ func streamAggN1Compact(
 	defer releaseCompactUint32(dictIdxByPos)
 	if groupByCol != nil {
 		valToIdx := make(map[string]uint32, 32)
-		scanGroupByColCompact(groupByCol, agg.GroupBy[0], pkSet, &dict, valToIdx, dictIdxByPos)
+		scanGroupByColCompact(groupByCol, agg.GroupBy[0], sortedPKs, &dict, valToIdx, dictIdxByPos)
 	}
 	numGroups := len(dict)
 
@@ -1766,7 +1808,7 @@ func streamAggN1Compact(
 			return aggErr
 		}
 		if aggCol != nil {
-			scanAggColCompact(aggCol, pkSet, aggValByPos, aggPresentByPos)
+			scanAggColCompact(aggCol, sortedPKs, aggValByPos, aggPresentByPos)
 		}
 	}
 
@@ -1861,91 +1903,9 @@ func streamAggN1CompactFromRefs(
 	defer releaseCompactUint32(sortedPKs)
 	timeBucketByPos := acquireCompactInt32(n) // 0 = out of range; 1..numSteps = bucket+1 (NOTE-116)
 	defer releaseCompactInt32(timeBucketByPos)
-	for i, ref := range inRangeRefs {
-		sortedPKs[i] = packKey(ref.BlockIdx, ref.RowIdx)
-		bk := timeBucketIndex(int64(inRangeVals[i]), tb.StartTime, tb.StepSizeNanos) //nolint:gosec
-		if bk >= 0 && bk < numSteps {
-			timeBucketByPos[i] = int32(bk + 1) //nolint:gosec
-		}
-	}
+	fillPKSetAndTimeBucketsFromPreSortedRefs(inRangeRefs, inRangeVals, &tb, numSteps, sortedPKs, timeBucketByPos)
 
-	groupByCol, err := r.GetIntrinsicColumn(agg.GroupBy[0])
-	if err != nil {
-		return err
-	}
-
-	// NOTE-125: pool dictIdxByPos (~28 MB), aggValByPos (~57 MB), aggPresentByPos (~7 MB).
-	dict := []string{""}
-	dictIdxByPos := acquireCompactUint32(n)
-	defer releaseCompactUint32(dictIdxByPos)
-	if groupByCol != nil {
-		valToIdx := make(map[string]uint32, 32)
-		scanGroupByColCompact(groupByCol, agg.GroupBy[0], sortedPKs, &dict, valToIdx, dictIdxByPos)
-	}
-	numGroups := len(dict)
-
-	aggValByPos := acquireCompactFloat64(n)
-	defer releaseCompactFloat64(aggValByPos)
-	aggPresentByPos := acquireCompactBool(n)
-	defer releaseCompactBool(aggPresentByPos)
-	if agg.Field != "" {
-		aggCol, aggErr := r.GetIntrinsicColumn(agg.Field)
-		if aggErr != nil {
-			return aggErr
-		}
-		if aggCol != nil {
-			scanAggColCompact(aggCol, sortedPKs, aggValByPos, aggPresentByPos)
-		}
-	}
-
-	groupBuckets := makeGroupBuckets(numGroups, numSteps) // NOTE-272
-	var arena bucketArena                                 // NOTE-276
-
-	spanCount := 0
-	for pos := range n {
-		if spanCount&ctxCheckMask == 0 {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-		}
-		spanCount++
-		bk := timeBucketByPos[pos]
-		if bk == 0 {
-			continue
-		}
-		gIdx := 0
-		if raw := dictIdxByPos[pos]; raw > 0 {
-			gIdx = int(raw - 1) //nolint:gosec
-		}
-		if gIdx >= numGroups {
-			continue
-		}
-		if groupBuckets[gIdx][bk-1] == nil {
-			b := arena.alloc()
-			b.min, b.max = math.MaxFloat64, -math.MaxFloat64
-			groupBuckets[gIdx][bk-1] = b
-		}
-		if aggPresentByPos[pos] {
-			updateAggBucket(groupBuckets[gIdx][bk-1], agg.Function, aggValByPos[pos])
-		}
-	}
-
-	// NOTE-245: precompute per-timestep key prefixes once instead of re-formatting timeIdx per cell.
-	keyPrefixes := timeBucketKeyPrefixes(numSteps)
-	for gIdx, row := range groupBuckets {
-		gk := ""
-		if gIdx < len(dict) {
-			gk = dict[gIdx]
-		}
-		for timeIdx, bucket := range row {
-			if bucket == nil {
-				continue
-			}
-			k := keyPrefixes[timeIdx] + gk
-			buckets[k] = bucket
-		}
-	}
-	return nil
+	return streamAggN1CompactCore(ctx, r, sortedPKs, timeBucketByPos, agg, numSteps, buckets)
 }
 
 // streamHistogramN1CompactFromRefs is the predicate-filtered companion to streamHistogramN1Compact.
@@ -1985,81 +1945,14 @@ func streamHistogramN1CompactFromRefs(
 	defer releaseCompactUint32(sortedPKs)
 	timeBucketByPos := acquireCompactInt32(n) // 0 = out of range; 1..numSteps = bucket+1 (NOTE-116)
 	defer releaseCompactInt32(timeBucketByPos)
-	for i, ref := range inRangeRefs {
-		sortedPKs[i] = packKey(ref.BlockIdx, ref.RowIdx)
-		bk := timeBucketIndex(int64(inRangeVals[i]), tb.StartTime, tb.StepSizeNanos) //nolint:gosec
-		if bk >= 0 && bk < numSteps {
-			timeBucketByPos[i] = int32(bk + 1) //nolint:gosec
-		}
-	}
+	fillPKSetAndTimeBucketsFromPreSortedRefs(inRangeRefs, inRangeVals, &tb, numSteps, sortedPKs, timeBucketByPos)
 
 	groupByCol, err := r.GetIntrinsicColumn(agg.GroupBy[0])
 	if err != nil {
 		return err
 	}
 
-	// NOTE-125: pool dictIdxByPos (~28 MB) and seenByPos (~7 MB).
-	dict := []string{""}
-	dictIdxByPos := acquireCompactUint32(n)
-	defer releaseCompactUint32(dictIdxByPos)
-	if groupByCol != nil {
-		valToIdx := make(map[string]uint32, 32)
-		scanGroupByColCompact(groupByCol, agg.GroupBy[0], sortedPKs, &dict, valToIdx, dictIdxByPos)
-	}
-	numGroups := len(dict)
-
-	aggCol, aggErr := r.GetIntrinsicColumn(agg.Field)
-	if aggErr != nil {
-		return aggErr
-	}
-	var actualStride int64
-	if aggCol != nil {
-		actualStride = int64(countIntrinsicHistogramBoundaries(aggCol, agg.Field)) + 1
-	} else {
-		actualStride = 1
-	}
-	stride2 := numSteps
-	stride1 := actualStride * numSteps
-	// NOTE-124: pool to avoid per-block allocation of numGroups×stride1 int64 array (up to 68MB).
-	groupCountsFlat := acquireGroupCountsFlat(int64(numGroups) * stride1) //nolint:gosec
-	defer releaseGroupCountsFlat(groupCountsFlat)
-
-	// NOTE-182: exponent-indexed boundary lookup replaces the per-row map[float64]int64.
-	bi := newBoundaryIndexer(agg.Field, actualStride)
-	getBoundaryIdx := bi.index
-
-	// NOTE-125: pool seenByPos (~7 MB at n=7.2 M).
-	seenByPos := acquireCompactBool(n)
-	defer releaseCompactBool(seenByPos)
-	if aggCol != nil {
-		if err := scanAggColHistogramCompact(
-			ctx, aggCol, sortedPKs, timeBucketByPos, dictIdxByPos, seenByPos,
-			getBoundaryIdx, groupCountsFlat, stride1, stride2, actualStride, agg.Field, bi.lookup, bi,
-		); err != nil {
-			return err
-		}
-	}
-	boundaries := bi.boundaries
-
-	// Absent-row pass: positions not seen in the aggregate column → boundary-0 bucket.
-	for pos, seen := range seenByPos {
-		if seen {
-			continue
-		}
-		bk := timeBucketByPos[pos]
-		if bk == 0 {
-			continue
-		}
-		var gIdx int64
-		if raw := dictIdxByPos[pos]; raw > 0 {
-			gIdx = int64(raw - 1) //nolint:gosec
-		}
-		if gIdx < int64(numGroups) { //nolint:gosec
-			groupCountsFlat[gIdx*stride1+int64(bk)-1]++ //nolint:gosec
-		}
-	}
-
-	return streamByRefSliceHistogramFlatEmit(groupCountsFlat, stride1, stride2, numGroups, dict, boundaries, buckets)
+	return streamHistogramN1CompactCore(ctx, r, sortedPKs, timeBucketByPos, groupByCol, agg, numSteps, buckets)
 }
 
 // scanAggColCompact scans an intrinsic column and populates aggValByPos/aggPresentByPos for each
@@ -2223,6 +2116,29 @@ func streamHistogramN1Compact(
 
 	fillPKSetAndTimeBucketsFromRefs(inRangeRefs, inRangeVals, &tb, numSteps, pkSet, timeBucketByPos)
 
+	return streamHistogramN1CompactCore(ctx, r, pkSet, timeBucketByPos, groupByCol, agg, numSteps, buckets)
+}
+
+// streamHistogramN1CompactCore is the shared accumulation core for the compact N=1
+// histogram_over_time paths. Receives sortedPKs (the in-range packKeys, position-aligned with
+// timeBucketByPos) and timeBucketByPos (0 = out-of-range sentinel), scans the group-by column for
+// the group dict, scans the aggregate column into a flat (group × boundary × step) counts array
+// via scanAggColHistogramCompact, runs the absent-row boundary-0 pass, and emits the non-zero
+// cells. Called by streamHistogramN1Compact (after building the set from in-range refs, NOTE-225)
+// and streamHistogramN1CompactFromRefs (with pre-sorted filtered refs from
+// mergeJoinFilteredRefsWithVals, NOTE-114). NOTE-337.
+func streamHistogramN1CompactCore(
+	ctx context.Context,
+	r *modules_reader.Reader,
+	sortedPKs []uint32,
+	timeBucketByPos []int32,
+	groupByCol *modules_shared.IntrinsicColumn,
+	agg vm.AggregateSpec,
+	numSteps int64,
+	buckets map[string]*aggBucketState,
+) error {
+	n := len(sortedPKs)
+
 	// Build group dict and dictIdxByPos by scanning the group-by column.
 	// dict[0]="" is the absent/default group; dict[1..] are actual group values.
 	// NOTE-125: pool dictIdxByPos (~28 MB) and seenByPos (~7 MB).
@@ -2231,7 +2147,7 @@ func streamHistogramN1Compact(
 	defer releaseCompactUint32(dictIdxByPos)
 	if groupByCol != nil {
 		valToIdx := make(map[string]uint32, 32)
-		scanGroupByColCompact(groupByCol, agg.GroupBy[0], pkSet, &dict, valToIdx, dictIdxByPos)
+		scanGroupByColCompact(groupByCol, agg.GroupBy[0], sortedPKs, &dict, valToIdx, dictIdxByPos)
 	}
 	numGroups := len(dict)
 
@@ -2260,7 +2176,7 @@ func streamHistogramN1Compact(
 	seenByPos := acquireCompactBool(n)
 	defer releaseCompactBool(seenByPos)
 	if aggCol != nil {
-		if err := scanAggColHistogramCompact(ctx, aggCol, pkSet, timeBucketByPos, dictIdxByPos, seenByPos, getBoundaryIdx, groupCountsFlat, stride1, stride2, actualStride, agg.Field, bi.lookup, bi); err != nil {
+		if err := scanAggColHistogramCompact(ctx, aggCol, sortedPKs, timeBucketByPos, dictIdxByPos, seenByPos, getBoundaryIdx, groupCountsFlat, stride1, stride2, actualStride, agg.Field, bi.lookup, bi); err != nil {
 			return err
 		}
 	}

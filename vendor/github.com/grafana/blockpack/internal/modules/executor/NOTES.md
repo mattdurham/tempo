@@ -5129,3 +5129,33 @@ benchmark-specific constants — a general decorate-sort + single-allocation key
 **Correctness:** the sort order is identical (same key string, same `cmp.Compare`), only the
 number of times each key is computed changes. `go test -race ./internal/modules/executor/...`
 green. Back-ref: `metrics_trace.go:traceLabelString`, `metrics_trace.go:sortSeriesByLabelString`.
+
+---
+
+## NOTE-337: deduplicate the compact N=1 FromRefs preamble and agg/histogram bodies
+
+Three predicate-filtered compact paths (`streamCountRateN1CompactFromRefs`,
+`streamAggN1CompactFromRefs`, `streamHistogramN1CompactFromRefs`) each copy-pasted the same
+~12-line preamble that builds `sortedPKs`/`timeBucketByPos` from the already-packKey-sorted
+`inRangeRefs`/`inRangeVals` (from `mergeJoinFilteredRefsWithVals`). Because those refs are
+pre-sorted, each ref's downstream rank equals its slice index, so unlike the unfiltered
+`fillPKSetAndTimeBuckets*` helpers there is no bitset + POPCNT rank scatter — it is a straight
+index-for-index fill. Extracted `fillPKSetAndTimeBucketsFromPreSortedRefs`, mirroring the
+existing `fillPKSetAndTimeBuckets` / `fillPKSetAndTimeBucketsFromRefs` pattern.
+
+The agg and histogram paths additionally duplicated their entire ~80-line accumulation body
+between the unfiltered (`streamAggN1Compact` / `streamHistogramN1Compact`) and FromRefs
+variants — the count/rate path had already split this out as `streamCountRateN1CompactCore`,
+but agg and histogram had not followed suit. Extracted `streamAggN1CompactCore` and
+`streamHistogramN1CompactCore`, each taking `sortedPKs`/`timeBucketByPos` and the agg spec;
+both the set-building unfiltered entry point and the pre-sorted FromRefs entry point now call
+the shared core. Net ~140 fewer lines, no behaviour change.
+
+**Verification:** new equivalence tests `TestStreamAggN1Compact_UnfilteredEqualsFromRefs` and
+`TestStreamHistogramN1Compact_UnfilteredEqualsFromRefs` feed both entry points the same logical
+spans (FromRefs gets a packKey-sorted copy) and assert identical bucket maps;
+`TestFillPKSetAndTimeBucketsFromPreSortedRefs` pins the preamble's index-for-index fill and the
+0=out-of-range sentinel. `go test -race ./internal/modules/executor/...` green; `make precommit`
+fully green. Back-ref: `metrics_trace_intrinsic.go:fillPKSetAndTimeBucketsFromPreSortedRefs`,
+`metrics_trace_intrinsic.go:streamAggN1CompactCore`,
+`metrics_trace_intrinsic.go:streamHistogramN1CompactCore`.

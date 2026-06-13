@@ -163,3 +163,27 @@ per-name fetches. Misses fall through to the existing per-name path, so the resu
 
 Back-ref: `internal/modules/tieredcache/typed.go:GetMultiIntrinsic`,
 `internal/modules/blockio/reader/intrinsic_reader.go:PrefetchIntrinsicColumns`.
+
+---
+
+## NOTE-337: deduplicate the V8-section batch-fetch body and PutV8Section routing
+
+`GetMultiV8Section` (`[]string` column names) and `GetMultiV8SectionMixed` (`[]V8SectionKey`)
+were ~39 lines each of structurally identical code: route by subType, bail if the tier is not a
+`sectionBatchGetter`, build `keys []string`, `GetMulti`, then re-key the hits back onto the
+input slice by index (NOTE-188). The only difference was the per-request identity type used to
+build the key and key the result map.
+
+Extracted `batchGetV8Section[K comparable](t, subType, reqs []K, keyFor func(K) string)` — a
+generic helper parameterized by the key-builder. Both public methods now reduce to a one-line
+call passing their respective `keyFor` closure. Behaviour is byte-for-byte preserved (same
+routing, same index-aligned re-key, same `observeSection` accounting).
+
+`PutV8Section` also carried a verbatim copy of `routeV8`'s subType→sub-cache switch (minus the
+metric-index return). It now calls `routeV8` and discards the metric index.
+
+**Verification:** new tests `TestPutV8Section_RoutesViaRouteV8` (all four routing classes land
+in the same tier `routeV8` picks) and `TestGetMultiV8SectionMixed_BatchHitAndMiss` /
+`_Empty` / `_NoBatchSupport` exercise the V8SectionKey-keyed path through the shared helper.
+tieredcache suite green under `-race`; `make precommit` fully green. Pure structural
+deduplication, no behaviour change. Back-ref: `internal/modules/tieredcache/typed.go:batchGetV8Section`.
