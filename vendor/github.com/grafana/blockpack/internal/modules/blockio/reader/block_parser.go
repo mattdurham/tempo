@@ -728,7 +728,14 @@ func decompressV14ColumnDataInto(
 	if cap(dst) < frameLen {
 		dst = make([]byte, 0, frameLen)
 	}
-	decoded, decErr := snappy.Decode(dst[:0], data)
+	// NOTE-262: hand snappy.Decode a slice grown to its full capacity, NOT dst[:0]. snappy
+	// reuses the dst backing array only when frameLen <= len(dst) — it checks len, not cap —
+	// so passing dst[:0] (len 0) made it take the make([]byte, frameLen) zeroed-alloc branch
+	// on every column even though dst was just grown to cap >= frameLen, defeating the
+	// buffer reuse this function's "avoids a new allocation" comment promised. dst[:cap(dst)]
+	// has len >= frameLen, so snappy decodes in place (no alloc, no memclr); the returned
+	// slice is resliced to frameLen as before.
+	decoded, decErr := snappy.Decode(dst[:cap(dst)], data)
 	if decErr != nil {
 		return nil, dst, fmt.Errorf("col %q snappy decode: %w", name, decErr)
 	}

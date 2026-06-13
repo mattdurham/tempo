@@ -33,27 +33,6 @@ func decodeBoundedSnappyColumn(compressed []byte) ([]byte, error) {
 	return snappy.Decode(nil, compressed)
 }
 
-// decodeBoundedSnappyColumnInto is decodeBoundedSnappyColumn with a caller-supplied scratch
-// buffer (NOTE-239). The decoded page is written into *scratch when it fits, reusing the
-// pooled backing array across pages instead of allocating a fresh buffer per page via
-// snappy.Decode(nil, ...). snappy may reallocate when the decoded size exceeds the buffer's
-// capacity, so the caller must update its pool pointer with the returned slice. The MaxBlockSize
-// decompression-bomb guard is applied identically to decodeBoundedSnappyColumn.
-//
-// Callers must treat the returned slice as valid only until the next decode into the same
-// scratch (the search-path scan loops copy out BlockRefs / string values per page before
-// advancing), exactly as decodePagedColumnBlob already does with its AcquireIntrinsicBuf pool.
-func decodeBoundedSnappyColumnInto(compressed []byte, scratch []byte) ([]byte, error) {
-	decodedLen, lenErr := snappy.DecodedLen(compressed)
-	if lenErr != nil {
-		return nil, fmt.Errorf("snappy decoded length: %w", lenErr)
-	}
-	if decodedLen > MaxBlockSize {
-		return nil, fmt.Errorf("snappy decoded size %d exceeds MaxBlockSize %d", decodedLen, MaxBlockSize)
-	}
-	return snappy.Decode(scratch, compressed)
-}
-
 // NOTE-012: Snappy decode buffer pool — 64KB default cap, 4MB cap guard.
 // AcquireIntrinsicBuf / ReleaseIntrinsicBuf are used in decodePagedColumnBlob
 // to reuse decode scratch buffers across calls, avoiding per-page allocations
@@ -77,6 +56,45 @@ var intrinsicBufPool = &sync.Pool{
 
 // AcquireIntrinsicBuf returns a pooled *[]byte for snappy decode scratch space.
 func AcquireIntrinsicBuf() *[]byte { return intrinsicBufPool.Get().(*[]byte) }
+
+// snappyDecodeReuse decompresses src into the pooled buffer *bp, reusing its retained
+// backing array whenever it is large enough.
+//
+// NOTE-262: snappy.Decode reuses dst's backing array only when the decoded length is
+// <= len(dst) — it checks len(dst), NOT cap(dst). Every caller here held a pooled buffer
+// reset to length 0 by ReleaseIntrinsicBuf, so snappy.Decode(*bp, src) always took the
+// `make([]byte, dLen)` branch and allocated a fresh zeroed buffer per decode, completely
+// defeating the intrinsicBufPool — the pool's retained capacity was never used because
+// the slice handed to snappy was always len 0. A querier CPU profile (2026-06-13) showed
+// snappy.decode at 6.50% self-time (the largest blockpack-controllable frame) with the
+// per-page make+memclr riding on top of it on the M1/M4 paged-column decode path.
+//
+// Growing the slice to its full capacity (*bp)[:cap(*bp)] before the call lets snappy take
+// the reuse branch whenever dLen <= cap, so a warmed pooled buffer is reused in place with
+// no allocation and no memclr (snappy.decode overwrites exactly dLen bytes). When the page
+// is larger than the pooled capacity snappy still reallocates (unavoidable), and *bp is
+// updated to the larger buffer so it is retained for the next, larger page. Behavior is
+// otherwise identical to snappy.Decode(*bp, src): the returned slice has len == dLen.
+//
+// NOTE-263: the MaxBlockSize decompression-bomb guard is applied here so every
+// pooled-buffer decode — including the search-path paged scanners that adopted this helper
+// in NOTE-263 — rejects an obviously-corrupt blob before snappy allocates a multi-megabyte
+// dst. The guard is cheap: snappy.DecodedLen reads only the varint length prefix.
+func snappyDecodeReuse(bp *[]byte, src []byte) ([]byte, error) {
+	decodedLen, lenErr := snappy.DecodedLen(src)
+	if lenErr != nil {
+		return nil, fmt.Errorf("snappy decoded length: %w", lenErr)
+	}
+	if decodedLen > MaxBlockSize {
+		return nil, fmt.Errorf("snappy decoded size %d exceeds MaxBlockSize %d", decodedLen, MaxBlockSize)
+	}
+	dst, err := snappy.Decode((*bp)[:cap(*bp)], src)
+	if err != nil {
+		return nil, err
+	}
+	*bp = dst
+	return dst, nil
+}
 
 // ReleaseIntrinsicBuf returns bp to the pool. Resets length; replaces oversized buffers.
 func ReleaseIntrinsicBuf(bp *[]byte) {
@@ -625,12 +643,11 @@ func decodeDictPagesArena(
 				i, pm.Offset, pm.Length, len(blob))
 		}
 		bp := AcquireIntrinsicBuf()
-		pageRaw, decErr := snappy.Decode(*bp, blob[pageStart:pageEnd])
+		pageRaw, decErr := snappyDecodeReuse(bp, blob[pageStart:pageEnd]) // NOTE-262
 		if decErr != nil {
 			ReleaseIntrinsicBuf(bp)
 			return nil, fmt.Errorf("decodeDictPagesArena: page %d snappy: %w", i, decErr)
 		}
-		*bp = pageRaw
 		if retainedBytes+len(pageRaw) <= retainBudget {
 			retained[i] = bp
 			retainedBytes += len(pageRaw)
@@ -652,11 +669,10 @@ func decodeDictPagesArena(
 			return nil, fmt.Errorf("decodeDictPagesArena: page %d out of bounds (offset=%d len=%d blobLen=%d)",
 				i, pm.Offset, pm.Length, len(blob))
 		}
-		pageRaw, decErr := snappy.Decode(*scratchBuf, blob[pageStart:pageEnd])
+		pageRaw, decErr := snappyDecodeReuse(scratchBuf, blob[pageStart:pageEnd]) // NOTE-262
 		if decErr != nil {
 			return nil, fmt.Errorf("decodeDictPagesArena: page %d snappy: %w", i, decErr)
 		}
-		*scratchBuf = pageRaw
 		return pageRaw, nil
 	}
 
@@ -871,11 +887,10 @@ func decodePagedColumnBlob(blob []byte) (*IntrinsicColumn, error) {
 				i, pm.Offset, pm.Length, len(blob))
 		}
 		pageCompressed := blob[pageStart:pageEnd]
-		pageRaw, decErr := snappy.Decode(*pageBuf, pageCompressed)
+		pageRaw, decErr := snappyDecodeReuse(pageBuf, pageCompressed) // NOTE-262
 		if decErr != nil {
 			return nil, fmt.Errorf("decodePagedColumnBlob: page %d snappy: %w", i, decErr)
 		}
-		*pageBuf = pageRaw // update pool buffer pointer (snappy may have reallocated)
 
 		// NOTE-145: Flat/XOR/Delta pages decode directly into merged's pre-allocated
 		// slices — the append helpers skip the per-page *IntrinsicColumn struct and
@@ -997,12 +1012,11 @@ func decodePagesParallel(
 						"(offset=%d len=%d blobLen=%d)", i, pm.Offset, pm.Length, len(blob)))
 					return
 				}
-				pageRaw, decErr := snappy.Decode(*pageBuf, blob[pageStart:pageEnd])
+				pageRaw, decErr := snappyDecodeReuse(pageBuf, blob[pageStart:pageEnd]) // NOTE-262
 				if decErr != nil {
 					setErr(fmt.Errorf("decodePagesParallel: page %d snappy: %w", i, decErr))
 					return
 				}
-				*pageBuf = pageRaw // snappy may have reallocated the buffer
 
 				off := rowOffsets[i]
 				rc := int(pm.RowCount)
@@ -1643,12 +1657,11 @@ func scanDictPagedBlob(
 		if pageEnd > len(blob) {
 			return nil
 		}
-		pageRaw, decErr := decodeBoundedSnappyColumnInto(blob[pageStart:pageEnd], *pageBuf)
+		pageRaw, decErr := snappyDecodeReuse(pageBuf, blob[pageStart:pageEnd]) // NOTE-263
 		if decErr != nil {
 			slog.Debug("intrinsic_codec: snappy decode failed", "err", decErr)
 			return nil
 		}
-		*pageBuf = pageRaw // snappy may have reallocated; keep the pool pointer current
 		var ok bool
 		result, ok = scanDictPageRaw(pageRaw, blockW, rowW, toc.ColType, matchFn, maxRefs, result)
 		if !ok {
@@ -1882,12 +1895,11 @@ func scanFlatPagedBlob(blob []byte, lo, hi uint64, hasLo, hasHi bool, maxRefs in
 		if pageEnd > len(blob) {
 			return nil
 		}
-		pageRaw, decErr := decodeBoundedSnappyColumnInto(blob[pageStart:pageEnd], *pageBuf)
+		pageRaw, decErr := snappyDecodeReuse(pageBuf, blob[pageStart:pageEnd]) // NOTE-263
 		if decErr != nil {
 			slog.Debug("intrinsic_codec: snappy decode failed", "err", decErr)
 			return nil
 		}
-		*pageBuf = pageRaw // snappy may have reallocated; keep the pool pointer current
 
 		rowCount := int(pm.RowCount)
 		refsStart := pageRefsStart(pageRaw)
@@ -1952,12 +1964,11 @@ func scanFlatPagedFiltered(blob []byte, backward bool, limit int, filter func(Bl
 		if pageEnd > len(blob) {
 			return false
 		}
-		pageRaw, decErr := decodeBoundedSnappyColumnInto(blob[pageStart:pageEnd], *pageBuf)
+		pageRaw, decErr := snappyDecodeReuse(pageBuf, blob[pageStart:pageEnd]) // NOTE-263
 		if decErr != nil {
 			slog.Debug("intrinsic_codec: snappy decode failed", "err", decErr)
 			return false
 		}
-		*pageBuf = pageRaw // snappy may have reallocated; keep the pool pointer current
 		rowCount := int(pm.RowCount)
 		refsStart := pageRefsStart(pageRaw)
 
@@ -2102,12 +2113,11 @@ func scanDeltaUint64PagedBlob(
 		if pageEnd > len(blob) {
 			return nil
 		}
-		pageRaw, decErr := decodeBoundedSnappyColumnInto(blob[pageStart:pageEnd], *pageBuf)
+		pageRaw, decErr := snappyDecodeReuse(pageBuf, blob[pageStart:pageEnd]) // NOTE-263
 		if decErr != nil {
 			slog.Debug("intrinsic_codec: snappy decode failed", "err", decErr)
 			return nil
 		}
-		*pageBuf = pageRaw // snappy may have reallocated; keep the pool pointer current
 
 		startIdx, endIdx, p, ok := scanDeltaUint64PageRange(pageRaw, int(pm.RowCount), lo, hi, hasLo, hasHi)
 		if !ok {
@@ -2172,12 +2182,11 @@ func scanDeltaUint64PagedFiltered(
 		if pageEnd > len(blob) {
 			return false
 		}
-		pageRaw, decErr := decodeBoundedSnappyColumnInto(blob[pageStart:pageEnd], *pageBuf)
+		pageRaw, decErr := snappyDecodeReuse(pageBuf, blob[pageStart:pageEnd]) // NOTE-263
 		if decErr != nil {
 			slog.Debug("intrinsic_codec: snappy decode failed", "err", decErr)
 			return false
 		}
-		*pageBuf = pageRaw // snappy may have reallocated; keep the pool pointer current
 		rowCount := int(pm.RowCount)
 		p := 0
 		for range rowCount {

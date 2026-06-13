@@ -1571,3 +1571,76 @@ ToC/section/block-index/trace-index parse and cold V14 column decompression.
 Back-ref: `shared/unzeroed_alloc.go:MakeNoZeroBytes`, `reader/parser.go:decodeBoundedSnappy`,
 `reader/block_parser.go:decompressV14ColumnData`; NOTE-258 (the pointer-free unzeroed-alloc
 lever this extends from decode arenas to snappy dst buffers).
+
+## NOTE-262: hand snappy.Decode the pooled buffer at full capacity, not length 0
+
+**Problem:** Every pooled-buffer snappy decode call site passed the buffer at length 0:
+`snappy.Decode(*bp, src)` where `*bp` came from `intrinsicBufPool` / `AcquireIntrinsicBuf`
+(reset to `[:0]` by `ReleaseIntrinsicBuf`), and `decompressV14ColumnDataInto` passed
+`dst[:0]` after explicitly growing `dst`'s capacity to `frameLen`. But `snappy.Decode`
+reuses the dst backing array only when `dLen <= len(dst)` — it checks **len**, not **cap**.
+With a length-0 slice that test is always false, so snappy took the `make([]byte, dLen)`
+branch and allocated a fresh **zeroed** buffer on every page/column decode, completely
+defeating the pool: its retained capacity was never used, and the memclr from the fresh
+make rode on top of the decode. A querier CPU profile (2026-06-13) put `snappy.decode` at
+6.50% self-time — the largest blockpack-controllable frame — on the M1/M4 paged-column
+decode path, with the redundant per-page make+memclr layered on it.
+
+**Fix:** `snappyDecodeReuse(bp, src)` (and the inline `dst[:cap(dst)]` in
+`decompressV14ColumnDataInto`) hand snappy a slice grown to its full capacity. When
+`dLen <= cap`, `len(dst[:cap])` >= dLen so snappy decodes in place — no allocation, no
+memclr — and reslices the result to `[:dLen]`, byte-identical to the old result. When the
+page exceeds the pooled capacity snappy still reallocates (unavoidable) and `*bp` is updated
+to the larger buffer so it is retained for the next page. Applied at all four pooled
+callsites: `decodeDictPagesArena` pass1/pass2, `decodePagedColumnBlob` serial loop, and
+`decodePagesParallel` workers.
+
+**Verification:** a probe confirmed snappy's `len`-not-`cap` semantics directly (len-0 dst
+reallocates even with ample cap; `[:cap]` reuses the backing array). Decode microbenchmarks
+(`-benchmem`): Dict 8.98MB→4.00MB/op (-55%), 372→265 allocs (-29%), 5.53ms→2.86ms (-48%);
+Delta 15.6MB→12.3MB/op (-21%), 79→28 allocs (-65%); XORBytes ~-3% bytes, -11% time. The Dict
+path is the M4 `rate() by` group-by hot path. `go test -race` green for shared/reader/executor.
+
+**Queries affected:** all paged-column decode on warm cache misses — every metrics rate/
+group-by query and every search scan that decodes intrinsic/V14 columns. Independent of the
+NOTE-258/259 unzeroed-alloc lever (those fixed the *nil/MakeNoZeroBytes* dst paths; this fixes
+the *pooled* dst paths that NOTE-258/259 did not cover).
+
+Back-ref: `shared/intrinsic_codec.go:snappyDecodeReuse`, `decodeDictPagesArena`,
+`decodePagedColumnBlob`, `decodePagesParallel`; `reader/block_parser.go:decompressV14ColumnDataInto`.
+
+## NOTE-263: extend the NOTE-262 pooled-buffer reuse to the search-path paged scanners
+
+**Problem:** NOTE-262 fixed the `snappy.Decode(*bp, src)` len-vs-cap defect at four
+metrics-decode callsites by routing them through `snappyDecodeReuse`, but five search-path
+paged scanners were missed: `scanDictPagedBlob`, `scanFlatPagedBlob`, `scanFlatPagedFiltered`,
+`scanDeltaUint64PagedBlob`, and `scanDeltaUint64PagedFiltered`. Each acquired a pooled buffer
+(`AcquireIntrinsicBuf`, reset to `[:0]` on release) and called
+`decodeBoundedSnappyColumnInto(blob[...], *pageBuf)` per page — i.e. `snappy.Decode(scratch, src)`
+with a **length-0** scratch. As NOTE-262 documented, snappy checks `len(dst)` not `cap(dst)`,
+so the length-0 slice always failed the reuse test and snappy allocated a fresh **zeroed**
+`make([]byte, dLen)` per page, defeating the pool exactly as on the metrics path. These are
+the search Q1–Q10 column-scan paths (dict/flat/delta range + filtered scanners).
+
+**Fix:** switch all five sites to `snappyDecodeReuse(pageBuf, blob[...])`, which hands snappy
+`(*bp)[:cap(*bp)]` so a warmed pooled buffer is reused in place (no alloc, no memclr) whenever
+`dLen <= cap`, and updates `*bp` internally when snappy reallocates for an oversized page. The
+trailing `*pageBuf = pageRaw` pointer-update lines became redundant (the helper does it) and
+were removed. The `MaxBlockSize` decompression-bomb guard that
+`decodeBoundedSnappyColumnInto` applied was folded into `snappyDecodeReuse` (via a cheap
+`snappy.DecodedLen` prefix read) so it now protects every pooled decode, including the four
+NOTE-262 metrics sites that previously lacked it. `decodeBoundedSnappyColumnInto` had no
+remaining callers and was deleted.
+
+**Verification:** `go build ./...` and `go test -race ./blockio/shared ./blockio/reader
+./executor` green. The five scanners' decode result is byte-identical to before: snappy
+reslices to `[:dLen]` whether it reuses the backing array or allocates, and the bomb guard
+only rejects blobs `decodeBoundedSnappyColumnInto` already rejected.
+
+**Queries affected:** all search scans (Q1–Q10) that decode paged dict/flat/delta intrinsic
+columns on a warm cache. Stacks directly on NOTE-262 (same defect class, disjoint callsites)
+and independent of NOTE-258/259 (nil-dst paths).
+
+Back-ref: `shared/intrinsic_codec.go:snappyDecodeReuse`, `scanDictPagedBlob`,
+`scanFlatPagedBlob`, `scanFlatPagedFiltered`, `scanDeltaUint64PagedBlob`,
+`scanDeltaUint64PagedFiltered`.
