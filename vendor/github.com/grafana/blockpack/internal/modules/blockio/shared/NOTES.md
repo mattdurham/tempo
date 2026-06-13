@@ -1542,3 +1542,32 @@ pass under `-race`, proving the decode output is byte-identical and no garbage l
 Back-ref: `internal/modules/blockio/shared/unzeroed_alloc.go`,
 `intrinsic_codec.go:decodePagedColumnBlob`, `decodeDictPagesArena`;
 NOTE-145/150 (pre-sized arenas), NOTE-152 (dict arena), NOTE-256 (delta decode BCE).
+
+## NOTE-259: unzeroed snappy-decode dst for cold metadata/column decompression
+
+**Problem:** `decodeBoundedSnappy` (`reader/parser.go`) and `decompressV14ColumnData`
+(`reader/block_parser.go`) call `snappy.Decode(nil, src)`. With a nil dst, snappy allocates
+`make([]byte, decodedLen)` internally — which memclr-zeroes the whole span — then `decode()`
+overwrites **every** byte. The zeroing is pure waste. These are the cold section/ToC/
+trace-index/column decode paths (`decodeBoundedSnappy` is ~7.18% inclusive / ~1.00% memclr on
+profile 2026-06-09); the decoded bytes escape to `r.cache`, so the buffer can't be pooled, but
+the per-decode zeroing still costs CPU on every cache miss.
+
+**Fix:** `MakeNoZeroBytes(n)` (`shared/unzeroed_alloc.go`) allocates via `runtime.mallocgc`
+with `needzero=false`, skipping the clear. Both callsites already compute `decodedLen` /
+`frameLen` (for the decompression-bomb guard) and pass `MakeNoZeroBytes(decodedLen)` as the
+dst. snappy.Decode reslices it to `[:decodedLen]` (since `decodedLen <= len(dst)`) and
+overwrites every byte, so the result is byte-identical to the nil-dst path.
+
+**Correctness / safety:** `[]byte` is pointer-free, so the GC never scans the uninitialised
+backing array — garbage bytes can never be misread as a heap pointer. snappy.Decode guarantees
+a full overwrite of `[0:decodedLen)` before returning the slice (it writes the entire decoded
+block or returns an error and we discard the buffer). The `MaxMetadataSize`/`MaxBlockSize`
+decompression-bomb guards still run unchanged before the alloc.
+
+**Queries affected:** every query whose blocks miss the warm metadata/column caches — cold
+ToC/section/block-index/trace-index parse and cold V14 column decompression.
+
+Back-ref: `shared/unzeroed_alloc.go:MakeNoZeroBytes`, `reader/parser.go:decodeBoundedSnappy`,
+`reader/block_parser.go:decompressV14ColumnData`; NOTE-258 (the pointer-free unzeroed-alloc
+lever this extends from decode arenas to snappy dst buffers).

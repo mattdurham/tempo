@@ -48,3 +48,17 @@ func makeNoZeroBlockRef(n int) []BlockRef {
 	//nolint:gosec // G103: unzeroed pointer-free alloc, fully overwritten before read (NOTE-258)
 	return unsafe.Slice((*BlockRef)(p), n)
 }
+
+// MakeNoZeroBytes returns a []byte of length and capacity n whose backing array is NOT zeroed
+// (NOTE-259). Exported for the reader package's snappy-decode dst (see decodeBoundedSnappy):
+// snappy.Decode overwrites every byte of a dst >= DecodedLen, so the memclr that make() emits
+// is pure waste. []byte is pointer-free, so the unscanned garbage is GC-safe; the caller MUST
+// fully overwrite [0:n) before any read. Returns nil for n <= 0.
+func MakeNoZeroBytes(n int) []byte {
+	if n <= 0 {
+		return nil
+	}
+	p := mallocgc(uintptr(n), nil, false)
+	//nolint:gosec // G103: unzeroed pointer-free alloc, fully overwritten by snappy.Decode (NOTE-259)
+	return unsafe.Slice((*byte)(p), n)
+}

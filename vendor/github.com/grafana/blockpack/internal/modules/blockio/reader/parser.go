@@ -216,7 +216,12 @@ func decodeBoundedSnappy(compressed []byte) ([]byte, error) {
 	if uint64(decodedLen) > shared.MaxMetadataSize { //nolint:gosec // safe: decodedLen is non-negative
 		return nil, fmt.Errorf("snappy decoded size %d exceeds MaxMetadataSize %d", decodedLen, shared.MaxMetadataSize)
 	}
-	return snappy.Decode(nil, compressed)
+	// NOTE-259: pass a pre-sized, unzeroed dst of exactly decodedLen. snappy.Decode reslices
+	// dst to [:decodedLen] (since decodedLen <= len(dst)) and overwrites every byte, so the
+	// memclr that snappy.Decode(nil, …)'s internal make([]byte, dLen) emits is pure waste.
+	// The decoded bytes escape to r.cache so the buffer can't be pooled, but []byte is
+	// pointer-free, so the unzeroed backing array is GC-safe before the full overwrite.
+	return snappy.Decode(shared.MakeNoZeroBytes(decodedLen), compressed)
 }
 
 // readV14Section reads and snappy-decodes one type-keyed section from the section directory.

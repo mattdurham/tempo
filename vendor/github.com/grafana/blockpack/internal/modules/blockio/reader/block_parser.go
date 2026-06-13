@@ -688,7 +688,9 @@ func decompressV14ColumnData(name string, data []byte, uncompressedLen uint32) (
 	if frameLen > shared.MaxBlockSize {
 		return nil, fmt.Errorf("col %q: snappy frame claims %d bytes, exceeds MaxBlockSize", name, frameLen)
 	}
-	decompressed, decErr := snappy.Decode(nil, data)
+	// NOTE-259: pre-sized, unzeroed dst — snappy.Decode overwrites every byte of frameLen, so
+	// the memclr from snappy's internal make([]byte, frameLen) is waste. []byte is pointer-free.
+	decompressed, decErr := snappy.Decode(shared.MakeNoZeroBytes(frameLen), data)
 	if decErr != nil {
 		return nil, fmt.Errorf("col %q snappy decode: %w", name, decErr)
 	}
