@@ -340,31 +340,64 @@ func (ci *compactTraceIndex) scanTraceIndexRaw(fileID string, traceID [16]byte) 
 	targetHi := binary.BigEndian.Uint64(traceID[0:8])
 	targetLo := binary.BigEndian.Uint64(traceID[8:16])
 
-	// NOTE-267: with a usable dense offset index, binary-search the entry offsets
-	// directly. Each probe reads the candidate trace ID from data at its stored
-	// offset -- no traceEntryStride call. The dense index walks the variable-stride
-	// layout exactly once, at build time, replacing the per-lookup stride loop with
-	// O(log n) ID compares (traceEntryStride was ~2% querier self-time).
+	// NOTE-279: with a usable sparse offset index, binary-search the SAMPLED entry
+	// offsets (one per traceIdxSampleStride entries) to bound the target to a single
+	// window of at most traceIdxSampleStride consecutive entries, then linear-walk that
+	// window via traceEntryStride to find the exact match. Each binary-search probe reads
+	// the sample's 16-byte trace ID directly from data at its stored offset -- no
+	// traceEntryStride call in the search itself; the bounded walk pays at most
+	// traceIdxSampleStride strides (a small constant) per lookup. Supersedes the NOTE-267
+	// dense index (one int32 per entry): the sparse index is traceIdxSampleStride× smaller,
+	// so it survives the n/16 parsedTraceSparseCache budget without eviction and the
+	// O(traceCount) build walk (~2.3% querier self-time, 2026-06-09 profile) re-runs far
+	// less often. Entries are sorted ascending by trace ID, so the sample preceding the
+	// window's first entry is a strict lower bound on the window's trace IDs.
 	if ci.traceIdxSampleOK && len(ci.traceIdxOffsets) > 0 {
 		offs := ci.traceIdxOffsets
+		// Binary search for the last sample whose trace ID is <= target; the matching
+		// entry, if present, lies in [that sample, the next sample).
 		lo, hi := 0, len(offs)
 		for lo < hi {
 			mid := int(uint(lo+hi) >> 1)
 			pos := int(offs[mid])
 			entryHi := binary.BigEndian.Uint64(data[pos : pos+8])
 			entryLo := binary.BigEndian.Uint64(data[pos+8 : pos+16])
-			switch {
-			case entryHi < targetHi:
+			if entryHi < targetHi || (entryHi == targetHi && entryLo <= targetLo) {
 				lo = mid + 1
-			case entryHi > targetHi:
-				hi = mid
-			case entryLo == targetLo:
-				return decodeTraceEntryBlocks(data, pos, fmtVersion)
-			case entryLo < targetLo:
-				lo = mid + 1
-			default:
+			} else {
 				hi = mid
 			}
+		}
+		// lo is the first sample strictly greater than target; the candidate window starts
+		// at the preceding sample (lo-1). If lo == 0 the target is below the first sample
+		// (and thus below the first entry, since sample[0] is the first entry), so it is
+		// absent.
+		if lo == 0 {
+			return nil
+		}
+		windowStart := int(offs[lo-1])
+		var windowEnd int
+		if lo < len(offs) {
+			windowEnd = int(offs[lo])
+		} else {
+			windowEnd = len(data)
+		}
+		// Linear-walk the window (at most traceIdxSampleStride entries).
+		for pos := windowStart; pos < windowEnd; {
+			entryHi := binary.BigEndian.Uint64(data[pos : pos+8])
+			entryLo := binary.BigEndian.Uint64(data[pos+8 : pos+16])
+			if entryHi == targetHi && entryLo == targetLo {
+				return decodeTraceEntryBlocks(data, pos, fmtVersion)
+			}
+			// Entries are sorted ascending: once we pass the target, it is absent.
+			if entryHi > targetHi || (entryHi == targetHi && entryLo > targetLo) {
+				return nil
+			}
+			stride, ok := traceEntryStride(data, pos, fmtVersion)
+			if !ok {
+				return nil
+			}
+			pos += stride
 		}
 		return nil
 	}
@@ -434,54 +467,49 @@ func (ci *compactTraceIndex) ensureTraceIdxSamples(fileID string, fmtVersion uin
 }
 
 // buildTraceIdxSamples walks the raw trace-index table once, recording the byte offset of
-// EVERY trace entry (NOTE-267: a dense offset index). Returns ok=false on a malformed entry
-// (the caller then falls back to a full linear scan). The returned offsets are plain int32
-// byte positions into data, so they do not alias the raw bytes. Offsets fit in int32: the
-// trace-index section is at most ~15 MB (well under 2^31).
+// every traceIdxSampleStride-th trace entry (NOTE-279: a sparse offset index, always
+// including entry 0). Returns ok=false on a malformed entry (the caller then falls back to a
+// full linear scan). The returned offsets are plain int32 byte positions into data, so they
+// do not alias the raw bytes. Offsets fit in int32: the trace-index section is at most
+// ~15 MB (well under 2^31).
 func buildTraceIdxSamples(data []byte, fmtVersion uint8) (offsets []int32, ok bool) {
 	traceCount := int(binary.LittleEndian.Uint32(data[1:]))
 	if traceCount == 0 {
 		return nil, true
 	}
-	// NOTE-268: pre-extend the offsets slice to exactly traceCount and store by index
-	// instead of append, and inline the v2 (block-IDs-only) per-entry stride directly
-	// into the walk loop rather than calling the non-inlinable traceEntryStride per entry.
-	// This build runs once per distinct trace-index section (amortized across Readers by
-	// the NOTE-265 process cache) but was still ~2.7% combined querier self-time on the
-	// 2026-06-13 profile (buildTraceIdxSamples ~0.91% + the traceEntryStride it called per
-	// entry ~1.79%) — a real CPU sink on bloom-hit trace-resolution queries (Q5/Q7/Q9/M6/M9)
-	// whenever a section is first touched. The v2 layout (the current writer format) has a
-	// fixed-shape entry — trace_id[16] + block_ref_count[2] + block_ref_count×block_id[2] —
-	// so its stride is 18+blockRefCount*2 with a single bounds check per entry, with no
-	// function-call overhead and the offsets store discharged from the loop bound. v1
-	// (legacy variable-stride entries with per-block span indices) keeps the generic
-	// traceEntryStride call.
-	offsets = make([]int32, traceCount)
+	// NOTE-279: store a SPARSE sample of entry offsets — one offset per
+	// traceIdxSampleStride entries (always including entry 0) — instead of the NOTE-267
+	// dense one-offset-per-entry index. The build still walks every entry once (the
+	// variable v1 stride forces it, and v2 must validate every entry's extent), but the
+	// stored slice is traceIdxSampleStride× smaller. The dense index was 4 bytes/entry; a
+	// section with millions of traces produced a multi-MB slice that the n/16
+	// parsedTraceSparseCache budget could evict, forcing the O(traceCount) walk to re-run on
+	// the next bloom-hit lookup (buildTraceIdxSamples ~2.3% querier self-time, 2026-06-09
+	// profile). A sparse index of the same sections fits the budget without eviction, so the
+	// walk amortizes across far more queries. scanTraceIndexRaw binary-searches the samples
+	// to bound the target to one window of at most traceIdxSampleStride entries, then walks
+	// that window — a small bounded per-lookup cost in exchange for the rebuild reduction.
+	// The number of samples is ceil(traceCount / stride).
+	numSamples := (traceCount + traceIdxSampleStride - 1) / traceIdxSampleStride
+	offsets = make([]int32, 0, numSamples)
 	pos := 5
-	// NOTE-275: eliminate the per-entry bounds checks in the dense-index build walk —
-	// the top blockpack-controllable querier CPU hotspot (buildTraceIdxSamples ~2.9% self-
-	// time on the 2026-06-09 profile, run once per distinct trace-index section on bloom-hit
-	// trace-resolution queries). The block_ref_count read was written as
-	// binary.LittleEndian.Uint16(data[pos+16:]), which the compiler lowered to TWO bounds
-	// checks per entry (an IsSliceInBounds for the data[pos+16:] reslice plus an IsInBounds
-	// for the 2-byte load) because the loop guard compared pos+18 against a copied length
-	// n := len(data) rather than against data directly, breaking the proof chain. Reading
-	// the two count bytes by direct index against data (whose extent the pos+18 guard has
-	// already proven) lets the compiler discharge both checks: data[pos+16] and data[pos+17]
-	// are provably < len(data) once pos+18 <= len(data) holds. Verified via
-	// -d=ssa/check_bce/debug=1: no Found IsInBounds/IsSliceInBounds remain in this loop.
+	// NOTE-275: read the two count bytes by direct index against data so the compiler can
+	// discharge the per-entry bounds checks (verified via -d=ssa/check_bce/debug=1: the
+	// pos+18 / p+4 guards prove the indexed loads are in bounds).
 	if fmtVersion == shared.TraceIndexFmtVersion2 {
-		for i := range offsets {
+		for i := range traceCount {
 			// Header (trace_id[16] + block_ref_count[2]) must be fully in bounds before
 			// we read block_ref_count, and the entry's refs (block_ref_count×block_id[2])
 			// must not overrun the section — the same validation traceEntryStride performed
-			// per entry. Checking the full entry extent here keeps every recorded offset
-			// pointing at a real, in-bounds entry header (the binary search relies on each
-			// offset's 16-byte trace ID being readable and the entries staying sorted).
+			// per entry. Checking the full entry extent here keeps every recorded sample
+			// offset pointing at a real, in-bounds entry header (the binary search relies on
+			// each sampled offset's 16-byte trace ID being readable and entries sorted).
 			if pos+18 > len(data) {
 				return nil, false // malformed
 			}
-			offsets[i] = int32(pos) //nolint:gosec // pos < len(data) <= ~15 MB < 2^31
+			if i%traceIdxSampleStride == 0 {
+				offsets = append(offsets, int32(pos)) //nolint:gosec // pos < len(data) <= ~15 MB < 2^31
+			}
 			hdr := data[pos : pos+18 : pos+18]
 			blockRefCount := int(hdr[16]) | int(hdr[17])<<8
 			pos += 18 + blockRefCount*2
@@ -492,26 +520,15 @@ func buildTraceIdxSamples(data []byte, fmtVersion uint8) (offsets []int32, ok bo
 		return offsets, true
 	}
 	// NOTE-270: inline the v1 (variable-stride: per-ref block_id[2]+span_count[2]+
-	// span_indices[span_count×2]) entry walk directly here, mirroring the v2 fast path
-	// above. Production V8 files still embed the legacy v1 trace-index layout, so the
-	// previous code took the per-entry traceEntryStride function-call path — which the
-	// 2026-06-13 querier CPU profile showed at ~9.6s self-time (alongside this builder's
-	// ~15.5s) on bloom-hit trace-resolution queries. traceEntryStride is non-inlinable
-	// (it loops over refs and returns two values), so it forced a call + return per entry
-	// across millions of entries each time a section was first touched. Folding the same
-	// bounds-checked ref walk into this loop removes the call overhead and the redundant
-	// (stride, ok) tuple plumbing while preserving identical malformed detection: every
-	// recorded offset still points at a fully-in-bounds entry header.
-	// NOTE-275: same per-entry bounds-check elimination as the v2 path above. The two
-	// uint16 reads (block_ref_count at pos+16, span_count at p+2) are decoded by direct
-	// byte index against data — the pos+18 and p+4 guards already prove those indices are
-	// < len(data), so the compiler discharges the bounds checks the binary.LittleEndian
-	// reslice+load pair would otherwise emit per entry / per block-ref.
-	for i := range offsets {
+	// span_indices[span_count×2]) entry walk directly here, mirroring the v2 path above.
+	// Production V8 files still embed the legacy v1 trace-index layout.
+	for i := range traceCount {
 		if pos+18 > len(data) {
 			return nil, false // malformed
 		}
-		offsets[i] = int32(pos) //nolint:gosec // pos < len(data) <= ~15 MB < 2^31
+		if i%traceIdxSampleStride == 0 {
+			offsets = append(offsets, int32(pos)) //nolint:gosec // pos < len(data) <= ~15 MB < 2^31
+		}
 		hdr := data[pos : pos+18 : pos+18]
 		blockRefCount := int(hdr[16]) | int(hdr[17])<<8
 		p := pos + 18
@@ -530,6 +547,13 @@ func buildTraceIdxSamples(data []byte, fmtVersion uint8) (offsets []int32, ok bo
 	}
 	return offsets, true
 }
+
+// traceIdxSampleStride is the number of trace-index entries represented by each stored
+// offset in the NOTE-279 sparse offset index. A larger stride shrinks the cached index
+// (reducing parsedTraceSparseCache eviction and thus expensive rebuilds) at the cost of a
+// longer bounded linear walk per lookup. 32 keeps the index ~32× smaller than the old dense
+// index while bounding each lookup's window walk to at most 32 entries.
+const traceIdxSampleStride = 32
 
 // ensureCompactHeaderParsedV3 reads the v3 split compact header section (raw, uncompressed).
 // Called by ensureCompactHeaderParsed when compactTracesLen > 0 (footer V6).

@@ -2090,3 +2090,41 @@ the same two bytes read in the same little-endian order. Covered by the existing
 green.
 
 Back-ref: `reader/trace_index.go:buildTraceIdxSamples`.
+
+---
+
+### NOTE-279: sparse-sampled trace-index offset index (replaces NOTE-267 dense per-entry index) — 2026-06-09
+
+NOTE-267 made the trace-ID lookup binary-search a *dense* offset index — one int32 per trace
+entry — built once per distinct trace-index section. NOTE-265 caches that built index in the
+process-level `parsedTraceSparseCache` (budget `n/16` of the intrinsic-cache bytes). The
+remaining cost, ~2.3% querier self-time on the 2026-06-09 process_cpu profile, is the
+`buildTraceIdxSamples` O(traceCount) build walk itself. A section with millions of traces
+produces a multi-MB dense index (4 bytes/entry); under the `n/16` budget those large sections
+can evict, forcing the expensive walk to re-run on the next bloom-hit lookup against the same
+section.
+
+**Mechanism:** store a *sparse* sample — one offset per `traceIdxSampleStride` (32) entries,
+always including entry 0 — instead of every entry. The build still walks every entry once (the
+v1 variable stride forces it, and v2 must validate every entry's extent), but the stored slice
+is ~32× smaller, so the same sections fit the budget without eviction and the walk amortizes
+across far more queries. `scanTraceIndexRaw` binary-searches the samples for the last sample
+whose trace ID is ≤ target, bounding the match to one window of at most `traceIdxSampleStride`
+consecutive entries `[sample[lo-1], sample[lo])`, then linear-walks that window via
+`traceEntryStride` to find (or rule out) the exact match. Entries are sorted ascending by trace
+ID, so the bounded walk stops as soon as it passes the target. The per-lookup window walk is a
+small bounded constant (≤32 strides) traded for the rebuild-frequency reduction; trace-ID
+lookups (Q8 and the trace-resolution second pass) are not on the per-row hot path.
+
+**Correctness:** if `lo == 0` the target sorts below `sample[0]` (the first entry), so it is
+absent. The window-end is `sample[lo]` or `len(data)` for the last window. Malformed detection
+in the build is unchanged (the same `pos+18 > len(data)` / `p+4 > len(data)` / overrun guards
+on every entry); a failed build still caches `ok=false`. Covered by the existing
+`TestScanTraceIndexRaw_SparseMatchesLinear` (4000 entries spanning many windows, every present
+ID resolves and every absent ID returns nil), `TestScanTraceIndexRaw_EmptyAndTiny`,
+`TestScanTraceIndexRaw_V1`, `TestScanTraceIndexRaw_V1MultiEntry`, and
+`TestScanTraceIndexRaw_ProcessCacheWarmEqualsCold`. `go test -race ./blockio/reader ./executor`
+green. General sampling factor, no benchmark-specific constants.
+
+Back-ref: `reader/trace_index.go:buildTraceIdxSamples`,
+`reader/trace_index.go:scanTraceIndexRaw`, `reader/compacttraceindex.go:traceIdxOffsets`.

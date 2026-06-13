@@ -90,7 +90,8 @@ type traceSparseIndex struct {
 
 // SizeBytes estimates the in-memory size of the sparse index for objectcache LRU budgeting.
 func (t *traceSparseIndex) SizeBytes() int64 {
-	// Each entry is one int32 byte offset = 4 bytes.
+	// Each sample is one int32 byte offset = 4 bytes (NOTE-279: one sample per
+	// traceIdxSampleStride entries, so this is ~stride× smaller than a dense index).
 	return int64(len(t.offsets))*4 + 16
 }
 
