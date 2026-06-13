@@ -8,12 +8,10 @@ package executor
 // See also NOTE-055 for the streamHistogramGroupBy dict-amortization extension.
 
 import (
-	"cmp"
 	"context"
 	"math"
 	"math/bits"
 	"runtime"
-	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -2539,9 +2537,7 @@ func finalizeCountRateSeries(series []TraceTimeSeries) []TraceTimeSeries {
 	if len(series) == 0 {
 		return nil
 	}
-	slices.SortFunc(series, func(a, b TraceTimeSeries) int {
-		return cmp.Compare(traceLabelString(a.Labels), traceLabelString(b.Labels))
-	})
+	sortSeriesByLabelString(series)
 	return series
 }
 

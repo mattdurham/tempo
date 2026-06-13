@@ -625,9 +625,7 @@ func traceBuildDenseSeries(
 	}
 
 	// Sort for deterministic output (SPEC-ETM-11).
-	slices.SortFunc(series, func(a, b TraceTimeSeries) int {
-		return cmp.Compare(traceLabelString(a.Labels), traceLabelString(b.Labels))
-	})
+	sortSeriesByLabelString(series)
 
 	return series
 }
@@ -727,11 +725,60 @@ func traceLabelString(labels []TraceMetricLabel) string {
 	if len(labels) == 0 {
 		return ""
 	}
-	parts := make([]string, len(labels))
-	for i, l := range labels {
-		parts[i] = l.Name + "=" + l.Value
+	// NOTE-281: build the key in a single pre-sized allocation. The former
+	// make([]string, n) + per-element "name=value" concat + strings.Join allocated
+	// n+2 strings per call (one transient per label plus the parts slice and the
+	// joined result). Sizing one byte buffer up front and writing name/value/separators
+	// into it directly yields exactly one allocation (the final string), turning the
+	// per-series key build from O(n) allocations into O(1).
+	total := 0
+	for i := range labels {
+		total += len(labels[i].Name) + len(labels[i].Value) + 2 // '=' and ',' (extra ',' counted; trimmed below)
 	}
-	return strings.Join(parts, ",")
+	if total > 0 {
+		total-- // last label has no trailing ','
+	}
+	var b strings.Builder
+	b.Grow(total)
+	for i := range labels {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(labels[i].Name)
+		b.WriteByte('=')
+		b.WriteString(labels[i].Value)
+	}
+	return b.String()
+}
+
+// sortSeriesByLabelString sorts series in place by their deterministic label-string key
+// (SPEC-ETM-11). NOTE-281: it computes traceLabelString exactly once per series (a
+// decorate-sort) instead of inside the comparator, which the previous SortFunc call did —
+// re-building each series' key on every one of the O(n log n) comparisons. For a query with
+// many output series (e.g. rate() by a high-cardinality attribute) that was ~2·n·log n key
+// builds, each allocating the joined string; the decorate-sort drops it to n by pairing each
+// series with its precomputed key, sorting the pairs, and writing the reordered series back.
+func sortSeriesByLabelString(series []TraceTimeSeries) {
+	if len(series) < 2 {
+		return
+	}
+	// Decorate with the precomputed key in a single backing slice (one allocation), sort the
+	// pairs, then write the reordered series back. This computes traceLabelString once per
+	// series while adding only one transient slice regardless of series count.
+	type keyedSeries struct {
+		key string
+		s   TraceTimeSeries
+	}
+	decorated := make([]keyedSeries, len(series))
+	for i := range series {
+		decorated[i] = keyedSeries{key: traceLabelString(series[i].Labels), s: series[i]}
+	}
+	slices.SortFunc(decorated, func(a, b keyedSeries) int {
+		return cmp.Compare(a.key, b.key)
+	})
+	for i := range decorated {
+		series[i] = decorated[i].s
+	}
 }
 
 // traceHistogramSeries builds histogram time-series from accumulated buckets.
@@ -824,8 +871,6 @@ func traceHistogramSeries(
 		series = append(series, TraceTimeSeries{Labels: labels, Values: values})
 	}
 
-	slices.SortFunc(series, func(a, b TraceTimeSeries) int {
-		return cmp.Compare(traceLabelString(a.Labels), traceLabelString(b.Labels))
-	})
+	sortSeriesByLabelString(series)
 	return series
 }

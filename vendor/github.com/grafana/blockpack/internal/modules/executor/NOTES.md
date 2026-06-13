@@ -5092,3 +5092,40 @@ contract is unchanged: the matrix pointer slot is still nil until `alloc()` fill
 benchmark-specific constants. Threaded `*bucketArena` through `accumulateAggDirectScanCol`.
 Back-ref: `aggbucketstate.go:bucketArena`, five matrix-cell sites in
 `metrics_trace_intrinsic.go`. Bench: `BenchmarkIntrinsicMaxGroupBy_HighCard`.
+
+---
+
+## NOTE-281: compute the per-series label-string sort key once (decorate-sort) and build it in one allocation
+
+The deterministic output ordering for trace-metrics results (SPEC-ETM-11) sorts the series by
+`traceLabelString(Labels)`. All three sort sites (`traceBuildDenseSeries`, `traceHistogramSeries`,
+`finalizeCountRateSeries`) passed `traceLabelString` *inside* the `slices.SortFunc` comparator, so
+each series' key was rebuilt on every one of the O(n log n) comparisons — roughly `2·n·log n` key
+builds for a query with n output series. The 2026-06-13 alloc profile of
+`BenchmarkIntrinsicCountRateGroupBy_AllocCount` put `traceLabelString` at ~16% of hot-path
+allocations, and it grows with series count (high-cardinality `rate() by`, histogram-over-time
+group-by → M4/M6/M8).
+
+**Two changes:**
+
+1. `traceLabelString` now writes the `name=value` pairs (comma-separated) into a single
+   pre-sized `strings.Builder` instead of `make([]string, n)` + per-element `name+"="+value`
+   concat + `strings.Join`. That collapses n+2 transient allocations per call to exactly one
+   (the final string). Byte-for-byte identical output (verified against the old form over
+   empty/single/multi/empty-field cases).
+
+2. New `sortSeriesByLabelString` helper does a decorate-sort: it computes each series' key
+   exactly once into a single `[]struct{key; series}` backing slice, sorts the pairs by the
+   precomputed key, then writes the reordered series back. So key builds drop from O(n log n)
+   to n, and the decoration adds only one transient slice regardless of series count (no
+   regression for the small-n case — verified: `BenchmarkIntrinsicCountRateGroupBy_AllocCount`
+   stays at 25 allocs/op). All three sort sites now call the shared helper.
+
+**Result:** `BenchmarkIntrinsicHistogramGroupBy_AllocCount` (the multi-series, multi-label
+histogram path that drives M8) drops from 52 → 42 allocs/op (-19%); the high-card count/rate
+microbench drops ~2 allocs/op; the small-series count/rate microbench is unchanged. No
+benchmark-specific constants — a general decorate-sort + single-allocation key build.
+
+**Correctness:** the sort order is identical (same key string, same `cmp.Compare`), only the
+number of times each key is computed changes. `go test -race ./internal/modules/executor/...`
+green. Back-ref: `metrics_trace.go:traceLabelString`, `metrics_trace.go:sortSeriesByLabelString`.
