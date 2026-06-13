@@ -4824,3 +4824,36 @@ their downstream series are unchanged. No benchmark-specific constants — a gen
 hoist over the timestep dimension.
 **Queries affected:** group-by rate/agg metrics (M4, M6, M9) emit. Back-ref:
 `internal/modules/executor/metrics_trace_intrinsic.go:timeBucketKeyPrefixes`.
+
+## NOTE-246: single-pass scatter for dense/histogram series build
+
+`traceBuildDenseSeries` and `traceHistogramSeries` consume the per-block accumulation map
+`map[string]*aggBucketState`, whose composite key is `bucketIdx\x00attrGroupKey` (dense) or
+`bucketIdx\x00attrGroupKey\x00histBoundary` (histogram). Both formerly used a two-phase build:
+(1) iterate the map once to enumerate the distinct series keys, then (2) for every
+`series × bucketIdx` cell, rebuild the composite key string and probe the map for that cell's
+bucket. For a sparse grid — the common case once a query has many groups but few populated
+timesteps per group — phase (2) performed `numSeries × numBuckets` map lookups plus an equal
+number of composite-key rebuilds, the vast majority returning nil (an empty cell). M4/M6/M9
+(rate-by, ~248 groups) and especially M8 (`histogram_over_time ... by`, ~1987 series × numBuckets
+steps) paid this cost in full.
+
+The replacement iterates the populated buckets exactly once and scatters each cell's value
+directly into its series' dense `values` slice, keyed by `attrGroupKey` (dense) or
+`(attrGroupKey, histBoundary)` (histogram). The scatter touches only `len(buckets)` cells — the
+number of *populated* cells — and rebuilds no composite keys. Series ordering remains
+deterministic via the final `slices.SortFunc` over the full label string (SPEC-ETM-11); the
+histogram path's former intermediate sort by (attrGroupKey, numeric boundary) was redundant with
+that final sort and is removed.
+
+**Correctness:** unpopulated cells must carry the per-function "empty" value (SPEC-ETM-2): 0 for
+COUNT/RATE, NaN otherwise. The dense path pre-fills each freshly allocated series slice with
+`traceRowValue(nil, ...)` (which yields exactly that) before scattering populated cells over it;
+when the empty value is 0 the pre-fill is skipped (slice zero value already 0). The histogram
+path uses COUNT semantics throughout (empty = 0 = slice zero value), so no pre-fill is needed.
+Composite-key parsing is unchanged (first-`\x00` strips bucketIdx; last-`\x00` separates the
+histogram boundary), and bucketIdx is range-checked to `[0, numBuckets)` before use. No
+benchmark-specific constants — a general algorithmic change from dense probing to sparse scatter.
+**Queries affected:** all group-by trace metrics series build (M4, M6, M9 rate-by; M8 histogram).
+Back-ref: `internal/modules/executor/metrics_trace.go:traceBuildDenseSeries`,
+`internal/modules/executor/metrics_trace.go:traceHistogramSeries`.

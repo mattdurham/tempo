@@ -547,16 +547,64 @@ func traceBuildDenseSeries(
 	buckets map[string]*aggBucketState,
 	querySpec *vm.QuerySpec,
 ) []TraceTimeSeries {
-	attrGroupKeys, numBuckets := collectGroupKeys(buckets, querySpec.TimeBucketing)
-	if attrGroupKeys == nil {
+	if len(buckets) == 0 {
+		return nil
+	}
+	tb := querySpec.TimeBucketing
+	numBuckets := int64(0)
+	if tb.Enabled && tb.StepSizeNanos > 0 {
+		numBuckets = (tb.EndTime - tb.StartTime + tb.StepSizeNanos - 1) / tb.StepSizeNanos
+	}
+	if numBuckets <= 0 {
 		return nil
 	}
 
 	stepSec := float64(querySpec.TimeBucketing.StepSizeNanos) / 1e9
 	groupBy := querySpec.Aggregate.GroupBy
+	funcName := querySpec.Aggregate.Function
+	quantile := querySpec.Aggregate.Quantile
 
-	series := make([]TraceTimeSeries, 0, len(attrGroupKeys))
-	for _, attrGroupKey := range attrGroupKeys {
+	// NOTE-246: single-pass scatter. The composite map key is "bucketIdx\x00attrGroupKey",
+	// so iterate the populated buckets exactly once and scatter each cell's computed value
+	// directly into its series' dense values slice — keyed by attrGroupKey. This replaces the
+	// former two-phase build (collectGroupKeys to enumerate distinct attrGroupKeys, then a
+	// numSeries×numBuckets loop that rebuilt each composite key and probed the map). For a
+	// sparse grid that loop performed numSeries×numBuckets map lookups + key rebuilds, the
+	// vast majority returning nil; the scatter touches only len(buckets) populated cells.
+	//
+	// Unpopulated cells must carry the "empty" value: 0 for COUNT/RATE, NaN for the others
+	// (SPEC-ETM-2). traceRowValue(nil, ...) yields exactly that, so each freshly allocated
+	// series slice is pre-filled with it and only populated cells overwrite.
+	emptyVal := traceRowValue(nil, funcName, stepSec, quantile)
+	seriesVals := make(map[string][]float64, len(buckets))
+	for compositeKey, bucket := range buckets {
+		sep := strings.IndexByte(compositeKey, '\x00')
+		if sep < 0 {
+			continue
+		}
+		bucketIdx, err := strconv.ParseInt(compositeKey[:sep], 10, 64)
+		if err != nil || bucketIdx < 0 || bucketIdx >= numBuckets {
+			continue
+		}
+		attrGroupKey := compositeKey[sep+1:]
+		values, ok := seriesVals[attrGroupKey]
+		if !ok {
+			values = make([]float64, numBuckets)
+			if emptyVal != 0 {
+				for i := range values {
+					values[i] = emptyVal
+				}
+			}
+			seriesVals[attrGroupKey] = values
+		}
+		values[bucketIdx] = traceRowValue(bucket, funcName, stepSec, quantile)
+	}
+	if len(seriesVals) == 0 {
+		return nil
+	}
+
+	series := make([]TraceTimeSeries, 0, len(seriesVals))
+	for attrGroupKey, values := range seriesVals {
 		// Build label slice from GroupBy + attrVals.
 		// Note: check only len(groupBy) > 0, not attrGroupKey != "". If all GroupBy attributes
 		// are absent from a span, attrGroupKey is "" but labels must still be emitted with
@@ -573,21 +621,6 @@ func traceBuildDenseSeries(
 				labels = append(labels, TraceMetricLabel{Name: intrinsicLabelName(name), Value: val})
 			}
 		}
-
-		// NOTE-070: acquire scratch buffer once for all buckets in this series;
-		// reset to [:0] at each inner iteration to avoid per-bucket pool roundtrips.
-		scratch := acquireCompositeKeyScratch()
-		values := make([]float64, numBuckets)
-		for bucketIdx := int64(0); bucketIdx < numBuckets; bucketIdx++ {
-			*scratch = strconv.AppendInt((*scratch)[:0], bucketIdx, 10)
-			*scratch = append(*scratch, '\x00')
-			*scratch = append(*scratch, attrGroupKey...)
-			bucket := buckets[string(*scratch)]
-			values[bucketIdx] = traceRowValue(bucket, querySpec.Aggregate.Function, stepSec,
-				querySpec.Aggregate.Quantile)
-		}
-		releaseCompositeKeyScratch(scratch)
-
 		series = append(series, TraceTimeSeries{Labels: labels, Values: values})
 	}
 
@@ -727,14 +760,32 @@ func traceHistogramSeries(
 		attrGroupKey   string
 		bucketBoundary string
 	}
-	keySet := make(map[histSeriesKey]struct{}, len(buckets))
-	for compositeKey := range buckets {
-		// Key format: "bucketIdx\x00attrGroupKey\x00histBoundary".
-		// attrGroupKey may itself contain "\x00" separating multiple GroupBy values,
-		// so split on the FIRST "\x00" (strips bucketIdx) and the LAST "\x00" (separates
-		// histBoundary from attrGroupKey) rather than using a naive second Cut.
+
+	// NOTE-246: single-pass scatter (companion to traceBuildDenseSeries). The histogram
+	// composite key is "bucketIdx\x00attrGroupKey\x00histBoundary"; iterate the populated
+	// buckets exactly once and scatter each count directly into its series' dense values
+	// slice — keyed by (attrGroupKey, bucketBoundary). This replaces the former two-phase
+	// build (enumerate distinct (attrGroupKey, boundary) pairs, then a numSeries×numBuckets
+	// loop that rebuilt each composite key and probed the map). For M8 (1987 histogram
+	// series × numBuckets steps) that probe loop ran numSeries×numBuckets map lookups + key
+	// rebuilds, nearly all returning nil; the scatter touches only len(buckets) populated
+	// cells. Histogram values use COUNT semantics: unpopulated cells are 0, which is the
+	// zero value of a freshly allocated slice, so no pre-fill is needed.
+	//
+	// attrGroupKey may itself contain "\x00" separating multiple GroupBy values, so split on
+	// the FIRST "\x00" (strips bucketIdx) and the LAST "\x00" (separates histBoundary from
+	// attrGroupKey).
+	seriesVals := make(map[histSeriesKey][]float64, len(buckets))
+	for compositeKey, bucket := range buckets {
+		if bucket == nil {
+			continue
+		}
 		firstSep := strings.IndexByte(compositeKey, '\x00')
 		if firstSep < 0 {
+			continue
+		}
+		bucketIdx, err := strconv.ParseInt(compositeKey[:firstSep], 10, 64)
+		if err != nil || bucketIdx < 0 || bucketIdx >= numBuckets {
 			continue
 		}
 		rest := compositeKey[firstSep+1:]
@@ -742,30 +793,21 @@ func traceHistogramSeries(
 		if lastSep < 0 {
 			continue
 		}
-		keySet[histSeriesKey{attrGroupKey: rest[:lastSep], bucketBoundary: rest[lastSep+1:]}] = struct{}{}
+		sk := histSeriesKey{attrGroupKey: rest[:lastSep], bucketBoundary: rest[lastSep+1:]}
+		values, ok := seriesVals[sk]
+		if !ok {
+			values = make([]float64, numBuckets)
+			seriesVals[sk] = values
+		}
+		values[bucketIdx] = float64(bucket.count)
 	}
-	if len(keySet) == 0 {
+	if len(seriesVals) == 0 {
 		return nil
 	}
 
-	sortedKeys := make([]histSeriesKey, 0, len(keySet))
-	for k := range keySet {
-		sortedKeys = append(sortedKeys, k)
-	}
-	slices.SortFunc(sortedKeys, func(a, b histSeriesKey) int {
-		if a.attrGroupKey != b.attrGroupKey {
-			return cmp.Compare(a.attrGroupKey, b.attrGroupKey)
-		}
-		// Parse boundaries as float64 to sort numerically, not lexicographically.
-		// %g formatting means "4" < "32" lexicographically but 4.0 < 32.0 numerically.
-		fi, _ := strconv.ParseFloat(a.bucketBoundary, 64)
-		fj, _ := strconv.ParseFloat(b.bucketBoundary, 64)
-		return cmp.Compare(fi, fj)
-	})
-
 	groupBy := querySpec.Aggregate.GroupBy
-	series := make([]TraceTimeSeries, 0, len(sortedKeys))
-	for _, sk := range sortedKeys {
+	series := make([]TraceTimeSeries, 0, len(seriesVals))
+	for sk, values := range seriesVals {
 		var labels []TraceMetricLabel
 		if len(groupBy) > 0 {
 			attrVals := strings.Split(sk.attrGroupKey, "\x00")
@@ -779,22 +821,6 @@ func traceHistogramSeries(
 			}
 		}
 		labels = append(labels, TraceMetricLabel{Name: "__bucket", Value: sk.bucketBoundary})
-
-		// NOTE-070: acquire scratch buffer once for all buckets in this histogram series;
-		// reset to [:0] at each inner iteration to avoid per-bucket pool roundtrips.
-		scratch := acquireCompositeKeyScratch()
-		values := make([]float64, numBuckets)
-		for bucketIdx := int64(0); bucketIdx < numBuckets; bucketIdx++ {
-			*scratch = strconv.AppendInt((*scratch)[:0], bucketIdx, 10)
-			*scratch = append(*scratch, '\x00')
-			*scratch = append(*scratch, sk.attrGroupKey...)
-			*scratch = append(*scratch, '\x00')
-			*scratch = append(*scratch, sk.bucketBoundary...)
-			if bucket := buckets[string(*scratch)]; bucket != nil {
-				values[bucketIdx] = float64(bucket.count)
-			}
-		}
-		releaseCompositeKeyScratch(scratch)
 		series = append(series, TraceTimeSeries{Labels: labels, Values: values})
 	}
 
