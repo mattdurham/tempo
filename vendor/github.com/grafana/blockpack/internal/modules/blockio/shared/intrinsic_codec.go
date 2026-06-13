@@ -1428,28 +1428,43 @@ func appendDeltaUint64Page(raw []byte, blockW, rowW, rowCount int, dst *Intrinsi
 		vals = append(vals, make([]uint64, rowCount)...)
 	}
 
-	pos := 0
-	n := len(raw)
+	// NOTE-256: hoist both per-row bounds checks out of the decode loop, mirroring the
+	// NOTE-236 discipline already applied to appendVariableWidthRefs. The previous loop
+	// paid two checks per row even on the dominant single-byte fast path: an IsInBounds on
+	// the source load `raw[pos]` (the compiler could not connect the `pos >= n` guard to it)
+	// and an IsInBounds on the destination store `vals[base+i]`. appendDeltaUint64Page was
+	// the #1 blockpack self-time frame (2.6% of querier CPU, profile 2026-06-13) — the
+	// residual decode cost of the unfiltered rate path (M1/M4) over hundreds of ~10k-row
+	// delta-sorted span:start pages.
+	//
+	// Source: consume `src` (a window into raw) by exactly the bytes used each row, so its
+	// shrinking length is the bound. The single-byte fast path reads src[0] after proving
+	// len(src) > 0, so the load is check-free. Destination: reslice to exactly rowCount slots
+	// (out := vals[base : base+rowCount]) so the store check is discharged from the loop bound
+	// i < rowCount.
+	out := vals[base : base+rowCount]
+	src := raw
 	var acc uint64
-	for i := range rowCount {
-		if pos >= n {
+	for i := range out {
+		if len(src) == 0 {
 			return fmt.Errorf("decodeDeltaUint64Page: truncated at uvarint row %d", i)
 		}
-		b := raw[pos]
+		b := src[0]
 		if b < 0x80 {
-			// Single-byte delta (the overwhelmingly common case).
+			// Single-byte delta (the overwhelmingly common case): check-free load + store.
 			acc += uint64(b)
-			pos++
+			src = src[1:]
 		} else {
-			delta, w := binary.Uvarint(raw[pos:])
+			delta, w := binary.Uvarint(src)
 			if w <= 0 {
 				return fmt.Errorf("decodeDeltaUint64Page: truncated at uvarint row %d", i)
 			}
 			acc += delta
-			pos += w
+			src = src[w:]
 		}
-		vals[base+i] = acc
+		out[i] = acc
 	}
+	pos := len(raw) - len(src)
 	dst.Uint64Values = vals
 
 	if _, err := appendVariableWidthRefs(raw, pos, blockW, rowW, rowCount, &dst.BlockRefs); err != nil {

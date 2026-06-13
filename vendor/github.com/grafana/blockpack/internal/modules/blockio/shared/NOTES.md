@@ -1464,3 +1464,43 @@ and the existing `TestScatterDictRefIndexDense_RejectsDuplicate`,
 Back-ref: `internal/modules/blockio/shared/intrinsic_ref_index.go:scatterDictRefIndexDense`,
 `scatterDictRefIndexMultiBlockDense`, `getClaimBuf`/`putClaimBuf`; NOTE-192 (pooled scratch),
 NOTE-226 (dict dense scatter), NOTE-240 (multi-block dense scatter), NOTE-252 (proven-dense skip).
+
+## NOTE-256: BCE the `appendDeltaUint64Page` decode loop — hoist both per-row bounds checks
+
+**Problem:** `appendDeltaUint64Page` was the #1 blockpack self-time frame (2.6% of querier
+CPU, profile 2026-06-13) — the residual decode cost of the unfiltered rate path (M1/M4) over
+hundreds of ~10k-row delta-sorted span:start pages. Despite the NOTE-169 single-byte varint
+fast path, the loop still paid **two** `IsInBounds` checks on every row, even on that fast
+path: the source load `raw[pos]` (the compiler could not connect the `pos >= n` guard to the
+index) and the destination store `vals[base+i]` (the compiler could not prove `base+i` was in
+range from the loop bound). Confirmed via `-d=ssa/check_bce/debug=1`.
+
+**Fix:** Apply the NOTE-236 reslice discipline already used in `appendVariableWidthRefs`.
+- **Destination:** reslice to exactly `rowCount` slots (`out := vals[base : base+rowCount]`)
+  and index `out[i]`. The store check is then discharged from the loop bound `i < rowCount`.
+- **Source:** walk a shrinking window `src := raw`, consuming exactly the bytes used per row
+  (`src = src[1:]` fast path, `src = src[w:]` multi-byte). The single-byte fast path reads
+  `src[0]` only after proving `len(src) > 0`, so the load is check-free. The varint fallback
+  still calls `binary.Uvarint(src)` (rare, multi-byte deltas only).
+After the change `-d=ssa/check_bce/debug=1` shows no `IsInBounds` on the single-byte load or
+the store; the remaining `IsSliceInBounds` reports are the `src = src[w:]` reslice in the rare
+multi-byte branch and the destination reslice setup, neither in the hot path.
+
+**Correctness:** Byte-for-byte identical decode. `acc` accumulation, the `< 0x80` fast-path
+branch, and the `binary.Uvarint` fallback are unchanged. The truncation guard is now
+`len(src) == 0` (equivalent to the old `pos >= n`). `pos` is reconstructed after the loop as
+`len(raw) - len(src)` so the trailing `appendVariableWidthRefs(raw, pos, ...)` ref decode reads
+from the same offset as before. The destination capacity invariant (callers pre-size to
+totalRows, NOTE-145/150) is unchanged — `vals` is already extended to `base+rowCount` before
+the reslice, so `out` is always valid.
+
+**Microbenchmark:** `BenchmarkDecodePagedColumnDelta` median ~3.3–4.0ms → ~2.5–2.7ms
+(~25–35% faster on the decode loop), allocs unchanged.
+
+**Queries affected:** every query that decodes a delta-encoded uint64 intrinsic column —
+the unfiltered/wide rate path (M1/M4) most heavily, since span:start is delta-sorted and
+decoded across hundreds of pages per block.
+
+Back-ref: `internal/modules/blockio/shared/intrinsic_codec.go:appendDeltaUint64Page`;
+NOTE-169 (single-byte varint fast path), NOTE-236 (the same BCE reslice on the ref side),
+NOTE-186 (index-based ref store).
