@@ -1797,3 +1797,49 @@ where these scans spend the bulk of their CPU and allocations.
 Back-ref: `shared/intrinsic_codec.go:scanDictPageRaw`, `ScanDictColumnRefs`;
 `shared/shared_test.go:BenchmarkScanDictColumnRefs_DenseMatch`,
 `TestScanDictColumnRefs_MaxRefsCap`.
+
+## NOTE-280: decodeDictPagesArena pass 2 reads entry index from pass-1 occurrence log (no map re-probe)
+
+**Problem:** `decodeDictPagesArena` decodes a multi-page dict column in two passes over the
+same pages (NOTE-171 retains decompressed bytes so each page is snappy-decoded once). Pass 1
+builds the cross-page dedup map (`idx[string(valBytes)]` → entry index) and sums each entry's
+ref count; pass 2 scatters each occurrence's refs into the entry's pre-sized arena sub-slice.
+To find the destination entry for an occurrence, pass 2 *re-probed the same dedup map* —
+`j = idx[string(valBytes)]` for string columns, or rebuilt the 9-byte int64 key (`keyScratch`)
+and probed `idx[string(keyScratch)]` for int64 columns — once for **every value occurrence on
+every page**. A multi-page group-by column (e.g. M4 `rate() by (resource.service.name)`)
+repeats its full distinct value set on every page, so this is `valueCount × numPages` map
+look-ups of pure redundant work: pass 1 already knew which entry each occurrence resolves to.
+A querier CPU profile of `BenchmarkDecodePagedColumnDict` showed `runtime.mapaccess1_faststr`
+(the pass-2 lookup) at **15.8% cumulative** self-time — the single largest avoidable frame
+after `appendVariableWidthRefs` and `snappy.decode`.
+
+**Fix:** pass 1 appends, in value-visitation order, the entry index each occurrence resolves
+to into a pooled `[]int32` (`occIdx`). Pass 2 walks the same `toc.Pages` in the same order and
+reads `j = occIdx[occCursor++]` instead of re-hashing the value into the dedup map. The two
+passes call `forEachDictPageValue` over identical page bytes in identical order, so a single
+monotonic cursor indexes the occurrences 1:1 — no map, no `keyScratch` rebuild, no `valBytes`
+re-hash in pass 2. `occIdx` is pooled (`dictOccIdxPool`) and reused across decodes, so on a
+warm pool it adds no per-call allocation (the benchmark's 264 allocs/op is unchanged).
+
+**Why correct:** `forEachDictPageValue` is a pure deterministic walk of the page wire format;
+given the same `pageRaw`, `refSize`, and `isInt64` it visits values in the same order every
+call. Both passes iterate `toc.Pages` in index order and decode the same retained/​re-decoded
+bytes, so occurrence `k` in pass 2 is the same `(page, value)` as occurrence `k` in pass 1.
+Entry order, `Value`/`Int64Val`, and per-entry ref order are therefore byte-identical to the
+NOTE-186/NOTE-204 layout. Pass 1 is unchanged (still builds the dedup map and sums `refTotals`),
+so the arena carve is identical. General to every multi-page dict column; no benchmark-specific
+constants.
+
+**Verification:** `go test -race ./blockio/shared ./blockio/reader ./executor` green (incl.
+`TestParsedV8ColumnCache_WarmEqualsCold` and the dict decode round-trip tests, which already
+assert the decoded column matches its encoded input value-for-value and ref-for-ref). CPU
+profile of `BenchmarkDecodePagedColumnDict` (100 pages × 245 values): the pass-2
+`mapaccess1_faststr` frame (15.8% cum) is **eliminated**; only the pass-1 dedup
+`mapaccess2_faststr` (7.8%) remains. Median ~2.87 ms → ~2.43 ms/op; allocs unchanged at 264.
+
+**Queries affected:** every full-column decode of a multi-page dict (string- or int64-keyed)
+intrinsic column — the group-by aggregation path (`rate()/histogram_over_time by (...)`) where
+high-cardinality dict columns decode the most occurrences (M4/M6/M8/M9).
+
+Back-ref: `shared/intrinsic_codec.go:decodeDictPagesArena`, `dictOccIdxPool`.

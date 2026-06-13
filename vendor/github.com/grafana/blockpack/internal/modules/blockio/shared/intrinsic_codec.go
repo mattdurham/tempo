@@ -134,6 +134,29 @@ func releaseDictIdxMap(m map[string]int) {
 	dictIdxMapPool.Put(m)
 }
 
+// NOTE-280: pool the per-occurrence dict entry-index slice used to skip the pass-2 dedup
+// map probe in decodeDictPagesArena. Pass 1 records, in value-visitation order, the entry
+// index each (page, value) occurrence resolves to; pass 2 reads them back sequentially
+// instead of re-hashing the value bytes (or rebuilding the int64 key) into the dedup map.
+// A multi-page group-by column (e.g. M4 rate-by-service) repeats its full distinct value
+// set on every page, so this slice has valueCount*numPages entries — sized once here and
+// reused across decodes, avoiding a per-call allocation.
+const dictOccIdxMaxLen = 1 << 20 // drop pathologically large pooled slices back to GC
+
+var dictOccIdxPool = &sync.Pool{
+	New: func() any { s := make([]int32, 0, 4096); return &s },
+}
+
+func acquireDictOccIdx() *[]int32 { return dictOccIdxPool.Get().(*[]int32) }
+
+func releaseDictOccIdx(sp *[]int32) {
+	if cap(*sp) > dictOccIdxMaxLen {
+		return
+	}
+	*sp = (*sp)[:0]
+	dictOccIdxPool.Put(sp)
+}
+
 // DecodeTOC decompresses a TOC blob and parses it into a slice of IntrinsicColMeta.
 func DecodeTOC(blob []byte) ([]IntrinsicColMeta, error) {
 	raw, err := decodeBoundedSnappyColumn(blob)
@@ -728,6 +751,16 @@ func decodeDictPagesArena(
 		return pageRaw, nil
 	}
 
+	// NOTE-280: record, in value-visitation order, the entry index each (page, value)
+	// occurrence resolves to, so pass 2 can read it back sequentially instead of re-probing
+	// the dedup map (re-hashing valBytes / rebuilding the int64 key) for every occurrence on
+	// every page. occIdx is appended in exactly the order forEachDictPageValue visits values
+	// in pass 1, and pass 2 walks the same toc.Pages in the same order, so a monotonic counter
+	// indexes them 1:1.
+	occIdxP := acquireDictOccIdx()
+	defer releaseDictOccIdx(occIdxP)
+	occIdx := (*occIdxP)[:0]
+
 	// Pass 1: materialize entries (Value/Int64Val) in first-appearance order and sum each
 	// entry's total ref count across all pages. refTotals is parallel to merged.DictEntries.
 	merged.DictEntries = merged.DictEntries[:0]
@@ -743,6 +776,7 @@ func decodeDictPagesArena(
 				if len(valBytes) > 0 {
 					if j, ok := idx[string(valBytes)]; ok {
 						refTotals[j] += refCount
+						occIdx = append(occIdx, int32(j)) //nolint:gosec
 						return nil
 					}
 					newIdx := len(merged.DictEntries)
@@ -750,24 +784,28 @@ func decodeDictPagesArena(
 						IntrinsicDictEntry{Value: string(valBytes), Int64Val: int64Val})
 					idx[merged.DictEntries[newIdx].Value] = newIdx // reuse kept string, no 2nd alloc
 					refTotals = append(refTotals, refCount)
+					occIdx = append(occIdx, int32(newIdx)) //nolint:gosec
 					return nil
 				}
 				keyScratch = append(keyScratch[:0], 0)
 				keyScratch = binary.LittleEndian.AppendUint64(keyScratch, uint64(int64Val)) //nolint:gosec
 				if j, ok := idx[string(keyScratch)]; ok {
 					refTotals[j] += refCount
+					occIdx = append(occIdx, int32(j)) //nolint:gosec
 					return nil
 				}
 				newIdx := len(merged.DictEntries)
 				merged.DictEntries = append(merged.DictEntries, IntrinsicDictEntry{Int64Val: int64Val})
 				idx[string(keyScratch)] = newIdx
 				refTotals = append(refTotals, refCount)
+				occIdx = append(occIdx, int32(newIdx)) //nolint:gosec
 				return nil
 			})
 		if err != nil {
 			return err
 		}
 	}
+	*occIdxP = occIdx // retain grown backing array for pooling
 	if len(merged.DictEntries) == 0 {
 		return nil
 	}
@@ -792,21 +830,20 @@ func decodeDictPagesArena(
 
 	// Pass 2: decode each value's refs into its entry's exact-capacity sub-slice. Appends
 	// happen in page order (same as legacy), so per-entry ref order is byte-identical.
+	// NOTE-280: the entry index j for each occurrence is read sequentially from occIdx
+	// (recorded in pass 1) via a monotonic counter, skipping the per-occurrence dedup-map
+	// re-probe (valBytes re-hash / int64-key rebuild). occCursor advances in lockstep with
+	// the identical value-visitation order of the two passes.
+	occCursor := 0
 	for i, pm := range toc.Pages {
 		pageRaw, err := decodePass2(i, pm)
 		if err != nil {
 			return err
 		}
 		err = forEachDictPageValue(pageRaw, refSize, isInt64,
-			func(valBytes []byte, int64Val int64, refStart, refCount int) error {
-				var j int
-				if len(valBytes) > 0 {
-					j = idx[string(valBytes)]
-				} else {
-					keyScratch = append(keyScratch[:0], 0)
-					keyScratch = binary.LittleEndian.AppendUint64(keyScratch, uint64(int64Val)) //nolint:gosec
-					j = idx[string(keyScratch)]
-				}
+			func(_ []byte, _ int64, refStart, refCount int) error {
+				j := int(occIdx[occCursor])
+				occCursor++
 				// NOTE-186: index-based ref store into the entry's pre-sized arena
 				// sub-slice instead of a per-ref append. Each entry's BlockRefs was
 				// carved with exact capacity refTotals[j] (arena[off:off:off+c]) and the
