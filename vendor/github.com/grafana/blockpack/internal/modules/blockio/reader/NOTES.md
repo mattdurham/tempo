@@ -2203,3 +2203,42 @@ Pure latency reduction; no extra CPU beyond one goroutine. The metrics query pat
 unaffected (trace-by-ID is a separate entry point).
 
 Back-ref: `reader.go:GetTraceByID`.
+
+### NOTE-291: GetTraceByID decodes matching span-blocks in parallel — 2026-06-13
+
+`GetTraceByID` (top-level `blockpack` package, `reader.go`) previously decoded each
+matching span-block serially:
+
+```go
+for _, entry := range entries {
+    bwb, _ := r.ParseBlockFromBytes(rawMap[entry.BlockID], WantAll(), ...)
+    // extract spans from bwb
+}
+```
+
+A trace that spans N span-blocks within one file paid N×decode time sequentially. Each
+`ParseBlockFromBytes(WantAll())` call decodes an independent input blob into an independent
+output `Block`, so the decode work is embarrassingly parallel. The calls now run under an
+`errgroup.Group` with results collected into a pre-allocated `parsedBlocks` slice indexed
+by entry position; the downstream row-emission loop stays sequential and order-preserving.
+
+**Concurrency safety:** `ParseBlockFromBytes` allocates a fresh per-call intern map
+(`localIntern`) — no sharing between goroutines. It reads the Reader's pre-decoded and
+pre-compressed column lookups (`preDecodedLookup`/`preCompressedLookup`), both of which
+guard the shared maps with `r.preDecodedMu`. `r.BlockMeta(entry.BlockID)` is a read-only
+slice index. Each goroutine writes only its own `parsedBlocks[i]` slot, and all writes
+happen-before the `gParse.Wait()` that precedes any read of the slice — no data race.
+
+**Concurrency cap:** `traceByIDParseConcurrency` bounds the fan-out to `[2, 4]` workers
+(`GOMAXPROCS/2`, clamped). Trace-by-ID is an interactive, relatively rare lookup that
+shares the querier with background metrics scans; the cap guarantees within-file
+parallelism (≥2) while preventing a single trace lookup from claiming every core and
+starving concurrent metrics queries (≤4). A trace spanning fewer blocks than the cap
+simply uses fewer workers.
+
+**Win:** latency for traces spanning multiple span-blocks reduced by up to N× on the
+decode leg. **Cost:** additional concurrent CPU per trace-by-ID call, bounded by the cap.
+Single-block traces are unaffected (one worker, no measurable overhead beyond the
+errgroup setup).
+
+Back-ref: `reader.go:GetTraceByID`, `reader.go:traceByIDParseConcurrency`.

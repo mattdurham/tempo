@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"runtime"
 
 	modules_blockio "github.com/grafana/blockpack/internal/modules/blockio"
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
@@ -450,15 +451,14 @@ func GetTraceByID(r *Reader, traceIDHex string) (results []SpanMatch, err error)
 	// when only a small subset of blocks match the trace.
 	spanIDByRef := buildIntrinsicBytesMapForRows(r, "span:id", rowsByBlock)
 
-	for _, entry := range entries {
-		raw, ok := rawMap[entry.BlockID]
-		if !ok {
-			return nil, fmt.Errorf("GetTraceByID: block %d missing from coalesced read", entry.BlockID)
-		}
-		bwb, blockErr := r.ParseBlockFromBytes(raw, modules_reader.WantAll(), r.BlockMeta(entry.BlockID))
-		if blockErr != nil {
-			return nil, fmt.Errorf("GetTraceByID: block %d: %w", entry.BlockID, blockErr)
-		}
+	// NOTE-291: parse each matching span-block concurrently (see parseMatchingBlocks).
+	parsedBlocks, parseErr := parseMatchingBlocks(r, entries, rawMap)
+	if parseErr != nil {
+		return nil, parseErr
+	}
+
+	for i, entry := range entries {
+		bwb := parsedBlocks[i]
 
 		var matchingRows []int
 		if useLegacyScan {
@@ -507,6 +507,70 @@ func GetTraceByID(r *Reader, traceIDHex string) (results []SpanMatch, err error)
 	}
 
 	return results, nil
+}
+
+// parseMatchingBlocks decodes each matching span-block concurrently (NOTE-291). Each
+// ParseBlockFromBytes call decodes an independent input blob (rawMap[entry.BlockID]) into
+// an independent output Block — there is no shared mutable state between calls
+// (ParseBlockFromBytes allocates a per-call intern map and reads the Reader's
+// pre-decoded/pre-compressed lookups under their own mutexes). A trace that spans N
+// span-blocks within one file previously paid N×decode serially; decoding them in parallel
+// reduces that to ~max.
+//
+// Results are returned in a slice indexed by entry position so the caller's row-emission
+// loop stays sequential and order-preserving. The fan-out is bounded by
+// traceByIDParseConcurrency so a single trace-by-ID call cannot saturate every core and
+// starve concurrent metrics queries on the same querier. Each goroutine writes only its own
+// slot, and all writes happen-before the gParse.Wait() return — no data race.
+func parseMatchingBlocks(
+	r *Reader,
+	entries []modules_reader.TraceEntry,
+	rawMap map[int][]byte,
+) ([]*modules_reader.BlockWithBytes, error) {
+	parsedBlocks := make([]*modules_reader.BlockWithBytes, len(entries))
+	var gParse errgroup.Group
+	gParse.SetLimit(traceByIDParseConcurrency())
+	for i, entry := range entries {
+		i, entry := i, entry
+		raw, ok := rawMap[entry.BlockID]
+		if !ok {
+			return nil, fmt.Errorf("GetTraceByID: block %d missing from coalesced read", entry.BlockID)
+		}
+		gParse.Go(func() error {
+			bwb, blockErr := r.ParseBlockFromBytes(raw, modules_reader.WantAll(), r.BlockMeta(entry.BlockID))
+			if blockErr != nil {
+				return fmt.Errorf("GetTraceByID: block %d: %w", entry.BlockID, blockErr)
+			}
+			parsedBlocks[i] = bwb
+			return nil
+		})
+	}
+	if waitErr := gParse.Wait(); waitErr != nil {
+		return nil, waitErr
+	}
+	return parsedBlocks, nil
+}
+
+// traceByIDParseConcurrency bounds the number of span-blocks GetTraceByID decodes
+// concurrently (NOTE-291). Trace-by-ID is an interactive, relatively rare lookup that
+// shares the querier with background metrics scans, so the per-trace decode fan-out is
+// capped to a small fraction of available cores. The cap scales with GOMAXPROCS but is
+// clamped to [2, 4]: 2 guarantees within-file parallelism even on small queriers, and 4
+// caps the CPU a single trace-by-ID call can claim so it cannot starve concurrent
+// metrics queries. A trace spanning fewer blocks than the cap simply uses fewer workers.
+func traceByIDParseConcurrency() int {
+	const (
+		minLimit = 2
+		maxLimit = 4
+	)
+	n := runtime.GOMAXPROCS(0) / 2
+	if n < minLimit {
+		n = minLimit
+	}
+	if n > maxLimit {
+		n = maxLimit
+	}
+	return n
 }
 
 // AGENT: Writer constructors - minimal set needed for creating writers.
