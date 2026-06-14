@@ -396,6 +396,18 @@ func (r *Reader) parseSectionsV8() error {
 // ensureV8TraceSection lazily loads the V8 compact trace index on first call.
 func (r *Reader) ensureV8TraceSection() error {
 	r.v8TraceOnce.Do(func() {
+		// Issue #340: prefer the range-readable chunked trace index when present. Only the
+		// fixed header + directory are read here (range reads); chunk bodies are fetched
+		// lazily per lookup. Falls back to the legacy compact section below when absent.
+		if entry, ok := r.tocMap[shared.ToCKey{Type: shared.ToCTypeMetadata, SubType: shared.ToCSubTypeTraceChunked}]; ok {
+			ci, perr := r.parseChunkedTraceIndex(entry)
+			if perr != nil {
+				r.v8TraceErr = fmt.Errorf("ensureV8TraceSection: chunked: %w", perr)
+				return
+			}
+			r.chunkedTrace = ci
+			return
+		}
 		raw, err := r.fetchToCSection(shared.ToCKey{Type: shared.ToCTypeMetadata, SubType: shared.ToCSubTypeTrace})
 		if err != nil {
 			r.v8TraceErr = fmt.Errorf("ensureV8TraceSection: %w", err)

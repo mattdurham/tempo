@@ -5,7 +5,6 @@ package writer
 import (
 	"bytes"
 	"encoding/binary"
-	"fmt"
 	"io"
 	"math"
 	"slices"
@@ -159,129 +158,6 @@ func writeRangeValueKey(buf *bytes.Buffer, colType shared.ColumnType, key string
 		buf.WriteByte(byte(len(key))) //nolint:gosec // safe: range boundary key is 8 bytes, fits uint8
 		buf.WriteString(key)
 	}
-}
-
-// writer/NOTES.md NOTE-37: trace index v2 — block IDs only, no span indices; reader scans in-block.
-// writeTraceBlockIndexSection serializes the trace block index (format version 2).
-// Format: fmt_version[1]=0x02 + trace_count[4 LE] +
-// per trace: trace_id[16] + block_ref_count[2 LE] + block_id[2 LE] × N.
-// Span indices are not stored; the reader scans the trace:id column in-block.
-// Returns the serialized bytes.
-func writeTraceBlockIndexSection(_ io.Writer, traceIndex map[[16]byte][]uint16) ([]byte, error) {
-	var buf bytes.Buffer
-
-	// Sort trace IDs for deterministic output.
-	traceIDs := make([][16]byte, 0, len(traceIndex))
-	for tid := range traceIndex {
-		traceIDs = append(traceIDs, tid)
-	}
-	slices.SortFunc(traceIDs, func(a, b [16]byte) int {
-		return bytes.Compare(a[:], b[:])
-	})
-
-	// fmt_version[1] = 0x02
-	buf.WriteByte(shared.TraceIndexFmtVersion2)
-
-	// trace_count[4 LE]
-	var tmp4 [4]byte
-	binary.LittleEndian.PutUint32(
-		tmp4[:],
-		uint32(len(traceIDs)), //nolint:gosec // safe: trace count bounded by MaxTraceCount
-	)
-	buf.Write(tmp4[:])
-
-	var tmp2 [2]byte
-
-	for _, tid := range traceIDs {
-		blockIDs := traceIndex[tid]
-
-		if len(blockIDs) > math.MaxUint16 {
-			return nil, fmt.Errorf("trace_index: trace %x has %d block refs, exceeds uint16 max", tid, len(blockIDs))
-		}
-
-		// trace_id[16]
-		buf.Write(tid[:])
-
-		// block_ref_count[2 LE]
-		binary.LittleEndian.PutUint16(
-			tmp2[:],
-			uint16(len(blockIDs)), //nolint:gosec // safe: len(blockIDs) <= math.MaxUint16 checked above
-		)
-		buf.Write(tmp2[:])
-
-		// block_id[2 LE] × N
-		for _, bid := range blockIDs {
-			binary.LittleEndian.PutUint16(tmp2[:], bid)
-			buf.Write(tmp2[:])
-		}
-	}
-
-	return buf.Bytes(), nil
-}
-
-// NOTE-36: bloom-enabled compact index (v2) — see SPECS.md §6
-// writeCompactTraceIndex writes the compact trace index section (version 2).
-// Format: magic[4] + version[1]=2 + block_count[4] + bloom_bytes[4] + bloom_data[N] +
-// block_table[block_count×12] + trace_index[...].
-// Returns bytes written.
-func writeCompactTraceIndex(
-	w io.Writer,
-	blockMetas []shared.BlockMeta,
-	traceIndex map[[16]byte][]uint16,
-) (int64, error) {
-	var buf bytes.Buffer
-
-	// magic[4 LE] = 0xC01DC1DE
-	var tmp4 [4]byte
-	binary.LittleEndian.PutUint32(tmp4[:], shared.CompactIndexMagic)
-	buf.Write(tmp4[:])
-
-	// version[1] = 2 (bloom-enabled)
-	buf.WriteByte(shared.CompactIndexVersion2)
-
-	// block_count[4 LE]
-	binary.LittleEndian.PutUint32(
-		tmp4[:],
-		uint32(len(blockMetas)), //nolint:gosec // safe: block count bounded by MaxBlocks
-	)
-	buf.Write(tmp4[:])
-
-	// Build trace ID bloom filter from all trace IDs in the index.
-	bloomSize := shared.TraceIDBloomSize(len(traceIndex))
-	bloom := make([]byte, bloomSize)
-	for tid := range traceIndex {
-		shared.AddTraceIDToBloom(bloom, tid)
-	}
-
-	// bloom_bytes[4 LE] + bloom_data[bloom_bytes]
-	binary.LittleEndian.PutUint32(
-		tmp4[:],
-		uint32(bloomSize), //nolint:gosec // safe: bloom size bounded by TraceIDBloomMaxBytes (1MB) fits uint32
-	)
-	buf.Write(tmp4[:])
-	buf.Write(bloom)
-
-	// block_table: block_count × { file_offset[8 LE] + file_length[4 LE] }
-	for _, m := range blockMetas {
-		var tmp8 [8]byte
-		binary.LittleEndian.PutUint64(tmp8[:], m.Offset)
-		buf.Write(tmp8[:])
-		binary.LittleEndian.PutUint32(
-			tmp4[:],
-			uint32(m.Length), //nolint:gosec // safe: block length bounded by MaxBlockSize (1GB) fits uint32
-		)
-		buf.Write(tmp4[:])
-	}
-
-	// Trace index: fmt_version[1] + trace_count[4] + traces
-	traceData, err := writeTraceBlockIndexSection(nil, traceIndex)
-	if err != nil {
-		return 0, err
-	}
-	buf.Write(traceData)
-
-	n, err := w.Write(buf.Bytes())
-	return int64(n), err
 }
 
 // V7 footer field offsets (M-25).

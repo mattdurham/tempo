@@ -185,6 +185,14 @@ func (r *Reader) parseCompactIndexBytesV14Header(header []byte) error {
 func (r *Reader) BlocksForTraceID(traceID [16]byte) []int {
 	// For V14 files, compactParsed is populated lazily on first access.
 	_ = r.ensureV14TraceSection()
+	// Issue #340: chunked trace index takes precedence.
+	if r.chunkedTrace != nil {
+		blockIDs, err := r.chunkedLookup(r.chunkedTrace, traceID)
+		if err != nil || len(blockIDs) == 0 {
+			return nil
+		}
+		return blockIDsToInts(blockIDs)
+	}
 	// For V3/V4 files, compactLen > 0 gates ensureCompactIndexParsed (lazy I/O).
 	if r.compactParsed != nil {
 		blocks := r.BlocksForTraceIDCompact(traceID)

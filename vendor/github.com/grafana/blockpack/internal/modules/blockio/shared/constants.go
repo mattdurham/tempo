@@ -56,6 +56,8 @@ const (
 	ToCSubTypeTrace     uint32 = 5 // compact trace index blob
 	ToCSubTypeTS        uint32 = 6 // timestamp index blob
 
+	ToCSubTypeTraceChunked uint32 = 8 // range-readable chunked trace index (SPEC: issue #340)
+
 	// ToCEntry SubType constants for ToCTypeIndex (Type=2).
 	ToCSubTypeBlockIndex uint32 = 7 // block offset table
 
@@ -99,6 +101,23 @@ const (
 
 	TraceIndexFmtVersion  uint8 = 0x01 // v1: block IDs + per-block span indices (legacy wire, still parsed in V8 files)
 	TraceIndexFmtVersion2 uint8 = 0x02 // v2: block IDs only — no per-block span indices
+
+	// Chunked trace index (ToCSubTypeTraceChunked) — range-readable trace index (issue #340).
+	// The section is NOT snappy-compressed as a whole (written raw, like intrinsic blobs); each
+	// chunk is independently snappy-compressed so a lookup range-reads only the relevant chunk
+	// instead of fetching + decompressing the entire trace index.
+	ChunkedTraceMagic   uint32 = 0xC01DC2DE
+	ChunkedTraceVersion uint8  = 0x01
+	// ChunkedTraceHeaderSize is the fixed leading-header size in bytes:
+	// magic[4]+version[1]+reserved[3]+block_count[4]+trace_count[4]+chunk_count[4]+
+	// entry_fmt[1]+reserved2[3]+dir_off[4]+bloom_off[4]+bloom_len[4] = 36 bytes.
+	ChunkedTraceHeaderSize = 36
+	// ChunkedTraceDirEntrySize is the size in bytes of one chunk-directory entry:
+	// first_trace_id[16]+comp_off[4]+comp_len[4] = 24 bytes.
+	ChunkedTraceDirEntrySize = 24
+	// ChunkedTraceEntriesPerChunk is the number of sorted trace entries packed into one chunk.
+	// Keeps each decompressed chunk small (a few tens of KB) so trace-by-id reads one chunk.
+	ChunkedTraceEntriesPerChunk = 4096
 
 	// CompactIndexVersion is the legacy compact index version (no trace ID bloom).
 	// Still encountered in V8 trace sections written before CompactIndexVersion2 was introduced.

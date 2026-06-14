@@ -734,3 +734,24 @@ Back-ref: `internal/modules/blockio/writer/column_types.go:int64ColumnBuilder.bu
           `internal/modules/blockio/writer/encoding_select.go:shouldUseDeltaInt64`,
           `internal/modules/blockio/reader/column.go:isDeltaInt64ColType`,
           `internal/modules/blockio/reader/column.go:promoteToInt64Dict`
+
+## NOTE-223: Range-readable chunked trace index (issue #340)
+*Added: 2026-06-13*
+
+**Problem:** the trace index was written as one snappy-compressed section
+(`ToCSubTypeTrace`). A trace-by-id lookup had to fetch and decompress the *entire* section
+to locate the blocks for a single trace. Profiling showed `FindTraceByID` was the largest
+allocator on the read path, ~97% of it the whole-section fetch+decompress — a cost
+proportional to the trace count of the file, not to the one trace requested.
+
+**Solution:** write the trace index as `ToCSubTypeTraceChunked` — a section written *raw*
+(via `writeRawToCEntry`, not snappy-compressed as a whole) so it is byte-addressable:
+a fixed header, a chunk directory `(first_trace_id, comp_off, comp_len)`, then
+`ChunkedTraceEntriesPerChunk`-sized independently snappy-compressed chunks, then the trace
+ID bloom. Each chunk decompresses to a v2 mini-body (`fmt_version[1] + entry_count[4] +
+sorted entries`) so the reader reuses the existing entry encode/scan. New files write only
+this section (leaner — no duplication); the reader prefers it and falls back to the legacy
+`ToCSubTypeTrace` section when absent.
+
+Back-ref: `internal/modules/blockio/writer/chunked_trace_index.go:buildChunkedTraceIndex`,
+          `internal/modules/blockio/writer/v8_sections.go:writeRawToCEntry`

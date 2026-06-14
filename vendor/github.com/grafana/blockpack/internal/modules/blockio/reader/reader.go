@@ -110,6 +110,12 @@ type Reader struct {
 	rangeParsed   map[string]parsedRangeIndex
 	compactParsed *compactTraceIndex
 
+	// chunkedTrace is the parsed header+directory of a range-readable chunked trace index
+	// (ToCSubTypeTraceChunked, issue #340). Non-nil only for files written with the chunked
+	// section; takes precedence over compactParsed on the trace-by-id path. Parsed lazily in
+	// ensureV8TraceSection (guarded by v8TraceOnce).
+	chunkedTrace *chunkedTraceIndex
+
 	// sketchIdx holds parsed column-major sketch data for the file.
 	// Nil for files written before the sketch section was introduced (old format).
 	sketchIdx *sketchIndex
@@ -341,6 +347,9 @@ func (r *Reader) BlockCount() int { return len(r.blockMetas) }
 // Returns 0 if no trace index is available.
 func (r *Reader) TraceCount() int {
 	_ = r.ensureV14TraceSection()
+	if r.chunkedTrace != nil {
+		return int(r.chunkedTrace.traceCount)
+	}
 	r.ensureTraceIndex()
 	if len(r.traceIndex) > 0 {
 		return len(r.traceIndex)
@@ -780,6 +789,18 @@ func (r *Reader) HasTraceIndex() bool {
 // Falls back to the compact trace index when the main index is empty (lean reader path).
 func (r *Reader) TraceEntries(traceID [16]byte) []TraceEntry {
 	_ = r.ensureV14TraceSection()
+	// Issue #340: chunked trace index — range-read only the candidate chunk.
+	if r.chunkedTrace != nil {
+		blockIDs, err := r.chunkedLookup(r.chunkedTrace, traceID)
+		if err != nil || len(blockIDs) == 0 {
+			return nil
+		}
+		result := make([]TraceEntry, len(blockIDs))
+		for i, bid := range blockIDs {
+			result[i] = TraceEntry{BlockID: int(bid)}
+		}
+		return result
+	}
 	r.ensureTraceIndex()
 	blockIDs, ok := r.traceIndex[traceID]
 	if !ok && r.compactParsed != nil {
@@ -857,6 +878,9 @@ func (r *Reader) FileSketchSummaryRaw() []byte {
 // Returns nil for files without a compact trace index bloom.
 func (r *Reader) TraceBloomRaw() []byte {
 	_ = r.ensureV14TraceSection()
+	if r.chunkedTrace != nil {
+		return slices.Clone(r.chunkedTraceBloom(r.chunkedTrace))
+	}
 	if r.compactLen > 0 {
 		_ = r.ensureCompactIndexParsed()
 	}
@@ -871,6 +895,13 @@ func (r *Reader) TraceBloomRaw() []byte {
 // compact trace index or bloom is present.
 func (r *Reader) MayContainTraceID(traceID [16]byte) bool {
 	_ = r.ensureV14TraceSection()
+	if r.chunkedTrace != nil {
+		bloom := r.chunkedTraceBloom(r.chunkedTrace)
+		if bloom == nil {
+			return true
+		}
+		return shared.TestTraceIDBloom(bloom, traceID)
+	}
 	if r.compactLen > 0 {
 		_ = r.ensureCompactIndexParsed()
 	}

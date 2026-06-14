@@ -3,7 +3,6 @@ package writer
 // NOTE: Any changes to this file must be reflected in the corresponding specs.md or NOTES.md.
 
 import (
-	"bytes"
 	"fmt"
 	"slices"
 
@@ -138,23 +137,41 @@ func (w *Writer) writeV8SketchBlobs(sw *v8SectionWriter) error {
 	return nil
 }
 
+// writeRawToCEntry writes raw (already-framed, not snappy-compressed) section bytes and appends
+// a ToCEntry. Used for sections whose internal layout must remain byte-addressable for range
+// reads (e.g. the chunked trace index, issue #340) — unlike writeToCEntry which snappy-compresses
+// the whole section.
+func (sw *v8SectionWriter) writeRawToCEntry(key shared.ToCKey, raw []byte) error {
+	offset := uint64(sw.out.total) //nolint:gosec
+	if _, err := sw.out.Write(raw); err != nil {
+		return fmt.Errorf("writeRawToCEntry(%v): %w", key, err)
+	}
+	sw.entries = append(sw.entries, shared.ToCEntry{
+		Key:    key,
+		Offset: offset,
+		Length: uint32(len(raw)), //nolint:gosec
+	})
+	return nil
+}
+
 // writeV8FileSections writes trace index, TS index, and optional bloom ToCEntries.
 func (w *Writer) writeV8FileSections(sw *v8SectionWriter) error {
-	// Trace index.
-	var compactBuf bytes.Buffer
-	if _, err := writeCompactTraceIndex(&compactBuf, w.blockMetas, w.traceIndex); err != nil {
+	// Trace index (issue #340): range-readable chunked section, written raw so the reader can
+	// range-read one chunk instead of fetching + decompressing the whole index.
+	chunked, err := buildChunkedTraceIndex(w.blockMetas, w.traceIndex)
+	if err != nil {
 		return fmt.Errorf("trace_index: %w", err)
 	}
-	if err := sw.writeToCEntry(
-		shared.ToCKey{Type: shared.ToCTypeMetadata, SubType: shared.ToCSubTypeTrace},
-		compactBuf.Bytes(),
+	if err = sw.writeRawToCEntry(
+		shared.ToCKey{Type: shared.ToCTypeMetadata, SubType: shared.ToCSubTypeTraceChunked},
+		chunked,
 	); err != nil {
 		return err
 	}
 
 	// TS index.
 	tsRaw := writeTSIndexSection(w.blockMetas)
-	if err := sw.writeToCEntry(
+	if err = sw.writeToCEntry(
 		shared.ToCKey{Type: shared.ToCTypeMetadata, SubType: shared.ToCSubTypeTS},
 		tsRaw,
 	); err != nil {

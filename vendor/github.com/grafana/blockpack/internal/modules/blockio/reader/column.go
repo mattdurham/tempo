@@ -973,12 +973,8 @@ func decodeDeltaUint64BitPacked(
 				need, len(packed),
 			)
 		}
-		bitPos := 0
-		for i := range presentCount {
-			off := readBitsLE(packed, bitPos, bitWidth)
-			col.Uint64Dict[i] = base + off
-			bitPos += int(bitWidth)
-		}
+		// NOTE-338: bulk-unpack the contiguous equal-width offsets in one pass.
+		unpackDeltaBitsLE(packed, bitWidth, base, col.Uint64Dict[:presentCount])
 	}
 
 	dictIdx := 0
@@ -1282,13 +1278,9 @@ func decodeDeltaUint64Paged(data []byte, spanCount int, colType shared.ColumnTyp
 				p, need, len(payload),
 			)
 		}
-		bitPos := 0
-		for i := 0; i < pageRows; i++ {
-			off := readBitsLE(payload, bitPos, hdr.bitWidth)
-			col.Uint64Dict[dictIdx] = hdr.base + off
-			bitPos += int(hdr.bitWidth)
-			dictIdx++
-		}
+		// NOTE-338: bulk-unpack this page's contiguous equal-width offsets in one pass.
+		unpackDeltaBitsLE(payload, hdr.bitWidth, hdr.base, col.Uint64Dict[dictIdx:dictIdx+pageRows])
+		dictIdx += pageRows
 	}
 
 	if dictIdx != presentCount {
@@ -1308,6 +1300,58 @@ func decodeDeltaUint64Paged(data []byte, spanCount int, colType shared.ColumnTyp
 	}
 
 	return col, nil
+}
+
+// unpackDeltaBitsLE decodes count contiguous, equal-width (width bits, 1..64) LSB-first
+// values from packed and writes base+value into dst[0:count]. It is the bulk equivalent of
+// the per-row `readBitsLE(packed, i*width, width)` loops in the delta-uint64 decoders.
+//
+// NOTE-338: the bit-packed delta-uint64 decoders (decodeDeltaUint64BitPacked and the per-page
+// variant in decodeDeltaUint64Paged) called the non-inlinable readBitsLE (cost 87 > budget 80)
+// once per present row, re-deriving byteIdx/bitOff from a fresh bitPos and running its inner
+// 1–9-iteration chunk loop every value — readBitsLE was ~0.46% of querier self-time (profile
+// 2026-06-14) and these two loops were its only hot callers. This helper instead carries a
+// 64-bit little-endian accumulator (`acc`, holding `nbits` buffered bits) and refills it from
+// `packed` one byte at a time from a monotonically advancing cursor, so each value is one
+// mask-and-shift with no per-value index math and no function-call overhead, and the source is
+// read strictly sequentially (cache-friendly). The caller must guarantee packed holds at least
+// ceil(count*width/8) bytes (both callers validate `need` up front).
+//
+// Widths > 56 fall back to the per-value readBitsLE: their post-extraction remainder (< width)
+// can be large enough that adding another byte would overflow the 64-bit window. width == 0
+// never reaches here (both callers special-case the all-zero-offset case before calling).
+func unpackDeltaBitsLE(packed []byte, width uint8, base uint64, dst []uint64) {
+	// Wide widths (>56 bits) can leave a remainder large enough that adding another byte to
+	// the 64-bit accumulator would overflow it, so the fast accumulator below is unsafe for
+	// them. They are vanishingly rare for delta offsets; fall back to the per-value reader.
+	if width > 56 {
+		bitPos := 0
+		for i := range dst {
+			dst[i] = base + readBitsLE(packed, bitPos, width)
+			bitPos += int(width)
+		}
+		return
+	}
+	mask := uint64(1)<<width - 1
+	var (
+		acc     uint64 // buffered bits, LSB-first, in the low nbits bits
+		nbits   uint   // number of valid bits currently in acc
+		bytePos int    // next unread byte in packed
+		w       = uint(width)
+	)
+	// Invariant: on each value extraction the remainder nbits-w < w <= 56, so before any
+	// byte add nbits <= 55 and `acc |= byte << nbits` (bits nbits..nbits+7 <= 62) never
+	// overflows the 64-bit window. The byte cursor advances monotonically (sequential read).
+	for i := range dst {
+		for nbits < w {
+			acc |= uint64(packed[bytePos]) << nbits
+			bytePos++
+			nbits += 8
+		}
+		dst[i] = base + (acc & mask)
+		acc >>= w
+		nbits -= w
+	}
 }
 
 // readBitsLE reads width bits (1..64) from src starting at bit offset bitPos, LSB-first within

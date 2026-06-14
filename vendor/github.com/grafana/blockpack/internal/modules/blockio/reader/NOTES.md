@@ -2242,3 +2242,63 @@ Single-block traces are unaffected (one worker, no measurable overhead beyond th
 errgroup setup).
 
 Back-ref: `reader.go:GetTraceByID`, `reader.go:traceByIDParseConcurrency`.
+
+## NOTE-292: Range-readable chunked trace index lookup (issue #340)
+*Added: 2026-06-13*
+
+**Problem:** `TraceEntries` (the trace-by-id path) called `ensureV8TraceSection`, which
+fetched and snappy-decompressed the whole trace index section per lookup. At scale this
+section is tens of MB and dominated `FindTraceByID` allocation (~97%), even though only the
+blocks for one trace are needed.
+
+**Solution:** when a file carries `ToCSubTypeTraceChunked` (NOTE-223), parse only the fixed
+header + chunk directory in a single range read (`chunkedTraceParsePrefix`, one extra read
+for very large directories), then on each lookup binary-search the directory and range-read +
+decompress only the single candidate chunk. Decompressed chunks are memoized per Reader.
+Per-lookup trace-index I/O is bounded (directory + one chunk) regardless of trace count.
+The trace ID bloom is range-read lazily (only for `MayContainTraceID`/`TraceBloomRaw`).
+`TraceEntries`, `BlocksForTraceID`, `TraceCount`, `MayContainTraceID`, and `TraceBloomRaw`
+prefer the chunked index and fall back to the legacy compact section when absent.
+
+Back-ref: `internal/modules/blockio/reader/chunked_trace_index.go:parseChunkedTraceIndex`,
+          `internal/modules/blockio/reader/chunked_trace_index.go:chunkedLookup`,
+          `internal/modules/blockio/reader/reader.go:TraceEntries`
+
+### NOTE-338: bulk bit-unpack for delta-uint64 offset arrays — 2026-06-14
+
+The bit-packed delta-uint64 decoders — `decodeDeltaUint64BitPacked` and the per-page
+loop in `decodeDeltaUint64Paged` (search-path V14 column reader, `column.go`) — decoded
+their contiguous equal-width offset arrays one value at a time:
+
+```go
+bitPos := 0
+for i := range presentCount {
+    off := readBitsLE(packed, bitPos, bitWidth)   // not inlinable: cost 87 > budget 80
+    col.Uint64Dict[i] = base + off
+    bitPos += int(bitWidth)
+}
+```
+
+Each iteration paid a non-inlined `readBitsLE` call that re-derived `byteIdx`/`bitOff`
+from a fresh `bitPos` and ran its inner 1–9-iteration chunk loop. The 2026-06-14 querier
+CPU profile showed `readBitsLE` at ~0.46% self-time and these two loops were its only hot
+callers (the Gorilla-float path calls it but is rare).
+
+`unpackDeltaBitsLE(packed, width, base, dst)` replaces both loops with a single pass that
+carries a 64-bit little-endian accumulator (`acc`, holding `nbits` buffered bits), refills
+it byte-at-a-time from a monotonically advancing cursor (sequential, cache-friendly read),
+and extracts each value with one mask + shift — no per-value index recompute and no
+function-call overhead. It adds `base` inline so the caller's add disappears too.
+
+**Width bound:** for `width > 56` the post-extraction remainder (`< width`) can be large
+enough that adding another byte would overflow the 64-bit window, so those (vanishingly
+rare for delta offsets) widths fall back to the per-value `readBitsLE`. For `width <= 56`
+the remainder is `< 56`, so before any byte add `nbits <= 55` and `acc |= byte << nbits`
+touches bits `nbits..nbits+7 <= 62` — never overflowing. `width == 0` is special-cased by
+both callers before the call (all offsets equal `base`).
+
+**Correctness:** verified byte-identical to the previous `readBitsLE` loop for every width
+1–64 over randomized packed inputs (both the accumulator path and the `>56` fallback).
+
+Back-ref: `column.go:unpackDeltaBitsLE`, `column.go:decodeDeltaUint64BitPacked`,
+`column.go:decodeDeltaUint64Paged`.
