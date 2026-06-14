@@ -2709,3 +2709,39 @@ over-retains, the drift being worst for many-small-object caches.
 
 Back-ref: `block.go` (`columnSnapshotFixedOverhead`, `Column.SizeBytes`). Test:
 `column_sizebytes_test.go` (`TestColumnSizeBytesIncludesFixedOverhead`).
+
+---
+
+## NOTE-365: single-block fast path in ReadCoalescedBlocks — drop the redundant per-block copy
+
+**Symptom.** `ReadCoalescedBlocks` was the #1 querier `inuse_space` frame under load
+(~1.0–1.1 GB), all of it the per-block `block := make([]byte, bLen); copy(block, buf...)`
+that carved each block out of the pooled read buffer so the pooled buffer could be returned.
+
+**Why it was wasteful.** Every caller passes a single `CoalescedRead`, and the dominant
+query-frontend shard shape is **one block per querier call** (per the Reader-lifetime
+invariant: a Reader is constructed fresh per query, per block). In that case the coalesced
+read covers exactly one block that spans the entire read — there is nothing to slice apart.
+The legacy code still:
+  1. filled a pooled buffer (`coalescedReadPool`, ≥8 MiB) with the block bytes, then
+  2. allocated a fresh `make([]byte, bLen)` and **copied** the whole block into it, then
+  3. returned the pooled buffer.
+
+So for the dominant case it held the pooled buffer **and** the copy live simultaneously
+(2× the block size of transient memory) and the copy was pure overhead — the block already
+*was* the whole read.
+
+**Fix.** When `len(c.BlockIDs) == 1 && c.BlockOffsets[0] == c.Offset && c.BlockLengths[0]
+== c.Length`, read directly into a single right-sized `make([]byte, c.Length)` that becomes
+the caller's (and cache's) buffer — no pool round-trip, no copy. The buffer is independently
+owned, identical lifetime/aliasing contract to the old copy. Multi-block coalesced reads
+(genuine coalescing folded several blocks into one S3 read) keep the pooled-buffer + copy
+path, where the copy legitimately carves out disjoint sub-blocks.
+
+**Effect.** Eliminates the dominant `ReadCoalescedBlocks` self-allocation for the common
+path and halves transient peak memory per single-block read (no simultaneous pooled-buf +
+copy hold). The pooled read buffer is now touched only on the rarer multi-block path,
+keeping its steady-state RSS footprint lower too.
+
+Back-ref: `coalesce.go` (`ReadCoalescedBlocks`). Bench: `coalesce_alloc_bench_test.go`
+(`BenchmarkReadCoalescedSingleBlock` / `BenchmarkReadCoalescedMultiBlock`).

@@ -130,6 +130,33 @@ func ReadCoalescedBlocks(provider rw.ReaderProvider, cr []shared.CoalescedRead) 
 	for i := range cr {
 		c := &cr[i]
 
+		// NOTE-365: single-block fast path. When a coalesced read covers exactly one block
+		// that spans the entire read (no neighbors were folded in), the legacy path read the
+		// bytes into a pooled buffer and then COPIED them out into a fresh per-block
+		// make([]byte, bLen) so the pooled buffer could be returned. That copy duplicated the
+		// whole block (the dominant ReadCoalescedBlocks self-alloc — ~1 GB inuse_space under
+		// load) and doubled transient memory (pooled buf + copy live simultaneously) for zero
+		// benefit: with one block spanning the read there is nothing to slice apart. This is
+		// the dominant query-frontend shard shape (one block per querier call). Read directly
+		// into a single right-sized allocation that becomes the caller's buffer — no pool
+		// round-trip, no copy. Multi-block coalesced reads (real coalescing) keep the pooled
+		// path below, where the copy genuinely carves disjoint sub-blocks out of one read.
+		if len(c.BlockIDs) == 1 && c.BlockOffsets[0] == c.Offset && c.BlockLengths[0] == c.Length {
+			block := make([]byte, c.Length)
+			n, err := provider.ReadAt(block, c.Offset, rw.DataTypeBlock)
+			if err != nil {
+				return nil, fmt.Errorf("coalesced read at offset %d length %d: %w", c.Offset, c.Length, err)
+			}
+			if int64(n) != c.Length {
+				return nil, fmt.Errorf(
+					"coalesced read at offset %d: short read, got %d want %d",
+					c.Offset, n, c.Length,
+				)
+			}
+			result[c.BlockIDs[0]] = block
+			continue
+		}
+
 		// Acquire a pooled read buffer; grow if needed.
 		bufPtr := coalescedReadPool.Get().(*[]byte)
 		if int64(cap(*bufPtr)) < c.Length {
