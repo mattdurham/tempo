@@ -310,6 +310,31 @@ func metricsColumnsAreIntrinsic(r *modules_reader.Reader, wantColumns map[string
 // NOTE-046: fast path is applicable when all wantColumns are intrinsic AND either:
 //   - program has no filter predicates (match-all { }): enumerate via span:start flat column.
 //   - program has only intrinsic predicates: BlockRefsFromIntrinsicTOC evaluates them.
+//
+// intrinsicDirectSeriesSinks decides which (if any) dense []TraceTimeSeries sink the
+// accumulation paths may emit into directly, bypassing the string-keyed `buckets` map and its
+// re-parse. On the intrinsic path the map is never shared across blocks, so this is always safe.
+//
+//   - seriesSink (NOTE-247): single-dimension count/rate — the per-(group,step) dense grid IS
+//     the final series grid (emitFlatCountRateSeries).
+//   - histSink (NOTE-350): histogram with N=0 or N=1 group-by — all funnel through
+//     emitHistogramFlat → the flat groupCountsFlat grid. The N>1 group-by histogram paths
+//     (streamHistogramGroupByID/streamHistogramGroupBy) write straight into `buckets` and do NOT
+//     pass through the flat emit, so they keep the traceHistogramSeries consumer; gating to
+//     len(GroupBy) <= 1 leaves histSink nil for those.
+func intrinsicDirectSeriesSinks(
+	isCountRate bool,
+	agg vm.AggregateSpec,
+) (seriesSink, histSink *[]TraceTimeSeries) {
+	if isCountRate && len(agg.GroupBy) == 1 {
+		seriesSink = &[]TraceTimeSeries{}
+	}
+	if agg.Function == vm.FuncNameHISTOGRAM && len(agg.GroupBy) <= 1 {
+		histSink = &[]TraceTimeSeries{}
+	}
+	return seriesSink, histSink
+}
+
 func executeTraceMetricsIntrinsic(
 	ctx context.Context,
 	r *modules_reader.Reader,
@@ -429,18 +454,10 @@ func executeTraceMetricsIntrinsic(
 		}
 	}
 
-	// NOTE-247: for the single-dimension count/rate group-by case, the dense per-(group,
-	// step) accumulator produced by dispatchIntrinsicAccumulate IS the final series grid.
-	// Supply a direct series sink so the count/rate emit paths skip the string `buckets`
-	// map and the traceBuildDenseSeries re-parse entirely (see emitFlatCountRateSeries).
-	// On the intrinsic path the map is never shared across blocks, so this is always safe.
-	var seriesSink *[]TraceTimeSeries
-	if isCountRate && len(agg.GroupBy) == 1 {
-		seriesSink = &[]TraceTimeSeries{}
-	}
+	seriesSink, histSink := intrinsicDirectSeriesSinks(isCountRate, agg)
 
 	buckets := make(map[string]*aggBucketState)
-	if err := dispatchIntrinsicAccumulate(ctx, r, tsCol, lo, hi, filteredRefs, isCountRate, inRangeRefs, inRangeVals, querySpec, buckets, seriesSink); err != nil {
+	if err := dispatchIntrinsicAccumulate(ctx, r, tsCol, lo, hi, filteredRefs, isCountRate, inRangeRefs, inRangeVals, querySpec, buckets, seriesSink, histSink); err != nil {
 		return nil, false, err
 	}
 	if isCountRate && len(agg.GroupBy) == 0 && len(buckets) == 0 {
@@ -451,6 +468,11 @@ func executeTraceMetricsIntrinsic(
 	switch {
 	case seriesSink != nil:
 		result.Series = finalizeCountRateSeries(*seriesSink)
+	case histSink != nil:
+		// NOTE-350: histogram dense-series direct path. The flat emit appended one series per
+		// occupied (group, boundary) slab; sort once for deterministic output (SPEC-ETM-11),
+		// matching traceHistogramSeries' final SortFunc. nil for an empty result.
+		result.Series = finalizeCountRateSeries(*histSink)
 	case querySpec.Aggregate.Function == vm.FuncNameHISTOGRAM:
 		result.Series = traceHistogramSeries(buckets, querySpec)
 	default:
@@ -513,6 +535,7 @@ func dispatchIntrinsicAccumulate(
 	querySpec *vm.QuerySpec,
 	buckets map[string]*aggBucketState,
 	seriesSink *[]TraceTimeSeries, // NOTE-247: non-nil for count/rate N=1 → emit series directly
+	histSink *[]TraceTimeSeries, // NOTE-350: non-nil for HISTOGRAM → emit series directly
 ) error {
 	agg := querySpec.Aggregate
 	tb := querySpec.TimeBucketing
@@ -532,10 +555,10 @@ func dispatchIntrinsicAccumulate(
 		if numSteps <= 0 {
 			return nil
 		}
-		return accumulateHistogramDirectN0(ctx, tb, agg, tsCol, numSteps, r, lo, hi, buckets)
+		return accumulateHistogramDirectN0(ctx, tb, agg, tsCol, numSteps, r, lo, hi, buckets, histSink)
 	case filteredRefs == nil && len(agg.GroupBy) == 1:
 		// NOTE-085/089: N=1 no-predicate direct path.
-		ok, err := accumulateIntrinsicBucketsDirect(ctx, r, tsCol, lo, hi, querySpec, buckets, seriesSink)
+		ok, err := accumulateIntrinsicBucketsDirect(ctx, r, tsCol, lo, hi, querySpec, buckets, seriesSink, histSink)
 		if err != nil || ok {
 			return err
 		}
@@ -564,7 +587,18 @@ func dispatchIntrinsicAccumulate(
 		if colErr != nil {
 			return colErr
 		}
-		return streamHistogramN1Compact(ctx, r, inRangeRefs, inRangeVals, groupByCol, agg, numSteps, tb, buckets)
+		return streamHistogramN1Compact(
+			ctx,
+			r,
+			inRangeRefs,
+			inRangeVals,
+			groupByCol,
+			agg,
+			numSteps,
+			tb,
+			buckets,
+			histSink,
+		)
 	case filteredRefs != nil && len(agg.GroupBy) == 1 && isCountRate:
 		// NOTE-110: predicate-filtered N=1 count/rate compact path.
 		// inRangeRefs is already packKey-sorted from mergeJoinFilteredRefsWithVals — skip the
@@ -583,9 +617,9 @@ func dispatchIntrinsicAccumulate(
 		// inRangeRefs is pre-sorted from mergeJoinFilteredRefsWithVals — build sortedPKs in O(n).
 		// Bypasses accumulateIntrinsicBucketsViaKeyMap (~90 MB keyToBucket) and the O(n log n)
 		// pkOrder sort inside streamHistogramN1Compact.
-		return streamHistogramN1CompactFromRefs(ctx, r, inRangeRefs, inRangeVals, querySpec, buckets)
+		return streamHistogramN1CompactFromRefs(ctx, r, inRangeRefs, inRangeVals, querySpec, buckets, histSink)
 	default:
-		return accumulateIntrinsicBucketsViaKeyMap(ctx, r, inRangeRefs, inRangeVals, tb, querySpec, buckets)
+		return accumulateIntrinsicBucketsViaKeyMap(ctx, r, inRangeRefs, inRangeVals, tb, querySpec, buckets, histSink)
 	}
 }
 
@@ -601,6 +635,7 @@ func accumulateIntrinsicBucketsViaKeyMap(
 	tb vm.TimeBucketSpec,
 	querySpec *vm.QuerySpec,
 	buckets map[string]*aggBucketState,
+	histSink *[]TraceTimeSeries, // NOTE-350
 ) error {
 	keyToBucket := make(map[uint32]int64, len(inRangeRefs))
 	for i, ref := range inRangeRefs {
@@ -615,7 +650,7 @@ func accumulateIntrinsicBucketsViaKeyMap(
 	if len(keyToBucket) == 0 {
 		return nil
 	}
-	return accumulateIntrinsicBuckets(ctx, r, keyToBucket, inRangeRefs, inRangeVals, querySpec, buckets)
+	return accumulateIntrinsicBuckets(ctx, r, keyToBucket, inRangeRefs, inRangeVals, querySpec, buckets, histSink)
 }
 
 // packKey packs (blockIdx, rowIdx) into a uint32 for use as a map key.
@@ -2001,6 +2036,7 @@ func streamHistogramN1CompactFromRefs(
 	inRangeVals []uint64,
 	querySpec *vm.QuerySpec,
 	buckets map[string]*aggBucketState,
+	histSink *[]TraceTimeSeries, // NOTE-350
 ) error {
 	agg := querySpec.Aggregate
 	tb := querySpec.TimeBucketing
@@ -2024,7 +2060,17 @@ func streamHistogramN1CompactFromRefs(
 		return err
 	}
 
-	return streamHistogramN1CompactCore(ctx, r, sortedPKs, timeBucketByPos, groupByCol, agg, numSteps, buckets)
+	return streamHistogramN1CompactCore(
+		ctx,
+		r,
+		sortedPKs,
+		timeBucketByPos,
+		groupByCol,
+		agg,
+		numSteps,
+		buckets,
+		histSink,
+	)
 }
 
 // scanAggColCompact scans an intrinsic column and populates aggValByPos/aggPresentByPos for each
@@ -2163,6 +2209,7 @@ func streamHistogramN1Compact(
 	numSteps int64,
 	tb vm.TimeBucketSpec,
 	buckets map[string]*aggBucketState,
+	histSink *[]TraceTimeSeries, // NOTE-350
 ) error {
 	if len(inRangeRefs) == 0 {
 		return nil
@@ -2188,7 +2235,7 @@ func streamHistogramN1Compact(
 
 	fillPKSetAndTimeBucketsFromRefs(inRangeRefs, inRangeVals, &tb, numSteps, pkSet, timeBucketByPos)
 
-	return streamHistogramN1CompactCore(ctx, r, pkSet, timeBucketByPos, groupByCol, agg, numSteps, buckets)
+	return streamHistogramN1CompactCore(ctx, r, pkSet, timeBucketByPos, groupByCol, agg, numSteps, buckets, histSink)
 }
 
 // streamHistogramN1CompactCore is the shared accumulation core for the compact N=1
@@ -2208,6 +2255,7 @@ func streamHistogramN1CompactCore(
 	agg vm.AggregateSpec,
 	numSteps int64,
 	buckets map[string]*aggBucketState,
+	histSink *[]TraceTimeSeries, // NOTE-350
 ) error {
 	n := len(sortedPKs)
 
@@ -2272,7 +2320,7 @@ func streamHistogramN1CompactCore(
 		}
 	}
 
-	return streamByRefSliceHistogramFlatEmit(groupCountsFlat, stride1, stride2, numGroups, dict, boundaries, buckets)
+	return emitHistogramFlat(histSink, groupCountsFlat, stride1, stride2, numGroups, dict, boundaries, agg, buckets)
 }
 
 // mergeJoinFilteredRefsWithVals returns the subset of (inRangeRefs, inRangeVals)
@@ -2792,6 +2840,7 @@ func accumulateIntrinsicBuckets(
 	inRangeVals []uint64,
 	querySpec *vm.QuerySpec,
 	buckets map[string]*aggBucketState,
+	histSink *[]TraceTimeSeries, // NOTE-350
 ) error {
 	agg := querySpec.Aggregate
 	isCountRate := agg.Function == vm.FuncNameCOUNT || agg.Function == vm.FuncNameRATE
@@ -2820,7 +2869,18 @@ func accumulateIntrinsicBuckets(
 		// The compact path uses binary search over sorted packKeys instead, reducing
 		// peak memory from ~520 MB to ~115 MB per goroutine for M8-style queries.
 		if agg.Function == vm.FuncNameHISTOGRAM {
-			return streamHistogramN1Compact(ctx, r, inRangeRefs, inRangeVals, groupByCol, agg, numSteps, tb, buckets)
+			return streamHistogramN1Compact(
+				ctx,
+				r,
+				inRangeRefs,
+				inRangeVals,
+				groupByCol,
+				agg,
+				numSteps,
+				tb,
+				buckets,
+				histSink,
+			)
 		}
 
 		dictIdxForRef, dict, dictByPK, maxPK, buildErr := buildDictIdxForRefs(groupByCol, agg.GroupBy[0], inRangeRefs)
@@ -2861,6 +2921,7 @@ func accumulateIntrinsicBuckets(
 			numSteps,
 			tb,
 			buckets,
+			histSink,
 		)
 	}
 
@@ -3408,6 +3469,7 @@ func accumulateIntrinsicBucketsDirect(
 	querySpec *vm.QuerySpec,
 	buckets map[string]*aggBucketState,
 	seriesSink *[]TraceTimeSeries, // NOTE-247
+	histSink *[]TraceTimeSeries, // NOTE-350
 ) (bool, error) {
 	agg := querySpec.Aggregate
 	isCountRate := agg.Function == vm.FuncNameCOUNT || agg.Function == vm.FuncNameRATE
@@ -3581,7 +3643,19 @@ func accumulateIntrinsicBucketsDirect(
 	}
 	// NOTE-089: HISTOGRAM and general agg now handled by direct column scan.
 	if agg.Function == vm.FuncNameHISTOGRAM {
-		return true, accumulateHistogramDirect(ctx, r, agg, dictByPK, bucketByPK, maxPK, dict, numSteps, tb, buckets)
+		return true, accumulateHistogramDirect(
+			ctx,
+			r,
+			agg,
+			dictByPK,
+			bucketByPK,
+			maxPK,
+			dict,
+			numSteps,
+			tb,
+			buckets,
+			histSink,
+		)
 	}
 	return true, accumulateAggDirect(ctx, r, agg, dictByPK, bucketByPK, minPK, maxPK, dict, numSteps, buckets)
 }
@@ -3718,6 +3792,7 @@ func accumulateHistogramDirect(
 	numSteps int64,
 	tb vm.TimeBucketSpec,
 	buckets map[string]*aggBucketState,
+	histSink *[]TraceTimeSeries, // NOTE-350
 ) error {
 	// Fetch col before allocation so we can pre-scan actual boundary count.
 	col, err := r.GetIntrinsicColumn(agg.Field)
@@ -3783,7 +3858,7 @@ func accumulateHistogramDirect(
 
 	// NOTE-129: release seenByPK before emit — frees 16 MB before non-trivial emit work.
 	releaseDirectBool(seenByPK)
-	return streamByRefSliceHistogramFlatEmit(groupCountsFlat, stride1, stride2, numGroups, dict, boundaries, buckets)
+	return emitHistogramFlat(histSink, groupCountsFlat, stride1, stride2, numGroups, dict, boundaries, agg, buckets)
 }
 
 // accumulateHistogramDirectN0 is the direct-path HISTOGRAM accumulator for N=0 (no group-by) queries.
@@ -3806,6 +3881,7 @@ func accumulateHistogramDirectN0(
 	r *modules_reader.Reader,
 	lo, hi int,
 	buckets map[string]*aggBucketState,
+	histSink *[]TraceTimeSeries, // NOTE-350
 ) error {
 	if lo >= hi {
 		return nil
@@ -3891,7 +3967,7 @@ func accumulateHistogramDirectN0(
 	releaseDirectBool(seenByPK)
 	// Step 7: emit — single group, dict = [""], numGroups = 1.
 	dict := []string{""}
-	return streamByRefSliceHistogramFlatEmit(groupCountsFlat, stride1, stride2, 1, dict, boundaries, buckets)
+	return emitHistogramFlat(histSink, groupCountsFlat, stride1, stride2, 1, dict, boundaries, agg, buckets)
 }
 
 // accumulateAggDirect is the direct-path general agg accumulator (SUM/AVG/MIN/MAX/STDDEV/QUANTILE)
@@ -4153,6 +4229,7 @@ func streamByRefSlice(
 	numSteps int64,
 	tb vm.TimeBucketSpec,
 	buckets map[string]*aggBucketState,
+	histSink *[]TraceTimeSeries, // NOTE-350
 ) error {
 	switch agg.Function {
 	case vm.FuncNameCOUNT, vm.FuncNameRATE:
@@ -4173,6 +4250,7 @@ func streamByRefSlice(
 			numSteps,
 			tb,
 			buckets,
+			histSink,
 		)
 	default:
 		return streamByRefSliceAgg(
@@ -4343,6 +4421,7 @@ func streamByRefSliceHistogram(
 	numSteps int64,
 	tb vm.TimeBucketSpec,
 	buckets map[string]*aggBucketState,
+	histSink *[]TraceTimeSeries, // NOTE-350
 ) error {
 	if len(inRangeRefs) == 0 {
 		return nil
@@ -4442,7 +4521,7 @@ func streamByRefSliceHistogram(
 	// NOTE-129: release before emit — frees 32+16 MB before non-trivial emit work.
 	releaseDirectInt16(bucketByPK)
 	releaseDirectBool(seenByPK)
-	return streamByRefSliceHistogramFlatEmit(groupCountsFlat, stride1, stride2, numGroups, dict, boundaries, buckets)
+	return emitHistogramFlat(histSink, groupCountsFlat, stride1, stride2, numGroups, dict, boundaries, agg, buckets)
 }
 
 // scanHistogramN0 is a specialized scanner for N=0 (no group-by) histogram accumulation.
@@ -4624,6 +4703,117 @@ func streamByRefSliceHistogramScanDict(
 // Layout: groupCountsFlat[gIdx*stride1 + bIdx*stride2 + timeIdx].
 // bIdx=0 is the absent/boundary-0 sentinel; bIdx=1..len(boundaries) are actual boundaries.
 // NOTE-088: replaces streamByRefSliceHistogramEmit (3D slice) — same emit semantics, flat layout.
+//
+// NOTE-350: when histSink is non-nil, scatter the flat accumulator straight into dense
+// []TraceTimeSeries instead of the string-keyed `buckets` map, mirroring the count/rate
+// seriesSink fast path (NOTE-247/emitFlatCountRateSeries). On the intrinsic path the buckets
+// map is never shared across blocks (executeTraceMetricsIntrinsic accumulates per file and
+// consumes immediately), so each (gIdx, bIdx) slab of the flat grid IS one final series: its
+// label set is the group-by dims (dict[gIdx], "\x00"-joined for N>1) plus __bucket=boundaryStr,
+// and Values is groupCountsFlat[base : base+stride2]. The previous form built a composite key
+// "timeIdx\x00gk\x00boundaryStr" per non-zero CELL (one strconv.AppendInt + appends + map insert
+// + per-cell aggBucketState heap alloc), then traceHistogramSeries re-parsed every key
+// (IndexByte + ParseInt + LastIndexByte) to scatter it back into the same (group, boundary, time)
+// dense grid — a full serialize/deserialize round-trip plus O(non-zero-cells) heap allocs, purely
+// to move integer counts. Building series directly removes the map, the key formatting, the
+// per-cell struct alloc, and the entire re-parse. Output series are byte-identical to the
+// buckets→traceHistogramSeries path; the caller sorts the combined sink once at emit time.
+// emitHistogramFlat routes the flat histogram accumulator to either the dense-series direct
+// emit (NOTE-350, when histSink is non-nil — the intrinsic path) or the legacy string-keyed
+// `buckets` map emit (block-pipeline / cross-block accumulation). Keeps the four histogram
+// accumulation paths from each duplicating the dispatch.
+func emitHistogramFlat(
+	histSink *[]TraceTimeSeries,
+	groupCountsFlat []int64,
+	stride1, stride2 int64,
+	numGroups int,
+	dict []string,
+	boundaries []float64,
+	agg vm.AggregateSpec,
+	buckets map[string]*aggBucketState,
+) error {
+	if histSink != nil {
+		streamByRefSliceHistogramFlatEmitDirect(
+			histSink,
+			groupCountsFlat,
+			stride1,
+			stride2,
+			numGroups,
+			dict,
+			boundaries,
+			agg,
+		)
+		return nil
+	}
+	return streamByRefSliceHistogramFlatEmit(groupCountsFlat, stride1, stride2, numGroups, dict, boundaries, buckets)
+}
+
+func streamByRefSliceHistogramFlatEmitDirect(
+	histSink *[]TraceTimeSeries,
+	groupCountsFlat []int64,
+	stride1, stride2 int64,
+	numGroups int,
+	dict []string,
+	boundaries []float64,
+	agg vm.AggregateSpec,
+) {
+	numBoundaries := int64(len(boundaries)) + 1 // +1 for absent sentinel at bIdx=0
+	// Per-boundary string depends only on bIdx (NOTE-266) — format each exactly once.
+	boundaryStrs := make([]string, numBoundaries)
+	for bIdx := int64(0); bIdx < numBoundaries; bIdx++ {
+		var boundary float64
+		if bIdx > 0 && int(bIdx-1) < len(boundaries) { //nolint:gosec
+			boundary = boundaries[bIdx-1]
+		}
+		boundaryStrs[bIdx] = strconv.FormatFloat(boundary, 'g', -1, 64)
+	}
+	groupBy := agg.GroupBy
+	for gIdx := int64(0); gIdx < int64(numGroups); gIdx++ { //nolint:gosec
+		gk := ""
+		if int(gIdx) < len(dict) { //nolint:gosec
+			gk = dict[gIdx]
+		}
+		// gk is the "\x00"-joined composite of the group-by dimension values; split once per
+		// group, reused across all boundary series for this group (matches traceHistogramSeries).
+		var attrVals []string
+		if len(groupBy) > 0 {
+			attrVals = strings.Split(gk, "\x00")
+		}
+		for bIdx := int64(0); bIdx < numBoundaries; bIdx++ {
+			base := gIdx*stride1 + bIdx*stride2
+			hasAny := false
+			for timeIdx := int64(0); timeIdx < stride2; timeIdx++ {
+				if groupCountsFlat[base+timeIdx] != 0 {
+					hasAny = true
+					break
+				}
+			}
+			if !hasAny {
+				continue
+			}
+			values := make([]float64, stride2)
+			for timeIdx := int64(0); timeIdx < stride2; timeIdx++ {
+				if c := groupCountsFlat[base+timeIdx]; c != 0 {
+					values[timeIdx] = float64(c)
+				}
+			}
+			var labels []TraceMetricLabel
+			if len(groupBy) > 0 {
+				labels = make([]TraceMetricLabel, 0, len(groupBy)+1)
+				for i, name := range groupBy {
+					val := ""
+					if i < len(attrVals) {
+						val = attrVals[i]
+					}
+					labels = append(labels, TraceMetricLabel{Name: intrinsicLabelName(name), Value: val})
+				}
+			}
+			labels = append(labels, TraceMetricLabel{Name: "__bucket", Value: boundaryStrs[bIdx]})
+			*histSink = append(*histSink, TraceTimeSeries{Labels: labels, Values: values})
+		}
+	}
+}
+
 func streamByRefSliceHistogramFlatEmit(
 	groupCountsFlat []int64,
 	stride1, stride2 int64,

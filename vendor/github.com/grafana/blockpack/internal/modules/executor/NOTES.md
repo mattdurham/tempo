@@ -5,6 +5,38 @@ This document captures the non-obvious design decisions, rationale, and invarian
 
 ---
 
+## NOTE-350: histogram dense-series direct emit (skip the buckets map round-trip)
+
+The intrinsic histogram path (M8: `histogram_over_time(duration) by (...)`) accumulated into a
+flat `groupCountsFlat[gIdx*stride1 + bIdx*stride2 + timeIdx]` grid, then `streamByRefSliceHistogramFlatEmit`
+serialized every non-zero CELL into a `map[string]*aggBucketState` keyed by the composite
+`"timeIdx\x00gk\x00boundaryStr"` (one `strconv.AppendInt` + byte appends + map insert + a
+per-cell `&aggBucketState{}` heap alloc — of which histogram only ever reads `.count`). The
+consumer `traceHistogramSeries` then re-parsed every key (`IndexByte` + `ParseInt` +
+`LastIndexByte`) to scatter the counts back into the SAME `(group, boundary, time)` dense grid.
+A full serialize/deserialize round-trip plus O(non-zero-cells) heap allocs, purely to move
+integer counts.
+
+This is the direct analog of the count/rate `seriesSink` fast path (NOTE-247): on the intrinsic
+path `buckets` is never shared across blocks (`executeTraceMetricsIntrinsic` accumulates per file
+and consumes immediately), so each `(gIdx, bIdx)` slab of the flat grid IS one final series — its
+labels are the group-by dims (`dict[gIdx]`, `"\x00"`-joined for N=1) plus `__bucket=boundaryStr`,
+and `Values` is the `[base : base+stride2]` row. `intrinsicDirectSeriesSinks` hands the histogram
+accumulation paths a `histSink *[]TraceTimeSeries`; `emitHistogramFlat` routes to
+`streamByRefSliceHistogramFlatEmitDirect` (scatter straight into dense series) when it is non-nil,
+falling back to the legacy `buckets` map emit otherwise. The result site sorts the sink with
+`finalizeCountRateSeries` (matching `traceHistogramSeries`' final SortFunc), so the output series
+are byte-identical to the `buckets → traceHistogramSeries` path (guarded by
+`TestStreamByRefSliceHistogram_3D_DirectEmitEquivalence`).
+
+**Scope gate:** the sink is only created for N=0 and N=1 group-by histograms, which all funnel
+through `emitHistogramFlat`. The N>1 group-by paths (`streamHistogramGroupByID`/
+`streamHistogramGroupBy`) write straight into the string-keyed `buckets` map and never reach the
+flat emit, so `intrinsicDirectSeriesSinks` leaves `histSink` nil for them and they keep the
+`traceHistogramSeries` consumer unchanged.
+
+---
+
 ## NOTE-349: pool the per-block []intrinsicRowFields scatter scratch
 
 `lookupIntrinsicFieldsTypedForBlock` (structural search path, e.g. `{...} >> {...}`),
