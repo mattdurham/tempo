@@ -2057,7 +2057,45 @@ func scanIntrinsicLeafRefs(
 
 	if meta.Format == modules_shared.IntrinsicFormatDict {
 		if len(leaf.Values) == 0 && leaf.Pattern == "" {
-			return nil // range predicate on dict — not supported in raw scan
+			// NOTE-339: a range predicate (>, >=, <, <=) on a NUMERIC dict-encoded column.
+			// Previously this returned nil, which propagates as "unevaluable" up through
+			// evalNodeBlockRefs → BlockRefsFromIntrinsicTOC returns nil → the entire
+			// intrinsic pre-filter is abandoned and the query falls back to scanning every
+			// span of every selected block via the full column-decode path. For a filtered
+			// rate-by query whose predicate AND-arm is a numeric range on a low-cardinality
+			// dict column (the dominant filtered-metrics shape), this means fetching and
+			// decoding the wide block for every block in the window — the opposite of the
+			// intrinsic-only refs fast path's purpose.
+			//
+			// The dict page scanner already exposes each distinct entry's value
+			// (valueBytes / int64Val + isInt64) to its matchFn, so a range comparison is
+			// evaluated once per DISTINCT dict entry — a handful of comparisons per page —
+			// then the matched entries' ref runs are emitted in bulk. Range predicates
+			// cannot use bloom pruning (a range spans many distinct values, so no single
+			// bloom key represents it), so nil bloom keys are passed and every page is
+			// scanned, exactly as the non-paged dict path does.
+			// Gate on the COLUMN type, not just the literal: only INTEGER-domain dict
+			// columns (int64 / uint64 / duration) store their dict values as a plain
+			// integer the scanner exposes via int64Val (int64 columns) or an 8-byte-LE
+			// uint64 (uint64/duration columns). Float64 dict columns encode their values
+			// as math.Float64bits LE — decoding those as integers would compare bit
+			// patterns, not magnitudes — and string dict columns are not numerically
+			// range-comparable, so both are excluded (fall back to the legacy path).
+			if !isIntegerDomainColType(meta.Type) {
+				return nil
+			}
+			lo, hi, hasLo, hasHi, ok := extractDictRangeBounds(leaf)
+			if !ok {
+				return nil // not a numeric range, or unencodable bound — fast path N/A
+			}
+			return modules_shared.ScanDictColumnRefsWithBloom(
+				blob,
+				func(valueBytes []byte, int64Val int64, isInt64 bool) bool {
+					return dictNumericInRange(valueBytes, int64Val, isInt64, lo, hi, hasLo, hasHi)
+				},
+				nil,
+				maxRefs,
+			)
 		}
 		// Regex predicate: compile pattern and scan dict entries.
 		// NOTE-038: regex on dict columns uses ScanDictColumnRefsWithBloom with nil bloom keys
@@ -2182,6 +2220,123 @@ func extractFlatRangeBounds(leaf vm.RangeNode) (lo, hi uint64, hasLo, hasHi, ok 
 		hi, hasHi = v, true
 	}
 	return lo, hi, hasLo, hasHi, true
+}
+
+// isIntegerDomainColType reports whether a dict-encoded column of this type stores its
+// values as plain integers (int64Val for int64 columns, or 8-byte-LE uint64 for
+// uint64/duration columns) — the only encodings dictNumericInRange can compare in their
+// natural numeric order. Float64 columns (math.Float64bits LE) and string columns are
+// excluded. NOTE-339.
+func isIntegerDomainColType(ct modules_shared.ColumnType) bool {
+	switch ct {
+	case modules_shared.ColumnTypeInt64, modules_shared.ColumnTypeRangeInt64,
+		modules_shared.ColumnTypeUint64, modules_shared.ColumnTypeRangeUint64,
+		modules_shared.ColumnTypeRangeDuration:
+		return true
+	}
+	return false
+}
+
+// extractDictRangeBounds extracts the inclusive numeric range bounds of a leaf's
+// Min/Max for the dict-range scan (NOTE-339). It returns the bounds as a signed int64
+// `lo`/`hi` PAIR with a corresponding unsigned `loU`/`hiU` interpretation packed into
+// the same value: the comparison in dictNumericInRange dispatches on the dict entry's
+// signedness (int64 entries vs 8-byte-LE uint64/duration entries), and each numeric
+// domain is compared in its own type. Because TraceQL numeric literals are int64
+// (or non-negative for uint64 columns), a single int64 bound covers both: int64
+// entries compare directly, and uint64/duration entries are decoded to uint64 and
+// compared against the bound re-interpreted as uint64 (a negative int64 bound implies
+// "all non-negative uint64 values match >=" / "none match <=", handled by the
+// inclusive/exclusive adjustment below). Returns ok=false when a bound cannot be encoded
+// as an integer (e.g. a string or float literal), in which case the caller skips the
+// dict-range fast path.
+func extractDictRangeBounds(leaf vm.RangeNode) (lo, hi int64, hasLo, hasHi, ok bool) {
+	if leaf.Min != nil {
+		v, encOK := valueToInt64Bound(*leaf.Min)
+		if !encOK {
+			return 0, 0, false, false, false
+		}
+		if !leaf.MinInclusive {
+			// Exclusive lower bound (> threshold): make inclusive by +1.
+			if v == math.MaxInt64 {
+				return 0, 0, false, false, false
+			}
+			v++
+		}
+		lo, hasLo = v, true
+	}
+	if leaf.Max != nil {
+		v, encOK := valueToInt64Bound(*leaf.Max)
+		if !encOK {
+			return 0, 0, false, false, false
+		}
+		if !leaf.MaxInclusive {
+			// Exclusive upper bound (< threshold): make inclusive by -1.
+			if v == math.MinInt64 {
+				return 0, 0, false, false, false
+			}
+			v--
+		}
+		hi, hasHi = v, true
+	}
+	if !hasLo && !hasHi {
+		return 0, 0, false, false, false
+	}
+	return lo, hi, hasLo, hasHi, true
+}
+
+// valueToInt64Bound converts an integer/duration vm.Value to a signed int64 range bound.
+// Returns ok=false for non-integer literals (string, float, vector), which makes the
+// dict-range fast path inapplicable so the caller skips it.
+func valueToInt64Bound(v vm.Value) (int64, bool) {
+	switch v.Type {
+	case vm.TypeInt, vm.TypeDuration:
+		if i, ok := v.Data.(int64); ok {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+// dictNumericInRange reports whether one distinct dict entry's value falls within the
+// inclusive [lo, hi] bound (either side optional). Int64-typed dict entries (isInt64)
+// compare in signed int64. Other numeric dict entries are stored as the 8-byte
+// little-endian encoding produced by encodeValue for uint64/duration columns; those
+// decode to uint64 and compare in unsigned domain against the bound re-interpreted per
+// sign. Non-numeric / unexpected-width entries never match (they are not range-comparable).
+// NOTE-339.
+func dictNumericInRange(valueBytes []byte, int64Val int64, isInt64 bool, lo, hi int64, hasLo, hasHi bool) bool {
+	if isInt64 {
+		if hasLo && int64Val < lo {
+			return false
+		}
+		if hasHi && int64Val > hi {
+			return false
+		}
+		return true
+	}
+	if len(valueBytes) != 8 {
+		return false // not an 8-byte LE numeric dict value — not range-comparable
+	}
+	u := binary.LittleEndian.Uint64(valueBytes)
+	if hasLo {
+		// A negative lower bound matches every non-negative uint64 value, so only enforce
+		// the bound when it is non-negative (when negative, the comparison is vacuously true).
+		if lo >= 0 && u < uint64(lo) {
+			return false
+		}
+	}
+	if hasHi {
+		// A negative upper bound (< some negative threshold) excludes every non-negative
+		// uint64 value; no uint64 value can be <= a negative bound.
+		if hi < 0 {
+			return false
+		}
+		if u > uint64(hi) {
+			return false
+		}
+	}
+	return true
 }
 
 // intrinsicFlatMatchRefs returns up to max BlockRefs from a flat (uint64-sorted) column

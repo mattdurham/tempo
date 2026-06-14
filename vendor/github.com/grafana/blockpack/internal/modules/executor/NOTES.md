@@ -5159,3 +5159,52 @@ spans (FromRefs gets a packKey-sorted copy) and assert identical bucket maps;
 fully green. Back-ref: `metrics_trace_intrinsic.go:fillPKSetAndTimeBucketsFromPreSortedRefs`,
 `metrics_trace_intrinsic.go:streamAggN1CompactCore`,
 `metrics_trace_intrinsic.go:streamHistogramN1CompactCore`.
+
+## NOTE-339: intrinsic dict-range predicate scan — keep the pure-intrinsic refs fast path usable for numeric range filters
+*Added: 2026-06-14*
+
+**Problem.** `scanIntrinsicLeafRefs` (the per-leaf scan behind `BlockRefsFromIntrinsicTOC`)
+bailed out with `return nil` for any range predicate (`>`, `>=`, `<`, `<=`) on a
+dict-format intrinsic column ("range predicate on dict — not supported in raw scan").
+A nil leaf result makes `evalNodeBlockRefs` return `ok=false`, which makes
+`BlockRefsFromIntrinsicTOC` abandon the ENTIRE intrinsic pre-filter and fall back to the
+full per-block column-decode + scan path. For a filtered rate-by query whose predicate
+AND-arm is a numeric range over a low-cardinality dict-encoded numeric column (the dominant
+filtered-metrics shape), this meant fetching and decoding the wide block for every block in
+the window — the exact wide-block I/O the intrinsic-only refs path exists to avoid.
+NOTE-156 had only sped up the *fallback's* per-row compare (`scanNumericDict`), not removed
+the fallback; the intrinsic pre-filter still gave up entirely.
+
+**Fix.** When the dict leaf is a range with no explicit value/pattern set AND the column is
+an INTEGER-domain numeric type, evaluate the range through the existing dict page scanner
+(`ScanDictColumnRefsWithBloom`) with a range matchFn. The scanner already exposes each
+DISTINCT dict entry's value (`int64Val` for int64 columns, 8-byte-LE `valueBytes` for
+uint64/duration columns) to its matchFn, so the comparison runs once per distinct entry —
+a handful of comparisons per page — then matched entries' ref runs are emitted in bulk by
+the existing `appendVariableWidthRefs` path. The returned refs are EXACT (the dict scanner
+emits refs only for matching entries), so the pure-intrinsic no-VM-re-eval contract holds.
+
+**Correctness gates.**
+- `isIntegerDomainColType(meta.Type)` restricts the fast path to int64/uint64/duration dict
+  columns. Float64 dict columns encode values as `math.Float64bits` LE — decoding those 8
+  bytes as a uint64 integer would compare bit patterns, not magnitudes — and string dict
+  columns are not numerically range-comparable; both fall back to the legacy path unchanged.
+- `extractDictRangeBounds` accepts only integer/duration literals (rejects string/float/
+  vector), normalizes exclusive bounds to inclusive (`>`→`+1`, `<`→`-1`) with overflow
+  rejection at MaxInt64/MinInt64, and returns ok=false (skip fast path) for any unencodable
+  bound or an empty constraint.
+- `dictNumericInRange` compares int64 entries in signed int64 and 8-byte-LE entries in
+  unsigned uint64, with the sign-mismatch edge cases handled explicitly: a negative lower
+  bound is vacuously satisfied by every non-negative uint64 value; a negative upper bound
+  excludes every non-negative uint64 value. A non-8-byte value is never range-comparable
+  (returns false). Range predicates cannot use bloom pruning (a range spans many distinct
+  values), so nil bloom keys are passed and every page is scanned — identical to the
+  non-paged dict path.
+
+**Verified.** `dict_range_test.go` exercises `extractDictRangeBounds` (all four operators,
+inclusive/exclusive, overflow rejection, non-integer-literal rejection) and
+`dictNumericInRange` against an independent oracle across int64 entries, 8-byte-LE uint64
+entries (incl. negative-bound edge cases), and non-numeric entries. Full executor and
+blockio suites green under `-race`.
+
+Back-ref: `internal/modules/executor/predicates.go:scanIntrinsicLeafRefs,extractDictRangeBounds,valueToInt64Bound,dictNumericInRange,isIntegerDomainColType`
