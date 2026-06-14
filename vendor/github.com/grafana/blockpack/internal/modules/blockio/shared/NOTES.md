@@ -1968,3 +1968,41 @@ NOTE-152) — refsDecode is nil for them, making EnsureBlockRefs a no-op.
 byte-equal to eager refs, idempotent, no re-decode); existing Delta/Flat/XOR equivalence tests
 adapted to EnsureBlockRefs before comparing (they now also verify lazy == eager refs).
 `go test -race ./blockio/... ./executor` green.
+
+## NOTE-344: account for lazy-ref footprint in IntrinsicColumn.SizeBytes (cache-budget leak)
+
+**Files:** `shared/intrinsiccolumn.go` (refsBlobLen field; EnsureBlockRefs clears it),
+`shared/intrinsic_codec.go` (decodePagedColumnBlob records refsBlobLen when capturing the
+lazy refsDecode closure), `shared/types.go` (IntrinsicColumn.SizeBytes adds the lazy terms),
+`shared/intrinsic_parallel_decode_test.go` (TestLazyRefsSizeBytesAccounting).
+
+**Change:** When a paged Flat/Delta/XOR column is decoded with deferred refs (NOTE-340), its
+`BlockRefs` slice is empty at `parsedIntrinsicCache.Put` time, so the old `SizeBytes()` term
+`len(BlockRefs)*4` counted ZERO for the refs — even though (a) the captured `refsDecode`
+closure pins the whole compressed column blob alive for the column's cached lifetime, and
+(b) the refs will later materialize `Count` BlockRefs (4 bytes each) INTO the cached object.
+The objectcache snapshots `SizeBytes()` exactly once at Put and never re-measures, so every
+lazy-ref column under-reported its true retained footprint by `blob + Count*4` bytes. With a
+512 MiB budget the cache silently grew to multiple GiB of live decoded refs + retained blobs.
+The fix records `refsBlobLen = len(blob)` when the closure is captured and adds
+`Count*4 + refsBlobLen` to SizeBytes while `refsDecode != nil`; EnsureBlockRefs zeroes
+refsBlobLen and drops the closure when refs materialize, after which `len(BlockRefs)*4` covers
+the refs exactly and the (now-GC'able) blob no longer counts.
+
+**Why:** `makeNoZeroBlockRef` (4.49 GB) and `makeNoZeroUint64` (4.77 GB) were the #1/#2 querier
+`inuse_space` frames (gcx memory:inuse_space, querier, 2026-06-15), together ~9.2 GB live on
+queriers sitting at 11–12 GiB RSS against the 13 GiB GOMEMLIMIT. The retention was the
+parsedIntrinsicCache holding far past its 512 MiB budget because the LRU accounting ignored
+the lazy-ref footprint. Accurate accounting lets the LRU evict on schedule, capping the cache
+at its configured budget and reclaiming the over-held refs + blobs.
+
+**Safety:** `Count` always equals the eventual ref count — every page append helper does
+`dst.Count += rowCount` and the parallel path sets `merged.Count = totalRows`, so refs length
+== Count (one BlockRef per row). The added terms are an over-estimate only transiently (the
+entry keeps its Put-time size until the next access re-Puts/re-sizes it), which is conservative
+— it can only make the cache evict slightly sooner, never later.
+
+**Verification:** TestLazyRefsSizeBytesAccounting (lazy SizeBytes ≥ values+refs+blob; after
+EnsureBlockRefs SizeBytes == values+refs and strictly less than the lazy estimate). Existing
+TestLazyBlockRefsDeferred + Delta/Flat/XOR equivalence tests unchanged & green.
+`go test -race ./blockio/shared ./objectcache ./blockio/reader` green; `make precommit` green.

@@ -5230,3 +5230,28 @@ Routing the Dict arm through `histRefPassPos` removes that branch and de-duplica
 `(_, false)` exactly when the inline code `continue`d (pk out of range or non-member).
 
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:scanAggColHistogramShard,histRefPassPos`
+
+## NOTE-345: per-column intrinsic scatter writes the field directly (no per-entry closure)
+
+`populateTypedColumnForBlock` (the block-boundary intrinsic scatter, NOTE-100) used to
+dispatch the uint64 and dict columns through three generic helpers —
+`scatterUint64Field` / `scatterDictStringField` / `scatterDictInt64Field` — each taking a
+`set func(*intrinsicRowFields, T)` closure that named the destination field. That closure
+was invoked on **every scattered entry**: an indirect, non-inlinable call O(spans) times per
+column. On the metrics intrinsic path (M4/M6/M8 read `span:duration`, `span:kind`,
+`service.name` through these), it ran across every span in every block.
+
+Replaced the three closure-taking helpers with eight dedicated, closure-free scatters
+(`scatterSpanStart` / `…SpanEnd` / `…SpanDuration` / `…SpanName` / `…ServiceName` /
+`…StatusMessage` / `…SpanKind` / `…SpanStatus`), each writing its destination field and
+present bit DIRECTLY — mirroring the already-direct `scatterTraceID` / `scatterSpanID` /
+`scatterParentID` byte scatters. This removes the per-entry indirect call and keeps the
+bounds-checked loop tight (the compiler can no longer be blocked by the opaque closure).
+
+Dispatch correctness is unchanged: the `colName` switch in `populateTypedColumnForBlock`
+selects exactly one scatter, and each new function carries the identical present bit and
+reads from the identical source array (`Uint64Values` / `DictEntries.Value` /
+`DictEntries.Int64Val`) the former closure call passed. The loop body is otherwise
+byte-for-byte the same (the closure was the only difference).
+
+Back-ref: `internal/modules/executor/intrinsic_row_block.go:populateTypedColumnForBlock`

@@ -266,6 +266,19 @@ func (col *IntrinsicColumn) SizeBytes() int64 {
 		n += int64(len(e.Value)) + int64(len(e.BlockRefs))*4 + 8
 	}
 	n += int64(len(col.refIndex)) * 8
+	// NOTE-344: a lazy-ref column (NOTE-340) has refsDecode != nil and an empty BlockRefs
+	// slice at Put time, so len(BlockRefs)*4 above counts zero — yet the column will
+	// materialize Count refs (4 bytes each) on first ref access AND, until then, retains the
+	// captured compressed blob (refsBlobLen) for the deferred re-walk. The process cache
+	// snapshots SizeBytes() once at Put and never re-measures, so without these terms the LRU
+	// budget under-counts every lazy-ref column by its blob + eventual-refs footprint and the
+	// cache grows far past maxBytes (decodePagedColumnRefs was the dominant querier
+	// inuse_space frame). Count the worst-case retained size so eviction stays accurate; once
+	// EnsureBlockRefs materializes the refs, refsBlobLen drops to 0 and len(BlockRefs)*4
+	// covers them exactly (the entry is re-Put or re-sized by the cache on the next access).
+	if col.refsDecode != nil {
+		n += int64(col.Count)*4 + int64(col.refsBlobLen)
+	}
 	return n
 }
 

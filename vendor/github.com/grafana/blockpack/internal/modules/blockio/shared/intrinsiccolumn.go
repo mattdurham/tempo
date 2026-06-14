@@ -24,6 +24,14 @@ type IntrinsicColumn struct {
 	Uint64Values []uint64
 	refIndexOnce sync.Once
 	refsOnce     sync.Once
+	// NOTE-344: refsBlobLen records the byte length of the compressed column blob retained
+	// by the refsDecode closure (NOTE-340). The closure pins the whole blob alive for the
+	// lifetime of the (process-cached) column so the deferred ref re-walk can run; that
+	// retained blob is real heap the LRU budget must account for — otherwise a cache holding
+	// many lazy-ref columns under-counts its true footprint by the blob size of each. Zero
+	// once refs are materialized (the closure and its captured blob are released by
+	// EnsureBlockRefs). See SizeBytes.
+	refsBlobLen uint32
 	// NOTE-229: dense single-block RowIdx permutation fast path for refIndex reverse lookups.
 	refDenseMin  uint32
 	refDenseHi16 uint32
@@ -43,6 +51,9 @@ func (col *IntrinsicColumn) EnsureBlockRefs() {
 	}
 	col.refsOnce.Do(func() {
 		col.BlockRefs = col.refsDecode()
+		// NOTE-344: drop the closure so its captured blob can be GC'd, and clear refsBlobLen
+		// — the materialized BlockRefs slice is now counted directly by SizeBytes.
 		col.refsDecode = nil
+		col.refsBlobLen = 0
 	})
 }

@@ -1044,6 +1044,11 @@ func decodePagedColumnBlob(blob []byte) (*IntrinsicColumn, error) {
 	if lazyRefs {
 		blobRef := blob // capture for the deferred ref decode (immutable cached blob)
 		merged.refsDecode = func() []BlockRef { return decodePagedColumnRefs(blobRef) }
+		// NOTE-344: the closure pins blobRef alive — record its length so the LRU budget
+		// (IntrinsicColumn.SizeBytes) accounts for the retained blob and the eventual refs.
+		// Column blobs are far below 4 GiB, so the uint32 conversion never overflows.
+		blobLen := len(blobRef)
+		merged.refsBlobLen = uint32(blobLen) //nolint:gosec // G115: column blob len << 4 GiB
 	}
 
 	// NOTE-150: Flat/XOR/Delta pages are self-contained (delta acc and XOR prev reset to
