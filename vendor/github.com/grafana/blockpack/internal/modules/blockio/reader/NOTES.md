@@ -2644,3 +2644,37 @@ and per-query. Composes with NOTE-360 so an all-present such column retains ONLY
 Back-ref: `column.go` (`decodeDeltaUint64` index build). Test/bench:
 `deltauint64_denseflat_test.go` (`TestDeltaUint64AllPresent_DenseFlatIdx`,
 `TestDeltaUint64PartialPresent_KeepsIdx`, `BenchmarkDecodeDeltaUint64AllPresent_Footprint`).
+
+## NOTE-362: narrow colMetaEntry.dataOffset uint64 -> uint32 (64 -> 56 bytes) + fix SizeBytes accounting
+
+`colMetaEntry` is retained one-per-column-per-block in the process-level `blockColTypesCache`
+(NOTE-214/241): the cache holds a deep-copied `[]colMetaEntry` for every block whose ToC has
+been parsed, so a wide block (hundreds of columns) retains hundreds of entries, multiplied
+across every cached block. The struct was 64 bytes.
+
+`dataOffset` is the column's byte offset **within the block**, bounded by `MaxBlockSize`
+(1 GiB) — it always fits in uint32. The wire format still stores it as 8 LE bytes;
+`parseColumnMetadataArray` now reads the 8 bytes, bounds-checks against `MaxBlockSize`
+(rejecting a malformed/oversized offset rather than silently truncating), then narrows to
+uint32 before storing. Narrowing shrinks the struct from 64 -> 56 bytes (the trailing
+`colType uint8` still pads to an 8-byte boundary, and the smaller body crosses the
+malloc size-class boundary).
+
+Also fixed a latent **LRU under-count**: `blockColTypes.SizeBytes` hard-coded the per-entry
+struct overhead at `48` while the real struct was 64 bytes — a ~25% undercount that let the
+cache silently retain more entries than its configured budget. `SizeBytes` now uses the true
+`sizeof(colMetaEntry) = 56`, so the budget is honoured accurately (a strictly *smaller* live
+set under the same byte budget).
+
+**Result:** `BenchmarkColMetaArrayFootprint` (200-column block, deep-copied + retained as the
+cache does): B/op 31,936 -> 29,376 (-8.0%, the 8-byte/entry narrowing × 200 plus a size-class
+shift), allocs/op unchanged (202), ns/op flat (within noise). Composes with the SizeBytes fix:
+the cache now both stores smaller entries AND accounts for them accurately, so the retained
+`blockColTypesCache` footprint drops on two axes. No accessor ripple — every `dataOffset`
+consumer already reads it via `int(m.dataOffset)` / `int64(m.dataOffset)`.
+
+Back-ref: `colmetaentry.go` (struct), `block_parser.go` (`parseColumnMetadataArray` bounds
+guard + narrowing store), `parser.go` (`blockColTypes.SizeBytes`). Test/bench:
+`colmeta_narrow_test.go` (`TestColMetaEntrySize`, `TestParseColMeta_DataOffsetNarrowing`,
+`TestParseColMeta_DataOffsetOverflowRejected`, `TestBlockColTypesSizeBytesAccountsStruct`,
+`BenchmarkColMetaArrayFootprint`).

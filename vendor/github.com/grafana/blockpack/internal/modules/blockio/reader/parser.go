@@ -145,7 +145,11 @@ func (b *blockColTypes) SizeBytes() int64 {
 			len(b.metas[i].name),
 		) + int64(
 			len(b.metas[i].inlineData),
-		) + 48 // name + inline bytes + struct overhead
+		) + 56 // name backing + inline bytes backing + sizeof(colMetaEntry)
+		// NOTE-362: the struct overhead was previously hard-coded at 48, but
+		// sizeof(colMetaEntry) is 56 bytes after narrowing dataOffset to uint32 (it was 64
+		// before). Account for the true struct size so the LRU budget does not under-count
+		// the retained entries and silently hold more than its configured limit.
 	}
 	return n + 32
 }

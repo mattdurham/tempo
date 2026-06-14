@@ -194,6 +194,12 @@ func parseColumnMetadataArray(data []byte, offset, colCount int, blockVersion ui
 
 		dataOffset := binary.LittleEndian.Uint64(data[pos:])
 		pos += 8
+		// NOTE-362: dataOffset is a within-block byte offset, bounded by MaxBlockSize (1 GiB),
+		// so it must fit in uint32. Reject a malformed/oversized offset here rather than
+		// truncating silently at the narrowing store.
+		if dataOffset > shared.MaxBlockSize {
+			return nil, pos, fmt.Errorf("col_meta[%d]: data_offset %d exceeds MaxBlockSize", i, dataOffset)
+		}
 
 		// SPEC-V14-001: compressed_len[4 LE] + uncompressed_len[4 LE]
 		compressedLen := binary.LittleEndian.Uint32(data[pos:])
@@ -204,7 +210,7 @@ func parseColumnMetadataArray(data []byte, offset, colCount int, blockVersion ui
 		entries = append(entries, colMetaEntry{
 			name:            name,
 			colType:         colType,
-			dataOffset:      dataOffset,
+			dataOffset:      uint32(dataOffset),
 			compressedLen:   compressedLen,
 			uncompressedLen: uncompressedLen,
 		})
