@@ -201,12 +201,21 @@ func decodePresenceRLEFromSlice(data []byte, pos, nBits int) ([]byte, int, int, 
 }
 
 // decodePresenceMaybe reads the presence section starting at pos, or — when allPresent is true
-// (an AllPresent encoding kind, NOTE-AP-001) — synthesizes a fully-present presence bitset
-// without consuming any bytes. Returns the presence bitset, the new position (unchanged when
-// allPresent), and the present count (== nBits when allPresent).
+// (an AllPresent encoding kind, NOTE-AP-001) — reports a fully-present column WITHOUT allocating
+// a bitset. Returns the presence bitset, the new position (unchanged when allPresent), and the
+// present count (== nBits when allPresent).
+//
+// NOTE-360: for an AllPresent column the returned bitset is nil, not a freshly-allocated
+// ceil(nBits/8)-byte all-1s slab. A nil Present field already means "every span present"
+// throughout the reader (see Column.IsPresent / PresenceView), so the all-1s bitmap carried
+// zero information yet was retained per-column both per-query AND in the parsedV8ColumnCache
+// snapshot — for a 1M-row column that is ~125 KB of pure redundant live memory. The decode
+// loops that previously walked shared.IsPresent(present, i) must instead consult the returned
+// presentCount (== nBits ⇒ every row present): callers that build a dense per-row index from
+// the bitset use the allPresentRows fast path below.
 func decodePresenceMaybe(data []byte, pos, nBits int, allPresent bool) ([]byte, int, int, error) {
 	if allPresent {
-		return shared.AllPresentBitset(nBits), pos, nBits, nil
+		return nil, pos, nBits, nil
 	}
 	return decodePresenceRLEFromSlice(data, pos, nBits)
 }
@@ -920,11 +929,20 @@ func decodeDeltaUint64(
 	}
 
 	// Build dense index array.
-	dictIdx := 0
-	for i := range spanCount {
-		if shared.IsPresent(present, i) {
-			col.Uint64Idx[i] = uint32(dictIdx) //nolint:gosec
-			dictIdx++
+	// NOTE-360: present == nil means every span is present (AllPresent kind, no bitmap), so
+	// the dense index is the identity permutation [0,1,…,spanCount-1]. Skip the per-row
+	// IsPresent walk in that case — IsPresent(nil, i) is always false and would mis-fill.
+	if present == nil {
+		for i := range spanCount {
+			col.Uint64Idx[i] = uint32(i) //nolint:gosec
+		}
+	} else {
+		dictIdx := 0
+		for i := range spanCount {
+			if shared.IsPresent(present, i) {
+				col.Uint64Idx[i] = uint32(dictIdx) //nolint:gosec
+				dictIdx++
+			}
 		}
 	}
 
@@ -1762,6 +1780,15 @@ func decodeInlineBytesUniform(data []byte, kind uint8, spanCount int, allPresent
 // (the slice is pre-allocated by the pool) but retained for documentation clarity.
 func collectPresentRowsInto(present []byte, _ /*presentCount*/, spanCount int, buf *[]int) []int {
 	*buf = (*buf)[:0]
+	// NOTE-360: present == nil means every span is present (AllPresent kind, no bitmap).
+	// IsPresent(nil, i) is always false, so without this branch the all-present case would
+	// collect an empty row set and corrupt the decode.
+	if present == nil {
+		for i := range spanCount {
+			*buf = append(*buf, i)
+		}
+		return *buf
+	}
 	for i := range spanCount {
 		if shared.IsPresent(present, i) {
 			*buf = append(*buf, i)

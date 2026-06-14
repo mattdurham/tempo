@@ -2557,3 +2557,50 @@ Back-ref: `column.go` (`Column.denseFlatIdx`/`dictIdxAt`/`IsDenseFlatIdx`,
 `decodeDeltaUint64BitPacked`, `decodeGorillaFloat64`, `decodeNow`), `block.go` (value
 accessors), `block_parser.go`/`reader.go` (eager copy + snapshot), `column_provider.go`
 (executor scans). Test/bench: `denseflatidx_bench_test.go`.
+
+## NOTE-360: stop materializing the all-1s presence bitmap for AllPresent columns
+
+A `nil` `Column.Present` field ALREADY means "every span present" throughout the reader
+(`Column.IsPresent` returns true on nil; `PresenceView` documents nil == all-present;
+`bytesInlineAt`/the dense-expansion path all treat nil as fully present). Yet the AllPresent
+decode path (NOTE-AP-001, kinds 15-23/28/41 — the dominant shape on real files where most
+columns have a value on every span) called `shared.AllPresentBitset(nBits)` to synthesize a
+freshly-allocated `ceil(nBits/8)`-byte slab with every bit set, then stored it in
+`col.Present`. That bitmap carried ZERO information — it was identically all-1s — but was
+retained per-column both per-query AND in the `parsedV8ColumnCache` snapshot for the cache
+lifetime. For a 1M-row all-present column that is ~125 KB of pure redundant live memory, and
+it is held for EVERY fully-present cached column across EVERY cached block.
+
+**Fix:** `decodePresenceMaybe` returns `nil` (no allocation) for the all-present case instead
+of `AllPresentBitset(nBits)`; every decoder's `col.Present = present` therefore stores nil.
+Two decode-time loops walked `shared.IsPresent(present, i)` and had to be made nil-aware
+(`IsPresent(nil, i)` is always false and would mis-fill / collect an empty row set):
+- `decodeDeltaUint64` dense index build: `present == nil` ⇒ index is the identity
+  `[0,1,…,spanCount-1]`, filled directly without the per-row presence test.
+- `collectPresentRowsInto` (XOR/uniform/prefix bytes decoders): `present == nil` ⇒ emit every
+  row index `[0..spanCount)`.
+
+Everything else is already nil-safe: there are NO Sparse-AllPresent kinds (sparse-with-all-
+present is a contradiction — see `constants.go`), so the sparse decode branches and
+`expandSparseIndexes` never run with a nil presence vector; the bit-packed/Gorilla dense
+index builders already short-circuit on `presentCount == spanCount` (NOTE-358); the
+`decodeNow` cache-merge `if c.Present == nil { c.Present = cached.Present }` now simply keeps
+nil; `SizeBytes` (`len(c.Present)`) is correctly 0; vectorF32 has no AllPresent variant and
+keeps its real decoded bitset; the deliberate all-ABSENT sentinel `col.Present = []byte{}`
+(corrupt/empty column) is non-nil and unchanged.
+
+**Result:** `BenchmarkDecodeAllPresentDict_Footprint` (8192 all-present rows): retained
+footprint 246,784 -> 245,760 bytes and 247,360 -> 246,336 B/op (-1024 bytes == the eliminated
+`ceil(8192/8)` presence bitmap), 5 -> 4 allocs/op. The absolute cut scales with the
+presence-bitmap fraction of the column: small-dict numeric / timestamp columns (where the
+bitmap was a large share of the retained bytes) see proportionally larger reductions, and the
+saving is multiplied across every fully-present column in every cached block. For an
+all-present bit-packed/Gorilla column this composes with NOTE-358 so the column retains ONLY
+its dict (both the identity index AND the presence bitmap elided).
+
+Back-ref: `column.go` (`decodePresenceMaybe`, `decodeDeltaUint64` index build,
+`collectPresentRowsInto`); `presence_rle.go` (`AllPresentBitset` now used only by tests as a
+bitmap-construction helper). Test/bench: `allpresent_footprint_bench_test.go`
+(`TestAllPresentDict_NilPresence`, `TestAllPresentBitPacked_NilPresence`,
+`BenchmarkDecodeAllPresentDict_Footprint`), plus the existing `allpresent_roundtrip_test.go`
+round-trip guards.
