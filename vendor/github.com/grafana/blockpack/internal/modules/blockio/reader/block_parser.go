@@ -475,6 +475,8 @@ func parseBlockColumnsReuse(
 		col.BytesDict = decoded.BytesDict
 		col.BytesIdx = decoded.BytesIdx
 		col.BytesInline = decoded.BytesInline
+		col.uniformSlab = decoded.uniformSlab     // NOTE-351
+		col.uniformStride = decoded.uniformStride // NOTE-351
 		col.Present = decoded.Present
 		col.SpanCount = decoded.SpanCount
 		col.sparseDictIdx = decoded.sparseDictIdx // NOTE-PERF-1: lazy dense expansion
@@ -670,6 +672,8 @@ func snapshotDecodedColumn(src *Column, name string, colType shared.ColumnType) 
 		BytesDict:     src.BytesDict,
 		BytesIdx:      src.BytesIdx,
 		BytesInline:   src.BytesInline,
+		uniformSlab:   src.uniformSlab,   // NOTE-351
+		uniformStride: src.uniformStride, // NOTE-351
 		Present:       src.Present,
 		SpanCount:     src.SpanCount,
 		sparseDictIdx: src.sparseDictIdx,
@@ -694,6 +698,8 @@ func copyDecodedColumnInto(dst, snap *Column) {
 	dst.BytesDict = snap.BytesDict
 	dst.BytesIdx = snap.BytesIdx
 	dst.BytesInline = snap.BytesInline
+	dst.uniformSlab = snap.uniformSlab     // NOTE-351
+	dst.uniformStride = snap.uniformStride // NOTE-351
 	dst.Present = snap.Present
 	dst.SpanCount = snap.SpanCount
 	dst.sparseDictIdx = snap.sparseDictIdx // NOTE-PERF-1: per-query col gets its own dense Idx
@@ -798,6 +804,8 @@ func resetColumn(col *Column) {
 	col.BytesDict = col.BytesDict[:0]
 	col.BytesIdx = col.BytesIdx[:0]
 	col.BytesInline = nil
+	col.uniformSlab = nil // NOTE-351
+	col.uniformStride = 0 // NOTE-351
 	col.Present = nil
 	// NOTE-001: clear lazy decode fields so reused columns don't carry stale state.
 	col.rawEncoding = nil

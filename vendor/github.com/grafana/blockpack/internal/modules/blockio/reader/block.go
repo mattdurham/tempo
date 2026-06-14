@@ -84,6 +84,9 @@ func (c *Column) SizeBytes() int64 {
 	for _, b := range c.BytesInline {
 		n += int64(len(b)) + 24
 	}
+	// NOTE-351: uniform-stride columns store inline bytes in one contiguous slab with no
+	// per-row header overhead — count just the slab body.
+	n += int64(len(c.uniformSlab))
 	return n
 }
 
@@ -185,10 +188,8 @@ func (c *Column) StringValue(idx int) (string, bool) {
 func (c *Column) uuidStringValue(idx int) (string, bool) {
 	var b []byte
 
-	if c.BytesInline != nil {
-		if idx < len(c.BytesInline) {
-			b = c.BytesInline[idx]
-		}
+	if c.hasInlineBytes() {
+		b = c.bytesInlineAt(idx)
 	} else if len(c.BytesIdx) > idx {
 		di := int(c.BytesIdx[idx])
 		if di < len(c.BytesDict) {
@@ -324,9 +325,9 @@ func (c *Column) BytesValue(idx int) ([]byte, bool) {
 		return nil, false
 	}
 
-	if c.BytesInline != nil {
-		if idx < len(c.BytesInline) {
-			return c.BytesInline[idx], true
+	if c.hasInlineBytes() {
+		if b := c.bytesInlineAt(idx); b != nil {
+			return b, true
 		}
 
 		return nil, false
@@ -355,10 +356,10 @@ func (c *Column) VectorF32Value(idx int) ([]float32, bool) {
 	if !c.IsPresent(idx) {
 		return nil, false
 	}
-	if c.BytesInline == nil || idx >= len(c.BytesInline) || c.BytesInline[idx] == nil {
+	raw := c.bytesInlineAt(idx)
+	if raw == nil {
 		return nil, false
 	}
-	raw := c.BytesInline[idx]
 	if len(raw)%4 != 0 {
 		return nil, false
 	}

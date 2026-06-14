@@ -1056,6 +1056,8 @@ func (r *Reader) AddColumnsToBlock(bwb *BlockWithBytes, addColumns map[string]st
 		col.BytesDict = decoded.BytesDict
 		col.BytesIdx = decoded.BytesIdx
 		col.BytesInline = decoded.BytesInline
+		col.uniformSlab = decoded.uniformSlab     // NOTE-351
+		col.uniformStride = decoded.uniformStride // NOTE-351
 		col.Present = decoded.Present
 		col.SpanCount = decoded.SpanCount
 		col.decoded.Store(true) // NOTE-CONC-001: mark eagerly decoded so needsDecode() is false

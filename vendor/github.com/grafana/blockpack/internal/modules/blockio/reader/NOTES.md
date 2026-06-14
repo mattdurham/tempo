@@ -2431,3 +2431,45 @@ recorded extent.
 
 Back-ref: `parser.go:ensureV8TraceSection`, `trace_index.go:ensureTraceIndexRaw`,
 `reader.go:TraceCount`, `compacttraceindex.go` (v8Section fields).
+
+## NOTE-351: Row-Indexed Uniform Slab for Uniform-Length Inline Byte Columns
+
+`decodeXORBytesUniform` / `decodeInlineBytesUniform` decode uniform-length inline byte
+columns (XOR/inline uniform kinds — chiefly the 16-byte `trace:id` / `span:id` columns).
+NOTE-342 already collapsed the per-row `make([]byte, uniformLen)` into ONE contiguous slab
+sliced per present row, but every decoded column STILL allocated a
+`make([][]byte, spanCount)` header array (`spanCount * 24` bytes of slice headers) to hold
+those slices. For 16-byte IDs that header array is ~1.5x the size of the actual data slab,
+and the decoded column is retained in `parsedV8ColumnCache` for its cached lifetime —
+making `decodeXORBytesUniform` the #1 querier `inuse_space` frame (~2.9 GB across the fleet).
+
+**Fix:** store the rows ROW-INDEXED in one contiguous `spanCount * uniformLen` slab
+(`Column.uniformSlab`, stride `Column.uniformStride`) and drop the `[][]byte` header array
+entirely. Row `idx` lives at `uniformSlab[idx*stride : (idx+1)*stride]`. All inline-byte
+reads route through the new `Column.bytesInlineAt(idx)` accessor, which computes the offset
+for uniform-stride columns (masking absent rows via the presence bitset) and falls back to
+the `BytesInline[idx]` header array for variable-length columns (prefix/vector kinds, which
+keep `[][]byte`). `hasInlineBytes()` reports either representation.
+
+Absent rows occupy a zeroed `uniformLen` gap in the slab (masked by the presence check), so
+for sparse columns the slab is `spanCount*uniformLen` rather than `presentCount*uniformLen`;
+this is still strictly smaller than the old slab + `spanCount*24` header array for any
+`uniformLen <= 24` (true for all current uniform kinds), and the dominant `trace:id`/
+`span:id` columns are essentially always all-present (zero gaps). The XOR decode chain is
+unchanged: `prev` still tracks the previous PRESENT row's slab slice across gaps, so output
+is byte-identical to NOTE-342.
+
+`SizeBytes` counts `len(uniformSlab)` (no per-row header overhead). The snapshot/restore and
+cache-copy paths (`snapshotDecodedColumn`, `copyDecodedColumnInto`, the lazy-decode cache
+assigns in `column.go`/`block_parser.go`/`reader.go`, and the column-reset path) all carry
+`uniformSlab` + `uniformStride` alongside `BytesInline`.
+
+**Result:** `BenchmarkDecodeXORBytesUniform_Allocs` (4096 all-present 16-byte rows):
+166,890 B/op -> 67,035 B/op (-60%), 4 -> 3 allocs/op, and ns/op ~262K -> ~165K (-37%, the
+eliminated header-array allocation + writes). The -60% bytes reduction applies to every
+retained uniform inline column in `parsedV8ColumnCache`, directly shrinking the top querier
+`inuse_space` frame.
+
+Back-ref: `column.go` (`bytesInlineAt`/`hasInlineBytes`, `Column.uniformSlab`/`uniformStride`,
+`decodeXORBytesUniform`, `decodeInlineBytesUniform`), `block.go` (`SizeBytes`, `BytesValue`,
+`uuidStringValue`, `VectorF32Value`), `block_parser.go`, `reader.go` (snapshot/copy paths).

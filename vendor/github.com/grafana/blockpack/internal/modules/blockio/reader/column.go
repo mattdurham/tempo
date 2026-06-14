@@ -396,6 +396,8 @@ func (c *Column) decodeNow() {
 				c.BytesDict = cached.BytesDict
 				c.BytesIdx = cached.BytesIdx
 				c.BytesInline = cached.BytesInline
+				c.uniformSlab = cached.uniformSlab     // NOTE-351
+				c.uniformStride = cached.uniformStride // NOTE-351
 				c.sparseDictIdx = cached.sparseDictIdx
 				c.rawEncoding = nil
 				c.compressedEncoding = nil
@@ -443,6 +445,8 @@ func (c *Column) decodeNow() {
 		c.BytesDict = dec.BytesDict
 		c.BytesIdx = dec.BytesIdx
 		c.BytesInline = dec.BytesInline
+		c.uniformSlab = dec.uniformSlab     // NOTE-351
+		c.uniformStride = dec.uniformStride // NOTE-351
 		c.sparseDictIdx = dec.sparseDictIdx
 
 		// NOTE-201: store a snapshot of the freshly decoded slices so subsequent warm
@@ -1604,17 +1608,21 @@ func decodeXORBytesUniform(data []byte, kind uint8, spanCount int, allPresent bo
 		)
 	}
 
-	col.BytesInline = make([][]byte, spanCount)
-	// NOTE-342: decode all present rows into ONE contiguous slab instead of a fresh
-	// make([]byte, uniformLen) per row. Each row was the #1 querier inuse-objects frame
-	// (~26 MB) because uniform XOR columns hold many present rows and every row paid a
-	// separate tiny heap allocation. A single backing slab of presentCount*uniformLen
-	// bytes (sliced per row) collapses N allocations into 1, with byte-identical output:
-	// rows never resize, slabs are stable, and each row's bytes are XOR-decoded in place
-	// against the previous row's slab slice (prev).
-	slab := make([]byte, presentCount*uniformLen)
+	// NOTE-351: store uniform-length rows ROW-INDEXED in one contiguous spanCount*uniformLen
+	// slab (row idx at slab[idx*uniformLen:]) and skip the [][]byte header array entirely.
+	// The old code allocated make([][]byte, spanCount) (spanCount*24 bytes of slice headers,
+	// ~1.5x the actual data for 16-byte trace:id/span:id and the dominant retained footprint
+	// of this path) on top of the slab. Row-indexed storage lets bytesInlineAt(idx) compute
+	// the offset directly, so the header array is pure waste. Absent rows occupy a (zeroed)
+	// uniformLen gap but are masked by the presence check in bytesInlineAt; for the all-present
+	// trace:id case there are no gaps and this is exactly the data with zero overhead.
+	// NOTE-342 (superseded): the prior single-slab fix collapsed per-row allocations; this
+	// keeps that win and additionally drops the header array.
+	col.uniformStride = uint32(uniformLen) //nolint:gosec // uniformLen validated > 0, << 4 GiB
+	slab := make([]byte, spanCount*uniformLen)
+	col.uniformSlab = slab
 	var prev []byte
-	xPos, sPos := 0, 0
+	xPos := 0
 
 	presRowsBuf := acquirePresentRowsScratch()
 	defer releasePresentRowsScratch(presRowsBuf)
@@ -1623,8 +1631,8 @@ func decodeXORBytesUniform(data []byte, kind uint8, spanCount int, allPresent bo
 		xorVal := payload[xPos : xPos+uniformLen]
 		xPos += uniformLen
 
-		result := slab[sPos : sPos+uniformLen : sPos+uniformLen]
-		sPos += uniformLen
+		rOff := presentRow * uniformLen
+		result := slab[rOff : rOff+uniformLen : rOff+uniformLen]
 
 		// All values share uniformLen, so XOR against prev is a straight uniformLen-byte loop.
 		for i := range uniformLen {
@@ -1635,7 +1643,6 @@ func decodeXORBytesUniform(data []byte, kind uint8, spanCount int, allPresent bo
 			}
 		}
 
-		col.BytesInline[presentRow] = result
 		prev = result
 	}
 
@@ -1685,20 +1692,19 @@ func decodeInlineBytesUniform(data []byte, kind uint8, spanCount int, allPresent
 		)
 	}
 
-	col.BytesInline = make([][]byte, spanCount)
-	// NOTE-342: same single-slab strategy as decodeXORBytesUniform — one contiguous
-	// allocation sliced per present row instead of a per-row make([]byte, uniformLen).
-	slab := make([]byte, presentCount*uniformLen)
-	xPos, sPos := 0, 0
+	// NOTE-351: row-indexed uniform slab (same scheme as decodeXORBytesUniform) — skip the
+	// [][]byte header array; bytesInlineAt(idx) computes the slab offset from uniformStride.
+	col.uniformStride = uint32(uniformLen) //nolint:gosec // uniformLen validated > 0, << 4 GiB
+	slab := make([]byte, spanCount*uniformLen)
+	col.uniformSlab = slab
+	xPos := 0
 
 	presRowsBuf := acquirePresentRowsScratch()
 	defer releasePresentRowsScratch(presRowsBuf)
 	presentRows := collectPresentRowsInto(present, presentCount, spanCount, presRowsBuf)
 	for _, presentRow := range presentRows {
-		b := slab[sPos : sPos+uniformLen : sPos+uniformLen]
-		copy(b, payload[xPos:xPos+uniformLen])
-		col.BytesInline[presentRow] = b
-		sPos += uniformLen
+		rOff := presentRow * uniformLen
+		copy(slab[rOff:rOff+uniformLen], payload[xPos:xPos+uniformLen])
 		xPos += uniformLen
 	}
 
@@ -2071,20 +2077,29 @@ type Column struct {
 	// decodeNow consults parsedV8ColumnCache on this key before doing snappy+readColumnEncoding
 	// and stores a snapshot on miss, extending NOTE-200's eager-loop reuse to first-access decode.
 	// Empty when no stable key is available (no fileID) — decode proceeds without cache.
-	v8CacheKey         string
-	StringDict         []string
-	StringIdx          []uint32
-	Int64Dict          []int64
-	Int64Idx           []uint32
-	Uint64Dict         []uint64
-	Uint64Idx          []uint32
-	Float64Dict        []float64
-	Float64Idx         []uint32
-	BoolDict           []uint8
-	BoolIdx            []uint32
-	BytesDict          [][]byte
-	BytesIdx           []uint32
-	BytesInline        [][]byte
+	v8CacheKey  string
+	StringDict  []string
+	StringIdx   []uint32
+	Int64Dict   []int64
+	Int64Idx    []uint32
+	Uint64Dict  []uint64
+	Uint64Idx   []uint32
+	Float64Dict []float64
+	Float64Idx  []uint32
+	BoolDict    []uint8
+	BoolIdx     []uint32
+	BytesDict   [][]byte
+	BytesIdx    []uint32
+	BytesInline [][]byte
+	// NOTE-351: uniform-stride inline bytes. When uniformStride > 0 the column's inline
+	// values are uniform-length (XOR/inline uniform kinds, e.g. 16-byte trace:id/span:id)
+	// and are stored row-indexed in one contiguous slab (uniformSlab) instead of a
+	// [][]byte header array. Row idx occupies uniformSlab[idx*uniformStride:(idx+1)*…].
+	// This eliminates the spanCount*24-byte [][]byte backing array — pure overhead that
+	// was ~1.5x the actual data for 16-byte IDs and the dominant retained footprint of the
+	// decodeXORBytesUniform / decodeInlineBytesUniform paths (top querier inuse_space frame).
+	// Reads go through bytesInlineAt(idx); BytesInline stays nil for uniform-stride columns.
+	uniformSlab        []byte
 	Present            []byte
 	rawEncoding        []byte
 	compressedEncoding []byte
@@ -2103,5 +2118,33 @@ type Column struct {
 	decompressOnce  sync.Once
 	decoded         atomic.Bool
 	uncompressedLen uint32
+	uniformStride   uint32 // NOTE-351: per-row stride into uniformSlab; 0 = not uniform-stride
 	Type            shared.ColumnType
+}
+
+// bytesInlineAt returns the inline bytes for row idx, transparently serving uniform-stride
+// columns (NOTE-351) from the contiguous uniformSlab and all other columns from the
+// BytesInline header array. Returns nil for absent / out-of-range rows. The returned slice
+// aliases the column's backing storage and must not be mutated by callers.
+func (c *Column) bytesInlineAt(idx int) []byte {
+	if c.uniformStride != 0 {
+		stride := int(c.uniformStride)
+		off := idx * stride
+		if idx < 0 || off+stride > len(c.uniformSlab) {
+			return nil
+		}
+		if c.Present != nil && !shared.IsPresent(c.Present, idx) {
+			return nil
+		}
+		return c.uniformSlab[off : off+stride : off+stride]
+	}
+	if idx < 0 || idx >= len(c.BytesInline) {
+		return nil
+	}
+	return c.BytesInline[idx]
+}
+
+// hasInlineBytes reports whether the column carries inline bytes (either representation).
+func (c *Column) hasInlineBytes() bool {
+	return c.BytesInline != nil || c.uniformSlab != nil
 }
