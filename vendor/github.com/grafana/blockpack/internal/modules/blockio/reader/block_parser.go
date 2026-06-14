@@ -480,6 +480,7 @@ func parseBlockColumnsReuse(
 		col.Present = decoded.Present
 		col.SpanCount = decoded.SpanCount
 		col.sparseDictIdx = decoded.sparseDictIdx // NOTE-PERF-1: lazy dense expansion
+		col.denseFlatIdx = decoded.denseFlatIdx   // NOTE-358
 		col.decoded.Store(true)                   // NOTE-CONC-001: mark eagerly decoded so needsDecode() is false
 
 		// NOTE-200: store an immutable snapshot of the decoded slices for reuse by later
@@ -677,6 +678,7 @@ func snapshotDecodedColumn(src *Column, name string, colType shared.ColumnType) 
 		Present:       src.Present,
 		SpanCount:     src.SpanCount,
 		sparseDictIdx: src.sparseDictIdx,
+		denseFlatIdx:  src.denseFlatIdx, // NOTE-358
 	}
 }
 
@@ -703,6 +705,7 @@ func copyDecodedColumnInto(dst, snap *Column) {
 	dst.Present = snap.Present
 	dst.SpanCount = snap.SpanCount
 	dst.sparseDictIdx = snap.sparseDictIdx // NOTE-PERF-1: per-query col gets its own dense Idx
+	dst.denseFlatIdx = snap.denseFlatIdx   // NOTE-358
 	dst.decoded.Store(true)                // NOTE-CONC-001: mark eagerly decoded
 }
 

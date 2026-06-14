@@ -1060,7 +1060,8 @@ func (r *Reader) AddColumnsToBlock(bwb *BlockWithBytes, addColumns map[string]st
 		col.uniformStride = decoded.uniformStride // NOTE-351
 		col.Present = decoded.Present
 		col.SpanCount = decoded.SpanCount
-		col.decoded.Store(true) // NOTE-CONC-001: mark eagerly decoded so needsDecode() is false
+		col.denseFlatIdx = decoded.denseFlatIdx // NOTE-358
+		col.decoded.Store(true)                 // NOTE-CONC-001: mark eagerly decoded so needsDecode() is false
 
 		bwb.Block.columns[shared.ColumnKey{Name: m.name, Type: m.colType}] = col
 	}

@@ -2511,3 +2511,49 @@ Back-ref: `column.go` (`decodeDictBody` ColumnTypeBytes case). Test/bench:
 `dict_bytes_arena_bench_test.go` (`TestBytesDictArena_Roundtrip`, `BenchmarkDecodeBytesDict_Allocs`).
 The intrinsic flat-bytes counterpart (same pattern, `shared` package) is also NOTE-356 — see
 `shared/NOTES.md`.
+
+---
+
+## NOTE-358: drop the identity dict-index slice for all-present dense-flat numeric columns
+
+`decodeDeltaUint64BitPacked` (kind 22/23) and `decodeGorillaFloat64` (kind 40/41) decode a
+*dense-flat* numeric column: one dict entry per PRESENT row, in row order, with an
+identity-by-present index (`Idx[i] = number of present rows before i`). When every row is
+present (the AllPresent kinds, and the dominant shape for `span:start` delta and
+high-cardinality float columns) that index is the pure identity permutation
+`[0,1,2,…,spanCount-1]`. It carries NO information beyond the presence vector — yet it was a
+materialized `make([]uint32, spanCount)`: 4 bytes/row of redundant RETAINED memory, held both
+per-query AND in the `parsedV8ColumnCache` snapshot for the cache-entry lifetime.
+`readIndexArray`/`makeNoZeroUint64` and the per-row index fill loop were top querier
+`inuse_space` frames.
+
+**Fix:** when `presentCount == spanCount`, set `Column.denseFlatIdx = true` and skip the
+`make([]uint32, spanCount)` index build entirely. Readers resolve the dict index
+arithmetically: for an all-present dense-flat column `present-rank(i) == i`, so `dictIdxAt`
+returns the row index directly and the value is `Dict[i]`. Partial-presence columns still
+need the real present-rank table, so they fall through and keep the materialized `*Idx`
+slice (`denseFlatIdx == false`). Mirrors NOTE-354's flat-dense `refIndex` drop (Pos == rank).
+
+All five `*Idx` consumers route through the new flag:
+- value accessors (`block.go` `Int64Value`/`Uint64Value`/`Float64Value`) via `dictIdxAt`;
+- executor dict-mask scans (`column_provider.go` `scanDictMaskRows`/`scanNumericDictMask`)
+  use `di == i` when `col.IsDenseFlatIdx()`, and their `idx == nil` fast-path bail-outs were
+  relaxed to allow a nil index slice for dense-flat columns (else they would silently fall
+  back to the slow per-row path and regress wall-clock).
+
+`denseFlatIdx` is propagated through every column-materialization path that copies decoded
+slices: `snapshotDecodedColumn`, `copyDecodedColumnInto`, both `decodeNow` cache/decode
+copies, and the eager-decode loops in `block_parser.go` and `reader.go`. `SizeBytes` needs
+no change — `len(c.*Idx)` is now 0 for these columns, so the LRU budget correctly reflects
+the dropped slice.
+
+**Result:** `BenchmarkDecodeBitPackedAllPresent_Footprint` (4096 all-present rows): decode
+50,240 -> 33,856 B/op (-32.6%, exactly the eliminated spanCount*4 = 16,384-byte index slice),
+4 -> 3 allocs/op, ns/op ~62K -> ~40K (-35%, no per-row index fill loop). Retained
+column footprint (`SizeBytes`) 49,664 -> 33,280 bytes (-33%) — held for every cached
+all-present bit-packed / Gorilla column in `parsedV8ColumnCache` and per-query.
+
+Back-ref: `column.go` (`Column.denseFlatIdx`/`dictIdxAt`/`IsDenseFlatIdx`,
+`decodeDeltaUint64BitPacked`, `decodeGorillaFloat64`, `decodeNow`), `block.go` (value
+accessors), `block_parser.go`/`reader.go` (eager copy + snapshot), `column_provider.go`
+(executor scans). Test/bench: `denseflatidx_bench_test.go`.

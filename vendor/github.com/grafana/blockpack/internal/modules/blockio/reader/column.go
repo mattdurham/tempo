@@ -399,6 +399,7 @@ func (c *Column) decodeNow() {
 				c.uniformSlab = cached.uniformSlab     // NOTE-351
 				c.uniformStride = cached.uniformStride // NOTE-351
 				c.sparseDictIdx = cached.sparseDictIdx
+				c.denseFlatIdx = cached.denseFlatIdx // NOTE-358
 				c.rawEncoding = nil
 				c.compressedEncoding = nil
 				c.internMap = nil
@@ -448,6 +449,7 @@ func (c *Column) decodeNow() {
 		c.uniformSlab = dec.uniformSlab     // NOTE-351
 		c.uniformStride = dec.uniformStride // NOTE-351
 		c.sparseDictIdx = dec.sparseDictIdx
+		c.denseFlatIdx = dec.denseFlatIdx // NOTE-358
 
 		// NOTE-201: store a snapshot of the freshly decoded slices so subsequent warm
 		// queries that lazily access the identical on-disk block column skip the decode.
@@ -982,7 +984,6 @@ func decodeDeltaUint64BitPacked(
 	}
 
 	col.Uint64Dict = make([]uint64, presentCount)
-	col.Uint64Idx = make([]uint32, spanCount)
 
 	// packed_len[4] + packed_offsets — always present (zero-length when bit_width==0).
 	packed, _, err := readRawSegment(data, pos)
@@ -1006,11 +1007,21 @@ func decodeDeltaUint64BitPacked(
 		unpackDeltaBitsLE(packed, bitWidth, base, col.Uint64Dict[:presentCount])
 	}
 
-	dictIdx := 0
-	for i := range spanCount {
-		if shared.IsPresent(present, i) {
-			col.Uint64Idx[i] = uint32(dictIdx) //nolint:gosec
-			dictIdx++
+	// NOTE-358: when every row is present the dict-index slice would be the pure identity
+	// permutation [0,1,…,spanCount-1] (Dict has one entry per row in row order). Skip the
+	// make([]uint32, spanCount) and resolve the index arithmetically via dictIdxAt. Only
+	// the all-present case qualifies; a partial-presence column needs the real present-rank
+	// table, so it falls through to materialize Uint64Idx below.
+	if presentCount == spanCount {
+		col.denseFlatIdx = true
+	} else {
+		col.Uint64Idx = make([]uint32, spanCount)
+		dictIdx := 0
+		for i := range spanCount {
+			if shared.IsPresent(present, i) {
+				col.Uint64Idx[i] = uint32(dictIdx) //nolint:gosec
+				dictIdx++
+			}
 		}
 	}
 
@@ -1071,17 +1082,24 @@ func decodeGorillaFloat64(data []byte, spanCount int, allPresent bool) (*Column,
 	}
 
 	col.Float64Dict = make([]float64, presentCount)
-	col.Float64Idx = make([]uint32, spanCount)
 
 	if err := decodeGorillaStream(stream, streamBitLen, col.Float64Dict); err != nil {
 		return nil, fmt.Errorf("gorilla_float64: %w", err)
 	}
 
-	dictIdx := 0
-	for i := range spanCount {
-		if shared.IsPresent(present, i) {
-			col.Float64Idx[i] = uint32(dictIdx) //nolint:gosec
-			dictIdx++
+	// NOTE-358: all-present ⇒ the index slice is the identity permutation. Skip the
+	// make([]uint32, spanCount) and resolve the dict index via dictIdxAt (see the matching
+	// branch in decodeDeltaUint64BitPacked). Partial-presence keeps the materialized slice.
+	if presentCount == spanCount {
+		col.denseFlatIdx = true
+	} else {
+		col.Float64Idx = make([]uint32, spanCount)
+		dictIdx := 0
+		for i := range spanCount {
+			if shared.IsPresent(present, i) {
+				col.Float64Idx[i] = uint32(dictIdx) //nolint:gosec
+				dictIdx++
+			}
 		}
 	}
 
@@ -2145,6 +2163,38 @@ type Column struct {
 	uncompressedLen uint32
 	uniformStride   uint32 // NOTE-351: per-row stride into uniformSlab; 0 = not uniform-stride
 	Type            shared.ColumnType
+	// NOTE-358: denseFlatIdx marks a fully-present dense-flat numeric column whose dict
+	// index for every row is the row index itself (Dict has one entry per present row, in
+	// row order; all-present ⇒ present-rank(i) == i). For these columns the *Idx slice is a
+	// pure identity permutation [0,1,2,…,SpanCount-1] — 4 bytes/row of redundant retained
+	// memory (both per-query AND in the parsedV8ColumnCache snapshot). The bit-packed delta
+	// (decodeDeltaUint64BitPacked) and Gorilla-float64 (decodeGorillaFloat64) decoders set
+	// this flag instead of materializing the identity slice; readers resolve the dict index
+	// arithmetically via dictIdxAt. Mirrors NOTE-354's flat-dense refIndex drop. Only the
+	// all-present case is covered: a partial-presence column needs a real rank table, so it
+	// keeps the materialized *Idx slice (denseFlatIdx == false).
+	denseFlatIdx bool
+}
+
+// IsDenseFlatIdx reports whether this column uses the NOTE-358 identity-index optimization
+// (all-present dense-flat numeric column with no materialized *Idx slice). Cross-package
+// scan helpers (executor) consult this so they can resolve the dict index as the row index
+// instead of reading the (nil) *Idx slice.
+func (c *Column) IsDenseFlatIdx() bool { return c.denseFlatIdx }
+
+// dictIdxAt returns the dictionary index for row idx and whether a dict lookup applies.
+// For a denseFlatIdx column (NOTE-358, all-present dense-flat) the index is the row index
+// itself, so no materialized *Idx slice is consulted. Otherwise it reads idx[row] from the
+// passed materialized index slice (caller selects the type-correct slice). Returns ok=false
+// when row is out of range for a materialized slice.
+func (c *Column) dictIdxAt(idx []uint32, row int) (int, bool) {
+	if c.denseFlatIdx {
+		return row, true
+	}
+	if row < 0 || row >= len(idx) {
+		return 0, false
+	}
+	return int(idx[row]), true
 }
 
 // bytesInlineAt returns the inline bytes for row idx, transparently serving uniform-stride

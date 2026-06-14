@@ -103,14 +103,21 @@ func classifyValueKind(values []any) valueKind {
 func scanDictMaskRows(col *modules_reader.Column, idx []uint32, dictMatch []bool, cb vm.RowCallback) int {
 	count := 0
 	present := col.PresenceView()
+	// NOTE-358: a denseFlatIdx column has no materialized index slice — the dict index for
+	// every (present) row is the row index itself. The column is all-present in this case, so
+	// the loop scans every row using di == i directly.
+	denseFlat := col.IsDenseFlatIdx()
 	for i := range col.SpanCount {
 		if !presentAt(present, i) {
 			continue
 		}
-		if i >= len(idx) {
-			continue
+		di := i
+		if !denseFlat {
+			if i >= len(idx) {
+				continue
+			}
+			di = int(idx[i])
 		}
-		di := int(idx[i])
 		if di < len(dictMatch) && dictMatch[di] {
 			if !cb(i) {
 				return count
@@ -588,7 +595,7 @@ func scanNumericDict(
 	case modules_shared.ColumnTypeUint64, modules_shared.ColumnTypeRangeUint64:
 		dict := col.Uint64Dict
 		idx := col.Uint64Idx
-		if dict == nil || idx == nil {
+		if dict == nil || (idx == nil && !col.IsDenseFlatIdx()) { // NOTE-358
 			return 0, false
 		}
 		matches := make([]bool, len(dict))
@@ -610,7 +617,7 @@ func scanNumericDict(
 	case modules_shared.ColumnTypeInt64, modules_shared.ColumnTypeRangeInt64, modules_shared.ColumnTypeRangeDuration:
 		dict := col.Int64Dict
 		idx := col.Int64Idx
-		if dict == nil || idx == nil {
+		if dict == nil || (idx == nil && !col.IsDenseFlatIdx()) { // NOTE-358
 			return 0, false
 		}
 		matches := make([]bool, len(dict))
@@ -632,7 +639,7 @@ func scanNumericDict(
 	case modules_shared.ColumnTypeFloat64, modules_shared.ColumnTypeRangeFloat64:
 		dict := col.Float64Dict
 		idx := col.Float64Idx
-		if dict == nil || idx == nil {
+		if dict == nil || (idx == nil && !col.IsDenseFlatIdx()) { // NOTE-358
 			return 0, false
 		}
 		matches := make([]bool, len(dict))
@@ -668,14 +675,18 @@ func scanNumericDictMask(
 	spanCount := col.SpanCount
 	count := 0
 	present := col.PresenceView()
+	denseFlat := col.IsDenseFlatIdx() // NOTE-358: di == i, no materialized index slice
 	for i := range spanCount {
 		if !presentAt(present, i) {
 			continue
 		}
-		if i >= len(idx) {
-			continue
+		di := i
+		if !denseFlat {
+			if i >= len(idx) {
+				continue
+			}
+			di = int(idx[i])
 		}
-		di := int(idx[i])
 		if di < len(matches) && matches[di] {
 			if !cb(i) {
 				return count

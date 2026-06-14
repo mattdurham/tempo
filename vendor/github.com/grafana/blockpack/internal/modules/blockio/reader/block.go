@@ -241,8 +241,7 @@ func (c *Column) Int64Value(idx int) (int64, bool) {
 		return 0, false
 	}
 
-	if len(c.Int64Idx) > idx {
-		di := int(c.Int64Idx[idx])
+	if di, ok := c.dictIdxAt(c.Int64Idx, idx); ok { // NOTE-358
 		if di < len(c.Int64Dict) {
 			return c.Int64Dict[di], true
 		}
@@ -262,8 +261,7 @@ func (c *Column) Uint64Value(idx int) (uint64, bool) {
 		return 0, false
 	}
 
-	if len(c.Uint64Idx) > idx {
-		di := int(c.Uint64Idx[idx])
+	if di, ok := c.dictIdxAt(c.Uint64Idx, idx); ok { // NOTE-358
 		if di < len(c.Uint64Dict) {
 			return c.Uint64Dict[di], true
 		}
@@ -283,8 +281,7 @@ func (c *Column) Float64Value(idx int) (float64, bool) {
 		return 0, false
 	}
 
-	if len(c.Float64Idx) > idx {
-		di := int(c.Float64Idx[idx])
+	if di, ok := c.dictIdxAt(c.Float64Idx, idx); ok { // NOTE-358
 		if di < len(c.Float64Dict) {
 			return c.Float64Dict[di], true
 		}
