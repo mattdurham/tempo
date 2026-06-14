@@ -1605,8 +1605,16 @@ func decodeXORBytesUniform(data []byte, kind uint8, spanCount int, allPresent bo
 	}
 
 	col.BytesInline = make([][]byte, spanCount)
+	// NOTE-342: decode all present rows into ONE contiguous slab instead of a fresh
+	// make([]byte, uniformLen) per row. Each row was the #1 querier inuse-objects frame
+	// (~26 MB) because uniform XOR columns hold many present rows and every row paid a
+	// separate tiny heap allocation. A single backing slab of presentCount*uniformLen
+	// bytes (sliced per row) collapses N allocations into 1, with byte-identical output:
+	// rows never resize, slabs are stable, and each row's bytes are XOR-decoded in place
+	// against the previous row's slab slice (prev).
+	slab := make([]byte, presentCount*uniformLen)
 	var prev []byte
-	xPos := 0
+	xPos, sPos := 0, 0
 
 	presRowsBuf := acquirePresentRowsScratch()
 	defer releasePresentRowsScratch(presRowsBuf)
@@ -1615,8 +1623,10 @@ func decodeXORBytesUniform(data []byte, kind uint8, spanCount int, allPresent bo
 		xorVal := payload[xPos : xPos+uniformLen]
 		xPos += uniformLen
 
+		result := slab[sPos : sPos+uniformLen : sPos+uniformLen]
+		sPos += uniformLen
+
 		// All values share uniformLen, so XOR against prev is a straight uniformLen-byte loop.
-		result := make([]byte, uniformLen)
 		for i := range uniformLen {
 			if i < len(prev) {
 				result[i] = xorVal[i] ^ prev[i]
@@ -1676,15 +1686,19 @@ func decodeInlineBytesUniform(data []byte, kind uint8, spanCount int, allPresent
 	}
 
 	col.BytesInline = make([][]byte, spanCount)
-	xPos := 0
+	// NOTE-342: same single-slab strategy as decodeXORBytesUniform — one contiguous
+	// allocation sliced per present row instead of a per-row make([]byte, uniformLen).
+	slab := make([]byte, presentCount*uniformLen)
+	xPos, sPos := 0, 0
 
 	presRowsBuf := acquirePresentRowsScratch()
 	defer releasePresentRowsScratch(presRowsBuf)
 	presentRows := collectPresentRowsInto(present, presentCount, spanCount, presRowsBuf)
 	for _, presentRow := range presentRows {
-		b := make([]byte, uniformLen)
+		b := slab[sPos : sPos+uniformLen : sPos+uniformLen]
 		copy(b, payload[xPos:xPos+uniformLen])
 		col.BytesInline[presentRow] = b
+		sPos += uniformLen
 		xPos += uniformLen
 	}
 

@@ -2302,3 +2302,30 @@ both callers before the call (all offsets equal `base`).
 
 Back-ref: `column.go:unpackDeltaBitsLE`, `column.go:decodeDeltaUint64BitPacked`,
 `column.go:decodeDeltaUint64Paged`.
+
+## NOTE-342: Single-Slab Decode for Uniform-Length Byte Columns
+
+`decodeXORBytesUniform` (and its sibling `decodeInlineBytesUniform`) decode the
+uniform-length XOR/Inline byte-column kinds (24/25/26/27/28, NOTE-217) where every present
+row holds exactly `uniformLen` bytes. The previous loop allocated a fresh
+`make([]byte, uniformLen)` per present row. On the warm querier, `decodeXORBytesUniform`
+was the **#1 inuse-objects frame (~26 MB)**: a uniform byte column with thousands of
+present rows paid thousands of tiny heap allocations, scaling with both rows-per-block and
+blocks-per-query.
+
+**Fix:** allocate one contiguous backing slab `make([]byte, presentCount*uniformLen)` per
+column and hand each present row a three-index subslice
+`slab[sPos : sPos+uniformLen : sPos+uniformLen]`. This collapses N allocations into 1 with
+**byte-identical output**:
+
+- Rows are fixed-width and never resized, so a stable shared slab is safe.
+- The capped (`:hi`) subslice prevents any accidental `append` into a neighbor's region.
+- For the XOR path, each row is decoded in place against `prev` (the previous row's slab
+  slice); writes to `result[i]` and reads from `prev[i]` touch disjoint slab regions, so
+  there is no aliasing hazard and the decoded bytes match the per-row-alloc version exactly.
+
+**Result (BenchmarkDecodeXORBytesUniform_Allocs, n=4096, uniformLen=16):**
+allocs/op ~4099 → 4 (-99.9%); bytes/op ~flat (the slab carries the same total payload the
+per-row allocs did).
+
+Back-ref: `column.go:decodeXORBytesUniform`, `column.go:decodeInlineBytesUniform`.
