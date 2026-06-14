@@ -2077,3 +2077,31 @@ would have its refs read from the correct tail offset regardless. blockW,rowW �
 refSize ∈ {2,3,4}, never zero. Cold path is unaffected (it decodes refs eagerly only for the
 dict format, which never enters this function). Verified: `go test -race ./internal/modules/
 blockio/shared ./internal/modules/blockio/reader ./internal/modules/executor` green.
+
+---
+
+## NOTE-356: single value arena for flat-bytes intrinsic columns
+
+`appendFlatPageOpt` (the per-page flat-bytes decode) and the legacy single-blob
+`DecodeIntrinsicColumnBlob` bytes path each allocated one `make([]byte, vLen)` per row to
+copy out a value (the NOTE-012 invariant requires copies — values cannot alias the pooled
+`pageBuf`/`raw` buffer that is reused across page decodes). For a flat-bytes intrinsic column
+that is one allocation per row (potentially millions), with the same size-class rounding +
+fragmentation cost as NOTE-356 in the reader package. Decoded intrinsic columns are retained
+by `parsedIntrinsicCache`, so the per-value overhead is retained `inuse_space`.
+
+**Fix:** mirror the NOTE-147 XOR-bytes arena. A cheap pre-scan (`flatBytesPageValueSize`) sums
+the page's value bytes from the `len[2]` prefixes; one arena of that exact size is allocated;
+each value is a non-overlapping, cap-bounded sub-slice. The arena is a fresh allocation that
+never aliases the pooled raw buffer, so the NOTE-012/013 "values are independent copies"
+invariant holds. Output is byte-identical.
+
+**Result:** `BenchmarkDecodeFlatBytes_Allocs` (2048 rows × 12 bytes): 2052 -> 5 allocs/op
+(-99.8%), 131,264 -> 123,072 B/op (-6.2%, the eliminated per-value size-class rounding), ns/op
+~150K -> ~100K (-33%). The bytes reduction is retained for every cached flat-bytes intrinsic
+column.
+
+Back-ref: `intrinsic_codec.go` (`appendFlatPageOpt` bytes branch, `DecodeIntrinsicColumnBlob`
+bytes branch, new `flatBytesPageValueSize`). Test/bench:
+`intrinsic_flat_bytes_arena_test.go` (`TestFlatBytesArena_Roundtrip`, `BenchmarkDecodeFlatBytes_Allocs`).
+The reader-package bytes-dict counterpart (same pattern) is also NOTE-356 — see `reader/NOTES.md`.

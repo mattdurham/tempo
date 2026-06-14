@@ -571,19 +571,29 @@ func appendFlatPageOpt(
 	pos := 0
 
 	if isBytes {
+		// NOTE-356: reconstruct all of this page's values into ONE page-sized arena instead
+		// of one make([]byte, vLen) per value (mirrors the NOTE-147 XOR-bytes arena). The
+		// per-value alloc was the dominant allocator on the flat-bytes intrinsic decode path:
+		// each small value rounds up to a malloc size class and carries per-object metadata,
+		// and the resulting many small objects are RETAINED (the decoded column is held by
+		// parsedIntrinsicCache for the cache-entry lifetime), inflating inuse_space with
+		// rounding slop + fragmentation. A cheap pre-scan over the len[2] prefixes sizes the
+		// arena exactly; each value is a non-overlapping, cap-bounded sub-slice. The arena is
+		// freshly allocated and never aliases the pooled raw page buffer, so the NOTE-012/013
+		// "values are independent copies" invariant holds.
+		valBytes, scanErr := flatBytesPageValueSize(raw, rowCount)
+		if scanErr != nil {
+			return scanErr
+		}
+		arena := make([]byte, valBytes)
+		arenaOff := 0
 		for range rowCount {
-			if pos+2 > len(raw) {
-				return fmt.Errorf("DecodeFlatPage: truncated at bytes len")
-			}
 			vLen := int(binary.LittleEndian.Uint16(raw[pos:]))
 			pos += 2
-			if pos+vLen > len(raw) {
-				return fmt.Errorf("DecodeFlatPage: truncated at bytes value")
-			}
-			// NOTE-012: copy BytesValues so the pool buffer can be safely reused.
-			v := make([]byte, vLen)
+			v := arena[arenaOff : arenaOff+vLen : arenaOff+vLen]
 			copy(v, raw[pos:pos+vLen])
 			dst.BytesValues = append(dst.BytesValues, v)
+			arenaOff += vLen
 			pos += vLen
 		}
 	} else {
@@ -1455,20 +1465,23 @@ func decodeLegacyFlatBlob(raw []byte, pos int, colType ColumnType, rowCount int,
 
 	isBytes := colType == ColumnTypeBytes
 	if isBytes {
+		// NOTE-356: single value arena instead of one make([]byte) per value (same rationale
+		// and safety contract as the appendFlatPageOpt bytes path). raw is the decoded blob;
+		// the arena is a fresh, non-aliasing allocation, preserving the NOTE-012 copy invariant.
+		valBytes, scanErr := flatBytesPageValueSize(raw[pos:], rowCount)
+		if scanErr != nil {
+			return fmt.Errorf("DecodeIntrinsicColumnBlob: %w", scanErr)
+		}
 		col.BytesValues = make([][]byte, 0, rowCount)
+		arena := make([]byte, valBytes)
+		arenaOff := 0
 		for range rowCount {
-			if pos+2 > len(raw) {
-				return fmt.Errorf("DecodeIntrinsicColumnBlob: truncated at bytes len")
-			}
 			vLen := int(binary.LittleEndian.Uint16(raw[pos:]))
 			pos += 2
-			if pos+vLen > len(raw) {
-				return fmt.Errorf("DecodeIntrinsicColumnBlob: truncated at bytes value")
-			}
-			// NOTE-012: copy BytesValues so the pool buffer can be safely reused.
-			v := make([]byte, vLen)
+			v := arena[arenaOff : arenaOff+vLen : arenaOff+vLen]
 			copy(v, raw[pos:pos+vLen])
 			col.BytesValues = append(col.BytesValues, v)
+			arenaOff += vLen
 			pos += vLen
 		}
 	} else {
@@ -1798,6 +1811,27 @@ func appendDeltaUint64PageOpt(raw []byte, blockW, rowW, rowCount int, dst *Intri
 // validation up front (NOTE-147) so the decode loop can size its arena exactly and then
 // trust the layout. It reads only the 4-byte length prefixes — the value payloads are
 // skipped, so the scan is near-free.
+// flatBytesPageValueSize pre-scans a flat-bytes page's len[2]+bytes records and returns the
+// total value-byte count, so appendFlatPageOpt can size its single value arena exactly
+// (NOTE-356). Validates every length prefix up front; the subsequent decode loop reuses the
+// same offset walk knowing the arena is large enough.
+func flatBytesPageValueSize(raw []byte, rowCount int) (totalValBytes int, err error) {
+	pos := 0
+	for range rowCount {
+		if pos+2 > len(raw) {
+			return 0, fmt.Errorf("DecodeFlatPage: truncated at bytes len")
+		}
+		vLen := int(binary.LittleEndian.Uint16(raw[pos:]))
+		pos += 2
+		if pos+vLen > len(raw) {
+			return 0, fmt.Errorf("DecodeFlatPage: truncated at bytes value")
+		}
+		pos += vLen
+		totalValBytes += vLen
+	}
+	return totalValBytes, nil
+}
+
 func xorBytesPageValueSize(raw []byte, rowCount int) (totalValBytes int, err error) {
 	pos := 0
 	for range rowCount {

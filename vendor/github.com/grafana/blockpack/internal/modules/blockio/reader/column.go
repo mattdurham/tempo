@@ -549,21 +549,46 @@ func decodeDictBody(dictBytes []byte, col *Column, ctx *decodeCtx) error {
 		copy(col.BoolDict, dictBytes[pos:pos+entryCnt])
 
 	case shared.ColumnTypeBytes, shared.ColumnTypeRangeBytes, shared.ColumnTypeUUID:
-		col.BytesDict = make([][]byte, 0, entryCnt)
+		// NOTE-356: copy every dict value into ONE contiguous arena, then sub-slice each
+		// entry's BytesDict view from it — instead of a per-entry make([]byte, bLen). The old
+		// code did entryCnt separate small heap allocations: each rounds up to a malloc
+		// size class (a 12-byte value lands in the 16-byte class, ~25% slop) and carries
+		// per-object allocator metadata, and the resulting many small objects fragment the
+		// heap. A bytes-dict column is retained by parsedV8ColumnCache for the lifetime of
+		// the cache entry, so that per-entry rounding + fragmentation is RETAINED inuse_space,
+		// not just transient churn. The dict body is read raw (readRawSegment sub-slice of the
+		// pooled, soon-recycled decompression buffer), so the values must be copied out; doing
+		// it once into a single right-sized arena keeps the same ownership contract with O(1)
+		// allocations instead of O(entries). Mirrors the NOTE-150 intrinsic value/ref arenas.
+		//
+		// Pass 1: validate every entry's length prefix and sum the total value bytes so the
+		// arena is sized exactly (no over-allocation, no growth reallocations).
+		total := 0
+		p := pos
 		for range entryCnt {
-			if pos+4 > len(dictBytes) {
+			if p+4 > len(dictBytes) {
 				return fmt.Errorf("dict body(bytes): short at entry")
 			}
-
-			bLen := int(binary.LittleEndian.Uint32(dictBytes[pos:]))
-			pos += 4
-			if pos+bLen > len(dictBytes) {
+			bLen := int(binary.LittleEndian.Uint32(dictBytes[p:]))
+			p += 4
+			if p+bLen > len(dictBytes) {
 				return fmt.Errorf("dict body(bytes): data overrun")
 			}
-
-			b := make([]byte, bLen)
-			copy(b, dictBytes[pos:pos+bLen])
-			col.BytesDict = append(col.BytesDict, b)
+			total += bLen
+			p += bLen
+		}
+		// Pass 2: one arena copy, then carve exact-length sub-slices. Each view uses a
+		// three-index slice (cap == len) so a stray future append on one entry reallocates
+		// rather than overwriting its neighbor in the shared arena.
+		col.BytesDict = make([][]byte, entryCnt)
+		arena := make([]byte, total)
+		off := 0
+		for i := range entryCnt {
+			bLen := int(binary.LittleEndian.Uint32(dictBytes[pos:]))
+			pos += 4
+			copy(arena[off:off+bLen], dictBytes[pos:pos+bLen])
+			col.BytesDict[i] = arena[off : off+bLen : off+bLen]
+			off += bLen
 			pos += bLen
 		}
 

@@ -2473,3 +2473,41 @@ retained uniform inline column in `parsedV8ColumnCache`, directly shrinking the 
 Back-ref: `column.go` (`bytesInlineAt`/`hasInlineBytes`, `Column.uniformSlab`/`uniformStride`,
 `decodeXORBytesUniform`, `decodeInlineBytesUniform`), `block.go` (`SizeBytes`, `BytesValue`,
 `uuidStringValue`, `VectorF32Value`), `block_parser.go`, `reader.go` (snapshot/copy paths).
+
+---
+
+## NOTE-356: single contiguous arena for bytes-dictionary column values
+
+`decodeDictBody` (`column.go`, the `ColumnTypeBytes`/`RangeBytes`/`UUID` case) allocated one
+`make([]byte, bLen)` per dictionary entry — `entryCnt` separate small heap objects. Two costs:
+
+1. **Size-class rounding slop:** a 12-byte value lands in the 16-byte malloc class (~25%
+   waste); plus per-object allocator metadata. For a K-entry bytes dict that is K × (rounding
+   + header) bytes of RETAINED overhead.
+2. **Fragmentation:** K small objects scattered across the heap.
+
+Because a decoded bytes-dict column is held by `parsedV8ColumnCache` for the cache-entry
+lifetime, that overhead is retained `inuse_space`, not transient churn.
+
+**Fix:** copy every entry's bytes into ONE right-sized arena, then carve each `BytesDict[i]`
+as a cap-bounded (three-index) sub-slice of it. A first pass over the length prefixes sums
+the total and validates every prefix, so the arena is sized exactly with no growth realloc;
+the second pass copies + carves. The dict body is read raw (a sub-slice of the soon-recycled
+pooled decompression buffer), so the values still MUST be copied out — doing it once into a
+single arena keeps the same ownership contract with O(1) allocations instead of O(entries).
+Cap-bounded views guarantee a stray future append on one entry reallocates rather than
+overwriting its neighbor. Mirrors the NOTE-150 intrinsic value/ref arenas.
+
+`Column.SizeBytes` is unchanged and still accurate: it counts `len(b)+24` per entry; the
+`+24` slice header still exists (the `[][]byte` headers are unchanged) and the arena body is
+exactly `sum(len(b))`.
+
+**Result:** `BenchmarkDecodeBytesDict_Allocs` (1024 entries × 12 bytes): 1028 -> 5 allocs/op
+(-99.5%), 48,448 -> 44,352 B/op (-8.5%, the eliminated size-class rounding slop), ns/op
+~67K -> ~45K (-33%, fewer malloc calls). The -8.5% bytes reduction is retained for every
+cached bytes-dict column.
+
+Back-ref: `column.go` (`decodeDictBody` ColumnTypeBytes case). Test/bench:
+`dict_bytes_arena_bench_test.go` (`TestBytesDictArena_Roundtrip`, `BenchmarkDecodeBytesDict_Allocs`).
+The intrinsic flat-bytes counterpart (same pattern, `shared` package) is also NOTE-356 — see
+`shared/NOTES.md`.
