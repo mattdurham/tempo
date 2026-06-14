@@ -5385,3 +5385,15 @@ reads from the identical source array (`Uint64Values` / `DictEntries.Value` /
 byte-for-byte the same (the closure was the only difference).
 
 Back-ref: `internal/modules/executor/intrinsic_row_block.go:populateTypedColumnForBlock`
+
+## NOTE-352 (executor side): dense flat scatter fast path in populateTypedColumnForBlock
+
+`populateTypedColumnForBlock` now checks `col.DenseFlatRange(blockIdx)` first. When the column
+is flat-dense (shared NOTE-352 dropped its refIndex slice — Pos == rank), it scatters via the
+`scatter*Dense(minRow, count, ...)` variants which iterate the synthesized identity range
+(rowIdx = minRow+i, valuePos = i) without materializing a `[]RefIndexEntry`. Only the flat
+(uint64/bytes) intrinsic columns can be flat-dense (span:start/end/duration, trace:id/span:id/
+parent_id); dict columns (span:name/service.name/status/kind) keep refIndex and take the
+existing BlockRefRange path. Each `*Dense` body mirrors its general counterpart's per-row body
+exactly (same bounds checks, present bit, source array), so output is byte-identical —
+verified by TestPopulateTypedColumnForBlock_DenseEqualsGeneral.

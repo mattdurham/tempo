@@ -2006,3 +2006,46 @@ entry keeps its Put-time size until the next access re-Puts/re-sizes it), which 
 EnsureBlockRefs SizeBytes == values+refs and strictly less than the lazy estimate). Existing
 TestLazyBlockRefsDeferred + Delta/Flat/XOR equivalence tests unchanged & green.
 `go test -race ./blockio/shared ./objectcache ./blockio/reader` green; `make precommit` green.
+
+## NOTE-352: drop the redundant identity refIndex slice for flat-dense columns
+
+**What:** `IntrinsicColumn.EnsureRefIndex` builds a `[]RefIndexEntry` (8 bytes/row: Packed +
+Pos) for O(log N) reverse lookups. For a flat/XOR/Delta column whose refs are emitted in
+ascending row order AND form a dense contiguous single-block permutation `[minRow, minRow+n)`
+— the dominant single-block fully-present decode (span:duration/span:start/trace:id/span:id/
+parent:id) — the sorted index is the IDENTITY: `idx[i] = {Packed: minRow+i, Pos: i}`, so
+`refIndex[rank].Pos == rank` and the whole slice carries no information beyond `(refDenseMin,
+count)`. NOTE-352 detects this in an allocation-free pre-scan (`detectFlatDense`) at the top of
+`buildRefIndexFlat`, records `refDenseFlat=true`/`refDenseMin`/`refDenseCount`, and DROPS the
+refIndex slice entirely (`refIndex = nil`). Reverse lookups become arithmetic:
+`pos == rank == (RowIdx - refDenseMin)` (`denseLookupPos`, `lookupRefIdx`). The hot scatter
+consumer (`populateTypedColumnForBlock` in executor) takes a dense fast path via the new
+`DenseFlatRange(blockIdx) (minRow, count, ok)` accessor and scatters the synthesized range
+without materializing `[]RefIndexEntry` at all. `BlockRefRange` reconstructs the identity
+slice on demand for any non-scatter caller so it stays a correct self-contained API.
+
+**Why:** `makeNoZeroUint64`/`makeNoZeroBlockRef` were the top retained frames (NOTE-344) and
+the flat-column refIndex slice is the LARGEST per-column array — 8 bytes/row, equal to the
+uint64 value array and 2× the 4-byte BlockRef array. Every cached flat-dense intrinsic column
+retained this redundant identity slice for its whole LRU lifetime. Dropping it cuts ~8 bytes/
+row of RETAINED heap per cached flat-dense column, and the allocation-free pre-scan also
+removes the transient `make([]RefIndexEntry, n)` + radix sort on the hot single-block path.
+
+**Scope/safety:** ONLY flat/XOR/Delta + in-order + single-block + dense → `Pos == rank`.
+- Out-of-order-but-dense flat columns (Pos != rank after the radix sort) KEEP the slice
+  (plain `refDense`, NOTE-229 path) — `detectFlatDense` fails the in-order check.
+- Dict columns store `Pos == entryIdx != rank` and never take this path (buildRefIndexDict).
+- Sparse/gapped/multi-block columns fail the pre-scan and build the full slice unchanged.
+`SizeBytes` now counts 0 for refIndex on flat-dense columns (it was already 0 at Put time
+since the index builds lazily on first ref access — the budget under-count NOTE-344 flagged
+becomes accurate for these columns).
+
+**Verification:** TestRefDenseFlat_DropsRefIndex (refIndex nil + SizeBytes has no refIndex
+term + lookups still correct; dict-dense retains slice). TestEnsureRefIndex_ProvenDenseMatchesScan,
+TestDenseLookup_EqualsBinarySearch, TestBlockRefRange_DenseEqualsBinarySearch updated to build
+their reference index from input refs / BlockRefRange (col.refIndex is dropped). Executor
+TestPopulateTypedColumnForBlock_DenseEqualsGeneral (dense scatter == general scatter, byte
+identical). Microbench BenchmarkEnsureRefIndexFlatDense_Allocs (4096 dense rows): 32960 B/op,
+2 allocs, ~10.8µs → 192 B/op, 1 alloc, ~2.2µs (-99% bytes, -80% time — the radix sort is
+skipped). `make precommit` green; `go test -race ./...` green (except pre-existing
+cmd/embed-server network-dependent stress tests).

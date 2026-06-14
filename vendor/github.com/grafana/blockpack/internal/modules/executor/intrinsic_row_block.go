@@ -90,6 +90,29 @@ func populateTypedColumnForBlock(
 	blockIdx uint16,
 	result []intrinsicRowFields,
 ) {
+	// NOTE-352: flat-dense columns (span:start/end/duration/trace:id/span:id/parent:id on the
+	// dominant single-block fully-present shape) dropped their refIndex slice — pos == rank ==
+	// (rowIdx - minRow). Scatter directly from the synthesized (minRow, count) range without
+	// materializing []RefIndexEntry. Only the flat (uint64/bytes) columns can be flat-dense;
+	// dict columns (span:name/service.name/status/kind) keep refIndex and take the path below.
+	if minRow, count, ok := col.DenseFlatRange(blockIdx); ok {
+		switch colName {
+		case colNameTraceID:
+			scatterTraceIDDense(minRow, count, col.BytesValues, result)
+		case colNameSpanID:
+			scatterSpanIDDense(minRow, count, col.BytesValues, result)
+		case colNameParentID:
+			scatterParentIDDense(minRow, count, col.BytesValues, result)
+		case colNameSpanStart:
+			scatterSpanStartDense(minRow, count, col.Uint64Values, result)
+		case colNameSpanEnd:
+			scatterSpanEndDense(minRow, count, col.Uint64Values, result)
+		case colNameSpanDuration:
+			scatterSpanDurationDense(minRow, count, col.Uint64Values, result)
+		}
+		return
+	}
+
 	entries := col.BlockRefRange(blockIdx)
 	if len(entries) == 0 {
 		return
@@ -118,6 +141,85 @@ func populateTypedColumnForBlock(
 	case colNameSpanStatus:
 		scatterSpanStatus(entries, col.DictEntries, result)
 		// Unknown column names are silently skipped (future-proof; consistent with storeTypedField).
+	}
+}
+
+// NOTE-352: dense flat scatter variants. For a flat-dense column (refIndex dropped) the
+// entries are the identity range [refDenseMin, refDenseMin+count): the i-th present row has
+// rowIdx == minRow+i and its value sits at Uint64Values/BytesValues position i. Iterating the
+// synthesized range with a single counter avoids both the per-call []RefIndexEntry
+// reconstruction and the 8-byte/row retained slice (its sole reason to exist was to map
+// rowIdx->pos, which here is a fixed offset). Each variant mirrors its general counterpart's
+// per-row body exactly (same bounds checks, same present bit, same source array).
+
+func scatterTraceIDDense(minRow uint32, count int, bytesVals [][]byte, result []intrinsicRowFields) {
+	for i := range count {
+		rowIdx := int(minRow) + i
+		if rowIdx >= len(result) || i >= len(bytesVals) {
+			continue
+		}
+		b := bytesVals[i]
+		if len(b) == traceIDByteLen {
+			copy(result[rowIdx].traceID[:], b)
+			result[rowIdx].present |= intrinsicPresentTraceID
+		}
+	}
+}
+
+func scatterSpanIDDense(minRow uint32, count int, bytesVals [][]byte, result []intrinsicRowFields) {
+	for i := range count {
+		rowIdx := int(minRow) + i
+		if rowIdx >= len(result) || i >= len(bytesVals) {
+			continue
+		}
+		if copy8(&result[rowIdx].spanID, bytesVals[i]) {
+			result[rowIdx].present |= intrinsicPresentSpanID
+		}
+	}
+}
+
+func scatterParentIDDense(minRow uint32, count int, bytesVals [][]byte, result []intrinsicRowFields) {
+	for i := range count {
+		rowIdx := int(minRow) + i
+		if rowIdx >= len(result) || i >= len(bytesVals) {
+			continue
+		}
+		if copy8(&result[rowIdx].parentID, bytesVals[i]) {
+			result[rowIdx].present |= intrinsicPresentParentID
+		}
+	}
+}
+
+func scatterSpanStartDense(minRow uint32, count int, uint64Vals []uint64, result []intrinsicRowFields) {
+	for i := range count {
+		rowIdx := int(minRow) + i
+		if rowIdx >= len(result) || i >= len(uint64Vals) {
+			continue
+		}
+		result[rowIdx].spanStart = uint64Vals[i]
+		result[rowIdx].present |= intrinsicPresentSpanStart
+	}
+}
+
+func scatterSpanEndDense(minRow uint32, count int, uint64Vals []uint64, result []intrinsicRowFields) {
+	for i := range count {
+		rowIdx := int(minRow) + i
+		if rowIdx >= len(result) || i >= len(uint64Vals) {
+			continue
+		}
+		result[rowIdx].spanEnd = uint64Vals[i]
+		result[rowIdx].present |= intrinsicPresentSpanEnd
+	}
+}
+
+func scatterSpanDurationDense(minRow uint32, count int, uint64Vals []uint64, result []intrinsicRowFields) {
+	for i := range count {
+		rowIdx := int(minRow) + i
+		if rowIdx >= len(result) || i >= len(uint64Vals) {
+			continue
+		}
+		result[rowIdx].spanDuration = uint64Vals[i]
+		result[rowIdx].present |= intrinsicPresentSpanDuration
 	}
 }
 

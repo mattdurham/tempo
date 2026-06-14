@@ -35,10 +35,25 @@ type IntrinsicColumn struct {
 	// NOTE-229: dense single-block RowIdx permutation fast path for refIndex reverse lookups.
 	refDenseMin  uint32
 	refDenseHi16 uint32
-	Count        uint32
-	Type         ColumnType
-	Format       uint8
-	refDense     bool
+	// NOTE-352: refDenseCount records the number of entries in the dense permutation when the
+	// refIndex slice has been dropped (refDenseFlat). For a flat/XOR/Delta column whose refs
+	// are emitted in row order, the dense sorted index is the identity {Packed: minRow+i,
+	// Pos: i}, so refIndex[rank].Pos == rank — the slice carries NO information beyond
+	// (refDenseMin, count). We therefore drop the whole refIndex slice (8 bytes/row, the
+	// LARGEST per-column array — larger than the value array itself for bytes columns and
+	// equal to it for uint64) and answer every reverse lookup arithmetically: pos == rank ==
+	// (RowIdx - refDenseMin). This is the dominant cached-column shape (span:duration/
+	// span:start single-block flat columns), so it is a large structural retained-memory cut.
+	// Zero/false for dict-dense (Pos == entryIdx ≠ rank, refIndex retained) and sparse columns.
+	refDenseCount uint32
+	Count         uint32
+	Type          ColumnType
+	Format        uint8
+	refDense      bool
+	// refDenseFlat is true when refIndex was dropped because Pos == rank (flat-dense, NOTE-352).
+	// denseLookupPos and the scatter fast path then synthesize entries from
+	// (refDenseMin, refDenseCount) instead of reading the (nil) refIndex slice.
+	refDenseFlat bool
 }
 
 // EnsureBlockRefs materializes the BlockRefs array if it was deferred by a lazy decode
