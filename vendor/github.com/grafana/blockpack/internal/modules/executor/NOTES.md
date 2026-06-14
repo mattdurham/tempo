@@ -5386,10 +5386,10 @@ byte-for-byte the same (the closure was the only difference).
 
 Back-ref: `internal/modules/executor/intrinsic_row_block.go:populateTypedColumnForBlock`
 
-## NOTE-352 (executor side): dense flat scatter fast path in populateTypedColumnForBlock
+## NOTE-354 (executor side): dense flat scatter fast path in populateTypedColumnForBlock
 
 `populateTypedColumnForBlock` now checks `col.DenseFlatRange(blockIdx)` first. When the column
-is flat-dense (shared NOTE-352 dropped its refIndex slice — Pos == rank), it scatters via the
+is flat-dense (shared NOTE-354 dropped its refIndex slice — Pos == rank), it scatters via the
 `scatter*Dense(minRow, count, ...)` variants which iterate the synthesized identity range
 (rowIdx = minRow+i, valuePos = i) without materializing a `[]RefIndexEntry`. Only the flat
 (uint64/bytes) intrinsic columns can be flat-dense (span:start/end/duration, trace:id/span:id/

@@ -541,7 +541,7 @@ func (col *IntrinsicColumn) setRefDense(hi16, minRow uint32) {
 }
 
 // setRefDenseFlat records a flat-dense column whose refIndex is the identity permutation
-// (Pos == rank), enabling the NOTE-352 refIndex-slice drop. It drops col.refIndex (so the
+// (Pos == rank), enabling the NOTE-354 refIndex-slice drop. It drops col.refIndex (so the
 // 8-byte/row slice is GC'd and stops counting against the LRU budget) and records the count
 // so denseLookupPos / DenseFlatRange can synthesize positions arithmetically. The caller must
 // have proven Pos == rank for every entry (refs already in ascending row order AND a dense
@@ -552,10 +552,10 @@ func (col *IntrinsicColumn) setRefDenseFlat(hi16, minRow, count uint32) {
 	col.refDenseHi16 = hi16
 	col.refDenseMin = minRow
 	col.refDenseCount = count
-	col.refIndex = nil // drop the redundant identity slice (NOTE-352)
+	col.refIndex = nil // drop the redundant identity slice (NOTE-354)
 }
 
-// DenseFlatRange reports whether col is a flat-dense column (NOTE-352) whose refIndex slice
+// DenseFlatRange reports whether col is a flat-dense column (NOTE-354) whose refIndex slice
 // was dropped, returning the (rowIdx, pos) synthesis parameters for blockIdx: rowIdx ==
 // refDenseMin + i and pos == i for i in [0, count). Returns ok == false for any other column
 // shape (dict-dense, sparse, multi-block), in which case callers must use BlockRefRange.
@@ -585,7 +585,7 @@ func (col *IntrinsicColumn) denseLookupPos(packedRef uint32) (pos int, ok bool) 
 		return -1, true
 	}
 	rank := int((packedRef & 0xFFFF) - col.refDenseMin)
-	// NOTE-352: a flat-dense column dropped its refIndex slice (Pos == rank), so the bound is
+	// NOTE-354: a flat-dense column dropped its refIndex slice (Pos == rank), so the bound is
 	// refDenseCount and the position IS the rank. A dict-dense column keeps refIndex (Pos ==
 	// entryIdx) and is bounded/answered by the slice exactly as before.
 	if col.refDenseFlat {
@@ -628,7 +628,7 @@ func (col *IntrinsicColumn) EnsureRefIndex() {
 // (the dominant single-block fully-present decode) this is the identity index, so the refIndex
 // slice is redundant (Pos == rank). The scan is O(N) with NO allocation. Returns ok == false
 // for any out-of-order, multi-block, or gapped layout, in which case the caller builds the
-// full refIndex slice. NOTE-352.
+// full refIndex slice. NOTE-354.
 func detectFlatDense(refs []BlockRef) (hi16, minRow, count uint32, ok bool) {
 	n := len(refs)
 	if n == 0 {
@@ -655,7 +655,7 @@ func detectFlatDense(refs []BlockRef) (hi16, minRow, count uint32, ok bool) {
 // row). Factored out of EnsureRefIndex (NOTE-252) to keep that dispatcher under the gocyclo
 // threshold; the build/sort/dense logic is otherwise unchanged from the prior inline body.
 func (col *IntrinsicColumn) buildRefIndexFlat() {
-	// NOTE-352: cheap allocation-free pre-scan for the dominant flat-dense shape (single
+	// NOTE-354: cheap allocation-free pre-scan for the dominant flat-dense shape (single
 	// block, refs already in ascending row order, dense contiguous [minRow, minRow+n)). When
 	// it holds, Pos == rank so the entire refIndex slice is redundant — skip building (and
 	// thus allocating) it altogether and record (refDenseMin, count) for arithmetic lookups.
@@ -724,7 +724,7 @@ func (col *IntrinsicColumn) buildRefIndexFlat() {
 		radixSortRefIndexPrepared(idx, keyOr, &hist0)
 	}
 	col.refIndex = idx
-	// NOTE-352: the flat-dense identity case (sorted + single-block + contiguous) is caught by
+	// NOTE-354: the flat-dense identity case (sorted + single-block + contiguous) is caught by
 	// the allocation-free detectFlatDense pre-scan at the top of this function, which returns
 	// before reaching here. Any column that reaches this point either needed a sort (Pos !=
 	// rank) or is sparse/multi-block, so its refIndex slice is genuinely required.
@@ -881,7 +881,7 @@ func (col *IntrinsicColumn) lookupRefIdx(packedRef uint32) int {
 	// NOTE-229/352: O(1) dense fast path. When the index is a dense contiguous single-block
 	// permutation the position is rank arithmetic; a fast-path miss is a genuine not-found
 	// (the dense range is exhaustive), so there is no fall-through to the binary search. This
-	// MUST run before the len(refIndex)==0 guard below: a flat-dense column (NOTE-352) dropped
+	// MUST run before the len(refIndex)==0 guard below: a flat-dense column (NOTE-354) dropped
 	// its refIndex slice, so refIndex is nil yet the column has refDenseCount entries answered
 	// arithmetically here.
 	if dpos, ok := col.denseLookupPos(packedRef); ok {
@@ -1016,7 +1016,7 @@ func (col *IntrinsicColumn) BlockRefRange(blockIdx uint16) []RefIndexEntry {
 		return nil
 	}
 	col.EnsureRefIndex()
-	// NOTE-352: a flat-dense column dropped its refIndex slice (Pos == rank). The hot consumer
+	// NOTE-354: a flat-dense column dropped its refIndex slice (Pos == rank). The hot consumer
 	// (populateTypedColumnForBlock) routes such columns through DenseFlatRange and never calls
 	// here, but reconstruct the identity []RefIndexEntry for any other caller so BlockRefRange
 	// stays a correct, self-contained API rather than silently returning nil. This allocation

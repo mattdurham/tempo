@@ -90,7 +90,7 @@ func populateTypedColumnForBlock(
 	blockIdx uint16,
 	result []intrinsicRowFields,
 ) {
-	// NOTE-352: flat-dense columns (span:start/end/duration/trace:id/span:id/parent:id on the
+	// NOTE-354: flat-dense columns (span:start/end/duration/trace:id/span:id/parent:id on the
 	// dominant single-block fully-present shape) dropped their refIndex slice — pos == rank ==
 	// (rowIdx - minRow). Scatter directly from the synthesized (minRow, count) range without
 	// materializing []RefIndexEntry. Only the flat (uint64/bytes) columns can be flat-dense;
@@ -144,7 +144,7 @@ func populateTypedColumnForBlock(
 	}
 }
 
-// NOTE-352: dense flat scatter variants. For a flat-dense column (refIndex dropped) the
+// NOTE-354: dense flat scatter variants. For a flat-dense column (refIndex dropped) the
 // entries are the identity range [refDenseMin, refDenseMin+count): the i-th present row has
 // rowIdx == minRow+i and its value sits at Uint64Values/BytesValues position i. Iterating the
 // synthesized range with a single counter avoids both the per-call []RefIndexEntry

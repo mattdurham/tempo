@@ -35,7 +35,7 @@ type IntrinsicColumn struct {
 	// NOTE-229: dense single-block RowIdx permutation fast path for refIndex reverse lookups.
 	refDenseMin  uint32
 	refDenseHi16 uint32
-	// NOTE-352: refDenseCount records the number of entries in the dense permutation when the
+	// NOTE-354: refDenseCount records the number of entries in the dense permutation when the
 	// refIndex slice has been dropped (refDenseFlat). For a flat/XOR/Delta column whose refs
 	// are emitted in row order, the dense sorted index is the identity {Packed: minRow+i,
 	// Pos: i}, so refIndex[rank].Pos == rank — the slice carries NO information beyond
@@ -50,7 +50,7 @@ type IntrinsicColumn struct {
 	Type          ColumnType
 	Format        uint8
 	refDense      bool
-	// refDenseFlat is true when refIndex was dropped because Pos == rank (flat-dense, NOTE-352).
+	// refDenseFlat is true when refIndex was dropped because Pos == rank (flat-dense, NOTE-354).
 	// denseLookupPos and the scatter fast path then synthesize entries from
 	// (refDenseMin, refDenseCount) instead of reading the (nil) refIndex slice.
 	refDenseFlat bool

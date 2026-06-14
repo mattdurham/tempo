@@ -2007,7 +2007,7 @@ EnsureBlockRefs SizeBytes == values+refs and strictly less than the lazy estimat
 TestLazyBlockRefsDeferred + Delta/Flat/XOR equivalence tests unchanged & green.
 `go test -race ./blockio/shared ./objectcache ./blockio/reader` green; `make precommit` green.
 
-## NOTE-352: drop the redundant identity refIndex slice for flat-dense columns
+## NOTE-354: drop the redundant identity refIndex slice for flat-dense columns
 
 **What:** `IntrinsicColumn.EnsureRefIndex` builds a `[]RefIndexEntry` (8 bytes/row: Packed +
 Pos) for O(log N) reverse lookups. For a flat/XOR/Delta column whose refs are emitted in
@@ -2015,7 +2015,7 @@ ascending row order AND form a dense contiguous single-block permutation `[minRo
 — the dominant single-block fully-present decode (span:duration/span:start/trace:id/span:id/
 parent:id) — the sorted index is the IDENTITY: `idx[i] = {Packed: minRow+i, Pos: i}`, so
 `refIndex[rank].Pos == rank` and the whole slice carries no information beyond `(refDenseMin,
-count)`. NOTE-352 detects this in an allocation-free pre-scan (`detectFlatDense`) at the top of
+count)`. NOTE-354 detects this in an allocation-free pre-scan (`detectFlatDense`) at the top of
 `buildRefIndexFlat`, records `refDenseFlat=true`/`refDenseMin`/`refDenseCount`, and DROPS the
 refIndex slice entirely (`refIndex = nil`). Reverse lookups become arithmetic:
 `pos == rank == (RowIdx - refDenseMin)` (`denseLookupPos`, `lookupRefIdx`). The hot scatter
