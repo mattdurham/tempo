@@ -320,6 +320,10 @@ func collectBlockStructuralSpanRecs(
 	} else {
 		idFields = identityFieldsFromBlockColsTyped(bwb.Block, n)
 	}
+	// NOTE-349: idFields is pooled scratch (both branches draw from the pool). It is fully
+	// consumed by the row loop below and copied out into structuralSpanRec entries; nothing
+	// retains a reference past this function, so release it on every exit path.
+	defer putIntrinsicRowFields(idFields)
 
 	for rowIdx := range n {
 		row := &idFields[rowIdx]

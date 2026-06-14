@@ -87,7 +87,9 @@ func lookupIntrinsicFieldsTyped(
 	selected []modules_shared.BlockRef,
 	wantCols map[string]struct{},
 ) ([]intrinsicRowFields, error) {
-	result := make([]intrinsicRowFields, len(selected))
+	// NOTE-349: pooled, zeroed scratch — the caller (filterRowSetByIntrinsicNodes) consumes
+	// the returned slice in a single filter loop and releases it via putIntrinsicRowFields.
+	result := getIntrinsicRowFields(len(selected))
 
 	wantCol := func(name string) bool {
 		if wantCols == nil {
@@ -103,6 +105,7 @@ func lookupIntrinsicFieldsTyped(
 		}
 		col, err := r.GetIntrinsicColumn(colName)
 		if err != nil {
+			putIntrinsicRowFields(result)
 			return nil, fmt.Errorf("lookupIntrinsicFieldsTyped: GetIntrinsicColumn %q: %w", colName, err)
 		}
 		if col == nil {
@@ -115,6 +118,7 @@ func lookupIntrinsicFieldsTyped(
 	if wantCol(colNameSpanEnd) {
 		col, err := r.GetIntrinsicColumn(colNameSpanEnd)
 		if err != nil {
+			putIntrinsicRowFields(result)
 			return nil, fmt.Errorf("lookupIntrinsicFieldsTyped: GetIntrinsicColumn %q: %w", colNameSpanEnd, err)
 		}
 		if col != nil {
@@ -213,7 +217,9 @@ func identityFieldsFromBlockColsTyped(block *modules_reader.Block, n int) []intr
 	traceCol := block.GetColumn("trace:id")
 	spanCol := block.GetColumn("span:id")
 	parentCol := block.GetColumn("span:parent_id")
-	result := make([]intrinsicRowFields, n)
+	// NOTE-349: pooled, zeroed scratch — the caller releases via putIntrinsicRowFields
+	// after its row loop, the same lifetime as the intrinsic-section branch.
+	result := getIntrinsicRowFields(n)
 	for rowIdx := range n {
 		row := &result[rowIdx]
 		if traceCol != nil {

@@ -27,7 +27,10 @@ func lookupIntrinsicFieldsTypedForBlock(
 	spanCount int,
 	wantCols map[string]struct{},
 ) ([]intrinsicRowFields, error) {
-	result := make([]intrinsicRowFields, spanCount)
+	// NOTE-349: pooled, zeroed scratch — the caller fully consumes the returned slice in a
+	// single row loop and then hands it back via putIntrinsicRowFields. Avoids one
+	// SpanCount-sized heap alloc (and its GC scan) per block per query.
+	result := getIntrinsicRowFields(spanCount)
 
 	wantCol := func(name string) bool {
 		if wantCols == nil {
@@ -43,6 +46,7 @@ func lookupIntrinsicFieldsTypedForBlock(
 		}
 		col, err := r.GetIntrinsicColumn(colName)
 		if err != nil {
+			putIntrinsicRowFields(result)
 			return nil, fmt.Errorf("lookupIntrinsicFieldsTypedForBlock: GetIntrinsicColumn %q: %w", colName, err)
 		}
 		if col == nil {
@@ -55,6 +59,7 @@ func lookupIntrinsicFieldsTypedForBlock(
 	if wantCol(colNameSpanEnd) {
 		col, err := r.GetIntrinsicColumn(colNameSpanEnd)
 		if err != nil {
+			putIntrinsicRowFields(result)
 			return nil, fmt.Errorf("lookupIntrinsicFieldsTypedForBlock: GetIntrinsicColumn %q: %w", colNameSpanEnd, err)
 		}
 		if col != nil {

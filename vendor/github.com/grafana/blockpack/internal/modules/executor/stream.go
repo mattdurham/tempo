@@ -1657,6 +1657,8 @@ func filterRowSetByIntrinsicNodes(
 			"err", err)
 		return rowSet
 	}
+	// NOTE-349: fields is pooled scratch; release it after the filter loop fully consumes it.
+	defer putIntrinsicRowFields(fields)
 	// Build filtered RowSet. Rows without intrinsic data for the wanted columns are
 	// treated as "absent" and fail the predicate (absent value != any predicate value).
 	filtered := newRowSetWithCap(len(rows))

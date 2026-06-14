@@ -5,6 +5,33 @@ This document captures the non-obvious design decisions, rationale, and invarian
 
 ---
 
+## NOTE-349: pool the per-block []intrinsicRowFields scatter scratch
+
+`lookupIntrinsicFieldsTypedForBlock` (structural search path, e.g. `{...} >> {...}`),
+`lookupIntrinsicFieldsTyped` (the ref-filter path in `filterRowSetByIntrinsicNodes`), and
+`identityFieldsFromBlockColsTyped` (legacy-file branch) each allocated a fresh
+`[]intrinsicRowFields` of `SpanCount` entries **once per block per query**. `intrinsicRowFields`
+is ~120 bytes (three string headers + two byte arrays + scalars), so a block with thousands of
+spans is a multi-hundred-KB short-lived allocation that the GC must scan (the strings are
+pointers). The slice is fully consumed by the caller's immediately-following row loop and then
+discarded — a textbook `sync.Pool` target.
+
+`getIntrinsicRowFields(n)`/`putIntrinsicRowFields` (intrinsicrowfields.go) draw a backing array
+from a `sync.Pool` (growing when `cap < n`) and return a length-`n` prefix. **Correctness
+hinges on zeroing**: the typed scatter functions (NOTE-345) only write entries that have a
+`RefIndexEntry`, so an unpopulated row keeps whatever was in the recycled backing array. Every
+reader of an `intrinsicRowFields` first checks the `present` bitmap (e.g.
+`if row.present&intrinsicPresentTraceID == 0 { continue }`), so the get path `clear()`s the
+returned prefix — guaranteeing every recycled row starts at `present==0` with no stale
+string/byte payload observable. All three producers now draw from the pool so callers
+(`stream_structural.go` row loop, `filterRowSetByIntrinsicNodes` filter loop) release
+unconditionally via `defer putIntrinsicRowFields(...)` after the loop fully consumes the slice.
+
+Lifetime safety: the structural row loop copies the value-typed identity fields
+(`[8]byte`/`[16]byte`) into `structuralSpanRec` and `computeNodeMatchForRow` reads `*row`
+synchronously and returns a `uint8` — nothing retains a pointer into the slice past the loop,
+and the defer fires after `releaseBlockColumnProvider`. Error paths release before returning nil.
+
 ## NOTE-348: share the POPCNT rank index between time-bucket scatter and group-by scan
 
 The compact N=1 count/rate group-by path (`streamCountRateN1Compact`, the M4/M6 `rate() by (…)`
