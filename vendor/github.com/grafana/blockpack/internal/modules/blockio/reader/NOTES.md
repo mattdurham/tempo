@@ -2329,3 +2329,57 @@ allocs/op ~4099 → 4 (-99.9%); bytes/op ~flat (the slab carries the same total 
 per-row allocs did).
 
 Back-ref: `column.go:decodeXORBytesUniform`, `column.go:decodeInlineBytesUniform`.
+## NOTE-293: GetTraceByID resolves identity from block columns, not file-wide intrinsic columns
+*Added: 2026-06-14*
+
+**Problem:** `GetTraceByID` loaded the whole-file intrinsic `trace:id` column (to find matching
+rows) and the whole-file intrinsic `span:id` column (to populate output span IDs). Both scale
+with the file's total span count, not the looked-up trace — profiling showed `GetIntrinsicColumn`
+on this path was ~11% of querier allocation, and on a sample block the two columns were ~77% of
+the per-lookup bytes while the actual trace lived in a single already-fetched block.
+
+**Solution:** the matching block blobs are fetched and decoded with `WantAll()` anyway, and each
+block payload carries per-row `trace:id` and `span:id` columns. Resolve matching rows by scanning
+each block's own `trace:id` column and read span IDs from its `span:id` column. The whole-file
+intrinsic `trace:id`/`span:id` columns are loaded only as a lazy fallback for blocks whose payload
+lacks those columns (`intrinsicFallbackRows`); current files never hit it. Stale comments claiming
+trace:id/span:id are "intrinsic-only"/"no longer present in block columns" were corrected
+(`executor.go`, `writer/writer.go`, `compaction/compaction.go`).
+
+**Result:** no whole-file intrinsic identity reads on the trace-by-id path for current files
+(asserted by `TestGetTraceByID_NoIntrinsicIdentityReads`). File size and the query/search path are
+unchanged.
+
+Back-ref: `reader.go:GetTraceByID`, `reader.go:intrinsicFallbackRows`
+
+## NOTE-346: Cap retained capacity of decompBufPool (snappy-decode scratch)
+*Added: 2026-06-14*
+
+**Problem:** `decompBufPool` (snappy-decode scratch for V14 lazy column decode) had NO
+cap on the backing capacity returned to the pool — unlike `assembledBufPool`
+(`assembledBufMaxPooledCap`, NOTE-208) and `intrinsicBufPool` (`intrinsicBufMaxCap`,
+NOTE-262). `decompressV14ColumnDataInto` grows `dst` up to the column's uncompressed
+length, bounded only by `shared.MaxBlockSize` (1 GiB). A single large-column decode
+(wide `trace:id`/`span:id` XORBytes column, or a fat attribute column) grew its pooled
+buffer to tens/hundreds of MiB, and all three Put sites (`parseBlockColumnsReuse` defer,
+`ensureDecompressed`'s error branch, `releaseDecompPooled`) returned that giant backing
+array to the pool unconditionally. Under concurrent heavy queries the pool accumulated
+several such arrays and — because a buffer that keeps getting reused never ages out
+across GC cycles — querier RSS stayed elevated long after the load that produced them
+drained. A heap profile (`memory:inuse_space`) attributed ~24.3 GB total live with the
+read/decode scratch frames among the largest retained.
+
+**Solution:** add `decompBufMaxPooledCap = 8 MiB` and a `putDecompBuf(*[]byte)` helper
+that drops (lets GC) any buffer whose capacity exceeds the cap, otherwise returns it to
+`decompBufPool`. Replaced all three raw `decompBufPool.Put` sites with `putDecompBuf`.
+The 8 MiB cap is comfortably above the warm-path per-column decode working set (the
+256 KiB seed already covers typical columns), so the common case still recycles with no
+churn; only the rare giant one-off decode is dropped, after which the next decode
+re-grows from the baseline. Mirrors the existing capped pools.
+
+**Result:** removes the unbounded high-water retention in `decompBufPool`. The cap only
+triggers for outsized buffers, so allocs/op on the warm microbench is unchanged — the win
+is total bytes-in-use / RSS, measured via gcx `memory:inuse_space` before/after deploy.
+
+Back-ref: `block_parser.go:putDecompBuf`, `column.go:ensureDecompressed`,
+`column.go:releaseDecompPooled`.

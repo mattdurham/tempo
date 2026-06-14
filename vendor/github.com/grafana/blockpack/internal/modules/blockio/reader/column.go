@@ -338,7 +338,7 @@ func (c *Column) ensureDecompressed() {
 				"uncompressed_len", c.uncompressedLen,
 				"max_block_size", shared.MaxBlockSize)
 			*bp = grown[:0]
-			decompBufPool.Put(bp)
+			putDecompBuf(bp)
 		} else {
 			c.rawEncoding = decompressed
 			*bp = grown[:0]
@@ -355,7 +355,7 @@ func (c *Column) ensureDecompressed() {
 // after this call rawEncoding must not be read again. Idempotent: a nil handle is a no-op.
 func (c *Column) releaseDecompPooled() {
 	if c.decompPooledPtr != nil {
-		decompBufPool.Put(c.decompPooledPtr)
+		putDecompBuf(c.decompPooledPtr)
 		c.decompPooledPtr = nil
 	}
 	c.rawEncoding = nil

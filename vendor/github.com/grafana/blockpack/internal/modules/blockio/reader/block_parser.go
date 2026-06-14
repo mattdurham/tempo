@@ -224,6 +224,32 @@ func parseColumnMetadataArray(data []byte, offset, colCount int, blockVersion ui
 // buffer is safe to reuse for the next column in the same parse call.
 var decompBufPool = sync.Pool{New: func() any { b := make([]byte, 0, 256<<10); return &b }}
 
+// decompBufMaxPooledCap bounds the backing capacity any buffer may carry back into
+// decompBufPool. NOTE-346: decompressV14ColumnDataInto grows dst up to the column's
+// uncompressed length, which is only bounded by shared.MaxBlockSize (1 GiB). A single
+// large-column decode (e.g. a wide trace:id/span:id XORBytes column) therefore grew its
+// pooled buffer to tens/hundreds of MiB, and the unconditional Put pinned that giant
+// backing array in the pool for the process lifetime. Under concurrent heavy queries the
+// pool accumulated several such arrays, keeping querier RSS elevated long after the load
+// that produced them had drained — sync.Pool only releases entries across GC cycles, but a
+// buffer this large that keeps getting reused never ages out. Buffers whose capacity
+// exceeds this cap are dropped (GC'd) instead of pooled, so the rare giant decode does not
+// leave a permanent high-water allocation behind; the next decode re-grows from the 256 KiB
+// baseline. This mirrors assembledBufMaxPooledCap (NOTE-208). The cap is comfortably above
+// the warm-path column-decode working set (a 256 KiB seed already covers typical columns),
+// so the common case still recycles its buffer with no churn.
+const decompBufMaxPooledCap = 8 << 20 // 8 MiB
+
+// putDecompBuf returns a snappy-decode scratch buffer to decompBufPool, dropping any buffer
+// grown beyond decompBufMaxPooledCap (NOTE-346) so an outsized one-off decode cannot pin a
+// large backing array in the pool indefinitely. ptr must be non-nil.
+func putDecompBuf(ptr *[]byte) {
+	if cap(*ptr) > decompBufMaxPooledCap {
+		return // drop oversized buffer: let it GC rather than pin RSS in the pool
+	}
+	decompBufPool.Put(ptr)
+}
+
 // NOTE-153: lazyColumnStore (NOTE-002) is a per-block []Column arena sized to the column count,
 // allocated fresh on every WantOnly parse. A 2026-06-09 querier alloc_space profile showed this
 // single make([]Column, 0, len(metas)) as the largest allocator (~21% / 29 GB) on the metrics
@@ -316,7 +342,7 @@ func parseBlockColumnsReuse(
 	decompBuf := (*decompBufPtr)[:0]
 	defer func() {
 		*decompBufPtr = decompBuf[:0]
-		decompBufPool.Put(decompBufPtr)
+		putDecompBuf(decompBufPtr)
 	}()
 	hdr, err := parseBlockHeader(rawBytes)
 	if err != nil {

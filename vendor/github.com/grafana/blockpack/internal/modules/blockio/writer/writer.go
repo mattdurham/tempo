@@ -931,9 +931,9 @@ func (w *Writer) AddRow(block *reader.Block, rowIdx int) error {
 // per-block intrinsic index cache.
 
 // AddRowFromReader adds one row from the source block at rowIdx, reading required
-// identity fields (trace:id, span:id, span:start) from the source reader's intrinsic
-// section when block columns are absent (new storage format where intrinsic columns
-// live exclusively in the intrinsic section, not block columns).
+// identity fields (trace:id, span:id, span:start) from the source block columns when
+// present and falling back to the source reader's intrinsic section only for blocks that
+// lack those columns.
 // Uses a per-Writer cache to build the intrinsic index once per (reader, blockIdx) pair,
 // reducing the trace:id and svcName lookups from O(N) per row to O(1).
 func (w *Writer) AddRowFromReader(block *reader.Block, rowIdx int, srcReader *reader.Reader, srcBlockIdx int) error {

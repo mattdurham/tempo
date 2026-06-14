@@ -5,6 +5,36 @@ This document captures the non-obvious design decisions, rationale, and invarian
 
 ---
 
+## NOTE-348: share the POPCNT rank index between time-bucket scatter and group-by scan
+
+The compact N=1 count/rate group-by path (`streamCountRateN1Compact`, the M4/M6 `rate() by (…)`
+hot path) built the SAME `pkBitset` + POPCNT `rankPrefix` index TWICE from the identical `pkSet`:
+
+  1. `fillPKSetAndTimeBuckets` → `scatterTimeBucketsByRank` built it to scatter each ref's time
+     bucket into its rank slot, then freed both pooled slices.
+  2. `streamCountRateN1CompactCore` → `scanGroupByColCompact` rebuilt the byte-identical index
+     (NOTE-135/140) from the same `pkSet` to scan the group-by column by rank.
+
+Both are pure functions of `(pkSet, maxPK)`. At `maxPK ≈ 16M` each build is two ~1 MB pool
+allocations plus an `O(maxPK/64)` bitset clear and an `O(maxPK/64)` popcount-prefix pass — paid
+twice per block on the dominant 24h `rate() by (resource.service.name)` query.
+
+The fix factors the index into a `pkRankIndex{minPK, maxPK, bitset, rankPrefix}` value built once
+by `buildPKRankIndex`. `fillPKSetAndTimeBuckets` now returns the index it built for the scatter;
+`streamCountRateN1Compact` holds it (deferring `release()`) and threads it through
+`streamCountRateN1CompactCore` into `scanGroupByColCompact`, which reuses it instead of
+rebuilding. When the index is `nil` (the general-agg path, the predicate-filtered
+`…FromRefs` paths, and the parallel-groupby test) `scanGroupByColCompact` builds a local index and
+frees it — byte-identical to the pre-NOTE-348 behaviour. The reused index is provably identical to
+the rebuilt one because both derive from the same `pkSet`/`maxPK`; `minPK` is now computed inside
+`buildPKRankIndex` (was a separate min-scan in the scan), so the bounds skip is unchanged.
+
+Correctness: the rank a ref receives is its position in the bitset, order-independent (NOTE-223),
+so reusing vs. rebuilding the index yields the same `dictIdxByPos`. Lifetime: the shared index
+outlives both the scatter and the scan and is released exactly once by the owning caller.
+
+---
+
 ## NOTE-249: early-break the count/rate entryGIdx build — first pass becomes O(dict entries)
 
 `accumulateIntrinsicBucketsDirect` builds a per-dict-entry first pass that, for every

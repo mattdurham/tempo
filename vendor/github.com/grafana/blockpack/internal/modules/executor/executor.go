@@ -89,16 +89,15 @@ func SpanMatchFromRow(row MatchedRow, signalType uint8, r *modules_reader.Reader
 	// Block-scan path: try to read from decoded Block columns first.
 	// PATTERN: block-column-first with intrinsic-section fallback (shared across
 	// compaction/compaction.go, writer/writer.go, executor.go, executor/metrics_trace.go).
-	// v3 files store identity columns in block payloads; v4 files store them exclusively
-	// in the intrinsic section. Try the block column first for backwards compat.
-	// For trace signals, trace:id and span:id are no longer present in block columns
-	// (intrinsic separation). Fall back to intrinsic section via r when missing.
+	// Current files store trace:id and span:id BOTH as per-row block columns and in the
+	// intrinsic section; read the block column first (no extra I/O — the block is decoded
+	// already) and fall back to the intrinsic section only when a block lacks the column.
 	if col := row.Block.GetColumn(traceIDCol); col != nil {
 		if v, ok := col.BytesValue(row.RowIdx); ok && len(v) == 16 {
 			copy(m.TraceID[:], v)
 		}
 	} else if r != nil && signalType != modules_shared.SignalTypeLog {
-		// Trace identity columns are intrinsic-only; look up via reader.
+		// Block lacks the identity column: look it up via the intrinsic section.
 		spanRef := modules_shared.BlockRef{
 			BlockIdx: uint16(row.BlockIdx), //nolint:gosec
 			RowIdx:   uint16(row.RowIdx),   //nolint:gosec

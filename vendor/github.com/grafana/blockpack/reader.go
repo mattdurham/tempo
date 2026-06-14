@@ -369,87 +369,26 @@ func GetTraceByID(r *Reader, traceIDHex string) (results []SpanMatch, err error)
 		return nil, nil
 	}
 	blockIDs := make([]int, len(entries))
-	// matchingBlockSet is built here and reused below to filter intrinsic column scans.
-	// This prevents O(all-blocks) intrinsic column traversal when the trace exists in
-	// only a small fraction of blocks.
-	matchingBlockSet := make(map[int]bool, len(entries))
 	for i, e := range entries {
 		blockIDs[i] = e.BlockID
-		matchingBlockSet[e.BlockID] = true
-	}
-	// NOTE-290: the block-blob fetch (CoalescedGroups → ReadGroup) and the intrinsic
-	// trace:id column load (EnsureIntrinsicTOC → GetIntrinsicColumn) are fully
-	// independent — neither result feeds the other. Run them concurrently so the
-	// per-trace cost is one I/O round-trip (max of the two) instead of two serial
-	// round-trips. On warm cache this saves a memcache RTT; on cold cache an S3 RTT.
-	//
-	// Concurrency safety: the two goroutines touch disjoint Reader state. ReadGroup
-	// reads/writes only the concurrency-safe tieredcache and the provider (whose ReadAt
-	// is already exercised concurrently by block scans). GetIntrinsicColumn guards its
-	// per-Reader decoded-column cache with r.intrinsicMu. Neither path mutates the
-	// intrinsicIndex TOC map here (EnsureIntrinsicTOC is a no-op for V8 files and
-	// IntrinsicColumnMeta is not called on this path).
-	var rawMap map[int][]byte
-	var intrinsicTraceCol *modules_shared.IntrinsicColumn
-	var g errgroup.Group
-
-	g.Go(func() error {
-		fetched := make(map[int][]byte, len(entries))
-		for _, group := range r.CoalescedGroups(blockIDs) {
-			groupRaw, fetchErr := r.ReadGroup(group)
-			if fetchErr != nil {
-				return fmt.Errorf("GetTraceByID: read group: %w", fetchErr)
-			}
-			for bi, raw := range groupRaw {
-				fetched[bi] = raw
-			}
-		}
-		rawMap = fetched
-		return nil
-	})
-
-	g.Go(func() error {
-		// Ensure the intrinsic TOC is loaded — lean readers skip this at open time.
-		// Required because trace:id is now stored exclusively in the intrinsic section.
-		if tocErr := r.EnsureIntrinsicTOC(); tocErr != nil {
-			return fmt.Errorf("GetTraceByID: load intrinsic TOC: %w", tocErr)
-		}
-		// Build intrinsic trace:id lookup to find (blockID, rowIdx) pairs.
-		// After dual-storage removal, trace:id is only in the intrinsic section.
-		col, traceColErr := r.GetIntrinsicColumn("trace:id")
-		if traceColErr != nil {
-			return fmt.Errorf("GetTraceByID: load intrinsic trace:id: %w", traceColErr)
-		}
-		intrinsicTraceCol = col
-		return nil
-	})
-
-	if waitErr := g.Wait(); waitErr != nil {
-		return nil, waitErr
 	}
 
-	// rowsByBlock maps blockID → []rowIdx for rows matching traceID.
-	// Only entries in matchingBlockSet are considered, scoping the scan to relevant blocks.
-	rowsByBlock := make(map[int][]int)
-	if intrinsicTraceCol != nil {
-		for i, ref := range intrinsicTraceCol.BlockRefs {
-			if !matchingBlockSet[int(ref.BlockIdx)] {
-				continue // skip blocks that don't contain this trace
-			}
-			if i < len(intrinsicTraceCol.BytesValues) && bytes.Equal(intrinsicTraceCol.BytesValues[i], traceID[:]) {
-				rowsByBlock[int(ref.BlockIdx)] = append(rowsByBlock[int(ref.BlockIdx)], int(ref.RowIdx))
-			}
+	// NOTE-293 (Lever B): resolve matching rows and span IDs from the block payloads that are
+	// fetched (and decoded with WantAll) anyway. Each block carries per-row trace:id and
+	// span:id columns, so the whole-file intrinsic trace:id and span:id columns — whose size
+	// scales with the file's total span count, not the looked-up trace — no longer need to be
+	// read on this path. The intrinsic columns are loaded only as a lazy fallback for blocks
+	// whose payload lacks these columns (e.g. files written without per-block identity).
+	rawMap := make(map[int][]byte, len(entries))
+	for _, group := range r.CoalescedGroups(blockIDs) {
+		groupRaw, fetchErr := r.ReadGroup(group)
+		if fetchErr != nil {
+			return nil, fmt.Errorf("GetTraceByID: read group: %w", fetchErr)
+		}
+		for bi, raw := range groupRaw {
+			rawMap[bi] = raw
 		}
 	}
-
-	// Fall back to scanning trace:id block columns for legacy files that still have them.
-	// This handles files written before the dual-storage removal.
-	useLegacyScan := len(rowsByBlock) == 0 && intrinsicTraceCol == nil
-
-	// Pre-build intrinsic span:id map, scoped to rows in rowsByBlock.
-	// Using the filtered variant avoids scanning span:id entries for all blocks
-	// when only a small subset of blocks match the trace.
-	spanIDByRef := buildIntrinsicBytesMapForRows(r, "span:id", rowsByBlock)
 
 	// NOTE-291: parse each matching span-block concurrently (see parseMatchingBlocks).
 	parsedBlocks, parseErr := parseMatchingBlocks(r, entries, rawMap)
@@ -457,27 +396,45 @@ func GetTraceByID(r *Reader, traceIDHex string) (results []SpanMatch, err error)
 		return nil, parseErr
 	}
 
+	// rowsByBlock maps blockID → matching rowIdxs, populated from each block's own trace:id
+	// column. Blocks lacking that column are recorded for the intrinsic fallback below.
+	rowsByBlock := make(map[int][]int, len(entries))
+	var blocksNeedingIntrinsic map[int]bool
+	for i, entry := range entries {
+		traceIDCol := parsedBlocks[i].Block.GetColumn("trace:id")
+		if traceIDCol == nil {
+			if blocksNeedingIntrinsic == nil {
+				blocksNeedingIntrinsic = make(map[int]bool, len(entries))
+			}
+			blocksNeedingIntrinsic[entry.BlockID] = true
+			continue
+		}
+		for rowIdx := range parsedBlocks[i].Block.SpanCount() {
+			if v, ok := traceIDCol.BytesValue(rowIdx); ok && bytes.Equal(v, traceID[:]) {
+				rowsByBlock[entry.BlockID] = append(rowsByBlock[entry.BlockID], rowIdx)
+			}
+		}
+	}
+
+	// Lazy fallback: only files whose blocks lack a trace:id column pay the whole-file
+	// intrinsic reads. For current files (per-block identity present) this is never taken.
+	var spanIDByRef map[uint32][]byte
+	if len(blocksNeedingIntrinsic) > 0 {
+		fallbackRows, fbErr := intrinsicFallbackRows(r, traceID, blocksNeedingIntrinsic)
+		if fbErr != nil {
+			return nil, fbErr
+		}
+		for bid, rows := range fallbackRows {
+			rowsByBlock[bid] = append(rowsByBlock[bid], rows...)
+		}
+		// span:id for fallback blocks also comes from the intrinsic section.
+		spanIDByRef = buildIntrinsicBytesMapForRows(r, "span:id", fallbackRows)
+	}
+
+	traceIDStr := hex.EncodeToString(traceID[:])
 	for i, entry := range entries {
 		bwb := parsedBlocks[i]
-
-		var matchingRows []int
-		if useLegacyScan {
-			// Legacy path: scan trace:id block column for matching rows.
-			traceIDCol := bwb.Block.GetColumn("trace:id")
-			if traceIDCol == nil {
-				continue
-			}
-			for rowIdx := range bwb.Block.SpanCount() {
-				v, ok2 := traceIDCol.BytesValue(rowIdx)
-				if ok2 && bytes.Equal(v, traceID[:]) {
-					matchingRows = append(matchingRows, rowIdx)
-				}
-			}
-		} else {
-			matchingRows = rowsByBlock[entry.BlockID]
-		}
-
-		for _, rowIdx := range matchingRows {
+		for _, rowIdx := range rowsByBlock[entry.BlockID] {
 			fields := modules_blockio.NewSpanFieldsAdapterWithReader(
 				bwb.Block,
 				r,
@@ -485,14 +442,17 @@ func GetTraceByID(r *Reader, traceIDHex string) (results []SpanMatch, err error)
 				rowIdx,
 				nil,
 			)
-			// trace:id is known; extract span:id via intrinsic fallback map.
-			traceIDStr := hex.EncodeToString(traceID[:])
+			// span:id comes from the block column; fall back to the intrinsic map only for
+			// blocks resolved via the intrinsic fallback above.
 			spanIDStr := ""
-			key := uint32(entry.BlockID)<<16 | uint32(rowIdx) //nolint:gosec // bounded values
-			if v, ok2 := spanIDByRef[key]; ok2 {
-				spanIDStr = hex.EncodeToString(v)
-			} else if col := bwb.Block.GetColumn("span:id"); col != nil {
-				if v, ok2 := col.BytesValue(rowIdx); ok2 {
+			if col := bwb.Block.GetColumn("span:id"); col != nil {
+				if v, ok := col.BytesValue(rowIdx); ok {
+					spanIDStr = hex.EncodeToString(v)
+				}
+			}
+			if spanIDStr == "" && spanIDByRef != nil {
+				key := uint32(entry.BlockID)<<16 | uint32(rowIdx) //nolint:gosec // bounded values
+				if v, ok := spanIDByRef[key]; ok {
 					spanIDStr = hex.EncodeToString(v)
 				}
 			}
@@ -507,6 +467,32 @@ func GetTraceByID(r *Reader, traceIDHex string) (results []SpanMatch, err error)
 	}
 
 	return results, nil
+}
+
+// intrinsicFallbackRows loads the whole-file intrinsic trace:id column and returns the rows
+// matching traceID, scoped to wantBlocks. It is the NOTE-293 fallback for blocks whose payload
+// lacks a per-block trace:id column; current files never reach it.
+func intrinsicFallbackRows(r *Reader, traceID [16]byte, wantBlocks map[int]bool) (map[int][]int, error) {
+	if tocErr := r.EnsureIntrinsicTOC(); tocErr != nil {
+		return nil, fmt.Errorf("GetTraceByID: load intrinsic TOC: %w", tocErr)
+	}
+	col, traceColErr := r.GetIntrinsicColumn("trace:id")
+	if traceColErr != nil {
+		return nil, fmt.Errorf("GetTraceByID: load intrinsic trace:id: %w", traceColErr)
+	}
+	rows := make(map[int][]int)
+	if col == nil {
+		return rows, nil
+	}
+	for i, ref := range col.BlockRefs {
+		if !wantBlocks[int(ref.BlockIdx)] {
+			continue
+		}
+		if i < len(col.BytesValues) && bytes.Equal(col.BytesValues[i], traceID[:]) {
+			rows[int(ref.BlockIdx)] = append(rows[int(ref.BlockIdx)], int(ref.RowIdx))
+		}
+	}
+	return rows, nil
 }
 
 // parseMatchingBlocks decodes each matching span-block concurrently (NOTE-291). Each

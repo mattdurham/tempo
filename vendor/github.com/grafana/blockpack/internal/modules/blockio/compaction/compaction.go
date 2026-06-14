@@ -206,8 +206,8 @@ func (s *compactionState) processBlock(r *modules_reader.Reader, blockIdx int, b
 }
 
 // dedupeKey builds a 24-byte deduplication key from trace:id (16 bytes) and span:id (8 bytes).
-// Falls back to the pre-built idIndex (O(1) lookup) when block columns are absent (new storage
-// format where intrinsic columns live exclusively in the intrinsic section).
+// Falls back to the pre-built idIndex (O(1) lookup) only when a block lacks the trace:id/span:id
+// columns; current files carry both per-block identity columns and the intrinsic section.
 // idIndex is built once per block by buildDedupeIndex; pass nil to disable intrinsic fallback.
 // Returns the key and true if both IDs are present and non-empty; false otherwise.
 func dedupeKey(block *modules_reader.Block, rowIdx int, idIndex map[uint16]blockIDPair) ([24]byte, bool) {

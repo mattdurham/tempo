@@ -668,52 +668,54 @@ func scanGroupByColCompact(
 	dict *[]string,
 	valToIdx map[string]uint32,
 	dictIdxByPos []uint32,
+	rankIdx *pkRankIndex, // NOTE-348: prebuilt rank index over sortedPKs (nil = build internally)
 ) {
 	if len(sortedPKs) == 0 {
 		return
 	}
-	// NOTE-223: this function only uses the in-range packKeys as a membership SET plus a
-	// POPCNT rank index — the position assigned to each ref is its rank in the bitset, which
-	// is order-independent. So the input slice need NOT be sorted; min/max are derived by an
-	// O(N) scan rather than reading [0]/[len-1]. This lets streamCountRateN1Compact drop its
-	// O(N) radixSortByPackKey pass (~7% querier self-time on M4) — the sort produced a sorted
-	// array used solely to feed this set. Callers that already pass a sorted slice (the
-	// merge-join paths) are unaffected: a scan over a sorted slice yields the same min/max.
-	minPK, maxPK := sortedPKs[0], sortedPKs[0]
-	for _, pk := range sortedPKs {
-		if pk < minPK {
-			minPK = pk
-		}
-		if pk > maxPK {
-			maxPK = pk
-		}
-	}
 
-	// NOTE-135/140: build pkBitset + POPCNT rank index from the in-range packKeys (shared
-	// read-only). Dict refs are not packKey-sorted; ~50% fail the pre-filter at 50% selectivity.
-	// NOTE-140: rankPrefix[i] = cumulative popcount of pkBitset[0..i-1], enabling O(1) rank
-	// lookup to replace searchSortedUint32 in both Dict and Flat/DeltaUint64 inner loops.
-	n := int((maxPK >> 6) + 1) //nolint:gosec
-	pkBitset := acquireCompactUint64(n)
-	defer releaseCompactUint64(pkBitset)
-	clear(pkBitset) // NOTE-135: zero-sentinel — must clear stale pool bits before setting
-	for _, pk := range sortedPKs {
-		pkBitset[pk>>6] |= uint64(1) << (pk & 63)
+	// NOTE-348: reuse the caller's prebuilt POPCNT rank index when supplied. The count/rate
+	// group-by path (streamCountRateN1Compact) already builds the identical bitset+rankPrefix
+	// from this same pkSet to scatter time buckets by rank; rebuilding it here (the O(maxPK/64)
+	// bitset clear + popcount-prefix passes plus the two ~1 MB pool allocations at maxPK≈16M) is
+	// pure duplicate work on the M4/M6 hot path. When nil (the agg/histogram and predicate-
+	// filtered FromRefs callers) we build a local index and free it, preserving prior behavior.
+	var (
+		minPK, maxPK uint32
+		pkBitset     []uint64
+		rankPrefix   []uint32
+		localIdx     pkRankIndex
+		ownsIdx      bool
+	)
+	if rankIdx != nil {
+		minPK, maxPK = rankIdx.minPK, rankIdx.maxPK
+		pkBitset, rankPrefix = rankIdx.bitset, rankIdx.rankPrefix
+	} else {
+		// NOTE-223: this function only uses the in-range packKeys as a membership SET plus a
+		// POPCNT rank index — the position assigned to each ref is its rank in the bitset, which
+		// is order-independent. So the input slice need NOT be sorted; min/max are derived by an
+		// O(N) scan rather than reading [0]/[len-1]. Callers that already pass a sorted slice (the
+		// merge-join paths) are unaffected: a scan over a sorted slice yields the same min/max.
+		//
+		// NOTE-135/140: build pkBitset + POPCNT rank index from the in-range packKeys (shared
+		// read-only). Dict refs are not packKey-sorted; ~50% fail the pre-filter at 50%
+		// selectivity. rankPrefix[i] = cumulative popcount of pkBitset[0..i-1], enabling O(1)
+		// rank lookup to replace searchSortedUint32 in both Dict and Flat/DeltaUint64 inner
+		// loops. Build cost: O(maxPK/64) ≈ 250K iterations at maxPK=16M → ~0.5µs.
+		maxPKLocal := sortedPKs[0]
+		for _, pk := range sortedPKs {
+			if pk > maxPKLocal {
+				maxPKLocal = pk
+			}
+		}
+		localIdx = buildPKRankIndex(sortedPKs, maxPKLocal)
+		ownsIdx = true
+		minPK, maxPK = localIdx.minPK, localIdx.maxPK
+		pkBitset, rankPrefix = localIdx.bitset, localIdx.rankPrefix
 	}
-	// NOTE-140: POPCNT rank index. Build cost: O(maxPK/64) ≈ 250K iterations at maxPK=16M → ~0.5µs.
-	// NOTE-195: rankPrefix is fully overwritten before any read — the loop writes
-	// rankPrefix[0:len(pkBitset)] (== [0:n)) and the trailing assignment writes
-	// rankPrefix[len(pkBitset)] (== [n]), covering all n+1 elements. The clear() inside
-	// acquireCompactUint32 is therefore pure waste here (~1 MB zeroed per call at maxPK=16M,
-	// on the M4/M6/M9 group-by scan path), so use the NoClear variant.
-	rankPrefix := acquireCompactUint32NoClear(n + 1)
-	defer releaseCompactUint32(rankPrefix)
-	var cum uint32
-	for i, w := range pkBitset {
-		rankPrefix[i] = cum
-		cum += uint32(bits.OnesCount64(w)) //nolint:gosec
+	if ownsIdx {
+		defer localIdx.release()
 	}
-	rankPrefix[len(pkBitset)] = cum
 
 	// NOTE-148: parallelize the Dict per-ref inner loop — the bulk of the scan cost — across
 	// min(NumCPU, histParallelWorkers) workers. The M4/M6/M9/M10 rate-by-group queries group by
@@ -1398,13 +1400,15 @@ func prewarmBoundaries(
 // NOTE-108: companion to streamHistogramN1Compact for count/rate queries.
 // fillPKSetAndTimeBuckets builds the unsorted in-range packKey set and the rank-indexed
 // timeBucketByPos array used by the compact N=1 group-by paths (NOTE-223/224). It fills pkSet[i]
-// with the packKey of tsCol.BlockRefs[lo+i], then builds a pkBitset + POPCNT rankPrefix over those
-// keys and scatters each ref's time bucket to its rank slot. The rank a ref receives equals its
-// sorted position (in-range span packKeys are distinct), so no radix sort is needed: the downstream
-// scans (scanGroupByColCompact, scanAggColCompact) rebuild the same rank index internally from
-// pkSet, and the position they assign each ref matches the rank used to write timeBucketByPos here.
-// pkSet and timeBucketByPos must each be length n == hi-lo; timeBucketByPos must be zero-cleared
-// (0 = out of range, 1..numSteps = bucket+1, NOTE-116).
+// with the packKey of tsCol.BlockRefs[lo+i], builds a pkBitset + POPCNT rankPrefix over those keys
+// (the returned pkRankIndex), and scatters each ref's time bucket to its rank slot. The rank a ref
+// receives equals its sorted position (in-range span packKeys are distinct), so no radix sort is
+// needed. pkSet and timeBucketByPos must each be length n == hi-lo; timeBucketByPos must be
+// zero-cleared (0 = out of range, 1..numSteps = bucket+1, NOTE-116).
+//
+// NOTE-348: the returned index is REUSED by the downstream group-by scan (scanGroupByColCompact)
+// instead of being rebuilt from the same pkSet; the caller MUST call idx.release() once that scan
+// has finished. Callers that do not thread the index downstream must release it immediately.
 func fillPKSetAndTimeBuckets(
 	tsCol *modules_shared.IntrinsicColumn,
 	lo, hi int,
@@ -1412,7 +1416,7 @@ func fillPKSetAndTimeBuckets(
 	numSteps int64,
 	pkSet []uint32,
 	timeBucketByPos []int32,
-) {
+) pkRankIndex {
 	inRefs := tsCol.BlockRefs[lo:hi]
 	maxPK := uint32(0)
 	for i, ref := range inRefs {
@@ -1422,7 +1426,9 @@ func fillPKSetAndTimeBuckets(
 			maxPK = pk
 		}
 	}
-	scatterTimeBucketsByRank(pkSet, maxPK, tsCol.Uint64Values[lo:hi], tb, numSteps, timeBucketByPos)
+	idx := buildPKRankIndex(pkSet, maxPK)
+	scatterTimeBucketsByRank(pkSet, maxPK, tsCol.Uint64Values[lo:hi], tb, numSteps, timeBucketByPos, &idx)
+	return idx
 }
 
 // fillPKSetAndTimeBucketsFromRefs is the explicit-slice companion to fillPKSetAndTimeBuckets,
@@ -1449,7 +1455,7 @@ func fillPKSetAndTimeBucketsFromRefs(
 			maxPK = pk
 		}
 	}
-	scatterTimeBucketsByRank(pkSet, maxPK, vals, tb, numSteps, timeBucketByPos)
+	scatterTimeBucketsByRank(pkSet, maxPK, vals, tb, numSteps, timeBucketByPos, nil)
 }
 
 // fillPKSetAndTimeBucketsFromPreSortedRefs is the pre-sorted-slice companion to
@@ -1479,14 +1485,61 @@ func fillPKSetAndTimeBucketsFromPreSortedRefs(
 	}
 }
 
-// scatterTimeBucketsByRank builds a pkBitset membership set + POPCNT rank index over the
-// already-populated pkSet (length n, distinct in-range packKeys, maxPK is their maximum), then
-// scatters each ref's time bucket into its rank slot of timeBucketByPos. The rank a ref receives
-// equals its sorted position (distinct keys), so no radix sort is needed: downstream scans
-// (scanGroupByColCompact, scanAggColCompact, scanAggColHistogramCompact) rebuild the same rank
-// index from pkSet and assign each ref the same position. Refs are distinct packKeys, so rank is
-// a bijection onto [0, n) — every timeBucketByPos slot is written exactly once. vals[i] is the
-// timestamp of the ref whose packKey is pkSet[i]. NOTE-135/140/223/225.
+// pkRankIndex is a prebuilt POPCNT rank index over a set of distinct packKeys (NOTE-135/140):
+// bitset[w] marks which packKeys are present, and rankPrefix[w] is the cumulative popcount of
+// bitset[0..w-1], so a packKey's rank (its position in sorted order) is
+// rankPrefix[pk>>6] + popcount(bitset[pk>>6] & ((1<<(pk&63))-1)) in O(1). minPK/maxPK bound the
+// set. Both slices are pooled and MUST be returned via release() once no longer read.
+type pkRankIndex struct {
+	bitset       []uint64
+	rankPrefix   []uint32
+	minPK, maxPK uint32
+}
+
+// buildPKRankIndex constructs the pkBitset + POPCNT rank index over pkSet (distinct packKeys,
+// maxPK is their maximum). The slices are drawn from the compact pools and held on the returned
+// index; the caller MUST call release() when done. NOTE-348.
+func buildPKRankIndex(pkSet []uint32, maxPK uint32) pkRankIndex {
+	nWords := int((maxPK >> 6) + 1) //nolint:gosec
+	bitset := acquireCompactUint64(nWords)
+	clear(bitset)
+	minPK := maxPK
+	for _, pk := range pkSet {
+		bitset[pk>>6] |= uint64(1) << (pk & 63)
+		if pk < minPK {
+			minPK = pk
+		}
+	}
+	rankPrefix := acquireCompactUint32NoClear(nWords + 1)
+	var cum uint32
+	for i, w := range bitset {
+		rankPrefix[i] = cum
+		cum += uint32(bits.OnesCount64(w)) //nolint:gosec
+	}
+	rankPrefix[len(bitset)] = cum
+	return pkRankIndex{minPK: minPK, maxPK: maxPK, bitset: bitset, rankPrefix: rankPrefix}
+}
+
+// rankOf returns the O(1) rank (sorted position) of pk within the indexed set. pk must be a
+// member (its bit is set); callers gate non-members out via the bitset before calling.
+func (idx *pkRankIndex) rankOf(pk uint32) int {
+	word := pk >> 6
+	bit := pk & 63
+	return int(idx.rankPrefix[word] + uint32(bits.OnesCount64(idx.bitset[word]&((uint64(1)<<bit)-1)))) //nolint:gosec
+}
+
+func (idx *pkRankIndex) release() {
+	releaseCompactUint32(idx.rankPrefix)
+	releaseCompactUint64(idx.bitset)
+	idx.rankPrefix = nil
+	idx.bitset = nil
+}
+
+// scatterTimeBucketsByRank builds (or reuses) the POPCNT rank index over pkSet and scatters each
+// ref's time bucket into its rank slot of timeBucketByPos. When idx is non-nil the prebuilt index
+// is reused (NOTE-348: avoids rebuilding the identical bitset+rankPrefix that scanGroupByColCompact
+// would otherwise reconstruct from the same pkSet on the M4/M6 count/rate group-by path); when nil
+// the index is built and freed internally, preserving the original behavior.
 func scatterTimeBucketsByRank(
 	pkSet []uint32,
 	maxPK uint32,
@@ -1494,32 +1547,26 @@ func scatterTimeBucketsByRank(
 	tb *vm.TimeBucketSpec,
 	numSteps int64,
 	timeBucketByPos []int32,
+	idx *pkRankIndex,
 ) {
-	nWords := int((maxPK >> 6) + 1) //nolint:gosec
-	pkBitset := acquireCompactUint64(nWords)
-	clear(pkBitset)
-	for _, pk := range pkSet {
-		pkBitset[pk>>6] |= uint64(1) << (pk & 63)
+	local := idx == nil
+	var ix pkRankIndex
+	if local {
+		ix = buildPKRankIndex(pkSet, maxPK)
+	} else {
+		ix = *idx
 	}
-	rankPrefix := acquireCompactUint32NoClear(nWords + 1)
-	var cum uint32
-	for i, w := range pkBitset {
-		rankPrefix[i] = cum
-		cum += uint32(bits.OnesCount64(w)) //nolint:gosec
-	}
-	rankPrefix[len(pkBitset)] = cum
 
 	for i, pk := range pkSet {
-		word := pk >> 6
-		bit := pk & 63
-		pos := int(rankPrefix[word] + uint32(bits.OnesCount64(pkBitset[word]&((uint64(1)<<bit)-1)))) //nolint:gosec
-		bk := timeBucketIndex(int64(vals[i]), tb.StartTime, tb.StepSizeNanos)                        //nolint:gosec
+		pos := ix.rankOf(pk)
+		bk := timeBucketIndex(int64(vals[i]), tb.StartTime, tb.StepSizeNanos) //nolint:gosec
 		if bk >= 0 && bk < numSteps {
 			timeBucketByPos[pos] = int32(bk + 1) //nolint:gosec
 		}
 	}
-	releaseCompactUint32(rankPrefix)
-	releaseCompactUint64(pkBitset)
+	if local {
+		ix.release()
+	}
 }
 
 func streamCountRateN1Compact(
@@ -1555,7 +1602,8 @@ func streamCountRateN1Compact(
 	timeBucketByPos := acquireCompactInt32(n) // 0 = out of range; 1..numSteps = bucket+1 (NOTE-116)
 	defer releaseCompactInt32(timeBucketByPos)
 
-	fillPKSetAndTimeBuckets(tsCol, lo, hi, &tb, numSteps, pkSet, timeBucketByPos)
+	idx := fillPKSetAndTimeBuckets(tsCol, lo, hi, &tb, numSteps, pkSet, timeBucketByPos)
+	defer idx.release()
 
 	return streamCountRateN1CompactCore(
 		ctx,
@@ -1568,6 +1616,7 @@ func streamCountRateN1Compact(
 		seriesSink,
 		agg.Function == vm.FuncNameRATE,
 		float64(tb.StepSizeNanos)/1e9,
+		&idx,
 	)
 }
 
@@ -1620,6 +1669,7 @@ func streamCountRateN1CompactFromRefs(
 		seriesSink,
 		agg.Function == vm.FuncNameRATE,
 		float64(tb.StepSizeNanos)/1e9,
+		nil,
 	)
 }
 
@@ -1639,6 +1689,7 @@ func streamCountRateN1CompactCore(
 	seriesSink *[]TraceTimeSeries, // NOTE-247
 	isRate bool,
 	stepSec float64,
+	rankIdx *pkRankIndex, // NOTE-348: prebuilt POPCNT rank index over sortedPKs (nil = build inside the scan)
 ) error {
 	n := len(sortedPKs)
 
@@ -1656,7 +1707,7 @@ func streamCountRateN1CompactCore(
 	defer releaseCompactUint32(dictIdxByPos)
 	if groupByCol != nil {
 		valToIdx := make(map[string]uint32, 32)
-		scanGroupByColCompact(groupByCol, groupByColName, sortedPKs, &dict, valToIdx, dictIdxByPos)
+		scanGroupByColCompact(groupByCol, groupByColName, sortedPKs, &dict, valToIdx, dictIdxByPos, rankIdx)
 	}
 	numGroups := int64(len(dict)) //nolint:gosec
 
@@ -1776,7 +1827,8 @@ func streamAggN1Compact(
 	timeBucketByPos := acquireCompactInt32(n) // 0 = out of range; 1..numSteps = bucket+1 (NOTE-116)
 	defer releaseCompactInt32(timeBucketByPos)
 
-	fillPKSetAndTimeBuckets(tsCol, lo, hi, &tb, numSteps, pkSet, timeBucketByPos)
+	idx := fillPKSetAndTimeBuckets(tsCol, lo, hi, &tb, numSteps, pkSet, timeBucketByPos)
+	idx.release() // NOTE-348: the general-agg core rebuilds its own rank index, so return the pooled buffers now.
 
 	return streamAggN1CompactCore(ctx, r, pkSet, timeBucketByPos, agg, numSteps, buckets)
 }
@@ -1812,7 +1864,7 @@ func streamAggN1CompactCore(
 	defer releaseCompactUint32(dictIdxByPos)
 	if groupByCol != nil {
 		valToIdx := make(map[string]uint32, 32)
-		scanGroupByColCompact(groupByCol, agg.GroupBy[0], sortedPKs, &dict, valToIdx, dictIdxByPos)
+		scanGroupByColCompact(groupByCol, agg.GroupBy[0], sortedPKs, &dict, valToIdx, dictIdxByPos, nil)
 	}
 	numGroups := len(dict)
 
@@ -2167,7 +2219,7 @@ func streamHistogramN1CompactCore(
 	defer releaseCompactUint32(dictIdxByPos)
 	if groupByCol != nil {
 		valToIdx := make(map[string]uint32, 32)
-		scanGroupByColCompact(groupByCol, agg.GroupBy[0], sortedPKs, &dict, valToIdx, dictIdxByPos)
+		scanGroupByColCompact(groupByCol, agg.GroupBy[0], sortedPKs, &dict, valToIdx, dictIdxByPos, nil)
 	}
 	numGroups := len(dict)
 
