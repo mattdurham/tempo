@@ -3812,29 +3812,21 @@ func accumulateHistogramDirect(
 	groupCountsFlat := acquireGroupCountsFlat(int64(numGroups) * stride1) //nolint:gosec
 	defer releaseGroupCountsFlat(groupCountsFlat)
 
-	boundaryCache := make(map[float64]int64, 32)
-	boundaries := make([]float64, 0, int(actualStride))
-
-	getBoundaryIdx := func(v float64) int64 {
-		b := intrinsicHistogramBoundary(v, agg.Field)
-		idx, ok := boundaryCache[b]
-		if !ok {
-			if int64(len(boundaries)) >= actualStride-1 {
-				idx = actualStride // discard sentinel
-				boundaryCache[b] = idx
-				return idx
-			}
-			boundaries = append(boundaries, b)
-			idx = int64(len(boundaries))
-			boundaryCache[b] = idx
-		}
-		return idx
-	}
+	// NOTE-352: exponent-indexed boundary lookup replaces the per-(dict-entry / row)
+	// map[float64]int64 closure. boundaryIndexer.index has byte-identical first-encounter
+	// semantics to the former closure (same boundary 0 sentinel, same discard cap at
+	// actualStride-1) but resolves each value with a single math.Frexp + dense table index —
+	// no float64 hashing, no map insert/lookup. The CPU profile of the dense direct histogram
+	// path attributed ~50% to runtime.f64hash + mapaccess2/mapassign in this closure; the
+	// indexer removes that entirely. This is the same lever NOTE-182 applied to the compact
+	// path (scanAggColHistogramCompact), now extended to the no-predicate dense paths that
+	// were still on the legacy map.
+	bi := newBoundaryIndexer(agg.Field, actualStride)
 
 	seenByPK := acquireDirectBool(int(maxPK) + 1) // NOTE-129
 
 	if col != nil {
-		if err := streamByRefSliceHistogramScanDict(ctx, col, bucketByPK, dictByPK, maxPK, seenByPK, getBoundaryIdx, groupCountsFlat, stride1, stride2, actualStride); err != nil {
+		if err := streamByRefSliceHistogramScanDict(ctx, col, bucketByPK, dictByPK, maxPK, seenByPK, bi.index, groupCountsFlat, stride1, stride2, actualStride); err != nil {
 			releaseDirectBool(seenByPK)
 			return err
 		}
@@ -3858,7 +3850,7 @@ func accumulateHistogramDirect(
 
 	// NOTE-129: release seenByPK before emit — frees 16 MB before non-trivial emit work.
 	releaseDirectBool(seenByPK)
-	return emitHistogramFlat(histSink, groupCountsFlat, stride1, stride2, numGroups, dict, boundaries, agg, buckets)
+	return emitHistogramFlat(histSink, groupCountsFlat, stride1, stride2, numGroups, dict, bi.boundaries, agg, buckets)
 }
 
 // accumulateHistogramDirectN0 is the direct-path HISTOGRAM accumulator for N=0 (no group-by) queries.
@@ -3914,25 +3906,11 @@ func accumulateHistogramDirectN0(
 	groupCountsFlat := acquireGroupCountsFlat(stride1)
 	defer releaseGroupCountsFlat(groupCountsFlat)
 
-	// Step 4: build boundary cache and getBoundaryIdx closure — same pattern as accumulateHistogramDirect.
-	boundaryCache := make(map[float64]int64, 32)
-	boundaries := make([]float64, 0, 32)
-
-	getBoundaryIdx := func(v float64) int64 {
-		b := intrinsicHistogramBoundary(v, agg.Field)
-		idx, ok := boundaryCache[b]
-		if !ok {
-			if len(boundaries) >= histFlatStride {
-				idx = int64(histFlatStride)
-				boundaryCache[b] = idx
-				return idx
-			}
-			boundaries = append(boundaries, b)
-			idx = int64(len(boundaries))
-			boundaryCache[b] = idx
-		}
-		return idx
-	}
+	// Step 4: exponent-indexed boundary lookup (NOTE-352) — same pattern as accumulateHistogramDirect.
+	// The indexer's discard cap is maxStride-1; the legacy closure here discarded once
+	// len(boundaries) >= histFlatStride (i.e. boundary #histFlatStride+1 onward), so pass
+	// actualStride = histFlatStride+1 to make boundaryIndexer.record cap at the same point.
+	bi := newBoundaryIndexer(agg.Field, int64(histFlatStride)+1)
 
 	seenByPK := acquireDirectBool(int(maxPK) + 1) // NOTE-129
 
@@ -3945,7 +3923,7 @@ func accumulateHistogramDirectN0(
 		return err
 	}
 	if col != nil {
-		if err := scanHistogramN0(ctx, col, bucketByPK, maxPK, seenByPK, getBoundaryIdx, groupCountsFlat, stride2); err != nil {
+		if err := scanHistogramN0(ctx, col, bucketByPK, maxPK, seenByPK, bi.index, groupCountsFlat, stride2); err != nil {
 			releaseDirectInt16(bucketByPK)
 			releaseDirectBool(seenByPK)
 			return err
@@ -3967,7 +3945,7 @@ func accumulateHistogramDirectN0(
 	releaseDirectBool(seenByPK)
 	// Step 7: emit — single group, dict = [""], numGroups = 1.
 	dict := []string{""}
-	return emitHistogramFlat(histSink, groupCountsFlat, stride1, stride2, 1, dict, boundaries, agg, buckets)
+	return emitHistogramFlat(histSink, groupCountsFlat, stride1, stride2, 1, dict, bi.boundaries, agg, buckets)
 }
 
 // accumulateAggDirect is the direct-path general agg accumulator (SUM/AVG/MIN/MAX/STDDEV/QUANTILE)
@@ -4342,7 +4320,46 @@ const histFlatStride = 64
 // if cardinality is high, so the caller can allocate the full cap instead.
 // The return value is in [0, histFlatStride]; callers add 1 for the absent sentinel slot.
 func countIntrinsicHistogramBoundaries(col *modules_shared.IntrinsicColumn, fieldName string) int {
-	seen := make(map[float64]struct{}, 32)
+	// NOTE-352: distinct boundaries are counted by distinct binary EXPONENT rather than by
+	// inserting each pow2 boundary float into a map[float64]struct{}. Every positive value maps
+	// to the boundary 2**(exp-1) where exp == frexpExpPos(scaledValue) (the same decode the
+	// per-row boundaryIndexer uses), so distinct boundaries ⇔ distinct exponents; v<=0 maps to
+	// the single boundary-0 bucket. A dense bool table indexed by (exp-expBase) replaces the
+	// map, removing the runtime.f64hash + mapassign that a profile of the dense histogram path
+	// attributed ~26% of accumulate CPU to (this function is called once per accumulate to size
+	// groupCountsFlat). Exponent range mirrors newBoundaryIndexer's [expLo, expHi). The returned
+	// count is identical to the former map-cardinality count for every input.
+	const expLo, expHi = -1075, 1025
+	scaleByNano := fieldName == colNameSpanDuration
+	seenExp := make([]bool, expHi-expLo)
+	count := 0
+	zeroSeen := false
+	// markValue records v's boundary bucket; returns true once the histFlatStride cap is hit.
+	markValue := func(v float64) bool {
+		if v <= 0 {
+			if !zeroSeen {
+				zeroSeen = true
+				count++
+			}
+		} else {
+			if scaleByNano {
+				v /= 1e9
+				if v <= 0 {
+					if !zeroSeen {
+						zeroSeen = true
+						count++
+					}
+					return count >= histFlatStride
+				}
+			}
+			slot := frexpExpPos(v) - expLo
+			if slot >= 0 && slot < len(seenExp) && !seenExp[slot] {
+				seenExp[slot] = true
+				count++
+			}
+		}
+		return count >= histFlatStride
+	}
 	switch col.Format {
 	case modules_shared.IntrinsicFormatDict:
 		for _, entry := range col.DictEntries {
@@ -4356,39 +4373,29 @@ func countIntrinsicHistogramBoundaries(col *modules_shared.IntrinsicColumn, fiel
 			} else {
 				v = float64(entry.Int64Val)
 			}
-			seen[intrinsicHistogramBoundary(v, fieldName)] = struct{}{}
-			if len(seen) >= histFlatStride {
+			if markValue(v) {
 				return histFlatStride
 			}
 		}
 	case modules_shared.IntrinsicFormatFlat:
 		for _, u := range col.Uint64Values {
-			seen[intrinsicHistogramBoundary(float64(u), fieldName)] = struct{}{}
-			if len(seen) >= histFlatStride {
+			if markValue(float64(u)) {
 				return histFlatStride
 			}
 		}
 	case modules_shared.IntrinsicFormatDeltaUint64:
 		// NOTE-123: DeltaUint64 values are sorted ascending. intrinsicHistogramBoundary is
-		// monotonically non-decreasing, so boundary transitions are detected by comparing
-		// consecutive values — only O(numBoundaries) map insertions, not O(numValues).
-		// This avoids scanning all 7.5M values with O(n) map lookups (75ms) while still
-		// returning the accurate boundary count for proper groupCountsFlat sizing.
-		var prevBoundary float64
-		first := true
+		// monotonically non-decreasing, so boundary transitions occur only when the boundary
+		// (equivalently the exponent) changes between consecutive values — markValue's seenExp
+		// dedup naturally skips the long runs of identical exponents, so this is O(numValues)
+		// reads with O(numBoundaries) distinct marks, no per-value comparison-against-prev needed.
 		for _, u := range col.Uint64Values {
-			b := intrinsicHistogramBoundary(float64(u), fieldName)
-			if first || b != prevBoundary {
-				seen[b] = struct{}{}
-				prevBoundary = b
-				first = false
-				if len(seen) >= histFlatStride {
-					return histFlatStride
-				}
+			if markValue(float64(u)) {
+				return histFlatStride
 			}
 		}
 	}
-	return len(seen)
+	return count
 }
 
 // streamByRefSliceHistogram accumulates histogram counts for the N=1 group-by path using a
@@ -4463,36 +4470,19 @@ func streamByRefSliceHistogram(
 	groupCountsFlat := acquireGroupCountsFlat(int64(numGroups) * stride1) //nolint:gosec
 	defer releaseGroupCountsFlat(groupCountsFlat)
 
-	// Step 3: scan the aggregate column directly — memoize boundaries (~20 unique values).
-	// boundaryCache maps boundary float64 → 1-based index into boundaries slice.
-	// Discard sentinel is actualStride (= actualBoundaryCount+1), never written to the flat array.
-	boundaryCache := make(map[float64]int64, 32)
-	boundaries := make([]float64, 0, int(actualStride))
-
-	getBoundaryIdx := func(v float64) int64 {
-		b := intrinsicHistogramBoundary(v, agg.Field)
-		idx, ok := boundaryCache[b]
-		if !ok {
-			// actualStride-1 is the number of actual boundary slots (bIdx=1..actualStride-1).
-			// When the cap is reached, return actualStride as the discard sentinel.
-			if int64(len(boundaries)) >= actualStride-1 {
-				idx = actualStride // discard sentinel; scanDict will skip this
-				boundaryCache[b] = idx
-				return idx
-			}
-			boundaries = append(boundaries, b)
-			idx = int64(len(boundaries)) // 1-based; 0 is absent sentinel
-			boundaryCache[b] = idx
-		}
-		return idx
-	}
+	// Step 3: scan the aggregate column directly — boundary indexing via the exponent-keyed
+	// boundaryIndexer (NOTE-352) rather than a per-value map[float64]int64 closure. Same
+	// first-encounter semantics and discard sentinel at actualStride, but a single math.Frexp
+	// + dense table index per value, eliminating the f64hash + mapaccess/mapassign that
+	// dominated the dense histogram CPU profile.
+	bi := newBoundaryIndexer(agg.Field, actualStride)
 
 	// seenByPK: dense absent-row tracking — avoids a hash set for len(inRangeRefs) pks.
 	// Always allocate when inRangeRefs is non-empty: packKey=0 is a valid span key.
 	seenByPK := acquireDirectBool(int(maxPK) + 1) // NOTE-129
 
 	if col != nil {
-		if err := streamByRefSliceHistogramScanDict(ctx, col, bucketByPK, dictByPK, maxPK, seenByPK, getBoundaryIdx, groupCountsFlat, stride1, stride2, actualStride); err != nil {
+		if err := streamByRefSliceHistogramScanDict(ctx, col, bucketByPK, dictByPK, maxPK, seenByPK, bi.index, groupCountsFlat, stride1, stride2, actualStride); err != nil {
 			releaseDirectInt16(bucketByPK)
 			releaseDirectBool(seenByPK)
 			return err
@@ -4521,7 +4511,7 @@ func streamByRefSliceHistogram(
 	// NOTE-129: release before emit — frees 32+16 MB before non-trivial emit work.
 	releaseDirectInt16(bucketByPK)
 	releaseDirectBool(seenByPK)
-	return emitHistogramFlat(histSink, groupCountsFlat, stride1, stride2, numGroups, dict, boundaries, agg, buckets)
+	return emitHistogramFlat(histSink, groupCountsFlat, stride1, stride2, numGroups, dict, bi.boundaries, agg, buckets)
 }
 
 // scanHistogramN0 is a specialized scanner for N=0 (no group-by) histogram accumulation.

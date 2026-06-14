@@ -5,6 +5,47 @@ This document captures the non-obvious design decisions, rationale, and invarian
 
 ---
 
+## NOTE-352: exponent-keyed boundary indexing on the dense histogram paths
+
+The dense direct histogram accumulators — `accumulateHistogramDirect` (N=1 no-predicate),
+`accumulateHistogramDirectN0` (N=0 no-predicate), and `streamByRefSliceHistogram` (the
+keymap fallback) — each built a `boundaryCache map[float64]int64` and a closure that, per
+dict-entry / per-row, computed `intrinsicHistogramBoundary(v)` and hashed the resulting
+float64 boundary through the map to assign its first-encounter index. A CPU profile of the
+dense path (BenchmarkIntrinsicHistogramGroupBy_AllocCount) attributed ~50% of accumulate CPU
+to `runtime.f64hash` + `mapaccess2` + `mapassign` inside this closure, plus another ~26% to
+the same float-keyed map inside `countIntrinsicHistogramBoundaries` (called once per
+accumulate to SIZE the flat grid).
+
+NOTE-182 had already solved exactly this for the COMPACT path (`scanAggColHistogramCompact`)
+with `boundaryIndexer`: every positive value maps to the boundary `2**(exp-1)` where `exp ==
+frexpExpPos(scaledValue)`, so the binary exponent is a perfect dense integer key — a slice
+indexed by `(exp - expBase)` replaces the float hash. This change extends that indexer to the
+three dense paths that were still on the legacy map: each now constructs a `boundaryIndexer`
+and passes `bi.index` as the `getBoundaryIdx` callback, and emits with `bi.boundaries`. The
+indexer's first-encounter ordering and the `actualStride-1` discard cap are byte-identical to
+the former closure (the N0 path passes `actualStride = histFlatStride+1` so the discard
+sentinel `>= histFlatStride` still trips `scanHistogramN0`'s guard exactly as before).
+
+`countIntrinsicHistogramBoundaries` is likewise rewritten to count distinct *exponents*
+(dense `[]bool` indexed by `exp - expLo`, with a separate flag for the v<=0 boundary-0
+bucket) rather than distinct boundary floats. Distinct boundaries are in 1:1 correspondence
+with distinct exponents (boundary `= 2**(exp-1)`), so the returned count is identical to the
+former map cardinality for every input — locked by
+TestCountIntrinsicHistogramBoundaries_MatchesMapReference (vs a legacy map oracle over dict
+int64/string, flat, delta-ascending, all-zero, and cap-exceeded columns) and the
+boundary↔exponent bijection test. The DeltaUint64 branch no longer needs its
+compare-against-prev shortcut — the `seenExp` dedup naturally skips the long runs of identical
+exponents in a sorted column.
+
+Result (BenchmarkIntrinsicHistogramGroupBy_AllocCount, 50000x): ns/op ~50633 → ~23404
+(~-54%), allocs 39 → 35 (the two maps + the boundaries-slice churn removed). The profile's
+`f64hash`/`mapassign`/`f64equal` nodes vanish; the boundary work is now `frexpExpPos` (~4.6%)
++ `boundaryIndexer.index` (~7%). The compact/parallel histogram paths were already on the
+indexer (NOTE-182/210) and are unchanged.
+
+---
+
 ## NOTE-350: histogram dense-series direct emit (skip the buckets map round-trip)
 
 The intrinsic histogram path (M8: `histogram_over_time(duration) by (...)`) accumulated into a
