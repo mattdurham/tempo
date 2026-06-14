@@ -1152,6 +1152,7 @@ func decodePagedColumnRefs(blob []byte) []BlockRef {
 
 	blockW := int(toc.BlockIdxWidth)
 	rowW := int(toc.RowIdxWidth)
+	refSize := blockW + rowW
 
 	var totalRows int
 	for _, pm := range toc.Pages {
@@ -1173,8 +1174,21 @@ func decodePagedColumnRefs(blob []byte) []BlockRef {
 			return nil
 		}
 		rowCount := int(pm.RowCount)
-		refsStart, ok := pageRefsOffset(pageRaw, rowCount, toc.Format, toc.ColType)
-		if !ok {
+		// NOTE-353: locate the refs section by subtraction, not by re-scanning the value
+		// section. Every value-decoupled page (Delta/Flat/XOR) writes its refs section LAST
+		// and contiguous, exactly count*(blockW+rowW) bytes, with NO trailing bytes (see the
+		// writer's encodeDeltaUint64Intrinsic / encodeFlatPageBlob / encodeXORBytesIntrinsic:
+		// values then refs, snappy'd as a unit). So refsStart == len(pageRaw) - count*refSize.
+		// pageRefsOffset re-walked the entire value section (every delta uvarint / every
+		// length prefix) on each page solely to arrive at this same offset — that re-scan was
+		// the dominant cost of the deferred-ref decode (~5.7s querier self-time, profile
+		// 2026-06-14, the #2 blockpack frame), and it duplicated work the eager value decode
+		// already performed. The refs section length is invariant of the value encoding, so
+		// the offset is computable in O(1). A negative/oversized result means the page is
+		// shorter than its declared refs section (malformed blob); bail like the old !ok path.
+		refsBytes := rowCount * refSize
+		refsStart := len(pageRaw) - refsBytes
+		if refsStart < 0 {
 			return nil
 		}
 		if _, rerr := appendVariableWidthRefs(pageRaw, refsStart, blockW, rowW, rowCount, &refs); rerr != nil {
@@ -1182,67 +1196,6 @@ func decodePagedColumnRefs(blob []byte) []BlockRef {
 		}
 	}
 	return refs
-}
-
-// pageRefsOffset returns the byte offset within a snappy-decoded page where its refs section
-// begins, by skipping the page's value section. NOTE-340. Flat (uint64) and Delta pages
-// encode values as varints; XOR-bytes pages as 4-byte-length-prefixed payloads; Flat bytes
-// pages as 2-byte-length-prefixed payloads.
-func pageRefsOffset(raw []byte, rowCount int, format uint8, colType ColumnType) (int, bool) {
-	pos := 0
-	switch format {
-	case IntrinsicFormatDeltaUint64:
-		// Varint deltas, no values_len prefix (NOTE-014).
-		for range rowCount {
-			if pos >= len(raw) {
-				return 0, false
-			}
-			_, n := binary.Uvarint(raw[pos:])
-			if n <= 0 {
-				return 0, false
-			}
-			pos += n
-		}
-		return pos, true
-	case IntrinsicFormatFlat:
-		if colType == ColumnTypeBytes {
-			for range rowCount {
-				if pos+2 > len(raw) {
-					return 0, false
-				}
-				vLen := int(binary.LittleEndian.Uint16(raw[pos:]))
-				pos += 2 + vLen
-				if pos > len(raw) {
-					return 0, false
-				}
-			}
-			return pos, true
-		}
-		// uint64 flat: values_len[4] prefix then varint deltas.
-		if pos+4 > len(raw) {
-			return 0, false
-		}
-		valuesLen := int(binary.LittleEndian.Uint32(raw[pos:]))
-		pos += 4 + valuesLen
-		if pos > len(raw) {
-			return 0, false
-		}
-		return pos, true
-	case IntrinsicFormatXORBytes:
-		for range rowCount {
-			if pos+4 > len(raw) {
-				return 0, false
-			}
-			xorLen := int(binary.LittleEndian.Uint32(raw[pos:]))
-			pos += 4 + xorLen
-			if pos > len(raw) {
-				return 0, false
-			}
-		}
-		return pos, true
-	default:
-		return 0, false
-	}
 }
 
 // NOTE-150: parallel page-decode tuning.

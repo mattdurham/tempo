@@ -2049,3 +2049,31 @@ identical). Microbench BenchmarkEnsureRefIndexFlatDense_Allocs (4096 dense rows)
 2 allocs, ~10.8µs → 192 B/op, 1 alloc, ~2.2µs (-99% bytes, -80% time — the radix sort is
 skipped). `make precommit` green; `go test -race ./...` green (except pre-existing
 cmd/embed-server network-dependent stress tests).
+
+## NOTE-353: O(1) refs-section offset in the deferred-ref page decode
+
+`decodePagedColumnRefs` (the lazy ref decode invoked by `IntrinsicColumn.EnsureBlockRefs`
+for value-decoupled Flat/Delta/XOR columns, NOTE-340) called `pageRefsOffset` per page to
+locate where that page's refs section begins. `pageRefsOffset` did this by **re-walking the
+entire value section** — every delta uvarint for Delta/Flat-uint64, every 2/4-byte length
+prefix + payload for Flat-bytes/XOR. On the deferred-ref queries (M4/M6/M8/M9 — anything
+that needs BlockRefs: group-by, predicate merge-join, histogram) that re-scan over hundreds
+of ~10k-row span:start pages was the **#2 blockpack querier self-time frame (~5.7s, profile
+2026-06-14)**, and it was pure duplicate work: the eager value decode (`appendDeltaUint64PageOpt`
+etc.) already walked those same bytes.
+
+**Change:** the refs section is always written LAST in each page, contiguous, exactly
+`count*(blockW+rowW)` bytes, with NO trailing bytes (writer: `encodeDeltaUint64Intrinsic`,
+`encodeFlatPageBlob`, `encodeXORBytesIntrinsic` all emit `[values][refs]` snappy'd as one
+unit). So `refsStart == len(pageRaw) - count*(blockW+rowW)` — an O(1) subtraction, invariant
+of the value encoding. Replaced the per-page `pageRefsOffset` call with this computation and
+**deleted `pageRefsOffset` entirely** (it had no other callers). A negative result means the
+decompressed page is shorter than its declared refs section (malformed blob) — bail exactly
+like the old `!ok` path.
+
+**Safety:** byte-identical output. `appendVariableWidthRefs` validates `pos + count*refSize <=
+len(raw)` internally, so an over-long page (extra value bytes, which the format never emits)
+would have its refs read from the correct tail offset regardless. blockW,rowW ∈ {1,2} so
+refSize ∈ {2,3,4}, never zero. Cold path is unaffected (it decodes refs eagerly only for the
+dict format, which never enters this function). Verified: `go test -race ./internal/modules/
+blockio/shared ./internal/modules/blockio/reader ./internal/modules/executor` green.
