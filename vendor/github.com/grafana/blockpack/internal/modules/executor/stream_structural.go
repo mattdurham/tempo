@@ -335,8 +335,8 @@ func collectBlockStructuralSpanRecs(
 		// NOTE-093: [8]byte direct copy — no allocation needed.
 		var rec structuralSpanRec
 		rec.parentIdx = -1
-		rec.blockIdx = blockIdx
-		rec.rowIdx = rowIdx
+		rec.blockIdx = uint16(blockIdx) //nolint:gosec // blockIdx bounded by file block count (<65535)
+		rec.rowIdx = uint16(rowIdx)     //nolint:gosec // rowIdx bounded by SpanCount (≤65535)
 		if row.present&intrinsicPresentSpanID != 0 {
 			rec.spanID = row.spanID
 			rec.present |= structuralSpanIDPresent
@@ -471,7 +471,7 @@ func resolveStructuralParentIndices(traceSpans map[[16]byte][]structuralSpanRec)
 		for i := range spans {
 			if spans[i].present&structuralParentIDPresent != 0 {
 				if idx, ok := byID[spans[i].parentID]; ok {
-					spans[i].parentIdx = idx
+					spans[i].parentIdx = int32(idx) //nolint:gosec // idx is a per-trace span index, well within int32
 				} else {
 					spans[i].parentIdx = -1
 				}
@@ -517,11 +517,11 @@ func evalStructuralMatches(
 			// NOTE-093: [8]byte → []byte conversion at match-emit time is per-match (acceptable);
 			// the hot path per-span clone is eliminated.
 			match := SpanMatch{
-				Block:    parsedBlocks[spans[ri].blockIdx],
+				Block:    parsedBlocks[int(spans[ri].blockIdx)],
 				TraceID:  tid,
 				SpanID:   append([]byte(nil), spans[ri].spanID[:]...),
-				BlockIdx: spans[ri].blockIdx,
-				RowIdx:   spans[ri].rowIdx,
+				BlockIdx: int(spans[ri].blockIdx),
+				RowIdx:   int(spans[ri].rowIdx),
 			}
 			result.Matches = append(result.Matches, match)
 			if opts.Limit > 0 && len(result.Matches) >= opts.Limit {
@@ -631,7 +631,7 @@ func evalOpSiblingStruct(spans []structuralSpanRec) []int {
 	leftCounts := make(map[int]int)
 	for _, sp := range spans {
 		if sp.nodeMatch&0x01 != 0 {
-			leftCounts[sp.parentIdx]++
+			leftCounts[int(sp.parentIdx)]++
 		}
 	}
 	result := make([]int, 0, len(spans))
@@ -639,7 +639,7 @@ func evalOpSiblingStruct(spans []structuralSpanRec) []int {
 		if r.nodeMatch&0x02 == 0 {
 			continue
 		}
-		cnt := leftCounts[r.parentIdx]
+		cnt := leftCounts[int(r.parentIdx)]
 		// Qualify if there is at least one left-match sibling OTHER than r itself.
 		if cnt > 1 || (cnt == 1 && r.nodeMatch&0x01 == 0) {
 			result = append(result, ri)
@@ -658,7 +658,7 @@ func evalOpAncestorStruct(spans []structuralSpanRec) []int {
 		cur := l.parentIdx
 		for cur >= 0 {
 			if spans[cur].nodeMatch&0x02 != 0 {
-				result = append(result, cur)
+				result = append(result, int(cur))
 			}
 			cur = spans[cur].parentIdx
 		}
@@ -674,7 +674,7 @@ func evalOpParentStruct(spans []structuralSpanRec) []int {
 			continue
 		}
 		if spans[l.parentIdx].nodeMatch&0x02 != 0 {
-			result = append(result, l.parentIdx)
+			result = append(result, int(l.parentIdx))
 		}
 	}
 	return result
@@ -686,12 +686,12 @@ func evalOpNotSiblingStruct(spans []structuralSpanRec) []int {
 	leftParents := make(map[int]struct{})
 	for _, sp := range spans {
 		if sp.nodeMatch&0x01 != 0 {
-			leftParents[sp.parentIdx] = struct{}{}
+			leftParents[int(sp.parentIdx)] = struct{}{}
 		}
 	}
 	result := make([]int, 0, len(spans))
 	for ri, r := range spans {
-		if _, hasLeft := leftParents[r.parentIdx]; r.nodeMatch&0x02 != 0 && !hasLeft {
+		if _, hasLeft := leftParents[int(r.parentIdx)]; r.nodeMatch&0x02 != 0 && !hasLeft {
 			result = append(result, ri)
 		}
 	}
@@ -716,7 +716,7 @@ func evalOpNotDescendantStruct(spans []structuralSpanRec) []int {
 		isDescendant := false
 		cur := r.parentIdx
 		for cur >= 0 {
-			if _, ok := leftSet[cur]; ok {
+			if _, ok := leftSet[int(cur)]; ok {
 				isDescendant = true
 				break
 			}
@@ -801,7 +801,7 @@ func evalOpChainStep(
 			}
 			cur := r.parentIdx
 			for cur >= 0 {
-				if _, ok := leftSet[cur]; ok {
+				if _, ok := leftSet[int(cur)]; ok {
 					nextSet[ri] = struct{}{}
 					break
 				}
@@ -813,7 +813,7 @@ func evalOpChainStep(
 			if r.nodeMatch&rightMask == 0 || r.parentIdx < 0 {
 				continue
 			}
-			if _, ok := leftSet[r.parentIdx]; ok {
+			if _, ok := leftSet[int(r.parentIdx)]; ok {
 				nextSet[ri] = struct{}{}
 			}
 		}
@@ -823,13 +823,13 @@ func evalOpChainStep(
 		// there are 2+ left-match spans sharing the same parent.
 		leftParentCounts := make(map[int]int, len(leftSet))
 		for li := range leftSet {
-			leftParentCounts[spans[li].parentIdx]++
+			leftParentCounts[int(spans[li].parentIdx)]++
 		}
 		for ri, r := range spans {
 			if r.nodeMatch&rightMask == 0 {
 				continue
 			}
-			cnt := leftParentCounts[r.parentIdx]
+			cnt := leftParentCounts[int(r.parentIdx)]
 			_, isLeft := leftSet[ri]
 			if cnt > 1 || (cnt == 1 && !isLeft) {
 				nextSet[ri] = struct{}{}
@@ -840,7 +840,7 @@ func evalOpChainStep(
 			cur := spans[li].parentIdx
 			for cur >= 0 {
 				if spans[cur].nodeMatch&rightMask != 0 {
-					nextSet[cur] = struct{}{}
+					nextSet[int(cur)] = struct{}{}
 				}
 				cur = spans[cur].parentIdx
 			}
@@ -849,7 +849,7 @@ func evalOpChainStep(
 		for li := range leftSet {
 			pi := spans[li].parentIdx
 			if pi >= 0 && spans[pi].nodeMatch&rightMask != 0 {
-				nextSet[pi] = struct{}{}
+				nextSet[int(pi)] = struct{}{}
 			}
 		}
 	default:

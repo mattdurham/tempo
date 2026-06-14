@@ -5424,3 +5424,34 @@ at ≤32 MiB rather than at the peak giant-block size. Mirrors `decompBufMaxPool
 and `assembledBufMaxPooledCap` (NOTE-208) on the reader side. Verified by
 `TestCompactPools_DropOversizedOnRelease` (over-cap buffers are never returned to their pool;
 all capped releases are panic-free for both under- and over-cap inputs).
+
+## NOTE-357: structuralSpanRec field-width narrowing (48 → 28 bytes/record)
+
+`collectBlockStructuralSpanRecs` appends one `structuralSpanRec` per matching span across
+EVERY selected block of a structural (TraceQL `>>`/`<`/`~` etc.) query, and retains the
+result map (`map[[16]byte][]structuralSpanRec`) for the whole query. For a heavy multi-block
+structural scan the record slices are a large per-query peak — it was a top querier
+inuse_space frame (~414 MB live in the 2026-06-14 profile).
+
+The record originally used three `int` (8-byte) fields — `parentIdx`, `blockIdx`, `rowIdx` —
+giving a 48-byte struct (two `[8]byte` arrays + three `int` + two `uint8`, padded). All three
+values have tight, provable bounds:
+- `blockIdx`: a file block index, bounded by the file's block count (< 65535) — used elsewhere
+  as `uint16(blockIdx)`. Now `uint16`.
+- `rowIdx`: a span row index, bounded by `SpanCount` ≤ MaxBlockSpans (65535). Now `uint16`.
+- `parentIdx`: an index into the per-trace `spans` slice (count of spans for ONE trace) with
+  `-1` as the "no parent" sentinel. Now `int32` (signed, preserves the sentinel; ample range).
+
+Reordered so the two 8-byte arrays lead, then the `int32`, then the two `uint16`s and two
+`uint8`s, packing to **28 bytes (-42%)** with no interior padding. Field-width narrowing on a
+retained per-row record is a pure inuse_space win: no extra work on the warm path, the slice
+just allocates fewer bytes. Mirrors r132's `bucketByPK` int64→int16 narrowing.
+
+Call-site impact: `SpanMatch.BlockIdx/RowIdx` and the `parsedBlocks` map key are `int`, so the
+emit path converts back with `int(...)`. The structural-op evaluators index `spans` and several
+`map[int]` sets by `parentIdx`; those take an explicit `int(...)` at the use site (indexing a
+slice with an `int32` is legal Go, but the `map[int]` keys and `[]int` appends need conversion).
+
+Verified: `BenchmarkStructuralSpanRecSliceFootprint` (100k records) 4.80 MB → 2.80 MB/op
+(-41.7%, controlled bytes/op signal); `go test -race ./...` green (excl. pre-existing
+env-only cmd/embed-server stress tests that need a live server); `make precommit` fully green.
