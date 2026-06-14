@@ -2105,3 +2105,32 @@ Back-ref: `intrinsic_codec.go` (`appendFlatPageOpt` bytes branch, `DecodeIntrins
 bytes branch, new `flatBytesPageValueSize`). Test/bench:
 `intrinsic_flat_bytes_arena_test.go` (`TestFlatBytesArena_Roundtrip`, `BenchmarkDecodeFlatBytes_Allocs`).
 The reader-package bytes-dict counterpart (same pattern) is also NOTE-356 — see `reader/NOTES.md`.
+
+## NOTE-364: IntrinsicColumn.SizeBytes fixed per-column overhead (honest parsedIntrinsicCache LRU)
+
+**Problem:** `IntrinsicColumn.SizeBytes` is the `objectcache.Sizer` driving `parsedIntrinsicCache`
+LRU eviction. It counted only the variable data slices (`Uint64Values`, `BytesValues`,
+`BlockRefs`, `DictEntries` data, `refIndex`) and omitted the fixed per-column retained overhead:
+the `IntrinsicColumn` struct itself (`unsafe.Sizeof == 192` bytes — 5 slice headers + 2
+`sync.Once`), the objectcache `entry[IntrinsicColumn]` wrapper (~48 bytes), the map bucket
+(~16 bytes), and the cache-key string bytes (`fileID + "/intrinsic/" + colName`, ~80 bytes).
+Separately each `IntrinsicDictEntry` (48-byte struct) was charged only `+8` — a 40-byte/entry
+undercount, and `BytesValues` elements omitted their 24-byte `[]byte` slice header. A small
+intrinsic/enum column reporting a few dozen data bytes actually retains >300 bytes; a wide
+trace block carries hundreds of intrinsic columns, so the LRU budget was honored against a
+fraction of the true live set and `parsedIntrinsicCache` silently over-retained past
+`SetMaxBytes` — pinning the very `makeNoZeroBlockRef` (2.0 GB) / `makeNoZeroUint64` (1.5 GB)
+decoded arrays that are the top querier `inuse_space` frames.
+
+**Fix:** fold the fixed footprint into `intrinsicColumnFixedOverhead = 336`
+(192 struct + 48 entry + 16 bucket + 80 key allowance) added once per column, count
+`len(col.Name)` bytes, charge each `IntrinsicDictEntry` its true 48 bytes, and count the
+24-byte `[]byte` header for each `BytesValues` element. Pure accounting correction — no data
+movement, no decode change — that makes the LRU evict to the real budget instead of
+over-retaining. Same bug class as NOTE-362 (`colMetaEntry` SizeBytes) and NOTE-363
+(`Column` SizeBytes): a Sizer that omits its fixed struct/wrapper/key overhead drifts the
+budget, worst for many-small-object caches where struct overhead dominates the data.
+
+Back-ref: `types.go` (`intrinsicColumnFixedOverhead`, `IntrinsicColumn.SizeBytes`). Test:
+`intrinsic_sizebytes_test.go` (`TestIntrinsicColumnSizeBytesIncludesFixedOverhead`); updated
+`TestLazyRefsSizeBytesAccounting` and `TestRefDenseFlat_DropsRefIndex` for the new fixed term.

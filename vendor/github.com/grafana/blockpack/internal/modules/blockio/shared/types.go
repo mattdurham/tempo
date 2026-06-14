@@ -255,15 +255,43 @@ type RangeValueKey = string
 // For dict: Pos is the DictEntries index.
 // Thread safety: built under refIndexOnce; safe for concurrent reads after that.
 
+// intrinsicColumnFixedOverhead is the fixed per-cached-column retained footprint NOT
+// captured by the variable data slices counted in SizeBytes: the IntrinsicColumn struct
+// itself (unsafe.Sizeof(IntrinsicColumn{}) == 192 bytes, dominated by its 5 value/ref/index
+// slice headers and 2 sync.Once) PLUS the objectcache entry[IntrinsicColumn] wrapper
+// (val ptr + prev + next + key string header + sizeBytes == 48 bytes) PLUS the map bucket
+// slot (~16 bytes amortized). The cache key string is held only by the entry and is
+// workload dependent (fileID + "/intrinsic/" + colName ~= a 36-char fileID + 11 + name),
+// folded in here as a typical ~80-byte allowance. Total ~= 192 + 48 + 16 + 80 = 336.
+//
+// NOTE-364: without this, SizeBytes undercounted every cached IntrinsicColumn by its fixed
+// overhead. A small dict/enum column reporting a few dozen data bytes actually retains
+// >300 bytes once snapshotted into parsedIntrinsicCache; the per-DictEntry overhead was
+// also undercounted (the 48-byte IntrinsicDictEntry struct was charged only +8). A wide
+// trace block carries hundreds of intrinsic columns, so the LRU budget was honored against
+// a fraction of the true live set and parsedIntrinsicCache silently over-retained past
+// SetMaxBytes — pinning the very makeNoZeroBlockRef / makeNoZeroUint64 arrays that dominate
+// querier inuse_space. Same class of fix as NOTE-362 (colMetaEntry SizeBytes) and NOTE-363
+// (Column SizeBytes): a Sizer that omits its fixed struct/wrapper/key overhead drifts the
+// budget, worst for many-small-column caches where the struct overhead dominates the data.
+const intrinsicColumnFixedOverhead = 336
+
 // SizeBytes returns an estimate of the in-memory size of this column for LRU cache budgeting.
 func (col *IntrinsicColumn) SizeBytes() int64 {
-	n := int64(len(col.Uint64Values)) * 8
+	// NOTE-364: count the fixed per-column retained overhead so the LRU honors the true
+	// live set, not just the variable data slices.
+	n := int64(intrinsicColumnFixedOverhead)
+	n += int64(len(col.Name))
+	n += int64(len(col.Uint64Values)) * 8
 	for _, b := range col.BytesValues {
-		n += int64(len(b))
+		n += int64(len(b)) + 24 // []byte slice header + bytes
 	}
 	n += int64(len(col.BlockRefs)) * 4
 	for _, e := range col.DictEntries {
-		n += int64(len(e.Value)) + int64(len(e.BlockRefs))*4 + 8
+		// NOTE-364: the IntrinsicDictEntry struct is 48 bytes (Value string header 16 +
+		// BlockRefs slice header 24 + Int64Val 8), previously charged at only +8 — a
+		// 40-byte/entry undercount on top of the missing struct + key bytes above.
+		n += int64(len(e.Value)) + int64(len(e.BlockRefs))*4 + 48
 	}
 	n += int64(len(col.refIndex)) * 8
 	// NOTE-344: a lazy-ref column (NOTE-340) has refsDecode != nil and an empty BlockRefs
