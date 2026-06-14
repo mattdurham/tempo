@@ -5208,3 +5208,25 @@ entries (incl. negative-bound edge cases), and non-numeric entries. Full executo
 blockio suites green under `-race`.
 
 Back-ref: `internal/modules/executor/predicates.go:scanIntrinsicLeafRefs,extractDictRangeBounds,valueToInt64Bound,dictNumericInRange,isIntegerDomainColType`
+
+## NOTE-341: histogram Dict scan shares histRefPassPos — drops loop-invariant bitset guard
+
+`scanAggColHistogramShard` (the per-worker M8 histogram scanner) had two near-identical
+per-ref pre-filters: the Flat/Delta arm called `histRefPassPos` (pk-range → bitset
+membership → POPCNT rank), while the Dict arm open-coded the same three steps inline and
+added a `len(pkBitset) > 0` guard before the membership test.
+
+That guard was loop-invariant **dead code on the hottest M8 loop**: the driver
+`scanAggColHistogramCompact` returns early when `len(sortedPKs) == 0` and otherwise always
+builds a non-empty `pkBitset` (≥1 bit set, since `maxPK ≥ minPK`) before dispatching any
+shard — serial or parallel — and the standalone test callsite builds the bitset the same
+way. So `pkBitset` is non-empty at every `scanAggColHistogramShard` entry, exactly the
+precondition the Flat arm's `histRefPassPos` already assumed. The branch was evaluated once
+per matching ref (millions on M8) for no effect.
+
+Routing the Dict arm through `histRefPassPos` removes that branch and de-duplicates the
+`word/bit/rank` math into the one helper. Output is byte-identical: `histRefPassPos` returns
+`(pos, true)` exactly when the inline code computed the same `pos` and fell through, and
+`(_, false)` exactly when the inline code `continue`d (pk out of range or non-member).
+
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:scanAggColHistogramShard,histRefPassPos`

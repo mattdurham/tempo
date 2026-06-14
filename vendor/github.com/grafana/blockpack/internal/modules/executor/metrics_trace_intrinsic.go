@@ -1210,18 +1210,18 @@ func scanAggColHistogramShard( //nolint:gocyclo
 					}
 				}
 				spanCount++
-				pk := packKey(ref.BlockIdx, ref.RowIdx)
-				if pk < minPK || pk > maxPK {
+				// NOTE-341: share the pk-range + bitset-membership + POPCNT-rank pre-filter
+				// with the Flat/Delta arm via histRefPassPos. The driver
+				// (scanAggColHistogramCompact) returns early on len(sortedPKs)==0 and always
+				// builds a non-empty pkBitset before any shard runs, so the former per-ref
+				// `len(pkBitset) > 0` guard was loop-invariant dead code on the hottest M8
+				// histogram loop (executed once per matching ref). histRefPassPos already
+				// assumes a non-empty bitset (the Flat arm relied on it), so routing the Dict
+				// arm through it removes that branch and de-duplicates the rank math.
+				pos, ok := histRefPassPos(ref, minPK, maxPK, pkBitset, rankPrefix)
+				if !ok {
 					continue
 				}
-				word := pk >> 6
-				bit := pk & 63
-				if len(pkBitset) > 0 && pkBitset[word]&(uint64(1)<<bit) == 0 {
-					continue // NOTE-135/140: fast pre-filter: pk not in sortedPKs
-				}
-				// NOTE-140: O(1) rank replaces O(log n) searchSortedUint32.
-				r := rankPrefix[word] + uint32(bits.OnesCount64(pkBitset[word]&((uint64(1)<<bit)-1))) //nolint:gosec
-				pos := int(r)                                                                         //nolint:gosec
 				bk := timeBucketByPos[pos]
 				if bk == 0 {
 					continue
