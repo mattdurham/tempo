@@ -2678,3 +2678,34 @@ guard + narrowing store), `parser.go` (`blockColTypes.SizeBytes`). Test/bench:
 `colmeta_narrow_test.go` (`TestColMetaEntrySize`, `TestParseColMeta_DataOffsetNarrowing`,
 `TestParseColMeta_DataOffsetOverflowRejected`, `TestBlockColTypesSizeBytesAccountsStruct`,
 `BenchmarkColMetaArrayFootprint`).
+
+## NOTE-363: count fixed per-snapshot overhead in Column.SizeBytes (LRU budget honesty)
+
+`Column.SizeBytes()` is the `objectcache.Sizer` that drives `parsedV8ColumnCache` LRU
+eviction (NOTE-200). Every decoded V8 column is snapshotted (`snapshotDecodedColumn`) into
+this process-level cache so warm queries reuse the decode. The Sizer counted only the
+variable data slices (dict + index + present + inline bytes) — it omitted the *fixed*
+per-snapshot retained footprint:
+
+  - the `*Column` struct itself: `unsafe.Sizeof(Column{}) ~= 544` bytes, dominated by 12
+    type-specific Dict/Idx slice headers (24 B each) of which ~10 are always nil for any
+    single-type column — dead-but-allocated struct space;
+  - the `objectcache.entry[*Column]` wrapper (val/prev/next/key/sizeBytes ~= 56 B);
+  - the map bucket slot (~16 B amortized);
+  - the v8 cache key string bytes (fileID+offset+name+type, ~80 B typical).
+
+Folded into `columnSnapshotFixedOverhead = 704` plus `len(Name)`. Without this, a small
+dict column (e.g. a few-entry bool/enum column reporting ~34 data bytes) was undercounted
+by >16x — it actually retains >700 bytes once snapshotted. A wide block has hundreds of
+such small columns, so the LRU budget was honored against a fraction of the true live set
+and the cache silently over-retained far past its configured byte budget. Adding the
+fixed overhead makes the budget honest: under the same `SetMaxBytes`, the cache now holds
+a strictly smaller (correct) live set, lowering retained RSS for the
+`snapshotDecodedColumn` / `cacheParsedBlockColTypes` family of frames.
+
+Same class of fix as NOTE-362 (the `blockColTypes.SizeBytes` struct-overhead undercount):
+any `Sizer` that omits its fixed struct/wrapper/key overhead drifts the LRU budget and
+over-retains, the drift being worst for many-small-object caches.
+
+Back-ref: `block.go` (`columnSnapshotFixedOverhead`, `Column.SizeBytes`). Test:
+`column_sizebytes_test.go` (`TestColumnSizeBytesIncludesFixedOverhead`).

@@ -64,12 +64,34 @@ func (c *Column) IsDecoded() bool { return c.decoded.Load() }
 // NOTE-CONC-001: reads decoded atomically — the only safe cross-goroutine check.
 func (c *Column) needsDecode() bool { return !c.decoded.Load() }
 
+// columnSnapshotFixedOverhead is the fixed per-cached-snapshot retained footprint NOT
+// captured by the variable data slices below: the *Column struct itself (NOTE-363:
+// unsafe.Sizeof(Column{}) ~= 544 bytes, dominated by 12 type-specific Dict/Idx slice
+// headers of which ~10 are always nil for any single-type column) PLUS the objectcache
+// entry[*Column] wrapper (val/prev/next/sizeBytes ~= 56 bytes) PLUS the map bucket slot
+// (~16 bytes amortized). The v8 cache key string is held only by the entry and is
+// workload dependent (fileID+offset+name+type), so it is folded into this constant as a
+// typical ~80-byte allowance. Total ~= 544 + 56 + 16 + 80 = 696, rounded up to 704.
+//
+// NOTE-363: without this, SizeBytes undercounted a small dict column (e.g. a few-entry
+// bool/enum column) by 16x — a column reporting 34 data bytes actually retains >700 bytes
+// once snapshotted into parsedV8ColumnCache. A wide block has hundreds of such small
+// columns, so the LRU budget was honored against a fraction of the true live set and the
+// cache silently over-retained. Same class of fix as NOTE-362 (colMetaEntry SizeBytes
+// undercount) — a Sizer that omits its fixed struct/wrapper overhead drifts the budget.
+const columnSnapshotFixedOverhead = 704
+
 // SizeBytes returns an estimate of the in-memory size of this column's decoded data
 // for objectcache LRU budgeting (NOTE-200). Only the immutable decoded slices that the
 // process-level parsedV8ColumnCache shares across queries are counted; the per-query
 // mutable scratch (rawEncoding/compressedEncoding/intern/sync.Once) is not cached.
+// NOTE-363: the fixed per-snapshot overhead (struct + cache wrapper + key) is added so
+// the LRU honors the true retained footprint, especially for small columns where the
+// struct overhead dominates the data.
 func (c *Column) SizeBytes() int64 {
-	n := int64(len(c.StringIdx)+len(c.Int64Idx)+len(c.Uint64Idx)+
+	n := int64(columnSnapshotFixedOverhead)
+	n += int64(len(c.Name))
+	n += int64(len(c.StringIdx)+len(c.Int64Idx)+len(c.Uint64Idx)+
 		len(c.Float64Idx)+len(c.BoolIdx)+len(c.BytesIdx)) * 4
 	n += int64(len(c.sparseDictIdx)) * 4
 	n += int64(len(c.Present))
