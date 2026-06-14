@@ -884,9 +884,8 @@ func decodeDeltaUint64(
 	width := data[pos]
 	pos++
 
-	// Build dense Uint64Dict + Uint64Idx.
+	// Build dense Uint64Dict (one entry per present row, in row order).
 	col.Uint64Dict = make([]uint64, presentCount)
-	col.Uint64Idx = make([]uint32, spanCount)
 
 	if width == 0 {
 		// All present values equal base.
@@ -929,14 +928,22 @@ func decodeDeltaUint64(
 	}
 
 	// Build dense index array.
-	// NOTE-360: present == nil means every span is present (AllPresent kind, no bitmap), so
-	// the dense index is the identity permutation [0,1,…,spanCount-1]. Skip the per-row
-	// IsPresent walk in that case — IsPresent(nil, i) is always false and would mis-fill.
-	if present == nil {
-		for i := range spanCount {
-			col.Uint64Idx[i] = uint32(i) //nolint:gosec
-		}
+	// NOTE-361: when every row is present this column's index is the pure identity
+	// permutation [0,1,…,spanCount-1] (Dict has one entry per present row, in row order, so
+	// present-rank(i) == i). Set denseFlatIdx and skip the make([]uint32, spanCount) +
+	// per-row fill entirely — readers resolve the dict index arithmetically via dictIdxAt.
+	// This extends the NOTE-358 optimization (already applied to decodeDeltaUint64BitPacked
+	// and decodeGorillaFloat64, which produce the byte-identical dense-flat layout) to the
+	// non-bit-packed delta kind 21 — the still-materializing decodeDeltaUint64 frame. Only
+	// the all-present case qualifies; a partial-presence column needs the real present-rank
+	// table, so it falls through to materialize Uint64Idx (denseFlatIdx == false).
+	// present == nil is the AllPresent kind (NOTE-360, no presence bitmap) and is always
+	// fully present; presentCount == spanCount covers both that and a materialized all-1s
+	// bitmap.
+	if presentCount == spanCount {
+		col.denseFlatIdx = true
 	} else {
+		col.Uint64Idx = make([]uint32, spanCount)
 		dictIdx := 0
 		for i := range spanCount {
 			if shared.IsPresent(present, i) {

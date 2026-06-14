@@ -2604,3 +2604,43 @@ bitmap-construction helper). Test/bench: `allpresent_footprint_bench_test.go`
 (`TestAllPresentDict_NilPresence`, `TestAllPresentBitPacked_NilPresence`,
 `BenchmarkDecodeAllPresentDict_Footprint`), plus the existing `allpresent_roundtrip_test.go`
 round-trip guards.
+
+## NOTE-361: extend the dense-flat identity-index drop to the byte-width DeltaUint64 kind
+
+NOTE-358 dropped the redundant identity `*Idx` slice for all-present *dense-flat* numeric
+columns, but only for `decodeDeltaUint64BitPacked` (kind 22/23) and `decodeGorillaFloat64`
+(kind 40/41). The byte-width delta decoder `decodeDeltaUint64` (kind 5/21 — the
+`DeltaUint64`/`DeltaUint64AllPresent` shape used for `span:start`-style timestamps and other
+smoothly-increasing uint64/int64 columns that don't qualify for bit-packing) was still
+materializing `col.Uint64Idx = make([]uint32, spanCount)` and filling the identity
+permutation `[0,1,…,spanCount-1]` for the all-present case. That slice carries NO information
+beyond the presence vector (Dict has one entry per present row in row order, so
+`present-rank(i) == i`) yet is 4 bytes/row of RETAINED memory — held both per-query AND in the
+`parsedV8ColumnCache` snapshot for the cache-entry lifetime. `decodeDeltaUint64` was a top
+`inuse_space` querier frame (~125 MB live).
+
+**Fix:** when `presentCount == spanCount`, set `Column.denseFlatIdx = true` and skip the
+`make([]uint32, spanCount)` + per-row fill entirely — byte-identical to the NOTE-358
+treatment of the bit-packed/Gorilla variants, which produce the same dense-flat layout. All
+`*Idx` consumers already route through the flag (`dictIdxAt` value accessors in `block.go`;
+`scanDictMaskRows`/`scanNumericDictMask` in the executor's `column_provider.go` with their
+`idx == nil` bail-outs relaxed for dense-flat columns), so no new consumer wiring is needed.
+The signed-int64 promotion path (`promoteToInt64Dict`, NOTE-222) is unaffected: it sets
+`Int64Idx = Uint64Idx` (now nil) and preserves `denseFlatIdx`, exactly as the bit-packed
+variant already does. Partial-presence columns need the real present-rank table and fall
+through to materialize `Uint64Idx` (`denseFlatIdx == false`).
+
+`present == nil` (the NOTE-360 AllPresent kind with no presence bitmap) is always fully
+present; the `presentCount == spanCount` test covers both that and a materialized all-1s
+bitmap, so the previous NOTE-360 nil-aware identity fill loop is subsumed and removed.
+
+**Result:** `BenchmarkDecodeDeltaUint64AllPresent_Footprint` (4096 all-present rows): retained
+footprint (`SizeBytes`) 49,152 -> 32,768 bytes (-33.3%, exactly the eliminated
+`spanCount*4 = 16,384`-byte identity index slice), 49,728 -> 33,344 B/op (-33%), 3 -> 2
+allocs/op, ns/op ~37.8K -> ~26.8K (-29%, no per-row index fill loop). Saving is multiplied
+across every cached all-present byte-width DeltaUint64/Int64 column in `parsedV8ColumnCache`
+and per-query. Composes with NOTE-360 so an all-present such column retains ONLY its dict.
+
+Back-ref: `column.go` (`decodeDeltaUint64` index build). Test/bench:
+`deltauint64_denseflat_test.go` (`TestDeltaUint64AllPresent_DenseFlatIdx`,
+`TestDeltaUint64PartialPresent_KeepsIdx`, `BenchmarkDecodeDeltaUint64AllPresent_Footprint`).
