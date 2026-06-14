@@ -232,7 +232,24 @@ func (r *Reader) PrefetchIntrinsicColumns(names []string) {
 // intrinsic section (files written after the span:end elimination optimization).
 //
 // NOT safe for concurrent use without external synchronization.
+//
+// NOTE-340: BlockRefs are decoded lazily for value-decoupled paged columns. This accessor
+// materializes them before returning so every existing caller observes the same behavior as
+// before (refs always present). The single caller that can skip the ref decode — the span:start
+// fetch on the unfiltered no-group-by rate path — uses GetIntrinsicColumnLazyRefs instead.
 func (r *Reader) GetIntrinsicColumn(name string) (*shared.IntrinsicColumn, error) {
+	col, err := r.GetIntrinsicColumnLazyRefs(name)
+	if col != nil {
+		col.EnsureBlockRefs()
+	}
+	return col, err
+}
+
+// GetIntrinsicColumnLazyRefs is like GetIntrinsicColumn but does NOT force the lazy BlockRefs
+// decode (NOTE-340). Callers that read only Uint64Values/BytesValues + Count (the unfiltered
+// no-group-by count/rate fast path) avoid the per-row ref decode entirely. Any caller that
+// reads col.BlockRefs MUST call col.EnsureBlockRefs() first.
+func (r *Reader) GetIntrinsicColumnLazyRefs(name string) (*shared.IntrinsicColumn, error) {
 	if r.intrinsicIndex == nil {
 		return nil, nil
 	}

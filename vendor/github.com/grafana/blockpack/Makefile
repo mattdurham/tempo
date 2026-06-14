@@ -139,7 +139,7 @@ install-tools:
 	@echo "==> Installing code quality tools..."
 	@go install go.uber.org/nilaway/cmd/nilaway@latest
 	@go install github.com/dkorunic/betteralign/cmd/betteralign@latest
-	@go install mvdan.cc/gofumpt@latest
+	@go install mvdan.cc/gofumpt@v0.10.0
 	@go install github.com/segmentio/golines@latest
 	@go install github.com/fzipp/gocyclo/cmd/gocyclo@latest
 	@go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest

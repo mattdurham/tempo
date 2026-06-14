@@ -570,6 +570,8 @@ func (col *IntrinsicColumn) EnsureRefIndex() {
 	if col == nil {
 		return
 	}
+	// NOTE-340: buildRefIndexFlat reads col.BlockRefs, so materialize any deferred refs first.
+	col.EnsureBlockRefs()
 	col.refIndexOnce.Do(func() {
 		switch col.Format {
 		case IntrinsicFormatFlat, IntrinsicFormatXORBytes, IntrinsicFormatDeltaUint64:

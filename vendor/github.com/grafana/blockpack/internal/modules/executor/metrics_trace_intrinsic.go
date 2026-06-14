@@ -334,7 +334,10 @@ func executeTraceMetricsIntrinsic(
 	// per-name path, so behavior is unchanged.
 	prefetchIntrinsicWorkingSet(r, program, querySpec)
 
-	tsCol, err := r.GetIntrinsicColumn("span:start")
+	// NOTE-340: fetch span:start with refs deferred. The unfiltered no-group-by rate path
+	// reads only Uint64Values + Count and never materializes BlockRefs; all other paths call
+	// tsCol.EnsureBlockRefs() below (needsRefs).
+	tsCol, err := r.GetIntrinsicColumnLazyRefs("span:start")
 	if err != nil {
 		return nil, false, err
 	}
@@ -366,11 +369,25 @@ func executeTraceMetricsIntrinsic(
 	isCountRate := agg.Function == vm.FuncNameCOUNT || agg.Function == vm.FuncNameRATE
 
 	// span:start is a flat (sorted ascending) column. Validate the column before use:
-	// BlockRefs and Uint64Values must be parallel arrays of equal length.
+	// Count is the eagerly-decoded row count and must equal len(Uint64Values).
+	// NOTE-340: tsCol.BlockRefs is lazily decoded — compare against Count (always set
+	// during decode) rather than len(BlockRefs) (nil until EnsureBlockRefs).
 	tsVals := tsCol.Uint64Values
-	if len(tsVals) != len(tsCol.BlockRefs) {
+	if len(tsVals) != int(tsCol.Count) {
 		// Malformed intrinsic column — fall back to block scan rather than panic.
 		return nil, false, nil
+	}
+
+	// NOTE-340: the unfiltered no-group-by count/rate fast path (streamCountRateNoGroupBySorted)
+	// reads only Uint64Values — it never touches BlockRefs. Every other intrinsic metrics path
+	// (predicate filter merge-join, group-by, histogram) does, so materialize the deferred refs
+	// up front for those. The decoded column is process-cached, so this decode happens at most
+	// once per column per process and is shared with later ref-needing queries. tsCol was fetched
+	// via GetIntrinsicColumnLazyRefs (refs deferred); all other GetIntrinsicColumn callers receive
+	// refs already materialized, so no other path needs an EnsureBlockRefs call.
+	needsRefs := !isCountRate || len(agg.GroupBy) != 0 || filteredRefs != nil
+	if needsRefs {
+		tsCol.EnsureBlockRefs()
 	}
 
 	// Binary-search to find the index range that overlaps (StartTime, EndTime].
@@ -381,7 +398,10 @@ func executeTraceMetricsIntrinsic(
 	hi := sort.Search(len(tsVals), func(i int) bool {
 		return int64(tsVals[i]) > tb.EndTime //nolint:gosec
 	})
-	inRangeRefs := tsCol.BlockRefs[lo:hi]
+	var inRangeRefs []modules_shared.BlockRef
+	if needsRefs {
+		inRangeRefs = tsCol.BlockRefs[lo:hi]
+	}
 	inRangeVals := tsVals[lo:hi]
 
 	// Apply predicate filter via merge-join (NOTE-070).

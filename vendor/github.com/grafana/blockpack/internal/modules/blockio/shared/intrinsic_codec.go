@@ -553,6 +553,19 @@ func DecodeFlatPage(raw []byte, blockW, rowW, rowCount int, colType ColumnType) 
 // into dst's (caller-pre-sized) slices, avoiding a per-page intermediate column.
 // NOTE-145.
 func appendFlatPage(raw []byte, blockW, rowW, rowCount int, colType ColumnType, dst *IntrinsicColumn) error {
+	return appendFlatPageOpt(raw, blockW, rowW, rowCount, colType, dst, true)
+}
+
+// appendFlatPageOpt decodes a flat page's values and, when wantRefs is true, its refs.
+// NOTE-340: wantRefs == false decodes only the value side, leaving BlockRefs untouched, for
+// the lazy-ref decode path (the unfiltered no-group-by rate path never reads BlockRefs).
+func appendFlatPageOpt(
+	raw []byte,
+	blockW, rowW, rowCount int,
+	colType ColumnType,
+	dst *IntrinsicColumn,
+	wantRefs bool,
+) error {
 	isBytes := colType == ColumnTypeBytes
 	refSize := blockW + rowW
 	pos := 0
@@ -598,12 +611,14 @@ func appendFlatPage(raw []byte, blockW, rowW, rowCount int, colType ColumnType, 
 		pos = valEnd // ensure we're at refs start
 	}
 
-	for range rowCount {
-		if pos+refSize > len(raw) {
-			return fmt.Errorf("DecodeFlatPage: truncated at refs")
+	if wantRefs {
+		for range rowCount {
+			if pos+refSize > len(raw) {
+				return fmt.Errorf("DecodeFlatPage: truncated at refs")
+			}
+			dst.BlockRefs = append(dst.BlockRefs, decodeRef(raw, pos, blockW, rowW))
+			pos += refSize
 		}
-		dst.BlockRefs = append(dst.BlockRefs, decodeRef(raw, pos, blockW, rowW))
-		pos += refSize
 	}
 	dst.Count += uint32(rowCount) //nolint:gosec
 	return nil
@@ -1003,6 +1018,12 @@ func decodePagedColumnBlob(blob []byte) (*IntrinsicColumn, error) {
 		totalRows += int(pm.RowCount)
 	}
 	merged := &IntrinsicColumn{Type: toc.ColType, Format: toc.Format}
+	// NOTE-340: defer BlockRefs decode for value-decoupled paged formats (Flat/Delta/XOR).
+	// The value side decodes eagerly; refs are filled on first read via EnsureBlockRefs ->
+	// decodePagedColumnRefs. The unfiltered no-group-by rate path (M1/M4) reads only values +
+	// Count, so it never triggers the ref decode (appendVariableWidthRefs was ~10.7s of querier
+	// self-time). Dict columns keep eager refs (their refs share a cross-page arena, NOTE-152).
+	lazyRefs := isParallelPageDecodeFormat(toc.Format)
 	// NOTE-145: pre-size only the value slice this column type actually uses (a column
 	// is uint64 OR bytes, never both) — the old code allocated a full totalRows-sized
 	// slice for the unused type on every flat/xor/delta column.
@@ -1015,8 +1036,14 @@ func decodePagedColumnBlob(blob []byte) (*IntrinsicColumn, error) {
 			// NOTE-258: pointer-free, fully overwritten by the page decode — skip the memclr.
 			merged.Uint64Values = makeNoZeroUint64(totalRows)[:0]
 		}
-		// NOTE-258: BlockRef is pointer-free and every slot is written by the decode.
-		merged.BlockRefs = makeNoZeroBlockRef(totalRows)[:0]
+		if !lazyRefs {
+			// NOTE-258: BlockRef is pointer-free and every slot is written by the decode.
+			merged.BlockRefs = makeNoZeroBlockRef(totalRows)[:0]
+		}
+	}
+	if lazyRefs {
+		blobRef := blob // capture for the deferred ref decode (immutable cached blob)
+		merged.refsDecode = func() []BlockRef { return decodePagedColumnRefs(blobRef) }
 	}
 
 	// NOTE-150: Flat/XOR/Delta pages are self-contained (delta acc and XOR prev reset to
@@ -1029,6 +1056,9 @@ func decodePagedColumnBlob(blob []byte) (*IntrinsicColumn, error) {
 	// are the hot decode targets — ~27% of querier allocs and the residual cost of M1.
 	if isParallelPageDecodeFormat(toc.Format) && len(toc.Pages) >= 2 &&
 		totalRows >= parallelPageDecodeMinRows {
+		// NOTE-340: lazyRefs is always true here (isParallelPageDecodeFormat == the lazy-ref
+		// formats), so the parallel decode fills only values; refs are deferred to
+		// EnsureBlockRefs. decodePagesParallel decodes values-only via the *Opt helpers.
 		if err = decodePagesParallel(blob, pos, toc, blockW, rowW, totalRows, merged); err != nil {
 			return nil, err
 		}
@@ -1069,13 +1099,17 @@ func decodePagedColumnBlob(blob []byte) (*IntrinsicColumn, error) {
 		// intermediate slices that the old code allocated only to copy-and-discard.
 		// Reached only for single-page or sub-threshold columns (the parallel path above
 		// handles the multi-page case); dict is handled by the arena path above.
+		// NOTE-340: wantRefs == !lazyRefs. For the value-decoupled formats lazyRefs is true,
+		// so the serial single-page / sub-threshold path also decodes values only and defers
+		// refs to EnsureBlockRefs (decodePagedColumnRefs).
+		wantRefs := !lazyRefs
 		switch toc.Format {
 		case IntrinsicFormatFlat:
-			err = appendFlatPage(pageRaw, blockW, rowW, int(pm.RowCount), toc.ColType, merged)
+			err = appendFlatPageOpt(pageRaw, blockW, rowW, int(pm.RowCount), toc.ColType, merged, wantRefs)
 		case IntrinsicFormatXORBytes:
-			err = appendXORBytesPage(pageRaw, blockW, rowW, int(pm.RowCount), merged)
+			err = appendXORBytesPageOpt(pageRaw, blockW, rowW, int(pm.RowCount), merged, wantRefs)
 		case IntrinsicFormatDeltaUint64:
-			err = appendDeltaUint64Page(pageRaw, blockW, rowW, int(pm.RowCount), merged)
+			err = appendDeltaUint64PageOpt(pageRaw, blockW, rowW, int(pm.RowCount), merged, wantRefs)
 		default:
 			return nil, fmt.Errorf("decodePagedColumnBlob: page %d: unknown format %d", i, toc.Format)
 		}
@@ -1084,6 +1118,126 @@ func decodePagedColumnBlob(blob []byte) (*IntrinsicColumn, error) {
 		}
 	}
 	return merged, nil
+}
+
+// decodePagedColumnRefs re-walks a paged Flat/Delta/XOR column blob decoding ONLY its
+// BlockRefs, returning a fully populated slice of length totalRows. NOTE-340: this is the
+// lazy ref decode invoked by IntrinsicColumn.EnsureBlockRefs the first time a query reads
+// the refs of a column whose value side was decoded eagerly with refs deferred. It mirrors
+// decodePagedColumnBlob's page-walk and width parsing exactly; refs of a page begin after
+// that page's value section, so the value section is skipped (delta/flat: varint scan;
+// XOR-bytes: length-prefix scan) to locate each page's refs offset. Errors during the
+// re-walk fall back to an empty slice (the caller's column is then ref-empty for this
+// process, which is safe: a malformed blob would also have failed the eager value decode).
+func decodePagedColumnRefs(blob []byte) []BlockRef {
+	if len(blob) < 5 || blob[0] != IntrinsicPagedVersion {
+		return nil
+	}
+	pos := 1
+	tocLen := int(binary.LittleEndian.Uint32(blob[pos:]))
+	pos += 4
+	if pos+tocLen > len(blob) {
+		return nil
+	}
+	toc, err := DecodePageTOCNoStats(blob[pos : pos+tocLen])
+	if err != nil {
+		return nil
+	}
+	pos += tocLen
+
+	blockW := int(toc.BlockIdxWidth)
+	rowW := int(toc.RowIdxWidth)
+
+	var totalRows int
+	for _, pm := range toc.Pages {
+		totalRows += int(pm.RowCount)
+	}
+	refs := makeNoZeroBlockRef(totalRows)[:0]
+
+	pageBuf := AcquireIntrinsicBuf()
+	defer ReleaseIntrinsicBuf(pageBuf)
+
+	for _, pm := range toc.Pages {
+		pageStart := pos + int(pm.Offset)
+		pageEnd := pageStart + int(pm.Length)
+		if pageEnd > len(blob) {
+			return nil
+		}
+		pageRaw, decErr := snappyDecodeReuse(pageBuf, blob[pageStart:pageEnd])
+		if decErr != nil {
+			return nil
+		}
+		rowCount := int(pm.RowCount)
+		refsStart, ok := pageRefsOffset(pageRaw, rowCount, toc.Format, toc.ColType)
+		if !ok {
+			return nil
+		}
+		if _, rerr := appendVariableWidthRefs(pageRaw, refsStart, blockW, rowW, rowCount, &refs); rerr != nil {
+			return nil
+		}
+	}
+	return refs
+}
+
+// pageRefsOffset returns the byte offset within a snappy-decoded page where its refs section
+// begins, by skipping the page's value section. NOTE-340. Flat (uint64) and Delta pages
+// encode values as varints; XOR-bytes pages as 4-byte-length-prefixed payloads; Flat bytes
+// pages as 2-byte-length-prefixed payloads.
+func pageRefsOffset(raw []byte, rowCount int, format uint8, colType ColumnType) (int, bool) {
+	pos := 0
+	switch format {
+	case IntrinsicFormatDeltaUint64:
+		// Varint deltas, no values_len prefix (NOTE-014).
+		for range rowCount {
+			if pos >= len(raw) {
+				return 0, false
+			}
+			_, n := binary.Uvarint(raw[pos:])
+			if n <= 0 {
+				return 0, false
+			}
+			pos += n
+		}
+		return pos, true
+	case IntrinsicFormatFlat:
+		if colType == ColumnTypeBytes {
+			for range rowCount {
+				if pos+2 > len(raw) {
+					return 0, false
+				}
+				vLen := int(binary.LittleEndian.Uint16(raw[pos:]))
+				pos += 2 + vLen
+				if pos > len(raw) {
+					return 0, false
+				}
+			}
+			return pos, true
+		}
+		// uint64 flat: values_len[4] prefix then varint deltas.
+		if pos+4 > len(raw) {
+			return 0, false
+		}
+		valuesLen := int(binary.LittleEndian.Uint32(raw[pos:]))
+		pos += 4 + valuesLen
+		if pos > len(raw) {
+			return 0, false
+		}
+		return pos, true
+	case IntrinsicFormatXORBytes:
+		for range rowCount {
+			if pos+4 > len(raw) {
+				return 0, false
+			}
+			xorLen := int(binary.LittleEndian.Uint32(raw[pos:]))
+			pos += 4 + xorLen
+			if pos > len(raw) {
+				return 0, false
+			}
+		}
+		return pos, true
+	default:
+		return 0, false
+	}
 }
 
 // NOTE-150: parallel page-decode tuning.
@@ -1129,13 +1283,14 @@ func decodePagesParallel(
 
 	// Expose the full backing arrays so per-page capped sub-slices land in the right slot.
 	// The append helpers fill [off:off+RowCount); the union covers [0:totalRows) exactly.
+	// NOTE-340: refs are deferred (lazyRefs is always true for these formats), so merged.BlockRefs
+	// is nil here; the parallel decode fills only values via the *Opt helpers with wantRefs=false.
 	isBytes := toc.ColType == ColumnTypeBytes
 	if isBytes {
 		merged.BytesValues = merged.BytesValues[:totalRows]
 	} else {
 		merged.Uint64Values = merged.Uint64Values[:totalRows]
 	}
-	merged.BlockRefs = merged.BlockRefs[:totalRows]
 
 	workers := min(len(toc.Pages), maxPageDecodeWorkers)
 
@@ -1201,16 +1356,17 @@ func decodePagesParallel(
 				} else {
 					slot.Uint64Values = merged.Uint64Values[off : off : off+rc]
 				}
-				slot.BlockRefs = merged.BlockRefs[off : off : off+rc]
+				// NOTE-340: wantRefs=false — refs deferred to EnsureBlockRefs. slot.BlockRefs
+				// stays nil; the *Opt helpers do not touch it.
 
 				var aerr error
 				switch toc.Format {
 				case IntrinsicFormatFlat:
-					aerr = appendFlatPage(pageRaw, blockW, rowW, rc, toc.ColType, slot)
+					aerr = appendFlatPageOpt(pageRaw, blockW, rowW, rc, toc.ColType, slot, false)
 				case IntrinsicFormatXORBytes:
-					aerr = appendXORBytesPage(pageRaw, blockW, rowW, rc, slot)
+					aerr = appendXORBytesPageOpt(pageRaw, blockW, rowW, rc, slot, false)
 				case IntrinsicFormatDeltaUint64:
-					aerr = appendDeltaUint64Page(pageRaw, blockW, rowW, rc, slot)
+					aerr = appendDeltaUint64PageOpt(pageRaw, blockW, rowW, rc, slot, false)
 				}
 				if aerr != nil {
 					setErr(fmt.Errorf("decodePagesParallel: page %d: %w", i, aerr))
@@ -1546,7 +1702,10 @@ func appendVariableWidthRefs(raw []byte, pos, blockW, rowW, count int, dst *[]Bl
 //
 // NOTE-013: BytesValues must be independent copies (NOTE-012 invariant) — they cannot alias
 // the pageBuf pool buffer that decodePagedColumnBlob reuses across page decodes.
-func appendXORBytesPage(raw []byte, blockW, rowW, rowCount int, dst *IntrinsicColumn) error {
+//
+// appendXORBytesPageOpt decodes an XOR-bytes page's values and, when wantRefs is true, its
+// refs. NOTE-340: wantRefs == false skips the BlockRefs decode for the lazy-ref path.
+func appendXORBytesPageOpt(raw []byte, blockW, rowW, rowCount int, dst *IntrinsicColumn, wantRefs bool) error {
 	// NOTE-147: reconstruct all values into one page-sized arena instead of one
 	// make([]byte) per value. xorInvert previously allocated a fresh slice per row
 	// (~one alloc/value = the dominant cost on this path, ~27% of querier allocs per
@@ -1582,8 +1741,10 @@ func appendXORBytesPage(raw []byte, blockW, rowW, rowCount int, dst *IntrinsicCo
 	// Refs section: rowCount × refSize bytes after all values. The decode loop above has
 	// advanced pos to exactly valBytes + 4*rowCount = the refs start (validated by the
 	// pre-scan), so no bounds re-check is needed here.
-	if _, err := appendVariableWidthRefs(raw, pos, blockW, rowW, rowCount, &dst.BlockRefs); err != nil {
-		return fmt.Errorf("decodeXORBytesPage refs: %w", err)
+	if wantRefs {
+		if _, err := appendVariableWidthRefs(raw, pos, blockW, rowW, rowCount, &dst.BlockRefs); err != nil {
+			return fmt.Errorf("decodeXORBytesPage refs: %w", err)
+		}
 	}
 	dst.Count += uint32(rowCount) //nolint:gosec
 	return nil
@@ -1601,7 +1762,12 @@ func appendXORBytesPage(raw []byte, blockW, rowW, rowCount int, dst *IntrinsicCo
 //
 // NOTE-014: no values_len prefix. Row count comes from the TOC RowCount field.
 // Do NOT call pageRefsStart here — that function assumes a values_len[4] prefix.
-func appendDeltaUint64Page(raw []byte, blockW, rowW, rowCount int, dst *IntrinsicColumn) error {
+//
+// appendDeltaUint64PageOpt decodes a delta-uint64 page's values and, when wantRefs is true,
+// its refs. NOTE-340: wantRefs == false skips the BlockRefs decode entirely for the lazy-ref
+// path (appendVariableWidthRefs was ~10.7s of querier self-time on the M1/M4 unfiltered rate
+// path, which never reads BlockRefs — only Uint64Values + Count).
+func appendDeltaUint64PageOpt(raw []byte, blockW, rowW, rowCount int, dst *IntrinsicColumn, wantRefs bool) error {
 	// NOTE-169: index-based varint decode with a single-byte fast path, writing into
 	// a pre-extended slice region instead of per-row append. Delta-sorted uint64 columns
 	// (span:start, hundreds of pages of ~10k rows each) overwhelmingly produce deltas < 128
@@ -1660,8 +1826,10 @@ func appendDeltaUint64Page(raw []byte, blockW, rowW, rowCount int, dst *Intrinsi
 	pos := len(raw) - len(src)
 	dst.Uint64Values = vals
 
-	if _, err := appendVariableWidthRefs(raw, pos, blockW, rowW, rowCount, &dst.BlockRefs); err != nil {
-		return fmt.Errorf("decodeDeltaUint64Page refs: %w", err)
+	if wantRefs {
+		if _, err := appendVariableWidthRefs(raw, pos, blockW, rowW, rowCount, &dst.BlockRefs); err != nil {
+			return fmt.Errorf("decodeDeltaUint64Page refs: %w", err)
+		}
 	}
 	dst.Count += uint32(rowCount) //nolint:gosec
 	return nil

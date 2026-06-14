@@ -1922,3 +1922,49 @@ random, matching real column pages): vs golang/snappy decode throughput +24% @ 6
 import golang/snappy to encode while production decodes with klauspost).
 
 Back-ref: `shared/intrinsic_codec.go` import block (NOTE-283 comment).
+
+## NOTE-340: lazy BlockRefs decode for paged Flat/Delta/XOR intrinsic columns
+
+**Files:** `shared/intrinsiccolumn.go` (refsDecode/refsOnce + EnsureBlockRefs),
+`shared/intrinsic_codec.go` (append*PageOpt value-only variants, decodePagedColumnRefs,
+pageRefsOffset, lazyRefs gating in decodePagedColumnBlob/decodePagesParallel),
+`shared/intrinsic_ref_index.go` (EnsureRefIndex calls EnsureBlockRefs first),
+`reader/intrinsic_reader.go` (GetIntrinsicColumn ensures refs; new GetIntrinsicColumnLazyRefs),
+`executor/metrics_trace_intrinsic.go` (span:start fetched lazily; EnsureBlockRefs only when needed).
+
+**Change:** Defer the per-row BlockRefs decode of value-decoupled paged columns
+(Flat/Delta/XOR) to first access. `decodePagedColumnBlob` decodes the value side eagerly
+(Uint64Values/BytesValues + Count) but skips `appendVariableWidthRefs`, instead capturing a
+closure `refsDecode = func() []BlockRef { return decodePagedColumnRefs(blob) }`.
+`IntrinsicColumn.EnsureBlockRefs()` runs that closure at most once under a `sync.Once`.
+The deferred decode re-walks pages, skipping each page's value section (`pageRefsOffset`:
+varint scan for Delta/Flat-uint64, length-prefix scan for XOR-bytes / Flat-bytes) to locate
+its refs offset, then `appendVariableWidthRefs` into a pre-sized arena — yielding refs
+byte-identical to the eager decode.
+
+**Why:** `appendVariableWidthRefs` was ~10.7s of querier self-time (process_cpu profile
+2026-06-14, second-largest blockpack frame after s2 decode) — entirely the span:start
+(Delta) ref decode. The unfiltered, no-group-by `{} | rate()` fast path
+(streamCountRateNoGroupBySorted) reads ONLY Uint64Values + the row count; it never touches
+BlockRefs. So for that dominant warm path the ref decode was pure waste.
+
+**Cache-safe:** the decoded IntrinsicColumn is process-cached (parsedIntrinsicCache) and shared
+across queries. A later rate()-by / histogram / predicate-filtered query that DOES need refs
+calls EnsureBlockRefs (via GetIntrinsicColumn, which always materializes, or the metrics
+dispatch's needsRefs branch), decoding once and memoizing under the Once's happens-before so
+every subsequent reader sees the same populated slice. The captured `blob` is the
+freshly-allocated, caller-owned copy returned by GetOrFetchIntrinsic/GetMultiIntrinsic (every
+cache tier — MemCache, FileCache — returns `make+copy`, never a pooled buffer), so retaining
+it in the closure is safe and keeps it alive for the lifetime of the cached column. The lazy
+re-walk decompresses pages into a pooled scratch (AcquireIntrinsicBuf) released before return.
+
+**Contract:** ALL readers of the BlockRefs field MUST call EnsureBlockRefs() first.
+GetIntrinsicColumn enforces this for every existing caller (it ensures before returning), so
+only the single span:start fetch on the no-group-by rate path opts into deferral via the new
+GetIntrinsicColumnLazyRefs. Dict columns keep eager refs (their refs share a cross-page arena,
+NOTE-152) — refsDecode is nil for them, making EnsureBlockRefs a no-op.
+
+**Verification:** new TestLazyBlockRefsDeferred (BlockRefs nil until EnsureBlockRefs, then
+byte-equal to eager refs, idempotent, no re-decode); existing Delta/Flat/XOR equivalence tests
+adapted to EnsureBlockRefs before comparing (they now also verify lazy == eager refs).
+`go test -race ./blockio/... ./executor` green.
