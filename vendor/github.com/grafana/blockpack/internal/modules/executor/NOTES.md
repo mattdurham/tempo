@@ -5397,3 +5397,30 @@ parent_id); dict columns (span:name/service.name/status/kind) keep refIndex and 
 existing BlockRefRange path. Each `*Dense` body mirrors its general counterpart's per-row body
 exactly (same bounds checks, present bit, source array), so output is byte-identical —
 verified by TestPopulateTypedColumnForBlock_DenseEqualsGeneral.
+
+## NOTE-355: retention cap on executor per-block scratch pools (bound post-spike RSS)
+
+Every executor scratch pool in `metrics_trace_intrinsic.go` — `groupCountsFlat`,
+`compactUint32` / `compactInt32` / `compactUint64` / `compactFloat64` / `compactBool` /
+`compactBlockRef`, and `directInt16` / `directBool` — is sized to a block's row count `n`
+(up to ~7.2 M) or its primary-key span `maxPK` (up to ~16 M). Their `release*` helpers did
+an unconditional `Pool.Put(s[:cap(s)])`, so a single giant block grew the pooled backing
+array to tens/hundreds of MiB (compactUint64 ~57 MB at n=7.2 M, groupCountsFlat up to 68 MB,
+directInt16 ~32 MB at maxPK=16 M) and pinned it.
+
+`sync.Pool` only ages out entries that sit a full GC cycle UNUSED — but a buffer this large
+that keeps getting reused never ages out. Under sustained heavy M4/M6/M8/M9 load these pools
+accumulated several giant arrays each (one per P plus the victim cache) and held querier RSS
+elevated long after the spike that produced them had drained. The 2026-06-14 querier
+inuse_space profile showed `acquireCompactUint64` (545 MB) and `acquireCompactUint32NoClear`
+(361 MB) among the top live frames — that is pool residue, not active query working set.
+
+Fix: each `release*` now drops a backing array whose byte size exceeds
+`compactPoolMaxPooledBytes` (32 MiB) instead of pooling it, so the array GCs and the next
+giant block re-grows from a fresh allocation. The 32 MiB cap covers the direct-aggregation
+working set (`maxDirectAggEntries` = 4 M × 8 B = 32 MiB) so common-to-large blocks still
+recycle with zero churn; only the p99 giants drop. Per-P × per-pool residue therefore settles
+at ≤32 MiB rather than at the peak giant-block size. Mirrors `decompBufMaxPooledCap` (NOTE-346)
+and `assembledBufMaxPooledCap` (NOTE-208) on the reader side. Verified by
+`TestCompactPools_DropOversizedOnRelease` (over-cap buffers are never returned to their pool;
+all capped releases are panic-free for both under- and over-cap inputs).

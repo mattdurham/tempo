@@ -29,6 +29,36 @@ import (
 // sync.Pool GC-collects items at each GC cycle, so no permanent memory leak.
 var groupCountsFlatPool sync.Pool
 
+// compactPoolMaxPooledBytes bounds the backing-array byte size any per-block scratch
+// buffer may carry back into the executor compact/direct pools.
+//
+// NOTE-355: every executor scratch pool (groupCountsFlat, compactUint32/Int32/Uint64/
+// Float64/Bool/BlockRef, directInt16/Bool) is sized to a block's row count n (up to ~7.2 M)
+// or its primary-key span maxPK (up to ~16 M). A single huge block therefore grows the
+// pooled buffer to tens/hundreds of MiB (e.g. compactUint64 ~57 MB at n=7.2 M,
+// groupCountsFlat up to 68 MB, directInt16 ~32 MB at maxPK=16 M), and the unconditional
+// Pool.Put pinned that giant backing array. sync.Pool only ages out entries that go a full
+// GC cycle UNUSED — but a buffer this size that keeps being reused never ages out, so under
+// sustained heavy M4/M6/M8/M9 load these pools accumulated several giant arrays per pool
+// (per P + victim cache) and held querier RSS elevated long after the spike that produced
+// them had drained. The querier inuse_space profile (2026-06-14) showed acquireCompactUint64
+// (545 MB) and acquireCompactUint32NoClear (361 MB) among the top live frames — pool
+// residue, not active query working set.
+//
+// Capping retained backing-array bytes lets the common/medium-block working set recycle with
+// no churn (a typical block fits comfortably under the cap) while dropping the rare giant
+// outlier so it GCs instead of permanently raising the pool's high-water mark; the next big
+// block simply re-grows from a freshly allocated array. Mirrors decompBufMaxPooledCap
+// (NOTE-346) and assembledBufMaxPooledCap (NOTE-208) on the reader side.
+//
+// Sizing (32 MiB): covers the direct-aggregation working set (maxDirectAggEntries = 4 M ×
+// 8 B = 32 MiB) so common-to-large blocks recycle without churn, while still dropping the
+// p99 giants — the 16 M-row maxPK span direct paths (e.g. directInt16 ~32 MB stays, but the
+// 7.2 M-row compactUint64 at ~57 MB and 16 M-entry int64 accumulators at >100 MB drop). The
+// effect is the per-P × per-pool pool residue settles at ≤32 MiB instead of at the peak
+// giant-block size, bounding post-spike RSS without penalizing the steady-state load.
+const compactPoolMaxPooledBytes = 32 << 20 // 32 MiB
+
 // acquireGroupCountsFlat returns a zeroed []int64 of at least size n, either
 // from the pool (if a large-enough slice is available) or freshly allocated.
 func acquireGroupCountsFlat(n int64) []int64 {
@@ -42,8 +72,12 @@ func acquireGroupCountsFlat(n int64) []int64 {
 	return make([]int64, n)
 }
 
-// releaseGroupCountsFlat returns s to the pool for reuse.
+// releaseGroupCountsFlat returns s to the pool for reuse. NOTE-355: oversized backing
+// arrays (a giant outlier block) are dropped rather than pooled so they cannot pin RSS.
 func releaseGroupCountsFlat(s []int64) {
+	if cap(s)*8 > compactPoolMaxPooledBytes {
+		return
+	}
 	groupCountsFlatPool.Put(s[:cap(s)]) //nolint:staticcheck // SA6002: slice is pointer-sized
 }
 
@@ -89,6 +123,9 @@ func acquireCompactUint32(n int) []uint32 {
 }
 
 func releaseCompactUint32(s []uint32) {
+	if cap(s)*4 > compactPoolMaxPooledBytes { // NOTE-355: drop oversized outlier
+		return
+	}
 	compactUint32Pool.Put(s[:cap(s)]) //nolint:staticcheck // SA6002: slice is pointer-sized
 }
 
@@ -122,6 +159,9 @@ func acquireCompactInt32(n int) []int32 {
 }
 
 func releaseCompactInt32(s []int32) {
+	if cap(s)*4 > compactPoolMaxPooledBytes { // NOTE-355: drop oversized outlier
+		return
+	}
 	compactInt32Pool.Put(s[:cap(s)]) //nolint:staticcheck // SA6002: slice is pointer-sized
 }
 
@@ -139,6 +179,9 @@ func acquireCompactUint64(n int) []uint64 {
 }
 
 func releaseCompactUint64(s []uint64) {
+	if cap(s)*8 > compactPoolMaxPooledBytes { // NOTE-355: drop oversized outlier
+		return
+	}
 	compactUint64Pool.Put(s[:cap(s)]) //nolint:staticcheck // SA6002: slice is pointer-sized
 }
 
@@ -154,6 +197,9 @@ func acquireCompactFloat64(n int) []float64 {
 }
 
 func releaseCompactFloat64(s []float64) {
+	if cap(s)*8 > compactPoolMaxPooledBytes { // NOTE-355: drop oversized outlier
+		return
+	}
 	compactFloat64Pool.Put(s[:cap(s)]) //nolint:staticcheck // SA6002: slice is pointer-sized
 }
 
@@ -169,6 +215,9 @@ func acquireCompactBool(n int) []bool {
 }
 
 func releaseCompactBool(s []bool) {
+	if cap(s) > compactPoolMaxPooledBytes { // NOTE-355: drop oversized outlier (1 byte/elem)
+		return
+	}
 	compactBoolPool.Put(s[:cap(s)]) //nolint:staticcheck // SA6002: slice is pointer-sized
 }
 
@@ -185,6 +234,9 @@ func acquireCompactBlockRef(n int) []modules_shared.BlockRef {
 }
 
 func releaseCompactBlockRef(s []modules_shared.BlockRef) {
+	if cap(s)*4 > compactPoolMaxPooledBytes { // NOTE-355: drop oversized outlier (BlockRef=4B)
+		return
+	}
 	compactBlockRefPool.Put(s[:cap(s)]) //nolint:staticcheck // SA6002: slice is pointer-sized
 }
 
@@ -208,6 +260,9 @@ func acquireDirectInt16(n int) []int16 {
 }
 
 func releaseDirectInt16(s []int16) {
+	if cap(s)*2 > compactPoolMaxPooledBytes { // NOTE-355: drop oversized outlier (2 bytes/elem)
+		return
+	}
 	directInt16Pool.Put(s[:cap(s)]) //nolint:staticcheck // SA6002: slice is pointer-sized
 }
 
@@ -223,6 +278,9 @@ func acquireDirectBool(n int) []bool {
 }
 
 func releaseDirectBool(s []bool) {
+	if cap(s) > compactPoolMaxPooledBytes { // NOTE-355: drop oversized outlier (1 byte/elem)
+		return
+	}
 	directBoolPool.Put(s[:cap(s)]) //nolint:staticcheck // SA6002: slice is pointer-sized
 }
 
