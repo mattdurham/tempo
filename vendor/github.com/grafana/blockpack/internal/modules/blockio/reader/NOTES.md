@@ -2383,3 +2383,51 @@ is total bytes-in-use / RSS, measured via gcx `memory:inuse_space` before/after 
 
 Back-ref: `block_parser.go:putDecompBuf`, `column.go:ensureDecompressed`,
 `column.go:releaseDecompPooled`.
+
+## NOTE-349: True two-phase loading for the legacy V8 snappy trace section
+*Added: 2026-06-14*
+
+**Problem:** `ensureV8TraceSection` (the full-reader entry point for trace-ID lookups on
+legacy V8 files — those written before the range-readable chunked trace index, issue #340)
+EAGERLY fetched, snappy-decompressed, and then ALIASED the whole trace-index body into
+`r.compactParsed.traceIndexRaw` (NOTE-257). The V14 trace index is tens of MB; aliasing it
+pinned the entire decompressed section in every live Reader. Trace lookups are per-block,
+per-query, and highly concurrent, so under load this was the single largest retained object
+on the querier heap: a `memory:inuse_space` profile attributed **~1.9 GB** to the frame
+`readRange <- fetchToCSection <- ensureV8TraceSection` (the top `maxSelf` frame, 1896 MB),
+the multiplicative per-query × concurrent-query peak described as memory target #4.
+
+The two-phase design was already documented (NOTE-013) and the lazy phase-2 machinery
+(`ensureTraceIndexRaw`, `isV14TraceSection`, `splitV14CompactSection`) already existed and is
+used by the lean-reader path — but the FULL V8 reader short-circuited it by populating
+`traceIndexRaw` in phase 1. The reason it short-circuited: phase 2's V14 branch fetches via
+`readV14Section`, which keys off `r.sectionDir` — and `sectionDir` is NOT populated on the V8
+path, so the lazy re-fetch would have returned nil for V8 files.
+
+**Solution:** make `ensureV8TraceSection` do real two-phase loading:
+- Phase 1: read + decompress the section into a TRANSIENT blob, parse ONLY the header
+  (`parseCompactIndexBytesV14Header` deep-copies the bloom filter and block table into
+  `compactParsed`), record the compressed section's `(offset, len)` on `compactParsed`
+  (new fields `v8SectionOffset`/`v8SectionLen`, flag `isV8SnappyTraceIndex`), and let the
+  transient decompressed blob become collectable. `traceIndexRaw` stays nil.
+- Phase 2: extend `ensureTraceIndexRaw` with an `isV8SnappyTraceIndex` branch that re-reads
+  the compressed section from its recorded location, snappy-decompresses, splits, and
+  returns an INDEPENDENT copy of the trace-index body. Runs only on a bloom HIT — the vast
+  majority of trace lookups reject at the bloom and never touch the body.
+- `TraceCount` (a stats/compaction call, not the hot path) now calls `ensureTraceIndexRaw`
+  before reading the count out of the header, since the body is no longer eager.
+
+The bloom filter + block table (the only fields phase-1 callers — `MayContainTraceID`,
+`BlocksForTraceID` bloom-reject, `TraceCount`) are already deep-copied out of the transient
+blob, so nothing aliases it after phase 1.
+
+**Result:** the ~1.9 GB legacy-trace-section retention is removed from the querier heap;
+only the small header (bloom + block table) is retained per live Reader. A bloom hit pays a
+re-read + re-decompress, which is the explicitly-accepted NOTE-013 tradeoff (rare, only on
+hits). Verified by `legacy_trace_twophase_test.go`: phase 1 leaves `traceIndexRaw` nil,
+sets `isV8SnappyTraceIndex`, and records the section location; a real lookup populates the
+body via phase 2 and returns the correct blocks; `TraceCount` works; phase 2 re-reads the
+recorded extent.
+
+Back-ref: `parser.go:ensureV8TraceSection`, `trace_index.go:ensureTraceIndexRaw`,
+`reader.go:TraceCount`, `compacttraceindex.go` (v8Section fields).

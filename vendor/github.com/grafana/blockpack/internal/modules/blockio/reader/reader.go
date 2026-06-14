@@ -354,6 +354,13 @@ func (r *Reader) TraceCount() int {
 	if len(r.traceIndex) > 0 {
 		return len(r.traceIndex)
 	}
+	// NOTE-349: the V8 legacy trace-index body is now loaded lazily (phase 2), so it
+	// must be fetched before reading the trace count out of its header. TraceCount is a
+	// stats/compaction call (not on the hot query path), so the one-off body fetch here
+	// is acceptable; bloom-reject query lookups still never trigger it.
+	if r.compactParsed != nil && r.compactParsed.traceIndexRaw == nil {
+		_ = r.ensureTraceIndexRaw()
+	}
 	if r.compactParsed != nil && len(r.compactParsed.traceIndexRaw) >= 5 {
 		fmtVer := r.compactParsed.traceIndexRaw[0]
 		if fmtVer == shared.TraceIndexFmtVersion || fmtVer == shared.TraceIndexFmtVersion2 {

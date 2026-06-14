@@ -30,8 +30,16 @@ type compactTraceIndex struct {
 	traceIdxSampleIDs []uint64
 	traceIndexOffset  uint64
 	traceIndexLen     uint64
-	traceIdxSampleOK  bool
-	isV14TraceSection bool
-	traceIndexOnce    sync.Once
-	traceIdxIndexOnce sync.Once
+	// NOTE-349: location of the FULL snappy-compressed V8 legacy trace section
+	// (header + block table + trace index, one snappy blob). Recorded during the
+	// phase-1 header parse so ensureTraceIndexRaw can re-read and re-split the
+	// section lazily on a bloom hit, instead of pinning the whole decompressed
+	// blob in every live Reader via traceIndexRaw. Zero when not a V8 section.
+	v8SectionOffset      uint64
+	v8SectionLen         uint64
+	traceIdxSampleOK     bool
+	isV14TraceSection    bool
+	isV8SnappyTraceIndex bool
+	traceIndexOnce       sync.Once
+	traceIdxIndexOnce    sync.Once
 }

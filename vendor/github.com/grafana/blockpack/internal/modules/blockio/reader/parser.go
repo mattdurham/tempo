@@ -408,15 +408,39 @@ func (r *Reader) ensureV8TraceSection() error {
 			r.chunkedTrace = ci
 			return
 		}
-		raw, err := r.fetchToCSection(shared.ToCKey{Type: shared.ToCTypeMetadata, SubType: shared.ToCSubTypeTrace})
-		if err != nil {
-			r.v8TraceErr = fmt.Errorf("ensureV8TraceSection: %w", err)
+		// NOTE-349: TRUE two-phase loading for the legacy V8 snappy trace section.
+		// Phase 1 here parses ONLY the header (bloom filter + block table) and records
+		// the compressed section's file location; it does NOT retain the decompressed
+		// trace-index bytes. Phase 2 (ensureTraceIndexRaw) re-reads + re-splits the
+		// section lazily on a bloom HIT — the vast majority of trace lookups reject at
+		// the bloom and never need the tens-of-MB trace-index body.
+		//
+		// Before NOTE-349 this method eagerly aliased the trace-index sub-slice into
+		// r.compactParsed.traceIndexRaw (NOTE-257), pinning the entire decompressed
+		// section in every live Reader. Under concurrent trace-lookup load that was the
+		// single largest retained object on the querier heap (~1.9 GB in the inuse_space
+		// profile, frame fetchToCSection<-ensureV8TraceSection). Deferring the body fetch
+		// removes that retention; the bloom + block table (the only fields phase-1
+		// callers — MayContainTraceID, BlocksForTraceID bloom-reject, TraceCount — need)
+		// are deep-copied out of the transient blob by parseCompactIndexBytesV14Header.
+		entry, ok := r.tocMap[shared.ToCKey{Type: shared.ToCTypeMetadata, SubType: shared.ToCSubTypeTrace}]
+		if !ok {
+			return
+		}
+		compressed, readErr := r.readRange(entry.Offset, uint64(entry.Length), rw.DataTypeMetadata) //nolint:gosec
+		if readErr != nil {
+			r.v8TraceErr = fmt.Errorf("ensureV8TraceSection: read: %w", readErr)
+			return
+		}
+		raw, decErr := decodeBoundedSnappy(compressed)
+		if decErr != nil {
+			r.v8TraceErr = fmt.Errorf("ensureV8TraceSection: snappy: %w", decErr)
 			return
 		}
 		if len(raw) == 0 {
 			return
 		}
-		header, traceIdxBytes, splitErr := splitV14CompactSection(raw)
+		header, _, splitErr := splitV14CompactSection(raw)
 		if splitErr != nil {
 			r.v8TraceErr = fmt.Errorf("ensureV8TraceSection: split: %w", splitErr)
 			return
@@ -425,20 +449,13 @@ func (r *Reader) ensureV8TraceSection() error {
 			r.v8TraceErr = fmt.Errorf("ensureV8TraceSection: parse: %w", parseErr)
 			return
 		}
-		if traceIdxBytes != nil && r.compactParsed != nil {
-			// NOTE-257: hold the trace-index bytes in place (a sub-slice of the cached
-			// compact-section blob) instead of copying them into a fresh allocation. The
-			// V14 trace index is tens of MB; the old append([]byte(nil), ...) was a full
-			// memmove of that whole extent on every Reader that does a FindTraceByID
-			// (the dominant memmove on the Q8/trace-lookup path, profile 2026-06-13).
-			// The blob returned by fetchToCSection -> GetOrFetchV8Section is owned and
-			// never mutated by the cache: MemoryCache.Get hands back the same backing
-			// array it stored under a "caller must not modify after Put" contract, and
-			// eviction merely drops the reference (no buffer reuse). scanTraceIndexRaw
-			// only ever READS traceIndexRaw, so aliasing the cache blob is safe — Go's GC
-			// keeps the backing array alive through this sub-slice even after the cache
-			// evicts its own reference.
-			r.compactParsed.traceIndexRaw = traceIdxBytes
+		// Record the section location so ensureTraceIndexRaw can re-fetch the body
+		// on a bloom hit. The transient `raw`/`compressed` blobs are now unreferenced
+		// and become collectable as soon as this closure returns.
+		if r.compactParsed != nil {
+			r.compactParsed.v8SectionOffset = entry.Offset
+			r.compactParsed.v8SectionLen = uint64(entry.Length) //nolint:gosec
+			r.compactParsed.isV8SnappyTraceIndex = true
 		}
 	})
 	return r.v8TraceErr

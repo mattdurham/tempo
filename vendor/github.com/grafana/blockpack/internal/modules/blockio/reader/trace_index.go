@@ -699,13 +699,39 @@ func (r *Reader) ensureTraceIndexRaw() error {
 		return nil
 	}
 
-	// Also fast path if no lazy-load location is recorded (V3/V4 path) and not V14.
-	if r.compactParsed.traceIndexLen == 0 && !r.compactParsed.isV14TraceSection {
+	// Also fast path if no lazy-load location is recorded (V3/V4 path) and not V14/V8.
+	if r.compactParsed.traceIndexLen == 0 && !r.compactParsed.isV14TraceSection &&
+		!r.compactParsed.isV8SnappyTraceIndex {
 		return fmt.Errorf("compact index: trace_index location not recorded")
 	}
 
 	r.compactParsed.traceIndexOnce.Do(func() {
 		data, err := r.cache.GetOrFetchTraceIndex(r.fileID, false, func() ([]byte, error) {
+			if r.compactParsed.isV8SnappyTraceIndex {
+				// NOTE-349: V8 legacy section — re-read the compressed section from its
+				// recorded file location, snappy-decompress, and extract the trace-index
+				// body. Phase 1 (ensureV8TraceSection) deliberately did NOT retain this
+				// body to keep it off the querier heap; this phase-2 fetch runs only on a
+				// bloom hit. The returned slice is an independent copy of the body so the
+				// large decompressed blob is not pinned by the cached trace-index entry.
+				compressed, readErr := r.readRange(
+					r.compactParsed.v8SectionOffset,
+					r.compactParsed.v8SectionLen,
+					rw.DataTypeTraceBloomFilter,
+				)
+				if readErr != nil {
+					return nil, readErr
+				}
+				decoded, decErr := decodeBoundedSnappy(compressed)
+				if decErr != nil {
+					return nil, decErr
+				}
+				_, traceIdx, splitErr := splitV14CompactSection(decoded)
+				if splitErr != nil {
+					return nil, splitErr
+				}
+				return append([]byte(nil), traceIdx...), nil
+			}
 			if r.compactParsed.isV14TraceSection {
 				// V14: re-read the full trace section and extract trace index bytes.
 				raw, readErr := r.readV14Section(shared.SectionTraceIndex)
