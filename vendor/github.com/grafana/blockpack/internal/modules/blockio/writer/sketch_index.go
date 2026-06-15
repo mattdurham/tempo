@@ -27,6 +27,7 @@ import (
 	"math"
 	"sync"
 
+	"github.com/grafana/blockpack/internal/modules/blockio/shared"
 	"github.com/grafana/blockpack/internal/modules/sketch"
 )
 
@@ -101,6 +102,13 @@ func newBlockSketchSet() blockSketchSet {
 // SPEC-SK-16: HashForFuse(key) is the canonical hash used at query time as well.
 // fp is computed once and shared across HLL, TopK, and the bloom filter.
 func (bs blockSketchSet) add(col, key string) {
+	// NOTE-402 (issue #354): skip identity / high-entropy ID columns. Their per-column
+	// SketchBloom saturates (no pruning value) yet costs a maximal 2 KiB/block — the most
+	// expensive sketch on disk. No query block-prunes or computes quantiles on span/parent
+	// IDs, and the reader treats an absent per-column sketch as a conservative pass.
+	if !shared.ShouldSketchColumn(col) {
+		return
+	}
 	cs, ok := bs[col]
 	if !ok {
 		cs = getColSketch()

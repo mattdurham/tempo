@@ -67,6 +67,42 @@ var semanticBytesOverrides = map[string]semanticOverride{
 	"log:span_id":    {reason: "fixed-width IDs with shared high-order bits", enc: SemanticBytesXOR},
 }
 
+// ShouldSketchColumn reports whether the per-column sketch (HLL distinct-count + TopK +
+// SketchBloom) should be built for the named column. It returns false for identity /
+// high-entropy ID columns whose sketch carries no query value (NOTE-402, issue #354).
+//
+// The per-column SketchBloom powers predicate block-pruning (queryplanner/scoring.go,
+// FuseContains). For high-cardinality identity columns (span:id, span:parent_id and their
+// log equivalents) every block holds thousands of distinct random IDs, so the bloom is
+// saturated (~5% FPR at 5 000 values) and prunes nothing; meanwhile each such column emits
+// a maximal 2 KiB bloom per block — the single most expensive sketch on disk. No TraceQL
+// query computes quantiles/histograms or block-prunes on span/parent IDs (ID lookups use
+// the trace-ID bloom and equality scans, independent of the per-column sketch), so dropping
+// these sketches loses nothing.
+//
+// The reader already tolerates an absent per-column sketch: ColumnSketch returns nil and the
+// scoring/pruning path takes its conservative "pass all candidates" branch. So skipping the
+// sketch is behavior-preserving and requires no format change (the writer simply emits fewer
+// sketch blobs).
+func ShouldSketchColumn(name string) bool {
+	_, skip := sketchSkipColumnSet[name]
+	return !skip
+}
+
+// sketchSkipColumnSet is the deliberate allow-list of identity / high-entropy ID columns whose
+// per-column sketch is unconditionally safe to skip (NOTE-402, issue #354). These are exactly
+// the fixed-width random-ID columns: their values are equality/bloom-tested via the trace-ID
+// path, never quantile/range/block-pruned through the per-column sketch. Adding a column here
+// requires confirming no query path block-prunes or computes quantiles on it.
+//
+// Timestamps (span:start/span:end/__timestamp__) and durations (span:duration) are NOT here —
+// they back range-boundary pruning and quantile/histogram estimation and keep their sketches.
+var sketchSkipColumnSet = map[string]struct{}{
+	"span:id":        {},
+	"span:parent_id": {},
+	"log:span_id":    {},
+}
+
 // intrinsicColumnSet is the canonical set of intrinsic column names across both trace and log
 // signal types. Values are empty struct{} for O(1) lookup with zero memory overhead.
 var intrinsicColumnSet = map[string]struct{}{

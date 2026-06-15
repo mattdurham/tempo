@@ -795,3 +795,32 @@ Back-ref: `internal/modules/blockio/writer/writer_block.go:feedSpanTiming`,
           `internal/modules/blockio/writer/writer_block.go:finalizeRowBookkeeping`,
           `internal/modules/blockio/writer/writer.go:AddRow`,
           `internal/modules/blockio/reader/intrinsic_reader.go:synthesizeSpanEnd`
+
+## NOTE-402 — Skip per-column sketch on identity / high-entropy ID columns (issue #354)
+
+**Decision:** Do not build the per-column sketch (HLL distinct-count + TopK + 2 KiB SketchBloom)
+for identity / high-entropy ID columns: `span:id`, `span:parent_id`, `log:span_id`.
+
+**Why:** The per-column SketchBloom powers predicate block-pruning (`queryplanner/scoring.go`,
+`FuseContains`). On high-cardinality identity columns every block holds thousands of distinct
+random IDs, so the bloom is saturated (~5% FPR at 5 000 values) and prunes nothing — yet each
+such column emits a *maximal* 2 KiB bloom per block, making these the single most expensive
+sketches on disk (~3–4% of file size on a representative block). No TraceQL query computes
+quantiles/histograms or block-prunes on span/parent IDs (ID lookups use the trace-ID bloom and
+equality scans, independent of the per-column sketch), so dropping these sketches loses nothing.
+
+**Mechanism:** A `shared.ShouldSketchColumn(name)` predicate (allow-list in
+`internal/modules/blockio/shared/column_classify.go`) gates the single write-side chokepoint,
+`blockSketchSet.add` (`sketch_index.go`). Skipped columns are never inserted into the
+`blockSketchSet`, so `writeOneColumnSketchBlob` returns `nil` for them and they never appear in
+the sketch TOC.
+
+**Back-compat / no format change:** The reader already tolerates an absent per-column sketch —
+`Reader.ColumnSketch` returns `nil` and the scoring/pruning path takes its conservative
+"pass all candidates" branch. Existing files are unaffected; new files simply emit fewer sketch
+blobs. Timestamps (`span:start`/`span:end`/`__timestamp__`) and durations (`span:duration`) are
+NOT skipped — they back range-boundary pruning and quantile/histogram estimation. `trace:id`
+is intentionally NOT skipped here (treated separately per the issue).
+
+Back-ref: `internal/modules/blockio/shared/column_classify.go:ShouldSketchColumn`,
+          `internal/modules/blockio/writer/sketch_index.go:add`
