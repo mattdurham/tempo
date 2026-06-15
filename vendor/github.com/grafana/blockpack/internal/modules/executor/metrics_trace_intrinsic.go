@@ -1112,7 +1112,7 @@ func scanAggColHistogramCompact( //nolint:gocyclo
 	seenByPos []bool,
 	getBoundaryIdx func(float64) int64,
 	groupCountsFlat []int64,
-	stride1, stride2 int64,
+	stride1, stepStride int64,
 	discardStride int64,
 	fieldName string, // NOTE-143: callers pass agg.Field; used to rebuild boundaries for worker reads
 	roBoundary func(float64) int64, // NOTE-182: race-free per-row lookup for parallel workers; nil → frozen-map fallback
@@ -1185,14 +1185,14 @@ func scanAggColHistogramCompact( //nolint:gocyclo
 	// read. Fully overwritten by buildHistBaseOffsets → acquire without clearing.
 	baseOffsetByPos := acquireCompactInt64NoClear(len(seenByPos))
 	defer releaseCompactInt64(baseOffsetByPos)
-	buildHistBaseOffsets(timeBucketByPos, dictIdxByPos, stride1, baseOffsetByPos)
+	buildHistBaseOffsets(timeBucketByPos, dictIdxByPos, stride1, stepStride, baseOffsetByPos)
 
 	// NOTE-143: serial fallback — byte-identical to the pre-NOTE-143 path. Writes directly into
 	// the caller's groupCountsFlat/seenByPos over the full range using the ORIGINAL closure.
 	if w <= 1 || numItems < histParallelMinItems {
 		return scanAggColHistogramShard(ctx, col, 0, numItems, minPK, maxPK,
 			pkBitset, rankPrefix, baseOffsetByPos, seenByPos,
-			getBoundaryIdx, groupCountsFlat, stride2, discardStride)
+			getBoundaryIdx, groupCountsFlat, discardStride)
 	}
 
 	// NOTE-143: parallel path. Serial pre-warm so workers do pure read-only boundary lookups, and
@@ -1255,7 +1255,7 @@ func scanAggColHistogramCompact( //nolint:gocyclo
 			defer wg.Done()
 			errs[k] = scanAggColHistogramShard(ctx, col, start, end, minPK, maxPK,
 				pkBitset, rankPrefix, baseOffsetByPos, seen,
-				roBoundary, gcf, stride2, discardStride)
+				roBoundary, gcf, discardStride)
 		}(k, start, end, gcf, seen)
 	}
 	wg.Wait()
@@ -1327,8 +1327,14 @@ func buildHistBaseOffsets(
 	timeBucketByPos []int32,
 	dictIdxByPos []uint32,
 	stride1 int64,
+	stepStride int64,
 	out []int64,
 ) {
+	// NOTE-398: boundary-innermost layout. base = gIdx*stride1 + (bk-1)*stepStride; the scan
+	// adds bIdx (boundary index, innermost, stride 1). The per-pos working set is the
+	// stepStride (=actualStride) contiguous cells for this (group,step) — a few cache lines —
+	// regardless of numSteps, so consecutive same-pos refs with differing value-buckets hit
+	// the same cache line instead of jumping by bIdx*numSteps (NOTE-397's old [group][bnd][step]).
 	for pos := range timeBucketByPos {
 		bk := timeBucketByPos[pos]
 		if bk == 0 {
@@ -1339,7 +1345,7 @@ func buildHistBaseOffsets(
 		if raw := dictIdxByPos[pos]; raw > 0 {
 			gIdx = int64(raw - 1) //nolint:gosec
 		}
-		out[pos] = gIdx*stride1 + int64(bk) - 1
+		out[pos] = gIdx*stride1 + (int64(bk)-1)*stepStride
 	}
 }
 
@@ -1358,7 +1364,6 @@ func scanAggColHistogramShard( //nolint:gocyclo
 	seenByPos []bool,
 	getBoundaryIdx func(float64) int64,
 	groupCountsFlat []int64,
-	stride2 int64,
 	discardStride int64,
 ) error {
 	spanCount := 0
@@ -1407,7 +1412,7 @@ func scanAggColHistogramShard( //nolint:gocyclo
 					continue
 				}
 				seenByPos[pos] = true
-				groupCountsFlat[base+bIdx*stride2]++
+				groupCountsFlat[base+bIdx]++
 			}
 		}
 	case modules_shared.IntrinsicFormatFlat,
@@ -1439,7 +1444,7 @@ func scanAggColHistogramShard( //nolint:gocyclo
 				continue
 			}
 			seenByPos[pos] = true
-			groupCountsFlat[base+bIdx*stride2]++
+			groupCountsFlat[base+bIdx]++
 		}
 	}
 	return nil
@@ -2432,7 +2437,10 @@ func streamHistogramN1CompactCore(
 	} else {
 		actualStride = 1
 	}
-	stride2 := numSteps
+	// NOTE-398: boundary-innermost layout [group][step][boundary]. stepStride = actualStride
+	// (the boundary count), so the inner (group,step) slot is actualStride contiguous cells and
+	// consecutive same-pos refs with differing value-buckets stay on the same cache line.
+	stepStride := actualStride
 	stride1 := actualStride * numSteps
 	// NOTE-124: pool to avoid per-block allocation.
 	groupCountsFlat := acquireGroupCountsFlat(int64(numGroups) * stride1) //nolint:gosec
@@ -2446,13 +2454,14 @@ func streamHistogramN1CompactCore(
 	seenByPos := acquireCompactBool(n)
 	defer releaseCompactBool(seenByPos)
 	if aggCol != nil {
-		if err := scanAggColHistogramCompact(ctx, aggCol, sortedPKs, timeBucketByPos, dictIdxByPos, seenByPos, getBoundaryIdx, groupCountsFlat, stride1, stride2, actualStride, agg.Field, bi.lookup, bi); err != nil {
+		if err := scanAggColHistogramCompact(ctx, aggCol, sortedPKs, timeBucketByPos, dictIdxByPos, seenByPos, getBoundaryIdx, groupCountsFlat, stride1, stepStride, actualStride, agg.Field, bi.lookup, bi); err != nil {
 			return err
 		}
 	}
 	boundaries := bi.boundaries
 
 	// Absent-row pass: positions not seen in the aggregate column → bIdx=0 sentinel.
+	// NOTE-398: bIdx=0 is the innermost (stride 1) slot, so the cell is gIdx*stride1 + (bk-1)*stepStride.
 	for pos, seen := range seenByPos {
 		if seen {
 			continue
@@ -2466,11 +2475,22 @@ func streamHistogramN1CompactCore(
 			gIdx = int64(raw - 1) //nolint:gosec
 		}
 		if gIdx < int64(numGroups) { //nolint:gosec
-			groupCountsFlat[gIdx*stride1+int64(bk)-1]++ //nolint:gosec
+			groupCountsFlat[gIdx*stride1+(int64(bk)-1)*stepStride]++ //nolint:gosec
 		}
 	}
 
-	return emitHistogramFlat(histSink, groupCountsFlat, stride1, stride2, numGroups, dict, boundaries, agg, buckets)
+	return emitHistogramFlat(
+		histSink,
+		groupCountsFlat,
+		stride1,
+		stepStride,
+		numSteps,
+		numGroups,
+		dict,
+		boundaries,
+		agg,
+		buckets,
+	)
 }
 
 // mergeJoinFilteredRefsWithVals returns the subset of (inRangeRefs, inRangeVals)
@@ -3971,7 +3991,8 @@ func accumulateHistogramDirect(
 	} else {
 		actualStride = 1
 	}
-	stride2 := numSteps
+	// NOTE-398: boundary-innermost layout [group][step][boundary]; stepStride = actualStride.
+	stepStride := actualStride
 	stride1 := actualStride * numSteps
 	groupCountsFlat := acquireGroupCountsFlat(int64(numGroups) * stride1) //nolint:gosec
 	defer releaseGroupCountsFlat(groupCountsFlat)
@@ -3990,13 +4011,14 @@ func accumulateHistogramDirect(
 	seenByPK := acquireDirectBool(int(maxPK) + 1) // NOTE-129
 
 	if col != nil {
-		if err := streamByRefSliceHistogramScanDict(ctx, col, bucketByPK, dictByPK, maxPK, seenByPK, bi.index, groupCountsFlat, stride1, stride2, actualStride); err != nil {
+		if err := streamByRefSliceHistogramScanDict(ctx, col, bucketByPK, dictByPK, maxPK, seenByPK, bi.index, groupCountsFlat, stride1, stepStride, actualStride); err != nil {
 			releaseDirectBool(seenByPK)
 			return err
 		}
 	}
 
 	// Absent-row pass: walk bucketByPK directly (no inRangeRefs) — bIdx=0 sentinel.
+	// NOTE-398: bIdx=0 is innermost (stride 1): gIdx*stride1 + (bk-1)*stepStride.
 	for pk, bk16 := range bucketByPK {
 		bk := int64(bk16)
 		if bk == 0 || seenByPK[pk] {
@@ -4009,22 +4031,33 @@ func accumulateHistogramDirect(
 		if gIdx >= int64(numGroups) { //nolint:gosec
 			continue
 		}
-		groupCountsFlat[gIdx*stride1+(bk-1)]++
+		groupCountsFlat[gIdx*stride1+(bk-1)*stepStride]++
 	}
 
 	// NOTE-129: release seenByPK before emit — frees 16 MB before non-trivial emit work.
 	releaseDirectBool(seenByPK)
-	return emitHistogramFlat(histSink, groupCountsFlat, stride1, stride2, numGroups, dict, bi.boundaries, agg, buckets)
+	return emitHistogramFlat(
+		histSink,
+		groupCountsFlat,
+		stride1,
+		stepStride,
+		numSteps,
+		numGroups,
+		dict,
+		bi.boundaries,
+		agg,
+		buckets,
+	)
 }
 
 // accumulateHistogramDirectN0 is the direct-path HISTOGRAM accumulator for N=0 (no group-by) queries.
 // Eliminates inRangeRefs materialization by building bucketByPK directly from tsCol.BlockRefs[lo:hi]
 // and scanning the histogram agg column with a single dense array pass — no keyToBucket hash map.
 //
-// Layout: groupCountsFlat[bIdx*numSteps + (bk-1)] (single group, gIdx always 0).
-// bIdx=0 is the absent/boundary-0 sentinel; bIdx=1..N are actual boundaries.
-// stride1 = histFlatStride*numSteps (group stride, numGroups=1 so outer loop is trivial).
-// stride2 = numSteps (boundary stride).
+// Layout (NOTE-398, boundary-innermost): groupCountsFlat[(bk-1)*histFlatStride + bIdx]
+// (single group, gIdx always 0). bIdx=0 is the absent/boundary-0 sentinel; bIdx=1..N are
+// actual boundaries. stride1 = histFlatStride*numSteps (group stride, numGroups=1 so outer loop
+// is trivial). stepStride = histFlatStride (boundary count = per-time-step stride).
 //
 // NOTE-089: extends the direct-path pattern (accumulateHistogramDirect) to N=0 histogram queries,
 // eliminating the streamAggColumnNoGroupBy map path for {} | histogram_over_time(duration).
@@ -4064,8 +4097,8 @@ func accumulateHistogramDirectN0(
 	}
 
 	// Step 3: pre-allocate flat accumulator for 1 group (pooled — NOTE-124).
-	// Layout: groupCountsFlat[bIdx*numSteps + timeIdx] (gIdx always 0).
-	stride2 := numSteps
+	// Layout (NOTE-398): groupCountsFlat[timeIdx*histFlatStride + bIdx] (gIdx always 0).
+	stepStride := int64(histFlatStride)
 	stride1 := int64(histFlatStride) * numSteps
 	groupCountsFlat := acquireGroupCountsFlat(stride1)
 	defer releaseGroupCountsFlat(groupCountsFlat)
@@ -4087,7 +4120,7 @@ func accumulateHistogramDirectN0(
 		return err
 	}
 	if col != nil {
-		if err := scanHistogramN0(ctx, col, bucketByPK, maxPK, seenByPK, bi.index, groupCountsFlat, stride2); err != nil {
+		if err := scanHistogramN0(ctx, col, bucketByPK, maxPK, seenByPK, bi.index, groupCountsFlat, stepStride); err != nil {
 			releaseDirectInt16(bucketByPK)
 			releaseDirectBool(seenByPK)
 			return err
@@ -4095,13 +4128,13 @@ func accumulateHistogramDirectN0(
 	}
 
 	// Step 6: absent-row pass — walk bucketByPK for pks not seen in the agg column.
-	// bIdx=0 sentinel: groupCountsFlat[0*stride2 + (bk-1)] = groupCountsFlat[bk-1].
+	// NOTE-398: bIdx=0 sentinel: groupCountsFlat[(bk-1)*stepStride + 0].
 	for pk, bk16 := range bucketByPK {
 		bk := int64(bk16)
 		if bk == 0 || seenByPK[pk] {
 			continue
 		}
-		groupCountsFlat[bk-1]++
+		groupCountsFlat[(bk-1)*stepStride]++
 	}
 
 	// NOTE-129: release before emit — frees 32+16 MB before non-trivial emit work.
@@ -4109,7 +4142,18 @@ func accumulateHistogramDirectN0(
 	releaseDirectBool(seenByPK)
 	// Step 7: emit — single group, dict = [""], numGroups = 1.
 	dict := []string{""}
-	return emitHistogramFlat(histSink, groupCountsFlat, stride1, stride2, 1, dict, bi.boundaries, agg, buckets)
+	return emitHistogramFlat(
+		histSink,
+		groupCountsFlat,
+		stride1,
+		stepStride,
+		numSteps,
+		1,
+		dict,
+		bi.boundaries,
+		agg,
+		buckets,
+	)
 }
 
 // accumulateAggDirect is the direct-path general agg accumulator (SUM/AVG/MIN/MAX/STDDEV/QUANTILE)
@@ -4717,7 +4761,8 @@ func streamByRefSliceHistogram(
 	} else {
 		actualStride = 1 // only the absent sentinel, no values
 	}
-	stride2 := numSteps                                                   // steps per boundary slot
+	// NOTE-398: boundary-innermost layout [group][step][boundary]; stepStride = actualStride.
+	stepStride := actualStride                                            // boundaries per time step (innermost)
 	stride1 := actualStride * numSteps                                    // slots per group (now actualStride, not histFlatStride)
 	groupCountsFlat := acquireGroupCountsFlat(int64(numGroups) * stride1) //nolint:gosec
 	defer releaseGroupCountsFlat(groupCountsFlat)
@@ -4734,7 +4779,7 @@ func streamByRefSliceHistogram(
 	seenByPK := acquireDirectBool(int(maxPK) + 1) // NOTE-129
 
 	if col != nil {
-		if err := streamByRefSliceHistogramScanDict(ctx, col, bucketByPK, dictByPK, maxPK, seenByPK, bi.index, groupCountsFlat, stride1, stride2, actualStride); err != nil {
+		if err := streamByRefSliceHistogramScanDict(ctx, col, bucketByPK, dictByPK, maxPK, seenByPK, bi.index, groupCountsFlat, stride1, stepStride, actualStride); err != nil {
 			releaseDirectInt16(bucketByPK)
 			releaseDirectBool(seenByPK)
 			return err
@@ -4755,21 +4800,33 @@ func streamByRefSliceHistogram(
 			if raw := dictByPK[pk]; raw > 0 {
 				gIdx = int64(raw - 1) //nolint:gosec
 			}
-			// bIdx=0 is the absent sentinel; flat index: gIdx*stride1 + 0*stride2 + (bk-1)
-			groupCountsFlat[gIdx*stride1+(bk-1)]++
+			// NOTE-398: bIdx=0 is innermost (stride 1): gIdx*stride1 + (bk-1)*stepStride.
+			groupCountsFlat[gIdx*stride1+(bk-1)*stepStride]++
 		}
 	}
 
 	// NOTE-129: release before emit — frees 32+16 MB before non-trivial emit work.
 	releaseDirectInt16(bucketByPK)
 	releaseDirectBool(seenByPK)
-	return emitHistogramFlat(histSink, groupCountsFlat, stride1, stride2, numGroups, dict, bi.boundaries, agg, buckets)
+	return emitHistogramFlat(
+		histSink,
+		groupCountsFlat,
+		stride1,
+		stepStride,
+		numSteps,
+		numGroups,
+		dict,
+		bi.boundaries,
+		agg,
+		buckets,
+	)
 }
 
 // scanHistogramN0 is a specialized scanner for N=0 (no group-by) histogram accumulation.
 // Eliminates the dictByPK allocation and per-span lookup of streamByRefSliceHistogramScanDict —
-// gIdx is always 0, so groupCountsFlat[bIdx*stride2+(bk-1)] is the only write target.
+// gIdx is always 0, so groupCountsFlat[(bk-1)*stepStride+bIdx] is the only write target.
 // NOTE-089: N=0 direct path — no dictByPK, no gIdx computation.
+// NOTE-398: boundary-innermost layout — cell is (bk-1)*stepStride + bIdx.
 func scanHistogramN0(
 	ctx context.Context,
 	col *modules_shared.IntrinsicColumn,
@@ -4778,7 +4835,7 @@ func scanHistogramN0(
 	seenByPK []bool,
 	getBoundaryIdx func(float64) int64,
 	groupCountsFlat []int64,
-	stride2 int64,
+	stepStride int64,
 ) error {
 	spanCount := 0
 	switch col.Format {
@@ -4798,7 +4855,6 @@ func scanHistogramN0(
 			if bIdx >= int64(histFlatStride) {
 				continue
 			}
-			base := bIdx * stride2
 			for _, ref := range entry.BlockRefs {
 				if spanCount&ctxCheckMask == 0 {
 					if err := ctx.Err(); err != nil {
@@ -4815,7 +4871,7 @@ func scanHistogramN0(
 					continue
 				}
 				seenByPK[pk] = true
-				groupCountsFlat[base+(bk-1)]++
+				groupCountsFlat[(bk-1)*stepStride+bIdx]++
 			}
 		}
 	case modules_shared.IntrinsicFormatFlat:
@@ -4842,7 +4898,7 @@ func scanHistogramN0(
 				continue
 			}
 			seenByPK[pk] = true
-			groupCountsFlat[bIdx*stride2+(bk-1)]++
+			groupCountsFlat[(bk-1)*stepStride+bIdx]++
 		}
 	}
 	return nil
@@ -4863,9 +4919,10 @@ func streamByRefSliceHistogramScanDict(
 	seenByPK []bool,
 	getBoundaryIdx func(float64) int64,
 	groupCountsFlat []int64,
-	stride1, stride2 int64,
+	stride1, stepStride int64,
 	discardStride int64,
 ) error {
+	// NOTE-398: boundary-innermost layout — cell is gIdx*stride1 + (bk-1)*stepStride + bIdx.
 	spanCount := 0
 	switch col.Format {
 	case modules_shared.IntrinsicFormatDict:
@@ -4904,7 +4961,7 @@ func streamByRefSliceHistogramScanDict(
 				if raw := dictByPK[pk]; raw > 0 {
 					gIdx = int64(raw - 1) //nolint:gosec
 				}
-				groupCountsFlat[gIdx*stride1+bIdx*stride2+(bk-1)]++
+				groupCountsFlat[gIdx*stride1+(bk-1)*stepStride+bIdx]++
 			}
 		}
 	case modules_shared.IntrinsicFormatFlat:
@@ -4935,14 +4992,14 @@ func streamByRefSliceHistogramScanDict(
 			if bIdx >= discardStride {
 				continue // guard: boundary cap exceeded
 			}
-			groupCountsFlat[gIdx*stride1+bIdx*stride2+(bk-1)]++
+			groupCountsFlat[gIdx*stride1+(bk-1)*stepStride+bIdx]++
 		}
 	}
 	return nil
 }
 
 // streamByRefSliceHistogramFlatEmit emits non-zero counts from the flat accumulator into buckets.
-// Layout: groupCountsFlat[gIdx*stride1 + bIdx*stride2 + timeIdx].
+// Layout (NOTE-398): groupCountsFlat[gIdx*stride1 + timeIdx*stepStride + bIdx].
 // bIdx=0 is the absent/boundary-0 sentinel; bIdx=1..len(boundaries) are actual boundaries.
 // NOTE-088: replaces streamByRefSliceHistogramEmit (3D slice) — same emit semantics, flat layout.
 //
@@ -4952,7 +5009,8 @@ func streamByRefSliceHistogramScanDict(
 // map is never shared across blocks (executeTraceMetricsIntrinsic accumulates per file and
 // consumes immediately), so each (gIdx, bIdx) slab of the flat grid IS one final series: its
 // label set is the group-by dims (dict[gIdx], "\x00"-joined for N>1) plus __bucket=boundaryStr,
-// and Values is groupCountsFlat[base : base+stride2]. The previous form built a composite key
+// and Values is the strided gather groupCountsFlat[gIdx*stride1 + timeIdx*stepStride + bIdx] over
+// all timeIdx (NOTE-398). The previous form built a composite key
 // "timeIdx\x00gk\x00boundaryStr" per non-zero CELL (one strconv.AppendInt + appends + map insert
 // + per-cell aggBucketState heap alloc), then traceHistogramSeries re-parsed every key
 // (IndexByte + ParseInt + LastIndexByte) to scatter it back into the same (group, boundary, time)
@@ -4964,10 +5022,12 @@ func streamByRefSliceHistogramScanDict(
 // emit (NOTE-350, when histSink is non-nil — the intrinsic path) or the legacy string-keyed
 // `buckets` map emit (block-pipeline / cross-block accumulation). Keeps the four histogram
 // accumulation paths from each duplicating the dispatch.
+// NOTE-398: stepStride is the per-time-step stride (= boundary count, the innermost dimension);
+// numSteps is the number of time steps. Cell index is gIdx*stride1 + timeIdx*stepStride + bIdx.
 func emitHistogramFlat(
 	histSink *[]TraceTimeSeries,
 	groupCountsFlat []int64,
-	stride1, stride2 int64,
+	stride1, stepStride, numSteps int64,
 	numGroups int,
 	dict []string,
 	boundaries []float64,
@@ -4979,7 +5039,8 @@ func emitHistogramFlat(
 			histSink,
 			groupCountsFlat,
 			stride1,
-			stride2,
+			stepStride,
+			numSteps,
 			numGroups,
 			dict,
 			boundaries,
@@ -4987,13 +5048,22 @@ func emitHistogramFlat(
 		)
 		return nil
 	}
-	return streamByRefSliceHistogramFlatEmit(groupCountsFlat, stride1, stride2, numGroups, dict, boundaries, buckets)
+	return streamByRefSliceHistogramFlatEmit(
+		groupCountsFlat,
+		stride1,
+		stepStride,
+		numSteps,
+		numGroups,
+		dict,
+		boundaries,
+		buckets,
+	)
 }
 
 func streamByRefSliceHistogramFlatEmitDirect(
 	histSink *[]TraceTimeSeries,
 	groupCountsFlat []int64,
-	stride1, stride2 int64,
+	stride1, stepStride, numSteps int64,
 	numGroups int,
 	dict []string,
 	boundaries []float64,
@@ -5022,10 +5092,11 @@ func streamByRefSliceHistogramFlatEmitDirect(
 			attrVals = strings.Split(gk, "\x00")
 		}
 		for bIdx := int64(0); bIdx < numBoundaries; bIdx++ {
-			base := gIdx*stride1 + bIdx*stride2
+			// NOTE-398: boundary-innermost — cell is gIdx*stride1 + timeIdx*stepStride + bIdx.
+			gbBase := gIdx*stride1 + bIdx
 			hasAny := false
-			for timeIdx := int64(0); timeIdx < stride2; timeIdx++ {
-				if groupCountsFlat[base+timeIdx] != 0 {
+			for timeIdx := int64(0); timeIdx < numSteps; timeIdx++ {
+				if groupCountsFlat[gbBase+timeIdx*stepStride] != 0 {
 					hasAny = true
 					break
 				}
@@ -5033,9 +5104,9 @@ func streamByRefSliceHistogramFlatEmitDirect(
 			if !hasAny {
 				continue
 			}
-			values := make([]float64, stride2)
-			for timeIdx := int64(0); timeIdx < stride2; timeIdx++ {
-				if c := groupCountsFlat[base+timeIdx]; c != 0 {
+			values := make([]float64, numSteps)
+			for timeIdx := int64(0); timeIdx < numSteps; timeIdx++ {
+				if c := groupCountsFlat[gbBase+timeIdx*stepStride]; c != 0 {
 					values[timeIdx] = float64(c)
 				}
 			}
@@ -5058,7 +5129,7 @@ func streamByRefSliceHistogramFlatEmitDirect(
 
 func streamByRefSliceHistogramFlatEmit(
 	groupCountsFlat []int64,
-	stride1, stride2 int64,
+	stride1, stepStride, numSteps int64,
 	numGroups int,
 	dict []string,
 	boundaries []float64,
@@ -5094,9 +5165,10 @@ func streamByRefSliceHistogramFlatEmit(
 		}
 		for bIdx := int64(0); bIdx < numBoundaries; bIdx++ {
 			boundaryStr := boundaryStrs[bIdx]
-			base := gIdx*stride1 + bIdx*stride2
-			for timeIdx := int64(0); timeIdx < stride2; timeIdx++ {
-				count := groupCountsFlat[base+timeIdx]
+			// NOTE-398: boundary-innermost — cell is gIdx*stride1 + timeIdx*stepStride + bIdx.
+			gbBase := gIdx*stride1 + bIdx
+			for timeIdx := int64(0); timeIdx < numSteps; timeIdx++ {
+				count := groupCountsFlat[gbBase+timeIdx*stepStride]
 				if count == 0 {
 					continue
 				}

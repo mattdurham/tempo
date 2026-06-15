@@ -6074,3 +6074,55 @@ constants. Cost moves from per-ref to per-position (always ≤ per-ref, since mu
 pos). Pure post-decode CPU, holds warm or cold.
 
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:buildHistBaseOffsets`.
+
+## NOTE-398: Boundary-innermost histogram accumulator layout to fix M8 scatter cache misses (2026-06-15)
+
+The hottest M8 loop is the scatter store in `scanAggColHistogramShard`, O(SpanCount) per block.
+NOTE-397 hoisted the per-position invariant address arithmetic out of the loop, but the residual
+cost (~6% querier self-time, CPU profile) is the random STORE itself: a cache miss per ref.
+
+The flat accumulator was laid out `[group][boundary][step]`:
+
+    stride1 = actualStride*numSteps   (group stride)
+    stride2 = numSteps                (boundary stride)
+    index   = gIdx*stride1 + bIdx*stride2 + (bk-1)     // step innermost
+
+For a fixed scan position `pos`, `gIdx` and `bk` are constant across the (often many) refs that
+resolve to that pos, but `bIdx` (the value-bucket of the aggregate column) varies arbitrarily per
+ref. So consecutive same-pos stores jumped by `bIdx*stride2 = bIdx*numSteps` — and `numSteps` is
+large (1440 at 24h/60s). Each store landed in a different multi-KB stripe → a guaranteed L2/LLC
+miss per ref into the multi-MB `groupCountsFlat`.
+
+**Fix:** transpose the inner two dimensions to `[group][step][boundary]` (boundary innermost):
+
+    stride1    = actualStride*numSteps   (group stride, unchanged)
+    stepStride = actualStride            (per-time-step stride = boundary count)
+    index      = gIdx*stride1 + (bk-1)*stepStride + bIdx     // boundary innermost
+
+Now for a fixed `pos` the touched cells are the `stepStride` (=actualStride) **contiguous** int64s
+of that (group,step) slot — a few cache lines — *regardless of numSteps*. Consecutive same-pos refs
+with differing value-buckets land on the same cache line(s) instead of striding by numSteps. The
+total array size and number of non-zero cells are identical; only the cell ADDRESS mapping changes.
+
+`buildHistBaseOffsets` now folds `(bk-1)*stepStride` (instead of `(bk-1)`) into `baseOffsetByPos`,
+so the per-ref store is still `groupCountsFlat[base+bIdx]++` — one read + one add + one store, no
+extra arithmetic vs NOTE-397. The change is applied consistently to ALL four histogram
+accumulation paths so emit stays correct: the compact predicate/parallel path
+(`scanAggColHistogramCompact`/`scanAggColHistogramShard`), the dense direct N>=1 paths
+(`streamByRefSliceHistogramScanDict`), and the N=0 path (`scanHistogramN0`). The two emitters
+(`streamByRefSliceHistogramFlatEmitDirect`, `streamByRefSliceHistogramFlatEmit`) read with the
+transposed gather `gIdx*stride1 + timeIdx*stepStride + bIdx`; emit is O(cells) one-time, not the
+hot per-ref path, so its now-strided inner time loop is irrelevant. The absent-row passes write
+the bIdx=0 sentinel at `...+(bk-1)*stepStride`.
+
+**Correctness:** output byte-identical (only the dense index mapping changes; the multiset of
+(group,boundary,step)→count is invariant). Covered by the parallel-vs-serial parity tests and the
+order-independence test in `intrinsic_hist_parallel_test.go` (canonicalHistCells updated to the
+transposed layout) plus the full executor `-race` suite incl. multi-block parquet parity.
+
+**Generality:** AoS→SoA-style cache-locality transpose of an accumulation grid; no benchmark-specific
+constants. Holds warm or cold (pure post-decode CPU + memory access pattern). Bounds: bIdx is capped
+at `< actualStride = stepStride` by the existing discard guard, so `(bk-1)*stepStride + bIdx <
+numSteps*stepStride = stride1` — within each group's slab.
+
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:buildHistBaseOffsets`.
