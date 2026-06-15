@@ -92,7 +92,7 @@ func ExecuteStructural(
 		return nil, err
 	}
 
-	resolveStructuralParentIndices(traceSpans, ops)
+	traceSpans = resolveStructuralParentIndices(traceSpans, ops)
 
 	result := &StructuralResult{}
 	if err := evalStructuralMatches(traceSpans, parsedBlocks, ops, opts, result); err != nil {
@@ -612,17 +612,30 @@ func (a *allMatchSet) ToSlice() []int {
 // NOTE-382: skip parent resolution for traces that cannot produce a structural match. The
 // per-trace work below — clear(byID), build the spanID→index map (one pass), then resolve every
 // span's parentID (second pass with a map probe) — is pure waste for a trace whose spans match
-// no relevant node, because evalStructuralMatches gates the same trace on traceCanMatch and
-// emits nothing. traceCanMatch is a cheap OR over the per-span nodeMatch bits (no map, no
-// allocation); running it FIRST lets the common structural workload, where most traces contain
-// no matching span at all (the measured Q9 returns 0 traces over a large span population), skip
-// the map clear/build/probe for every such trace. The semantics of the resolved parentIdx for a
-// skipped trace are irrelevant: evalStructuralMatches will continue past it on the identical
-// traceCanMatch check before ever reading parentIdx. ops is threaded in so the same predicate is
-// shared with the eval phase; a nil ops disables the skip and resolves every trace
-// unconditionally (used by resolution-only unit tests that do not populate nodeMatch).
-func resolveStructuralParentIndices(traceSpans [][]structuralSpanRec, ops []traceqlparser.StructuralOp) {
+// no relevant node, because a non-qualifying trace emits nothing. traceCanMatch is a cheap OR
+// over the per-span nodeMatch bits (no map, no allocation); running it FIRST lets the common
+// structural workload, where most traces contain no matching span at all (the measured Q9 returns
+// 0 traces over a large span population), skip the map clear/build/probe for every such trace.
+// ops is threaded in so the qualification predicate is evaluated once; a nil ops disables the
+// skip and resolves every trace unconditionally (used by resolution-only unit tests that do not
+// populate nodeMatch). See NOTE-383 for how the qualified subset is carried forward to eliminate
+// the duplicate scan that evalStructuralMatches previously performed.
+// NOTE-383: when ops != nil, resolveStructuralParentIndices COMPACTS traceSpans in place to
+// the subset of traces that pass traceCanMatch and returns that prefix. The qualification scan
+// (traceCanMatch: an OR over every span's nodeMatch bits) previously ran twice per trace — once
+// here to gate parent resolution (NOTE-382) and again in evalStructuralMatches to gate emission
+// — duplicating O(spans) work per trace on the dominant zero-match structural case (Q9 returns 0
+// traces over a large span population). Carrying the qualified subset forward lets the caller skip
+// the second scan entirely: evalStructuralMatches no longer re-runs traceCanMatch because every
+// trace it receives is already known to qualify. Compaction is order-preserving and reuses the
+// backing array (no allocation). When ops == nil (resolution-only unit tests) the skip is
+// disabled and the input is resolved and returned unchanged.
+func resolveStructuralParentIndices(
+	traceSpans [][]structuralSpanRec,
+	ops []traceqlparser.StructuralOp,
+) [][]structuralSpanRec {
 	byID := make(map[[8]byte]int)
+	w := 0
 	for _, spans := range traceSpans {
 		if ops != nil && !traceCanMatch(spans, ops) {
 			continue
@@ -649,7 +662,10 @@ func resolveStructuralParentIndices(traceSpans [][]structuralSpanRec, ops []trac
 			spans[i].parentID = [8]byte{}
 			spans[i].present &^= structuralParentIDPresent
 		}
+		traceSpans[w] = spans
+		w++
 	}
+	return traceSpans[:w]
 }
 
 // evalStructuralMatches evaluates the structural operator(s) for each trace and
@@ -668,10 +684,9 @@ func evalStructuralMatches(
 		// NOTE-377: every record in a window shares the trace ID (grouped contiguously); read it
 		// from the first record instead of a map key.
 		traceID := spans[0].traceID
-		// NOTE-096: Skip traces that cannot possibly produce a structural match.
-		if !traceCanMatch(spans, ops) {
-			continue
-		}
+		// NOTE-383: traceCanMatch is NOT re-run here. resolveStructuralParentIndices already
+		// compacted traceSpans to the qualified subset, so every trace reaching this loop is
+		// known to pass the gate. Re-scanning here would duplicate the OR-over-nodeMatch work.
 		rightIndices := applyStructuralOps(spans, ops)
 
 		// NOTE-079: slices.Sort + dedup replaces map[int]struct{} — zero extra allocs.

@@ -5795,3 +5795,26 @@ operator chain length and negation shape.
 
 Back-ref: `internal/modules/executor/stream_structural.go:resolveStructuralParentIndices`,
 `ExecuteStructural`, `traceCanMatch`.
+
+### NOTE-383: carry the qualified-trace subset out of resolution to drop the duplicate scan
+
+`traceCanMatch` (an OR over every span's `nodeMatch` bits) was evaluated TWICE per trace:
+`resolveStructuralParentIndices` ran it to gate parent resolution (NOTE-382), and
+`evalStructuralMatches` ran it again to gate emission. On the dominant structural case — a query
+where most traces contain no matching span (Q9 `{kind=server} >> {kind=client}` returns 0 traces
+over a large span population) — this duplicated O(spans) work for every trace.
+
+Fix: `resolveStructuralParentIndices` now compacts `traceSpans` IN PLACE (order-preserving, reusing
+the backing array — no allocation) to the subset of traces that pass `traceCanMatch`, and returns
+that prefix. `ExecuteStructural` rebinds `traceSpans` to the returned subset. `evalStructuralMatches`
+no longer calls `traceCanMatch` at all — every trace it receives is already known to qualify, so the
+second full scan is eliminated. When `ops == nil` (resolution-only unit tests) the gate is disabled
+and the input slice is resolved and returned unchanged.
+
+Correctness: the compaction predicate is identical to the gate `evalStructuralMatches` previously
+applied, so the set of traces processed for emission is byte-for-byte the same; only the redundant
+re-scan is removed. No benchmark-specific constants — `traceCanMatch` derives its required-node
+bitmask purely from the operator chain length and negation shape.
+
+Back-ref: `internal/modules/executor/stream_structural.go:resolveStructuralParentIndices`,
+`ExecuteStructural`, `evalStructuralMatches`.
