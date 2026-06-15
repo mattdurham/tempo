@@ -89,3 +89,18 @@ The default byte budget is 20% of GOMEMLIMIT when set, or 256 MiB otherwise.
 Passing 0 to `SetMaxBytes` reverts to the default computation on next `Put`.
 
 Back-ref: `internal/modules/objectcache/cache.go:Cache.SetMaxBytes`
+
+---
+
+## SPEC-OC-008: Hit/miss/eviction counters
+*Added: 2026-06-15*
+
+`StatsSnapshot()` returns a point-in-time `Stats` with cumulative `Hits`,
+`Misses`, and `Evictions` counters plus current `Entries`, `CurBytes`, and
+`MaxBytes`. `Get` increments `Hits` on a live entry and `Misses` otherwise;
+`evictTail` increments `Evictions`. `Clear` resets all three counters to 0 so
+the cache reports a fresh baseline. `Stats.HitRatio()` returns
+`Hits/(Hits+Misses)`, or 0 when there have been no lookups. `StatsSnapshot` is
+safe for concurrent use.
+
+Back-ref: `internal/modules/objectcache/cache.go:Cache.StatsSnapshot`

@@ -62,3 +62,26 @@ file. This was deferred because `filecache.GetOrFetch` already deduplicates the
 underlying I/O at the raw-bytes level. A double-parse (two goroutines both get a
 cache miss, both parse, second Put overwrites first) is rare and benign for
 immutable data.
+
+---
+
+## NOTE-371: Cache hit/miss/eviction instrumentation
+*Added: 2026-06-15*
+
+Investigation of `parsedIntrinsicCache` value (issue #345) had no signal beyond
+process RSS — there was no way to distinguish a well-utilized cache from one that
+thrashes under budget pressure. NOTE-344 fixed a `SizeBytes()` bug that had let the
+intrinsic cache balloon to ~9 GiB under a nominal 512 MiB budget; that it ran that
+way without query failures suggested most held entries were never re-read.
+
+`StatsSnapshot()` exposes cumulative `Hits`/`Misses`/`Evictions` plus current
+occupancy, and `Stats.HitRatio()` directly answers "does memcached make the decoded
+cache redundant" over a warm window. Counters are cheap (`int64++` under the existing
+mutex) and reset on `Clear` so each cache lifecycle reports a clean baseline.
+
+The reader-level lever (`SetIntrinsicCacheBytes`) was also decoupled (see reader
+NOTES.md NOTE-371): the intrinsic cache now gets half the configured budget while
+the separately-proven V8 column cache (NOTE-200) keeps the full budget, so the
+intrinsic footprint can shrink without touching the V8 cache's hit rate.
+
+Back-ref: `internal/modules/objectcache/cache.go:Cache.StatsSnapshot`

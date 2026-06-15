@@ -2925,3 +2925,28 @@ Back-ref: `column.go` (`Column.packedIdx`/`packedIdxWidth`, `readPackedIndexArra
 `SizeBytes`), `block_parser.go` (snapshot/copy/reset propagation),
 `executor/column_provider.go` (hoisted scan loops). Tests/bench: `packed_idx_note369_test.go`,
 `packed_idx_note369_bench_test.go`.
+
+---
+
+## NOTE-371 — Decouple intrinsic cache budget from the V8 column cache
+*Added: 2026-06-15*
+
+**Problem:** `SetIntrinsicCacheBytes(n)` set the SAME byte budget on both the decoded
+intrinsic column cache (`parsedIntrinsicCache`) and the decoded V8 block-column cache
+(`parsedV8ColumnCache`). Tempo passes 512 MiB. After NOTE-344 fixed the intrinsic
+`SizeBytes()` under-count (the cache had silently grown to ~9 GiB), issue #345 asked
+whether the intrinsic cache earns its reserved heap at all: the compressed bytes are
+always in memcached, so an intrinsic cache miss costs only a re-decode, not an extra
+round trip. The shared lever meant any attempt to shrink the intrinsic budget would
+also shrink the V8 cache, which is a separately-proven warm-columnar-path win
+(NOTE-200) and must not regress.
+
+**Fix:** split the lever. `parsedIntrinsicCache` now gets `n/2` while
+`parsedV8ColumnCache` keeps the full `n`. A non-positive `n` is passed through
+unchanged so the objectcache GOMEMLIMIT default still applies to every cache.
+Paired with objectcache NOTE-371 hit/miss/eviction instrumentation
+(`Cache.StatsSnapshot`) so the intrinsic cache's real utilization can be observed
+under warm load rather than inferred from RSS.
+
+Back-ref: `parser.go:SetIntrinsicCacheBytes`; objectcache NOTES.md NOTE-371.
+Tests: `parser_test.go:TestSetIntrinsicCacheBytes_BudgetSplit` / `_ZeroPassthrough`.

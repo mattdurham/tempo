@@ -44,13 +44,59 @@ const defaultEntrySize int64 = 1 << 20 // 1 MB fallback
 // SPEC-OC-006: All methods are safe for concurrent use.
 // SPEC-OC-007: Byte budget defaults to 20% of GOMEMLIMIT (or 256 MiB fallback); configurable via SetMaxBytes.
 type Cache[V any] struct {
-	items    map[string]*entry[V]
-	head     *entry[V] // most recently used
-	tail     *entry[V] // least recently used
-	curBytes int64
-	maxBytes int64 // 0 = compute from GOMEMLIMIT on first Put
-	mu       sync.Mutex
-	inited   bool
+	items     map[string]*entry[V]
+	head      *entry[V] // most recently used
+	tail      *entry[V] // least recently used
+	curBytes  int64
+	maxBytes  int64 // 0 = compute from GOMEMLIMIT on first Put
+	hits      int64 // NOTE-371: Get returned a live entry
+	misses    int64 // NOTE-371: Get found no entry
+	evictions int64 // NOTE-371: entries dropped by LRU budget pressure
+	mu        sync.Mutex
+	inited    bool
+}
+
+// Stats is an immutable snapshot of a Cache's runtime counters and current
+// occupancy. It answers the operational question of whether a process-level
+// decoded-object cache is earning its reserved heap: a high hit count relative
+// to misses means re-decode is being avoided; a hit count near zero with steady
+// evictions means the budget is churning and the cache is not paying for itself.
+//
+// NOTE-371: added to investigate parsedIntrinsicCache value (issue #345). The
+// only signal previously available was process RSS — there was no way to tell a
+// well-utilized cache from one that thrashes. HitRatio over a warm benchmark
+// window directly answers "does memcached make the decoded cache redundant".
+type Stats struct {
+	Hits      int64
+	Misses    int64
+	Evictions int64
+	Entries   int
+	CurBytes  int64
+	MaxBytes  int64
+}
+
+// HitRatio returns Hits/(Hits+Misses), or 0 when there have been no lookups.
+func (s Stats) HitRatio() float64 {
+	total := s.Hits + s.Misses
+	if total == 0 {
+		return 0
+	}
+	return float64(s.Hits) / float64(total)
+}
+
+// StatsSnapshot returns a point-in-time copy of the cache counters. Safe for
+// concurrent use.
+func (c *Cache[V]) StatsSnapshot() Stats {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return Stats{
+		Hits:      c.hits,
+		Misses:    c.misses,
+		Evictions: c.evictions,
+		Entries:   len(c.items),
+		CurBytes:  c.curBytes,
+		MaxBytes:  c.maxBytes,
+	}
 }
 
 // SetMaxBytes overrides the default byte budget. Must be called before first Put.
@@ -69,8 +115,10 @@ func (c *Cache[V]) Get(key string) *V {
 	defer c.mu.Unlock()
 	e, ok := c.items[key]
 	if !ok {
+		c.misses++
 		return nil
 	}
+	c.hits++
 	c.moveToFront(e)
 	return e.val
 }
@@ -139,6 +187,11 @@ func (c *Cache[V]) Clear() {
 	c.tail = nil
 	c.curBytes = 0
 	c.inited = false
+	// NOTE-371: reset counters so a Clear (used by tests and ClearCaches) gives a
+	// clean stats baseline; counters track activity since the last Clear.
+	c.hits = 0
+	c.misses = 0
+	c.evictions = 0
 }
 
 // Len returns the number of entries in the cache.
@@ -211,4 +264,5 @@ func (c *Cache[V]) evictTail() {
 	c.unlink(e)
 	delete(c.items, e.key)
 	c.curBytes -= e.sizeBytes
+	c.evictions++ // NOTE-371
 }

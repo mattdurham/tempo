@@ -163,9 +163,24 @@ func (b *blockColTypes) SizeBytes() int64 {
 //   - Queriers: 256-512 MiB (decoded intrinsic columns are short-lived per query)
 //   - Backend workers: default (compaction benefits from larger cache)
 func SetIntrinsicCacheBytes(n int64) {
-	parsedIntrinsicCache.SetMaxBytes(n)
+	// NOTE-371: the intrinsic and V8-column caches no longer share the same byte
+	// budget. NOTE-344 fixed a SizeBytes() bug that let the intrinsic cache balloon
+	// to ~9 GiB under a nominal 512 MiB budget; that it ran for so long without
+	// query failures showed most of what it held was never re-read before eviction
+	// would have happened anyway (the compressed bytes are always available from
+	// memcached, so a miss costs only a re-decode, not an extra round trip). The V8
+	// column cache (NOTE-200) is a separately-proven win on the warm columnar path,
+	// so it keeps the full budget while the intrinsic cache gets a smaller dedicated
+	// share. Splitting the lever lets the intrinsic footprint shrink without
+	// touching the V8 cache's hit rate. n <= 0 is passed through unchanged so the
+	// objectcache default (20% of GOMEMLIMIT) still applies to every cache.
+	intrinsicBytes := n
+	if n > 0 {
+		intrinsicBytes = n / 2
+	}
+	parsedIntrinsicCache.SetMaxBytes(intrinsicBytes)
 	// parsedIntrinsicTOCCache removed 2026-06-12 (legacy V4/V5/V6 format)
-	parsedV8ColumnCache.SetMaxBytes(n)         // NOTE-200: same budget as intrinsic columns
+	parsedV8ColumnCache.SetMaxBytes(n)         // NOTE-200: proven warm-path win, full budget
 	blockColTypesCache.SetMaxBytes(n / 16)     // NOTE-214: name->type maps are tiny vs decoded columns
 	parsedTraceSparseCache.SetMaxBytes(n / 16) // NOTE-265: sparse trace-index samples are tiny
 }
