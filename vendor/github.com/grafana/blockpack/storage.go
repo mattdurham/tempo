@@ -19,12 +19,10 @@ import (
 
 	modules_compaction "github.com/grafana/blockpack/internal/modules/blockio/compaction"
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
-	modules_embedder "github.com/grafana/blockpack/internal/modules/embedder"
 	modules_rw "github.com/grafana/blockpack/internal/modules/rw"
 	modules_sectioncache "github.com/grafana/blockpack/internal/modules/sectioncache"
 	"github.com/grafana/blockpack/internal/otlpconvert"
 	"github.com/grafana/blockpack/internal/s3provider"
-	vm "github.com/grafana/blockpack/internal/vm"
 )
 
 // AGENT: Storage interfaces - minimal abstraction for storage backends.
@@ -365,16 +363,7 @@ func CompactBlocks(
 	return paths, err
 }
 
-// Embedder provides text-to-vector embedding via a pluggable Backend.
-type Embedder = modules_embedder.Embedder
-
-// EmbedderHTTPConfig configures the HTTP embedding backend.
-type EmbedderHTTPConfig = modules_embedder.HTTPConfig
-
-// NewHTTPEmbedder creates an Embedder backed by an HTTP embedding server (TEI or compatible).
-func NewHTTPEmbedder(cfg EmbedderHTTPConfig) (*Embedder, error) {
-	return modules_embedder.NewHTTP(cfg)
-}
-
-// Compile-time check: *modules_embedder.Embedder satisfies vm.TextEmbedder.
-var _ vm.TextEmbedder = (*modules_embedder.Embedder)(nil)
+// NOTE-370: The HTTP embedder write-path constructor (formerly Embedder,
+// EmbedderHTTPConfig, NewHTTPEmbedder here) was moved to the dedicated
+// importable subpackage github.com/grafana/blockpack/embedder to remove it
+// from blockpack's general storage API surface (issue #346).

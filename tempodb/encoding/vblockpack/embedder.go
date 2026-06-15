@@ -4,11 +4,11 @@ import (
 	"log/slog"
 	"sync"
 
-	"github.com/grafana/blockpack"
+	bpembedder "github.com/grafana/blockpack/embedder"
 )
 
 var (
-	processEmbedder            *blockpack.Embedder
+	processEmbedder            *bpembedder.Embedder
 	processEmbedderOnce        sync.Once
 	configuredEmbedURL         string // set by ConfigureEmbedding
 	configuredEmbedConcurrency int    // set by ConfigureEmbedding; 0 = use blockpack default
@@ -34,18 +34,18 @@ func ConfigureEmbedding(url string, concurrentBatches int, batchSize int, maxTex
 // getProcessEmbedder returns a process-level embedder for the configured URL.
 // Returns nil if no URL is configured (embedding disabled). Thread-safe;
 // initializes the embedder exactly once.
-func getProcessEmbedder(url string) *blockpack.Embedder {
+func getProcessEmbedder(url string) *bpembedder.Embedder {
 	if url == "" {
 		return nil
 	}
 	processEmbedderOnce.Do(func() {
-		cfg := blockpack.EmbedderHTTPConfig{
+		cfg := bpembedder.HTTPConfig{
 			ServerURL:            url,
 			MaxConcurrentBatches: configuredEmbedConcurrency,
 			MaxBatchSize:         configuredEmbedBatchSize,
 			MaxTextLength:        configuredEmbedMaxTextLen,
 		}
-		emb, err := blockpack.NewHTTPEmbedder(cfg)
+		emb, err := bpembedder.NewHTTPEmbedder(cfg)
 		if err != nil {
 			slog.Error("vblockpack: failed to initialize embedder", "url", url, "err", err)
 			return

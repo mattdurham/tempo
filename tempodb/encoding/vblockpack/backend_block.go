@@ -627,7 +627,7 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 	}
 
 	// Build QueryOptions and set Embedder only when non-nil. Assigning a typed nil
-	// (*blockpack.Embedder)(nil) directly to the vm.TextEmbedder interface field creates
+	// (*bpembedder.Embedder)(nil) directly to the vm.TextEmbedder interface field creates
 	// a non-nil interface containing a nil pointer, causing a nil dereference panic inside
 	// CompileTraceQLFilterWithOptions when it calls embedder.Embed(). Checking the pointer
 	// before assigning keeps the interface nil when no embedder is configured.
