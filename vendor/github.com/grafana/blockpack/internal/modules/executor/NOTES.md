@@ -6157,3 +6157,52 @@ suite. **Generality:** no benchmark-specific constants; applies to any flat uint
 
 Back-ref: `internal/modules/executor/predicates.go:scanFlatEqualityRefs`,
 `internal/modules/blockio/shared/intrinsic_codec.go:scanFlatPagedBlob/scanDeltaUint64PagedBlob`.
+
+## NOTE-401: dict-index-native group-by for Dict-format intrinsic columns (issue #349)
+
+The compact N=1 group-by scan (`scanGroupByColCompact`) formerly built a FRESH group dict
+keyed by the decoded VALUE STRING via a `valToIdx map[string]uint32`, for every group-by query
+including the unfiltered high-cardinality `rate() by (service.name)` hot path. For a Dict-encoded
+column this is redundant: the parsed `col.DictEntries` already stores each distinct value exactly
+once (the cross-page parse dedups by value / Int64Val — `intrinsic_codec.go`), so the native entry
+index IS a valid dense group index and is guaranteed unique per value.
+
+The Dict path now writes the **native entry index** (`entryIdx+1`; 0 = absent sentinel) directly
+into `dictIdxByPos` (`scanGroupByColCompactDictSerial` / `scanGroupByColCompactDictParallel`), and
+sizes the group `dict` to `len(DictEntries)+1` with all slots left `""`. The per-group value string
+is materialized **lazily at emit time** (`resolveDictGroupKeys`) only for the groups that actually
+accumulated a non-zero count (`groupHasNonZero` / non-nil bucket / non-zero histogram cell). This
+removes, on the per-block group-by path:
+
+- the per-entry `valToIdx` string-dedup map (entry index is already the group),
+- the per-entry value-string conversion during scan (`intrinsicInt64ColToString` / `[]byte→string`,
+  `strconv`) for every entry that never emits on a high-cardinality column, and
+- the parallel Dict path's prior **Phase B + O(n) translation pass** over every `dictIdxByPos`
+  position (the markers ARE the final indices — no remap).
+
+The Flat/XOR/Delta path keeps the string-deduped dict (no native dictionary exists), built
+internally by `scanGroupByColCompactFlatSerial` via a local `valToIdx` map. `scanGroupByColCompact`
+no longer takes a `valToIdx` parameter — each caller's `make(map[string]uint32)` is gone.
+
+**Correctness — empty-group equivalence:** the legacy path skipped empty-value entries entirely
+(their spans fell to sentinel group 0, merged into the absent group). The new scan reproduces this
+by skipping a Dict entry whose value resolves to empty: for a STRING-domain column that is just
+`entry.Value == ""` (zero-alloc); for an INT64-domain column (`isInt64DomainColumn` mirrors the
+decoder's `colType == ColumnTypeInt64 || ColumnTypeRangeInt64`) the value is NEVER empty
+(`intrinsicInt64ColToString` returns a kind/status enum name or the `FormatInt` fallback, both
+non-empty), so a zero-valued int64 entry (`span:kind` "unspecified", `span:status` "unset")
+correctly forms its own group rather than being dropped. Emitted series are therefore identical to
+the value-deduped path.
+
+**No format change. No file-size impact. Identical results** — only the grouping-key representation
+changes (native entry index vs decoded-string-deduped index), resolved to the same value at emit.
+
+Covered by `intrinsic_groupby_parallel_test.go`: serial↔parallel byte-identical equivalence
+(unchanged), `TestDictGroupByIndexNative_DirectEntryIndex` (native index in `dictIdxByPos`,
+unresolved dict after scan), `TestDictGroupByEmptyStringSkipped` (empty string → sentinel 0),
+`TestDictGroupByInt64ZeroFormsGroup` (int64 0 forms a group), `TestResolveDictGroupKeys_Lazy`
+(only emitted groups resolved), `TestResolveDictGroupKeys_FlatNoOp`.
+
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:scanGroupByColCompact /
+scanGroupByColCompactDictSerial / scanGroupByColCompactDictParallel / scanGroupByColCompactFlatSerial
+/ resolveDictGroupKeys / groupHasNonZero / isInt64DomainColumn`.

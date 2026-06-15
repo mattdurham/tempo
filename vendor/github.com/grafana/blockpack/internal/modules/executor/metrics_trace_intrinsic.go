@@ -793,12 +793,29 @@ func searchSortedUint32(s []uint32, pk uint32) (int, bool) {
 // scanGroupByColCompact scans col and populates dictIdxByPos for each packKey that
 // appears in sortedPKs (sorted ascending), using binary search. Returns updated dict
 // and populates dictIdxByPos (1-based index into dict; 0 = absent sentinel).
+//
+// NOTE-401: dict-index-native group-by for Dict-format columns. A Dict column already
+// stores each distinct value exactly once in col.DictEntries (the cross-page parse
+// dedups by value, intrinsic_codec.go), so the native entry index IS a valid dense
+// group index and is GUARANTEED unique per value. The Dict path therefore writes
+// entryIdx+1 directly into dictIdxByPos (1-based; 0 = absent sentinel) and sizes *dict
+// to len(DictEntries)+1, leaving the per-group value string UNRESOLVED (""). The
+// resolved value is materialized lazily — only for the (typically few) groups that
+// actually accumulate a non-zero count — at emit time via resolveDictGroupKey. This
+// eliminates, on the unfiltered high-cardinality group-by hot path:
+//   - the per-entry valToIdx map[string]uint32 dedup (entry index is already the group),
+//   - the per-entry value-string conversion during scan (intrinsicInt64ColToString /
+//     []byte→string) for entries that never emit,
+//   - the parallel path's O(n) translation pass over every dictIdxByPos position
+//     (markers ARE the final indices; no remap needed).
+//
+// The Flat/XOR/Delta path keeps the string-deduped dict (no native dictionary exists),
+// built internally via a local valToIdx map.
 func scanGroupByColCompact(
 	col *modules_shared.IntrinsicColumn,
 	colName string,
 	sortedPKs []uint32,
 	dict *[]string,
-	valToIdx map[string]uint32,
 	dictIdxByPos []uint32,
 	rankIdx *pkRankIndex, // NOTE-348: prebuilt rank index over sortedPKs (nil = build internally)
 ) {
@@ -864,79 +881,120 @@ func scanGroupByColCompact(
 	// (totalRefs ≈ n) the goroutine + per-position-write contention + translation pass make it a
 	// regression, so we stay serial. Microbench (BenchmarkScanGroupByColCompact): 2x→2.0x, 4x→1.8x,
 	// 12x→2.7x faster; full-coverage stays serial.
-	if col.Format == modules_shared.IntrinsicFormatDict &&
-		len(sortedPKs) >= histParallelMinItems && len(col.DictEntries) >= 2 {
-		w := min(runtime.NumCPU(), histParallelWorkers)
-		totalRefs := 0
-		for i := range col.DictEntries {
-			totalRefs += len(col.DictEntries[i].BlockRefs)
+	if col.Format == modules_shared.IntrinsicFormatDict {
+		// NOTE-401: dict-index-native — *dict slot index == entryIdx+1, values resolved
+		// lazily at emit time. Size it to numEntries+1 (slot 0 = absent) up front; the
+		// scan only writes dictIdxByPos, never the dict slice.
+		numEntries := len(col.DictEntries)
+		*dict = (*dict)[:0]
+		*dict = append(*dict, "")
+		for range numEntries {
+			*dict = append(*dict, "")
 		}
-		if w > 1 && totalRefs >= 2*len(sortedPKs) {
-			scanGroupByColCompactDictParallel(
-				col, colName, minPK, maxPK, pkBitset, rankPrefix, dict, valToIdx, dictIdxByPos, w,
-			)
-			return
+		if len(sortedPKs) >= histParallelMinItems && numEntries >= 2 {
+			w := min(runtime.NumCPU(), histParallelWorkers)
+			totalRefs := 0
+			for i := range col.DictEntries {
+				totalRefs += len(col.DictEntries[i].BlockRefs)
+			}
+			if w > 1 && totalRefs >= 2*len(sortedPKs) {
+				scanGroupByColCompactDictParallel(
+					col, minPK, maxPK, pkBitset, rankPrefix, dictIdxByPos, w,
+				)
+				return
+			}
 		}
+		scanGroupByColCompactDictSerial(col, minPK, maxPK, pkBitset, rankPrefix, dictIdxByPos)
+		return
 	}
 
-	scanGroupByColCompactSerial(col, colName, minPK, maxPK, pkBitset, rankPrefix, dict, valToIdx, dictIdxByPos)
+	scanGroupByColCompactFlatSerial(col, minPK, maxPK, pkBitset, rankPrefix, dict, dictIdxByPos)
 }
 
-// scanGroupByColCompactSerial is the single-threaded body of scanGroupByColCompact. pkBitset and
-// rankPrefix are the shared read-only POPCNT index over sortedPKs (NOTE-135/140). This is the
-// byte-identical pre-NOTE-148 path; the parallel Dict path reproduces its output exactly.
-func scanGroupByColCompactSerial(
+// resolveDictGroupKeys lazily materializes the per-group value strings for a Dict-format
+// group-by column into dict (NOTE-401). The scan left dict[1..numEntries] = "" and wrote
+// the native entry index (entryIdx+1) into dictIdxByPos; this resolves dict[entryIdx+1] =
+// value ONLY for entries flagged in nonEmpty (groups that accumulated a non-zero count),
+// avoiding the value-string conversion (intrinsicInt64ColToString / []byte→string) for the
+// many entries that never emit on a high-cardinality column.
+//
+// Empty values are NOT resolved (left ""), reproducing the legacy value-deduped path which
+// skipped empty-value entries entirely: a group whose resolved value is "" emits no series
+// (the emit/bucket paths treat "" group keys identically — see emitFlatCountRateSeries and
+// the bucket loops, which append the resolved string as the label value).
+//
+// For Flat/XOR/Delta columns dict is already fully populated by the scan, so this is a no-op.
+func resolveDictGroupKeys(
 	col *modules_shared.IntrinsicColumn,
 	colName string,
+	dict []string,
+	nonEmpty func(gIdx int64) bool,
+) {
+	if col == nil || col.Format != modules_shared.IntrinsicFormatDict {
+		return
+	}
+	for e := range col.DictEntries {
+		gIdx := int64(e + 1)
+		if gIdx >= int64(len(dict)) {
+			break
+		}
+		if !nonEmpty(gIdx) {
+			continue
+		}
+		entry := &col.DictEntries[e]
+		val := entry.Value
+		if val == "" {
+			val = intrinsicInt64ColToString(colName, entry.Int64Val)
+		}
+		dict[gIdx] = val
+	}
+}
+
+// groupHasNonZero reports whether group gIdx has any non-zero count across its numSteps
+// cells in a groupCountsFlat array laid out as groupCountsFlat[gIdx*numSteps+bk] (NOTE-401).
+func groupHasNonZero(groupCountsFlat []int64, gIdx, numSteps int64) bool {
+	base := gIdx * numSteps
+	for bk := int64(0); bk < numSteps; bk++ {
+		if groupCountsFlat[base+bk] != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// scanGroupByColCompactDictSerial is the single-threaded Dict-format body of
+// scanGroupByColCompact (NOTE-401). It writes the NATIVE entry index (entryIdx+1; 0 =
+// absent sentinel) directly into dictIdxByPos — no string conversion, no dedup map, and
+// no remap pass. The caller has already sized *dict to len(DictEntries)+1; per-group
+// value strings are resolved lazily at emit time (resolveDictGroupKey). pkBitset and
+// rankPrefix are the shared read-only POPCNT index over sortedPKs (NOTE-135/140).
+//
+// Empty-value entries are NOT skipped here (unlike the legacy value-deduped path): their
+// refs are still assigned their entry slot, and resolveDictGroupKey resolves the value
+// at emit time and drops the group if it is empty. This is byte-identical at emit because
+// the legacy path skipped empty-value entries entirely (so they never produced a group);
+// the lazy emit-time drop produces the same set of emitted groups.
+func scanGroupByColCompactDictSerial(
+	col *modules_shared.IntrinsicColumn,
 	minPK, maxPK uint32,
 	pkBitset []uint64,
 	rankPrefix []uint32,
-	dict *[]string,
-	valToIdx map[string]uint32,
 	dictIdxByPos []uint32,
 ) {
-	switch col.Format {
-	case modules_shared.IntrinsicFormatDict:
-		for _, entry := range col.DictEntries {
-			val := entry.Value
-			if val == "" {
-				val = intrinsicInt64ColToString(colName, entry.Int64Val)
-			}
-			if val == "" {
-				continue
-			}
-			var dictIdx uint32
-			dictAssigned := false
-			for _, ref := range entry.BlockRefs {
-				pk := packKey(ref.BlockIdx, ref.RowIdx)
-				if pk < minPK || pk > maxPK {
-					continue
-				}
-				word := pk >> 6
-				bit := pk & 63
-				if len(pkBitset) > 0 && pkBitset[word]&(uint64(1)<<bit) == 0 {
-					continue // NOTE-135/140: fast pre-filter: pk not in sortedPKs
-				}
-				// NOTE-140: O(1) rank replaces O(log n) searchSortedUint32.
-				r := rankPrefix[word] + uint32(bits.OnesCount64(pkBitset[word]&((uint64(1)<<bit)-1))) //nolint:gosec
-				pos := int(r)                                                                         //nolint:gosec
-				if !dictAssigned {
-					idx, ok := valToIdx[val]
-					if !ok {
-						idx = uint32(len(*dict)) //nolint:gosec
-						*dict = append(*dict, val)
-						valToIdx[val] = idx
-					}
-					dictIdx = idx + 1 // +1: 0 is absent sentinel
-					dictAssigned = true
-				}
-				dictIdxByPos[pos] = dictIdx
-			}
+	int64Domain := isInt64DomainColumn(col)
+	for e := range col.DictEntries {
+		entry := &col.DictEntries[e]
+		// NOTE-401: skip empty-value entries so their spans stay at sentinel 0 (the absent
+		// group), reproducing the legacy value-deduped path which dropped empty values
+		// entirely. For an int64-domain column the value is NEVER empty
+		// (intrinsicInt64ColToString returns a kind/status enum name or the FormatInt
+		// fallback, both always non-empty), so the scan never skips and never converts the
+		// string. For a string column the empty check is just entry.Value == "" — zero-alloc.
+		if !int64Domain && entry.Value == "" {
+			continue
 		}
-	case modules_shared.IntrinsicFormatFlat,
-		modules_shared.IntrinsicFormatXORBytes,
-		modules_shared.IntrinsicFormatDeltaUint64:
-		for i, ref := range col.BlockRefs {
+		dictIdx := uint32(e + 1) //nolint:gosec // entryIdx+1, bounded by numEntries
+		for _, ref := range entry.BlockRefs {
 			pk := packKey(ref.BlockIdx, ref.RowIdx)
 			if pk < minPK || pk > maxPK {
 				continue
@@ -944,60 +1002,98 @@ func scanGroupByColCompactSerial(
 			word := pk >> 6
 			bit := pk & 63
 			if len(pkBitset) > 0 && pkBitset[word]&(uint64(1)<<bit) == 0 {
-				continue // NOTE-140: bitset pre-filter before rank lookup
+				continue // NOTE-135/140: fast pre-filter: pk not in sortedPKs
 			}
 			// NOTE-140: O(1) rank replaces O(log n) searchSortedUint32.
-			pos := int(rankPrefix[word] + uint32(bits.OnesCount64(pkBitset[word]&((uint64(1)<<bit)-1)))) //nolint:gosec
-			var val string
-			if i < len(col.Uint64Values) {
-				val = strconv.FormatUint(col.Uint64Values[i], 10)
-			} else if i < len(col.BytesValues) {
-				val = string(col.BytesValues[i])
-			}
-			if val == "" {
-				continue
-			}
-			idx, ok := valToIdx[val]
-			if !ok {
-				idx = uint32(len(*dict)) //nolint:gosec
-				*dict = append(*dict, val)
-				valToIdx[val] = idx
-			}
-			dictIdxByPos[pos] = idx + 1
+			r := rankPrefix[word] + uint32(bits.OnesCount64(pkBitset[word]&((uint64(1)<<bit)-1))) //nolint:gosec
+			dictIdxByPos[int(r)] = dictIdx
 		}
 	}
 }
 
-// scanGroupByColCompactDictParallel is the parallel Dict-format path for scanGroupByColCompact
-// (NOTE-148). It parallelizes the per-ref inner loop — the bulk of the scan cost — across `workers`
-// goroutines while keeping dict construction serial, so the output (dict + dictIdxByPos) is
-// byte-identical to scanGroupByColCompactSerial.
-//
-// Why it is race-free without per-worker copies + reduction: each in-range span position is owned
-// by exactly one ref (a span has a single value per column), so the dictIdxByPos[pos] writes are
-// disjoint across workers. Workers take contiguous DictEntries ranges balanced by cumulative ref
-// count, so each entry is owned by exactly one worker — the per-entry entryPassed[] writes are
-// disjoint too. pkBitset, rankPrefix, and col.DictEntries are read-only. intrinsicInt64ColToString
-// and packKey are pure.
-//
-//   - Phase A (parallel): for each owned entry with a non-empty value, write entryIdx+1 into
-//     dictIdxByPos[pos] for every passing ref (pk in range + bitset member) and record entryPassed.
-//   - Phase B (serial, O(numEntries)+O(n)): build dict in entry order — identical to the serial
-//     path's first-passing-ref order, since it iterates entries in order and assigns on first pass —
-//     then translate the temporary entryIdx+1 markers in dictIdxByPos to the final dictIdx+1.
-func scanGroupByColCompactDictParallel(
+// isInt64DomainColumn reports whether a Dict column stores int64 values in Int64Val rather
+// than a string Value. This mirrors the decoder's `isInt64` predicate (intrinsic_codec.go:
+// colType == ColumnTypeInt64 || ColumnTypeRangeInt64), the exact set of columns whose Dict
+// entries leave Value == "" and carry Int64Val. For these the per-group key is produced by
+// intrinsicInt64ColToString — never empty (kind/status enum names or the FormatInt fallback)
+// — so the group-by scan must NOT treat a "" Value as an empty group (NOTE-401). Holds even
+// when a stored Int64Val happens to be 0 (e.g. span:kind "unspecified", span:status "unset").
+func isInt64DomainColumn(col *modules_shared.IntrinsicColumn) bool {
+	return col.Type == modules_shared.ColumnTypeInt64 || col.Type == modules_shared.ColumnTypeRangeInt64
+}
+
+// scanGroupByColCompactFlatSerial is the single-threaded Flat/XOR/Delta body of
+// scanGroupByColCompact. These formats have no native dictionary, so it builds a
+// string-deduped group dict via a local valToIdx map (entry positions are the row
+// positions; many rows can share a value). pkBitset and rankPrefix are the shared
+// read-only POPCNT index over sortedPKs (NOTE-135/140).
+func scanGroupByColCompactFlatSerial(
 	col *modules_shared.IntrinsicColumn,
-	colName string,
 	minPK, maxPK uint32,
 	pkBitset []uint64,
 	rankPrefix []uint32,
 	dict *[]string,
-	valToIdx map[string]uint32,
+	dictIdxByPos []uint32,
+) {
+	valToIdx := make(map[string]uint32, 32)
+	for i, ref := range col.BlockRefs {
+		pk := packKey(ref.BlockIdx, ref.RowIdx)
+		if pk < minPK || pk > maxPK {
+			continue
+		}
+		word := pk >> 6
+		bit := pk & 63
+		if len(pkBitset) > 0 && pkBitset[word]&(uint64(1)<<bit) == 0 {
+			continue // NOTE-140: bitset pre-filter before rank lookup
+		}
+		// NOTE-140: O(1) rank replaces O(log n) searchSortedUint32.
+		pos := int(rankPrefix[word] + uint32(bits.OnesCount64(pkBitset[word]&((uint64(1)<<bit)-1)))) //nolint:gosec
+		var val string
+		if i < len(col.Uint64Values) {
+			val = strconv.FormatUint(col.Uint64Values[i], 10)
+		} else if i < len(col.BytesValues) {
+			val = string(col.BytesValues[i])
+		}
+		if val == "" {
+			continue
+		}
+		idx, ok := valToIdx[val]
+		if !ok {
+			idx = uint32(len(*dict)) //nolint:gosec
+			*dict = append(*dict, val)
+			valToIdx[val] = idx
+		}
+		dictIdxByPos[pos] = idx + 1
+	}
+}
+
+// scanGroupByColCompactDictParallel is the parallel Dict-format path for scanGroupByColCompact
+// (NOTE-148, simplified by NOTE-401). It parallelizes the per-ref inner loop — the bulk of the
+// scan cost — across `workers` goroutines, writing the NATIVE entry index (entryIdx+1; 0 = absent
+// sentinel) directly into dictIdxByPos. The output is byte-identical to
+// scanGroupByColCompactDictSerial.
+//
+// Why it is race-free without per-worker copies + reduction: each in-range span position is owned
+// by exactly one ref (a span has a single value per column), so the dictIdxByPos[pos] writes are
+// disjoint across workers. Workers take contiguous DictEntries ranges balanced by cumulative ref
+// count, so each entry is owned by exactly one worker. pkBitset, rankPrefix, and col.DictEntries
+// are read-only. packKey is pure.
+//
+// NOTE-401 removed the prior Phase B: because the native entry index is itself the final group
+// index (the parsed Dict dedups values, so entries are unique — intrinsic_codec.go), there is no
+// string dedup map and no O(n) translation pass over every dictIdxByPos position. Per-group value
+// strings are resolved lazily at emit time (resolveDictGroupKey) only for groups that emit.
+func scanGroupByColCompactDictParallel(
+	col *modules_shared.IntrinsicColumn,
+	minPK, maxPK uint32,
+	pkBitset []uint64,
+	rankPrefix []uint32,
 	dictIdxByPos []uint32,
 	workers int,
 ) {
 	entries := col.DictEntries
 	numEntries := len(entries)
+	int64Domain := isInt64DomainColumn(col)
 
 	// Cumulative ref counts for ref-balanced contiguous entry sharding.
 	cumRefs := make([]int, numEntries+1)
@@ -1006,9 +1102,7 @@ func scanGroupByColCompactDictParallel(
 	}
 	totalRefs := cumRefs[numEntries]
 
-	entryPassed := make([]bool, numEntries)
-
-	// Phase A: parallel per-ref writes. Contiguous entry ranges balanced by cumulative ref count
+	// Parallel per-ref writes. Contiguous entry ranges balanced by cumulative ref count
 	// (low-cardinality dicts have a few ref-heavy entries; even-count chunking would leave one
 	// worker doing most of the work). Each range is owned by exactly one worker.
 	var wg sync.WaitGroup
@@ -1030,15 +1124,13 @@ func scanGroupByColCompactDictParallel(
 			defer wg.Done()
 			for e := lo; e < hi; e++ {
 				entry := &entries[e]
-				val := entry.Value
-				if val == "" {
-					val = intrinsicInt64ColToString(colName, entry.Int64Val)
+				// NOTE-401: skip empty-value string entries so their spans stay at sentinel
+				// 0 (matches scanGroupByColCompactDictSerial and the legacy value-deduped
+				// path). int64-domain entries are never empty.
+				if !int64Domain && entry.Value == "" {
+					continue
 				}
-				if val == "" {
-					continue // matches serial: empty values are skipped entirely
-				}
-				passed := false
-				marker := uint32(e + 1) //nolint:gosec // entryIdx+1, bounded by numEntries
+				dictIdx := uint32(e + 1) //nolint:gosec // entryIdx+1, bounded by numEntries
 				for _, ref := range entry.BlockRefs {
 					pk := packKey(ref.BlockIdx, ref.RowIdx)
 					if pk < minPK || pk > maxPK {
@@ -1052,44 +1144,13 @@ func scanGroupByColCompactDictParallel(
 					// NOTE-140: O(1) rank replaces O(log n) searchSortedUint32.
 					lowerBits := bits.OnesCount64(pkBitset[word] & ((uint64(1) << bit) - 1))
 					rank := rankPrefix[word] + uint32(lowerBits) //nolint:gosec
-					dictIdxByPos[int(rank)] = marker
-					passed = true
+					dictIdxByPos[int(rank)] = dictIdx
 				}
-				entryPassed[e] = passed
 			}
 		}(prev, end)
 		prev = end
 	}
 	wg.Wait()
-
-	// Phase B (serial): build the dict in entry order — byte-identical to the serial path, whose
-	// first-passing-ref encounter order IS entry order (it iterates DictEntries sequentially). Only
-	// entries with a passing ref get a slot, so fully-filtered groups never enlarge groupCountsFlat.
-	entryFinalIdx := make([]uint32, numEntries)
-	for e := range entries {
-		if !entryPassed[e] {
-			continue
-		}
-		entry := &entries[e]
-		val := entry.Value
-		if val == "" {
-			val = intrinsicInt64ColToString(colName, entry.Int64Val)
-		}
-		// val != "" is guaranteed: entryPassed[e] is only set for non-empty values.
-		idx, ok := valToIdx[val]
-		if !ok {
-			idx = uint32(len(*dict)) //nolint:gosec
-			*dict = append(*dict, val)
-			valToIdx[val] = idx
-		}
-		entryFinalIdx[e] = idx + 1
-	}
-	// Translate entryIdx+1 markers to final dictIdx+1. Positions left 0 by Phase A stay absent.
-	for pos := range dictIdxByPos {
-		if v := dictIdxByPos[pos]; v > 0 {
-			dictIdxByPos[pos] = entryFinalIdx[v-1]
-		}
-	}
 }
 
 // scanAggColHistogramCompact is the compact-path equivalent of streamByRefSliceHistogramScanDict.
@@ -1896,8 +1957,7 @@ func streamCountRateN1CompactCore(
 	dictIdxByPos := acquireCompactUint32(n)
 	defer releaseCompactUint32(dictIdxByPos)
 	if groupByCol != nil {
-		valToIdx := make(map[string]uint32, 32)
-		scanGroupByColCompact(groupByCol, groupByColName, sortedPKs, &dict, valToIdx, dictIdxByPos, rankIdx)
+		scanGroupByColCompact(groupByCol, groupByColName, sortedPKs, &dict, dictIdxByPos, rankIdx)
 	}
 	numGroups := int64(len(dict)) //nolint:gosec
 
@@ -1927,6 +1987,13 @@ func streamCountRateN1CompactCore(
 		}
 		groupCountsFlat[gIdx*numSteps+int64(bk)-1]++ //nolint:gosec
 	}
+
+	// NOTE-401: resolve Dict-format group key strings lazily — only for groups that
+	// accumulated a non-zero count — now that groupCountsFlat is populated. Flat columns
+	// already have dict fully built by the scan, so this is a no-op for them.
+	resolveDictGroupKeys(groupByCol, groupByColName, dict, func(gIdx int64) bool {
+		return groupHasNonZero(groupCountsFlat, gIdx, numSteps)
+	})
 
 	// NOTE-247: when a direct series sink is supplied, emit straight from the dense array
 	// (one series per non-empty group) and skip the string `buckets` map + the
@@ -2053,8 +2120,7 @@ func streamAggN1CompactCore(
 	dictIdxByPos := acquireCompactUint32(n)
 	defer releaseCompactUint32(dictIdxByPos)
 	if groupByCol != nil {
-		valToIdx := make(map[string]uint32, 32)
-		scanGroupByColCompact(groupByCol, agg.GroupBy[0], sortedPKs, &dict, valToIdx, dictIdxByPos, nil)
+		scanGroupByColCompact(groupByCol, agg.GroupBy[0], sortedPKs, &dict, dictIdxByPos, nil)
 	}
 	numGroups := len(dict)
 
@@ -2107,6 +2173,18 @@ func streamAggN1CompactCore(
 		}
 		// absent field: bucket stays count=0, emits NaN — matches streamByRefSliceAgg behavior
 	}
+
+	// NOTE-401: resolve Dict-format group key strings lazily — only for groups with at
+	// least one non-nil bucket. No-op for Flat columns (dict already built by the scan).
+	resolveDictGroupKeys(groupByCol, agg.GroupBy[0], dict, func(gIdx int64) bool {
+		row := groupBuckets[gIdx]
+		for _, bucket := range row {
+			if bucket != nil {
+				return true
+			}
+		}
+		return false
+	})
 
 	// Emit.
 	// NOTE-245: precompute per-timestep key prefixes once instead of re-formatting timeIdx per cell.
@@ -2421,8 +2499,7 @@ func streamHistogramN1CompactCore(
 	dictIdxByPos := acquireCompactUint32(n)
 	defer releaseCompactUint32(dictIdxByPos)
 	if groupByCol != nil {
-		valToIdx := make(map[string]uint32, 32)
-		scanGroupByColCompact(groupByCol, agg.GroupBy[0], sortedPKs, &dict, valToIdx, dictIdxByPos, nil)
+		scanGroupByColCompact(groupByCol, agg.GroupBy[0], sortedPKs, &dict, dictIdxByPos, nil)
 	}
 	numGroups := len(dict)
 
@@ -2478,6 +2555,13 @@ func streamHistogramN1CompactCore(
 			groupCountsFlat[gIdx*stride1+(int64(bk)-1)*stepStride]++ //nolint:gosec
 		}
 	}
+
+	// NOTE-401: resolve Dict-format group key strings lazily — only for groups with a
+	// non-zero cell anywhere in their stride1-sized (step × boundary) block. No-op for
+	// Flat columns (dict already built by the scan).
+	resolveDictGroupKeys(groupByCol, agg.GroupBy[0], dict, func(gIdx int64) bool {
+		return groupHasNonZero(groupCountsFlat, gIdx, stride1)
+	})
 
 	return emitHistogramFlat(
 		histSink,
