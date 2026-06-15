@@ -2194,3 +2194,39 @@ reuse keeps it stack-friendly regardless of page count and removes any per-page 
 Back-ref: `intrinsic_codec.go` (`decodePagesParallel`). Pure synchronization/allocation
 change — output is byte-for-byte identical; covered by the existing parallel-vs-serial
 equivalence tests in `intrinsic_parallel_decode_test.go`.
+
+## NOTE-389: inline >=3-byte uvarint decode in `appendDeltaUint64PageOpt`
+
+**Problem:** After NOTE-388 inlined the 1- and 2-byte uvarint cases, `appendDeltaUint64PageOpt`
+remained the #1 blockpack self-time frame (10.68% of querier CPU, profile 2026-06-15 over the
+24h M8 `histogram_over_time(duration)` window) and `encoding/binary.Uvarint` — now reached only
+by the `default` branch — was still 2.57% of total CPU. Delta-sorted `span:start` gaps larger
+than ~16 µs land in the 3+ byte uvarint range and took the generic `binary.Uvarint(src)` call,
+which re-slices `src` into a fresh header and runs a loop bounded by `binary.MaxVarintLen64` with
+its own per-byte index checks and an overflow guard the decoder does not need (the writer always
+emits well-formed uvarints).
+
+**Fix:** Replace the `binary.Uvarint` call in the `default` branch with an inline continuation-bit
+loop that reuses `src` directly. The branch is reached only with `b >= 0x80` (continuation set on
+byte 0), so byte 0's 7-bit group is consumed (`acc += uint64(b&0x7f)`, `shift := 7`) and the loop
+walks the remaining bytes, OR-ing each 7-bit group at the running shift and stopping at the first
+byte without the continuation bit. The loop is bounded by `j >= len(src)` (returns the same
+truncation error `binary.Uvarint` would have signalled via `w <= 0`), so no separate bounds checks
+or `MaxVarintLen64` cap are needed. `src = src[j:]` advances by exactly the bytes consumed,
+keeping the post-loop `pos = len(raw) - len(src)` and the deferred ref decode offset consistent.
+
+**Correctness:** `acc` accumulates the same LSB-first 7-bit groups `binary.Uvarint` would, with
+the same uint64 wraparound semantics (matching the existing 1-/2-byte inline branches, which also
+omit the overflow cap). `TestAppendDeltaUint64_BoundaryWidths` was extended with 3-, 4-, 5-, and
+9-byte deltas (2097151/2097152, 1<<28, 1<<35, 1<<50, 1<<63) and asserts the cumulative-sum output
+matches an independent `binary.Uvarint` reference decode across all widths.
+
+**Microbenchmark** (`BenchmarkAppendDeltaUint64_*`, 10k-row page): all-3-byte 43.0 µs → 32.7 µs
+(−24%), mixed (40% 2-byte + 20% 3-byte) 50.0 µs → 42.4 µs (−15%), all-1/2-byte unchanged, 0 allocs
+throughout. `binary.Uvarint` is now never called on this hot path.
+
+**Queries affected:** same as NOTE-388 — every delta-encoded uint64 intrinsic decode, heaviest on
+the wide metrics paths (M4/M6/M8/M9) where `span:start` pages with larger inter-span gaps appear.
+
+Back-ref: `internal/modules/blockio/shared/intrinsic_codec.go:appendDeltaUint64PageOpt`;
+NOTE-388 (2-byte inline), NOTE-256 (BCE), NOTE-169 (single-byte fast path).

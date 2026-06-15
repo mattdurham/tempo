@@ -1810,12 +1810,36 @@ func appendDeltaUint64PageOpt(raw []byte, blockW, rowW, rowCount int, dst *Intri
 			acc += uint64(b&0x7f) | uint64(src[1])<<7
 			src = src[2:]
 		default:
-			delta, w := binary.Uvarint(src)
-			if w <= 0 {
-				return fmt.Errorf("decodeDeltaUint64Page: truncated at uvarint row %d", i)
+			// NOTE-389: inline the >=3-byte uvarint decode instead of calling
+			// binary.Uvarint. After ascending sort, span:start gaps larger than ~16µs
+			// land in the 3+ byte range; the profile (2026-06-15, 24h M8 window) shows
+			// binary.Uvarint still at 2.57% of querier CPU as the only remaining
+			// non-inline path here. binary.Uvarint re-slices src into a fresh header and
+			// runs a generic loop bounded by binary.MaxVarintLen64 with its own per-byte
+			// index checks and an overflow guard the decoder does not need (the writer
+			// emits well-formed uvarints). We reach this branch with b >= 0x80
+			// (continuation set on byte 0); the 2-byte case above already handled
+			// len(src) >= 2 && src[1] < 0x80, so here either len(src) < 2 (truncated) or
+			// src[1] >= 0x80 (3+ bytes). Decode byte 0's 7-bit group, then continue from
+			// shift 7 over the remaining bytes; src shrinks by exactly the bytes consumed
+			// so its length is the bound and the j >= len(src) guard catches truncation.
+			acc += uint64(b & 0x7f)
+			j := 1
+			shift := uint(7)
+			for {
+				if j >= len(src) {
+					return fmt.Errorf("decodeDeltaUint64Page: truncated at uvarint row %d", i)
+				}
+				c := src[j]
+				j++
+				if c < 0x80 {
+					acc += uint64(c) << shift
+					break
+				}
+				acc += uint64(c&0x7f) << shift
+				shift += 7
 			}
-			acc += delta
-			src = src[w:]
+			src = src[j:]
 		}
 		out[i] = acc
 	}
