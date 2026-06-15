@@ -5935,3 +5935,36 @@ in the bitset), validated by `TestMergeJoinRefs_CorrectnessVsMap` (incl. shuffle
 duplicate packkeys, output compared against an independent map reference).
 
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:mergeJoinFilteredRefsWithVals`.
+
+---
+
+## NOTE-392: Memoize the node-0-ancestor existence walk in >> / !>> (2026-06-15)
+
+**Context:** `evalOpDescendantStruct` (`>>`) and `evalOpNotDescendantStruct` (`!>>`) each test, per
+RHS span, whether any strict ancestor carries the node-0 (LHS) bit by walking the span's parent
+chain (`parentIdx`) up to the root or first match. When many RHS spans share an ancestor subtree
+(a deep trace, or a wide fan-out under a common ancestor), the same chain prefix is re-walked for
+every descendant — O(RHS × depth). A single 2000-span chain (every span a descendant of one LHS
+root) cost ~4.55ms per evaluation in the microbench.
+
+**Decision:** Memoize the result with a per-trace tri-state scratch slice `memo []uint8`
+(0=unknown, 1=has-node-0-ancestor, 2=no-node-0-ancestor). `hasNode0AncestorMemo` walks up,
+stopping early on a cached node or an LHS-matching ancestor, then backfills `memo` for every
+previously-unknown node on the walked path with the resolved outcome. Each distinct span node is
+therefore visited at most once across the whole trace, making both evaluators O(spans) amortized.
+The same helper serves both ops (`!>>` is the negation of the same predicate; its prior per-span
+`leftSet map[int]struct{}` was redundant with `nodeMatch&0x01` and is dropped).
+
+**Result:** Deep-chain microbench `BenchmarkEvalOpDescendant_Deep` (2000-span chain): ~4.55ms →
+~7.8µs (~580x). Shallow/flat traces (the common 20-span case) are unchanged at ~97ns/0 allocs —
+the `make([]uint8, n)` memo is stack-allocated by escape analysis when it does not escape, so
+small traces pay no allocation. Correctness is byte-identical: all executor `-race` tests pass,
+plus `TestStructuralParquetComparison` / `TestFormatComparisonCorrectness` (multi-block fixtures,
+parity vs the parquet engine across `>>`, `!>>`, `!~`, etc.).
+
+**Generality:** A pure algorithmic complexity reduction (quadratic → linear) on the ancestor-chain
+existence test; no benchmark-specific constants, adapts to any trace shape. Only the existence
+operators (`>>`, `!>>`) benefit — `<<` (`evalOpAncestorStruct`) must collect ALL matching ancestors
+(not just existence) so it cannot break early and is left unchanged.
+
+Back-ref: `internal/modules/executor/stream_structural.go:hasNode0AncestorMemo`.

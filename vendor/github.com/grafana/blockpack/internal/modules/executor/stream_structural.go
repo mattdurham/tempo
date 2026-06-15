@@ -822,20 +822,58 @@ func applyStructuralOp(spans []structuralSpanRec, op traceqlparser.StructuralOp,
 	}
 }
 
-// evalOpDescendantStruct: R is a descendant of L (>>) — walk R's ancestor chain.
+// memo tri-state values for the node-0-ancestor existence walk (NOTE-392).
+const (
+	memoUnknown uint8 = 0
+	memoYes     uint8 = 1 // span has a node-0 (LHS) ancestor
+	memoNo      uint8 = 2 // span has no node-0 ancestor
+)
+
+// hasNode0AncestorMemo returns, for the span at index ri, whether any of its strict ancestors
+// carries the node-0 (LHS) bit. memo is a per-trace tri-state scratch slice (len == len(spans))
+// seeded along each walk so shared ancestor-chain prefixes are traversed at most once across all
+// RHS spans of the trace — turning the naive O(RHS×depth) chain walk into O(spans) amortized.
+// See NOTE-392.
+func hasNode0AncestorMemo(spans []structuralSpanRec, ri int, memo []uint8) bool {
+	// Walk up, stopping early on a cached node or an LHS-matching ancestor; record the resolved
+	// outcome for every previously-unknown node on the walked path.
+	cur := spans[ri].parentIdx
+	found := false
+	for cur >= 0 {
+		if m := memo[cur]; m != memoUnknown {
+			found = m == memoYes
+			break
+		}
+		if spans[cur].nodeMatch&0x01 != 0 {
+			found = true
+			break
+		}
+		cur = spans[cur].parentIdx
+	}
+	outcome := memoNo
+	if found {
+		outcome = memoYes
+	}
+	for p := spans[ri].parentIdx; p >= 0 && p != cur; p = spans[p].parentIdx {
+		if memo[p] != memoUnknown {
+			break
+		}
+		memo[p] = outcome
+	}
+	return found
+}
+
+// evalOpDescendantStruct: R is a descendant of L (>>) — true when R has a node-0 ancestor.
 func evalOpDescendantStruct(spans []structuralSpanRec, dst []int) []int {
+	// NOTE-392: memoized ancestor-existence walk; see hasNode0AncestorMemo.
+	memo := make([]uint8, len(spans))
 	result := dst
 	for ri, r := range spans {
 		if r.nodeMatch&0x02 == 0 {
 			continue
 		}
-		cur := r.parentIdx
-		for cur >= 0 {
-			if spans[cur].nodeMatch&0x01 != 0 {
-				result = append(result, ri)
-				break
-			}
-			cur = spans[cur].parentIdx
+		if hasNode0AncestorMemo(spans, ri, memo) {
+			result = append(result, ri)
 		}
 	}
 	return result
@@ -934,27 +972,16 @@ func evalOpNotSiblingStruct(spans []structuralSpanRec, dst []int) []int {
 // none of its ancestors has the node 0 bit set (nodeMatch&0x01) (!>>).
 // Walk the span's ancestor chain; if no ancestor carries node 0, emit the span.
 func evalOpNotDescendantStruct(spans []structuralSpanRec, dst []int) []int {
-	leftSet := make(map[int]struct{})
-	for i, sp := range spans {
-		if sp.nodeMatch&0x01 != 0 {
-			leftSet[i] = struct{}{}
-		}
-	}
+	// NOTE-392: same memoized ancestor-existence walk as the positive descendant op (the node-0
+	// membership is already encoded by nodeMatch&0x01, so the prior per-span leftSet map was
+	// redundant and is dropped). !>> emits RHS spans with NO node-0 ancestor.
+	memo := make([]uint8, len(spans))
 	result := dst
 	for ri, r := range spans {
 		if r.nodeMatch&0x02 == 0 {
 			continue
 		}
-		isDescendant := false
-		cur := r.parentIdx
-		for cur >= 0 {
-			if _, ok := leftSet[int(cur)]; ok {
-				isDescendant = true
-				break
-			}
-			cur = spans[cur].parentIdx
-		}
-		if !isDescendant {
+		if !hasNode0AncestorMemo(spans, ri, memo) {
 			result = append(result, ri)
 		}
 	}
