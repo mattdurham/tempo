@@ -18,6 +18,13 @@ latency (50–100 ms first-byte) dominates cost, not bytes transferred. Each unn
 I/O operation has a measurable latency cost. Keeping `io_ops` low and `bytes/io` high
 ensures the provider stack stays efficient on S3/GCS/Azure.
 
+**Programmatic guardrail (NOTE-403):** these bands are not markdown-only. The constants
+in `ioguardrail.go` are the single source of truth, and `EvaluateIOHealth(ioOps, bytesRead)`
+classifies counters into `BandGood` / `BandWarning` / `BandCritical`. `IOHealth.Band()`
+returns the worst component band so CI / dashboards gate on one value — e.g. fail a
+read-path regression check if `dp.IOHealth().Band() == BandCritical`. Keep this table in
+sync with the thresholds in `ioguardrail.go`.
+
 ---
 
 ## BENCH-RW-01: BenchmarkDefaultProviderSingleRead

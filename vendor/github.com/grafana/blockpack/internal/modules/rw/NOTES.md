@@ -248,3 +248,35 @@ changes. Using plain `int` (native word size: 32-bit on 32-bit, 64-bit on 64-bit
 eliminates the truncation on 64-bit builds and the nolint annotations that suppressed it.
 
 Back-ref: `internal/modules/rw/lru.go:cacheKey`
+
+---
+
+## NOTE-403: I/O Guardrails — Programmatic Bands for io_ops / bytes-per-io (2026-06-15)
+*Added: 2026-06-15*
+
+**Decision:** Added `EvaluateIOHealth`, `IOHealth`, `IOBand` (good/warning/critical) and
+`IOHealth()` methods on `TrackingReaderProvider` and `DefaultProvider`. The thresholds
+(`io_ops`: warn >=500, critical >1000; `bytes/io`: warn <=100KB, critical <10KB) live as
+constants in `ioguardrail.go` and are the single source of truth for the previously
+markdown-only table in `BENCHMARKS.md`.
+
+**Rationale:** The read path was deliberately shifted toward more, smaller bounded range
+reads (chunked trace index #341, page-pruned intrinsic decode #347). On high-latency
+object storage each request pays a fixed first-byte cost, so the bytes win only holds if
+`io_ops` stays low and `bytes/io` stays large. The bands existed only as prose, so nothing
+programmatically caught a regression where pruning multiplies small requests. The guardrail
+turns the bands into a classification CI / dashboards can assert against.
+
+**Design points:**
+- `EvaluateIOHealth(ioOps, bytesRead)` is pure (no provider state) so callers can classify
+  per-query-phase counter deltas, not just lifetime totals.
+- `IOBand` is ordered `good < warning < critical` so `IOHealth.Band()` can return the worst
+  component band and a caller gates on a single value.
+- `IOOps == 0` (fully cached query) classifies bytes/io as good: there is no small-read
+  problem when there were no real reads. This composes with the cache-wraps-tracker
+  invariant (§1) — cache hits never inflate the guardrail.
+
+**Constraint:** No format change, no file-size impact, behavior-preserving (observability
+only). The tracker's `ReadAt` is unchanged.
+
+Back-ref: `internal/modules/rw/ioguardrail.go`

@@ -128,6 +128,52 @@ func (t *TrackingReaderProvider) Reset()
 
 Atomically zeroes both counters.
 
+### 4.5 IOHealth
+
+```go
+func (t *TrackingReaderProvider) IOHealth() IOHealth
+func (d *DefaultProvider) IOHealth() IOHealth
+```
+
+Returns the guardrail classification of the current counters (see §4.6). On
+`DefaultProvider` this reflects only real storage I/O (cache hits excluded), per
+the composition invariant in §6.
+
+### 4.6 IOHealth / EvaluateIOHealth — I/O Guardrails
+
+```go
+type IOBand uint8 // BandGood < BandWarning < BandCritical
+
+type IOHealth struct {
+    IOOps          int64
+    BytesRead      int64
+    BytesPerIO     int64  // BytesRead/IOOps, or 0 when IOOps == 0
+    IOOpsBand      IOBand
+    BytesPerIOBand IOBand
+}
+
+func (h IOHealth) Band() IOBand // worst (highest-severity) of the two component bands
+
+func EvaluateIOHealth(ioOps, bytesRead int64) IOHealth
+```
+
+Classifies read-path I/O efficiency against the documented bands (see
+`BENCHMARKS.md` for the table and rationale):
+
+| Metric | Good | Warning | Critical |
+|--------|------|---------|----------|
+| `io_ops` | < 500 | 500 – 1000 | > 1000 |
+| `bytes/io` | > 100 KB | 10 – 100 KB | < 10 KB |
+
+**Invariant:** `EvaluateIOHealth` is pure (no provider state) so callers can classify
+per-query-phase counter deltas, not just lifetime totals.
+
+**Invariant:** `IOBand` is ordered `BandGood < BandWarning < BandCritical`, so
+`Band()` returns the worst component band and a caller gates on a single value.
+
+**Invariant:** When `IOOps == 0` (fully cached query, no real I/O) `BytesPerIO` is 0 and
+`BytesPerIOBand` is `BandGood` — there is no small-read problem when there were no reads.
+
 ---
 
 ## 5. RangeCachingProvider — Sub-Range Memory Cache

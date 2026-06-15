@@ -49,6 +49,28 @@ type TrackingReaderProvider = modules_rw.TrackingReaderProvider
 // RangeCachingProvider wraps a ReaderProvider with sub-range caching.
 type RangeCachingProvider = modules_rw.RangeCachingProvider
 
+// IOHealth is the guardrail classification of read-path I/O efficiency
+// (io_ops and bytes/io) against the documented bands.
+type IOHealth = modules_rw.IOHealth
+
+// IOBand classifies an I/O metric against the documented efficiency bands
+// (good / warning / critical).
+type IOBand = modules_rw.IOBand
+
+// IOBand values, ordered good < warning < critical so callers can take the
+// worst band across metrics and gate on a single threshold.
+const (
+	BandGood     = modules_rw.BandGood
+	BandWarning  = modules_rw.BandWarning
+	BandCritical = modules_rw.BandCritical
+)
+
+// EvaluateIOHealth classifies raw io_ops / bytes_read counters against the
+// documented bands. Pure: callers may evaluate per-query-phase counter deltas.
+func EvaluateIOHealth(ioOps, bytesRead int64) IOHealth {
+	return modules_rw.EvaluateIOHealth(ioOps, bytesRead)
+}
+
 // NewReaderFromProvider constructs a Reader from any storage backend.
 func NewReaderFromProvider(provider ReaderProvider) (*Reader, error) {
 	return reader.NewReaderFromProvider(provider)
