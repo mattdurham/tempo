@@ -986,7 +986,7 @@ func decodeDictPagesArena(
 	return nil
 }
 
-// decodePagedColumnBlob decodes a v2 paged column blob into a merged IntrinsicColumn.
+// decodePagedColumnBlobOpt decodes a v2 paged column blob into a merged IntrinsicColumn.
 // blob[0] must already be verified to be IntrinsicPagedVersion (0x02).
 //
 // Wire format:
@@ -997,7 +997,24 @@ func decodeDictPagesArena(
 //	page_blob_0[pages[0].Length]
 //	page_blob_1[pages[1].Length]
 //	...
-func decodePagedColumnBlob(blob []byte) (*IntrinsicColumn, error) {
+//
+// When eagerRefs is true the BlockRefs
+// are decoded in the SAME page-decompression pass as the values, instead of deferring them to
+// EnsureBlockRefs -> decodePagedColumnRefs (which snappy-decompresses every page a SECOND time).
+//
+// NOTE-390: the ref-needing metrics paths (predicate-filtered span:start, every `... by (...)`
+// group-by column and agg field — M6/M8/M9 and any filtered/grouped query) reach refs via
+// EnsureBlockRefs, which re-walks the blob and re-decompresses each page solely to recover the
+// refs section that sits at the tail of bytes the eager value decode already decompressed.
+// decodePagedColumnRefs was ~6% of querier cumulative CPU (profile 2026-06-15 24h M8 window),
+// dominated by the redundant snappy pass. When the caller knows up front it needs refs (the
+// executor computes needsRefs before any decode, metrics_trace_intrinsic.go), eagerRefs=true
+// folds the ref decode into the existing wantRefs=true page path so each page is decompressed
+// exactly once. The unfiltered no-group-by rate fast path (M1/M4) still passes eagerRefs=false
+// and keeps the deferred-ref behavior (it never reads BlockRefs). The decoded column is
+// byte-identical either way — eager refs just materializes col.BlockRefs during decode rather
+// than on first read.
+func decodePagedColumnBlobOpt(blob []byte, eagerRefs bool) (*IntrinsicColumn, error) {
 	if len(blob) < 5 {
 		return nil, fmt.Errorf("decodePagedColumnBlob: too short")
 	}
@@ -1033,7 +1050,10 @@ func decodePagedColumnBlob(blob []byte) (*IntrinsicColumn, error) {
 	// decodePagedColumnRefs. The unfiltered no-group-by rate path (M1/M4) reads only values +
 	// Count, so it never triggers the ref decode (appendVariableWidthRefs was ~10.7s of querier
 	// self-time). Dict columns keep eager refs (their refs share a cross-page arena, NOTE-152).
-	lazyRefs := isParallelPageDecodeFormat(toc.Format)
+	// NOTE-390: eagerRefs forces the refs to be decoded in the same page pass as the values,
+	// avoiding the second snappy decompression in decodePagedColumnRefs. Only the lazy-ref
+	// formats (Flat/Delta/XOR) defer refs; eagerRefs makes them decode refs inline instead.
+	lazyRefs := isParallelPageDecodeFormat(toc.Format) && !eagerRefs
 	// NOTE-145: pre-size only the value slice this column type actually uses (a column
 	// is uint64 OR bytes, never both) — the old code allocated a full totalRows-sized
 	// slice for the unused type on every flat/xor/delta column.
@@ -1048,6 +1068,9 @@ func decodePagedColumnBlob(blob []byte) (*IntrinsicColumn, error) {
 		}
 		if !lazyRefs {
 			// NOTE-258: BlockRef is pointer-free and every slot is written by the decode.
+			// NOTE-390: also reached on the eagerRefs path for Flat/Delta/XOR (lazyRefs is
+			// false because eagerRefs overrode it) — pre-size the refs backing so the page
+			// decode writes refs inline alongside the values.
 			merged.BlockRefs = makeNoZeroBlockRef(totalRows)[:0]
 		}
 	}
@@ -1071,10 +1094,11 @@ func decodePagedColumnBlob(blob []byte) (*IntrinsicColumn, error) {
 	// are the hot decode targets — ~27% of querier allocs and the residual cost of M1.
 	if isParallelPageDecodeFormat(toc.Format) && len(toc.Pages) >= 2 &&
 		totalRows >= parallelPageDecodeMinRows {
-		// NOTE-340: lazyRefs is always true here (isParallelPageDecodeFormat == the lazy-ref
-		// formats), so the parallel decode fills only values; refs are deferred to
-		// EnsureBlockRefs. decodePagesParallel decodes values-only via the *Opt helpers.
-		if err = decodePagesParallel(blob, pos, toc, blockW, rowW, totalRows, merged); err != nil {
+		// NOTE-340: when lazyRefs is true the parallel decode fills only values; refs are
+		// deferred to EnsureBlockRefs. NOTE-390: when eagerRefs forced lazyRefs=false the
+		// parallel decode also fills refs inline (wantRefs == !lazyRefs), so each page is
+		// decompressed once for both values and refs.
+		if err = decodePagesParallel(blob, pos, toc, blockW, rowW, totalRows, merged, !lazyRefs); err != nil {
 			return nil, err
 		}
 		return merged, nil
@@ -1240,6 +1264,7 @@ func decodePagesParallel(
 	toc PagedIntrinsicTOC,
 	blockW, rowW, totalRows int,
 	merged *IntrinsicColumn,
+	wantRefs bool, // NOTE-390: when true, refs are decoded inline (single snappy pass per page)
 ) error {
 	// rowOffsets[i] = first output row index for page i (cumulative RowCount).
 	rowOffsets := make([]int, len(toc.Pages))
@@ -1258,6 +1283,13 @@ func decodePagesParallel(
 		merged.BytesValues = merged.BytesValues[:totalRows]
 	} else {
 		merged.Uint64Values = merged.Uint64Values[:totalRows]
+	}
+	// NOTE-390: when refs are decoded inline, expose the full pre-sized refs backing so each
+	// page's capped sub-slice [off:off:off+rc] writes into its disjoint slot, mirroring the
+	// value-slice discipline above. merged.BlockRefs was pre-sized to cap==totalRows by
+	// decodePagedColumnBlobOpt's !lazyRefs branch.
+	if wantRefs {
+		merged.BlockRefs = merged.BlockRefs[:totalRows]
 	}
 
 	workers := min(len(toc.Pages), maxPageDecodeWorkers)
@@ -1338,17 +1370,22 @@ func decodePagesParallel(
 				} else {
 					slot.Uint64Values = merged.Uint64Values[off : off : off+rc]
 				}
-				// NOTE-340: wantRefs=false — refs deferred to EnsureBlockRefs. slot.BlockRefs
-				// stays nil; the *Opt helpers do not touch it.
+				// NOTE-340: when wantRefs is false refs are deferred to EnsureBlockRefs and
+				// slot.BlockRefs stays nil (the *Opt helpers leave it untouched).
+				// NOTE-390: when wantRefs is true, alias this page's disjoint refs slot
+				// [off:off:off+rc] so the inline ref decode writes into merged's backing.
+				if wantRefs {
+					slot.BlockRefs = merged.BlockRefs[off : off : off+rc]
+				}
 
 				var aerr error
 				switch toc.Format {
 				case IntrinsicFormatFlat:
-					aerr = appendFlatPageOpt(pageRaw, blockW, rowW, rc, toc.ColType, slot, false)
+					aerr = appendFlatPageOpt(pageRaw, blockW, rowW, rc, toc.ColType, slot, wantRefs)
 				case IntrinsicFormatXORBytes:
-					aerr = appendXORBytesPageOpt(pageRaw, blockW, rowW, rc, slot, false)
+					aerr = appendXORBytesPageOpt(pageRaw, blockW, rowW, rc, slot, wantRefs)
 				case IntrinsicFormatDeltaUint64:
-					aerr = appendDeltaUint64PageOpt(pageRaw, blockW, rowW, rc, slot, false)
+					aerr = appendDeltaUint64PageOpt(pageRaw, blockW, rowW, rc, slot, wantRefs)
 				}
 				if aerr != nil {
 					setErr(fmt.Errorf("decodePagesParallel: page %d: %w", i, aerr))
@@ -1424,10 +1461,26 @@ func PeekIntrinsicBlobHeader(blob []byte) (format uint8, colType ColumnType, cou
 
 // DecodeIntrinsicColumnBlob decompresses and decodes a column data blob into an IntrinsicColumn.
 func DecodeIntrinsicColumnBlob(blob []byte) (*IntrinsicColumn, error) {
+	return decodeIntrinsicColumnBlobOpt(blob, false)
+}
+
+// DecodeIntrinsicColumnBlobEagerRefs decodes a column blob with its BlockRefs materialized in
+// the same page-decompression pass as the values (NOTE-390). Callers that know up front they
+// will read col.BlockRefs (predicate-filtered / group-by metrics paths) should use this instead
+// of DecodeIntrinsicColumnBlob followed by col.EnsureBlockRefs(): the latter re-decompresses
+// every page a second time in decodePagedColumnRefs just to recover the refs section the value
+// decode already had in hand. The non-paged (legacy v1) and Dict formats already decode refs
+// eagerly, so eagerRefs is a no-op for them and the result is byte-identical to Decode
+// IntrinsicColumnBlob.
+func DecodeIntrinsicColumnBlobEagerRefs(blob []byte) (*IntrinsicColumn, error) {
+	return decodeIntrinsicColumnBlobOpt(blob, true)
+}
+
+func decodeIntrinsicColumnBlobOpt(blob []byte, eagerRefs bool) (*IntrinsicColumn, error) {
 	// v2 paged format: first byte is IntrinsicPagedVersion (0x02).
 	// The blob is NOT snappy-compressed as a whole; it contains the page TOC + page blobs.
 	if len(blob) > 0 && blob[0] == IntrinsicPagedVersion {
-		return decodePagedColumnBlob(blob)
+		return decodePagedColumnBlobOpt(blob, eagerRefs)
 	}
 
 	raw, err := decodeBoundedSnappyColumn(blob)

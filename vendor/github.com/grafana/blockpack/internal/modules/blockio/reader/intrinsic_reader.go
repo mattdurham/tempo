@@ -238,11 +238,15 @@ func (r *Reader) PrefetchIntrinsicColumns(names []string) {
 // before (refs always present). The single caller that can skip the ref decode — the span:start
 // fetch on the unfiltered no-group-by rate path — uses GetIntrinsicColumnLazyRefs instead.
 func (r *Reader) GetIntrinsicColumn(name string) (*shared.IntrinsicColumn, error) {
-	col, err := r.GetIntrinsicColumnLazyRefs(name)
-	if col != nil {
-		col.EnsureBlockRefs()
-	}
-	return col, err
+	// NOTE-390: decode values AND refs in a single page-decompression pass. The previous
+	// form (GetIntrinsicColumnLazyRefs then EnsureBlockRefs) decompressed every page twice —
+	// once for values, once for refs in decodePagedColumnRefs (~6% of querier cumulative CPU,
+	// profile 2026-06-15 24h M8). Every GetIntrinsicColumn caller reads refs (group-by
+	// columns, agg fields, predicate-filtered scans), so decoding them eagerly here folds the
+	// second snappy pass away. The unfiltered no-group-by count/rate fast path is the only
+	// caller that reads values without refs, and it goes through GetIntrinsicColumnLazyRefs
+	// directly, so it keeps the deferred-ref behavior.
+	return r.getIntrinsicColumn(name, true /* eagerRefs */)
 }
 
 // GetIntrinsicColumnLazyRefs is like GetIntrinsicColumn but does NOT force the lazy BlockRefs
@@ -250,6 +254,17 @@ func (r *Reader) GetIntrinsicColumn(name string) (*shared.IntrinsicColumn, error
 // no-group-by count/rate fast path) avoid the per-row ref decode entirely. Any caller that
 // reads col.BlockRefs MUST call col.EnsureBlockRefs() first.
 func (r *Reader) GetIntrinsicColumnLazyRefs(name string) (*shared.IntrinsicColumn, error) {
+	return r.getIntrinsicColumn(name, false /* eagerRefs */)
+}
+
+// getIntrinsicColumn fetches and decodes the named intrinsic column. When eagerRefs is true the
+// BlockRefs are materialized in the same page-decompression pass as the values (NOTE-390),
+// avoiding the second snappy pass that EnsureBlockRefs -> decodePagedColumnRefs would otherwise
+// perform. When false, refs are deferred (the unfiltered no-group-by rate path reads only
+// values). The decoded column is cached identically in both cases; a cached column whose refs
+// were deferred is still correct for an eager caller (it calls EnsureBlockRefs as a fallback),
+// and a cached eager column already satisfies a lazy caller (it just never reads BlockRefs).
+func (r *Reader) getIntrinsicColumn(name string, eagerRefs bool) (*shared.IntrinsicColumn, error) {
 	if r.intrinsicIndex == nil {
 		return nil, nil
 	}
@@ -267,6 +282,12 @@ func (r *Reader) GetIntrinsicColumnLazyRefs(name string) (*shared.IntrinsicColum
 	if r.intrinsicDecoded != nil {
 		if cached, ok := r.intrinsicDecoded[name]; ok {
 			r.intrinsicMu.RUnlock()
+			// NOTE-390: a previously-cached column may have had its refs deferred (decoded by
+			// a lazy caller). An eager caller needs refs materialized; EnsureBlockRefs is
+			// idempotent and runs the decode at most once per column per process.
+			if eagerRefs {
+				cached.EnsureBlockRefs()
+			}
 			return cached, nil
 		}
 	}
@@ -288,6 +309,10 @@ func (r *Reader) GetIntrinsicColumnLazyRefs(name string) (*shared.IntrinsicColum
 			}
 			r.intrinsicDecoded[name] = col
 			r.intrinsicMu.Unlock()
+			// NOTE-390: see the per-Reader cache-hit path above.
+			if eagerRefs {
+				col.EnsureBlockRefs()
+			}
 			return col, nil
 		}
 	}
@@ -300,7 +325,15 @@ func (r *Reader) GetIntrinsicColumnLazyRefs(name string) (*shared.IntrinsicColum
 		return nil, fmt.Errorf("GetIntrinsicColumn %q: read: %w", name, err)
 	}
 
-	col, err := shared.DecodeIntrinsicColumnBlob(blob)
+	// NOTE-390: decode values + refs in one page-decompression pass when the caller needs
+	// refs, instead of a lazy value decode followed by a second snappy pass in
+	// decodePagedColumnRefs.
+	var col *shared.IntrinsicColumn
+	if eagerRefs {
+		col, err = shared.DecodeIntrinsicColumnBlobEagerRefs(blob)
+	} else {
+		col, err = shared.DecodeIntrinsicColumnBlob(blob)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("GetIntrinsicColumn %q: decode: %w", name, err)
 	}
@@ -319,6 +352,11 @@ func (r *Reader) GetIntrinsicColumnLazyRefs(name string) (*shared.IntrinsicColum
 		r.intrinsicDecoded = make(map[string]*shared.IntrinsicColumn)
 	} else if existing, ok := r.intrinsicDecoded[name]; ok {
 		r.intrinsicMu.Unlock()
+		// NOTE-390: prefer the concurrently-decoded column, but materialize its refs if this
+		// is an eager caller and that decode deferred them.
+		if eagerRefs {
+			existing.EnsureBlockRefs()
+		}
 		return existing, nil
 	}
 	r.intrinsicDecoded[name] = col

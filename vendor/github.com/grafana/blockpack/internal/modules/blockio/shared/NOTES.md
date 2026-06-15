@@ -2230,3 +2230,50 @@ the wide metrics paths (M4/M6/M8/M9) where `span:start` pages with larger inter-
 
 Back-ref: `internal/modules/blockio/shared/intrinsic_codec.go:appendDeltaUint64PageOpt`;
 NOTE-388 (2-byte inline), NOTE-256 (BCE), NOTE-169 (single-byte fast path).
+
+---
+
+## NOTE-390: single-pass eager-ref decode avoids the second snappy pass for ref-needing columns
+
+**Problem:** The lazy-ref decode (NOTE-340) defers a paged Flat/Delta/XOR column's `BlockRefs`
+to first read via `EnsureBlockRefs` → `decodePagedColumnRefs`. That deferred decode re-walks the
+column blob and **snappy-decompresses every page a second time** purely to recover the refs
+section that sits at the tail of bytes the eager value decode already decompressed and discarded.
+On the ref-needing metrics paths (predicate-filtered `span:start`, every `... by (...)` group-by
+column and agg field — M6/M8/M9 and any filtered/grouped query) this double-decompress was ~6% of
+querier *cumulative* CPU (`decodePagedColumnRefs`, gcx profile 2026-06-15 24h M8 window), dominated
+by the redundant `s2.s2Decode`/`memmove` of pages whose value decode had already paid that cost.
+NOTE-353 had already removed the redundant *value-section re-scan* inside that pass, but the snappy
+decompression of each page still happened twice.
+
+**Fix:** Add an `eagerRefs` path that decodes refs in the **same** page-decompression pass as the
+values. `decodePagedColumnBlobOpt(blob, eagerRefs)` overrides `lazyRefs` to false when `eagerRefs`
+is set, so the serial and parallel page decoders run with `wantRefs = !lazyRefs == true` — each
+page is decompressed once and both its values and its refs are written inline. The parallel decoder
+gained a `wantRefs` parameter: when true it exposes the pre-sized `merged.BlockRefs[:totalRows]` and
+aliases each page's disjoint `[off:off:off+rc]` ref slot, mirroring the value-slice discipline, so
+the inline `appendVariableWidthRefs` writes into `merged`'s backing with no cross-goroutine aliasing.
+`DecodeIntrinsicColumnBlobEagerRefs` is the public entry point; legacy v1 and Dict formats already
+decode refs eagerly so it is a no-op for them.
+
+**Reader wiring:** `Reader.GetIntrinsicColumn` now decodes eagerly (it always read refs anyway —
+group-by columns, agg fields, predicates, span:end synthesis, compaction, writer). The cache-hit
+paths call `EnsureBlockRefs()` on an eager request as a fallback, so a column previously cached with
+refs deferred (by a lazy caller) is still correct. The unfiltered no-group-by count/rate fast path
+still calls `GetIntrinsicColumnLazyRefs` directly and keeps the deferred-ref behaviour (it reads
+only `Uint64Values`). The metrics executor computes `needsRefs` from `program`/`querySpec` *before*
+the `span:start` fetch (isCountRate, group-by arity, hasPreds are all known without the column), so
+it picks the eager fetch for ref-needing queries and the lazy fetch for the M1/M4 fast path.
+
+**Correctness:** `TestEagerRefsEqualsLazy` asserts the eager decode yields values and BlockRefs
+byte-identical to a lazy decode + `EnsureBlockRefs`, across parallel / serial-single / serial-multi
+layouts for Delta and XOR-bytes. The decoded column is identical either way — eager just
+materializes `col.BlockRefs` during decode rather than on first read.
+
+**Queries affected:** all predicate-filtered and group-by metrics (M6/M8/M9, M4 group-by) plus any
+`GetIntrinsicColumn` caller — the second snappy pass over the column's pages is eliminated.
+
+Back-ref: `internal/modules/blockio/shared/intrinsic_codec.go:decodePagedColumnBlobOpt`,
+`decodePagesParallel`, `DecodeIntrinsicColumnBlobEagerRefs`;
+`internal/modules/blockio/reader/intrinsic_reader.go:getIntrinsicColumn`;
+NOTE-340 (lazy refs), NOTE-353 (drop ref-section re-scan).
