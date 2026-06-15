@@ -3,6 +3,7 @@ package executor
 // NOTE: Any changes to this file must be reflected in the corresponding SPECS.md or NOTES.md.
 
 import (
+	"encoding/binary"
 	"fmt"
 	"slices"
 
@@ -148,7 +149,7 @@ func collectAllStructuralSpans(
 	ops []traceqlparser.StructuralOp,
 	tr queryplanner.TimeRange,
 	startBlock, blockCount int,
-) (map[[16]byte][]structuralSpanRec, map[int]*modules_reader.Block, error) {
+) ([][]structuralSpanRec, map[int]*modules_reader.Block, error) {
 	// NOTE-091: Each structural node is a regular filter program with an added relationship
 	// constraint. Block selection uses planBlocks per program — the same bloom/range/intrinsic-TOC
 	// pruning as plain filter queries — and the selected block sets are unioned.
@@ -225,7 +226,21 @@ func collectAllStructuralSpans(
 	// map probe ran once per span row. Collecting flat then grouping ONCE (group-by sort on the
 	// 16-byte trace ID) replaces O(spans) slice growations with a single contiguous backing
 	// array and exactly len(traces) final sub-slices, each sized exactly.
-	var flat []structuralSpanRec
+	// NOTE-377: pre-size flat to the exact upper bound on records (sum of SpanCount over the
+	// selected blocks, read from BlockMeta without parsing). collectBlockStructuralSpanRecs
+	// appends one record per row that carries a trace ID — at most SpanCount per block — so the
+	// summed span count is a tight upper bound. Sizing the backing array once eliminates the
+	// O(log spans) reallocation+memmove chain that the per-row cross-block append paid as flat
+	// grew (collectBlockStructuralSpanRecs→growslice was ~1% of querier CPU on the structural
+	// path, profile 2026-06-15). Rows without a trace ID never append, so the slice may finish
+	// shorter than capacity — harmless, the surplus is never touched.
+	var totalSpans int
+	for _, blockIdx := range plan.SelectedBlocks {
+		if _, ok := rawBlocks[blockIdx]; ok {
+			totalSpans += int(r.BlockMeta(blockIdx).SpanCount)
+		}
+	}
+	flat := make([]structuralSpanRec, 0, totalSpans)
 	// parsedBlocks caches the parsed *Block per blockIdx so evalStructuralMatches can
 	// populate SpanMatch.Block. Peak memory is bounded by len(plan.SelectedBlocks) parsed
 	// blocks, which is the same set already held in rawBlocks — no additional I/O.
@@ -314,33 +329,65 @@ func buildStructuralBlockPlan(r *modules_reader.Reader, programs []*vm.Program) 
 	}
 }
 
-// groupStructuralRecsByTrace converts the flat per-block record slice into the
-// trace-ID-keyed map consumed by resolveStructuralParentIndices and evalStructuralMatches.
-// Records of one trace are NOT contiguous in flat (they may come from different blocks),
-// so a single counting pass sizes each trace's slice exactly, then a fill pass scatters
-// records into pre-sized, exactly-fitted sub-slices carved from one shared backing array.
-// This replaces the per-row result[traceID] append churn (NOTE-373).
-func groupStructuralRecsByTrace(flat []structuralSpanRec) map[[16]byte][]structuralSpanRec {
+// groupStructuralRecsByTrace partitions the flat per-block record slice into one contiguous
+// window per trace, returned as a slice of sub-slices over the (now trace-sorted) flat backing
+// array. The downstream consumers (resolveStructuralParentIndices, evalStructuralMatches) treat
+// each trace independently and do not depend on the inter-trace ordering, so a stable sort by
+// 16-byte trace ID groups the records with neither the per-record hash store nor the second
+// backing allocation the prior map form paid.
+//
+// NOTE-377: the map form ran two full passes over flat, each hashing the 16-byte trace ID per
+// record — a counting pass (counts[traceID]++ → mapassign) plus a fill pass whose
+// out[tid]=append(...) did a map lookup AND a slice-header store per record. groupStructural →
+// mapassign was ~0.8% of querier CPU (profile 2026-06-15) and the rebuilt map plus the separate
+// `backing` array doubled the structural grouping's allocation. A single stable sort by trace ID
+// (uint64-pair compare, no hashing) clusters each trace into a contiguous run in place; one linear
+// pass then carves the run boundaries into exactly-sized windows. No per-record map operation, no
+// second backing array — the windows alias flat directly.
+// compareTraceID orders two 16-byte trace IDs lexicographically, comparing the high and low
+// 8-byte halves as big-endian uint64s. Big-endian decode makes the integer order match the
+// byte-lexicographic order, so the result is identical to bytes.Compare without slicing.
+func compareTraceID(a, b [16]byte) int {
+	ah := binary.BigEndian.Uint64(a[:8])
+	bh := binary.BigEndian.Uint64(b[:8])
+	if ah != bh {
+		if ah < bh {
+			return -1
+		}
+		return 1
+	}
+	al := binary.BigEndian.Uint64(a[8:])
+	bl := binary.BigEndian.Uint64(b[8:])
+	if al != bl {
+		if al < bl {
+			return -1
+		}
+		return 1
+	}
+	return 0
+}
+
+func groupStructuralRecsByTrace(flat []structuralSpanRec) [][]structuralSpanRec {
 	if len(flat) == 0 {
-		return map[[16]byte][]structuralSpanRec{}
+		return nil
 	}
-	counts := make(map[[16]byte]int)
-	for i := range flat {
-		counts[flat[i].traceID]++
-	}
-	out := make(map[[16]byte][]structuralSpanRec, len(counts))
-	// One shared backing array sized to the total record count; each trace gets a
-	// non-overlapping, exactly-sized window with cap == len so a later append (none occur
-	// downstream) could not bleed into the next trace's window.
-	backing := make([]structuralSpanRec, len(flat))
-	off := 0
-	for tid, c := range counts {
-		out[tid] = backing[off : off : off+c]
-		off += c
-	}
-	for i := range flat {
-		tid := flat[i].traceID
-		out[tid] = append(out[tid], flat[i])
+	// Stable sort by trace ID so records of one trace become contiguous. Stability preserves the
+	// original (block, row) order within each trace; downstream parent-index resolution keys on
+	// span ID and is order-independent, but keeping the order avoids any behavioral surprise.
+	// The 16-byte ID is compared as two big-endian uint64 halves — no slice headers, no per-byte
+	// loop — which orders identically to a lexicographic byte compare.
+	slices.SortStableFunc(flat, func(a, b structuralSpanRec) int {
+		return compareTraceID(a.traceID, b.traceID)
+	})
+	// Carve contiguous runs of equal trace ID into windows aliasing flat. cap is clamped to the
+	// run length so a downstream append (none occur) could not bleed into the next trace.
+	out := make([][]structuralSpanRec, 0, 16)
+	start := 0
+	for i := 1; i <= len(flat); i++ {
+		if i == len(flat) || flat[i].traceID != flat[start].traceID {
+			out = append(out, flat[start:i:i])
+			start = i
+		}
 	}
 	return out
 }
@@ -556,10 +603,9 @@ func (a *allMatchSet) ToSlice() []int {
 // retains the backing array) gives identical semantics with a single amortized allocation
 // that grows to the largest trace's span count. The clear runs at the TOP of each trace so
 // the very first iteration starts empty regardless of pool reuse.
-func resolveStructuralParentIndices(traceSpans map[[16]byte][]structuralSpanRec) {
+func resolveStructuralParentIndices(traceSpans [][]structuralSpanRec) {
 	byID := make(map[[8]byte]int)
-	for traceID := range traceSpans {
-		spans := traceSpans[traceID]
+	for _, spans := range traceSpans {
 		// NOTE-079, NOTE-093: [8]byte map key — zero string allocations on insert or lookup.
 		// Use present bits (not zero-value sentinel) to distinguish absent from all-zero IDs.
 		// NOTE-271: clear (not re-make) so the prior trace's entries do not leak in.
@@ -582,20 +628,25 @@ func resolveStructuralParentIndices(traceSpans map[[16]byte][]structuralSpanRec)
 			spans[i].parentID = [8]byte{}
 			spans[i].present &^= structuralParentIDPresent
 		}
-		traceSpans[traceID] = spans
 	}
 }
 
 // evalStructuralMatches evaluates the structural operator(s) for each trace and
 // appends matching terminal spans to result. Stops early if limit is reached.
 func evalStructuralMatches(
-	traceSpans map[[16]byte][]structuralSpanRec,
+	traceSpans [][]structuralSpanRec,
 	parsedBlocks map[int]*modules_reader.Block,
 	ops []traceqlparser.StructuralOp,
 	opts Options,
 	result *StructuralResult,
 ) error {
-	for traceID, spans := range traceSpans {
+	for _, spans := range traceSpans {
+		if len(spans) == 0 {
+			continue
+		}
+		// NOTE-377: every record in a window shares the trace ID (grouped contiguously); read it
+		// from the first record instead of a map key.
+		traceID := spans[0].traceID
 		// NOTE-096: Skip traces that cannot possibly produce a structural match.
 		if !traceCanMatch(spans, ops) {
 			continue

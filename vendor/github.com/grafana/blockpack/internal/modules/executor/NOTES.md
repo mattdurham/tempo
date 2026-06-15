@@ -5607,3 +5607,56 @@ full key space, run twice through the pool so pass 2 acquires a dirty buffer). C
 unchanged — this is membership-structure substitution on the existing scan path.
 
 Back-ref: `internal/modules/executor/stream.go:collectIntrinsicTopKScan`, `packedRefSet`
+
+## NOTE-377: Sort-group structural records + pre-size the flat record slice (2026-06-15)
+
+**Problem:** the structural query path (`{...} >> {...}` etc.) builds a flat `[]structuralSpanRec`
+across all selected blocks, then groups it by 16-byte trace ID for per-trace parent resolution and
+operator evaluation. A CPU profile (process_cpu, 30m, 2026-06-15) put two of its frames among the
+top blockpack self-time sinks:
+
+- `collectBlockStructuralSpanRecs` → `runtime.growslice` ~0.98%: `flat` started at nil and grew by
+  repeated reallocation+memmove as each block appended its per-row records.
+- `groupStructuralRecsByTrace` → `runtime.mapassign` ~0.80%: the grouping ran two full passes over
+  `flat`, each hashing the 16-byte trace ID per record — a counting pass (`counts[traceID]++`,
+  mapassign) plus a fill pass whose `out[tid] = append(...)` did a map lookup AND a slice-header
+  store per record. The rebuilt `out` map plus a separate `backing` array also doubled the
+  grouping's allocation.
+
+**Fix (two parts):**
+
+1. *Pre-size `flat`.* `collectAllStructuralSpans` now sums `BlockMeta(blockIdx).SpanCount` over the
+   selected blocks (read from the ToC, no parsing) and allocates `flat` with that exact capacity.
+   Each block appends at most `SpanCount` records (one per row carrying a trace ID), so the sum is a
+   tight upper bound; the single allocation eliminates the growslice/memmove chain. Rows without a
+   trace ID never append, so the slice may finish shorter than capacity — the surplus is untouched.
+
+2. *Sort-group instead of map-group.* `groupStructuralRecsByTrace` now `slices.SortStableFunc`s
+   `flat` by trace ID (compared as two big-endian uint64 halves via `compareTraceID` — no slice
+   headers, no per-byte loop, identical order to `bytes.Compare`) so records of one trace become
+   contiguous, then carves the runs into windows aliasing `flat` directly. It returns
+   `[][]structuralSpanRec` instead of `map[[16]byte][]structuralSpanRec`. No per-record map
+   operation, no second backing array. The downstream consumers
+   (`resolveStructuralParentIndices`, `evalStructuralMatches`) treat each trace window
+   independently and do not depend on inter-trace ordering; `evalStructuralMatches` recovers the
+   trace ID from `spans[0].traceID` (every record in a window shares it) instead of a map key.
+
+**Correctness:** stability of the sort preserves the original (block, row) order within each trace.
+Parent-index resolution keys on span ID and is order-independent, so even an unstable sort would be
+correct, but stability avoids any behavioral surprise. Big-endian uint64 decode makes the integer
+compare match the byte-lexicographic compare, so the grouping is independent of trace-ID layout.
+A nil `flat` (no selected blocks) yields a nil window slice, which both consumers range over safely.
+
+**Verified:** `go test -race ./internal/modules/executor/...` green incl. all
+TestResolveStructuralParentIndices_* (root/chain/multi-trace-no-leak/duplicate/absent),
+TestExecuteStructural_* (descendant/child/sibling/ancestor/parent/negations/multi-block/3-node-chain),
+TestEvalStructuralMatches_Dedup, TestResolveStructuralParentIndices_ZeroStringAllocs (≤ numTraces+2
+allocs holds — the byID map is the only alloc). `make precommit` fully green (deadcode,
+fieldalignment, staticcheck clean). Microbench BenchmarkExecuteStructural: AND_control
+2172904→1770342 ns/op (-18.5%), 4960611→4244548 B/op (-14.4%); OR_LHS 2270758→1721343 ns/op
+(-24.2%), 5158716→4008297 B/op (-22.3%); OR_RHS 1977471→1921690 ns/op (-2.8%), 5403500→4508550
+B/op (-16.6%).
+
+Back-ref: `internal/modules/executor/stream_structural.go:collectAllStructuralSpans`,
+`groupStructuralRecsByTrace`, `resolveStructuralParentIndices`, `evalStructuralMatches`,
+`compareTraceID`
