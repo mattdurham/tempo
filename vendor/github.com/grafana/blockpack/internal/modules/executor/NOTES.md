@@ -5541,3 +5541,33 @@ per-trace contiguity and parent resolution is identical.
 
 Back-ref: `internal/modules/executor/stream_structural.go:buildStructuralBlockPlan`,
 `groupStructuralRecsByTrace`, `collectBlockStructuralSpanRecs`
+
+## NOTE-375: Window the pkBitset clear + rank build to [minPK, maxPK] (2026-06-15)
+
+**Problem:** the POPCNT rank index (`buildPKRankIndex`, and the inline copy in
+`scanAggColHistogramCompact`) sizes `pkBitset`/`rankPrefix` by `maxPK` — the maximum *packKey
+value* (`blockIdx*stride + rowIdx`), up to ~16 M → ~256 K words / ~2 MB. The bitset is a
+zero-sentinel membership set drawn from a pool, so it was cleared in full on every acquire
+(`clear(pkBitset)` over all `nWords`), and the cumulative-popcount `rankPrefix` pass also ran the
+full `[0, maxPK]` word span. `runtime.memclrNoHeapPointers` was ~2.2% of querier CPU on the
+metrics group-by/histogram paths, and the work was paid per block regardless of how few keys (or
+how narrow a high window) the block actually contributed.
+
+**Fix:** every member packKey lies in `[minPK, maxPK]`, and every scan/`rankOf` caller gates
+`pk < minPK || pk > maxPK` *before* touching `pkBitset[word]`/`rankPrefix[word]`, so words below
+`minWord = minPK>>6` are never read. Clear only `pkBitset[minWord : maxWord+1]` (leaving the
+stale low words untouched — they are never read) and build `rankPrefix` cumulatively *within* the
+window (`rankPrefix` resets to 0 at `minWord`). A member's rank still equals its 0-based position
+among all members because no member lives below `minWord`, so the stale low/high words contribute
+nothing to any rank that is actually looked up.
+
+**Correctness:** `minPK` is derived by an O(N) scan of the key set (no sorted-input assumption,
+matching the existing NOTE-223/225 behavior). For a single-key set `minWord == maxWord` and the
+window is one word. `rankPrefix[maxWord+1]` still holds the total member count.
+
+**Verified:** `go test -race ./internal/modules/executor/...` green incl. the existing
+count/rate, agg, and histogram group-by equivalence suites (which already cover sparse, high-PK,
+and single-block key sets). Cold/warm behavior unchanged — this is pure scratch-buffer hygiene.
+
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:buildPKRankIndex`,
+`scanAggColHistogramCompact`

@@ -1102,10 +1102,16 @@ func scanAggColHistogramCompact( //nolint:gocyclo
 	// NOTE-143: build pkBitset + POPCNT rankPrefix ONCE (was rebuilt per branch at the old
 	// 678-697 / 751-773). Pure function of sortedPKs → identical for every worker; shared read-only.
 	// NOTE-134/140: zero-bit membership sentinel — must clear stale pool bits before setting.
+	// NOTE-375: clear and rank-sum only the touched word window [minWord, maxWord] (see
+	// buildPKRankIndex). Every scan site gates pk<minPK||pk>maxPK before reading
+	// pkBitset[word]/rankPrefix[word], so the words below minWord are never read; restricting the
+	// clear avoids a ~2 MB memclr per block when the actual key range is a small high window.
 	nWords := int((maxPK >> 6) + 1) //nolint:gosec
 	pkBitset := acquireCompactUint64(nWords)
 	defer releaseCompactUint64(pkBitset)
-	clear(pkBitset)
+	minWord := int(minPK >> 6) //nolint:gosec
+	maxWord := int(maxPK >> 6) //nolint:gosec
+	clear(pkBitset[minWord : maxWord+1])
 	for _, pk := range sortedPKs {
 		pkBitset[pk>>6] |= uint64(1) << (pk & 63)
 	}
@@ -1113,11 +1119,11 @@ func scanAggColHistogramCompact( //nolint:gocyclo
 	rankPrefix := acquireCompactUint32NoClear(nWords + 1)
 	defer releaseCompactUint32(rankPrefix)
 	var cum uint32
-	for i, w := range pkBitset {
+	for i := minWord; i <= maxWord; i++ {
 		rankPrefix[i] = cum
-		cum += uint32(bits.OnesCount64(w)) //nolint:gosec
+		cum += uint32(bits.OnesCount64(pkBitset[i])) //nolint:gosec
 	}
-	rankPrefix[len(pkBitset)] = cum
+	rankPrefix[maxWord+1] = cum
 
 	var numItems int
 	switch col.Format {
@@ -1595,21 +1601,35 @@ type pkRankIndex struct {
 func buildPKRankIndex(pkSet []uint32, maxPK uint32) pkRankIndex {
 	nWords := int((maxPK >> 6) + 1) //nolint:gosec
 	bitset := acquireCompactUint64(nWords)
-	clear(bitset)
+	// NOTE-375: the bitset/rankPrefix are sized by maxPK (the maximum packKey value, up to
+	// ~16 M → ~256 K words / 2 MB), but every member packKey lies in [minPK, maxPK]. Clearing
+	// and rank-summing the full [0, maxPK] span wasted a ~2 MB memclr per block (memclr was
+	// 2.2% of querier CPU) plus a full-width popcount pass, even when the actual key range was
+	// a small high window. Restrict both the clear AND the rankPrefix build to the touched word
+	// window [minWord, maxWord]: every scan/rankOf caller gates pk<minPK||pk>maxPK before
+	// reading bitset[word]/rankPrefix[word], so words below minWord are never read — they may
+	// retain stale pooled bits. rankPrefix is made cumulative within the window (rankPrefix
+	// resets to 0 at minWord), so a member's rank still equals its 0-based position among all
+	// members, independent of the stale low words.
 	minPK := maxPK
 	for _, pk := range pkSet {
-		bitset[pk>>6] |= uint64(1) << (pk & 63)
 		if pk < minPK {
 			minPK = pk
 		}
 	}
+	minWord := int(minPK >> 6) //nolint:gosec
+	maxWord := int(maxPK >> 6) //nolint:gosec
+	clear(bitset[minWord : maxWord+1])
+	for _, pk := range pkSet {
+		bitset[pk>>6] |= uint64(1) << (pk & 63)
+	}
 	rankPrefix := acquireCompactUint32NoClear(nWords + 1)
 	var cum uint32
-	for i, w := range bitset {
+	for i := minWord; i <= maxWord; i++ {
 		rankPrefix[i] = cum
-		cum += uint32(bits.OnesCount64(w)) //nolint:gosec
+		cum += uint32(bits.OnesCount64(bitset[i])) //nolint:gosec
 	}
-	rankPrefix[len(bitset)] = cum
+	rankPrefix[maxWord+1] = cum
 	return pkRankIndex{minPK: minPK, maxPK: maxPK, bitset: bitset, rankPrefix: rankPrefix}
 }
 
