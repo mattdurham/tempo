@@ -107,6 +107,10 @@ var compactFloat64Pool sync.Pool
 // NOTE-125: ~7 MB per call at n=7.2 M (agg and histogram paths only). See compactUint32Pool.
 var compactBoolPool sync.Pool
 
+// compactInt64Pool pools []int64 for baseOffsetByPos in the histogram scatter scan (NOTE-397).
+// ~57 MB per call at n=7.2 M (histogram group-by path only). See compactUint32Pool.
+var compactInt64Pool sync.Pool
+
 // compactBlockRefPool pools []modules_shared.BlockRef for outRefs in mergeJoinFilteredRefsWithVals.
 // NOTE-130: ~14 MB per call at outCap=3.5 M; pooled to eliminate GC pressure.
 var compactBlockRefPool sync.Pool
@@ -201,6 +205,25 @@ func releaseCompactFloat64(s []float64) {
 		return
 	}
 	compactFloat64Pool.Put(s[:cap(s)]) //nolint:staticcheck // SA6002: slice is pointer-sized
+}
+
+// acquireCompactInt64NoClear returns a []int64 of length n from the pool WITHOUT clearing.
+// NOTE-397: the histogram baseOffsetByPos table is fully overwritten by buildHistBaseOffsets
+// (every position gets a value or a skip sentinel) before any read, so the clear is skipped.
+func acquireCompactInt64NoClear(n int) []int64 {
+	if v := compactInt64Pool.Get(); v != nil {
+		if s, ok := v.([]int64); ok && cap(s) >= n {
+			return s[:n]
+		}
+	}
+	return make([]int64, n)
+}
+
+func releaseCompactInt64(s []int64) {
+	if cap(s)*8 > compactPoolMaxPooledBytes { // NOTE-355: drop oversized outlier
+		return
+	}
+	compactInt64Pool.Put(s[:cap(s)]) //nolint:staticcheck // SA6002: slice is pointer-sized
 }
 
 func acquireCompactBool(n int) []bool {
@@ -1156,12 +1179,20 @@ func scanAggColHistogramCompact( //nolint:gocyclo
 		w = histParallelWorkers
 	}
 
+	// NOTE-397: precompute the loop-invariant scatter base (gIdx*stride1 + bk-1) per position
+	// once, shared read-only across all shards. The scan then folds the bk==0 skip and the
+	// gIdx*stride1 multiply (executed once per matching ref, O(SpanCount)) into a single array
+	// read. Fully overwritten by buildHistBaseOffsets → acquire without clearing.
+	baseOffsetByPos := acquireCompactInt64NoClear(len(seenByPos))
+	defer releaseCompactInt64(baseOffsetByPos)
+	buildHistBaseOffsets(timeBucketByPos, dictIdxByPos, stride1, baseOffsetByPos)
+
 	// NOTE-143: serial fallback — byte-identical to the pre-NOTE-143 path. Writes directly into
 	// the caller's groupCountsFlat/seenByPos over the full range using the ORIGINAL closure.
 	if w <= 1 || numItems < histParallelMinItems {
 		return scanAggColHistogramShard(ctx, col, 0, numItems, minPK, maxPK,
-			pkBitset, rankPrefix, timeBucketByPos, dictIdxByPos, seenByPos,
-			getBoundaryIdx, groupCountsFlat, stride1, stride2, discardStride)
+			pkBitset, rankPrefix, baseOffsetByPos, seenByPos,
+			getBoundaryIdx, groupCountsFlat, stride2, discardStride)
 	}
 
 	// NOTE-143: parallel path. Serial pre-warm so workers do pure read-only boundary lookups, and
@@ -1223,8 +1254,8 @@ func scanAggColHistogramCompact( //nolint:gocyclo
 		go func(k, start, end int, gcf []int64, seen []bool) {
 			defer wg.Done()
 			errs[k] = scanAggColHistogramShard(ctx, col, start, end, minPK, maxPK,
-				pkBitset, rankPrefix, timeBucketByPos, dictIdxByPos, seen,
-				roBoundary, gcf, stride1, stride2, discardStride)
+				pkBitset, rankPrefix, baseOffsetByPos, seen,
+				roBoundary, gcf, stride2, discardStride)
 		}(k, start, end, gcf, seen)
 	}
 	wg.Wait()
@@ -1281,6 +1312,37 @@ func histRefPassPos(
 	return pos, true
 }
 
+// histSkipPos marks a position whose time bucket is 0 (out of the query time range) in the
+// precomputed baseOffsetByPos table — the scan must not scatter such refs (NOTE-397).
+const histSkipPos = int64(-1)
+
+// buildHistBaseOffsets precomputes, for every scan position pos, the LOOP-INVARIANT part of the
+// groupCountsFlat scatter index: gIdx*stride1 + (bk-1), where gIdx = dictIdxByPos[pos]-1 (or 0)
+// and bk = timeBucketByPos[pos]. NOTE-397: dictIdxByPos and timeBucketByPos are read-only,
+// query-wide arrays keyed by pos, so this base depends ONLY on pos — it is constant across the
+// (potentially many) refs that resolve to the same pos. Hoisting it out of the O(SpanCount) scan
+// loop replaces a per-ref multiply + two array reads + two branches with a single array read.
+// Positions with bk==0 get histSkipPos so the scan can skip them with one signed compare.
+func buildHistBaseOffsets(
+	timeBucketByPos []int32,
+	dictIdxByPos []uint32,
+	stride1 int64,
+	out []int64,
+) {
+	for pos := range timeBucketByPos {
+		bk := timeBucketByPos[pos]
+		if bk == 0 {
+			out[pos] = histSkipPos
+			continue
+		}
+		var gIdx int64
+		if raw := dictIdxByPos[pos]; raw > 0 {
+			gIdx = int64(raw - 1) //nolint:gosec
+		}
+		out[pos] = gIdx*stride1 + int64(bk) - 1
+	}
+}
+
 // scanAggColHistogramShard scans col.DictEntries[start:end] (Dict) or col.BlockRefs[start:end)
 // (Flat/Delta), writing into the supplied (possibly per-worker private) groupCountsFlat/seenByPos.
 // minPK/maxPK/pkBitset/rankPrefix are built once by the driver and shared read-only.
@@ -1292,12 +1354,11 @@ func scanAggColHistogramShard( //nolint:gocyclo
 	minPK, maxPK uint32,
 	pkBitset []uint64,
 	rankPrefix []uint32,
-	timeBucketByPos []int32,
-	dictIdxByPos []uint32,
+	baseOffsetByPos []int64,
 	seenByPos []bool,
 	getBoundaryIdx func(float64) int64,
 	groupCountsFlat []int64,
-	stride1, stride2 int64,
+	stride2 int64,
 	discardStride int64,
 ) error {
 	spanCount := 0
@@ -1339,16 +1400,14 @@ func scanAggColHistogramShard( //nolint:gocyclo
 				if !ok {
 					continue
 				}
-				bk := timeBucketByPos[pos]
-				if bk == 0 {
+				// NOTE-397: base = gIdx*stride1 + (bk-1), precomputed per pos. histSkipPos
+				// (-1) folds the former bk==0 check into one signed compare.
+				base := baseOffsetByPos[pos]
+				if base < 0 {
 					continue
 				}
 				seenByPos[pos] = true
-				var gIdx int64
-				if raw := dictIdxByPos[pos]; raw > 0 {
-					gIdx = int64(raw - 1) //nolint:gosec
-				}
-				groupCountsFlat[gIdx*stride1+bIdx*stride2+int64(bk)-1]++ //nolint:gosec
+				groupCountsFlat[base+bIdx*stride2]++
 			}
 		}
 	case modules_shared.IntrinsicFormatFlat,
@@ -1370,8 +1429,9 @@ func scanAggColHistogramShard( //nolint:gocyclo
 			if !ok {
 				continue
 			}
-			bk := timeBucketByPos[pos]
-			if bk == 0 {
+			// NOTE-397: precomputed base = gIdx*stride1 + (bk-1); histSkipPos folds bk==0.
+			base := baseOffsetByPos[pos]
+			if base < 0 {
 				continue
 			}
 			bIdx := getBoundaryIdx(float64(col.Uint64Values[i]))
@@ -1379,11 +1439,7 @@ func scanAggColHistogramShard( //nolint:gocyclo
 				continue
 			}
 			seenByPos[pos] = true
-			var gIdx int64
-			if raw := dictIdxByPos[pos]; raw > 0 {
-				gIdx = int64(raw - 1) //nolint:gosec
-			}
-			groupCountsFlat[gIdx*stride1+bIdx*stride2+int64(bk)-1]++ //nolint:gosec
+			groupCountsFlat[base+bIdx*stride2]++
 		}
 	}
 	return nil

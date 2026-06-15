@@ -6034,3 +6034,43 @@ reference, plus the existing `_MatchesMapReference` cases. All executor `-race` 
 no benchmark-specific constants. Sizing-only, so it cannot affect query results.
 
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:countDeltaHistogramBoundariesGallop`.
+
+## NOTE-397: Hoist the per-position invariant scatter base out of the M8 histogram scan (2026-06-15)
+
+The hottest M8 loop is the scatter write in `scanAggColHistogramShard`, executed once per matching
+ref (O(SpanCount) per block). It wrote:
+
+    groupCountsFlat[gIdx*stride1 + bIdx*stride2 + (bk-1)]++
+
+where `gIdx = dictIdxByPos[pos]-1` (or 0) and `bk = timeBucketByPos[pos]`. Both `dictIdxByPos` and
+`timeBucketByPos` are read-only, query-wide arrays keyed by the rank position `pos`, so the entire
+`gIdx*stride1 + (bk-1)` term — and the `bk==0` skip — depend ONLY on `pos`. They are *constant*
+across the (often many) refs that resolve to the same pos, yet were recomputed per ref: a multiply,
+two array reads, and two branches (`bk==0`, `dictIdxByPos>0`) on every iteration.
+
+**Fix:** `buildHistBaseOffsets` precomputes `baseOffsetByPos[pos] = gIdx*stride1 + (bk-1)` once in
+the driver (`scanAggColHistogramCompact`), sized `len(seenByPos)`, shared read-only across all
+parallel shards (same pattern as `timeBucketByPos`/`pkBitset`). Positions with `bk==0` get the
+`histSkipPos` (-1) sentinel, folding the time-range skip into a single signed compare. The scan
+becomes:
+
+    base := baseOffsetByPos[pos]
+    if base < 0 { continue }
+    ...
+    groupCountsFlat[base + bIdx*stride2]++
+
+The arithmetic is byte-identical (`base + bIdx*stride2 == gIdx*stride1 + bIdx*stride2 + bk-1`). The
+table is pooled via a new `compactInt64Pool` (acquired NoClear — `buildHistBaseOffsets` writes every
+position before any read). The Dict and Flat/Delta arms are updated identically; the serial fallback
+and the parallel worker call both pass the shared table.
+
+**Correctness:** identical output — covered by the parallel-vs-serial parity tests
+(`intrinsic_hist_parallel_test.go`, updated to build the table) and the full executor `-race` suite
+(incl. multi-block parquet parity). The absent-row pass in the caller is unchanged (still reads
+`dictIdxByPos`/`timeBucketByPos` once per position, not per ref).
+
+**Generality:** loop-invariant code motion out of the O(SpanCount) hot loop; no benchmark-specific
+constants. Cost moves from per-ref to per-position (always ≤ per-ref, since multiple refs share a
+pos). Pure post-decode CPU, holds warm or cold.
+
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:buildHistBaseOffsets`.

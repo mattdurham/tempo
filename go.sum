@@ -425,10 +425,8 @@ github.com/gorilla/securecookie v1.1.1/go.mod h1:ra0sb63/xPlUeL+yeDciTfxMRAA+MP+
 github.com/gorilla/sessions v1.2.1/go.mod h1:dk2InVEVJ0sfLlnXv9EAgkf6ecYs/i80K/zI+bUmuGM=
 github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674 h1:JeSE6pjso5THxAzdVpqr6/geYxZytqFMBCOtn/ujyeo=
 github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674/go.mod h1:r4w70xmWCQKmi1ONH4KIaBptdivuRPyosB9RmPlGEwA=
-github.com/grafana/blockpack v0.0.0-20260615174331-f405a3167234 h1:0F0A1vc0ybB8dxvJPOyKoxW8EBujptGlqXS6pEBRl/k=
-github.com/grafana/blockpack v0.0.0-20260615174331-f405a3167234/go.mod h1:iW6IBVDkWOxlJM/Maw6Rnmz4kC47AxWVOwpcd2RxN5c=
-github.com/grafana/blockpack v0.0.0-20260615184734-612d9b12c3f2 h1:RtuyZk8fpAhR14eL/XJIRQffj42M/pbuxdswk05vYJ0=
-github.com/grafana/blockpack v0.0.0-20260615184734-612d9b12c3f2/go.mod h1:iW6IBVDkWOxlJM/Maw6Rnmz4kC47AxWVOwpcd2RxN5c=
+github.com/grafana/blockpack v0.0.0-20260615190429-d75a7dd6e377 h1:G3XNuVnpwx27gi3z2wwaQQItyGOuOadt4NuJ63SojHI=
+github.com/grafana/blockpack v0.0.0-20260615190429-d75a7dd6e377/go.mod h1:iW6IBVDkWOxlJM/Maw6Rnmz4kC47AxWVOwpcd2RxN5c=
 github.com/grafana/dskit v0.0.0-20260427162712-0457a92dacc3 h1:/m/qmt7Ay+HK+GVbIvXrJIRHC07xFM6nWFMmyePmAUs=
 github.com/grafana/dskit v0.0.0-20260427162712-0457a92dacc3/go.mod h1:6zFIzal2FCd0JC1pE0ZTb2ftC0Jr/zsQR4zRNRdDfZA=
 github.com/grafana/e2e v0.1.2-0.20260504080022-0f57c9f0da68 h1:+GLaDMc1zkYNTMHZq3ljGaRSm1IcOxQvpBNn0YUyh60=
