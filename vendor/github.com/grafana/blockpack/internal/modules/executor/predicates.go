@@ -2165,13 +2165,7 @@ func scanIntrinsicLeafRefs(
 	// Flat column — extract range bounds.
 	switch {
 	case len(leaf.Values) > 0:
-		// Equality: scan for each value. Use full-decode fallback for simplicity
-		// since equality on flat columns is rare and may have multiple values.
-		col, err := r.GetIntrinsicColumn(colName)
-		if err != nil || col == nil {
-			return nil
-		}
-		return intrinsicFlatMatchRefs(col, leaf, maxRefs)
+		return scanFlatEqualityRefs(blob, leaf.Values, maxRefs)
 
 	case leaf.Min != nil || leaf.Max != nil:
 		lo, hi, hasLo, hasHi, ok := extractFlatRangeBounds(leaf)
@@ -2183,6 +2177,54 @@ func scanIntrinsicLeafRefs(
 	default:
 		return nil // pattern or no constraint
 	}
+}
+
+// scanFlatEqualityRefs returns the BlockRefs of a flat (sorted uint64) intrinsic column blob
+// whose value equals any of values, capped at maxRefs (0 == unlimited).
+//
+// NOTE-400: equality on a flat (sorted uint64) column is a degenerate range [target, target].
+// Each value is scanned through the page-pruned ScanFlatColumnRefs (which skips pages whose
+// [Min, Max] does not bracket the target via the PageTOC stats already present in the blob —
+// issue #347 query shape (a), equality variant) instead of GetIntrinsicColumn's full eager
+// decode of every page. Min/Max pruning is exact for a sorted column: a page can only contain a
+// row == target if Min <= target <= Max. The previous full-decode path (intrinsicFlatMatchRefs)
+// binary-searched col.Uint64Values, which itself required materializing the whole column; this
+// scans only the pages bracketing each value and is byte-identical for the rows the caller
+// consumes (the flat equality fast path already assumed sorted order via sortSearchUint64).
+//
+// A bytes flat column is not range-searchable; ScanFlatColumnRefs returns nil for it, matching
+// the old len(col.Uint64Values)==0 guard. nil from any value (unencodable literal / decode
+// failure / not-flat) makes the leaf unevaluable, exactly as before. An evaluable scan that
+// matches no row returns a non-nil empty slice (so the leaf stays evaluable rather than
+// collapsing the intrinsic pre-filter — see the matching empty-vs-nil contract in
+// scanFlatPagedBlob).
+func scanFlatEqualityRefs(blob []byte, values []vm.Value, maxRefs int) []modules_shared.BlockRef {
+	var result []modules_shared.BlockRef
+	for _, v := range values {
+		target, encOK := valueToUint64(v)
+		if !encOK {
+			return nil // unencodable literal — fast path N/A
+		}
+		rem := maxRefs
+		if maxRefs > 0 {
+			rem = maxRefs - len(result)
+			if rem <= 0 {
+				return result
+			}
+		}
+		refs := modules_shared.ScanFlatColumnRefs(blob, target, target, true, true, rem)
+		if refs == nil {
+			return nil // not a searchable flat column / decode failure — unevaluable
+		}
+		result = append(result, refs...)
+		if maxRefs > 0 && len(result) >= maxRefs {
+			return result[:maxRefs]
+		}
+	}
+	if result == nil {
+		return []modules_shared.BlockRef{} // evaluable but no values produced matches
+	}
+	return result
 }
 
 // extractFlatRangeBounds converts a RangeNode's Min/Max into inclusive uint64 bounds
@@ -2337,77 +2379,6 @@ func dictNumericInRange(valueBytes []byte, int64Val int64, isInt64 bool, lo, hi 
 		}
 	}
 	return true
-}
-
-// intrinsicFlatMatchRefs returns up to max BlockRefs from a flat (uint64-sorted) column
-// matching the predicate range. Returns nil when the predicate cannot be evaluated.
-func intrinsicFlatMatchRefs(
-	col *modules_shared.IntrinsicColumn,
-	leaf vm.RangeNode,
-	limit int,
-) []modules_shared.BlockRef {
-	if len(col.Uint64Values) == 0 {
-		return nil // bytes flat column — not range-searchable
-	}
-
-	vals := col.Uint64Values
-	var start, end int
-
-	switch {
-	case len(leaf.Values) > 0:
-		// Equality match.
-		var result []modules_shared.BlockRef
-		for _, v := range leaf.Values {
-			target, ok := valueToUint64(v)
-			if !ok {
-				return nil
-			}
-			i := sortSearchUint64(vals, target)
-			for i < len(vals) && vals[i] == target {
-				result = append(result, col.BlockRefs[i])
-				if limit > 0 && len(result) >= limit {
-					return result
-				}
-				i++
-			}
-		}
-		return result
-
-	case leaf.Min != nil || leaf.Max != nil:
-		start = 0
-		end = len(vals)
-		if leaf.Min != nil {
-			lo, ok := valueToUint64(*leaf.Min)
-			if !ok {
-				return nil
-			}
-			start = sortSearchUint64(vals, lo)
-		}
-		if leaf.Max != nil {
-			hi, ok := valueToUint64(*leaf.Max)
-			if !ok {
-				return nil
-			}
-			end = sortSearchUint64(vals, hi+1)
-			if hi == ^uint64(0) {
-				end = len(vals)
-			}
-		}
-
-	default:
-		return nil
-	}
-
-	if start >= end {
-		return []modules_shared.BlockRef{} // no matches but evaluable
-	}
-	count := end - start
-	if limit > 0 && count > limit {
-		count = limit
-	}
-	result := make([]modules_shared.BlockRef, count)
-	copy(result, col.BlockRefs[start:start+count])
-	return result
 }
 
 // rowSatisfiesIntrinsicNodesTyped evaluates intrinsic-column leaf nodes from the predicate

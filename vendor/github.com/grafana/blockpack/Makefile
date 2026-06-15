@@ -1,5 +1,14 @@
 .PHONY: test-data clean-test-data help bench bench-report serve-report cost-analysis cost-analysis-no-freetier build-cost-tool build test format lint clean format-benchmark precommit ci install-tools nilaway betteralign betteralign-fix gofumpt-check gofumpt golines-check golines format-all bench-profile-writes deadcode staticcheck bench-logs bench-logs-html bench-logs-full bench-logs-full-html clean-bench-logs-full docs
 
+# NOTE-399: Pinned lint/format/static-analysis tool versions — single source of truth.
+# These MUST stay in lockstep with .github/workflows/ci.yml so `make precommit` is a
+# faithful predictor of CI (no "green locally, red in CI" drift, per issue #352).
+# Bumping a version is a single deliberate change: edit the value here AND the matching
+# pin in ci.yml in the same commit.
+GOLANGCI_LINT_VERSION ?= v2.10.1
+STATICCHECK_VERSION   ?= v0.7.0
+GOFUMPT_VERSION       ?= v0.10.0
+
 # Number of traces to generate (approximately 670K spans like original dataset)
 NUM_TRACES ?= 191119
 
@@ -102,12 +111,14 @@ install-tools:
 	@echo "==> Installing code quality tools..."
 	@go install go.uber.org/nilaway/cmd/nilaway@latest
 	@go install github.com/dkorunic/betteralign/cmd/betteralign@latest
-	@go install mvdan.cc/gofumpt@v0.10.0
+	@go install mvdan.cc/gofumpt@$(GOFUMPT_VERSION)
 	@go install github.com/segmentio/golines@latest
 	@go install github.com/fzipp/gocyclo/cmd/gocyclo@latest
-	@go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+	@# NOTE-399: install golangci-lint via the official script at the CI-pinned version
+	@# (identical method + version to ci.yml) so local lint matches CI exactly.
+	@curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh | sh -s -- -b $$(go env GOPATH)/bin $(GOLANGCI_LINT_VERSION)
 	@go install golang.org/x/tools/cmd/deadcode@latest
-	@go install honnef.co/go/tools/cmd/staticcheck@latest
+	@go install honnef.co/go/tools/cmd/staticcheck@$(STATICCHECK_VERSION)
 	@echo "==> All tools installed!"
 
 # Nil safety checks

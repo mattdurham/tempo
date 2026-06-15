@@ -2277,3 +2277,21 @@ Back-ref: `internal/modules/blockio/shared/intrinsic_codec.go:decodePagedColumnB
 `decodePagesParallel`, `DecodeIntrinsicColumnBlobEagerRefs`;
 `internal/modules/blockio/reader/intrinsic_reader.go:getIntrinsicColumn`;
 NOTE-340 (lazy refs), NOTE-353 (drop ref-section re-scan).
+
+## NOTE-399: pin lint/static-analysis tool versions (issue #352)
+
+Pinned `golangci-lint` (v2.10.1) and `staticcheck` (v0.7.0) in `make install-tools` to the
+exact versions CI installs in `.github/workflows/ci.yml`, with the versions defined once as
+Makefile variables (`GOLANGCI_LINT_VERSION`, `STATICCHECK_VERSION`, `GOFUMPT_VERSION`). The
+Makefile now installs golangci-lint via the same official `install.sh` curl method CI uses
+(go install of golangci-lint v2 is discouraged), so local lint is byte-faithful to CI.
+
+Surfacing the pin exposed a real finding the unpinned local lint had been hiding: the newer
+locally-installed golangci-lint (v2.11.4) silently dropped a `prealloc` issue that CI's v2.10.1
+flags in `intrinsic_delta_bench_test.go` (`var buf []byte` in `TestAppendDeltaUint64_BoundaryWidths`
+→ preallocate `make([]byte, 0, len(deltas)*binary.MaxVarintLen64)`). Fixed in the same change so
+the repo is green under the pinned version — i.e. the pin was already silently breaking CI.
+
+Back-ref: `Makefile` (GOLANGCI_LINT_VERSION/STATICCHECK_VERSION/GOFUMPT_VERSION, install-tools);
+`.github/workflows/ci.yml` (golangci-lint + staticcheck install steps);
+`internal/modules/blockio/shared/intrinsic_delta_bench_test.go`.

@@ -6126,3 +6126,34 @@ at `< actualStride = stepStride` by the existing discard guard, so `(bk-1)*stepS
 numSteps*stepStride = stride1` — within each group's slab.
 
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:buildHistBaseOffsets`.
+
+## NOTE-400: page-pruned flat-equality intrinsic leaf scan (+ evaluable-empty contract)
+
+Issue #347 query shape (a), equality variant. `scanIntrinsicLeafRefs`'s flat-column equality
+branch previously called `GetIntrinsicColumn` — a full eager decode of EVERY page of the column —
+then binary-searched the materialized `Uint64Values`. Equality on a flat (sorted uint64) column is
+a degenerate range `[target, target]`, so it now routes through `scanFlatEqualityRefs` →
+`shared.ScanFlatColumnRefs(blob, target, target, true, true, rem)`, which prunes pages whose
+`[Min, Max]` does not bracket the target using the PageTOC stats already present in the blob (the
+same min/max page-skip the range path already used). Min/Max pruning is **exact** for a sorted
+column: a page can only contain a row == target if `Min <= target <= Max`. Each requested value
+scans independently and matches are concatenated, byte-identical to the rows the old full-decode
+path consumed. `intrinsicFlatMatchRefs` is deleted (its range branch was already dead — the range
+case routes through `ScanFlatColumnRefs` — and its equality branch is now the helper).
+
+**Evaluable-empty contract fix:** `scanFlatPagedBlob` / `scanDeltaUint64PagedBlob` returned `nil`
+when no row matched, conflating "evaluable, zero matches" with "decode error / not flat". The
+v1 `ScanFlatColumnRefs` already returned a non-nil empty slice for the former. The executor leaf
+path treats a `nil` result as "leaf unevaluable" → abandons the WHOLE intrinsic pre-filter and
+falls back to a full block scan. So a selective range/equality query that legitimately matched
+zero rows in a paged block was wrongly full-scanning it. Both paged scanners now return
+`[]BlockRef{}` (non-nil) for the evaluable-empty case, matching the v1 contract. This is a
+correctness/generality improvement on the paged range path too, not just equality.
+
+**Correctness:** byte-identical results for the rows the caller consumes; pruning is exact (sorted
+column min/max). No format change. Covered by `TestScanFlatColumnRefs_EqualityDegenerateRange_*`
+(V1, V2 paged across a page boundary, limit) in `shared_test.go` plus the full executor `-race`
+suite. **Generality:** no benchmark-specific constants; applies to any flat uint64 intrinsic column.
+
+Back-ref: `internal/modules/executor/predicates.go:scanFlatEqualityRefs`,
+`internal/modules/blockio/shared/intrinsic_codec.go:scanFlatPagedBlob/scanDeltaUint64PagedBlob`.

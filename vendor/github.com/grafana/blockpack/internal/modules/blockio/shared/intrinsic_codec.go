@@ -2404,6 +2404,17 @@ func scanFlatPagedBlob(blob []byte, lo, hi uint64, hasLo, hasHi bool, maxRefs in
 			return result
 		}
 	}
+	if result == nil {
+		// NOTE-400: distinguish "evaluable, no rows matched" (non-nil empty) from the
+		// error/not-flat paths above (nil). The v1 ScanFlatColumnRefs already returns a
+		// non-nil empty slice for an evaluable-but-empty scan, and the executor leaf path
+		// (scanIntrinsicLeafRefs) treats a nil result as "leaf unevaluable" → abandon the
+		// whole intrinsic pre-filter. A paged column whose predicate (range OR equality)
+		// simply matches no row is still fully evaluable, so it must return empty, not nil,
+		// or every selective query that legitimately matches zero rows in this block would
+		// wrongly fall back to a full block scan.
+		return []BlockRef{}
+	}
 	return result
 }
 
@@ -2623,6 +2634,12 @@ func scanDeltaUint64PagedBlob(
 		if maxRefs > 0 && len(result) >= maxRefs {
 			return result
 		}
+	}
+	if result == nil {
+		// NOTE-400: mirror scanFlatPagedBlob — evaluable-but-empty must be non-nil empty so
+		// the executor leaf path does not mistake a legitimate zero-match scan for an
+		// unevaluable leaf (which would abandon the intrinsic pre-filter).
+		return []BlockRef{}
 	}
 	return result
 }
