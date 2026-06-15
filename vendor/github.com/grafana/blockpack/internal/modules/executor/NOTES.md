@@ -5818,3 +5818,34 @@ bitmask purely from the operator chain length and negation shape.
 
 Back-ref: `internal/modules/executor/stream_structural.go:resolveStructuralParentIndices`,
 `ExecuteStructural`, `evalStructuralMatches`.
+
+### NOTE-384: pre-size the per-trace spanID→index map to the widest trace window
+
+`resolveStructuralParentIndices` allocates `byID` ONCE and `clear()`s it per trace (NOTE-271), but
+the map was created with no capacity hint. Go's map grew incrementally on the first trace it filled,
+rehashing each time it crossed a load-factor threshold; the grown bucket array then survives the
+`clear()` and is reused by later traces. Sizing the hint up front to the largest per-trace window
+(an O(traces) scan over slice headers — no per-span work) means even the widest trace inserts its
+spanID keys without a single rehash. The hint is an upper bound (a trace may carry fewer
+span-ID-present rows than its length), never an under-size, so it cannot cause spill.
+
+Back-ref: `internal/modules/executor/stream_structural.go:resolveStructuralParentIndices`.
+
+### NOTE-385: reuse one right-index scratch buffer across traces in the single-op path
+
+The single-op structural evaluators (`evalOpDescendantStruct`, `evalOpChildStruct`, …) each
+allocated `make([]int, 0, len(spans))` PER qualified trace — sized to the full per-trace span count
+even though the realised match set is typically tiny or empty. With many qualifying traces this is
+O(traces) allocations, each at span-count capacity.
+
+Fix: `evalStructuralMatches` holds a single `scratch []int` and threads `scratch[:0]` into
+`applyStructuralOps` → `applyStructuralOp` → the per-op evaluator, which appends into it instead of
+allocating. After each trace `scratch` is rebound to the returned (possibly grown) slice so the next
+trace reuses the high-water-mark backing array. The buffer is fully consumed — sorted, deduped, and
+emitted — before the next trace overwrites it (`evalStructuralMatches` reads every `rightIndices`
+entry into `result.Matches` within the same loop iteration), so no emitted match aliases it. The
+N>1 chain path (`evalOpChain`) uses map-set semantics and ignores the buffer; only the dominant
+2-node path is affected.
+
+Back-ref: `internal/modules/executor/stream_structural.go:evalStructuralMatches`,
+`applyStructuralOps`, `applyStructuralOp`, and the eight single-op evaluators.

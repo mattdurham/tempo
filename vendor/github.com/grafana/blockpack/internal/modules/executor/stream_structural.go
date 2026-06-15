@@ -634,7 +634,20 @@ func resolveStructuralParentIndices(
 	traceSpans [][]structuralSpanRec,
 	ops []traceqlparser.StructuralOp,
 ) [][]structuralSpanRec {
-	byID := make(map[[8]byte]int)
+	// NOTE-384: pre-size byID to the largest per-trace window. The map is allocated ONCE and
+	// clear()'d per trace (NOTE-271), but with no capacity hint Go's map grew incrementally on
+	// the first trace it filled, rehashing as it crossed each load-factor threshold. Sizing it
+	// up front to the widest trace window means the largest trace — and every trace after the
+	// first clear() that reuses the already-grown buckets — inserts without a single rehash.
+	// maxWin is an O(traces) scan over slice headers (no per-span work); the hint is an upper
+	// bound (a trace may carry fewer span-ID-present rows than its length), never an under-size.
+	maxWin := 0
+	for _, spans := range traceSpans {
+		if len(spans) > maxWin {
+			maxWin = len(spans)
+		}
+	}
+	byID := make(map[[8]byte]int, maxWin)
 	w := 0
 	for _, spans := range traceSpans {
 		if ops != nil && !traceCanMatch(spans, ops) {
@@ -677,6 +690,14 @@ func evalStructuralMatches(
 	opts Options,
 	result *StructuralResult,
 ) error {
+	// NOTE-385: scratch is a single per-call buffer reused across all traces for the matched
+	// right-side index slice. The single-op evaluators (the dominant 2-node path, e.g. {a}>>{b})
+	// previously each allocated make([]int, 0, len(spans)) PER qualified trace — sized to the full
+	// per-trace span count even though the realized match set is typically tiny or empty. Threading
+	// one reusable buffer (reset to [:0] per trace) collapses those O(traces) allocations into a
+	// single buffer that grows to the high-water mark and is then reused. It is fully consumed
+	// (sorted/deduped/emitted) before the next trace overwrites it, so no result aliases it.
+	var scratch []int
 	for _, spans := range traceSpans {
 		if len(spans) == 0 {
 			continue
@@ -687,7 +708,8 @@ func evalStructuralMatches(
 		// NOTE-383: traceCanMatch is NOT re-run here. resolveStructuralParentIndices already
 		// compacted traceSpans to the qualified subset, so every trace reaching this loop is
 		// known to pass the gate. Re-scanning here would duplicate the OR-over-nodeMatch work.
-		rightIndices := applyStructuralOps(spans, ops)
+		rightIndices := applyStructuralOps(spans, ops, scratch[:0])
+		scratch = rightIndices
 
 		// NOTE-079: slices.Sort + dedup replaces map[int]struct{} — zero extra allocs.
 		// rightIndices is a fresh local slice from applyStructuralOp; sorting it is safe.
@@ -744,43 +766,47 @@ func traceCanMatch(spans []structuralSpanRec, ops []traceqlparser.StructuralOp) 
 // applyStructuralOps dispatches to the appropriate evaluator based on chain length.
 // For a single op (2-node chain) it delegates to applyStructuralOp (unchanged path).
 // For N>1 ops it uses evalOpChain.
-func applyStructuralOps(spans []structuralSpanRec, ops []traceqlparser.StructuralOp) []int {
+// NOTE-385: dst is a caller-owned reusable buffer (already reset to len 0). The single-op
+// evaluators append into it and return the grown slice so the caller can re-supply it next
+// trace. The N>1 chain path uses set semantics and ignores dst.
+func applyStructuralOps(spans []structuralSpanRec, ops []traceqlparser.StructuralOp, dst []int) []int {
 	if len(ops) == 0 {
 		return nil
 	}
 	if len(ops) == 1 {
-		return applyStructuralOp(spans, ops[0])
+		return applyStructuralOp(spans, ops[0], dst)
 	}
 	return evalOpChain(spans, ops)
 }
 
-// applyStructuralOp returns the right-side span indices matched by the operator.
-func applyStructuralOp(spans []structuralSpanRec, op traceqlparser.StructuralOp) []int {
+// applyStructuralOp returns the right-side span indices matched by the operator, appended into
+// the caller-supplied dst buffer (NOTE-385).
+func applyStructuralOp(spans []structuralSpanRec, op traceqlparser.StructuralOp, dst []int) []int {
 	switch op {
 	case traceqlparser.OpDescendant:
-		return evalOpDescendantStruct(spans)
+		return evalOpDescendantStruct(spans, dst)
 	case traceqlparser.OpChild:
-		return evalOpChildStruct(spans)
+		return evalOpChildStruct(spans, dst)
 	case traceqlparser.OpSibling:
-		return evalOpSiblingStruct(spans)
+		return evalOpSiblingStruct(spans, dst)
 	case traceqlparser.OpAncestor:
-		return evalOpAncestorStruct(spans)
+		return evalOpAncestorStruct(spans, dst)
 	case traceqlparser.OpParent:
-		return evalOpParentStruct(spans)
+		return evalOpParentStruct(spans, dst)
 	case traceqlparser.OpNotSibling:
-		return evalOpNotSiblingStruct(spans)
+		return evalOpNotSiblingStruct(spans, dst)
 	case traceqlparser.OpNotDescendant:
-		return evalOpNotDescendantStruct(spans)
+		return evalOpNotDescendantStruct(spans, dst)
 	case traceqlparser.OpNotChild:
-		return evalOpNotChildStruct(spans)
+		return evalOpNotChildStruct(spans, dst)
 	default:
 		return nil
 	}
 }
 
 // evalOpDescendantStruct: R is a descendant of L (>>) — walk R's ancestor chain.
-func evalOpDescendantStruct(spans []structuralSpanRec) []int {
-	result := make([]int, 0, len(spans))
+func evalOpDescendantStruct(spans []structuralSpanRec, dst []int) []int {
+	result := dst
 	for ri, r := range spans {
 		if r.nodeMatch&0x02 == 0 {
 			continue
@@ -798,8 +824,8 @@ func evalOpDescendantStruct(spans []structuralSpanRec) []int {
 }
 
 // evalOpChildStruct: R's direct parent is L (>).
-func evalOpChildStruct(spans []structuralSpanRec) []int {
-	result := make([]int, 0, len(spans))
+func evalOpChildStruct(spans []structuralSpanRec, dst []int) []int {
+	result := dst
 	for ri, r := range spans {
 		if r.nodeMatch&0x02 == 0 || r.parentIdx < 0 {
 			continue
@@ -815,14 +841,14 @@ func evalOpChildStruct(spans []structuralSpanRec) []int {
 // A span qualifies as R if it has at least one node-0-matching sibling OTHER than itself.
 // Using a count map handles the case where R also matches node 0 (both sides): it qualifies
 // when a distinct second node-0-matching span shares the same parent.
-func evalOpSiblingStruct(spans []structuralSpanRec) []int {
+func evalOpSiblingStruct(spans []structuralSpanRec, dst []int) []int {
 	leftCounts := make(map[int]int)
 	for _, sp := range spans {
 		if sp.nodeMatch&0x01 != 0 {
 			leftCounts[int(sp.parentIdx)]++
 		}
 	}
-	result := make([]int, 0, len(spans))
+	result := dst
 	for ri, r := range spans {
 		if r.nodeMatch&0x02 == 0 {
 			continue
@@ -837,8 +863,8 @@ func evalOpSiblingStruct(spans []structuralSpanRec) []int {
 }
 
 // evalOpAncestorStruct: R is an ancestor of L (<<) — walk L's parent chain.
-func evalOpAncestorStruct(spans []structuralSpanRec) []int {
-	result := make([]int, 0, len(spans))
+func evalOpAncestorStruct(spans []structuralSpanRec, dst []int) []int {
+	result := dst
 	for _, l := range spans {
 		if l.nodeMatch&0x01 == 0 {
 			continue
@@ -855,8 +881,8 @@ func evalOpAncestorStruct(spans []structuralSpanRec) []int {
 }
 
 // evalOpParentStruct: R is the direct parent of L (<).
-func evalOpParentStruct(spans []structuralSpanRec) []int {
-	result := make([]int, 0, len(spans))
+func evalOpParentStruct(spans []structuralSpanRec, dst []int) []int {
+	result := dst
 	for _, l := range spans {
 		if l.nodeMatch&0x01 == 0 || l.parentIdx < 0 {
 			continue
@@ -870,14 +896,14 @@ func evalOpParentStruct(spans []structuralSpanRec) []int {
 
 // evalOpNotSiblingStruct: a span with node 1 bit set (nodeMatch&0x02) qualifies when
 // no span with node 0 bit set (nodeMatch&0x01) shares its parent (!~).
-func evalOpNotSiblingStruct(spans []structuralSpanRec) []int {
+func evalOpNotSiblingStruct(spans []structuralSpanRec, dst []int) []int {
 	leftParents := make(map[int]struct{})
 	for _, sp := range spans {
 		if sp.nodeMatch&0x01 != 0 {
 			leftParents[int(sp.parentIdx)] = struct{}{}
 		}
 	}
-	result := make([]int, 0, len(spans))
+	result := dst
 	for ri, r := range spans {
 		if _, hasLeft := leftParents[int(r.parentIdx)]; r.nodeMatch&0x02 != 0 && !hasLeft {
 			result = append(result, ri)
@@ -889,14 +915,14 @@ func evalOpNotSiblingStruct(spans []structuralSpanRec) []int {
 // SPEC-STRUCT-6: evalOpNotDescendantStruct: a span with node 1 bit set (nodeMatch&0x02) qualifies when
 // none of its ancestors has the node 0 bit set (nodeMatch&0x01) (!>>).
 // Walk the span's ancestor chain; if no ancestor carries node 0, emit the span.
-func evalOpNotDescendantStruct(spans []structuralSpanRec) []int {
+func evalOpNotDescendantStruct(spans []structuralSpanRec, dst []int) []int {
 	leftSet := make(map[int]struct{})
 	for i, sp := range spans {
 		if sp.nodeMatch&0x01 != 0 {
 			leftSet[i] = struct{}{}
 		}
 	}
-	result := make([]int, 0, len(spans))
+	result := dst
 	for ri, r := range spans {
 		if r.nodeMatch&0x02 == 0 {
 			continue
@@ -920,8 +946,8 @@ func evalOpNotDescendantStruct(spans []structuralSpanRec) []int {
 // SPEC-STRUCT-7: evalOpNotChildStruct: a span with node 1 bit set (nodeMatch&0x02) qualifies when
 // its direct parent does not have the node 0 bit set (nodeMatch&0x01) (!>).
 // A span with no parent also qualifies.
-func evalOpNotChildStruct(spans []structuralSpanRec) []int {
-	result := make([]int, 0, len(spans))
+func evalOpNotChildStruct(spans []structuralSpanRec, dst []int) []int {
+	result := dst
 	for ri, r := range spans {
 		if r.nodeMatch&0x02 == 0 {
 			continue
