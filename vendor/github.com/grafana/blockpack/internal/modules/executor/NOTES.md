@@ -5875,3 +5875,41 @@ all-unmatched case (`len(matched)==0`) returns `flat[:0]`, skipping the sort ent
 
 Back-ref: `internal/modules/executor/stream_structural.go:compactMatchingTraces`,
 `collectAllStructuralSpans` (call site before `groupStructuralRecsByTrace`).
+
+### NOTE-387: fuse the matched-trace filter and group-by into a counting bucket scatter
+
+NOTE-386 already paid one full hashing pass over the flat span population to build the
+matched-trace set (`compactMatchingTraces`), then ran a second pass to drop non-matching records
+in place and handed the survivors to `groupStructuralRecsByTrace`, which performed an O(n log n)
+16-byte trace-ID sort to carve contiguous per-trace windows. That is: 1 hashing pass + 1
+compaction pass + 1 comparison sort.
+
+Fix: `groupMatchingStructuralTraces` replaces both `compactMatchingTraces` and
+`groupStructuralRecsByTrace` with a single counting bucket scatter — no comparison sort. It reuses
+the matched-trace hashing pass and turns it into a dense bucket grouping:
+
+- Pass 1 assigns each trace carrying ≥1 matched span (`nodeMatch != 0`) a dense slot index on
+  first sighting (`buckets map[[16]byte]*structuralTraceBucket`). `len(buckets)==0` ⇒ no trace can
+  match ⇒ return nil (no scatter, no backing allocation).
+- Pass 2 counts survivors per matched trace. Every span of a kept trace survives (including the
+  `nodeMatch==0` intermediates the parent-topology chain needs), so the count is incremented for
+  every record whose trace is in the set.
+- A prefix sum over the per-slot counts produces bucket start offsets; each cursor is reset to its
+  window start.
+- Pass 3 scatters survivors directly into trace-contiguous windows of one freshly sized backing
+  array. Non-matching records are never copied.
+
+This replaces (compaction pass + O(n log n) sort) with (one scatter pass + one backing alloc). The
+windows alias the new backing array, each clamped to its run length (`backing[lo:hi:hi]`) so a
+downstream append could not bleed into the next trace. Inter-trace ordering is slot order
+(first-matched-span order) instead of sorted-ID order, which is fine: `resolveStructuralParentIndices`
+and `evalStructuralMatches` treat each trace independently and re-sort the matched right indices per
+trace before emitting, so neither inter-trace order nor intra-trace order reaches the result.
+
+Correctness of the "≥1 matched span" filter is unchanged from NOTE-386: it is a conservative
+superset for every op type including negation (RHS bit `0x02` is itself a nonzero `nodeMatch`), and
+whole traces are kept/dropped as a unit so intermediate ancestors stay intact.
+
+Back-ref: `internal/modules/executor/stream_structural.go:groupMatchingStructuralTraces`,
+`collectAllStructuralSpans` (single call site). Replaced and removed `compactMatchingTraces`,
+`groupStructuralRecsByTrace`, and `compareTraceID` (NOTE-380's sort comparator, now dead).

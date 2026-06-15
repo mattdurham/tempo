@@ -14,7 +14,7 @@ package executor
 // NOTE-373: traceID ([16]byte) is carried on the record itself so records can be accumulated
 // into a single FLAT slice across all blocks and grouped by trace ID in one final pass, instead
 // of appending into a per-trace result[traceID] slice per row (the prior dominant alloc). It is
-// only read by groupStructuralRecsByTrace; once grouped it is redundant with the map key but
+// only read by groupMatchingStructuralTraces; once grouped it is redundant with the map key but
 // retaining it costs nothing on the hot path and keeps the grouping pass branchless.
 //
 // Field order places the 16-byte array first, then the two 8-byte arrays, then the 4-byte

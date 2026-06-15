@@ -3,7 +3,6 @@ package executor
 // NOTE: Any changes to this file must be reflected in the corresponding SPECS.md or NOTES.md.
 
 import (
-	"encoding/binary"
 	"fmt"
 	"slices"
 
@@ -257,63 +256,95 @@ func collectAllStructuralSpans(
 		}
 	}
 
-	// NOTE-386: drop entire non-matching traces BEFORE the group-by sort. A trace can
-	// contribute a structural match only if at least one of its spans matched a node
-	// (nodeMatch != 0) — this holds for every op type including negation, where the
-	// qualifying side is the RHS bit (0x02), itself a nonzero nodeMatch (see traceCanMatch).
-	// groupStructuralRecsByTrace sorts the FULL flat population (O(n log n) 16-byte compares),
-	// and on the dominant structural workload most traces match no node at all (Q9 returns 0
-	// traces over a large span population). compactMatchingTraces first records the trace IDs
-	// that carry ≥1 matched span (one map insert per matched span — cheap when few match), then
-	// keeps only records whose trace ID is in that set. Whole traces are kept or dropped as a
-	// unit: a kept trace retains ALL its spans (including nodeMatch==0 intermediates) so the
-	// parent-topology chain that resolveStructuralParentIndices walks stays intact. The sort
-	// then runs over only the surviving (potentially matching) records. When every trace matches
-	// the compaction is a no-op pass and the set is freed immediately after.
-	flat = compactMatchingTraces(flat)
-	result := groupStructuralRecsByTrace(flat)
+	// NOTE-387: fuse the matched-trace filter and the group-by into a single counting bucket
+	// scatter — no comparison sort. A trace can contribute a structural match only if ≥1 of its
+	// spans matched a node (nodeMatch != 0); this holds for every op type including negation,
+	// where the qualifying side is the RHS bit (0x02), itself a nonzero nodeMatch (see
+	// traceCanMatch). NOTE-386 already paid one full hashing pass to build the matched-trace set,
+	// then dropped non-matching records in place and handed the survivors to an O(n log n) 16-byte
+	// trace-ID sort. groupMatchingStructuralTraces reuses that one hashing pass: it assigns each
+	// matched trace a dense slot and accumulates its surviving-record count, then a prefix sum
+	// turns the counts into bucket offsets and a single linear scatter places each surviving
+	// record directly into its trace's contiguous window in a freshly sized backing array. That
+	// replaces (compaction pass + O(n log n) sort) with (one scatter pass + one backing alloc).
+	// Whole traces are kept or dropped as a unit: a kept trace retains ALL its spans (including
+	// nodeMatch==0 intermediates) so the parent-topology chain resolveStructuralParentIndices
+	// walks stays intact. Non-matching records are never copied, so the scatter only touches the
+	// survivors. On the all-matching workload every record is a survivor and the scatter is a
+	// full copy, but it is still a single linear pass with no comparisons.
+	result := groupMatchingStructuralTraces(flat)
 	return result, parsedBlocks, nil
 }
 
-// compactMatchingTraces removes records belonging to traces that have no matched span
-// (every span's nodeMatch == 0), compacting flat in place. See NOTE-386. The returned slice
-// aliases flat's backing array (a prefix); the surplus tail is left untouched. Records are
-// not reordered, so the subsequent group-by sort sees the same relative order it would have.
-func compactMatchingTraces(flat []structuralSpanRec) []structuralSpanRec {
+// groupMatchingStructuralTraces drops records belonging to traces that have no matched span
+// (every span's nodeMatch == 0) AND groups the survivors into one contiguous window per trace,
+// in a single counting bucket scatter with no comparison sort. See NOTE-387.
+//
+// A trace qualifies iff at least one of its spans matched a node (nodeMatch != 0); whole
+// traces are kept or dropped as a unit so a kept trace retains every span (including the
+// nodeMatch==0 intermediates that resolveStructuralParentIndices walks). The returned windows
+// alias a freshly allocated backing array (not flat), each clamped to its run length so a
+// downstream append could not bleed into the next trace.
+//
+// Bucket state (dense slot index + running count/cursor) lives in slot-indexed slices, not in a
+// per-trace heap struct: the map carries only trace ID → slot (one int value, no pointer
+// allocation), and the count and cursor are looked up by slot in flat int slices. This keeps the
+// per-matched-trace cost to a single map entry with no satellite allocation.
+func groupMatchingStructuralTraces(flat []structuralSpanRec) [][]structuralSpanRec {
 	if len(flat) == 0 {
-		return flat
+		return nil
 	}
-	// First pass: collect the trace IDs that carry at least one matched span, and note whether
-	// any record matched no node at all. If every record matched (the all-matching workload),
-	// no trace can be dropped — return flat untouched and skip the second pass entirely so the
-	// matched-set map is the only added cost. The common structural workload is the opposite:
-	// most records carry nodeMatch==0 and whole traces fall away.
-	matched := make(map[[16]byte]struct{})
-	anyUnmatched := false
+	// Pass 1: assign each trace carrying ≥1 matched span a dense slot index on first sighting.
+	// A trace is only ever added by a matched span; non-matching records of a trace already in
+	// the set are counted in pass 2 (a kept trace retains ALL its spans).
+	slotOf := make(map[[16]byte]int)
 	for i := range flat {
-		if flat[i].nodeMatch != 0 {
-			matched[flat[i].traceID] = struct{}{}
-		} else {
-			anyUnmatched = true
+		if flat[i].nodeMatch == 0 {
+			continue
+		}
+		if _, ok := slotOf[flat[i].traceID]; !ok {
+			slotOf[flat[i].traceID] = len(slotOf)
 		}
 	}
-	if len(matched) == 0 {
-		// No trace can match — drop everything, skipping the sort entirely.
-		return flat[:0]
+	nSlots := len(slotOf)
+	if nSlots == 0 {
+		// No trace can match — nothing survives.
+		return nil
 	}
-	if !anyUnmatched {
-		// Every record matched a node; no trace is droppable.
-		return flat
-	}
-	// Second pass: keep records whose trace ID is in the matched set.
-	w := 0
+	// Pass 2: count survivors per matched trace by slot (every span of a kept trace survives).
+	// offsets is sized nSlots+1; counts accumulate into offsets[slot+1] so the prefix sum below
+	// turns it directly into per-window start offsets.
+	offsets := make([]int, nSlots+1)
+	total := 0
 	for i := range flat {
-		if _, ok := matched[flat[i].traceID]; ok {
-			flat[w] = flat[i]
-			w++
+		if slot, ok := slotOf[flat[i].traceID]; ok {
+			offsets[slot+1]++
+			total++
 		}
 	}
-	return flat[:w]
+	for s := 1; s <= nSlots; s++ {
+		offsets[s] += offsets[s-1]
+	}
+	// cursors[slot] is the live write position for the trace's window; initialized to the
+	// window start offset (offsets[slot]).
+	cursors := make([]int, nSlots)
+	copy(cursors, offsets[:nSlots])
+	// Pass 3: scatter survivors into trace-contiguous windows of a single backing array.
+	backing := make([]structuralSpanRec, total)
+	for i := range flat {
+		if slot, ok := slotOf[flat[i].traceID]; ok {
+			backing[cursors[slot]] = flat[i]
+			cursors[slot]++
+		}
+	}
+	// Carve the backing array into per-trace windows using the offsets, clamping cap to length.
+	out := make([][]structuralSpanRec, nSlots)
+	for s := range nSlots {
+		lo := offsets[s]
+		hi := offsets[s+1]
+		out[s] = backing[lo:hi:hi]
+	}
+	return out
 }
 
 // structuralBlockPlan holds the per-query, block-independent inputs to
@@ -382,74 +413,6 @@ func buildStructuralBlockPlan(r *modules_reader.Reader, programs []*vm.Program) 
 		intrinsicWant: intrinsicWant,
 		nodesList:     nodesList,
 	}
-}
-
-// groupStructuralRecsByTrace partitions the flat per-block record slice into one contiguous
-// window per trace, returned as a slice of sub-slices over the (now trace-sorted) flat backing
-// array. The downstream consumers (resolveStructuralParentIndices, evalStructuralMatches) treat
-// each trace independently and do not depend on the inter-trace ordering, so a stable sort by
-// 16-byte trace ID groups the records with neither the per-record hash store nor the second
-// backing allocation the prior map form paid.
-//
-// NOTE-377: the map form ran two full passes over flat, each hashing the 16-byte trace ID per
-// record — a counting pass (counts[traceID]++ → mapassign) plus a fill pass whose
-// out[tid]=append(...) did a map lookup AND a slice-header store per record. groupStructural →
-// mapassign was ~0.8% of querier CPU (profile 2026-06-15) and the rebuilt map plus the separate
-// `backing` array doubled the structural grouping's allocation. A single stable sort by trace ID
-// (uint64-pair compare, no hashing) clusters each trace into a contiguous run in place; one linear
-// pass then carves the run boundaries into exactly-sized windows. No per-record map operation, no
-// second backing array — the windows alias flat directly.
-// compareTraceID orders two 16-byte trace IDs lexicographically, comparing the high and low
-// 8-byte halves as big-endian uint64s. Big-endian decode makes the integer order match the
-// byte-lexicographic order, so the result is identical to bytes.Compare without slicing.
-func compareTraceID(a, b [16]byte) int {
-	ah := binary.BigEndian.Uint64(a[:8])
-	bh := binary.BigEndian.Uint64(b[:8])
-	if ah != bh {
-		if ah < bh {
-			return -1
-		}
-		return 1
-	}
-	al := binary.BigEndian.Uint64(a[8:])
-	bl := binary.BigEndian.Uint64(b[8:])
-	if al != bl {
-		if al < bl {
-			return -1
-		}
-		return 1
-	}
-	return 0
-}
-
-func groupStructuralRecsByTrace(flat []structuralSpanRec) [][]structuralSpanRec {
-	if len(flat) == 0 {
-		return nil
-	}
-	// NOTE-380: unstable sort by trace ID. Records only need to be CONTIGUOUS by trace, not in
-	// any particular intra-trace order: downstream parent-index resolution
-	// (resolveStructuralParentIndices) builds a per-trace spanID→index map and is order-
-	// independent, and evalStructuralMatches re-sorts+dedups the matched right indices per trace
-	// (slices.Sort(rightIndices)) before emitting, so the within-trace record order never reaches
-	// the result. SortStableFunc used the O(n log² n) symmerge path (rotateCmpFunc +
-	// symMergeCmpFunc were ~1.7% of querier CPU on the structural Q9 path, profile 2026-06-15) to
-	// preserve an order nothing observes. The unstable pdqsort is O(n log n) with no merge-buffer
-	// rotations. The 16-byte ID is compared as two big-endian uint64 halves — no slice headers, no
-	// per-byte loop — which orders identically to a lexicographic byte compare.
-	slices.SortFunc(flat, func(a, b structuralSpanRec) int {
-		return compareTraceID(a.traceID, b.traceID)
-	})
-	// Carve contiguous runs of equal trace ID into windows aliasing flat. cap is clamped to the
-	// run length so a downstream append (none occur) could not bleed into the next trace.
-	out := make([][]structuralSpanRec, 0, 16)
-	start := 0
-	for i := 1; i <= len(flat); i++ {
-		if i == len(flat) || flat[i].traceID != flat[start].traceID {
-			out = append(out, flat[start:i:i])
-			start = i
-		}
-	}
-	return out
 }
 
 // collectBlockStructuralSpanRecs parses one block and appends span records to the flat slice,
@@ -539,7 +502,7 @@ func collectBlockStructuralSpanRecs(
 
 		// NOTE-093: [8]byte direct copy — no allocation needed.
 		// NOTE-373: carry the trace ID on the record and append to the flat cross-block
-		// slice; grouping by trace ID happens once at the end (groupStructuralRecsByTrace).
+		// slice; grouping by trace ID happens once at the end (groupMatchingStructuralTraces).
 		var rec structuralSpanRec
 		rec.traceID = row.traceID
 		rec.parentIdx = -1
