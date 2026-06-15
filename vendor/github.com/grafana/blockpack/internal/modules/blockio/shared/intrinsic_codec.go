@@ -1794,11 +1794,22 @@ func appendDeltaUint64PageOpt(raw []byte, blockW, rowW, rowCount int, dst *Intri
 			return fmt.Errorf("decodeDeltaUint64Page: truncated at uvarint row %d", i)
 		}
 		b := src[0]
-		if b < 0x80 {
+		switch {
+		case b < 0x80:
 			// Single-byte delta (the overwhelmingly common case): check-free load + store.
 			acc += uint64(b)
 			src = src[1:]
-		} else {
+		case len(src) >= 2 && src[1] < 0x80:
+			// NOTE-388: inline 2-byte uvarint. After ascending sort, span:start deltas
+			// cluster in [128,16383] (sub-µs to ~16µs inter-span gaps), so the 2-byte
+			// case is the dominant non-single-byte path. binary.Uvarint allocated a fresh
+			// slice header and ran its generic continuation-bit loop (3.6% of querier CPU,
+			// profile 2026-06-15); the 2-byte decode is a single OR-shift with no call,
+			// no re-slice, and no loop. The len(src) >= 2 guard plus src[1] < 0x80 prove
+			// both bytes are present and the value terminates, so both loads are check-free.
+			acc += uint64(b&0x7f) | uint64(src[1])<<7
+			src = src[2:]
+		default:
 			delta, w := binary.Uvarint(src)
 			if w <= 0 {
 				return fmt.Errorf("decodeDeltaUint64Page: truncated at uvarint row %d", i)

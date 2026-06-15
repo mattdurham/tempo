@@ -1505,6 +1505,40 @@ Back-ref: `internal/modules/blockio/shared/intrinsic_codec.go:appendDeltaUint64P
 NOTE-169 (single-byte varint fast path), NOTE-236 (the same BCE reslice on the ref side),
 NOTE-186 (index-based ref store).
 
+## NOTE-388: inline 2-byte uvarint fast path in `appendDeltaUint64PageOpt`
+
+**Problem:** `appendDeltaUint64PageOpt` was the #1 blockpack self-time frame (10.3% of querier
+CPU, profile 2026-06-15) and `encoding/binary.Uvarint` — its only multi-byte fallback — was a
+further 3.6%. The NOTE-169 single-byte fast path covers deltas `< 128`, but after the ascending
+`sortFlatAccum` of `span:start`, inter-span gaps very commonly fall in the 2-byte uvarint range
+`[128,16383]` (≈128 ns … ≈16 µs apart). Every such row took the `binary.Uvarint(src)` fallback,
+which builds a fresh slice header and runs its generic 10-iteration continuation-bit shift loop.
+A microbenchmark on a 10k-row page confirmed the multi-byte path cost ~3–4× the single-byte path
+per row (32.7 µs all-2-byte vs 11.6 µs all-1-byte).
+
+**Fix:** Add an inline 2-byte uvarint branch between the single-byte fast path and the generic
+fallback. When the lead byte has its continuation bit set but the next byte does not
+(`len(src) >= 2 && src[1] < 0x80`), the value is exactly two bytes and decodes as a single
+OR-shift `uint64(b&0x7f) | uint64(src[1])<<7` — no `binary.Uvarint` call, no fresh slice header,
+no continuation loop. The `len(src) >= 2` guard plus `src[1] < 0x80` prove both source bytes are
+present and the value terminates, so both loads are check-free. Deltas needing ≥ 3 bytes still
+take the unchanged `binary.Uvarint` fallback.
+
+**Correctness:** Byte-for-byte identical decode. `(b & 0x7f) | (src[1] << 7)` is the standard
+2-byte LSB-first uvarint reconstruction and matches what `binary.Uvarint` returns for a 2-byte
+encoding; `acc` accumulation and `src` advance (`src[2:]`) are consistent with the other branches,
+so the post-loop `pos = len(raw) - len(src)` and the deferred ref decode read from the same offset.
+
+**Microbenchmark** (`BenchmarkAppendDeltaUint64_*`, 10k-row page): all-2-byte 32.7 µs → 15.1 µs
+(−54%), half-2-byte 45.6 µs → 30.8 µs (−32%), all-1-byte unchanged (11.6 µs), 0 allocs throughout.
+
+**Queries affected:** every query that decodes a delta-encoded uint64 intrinsic column — the
+unfiltered/wide rate path (M1/M4/M6/M8/M9) most heavily, since `span:start` is delta-sorted and
+decoded across hundreds of pages per block.
+
+Back-ref: `internal/modules/blockio/shared/intrinsic_codec.go:appendDeltaUint64PageOpt`;
+NOTE-256 (BCE the same loop), NOTE-169 (single-byte fast path).
+
 ## NOTE-258: unzeroed backing-array allocation for full-overwrite, pointer-free decode slices
 
 **Problem:** `decodePagedColumnBlob` pre-sizes the merged column's backing arrays to the exact
