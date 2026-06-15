@@ -371,12 +371,17 @@ func groupStructuralRecsByTrace(flat []structuralSpanRec) [][]structuralSpanRec 
 	if len(flat) == 0 {
 		return nil
 	}
-	// Stable sort by trace ID so records of one trace become contiguous. Stability preserves the
-	// original (block, row) order within each trace; downstream parent-index resolution keys on
-	// span ID and is order-independent, but keeping the order avoids any behavioral surprise.
-	// The 16-byte ID is compared as two big-endian uint64 halves — no slice headers, no per-byte
-	// loop — which orders identically to a lexicographic byte compare.
-	slices.SortStableFunc(flat, func(a, b structuralSpanRec) int {
+	// NOTE-380: unstable sort by trace ID. Records only need to be CONTIGUOUS by trace, not in
+	// any particular intra-trace order: downstream parent-index resolution
+	// (resolveStructuralParentIndices) builds a per-trace spanID→index map and is order-
+	// independent, and evalStructuralMatches re-sorts+dedups the matched right indices per trace
+	// (slices.Sort(rightIndices)) before emitting, so the within-trace record order never reaches
+	// the result. SortStableFunc used the O(n log² n) symmerge path (rotateCmpFunc +
+	// symMergeCmpFunc were ~1.7% of querier CPU on the structural Q9 path, profile 2026-06-15) to
+	// preserve an order nothing observes. The unstable pdqsort is O(n log n) with no merge-buffer
+	// rotations. The 16-byte ID is compared as two big-endian uint64 halves — no slice headers, no
+	// per-byte loop — which orders identically to a lexicographic byte compare.
+	slices.SortFunc(flat, func(a, b structuralSpanRec) int {
 		return compareTraceID(a.traceID, b.traceID)
 	})
 	// Carve contiguous runs of equal trace ID into windows aliasing flat. cap is clamped to the

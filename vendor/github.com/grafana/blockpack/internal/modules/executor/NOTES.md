@@ -5717,3 +5717,24 @@ input (verified against a 2000-iteration random-sorted parity harness and the ex
 `markValue`/`seenExp` path unchanged.
 
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:countIntrinsicHistogramBoundaries`
+
+## NOTE-380 — Unstable sort in groupStructuralRecsByTrace (2026-06-15)
+
+`groupStructuralRecsByTrace` sorts the flat cross-block `[]structuralSpanRec` by 16-byte trace
+ID so each trace's records form a contiguous run. It previously used `slices.SortStableFunc`,
+which takes the symmerge path (`rotateCmpFunc` + `symMergeCmpFunc` were ~1.7% combined querier
+self-CPU on the structural Q9 `{kind=server} >> {kind=client}` path, gcx profile 2026-06-15) to
+preserve the original (block, row) order within each trace.
+
+That intra-trace order is never observed: `resolveStructuralParentIndices` builds a per-trace
+`map[[8]byte]int` (spanID → local index) and resolves parent indices order-independently, and
+`evalStructuralMatches` re-sorts and dedups the matched right indices (`slices.Sort(rightIndices)`)
+before emitting matches. Only contiguity by trace ID matters, not order within a trace.
+
+Switched to `slices.SortFunc` (unstable pdqsort, O(n log n), no merge-buffer rotations). The run-
+carving loop is unchanged — it still groups equal-trace-ID runs into windows aliasing `flat`.
+Trace IDs are distinct across traces, so there are no equal full keys whose relative order a
+stable sort would protect; the only "equal" comparisons are within one trace, exactly the order
+nothing downstream depends on.
+
+Back-ref: `internal/modules/executor/stream_structural.go:groupStructuralRecsByTrace`
