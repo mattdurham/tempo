@@ -5491,3 +5491,53 @@ multi-block traces and compare blockpack vs vparquet5 span-level results) remain
 the intrinsic post-filter produces identical matches with the reduced fetch set.
 
 Back-ref: `internal/modules/executor/stream_structural.go:collectBlockStructuralSpanRecs`
+
+## NOTE-373: Hoist the structural block plan + flat-accumulate span records (2026-06-14)
+
+**Context:** Two structural-path allocation hotspots on the `collectAllStructuralSpans` loop,
+both scaling with the number of selected blocks / matched spans:
+
+1. **Per-block plan rebuild.** `collectBlockStructuralSpanRecs` recomputed, on EVERY selected
+   block: the `wantColumns` set (re-running `userAttrProgram` + `ProgramWantColumns` over all
+   programs and rebuilding the map — ~16 MB/op in `BenchmarkExecuteStructural_AND_control`),
+   the `intrinsicWant` map, and the `nodesList`. All three derive only from `programs` and
+   `r.HasIntrinsicSection()` — they are identical for every block of one query.
+
+2. **Per-row result-map append.** The row loop did `result[traceID] = append(result[traceID],
+   rec)` per span across all blocks. Every distinct trace's slice started at cap 0 and was
+   grown by repeated reallocation, plus a map probe per row. This was the single dominant
+   structural allocation — ~368 MB flat (29.8% cum) in the alloc profile.
+
+**Decision:**
+
+1. Compute the block-independent plan ONCE in `collectAllStructuralSpans` via
+   `buildStructuralBlockPlan` (returns a `structuralBlockPlan` carrying `programs`,
+   `hasIntrinsic`, `wantColumns`, `intrinsicWant`, `nodesList`) and pass `*structuralBlockPlan`
+   read-only into `collectBlockStructuralSpanRecs`. The NOTE-372 intrinsic-column-omission logic
+   moved verbatim into `buildStructuralBlockPlan`.
+
+2. Accumulate records into a single FLAT `[]structuralSpanRec` across all blocks
+   (`flat = append(flat, rec)`), carrying the trace ID on the record (`structuralSpanRec.traceID`,
+   NOTE-357 struct widened 32→44 bytes). After all blocks, `groupStructuralRecsByTrace` does one
+   counting pass to size each trace's window exactly, then one fill pass scattering records into
+   non-overlapping cap==len windows carved from a single shared backing array. This replaces
+   O(spans) per-trace slice growations + per-row map probes with one contiguous allocation and
+   exactly `len(traces)` final sub-slices. Downstream (`resolveStructuralParentIndices`,
+   `evalStructuralMatches`) is unchanged — it still receives `map[[16]byte][]structuralSpanRec`
+   with each trace's records contiguous.
+
+**Trade-off:** the record widened 12 bytes (the `[16]byte` trace ID), so total bytes/op rose
+slightly (~4.3→4.6 MB in the bench), but allocation COUNT dropped ~40% (3264→1970 allocs/op on
+AND_control, 3337→2020 on OR_LHS) — the dominant GC-pressure metric on this path. The widened
+backing array is a single contiguous allocation, not N growing per-trace slices.
+
+**Also fixed:** the `lookupIntrinsicFieldsTypedForBlock` error path now releases the block column
+provider before returning (it previously leaked the pooled provider on that error branch).
+
+**Verified:** `go test -race ./internal/modules/executor/...` green incl.
+`TestStructuralParquetComparison`, `TestFormatComparisonCorrectness`, and the
+`TestResolveStructuralParentIndices_*` (multi-trace no-leak) suite — grouping preserves
+per-trace contiguity and parent resolution is identical.
+
+Back-ref: `internal/modules/executor/stream_structural.go:buildStructuralBlockPlan`,
+`groupStructuralRecsByTrace`, `collectBlockStructuralSpanRecs`

@@ -209,7 +209,23 @@ func collectAllStructuralSpans(
 		return nil, nil, fmt.Errorf("structural FetchBlocks: %w", err)
 	}
 
-	result := make(map[[16]byte][]structuralSpanRec, len(plan.SelectedBlocks))
+	// NOTE-373: the per-block fetch/eval plan (wantColumns, the user-attr program set, and
+	// the intrinsic post-filter node lists) is identical for every selected block — it derives
+	// only from `programs` and `hasIntrinsic`, not from block contents. Compute it ONCE here
+	// instead of rebuilding the wantColumns map, re-deriving userAttrProgram, and rebuilding
+	// the nodesList on every block (collectBlockStructuralSpanRecs was a top alloc frame: the
+	// per-block wantColumns map rebuild alone was ~16MB/op in the structural bench). The shared
+	// plan is read-only across blocks.
+	bp := buildStructuralBlockPlan(r, programs)
+
+	// NOTE-373: accumulate span records into a single FLAT slice across all blocks instead of
+	// appending into result[traceID] per row. The previous map-append (result[traceID] =
+	// append(...)) was the dominant structural-path allocation (~368MB flat in the bench): every
+	// distinct trace's slice started at cap 0 and was grown by repeated reallocation, and the
+	// map probe ran once per span row. Collecting flat then grouping ONCE (group-by sort on the
+	// 16-byte trace ID) replaces O(spans) slice growations with a single contiguous backing
+	// array and exactly len(traces) final sub-slices, each sized exactly.
+	var flat []structuralSpanRec
 	// parsedBlocks caches the parsed *Block per blockIdx so evalStructuralMatches can
 	// populate SpanMatch.Block. Peak memory is bounded by len(plan.SelectedBlocks) parsed
 	// blocks, which is the same set already held in rawBlocks — no additional I/O.
@@ -219,45 +235,40 @@ func collectAllStructuralSpans(
 		if !ok {
 			continue
 		}
-		if err := collectBlockStructuralSpanRecs(r, blockIdx, raw, programs, result, parsedBlocks); err != nil {
+		var err error
+		flat, err = collectBlockStructuralSpanRecs(r, blockIdx, raw, &bp, flat, parsedBlocks)
+		if err != nil {
 			return nil, parsedBlocks, err
 		}
 	}
+
+	result := groupStructuralRecsByTrace(flat)
 	return result, parsedBlocks, nil
 }
 
-// collectBlockStructuralSpanRecs parses one block and appends span records to result.
-// The parsed block is stored in parsedBlocks keyed by blockIdx for later use.
-func collectBlockStructuralSpanRecs(
-	r *modules_reader.Reader,
-	blockIdx int,
-	raw []byte,
-	programs []*vm.Program,
-	result map[[16]byte][]structuralSpanRec,
-	parsedBlocks map[int]*modules_reader.Block,
-) error {
-	meta := r.BlockMeta(blockIdx)
+// structuralBlockPlan holds the per-query, block-independent inputs to
+// collectBlockStructuralSpanRecs. It is built once per structural query and shared
+// (read-only) across every selected block. See NOTE-373.
+type structuralBlockPlan struct {
+	programs    []*vm.Program
+	wantColumns map[string]struct{}
+	// intrinsicWant is the identity-column set requested from the intrinsic section
+	// (also augmented with the intrinsic predicate columns when hasIntrinsic).
+	intrinsicWant map[string]struct{}
+	// nodesList[i] holds the intrinsic predicate RangeNodes for program i, used by the
+	// post-filter (computeNodeMatchForRow). Nil for legacy (no-intrinsic) files.
+	nodesList    [][]vm.RangeNode
+	hasIntrinsic bool
+}
 
+// buildStructuralBlockPlan computes the block-independent fetch/eval plan once per query.
+func buildStructuralBlockPlan(r *modules_reader.Reader, programs []*vm.Program) structuralBlockPlan {
 	hasIntrinsic := r.HasIntrinsicSection()
 
-	// Union predicate columns from all programs.
-	// For files with an intrinsic section, identity columns (trace:id, span:id,
-	// span:parent_id) are served from the intrinsic section — omit from wantColumns.
-	// For legacy files (no intrinsic section), identity columns live in block payloads
-	// and must be decoded — include them in wantColumns.
-	//
-	// NOTE-372: for intrinsic-section files, also omit ALL intrinsic predicate columns
-	// (span:kind, span:duration, span:status, resource.service.name, span:name, …) from
-	// wantColumns. These are evaluated against the intrinsic section via the per-program
-	// nodesList post-filter (computeNodeMatchForRow → rowSatisfiesIntrinsicNodesTyped reading
-	// idFields), and predicate evaluation already runs against userAttrProgram(prog) which
-	// strips intrinsic leaves. Including them here forced the parser to fetch and decode the
-	// redundant block-payload copy of each intrinsic column — pure wasted column I/O and decode
-	// CPU on every selected block of a structural query (e.g. span:kind in `{kind=server} >>
-	// {kind=client && rpc.method != ""}`). userAttrProgram(prog) returns a program whose
-	// WantColumns spans only the genuine user-attribute leaves, so ProgramWantColumns on it
-	// yields the minimal fetch set. Legacy (no-intrinsic) files keep the full set: there is no
-	// intrinsic section to serve those columns, so they must be decoded from block payloads.
+	// Union predicate columns from all programs. For intrinsic-section files, identity and
+	// intrinsic predicate columns are served from the intrinsic section (NOTE-372), so build
+	// wantColumns from userAttrProgram(prog) to omit them from the block fetch. Legacy files
+	// have no intrinsic section, so they keep the full set including identity columns.
 	var wantColumns map[string]struct{}
 	for _, prog := range programs {
 		wantProg := prog
@@ -284,29 +295,6 @@ func collectBlockStructuralSpanRecs(
 		wantColumns["span:parent_id"] = struct{}{}
 	}
 
-	// NOTE-020: Reset intern strings before each block parse to bound per-reader memory growth.
-	r.ResetInternStrings()
-	bwb, err := r.ParseBlockFromBytes(raw, modules_reader.WantOnly(wantColumns), meta)
-	if err != nil {
-		return fmt.Errorf("structural ParseBlockFromBytes block %d: %w", blockIdx, err)
-	}
-
-	parsedBlocks[blockIdx] = bwb.Block
-	provider := acquireBlockColumnProvider(bwb.Block)
-	spanCount := bwb.Block.SpanCount()
-
-	// Evaluate each program against block columns.
-	// For files with an intrinsic section, strip intrinsic-column predicates first.
-	sets, err := evaluateStructuralPrograms(programs, hasIntrinsic, provider, spanCount, blockIdx)
-	if err != nil {
-		releaseBlockColumnProvider(provider)
-		return err
-	}
-
-	n := spanCount
-
-	// Collect intrinsic predicate nodes for post-filtering (intrinsic-section files only).
-	// For legacy files, ColumnPredicate already evaluated intrinsic columns from block payloads.
 	intrinsicWant := map[string]struct{}{
 		"trace:id":       {},
 		"span:id":        {},
@@ -316,6 +304,95 @@ func collectBlockStructuralSpanRecs(
 	if hasIntrinsic {
 		nodesList = collectStructuralIntrinsicNodes(programs, intrinsicWant)
 	}
+
+	return structuralBlockPlan{
+		programs:      programs,
+		hasIntrinsic:  hasIntrinsic,
+		wantColumns:   wantColumns,
+		intrinsicWant: intrinsicWant,
+		nodesList:     nodesList,
+	}
+}
+
+// groupStructuralRecsByTrace converts the flat per-block record slice into the
+// trace-ID-keyed map consumed by resolveStructuralParentIndices and evalStructuralMatches.
+// Records of one trace are NOT contiguous in flat (they may come from different blocks),
+// so a single counting pass sizes each trace's slice exactly, then a fill pass scatters
+// records into pre-sized, exactly-fitted sub-slices carved from one shared backing array.
+// This replaces the per-row result[traceID] append churn (NOTE-373).
+func groupStructuralRecsByTrace(flat []structuralSpanRec) map[[16]byte][]structuralSpanRec {
+	if len(flat) == 0 {
+		return map[[16]byte][]structuralSpanRec{}
+	}
+	counts := make(map[[16]byte]int)
+	for i := range flat {
+		counts[flat[i].traceID]++
+	}
+	out := make(map[[16]byte][]structuralSpanRec, len(counts))
+	// One shared backing array sized to the total record count; each trace gets a
+	// non-overlapping, exactly-sized window with cap == len so a later append (none occur
+	// downstream) could not bleed into the next trace's window.
+	backing := make([]structuralSpanRec, len(flat))
+	off := 0
+	for tid, c := range counts {
+		out[tid] = backing[off : off : off+c]
+		off += c
+	}
+	for i := range flat {
+		tid := flat[i].traceID
+		out[tid] = append(out[tid], flat[i])
+	}
+	return out
+}
+
+// collectBlockStructuralSpanRecs parses one block and appends span records to the flat slice,
+// returning the (possibly reallocated) slice. The parsed block is stored in parsedBlocks keyed
+// by blockIdx for later use. The block-independent plan (bp) is built once per query
+// (buildStructuralBlockPlan) and shared read-only across all blocks — see NOTE-373.
+//
+// NOTE-372: for intrinsic-section files, ALL intrinsic predicate columns (span:kind,
+// span:duration, span:status, resource.service.name, span:name, …) and identity columns
+// (trace:id, span:id, span:parent_id) are omitted from bp.wantColumns. These are served from
+// the intrinsic section via the per-program nodesList post-filter (computeNodeMatchForRow →
+// rowSatisfiesIntrinsicNodesTyped reading idFields) and predicate evaluation runs against the
+// pre-derived user-attr program set, so the parser never fetches/decodes the redundant
+// block-payload copy of each intrinsic column. Legacy (no-intrinsic) files keep the full set
+// including identity columns, which must be decoded from block payloads.
+func collectBlockStructuralSpanRecs(
+	r *modules_reader.Reader,
+	blockIdx int,
+	raw []byte,
+	bp *structuralBlockPlan,
+	flat []structuralSpanRec,
+	parsedBlocks map[int]*modules_reader.Block,
+) ([]structuralSpanRec, error) {
+	meta := r.BlockMeta(blockIdx)
+
+	hasIntrinsic := bp.hasIntrinsic
+
+	// NOTE-020: Reset intern strings before each block parse to bound per-reader memory growth.
+	r.ResetInternStrings()
+	bwb, err := r.ParseBlockFromBytes(raw, modules_reader.WantOnly(bp.wantColumns), meta)
+	if err != nil {
+		return flat, fmt.Errorf("structural ParseBlockFromBytes block %d: %w", blockIdx, err)
+	}
+
+	parsedBlocks[blockIdx] = bwb.Block
+	provider := acquireBlockColumnProvider(bwb.Block)
+	spanCount := bwb.Block.SpanCount()
+
+	// Evaluate each program against block columns.
+	// For files with an intrinsic section, strip intrinsic-column predicates first.
+	sets, err := evaluateStructuralPrograms(bp.programs, hasIntrinsic, provider, spanCount, blockIdx)
+	if err != nil {
+		releaseBlockColumnProvider(provider)
+		return flat, err
+	}
+
+	n := spanCount
+
+	nodesList := bp.nodesList
+	intrinsicWant := bp.intrinsicWant
 
 	// Resolve identity fields. For files with an intrinsic section, use
 	// lookupIntrinsicFieldsTypedForBlock (NOTE-100): one binary search per column instead
@@ -332,7 +409,12 @@ func collectBlockStructuralSpanRecs(
 			intrinsicWant,
 		)
 		if intrinsicErr != nil {
-			return fmt.Errorf("structural lookupIntrinsicFieldsTypedForBlock block %d: %w", blockIdx, intrinsicErr)
+			releaseBlockColumnProvider(provider)
+			return flat, fmt.Errorf(
+				"structural lookupIntrinsicFieldsTypedForBlock block %d: %w",
+				blockIdx,
+				intrinsicErr,
+			)
 		}
 	} else {
 		idFields = identityFieldsFromBlockColsTyped(bwb.Block, n)
@@ -347,10 +429,12 @@ func collectBlockStructuralSpanRecs(
 		if row.present&intrinsicPresentTraceID == 0 {
 			continue
 		}
-		traceID := row.traceID
 
 		// NOTE-093: [8]byte direct copy — no allocation needed.
+		// NOTE-373: carry the trace ID on the record and append to the flat cross-block
+		// slice; grouping by trace ID happens once at the end (groupStructuralRecsByTrace).
 		var rec structuralSpanRec
+		rec.traceID = row.traceID
 		rec.parentIdx = -1
 		rec.blockIdx = uint16(blockIdx) //nolint:gosec // blockIdx bounded by file block count (<65535)
 		rec.rowIdx = uint16(rowIdx)     //nolint:gosec // rowIdx bounded by SpanCount (≤65535)
@@ -363,13 +447,13 @@ func collectBlockStructuralSpanRecs(
 			rec.present |= structuralParentIDPresent
 		}
 		rec.nodeMatch = computeNodeMatchForRow(sets, nodesList, hasIntrinsic, row, rowIdx)
-		result[traceID] = append(result[traceID], rec)
+		flat = append(flat, rec)
 	}
 	// Release after the row loop: sets may contain scratch-backed rowSets (single-predicate programs).
 	// Releasing earlier would allow pool reuse to overwrite p.scratch before computeNodeMatchForRow
 	// reads it via s.Contains().
 	releaseBlockColumnProvider(provider)
-	return nil
+	return flat, nil
 }
 
 // evalStructuralProgram evaluates a compiled program against a column provider,

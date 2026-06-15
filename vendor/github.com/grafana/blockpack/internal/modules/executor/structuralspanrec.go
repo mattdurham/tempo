@@ -11,9 +11,17 @@ package executor
 //   - parentIdx: an index into the per-trace spans slice (count of spans for one trace),
 //     with -1 as the "no parent" sentinel; int32 is ample and preserves the signed sentinel.
 //
-// Field order places the two 8-byte arrays first, then the 4-byte int32, then the 2-byte
-// uint16s and the two uint8 flags, so the struct packs to 32 bytes with no interior padding.
+// NOTE-373: traceID ([16]byte) is carried on the record itself so records can be accumulated
+// into a single FLAT slice across all blocks and grouped by trace ID in one final pass, instead
+// of appending into a per-trace result[traceID] slice per row (the prior dominant alloc). It is
+// only read by groupStructuralRecsByTrace; once grouped it is redundant with the map key but
+// retaining it costs nothing on the hot path and keeps the grouping pass branchless.
+//
+// Field order places the 16-byte array first, then the two 8-byte arrays, then the 4-byte
+// int32, then the 2-byte uint16s and the two uint8 flags, so the struct packs with no interior
+// padding (16 + 8 + 8 + 4 + 2 + 2 + 1 + 1 = 42 → 44 bytes after trailing alignment).
 type structuralSpanRec struct {
+	traceID   [16]byte
 	spanID    [8]byte
 	parentID  [8]byte
 	parentIdx int32
