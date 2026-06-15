@@ -92,7 +92,7 @@ func ExecuteStructural(
 		return nil, err
 	}
 
-	resolveStructuralParentIndices(traceSpans)
+	resolveStructuralParentIndices(traceSpans, ops)
 
 	result := &StructuralResult{}
 	if err := evalStructuralMatches(traceSpans, parsedBlocks, ops, opts, result); err != nil {
@@ -608,9 +608,25 @@ func (a *allMatchSet) ToSlice() []int {
 // retains the backing array) gives identical semantics with a single amortized allocation
 // that grows to the largest trace's span count. The clear runs at the TOP of each trace so
 // the very first iteration starts empty regardless of pool reuse.
-func resolveStructuralParentIndices(traceSpans [][]structuralSpanRec) {
+//
+// NOTE-382: skip parent resolution for traces that cannot produce a structural match. The
+// per-trace work below — clear(byID), build the spanID→index map (one pass), then resolve every
+// span's parentID (second pass with a map probe) — is pure waste for a trace whose spans match
+// no relevant node, because evalStructuralMatches gates the same trace on traceCanMatch and
+// emits nothing. traceCanMatch is a cheap OR over the per-span nodeMatch bits (no map, no
+// allocation); running it FIRST lets the common structural workload, where most traces contain
+// no matching span at all (the measured Q9 returns 0 traces over a large span population), skip
+// the map clear/build/probe for every such trace. The semantics of the resolved parentIdx for a
+// skipped trace are irrelevant: evalStructuralMatches will continue past it on the identical
+// traceCanMatch check before ever reading parentIdx. ops is threaded in so the same predicate is
+// shared with the eval phase; a nil ops disables the skip and resolves every trace
+// unconditionally (used by resolution-only unit tests that do not populate nodeMatch).
+func resolveStructuralParentIndices(traceSpans [][]structuralSpanRec, ops []traceqlparser.StructuralOp) {
 	byID := make(map[[8]byte]int)
 	for _, spans := range traceSpans {
+		if ops != nil && !traceCanMatch(spans, ops) {
+			continue
+		}
 		// NOTE-079, NOTE-093: [8]byte map key — zero string allocations on insert or lookup.
 		// Use present bits (not zero-value sentinel) to distinguish absent from all-zero IDs.
 		// NOTE-271: clear (not re-make) so the prior trace's entries do not leak in.

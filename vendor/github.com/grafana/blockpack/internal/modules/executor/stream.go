@@ -892,7 +892,23 @@ func collectMatchAllTopK(
 	// destroying the newest-first ordering from ScanFlatColumnTopKRefs.
 	// Mirrors collectIntrinsicTopK lines 1149-1172.
 	if opts.TimestampColumn != "" && len(results) > 1 {
-		sortMatchedRowsByTimestamp(results, opts.TimestampColumn, backward)
+		slices.SortStableFunc(results, func(a, b MatchedRow) int {
+			var tsA, tsB uint64
+			if a.Block != nil {
+				if col := a.Block.GetColumn(opts.TimestampColumn); col != nil {
+					tsA, _ = col.Uint64Value(a.RowIdx)
+				}
+			}
+			if b.Block != nil {
+				if col := b.Block.GetColumn(opts.TimestampColumn); col != nil {
+					tsB, _ = col.Uint64Value(b.RowIdx)
+				}
+			}
+			if backward {
+				return cmp.Compare(tsB, tsA)
+			}
+			return cmp.Compare(tsA, tsB)
+		})
 	}
 
 	qs.Steps = append(qs.Steps, StepStats{
@@ -901,52 +917,6 @@ func collectMatchAllTopK(
 		Metadata: map[string]any{"selected_blocks": selectedBlocks},
 	})
 	return results, qs, nil
-}
-
-// NOTE-381: sortMatchedRowsByTimestamp orders results by their timestamp column,
-// replacing two identical slices.SortStableFunc call sites that re-decoded each row's
-// timestamp inside the comparator. The previous comparator called GetColumn +
-// Uint64Value TWICE per comparison — O(n log n) lazy-column probes (needsDecode check,
-// expandDenseIdx, IsPresent, dictIdxAt, dict index) for a value that is fixed per row.
-// On the search Q1/Q5 path this comparator dominated the residual sort cost and routed
-// through the stable symmerge path (rotateCmpFunc + symMergeCmpFunc + swapRangeCmpFunc
-// ~2.8% combined querier self-CPU, gcx 2026-06-15).
-//
-// This is a decorate-sort-undecorate: each row's timestamp is read exactly ONCE into a
-// parallel key slice (O(n) column probes), the index permutation is sorted by the
-// precomputed keys, and the rows are reordered in place from the permutation. Column
-// decodes drop from O(n log n) to O(n). The sort is unstable (pdqsort): the prior order
-// is forEachBlockInGroups' (BlockIdx, RowIdx) layout, which is not a meaningful tie-break
-// for a timestamp ordering — equal-timestamp rows have no semantic order to preserve, so
-// stability buys nothing here and the symmerge merge-buffer work is pure overhead.
-func sortMatchedRowsByTimestamp(results []MatchedRow, tsColumn string, backward bool) {
-	keys := make([]uint64, len(results))
-	for i := range results {
-		if results[i].Block != nil {
-			if col := results[i].Block.GetColumn(tsColumn); col != nil {
-				keys[i], _ = col.Uint64Value(results[i].RowIdx)
-			}
-		}
-	}
-	// Sort an index permutation by the precomputed keys rather than the rows themselves,
-	// so the comparator is a single integer compare with no column probe. The keys slice
-	// is captured by closure; SortFunc on []int is the unstable pdqsort path.
-	perm := make([]int, len(results))
-	for i := range perm {
-		perm[i] = i
-	}
-	if backward {
-		slices.SortFunc(perm, func(a, b int) int { return cmp.Compare(keys[b], keys[a]) })
-	} else {
-		slices.SortFunc(perm, func(a, b int) int { return cmp.Compare(keys[a], keys[b]) })
-	}
-	// Gather the rows into their sorted order: out[i] = results[perm[i]]. One O(n) pass
-	// over a single scratch buffer, then copy back.
-	sorted := make([]MatchedRow, len(results))
-	for i, p := range perm {
-		sorted[i] = results[p]
-	}
-	copy(results, sorted)
 }
 
 // NOTE-038: The partial-AND pre-filter for mixed queries is a superset; ColumnPredicate
@@ -1301,7 +1271,23 @@ func collectIntrinsicTopK(
 	// after forEachBlockInGroups populates MatchedRow.Block above.
 	if opts.TimestampColumn != "" && len(results) > 1 {
 		backward := opts.Direction == queryplanner.Backward
-		sortMatchedRowsByTimestamp(results, opts.TimestampColumn, backward)
+		slices.SortStableFunc(results, func(a, b MatchedRow) int {
+			var tsA, tsB uint64
+			if a.Block != nil {
+				if col := a.Block.GetColumn(opts.TimestampColumn); col != nil {
+					tsA, _ = col.Uint64Value(a.RowIdx)
+				}
+			}
+			if b.Block != nil {
+				if col := b.Block.GetColumn(opts.TimestampColumn); col != nil {
+					tsB, _ = col.Uint64Value(b.RowIdx)
+				}
+			}
+			if backward {
+				return cmp.Compare(tsB, tsA) // descending: newer first
+			}
+			return cmp.Compare(tsA, tsB) // ascending: older first
+		})
 	}
 	return results, nil
 }

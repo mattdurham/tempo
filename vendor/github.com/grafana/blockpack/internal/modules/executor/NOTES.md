@@ -5762,3 +5762,36 @@ a meaningful tie-break for a timestamp ordering — equal-timestamp rows have no
 preserve. The two call sites now share one helper instead of duplicating the comparator.
 
 Back-ref: `internal/modules/executor/stream.go:sortMatchedRowsByTimestamp`
+
+### NOTE-382: skip parent-index resolution for traces that cannot match
+
+`ExecuteStructural` ran three phases over the collected per-trace span windows:
+`resolveStructuralParentIndices` (build a per-trace spanID→rowIndex map, then resolve every
+span's `parentIdx`), then `evalStructuralMatches` (gated per trace by `traceCanMatch`, a cheap
+OR over the per-span `nodeMatch` bits that returns false when the trace cannot possibly satisfy
+the chain). The resolution phase ran **unconditionally** over every trace window — including the
+many traces whose spans match no relevant node — even though `evalStructuralMatches` then
+immediately discards those same traces on the identical `traceCanMatch` check before reading
+`parentIdx`.
+
+On the structural workload this is pure waste: the measured Q9
+(`{span.kind=server} >> {span.kind=client && span.rpc.method != ""}`) returns **0 traces** over a
+large span population, so every trace window paid a `clear(byID)` + a populate pass + a
+resolve pass (with a map probe per span) whose result was never observed.
+
+**Mechanism:** thread `ops` into `resolveStructuralParentIndices` and run the same
+`traceCanMatch` predicate FIRST, skipping the map work for any trace that cannot match. The skip
+is sound because the resolved `parentIdx` of a skipped trace is never read — `evalStructuralMatches`
+applies the identical `traceCanMatch` gate and `continue`s before touching `parentIdx`. The check
+is a branch-free bitmask OR over `nodeMatch`; it adds nothing to traces that DO match (they were
+already going to be scanned by the same predicate in the eval phase). A `nil` ops disables the
+skip and resolves every trace unconditionally — used by the resolution-only unit tests that
+exercise parent linking directly without populating `nodeMatch`.
+
+**Correctness:** byte-identical results. Matching traces resolve exactly as before; non-matching
+traces produce no output in either the old or new code (the eval-phase gate is unchanged). No
+benchmark-specific constants — `traceCanMatch` derives its required-node bitmask purely from the
+operator chain length and negation shape.
+
+Back-ref: `internal/modules/executor/stream_structural.go:resolveStructuralParentIndices`,
+`ExecuteStructural`, `traceCanMatch`.
