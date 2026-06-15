@@ -245,9 +245,26 @@ func collectBlockStructuralSpanRecs(
 	// span:parent_id) are served from the intrinsic section — omit from wantColumns.
 	// For legacy files (no intrinsic section), identity columns live in block payloads
 	// and must be decoded — include them in wantColumns.
+	//
+	// NOTE-372: for intrinsic-section files, also omit ALL intrinsic predicate columns
+	// (span:kind, span:duration, span:status, resource.service.name, span:name, …) from
+	// wantColumns. These are evaluated against the intrinsic section via the per-program
+	// nodesList post-filter (computeNodeMatchForRow → rowSatisfiesIntrinsicNodesTyped reading
+	// idFields), and predicate evaluation already runs against userAttrProgram(prog) which
+	// strips intrinsic leaves. Including them here forced the parser to fetch and decode the
+	// redundant block-payload copy of each intrinsic column — pure wasted column I/O and decode
+	// CPU on every selected block of a structural query (e.g. span:kind in `{kind=server} >>
+	// {kind=client && rpc.method != ""}`). userAttrProgram(prog) returns a program whose
+	// WantColumns spans only the genuine user-attribute leaves, so ProgramWantColumns on it
+	// yields the minimal fetch set. Legacy (no-intrinsic) files keep the full set: there is no
+	// intrinsic section to serve those columns, so they must be decoded from block payloads.
 	var wantColumns map[string]struct{}
 	for _, prog := range programs {
-		cols := ProgramWantColumns(prog)
+		wantProg := prog
+		if hasIntrinsic {
+			wantProg = userAttrProgram(prog)
+		}
+		cols := ProgramWantColumns(wantProg)
 		if cols == nil {
 			continue
 		}

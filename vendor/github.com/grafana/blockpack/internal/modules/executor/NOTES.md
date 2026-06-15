@@ -5455,3 +5455,39 @@ slice with an `int32` is legal Go, but the `map[int]` keys and `[]int` appends n
 Verified: `BenchmarkStructuralSpanRecSliceFootprint` (100k records) 4.80 MB → 2.80 MB/op
 (-41.7%, controlled bytes/op signal); `go test -race ./...` green (excl. pre-existing
 env-only cmd/embed-server stress tests that need a live server); `make precommit` fully green.
+
+---
+
+## NOTE-372: Structural Queries Omit Intrinsic Predicate Columns from the Block Fetch (2026-06-14)
+
+**Context:** `collectBlockStructuralSpanRecs` built the `wantColumns` fetch set from
+`ProgramWantColumns(prog)` over the FULL compiled program of each structural node. For
+intrinsic-section files that set still contained intrinsic columns (`span:kind`,
+`span:duration`, `span:status`, `resource.service.name`, `span:name`, …) even though those
+columns are served from the warm intrinsic section, NOT block payloads. The parser therefore
+fetched and decoded a redundant block-payload copy of every intrinsic predicate column on every
+selected block of a structural query — e.g. `span:kind` for `{kind=server} >> {kind=client &&
+rpc.method != ""}` — pure wasted column I/O (cold S3 in production, where the page cache is
+exhausted) and decode CPU.
+
+**Decision:** For intrinsic-section files, build `wantColumns` from `userAttrProgram(prog)`
+rather than the full program. `userAttrProgram` strips intrinsic predicate leaves (it is already
+the program used for `ColumnPredicate` evaluation in `evaluateStructuralPrograms`), so
+`ProgramWantColumns` on it yields only the genuine user-attribute leaves. Intrinsic predicates
+are still enforced — via the per-program `nodesList` post-filter
+(`computeNodeMatchForRow → rowSatisfiesIntrinsicNodesTyped`) reading the intrinsic-section
+`idFields`. Legacy (no-intrinsic) files keep the full set: with no intrinsic section those
+columns must be decoded from block payloads.
+
+**Edge case — all-intrinsic node:** `userAttrProgram(prog)` returns nil when every predicate
+leaf is intrinsic (e.g. node 0 `{span.kind=server}`). `ProgramWantColumns(nil)` returns nil and
+that node contributes no columns, which is correct — `WantOnly(nil)` decodes no eager columns and
+the node's predicate is satisfied entirely from the intrinsic section. If ALL nodes are
+intrinsic-only, `wantColumns` stays nil and the parse decodes only the identity/intrinsic data.
+
+**Verified:** `go test -race ./internal/modules/executor/...` green; the parquet parity tests
+`TestStructuralParquetComparison` and `TestFormatComparisonCorrectness` (which exercise
+multi-block traces and compare blockpack vs vparquet5 span-level results) remain green — proving
+the intrinsic post-filter produces identical matches with the reduced fetch set.
+
+Back-ref: `internal/modules/executor/stream_structural.go:collectBlockStructuralSpanRecs`
