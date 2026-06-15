@@ -919,14 +919,39 @@ func evalOpSiblingStruct(spans []structuralSpanRec, dst []int) []int {
 }
 
 // evalOpAncestorStruct: R is an ancestor of L (<<) — walk L's parent chain.
+//
+// NOTE-393: memoize the ancestor-chain collection with a per-trace "collected" bitmap, mirroring
+// the existence-walk memo of NOTE-392 but adapted to the collect-ALL semantics of <<. Each L-match
+// walks its parent chain appending every node-1 ancestor it encounters; when several L-matches
+// share an ancestor-chain prefix (a deep trace, or many leaf L-matches under one common ancestor),
+// the same prefix — and every node-1 emit on it — was re-walked per L-match: O(L × depth).
+//
+// A node X's strict-ancestor chain is identical for every span that walks through X. So once any
+// L-walk has reached X and continued upward to the root, every node-1 ancestor strictly above X is
+// already in result. A later walk arriving at X can therefore stop: it has already contributed
+// every node-1 ancestor at-or-above X's parent on a prior pass. The downstream emit (NOTE-079)
+// sorts + dedups rightIndices, so the duplicate appends a shared subtree would otherwise produce
+// are collapsed — meaning stopping early at a "collected" node yields byte-identical output while
+// traversing each parent edge at most once globally → O(spans) amortized.
+//
+// collected[X] is set the moment a walk *enters* X (before testing/emitting X's own node-1 bit and
+// before ascending past it), so the very next walk that reaches X halts immediately. The first walk
+// that reaches X still emits X (if node-1) and ascends, seeding collected for the whole prefix above.
 func evalOpAncestorStruct(spans []structuralSpanRec, dst []int) []int {
 	result := dst
+	collected := make([]bool, len(spans))
 	for _, l := range spans {
 		if l.nodeMatch&0x01 == 0 {
 			continue
 		}
 		cur := l.parentIdx
 		for cur >= 0 {
+			if collected[cur] {
+				// Every node-1 ancestor at-or-above cur was emitted by a prior walk; the
+				// downstream sort+dedup collapses the overlap. Stop re-walking the prefix.
+				break
+			}
+			collected[cur] = true
 			if spans[cur].nodeMatch&0x02 != 0 {
 				result = append(result, int(cur))
 			}

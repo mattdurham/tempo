@@ -5968,3 +5968,36 @@ operators (`>>`, `!>>`) benefit — `<<` (`evalOpAncestorStruct`) must collect A
 (not just existence) so it cannot break early and is left unchanged.
 
 Back-ref: `internal/modules/executor/stream_structural.go:hasNode0AncestorMemo`.
+
+## NOTE-393: Memoize the ancestor-chain collection in << (2026-06-15)
+
+**Context:** `evalOpAncestorStruct` (`<<`) is the mirror of `>>`: for each node-0 (LHS) match it
+walks the `parentIdx` chain to the root, appending every node-1 (RHS) ancestor it crosses. Unlike
+`>>` (existence), `<<` must collect ALL matching ancestors, so NOTE-392's early-break existence
+memo did not apply and it was left unchanged. But the collect-all walk is still quadratic when
+L-matches share an ancestor-chain prefix: a deep trace, or many leaf L-matches under one common
+ancestor, re-walks the same prefix — and re-appends every node-1 node on it — once per L-match,
+O(L × depth). A 2000-span chain where every span is both an L-match and an RHS candidate cost
+~19.5ms and **~82 MB** of result-slice growth (the duplicate appends pile up before dedup).
+
+**Decision:** A node X's strict-ancestor chain is identical for every span that walks through X.
+Once any L-walk has entered X and ascended to the root, every node-1 ancestor strictly above X is
+already in `result`. So maintain a per-trace `collected []bool`: a walk sets `collected[cur]=true`
+the moment it *enters* `cur` (before emitting `cur`'s own node-1 bit and before ascending), then a
+later walk that reaches an already-`collected` node breaks immediately. The downstream emit
+(NOTE-079) sorts + dedups `rightIndices`, so the overlap a shared subtree would otherwise duplicate
+is collapsed — output is byte-identical while each parent edge is traversed at most once globally →
+O(spans) amortized. The first walk to reach X still emits X (if node-1) and seeds `collected` for
+the whole prefix above; subsequent walks halt at X having already had those ancestors emitted.
+
+**Result:** `BenchmarkEvalOpAncestor_Deep` (2000-span chain, every span L+RHS): ~19.5ms → ~17µs
+(~1140x); allocs/result memory 82 MB → 62 KB (the result slice stops growing quadratically). All
+executor `-race` tests pass, including `TestStructuralParquetComparison` /
+`TestFormatComparisonCorrectness` (multi-block parity vs the parquet engine across structural ops).
+
+**Generality:** Pure algorithmic complexity reduction (quadratic → linear) on the ancestor-chain
+collection; no benchmark-specific constants. Completes the structural-op memoization pair started in
+NOTE-392 (`>>`/`!>>` existence), now extended to `<<` collect-all. `<` (`evalOpParentStruct`) is a
+single-hop test and needs no memo.
+
+Back-ref: `internal/modules/executor/stream_structural.go:evalOpAncestorStruct`.
