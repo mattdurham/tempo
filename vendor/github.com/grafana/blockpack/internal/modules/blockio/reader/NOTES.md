@@ -2875,3 +2875,53 @@ In production the absolute saving scales with concurrency (one bloated handle pe
 worker), directly reducing the reclaimable share of the `internString` inuse_space frame.
 Back-ref: `column.go` (`ReleaseInternMap`, `internMapMaxPooledEntries`).
 Test/bench: `internmap_note368_test.go`.
+
+## NOTE-369 — Pack dense dictionary indexes at native width (drop 4x/2x []uint32 blowup)
+
+**Problem.** A dense dictionary column (`KindDictionary`) was decoded by `readIndexArray` into a
+`[]uint32` per-row index slice (`StringIdx`/`Int64Idx`/`Uint64Idx`/`Float64Idx`/`BoolIdx`/
+`BytesIdx`). The on-disk index width is chosen by the writer's `pickIndexWidth` from dict
+cardinality: 1 byte for ≤256 entries, 2 bytes for ≤65536, 4 bytes otherwise. Expanding a width-1
+index to `uint32` is a 4x blowup; width-2 is a 2x blowup. These `*Idx` slices are the canonical
+retained representation: the `parsedV8ColumnCache` snapshot (NOTE-200) shares the *same* slice the
+per-query Column reads (`copyDecodedColumnInto` shares, never copies), so the bloat is held for the
+cache's whole lifetime, not just per query. The querier `inuse_space` profile showed
+`readIndexArray` retaining ~807 MB. An on-block probe (`BP_PROBE_IDX` instrumentation, since
+removed) of the realworld block found **every** dict index at width 2 (43.96M elements → 175.8 MB
+of `uint32` vs 87.9 MB ideal — a flat 2x blowup).
+
+**Fix.** For the dense dict path with `indexWidth` 1 or 2, store the index bytes at native width in
+a new `Column.packedIdx []byte` + `packedIdxWidth uint8` (`readPackedIndexArray` copies the
+native-width bytes out of the reused `decompBuf`) and leave the type-specific `*Idx` slice nil.
+Readers resolve the dict index via `dictIdxAt`, which now consults `packedIdx` first
+(`packedIdxAt`: `packedIdx[row]` for width 1, LE-`uint16` at `packedIdx[2*row:]` for width 2).
+Width-4 keeps the `[]uint32` path — no blowup to remove. The packed fields are threaded through
+every snapshot/per-query propagation site: `snapshotDecodedColumn`, `copyDecodedColumnInto`, the
+inline miss-path assignment in `parseBlockColumnsReuse`, both `decodeNow` assignment blocks
+(cache-hit restore + fresh-decode), `resetColumn` (cleared on reuse), and `SizeBytes` (counts
+`len(packedIdx)` so the LRU budget stays honest — NOTE-362/363/364 class).
+
+**Hot-loop safety (no wall-clock regression).** The executor bulk scan loops (`scanDictMaskRows`,
+`scanNumericDictMask`, `scanStringDictFloat`) previously iterated `idx []uint32` directly. They now
+call `Column.DictIdxReader(idx)` once per column, which returns a closure with the storage branch
+(denseFlatIdx identity / packed width-1 / packed width-2 / materialized uint32) **hoisted out of
+the per-row loop** — exactly the pattern the prior `denseFlat` bool hoist used. For the common
+width-1 case the per-row cost is `int(p[row])`, identical to `int(idx[row])`. The
+`idx == nil && !IsDenseFlatIdx()` fast-path guards became `!HasDictIdx(idx)` so a packed column
+(nil `*Idx`) is not mistaken for an unset column. Per-row reader value accessors (`StringValue`,
+`BytesValue`, `BoolValue`, `uuidStringValue`) route through `dictIdxAt` instead of
+`len(c.XxxIdx) > idx` + `c.XxxIdx[idx]`, so they transparently serve packed columns.
+
+**Effect.** `BenchmarkPackedIdxRetained_Width2` (200 retained width-2 dict columns × 50k rows,
+measuring `runtime.HeapInuse` with the decoded columns alive): **48.39 MB → 29.90 MB (−38%)**;
+`B/op` 48.93 MB → 29.27 MB (−40%). The index component itself drops 50% (4→2 bytes/row); the column
+total drops 38% because the dict values + presence are unchanged. Wall-clock flat (decode is
+marginally faster — fewer bytes written). Decode parity verified against the realworld block by the
+existing `TestModulesFormatCorrectness` / `TestFormatComparisonDeepCompare`. New tests
+(`packed_idx_note369_test.go`) cover non-identity width-1, width-2 (incl. >255 entries exercising
+the second index byte), and width-4 (asserts the `[]uint32` path is kept, `packedIdxWidth == 0`).
+Back-ref: `column.go` (`Column.packedIdx`/`packedIdxWidth`, `readPackedIndexArray`, `dictIdxAt`,
+`packedIdxAt`, `packedIdxReader`, `DictIdxReader`, `HasDictIdx`), `block.go` (value accessors +
+`SizeBytes`), `block_parser.go` (snapshot/copy/reset propagation),
+`executor/column_provider.go` (hoisted scan loops). Tests/bench: `packed_idx_note369_test.go`,
+`packed_idx_note369_bench_test.go`.

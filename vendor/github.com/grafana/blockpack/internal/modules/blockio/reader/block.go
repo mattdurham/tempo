@@ -94,6 +94,7 @@ func (c *Column) SizeBytes() int64 {
 	n += int64(len(c.StringIdx)+len(c.Int64Idx)+len(c.Uint64Idx)+
 		len(c.Float64Idx)+len(c.BoolIdx)+len(c.BytesIdx)) * 4
 	n += int64(len(c.sparseDictIdx)) * 4
+	n += int64(len(c.packedIdx)) // NOTE-369: packed native-width dict index (1/2 bytes/row)
 	n += int64(len(c.Present))
 	n += int64(len(c.Int64Dict)+len(c.Uint64Dict)+len(c.Float64Dict)) * 8
 	n += int64(len(c.BoolDict))
@@ -196,8 +197,7 @@ func (c *Column) StringValue(idx int) (string, bool) {
 		return c.uuidStringValue(idx)
 	}
 
-	if len(c.StringIdx) > idx {
-		di := int(c.StringIdx[idx])
+	if di, ok := c.dictIdxAt(c.StringIdx, idx); ok { // NOTE-369: packed-index aware
 		if di < len(c.StringDict) {
 			return c.StringDict[di], true
 		}
@@ -212,8 +212,7 @@ func (c *Column) uuidStringValue(idx int) (string, bool) {
 
 	if c.hasInlineBytes() {
 		b = c.bytesInlineAt(idx)
-	} else if len(c.BytesIdx) > idx {
-		di := int(c.BytesIdx[idx])
+	} else if di, ok := c.dictIdxAt(c.BytesIdx, idx); ok { // NOTE-369: packed-index aware
 		if di < len(c.BytesDict) {
 			b = c.BytesDict[di]
 		}
@@ -323,8 +322,7 @@ func (c *Column) BoolValue(idx int) (bool, bool) {
 		return false, false
 	}
 
-	if len(c.BoolIdx) > idx {
-		di := int(c.BoolIdx[idx])
+	if di, ok := c.dictIdxAt(c.BoolIdx, idx); ok { // NOTE-369: packed-index aware
 		if di < len(c.BoolDict) {
 			return c.BoolDict[di] != 0, true
 		}
@@ -352,8 +350,7 @@ func (c *Column) BytesValue(idx int) ([]byte, bool) {
 		return nil, false
 	}
 
-	if len(c.BytesIdx) > idx {
-		di := int(c.BytesIdx[idx])
+	if di, ok := c.dictIdxAt(c.BytesIdx, idx); ok { // NOTE-369: packed-index aware
 		if di < len(c.BytesDict) {
 			return c.BytesDict[di], true
 		}

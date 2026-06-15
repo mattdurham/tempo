@@ -279,6 +279,31 @@ func readIndexArray(data []byte, pos, count int, indexWidth uint8) ([]uint32, in
 	return out, pos + need, nil
 }
 
+// readPackedIndexArray copies count index values of indexWidth bytes (1 or 2) into a fresh
+// []byte at native width — no 4x/2x expansion to []uint32. The returned slice is a copy
+// (not an alias of data, which is the reused decompBuf and will be overwritten by the next
+// column's decode). Width 4 is not supported here (no blowup to remove — callers use
+// readIndexArray). NOTE-369.
+func readPackedIndexArray(data []byte, pos, count int, indexWidth uint8) ([]byte, int, error) {
+	if count == 0 {
+		return nil, pos, nil
+	}
+	stride := int(indexWidth)
+	if stride != 1 && stride != 2 {
+		return nil, pos, fmt.Errorf("readPackedIndexArray: invalid index_width %d", indexWidth)
+	}
+	need := count * stride
+	if pos+need > len(data) {
+		return nil, pos, fmt.Errorf(
+			"readPackedIndexArray: need %d bytes at pos %d, have %d",
+			need, pos, len(data),
+		)
+	}
+	out := make([]byte, need)
+	copy(out, data[pos:pos+need])
+	return out, pos + need, nil
+}
+
 // readColumnEncoding reads enc_version[1] + encoding_kind[1] then dispatches.
 // colType is passed through so dictionary decoders can populate the correct typed fields.
 // ctx carries the per-reader intern table.
@@ -428,7 +453,9 @@ func (c *Column) decodeNow() {
 				c.uniformSlab = cached.uniformSlab     // NOTE-351
 				c.uniformStride = cached.uniformStride // NOTE-351
 				c.sparseDictIdx = cached.sparseDictIdx
-				c.denseFlatIdx = cached.denseFlatIdx // NOTE-358
+				c.denseFlatIdx = cached.denseFlatIdx     // NOTE-358
+				c.packedIdx = cached.packedIdx           // NOTE-369
+				c.packedIdxWidth = cached.packedIdxWidth // NOTE-369
 				c.rawEncoding = nil
 				c.compressedEncoding = nil
 				c.internMap = nil
@@ -478,7 +505,9 @@ func (c *Column) decodeNow() {
 		c.uniformSlab = dec.uniformSlab     // NOTE-351
 		c.uniformStride = dec.uniformStride // NOTE-351
 		c.sparseDictIdx = dec.sparseDictIdx
-		c.denseFlatIdx = dec.denseFlatIdx // NOTE-358
+		c.denseFlatIdx = dec.denseFlatIdx     // NOTE-358
+		c.packedIdx = dec.packedIdx           // NOTE-369
+		c.packedIdxWidth = dec.packedIdxWidth // NOTE-369
 
 		// NOTE-201: store a snapshot of the freshly decoded slices so subsequent warm
 		// queries that lazily access the identical on-disk block column skip the decode.
@@ -685,12 +714,23 @@ func decodeDictionary(
 	// indexes
 	switch kind {
 	case shared.KindDictionary: // dense: rowCount indexes
-		idx, _, err := readIndexArray(data, pos, rowCount, indexWidth)
-		if err != nil {
-			return nil, fmt.Errorf("dictionary(dense): %w", err)
+		// NOTE-369: for indexWidth 1/2 keep the index packed at native width instead of
+		// expanding 4x/2x into a []uint32 — readers resolve it via dictIdxAt. Width 4 has
+		// no blowup to remove and falls back to the materialized []uint32 path.
+		if indexWidth == 1 || indexWidth == 2 {
+			packed, _, perr := readPackedIndexArray(data, pos, rowCount, indexWidth)
+			if perr != nil {
+				return nil, fmt.Errorf("dictionary(dense): %w", perr)
+			}
+			col.packedIdx = packed
+			col.packedIdxWidth = indexWidth
+		} else {
+			idx, _, err := readIndexArray(data, pos, rowCount, indexWidth)
+			if err != nil {
+				return nil, fmt.Errorf("dictionary(dense): %w", err)
+			}
+			assignDictIdx(col, idx)
 		}
-
-		assignDictIdx(col, idx)
 
 	case shared.KindSparseDictionary: // sparse: present_count[4] + presentCount indexes
 		if pos+4 > len(data) {
@@ -2209,6 +2249,19 @@ type Column struct {
 	// or the column was not decompressed via the pooled path.
 	decompPooledPtr *[]byte
 	sparseDictIdx   []uint32
+	// NOTE-369: packed native-width dictionary index. A dense dictionary column with
+	// indexWidth 1 or 2 (dict cardinality <= 256 / <= 65536 — the common low-cardinality
+	// case for attribute/intrinsic columns) previously materialized a []uint32 *Idx slice,
+	// expanding each on-disk index 4x (width 1) or 2x (width 2). The realworld profile
+	// showed readIndexArray retaining ~800 MB of these uint32 index arrays (mostly width-2
+	// columns, a 2x blowup). When packedIdxWidth != 0 the type-specific *Idx slice is left
+	// nil and the dict index for row i is read at native width from packedIdx via
+	// dictIdxAt — packedIdx[i] (width 1) or LE-uint16 at packedIdx[2i:] (width 2). The
+	// snapshot stored in parsedV8ColumnCache (NOTE-200) shares this compact slice, so the
+	// retained footprint is the on-disk width, not 4 bytes/row. Width-4 columns keep the
+	// []uint32 path (no blowup to remove). Only the all-present dense dict path uses this;
+	// sparse / denseFlatIdx (NOTE-358) are unchanged.
+	packedIdx       []byte
 	SpanCount       int
 	decodeOnce      sync.Once
 	denseOnce       sync.Once
@@ -2217,6 +2270,9 @@ type Column struct {
 	uncompressedLen uint32
 	uniformStride   uint32 // NOTE-351: per-row stride into uniformSlab; 0 = not uniform-stride
 	Type            shared.ColumnType
+	// NOTE-369: native width (1 or 2 bytes/index) of packedIdx; 0 = no packed index
+	// (use the materialized *Idx slice or denseFlatIdx).
+	packedIdxWidth uint8
 	// NOTE-358: denseFlatIdx marks a fully-present dense-flat numeric column whose dict
 	// index for every row is the row index itself (Dict has one entry per present row, in
 	// row order; all-present ⇒ present-rank(i) == i). For these columns the *Idx slice is a
@@ -2236,6 +2292,23 @@ type Column struct {
 // instead of reading the (nil) *Idx slice.
 func (c *Column) IsDenseFlatIdx() bool { return c.denseFlatIdx }
 
+// DictIdxReader returns a per-row dict-index resolver for cross-package bulk scan loops
+// (executor), with the storage branch (denseFlatIdx / packed native width / materialized
+// []uint32) hoisted out of the per-row loop. idx is the type-correct exported *Idx slice
+// the caller selects (e.g. col.Uint64Idx); it is used only for the materialized-uint32
+// fallback. The resolver returns -1 for an out-of-range row. NOTE-369.
+func (c *Column) DictIdxReader(idx []uint32) func(row int) int {
+	return c.packedIdxReader(idx)
+}
+
+// HasDictIdx reports whether the column exposes a usable per-row dict index via DictIdxReader
+// — a packed native-width slice (NOTE-369), a materialized *Idx slice, or the denseFlatIdx
+// identity (NOTE-358). idx is the type-correct *Idx slice the caller would pass to
+// DictIdxReader. NOTE-369.
+func (c *Column) HasDictIdx(idx []uint32) bool {
+	return c.hasMaterializedIdx(idx)
+}
+
 // dictIdxAt returns the dictionary index for row idx and whether a dict lookup applies.
 // For a denseFlatIdx column (NOTE-358, all-present dense-flat) the index is the row index
 // itself, so no materialized *Idx slice is consulted. Otherwise it reads idx[row] from the
@@ -2245,10 +2318,82 @@ func (c *Column) dictIdxAt(idx []uint32, row int) (int, bool) {
 	if c.denseFlatIdx {
 		return row, true
 	}
+	// NOTE-369: packed native-width index supersedes the (nil) *Idx slice when set.
+	if c.packedIdxWidth != 0 {
+		return c.packedIdxAt(row)
+	}
 	if row < 0 || row >= len(idx) {
 		return 0, false
 	}
 	return int(idx[row]), true
+}
+
+// packedIdxAt returns the dict index for row from the NOTE-369 packed native-width
+// representation. Returns ok=false for an out-of-range row. The width branch is on a
+// per-column field; bulk scan loops should hoist it via packedIdxReader instead of
+// calling this per row.
+func (c *Column) packedIdxAt(row int) (int, bool) {
+	if row < 0 {
+		return 0, false
+	}
+	switch c.packedIdxWidth {
+	case 1:
+		if row >= len(c.packedIdx) {
+			return 0, false
+		}
+		return int(c.packedIdx[row]), true
+	case 2:
+		off := row * 2
+		if off+2 > len(c.packedIdx) {
+			return 0, false
+		}
+		return int(binary.LittleEndian.Uint16(c.packedIdx[off:])), true
+	default:
+		return 0, false
+	}
+}
+
+// hasMaterializedIdx reports whether the column has a usable per-row dict index — either
+// a packed native-width slice (NOTE-369), a materialized *Idx slice, or the denseFlatIdx
+// identity (NOTE-358). idx is the type-correct *Idx slice the caller would otherwise read.
+func (c *Column) hasMaterializedIdx(idx []uint32) bool {
+	return c.denseFlatIdx || c.packedIdxWidth != 0 || idx != nil
+}
+
+// packedIdxReader returns a closure resolving the dict index for a row, with the storage
+// branch hoisted out of the per-row loop. Bulk scan loops (executor) use this so the width
+// decision is made once per column, not once per row — matching the existing denseFlat
+// hoist. The returned function assumes row is in range (callers bound by SpanCount and
+// check presence first). NOTE-369.
+func (c *Column) packedIdxReader(idx []uint32) func(row int) int {
+	switch {
+	case c.denseFlatIdx:
+		return func(row int) int { return row }
+	case c.packedIdxWidth == 1:
+		p := c.packedIdx
+		return func(row int) int {
+			if row >= len(p) {
+				return -1
+			}
+			return int(p[row])
+		}
+	case c.packedIdxWidth == 2:
+		p := c.packedIdx
+		return func(row int) int {
+			off := row * 2
+			if off+2 > len(p) {
+				return -1
+			}
+			return int(binary.LittleEndian.Uint16(p[off:]))
+		}
+	default:
+		return func(row int) int {
+			if row >= len(idx) {
+				return -1
+			}
+			return int(idx[row])
+		}
+	}
 }
 
 // bytesInlineAt returns the inline bytes for row idx, transparently serving uniform-stride

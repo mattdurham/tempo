@@ -485,9 +485,11 @@ func parseBlockColumnsReuse(
 		col.uniformStride = decoded.uniformStride // NOTE-351
 		col.Present = decoded.Present
 		col.SpanCount = decoded.SpanCount
-		col.sparseDictIdx = decoded.sparseDictIdx // NOTE-PERF-1: lazy dense expansion
-		col.denseFlatIdx = decoded.denseFlatIdx   // NOTE-358
-		col.decoded.Store(true)                   // NOTE-CONC-001: mark eagerly decoded so needsDecode() is false
+		col.sparseDictIdx = decoded.sparseDictIdx   // NOTE-PERF-1: lazy dense expansion
+		col.denseFlatIdx = decoded.denseFlatIdx     // NOTE-358
+		col.packedIdx = decoded.packedIdx           // NOTE-369: packed native-width dict index
+		col.packedIdxWidth = decoded.packedIdxWidth // NOTE-369
+		col.decoded.Store(true)                     // NOTE-CONC-001: mark eagerly decoded so needsDecode() is false
 
 		// NOTE-200: store an immutable snapshot of the decoded slices for reuse by later
 		// queries on the same block. The snapshot shares the freshly-decoded slices (they
@@ -664,27 +666,29 @@ func v8ColumnCacheKey(fileID string, blockOffset uint64, name string, colType sh
 // Idx on the per-query Column and never overwrites sparseDictIdx in place. NOTE-200.
 func snapshotDecodedColumn(src *Column, name string, colType shared.ColumnType) *Column {
 	return &Column{
-		Name:          name,
-		Type:          colType,
-		StringDict:    src.StringDict,
-		StringIdx:     src.StringIdx,
-		Int64Dict:     src.Int64Dict,
-		Int64Idx:      src.Int64Idx,
-		Uint64Dict:    src.Uint64Dict,
-		Uint64Idx:     src.Uint64Idx,
-		Float64Dict:   src.Float64Dict,
-		Float64Idx:    src.Float64Idx,
-		BoolDict:      src.BoolDict,
-		BoolIdx:       src.BoolIdx,
-		BytesDict:     src.BytesDict,
-		BytesIdx:      src.BytesIdx,
-		BytesInline:   src.BytesInline,
-		uniformSlab:   src.uniformSlab,   // NOTE-351
-		uniformStride: src.uniformStride, // NOTE-351
-		Present:       src.Present,
-		SpanCount:     src.SpanCount,
-		sparseDictIdx: src.sparseDictIdx,
-		denseFlatIdx:  src.denseFlatIdx, // NOTE-358
+		Name:           name,
+		Type:           colType,
+		StringDict:     src.StringDict,
+		StringIdx:      src.StringIdx,
+		Int64Dict:      src.Int64Dict,
+		Int64Idx:       src.Int64Idx,
+		Uint64Dict:     src.Uint64Dict,
+		Uint64Idx:      src.Uint64Idx,
+		Float64Dict:    src.Float64Dict,
+		Float64Idx:     src.Float64Idx,
+		BoolDict:       src.BoolDict,
+		BoolIdx:        src.BoolIdx,
+		BytesDict:      src.BytesDict,
+		BytesIdx:       src.BytesIdx,
+		BytesInline:    src.BytesInline,
+		uniformSlab:    src.uniformSlab,   // NOTE-351
+		uniformStride:  src.uniformStride, // NOTE-351
+		Present:        src.Present,
+		SpanCount:      src.SpanCount,
+		sparseDictIdx:  src.sparseDictIdx,
+		denseFlatIdx:   src.denseFlatIdx,   // NOTE-358
+		packedIdx:      src.packedIdx,      // NOTE-369: packed native-width dict index
+		packedIdxWidth: src.packedIdxWidth, // NOTE-369
 	}
 }
 
@@ -710,9 +714,11 @@ func copyDecodedColumnInto(dst, snap *Column) {
 	dst.uniformStride = snap.uniformStride // NOTE-351
 	dst.Present = snap.Present
 	dst.SpanCount = snap.SpanCount
-	dst.sparseDictIdx = snap.sparseDictIdx // NOTE-PERF-1: per-query col gets its own dense Idx
-	dst.denseFlatIdx = snap.denseFlatIdx   // NOTE-358
-	dst.decoded.Store(true)                // NOTE-CONC-001: mark eagerly decoded
+	dst.sparseDictIdx = snap.sparseDictIdx   // NOTE-PERF-1: per-query col gets its own dense Idx
+	dst.denseFlatIdx = snap.denseFlatIdx     // NOTE-358
+	dst.packedIdx = snap.packedIdx           // NOTE-369: packed native-width dict index
+	dst.packedIdxWidth = snap.packedIdxWidth // NOTE-369
+	dst.decoded.Store(true)                  // NOTE-CONC-001: mark eagerly decoded
 }
 
 // decompressV14ColumnData applies SPEC-ROOT-012 guards and snappy-decompresses a V14 column blob.
@@ -821,8 +827,11 @@ func resetColumn(col *Column) {
 	col.compressedEncoding = nil // SPEC-V14-002: clear deferred decompression state
 	col.uncompressedLen = 0
 	col.internMap = nil
-	col.sparseDictIdx = nil // NOTE-PERF-1: clear deferred dense expansion
-	col.v8CacheKey = ""     // NOTE-201: clear stale lazy-decode cache key on reuse
+	col.sparseDictIdx = nil  // NOTE-PERF-1: clear deferred dense expansion
+	col.packedIdx = nil      // NOTE-369: clear packed native-width dict index on reuse
+	col.packedIdxWidth = 0   // NOTE-369
+	col.denseFlatIdx = false // NOTE-358/369: clear identity-index flag on reuse
+	col.v8CacheKey = ""      // NOTE-201: clear stale lazy-decode cache key on reuse
 	col.decodeOnce = sync.Once{}
 	col.denseOnce = sync.Once{}
 	col.decompressOnce = sync.Once{}

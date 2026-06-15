@@ -103,22 +103,16 @@ func classifyValueKind(values []any) valueKind {
 func scanDictMaskRows(col *modules_reader.Column, idx []uint32, dictMatch []bool, cb vm.RowCallback) int {
 	count := 0
 	present := col.PresenceView()
-	// NOTE-358: a denseFlatIdx column has no materialized index slice — the dict index for
-	// every (present) row is the row index itself. The column is all-present in this case, so
-	// the loop scans every row using di == i directly.
-	denseFlat := col.IsDenseFlatIdx()
+	// NOTE-358/369: the dict-index storage branch (identity / packed native-width / materialized
+	// []uint32) is hoisted out of the per-row loop by DictIdxReader. The resolver returns -1 for
+	// an out-of-range row (skipped here, matching the old i >= len(idx) guard).
+	idxAt := col.DictIdxReader(idx)
 	for i := range col.SpanCount {
 		if !presentAt(present, i) {
 			continue
 		}
-		di := i
-		if !denseFlat {
-			if i >= len(idx) {
-				continue
-			}
-			di = int(idx[i])
-		}
-		if di < len(dictMatch) && dictMatch[di] {
+		di := idxAt(i)
+		if di >= 0 && di < len(dictMatch) && dictMatch[di] {
 			if !cb(i) {
 				return count
 			}
@@ -548,15 +542,15 @@ func scanStringDictFloat(
 	spanCount := col.SpanCount
 	count := 0
 	present := col.PresenceView()
+	// NOTE-369: hoist the dict-index storage branch (packed native-width / materialized) out
+	// of the per-row loop.
+	idxAt := col.DictIdxReader(col.StringIdx)
 	for i := range spanCount {
 		if !presentAt(present, i) {
 			continue
 		}
-		if i >= len(col.StringIdx) {
-			continue
-		}
-		di := int(col.StringIdx[i])
-		if di < len(matches) && matches[di] {
+		di := idxAt(i)
+		if di >= 0 && di < len(matches) && matches[di] {
 			if !cb(i) {
 				return count
 			}
@@ -595,7 +589,7 @@ func scanNumericDict(
 	case modules_shared.ColumnTypeUint64, modules_shared.ColumnTypeRangeUint64:
 		dict := col.Uint64Dict
 		idx := col.Uint64Idx
-		if dict == nil || (idx == nil && !col.IsDenseFlatIdx()) { // NOTE-358
+		if dict == nil || !col.HasDictIdx(idx) { // NOTE-358/369
 			return 0, false
 		}
 		matches := make([]bool, len(dict))
@@ -617,7 +611,7 @@ func scanNumericDict(
 	case modules_shared.ColumnTypeInt64, modules_shared.ColumnTypeRangeInt64, modules_shared.ColumnTypeRangeDuration:
 		dict := col.Int64Dict
 		idx := col.Int64Idx
-		if dict == nil || (idx == nil && !col.IsDenseFlatIdx()) { // NOTE-358
+		if dict == nil || !col.HasDictIdx(idx) { // NOTE-358/369
 			return 0, false
 		}
 		matches := make([]bool, len(dict))
@@ -639,7 +633,7 @@ func scanNumericDict(
 	case modules_shared.ColumnTypeFloat64, modules_shared.ColumnTypeRangeFloat64:
 		dict := col.Float64Dict
 		idx := col.Float64Idx
-		if dict == nil || (idx == nil && !col.IsDenseFlatIdx()) { // NOTE-358
+		if dict == nil || !col.HasDictIdx(idx) { // NOTE-358/369
 			return 0, false
 		}
 		matches := make([]bool, len(dict))
@@ -675,19 +669,14 @@ func scanNumericDictMask(
 	spanCount := col.SpanCount
 	count := 0
 	present := col.PresenceView()
-	denseFlat := col.IsDenseFlatIdx() // NOTE-358: di == i, no materialized index slice
+	// NOTE-358/369: hoist the dict-index storage branch out of the per-row loop.
+	idxAt := col.DictIdxReader(idx)
 	for i := range spanCount {
 		if !presentAt(present, i) {
 			continue
 		}
-		di := i
-		if !denseFlat {
-			if i >= len(idx) {
-				continue
-			}
-			di = int(idx[i])
-		}
-		if di < len(matches) && matches[di] {
+		di := idxAt(i)
+		if di >= 0 && di < len(matches) && matches[di] {
 			if !cb(i) {
 				return count
 			}
