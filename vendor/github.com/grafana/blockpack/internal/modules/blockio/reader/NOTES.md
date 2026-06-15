@@ -2790,3 +2790,52 @@ Back-ref: `parser.go` (`readRangeDecodeSnappy`, `rangeScratchPool`, `putRangeScr
 `readV14Section`, `parseV8ToCBlob`, `fetchToCSection`, `ensureV8TraceSection`),
 `trace_index.go` (`ensureTraceIndexRaw`), `chunked_trace_index.go` (`chunkBytes`).
 Test/bench: `range_snappy_pool_test.go`.
+
+## NOTE-367: stash columnar-read column blobs instead of copying into the assembled buffer
+
+**Problem.** `acquireAssembledBuffer` was the #1 querier `memory:inuse_space` self-frame
+(~1068 MB under load). `readBlockColumnarWithCache` builds one contiguous "assembled" buffer
+per block, sized from byte 0 to the furthest wanted column (`bufSize = max(colEnd)` over
+`keepCols`), and copies each wanted column's compressed blob into its ABSOLUTE `dataOffset`
+inside it. The parser then sub-slices `rawBytes[dataOffset:end]` zero-copy (lazy decode), so
+the buffer must place every kept column at its true offset — meaning the buffer also spans the
+DEAD GAPS between scattered columns. A heavy metrics query touches a few small columns sitting
+far apart in a wide block, so the buffer spanned most of the block while only disjoint extents
+were ever read. With many concurrent 1-block sub-requests each holding such a buffer for the
+block's full processing window, the wasted gap-span dominated querier inuse_space.
+
+**Fix.** The parser already supports `preCompressedLookup` (NOTE-234): a column whose compressed
+blob is stashed on the Reader (`r.preCompressedColumns`, keyed by `(blockOffset, name, colType)`)
+is decoded straight from the stash and NEVER reads `rawBytes[dataOffset:end]`. NOTE-234 used this
+only for columns returned by the combined ToC+columns GetMulti. NOTE-367 extends it to the
+`keepCols` fetch path: `fetchColumnInto` and `fetchColumnsBatched` now `stashPreCompressedColumn`
+the resolved blob instead of `copy(assembled[colStart:colEnd], blob)`. With every wanted column
+served from a stash (decoded snapshot, combined-GetMulti blob, or keepCols blob), the assembled
+buffer no longer needs to span any column — so the sizing pass stops growing `bufSize` past
+`tocEnd`. The returned buffer is the ToC prefix only.
+
+**Why it is safe (lifetime).** Each stashed blob's backing array outlives the parse:
+- `fetchColumnInto`: `colBytes` from `GetOrFetchV8Section` is owned by the section cache for
+  the Reader's lifetime (same as NOTE-234's combined-GetMulti hits).
+- `fetchColumnsBatched`: a batch HIT blob is cache-owned; a batch MISS is a freshly-allocated
+  `cp := make([]byte, colLen)` that is also written back into the cache.
+The parser copies all data out during decode, so no longer-lived alias is created. The same
+`*Reader` both reads the group AND parses each block (`processGroup` is sequential on the
+reading goroutine — see `block_group_pipeline.go`), and the stash is keyed by block offset, so
+multi-block / multi-pass (predicate + output) consumers all resolve from the correct stash.
+The pipeline is always called with the UNION of both parse passes' columns
+(`outputCols` / `filterCols`), so every column a parse pass can want is stashed at read time.
+
+**Effect.** Test `TestReader_NOTE367_AssembledBufferIsTocPrefixOnly`: a 6-scattered-column read
+of a 16 KiB block returns a 395-byte buffer (−97.5%) — the column data lives once in the section
+cache, not duplicated into a per-query buffer spanning the block. On the querier this removes the
+assembled-buffer column-span from `inuse_space` (the ~1 GiB `acquireAssembledBuffer` self-frame).
+The warm-path microbench `BenchmarkReadGroupColumnarCached_NOTE367` is roughly flat on allocs/op
+(the buffer was already pool-recycled, so the win is RETAINED bytes, not allocation rate — +2
+allocs/op for the stash-map writes, transient and per-Reader-bounded).
+
+Back-ref: `columnar_read.go` (`readBlockColumnarWithCache` sizing pass, `fetchColumnInto`,
+`fetchColumnsBatched` — `assembled` param dropped from both as it is no longer written).
+Test/bench: `assembled_buffer_note367_test.go`, `columnar_read_note367_bench_test.go`. Updated
+`TestReader_PreCompressedColumns_DecodeFromStashedBlob` (sectioncache_test.go) to extract column
+blobs from the full block bytes since the columnar buffer no longer carries column data.

@@ -415,28 +415,38 @@ func (r *Reader) readBlockColumnarWithCache(
 			continue
 		}
 		keepCols = append(keepCols, m)
-		if colEnd > bufSize {
-			bufSize = colEnd
-		}
+		// NOTE-367: keepCols are resolved by fetchColumnInto/fetchColumnsBatched, which
+		// now STASH each fetched blob on the Reader (stashPreCompressedColumn) rather than
+		// copying it into the assembled buffer at its absolute dataOffset. The parser
+		// decodes those columns straight from the stash (preCompressedLookup), exactly as
+		// the NOTE-234 cache-hit columns do, so it never reads assembled[colStart:colEnd].
+		// The assembled buffer therefore only needs to span the ToC prefix — it no longer
+		// grows to the furthest kept column, eliminating both the dead gaps BETWEEN
+		// scattered columns and the per-column copy. This is the dominant remaining
+		// inuse_space frame (acquireAssembledBuffer, ~1 GiB under load): a heavy metrics
+		// query touches a few small columns scattered across a large block, so bufSize
+		// previously spanned most of the block while only disjoint extents were ever read.
 	}
 
-	// NOTE-208: draw the assembled buffer from a pool instead of make([]byte, bufSize).
-	// The buffer is not zeroed; the copies below fully overwrite the only regions the
-	// parser ever reads (the ToC prefix and each kept column extent). The caller
-	// recycles it via Reader.ReleaseRawBuffer once the parsed block is fully consumed.
+	// NOTE-208/367: draw the assembled buffer from a pool. It now holds ONLY the ToC
+	// prefix (bufSize == tocEnd); every wanted column is served from a process-cache
+	// decoded snapshot, a stashed compressed blob from the combined GetMulti (NOTE-234),
+	// or a stashed blob from the keepCols fetch below (NOTE-367) — none of which read the
+	// assembled buffer's column region. The caller recycles it via ReleaseRawBuffer once
+	// the parsed block is fully consumed.
 	assembled := acquireAssembledBuffer(bufSize)
 	copy(assembled, toc[:min(int64(len(toc)), int64(tocEnd))]) //nolint:gosec
 
 	// Phase-2 column fetches. Each kept column's compressed blob is cached as an
-	// independent section keyed by blockIdx/colName and written into a DISJOINT region
-	// of `assembled` (column extents never overlap).
+	// independent section keyed by blockIdx/colName. NOTE-367: the resolved blob is STASHED
+	// on the Reader (stashPreCompressedColumn) so the parser decodes straight from it —
+	// nothing is written into the assembled buffer, which now holds only the ToC prefix.
 	//
 	// NOTE-185: columns returned by the combined ToC+columns batch above are satisfied
-	// without any further memcache round-trip. NOTE-234: such a column is now stashed in
-	// r.preCompressedColumns during the sizing pass and excluded from keepCols entirely —
-	// the parser decodes straight from the stashed blob, so no copy into the assembled
-	// buffer happens here. keepCols therefore contains only true misses, which fall into
-	// `cols` for individual resolution below.
+	// without any further memcache round-trip. NOTE-234: such a column is already stashed in
+	// r.preCompressedColumns during the sizing pass and excluded from keepCols entirely.
+	// keepCols therefore contains only true misses, which fall into `cols` for individual
+	// resolution (and stashing) below.
 	cols := keepCols
 
 	// NOTE-187: lazily plan cold runs only when there is at least one cold miss to
@@ -454,7 +464,7 @@ func (r *Reader) readBlockColumnarWithCache(
 	if len(cols) <= 1 {
 		// Single (or zero) wanted column: the fan-out machinery is pure overhead. Resolve inline.
 		for _, m := range cols {
-			if err := r.fetchColumnInto(assembled, toc, runs, nil, blockOff, blockIdx, m); err != nil {
+			if err := r.fetchColumnInto(toc, runs, nil, blockOff, blockIdx, m); err != nil {
 				return nil, err
 			}
 		}
@@ -474,7 +484,7 @@ func (r *Reader) readBlockColumnarWithCache(
 	// byte-for-byte identical to the serial/fan-out version (each column lands at its absolute
 	// offset). When the cache lacks batch support we fall back to the concurrent fan-out.
 	if bg, ok := r.cache.(sectionBatchFetcher); ok {
-		if err := r.fetchColumnsBatched(bg, assembled, toc, runs, blockOff, blockIdx, cols); err != nil {
+		if err := r.fetchColumnsBatched(bg, toc, runs, blockOff, blockIdx, cols); err != nil {
 			return nil, err
 		}
 		return assembled, nil
@@ -494,7 +504,7 @@ func (r *Reader) readBlockColumnarWithCache(
 		go func(m colMetaEntry) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			if err := r.fetchColumnInto(assembled, toc, runs, &runMu, blockOff, blockIdx, m); err != nil {
+			if err := r.fetchColumnInto(toc, runs, &runMu, blockOff, blockIdx, m); err != nil {
 				errMu.Lock()
 				if firstErr == nil {
 					firstErr = err
@@ -749,12 +759,13 @@ func (r *Reader) fetchTocAndColumnsCombined(
 }
 
 // fetchColumnsBatched resolves all wanted columns for one block with a single batched
-// section-cache fetch, copying each hit into its disjoint region of assembled. Columns
-// that miss the batch are read from the (cached ToC or coalesced cold) source and written
-// back to the cache individually, then copied in. NOTE-179.
+// section-cache fetch, STASHING each resolved blob on the Reader (stashPreCompressedColumn)
+// so the parser decodes straight from it (NOTE-367) — no assembled-buffer copy. Columns
+// that miss the batch are read from the (cached ToC or coalesced cold) source, written back
+// to the cache, and stashed. NOTE-179.
 func (r *Reader) fetchColumnsBatched(
 	bg sectionBatchFetcher,
-	assembled, toc []byte,
+	toc []byte,
 	runs coldRuns,
 	blockOff int64,
 	blockIdx int,
@@ -777,7 +788,7 @@ func (r *Reader) fetchColumnsBatched(
 		// Cache reported no batch support after the type assertion (shouldn't happen);
 		// resolve every column individually as a safe fallback.
 		for _, m := range cols {
-			if ferr := r.fetchColumnInto(assembled, toc, runs, nil, blockOff, blockIdx, m); ferr != nil {
+			if ferr := r.fetchColumnInto(toc, runs, nil, blockOff, blockIdx, m); ferr != nil {
 				return ferr
 			}
 		}
@@ -788,12 +799,16 @@ func (r *Reader) fetchColumnsBatched(
 		colStart := int64(m.dataOffset)  //nolint:gosec
 		colLen := int64(m.compressedLen) //nolint:gosec
 		if blob, found := hits[name]; found {
-			copy(assembled[colStart:colStart+colLen], blob)
+			// NOTE-367: stash the cache-owned blob instead of copying it into the assembled
+			// buffer; the parser decodes straight from it (preCompressedLookup). The blob is
+			// owned by the section cache for the Reader's lifetime, matching NOTE-234.
+			r.stashPreCompressedColumn(blockOff, m, blob)
 			continue
 		}
-		// Miss: read the compressed blob from the cached ToC or a coalesced cold run,
-		// write it back to the cache, then copy into assembled. The cold path mutates
-		// shared run state but is single-goroutine here (no fan-out), so no lock needed.
+		// Miss: read the compressed blob from the cached ToC or a coalesced cold run, write
+		// it back to the cache, then stash the freshly-allocated copy (NOTE-367) — the
+		// parser decodes from it directly. The cold path mutates shared run state but is
+		// single-goroutine here (no fan-out), so no lock needed.
 		var blob []byte
 		if colStart+colLen <= int64(len(toc)) {
 			blob = toc[colStart : colStart+colLen]
@@ -807,17 +822,24 @@ func (r *Reader) fetchColumnsBatched(
 		cp := make([]byte, colLen)
 		copy(cp, blob)
 		_ = bg.PutV8Section(r.fileID, sectionTypeBlockCol, 0, name, cp)
-		copy(assembled[colStart:colStart+colLen], cp)
+		r.stashPreCompressedColumn(blockOff, m, cp)
 	}
 	return nil
 }
 
-// fetchColumnInto resolves one wanted column through the section cache and copies its
-// compressed blob into its disjoint region of assembled. Cold-path provider reads
+// fetchColumnInto resolves one wanted column through the section cache and STASHES its
+// compressed blob on the Reader (stashPreCompressedColumn) so the parser decodes straight
+// from it — never reading the assembled buffer (NOTE-367). Cold-path provider reads
 // (coldRuns.ensure) mutate shared run state and are serialized under runMu; runMu may be
 // nil on the single-column inline path where no concurrency is in flight. NOTE-177.
+//
+// The stashed blob is owned by the section cache (GetOrFetchV8Section result) for the
+// Reader's lifetime, or is a freshly-allocated copy from the cold/ToC source written back
+// into that cache — in both cases its backing array outlives the parse, matching the NOTE-234
+// stash lifetime contract (the parser copies all data out during decode anyway). The
+// `toc` remains as the cold-fetch fallback source; no assembled-buffer write happens.
 func (r *Reader) fetchColumnInto(
-	assembled, toc []byte,
+	toc []byte,
 	runs coldRuns,
 	runMu *sync.Mutex,
 	blockOff int64,
@@ -854,7 +876,7 @@ func (r *Reader) fetchColumnInto(
 	if fetchErr != nil {
 		return fmt.Errorf("block %d col %q: %w", blockIdx, m.name, fetchErr)
 	}
-	copy(assembled[colStart:colStart+colLen], colBytes)
+	r.stashPreCompressedColumn(blockOff, m, colBytes)
 	return nil
 }
 
