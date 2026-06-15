@@ -755,3 +755,43 @@ this section (leaner — no duplication); the reader prefers it and falls back t
 
 Back-ref: `internal/modules/blockio/writer/chunked_trace_index.go:buildChunkedTraceIndex`,
           `internal/modules/blockio/writer/v8_sections.go:writeRawToCEntry`
+
+---
+
+## NOTE-399: Stop storing the span:end per-row block column (synthesize on read)
+*Added: 2026-06-15*
+
+**Problem:** `span:end` was written as a per-row block column on every write path
+(`feedSpanTiming` for ingest, `applySpanEnd` for compaction) even though it is **fully
+derivable** from `span:start + span:duration`, both of which are always stored. On a
+representative block the per-row `span:end` payload accounted for ~8% of file size — pure
+redundancy. It was already absent from the intrinsic TOC section and synthesized on read
+there (`reader.synthesizeSpanEnd`); only the block-column copy remained.
+
+**Decision:** Stop emitting the `span:end` per-row block column entirely. Keep only the
+`span:end` range-index min/max so block pruning of `span:end` predicates stays correct
+(16 bytes per block, negligible). All read paths already resolve `span:end` via
+`GetIntrinsicColumn("span:end")` → `synthesizeSpanEnd`, so query results are byte-identical.
+
+**Write paths changed:**
+- `feedSpanTiming` (proto ingest): dropped the `addPresent(span:end, ...)` call; kept
+  `updateMinMaxNum` for the range index.
+- `applySpanEnd` (compaction, legacy source blocks that still carry span:end): no longer
+  writes a block column — only updates the range-index min/max from the source value.
+- `applySpanDuration` now returns the duration value so `finalizeRowBookkeeping` can
+  synthesize the `span:end` range-index entry (`start + duration`) when the source block
+  lacks `span:end` (i.e. it was itself written under NOTE-399). Per-row payload is never
+  re-emitted.
+- `Writer.AddRow` validation relaxed: a source block is accepted when it carries *either*
+  `span:end` (legacy) *or* `span:duration` (from which `span:end` is derivable).
+
+**Back-compat:** readers still read `span:end` when a legacy file contains it (the
+intrinsic synthesis path is preferred; the block column is simply ignored on the read
+side since the executor always goes through `GetIntrinsicColumn`).
+
+Back-ref: `internal/modules/blockio/writer/writer_block.go:feedSpanTiming`,
+          `internal/modules/blockio/writer/writer_block.go:applySpanEnd`,
+          `internal/modules/blockio/writer/writer_block.go:applySpanDuration`,
+          `internal/modules/blockio/writer/writer_block.go:finalizeRowBookkeeping`,
+          `internal/modules/blockio/writer/writer.go:AddRow`,
+          `internal/modules/blockio/reader/intrinsic_reader.go:synthesizeSpanEnd`

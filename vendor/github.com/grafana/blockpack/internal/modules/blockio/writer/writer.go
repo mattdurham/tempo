@@ -882,15 +882,22 @@ func (w *Writer) AddRow(block *reader.Block, rowIdx int) error {
 			rowIdx,
 		)
 	}
-	endCol := block.GetColumn(spanEndColumnName)
-	if endCol == nil {
-		return fmt.Errorf("writer: AddRow: required column %q missing", spanEndColumnName)
-	}
-	if _, ok := endCol.Uint64Value(rowIdx); !ok {
+	// span:end is no longer a required stored column (NOTE-399): it is synthesized from
+	// span:start + span:duration on read. Accept a source block that either carries
+	// span:end (legacy blocks) or carries span:duration (from which span:end is derivable).
+	if endCol := block.GetColumn(spanEndColumnName); endCol != nil {
+		if _, ok := endCol.Uint64Value(rowIdx); !ok {
+			return fmt.Errorf(
+				"writer: AddRow: column %q present but has no uint64 value at row %d",
+				spanEndColumnName,
+				rowIdx,
+			)
+		}
+	} else if durCol := block.GetColumn(spanDurationColumnName); durCol == nil {
 		return fmt.Errorf(
-			"writer: AddRow: required column %q must have uint64 value at row %d",
+			"writer: AddRow: require either %q or %q on the source block (span:end is synthesized from start+duration)",
 			spanEndColumnName,
-			rowIdx,
+			spanDurationColumnName,
 		)
 	}
 

@@ -403,8 +403,10 @@ func (b *blockBuilder) feedSpanKind(kind int64, rowIdx int) {
 		shared.AttrValue{Type: shared.ColumnTypeInt64, Int: kind})
 }
 
-// feedSpanTiming writes span:start, span:end, and span:duration to the accumulator and block
-// columns. span:end is written only to block columns (synthesized from start+duration on read).
+// feedSpanTiming writes span:start and span:duration to the accumulator and block
+// columns. span:end is NOT stored — it is synthesized from span:start + span:duration on
+// read (NOTE-399). Only the span:end range-index min/max is fed (for block pruning of
+// span:end predicates); the per-row column payload is omitted entirely.
 // The timestamp sketch is updated when start > 0.
 func (b *blockBuilder) feedSpanTiming(start, end uint64, rowIdx int) {
 	var tmp [8]byte
@@ -419,11 +421,11 @@ func (b *blockBuilder) feedSpanTiming(start, end uint64, rowIdx int) {
 		b.colSketches.add(sketchTimestampColName, encodeSecondBucket(start))
 	}
 
-	// span:end — written to block columns only; synthesized from start+duration in intrinsic path.
+	// span:end — NOT stored as a per-row block column (NOTE-399). Synthesized from
+	// span:start + span:duration on read. Only the range-index min/max is updated so
+	// block pruning of span:end predicates remains correct.
 	binary.LittleEndian.PutUint64(tmp[:], end)
 	b.updateMinMaxNum(spanEndColumnName, shared.ColumnTypeUint64, tmp)
-	b.addPresent(rowIdx, spanEndColumnName, shared.ColumnTypeUint64,
-		shared.AttrValue{Type: shared.ColumnTypeUint64, Uint: end})
 
 	var dur uint64
 	if end >= start {
@@ -840,28 +842,26 @@ func (b *blockBuilder) applySpanStart(col *modules_reader.Column, srcRowIdx, dst
 	return 0, false
 }
 
-// applySpanEnd updates span:end min/max and writes to block column (dual storage).
-// span:end is NOT written to the intrinsic section — it is synthesized on read from start+duration.
-// Written to block column payloads (dual storage); NOT written to intrinsic section.
-// Returns the value and whether it was present (used by finalizeRowBookkeeping).
+// applySpanEnd reads span:end from the source block column (present only in legacy
+// blocks written before NOTE-399) and updates the span:end range-index min/max. It does
+// NOT write a per-row block column — span:end is synthesized from span:start +
+// span:duration on read. Returns the value and whether it was present in the source
+// (used by finalizeRowBookkeeping for legacy duration derivation).
 func (b *blockBuilder) applySpanEnd(col *modules_reader.Column, srcRowIdx, dstRowIdx int) (uint64, bool) {
+	_ = dstRowIdx
 	if v, ok := col.Uint64Value(srcRowIdx); ok {
 		var tmp [8]byte
 		binary.LittleEndian.PutUint64(tmp[:], v)
 		b.updateMinMaxNum(spanEndColumnName, shared.ColumnTypeUint64, tmp)
-		b.addPresent(
-			dstRowIdx,
-			spanEndColumnName,
-			shared.ColumnTypeUint64,
-			shared.AttrValue{Type: shared.ColumnTypeUint64, Uint: v},
-		)
 		return v, true
 	}
 	return 0, false
 }
 
 // applySpanDuration feeds span:duration into the intrinsic accumulator and writes to block column (dual storage).
-func (b *blockBuilder) applySpanDuration(col *modules_reader.Column, srcRowIdx, dstRowIdx int) bool {
+// Returns the value and whether it was present (used by finalizeRowBookkeeping to synthesize the
+// span:end range index when the source block lacks the span:end column — NOTE-399).
+func (b *blockBuilder) applySpanDuration(col *modules_reader.Column, srcRowIdx, dstRowIdx int) (uint64, bool) {
 	if v, ok := col.Uint64Value(srcRowIdx); ok {
 		var tmp [8]byte
 		binary.LittleEndian.PutUint64(tmp[:], v)
@@ -873,9 +873,9 @@ func (b *blockBuilder) applySpanDuration(col *modules_reader.Column, srcRowIdx, 
 			shared.ColumnTypeUint64,
 			shared.AttrValue{Type: shared.ColumnTypeUint64, Uint: v},
 		)
-		return true
+		return v, true
 	}
-	return false
+	return 0, false
 }
 
 // applySpanStatus feeds the span:status column value into the intrinsic accumulator and writes to block column (dual storage).
@@ -900,7 +900,7 @@ func (b *blockBuilder) applySpanStatus(col *modules_reader.Column, srcRowIdx, ds
 // writing them into the destination block via addPresent.
 func (b *blockBuilder) addRowFromBlock(srcBlock *modules_reader.Block, srcRowIdx, dstRowIdx int) {
 	var traceID [16]byte
-	var spanStart, spanEnd uint64
+	var spanStart, spanEnd, spanDuration uint64
 	traceIDFound := false
 	spanStartFound := false
 	spanEndFound := false
@@ -943,7 +943,7 @@ func (b *blockBuilder) addRowFromBlock(srcBlock *modules_reader.Block, srcRowIdx
 			continue
 
 		case spanDurationColumnName:
-			durationFound = b.applySpanDuration(col, srcRowIdx, dstRowIdx)
+			spanDuration, durationFound = b.applySpanDuration(col, srcRowIdx, dstRowIdx)
 			continue
 
 		case spanStatusColumnName:
@@ -994,7 +994,8 @@ func (b *blockBuilder) addRowFromBlock(srcBlock *modules_reader.Block, srcRowIdx
 
 	b.finalizeRowBookkeeping(
 		dstRowIdx, traceID, traceIDFound,
-		spanStart, spanStartFound, spanEnd, spanEndFound, durationFound,
+		spanStart, spanStartFound, spanEnd, spanEndFound,
+		spanDuration, durationFound,
 	)
 }
 
@@ -1002,9 +1003,11 @@ func (b *blockBuilder) addRowFromBlock(srcBlock *modules_reader.Block, srcRowIdx
 // derives missing duration, updates min/max start/traceID, and increments spanCount.
 func (b *blockBuilder) finalizeRowBookkeeping(
 	dstRowIdx int, traceID [16]byte, traceIDFound bool,
-	spanStart uint64, spanStartFound bool, spanEnd uint64, spanEndFound, durationFound bool,
+	spanStart uint64, spanStartFound bool, spanEnd uint64, spanEndFound bool,
+	spanDuration uint64, durationFound bool,
 ) {
-	// Derive duration from start+end if source block lacked span:duration.
+	// Derive duration from start+end if source block lacked span:duration (legacy blocks
+	// that still carry span:end). span:duration is the canonical stored column.
 	if !durationFound && spanStartFound && spanEndFound {
 		var dur uint64
 		if spanEnd >= spanStart {
@@ -1014,6 +1017,17 @@ func (b *blockBuilder) finalizeRowBookkeeping(
 		binary.LittleEndian.PutUint64(tmp[:], dur)
 		b.updateMinMaxNum(spanDurationColumnName, shared.ColumnTypeUint64, tmp)
 		b.feedIntrinsicUint64(spanDurationColumnName, shared.ColumnTypeUint64, dur, dstRowIdx)
+	}
+
+	// NOTE-399: span:end is no longer stored as a per-row block column. When the source
+	// block lacks it (NOTE-399 blocks), synthesize the span:end value from
+	// span:start + span:duration so the span:end range-index min/max stays correct for
+	// block pruning of span:end predicates. The per-row payload is never written.
+	if !spanEndFound && spanStartFound && durationFound {
+		synthEnd := spanStart + spanDuration
+		var tmp [8]byte
+		binary.LittleEndian.PutUint64(tmp[:], synthEnd)
+		b.updateMinMaxNum(spanEndColumnName, shared.ColumnTypeUint64, tmp)
 	}
 
 	// Update min/max start time and trace ID bookkeeping.
