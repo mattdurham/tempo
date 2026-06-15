@@ -4409,6 +4409,49 @@ func countIntrinsicHistogramBoundaries(col *modules_shared.IntrinsicColumn, fiel
 	// count is identical to the former map-cardinality count for every input.
 	const expLo, expHi = -1075, 1025
 	scaleByNano := fieldName == colNameSpanDuration
+
+	// NOTE-379: DeltaUint64 fast path. Values are sorted ascending (NOTE-123) and the boundary
+	// exponent (frexpExpPos) is monotonically non-decreasing in the value, so distinct boundaries
+	// appear in a single contiguous run as the scan advances. A serial walk that only remembers
+	// the previous boundary slot therefore counts distinct boundaries exactly, with no dedup
+	// table — removing both the per-call make([]bool, 2100) allocation (countIntrinsicHistogram-
+	// Boundaries was ~0.30% querier self-time, profile 2026-06-15, dominated by that alloc on the
+	// M8 duration path) and the per-value table store/probe. v<=0 (after optional nano scale) maps
+	// to the single boundary-0 bucket, which for sorted-ascending data is at most the leading run,
+	// so a one-shot zeroSeen flag suffices. Scaling by 1/1e9 is order-preserving, so the post-scale
+	// values remain sorted and the monotonicity argument holds. The result is identical to the
+	// generic seenExp count for any sorted-ascending input.
+	if col.Format == modules_shared.IntrinsicFormatDeltaUint64 {
+		count := 0
+		zeroSeen := false
+		prevSlot := -1 // last positive boundary slot recorded; -1 = none yet
+		for _, u := range col.Uint64Values {
+			v := float64(u)
+			if scaleByNano {
+				v /= 1e9
+			}
+			if v <= 0 {
+				if !zeroSeen {
+					zeroSeen = true
+					count++
+				}
+				continue
+			}
+			slot := frexpExpPos(v) - expLo
+			if slot != prevSlot {
+				// Monotonic non-decreasing slot: a value differing from the immediately
+				// preceding positive boundary is a new distinct boundary (it can never
+				// re-appear later because the sequence never decreases).
+				prevSlot = slot
+				count++
+				if count >= histFlatStride {
+					return histFlatStride
+				}
+			}
+		}
+		return count
+	}
+
 	seenExp := make([]bool, expHi-expLo)
 	count := 0
 	zeroSeen := false
@@ -4461,17 +4504,8 @@ func countIntrinsicHistogramBoundaries(col *modules_shared.IntrinsicColumn, fiel
 				return histFlatStride
 			}
 		}
-	case modules_shared.IntrinsicFormatDeltaUint64:
-		// NOTE-123: DeltaUint64 values are sorted ascending. intrinsicHistogramBoundary is
-		// monotonically non-decreasing, so boundary transitions occur only when the boundary
-		// (equivalently the exponent) changes between consecutive values — markValue's seenExp
-		// dedup naturally skips the long runs of identical exponents, so this is O(numValues)
-		// reads with O(numBoundaries) distinct marks, no per-value comparison-against-prev needed.
-		for _, u := range col.Uint64Values {
-			if markValue(float64(u)) {
-				return histFlatStride
-			}
-		}
+		// NOTE-379: IntrinsicFormatDeltaUint64 is handled by the sorted fast path above the
+		// switch (no dedup table, prev-slot comparison) — it can never reach here.
 	}
 	return count
 }

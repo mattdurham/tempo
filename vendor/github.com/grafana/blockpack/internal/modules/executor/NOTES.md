@@ -5692,3 +5692,28 @@ fully green (deadcode, fieldalignment, staticcheck clean).
 Back-ref: `internal/modules/executor/intrinsic_row_block.go:denseScatterBound`,
 `scatterTraceIDDense`, `scatterSpanIDDense`, `scatterParentIDDense`, `scatterSpanStartDense`,
 `scatterSpanEndDense`, `scatterSpanDurationDense`
+
+## NOTE-379 — DeltaUint64 sorted fast path in countIntrinsicHistogramBoundaries
+
+`countIntrinsicHistogramBoundaries` sizes the M8 histogram accumulator (`groupCountsFlat`)
+and is called once per accumulate. Its generic implementation allocates a 2100-element
+`make([]bool, expHi-expLo)` dedup table on every call and stores/probes it once per value.
+A 2026-06-15 querier CPU profile attributed ~0.30% self-time to this function, dominated by
+that per-call allocation on the M8 `histogram_over_time(duration) by (...)` path.
+
+DeltaUint64 columns are sorted ascending (NOTE-123) and the boundary exponent
+(`frexpExpPos`) is monotonically non-decreasing in the value, so distinct boundaries appear
+in a single contiguous run as the scan advances. A serial walk that remembers only the
+previous boundary slot therefore counts distinct boundaries exactly — no dedup table, no
+per-value table store/probe. The `1/1e9` nano scale is order-preserving so the post-scale
+sequence is still sorted and the monotonicity argument holds; `v<=0` (only `u==0` here) maps
+to the single boundary-0 bucket tracked by a one-shot `zeroSeen` flag. The `histFlatStride`
+overflow cap is preserved.
+
+This removes the allocation and the table traffic for the heaviest metrics query's count
+pass. Output is byte-identical to the generic `seenExp` count for every sorted-ascending
+input (verified against a 2000-iteration random-sorted parity harness and the existing
+`duration_delta_sorted_ascending` case). The Dict and Flat arms (unsorted) keep the generic
+`markValue`/`seenExp` path unchanged.
+
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:countIntrinsicHistogramBoundaries`

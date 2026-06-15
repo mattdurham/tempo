@@ -75,7 +75,7 @@ require (
 	github.com/bytedance/sonic v1.15.1
 	github.com/evanphx/json-patch v5.9.11+incompatible
 	github.com/googleapis/gax-go/v2 v2.22.0
-	github.com/grafana/blockpack v0.0.0-20260613130007-4cff762233a3
+	github.com/grafana/blockpack v0.0.0-20260615052704-b8a8308cb596
 	github.com/grafana/gomemcache v0.0.0-20251127154401-74f93547077b
 	github.com/grpc-ecosystem/go-grpc-middleware v1.4.0
 	github.com/hashicorp/golang-lru/v2 v2.0.7
@@ -459,7 +459,6 @@ require (
 )
 
 replace (
-	github.com/grafana/blockpack => ../blockpack
 	k8s.io/api => k8s.io/api v0.36.0
 	k8s.io/client-go => k8s.io/client-go v0.36.0
 )
