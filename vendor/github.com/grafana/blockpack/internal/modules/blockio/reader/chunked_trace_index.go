@@ -151,14 +151,15 @@ func (r *Reader) chunkBytes(ci *chunkedTraceIndex, chunkIdx int) ([]byte, error)
 	ci.chunkMu.Unlock()
 
 	ent := ci.dir[chunkIdx]
-	compressed, err := r.readRange(ci.secOffset+uint64(ent.compOff), uint64(ent.compLen), rw.DataTypeTraceBloomFilter)
-	if err != nil {
-		return nil, fmt.Errorf("chunked trace index: chunk read: %w", err)
-	}
+	// NOTE-366: read into pooled scratch, decode, recycle the compressed buffer.
 	// SPEC-ROOT-012: decodeBoundedSnappy checks DecodedLen before allocating.
-	mini, decErr := decodeBoundedSnappy(compressed)
+	mini, decErr := r.readRangeDecodeSnappy(
+		ci.secOffset+uint64(ent.compOff),
+		uint64(ent.compLen),
+		rw.DataTypeTraceBloomFilter,
+	)
 	if decErr != nil {
-		return nil, fmt.Errorf("chunked trace index: chunk snappy decode: %w", decErr)
+		return nil, fmt.Errorf("chunked trace index: chunk read/snappy decode: %w", decErr)
 	}
 
 	ci.chunkMu.Lock()

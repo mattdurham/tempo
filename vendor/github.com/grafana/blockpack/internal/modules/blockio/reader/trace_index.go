@@ -714,15 +714,12 @@ func (r *Reader) ensureTraceIndexRaw() error {
 				// body to keep it off the querier heap; this phase-2 fetch runs only on a
 				// bloom hit. The returned slice is an independent copy of the body so the
 				// large decompressed blob is not pinned by the cached trace-index entry.
-				compressed, readErr := r.readRange(
+				// NOTE-366: read into pooled scratch, decode, recycle the compressed buffer.
+				decoded, decErr := r.readRangeDecodeSnappy(
 					r.compactParsed.v8SectionOffset,
 					r.compactParsed.v8SectionLen,
 					rw.DataTypeTraceBloomFilter,
 				)
-				if readErr != nil {
-					return nil, readErr
-				}
-				decoded, decErr := decodeBoundedSnappy(compressed)
 				if decErr != nil {
 					return nil, decErr
 				}

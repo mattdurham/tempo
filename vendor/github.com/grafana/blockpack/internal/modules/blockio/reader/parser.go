@@ -5,6 +5,7 @@ package reader
 import (
 	"encoding/binary"
 	"fmt"
+	"sync"
 
 	"github.com/klauspost/compress/snappy"
 
@@ -250,6 +251,66 @@ const (
 
 // decodeBoundedSnappy snappy-decodes compressed, rejecting inputs whose
 // decoded size would exceed MaxMetadataSize (decompression-bomb guard).
+// NOTE-366: pooled scratch for the read-compressed-then-snappy-decode-then-discard pattern.
+//
+// readV14Section / parseV8ToCBlob / fetchToCSection / ensureV8TraceSection / chunkBytes /
+// ensureTraceIndexRaw all do the same thing: r.readRange(...) allocates a fresh
+// make([]byte, length) (NOTE: readRange), the bytes are fed straight to decodeBoundedSnappy,
+// and the compressed buffer is then unreferenced. The decoded output escapes (to r.cache or
+// a parsed struct), but the *compressed* buffer is pure transient scratch. Under heavy
+// concurrent metadata loading these transient buffers piled up as live bytes attributed to
+// readRange (the #3 inuse_space self-frame at ~188 MB warm). Routing them through a pool
+// keyed only by the 8 MiB cap (mirroring decompBufPool / NOTE-346) keeps the steady-state
+// scratch footprint bounded instead of one-shot-allocating each compressed blob.
+var rangeScratchPool = sync.Pool{New: func() any { b := make([]byte, 0, 64<<10); return &b }}
+
+// rangeScratchMaxPooledCap bounds the backing capacity any buffer may carry back into
+// rangeScratchPool, so a rare large compressed section (e.g. a tens-of-MB legacy V8 trace
+// index) does not pin a giant array in the pool for the process lifetime. Mirrors
+// decompBufMaxPooledCap (NOTE-346). Metadata/section compressed blobs are typically KB to a
+// few MB, well under this cap, so the common case recycles its buffer with no churn.
+const rangeScratchMaxPooledCap = 8 << 20 // 8 MiB
+
+// putRangeScratch returns a read-scratch buffer to rangeScratchPool, dropping any buffer
+// grown beyond rangeScratchMaxPooledCap. ptr must be non-nil.
+func putRangeScratch(ptr *[]byte) {
+	if cap(*ptr) > rangeScratchMaxPooledCap {
+		return // drop oversized buffer: let it GC rather than pin RSS in the pool
+	}
+	rangeScratchPool.Put(ptr)
+}
+
+// readRangeDecodeSnappy reads [offset, offset+length) into a pooled scratch buffer, snappy-
+// decodes it, and returns the freshly-allocated decoded bytes. The pooled scratch (the
+// compressed source) is returned to rangeScratchPool before return; the decoded output is
+// independently allocated by decodeBoundedSnappy and does NOT alias the scratch, so the
+// buffer is safe to recycle (NOTE-366). Returns (nil, nil) for length == 0.
+func (r *Reader) readRangeDecodeSnappy(offset, length uint64, dt rw.DataType) ([]byte, error) {
+	if length == 0 {
+		return nil, nil
+	}
+	scratchPtr := rangeScratchPool.Get().(*[]byte)
+	scratch := *scratchPtr
+	if uint64(cap(scratch)) < length { //nolint:gosec // length is a section size, bounded by MaxMetadataSize
+		scratch = make([]byte, length)
+	} else {
+		scratch = scratch[:length]
+	}
+	defer func() {
+		*scratchPtr = scratch[:0]
+		putRangeScratch(scratchPtr)
+	}()
+	off := int64(offset) //nolint:gosec // safe: offset is a file offset, fits in int64
+	n, err := r.provider.ReadAt(scratch, off, dt)
+	if err != nil {
+		return nil, fmt.Errorf("readRangeDecodeSnappy offset=%d length=%d: %w", offset, length, err)
+	}
+	if uint64(n) != length { //nolint:gosec // safe: n is bytes read, always non-negative
+		return nil, fmt.Errorf("readRangeDecodeSnappy offset=%d: short read %d/%d", offset, n, length)
+	}
+	return decodeBoundedSnappy(scratch)
+}
+
 func decodeBoundedSnappy(compressed []byte) ([]byte, error) {
 	decodedLen, lenErr := snappy.DecodedLen(compressed)
 	if lenErr != nil {
@@ -276,13 +337,10 @@ func (r *Reader) readV14Section(sectionType uint8) ([]byte, error) {
 		return nil, nil
 	}
 	raw, err := r.cache.GetOrFetchV14Section(r.fileID, sectionType, func() ([]byte, error) {
-		compressed, readErr := r.readRange(e.Offset, uint64(e.CompressedLen), rw.DataTypeMetadata) //nolint:gosec
-		if readErr != nil {
-			return nil, fmt.Errorf("section 0x%02X read: %w", sectionType, readErr)
-		}
-		dec, decErr := decodeBoundedSnappy(compressed)
+		// NOTE-366: read into pooled scratch, decode, recycle the compressed buffer.
+		dec, decErr := r.readRangeDecodeSnappy(e.Offset, uint64(e.CompressedLen), rw.DataTypeMetadata) //nolint:gosec
 		if decErr != nil {
-			return nil, fmt.Errorf("section 0x%02X snappy: %w", sectionType, decErr)
+			return nil, fmt.Errorf("section 0x%02X read/snappy: %w", sectionType, decErr)
 		}
 		return dec, nil
 	})
@@ -296,11 +354,8 @@ func (r *Reader) parseV8ToCBlob() (map[shared.ToCKey]shared.ToCEntry, uint8, err
 		return make(map[shared.ToCKey]shared.ToCEntry), shared.SignalTypeTrace, nil
 	}
 	raw, err := r.cache.GetOrFetchV8TOC(r.fileID, func() ([]byte, error) {
-		compressed, readErr := r.readRange(r.v8ToCOffset, uint64(r.v8ToCLen), rw.DataTypeMetadata) //nolint:gosec
-		if readErr != nil {
-			return nil, readErr
-		}
-		return decodeBoundedSnappy(compressed)
+		// NOTE-366: read into pooled scratch, decode, recycle the compressed buffer.
+		return r.readRangeDecodeSnappy(r.v8ToCOffset, uint64(r.v8ToCLen), rw.DataTypeMetadata) //nolint:gosec
 	})
 	if err != nil {
 		return nil, 0, fmt.Errorf("parseV8ToCBlob: %w", err)
@@ -337,13 +392,10 @@ func (r *Reader) fetchToCSection(key shared.ToCKey) ([]byte, error) {
 		return nil, nil
 	}
 	raw, err := r.cache.GetOrFetchV8Section(r.fileID, key.Type, key.SubType, key.Name, func() ([]byte, error) {
-		compressed, readErr := r.readRange(e.Offset, uint64(e.Length), rw.DataTypeMetadata) //nolint:gosec
-		if readErr != nil {
-			return nil, fmt.Errorf("fetchToCSection(%v): read: %w", key, readErr)
-		}
-		dec, decErr := decodeBoundedSnappy(compressed)
+		// NOTE-366: read into pooled scratch, decode, recycle the compressed buffer.
+		dec, decErr := r.readRangeDecodeSnappy(e.Offset, uint64(e.Length), rw.DataTypeMetadata) //nolint:gosec
 		if decErr != nil {
-			return nil, fmt.Errorf("fetchToCSection(%v): snappy: %w", key, decErr)
+			return nil, fmt.Errorf("fetchToCSection(%v): read/snappy: %w", key, decErr)
 		}
 		return dec, nil
 	})
@@ -431,14 +483,10 @@ func (r *Reader) ensureV8TraceSection() error {
 		if !ok {
 			return
 		}
-		compressed, readErr := r.readRange(entry.Offset, uint64(entry.Length), rw.DataTypeMetadata) //nolint:gosec
-		if readErr != nil {
-			r.v8TraceErr = fmt.Errorf("ensureV8TraceSection: read: %w", readErr)
-			return
-		}
-		raw, decErr := decodeBoundedSnappy(compressed)
+		// NOTE-366: read into pooled scratch, decode, recycle the compressed buffer.
+		raw, decErr := r.readRangeDecodeSnappy(entry.Offset, uint64(entry.Length), rw.DataTypeMetadata) //nolint:gosec
 		if decErr != nil {
-			r.v8TraceErr = fmt.Errorf("ensureV8TraceSection: snappy: %w", decErr)
+			r.v8TraceErr = fmt.Errorf("ensureV8TraceSection: read/snappy: %w", decErr)
 			return
 		}
 		if len(raw) == 0 {
@@ -454,8 +502,9 @@ func (r *Reader) ensureV8TraceSection() error {
 			return
 		}
 		// Record the section location so ensureTraceIndexRaw can re-fetch the body
-		// on a bloom hit. The transient `raw`/`compressed` blobs are now unreferenced
-		// and become collectable as soon as this closure returns.
+		// on a bloom hit. The transient `raw` blob is now unreferenced and becomes
+		// collectable as soon as this closure returns; the compressed source was read
+		// into pooled scratch and already recycled by readRangeDecodeSnappy (NOTE-366).
 		if r.compactParsed != nil {
 			r.compactParsed.v8SectionOffset = entry.Offset
 			r.compactParsed.v8SectionLen = uint64(entry.Length) //nolint:gosec

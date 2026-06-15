@@ -2745,3 +2745,48 @@ keeping its steady-state RSS footprint lower too.
 
 Back-ref: `coalesce.go` (`ReadCoalescedBlocks`). Bench: `coalesce_alloc_bench_test.go`
 (`BenchmarkReadCoalescedSingleBlock` / `BenchmarkReadCoalescedMultiBlock`).
+
+## NOTE-366: Pool the transient compressed-read scratch on the snappy-decode-then-discard path
+*Added: 2026-06-14*
+
+**Problem.** Six metadata/section read sites all share one shape:
+
+```go
+compressed, _ := r.readRange(off, len, dt)   // make([]byte, len) — escapes, held until GC
+dec, _        := decodeBoundedSnappy(compressed)  // dec is kept; compressed discarded
+```
+
+`readV14Section`, `parseV8ToCBlob`, `fetchToCSection`, `ensureV8TraceSection` (phase 1),
+`chunkBytes`, and `ensureTraceIndexRaw` (V8 phase 2). The decoded output legitimately escapes
+(into `r.cache` / a parsed struct), but the **compressed** buffer is pure transient scratch:
+`readRange` allocates it with `make([]byte, length)`, it is fed straight to
+`decodeBoundedSnappy`, and is then unreferenced. Under heavy concurrent metadata loading these
+one-shot compressed buffers piled up as live bytes attributed to `readRange` — the #3
+`memory:inuse_space` self-frame on the post-NOTE-365 querier heap (~188 MB warm, mid-load).
+
+**Fix.** Add `readRangeDecodeSnappy(offset, length, dt)` which reads the compressed bytes into a
+buffer borrowed from `rangeScratchPool` (`sync.Pool` of `*[]byte`, 64 KiB seed), snappy-decodes
+into a fresh independently-allocated slice (`decodeBoundedSnappy` never aliases its source),
+and recycles the scratch via `putRangeScratch` before returning — dropping any buffer grown
+beyond `rangeScratchMaxPooledCap` (8 MiB) so a rare large legacy-V8 trace section cannot pin a
+giant array in the pool (mirrors `decompBufPool` / NOTE-346). All six call sites now route
+through it; the V3/V4 raw (uncompressed) trace-index branch still uses `readRange` directly
+since it has no decode step to recycle around.
+
+**Why it is safe.** `decodeBoundedSnappy` calls `snappy.Decode(MakeNoZeroBytes(decodedLen),
+compressed)` — `snappy.Decode` writes into its own freshly-sized dst and only *reads* the
+source, so the decoded output never aliases the scratch. The scratch can therefore be recycled
+the instant decode returns. Verified by `range_snappy_pool_test.go`: round-trip correctness at
+a non-zero offset, zero-length `(nil,nil)`, and a no-alias-after-recycle test where a second
+call reuses the same pooled scratch and must not corrupt the first decode's output.
+
+**Effect.** Microbench `BenchmarkReadRangeDecodeSnappy`: old non-pooled path 2 allocs/op,
+25856 B/op → pooled path 1 alloc/op, 24607 B/op (−50% allocs, −4.8% bytes — the compressed
+buffer no longer escapes to the heap). The win on the querier is the removal of the transient
+`readRange` compressed scratch from `inuse_space`: bytes held drops by the concurrent ×
+per-call compressed-blob footprint.
+
+Back-ref: `parser.go` (`readRangeDecodeSnappy`, `rangeScratchPool`, `putRangeScratch`,
+`readV14Section`, `parseV8ToCBlob`, `fetchToCSection`, `ensureV8TraceSection`),
+`trace_index.go` (`ensureTraceIndexRaw`), `chunked_trace_index.go` (`chunkBytes`).
+Test/bench: `range_snappy_pool_test.go`.
