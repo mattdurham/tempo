@@ -5913,3 +5913,25 @@ whole traces are kept/dropped as a unit so intermediate ancestors stay intact.
 Back-ref: `internal/modules/executor/stream_structural.go:groupMatchingStructuralTraces`,
 `collectAllStructuralSpans` (single call site). Replaced and removed `compactMatchingTraces`,
 `groupStructuralRecsByTrace`, and `compareTraceID` (NOTE-380's sort comparator, now dead).
+
+### NOTE-391: reconstruct outRefs from the packKey instead of a second random gather
+
+`mergeJoinFilteredRefsWithVals` was the #1 executor self-time frame after the decode hot loop
+(4.64% of querier CPU, gcx 2026-06-15 24h M8 window). Its dominant cost is the final gather loop,
+which walks `matched` (sorted by packKey via `radixSortByPackKey`) and reads
+`inRangeRefs[pos]` and `inRangeVals[pos]`. Both `inRangeRefs` and `inRangeVals` are
+**timestamp-sorted** (the caller slices `tsCol.BlockRefs[lo:hi]` / `tsVals[lo:hi]`, types.go:228),
+not packKey-sorted, so after the radix sort `pos` jumps around — two independent cache-missing
+random streams per match.
+
+Fix: `matched[i] = packKey<<32 | pos`, and a `BlockRef` is exactly `{BlockIdx uint16, RowIdx uint16}`
+with `packKey == BlockIdx<<16 | RowIdx` (blockref.go, packKey). The high 32 bits of each `matched`
+entry therefore ARE the output BlockRef's bit layout, and `matched` is already ordered by that high
+word. So `outRefs` is reconstructed directly from the packKey (sequential read of `matched`,
+zero extra memory traffic) instead of re-fetching `inRangeRefs[pos]`. Only `inRangeVals[pos]`
+remains a random read — the random-access pressure of the gather is halved. Output is byte-identical:
+the reconstructed BlockRef equals `inRangeRefs[pos]` by construction (its packKey was what put it
+in the bitset), validated by `TestMergeJoinRefs_CorrectnessVsMap` (incl. shuffled inputs and
+duplicate packkeys, output compared against an independent map reference).
+
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:mergeJoinFilteredRefsWithVals`.

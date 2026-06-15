@@ -2561,9 +2561,23 @@ func mergeJoinFilteredRefsWithVals(
 		releaseCompactUint64(outValsBacking)
 	}
 
+	// NOTE-391: reconstruct outRefs from the packKey carried in matched's high 32 bits
+	// instead of re-reading inRangeRefs[pos]. matched[i] = packKey<<32 | pos, and a
+	// BlockRef is exactly {BlockIdx uint16, RowIdx uint16} with packKey == BlockIdx<<16|RowIdx
+	// (packKey, blockref.go), so the high word IS the BlockRef bit layout. The radix sort
+	// orders matched by that high word, so this read is sequential. Previously the gather
+	// chased TWO independent random streams per match — inRangeRefs[pos] AND inRangeVals[pos]
+	// — into timestamp-sorted (not packKey-sorted, types.go:228) arrays, since pos jumps
+	// around after the sort. mergeJoinFilteredRefsWithVals was 4.64% querier self-time
+	// (gcx 2026-06-15 24h M8 window); the cache-missing scatter-gather is its dominant cost.
+	// Pulling outRefs from matched halves the random-access pressure to inRangeVals alone.
 	for _, packed := range matched {
+		pk := uint32(packed >> 32) //nolint:gosec
 		pos := int(uint32(packed)) //nolint:gosec
-		outRefs = append(outRefs, inRangeRefs[pos])
+		outRefs = append(outRefs, modules_shared.BlockRef{
+			BlockIdx: uint16(pk >> 16), //nolint:gosec
+			RowIdx:   uint16(pk),       //nolint:gosec
+		})
 		outVals = append(outVals, inRangeVals[pos])
 	}
 	releaseCompactUint64(matched)
