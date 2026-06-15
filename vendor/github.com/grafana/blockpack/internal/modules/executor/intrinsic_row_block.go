@@ -152,74 +152,106 @@ func populateTypedColumnForBlock(
 // rowIdx->pos, which here is a fixed offset). Each variant mirrors its general counterpart's
 // per-row body exactly (same bounds checks, same present bit, same source array).
 
+// NOTE-378: hoist the two per-row bounds checks (rowIdx < len(result), i < len(vals)) out of
+// the dense scatter loops. On the structural path lookupIntrinsicFieldsTypedForBlock calls
+// these once per intrinsic column per block over the full SpanCount range, so the checks run
+// O(SpanCount × columns) times per block. The dense invariant (NOTE-354) is rowIdx == minRow+i
+// and value position == i for i in [0,count); since minRow, count and both slice lengths are
+// known up front, the safe iteration count n = min(count, len(vals), len(result)-minRow) can
+// be computed once. Re-slicing the destination to res := result[minRow:minRow+n] and the
+// source to vals[:n] makes res[i] and vals[i] provably in range for i < n, so the compiler
+// discharges both checks from the loop body. When minRow >= len(result) (degenerate, should
+// not happen on a valid dense column) n clamps to 0 and the loop is skipped — identical
+// behavior to the former per-row `continue`. The shorter-slice clamp preserves the former
+// `i >= len(vals)` guard exactly: rows past either slice end were skipped before and are not
+// iterated now.
+
+// denseScatterBound returns the safe loop count n and the result sub-slice aligned so that
+// res[i] corresponds to source position i, for a dense column with the given minRow/count.
+func denseScatterBound(
+	minRow uint32,
+	count, valsLen int,
+	result []intrinsicRowFields,
+) (res []intrinsicRowFields, n int) {
+	start := int(minRow)
+	if start >= len(result) {
+		return nil, 0
+	}
+	n = count
+	if avail := len(result) - start; n > avail {
+		n = avail
+	}
+	if n > valsLen {
+		n = valsLen
+	}
+	if n <= 0 {
+		return nil, 0
+	}
+	return result[start : start+n], n
+}
+
 func scatterTraceIDDense(minRow uint32, count int, bytesVals [][]byte, result []intrinsicRowFields) {
-	for i := range count {
-		rowIdx := int(minRow) + i
-		if rowIdx >= len(result) || i >= len(bytesVals) {
-			continue
-		}
-		b := bytesVals[i]
+	res, n := denseScatterBound(minRow, count, len(bytesVals), result)
+	src := bytesVals[:n:n]
+	res = res[:n:n] // tie len(res) == len(src) == n so the loop body needs no bounds check
+	for i := range src {
+		b := src[i]
 		if len(b) == traceIDByteLen {
-			copy(result[rowIdx].traceID[:], b)
-			result[rowIdx].present |= intrinsicPresentTraceID
+			copy(res[i].traceID[:], b)
+			res[i].present |= intrinsicPresentTraceID
 		}
 	}
 }
 
 func scatterSpanIDDense(minRow uint32, count int, bytesVals [][]byte, result []intrinsicRowFields) {
-	for i := range count {
-		rowIdx := int(minRow) + i
-		if rowIdx >= len(result) || i >= len(bytesVals) {
-			continue
-		}
-		if copy8(&result[rowIdx].spanID, bytesVals[i]) {
-			result[rowIdx].present |= intrinsicPresentSpanID
+	res, n := denseScatterBound(minRow, count, len(bytesVals), result)
+	src := bytesVals[:n:n]
+	res = res[:n:n]
+	for i := range src {
+		if copy8(&res[i].spanID, src[i]) {
+			res[i].present |= intrinsicPresentSpanID
 		}
 	}
 }
 
 func scatterParentIDDense(minRow uint32, count int, bytesVals [][]byte, result []intrinsicRowFields) {
-	for i := range count {
-		rowIdx := int(minRow) + i
-		if rowIdx >= len(result) || i >= len(bytesVals) {
-			continue
-		}
-		if copy8(&result[rowIdx].parentID, bytesVals[i]) {
-			result[rowIdx].present |= intrinsicPresentParentID
+	res, n := denseScatterBound(minRow, count, len(bytesVals), result)
+	src := bytesVals[:n:n]
+	res = res[:n:n]
+	for i := range src {
+		if copy8(&res[i].parentID, src[i]) {
+			res[i].present |= intrinsicPresentParentID
 		}
 	}
 }
 
 func scatterSpanStartDense(minRow uint32, count int, uint64Vals []uint64, result []intrinsicRowFields) {
-	for i := range count {
-		rowIdx := int(minRow) + i
-		if rowIdx >= len(result) || i >= len(uint64Vals) {
-			continue
-		}
-		result[rowIdx].spanStart = uint64Vals[i]
-		result[rowIdx].present |= intrinsicPresentSpanStart
+	res, n := denseScatterBound(minRow, count, len(uint64Vals), result)
+	src := uint64Vals[:n:n]
+	res = res[:n:n]
+	for i := range src {
+		res[i].spanStart = src[i]
+		res[i].present |= intrinsicPresentSpanStart
 	}
 }
 
 func scatterSpanEndDense(minRow uint32, count int, uint64Vals []uint64, result []intrinsicRowFields) {
-	for i := range count {
-		rowIdx := int(minRow) + i
-		if rowIdx >= len(result) || i >= len(uint64Vals) {
-			continue
-		}
-		result[rowIdx].spanEnd = uint64Vals[i]
-		result[rowIdx].present |= intrinsicPresentSpanEnd
+	res, n := denseScatterBound(minRow, count, len(uint64Vals), result)
+	src := uint64Vals[:n:n]
+	res = res[:n:n]
+	for i := range src {
+		res[i].spanEnd = src[i]
+		res[i].present |= intrinsicPresentSpanEnd
 	}
 }
 
 func scatterSpanDurationDense(minRow uint32, count int, uint64Vals []uint64, result []intrinsicRowFields) {
-	for i := range count {
-		rowIdx := int(minRow) + i
-		if rowIdx >= len(result) || i >= len(uint64Vals) {
-			continue
-		}
-		result[rowIdx].spanDuration = uint64Vals[i]
-		result[rowIdx].present |= intrinsicPresentSpanDuration
+	res, n := denseScatterBound(minRow, count, len(uint64Vals), result)
+	src := uint64Vals[:n:n]
+	res = res[:n:n]
+	for i := range src {
+		res[i].spanDuration = src[i]
+		res[i].present |= intrinsicPresentSpanDuration
 	}
 }
 

@@ -125,7 +125,7 @@ by `buildPKRankIndex`. `fillPKSetAndTimeBuckets` now returns the index it built 
 `streamCountRateN1CompactCore` into `scanGroupByColCompact`, which reuses it instead of
 rebuilding. When the index is `nil` (the general-agg path, the predicate-filtered
 `…FromRefs` paths, and the parallel-groupby test) `scanGroupByColCompact` builds a local index and
-frees it — byte-identical to the pre-NOTE-348 behaviour. The reused index is provably identical to
+frees it — byte-identical to the pre-NOTE-348 behavior. The reused index is provably identical to
 the rebuilt one because both derive from the same `pkSet`/`maxPK`; `minPK` is now computed inside
 `buildPKRankIndex` (was a separate min-scan in the scan), so the bounds skip is unchanged.
 
@@ -1891,7 +1891,7 @@ not applicable" for the query `{ resource.service.name =~ "loki-.*" && span.http
 After the gate change from `ProgramIsIntrinsicOnly` to `hasSomeIntrinsicPredicates` (NOTE-038),
 this query now takes Case C (mixed + no sort): the intrinsic pre-filter narrows candidates
 by service name, then VM re-evaluation eliminates all rows because no spans have http.method
-set. The comment was updated to accurately describe Case C behaviour.
+set. The comment was updated to accurately describe Case C behavior.
 
 ---
 
@@ -3841,7 +3841,7 @@ Back-ref: `internal/modules/executor/column_provider.go:acquireBlockColumnProvid
 **Decision:** Add `WantColumns map[string]struct{}` field to `vm.Program`. Populated once at compile time by `program.ComputeWantColumns()` (called at the end of `CompileTraceQLFilter`, `CompileTraceQLFilterWithOptions`, the metrics compiler, `logqlparser.Compile`, and `logqlparser.CompileAll`). `ProgramWantColumns` returns this cached map directly when `len(extra) == 0`. When `len(extra) > 0`, `ProgramWantColumns` copies the cached set and merges extra — O(cached-set-size + extra) — rather than re-walking the predicate tree. `ProgramWantColumns` is called from 6 distinct locations across the executor package (computeColumnFilters, ExecuteLogMetrics, stream_log.go, stream_log_topk.go, metrics_trace.go, predicates.go:ComputeSecondPassCols).
 **Rationale:** `ProgramWantColumns` was called once per file and once per second-pass decode, walking the `RangeNode` tree and building a new `map[string]struct{}` each time. For 10 000 files per query, this was 10 000 map allocations + tree walks. Since `Program` is immutable after compilation, the column set never changes — caching it eliminates all per-file allocs on the hot path.
 **Immutability invariant:** `WantColumns` is written once at compile time and never modified after that. Callers must not mutate the returned map. When extra columns are needed (`len(extra) > 0`), `ProgramWantColumns` returns a fresh copy.
-**Legacy programs:** Programs constructed manually (e.g. in tests, or via the `compileMatchAllProgram` path) have `WantColumns == nil`. `ProgramWantColumns` still falls through to the tree-walk path, so behaviour is unchanged for those callers.
+**Legacy programs:** Programs constructed manually (e.g. in tests, or via the `compileMatchAllProgram` path) have `WantColumns == nil`. `ProgramWantColumns` still falls through to the tree-walk path, so behavior is unchanged for those callers.
 **LogQL programs:** `logqlparser.Compile` and `logqlparser.CompileAll` also call `ComputeWantColumns()` so LogQL programs benefit from the same compile-time cache.
 Back-ref: `internal/vm/program.go:ComputeWantColumns`, `internal/modules/executor/predicates.go:ProgramWantColumns`
 
@@ -5279,7 +5279,7 @@ variants — the count/rate path had already split this out as `streamCountRateN
 but agg and histogram had not followed suit. Extracted `streamAggN1CompactCore` and
 `streamHistogramN1CompactCore`, each taking `sortedPKs`/`timeBucketByPos` and the agg spec;
 both the set-building unfiltered entry point and the pre-sorted FromRefs entry point now call
-the shared core. Net ~140 fewer lines, no behaviour change.
+the shared core. Net ~140 fewer lines, no behavior change.
 
 **Verification:** new equivalence tests `TestStreamAggN1Compact_UnfilteredEqualsFromRefs` and
 `TestStreamHistogramN1Compact_UnfilteredEqualsFromRefs` feed both entry points the same logical
@@ -5660,3 +5660,35 @@ B/op (-16.6%).
 Back-ref: `internal/modules/executor/stream_structural.go:collectAllStructuralSpans`,
 `groupStructuralRecsByTrace`, `resolveStructuralParentIndices`, `evalStructuralMatches`,
 `compareTraceID`
+
+## NOTE-378: Hoist per-row bounds checks out of the dense scatter loops (2026-06-15)
+
+`populateTypedColumnForBlock` routes flat-dense intrinsic columns (NOTE-354) through the
+`scatter*Dense` family, which `lookupIntrinsicFieldsTypedForBlock` calls once per intrinsic
+column per block over the full SpanCount row range on the structural path. Each former loop
+body paid two bounds checks per row — `rowIdx >= len(result)` and `i >= len(vals)` — that the
+compiler could not eliminate, so the checks ran O(SpanCount × columns) times per block.
+`populateTypedColumnForBlock` was the top executor self-time frame (0.79% of querier CPU,
+gcx profile 2026-06-15).
+
+The dense invariant (NOTE-354) is `rowIdx == minRow + i` and value position `== i` for
+`i in [0, count)`. Since `minRow`, `count` and both slice lengths are known up front, the
+safe iteration count `n = min(count, len(vals), len(result)-minRow)` is computed once in
+`denseScatterBound`, which also returns the destination sub-slice `result[minRow:minRow+n]`
+aligned so that `res[i]` corresponds to source position `i`. With both `res` and the source
+window re-sliced to length `n`, `res[i]` and `src[i]` are provably in range for `i < n`, so
+the compiler discharges both bounds checks from the loop body — leaving a tight typed write.
+
+**Correctness:** the clamp preserves the former per-row `continue` exactly. Rows where
+`rowIdx >= len(result)` or `i >= len(vals)` were skipped before; now they are simply not
+iterated (n stops at the shorter bound). When `minRow >= len(result)` (degenerate, not
+expected on a valid dense column) `n` clamps to 0 and the loop is skipped, matching the
+former all-`continue` behavior. The non-dense (`BlockRefRange`) path is untouched.
+
+**Verified:** `go test -race ./internal/modules/executor/...` green incl. all
+TestStructural/TestExecuteStructural/TestResolveStructuralParentIndices. `make precommit`
+fully green (deadcode, fieldalignment, staticcheck clean).
+
+Back-ref: `internal/modules/executor/intrinsic_row_block.go:denseScatterBound`,
+`scatterTraceIDDense`, `scatterSpanIDDense`, `scatterParentIDDense`, `scatterSpanStartDense`,
+`scatterSpanEndDense`, `scatterSpanDurationDense`
