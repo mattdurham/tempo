@@ -5738,3 +5738,27 @@ stable sort would protect; the only "equal" comparisons are within one trace, ex
 nothing downstream depends on.
 
 Back-ref: `internal/modules/executor/stream_structural.go:groupStructuralRecsByTrace`
+
+## NOTE-381 — Decorate-sort-undecorate for MatchedRow timestamp ordering (2026-06-15)
+
+Two identical sort sites in `stream.go` (the `forEachBlockInGroups` re-sort after the scan and
+KLL intrinsic top-K paths) re-ordered `[]MatchedRow` by their timestamp column to restore the
+newest-first ordering that block reads destroy. Both used `slices.SortStableFunc` with a
+comparator that called `Block.GetColumn(tsColumn).Uint64Value(RowIdx)` for **both** operands on
+**every** comparison — O(n log n) lazy-column probes per sort. Each `Uint64Value` is not free:
+`needsDecode` check, `expandDenseIdx`, `IsPresent`, `dictIdxAt` (packed-index lookup), and a dict
+array index. The stable comparator also routed through the symmerge path (`rotateCmpFunc` +
+`symMergeCmpFunc` + `swapRangeCmpFunc` ~2.8% combined querier self-CPU, gcx 2026-06-15).
+
+Replaced with `sortMatchedRowsByTimestamp`, a decorate-sort-undecorate:
+1. Read each row's timestamp **once** into a parallel `[]uint64` keys slice — O(n) column probes.
+2. Sort an index permutation (`[]int`) by the precomputed keys via `slices.SortFunc` (unstable
+   pdqsort). The comparator is a single `cmp.Compare(keys[a], keys[b])` — no column access.
+3. Gather rows into sorted order through the permutation.
+
+Column probes drop from O(n log n) to O(n); the comparator is an integer compare. Stability is
+not needed: the pre-sort order is `forEachBlockInGroups`' (BlockIdx, RowIdx) layout, which is not
+a meaningful tie-break for a timestamp ordering — equal-timestamp rows have no semantic order to
+preserve. The two call sites now share one helper instead of duplicating the comparator.
+
+Back-ref: `internal/modules/executor/stream.go:sortMatchedRowsByTimestamp`
