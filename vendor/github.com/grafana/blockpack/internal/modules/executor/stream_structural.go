@@ -257,8 +257,63 @@ func collectAllStructuralSpans(
 		}
 	}
 
+	// NOTE-386: drop entire non-matching traces BEFORE the group-by sort. A trace can
+	// contribute a structural match only if at least one of its spans matched a node
+	// (nodeMatch != 0) — this holds for every op type including negation, where the
+	// qualifying side is the RHS bit (0x02), itself a nonzero nodeMatch (see traceCanMatch).
+	// groupStructuralRecsByTrace sorts the FULL flat population (O(n log n) 16-byte compares),
+	// and on the dominant structural workload most traces match no node at all (Q9 returns 0
+	// traces over a large span population). compactMatchingTraces first records the trace IDs
+	// that carry ≥1 matched span (one map insert per matched span — cheap when few match), then
+	// keeps only records whose trace ID is in that set. Whole traces are kept or dropped as a
+	// unit: a kept trace retains ALL its spans (including nodeMatch==0 intermediates) so the
+	// parent-topology chain that resolveStructuralParentIndices walks stays intact. The sort
+	// then runs over only the surviving (potentially matching) records. When every trace matches
+	// the compaction is a no-op pass and the set is freed immediately after.
+	flat = compactMatchingTraces(flat)
 	result := groupStructuralRecsByTrace(flat)
 	return result, parsedBlocks, nil
+}
+
+// compactMatchingTraces removes records belonging to traces that have no matched span
+// (every span's nodeMatch == 0), compacting flat in place. See NOTE-386. The returned slice
+// aliases flat's backing array (a prefix); the surplus tail is left untouched. Records are
+// not reordered, so the subsequent group-by sort sees the same relative order it would have.
+func compactMatchingTraces(flat []structuralSpanRec) []structuralSpanRec {
+	if len(flat) == 0 {
+		return flat
+	}
+	// First pass: collect the trace IDs that carry at least one matched span, and note whether
+	// any record matched no node at all. If every record matched (the all-matching workload),
+	// no trace can be dropped — return flat untouched and skip the second pass entirely so the
+	// matched-set map is the only added cost. The common structural workload is the opposite:
+	// most records carry nodeMatch==0 and whole traces fall away.
+	matched := make(map[[16]byte]struct{})
+	anyUnmatched := false
+	for i := range flat {
+		if flat[i].nodeMatch != 0 {
+			matched[flat[i].traceID] = struct{}{}
+		} else {
+			anyUnmatched = true
+		}
+	}
+	if len(matched) == 0 {
+		// No trace can match — drop everything, skipping the sort entirely.
+		return flat[:0]
+	}
+	if !anyUnmatched {
+		// Every record matched a node; no trace is droppable.
+		return flat
+	}
+	// Second pass: keep records whose trace ID is in the matched set.
+	w := 0
+	for i := range flat {
+		if _, ok := matched[flat[i].traceID]; ok {
+			flat[w] = flat[i]
+			w++
+		}
+	}
+	return flat[:w]
 }
 
 // structuralBlockPlan holds the per-query, block-independent inputs to

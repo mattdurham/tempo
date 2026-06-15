@@ -5849,3 +5849,29 @@ N>1 chain path (`evalOpChain`) uses map-set semantics and ignores the buffer; on
 
 Back-ref: `internal/modules/executor/stream_structural.go:evalStructuralMatches`,
 `applyStructuralOps`, `applyStructuralOp`, and the eight single-op evaluators.
+
+### NOTE-386: drop whole non-matching traces before the structural group-by sort
+
+`groupStructuralRecsByTrace` sorts the FULL flat span population by 16-byte trace ID (O(n log n)
+two-uint64 compares) to carve contiguous per-trace windows. On the dominant structural workload
+most traces match no node predicate at all — the measured Q9 (`{a} >> {b}`) returns 0 traces over a
+large span population — so the entire sort is spent ordering records that the downstream
+`traceCanMatch` gate (NOTE-382/383) will discard anyway.
+
+Fix: `compactMatchingTraces` runs once before the sort. Pass 1 records every trace ID that carries
+at least one matched span (`nodeMatch != 0`) into a set — one map insert per matched span, cheap
+when few match. Pass 2 keeps only records whose trace ID is in that set, compacting `flat` in place
+(order-preserving, aliases the same backing array). The sort then runs over only the surviving
+records.
+
+Correctness: a trace can satisfy ANY structural op only if some span matched a node. For positive
+ops the chain requires every node bit present (a superset of "≥1 matched span"); for negation ops
+`traceCanMatch` requires the RHS bit `0x02`, itself a nonzero `nodeMatch`. So "trace has ≥1 span
+with `nodeMatch != 0`" is a conservative superset filter for every op type — it never drops a trace
+that could match. Whole traces are kept or dropped as a unit: a kept trace retains ALL its spans,
+including `nodeMatch==0` intermediate ancestors, so the parent-topology chain walked by
+`resolveStructuralParentIndices` and the `>>`/`<<` ancestor-chain evaluators stays intact. The
+all-unmatched case (`len(matched)==0`) returns `flat[:0]`, skipping the sort entirely.
+
+Back-ref: `internal/modules/executor/stream_structural.go:compactMatchingTraces`,
+`collectAllStructuralSpans` (call site before `groupStructuralRecsByTrace`).
