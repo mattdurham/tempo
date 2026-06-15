@@ -35,13 +35,33 @@ var internMapPool = &sync.Pool{ //nolint:gochecknoglobals
 	},
 }
 
+// internMapMaxPooledEntries caps the entry count a pooled intern map may have grown to
+// before ReleaseInternMap will return it to the pool (NOTE-368). Go's map never shrinks its
+// bucket array on clear() — a map that grew to N entries for one high-cardinality block keeps
+// that ~N-bucket backing array for the lifetime of the pooled handle, even though clear()
+// empties it. The querier scans one block per goroutine through this pool; a single wide
+// high-cardinality block (e.g. a unique-string attribute column) inflates a map to tens of
+// thousands of buckets, then that bloated handle is reused for every subsequent (typically
+// small) block, pinning the large array permanently. internString was a top querier
+// inuse_space self-frame (~332 MB) — partly the interned strings (which legitimately escape
+// to StringDict) but also these never-reclaimed grown bucket arrays. Dropping an oversized
+// map lets the big bucket array be GC'd; the pool re-seeds a fresh 64-entry map on next Get.
+const internMapMaxPooledEntries = 4096
+
 // AcquireInternMap returns a pooled intern map, cleared and ready for use.
 func AcquireInternMap() *map[string]string {
 	return internMapPool.Get().(*map[string]string)
 }
 
-// ReleaseInternMap clears the map and returns it to the pool.
+// ReleaseInternMap clears the map and returns it to the pool, UNLESS it grew past
+// internMapMaxPooledEntries (NOTE-368) — an oversized map's bucket array is dropped (left for
+// GC) rather than pooled, so a single high-cardinality block can't pin a large map indefinitely.
 func ReleaseInternMap(mp *map[string]string) {
+	if len(*mp) > internMapMaxPooledEntries {
+		// Drop the bloated backing array; do not return it to the pool. The next Get
+		// allocates a fresh 64-entry map.
+		return
+	}
 	clear(*mp)
 	internMapPool.Put(mp)
 }

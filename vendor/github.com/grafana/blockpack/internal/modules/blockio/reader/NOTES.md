@@ -2839,3 +2839,39 @@ Back-ref: `columnar_read.go` (`readBlockColumnarWithCache` sizing pass, `fetchCo
 Test/bench: `assembled_buffer_note367_test.go`, `columnar_read_note367_bench_test.go`. Updated
 `TestReader_PreCompressedColumns_DecodeFromStashedBlob` (sectioncache_test.go) to extract column
 blobs from the full block bytes since the columnar buffer no longer carries column data.
+
+## NOTE-368: drop oversized intern maps on release instead of pooling them (LRU-free pool cap)
+
+**Problem.** `internString` was a top querier `memory:inuse_space` self-frame (~332 MB warm).
+Part of that is the interned strings themselves, which legitimately escape into
+`Column.StringDict` and are retained for the cached column's lifetime — that part is unavoidable.
+But a second, reclaimable part is the **bucket arrays of the pooled intern maps**. `internMapPool`
+(NOTE-006) hands one `map[string]string` per scanned block to the streaming scan (`stream.go`
+acquires/releases one per block), and `ReleaseInternMap` only `clear()`s the map before
+`Put`-ting it back. Go's runtime map **never shrinks its bucket array on `clear()`** — a map that
+grew to N entries for one high-cardinality block (e.g. a wide unique-string attribute column with
+tens of thousands of distinct values) keeps that ~N-bucket backing array for the entire lifetime
+of the pooled handle. Since the querier scans one block per goroutine through this pool, a single
+saturated block per GOMAXPROCS worth of pooled handles inflates each handle's map to a large
+bucket array, and every subsequent (typically small) block reuses that bloated handle — pinning
+the large array permanently across the whole pool.
+
+**Fix.** `ReleaseInternMap` now checks `len(*mp)` against `internMapMaxPooledEntries` (4096) and
+**drops** an oversized map (returns without `Put`) so its large bucket array becomes collectable;
+the next `Get` allocates a fresh 64-entry map from the pool's `New`. This mirrors the cap-guard
+pattern already used by `presentRowsScratchPool` (NOTE-007), `decompBufPool` (NOTE-346) and
+`assembledBufPool` (NOTE-367 / `assembledBufMaxPooledCap`): a pool that recycles backing storage
+must bound the storage it retains, or one outlier sizes the steady-state floor for the whole pool.
+
+**Why it is safe.** Strings interned during parsing have already escaped to heap-allocated
+`StringDict` entries (NOTE-006), so dropping the map handle never corrupts previously interned
+data — it only forfeits the reuse of one (bloated) bucket array. Correctness is identical; the
+only effect is that a rare high-cardinality block pays one fresh `make(map)` on the next acquire
+instead of pinning its grown array forever.
+
+**Effect.** Microbench `TestInternMapPool_*` (single local pool, 50 churn cycles of a 100k-entry
+map then 8 small acquires): pooled `HeapInuse` after the churn drops 7056 KB → 1680 KB (−76%).
+In production the absolute saving scales with concurrency (one bloated handle per GOMAXPROCS
+worker), directly reducing the reclaimable share of the `internString` inuse_space frame.
+Back-ref: `column.go` (`ReleaseInternMap`, `internMapMaxPooledEntries`).
+Test/bench: `internmap_note368_test.go`.
