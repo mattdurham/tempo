@@ -1264,21 +1264,25 @@ func decodePagesParallel(
 
 	var (
 		next     atomic.Int64 // next page index to claim (work-stealing for balanced load)
+		failed   atomic.Bool  // NOTE-374: lock-free per-page abort gate (was a mutex-guarded read)
 		mu       sync.Mutex
 		firstErr error
 		wg       sync.WaitGroup
 	)
+	// NOTE-374: split the abort signal (atomic.Bool, polled once per page) from the error
+	// capture (mutex, hit at most once per worker on the error path). decodePagesParallel
+	// runs over hundreds of small Delta/XOR pages per hot column; the previous hasErr()
+	// acquired and released a sync.Mutex on EVERY page iteration purely to read whether any
+	// worker had failed — a per-page lock on the happy path where firstErr is always nil. A
+	// single atomic.Bool load is branch-light and contention-free, so the abort poll no longer
+	// serializes the workers. The mutex now guards only the rare first-error store.
 	setErr := func(e error) {
 		mu.Lock()
 		if firstErr == nil {
 			firstErr = e
 		}
 		mu.Unlock()
-	}
-	hasErr := func() bool {
-		mu.Lock()
-		defer mu.Unlock()
-		return firstErr != nil
+		failed.Store(true)
 	}
 
 	wg.Add(workers)
@@ -1294,9 +1298,17 @@ func decodePagesParallel(
 			pageBuf := AcquireIntrinsicBuf()
 			defer ReleaseIntrinsicBuf(pageBuf)
 
+			// NOTE-374: one worker-local slot struct reused across this worker's pages instead
+			// of a fresh &IntrinsicColumn per page. Each worker decodes its claimed pages
+			// serially, so re-pointing slot's value slice each iteration is safe — the append
+			// helpers only read Type/Format and write into the value slice + Count, and the
+			// regions are disjoint across pages. Eliminates one heap alloc per page (hundreds
+			// per hot column per block).
+			slot := &IntrinsicColumn{Type: toc.ColType, Format: toc.Format}
+
 			for {
 				i := int(next.Add(1)) - 1
-				if i >= len(toc.Pages) || hasErr() {
+				if i >= len(toc.Pages) || failed.Load() {
 					return
 				}
 				pm := toc.Pages[i]
@@ -1318,7 +1330,9 @@ func decodePagesParallel(
 				// slot aliases merged's disjoint [off:off+rc) region with len 0, cap rc.
 				// The append helpers fill exactly rc entries — never exceeding cap, so they
 				// stay within this goroutine's region and never reallocate or alias others.
-				slot := &IntrinsicColumn{Type: toc.ColType, Format: toc.Format}
+				// NOTE-374: slot is reused across this worker's pages; re-point and reset its
+				// value slice + Count before each page decode.
+				slot.Count = 0
 				if isBytes {
 					slot.BytesValues = merged.BytesValues[off : off : off+rc]
 				} else {

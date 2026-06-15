@@ -2134,3 +2134,29 @@ budget, worst for many-small-object caches where struct overhead dominates the d
 Back-ref: `types.go` (`intrinsicColumnFixedOverhead`, `IntrinsicColumn.SizeBytes`). Test:
 `intrinsic_sizebytes_test.go` (`TestIntrinsicColumnSizeBytesIncludesFixedOverhead`); updated
 `TestLazyRefsSizeBytesAccounting` and `TestRefDenseFlat_DropsRefIndex` for the new fixed term.
+
+## NOTE-374: lock-free per-page abort gate + worker-local slot in decodePagesParallel
+
+`decodePagesParallel` work-steals pages via `next atomic.Int64`, and each worker polled
+whether any sibling had errored before claiming the next page. That poll went through a
+`hasErr()` helper that **acquired and released a `sync.Mutex` on every page iteration** purely
+to read `firstErr != nil`. Hot Delta (`span:start`) and XOR (`trace:id`/`span:id`) columns
+carry hundreds of small pages per block, and queriers decode many blocks concurrently, so the
+per-page lock serialized the abort poll on the happy path where `firstErr` is always nil.
+
+**Fix:** split the abort signal from the error capture. A `failed atomic.Bool` is polled once
+per page with a single contention-free load (`failed.Load()`); the `sync.Mutex` now guards
+only the rare first-error store inside `setErr`, which also flips `failed`. The happy path no
+longer takes a lock per page.
+
+Also reuse one worker-local `slot := &IntrinsicColumn{...}` across that worker's pages instead
+of allocating a fresh struct per page. Each worker decodes its claimed pages serially, so
+re-pointing `slot`'s value slice and resetting `slot.Count` each iteration is safe — the
+append helpers only read `Type`/`Format` and write the value slice + `Count` into a disjoint
+`[off:off:off+rc]` region. `merged.Count` is set to `totalRows` after the join, so the
+per-slot Count is discarded. (On escape-analyzed builds the slot may not heap-escape; the
+reuse keeps it stack-friendly regardless of page count and removes any per-page escape.)
+
+Back-ref: `intrinsic_codec.go` (`decodePagesParallel`). Pure synchronization/allocation
+change — output is byte-for-byte identical; covered by the existing parallel-vs-serial
+equivalence tests in `intrinsic_parallel_decode_test.go`.
