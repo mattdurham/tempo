@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"sync"
 	"time"
 
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
@@ -16,6 +17,101 @@ import (
 	"github.com/grafana/blockpack/internal/modules/queryplanner"
 	"github.com/grafana/blockpack/internal/vm"
 )
+
+// NOTE-376: packedRefSet is a dense bitset membership test over packed
+// (blockIdx<<16|rowIdx) ref keys, replacing the map[uint32]struct{} match-set in
+// collectIntrinsicTopKScan. For a high-cardinality intrinsic equality (e.g. a
+// service-name match covering a large fraction of spans), the match set holds M refs —
+// up to the full span count of the shard — and was built as a hash map (~48B/entry plus
+// per-row hash+probe on the subsequent timestamp blob scan). Packed keys are a bounded
+// 32-bit value and, for the single-block query-frontend shard, span the tight contiguous
+// range [block<<16, block<<16+maxRow]; offsetting the bitset by the minimum packed key
+// sizes it to (maxPacked-minPacked+1) bits (~spanCount/8 bytes) regardless of how high
+// the block index sits. Build is a sequential bit-set per ref and membership is a
+// branch-free word load + shift — both strictly cheaper than the hashmap on the dominant
+// dense path. The backing []uint64 is pooled; on acquire only the in-range word span is
+// cleared (the set is a zero-sentinel membership set), so a reused dirty buffer costs only
+// the words this call actually addresses.
+type packedRefSet struct {
+	words  []uint64
+	offset uint32 // subtracted from packed key before indexing (== minPacked)
+}
+
+var packedRefSetWordsPool = sync.Pool{
+	New: func() any {
+		s := make([]uint64, 0)
+		return &s
+	},
+}
+
+// packedRefSetWordCap bounds the backing array kept in the pool. A pathologically wide
+// packed-key range (sparse refs across many high block indices) could grow the bitset far
+// beyond steady-state need; such buffers are dropped on release so the pool footprint stays
+// bounded (mirrors the cap-guard discipline used elsewhere, e.g. radixBufCap).
+const packedRefSetWordCap = 1 << 20 // 1Mi words = 8 MiB = up to ~64M packed keys
+
+// buildPackedRefSet returns a membership set over the packed keys of refs. The caller MUST
+// call release() once it is done probing the set so the backing buffer returns to the pool.
+func buildPackedRefSet(refs []modules_shared.BlockRef) packedRefSet {
+	if len(refs) == 0 {
+		return packedRefSet{}
+	}
+	minPK := uint32(refs[0].BlockIdx)<<16 | uint32(refs[0].RowIdx)
+	maxPK := minPK
+	for _, ref := range refs[1:] {
+		pk := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx)
+		if pk < minPK {
+			minPK = pk
+		} else if pk > maxPK {
+			maxPK = pk
+		}
+	}
+	span := maxPK - minPK + 1
+	nWords := int((span + 63) / 64)
+
+	wp := packedRefSetWordsPool.Get().(*[]uint64)
+	if cap(*wp) < nWords {
+		*wp = make([]uint64, nWords)
+	} else {
+		*wp = (*wp)[:nWords]
+		// Zero-sentinel set: clear only the words this call addresses; a reused dirty
+		// buffer's bits all lie within [0,nWords) since every member maps into that span.
+		clear(*wp)
+	}
+	words := *wp
+
+	for _, ref := range refs {
+		pk := (uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx)) - minPK
+		words[pk>>6] |= 1 << (pk & 63)
+	}
+	return packedRefSet{words: words, offset: minPK}
+}
+
+// contains reports whether packed key pk is a member. pk values outside the built range
+// are not members (the offset-relative index would underflow/overrun), so they are gated.
+func (s packedRefSet) contains(pk uint32) bool {
+	if s.words == nil || pk < s.offset {
+		return false
+	}
+	rel := pk - s.offset
+	w := int(rel >> 6)
+	if w >= len(s.words) {
+		return false
+	}
+	return s.words[w]>>(rel&63)&1 != 0
+}
+
+// release returns the backing buffer to the pool. A zero-value set (nil words) is a no-op.
+func (s packedRefSet) release() {
+	if s.words == nil {
+		return
+	}
+	if cap(s.words) > packedRefSetWordCap {
+		return // drop oversized buffer; let it be GC'd
+	}
+	w := s.words[:0]
+	packedRefSetWordsPool.Put(&w)
+}
 
 // errNeedBlockScan is returned by collectFromIntrinsicRefs when the intrinsic pre-filter
 // is not applicable and the caller should fall through to a full block scan.
@@ -1320,13 +1416,14 @@ func collectIntrinsicTopKScan(
 	backward := opts.Direction == queryplanner.Backward
 	limit := opts.Limit
 
-	// Build a hash set for O(1) per-row membership tests during the blob scan.
-	// Previously this was a sorted []uint32 + slices.BinarySearch (O(log M) per row),
-	// which caused 43% CPU flat in pprof for files with 1M spans. See NOTE-043.
-	matchSet := make(map[uint32]struct{}, len(refs))
-	for _, ref := range refs {
-		matchSet[uint32(ref.BlockIdx)<<16|uint32(ref.RowIdx)] = struct{}{}
-	}
+	// NOTE-376: dense bitset for O(1) per-row membership tests during the blob scan.
+	// Previously a map[uint32]struct{} (NOTE-043 replaced a sorted []uint32 binary search
+	// with this hash set; it was 43% CPU flat in pprof for files with 1M spans). The packed
+	// keys are a bounded, typically dense 32-bit range, so a bitset offset by the minimum
+	// packed key is both cheaper to build (sequential bit-set, no hashing/rehash growth) and
+	// cheaper to probe (branch-free word load) than the hash map. See packedRefSet.
+	matchSet := buildPackedRefSet(refs)
+	defer matchSet.release()
 
 	tsBlob, tsBlobErr := r.GetIntrinsicColumnBlob(opts.TimestampColumn)
 	if tsBlobErr != nil || tsBlob == nil {
@@ -1348,8 +1445,7 @@ func collectIntrinsicTopKScan(
 				return false
 			}
 			key := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx)
-			_, found := matchSet[key]
-			return found
+			return matchSet.contains(key)
 		},
 	)
 	qs.ExecutionPath = ExecPathIntrinsicTopKScan

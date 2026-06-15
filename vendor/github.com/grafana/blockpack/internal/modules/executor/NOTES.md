@@ -5571,3 +5571,39 @@ and single-block key sets). Cold/warm behavior unchanged — this is pure scratc
 
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:buildPKRankIndex`,
 `scanAggColHistogramCompact`
+
+## NOTE-376: Dense bitset match-set in collectIntrinsicTopKScan (2026-06-15)
+
+**Problem:** `collectIntrinsicTopKScan` (the large-M intrinsic top-K path, taken when a
+single-equality intrinsic predicate like `resource.service.name = X` matches more than
+`SortScanThreshold` refs) built a `map[uint32]struct{}` over ALL M matching packed
+(`blockIdx<<16|rowIdx`) refs, then scanned the entire timestamp blob calling one map lookup
+per row. For a high-cardinality intrinsic equality covering a large fraction of the shard's
+spans, M approaches the full span count: the hash map costs ~48 B/entry plus rehash growth on
+build, and a hash+probe per row on the subsequent O(N) blob scan. This dominated the slow
+high-match search (a `resource.service.name` equality ran ~18x slower than a low-cardinality
+`span.kind` equality in the 3h benchmark).
+
+**Fix:** replace the map with `packedRefSet`, a dense `[]uint64` bitset offset by the minimum
+packed key. Packed keys are a bounded 32-bit value; for the single-block query-frontend shard
+they span the tight contiguous range `[block<<16, block<<16+maxRow]`, so offsetting by `minPK`
+sizes the bitset to `(maxPK-minPK+1)` bits (~`spanCount/8` bytes) no matter how high the block
+index sits. Build is a sequential `words[pk>>6] |= 1<<(pk&63)` per ref; membership is a
+branch-free word load + shift gated on `pk >= offset` and `word < len(words)`. Both are strictly
+cheaper than the hash map on the dominant dense path. The backing `[]uint64` is pooled
+(`packedRefSetWordsPool`); on a reused buffer only the in-range words are `clear()`'d because the
+set is a zero-sentinel membership set and every member maps into `[0,nWords)`. Oversized buffers
+(> `packedRefSetWordCap` = 8 MiB) are dropped on release to bound the pool footprint.
+
+**Correctness:** `contains` returns false for any packed key below `offset` or beyond the word
+span, so keys not present in the original ref set (which are exactly the keys outside
+`[minPK,maxPK]` plus the unset bits inside it) are correctly non-members — identical to the map's
+`_, found := matchSet[key]`. `release()` is deferred so the buffer returns to the pool on every
+exit path; a zero-value set (empty refs) has nil words and both `contains` and `release` no-op.
+
+**Verified:** `go test -race ./internal/modules/executor/...` green incl. new
+TestPackedRefSet_MatchesMap (random ref sets, asserts `contains` == map membership across the
+full key space, run twice through the pool so pass 2 acquires a dirty buffer). Cold/warm behavior
+unchanged — this is membership-structure substitution on the existing scan path.
+
+Back-ref: `internal/modules/executor/stream.go:collectIntrinsicTopKScan`, `packedRefSet`
