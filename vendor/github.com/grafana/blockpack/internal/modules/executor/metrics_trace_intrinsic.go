@@ -4427,6 +4427,87 @@ const histFlatStride = 64
 // For flat-format columns this is O(numValues) — a fallback that returns histFlatStride early
 // if cardinality is high, so the caller can allocate the full cap instead.
 // The return value is in [0, histFlatStride]; callers add 1 for the absent sentinel slot.
+// countDeltaHistogramBoundariesGallop counts distinct histogram boundary buckets for a
+// sorted-ascending DeltaUint64 value column (NOTE-396). The values are sorted (NOTE-123) and the
+// boundary slot (frexpExpPos of the scaled value) is monotonically non-decreasing, so distinct
+// boundaries appear in contiguous runs. The former linear walk (NOTE-379) still touched EVERY value
+// (one frexpExpPos per row), which on the M8 duration column is an O(rows) pass over millions of
+// rows purely to size groupCountsFlat — the 24h CPU profile attributed ~1% of total querier
+// self-time to this count alone (separate from the real histogram scan). Because the slot only ever
+// increases, the boundary of each same-slot run is found by an exponential probe forward from the
+// run start followed by a binary search, so the whole column is counted in
+// O(distinct_slots * log(run_len)) value reads instead of O(rows). distinct_slots is capped at
+// histFlatStride (64), so this is at most ~64*log(n) frexpExpPos calls regardless of column size.
+// The result is identical to the linear walk: exactly the distinct slots actually present plus one
+// for the leading v<=0 run (which, for sorted data, is a contiguous prefix).
+func countDeltaHistogramBoundariesGallop(vals []uint64, scaleByNano bool, expLo int) int {
+	n := len(vals)
+	// slotAt returns (slot, isZeroBucket) for vals[i] under the same scaling/sign rules as the
+	// linear walk. v<=0 (after optional nano scale) maps to the single zero bucket.
+	slotAt := func(i int) (int, bool) {
+		v := float64(vals[i])
+		if scaleByNano {
+			v /= 1e9
+		}
+		if v <= 0 {
+			return 0, true
+		}
+		return frexpExpPos(v) - expLo, false
+	}
+	// runEnd galloping-searches the first index > start whose slot differs from start's slot
+	// (or, when zeroRun, the first non-zero index). Slots are non-decreasing, so the run is
+	// contiguous. Returns the index one past the run.
+	runEnd := func(start, curSlot int, zeroRun bool) int {
+		sameAs := func(i int) bool {
+			s, z := slotAt(i)
+			if zeroRun {
+				return z
+			}
+			return s == curSlot
+		}
+		lo := start
+		step := 1
+		for lo+step < n && sameAs(lo+step) {
+			lo += step
+			step <<= 1
+		}
+		hi := lo + step
+		if hi > n {
+			hi = n
+		}
+		for lo+1 < hi {
+			mid := lo + (hi-lo)/2
+			if sameAs(mid) {
+				lo = mid
+			} else {
+				hi = mid
+			}
+		}
+		return lo + 1
+	}
+
+	count := 0
+	i := 0
+	// Leading v<=0 run (contiguous prefix for sorted-ascending values) → single zero bucket.
+	if i < n {
+		if _, isZero := slotAt(i); isZero {
+			count++
+			i = runEnd(i, 0, true)
+		}
+	}
+	// Remaining positive values: count distinct monotonic non-decreasing slots, galloping past
+	// each same-slot run.
+	for i < n {
+		curSlot, _ := slotAt(i)
+		count++
+		if count >= histFlatStride {
+			return histFlatStride
+		}
+		i = runEnd(i, curSlot, false)
+	}
+	return count
+}
+
 func countIntrinsicHistogramBoundaries(col *modules_shared.IntrinsicColumn, fieldName string) int {
 	// NOTE-352: distinct boundaries are counted by distinct binary EXPONENT rather than by
 	// inserting each pow2 boundary float into a map[float64]struct{}. Every positive value maps
@@ -4452,34 +4533,7 @@ func countIntrinsicHistogramBoundaries(col *modules_shared.IntrinsicColumn, fiel
 	// values remain sorted and the monotonicity argument holds. The result is identical to the
 	// generic seenExp count for any sorted-ascending input.
 	if col.Format == modules_shared.IntrinsicFormatDeltaUint64 {
-		count := 0
-		zeroSeen := false
-		prevSlot := -1 // last positive boundary slot recorded; -1 = none yet
-		for _, u := range col.Uint64Values {
-			v := float64(u)
-			if scaleByNano {
-				v /= 1e9
-			}
-			if v <= 0 {
-				if !zeroSeen {
-					zeroSeen = true
-					count++
-				}
-				continue
-			}
-			slot := frexpExpPos(v) - expLo
-			if slot != prevSlot {
-				// Monotonic non-decreasing slot: a value differing from the immediately
-				// preceding positive boundary is a new distinct boundary (it can never
-				// re-appear later because the sequence never decreases).
-				prevSlot = slot
-				count++
-				if count >= histFlatStride {
-					return histFlatStride
-				}
-			}
-		}
-		return count
+		return countDeltaHistogramBoundariesGallop(col.Uint64Values, scaleByNano, expLo)
 	}
 
 	seenExp := make([]bool, expHi-expLo)

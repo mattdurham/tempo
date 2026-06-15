@@ -6001,3 +6001,36 @@ NOTE-392 (`>>`/`!>>` existence), now extended to `<<` collect-all. `<` (`evalOpP
 single-hop test and needs no memo.
 
 Back-ref: `internal/modules/executor/stream_structural.go:evalOpAncestorStruct`.
+
+## NOTE-396: Galloping boundary count over sorted DeltaUint64 histogram values (2026-06-15)
+
+`countIntrinsicHistogramBoundaries` is called once per accumulate to count the distinct histogram
+boundary buckets so `streamHistogramN1CompactCore` can size `groupCountsFlat`
+(`numGroups*actualStride*numSteps` int64). NOTE-352 replaced the per-value `map[float64]struct{}`
+with an exponent-keyed dense table; NOTE-379 added a sorted-ascending DeltaUint64 fast path that
+drops the dedup table. But that fast path still walked EVERY value (one `frexpExpPos` per row),
+so on the M8 duration column it is an O(rows) pass over millions of rows whose ONLY purpose is to
+size a buffer — separate from, and on top of, the real histogram scan. The 24h CPU profile put
+`countIntrinsicHistogramBoundaries` self-time at ~1% of total querier CPU.
+
+**Fix:** the boundary slot (`frexpExpPos` of the scaled value) is monotonically non-decreasing in a
+sorted-ascending column, so distinct boundaries appear in contiguous runs. Instead of stepping
+through every value, gallop: from each run start, exponentially probe forward while the slot is
+unchanged, then binary-search the first differing index, and jump there. The whole column is counted
+in O(distinct_slots * log(run_len)) value reads instead of O(rows); distinct_slots is capped at
+`histFlatStride` (64), so this is at most ~64*log(n) `frexpExpPos` calls regardless of column size.
+The leading `v<=0` run is a contiguous prefix for sorted data and is skipped the same way (single
+zero bucket). Extracted into `countDeltaHistogramBoundariesGallop` to keep the parent under the
+gocyclo budget.
+
+**Correctness:** the count is identical to the linear walk for every input — it counts exactly the
+distinct slots present plus one for the zero prefix. Covered by
+`TestCountIntrinsicHistogramBoundaries_DeltaGallopMatchesReference` (4000 randomized sorted-ascending
+columns: leading-zero prefixes of varied length, zero-delta same-exponent runs, wide exponent jumps,
+cap-exceeded, duration + non-duration fields) asserting equality against the map-cardinality
+reference, plus the existing `_MatchesMapReference` cases. All executor `-race` tests pass.
+
+**Generality:** pure algorithmic complexity reduction (O(rows) → O(distinct*log)) over sorted data;
+no benchmark-specific constants. Sizing-only, so it cannot affect query results.
+
+Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:countDeltaHistogramBoundariesGallop`.
