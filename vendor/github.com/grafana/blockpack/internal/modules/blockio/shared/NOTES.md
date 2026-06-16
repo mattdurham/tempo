@@ -2295,3 +2295,54 @@ the repo is green under the pinned version — i.e. the pin was already silently
 Back-ref: `Makefile` (GOLANGCI_LINT_VERSION/STATICCHECK_VERSION/GOFUMPT_VERSION, install-tools);
 `.github/workflows/ci.yml` (golangci-lint + staticcheck install steps);
 `internal/modules/blockio/shared/intrinsic_delta_bench_test.go`.
+
+---
+
+## NOTE-406: streaming (decode-time push-down) paged-column scan (issue #348)
+
+`ScanPagedColumnBlob(blob, visit)` (intrinsic_stream.go) decodes a v2 paged Flat/XOR/Delta
+column ONE PAGE AT A TIME into buffers reused across pages and hands each page to a visitor as
+a `DecodedPage`, instead of materializing the full-column `Uint64Values`/`BytesValues`/
+`BlockRefs` arrays (sized to the WHOLE column) the way `decodePagedColumnBlobOpt` (via
+`GetIntrinsicColumn`) does. For an unfiltered full-column group-by/scatter consumer that reads
+every row exactly once, those O(column) arrays exist only to be scanned and discarded —
+streaming makes the transient decode-side allocation **O(one page), reused**, not O(column).
+
+**Page-batch granularity (whole `DecodedPage` per visit call, not per-value):** a per-value
+callback would pay an un-inlinable indirect call per row; visiting a whole page amortizes that
+to near-zero over the page's rows.
+
+**Reuse mechanism:** a single scratch `IntrinsicColumn` whose value/ref slices are reset to
+`[:0]` (capacity retained) before each page; the existing `appendFlatPageOpt` /
+`appendXORBytesPageOpt` / `appendDeltaUint64PageOpt` helpers decode into it unchanged (so the
+streamed values/refs are byte-identical to the eager path), reusing the same backing arrays
+across pages. Refs are ALWAYS decoded (`wantRefs == true`) — a streaming consumer scatters
+values by their refs. The flat/XOR-bytes value arena is freshly allocated per page (values are
+pointers into it), but the `BytesValues` slice header backing is reused.
+
+**Validity contract:** the `DecodedPage` and every slice it references are valid ONLY for the
+duration of a single `visit` call — the next page overwrites the same buffers. A visitor that
+retains any value/ref MUST copy it.
+
+**Selective by format (the issue's chief design point / regression risk):** only the
+value-decoupled Flat/XOR/Delta formats are streamable. Dict columns share a cross-page dict
+arena and are NOT streamed (`IsStreamablePagedColumnBlob` returns false; `ScanPagedColumnBlob`
+errors). Legacy v1 single-blob columns are likewise not streamable. A streamed scan is consumed
+in place and is NOT cached as a decoded column — a net win for the large, high-cardinality
+value-decoupled columns that churn `parsedIntrinsicCache` (decode → evict → re-decode, so they
+weren't staying cached anyway), and the cached `GetIntrinsicColumn` path is retained for the
+small/hot Dict columns where it is better. The compressed blob itself stays in the section
+cache (`GetOrFetchIntrinsic`), so a re-decode does not re-fetch.
+
+**Correctness:** pages are emitted in row order with `DecodedPage.RowBase` set to the page's
+first column position; scatter/accumulate are order-independent (or processed in order), so
+both are safe. Differential tests (`intrinsic_stream_test.go`) pin the streamed values + refs
+byte-identical to `DecodeIntrinsicColumnBlob` + `EnsureBlockRefs` across all three formats,
+multiple page layouts (parallel/serial/tiny-tail/single-row), buffer-reuse (same backing
+pointer reused across pages), visitor-error short-circuit, and non-streamable rejection.
+
+Back-ref: `internal/modules/blockio/shared/intrinsic_stream.go` (DecodedPage,
+IsStreamablePagedColumnBlob, ScanPagedColumnBlob); `internal/modules/blockio/reader/
+intrinsic_reader.go` (Reader.ScanIntrinsicColumn); `internal/modules/executor/
+metrics_trace_intrinsic.go` (scanGroupByColCompactFlatStreaming / scatterFlatGroupByRef /
+streamGroupByColCompactFlat — first consumer: the N=1 Flat/XOR/Delta group-by accumulators).

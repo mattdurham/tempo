@@ -680,16 +680,15 @@ func dispatchIntrinsicAccumulate(
 		if numSteps <= 0 {
 			return nil
 		}
-		groupByCol, colErr := r.GetIntrinsicColumn(agg.GroupBy[0])
-		if colErr != nil {
-			return colErr
-		}
+		// NOTE-406 (issue #348): defer the group-by column fetch to streamHistogramN1CompactCore,
+		// which tries the streaming (decode-time push-down) scan first and only falls back to an
+		// eager GetIntrinsicColumn for non-streamable Dict/legacy columns. Passing nil avoids the
+		// O(column) eager materialization on the streamable Flat/XOR/Delta path.
 		return streamHistogramN1Compact(
 			ctx,
 			r,
 			inRangeRefs,
 			inRangeVals,
-			groupByCol,
 			agg,
 			numSteps,
 			tb,
@@ -911,6 +910,63 @@ func scanGroupByColCompact(
 	scanGroupByColCompactFlatSerial(col, minPK, maxPK, pkBitset, rankPrefix, dict, dictIdxByPos)
 }
 
+// streamGroupByColCompactFlat attempts the streaming (decode-time push-down) Flat/XOR/Delta
+// group-by scan (NOTE-406, issue #348) WITHOUT first materializing the column. It builds the
+// POPCNT rank index over sortedPKs (the same index scanGroupByColCompact builds internally),
+// then streams the named column page-by-page, folding each page into dict + dictIdxByPos.
+//
+// Returns (true, nil) when the column was streamed (Flat/XOR/Delta v2 paged). Returns
+// (false, nil) when the column is absent or NOT streamable (Dict / legacy v1) — the caller
+// must then fall back to the eager fetch + scanGroupByColCompact path. Returns (false, err)
+// on a stream/decode error.
+//
+// Streaming is selected for these value-decoupled columns because the group-by scan consumes
+// the whole column exactly once and discards it: the eager path's O(column)
+// Uint64Values/BytesValues/BlockRefs arrays exist only to be scanned here. The Dict columns
+// (the common low-cardinality service.name group-by) are NOT streamable and keep the cached
+// native-index path (NOTE-401), which is the right choice for those small, hot, cache-resident
+// columns (issue #348 trade-off).
+func streamGroupByColCompactFlat(
+	r *modules_reader.Reader,
+	colName string,
+	sortedPKs []uint32,
+	dict *[]string,
+	dictIdxByPos []uint32,
+	rankIdx *pkRankIndex,
+) (bool, error) {
+	if len(sortedPKs) == 0 {
+		// Nothing in range; still must report whether the column is streamable so the caller
+		// does not redundantly fall back. Treat empty-range as "handled" — no scatter needed.
+		return true, nil
+	}
+	var (
+		minPK, maxPK uint32
+		pkBitset     []uint64
+		rankPrefix   []uint32
+		localIdx     pkRankIndex
+		ownsIdx      bool
+	)
+	if rankIdx != nil {
+		minPK, maxPK = rankIdx.minPK, rankIdx.maxPK
+		pkBitset, rankPrefix = rankIdx.bitset, rankIdx.rankPrefix
+	} else {
+		maxPKLocal := sortedPKs[0]
+		for _, pk := range sortedPKs {
+			if pk > maxPKLocal {
+				maxPKLocal = pk
+			}
+		}
+		localIdx = buildPKRankIndex(sortedPKs, maxPKLocal)
+		ownsIdx = true
+		minPK, maxPK = localIdx.minPK, localIdx.maxPK
+		pkBitset, rankPrefix = localIdx.bitset, localIdx.rankPrefix
+	}
+	if ownsIdx {
+		defer localIdx.release()
+	}
+	return scanGroupByColCompactFlatStreaming(r, colName, minPK, maxPK, pkBitset, rankPrefix, dict, dictIdxByPos)
+}
+
 // resolveDictGroupKeys lazily materializes the per-group value strings for a Dict-format
 // group-by column into dict (NOTE-401). The scan left dict[1..numEntries] = "" and wrote
 // the native entry index (entryIdx+1) into dictIdxByPos; this resolves dict[entryIdx+1] =
@@ -1037,34 +1093,91 @@ func scanGroupByColCompactFlatSerial(
 ) {
 	valToIdx := make(map[string]uint32, 32)
 	for i, ref := range col.BlockRefs {
-		pk := packKey(ref.BlockIdx, ref.RowIdx)
-		if pk < minPK || pk > maxPK {
-			continue
-		}
-		word := pk >> 6
-		bit := pk & 63
-		if len(pkBitset) > 0 && pkBitset[word]&(uint64(1)<<bit) == 0 {
-			continue // NOTE-140: bitset pre-filter before rank lookup
-		}
-		// NOTE-140: O(1) rank replaces O(log n) searchSortedUint32.
-		pos := int(rankPrefix[word] + uint32(bits.OnesCount64(pkBitset[word]&((uint64(1)<<bit)-1)))) //nolint:gosec
 		var val string
 		if i < len(col.Uint64Values) {
 			val = strconv.FormatUint(col.Uint64Values[i], 10)
 		} else if i < len(col.BytesValues) {
 			val = string(col.BytesValues[i])
 		}
-		if val == "" {
-			continue
-		}
-		idx, ok := valToIdx[val]
-		if !ok {
-			idx = uint32(len(*dict)) //nolint:gosec
-			*dict = append(*dict, val)
-			valToIdx[val] = idx
-		}
-		dictIdxByPos[pos] = idx + 1
+		scatterFlatGroupByRef(ref, val, minPK, maxPK, pkBitset, rankPrefix, dict, dictIdxByPos, valToIdx)
 	}
+}
+
+// scatterFlatGroupByRef is the shared per-ref body of the Flat/XOR/Delta group-by scan: it
+// filters ref by the in-range pkBitset, computes its rank-derived output position, and
+// scatters the group index for val into dictIdxByPos[pos], deduping val into *dict via
+// valToIdx. Extracted (NOTE-406) so both the materialized-column path
+// (scanGroupByColCompactFlatSerial) and the streaming page-visitor path
+// (scanGroupByColCompactFlatStreaming) share one byte-identical scatter. pkBitset and
+// rankPrefix are the shared read-only POPCNT index over sortedPKs (NOTE-135/140).
+func scatterFlatGroupByRef(
+	ref modules_shared.BlockRef,
+	val string,
+	minPK, maxPK uint32,
+	pkBitset []uint64,
+	rankPrefix []uint32,
+	dict *[]string,
+	dictIdxByPos []uint32,
+	valToIdx map[string]uint32,
+) {
+	pk := packKey(ref.BlockIdx, ref.RowIdx)
+	if pk < minPK || pk > maxPK {
+		return
+	}
+	word := pk >> 6
+	bit := pk & 63
+	if len(pkBitset) > 0 && pkBitset[word]&(uint64(1)<<bit) == 0 {
+		return // NOTE-140: bitset pre-filter before rank lookup
+	}
+	// NOTE-140: O(1) rank replaces O(log n) searchSortedUint32.
+	pos := int(rankPrefix[word] + uint32(bits.OnesCount64(pkBitset[word]&((uint64(1)<<bit)-1)))) //nolint:gosec
+	if val == "" {
+		return
+	}
+	idx, ok := valToIdx[val]
+	if !ok {
+		idx = uint32(len(*dict)) //nolint:gosec
+		*dict = append(*dict, val)
+		valToIdx[val] = idx
+	}
+	dictIdxByPos[pos] = idx + 1
+}
+
+// scanGroupByColCompactFlatStreaming is the streaming (decode-time push-down) variant of
+// scanGroupByColCompactFlatSerial (NOTE-406, issue #348). Instead of consuming a fully
+// materialized Flat/XOR/Delta column (col.Uint64Values/BytesValues/BlockRefs sized to the
+// whole column, then scanned once and discarded), it decodes the column ONE PAGE AT A TIME
+// via r.ScanIntrinsicColumn and folds each page straight into the group dict + dictIdxByPos.
+// The group state (dict + valToIdx) is O(groups), retained across pages; the per-page value/
+// ref buffers are O(one page), reused — so the O(column) decode-side arrays are never
+// allocated. Output (dict + dictIdxByPos) is byte-identical to the materialized path.
+//
+// Returns (false, nil) when the column is absent or not streamable (Dict/legacy) — the caller
+// then falls back to the eager scanGroupByColCompact path. Returns (true, err) when streamed.
+func scanGroupByColCompactFlatStreaming(
+	r *modules_reader.Reader,
+	colName string,
+	minPK, maxPK uint32,
+	pkBitset []uint64,
+	rankPrefix []uint32,
+	dict *[]string,
+	dictIdxByPos []uint32,
+) (bool, error) {
+	valToIdx := make(map[string]uint32, 32)
+	return r.ScanIntrinsicColumn(colName, func(p *modules_shared.DecodedPage) error {
+		if len(p.Uint64Values) > 0 {
+			for i, ref := range p.BlockRefs {
+				val := strconv.FormatUint(p.Uint64Values[i], 10)
+				scatterFlatGroupByRef(ref, val, minPK, maxPK, pkBitset, rankPrefix, dict, dictIdxByPos, valToIdx)
+			}
+			return nil
+		}
+		for i, ref := range p.BlockRefs {
+			val := string(p.BytesValues[i])
+			scatterFlatGroupByRef(ref, val, minPK, maxPK, pkBitset, rankPrefix, dict, dictIdxByPos, valToIdx)
+		}
+		return nil
+	})
 }
 
 // scanGroupByColCompactDictParallel is the parallel Dict-format path for scanGroupByColCompact
@@ -1944,20 +2057,31 @@ func streamCountRateN1CompactCore(
 ) error {
 	n := len(sortedPKs)
 
-	// Get the group-by column.
-	groupByCol, err := r.GetIntrinsicColumn(groupByColName)
-	if err != nil {
-		return err
-	}
-
 	// Build group dict and dictIdxByPos by scanning the group-by column.
 	// NOTE-125: pool dictIdxByPos (~28 MB at n=7.2 M) — absent entries are 0 (sentinel),
 	// acquireCompactUint32 clears before use.
 	dict := []string{""}
 	dictIdxByPos := acquireCompactUint32(n)
 	defer releaseCompactUint32(dictIdxByPos)
-	if groupByCol != nil {
-		scanGroupByColCompact(groupByCol, groupByColName, sortedPKs, &dict, dictIdxByPos, rankIdx)
+
+	// NOTE-406 (issue #348): try the streaming (decode-time push-down) Flat/XOR/Delta scan
+	// first — it folds the column into dict + dictIdxByPos one page at a time without
+	// materializing the O(column) value/ref arrays. Dict/legacy columns are not streamable;
+	// streamGroupByColCompactFlat returns false for those and we fall back to the eager fetch +
+	// cached native-index Dict path (NOTE-401), which is correct for those small/hot columns.
+	var groupByCol *modules_shared.IntrinsicColumn
+	streamed, err := streamGroupByColCompactFlat(r, groupByColName, sortedPKs, &dict, dictIdxByPos, rankIdx)
+	if err != nil {
+		return err
+	}
+	if !streamed {
+		groupByCol, err = r.GetIntrinsicColumn(groupByColName)
+		if err != nil {
+			return err
+		}
+		if groupByCol != nil {
+			scanGroupByColCompact(groupByCol, groupByColName, sortedPKs, &dict, dictIdxByPos, rankIdx)
+		}
 	}
 	numGroups := int64(len(dict)) //nolint:gosec
 
@@ -2108,19 +2232,27 @@ func streamAggN1CompactCore(
 ) error {
 	n := len(sortedPKs)
 
-	// Get the group-by column.
-	groupByCol, err := r.GetIntrinsicColumn(agg.GroupBy[0])
-	if err != nil {
-		return err
-	}
-
 	// Build group dict and dictIdxByPos by scanning the group-by column.
 	// NOTE-125: pool dictIdxByPos (~28 MB at n=7.2 M).
 	dict := []string{""}
 	dictIdxByPos := acquireCompactUint32(n)
 	defer releaseCompactUint32(dictIdxByPos)
-	if groupByCol != nil {
-		scanGroupByColCompact(groupByCol, agg.GroupBy[0], sortedPKs, &dict, dictIdxByPos, nil)
+
+	// NOTE-406 (issue #348): try the streaming Flat/XOR/Delta scan first (decode-time push-down,
+	// no O(column) materialization). Falls back to the eager Dict/legacy path when not streamable.
+	var groupByCol *modules_shared.IntrinsicColumn
+	streamed, err := streamGroupByColCompactFlat(r, agg.GroupBy[0], sortedPKs, &dict, dictIdxByPos, nil)
+	if err != nil {
+		return err
+	}
+	if !streamed {
+		groupByCol, err = r.GetIntrinsicColumn(agg.GroupBy[0])
+		if err != nil {
+			return err
+		}
+		if groupByCol != nil {
+			scanGroupByColCompact(groupByCol, agg.GroupBy[0], sortedPKs, &dict, dictIdxByPos, nil)
+		}
 	}
 	numGroups := len(dict)
 
@@ -2288,17 +2420,14 @@ func streamHistogramN1CompactFromRefs(
 	defer releaseCompactInt32(timeBucketByPos)
 	fillPKSetAndTimeBucketsFromPreSortedRefs(inRangeRefs, inRangeVals, &tb, numSteps, sortedPKs, timeBucketByPos)
 
-	groupByCol, err := r.GetIntrinsicColumn(agg.GroupBy[0])
-	if err != nil {
-		return err
-	}
-
+	// NOTE-406 (issue #348): defer the group-by fetch to the core, which streams the
+	// Flat/XOR/Delta path (no O(column) materialization) and falls back to eager fetch for
+	// non-streamable Dict/legacy columns.
 	return streamHistogramN1CompactCore(
 		ctx,
 		r,
 		sortedPKs,
 		timeBucketByPos,
-		groupByCol,
 		agg,
 		numSteps,
 		buckets,
@@ -2432,12 +2561,14 @@ func scanAggColCompact(
 //	compact: sortedPKs(4 MB) + timeBuckets(4 MB) + dictIdxByPos(4 MB) + seenByPos(1 MB) + groupCountsFlat(98 MB) ≈ 111 MB
 //
 // NOTE-092: replaces the dense-array histogram path for N=1 group-by in accumulateIntrinsicBuckets.
+// NOTE-406 (issue #348): the group-by column is no longer fetched by the caller and passed in;
+// streamHistogramN1CompactCore streams it (decode-time push-down) and falls back to an eager
+// fetch by name only for non-streamable Dict/legacy columns.
 func streamHistogramN1Compact(
 	ctx context.Context,
 	r *modules_reader.Reader,
 	inRangeRefs []modules_shared.BlockRef,
 	inRangeVals []uint64,
-	groupByCol *modules_shared.IntrinsicColumn,
 	agg vm.AggregateSpec,
 	numSteps int64,
 	tb vm.TimeBucketSpec,
@@ -2468,7 +2599,7 @@ func streamHistogramN1Compact(
 
 	fillPKSetAndTimeBucketsFromRefs(inRangeRefs, inRangeVals, &tb, numSteps, pkSet, timeBucketByPos)
 
-	return streamHistogramN1CompactCore(ctx, r, pkSet, timeBucketByPos, groupByCol, agg, numSteps, buckets, histSink)
+	return streamHistogramN1CompactCore(ctx, r, pkSet, timeBucketByPos, agg, numSteps, buckets, histSink)
 }
 
 // streamHistogramN1CompactCore is the shared accumulation core for the compact N=1
@@ -2484,7 +2615,6 @@ func streamHistogramN1CompactCore(
 	r *modules_reader.Reader,
 	sortedPKs []uint32,
 	timeBucketByPos []int32,
-	groupByCol *modules_shared.IntrinsicColumn,
 	agg vm.AggregateSpec,
 	numSteps int64,
 	buckets map[string]*aggBucketState,
@@ -2498,8 +2628,24 @@ func streamHistogramN1CompactCore(
 	dict := []string{""}
 	dictIdxByPos := acquireCompactUint32(n)
 	defer releaseCompactUint32(dictIdxByPos)
-	if groupByCol != nil {
-		scanGroupByColCompact(groupByCol, agg.GroupBy[0], sortedPKs, &dict, dictIdxByPos, nil)
+
+	// NOTE-406 (issue #348): try the streaming Flat/XOR/Delta scan first (decode-time push-down,
+	// no O(column) materialization). Falls back to an eager GetIntrinsicColumn for non-streamable
+	// Dict/legacy columns. groupByCol is used post-scan only by resolveDictGroupKeys (a no-op for
+	// nil / Flat-streamed columns).
+	var groupByCol *modules_shared.IntrinsicColumn
+	streamed, err := streamGroupByColCompactFlat(r, agg.GroupBy[0], sortedPKs, &dict, dictIdxByPos, nil)
+	if err != nil {
+		return err
+	}
+	if !streamed {
+		groupByCol, err = r.GetIntrinsicColumn(agg.GroupBy[0])
+		if err != nil {
+			return err
+		}
+		if groupByCol != nil {
+			scanGroupByColCompact(groupByCol, agg.GroupBy[0], sortedPKs, &dict, dictIdxByPos, nil)
+		}
 	}
 	numGroups := len(dict)
 
@@ -3127,22 +3273,19 @@ func accumulateIntrinsicBuckets(
 		if numSteps <= 0 {
 			return nil
 		}
-		groupByCol, colErr := r.GetIntrinsicColumn(agg.GroupBy[0])
-		if colErr != nil {
-			return colErr
-		}
-
 		// NOTE-092: HISTOGRAM uses the compact path to avoid three large dense arrays
 		// (dictByPK, bucketByPK, seenByPK) each sized maxPK+1 (up to 32 M entries).
 		// The compact path uses binary search over sorted packKeys instead, reducing
 		// peak memory from ~520 MB to ~115 MB per goroutine for M8-style queries.
+		// NOTE-406 (issue #348): pass nil to defer the group-by fetch to the core, which
+		// streams the Flat/XOR/Delta path (no O(column) materialization) and falls back to an
+		// eager fetch only for non-streamable Dict/legacy columns.
 		if agg.Function == vm.FuncNameHISTOGRAM {
 			return streamHistogramN1Compact(
 				ctx,
 				r,
 				inRangeRefs,
 				inRangeVals,
-				groupByCol,
 				agg,
 				numSteps,
 				tb,
@@ -3151,6 +3294,10 @@ func accumulateIntrinsicBuckets(
 			)
 		}
 
+		groupByCol, colErr := r.GetIntrinsicColumn(agg.GroupBy[0])
+		if colErr != nil {
+			return colErr
+		}
 		dictIdxForRef, dict, dictByPK, maxPK, buildErr := buildDictIdxForRefs(groupByCol, agg.GroupBy[0], inRangeRefs)
 		if buildErr != nil {
 			return buildErr

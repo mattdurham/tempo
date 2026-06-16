@@ -6206,3 +6206,36 @@ unresolved dict after scan), `TestDictGroupByEmptyStringSkipped` (empty string �
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:scanGroupByColCompact /
 scanGroupByColCompactDictSerial / scanGroupByColCompactDictParallel / scanGroupByColCompactFlatSerial
 / resolveDictGroupKeys / groupHasNonZero / isInt64DomainColumn`.
+
+## NOTE-406: streaming Flat/XOR/Delta group-by scan (issue #348)
+
+The N=1 group-by accumulators (count/rate `streamCountRateN1Compact`-class, agg
+`streamAggN1CompactCore`, histogram `streamHistogramN1CompactCore`) formerly fetched the
+group-by column via `GetIntrinsicColumn` (eager full-column decode — `Uint64Values`/
+`BytesValues`/`BlockRefs` sized to the WHOLE column) and then scanned it once in
+`scanGroupByColCompact`. For the value-decoupled Flat/XOR/Delta formats the column is consumed
+exactly once and discarded, so the O(column) decode-side arrays exist only to be scanned here.
+
+`streamGroupByColCompactFlat` now tries the streaming (decode-time push-down) scan FIRST
+(`scanGroupByColCompactFlatStreaming` → `Reader.ScanIntrinsicColumn` → shared
+`ScanPagedColumnBlob`, NOTE-406): it folds each decoded page straight into the group dict +
+`dictIdxByPos`, so the column's value/ref arrays are never materialized. The group state
+(`dict` + `valToIdx`) is O(groups), retained across pages; the per-page value/ref buffers are
+O(one page), reused. The per-ref scatter body (`scatterFlatGroupByRef`) is shared with the
+materialized path (`scanGroupByColCompactFlatSerial`), so the streamed `dict`/`dictIdxByPos`
+output is byte-identical.
+
+`streamGroupByColCompactFlat` returns `(false, nil)` for non-streamable columns (Dict — the
+common low-cardinality `service.name` group-by — and legacy v1 single blobs); the caller then
+falls back to the eager `GetIntrinsicColumn` + cached native-index Dict path (NOTE-401), which
+is the right choice for those small, hot, cache-resident columns (issue #348 trade-off).
+
+The histogram N=1 callers no longer pre-fetch and thread `groupByCol` through
+`streamHistogramN1Compact`/`...Core` — they pass nothing and the core streams or lazily fetches
+on fallback — so the O(column) eager materialization is avoided whenever the group-by column is
+streamable. `resolveDictGroupKeys` (the only post-scan use of `groupByCol`) is a no-op for the
+nil / Flat-streamed case (Flat dicts are fully populated by the scan).
+
+Covered by `intrinsic_stream_groupby_test.go`: streamed-vs-eager byte-identical `dict` +
+`dictIdxByPos` over a real multi-page v2 paged column (30k spans → DeltaUint64), the legacy
+single-blob non-streamable fallback, and the Dict-column non-streamable fallback.

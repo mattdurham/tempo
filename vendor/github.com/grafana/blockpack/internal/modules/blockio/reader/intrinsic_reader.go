@@ -119,6 +119,50 @@ func (r *Reader) GetIntrinsicColumnBlob(name string) ([]byte, error) {
 	return blob, nil
 }
 
+// ScanIntrinsicColumn fetches the named intrinsic column's blob (from cache or disk) and
+// streams it ONE PAGE AT A TIME into reused buffers, invoking visit on each decoded page in
+// row order (NOTE-406, issue #348). The full-column value/ref arrays are NEVER materialized —
+// transient allocation is O(one page), reused across pages — so an unfiltered full-column
+// group-by/scatter consumer that reads every row once pays O(one page) instead of O(column)
+// for the decode-side arrays the eager GetIntrinsicColumn would allocate only to discard.
+//
+// Returns (false, nil) when the column is absent (no intrinsic section, name not present, or a
+// non-streamable Dict/legacy blob) — the caller MUST then fall back to the eager
+// GetIntrinsicColumn path. Returns (true, err) when the column was streamed (err non-nil if the
+// visitor or decode failed). visit's DecodedPage and its slices are valid only for the duration
+// of each call; a visitor that retains a value/ref MUST copy it.
+//
+// Trade-off (issue #348): a streamed scan is consumed in place and is NOT cached as a decoded
+// column. This is a net win for the large, high-cardinality columns that drive decode-time
+// allocation (they churn the process cache — decode → evict → re-decode — so they were not
+// staying cached anyway, and streaming avoids the big O(column) allocation on every mostly-miss
+// decode). For small, hot, cache-resident columns the cached GetIntrinsicColumn path is better,
+// so callers must select streaming only for consume-once full-column scans. The compressed blob
+// itself remains in the section cache (GetOrFetchIntrinsic), so re-decode does not re-fetch.
+func (r *Reader) ScanIntrinsicColumn(name string, visit func(*shared.DecodedPage) error) (streamed bool, err error) {
+	if r.intrinsicIndex == nil {
+		return false, nil
+	}
+	meta, ok := r.intrinsicIndex[name]
+	if !ok {
+		return false, nil
+	}
+	blob, err := r.cache.GetOrFetchIntrinsic(r.fileID, name, func() ([]byte, error) {
+		return r.readRange(meta.Offset, uint64(meta.Length), rw.DataTypeMetadata)
+	})
+	if err != nil {
+		return false, fmt.Errorf("ScanIntrinsicColumn %q: read: %w", name, err)
+	}
+	if !shared.IsStreamablePagedColumnBlob(blob) {
+		// Dict / legacy v1 blob — not streamable; caller falls back to eager decode.
+		return false, nil
+	}
+	if err := shared.ScanPagedColumnBlob(blob, visit); err != nil {
+		return true, fmt.Errorf("ScanIntrinsicColumn %q: %w", name, err)
+	}
+	return true, nil
+}
+
 // intrinsicBatchFetcher is the optional interface a section cache may implement to
 // batch-fetch several intrinsic column blobs for one file in a single round-trip.
 // TypedTieredCache.GetMultiIntrinsic implements it; caches that don't are simply not
