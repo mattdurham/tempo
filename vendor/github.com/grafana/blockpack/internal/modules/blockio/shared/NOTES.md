@@ -2393,3 +2393,26 @@ IsDictPagedColumnBlob, ScanDictPagedColumnBlob); `intrinsic_codec.go` (DecodeRef
 `internal/modules/blockio/reader/intrinsic_reader.go` (Reader.ScanDictGroupByColumn);
 `internal/modules/executor/metrics_trace_intrinsic.go` (scanGroupByColCompactDictStreaming /
 isInt64DomainColName — wired into the count/rate, agg, and histogram N=1 compact group-by cores).
+
+## NOTE-421: bulk indexed-store RLE index decode (DecodeIndexRLE)
+
+`DecodeIndexRLE` (column.go rle_indexes/sparse_rle_indexes path) expands a run-length-encoded
+dict-index stream back to a `[]uint32` of length `nIndexes`. It runs once per dict-encoded
+column per query on every search/metrics request, so it is on the universal decode hot path
+(top blockpack self-time in the CPU profile).
+
+The former body started from a len-0, cap-nIndexes slice and `append`ed one element per row,
+paying a per-element `len(out) >= nIndexes` branch plus append's per-element cap recheck. Since
+the destination length is known exactly up front, allocate `make([]uint32, nIndexes)` and fill
+each run by direct indexed store into `seg := out[pos:pos+runLen]` (runLen clamped once to the
+remaining space). The slice expression elides the inner bounds check, and the truncate-to-
+nIndexes behavior (drop run overflow past the requested count) is preserved by the clamp +
+final `pos != nIndexes` mismatch error. Output is byte-identical.
+
+Measured ~20-25% faster on representative low/medium-cardinality columns (long and 32-row runs),
+no allocation change (still one exact-size alloc). An exponential-doubling `copy` variant was
+tried first but lost on short/medium runs to call overhead — the plain indexed store wins
+uniformly across run lengths.
+
+Back-ref: `internal/modules/blockio/shared/index_rle.go` (DecodeIndexRLE);
+`internal/modules/blockio/reader/column.go` (rle_indexes / sparse_rle_indexes decode).

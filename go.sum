@@ -443,6 +443,8 @@ github.com/grafana/blockpack v0.0.0-20260616185526-2057805a3503 h1:fRHQKVgz4XlcQ
 github.com/grafana/blockpack v0.0.0-20260616185526-2057805a3503/go.mod h1:iW6IBVDkWOxlJM/Maw6Rnmz4kC47AxWVOwpcd2RxN5c=
 github.com/grafana/blockpack v0.0.0-20260616191324-89df5404ea7e h1:nrCGjBU3eTR7ZuM1724Kn0TBLFH5Rw9XwwrH64xF9WE=
 github.com/grafana/blockpack v0.0.0-20260616191324-89df5404ea7e/go.mod h1:iW6IBVDkWOxlJM/Maw6Rnmz4kC47AxWVOwpcd2RxN5c=
+github.com/grafana/blockpack v0.0.0-20260616192825-c0d75c52c1d8 h1:LoJlNEUP0+wk8EFLbLVJ8AVBVpoUBiNHMnR6sd/NbJ0=
+github.com/grafana/blockpack v0.0.0-20260616192825-c0d75c52c1d8/go.mod h1:iW6IBVDkWOxlJM/Maw6Rnmz4kC47AxWVOwpcd2RxN5c=
 github.com/grafana/dskit v0.0.0-20260427162712-0457a92dacc3 h1:/m/qmt7Ay+HK+GVbIvXrJIRHC07xFM6nWFMmyePmAUs=
 github.com/grafana/dskit v0.0.0-20260427162712-0457a92dacc3/go.mod h1:6zFIzal2FCd0JC1pE0ZTb2ftC0Jr/zsQR4zRNRdDfZA=
 github.com/grafana/e2e v0.1.2-0.20260504080022-0f57c9f0da68 h1:+GLaDMc1zkYNTMHZq3ljGaRSm1IcOxQvpBNn0YUyh60=

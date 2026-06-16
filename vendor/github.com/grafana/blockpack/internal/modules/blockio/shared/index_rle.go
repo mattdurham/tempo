@@ -52,7 +52,7 @@ func EncodeIndexRLE(indexes []uint32) ([]byte, error) {
 	return buf, nil
 }
 
-// DecodeIndexRLE decodes rle_data to a []uint32 of length nIndexes.
+// DecodeIndexRLE decodes rle_data to a []uint32 of length nIndexes. NOTE-421.
 func DecodeIndexRLE(data []byte, nIndexes int) ([]uint32, error) {
 	if nIndexes < 0 {
 		return nil, fmt.Errorf("index_rle: nIndexes must be non-negative, got %d", nIndexes)
@@ -75,27 +75,42 @@ func DecodeIndexRLE(data []byte, nIndexes int) ([]uint32, error) {
 		)
 	}
 
-	out := make([]uint32, 0, nIndexes)
+	// NOTE-421: fill each RLE run by direct indexed write into a destination allocated at its
+	// exact final length (nIndexes), instead of appending one element at a time into a len-0
+	// slice. The append form re-checked cap on every element and paid a per-element
+	// `len(out) >= nIndexes` branch; with a write cursor `pos` and runLen clamped once to the
+	// remaining space, the inner loop is a bare bounds-check-elided indexed store — provably in
+	// range because seg := out[pos:pos+runLen] is taken up front. This is a throughput win on
+	// the dict-index decode path (runs once per dict column per query on every search/metrics
+	// request); output is byte-identical to the former append loop, including the prior
+	// truncate-to-nIndexes behavior when a run would overrun the requested count.
+	out := make([]uint32, nIndexes)
 	off := 5
+	pos := 0
 
 	for range runCount {
 		runLen := int(binary.LittleEndian.Uint32(data[off:]))
 		runVal := binary.LittleEndian.Uint32(data[off+4:])
 		off += 8
 
-		for range runLen {
-			if len(out) >= nIndexes {
-				break
-			}
-
-			out = append(out, runVal)
+		if rem := nIndexes - pos; runLen > rem {
+			runLen = rem
 		}
+		if runLen <= 0 {
+			continue
+		}
+
+		seg := out[pos : pos+runLen]
+		for i := range seg {
+			seg[i] = runVal
+		}
+		pos += runLen
 	}
 
-	if len(out) != nIndexes {
+	if pos != nIndexes {
 		return nil, fmt.Errorf(
 			"index_rle: decoded %d indexes but expected %d",
-			len(out), nIndexes,
+			pos, nIndexes,
 		)
 	}
 
