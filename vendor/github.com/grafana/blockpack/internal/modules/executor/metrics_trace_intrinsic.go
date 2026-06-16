@@ -4204,7 +4204,6 @@ func accumulateIntrinsicBucketsDirect(
 			maxPK,
 			dict,
 			numSteps,
-			tb,
 			buckets,
 			histSink,
 		)
@@ -4520,6 +4519,149 @@ func accumulateCountRateDirect(
 // rebuilding bucketByPK from inRangeRefs (eliminates O(inRangeCount) redundant array writes).
 // Absent-row pass walks bucketByPK directly, matching accumulateCountRateDirect's pattern.
 // NOTE-089: extends accumulateIntrinsicBucketsDirect to HISTOGRAM without inRangeRefs.
+// accumulateHistogramDirectStreaming is the streaming (decode-time push-down) variant of
+// accumulateHistogramDirect for the N=1 group-by histogram path (NOTE-410, issue #356). It
+// replaces the eager GetIntrinsicColumn(agg.Field) — which materializes the WHOLE aggregate
+// column's O(rows) Uint64Values + BlockRefs arrays purely to do two sequential forward scans
+// (boundary pre-count, then bucket accumulation) — with two streaming passes over
+// ScanIntrinsicColumn: each decodes ONE page at a time into reused buffers, so transient
+// allocation is O(one page) not O(column). span:duration is the largest remaining un-streamed
+// sequential scan on the M8 (histogram_over_time) path; after this it has no O(rows) eager
+// decode (resource.service.name already streams via ScanDictGroupByColumn, NOTE-407).
+//
+// Two-pass (issue #356 option 1): pass 1 streams the column to count distinct boundaries (so
+// groupCountsFlat is sized to actualStride, not the histFlatStride=64 worst case); pass 2 streams
+// it again to accumulate. Both passes are O(one page) transient — the compressed blob stays in
+// the section cache between passes (GetOrFetchIntrinsic), so pass 2 re-decodes (cheap) but does
+// not re-fetch.
+//
+// Returns (false, nil) when agg.Field is NOT a streamable paged Flat/XOR/Delta column (Dict /
+// legacy v1) so the caller falls back to the eager accumulateHistogramDirect; the absent-column
+// case (col == nil) is also left to the eager path, which already handles it as boundary-0 only.
+func accumulateHistogramDirectStreaming(
+	ctx context.Context,
+	r *modules_reader.Reader,
+	agg vm.AggregateSpec,
+	dictByPK []uint32,
+	bucketByPK []int16,
+	maxPK uint32,
+	dict []string,
+	numSteps int64,
+	buckets map[string]*aggBucketState,
+	histSink *[]TraceTimeSeries,
+) (bool, error) {
+	// Pass 1: stream to count distinct boundaries (right-size actualStride).
+	counter := newHistBoundaryCounter(agg.Field)
+	spanCount := 0
+	streamed, err := r.ScanIntrinsicColumn(agg.Field, func(p *modules_shared.DecodedPage) error {
+		if spanCount&ctxCheckMask == 0 {
+			if cerr := ctx.Err(); cerr != nil {
+				return cerr
+			}
+		}
+		for _, u := range p.Uint64Values {
+			spanCount++
+			if counter.add(float64(u)) {
+				break // histFlatStride cap reached — further values cannot raise the count
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return streamed, err
+	}
+	if !streamed {
+		return false, nil // not a streamable paged column — caller falls back to eager path
+	}
+
+	actualStride := int64(counter.count) + 1 // +1 for absent sentinel at bIdx=0
+	numGroups := len(dict)
+	// NOTE-398: boundary-innermost layout [group][step][boundary]; stepStride = actualStride.
+	stepStride := actualStride
+	stride1 := actualStride * numSteps
+	groupCountsFlat := acquireGroupCountsFlat(int64(numGroups) * stride1) //nolint:gosec
+	defer releaseGroupCountsFlat(groupCountsFlat)
+
+	// boundaryIndexer: same first-encounter / discard-at-actualStride semantics as the eager
+	// path (NOTE-352). The streaming pass 1 already guaranteed counter.count distinct boundaries
+	// fit under actualStride-1 unless the histFlatStride cap was hit, in which case the indexer's
+	// own discard sentinel handles the overflow identically to the eager path.
+	bi := newBoundaryIndexer(agg.Field, actualStride)
+	seenByPK := acquireDirectBool(int(maxPK) + 1) // NOTE-129
+
+	// Pass 2: stream again to accumulate. Each page's value i belongs to span p.BlockRefs[i];
+	// the per-value work is identical to streamByRefSliceHistogramScanDict's Flat branch.
+	spanCount = 0
+	_, err = r.ScanIntrinsicColumn(agg.Field, func(p *modules_shared.DecodedPage) error {
+		for i := range p.BlockRefs {
+			if spanCount&ctxCheckMask == 0 {
+				if cerr := ctx.Err(); cerr != nil {
+					return cerr
+				}
+			}
+			spanCount++
+			if i >= len(p.Uint64Values) {
+				continue
+			}
+			ref := p.BlockRefs[i]
+			pk := packKey(ref.BlockIdx, ref.RowIdx)
+			if pk > maxPK {
+				continue
+			}
+			bk := int64(bucketByPK[pk])
+			if bk == 0 {
+				continue // out of range
+			}
+			seenByPK[pk] = true
+			var gIdx int64
+			if raw := dictByPK[pk]; raw > 0 {
+				gIdx = int64(raw - 1) //nolint:gosec
+			}
+			bIdx := bi.index(float64(p.Uint64Values[i]))
+			if bIdx >= actualStride {
+				continue // guard: boundary cap exceeded
+			}
+			groupCountsFlat[gIdx*stride1+(bk-1)*stepStride+bIdx]++
+		}
+		return nil
+	})
+	if err != nil {
+		releaseDirectBool(seenByPK)
+		return true, err
+	}
+
+	// Absent-row pass: walk bucketByPK directly (no inRangeRefs) — bIdx=0 sentinel.
+	// NOTE-398: bIdx=0 is innermost (stride 1): gIdx*stride1 + (bk-1)*stepStride.
+	for pk, bk16 := range bucketByPK {
+		bk := int64(bk16)
+		if bk == 0 || seenByPK[pk] {
+			continue
+		}
+		var gIdx int64
+		if raw := dictByPK[pk]; raw > 0 {
+			gIdx = int64(raw - 1) //nolint:gosec
+		}
+		if gIdx >= int64(numGroups) { //nolint:gosec
+			continue
+		}
+		groupCountsFlat[gIdx*stride1+(bk-1)*stepStride]++
+	}
+
+	releaseDirectBool(seenByPK)
+	return true, emitHistogramFlat(
+		histSink,
+		groupCountsFlat,
+		stride1,
+		stepStride,
+		numSteps,
+		numGroups,
+		dict,
+		bi.boundaries,
+		agg,
+		buckets,
+	)
+}
+
 func accumulateHistogramDirect(
 	ctx context.Context,
 	r *modules_reader.Reader,
@@ -4529,7 +4671,38 @@ func accumulateHistogramDirect(
 	maxPK uint32,
 	dict []string,
 	numSteps int64,
-	tb vm.TimeBucketSpec,
+	buckets map[string]*aggBucketState,
+	histSink *[]TraceTimeSeries, // NOTE-350
+) error {
+	// NOTE-410 (issue #356): try the streaming path first. span:duration is a paged Delta column,
+	// so the eager GetIntrinsicColumn below — which materializes O(rows) Uint64Values+BlockRefs
+	// only to scan them sequentially twice — is replaced by two O(one-page) streaming passes.
+	// Falls through to the eager path for non-streamable (Dict / legacy / absent) columns.
+	streamed, serr := accumulateHistogramDirectStreaming(
+		ctx, r, agg, dictByPK, bucketByPK, maxPK, dict, numSteps, buckets, histSink,
+	)
+	if serr != nil {
+		return serr
+	}
+	if streamed {
+		return nil
+	}
+	return accumulateHistogramDirectEager(ctx, r, agg, dictByPK, bucketByPK, maxPK, dict, numSteps, buckets, histSink)
+}
+
+// accumulateHistogramDirectEager is the eager (full-column materialization) histogram direct
+// path — the fallback when accumulateHistogramDirectStreaming reports the aggregate field is not
+// a streamable paged column (Dict / legacy v1 / absent). Split out of accumulateHistogramDirect
+// (NOTE-410) so the eager and streaming paths can be exercised independently in tests.
+func accumulateHistogramDirectEager(
+	ctx context.Context,
+	r *modules_reader.Reader,
+	agg vm.AggregateSpec,
+	dictByPK []uint32,
+	bucketByPK []int16,
+	maxPK uint32,
+	dict []string,
+	numSteps int64,
 	buckets map[string]*aggBucketState,
 	histSink *[]TraceTimeSeries, // NOTE-350
 ) error {
@@ -5163,6 +5336,61 @@ func countDeltaHistogramBoundariesGallop(vals []uint64, scaleByNano bool, expLo 
 	return count
 }
 
+// histBoundaryCounter counts distinct histogram boundary buckets across a stream of values
+// presented one page at a time (NOTE-410, issue #356). It mirrors the dense exponent-table
+// counting in countIntrinsicHistogramBoundaries exactly — distinct boundaries ⇔ distinct binary
+// exponents (every positive value maps to boundary 2**(exp-1) where exp == frexpExpPos(scaled
+// value)); v<=0 maps to the single boundary-0 bucket — so the streamed count is byte-identical to
+// the eager count over the same values. The state (seenExp / count / zeroSeen) persists across
+// pages so a multi-page column is counted as one logical scan, unlike the eager path which
+// receives the whole column at once. Once the histFlatStride cap is reached, add() returns true so
+// the caller can stop streaming early.
+type histBoundaryCounter struct {
+	seenExp     []bool
+	count       int
+	expBase     int
+	zeroSeen    bool
+	scaleByNano bool
+}
+
+func newHistBoundaryCounter(fieldName string) *histBoundaryCounter {
+	const expLo, expHi = -1075, 1025
+	return &histBoundaryCounter{
+		seenExp:     make([]bool, expHi-expLo),
+		expBase:     expLo,
+		scaleByNano: fieldName == colNameSpanDuration,
+	}
+}
+
+// add records v's boundary bucket; returns true once the histFlatStride cap is reached (the
+// caller may then stop). Identical bucket-assignment rules to countIntrinsicHistogramBoundaries'
+// markValue closure.
+func (c *histBoundaryCounter) add(v float64) bool {
+	if v <= 0 {
+		if !c.zeroSeen {
+			c.zeroSeen = true
+			c.count++
+		}
+		return c.count >= histFlatStride
+	}
+	if c.scaleByNano {
+		v /= 1e9
+		if v <= 0 {
+			if !c.zeroSeen {
+				c.zeroSeen = true
+				c.count++
+			}
+			return c.count >= histFlatStride
+		}
+	}
+	slot := frexpExpPos(v) - c.expBase
+	if slot >= 0 && slot < len(c.seenExp) && !c.seenExp[slot] {
+		c.seenExp[slot] = true
+		c.count++
+	}
+	return c.count >= histFlatStride
+}
+
 func countIntrinsicHistogramBoundaries(col *modules_shared.IntrinsicColumn, fieldName string) int {
 	// NOTE-352: distinct boundaries are counted by distinct binary EXPONENT rather than by
 	// inserting each pow2 boundary float into a map[float64]struct{}. Every positive value maps
@@ -5429,7 +5657,10 @@ func scanHistogramN0(
 				groupCountsFlat[(bk-1)*stepStride+bIdx]++
 			}
 		}
-	case modules_shared.IntrinsicFormatFlat:
+	// NOTE-410: DeltaUint64 shares the Flat value-decoupled branch (see
+	// streamByRefSliceHistogramScanDict) — the former switch omitted it, so a Delta-decoded
+	// span:duration column accumulated nothing and every span fell to the boundary-0 sentinel.
+	case modules_shared.IntrinsicFormatFlat, modules_shared.IntrinsicFormatDeltaUint64:
 		for i, ref := range col.BlockRefs {
 			if spanCount&ctxCheckMask == 0 {
 				if err := ctx.Err(); err != nil {
@@ -5519,7 +5750,14 @@ func streamByRefSliceHistogramScanDict(
 				groupCountsFlat[gIdx*stride1+(bk-1)*stepStride+bIdx]++
 			}
 		}
-	case modules_shared.IntrinsicFormatFlat:
+	// NOTE-410: DeltaUint64 (the eager-decoded form of a paged span:duration column, NOTE-123/
+	// 396) populates col.Uint64Values + col.BlockRefs identically to Flat, so it accumulates via
+	// the same value-decoupled branch. The former switch omitted DeltaUint64, so a Delta-decoded
+	// aggregate column fell through with NO accumulation — every span was wrongly counted into the
+	// boundary-0 sentinel by the caller's absent-row pass. (In practice this eager path is now the
+	// fallback behind accumulateHistogramDirectStreaming, which streams Delta correctly; this case
+	// keeps the eager fallback correct for any Delta column that reaches it.)
+	case modules_shared.IntrinsicFormatFlat, modules_shared.IntrinsicFormatDeltaUint64:
 		for i, ref := range col.BlockRefs {
 			if spanCount&ctxCheckMask == 0 {
 				if err := ctx.Err(); err != nil {

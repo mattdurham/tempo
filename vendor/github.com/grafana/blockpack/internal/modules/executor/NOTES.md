@@ -6280,3 +6280,50 @@ Covered by `intrinsic_stream_groupby_test.go`
 per-position group VALUE equals the eager native-index Dict path's over a real multi-page
 service.name column, and the legacy single-blob falls back. Shared-layer differential +
 rejection + visitor-error tests in `intrinsic_stream_test.go`.
+
+## NOTE-410: streaming histogram aggregate-field decode (issue #356)
+
+NOTE-406/407 streamed the metrics group-by columns (`rate()`/`count_over_time` Flat & Dict
+group-by) but the **histogram aggregate field** (`span:duration` in M8: `{kind=server} |
+histogram_over_time(duration) by (resource.service.name)`) still fell through to the eager
+`GetIntrinsicColumn(agg.Field)` in `accumulateHistogramDirect`. That materialized the WHOLE
+`span:duration` column's O(rows) `Uint64Values` + `BlockRefs` arrays purely to do two sequential
+forward scans — `countIntrinsicHistogramBoundaries` (boundary pre-count to size
+`groupCountsFlat`) then `streamByRefSliceHistogramScanDict` (bucket accumulation) — used once and
+discarded. `span:duration` is a paged DeltaUint64 column (sorted ascending, NOTE-123/396), hence
+streamable. After NOTE-407 already streamed `resource.service.name`, this was the last O(rows)
+eager decode on the M8 path.
+
+`accumulateHistogramDirectStreaming` (tried first in `accumulateHistogramDirect`, falling through
+to the eager path for non-streamable Dict / legacy / absent columns) replaces the eager decode
+with **two streaming passes** over `Reader.ScanIntrinsicColumn` → shared `ScanPagedColumnBlob`
+(NOTE-406): each decodes ONE page at a time into reused buffers, so transient allocation is O(one
+page), not O(column). Pass 1 counts distinct boundaries via `histBoundaryCounter` (the streaming
+analog of `countIntrinsicHistogramBoundaries` — same dense exponent-table dedup, persisted across
+pages — so the streamed count is byte-identical to the eager count), right-sizing `actualStride`.
+Pass 2 streams again, folding each page-local value/ref pair straight into `groupCountsFlat`
+exactly as `streamByRefSliceHistogramScanDict`'s Flat branch did. The compressed blob stays in the
+section cache between passes (`GetOrFetchIntrinsic`), so pass 2 re-decodes (cheap, pooled buffers)
+but never re-fetches. The absent-row pass, boundary indexer (NOTE-352), and `emitHistogramFlat`
+are unchanged — only the source of the values moved from an eager O(rows) array to a streamed
+page walk, so emitted series are byte-identical.
+
+While adding the multi-page differential test, the eager fallback was found to be **silently
+wrong for a paged DeltaUint64 aggregate column** (the common shape of a large `span:duration`):
+`streamByRefSliceHistogramScanDict` and `scanHistogramN0` switched only on
+`IntrinsicFormatDict` / `IntrinsicFormatFlat`, so a Delta-decoded column (`col.Format ==
+IntrinsicFormatDeltaUint64`, populating the SAME `Uint64Values`+`BlockRefs` as Flat) fell through
+the switch with NO accumulation — every span was then counted into the boundary-0 sentinel by the
+absent-row pass, collapsing the histogram to a single bucket. Both switches now treat
+`IntrinsicFormatDeltaUint64` identically to `IntrinsicFormatFlat` (the value-decoupled branch), so
+the eager fallback and the N=0 path are correct for Delta columns. The new streaming path handles
+Delta natively (it streams via `ScanPagedColumnBlob`, which already decodes Delta pages), so the
+production M8 path is correct independent of this fallback fix.
+
+Covered by `intrinsic_hist_stream_test.go`
+(`TestAccumulateHistogramDirect_StreamingVsEager`): the streaming path's emitted series equal the
+eager `accumulateHistogramDirectEager` over a real multi-page paged DeltaUint64 `span:duration`
+column, asserting >1 distinct boundary (so the Delta accumulation is actually exercised, not just
+the boundary-0 sentinel). `TestHistBoundaryCounter_MatchesEager` pins the streaming boundary count
+against `countIntrinsicHistogramBoundaries`, and `..._FallbackNonStreamable` pins the Dict
+fall-through.
