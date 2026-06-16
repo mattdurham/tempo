@@ -939,7 +939,9 @@ func evalOpSiblingStruct(spans []structuralSpanRec, dst []int) []int {
 // that reaches X still emits X (if node-1) and ascends, seeding collected for the whole prefix above.
 func evalOpAncestorStruct(spans []structuralSpanRec, dst []int) []int {
 	result := dst
-	collected := make([]bool, len(spans))
+	collected := acquireCompactBool(len(spans))
+	defer releaseCompactBool(collected)
+
 	for _, l := range spans {
 		if l.nodeMatch&0x01 == 0 {
 			continue
@@ -978,15 +980,16 @@ func evalOpParentStruct(spans []structuralSpanRec, dst []int) []int {
 // evalOpNotSiblingStruct: a span with node 1 bit set (nodeMatch&0x02) qualifies when
 // no span with node 0 bit set (nodeMatch&0x01) shares its parent (!~).
 func evalOpNotSiblingStruct(spans []structuralSpanRec, dst []int) []int {
-	leftParents := make(map[int]struct{})
+	leftParents := acquireCompactBool(len(spans) + 1)
+	defer releaseCompactBool(leftParents)
 	for _, sp := range spans {
 		if sp.nodeMatch&0x01 != 0 {
-			leftParents[int(sp.parentIdx)] = struct{}{}
+			leftParents[int(sp.parentIdx)+1] = true
 		}
 	}
 	result := dst
 	for ri, r := range spans {
-		if _, hasLeft := leftParents[int(r.parentIdx)]; r.nodeMatch&0x02 != 0 && !hasLeft {
+		if hasLeft := leftParents[int(r.parentIdx)+1]; r.nodeMatch&0x02 != 0 && !hasLeft {
 			result = append(result, ri)
 		}
 	}
