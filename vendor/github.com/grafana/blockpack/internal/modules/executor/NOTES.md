@@ -6363,3 +6363,23 @@ and the emitted dict + dictIdxByPos — is byte-identical. Only the wasted `strc
 `string(bytes)` allocation for out-of-time-range refs is eliminated, cutting per-block allocation
 volume (and the GC pointer-scan cost the production CPU profile is dominated by) on the streaming
 flat group-by rate path. The materialization for in-range refs is unchanged.
+
+## NOTE-416: pool buildAggValsForRef's dense valByPK/hasByPK scratch arrays
+
+`buildAggValsForRef` (the N≥1 group-by non-count/rate aggregate path: min/max/avg/sum/quantile field
+extraction) builds two dense arrays indexed by packed key (`packKey(blockIdx,rowIdx)`): `valByPK`
+(`[]float64`) and `hasByPK` (`[]bool`), each sized `maxPK+1` where `maxPK` is the largest packed key
+over `inRangeRefs`. For a wide block these can reach ~32M entries → ~256 MB for `valByPK` plus ~32 MB
+for `hasByPK` (the ~288 MB figure the heap profile flagged). They were freshly `make`-allocated and
+GC'd on every per-block aggregate eval.
+
+Both are **pure local scratch** — they are never returned. The function scatters the aggregate column
+into them by packed key, then in a final pass copies only the in-range positions into the small
+returned `aggVals`/`aggPresent` slices (`len = len(inRangeRefs)`). So they can be drawn from the
+existing compact pools (`acquireCompactFloat64` / `acquireCompactBool`, zeroed on a pool hit) and
+released via `defer` before return. The defers fire after the named return values are evaluated, and
+the returned slices are independent copies, so handing the scratch back to the pool is safe even under
+concurrent block-evals. The pools' NOTE-355 oversized-drop guard caps what is retained, so a single
+giant-maxPK block does not pin a 256 MB buffer in the pool forever. Output is byte-identical; this only
+amortizes the large dense-array allocation across calls, cutting the per-block alloc volume that the
+production CPU profile attributes to GC pointer-scan (scanObject/findObject).

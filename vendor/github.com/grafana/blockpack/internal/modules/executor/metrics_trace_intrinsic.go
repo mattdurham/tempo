@@ -5087,8 +5087,15 @@ func buildAggValsForRef(
 			maxPK = pk
 		}
 	}
-	valByPK := make([]float64, maxPK+1) //nolint:gosec
-	hasByPK := make([]bool, maxPK+1)    //nolint:gosec
+	// NOTE-416: valByPK (float64) and hasByPK (bool) are dense scratch arrays sized by maxPK
+	// (up to ~288 MB combined for a wide block). They are pure locals — never returned, only
+	// used to scatter the small returned aggVals/aggPresent (len = len(inRangeRefs)). Draw them
+	// from the compact pools (zeroed on pool hit) and release before return so this large
+	// allocation is amortized across calls instead of pressuring GC on every block-eval.
+	valByPK := acquireCompactFloat64(int(maxPK) + 1) //nolint:gosec // G115: packed key < 2^31
+	defer releaseCompactFloat64(valByPK)
+	hasByPK := acquireCompactBool(int(maxPK) + 1) //nolint:gosec // G115: packed key < 2^31
+	defer releaseCompactBool(hasByPK)
 	switch col.Format {
 	// NOTE-411 (issue #357): IntrinsicFormatDeltaUint64 shares this branch (always-paged write path);
 	// a uint64 aggregate field (span:duration) is now a single-page Delta blob even when small.
