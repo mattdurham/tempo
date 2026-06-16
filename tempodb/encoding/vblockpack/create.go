@@ -57,6 +57,12 @@ func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.Blo
 		// is safe to enable here. Tiny low-cardinality columns are stored inline in the TOC
 		// entry, skipping the offset indirection and per-column outer snappy.
 		EnableInlineColumns: true,
+		// blockpack NOTE-405 (issue #355): per-column zstd codec, benefit-gated. The writer
+		// keeps zstd only when it beats snappy by a margin (large dict/ID columns like
+		// trace:id/span:id/span:parent_id), leaving incompressible/bit-packed columns on
+		// snappy. The reader is always codec-aware (additive flag on the V15 flags byte), so
+		// any V15 reader decodes zstd blobs. Shrinks on-disk size on the I/O-bound read path.
+		EnableZstdColumns: true,
 	}
 	// Pass embedder to blockpack writer — it handles field assembly and embedding internally.
 	// Must guard against nil *Embedder assigned to interface (Go nil interface trap).

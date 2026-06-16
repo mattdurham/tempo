@@ -213,6 +213,10 @@ func parseColumnMetadataArray(data []byte, offset, colCount int, blockVersion ui
 			dataOffset:      uint32(dataOffset),
 			compressedLen:   compressedLen,
 			uncompressedLen: uncompressedLen,
+			// NOTE-405 (issue #355): V15 may zstd-compress an offset-addressed blob. The
+			// codec is signaled by ColFlagZstd in the flags byte; V14 has no flags byte so
+			// flags is 0 and this is always false there.
+			zstd: v15 && flags&shared.ColFlagZstd != 0,
 		})
 	}
 
@@ -456,7 +460,13 @@ func parseBlockColumnsReuse(
 			// Reuse decompBuf across columns: all decoders copy data out (Present bitmap,
 			// Dict values, Idx arrays), so colData is safe to overwrite after readColumnEncoding.
 			var decErr error
-			colData, decompBuf, decErr = decompressV14ColumnDataInto(decompBuf, m.name, colData, m.uncompressedLen)
+			colData, decompBuf, decErr = decompressV14ColumnDataInto(
+				decompBuf,
+				m.name,
+				colData,
+				m.uncompressedLen,
+				m.zstd,
+			)
 			if decErr != nil {
 				return nil, fmt.Errorf("parseBlock: %w", decErr)
 			}
@@ -627,6 +637,7 @@ func appendLazyColumn(
 		Type:               m.colType,
 		SpanCount:          spanCount,
 		compressedEncoding: rawBytes[start:end], // zero-copy sub-slice; decompressed on first access
+		compressedZstd:     m.zstd,              // NOTE-405: codec for the deferred decompress
 		uncompressedLen:    m.uncompressedLen,
 		internMap:          nil, // nil → internString skips map; safe for concurrent lazy decode
 		v8CacheKey:         lazyKey,
@@ -721,12 +732,32 @@ func copyDecodedColumnInto(dst, snap *Column) {
 	dst.decoded.Store(true)                  // NOTE-CONC-001: mark eagerly decoded
 }
 
-// decompressV14ColumnData applies SPEC-ROOT-012 guards and snappy-decompresses a V14 column blob.
+// decompressV14ColumnData applies SPEC-ROOT-012 guards and decompresses a V14/V15 column blob.
+// The codec is snappy unless useZstd is set (NOTE-405, issue #355: V15 ColFlagZstd).
 // Returns the decompressed bytes or an error if the TOC length, frame header, or decode fails.
-// SPEC-ROOT-012: guards against decompression-bomb OOM via both TOC and snappy frame-header checks.
-func decompressV14ColumnData(name string, data []byte, uncompressedLen uint32) ([]byte, error) {
+// SPEC-ROOT-012: guards against decompression-bomb OOM via both TOC and codec frame-header checks.
+func decompressV14ColumnData(name string, data []byte, uncompressedLen uint32, useZstd bool) ([]byte, error) {
 	if uncompressedLen > uint32(shared.MaxBlockSize) { //nolint:gosec
 		return nil, fmt.Errorf("col %q: uncompressed_len %d exceeds MaxBlockSize", name, uncompressedLen)
+	}
+	if useZstd {
+		// NOTE-405: zstd carries no cheaply-readable framed length, so we size the dst from
+		// the TOC's uncompressed_len (already bounds-checked above). DecodeAll appends into
+		// the pre-sized, unzeroed dst; if the actual decoded length differs from the TOC we
+		// reject below, which is the same decompression-bomb protection snappy's frame check
+		// provides for that codec.
+		dst := shared.MakeNoZeroBytes(int(uncompressedLen))[:0]
+		decompressed, decErr := getZstdDecoder().DecodeAll(data, dst)
+		if decErr != nil {
+			return nil, fmt.Errorf("col %q zstd decode: %w", name, decErr)
+		}
+		if uint32(len(decompressed)) != uncompressedLen { //nolint:gosec
+			return nil, fmt.Errorf(
+				"col %q: zstd decoded length %d does not match uncompressed_len %d",
+				name, len(decompressed), uncompressedLen,
+			)
+		}
+		return decompressed, nil
 	}
 	frameLen, lenErr := snappy.DecodedLen(data)
 	if lenErr != nil {
@@ -755,14 +786,36 @@ func decompressV14ColumnData(name string, data []byte, uncompressedLen uint32) (
 // decompressV14ColumnDataInto is like decompressV14ColumnData but decompresses into dst,
 // growing it as needed. Returns the decoded slice (sub-slice of grown dst) and the grown dst.
 // The caller must not use colData after dst is reused for the next column.
+// The codec is snappy unless useZstd is set (NOTE-405, issue #355: V15 ColFlagZstd).
 func decompressV14ColumnDataInto(
 	dst []byte,
 	name string,
 	data []byte,
 	uncompressedLen uint32,
+	useZstd bool,
 ) (colData []byte, grownDst []byte, err error) {
 	if uncompressedLen > uint32(shared.MaxBlockSize) { //nolint:gosec
 		return nil, dst, fmt.Errorf("col %q: uncompressed_len %d exceeds MaxBlockSize", name, uncompressedLen)
+	}
+	if useZstd {
+		// NOTE-405: grow dst to the TOC's uncompressed_len so DecodeAll appends into the
+		// existing backing array (no fresh alloc when the pooled buffer is large enough).
+		// DecodeAll appends to dst[:0]; the result reslices the same array when cap suffices.
+		frameLen := int(uncompressedLen)
+		if cap(dst) < frameLen {
+			dst = make([]byte, 0, frameLen)
+		}
+		decoded, decErr := getZstdDecoder().DecodeAll(data, dst[:0])
+		if decErr != nil {
+			return nil, dst, fmt.Errorf("col %q zstd decode: %w", name, decErr)
+		}
+		if uint32(len(decoded)) != uncompressedLen { //nolint:gosec
+			return nil, dst, fmt.Errorf(
+				"col %q: zstd decoded length %d does not match uncompressed_len %d",
+				name, len(decoded), uncompressedLen,
+			)
+		}
+		return decoded, decoded[:0], nil
 	}
 	frameLen, lenErr := snappy.DecodedLen(data)
 	if lenErr != nil {
@@ -825,6 +878,7 @@ func resetColumn(col *Column) {
 	// NOTE-001: clear lazy decode fields so reused columns don't carry stale state.
 	col.rawEncoding = nil
 	col.compressedEncoding = nil // SPEC-V14-002: clear deferred decompression state
+	col.compressedZstd = false   // NOTE-405: clear deferred codec selection
 	col.uncompressedLen = 0
 	col.internMap = nil
 	col.sparseDictIdx = nil  // NOTE-PERF-1: clear deferred dense expansion

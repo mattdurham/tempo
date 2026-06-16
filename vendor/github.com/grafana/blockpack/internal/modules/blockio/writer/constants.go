@@ -132,6 +132,38 @@ func inlineColumnsActive() bool {
 	return inlineColumnsEnabled.Load()
 }
 
+// zstdColumnsEnabled is the process-level rollout toggle for per-column zstd compression of
+// V15 offset-addressed column blobs (NOTE-405, issue #355). It defaults to false. When true,
+// the writer compresses each V15 (non-inline) column blob with BOTH snappy and zstd and keeps
+// zstd only when it beats snappy by the benefit margin (zstdBenefitNum/zstdBenefitDen),
+// flagging those blobs with shared.ColFlagZstd. Reading is always codec-aware (additive), so
+// unlike the V15 version bump itself this is a pure encoder-side choice that any V15 reader
+// handles; it is still gated to default-OFF so it can be rolled out deliberately and reverted
+// by toggle without a format change. Atomic for the same reason as inlineColumnsEnabled: a
+// deploy-level constant in practice, atomic access removes the encoder-goroutine data race.
+var zstdColumnsEnabled atomic.Bool //nolint:gochecknoglobals // process-level rollout flag
+
+// setZstdColumnsEnabled sets the process-level per-column zstd rollout flag.
+func setZstdColumnsEnabled(v bool) {
+	zstdColumnsEnabled.Store(v)
+}
+
+// zstdColumnsActive reports whether per-column zstd emission is active.
+func zstdColumnsActive() bool {
+	return zstdColumnsEnabled.Load()
+}
+
+// zstd benefit gate (NOTE-405, issue #355). A column blob switches from snappy to zstd only
+// when len(zstd) * zstdBenefitDen < len(snappy) * zstdBenefitNum, i.e. zstd is at least
+// (1 - Num/Den) smaller than snappy. With Num=97, Den=100 a blob must be >=3% smaller under
+// zstd to switch — enough to comfortably clear noise on already-small blobs and to leave
+// incompressible/bit-packed columns (span:start/span:end show ~0% headroom) on snappy, while
+// still capturing the large dict/ID-column wins (trace:id ~70% smaller, span:parent_id ~40%).
+const (
+	zstdBenefitNum = 97
+	zstdBenefitDen = 100
+)
+
 // emittedBlockVersion returns the block-header version the writer should emit. V15 when the
 // inline-column rollout flag is set (NOTE-220), V14 otherwise.
 func emittedBlockVersion() uint8 {

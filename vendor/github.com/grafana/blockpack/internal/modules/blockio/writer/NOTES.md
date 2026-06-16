@@ -824,3 +824,41 @@ is intentionally NOT skipped here (treated separately per the issue).
 
 Back-ref: `internal/modules/blockio/shared/column_classify.go:ShouldSketchColumn`,
           `internal/modules/blockio/writer/sketch_index.go:add`
+
+## NOTE-405 — Per-column zstd codec, benefit-gated, for V15 column blobs (issue #355)
+
+*Added: 2026-06-16*
+
+**Problem:** the per-column section/page compressor is snappy. Measured on real encoded
+payloads, zstd (`SpeedDefault`) beats snappy substantially on the dict/ID-encoded columns
+(trace:id ~30% of snappy size, span:parent_id ~61%, span:id ~63%) while showing ~0% headroom on
+already-bit-packed columns (span:start/span:end). The read path is I/O/alloc-bound, so zstd's
+2–3× slower decode is single-digit ms, immaterial against object-storage round-trip latency.
+
+**Change:** a purely additive per-column codec choice on the V15 column TOC entry. Added
+`shared.ColFlagZstd` (0x02) to the V15 per-column flags byte (NOTE-220 added the byte; only bit 0
+ColFlagInline was used). When the per-column zstd rollout flag is active, `blockBuilder.finalize`
+compresses each non-inline V15 blob with BOTH snappy and zstd and keeps zstd only when
+`len(zstd)·zstdBenefitDen < len(snappy)·zstdBenefitNum` (currently 97/100 → zstd ≥3% smaller),
+flagging those blobs with ColFlagZstd. Incompressible/bit-packed blobs (no headroom) and inline
+columns (stored raw) stay on snappy. The benefit comparison runs BEFORE the inline decision so
+inline weighs against the smaller codec.
+
+**Codec selection is keyed off metadata, not the blob source.** The reader's
+`colMetaEntry.zstd` (parsed from the flags byte) drives `decompressV14ColumnData[Into]`'s codec
+in every decode path — eager full-block, lazy WantOnly defer-decompress, and the compaction
+pass-through `resolveColumnData` (which returns the same on-disk bytes). No file size grows: a
+blob lacking the bit decodes as snappy byte-for-byte as before.
+
+**Rollout:** `Config.EnableZstdColumns` (default OFF, requires `EnableInlineColumns`/V15). The
+reader is always codec-aware so no reader version bump is needed; emission is toggle-gated so it
+can be enabled and reverted without a format change. Encoder is a package-level
+`zstd.SpeedDefault`/`EncoderConcurrency(1)` writer constructed lazily (the OFF default never
+builds it), mirroring the existing vectorF32 encoder.
+
+Back-ref: `shared/constants.go:ColFlagZstd`, `writer/constants.go:zstdColumnsEnabled` +
+          `zstdBenefit{Num,Den}`, `writer/config.go:EnableZstdColumns`,
+          `writer/writer_block.go:finalize` (codec choice + flag write) +
+          `getColumnZstdEncoder`; reader side: `reader/block_parser.go:parseColumnMetadataArray`
+          (flag parse) + `decompressV14ColumnData[Into]` (codec select),
+          `reader/colmetaentry.go:zstd`, `reader/column.go:compressedZstd`.

@@ -9,15 +9,43 @@ import (
 	"fmt"
 	"math"
 	"slices"
+	"sync"
 	"unsafe"
 
 	tempotrace "github.com/grafana/tempo/pkg/tempopb/trace/v1"
 	"github.com/klauspost/compress/snappy"
+	"github.com/klauspost/compress/zstd"
 	commonv1 "go.opentelemetry.io/proto/otlp/common/v1"
 
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
 )
+
+// columnZstdEnc is the package-level zstd encoder used for per-column V15 blob compression
+// (NOTE-405, issue #355). SpeedDefault matches the issue's measured codec and the existing
+// vectorF32 encoder; EncoderConcurrency(1) keeps it usable concurrently across per-block
+// encoder goroutines (EncodeAll is goroutine-safe at concurrency 1). It is created lazily so
+// the OFF (snappy-only) default never constructs a zstd encoder.
+var (
+	columnZstdEncOnce sync.Once
+	columnZstdEnc     *zstd.Encoder //nolint:gochecknoglobals
+)
+
+// getColumnZstdEncoder returns the shared per-column zstd encoder.
+func getColumnZstdEncoder() *zstd.Encoder {
+	columnZstdEncOnce.Do(func() {
+		var err error
+		columnZstdEnc, err = zstd.NewWriter(
+			nil,
+			zstd.WithEncoderLevel(zstd.SpeedDefault),
+			zstd.WithEncoderConcurrency(1),
+		)
+		if err != nil {
+			panic("writer: column zstd.NewWriter: " + err.Error())
+		}
+	})
+	return columnZstdEnc
+}
 
 // pendingSpan is a lightweight span record buffered before sorting and flushing.
 // Stores only the sort keys and proto pointers; full OTLP→column decoding is deferred
@@ -1516,11 +1544,12 @@ func (b *blockBuilder) finalize(blockVersion uint8) ([]byte, error) {
 	// (un-snappy) blob is stored directly in the TOC entry and dataBlob is empty.
 	type colBlob struct {
 		name            string
-		dataBlob        []byte // on-disk bytes (snappy-compressed for V14+, raw for earlier)
+		dataBlob        []byte // on-disk bytes (snappy- or zstd-compressed for V14+, raw for earlier)
 		rawBlob         []byte // V15 inline: raw bytes stored in the TOC entry
-		uncompressedLen uint32 // V14+ only: original raw byte length before snappy
+		uncompressedLen uint32 // V14+ only: original raw byte length before compression
 		typ             shared.ColumnType
 		inline          bool // V15 only: stored inline in the TOC entry
+		zstd            bool // V15 only: dataBlob is zstd-compressed (NOTE-405); else snappy
 	}
 	blobs := make([]colBlob, 0, colCount)
 
@@ -1539,17 +1568,32 @@ func (b *blockBuilder) finalize(blockVersion uint8) ([]byte, error) {
 				dataBlob:        compressed,
 				uncompressedLen: uint32(len(raw)), //nolint:gosec // safe: raw blob bounded by block size
 			}
+			// NOTE-405 (issue #355): for V15, optionally switch this blob to zstd when it
+			// beats snappy by the benefit margin. Done BEFORE the inline decision so the
+			// inline comparison weighs against the smaller of the two codecs. Skipped unless
+			// the per-column zstd rollout flag is active (default OFF → snappy everywhere).
+			// The benefit gate leaves incompressible/bit-packed blobs (no headroom) on snappy.
+			if blockVersion == shared.VersionBlockV15 && zstdColumnsActive() {
+				zblob := getColumnZstdEncoder().EncodeAll(raw, nil)
+				if len(zblob)*zstdBenefitDen < len(compressed)*zstdBenefitNum {
+					compressed = zblob
+					bl.dataBlob = zblob
+					bl.zstd = true
+				}
+			}
 			// NOTE-220: for V15, choose inline when it is strictly smaller on the wire.
 			// Non-inline costs 16 B of TOC tail (offset[8]+clen[4]+ulen[4]) PLUS the
 			// compressed blob in the data section. Inline costs 1 B of inline_len PLUS the
 			// raw blob in the TOC. The shared flags byte cancels. Inline wins when
 			//   1 + len(raw) < 16 + len(compressed)   and   len(raw) <= ColInlineMaxLen.
+			// An inline column is stored raw (uncompressed), so drop any zstd choice for it.
 			if blockVersion == shared.VersionBlockV15 &&
 				len(raw) <= shared.ColInlineMaxLen &&
 				1+len(raw) < 16+len(compressed) {
 				bl.inline = true
 				bl.rawBlob = raw
 				bl.dataBlob = nil
+				bl.zstd = false
 			}
 			blobs = append(blobs, bl)
 		} else {
@@ -1657,7 +1701,13 @@ func (b *blockBuilder) finalize(blockVersion uint8) ([]byte, error) {
 				// No data-section blob; curDataOff unchanged.
 				continue
 			}
-			payload = append(payload, 0) // flags: no inline
+			// NOTE-405 (issue #355): set the zstd codec bit for offset-addressed blobs the
+			// writer chose to zstd-compress; otherwise the blob is snappy (flags 0).
+			var flags uint8
+			if bl.zstd {
+				flags |= shared.ColFlagZstd
+			}
+			payload = append(payload, flags)
 			// data_offset[8 LE] + compressed_len[4 LE] + uncompressed_len[4 LE]
 			payload = appendUint64LE(payload, dataOff)
 			payload = appendUint32LE(payload, uint32(dataLen)) //nolint:gosec // safe: blob bounded by block size

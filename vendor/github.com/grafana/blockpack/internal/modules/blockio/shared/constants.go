@@ -24,6 +24,15 @@ const (
 	// snappy). Inline payload length is bounded by ColInlineMaxLen.
 	ColFlagInline uint8 = 0x01
 
+	// ColFlagZstd is the V15 column TOC flag bit indicating the column's offset-addressed
+	// data blob is compressed with zstd instead of the default snappy (NOTE-405, issue #355).
+	// It is purely additive: a blob without this bit decodes as snappy exactly as before, so
+	// existing V15 files keep working. Mutually exclusive with ColFlagInline (an inline column
+	// is stored raw and is never compressed). Only the offset-addressed (non-inline) form can
+	// carry this bit. The writer sets it per-column only when zstd beats snappy by a benefit
+	// margin (zstdBenefitNum/zstdBenefitDen) so incompressible/bit-packed blobs stay on snappy.
+	ColFlagZstd uint8 = 0x02
+
 	// ColInlineMaxLen is the maximum byte length of an inline column payload (NOTE-220).
 	// The inline length is encoded in a single byte, so the hard cap is 255; the writer
 	// only chooses inline when it is strictly smaller than the non-inline encoding, which

@@ -1031,7 +1031,7 @@ func (r *Reader) AddColumnsToBlock(bwb *BlockWithBytes, addColumns map[string]st
 
 			// SPEC-V14-001: column blobs are snappy-compressed; decompress before decode.
 			// SPEC-ROOT-012: decompressV14ColumnData guards against decompression-bomb OOM.
-			colData, err = decompressV14ColumnData(m.name, bwb.RawBytes[start:end], m.uncompressedLen)
+			colData, err = decompressV14ColumnData(m.name, bwb.RawBytes[start:end], m.uncompressedLen, m.zstd)
 			if err != nil {
 				return fmt.Errorf("AddColumnsToBlock: %w", err)
 			}

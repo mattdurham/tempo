@@ -2990,3 +2990,23 @@ Back-ref: `chunked_trace_index.go:chunkBytes / traceChunkProcKey / recordChunkL1
 `parser.go:parsedTraceChunkCache / traceChunk.SizeBytes`.
 Tests: `chunked_trace_index_test.go:TestChunkedTraceIndex_ProcessChunkCacheCrossReader`
 (cold→warm I/O drop, entry equivalence, fileID key isolation).
+
+## NOTE-405 (reader side) — Codec-aware V15 column decompress (zstd or snappy)
+
+*Added: 2026-06-16*
+
+The writer-side decision lives in `writer/NOTES.md:NOTE-405`. Reader side: V15 column blobs may
+be zstd-compressed (signaled by `shared.ColFlagZstd` in the per-column flags byte) instead of
+snappy. `parseColumnMetadataArray` parses the bit into `colMetaEntry.zstd` (always false for V14 —
+no flags byte — and for inline columns, which are stored raw). `decompressV14ColumnData` and
+`decompressV14ColumnDataInto` take a `useZstd bool` and dispatch to the shared
+`getZstdDecoder().DecodeAll` (the same package-level decoder the vectorF32 path already uses) or
+the snappy path. The codec flows through all three decode entry points: eager full-block parse
+(`reader.go`/`block_parser.go`), and the lazy WantOnly defer-decompress via `Column.compressedZstd`
+(set at lazy registration, cleared in `resetColumn`/cache-hit reuse so a recycled Column never
+carries a stale codec). zstd carries no cheaply-readable framed length, so the dst is sized from
+the TOC's already-bounds-checked `uncompressed_len`; a decoded length that disagrees is rejected,
+giving the same decompression-bomb protection snappy's frame-header check provides.
+
+Back-ref: `reader/colmetaentry.go:zstd`, `reader/block_parser.go:parseColumnMetadataArray` +
+          `decompressV14ColumnData[Into]`, `reader/column.go:compressedZstd` + `ensureDecompressed`.

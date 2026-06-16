@@ -147,4 +147,16 @@ type Config struct {
 	// bump: V14-only readers cannot read a V15 block, so a writer emitting V15 must be deployed
 	// AFTER readers understand V15. Readers in this codebase accept both V14 and V15.
 	EnableInlineColumns bool
+
+	// EnableZstdColumns turns ON per-column zstd compression of V15 offset-addressed column
+	// blobs (NOTE-405, issue #355). When true the writer compresses each non-inline V15 column
+	// blob with both snappy and zstd and keeps zstd only when it is meaningfully smaller (the
+	// blob is flagged with shared.ColFlagZstd; incompressible/bit-packed blobs stay on snappy).
+	// When false (the DEFAULT) every column blob uses snappy exactly as before.
+	//
+	// Requires EnableInlineColumns (V15 blocks): the zstd codec is signaled by a flag bit in
+	// the V15 per-column flags byte, which V14 does not have. The reader is always codec-aware,
+	// so any V15 reader decodes zstd blobs without a further version bump. Defaults OFF so it
+	// can be rolled out deliberately and reverted by toggle without a format change.
+	EnableZstdColumns bool
 }

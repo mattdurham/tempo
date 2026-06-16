@@ -150,6 +150,11 @@ func NewWriterWithConfig(cfg Config) (*Writer, error) {
 	// NOTE-220: apply the V15 inline-column rollout flag. Default is DISABLED (V14 blocks);
 	// setting Config.EnableInlineColumns emits V15 blocks with inline tiny columns.
 	setInlineColumnsEnabled(cfg.EnableInlineColumns)
+	// NOTE-405 (issue #355): apply the per-column zstd rollout flag. Default is DISABLED
+	// (every column blob snappy); setting Config.EnableZstdColumns lets the writer pick zstd
+	// per-column when it beats snappy by the benefit margin. Requires V15 (EnableInlineColumns)
+	// since the codec is signaled by a V15 flags-byte bit; gated to that combination below.
+	setZstdColumnsEnabled(cfg.EnableZstdColumns && cfg.EnableInlineColumns)
 	// Default auto-flush at 5× block size. Caps live proto memory to one batch of
 	// 5 blocks while preserving enough lookahead for MinHash sort quality.
 	if cfg.MaxBufferedSpans == 0 {

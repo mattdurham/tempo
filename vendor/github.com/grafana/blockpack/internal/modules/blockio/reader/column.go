@@ -383,7 +383,7 @@ func (c *Column) ensureDecompressed() {
 		// a pooled buffer.
 		bp := decompBufPool.Get().(*[]byte)
 		decompressed, grown, err := decompressV14ColumnDataInto(
-			(*bp)[:0], c.Name, c.compressedEncoding, c.uncompressedLen,
+			(*bp)[:0], c.Name, c.compressedEncoding, c.uncompressedLen, c.compressedZstd,
 		)
 		if err != nil {
 			// SPEC-ROOT-010: log decompression failures; silent skips hide data corruption.
@@ -399,6 +399,7 @@ func (c *Column) ensureDecompressed() {
 			c.decompPooledPtr = bp
 		}
 		c.compressedEncoding = nil
+		c.compressedZstd = false
 		c.uncompressedLen = 0
 	})
 }
@@ -458,6 +459,7 @@ func (c *Column) decodeNow() {
 				c.packedIdxWidth = cached.packedIdxWidth // NOTE-369
 				c.rawEncoding = nil
 				c.compressedEncoding = nil
+				c.compressedZstd = false
 				c.internMap = nil
 				c.decoded.Store(true)
 			})
@@ -2284,6 +2286,12 @@ type Column struct {
 	// all-present case is covered: a partial-presence column needs a real rank table, so it
 	// keeps the materialized *Idx slice (denseFlatIdx == false).
 	denseFlatIdx bool
+	// compressedZstd selects the codec for the deferred lazy-decompress of compressedEncoding
+	// (NOTE-405, issue #355). false → snappy (the historical path), true → zstd (V15
+	// ColFlagZstd). Set from colMetaEntry.zstd at lazy registration; ensureDecompressed
+	// passes it to decompressV14ColumnDataInto. Placed with denseFlatIdx/packedIdxWidth so
+	// the trailing small fields pack without growing the struct (fieldalignment).
+	compressedZstd bool
 }
 
 // IsDenseFlatIdx reports whether this column uses the NOTE-358 identity-index optimization

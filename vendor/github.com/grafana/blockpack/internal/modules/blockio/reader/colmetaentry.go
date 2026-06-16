@@ -19,4 +19,9 @@ type colMetaEntry struct {
 	compressedLen   uint32
 	uncompressedLen uint32
 	colType         shared.ColumnType
+	// zstd is set when the V15 ColFlagZstd bit is present on this column's flags byte
+	// (NOTE-405, issue #355): the offset-addressed blob is zstd-compressed rather than
+	// snappy. Always false for V14 and for inline columns. The decompress path selects the
+	// codec from this flag; a false value keeps the historical snappy path byte-for-byte.
+	zstd bool
 }

@@ -1403,10 +1403,10 @@ name_len[2] + name[name_len] + col_type[1] + flags[1]
 | name_len | uint16 LE | 2 | Column name length in bytes |
 | name | bytes | N | Column name (UTF-8) |
 | col_type | uint8 | 1 | ColumnType enum |
-| flags | uint8 | 1 | Bit 0 (ColFlagInline) = inline; other bits reserved (must be 0) |
+| flags | uint8 | 1 | Bit 0 (ColFlagInline) = inline; Bit 1 (ColFlagZstd) = blob is zstd (else snappy); other bits reserved (must be 0) |
 | *(non-inline)* data_offset | uint64 LE | 8 | Offset of column blob from block start |
-| *(non-inline)* compressed_len | uint32 LE | 4 | Byte length of snappy blob on disk |
-| *(non-inline)* uncompressed_len | uint32 LE | 4 | Byte length after snappy decompress |
+| *(non-inline)* compressed_len | uint32 LE | 4 | Byte length of compressed blob on disk (snappy or zstd per ColFlagZstd) |
+| *(non-inline)* uncompressed_len | uint32 LE | 4 | Byte length after decompress |
 | *(inline)* inline_len | uint8 | 1 | Byte length of inline_data (≤ 255) |
 | *(inline)* inline_data | bytes | inline_len | Raw column blob (un-snappy), decoded directly |
 
@@ -1422,9 +1422,25 @@ blob — no offset chase, no snappy decompress. Inline columns also skip the laz
 defer-decompression machinery: the lazy-registration loop sets `rawEncoding` directly so
 `ensureDecompressed` is a no-op and `decodeNow` decodes straight from the inline bytes.
 
+**Per-column zstd codec (NOTE-405, issue #355).** A V15 non-inline column blob may be
+zstd-compressed instead of snappy, signaled by the `ColFlagZstd` (0x02) flag bit. This is a
+**purely additive** codec choice: a blob without the bit decodes as snappy exactly as before, so
+existing V15 files keep working and **no file-size grows**. The writer compresses each non-inline
+blob with both codecs and keeps zstd **only** when it beats snappy by the benefit margin
+(`len(zstd)·zstdBenefitDen < len(snappy)·zstdBenefitNum`, currently zstd ≥3% smaller), leaving
+incompressible/bit-packed columns (`span:start`/`span:end` — ~0% headroom) on snappy. Inline
+columns are stored raw and never carry this bit (ColFlagZstd and ColFlagInline are mutually
+exclusive). `ColFlagZstd` is meaningful only in V15: V14 has no flags byte, so V14 blobs are
+always snappy. The reader selects the codec from the flag in both the eager and lazy-decompress
+paths; the decompression-bomb guard uses `uncompressed_len` to size the zstd dst and rejects a
+decoded length that disagrees with the TOC.
+
 **Rollout.** Emission of V15 is gated by `writer.Config.EnableInlineColumns` (default OFF — the
 writer keeps emitting V14). V15 is a version bump that V14-only readers cannot read, so the writer
 must be deployed AFTER readers understand V15. Readers in this codebase accept both V14 and V15.
+Per-column zstd is gated by `writer.Config.EnableZstdColumns` (default OFF; requires V15) — the
+reader is always codec-aware, so any V15 reader decodes zstd blobs without a further version bump,
+but emission is toggle-gated so it can be rolled out and reverted without a format change.
 Compaction reads V14/V15 inputs transparently and always emits the configured output version.
 
 ### 12.3 V14 Column Blob Format (enc_version=3)
