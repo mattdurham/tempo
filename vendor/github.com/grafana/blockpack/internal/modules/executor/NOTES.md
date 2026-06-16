@@ -6327,3 +6327,20 @@ column, asserting >1 distinct boundary (so the Delta accumulation is actually ex
 the boundary-0 sentinel). `TestHistBoundaryCounter_MatchesEager` pins the streaming boundary count
 against `countIntrinsicHistogramBoundaries`, and `..._FallbackNonStreamable` pins the Dict
 fall-through.
+
+
+## NOTE-414: pool the >> / !>> ancestor-existence memo (eliminate per-block []uint8 alloc)
+
+`evalOpDescendantStruct` (`>>`) and `evalOpNotDescendantStruct` (`!>>`) each began with
+`memo := make([]uint8, len(spans))` — a fresh tri-state (memoUnknown/memoYes/memoNo) ancestor
+memo allocated per block-eval on the structural query hot path (Q9). The memo is fully
+overwritten/read within the single call and never escapes, so it is a textbook per-call scratch
+buffer. Both now draw from a process-wide `compactUint8Pool` via `acquireCompactUint8(len(spans))`
+(zeroed back to memoUnknown=0 on a pool hit) and return it with `defer releaseCompactUint8(memo)`.
+This mirrors the existing `compactBoolPool`/`compactInt16Pool` family (NOTE-125/129) and the
+structural `compactBool` reuse of NOTE-413, extending the per-block scratch-pooling discipline to
+the last unpooled structural memo. The pool stores `*[]uint8` (pointer-wrapped) so `Put` is
+SA6002-clean without a nolint. `releaseCompactUint8` honours the NOTE-355 oversized-drop cap
+(`cap > compactPoolMaxPooledBytes`) so a pathological wide block does not pin a giant array in the
+pool. Output is byte-identical (same memo states, same emit order); the only change is the backing
+array is reused across block-evals instead of freshly heap-allocated and GC'd each call.

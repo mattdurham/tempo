@@ -7035,3 +7035,24 @@ func intrinsicHistogramBoundary(v float64, fieldName string) float64 {
 	}
 	return pow2Floor(math.Abs(v))
 }
+
+var compactUint8Pool sync.Pool
+
+func acquireCompactUint8(n int) []uint8 {
+	if v := compactUint8Pool.Get(); v != nil {
+		if p, ok := v.(*[]uint8); ok && cap(*p) >= n {
+			s := (*p)[:n]
+			clear(s)
+			return s
+		}
+	}
+	return make([]uint8, n)
+}
+
+func releaseCompactUint8(s []uint8) {
+	if cap(s) > compactPoolMaxPooledBytes {
+		return
+	}
+	s = s[:cap(s)]
+	compactUint8Pool.Put(&s)
+}

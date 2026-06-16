@@ -865,8 +865,10 @@ func hasNode0AncestorMemo(spans []structuralSpanRec, ri int, memo []uint8) bool 
 
 // evalOpDescendantStruct: R is a descendant of L (>>) — true when R has a node-0 ancestor.
 func evalOpDescendantStruct(spans []structuralSpanRec, dst []int) []int {
-	// NOTE-392: memoized ancestor-existence walk; see hasNode0AncestorMemo.
-	memo := make([]uint8, len(spans))
+	memo := // NOTE-392: memoized ancestor-existence walk; see hasNode0AncestorMemo.
+	acquireCompactUint8(len(spans))
+	defer releaseCompactUint8(memo)
+
 	result := dst
 	for ri, r := range spans {
 		if r.nodeMatch&0x02 == 0 {
@@ -1000,10 +1002,12 @@ func evalOpNotSiblingStruct(spans []structuralSpanRec, dst []int) []int {
 // none of its ancestors has the node 0 bit set (nodeMatch&0x01) (!>>).
 // Walk the span's ancestor chain; if no ancestor carries node 0, emit the span.
 func evalOpNotDescendantStruct(spans []structuralSpanRec, dst []int) []int {
-	// NOTE-392: same memoized ancestor-existence walk as the positive descendant op (the node-0
+	memo := // NOTE-392: same memoized ancestor-existence walk as the positive descendant op (the node-0
 	// membership is already encoded by nodeMatch&0x01, so the prior per-span leftSet map was
 	// redundant and is dropped). !>> emits RHS spans with NO node-0 ancestor.
-	memo := make([]uint8, len(spans))
+	acquireCompactUint8(len(spans))
+	defer releaseCompactUint8(memo)
+
 	result := dst
 	for ri, r := range spans {
 		if r.nodeMatch&0x02 == 0 {
