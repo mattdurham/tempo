@@ -3968,7 +3968,13 @@ func buildDictIdxForRefs(
 				}
 			}
 		}
-	case modules_shared.IntrinsicFormatFlat:
+	// NOTE-411 (issue #357): DeltaUint64 (uint64 group-by) and XORBytes (bytes group-by) share
+	// this branch (always-paged write path). A small uint64/bytes group-by column is now a
+	// single-page Delta/XORBytes blob; both decode to col.Uint64Values / col.BytesValues exactly
+	// as the legacy v1 Flat path did, so a missing case here would yield an empty group dict.
+	case modules_shared.IntrinsicFormatFlat,
+		modules_shared.IntrinsicFormatDeltaUint64,
+		modules_shared.IntrinsicFormatXORBytes:
 		// Flat columns: build val→idx mapping on the fly.
 		valToIdx := make(map[string]uint32, 16)
 		for i, ref := range col.BlockRefs {
@@ -5015,7 +5021,9 @@ func accumulateAggDirectScanCol(
 				updateAggBucket(groupBuckets[gIdx][bk-1], fn, fval)
 			}
 		}
-	case modules_shared.IntrinsicFormatFlat:
+	// NOTE-411 (issue #357): IntrinsicFormatDeltaUint64 shares this branch (always-paged write path);
+	// a uint64 aggregate field is now a single-page Delta blob even when small.
+	case modules_shared.IntrinsicFormatFlat, modules_shared.IntrinsicFormatDeltaUint64:
 		for i, ref := range col.BlockRefs {
 			if spanCount&ctxCheckMask == 0 {
 				if err := ctx.Err(); err != nil {
@@ -5080,7 +5088,9 @@ func buildAggValsForRef(
 	valByPK := make([]float64, maxPK+1) //nolint:gosec
 	hasByPK := make([]bool, maxPK+1)    //nolint:gosec
 	switch col.Format {
-	case modules_shared.IntrinsicFormatFlat:
+	// NOTE-411 (issue #357): IntrinsicFormatDeltaUint64 shares this branch (always-paged write path);
+	// a uint64 aggregate field (span:duration) is now a single-page Delta blob even when small.
+	case modules_shared.IntrinsicFormatFlat, modules_shared.IntrinsicFormatDeltaUint64:
 		for i, ref := range col.BlockRefs {
 			if i >= len(col.Uint64Values) {
 				continue
@@ -6137,7 +6147,8 @@ func buildAggValsMap(
 		return out, nil
 	}
 	switch col.Format {
-	case modules_shared.IntrinsicFormatFlat:
+	// NOTE-411 (issue #357): IntrinsicFormatDeltaUint64 shares this branch (always-paged write path).
+	case modules_shared.IntrinsicFormatFlat, modules_shared.IntrinsicFormatDeltaUint64:
 		for i, ref := range col.BlockRefs {
 			if i >= len(col.Uint64Values) {
 				continue
@@ -6228,7 +6239,12 @@ func streamHistogramGroupBy(
 				intrinsicGetOrCreateBucket(buckets, key).count++
 			}
 		}
-	case modules_shared.IntrinsicFormatFlat:
+	// NOTE-411 (issue #357): IntrinsicFormatDeltaUint64 shares this branch. With the always-paged
+	// write path, a small span:duration column is now a single-page DeltaUint64 blob (previously
+	// IntrinsicFormatFlat). Both decode to col.Uint64Values + col.BlockRefs identically, so a
+	// missing Delta case here would silently route every pk to the absent-row pass → boundary-0
+	// collapse (the same class of bug NOTE-410 fixed on the streaming histogram scan).
+	case modules_shared.IntrinsicFormatFlat, modules_shared.IntrinsicFormatDeltaUint64:
 		for i, ref := range col.BlockRefs {
 			if i >= len(col.Uint64Values) {
 				continue
@@ -6461,7 +6477,9 @@ func streamHistogramGroupByID(
 				histCounts[hk]++
 			}
 		}
-	case modules_shared.IntrinsicFormatFlat:
+	// NOTE-411 (issue #357): IntrinsicFormatDeltaUint64 shares this branch — see the equivalent
+	// fold in streamHistogramGroupBy. A small span:duration column is now a single-page Delta blob.
+	case modules_shared.IntrinsicFormatFlat, modules_shared.IntrinsicFormatDeltaUint64:
 		for i, ref := range col.BlockRefs {
 			if spanCount&ctxCheckMask == 0 {
 				if err := ctx.Err(); err != nil {
@@ -6583,7 +6601,8 @@ func streamHistogramGroupByIDSingle(
 				histCounts[hk]++
 			}
 		}
-	case modules_shared.IntrinsicFormatFlat:
+	// NOTE-411 (issue #357): IntrinsicFormatDeltaUint64 shares this branch (always-paged write path).
+	case modules_shared.IntrinsicFormatFlat, modules_shared.IntrinsicFormatDeltaUint64:
 		for i, ref := range col.BlockRefs {
 			if spanCount&ctxCheckMask == 0 {
 				if err := ctx.Err(); err != nil {

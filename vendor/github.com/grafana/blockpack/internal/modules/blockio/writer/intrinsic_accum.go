@@ -231,26 +231,39 @@ func (a *intrinsicAccumulator) columnNames() []string {
 }
 
 // encodeColumn serializes one column's accumulated data into a compressed blob.
-// Uses paged (v2) format when row count exceeds IntrinsicPageSize, otherwise v1 monolithic.
+//
+// NOTE-411 (issue #357): the writer now ALWAYS emits the v2 paged format for non-empty
+// columns — XORBytes/DeltaUint64 (single-page paged blob) for flat bytes/uint64, and the
+// paged dict format for dict columns. The old IntrinsicPageSize-gated split (≤10k rows →
+// v1 monolithic encodeFlatColumn/encodeDictColumn) is gone on the WRITE path. IntrinsicPageSize
+// remains the per-page chunk size for multi-page columns (see encodePagedDictColumn);
+// it is no longer a format-selection threshold.
+//
+// Rationale: the v1 monolithic format kept two reader decode paths alive
+// (decodeLegacyFlatBlob/decodeLegacyDictBlob) and forced the NOTE-406/407 streaming group-by
+// paths to retain a non-streamable v1 fallback (paged dict IS page-streamable, v1 dict is not).
+// Always emitting paged makes streaming unconditional for all NEW blocks. The reader-side
+// legacy decode is RETAINED for now: existing on-disk blocks still contain v1 blobs and must be
+// recompacted before that decode can be removed (the reader cleanup is a follow-up gated on
+// block migration, per issue #357 trade-offs).
+//
+// Empty columns (no refs / no values) still fall through encodeXORBytes/Delta's len==0 guard
+// to encodeFlatColumn, which is a degenerate v1 blob; an empty column has nothing to stream
+// and never reaches the legacy decode complexity this change targets.
 func (a *intrinsicAccumulator) encodeColumn(name string) ([]byte, error) {
 	if c, ok := a.flatCols[name]; ok {
-		if len(c.refs) > shared.IntrinsicPageSize {
-			if len(c.bytesValues) > 0 {
-				return encodeXORBytesIntrinsic(c)
-			}
+		if len(c.bytesValues) > 0 {
+			return encodeXORBytesIntrinsic(c)
+		}
+		if len(c.uint64Values) > 0 {
 			return encodeDeltaUint64Intrinsic(c)
 		}
+		// No values: degenerate/empty column. encodeXORBytes/Delta both guard len==0 by
+		// delegating here anyway, so call it directly to avoid an empty single-page blob.
 		return encodeFlatColumn(c)
 	}
 	if c, ok := a.dictCols[name]; ok {
-		total := 0
-		for _, e := range c.entries {
-			total += len(e.refs)
-		}
-		if total > shared.IntrinsicPageSize {
-			return encodePagedDictColumn(c)
-		}
-		return encodeDictColumn(c)
+		return encodePagedDictColumn(c)
 	}
 	return nil, nil
 }
@@ -1012,5 +1025,9 @@ func decodeTOC(blob []byte) ([]shared.IntrinsicColMeta, error) {
 // decodeIntrinsicColumnBlob is a package-local alias to shared.DecodeIntrinsicColumnBlob,
 // used by white-box tests.
 func decodeIntrinsicColumnBlob(blob []byte) (*shared.IntrinsicColumn, error) {
-	return shared.DecodeIntrinsicColumnBlob(blob)
+	// NOTE-411: writer tests assert col.BlockRefs directly. With the always-paged write path
+	// (issue #357), flat columns now decode as paged Delta/XOR blobs whose refs are lazy by
+	// default (NOTE-390). Use the eager-refs decode so this helper materializes BlockRefs the
+	// same way the old v1 monolithic decode did, keeping the test contract unchanged.
+	return shared.DecodeIntrinsicColumnBlobEagerRefs(blob)
 }

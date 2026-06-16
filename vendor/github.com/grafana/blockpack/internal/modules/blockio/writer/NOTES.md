@@ -862,3 +862,42 @@ Back-ref: `shared/constants.go:ColFlagZstd`, `writer/constants.go:zstdColumnsEna
           `getColumnZstdEncoder`; reader side: `reader/block_parser.go:parseColumnMetadataArray`
           (flag parse) + `decompressV14ColumnData[Into]` (codec select),
           `reader/colmetaentry.go:zstd`, `reader/column.go:compressedZstd`.
+
+## NOTE-411 — Writer always emits v2 paged intrinsic columns (issue #357)
+
+*Added: 2026-06-16*
+
+**Problem:** the writer split intrinsic columns by row count: ≤`IntrinsicPageSize` (10k) rows
+went to the v1 monolithic format (`encodeFlatColumn`/`encodeDictColumn`), above went to the
+non-legacy formats (XORBytes/DeltaUint64 single-page for flat, paged for dict). That split kept
+two reader decode paths alive (`decodeLegacyFlatBlob`/`decodeLegacyDictBlob`) and forced the
+NOTE-406/407 streaming group-by paths to retain a non-streamable v1 fallback (paged dict IS
+page-streamable; v1 dict is not).
+
+**Change (write path only):** `intrinsicAccumulator.encodeColumn` no longer consults
+`IntrinsicPageSize` as a format-selection threshold. It always emits the v2 paged format for
+non-empty columns — XORBytes for flat bytes, DeltaUint64 for flat uint64 (both single-page paged
+blobs), paged dict for dict columns. `IntrinsicPageSize` is retained as the per-page CHUNK size
+for multi-page columns (`encodePagedDictColumn`); it is NOT removed (setting it to 0 would divide
+by zero in the page-count math and break `parallelPageDecodeMinRows`). Empty columns still fall
+through to `encodeFlatColumn` (a degenerate v1 blob with nothing to stream).
+
+**Reader cleanup is deliberately NOT done here.** Existing on-disk blocks still contain v1 blobs;
+`decodeLegacyFlatBlob`/`decodeLegacyDictBlob` and the streaming v1 fallback MUST stay until those
+blocks are recompacted out (per issue #357 trade-offs). This is the safe half of the issue; the
+reader-side deletion is a follow-up gated on block migration.
+
+**Latent format-dispatch bugs surfaced.** Because small columns were always v1 Flat/Dict before,
+several executor format switches handled only `IntrinsicFormatFlat` (reading `col.Uint64Values`)
+and silently routed everything else to an absent/empty path. With small span:duration now always
+`IntrinsicFormatDeltaUint64`, those switches collapsed histograms to boundary-0 and zeroed SUM/AVG.
+Folded `IntrinsicFormatDeltaUint64` (and `IntrinsicFormatXORBytes` where bytes group-by applies)
+into the Flat branch of: `streamHistogramGroupBy`, `streamHistogramGroupByID`,
+`streamHistogramGroupByIDSingle`, `accumulateAggDirectScanCol`, `buildAggValsForRef`,
+`buildAggValsMap`, and `buildDictIdxForRefs`. Same class as the NOTE-410 fix, re-surfaced for ALL
+small duration columns by always-paged. `countIntrinsicHistogramBoundaries` already handled Delta
+via its sorted-gallop fast path (NOTE-379) and needed no change.
+
+Back-ref: `writer/intrinsic_accum.go:encodeColumn` + `decodeIntrinsicColumnBlob` (test helper now
+uses eager-refs decode since flat columns are paged-lazy-ref); executor folds in
+`metrics_trace_intrinsic.go`; guard tests `executor/intrinsic_alwayspaged_test.go`.
