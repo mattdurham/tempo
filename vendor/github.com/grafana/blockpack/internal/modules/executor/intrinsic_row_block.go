@@ -71,7 +71,12 @@ func lookupIntrinsicFieldsTypedForBlock(
 }
 
 // populateTypedColumnForBlock fills one column's values into result for all spans
-// in blockIdx using the BlockRefRange scatter pattern (NOTE-100).
+// in blockIdx (NOTE-100).
+//
+// Dict columns (NOTE-423) scatter directly from col.DictEntries, skipping EnsureRefIndex
+// (and its radix/low-16 sort) entirely — the full-block scatter indexes result by the ref's
+// RowIdx and never needs the sorted refIndex. Flat/uint64 identity columns use the
+// BlockRefRange scatter pattern (usually short-circuited by the flat-dense DenseFlatRange path).
 //
 // The colName switch is hoisted outside the scatter loop so each column type executes
 // a tight, branch-free typed write with no any boxing per entry. This eliminates the
@@ -113,6 +118,33 @@ func populateTypedColumnForBlock(
 		return
 	}
 
+	// NOTE-423: dict columns scatter directly from DictEntries for the target block, skipping
+	// EnsureRefIndex (and its radix sort / dense-detection) entirely. The full-block scatter
+	// writes result[rowIdx] indexed by the ref's low-16 RowIdx and is order-INDEPENDENT: it
+	// never does a reverse (packedRef -> pos) lookup, so the sorted refIndex that BlockRefRange
+	// builds is pure waste on this path. radixSortRefIndexPrepared was the #1 self-time frame on
+	// the structural Q9 profile (the union of block sets across both nodes drives many
+	// per-block dict ref-index builds). Walking DictEntries here emits (rowIdx, entryIdx) pairs
+	// in decode order and scatters them straight into result — same writes, same final state,
+	// no sort. Flat/uint64 identity columns keep the BlockRefRange path: they are usually
+	// flat-dense (handled above) and otherwise rare on this path.
+	if col.Format == modules_shared.IntrinsicFormatDict {
+		switch colName {
+		case colNameSpanName:
+			scatterSpanNameDict(col.DictEntries, blockIdx, result)
+		case colNameServiceName:
+			scatterServiceNameDict(col.DictEntries, blockIdx, result)
+		case colNameStatusMessage:
+			scatterStatusMessageDict(col.DictEntries, blockIdx, result)
+		case colNameSpanKind:
+			scatterSpanKindDict(col.DictEntries, blockIdx, result)
+		case colNameSpanStatus:
+			scatterSpanStatusDict(col.DictEntries, blockIdx, result)
+			// Unknown dict column names are silently skipped (consistent with storeTypedField).
+		}
+		return
+	}
+
 	entries := col.BlockRefRange(blockIdx)
 	if len(entries) == 0 {
 		return
@@ -130,17 +162,119 @@ func populateTypedColumnForBlock(
 		scatterSpanEnd(entries, col.Uint64Values, result)
 	case colNameSpanDuration:
 		scatterSpanDuration(entries, col.Uint64Values, result)
-	case colNameSpanName:
-		scatterSpanName(entries, col.DictEntries, result)
-	case colNameServiceName:
-		scatterServiceName(entries, col.DictEntries, result)
-	case colNameStatusMessage:
-		scatterStatusMessage(entries, col.DictEntries, result)
-	case colNameSpanKind:
-		scatterSpanKind(entries, col.DictEntries, result)
-	case colNameSpanStatus:
-		scatterSpanStatus(entries, col.DictEntries, result)
 		// Unknown column names are silently skipped (future-proof; consistent with storeTypedField).
+	}
+}
+
+// NOTE-423: dict scatter variants that walk DictEntries directly for one block, skipping the
+// sorted refIndex build. For each dict entry, every BlockRef whose BlockIdx matches blockIdx
+// contributes one scatter write result[ref.RowIdx] = entry value. This visits the same
+// (rowIdx, entryIdx) pairs BlockRefRange would yield, just in decode order rather than sorted
+// by packed ref — which is irrelevant because the scatter indexes result by rowIdx. The
+// per-row bounds check (rowIdx >= len(result)) mirrors the general scatter variants exactly.
+
+func scatterSpanNameDict(
+	dictEntries []modules_shared.IntrinsicDictEntry,
+	blockIdx uint16,
+	result []intrinsicRowFields,
+) {
+	for pos := range dictEntries {
+		val := dictEntries[pos].Value
+		for _, ref := range dictEntries[pos].BlockRefs {
+			if ref.BlockIdx != blockIdx {
+				continue
+			}
+			rowIdx := int(ref.RowIdx)
+			if rowIdx >= len(result) {
+				continue
+			}
+			result[rowIdx].spanName = val
+			result[rowIdx].present |= intrinsicPresentSpanName
+		}
+	}
+}
+
+func scatterServiceNameDict(
+	dictEntries []modules_shared.IntrinsicDictEntry,
+	blockIdx uint16,
+	result []intrinsicRowFields,
+) {
+	for pos := range dictEntries {
+		val := dictEntries[pos].Value
+		for _, ref := range dictEntries[pos].BlockRefs {
+			if ref.BlockIdx != blockIdx {
+				continue
+			}
+			rowIdx := int(ref.RowIdx)
+			if rowIdx >= len(result) {
+				continue
+			}
+			result[rowIdx].serviceName = val
+			result[rowIdx].present |= intrinsicPresentServiceName
+		}
+	}
+}
+
+func scatterStatusMessageDict(
+	dictEntries []modules_shared.IntrinsicDictEntry,
+	blockIdx uint16,
+	result []intrinsicRowFields,
+) {
+	for pos := range dictEntries {
+		val := dictEntries[pos].Value
+		for _, ref := range dictEntries[pos].BlockRefs {
+			if ref.BlockIdx != blockIdx {
+				continue
+			}
+			rowIdx := int(ref.RowIdx)
+			if rowIdx >= len(result) {
+				continue
+			}
+			result[rowIdx].statusMessage = val
+			result[rowIdx].present |= intrinsicPresentStatusMessage
+		}
+	}
+}
+
+func scatterSpanKindDict(
+	dictEntries []modules_shared.IntrinsicDictEntry,
+	blockIdx uint16,
+	result []intrinsicRowFields,
+) {
+	for pos := range dictEntries {
+		val := dictEntries[pos].Int64Val
+		for _, ref := range dictEntries[pos].BlockRefs {
+			if ref.BlockIdx != blockIdx {
+				continue
+			}
+			rowIdx := int(ref.RowIdx)
+			if rowIdx >= len(result) {
+				continue
+			}
+			result[rowIdx].spanKind = val
+			result[rowIdx].present |= intrinsicPresentSpanKind
+		}
+	}
+}
+
+func scatterSpanStatusDict(
+	dictEntries []modules_shared.IntrinsicDictEntry,
+	blockIdx uint16,
+	result []intrinsicRowFields,
+) {
+	for pos := range dictEntries {
+		val := dictEntries[pos].Int64Val
+		for _, ref := range dictEntries[pos].BlockRefs {
+			if ref.BlockIdx != blockIdx {
+				continue
+			}
+			rowIdx := int(ref.RowIdx)
+			if rowIdx >= len(result) {
+				continue
+			}
+			result[rowIdx].spanStatus = val
+			result[rowIdx].present |= intrinsicPresentSpanStatus
+		}
 	}
 }
 
@@ -384,105 +518,5 @@ func scatterSpanDuration(entries []modules_shared.RefIndexEntry, uint64Vals []ui
 		}
 		result[rowIdx].spanDuration = uint64Vals[pos]
 		result[rowIdx].present |= intrinsicPresentSpanDuration
-	}
-}
-
-// scatterSpanName scatters a dict string column into result[*].spanName.
-func scatterSpanName(
-	entries []modules_shared.RefIndexEntry,
-	dictEntries []modules_shared.IntrinsicDictEntry,
-	result []intrinsicRowFields,
-) {
-	for _, e := range entries {
-		rowIdx := int(uint16(e.Packed)) //nolint:gosec // low 16 bits are rowIdx; blockIdx in high 16 bits
-		if rowIdx >= len(result) {
-			continue
-		}
-		pos := int(e.Pos)
-		if pos >= len(dictEntries) {
-			continue
-		}
-		result[rowIdx].spanName = dictEntries[pos].Value
-		result[rowIdx].present |= intrinsicPresentSpanName
-	}
-}
-
-// scatterServiceName scatters a dict string column into result[*].serviceName.
-func scatterServiceName(
-	entries []modules_shared.RefIndexEntry,
-	dictEntries []modules_shared.IntrinsicDictEntry,
-	result []intrinsicRowFields,
-) {
-	for _, e := range entries {
-		rowIdx := int(uint16(e.Packed)) //nolint:gosec // low 16 bits are rowIdx; blockIdx in high 16 bits
-		if rowIdx >= len(result) {
-			continue
-		}
-		pos := int(e.Pos)
-		if pos >= len(dictEntries) {
-			continue
-		}
-		result[rowIdx].serviceName = dictEntries[pos].Value
-		result[rowIdx].present |= intrinsicPresentServiceName
-	}
-}
-
-// scatterStatusMessage scatters a dict string column into result[*].statusMessage.
-func scatterStatusMessage(
-	entries []modules_shared.RefIndexEntry,
-	dictEntries []modules_shared.IntrinsicDictEntry,
-	result []intrinsicRowFields,
-) {
-	for _, e := range entries {
-		rowIdx := int(uint16(e.Packed)) //nolint:gosec // low 16 bits are rowIdx; blockIdx in high 16 bits
-		if rowIdx >= len(result) {
-			continue
-		}
-		pos := int(e.Pos)
-		if pos >= len(dictEntries) {
-			continue
-		}
-		result[rowIdx].statusMessage = dictEntries[pos].Value
-		result[rowIdx].present |= intrinsicPresentStatusMessage
-	}
-}
-
-// scatterSpanKind scatters a dict int64 column into result[*].spanKind.
-func scatterSpanKind(
-	entries []modules_shared.RefIndexEntry,
-	dictEntries []modules_shared.IntrinsicDictEntry,
-	result []intrinsicRowFields,
-) {
-	for _, e := range entries {
-		rowIdx := int(uint16(e.Packed)) //nolint:gosec // low 16 bits are rowIdx; blockIdx in high 16 bits
-		if rowIdx >= len(result) {
-			continue
-		}
-		pos := int(e.Pos)
-		if pos >= len(dictEntries) {
-			continue
-		}
-		result[rowIdx].spanKind = dictEntries[pos].Int64Val
-		result[rowIdx].present |= intrinsicPresentSpanKind
-	}
-}
-
-// scatterSpanStatus scatters a dict int64 column into result[*].spanStatus.
-func scatterSpanStatus(
-	entries []modules_shared.RefIndexEntry,
-	dictEntries []modules_shared.IntrinsicDictEntry,
-	result []intrinsicRowFields,
-) {
-	for _, e := range entries {
-		rowIdx := int(uint16(e.Packed)) //nolint:gosec // low 16 bits are rowIdx; blockIdx in high 16 bits
-		if rowIdx >= len(result) {
-			continue
-		}
-		pos := int(e.Pos)
-		if pos >= len(dictEntries) {
-			continue
-		}
-		result[rowIdx].spanStatus = dictEntries[pos].Int64Val
-		result[rowIdx].present |= intrinsicPresentSpanStatus
 	}
 }

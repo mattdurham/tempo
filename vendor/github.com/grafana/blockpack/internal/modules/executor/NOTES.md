@@ -6402,3 +6402,46 @@ probe count from ~`2n` to ~`n` (the count pass keeps its single probe; the slot-
 unchanged). `recSlot` costs 4 bytes/record, far cheaper than the hash it elides. Output is identical:
 the scatter visits exactly the same records (slot ≥ 0 ⇔ map-hit) and writes them to the same window
 offsets in the same order.
+
+## NOTE-423: dict intrinsic columns scatter directly from DictEntries — skip the sorted refIndex build
+
+*Added: 2026-06-16*
+
+`populateTypedColumnForBlock` (NOTE-100) fills one intrinsic column's values into the per-block
+`[]intrinsicRowFields` for all spans. For DICT columns (span:kind / span:name / resource.service.name /
+span:status / status message) it previously called `col.BlockRefRange(blockIdx)`, which triggers
+`EnsureRefIndex` → `buildRefIndexDict` → (in the non-dense/multi-block case) `radixSortRefIndexPrepared`,
+to obtain a **sorted-by-packed-ref** `[]RefIndexEntry` window for the block.
+
+**The sort is pure waste on this path.** The dict scatter loop writes `result[rowIdx] = entry.value`
+indexed by the ref's low-16 `RowIdx`; it is fully order-INDEPENDENT and never does a reverse
+(packedRef → pos) lookup. So the only reason `BlockRefRange` builds and sorts an index — to support
+binary-search point lookups — does not apply here.
+
+`radixSortRefIndexPrepared` was the **#1 self-time frame** on the structural Q9 profile
+(2026-06-16): Q9 unions the block sets selected by BOTH structural nodes (`{a} >> {b}`), so the
+union spans many blocks and each block's dict ref-index is built per querier call. Even though
+query-frontend shards one block per querier call (so the column is single-block), a sparse/optional
+dict column (the attribute present on only some rows) falls to the `radixSortRefIndexLow16Prepared`
+sort, and a merged multi-block column falls to the full four-pass `radixSortRefIndexPrepared`.
+
+**Fix:** scatter directly from `col.DictEntries`. For each dict entry, every `BlockRef` whose
+`BlockIdx == blockIdx` contributes one write `result[ref.RowIdx] = entry.value`. This visits the same
+`(rowIdx, entryIdx)` pairs `BlockRefRange` would yield, just in decode order instead of sorted by
+packed ref — irrelevant, because the scatter indexes `result` by `rowIdx`, not by iteration position.
+No `EnsureRefIndex`, no histogram, no radix/low-16 sort, no `[]RefIndexEntry` materialization.
+
+**Why safe:** dict columns keep EAGER refs at decode time (`decodePagedColumnBlobOpt`: only
+Flat/XOR/Delta defer refs via `refsDecode`; dict refs share a cross-page arena, NOTE-152), so
+`DictEntries[].BlockRefs` is always populated without `EnsureBlockRefs`. The per-row bounds check
+(`rowIdx >= len(result)`) mirrors the general scatter variants exactly. Flat/uint64 identity columns
+(trace:id / span:id / span:parent_id / span:start/end/duration) keep the `BlockRefRange` path — they
+are usually flat-dense (handled up front via `DenseFlatRange`, NOTE-354) and the sorted-index path is
+otherwise rare for them.
+
+The five entries-based dict scatter helpers (`scatterSpanName`/`scatterServiceName`/
+`scatterStatusMessage`/`scatterSpanKind`/`scatterSpanStatus`) are deleted — replaced by the
+`*Dict` variants that take `(dictEntries, blockIdx, result)`.
+
+Back-ref: `internal/modules/executor/intrinsic_row_block.go:populateTypedColumnForBlock`,
+          `internal/modules/executor/intrinsic_row_block.go:scatterSpanKindDict`
