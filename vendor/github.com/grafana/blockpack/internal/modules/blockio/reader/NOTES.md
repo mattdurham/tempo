@@ -3061,3 +3061,64 @@ for the columns it actually decodes). `resetColumn` clears the two new component
 Behavior is identical: when `lazyFileID == ""` (no stable fileID) the key is empty and decode
 proceeds without caching, exactly as before; when set, the same key string is produced — just
 lazily. Byte-for-byte identical cache keys and decoded output.
+
+## NOTE-418 — Cap-0 lazyColumnStorePool New + oversized-drop guard
+
+`acquireLazyColumnStore` was the **#1 alloc_space frame on the querier** (~15.5%, 2026-06-16 heap
+profile). The lazy-column arena (`lazyColumnStore`, NOTE-002/153) is sized to the block's column
+count on every WantOnly parse, and the pool's `New` allocated a fixed `make([]Column, 0, 64)`
+stub. Real OTel trace blocks carry **hundreds** of attribute columns (NOTE-154), so the 64-cap
+stub was always too small: `acquireLazyColumnStore` immediately discarded it for a right-sized
+`make([]Column, 0, n)`. Every pool miss therefore paid **two** allocations — a wasted ~37 KiB
+64-cap stub plus the real arena.
+
+Pool misses are not rare: `sync.Pool` is drained on every GC cycle and the querier spends ~20% of
+CPU in GC (top profile frames are `scanObject`/`tryDeferToSpanScan`/`findObject`), so the pool is
+repeatedly emptied under load and `New` fires often.
+
+**Fix:** `New` returns a cap-0 (`var s []Column`) handle, so on a miss the only arena allocation is
+the single right-sized `make([]Column, 0, n)` — the wasted 64-cap make is eliminated. Microbench
+(`BenchmarkParseBlockWantOnly_LazyStorePool/NoRelease`, which never returns the arena so always
+hits `New`): **46.8 KB/op → 12.0 KB/op (−74%)**. The warm-pool `WithRelease` path is unchanged
+(~5.5 KB/op) — once an arena is recycled its grown cap is preserved via `(*p)[:0]`.
+
+**Oversized-drop guard:** with a cap-0 `New` a pathological block (up to `MaxColumns`=10k columns →
+~5.7 MiB of `Column` structs) could pin a giant backing array in the pool for the process
+lifetime. `ReleaseLazyColumnStore` now drops arenas whose capacity exceeds
+`lazyColumnStoreMaxPooledCap` (1024 columns ≈ 590 KiB) — comfortably above a typical wide block, so
+the common case still recycles with no churn, while the rare giant block GCs instead of pinning
+RSS. Mirrors NOTE-346 (`decompBufMaxPooledCap`) / NOTE-208 (`assembledBufMaxPooledCap`).
+
+**Verification:** `go build`, `go test -race ./reader` + `./executor` all green; NOTE-153
+correctness guard (`TestNOTE153_LazyStorePoolReuseCorrect`) still passes (cap-0 New does not change
+arena reuse semantics — `acquireLazyColumnStore` zeroes/sizes identically). New wide-block guard
+`BenchmarkParseBlockWantOnly_WideLazyStore` (200 spans × 250 distinct columns) exercises the
+production-width arena.
+
+## NOTE-419: Column.MatchingBytesRows — hoist per-row decode/present out of the trace:id scan
+
+`GetTraceByID` (reader.go) locates a trace's span rows within each matching block by scanning
+that block's per-block `trace:id` column. The prior loop called `traceIDCol.BytesValue(rowIdx)`
+for **every** row in the block (SpanCount, which on a wide block is thousands of rows from other
+traces) and `bytes.Equal`'d the result against the looked-up trace ID. `BytesValue` pays, on
+every call: an atomic `decoded.Load()` (`needsDecode`), a `sync.Once` check (`expandDenseIdx`),
+an `IsPresent` dispatch, and the inline/dict branch dispatch — all of which are loop-invariant
+after the first row. This is the same per-row-atomic anti-pattern NOTE-222 fixed for the
+column-provider scan loops via `PresenceView`.
+
+**Fix:** new `Column.MatchingBytesRows(target, dst)` appends the matching row indices, paying the
+decode + dense-index expansion **once** and capturing the stable `Present` bitmap (nil ⇒ all
+present) before the loop, then bit-testing inline. For a dict-encoded bytes column it resolves
+`target` to its dict index **once** (an O(dict) scan; dicts are deduplicated so at most one entry
+matches) and then matches rows by integer index equality instead of re-comparing the full byte
+value per row. The uniform-stride / inline path scans `bytesInlineAt(idx)` directly. Output is
+identical to the prior `BytesValue`+`bytes.Equal` loop (same presence semantics, same dict
+resolution via `dictIdxAt`).
+
+This is a general bulk-equality accessor on the read path; it is not specialized to trace IDs (it
+takes an arbitrary `target []byte`), and the trace-by-ID API contract is unchanged — `GetTraceByID`
+still parses with `WantAll()` and returns the complete span with all attributes.
+
+**Verification:** `go build`; `go test -race ./reader` + `./executor` green, incl. new
+white-box `TestMatchingBytesRows_*` (uniform-stride, inline, dict, dict-miss, present-bitmap,
+append-to-dst) and the existing GetTraceByID end-to-end tests.

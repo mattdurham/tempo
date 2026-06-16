@@ -270,7 +270,15 @@ func putDecompBuf(ptr *[]byte) {
 // it via Block.ReleaseLazyColumnStore once the block is fully scanned. Entries are zeroed on
 // release so retained compressedEncoding sub-slices (which alias rawBytes) cannot keep large block
 // buffers alive through the pool, and any lazily-decoded slices are dropped for GC.
-var lazyColumnStorePool = sync.Pool{New: func() any { s := make([]Column, 0, 64); return &s }}
+// NOTE-418: New returns an empty (cap-0) slice handle, NOT a pre-sized make([]Column, 0, 64).
+// Real OTel trace blocks carry hundreds of attribute columns (NOTE-154), so the old 64-cap stub
+// was ALWAYS too small on the WantOnly path: every pool miss produced a 64-cap allocation that
+// acquireLazyColumnStore immediately discarded for a right-sized make([]Column, 0, n) — a wasted
+// ~37 KB alloc per miss. sync.Pool is drained on every GC cycle (and the querier spends ~20% of
+// CPU in GC), so pool misses are common, not rare — making acquireLazyColumnStore the #1
+// alloc_space frame (~15%, 2026-06-16 querier heap profile). With a cap-0 New the only arena
+// allocation on a miss is the single right-sized one.
+var lazyColumnStorePool = sync.Pool{New: func() any { var s []Column; return &s }}
 
 // acquireLazyColumnStore returns a pooled *[]Column whose slice has length 0 and capacity ≥ n.
 func acquireLazyColumnStore(n int) *[]Column {
@@ -296,6 +304,16 @@ func (b *Block) ReleaseLazyColumnStore() {
 		return
 	}
 	s := *b.lazyStorePtr
+	// NOTE-418: with the cap-0 pool New, a pathologically wide block (up to MaxColumns=10k
+	// columns → ~5.7 MiB of Column structs) would otherwise pin a giant backing array in the
+	// pool for the process lifetime (sync.Pool only ages entries across GC). Drop arenas grown
+	// beyond lazyColumnStoreMaxPooledCap so the rare giant block GCs instead of pinning RSS;
+	// the next parse re-grows from a right-sized make. Mirrors NOTE-346/decompBufMaxPooledCap.
+	if cap(s) > lazyColumnStoreMaxPooledCap {
+		b.lazyStorePtr = nil
+		b.lazyColumnStore = nil
+		return
+	}
 	for i := range s {
 		s[i] = Column{}
 	}
@@ -304,6 +322,13 @@ func (b *Block) ReleaseLazyColumnStore() {
 	b.lazyStorePtr = nil
 	b.lazyColumnStore = nil
 }
+
+// lazyColumnStoreMaxPooledCap bounds the lazy-column arena capacity (in Column elements) that
+// ReleaseLazyColumnStore returns to lazyColumnStorePool. 1024 columns × 576 B/Column ≈ 590 KiB —
+// comfortably above the typical wide OTel trace block (hundreds of columns, NOTE-154) so the
+// common case recycles its arena with no churn, while a pathological MaxColumns block (10k) is
+// dropped to GC rather than pinned. NOTE-418.
+const lazyColumnStoreMaxPooledCap = 1024
 
 // resolveBlockColMetas returns the block's column-metadata array, reusing the per-block parsed
 // ToC cached by NOTE-241/242 (blockColTypesCache) when present and parsing + caching it otherwise.

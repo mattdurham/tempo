@@ -409,11 +409,13 @@ func GetTraceByID(r *Reader, traceIDHex string) (results []SpanMatch, err error)
 			blocksNeedingIntrinsic[entry.BlockID] = true
 			continue
 		}
-		for rowIdx := range parsedBlocks[i].Block.SpanCount() {
-			if v, ok := traceIDCol.BytesValue(rowIdx); ok && bytes.Equal(v, traceID[:]) {
-				rowsByBlock[entry.BlockID] = append(rowsByBlock[entry.BlockID], rowIdx)
-			}
-		}
+		// NOTE-419: MatchingBytesRows scans the per-block trace:id column for matching rows
+		// while paying the lazy-decode atomic and dense-index expansion ONCE for the whole
+		// block, instead of per row as the prior BytesValue+bytes.Equal loop did.
+		rowsByBlock[entry.BlockID] = traceIDCol.MatchingBytesRows(
+			traceID[:],
+			rowsByBlock[entry.BlockID],
+		)
 	}
 
 	// Lazy fallback: only files whose blocks lack a trace:id column pay the whole-file

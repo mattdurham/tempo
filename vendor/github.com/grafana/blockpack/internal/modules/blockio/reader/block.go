@@ -4,6 +4,7 @@ package reader
 // NOTE: Any changes to this file must be reflected in the corresponding specs.md or NOTES.md.
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/hex"
 	"math"
@@ -357,6 +358,63 @@ func (c *Column) BytesValue(idx int) ([]byte, bool) {
 	}
 
 	return nil, false
+}
+
+// MatchingBytesRows appends every row index whose bytes value equals target to dst and
+// returns the extended slice. It is the bulk equivalent of calling BytesValue(idx) for
+// every row and comparing — but it pays the lazy-decode atomic (needsDecode) and the
+// dense-index expansion ONCE for the whole scan instead of per row, mirroring the NOTE-222
+// PresenceView discipline. Used by the trace-by-ID path (GetTraceByID), which must locate
+// the matching span rows within a block by scanning the per-block trace:id column.
+//
+// NOTE-419: the previous per-row BytesValue scan paid, on every row, an atomic decoded.Load
+// (needsDecode), a sync.Once check (expandDenseIdx), an IsPresent dispatch, and the inline/
+// dict branch dispatch — all loop-invariant after the first row. This hoists the decode and
+// dense expansion out of the loop and, for a dict-encoded column, resolves the target to its
+// dict index ONCE (an O(dict) scan) and then matches rows by integer index equality rather
+// than re-comparing the full byte value per row.
+func (c *Column) MatchingBytesRows(target []byte, dst []int) []int {
+	if c.needsDecode() {
+		c.decodeNow()
+	}
+	c.expandDenseIdx()
+	present := c.Present // nil ⇒ all rows present (NOTE-222: stable after decode)
+	n := c.SpanCount
+
+	if c.hasInlineBytes() {
+		for idx := range n {
+			if present != nil && !shared.IsPresent(present, idx) {
+				continue
+			}
+			if b := c.bytesInlineAt(idx); b != nil && bytes.Equal(b, target) {
+				dst = append(dst, idx)
+			}
+		}
+		return dst
+	}
+
+	// Dict-encoded: find the (at most one, dicts are deduplicated) dict entry equal to target,
+	// then match rows by its dict index. A row matches iff it is present and its packed dict
+	// index equals the target entry's index.
+	targetDi := -1
+	for di, b := range c.BytesDict {
+		if bytes.Equal(b, target) {
+			targetDi = di
+			break
+		}
+	}
+	if targetDi < 0 {
+		return dst // target value not in this column's dictionary
+	}
+	for idx := range n {
+		if present != nil && !shared.IsPresent(present, idx) {
+			continue
+		}
+		if di, ok := c.dictIdxAt(c.BytesIdx, idx); ok && di == targetDi {
+			dst = append(dst, idx)
+		}
+	}
+	return dst
 }
 
 // VectorF32Value returns the []float32 embedding vector at idx for ColumnTypeVectorF32 columns.
