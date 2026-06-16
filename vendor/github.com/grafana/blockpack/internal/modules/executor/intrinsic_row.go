@@ -138,85 +138,161 @@ func lookupIntrinsicFieldsTyped(
 	return result, nil
 }
 
-// populateTypedColumn fills one column's values into the result slice using LookupRefFast.
+// populateTypedColumn fills one column's values into the result slice via typed ref lookups.
+// NOTE-429: hoist the colName type switch OUT of the per-ref loop and call the typed
+// LookupRefFast{Uint64,Int64,String,Bytes} accessors directly, so each ref does one typed
+// binary-search lookup with NO any boxing and NO per-row storeTypedField switch. The previous
+// body called LookupRefFast (returns any) per ref, which boxed every uint64/int64 value onto the
+// heap (the dominant alloc on the predicate-filtered search post-filter path,
+// filterRowSetByIntrinsicNodes → lookupIntrinsicFieldsTyped → populateTypedColumn for Q6/Q7),
+// then re-dispatched the same colName switch per row in storeTypedField (which re-asserts the
+// boxed type). The typed accessors return concrete values (zero-alloc, NOTE-015), and dispatching
+// the column type once per column instead of once per ref removes N interface-assertion branches
+// and N boxing allocations (N = selected refs). This is the per-ref twin of the structural
+// full-block scatter's hoisted switch (populateTypedColumnForBlock, NOTE-100/423).
 func populateTypedColumn(
 	colName string,
 	col *modules_shared.IntrinsicColumn,
 	selected []modules_shared.BlockRef,
 	result []intrinsicRowFields,
 ) {
-	for i, ref := range selected {
-		packed := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx) //nolint:gosec
-		val, ok := col.LookupRefFast(packed)
-		if !ok {
-			continue
-		}
-		storeTypedField(colName, val, &result[i])
+	// The column type is dispatched ONCE here and each group runs a tight typed per-ref loop.
+	// Split into per-kind helpers (bytes-identity / string / uint64 / int64) to keep each
+	// function's cyclomatic complexity low while preserving the zero-boxing hot loop.
+	switch colName {
+	case colNameTraceID, colNameSpanID, colNameParentID:
+		populateBytesIdentityColumn(colName, col, selected, result)
+	case colNameSpanName, colNameServiceName, colNameStatusMessage:
+		populateStringColumn(colName, col, selected, result)
+	case colNameSpanStart, colNameSpanEnd, colNameSpanDuration:
+		populateUint64Column(colName, col, selected, result)
+	case colNameSpanKind, colNameSpanStatus:
+		populateInt64Column(colName, col, selected, result)
 	}
 }
 
-// storeTypedField writes val into the appropriate field of row and sets the present bit.
-// Type assertions use ok-checks to skip unexpected wire formats without panicking.
-func storeTypedField(colName string, val any, row *intrinsicRowFields) {
+// populateBytesIdentityColumn fills trace:id/span:id/span:parent_id from the column's
+// per-ref []byte values without any boxing (NOTE-429). The colName is dispatched once by the
+// caller; this helper still branches per identity field because the destination field and
+// present bit differ, but the typed accessor is the same.
+func populateBytesIdentityColumn(
+	colName string,
+	col *modules_shared.IntrinsicColumn,
+	selected []modules_shared.BlockRef,
+	result []intrinsicRowFields,
+) {
 	switch colName {
 	case colNameTraceID:
-		if b, ok := val.([]byte); ok && len(b) == traceIDByteLen {
-			// NOTE-427: array conversion, not copy() — see copy8. The len == traceIDByteLen
-			// guard proves the conversion's own bound, so this is a single 16-byte load+store.
-			row.traceID = [traceIDByteLen]byte(b)
-			row.present |= intrinsicPresentTraceID
+		for i, ref := range selected {
+			if b, ok := col.LookupRefFastBytes(packRef(ref)); ok && len(b) == traceIDByteLen {
+				// NOTE-427: array conversion, not copy() — single 16-byte load+store.
+				result[i].traceID = [traceIDByteLen]byte(b)
+				result[i].present |= intrinsicPresentTraceID
+			}
 		}
 	case colNameSpanID:
-		// NOTE-093: [8]byte eliminates clone; blockio/shared NOTE-012 guarantees BytesValues are independent copies.
-		// Non-spanIDByteLen values silently skipped per NOTE-093 (OTel spec forbids non-8-byte span IDs).
-		if b, ok := val.([]byte); ok && copy8(&row.spanID, b) {
-			row.present |= intrinsicPresentSpanID
+		for i, ref := range selected {
+			if b, ok := col.LookupRefFastBytes(packRef(ref)); ok && copy8(&result[i].spanID, b) {
+				result[i].present |= intrinsicPresentSpanID
+			}
 		}
 	case colNameParentID:
-		// NOTE-093: [8]byte eliminates clone; blockio/shared NOTE-012 guarantees BytesValues are independent copies.
-		// Non-spanIDByteLen values silently skipped per NOTE-093 (OTel spec forbids non-8-byte span IDs).
-		if b, ok := val.([]byte); ok && copy8(&row.parentID, b) {
-			row.present |= intrinsicPresentParentID
+		for i, ref := range selected {
+			if b, ok := col.LookupRefFastBytes(packRef(ref)); ok && copy8(&result[i].parentID, b) {
+				result[i].present |= intrinsicPresentParentID
+			}
 		}
+	}
+}
+
+// populateStringColumn fills span:name/resource.service.name/span:status_message from the
+// column's per-ref string values without any boxing (NOTE-429).
+func populateStringColumn(
+	colName string,
+	col *modules_shared.IntrinsicColumn,
+	selected []modules_shared.BlockRef,
+	result []intrinsicRowFields,
+) {
+	switch colName {
 	case colNameSpanName:
-		if s, ok := val.(string); ok {
-			row.spanName = s
-			row.present |= intrinsicPresentSpanName
+		for i, ref := range selected {
+			if s, ok := col.LookupRefFastString(packRef(ref)); ok {
+				result[i].spanName = s
+				result[i].present |= intrinsicPresentSpanName
+			}
 		}
 	case colNameServiceName:
-		if s, ok := val.(string); ok {
-			row.serviceName = s
-			row.present |= intrinsicPresentServiceName
+		for i, ref := range selected {
+			if s, ok := col.LookupRefFastString(packRef(ref)); ok {
+				result[i].serviceName = s
+				result[i].present |= intrinsicPresentServiceName
+			}
 		}
 	case colNameStatusMessage:
-		if s, ok := val.(string); ok {
-			row.statusMessage = s
-			row.present |= intrinsicPresentStatusMessage
+		for i, ref := range selected {
+			if s, ok := col.LookupRefFastString(packRef(ref)); ok {
+				result[i].statusMessage = s
+				result[i].present |= intrinsicPresentStatusMessage
+			}
 		}
+	}
+}
+
+// populateUint64Column fills span:start/span:end/span:duration from the column's per-ref
+// uint64 values without any boxing (NOTE-429).
+func populateUint64Column(
+	colName string,
+	col *modules_shared.IntrinsicColumn,
+	selected []modules_shared.BlockRef,
+	result []intrinsicRowFields,
+) {
+	switch colName {
 	case colNameSpanStart:
-		if u, ok := val.(uint64); ok {
-			row.spanStart = u
-			row.present |= intrinsicPresentSpanStart
+		for i, ref := range selected {
+			if u, ok := col.LookupRefFastUint64(packRef(ref)); ok {
+				result[i].spanStart = u
+				result[i].present |= intrinsicPresentSpanStart
+			}
 		}
 	case colNameSpanEnd:
-		if u, ok := val.(uint64); ok {
-			row.spanEnd = u
-			row.present |= intrinsicPresentSpanEnd
+		for i, ref := range selected {
+			if u, ok := col.LookupRefFastUint64(packRef(ref)); ok {
+				result[i].spanEnd = u
+				result[i].present |= intrinsicPresentSpanEnd
+			}
 		}
 	case colNameSpanDuration:
-		if u, ok := val.(uint64); ok {
-			row.spanDuration = u
-			row.present |= intrinsicPresentSpanDuration
+		for i, ref := range selected {
+			if u, ok := col.LookupRefFastUint64(packRef(ref)); ok {
+				result[i].spanDuration = u
+				result[i].present |= intrinsicPresentSpanDuration
+			}
 		}
+	}
+}
+
+// populateInt64Column fills span:kind/span:status from the column's per-ref int64 values
+// without any boxing (NOTE-429).
+func populateInt64Column(
+	colName string,
+	col *modules_shared.IntrinsicColumn,
+	selected []modules_shared.BlockRef,
+	result []intrinsicRowFields,
+) {
+	switch colName {
 	case colNameSpanKind:
-		if i, ok := val.(int64); ok {
-			row.spanKind = i
-			row.present |= intrinsicPresentSpanKind
+		for i, ref := range selected {
+			if iv, ok := col.LookupRefFastInt64(packRef(ref)); ok {
+				result[i].spanKind = iv
+				result[i].present |= intrinsicPresentSpanKind
+			}
 		}
 	case colNameSpanStatus:
-		if i, ok := val.(int64); ok {
-			row.spanStatus = i
-			row.present |= intrinsicPresentSpanStatus
+		for i, ref := range selected {
+			if iv, ok := col.LookupRefFastInt64(packRef(ref)); ok {
+				result[i].spanStatus = iv
+				result[i].present |= intrinsicPresentSpanStatus
+			}
 		}
 	}
 }

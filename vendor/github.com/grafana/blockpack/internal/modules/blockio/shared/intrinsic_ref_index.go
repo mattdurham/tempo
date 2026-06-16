@@ -964,42 +964,6 @@ func (col *IntrinsicColumn) LookupRefFastBytes(packedRef uint32) ([]byte, bool) 
 	return col.BytesValues[idx], true
 }
 
-// LookupRefFast performs an O(log N) binary search for packedRef in col.refIndex.
-// Calls EnsureRefIndex internally (sync.Once, so subsequent calls are free);
-// callers no longer need a separate EnsureRefIndex call before LookupRefFast.
-// Returns (nil, false) when not found.
-//
-// Return types mirror LookupRef: uint64 or []byte for flat, string or int64 for dict.
-func (col *IntrinsicColumn) LookupRefFast(packedRef uint32) (val any, found bool) {
-	if col == nil {
-		return nil, false
-	}
-	// lookupRefIdx (NOTE-229) handles EnsureRefIndex, the O(1) dense fast path, and the
-	// binary-search fallback; it returns -1 when the ref is absent.
-	idx := col.lookupRefIdx(packedRef)
-	if idx < 0 {
-		return nil, false
-	}
-	switch col.Format {
-	case IntrinsicFormatFlat, IntrinsicFormatXORBytes, IntrinsicFormatDeltaUint64:
-		if idx < len(col.Uint64Values) {
-			return col.Uint64Values[idx], true
-		}
-		if idx < len(col.BytesValues) {
-			return col.BytesValues[idx], true
-		}
-	case IntrinsicFormatDict:
-		if idx < len(col.DictEntries) {
-			e := col.DictEntries[idx]
-			if col.Type == ColumnTypeInt64 || col.Type == ColumnTypeRangeInt64 {
-				return e.Int64Val, true
-			}
-			return e.Value, true
-		}
-	}
-	return nil, false
-}
-
 // BlockRefRange returns the subslice of refIndex whose entries belong to blockIdx.
 // Calls EnsureRefIndex internally (sync.Once, idempotent). Returns nil if col is nil
 // or no entries exist for blockIdx.

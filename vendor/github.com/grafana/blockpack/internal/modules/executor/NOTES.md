@@ -6403,6 +6403,39 @@ unchanged). `recSlot` costs 4 bytes/record, far cheaper than the hash it elides.
 the scatter visits exactly the same records (slot ≥ 0 ⇔ map-hit) and writes them to the same window
 offsets in the same order.
 
+## NOTE-429: hoist the colName switch out of populateTypedColumn's per-ref loop (kill `any` boxing)
+
+*Added: 2026-06-16*
+
+`populateTypedColumn` (the per-ref intrinsic-field lookup used by the predicate-filtered SEARCH
+post-filter path: `filterRowSetByIntrinsicNodes` → `lookupIntrinsicFieldsTyped` → here, for queries
+like `{resource.service.name = …}` / `{status = error}` / `{kind = server && …}`) previously did,
+for each of the N selected refs:
+
+    val, ok := col.LookupRefFast(packed)   // returns (any, bool)
+    storeTypedField(colName, val, &result[i])
+
+`LookupRefFast` returned `any`, so every uint64/int64/[]byte value was BOXED onto the heap (one
+alloc per ref), and `storeTypedField` re-dispatched the identical `colName` type switch per row and
+re-asserted the boxed dynamic type. Bench `BenchmarkPopulateTypedColumn_SpanIDAllocs` (100 refs,
+span:id + span:parent_id) measured **103 allocs/op** — ~1 boxing alloc per ref.
+
+Fix: dispatch the column type ONCE (the colName switch is now the outer structure), then run a tight
+per-ref loop calling the concrete typed accessor — `LookupRefFastBytes` / `LookupRefFastString` /
+`LookupRefFastUint64` / `LookupRefFastInt64` (zero-alloc, NOTE-015) — and write straight into the
+typed `intrinsicRowFields` field. No `any`, no boxing, no per-row switch, no per-row type assertion.
+This is the per-ref twin of the structural full-block scatter's hoisted-switch design
+(`populateTypedColumnForBlock`, NOTE-100/423). Bench drops to **3 allocs/op** (the 3 are the pooled
+result-slice acquire + column fetch, independent of ref count) — a 97% allocation reduction and a
+genuinely flat per-ref inner loop.
+
+Dead-code cleanup (rules: no dead code): `storeTypedField` (unexported) had no remaining caller and
+was deleted. `(*IntrinsicColumn).LookupRefFast` — the `any`-returning accessor whose sole remaining
+caller was `populateTypedColumn` (other call sites already used the typed family) — is no longer
+referenced anywhere in the tree (tempo consumes blockpack only via vendoring), so it was deleted too;
+the typed
+`LookupRefFast{Uint64,Int64,String,Bytes}` family remains the supported accessor set.
+
 ## NOTE-423: dict intrinsic columns scatter directly from DictEntries — skip the sorted refIndex build
 
 *Added: 2026-06-16*
