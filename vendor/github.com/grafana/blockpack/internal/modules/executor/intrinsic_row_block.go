@@ -129,6 +129,35 @@ func populateTypedColumnForBlock(
 	// no sort. Flat/uint64 identity columns keep the BlockRefRange path: they are usually
 	// flat-dense (handled above) and otherwise rare on this path.
 	if col.Format == modules_shared.IntrinsicFormatDict {
+		// NOTE-424: for a MULTI-BLOCK dict column the direct-DictEntries scatter (NOTE-423)
+		// re-walks every entry's every ref on EACH per-block call, filtering by blockIdx —
+		// O(totalRefs) per block, so O(N_blocks × totalRefs) across the file. That is the
+		// structural Q9 blowup (scatterSpanKindDict was the #1 self-time frame at ~5s).
+		// Build the sorted refIndex ONCE (cached via EnsureRefIndex) and binary-search this
+		// block's contiguous range instead — O(log totalRefs + blockRefs) per block. The
+		// single-block case keeps the NOTE-423 direct scatter (no sort needed, the dominant
+		// shape). DictMultiBlock caches its O(totalRefs) one-time scan, free against the
+		// (N_blocks − 1) full re-scans it removes.
+		if col.DictMultiBlock() {
+			entries := col.BlockRefRange(blockIdx)
+			if len(entries) == 0 {
+				return
+			}
+			switch colName {
+			case colNameSpanName:
+				scatterSpanNameDictRefIndex(entries, col.DictEntries, result)
+			case colNameServiceName:
+				scatterServiceNameDictRefIndex(entries, col.DictEntries, result)
+			case colNameStatusMessage:
+				scatterStatusMessageDictRefIndex(entries, col.DictEntries, result)
+			case colNameSpanKind:
+				scatterSpanKindDictRefIndex(entries, col.DictEntries, result)
+			case colNameSpanStatus:
+				scatterSpanStatusDictRefIndex(entries, col.DictEntries, result)
+				// Unknown dict column names are silently skipped.
+			}
+			return
+		}
 		switch colName {
 		case colNameSpanName:
 			scatterSpanNameDict(col.DictEntries, blockIdx, result)
@@ -275,6 +304,90 @@ func scatterSpanStatusDict(
 			result[rowIdx].spanStatus = val
 			result[rowIdx].present |= intrinsicPresentSpanStatus
 		}
+	}
+}
+
+// NOTE-424: refIndex-based dict scatter variants for MULTI-BLOCK columns. entries is the
+// pre-sorted, block-bounded window returned by BlockRefRange(blockIdx): every entry's high-16
+// BlockIdx already equals blockIdx (the binary-search range), so no per-ref blockIdx filter is
+// needed. entry.Pos is the dict-entry index; entry.Packed&0xFFFF is the row index. Each entry
+// contributes one scatter write result[rowIdx] = DictEntries[Pos].value — the same (rowIdx,
+// value) pairs the direct DictEntries scatter would produce for this block, sourced from the
+// cached sorted index instead of an O(totalRefs) re-walk. The per-row bounds check mirrors the
+// direct variants exactly.
+
+func scatterSpanNameDictRefIndex(
+	entries []modules_shared.RefIndexEntry,
+	dictEntries []modules_shared.IntrinsicDictEntry,
+	result []intrinsicRowFields,
+) {
+	for i := range entries {
+		rowIdx := int(entries[i].Packed & 0xFFFF)
+		if rowIdx >= len(result) {
+			continue
+		}
+		result[rowIdx].spanName = dictEntries[entries[i].Pos].Value
+		result[rowIdx].present |= intrinsicPresentSpanName
+	}
+}
+
+func scatterServiceNameDictRefIndex(
+	entries []modules_shared.RefIndexEntry,
+	dictEntries []modules_shared.IntrinsicDictEntry,
+	result []intrinsicRowFields,
+) {
+	for i := range entries {
+		rowIdx := int(entries[i].Packed & 0xFFFF)
+		if rowIdx >= len(result) {
+			continue
+		}
+		result[rowIdx].serviceName = dictEntries[entries[i].Pos].Value
+		result[rowIdx].present |= intrinsicPresentServiceName
+	}
+}
+
+func scatterStatusMessageDictRefIndex(
+	entries []modules_shared.RefIndexEntry,
+	dictEntries []modules_shared.IntrinsicDictEntry,
+	result []intrinsicRowFields,
+) {
+	for i := range entries {
+		rowIdx := int(entries[i].Packed & 0xFFFF)
+		if rowIdx >= len(result) {
+			continue
+		}
+		result[rowIdx].statusMessage = dictEntries[entries[i].Pos].Value
+		result[rowIdx].present |= intrinsicPresentStatusMessage
+	}
+}
+
+func scatterSpanKindDictRefIndex(
+	entries []modules_shared.RefIndexEntry,
+	dictEntries []modules_shared.IntrinsicDictEntry,
+	result []intrinsicRowFields,
+) {
+	for i := range entries {
+		rowIdx := int(entries[i].Packed & 0xFFFF)
+		if rowIdx >= len(result) {
+			continue
+		}
+		result[rowIdx].spanKind = dictEntries[entries[i].Pos].Int64Val
+		result[rowIdx].present |= intrinsicPresentSpanKind
+	}
+}
+
+func scatterSpanStatusDictRefIndex(
+	entries []modules_shared.RefIndexEntry,
+	dictEntries []modules_shared.IntrinsicDictEntry,
+	result []intrinsicRowFields,
+) {
+	for i := range entries {
+		rowIdx := int(entries[i].Packed & 0xFFFF)
+		if rowIdx >= len(result) {
+			continue
+		}
+		result[rowIdx].spanStatus = dictEntries[entries[i].Pos].Int64Val
+		result[rowIdx].present |= intrinsicPresentSpanStatus
 	}
 }
 

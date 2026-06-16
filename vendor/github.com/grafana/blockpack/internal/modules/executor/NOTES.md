@@ -6445,3 +6445,47 @@ The five entries-based dict scatter helpers (`scatterSpanName`/`scatterServiceNa
 
 Back-ref: `internal/modules/executor/intrinsic_row_block.go:populateTypedColumnForBlock`,
           `internal/modules/executor/intrinsic_row_block.go:scatterSpanKindDict`
+
+## NOTE-424: route MULTI-BLOCK dict intrinsic columns through the cached sorted refIndex (revert NOTE-423 for that shape)
+
+*Added: 2026-06-16*
+
+NOTE-423 made the per-block dict intrinsic scatter (`populateTypedColumnForBlock`) walk
+`col.DictEntries` directly — for each entry, every `BlockRef` with `BlockIdx == blockIdx`
+emits one write `result[ref.RowIdx] = value`. That is O(totalRefs) **per block call** because
+it re-scans the WHOLE column's refs and `continue`s on every ref belonging to another block.
+
+`populateTypedColumnForBlock` is called **once per selected internal block** (a single querier
+Reader holds the whole object file — many internal blocks — and structural `{a} >> {b}` queries
+union the block sets selected by BOTH nodes, so the selected set is large). So the direct scatter
+costs **O(N_blocks × totalRefs)** across the file — quadratic. The 2026-06-16 Q9 CPU profile showed
+`scatterSpanKindDict` as the **#1 blockpack self-time frame (~5.0s)**, dwarfing everything else.
+
+NOTE-423's premise ("query-frontend shards one block per querier call so the column is
+single-block") is wrong for the internal-block dimension: sharding is at the object/file level,
+not the internal-block level, and one file has many internal blocks.
+
+**Fix:** gate on `col.DictMultiBlock()` (NOTE-424, cached one-time O(totalRefs) scan).
+- **Single-block** dict column → keep the NOTE-423 direct `*Dict` scatter (no sort needed; this
+  remains the dominant shape and the original NOTE-423 win).
+- **Multi-block** dict column → build the sorted refIndex **once** (cached via `EnsureRefIndex` /
+  `refIndexOnce`) and binary-search this block's contiguous window with `BlockRefRange(blockIdx)` —
+  O(log totalRefs + blockRefs) per block. New `*DictRefIndex` scatter helpers consume that window:
+  `entry.Pos` is the dict-entry index, `entry.Packed&0xFFFF` is the row index, so
+  `result[rowIdx] = DictEntries[Pos].value`. Same (rowIdx, value) pairs as the direct scatter for
+  this block, sourced from the cached sorted index instead of an O(totalRefs) re-walk.
+
+The one-time `DictMultiBlock` scan costs the same O(totalRefs) the first block's direct scatter
+already paid, so it is free relative to the (N_blocks − 1) full re-scans it eliminates. The radix
+sort that NOTE-423 was avoiding now fires **once per query** (cached) instead of being re-paid
+implicitly through the per-block re-walk — a strict win on multi-block files.
+
+**Why safe:** `BlockRefRange` already returns the block-bounded, sorted window used by the
+flat/uint64 identity columns; the dict scatter is order-INDEPENDENT (indexes `result` by rowIdx),
+so reading the sorted window in sorted order is identical to reading DictEntries in decode order.
+Validated by `TestLookupIntrinsicFieldsTypedForBlock_MultiBlock_AllMatch` (10 blocks, dict
+span:name/service.name/span:kind), which compares `ForBlock` against the reference typed path
+row-for-row across every block.
+
+Back-ref: `internal/modules/executor/intrinsic_row_block.go:populateTypedColumnForBlock`,
+          `internal/modules/blockio/shared/intrinsiccolumn.go:DictMultiBlock`

@@ -24,6 +24,8 @@ type IntrinsicColumn struct {
 	Uint64Values []uint64
 	refIndexOnce sync.Once
 	refsOnce     sync.Once
+	// NOTE-424: dictMultiBlockOnce guards the one-time DictMultiBlock() scan.
+	dictMultiBlockOnce sync.Once
 	// NOTE-344: refsBlobLen records the byte length of the compressed column blob retained
 	// by the refsDecode closure (NOTE-340). The closure pins the whole blob alive for the
 	// lifetime of the (process-cached) column so the deferred ref re-walk can run; that
@@ -49,7 +51,10 @@ type IntrinsicColumn struct {
 	Count         uint32
 	Type          ColumnType
 	Format        uint8
-	refDense      bool
+	// NOTE-424: dictMultiBlock caches the DictMultiBlock() result: 0 = unknown,
+	// 1 = single-block, 2 = multi-block. Populated under dictMultiBlockOnce.
+	dictMultiBlock uint8
+	refDense       bool
 	// refDenseFlat is true when refIndex was dropped because Pos == rank (flat-dense, NOTE-354).
 	// denseLookupPos and the scatter fast path then synthesize entries from
 	// (refDenseMin, refDenseCount) instead of reading the (nil) refIndex slice.
@@ -71,4 +76,41 @@ func (col *IntrinsicColumn) EnsureBlockRefs() {
 		col.refsDecode = nil
 		col.refsBlobLen = 0
 	})
+}
+
+// DictMultiBlock reports whether this dict column's refs span more than one internal block.
+// The result is computed once (cached under dictMultiBlockOnce) by scanning DictEntries'
+// BlockRefs for any BlockIdx that differs from the first ref's BlockIdx.
+//
+// NOTE-424: the structural per-block dict scatter (populateTypedColumnForBlock) is called once
+// per selected internal block. The direct-DictEntries scatter (NOTE-423) walks EVERY entry's
+// EVERY ref per call, filtering by blockIdx — O(totalRefs) per block, so O(N_blocks × totalRefs)
+// across a multi-block file (exactly the structural Q9 shape, which unions the block sets of
+// both nodes). For a multi-block column it is far cheaper to build the sorted refIndex ONCE
+// (cached via EnsureRefIndex/refIndexOnce) and binary-search each block's contiguous range
+// (BlockRefRange: O(log totalRefs + blockRefs) per block). For a single-block column the direct
+// scatter is optimal (no sort needed), so this gate keeps NOTE-423 on the dominant shape.
+// The one-time scan here is O(totalRefs) — the same cost the first block's scatter already pays —
+// so it is free relative to the (N_blocks − 1) full re-scans it eliminates.
+func (col *IntrinsicColumn) DictMultiBlock() bool {
+	col.dictMultiBlockOnce.Do(func() {
+		col.dictMultiBlock = 1 // assume single-block until a differing BlockIdx is seen
+		var first uint16
+		seen := false
+		for ei := range col.DictEntries {
+			refs := col.DictEntries[ei].BlockRefs
+			for ri := range refs {
+				if !seen {
+					first = refs[ri].BlockIdx
+					seen = true
+					continue
+				}
+				if refs[ri].BlockIdx != first {
+					col.dictMultiBlock = 2
+					return
+				}
+			}
+		}
+	})
+	return col.dictMultiBlock == 2
 }
