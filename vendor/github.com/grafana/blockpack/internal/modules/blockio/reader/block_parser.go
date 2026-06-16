@@ -8,12 +8,73 @@ import (
 	"log/slog"
 	"strconv"
 	"sync"
+	"unsafe"
 
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
 	"github.com/klauspost/compress/snappy"
 )
 
 // blockHeader holds the parsed block header fields.
+
+// NOTE-430: process-global column-name intern table for parseColumnMetadataArray.
+//
+// parseColumnMetadataArray allocated one fresh string(data[pos:pos+nameLen]) per column on
+// every cold/miss ToC parse (parseColumnMetadataArray was the #3 blockpack self-time frame at
+// ~1.3s on a 2026-06-16 querier CPU profile, and a per-block ToC re-parse runs for every
+// distinct block not currently in blockColTypesCache — which is small, n/16, so eviction is
+// common under real traffic with hundreds of columns per block). Column names are drawn from a
+// tiny bounded universe (the block schema: trace:id, span:id, resource/span attribute keys,
+// etc.) repeated across thousands of blocks, so each distinct name was heap-allocated once per
+// block-parse rather than once per process. Interning collapses all those duplicates onto a
+// single shared backing string: it eliminates the repeat allocations AND shrinks live heap
+// (fewer distinct strings for the GC to scan — the same lever as internString/NOTE-2845, which
+// was a top inuse_space frame). The table is keyed by the raw name bytes via a zero-alloc
+// unsafe.String header that never escapes the lookup; a heap copy is made only on the first
+// occurrence of a name. It is bounded by colNameInternMaxEntries so a pathological file with
+// runaway-cardinality column names cannot grow it without limit — past the cap, names fall back
+// to a plain per-parse string() copy (correct, just unshared), so the table size is bounded
+// while the common bounded-schema case is fully interned.
+const colNameInternMaxEntries = 1 << 16 // 65536 distinct column names — far above any real schema
+
+var (
+	colNameInternMu  sync.RWMutex
+	colNameIntern    = make(map[string]string)
+	colNameInternLen int
+)
+
+// internColName returns a process-shared string equal to the name bytes at data[pos:pos+nameLen],
+// allocating a heap copy only on the first occurrence. The key never escapes (zero-alloc lookup).
+// Past colNameInternMaxEntries distinct names it falls back to an unshared string() copy so the
+// table stays bounded. b must not be retained by the caller beyond this call.
+func internColName(b []byte) string {
+	if len(b) == 0 {
+		return ""
+	}
+	key := unsafe.String(unsafe.SliceData(b), len(b)) //nolint:gosec // safe: key never escapes this func
+
+	colNameInternMu.RLock()
+	if s, ok := colNameIntern[key]; ok {
+		colNameInternMu.RUnlock()
+		return s
+	}
+	colNameInternMu.RUnlock()
+
+	s := string(b) // heap-allocate the canonical copy only on first occurrence
+	colNameInternMu.Lock()
+	// Re-check under the write lock: another goroutine may have inserted concurrently.
+	if existing, ok := colNameIntern[key]; ok {
+		colNameInternMu.Unlock()
+		return existing
+	}
+	if colNameInternLen >= colNameInternMaxEntries {
+		colNameInternMu.Unlock()
+		return s // table full: return the unshared copy without inserting
+	}
+	colNameIntern[s] = s
+	colNameInternLen++
+	colNameInternMu.Unlock()
+	return s
+}
 
 // resolveColumnData returns the (still-compressed unless inline) bytes for column m. It
 // prefers, in order: the inline blob carried in the TOC entry (NOTE-220, no outer snappy);
@@ -145,7 +206,11 @@ func parseColumnMetadataArray(data []byte, offset, colCount int, blockVersion ui
 			return nil, pos, fmt.Errorf("col_meta[%d]: short for name", i)
 		}
 
-		name := string(data[pos : pos+nameLen])
+		// NOTE-430: intern the column name against a process-global table so the same
+		// schema name shared across thousands of blocks is heap-allocated once, not once per
+		// cold ToC parse. data[pos:pos+nameLen] aliases the transient ToC buffer; internColName
+		// copies on first occurrence and never retains the slice.
+		name := internColName(data[pos : pos+nameLen])
 		pos += nameLen
 
 		// col_type[1] (+ flags[1] for V15) must be present before the variable tail.

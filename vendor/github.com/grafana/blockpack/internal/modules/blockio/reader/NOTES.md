@@ -3142,3 +3142,32 @@ appends the suffix per column. The assembled key is byte-for-byte identical to t
 
 **Verification:** `go build`; `go test -race ./reader` + `./executor` green (existing
 parsedV8ColumnCache warm/cold equivalence tests unchanged — same keys ⇒ same cache hits).
+
+## NOTE-430: process-global column-name intern table in parseColumnMetadataArray
+
+`parseColumnMetadataArray` decoded every column's name with `name := string(data[pos:pos+nameLen])`,
+heap-allocating one fresh string PER COLUMN on every cold/miss ToC parse. A 2026-06-16 querier CPU
+profile put `parseColumnMetadataArray` at ~1.3s self-time (#3 blockpack frame): the per-block
+parsed ToC is cached in `blockColTypesCache` (NOTE-241/242) but that cache is sized `n/16` (tiny vs
+decoded columns), so under real traffic — hundreds of attribute columns per block, thousands of
+distinct blocks — it evicts and the parse (and its per-column string allocs) reruns constantly.
+Column names come from a tiny bounded universe (the block schema) repeated across all those blocks,
+so the SAME name (`trace:id`, `resource.service.name`, every attribute key) was heap-allocated once
+per block-parse instead of once per process.
+
+**Fix:** a process-global, RWMutex-guarded intern table (`colNameIntern`) keyed by the raw name
+bytes via a zero-alloc `unsafe.String` header that never escapes the lookup. `internColName` heap-
+copies a name only on its first occurrence; every later parse of any block returns the shared
+backing string. This (a) eliminates the repeat per-column allocations and (b) shrinks live heap and
+GC scan work by collapsing duplicate name strings onto one copy — the same lever as
+`internString`/NOTE-2845. The table is bounded by `colNameInternMaxEntries` (65536, far above any
+real schema); past the cap names fall back to a plain `string()` copy (correct, just unshared) so a
+pathological runaway-cardinality file cannot grow it without limit. Interned names are immutable and
+never alias the transient ToC buffer, so caching them in `blockColTypesCache` (which already deep-
+copies only `inlineData`) remains safe — byte-for-byte identical metas, just shared name backing.
+
+**Verification:** `go build`; `go test -race ./reader` + `./executor` green;
+`TestParseColumnMetadataArray_InternedNamesShared` asserts equal names across independent parses
+share one backing pointer. `BenchmarkParseColumnMetadataArray` (120-column schema): **121 allocs/op
+→ 1 alloc/op** (the lone remaining alloc is the entries slice), 8696 B/op → 6784 B/op (~22% less).
+Production blocks carry hundreds of columns, multiplying the per-parse win.
