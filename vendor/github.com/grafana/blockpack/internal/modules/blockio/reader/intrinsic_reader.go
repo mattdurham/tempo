@@ -163,6 +163,50 @@ func (r *Reader) ScanIntrinsicColumn(name string, visit func(*shared.DecodedPage
 	return true, nil
 }
 
+// ScanDictGroupByColumn fetches the named intrinsic column's blob (from cache or disk) and, if
+// it is a v2 paged Dict column, streams it ONE PAGE AT A TIME, invoking visit once per
+// value-record per page with the raw (undecoded) ref run for that occurrence (NOTE-407, issue
+// #356). Unlike GetIntrinsicColumn, it NEVER materializes the O(column) BlockRefs arena — the
+// dominant decode-side allocation on the M4/M6/M9 rate-by-Dict-group hot path. A group-by
+// scatter consumer reads each ref straight out of the raw run, so the BlockRef structs never
+// exist.
+//
+// Returns (false, nil) when the column is absent or is NOT a paged Dict column (Flat/XOR/Delta
+// paged — streamable via ScanIntrinsicColumn — or legacy v1) so the caller can fall back. The
+// DictPageValue and its RawRefs slice are valid only for the duration of each visit call.
+//
+// Trade-off (issue #356): like ScanIntrinsicColumn, a streamed Dict scan is consumed in place
+// and NOT cached as a decoded column. service.name and the other rate-by-group Dict columns are
+// large, churn the process cache, and are read once per query, so streaming avoids the big
+// BlockRefs arena allocation on each decode while the compressed blob stays in the section cache
+// (GetOrFetchIntrinsic) — no re-fetch on re-decode.
+func (r *Reader) ScanDictGroupByColumn(
+	name string,
+	visit func(*shared.DictPageValue) error,
+) (streamed bool, err error) {
+	if r.intrinsicIndex == nil {
+		return false, nil
+	}
+	meta, ok := r.intrinsicIndex[name]
+	if !ok {
+		return false, nil
+	}
+	blob, err := r.cache.GetOrFetchIntrinsic(r.fileID, name, func() ([]byte, error) {
+		return r.readRange(meta.Offset, uint64(meta.Length), rw.DataTypeMetadata)
+	})
+	if err != nil {
+		return false, fmt.Errorf("ScanDictGroupByColumn %q: read: %w", name, err)
+	}
+	if !shared.IsDictPagedColumnBlob(blob) {
+		// Not a paged Dict column (Flat/XOR/Delta paged or legacy v1) — caller falls back.
+		return false, nil
+	}
+	if err := shared.ScanDictPagedColumnBlob(blob, visit); err != nil {
+		return true, fmt.Errorf("ScanDictGroupByColumn %q: %w", name, err)
+	}
+	return true, nil
+}
+
 // intrinsicBatchFetcher is the optional interface a section cache may implement to
 // batch-fetch several intrinsic column blobs for one file in a single round-trip.
 // TypedTieredCache.GetMultiIntrinsic implements it; caches that don't are simply not

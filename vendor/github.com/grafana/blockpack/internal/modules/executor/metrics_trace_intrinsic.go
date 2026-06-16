@@ -1180,6 +1180,129 @@ func scanGroupByColCompactFlatStreaming(
 	})
 }
 
+// scanGroupByColCompactDictStreaming is the streaming (decode-time push-down) variant of the
+// Dict-format group-by scan (NOTE-407, issue #356). Instead of consuming a fully materialized
+// Dict column (decodeDictPagesArena materializes a contiguous makeNoZeroBlockRef(totalRows)
+// arena plus per-entry []BlockRef sub-slices, all decoded only to be walked once and discarded),
+// it streams the Dict column ONE PAGE AT A TIME via r.ScanDictGroupByColumn and scatters each
+// ref's group index straight out of the page's raw ref run — the BlockRef structs never exist.
+//
+// It dedups each distinct value into a group slot via valToIdx (string column) / an int64 key
+// map (int64-domain column), reproducing the merged first-appearance entry order of
+// decodeDictPagesArena. Empty string values are skipped so their refs stay at sentinel 0 (the
+// absent group), matching NOTE-401's scanGroupByColCompactDictSerial. The resulting
+// dict + dictIdxByPos are byte-identical to the eager path; the dict strings are resolved here
+// (one intern per distinct value) rather than lazily at emit, because the column is not
+// materialized — but distinct values are few (low-cardinality group-by columns), so this is a
+// handful of interns, not O(rows).
+//
+// Returns (false, nil) when the column is not a paged Dict column so the caller falls back to the
+// eager scanGroupByColCompact + lazy resolveDictGroupKeys path.
+func scanGroupByColCompactDictStreaming(
+	r *modules_reader.Reader,
+	colName string,
+	sortedPKs []uint32,
+	rankIdx *pkRankIndex, // NOTE-348: prebuilt rank index over sortedPKs (nil = build internally)
+	dict *[]string,
+	dictIdxByPos []uint32,
+) (bool, error) {
+	if len(sortedPKs) == 0 {
+		return true, nil // nothing in range; treat as handled (no scatter needed)
+	}
+	var (
+		minPK, maxPK uint32
+		pkBitset     []uint64
+		rankPrefix   []uint32
+		localIdx     pkRankIndex
+		ownsIdx      bool
+	)
+	if rankIdx != nil {
+		minPK, maxPK = rankIdx.minPK, rankIdx.maxPK
+		pkBitset, rankPrefix = rankIdx.bitset, rankIdx.rankPrefix
+	} else {
+		maxPKLocal := sortedPKs[0]
+		for _, pk := range sortedPKs {
+			if pk > maxPKLocal {
+				maxPKLocal = pk
+			}
+		}
+		localIdx = buildPKRankIndex(sortedPKs, maxPKLocal)
+		ownsIdx = true
+		minPK, maxPK = localIdx.minPK, localIdx.maxPK
+		pkBitset, rankPrefix = localIdx.bitset, localIdx.rankPrefix
+	}
+	if ownsIdx {
+		defer localIdx.release()
+	}
+
+	int64Domain := isInt64DomainColName(colName)
+	valToIdx := make(map[string]uint32, 32)
+	var int64ToIdx map[int64]uint32
+	if int64Domain {
+		int64ToIdx = make(map[int64]uint32, 32)
+	}
+	return r.ScanDictGroupByColumn(colName, func(pv *modules_shared.DictPageValue) error {
+		// Resolve this value-record's 1-based group slot, deduping across pages so a value that
+		// repeats on multiple pages folds into one group (decodeDictPagesArena first-appearance
+		// merge). dictSlot is the value's index in *dict (which starts as [""], slot 0 = the
+		// absent group); refs scatter dictSlot, and emit reads dict[dictSlot] — matching
+		// scatterFlatGroupByRef's idx+1 convention. Empty string values are skipped (NOTE-401).
+		var dictSlot uint32
+		if int64Domain {
+			slot, ok := int64ToIdx[pv.Int64Val]
+			if !ok {
+				slot = uint32(len(*dict)) //nolint:gosec
+				*dict = append(*dict, intrinsicInt64ColToString(colName, pv.Int64Val))
+				int64ToIdx[pv.Int64Val] = slot
+			}
+			dictSlot = slot
+		} else {
+			if len(pv.ValBytes) == 0 {
+				return nil // empty value → refs stay at sentinel 0 (NOTE-401)
+			}
+			val := string(pv.ValBytes)
+			slot, ok := valToIdx[val]
+			if !ok {
+				slot = uint32(len(*dict)) //nolint:gosec
+				*dict = append(*dict, val)
+				valToIdx[val] = slot
+			}
+			dictSlot = slot
+		}
+		// Scatter this group index for every ref in the page-local run, reading each ref
+		// straight out of the raw bytes (no BlockRef materialization).
+		refSize := pv.BlockW + pv.RowW
+		for k := 0; k < pv.RefCount; k++ {
+			blockIdx, rowIdx := modules_shared.DecodeRefAt(pv.RawRefs, k*refSize, pv.BlockW, pv.RowW)
+			pk := packKey(blockIdx, rowIdx)
+			if pk < minPK || pk > maxPK {
+				continue
+			}
+			word := pk >> 6
+			bit := pk & 63
+			if len(pkBitset) > 0 && pkBitset[word]&(uint64(1)<<bit) == 0 {
+				continue // NOTE-135/140: pre-filter: pk not in sortedPKs
+			}
+			rk := rankPrefix[word] + uint32(bits.OnesCount64(pkBitset[word]&((uint64(1)<<bit)-1))) //nolint:gosec
+			dictIdxByPos[int(rk)] = dictSlot
+		}
+		return nil
+	})
+}
+
+// isInt64DomainColName reports whether the named intrinsic column stores int64 values in a Dict
+// column (kind/status enum columns), the name-keyed counterpart of isInt64DomainColumn used by
+// the streaming Dict group-by scan (NOTE-407), which has no materialized IntrinsicColumn to read
+// col.Type from. Mirrors the decoder's isInt64 predicate by intrinsic column name.
+func isInt64DomainColName(colName string) bool {
+	switch colName {
+	case "span:kind", "span:status":
+		return true
+	default:
+		return false
+	}
+}
+
 // scanGroupByColCompactDictParallel is the parallel Dict-format path for scanGroupByColCompact
 // (NOTE-148, simplified by NOTE-401). It parallelizes the per-ref inner loop — the bulk of the
 // scan cost — across `workers` goroutines, writing the NATIVE entry index (entryIdx+1; 0 = absent
@@ -2075,6 +2198,21 @@ func streamCountRateN1CompactCore(
 		return err
 	}
 	if !streamed {
+		// NOTE-407 (issue #356): Dict columns (resource.service.name and the other rate-by-group
+		// columns) are NOT Flat-streamable, so they fell through to GetIntrinsicColumn, which
+		// materialized the O(rows) BlockRefs arena (decodeDictPagesArena) only to walk it once.
+		// Stream the Dict column page-by-page instead, scattering each ref's group index straight
+		// out of the raw ref bytes — no arena. groupByCol stays nil, so resolveDictGroupKeys below
+		// is a no-op (the streaming scan already populated dict). Dict columns that are not paged
+		// (legacy v1) or any other format fall through to the eager path.
+		streamed, err = scanGroupByColCompactDictStreaming(
+			r, groupByColName, sortedPKs, rankIdx, &dict, dictIdxByPos,
+		)
+		if err != nil {
+			return err
+		}
+	}
+	if !streamed {
 		groupByCol, err = r.GetIntrinsicColumn(groupByColName)
 		if err != nil {
 			return err
@@ -2244,6 +2382,13 @@ func streamAggN1CompactCore(
 	streamed, err := streamGroupByColCompactFlat(r, agg.GroupBy[0], sortedPKs, &dict, dictIdxByPos, nil)
 	if err != nil {
 		return err
+	}
+	if !streamed {
+		// NOTE-407: stream the Dict group-by column page-by-page (no O(rows) BlockRefs arena).
+		streamed, err = scanGroupByColCompactDictStreaming(r, agg.GroupBy[0], sortedPKs, nil, &dict, dictIdxByPos)
+		if err != nil {
+			return err
+		}
 	}
 	if !streamed {
 		groupByCol, err = r.GetIntrinsicColumn(agg.GroupBy[0])
@@ -2637,6 +2782,13 @@ func streamHistogramN1CompactCore(
 	streamed, err := streamGroupByColCompactFlat(r, agg.GroupBy[0], sortedPKs, &dict, dictIdxByPos, nil)
 	if err != nil {
 		return err
+	}
+	if !streamed {
+		// NOTE-407: stream the Dict group-by column page-by-page (no O(rows) BlockRefs arena).
+		streamed, err = scanGroupByColCompactDictStreaming(r, agg.GroupBy[0], sortedPKs, nil, &dict, dictIdxByPos)
+		if err != nil {
+			return err
+		}
 	}
 	if !streamed {
 		groupByCol, err = r.GetIntrinsicColumn(agg.GroupBy[0])
@@ -3979,6 +4131,28 @@ func accumulateIntrinsicBucketsDirect(
 		return true, nil
 	}
 
+	// NOTE-407: count/rate streaming direct path. The eager path below fetches the whole group-by
+	// column via GetIntrinsicColumn (materializing the O(rows) BlockRefs arena, decodeDictPagesArena)
+	// and then walks every entry's refs TWICE — once to build entryGIdx, once in
+	// accumulateCountRateDirect to scatter into groupCountsFlat. For a paged Dict group-by column
+	// (resource.service.name etc.) we instead stream the column page-by-page and scatter each ref's
+	// group count straight out of the raw ref bytes into groupCountsFlat[gIdx*numSteps + bk-1],
+	// using the bucketByPK array already built above — no BlockRefs arena, one fused pass. This is
+	// the dominant remaining M4/M9 cost (the only work beyond the no-group-by {} | rate()).
+	if isCountRate {
+		streamed, serr := accumulateCountRateDirectStreaming(
+			ctx, r, agg.GroupBy[0], bucketByPK, pkOffset, minPK, maxPK,
+			inRangeCount, stepCounts, numSteps, buckets, seriesSink,
+			agg.Function == vm.FuncNameRATE, float64(tb.StepSizeNanos)/1e9,
+		)
+		if serr != nil {
+			return false, serr
+		}
+		if streamed {
+			return true, nil // streamed → done; otherwise fall through to the eager path
+		}
+	}
+
 	// Get the single group-by column.
 	groupByCol, err := r.GetIntrinsicColumn(agg.GroupBy[0])
 	if err != nil {
@@ -3989,52 +4163,15 @@ func accumulateIntrinsicBucketsDirect(
 	}
 
 	// Build dict and (for histogram/agg) dictByPK from the group-by column.
-	// entryGIdx[i] = dictIdx+1 for DictEntries[i] (0 = entry has no refs within maxPK).
 	// NOTE-091: dictByPK is only needed for accumulateHistogramDirect/accumulateAggDirect;
-	// count/rate uses entryGIdx exclusively (set in accumulateCountRateDirect), so
-	// skipping dictByPK for that path saves up to (maxPK+1)×4 bytes per file.
-	dict := []string{""}
+	// count/rate uses entryGIdx exclusively, so skipping dictByPK for that path saves up to
+	// (maxPK+1)×4 bytes per file.
 	var dictByPK []uint32
 	if !isCountRate {
 		dictByPK = acquireCompactUint32(int(maxPK) + 1) // NOTE-129
 		defer releaseCompactUint32(dictByPK)
 	}
-	entryGIdx := make([]uint32, len(groupByCol.DictEntries))
-	for i, entry := range groupByCol.DictEntries {
-		val := entry.Value
-		if val == "" {
-			val = intrinsicInt64ColToString(agg.GroupBy[0], entry.Int64Val)
-		}
-		if val == "" {
-			continue
-		}
-		// NOTE-249: count/rate (dictByPK == nil) only needs entryGIdx[i] — a per-entry flag of
-		// "has any ref ≤ maxPK" — because accumulateCountRateDirect re-walks every entry's
-		// BlockRefs itself (the per-span bucket lookup is keyed off entryGIdx, not dictByPK). So
-		// once this entry has been assigned a gIdx there is no remaining work for the count/rate
-		// path: the only reason to keep scanning refs is to populate dictByPK, which is nil here.
-		// Breaking turns this first pass from O(total spans) into O(num dict entries) for
-		// count/rate. The histogram/agg paths (dictByPK != nil) must visit every ref to fill the
-		// dense dictByPK, so they scan in full — unchanged.
-		dictIdx := uint32(len(dict)) //nolint:gosec
-		assigned := false
-		for _, ref := range entry.BlockRefs {
-			pk := packKey(ref.BlockIdx, ref.RowIdx)
-			if pk <= maxPK {
-				if !assigned {
-					dict = append(dict, val)
-					entryGIdx[i] = dictIdx + 1
-					assigned = true
-					if dictByPK == nil {
-						break
-					}
-				}
-				if dictByPK != nil {
-					dictByPK[pk] = dictIdx + 1
-				}
-			}
-		}
-	}
+	dict, entryGIdx := buildDirectDictAndDictByPK(groupByCol, agg.GroupBy[0], maxPK, dictByPK)
 
 	if isCountRate {
 		return true, accumulateCountRateDirect(
@@ -4073,6 +4210,193 @@ func accumulateIntrinsicBucketsDirect(
 		)
 	}
 	return true, accumulateAggDirect(ctx, r, agg, dictByPK, bucketByPK, minPK, maxPK, dict, numSteps, buckets)
+}
+
+// buildDirectDictAndDictByPK builds the group dict (slot 0 = absent) and entryGIdx (entryGIdx[i]
+// = dictIdx+1 for DictEntries[i], 0 = entry has no refs ≤ maxPK) for the eager direct path. When
+// dictByPK != nil (histogram/agg) it also fills the dense per-pk group index; when nil (count/
+// rate, NOTE-249) it breaks after the first in-range ref per entry — that path re-walks refs in
+// accumulateCountRateDirect — turning this first pass from O(total spans) into O(num entries).
+func buildDirectDictAndDictByPK(
+	groupByCol *modules_shared.IntrinsicColumn,
+	groupByName string,
+	maxPK uint32,
+	dictByPK []uint32,
+) (dict []string, entryGIdx []uint32) {
+	dict = []string{""}
+	entryGIdx = make([]uint32, len(groupByCol.DictEntries))
+	for i, entry := range groupByCol.DictEntries {
+		val := entry.Value
+		if val == "" {
+			val = intrinsicInt64ColToString(groupByName, entry.Int64Val)
+		}
+		if val == "" {
+			continue
+		}
+		dictIdx := uint32(len(dict)) //nolint:gosec
+		assigned := false
+		for _, ref := range entry.BlockRefs {
+			pk := packKey(ref.BlockIdx, ref.RowIdx)
+			if pk > maxPK {
+				continue
+			}
+			if !assigned {
+				dict = append(dict, val)
+				entryGIdx[i] = dictIdx + 1
+				assigned = true
+				if dictByPK == nil {
+					break
+				}
+			}
+			if dictByPK != nil {
+				dictByPK[pk] = dictIdx + 1
+			}
+		}
+	}
+	return dict, entryGIdx
+}
+
+// accumulateCountRateDirectStreaming is the streaming (decode-time push-down) count/rate direct
+// path (NOTE-407). It replaces accumulateIntrinsicBucketsDirect's eager
+// GetIntrinsicColumn + double ref-walk (build entryGIdx, then accumulateCountRateDirect scatter)
+// for a paged Dict group-by column: it streams the column page-by-page via
+// r.ScanDictGroupByColumn and folds each ref straight into groupCountsFlat using the caller's
+// bucketByPK — no O(rows) BlockRefs arena, one fused pass. The dict (value→group slot, built in
+// first-appearance order) and groupCountsFlat grow together as new values appear; service.name
+// and the other rate-by-group columns are low-cardinality, so this is a handful of grows.
+//
+// Returns (false, nil) when the column is NOT a paged Dict column (legacy v1 / absent) so the
+// caller falls back to the eager path. Output (per-group counts → emitted series) is identical
+// to accumulateCountRateDirect: empty-value refs are the absent group (slot 0), and the
+// absent-row pass adds in-range spans with no group value to slot 0 per time bucket.
+func accumulateCountRateDirectStreaming(
+	ctx context.Context,
+	r *modules_reader.Reader,
+	groupByName string,
+	bucketByPK []int16,
+	pkOffset, minPK, maxPK uint32,
+	inRangeCount int,
+	stepCounts []int64,
+	numSteps int64,
+	buckets map[string]*aggBucketState,
+	seriesSink *[]TraceTimeSeries,
+	isRate bool,
+	stepSec float64,
+) (bool, error) {
+	int64Domain := isInt64DomainColName(groupByName)
+	dict := []string{""}                       // slot 0 = absent group
+	groupCountsFlat := make([]int64, numSteps) // grows by numSteps per new group
+	valToIdx := make(map[string]uint32, 32)
+	var int64ToIdx map[int64]uint32
+	if int64Domain {
+		int64ToIdx = make(map[int64]uint32, 32)
+	}
+	totalSeen := int64(0)
+	spanCount := 0
+
+	streamed, err := r.ScanDictGroupByColumn(groupByName, func(pv *modules_shared.DictPageValue) error {
+		if spanCount&ctxCheckMask == 0 {
+			if cerr := ctx.Err(); cerr != nil {
+				return cerr
+			}
+		}
+		// Resolve this value-record's group slot (dedup across pages → first-appearance merge).
+		// Empty string values stay at the absent group (slot 0), matching the eager path's
+		// val == "" skip.
+		var slot uint32
+		if int64Domain {
+			idx, ok := int64ToIdx[pv.Int64Val]
+			if !ok {
+				idx = uint32(len(dict)) //nolint:gosec
+				dict = append(dict, intrinsicInt64ColToString(groupByName, pv.Int64Val))
+				groupCountsFlat = append(groupCountsFlat, make([]int64, numSteps)...)
+				int64ToIdx[pv.Int64Val] = idx
+			}
+			slot = idx
+		} else {
+			if len(pv.ValBytes) == 0 {
+				return nil // empty value → absent group; refs contribute via the absent-row pass
+			}
+			val := string(pv.ValBytes)
+			idx, ok := valToIdx[val]
+			if !ok {
+				idx = uint32(len(dict)) //nolint:gosec
+				dict = append(dict, val)
+				groupCountsFlat = append(groupCountsFlat, make([]int64, numSteps)...)
+				valToIdx[val] = idx
+			}
+			slot = idx
+		}
+		base := int64(slot) * numSteps
+		refSize := pv.BlockW + pv.RowW
+		for k := 0; k < pv.RefCount; k++ {
+			spanCount++
+			blockIdx, rowIdx := modules_shared.DecodeRefAt(pv.RawRefs, k*refSize, pv.BlockW, pv.RowW)
+			pk := packKey(blockIdx, rowIdx)
+			if pk < minPK || pk > maxPK {
+				continue
+			}
+			bk := int64(bucketByPK[pk-pkOffset]) // NOTE-269: rebased index
+			if bk == 0 {
+				continue
+			}
+			totalSeen++
+			groupCountsFlat[base+bk-1]++
+		}
+		return nil
+	})
+	if err != nil {
+		return streamed, err
+	}
+	if !streamed {
+		return false, nil // not a paged Dict column — caller falls back to the eager path
+	}
+
+	numGroups := int64(len(dict)) //nolint:gosec
+
+	// Absent-row pass: in-range spans with no group value → empty-string group (slot 0).
+	// Identical to accumulateCountRateDirect (NOTE-091).
+	if totalSeen < int64(inRangeCount) {
+		for bk := range numSteps {
+			presentAtBk := int64(0)
+			for gIdx := int64(1); gIdx < numGroups; gIdx++ {
+				presentAtBk += groupCountsFlat[gIdx*numSteps+bk]
+			}
+			absentAtBk := stepCounts[bk] - presentAtBk
+			if absentAtBk > 0 {
+				groupCountsFlat[bk] += absentAtBk
+			}
+		}
+	}
+
+	if seriesSink != nil {
+		emitFlatCountRateSeries(seriesSink, groupCountsFlat, numGroups, numSteps, dict, groupByName, isRate, stepSec)
+		return true, nil
+	}
+
+	for gIdx := range numGroups {
+		gk := dict[gIdx]
+		base := gIdx * numSteps
+		hasAny := false
+		for bk := range numSteps {
+			if groupCountsFlat[base+bk] > 0 {
+				hasAny = true
+				break
+			}
+		}
+		if !hasAny {
+			continue
+		}
+		for bk := range numSteps {
+			c := groupCountsFlat[base+bk]
+			if c == 0 {
+				continue
+			}
+			k := strconv.FormatInt(bk, 10) + "\x00" + gk
+			intrinsicGetOrCreateBucket(buckets, k).count += c
+		}
+	}
+	return true, nil
 }
 
 // accumulateCountRateDirect scans the group-by dict entries directly and accumulates

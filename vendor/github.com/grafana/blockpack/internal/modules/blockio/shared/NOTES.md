@@ -2346,3 +2346,50 @@ IsStreamablePagedColumnBlob, ScanPagedColumnBlob); `internal/modules/blockio/rea
 intrinsic_reader.go` (Reader.ScanIntrinsicColumn); `internal/modules/executor/
 metrics_trace_intrinsic.go` (scanGroupByColCompactFlatStreaming / scatterFlatGroupByRef /
 streamGroupByColCompactFlat — first consumer: the N=1 Flat/XOR/Delta group-by accumulators).
+
+## NOTE-407: streaming (decode-time push-down) Dict group-by scan (issue #356)
+
+NOTE-406 streamed only the value-decoupled Flat/XOR/Delta formats; **Dict columns (every
+rate-by-group column in the bench set — `resource.service.name`, `span.http.request.method`,
+`span:kind`/`span:status`) still fell through to the eager `GetIntrinsicColumn`**, whose
+`decodeDictPagesArena` materializes a contiguous `makeNoZeroBlockRef(totalRows)` arena plus a
+per-entry `[]BlockRef` sub-slice for EVERY span row, decoded only to be walked once by the
+group-by scatter and discarded. On the warm M4 (`{} | rate() by service`) path — where the
+block I/O is cached and the only work beyond the no-group-by `{} | rate()` (M1) is reading the
+service.name column — this BlockRefs arena decode (`appendVariableWidthRefs` over millions of
+refs) was the dominant remaining cost: 24h-window warm M4 ≈ 4.1 s vs M1 ≈ 0.27 s over the same
+cached blocks (~3.8 s purely the service-name group-by).
+
+`ScanDictPagedColumnBlob(blob, visit)` (intrinsic_stream.go) decodes a v2 paged **Dict** column
+ONE PAGE AT A TIME (reused pooled snappy buffer) and invokes `visit` once per value-record per
+page with a `DictPageValue` carrying the value (`ValBytes`/`Int64Val`) and the **raw, undecoded
+ref run** (`RawRefs`, `RefCount` refs of `BlockW+RowW` bytes each) for that page occurrence. The
+shared `forEachDictPageValue` walker (also used by `decodeDictPagesArena` pass 2) guarantees
+per-page, per-value visitation order is byte-identical to the eager path, so a consumer that
+dedups by value reproduces the same merged entry set and per-entry ref membership — but the
+`[]BlockRef` arena is NEVER allocated: the consumer reads each ref straight out of `RawRefs` via
+the new exported `shared.DecodeRefAt` (struct-free counterpart of `decodeRef`) and scatters its
+group index. `IsDictPagedColumnBlob` selects the target (paged Dict only; Flat/XOR/Delta paged
+are streamed by NOTE-406, legacy v1 falls back).
+
+**Validity / trade-off:** identical to NOTE-406 — `DictPageValue` and `RawRefs` are valid only
+for the duration of each `visit` call; a streamed scan is consumed in place and NOT cached.
+service.name and the other rate-by-group Dict columns are large, churn the process cache, and
+are read once per query, so streaming avoids the arena allocation on every decode while the
+compressed blob stays in the section cache (`GetOrFetchIntrinsic`).
+
+**Correctness:** differential tests pin the streamed merged dict (first-appearance order) +
+per-entry refs byte-identical to `DecodeIntrinsicColumnBlob` across single-/multi-page (value
+repeated across pages) / many-page / single-value-across-pages layouts, plus non-dict rejection
+and visitor-error short-circuit (`intrinsic_stream_test.go`); an end-to-end executor test
+(`intrinsic_stream_groupby_test.go`) pins the streamed per-position GROUP ASSIGNMENT
+(`streamDict[streamPos[i]] == eagerDict[eagerPos[i]]`) equal to the eager native-index Dict path
+over a real multi-page service.name column (the two paths assign dict SLOTS in different orders —
+first-appearance vs native entry order — so the dict arrays differ but the resolved per-row group
+value, which is all the rate accumulation depends on, is identical).
+
+Back-ref: `internal/modules/blockio/shared/intrinsic_stream.go` (DictPageValue,
+IsDictPagedColumnBlob, ScanDictPagedColumnBlob); `intrinsic_codec.go` (DecodeRefAt);
+`internal/modules/blockio/reader/intrinsic_reader.go` (Reader.ScanDictGroupByColumn);
+`internal/modules/executor/metrics_trace_intrinsic.go` (scanGroupByColCompactDictStreaming /
+isInt64DomainColName — wired into the count/rate, agg, and histogram N=1 compact group-by cores).

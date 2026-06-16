@@ -163,3 +163,118 @@ func ScanPagedColumnBlob(blob []byte, visit func(*DecodedPage) error) error {
 	}
 	return nil
 }
+
+// DictPageValue is one value-record encountered while streaming a paged Dict column with
+// ScanDictPagedColumnBlob. ValBytes/Int64Val carry the value (ValBytes nil for an int64
+// value); RawRefs is the packed ref run (RefCount refs, each BlockW+RowW bytes, little-endian
+// blockIdx then rowIdx) for THIS page occurrence of the value. A value that spans multiple
+// pages is visited once per page it appears in, with the per-page ref run each time — the
+// caller dedups the value into a group and folds every occurrence's refs into that group.
+//
+// RawRefs aliases the page's pooled decode buffer and is valid ONLY for the duration of the
+// visit call; the next page reuses the buffer. A visitor that retains ref bytes MUST copy them
+// (the group-by scatter consumer reads them in place, so it never copies).
+type DictPageValue struct {
+	ValBytes []byte
+	RawRefs  []byte
+	Int64Val int64
+	RefCount int
+	BlockW   int
+	RowW     int
+}
+
+// ScanDictPagedColumnBlob decodes a v2 paged Dict column blob ONE PAGE AT A TIME into a reused
+// snappy buffer and invokes visit once per value-record per page, handing the raw (undecoded)
+// ref run for that occurrence. Unlike the eager decodeDictPagesArena path (reached via
+// GetIntrinsicColumn), it NEVER materializes the O(column) BlockRefs arena nor the per-entry
+// []BlockRef slices — the dominant decode-side allocation on the M4/M6/M9 rate-by-Dict-group
+// hot path (decodeDictPagesArena's makeNoZeroBlockRef(total) + appendVariableWidthRefs of
+// millions of refs). A group-by scatter consumer reads each ref straight out of RawRefs and
+// scatters its group index, so the BlockRef structs never exist (NOTE-407, issue #356).
+//
+// blob MUST be a v2 paged Dict column (blob[0] == IntrinsicPagedVersion and TOC format ==
+// IntrinsicFormatDict); ScanDictPagedColumnBlob returns an error otherwise rather than silently
+// misdecoding. The visitor's returned error short-circuits the scan and is returned.
+//
+// Per-page, per-value visitation order is byte-identical to decodeDictPagesArena's pass 2 (the
+// shared forEachDictPageValue walker), so a consumer that dedups by value reproduces the same
+// merged entry set and per-entry ref membership as the eager path.
+func ScanDictPagedColumnBlob(blob []byte, visit func(*DictPageValue) error) error {
+	if len(blob) < 5 || blob[0] != IntrinsicPagedVersion {
+		return fmt.Errorf("ScanDictPagedColumnBlob: not a v2 paged column blob")
+	}
+	pos := 1
+	tocLen := int(binary.LittleEndian.Uint32(blob[pos:]))
+	pos += 4
+	if pos+tocLen > len(blob) {
+		return fmt.Errorf("ScanDictPagedColumnBlob: truncated at toc_blob")
+	}
+	toc, err := DecodePageTOCNoStats(blob[pos : pos+tocLen])
+	if err != nil {
+		return fmt.Errorf("ScanDictPagedColumnBlob: %w", err)
+	}
+	pos += tocLen // pos now points to first page blob
+
+	if toc.Format != IntrinsicFormatDict {
+		return fmt.Errorf("ScanDictPagedColumnBlob: format %d is not a Dict column", toc.Format)
+	}
+
+	blockW := int(toc.BlockIdxWidth)
+	rowW := int(toc.RowIdxWidth)
+	refSize := blockW + rowW
+	if refSize <= 0 {
+		return fmt.Errorf("ScanDictPagedColumnBlob: invalid ref size %d", refSize)
+	}
+	isInt64 := toc.ColType == ColumnTypeInt64 || toc.ColType == ColumnTypeRangeInt64
+
+	// NOTE-012: reuse a pooled snappy decode buffer across page decompressions.
+	pageBuf := AcquireIntrinsicBuf()
+	defer ReleaseIntrinsicBuf(pageBuf)
+
+	pv := &DictPageValue{BlockW: blockW, RowW: rowW}
+	for i, pm := range toc.Pages {
+		pageStart := pos + int(pm.Offset)
+		pageEnd := pageStart + int(pm.Length)
+		if pageEnd > len(blob) {
+			return fmt.Errorf("ScanDictPagedColumnBlob: page %d out of bounds (offset=%d len=%d blobLen=%d)",
+				i, pm.Offset, pm.Length, len(blob))
+		}
+		pageRaw, decErr := snappyDecodeReuse(pageBuf, blob[pageStart:pageEnd]) // NOTE-262
+		if decErr != nil {
+			return fmt.Errorf("ScanDictPagedColumnBlob: page %d snappy: %w", i, decErr)
+		}
+
+		err = forEachDictPageValue(pageRaw, refSize, isInt64,
+			func(valBytes []byte, int64Val int64, refStart, refCount int) error {
+				pv.ValBytes = valBytes
+				pv.Int64Val = int64Val
+				pv.RefCount = refCount
+				pv.RawRefs = pageRaw[refStart : refStart+refCount*refSize]
+				return visit(pv)
+			})
+		if err != nil {
+			return fmt.Errorf("ScanDictPagedColumnBlob: page %d: %w", i, err)
+		}
+	}
+	return nil
+}
+
+// IsDictPagedColumnBlob reports whether blob is a v2 paged Dict column — the streamable target
+// of ScanDictPagedColumnBlob. Flat/XOR/Delta paged blobs (streamable via ScanPagedColumnBlob)
+// and legacy v1 blobs return false. NOTE-407.
+func IsDictPagedColumnBlob(blob []byte) bool {
+	if len(blob) < 5 || blob[0] != IntrinsicPagedVersion {
+		return false
+	}
+	pos := 1
+	tocLen := int(binary.LittleEndian.Uint32(blob[pos:]))
+	pos += 4
+	if pos+tocLen > len(blob) {
+		return false
+	}
+	toc, err := DecodePageTOCNoStats(blob[pos : pos+tocLen])
+	if err != nil {
+		return false
+	}
+	return toc.Format == IntrinsicFormatDict
+}

@@ -6239,3 +6239,44 @@ nil / Flat-streamed case (Flat dicts are fully populated by the scan).
 Covered by `intrinsic_stream_groupby_test.go`: streamed-vs-eager byte-identical `dict` +
 `dictIdxByPos` over a real multi-page v2 paged column (30k spans → DeltaUint64), the legacy
 single-blob non-streamable fallback, and the Dict-column non-streamable fallback.
+
+## NOTE-407: streaming Dict group-by scan (issue #356)
+
+NOTE-406 streamed only Flat/XOR/Delta; **Dict columns — every rate-by-group column in the
+bench set (`resource.service.name`, `span.http.request.method`, `span:kind`/`span:status`) —
+still fell through to the eager `GetIntrinsicColumn`**, whose `decodeDictPagesArena` allocates a
+contiguous `makeNoZeroBlockRef(totalRows)` arena plus a per-entry `[]BlockRef` for EVERY span
+row, decoded once for the scatter and discarded. On the warm M4 (`{} | rate() by service`) path
+this was the dominant remaining cost: the block I/O is cached, so M4's only work beyond M1
+(`{} | rate()`, no group-by) is this service-name BlockRefs arena decode — 24h warm M4 ≈ 4.1 s
+vs M1 ≈ 0.27 s over the same cached blocks.
+
+`scanGroupByColCompactDictStreaming` (reached when `streamGroupByColCompactFlat` reports the
+column is not Flat-streamable, BEFORE the eager `GetIntrinsicColumn` fallback) streams the Dict
+column page-by-page via `Reader.ScanDictGroupByColumn` → shared `ScanDictPagedColumnBlob`. The
+visitor dedups each distinct value into a group slot (string `valToIdx` / int64 key map for
+`span:kind`/`span:status`, reproducing the merged first-appearance entry order of
+`decodeDictPagesArena`) — a handful of interns, NOT O(rows) — and scatters that slot for every
+ref in the page-local run by reading each ref straight out of the raw bytes via
+`shared.DecodeRefAt`, so the `[]BlockRef` arena is NEVER materialized. Empty string values are
+skipped so their refs stay at sentinel 0 (the absent group), matching NOTE-401's
+`scanGroupByColCompactDictSerial`.
+
+Wired into all three N=1 compact cores (count/rate `streamCountRateN1CompactCore`, agg
+`streamAggN1CompactCore`, histogram `streamHistogramN1CompactCore`). `groupByCol` stays nil on
+the streamed path, so the post-scan `resolveDictGroupKeys` is a no-op (the streaming scan
+already fully populated `dict`); non-paged (legacy v1) Dict columns and any unexpected format
+still fall back to the eager native-index Dict path (NOTE-401).
+
+The streamed `dict` is built in first-appearance order (vs the eager native entry order), so the
+two paths assign dict SLOTS differently and `dict`/`numGroups` may differ in size (streamed dict
+holds only values actually seen) — but the per-row group ASSIGNMENT
+(`dict[dictIdxByPos[pos]]`) and therefore every emitted series is identical. `numGroups =
+len(dict)` and the `groupCountsFlat` sizing follow the streamed dict; unseen native entries
+(absent from the streamed dict) would have had zero counts anyway, so dropping them is correct.
+
+Covered by `intrinsic_stream_groupby_test.go`
+(`TestStreamGroupByDict_DifferentialVsEager_MultiPage` /`_LegacySinglePage`): the streamed
+per-position group VALUE equals the eager native-index Dict path's over a real multi-page
+service.name column, and the legacy single-blob falls back. Shared-layer differential +
+rejection + visitor-error tests in `intrinsic_stream_test.go`.

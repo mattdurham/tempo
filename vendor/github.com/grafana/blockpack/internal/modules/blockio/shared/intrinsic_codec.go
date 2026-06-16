@@ -3044,19 +3044,25 @@ func pageRefsStart(pageRaw []byte) int {
 	return 4 + valuesLen
 }
 
-// decodeRef reads a single BlockRef from raw at the given position using variable-width encoding.
-func decodeRef(raw []byte, pos, blockW, rowW int) BlockRef {
-	var blockIdx uint16
+// DecodeRefAt reads the (blockIdx, rowIdx) ref at byte offset pos in raw using the column's
+// blockW/rowW ref widths. It is the exported, struct-free counterpart of decodeRef used by the
+// streaming Dict group-by scatter (NOTE-407): the executor reads each ref straight out of a
+// page's raw ref run and packs it into a packKey without ever materializing a BlockRef.
+func DecodeRefAt(raw []byte, pos, blockW, rowW int) (blockIdx, rowIdx uint16) {
 	if blockW == 1 {
 		blockIdx = uint16(raw[pos])
 	} else {
 		blockIdx = binary.LittleEndian.Uint16(raw[pos:])
 	}
-	var rowIdx uint16
 	if rowW == 1 {
 		rowIdx = uint16(raw[pos+blockW])
 	} else {
 		rowIdx = binary.LittleEndian.Uint16(raw[pos+blockW:])
 	}
+	return blockIdx, rowIdx
+}
+
+func decodeRef(raw []byte, pos, blockW, rowW int) BlockRef {
+	blockIdx, rowIdx := DecodeRefAt(raw, pos, blockW, rowW)
 	return BlockRef{BlockIdx: blockIdx, RowIdx: rowIdx}
 }
