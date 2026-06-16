@@ -1143,6 +1143,8 @@ func scatterFlatGroupByRef(
 	dictIdxByPos[pos] = idx + 1
 }
 
+func
+
 // scanGroupByColCompactFlatStreaming is the streaming (decode-time push-down) variant of
 // scanGroupByColCompactFlatSerial (NOTE-406, issue #348). Instead of consuming a fully
 // materialized Flat/XOR/Delta column (col.Uint64Values/BytesValues/BlockRefs sized to the
@@ -1154,25 +1156,25 @@ func scatterFlatGroupByRef(
 //
 // Returns (false, nil) when the column is absent or not streamable (Dict/legacy) — the caller
 // then falls back to the eager scanGroupByColCompact path. Returns (true, err) when streamed.
-func scanGroupByColCompactFlatStreaming(
-	r *modules_reader.Reader,
-	colName string,
-	minPK, maxPK uint32,
-	pkBitset []uint64,
-	rankPrefix []uint32,
-	dict *[]string,
-	dictIdxByPos []uint32,
-) (bool, error) {
+scanGroupByColCompactFlatStreaming(r *modules_reader.Reader, colName string, minPK, maxPK uint32, pkBitset []uint64, rankPrefix []uint32, dict *[]string, dictIdxByPos []uint32) (bool, error) {
 	valToIdx := make(map[string]uint32, 32)
 	return r.ScanIntrinsicColumn(colName, func(p *modules_shared.DecodedPage) error {
 		if len(p.Uint64Values) > 0 {
 			for i, ref := range p.BlockRefs {
+				pk := packKey(ref.BlockIdx, ref.RowIdx)
+				if pk < minPK || pk > maxPK {
+					continue
+				}
 				val := strconv.FormatUint(p.Uint64Values[i], 10)
 				scatterFlatGroupByRef(ref, val, minPK, maxPK, pkBitset, rankPrefix, dict, dictIdxByPos, valToIdx)
 			}
 			return nil
 		}
 		for i, ref := range p.BlockRefs {
+			pk := packKey(ref.BlockIdx, ref.RowIdx)
+			if pk < minPK || pk > maxPK {
+				continue
+			}
 			val := string(p.BytesValues[i])
 			scatterFlatGroupByRef(ref, val, minPK, maxPK, pkBitset, rankPrefix, dict, dictIdxByPos, valToIdx)
 		}

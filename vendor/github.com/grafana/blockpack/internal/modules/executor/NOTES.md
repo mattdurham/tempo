@@ -6344,3 +6344,22 @@ SA6002-clean without a nolint. `releaseCompactUint8` honours the NOTE-355 oversi
 (`cap > compactPoolMaxPooledBytes`) so a pathological wide block does not pin a giant array in the
 pool. Output is byte-identical (same memo states, same emit order); the only change is the backing
 array is reused across block-evals instead of freshly heap-allocated and GC'd each call.
+
+## NOTE-415: skip per-ref group-value materialization for out-of-time-range refs (flat streaming group-by)
+
+`scanGroupByColCompactFlatStreaming` (the streaming Flat/XOR/Delta group-by rate path, NOTE-406/407)
+decoded each page and, for EVERY ref in the page, materialized the group value as a fresh string
+(`strconv.FormatUint(p.Uint64Values[i], 10)` for the uint64 case, `string(p.BytesValues[i])` for the
+bytes case) BEFORE calling `scatterFlatGroupByRef`. But `scatterFlatGroupByRef` immediately discards
+any ref whose packed key is outside `[minPK, maxPK]` (the query time-range window) — so for every
+out-of-range ref the freshly-allocated value string was computed and then thrown away unused. On a
+time-narrowed query (the common case: a wide block, a narrow step window) the majority of a block's
+refs are out of range, so this is a per-ref wasted allocation dominated by the filtered-out spans.
+
+The fix hoists the cheap `packKey` + `pk < minPK || pk > maxPK` range check into the caller's per-ref
+loop, BEFORE the string materialization, and `continue`s on out-of-range refs. `scatterFlatGroupByRef`
+still performs the identical range check internally (idempotent), so for in-range refs the behaviour —
+and the emitted dict + dictIdxByPos — is byte-identical. Only the wasted `strconv.FormatUint` /
+`string(bytes)` allocation for out-of-time-range refs is eliminated, cutting per-block allocation
+volume (and the GC pointer-scan cost the production CPU profile is dominated by) on the streaming
+flat group-by rate path. The materialization for in-range refs is unchanged.
