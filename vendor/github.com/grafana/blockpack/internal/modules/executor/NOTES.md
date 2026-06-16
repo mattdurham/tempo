@@ -6550,3 +6550,27 @@ lowering applies but the guarded-write shape is already inline.
 **Back-ref:** `internal/modules/executor/intrinsic_row_block.go:scatterSpanIDDense`,
           `scatterParentIDDense`, `scatterTraceIDDense`, `scatterSpanID`, `scatterParentID`,
           `scatterTraceID`
+
+## NOTE-427: scatter fixed-width identity IDs via array conversion in the ref-driven path too (2026-06-16)
+
+**Context:** NOTE-426 replaced `copy()` with a slice→array conversion in the *dense* scatter
+twins (`scatterSpanIDDense` etc.) but explicitly LEFT `copy8` and the two `copy(row.traceID[:], …)`
+sites in `intrinsic_row.go` on the `copy` builtin, asserting "the same single-MOV lowering applies
+but the guarded-write shape is already inline." The post-NOTE-426 querier CPU profile (2026-06-16,
+30m window) disproved that: `copy8` was still ~2.0s self-time (~0.6% of querier CPU), the residual
+of the structural ref-driven path (`storeTypedField`) and the legacy no-intrinsic-section identity
+build (`identityFieldsFromBlockColsTyped`). The `copy` builtin does NOT fold to a single MOV here:
+it still computes `min(len(dst), len(b))` and dispatches a memmove-style sequence even with the
+`len(b) == N` guard, because the guard's proven length is not propagated into the builtin.
+
+**Decision:** Use the same Go 1.20+ slice→array conversion NOTE-426 used for the dense twins:
+`*dst = [spanIDByteLen]byte(b)` in `copy8`, and `row.traceID = [traceIDByteLen]byte(b)` at both
+trace-ID sites. Each compiles to a single fixed-width load+store with exactly one bounds check
+(the conversion's own `len(b) >= N`, which the preceding `len(b) == N` guard already proves).
+
+**Correctness:** The `len(b) == N` guard is preserved on every path, so non-spec-width values are
+rejected exactly as before. `[N]byte(b)` panics only if `len(b) < N`, which the guard makes
+unreachable. Byte-identical semantics.
+
+**Back-ref:** `internal/modules/executor/intrinsic_row.go:copy8`, `storeTypedField` (trace:id),
+          `identityFieldsFromBlockColsTyped` (trace:id)

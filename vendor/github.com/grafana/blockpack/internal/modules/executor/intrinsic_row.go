@@ -33,11 +33,20 @@ const spanIDByteLen = 8
 const traceIDByteLen = 16
 
 // copy8 copies b into dst if len(b) == spanIDByteLen. Returns true if copied.
+//
+// NOTE-427: write via a direct slice→array conversion (*dst = [spanIDByteLen]byte(b))
+// rather than copy(dst[:], b). The copy builtin computes min(len(dst), len(b)) and lowers
+// to a runtime memmove-style sequence even though the len(b) != spanIDByteLen guard above
+// fixes the length; the array conversion is a single 8-byte load+store with one bounds
+// check (its own len(b) >= spanIDByteLen, already proven by the guard). copy8 was still
+// ~0.6% of querier self-time on the structural/legacy identity path (profile 2026-06-16,
+// after NOTE-426 fixed only the dense scatter twins). Semantics are byte-identical: the
+// len(b) != spanIDByteLen guard rejects non-spec widths exactly as before.
 func copy8(dst *[8]byte, b []byte) bool {
 	if len(b) != spanIDByteLen {
 		return false
 	}
-	copy(dst[:], b)
+	*dst = [spanIDByteLen]byte(b)
 	return true
 }
 
@@ -152,7 +161,9 @@ func storeTypedField(colName string, val any, row *intrinsicRowFields) {
 	switch colName {
 	case colNameTraceID:
 		if b, ok := val.([]byte); ok && len(b) == traceIDByteLen {
-			copy(row.traceID[:], b)
+			// NOTE-427: array conversion, not copy() — see copy8. The len == traceIDByteLen
+			// guard proves the conversion's own bound, so this is a single 16-byte load+store.
+			row.traceID = [traceIDByteLen]byte(b)
 			row.present |= intrinsicPresentTraceID
 		}
 	case colNameSpanID:
@@ -224,7 +235,8 @@ func identityFieldsFromBlockColsTyped(block *modules_reader.Block, n int) []intr
 		row := &result[rowIdx]
 		if traceCol != nil {
 			if v, ok := traceCol.BytesValue(rowIdx); ok && len(v) == traceIDByteLen {
-				copy(row.traceID[:], v)
+				// NOTE-427: array conversion, not copy() — see copy8.
+				row.traceID = [traceIDByteLen]byte(v)
 				row.present |= intrinsicPresentTraceID
 			}
 		}
