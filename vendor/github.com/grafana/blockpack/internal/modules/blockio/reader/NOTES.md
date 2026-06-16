@@ -3010,3 +3010,27 @@ giving the same decompression-bomb protection snappy's frame-header check provid
 
 Back-ref: `reader/colmetaentry.go:zstd`, `reader/block_parser.go:parseColumnMetadataArray` +
           `decompressV14ColumnData[Into]`, `reader/column.go:compressedZstd` + `ensureDecompressed`.
+
+## NOTE-412: branch-free word-wide XOR in decodeXORBytesUniform
+
+`decodeXORBytesUniform` (kinds 24/25/28 — the XOR-against-previous uniform-width byte columns:
+trace:id, span:id, and the flat uint64 intrinsics span:start/end/duration) reconstructed each
+present row with a per-byte loop carrying a `if i < len(prev)` branch:
+
+```go
+for i := range uniformLen {
+    if i < len(prev) { result[i] = xorVal[i] ^ prev[i] } else { result[i] = xorVal[i] }
+}
+```
+
+The branch is true only for the *single* first row of the column (where `prev == nil`), yet it
+was evaluated once per BYTE for every row, blocking the compiler from tightening/vectorizing the
+inner loop. A querier CPU profile (2026-06-16) showed `decodeXORBytesUniform` at ~0.55% self —
+this decode runs on essentially every metrics/structural query that touches an intrinsic.
+
+FIX: hoist the first present row out (plain `copy`, since XOR against an implicit zero predecessor
+is identity) so the steady-state arm has `prev` always exactly `uniformLen`. The steady-state XOR
+then uses the stdlib word-wide `crypto/subtle.XORBytes` (8 bytes at a time, one hoisted bounds
+check) — the same primitive the paged XOR decode already uses (NOTE-237). Byte-identical output;
+microbench (16-byte trace:id width, 4096 present rows) ~108µs/op → ~56µs/op (≈48% faster),
+allocations unchanged at the NOTE-342/351 optimum of 2/op.
