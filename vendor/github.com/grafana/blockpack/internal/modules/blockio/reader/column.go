@@ -433,8 +433,14 @@ func (c *Column) decodeNow() {
 	// were not in the eager wantColumns set). On a hit we copy the immutable decoded slices in
 	// and skip decompression entirely. The per-query Column keeps its own fresh denseOnce /
 	// sparseDictIdx so NOTE-PERF-1 dense expansion runs per query and never mutates the snapshot.
-	if c.v8CacheKey != "" {
-		if cached := parsedV8ColumnCache.Get(c.v8CacheKey); cached != nil {
+	// NOTE-417: build the cache key here (deferred from lazy registration) so never-accessed
+	// lazy columns never pay the string concatenation. Empty lazyFileID ⇒ no stable key.
+	v8Key := ""
+	if c.lazyFileID != "" {
+		v8Key = v8ColumnCacheKey(c.lazyFileID, c.lazyBlockOffset, c.Name, c.Type)
+	}
+	if v8Key != "" {
+		if cached := parsedV8ColumnCache.Get(v8Key); cached != nil {
 			c.decodeOnce.Do(func() {
 				if c.Present == nil {
 					c.Present = cached.Present
@@ -516,11 +522,11 @@ func (c *Column) decodeNow() {
 		// queries that lazily access the identical on-disk block column skip the decode.
 		// dec was allocated fresh by readColumnEncoding; the snapshot shares those read-only
 		// slices (dense expansion builds a new Idx on the per-query col, never mutating these).
-		if c.v8CacheKey != "" {
+		if v8Key != "" {
 			snap := snapshotDecodedColumn(dec, c.Name, c.Type)
 			snap.Present = c.Present
 			snap.SpanCount = c.SpanCount
-			_ = parsedV8ColumnCache.Put(c.v8CacheKey, snap)
+			_ = parsedV8ColumnCache.Put(v8Key, snap)
 		}
 
 		// NOTE-209: readColumnEncoding has copied every decoded slice out of rawEncoding,
@@ -2224,12 +2230,18 @@ func decodeVectorF32(data []byte, spanCount int, ctx *decodeCtx) (*Column, error
 type Column struct {
 	internMap map[string]string
 	Name      string
-	// NOTE-201: process-cache key for the lazy (deferred) decode path. Populated by the
-	// lazy-registration loop in parseBlockColumnsReuse when a stable fileID is available.
-	// decodeNow consults parsedV8ColumnCache on this key before doing snappy+readColumnEncoding
-	// and stores a snapshot on miss, extending NOTE-200's eager-loop reuse to first-access decode.
-	// Empty when no stable key is available (no fileID) — decode proceeds without cache.
-	v8CacheKey  string
+	// NOTE-201/NOTE-417: components of the process-cache key for the lazy (deferred) decode
+	// path, set by the lazy-registration loop in parseBlockColumnsReuse when a stable fileID is
+	// available. decodeNow builds the parsedV8ColumnCache key from (lazyFileID, lazyBlockOffset,
+	// Name, Type) ONLY when the column is actually decoded — it consults parsedV8ColumnCache on
+	// that key before snappy+readColumnEncoding and stores a snapshot on miss, extending
+	// NOTE-200's eager-loop reuse to first-access decode. lazyFileID == "" ⇒ no stable key (no
+	// fileID) — decode proceeds without cache. NOTE-417: storing the (fileID, offset) components
+	// instead of the pre-built string defers the 5-part concatenation + strconv allocs to first
+	// access. A narrow WantOnly query registers hundreds of never-accessed lazy columns per
+	// block; eagerly building each one's key was pure per-block CPU/allocation for keys that were
+	// never used (the column's decodeNow never ran). The components are cheap value copies.
+	lazyFileID  string
 	StringDict  []string
 	StringIdx   []uint32
 	Int64Dict   []int64
@@ -2276,8 +2288,11 @@ type Column struct {
 	// retained footprint is the on-disk width, not 4 bytes/row. Width-4 columns keep the
 	// []uint32 path (no blowup to remove). Only the all-present dense dict path uses this;
 	// sparse / denseFlatIdx (NOTE-358) are unchanged.
-	packedIdx       []byte
-	SpanCount       int
+	packedIdx []byte
+	SpanCount int
+	// NOTE-417: block byte offset within the file, paired with lazyFileID to build the
+	// parsedV8ColumnCache key lazily in decodeNow (deferred from eager registration).
+	lazyBlockOffset uint64
 	decodeOnce      sync.Once
 	denseOnce       sync.Once
 	decompressOnce  sync.Once

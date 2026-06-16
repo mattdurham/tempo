@@ -625,13 +625,12 @@ func appendLazyColumn(
 		return store, false
 	}
 
-	// NOTE-201: precompute the process-cache key for the deferred-decode path so decodeNow can
-	// consult/populate parsedV8ColumnCache on first access. Empty when no stable fileID is
-	// available — decodeNow then decodes without caching.
-	lazyKey := ""
-	if fileID != "" {
-		lazyKey = v8ColumnCacheKey(fileID, blockOffset, m.name, m.colType)
-	}
+	// NOTE-417: store the process-cache key COMPONENTS (fileID + block offset) instead of the
+	// pre-built string. decodeNow builds the key on first access via v8ColumnCacheKey, so a
+	// never-accessed lazy column never pays the 5-part string concatenation + strconv. A narrow
+	// WantOnly query registers hundreds of such columns per block; the eager key build was pure
+	// per-block CPU/allocation for keys that were almost always discarded unused. lazyFileID == ""
+	// (no stable fileID) ⇒ decodeNow decodes without caching, identical to the prior behavior.
 	return append(store, Column{
 		Name:               m.name,
 		Type:               m.colType,
@@ -640,7 +639,8 @@ func appendLazyColumn(
 		compressedZstd:     m.zstd,              // NOTE-405: codec for the deferred decompress
 		uncompressedLen:    m.uncompressedLen,
 		internMap:          nil, // nil → internString skips map; safe for concurrent lazy decode
-		v8CacheKey:         lazyKey,
+		lazyFileID:         fileID,
+		lazyBlockOffset:    blockOffset,
 	}), true
 }
 
@@ -885,7 +885,8 @@ func resetColumn(col *Column) {
 	col.packedIdx = nil      // NOTE-369: clear packed native-width dict index on reuse
 	col.packedIdxWidth = 0   // NOTE-369
 	col.denseFlatIdx = false // NOTE-358/369: clear identity-index flag on reuse
-	col.v8CacheKey = ""      // NOTE-201: clear stale lazy-decode cache key on reuse
+	col.lazyFileID = ""      // NOTE-417: clear stale lazy-decode cache-key components on reuse
+	col.lazyBlockOffset = 0  // NOTE-417
 	col.decodeOnce = sync.Once{}
 	col.denseOnce = sync.Once{}
 	col.decompressOnce = sync.Once{}

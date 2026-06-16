@@ -3034,3 +3034,30 @@ then uses the stdlib word-wide `crypto/subtle.XORBytes` (8 bytes at a time, one 
 check) — the same primitive the paged XOR decode already uses (NOTE-237). Byte-identical output;
 microbench (16-byte trace:id width, 4096 present rows) ~108µs/op → ~56µs/op (≈48% faster),
 allocations unchanged at the NOTE-342/351 optimum of 2/op.
+
+## NOTE-417 — Defer lazy-column parsedV8ColumnCache key construction to first decode
+
+`appendLazyColumn` (the WantOnly lazy-registration loop in `parseBlockColumnsReuse`) eagerly
+built each non-wanted column's process-cache key via `v8ColumnCacheKey(fileID, blockOffset,
+name, type)` and stored it in `Column.v8CacheKey`. That key is a 5-part string concatenation
+(`fileID + "/v8col/" + strconv(offset) + "/" + name + "/" + strconv(type)`) — one heap-allocating
+string build per registered column.
+
+On a narrow `WantOnly(smallSet)` query (the dominant search/structural shape: only a handful of
+predicate/output columns wanted) the parser registers EVERY other column lazily — hundreds for a
+wide trace block — and the vast majority of those lazy columns are never accessed, so their
+`decodeNow` never runs and the eagerly-built key is discarded unused. The key build was therefore
+pure per-block CPU + allocation that scaled with the block's total column count, paid on every
+parse regardless of cache warmth (a querier CPU profile, 2026-06-16, showed string-map hashing —
+`aeshashbody`/`mapaccess2_faststr` — and `parseBlockColumnsReuse` among the top app frames).
+
+FIX: store the key COMPONENTS (`lazyFileID string`, `lazyBlockOffset uint64`) on the lazy Column
+instead of the pre-built string — both are cheap value copies (`fileID` is the Reader's
+already-interned string; `blockOffset` is a uint64). `decodeNow` builds the key via
+`v8ColumnCacheKey` once, ONLY when the column is actually decoded (under `decodeOnce`), using it
+for both the pre-decompress cache `Get` and the post-decode snapshot `Put`. A never-accessed lazy
+column now pays zero key-build cost. The eager-decode loop is unchanged (it builds a local `v8Key`
+for the columns it actually decodes). `resetColumn` clears the two new components on Column reuse.
+Behavior is identical: when `lazyFileID == ""` (no stable fileID) the key is empty and decode
+proceeds without caching, exactly as before; when set, the same key string is produced — just
+lazily. Byte-for-byte identical cache keys and decoded output.
