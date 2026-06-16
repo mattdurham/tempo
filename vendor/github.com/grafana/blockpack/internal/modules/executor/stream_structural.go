@@ -314,12 +314,25 @@ func groupMatchingStructuralTraces(flat []structuralSpanRec) [][]structuralSpanR
 	// Pass 2: count survivors per matched trace by slot (every span of a kept trace survives).
 	// offsets is sized nSlots+1; counts accumulate into offsets[slot+1] so the prefix sum below
 	// turns it directly into per-window start offsets.
+	//
+	// NOTE-422: cache each record's resolved slot in recSlot during this pass so pass 3 can
+	// scatter without re-probing the [16]byte map. The map key is a 16-byte trace ID hashed
+	// via aeshashbody; the profile (2026-06-16) showed mapaccess2/aeshashbody dominating the
+	// structural-grouping self-time because the prior body probed slotOf for EVERY record in
+	// BOTH the count pass and the scatter pass (~2n probes total). Recording the slot once
+	// (recSlot[i] = slot, or -1 for a record whose trace did not match) drops the scatter pass
+	// to a flat int32 read, halving the per-record map probes (count pass keeps the one probe).
+	// recSlot costs 4 bytes/record — far cheaper than a 16-byte AES hash per record.
 	offsets := make([]int, nSlots+1)
+	recSlot := make([]int32, len(flat))
 	total := 0
 	for i := range flat {
 		if slot, ok := slotOf[flat[i].traceID]; ok {
 			offsets[slot+1]++
 			total++
+			recSlot[i] = int32(slot) //nolint:gosec // slot < nSlots ≤ record count, well within int32
+		} else {
+			recSlot[i] = -1
 		}
 	}
 	for s := 1; s <= nSlots; s++ {
@@ -329,13 +342,16 @@ func groupMatchingStructuralTraces(flat []structuralSpanRec) [][]structuralSpanR
 	// window start offset (offsets[slot]).
 	cursors := make([]int, nSlots)
 	copy(cursors, offsets[:nSlots])
-	// Pass 3: scatter survivors into trace-contiguous windows of a single backing array.
+	// Pass 3: scatter survivors into trace-contiguous windows of a single backing array,
+	// reading the cached slot (NOTE-422) instead of re-probing the [16]byte map.
 	backing := make([]structuralSpanRec, total)
 	for i := range flat {
-		if slot, ok := slotOf[flat[i].traceID]; ok {
-			backing[cursors[slot]] = flat[i]
-			cursors[slot]++
+		slot := recSlot[i]
+		if slot < 0 {
+			continue
 		}
+		backing[cursors[slot]] = flat[i]
+		cursors[slot]++
 	}
 	// Carve the backing array into per-trace windows using the offsets, clamping cap to length.
 	out := make([][]structuralSpanRec, nSlots)

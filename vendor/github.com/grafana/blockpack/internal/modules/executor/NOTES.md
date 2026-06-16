@@ -6383,3 +6383,22 @@ concurrent block-evals. The pools' NOTE-355 oversized-drop guard caps what is re
 giant-maxPK block does not pin a 256 MB buffer in the pool forever. Output is byte-identical; this only
 amortizes the large dense-array allocation across calls, cutting the per-block alloc volume that the
 production CPU profile attributes to GC pointer-scan (scanObject/findObject).
+
+## NOTE-422: cache per-record slot in groupMatchingStructuralTraces to halve [16]byte map probes
+
+`groupMatchingStructuralTraces` (NOTE-387) groups the flat cross-block `[]structuralSpanRec` into
+one contiguous window per matched trace via a counting-bucket scatter keyed on the 16-byte trace ID.
+The prior body probed the `map[[16]byte]int` slot map for EVERY record in BOTH the count pass and the
+scatter pass (~`2n` probes for `n` records, plus the `nMatched` first-sighting probes in the slot-assign
+pass). The production CPU profile (2026-06-16) showed `runtime.mapaccess2` (2.05s) and `aeshashbody`
+(1.80s) among the top overall self-time frames, and `groupMatchingStructuralTraces` itself at 0.62s —
+the 16-byte trace ID is hashed through aeshashbody on every probe, so re-probing the same key in two
+full passes was the dominant grouping cost.
+
+Fix: the count pass now records each record's resolved slot into a `recSlot []int32` (`slot`, or `-1`
+when the record's trace did not match). The scatter pass reads `recSlot[i]` directly instead of probing
+the map again — a flat int32 load replaces a 16-byte AES hash + bucket walk. This drops the per-record
+probe count from ~`2n` to ~`n` (the count pass keeps its single probe; the slot-assign pass is
+unchanged). `recSlot` costs 4 bytes/record, far cheaper than the hash it elides. Output is identical:
+the scatter visits exactly the same records (slot ≥ 0 ⇔ map-hit) and writes them to the same window
+offsets in the same order.
