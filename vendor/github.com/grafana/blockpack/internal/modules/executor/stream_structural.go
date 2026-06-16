@@ -160,19 +160,36 @@ func collectAllStructuralSpans(
 	//
 	// Negation-LHS programs (shouldRejectFileForProgram=false) use planBlocks(nil, tr, opts)
 	// so the time range is still applied but no predicate pruning is attempted for that node.
+	// NOTE-425: capture each program's OWN selected-block set (not just the union). A block
+	// absent from program i's set has no span matching node i (block-level range/intrinsic-TOC
+	// pruning is exact; bloom carries the already-accepted file-level FPR), so evaluating node
+	// i's predicate there is wasted column decode. progBlockSets[i] == nil means "evaluate on
+	// every block" — used for negation-LHS nodes whose time-range-only plan does not bound the
+	// node-match set, and for the all-blocks {} node.
 	unionSet := make(map[int]struct{})
+	progBlockSets := make([]map[int]struct{}, len(programs))
 	for i, prog := range programs {
 		var p *queryplanner.Plan
-		if !shouldRejectFileForProgram(ops, i) {
+		gated := shouldRejectFileForProgram(ops, i)
+		if !gated {
 			// Negation LHS — absent LHS means all RHS spans qualify; use time-range-only plan.
 			p = planBlocks(r, nil, tr, queryplanner.PlanOptions{})
 		} else {
 			p = planBlocks(r, prog, tr, queryplanner.PlanOptions{})
 		}
-		if len(p.SelectedBlocks) == 0 && shouldRejectFileForProgram(ops, i) {
+		if len(p.SelectedBlocks) == 0 && gated {
 			// planBlocks rejected the file entirely for this non-negation program —
 			// no structural match is possible (the node cannot match any span in this file).
 			return nil, nil, nil
+		}
+		// Only a gated (predicate-pruned) node has a block set that bounds where it can match.
+		// A negation-LHS node's time-range-only plan does not, so leave its set nil.
+		if gated {
+			set := make(map[int]struct{}, len(p.SelectedBlocks))
+			for _, bi := range p.SelectedBlocks {
+				set[bi] = struct{}{}
+			}
+			progBlockSets[i] = set
 		}
 		for _, bi := range p.SelectedBlocks {
 			unionSet[bi] = struct{}{}
@@ -216,7 +233,7 @@ func collectAllStructuralSpans(
 	// the nodesList on every block (collectBlockStructuralSpanRecs was a top alloc frame: the
 	// per-block wantColumns map rebuild alone was ~16MB/op in the structural bench). The shared
 	// plan is read-only across blocks.
-	bp := buildStructuralBlockPlan(r, programs)
+	bp := buildStructuralBlockPlan(r, programs, progBlockSets)
 
 	// NOTE-373: accumulate span records into a single FLAT slice across all blocks instead of
 	// appending into result[traceID] per row. The previous map-append (result[traceID] =
@@ -374,12 +391,20 @@ type structuralBlockPlan struct {
 	intrinsicWant map[string]struct{}
 	// nodesList[i] holds the intrinsic predicate RangeNodes for program i, used by the
 	// post-filter (computeNodeMatchForRow). Nil for legacy (no-intrinsic) files.
-	nodesList    [][]vm.RangeNode
-	hasIntrinsic bool
+	nodesList [][]vm.RangeNode
+	// progBlockSets[i] is program i's own selected-block set (NOTE-425). A non-nil set means
+	// node i can match a span only in those blocks, so its predicate is skipped on any other
+	// block (empty rowset). A nil entry means "evaluate on every block".
+	progBlockSets []map[int]struct{}
+	hasIntrinsic  bool
 }
 
 // buildStructuralBlockPlan computes the block-independent fetch/eval plan once per query.
-func buildStructuralBlockPlan(r *modules_reader.Reader, programs []*vm.Program) structuralBlockPlan {
+func buildStructuralBlockPlan(
+	r *modules_reader.Reader,
+	programs []*vm.Program,
+	progBlockSets []map[int]struct{},
+) structuralBlockPlan {
 	hasIntrinsic := r.HasIntrinsicSection()
 
 	// Union predicate columns from all programs. For intrinsic-section files, identity and
@@ -428,6 +453,7 @@ func buildStructuralBlockPlan(r *modules_reader.Reader, programs []*vm.Program) 
 		wantColumns:   wantColumns,
 		intrinsicWant: intrinsicWant,
 		nodesList:     nodesList,
+		progBlockSets: progBlockSets,
 	}
 }
 
@@ -469,7 +495,9 @@ func collectBlockStructuralSpanRecs(
 
 	// Evaluate each program against block columns.
 	// For files with an intrinsic section, strip intrinsic-column predicates first.
-	sets, err := evaluateStructuralPrograms(bp.programs, hasIntrinsic, provider, spanCount, blockIdx)
+	sets, err := evaluateStructuralPrograms(
+		bp.programs, hasIntrinsic, provider, spanCount, blockIdx, bp.progBlockSets,
+	)
 	if err != nil {
 		releaseBlockColumnProvider(provider)
 		return flat, err
@@ -552,14 +580,28 @@ func evalStructuralProgram(prog *vm.Program, provider vm.ColumnDataProvider, spa
 }
 
 // evaluateStructuralPrograms evaluates all N programs against the block column provider.
+//
+// NOTE-425: when progBlockSets[i] is non-nil and does not contain blockIdx, node i's predicate
+// cannot match any span in this block (block-level pruning excluded it). Skip the ColumnPredicate
+// call — which would decode and scan node i's user-attribute columns on this block — and return
+// the emptyRowSet sentinel. This is byte-identical to running the predicate (the pruned block has
+// no matching span, modulo the bloom FPR already accepted at file level) but avoids the wasted
+// per-block decode that dominates the structural CPU profile on union-of-block-sets shapes.
 func evaluateStructuralPrograms(
 	programs []*vm.Program,
 	hasIntrinsic bool,
 	provider vm.ColumnDataProvider,
 	spanCount, blockIdx int,
+	progBlockSets []map[int]struct{},
 ) ([]vm.RowSet, error) {
 	sets := make([]vm.RowSet, len(programs))
 	for i, prog := range programs {
+		if i < len(progBlockSets) && progBlockSets[i] != nil {
+			if _, ok := progBlockSets[i][blockIdx]; !ok {
+				sets[i] = emptyRowSet{}
+				continue
+			}
+		}
 		var uap *vm.Program
 		if hasIntrinsic {
 			uap = userAttrProgram(prog)

@@ -6489,3 +6489,36 @@ row-for-row across every block.
 
 Back-ref: `internal/modules/executor/intrinsic_row_block.go:populateTypedColumnForBlock`,
           `internal/modules/blockio/shared/intrinsiccolumn.go:DictMultiBlock`
+
+## NOTE-425: skip a structural node's predicate on blocks its own plan excluded (2026-06-16)
+
+**Context:** `collectAllStructuralSpans` plans each structural node independently via
+`planBlocks(prog_i)` and **unions** the selected block sets — a block matching ANY node is
+fetched and decoded (NOTE-091). But `evaluateStructuralPrograms` then ran EVERY node's
+`ColumnPredicate` against EVERY block in the union. For `{kind=server} >> {kind=client &&
+span.rpc.method != ""}` (Q9), node 1's user-attr predicate (`span.rpc.method`) was decoded and
+scanned even on blocks that only node 0's plan selected — where node 1's range/intrinsic-TOC
+pruning had already proven no span can match. The structural CPU profile is dominated by exactly
+this per-block column decode (radixSortRefIndexPrepared, buildRefIndex*, scatter*), and the union
+of block sets across both nodes multiplies it.
+
+**Decision:** Capture each node's OWN selected-block set (`progBlockSets[i]`) during planning,
+carry it on the read-only per-query `structuralBlockPlan`, and in `evaluateStructuralPrograms`
+return the `emptyRowSet` sentinel — skipping the `ColumnPredicate` call and its user-attribute
+column decode/scan — for any node whose set does not contain the current block. The union of
+fetched blocks is UNCHANGED (a block selected only by node 0 is still decoded for its identity
+columns so cross-block parent linkage in NOTE-091 still works); only the wasted per-node predicate
+evaluation on non-selected blocks is removed.
+
+**Correctness:** A node's `planBlocks` `SelectedBlocks` is a superset of the blocks where that
+node can match — block-level range and intrinsic-TOC pruning are exact, and bloom pruning carries
+the same file-level FPR semantics the codebase already accepts (NOTE-091 "file-level rejection
+safety"). So a block absent from node i's set has no span matching node i; its rowset is
+necessarily empty and `emptyRowSet{}` is byte-identical to evaluating the predicate. The
+optimization is gated to predicate-pruned ("gated") nodes only: a negation-LHS node uses a
+time-range-only plan that does NOT bound its node-match set, so its `progBlockSets` entry is left
+nil ("evaluate everywhere"), as is the all-blocks `{}` node — preserving negation semantics.
+
+**Back-ref:** `internal/modules/executor/stream_structural.go:collectAllStructuralSpans`,
+          `evaluateStructuralPrograms`,
+          `internal/modules/executor/allmatchset.go:emptyRowSet`
