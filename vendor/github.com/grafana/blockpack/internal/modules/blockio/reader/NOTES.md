@@ -2950,3 +2950,43 @@ under warm load rather than inferred from RSS.
 
 Back-ref: `parser.go:SetIntrinsicCacheBytes`; objectcache NOTES.md NOTE-371.
 Tests: `parser_test.go:TestSetIntrinsicCacheBytes_BudgetSplit` / `_ZeroPassthrough`.
+
+## NOTE-404: Process-level per-chunk decoded-unit cache for the chunked trace index (issue #350)
+
+**Problem:** the chunked trace index (NOTE-292, issue #341) memoizes decompressed chunk
+mini-bodies only in `chunkedTraceIndex.chunkCache`, an in-struct map guarded by `chunkMu`.
+But `chunkedTraceIndex` is held in `r.chunkedTrace`, and a `Reader` is constructed FRESH per
+query (per block, per querier call — query-frontend shards one block per querier). So that
+memoization is purely intra-query: a warm file re-fetched + re-snappy-decoded the SAME chunk
+on every repeat trace-by-id lookup served by a new Reader. The existing process caches
+(`parsedIntrinsicCache`, `parsedV8ColumnCache`) are keyed by whole column / whole block, so
+the chunk reads bypassed every shared cache tier.
+
+**Fix:** introduce a process-level per-chunk decoded-unit cache `parsedTraceChunkCache`
+(`objectcache.Cache[traceChunk]`) keyed by `fileID + "/tracechunk/" + sectionOffset + "/" +
+chunkIdx`. `chunkBytes` is now two-tier: L1 = the per-Reader `chunkCache` (intra-query,
+serves concurrent / repeat lookups within one query), L2 = `parsedTraceChunkCache`
+(cross-query, serves warm-file repeat lookups by fresh Readers). On a miss the chunk is read
++ decoded once, populated into L2 then L1, and reused thereafter. The L2 tier is engaged only
+when the Reader has a non-empty fileID (the key requires one); fileID-less Readers fall back
+to read+decode + L1, unchanged.
+
+**Cache-safety:** `readRangeDecodeSnappy` returns a freshly allocated caller-owned buffer (the
+`snappy.Decode` dst that escapes), never a pooled/shared one, so retaining it in a process
+cache satisfies the lazy-closure cache-safety invariant. The mini-body is immutable once
+decoded; `scanMiniBody` only reads it.
+
+**Budget:** `traceChunk` implements `Sizer` (body length + slice-header overhead) so retained
+chunks are byte-accounted in the LRU; `SetIntrinsicCacheBytes` grants it `n/16` (one decoded
+chunk per repeat lookup is small vs decoded columns), mirroring `parsedTraceSparseCache`.
+Cleared by `ClearCaches`.
+
+**Shared enabler (issue #350):** this is the "cache a decoded sub-unit, not the whole thing"
+primitive the issue calls for — built first for the chunked trace index (the #341 chunk-cache
+follow-up). The same `objectcache`-keyed-by-(fileID, section, unitIdx) pattern is reusable for
+the page-pruned (#347) / streamed (#348) intrinsic decodes.
+
+Back-ref: `chunked_trace_index.go:chunkBytes / traceChunkProcKey / recordChunkL1`;
+`parser.go:parsedTraceChunkCache / traceChunk.SizeBytes`.
+Tests: `chunked_trace_index_test.go:TestChunkedTraceIndex_ProcessChunkCacheCrossReader`
+(cold→warm I/O drop, entry equivalence, fileID key isolation).

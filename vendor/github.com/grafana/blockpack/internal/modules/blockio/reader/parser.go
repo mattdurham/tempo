@@ -42,6 +42,33 @@ var parsedIntrinsicCache objectcache.Cache[shared.IntrinsicColumn]
 // SPEC-OC-003, NOTE-200 (reader NOTES.md)
 var parsedV8ColumnCache objectcache.Cache[Column]
 
+// parsedTraceChunkCache caches the decompressed mini-body of a single chunked-trace-index
+// chunk (issue #350: the per-chunk decoded-unit cache that completes the #341 chunk-caching
+// follow-up). Keyed by fileID + "/tracechunk/" + sectionOffset + "/" + chunkIdx.
+//
+// NOTE-404: the chunkedTraceIndex (r.chunkedTrace) is per-Reader and a Reader is constructed
+// fresh per query (per block, per querier call), so its in-struct chunkCache (NOTE-292) only
+// memoizes within ONE query. A warm file therefore re-fetched + re-snappy-decoded the same
+// chunk on every repeat trace-by-id lookup. This process-level cache holds the decoded
+// mini-body across queries keyed by (fileID, section offset, chunkIdx) so a warm-file repeat
+// lookup that resolves to the same chunk becomes a cache hit instead of a provider round-trip
+// + decode. Cache-safe: readRangeDecodeSnappy returns a freshly allocated caller-owned buffer
+// (the snappy.Decode dst that escapes), never a pooled/shared one. Strong references: entries
+// persist until Clear is called.
+// SPEC-OC-003, NOTE-404 (reader NOTES.md)
+var parsedTraceChunkCache objectcache.Cache[traceChunk]
+
+// traceChunk wraps a decoded chunked-trace-index mini-body so it can be byte-budgeted by the
+// objectcache LRU. The body is immutable once decoded.
+type traceChunk struct {
+	body []byte
+}
+
+// SizeBytes reports the chunk's retained footprint for objectcache LRU budgeting.
+func (c *traceChunk) SizeBytes() int64 {
+	return int64(len(c.body)) + 16 // body + slice header overhead
+}
+
 // blockColTypesCache caches the per-block parsed ToC (column-metadata array + tocEnd) by
 // fileID+"/v8coltypes/"+blockOffset. NOTE-214: the combined ToC+columns GetMulti
 // (NOTE-185) requests the compressed blob of EVERY wanted column, but on the warm path
@@ -183,6 +210,7 @@ func SetIntrinsicCacheBytes(n int64) {
 	parsedV8ColumnCache.SetMaxBytes(n)         // NOTE-200: proven warm-path win, full budget
 	blockColTypesCache.SetMaxBytes(n / 16)     // NOTE-214: name->type maps are tiny vs decoded columns
 	parsedTraceSparseCache.SetMaxBytes(n / 16) // NOTE-265: sparse trace-index samples are tiny
+	parsedTraceChunkCache.SetMaxBytes(n / 16)  // NOTE-404: one decoded chunk per repeat lookup, small share
 }
 
 // ClearCaches resets all process-level caches. Intended for testing.
@@ -194,6 +222,7 @@ func ClearCaches() {
 	parsedV8ColumnCache.Clear()
 	blockColTypesCache.Clear()
 	parsedTraceSparseCache.Clear()
+	parsedTraceChunkCache.Clear()
 }
 
 // rangeIndexMeta records the byte range within metadataBytes for a

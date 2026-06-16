@@ -10,6 +10,8 @@ package reader
 import (
 	"encoding/binary"
 	"fmt"
+	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
@@ -40,9 +42,11 @@ type chunkedTraceIndex struct {
 
 	bloomOnce sync.Once
 
-	// chunkCache memoizes decompressed chunk mini-bodies by directory index so repeated
-	// lookups that resolve to the same chunk (and concurrent GetTraceByID callers) avoid
-	// re-reading and re-decompressing it. Guarded by chunkMu.
+	// chunkCache is the per-Reader (intra-query, L1) memoization of decompressed chunk
+	// mini-bodies by directory index so repeated lookups that resolve to the same chunk
+	// (and concurrent GetTraceByID callers) within ONE query avoid re-reading and
+	// re-decompressing it. Guarded by chunkMu. NOTE-404: cross-query reuse is served by the
+	// process-level parsedTraceChunkCache (L2), since a Reader is fresh per query.
 	chunkMu    sync.Mutex
 	traceCount uint32
 	blockCount uint32
@@ -140,15 +144,35 @@ func (r *Reader) chunkedLookup(ci *chunkedTraceIndex, traceID [16]byte) ([]uint1
 	return scanMiniBody(mini, traceID), nil
 }
 
-// chunkBytes returns the decompressed mini-body for the directory entry at chunkIdx, reading
-// and decompressing it on first use and memoizing the result for subsequent lookups.
+// chunkBytes returns the decompressed mini-body for the directory entry at chunkIdx.
+//
+// Two-tier cache (NOTE-404):
+//   - L1 (intra-query): the per-Reader ci.chunkCache (NOTE-292) memoizes within ONE query so
+//     concurrent / repeat lookups resolving to the same chunk in this Reader avoid re-decode.
+//   - L2 (cross-query): the process-level parsedTraceChunkCache holds the decoded mini-body
+//     keyed by (fileID, section offset, chunkIdx) so a warm-file REPEAT lookup served by a
+//     fresh Reader becomes a cache hit instead of a provider round-trip + snappy decode.
+//
+// The L2 cache is consulted only when the Reader has a fileID (the process cache key requires
+// one); fileID-less Readers (e.g. some tests) fall back to read+decode and the per-Reader L1.
 func (r *Reader) chunkBytes(ci *chunkedTraceIndex, chunkIdx int) ([]byte, error) {
+	// L1: intra-query per-Reader memoization.
 	ci.chunkMu.Lock()
 	if cached, ok := ci.chunkCache[chunkIdx]; ok {
 		ci.chunkMu.Unlock()
 		return cached, nil
 	}
 	ci.chunkMu.Unlock()
+
+	// L2: cross-query process-level cache.
+	var procKey string
+	if r.fileID != "" {
+		procKey = r.traceChunkProcKey(ci, chunkIdx)
+		if tc := parsedTraceChunkCache.Get(procKey); tc != nil {
+			r.recordChunkL1(ci, chunkIdx, tc.body)
+			return tc.body, nil
+		}
+	}
 
 	ent := ci.dir[chunkIdx]
 	// NOTE-366: read into pooled scratch, decode, recycle the compressed buffer.
@@ -162,13 +186,37 @@ func (r *Reader) chunkBytes(ci *chunkedTraceIndex, chunkIdx int) ([]byte, error)
 		return nil, fmt.Errorf("chunked trace index: chunk read/snappy decode: %w", decErr)
 	}
 
+	// Populate L2 first (cache-safe: mini is the freshly allocated snappy.Decode dst, never
+	// pooled/shared), then L1. A Put failure (over budget) is non-fatal — L1 still serves
+	// this query.
+	if procKey != "" {
+		_ = parsedTraceChunkCache.Put(procKey, &traceChunk{body: mini})
+	}
+	r.recordChunkL1(ci, chunkIdx, mini)
+	return mini, nil
+}
+
+// recordChunkL1 stores mini in the per-Reader L1 chunk cache under chunkIdx.
+func (r *Reader) recordChunkL1(ci *chunkedTraceIndex, chunkIdx int, mini []byte) {
 	ci.chunkMu.Lock()
 	if ci.chunkCache == nil {
 		ci.chunkCache = make(map[int][]byte, 1)
 	}
 	ci.chunkCache[chunkIdx] = mini
 	ci.chunkMu.Unlock()
-	return mini, nil
+}
+
+// traceChunkProcKey builds the process-cache key for a chunk. The section offset disambiguates
+// multiple chunked-trace sections in one file; chunkIdx selects the directory entry.
+func (r *Reader) traceChunkProcKey(ci *chunkedTraceIndex, chunkIdx int) string {
+	var b strings.Builder
+	b.Grow(len(r.fileID) + 32)
+	b.WriteString(r.fileID)
+	b.WriteString("/tracechunk/")
+	b.WriteString(strconv.FormatUint(ci.secOffset, 10))
+	b.WriteByte('/')
+	b.WriteString(strconv.Itoa(chunkIdx))
+	return b.String()
 }
 
 // scanMiniBody walks a decompressed v2 mini-body (fmt_version[1] + entry_count[4] + sorted
