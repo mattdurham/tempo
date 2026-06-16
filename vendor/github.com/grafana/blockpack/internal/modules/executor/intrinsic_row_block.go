@@ -442,9 +442,12 @@ func scatterTraceIDDense(minRow uint32, count int, bytesVals [][]byte, result []
 	src := bytesVals[:n:n]
 	res = res[:n:n] // tie len(res) == len(src) == n so the loop body needs no bounds check
 	for i := range src {
+		// NOTE-426: trace IDs are fixed OTel-spec 16-byte values — direct [16]byte array
+		// conversion (single load+store, one bounds check) over the copy() builtin's
+		// min(16, len(b)) memmove-style lowering. Matches the span/parent ID scatter below.
 		b := src[i]
 		if len(b) == traceIDByteLen {
-			copy(res[i].traceID[:], b)
+			res[i].traceID = [traceIDByteLen]byte(b)
 			res[i].present |= intrinsicPresentTraceID
 		}
 	}
@@ -455,7 +458,16 @@ func scatterSpanIDDense(minRow uint32, count int, bytesVals [][]byte, result []i
 	src := bytesVals[:n:n]
 	res = res[:n:n]
 	for i := range src {
-		if copy8(&res[i].spanID, src[i]) {
+		// NOTE-426: span IDs are fixed OTel-spec 8-byte values. When len==8 use a direct
+		// [8]byte array conversion (single 8-byte load+store, one bounds check) instead of
+		// copy8's `copy(dst[:], b)` builtin, which computes min(8, len(b)) and lowers to a
+		// runtime memmove-style sequence. This is the dominant identity scatter on the
+		// structural hot path (flat-dense single-block span:id), where copy8 was the #1
+		// blockpack self-time frame. The len guard preserves OTel-spec safety (non-8-byte
+		// values are skipped, as in copy8).
+		b := src[i]
+		if len(b) == spanIDByteLen {
+			res[i].spanID = [spanIDByteLen]byte(b)
 			res[i].present |= intrinsicPresentSpanID
 		}
 	}
@@ -466,7 +478,10 @@ func scatterParentIDDense(minRow uint32, count int, bytesVals [][]byte, result [
 	src := bytesVals[:n:n]
 	res = res[:n:n]
 	for i := range src {
-		if copy8(&res[i].parentID, src[i]) {
+		// NOTE-426: see scatterSpanIDDense — direct [8]byte conversion over copy8.
+		b := src[i]
+		if len(b) == spanIDByteLen {
+			res[i].parentID = [spanIDByteLen]byte(b)
 			res[i].present |= intrinsicPresentParentID
 		}
 	}
@@ -519,9 +534,9 @@ func scatterTraceID(
 		if pos >= len(bytesVals) {
 			continue
 		}
-		b := bytesVals[pos]
-		if len(b) == traceIDByteLen {
-			copy(result[rowIdx].traceID[:], b)
+		// NOTE-426: direct [16]byte conversion over the copy() builtin.
+		if b := bytesVals[pos]; len(b) == traceIDByteLen {
+			result[rowIdx].traceID = [traceIDByteLen]byte(b)
 			result[rowIdx].present |= intrinsicPresentTraceID
 		}
 	}
@@ -545,7 +560,9 @@ func scatterSpanID(
 		if pos >= len(bytesVals) {
 			continue
 		}
-		if copy8(&result[rowIdx].spanID, bytesVals[pos]) {
+		// NOTE-426: direct [8]byte conversion over copy8 (single load+store).
+		if b := bytesVals[pos]; len(b) == spanIDByteLen {
+			result[rowIdx].spanID = [spanIDByteLen]byte(b)
 			result[rowIdx].present |= intrinsicPresentSpanID
 		}
 	}
@@ -569,7 +586,9 @@ func scatterParentID(
 		if pos >= len(bytesVals) {
 			continue
 		}
-		if copy8(&result[rowIdx].parentID, bytesVals[pos]) {
+		// NOTE-426: direct [8]byte conversion over copy8 (single load+store).
+		if b := bytesVals[pos]; len(b) == spanIDByteLen {
+			result[rowIdx].parentID = [spanIDByteLen]byte(b)
 			result[rowIdx].present |= intrinsicPresentParentID
 		}
 	}

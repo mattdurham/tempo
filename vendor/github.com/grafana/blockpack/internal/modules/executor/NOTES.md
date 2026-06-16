@@ -6522,3 +6522,31 @@ nil ("evaluate everywhere"), as is the all-blocks `{}` node — preserving negat
 **Back-ref:** `internal/modules/executor/stream_structural.go:collectAllStructuralSpans`,
           `evaluateStructuralPrograms`,
           `internal/modules/executor/allmatchset.go:emptyRowSet`
+
+## NOTE-426: scatter fixed-width identity IDs via array conversion, not the copy() builtin (2026-06-16)
+
+**Context:** The structural identity scatter (`scatterSpanIDDense`/`scatterParentIDDense`/
+`scatterTraceIDDense` and their non-dense `scatterSpanID`/`scatterParentID`/`scatterTraceID`
+twins in `intrinsic_row_block.go`) writes each row's fixed-width OTel ID from `col.BytesValues`
+(`[][]byte`) into the `[8]byte`/`[16]byte` field on `intrinsicRowFields`. The previous code used
+`copy8(dst, b)` (and `copy(dst[:], b)` for trace IDs), whose `copy` builtin computes
+`min(len(dst), len(b))` and lowers to a runtime memmove-style sequence even though the preceding
+`len(b) == N` guard fixes the length. This per-row copy was the #1 blockpack self-time frame on
+the structural Q9 profile (`copy8`, ~0.72s) because it runs O(SpanCount) per block over the union
+of selected blocks.
+
+**Decision:** After the `len(b) == N` guard, copy via a direct array conversion
+`dst = [N]byte(b)` (Go 1.20+ slice→array conversion). The conversion compiles to a single
+N-byte load+store with exactly one bounds check (the conversion's own `len(b) >= N` check, which
+the guard already proves), eliminating the builtin's min-length computation and memmove dispatch.
+The `len(b) == N` guard is preserved on every path so non-spec-width values are skipped exactly as
+`copy8` did — semantics are byte-identical.
+
+**Correctness:** Identical guarded write; `[N]byte(b)` panics only if `len(b) < N`, which the
+`len(b) == N` guard makes unreachable. `copy8` itself is retained for the `intrinsic_row.go`
+ref-driven path (`storeTypedField`/`identityFieldsFromBlockColsTyped`) where the same single-MOV
+lowering applies but the guarded-write shape is already inline.
+
+**Back-ref:** `internal/modules/executor/intrinsic_row_block.go:scatterSpanIDDense`,
+          `scatterParentIDDense`, `scatterTraceIDDense`, `scatterSpanID`, `scatterParentID`,
+          `scatterTraceID`
