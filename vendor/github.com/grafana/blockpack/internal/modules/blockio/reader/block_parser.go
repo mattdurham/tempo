@@ -414,6 +414,16 @@ func parseBlockColumnsReuse(
 		columns = make(map[shared.ColumnKey]*Column, colCount)
 	}
 
+	// NOTE-420: build the per-block parsedV8ColumnCache key prefix ONCE (fileID + "/v8col/" +
+	// blockOffset + "/"). The eager loop appends only the per-column suffix, avoiding the
+	// repeated strconv.FormatUint(blockOffset) + concatenation for every wanted column. Empty
+	// when there is no stable fileID (cold block) — the loop then skips the cache entirely,
+	// identical to before.
+	v8KeyPrefix := ""
+	if fileID != "" {
+		v8KeyPrefix = v8ColumnCacheKeyPrefix(fileID, meta.Offset)
+	}
+
 	for _, m := range metas {
 		if wantColumns != nil {
 			if _, ok := wantColumns[m.name]; !ok {
@@ -465,8 +475,8 @@ func parseBlockColumnsReuse(
 		// lazy dense expansion of NOTE-PERF-1 runs per query and never mutates the shared
 		// snapshot). On a miss we decode and store a snapshot.
 		v8Key := ""
-		if fileID != "" {
-			v8Key = v8ColumnCacheKey(fileID, meta.Offset, m.name, m.colType)
+		if v8KeyPrefix != "" {
+			v8Key = v8ColumnCacheKeyFromPrefix(v8KeyPrefix, m.name, m.colType)
 			if cached := parsedV8ColumnCache.Get(v8Key); cached != nil {
 				copyDecodedColumnInto(col, cached)
 				columns[key] = col
@@ -690,10 +700,25 @@ func blockColTypesCacheKey(fileID string, blockOffset uint64) string {
 // byte offset within the file is stable across queries and uniquely identifies the block,
 // so (fileID, offset, name, type) keys exactly one decoded column. NOTE-200.
 func v8ColumnCacheKey(fileID string, blockOffset uint64, name string, colType shared.ColumnType) string {
-	return fileID + "/v8col/" +
-		strconv.FormatUint(blockOffset, 10) + "/" +
-		name + "/" +
-		strconv.Itoa(int(colType))
+	return v8ColumnCacheKeyFromPrefix(v8ColumnCacheKeyPrefix(fileID, blockOffset), name, colType)
+}
+
+// v8ColumnCacheKeyPrefix builds the per-block portion of the parsedV8ColumnCache key:
+// fileID + "/v8col/" + blockOffset + "/". NOTE-420: this prefix is invariant across every
+// column of one block, but parseBlockColumnsReuse's eager (wanted-column) loop rebuilt it —
+// including the strconv.FormatUint(blockOffset) — once per wanted column. A wide rate-by /
+// predicate-filtered query (M4/M8/M9) wants many columns per block, so the offset format +
+// concatenation ran O(wantColumns) times for an identical result. Hoisting the prefix to the
+// per-block scope and appending only the column suffix per column drops that to one FormatUint
+// per block. The assembled key is byte-identical to v8ColumnCacheKey.
+func v8ColumnCacheKeyPrefix(fileID string, blockOffset uint64) string {
+	return fileID + "/v8col/" + strconv.FormatUint(blockOffset, 10) + "/"
+}
+
+// v8ColumnCacheKeyFromPrefix appends a single column's (name, type) suffix to a per-block
+// prefix produced by v8ColumnCacheKeyPrefix. NOTE-420.
+func v8ColumnCacheKeyFromPrefix(prefix, name string, colType shared.ColumnType) string {
+	return prefix + name + "/" + strconv.Itoa(int(colType))
 }
 
 // snapshotDecodedColumn builds an immutable cache snapshot holding only the decoded slices

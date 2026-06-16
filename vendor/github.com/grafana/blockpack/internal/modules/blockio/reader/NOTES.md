@@ -3122,3 +3122,23 @@ still parses with `WantAll()` and returns the complete span with all attributes.
 **Verification:** `go build`; `go test -race ./reader` + `./executor` green, incl. new
 white-box `TestMatchingBytesRows_*` (uniform-stride, inline, dict, dict-miss, present-bitmap,
 append-to-dst) and the existing GetTraceByID end-to-end tests.
+
+## NOTE-420: hoist per-block parsedV8ColumnCache key prefix out of the eager wanted-column loop
+
+`parseBlockColumnsReuse`'s eager loop (the `wantColumns` set actually decoded for a query) built
+the `parsedV8ColumnCache` key for each wanted column with `v8ColumnCacheKey(fileID, meta.Offset,
+name, type)`, which formats `fileID + "/v8col/" + strconv.FormatUint(blockOffset, 10) + "/" +
+name + "/" + strconv.Itoa(type)`. The prefix `fileID + "/v8col/" + blockOffset + "/"` is invariant
+across every column of one block, yet the `strconv.FormatUint(blockOffset)` + first concatenation
+ran once per wanted column. A wide rate-by / predicate-filtered query (M4/M8/M9) wants many
+columns per block, so this was pure repeated per-block CPU/allocation for an identical prefix.
+
+**Fix:** split `v8ColumnCacheKey` into `v8ColumnCacheKeyPrefix(fileID, blockOffset)` (the per-block
+portion) and `v8ColumnCacheKeyFromPrefix(prefix, name, type)` (appends only the column suffix).
+`v8ColumnCacheKey` is now the composition of the two, so all other callers (decodeNow lazy path,
+stashPreDecodedColumn, columnar_read sizing) are byte-identical. The eager loop computes the prefix
+ONCE before the loop (empty when fileID == "", which skips the cache entirely as before) and
+appends the suffix per column. The assembled key is byte-for-byte identical to the prior code.
+
+**Verification:** `go build`; `go test -race ./reader` + `./executor` green (existing
+parsedV8ColumnCache warm/cold equivalence tests unchanged — same keys ⇒ same cache hits).
