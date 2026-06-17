@@ -4,7 +4,9 @@ package executor
 
 import (
 	"fmt"
+	"math/bits"
 	"slices"
+	"sync"
 
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
 	"github.com/grafana/blockpack/internal/modules/queryplanner"
@@ -538,6 +540,12 @@ func collectBlockStructuralSpanRecs(
 	// retains a reference past this function, so release it on every exit path.
 	defer putIntrinsicRowFields(idFields)
 
+	// NOTE-432: precompute the per-row predicate-match bitmask in O(sum of set sizes) so the
+	// row loop reads a bit with one array index instead of binary-searching every program's
+	// RowSet per row (the per-block hot loop on the union-of-block-sets structural path).
+	predBits := computeStructuralPredBits(sets, n)
+	defer releaseStructuralPredBits(predBits)
+
 	for rowIdx := range n {
 		row := &idFields[rowIdx]
 		if row.present&intrinsicPresentTraceID == 0 {
@@ -560,7 +568,7 @@ func collectBlockStructuralSpanRecs(
 			rec.parentID = row.parentID
 			rec.present |= structuralParentIDPresent
 		}
-		rec.nodeMatch = computeNodeMatchForRow(sets, nodesList, hasIntrinsic, row, rowIdx)
+		rec.nodeMatch = computeNodeMatchForRow(predBits[rowIdx], nodesList, hasIntrinsic, row)
 		flat = append(flat, rec)
 	}
 	// Release after the row loop: sets may contain scratch-backed rowSets (single-predicate programs).
@@ -617,27 +625,93 @@ func evaluateStructuralPrograms(
 	return sets, nil
 }
 
-// computeNodeMatchForRow computes the nodeMatch bitmask for a single row.
-// Bit i is set if sets[i] contains rowIdx and (if hasIntrinsic) the intrinsic nodes pass.
+// structuralPredBitsPool pools the per-row predicate-match bitmask scratch used by the
+// structural block scan. NOTE-432.
+var structuralPredBitsPool sync.Pool //nolint:gochecknoglobals
+
+// acquireStructuralPredBits returns a zeroed []uint8 of length n from the pool.
+func acquireStructuralPredBits(n int) []uint8 {
+	if v := structuralPredBitsPool.Get(); v != nil {
+		if s, ok := v.([]uint8); ok && cap(s) >= n {
+			s = s[:n]
+			clear(s)
+			return s
+		}
+	}
+	return make([]uint8, n)
+}
+
+// releaseStructuralPredBits returns the scratch to the pool.
+func releaseStructuralPredBits(s []uint8) {
+	if cap(s) > compactPoolMaxPooledBytes { // NOTE-355: drop oversized outlier (1 byte/elem)
+		return
+	}
+	structuralPredBitsPool.Put(s[:cap(s)]) //nolint:staticcheck // SA6002: slice is pointer-sized
+}
+
+// computeStructuralPredBits builds a per-row predicate-match bitmask in O(sum of set sizes)
+// instead of O(spanCount × programs × log(matched-rows)). NOTE-432.
+//
+// computeNodeMatchForRow's predecessor probed every program's RowSet with a binary search
+// (rowSet.Contains) once PER ROW — O(spanCount × programs × log M) over the whole block scan,
+// the dominant per-block CPU on the structural union-of-block-sets path (Q9 walks every span of
+// every block selected by EITHER node). Each RowSet is already a sorted ascending slice of
+// matched rows, so scattering each set's matched rows directly into a per-row bitmask is a single
+// linear pass per program (O(M)) that visits only the matched rows — typically far fewer than the
+// full span count. The row loop then reads bit i with one array index instead of a binary search.
+//
+// allMatchSet (the {} node) matches every row: set the bit for all rows in one tight loop without
+// materializing its ToSlice() (which would allocate a spanCount-sized int slice). emptyRowSet
+// contributes nothing. *rowSet exposes its sorted backing slice via ToSlice() (no copy).
+//
+// The returned scratch is pooled; the caller must release it.
+func computeStructuralPredBits(sets []vm.RowSet, spanCount int) []uint8 {
+	predBits := acquireStructuralPredBits(spanCount)
+	for i, s := range sets {
+		mask := uint8(1) << uint(i) //nolint:gosec // safe: i bounded by len(programs) <= 8
+		if am, ok := s.(*allMatchSet); ok {
+			// Every row in [0, am.n) matches — set the bit without allocating ToSlice().
+			n := am.n
+			if n > spanCount {
+				n = spanCount
+			}
+			for r := range n {
+				predBits[r] |= mask
+			}
+			continue
+		}
+		for _, r := range s.ToSlice() {
+			if r >= 0 && r < spanCount {
+				predBits[r] |= mask
+			}
+		}
+	}
+	return predBits
+}
+
+// computeNodeMatchForRow computes the nodeMatch bitmask for a single row, given the
+// precomputed predicate-match bits for that row (predBits, bit i = sets[i] contains rowIdx).
+// Bit i is set if predBits has bit i and (if hasIntrinsic) the intrinsic nodes pass.
 // NOTE-081: accepts *intrinsicRowFields (typed) to avoid per-row map allocations.
+// NOTE-432: the predicate membership test is precomputed (computeStructuralPredBits) so this
+// only folds in the per-row intrinsic-node check, eliminating the per-row binary search.
 func computeNodeMatchForRow(
-	sets []vm.RowSet,
+	predBits uint8,
 	nodesList [][]vm.RangeNode,
 	hasIntrinsic bool,
 	row *intrinsicRowFields,
-	rowIdx int,
 ) uint8 {
 	var nodeMatch uint8
-	for i, s := range sets {
-		if !s.Contains(rowIdx) {
-			continue
-		}
+	for predBits != 0 {
+		i := bits.TrailingZeros8(predBits)
+		mask := uint8(1) << uint(i) //nolint:gosec // safe: i bounded by len(programs) <= 8
+		predBits &^= mask
 		passes := true
 		if hasIntrinsic && len(nodesList) > i && len(nodesList[i]) > 0 {
 			passes = rowSatisfiesIntrinsicNodesTyped(nodesList[i], row)
 		}
 		if passes {
-			nodeMatch |= 1 << uint(i) //nolint:gosec // safe: i bounded by len(programs) <= 8
+			nodeMatch |= mask
 		}
 	}
 	return nodeMatch

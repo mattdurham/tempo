@@ -6607,3 +6607,34 @@ unreachable. Byte-identical semantics.
 
 **Back-ref:** `internal/modules/executor/intrinsic_row.go:copy8`, `storeTypedField` (trace:id),
           `identityFieldsFromBlockColsTyped` (trace:id)
+
+## NOTE-432: Precompute structural per-row predicate-match bitmask (eliminate per-row binary search)
+
+**Path:** `collectBlockStructuralSpanRecs` → per-row `computeNodeMatchForRow` (structural `>>`/`<<`
+block scan). For every span of every block selected by EITHER node (the union-of-block-sets shape
+that drives the Q9 9x-vs-parquet gap), the old `computeNodeMatchForRow` probed EACH program's
+`vm.RowSet` with `rowSet.Contains` — a `slices.BinarySearch` — once per row. Cost was
+O(spanCount × programs × log(matchedRows)) across the block, the dominant per-block CPU on the
+structural path.
+
+**Change:** Each `RowSet` is already a sorted ascending slice of its matched rows. Scatter each
+set's matched rows directly into a per-row `[]uint8` bitmask in a single linear pass per program
+(`computeStructuralPredBits`, O(sum of set sizes) — visits only matched rows, typically far fewer
+than spanCount). The row loop then reads bit `i` with one array index instead of a binary search.
+`computeNodeMatchForRow` now takes the precomputed `predBits uint8` for that row and only folds in
+the per-row intrinsic-node check (iterating set bits via `bits.TrailingZeros8`).
+
+**allMatchSet** (the `{}` node) matches every row — its bit is set in one tight loop WITHOUT
+materializing `ToSlice()` (which would allocate a spanCount-sized `[]int`). `emptyRowSet`
+contributes nothing. `*rowSet` exposes its sorted backing slice via `ToSlice()` (no copy).
+
+**Pooling:** `structuralPredBitsPool` (`[]uint8`, mirrors `compactBoolPool`) amortizes the scratch
+allocation; released after the row loop. Drops oversized outliers per NOTE-355.
+
+**Correctness:** Byte-identical. predBits is computed before `releaseBlockColumnProvider` so any
+scratch-backed single-predicate RowSet is fully consumed before pool reuse can overwrite it.
+predBits is computed for all rows (incl. trace-ID-absent rows skipped by the loop) — harmless, the
+surplus bits are never read. Tests `go test -race ./internal/modules/executor/...` green.
+
+**Back-ref:** `internal/modules/executor/stream_structural.go:computeStructuralPredBits`,
+`computeNodeMatchForRow`, `collectBlockStructuralSpanRecs` row loop.
