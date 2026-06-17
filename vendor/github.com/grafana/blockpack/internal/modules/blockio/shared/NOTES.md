@@ -2416,3 +2416,34 @@ uniformly across run lengths.
 
 Back-ref: `internal/modules/blockio/shared/index_rle.go` (DecodeIndexRLE);
 `internal/modules/blockio/reader/column.go` (rle_indexes / sparse_rle_indexes decode).
+
+## NOTE-433: unzeroed value arenas for flat-bytes and XOR-bytes paged decode
+
+`appendFlatPageOpt` (flat-bytes) and `appendXORBytesPageOpt` (XOR-bytes) each reconstruct a
+page's values into ONE page-sized byte arena (NOTE-356/147) sized exactly by a pre-scan over
+the per-value length prefixes (`flatBytesPageValueSize` / `xorBytesPageValueSize`). Both arenas
+were allocated with `make([]byte, valBytes)`, which memclr-zeroes the whole span — pure waste,
+because the carve loop overwrites EVERY byte before any value sub-slice is observed:
+
+  - Flat: `copy(v, raw[...])` writes each carved value; `arenaOff` advances by exactly `vLen`
+    per row, and the pre-scan guarantees `sum(vLen) == valBytes`, so the union of writes covers
+    [0:valBytes) exactly.
+  - XOR: `xorInvertInto(reconstructed, xorData, prev)` writes ALL `xorLen` bytes of each value
+    (XORBytes over the prev-overlap prefix, `copy()` over the non-overlapping tail — len(dst) ==
+    len(xored) == xorLen here), and `arenaOff` advances by exactly `xorLen` per row with the
+    pre-scan guaranteeing `sum(xorLen) == valBytes`.
+
+Switched both to `MakeNoZeroBytes(valBytes)` (NOTE-259), which allocates via mallocgc with
+needzero=false. Sound because the arena is pointer-free ([]byte) so unscanned garbage is GC-safe,
+and the full-overwrite-before-read contract holds by construction (same contract as NOTE-258/259).
+`runtime.memclrNoHeapPointers` was the #3 querier self-time frame (~6.4s) on the 2026-06-16 CPU
+profile; these byte-column arenas (16-byte trace:id / 8-byte span:id, plus high-cardinality
+attribute/name flat-bytes columns on the M4/M6/M9 group-by path) are a major contributor since
+the arena spans the whole page. Microbench (BenchmarkDecodePagedColumnXORBytes): median
+~8.9ms -> ~8.2ms (~8% faster); allocs/B unchanged (same allocation, only the clear is skipped).
+
+The legacy v1 `DecodeIntrinsicColumnBlob` flat-bytes arena (cold non-paged path) is intentionally
+left on `make([]byte, ...)` — it is not on the hot paged-decode path.
+
+Back-ref: `internal/modules/blockio/shared/intrinsic_codec.go` (appendFlatPageOpt,
+appendXORBytesPageOpt); `internal/modules/blockio/shared/unzeroed_alloc.go` (MakeNoZeroBytes).

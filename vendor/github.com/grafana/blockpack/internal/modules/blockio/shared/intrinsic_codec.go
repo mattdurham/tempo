@@ -585,7 +585,16 @@ func appendFlatPageOpt(
 		if scanErr != nil {
 			return scanErr
 		}
-		arena := make([]byte, valBytes)
+		// NOTE-433: skip the make() memclr on the value arena. flatBytesPageValueSize sums
+		// every len[2] prefix to valBytes, so the carve loop below writes EVERY byte of the
+		// arena via copy() (arenaOff advances by exactly vLen each row, the union covering
+		// [0:valBytes) exactly) before any BytesValues sub-slice is observed. The arena is
+		// pointer-free ([]byte) so unscanned garbage is GC-safe (NOTE-258/259 contract). The
+		// flat-bytes path decodes high-cardinality attribute/name columns on the M4/M6/M9
+		// group-by hot path, where the arena spans the whole page's values — the eliminated
+		// memclr (runtime.memclrNoHeapPointers was the #3 querier self-time frame, ~6.4s) is
+		// pure waste since copy() overwrites it immediately.
+		arena := MakeNoZeroBytes(valBytes)
 		arenaOff := 0
 		for range rowCount {
 			vLen := int(binary.LittleEndian.Uint16(raw[pos:]))
@@ -1756,7 +1765,16 @@ func appendXORBytesPageOpt(raw []byte, blockW, rowW, rowCount int, dst *Intrinsi
 	if err != nil {
 		return err
 	}
-	arena := make([]byte, valBytes)
+	// NOTE-433: skip the make() memclr on the value arena. xorBytesPageValueSize sums every
+	// xor_data_len prefix to valBytes, and xorInvertInto writes ALL xorLen bytes of each
+	// carved value (XORBytes over the prev-overlap prefix, copy() over the non-overlapping
+	// tail), so the carve loop overwrites EVERY arena byte (arenaOff advances by exactly
+	// xorLen each row, the union covering [0:valBytes) exactly) before any BytesValues
+	// sub-slice is observed. The arena is pointer-free ([]byte) so unscanned garbage is
+	// GC-safe (NOTE-258/259 contract). The XOR-bytes path decodes the 16-byte trace:id /
+	// 8-byte span:id columns; the eliminated memclr (memclrNoHeapPointers, ~6.4s self-time)
+	// is pure waste since xorInvertInto overwrites it immediately.
+	arena := MakeNoZeroBytes(valBytes)
 	arenaOff := 0
 
 	pos := 0
