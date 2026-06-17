@@ -3172,3 +3172,46 @@ share one backing pointer. `BenchmarkParseColumnMetadataArray` (120-column schem
 → 1 alloc/op** (the lone remaining alloc is the entries slice), 8696 B/op → 6784 B/op (~22% less).
 Production blocks carry hundreds of columns, multiplying the per-parse win.
 
+
+## NOTE-441: batched cold-miss writeback (PutMultiV8Section) — eliminate the per-column Set dial storm
+
+**Problem (from a querier CPU profile):** `memcache.(*Client).dial` accounted for ~28% of cumulative
+querier CPU despite a 512-deep idle pool — `getFreeConn` was ~0%, i.e. the pool was effectively
+unused. NOTE-179/185 already collapsed the per-column *read* fan-out into one `GetMultiV8Section` /
+one combined `GetMultiV8SectionMixed`, so the warm GET path was a single round-trip. But the
+**cold-miss writeback** inside `fetchColumnsBatched` still issued one `PutV8Section` — and thus one
+gomemcache `Set` → one `getConn` (potential dial + TLS) → release — **per missing column**. Under
+concurrent cold-block load (many tenants, each cold block writing back 5–15 columns) this write fan
+drained the idle pool exactly like the per-column reads NOTE-179 fixed, forcing a fresh dial per
+column. The write side was the remaining, unbatched half of the same dial storm.
+
+**Fix:** the write-side analog of the batched read path. A new `MemCache.SetMulti(map[string][]byte)`
+funnels a whole block's cold-miss writeback set through ONE call that issues the underlying gomemcache
+`Set`s back to back from a SINGLE goroutine. Because the cold-miss path is already single-goroutine,
+the sequential `Set`s REUSE one pooled connection (dial once, reuse for the rest) instead of each
+racing for its own — collapsing the per-block connection-acquisition fan to ~1. Crucially this uses
+only gomemcache's existing public `Set`, so it needs NO new gomemcache method and survives
+`go mod vendor` unchanged (blockpack's `vendor/` is gitignored and tempo re-vendors from the module
+proxy, so a vendored-fork edit would not propagate). This is surfaced up the stack as
+`MemCache.SetMulti` → `ChainedCache.PutMulti` (batch tier writes in one funneled call; non-batch
+in-process/disk tiers store per-key, which carry no connection cost) → `TypedTieredCache.PutMultiV8Section`.
+`fetchColumnsBatched` now collects every cold-miss column's freshly-allocated compressed copy into a
+`writebacks` map and flushes them in ONE `PutMultiV8Section` after the loop, falling back to per-name
+`PutV8Section` only when the cache reports no batch-put support. The warm path is unchanged: every
+column hits the batch GET, `writebacks` stays nil, and no extra allocation occurs.
+
+**Correctness:** the per-column copies, stash, and parser-decode path (NOTE-367) are byte-for-byte
+identical to the pre-change per-column `PutV8Section` — only the connection acquisition is coalesced.
+`SetMulti` swallows transient errors like `Put` (an unavailable memcache never breaks the read path).
+
+**Verification:** `go test -race ./...` green. `TestReader_ColdMissWriteback_Batched` drives a cold
+multi-column read through a batch-capable `ChainedCache` and asserts exactly ONE batched
+`PutMultiV8Section` covering all cold-miss columns and ZERO per-column `PutV8Section`, with a warm
+re-read byte-identical to the cold bytes. `TestMemCache_SetMulti`, `TestPutMulti_*`,
+`TestPutMultiV8Section_*` cover the wrapper / chain / typed layers including the no-batch-support
+fallback and empty-batch no-op.
+
+**Back-ref:** `internal/modules/blockio/reader/columnar_read.go:fetchColumnsBatched`,
+`internal/modules/tieredcache/typed.go:PutMultiV8Section`,
+`internal/modules/chaincache/chaincache.go:PutMulti`,
+`internal/modules/memcache/memcache.go:SetMulti`, NOTE-179/185 (the read-side analogs).

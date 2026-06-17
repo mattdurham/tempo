@@ -372,6 +372,42 @@ func (m *MemCache) Put(key string, value []byte) error {
 	return nil
 }
 
+// SetMulti stores all key→value pairs in memcache by issuing the writes back to
+// back from a SINGLE goroutine. Non-fatal errors are silently ignored so an
+// unavailable memcache server never breaks the read path, matching Put.
+//
+// NOTE-441: the V8 cold-miss writeback path (fetchColumnsBatched) previously
+// scattered its per-column Puts; under concurrent cold-block load each Put
+// independently acquired a pooled connection, and when many queries wrote back
+// at once the 512-deep idle pool drained and every Put dialed a fresh TLS
+// connection (~28% of querier CPU in (*Client).dial — the write-side twin of the
+// per-column read storm NOTE-179 fixed). Funneling a block's whole writeback set
+// through one SetMulti call serializes the Sets on one goroutine, so they REUSE a
+// single pooled connection (dial once, reuse for the rest) instead of each racing
+// for its own — collapsing the per-block connection-acquisition fan to ~1. The
+// gomemcache pool keeps the connection hot across the sequential Sets, so this
+// needs no new gomemcache API and survives `go mod vendor` unchanged.
+func (m *MemCache) SetMulti(items map[string][]byte) error {
+	if m == nil || len(items) == 0 {
+		return nil
+	}
+	var start time.Time
+	if m.durPutOk != nil {
+		start = time.Now()
+	}
+	for key, value := range items {
+		_ = m.c.Set(&gomemcache.Item{
+			Key:        memcacheKey(key),
+			Value:      value,
+			Expiration: m.expiration,
+		})
+	}
+	if m.durPutOk != nil {
+		m.durPutOk.Observe(time.Since(start).Seconds())
+	}
+	return nil
+}
+
 // GetOrFetch returns the cached value for key; on a miss it calls fetch(),
 // stores the result, and returns it. Concurrent calls for the same uncached
 // key share a single fetch invocation via singleflight.

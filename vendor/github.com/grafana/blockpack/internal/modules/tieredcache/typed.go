@@ -521,6 +521,40 @@ func (t *TypedTieredCache) PutV8Section(
 	return sub.Put(key, value)
 }
 
+// sectionBatchPutter is the optional interface a sub-cache tier may implement to
+// store many keys in one round-trip (NOTE-441). chaincache.ChainedCache provides
+// it; nil/non-batch tiers fall back to per-key PutV8Section.
+type sectionBatchPutter interface {
+	PutMulti(items map[string][]byte) error
+}
+
+// PutMultiV8Section writes back many V8 per-column/per-index blobs that all share
+// the same (tocType, subType) routing in ONE batched round-trip when the sub-cache
+// supports it, returning false when it does not (the caller then falls back to
+// per-name PutV8Section). NOTE-441: the write-side analog of GetMultiV8Section —
+// the V8 cold-miss path resolves the columns that miss the batch GET, then writes
+// them all back here in a single funneled SetMulti (sequential writes reusing one
+// pooled connection) instead of one independent Set (one connection acquisition) per column.
+func (t *TypedTieredCache) PutMultiV8Section(
+	fileID string,
+	tocType, subType uint32,
+	values map[string][]byte,
+) (bool, error) {
+	if len(values) == 0 {
+		return true, nil
+	}
+	sub, _ := t.routeV8(subType)
+	bp, ok := sub.(sectionBatchPutter)
+	if !ok {
+		return false, nil
+	}
+	keyed := make(map[string][]byte, len(values))
+	for name, value := range values {
+		keyed[sectioncache.V8SectionKeyFast(fileID, tocType, subType, name)] = value
+	}
+	return true, bp.PutMulti(keyed)
+}
+
 // GetOrFetchV14Section fetches or caches a V14 decompressed generic section blob.
 func (t *TypedTieredCache) GetOrFetchV14Section(
 	fileID string,

@@ -687,6 +687,10 @@ func cacheParsedBlockColTypes(fileID string, blockOff uint64, metas []colMetaEnt
 type sectionBatchFetcher interface {
 	GetMultiV8Section(fileID string, tocType, subType uint32, names []string) (map[string][]byte, bool, error)
 	PutV8Section(fileID string, tocType, subType uint32, name string, value []byte) error
+	// PutMultiV8Section writes back every column that missed the batch GET in ONE
+	// funneled writeback (NOTE-441). Returns false when the underlying cache has
+	// no batch-put support, so the caller falls back to per-name PutV8Section.
+	PutMultiV8Section(fileID string, tocType, subType uint32, values map[string][]byte) (bool, error)
 }
 
 // sectionMixedFetcher is the optional interface a section cache may implement to
@@ -795,6 +799,14 @@ func (r *Reader) fetchColumnsBatched(
 		return nil
 	}
 
+	// NOTE-441: collect every cold-miss writeback and flush them in ONE batched
+	// SetMulti after the loop rather than one PutV8Section (one memcache Set / one
+	// connection acquisition) per missing column. Under concurrent cold-block load
+	// the per-column writeback fan drained the idle pool exactly like the per-column
+	// reads NOTE-179 collapsed, forcing a fresh dial per column. writebacks holds the
+	// freshly-allocated copies keyed by their section name; it is nil on the warm path
+	// (every column hit the batch GET) so warm reads allocate nothing extra.
+	var writebacks map[string][]byte
 	for name, m := range colByName {
 		colStart := int64(m.dataOffset)  //nolint:gosec
 		colLen := int64(m.compressedLen) //nolint:gosec
@@ -805,9 +817,9 @@ func (r *Reader) fetchColumnsBatched(
 			r.stashPreCompressedColumn(blockOff, m, blob)
 			continue
 		}
-		// Miss: read the compressed blob from the cached ToC or a coalesced cold run, write
-		// it back to the cache, then stash the freshly-allocated copy (NOTE-367) — the
-		// parser decodes from it directly. The cold path mutates shared run state but is
+		// Miss: read the compressed blob from the cached ToC or a coalesced cold run, queue
+		// it for the batched writeback, then stash the freshly-allocated copy (NOTE-367) —
+		// the parser decodes from it directly. The cold path mutates shared run state but is
 		// single-goroutine here (no fan-out), so no lock needed.
 		var blob []byte
 		if colStart+colLen <= int64(len(toc)) {
@@ -821,8 +833,21 @@ func (r *Reader) fetchColumnsBatched(
 		}
 		cp := make([]byte, colLen)
 		copy(cp, blob)
-		_ = bg.PutV8Section(r.fileID, sectionTypeBlockCol, 0, name, cp)
+		if writebacks == nil {
+			writebacks = make(map[string][]byte)
+		}
+		writebacks[name] = cp
 		r.stashPreCompressedColumn(blockOff, m, cp)
+	}
+
+	// NOTE-441: flush all cold-miss writebacks in ONE funneled PutMultiV8Section. If the cache
+	// has no batch-put support, fall back to per-name PutV8Section (the prior behavior).
+	if len(writebacks) > 0 {
+		if batched, _ := bg.PutMultiV8Section(r.fileID, sectionTypeBlockCol, 0, writebacks); !batched {
+			for name, cp := range writebacks {
+				_ = bg.PutV8Section(r.fileID, sectionTypeBlockCol, 0, name, cp)
+			}
+		}
 	}
 	return nil
 }

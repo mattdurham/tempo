@@ -134,6 +134,40 @@ func (c *ChainedCache) Put(key string, value []byte) error {
 	return errors.Join(errs...)
 }
 
+// batchPutter is an optional interface a tier may implement to store many
+// key→value pairs in one round-trip (NOTE-441). The memcache tier implements it
+// via SetMulti, which funnels the writes through one goroutine so they reuse a single pooled connection per server.
+type batchPutter interface {
+	SetMulti(items map[string][]byte) error
+}
+
+// PutMulti stores many key→value pairs in every tier. A tier that implements
+// batchPutter (the memcache tier) stores the whole batch via one funneled
+// SetMulti (sequential single-goroutine writes reusing one pooled connection); other tiers (in-process / local-disk, with no per-write connection
+// cost) store each entry individually. NOTE-441: the write-side analog of
+// GetMulti — collapses the V8 cold-miss per-column writeback dial storm into one
+// connection acquisition per memcache server.
+func (c *ChainedCache) PutMulti(items map[string][]byte) error {
+	if len(items) == 0 {
+		return nil
+	}
+	var errs []error
+	for _, tier := range c.tiers {
+		if bp, ok := tier.(batchPutter); ok {
+			if err := bp.SetMulti(items); err != nil {
+				errs = append(errs, err)
+			}
+			continue
+		}
+		for key, value := range items {
+			if err := tier.Put(key, value); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
+	return errors.Join(errs...)
+}
+
 // GetOrFetch returns the cached value for key; on a miss it calls fetch(),
 // stores the result in all tiers, and returns it.
 // Concurrent callers for the same missing key share a single fetch invocation.
