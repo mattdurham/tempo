@@ -6694,3 +6694,32 @@ trees mixing intrinsic and non-intrinsic columns. The original `rowSatisfiesIntr
 **Back-ref:** `internal/modules/executor/predicates.go:prepareIntrinsicNodes`,
 `stream_structural.go:collectStructuralIntrinsicNodes`/`computeNodeMatchForRow`,
 `stream.go:filterRowSetByIntrinsicNodes`.
+
+## NOTE-436: Pool the cross-block structuralSpanRec accumulator (2026-06-17)
+**Context:** `collectAllStructuralSpans` sizes `flat := make([]structuralSpanRec, 0, totalSpans)`
+to the summed SpanCount of EVERY block in the UNION of both structural nodes' selected-block
+sets (NOTE-091 forbids intersecting the sets; the union is the sound block population). For a
+heavy `>>`/`<<` query over a large span population (the priority-#1 Q9 9x-gap workload) this is
+the single largest per-query allocation on the structural path: the 2026-06-17 alloc profile
+attributed ~9.8 GB *self* to `collectAllStructuralSpans`, virtually all of it this one make. It
+was allocated fresh (and zeroed) every query and discarded.
+
+**Change:** draw `flat` from a `sync.Pool` (`acquireStructuralSpanRecs(totalSpans)` /
+`releaseStructuralSpanRecs`). `flat` is fully consumed by `groupMatchingStructuralTraces`, which
+scatters survivors into a FRESH `backing` array and returns windows aliasing THAT array — never
+`flat` (see NOTE-387). So `flat` never escapes `collectAllStructuralSpans` and is released on
+every exit path (after grouping, and on the per-block error path where `flat` holds the latest
+possibly-reallocated backing). The pool stores `*[]structuralSpanRec` so boxing for `Put` does
+not allocate the slice header (staticcheck SA6002-clean), and drops over-32-MiB backings on
+release (NOTE-355) so one giant query cannot pin a multi-hundred-MB array in the pool.
+
+**Correctness:** `structuralSpanRec` is pointer-free (NOTE-357: all-value [16]byte/[8]byte/
+int32/uint16/uint8 fields), so a recycled backing pins no string/byte payload and carries no
+live pointers for the GC to scan between uses. `acquire` returns length 0, so the caller appends
+exactly as before and every emitted element is fully written — the recycled contents are never
+observed. Verified by `TestStructuralSpanRecsPool_*` (zero-length adequate-cap reuse; oversized
+drop) and the unchanged structural/format-comparison correctness suite
+(`go test ./benchmark -run 'Structural|FormatComparison|Correctness'`).
+
+**Back-ref:** `internal/modules/executor/structuralspanrec.go:acquireStructuralSpanRecs`/
+`releaseStructuralSpanRecs`, `stream_structural.go:collectAllStructuralSpans`.

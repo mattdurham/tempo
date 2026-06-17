@@ -258,7 +258,12 @@ func collectAllStructuralSpans(
 			totalSpans += int(r.BlockMeta(blockIdx).SpanCount)
 		}
 	}
-	flat := make([]structuralSpanRec, 0, totalSpans)
+	// NOTE-436: draw the cross-block accumulator from a pool. It is fully consumed by
+	// groupMatchingStructuralTraces below (which scatters survivors into a fresh backing array
+	// and returns windows aliasing THAT array, not flat) and is never retained past this call,
+	// so it is released before return on every path. structuralSpanRec is pointer-free, so the
+	// reused backing pins no string/byte payload between queries.
+	flat := acquireStructuralSpanRecs(totalSpans)
 	// parsedBlocks caches the parsed *Block per blockIdx so evalStructuralMatches can
 	// populate SpanMatch.Block. Peak memory is bounded by len(plan.SelectedBlocks) parsed
 	// blocks, which is the same set already held in rawBlocks — no additional I/O.
@@ -271,6 +276,8 @@ func collectAllStructuralSpans(
 		var err error
 		flat, err = collectBlockStructuralSpanRecs(r, blockIdx, raw, &bp, flat, parsedBlocks)
 		if err != nil {
+			// NOTE-436: flat holds the latest (possibly reallocated) pooled backing — release it.
+			releaseStructuralSpanRecs(flat)
 			return nil, parsedBlocks, err
 		}
 	}
@@ -292,6 +299,9 @@ func collectAllStructuralSpans(
 	// survivors. On the all-matching workload every record is a survivor and the scatter is a
 	// full copy, but it is still a single linear pass with no comparisons.
 	result := groupMatchingStructuralTraces(flat)
+	// NOTE-436: flat is fully consumed by groupMatchingStructuralTraces (result aliases a fresh
+	// backing array, never flat) — release the pooled accumulator for reuse by the next query.
+	releaseStructuralSpanRecs(flat)
 	return result, parsedBlocks, nil
 }
 
