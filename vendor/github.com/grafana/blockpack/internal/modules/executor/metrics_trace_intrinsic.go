@@ -403,6 +403,25 @@ func metricsColumnsAreIntrinsic(r *modules_reader.Reader, wantColumns map[string
 //     (streamHistogramGroupByID/streamHistogramGroupBy) write straight into `buckets` and do NOT
 //     pass through the flat emit, so they keep the traceHistogramSeries consumer; gating to
 //     len(GroupBy) <= 1 leaves histSink nil for those.
+// maybeIntrinsicBucketsMap allocates the string-keyed `buckets` map ONLY when neither direct
+// sink is active. NOTE-438: when seriesSink (single-dim count/rate: M4/M6/M9) or histSink
+// (N<=1 histogram: M8) is non-nil, every accumulation core that receives a sink early-returns
+// into it (streamCountRateN1CompactCore returns right after emitFlatCountRateSeries;
+// emitHistogramFlat returns right after streamByRefSliceHistogramFlatEmitDirect) and NEVER
+// writes `buckets` — so the map was a pure per-block, per-query live pointer-bearing GC object
+// on exactly the heavy 24h metrics queries that fan out over 1500+ blocks (one Reader/goroutine
+// each). The paths that DO use `buckets` (M1 no-group-by count/rate, the N>1 group-by histogram,
+// and the default accumulateIntrinsicBucketsViaKeyMap fallback) all leave both sinks nil per
+// intrinsicDirectSeriesSinks, so they still receive a real map; the nil-map write panic is
+// therefore structurally impossible. len(nil) == 0 keeps the post-dispatch empty-result
+// short-circuit (len(buckets)==0) well-defined on the sinks-nil branch it guards.
+func maybeIntrinsicBucketsMap(seriesSink, histSink *[]TraceTimeSeries) map[string]*aggBucketState {
+	if seriesSink == nil && histSink == nil {
+		return make(map[string]*aggBucketState)
+	}
+	return nil
+}
+
 func intrinsicDirectSeriesSinks(
 	isCountRate bool,
 	agg vm.AggregateSpec,
@@ -553,7 +572,7 @@ func executeTraceMetricsIntrinsic(
 
 	seriesSink, histSink := intrinsicDirectSeriesSinks(isCountRate, agg)
 
-	buckets := make(map[string]*aggBucketState)
+	buckets := maybeIntrinsicBucketsMap(seriesSink, histSink)
 	if err := dispatchIntrinsicAccumulate(ctx, r, tsCol, lo, hi, filteredRefs, isCountRate, inRangeRefs, inRangeVals, querySpec, buckets, seriesSink, histSink); err != nil {
 		return nil, false, err
 	}
@@ -3097,35 +3116,43 @@ func emitFlatCountRateSeries(
 	stepSec float64,
 ) {
 	labelName := intrinsicLabelName(groupByName)
+	// NOTE-437: precompute the rate divisor once. rateScale==0 reproduces the prior
+	// "isRate && stepSec<=0 leaves values at 0" behavior (the series is still emitted, with
+	// zero values, because the cell counts were non-zero).
+	rateScale := 1.0
+	if isRate {
+		if stepSec > 0 {
+			rateScale = 1.0 / stepSec
+		} else {
+			rateScale = 0
+		}
+	}
 	for gIdx := int64(0); gIdx < numGroups; gIdx++ {
 		base := gIdx * numSteps
-		hasAny := false
-		for bk := int64(0); bk < numSteps; bk++ {
-			if groupCountsFlat[base+bk] != 0 {
-				hasAny = true
-				break
-			}
-		}
-		if !hasAny {
-			continue
-		}
-		gk := ""
-		if gIdx < int64(len(dict)) { //nolint:gosec
-			gk = dict[gIdx]
-		}
-		values := make([]float64, numSteps)
+		// NOTE-437: single pass over the step cells — defer the values allocation until the
+		// first non-zero cell so empty groups cost no allocation and no second scan. The former
+		// form scanned numSteps cells once for a hasAny probe and a second time to fill them.
+		var values []float64
 		for bk := int64(0); bk < numSteps; bk++ {
 			c := groupCountsFlat[base+bk]
 			if c == 0 {
 				continue
 			}
+			if values == nil {
+				values = make([]float64, numSteps)
+			}
 			if isRate {
-				if stepSec > 0 {
-					values[bk] = float64(c) / stepSec
-				}
+				values[bk] = float64(c) * rateScale
 			} else {
 				values[bk] = float64(c)
 			}
+		}
+		if values == nil {
+			continue // no non-zero cell for this group
+		}
+		gk := ""
+		if gIdx < int64(len(dict)) { //nolint:gosec
+			gk = dict[gIdx]
 		}
 		*sink = append(*sink, TraceTimeSeries{
 			Labels: []TraceMetricLabel{{Name: labelName, Value: gk}},
@@ -5892,45 +5919,61 @@ func streamByRefSliceHistogramFlatEmitDirect(
 		boundaryStrs[bIdx] = strconv.FormatFloat(boundary, 'g', -1, 64)
 	}
 	groupBy := agg.GroupBy
+	// NOTE-437: the group-by label NAMES are loop-invariant (they depend only on groupBy,
+	// constant across every group and every boundary series). Resolve them once instead of
+	// per emitted series via intrinsicLabelName — for a high-cardinality histogram (M8:
+	// thousands of groups × tens of boundaries) the old form re-resolved the same names
+	// numSeries×len(groupBy) times.
+	labelNames := make([]string, len(groupBy))
+	for i, name := range groupBy {
+		labelNames[i] = intrinsicLabelName(name)
+	}
 	for gIdx := int64(0); gIdx < int64(numGroups); gIdx++ { //nolint:gosec
 		gk := ""
 		if int(gIdx) < len(dict) { //nolint:gosec
 			gk = dict[gIdx]
 		}
-		// gk is the "\x00"-joined composite of the group-by dimension values; split once per
-		// group, reused across all boundary series for this group (matches traceHistogramSeries).
+		// gk is the "\x00"-joined composite of the group-by dimension values. For the common
+		// single-dimension group-by (M4/M8: `by (resource.service.name)`) gk has no separator,
+		// so it IS the sole dimension value — skip strings.Split entirely (it allocated a fresh
+		// 1-element slice per group, i.e. once per service for M8's thousands of groups).
+		// NOTE-437.
 		var attrVals []string
-		if len(groupBy) > 0 {
+		if len(groupBy) > 1 {
 			attrVals = strings.Split(gk, "\x00")
 		}
 		for bIdx := int64(0); bIdx < numBoundaries; bIdx++ {
 			// NOTE-398: boundary-innermost — cell is gIdx*stride1 + timeIdx*stepStride + bIdx.
 			gbBase := gIdx*stride1 + bIdx
-			hasAny := false
+			// NOTE-437: single pass — defer the values allocation until the first non-zero cell
+			// so empty (group,boundary) series cost no allocation and no second scan. The former
+			// form scanned the numSteps cells once for a hasAny probe and a second time to fill,
+			// touching every cell twice for every emitted series.
+			var values []float64
 			for timeIdx := int64(0); timeIdx < numSteps; timeIdx++ {
-				if groupCountsFlat[gbBase+timeIdx*stepStride] != 0 {
-					hasAny = true
-					break
+				c := groupCountsFlat[gbBase+timeIdx*stepStride]
+				if c == 0 {
+					continue
 				}
-			}
-			if !hasAny {
-				continue
-			}
-			values := make([]float64, numSteps)
-			for timeIdx := int64(0); timeIdx < numSteps; timeIdx++ {
-				if c := groupCountsFlat[gbBase+timeIdx*stepStride]; c != 0 {
-					values[timeIdx] = float64(c)
+				if values == nil {
+					values = make([]float64, numSteps)
 				}
+				values[timeIdx] = float64(c)
+			}
+			if values == nil {
+				continue // no non-zero cell for this (group, boundary)
 			}
 			var labels []TraceMetricLabel
 			if len(groupBy) > 0 {
 				labels = make([]TraceMetricLabel, 0, len(groupBy)+1)
-				for i, name := range groupBy {
+				for i := range groupBy {
 					val := ""
-					if i < len(attrVals) {
+					if len(groupBy) == 1 {
+						val = gk
+					} else if i < len(attrVals) {
 						val = attrVals[i]
 					}
-					labels = append(labels, TraceMetricLabel{Name: intrinsicLabelName(name), Value: val})
+					labels = append(labels, TraceMetricLabel{Name: labelNames[i], Value: val})
 				}
 			}
 			labels = append(labels, TraceMetricLabel{Name: "__bucket", Value: boundaryStrs[bIdx]})

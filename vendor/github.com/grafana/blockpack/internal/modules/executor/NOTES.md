@@ -6723,3 +6723,65 @@ drop) and the unchanged structural/format-comparison correctness suite
 
 **Back-ref:** `internal/modules/executor/structuralspanrec.go:acquireStructuralSpanRecs`/
 `releaseStructuralSpanRecs`, `stream_structural.go:collectAllStructuralSpans`.
+
+## NOTE-437: Single-pass / split-free direct metrics emit (2026-06-17)
+**Context:** The directly-emitted metrics series builders (`emitFlatCountRateSeries` for
+count/rate `by (...)` — M4-class; `streamByRefSliceHistogramFlatEmitDirect` for
+`histogram_over_time by (...)` — M8-class) walked the per-group step cells TWICE: a
+`hasAny` probe loop followed by a separate fill loop. For a high-cardinality group-by
+(M8: thousands of service-name groups × tens of boundaries × many timesteps) this is a
+redundant full scan of the dense `groupCountsFlat` grid. The histogram emitter additionally
+called `strings.Split(gk, "\x00")` once per group (allocating a fresh 1-element slice for
+every service on the single-dimension group-by that M4/M8 actually use) and re-resolved the
+loop-invariant group-by label NAMES via `intrinsicLabelName` once per emitted series.
+
+**Change:** Fold the probe+fill into one pass that defers the `values := make([]float64, numSteps)`
+allocation until the first non-zero cell — so empty (group[,boundary]) series cost neither an
+allocation nor a second scan. In the histogram emitter, hoist the group-by label names out of
+the series loop (`labelNames` computed once) and skip `strings.Split` entirely when
+`len(groupBy) == 1` (gk IS the sole dimension value; the `\x00` separator only appears in
+multi-dimension composite keys). In `emitFlatCountRateSeries`, precompute the rate divisor
+once (`rateScale`).
+
+**Correctness:** For single-dimension group-by, `strings.Split(gk, "\x00")` returned `[gk]`
+(values never contain the `\x00` separator — that is the invariant the composite key relies
+on), so reading `gk` directly is byte-identical. The rate `stepSec<=0` corner is preserved:
+`rateScale=0` still emits the series with zero values because the cell counts were non-zero
+(values is allocated on the first non-zero cell). Deferring the allocation cannot change which
+series are emitted — a series was emitted iff `hasAny` (≥1 non-zero cell), which is exactly the
+condition under which `values` is now non-nil. Verified by the executor suite (incl.
+`TestStreamByRefSliceHistogram_3D_DirectEmitEquivalence`, the multi-dimension path that
+exercises the retained `strings.Split` branch) and the benchmark parity suite.
+
+**Back-ref:** `internal/modules/executor/metrics_trace_intrinsic.go:emitFlatCountRateSeries`,
+`streamByRefSliceHistogramFlatEmitDirect`.
+
+## NOTE-438: Lazy `buckets` map on the direct-sink metrics paths (2026-06-17)
+**Context:** `executeTraceMetricsIntrinsic` allocated `buckets := make(map[string]*aggBucketState)`
+unconditionally, once per block per metrics query, before dispatching the accumulation. But the
+single-dimension count/rate path (M4/M6/M9 → `seriesSink`) and the N≤1 `histogram_over_time by (...)`
+path (M8 → `histSink`) never write that map: every accumulation core that receives a non-nil sink
+early-returns into the dense sink grid (`streamCountRateN1CompactCore` returns right after
+`emitFlatCountRateSeries`; `emitHistogramFlat` returns right after
+`streamByRefSliceHistogramFlatEmitDirect`) and the `intrinsicGetOrCreateBucket(buckets, …)` calls are
+only reached on the `seriesSink == nil` / `histSink == nil` branch. So on exactly the heavy 24h
+metrics queries — the ones that fan out over 1500+ blocks (one Reader/goroutine each) — the map was a
+pure live pointer-bearing GC object allocated and discarded per block. GC scan (`scanObject` +
+`findObject` + `tryDeferToSpanScan`) is ~4.5% self on the metrics CPU profile (2026-06-17), and live
+pointer-bearing maps are exactly what the scan walks.
+
+**Change:** Allocate `buckets` lazily: only when `seriesSink == nil && histSink == nil`. The paths that
+genuinely use the map (M1 `{} | rate()` no-group-by, the N>1 group-by histogram, and the default
+`accumulateIntrinsicBucketsViaKeyMap` fallback) all leave both sinks nil per `intrinsicDirectSeriesSinks`,
+so they still receive a real (non-nil) map and the nil-map write panic is structurally impossible.
+
+**Correctness:** The post-dispatch consumers are sink-gated: `seriesSink != nil` →
+`finalizeCountRateSeries(*seriesSink)`, `histSink != nil` → `finalizeCountRateSeries(*histSink)`, and
+only the remaining `case`s read `buckets` (HISTOGRAM N>1 → `traceHistogramSeries`, default →
+`traceBuildDenseSeries`) — all of which are unreachable when a sink is set. The lone other `buckets`
+read, `len(buckets) == 0` for the empty count/rate-no-group-by short-circuit, is on the sinks-nil
+branch (count/rate with `len(GroupBy)==0` never sets seriesSink), and `len(nil) == 0` is well-defined
+in Go regardless. No accumulation core writes `buckets` while a sink is active (verified by reading
+both sink-bearing cores). Verified by the executor suite + benchmark parity suite.
+
+**Back-ref:** `internal/modules/executor/metrics_trace_intrinsic.go:executeTraceMetricsIntrinsic`.
