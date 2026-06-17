@@ -2381,10 +2381,118 @@ func dictNumericInRange(valueBytes []byte, int64Val int64, isInt64 bool, lo, hi 
 	return true
 }
 
+// prepareIntrinsicNodes prunes a predicate node tree to the subset that the typed
+// intrinsic-row evaluator (rowSatisfiesIntrinsicNodesTyped) actually consults, classifying
+// every node's intrinsic relevance ONCE so the per-row loop never repeats the
+// traceIntrinsicColumns[n.Column] map probe.
+//
+// NOTE-435: rowSatisfiesIntrinsicNodesTyped is called once per CANDIDATE row on the
+// search/structural and predicate-filtered metrics paths (Q9 walks every span of every block
+// selected by either structural node — millions of rows). Its first action on every leaf was
+// a `traceIntrinsicColumns[n.Column]` map lookup, but the node set — and therefore each node's
+// intrinsic classification — is constant across all rows in the scan. mapaccess2_faststr was
+// ~4.2s of querier self-time on the 2026-06-16 CPU profile, ~0.38s of it attributed to
+// rowSatisfiesIntrinsicNodesTyped's per-row, per-node probe. Pruning the tree once removes
+// the probe from the row loop entirely.
+//
+// Pruning preserves the original semantics exactly:
+//   - AND context: a non-intrinsic leaf was `continue`d (it imposed no constraint on the
+//     typed row). Dropping it leaves the AND result unchanged.
+//   - OR context: a non-intrinsic leaf was `continue`d WITHOUT setting hadConstrainedChild and
+//     without short-circuiting. Dropping it changes neither the constrained-child accounting
+//     nor any match outcome.
+//   - A group node (Children != nil) whose subtree retains no intrinsic leaf collapses to
+//     nothing: an empty AND group passed trivially (returned true, contributing no constraint),
+//     and an empty OR group's hadConstrainedChild stayed false (returned true, contributing no
+//     constraint). Either way the parent treated it as unconstrained, identical to dropping it.
+//
+// The result is a fresh node tree whose every leaf is a known intrinsic column, evaluated by
+// the map-free rowSatisfiesPreparedIntrinsicNodes. Returns nil when nothing survives (the
+// caller then skips evaluation altogether). Run once per scan; never in the row loop.
+func prepareIntrinsicNodes(nodes []vm.RangeNode) []vm.RangeNode {
+	var out []vm.RangeNode
+	for i := range nodes {
+		n := nodes[i]
+		if n.Column != "" {
+			if _, isIntrinsic := traceIntrinsicColumns[n.Column]; !isIntrinsic {
+				continue // non-intrinsic leaf: no effect on the typed row in either context
+			}
+			out = append(out, n)
+			continue
+		}
+		// Group node: prune its children; drop the group if nothing intrinsic survives.
+		kept := prepareIntrinsicNodes(n.Children)
+		if len(kept) == 0 {
+			continue
+		}
+		g := n
+		g.Children = kept
+		out = append(out, g)
+	}
+	return out
+}
+
+// rowSatisfiesPreparedIntrinsicNodes is the map-free twin of rowSatisfiesIntrinsicNodesTyped:
+// it assumes the node tree was already pruned by prepareIntrinsicNodes so every leaf is a
+// known intrinsic column and every group retains at least one intrinsic leaf. NOTE-435.
+func rowSatisfiesPreparedIntrinsicNodes(nodes []vm.RangeNode, row *intrinsicRowFields) bool {
+	for i := range nodes {
+		n := nodes[i]
+		if n.Column != "" {
+			if !intrinsicLeafMatchTyped(n, row) {
+				return false
+			}
+			continue
+		}
+		if n.IsOR {
+			if !rowSatisfiesPreparedIntrinsicNodesOR(n.Children, row) {
+				return false
+			}
+		} else {
+			if !rowSatisfiesPreparedIntrinsicNodes(n.Children, row) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// rowSatisfiesPreparedIntrinsicNodesOR is the map-free OR twin. Because prepareIntrinsicNodes
+// guarantees every retained child is intrinsic-constrained (no node is dropped at evaluation
+// time), the hadConstrainedChild bookkeeping collapses: a pruned OR group always has at least
+// one constrained child, so an empty match simply returns false. NOTE-435.
+func rowSatisfiesPreparedIntrinsicNodesOR(nodes []vm.RangeNode, row *intrinsicRowFields) bool {
+	for i := range nodes {
+		n := nodes[i]
+		if n.Column != "" {
+			if intrinsicLeafMatchTyped(n, row) {
+				return true
+			}
+			continue
+		}
+		if n.IsOR {
+			if rowSatisfiesPreparedIntrinsicNodesOR(n.Children, row) {
+				return true
+			}
+		} else {
+			if rowSatisfiesPreparedIntrinsicNodes(n.Children, row) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // rowSatisfiesIntrinsicNodesTyped evaluates intrinsic-column leaf nodes from the predicate
-// tree against a typed intrinsicRowFields row (structural hot path).
-// Only leaf nodes whose Column is in traceIntrinsicColumns are checked; composite nodes
-// preserve AND/OR semantics. Returns true when the row satisfies all constraints.
+// tree against a typed intrinsicRowFields row. Only leaf nodes whose Column is in
+// traceIntrinsicColumns are checked; composite nodes preserve AND/OR semantics. Returns true
+// when the row satisfies all constraints.
+//
+// NOTE-435: on the per-row hot path this is superseded by the pre-pruned, map-free
+// rowSatisfiesPreparedIntrinsicNodes (prepareIntrinsicNodes hoists the per-node intrinsic
+// classification out of the row loop). This version retains the inline traceIntrinsicColumns
+// probe and is the equivalence oracle that TestPrepareIntrinsicNodes_EquivalentToOracle
+// validates the prepared path against.
 func rowSatisfiesIntrinsicNodesTyped(nodes []vm.RangeNode, row *intrinsicRowFields) bool {
 	for _, n := range nodes {
 		if n.Column != "" {

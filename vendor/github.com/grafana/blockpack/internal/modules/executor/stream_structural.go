@@ -716,7 +716,9 @@ func computeNodeMatchForRow(
 		predBits &^= mask
 		passes := true
 		if hasIntrinsic && len(nodesList) > i && len(nodesList[i]) > 0 {
-			passes = rowSatisfiesIntrinsicNodesTyped(nodesList[i], row)
+			// NOTE-435: nodesList[i] is pre-pruned to intrinsic leaves (prepareIntrinsicNodes),
+			// so the map-free evaluator is exact here.
+			passes = rowSatisfiesPreparedIntrinsicNodes(nodesList[i], row)
 		}
 		if passes {
 			nodeMatch |= mask
@@ -732,7 +734,10 @@ func collectStructuralIntrinsicNodes(programs []*vm.Program, want map[string]str
 	for i, prog := range programs {
 		if prog != nil && prog.Predicates != nil {
 			collectIntrinsicNodeColumns(prog.Predicates.Nodes, want)
-			nodesList[i] = prog.Predicates.Nodes
+			// NOTE-435: prune the node tree to its intrinsic leaves ONCE here so the per-row
+			// computeNodeMatchForRow loop (rowSatisfiesPreparedIntrinsicNodes) never repeats
+			// the traceIntrinsicColumns map probe per span of every block in the union.
+			nodesList[i] = prepareIntrinsicNodes(prog.Predicates.Nodes)
 		}
 	}
 	return nodesList

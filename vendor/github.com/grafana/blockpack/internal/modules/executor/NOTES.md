@@ -6660,3 +6660,37 @@ on the structural hot path.
 length/contents as before. Tests `go test -race ./internal/modules/executor/...` green.
 
 **Back-ref:** `internal/modules/executor/stream_structural.go:groupMatchingStructuralTraces`.
+
+## NOTE-435: Prune intrinsic-node tree once; map-free per-row predicate evaluation (2026-06-16)
+**Context:** `rowSatisfiesIntrinsicNodesTyped` runs once per CANDIDATE row on the
+search/structural and predicate-filtered metrics paths (Q9 walks every span of every block
+selected by EITHER structural node — millions of rows over the union). Its first action on every
+leaf was a `traceIntrinsicColumns[n.Column]` map probe to classify intrinsic vs non-intrinsic.
+But the predicate node set — and therefore each node's intrinsic classification — is constant
+across all rows in a scan. `mapaccess2_faststr` was ~4.2s of querier self-time on the 2026-06-16
+CPU profile; ~0.38s of it attributed to this per-row, per-node probe (the largest map-lookup
+consumer on the structural priority-#1 path).
+
+**Change:** `prepareIntrinsicNodes` prunes the node tree ONCE (before the row loop) to the subset
+the typed evaluator actually consults — only intrinsic-column leaves, and only group nodes that
+retain at least one intrinsic leaf. The pruned tree is fed to map-free twins
+`rowSatisfiesPreparedIntrinsicNodes` / `...OR`. Hoisted into `collectStructuralIntrinsicNodes`
+(structural `nodesList[i]`, consumed by `computeNodeMatchForRow`) and into
+`filterRowSetByIntrinsicNodes` (search/legacy filter), so the map probe leaves the row loop
+entirely.
+
+**Correctness:** Pruning is semantics-preserving. AND context: a non-intrinsic leaf was `continue`d
+(no constraint) — dropping it is identical. OR context: a non-intrinsic leaf was `continue`d
+WITHOUT setting `hadConstrainedChild` and without short-circuiting — dropping it changes neither the
+constrained-child accounting nor any outcome. A group that retains no intrinsic leaf collapses to
+"unconstrained" (empty AND returned true; empty OR's `hadConstrainedChild` stayed false → true),
+which the parent treated as unconstrained — identical to dropping the group. Because every retained
+OR child is constrained, the `hadConstrainedChild` bookkeeping collapses and the prepared OR simply
+returns false on no match. Verified by `TestPrepareIntrinsicNodes_EquivalentToOracle`, which asserts
+the prepared evaluator matches the original oracle byte-for-byte across AND/OR/nested/range/absent
+trees mixing intrinsic and non-intrinsic columns. The original `rowSatisfiesIntrinsicNodesTyped`
+/`...ORTyped` are retained as the test oracle.
+
+**Back-ref:** `internal/modules/executor/predicates.go:prepareIntrinsicNodes`,
+`stream_structural.go:collectStructuralIntrinsicNodes`/`computeNodeMatchForRow`,
+`stream.go:filterRowSetByIntrinsicNodes`.

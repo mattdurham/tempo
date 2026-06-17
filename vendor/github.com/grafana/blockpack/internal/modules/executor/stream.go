@@ -1769,11 +1769,18 @@ func filterRowSetByIntrinsicNodes(
 	}
 	// NOTE-349: fields is pooled scratch; release it after the filter loop fully consumes it.
 	defer putIntrinsicRowFields(fields)
+	// NOTE-435: prune the node tree to its intrinsic leaves ONCE so the per-row loop
+	// (rowSatisfiesPreparedIntrinsicNodes) skips the traceIntrinsicColumns map probe. want
+	// was non-empty above, so at least one intrinsic leaf survives.
+	prepared := prepareIntrinsicNodes(nodes)
+	if len(prepared) == 0 {
+		return rowSet
+	}
 	// Build filtered RowSet. Rows without intrinsic data for the wanted columns are
 	// treated as "absent" and fail the predicate (absent value != any predicate value).
 	filtered := newRowSetWithCap(len(rows))
 	for i, rowIdx := range rows {
-		if rowSatisfiesIntrinsicNodesTyped(nodes, &fields[i]) {
+		if rowSatisfiesPreparedIntrinsicNodes(prepared, &fields[i]) {
 			filtered.Add(rowIdx)
 		}
 	}
