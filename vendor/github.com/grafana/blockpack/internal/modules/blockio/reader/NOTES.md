@@ -3171,3 +3171,4 @@ copies only `inlineData`) remains safe — byte-for-byte identical metas, just s
 share one backing pointer. `BenchmarkParseColumnMetadataArray` (120-column schema): **121 allocs/op
 → 1 alloc/op** (the lone remaining alloc is the entries slice), 8696 B/op → 6784 B/op (~22% less).
 Production blocks carry hundreds of columns, multiplying the per-parse win.
+

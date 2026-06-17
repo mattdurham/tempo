@@ -265,7 +265,7 @@ func (r *Reader) PrefetchIntrinsicColumns(names []string) {
 			}
 		}
 		if useProcessCache {
-			if col := parsedIntrinsicCache.Get(r.fileID + "/intrinsic/" + name); col != nil {
+			if col := parsedIntrinsicCache.Get(r.intrinsicCacheKey(name)); col != nil {
 				if r.intrinsicDecoded == nil {
 					r.intrinsicDecoded = make(map[string]*shared.IntrinsicColumn)
 				}
@@ -297,7 +297,7 @@ func (r *Reader) PrefetchIntrinsicColumns(names []string) {
 
 		if useProcessCache {
 			// Best-effort process-cache population; ignore Put errors (e.g. size cap).
-			_ = parsedIntrinsicCache.Put(r.fileID+"/intrinsic/"+name, col)
+			_ = parsedIntrinsicCache.Put(r.intrinsicCacheKey(name), col)
 		}
 
 		r.intrinsicMu.Lock()
@@ -345,6 +345,20 @@ func (r *Reader) GetIntrinsicColumnLazyRefs(name string) (*shared.IntrinsicColum
 	return r.getIntrinsicColumn(name, false /* eagerRefs */)
 }
 
+// intrinsicCacheKey builds this Reader's parsedIntrinsicCache key for the named
+// intrinsic column: fileID + "/intrinsic/" + name. NOTE-431: the fileID-derived
+// prefix is invariant across every intrinsic column of one file, but the four
+// callsites (prefetch probe, prefetch store, lazy fetch probe, lazy fetch store)
+// each rebuilt the full two-segment concat (two allocs) per column. The prefix is
+// computed once at Reader construction (intrinsicKeyPrefix, set whenever fileID is
+// non-empty); this helper appends only the per-name suffix, halving the concat work
+// per intrinsic-column lookup. The assembled key is byte-identical to the prior
+// inline concat. intrinsicKeyPrefix is written only at construction (single
+// goroutine) and read-only thereafter, so no lock is required.
+func (r *Reader) intrinsicCacheKey(name string) string {
+	return r.intrinsicKeyPrefix + name
+}
+
 // getIntrinsicColumn fetches and decodes the named intrinsic column. When eagerRefs is true the
 // BlockRefs are materialized in the same page-decompression pass as the values (NOTE-390),
 // avoiding the second snappy pass that EnsureBlockRefs -> decodePagedColumnRefs would otherwise
@@ -389,7 +403,7 @@ func (r *Reader) getIntrinsicColumn(name string, eagerRefs bool) (*shared.Intrin
 	// persist until Clear) for decoded IntrinsicColumn values.
 	useProcessCache := r.fileID != ""
 	if useProcessCache {
-		procKey := r.fileID + "/intrinsic/" + name
+		procKey := r.intrinsicCacheKey(name)
 		if col := parsedIntrinsicCache.Get(procKey); col != nil {
 			r.intrinsicMu.Lock()
 			if r.intrinsicDecoded == nil {
@@ -428,7 +442,7 @@ func (r *Reader) getIntrinsicColumn(name string, eagerRefs bool) (*shared.Intrin
 	col.Name = name
 
 	if useProcessCache {
-		if err := parsedIntrinsicCache.Put(r.fileID+"/intrinsic/"+name, col); err != nil {
+		if err := parsedIntrinsicCache.Put(r.intrinsicCacheKey(name), col); err != nil {
 			return nil, fmt.Errorf("GetIntrinsicColumn %q: cache: %w", name, err)
 		}
 	}
