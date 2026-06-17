@@ -343,7 +343,15 @@ func groupMatchingStructuralTraces(flat []structuralSpanRec) [][]structuralSpanR
 	// to a flat int32 read, halving the per-record map probes (count pass keeps the one probe).
 	// recSlot costs 4 bytes/record — far cheaper than a 16-byte AES hash per record.
 	offsets := make([]int, nSlots+1)
-	recSlot := make([]int32, len(flat))
+	// NOTE-434: recSlot is a per-query len(flat)-sized int32 scratch (4 bytes/record over the
+	// WHOLE flat, including the non-matching records that dominate a low-match structural query
+	// like a deep >> chain). It is fully built then consumed by pass 3 before this call returns
+	// and nothing retains it, so draw it from compactInt32Pool instead of allocating (and
+	// memclr-zeroing then fully overwriting) a fresh array every query. acquireCompactInt32
+	// clears the prefix; the loop assigns every element (slot or -1), so the clear is redundant
+	// but harmless and the pool amortizes the allocation + its GC churn across query traffic.
+	recSlot := acquireCompactInt32(len(flat))
+	defer releaseCompactInt32(recSlot)
 	total := 0
 	for i := range flat {
 		if slot, ok := slotOf[flat[i].traceID]; ok {

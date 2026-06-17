@@ -6638,3 +6638,25 @@ surplus bits are never read. Tests `go test -race ./internal/modules/executor/..
 
 **Back-ref:** `internal/modules/executor/stream_structural.go:computeStructuralPredBits`,
 `computeNodeMatchForRow`, `collectBlockStructuralSpanRecs` row loop.
+
+## NOTE-434: Pool the structural-grouping recSlot scratch (drop a per-query len(flat) alloc)
+
+`groupMatchingStructuralTraces` (NOTE-387/NOTE-422) builds `recSlot []int32` of length `len(flat)`
+— the cached per-record dense slot used by pass 3 to scatter survivors without re-probing the
+`[16]byte` trace-ID map. `flat` carries one record per trace-ID-bearing span across the WHOLE union
+of selected blocks, so on a heavy structural query (a deep `>>`/`<<` chain over a large span
+population) recSlot is one of the largest per-query allocations on the structural path, and it was
+`make([]int32, len(flat))`'d fresh — memclr-zeroed then fully overwritten (every element is assigned
+a slot or -1) — on every query.
+
+**Change:** draw recSlot from the existing `compactInt32Pool` (`acquireCompactInt32` /
+`releaseCompactInt32`, NOTE-355/oversize-drop) and release it on return. It is built in pass 2 and
+fully consumed by pass 3 before the function returns; nothing retains it, so the pool reuse is
+sound. `acquireCompactInt32` clears the prefix — redundant here since the loop assigns every
+element, but harmless — and the pool amortizes the allocation and its GC churn across query traffic
+on the structural hot path.
+
+**Correctness:** Byte-identical grouping. recSlot is pointer-free, never escapes, and is the same
+length/contents as before. Tests `go test -race ./internal/modules/executor/...` green.
+
+**Back-ref:** `internal/modules/executor/stream_structural.go:groupMatchingStructuralTraces`.
