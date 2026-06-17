@@ -12,6 +12,7 @@
 package filecache
 
 import (
+	"container/heap"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -59,18 +60,18 @@ const (
 // Concurrent writes to different keys happen in parallel (OS-level).
 // Concurrent fetches for the same key are deduplicated via singleflight.
 type FileCache struct {
-	group     singleflight.Group // mutex (no ptr) then map ptr — starts pointer region
-	index     map[string]*entry  // key → entry
-	requests  *prometheus.CounterVec
-	bytes     *prometheus.CounterVec
-	evictions *prometheus.CounterVec
-	errs      *prometheus.CounterVec
-	// Pre-resolved histogram observers for 0-alloc hot path.
-	// Each is nil when Registerer is not configured.
+	// Pre-resolved histogram observers for 0-alloc hot path (nil when no Registerer).
 	durGetHit  prometheus.Observer
-	durGetMiss prometheus.Observer
 	durPutOk   prometheus.Observer
+	durGetMiss prometheus.Observer
+	group      singleflight.Group
+	requests   *prometheus.CounterVec
+	evictions  *prometheus.CounterVec
+	errs       *prometheus.CounterVec
+	bytes      *prometheus.CounterVec
+	index      map[string]*entry // key → entry
 	dir        string
+	evict      evictHeap // min-heap of *entry by order; oldest = next FIFO victim (NOTE-439)
 	maxBytes   int64
 	curBytes   int64
 	seq        uint64 // monotonic insertion counter for FIFO ordering
@@ -255,14 +256,21 @@ func (c *FileCache) load() error {
 			continue
 		}
 		c.seq++
-		c.index[cand.key] = &entry{
+		e := &entry{
 			filename: cand.path,
 			key:      cand.key,
 			order:    c.seq,
 			size:     cand.size,
 		}
+		c.index[cand.key] = e
+		c.evict = append(c.evict, e) // built in ascending-order, already heap-valid
 		c.curBytes += cand.size
 	}
+	// candidates were sorted ascending by (mtime, filename), so c.seq — and thus
+	// entry.order — is assigned in ascending order; the slice is already a valid
+	// min-heap (parent.order ≤ child.order). No heap.Init needed, but it is cheap
+	// insurance against future changes to the load ordering.
+	heap.Init(&c.evict)
 	return nil
 }
 
@@ -391,7 +399,9 @@ func (c *FileCache) Put(key string, value []byte) error {
 	}
 
 	c.seq++
-	c.index[key] = &entry{filename: filename, key: key, size: needed, order: c.seq}
+	e := &entry{filename: filename, key: key, size: needed, order: c.seq}
+	c.index[key] = e
+	heap.Push(&c.evict, e)
 	c.curBytes += needed
 	if c.durPutOk != nil {
 		c.durPutOk.Observe(time.Since(start).Seconds())
@@ -415,36 +425,25 @@ func (c *FileCache) evictLocked(needed int64) {
 		target = 0 // entire cache must be cleared for a very large entry
 	}
 
-	// Collect entries sorted by insertion order (FIFO = lowest seq first).
-	type candidate struct {
-		e     *entry
-		key   string
-		order uint64
-	}
-	candidates := make([]candidate, 0, len(c.index))
-	for k, e := range c.index {
-		candidates = append(candidates, candidate{e, k, e.order})
-	}
-	// Insertion sort (ascending). Cache typically has hundreds of entries; fine.
-	for i := 1; i < len(candidates); i++ {
-		for j := i; j > 0 && candidates[j].order < candidates[j-1].order; j-- {
-			candidates[j], candidates[j-1] = candidates[j-1], candidates[j]
+	// Pop oldest-first from the FIFO min-heap (NOTE-439). This is O(k·log N) for k
+	// victims instead of re-sorting all N entries on every Put. Stale heap entries
+	// — superseded by a re-insert or removed by a Get ErrNotExist cleanup — are
+	// tolerated via lazy deletion: an entry whose live index slot no longer points
+	// to the same *entry is simply dropped without touching disk or curBytes.
+	//
+	// Files are removed and the index updated while holding the lock: releasing it
+	// during os.Remove would race a concurrent Put for an evicted key that could
+	// re-create the file at the same deterministic path, which the deferred
+	// os.Remove would then silently delete. Cache files are small (~KB to ~MB), so
+	// the lock hold time is acceptable.
+	for c.curBytes > target && c.evict.Len() > 0 {
+		e := heap.Pop(&c.evict).(*entry)
+		if cur, ok := c.index[e.key]; !ok || cur != e {
+			continue // stale heap entry — already evicted/superseded
 		}
-	}
-
-	// Remove files and update index while holding the lock.
-	// Releasing the lock during os.Remove creates a race: a concurrent Put
-	// for an evicted key could re-create the file at the same deterministic
-	// path, which the deferred os.Remove would then silently delete, leaving
-	// the new index entry pointing to a nonexistent file.
-	// Cache files are small (~KB to ~MB); the lock hold time is acceptable.
-	for _, cand := range candidates {
-		if c.curBytes <= target {
-			break
-		}
-		_ = os.Remove(cand.e.filename)
-		delete(c.index, cand.key)
-		c.curBytes -= cand.e.size
+		_ = os.Remove(e.filename)
+		delete(c.index, e.key)
+		c.curBytes -= e.size
 		if c.evictions != nil {
 			c.evictions.WithLabelValues("disk").Inc()
 		}
