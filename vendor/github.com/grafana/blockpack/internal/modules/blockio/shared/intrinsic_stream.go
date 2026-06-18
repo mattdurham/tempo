@@ -43,6 +43,21 @@ type DecodedPage struct {
 	RowBase      uint32
 }
 
+// PageStats carries a single page's pruning statistics, presented to a ScanPagedColumnBlobWithStats
+// prefilter BEFORE the page's values are decoded. Min/Max are the page's value range (valid only
+// when HasMinMax — encodeDeltaUint64Intrinsic/Flat write 8-byte LE Min/Max, the Min/Max page-skip
+// the scan path already uses). RowCount is the number of rows in the page; RowBase is the column
+// position of the page's first row. A prefilter that can fully account for the page from these
+// stats alone (e.g. count all RowCount rows into one time bucket, or skip a page entirely outside
+// the query window) returns true to SKIP the per-value decode for that page (NOTE-444, issue #363).
+type PageStats struct {
+	Min       uint64
+	Max       uint64
+	RowCount  uint32
+	RowBase   uint32
+	HasMinMax bool
+}
+
 // IsStreamablePagedColumnBlob reports whether blob is a v2 paged column in a value-decoupled
 // format (Flat/XOR/Delta) that ScanPagedColumnBlob can stream. Dict columns and legacy v1
 // blobs return false — the caller must fall back to the eager DecodeIntrinsicColumnBlob path
@@ -149,6 +164,126 @@ func ScanPagedColumnBlob(blob []byte, visit func(*DecodedPage) error) error {
 		}
 		if err != nil {
 			return fmt.Errorf("ScanPagedColumnBlob: page %d: %w", i, err)
+		}
+
+		page.Uint64Values = scratch.Uint64Values
+		page.BytesValues = scratch.BytesValues
+		page.BlockRefs = scratch.BlockRefs
+		page.RowBase = rowBase
+
+		if vErr := visit(page); vErr != nil {
+			return vErr
+		}
+		rowBase += uint32(rowCount) //nolint:gosec // row count per page << 4 GiB
+	}
+	return nil
+}
+
+// ScanPagedColumnBlobWithStats is ScanPagedColumnBlob plus a page-level pruning prefilter (NOTE-444,
+// issue #363). Before decoding a page's values, it presents that page's PageStats (Min/Max/RowCount/
+// RowBase) to prefilter. When prefilter returns true the page is fully accounted for from its stats
+// alone and the per-value decode (appendFlatPageOpt / appendXORBytesPageOpt / appendDeltaUint64PageOpt
+// — the latter the 14.5%-of-querier-CPU self-time frame on the span:start rate hot path) is SKIPPED;
+// visit is NOT called for that page. When prefilter returns false the page is decoded and handed to
+// visit exactly as ScanPagedColumnBlob does.
+//
+// Unlike ScanPagedColumnBlob, this decodes the stats TOC (DecodePageTOC) so each page's Min/Max are
+// available to the prefilter; that costs a per-page Min/Max string materialization (NOTE-274), paid
+// only on this stats path — the plain ScanPagedColumnBlob stays on the no-stats TOC. The win is that
+// for time-ordered columns whose page time span ≤ the query step (the common span:start rate case),
+// most pages are pruned/bulk-counted by the prefilter and never decode a single value.
+//
+// prefilter may be nil, in which case every page is decoded and visited (equivalent to
+// ScanPagedColumnBlob). The DecodedPage validity contract is identical to ScanPagedColumnBlob: it and
+// its slices are valid only for the duration of a single visit call.
+func ScanPagedColumnBlobWithStats(
+	blob []byte,
+	prefilter func(*PageStats) bool,
+	visit func(*DecodedPage) error,
+) error {
+	if len(blob) < 5 || blob[0] != IntrinsicPagedVersion {
+		return fmt.Errorf("ScanPagedColumnBlobWithStats: not a v2 paged column blob")
+	}
+	pos := 1
+	tocLen := int(binary.LittleEndian.Uint32(blob[pos:]))
+	pos += 4
+	if pos+tocLen > len(blob) {
+		return fmt.Errorf("ScanPagedColumnBlobWithStats: truncated at toc_blob")
+	}
+	toc, err := DecodePageTOC(blob[pos : pos+tocLen]) // stats TOC: per-page Min/Max for the prefilter
+	if err != nil {
+		return fmt.Errorf("ScanPagedColumnBlobWithStats: %w", err)
+	}
+	pos += tocLen // pos now points to first page blob
+
+	if !isParallelPageDecodeFormat(toc.Format) {
+		return fmt.Errorf(
+			"ScanPagedColumnBlobWithStats: format %d is not streamable (Dict/legacy not supported)",
+			toc.Format,
+		)
+	}
+
+	blockW := int(toc.BlockIdxWidth)
+	rowW := int(toc.RowIdxWidth)
+
+	scratch := &IntrinsicColumn{Type: toc.ColType, Format: toc.Format}
+	page := &DecodedPage{Type: toc.ColType, Format: toc.Format}
+	stats := &PageStats{}
+
+	pageBuf := AcquireIntrinsicBuf()
+	defer ReleaseIntrinsicBuf(pageBuf)
+
+	var rowBase uint32
+	for i, pm := range toc.Pages {
+		rowCount := int(pm.RowCount)
+
+		// Present this page's pruning stats before any value decode. A prefilter that fully
+		// accounts for the page (skip / bulk-count) returns true and we never decode its values.
+		if prefilter != nil {
+			stats.RowCount = pm.RowCount
+			stats.RowBase = rowBase
+			if len(pm.Min) == 8 && len(pm.Max) == 8 {
+				stats.Min = leUint64FromString(pm.Min) // NOTE-274: avoid []byte(...) copy
+				stats.Max = leUint64FromString(pm.Max)
+				stats.HasMinMax = true
+			} else {
+				stats.Min, stats.Max, stats.HasMinMax = 0, 0, false
+			}
+			if prefilter(stats) {
+				rowBase += uint32(rowCount) //nolint:gosec // row count per page << 4 GiB
+				continue
+			}
+		}
+
+		pageStart := pos + int(pm.Offset)
+		pageEnd := pageStart + int(pm.Length)
+		if pageEnd > len(blob) {
+			return fmt.Errorf("ScanPagedColumnBlobWithStats: page %d out of bounds (offset=%d len=%d blobLen=%d)",
+				i, pm.Offset, pm.Length, len(blob))
+		}
+		pageCompressed := blob[pageStart:pageEnd]
+		pageRaw, decErr := snappyDecodeReuse(pageBuf, pageCompressed) // NOTE-262
+		if decErr != nil {
+			return fmt.Errorf("ScanPagedColumnBlobWithStats: page %d snappy: %w", i, decErr)
+		}
+
+		scratch.Uint64Values = scratch.Uint64Values[:0]
+		scratch.BytesValues = scratch.BytesValues[:0]
+		scratch.BlockRefs = scratch.BlockRefs[:0]
+		scratch.Count = 0
+
+		switch toc.Format {
+		case IntrinsicFormatFlat:
+			err = appendFlatPageOpt(pageRaw, blockW, rowW, rowCount, toc.ColType, scratch, true)
+		case IntrinsicFormatXORBytes:
+			err = appendXORBytesPageOpt(pageRaw, blockW, rowW, rowCount, scratch, true)
+		case IntrinsicFormatDeltaUint64:
+			err = appendDeltaUint64PageOpt(pageRaw, blockW, rowW, rowCount, scratch, true)
+		default:
+			return fmt.Errorf("ScanPagedColumnBlobWithStats: page %d: unknown format %d", i, toc.Format)
+		}
+		if err != nil {
+			return fmt.Errorf("ScanPagedColumnBlobWithStats: page %d: %w", i, err)
 		}
 
 		page.Uint64Values = scratch.Uint64Values

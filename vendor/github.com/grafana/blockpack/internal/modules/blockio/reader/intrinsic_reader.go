@@ -163,6 +163,46 @@ func (r *Reader) ScanIntrinsicColumn(name string, visit func(*shared.DecodedPage
 	return true, nil
 }
 
+// ScanIntrinsicColumnWithStats is ScanIntrinsicColumn plus a page-level pruning prefilter
+// (NOTE-444, issue #363). Before a page's values are decoded, the page's PageStats
+// (Min/Max/RowCount/RowBase) are presented to prefilter; if prefilter returns true the page is
+// fully accounted for from its stats alone and the per-value decode is SKIPPED (visit is not
+// called for it). This lets a consumer over a time-ordered column (e.g. span:start) skip pages
+// outside the query window and bulk-count pages that fall entirely within one step bucket — the
+// dominant case for rate/count queries whose step ≥ a page's time span — without decoding any
+// values for those pages.
+//
+// Same fall-back contract as ScanIntrinsicColumn: returns (false, nil) when the column is absent
+// or a non-streamable Dict/legacy blob, so the caller falls back to the eager GetIntrinsicColumn
+// path. The DecodedPage and PageStats are valid only for the duration of each call.
+func (r *Reader) ScanIntrinsicColumnWithStats(
+	name string,
+	prefilter func(*shared.PageStats) bool,
+	visit func(*shared.DecodedPage) error,
+) (streamed bool, err error) {
+	if r.intrinsicIndex == nil {
+		return false, nil
+	}
+	meta, ok := r.intrinsicIndex[name]
+	if !ok {
+		return false, nil
+	}
+	blob, err := r.cache.GetOrFetchIntrinsic(r.fileID, name, func() ([]byte, error) {
+		return r.readRange(meta.Offset, uint64(meta.Length), rw.DataTypeMetadata)
+	})
+	if err != nil {
+		return false, fmt.Errorf("ScanIntrinsicColumnWithStats %q: read: %w", name, err)
+	}
+	if !shared.IsStreamablePagedColumnBlob(blob) {
+		// Dict / legacy v1 blob — not streamable; caller falls back to eager decode.
+		return false, nil
+	}
+	if err := shared.ScanPagedColumnBlobWithStats(blob, prefilter, visit); err != nil {
+		return true, fmt.Errorf("ScanIntrinsicColumnWithStats %q: %w", name, err)
+	}
+	return true, nil
+}
+
 // ScanDictGroupByColumn fetches the named intrinsic column's blob (from cache or disk) and, if
 // it is a v2 paged Dict column, streams it ONE PAGE AT A TIME, invoking visit once per
 // value-record per page with the raw (undecoded) ref run for that occurrence (NOTE-407, issue

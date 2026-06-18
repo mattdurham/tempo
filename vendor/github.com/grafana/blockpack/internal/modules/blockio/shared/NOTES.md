@@ -2447,3 +2447,52 @@ left on `make([]byte, ...)` — it is not on the hot paged-decode path.
 
 Back-ref: `internal/modules/blockio/shared/intrinsic_codec.go` (appendFlatPageOpt,
 appendXORBytesPageOpt); `internal/modules/blockio/shared/unzeroed_alloc.go` (MakeNoZeroBytes).
+
+## NOTE-444: page-level time-bucket pruning for span:start rate/count (issue #363)
+
+`ScanPagedColumnBlobWithStats(blob, prefilter, visit)` (intrinsic_stream.go) extends the NOTE-406
+streaming scan with a per-page pruning prefilter. Before a page's values are decoded, it presents
+the page's `PageStats` (Min/Max/RowCount/RowBase) to `prefilter`; when `prefilter` returns true the
+page is fully accounted for from its stats alone and the per-value decode (the
+`appendDeltaUint64PageOpt` self-time frame — **14.5% of querier CPU** on the span:start rate hot
+path) is SKIPPED — `visit` is never called for that page. `prefilter==nil` decodes every page
+(equivalent to `ScanPagedColumnBlob`).
+
+**TOC choice / cost trade-off:** unlike the plain `ScanPagedColumnBlob` (no-stats TOC, NOTE-274),
+this decodes the *stats* TOC (`DecodePageTOC`) so each page's 8-byte LE Min/Max is available to the
+prefilter. That per-page Min/Max string materialization is paid only on this stats path — the plain
+stream stays on the cheaper no-stats TOC. The win dwarfs that cost: for a time-ordered span:start
+whose per-page time span ≤ the query step, most pages are pruned or bulk-counted and never decode a
+single value.
+
+**Consumer — `streamCountRateNoGroupByPaged`** (executor/metrics_trace_intrinsic.go, the M1
+`{} | rate()` / `count_over_time()` path) classifies each `span:start` page from its [Min,Max]
+against the query window `(StartTime,EndTime]` and step:
+  - **Case 1 (skip):** `Max ≤ StartTime || Min > EndTime` — page entirely outside the window; no
+    in-window value, skip decode.
+  - **Case 2 (bulk-count):** `Min > StartTime && Max ≤ EndTime` and `timeBucketIndex(Min) ==
+    timeBucketIndex(Max)` — the page is entirely inside the window and within ONE step bucket, so
+    add `RowCount` to that bucket directly; no value decode.
+  - **Case 3 (decode):** straddles the window edge or multiple buckets (or no Min/Max) — decode per
+    value, byte-identical to the previous all-values loop.
+
+**Correctness:** Cases 1/2 are exact because `span:start` is a paged Delta column sorted ascending
+(types.go) and `timeBucketIndex` is monotone in ts — Min/Max bound every value in the page, so a
+page whose [Min,Max] is inside one bucket has ALL its values in that bucket, and a page entirely
+outside the window contributes nothing. Per-bucket counts are identical to decoding every value.
+The eager `streamCountRateNoGroupBySorted` reference is unchanged; the predicate-filtered /
+group-by shapes still take their existing paths (this fires only for the unfiltered N=0 count/rate
+shape). Extends the existing `scanDeltaUint64PagedBlob` Min/Max page-skip (NOTE-017) from the
+predicate scan path to the metrics accumulation path.
+
+**Tests:** `shared/intrinsic_stream_test.go` pins the prefilter sees every page's correct
+Min/Max/RowCount/RowBase in order over a real 4-page Delta blob, that returning true skips that
+page's value decode (visit not called), that the let-through pages decode byte-identically, that a
+nil prefilter matches the plain stream, and non-streamable rejection. `executor/
+intrinsic_countrate_stream_test.go` (EX-ETM-444-01) pins the page-pruned streamed per-bucket counts
+equal the eager reference over a window strictly inside the column with a step spanning whole pages.
+
+Back-ref: `internal/modules/blockio/shared/intrinsic_stream.go` (PageStats,
+ScanPagedColumnBlobWithStats); `internal/modules/blockio/reader/intrinsic_reader.go`
+(Reader.ScanIntrinsicColumnWithStats); `internal/modules/executor/metrics_trace_intrinsic.go`
+(streamCountRateNoGroupByPaged prefilter).

@@ -3283,6 +3283,13 @@ func tryStreamCountRateNoGroupBy(
 // inline — the O(column) []uint64 is never allocated; transient allocation is O(one page),
 // reused across pages (NOTE-406 pattern).
 //
+// NOTE-444 (issue #363) layers page-level time-bucket pruning on top: via
+// ScanIntrinsicColumnWithStats, each page's [Min,Max] is checked before decode. Pages entirely
+// outside the query window are skipped, and pages entirely within one step bucket are bulk-counted
+// by RowCount — neither decodes a single value. For a time-ordered span:start whose per-page time
+// span ≤ the query step (the common rate/count case), this eliminates the per-value decode
+// (appendDeltaUint64PageOpt, the 14.5%-of-querier-CPU self-time frame) on the vast majority of pages.
+//
 // span:start is a paged Delta column sorted ascending (types.go), so a span's time bucket is
 // timeBucketIndex(ts) and every in-window value lands in [0,numSteps). Values outside the
 // query window (ts ≤ StartTime or ts > EndTime) are skipped per-value, reproducing the lo/hi
@@ -3312,26 +3319,67 @@ func streamCountRateNoGroupByPaged(
 	// allocation or hash lookup in the hot loop — emitted to the string-keyed map once at the end.
 	counts := make([]int64, numSteps)
 	spanCount := 0
-	streamed, err = r.ScanIntrinsicColumn(colNameSpanStart, func(p *modules_shared.DecodedPage) error {
-		for _, u := range p.Uint64Values {
-			if spanCount&ctxCheckMask == 0 {
-				if cerr := ctx.Err(); cerr != nil {
-					return cerr
-				}
-			}
-			spanCount++
-			ts := int64(u) //nolint:gosec
-			// Skip values outside the query window — reproduces the eager lo/hi narrowing.
-			if ts <= tb.StartTime || ts > tb.EndTime {
-				continue
-			}
-			bk := timeBucketIndex(ts, tb.StartTime, tb.StepSizeNanos)
-			if bk >= 0 && bk < numSteps {
-				counts[bk]++
+
+	// NOTE-444 (issue #363): page-level time-bucket pruning. span:start is a paged Delta column
+	// sorted ascending, and each page carries [Min,Max] (8-byte LE). Before decoding a page's
+	// values, classify it from its Min/Max:
+	//   Case 1 (skip): the page is entirely outside the query window (StartTime,EndTime] — every
+	//     value would be filtered out anyway, so skip the value decode entirely.
+	//   Case 2 (bulk count): the page is entirely inside the window AND Min/Max share one step
+	//     bucket — every one of its RowCount values lands in that single bucket, so add RowCount
+	//     to it without decoding any value.
+	// Both return true to skip appendDeltaUint64PageOpt (the 14.5%-of-querier-CPU self-time frame)
+	// for that page. For a time-ordered span:start whose per-page time span ≤ the query step
+	// (the common rate/count case), most pages hit Case 1 or 2 and never decode a single value.
+	// Case 3 (mixed/boundary-straddling pages, or pages with no Min/Max) returns false → per-value
+	// decode below, byte-identical to the previous all-values-decoded loop.
+	prefilter := func(ps *modules_shared.PageStats) bool {
+		if !ps.HasMinMax {
+			return false
+		}
+		start := uint64(tb.StartTime) //nolint:gosec
+		end := uint64(tb.EndTime)     //nolint:gosec
+		// Case 1: entirely outside (StartTime,EndTime] — no in-window value.
+		if ps.Max <= start || ps.Min > end {
+			return true
+		}
+		// Case 2: entirely inside the window and within one step bucket.
+		if ps.Min > start && ps.Max <= end {
+			bkMin := timeBucketIndex(int64(ps.Min), tb.StartTime, tb.StepSizeNanos) //nolint:gosec
+			bkMax := timeBucketIndex(int64(ps.Max), tb.StartTime, tb.StepSizeNanos) //nolint:gosec
+			if bkMin == bkMax && bkMin >= 0 && bkMin < numSteps {
+				counts[bkMin] += int64(ps.RowCount)
+				return true
 			}
 		}
-		return nil
-	})
+		// Case 3: straddles the window edge or multiple buckets — decode per value.
+		return false
+	}
+
+	streamed, err = r.ScanIntrinsicColumnWithStats(
+		colNameSpanStart,
+		prefilter,
+		func(p *modules_shared.DecodedPage) error {
+			for _, u := range p.Uint64Values {
+				if spanCount&ctxCheckMask == 0 {
+					if cerr := ctx.Err(); cerr != nil {
+						return cerr
+					}
+				}
+				spanCount++
+				ts := int64(u) //nolint:gosec
+				// Skip values outside the query window — reproduces the eager lo/hi narrowing.
+				if ts <= tb.StartTime || ts > tb.EndTime {
+					continue
+				}
+				bk := timeBucketIndex(ts, tb.StartTime, tb.StepSizeNanos)
+				if bk >= 0 && bk < numSteps {
+					counts[bk]++
+				}
+			}
+			return nil
+		},
+	)
 	if err != nil {
 		return streamed, err
 	}
