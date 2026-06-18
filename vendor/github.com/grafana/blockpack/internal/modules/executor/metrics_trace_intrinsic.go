@@ -1037,6 +1037,82 @@ func resolveDictGroupKeys(
 	}
 }
 
+// resolveGroupByDict runs the shared three-level group-by scan cascade used by all three
+// compact N=1 cores (count/rate, agg, histogram): try the streaming Flat/XOR/Delta scan
+// (decode-time push-down, no O(column) materialization), then the streaming Dict scan (no
+// O(rows) BlockRefs arena), then the eager GetIntrinsicColumn + scanGroupByColCompact fallback
+// for non-streamable Dict/legacy columns. On entry *dict must be ["", ...] and dictIdxByPos
+// pooled and sized to len(sortedPKs); on return both are populated. rankIdx is the prebuilt
+// POPCNT rank index over sortedPKs (NOTE-348) — the count/rate path passes a non-nil index;
+// agg/histogram pass nil (built internally). The returned groupByCol is non-nil only on the
+// eager Dict fallback path and is consumed afterwards by resolveDictGroupKeys (a no-op for
+// nil / Flat-streamed columns).
+//
+// NOTE-359: extracted to unify the three byte-for-byte-identical scan cascades.
+func resolveGroupByDict(
+	r *modules_reader.Reader,
+	colName string,
+	sortedPKs []uint32,
+	dict *[]string,
+	dictIdxByPos []uint32,
+	rankIdx *pkRankIndex,
+) (groupByCol *modules_shared.IntrinsicColumn, err error) {
+	// NOTE-406 (issue #348): try the streaming (decode-time push-down) Flat/XOR/Delta scan
+	// first — it folds the column into dict + dictIdxByPos one page at a time without
+	// materializing the O(column) value/ref arrays.
+	streamed, err := streamGroupByColCompactFlat(r, colName, sortedPKs, dict, dictIdxByPos, rankIdx)
+	if err != nil {
+		return nil, err
+	}
+	if !streamed {
+		// NOTE-407 (issue #356): stream the Dict group-by column page-by-page, scattering each
+		// ref's group index straight out of the raw ref bytes (no O(rows) BlockRefs arena).
+		// groupByCol stays nil, so resolveDictGroupKeys is a no-op (the scan already populated dict).
+		streamed, err = scanGroupByColCompactDictStreaming(r, colName, sortedPKs, rankIdx, dict, dictIdxByPos)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if !streamed {
+		groupByCol, err = r.GetIntrinsicColumn(colName)
+		if err != nil {
+			return nil, err
+		}
+		if groupByCol != nil {
+			scanGroupByColCompact(groupByCol, colName, sortedPKs, dict, dictIdxByPos, rankIdx)
+		}
+	}
+	return groupByCol, nil
+}
+
+// applyCountRateAbsentRowPass credits in-range spans that carried no group-by value to the
+// empty-string group (slot 0) of groupCountsFlat (NOTE-091). When totalSeen < inRangeCount,
+// for each step bk it subtracts the present (non-zero-group) count from stepCounts[bk] — the
+// per-step in-range span count built from tsCol — and credits the remainder to slot 0. This
+// computes absent counts in O(numSteps×numGroups) instead of an O(maxPK) scan of seenByPK.
+// groupCountsFlat is laid out as groupCountsFlat[gIdx*numSteps+bk].
+//
+// NOTE-359: extracted to unify the identical absent-row pass in accumulateCountRateDirect and
+// accumulateCountRateDirectStreaming.
+func applyCountRateAbsentRowPass(
+	groupCountsFlat, stepCounts []int64,
+	numGroups, numSteps, totalSeen, inRangeCount int64,
+) {
+	if totalSeen >= inRangeCount {
+		return
+	}
+	for bk := range numSteps {
+		presentAtBk := int64(0)
+		for gIdx := int64(1); gIdx < numGroups; gIdx++ {
+			presentAtBk += groupCountsFlat[gIdx*numSteps+bk]
+		}
+		absentAtBk := stepCounts[bk] - presentAtBk //nolint:gosec // G602: callers pass len(stepCounts) >= numSteps (one entry per step)
+		if absentAtBk > 0 {
+			groupCountsFlat[bk] += absentAtBk
+		}
+	}
+}
+
 // groupHasNonZero reports whether group gIdx has any non-zero count across its numSteps
 // cells in a groupCountsFlat array laid out as groupCountsFlat[gIdx*numSteps+bk] (NOTE-401).
 func groupHasNonZero(groupCountsFlat []int64, gIdx, numSteps int64) bool {
@@ -1061,6 +1137,36 @@ func groupHasNonZero(groupCountsFlat []int64, gIdx, numSteps int64) bool {
 // at emit time and drops the group if it is empty. This is byte-identical at emit because
 // the legacy path skipped empty-value entries entirely (so they never produced a group);
 // the lazy emit-time drop produces the same set of emitted groups.
+// scatterDictRef is the inner Dict scatter body shared by scanGroupByColCompactDictSerial and
+// the parallel worker in scanGroupByColCompactDictParallel: it gates ref by the [minPK,maxPK]
+// packKey range and the in-range pkBitset, computes its O(1) POPCNT rank, and scatters dictIdx
+// into dictIdxByPos at that rank. pkBitset MUST be non-empty — every Dict scatter caller goes
+// through scanGroupByColCompact, which returns early on len(sortedPKs)==0 and otherwise always
+// has a built bitset, so the pre-NOTE-359 serial `len(pkBitset)>0` guard was dead (it matched
+// the parallel path, which already had no guard).
+//
+// NOTE-359: extracted from the two byte-identical scatter loops. 5 statements, no allocation —
+// inlines cleanly (verified via go build -gcflags=-m before commit).
+func scatterDictRef(
+	ref modules_shared.BlockRef,
+	dictIdx, minPK, maxPK uint32,
+	pkBitset []uint64,
+	rankPrefix, dictIdxByPos []uint32,
+) {
+	pk := packKey(ref.BlockIdx, ref.RowIdx)
+	if pk < minPK || pk > maxPK {
+		return
+	}
+	word := pk >> 6
+	bit := pk & 63
+	if pkBitset[word]&(uint64(1)<<bit) == 0 {
+		return // NOTE-135/140: fast pre-filter: pk not in sortedPKs
+	}
+	// NOTE-140: O(1) rank replaces O(log n) searchSortedUint32.
+	r := rankPrefix[word] + uint32(bits.OnesCount64(pkBitset[word]&((uint64(1)<<bit)-1))) //nolint:gosec
+	dictIdxByPos[int(r)] = dictIdx
+}
+
 func scanGroupByColCompactDictSerial(
 	col *modules_shared.IntrinsicColumn,
 	minPK, maxPK uint32,
@@ -1082,18 +1188,7 @@ func scanGroupByColCompactDictSerial(
 		}
 		dictIdx := uint32(e + 1) //nolint:gosec // entryIdx+1, bounded by numEntries
 		for _, ref := range entry.BlockRefs {
-			pk := packKey(ref.BlockIdx, ref.RowIdx)
-			if pk < minPK || pk > maxPK {
-				continue
-			}
-			word := pk >> 6
-			bit := pk & 63
-			if len(pkBitset) > 0 && pkBitset[word]&(uint64(1)<<bit) == 0 {
-				continue // NOTE-135/140: fast pre-filter: pk not in sortedPKs
-			}
-			// NOTE-140: O(1) rank replaces O(log n) searchSortedUint32.
-			r := rankPrefix[word] + uint32(bits.OnesCount64(pkBitset[word]&((uint64(1)<<bit)-1))) //nolint:gosec
-			dictIdxByPos[int(r)] = dictIdx
+			scatterDictRef(ref, dictIdx, minPK, maxPK, pkBitset, rankPrefix, dictIdxByPos)
 		}
 	}
 }
@@ -1401,19 +1496,7 @@ func scanGroupByColCompactDictParallel(
 				}
 				dictIdx := uint32(e + 1) //nolint:gosec // entryIdx+1, bounded by numEntries
 				for _, ref := range entry.BlockRefs {
-					pk := packKey(ref.BlockIdx, ref.RowIdx)
-					if pk < minPK || pk > maxPK {
-						continue
-					}
-					word := pk >> 6
-					bit := pk & 63
-					if pkBitset[word]&(uint64(1)<<bit) == 0 {
-						continue
-					}
-					// NOTE-140: O(1) rank replaces O(log n) searchSortedUint32.
-					lowerBits := bits.OnesCount64(pkBitset[word] & ((uint64(1) << bit) - 1))
-					rank := rankPrefix[word] + uint32(lowerBits) //nolint:gosec
-					dictIdxByPos[int(rank)] = dictIdx
+					scatterDictRef(ref, dictIdx, minPK, maxPK, pkBitset, rankPrefix, dictIdxByPos)
 				}
 			}
 		}(prev, end)
@@ -1991,6 +2074,34 @@ func fillPKSetAndTimeBucketsFromPreSortedRefs(
 	}
 }
 
+// unpackPreSortedRefs is the shared preamble for the three compact *FromRefs wrappers
+// (count/rate, agg, histogram). refs is already packKey-sorted by
+// mergeJoinFilteredRefsWithVals, so this builds sortedPKs and timeBucketByPos in a single
+// O(n) pass without allocating pkOrder or sorting (NOTE-114). The returned slices are pooled
+// (NOTE-125) and MUST be released by the caller via the returned release func, e.g.
+// `defer release()`. When numSteps <= 0 or refs is empty, ok is false, the slices are nil,
+// and release is a no-op — the caller should return early.
+//
+// NOTE-359: extracted to unify the byte-for-byte-identical preambles across the three wrappers.
+func unpackPreSortedRefs(
+	refs []modules_shared.BlockRef,
+	vals []uint64,
+	tb *vm.TimeBucketSpec,
+) (sortedPKs []uint32, timeBucketByPos []int32, numSteps int64, ok bool, release func()) {
+	numSteps = (tb.EndTime - tb.StartTime + tb.StepSizeNanos - 1) / tb.StepSizeNanos
+	if numSteps <= 0 || len(refs) == 0 {
+		return nil, nil, numSteps, false, func() {}
+	}
+	n := len(refs)
+	sortedPKs = acquireCompactUint32NoClear(n)
+	timeBucketByPos = acquireCompactInt32(n) // 0 = out of range; 1..numSteps = bucket+1 (NOTE-116)
+	fillPKSetAndTimeBucketsFromPreSortedRefs(refs, vals, tb, numSteps, sortedPKs, timeBucketByPos)
+	return sortedPKs, timeBucketByPos, numSteps, true, func() {
+		releaseCompactUint32(sortedPKs)
+		releaseCompactInt32(timeBucketByPos)
+	}
+}
+
 // pkRankIndex is a prebuilt POPCNT rank index over a set of distinct packKeys (NOTE-135/140):
 // bitset[w] marks which packKeys are present, and rankPrefix[w] is the cumulative popcount of
 // bitset[0..w-1], so a packKey's rank (its position in sorted order) is
@@ -2163,21 +2274,13 @@ func streamCountRateN1CompactFromRefs(
 ) error {
 	agg := querySpec.Aggregate
 	tb := querySpec.TimeBucketing
-	numSteps := (tb.EndTime - tb.StartTime + tb.StepSizeNanos - 1) / tb.StepSizeNanos
-	if numSteps <= 0 || len(inRangeRefs) == 0 {
+	// inRangeRefs is already packKey-sorted from mergeJoinFilteredRefsWithVals — build
+	// sortedPKs and timeBucketByPos in a single O(n) pass without allocating pkOrder (NOTE-359).
+	sortedPKs, timeBucketByPos, numSteps, ok, release := unpackPreSortedRefs(inRangeRefs, inRangeVals, &tb)
+	if !ok {
 		return nil
 	}
-	n := len(inRangeRefs)
-
-	// inRangeRefs is already packKey-sorted from mergeJoinFilteredRefsWithVals — build
-	// sortedPKs and timeBucketByPos in a single O(n) pass without allocating pkOrder.
-	// NOTE-125: pool to avoid per-block allocations of sortedPKs (~28 MB) and
-	// timeBucketByPos (~29 MB) at n=7.2 M.
-	sortedPKs := acquireCompactUint32NoClear(n)
-	defer releaseCompactUint32(sortedPKs)
-	timeBucketByPos := acquireCompactInt32(n) // 0 = out of range; 1..numSteps = bucket+1 (NOTE-116)
-	defer releaseCompactInt32(timeBucketByPos)
-	fillPKSetAndTimeBucketsFromPreSortedRefs(inRangeRefs, inRangeVals, &tb, numSteps, sortedPKs, timeBucketByPos)
+	defer release()
 	return streamCountRateN1CompactCore(
 		ctx,
 		r,
@@ -2220,39 +2323,10 @@ func streamCountRateN1CompactCore(
 	dictIdxByPos := acquireCompactUint32(n)
 	defer releaseCompactUint32(dictIdxByPos)
 
-	// NOTE-406 (issue #348): try the streaming (decode-time push-down) Flat/XOR/Delta scan
-	// first — it folds the column into dict + dictIdxByPos one page at a time without
-	// materializing the O(column) value/ref arrays. Dict/legacy columns are not streamable;
-	// streamGroupByColCompactFlat returns false for those and we fall back to the eager fetch +
-	// cached native-index Dict path (NOTE-401), which is correct for those small/hot columns.
-	var groupByCol *modules_shared.IntrinsicColumn
-	streamed, err := streamGroupByColCompactFlat(r, groupByColName, sortedPKs, &dict, dictIdxByPos, rankIdx)
+	// NOTE-359: shared three-level group-by scan cascade (Flat-stream → Dict-stream → eager).
+	groupByCol, err := resolveGroupByDict(r, groupByColName, sortedPKs, &dict, dictIdxByPos, rankIdx)
 	if err != nil {
 		return err
-	}
-	if !streamed {
-		// NOTE-407 (issue #356): Dict columns (resource.service.name and the other rate-by-group
-		// columns) are NOT Flat-streamable, so they fell through to GetIntrinsicColumn, which
-		// materialized the O(rows) BlockRefs arena (decodeDictPagesArena) only to walk it once.
-		// Stream the Dict column page-by-page instead, scattering each ref's group index straight
-		// out of the raw ref bytes — no arena. groupByCol stays nil, so resolveDictGroupKeys below
-		// is a no-op (the streaming scan already populated dict). Dict columns that are not paged
-		// (legacy v1) or any other format fall through to the eager path.
-		streamed, err = scanGroupByColCompactDictStreaming(
-			r, groupByColName, sortedPKs, rankIdx, &dict, dictIdxByPos,
-		)
-		if err != nil {
-			return err
-		}
-	}
-	if !streamed {
-		groupByCol, err = r.GetIntrinsicColumn(groupByColName)
-		if err != nil {
-			return err
-		}
-		if groupByCol != nil {
-			scanGroupByColCompact(groupByCol, groupByColName, sortedPKs, &dict, dictIdxByPos, rankIdx)
-		}
 	}
 	numGroups := int64(len(dict)) //nolint:gosec
 
@@ -2409,28 +2483,10 @@ func streamAggN1CompactCore(
 	dictIdxByPos := acquireCompactUint32(n)
 	defer releaseCompactUint32(dictIdxByPos)
 
-	// NOTE-406 (issue #348): try the streaming Flat/XOR/Delta scan first (decode-time push-down,
-	// no O(column) materialization). Falls back to the eager Dict/legacy path when not streamable.
-	var groupByCol *modules_shared.IntrinsicColumn
-	streamed, err := streamGroupByColCompactFlat(r, agg.GroupBy[0], sortedPKs, &dict, dictIdxByPos, nil)
+	// NOTE-359: shared three-level group-by scan cascade (Flat-stream → Dict-stream → eager).
+	groupByCol, err := resolveGroupByDict(r, agg.GroupBy[0], sortedPKs, &dict, dictIdxByPos, nil)
 	if err != nil {
 		return err
-	}
-	if !streamed {
-		// NOTE-407: stream the Dict group-by column page-by-page (no O(rows) BlockRefs arena).
-		streamed, err = scanGroupByColCompactDictStreaming(r, agg.GroupBy[0], sortedPKs, nil, &dict, dictIdxByPos)
-		if err != nil {
-			return err
-		}
-	}
-	if !streamed {
-		groupByCol, err = r.GetIntrinsicColumn(agg.GroupBy[0])
-		if err != nil {
-			return err
-		}
-		if groupByCol != nil {
-			scanGroupByColCompact(groupByCol, agg.GroupBy[0], sortedPKs, &dict, dictIdxByPos, nil)
-		}
 	}
 	numGroups := len(dict)
 
@@ -2552,19 +2608,12 @@ func streamAggN1CompactFromRefs(
 ) error {
 	agg := querySpec.Aggregate
 	tb := querySpec.TimeBucketing
-	numSteps := (tb.EndTime - tb.StartTime + tb.StepSizeNanos - 1) / tb.StepSizeNanos
-	if numSteps <= 0 || len(inRangeRefs) == 0 {
+	// inRangeRefs is already packKey-sorted from mergeJoinFilteredRefsWithVals (NOTE-359).
+	sortedPKs, timeBucketByPos, numSteps, ok, release := unpackPreSortedRefs(inRangeRefs, inRangeVals, &tb)
+	if !ok {
 		return nil
 	}
-	n := len(inRangeRefs)
-
-	// inRangeRefs is already packKey-sorted from mergeJoinFilteredRefsWithVals.
-	// NOTE-125: pool to avoid per-block allocations (~28 MB sortedPKs, ~29 MB timeBucketByPos).
-	sortedPKs := acquireCompactUint32NoClear(n)
-	defer releaseCompactUint32(sortedPKs)
-	timeBucketByPos := acquireCompactInt32(n) // 0 = out of range; 1..numSteps = bucket+1 (NOTE-116)
-	defer releaseCompactInt32(timeBucketByPos)
-	fillPKSetAndTimeBucketsFromPreSortedRefs(inRangeRefs, inRangeVals, &tb, numSteps, sortedPKs, timeBucketByPos)
+	defer release()
 
 	return streamAggN1CompactCore(ctx, r, sortedPKs, timeBucketByPos, agg, numSteps, buckets)
 }
@@ -2594,20 +2643,12 @@ func streamHistogramN1CompactFromRefs(
 ) error {
 	agg := querySpec.Aggregate
 	tb := querySpec.TimeBucketing
-	numSteps := (tb.EndTime - tb.StartTime + tb.StepSizeNanos - 1) / tb.StepSizeNanos
-	if numSteps <= 0 || len(inRangeRefs) == 0 {
+	// inRangeRefs is already packKey-sorted from mergeJoinFilteredRefsWithVals (NOTE-359).
+	sortedPKs, timeBucketByPos, numSteps, ok, release := unpackPreSortedRefs(inRangeRefs, inRangeVals, &tb)
+	if !ok {
 		return nil
 	}
-	n := len(inRangeRefs)
-
-	// inRangeRefs is already packKey-sorted from mergeJoinFilteredRefsWithVals.
-	// Build sortedPKs and timeBucketByPos in O(n) without pkOrder alloc or sort.
-	// NOTE-125: pool to avoid per-block allocations (~28 MB sortedPKs, ~29 MB timeBucketByPos).
-	sortedPKs := acquireCompactUint32NoClear(n)
-	defer releaseCompactUint32(sortedPKs)
-	timeBucketByPos := acquireCompactInt32(n) // 0 = out of range; 1..numSteps = bucket+1 (NOTE-116)
-	defer releaseCompactInt32(timeBucketByPos)
-	fillPKSetAndTimeBucketsFromPreSortedRefs(inRangeRefs, inRangeVals, &tb, numSteps, sortedPKs, timeBucketByPos)
+	defer release()
 
 	// NOTE-406 (issue #348): defer the group-by fetch to the core, which streams the
 	// Flat/XOR/Delta path (no O(column) materialization) and falls back to eager fetch for
@@ -3007,30 +3048,10 @@ func streamHistogramN1CompactCore(
 	dictIdxByPos := acquireCompactUint32(n)
 	defer releaseCompactUint32(dictIdxByPos)
 
-	// NOTE-406 (issue #348): try the streaming Flat/XOR/Delta scan first (decode-time push-down,
-	// no O(column) materialization). Falls back to an eager GetIntrinsicColumn for non-streamable
-	// Dict/legacy columns. groupByCol is used post-scan only by resolveDictGroupKeys (a no-op for
-	// nil / Flat-streamed columns).
-	var groupByCol *modules_shared.IntrinsicColumn
-	streamed, err := streamGroupByColCompactFlat(r, agg.GroupBy[0], sortedPKs, &dict, dictIdxByPos, nil)
+	// NOTE-359: shared three-level group-by scan cascade (Flat-stream → Dict-stream → eager).
+	groupByCol, err := resolveGroupByDict(r, agg.GroupBy[0], sortedPKs, &dict, dictIdxByPos, nil)
 	if err != nil {
 		return err
-	}
-	if !streamed {
-		// NOTE-407: stream the Dict group-by column page-by-page (no O(rows) BlockRefs arena).
-		streamed, err = scanGroupByColCompactDictStreaming(r, agg.GroupBy[0], sortedPKs, nil, &dict, dictIdxByPos)
-		if err != nil {
-			return err
-		}
-	}
-	if !streamed {
-		groupByCol, err = r.GetIntrinsicColumn(agg.GroupBy[0])
-		if err != nil {
-			return err
-		}
-		if groupByCol != nil {
-			scanGroupByColCompact(groupByCol, agg.GroupBy[0], sortedPKs, &dict, dictIdxByPos, nil)
-		}
 	}
 	numGroups := len(dict)
 
@@ -4781,19 +4802,8 @@ func accumulateCountRateDirectStreaming(
 	numGroups := int64(len(dict)) //nolint:gosec
 
 	// Absent-row pass: in-range spans with no group value → empty-string group (slot 0).
-	// Identical to accumulateCountRateDirect (NOTE-091).
-	if totalSeen < int64(inRangeCount) {
-		for bk := range numSteps {
-			presentAtBk := int64(0)
-			for gIdx := int64(1); gIdx < numGroups; gIdx++ {
-				presentAtBk += groupCountsFlat[gIdx*numSteps+bk]
-			}
-			absentAtBk := stepCounts[bk] - presentAtBk
-			if absentAtBk > 0 {
-				groupCountsFlat[bk] += absentAtBk
-			}
-		}
-	}
+	// NOTE-359: identical to accumulateCountRateDirect (NOTE-091).
+	applyCountRateAbsentRowPass(groupCountsFlat, stepCounts, numGroups, numSteps, totalSeen, int64(inRangeCount))
 
 	if seriesSink != nil {
 		emitFlatCountRateSeries(seriesSink, groupCountsFlat, numGroups, numSteps, dict, groupByName, isRate, stepSec)
@@ -4893,18 +4903,8 @@ func accumulateCountRateDirect(
 	// Absent-row pass: spans in time range with no group-by value → empty-string group.
 	// NOTE-091: uses stepCounts (per-step in-range span counts built from tsCol) to
 	// compute absent counts in O(numSteps×numGroups) instead of O(maxPK) scan of seenByPK.
-	if totalSeen < int64(inRangeCount) {
-		for bk := range numSteps {
-			presentAtBk := int64(0)
-			for gIdx := int64(1); gIdx < numGroups; gIdx++ {
-				presentAtBk += groupCountsFlat[gIdx*numSteps+bk]
-			}
-			absentAtBk := stepCounts[bk] - presentAtBk
-			if absentAtBk > 0 {
-				groupCountsFlat[bk] += absentAtBk
-			}
-		}
-	}
+	// NOTE-359: shared with accumulateCountRateDirectStreaming.
+	applyCountRateAbsentRowPass(groupCountsFlat, stepCounts, numGroups, numSteps, totalSeen, int64(inRangeCount))
 
 	// NOTE-247: direct series emit when a sink is supplied (skips the string map + re-parse).
 	if seriesSink != nil {

@@ -6874,3 +6874,46 @@ fallback test for each.
 **Back-ref:** `internal/modules/executor/metrics_trace_intrinsic.go`:
 `scanAggColCompactStreaming`, `accumulateAggDirectStreaming`, `scanHistogramN0Streaming`,
 `streamHistogramCompactAggCol`.
+
+## NOTE-359: unify four duplicated code paths in the compact N=1 metrics executor (issue #359)
+
+Pure structural refactor of `metrics_trace_intrinsic.go` — no hot-loop algorithm change, no
+new benchmark-specific constants. Four byte-for-byte-identical fragments were extracted into
+shared unexported helpers (all output byte-identical to the inline code they replaced; pinned by
+`intrinsic_n1_helpers_test.go` unit tests + the existing `intrinsic_n1_core_dedup_test.go`
+differential equivalence tests that exercise the cores end-to-end):
+
+1. **`unpackPreSortedRefs(refs, vals, tb) (sortedPKs, timeBucketByPos, numSteps, ok, release)`** —
+   the identical preamble of the three compact `*FromRefs` wrappers (count/rate, agg, histogram):
+   numSteps guard → two pooled acquires (NOTE-125) → `fillPKSetAndTimeBucketsFromPreSortedRefs`.
+   Returns `ok=false` (nil slices, no-op release) for the empty-refs / numSteps<=0 guards so the
+   caller returns early; otherwise the caller `defer release()`s the pooled slices.
+
+2. **`resolveGroupByDict(r, colName, sortedPKs, dict, dictIdxByPos, rankIdx) (groupByCol, err)`** —
+   the three-level group-by scan cascade shared by all three Core functions:
+   `streamGroupByColCompactFlat` (NOTE-406 Flat/XOR/Delta stream) → `scanGroupByColCompactDictStreaming`
+   (NOTE-407 Dict stream, no O(rows) arena) → eager `GetIntrinsicColumn` + `scanGroupByColCompact`
+   fallback. The count/rate path passes a non-nil prebuilt `rankIdx` (NOTE-348); agg/histogram pass
+   nil. The returned `groupByCol` is non-nil only on the eager Dict fallback and is consumed
+   afterwards by `resolveDictGroupKeys` (a no-op for nil / Flat-streamed columns).
+
+3. **`applyCountRateAbsentRowPass(groupCountsFlat, stepCounts, numGroups, numSteps, totalSeen, inRangeCount)`** —
+   the absent-row credit pass (NOTE-091) duplicated in `accumulateCountRateDirect` and
+   `accumulateCountRateDirectStreaming`: when `totalSeen < inRangeCount`, subtract each step's
+   present (non-zero-group) count from `stepCounts[bk]` and credit the remainder to the absent
+   group (slot 0). `//nolint:gosec` G602 on `stepCounts[bk]` — callers' contract is
+   `len(stepCounts) >= numSteps` (the inline loop bounded bk by numSteps directly; the helper
+   loses that correlation so the linter cannot prove it).
+
+4. **`scatterDictRef(ref, dictIdx, minPK, maxPK, pkBitset, rankPrefix, dictIdxByPos)`** — the inner
+   Dict scatter body shared by `scanGroupByColCompactDictSerial` and the parallel worker in
+   `scanGroupByColCompactDictParallel`: packKey range gate + bitset membership test + O(1) POPCNT
+   rank + `dictIdxByPos[rank] = dictIdx`. The pre-NOTE-359 serial path had a `len(pkBitset)>0`
+   guard that the parallel path lacked; that guard was dead (every Dict scatter caller goes through
+   `scanGroupByColCompact`, which returns early on `len(sortedPKs)==0` and otherwise always has a
+   built bitset), so it was dropped to bring the helper under the inliner budget — verified
+   inlinable (cost 78 < 80) via `go build -gcflags=-m=2`; both call sites show "inlining call to
+   scatterDictRef", so the hot M4/M6 Dict scatter is not penalized by the extraction.
+
+**Back-ref:** `internal/modules/executor/metrics_trace_intrinsic.go`: `unpackPreSortedRefs`,
+`resolveGroupByDict`, `applyCountRateAbsentRowPass`, `scatterDictRef`.
