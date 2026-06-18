@@ -6329,6 +6329,46 @@ against `countIntrinsicHistogramBoundaries`, and `..._FallbackNonStreamable` pin
 fall-through.
 
 
+## NOTE-442: stream span:start decode in the unfiltered no-group-by count/rate hot path (issue #360)
+
+NOTE-406/407 streamed the metrics **group-by** dimension and NOTE-410 streamed the histogram
+**aggregate field** (`span:duration`), but the **time-bucketing** dimension (`span:start`) on the
+hottest metrics shape — the unfiltered no-group-by count/rate query (M1 `{} | rate()`,
+`count_over_time()`) — still materialized the WHOLE `span:start` `[]uint64` column via
+`fetchSpanStartColumn` → `appendDeltaUint64PageOpt` across every page. That eager materialization
+was the top self-time frame in the production querier profile (`appendDeltaUint64PageOpt` ~14.5%
+of CPU), allocated only to binary-search a `[lo,hi]` in-window sub-slice and count it per bucket in
+`streamCountRateNoGroupBySorted`.
+
+`streamCountRateNoGroupByPaged` (tried first in `executeTraceMetricsIntrinsic` for the
+`isCountRate && len(GroupBy)==0 && !hasPreds` shape, falling through to the eager materialized path
+for legacy v1 / non-paged `span:start` blobs) replaces the eager decode with a single streaming
+pass over `Reader.ScanIntrinsicColumn("span:start", …)` → shared `ScanPagedColumnBlob` (NOTE-406):
+each page is decoded ONE AT A TIME into reused buffers (transient allocation O(one page), not
+O(column)) and its in-window values are counted straight into a flat `[]int64` per-bucket counter,
+emitted once at the end to the same string-keyed `buckets` map the eager path produces. The
+per-value window-skip (`ts <= StartTime || ts > EndTime`) reproduces the eager lo/hi binary-search
+narrowing, and the right-closed bucketing (`timeBucketIndex`) reduces to the same
+"number of in-window timestamps with `timeBucketIndex == b`" as `streamCountRateNoGroupBySorted`,
+so per-bucket counts and emitted series are byte-identical. The unfiltered path reads NOTHING but
+`span:start` values (no refs, no group-by, no predicate), which is exactly why streaming is
+unconditionally correct here: there is no second column to merge-join against.
+
+This is the time-bucketing complement to NOTE-406/407 (group-by) and NOTE-410 (aggregate field) —
+all three eager O(rows) intrinsic-column materializations are now streamed on the metrics hot path.
+Predicate-filtered and group-by count/rate paths still need the materialized column (refs and
+binary-searched sub-slices fed to the compact cores), so they are excluded and keep the eager
+`fetchSpanStartColumn`. As a follow-on, issue #363 layers PageTOC `Min`/`Max` page-level pruning
+onto this streaming visitor (skip whole pages outside the window, bulk-count pages entirely within
+one step bucket).
+
+Covered by `intrinsic_countrate_stream_test.go`: `..._VsEager` asserts streamed per-bucket counts
+equal `streamCountRateNoGroupBySorted` over a real multi-page paged Delta `span:start` column with
+a window strictly inside the column (so the per-value window-skip is exercised); `..._FullWindow`
+asserts a window covering every span counts the full column exactly once; and
+`TestExecuteTraceMetrics_CountRateNoGroupBy_StreamEquivalence` pins the public `ExecuteTraceMetrics`
+`{} | count_over_time()` path (which now routes through the streamer) against the eager bucket total.
+
 ## NOTE-414: pool the >> / !>> ancestor-existence memo (eliminate per-block []uint8 alloc)
 
 `evalOpDescendantStruct` (`>>`) and `evalOpNotDescendantStruct` (`!>>`) each began with

@@ -403,6 +403,7 @@ func metricsColumnsAreIntrinsic(r *modules_reader.Reader, wantColumns map[string
 //     (streamHistogramGroupByID/streamHistogramGroupBy) write straight into `buckets` and do NOT
 //     pass through the flat emit, so they keep the traceHistogramSeries consumer; gating to
 //     len(GroupBy) <= 1 leaves histSink nil for those.
+//
 // maybeIntrinsicBucketsMap allocates the string-keyed `buckets` map ONLY when neither direct
 // sink is active. NOTE-438: when seriesSink (single-dim count/rate: M4/M6/M9) or histSink
 // (N<=1 histogram: M8) is non-nil, every accumulation core that receives a sink early-returns
@@ -481,6 +482,17 @@ func executeTraceMetricsIntrinsic(
 	tsAgg := querySpec.Aggregate
 	tsIsCountRate := tsAgg.Function == vm.FuncNameCOUNT || tsAgg.Function == vm.FuncNameRATE
 	tsNeedsRefs := !tsIsCountRate || len(tsAgg.GroupBy) != 0 || hasPreds
+
+	// NOTE-442 (issue #360): the unfiltered no-group-by count/rate query (M1 `{} | rate()`) is
+	// the hottest metrics shape — appendDeltaUint64PageOpt materializing the full span:start
+	// []uint64 was the top self-time frame (14.5% of querier CPU). tryStreamCountRateNoGroupBy
+	// streams span:start page-by-page and counts inline instead of materializing the whole
+	// column, returning handled=true (with the result) when it took the query. handled=false
+	// falls through to the eager materialized path below (legacy v1 / non-paged span:start, or a
+	// shape that needs refs / binary-searched sub-slices — predicate-filtered or group-by).
+	if res, take, ok, serr := tryStreamCountRateNoGroupBy(ctx, r, querySpec, tsIsCountRate, hasPreds); take {
+		return res, ok, serr
+	}
 
 	// NOTE-340/390: fetch span:start, deferring refs only on the no-refs fast path. The
 	// unfiltered no-group-by rate path reads only Uint64Values + Count and never materializes
@@ -3224,6 +3236,118 @@ func streamCountRateNoGroupBy(
 		}
 	}
 	return nil
+}
+
+// tryStreamCountRateNoGroupBy attempts the NOTE-442 streaming span:start count/rate path for the
+// unfiltered no-group-by count/rate shape (M1 `{} | rate()` / `count_over_time()`). The `take`
+// return tells the caller whether to return (res, ok, err) immediately: take=true means this path
+// either took the query (the span:start column was a streamable paged blob) or hit a decode error;
+// take=false means the caller must fall through to the eager materialized path (wrong shape, or a
+// legacy v1 / non-paged span:start column). Extracted from executeTraceMetricsIntrinsic to keep
+// its cyclomatic complexity within the gocyclo limit (the inline form pushed it over 30).
+func tryStreamCountRateNoGroupBy(
+	ctx context.Context,
+	r *modules_reader.Reader,
+	querySpec *vm.QuerySpec,
+	tsIsCountRate bool,
+	hasPreds bool,
+) (res *TraceMetricsResult, take, ok bool, err error) {
+	tb := querySpec.TimeBucketing
+	if !tsIsCountRate || len(querySpec.Aggregate.GroupBy) != 0 || hasPreds ||
+		!tb.Enabled || tb.StepSizeNanos <= 0 {
+		return nil, false, false, nil
+	}
+	streamBuckets := make(map[string]*aggBucketState)
+	streamed, serr := streamCountRateNoGroupByPaged(ctx, r, tb, streamBuckets)
+	if serr != nil {
+		return nil, true, false, serr
+	}
+	if !streamed {
+		// Not a streamable paged column — caller falls through to the eager materialized path.
+		return nil, false, false, nil
+	}
+	if len(streamBuckets) == 0 {
+		return &TraceMetricsResult{}, true, true, nil
+	}
+	return &TraceMetricsResult{Series: traceBuildDenseSeries(streamBuckets, querySpec)}, true, true, nil
+}
+
+// streamCountRateNoGroupByPaged is the streaming (decode-time push-down) fast path for the
+// unfiltered N=0 count/rate query (e.g. M1 `{} | rate()`). NOTE-442 (issue #360).
+//
+// The eager path (streamCountRateNoGroupBySorted) requires the FULL span:start column to be
+// materialized first (fetchSpanStartColumn → appendDeltaUint64PageOpt across every page,
+// the top self-time frame at 14.5% of querier CPU) only to binary-search a [lo,hi] sub-slice
+// and count per bucket. This path instead streams span:start ONE PAGE AT A TIME via
+// ScanIntrinsicColumn and counts each page's in-window values into a per-bucket counter array
+// inline — the O(column) []uint64 is never allocated; transient allocation is O(one page),
+// reused across pages (NOTE-406 pattern).
+//
+// span:start is a paged Delta column sorted ascending (types.go), so a span's time bucket is
+// timeBucketIndex(ts) and every in-window value lands in [0,numSteps). Values outside the
+// query window (ts ≤ StartTime or ts > EndTime) are skipped per-value, reproducing the lo/hi
+// binary-search narrowing the eager path does up front. Per-bucket counts are byte-identical
+// to streamCountRateNoGroupBySorted because both reduce to "number of in-window timestamps
+// whose timeBucketIndex == b".
+//
+// Returns (true, nil) on a successful streamed scan (buckets populated). Returns (false, nil)
+// when span:start is not a streamable paged column (legacy v1 / non-paged) so the caller MUST
+// fall back to the eager materialized path. Returns (_, err) on a decode failure.
+func streamCountRateNoGroupByPaged(
+	ctx context.Context,
+	r *modules_reader.Reader,
+	tb vm.TimeBucketSpec,
+	buckets map[string]*aggBucketState,
+) (streamed bool, err error) {
+	numSteps := (tb.EndTime - tb.StartTime + tb.StepSizeNanos - 1) / tb.StepSizeNanos
+	if numSteps <= 0 {
+		// No buckets to fill; still report streamed so the caller skips the eager path.
+		return true, nil
+	}
+	if cerr := ctx.Err(); cerr != nil {
+		return false, cerr
+	}
+
+	// Per-bucket counter array (numSteps int64). Flat, cache-friendly, no per-span string
+	// allocation or hash lookup in the hot loop — emitted to the string-keyed map once at the end.
+	counts := make([]int64, numSteps)
+	spanCount := 0
+	streamed, err = r.ScanIntrinsicColumn(colNameSpanStart, func(p *modules_shared.DecodedPage) error {
+		for _, u := range p.Uint64Values {
+			if spanCount&ctxCheckMask == 0 {
+				if cerr := ctx.Err(); cerr != nil {
+					return cerr
+				}
+			}
+			spanCount++
+			ts := int64(u) //nolint:gosec
+			// Skip values outside the query window — reproduces the eager lo/hi narrowing.
+			if ts <= tb.StartTime || ts > tb.EndTime {
+				continue
+			}
+			bk := timeBucketIndex(ts, tb.StartTime, tb.StepSizeNanos)
+			if bk >= 0 && bk < numSteps {
+				counts[bk]++
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return streamed, err
+	}
+	if !streamed {
+		return false, nil
+	}
+
+	// Emit non-zero buckets — same key format (strconv.FormatInt(b)+"\x00") as
+	// streamCountRateNoGroupBySorted so finalizeCountRateSeries produces identical series.
+	for idx, c := range counts {
+		if c > 0 {
+			key := strconv.FormatInt(int64(idx), 10) + "\x00" //nolint:gosec
+			intrinsicGetOrCreateBucket(buckets, key).count = c
+		}
+	}
+	return true, nil
 }
 
 // streamCountRateNoGroupBySorted is the O(numSteps · log N) fast path for the unfiltered
