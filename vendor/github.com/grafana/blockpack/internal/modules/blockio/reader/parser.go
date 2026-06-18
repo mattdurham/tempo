@@ -604,6 +604,48 @@ func (r *Reader) ensureV8BloomSection() error {
 	return r.v8BloomErr
 }
 
+// ensureV8ColStatsSection lazily loads the V8 per-block column statistics section
+// (ToCSubTypeColStats, NOTE-446 issue #364) on first call. Populates r.colStats.
+// No-op (leaves r.colStats nil) for files written before the section was introduced.
+func (r *Reader) ensureV8ColStatsSection() error {
+	r.v8ColStatsOnce.Do(func() {
+		raw, err := r.fetchToCSection(shared.ToCKey{Type: shared.ToCTypeMetadata, SubType: shared.ToCSubTypeColStats})
+		if err != nil {
+			r.v8ColStatsErr = fmt.Errorf("ensureV8ColStatsSection: %w", err)
+			return
+		}
+		if len(raw) == 0 {
+			return
+		}
+		parsed, parseErr := shared.DecodeColStatsSection(raw)
+		if parseErr != nil {
+			r.v8ColStatsErr = fmt.Errorf("ensureV8ColStatsSection: parse: %w", parseErr)
+			return
+		}
+		r.colStats = parsed
+	})
+	return r.v8ColStatsErr
+}
+
+// ColStats returns the parsed per-block column statistics for the given block index, or nil
+// if the file has no ColStats section or the block has no recorded statistics (NOTE-446,
+// issue #364). The returned *shared.BlockColStats is read-only and safe for concurrent use
+// after the first call. Fetched lazily and cached per-Reader.
+func (r *Reader) ColStats(blockIdx int) *shared.BlockColStats {
+	if err := r.ensureV8ColStatsSection(); err != nil || r.colStats == nil {
+		return nil
+	}
+	return r.colStats[blockIdx]
+}
+
+// HasColStats reports whether the file carries a ColStats section (NOTE-446).
+func (r *Reader) HasColStats() bool {
+	if err := r.ensureV8ColStatsSection(); err != nil {
+		return false
+	}
+	return r.colStats != nil
+}
+
 // ensureV14RangeSection lazily loads the V14 range index section on first call.
 // Populates r.rangeOffsets and r.metadataBytes (which ensureRangeColumnParsed indexes into).
 // ensureV14TraceSection lazily loads the V14 trace index section on first call.

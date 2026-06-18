@@ -596,7 +596,7 @@ func buildLogBlock(pending []pendingLogRecord) (builtBlock, error) {
 			bb.colMinMax[name] = fmm
 		}
 	}
-	payload, err := bb.finalize(emittedBlockVersion())
+	payload, colStats, err := bb.finalize(emittedBlockVersion())
 	if err != nil {
 		return builtBlock{}, err
 	}
@@ -607,6 +607,7 @@ func buildLogBlock(pending []pendingLogRecord) (builtBlock, error) {
 		minStart:    bb.minStart,
 		maxStart:    bb.maxStart,
 		colMinMax:   bb.colMinMax,
+		colStats:    colStats,
 		colSketches: bb.colSketches,
 		// traceRows is nil — log blocks have no trace ID index.
 		// minTraceID/maxTraceID are the zero [16]byte value.
@@ -617,12 +618,18 @@ func buildLogBlock(pending []pendingLogRecord) (builtBlock, error) {
 // Delegates to the shared finalize logic on blockBuilder by using its column map.
 // Since logBlockBuilder mirrors blockBuilder's column infrastructure exactly,
 // we build a minimal blockBuilder shell to reuse finalize().
-func (b *logBlockBuilder) finalize(blockVersion uint8) ([]byte, error) {
+func (b *logBlockBuilder) finalize(blockVersion uint8) ([]byte, []shared.ColStat, error) {
 	// Build a minimal blockBuilder to reuse the finalize() method.
-	// We only need the columns map and spanCount fields for finalization.
+	// We need the columns map and spanCount for finalization, plus colMinMax so the
+	// NOTE-446 ColStats computation can populate numeric ranges for log columns.
 	shell := &blockBuilder{
 		columns:   b.columns,
 		spanCount: b.recordCount,
+		colMinMax: b.colMinMax,
 	}
-	return shell.finalize(blockVersion)
+	payload, err := shell.finalize(blockVersion)
+	if err != nil {
+		return nil, nil, err
+	}
+	return payload, append([]shared.ColStat(nil), shell.colStats...), nil
 }

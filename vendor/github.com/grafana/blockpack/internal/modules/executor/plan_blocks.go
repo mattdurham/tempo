@@ -85,7 +85,140 @@ func planBlocks(
 		plan.SelectedBlocks = filtered
 	}
 
+	// ColStats block pruning (NOTE-446, issue #364): skip blocks where a predicate column
+	// is wholly absent (present_count == 0) or whose per-block numeric range cannot satisfy
+	// the predicate's bound. Runs last so it refines the already-selected set with no extra
+	// I/O beyond the lazily-fetched ColStats section.
+	if program != nil && program.Predicates != nil && r.HasColStats() {
+		plan.SelectedBlocks = pruneByColStats(r, program.Predicates.Nodes, plan.SelectedBlocks)
+	}
+
 	return plan
+}
+
+// pruneByColStats removes blocks from selected that cannot match any top-level AND
+// predicate, using the per-block ColStats section. Only top-level AND leaves (and OR
+// composites where every arm rejects) are considered; this is conservative — when a
+// predicate cannot be evaluated against ColStats the block is kept.
+func pruneByColStats(r *modules_reader.Reader, nodes []vm.RangeNode, selected []int) []int {
+	if len(selected) == 0 || len(nodes) == 0 {
+		return selected
+	}
+	out := selected[:0]
+	for _, bi := range selected {
+		cs := r.ColStats(bi)
+		if cs == nil {
+			out = append(out, bi)
+			continue
+		}
+		reject := false
+		for i := range nodes {
+			if colStatsRejects(cs, &nodes[i]) {
+				reject = true
+				break
+			}
+		}
+		if !reject {
+			out = append(out, bi)
+		}
+	}
+	return out
+}
+
+// colStatsRejects reports whether the block's column statistics guarantee that no row can
+// satisfy node. AND composites reject if ANY child rejects; OR composites reject only if
+// ALL children reject. Leaves reject on column absence (RequirePresent / equality / range
+// against an absent column) or on a numeric range that cannot intersect the predicate.
+func colStatsRejects(cs *modules_shared.BlockColStats, node *vm.RangeNode) bool {
+	if len(node.Children) > 0 {
+		if node.IsOR {
+			for i := range node.Children {
+				if !colStatsRejects(cs, &node.Children[i]) {
+					return false
+				}
+			}
+			return true
+		}
+		for i := range node.Children {
+			if colStatsRejects(cs, &node.Children[i]) {
+				return true
+			}
+		}
+		return false
+	}
+
+	if node.Column == "" {
+		return false
+	}
+	stat := cs.Lookup(node.Column)
+
+	// A leaf that requires the column to be present, match a value, fall in a range, or
+	// match a pattern can never match a block where the column is wholly absent
+	// (present_count == 0 or no recorded stat).
+	requiresPresence := node.RequirePresent ||
+		len(node.Values) > 0 || node.Min != nil || node.Max != nil || node.Pattern != ""
+	if requiresPresence {
+		if stat == nil || stat.PresentCount == 0 {
+			return true
+		}
+	}
+	if stat == nil {
+		return false
+	}
+
+	// Numeric range pruning: if the predicate has a numeric bound and the block's recorded
+	// [min, max] cannot intersect it, the block cannot match. Only applied when ColStats
+	// carries a numeric range for this column.
+	if stat.HasNumRange {
+		if node.Min != nil && numNodeBoundExceedsMax(node.Min, node.MinInclusive, stat.MaxNum) {
+			return true
+		}
+		if node.Max != nil && numNodeBoundBelowMin(node.Max, node.MaxInclusive, stat.MinNum) {
+			return true
+		}
+	}
+	return false
+}
+
+// numNodeBoundExceedsMax reports whether a lower-bound predicate (Min) excludes the whole
+// block: the smallest value the predicate admits is strictly greater than the block max.
+func numNodeBoundExceedsMax(minVal *vm.Value, inclusive bool, blockMax uint64) bool {
+	v, ok := valueAsUint64(minVal)
+	if !ok {
+		return false
+	}
+	if inclusive {
+		return v > blockMax
+	}
+	return v >= blockMax
+}
+
+// numNodeBoundBelowMin reports whether an upper-bound predicate (Max) excludes the whole
+// block: the largest value the predicate admits is strictly less than the block min.
+func numNodeBoundBelowMin(maxVal *vm.Value, inclusive bool, blockMin uint64) bool {
+	v, ok := valueAsUint64(maxVal)
+	if !ok {
+		return false
+	}
+	if inclusive {
+		return v < blockMin
+	}
+	return v <= blockMin
+}
+
+// valueAsUint64 returns the uint64 representation of a numeric Value for comparison against
+// ColStats numeric ranges, matching the writer's little-endian range-key encoding (the raw
+// bits of an int64/uint64). Returns false for non-numeric values.
+func valueAsUint64(v *vm.Value) (uint64, bool) {
+	switch v.Type {
+	case vm.TypeInt, vm.TypeDuration:
+		if iv, ok := v.Data.(int64); ok {
+			return uint64(iv), true //nolint:gosec
+		}
+		return 0, false
+	default:
+		return 0, false
+	}
 }
 
 // fileLevelBloomReject returns true if file-level bloom filters guarantee that no span

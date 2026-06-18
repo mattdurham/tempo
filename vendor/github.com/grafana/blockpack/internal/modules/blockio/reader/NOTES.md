@@ -3265,3 +3265,17 @@ and eager fallback paths are asserted byte-identical to the eager `GetIntrinsicC
 **Back-ref:** `internal/modules/blockio/reader/intrinsic_scanner.go`,
 `internal/modules/blockio/reader/intrinsic_reader.go:ScanIntrinsicColumn,GetIntrinsicColumn`,
 `internal/modules/blockio/shared/intrinsic_stream.go:DecodedPage`, NOTE-406/407/410/442.
+
+---
+
+## NOTE-446 (reader side): ColStats lazy fetch (issue #364)
+*Added: 2026-06-18*
+
+`Reader.ColStats(blockIdx)` / `Reader.HasColStats()` expose the `ToCSubTypeColStats` section
+(canonical design: writer NOTES NOTE-446). The whole snappy-compressed section is fetched once via
+the existing `fetchToCSection` + `GetOrFetchV8Section` path, decoded with
+`shared.DecodeColStatsSection`, and cached in `r.colStats` under `v8ColStatsOnce`. Returns nil for
+files without the section (old format) so callers fall back to no pruning. Used by the executor's
+`pruneByColStats` block pruning.
+
+**Back-ref:** `reader/parser.go:ensureV8ColStatsSection,ColStats,HasColStats`, `shared/colstats.go`.

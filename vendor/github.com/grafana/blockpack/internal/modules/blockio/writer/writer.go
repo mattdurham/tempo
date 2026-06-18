@@ -41,6 +41,11 @@ type Writer struct {
 	// Consumed at Flush() by writeV8Sections.
 	sketchIdx []blockSketchSet
 
+	// colStatsByBlock accumulates per-block per-column statistics (NOTE-446, issue #364).
+	// Fed in the serial flush pass from built.colStats; consumed at Flush() by
+	// writeV8Sections to write the ToCSubTypeColStats section.
+	colStatsByBlock []shared.BlockColStats
+
 	// intrinsicAccum accumulates file-level columnar data for intrinsic columns.
 	// Fed row-by-row during block building via blockBuilder.intrinsicAccum.
 	// Consumed at Flush() by writeV8Sections.
@@ -708,6 +713,14 @@ func (w *Writer) flushBlocks() error {
 			addBlockRangeToColumn(cd, mm, bid)
 		}
 
+		// NOTE-446: collect per-block column statistics for the ColStats section.
+		if len(built.colStats) > 0 {
+			w.colStatsByBlock = append(w.colStatsByBlock, shared.BlockColStats{
+				BlockIdx: uint16(s.blockID), //nolint:gosec
+				Cols:     built.colStats,
+			})
+		}
+
 		// Collect sketch set for this block.
 		w.sketchIdx = append(w.sketchIdx, built.colSketches)
 
@@ -822,6 +835,14 @@ func (w *Writer) flushLogBlocks() error {
 				w.rangeIdx[mm.colName] = cd
 			}
 			addBlockRangeToColumn(cd, mm, bid)
+		}
+
+		// NOTE-446: collect per-block column statistics for the ColStats section.
+		if len(built.colStats) > 0 {
+			w.colStatsByBlock = append(w.colStatsByBlock, shared.BlockColStats{
+				BlockIdx: uint16(s.blockID), //nolint:gosec
+				Cols:     built.colStats,
+			})
 		}
 
 		w.sketchIdx = append(w.sketchIdx, built.colSketches)

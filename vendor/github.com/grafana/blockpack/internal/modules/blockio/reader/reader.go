@@ -97,9 +97,10 @@ type Reader struct {
 	// Assigned directly from Options.Cache; nil is normalized to NopSectionCache.
 	cache sectioncache.SectionCache
 
-	v8TraceErr error
-	v8TSErr    error
-	v8BloomErr error
+	v8TraceErr    error
+	v8TSErr       error
+	v8BloomErr    error
+	v8ColStatsErr error
 
 	// compactParsedErr holds any error from compactParsedOnce initialization.
 	compactParsedErr error
@@ -179,6 +180,11 @@ type Reader struct {
 	// tocMap is the decoded unified ToC (V8 format).
 	tocMap map[shared.ToCKey]shared.ToCEntry
 
+	// colStats is the lazily-parsed ToCSubTypeColStats section (NOTE-446, issue #364):
+	// block index → per-block per-column statistics. Nil when the file has no ColStats
+	// section (blocks written before the section was introduced).
+	colStats map[int]*shared.BlockColStats
+
 	// sectionDir holds the section directory; unused post-V8 but retained for readV14Section.
 	sectionDir shared.SectionDirectory
 
@@ -218,9 +224,10 @@ type Reader struct {
 	intrinsicMu sync.RWMutex
 
 	// V8 lazy section errors and sync.Once guards (mirror of v14 ones).
-	v8TraceOnce sync.Once
-	v8TSOnce    sync.Once
-	v8BloomOnce sync.Once
+	v8TraceOnce    sync.Once
+	v8TSOnce       sync.Once
+	v8BloomOnce    sync.Once
+	v8ColStatsOnce sync.Once
 
 	fileBloomOnce sync.Once
 

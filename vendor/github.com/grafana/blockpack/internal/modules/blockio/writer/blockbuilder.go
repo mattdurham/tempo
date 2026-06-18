@@ -3,7 +3,7 @@ package writer
 import "github.com/grafana/blockpack/internal/modules/blockio/shared"
 
 type blockBuilder struct {
-	columns          map[shared.ColumnKey]columnBuilder
+	builderCache     map[shared.ColumnKey]columnBuilder
 	traceRows        map[[16]byte]struct{}
 	intrinsicAccum   *intrinsicAccumulator
 	dedicatedCols    map[string]struct{}
@@ -11,8 +11,9 @@ type blockBuilder struct {
 	resourceColNames map[string]string
 	scopeColNames    map[string]string
 	colMinMax        map[string]*blockColMinMax
+	columns          map[shared.ColumnKey]columnBuilder
 	colSketches      blockSketchSet
-	builderCache     map[shared.ColumnKey]columnBuilder
+	colStats         []shared.ColStat
 	spanCount        int
 	spanHint         int
 	minStart         uint64

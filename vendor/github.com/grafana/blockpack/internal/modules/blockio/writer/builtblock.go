@@ -1,8 +1,11 @@
 package writer
 
+import "github.com/grafana/blockpack/internal/modules/blockio/shared"
+
 type builtBlock struct {
 	traceRows    map[[16]byte]struct{}
 	colMinMax    map[string]*blockColMinMax
+	colStats     []shared.ColStat
 	colSketches  blockSketchSet
 	localAccum   *intrinsicAccumulator
 	blockVectors [][]float32

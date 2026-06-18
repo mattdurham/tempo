@@ -883,7 +883,17 @@ func extractTraceQLNodes(expr traceqlparser.Expr) (nodes []RangeNode, cols []str
 	case traceqlparser.OpEq:
 		return extractEqNode(e)
 
-	case traceqlparser.OpNeq, traceqlparser.OpNotRegex:
+	case traceqlparser.OpNeq:
+		// `attr != ""` requires the attribute to be present (a row with the attribute
+		// absent does not match). Emit a presence-requiring node so ColStats pruning
+		// (NOTE-446) can skip blocks where the column has present_count == 0. Other
+		// `!=` comparisons cannot prune (an absent or differing row may match).
+		if nodes, cols := extractNeqPresenceNode(e); nodes != nil {
+			return nodes, cols
+		}
+		return nil, negationCols(e)
+
+	case traceqlparser.OpNotRegex:
 		// Negations cannot prune; just track accessed columns for the row-level decode.
 		return nil, negationCols(e)
 
@@ -965,6 +975,41 @@ func extractEqNode(expr *traceqlparser.BinaryExpr) (nodes []RangeNode, cols []st
 		cols = []string{columnName}
 	}
 	return []RangeNode{{Column: columnName, Values: []Value{vmValue}}}, cols
+}
+
+// extractNeqPresenceNode builds a presence-requiring RangeNode for `attr != ""`.
+// Returns nil nodes for any other `!=` comparison (RHS not an empty string literal, or a
+// built-in field). The presence node prunes blocks where the column is wholly absent.
+func extractNeqPresenceNode(expr *traceqlparser.BinaryExpr) (nodes []RangeNode, cols []string) {
+	field, lit, columnName, ok := parseBinaryExprArgs(expr)
+	if !ok {
+		return nil, nil
+	}
+	if lit.Type != traceqlparser.LitString {
+		return nil, nil
+	}
+	s, sok := lit.Value.(string)
+	if !sok || s != "" {
+		return nil, nil
+	}
+	if isBuiltInField(columnName) {
+		// Built-in fields are always present; presence pruning would never fire.
+		return nil, nil
+	}
+	if field.Scope == "" {
+		// Unscoped: a block matches if ANY scope column is present → OR composite.
+		res, span, log := unscopedCols(field.Name)
+		cols = []string{res, span, log}
+		return []RangeNode{{
+			IsOR: true,
+			Children: []RangeNode{
+				{Column: res, RequirePresent: true},
+				{Column: span, RequirePresent: true},
+				{Column: log, RequirePresent: true},
+			},
+		}}, cols
+	}
+	return []RangeNode{{Column: columnName, RequirePresent: true}}, []string{columnName}
 }
 
 // extractRangeNode builds a RangeNode for a range predicate (>, >=, <, <=).

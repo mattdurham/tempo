@@ -178,6 +178,21 @@ func (w *Writer) writeV8FileSections(sw *v8SectionWriter) error {
 		return err
 	}
 
+	// ColStats (issue #364): per-block per-column statistics for predicate pruning.
+	// Snappy-compressed whole section (fetched once per file, cached per-Reader).
+	if len(w.colStatsByBlock) > 0 {
+		slices.SortFunc(w.colStatsByBlock, func(a, b shared.BlockColStats) int {
+			return int(a.BlockIdx) - int(b.BlockIdx)
+		})
+		colStatsRaw := shared.EncodeColStatsSection(w.colStatsByBlock)
+		if err = sw.writeToCEntry(
+			shared.ToCKey{Type: shared.ToCTypeMetadata, SubType: shared.ToCSubTypeColStats},
+			colStatsRaw,
+		); err != nil {
+			return err
+		}
+	}
+
 	// File bloom (optional).
 	if len(w.fileBloomSvcNames) == 0 {
 		return nil

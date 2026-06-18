@@ -162,3 +162,19 @@ Fix: when a filter is present, instantiate a `traceqlCompiler` and call
 `compileColumnPredicate(filter.Expr)`, exactly as `CompileTraceQLFilter` does.
 
 Back-ref: `internal/vm/metrics_compiler.go:CompileTraceQLMetrics`
+
+---
+
+## NOTE-446 (compiler side): `!= ""` presence-pruning node (issue #364)
+*Added: 2026-06-18*
+
+`attr != ""` now compiles to a `RangeNode{RequirePresent: true}` (`extractNeqPresenceNode`) instead
+of producing no pruning node. A row with the attribute absent never matches `!= ""`, so a block
+where the column has `present_count == 0` can be skipped by the executor's ColStats pruning. Scoped
+attrs yield one leaf; unscoped attrs yield an OR over resource/span/log presence. Other `!= "x"`
+comparisons still produce no node (an absent or differing row may match → unsafe). The new
+`RangeNode.RequirePresent` flag carries no Values/Min/Max — it constrains existence only, and falls
+through `translateNode` to a harmless bloom-only predicate in the planner. Canonical design: writer
+NOTES NOTE-446.
+
+**Back-ref:** `vm/traceql_compiler.go:extractNeqPresenceNode`, `vm/rangenode.go:RequirePresent`.

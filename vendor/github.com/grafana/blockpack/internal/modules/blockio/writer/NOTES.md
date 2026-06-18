@@ -901,3 +901,49 @@ via its sorted-gallop fast path (NOTE-379) and needed no change.
 Back-ref: `writer/intrinsic_accum.go:encodeColumn` + `decodeIntrinsicColumnBlob` (test helper now
 uses eager-refs decode since flat columns are paged-lazy-ref); executor folds in
 `metrics_trace_intrinsic.go`; guard tests `executor/intrinsic_alwayspaged_test.go`.
+
+---
+
+## NOTE-446: Per-block per-column statistics section (ToCSubTypeColStats, issue #364)
+*Added: 2026-06-18*
+
+**Problem:** Blockpack could not skip column fetches for a column wholly absent from a block.
+Q9 `{kind=server} >> {kind=client && span.rpc.method != ""}` fetched `span.rpc.method` for every
+block even when entirely null (the common case). `!=` predicates produced NO pruning node
+(`extractTraceQLNodes`: negations cannot prune), so the planner kept every block.
+
+**Solution:** a new file-level ToC section `ToCSubTypeColStats = 9` with one entry per block
+holding packed per-column statistics. Wire format (`shared/colstats.go`):
+`entry_count[4]` then per block `block_idx[2] + col_count[2]` then per column
+`name_len[2]+name + stats_flags[1] + present_count[4]` and, when `stats_flags & 0x01`,
+`min_uint64[8] + max_uint64[8]`. Snappy-compressed whole section, fetched lazily once per file
+and cached per-Reader (mirrors the TS/bloom section path).
+
+**Writer:** stats are captured inside `blockBuilder.finalize` while the column builders are still
+live — `present_count = rowCount() - nullCount()` per column, plus a numeric `[min,max]` range
+pulled from the per-block `colMinMax` bookkeeping. Numeric range is emitted ONLY for unsigned
+families (uint64 / duration): the LE bytes are compared as uint64, which is wrong for signed
+int64 (negatives sort wrong under unsigned compare), so int64 columns carry presence only. Both
+the trace and log flush passes feed `w.colStatsByBlock`; the section is sorted by block index and
+written in `writeV8FileSections`. Computing during `finalize` avoids a second walk over the columns
+(they are cleared right after).
+
+**Executor:** `pruneByColStats` (in `plan_blocks.go`) runs last in `planBlocks`, after intrinsic
+TOC intersection, refining the selected set with no extra I/O beyond the lazy ColStats fetch. A
+leaf that requires presence (RequirePresent / equality / range / pattern) prunes a block where the
+column has `present_count == 0`; a numeric leaf bound that cannot intersect the block `[min,max]`
+prunes the block. Conservative: AND rejects if any child rejects, OR rejects only if all children
+reject, and an unevaluable predicate keeps the block.
+
+**The `!= ""` fix:** `attr != ""` requires the attribute to be present (an absent row never
+matches), so OpNeq against an empty string literal now compiles to a `RequirePresent` RangeNode
+(`extractNeqPresenceNode`) — scoped to one leaf or, for unscoped attrs, an OR over
+resource/span/log presence. Other `!= "x"` comparisons still produce no node (an absent or
+differing row could match → unsafe to prune).
+
+**Backward compatibility:** new optional section; old readers skip unknown ToC types. Files without
+the section get no ColStats pruning (`HasColStats()` returns false). No format-version bump.
+
+Back-ref: `shared/colstats.go` (codec), `writer/writer_block.go:finalize` (capture),
+`writer/v8_sections.go:writeV8FileSections` (write), `reader/parser.go:ColStats/HasColStats`
+(read), `executor/plan_blocks.go:pruneByColStats`, `vm/traceql_compiler.go:extractNeqPresenceNode`.

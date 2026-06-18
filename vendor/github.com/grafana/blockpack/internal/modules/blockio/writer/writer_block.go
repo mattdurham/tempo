@@ -258,6 +258,7 @@ func buildBlock(
 		maxTraceID:  bb.maxTraceID,
 		traceRows:   bb.traceRows,
 		colMinMax:   bb.colMinMax,
+		colStats:    append([]shared.ColStat(nil), bb.colStats...),
 		colSketches: bb.colSketches,
 		localAccum:  intrinsicAccum,
 	}, bb, nil
@@ -1537,6 +1538,33 @@ func (b *blockBuilder) finalize(blockVersion uint8) ([]byte, error) {
 	})
 
 	colCount := len(entries)
+
+	// NOTE-446 (issue #364): capture per-column statistics for the file-level ColStats
+	// section while the column builders are still live. present_count = rowCount - nullCount
+	// drives column-absence and single-value pruning; numeric min/max (when available from
+	// the per-block range bookkeeping) enables per-block range pruning. Computed here rather
+	// than in a separate pass to avoid re-walking the columns after finalize clears them.
+	b.colStats = b.colStats[:0]
+	for _, e := range entries {
+		present := e.cb.rowCount() - e.cb.nullCount()
+		if present < 0 {
+			present = 0
+		}
+		cs := shared.ColStat{Name: e.key.Name, PresentCount: uint32(present)} //nolint:gosec
+		if mm, ok := b.colMinMax[e.key.Name]; ok && mm.isNum {
+			// Only unsigned-family columns are range-pruned: the LE bytes are compared as
+			// uint64, which is correct for uint64 / duration (non-negative nanoseconds) but
+			// NOT for signed int64 (negative values sort wrong under unsigned compare). The
+			// executor side mirrors this by only treating uint64/duration predicate bounds.
+			switch mm.colType {
+			case shared.ColumnTypeUint64, shared.ColumnTypeRangeUint64, shared.ColumnTypeRangeDuration:
+				cs.MinNum = binary.LittleEndian.Uint64(mm.numMinKey[:])
+				cs.MaxNum = binary.LittleEndian.Uint64(mm.numMaxKey[:])
+				cs.HasNumRange = true
+			}
+		}
+		b.colStats = append(b.colStats, cs)
+	}
 
 	// Build column data blobs.
 	// SPEC-V14-001: for V14 blocks, each blob is snappy-compressed (outer per-column snappy).

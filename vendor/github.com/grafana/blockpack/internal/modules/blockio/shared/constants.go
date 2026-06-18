@@ -67,6 +67,8 @@ const (
 
 	ToCSubTypeTraceChunked uint32 = 8 // range-readable chunked trace index (SPEC: issue #340)
 
+	ToCSubTypeColStats uint32 = 9 // per-block per-column statistics for predicate pruning (SPEC: issue #364)
+
 	// ToCEntry SubType constants for ToCTypeIndex (Type=2).
 	ToCSubTypeBlockIndex uint32 = 7 // block offset table
 
