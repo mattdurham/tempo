@@ -6825,3 +6825,52 @@ in Go regardless. No accumulation core writes `buckets` while a sink is active (
 both sink-bearing cores). Verified by the executor suite + benchmark parity suite.
 
 **Back-ref:** `internal/modules/executor/metrics_trace_intrinsic.go:executeTraceMetricsIntrinsic`.
+
+
+## NOTE-445: stream agg.Field (span:duration) in the 4 remaining compact/direct metrics scans (issue #361)
+
+NOTE-410 streamed the histogram aggregate field on the N=1 group-by **direct** path
+(`accumulateHistogramDirect`). An audit of all metrics execution paths found four remaining sites
+where the aggregate column (`span:duration`) was still materialized eagerly via
+`GetIntrinsicColumn(agg.Field)` purely to drive a sequential forward scan into a fixed-size dense
+array. This note extends the same try-stream-then-fallback pattern to all four, eliminating the
+last O(rows) eager `agg.Field` decodes from the metrics hot path:
+
+1. **`streamAggN1CompactCore`** (N=1 compact agg: min/max/avg/sum/quantile by service) —
+   `scanAggColCompactStreaming` builds the POPCNT `pkRankIndex` over `sortedPKs` once, then streams
+   the column page-by-page, rank-scattering each page-local `(BlockRefs[i], Uint64Values[i])` pair
+   into `aggValByPos`/`aggPresentByPos` exactly as `scanAggColCompact`'s Flat branch did.
+2. **`accumulateAggDirect`** (N=1 direct agg) — `accumulateAggDirectStreaming` streams the column
+   and scatters into the dense `groupBuckets` via O(1) `dictByPK`/`bucketByPK` lookups, identical
+   per-value work to `accumulateAggDirectScanCol`'s Flat branch.
+3. **`accumulateHistogramDirectN0`** (`{} | histogram_over_time(duration)`) —
+   `scanHistogramN0Streaming` streams into the single-group `groupCountsFlat`, mirroring
+   `scanHistogramN0`'s Flat branch. The N=0 path uses the fixed `histFlatStride`, so no separate
+   boundary-count pass is needed (the indexer is pre-warmed lazily during the same scan).
+4. **`streamHistogramN1CompactCore`** (compact M8 histogram, the hottest of the four) —
+   `streamHistogramCompactAggCol` does **two** streaming passes: pass 1 counts distinct boundaries
+   via `histBoundaryCounter` (the streaming analog of `countIntrinsicHistogramBoundaries`,
+   byte-identical count) to right-size `actualStride`; pass 2 rank-scatters into `groupCountsFlat`
+   via the prebuilt `pkRankIndex` + per-pos `baseOffsetByPos`, mirroring
+   `scanAggColHistogramShard`'s Flat branch. Streaming is **serial** (page-by-page): the eager
+   path's parallel sharding existed only to amortize a full-column array scan; with page-at-a-time
+   decode there is no full array to shard. `streamHistogramCompactAggCol` returns the POOLED
+   `groupCountsFlat` + `seenByPos` (caller releases) on `streamed=true`, and acquires nothing on
+   `streamed=false` so the eager fallback owns its own buffers.
+
+In every case transient allocation is O(one page), not O(column). All four keep the eager
+`GetIntrinsicColumn` scan as the fallback for non-streamable Dict/legacy/absent columns (same
+contract as NOTE-410): `Reader.ScanIntrinsicColumn` returns `streamed=false` for those and the
+caller takes the original path unchanged. The compressed blob stays in the section cache between
+the two histogram passes (`GetOrFetchIntrinsic`), so pass 2 re-decodes (cheap, pooled buffers) but
+never re-fetches.
+
+Covered by `intrinsic_aggfield_stream_test.go` (EX-ETM-445-01..08): each streamed scan is asserted
+byte-identical to the eager scan it replaces over a real multi-page paged Delta `span:duration`
+column (matching `aggValByPos`/`groupBuckets`/`groupCountsFlat`/`seenBy*`/`boundaries`), with a
+`>1 distinct cell` assertion so the Delta accumulation is actually exercised, plus a Dict-field
+fallback test for each.
+
+**Back-ref:** `internal/modules/executor/metrics_trace_intrinsic.go`:
+`scanAggColCompactStreaming`, `accumulateAggDirectStreaming`, `scanHistogramN0Streaming`,
+`streamHistogramCompactAggCol`.

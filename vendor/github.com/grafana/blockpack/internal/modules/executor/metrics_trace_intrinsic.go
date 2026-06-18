@@ -2441,12 +2441,23 @@ func streamAggN1CompactCore(
 	aggPresentByPos := acquireCompactBool(n)
 	defer releaseCompactBool(aggPresentByPos)
 	if agg.Field != "" {
-		aggCol, aggErr := r.GetIntrinsicColumn(agg.Field)
-		if aggErr != nil {
-			return aggErr
+		// NOTE-445 (issue #361): stream the aggregate column page-by-page (decode-time
+		// rank-scatter, no O(column) materialization). span:duration is a paged DeltaUint64
+		// column, so this avoids materializing the whole Uint64Values+BlockRefs arrays purely
+		// for one forward rank-scatter pass. Falls back to the eager GetIntrinsicColumn scan for
+		// non-streamable Dict/legacy columns.
+		streamed, serr := scanAggColCompactStreaming(ctx, r, agg.Field, sortedPKs, aggValByPos, aggPresentByPos)
+		if serr != nil {
+			return serr
 		}
-		if aggCol != nil {
-			scanAggColCompact(aggCol, sortedPKs, aggValByPos, aggPresentByPos)
+		if !streamed {
+			aggCol, aggErr := r.GetIntrinsicColumn(agg.Field)
+			if aggErr != nil {
+				return aggErr
+			}
+			if aggCol != nil {
+				scanAggColCompact(aggCol, sortedPKs, aggValByPos, aggPresentByPos)
+			}
 		}
 	}
 
@@ -2724,6 +2735,195 @@ func scanAggColCompact(
 	}
 }
 
+// scanAggColCompactStreaming is the streaming analog of scanAggColCompact's Flat/DeltaUint64
+// branch (NOTE-445, issue #361). It builds the POPCNT pkRankIndex over sortedPKs once, then
+// streams the aggregate column page-by-page via Reader.ScanIntrinsicColumn: each page's
+// (BlockRefs[i], Uint64Values[i]) pair is rank-scattered into aggValByPos/aggPresentByPos
+// exactly as the eager Flat branch did, so the result is byte-identical. Transient allocation is
+// O(one page), not O(column) — the whole span:duration Uint64Values+BlockRefs arena is never
+// materialized for the single forward scan. Returns (false,nil) when agg.Field is a
+// non-streamable Dict/legacy/absent column so the caller falls back to the eager scan.
+func scanAggColCompactStreaming(
+	ctx context.Context,
+	r *modules_reader.Reader,
+	fieldName string,
+	sortedPKs []uint32,
+	aggValByPos []float64,
+	aggPresentByPos []bool,
+) (bool, error) {
+	if len(sortedPKs) == 0 {
+		return true, nil // nothing to scatter; treat as handled (matches scanAggColCompact early-return)
+	}
+	var maxPK uint32
+	for _, pk := range sortedPKs {
+		if pk > maxPK {
+			maxPK = pk
+		}
+	}
+	idx := buildPKRankIndex(sortedPKs, maxPK)
+	defer idx.release()
+
+	spanCount := 0
+	streamed, err := r.ScanIntrinsicColumn(fieldName, func(p *modules_shared.DecodedPage) error {
+		for i := range p.BlockRefs {
+			if spanCount&ctxCheckMask == 0 {
+				if cerr := ctx.Err(); cerr != nil {
+					return cerr
+				}
+			}
+			spanCount++
+			if i >= len(p.Uint64Values) {
+				continue
+			}
+			ref := p.BlockRefs[i]
+			pk := packKey(ref.BlockIdx, ref.RowIdx)
+			if pk < idx.minPK || pk > idx.maxPK {
+				continue
+			}
+			word := pk >> 6
+			bit := pk & 63
+			if idx.bitset[word]&(uint64(1)<<bit) == 0 {
+				continue // pk not in sortedPKs
+			}
+			pos := idx.rankOf(pk)
+			aggValByPos[pos] = float64(p.Uint64Values[i]) //nolint:gosec
+			aggPresentByPos[pos] = true
+		}
+		return nil
+	})
+	if err != nil {
+		return streamed, err
+	}
+	return streamed, nil
+}
+
+// streamHistogramCompactAggCol is the streaming analog of the compact N=1 histogram aggregate
+// scan (NOTE-445, issue #361). It replaces the eager GetIntrinsicColumn(agg.Field) +
+// countIntrinsicHistogramBoundaries + scanAggColHistogramCompact with two streaming passes over
+// Reader.ScanIntrinsicColumn (each decodes ONE page at a time into reused buffers, transient
+// allocation O(one page) not O(column)):
+//
+//   - Pass 1: count distinct boundaries via histBoundaryCounter (the streaming analog of
+//     countIntrinsicHistogramBoundaries, byte-identical count), right-sizing actualStride. Also
+//     determines the streamable/eager decision: if the column is not a streamable paged Flat/XOR/
+//     Delta blob it returns streamed=false and the caller falls back to the eager path.
+//   - Pass 2: stream again, rank-scatter each page-local (BlockRefs[i], Uint64Values[i]) pair into
+//     groupCountsFlat via the prebuilt pkRankIndex + per-pos baseOffsetByPos — identical per-value
+//     work to scanAggColHistogramShard's Flat branch, so the accumulated cells are byte-identical.
+//
+// On streamed=true it returns the POOLED groupCountsFlat (caller releases) and sets *seenByPosOut
+// to a pooled seenByPos (caller releases). On streamed=false it returns zero values and releases
+// nothing (no buffers acquired), and the caller takes the eager path. The compressed blob stays in
+// the section cache between passes (GetOrFetchIntrinsic), so pass 2 re-decodes (cheap) but never
+// re-fetches.
+func streamHistogramCompactAggCol(
+	ctx context.Context,
+	r *modules_reader.Reader,
+	fieldName string,
+	sortedPKs []uint32,
+	timeBucketByPos []int32,
+	dictIdxByPos []uint32,
+	numGroups int,
+	numSteps int64,
+	seenByPosOut *[]bool,
+) (streamed bool, groupCountsFlat []int64, stride1, stepStride int64, boundaries []float64, err error) {
+	n := len(sortedPKs)
+
+	// Pass 1: stream to count distinct boundaries (right-size actualStride).
+	counter := newHistBoundaryCounter(fieldName)
+	spanCount := 0
+	streamed, err = r.ScanIntrinsicColumn(fieldName, func(p *modules_shared.DecodedPage) error {
+		if spanCount&ctxCheckMask == 0 {
+			if cerr := ctx.Err(); cerr != nil {
+				return cerr
+			}
+		}
+		for _, u := range p.Uint64Values {
+			spanCount++
+			if counter.add(float64(u)) {
+				break // histFlatStride cap reached — further values cannot raise the count
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return streamed, nil, 0, 0, nil, err
+	}
+	if !streamed {
+		return false, nil, 0, 0, nil, nil // not a streamable paged column — caller falls back to eager
+	}
+
+	actualStride := int64(counter.count) + 1 // +1 for absent sentinel at bIdx=0
+	// NOTE-398: boundary-innermost layout [group][step][boundary]; stepStride = actualStride.
+	stepStride = actualStride
+	stride1 = actualStride * numSteps
+	groupCountsFlat = acquireGroupCountsFlat(int64(numGroups) * stride1) //nolint:gosec
+
+	// NOTE-182: exponent-indexed boundary lookup. The streaming pass 1 guaranteed counter.count
+	// distinct boundaries fit under actualStride-1 unless the histFlatStride cap was hit, in which
+	// case the indexer's own discard sentinel handles the overflow identically to the eager path.
+	bi := newBoundaryIndexer(fieldName, actualStride)
+
+	// Build the POPCNT rank index over sortedPKs once (shared across pass-2 pages), and the
+	// per-pos scatter base (gIdx*stride1 + bk-1, histSkipPos for bk==0) — same as the eager
+	// scanAggColHistogramCompact (NOTE-397).
+	seenByPos := acquireCompactBool(n)
+	*seenByPosOut = seenByPos
+
+	var maxPK uint32
+	if n > 0 {
+		maxPK = sortedPKs[0]
+		for _, pk := range sortedPKs {
+			if pk > maxPK {
+				maxPK = pk
+			}
+		}
+	}
+	idx := buildPKRankIndex(sortedPKs, maxPK)
+	defer idx.release()
+
+	baseOffsetByPos := acquireCompactInt64NoClear(n)
+	defer releaseCompactInt64(baseOffsetByPos)
+	buildHistBaseOffsets(timeBucketByPos, dictIdxByPos, stride1, stepStride, baseOffsetByPos)
+
+	// Pass 2: stream again to accumulate. Each page's value i belongs to span p.BlockRefs[i];
+	// the per-value work mirrors scanAggColHistogramShard's Flat branch (serial — the eager
+	// parallel sharding existed only to amortize a full-column scan; streaming is page-serial).
+	spanCount = 0
+	_, err = r.ScanIntrinsicColumn(fieldName, func(p *modules_shared.DecodedPage) error {
+		for i := range p.BlockRefs {
+			if spanCount&ctxCheckMask == 0 {
+				if cerr := ctx.Err(); cerr != nil {
+					return cerr
+				}
+			}
+			spanCount++
+			if i >= len(p.Uint64Values) {
+				continue
+			}
+			pos, ok := histRefPassPos(p.BlockRefs[i], idx.minPK, idx.maxPK, idx.bitset, idx.rankPrefix)
+			if !ok {
+				continue
+			}
+			base := baseOffsetByPos[pos]
+			if base < 0 {
+				continue // histSkipPos — bk==0
+			}
+			bIdx := bi.index(float64(p.Uint64Values[i]))
+			if bIdx >= actualStride {
+				continue // guard: boundary cap exceeded
+			}
+			seenByPos[pos] = true
+			groupCountsFlat[base+bIdx]++
+		}
+		return nil
+	})
+	if err != nil {
+		return true, groupCountsFlat, stride1, stepStride, bi.boundaries, err
+	}
+	return true, groupCountsFlat, stride1, stepStride, bi.boundaries, nil
+}
+
 // streamHistogramN1Compact accumulates histogram counts for the N=1 group-by case
 // without allocating large dense arrays indexed by packKey.
 //
@@ -2834,39 +3034,59 @@ func streamHistogramN1CompactCore(
 	}
 	numGroups := len(dict)
 
-	// Fetch aggregate column and pre-scan boundaries.
-	aggCol, aggErr := r.GetIntrinsicColumn(agg.Field)
-	if aggErr != nil {
-		return aggErr
-	}
-	var actualStride int64
-	if aggCol != nil {
-		actualStride = int64(countIntrinsicHistogramBoundaries(aggCol, agg.Field)) + 1
-	} else {
-		actualStride = 1
-	}
-	// NOTE-398: boundary-innermost layout [group][step][boundary]. stepStride = actualStride
-	// (the boundary count), so the inner (group,step) slot is actualStride contiguous cells and
-	// consecutive same-pos refs with differing value-buckets stay on the same cache line.
-	stepStride := actualStride
-	stride1 := actualStride * numSteps
-	// NOTE-124: pool to avoid per-block allocation.
-	groupCountsFlat := acquireGroupCountsFlat(int64(numGroups) * stride1) //nolint:gosec
-	defer releaseGroupCountsFlat(groupCountsFlat)
-
-	// NOTE-182: exponent-indexed boundary lookup replaces the per-row map[float64]int64.
-	bi := newBoundaryIndexer(agg.Field, actualStride)
-	getBoundaryIdx := bi.index
-
-	// NOTE-125: pool seenByPos (~7 MB at n=7.2 M).
-	seenByPos := acquireCompactBool(n)
-	defer releaseCompactBool(seenByPos)
-	if aggCol != nil {
-		if err := scanAggColHistogramCompact(ctx, aggCol, sortedPKs, timeBucketByPos, dictIdxByPos, seenByPos, getBoundaryIdx, groupCountsFlat, stride1, stepStride, actualStride, agg.Field, bi.lookup, bi); err != nil {
-			return err
+	// NOTE-445 (issue #361): try streaming the aggregate column first (decode-time rank-scatter,
+	// no O(column) materialization). span:duration is a paged DeltaUint64 column, so the eager
+	// GetIntrinsicColumn below — which materializes O(rows) Uint64Values+BlockRefs for a boundary
+	// pre-count then a sharded scan — is replaced by two O(one-page) streaming passes. Falls back
+	// to the eager fetch+scan for non-streamable (Dict / legacy / absent) columns.
+	var seenByPos []bool
+	streamed, groupCountsFlat, stride1, stepStride, boundaries, serr := streamHistogramCompactAggCol(
+		ctx, r, agg.Field, sortedPKs, timeBucketByPos, dictIdxByPos, numGroups, numSteps, &seenByPos,
+	)
+	if serr != nil {
+		if seenByPos != nil {
+			releaseCompactBool(seenByPos)
 		}
+		if groupCountsFlat != nil {
+			releaseGroupCountsFlat(groupCountsFlat)
+		}
+		return serr
 	}
-	boundaries := bi.boundaries
+	if !streamed {
+		// Eager fallback: fetch aggregate column and pre-scan boundaries.
+		aggCol, aggErr := r.GetIntrinsicColumn(agg.Field)
+		if aggErr != nil {
+			return aggErr
+		}
+		var actualStride int64
+		if aggCol != nil {
+			actualStride = int64(countIntrinsicHistogramBoundaries(aggCol, agg.Field)) + 1
+		} else {
+			actualStride = 1
+		}
+		// NOTE-398: boundary-innermost layout [group][step][boundary]. stepStride = actualStride
+		// (the boundary count), so the inner (group,step) slot is actualStride contiguous cells and
+		// consecutive same-pos refs with differing value-buckets stay on the same cache line.
+		stepStride = actualStride
+		stride1 = actualStride * numSteps
+		// NOTE-124: pool to avoid per-block allocation.
+		groupCountsFlat = acquireGroupCountsFlat(int64(numGroups) * stride1) //nolint:gosec
+		// NOTE-182: exponent-indexed boundary lookup replaces the per-row map[float64]int64.
+		bi := newBoundaryIndexer(agg.Field, actualStride)
+		getBoundaryIdx := bi.index
+		// NOTE-125: pool seenByPos (~7 MB at n=7.2 M).
+		seenByPos = acquireCompactBool(n)
+		if aggCol != nil {
+			if err := scanAggColHistogramCompact(ctx, aggCol, sortedPKs, timeBucketByPos, dictIdxByPos, seenByPos, getBoundaryIdx, groupCountsFlat, stride1, stepStride, actualStride, agg.Field, bi.lookup, bi); err != nil {
+				releaseCompactBool(seenByPos)
+				releaseGroupCountsFlat(groupCountsFlat)
+				return err
+			}
+		}
+		boundaries = bi.boundaries
+	}
+	defer releaseGroupCountsFlat(groupCountsFlat)
+	defer releaseCompactBool(seenByPos)
 
 	// Absent-row pass: positions not seen in the aggregate column → bIdx=0 sentinel.
 	// NOTE-398: bIdx=0 is the innermost (stride 1) slot, so the cell is gIdx*stride1 + (bk-1)*stepStride.
@@ -5046,19 +5266,44 @@ func accumulateHistogramDirectN0(
 
 	seenByPK := acquireDirectBool(int(maxPK) + 1) // NOTE-129
 
-	// Step 5: scan the histogram agg column using the N=0 specialized scanner.
-	// N=0: gIdx is always 0 — no dictByPK allocation or lookup needed.
-	col, err := r.GetIntrinsicColumn(agg.Field)
-	if err != nil {
+	// Step 5: scan the histogram agg column.
+	// NOTE-445 (issue #361): stream the agg column page-by-page (decode-time scatter into the
+	// dense groupCountsFlat, no O(column) materialization). span:duration is a paged DeltaUint64
+	// column, so the eager GetIntrinsicColumn — which materializes O(rows) Uint64Values+BlockRefs
+	// for one forward scan — is replaced by a single O(one-page) streaming pass. The N=0 indexer
+	// is pre-warmed lazily by bi.index during the same pass (no separate boundary-count pass is
+	// needed: stepStride is the fixed histFlatStride, unlike the N=1 path which right-sizes
+	// actualStride). Falls back to the eager scanHistogramN0 for non-streamable Dict/legacy
+	// columns; the absent column case is handled below (col==nil → boundary-0 only).
+	streamed, serr := scanHistogramN0Streaming(
+		ctx,
+		r,
+		agg.Field,
+		bucketByPK,
+		maxPK,
+		seenByPK,
+		bi.index,
+		groupCountsFlat,
+		stepStride,
+	)
+	if serr != nil {
 		releaseDirectInt16(bucketByPK)
 		releaseDirectBool(seenByPK)
-		return err
+		return serr
 	}
-	if col != nil {
-		if err := scanHistogramN0(ctx, col, bucketByPK, maxPK, seenByPK, bi.index, groupCountsFlat, stepStride); err != nil {
+	if !streamed {
+		col, err := r.GetIntrinsicColumn(agg.Field)
+		if err != nil {
 			releaseDirectInt16(bucketByPK)
 			releaseDirectBool(seenByPK)
 			return err
+		}
+		if col != nil {
+			if err := scanHistogramN0(ctx, col, bucketByPK, maxPK, seenByPK, bi.index, groupCountsFlat, stepStride); err != nil {
+				releaseDirectInt16(bucketByPK)
+				releaseDirectBool(seenByPK)
+				return err
+			}
 		}
 	}
 
@@ -5114,13 +5359,38 @@ func accumulateAggDirect(
 	seenByPK := acquireDirectBool(int(maxPK) + 1)         // NOTE-129
 	defer releaseDirectBool(seenByPK)
 
-	col, err := r.GetIntrinsicColumn(agg.Field)
-	if err != nil {
-		return err
+	// NOTE-445 (issue #361): stream the aggregate column page-by-page (decode-time scatter into
+	// the dense groupBuckets, no O(column) materialization). span:duration is a paged DeltaUint64
+	// column, so the eager GetIntrinsicColumn below — which materializes O(rows) Uint64Values +
+	// BlockRefs only to do one forward scan — is replaced by a single O(one-page) streaming pass.
+	// Falls back to the eager scan for non-streamable (Dict / legacy / absent) columns.
+	streamed, serr := accumulateAggDirectStreaming(
+		ctx,
+		r,
+		agg.Field,
+		agg.Function,
+		dictByPK,
+		bucketByPK,
+		minPK,
+		maxPK,
+		numSteps,
+		numGroups,
+		groupBuckets,
+		&arena,
+		seenByPK,
+	)
+	if serr != nil {
+		return serr
 	}
-	if col != nil {
-		if err := accumulateAggDirectScanCol(ctx, col, agg.Function, dictByPK, bucketByPK, minPK, maxPK, numSteps, numGroups, groupBuckets, &arena, seenByPK); err != nil {
+	if !streamed {
+		col, err := r.GetIntrinsicColumn(agg.Field)
+		if err != nil {
 			return err
+		}
+		if col != nil {
+			if err := accumulateAggDirectScanCol(ctx, col, agg.Function, dictByPK, bucketByPK, minPK, maxPK, numSteps, numGroups, groupBuckets, &arena, seenByPK); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -5260,6 +5530,72 @@ func accumulateAggDirectScanCol(
 		}
 	}
 	return nil
+}
+
+// accumulateAggDirectStreaming is the streaming analog of accumulateAggDirectScanCol's
+// Flat/DeltaUint64 branch (NOTE-445, issue #361). It streams the aggregate column page-by-page
+// via Reader.ScanIntrinsicColumn, scattering each page's (BlockRefs[i], Uint64Values[i]) pair
+// directly into the dense groupBuckets via O(1) dictByPK/bucketByPK lookups — identical per-value
+// work to the eager Flat branch, so the accumulated buckets are byte-identical. Transient
+// allocation is O(one page), not O(column). Returns (false,nil) when fieldName is a
+// non-streamable Dict/legacy/absent column so the caller falls back to the eager scan.
+func accumulateAggDirectStreaming(
+	ctx context.Context,
+	r *modules_reader.Reader,
+	fieldName string,
+	fn string,
+	dictByPK []uint32,
+	bucketByPK []int16,
+	minPK uint32,
+	maxPK uint32,
+	numSteps int64,
+	numGroups int,
+	groupBuckets [][]*aggBucketState,
+	arena *bucketArena,
+	seenByPK []bool,
+) (bool, error) {
+	spanCount := 0
+	streamed, err := r.ScanIntrinsicColumn(fieldName, func(p *modules_shared.DecodedPage) error {
+		for i := range p.BlockRefs {
+			if spanCount&ctxCheckMask == 0 {
+				if cerr := ctx.Err(); cerr != nil {
+					return cerr
+				}
+			}
+			spanCount++
+			if i >= len(p.Uint64Values) {
+				continue
+			}
+			ref := p.BlockRefs[i]
+			pk := packKey(ref.BlockIdx, ref.RowIdx)
+			if pk < minPK || pk > maxPK {
+				continue
+			}
+			bk := int64(bucketByPK[pk])
+			if bk == 0 {
+				continue
+			}
+			seenByPK[pk] = true
+			var gIdx int
+			if raw := dictByPK[pk]; raw > 0 {
+				gIdx = int(raw - 1) //nolint:gosec
+			}
+			if gIdx >= numGroups || bk-1 >= numSteps {
+				continue
+			}
+			if groupBuckets[gIdx][bk-1] == nil {
+				b := arena.alloc()
+				b.min, b.max = math.MaxFloat64, -math.MaxFloat64
+				groupBuckets[gIdx][bk-1] = b
+			}
+			updateAggBucket(groupBuckets[gIdx][bk-1], fn, float64(p.Uint64Values[i])) //nolint:gosec
+		}
+		return nil
+	})
+	if err != nil {
+		return streamed, err
+	}
+	return streamed, nil
 }
 
 // buildAggValsForRef builds a []float64 parallel to inRangeRefs containing the aggregate
@@ -5906,6 +6242,62 @@ func scanHistogramN0(
 		}
 	}
 	return nil
+}
+
+// scanHistogramN0Streaming is the streaming analog of scanHistogramN0's Flat/DeltaUint64 branch
+// (NOTE-445, issue #361). It streams the histogram agg column page-by-page via
+// Reader.ScanIntrinsicColumn, folding each page's (BlockRefs[i], Uint64Values[i]) pair straight
+// into the single-group dense groupCountsFlat — identical per-value work to the eager Flat
+// branch, so the accumulated counts are byte-identical. The boundary indexer (getBoundaryIdx) is
+// pre-warmed lazily during the same scan; the N=0 path uses the fixed histFlatStride so no
+// separate boundary-count pass is required. Transient allocation is O(one page), not O(column).
+// Returns (false,nil) when fieldName is a non-streamable Dict/legacy/absent column so the caller
+// falls back to the eager scanHistogramN0.
+func scanHistogramN0Streaming(
+	ctx context.Context,
+	r *modules_reader.Reader,
+	fieldName string,
+	bucketByPK []int16,
+	maxPK uint32,
+	seenByPK []bool,
+	getBoundaryIdx func(float64) int64,
+	groupCountsFlat []int64,
+	stepStride int64,
+) (bool, error) {
+	spanCount := 0
+	streamed, err := r.ScanIntrinsicColumn(fieldName, func(p *modules_shared.DecodedPage) error {
+		for i := range p.BlockRefs {
+			if spanCount&ctxCheckMask == 0 {
+				if cerr := ctx.Err(); cerr != nil {
+					return cerr
+				}
+			}
+			spanCount++
+			if i >= len(p.Uint64Values) {
+				continue
+			}
+			ref := p.BlockRefs[i]
+			pk := packKey(ref.BlockIdx, ref.RowIdx)
+			if pk > maxPK {
+				continue
+			}
+			bk := int64(bucketByPK[pk])
+			if bk == 0 {
+				continue
+			}
+			bIdx := getBoundaryIdx(float64(p.Uint64Values[i]))
+			if bIdx >= int64(histFlatStride) {
+				continue
+			}
+			seenByPK[pk] = true
+			groupCountsFlat[(bk-1)*stepStride+bIdx]++
+		}
+		return nil
+	})
+	if err != nil {
+		return streamed, err
+	}
+	return streamed, nil
 }
 
 // streamByRefSliceHistogramScanDict scans an intrinsic column (both dict and flat formats) and
