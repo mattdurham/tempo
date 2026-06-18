@@ -1107,3 +1107,45 @@ for _, row := range rows {
 ```
 
 Back-ref: `internal/modules/executor/predicates.go:ComputeSecondPassCols`
+
+## SPEC-IS-01: IntrinsicScanner — Mandatory Sequential-Scan Access (NOTE-443, issue #362)
+
+`reader.IntrinsicScanner` is the canonical way to read an intrinsic column with a
+sequential forward scan. It centralizes the streaming-vs-eager decision that callers
+previously hand-rolled (try `Reader.ScanIntrinsicColumn`, fall back to
+`Reader.GetIntrinsicColumn` on `streamed=false`).
+
+### Policy
+
+- **Sequential-scan access to intrinsic columns MUST use `IntrinsicScanner`.** A caller
+  that walks every row of a value-decoupled column once (boundary pre-count, bucket
+  accumulation, rank-scatter) writes its logic as a single `Scan(visit)` callback over
+  `*shared.DecodedPage` and lets the scanner pick streaming (paged Flat/XOR/Delta, O(one
+  page)) or the eager single-synthetic-page fallback (legacy v1 / non-paged) transparently.
+- **Direct `GetIntrinsicColumn` calls in the executor are reserved for random-access
+  patterns** — predicate evaluation, reverse `refIndex` lookups by rank, multi-pass
+  random algorithms — where a materialized full column is genuinely required.
+
+### Scope and limits
+
+- `IntrinsicScanner` serves **value-decoupled columns only** (uint64 Flat/XOR/Delta and
+  per-row bytes), whose values live in `Uint64Values`/`BytesValues` parallel to
+  `BlockRefs`. `DecodedPage` is a flat value-per-row model with no `DictEntries` field.
+- **Dict columns are out of scope.** Their values live in a cross-row `DictEntries` arena
+  with no flat `DecodedPage` representation. `Scan` returns an error (rather than silently
+  dropping data) if the eager-fallback column is Dict-format. Dict sequential scans use
+  `Reader.ScanDictGroupByColumn` (NOTE-407) instead.
+- **Absent columns** (no intrinsic section, or name not present) cause zero `visit` calls
+  and a `nil` return — identical to streaming a column with zero pages.
+
+### Lifetime contract
+
+The `*shared.DecodedPage` and every slice it references are valid ONLY for the duration of
+a single `visit` call. The streaming path reuses page buffers across pages; a visitor that
+retains any value or ref beyond its call MUST copy it. The eager-fallback path happens to
+alias the cached column's immutable slices, but callers MUST NOT rely on that — which path
+runs is intentionally opaque.
+
+Back-ref: `internal/modules/blockio/reader/intrinsic_scanner.go`,
+`internal/modules/blockio/reader/intrinsic_reader.go:ScanIntrinsicColumn,GetIntrinsicColumn`,
+NOTE-406/407/410/442 (the streaming-discipline predecessors).

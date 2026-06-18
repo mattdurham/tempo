@@ -3215,3 +3215,53 @@ fallback and empty-batch no-op.
 `internal/modules/tieredcache/typed.go:PutMultiV8Section`,
 `internal/modules/chaincache/chaincache.go:PutMulti`,
 `internal/modules/memcache/memcache.go:SetMulti`, NOTE-179/185 (the read-side analogs).
+
+## NOTE-443: IntrinsicScanner — always-streaming sequential-scan adapter (issue #362)
+
+The reader exposed two competing APIs for reading an intrinsic column:
+`ScanIntrinsicColumn` (streaming, page-by-page, O(one page), but returns `(false, nil)` for
+non-streamable Dict / legacy v1 / absent blobs so the caller must hand-roll the eager
+fallback) and `GetIntrinsicColumn` (eager, O(rows) materialization). Sequential-scan
+callsites that wanted streaming duplicated the try-stream-then-fall-back-to-eager dance, and
+several un-converted sites (issues #360, #361) used `GetIntrinsicColumn` by habit, paying
+unnecessary O(rows) materialization.
+
+`IntrinsicScanner` (`intrinsic_scanner.go`) centralizes that decision exactly once. A caller
+writes its sequential forward-scan logic as a single `Scan(visit)` callback over
+`*shared.DecodedPage`. The scanner:
+
+1. Tries `ScanIntrinsicColumn` (streaming paged Flat/XOR/Delta). If streamed, done.
+2. Else falls back to `GetIntrinsicColumn` ONCE and re-presents the eager column as a single
+   synthetic `DecodedPage` (`RowBase 0`, the whole column's flat values + refs parallel to
+   `BlockRefs`), invoking `visit` once.
+3. An absent column (`col == nil`) causes zero `visit` calls and a `nil` return — identical
+   to streaming an empty column.
+
+**Scope — value-decoupled columns only.** `DecodedPage` is a flat value-per-row model with no
+`DictEntries` field. Dict columns store values in a cross-row `DictEntries` arena that has no
+flat page representation, so `Scan` returns an error (rather than silently handing the visitor
+an empty value slice) if the eager-fallback column is `IntrinsicFormatDict`. Dict sequential
+scans use `ScanDictGroupByColumn` (NOTE-407). The eager fallback uses the eager-refs
+`GetIntrinsicColumn` (not the lazy-refs variant) because visitors read `p.BlockRefs`.
+
+**Lifetime** (inherited from `ScanIntrinsicColumn` / `shared.DecodedPage`): the page and its
+slices are valid only for the duration of a single `visit` call; the streaming path reuses
+page buffers across pages, so a visitor that retains a value/ref MUST copy it.
+
+**Policy** (executor/SPECS.md SPEC-IS-01): sequential-scan access to intrinsic columns MUST
+use `IntrinsicScanner`; direct `GetIntrinsicColumn` calls are reserved for random-access
+patterns (predicate eval, reverse refIndex lookups, multi-pass random algorithms).
+
+This is the foundation issues #360/#361/#363 build on: each becomes "replace
+`GetIntrinsicColumn(agg.Field)` with `NewIntrinsicScanner(r, agg.Field).Scan(...)` and write
+the accumulation as a page callback", keeping any Dict branch on the eager path.
+
+**Verification:** `intrinsic_scanner_test.go` covers all four branches with real reader
+fixtures — `span:duration` (Delta-paged → streaming), `span:end` (synthesized Flat, NOT
+paged-streamable → eager single-synthetic-page fallback), `span:name` (Dict → error), an
+absent name (zero visit calls), and visitor-error propagation on both paths. The streaming
+and eager fallback paths are asserted byte-identical to the eager `GetIntrinsicColumn` view.
+
+**Back-ref:** `internal/modules/blockio/reader/intrinsic_scanner.go`,
+`internal/modules/blockio/reader/intrinsic_reader.go:ScanIntrinsicColumn,GetIntrinsicColumn`,
+`internal/modules/blockio/shared/intrinsic_stream.go:DecodedPage`, NOTE-406/407/410/442.
