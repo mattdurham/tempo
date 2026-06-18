@@ -2666,6 +2666,33 @@ func scanDeltaUint64PagedBlob(
 // Decodes the uvarint stream to reconstruct absolute values, collects refs matching filter.
 //
 // NOTE-014: must NOT call pageRefsStart — DeltaUint64 pages have no values_len prefix.
+// deltaUint64RefsStart returns the byte offset of the refs section within a decompressed
+// DeltaUint64 page (payload = uvarint deltas followed by refs[rowCount × refSize], with
+// nothing after — see encodeDeltaUint64Intrinsic).
+//
+// NOTE-447 (issue #365): when unfiltered is true (the match-all top-K path, filter == nil),
+// the caller never inspects values, so the refs offset is derived in O(1) as
+// len(pageRaw) - rowCount*refSize — skipping the per-value uvarint decode loop entirely
+// (300k+ binary.Uvarint calls on a real span:start column). This mirrors how parquet locates
+// the newest rows from row-group statistics without decompressing data pages. The overflow-
+// safe guard rowCount <= len(pageRaw)/refSize falls back to the full uvarint scan on an
+// implausible offset (corrupt/truncated page). For filtered scans the value boundary is
+// found by the sequential uvarint scan as before. Returns ok=false on uvarint decode error.
+func deltaUint64RefsStart(pageRaw []byte, rowCount, refSize int, unfiltered bool) (int, bool) {
+	if unfiltered && refSize > 0 && rowCount <= len(pageRaw)/refSize {
+		return len(pageRaw) - rowCount*refSize, true
+	}
+	p := 0
+	for range rowCount {
+		_, n := binary.Uvarint(pageRaw[p:])
+		if n <= 0 {
+			return 0, false
+		}
+		p += n
+	}
+	return p, true
+}
+
 func scanDeltaUint64PagedFiltered(
 	blob []byte,
 	toc PagedIntrinsicTOC,
@@ -2704,13 +2731,9 @@ func scanDeltaUint64PagedFiltered(
 			return false
 		}
 		rowCount := int(pm.RowCount)
-		p := 0
-		for range rowCount {
-			_, n := binary.Uvarint(pageRaw[p:])
-			if n <= 0 {
-				return false
-			}
-			p += n
+		p, ok := deltaUint64RefsStart(pageRaw, rowCount, refSize, filter == nil)
+		if !ok {
+			return false
 		}
 		// p is now the start of the refs section.
 		if backward {

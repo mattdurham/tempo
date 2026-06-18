@@ -336,6 +336,48 @@ Back-ref: `internal/modules/blockio/shared/constants.go:IntrinsicFormatXORBytes`
 
 ---
 
+## NOTE-447: O(1) refs-offset for the unfiltered DeltaUint64 top-K path (issue #365)
+*Added: 2026-06-18*
+
+**Problem:** `{}` (unfiltered search, limit=N) on a block dominated by a Delta-encoded
+`span:start` column was ~20x slower than parquet. Parquet uses row-group min/max stats to
+find the newest rows without touching data pages; blockpack's `collectMatchAllTopK` routes
+through `ScanFlatColumnTopKRefs` → `scanFlatPagedFiltered` → `scanDeltaUint64PagedFiltered`,
+which decoded the ENTIRE uvarint delta stream (300k+ `binary.Uvarint` calls on a real block)
+solely to locate the start of the refs section — even though the match-all path
+(`filter == nil`) never inspects a single value, it only wants the newest/oldest N refs.
+
+**Fix:** `encodeDeltaUint64Intrinsic` lays the single page out as
+`[uvarint deltas][refs N×refSize]` with NOTHING after the refs (NOTE-014). The refs section
+therefore begins at `len(pageRaw) - rowCount*refSize` — derivable in O(1) from the TOC's
+`RowCount` and the ref widths, with ZERO value decode. `scanDeltaUint64PagedFiltered` now
+takes this O(1) offset whenever `filter == nil`; the full uvarint scan is retained for
+`filter != nil` and as a safety fallback when the computed offset is implausible (corrupt /
+truncated page, guarded by `refSize > 0 && rowCount <= len(pageRaw)/refSize`).
+
+**Why this is general, not a benchmark shortcut:** the optimization keys ONLY on the
+structural invariant `filter == nil` (no predicate / time-range-only) and the fixed
+delta-page layout — no attribute names, no query-specific constants. It mirrors exactly what
+parquet does with row-group statistics. It applies to every unfiltered limit query on any
+DeltaUint64 column, which is the dominant Grafana "Search" UI pattern.
+
+**Single-page note:** `encodeDeltaUint64Intrinsic` always emits exactly one logical page
+(`Pages=[1 entry]`), so the issue's "sort pages by pm.Max, decode only top-K pages" reduces
+to "skip the value decode of the single page" — there is only one page and the refs within
+it are already globally sorted ascending (`sortFlatAccum`), so the last N refs ARE the
+newest N. No wire-format change and no per-page Max sort is needed.
+
+**Proof the value decode is skipped:** `TestDeltaUint64TopK_FastPathSkipsValueDecode`
+(shared_test.go) builds two byte blobs with identical refs but one with deliberately
+corrupted value uvarints; both yield identical top-K refs, proving the value stream is never
+read on the `filter == nil` path.
+
+Back-ref: `internal/modules/blockio/shared/intrinsic_codec.go:scanDeltaUint64PagedFiltered`,
+          `internal/modules/blockio/writer/intrinsic_accum.go:encodeDeltaUint64Intrinsic`,
+          `internal/modules/executor/stream.go:collectMatchAllTopK`
+
+---
+
 ## NOTE-014: IntrinsicFormatDeltaUint64 — Single Snappy Pass for uint64 Columns
 *Added: 2026-04-22*
 
