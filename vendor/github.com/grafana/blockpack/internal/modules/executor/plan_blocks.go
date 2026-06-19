@@ -74,6 +74,7 @@ func planBlocks(
 	// Returns nil when no pruning is possible (no intrinsic section, no intrinsic
 	// predicates, or all blocks survive), so we skip the intersection step in that case.
 	if intrinsicBlocks := BlocksFromIntrinsicTOC(r, program); intrinsicBlocks != nil {
+		beforeIntrinsic := len(plan.SelectedBlocks)
 		keepSet := make(map[int]struct{}, len(intrinsicBlocks))
 		for _, bi := range intrinsicBlocks {
 			keepSet[bi] = struct{}{}
@@ -85,6 +86,7 @@ func planBlocks(
 			}
 		}
 		plan.SelectedBlocks = filtered
+		plan.PrunedByIntrinsicTOC = beforeIntrinsic - len(plan.SelectedBlocks) // NOTE-449
 	}
 
 	// ColStats block pruning (NOTE-446, issue #364): skip blocks where a predicate column
@@ -92,7 +94,9 @@ func planBlocks(
 	// the predicate's bound. Runs last so it refines the already-selected set with no extra
 	// I/O beyond the lazily-fetched ColStats section.
 	if program != nil && program.Predicates != nil && r.HasColStats() {
+		beforeColStats := len(plan.SelectedBlocks) // NOTE-449
 		plan.SelectedBlocks = pruneByColStats(r, program.Predicates.Nodes, plan.SelectedBlocks)
+		plan.PrunedByColStats = beforeColStats - len(plan.SelectedBlocks) // NOTE-449
 	}
 
 	return plan

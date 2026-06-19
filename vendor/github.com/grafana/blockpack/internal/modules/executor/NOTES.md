@@ -6995,3 +6995,39 @@ the new dispatch branches never fire on old files. New files gain more aggressiv
 `rejectBytesRange`, `rejectRegexByStringBounds`, `extractAnchoredLiteralPrefix`,
 `colStatsRejectsInt64`, `colStatsRejectsFloat64`, `colStatsRejects`.
 `internal/modules/blockio/writer/writer_block.go:finalize` (switch extension).
+
+---
+
+## NOTE-449: OTel Tracing Instrumentation — Layered Spans with Aggregated Cache Attributes (2026-06-19)
+
+Resolves NOTE-058 context propagation TODOs and adds OpenTelemetry spans at three levels:
+`blockpack.query` (per `Collect` call), `blockpack.planner` (per `planBlocks` call), and
+`blockpack.block` (per dispatched block in `scanBlocks`).
+
+Cache hit/miss counts are aggregated per-block in a `CacheStats` struct passed into
+`readBlockColumnarWithCache` — no per-fetch spans. All `span.SetAttributes` calls are guarded
+by `span.IsRecording()` to prevent attribute allocations on unsampled queries. The package-level
+`var tracer` follows Tempo's pattern.
+
+See issue #368 for the full observability requirements.
+
+Changes:
+- `Collect`, `ExecuteLogMetrics` gain `ctx context.Context` first param (NOTE-058 resolved).
+- NOTE-058 `context.Background()` placeholders removed in `stream.go`, `stream_topk.go`,
+  `metrics_log.go`.
+- `Plan` struct gains `PrunedByColStats`, `PrunedByIntrinsicTOC` int fields (plan_blocks.go
+  wires the counters). See queryplanner NOTE-449.
+- New files: `tracer.go`, `otel_spans.go` (span helpers), reader `cache_stats.go`.
+- `readBlockColumnarWithCache` gains `*CacheStats` parameter (nil-safe).
+- `Collect`'s `scanBlocks` `processGroup` wraps each block in a `blockpack.block` span via a
+  per-iteration closure (`defer span.End()` pattern).
+
+Deferred: CacheStats population from `blockGroupPipeline` workers requires threading
+`*CacheStats` out of `ReadGroupColumnar` workers — currently stats remain zero; follow-up issue.
+NOTE-447 gate hit counter for structural query path also deferred.
+
+**Back-ref:** `internal/modules/executor/stream.go:Collect,scanBlocks`,
+`internal/modules/executor/tracer.go:tracer`,
+`internal/modules/executor/otel_spans.go:emitPlannerSpan,startBlockSpan,attachCacheStats`,
+`internal/modules/blockio/reader/cache_stats.go:CacheStats`,
+`internal/modules/queryplanner/plan.go:Plan`.

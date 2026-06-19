@@ -19,7 +19,7 @@ This document defines the public contracts, input/output semantics, and invarian
 ## 2. Executor
 
 ```go
-func Collect(r *modules_reader.Reader, program *vm.Program, opts CollectOptions) ([]MatchedRow, QueryStats, error)
+func Collect(ctx context.Context, r *modules_reader.Reader, program *vm.Program, opts CollectOptions) ([]MatchedRow, QueryStats, error)
 func SpanMatchFromRow(row MatchedRow, signalType uint8, r *modules_reader.Reader) (SpanMatch, error)
 ```
 
@@ -433,7 +433,8 @@ Back-ref: `internal/modules/executor/predicates.go:rowSatisfiesIntrinsicNodesOR`
 
 All block-scan paths (scanBlocks, forEachBlockInGroups, ExecuteTraceMetrics,
 ExecuteLogMetrics, topKScanBlocks) use `blockGroupPipeline` for I/O.
-See NOTE-058 for the full caller inventory.
+NOTE-449 resolved NOTE-058: all callers now propagate a real `context.Context`; the
+`context.Background()` placeholders have been removed.
 Back-ref: `internal/modules/executor/stream_topk.go:topKScanBlocks`
 
 **Invariants:**
@@ -629,6 +630,7 @@ Back-ref: `internal/modules/executor/stream_log_topk.go:CollectLogs`
 
 ```go
 func ExecuteLogMetrics(
+    ctx context.Context,
     r *modules_reader.Reader,
     program *vm.Program,
     pipeline *logqlparser.Pipeline,
@@ -1149,3 +1151,42 @@ runs is intentionally opaque.
 Back-ref: `internal/modules/blockio/reader/intrinsic_scanner.go`,
 `internal/modules/blockio/reader/intrinsic_reader.go:ScanIntrinsicColumn,GetIntrinsicColumn`,
 NOTE-406/407/410/442 (the streaming-discipline predecessors).
+
+---
+
+## SPEC-OBS-001: Context Propagation (see root SPEC.md)
+
+All executor entry points (`Collect`, `ExecuteLogMetrics`) MUST accept `ctx context.Context`
+as first parameter. Nil is normalized to `context.Background()` at the boundary. See root
+SPEC-OBS-001 for the full invariant. NOTE-449 resolved NOTE-058.
+
+Back-ref: `internal/modules/executor/stream.go:Collect`,
+`internal/modules/executor/metrics_log.go:ExecuteLogMetrics`.
+
+---
+
+## SPEC-OBS-002: Mandatory Spans Per Query Type (see root SPEC.md)
+
+`Collect` on the `planBlocks → scanBlocks` path MUST produce:
+`blockpack.query` → `blockpack.planner` (child) → `blockpack.block` (children, one per block).
+
+Back-ref: `internal/modules/executor/stream.go:Collect,scanBlocks`,
+`internal/modules/executor/otel_spans.go:emitPlannerSpan,startBlockSpan`.
+
+---
+
+## SPEC-OBS-003: IsRecording() Guard (see root SPEC.md)
+
+Every `span.SetAttributes(...)` on the hot path MUST be wrapped in `if span.IsRecording()`.
+
+Back-ref: `internal/modules/executor/otel_spans.go`.
+
+---
+
+## SPEC-OBS-004: Block Span Cache Attributes (see root SPEC.md)
+
+Cache hit/miss counts on `blockpack.block` spans are aggregated via `CacheStats`, never
+via per-fetch child spans.
+
+Back-ref: `internal/modules/executor/otel_spans.go:attachCacheStats`,
+`internal/modules/blockio/reader/cache_stats.go`.

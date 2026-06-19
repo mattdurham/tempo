@@ -57,7 +57,9 @@ const (
 // pipeline may be nil (no post-filter transformation).
 // funcName is the LogQL aggregation function (count_over_time, rate, etc.).
 // groupBy is the list of label names to group the time series by.
+// SPEC-OBS-001: ctx is the first parameter to enable OTel context propagation; nil is normalized to Background.
 func ExecuteLogMetrics(
+	ctx context.Context,
 	r *modules_reader.Reader,
 	program *vm.Program,
 	pipeline *logqlparser.Pipeline,
@@ -65,6 +67,9 @@ func ExecuteLogMetrics(
 	funcName string,
 	groupBy []string,
 ) (*LogMetricsResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if r == nil {
 		return &LogMetricsResult{}, nil
 	}
@@ -98,9 +103,9 @@ func ExecuteLogMetrics(
 	// buckets maps composite key (bucketIdxStr + "\x00" + attrGroupKey) to aggBucketState.
 	buckets := make(map[string]*aggBucketState)
 
-	// TODO: propagate caller context (NOTE-058: ExecuteLogMetrics does not yet accept context.Context).
+	// NOTE-449: ctx is now propagated (resolves NOTE-058 for ExecuteLogMetrics).
 	_, _, _, pipelineErr := blockGroupPipeline(
-		context.Background(), r, groups, defaultPipelineWorkers, wantColumns,
+		ctx, r, groups, defaultPipelineWorkers, wantColumns,
 		func(groupIdx int, groupRaw map[int][]byte) error {
 			for _, blockIdx := range groups[groupIdx].BlockIDs {
 				raw, ok := groupRaw[blockIdx]

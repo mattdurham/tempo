@@ -151,6 +151,7 @@ func topKScanRowsFromIntrinsic(
 // SPEC-STREAM-11: I/O is concurrent across defaultPipelineWorkers goroutines; parse and heap
 // updates are sequential within processGroup callbacks, so buf requires no synchronization.
 func topKScanBlocks(
+	ctx context.Context,
 	r *modules_reader.Reader,
 	program *vm.Program,
 	wantColumns map[string]struct{},
@@ -249,7 +250,7 @@ func topKScanBlocks(
 	}
 
 	// SPEC-STREAM-11: concurrent I/O via blockGroupPipeline; processGroup called sequentially.
-	// TODO: propagate caller context (NOTE-058: Collect does not yet accept context.Context).
+	// NOTE-449: ctx is now propagated (resolves NOTE-058 for topKScanBlocks).
 	// Pass union of wantColumns + secondPassCols so filterBlockColumns retains all needed data.
 	allCols := make(map[string]struct{}, len(wantColumns)+len(secondPassCols))
 	for k := range wantColumns {
@@ -259,7 +260,7 @@ func topKScanBlocks(
 		allCols[k] = struct{}{}
 	}
 	fetchedGroups, _, bytesRead, err := blockGroupPipeline(
-		context.Background(), r, groups, defaultPipelineWorkers, allCols, processGroup,
+		ctx, r, groups, defaultPipelineWorkers, allCols, processGroup,
 	)
 	return fetchedGroups, processedBlocks, bytesRead, err
 }

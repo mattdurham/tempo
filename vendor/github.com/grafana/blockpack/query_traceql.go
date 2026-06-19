@@ -5,6 +5,7 @@ package blockpack
 // implementation helpers it delegates to.
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"math"
@@ -22,6 +23,7 @@ const noTraceIDKey = "__no_trace_id__"
 
 // streamFilterQuery executes a TraceQL filter query against a modules-format reader.
 func streamFilterQuery(
+	ctx context.Context,
 	r *Reader,
 	filterExpr *traceqlparser.FilterExpression,
 	opts QueryOptions,
@@ -42,11 +44,11 @@ func streamFilterQuery(
 		return QueryStats{}, fmt.Errorf("compile TraceQL filter: %w", compileErr)
 	}
 
-	return streamFilterProgram(r, program, opts, fn)
+	return streamFilterProgram(ctx, r, program, opts, fn)
 }
 
 // streamFilterProgram executes a compiled filter program against a modules-format reader.
-func streamFilterProgram(r *Reader, program *vm.Program, opts QueryOptions, fn spanMatchFn) (QueryStats, error) {
+func streamFilterProgram(ctx context.Context, r *Reader, program *vm.Program, opts QueryOptions, fn spanMatchFn) (QueryStats, error) {
 	// SPEC-STREAM-8: MostRecent maps to Backward direction with span:start timestamp sorting.
 	// span:start is in searchMetaColumns for V14 files (see NOTE-013); additional I/O may be
 	// needed for older formats.
@@ -64,7 +66,7 @@ func streamFilterProgram(r *Reader, program *vm.Program, opts QueryOptions, fn s
 		collectOpts.Direction = modules_queryplanner.Backward
 		collectOpts.TimestampColumn = "span:start"
 	}
-	rows, stats, err := modules_executor.Collect(r, program, collectOpts)
+	rows, stats, err := modules_executor.Collect(ctx, r, program, collectOpts)
 	if err != nil {
 		return stats, err
 	}
@@ -159,11 +161,11 @@ func emitAllSpans(allSpans []SpanMatch, limit int, fn spanMatchFn) {
 // aggregate function per spanset, filters by threshold, and emits qualifying spans.
 // NOTE-092: For count/count_over_time with a threshold, dispatches to streamPipelineQueryCount
 // (two-pass streaming) to avoid O(N_spans) allocation.
-func streamPipelineQuery(r *Reader, mq *traceqlparser.MetricsQuery, opts QueryOptions, fn spanMatchFn) error {
+func streamPipelineQuery(ctx context.Context, r *Reader, mq *traceqlparser.MetricsQuery, opts QueryOptions, fn spanMatchFn) error {
 	pipeline := mq.Pipeline
 	if pipeline != nil && pipeline.HasThreshold &&
 		(pipeline.Aggregate.Name == "count" || pipeline.Aggregate.Name == "count_over_time") {
-		return streamPipelineQueryCount(r, mq, opts, fn)
+		return streamPipelineQueryCount(ctx, r, mq, opts, fn)
 	}
 
 	// Compile and execute the filter part to get all matching spans.
@@ -177,7 +179,7 @@ func streamPipelineQuery(r *Reader, mq *traceqlparser.MetricsQuery, opts QueryOp
 	filterOpts.Limit = 0
 
 	var allSpans []SpanMatch
-	_, streamErr := streamFilterProgram(r, program, filterOpts, func(match *SpanMatch, more bool) bool {
+	_, streamErr := streamFilterProgram(ctx, r, program, filterOpts, func(match *SpanMatch, more bool) bool {
 		if !more {
 			return false
 		}
@@ -286,14 +288,14 @@ func streamPipelineQuery(r *Reader, mq *traceqlparser.MetricsQuery, opts QueryOp
 // Precondition: pipeline != nil && pipeline.HasThreshold must be true.
 // The caller (streamPipelineQuery) guards on HasThreshold before dispatching here.
 // The defensive check below ensures correctness if this invariant is ever violated.
-func streamPipelineQueryCount(r *Reader, mq *traceqlparser.MetricsQuery, opts QueryOptions, fn spanMatchFn) error {
+func streamPipelineQueryCount(ctx context.Context, r *Reader, mq *traceqlparser.MetricsQuery, opts QueryOptions, fn spanMatchFn) error {
 	pipeline := mq.Pipeline
 	if pipeline == nil || !pipeline.HasThreshold {
 		// Should not happen — caller guards on HasThreshold, but be defensive.
 		// Without a threshold, compareThreshold's zero-value BinaryOp returns false
 		// for all traces, silently producing empty results (SPEC-PA-6 regression).
 		// Fall back to the general path which handles no-threshold correctly (SPEC-PA-6).
-		return streamPipelineQuery(r, mq, opts, fn)
+		return streamPipelineQuery(ctx, r, mq, opts, fn)
 	}
 
 	program, err := vm.CompileTraceQLFilter(mq.Filter)
@@ -305,7 +307,7 @@ func streamPipelineQueryCount(r *Reader, mq *traceqlparser.MetricsQuery, opts Qu
 
 	// Pass 1: count spans per trace.
 	counts := make(map[string]int)
-	if _, pass1Err := streamFilterProgram(r, program, filterOpts, func(match *SpanMatch, more bool) bool {
+	if _, pass1Err := streamFilterProgram(ctx, r, program, filterOpts, func(match *SpanMatch, more bool) bool {
 		if !more {
 			return false
 		}
@@ -333,7 +335,7 @@ func streamPipelineQueryCount(r *Reader, mq *traceqlparser.MetricsQuery, opts Qu
 
 	// Pass 2: emit spans from qualifying traces only.
 	limit := opts.Limit
-	_, err = streamFilterProgram(r, program, filterOpts, func(match *SpanMatch, more bool) bool {
+	_, err = streamFilterProgram(ctx, r, program, filterOpts, func(match *SpanMatch, more bool) bool {
 		if !more {
 			// streamFilterProgram calls this inner callback with (nil, false) as its
 			// terminal signal. The inner callback returns false here without forwarding

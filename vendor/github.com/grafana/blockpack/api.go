@@ -185,10 +185,14 @@ func CompileTraceQL(traceqlQuery string, opts QueryOptions) (*Program, error) {
 //
 // SPEC-VM-001: Program immutability and safe reuse.
 func QueryTraceQLWithProgram(
+	ctx context.Context,
 	r *Reader,
 	program *Program,
 	opts QueryOptions,
 ) (results []SpanMatch, stats QueryStats, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	defer func() {
 		if rec := recover(); rec != nil {
 			err = fmt.Errorf("internal error in QueryTraceQLWithProgram: %v", rec)
@@ -210,7 +214,7 @@ func QueryTraceQLWithProgram(
 		results = append(results, match.Clone())
 		return true
 	}
-	stats, err = streamFilterProgram(r, program, opts, collector)
+	stats, err = streamFilterProgram(ctx, r, program, opts, collector)
 	return results, stats, err
 }
 
@@ -229,10 +233,14 @@ func QueryTraceQLWithProgram(
 // Pipeline queries group matching spans into spansets, compute aggregates, and
 // filter by threshold before returning qualifying spans.
 func QueryTraceQL(
+	ctx context.Context,
 	r *Reader,
 	traceqlQuery string,
 	opts QueryOptions,
 ) (results []SpanMatch, stats QueryStats, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	defer func() {
 		if rec := recover(); rec != nil {
 			err = fmt.Errorf("internal error in QueryTraceQL: %v", rec)
@@ -261,7 +269,7 @@ func QueryTraceQL(
 
 	switch q := parsed.(type) {
 	case *traceqlparser.FilterExpression:
-		stats, err = streamFilterQuery(r, q, opts, collector)
+		stats, err = streamFilterQuery(ctx, r, q, opts, collector)
 	case *traceqlparser.StructuralQuery:
 		execOpts := modules_executor.Options{
 			Limit:      opts.Limit,
@@ -296,7 +304,7 @@ func QueryTraceQL(
 			collector(nil, false)
 		}
 	case *traceqlparser.MetricsQuery:
-		err = streamPipelineQuery(r, q, opts, collector)
+		err = streamPipelineQuery(ctx, r, q, opts, collector)
 	default:
 		err = fmt.Errorf(
 			"QueryTraceQL: query type %T is not supported",
@@ -334,7 +342,10 @@ func QueryTraceQL(
 // label columns (e.g. GetField("service.name") returns ""). Callers needing
 // the full resource label set should parse the resource.__loki_labels__ string,
 // or use QueryTraceQL which uses SpanFieldsAdapter with lazy full-column access.
-func QueryLogQL(r *Reader, logqlQuery string, opts LogQueryOptions) (results []SpanMatch, qs QueryStats, err error) {
+func QueryLogQL(ctx context.Context, r *Reader, logqlQuery string, opts LogQueryOptions) (results []SpanMatch, qs QueryStats, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	defer func() {
 		if rec := recover(); rec != nil {
 			err = fmt.Errorf("internal error in QueryLogQL: %v", rec)
@@ -364,9 +375,9 @@ func QueryLogQL(r *Reader, logqlQuery string, opts LogQueryOptions) (results []S
 	}
 
 	if pipeline != nil {
-		qs, err = streamLogQLWithPipeline(r, program, pipeline, opts, collector)
+		qs, err = streamLogQLWithPipeline(ctx, r, program, pipeline, opts, collector)
 	} else {
-		qs, err = streamLogProgram(r, program, opts, collector)
+		qs, err = streamLogProgram(ctx, r, program, opts, collector)
 	}
 	return results, qs, err
 }
@@ -403,7 +414,10 @@ type LogMetricsRow = modules_executor.LogMetricsRow
 //
 // Returns a LogMetricsResult with one row per (time-bucket × group-by-key) pair.
 // GroupKey[0] is the 0-indexed bucket number; GroupKey[1..] are group-by label values.
-func ExecuteMetricsLogQL(r *Reader, logqlQuery string, opts LogMetricOptions) (result *LogMetricsResult, err error) {
+func ExecuteMetricsLogQL(ctx context.Context, r *Reader, logqlQuery string, opts LogMetricOptions) (result *LogMetricsResult, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	defer func() {
 		if rec := recover(); rec != nil {
 			result = nil
@@ -479,7 +493,7 @@ func ExecuteMetricsLogQL(r *Reader, logqlQuery string, opts LogMetricOptions) (r
 		Filter: vm.FilterSpec{IsMatchAll: true},
 	}
 
-	return modules_executor.ExecuteLogMetrics(r, program, pipeline, querySpec, metric.Function, opts.GroupBy)
+	return modules_executor.ExecuteLogMetrics(ctx, r, program, pipeline, querySpec, metric.Function, opts.GroupBy)
 }
 
 // TraceMetricsResult is the output of ExecuteMetricsTraceQL.

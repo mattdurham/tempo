@@ -5,6 +5,8 @@ package blockpack
 // implementation helpers it delegates to.
 
 import (
+	"context"
+
 	"github.com/grafana/blockpack/internal/logqlparser"
 	modules_blockio "github.com/grafana/blockpack/internal/modules/blockio"
 	modules_executor "github.com/grafana/blockpack/internal/modules/executor"
@@ -16,6 +18,7 @@ import (
 // Delegates to CollectLogs which uses a heap with block-level timestamp pruning
 // for limited queries, and a collect-sort-deliver path for unlimited queries.
 func streamLogQLWithPipeline(
+	_ context.Context,
 	r *Reader,
 	program *vm.Program,
 	pipeline *logqlparser.Pipeline,
@@ -109,12 +112,13 @@ func (f *logEntryFields) IterateFields(fn func(name string, value any) bool) {
 // streamLogProgram executes a compiled log program against a modules-format reader.
 // Blocks are fetched lazily in ~8 MB coalesced batches; fetching stops once opts.Limit
 // matches have been delivered, so I/O is proportional to results returned.
-func streamLogProgram(r *Reader, program *vm.Program, opts LogQueryOptions, fn spanMatchFn) (QueryStats, error) {
+func streamLogProgram(ctx context.Context, r *Reader, program *vm.Program, opts LogQueryOptions, fn spanMatchFn) (QueryStats, error) {
 	direction := modules_queryplanner.Backward
 	if opts.Forward {
 		direction = modules_queryplanner.Forward
 	}
 	rows, qs, err := modules_executor.Collect(
+		ctx,
 		r,
 		program,
 		modules_executor.CollectOptions{

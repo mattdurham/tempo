@@ -677,3 +677,24 @@ sets (virtually all real queries), insertion sort avoids the closure allocation 
 (rare, deep predicate trees with many constrained children), falling back to `sort.Slice` avoids
 O(n²) cost with the per-comparison `count()` calls. Re-added `import "sort"` to `selection.go` to
 support the fallback path.
+
+---
+
+## NOTE-449: Plan.PrunedByColStats and Plan.PrunedByIntrinsicTOC — OTel Observability Fields
+*Added: 2026-06-19*
+
+**Decision:** Added two new int fields to `Plan` to expose pruning counts that previously had
+no dedicated counter:
+- `PrunedByColStats`: blocks eliminated by `pruneByColStats` in `plan_blocks.go` (NOTE-446).
+- `PrunedByIntrinsicTOC`: blocks eliminated by `BlocksFromIntrinsicTOC` intersection.
+
+**Why:** `planBlocks` already computed these via before/after deltas internally, but discarded
+the counts. The `blockpack.planner` OTel span (issue #368) needs them as span attributes to
+show users why blocks were skipped.
+
+**Safety:** Both fields are additive to the existing `Plan` struct — no callers break. The
+`PlanWithOptions` return already populates `PrunedByIndex`, `PrunedByTime`, `PrunedByFuse`
+at the planner level; these two fields extend that pattern for the executor's post-planner steps.
+
+**Back-ref:** `internal/modules/executor/plan_blocks.go:planBlocks` (counter wiring),
+`internal/modules/queryplanner/plan.go:Plan` (struct definition).

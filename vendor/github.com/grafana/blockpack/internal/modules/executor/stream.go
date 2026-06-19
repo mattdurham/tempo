@@ -259,11 +259,17 @@ func computeColumnFilters(program *vm.Program, opts CollectOptions) (wantColumns
 // Collect executes program against all blocks in r and returns matched rows.
 // SPEC-STREAM-5: Direction is applied at plan time; rows are reversed within each block for Backward.
 // SPEC-STREAM-6: QueryStats is returned as the third return value with execution metrics.
+// SPEC-OBS-001: ctx is the first parameter to enable OTel context propagation; nil is normalized to Background.
+// SPEC-OBS-002: on the planBlocks → scanBlocks path emits blockpack.query/planner/block spans.
 func Collect(
+	ctx context.Context,
 	r *modules_reader.Reader,
 	program *vm.Program,
 	opts CollectOptions,
 ) ([]MatchedRow, QueryStats, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	// SPEC-STREAM-1: nil reader — return nil result slice and nil error.
 	if r == nil {
 		return nil, QueryStats{}, nil
@@ -285,6 +291,10 @@ func Collect(
 			opts.BlockCount,
 		)
 	}
+
+	// NOTE-449: top-level query span; child of ctx (inherits Tempo's distributed trace).
+	ctx, querySpan := tracer.Start(ctx, "blockpack.query")
+	defer querySpan.End()
 
 	queryStart := time.Now()
 
@@ -308,7 +318,7 @@ func Collect(
 	// those rows — typically 1-3 blocks vs all blocks for the full scan path.
 	if isMatchAllProgram(program) && opts.Limit > 0 && opts.TimestampColumn != "" &&
 		r.HasIntrinsicSection() {
-		rows, fastQS, err := collectMatchAllTopK(r, opts, wantColumns, secondPassCols)
+		rows, fastQS, err := collectMatchAllTopK(ctx, r, opts, wantColumns, secondPassCols)
 		if err != errNeedBlockScan {
 			fastQS.TotalDuration = time.Since(queryStart)
 			return rows, fastQS, err
@@ -324,7 +334,7 @@ func Collect(
 	// evaluate nil columns and return 0 results for any intrinsic predicate.
 	// Mixed queries (Cases C/D) still require Limit > 0 to bound the pre-filter cost.
 	if hasSomeIntrinsicPredicates(program) && (opts.Limit > 0 || ProgramIsIntrinsicOnly(program)) {
-		rows, fastQS, err := collectWithBloomCheck(r, program, opts, wantColumns, secondPassCols)
+		rows, fastQS, err := collectWithBloomCheck(ctx, r, program, opts, wantColumns, secondPassCols)
 		if err != errNeedBlockScan {
 			// Fast path produced a definitive result (rows, empty result, or error).
 			fastQS.TotalDuration = time.Since(queryStart)
@@ -361,6 +371,9 @@ func Collect(
 		}
 		plan.SelectedBlocks = filtered
 	}
+
+	// NOTE-449: emit planner span with pruning counts for OTel distributed traces.
+	emitPlannerSpan(ctx, plan)
 
 	qs.Steps = append(qs.Steps, StepStats{
 		Name:     stepNamePlan,
@@ -403,6 +416,7 @@ func Collect(
 		buf := &topKHeap{entries: make([]topKEntry, 0, opts.Limit), backward: backward}
 		var scanErr error
 		fetchedGroups, fetchedBlocks, bytesRead, scanErr = topKScanBlocks(
+			ctx,
 			r,
 			program,
 			wantColumns,
@@ -427,7 +441,7 @@ func Collect(
 		}
 		var scanErr error
 		fetchedGroups, fetchedBlocks, bytesRead, scanErr = scanBlocks(
-			r, program, wantColumns, secondPassCols, opts,
+			ctx, r, program, wantColumns, secondPassCols, opts,
 			plan.SelectedBlocks, groups, &results,
 		)
 		if scanErr != nil {
@@ -473,6 +487,7 @@ func shouldUseTopKPath(opts CollectOptions, program *vm.Program) bool {
 // Groups that are never fetched (due to early stop) are not counted in either.
 // SPEC-STREAM-11: I/O is concurrent across defaultPipelineWorkers goroutines; parse is sequential.
 func scanBlocks(
+	ctx context.Context,
 	r *modules_reader.Reader,
 	program *vm.Program,
 	wantColumns map[string]struct{},
@@ -519,124 +534,136 @@ func scanBlocks(
 			if !ok {
 				continue
 			}
-			// Free raw bytes immediately after access — avoids retaining the full
-			// coalesced group in memory for the duration of the block scan loop.
-			delete(groupRaw, blockIdx)
+			// NOTE-449: per-block OTel span. Uses a local closure so defer span.End() fires
+			// at the end of each iteration, not when processGroup returns (as defer would in a loop).
+			if blockErr := func() error {
+				_, blockSpan := startBlockSpan(ctx, blockIdx)
+				defer blockSpan.End()
+				// TODO(NOTE-449): blockpack.block cache attrs (hits/misses/bytes) are zero
+				// until CacheStats can be threaded out of ReadGroupColumnar worker goroutines.
+				// See NOTE-449 deferred items.
+				// Free raw bytes immediately after access — avoids retaining the full
+				// coalesced group in memory for the duration of the block scan loop.
+				delete(groupRaw, blockIdx)
 
-			meta := r.BlockMeta(blockIdx)
-			r.ResetInternStrings()
+				meta := r.BlockMeta(blockIdx)
+				r.ResetInternStrings()
 
-			// NOTE-006: Acquire a pooled intern map for this block's lifetime. The map must
-			// remain alive through both parse passes and the entire row-emission loop, because
-			// lazy columns (registered during first pass) call decodeNow() during row iteration
-			// and reference the intern map. Release after streamSortedRows completes.
-			internPtr := modules_reader.AcquireInternMap()
-			intern := *internPtr
+				// NOTE-006: Acquire a pooled intern map for this block's lifetime. The map must
+				// remain alive through both parse passes and the entire row-emission loop, because
+				// lazy columns (registered during first pass) call decodeNow() during row iteration
+				// and reference the intern map. Release after streamSortedRows completes.
+				internPtr := modules_reader.AcquireInternMap()
+				intern := *internPtr
 
-			bwb, parseErr := r.ParseBlockFromBytesWithIntern(raw, modules_reader.WantOnly(wantColumns), meta, intern)
-			if parseErr != nil {
-				modules_reader.ReleaseInternMap(internPtr)
-				return fmt.Errorf("ParseBlockFromBytes block %d: %w", blockIdx, parseErr)
-			}
-
-			// NOTE-102: use pooled provider to avoid per-block heap allocation.
-			provider := acquireBlockColumnProvider(bwb.Block)
-			// Only strip intrinsic predicates when the file has an intrinsic section.
-			// Log files do not have an intrinsic section; their block columns still hold
-			// all label values and ColumnPredicate must evaluate them directly.
-			var rowSet vm.RowSet
-			var evalErr error
-			if r.HasIntrinsicSection() {
-				uap := userAttrProgram(program)
-				if uap == nil {
-					rowSet = provider.FullScan()
-				} else {
-					rowSet, evalErr = uap.ColumnPredicate(provider)
+				bwb, parseErr := r.ParseBlockFromBytesWithIntern(raw, modules_reader.WantOnly(wantColumns), meta, intern)
+				if parseErr != nil {
+					modules_reader.ReleaseInternMap(internPtr)
+					return fmt.Errorf("ParseBlockFromBytes block %d: %w", blockIdx, parseErr)
 				}
-			} else {
-				rowSet, evalErr = program.ColumnPredicate(provider)
-			}
-			if evalErr != nil {
-				releaseBlockColumnProvider(provider)
-				modules_reader.ReleaseInternMap(internPtr)
-				return fmt.Errorf("ColumnPredicate block %d: %w", blockIdx, evalErr)
-			}
 
-			if rowSet.Size() == 0 {
-				releaseBlockColumnProvider(provider)
-				modules_reader.ReleaseInternMap(internPtr)
-				continue
-			}
+				// NOTE-102: use pooled provider to avoid per-block heap allocation.
+				provider := acquireBlockColumnProvider(bwb.Block)
+				// Only strip intrinsic predicates when the file has an intrinsic section.
+				// Log files do not have an intrinsic section; their block columns still hold
+				// all label values and ColumnPredicate must evaluate them directly.
+				var rowSet vm.RowSet
+				var evalErr error
+				if r.HasIntrinsicSection() {
+					uap := userAttrProgram(program)
+					if uap == nil {
+						rowSet = provider.FullScan()
+					} else {
+						rowSet, evalErr = uap.ColumnPredicate(provider)
+					}
+				} else {
+					rowSet, evalErr = program.ColumnPredicate(provider)
+				}
+				if evalErr != nil {
+					releaseBlockColumnProvider(provider)
+					modules_reader.ReleaseInternMap(internPtr)
+					return fmt.Errorf("ColumnPredicate block %d: %w", blockIdx, evalErr)
+				}
 
-			// Post-filter rowSet against any intrinsic predicates stripped by userAttrProgram.
-			// Only applies when the file has an intrinsic section (trace files with new storage format).
-			// Log files and legacy files evaluate intrinsic predicates directly via ColumnPredicate above.
-			intrNodes := programIntrinsicNodes(program)
-			if len(intrNodes) > 0 && r.HasIntrinsicSection() {
-				rowSet = filterRowSetByIntrinsicNodes(r, blockIdx, rowSet, intrNodes)
 				if rowSet.Size() == 0 {
 					releaseBlockColumnProvider(provider)
 					modules_reader.ReleaseInternMap(internPtr)
-					continue
+					return nil
 				}
-			}
 
-			// NOTE-018: Second pass — decode result columns now that we know this block has matches.
-			// NOTE-028: secondPassCols is pre-computed above (searchMetaColumns ∪ wantColumns, or nil for all).
-			if wantColumns != nil {
-				bwb, parseErr = r.ParseBlockFromBytesWithIntern(
-					bwb.RawBytes,
-					modules_reader.WantOnly(secondPassCols),
-					meta,
-					intern,
-				)
-				if parseErr != nil {
+				// Post-filter rowSet against any intrinsic predicates stripped by userAttrProgram.
+				// Only applies when the file has an intrinsic section (trace files with new storage format).
+				// Log files and legacy files evaluate intrinsic predicates directly via ColumnPredicate above.
+				intrNodes := programIntrinsicNodes(program)
+				if len(intrNodes) > 0 && r.HasIntrinsicSection() {
+					rowSet = filterRowSetByIntrinsicNodes(r, blockIdx, rowSet, intrNodes)
+					if rowSet.Size() == 0 {
+						releaseBlockColumnProvider(provider)
+						modules_reader.ReleaseInternMap(internPtr)
+						return nil
+					}
+				}
+
+				// NOTE-018: Second pass — decode result columns now that we know this block has matches.
+				// NOTE-028: secondPassCols is pre-computed above (searchMetaColumns ∪ wantColumns, or nil for all).
+				if wantColumns != nil {
+					bwb, parseErr = r.ParseBlockFromBytesWithIntern(
+						bwb.RawBytes,
+						modules_reader.WantOnly(secondPassCols),
+						meta,
+						intern,
+					)
+					if parseErr != nil {
+						releaseBlockColumnProvider(provider)
+						modules_reader.ReleaseInternMap(internPtr)
+						return fmt.Errorf("ParseBlockFromBytes (second pass) block %d: %w", blockIdx, parseErr)
+					}
+				}
+
+				// Vector post-filter: when the query has a VectorScorer, score only the candidate
+				// rows (survivors of ColumnPredicate + intrinsic filter) via point lookup.
+				// Non-vector queries take the streamSortedRows path unchanged.
+				if program.VectorScorer != nil {
+					scoredRows := applyVectorScorerToBlock(bwb.Block, program, rowSet)
 					releaseBlockColumnProvider(provider)
 					modules_reader.ReleaseInternMap(internPtr)
-					return fmt.Errorf("ParseBlockFromBytes (second pass) block %d: %w", blockIdx, parseErr)
+					for _, sr := range scoredRows {
+						*results = append(*results, MatchedRow{
+							Block:    bwb.Block,
+							BlockIdx: blockIdx,
+							RowIdx:   sr.RowIdx,
+							Score:    sr.Score,
+						})
+					}
+					return nil
 				}
-			}
 
-			// Vector post-filter: when the query has a VectorScorer, score only the candidate
-			// rows (survivors of ColumnPredicate + intrinsic filter) via point lookup.
-			// Non-vector queries take the streamSortedRows path unchanged.
-			if program.VectorScorer != nil {
-				scoredRows := applyVectorScorerToBlock(bwb.Block, program, rowSet)
+				// NOTE: rowSet is not used after ToSlice() — safe to sort in-place without clone.
+				// streamSortedRows sorts and reverses rows in-place via slices.SortFunc and index swap,
+				// which mutates the backing slice returned by ToSlice(). This is intentional: rowSet
+				// is never accessed again (no Contains calls) after this point in scanBlocks.
+				// If rowSet reuse is added in future, restore slices.Clone here to preserve the
+				// ascending-sorted invariant required by rowSet.Contains.
+				// NOTE-107: rows may point into p.scratch; provider must not be released until after
+				// streamSortedRows completes, so that no concurrent goroutine can overwrite p.scratch.
+				rows := rowSet.ToSlice()
+
+				// SPEC-STREAM-5: Sort rows by per-row timestamp when TimestampColumn is set.
+				var tsCol *modules_reader.Column
+				if opts.TimestampColumn != "" {
+					tsCol = bwb.Block.GetColumn(opts.TimestampColumn)
+				}
+
+				stop := streamSortedRows(bwb.Block, blockIdx, rows, tsCol, opts, results)
 				releaseBlockColumnProvider(provider)
+				// Release intern map after all lazy decodes in streamSortedRows are complete.
 				modules_reader.ReleaseInternMap(internPtr)
-				for _, sr := range scoredRows {
-					*results = append(*results, MatchedRow{
-						Block:    bwb.Block,
-						BlockIdx: blockIdx,
-						RowIdx:   sr.RowIdx,
-						Score:    sr.Score,
-					})
+				if stop {
+					return errLimitReached
 				}
-				continue
-			}
-
-			// NOTE: rowSet is not used after ToSlice() — safe to sort in-place without clone.
-			// streamSortedRows sorts and reverses rows in-place via slices.SortFunc and index swap,
-			// which mutates the backing slice returned by ToSlice(). This is intentional: rowSet
-			// is never accessed again (no Contains calls) after this point in scanBlocks.
-			// If rowSet reuse is added in future, restore slices.Clone here to preserve the
-			// ascending-sorted invariant required by rowSet.Contains.
-			// NOTE-107: rows may point into p.scratch; provider must not be released until after
-			// streamSortedRows completes, so that no concurrent goroutine can overwrite p.scratch.
-			rows := rowSet.ToSlice()
-
-			// SPEC-STREAM-5: Sort rows by per-row timestamp when TimestampColumn is set.
-			var tsCol *modules_reader.Column
-			if opts.TimestampColumn != "" {
-				tsCol = bwb.Block.GetColumn(opts.TimestampColumn)
-			}
-
-			stop := streamSortedRows(bwb.Block, blockIdx, rows, tsCol, opts, results)
-			releaseBlockColumnProvider(provider)
-			// Release intern map after all lazy decodes in streamSortedRows are complete.
-			modules_reader.ReleaseInternMap(internPtr)
-			if stop {
-				return errLimitReached
+				return nil
+			}(); blockErr != nil {
+				return blockErr
 			}
 		}
 		return nil
@@ -655,8 +682,8 @@ func scanBlocks(
 		}
 	}
 	// SPEC-STREAM-11: concurrent I/O via blockGroupPipeline; processGroup called sequentially.
-	// TODO: propagate caller context (NOTE-058: Collect does not yet accept context.Context).
-	return blockGroupPipeline(context.Background(), r, groups, defaultPipelineWorkers, filterCols, processGroup)
+	// NOTE-449: ctx is now propagated from Collect (resolves NOTE-058).
+	return blockGroupPipeline(ctx, r, groups, defaultPipelineWorkers, filterCols, processGroup)
 }
 
 // streamSortedRows sorts rows by timestamp (when tsCol is non-nil) or reverses them
@@ -751,6 +778,7 @@ func countUniqueBlockIdxs(refs []modules_shared.BlockRef) int {
 // SPEC-INTRINSIC-004: reject the file in O(1) if bloom says no span matches.
 // SPEC-STREAM-6: QueryStats is returned as part of the result.
 func collectWithBloomCheck(
+	ctx context.Context,
 	r *modules_reader.Reader,
 	program *vm.Program,
 	opts CollectOptions,
@@ -762,7 +790,7 @@ func collectWithBloomCheck(
 		qs.ExecutionPath = ExecPathBloomRejected
 		return nil, qs, nil
 	}
-	return collectFromIntrinsicRefs(r, program, opts, wantColumns, secondPassCols, &qs)
+	return collectFromIntrinsicRefs(ctx, r, program, opts, wantColumns, secondPassCols, &qs)
 }
 
 // isMatchAllProgram reports whether the program is a match-all query (no predicates).
@@ -791,6 +819,7 @@ func isMatchAllProgram(program *vm.Program) bool {
 // returns nil (unsupported blob format).
 // NOTE-127: Case E — match-all + sort + limit.
 func collectMatchAllTopK(
+	ctx context.Context,
 	r *modules_reader.Reader,
 	opts CollectOptions,
 	wantColumns map[string]struct{},
@@ -866,6 +895,7 @@ func collectMatchAllTopK(
 	blockOrder, blockCandidates := groupRefsByBlock(refs)
 	results := make([]MatchedRow, 0, len(refs))
 	hydrateErr := forEachBlockInGroups(
+		ctx,
 		r,
 		blockOrder,
 		blockCandidates,
@@ -953,6 +983,7 @@ func sortMatchedRowsByTimestamp(results []MatchedRow, tsColumn string, backward 
 // re-evaluation in Cases C/D provides correctness. Global top-K is preserved for Case D
 // because the pre-filter never excludes true matches (it is a superset, never a subset).
 func collectFromIntrinsicRefs(
+	ctx context.Context,
 	r *modules_reader.Reader,
 	program *vm.Program,
 	opts CollectOptions,
@@ -1037,20 +1068,20 @@ func collectFromIntrinsicRefs(
 
 	// Step 2: Dispatch based on (isPureIntrinsic, hasSort).
 	if isPureIntrinsic && !hasSort {
-		rows, err := collectIntrinsicPlain(r, refs, opts, wantColumns, secondPassCols, qs)
+		rows, err := collectIntrinsicPlain(ctx, r, refs, opts, wantColumns, secondPassCols, qs)
 		return rows, *qs, err
 	}
 	if isPureIntrinsic && hasSort {
-		rows, err := collectIntrinsicTopK(r, refs, opts, wantColumns, secondPassCols, qs)
+		rows, err := collectIntrinsicTopK(ctx, r, refs, opts, wantColumns, secondPassCols, qs)
 		return rows, *qs, err
 	}
 	if !hasSort {
 		// Case C: mixed + no sort
-		rows, err := collectMixedPlain(r, program, refs, opts, wantColumns, secondPassCols, qs)
+		rows, err := collectMixedPlain(ctx, r, program, refs, opts, wantColumns, secondPassCols, qs)
 		return rows, *qs, err
 	}
 	// Case D: mixed + sort
-	rows, err := collectMixedTopK(r, program, refs, opts, wantColumns, secondPassCols, qs)
+	rows, err := collectMixedTopK(ctx, r, program, refs, opts, wantColumns, secondPassCols, qs)
 	return rows, *qs, err
 }
 
@@ -1087,6 +1118,7 @@ func groupRefsByBlock(refs []modules_shared.BlockRef) (blockOrder []int, blockRo
 // skipped for that block. When preFn is nil it is not called and the second-pass decode
 // proceeds as usual (preserves behavior for intrinsic-only callers).
 func forEachBlockInGroups(
+	ctx context.Context,
 	r *modules_reader.Reader,
 	blockOrder []int,
 	blockCandidates map[int][]int,
@@ -1160,9 +1192,9 @@ func forEachBlockInGroups(
 		}
 	}
 	// SPEC-STREAM-11: concurrent I/O via blockGroupPipeline; processGroup called sequentially.
-	// TODO: propagate caller context (NOTE-058: forEachBlockInGroups callers do not yet accept context.Context).
+	// NOTE-449: ctx is now propagated (resolves NOTE-058 for forEachBlockInGroups callers).
 	_, _, _, err := blockGroupPipeline(
-		context.Background(),
+		ctx,
 		r,
 		groups,
 		defaultPipelineWorkers,
@@ -1179,6 +1211,7 @@ func forEachBlockInGroups(
 // LookupRefFast for O(M log N) binary search per ref, which caches the ref index
 // on the column object (EnsureRefIndex is called internally on first use).
 func collectIntrinsicPlain(
+	ctx context.Context,
 	r *modules_reader.Reader,
 	refs []modules_shared.BlockRef,
 	opts CollectOptions,
@@ -1212,6 +1245,7 @@ func collectIntrinsicPlain(
 	blockOrder, blockCandidates := groupRefsByBlock(refs)
 	results := make([]MatchedRow, 0, len(refs))
 	err := forEachBlockInGroups(
+		ctx,
 		r,
 		blockOrder,
 		blockCandidates,
@@ -1255,6 +1289,7 @@ func collectIntrinsicPlain(
 // and runs ScanFlatColumnRefsFiltered backward, stopping after K results.
 // O(K/rate × log M) — ideal for common predicates where rate is high.
 func collectIntrinsicTopK(
+	ctx context.Context,
 	r *modules_reader.Reader,
 	refs []modules_shared.BlockRef,
 	opts CollectOptions,
@@ -1281,7 +1316,7 @@ func collectIntrinsicTopK(
 	slices.SortFunc(selected, blockRefCompare)
 	blockOrder, blockCandidates := groupRefsByBlock(selected)
 	results := make([]MatchedRow, 0, len(selected))
-	err = forEachBlockInGroups(r, blockOrder, blockCandidates, wantColumns, secondPassCols, "collectIntrinsicTopK", nil,
+	err = forEachBlockInGroups(ctx, r, blockOrder, blockCandidates, wantColumns, secondPassCols, "collectIntrinsicTopK", nil,
 		func(pb parsedBlock, candidateRows []int) error {
 			for _, rowIdx := range candidateRows {
 				results = append(results, MatchedRow{
@@ -1508,6 +1543,7 @@ func collectIntrinsicTopKScan(
 // For each candidate block, ColumnPredicate re-evaluates the full predicate to eliminate
 // false positives.
 func collectMixedPlain(
+	ctx context.Context,
 	r *modules_reader.Reader,
 	program *vm.Program,
 	refs []modules_shared.BlockRef,
@@ -1548,7 +1584,7 @@ func collectMixedPlain(
 	var mixedPlainProvider *blockColumnProvider
 	// Coalesce all candidate blocks for efficient batch I/O.
 	err := forEachBlockInGroups(
-		r, blockOrder, blockCandidates, wantColumns, secondPassCols, "collectMixedPlain",
+		ctx, r, blockOrder, blockCandidates, wantColumns, secondPassCols, "collectMixedPlain",
 		func(pb parsedBlock, candidateRows []int) bool {
 			// Re-evaluate the full predicate on the first-pass block to gate second-pass decode.
 			// NOTE-102: use pooled provider to avoid per-block heap allocation.
@@ -1613,6 +1649,7 @@ func collectMixedPlain(
 // are present among the candidate blocks. ColumnPredicate eliminates false positives.
 // topKScanRows then finds the globally correct top-K timestamp order within those candidates.
 func collectMixedTopK(
+	ctx context.Context,
 	r *modules_reader.Reader,
 	program *vm.Program,
 	refs []modules_shared.BlockRef,
@@ -1650,7 +1687,7 @@ func collectMixedTopK(
 	var mixedTopKProvider *blockColumnProvider
 	// Coalesce all candidate blocks for efficient batch I/O.
 	if err := forEachBlockInGroups(
-		r, blockOrder, blockCandidates, wantColumns, secondPassCols, "collectMixedTopK",
+		ctx, r, blockOrder, blockCandidates, wantColumns, secondPassCols, "collectMixedTopK",
 		func(pb parsedBlock, candidateRows []int) bool {
 			// Re-evaluate the full predicate on the first-pass block to gate second-pass decode.
 			// NOTE-102: use pooled provider to avoid per-block heap allocation.

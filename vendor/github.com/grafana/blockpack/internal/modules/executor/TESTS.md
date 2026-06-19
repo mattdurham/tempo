@@ -3760,3 +3760,19 @@ node.Min = &vm.Value{Type:TypeFloat, Data:10.0}, MinInclusive=true.
 **Scenario:** Signed int64 range: all-positive query cannot match all-negative block.
 **Setup:** blockMin=-20, blockMax=-1 (stored as uint64 bit patterns), queryMin=0.
 **Assertions:** `colStatsRejectsInt64` returns true.
+
+---
+
+## EX-OTEL: OTel Tracing Instrumentation Tests (NOTE-449)
+
+**File:** `internal/modules/executor/otel_spans_test.go`
+**File:** `internal/modules/executor/context_propagation_test.go`
+
+Tests verify:
+- `TestAttachCacheStats_IsRecording`: attributes are set when span is recording, NOT set on noop span — verifies the `span.IsRecording()` guard prevents allocations on unsampled queries.
+- `TestAttachCacheStats_ZeroStats`: no attributes set when all counts are zero.
+- `TestEmitPlannerSpan_Attributes`: `blockpack.planner` span has correct attribute keys/values including `pruned_by_colstats` and `pruned_by_intrinsic_toc`.
+- `TestStartBlockSpan_Attributes`: `blockpack.block` span name is correct and `blockpack.block.index` is set.
+- `TestCollect_ContextCancellation`: canceled context causes `Collect` to return `ctx.Err()`.
+- `TestCollect_BackgroundContext`: Collect works correctly with a valid context (covers the ctx-threading path).
+- `TestExecuteLogMetrics_ContextPropagation`: canceled ctx propagates to `ExecuteLogMetrics`.

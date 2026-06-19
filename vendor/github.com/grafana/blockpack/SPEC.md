@@ -665,3 +665,134 @@ Back-ref: `internal/modules/blockio/reader/parser.go:scanRangeIndexOffsets` (rep
 by direct ToC key lookup)
 Back-ref: `internal/modules/blockio/reader/sketch_index.go:parseSketchIndexSection`
 (replaced by per-column ToC-keyed lazy load)
+
+---
+
+## SPEC-OBS-001: Context Propagation — All Query Entry Points Must Accept ctx
+*Added: 2026-06-19*
+
+Every public blockpack query entry point (`QueryTraceQL`, `QueryTraceQLWithProgram`,
+`QueryLogQL`, `ExecuteMetricsLogQL`, `ExecuteMetricsTraceQL`) and every internal executor
+entry point (`Collect`, `ExecuteLogMetrics`) MUST accept `context.Context` as their first
+parameter. Nil is normalized to `context.Background()` at the entry point; downstream code
+may trust ctx is non-nil.
+
+**Rationale:** Without a propagated context, blockpack spans cannot attach to the distributed
+trace from the Tempo caller (issue #368). A nil-normalization guard is required for callers
+that pass nil defensively (e.g. tests, migration helpers).
+
+**Verification:** `TestCollect_BackgroundContext` and `TestCollect_ContextCancellation`
+(context_propagation_test.go). All NOTE-058 TODO comments must be absent.
+
+Back-ref: `api.go:QueryTraceQL,QueryTraceQLWithProgram,QueryLogQL,ExecuteMetricsLogQL`,
+`internal/modules/executor/stream.go:Collect`,
+`internal/modules/executor/metrics_log.go:ExecuteLogMetrics`.
+
+---
+
+## SPEC-OBS-002: Mandatory Spans Per Query Type
+*Added: 2026-06-19*
+
+Every call to `Collect` MUST produce the following OTel span hierarchy when a TracerProvider
+is configured:
+
+```
+blockpack.query          — one per Collect call (wraps full execution)
+  blockpack.planner      — one per planBlocks call, carries pruning counts
+  blockpack.block (×N)   — one per dispatched block in the block-scan path
+```
+
+Spans are no-ops when no TracerProvider is configured (OTel global noop). The hierarchy is
+only produced on the `planBlocks → scanBlocks` execution path; intrinsic fast-path and
+structural paths are exempt.
+
+**Attribute contract:**
+- `blockpack.query`: no attributes required (span name is sufficient)
+- `blockpack.planner`: MUST set `blockpack.planner.total_blocks`, `selected_blocks`,
+  `pruned_by_time`, `pruned_by_index`, `pruned_by_bloom`, `pruned_by_colstats`,
+  `pruned_by_intrinsic_toc`, `explain`
+- `blockpack.block`: MUST set `blockpack.block.index`
+
+**Verification:** `TestQueryEmitsSpans` (otel_integration_test.go).
+
+Back-ref: `internal/modules/executor/stream.go:Collect,scanBlocks`,
+`internal/modules/executor/otel_spans.go:emitPlannerSpan,startBlockSpan`.
+
+---
+
+## SPEC-OBS-003: IsRecording() Guard — No Attribute Allocations on Unsampled Queries
+*Added: 2026-06-19*
+
+Every `span.SetAttributes(...)` call that runs on the hot query path MUST be wrapped in
+`if span.IsRecording() { ... }`. The `attribute.Int()` and `attribute.String()` functions
+allocate `attribute.KeyValue` structs; calling them on a noop span wastes allocations on
+every unsampled query (the production majority).
+
+The noop tracer's `Start` call is ~2ns and creates a noop span that always returns false for
+`IsRecording()`. The guard ensures zero new allocations per query when no TracerProvider is
+active.
+
+**Enforcement:** Code review checklist. Every `SetAttributes` in `otel_spans.go` and
+`tracer.go` must have the guard. Any future span attribute added to the hot path MUST follow
+this pattern.
+
+**Verification:** `TestAttachCacheStats_IsRecording` (otel_spans_test.go) verifies attributes
+are set on a recording span. The noop path is implicitly verified by
+`TestQueryNoTracerProvider_NoSpans`.
+
+Back-ref: `internal/modules/executor/otel_spans.go:attachCacheStats,emitPlannerSpan,startBlockSpan`.
+
+---
+
+## SPEC-OBS-004: Block Span Cache Attributes — Aggregate Per-Block, Not Per-Fetch
+*Added: 2026-06-19*
+
+Cache observability for `blockpack.block` spans MUST be implemented as aggregate hit/miss
+counts (not per-fetch child spans). Per-fetch spans in tieredcache would add ~10–100 ns per
+`GetOrFetch` call × 8 section fetches × hundreds of blocks = significant overhead on
+unsampled queries.
+
+The `CacheStats` struct (`internal/modules/blockio/reader/cache_stats.go`) is a stack-
+allocated `[CacheStatsCount]int32` pair (hits, misses) per section index. It is passed as a
+nil-safe `*CacheStats` pointer into `readBlockColumnarWithCache`. Attributes MUST only be
+set on the span when `cs != nil && span.IsRecording()`.
+
+Section-to-attribute key mapping:
+- `CacheStatsSectionToc` (0) → `blockpack.cache.toc.hits`, `blockpack.cache.toc.misses`
+- `CacheStatsSectionCol` (1) → `blockpack.cache.col.hits`, `blockpack.cache.col.misses`
+
+**Verification:** `TestAttachCacheStats_IsRecording`, `TestAttachCacheStats_ZeroStats`,
+`TestAttachCacheStats_NilStats` (otel_spans_test.go).
+
+Back-ref: `internal/modules/blockio/reader/cache_stats.go:CacheStats`,
+`internal/modules/blockio/reader/columnar_read.go:readBlockColumnarWithCache`,
+`internal/modules/executor/otel_spans.go:attachCacheStats`.
+
+---
+
+## SPEC-OBS-005: Per-Section Cache Stat Collection via Fetched-Flag Pattern
+*Added: 2026-06-19*
+
+Cache hit vs miss detection in `readBlockColumnarWithCache` MUST use a fetched-flag wrapper
+rather than inspecting return values or adding state to the tieredcache. The pattern:
+
+```go
+var fetched bool
+result, err = cache.GetOrFetchV8Section(fileID, section, 0, key, func() ([]byte, error) {
+    fetched = true
+    return innerFetch()
+})
+if err == nil && cs != nil {
+    if fetched { cs.Misses[sectionIdx]++ } else { cs.Hits[sectionIdx]++ }
+}
+```
+
+This is zero-cost when `cs == nil` (the guard prevents the branch), and requires no changes
+to the tieredcache API. The tieredcache Prometheus metrics (`blockpack_typed_cache_requests_total`)
+remain the authoritative aggregate-level signal; OTel attributes serve per-trace debugging.
+
+For the combined ToC+columns batch fetch path (`sectionMixedFetcher`): if `toc` is non-nil
+after the batch (cache hit), record a ToC hit. For column-level: `len(keepCols)` are cold
+misses; the rest of `wantColumns` are warm hits.
+
+Back-ref: `internal/modules/blockio/reader/columnar_read.go:readBlockColumnarWithCache`.

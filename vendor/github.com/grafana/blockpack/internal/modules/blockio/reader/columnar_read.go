@@ -225,7 +225,7 @@ func (r *Reader) ReadGroupColumnarCached(
 	// from being lost — irrelevant with one block).
 	if len(cr.BlockIDs) == 1 {
 		blockIdx := cr.BlockIDs[0]
-		data, err := r.readBlockColumnarWithCache(cr.BlockOffsets[0], cr.BlockLengths[0], blockIdx, wantColumns)
+		data, err := r.readBlockColumnarWithCache(cr.BlockOffsets[0], cr.BlockLengths[0], blockIdx, wantColumns, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -259,7 +259,7 @@ func (r *Reader) ReadGroupColumnarCached(
 				}
 			}()
 			// Reuse readBlockColumnar's logic but route through the section cache.
-			data, err := r.readBlockColumnarWithCache(cr.BlockOffsets[j], cr.BlockLengths[j], blockIdx, wantColumns)
+			data, err := r.readBlockColumnarWithCache(cr.BlockOffsets[j], cr.BlockLengths[j], blockIdx, wantColumns, nil)
 			results[j] = blockResult{blockIdx: blockIdx, data: data, err: err}
 		}(j, blockIdx)
 	}
@@ -278,10 +278,12 @@ func (r *Reader) ReadGroupColumnarCached(
 // readBlockColumnarWithCache is readBlockColumnar extended with section cache routing.
 // Phase 1 (ToC) and Phase 2 (column reads) both go through r.cache so repeated queries
 // pay zero S3 cost. Falls back to the full block read on ToC parse errors.
+// NOTE-449: cs accumulates cache hit/miss counts when non-nil; nil is safe (no counting).
 func (r *Reader) readBlockColumnarWithCache(
 	blockOff, blockLen int64,
 	blockIdx int,
 	wantColumns map[string]struct{},
+	cs *CacheStats,
 ) ([]byte, error) {
 	// Encode blockIdx in the name field so subType=0 always, avoiding accidental
 	// collision with ToCSubTypeBloom(3), ToCSubTypeIntrinsic(4), ToCSubTypeTrace(5).
@@ -323,12 +325,24 @@ func (r *Reader) readBlockColumnarWithCache(
 	// columnar cache. The correctly-sized ToC is what gets cached, so warm queries
 	// pay one cache hit and one successful parse — no growth, no full-block read.
 	if toc == nil {
+		var tocFetched bool
 		toc, err = r.cache.GetOrFetchV8Section(r.fileID, sectionTypeBlockToc, 0, tocKey, func() ([]byte, error) {
+			tocFetched = true
 			return r.readSufficientToC(blockOff, blockLen)
 		})
 		if err != nil {
 			return nil, fmt.Errorf("block %d toc: %w", blockIdx, err)
 		}
+		if cs != nil { // NOTE-449: track ToC hit/miss
+			if tocFetched {
+				cs.Misses[CacheStatsSectionToc]++
+			} else {
+				cs.Hits[CacheStatsSectionToc]++
+			}
+		}
+	} else if cs != nil {
+		// toc came from the combined ToC+columns batch — section cache hit.
+		cs.Hits[CacheStatsSectionToc]++
 	}
 
 	// NOTE-241: reuse the per-block parsed ToC if it was cached by an earlier read. The
@@ -426,6 +440,15 @@ func (r *Reader) readBlockColumnarWithCache(
 		// inuse_space frame (acquireAssembledBuffer, ~1 GiB under load): a heavy metrics
 		// query touches a few small columns scattered across a large block, so bufSize
 		// previously spanned most of the block while only disjoint extents were ever read.
+	}
+
+	// NOTE-449: record column-level cache hits and misses after the sizing pass.
+	// keepCols are cold misses; the remaining wanted columns are warm hits.
+	if cs != nil && len(wantColumns) > 0 {
+		cs.Misses[CacheStatsSectionCol] += int32(len(keepCols)) //nolint:gosec
+		if wantHits := len(wantColumns) - len(keepCols); wantHits > 0 {
+			cs.Hits[CacheStatsSectionCol] += int32(wantHits) //nolint:gosec
+		}
 	}
 
 	// NOTE-208/367: draw the assembled buffer from a pool. It now holds ONLY the ToC
