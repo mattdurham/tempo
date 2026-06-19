@@ -390,14 +390,14 @@ func (b *blockpackBlock) FindTraceByID(_ context.Context, id common.ID, _ common
 
 // Search performs a search across the blockpack block
 // Uses blockpack's query engine for tag/duration filtering
-func (b *blockpackBlock) Search(_ context.Context, req *tempopb.SearchRequest,
+func (b *blockpackBlock) Search(ctx context.Context, req *tempopb.SearchRequest,
 	_ common.SearchOptions,
 ) (*tempopb.SearchResponse, error) {
 	// Build TraceQL query from SearchRequest
 	query := buildSearchQuery(req)
 
 	// Execute TraceQL query using public API
-	matches, err := b.executeQuery(query, blockpack.QueryOptions{
+	matches, err := b.executeQuery(ctx, query, blockpack.QueryOptions{
 		Limit: int(req.Limit),
 	})
 	if err != nil {
@@ -445,14 +445,14 @@ func (b *blockpackBlock) SearchTags(_ context.Context, scope traceql.AttributeSc
 
 // SearchTagValues implements the Searcher interface
 // Extracts unique values for a given tag
-func (b *blockpackBlock) SearchTagValues(_ context.Context, tag string, cb common.TagValuesCallback, _ common.MetricsCallback, _ common.SearchOptions) error {
+func (b *blockpackBlock) SearchTagValues(ctx context.Context, tag string, cb common.TagValuesCallback, _ common.MetricsCallback, _ common.SearchOptions) error {
 	// Use empty TraceQL query to match all spans, then extract tag values
 	// Tag names like "service.name" become column names like "resource.service.name"
 	colName := tagToColumnName(tag)
 	query := "{}" // Match all spans
 
 	// Execute TraceQL query using public API
-	matches, err := b.executeQuery(query, blockpack.QueryOptions{})
+	matches, err := b.executeQuery(ctx, query, blockpack.QueryOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to execute query: %w", err)
 	}
@@ -473,14 +473,14 @@ func (b *blockpackBlock) SearchTagValues(_ context.Context, tag string, cb commo
 }
 
 // SearchTagValuesV2 implements the Searcher interface
-func (b *blockpackBlock) SearchTagValuesV2(_ context.Context, tag traceql.Attribute, cb common.TagValuesCallbackV2, _ common.MetricsCallback, _ common.SearchOptions) error {
+func (b *blockpackBlock) SearchTagValuesV2(ctx context.Context, tag traceql.Attribute, cb common.TagValuesCallbackV2, _ common.MetricsCallback, _ common.SearchOptions) error {
 	// Convert traceql.Attribute to column name
 	colName := tagToColumnName(tag.Name)
 	// Use match-all TraceQL query
 	query := "{}"
 
 	// Execute TraceQL query using public API
-	matches, err := b.executeQuery(query, blockpack.QueryOptions{})
+	matches, err := b.executeQuery(ctx, query, blockpack.QueryOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to execute query: %w", err)
 	}
@@ -989,7 +989,7 @@ func (b *blockpackBlock) FetchTagValues(ctx context.Context, req traceql.FetchTa
 	query := conditionsToTraceQL(valConditions, true) // Use AND for multiple conditions
 
 	// Execute TraceQL query using public API
-	matches, err := b.executeQuery(query, blockpack.QueryOptions{})
+	matches, err := b.executeQuery(ctx, query, blockpack.QueryOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to execute query: %w", err)
 	}
@@ -1030,7 +1030,7 @@ func (b *blockpackBlock) FetchTagNames(ctx context.Context, req traceql.FetchTag
 		query := conditionsToTraceQL(flatConditions, true)
 
 		// Execute TraceQL query using public API
-		matches, err := b.executeQuery(query, blockpack.QueryOptions{})
+		matches, err := b.executeQuery(ctx, query, blockpack.QueryOptions{})
 		if err != nil {
 			return fmt.Errorf("failed to execute query: %w", err)
 		}

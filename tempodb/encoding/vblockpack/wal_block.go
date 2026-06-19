@@ -407,7 +407,7 @@ func (w *walBlock) Fetch(ctx context.Context, req traceql.FetchSpansRequest, opt
 	if e := getProcessEmbedder(configuredEmbedURL); e != nil {
 		walQueryOpts.Embedder = e
 	}
-	matches, _, fetchErr := blockpack.QueryTraceQL(r, query, walQueryOpts)
+	matches, _, fetchErr := blockpack.QueryTraceQL(ctx, r, query, walQueryOpts)
 	if fetchErr != nil {
 		return traceql.FetchSpansResponse{}, fmt.Errorf("walBlock Fetch: query: %w", fetchErr)
 	}
@@ -514,7 +514,7 @@ func newBlockpackIterator(reader *blockpack.Reader) (*blockpackIterator, error) 
 	byTrace := make(map[string][]blockpack.SpanMatch)
 	var traceOrder []string
 
-	allMatches, _, err := blockpack.QueryTraceQL(reader, "{}", blockpack.QueryOptions{})
+	allMatches, _, err := blockpack.QueryTraceQL(context.Background(), reader, "{}", blockpack.QueryOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to query spans: %w", err)
 	}
