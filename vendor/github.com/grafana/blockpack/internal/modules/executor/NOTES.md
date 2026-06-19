@@ -7031,3 +7031,25 @@ NOTE-447 gate hit counter for structural query path also deferred.
 `internal/modules/executor/otel_spans.go:emitPlannerSpan,startBlockSpan,attachCacheStats`,
 `internal/modules/blockio/reader/cache_stats.go:CacheStats`,
 `internal/modules/queryplanner/plan.go:Plan`.
+
+---
+
+## NOTE-450: File-level numeric range rejection honors bound exclusivity (2026-06-19)
+
+`rejectInt64Range`, `rejectUint64Range`, and `rejectFloat64Range` in `plan_blocks.go`
+previously ignored `node.MinInclusive`/`node.MaxInclusive` and treated every bound as
+inclusive. This produced false negatives (issue #370): a `> V` predicate with `fileMax == V`
+was NOT pruned, because the strict `queryMin > fileMax` test evaluated `V > V == false`,
+even though no value in the file can satisfy `> V`.
+
+Fix mirrors the already-correct block-level functions `colStatsRejectsInt64`/
+`colStatsRejectsFloat64`:
+- exclusive min → reject when `queryMin >= fileMax`
+- exclusive max → reject when `queryMax <= fileMin`
+- inclusive bounds keep the original strict comparison
+
+This is a pure pruning-precision (correctness) fix: it only ever *adds* rejections that
+were always logically valid, never removes a block that could match. NaN guards in the
+float path are unchanged. Same class of bug for string/bytes bounds is tracked in #369.
+
+**Back-ref:** `internal/modules/executor/plan_blocks.go:rejectInt64Range,rejectUint64Range,rejectFloat64Range`.

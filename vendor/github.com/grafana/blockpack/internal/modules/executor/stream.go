@@ -12,6 +12,8 @@ import (
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
 	modules_shared "github.com/grafana/blockpack/internal/modules/blockio/shared"
 	"github.com/grafana/blockpack/internal/modules/queryplanner"
@@ -295,6 +297,15 @@ func Collect(
 	// NOTE-449: top-level query span; child of ctx (inherits Tempo's distributed trace).
 	ctx, querySpan := tracer.Start(ctx, "blockpack.query")
 	defer querySpan.End()
+	if querySpan.IsRecording() {
+		querySpan.SetAttributes(
+			attribute.Int64("blockpack.query.start_ns", int64(opts.TimeRange.MinNano)), //nolint:gosec
+			attribute.Int64("blockpack.query.end_ns", int64(opts.TimeRange.MaxNano)),   //nolint:gosec
+			attribute.Int("blockpack.query.limit", opts.Limit),
+			attribute.Int("blockpack.query.shard_start", opts.StartBlock),
+			attribute.Int("blockpack.query.shard_count", opts.BlockCount),
+		)
+	}
 
 	queryStart := time.Now()
 
@@ -547,6 +558,12 @@ func scanBlocks(
 				delete(groupRaw, blockIdx)
 
 				meta := r.BlockMeta(blockIdx)
+				if blockSpan.IsRecording() {
+					blockSpan.SetAttributes(
+						attribute.Int64("blockpack.block.length_bytes", int64(meta.Length)), //nolint:gosec
+						attribute.Int("blockpack.block.span_count", int(meta.SpanCount)),
+					)
+				}
 				r.ResetInternStrings()
 
 				// NOTE-006: Acquire a pooled intern map for this block's lifetime. The map must
@@ -1316,7 +1333,15 @@ func collectIntrinsicTopK(
 	slices.SortFunc(selected, blockRefCompare)
 	blockOrder, blockCandidates := groupRefsByBlock(selected)
 	results := make([]MatchedRow, 0, len(selected))
-	err = forEachBlockInGroups(ctx, r, blockOrder, blockCandidates, wantColumns, secondPassCols, "collectIntrinsicTopK", nil,
+	err = forEachBlockInGroups(
+		ctx,
+		r,
+		blockOrder,
+		blockCandidates,
+		wantColumns,
+		secondPassCols,
+		"collectIntrinsicTopK",
+		nil,
 		func(pb parsedBlock, candidateRows []int) error {
 			for _, rowIdx := range candidateRows {
 				results = append(results, MatchedRow{
@@ -1326,7 +1351,8 @@ func collectIntrinsicTopK(
 				})
 			}
 			return nil
-		})
+		},
+	)
 	if err != nil {
 		return nil, err
 	}

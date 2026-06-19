@@ -426,71 +426,97 @@ func rangeRejectsFile(bounds *modules_reader.RangeBoundaries, node *vm.RangeNode
 }
 
 // rejectInt64Range checks if a range predicate can be rejected for an int64 column.
+//
+// NOTE-450: Honor node.MinInclusive/MaxInclusive (mirrors colStatsRejectsInt64). An
+// exclusive lower bound (queryMin, e.g. "> V") rejects the file when queryMin >= fileMax,
+// because the only file value that could possibly satisfy the predicate would be fileMax
+// and that value is excluded. Likewise an exclusive upper bound rejects when
+// queryMax <= fileMin. Inclusive bounds keep the original strict comparison.
 func rejectInt64Range(fileMin, fileMax int64, node *vm.RangeNode) bool {
-	if node.Min != nil && node.Max == nil {
+	if node.Min != nil {
 		if queryMin, ok := ptrValueToInt64(node.Min); ok {
-			return queryMin > fileMax
+			if node.MinInclusive {
+				if queryMin > fileMax {
+					return true
+				}
+			} else if queryMin >= fileMax {
+				return true
+			}
 		}
 	}
-	if node.Max != nil && node.Min == nil {
+	if node.Max != nil {
 		if queryMax, ok := ptrValueToInt64(node.Max); ok {
-			return queryMax < fileMin
-		}
-	}
-	if node.Min != nil && node.Max != nil {
-		queryMin, okMin := ptrValueToInt64(node.Min)
-		queryMax, okMax := ptrValueToInt64(node.Max)
-		if okMin && okMax {
-			return queryMin > fileMax || queryMax < fileMin
+			if node.MaxInclusive {
+				if queryMax < fileMin {
+					return true
+				}
+			} else if queryMax <= fileMin {
+				return true
+			}
 		}
 	}
 	return false
 }
 
 // rejectUint64Range checks if a range predicate can be rejected for a uint64 column.
+//
+// NOTE-450: Honor node.MinInclusive/MaxInclusive (see rejectInt64Range).
 func rejectUint64Range(fileMin, fileMax uint64, node *vm.RangeNode) bool {
-	if node.Min != nil && node.Max == nil {
+	if node.Min != nil {
 		if queryMin, ok := ptrValueToUint64(node.Min); ok {
-			return queryMin > fileMax
+			if node.MinInclusive {
+				if queryMin > fileMax {
+					return true
+				}
+			} else if queryMin >= fileMax {
+				return true
+			}
 		}
 	}
-	if node.Max != nil && node.Min == nil {
+	if node.Max != nil {
 		if queryMax, ok := ptrValueToUint64(node.Max); ok {
-			return queryMax < fileMin
-		}
-	}
-	if node.Min != nil && node.Max != nil {
-		queryMin, okMin := ptrValueToUint64(node.Min)
-		queryMax, okMax := ptrValueToUint64(node.Max)
-		if okMin && okMax {
-			return queryMin > fileMax || queryMax < fileMin
+			if node.MaxInclusive {
+				if queryMax < fileMin {
+					return true
+				}
+			} else if queryMax <= fileMin {
+				return true
+			}
 		}
 	}
 	return false
 }
 
 // rejectFloat64Range checks if a range predicate can be rejected for a float64 column.
+//
+// NOTE-450: Honor node.MinInclusive/MaxInclusive (see rejectInt64Range). NaN guards on
+// both the file bounds and the query bounds remain conservative (no rejection).
 func rejectFloat64Range(bounds *modules_reader.RangeBoundaries, node *vm.RangeNode) bool {
 	fileMin := math.Float64frombits(uint64(bounds.BucketMin)) //nolint:gosec
 	fileMax := math.Float64frombits(uint64(bounds.BucketMax)) //nolint:gosec
 	if math.IsNaN(fileMin) || math.IsNaN(fileMax) {
 		return false
 	}
-	if node.Min != nil && node.Max == nil {
+	if node.Min != nil {
 		if queryMin, ok := ptrValueToFloat64(node.Min); ok && !math.IsNaN(queryMin) {
-			return queryMin > fileMax
+			if node.MinInclusive {
+				if queryMin > fileMax {
+					return true
+				}
+			} else if queryMin >= fileMax {
+				return true
+			}
 		}
 	}
-	if node.Max != nil && node.Min == nil {
+	if node.Max != nil {
 		if queryMax, ok := ptrValueToFloat64(node.Max); ok && !math.IsNaN(queryMax) {
-			return queryMax < fileMin
-		}
-	}
-	if node.Min != nil && node.Max != nil {
-		queryMin, okMin := ptrValueToFloat64(node.Min)
-		queryMax, okMax := ptrValueToFloat64(node.Max)
-		if okMin && okMax && !math.IsNaN(queryMin) && !math.IsNaN(queryMax) {
-			return queryMin > fileMax || queryMax < fileMin
+			if node.MaxInclusive {
+				if queryMax < fileMin {
+					return true
+				}
+			} else if queryMax <= fileMin {
+				return true
+			}
 		}
 	}
 	return false
