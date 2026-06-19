@@ -261,12 +261,12 @@ func (b *blockpackBlock) newReader() (*blockpack.Reader, error) {
 }
 
 // executeQuery creates a reader and executes a TraceQL query, returning all matching spans.
-func (b *blockpackBlock) executeQuery(query string, opts blockpack.QueryOptions) ([]blockpack.SpanMatch, error) {
+func (b *blockpackBlock) executeQuery(ctx context.Context, query string, opts blockpack.QueryOptions) ([]blockpack.SpanMatch, error) {
 	r, err := b.newReader()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create blockpack reader: %w", err)
 	}
-	matches, _, err := blockpack.QueryTraceQL(r, query, opts)
+	matches, _, err := blockpack.QueryTraceQL(ctx, r, query, opts)
 	return matches, err
 }
 
@@ -651,9 +651,9 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 	// Use the pre-compiled program when available (NOTE-049: compile-once for regex DFA reuse).
 	// Fall back to the string-based path when compilation failed (structural/pipeline queries).
 	if compiledProgram != nil {
-		matches, qs, fetchErr = blockpack.QueryTraceQLWithProgram(r, compiledProgram, queryOpts)
+		matches, qs, fetchErr = blockpack.QueryTraceQLWithProgram(ctx, r, compiledProgram, queryOpts)
 	} else {
-		matches, qs, fetchErr = blockpack.QueryTraceQL(r, query, queryOpts)
+		matches, qs, fetchErr = blockpack.QueryTraceQL(ctx, r, query, queryOpts)
 	}
 	if len(qs.Steps) > 0 {
 		args := []any{"query", query, "path", qs.ExecutionPath, "total", qs.TotalDuration}
