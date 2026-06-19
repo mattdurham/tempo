@@ -7088,3 +7088,37 @@ Depends on the bound-exclusivity correctness fix (NOTE-450 / issue #370) so the 
 `[V,V]` boundary comparison is exact.
 
 **Back-ref:** `internal/modules/executor/plan_blocks.go:numericEqualityAsRange,numericValueLess,rejectByBoundary,colStatsRejects`.
+
+## NOTE-452: Bool ColStats pruning — `attr = true` / `= false` (issue #373)
+
+Bool attributes (`span.error`, custom bool spans) previously got zero block pruning: bool
+was explicitly excluded from `updateMinMaxFromAttr` (writer), so the ColStats section carried
+no numeric range for bool columns, and `attr = true`/`= false` compiled to a bare `Values`
+leaf that only the (string-only) bloom path could touch — which never fires for bool.
+
+Fix (mirrors NOTE-451's low-blast-radius philosophy — equality stays a `Values` leaf; the
+range synthesis lives entirely in the pruning functions):
+
+- **Writer** (`writer_block.go`, `writer_log.go`): bool now feeds the per-block min/max
+  tracker as a uint64 `0`/`1` (true=1, false=0), so the ColStats section records a numeric
+  `[min,max]` range with `HasNumRange=true`. `numKeyLess`'s default uint64 path orders `{0,1}`
+  correctly. `ColumnTypeBool` is added to the ColStats `switch mm.colType` that sets
+  `HasNumRange`. Bool is STILL excluded from the on-disk *range index* (no `RangeBool` type) —
+  the exclusion moved from `updateMinMaxFromAttr` to the range-index build loops in `writer.go`
+  (`if mm.colType == ColumnTypeBool { continue }`), preserving the `BlocksForRange` invariant.
+
+- **Executor** (`plan_blocks.go`): `valueAsUint64`, `numericEqualityAsRange`, and
+  `numericValueLess` now handle `vm.TypeBool` (true→1, false→0, false<true). A bool equality
+  leaf is synthesized to a degenerate inclusive `[v,v]` range; `bound.Type == TypeBool` routes
+  through the `default` (uint64) arm of the `colStatsRejectsNumeric` dispatch. Result:
+  `attr = true` rejects a block whose `blockMax == 0` (all false); `attr = false` rejects a
+  block whose `blockMin == 1` (all true). Column-absence pruning (`present_count == 0`) already
+  applied via the equality `requiresPresence` path.
+
+`!=` on bool is intentionally NOT pruned here: `!= true` matches both `false` AND *absent*
+rows, so a range/presence node would risk false-pruning blocks with absent rows. Old blocks
+without a bool ColStats range get no pruning (no-op, safe — `HasNumRange=false`).
+
+**Back-ref:** `executor/plan_blocks.go:valueAsUint64,numericEqualityAsRange,numericValueLess`;
+`writer/writer_block.go:updateMinMaxFromAttr`; `writer/writer.go` range-index loops;
+`writer/writer_log.go:updateLogMinMaxFromAttr`.

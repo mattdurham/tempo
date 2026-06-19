@@ -954,3 +954,12 @@ existing `math.Float64bits` LE encoding (already populated in `numMinKey`/`numMa
 uses the raw int64 bit pattern as uint64 LE — correct for round-trip via `int64(stat.MinNum)`
 on the executor side. The executor's `colStatsRejects` was updated to dispatch on value type
 before choosing the comparison path; old files (HasNumRange=false for these types) are unaffected.
+
+**Extension (NOTE-452, issue #373):** `HasNumRange` extended to `ColumnTypeBool`. Bool min/max
+is tracked as uint64 `0`/`1` (true=1, false=0) in `updateMinMaxFromAttr` /
+`updateLogMinMaxFromAttr`, giving each block a `[min,max]` range over `{0,1}`. Bool remains
+EXCLUDED from the on-disk range index (no `RangeBool` type): the exclusion was moved out of
+`updateMinMaxFromAttr` into the range-index build loops in `writer.go`
+(`if mm.colType == ColumnTypeBool { continue }`). This lets the executor prune blocks for
+`attr = true` (`blockMax == 0` → all false) and `attr = false` (`blockMin == 1` → all true)
+while keeping `BlocksForRange` bool-free. See executor NOTE-452.

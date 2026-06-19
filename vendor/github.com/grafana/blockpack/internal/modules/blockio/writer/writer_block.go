@@ -1397,6 +1397,15 @@ func (b *blockBuilder) updateMinMaxFromAttr(name string, typ shared.ColumnType, 
 	case shared.ColumnTypeFloat64, shared.ColumnTypeRangeFloat64:
 		binary.LittleEndian.PutUint64(tmp[:], math.Float64bits(val.Float))
 		b.updateMinMaxNum(name, typ, tmp)
+	case shared.ColumnTypeBool:
+		// NOTE-452 (issue #373): bool min/max tracked as numeric 0/1 (true=1, false=0) so
+		// ColStats records a [0,1] range; the uint64 numKeyLess ordering is correct for {0,1}.
+		var v uint64
+		if val.Bool {
+			v = 1
+		}
+		binary.LittleEndian.PutUint64(tmp[:], v)
+		b.updateMinMaxNum(name, typ, tmp)
 	default:
 		if key := encodeRangeKey(typ, val); key != "" {
 			b.updateMinMax(name, typ, key)
@@ -1507,9 +1516,13 @@ func (b *blockBuilder) addPresent(rowIdx int, name string, typ shared.ColumnType
 	}
 
 	// Feed range column index.
-	// Excluded: trace:id (unique per trace, not useful for block pruning)
-	//           Bool (no Range* equivalent; cardinality is always ≤2)
-	if name != traceIDColumnName && typ != shared.ColumnTypeBool {
+	// Excluded: trace:id (unique per trace, not useful for block pruning).
+	// NOTE-452 (issue #373): Bool columns DO feed the per-block min/max tracker so the
+	// file-level ColStats section records a numeric [0,1] range (true=1, false=0). This
+	// lets the executor prune blocks for `attr = true` (blockMax == 0 → no true spans) and
+	// `attr = false` (blockMin == 1 → no false spans). Bool has no Range* column index, so
+	// only the ColStats numeric range — not the on-disk range index — is populated.
+	if name != traceIDColumnName {
 		b.updateMinMaxFromAttr(name, typ, val)
 	}
 }
@@ -1562,7 +1575,9 @@ func (b *blockBuilder) finalize(blockVersion uint8) ([]byte, error) {
 			switch mm.colType {
 			case shared.ColumnTypeUint64, shared.ColumnTypeRangeUint64, shared.ColumnTypeRangeDuration,
 				shared.ColumnTypeFloat64, shared.ColumnTypeRangeFloat64,
-				shared.ColumnTypeInt64, shared.ColumnTypeRangeInt64:
+				shared.ColumnTypeInt64, shared.ColumnTypeRangeInt64,
+				// NOTE-452 (issue #373): Bool min/max stored as uint64 0/1.
+				shared.ColumnTypeBool:
 				cs.MinNum = binary.LittleEndian.Uint64(mm.numMinKey[:])
 				cs.MaxNum = binary.LittleEndian.Uint64(mm.numMaxKey[:])
 				cs.HasNumRange = true

@@ -705,6 +705,12 @@ func (w *Writer) flushBlocks() error {
 		// Update range index.
 		bid := uint32(s.blockID) //nolint:gosec
 		for _, mm := range built.colMinMax {
+			if mm.colType == shared.ColumnTypeBool {
+				// NOTE-452 (issue #373): bool min/max is tracked in colMinMax only to feed
+				// the ColStats numeric [0,1] range; there is no RangeBool index type, so it
+				// must be excluded from the on-disk range index.
+				continue
+			}
 			cd, ok := w.rangeIdx[mm.colName]
 			if !ok {
 				cd = newRangeColumnData(mm.colType)
@@ -829,6 +835,11 @@ func (w *Writer) flushLogBlocks() error {
 
 		bid := uint32(s.blockID) //nolint:gosec
 		for _, mm := range built.colMinMax {
+			if mm.colType == shared.ColumnTypeBool {
+				// NOTE-452 (issue #373): see the trace-block loop above — bool is excluded
+				// from the on-disk range index (no RangeBool type); ColStats only.
+				continue
+			}
 			cd, ok := w.rangeIdx[mm.colName]
 			if !ok {
 				cd = newRangeColumnData(mm.colType)

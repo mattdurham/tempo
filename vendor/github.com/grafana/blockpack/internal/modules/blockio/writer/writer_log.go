@@ -243,6 +243,14 @@ func (b *logBlockBuilder) updateLogMinMaxFromAttr(name string, typ shared.Column
 	case shared.ColumnTypeFloat64, shared.ColumnTypeRangeFloat64:
 		binary.LittleEndian.PutUint64(tmp[:], math.Float64bits(val.Float))
 		b.updateLogMinMaxNum(name, typ, tmp)
+	case shared.ColumnTypeBool:
+		// NOTE-452 (issue #373): bool min/max tracked as numeric 0/1 (true=1, false=0).
+		var v uint64
+		if val.Bool {
+			v = 1
+		}
+		binary.LittleEndian.PutUint64(tmp[:], v)
+		b.updateLogMinMaxNum(name, typ, tmp)
 	default:
 		if key := encodeRangeKey(typ, val); key != "" {
 			b.updateLogMinMax(name, typ, key)
@@ -321,9 +329,12 @@ func (b *logBlockBuilder) addLogPresent(name string, typ shared.ColumnType, val 
 	default:
 		cb.addBytes(val.Bytes, true)
 	}
-	// Feed range column index. Excluded: Bool, logTraceIDColumnName, logSpanIDColumnName
+	// Feed range column index. Excluded: logTraceIDColumnName, logSpanIDColumnName
 	// (IDs are unique per record; not useful for block pruning).
-	if name != logTraceIDColumnName && name != logSpanIDColumnName && typ != shared.ColumnTypeBool {
+	// NOTE-452 (issue #373): bool DOES feed the per-block min/max tracker (as numeric 0/1)
+	// so ColStats records a [0,1] range for log bool attributes. Bool is still excluded
+	// from the on-disk range index in writer.go (no RangeBool type).
+	if name != logTraceIDColumnName && name != logSpanIDColumnName {
 		b.updateLogMinMaxFromAttr(name, typ, val)
 	}
 	// NOTE-040: attempt numeric promotion for string columns.

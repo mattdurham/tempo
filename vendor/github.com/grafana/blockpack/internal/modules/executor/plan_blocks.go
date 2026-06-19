@@ -213,7 +213,8 @@ func colStatsRejectsNumeric(stat *modules_shared.ColStat, node *vm.RangeNode) bo
 		// Int64) are unaffected — this branch only fires when HasNumRange=true.
 		return colStatsRejectsInt64(stat, rangeNode)
 	default:
-		// uint64, duration, and other unsigned types use the existing uint64 path.
+		// uint64, duration, bool ({0,1}), and other unsigned types use the uint64 path
+		// (NOTE-452 routes TypeBool here; valueAsUint64 maps true→1, false→0).
 		if rangeNode.Min != nil && numNodeBoundExceedsMax(rangeNode.Min, rangeNode.MinInclusive, stat.MaxNum) {
 			return true
 		}
@@ -258,6 +259,15 @@ func valueAsUint64(v *vm.Value) (uint64, bool) {
 	case vm.TypeInt, vm.TypeDuration:
 		if iv, ok := v.Data.(int64); ok {
 			return uint64(iv), true //nolint:gosec
+		}
+		return 0, false
+	case vm.TypeBool:
+		// NOTE-452 (issue #373): bool ColStats range is stored as uint64 0/1 (true=1).
+		if bv, ok := v.Data.(bool); ok {
+			if bv {
+				return 1, true
+			}
+			return 0, true
 		}
 		return 0, false
 	default:
@@ -448,6 +458,10 @@ func numericEqualityAsRange(node *vm.RangeNode) (vm.RangeNode, bool) {
 	wantType := node.Values[0].Type
 	switch wantType {
 	case vm.TypeInt, vm.TypeFloat, vm.TypeDuration:
+	// NOTE-452 (issue #373): bool equality ("attr = true"/"= false") is a degenerate
+	// numeric range [v,v] over the {0,1} ColStats range, prunes blocks where every span
+	// has the opposite value (blockMax == 0 → no true; blockMin == 1 → no false).
+	case vm.TypeBool:
 	default:
 		return vm.RangeNode{}, false
 	}
@@ -485,6 +499,11 @@ func numericValueLess(a, b vm.Value) bool {
 		af, _ := a.Data.(float64)
 		bf, _ := b.Data.(float64)
 		return af < bf
+	case vm.TypeBool:
+		// NOTE-452 (issue #373): false(0) < true(1).
+		ab, _ := a.Data.(bool)
+		bb, _ := b.Data.(bool)
+		return !ab && bb
 	default: // TypeInt, TypeDuration
 		ai, _ := a.Data.(int64)
 		bi, _ := b.Data.(int64)
