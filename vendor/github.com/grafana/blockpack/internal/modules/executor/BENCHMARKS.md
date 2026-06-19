@@ -767,3 +767,32 @@ go test -run='^$' -bench=BenchmarkPopulateTypedColumnForBlock -benchmem -count=5
 
 Back-ref: `internal/modules/executor/intrinsic_row_block_bench_test.go`,
 `internal/modules/executor/intrinsic_row_block.go:lookupIntrinsicFieldsTypedForBlock`
+
+## BENCH-ST-06: BenchmarkStructural_LazyRHSColumn (NOTE-447)
+
+*Added: 2026-06-19*
+
+**Purpose:** Verify that the NOTE-447 lazy RHS column gate eliminates `span.rpc.method` decode
+cost when a file contains no `kind=client` spans. Measures `ExecuteStructural` on a pure
+gate-fires-always workload.
+
+**Query:** `{kind=server} >> {kind=client && span.rpc.method!=""}`
+
+**What it measures:**
+- `BenchmarkStructural_LazyRHSColumn`: 100 traces, each with 1 kind=server span (rpc.method="GET").
+  Expected result: 0 matches (no kind=client spans → no >> pairs). Measures ns/op and allocs/op.
+
+**Regression threshold:** Must not be slower than `BenchmarkExecuteStructural_AND_control`
+(BENCH-ST-03). A regression here means the NOTE-447 gate overhead exceeds the savings from
+skipping column decode.
+
+**Setup:** 100 kind=server spans (no client spans) with rpc.method attribute. `b.ReportAllocs()`.
+
+**Run:**
+```
+go test -run='^$' -bench=BenchmarkStructural_LazyRHSColumn -benchmem -benchtime=3x -count=6 \
+    ./internal/modules/executor/
+```
+
+Back-ref: `internal/modules/executor/stream_structural_bench_test.go:BenchmarkStructural_LazyRHSColumn`,
+`internal/modules/executor/stream_structural.go:anySpanMatchesIntrinsicNodes`

@@ -3626,3 +3626,38 @@ Verifies the NOTE-100 optimization produces identical results to the original co
 - `_MultiBlock_AllMatch`: 500 spans, 10 blocks. No cross-block bleed.
 
 Back-ref: `internal/modules/executor/intrinsic_row_block_test.go`
+
+## EX-STRUCT-LAZY-01: anySpanMatchesIntrinsicNodes unit tests (NOTE-447)
+
+**File:** `internal/modules/executor/stream_structural_lazy_test.go`
+
+Four tests exercising all branches of the NOTE-447 intrinsic pre-check helper:
+
+- `TestAnySpanMatchesIntrinsicNodes_NoMatch`: 3 server spans, nodes require client → false.
+- `TestAnySpanMatchesIntrinsicNodes_MatchFirst`: row 0 is client → true (early exit).
+- `TestAnySpanMatchesIntrinsicNodes_MatchLast`: rows 0-1 server, row 2 client → true.
+- `TestAnySpanMatchesIntrinsicNodes_Empty`: nil/empty idFields → false.
+
+Back-ref: `internal/modules/executor/stream_structural.go:anySpanMatchesIntrinsicNodes`
+
+## EX-STRUCT-LAZY-02: NOTE-447 RHS intrinsic pre-check gate integration tests
+
+**File:** `internal/modules/executor/stream_structural_lazy_test.go`
+
+- `TestCollectBlockStructuralSpanRecs_LazyRHSGate_SkipsRHSColumn`: file with only
+  kind=server spans runs `{kind=server} >> {kind=client && span.rpc.method!=""}`;
+  gate fires, no kind=client spans match RHS, result has zero nodeMatch!=0 entries.
+- `TestCollectBlockStructuralSpanRecs_LazyRHSGate_PassesWhenClientPresent`: file with
+  server parent and client child (rpc.method="GET"); gate passes, RHS program matches
+  exactly 1 span.
+
+**Invariant tests (NOTE-373/NOTE-425/NOTE-447):**
+- `TestBuildStructuralBlockPlan_RHSColumnsExcludedFromWant`: RHS-only user-attr columns
+  (e.g. `span.rpc.method`) are excluded from `bp.wantColumns` when `nodesList[i]` is non-empty.
+- `TestBuildStructuralBlockPlan_LegacyFile_AllColumnsEager`: skipped on intrinsic-section
+  files; verifies legacy path on old-format files.
+- `TestEvaluateStructuralPrograms_BlockSetGateBeforeIntrinsicCheck`: NOTE-425 block-set
+  gate fires before NOTE-447 intrinsic pre-check; program excluded by block-set returns
+  emptyRowSet without reaching anySpanMatchesIntrinsicNodes.
+
+Back-ref: `internal/modules/executor/stream_structural_lazy_test.go`

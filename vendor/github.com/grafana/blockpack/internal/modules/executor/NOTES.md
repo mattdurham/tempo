@@ -6917,3 +6917,33 @@ differential equivalence tests that exercise the cores end-to-end):
 
 **Back-ref:** `internal/modules/executor/metrics_trace_intrinsic.go`: `unpackPreSortedRefs`,
 `resolveGroupByDict`, `applyCountRateAbsentRowPass`, `scatterDictRef`.
+
+## NOTE-447: Lazy per-program RHS column loading gate for structural queries (2026-06-19)
+
+For structural queries like `{kind=server} >> {kind=client && span.rpc.method!=""}`,
+`buildStructuralBlockPlan` previously unioned ALL programs' user-attr columns into
+`bp.wantColumns`, causing `span.rpc.method` to be eagerly decoded for every block in
+`progBlockSets[1]` — even blocks with zero `kind=client` spans. NOTE-425 already skipped
+the ColumnPredicate call for blocks NOT in `progBlockSets[i]`, but blocks that ARE in the
+set still paid the full column-decode cost if no actual span satisfied the intrinsic predicate.
+
+This note splits the column union: programs where `nodesList[i]` is non-empty (have an
+intrinsic gate like `kind=client`) no longer contribute to the eager `bp.wantColumns`. Their
+user-attr columns for programs with non-empty `nodesList[i]` are excluded from `bp.wantColumns`
+and lazily registered (not in the `WantOnly` set), so `ParseBlockFromBytes` registers them with
+zero decode cost. Before running program i's `ColumnPredicate`, a new pre-check
+`anySpanMatchesIntrinsicNodes(idFields, nodesList[i])` scans the already-loaded `idFields` slice
+(O(spanCount), early exit) and returns `emptyRowSet{}` immediately if no span satisfies the
+intrinsic constraint. When it passes, `ColumnPredicate` runs as today and triggers lazy decode
+on first column access via `ensureDecompressed`.
+
+`lookupIntrinsicFieldsTypedForBlock` is moved before `evaluateStructuralPrograms` in
+`collectBlockStructuralSpanRecs` so `idFields` is available for the pre-check gate.
+
+NOTE-373 is preserved: `nodesList` is computed once in `buildStructuralBlockPlan` per the plan-once
+invariant. NOTE-425 is preserved: the block-set check fires first. Legacy files
+(`hasIntrinsic=false`) are unaffected: both the column split and the pre-check gate are
+guarded by `hasIntrinsic`.
+
+**Back-ref:** `internal/modules/executor/stream_structural.go:anySpanMatchesIntrinsicNodes`,
+`buildStructuralBlockPlan`, `evaluateStructuralPrograms`, `collectBlockStructuralSpanRecs`.

@@ -427,12 +427,36 @@ func buildStructuralBlockPlan(
 ) structuralBlockPlan {
 	hasIntrinsic := r.HasIntrinsicSection()
 
-	// Union predicate columns from all programs. For intrinsic-section files, identity and
-	// intrinsic predicate columns are served from the intrinsic section (NOTE-372), so build
-	// wantColumns from userAttrProgram(prog) to omit them from the block fetch. Legacy files
-	// have no intrinsic section, so they keep the full set including identity columns.
+	intrinsicWant := map[string]struct{}{
+		colNameTraceID:  {},
+		colNameSpanID:   {},
+		colNameParentID: {},
+	}
+
+	// NOTE-447: compute nodesList BEFORE the column split so we know which programs have
+	// intrinsic gates (non-empty nodesList[i]). For legacy files (no intrinsic section),
+	// nodesList is nil and all programs go into the eager wantColumns union unchanged.
+	var nodesList [][]vm.RangeNode
+	if hasIntrinsic {
+		nodesList = collectStructuralIntrinsicNodes(programs, intrinsicWant)
+	}
+
+	// Union predicate columns from all programs into wantColumns. For intrinsic-section files,
+	// identity and intrinsic predicate columns are served from the intrinsic section (NOTE-372),
+	// so build columns from userAttrProgram(prog) to omit them from the block fetch. Legacy
+	// files have no intrinsic section, so they keep the full set including identity columns.
+	//
+	// NOTE-447: programs where nodesList[i] is non-empty (have an intrinsic gate) are EXCLUDED
+	// from the eager wantColumns union. Their user-attr columns are not listed in WantOnly(wantColumns),
+	// so ParseBlockFromBytes registers them lazily (zero decode cost) — ensureDecompressed fires
+	// on first ColumnPredicate access, which is skipped entirely when anySpanMatchesIntrinsicNodes
+	// returns false. Programs with no intrinsic gate still go into the eager wantColumns union.
 	var wantColumns map[string]struct{}
-	for _, prog := range programs {
+	for i, prog := range programs {
+		// NOTE-447: skip programs with an intrinsic gate — their columns are lazily registered.
+		if hasIntrinsic && i < len(nodesList) && len(nodesList[i]) > 0 {
+			continue
+		}
 		wantProg := prog
 		if hasIntrinsic {
 			wantProg = userAttrProgram(prog)
@@ -452,19 +476,9 @@ func buildStructuralBlockPlan(
 		if wantColumns == nil {
 			wantColumns = make(map[string]struct{})
 		}
-		wantColumns["trace:id"] = struct{}{}
-		wantColumns["span:id"] = struct{}{}
-		wantColumns["span:parent_id"] = struct{}{}
-	}
-
-	intrinsicWant := map[string]struct{}{
-		"trace:id":       {},
-		"span:id":        {},
-		"span:parent_id": {},
-	}
-	var nodesList [][]vm.RangeNode
-	if hasIntrinsic {
-		nodesList = collectStructuralIntrinsicNodes(programs, intrinsicWant)
+		wantColumns[colNameTraceID] = struct{}{}
+		wantColumns[colNameSpanID] = struct{}{}
+		wantColumns[colNameParentID] = struct{}{}
 	}
 
 	return structuralBlockPlan{
@@ -512,22 +526,13 @@ func collectBlockStructuralSpanRecs(
 	parsedBlocks[blockIdx] = bwb.Block
 	provider := acquireBlockColumnProvider(bwb.Block)
 	spanCount := bwb.Block.SpanCount()
-
-	// Evaluate each program against block columns.
-	// For files with an intrinsic section, strip intrinsic-column predicates first.
-	sets, err := evaluateStructuralPrograms(
-		bp.programs, hasIntrinsic, provider, spanCount, blockIdx, bp.progBlockSets,
-	)
-	if err != nil {
-		releaseBlockColumnProvider(provider)
-		return flat, err
-	}
-
 	n := spanCount
 
 	nodesList := bp.nodesList
 	intrinsicWant := bp.intrinsicWant
 
+	// NOTE-447: load idFields BEFORE evaluateStructuralPrograms so the intrinsic pre-check
+	// gate can inspect per-span kind/status/etc without re-loading from the intrinsic section.
 	// Resolve identity fields. For files with an intrinsic section, use
 	// lookupIntrinsicFieldsTypedForBlock (NOTE-100): one binary search per column instead
 	// of one per span, eliminating the allRefs allocation and O(N×log(B×N)) binary searches.
@@ -557,6 +562,17 @@ func collectBlockStructuralSpanRecs(
 	// consumed by the row loop below and copied out into structuralSpanRec entries; nothing
 	// retains a reference past this function, so release it on every exit path.
 	defer putIntrinsicRowFields(idFields)
+
+	// Evaluate each program against block columns (NOTE-425 gate + NOTE-447 intrinsic pre-check).
+	// For files with an intrinsic section, strip intrinsic-column predicates first.
+	sets, err := evaluateStructuralPrograms(
+		bp.programs, hasIntrinsic, provider, spanCount, blockIdx,
+		bp.progBlockSets, nodesList, idFields,
+	)
+	if err != nil {
+		releaseBlockColumnProvider(provider)
+		return flat, err
+	}
 
 	// NOTE-432: precompute the per-row predicate-match bitmask in O(sum of set sizes) so the
 	// row loop reads a bit with one array index instead of binary-searching every program's
@@ -613,17 +629,34 @@ func evalStructuralProgram(prog *vm.Program, provider vm.ColumnDataProvider, spa
 // the emptyRowSet sentinel. This is byte-identical to running the predicate (the pruned block has
 // no matching span, modulo the bloom FPR already accepted at file level) but avoids the wasted
 // per-block decode that dominates the structural CPU profile on union-of-block-sets shapes.
+//
+// NOTE-447: after the NOTE-425 gate, if program i has intrinsic predicate nodes (nodesList[i]
+// non-empty) and no span in idFields satisfies them, skip ColumnPredicate and return emptyRowSet.
+// RHS user-attr columns are NOT in bp.wantColumns (they are lazily registered), so skipping
+// ColumnPredicate means they are never decoded for this block.
 func evaluateStructuralPrograms(
 	programs []*vm.Program,
 	hasIntrinsic bool,
 	provider vm.ColumnDataProvider,
 	spanCount, blockIdx int,
 	progBlockSets []map[int]struct{},
+	nodesList [][]vm.RangeNode,
+	idFields []intrinsicRowFields,
 ) ([]vm.RowSet, error) {
 	sets := make([]vm.RowSet, len(programs))
 	for i, prog := range programs {
 		if i < len(progBlockSets) && progBlockSets[i] != nil {
 			if _, ok := progBlockSets[i][blockIdx]; !ok {
+				sets[i] = emptyRowSet{}
+				continue
+			}
+		}
+		// NOTE-447: intrinsic pre-check — if program i has intrinsic predicate nodes and
+		// no span in this block satisfies them, skip ColumnPredicate entirely.
+		// RHS user-attr columns (e.g. span.rpc.method) are lazily registered via WantOnly;
+		// skipping ColumnPredicate means they are never decoded for this block.
+		if hasIntrinsic && i < len(nodesList) && len(nodesList[i]) > 0 {
+			if !anySpanMatchesIntrinsicNodes(idFields, nodesList[i]) {
 				sets[i] = emptyRowSet{}
 				continue
 			}
@@ -735,6 +768,20 @@ func computeNodeMatchForRow(
 		}
 	}
 	return nodeMatch
+}
+
+// anySpanMatchesIntrinsicNodes returns true if any span in idFields satisfies all nodes in
+// the prepared intrinsic node list. It is an early-exit O(spanCount) scan over already-loaded
+// intrinsic data — no I/O, no column decode. Used by the NOTE-447 per-program intrinsic
+// pre-check gate in evaluateStructuralPrograms.
+// NOTE-447: pre-check for lazy RHS column loading gate.
+func anySpanMatchesIntrinsicNodes(idFields []intrinsicRowFields, nodes []vm.RangeNode) bool {
+	for i := range idFields {
+		if rowSatisfiesPreparedIntrinsicNodes(nodes, &idFields[i]) {
+			return true
+		}
+	}
+	return false
 }
 
 // collectStructuralIntrinsicNodes collects intrinsic predicate nodes from each program,
