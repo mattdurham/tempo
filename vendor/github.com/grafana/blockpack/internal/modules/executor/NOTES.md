@@ -6947,3 +6947,51 @@ guarded by `hasIntrinsic`.
 
 **Back-ref:** `internal/modules/executor/stream_structural.go:anySpanMatchesIntrinsicNodes`,
 `buildStructuralBlockPlan`, `evaluateStructuralPrograms`, `collectBlockStructuralSpanRecs`.
+
+---
+
+## NOTE-448: Pruning completeness — string/bytes range, regex prefix, Int64 and Float64 ColStats (issue #367)
+
+*Added: 2026-06-19*
+
+**Problem:** Blockpack stored string/bytes min/max bounds in `RangeBoundaries`, and stored
+Int64 and Float64 bit patterns in `colMinMax`, but none of these were used for pruning.
+String range predicates (`span.http.url > "http://z"`) and anchored regex patterns
+(`span.service.name =~ "^checkout.*"`) always fell through `rangeRejectsFile` unchanged.
+Int64 and Float64 columns never received `HasNumRange = true` from the writer, so
+`colStatsRejects` only applied presence pruning to them.
+
+**Gap 1 — String/Bytes file-level reject:** Added `rejectStringRange` and `rejectBytesRange`
+helpers to `rangeRejectsFile`. They consume `bounds.StringBounds[0]`/`[last]` and
+`bounds.BytesBounds[0]`/`[last]` as the file-wide min/max. These are exact: the writer's
+KLL sketch was fed every block's min and max string. Conservative: `truncateBoundaryKey`
+may shorten long keys, but only makes the reject criterion looser (false negatives only).
+
+**Gap 2 — Anchored regex prefix rejection:** Added `extractAnchoredLiteralPrefix` (naive
+byte scan, no regexp/syntax import, zero allocation) and `rejectRegexByStringBounds`.
+`rejectByBoundary` now intercepts `Min==nil && Max==nil && Pattern!=""` leaf nodes and
+routes them through `rejectRegexByStringBounds`. Only the `prefix > fileMax` direction is
+exploited; the lower-bound direction requires computing `nextPrefix(prefix)` (byte overflow
+handling) — omitted to keep the implementation conservative and correct.
+
+**Gap 3 — Float64 ColStats:** Writer (`writer_block.go:finalize`) now emits `HasNumRange=true`
+for `ColumnTypeFloat64` and `ColumnTypeRangeFloat64`. Executor added `colStatsRejectsFloat64`
+which uses `math.Float64frombits` to decode `stat.MinNum`/`stat.MaxNum` with a NaN guard.
+
+**Gap 4 — Int64 ColStats:** Writer now emits `HasNumRange=true` for `ColumnTypeInt64` and
+`ColumnTypeRangeInt64`. Executor added `colStatsRejectsInt64` which casts `stat.MinNum`/
+`stat.MaxNum` to `int64` for signed comparison. CRITICAL: the writer and executor changes are
+atomic (same commit). If the writer emitted `HasNumRange` for Int64 while the executor still
+used `numNodeBoundExceedsMax` (uint64 path), negative int64 values would be pruned incorrectly.
+
+**Type dispatch in `colStatsRejects`:** The `if stat.HasNumRange` block now dispatches on
+`bound.Type` before choosing the comparison path: `TypeFloat` → float64 path; `TypeInt` →
+signed int64 path; all other types (uint64, duration) → existing uint64 path.
+
+**Backward compatibility:** Old files have `HasNumRange=false` for Int64/Float64 columns;
+the new dispatch branches never fire on old files. New files gain more aggressive block pruning.
+
+**Back-ref:** `internal/modules/executor/plan_blocks.go:rejectStringRange`,
+`rejectBytesRange`, `rejectRegexByStringBounds`, `extractAnchoredLiteralPrefix`,
+`colStatsRejectsInt64`, `colStatsRejectsFloat64`, `colStatsRejects`.
+`internal/modules/blockio/writer/writer_block.go:finalize` (switch extension).

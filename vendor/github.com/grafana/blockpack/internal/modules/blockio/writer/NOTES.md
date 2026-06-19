@@ -947,3 +947,10 @@ the section get no ColStats pruning (`HasColStats()` returns false). No format-v
 Back-ref: `shared/colstats.go` (codec), `writer/writer_block.go:finalize` (capture),
 `writer/v8_sections.go:writeV8FileSections` (write), `reader/parser.go:ColStats/HasColStats`
 (read), `executor/plan_blocks.go:pruneByColStats`, `vm/traceql_compiler.go:extractNeqPresenceNode`.
+
+**Extension (NOTE-448, issue #367):** `HasNumRange` was subsequently extended to `ColumnTypeFloat64`,
+`ColumnTypeRangeFloat64`, `ColumnTypeInt64`, and `ColumnTypeRangeInt64`. Float64 uses the
+existing `math.Float64bits` LE encoding (already populated in `numMinKey`/`numMaxKey`). Int64
+uses the raw int64 bit pattern as uint64 LE — correct for round-trip via `int64(stat.MinNum)`
+on the executor side. The executor's `colStatsRejects` was updated to dispatch on value type
+before choosing the comparison path; old files (HasNumRange=false for these types) are unaffected.

@@ -1552,12 +1552,17 @@ func (b *blockBuilder) finalize(blockVersion uint8) ([]byte, error) {
 		}
 		cs := shared.ColStat{Name: e.key.Name, PresentCount: uint32(present)} //nolint:gosec
 		if mm, ok := b.colMinMax[e.key.Name]; ok && mm.isNum {
-			// Only unsigned-family columns are range-pruned: the LE bytes are compared as
-			// uint64, which is correct for uint64 / duration (non-negative nanoseconds) but
-			// NOT for signed int64 (negative values sort wrong under unsigned compare). The
-			// executor side mirrors this by only treating uint64/duration predicate bounds.
+			// NOTE-448: Numeric range ColStats covers unsigned, float64, and int64 families.
+			// numMinKey/numMaxKey store the correct bit patterns in all cases:
+			//   - uint64/duration: raw uint64 LE.
+			//   - Float64: math.Float64bits LE (updateMinMaxNum).
+			//   - Int64:   raw int64 bits LE (round-trip via int64(stat.MinNum) on executor).
+			// The executor dispatches to a type-aware comparator; see colStatsRejectsFloat64
+			// and colStatsRejectsInt64 in executor/plan_blocks.go.
 			switch mm.colType {
-			case shared.ColumnTypeUint64, shared.ColumnTypeRangeUint64, shared.ColumnTypeRangeDuration:
+			case shared.ColumnTypeUint64, shared.ColumnTypeRangeUint64, shared.ColumnTypeRangeDuration,
+				shared.ColumnTypeFloat64, shared.ColumnTypeRangeFloat64,
+				shared.ColumnTypeInt64, shared.ColumnTypeRangeInt64:
 				cs.MinNum = binary.LittleEndian.Uint64(mm.numMinKey[:])
 				cs.MaxNum = binary.LittleEndian.Uint64(mm.numMaxKey[:])
 				cs.HasNumRange = true

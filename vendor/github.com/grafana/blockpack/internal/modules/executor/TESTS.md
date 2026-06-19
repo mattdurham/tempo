@@ -3661,3 +3661,102 @@ Back-ref: `internal/modules/executor/stream_structural.go:anySpanMatchesIntrinsi
   emptyRowSet without reaching anySpanMatchesIntrinsicNodes.
 
 Back-ref: `internal/modules/executor/stream_structural_lazy_test.go`
+
+---
+
+## EX-22: TestRejectStringRange_MinOnly_Reject
+**Scenario:** Min-only string range predicate where queryMin > fileMax.
+**Setup:** bounds.StringBounds = ["f","m"], node.Min = "z".
+**Assertions:** `rejectStringRange` returns true.
+
+---
+
+## EX-23: TestRejectStringRange_MaxOnly_Reject
+**Scenario:** Max-only string range predicate where queryMax < fileMin.
+**Setup:** bounds.StringBounds = ["f","m"], node.Max = "a".
+**Assertions:** `rejectStringRange` returns true.
+
+---
+
+## EX-24: TestRejectStringRange_BothMinMax_NoReject
+**Scenario:** Min/max range overlaps the file range.
+**Setup:** bounds.StringBounds = ["f","t"], node.Min = "a", node.Max = "z".
+**Assertions:** `rejectStringRange` returns false.
+
+---
+
+## EX-25: TestRejectStringRange_EmptyBounds_NoReject
+**Scenario:** Insufficient bounds to reject.
+**Setup:** bounds.StringBounds = nil or len < 2.
+**Assertions:** `rejectStringRange` returns false.
+
+---
+
+## EX-26: TestRangeRejectsFile_StringColumn_Reject
+**Scenario:** Full dispatch path: ColType=RangeString, queryMin above fileMax.
+**Setup:** RangeBoundaries.ColType=ColumnTypeRangeString, StringBounds=["f","m"], node.Min="z".
+**Assertions:** `rangeRejectsFile` returns true.
+
+---
+
+## EX-27: TestRejectBytesRange_MinOnly_Reject
+**Scenario:** Min-only bytes range predicate where queryMin > fileMax.
+**Setup:** BytesBounds = [[]byte("f"), []byte("m")], node.Min = []byte("z").
+**Assertions:** `rejectBytesRange` returns true.
+
+---
+
+## EX-28: TestExtractAnchoredLiteralPrefix_AnchoredLiteral
+**Scenario:** Anchored pattern with a literal prefix before metacharacter.
+**Setup:** pattern = "^hello.*"
+**Assertions:** returns "hello".
+
+---
+
+## EX-29: TestExtractAnchoredLiteralPrefix_NoAnchor
+**Scenario:** Pattern not anchored at start.
+**Setup:** pattern = "hello.*"
+**Assertions:** returns "".
+
+---
+
+## EX-30: TestRejectRegexByStringBounds_PrefixAboveFileMax
+**Scenario:** Anchored regex prefix is lexicographically above the file's maximum string.
+**Setup:** StringBounds=["a","m"], pattern="^z.*"
+**Assertions:** `rejectRegexByStringBounds` returns true.
+
+---
+
+## EX-31: TestRejectRegexByStringBounds_PrefixBelowFileMax
+**Scenario:** Anchored regex prefix is within the file's range.
+**Setup:** StringBounds=["a","m"], pattern="^b.*"
+**Assertions:** `rejectRegexByStringBounds` returns false.
+
+---
+
+## EX-32: TestColStatsRejectsFloat64_MinOnly_Reject
+**Scenario:** Float64 ColStats: queryMin > blockMax → block pruned.
+**Setup:** stat.HasNumRange=true, stat.MinNum=math.Float64bits(1.0), stat.MaxNum=math.Float64bits(5.0),
+node.Min = &vm.Value{Type:TypeFloat, Data:10.0}, MinInclusive=true.
+**Assertions:** `colStatsRejectsFloat64` returns true; `colStatsRejects` returns true.
+
+---
+
+## EX-33: TestColStatsRejectsFloat64_NaN_StatMin_NoReject
+**Scenario:** NaN in stat min → conservative, no rejection.
+**Setup:** stat.HasNumRange=true, stat.MinNum=math.Float64bits(math.NaN()), node.Min = &vm.Value{Type:TypeFloat, Data:10.0}.
+**Assertions:** `colStatsRejectsFloat64` returns false.
+
+---
+
+## EX-34: TestColStatsRejectsInt64_NegativeValues_NoReject
+**Scenario:** Signed int64 range: query overlaps negative block range.
+**Setup:** blockMin=-20, blockMax=-5 (stored as uint64 bit patterns), queryMin=-10, queryMax=-1.
+**Assertions:** `colStatsRejectsInt64` returns false (overlap exists).
+
+---
+
+## EX-35: TestColStatsRejectsInt64_NegativeValues_Reject
+**Scenario:** Signed int64 range: all-positive query cannot match all-negative block.
+**Setup:** blockMin=-20, blockMax=-1 (stored as uint64 bit patterns), queryMin=0.
+**Assertions:** `colStatsRejectsInt64` returns true.
