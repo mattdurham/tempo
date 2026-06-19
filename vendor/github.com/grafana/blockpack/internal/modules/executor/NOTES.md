@@ -7053,3 +7053,38 @@ were always logically valid, never removes a block that could match. NaN guards 
 float path are unchanged. Same class of bug for string/bytes bounds is tracked in #369.
 
 **Back-ref:** `internal/modules/executor/plan_blocks.go:rejectInt64Range,rejectUint64Range,rejectFloat64Range`.
+
+---
+
+## NOTE-451: Numeric equality "attr = V" gets range-based block/file pruning (issue #371)
+
+A numeric equality predicate (`span.http.status_code = 404`) compiles to a
+`RangeNode{Values: [404]}` — it carries only `Values`, never `Min`/`Max`. Previously the
+file-level (`rejectByBoundary`/`rangeRejectsFile`) and block-level (`colStatsRejects`)
+pruning functions only consulted `Min`/`Max`, so range-indexed numeric columns *without a
+bloom filter* (Int64, Uint64, Float64, Duration) got zero pruning from equality — bloom
+doesn't exist for numeric types, and the range bounds were never checked.
+
+Fix: a numeric equality value set is a degenerate inclusive range. `numericEqualityAsRange`
+synthesizes `[min(values), max(values)]` (both inclusive) from an equality leaf whose
+values are all numeric (TypeInt/TypeFloat/TypeDuration), and feeds it through the existing
+range-rejection helpers (`rejectInt64Range`, `colStatsRejectsInt64`, `colStatsRejectsFloat64`,
+the uint64/duration path). For a single value V this is `[V, V]`; for an OR-folded multi-value
+leaf (`= A || = B`) it is `[min, max]` so a block/file is rejected only when its bounds cannot
+intersect ANY equality value (conservative — never a false reject).
+
+Why this is the lowest-blast-radius design:
+- It lives ENTIRELY in the pruning functions. RangeNode shape is untouched, so nothing in the
+  matching/merge path changes: `predicates.go` paths all test `len(node.Values) > 0` FIRST
+  (point-lookup), and `mergeORIntrinsicLeaves` still sees pure equality leaves with no Min/Max.
+- String/bytes equality is explicitly EXCLUDED (non-numeric value types return ok=false): those
+  columns are served by bloom + KLL range bounds, and treating them as numeric ranges would be
+  wrong (8-byte LE numeric comparison is meaningless for strings).
+- Relies on writer ColStats numeric range (`HasNumRange`, NOTE-446/NOTE-448) which is already
+  populated for ALL non-trace-id/non-bool columns via `updateMinMaxFromAttr`, including user
+  numeric attributes. Old blocks without ColStats simply get no pruning (no-op, safe).
+
+Depends on the bound-exclusivity correctness fix (NOTE-450 / issue #370) so the inclusive
+`[V,V]` boundary comparison is exact.
+
+**Back-ref:** `internal/modules/executor/plan_blocks.go:numericEqualityAsRange,numericValueLess,rejectByBoundary,colStatsRejects`.

@@ -175,39 +175,53 @@ func colStatsRejects(cs *modules_shared.BlockColStats, node *vm.RangeNode) bool 
 	// Numeric range pruning: if the predicate has a numeric bound and the block's recorded
 	// [min, max] cannot intersect it, the block cannot match. Only applied when ColStats
 	// carries a numeric range for this column.
-	//
-	// NOTE-448: Dispatch numeric range pruning to a type-aware helper based on the value type
-	// of the predicate bounds. This avoids applying uint64 bit comparison to signed int64
-	// values (wrong for negatives) or float64 values.
 	if stat.HasNumRange {
-		if node.Min != nil || node.Max != nil {
-			bound := node.Min
-			if bound == nil {
-				bound = node.Max
-			}
-			switch bound.Type {
-			case vm.TypeFloat:
-				if colStatsRejectsFloat64(stat, node) {
-					return true
-				}
-			case vm.TypeInt:
-				// NOTE-448: Int64 path uses signed comparison. Old files (HasNumRange=false
-				// for Int64) are unaffected — this branch only fires when HasNumRange=true.
-				if colStatsRejectsInt64(stat, node) {
-					return true
-				}
-			default:
-				// uint64, duration, and other unsigned types use the existing uint64 path.
-				if node.Min != nil && numNodeBoundExceedsMax(node.Min, node.MinInclusive, stat.MaxNum) {
-					return true
-				}
-				if node.Max != nil && numNodeBoundBelowMin(node.Max, node.MaxInclusive, stat.MinNum) {
-					return true
-				}
-			}
-		}
+		return colStatsRejectsNumeric(stat, node)
 	}
 	return false
+}
+
+// colStatsRejectsNumeric reports whether a block's recorded numeric [min,max] (stat) cannot
+// intersect node's predicate. Called only when stat.HasNumRange is true.
+//
+// NOTE-448: Dispatch numeric range pruning to a type-aware helper based on the value type of
+// the predicate bounds. This avoids applying uint64 bit comparison to signed int64 values
+// (wrong for negatives) or float64 values.
+//
+// NOTE-451: A numeric equality predicate ("attr = V") carries only Values. Treat it as a
+// degenerate inclusive range [min(values), max(values)] so range-indexed numeric columns
+// without a bloom filter still get block-level pruning.
+func colStatsRejectsNumeric(stat *modules_shared.ColStat, node *vm.RangeNode) bool {
+	rangeNode := node
+	if node.Min == nil && node.Max == nil {
+		if eq, ok := numericEqualityAsRange(node); ok {
+			rangeNode = &eq
+		}
+	}
+	if rangeNode.Min == nil && rangeNode.Max == nil {
+		return false
+	}
+	bound := rangeNode.Min
+	if bound == nil {
+		bound = rangeNode.Max
+	}
+	switch bound.Type {
+	case vm.TypeFloat:
+		return colStatsRejectsFloat64(stat, rangeNode)
+	case vm.TypeInt:
+		// NOTE-448: Int64 path uses signed comparison. Old files (HasNumRange=false for
+		// Int64) are unaffected — this branch only fires when HasNumRange=true.
+		return colStatsRejectsInt64(stat, rangeNode)
+	default:
+		// uint64, duration, and other unsigned types use the existing uint64 path.
+		if rangeNode.Min != nil && numNodeBoundExceedsMax(rangeNode.Min, rangeNode.MinInclusive, stat.MaxNum) {
+			return true
+		}
+		if rangeNode.Max != nil && numNodeBoundBelowMin(rangeNode.Max, rangeNode.MaxInclusive, stat.MinNum) {
+			return true
+		}
+		return false
+	}
 }
 
 // numNodeBoundExceedsMax reports whether a lower-bound predicate (Min) excludes the whole
@@ -384,6 +398,17 @@ func rejectByBoundary(r *modules_reader.Reader, node *vm.RangeNode) bool {
 
 	// Leaf node — only handle range predicates (Min/Max) for numeric columns.
 	if node.Min == nil && node.Max == nil {
+		// NOTE-451: A numeric equality predicate ("attr = V") carries only Values, never
+		// Min/Max — so range-indexed numeric columns without a bloom filter (Int64, Uint64,
+		// Float64, Duration) previously got no file-level pruning. Treat the equality value
+		// set as a degenerate inclusive range [min(values), max(values)] and feed it through
+		// the same range-rejection path. String/bytes equality is handled by bloom (and KLL
+		// range bounds elsewhere); this branch only synthesizes a range for numeric values.
+		if eq, ok := numericEqualityAsRange(node); ok && node.Column != "" {
+			if bounds := r.RangeColumnBoundaries(node.Column); bounds != nil {
+				return rangeRejectsFile(bounds, &eq)
+			}
+		}
 		// NOTE-448: For anchored regex patterns on string columns, attempt prefix rejection.
 		if node.Pattern != "" && node.Column != "" {
 			bounds := r.RangeColumnBoundaries(node.Column)
@@ -403,6 +428,68 @@ func rejectByBoundary(r *modules_reader.Reader, node *vm.RangeNode) bool {
 	}
 
 	return rangeRejectsFile(bounds, node)
+}
+
+// numericEqualityAsRange synthesizes a degenerate inclusive range node from an equality
+// leaf whose Values are all numeric (TypeInt, TypeFloat, or TypeDuration). For a single
+// value V it produces [V, V]; for a merged value set (e.g. "attr = A || attr = B" folded
+// into one leaf) it produces [min, max] so the block/file is rejected only when its
+// boundaries cannot intersect ANY of the equality values.
+//
+// Returns ok=false when the node is not a pure equality leaf (has Min/Max/Pattern), has no
+// values, or contains any non-numeric value (string/bytes equality is handled by bloom and
+// KLL bounds, not numeric range comparison). All values must share one numeric kind so the
+// resulting bound type is well-defined for the range-rejection helpers.
+func numericEqualityAsRange(node *vm.RangeNode) (vm.RangeNode, bool) {
+	if !nodeIsEqualityLeaf(node) {
+		return vm.RangeNode{}, false
+	}
+	var minV, maxV vm.Value
+	wantType := node.Values[0].Type
+	switch wantType {
+	case vm.TypeInt, vm.TypeFloat, vm.TypeDuration:
+	default:
+		return vm.RangeNode{}, false
+	}
+	for i, v := range node.Values {
+		if v.Type != wantType {
+			return vm.RangeNode{}, false
+		}
+		if i == 0 {
+			minV, maxV = v, v
+			continue
+		}
+		if numericValueLess(v, minV) {
+			minV = v
+		}
+		if numericValueLess(maxV, v) {
+			maxV = v
+		}
+	}
+	lo, hi := minV, maxV
+	return vm.RangeNode{
+		Column:       node.Column,
+		Min:          &lo,
+		Max:          &hi,
+		MinInclusive: true,
+		MaxInclusive: true,
+	}, true
+}
+
+// numericValueLess reports whether a < b for two numeric Values of the same type
+// (TypeInt, TypeFloat, or TypeDuration). Behavior is undefined for differing or
+// non-numeric types; callers guarantee same-type numeric values.
+func numericValueLess(a, b vm.Value) bool {
+	switch a.Type {
+	case vm.TypeFloat:
+		af, _ := a.Data.(float64)
+		bf, _ := b.Data.(float64)
+		return af < bf
+	default: // TypeInt, TypeDuration
+		ai, _ := a.Data.(int64)
+		bi, _ := b.Data.(int64)
+		return ai < bi
+	}
 }
 
 // rangeRejectsFile returns true when the predicate's interval is entirely outside
