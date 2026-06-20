@@ -7155,3 +7155,46 @@ those nodes.
 
 **Back-ref:** `executor/plan_blocks.go:rejectStringRange,rejectBytesRange`;
 `vm/traceql_compiler.go:extractNeqNode`.
+
+---
+
+## NOTE-455: Anchored regex pruning — character-class bounds + bidirectional reject (issue #374)
+*Added: 2026-06-19*
+
+**Problem:** NOTE-448's `extractAnchoredLiteralPrefix` only scanned the literal run before
+the first metacharacter and exploited a *single* direction (`prefix > fileMax`). Two common
+anchored shapes yielded no bound at all:
+- `^[a-m].*` — leading character class. `[` was a hard stop, so the prefix was empty → no prune.
+- `^abc[d-f].*` — literal prefix then a class. Extraction stopped at `[`, discarding the
+  range information that tightens both ends.
+
+**Fix:** replaced the prefix-only helper with `extractAnchoredBounds(pattern)` returning a
+conservative lexicographic interval `[lower, upper)` (plus `hasUpper`, `ok`):
+1. **Both directions.** A literal prefix `P` gives `lower = P` (inclusive) and
+   `upper = nextStringPrefix(P)` (exclusive) — every match has prefix `P`, so it sorts in
+   `[P, nextPrefix(P))`. `rejectRegexByStringBounds` now rejects when `lower > fileMax` OR
+   `upper <= fileMin`.
+2. **Simple char class fold.** A trailing `[X-Y]` (recognized ONLY in the exact form `[X-Y]`
+   by `parseSimpleCharClass` — no negation `[^…]`, no POSIX `[[:…:]]`, no multi-range/member,
+   printable ASCII, `X<=Y`) is folded: `lower = P+X`, `upper = P+(Y+1)`. Scanning stops after
+   the class (upper can't tighten further without deeper parsing). An *unrecognized* class is
+   treated as a wildcard stop → falls back to the prefix-only interval (or no bound).
+
+**`nextStringPrefix`:** smallest string strictly greater than every string prefixed by `s`.
+Increments the last byte; on `0xFF` it carries (drop + increment previous). `ok=false` only
+for empty `s` or an all-`0xFF` string (no finite ceiling) — callers then use only `lower`.
+Restricting the class fold to printable ASCII (`<=0x7E`) guarantees `Y+1` stays single-byte.
+
+**Conservatism / safety:** a wrong bound would silently drop matching data, so the bound must
+*contain every match*. Alternation (`|`) anywhere → `ok=false` (an arm could sort outside the
+interval). Empty prefix with no recognized class → `ok=false`. A property test
+(`TestExtractAnchoredBounds_NeverPrunesAMatch`) cross-checks 12 patterns × 50k random strings
+against the real `regexp` engine: every string the regex matches lies inside `[lower, upper)`.
+
+**Backward compatibility:** purely a pruning optimization on the same `RangeBoundaries` data
+(`ColumnTypeRangeString` KLL extrema). No format change. Worst case is a missed prune (now
+strictly fewer than before), never a wrong prune. The old `extractAnchoredLiteralPrefix` was
+removed (superseded; would have been dead code).
+
+**Back-ref:** `executor/plan_blocks.go:extractAnchoredBounds,parseSimpleCharClass,`
+`nextStringPrefix,rejectRegexByStringBounds`.

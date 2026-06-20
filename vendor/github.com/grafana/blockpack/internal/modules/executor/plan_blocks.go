@@ -788,38 +788,115 @@ func rejectBytesRange(bounds [][]byte, node *vm.RangeNode) bool {
 	return false
 }
 
-// extractAnchoredLiteralPrefix extracts a guaranteed literal prefix from an anchored regex
-// pattern for conservative range pruning. Returns "" when no useful prefix can be extracted.
-//
-// Rules:
-//   - Pattern must start with "^" — unanchored patterns could match anywhere.
-//   - Scans bytes after "^" until the first regex metacharacter: [ ( . * + ? { \ $ |
-//   - The literal run (possibly empty) is the prefix.
-//
-// NOTE-448: Only the upper bound direction is exploited (prefix > fileMax). The lower
-// bound direction requires computing nextPrefix(prefix) — omitted to stay conservative.
-func extractAnchoredLiteralPrefix(pattern string) string {
-	if !strings.HasPrefix(pattern, "^") {
-		return ""
-	}
-	rest := pattern[1:]
-	// Alternation anywhere in the pattern makes any extracted prefix unsafe:
-	// "^abc.*|def" also matches "def" which may be below the extracted "abc".
-	if strings.ContainsRune(rest, '|') {
-		return ""
-	}
-	for i := 0; i < len(rest); i++ {
-		switch rest[i] {
-		case '[', '(', '.', '*', '+', '?', '{', '\\', '$':
-			return rest[:i]
+// nextStringPrefix returns the smallest string strictly greater than every string that has
+// `s` as a prefix — i.e. the exclusive upper bound of the prefix's lexicographic range.
+// It increments the last byte; if that byte is 0xFF it is dropped and the next byte is
+// incremented (carry). Returns ok=false only when the whole string is 0xFF bytes (no finite
+// upper bound exists) or s is empty. Pure byte arithmetic; no UTF-8 awareness needed since
+// lexicographic byte order matches the string comparison used against the bounds.
+func nextStringPrefix(s string) (string, bool) {
+	b := []byte(s)
+	for i := len(b) - 1; i >= 0; i-- {
+		if b[i] != 0xFF {
+			b[i]++
+			return string(b[:i+1]), true
 		}
 	}
-	return rest
+	return "", false
 }
 
-// rejectRegexByStringBounds attempts to reject a regex-only predicate node by comparing
-// the pattern's anchored literal prefix against the file's string bounds.
-// Only rejects when prefix > fileMax. NOTE-448: Only applies to ColumnTypeRangeString.
+// extractAnchoredBounds extracts a conservative lexicographic interval [lower, upper) that
+// contains every string the anchored regex can match. Returns ok=false when no useful bound
+// can be derived.
+//
+// NOTE-455 (issue #374): generalizes the previous literal-prefix-only extraction in two ways:
+//  1. Both directions are exploited. A literal prefix P gives lower=P (inclusive) and
+//     upper=nextStringPrefix(P) (exclusive) — every match starts with P, so it lies in
+//     [P, nextPrefix(P)).
+//  2. A trailing simple character class `[X-Y]` (single ASCII range, no negation, no POSIX
+//     classes, no extra members) following the literal run is folded in: lower=P+X,
+//     upper=P+(Y+1). Scanning stops after the class because the upper bound cannot be
+//     tightened further without more parsing.
+//
+// Conservatism: when no class is present we still return the prefix interval; when the
+// prefix is empty AND there is no class, ok=false (no bound). hasUpper is false when the
+// upper bound overflowed past 0xFF (no finite ceiling) — callers then use only the lower
+// bound. Alternation ('|') anywhere makes any bound unsafe → ok=false.
+func extractAnchoredBounds(pattern string) (lower, upper string, hasUpper, ok bool) {
+	if !strings.HasPrefix(pattern, "^") {
+		return "", "", false, false
+	}
+	rest := pattern[1:]
+	if strings.ContainsRune(rest, '|') {
+		return "", "", false, false
+	}
+	i := 0
+	for i < len(rest) {
+		switch rest[i] {
+		case '[', '(', '.', '*', '+', '?', '{', '\\', '$':
+			goto stop
+		}
+		i++
+	}
+stop:
+	prefix := rest[:i]
+	// Try to fold a trailing simple character class `[X-Y]` immediately after the literal.
+	if i < len(rest) && rest[i] == '[' {
+		if lo, hi, classOK := parseSimpleCharClass(rest[i:]); classOK {
+			lower = prefix + string(lo)
+			if hi == 0xFF {
+				return lower, "", false, true
+			}
+			upper = prefix + string(hi+1)
+			return lower, upper, true, true
+		}
+	}
+	if prefix == "" {
+		return "", "", false, false
+	}
+	lower = prefix
+	up, hasUp := nextStringPrefix(prefix)
+	return lower, up, hasUp, true
+}
+
+// parseSimpleCharClass recognizes ONLY a single-range ASCII character class of the exact
+// form `[X-Y]` where X <= Y, both are printable ASCII bytes, and there is nothing else
+// inside the brackets. Returns ok=false for negation (`[^...]`), POSIX classes
+// (`[[:alpha:]]`), multi-range/multi-member classes (`[a-cx-z]`, `[abc]`), escapes, or any
+// non-ASCII byte. This deliberately narrow recognizer keeps extraction conservative: an
+// unrecognized class is simply treated as a wildcard stop (no bound from it).
+func parseSimpleCharClass(s string) (lo, hi byte, ok bool) {
+	// Minimal form is "[X-Y]" = 5 bytes.
+	if len(s) < 5 || s[0] != '[' {
+		return 0, 0, false
+	}
+	if s[1] == '^' {
+		return 0, 0, false
+	}
+	lo = s[1]
+	if s[2] != '-' {
+		return 0, 0, false
+	}
+	hi = s[3]
+	if s[4] != ']' {
+		return 0, 0, false
+	}
+	// Require printable ASCII and a well-ordered range. Excludes non-ASCII (>=0x80) so the
+	// hi+1 increment stays within a single byte and lexicographic byte order is unambiguous.
+	if lo < 0x20 || lo > 0x7E || hi < 0x20 || hi > 0x7E || lo > hi {
+		return 0, 0, false
+	}
+	return lo, hi, true
+}
+
+// rejectRegexByStringBounds attempts to reject a regex-only predicate node by comparing the
+// pattern's anchored [lower, upper) interval against the file's string bounds.
+//
+// NOTE-455 (issue #374): rejects when EITHER (a) lower > fileMax — every match sorts above
+// the file's largest value — OR (b) upper <= fileMin — every match sorts below the file's
+// smallest value (upper is exclusive, so a match equal to fileMin is impossible when
+// upper <= fileMin). When hasUpper is false (prefix had no finite ceiling) only the lower
+// bound test applies. NOTE-448: Only applies to ColumnTypeRangeString.
 func rejectRegexByStringBounds(bounds *modules_reader.RangeBoundaries, node *vm.RangeNode) bool {
 	if bounds.ColType != modules_shared.ColumnTypeRangeString {
 		return false
@@ -827,12 +904,19 @@ func rejectRegexByStringBounds(bounds *modules_reader.RangeBoundaries, node *vm.
 	if len(bounds.StringBounds) < 2 {
 		return false
 	}
-	prefix := extractAnchoredLiteralPrefix(node.Pattern)
-	if prefix == "" {
+	lower, upper, hasUpper, ok := extractAnchoredBounds(node.Pattern)
+	if !ok {
 		return false
 	}
+	fileMin := bounds.StringBounds[0]
 	fileMax := bounds.StringBounds[len(bounds.StringBounds)-1]
-	return prefix > fileMax
+	if lower != "" && lower > fileMax {
+		return true
+	}
+	if hasUpper && upper <= fileMin {
+		return true
+	}
+	return false
 }
 
 // colStatsRejectsInt64 applies signed int64 range comparison against ColStats numeric bounds.
