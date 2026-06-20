@@ -177,4 +177,43 @@ comparisons still produce no node (an absent or differing row may match → unsa
 through `translateNode` to a harmless bloom-only predicate in the planner. Canonical design: writer
 NOTES NOTE-446.
 
-**Back-ref:** `vm/traceql_compiler.go:extractNeqPresenceNode`, `vm/rangenode.go:RequirePresent`.
+**Superseded by NOTE-453** (`extractNeqPresenceNode` was renamed to `extractNeqNode`).
+
+**Back-ref:** `vm/traceql_compiler.go:extractNeqNode`, `vm/rangenode.go:RequirePresent`.
+
+---
+
+## NOTE-453 (compiler side): `!= V` presence + range-OR rewrite (issue #369)
+*Added: 2026-06-19*
+
+Generalizes NOTE-446. `extractNeqPresenceNode` → `extractNeqNode`. Two behavior changes:
+
+1. **All `attr != V` (any string/bytes V, not just `""`) now emit a `RequirePresent` node.**
+   A row whose attribute is absent never matches `!=` (SPEC-SCAN-2, SQL NULL semantics), so the
+   column must be present. This lets ColStats presence pruning (NOTE-446) skip blocks where the
+   column has `present_count == 0` for *any* `!= V`, not only `!= ""`.
+
+2. **Scoped `attr != V` additionally emits the range rewrite `OR(> V, < V)` (both exclusive).**
+   An OR `RangeNode` lets the file-level KLL string/bytes bounds pruner
+   (`executor/plan_blocks.go:rejectStringRange` / `rejectBytesRange`) drop blocks where ALL values
+   equal V — the only case where `!= V` matches nothing (both arms reject ⟺ `fileMin == fileMax == V`).
+   For `!= ""` the `< ""` arm always rejects (no string sorts before `""`), so the OR reduces to
+   "reject when `fileMax == ""`" (every value empty) — strictly stronger than presence alone.
+
+**Why the range-OR is SKIPPED for intrinsic-refs columns** (`isIntrinsicRefsColumn`,
+`resource.service.name`): the executor's pure-intrinsic refs fast path
+(`BlockRefsFromIntrinsicTOC`) is all-or-nothing and treats a string range leaf on a dict column
+as unevaluable (`scanIntrinsicLeafRefs` returns nil for non-integer-domain range leaves).
+Injecting an OR-of-ranges top-level node would collapse the entire pre-filter for `!= V` on such
+columns. Presence-only is safe there because `BlocksFromIntrinsicTOC` treats a `RequirePresent`
+leaf as match-all (`intrinsicTOCOverlaps` default arm → true). Built-in fields are still excluded
+entirely (always present → presence pruning never fires).
+
+**Unscoped `attr != V`** keeps presence-only behavior (OR of per-scope `RequirePresent` leaves);
+the range rewrite is not applied to the unscoped expansion.
+
+Hex-bytes attributes (`trace:id` etc., `neqRangeValue`) decode the literal to a 16-byte
+`TypeBytes` value so the bytes bounds pruner compares against the column's native encoding.
+
+**Back-ref:** `vm/traceql_compiler.go:extractNeqNode,neqRangeValue,isIntrinsicRefsColumn`,
+`executor/plan_blocks.go:rejectStringRange,rejectBytesRange`.

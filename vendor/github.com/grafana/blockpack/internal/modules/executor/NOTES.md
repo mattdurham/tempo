@@ -7122,3 +7122,36 @@ without a bool ColStats range get no pruning (no-op, safe — `HasNumRange=false
 **Back-ref:** `executor/plan_blocks.go:valueAsUint64,numericEqualityAsRange,numericValueLess`;
 `writer/writer_block.go:updateMinMaxFromAttr`; `writer/writer.go` range-index loops;
 `writer/writer_log.go:updateLogMinMaxFromAttr`.
+
+---
+
+## NOTE-453: String/bytes range rejection honors bound exclusivity (issue #369)
+*Added: 2026-06-19*
+
+Completes the `!= V` string/bytes pruning story whose compiler half lives in vm NOTE-453.
+
+**Problem (Gap 3):** `rejectStringRange` / `rejectBytesRange` (`plan_blocks.go`) ignored
+`node.MinInclusive` / `node.MaxInclusive`. The lower-bound check was `queryMin > fileMax`,
+which misses the exclusive case `queryMin == fileMax`. Mirrors the numeric bug fixed in
+NOTE-450, but for the string/bytes KLL-bounds path.
+
+**Fix:** both functions now branch on the inclusivity flag:
+- exclusive lower bound `> V` rejects when `queryMin >= fileMax` (only `fileMax` could match,
+  and it is excluded); inclusive `>= V` keeps the original strict `queryMin > fileMax`.
+- exclusive upper bound `< V` rejects when `queryMax <= fileMin`; inclusive `<= V` keeps
+  `queryMax < fileMin`.
+
+This is what lets the vm `!= V` rewrite `OR(> V, < V)` (both exclusive, NOTE-453 compiler
+side) prune a block via `rejectByBoundary`'s OR semantics: both arms reject ⟺
+`fileMin == fileMax == V` ⟺ every value equals V ⟺ `!= V` matches nothing. For `!= ""` the
+`< ""` arm always rejects (no string sorts before `""`), so the prune fires when
+`fileMax == ""` (all values empty).
+
+**Backward compatibility:** existing inclusive range predicates (`>=`, `<=`) and the
+numeric-equality `[V,V]` synthesis (NOTE-451) set their inclusivity flags explicitly, so
+behavior for those is unchanged. Pre-NOTE-453 callers that left the flag unset (false) now
+get the *exclusive* boundary semantics — correct for the `>`/`<` predicates that produce
+those nodes.
+
+**Back-ref:** `executor/plan_blocks.go:rejectStringRange,rejectBytesRange`;
+`vm/traceql_compiler.go:extractNeqNode`.

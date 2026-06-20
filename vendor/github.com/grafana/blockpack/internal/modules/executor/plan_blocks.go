@@ -710,27 +710,39 @@ func ptrValueToBytes(v *vm.Value) ([]byte, bool) {
 // fileMin = stringBounds[0], fileMax = stringBounds[last] (KLL sketch exact extrema).
 // NOTE-448: StringBounds[0] and StringBounds[last] are the exact file-wide min and max
 // strings fed to the KLL sketch during write.
+//
+// NOTE-453 (issue #369): honor node.MinInclusive / node.MaxInclusive. An exclusive lower
+// bound (queryMin, e.g. "> V") rejects the file when queryMin >= fileMax: the only file
+// value that could satisfy the predicate would be exactly fileMax, and that value is
+// excluded by the strict ">". Likewise an exclusive upper bound rejects when
+// queryMax <= fileMin. Inclusive bounds keep the original strict-only comparison. This is
+// what lets the `!= V` rewrite OR(> V, < V) prune blocks where fileMin == fileMax == V.
 func rejectStringRange(bounds []string, node *vm.RangeNode) bool {
 	if len(bounds) < 2 {
 		return false
 	}
 	fileMin := bounds[0]
 	fileMax := bounds[len(bounds)-1]
-	if node.Min != nil && node.Max == nil {
+	if node.Min != nil {
 		if queryMin, ok := ptrValueToString(node.Min); ok {
-			return queryMin > fileMax
+			if node.MinInclusive {
+				if queryMin > fileMax {
+					return true
+				}
+			} else if queryMin >= fileMax {
+				return true
+			}
 		}
 	}
-	if node.Max != nil && node.Min == nil {
+	if node.Max != nil {
 		if queryMax, ok := ptrValueToString(node.Max); ok {
-			return queryMax < fileMin
-		}
-	}
-	if node.Min != nil && node.Max != nil {
-		queryMin, okMin := ptrValueToString(node.Min)
-		queryMax, okMax := ptrValueToString(node.Max)
-		if okMin && okMax {
-			return queryMin > fileMax || queryMax < fileMin
+			if node.MaxInclusive {
+				if queryMax < fileMin {
+					return true
+				}
+			} else if queryMax <= fileMin {
+				return true
+			}
 		}
 	}
 	return false
@@ -740,27 +752,37 @@ func rejectStringRange(bounds []string, node *vm.RangeNode) bool {
 // Uses lexicographic byte order, matching the writer's bytes bounds encoding.
 // NOTE-448: In practice TraceQL does not emit byte-typed range predicates; added for
 // completeness and consistency with the string path.
+//
+// NOTE-453 (issue #369): honor node.MinInclusive / node.MaxInclusive — same exclusive-bound
+// semantics as rejectStringRange, using lexicographic byte comparison.
 func rejectBytesRange(bounds [][]byte, node *vm.RangeNode) bool {
 	if len(bounds) < 2 {
 		return false
 	}
 	fileMin := bounds[0]
 	fileMax := bounds[len(bounds)-1]
-	if node.Min != nil && node.Max == nil {
+	if node.Min != nil {
 		if queryMin, ok := ptrValueToBytes(node.Min); ok {
-			return bytes.Compare(queryMin, fileMax) > 0
+			cmp := bytes.Compare(queryMin, fileMax)
+			if node.MinInclusive {
+				if cmp > 0 {
+					return true
+				}
+			} else if cmp >= 0 {
+				return true
+			}
 		}
 	}
-	if node.Max != nil && node.Min == nil {
+	if node.Max != nil {
 		if queryMax, ok := ptrValueToBytes(node.Max); ok {
-			return bytes.Compare(queryMax, fileMin) < 0
-		}
-	}
-	if node.Min != nil && node.Max != nil {
-		queryMin, okMin := ptrValueToBytes(node.Min)
-		queryMax, okMax := ptrValueToBytes(node.Max)
-		if okMin && okMax {
-			return bytes.Compare(queryMin, fileMax) > 0 || bytes.Compare(queryMax, fileMin) < 0
+			cmp := bytes.Compare(queryMax, fileMin)
+			if node.MaxInclusive {
+				if cmp < 0 {
+					return true
+				}
+			} else if cmp <= 0 {
+				return true
+			}
 		}
 	}
 	return false

@@ -936,17 +936,18 @@ prunes the block. Conservative: AND rejects if any child rejects, OR rejects onl
 reject, and an unevaluable predicate keeps the block.
 
 **The `!= ""` fix:** `attr != ""` requires the attribute to be present (an absent row never
-matches), so OpNeq against an empty string literal now compiles to a `RequirePresent` RangeNode
-(`extractNeqPresenceNode`) — scoped to one leaf or, for unscoped attrs, an OR over
-resource/span/log presence. Other `!= "x"` comparisons still produce no node (an absent or
-differing row could match → unsafe to prune).
+matches), so OpNeq against an empty string literal compiles to a `RequirePresent` RangeNode
+(`extractNeqNode`, renamed from `extractNeqPresenceNode`) — scoped to one leaf or, for unscoped
+attrs, an OR over resource/span/log presence. NOTE-453 (issue #369) later generalized this: ALL
+scoped `!= V` (any V) now emit presence + an `OR(> V, < V)` range rewrite for KLL bounds pruning;
+see vm/executor NOTE-453.
 
 **Backward compatibility:** new optional section; old readers skip unknown ToC types. Files without
 the section get no ColStats pruning (`HasColStats()` returns false). No format-version bump.
 
 Back-ref: `shared/colstats.go` (codec), `writer/writer_block.go:finalize` (capture),
 `writer/v8_sections.go:writeV8FileSections` (write), `reader/parser.go:ColStats/HasColStats`
-(read), `executor/plan_blocks.go:pruneByColStats`, `vm/traceql_compiler.go:extractNeqPresenceNode`.
+(read), `executor/plan_blocks.go:pruneByColStats`, `vm/traceql_compiler.go:extractNeqNode`.
 
 **Extension (NOTE-448, issue #367):** `HasNumRange` was subsequently extended to `ColumnTypeFloat64`,
 `ColumnTypeRangeFloat64`, `ColumnTypeInt64`, and `ColumnTypeRangeInt64`. Float64 uses the

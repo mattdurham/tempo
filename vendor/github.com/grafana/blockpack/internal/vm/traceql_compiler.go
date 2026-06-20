@@ -11,6 +11,7 @@ import (
 
 	regexp "github.com/coregx/coregex"
 
+	"github.com/grafana/blockpack/internal/modules/blockio/shared"
 	"github.com/grafana/blockpack/internal/modules/vectormath"
 	"github.com/grafana/blockpack/internal/traceqlparser"
 )
@@ -795,6 +796,18 @@ func isBuiltInField(attrPath string) bool {
 	}
 }
 
+// isIntrinsicRefsColumn reports whether columnName is a non-built-in column served by the
+// executor's pure-intrinsic refs fast path (BlockRefsFromIntrinsicTOC). That path is
+// all-or-nothing and cannot evaluate a string range leaf, so the `!= V` range-OR rewrite
+// (NOTE-453) must NOT be injected for these columns or the whole pre-filter collapses.
+//
+// resource.service.name (shared.SvcNameColumnName) is the only intrinsic column that is not
+// already classified as a built-in field by isBuiltInField; the intrinsic numeric columns
+// (span:duration, span:start, etc.) are all built-ins and therefore excluded earlier.
+func isIntrinsicRefsColumn(columnName string) bool {
+	return columnName == shared.SvcNameColumnName
+}
+
 // extractTraceQLPredicates walks the TraceQL expression tree and returns QueryPredicates
 // for block-level pruning. Unscoped attributes are expanded to OR composites covering
 // resource.*, span.*, and log.* children so range-index lookup works on real scoped columns.
@@ -884,11 +897,12 @@ func extractTraceQLNodes(expr traceqlparser.Expr) (nodes []RangeNode, cols []str
 		return extractEqNode(e)
 
 	case traceqlparser.OpNeq:
-		// `attr != ""` requires the attribute to be present (a row with the attribute
-		// absent does not match). Emit a presence-requiring node so ColStats pruning
-		// (NOTE-446) can skip blocks where the column has present_count == 0. Other
-		// `!=` comparisons cannot prune (an absent or differing row may match).
-		if nodes, cols := extractNeqPresenceNode(e); nodes != nil {
+		// `attr != V` requires the attribute to be present: a row where the attribute is
+		// absent never matches `!=` (SPEC-SCAN-2, SQL NULL semantics). Emit a
+		// presence-requiring node plus — for string/bytes columns — an OR of exclusive
+		// range bounds so KLL string/bytes bounds pruning can skip blocks where every
+		// value equals V. See extractNeqNode / NOTE-453.
+		if nodes, cols := extractNeqNode(e); nodes != nil {
 			return nodes, cols
 		}
 		return nil, negationCols(e)
@@ -977,10 +991,29 @@ func extractEqNode(expr *traceqlparser.BinaryExpr) (nodes []RangeNode, cols []st
 	return []RangeNode{{Column: columnName, Values: []Value{vmValue}}}, cols
 }
 
-// extractNeqPresenceNode builds a presence-requiring RangeNode for `attr != ""`.
-// Returns nil nodes for any other `!=` comparison (RHS not an empty string literal, or a
-// built-in field). The presence node prunes blocks where the column is wholly absent.
-func extractNeqPresenceNode(expr *traceqlparser.BinaryExpr) (nodes []RangeNode, cols []string) {
+// extractNeqNode builds block-pruning nodes for a string/bytes `attr != V` predicate.
+//
+// NOTE-453 (issue #369): a row whose attribute is absent never matches `!=` (SPEC-SCAN-2,
+// SQL NULL semantics), so every `attr != V` requires the column to be present. We always
+// emit a RequirePresent node so ColStats presence pruning (NOTE-446) can skip blocks where
+// the column has present_count == 0.
+//
+// For non-empty `attr != V` we additionally rewrite to the equivalent range form
+// `attr > V OR attr < V` (both exclusive). An OR RangeNode lets the file-level KLL string
+// bounds pruner (rejectStringRange / rejectBytesRange) drop blocks where ALL values equal V
+// — the only case where `!= V` matches nothing. For `attr != ""` the `< ""` arm always
+// rejects (no string sorts before ""), so the OR reduces to "reject when fileMax == ”"
+// (every value is empty), strictly stronger than presence pruning alone.
+//
+// The range-OR rewrite is intentionally SKIPPED for intrinsic columns served by the
+// executor's pure-intrinsic refs fast path: that path is all-or-nothing and treats a
+// string range leaf as unevaluable, so injecting one would collapse the whole pre-filter
+// for `attr != V` on such columns (e.g. resource.service.name). Presence pruning is still
+// emitted for them.
+//
+// Returns nil nodes for non-string/bytes literals or built-in fields (built-ins are always
+// present, so presence pruning would never fire).
+func extractNeqNode(expr *traceqlparser.BinaryExpr) (nodes []RangeNode, cols []string) {
 	field, lit, columnName, ok := parseBinaryExprArgs(expr)
 	if !ok {
 		return nil, nil
@@ -989,15 +1022,20 @@ func extractNeqPresenceNode(expr *traceqlparser.BinaryExpr) (nodes []RangeNode, 
 		return nil, nil
 	}
 	s, sok := lit.Value.(string)
-	if !sok || s != "" {
+	if !sok {
 		return nil, nil
 	}
 	if isBuiltInField(columnName) {
 		// Built-in fields are always present; presence pruning would never fire.
 		return nil, nil
 	}
+
 	if field.Scope == "" {
-		// Unscoped: a block matches if ANY scope column is present → OR composite.
+		// Unscoped: a block matches if ANY scope column is present → OR composite of
+		// presence requirements. The range-OR rewrite is not applied to the unscoped
+		// expansion: a block matching on any one scope's range is enough, and composing
+		// per-scope (presence AND range-OR) across three scopes is conservative-unfriendly
+		// here, so we keep the existing presence-only behavior for unscoped.
 		res, span, log := unscopedCols(field.Name)
 		cols = []string{res, span, log}
 		return []RangeNode{{
@@ -1009,7 +1047,36 @@ func extractNeqPresenceNode(expr *traceqlparser.BinaryExpr) (nodes []RangeNode, 
 			},
 		}}, cols
 	}
-	return []RangeNode{{Column: columnName, RequirePresent: true}}, []string{columnName}
+
+	nodes = []RangeNode{{Column: columnName, RequirePresent: true}}
+	// Add the `> V OR < V` range rewrite for scoped string/bytes columns that are NOT
+	// served by the intrinsic refs fast path (see doc comment).
+	if !isIntrinsicRefsColumn(columnName) {
+		neqVal := neqRangeValue(columnName, s)
+		minV := neqVal
+		maxV := neqVal
+		nodes = append(nodes, RangeNode{
+			IsOR: true,
+			Children: []RangeNode{
+				{Column: columnName, Min: &minV, MinInclusive: false}, // attr > V
+				{Column: columnName, Max: &maxV, MaxInclusive: false}, // attr < V
+			},
+		})
+	}
+	return nodes, []string{columnName}
+}
+
+// neqRangeValue builds the comparison Value for a `!= V` range rewrite. Hex-bytes
+// attributes (trace:id / span:id / span:parent_id) are decoded to a 16-byte TypeBytes
+// value so the bytes bounds pruner compares against the column's native encoding; all
+// other columns compare as TypeString.
+func neqRangeValue(columnName, s string) Value {
+	if isHexBytesAttribute(columnName) {
+		if decoded, err := hex.DecodeString(s); err == nil && len(decoded) == 16 {
+			return Value{Type: TypeBytes, Data: decoded}
+		}
+	}
+	return Value{Type: TypeString, Data: s}
 }
 
 // extractRangeNode builds a RangeNode for a range predicate (>, >=, <, <=).
