@@ -217,3 +217,32 @@ Hex-bytes attributes (`trace:id` etc., `neqRangeValue`) decode the literal to a 
 
 **Back-ref:** `vm/traceql_compiler.go:extractNeqNode,neqRangeValue,isIntrinsicRefsColumn`,
 `executor/plan_blocks.go:rejectStringRange,rejectBytesRange`.
+
+## NOTE-454 (compiler side): numeric `!= V` presence + range-OR rewrite (issue #372)
+*Added: 2026-06-19*
+
+Extends NOTE-453 (strings/bytes) to numeric attribute columns (Int / Float / Duration).
+`extractNeqNode` previously early-returned `nil` for any non-string literal, so numeric
+`attr != V` emitted no pruning node at all. It now routes numeric literals to
+`extractNeqNumericNode`, which mirrors the string path:
+
+1. **Always emit a `RequirePresent` leaf** — a row whose attribute is absent never matches
+   `!=` (SPEC-SCAN-2, SQL NULL semantics), so ColStats presence pruning (NOTE-446) can skip
+   blocks with `present_count == 0`.
+2. **Scoped numeric `attr != V` additionally emits `OR(> V, < V)` (both exclusive).** The
+   numeric range-rejection helpers (`colStatsRejectsInt64/Float64` and the uint64/duration
+   path) already honor exclusive bounds (NOTE-450), so the OR rejects a block ONLY when both
+   arms reject ⟺ `blockMin == blockMax == V` (every value equals V) — the single case where
+   `!= V` matches nothing.
+
+**No intrinsic-refs skip** (unlike strings): the pure-intrinsic refs fast path serves only
+dict-encoded string columns (`resource.service.name`). Numeric intrinsics (`span:duration`,
+`span:start`) are built-ins excluded by the caller's `isBuiltInField` guard, so any numeric
+column reaching `extractNeqNumericNode` is a user attribute flowing through the standard
+range/ColStats pruning path.
+
+**Unscoped numeric `attr != V`** keeps presence-only (OR of per-scope `RequirePresent`
+leaves), mirroring the string unscoped path.
+
+**Back-ref:** `vm/traceql_compiler.go:extractNeqNode,extractNeqNumericNode`,
+`executor/plan_blocks.go:colStatsRejectsInt64,colStatsRejectsFloat64,numNodeBoundExceedsMax`.

@@ -1018,15 +1018,18 @@ func extractNeqNode(expr *traceqlparser.BinaryExpr) (nodes []RangeNode, cols []s
 	if !ok {
 		return nil, nil
 	}
-	if lit.Type != traceqlparser.LitString {
+	if isBuiltInField(columnName) {
+		// Built-in fields are always present; presence pruning would never fire.
 		return nil, nil
+	}
+	// NOTE-454 (issue #372): numeric `attr != V` (Int/Float/Duration) rewrites to the
+	// range-OR `attr < V OR attr > V` (both exclusive), mirroring the string path. This
+	// prunes blocks where every value equals V — the only case where `!= V` matches nothing.
+	if lit.Type != traceqlparser.LitString {
+		return extractNeqNumericNode(field, lit, columnName)
 	}
 	s, sok := lit.Value.(string)
 	if !sok {
-		return nil, nil
-	}
-	if isBuiltInField(columnName) {
-		// Built-in fields are always present; presence pruning would never fire.
 		return nil, nil
 	}
 
@@ -1062,6 +1065,69 @@ func extractNeqNode(expr *traceqlparser.BinaryExpr) (nodes []RangeNode, cols []s
 				{Column: columnName, Max: &maxV, MaxInclusive: false}, // attr < V
 			},
 		})
+	}
+	return nodes, []string{columnName}
+}
+
+// extractNeqNumericNode builds block-pruning nodes for a numeric `attr != V` predicate
+// (Int / Float / Duration). It mirrors the string path (NOTE-453): a row whose attribute
+// is absent never matches `!=` (SPEC-SCAN-2, SQL NULL semantics), so we always emit a
+// RequirePresent node, and additionally rewrite to the range-OR `attr < V OR attr > V`
+// (both exclusive).
+//
+// The OR rejects a block ONLY when both arms reject ⟺ blockMin == blockMax == V (every
+// value equals V) — the single case where `!= V` matches nothing. The numeric range
+// rejection helpers (colStatsRejectsInt64/Float64 and the uint64/duration path) already
+// honor exclusive bounds (NOTE-450), so an exclusive `> V`/`< V` pair on an all-equal-V
+// block rejects correctly.
+//
+// Unlike the string path there is no intrinsic-refs skip: the pure-intrinsic refs fast
+// path serves only dict-encoded string columns (resource.service.name); numeric intrinsics
+// (span:duration, span:start) are built-ins excluded by the caller's isBuiltInField guard,
+// so any numeric column reaching here is a user attribute that flows through the standard
+// range/ColStats pruning path.
+//
+// Returns nil for non-numeric literals (bool/status/kind equality `!=` is handled by the
+// caller's string branch or yields no nodes).
+func extractNeqNumericNode(
+	field *traceqlparser.FieldExpr, lit *traceqlparser.LiteralExpr, columnName string,
+) (nodes []RangeNode, cols []string) {
+	switch lit.Type {
+	case traceqlparser.LitInt, traceqlparser.LitFloat, traceqlparser.LitDuration:
+	default:
+		return nil, nil
+	}
+	vmValue, ok := convertTraceQLLiteralToValue(lit)
+	if !ok {
+		return nil, nil
+	}
+
+	if field.Scope == "" {
+		// Unscoped: presence-only across all three scopes, mirroring the string path —
+		// composing per-scope (presence AND range-OR) across three scopes is
+		// conservative-unfriendly, so keep presence-only for unscoped.
+		res, span, log := unscopedCols(field.Name)
+		return []RangeNode{{
+			IsOR: true,
+			Children: []RangeNode{
+				{Column: res, RequirePresent: true},
+				{Column: span, RequirePresent: true},
+				{Column: log, RequirePresent: true},
+			},
+		}}, []string{res, span, log}
+	}
+
+	minV := vmValue
+	maxV := vmValue
+	nodes = []RangeNode{
+		{Column: columnName, RequirePresent: true},
+		{
+			IsOR: true,
+			Children: []RangeNode{
+				{Column: columnName, Min: &minV, MinInclusive: false}, // attr > V
+				{Column: columnName, Max: &maxV, MaxInclusive: false}, // attr < V
+			},
+		},
 	}
 	return nodes, []string{columnName}
 }
