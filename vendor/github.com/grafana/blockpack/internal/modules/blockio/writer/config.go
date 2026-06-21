@@ -38,6 +38,15 @@ type TextEmbedder = shared.TextEmbedder
 type Config struct {
 	OutputStream io.Writer
 
+	// ScratchDir is a local directory for the writer's on-disk scratch files, currently the
+	// per-column intrinsic spill files (NOTE-461, issue #380). When empty, a unique temp
+	// directory under os.TempDir() is created and removed automatically at Flush(). When set,
+	// the caller owns the directory; the writer creates and removes only its own files inside
+	// it. Compaction passes its StagingDir here so spill files land on the same volume as the
+	// staged output block, keeping all of compaction's disk I/O on the configured scratch
+	// volume rather than the default /tmp.
+	ScratchDir string
+
 	// Embedder enables automatic embedding of spans during block building.
 	// When non-nil, the writer assembles text from each span's fields (using
 	// EmbeddingFields or all fields by default), calls Embedder.Embed(), and

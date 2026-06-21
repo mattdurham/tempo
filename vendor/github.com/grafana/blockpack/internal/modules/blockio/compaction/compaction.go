@@ -6,7 +6,6 @@
 package compaction
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -338,45 +337,66 @@ func (s *compactionState) addSpanFromBlock(
 }
 
 // ensureWriter initializes the current writer if it is nil.
+// The writer streams directly to a staging file on disk so that each internal
+// block flush (triggered by the writer's MaxBufferedSpans threshold) writes to
+// disk rather than to an in-memory buffer. This bounds peak output-side memory
+// to ~one block's worth of pending spans regardless of total input size.
 func (s *compactionState) ensureWriter() error {
 	if s.current != nil {
 		return nil
 	}
 
-	buf := &bytes.Buffer{}
+	filename := fmt.Sprintf("compacted-%05d.blockpack", s.outputSeq)
+	s.outputSeq++
+	stagedPath := filepath.Join(s.stagingDir, filename)
+
+	f, err := os.OpenFile(stagedPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600) //nolint:gosec
+	if err != nil {
+		return fmt.Errorf("create staging file %s: %w", stagedPath, err)
+	}
+
 	w, err := modules_blockio.NewWriterWithConfig(modules_blockio.WriterConfig{
-		OutputStream:     buf,
+		OutputStream:     f,
 		MaxBlockSpans:    s.maxSpans,
 		DedicatedColumns: s.cfg.DedicatedColumns,
+		// NOTE-461 (issue #380): keep the intrinsic spill files on the same staging volume as
+		// the output block so all of compaction's disk I/O stays on the configured scratch
+		// volume rather than the default /tmp.
+		ScratchDir: s.stagingDir,
 	})
 	if err != nil {
+		_ = f.Close()
+		_ = os.Remove(stagedPath)
 		return fmt.Errorf("new writer: %w", err)
 	}
 
-	s.current = &writerState{w: w, buf: buf}
+	s.current = &writerState{w: w, f: f, stagedPath: stagedPath}
 	return nil
 }
 
-// flushCurrentWriter flushes the current writer to the staging directory.
-// Does nothing if no writer is active or no spans were added.
+// flushCurrentWriter finalizes the current writer, closing the staging file.
+// The writer has been streaming blocks directly to disk throughout processing,
+// so Flush() only writes any remaining pending spans. Does nothing if no writer
+// is active or no spans were added.
 func (s *compactionState) flushCurrentWriter() error {
 	if s.current == nil || s.current.spanCount == 0 {
+		if s.current != nil {
+			_ = s.current.f.Close()
+			_ = os.Remove(s.current.stagedPath)
+		}
 		s.current = nil
 		return nil
 	}
 
 	if _, err := s.current.w.Flush(); err != nil {
+		_ = s.current.f.Close()
 		return fmt.Errorf("flush writer: %w", err)
 	}
-
-	data := s.current.buf.Bytes()
-	filename := fmt.Sprintf("compacted-%05d.blockpack", s.outputSeq)
-	s.outputSeq++
-	stagedPath := filepath.Join(s.stagingDir, filename)
-
-	if err := os.WriteFile(stagedPath, data, 0o600); err != nil { //nolint:gosec
-		return fmt.Errorf("write staged file %s: %w", stagedPath, err)
+	if err := s.current.f.Close(); err != nil {
+		return fmt.Errorf("close staging file: %w", err)
 	}
+
+	stagedPath := s.current.stagedPath
 
 	s.stagedFiles = append(s.stagedFiles, stagedPath)
 	s.current = nil

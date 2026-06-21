@@ -126,11 +126,12 @@ one block, and returns both to their respective pools. After all goroutines comp
 pass writes payloads and updates `blockMetas`, `rangeIdx`, `sketchIdx`, and `traceIndex` in
 block-ID order.
 
-For trace blocks, each goroutine receives its own `*intrinsicAccumulator` (`localAccum`).
-After the parallel phase, `localAccum` values are merged into `w.intrinsicAccum` via the
-new `merge()` method in block-ID order. No sorting is performed at merge time; sorting
-happens later in `encodeColumn`. Log blocks have no `intrinsicAccum`, so the merge step
-is absent from `flushLogBlocks`.
+For trace blocks, each goroutine receives its own in-memory `*intrinsicAccumulator`
+(`localAccum`). After the parallel phase, `localAccum` rows are spilled into the file-level
+on-disk accumulator `w.intrinsicAccum` (a `*tempFileAccum`, NOTE-461) via `spillMerge` in
+block-ID order. No sorting is performed at spill time; sorting happens later in `encodeColumn`
+when each column is rebuilt from its spill file. (The original in-memory `merge()` method was
+removed when the file-level accumulator moved on-disk — see NOTE-461.)
 
 **Rationale:** Block building (OTLP→column decode, dict/delta/XOR encoding, zstd compress)
 is CPU-bound and has no shared mutable state within a block. Blockpack block writing was
@@ -157,7 +158,69 @@ row-groups concurrently. This change applies the same approach.
 
 **Back-ref:** `internal/modules/blockio/writer/writer.go:flushBlocks`,
 `internal/modules/blockio/writer/writer.go:flushLogBlocks`,
-`internal/modules/blockio/writer/intrinsic_accum.go:merge`
+`internal/modules/blockio/writer/intrinsic_tempfile.go:spillMerge`
+
+---
+
+## NOTE-461: File-level intrinsic accumulator spills to per-column temp files (issue #380) (2026-06-21)
+*Added: 2026-06-21*
+
+**Problem:** The file-level intrinsic section (trace:id, span:id, span:kind, span:name,
+resource.service.name, span:start/duration, …) was built entirely in memory by the
+`intrinsicAccumulator` on the `Writer`. It accumulated `map[column]→[]entry` for EVERY span
+in the output file and was only serialised at `Flush()`. A pyroscope profile during compaction
+showed `(*intrinsicAccumulator).merge` as the dominant live allocation (tens of GB across
+workers): for 8 L1 blocks × ~2M spans ≈ 16M spans across ~15 columns this is ~10–30 GiB. This
+caused OOMKills and forced the `max_input_blocks: 2` workaround even though output block bytes
+already stream to disk (NOTE on streaming compaction output).
+
+**Decision:** Replace the file-level accumulator with `tempFileAccum`
+(`intrinsic_tempfile.go`). Per-block accumulation still uses the in-memory
+`intrinsicAccumulator` (`localAccum`) — bounded by one block and built in the parallel phase.
+The serial merge pass now calls `spillMerge`, which appends each block's rows to a **per-column
+on-disk spill file** instead of growing in-memory maps. At `Flush()`, `encodeColumn` rebuilds
+ONE column's in-memory `flatAccum`/`dictAccum` from its spill file, encodes it via the existing
+wire-format path (`encodeXORBytesIntrinsic` / `encodeDeltaUint64Intrinsic` /
+`encodePagedDictColumn`, which sort internally), then releases it before the next column. Peak
+RSS for the intrinsic section becomes O(largest single column's rows) instead of O(all columns ×
+all spans) — e.g. ~one trace:id column (~320 MiB at 16M spans) vs ~30 GiB.
+
+**Wire format unchanged:** spill files are an internal scratch encoding; the on-disk
+intrinsic section bytes are byte-for-byte identical to the old in-memory path (verified by
+equivalence tests comparing `tempFileAccum.encodeColumn` to `intrinsicAccumulator.encodeColumn`).
+
+**Spill ordering:** rows are appended in write order — block-by-block in ascending blockID,
+row-by-row within each block — so each column file is naturally ordered by `(blockIdx ASC,
+rowIdx ASC)`. Correctness does not depend on this (the encode path re-sorts per wire-format
+requirement: value order for flat columns, value-grouped for dict columns); the spill order
+just documents the sequential-block-access property from issue #380. Dict entries are expanded
+back to one `(value, ref)` record per ref on spill and re-deduplicated at encode time, keeping
+the spill append-only and streamable.
+
+**Lifetime:** `tempFileAccum` is created lazily on the first `flushBlocks()` that has a
+`localAccum` (`ensureIntrinsicAccum`), so a Writer that produces an empty file never touches
+the filesystem. It is closed (spill files removed; owned temp dir removed) by a `defer` at the
+top of `Flush()` covering all exit paths including errors, so a failed compaction does not leak
+scratch files. When `Config.ScratchDir` is set (compaction passes its `StagingDir`), spill
+files land on the same volume as the staged output block; otherwise a unique `os.MkdirTemp`
+dir under `os.TempDir()` is created and owned by the accumulator.
+
+**Trade-off:** intrinsic data is now written to disk twice (spill, then read back to encode)
+and re-snappy-compressed once, adding sequential disk I/O during compaction. This is accepted:
+the streaming spill is sequential and on the local scratch volume, and OOMKills aborting the
+whole job are far costlier than the extra I/O. Allows `max_input_blocks` 8+ without OOMKills.
+
+**Consequence:** the in-memory `intrinsicAccumulator.merge` method was removed (fully
+superseded by `spillMerge`); `merge`'s unit test was deleted and replaced by `tempFileAccum`
+tests including per-type equivalence and spill-merge equivalence. The unused
+`intrinsicAccumulator.columnNames` (the file-level encode path no longer calls it) was also
+removed.
+
+**Back-ref:** `internal/modules/blockio/writer/intrinsic_tempfile.go`,
+`internal/modules/blockio/writer/writer.go:ensureIntrinsicAccum`,
+`internal/modules/blockio/writer/writer.go:flushBlocks`,
+`internal/modules/blockio/writer/config.go:ScratchDir`,
+`internal/modules/blockio/compaction/compaction.go:ensureWriter`
 
 ---
 

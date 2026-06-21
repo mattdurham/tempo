@@ -36,70 +36,6 @@ func newIntrinsicAccumulator() *intrinsicAccumulator {
 	}
 }
 
-func
-
-// merge appends all rows from other into the receiver.
-// Column types are taken from other when a column is new to the receiver.
-// No sorting is performed here; sorting happens at encodeColumn time.
-// Safe to call with an empty other accumulator (no-op).
-(a *intrinsicAccumulator) merge(other *intrinsicAccumulator) {
-	for name, src := range other.flatCols {
-		dst, ok := a.flatCols[name]
-		if !ok {
-			dst = &flatAccum{colType: src.colType}
-			a.flatCols[name] = dst
-		}
-		dst.uint64Values = append(dst.uint64Values, src.uint64Values...)
-		dst.bytesValues = append(dst.bytesValues, src.bytesValues...)
-		dst.refs = append(dst.refs, src.refs...)
-	}
-	for name, src := range other.dictCols {
-		dst, ok := a.dictCols[name]
-		if !ok {
-			dst = &dictAccum{
-				index:    make(map[string]int, len(src.index)),
-				numIndex: make(map[[8]byte]int),
-				entries:  make([]dictEntry, 0, len(src.entries)),
-				colType:  src.colType,
-			}
-			a.dictCols[name] = dst
-		}
-		isInt64 := src.colType == shared.ColumnTypeInt64 || src.colType == shared.ColumnTypeRangeInt64
-		for _, srcEntry := range src.entries {
-			tmp := [8]byte{}
-			if isInt64 {
-				binary.LittleEndian.PutUint64(
-					tmp[:],
-					uint64(srcEntry.int64Val), //nolint:gosec // reinterpreting int64 bits as uint64 for binary encoding
-				)
-				idx, exists := dst.numIndex[tmp]
-				if !exists {
-					idx = len(dst.entries)
-					dst.numIndex[tmp] = idx
-					dst.entries = append(dst.entries, dictEntry{strVal: srcEntry.strVal, int64Val: srcEntry.int64Val})
-				}
-				dst.entries[idx].refs = append(dst.entries[idx].refs, srcEntry.refs...)
-			} else {
-				key := srcEntry.strVal
-				idx, exists := dst.index[key]
-				if !exists {
-					idx = len(dst.entries)
-					dst.index[key] = idx
-					dst.entries = append(dst.entries, dictEntry{strVal: srcEntry.strVal, int64Val: srcEntry.int64Val})
-				}
-				dst.entries[idx].refs = append(dst.entries[idx].refs, srcEntry.refs...)
-			}
-		}
-	}
-}
-
-// New column: create a fresh dictAccum with empty entries and index.
-// Entries are populated by the per-entry merge loop below, not copied wholesale.
-
-// Merge entries: for each entry in src, find or create a matching entry in dst.
-
-//nolint:gosec
-
 // overCap reports whether any single column exceeds MaxIntrinsicRows.
 func (a *intrinsicAccumulator) overCap() bool {
 	for _, c := range a.flatCols {
@@ -216,19 +152,6 @@ func
 }
 
 //nolint:gosec
-
-// columnNames returns all accumulated column names (flat + dict), sorted.
-func (a *intrinsicAccumulator) columnNames() []string {
-	names := make([]string, 0, len(a.flatCols)+len(a.dictCols))
-	for n := range a.flatCols {
-		names = append(names, n)
-	}
-	for n := range a.dictCols {
-		names = append(names, n)
-	}
-	slices.Sort(names)
-	return names
-}
 
 // encodeColumn serializes one column's accumulated data into a compressed blob.
 //

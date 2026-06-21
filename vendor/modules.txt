@@ -782,7 +782,7 @@ github.com/googleapis/gax-go/v2/iterator
 # github.com/gorilla/mux v1.8.1
 ## explicit; go 1.20
 github.com/gorilla/mux
-# github.com/grafana/blockpack v0.0.0-20260621041509-8e9f77d2aa44
+# github.com/grafana/blockpack v0.0.0-20260621132436-92c7cbe917b8
 ## explicit; go 1.26.0
 github.com/grafana/blockpack
 github.com/grafana/blockpack/embedder

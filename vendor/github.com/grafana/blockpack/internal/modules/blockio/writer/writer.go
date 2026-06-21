@@ -46,9 +46,12 @@ type Writer struct {
 	colStatsByBlock []shared.BlockColStats
 
 	// intrinsicAccum accumulates file-level columnar data for intrinsic columns.
-	// Fed row-by-row during block building via blockBuilder.intrinsicAccum.
-	// Consumed at Flush() by writeV8Sections.
-	intrinsicAccum *intrinsicAccumulator
+	// NOTE-461 (issue #380): backed by per-column on-disk spill files (tempFileAccum) so peak
+	// RSS during compaction is bounded by the largest single column, not all columns × all
+	// spans. Per-block accumulation still uses an in-memory intrinsicAccumulator (localAccum);
+	// the serial merge pass spills each block's rows here via spillMerge. Created lazily on
+	// the first flushBlocks() (see ensureIntrinsicAccum) and released at Flush().
+	intrinsicAccum *tempFileAccum
 
 	// fileBloomSvcNames accumulates unique service names for file-level bloom construction.
 	// Fed from flushBlocks; consumed at Flush by writeV8Sections.
@@ -187,7 +190,6 @@ func NewWriterWithConfig(cfg Config) (*Writer, error) {
 		traceIndex:        make(map[[16]byte][]uint16),
 		uuidColumns:       make(map[string]bool),
 		rangeIdx:          make(rangeIndex),
-		intrinsicAccum:    newIntrinsicAccumulator(),
 		fileBloomSvcNames: make(map[string]struct{}),
 		vectorAccum:       va,
 		dedicatedCols:     dedicatedCols,
@@ -379,6 +381,15 @@ func (w *Writer) Flush() (int64, error) {
 		panic("writer: concurrent use detected")
 	}
 	defer w.inUse.Store(false)
+	// Always release the on-disk intrinsic spill files / temp dir on any Flush exit path,
+	// including errors, so a failed compaction does not leak scratch files (NOTE-461). close
+	// is idempotent; the success path's explicit reset below nils the reference first.
+	defer func() {
+		if w.intrinsicAccum != nil {
+			_ = w.intrinsicAccum.close()
+			w.intrinsicAccum = nil
+		}
+	}()
 
 	if len(w.pending) == 0 && len(w.blockMetas) == 0 {
 		// Nothing has ever been written — produce a valid empty file.
@@ -422,8 +433,8 @@ func (w *Writer) Flush() (int64, error) {
 	w.tempoProtoRoots = w.tempoProtoRoots[:0]
 	w.signalType = 0
 
-	// Reset intrinsic accumulator for reuse.
-	w.intrinsicAccum = newIntrinsicAccumulator()
+	// Intrinsic accumulator is closed and nil'd by the deferred cleanup at the top of Flush()
+	// (NOTE-461); the next write lazily re-creates it via ensureIntrinsicAccum.
 
 	// Reset file-level bloom service names.
 	for k := range w.fileBloomSvcNames {
@@ -444,6 +455,22 @@ func (w *Writer) writeEmptyFile() (int64, error) {
 		return w.out.total, err
 	}
 	return w.out.total, nil
+}
+
+// ensureIntrinsicAccum lazily creates the file-level on-disk intrinsic accumulator
+// (NOTE-461). Created on first use so a Writer that is constructed but never written
+// (or only used for an empty file) does not touch the filesystem, and so the spill
+// directory is created under w.cfg.ScratchDir when configured by the caller (compaction).
+func (w *Writer) ensureIntrinsicAccum() error {
+	if w.intrinsicAccum != nil {
+		return nil
+	}
+	a, err := newTempFileAccum(w.cfg.ScratchDir)
+	if err != nil {
+		return err
+	}
+	w.intrinsicAccum = a
+	return nil
 }
 
 // flushBlocks sorts w.pending, builds all blocks concurrently, writes payloads and
@@ -609,9 +636,16 @@ func (w *Writer) flushBlocks() error {
 
 		w.blockMetas = append(w.blockMetas, meta)
 
-		// Merge per-block intrinsic accumulator into the file-level one, then release.
+		// Spill per-block intrinsic accumulator into the file-level on-disk accumulator,
+		// then release. NOTE-461: spillMerge streams the block's rows to disk instead of
+		// growing in-memory maps, bounding peak RSS to one block's worth of intrinsic data.
 		if built.localAccum != nil {
-			w.intrinsicAccum.merge(built.localAccum)
+			if err := w.ensureIntrinsicAccum(); err != nil {
+				return fmt.Errorf("writer: intrinsic accumulator: %w", err)
+			}
+			if err := w.intrinsicAccum.spillMerge(built.localAccum); err != nil {
+				return fmt.Errorf("writer: block %d intrinsic spill: %w", s.blockID, err)
+			}
 			results[i].localAccum = nil
 		}
 
