@@ -110,6 +110,7 @@ func ExecuteTraceMetrics(
 		}
 	}
 	plan := planBlocks(r, program, tr, queryplanner.PlanOptions{})
+	emitPlannerSpan(ctx, plan) // NOTE-456
 
 	result := &TraceMetricsResult{}
 	if len(plan.SelectedBlocks) == 0 {

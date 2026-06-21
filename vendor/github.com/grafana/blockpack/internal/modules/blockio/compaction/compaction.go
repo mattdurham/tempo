@@ -275,13 +275,6 @@ func (s *compactionState) addSpanFromBlock(
 
 	s.current.spanCount++
 
-	if s.cfg.MaxOutputFileSize > 0 &&
-		s.current.w.CurrentSize() >= s.cfg.MaxOutputFileSize {
-		if err := s.flushCurrentWriter(); err != nil {
-			return fmt.Errorf("flush on size limit: %w", err)
-		}
-	}
-
 	return nil
 }
 

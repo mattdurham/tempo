@@ -13,8 +13,10 @@ import (
 	commonv1 "go.opentelemetry.io/proto/otlp/common/v1"
 )
 
-// sortPending sorts the pending span buffer by (service.name ASC, MinHashSig ASC, TraceID ASC).
-// This is the canonical sort order per NOTES §2.
+// sortPending sorts the pending span buffer by (service.name ASC, span.name ASC, MinHashSig ASC, TraceID ASC).
+// NOTE-457: span.name as secondary sort key guarantees same-name spans cluster into the same blocks,
+// enabling the exact-value range index fast path (min==max per block → zero false positives for
+// {span.name = "X"} queries). MinHash as tertiary preserves attribute-set similarity within a name.
 //
 // Sorts a []int index slice to avoid copying pendingSpan values during the O(n log n) comparison
 // phase, then applies the final permutation in one O(n) copy pass.
@@ -33,6 +35,12 @@ func sortPending(pending []pendingSpan) {
 		a, b := &pending[ai], &pending[bi]
 		if a.svcName != b.svcName {
 			if a.svcName < b.svcName {
+				return -1
+			}
+			return 1
+		}
+		if a.spanName != b.spanName {
+			if a.spanName < b.spanName {
 				return -1
 			}
 			return 1

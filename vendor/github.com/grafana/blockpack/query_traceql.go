@@ -48,7 +48,13 @@ func streamFilterQuery(
 }
 
 // streamFilterProgram executes a compiled filter program against a modules-format reader.
-func streamFilterProgram(ctx context.Context, r *Reader, program *vm.Program, opts QueryOptions, fn spanMatchFn) (QueryStats, error) {
+func streamFilterProgram(
+	ctx context.Context,
+	r *Reader,
+	program *vm.Program,
+	opts QueryOptions,
+	fn spanMatchFn,
+) (QueryStats, error) {
 	// SPEC-STREAM-8: MostRecent maps to Backward direction with span:start timestamp sorting.
 	// span:start is in searchMetaColumns for V14 files (see NOTE-013); additional I/O may be
 	// needed for older formats.
@@ -161,7 +167,13 @@ func emitAllSpans(allSpans []SpanMatch, limit int, fn spanMatchFn) {
 // aggregate function per spanset, filters by threshold, and emits qualifying spans.
 // NOTE-092: For count/count_over_time with a threshold, dispatches to streamPipelineQueryCount
 // (two-pass streaming) to avoid O(N_spans) allocation.
-func streamPipelineQuery(ctx context.Context, r *Reader, mq *traceqlparser.MetricsQuery, opts QueryOptions, fn spanMatchFn) error {
+func streamPipelineQuery(
+	ctx context.Context,
+	r *Reader,
+	mq *traceqlparser.MetricsQuery,
+	opts QueryOptions,
+	fn spanMatchFn,
+) error {
 	pipeline := mq.Pipeline
 	if pipeline != nil && pipeline.HasThreshold &&
 		(pipeline.Aggregate.Name == "count" || pipeline.Aggregate.Name == "count_over_time") {
@@ -288,7 +300,13 @@ func streamPipelineQuery(ctx context.Context, r *Reader, mq *traceqlparser.Metri
 // Precondition: pipeline != nil && pipeline.HasThreshold must be true.
 // The caller (streamPipelineQuery) guards on HasThreshold before dispatching here.
 // The defensive check below ensures correctness if this invariant is ever violated.
-func streamPipelineQueryCount(ctx context.Context, r *Reader, mq *traceqlparser.MetricsQuery, opts QueryOptions, fn spanMatchFn) error {
+func streamPipelineQueryCount(
+	ctx context.Context,
+	r *Reader,
+	mq *traceqlparser.MetricsQuery,
+	opts QueryOptions,
+	fn spanMatchFn,
+) error {
 	pipeline := mq.Pipeline
 	if pipeline == nil || !pipeline.HasThreshold {
 		// Should not happen — caller guards on HasThreshold, but be defensive.

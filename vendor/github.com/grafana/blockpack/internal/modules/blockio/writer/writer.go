@@ -306,11 +306,12 @@ func (w *Writer) AddTracesData(td *tracev1.TracesData) error {
 				}
 
 				ps := pendingSpan{
-					traceID: tid,
-					svcName: svcName,
-					rs:      rs,
-					ss:      ss,
-					span:    span,
+					traceID:  tid,
+					svcName:  svcName,
+					spanName: span.Name,
+					rs:       rs,
+					ss:       ss,
+					span:     span,
 				}
 				computeMinHashSigFromProto(&ps)
 				w.pending = append(w.pending, ps)
@@ -370,6 +371,7 @@ func (w *Writer) AddTempoTrace(trace *tempopb.Trace) error {
 				ps := pendingSpan{
 					traceID:   tid,
 					svcName:   svcName,
+					spanName:  span.Name,
 					tempoRS:   rs,
 					tempoSS:   ss,
 					tempoSpan: span,
@@ -946,16 +948,22 @@ func (w *Writer) AddRow(block *reader.Block, rowIdx int) error {
 	var tid [16]byte
 	copy(tid[:], traceBytes)
 
-	var svcName string
+	var svcName, spanName string
 	if col := block.GetColumn(svcNameColumnName); col != nil {
 		if v, ok := col.StringValue(rowIdx); ok {
 			svcName = v
+		}
+	}
+	if col := block.GetColumn(spanNameColumnName); col != nil {
+		if v, ok := col.StringValue(rowIdx); ok {
+			spanName = v
 		}
 	}
 
 	ps := pendingSpan{
 		traceID:   tid,
 		svcName:   svcName,
+		spanName:  spanName,
 		srcBlock:  block,
 		srcRowIdx: rowIdx,
 	}
@@ -1019,8 +1027,8 @@ func (w *Writer) AddRowFromReader(block *reader.Block, rowIdx int, srcReader *re
 	var tid [16]byte
 	copy(tid[:], traceBytes)
 
-	// svcName — block column if present, otherwise O(1) index lookup.
-	var svcName string
+	// svcName and spanName — block column if present, otherwise O(1) index lookup.
+	var svcName, spanName string
 	if col := block.GetColumn(svcNameColumnName); col != nil {
 		svcName, _ = col.StringValue(rowIdx)
 	}
@@ -1032,10 +1040,14 @@ func (w *Writer) AddRowFromReader(block *reader.Block, rowIdx int, srcReader *re
 			}
 		}
 	}
+	if col := block.GetColumn(spanNameColumnName); col != nil {
+		spanName, _ = col.StringValue(rowIdx)
+	}
 
 	ps := pendingSpan{
 		traceID:     tid,
 		svcName:     svcName,
+		spanName:    spanName,
 		srcBlock:    block,
 		srcReader:   srcReader,
 		srcBlockIdx: srcBlockIdx,
@@ -1075,4 +1087,20 @@ func (w *Writer) getOrBuildAddRowIndex(r *reader.Reader, blockIdx int) intrinsic
 // CurrentSize returns estimated buffered size in bytes.
 func (w *Writer) CurrentSize() int64 {
 	return int64(len(w.pending)+len(w.pendingLogs)) * estimatedBytesPerSpan
+}
+
+// FlushedBytes returns the total number of bytes the writer has written to its
+// OutputStream so far. Unlike CurrentSize — which only reflects the spans still
+// pending in the in-memory buffer and resets to ~0 after each internal flush —
+// this counter is monotonically increasing across the writer's whole lifetime.
+//
+// NOTE-458 (issue #377): callers that need to decide when to cut a new block by
+// on-disk size (e.g. Tempo's block-builder via walBlock.DataLength) must use
+// this, not a span-count × bytes-per-span estimate. After the WAL switched to
+// counting one object per trace (TotalObjects = trace count, aligning blockpack
+// with parquet's trace-based max_compaction_objects), the old
+// TotalObjects × estimatedBytesPerSpan heuristic under-counted by the
+// spans-per-trace factor and let blocks grow far past the configured byte limit.
+func (w *Writer) FlushedBytes() int64 {
+	return w.out.total
 }

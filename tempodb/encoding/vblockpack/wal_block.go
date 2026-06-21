@@ -168,24 +168,38 @@ func (w *walBlock) Flush() error {
 	return nil
 }
 
-// DataLength returns the estimated size of accumulated WAL data in bytes.
+// DataLength returns the size of accumulated WAL data in bytes.
 // Used by block-builder to decide when to cut a new block (max_block_bytes).
 //
-// We cannot use w.writer.CurrentSize() because the blockpack writer clears its
-// pending-span buffer after each internal flush (every ~10k spans), causing
-// CurrentSize() to reset to 0. That made DataLength() report 0 throughout
-// ingestion, so block-builder never cut on size and blocks grew to 3 minutes
-// of data (~400-500k spans) instead of the configured 100 MB limit.
+// We use the writer's real byte counters rather than a span-count estimate.
+// meta.TotalObjects is now a TRACE count (ObjectAdded fires once per
+// AppendTrace, aligning blockpack with parquet's trace-based
+// max_compaction_objects, issue #377), so the old
+// TotalObjects × bytesPerSpan heuristic under-counted by the spans-per-trace
+// factor and let blocks grow far past the configured byte limit.
 //
-// Instead we derive size from meta.TotalObjects (span count), which is
-// monotonically increasing and already tracked by AppendTrace via ObjectAdded.
-// The constant matches observed on-disk bytes/span for vblockpack L0 blocks.
+// blockpack.Writer.FlushedBytes() returns the bytes already encoded and written
+// to the output stream (monotonic, survives the writer's internal pending-buffer
+// flushes — unlike CurrentSize(), which resets to 0 after each flush).
+// CurrentSize() adds an estimate for the spans still buffered but not yet
+// encoded, so the total tracks actual on-disk size throughout ingestion.
 func (w *walBlock) DataLength() uint64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	const estimatedBytesPerSpan = 1024
-	return uint64(w.meta.TotalObjects) * estimatedBytesPerSpan
+	if w.writer == nil {
+		// Writer already flushed/cleared — the on-disk size is authoritative.
+		return w.meta.Size_
+	}
+	flushed := w.writer.FlushedBytes()
+	pending := w.writer.CurrentSize()
+	if flushed < 0 {
+		flushed = 0
+	}
+	if pending < 0 {
+		pending = 0
+	}
+	return uint64(flushed + pending)
 }
 
 // Iterator returns an iterator over all traces in the WAL

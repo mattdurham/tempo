@@ -18,7 +18,7 @@ import (
 // Delegates to CollectLogs which uses a heap with block-level timestamp pruning
 // for limited queries, and a collect-sort-deliver path for unlimited queries.
 func streamLogQLWithPipeline(
-	_ context.Context,
+	ctx context.Context,
 	r *Reader,
 	program *vm.Program,
 	pipeline *logqlparser.Pipeline,
@@ -31,6 +31,7 @@ func streamLogQLWithPipeline(
 	}
 
 	entries, qs, err := modules_executor.CollectLogs(
+		ctx,
 		r,
 		program,
 		pipeline,
@@ -112,7 +113,13 @@ func (f *logEntryFields) IterateFields(fn func(name string, value any) bool) {
 // streamLogProgram executes a compiled log program against a modules-format reader.
 // Blocks are fetched lazily in ~8 MB coalesced batches; fetching stops once opts.Limit
 // matches have been delivered, so I/O is proportional to results returned.
-func streamLogProgram(ctx context.Context, r *Reader, program *vm.Program, opts LogQueryOptions, fn spanMatchFn) (QueryStats, error) {
+func streamLogProgram(
+	ctx context.Context,
+	r *Reader,
+	program *vm.Program,
+	opts LogQueryOptions,
+	fn spanMatchFn,
+) (QueryStats, error) {
 	direction := modules_queryplanner.Backward
 	if opts.Forward {
 		direction = modules_queryplanner.Forward

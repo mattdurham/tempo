@@ -3,6 +3,7 @@ package executor
 // NOTE: Any changes to this file must be reflected in the corresponding SPECS.md or NOTES.md.
 
 import (
+	"context"
 	"fmt"
 	"maps"
 	"strings"
@@ -49,10 +50,14 @@ const maxLogPreallocRows = 4096
 //
 // Blocks are fetched lazily in ~8 MB coalesced batches.
 func StreamLogs(
+	ctx context.Context,
 	r *modules_reader.Reader,
 	program *vm.Program,
 	pipeline *logqlparser.Pipeline,
 ) ([]LogEntry, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if r == nil {
 		return nil, nil
 	}
@@ -64,6 +69,7 @@ func StreamLogs(
 	wantColumns = injectLogRequiredColumns(wantColumns)
 
 	plan := planBlocks(r, program, queryplanner.TimeRange{}, queryplanner.PlanOptions{})
+	emitPlannerSpan(ctx, plan) // NOTE-456
 
 	if len(plan.SelectedBlocks) == 0 {
 		return nil, nil

@@ -5,6 +5,7 @@ package executor
 import (
 	"cmp"
 	"container/heap"
+	"context"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -138,11 +139,15 @@ func logTopKInsert(buf *logTopKHeap, limit int, backward bool, entry LogEntry) {
 // Per-row time filtering via opts.TimeRange.MinNano/MaxNano (NOTE-021) applies
 // in addition for sub-block granularity.
 func CollectLogs(
+	ctx context.Context,
 	r *modules_reader.Reader,
 	program *vm.Program,
 	pipeline *logqlparser.Pipeline,
 	opts CollectOptions,
 ) ([]LogEntry, QueryStats, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if r == nil {
 		return nil, QueryStats{}, nil
 	}
@@ -160,6 +165,7 @@ func CollectLogs(
 		MinNano: opts.TimeRange.MinNano,
 		MaxNano: opts.TimeRange.MaxNano,
 	}, queryplanner.PlanOptions{})
+	emitPlannerSpan(ctx, plan) // NOTE-456
 	qs.Steps = append(qs.Steps, StepStats{
 		Name:     stepNamePlan,
 		Duration: time.Since(planStart),

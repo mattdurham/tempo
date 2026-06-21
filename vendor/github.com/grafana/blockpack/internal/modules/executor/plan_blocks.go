@@ -37,6 +37,7 @@ func planBlocks(
 	// file's [bucketMin, bucketMax] range, skip all remaining pruning.
 	if program != nil && program.Predicates != nil {
 		if fileLevelReject(r, program.Predicates.Nodes) {
+			plan.PrunedByFileBounds = len(plan.SelectedBlocks) // NOTE-456
 			plan.SelectedBlocks = nil
 			plan.Explain = "file-level reject: query value outside column [bucketMin, bucketMax]"
 			plan.PrunedByIndex = 0
@@ -50,6 +51,7 @@ func planBlocks(
 	// NOTE-045: Checks equality predicates via FileBloom (Fuse8) and compact trace bloom.
 	if program != nil && program.Predicates != nil {
 		if fileLevelBloomReject(r, program.Predicates.Nodes) {
+			plan.PrunedByFileBounds = len(plan.SelectedBlocks) // NOTE-456
 			plan.SelectedBlocks = nil
 			plan.Explain = "file-level reject: bloom filter absence for equality predicate"
 			plan.PrunedByIndex = 0

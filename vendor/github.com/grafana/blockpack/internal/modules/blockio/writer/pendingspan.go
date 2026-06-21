@@ -16,6 +16,7 @@ type pendingSpan struct {
 	srcBlock    *modules_reader.Block
 	srcReader   *modules_reader.Reader
 	svcName     string
+	spanName    string // NOTE-457: secondary sort key for block-level span-name locality
 	minHashSig  [4]uint64
 	srcRowIdx   int
 	srcBlockIdx int

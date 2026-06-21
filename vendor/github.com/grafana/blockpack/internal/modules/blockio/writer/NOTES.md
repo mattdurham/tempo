@@ -964,3 +964,24 @@ EXCLUDED from the on-disk range index (no `RangeBool` type): the exclusion was m
 (`if mm.colType == ColumnTypeBool { continue }`). This lets the executor prune blocks for
 `attr = true` (`blockMax == 0` → all false) and `attr = false` (`blockMin == 1` → all true)
 while keeping `BlocksForRange` bool-free. See executor NOTE-452.
+
+## NOTE-458 — Writer.FlushedBytes(): real on-disk size for block-cutting (issue #377)
+
+`CurrentSize()` only reflects the spans still pending in the in-memory buffer; after each
+internal `flushBlocks()` auto-flush (at `MaxBufferedSpans`) the pending buffer is cleared,
+so `CurrentSize()` drops back toward 0. A caller polling it during ingestion to decide when
+to cut a block sees a sawtooth that never reaches the configured byte limit.
+
+`FlushedBytes()` returns `w.out.total` — the monotonically increasing count of bytes the
+`countingWriter` has actually written to the `OutputStream` (block payloads are written in
+the serial merge pass of `flushBlocks`, and the V8 sections at final `Flush`). Combined with
+`CurrentSize()` (an estimate for the not-yet-encoded pending tail), a caller gets an accurate
+running on-disk size throughout ingestion.
+
+Motivation: Tempo's `vblockpack` WAL block previously estimated `DataLength()` as
+`meta.TotalObjects × bytesPerSpan`. But `TotalObjects` is now a **trace** count (one
+`ObjectAdded` per `AppendTrace`), aligning blockpack with parquet's trace-based
+`max_compaction_objects`. The old per-span estimate therefore under-counted by the
+spans-per-trace factor (~8×), letting WAL blocks grow far past `max_block_bytes`.
+`DataLength()` now uses `FlushedBytes() + CurrentSize()` instead. Anchored in
+`cmd/deadcode/main.go` (public API consumed only by Tempo).

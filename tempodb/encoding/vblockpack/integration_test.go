@@ -87,6 +87,75 @@ func TestWALBlockBasicOperations(t *testing.T) {
 	}
 }
 
+// TestWALBlockDataLengthTracksBytes verifies that DataLength() reports a real
+// byte size (blockpack Writer.FlushedBytes + CurrentSize, NOTE-458/issue #377),
+// not a trace-count × bytes-per-span estimate. It must grow as traces are added,
+// be far larger than the trace count (proving it is not the old estimate scaled
+// off TotalObjects), and fall back to meta.Size_ after Flush clears the writer.
+func TestWALBlockDataLengthTracksBytes(t *testing.T) {
+	tmpDir := t.TempDir()
+	walDir := filepath.Join(tmpDir, "wal")
+
+	meta := backend.NewBlockMeta("test-tenant", uuid.New(), VersionString)
+	meta.StartTime = time.Now().Add(-time.Hour)
+	meta.EndTime = time.Now()
+
+	block := createWALBlock(meta, walDir, time.Minute)
+
+	// Each trace carries several spans so span count >> trace count; this is the
+	// scenario where the old per-span estimate diverged from real bytes.
+	const numTraces = 20
+	const spansPerTrace = 8
+	now := uint64(time.Now().UnixNano())
+	for tIdx := range numTraces {
+		spans := make([]*tempotrace.Span, spansPerTrace)
+		for s := range spansPerTrace {
+			spans[s] = &tempotrace.Span{
+				TraceId:           []byte{byte(tIdx), 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+				SpanId:            []byte{byte(tIdx), byte(s), 3, 4, 5, 6, 7, 8},
+				Name:              "span",
+				StartTimeUnixNano: now,
+				EndTimeUnixNano:   now + uint64(time.Second),
+			}
+		}
+		tr := &tempopb.Trace{
+			ResourceSpans: []*tempotrace.ResourceSpans{
+				{ScopeSpans: []*tempotrace.ScopeSpans{{Spans: spans}}},
+			},
+		}
+		traceID := common.ID(spans[0].TraceId)
+		start := uint32(meta.StartTime.Unix())
+		end := uint32(meta.EndTime.Unix())
+		if err := block.AppendTrace(traceID, tr, start, end, false); err != nil {
+			t.Fatalf("AppendTrace failed: %v", err)
+		}
+	}
+
+	before := block.DataLength()
+	if before == 0 {
+		t.Fatalf("expected DataLength > 0 after appending traces")
+	}
+	// TotalObjects is a TRACE count (one ObjectAdded per AppendTrace). DataLength
+	// must NOT equal that small number; a real-bytes signal is far larger.
+	if before <= uint64(meta.TotalObjects) {
+		t.Fatalf("DataLength (%d) should exceed trace count (%d) — it must be a byte size, not a trace estimate",
+			before, meta.TotalObjects)
+	}
+
+	// Flush moves data to disk and clears the writer; DataLength then reports the
+	// recorded on-disk size (meta.Size_), which must be > 0.
+	if err := block.Flush(); err != nil {
+		t.Fatalf("Flush failed: %v", err)
+	}
+	after := block.DataLength()
+	if after == 0 {
+		t.Fatalf("expected DataLength > 0 after flush (meta.Size_)")
+	}
+	if after != meta.Size_ {
+		t.Fatalf("after flush DataLength (%d) should equal meta.Size_ (%d)", after, meta.Size_)
+	}
+}
+
 // TestCreateBlockBasicOperations tests CreateBlock functionality
 func TestCreateBlockBasicOperations(t *testing.T) {
 	tmpDir := t.TempDir()

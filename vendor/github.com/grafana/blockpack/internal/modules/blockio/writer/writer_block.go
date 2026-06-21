@@ -1113,12 +1113,14 @@ func buildIntrinsicBlockIndex(r *modules_reader.Reader, srcBlockIdx int) intrins
 	if r == nil {
 		return nil
 	}
-	names := r.IntrinsicColumnNames()
-	if len(names) == 0 {
-		return nil
-	}
+	// Only scan identity columns that v4+ blocks store exclusively in the intrinsic
+	// section. All other intrinsic columns (span:kind, span:status, resource.service.name,
+	// span:start, span:duration, span:name, span:parent_id, etc.) are present in block
+	// columns and are already written by addRowFromBlock — rebuilding them here would be
+	// redundant and was the dominant CPU cost (dict-entry scan at ~40% of compaction CPU).
+	identityOnly := []string{traceIDColumnName, spanIDColumnName}
 	out := make(intrinsicRowFields)
-	for _, colName := range names {
+	for _, colName := range identityOnly {
 		col, err := r.GetIntrinsicColumn(colName)
 		if err != nil || col == nil {
 			continue
@@ -1159,11 +1161,12 @@ func buildIntrinsicBlockIndex(r *modules_reader.Reader, srcBlockIdx int) intrins
 	return out
 }
 
-// feedIntrinsicsFromIndex copies intrinsic column values from a pre-built per-block
-// index (see buildIntrinsicBlockIndex) into this block's intrinsic accumulator at
-// dstRowIdx. O(1) per call — the index is built once per source block.
-// Used by the compaction path when source blocks no longer carry intrinsic columns
-// in their block-column storage.
+// feedIntrinsicsFromIndex copies trace:id and span:id from a pre-built per-block
+// identity index into this block's intrinsic accumulator at dstRowIdx. Only these
+// two columns require the index because v4+ blocks store them exclusively in the
+// intrinsic section (not in block columns). All other intrinsic values (span:kind,
+// resource.service.name, span:status, span:duration, etc.) are present in block
+// columns and are already written by addRowFromBlock — no index needed for them.
 func (b *blockBuilder) feedIntrinsicsFromIndex(index intrinsicRowFields, srcRowIdx, dstRowIdx int) {
 	if index == nil || b.intrinsicAccum == nil {
 		return
@@ -1172,9 +1175,9 @@ func (b *blockBuilder) feedIntrinsicsFromIndex(index intrinsicRowFields, srcRowI
 	if !ok {
 		return
 	}
-	if v, ok := fields["trace:id"]; ok {
+	if v, ok := fields[traceIDColumnName]; ok {
 		if bv, ok := v.([]byte); ok {
-			b.feedIntrinsicBytes("trace:id", shared.ColumnTypeBytes, bv, dstRowIdx)
+			b.feedIntrinsicBytes(traceIDColumnName, shared.ColumnTypeBytes, bv, dstRowIdx)
 			b.addPresent(
 				dstRowIdx,
 				traceIDColumnName,
@@ -1192,118 +1195,6 @@ func (b *blockBuilder) feedIntrinsicsFromIndex(index intrinsicRowFields, srcRowI
 				spanIDColumnName,
 				shared.ColumnTypeBytes,
 				shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: bv},
-			)
-		}
-	}
-	if v, ok := fields[spanParentIDColumnName]; ok {
-		if bv, ok := v.([]byte); ok {
-			b.updateMinMax(spanParentIDColumnName, shared.ColumnTypeBytes, string(bv))
-			b.feedIntrinsicBytes(spanParentIDColumnName, shared.ColumnTypeBytes, bv, dstRowIdx)
-			b.addPresent(
-				dstRowIdx,
-				spanParentIDColumnName,
-				shared.ColumnTypeBytes,
-				shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: bv},
-			)
-		}
-	}
-	if v, ok := fields[spanNameColumnName]; ok {
-		if sv, ok := v.(string); ok && sv != "" {
-			b.updateMinMax(spanNameColumnName, shared.ColumnTypeString, sv)
-			b.feedIntrinsicString(spanNameColumnName, shared.ColumnTypeString, sv, dstRowIdx)
-			b.addPresent(
-				dstRowIdx,
-				spanNameColumnName,
-				shared.ColumnTypeString,
-				shared.AttrValue{Type: shared.ColumnTypeString, Str: sv},
-			)
-		}
-	}
-	if v, ok := fields[spanKindColumnName]; ok {
-		if iv, ok := v.(int64); ok {
-			var tmp [8]byte
-			binary.LittleEndian.PutUint64(
-				tmp[:],
-				uint64(iv), //nolint:gosec // G115: safe reinterpret int64 bits as uint64
-			)
-			b.updateMinMaxNum(spanKindColumnName, shared.ColumnTypeInt64, tmp)
-			b.feedIntrinsicInt64(spanKindColumnName, shared.ColumnTypeInt64, iv, dstRowIdx)
-			b.addPresent(
-				dstRowIdx,
-				spanKindColumnName,
-				shared.ColumnTypeInt64,
-				shared.AttrValue{Type: shared.ColumnTypeInt64, Int: iv},
-			)
-		}
-	}
-	if v, ok := fields[spanStartColumnName]; ok {
-		if uv, ok := v.(uint64); ok {
-			var tmp [8]byte
-			binary.LittleEndian.PutUint64(tmp[:], uv)
-			b.updateMinMaxNum(spanStartColumnName, shared.ColumnTypeUint64, tmp)
-			b.feedIntrinsicUint64(spanStartColumnName, shared.ColumnTypeUint64, uv, dstRowIdx)
-			b.addPresent(
-				dstRowIdx,
-				spanStartColumnName,
-				shared.ColumnTypeUint64,
-				shared.AttrValue{Type: shared.ColumnTypeUint64, Uint: uv},
-			)
-			if uv > 0 {
-				b.colSketches.add(sketchTimestampColName, encodeSecondBucket(uv))
-			}
-		}
-	}
-	if v, ok := fields[spanDurationColumnName]; ok {
-		if uv, ok := v.(uint64); ok {
-			var tmp [8]byte
-			binary.LittleEndian.PutUint64(tmp[:], uv)
-			b.updateMinMaxNum(spanDurationColumnName, shared.ColumnTypeUint64, tmp)
-			b.feedIntrinsicUint64(spanDurationColumnName, shared.ColumnTypeUint64, uv, dstRowIdx)
-			b.addPresent(
-				dstRowIdx,
-				spanDurationColumnName,
-				shared.ColumnTypeUint64,
-				shared.AttrValue{Type: shared.ColumnTypeUint64, Uint: uv},
-			)
-		}
-	}
-	if v, ok := fields[spanStatusColumnName]; ok {
-		if iv, ok := v.(int64); ok {
-			var tmp [8]byte
-			binary.LittleEndian.PutUint64(
-				tmp[:],
-				uint64(iv), //nolint:gosec // G115: safe reinterpret int64 bits as uint64
-			)
-			b.updateMinMaxNum(spanStatusColumnName, shared.ColumnTypeInt64, tmp)
-			b.feedIntrinsicInt64(spanStatusColumnName, shared.ColumnTypeInt64, iv, dstRowIdx)
-			b.addPresent(
-				dstRowIdx,
-				spanStatusColumnName,
-				shared.ColumnTypeInt64,
-				shared.AttrValue{Type: shared.ColumnTypeInt64, Int: iv},
-			)
-		}
-	}
-	if v, ok := fields[spanStatusMsgColumnName]; ok {
-		if sv, ok := v.(string); ok && sv != "" {
-			b.feedIntrinsicString(spanStatusMsgColumnName, shared.ColumnTypeString, sv, dstRowIdx)
-			b.addPresent(
-				dstRowIdx,
-				spanStatusMsgColumnName,
-				shared.ColumnTypeString,
-				shared.AttrValue{Type: shared.ColumnTypeString, Str: sv},
-			)
-		}
-	}
-	if v, ok := fields[svcNameColumnName]; ok {
-		if sv, ok := v.(string); ok && sv != "" {
-			b.updateMinMax(svcNameColumnName, shared.ColumnTypeRangeString, sv)
-			b.feedIntrinsicString(svcNameColumnName, shared.ColumnTypeString, sv, dstRowIdx)
-			b.addPresent(
-				dstRowIdx,
-				svcNameColumnName,
-				shared.ColumnTypeString,
-				shared.AttrValue{Type: shared.ColumnTypeString, Str: sv},
 			)
 		}
 	}

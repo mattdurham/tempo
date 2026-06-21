@@ -3,10 +3,13 @@ package executor
 // NOTE: Any changes to this file must be reflected in the corresponding SPECS.md or NOTES.md.
 
 import (
+	"context"
 	"fmt"
 	"math/bits"
 	"slices"
 	"sync"
+
+	"go.opentelemetry.io/otel/attribute"
 
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
 	"github.com/grafana/blockpack/internal/modules/queryplanner"
@@ -46,15 +49,32 @@ const (
 // so file-level rejection is skipped for that program. Within the file, all blocks are scanned —
 // parent spans may be in any internal block.
 func ExecuteStructural(
+	ctx context.Context,
 	r *modules_reader.Reader,
 	q *traceqlparser.StructuralQuery,
 	opts Options,
 ) (*StructuralResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if r == nil {
 		return &StructuralResult{}, nil
 	}
 	if q == nil {
 		return &StructuralResult{}, nil
+	}
+
+	// NOTE-456: top-level query span mirrors Collect; structural queries were previously dark.
+	ctx, querySpan := tracer.Start(ctx, "blockpack.query")
+	defer querySpan.End()
+	if querySpan.IsRecording() {
+		querySpan.SetAttributes(
+			attribute.Int64("blockpack.query.start_ns", int64(opts.TimeRange.MinNano)), //nolint:gosec
+			attribute.Int64("blockpack.query.end_ns", int64(opts.TimeRange.MaxNano)),   //nolint:gosec
+			attribute.Int("blockpack.query.limit", opts.Limit),
+			attribute.Int("blockpack.query.shard_start", opts.StartBlock),
+			attribute.Int("blockpack.query.shard_count", opts.BlockCount),
+		)
 	}
 
 	filters, ops := traceqlparser.FlattenChain(q)
@@ -82,6 +102,7 @@ func ExecuteStructural(
 	}
 
 	traceSpans, parsedBlocks, err := collectAllStructuralSpans(
+		ctx,
 		r,
 		programs,
 		ops,
@@ -145,6 +166,7 @@ func isNegationOp(op traceqlparser.StructuralOp) bool {
 // collectAllStructuralSpans fetches blocks (optionally filtered by time range and sub-file
 // sharding) and accumulates per-trace span records. Returns a map keyed by [16]byte trace ID.
 func collectAllStructuralSpans(
+	ctx context.Context,
 	r *modules_reader.Reader,
 	programs []*vm.Program,
 	ops []traceqlparser.StructuralOp,
@@ -179,6 +201,7 @@ func collectAllStructuralSpans(
 		} else {
 			p = planBlocks(r, prog, tr, queryplanner.PlanOptions{})
 		}
+		emitPlannerSpan(ctx, p) // NOTE-456: emit per-node planner span for structural queries
 		if len(p.SelectedBlocks) == 0 && gated {
 			// planBlocks rejected the file entirely for this non-negation program —
 			// no structural match is possible (the node cannot match any span in this file).

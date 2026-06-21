@@ -278,7 +278,7 @@ func QueryTraceQL(
 			BlockCount: opts.BlockCount,
 		}
 		var execResult *modules_executor.StructuralResult
-		execResult, err = modules_executor.ExecuteStructural(r, q, execOpts)
+		execResult, err = modules_executor.ExecuteStructural(ctx, r, q, execOpts)
 		if err == nil {
 			// SPEC-ROOT-017: pass secondPassCols as wantCols to restrict intrinsic decoding
 			structuralWantCols := modules_executor.ComputeSecondPassCols(nil, opts.SelectColumns)
@@ -342,7 +342,12 @@ func QueryTraceQL(
 // label columns (e.g. GetField("service.name") returns ""). Callers needing
 // the full resource label set should parse the resource.__loki_labels__ string,
 // or use QueryTraceQL which uses SpanFieldsAdapter with lazy full-column access.
-func QueryLogQL(ctx context.Context, r *Reader, logqlQuery string, opts LogQueryOptions) (results []SpanMatch, qs QueryStats, err error) {
+func QueryLogQL(
+	ctx context.Context,
+	r *Reader,
+	logqlQuery string,
+	opts LogQueryOptions,
+) (results []SpanMatch, qs QueryStats, err error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -414,7 +419,12 @@ type LogMetricsRow = modules_executor.LogMetricsRow
 //
 // Returns a LogMetricsResult with one row per (time-bucket × group-by-key) pair.
 // GroupKey[0] is the 0-indexed bucket number; GroupKey[1..] are group-by label values.
-func ExecuteMetricsLogQL(ctx context.Context, r *Reader, logqlQuery string, opts LogMetricOptions) (result *LogMetricsResult, err error) {
+func ExecuteMetricsLogQL(
+	ctx context.Context,
+	r *Reader,
+	logqlQuery string,
+	opts LogMetricOptions,
+) (result *LogMetricsResult, err error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}

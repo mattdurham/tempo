@@ -259,7 +259,13 @@ func (r *Reader) ReadGroupColumnarCached(
 				}
 			}()
 			// Reuse readBlockColumnar's logic but route through the section cache.
-			data, err := r.readBlockColumnarWithCache(cr.BlockOffsets[j], cr.BlockLengths[j], blockIdx, wantColumns, nil)
+			data, err := r.readBlockColumnarWithCache(
+				cr.BlockOffsets[j],
+				cr.BlockLengths[j],
+				blockIdx,
+				wantColumns,
+				nil,
+			)
 			results[j] = blockResult{blockIdx: blockIdx, data: data, err: err}
 		}(j, blockIdx)
 	}
