@@ -20,9 +20,8 @@ import (
 //  3. fileLevelReject — fast-reject the entire file when bucketMin/bucketMax guarantees no match
 //  4. BlocksFromIntrinsicTOC intersection — intrinsic-column fast reject (when available)
 //
-// NOTE-036: All query paths (Collect, ExecuteTraceMetrics, ExecuteLogMetrics,
-// StreamLogs, CollectLogs) must use planBlocks to ensure intrinsic TOC pruning
-// is active everywhere, not just in Collect.
+// NOTE-036: All query paths (Collect, ExecuteTraceMetrics) must use planBlocks to
+// ensure intrinsic TOC pruning is active everywhere, not just in Collect.
 func planBlocks(
 	r *modules_reader.Reader,
 	program *vm.Program,

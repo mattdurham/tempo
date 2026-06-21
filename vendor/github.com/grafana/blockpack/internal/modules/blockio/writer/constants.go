@@ -232,18 +232,6 @@ const (
 	svcNameColumnName       = shared.SvcNameColumnName
 )
 
-// Log intrinsic column name constants — aliases to canonical definitions in shared.
-const (
-	logTimestampColumnName         = shared.LogTimestampColumnName
-	logObservedTimestampColumnName = shared.LogObservedTimestampColumnName
-	logBodyColumnName              = shared.LogBodyColumnName
-	logSeverityNumberColumnName    = shared.LogSeverityNumberColumnName
-	logSeverityTextColumnName      = shared.LogSeverityTextColumnName
-	logTraceIDColumnName           = shared.LogTraceIDColumnName
-	logSpanIDColumnName            = shared.LogSpanIDColumnName
-	logFlagsColumnName             = shared.LogFlagsColumnName
-)
-
 const (
 	defaultMaxBlockSpans      = 2000
 	estimatedBytesPerSpan     = 2048

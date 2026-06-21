@@ -8,7 +8,6 @@ import (
 	"cmp"
 	"context"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -21,7 +20,6 @@ import (
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
 	modules_rw "github.com/grafana/blockpack/internal/modules/rw"
 	modules_sectioncache "github.com/grafana/blockpack/internal/modules/sectioncache"
-	"github.com/grafana/blockpack/internal/otlpconvert"
 	"github.com/grafana/blockpack/internal/s3provider"
 )
 
@@ -326,19 +324,6 @@ func (p *FilePlan) Between(minNanos, maxNanos uint64) []string {
 }
 
 // AGENT: Conversion functions - convert from other formats into blockpack.
-
-// ConvertLogsProtoToBlockpack reads an OTLP protobuf-encoded LogsData file and writes
-// a blockpack log file to output.
-// The input file must contain a single wire-encoded logsv1.LogsData protobuf message.
-// maxRecordsPerBlock controls block granularity (0 uses the default of 2000).
-func ConvertLogsProtoToBlockpack(inputPath string, output io.Writer, maxRecordsPerBlock int) (err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("internal error in ConvertLogsProtoToBlockpack: %v", r)
-		}
-	}()
-	return otlpconvert.ConvertLogsProtoFile(inputPath, output, maxRecordsPerBlock)
-}
 
 // AGENT: Compaction - merge and deduplicate multiple blockpack files.
 

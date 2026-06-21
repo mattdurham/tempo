@@ -778,18 +778,19 @@ func isComputedField(columnName string) bool {
 	return computedFields[columnName]
 }
 
-// unscopedCols returns the three scoped column names for an unscoped attribute.
-func unscopedCols(name string) (resource, span, log string) {
-	return "resource." + name, "span." + name, "log." + name
+// unscopedCols returns the scoped column names for an unscoped attribute.
+// Blockpack stores traces only, so unscoped attributes expand to resource.* and span.*.
+// NOTE-460 (issue #376): the former log.* arm was dropped with LogQL removal; it only ever
+// evaluated to no-match since trace files never carry log.* columns.
+func unscopedCols(name string) (resource, span string) {
+	return "resource." + name, "span." + name
 }
 
 // isBuiltInField checks if a field is a built-in intrinsic field
 func isBuiltInField(attrPath string) bool {
 	switch attrPath {
 	case "span:name", "span:duration", "span:kind", "span:status", "span:status_message",
-		intrinsicTraceID, intrinsicSpanID, intrinsicSpanParentID, "span:start", "span:end",
-		"log:timestamp", "log:observed_timestamp", "log:body", "log:severity_number",
-		"log:severity_text", "log:trace_id", "log:span_id", "log:flags":
+		intrinsicTraceID, intrinsicSpanID, intrinsicSpanParentID, "span:start", "span:end":
 		return true
 	default:
 		return false
@@ -972,15 +973,14 @@ func extractEqNode(expr *traceqlparser.BinaryExpr) (nodes []RangeNode, cols []st
 	}
 
 	if field.Scope == "" && !isBuiltInField(columnName) {
-		// Unscoped: expand to OR across resource.*, span.*, log.*
-		res, span, log := unscopedCols(field.Name)
-		cols = []string{res, span, log}
+		// Unscoped: expand to OR across resource.*, span.*
+		res, span := unscopedCols(field.Name)
+		cols = []string{res, span}
 		return []RangeNode{{
 			IsOR: true,
 			Children: []RangeNode{
 				{Column: res, Values: []Value{vmValue}},
 				{Column: span, Values: []Value{vmValue}},
-				{Column: log, Values: []Value{vmValue}},
 			},
 		}}, cols
 	}
@@ -1039,14 +1039,13 @@ func extractNeqNode(expr *traceqlparser.BinaryExpr) (nodes []RangeNode, cols []s
 		// expansion: a block matching on any one scope's range is enough, and composing
 		// per-scope (presence AND range-OR) across three scopes is conservative-unfriendly
 		// here, so we keep the existing presence-only behavior for unscoped.
-		res, span, log := unscopedCols(field.Name)
-		cols = []string{res, span, log}
+		res, span := unscopedCols(field.Name)
+		cols = []string{res, span}
 		return []RangeNode{{
 			IsOR: true,
 			Children: []RangeNode{
 				{Column: res, RequirePresent: true},
 				{Column: span, RequirePresent: true},
-				{Column: log, RequirePresent: true},
 			},
 		}}, cols
 	}
@@ -1106,15 +1105,14 @@ func extractNeqNumericNode(
 		// Unscoped: presence-only across all three scopes, mirroring the string path —
 		// composing per-scope (presence AND range-OR) across three scopes is
 		// conservative-unfriendly, so keep presence-only for unscoped.
-		res, span, log := unscopedCols(field.Name)
+		res, span := unscopedCols(field.Name)
 		return []RangeNode{{
 			IsOR: true,
 			Children: []RangeNode{
 				{Column: res, RequirePresent: true},
 				{Column: span, RequirePresent: true},
-				{Column: log, RequirePresent: true},
 			},
-		}}, []string{res, span, log}
+		}}, []string{res, span}
 	}
 
 	minV := vmValue
@@ -1179,14 +1177,13 @@ func extractRangeNode(expr *traceqlparser.BinaryExpr) (nodes []RangeNode, cols [
 	}
 
 	if field.Scope == "" && !isBuiltInField(columnName) {
-		res, span, log := unscopedCols(field.Name)
-		cols = []string{res, span, log}
+		res, span := unscopedCols(field.Name)
+		cols = []string{res, span}
 		return []RangeNode{{
 			IsOR: true,
 			Children: []RangeNode{
 				{Column: res, Min: minVal, Max: maxVal, MinInclusive: minInclusive, MaxInclusive: maxInclusive},
 				{Column: span, Min: minVal, Max: maxVal, MinInclusive: minInclusive, MaxInclusive: maxInclusive},
-				{Column: log, Min: minVal, Max: maxVal, MinInclusive: minInclusive, MaxInclusive: maxInclusive},
 			},
 		}}, cols
 	}
@@ -1211,14 +1208,13 @@ func extractRegexNode(expr *traceqlparser.BinaryExpr) (nodes []RangeNode, cols [
 	}
 
 	if field.Scope == "" && !isBuiltInField(columnName) {
-		res, span, log := unscopedCols(field.Name)
-		cols = []string{res, span, log}
+		res, span := unscopedCols(field.Name)
+		cols = []string{res, span}
 		return []RangeNode{{
 			IsOR: true,
 			Children: []RangeNode{
 				{Column: res, Pattern: pattern},
 				{Column: span, Pattern: pattern},
-				{Column: log, Pattern: pattern},
 			},
 		}}, cols
 	}
@@ -1245,8 +1241,8 @@ func negationCols(expr *traceqlparser.BinaryExpr) []string {
 		return nil
 	}
 	if field.Scope == "" {
-		res, span, log := unscopedCols(field.Name)
-		return []string{res, span, log}
+		res, span := unscopedCols(field.Name)
+		return []string{res, span}
 	}
 	return []string{columnName}
 }

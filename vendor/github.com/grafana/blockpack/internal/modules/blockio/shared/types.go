@@ -119,7 +119,7 @@ func UnmarshalDirEntryName(data []byte) (DirEntryName, int, error) {
 // SectionDirectory holds the decoded V14 section directory.
 // TypeEntries maps section_type (0x01–0x06) to its type-keyed entry.
 // NameEntries maps intrinsic column name to its name-keyed entry.
-// SignalType holds the file's signal type (SignalTypeTrace=0x01, SignalTypeLog=0x02).
+// SignalType holds the file's signal type (SignalTypeTrace=0x01).
 // Defaults to 0 (unknown) if no DirEntryKindSignal entry is present.
 
 // ToCKey is the lookup key in a V8 unified Table of Contents.

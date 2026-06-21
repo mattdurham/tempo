@@ -1,6 +1,6 @@
 package blockpack
 
-// query_helpers.go — shared helpers used by both TraceQL and LogQL query paths.
+// query_helpers.go — shared helpers used by the TraceQL query path.
 
 import (
 	"encoding/hex"

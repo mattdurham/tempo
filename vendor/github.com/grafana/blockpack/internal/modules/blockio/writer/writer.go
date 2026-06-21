@@ -11,7 +11,6 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/grafana/tempo/pkg/tempopb"
-	logsv1 "go.opentelemetry.io/proto/otlp/logs/v1"
 	tracev1 "go.opentelemetry.io/proto/otlp/trace/v1"
 
 	"github.com/grafana/blockpack/internal/modules/blockio/reader"
@@ -52,7 +51,7 @@ type Writer struct {
 	intrinsicAccum *intrinsicAccumulator
 
 	// fileBloomSvcNames accumulates unique service names for file-level bloom construction.
-	// Fed from flushBlocks and flushLogBlocks; consumed at Flush by writeV8Sections.
+	// Fed from flushBlocks; consumed at Flush by writeV8Sections.
 	fileBloomSvcNames map[string]struct{}
 
 	// addRowIntrinsicCache caches per-block intrinsic indexes built during AddRowFromReader
@@ -94,14 +93,6 @@ type Writer struct {
 	// Mirrors protoRoots for the AddTempoTrace path.
 	tempoProtoRoots []*tempopb.Trace
 
-	// pendingLogs holds lightweight log records awaiting the next flushLogBlocks call.
-	// Parallel to w.pending (trace path). Protected by the same inUse guard.
-	pendingLogs []pendingLogRecord
-
-	// logProtoRoots anchors LogsData protos until flushLogBlocks() processes all pending
-	// log records referencing them. Cleared after flushLogBlocks(). Mirrors protoRoots.
-	logProtoRoots []*logsv1.LogsData
-
 	cfg Config
 
 	// inUse is a concurrency guard: AddSpan, AddTracesData, and Flush each do
@@ -109,9 +100,9 @@ type Writer struct {
 	// concurrent callers. The Writer is documented as NOT thread-safe (NOTE-004).
 	inUse atomic.Bool
 
-	// signalType identifies whether this Writer produces trace or log files.
-	// Set implicitly on the first AddLogsData or AddTracesData/AddSpan call.
-	// 0 means unset; shared.SignalTypeTrace = 0x01; shared.SignalTypeLog = 0x02.
+	// signalType identifies the file's signal type. Blockpack stores traces only
+	// (NOTE-460, issue #376), so this is always shared.SignalTypeTrace once any data
+	// has been added. 0 means unset; shared.SignalTypeTrace = 0x01.
 	signalType uint8
 }
 
@@ -223,9 +214,6 @@ func (w *Writer) AddSpan(
 	}
 	defer w.inUse.Store(false)
 
-	if w.signalType == shared.SignalTypeLog {
-		return fmt.Errorf("writer: cannot mix trace and log records in the same Writer")
-	}
 	w.signalType = shared.SignalTypeTrace
 
 	// Synthesize proto containers for the attribute maps so addRowFromProto can
@@ -278,9 +266,6 @@ func (w *Writer) AddTracesData(td *tracev1.TracesData) error {
 	}
 	defer w.inUse.Store(false)
 
-	if w.signalType == shared.SignalTypeLog {
-		return fmt.Errorf("writer: cannot mix trace and log records in the same Writer")
-	}
 	w.signalType = shared.SignalTypeTrace
 	// Anchor the proto until flushBlocks() processes all pending spans.
 	// After flushBlocks() clears w.pending, protoRoots is also cleared —
@@ -343,9 +328,6 @@ func (w *Writer) AddTempoTrace(trace *tempopb.Trace) error {
 	}
 	defer w.inUse.Store(false)
 
-	if w.signalType == shared.SignalTypeLog {
-		return fmt.Errorf("writer: cannot mix trace and log records in the same Writer")
-	}
 	w.signalType = shared.SignalTypeTrace
 	w.tempoProtoRoots = append(w.tempoProtoRoots, trace)
 
@@ -390,60 +372,6 @@ func (w *Writer) AddTempoTrace(trace *tempopb.Trace) error {
 	return nil
 }
 
-// AddLogsData buffers all log records from an OTLP LogsData message.
-// The Writer must not have had AddTracesData or AddSpan called on it (signal types cannot
-// be mixed in a single Writer). Returns an error if signalType is already SignalTypeTrace
-// and there are buffered trace records.
-func (w *Writer) AddLogsData(ld *logsv1.LogsData) error {
-	if ld == nil {
-		return nil
-	}
-	// Guard against mixing signal types.
-	if w.signalType == shared.SignalTypeTrace {
-		return fmt.Errorf("writer: cannot mix trace and log records in the same Writer")
-	}
-	if !w.inUse.CompareAndSwap(false, true) {
-		panic("writer: concurrent use detected")
-	}
-	defer w.inUse.Store(false)
-	w.signalType = shared.SignalTypeLog
-	w.logProtoRoots = append(w.logProtoRoots, ld)
-
-	for _, rl := range ld.ResourceLogs {
-		if rl == nil {
-			continue
-		}
-		svcName := extractSvcNameFromProto(rl.Resource)
-		for _, sl := range rl.ScopeLogs {
-			if sl == nil {
-				continue
-			}
-			for _, record := range sl.LogRecords {
-				if record == nil {
-					continue
-				}
-
-				plr := pendingLogRecord{
-					svcName:   svcName,
-					rl:        rl,
-					sl:        sl,
-					record:    record,
-					timestamp: record.TimeUnixNano,
-				}
-				computeMinHashSigFromLog(&plr)
-				w.pendingLogs = append(w.pendingLogs, plr)
-
-				if w.cfg.MaxBufferedSpans > 0 && len(w.pendingLogs) >= w.cfg.MaxBufferedSpans {
-					if flushErr := w.flushLogBlocks(); flushErr != nil {
-						return fmt.Errorf("writer: auto-flush: %w", flushErr)
-					}
-				}
-			}
-		}
-	}
-	return nil
-}
-
 // Flush sorts spans, encodes blocks, writes all structures, and returns bytes written.
 // Panics if called concurrently.
 func (w *Writer) Flush() (int64, error) {
@@ -452,20 +380,14 @@ func (w *Writer) Flush() (int64, error) {
 	}
 	defer w.inUse.Store(false)
 
-	if len(w.pending) == 0 && len(w.pendingLogs) == 0 && len(w.blockMetas) == 0 {
+	if len(w.pending) == 0 && len(w.blockMetas) == 0 {
 		// Nothing has ever been written — produce a valid empty file.
 		return w.writeEmptyFile()
 	}
 
-	// 1. Flush any remaining buffered spans/records into blocks.
-	if w.signalType == shared.SignalTypeLog {
-		if err := w.flushLogBlocks(); err != nil {
-			return w.out.total, err
-		}
-	} else {
-		if err := w.flushBlocks(); err != nil {
-			return w.out.total, err
-		}
+	// 1. Flush any remaining buffered spans into blocks.
+	if err := w.flushBlocks(); err != nil {
+		return w.out.total, err
 	}
 
 	// 2. Apply KLL bucket boundaries to the range index.
@@ -498,11 +420,6 @@ func (w *Writer) Flush() (int64, error) {
 	w.protoRoots = w.protoRoots[:0]
 	clear(w.tempoProtoRoots)
 	w.tempoProtoRoots = w.tempoProtoRoots[:0]
-
-	// Reset log state (parallel to trace state reset above).
-	w.pendingLogs = w.pendingLogs[:0]
-	clear(w.logProtoRoots)
-	w.logProtoRoots = w.logProtoRoots[:0]
 	w.signalType = 0
 
 	// Reset intrinsic accumulator for reuse.
@@ -759,124 +676,6 @@ func (w *Writer) flushBlocks() error {
 	return nil
 }
 
-// flushLogBlocks sorts w.pendingLogs, builds all log blocks concurrently, writes payloads
-// and updates indexes in deterministic block-ID order, then resets the buffer.
-// Mirrors flushBlocks for the log signal path. Log blocks have no intrinsicAccum.
-func (w *Writer) flushLogBlocks() error {
-	if len(w.pendingLogs) == 0 {
-		return nil
-	}
-
-	sortPendingLogs(w.pendingLogs)
-
-	// Pre-compute block boundaries and pre-assign block IDs.
-	type logBlockSlice struct {
-		records []pendingLogRecord
-		blockID int
-	}
-	var slices []logBlockSlice
-	blockStart := 0
-	for blockStart < len(w.pendingLogs) {
-		blockEnd := min(blockStart+w.cfg.MaxBlockSpans, len(w.pendingLogs))
-		slices = append(slices, logBlockSlice{
-			records: w.pendingLogs[blockStart:blockEnd],
-			blockID: len(w.blockMetas) + len(slices),
-		})
-		blockStart = blockEnd
-	}
-
-	results := make([]builtBlock, len(slices))
-
-	// Parallel build phase.
-	var g errgroup.Group
-	g.SetLimit(runtime.NumCPU())
-	for i, s := range slices {
-		i, s := i, s
-		g.Go(func() error {
-			built, err := buildLogBlock(s.records)
-			if err != nil {
-				return fmt.Errorf("writer: log block %d finalize: %w", s.blockID, err)
-			}
-			results[i] = built
-			return nil
-		})
-	}
-	if err := g.Wait(); err != nil {
-		clear(w.pendingLogs)
-		w.pendingLogs = w.pendingLogs[:0]
-		clear(w.logProtoRoots)
-		w.logProtoRoots = w.logProtoRoots[:0]
-		return err
-	}
-
-	// Serial merge pass.
-	for i, built := range results {
-		s := slices[i]
-		blockOffset := uint64(w.out.total) //nolint:gosec
-
-		if _, err := w.out.Write(built.payload); err != nil {
-			// Clear buffered state so the Writer is not left in a partially-flushed limbo.
-			clear(w.pendingLogs)
-			w.pendingLogs = w.pendingLogs[:0]
-			clear(w.logProtoRoots)
-			w.logProtoRoots = w.logProtoRoots[:0]
-			return fmt.Errorf("writer: log block %d write: %w", s.blockID, err)
-		}
-		results[i].payload = nil
-
-		meta := shared.BlockMeta{
-			Offset:    blockOffset,
-			Length:    uint64(len(built.payload)),
-			Kind:      shared.BlockKindLeaf,
-			SpanCount: uint32(built.spanCount), //nolint:gosec
-			MinStart:  built.minStart,
-			MaxStart:  built.maxStart,
-			// MinTraceID and MaxTraceID are zero ([16]byte zero value) for log blocks.
-		}
-		w.blockMetas = append(w.blockMetas, meta)
-
-		bid := uint32(s.blockID) //nolint:gosec
-		for _, mm := range built.colMinMax {
-			if mm.colType == shared.ColumnTypeBool {
-				// NOTE-452 (issue #373): see the trace-block loop above — bool is excluded
-				// from the on-disk range index (no RangeBool type); ColStats only.
-				continue
-			}
-			cd, ok := w.rangeIdx[mm.colName]
-			if !ok {
-				cd = newRangeColumnData(mm.colType)
-				w.rangeIdx[mm.colName] = cd
-			}
-			addBlockRangeToColumn(cd, mm, bid)
-		}
-
-		// NOTE-446: collect per-block column statistics for the ColStats section.
-		if len(built.colStats) > 0 {
-			w.colStatsByBlock = append(w.colStatsByBlock, shared.BlockColStats{
-				BlockIdx: uint16(s.blockID), //nolint:gosec
-				Cols:     built.colStats,
-			})
-		}
-
-		w.sketchIdx = append(w.sketchIdx, built.colSketches)
-		// No trace index update for log blocks.
-	}
-
-	// Collect service names for file-level bloom filter.
-	for _, pl := range w.pendingLogs {
-		if pl.svcName != "" {
-			w.fileBloomSvcNames[pl.svcName] = struct{}{}
-		}
-	}
-
-	clear(w.pendingLogs)
-	w.pendingLogs = w.pendingLogs[:0]
-	clear(w.logProtoRoots)
-	w.logProtoRoots = w.logProtoRoots[:0]
-
-	return nil
-}
-
 // AddRow buffers one row from a decoded Block for the columnar compaction path.
 // This avoids all OTLP proto allocations — values are read directly from block columns
 // at flush time by addRowFromBlock. The caller owns the block; it must remain valid
@@ -1086,7 +885,7 @@ func (w *Writer) getOrBuildAddRowIndex(r *reader.Reader, blockIdx int) intrinsic
 
 // CurrentSize returns estimated buffered size in bytes.
 func (w *Writer) CurrentSize() int64 {
-	return int64(len(w.pending)+len(w.pendingLogs)) * estimatedBytesPerSpan
+	return int64(len(w.pending)) * estimatedBytesPerSpan
 }
 
 // FlushedBytes returns the total number of bytes the writer has written to its

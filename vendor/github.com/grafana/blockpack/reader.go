@@ -269,13 +269,9 @@ func NewLeanReaderWithSectionCache(provider ReaderProvider, fileID string, sc Se
 	})
 }
 
-// Signal type constants for blockpack file discrimination.
-// SignalTypeLog is returned by Reader.SignalType() for log blockpack files.
-// SignalTypeTrace is the default for trace blockpack files (version < 12).
-const (
-	SignalTypeTrace = modules_shared.SignalTypeTrace
-	SignalTypeLog   = modules_shared.SignalTypeLog
-)
+// SignalTypeTrace is the signal type for trace blockpack files (the only signal type;
+// also the default for legacy files with version < 12).
+const SignalTypeTrace = modules_shared.SignalTypeTrace
 
 // ReaderProvider supplies random access to blockpack data.
 // Implementations can use files, memory, cloud storage, etc.

@@ -9,8 +9,6 @@
 //
 //	rows, err := executor.Collect(r, program, executor.CollectOptions{})
 //	// rows contains matched MatchedRow values; use SpanMatchFromRow to extract TraceID/SpanID
-//
-//	rows, logErr = executor.CollectLogs(r, program, nil, executor.CollectOptions{TimestampColumn: "log:timestamp"})
 package executor
 
 // NOTE: Any changes to this file must be reflected in the corresponding specs.md or NOTES.md.
@@ -44,27 +42,21 @@ import (
 // BlockCount is the number of internal blocks to include starting from StartBlock.
 // 0 means no sub-file sharding (scan all blocks selected by the planner).
 
-// SpanMatchFromRow extracts a SpanMatch from a MatchedRow by reading the appropriate
-// trace and span identity columns for the given signal type. For trace signals it
-// reads "trace:id" and "span:id"; for log signals it reads "log:trace_id" and "log:span_id".
+// SpanMatchFromRow extracts a SpanMatch from a MatchedRow by reading the "trace:id"
+// and "span:id" identity columns.
 //
 // r is the Reader used to look up trace identity fields from the intrinsic section when
 // row.IntrinsicFields is nil and the columns are not present in the decoded Block.
-// Pass nil only for log signals (log identity columns remain in block columns).
 //
 // Supports both row representations:
 //   - IntrinsicFields-populated rows (range-predicate Case A, Case B): reads from IntrinsicFields.
 //   - Block-populated rows (block-scan path): reads from Block columns, then falls back
 //     to intrinsic section via r when trace identity columns are absent from the Block.
-func SpanMatchFromRow(row MatchedRow, signalType uint8, r *modules_reader.Reader) (SpanMatch, error) {
+func SpanMatchFromRow(row MatchedRow, r *modules_reader.Reader) (SpanMatch, error) {
 	m := SpanMatch{BlockIdx: row.BlockIdx, RowIdx: row.RowIdx}
 
-	traceIDCol := "trace:id"
-	spanIDCol := "span:id"
-	if signalType == modules_shared.SignalTypeLog {
-		traceIDCol = "log:trace_id"
-		spanIDCol = "log:span_id"
-	}
+	const traceIDCol = "trace:id"
+	const spanIDCol = "span:id"
 
 	if row.IntrinsicFields != nil {
 		// Range-predicate Case A and Case B: IDs are in the IntrinsicFields map.
@@ -96,7 +88,7 @@ func SpanMatchFromRow(row MatchedRow, signalType uint8, r *modules_reader.Reader
 		if v, ok := col.BytesValue(row.RowIdx); ok && len(v) == 16 {
 			copy(m.TraceID[:], v)
 		}
-	} else if r != nil && signalType != modules_shared.SignalTypeLog {
+	} else if r != nil {
 		// Block lacks the identity column: look it up via the intrinsic section.
 		spanRef := modules_shared.BlockRef{
 			BlockIdx: uint16(row.BlockIdx), //nolint:gosec

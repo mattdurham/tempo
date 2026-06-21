@@ -6,7 +6,7 @@ package blockpack
 import "sync"
 
 // SpanMatch represents a single span that matched the query.
-// Fields is safe to retain after QueryTraceQL or QueryLogQL returns.
+// Fields is safe to retain after QueryTraceQL returns.
 type SpanMatch struct {
 	Fields  SpanFieldsProvider
 	TraceID string

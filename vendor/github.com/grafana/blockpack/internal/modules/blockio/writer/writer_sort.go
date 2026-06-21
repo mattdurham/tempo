@@ -71,7 +71,7 @@ func sortPending(pending []pendingSpan) {
 // key-only hashing. Classic MinHash: keep the 4 smallest hashes.
 // Iterates directly over proto attribute slices — no AttrKV materialization required.
 //
-//nolint:dupl // intentional mirror of computeMinHashSigFromLog for the span path; different receiver types prevent sharing
+//nolint:dupl // intentional mirror of computeMinHashSigFromTempoProto for OTLP types; different proto types prevent sharing
 func computeMinHashSigFromProto(ps *pendingSpan) {
 	// Initialize with max uint64 values.
 	ps.minHashSig = [4]uint64{

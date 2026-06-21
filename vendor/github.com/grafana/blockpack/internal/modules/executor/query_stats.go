@@ -25,8 +25,8 @@ const (
 	stepNameMixedPrefilter = "mixed-prefilter"
 )
 
-// QueryStats is returned by Collect and CollectLogs with per-phase execution metrics.
-// It replaces CollectStats (internal) and LogQueryStats (public api.go).
+// QueryStats is returned by Collect with per-phase execution metrics.
+// It replaces CollectStats (internal).
 //
 // ExecutionPath identifies which code path ran:
 //
@@ -34,9 +34,6 @@ const (
 //	  "intrinsic-plain", "intrinsic-topk-kll", "intrinsic-topk-scan",
 //	  "mixed-plain", "mixed-topk", "block-plain", "block-topk",
 //	  "intrinsic-need-block-scan", "bloom-rejected", "block-pruned".
-//
-//	CollectLogs (log queries):
-//	  "block-plain" (full block scan, no top-K), "block-topk" (heap-based top-K by timestamp).
 //
 // Steps contains one entry per phase that actually ran. Phases that were
 // skipped (e.g. intrinsic paths always skip the block-scan phase) are absent.

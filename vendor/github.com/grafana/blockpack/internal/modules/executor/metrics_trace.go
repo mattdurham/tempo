@@ -633,7 +633,7 @@ func traceBuildDenseSeries(
 
 // traceRowValue computes the final metric value for a single bucket.
 // SPEC-ETM-2: COUNT/RATE return 0 for nil/empty buckets; others return NaN.
-// NOTE-033: QUANTILE reuses logComputeQuantile; STDDEV uses Welford sample variance.
+// NOTE-033: QUANTILE uses computeQuantile (nearest-rank); STDDEV uses Welford sample variance.
 func traceRowValue(bucket *aggBucketState, funcName string, stepSec, quantile float64) float64 {
 	switch funcName {
 	case vm.FuncNameCOUNT:
@@ -670,8 +670,8 @@ func traceRowValue(bucket *aggBucketState, funcName string, stepSec, quantile fl
 			}
 			return bucket.max
 		case vm.FuncNameQUANTILE:
-			// Reuse logComputeQuantile (nearest-rank method, same as log metrics). NOTE-033.
-			return logComputeQuantile(bucket.values, quantile)
+			// Nearest-rank method. NOTE-033.
+			return computeQuantile(bucket.values, quantile)
 		case vm.FuncNameSTDDEV:
 			// Sample stddev undefined for n < 2. NOTE-033.
 			if bucket.count < 2 {
@@ -874,4 +874,26 @@ func traceHistogramSeries(
 
 	sortSeriesByLabelString(series)
 	return series
+}
+
+// computeQuantile returns the q-quantile of values using the nearest-rank method.
+// q is clamped to [0,1]; an empty slice yields 0.
+func computeQuantile(values []float64, q float64) float64 {
+	if len(values) == 0 {
+		return 0
+	}
+	sorted := make([]float64, len(values))
+	copy(sorted, values)
+	slices.Sort(sorted)
+	if q <= 0 {
+		return sorted[0]
+	}
+	if q >= 1 {
+		return sorted[len(sorted)-1]
+	}
+	idx := max(int(math.Ceil(q*float64(len(sorted))))-1, 0)
+	if idx >= len(sorted) {
+		idx = len(sorted) - 1
+	}
+	return sorted[idx]
 }

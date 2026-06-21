@@ -160,11 +160,10 @@ func filterRefsByShardRange(refs []modules_shared.BlockRef, opts CollectOptions)
 	return filtered
 }
 
-// CollectOptions configures collect execution for both trace and log signals.
+// CollectOptions configures collect execution.
 
 // TimestampColumn is the column for per-row time filtering.
-// Empty string disables per-row filtering (trace mode).
-// "log:timestamp" enables per-row filtering (log mode).
+// Empty string disables per-row filtering.
 
 // SelectColumns limits which output columns are decoded from block blobs.
 // nil or empty means all columns are returned (no projection applied).

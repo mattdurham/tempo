@@ -7198,3 +7198,45 @@ removed (superseded; would have been dead code).
 
 **Back-ref:** `executor/plan_blocks.go:extractAnchoredBounds,parseSimpleCharClass,`
 `nextStringPrefix,rejectRegexByStringBounds`.
+
+---
+
+## NOTE-460: LogQL support removed — trace-only blockpack (issue #376)
+
+Blockpack is a trace storage format for Tempo. The LogQL execution and storage paths
+added significant maintenance surface (every OTel-context-threading fix and feature had
+to touch log code paths that Tempo never exercises) for a use case that does not apply.
+The entire log signal was removed in one cycle:
+
+**Query path:** deleted `internal/logqlparser/` (parser + compiler), the executor log
+query/metrics files (`stream_log.go`, `stream_log_topk.go` with `CollectLogs`/`StreamLogs`,
+`metrics_log.go` with `ExecuteLogMetrics`, plus `logattrs.go`/`logentry.go`/`logmetricsresult.go`/
+`logmetricsrow.go`/`logtopkheap.go`), `block_label_set.go`/`blocklabelset.go` (the
+`logqlparser.LabelSet` block-scan implementation), and the public API (`QueryLogQL`,
+`ExecuteMetricsLogQL`, `LogQueryOptions`, `LogMetricOptions`, `LogMetricsResult`/`Row`,
+`query_logql.go`, `logentryfields.go`).
+
+**Storage/write path:** deleted `AddLogsData` on the Writer, `writer_log*.go`,
+`logblockbuilder.go`, `pendinglogrecord.go`, compaction `log_compaction.go`/`pendinglogrow.go`,
+otlpconvert `WriteBlockpackLogs`/`NormalizeLogsForBlockpack`/`ConvertLogsProtoFile` and the
+public `ConvertLogsProtoToBlockpack`. The Writer's `signalType` field is retained (the V8
+format still writes a 1-byte signal type) but is now always `SignalTypeTrace`; the
+mix-signal guards are gone, and the public `SignalTypeLog` constant was removed.
+
+**Column metadata:** removed the `log:*` intrinsic column names and classifications
+(`IsIntrinsicColumn`/`ShouldSketchColumn`/semantic-encoding overrides), the `log.*` entries
+in vm's TraceQL intrinsic map (`normalizeFieldName`), and the `log:*` cases in `isBuiltInField`.
+
+**General consequence (not log-specific):** unscoped TraceQL attribute matching
+(`unscopedCols`) now expands to `resource.*` and `span.*` only (was 3 scopes incl. `log.*`).
+Since trace files never carry `log.*` columns, the dropped arm only ever evaluated to
+no-match; removing it shrinks every unscoped OR composite from 3 to 2 children — a small
+universal pruning/decode win, with no behavior change for any data blockpack actually stores.
+
+**Shared helpers relocated** (were defined in deleted log files but used by trace paths):
+`metricsColumnString` → `columnstring.go`; the `rowIndexScratch` pool → `rowindexscratch.go`;
+`computeQuantile` (was `logComputeQuantile`) folded into `metrics_trace.go`.
+
+**Back-ref:** `api.go`, `reader.go:SignalTypeTrace`, `executor/executor.go:SpanMatchFromRow`
+(dropped the now-constant `signalType` param), `vm/traceql_compiler.go:unscopedCols,isBuiltInField`,
+`vm/query_spec.go:normalizeFieldName`, `blockio/shared/column_classify.go`.

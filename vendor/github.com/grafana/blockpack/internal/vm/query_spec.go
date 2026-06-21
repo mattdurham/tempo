@@ -96,15 +96,6 @@ var normalizedIntrinsics = map[string]string{ //nolint:gochecknoglobals
 	// resource/scope schema URL intrinsics
 	"resource.schema_url": shared.ResourceSchemaURL,
 	"scope.schema_url":    shared.ScopeSchemaURL,
-	// log intrinsics
-	"log.timestamp":          shared.LogTimestampColumnName,
-	"log.observed_timestamp": shared.LogObservedTimestampColumnName,
-	"log.body":               shared.LogBodyColumnName,
-	"log.severity_number":    shared.LogSeverityNumberColumnName,
-	"log.severity_text":      shared.LogSeverityTextColumnName,
-	"log.trace_id":           shared.LogTraceIDColumnName,
-	"log.span_id":            shared.LogSpanIDColumnName,
-	"log.flags":              shared.LogFlagsColumnName,
 }
 
 // normalizeFieldName converts attribute paths to canonical colon form.

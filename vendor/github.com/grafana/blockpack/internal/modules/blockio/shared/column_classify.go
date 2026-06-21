@@ -5,9 +5,9 @@ package shared
 // Both the writer (to classify columns into intrinsic vs attribute tier at block-build time) and
 // the reader (to select which TOC tier to consult for a given column name) use this function.
 //
-// The set covers trace signal intrinsics (trace:id, span:*, resource.service.name) and log
-// signal intrinsics (log:*). resource.service.name is included because it is "practically
-// intrinsic" — it is present in the intrinsic section for all signal types.
+// The set covers trace signal intrinsics (trace:id, span:*, resource.service.name).
+// resource.service.name is included because it is "practically intrinsic" — it is present
+// in the intrinsic section.
 func IsIntrinsicColumn(name string) bool {
 	_, ok := intrinsicColumnSet[name]
 	return ok
@@ -63,8 +63,6 @@ var semanticBytesOverrides = map[string]semanticOverride{
 	// further drops the per-row length prefix).
 	"span:id":        {reason: "fixed-width IDs with shared high-order bits", enc: SemanticBytesXOR},
 	"span:parent_id": {reason: "fixed-width IDs with shared high-order bits", enc: SemanticBytesXOR},
-	"log:trace_id":   {reason: "sorted 16-byte trace IDs", enc: SemanticBytesDeltaDictionary},
-	"log:span_id":    {reason: "fixed-width IDs with shared high-order bits", enc: SemanticBytesXOR},
 }
 
 // ShouldSketchColumn reports whether the per-column sketch (HLL distinct-count + TopK +
@@ -100,13 +98,12 @@ func ShouldSketchColumn(name string) bool {
 var sketchSkipColumnSet = map[string]struct{}{
 	"span:id":        {},
 	"span:parent_id": {},
-	"log:span_id":    {},
 }
 
-// intrinsicColumnSet is the canonical set of intrinsic column names across both trace and log
-// signal types. Values are empty struct{} for O(1) lookup with zero memory overhead.
+// intrinsicColumnSet is the canonical set of intrinsic column names. Values are empty
+// struct{} for O(1) lookup with zero memory overhead.
 var intrinsicColumnSet = map[string]struct{}{
-	// Trace signal intrinsics (from SPECS §11.1)
+	// Trace signal intrinsics (from SPECS §11.1).
 	"trace:id":              {},
 	"span:id":               {},
 	"span:parent_id":        {},
@@ -118,13 +115,4 @@ var intrinsicColumnSet = map[string]struct{}{
 	"span:status":           {},
 	"span:status_message":   {},
 	"resource.service.name": {},
-	// Log signal intrinsics (from SPECS §11.4)
-	"log:timestamp":          {},
-	"log:observed_timestamp": {},
-	"log:body":               {},
-	"log:severity_number":    {},
-	"log:severity_text":      {},
-	"log:trace_id":           {},
-	"log:span_id":            {},
-	"log:flags":              {},
 }

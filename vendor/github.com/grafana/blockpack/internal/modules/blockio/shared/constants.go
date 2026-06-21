@@ -107,8 +107,7 @@ const (
 	// Retained as a wire-format threshold constant; the V12 block format is no longer written.
 	VersionBlockV12 uint8 = 12
 
-	SignalTypeTrace uint8 = 0x01 // file contains OTEL trace spans
-	SignalTypeLog   uint8 = 0x02 // file contains OTEL log records
+	SignalTypeTrace uint8 = 0x01 // file contains OTEL trace spans (the only signal type)
 
 	TraceIndexFmtVersion  uint8 = 0x01 // v1: block IDs + per-block span indices (legacy wire, still parsed in V8 files)
 	TraceIndexFmtVersion2 uint8 = 0x02 // v2: block IDs only — no per-block span indices
@@ -422,18 +421,6 @@ const (
 	TraceStateColumnName    = "trace:state"
 	ResourceSchemaURL       = "resource:schema_url"
 	ScopeSchemaURL          = "scope:schema_url"
-)
-
-// Log intrinsic column name constants (SPECS §11 log signal extension).
-const (
-	LogTimestampColumnName         = "log:timestamp"
-	LogObservedTimestampColumnName = "log:observed_timestamp"
-	LogBodyColumnName              = "log:body"
-	LogSeverityNumberColumnName    = "log:severity_number"
-	LogSeverityTextColumnName      = "log:severity_text"
-	LogTraceIDColumnName           = "log:trace_id"
-	LogSpanIDColumnName            = "log:span_id"
-	LogFlagsColumnName             = "log:flags"
 )
 
 // Well-known vector column names. Double-underscore prefix signals internal/synthetic columns.

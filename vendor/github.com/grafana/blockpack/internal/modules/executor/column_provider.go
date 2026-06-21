@@ -353,7 +353,7 @@ func releaseBlockColumnProvider(p *blockColumnProvider) {
 }
 
 // lookupColumn finds a column by its fully-qualified name.
-// All callers (TraceQL via unscopedOrScoped, LogQL via compileSinglePushdownPredicate)
+// All callers (TraceQL via unscopedOrScoped)
 // pre-expand unscoped attribute names to resource./span./log. at compile time,
 // so no runtime fallback is needed here.
 func (p *blockColumnProvider) lookupColumn(name string) *modules_reader.Column {
