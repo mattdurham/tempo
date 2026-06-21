@@ -99,9 +99,51 @@ func buildDedupeIndex(r *modules_reader.Reader, blockIdx int) map[uint16]blockID
 // and writes compacted output to outputStorage.
 // Returns relative paths of all output files written and the count of spans dropped
 // due to missing trace:id or span:id columns.
+//
+// All providers are passed already materialized; if the caller holds every input
+// block fully in memory before calling this, peak memory is sum(all blocks). To
+// bound peak memory to ~max(single block), use CompactBlocksStreaming with lazy
+// provider factories that download just-in-time and release after consumption.
 func CompactBlocks(
 	ctx context.Context,
 	providers []modules_rw.ReaderProvider,
+	cfg Config,
+	outputStorage OutputStorage,
+) ([]string, int64, error) {
+	// NOTE-459: Adapt pre-materialized providers to the streaming API by wrapping
+	// each in a factory that returns the already-open provider. This keeps a single
+	// span-merge/dedup code path; memory bounding is the caller's responsibility
+	// (they already hold all providers, so peak is unchanged for this entry point).
+	if len(providers) == 0 {
+		return nil, 0, nil
+	}
+	factories := make([]ProviderFunc, len(providers))
+	for i := range providers {
+		p := providers[i]
+		factories[i] = func() (modules_rw.ReaderProvider, error) { return p, nil }
+	}
+	return CompactBlocksStreaming(ctx, factories, cfg, outputStorage)
+}
+
+// ProviderFunc lazily opens a single input blockpack provider on demand.
+// CompactBlocksStreaming invokes each ProviderFunc immediately before consuming its
+// block and discards the returned provider before invoking the next, so the caller
+// can download one block at a time and release its bytes between blocks.
+type ProviderFunc func() (modules_rw.ReaderProvider, error)
+
+// CompactBlocksStreaming merges and deduplicates spans from input blockpack files,
+// consuming one provider at a time to bound peak memory.
+//
+// NOTE-459: Unlike CompactBlocks (which takes all providers already materialized),
+// this opens each provider via its ProviderFunc just-in-time, feeds all of its spans
+// into the output writer, then drops the provider reference before opening the next.
+// Peak input-side memory is therefore ~max(largest single block) rather than
+// sum(all blocks), regardless of how many inputs are compacted. The only state that
+// spans all inputs is the dedup set of (trace:id, span:id) keys — far smaller than
+// the raw block bytes — so raising the input-block count no longer scales peak memory.
+func CompactBlocksStreaming(
+	ctx context.Context,
+	providers []ProviderFunc,
 	cfg Config,
 	outputStorage OutputStorage,
 ) ([]string, int64, error) {
@@ -136,13 +178,13 @@ func CompactBlocks(
 		seenSpans:   make(map[[24]byte]struct{}),
 	}
 
-	for i, provider := range providers {
+	for i, open := range providers {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, state.droppedSpans, fmt.Errorf("context canceled: %w", ctxErr)
 		}
 
-		if processErr := state.processProvider(provider); processErr != nil {
-			return nil, state.droppedSpans, fmt.Errorf("process provider %d: %w", i, processErr)
+		if procErr := openAndProcess(open, state, i); procErr != nil {
+			return nil, state.droppedSpans, procErr
 		}
 	}
 
@@ -156,6 +198,23 @@ func CompactBlocks(
 	}
 
 	return outputPaths, state.droppedSpans, nil
+}
+
+// openAndProcess opens one lazy provider, feeds its spans into state, and ensures the
+// provider reference does not outlive this call so its block bytes become GC-eligible
+// before the next provider is opened (the core memory-bounding guarantee of NOTE-459).
+func openAndProcess(open ProviderFunc, state *compactionState, idx int) error {
+	provider, err := open()
+	if err != nil {
+		return fmt.Errorf("open provider %d: %w", idx, err)
+	}
+	if provider == nil {
+		return fmt.Errorf("open provider %d: nil provider", idx)
+	}
+	if processErr := state.processProvider(provider); processErr != nil {
+		return fmt.Errorf("process provider %d: %w", idx, processErr)
+	}
+	return nil
 }
 
 // processProvider feeds all spans from the given provider into the current writer.

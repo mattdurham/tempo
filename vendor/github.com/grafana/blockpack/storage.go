@@ -363,6 +363,30 @@ func CompactBlocks(
 	return paths, err
 }
 
+// CompactionProviderFunc lazily opens a single input blockpack provider on demand.
+// See CompactBlocksStreaming.
+type CompactionProviderFunc = modules_compaction.ProviderFunc
+
+// CompactBlocksStreaming is the memory-bounded variant of CompactBlocks: instead of
+// taking all input providers already materialized, it opens each provider via its
+// CompactionProviderFunc just-in-time, feeds its spans into the output, then releases
+// the provider before opening the next. Peak input-side memory is ~max(largest single
+// block) rather than sum(all blocks), so the number of input blocks can be raised
+// without proportionally growing peak memory. The dedup set of (trace:id, span:id)
+// keys is the only state that spans all inputs.
+//
+// providers are opened sequentially in slice order; each closure should download/open
+// exactly one block and must not capture references that pin earlier blocks in memory.
+func CompactBlocksStreaming(
+	ctx context.Context,
+	providers []CompactionProviderFunc,
+	cfg CompactionConfig,
+	output WritableStorage,
+) ([]string, error) {
+	paths, _, err := modules_compaction.CompactBlocksStreaming(ctx, providers, cfg, output)
+	return paths, err
+}
+
 // NOTE-370: The HTTP embedder write-path constructor (formerly Embedder,
 // EmbedderHTTPConfig, NewHTTPEmbedder here) was moved to the dedicated
 // importable subpackage github.com/grafana/blockpack/embedder to remove it

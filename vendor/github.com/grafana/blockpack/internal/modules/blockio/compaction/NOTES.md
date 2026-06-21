@@ -109,3 +109,37 @@ the per-block min/max timestamp bounds stay narrow, enabling block-level time pr
 suitable for arbitrarily large files; it is intended for moderate-size log segments.
 
 Back-ref: `internal/modules/blockio/compaction/log_compaction.go:CompactLogFile`
+
+---
+
+## NOTE-459: Streaming compaction bounds peak memory to one input block
+*Added: 2026-06-21*
+
+`CompactBlocks` previously required the caller to pass every input provider already
+materialized (`[]ReaderProvider`). The Tempo callsite downloaded all N input blocks
+into memory in parallel before calling it, so peak input-side memory was
+`sum(all blocks)` — at L1 ~730 MB/block and `max_input_blocks=4` that is ~3 GB,
+causing OOMKills on 20 Gi workers and forcing `max_input_blocks: 2` as a workaround.
+
+`CompactBlocksStreaming` takes `[]ProviderFunc` (lazy factories) instead. It invokes
+each factory just-in-time, feeds that single block's spans into the output writer via
+`processProvider`, then drops the provider reference before invoking the next factory.
+Peak input-side memory is therefore `~max(largest single block)` regardless of input
+count. `openAndProcess` is a separate function specifically so the opened provider does
+not outlive a single loop iteration: it returns (and the block bytes become GC-eligible)
+before the next factory runs.
+
+The only state spanning all inputs is `seenSpans` — the dedup set of 24-byte
+`(trace:id, span:id)` keys — which is far smaller than the raw block bytes. Raising the
+input-block count grows the dedup set linearly in span count but does not scale peak
+memory by block size, so `max_input_blocks` can be raised (8, 16+) without OOM risk.
+
+**Trade-off:** parallel downloads are no longer possible on this path (blocks are
+consumed sequentially). Memory safety was prioritized over download parallelism because
+OOMKills abort the entire compaction job whereas serial downloads only lengthen it.
+
+`CompactBlocks` is retained as a thin adapter: it wraps each pre-materialized provider in
+a trivial factory and delegates to `CompactBlocksStreaming`, keeping one merge/dedup path.
+
+Back-ref: `compaction.go:CompactBlocksStreaming`, `compaction.go:openAndProcess`,
+`storage.go:CompactBlocksStreaming`
