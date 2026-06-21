@@ -59,18 +59,25 @@ func (c *Compactor) Compact(ctx context.Context, l log.Logger, r backend.Reader,
 
 	first := inputs[0]
 
-	// Pre-download each input block in full before compaction begins.
-	// tempoBlockProvider.ReadAt previously issued one S3 ranged GET per column
-	// section, generating hundreds of per-column requests per job (50-100ms each).
-	// Downloading the full block once matches how queries work (GetBlockWithBytes)
-	// and reduces S3 request count from O(blocks×columns) to O(blocks).
-	providers := make([]blockpack.ReaderProvider, len(inputs))
+	// NOTE-459: Stream one input block at a time to bound peak memory.
+	// Previously all N blocks were downloaded into memory in parallel before
+	// compaction began, so peak input-side memory was sum(all blocks): at L1
+	// ~730 MB/block with max_input_blocks=4 that is ~3 GB, causing OOMKills and
+	// forcing max_input_blocks: 2 as a workaround. Each factory below downloads
+	// exactly one block just-in-time; CompactBlocksStreaming consumes and releases
+	// it before opening the next, so peak input-side memory is ~max(single block)
+	// regardless of input count. Trade-off: downloads are now serial, but an OOMKill
+	// aborts the whole job whereas serial downloads only lengthen it.
+	providers := make([]blockpack.CompactionProviderFunc, len(inputs))
 	for i, m := range inputs {
-		data, err := r.Read(ctx, DataFileName, uuid.UUID(m.BlockID), m.TenantID, nil)
-		if err != nil {
-			return nil, fmt.Errorf("read block %s for compaction: %w", m.BlockID, err)
+		i, m := i, m
+		providers[i] = func() (blockpack.ReaderProvider, error) {
+			data, err := r.Read(ctx, DataFileName, uuid.UUID(m.BlockID), m.TenantID, nil)
+			if err != nil {
+				return nil, fmt.Errorf("read block %s for compaction: %w", m.BlockID, err)
+			}
+			return &memoryBlockProvider{data: data}, nil
 		}
-		providers[i] = &memoryBlockProvider{data: data}
 	}
 
 	// WritableStorage receives the compacted output files.
@@ -103,12 +110,11 @@ func (c *Compactor) Compact(ctx context.Context, l log.Logger, r backend.Reader,
 		compactDedicatedCols = first.DedicatedColumns
 	}
 	cfg := blockpack.CompactionConfig{
-		MaxSpansPerBlock:  maxSpansFromConfig(&c.opts.BlockConfig),
-		MaxOutputFileSize: c.opts.BlockConfig.Blockpack.MaxOutputFileSize,
-		DedicatedColumns:  dedicatedColumnsToBlockpack(compactDedicatedCols),
+		MaxSpansPerBlock: maxSpansFromConfig(&c.opts.BlockConfig),
+		DedicatedColumns: dedicatedColumnsToBlockpack(compactDedicatedCols),
 	}
 
-	outputPaths, err := blockpack.CompactBlocks(ctx, providers, cfg, out)
+	outputPaths, err := blockpack.CompactBlocksStreaming(ctx, providers, cfg, out)
 	if err != nil {
 		return nil, fmt.Errorf("blockpack.CompactBlocks: %w", err)
 	}
