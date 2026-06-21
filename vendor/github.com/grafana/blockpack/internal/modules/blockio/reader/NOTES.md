@@ -3279,3 +3279,27 @@ files without the section (old format) so callers fall back to no pruning. Used 
 `pruneByColStats` block pruning.
 
 **Back-ref:** `reader/parser.go:ensureV8ColStatsSection,ColStats,HasColStats`, `shared/colstats.go`.
+
+---
+
+## NOTE-463 (reader side): IntrinsicDictStringSet for compaction similarity (issue #382)
+*Added: 2026-06-21*
+
+`Reader.IntrinsicDictStringSet(name)` collects the distinct string value set of a paged Dict
+intrinsic column (e.g. `resource.service.name`, `span:name`) by streaming it one page at a time
+through the existing `ScanDictGroupByColumn` / `shared.ScanDictPagedColumnBlob` path and copying
+`DictPageValue.ValBytes` into a `map[string]struct{}`. It NEVER decodes block refs — the only
+work is O(distinct values) string copies plus one (cache-resident after first access) column blob
+fetch. Int64 dict columns (nil `ValBytes`) are skipped; similarity is defined over string columns.
+
+Returns `(nil, nil)` when the column is absent or not a paged Dict column so the caller (the
+compaction scheduler) treats it as "no value-set information" and falls back to time-window
+ordering — distinct from an empty-but-present set.
+
+This is the cheap ToC-only read the public-package `ReadBlockValueSets` / `BlockSimilarity`
+(blockpack `blocksimilarity.go`) use to score and order compaction inputs by content similarity so
+the densest (svcName, spanName) data pattern is fed to the writer first, improving dict/snappy
+density of the output block.
+
+**Back-ref:** `reader/intrinsic_reader.go:IntrinsicDictStringSet,ScanDictGroupByColumn`,
+`shared/intrinsic_stream.go:ScanDictPagedColumnBlob,DictPageValue`, top-level `blocksimilarity.go`.

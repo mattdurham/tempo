@@ -247,6 +247,43 @@ func (r *Reader) ScanDictGroupByColumn(
 	return true, nil
 }
 
+// IntrinsicDictStringSet collects the set of distinct string values held by the named
+// intrinsic Dict column, reading only the column's compressed blob (cheap ToC + ranged
+// GET) and streaming it one page at a time WITHOUT decoding any block refs. This is the
+// value-set extraction used by compaction similarity scoring (NOTE-463): two blocks whose
+// resource.service.name / span:name value sets overlap heavily compress better when merged.
+//
+// Returns (nil, nil) when there is no intrinsic section, the column is absent, or the
+// column is not a paged Dict column — the caller treats an absent set as "no overlap
+// information" and falls back to time-window ordering. The returned set is freshly
+// allocated and owned by the caller.
+//
+// Cost: one GetOrFetchIntrinsic for the column blob (already cached after first access)
+// plus O(distinct values) string allocations. No full block download and no ref decode.
+func (r *Reader) IntrinsicDictStringSet(name string) (map[string]struct{}, error) {
+	set := make(map[string]struct{})
+	streamed, err := r.ScanDictGroupByColumn(name, func(v *shared.DictPageValue) error {
+		// Int64 dict columns have nil ValBytes; skip them — similarity scoring is
+		// defined over string-valued columns (service/span names) only.
+		if v.ValBytes == nil {
+			return nil
+		}
+		// ValBytes aliases the page's pooled decode buffer (valid only during this call),
+		// so materialize a string copy into the set. A value spanning multiple pages is
+		// visited once per page; the map dedups it to a single entry.
+		set[string(v.ValBytes)] = struct{}{}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("IntrinsicDictStringSet %q: %w", name, err)
+	}
+	if !streamed {
+		// Column absent or not a paged Dict column — no value-set information.
+		return nil, nil
+	}
+	return set, nil
+}
+
 // intrinsicBatchFetcher is the optional interface a section cache may implement to
 // batch-fetch several intrinsic column blobs for one file in a single round-trip.
 // TypedTieredCache.GetMultiIntrinsic implements it; caches that don't are simply not

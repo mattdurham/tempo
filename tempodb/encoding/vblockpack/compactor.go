@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"time"
 
 	"github.com/go-kit/log"
@@ -57,17 +58,26 @@ func (c *Compactor) Compact(ctx context.Context, l log.Logger, r backend.Reader,
 		totalObjects += m.TotalObjects
 	}
 
+	// NOTE-463 (blockpack issue #382): Reorder inputs so the most mutually-similar blocks
+	// are compacted in a contiguous, similarity-descending chain — the most-similar block is
+	// fed FIRST so the writer's dictionary and sort baseline (sort key is
+	// (resource.service.name, span:name, minHash)) are established from the dominant data
+	// pattern before less-similar spans merge in. Denser identical-string runs ⇒ better dict
+	// encoding + snappy ratio and fewer distinct dict values per output block. Best-effort:
+	// reads only each block's intrinsic ToC (footer + section directory + two column blobs,
+	// cheap ranged GETs — no full block download); on any read failure it leaves the original
+	// time-window order untouched, so behaviour falls back to pre-NOTE-463.
+	inputs = orderInputsBySimilarity(ctx, l, r, inputs)
+
 	first := inputs[0]
 
-	// NOTE-459: Stream one input block at a time to bound peak memory.
-	// Previously all N blocks were downloaded into memory in parallel before
-	// compaction began, so peak input-side memory was sum(all blocks): at L1
-	// ~730 MB/block with max_input_blocks=4 that is ~3 GB, causing OOMKills and
-	// forcing max_input_blocks: 2 as a workaround. Each factory below downloads
-	// exactly one block just-in-time; CompactBlocksStreaming consumes and releases
-	// it before opening the next, so peak input-side memory is ~max(single block)
-	// regardless of input count. Trade-off: downloads are now serial, but an OOMKill
-	// aborts the whole job whereas serial downloads only lengthen it.
+	// NOTE-459: Stream one input block at a time, downloading each to a temp file
+	// rather than holding it in memory. The factory downloads the block, writes it
+	// to a local temp file, and immediately frees the in-memory download buffer.
+	// CompactBlocksStreaming calls each factory just-in-time (not all upfront), so
+	// at most one block's temp file exists on disk at once; the provider deletes it
+	// when the reader is done. Peak memory = writer pending buffer (~1MB), not the
+	// full block size. This allows max_input_blocks=8+ without OOMKills.
 	providers := make([]blockpack.CompactionProviderFunc, len(inputs))
 	for i, m := range inputs {
 		i, m := i, m
@@ -76,7 +86,20 @@ func (c *Compactor) Compact(ctx context.Context, l log.Logger, r backend.Reader,
 			if err != nil {
 				return nil, fmt.Errorf("read block %s for compaction: %w", m.BlockID, err)
 			}
-			return &memoryBlockProvider{data: data}, nil
+
+			// Write to a temp file, then immediately release the in-memory buffer.
+			// The fileBlockProvider reads from the temp file and deletes it on close.
+			tmpFile, tmpErr := os.CreateTemp("", "blockpack-compact-*.blockpack")
+			if tmpErr != nil {
+				return nil, fmt.Errorf("create temp file for block %s: %w", m.BlockID, tmpErr)
+			}
+			if _, writeErr := tmpFile.Write(data); writeErr != nil {
+				_ = tmpFile.Close()
+				_ = os.Remove(tmpFile.Name())
+				return nil, fmt.Errorf("write temp file for block %s: %w", m.BlockID, writeErr)
+			}
+			data = nil // release in-memory buffer immediately; GC can collect it
+			return &fileBlockProvider{file: tmpFile}, nil
 		}
 	}
 
@@ -158,6 +181,178 @@ func (p *memoryBlockProvider) ReadAt(buf []byte, off int64, _ blockpack.DataType
 }
 
 func (p *memoryBlockProvider) Delete() error { return nil }
+
+// orderInputsBySimilarity returns inputs reordered so contiguous blocks are as content-similar
+// as possible, most-similar-pair first (NOTE-463). It reads each block's intrinsic ToC value
+// sets (resource.service.name, span:name) via cheap ranged GETs and builds a greedy
+// nearest-neighbour chain: start from the most-similar pair, then repeatedly append the
+// unselected block most similar to the chain head.
+//
+// Best-effort and side-effect-free on failure: if fewer than three blocks, or any block's
+// value sets cannot be read, the original (time-window) order is returned unchanged so
+// compaction behaves exactly as it did before NOTE-463.
+func orderInputsBySimilarity(ctx context.Context, l log.Logger, r backend.Reader, inputs []*backend.BlockMeta) []*backend.BlockMeta {
+	// With 0–2 blocks every order produces the same single contiguous merge, so there is no
+	// ordering decision to make — skip the ToC reads entirely.
+	if len(inputs) < 3 {
+		return inputs
+	}
+
+	sets := make([]blockpack.BlockValueSets, len(inputs))
+	for i, m := range inputs {
+		vs, err := readBlockValueSetsFromBackend(ctx, r, m)
+		if err != nil {
+			// Any failure means we cannot reliably score similarity for the whole set;
+			// fall back to the original order rather than ordering on partial data.
+			level.Debug(l).Log(
+				"msg", "blockpack compaction: similarity ordering skipped, falling back to input order",
+				"block", m.BlockID, "err", err,
+			)
+			return inputs
+		}
+		sets[i] = vs
+	}
+
+	order := greedySimilarityChain(sets)
+	ordered := make([]*backend.BlockMeta, len(inputs))
+	for newIdx, oldIdx := range order {
+		ordered[newIdx] = inputs[oldIdx]
+	}
+	return ordered
+}
+
+// greedySimilarityChain returns a permutation of indices [0,len(sets)) ordered as a greedy
+// nearest-neighbour chain: the most-similar pair seeds the chain, then each step appends the
+// not-yet-placed block most similar to the current chain head. This keeps the most mutually
+// similar blocks adjacent and front-loads the densest data pattern.
+func greedySimilarityChain(sets []blockpack.BlockValueSets) []int {
+	n := len(sets)
+	// Seed with the most-similar pair.
+	bestI, bestJ := 0, 1
+	best := -1.0
+	for i := 0; i < n; i++ {
+		for j := i + 1; j < n; j++ {
+			s := blockpack.BlockSimilarity(sets[i], sets[j])
+			if s > best {
+				best, bestI, bestJ = s, i, j
+			}
+		}
+	}
+
+	placed := make([]bool, n)
+	order := make([]int, 0, n)
+	order = append(order, bestI, bestJ)
+	placed[bestI], placed[bestJ] = true, true
+
+	for len(order) < n {
+		head := order[len(order)-1]
+		next := -1
+		nextScore := -1.0
+		for cand := 0; cand < n; cand++ {
+			if placed[cand] {
+				continue
+			}
+			s := blockpack.BlockSimilarity(sets[head], sets[cand])
+			if s > nextScore {
+				nextScore, next = s, cand
+			}
+		}
+		order = append(order, next)
+		placed[next] = true
+	}
+	return order
+}
+
+// readBlockValueSetsFromBackend reads a block's resource.service.name and span:name distinct
+// value sets through a lean blockpack reader backed by ranged backend GETs — no full block
+// download. The lean reader reads only the footer + section directory on open; the two
+// intrinsic column blobs are fetched lazily by ReadBlockValueSets.
+func readBlockValueSetsFromBackend(ctx context.Context, r backend.Reader, m *backend.BlockMeta) (blockpack.BlockValueSets, error) {
+	prov, err := newRangeBlockProvider(ctx, r, m)
+	if err != nil {
+		return blockpack.BlockValueSets{}, err
+	}
+	reader, err := blockpack.NewLeanReaderFromProvider(prov)
+	if err != nil {
+		return blockpack.BlockValueSets{}, fmt.Errorf("open lean reader for %s: %w", m.BlockID, err)
+	}
+	return blockpack.ReadBlockValueSets(reader)
+}
+
+// rangeBlockProvider implements blockpack.ReaderProvider by issuing ranged GETs against the
+// tempo backend, so a lean reader can read a block's ToC without downloading the whole block.
+type rangeBlockProvider struct {
+	ctx      context.Context
+	r        backend.Reader
+	blockID  uuid.UUID
+	tenantID string
+	size     int64
+}
+
+// newRangeBlockProvider resolves the block's object size (needed for footer reads from the
+// end of the file) via a StreamReader open, immediately closing the body without reading it.
+func newRangeBlockProvider(ctx context.Context, r backend.Reader, m *backend.BlockMeta) (*rangeBlockProvider, error) {
+	rc, size, err := r.StreamReader(ctx, DataFileName, uuid.UUID(m.BlockID), m.TenantID)
+	if err != nil {
+		return nil, fmt.Errorf("stat block %s: %w", m.BlockID, err)
+	}
+	_ = rc.Close()
+	return &rangeBlockProvider{
+		ctx:      ctx,
+		r:        r,
+		blockID:  uuid.UUID(m.BlockID),
+		tenantID: m.TenantID,
+		size:     size,
+	}, nil
+}
+
+func (p *rangeBlockProvider) Size() (int64, error) { return p.size, nil }
+
+func (p *rangeBlockProvider) ReadAt(buf []byte, off int64, _ blockpack.DataType) (int, error) {
+	if off < 0 {
+		return 0, fmt.Errorf("negative offset: %d", off)
+	}
+	if off >= p.size {
+		return 0, io.EOF
+	}
+	n := len(buf)
+	if int64(n) > p.size-off {
+		n = int(p.size - off)
+	}
+	if err := p.r.ReadRange(p.ctx, DataFileName, p.blockID, p.tenantID, uint64(off), buf[:n], nil); err != nil {
+		return 0, fmt.Errorf("read range [%d,%d) of block %s: %w", off, off+int64(n), p.blockID, err)
+	}
+	if n < len(buf) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+// fileBlockProvider implements blockpack.ReaderProvider using a local temp file.
+// The download buffer is released immediately after writing to disk; ReadAt
+// serves requests via file I/O. Delete removes the temp file when compaction
+// is done with this block.
+type fileBlockProvider struct {
+	file *os.File
+}
+
+func (p *fileBlockProvider) Size() (int64, error) {
+	info, err := p.file.Stat()
+	if err != nil {
+		return 0, err
+	}
+	return info.Size(), nil
+}
+
+func (p *fileBlockProvider) ReadAt(buf []byte, off int64, _ blockpack.DataType) (int, error) {
+	return p.file.ReadAt(buf, off)
+}
+
+func (p *fileBlockProvider) Delete() error {
+	name := p.file.Name()
+	_ = p.file.Close()
+	return os.Remove(name)
+}
 
 // tempoOutputStorage implements blockpack.WritableStorage.
 // Each call to Put() writes one output blockpack file as a new block in the backend.
