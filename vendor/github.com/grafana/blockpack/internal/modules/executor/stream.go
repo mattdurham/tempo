@@ -331,6 +331,7 @@ func Collect(
 		rows, fastQS, err := collectMatchAllTopK(ctx, r, opts, wantColumns, secondPassCols)
 		if err != errNeedBlockScan {
 			fastQS.TotalDuration = time.Since(queryStart)
+			emitFastPathPlannerSpan(ctx, r, &fastQS) // NOTE-464 (issue #383)
 			return rows, fastQS, err
 		}
 		// Fall through to full block scan if fast path is not applicable.
@@ -348,6 +349,7 @@ func Collect(
 		if err != errNeedBlockScan {
 			// Fast path produced a definitive result (rows, empty result, or error).
 			fastQS.TotalDuration = time.Since(queryStart)
+			emitFastPathPlannerSpan(ctx, r, &fastQS) // NOTE-464 (issue #383)
 			return rows, fastQS, err
 		}
 		// SPEC-ROOT-010: slog.Warn when intrinsic fast path falls through to block scan.
@@ -383,7 +385,9 @@ func Collect(
 	}
 
 	// NOTE-449: emit planner span with pruning counts for OTel distributed traces.
-	emitPlannerSpan(ctx, plan)
+	// NOTE-464 (issue #383): this is the full block-scan path — no row-level candidate bitmap
+	// was built, so full_fetch_skipped is false and bitmap_selectivity is omitted (stats nil).
+	emitPlannerSpan(ctx, plan, nil)
 
 	qs.Steps = append(qs.Steps, StepStats{
 		Name:     stepNamePlan,
@@ -762,6 +766,27 @@ func streamSortedRows(
 	return false
 }
 
+// totalSpansOfRefBlocks sums BlockMeta.SpanCount over the distinct blocks referenced by
+// refs — the denominator for the intrinsic-pre-filter bitmap selectivity (NOTE-464,
+// issue #383). It is the count of all spans the query would have had to materialize from
+// full block payloads had the candidate bitmap not narrowed the work. Returns 0 when refs
+// is empty (selectivity is then reported as omitted / not meaningful).
+func totalSpansOfRefBlocks(r *modules_reader.Reader, refs []modules_shared.BlockRef) int {
+	if len(refs) == 0 {
+		return 0
+	}
+	seen := make(map[uint16]struct{}, min(len(refs), 64))
+	var total int
+	for _, ref := range refs {
+		if _, ok := seen[ref.BlockIdx]; ok {
+			continue
+		}
+		seen[ref.BlockIdx] = struct{}{}
+		total += int(r.BlockMeta(int(ref.BlockIdx)).SpanCount)
+	}
+	return total
+}
+
 // countUniqueBlockIdxs returns the number of distinct BlockIdx values in refs.
 func countUniqueBlockIdxs(refs []modules_shared.BlockRef) int {
 	if len(refs) == 0 {
@@ -1074,11 +1099,17 @@ func collectFromIntrinsicRefs(
 	// Unlike the block-scan path, no time-range or bloom pruning occurs here — the
 	// intrinsic TOC already filters refs by predicate. selected_blocks reflects the
 	// number of distinct blocks containing matching refs after shard filtering.
+	// NOTE-464 (issue #383): record the candidate-bitmap size (refs that passed the
+	// intrinsic/dedicated pre-filter) and the total span count over the candidate blocks so
+	// the planner span can report bitmap_selectivity.
+	candidateBlocks := countUniqueBlockIdxs(refs)
 	qs.Steps = append(qs.Steps, StepStats{
 		Name: stepNamePlan,
 		Metadata: map[string]any{
 			"total_blocks":    r.BlockCount(),
-			"selected_blocks": countUniqueBlockIdxs(refs),
+			"selected_blocks": candidateBlocks,
+			"candidate_rows":  len(refs),
+			"total_spans":     totalSpansOfRefBlocks(r, refs),
 		},
 	})
 

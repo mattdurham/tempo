@@ -110,10 +110,11 @@ func ExecuteTraceMetrics(
 		}
 	}
 	plan := planBlocks(r, program, tr, queryplanner.PlanOptions{})
-	emitPlannerSpan(ctx, plan) // NOTE-456
 
 	result := &TraceMetricsResult{}
 	if len(plan.SelectedBlocks) == 0 {
+		// NOTE-464 (issue #383): all blocks pruned at the block level — no full fetch needed.
+		emitPlannerSpan(ctx, plan, &PlannerSpanStats{CandidateRows: -1, FullFetchSkipped: true})
 		return result, nil
 	}
 
@@ -149,8 +150,15 @@ func ExecuteTraceMetrics(
 	if intrinsicResult, used, intrinsicErr := executeTraceMetricsIntrinsic(ctx, r, program, querySpec, outputCols); intrinsicErr != nil {
 		return nil, intrinsicErr
 	} else if used {
+		// NOTE-464 (issue #383): the metrics query was fully covered by dedicated/intrinsic
+		// columns and answered from ToC data alone — zero full block fetches.
+		emitPlannerSpan(ctx, plan, &PlannerSpanStats{CandidateRows: -1, FullFetchSkipped: true})
 		return intrinsicResult, nil
 	}
+
+	// NOTE-464 (issue #383): the intrinsic fast path declined — this query needs full block
+	// payloads (non-dedicated columns referenced). Report full_fetch_skipped=false.
+	emitPlannerSpan(ctx, plan, nil)
 
 	// SPEC-ETM-12 / SPEC-STREAM-11: Blocks are fetched concurrently via blockGroupPipeline
 	// (W workers, bounded channel), processed sequentially for parse safety. Peak memory is

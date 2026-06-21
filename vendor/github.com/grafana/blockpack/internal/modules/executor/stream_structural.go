@@ -201,7 +201,10 @@ func collectAllStructuralSpans(
 		} else {
 			p = planBlocks(r, prog, tr, queryplanner.PlanOptions{})
 		}
-		emitPlannerSpan(ctx, p) // NOTE-456: emit per-node planner span for structural queries
+		// NOTE-456: emit per-node planner span for structural queries.
+		// NOTE-464 (issue #383): structural nodes always fetch block payloads for the
+		// relationship walk, so full_fetch_skipped is false and bitmap_selectivity is omitted.
+		emitPlannerSpan(ctx, p, nil)
 		if len(p.SelectedBlocks) == 0 && gated {
 			// planBlocks rejected the file entirely for this non-negation program —
 			// no structural match is possible (the node cannot match any span in this file).

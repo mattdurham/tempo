@@ -1170,8 +1170,34 @@ Back-ref: `internal/modules/executor/stream.go:Collect`,
 `Collect` on the `planBlocks → scanBlocks` path MUST produce:
 `blockpack.query` → `blockpack.planner` (child) → `blockpack.block` (children, one per block).
 
-Back-ref: `internal/modules/executor/stream.go:Collect,scanBlocks`,
+Every query path MUST emit exactly one `blockpack.planner` span — including the intrinsic
+pre-filter fast paths (search and metrics) that resolve the query before reaching the
+`planBlocks → scanBlocks` site. A successfully two-phase-pruned query (NOTE-464, issue #383)
+MUST NOT be invisible in a distributed trace.
+
+Back-ref: `internal/modules/executor/stream.go:Collect,scanBlocks,emitFastPathPlannerSpan`,
+`internal/modules/executor/metrics_trace.go:ExecuteTraceMetrics`,
 `internal/modules/executor/otel_spans.go:emitPlannerSpan,startBlockSpan`.
+
+---
+
+## SPEC-OBS-005: Two-Phase Execution Observables (NOTE-464, issue #383)
+
+The `blockpack.planner` span MUST carry two attributes describing the two-phase
+(dedicated/intrinsic pre-filter → optional full block fetch) execution model:
+
+- `blockpack.planner.full_fetch_skipped` (bool, ALWAYS present): true when the query was
+  answered from ToC/intrinsic data with zero full block payload fetches — the strongest form
+  of the issue #383 win. True on: metrics intrinsic fast path, block-pruned / bloom-rejected
+  search paths, and the intrinsic-topk-kll path. False on hydrating intrinsic paths, mixed
+  paths, the full block-scan path, and structural nodes.
+- `blockpack.planner.bitmap_selectivity` (float, present only when computable): candidate-bitmap
+  rows / total spans across the candidate blocks — the fraction of spans that survived the
+  pre-filter. Omitted when no row-level bitmap was built (block-scan / structural path) or when
+  the total span count is unknown.
+
+Back-ref: `internal/modules/executor/otel_spans.go:PlannerSpanStats,emitPlannerSpan,emitFastPathPlannerSpan`,
+`internal/modules/executor/stream.go:totalSpansOfRefBlocks,collectFromIntrinsicRefs`.
 
 ---
 

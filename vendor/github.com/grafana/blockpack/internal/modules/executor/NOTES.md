@@ -7240,3 +7240,43 @@ universal pruning/decode win, with no behavior change for any data blockpack act
 **Back-ref:** `api.go`, `reader.go:SignalTypeTrace`, `executor/executor.go:SpanMatchFromRow`
 (dropped the now-constant `signalType` param), `vm/traceql_compiler.go:unscopedCols,isBuiltInField`,
 `vm/query_spec.go:normalizeFieldName`, `blockio/shared/column_classify.go`.
+
+---
+
+## NOTE-464: two-phase execution observables on the planner span (issue #383)
+
+Issue #383 asks for the dedicated/intrinsic-column pre-filter to be the mandatory first pass,
+with the full block fetch as the fallback of last resort. The core machinery already existed —
+`BlockRefsFromIntrinsicTOC` / `blockRefsFromIntrinsicPartial` build a candidate ref set from the
+~50KB-per-block ToC data before any `GetBlockWithBytes`, and the search/metrics fast paths skip
+the full fetch when fully covered (Cases A–E in `collectFromIntrinsicRefs`, the metrics
+intrinsic path in `executeTraceMetricsIntrinsic`). The missing piece was **observability**: the
+issue's own evidence (`pruned_by_*=0` across all planner spans) was a symptom of the fast paths
+returning **before** `emitPlannerSpan` was ever reached — a successfully two-phase-pruned query
+emitted no `blockpack.planner` span at all, so the trace could not show the model engaging.
+
+**Change:**
+- `emitPlannerSpan` now takes a `*PlannerSpanStats` and always emits
+  `blockpack.planner.full_fetch_skipped` (bool); it emits `blockpack.planner.bitmap_selectivity`
+  (candidate_rows / total_spans) only when computable. nil stats → full_fetch_skipped=false,
+  selectivity omitted (the full block-scan and structural paths).
+- `collectFromIntrinsicRefs` records `candidate_rows` (the bitmap size) and `total_spans`
+  (`totalSpansOfRefBlocks` — sum of `BlockMeta.SpanCount` over the distinct candidate blocks)
+  in its plan step.
+- `emitFastPathPlannerSpan` reconstructs a minimal `Plan` + `PlannerSpanStats` from the
+  fast-path `QueryStats` and emits the planner span on the search intrinsic/match-all returns
+  (which previously emitted none).
+- The metrics path emits the span **after** the intrinsic fast-path decision:
+  full_fetch_skipped=true when `executeTraceMetricsIntrinsic` took the query (or all blocks
+  were block-pruned), false otherwise.
+
+**full_fetch_skipped semantics (honest, not aspirational):** true only when **zero** full block
+payloads were fetched. The hydrating intrinsic search paths (intrinsic-plain, intrinsic-topk-scan,
+match-all-topk) still read candidate block payloads to populate output columns, so they report
+false but a meaningful `bitmap_selectivity`. The truly-zero-fetch paths are: the metrics intrinsic
+path, the block-pruned / bloom-rejected search paths, and intrinsic-topk-kll (refs picked from the
+cached timestamp blob alone). See `fullFetchSkippedExecPaths`.
+
+**Back-ref:** `otel_spans.go:PlannerSpanStats,emitPlannerSpan,emitFastPathPlannerSpan,fullFetchSkippedExecPaths`,
+`stream.go:totalSpansOfRefBlocks,collectFromIntrinsicRefs`, `metrics_trace.go:ExecuteTraceMetrics`,
+`stream_structural.go`. SPEC-OBS-002 / SPEC-OBS-005.
