@@ -1048,3 +1048,42 @@ Motivation: Tempo's `vblockpack` WAL block previously estimated `DataLength()` a
 spans-per-trace factor (~8×), letting WAL blocks grow far past `max_block_bytes`.
 `DataLength()` now uses `FlushedBytes() + CurrentSize()` instead. Anchored in
 `cmd/deadcode/main.go` (public API consumed only by Tempo).
+
+## NOTE-462 — SpanTree structural index (issue #381)
+
+A new ToC entry (`ToCSubTypeSpanTree`) stores, per span, `(traceID, spanID, parentID, dfsIn,
+dfsOut, blockIdx, rowIdx)`. The DFS in/out counters — assigned per trace by a depth-first walk
+— collapse ancestor/descendant checks to two integer comparisons (`shared.IsDescendant`):
+`J descends from I  iff  I.dfsIn < J.dfsIn AND J.dfsOut < I.dfsOut`. This enables block-level
+structural pruning for TraceQL `>>`/`<<`/`~` without loading spans and reconstructing the tree,
+and subsumes the chunked trace index for trace-by-ID (every `(blockIdx,rowIdx)` per trace is
+present).
+
+**Streaming requirement (mirrors NOTE-461):** one record per span would be an O(spans)
+in-memory accumulator. `spanTreeAccum` (writer/spantree_tempfile.go) instead runs a bounded
+EXTERNAL SORT: during block build it appends fixed-stride spill records to runs of at most
+`spanTreeRunRecords` (sorted in memory, then flushed to a run file, buffer released — peak
+RAM = one run buffer, ~9 MiB). At `Flush()` a k-way `container/heap` merge over the sorted run
+files yields global `(traceID, spanID)` order; consecutive same-traceID records form one trace
+that is held in memory (bounded by the largest single trace, NOT the file), DFS-numbered
+(`dfsNumber`, iterative DFS — no recursion depth risk; dangling/cyclic parents degrade to roots
+so every span still gets a valid interval), and emitted into independently-snappy-compressed
+chunks. A trace's records never split across a chunk boundary, so one chunk read resolves any
+single trace.
+
+**Section framing** mirrors the chunked trace index (issue #340): written RAW via
+`writeRawToCEntry` = header[36] + chunk directory[28/entry] + concatenated snappy chunks +
+trace-ID bloom. Within a chunk the decoded records are fixed stride
+(`shared.SpanTreeRecordSize`=44) so the reader binary-searches on traceID without a full decode.
+
+**Reader** (reader/spantree.go): `ensureSpanTreeSection` parses header+directory in one range
+read; `SpanTreeForTrace(traceID)` bloom-rejects, binary-searches the directory for the one
+chunk, range-reads + snappy-decodes it, then binary-searches the fixed-stride records.
+
+**Migration:** new blocks write SpanTree; the old compact trace index *decoder* is retained for
+reading pre-migration blocks. Compaction rebuilds SpanTree from output spans automatically
+(compaction feeds the Writer via AddRow → buildBlock → localAccum → the same serial merge pass
+that feeds `feedSpanTreeFromAccum`); old ToC entries are never copied forward.
+
+**Codec & predicates** live in `shared/spantree.go` (EncodeSpanTreeRecord/DecodeSpanTreeRecord,
+IsDescendant/IsAncestor/IsRoot/AreSiblings) so writer and reader share one wire format.

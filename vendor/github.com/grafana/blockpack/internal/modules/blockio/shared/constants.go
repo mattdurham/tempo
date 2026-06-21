@@ -69,6 +69,8 @@ const (
 
 	ToCSubTypeColStats uint32 = 9 // per-block per-column statistics for predicate pruning (SPEC: issue #364)
 
+	ToCSubTypeSpanTree uint32 = 10 // parent-child span tree index for structural query pruning (SPEC: issue #381)
+
 	// ToCEntry SubType constants for ToCTypeIndex (Type=2).
 	ToCSubTypeBlockIndex uint32 = 7 // block offset table
 
@@ -128,6 +130,30 @@ const (
 	// ChunkedTraceEntriesPerChunk is the number of sorted trace entries packed into one chunk.
 	// Keeps each decompressed chunk small (a few tens of KB) so trace-by-id reads one chunk.
 	ChunkedTraceEntriesPerChunk = 4096
+
+	// Span tree index (ToCSubTypeSpanTree) — parent-child structural index (issue #381).
+	// Like the chunked trace index, the section is written RAW (not snappy-compressed as a
+	// whole); each chunk is independently snappy-compressed so a lookup range-reads + decodes
+	// only the chunk(s) that can contain a target trace ID. Within a chunk the records are
+	// fixed-stride (SpanTreeRecordSize), enabling binary search on traceID without full decode.
+	SpanTreeMagic   uint32 = 0xC01DC3DE
+	SpanTreeVersion uint8  = 0x01
+	// SpanTreeHeaderSize is the fixed leading-header size in bytes:
+	// magic[4]+version[1]+reserved[3]+block_count[4]+trace_count[4]+span_count[4]+
+	// chunk_count[4]+dir_off[4]+bloom_off[4]+bloom_len[4] = 36 bytes.
+	SpanTreeHeaderSize = 36
+	// SpanTreeDirEntrySize is the size in bytes of one chunk-directory entry:
+	// first_trace_id[16]+comp_off[4]+comp_len[4]+span_count[4] = 28 bytes. The per-chunk
+	// span_count lets a reader size its decode buffer and walk the chunk without a sub-header.
+	SpanTreeDirEntrySize = 28
+	// SpanTreeRecordSize is the fixed stride of one decoded SpanTree record:
+	// trace_id[16]+span_id[8]+parent_id[8]+dfs_in[4]+dfs_out[4]+block_idx[2]+row_idx[2] = 44 bytes.
+	SpanTreeRecordSize = 44
+	// SpanTreeRecordsPerChunk is the number of records packed into one independently-compressed
+	// chunk. A chunk boundary never splits a trace's records (a trace's spans are always in one
+	// chunk), so the chunk that may exceed this slightly to keep a trace intact; the value keeps
+	// each decompressed chunk small (a few hundred KB) for cheap range reads.
+	SpanTreeRecordsPerChunk = 8192
 
 	// CompactIndexVersion is the legacy compact index version (no trace ID bloom).
 	// Still encountered in V8 trace sections written before CompactIndexVersion2 was introduced.

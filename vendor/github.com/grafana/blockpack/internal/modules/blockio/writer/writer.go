@@ -53,6 +53,14 @@ type Writer struct {
 	// the first flushBlocks() (see ensureIntrinsicAccum) and released at Flush().
 	intrinsicAccum *tempFileAccum
 
+	// spanTreeAccum accumulates one structural record per span for the SpanTree section
+	// (NOTE-462, issue #381). Backed by sorted on-disk run files (external sort) so peak RSS
+	// is bounded by one run buffer during the spill phase and by the largest single trace
+	// during the merge/DFS phase — never by total span count. Fed in the serial flush pass
+	// from each block's intrinsic identity columns; consumed at Flush() by writeV8FileSections.
+	// Created lazily on the first flushBlocks() (see ensureSpanTreeAccum) and released at Flush().
+	spanTreeAccum *spanTreeAccum
+
 	// fileBloomSvcNames accumulates unique service names for file-level bloom construction.
 	// Fed from flushBlocks; consumed at Flush by writeV8Sections.
 	fileBloomSvcNames map[string]struct{}
@@ -389,6 +397,11 @@ func (w *Writer) Flush() (int64, error) {
 			_ = w.intrinsicAccum.close()
 			w.intrinsicAccum = nil
 		}
+		// NOTE-462: release the SpanTree spill run files / temp dir on every Flush exit path.
+		if w.spanTreeAccum != nil {
+			_ = w.spanTreeAccum.close()
+			w.spanTreeAccum = nil
+		}
 	}()
 
 	if len(w.pending) == 0 && len(w.blockMetas) == 0 {
@@ -470,6 +483,63 @@ func (w *Writer) ensureIntrinsicAccum() error {
 		return err
 	}
 	w.intrinsicAccum = a
+	return nil
+}
+
+// ensureSpanTreeAccum lazily creates the file-level on-disk SpanTree accumulator
+// (NOTE-462, issue #381). Like ensureIntrinsicAccum it is created on first use and spills
+// under w.cfg.ScratchDir when the caller configures one.
+func (w *Writer) ensureSpanTreeAccum() error {
+	if w.spanTreeAccum != nil {
+		return nil
+	}
+	a, err := newSpanTreeAccum(w.cfg.ScratchDir)
+	if err != nil {
+		return err
+	}
+	w.spanTreeAccum = a
+	return nil
+}
+
+// feedSpanTreeFromAccum extracts (traceID, spanID, parentID) per row from a per-block
+// intrinsic accumulator and feeds one SpanTree record per span. trace:id is always present;
+// span:id and span:parent_id are present only when non-empty (root spans have no parent).
+// Rows missing a span:id are skipped — a structural index entry without a span identity is
+// not addressable. NOTE-462.
+func feedSpanTreeFromAccum(acc *spanTreeAccum, local *intrinsicAccumulator, blockID uint16) error {
+	traceCol := local.flatCols[traceIDColumnName]
+	spanCol := local.flatCols[spanIDColumnName]
+	if traceCol == nil || spanCol == nil {
+		return nil
+	}
+	// Index trace:id and span:parent_id by rowIdx so they can be joined to each span:id row.
+	traceByRow := make(map[uint16][]byte, len(traceCol.refs))
+	for i, ref := range traceCol.refs {
+		traceByRow[ref.RowIdx] = traceCol.bytesValues[i]
+	}
+	var parentByRow map[uint16][]byte
+	if parentCol := local.flatCols[spanParentIDColumnName]; parentCol != nil {
+		parentByRow = make(map[uint16][]byte, len(parentCol.refs))
+		for i, ref := range parentCol.refs {
+			parentByRow[ref.RowIdx] = parentCol.bytesValues[i]
+		}
+	}
+	for i, ref := range spanCol.refs {
+		tid := traceByRow[ref.RowIdx]
+		if len(tid) != 16 {
+			// trace:id is always 16 bytes; skip malformed rows.
+			continue
+		}
+		var traceID [16]byte
+		copy(traceID[:], tid)
+		var parent []byte
+		if parentByRow != nil {
+			parent = parentByRow[ref.RowIdx]
+		}
+		if err := acc.add(traceID, spanCol.bytesValues[i], parent, blockID, ref.RowIdx); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -645,6 +715,15 @@ func (w *Writer) flushBlocks() error {
 			}
 			if err := w.intrinsicAccum.spillMerge(built.localAccum); err != nil {
 				return fmt.Errorf("writer: block %d intrinsic spill: %w", s.blockID, err)
+			}
+			// NOTE-462 (issue #381): feed the SpanTree accumulator from the same per-block
+			// intrinsic identity columns before releasing localAccum, so structural records
+			// are spilled in the same single write pass.
+			if err := w.ensureSpanTreeAccum(); err != nil {
+				return fmt.Errorf("writer: spantree accumulator: %w", err)
+			}
+			if err := feedSpanTreeFromAccum(w.spanTreeAccum, built.localAccum, uint16(s.blockID)); err != nil { //nolint:gosec // blockID bounded above by 65534
+				return fmt.Errorf("writer: block %d spantree spill: %w", s.blockID, err)
 			}
 			results[i].localAccum = nil
 		}

@@ -117,6 +117,12 @@ type Reader struct {
 	// ensureV8TraceSection (guarded by v8TraceOnce).
 	chunkedTrace *chunkedTraceIndex
 
+	// spanTree is the parsed header+directory of the SpanTree structural index
+	// (ToCSubTypeSpanTree, issue #381). Non-nil only for files written with the section.
+	// Parsed lazily in ensureSpanTreeSection (guarded by spanTreeOnce).
+	spanTree    *spanTreeIndex
+	spanTreeErr error
+
 	// sketchIdx holds parsed column-major sketch data for the file.
 	// Nil for files written before the sketch section was introduced (old format).
 	sketchIdx *sketchIndex
@@ -225,6 +231,7 @@ type Reader struct {
 
 	// V8 lazy section errors and sync.Once guards (mirror of v14 ones).
 	v8TraceOnce    sync.Once
+	spanTreeOnce   sync.Once
 	v8TSOnce       sync.Once
 	v8BloomOnce    sync.Once
 	v8ColStatsOnce sync.Once

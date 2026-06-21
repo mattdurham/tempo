@@ -169,6 +169,24 @@ func (w *Writer) writeV8FileSections(sw *v8SectionWriter) error {
 		return err
 	}
 
+	// SpanTree structural index (issue #381): parent-child DFS index, written raw so the
+	// reader can range-read one chunk. Built from the file-level SpanTree accumulator
+	// (NOTE-462). Skipped when no spans were fed (build returns nil).
+	if w.spanTreeAccum != nil {
+		spanTreeBlob, stErr := w.spanTreeAccum.build(len(w.blockMetas))
+		if stErr != nil {
+			return fmt.Errorf("span_tree: %w", stErr)
+		}
+		if len(spanTreeBlob) > 0 {
+			if err = sw.writeRawToCEntry(
+				shared.ToCKey{Type: shared.ToCTypeMetadata, SubType: shared.ToCSubTypeSpanTree},
+				spanTreeBlob,
+			); err != nil {
+				return err
+			}
+		}
+	}
+
 	// TS index.
 	tsRaw := writeTSIndexSection(w.blockMetas)
 	if err = sw.writeToCEntry(
