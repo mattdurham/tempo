@@ -60,7 +60,7 @@ Intrinsic columns use two encoding strategies:
 
 **Dict columns** (`span:name`, `span:kind`, `resource.service.name`): values are deduplicated into a dictionary. Each unique string (or int64) maps to a list of `BlockRef` pointers. Repeated values cost O(1) additional storage (only a new `BlockRef` is appended, not the value bytes again).
 
-For large files (>10 000 rows in any column, controlled by `MaxIntrinsicRows`), columns switch from a monolithic v1 format to a **paged v2 format** that splits data into independently-readable pages. If any column exceeds `MaxIntrinsicRows` total rows, the entire intrinsic section is written as an empty TOC to avoid unbounded growth.
+Large columns switch from a monolithic v1 format to a **paged v2 format** (page size `deltaPageSize = 1024` present rows) that splits data into independently-readable pages, so the reader never materializes a whole column. As a final sanity guard, if any single column exceeds `MaxIntrinsicRows` total rows the entire intrinsic section is written as an empty TOC. After NOTE-461 (per-column on-disk spill at write time) and the paged read format, neither write- nor read-time memory grows with total file rows, so `MaxIntrinsicRows` is set to 100M (NOTE-465 / issue #384) — high enough that realistic large files keep their intrinsic fast path, while still rejecting pathological files.
 
 Both flat and dict formats are snappy-compressed at the blob level.
 
@@ -86,7 +86,7 @@ The reader loads the intrinsic section once via `writeIntrinsicSection`-compatib
 | **Enables file-level bloom** | `resource.service.name` intrinsics are the input for FBLM construction |
 | **Deduplication** | Dict columns: repeated service names or span names cost only a `BlockRef` (4 bytes), not the string again |
 | **Buffering required** | All intrinsic values must be accumulated in memory until `Flush()` — cannot be streamed per-block |
-| **Growth cap** | Files with >10 000 total rows in any intrinsic column write an empty TOC to avoid unbounded memory |
+| **Growth cap** | Files with >`MaxIntrinsicRows` (100M, NOTE-465) rows in any single intrinsic column write an empty TOC as a sanity guard; write/read memory is otherwise bounded by per-column spill (NOTE-461) and paged columns |
 | **8 fixed columns** | Adding a new intrinsic column requires a format version bump and changes to both writer and reader |
 
 ---

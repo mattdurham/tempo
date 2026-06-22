@@ -162,6 +162,69 @@ row-groups concurrently. This change applies the same approach.
 
 ---
 
+## NOTE-465: Remove the ~700-block intrinsic fast-path cliff — two causes (issue #384) (2026-06-22)
+*Added: 2026-06-22*
+
+**Two independent ~700-block cliffs, same issue.** Issue #384 reported the intrinsic fast
+path disabling itself above ~700–800 assigned blocks. There were two distinct causes, fixed
+together under this note:
+
+1. **Metrics path — `MaxIntrinsicRows` section drop (this section, writer side).** A query
+   fully covered by intrinsic columns silently lost its intrinsic section at write time.
+2. **Search/Collect mixed path — Case C/D 50% selectivity guard (executor side, see
+   `internal/modules/executor/stream.go:collectFromIntrinsicRefs`).** The partial-AND
+   pre-filter for mixed queries (`{ span:kind = server && span.http.method = "GET" }`) fell
+   back to the full block scan whenever its candidate set covered more than HALF the file's
+   internal blocks (`uniqueBlocks*2 > BlockCount`). A broad-but-not-universal intrinsic
+   predicate like `kind = server` covers most blocks of a large file, so above ~50% coverage
+   (~700 of ~1400 blocks) the guard abandoned the fast path even though pruning the remaining
+   blocks still skips real block I/O + second-pass decode + VM eval. Replaced the 50% cliff
+   with a coverage heuristic (`minPruneShiftCDsel = 4`): keep the fast path as long as the
+   pre-filter prunes at least 1/16 of the blocks; fall back only when candidate coverage is
+   near-total. General heuristic, no benchmark-specific value. Covered by
+   `TestExecutionPath_MixedSelectivityGuard` (40/52/90/100% coverage, asserting identical
+   result counts on both execution paths).
+
+**Problem (metrics / writer):** The intrinsic/dedicated-column metrics fast path (zero block
+I/O) silently stopped triggering for queriers assigned more than ~700–800 blocks. A query fully covered by
+intrinsic columns (e.g. `{kind = server} | histogram_over_time(duration) by
+(resource.service.name)`) reported `full_fetch_skipped=false` and `pruned_by_intrinsic_toc=0`
+on 93/96 querier calls, each then doing an unnecessary full block fetch. Root cause was NOT in
+the executor dispatch — it was at write time: `MaxIntrinsicRows = 10_000_000` plus
+`overCap()`. When any single intrinsic column exceeds the cap, `writeV8IntrinsicBlobs` writes
+**no** intrinsic columns at all (empty TOC). The reader then reports `HasIntrinsicSection() ==
+false` / `HasIntrinsicColumn() == false`, so `metricsColumnsAreIntrinsic` returns false and the
+metrics path falls through to a full block scan. Files assigned ~814–3,598 blocks hold roughly
+11–50M spans, so `span:start` (one row per span) blew past 10M and the whole section was
+dropped — a hard performance cliff, not a gradual degradation.
+
+**Why 10M was obsolete:** the cap dates to when the file-level intrinsic section was built
+entirely in memory — `O(all columns × all spans)`, tens of GiB, the OOM source. NOTE-461
+replaced that with per-column on-disk spill: at `Flush()` exactly ONE column is rebuilt in
+memory at a time, so peak write RSS is `O(largest single column's rows)`. The on-disk column
+blobs are also page-encoded (`deltaPageSize = 1024` for delta-uint64; paged dict), so the
+reader streams pages and never materializes a whole column. With both write- and read-time
+memory bounded independent of total file rows, the 10M section-drop bought no memory safety —
+it only disabled the fast path.
+
+**Decision:** Raise `MaxIntrinsicRows` to `100_000_000`. It remains a var (tests lower it) and
+keeps the same all-or-nothing `overCap()` semantics — it is now purely a sanity guard against
+pathological files. 100M is principled, not benchmark-tuned: a single-column rebuild at 100M
+rows is ≈1–2 GiB transient (trace:id ≈ 20B value + 4B ref), within `MaxMetadataSize` (2 GiB),
+and comfortably above realistic large files (≈50M rows) so they keep their intrinsic fast path.
+
+**Test:** `TestMaxIntrinsicRows_OverCap` now reads the original threshold from
+`modules_shared.MaxIntrinsicRows` (was a hardcoded `10_000_000` literal) so it tracks the
+constant; it still lowers the cap to 5 to exercise both below- and above-cap section emission.
+
+**Back-ref:** `internal/modules/blockio/shared/constants.go:MaxIntrinsicRows`,
+`internal/modules/blockio/writer/intrinsic_accum.go:overCap`,
+`internal/modules/blockio/writer/intrinsic_tempfile.go:overCap`,
+`internal/modules/blockio/writer/v8_sections.go:writeV8IntrinsicBlobs`,
+`internal/modules/executor/metrics_trace_intrinsic.go:metricsColumnsAreIntrinsic`
+
+---
+
 ## NOTE-461: File-level intrinsic accumulator spills to per-column temp files (issue #380) (2026-06-21)
 *Added: 2026-06-21*
 

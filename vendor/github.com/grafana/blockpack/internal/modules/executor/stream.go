@@ -135,6 +135,14 @@ var errLimitReached = errors.New("limit reached")
 // Exported so tests can override it to force the scan path. See NOTE-043.
 var SortScanThreshold = 8000
 
+// minPruneShiftCDsel sets the minimum block-pruning fraction required to keep the Case C/D
+// mixed-query intrinsic pre-filter (NOTE-465, issue #384). The pre-filter is kept on the
+// fast path as long as it prunes at least 1/2^minPruneShiftCDsel of the file's internal
+// blocks; below that it prunes too few blocks to repay its ref-building overhead and we fall
+// back to the full block scan. Shift 4 ⇒ 1/16 ⇒ keep the fast path while ≥6.25% of blocks
+// are pruned (candidate coverage ≤ 93.75%). General heuristic; no benchmark-specific value.
+const minPruneShiftCDsel = 4
+
 // blockRefCompare orders BlockRefs by (BlockIdx, RowIdx) ascending.
 func blockRefCompare(a, b modules_shared.BlockRef) int {
 	if n := cmp.Compare(a.BlockIdx, b.BlockIdx); n != 0 {
@@ -1080,12 +1088,31 @@ func collectFromIntrinsicRefs(
 		return nil, *qs, nil
 	}
 
-	// Selectivity guard: if the partial pre-filter covers more than half the internal
-	// blocks it offers no I/O benefit for Cases C/D, which must read blocks for VM eval.
-	// Fall through to the regular block scan (coalesced I/O, planBlocks pruning).
+	// Selectivity guard (NOTE-465, issue #384): for Cases C/D the partial-AND pre-filter
+	// must still read every candidate block to VM-re-evaluate the non-intrinsic predicate,
+	// so its only I/O win is *skipping* the blocks that contain no candidate ref. The win
+	// scales with the fraction of blocks pruned: at 90% block coverage we still skip 10%
+	// of the (potentially ~200 MB) block payloads, plus the second-pass decode + VM eval
+	// for those blocks.
+	//
+	// The previous guard fell back to the full block scan whenever candidates covered more
+	// than HALF the blocks (uniqueBlocks*2 > BlockCount). That 50% cliff discarded the fast
+	// path for a broad-but-not-universal intrinsic predicate (the dominant production shape,
+	// e.g. `{kind = server}`, which is present in most blocks of a large file) — abandoning
+	// real block-pruning savings the moment coverage crossed 50%. With ~1400 internal blocks
+	// per large file this manifested as the fast path silently disabling itself above ~700
+	// matching blocks (issue #384).
+	//
+	// Fall back only when the pre-filter prunes a negligible fraction of blocks — i.e. its
+	// candidate set covers (nearly) all blocks — so the ref-building / grouping / sort
+	// overhead is not repaid by any block skipping. The threshold is the inverse of
+	// minPruneShiftCDsel: prune at least 1/2^minPruneShiftCDsel of the blocks to stay on
+	// the fast path. This is a general coverage heuristic with no benchmark-specific tuning.
 	if !isPureIntrinsic {
 		uniqueBlocks := countUniqueBlockIdxs(refs)
-		if uniqueBlocks*2 > r.BlockCount() {
+		total := r.BlockCount()
+		prunedBlocks := total - uniqueBlocks
+		if prunedBlocks <= total>>minPruneShiftCDsel {
 			qs.ExecutionPath = ExecPathIntrinsicNeedBlock
 			return nil, *qs, errNeedBlockScan
 		}
