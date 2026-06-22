@@ -617,3 +617,14 @@ func AnalyzeFileLayout(r *Reader) (report *FileLayoutReport, err error) {
 func ClearReaderCaches() {
 	modules_reader.ClearCaches()
 }
+
+// ToCSection describes one entry in the file's Table of Contents.
+type ToCSection = modules_reader.ToCSection
+
+// ColMeta holds per-column metadata from an inner block without decoding column data.
+type ColMeta = modules_reader.ColMeta
+
+// ParseColMetas extracts per-column metadata from block bytes without fully decoding columns.
+func ParseColMetas(blockBytes []byte, meta modules_shared.BlockMeta) ([]ColMeta, error) {
+	return modules_reader.ParseColMetas(blockBytes, meta)
+}

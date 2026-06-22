@@ -1122,3 +1122,28 @@ func (r *Reader) GetBlockWithBytes(
 	}
 	return bwb, nil
 }
+
+// ToCSection describes one entry in the file's Table of Contents.
+type ToCSection struct {
+	Name            string
+	Offset          int64
+	CompressedBytes int64
+	Type            uint32
+	SubType         uint32
+}
+
+// ToCEntries returns all entries in the file's Table of Contents.
+// Cheap — the ToC is fully parsed during NewReaderFromProvider.
+func (r *Reader) ToCEntries() []ToCSection {
+	out := make([]ToCSection, 0, len(r.tocMap))
+	for k, e := range r.tocMap {
+		out = append(out, ToCSection{
+			Type:            k.Type,
+			SubType:         k.SubType,
+			Name:            k.Name,
+			Offset:          int64(e.Offset), //nolint:gosec
+			CompressedBytes: int64(e.Length), //nolint:gosec
+		})
+	}
+	return out
+}

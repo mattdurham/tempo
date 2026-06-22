@@ -32,28 +32,7 @@ func sortPending(pending []pendingSpan) {
 	}
 
 	slices.SortFunc(indices, func(ai, bi int) int {
-		a, b := &pending[ai], &pending[bi]
-		if a.svcName != b.svcName {
-			if a.svcName < b.svcName {
-				return -1
-			}
-			return 1
-		}
-		if a.spanName != b.spanName {
-			if a.spanName < b.spanName {
-				return -1
-			}
-			return 1
-		}
-		for i := range 4 {
-			if a.minHashSig[i] != b.minHashSig[i] {
-				if a.minHashSig[i] < b.minHashSig[i] {
-					return -1
-				}
-				return 1
-			}
-		}
-		return bytes.Compare(a.traceID[:], b.traceID[:])
+		return spanSortKeyCmp(&pending[ai], &pending[bi])
 	})
 
 	// Apply the permutation with a single O(n) copy pass.
@@ -62,6 +41,60 @@ func sortPending(pending []pendingSpan) {
 		sorted[i] = pending[idx]
 	}
 	copy(pending, sorted)
+}
+
+// spanSortKeyCmp is the active span ordering comparator. It is a var (not a
+// direct call) solely so the NOTE-466 (issue #385) investigation benchmark can
+// swap in candidate orders to measure their compression / range-index trade-off
+// end-to-end through the real writer. Production always uses compareSpanSortKey;
+// the benchmark restores it after each run.
+var spanSortKeyCmp = compareSpanSortKey
+
+// compareSpanSortKey is the production span ordering comparator (NOTE-457):
+//
+//	(service.name ASC, span.name ASC, MinHashSig ASC, TraceID ASC)
+//
+// service.name / span.name primary keys keep blocks value-homogeneous so the
+// exact-value range-index fast path (min==max per block → zero false positives)
+// fires for {resource.service.name = X} and {span.name = X} equality queries.
+// MinHash tertiary preserves attribute-set similarity within a (service, name)
+// group; TraceID quaternary keeps a trace's same-group spans physically adjacent.
+//
+// NOTE-466: issue #385 evaluated promoting MinHash to the primary key
+// (MinHash, TraceID) and a coarse bucket-then-sort hybrid. See NOTES.md NOTE-466
+// for the measured trade-off; this ordering is retained because the range-index
+// homogeneity it guarantees is worth more than the marginal cross-service
+// compression gain MinHash-primary offers.
+func compareSpanSortKey(a, b *pendingSpan) int {
+	if a.svcName != b.svcName {
+		if a.svcName < b.svcName {
+			return -1
+		}
+		return 1
+	}
+	if a.spanName != b.spanName {
+		if a.spanName < b.spanName {
+			return -1
+		}
+		return 1
+	}
+	if c := compareMinHashSig(&a.minHashSig, &b.minHashSig); c != 0 {
+		return c
+	}
+	return bytes.Compare(a.traceID[:], b.traceID[:])
+}
+
+// compareMinHashSig lexicographically compares two 4-word MinHash signatures.
+func compareMinHashSig(a, b *[4]uint64) int {
+	for i := range 4 {
+		if a[i] != b[i] {
+			if a[i] < b[i] {
+				return -1
+			}
+			return 1
+		}
+	}
+	return 0
 }
 
 // computeMinHashSigFromProto computes a compact MinHash signature for a pendingSpan's attribute set.

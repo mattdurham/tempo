@@ -839,3 +839,54 @@ func (r *Reader) readRange(offset, length uint64, dt rw.DataType) ([]byte, error
 
 	return buf, nil
 }
+
+// ColMeta holds per-column metadata from an inner block without decoding column data.
+type ColMeta struct {
+	Name            string
+	ColType         shared.ColumnType
+	Kind            uint8 // encoding kind byte (byte 1 of decompressed blob: enc_version[0]+kind[1])
+	CompressedBytes uint32
+	UncompressedLen uint32
+}
+
+// ParseColMetas extracts column metadata from block bytes without decoding any column data.
+func ParseColMetas(blockBytes []byte, _ shared.BlockMeta) ([]ColMeta, error) {
+	if len(blockBytes) < int(shared.BlockHeaderV14Size) {
+		return nil, fmt.Errorf("ParseColMetas: block too short (%d bytes)", len(blockBytes))
+	}
+	hdr, err := parseBlockHeader(blockBytes)
+	if err != nil {
+		return nil, fmt.Errorf("ParseColMetas: %w", err)
+	}
+	entries, _, err := parseColumnMetadataArray(
+		blockBytes,
+		int(shared.BlockHeaderV14Size),
+		int(hdr.columnCount),
+		hdr.version,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("ParseColMetas: metadata: %w", err)
+	}
+	out := make([]ColMeta, 0, len(entries))
+	for _, e := range entries {
+		cm := ColMeta{
+			Name:            e.name,
+			ColType:         e.colType,
+			CompressedBytes: e.compressedLen,
+			UncompressedLen: e.uncompressedLen,
+		}
+		// Peek kind byte: decompressed blob = enc_version[1] + kind[1] + ...
+		if len(e.inlineData) >= 2 {
+			cm.Kind = e.inlineData[1]
+		} else if e.compressedLen >= 2 {
+			blobEnd := int(e.dataOffset) + int(e.compressedLen)
+			if blobEnd <= len(blockBytes) {
+				if dec, derr := snappy.Decode(nil, blockBytes[e.dataOffset:blobEnd]); derr == nil && len(dec) >= 2 {
+					cm.Kind = dec[1]
+				}
+			}
+		}
+		out = append(out, cm)
+	}
+	return out, nil
+}

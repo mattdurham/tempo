@@ -207,19 +207,21 @@ reader streams pages and never materializes a whole column. With both write- and
 memory bounded independent of total file rows, the 10M section-drop bought no memory safety —
 it only disabled the fast path.
 
-**Decision:** Raise `MaxIntrinsicRows` to `100_000_000`. It remains a var (tests lower it) and
-keeps the same all-or-nothing `overCap()` semantics — it is now purely a sanity guard against
-pathological files. 100M is principled, not benchmark-tuned: a single-column rebuild at 100M
-rows is ≈1–2 GiB transient (trace:id ≈ 20B value + 4B ref), within `MaxMetadataSize` (2 GiB),
-and comfortably above realistic large files (≈50M rows) so they keep their intrinsic fast path.
+**Decision (initial):** Raise `MaxIntrinsicRows` to `100_000_000` as a sanity guard. 100M is
+principled, not benchmark-tuned: a single-column rebuild at 100M rows is ≈1–2 GiB transient,
+within `MaxMetadataSize` (2 GiB), and comfortably above realistic large files (≈50M rows).
 
-**Test:** `TestMaxIntrinsicRows_OverCap` now reads the original threshold from
-`modules_shared.MaxIntrinsicRows` (was a hardcoded `10_000_000` literal) so it tracks the
-constant; it still lowers the cap to 5 to exercise both below- and above-cap section emission.
+**Decision (final, commit dafcf3e8):** Remove `MaxIntrinsicRows` entirely. After observing that
+even the raised 100M value left a visible cliff (blocks with >100M spans still emitted an empty
+intrinsic section), the cap was removed completely. With NOTE-461 in place both write-time
+memory (O(largest single column rebuild)) and read-time memory (paged streaming) are bounded
+independent of total row count — the cap provided no remaining safety. `overCap()` on both
+accumulators is retained as an always-false stub for interface compatibility; `TestMaxIntrinsicRows_OverCap`
+and related tests were deleted as they tested behaviour that no longer exists.
 
-**Back-ref:** `internal/modules/blockio/shared/constants.go:MaxIntrinsicRows`,
-`internal/modules/blockio/writer/intrinsic_accum.go:overCap`,
-`internal/modules/blockio/writer/intrinsic_tempfile.go:overCap`,
+**Back-ref:** `internal/modules/blockio/shared/constants.go` (MaxIntrinsicRows removed),
+`internal/modules/blockio/writer/intrinsic_accum.go:overCap` (always false),
+`internal/modules/blockio/writer/intrinsic_tempfile.go:overCap` (always false),
 `internal/modules/blockio/writer/v8_sections.go:writeV8IntrinsicBlobs`,
 `internal/modules/executor/metrics_trace_intrinsic.go:metricsColumnsAreIntrinsic`
 
@@ -1150,3 +1152,44 @@ that feeds `feedSpanTreeFromAccum`); old ToC entries are never copied forward.
 
 **Codec & predicates** live in `shared/spantree.go` (EncodeSpanTreeRecord/DecodeSpanTreeRecord,
 IsDescendant/IsAncestor/IsRoot/AreSiblings) so writer and reader share one wire format.
+
+---
+
+## NOTE-466: MinHash-primary sort order rejected (issue #385)
+*Added: 2026-06-23*
+
+**Decision:** Keep the production span order `(service.name, span.name, MinHash, TraceID)`
+(NOTE-457). Issue #385 proposed inverting to MinHash-primary `(MinHash, TraceID)` or a coarse
+8-bit bucket hybrid `(MinHashBucket8, TraceID)` on the hypothesis that attribute-set similarity
+clustering — independent of service/span name — would improve column compression. **It does
+not.** Both candidates were rejected.
+
+**Method:** `compareSpanSortKey` was extracted into a swappable package var `spanSortKeyCmp`
+(default = the production comparator). A reproducible white-box benchmark
+(`sort_order_investigation_test.go`, `TestSortOrderInvestigation_MinHashPrimary`) writes one
+representative multi-service corpus — where attribute "shapes" deliberately cross-cut services,
+the best case for the proposal — end-to-end through the real writer under each order, then
+measures total compressed file size and per-block distinct service.name / span.name counts.
+
+**Findings (representative corpus, 22 blocks):**
+- File size: MinHash-primary was *larger* than prod; the bucket hybrid was larger still. The
+  proposed compression win does not materialize — it regresses.
+- Range-index homogeneity: prod keeps blocks near single-service (because service.name is the
+  primary key) — ~2 distinct services/block — while both candidates scatter every service into
+  every block (= service count/block). Dropping service.name as the primary key destroys the
+  NOTE-457 exact-value range-index fast path (min==max ⇒ zero-false-positive equality pruning)
+  for `{resource.service.name = X}`, the single most common metrics filter.
+
+**Why the hypothesis failed:** the ID columns (span:id, trace:id, span:parent_id) dominate
+compressed bytes at ~1.0x regardless of order, so the addressable string-column fraction is
+small; and `span:name` already compresses extremely well under the current order because
+span.name is a primary key. MinHash-primary trades away guaranteed service/name homogeneity
+(real query-pruning value) for marginal, here-negative, string-column gains.
+
+**Reproduce:** `go test ./internal/modules/blockio/writer/ -run TestSortOrderInvestigation -v`
+The candidate comparators live test-only in `export_test.go`
+(`CompareSpanSortKeyMinHashPrimaryForTest`, `CompareSpanSortKeyMinHashBucketForTest`) so they
+are not dead code in production.
+
+**Back-ref:** `internal/modules/blockio/writer/writer_sort.go:compareSpanSortKey`,
+`internal/modules/blockio/writer/sort_order_investigation_test.go`.
