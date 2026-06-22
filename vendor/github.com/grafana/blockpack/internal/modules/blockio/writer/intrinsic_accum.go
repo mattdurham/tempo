@@ -36,22 +36,13 @@ func newIntrinsicAccumulator() *intrinsicAccumulator {
 	}
 }
 
-// overCap reports whether any single column exceeds MaxIntrinsicRows.
+// overCap formerly capped the intrinsic section at MaxIntrinsicRows rows and
+// returned true (causing writeV8IntrinsicBlobs to emit an empty section) when
+// exceeded. Removed: the original memory concern (O(all-spans × all-columns)
+// in RAM) was fixed by NOTE-461 (per-column temp-file spill), so the cap was
+// a performance cliff with no remaining benefit. Always returns false so the
+// caller interface is satisfied without changing call sites in tests.
 func (a *intrinsicAccumulator) overCap() bool {
-	for _, c := range a.flatCols {
-		if len(c.uint64Values)+len(c.bytesValues) > shared.MaxIntrinsicRows {
-			return true
-		}
-	}
-	for _, c := range a.dictCols {
-		total := 0
-		for _, e := range c.entries {
-			total += len(e.refs)
-		}
-		if total > shared.MaxIntrinsicRows {
-			return true
-		}
-	}
 	return false
 }
 

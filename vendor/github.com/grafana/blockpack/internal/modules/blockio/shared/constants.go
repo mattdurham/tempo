@@ -460,26 +460,6 @@ const (
 	EmbeddingAllTextColumnName = "__embedding_all_text__"
 )
 
-// MaxIntrinsicRows is the safety cap on accumulated rows in a single intrinsic column.
-// If any one column exceeds this, the entire intrinsic section is written empty (TOC with
-// 0 columns), which disables the zero-block-read intrinsic fast path for that file.
-// Declared as a var (not const) so tests can temporarily lower it without writing huge files.
-//
-// NOTE-465 (issue #384): raised from 10_000_000 to 100_000_000. The 10M value was set when
-// the file-level intrinsic section was accumulated entirely in memory (O(all columns × all
-// spans) — tens of GiB, the OOM source fixed by NOTE-461). After NOTE-461 the writer spills
-// per-column rows to disk and rebuilds ONE column at a time at Flush(), so peak write RSS is
-// O(largest single column's rows); and the on-disk column blobs are page-encoded
-// (deltaPageSize=1024 / paged dict), so the reader never materializes a whole column either.
-// With both bounds in place the 10M section-drop was a pure performance cliff: production
-// files assigned ~814–3,598 blocks (≈11–50M rows) silently lost their intrinsic section and
-// fell back to full block fetch even when a query was fully intrinsic-covered. 100M keeps a
-// sanity guard against pathological files (a single-column rebuild at 100M rows is ≈1–2 GiB
-// transient, within MaxMetadataSize) while covering realistic large files with headroom.
-//
-// WARNING: production code must never modify this variable. Only tests may override it,
-// and they must restore the original value via defer (see TestMaxIntrinsicRows_OverCap).
-var MaxIntrinsicRows = 100_000_000
 
 // Limits per SPECS §1.1
 const (

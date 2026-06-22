@@ -188,14 +188,9 @@ func (t *tempFileAccum) addInt64(name string, colType shared.ColumnType, val int
 	return nil
 }
 
-// overCap reports whether any single column exceeds MaxIntrinsicRows. Matches the in-memory
-// accumulator's overCap semantics: when true the intrinsic section is written empty.
+// overCap formerly dropped the intrinsic section when any column exceeded MaxIntrinsicRows.
+// Removed (see intrinsic_accum.go). Always returns false.
 func (t *tempFileAccum) overCap() bool {
-	for _, cs := range t.cols {
-		if cs.count > shared.MaxIntrinsicRows {
-			return true
-		}
-	}
 	return false
 }
 

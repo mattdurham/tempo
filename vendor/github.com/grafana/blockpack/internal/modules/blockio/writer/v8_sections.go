@@ -232,7 +232,7 @@ func (w *Writer) writeV8FileSections(sw *v8SectionWriter) error {
 // Intrinsic blobs are already snappy-compressed; they are NOT re-compressed via writeToCEntry.
 func (w *Writer) writeV8IntrinsicBlobs(sw *v8SectionWriter) error {
 	a := w.intrinsicAccum
-	if a == nil || a.overCap() {
+	if a == nil {
 		return nil
 	}
 	for _, name := range a.columnNames() {
