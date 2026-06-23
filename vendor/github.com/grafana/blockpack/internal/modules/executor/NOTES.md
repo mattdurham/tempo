@@ -7280,3 +7280,50 @@ cached timestamp blob alone). See `fullFetchSkippedExecPaths`.
 **Back-ref:** `otel_spans.go:PlannerSpanStats,emitPlannerSpan,emitFastPathPlannerSpan,fullFetchSkippedExecPaths`,
 `stream.go:totalSpansOfRefBlocks,collectFromIntrinsicRefs`, `metrics_trace.go:ExecuteTraceMetrics`,
 `stream_structural.go`. SPEC-OBS-002 / SPEC-OBS-005.
+
+---
+
+## NOTE-470 — Structural `>>` descendant via SpanTree DFS intervals (issue #388 step 3)
+
+Completes the structural half of #388: the descendant operator (`>>`) is served from the
+SpanTree's precomputed DFS in/out intervals instead of the per-trace `span:parent_id` →
+`parentIdx` map plus the memoized ancestor-chain walk (NOTE-392).
+
+**Activation.** `useSpanTreeDescendant := r.HasSpanTree() && len(ops) == 1 && ops[0] ==
+OpDescendant`, decided once in `ExecuteStructural`. It is intentionally narrow — only a single
+`>>` op. The other operators (`>`, `~`, `<<`, and all negations) and multi-node chains still
+need real parent identity / sibling grouping, which the DFS intervals alone do not provide, so
+they keep the parent-map path (`resolveStructuralParentIndices` + the per-op evaluators).
+Legacy (no-SpanTree) files always take the parent-map path.
+
+**Three savings on the fast path:**
+1. `span:parent_id` is dropped from `buildStructuralBlockPlan`'s `intrinsicWant` — the intrinsic
+   section column is never scattered/decoded per block.
+2. The per-trace `byID` parent map build and `parentIdx` resolution are skipped:
+   `compactQualifiedStructuralTraces` runs only the NOTE-382/NOTE-383 `traceCanMatch`
+   compaction (so SpanTree records are fetched only for traces that can emit), no map.
+3. The ancestor-chain walk is replaced by an O(spans log spans) DFS-interval sweep.
+
+**Sweep correctness (`evalOpDescendantStructSpanTree`).** Join the per-trace structural records
+(authoritative node-match bits + `(blockIdx,rowIdx)`) to `SpanTreeForTrace(traceID)` records
+(DFSIn/DFSOut keyed by `(BlockIdx,RowIdx)`). A span R (node-1, `nodeMatch&0x02`) is a descendant
+of some L (node-0, `nodeMatch&0x01`) iff some L strictly contains R: `L.DFSIn < R.DFSIn &&
+R.DFSOut < L.DFSOut` (`shared.IsDescendant` semantics). Implemented as a single sweep over
+bracket events: open(L.DFSIn), close(L.DFSOut), query(R.DFSIn). Because a trace's DFS numbers are
+one monotonic counter, in/out coordinates nest as balanced brackets, so the count of currently
+**open** L intervals at a query point equals the number of L ancestors enclosing R. Same-coordinate
+events are ordered `close(0) < query(1) < open(2)` so a span that matches BOTH sides never counts
+its own open bracket as its own ancestor (self-exclusion). A multiply-enclosed R emits once (it is
+a single query event). DFS numbers are unique per trace, so `L.DFSIn == R.DFSIn` only for `L==R`.
+
+**Multi-block / shard interaction.** `SpanTreeForTrace` returns ALL records for the trace
+regardless of shard, but the sweep only contains intervals for spans actually collected in this
+shard (those with a node-match bit). If the LHS ancestor is in a pruned/other shard it is not in
+the sweep → no match — identical to the existing NOTE-091 limitation, no new false positives or
+negatives. A trace whose chunk lookup returns no records yields no matches (parentIdx is
+unresolved on this path).
+
+**Back-ref:** `stream_structural.go:ExecuteStructural,collectAllStructuralSpans,
+buildStructuralBlockPlan,compactQualifiedStructuralTraces,evalStructuralMatches,
+evalOpDescendantStructSpanTree`, `reader/spantree.go:SpanTreeForTrace`,
+`shared/spantree.go:IsDescendant`. Tests: `stream_structural_spantree_test.go`.

@@ -101,6 +101,15 @@ func ExecuteStructural(
 		return nil, err
 	}
 
+	// NOTE-470 (issue #388 step 3): the descendant operator (>>) can be served from the
+	// SpanTree's precomputed DFS in/out intervals instead of the per-trace parentID→index map
+	// and the ancestor-chain walk. A single `>>` op against a SpanTree-bearing file uses the
+	// interval path: span:parent_id is never decoded from the intrinsic section, the per-trace
+	// byID parent map is never built, and descendant containment is an O(spans log spans) DFS
+	// interval sweep (shared.IsDescendant semantics) over the trace's SpanTree records. All other
+	// operators (>, ~, <<, negations) and legacy (no-SpanTree) files keep the parent-map path.
+	useSpanTreeDescendant := r.HasSpanTree() && len(ops) == 1 && ops[0] == traceqlparser.OpDescendant
+
 	traceSpans, parsedBlocks, err := collectAllStructuralSpans(
 		ctx,
 		r,
@@ -109,15 +118,22 @@ func ExecuteStructural(
 		opts.TimeRange,
 		opts.StartBlock,
 		opts.BlockCount,
+		useSpanTreeDescendant,
 	)
 	if err != nil {
 		return nil, err
 	}
 
-	traceSpans = resolveStructuralParentIndices(traceSpans, ops)
+	if useSpanTreeDescendant {
+		// SpanTree path: only the per-trace match-qualification compaction is needed; parentIdx
+		// resolution is skipped because the DFS intervals supersede it (NOTE-470).
+		traceSpans = compactQualifiedStructuralTraces(traceSpans, ops)
+	} else {
+		traceSpans = resolveStructuralParentIndices(traceSpans, ops)
+	}
 
 	result := &StructuralResult{}
-	if err := evalStructuralMatches(traceSpans, parsedBlocks, ops, opts, result); err != nil {
+	if err := evalStructuralMatches(traceSpans, parsedBlocks, ops, opts, result, r, useSpanTreeDescendant); err != nil {
 		return nil, err
 	}
 	return result, nil
@@ -172,6 +188,7 @@ func collectAllStructuralSpans(
 	ops []traceqlparser.StructuralOp,
 	tr queryplanner.TimeRange,
 	startBlock, blockCount int,
+	useSpanTreeDescendant bool,
 ) ([][]structuralSpanRec, map[int]*modules_reader.Block, error) {
 	// NOTE-091: Each structural node is a regular filter program with an added relationship
 	// constraint. Block selection uses planBlocks per program — the same bloom/range/intrinsic-TOC
@@ -261,7 +278,7 @@ func collectAllStructuralSpans(
 	// the nodesList on every block (collectBlockStructuralSpanRecs was a top alloc frame: the
 	// per-block wantColumns map rebuild alone was ~16MB/op in the structural bench). The shared
 	// plan is read-only across blocks.
-	bp := buildStructuralBlockPlan(r, programs, progBlockSets)
+	bp := buildStructuralBlockPlan(r, programs, progBlockSets, useSpanTreeDescendant)
 
 	// NOTE-373: accumulate span records into a single FLAT slice across all blocks instead of
 	// appending into result[traceID] per row. The previous map-append (result[traceID] =
@@ -450,13 +467,20 @@ func buildStructuralBlockPlan(
 	r *modules_reader.Reader,
 	programs []*vm.Program,
 	progBlockSets []map[int]struct{},
+	useSpanTreeDescendant bool,
 ) structuralBlockPlan {
 	hasIntrinsic := r.HasIntrinsicSection()
 
+	// NOTE-470: span:parent_id is only needed to reconstruct parent topology for the
+	// parent-map path. When the descendant operator is served from SpanTree DFS intervals,
+	// parent topology comes from the SpanTree records, so the parent_id intrinsic column is
+	// never decoded — drop it from the per-block intrinsic identity set.
 	intrinsicWant := map[string]struct{}{
-		colNameTraceID:  {},
-		colNameSpanID:   {},
-		colNameParentID: {},
+		colNameTraceID: {},
+		colNameSpanID:  {},
+	}
+	if !useSpanTreeDescendant {
+		intrinsicWant[colNameParentID] = struct{}{}
 	}
 
 	// NOTE-447: compute nodesList BEFORE the column split so we know which programs have
@@ -927,6 +951,27 @@ func resolveStructuralParentIndices(
 	return traceSpans[:w]
 }
 
+// compactQualifiedStructuralTraces is the SpanTree-descendant counterpart to
+// resolveStructuralParentIndices (NOTE-470). The DFS-interval descendant evaluator does not use
+// parentIdx, so the per-trace byID parent map build and parentIdx resolution are skipped
+// entirely. Only the NOTE-382/NOTE-383 qualification compaction is retained: traces that cannot
+// produce a structural match (traceCanMatch == false) are dropped in place so the evaluator only
+// fetches SpanTree records for traces that can emit. Order-preserving, reuses the backing array.
+func compactQualifiedStructuralTraces(
+	traceSpans [][]structuralSpanRec,
+	ops []traceqlparser.StructuralOp,
+) [][]structuralSpanRec {
+	w := 0
+	for _, spans := range traceSpans {
+		if ops != nil && !traceCanMatch(spans, ops) {
+			continue
+		}
+		traceSpans[w] = spans
+		w++
+	}
+	return traceSpans[:w]
+}
+
 // evalStructuralMatches evaluates the structural operator(s) for each trace and
 // appends matching terminal spans to result. Stops early if limit is reached.
 func evalStructuralMatches(
@@ -935,6 +980,8 @@ func evalStructuralMatches(
 	ops []traceqlparser.StructuralOp,
 	opts Options,
 	result *StructuralResult,
+	r *modules_reader.Reader,
+	useSpanTreeDescendant bool,
 ) error {
 	// NOTE-385: scratch is a single per-call buffer reused across all traces for the matched
 	// right-side index slice. The single-op evaluators (the dominant 2-node path, e.g. {a}>>{b})
@@ -951,10 +998,21 @@ func evalStructuralMatches(
 		// NOTE-377: every record in a window shares the trace ID (grouped contiguously); read it
 		// from the first record instead of a map key.
 		traceID := spans[0].traceID
-		// NOTE-383: traceCanMatch is NOT re-run here. resolveStructuralParentIndices already
-		// compacted traceSpans to the qualified subset, so every trace reaching this loop is
-		// known to pass the gate. Re-scanning here would duplicate the OR-over-nodeMatch work.
-		rightIndices := applyStructuralOps(spans, ops, scratch[:0])
+		// NOTE-383: traceCanMatch is NOT re-run here. resolveStructuralParentIndices /
+		// compactQualifiedStructuralTraces already compacted traceSpans to the qualified subset,
+		// so every trace reaching this loop is known to pass the gate. Re-scanning here would
+		// duplicate the OR-over-nodeMatch work.
+		var rightIndices []int
+		if useSpanTreeDescendant {
+			// NOTE-470: descendant via SpanTree DFS intervals; parentIdx is unused on this path.
+			var derr error
+			rightIndices, derr = evalOpDescendantStructSpanTree(r, traceID, spans, scratch[:0])
+			if derr != nil {
+				return derr
+			}
+		} else {
+			rightIndices = applyStructuralOps(spans, ops, scratch[:0])
+		}
 		scratch = rightIndices
 
 		// NOTE-079: slices.Sort + dedup replaces map[int]struct{} — zero extra allocs.
@@ -1107,6 +1165,135 @@ func evalOpDescendantStruct(spans []structuralSpanRec, dst []int) []int {
 		}
 	}
 	return result
+}
+
+// dfsInterval is a span's DFS in/out pair plus the node-0/node-1 match bits and the index of
+// the span in the per-trace window, used by the SpanTree descendant sweep (NOTE-470).
+type dfsInterval struct {
+	dfsIn     uint32
+	dfsOut    uint32
+	spanIdx   int
+	nodeMatch uint8
+}
+
+// evalOpDescendantStructSpanTree evaluates the descendant operator (>>) using the SpanTree's
+// precomputed DFS in/out intervals instead of the parentID→index map and ancestor-chain walk
+// (NOTE-470). It joins the per-trace structural span records (which carry the authoritative
+// node-match bits and (blockIdx, rowIdx)) to the SpanTree records for the same trace (which
+// carry DFSIn/DFSOut keyed by (BlockIdx, RowIdx)), then determines, for each node-1 (RHS) span,
+// whether any node-0 (LHS) span is a strict ancestor.
+//
+// Containment is decided with a single DFS-coordinate sweep over bracket events (open at an
+// LHS span's DFSIn, close at its DFSOut, query at an RHS span's DFSIn). Because the SpanTree's
+// DFS numbers form one monotonic counter per trace, the in/out coordinates nest as balanced
+// brackets, so the count of currently-open LHS intervals at a query point equals the number of
+// LHS ancestors enclosing that span. Events at the same coordinate are ordered close < query <
+// open so a span that is both LHS and RHS never counts itself as its own ancestor. This is
+// O(spans log spans) per trace (the sort) and replaces the O(spans)-amortized parent walk
+// while eliminating the span:parent_id decode and the per-trace byID map build.
+//
+// Falls back to the parent-map descendant evaluator (evalOpDescendantStruct) when the SpanTree
+// has no records for the trace (e.g. a trace split such that the chunk lookup misses) — but in
+// that fallback parentIdx is -1 for every span (compactQualifiedStructuralTraces did not resolve
+// it), so the fallback simply yields no matches. A trace with SpanTree records always uses the
+// interval path.
+func evalOpDescendantStructSpanTree(
+	r *modules_reader.Reader,
+	traceID [16]byte,
+	spans []structuralSpanRec,
+	dst []int,
+) ([]int, error) {
+	recs, err := r.SpanTreeForTrace(traceID)
+	if err != nil {
+		return dst, err
+	}
+	if len(recs) == 0 {
+		// No SpanTree records for this trace — nothing can be resolved to an ancestor.
+		return dst, nil
+	}
+
+	// Index SpanTree records by (blockIdx, rowIdx) so each structural record can read its DFS
+	// interval. Span IDs are unique within a trace, but (blockIdx, rowIdx) is the join key the
+	// structural records already carry (NOTE-373).
+	type blockRef struct {
+		block uint16
+		row   uint16
+	}
+	dfsByRef := make(map[blockRef]struct {
+		in  uint32
+		out uint32
+	}, len(recs))
+	for _, rec := range recs {
+		dfsByRef[blockRef{rec.BlockIdx, rec.RowIdx}] = struct {
+			in  uint32
+			out uint32
+		}{rec.DFSIn, rec.DFSOut}
+	}
+
+	// Build the interval list for the trace's structural spans (those that carry a node match).
+	intervals := make([]dfsInterval, 0, len(spans))
+	for i := range spans {
+		sp := &spans[i]
+		if sp.nodeMatch == 0 {
+			continue
+		}
+		d, ok := dfsByRef[blockRef{sp.blockIdx, sp.rowIdx}]
+		if !ok {
+			continue
+		}
+		intervals = append(intervals, dfsInterval{
+			dfsIn:     d.in,
+			dfsOut:    d.out,
+			spanIdx:   i,
+			nodeMatch: sp.nodeMatch,
+		})
+	}
+	if len(intervals) == 0 {
+		return dst, nil
+	}
+
+	// Sweep events. Event kinds at the same coordinate are ordered close(0) < query(1) < open(2)
+	// so an LHS span's own open does not count toward its own RHS query.
+	type sweepEvent struct {
+		coord   uint32
+		kind    uint8 // 0 = close LHS, 1 = query RHS, 2 = open LHS
+		spanIdx int   // valid only for query events
+	}
+	events := make([]sweepEvent, 0, len(intervals)*2)
+	for _, iv := range intervals {
+		if iv.nodeMatch&0x01 != 0 { // LHS (node 0): contributes open/close brackets
+			events = append(events, sweepEvent{coord: iv.dfsIn, kind: 2})
+			events = append(events, sweepEvent{coord: iv.dfsOut, kind: 0})
+		}
+		if iv.nodeMatch&0x02 != 0 { // RHS (node 1): contributes a query
+			events = append(events, sweepEvent{coord: iv.dfsIn, kind: 1, spanIdx: iv.spanIdx})
+		}
+	}
+	slices.SortFunc(events, func(a, b sweepEvent) int {
+		if a.coord != b.coord {
+			if a.coord < b.coord {
+				return -1
+			}
+			return 1
+		}
+		return int(a.kind) - int(b.kind)
+	})
+
+	result := dst
+	open := 0
+	for _, ev := range events {
+		switch ev.kind {
+		case 0: // close LHS
+			open--
+		case 1: // query RHS
+			if open > 0 {
+				result = append(result, ev.spanIdx)
+			}
+		case 2: // open LHS
+			open++
+		}
+	}
+	return result, nil
 }
 
 // evalOpChildStruct: R's direct parent is L (>).
