@@ -218,13 +218,19 @@ func buildBlock(
 			if ps.srcReader != nil {
 				k := readerBlockKey{ps.srcReader, ps.srcBlockIdx}
 				// feedIntrinsicsFromIndex is only needed for v4+ blocks that store
-				// identity columns (trace:id, span:id, etc.) exclusively in the
-				// intrinsic section. For v3 blocks that use dual storage (same fields
-				// in both block columns and the intrinsic section), addRowFromBlock
-				// has already written these fields via applyTraceID and friends.
+				// identity columns (trace:id, span:id, span:parent_id) exclusively in
+				// the intrinsic section. For legacy dual-storage blocks (same fields in
+				// both block columns and the intrinsic section), addRowFromBlock has
+				// already written these fields via applyTraceID and friends — the block
+				// column iteration in addRowFromBlock visits each identity column.
 				// Calling feedIntrinsicsFromIndex for a dual-storage block would
 				// append a second entry to the intrinsic accumulator for the same
 				// (blockIdx, rowIdx), causing GetTraceByID to return each span twice.
+				//
+				// NOTE-469 (issue #389): freshly-written and recompacted v4+ blocks have
+				// no trace:id block column, so this gate routes them through
+				// feedIntrinsicsFromIndex, which carries all three identity columns
+				// (incl. span:parent_id) from the source intrinsic section.
 				if ps.srcBlock.GetColumn(traceIDColumnName) == nil {
 					bb.feedIntrinsicsFromIndex(intrinsicIndexCache[k], ps.srcRowIdx, rowIdx)
 				}
@@ -385,26 +391,26 @@ func (b *blockBuilder) feedDedicatedAttrValue(name string, val shared.AttrValue,
 	}
 }
 
-// feedSpanIdentifiers writes trace:id, span:id, and span:parent_id to the accumulator
-// and block columns. spanID and parentSpanID are written only when non-empty.
+// feedSpanIdentifiers writes trace:id, span:id, and span:parent_id to the intrinsic
+// accumulator only. spanID and parentSpanID are written only when non-empty.
+//
+// NOTE-469 (issue #389, completes NOTE-050): these three identity columns are stored
+// exclusively in the intrinsic section, NOT duplicated into per-inner-block column
+// payloads. All readers source them from the intrinsic section (or the SpanTree for
+// GetTraceByID, NOTE-468) — see writer/NOTES.md NOTE-469 for the full callsite audit.
+// The block-column writes (addPresent) and range-index updates (updateMinMax) for these
+// columns are therefore removed; trace:id was never range-indexed (unique per trace) and
+// span:id/span:parent_id min/max are unused for block pruning.
 func (b *blockBuilder) feedSpanIdentifiers(traceID, spanID, parentSpanID []byte, rowIdx int) {
-	// trace:id — always present; excluded from the range index.
+	// trace:id — always present.
 	b.feedIntrinsicBytes(traceIDColumnName, shared.ColumnTypeBytes, traceID, rowIdx)
-	b.addPresent(rowIdx, traceIDColumnName, shared.ColumnTypeBytes,
-		shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: traceID})
 
 	if len(spanID) > 0 {
-		b.updateMinMax(spanIDColumnName, shared.ColumnTypeBytes, string(spanID))
 		b.feedIntrinsicBytes(spanIDColumnName, shared.ColumnTypeBytes, spanID, rowIdx)
-		b.addPresent(rowIdx, spanIDColumnName, shared.ColumnTypeBytes,
-			shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: spanID})
 	}
 
 	if len(parentSpanID) > 0 {
-		b.updateMinMax(spanParentIDColumnName, shared.ColumnTypeBytes, string(parentSpanID))
 		b.feedIntrinsicBytes(spanParentIDColumnName, shared.ColumnTypeBytes, parentSpanID, rowIdx)
-		b.addPresent(rowIdx, spanParentIDColumnName, shared.ColumnTypeBytes,
-			shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: parentSpanID})
 	}
 }
 
@@ -774,8 +780,12 @@ func readDynAttrValue(col *modules_reader.Column, rowIdx int, baseType shared.Co
 	return val, true
 }
 
-// applyTraceID feeds trace:id into the intrinsic accumulator and writes to block column (dual storage).
-// Returns the extracted traceID and whether it was valid (used for bookkeeping).
+// applyTraceID feeds trace:id into the intrinsic accumulator (NOTE-469: intrinsic-only,
+// no block column). Returns the extracted traceID and whether it was valid.
+//
+// NOTE-469: this path fires only when compacting a legacy dual-storage source block that
+// still carries the trace:id block column. v4+ sources have no such column; their identity
+// fields are carried via feedIntrinsicsFromIndex instead (see appendBlockBuilders).
 func (b *blockBuilder) applyTraceID(
 	col *modules_reader.Column,
 	srcRowIdx, dstRowIdx int,
@@ -783,42 +793,24 @@ func (b *blockBuilder) applyTraceID(
 	if v, ok := col.BytesValue(srcRowIdx); ok && len(v) == 16 {
 		copy(traceID[:], v)
 		b.feedIntrinsicBytes("trace:id", shared.ColumnTypeBytes, v, dstRowIdx)
-		b.addPresent(
-			dstRowIdx,
-			traceIDColumnName,
-			shared.ColumnTypeBytes,
-			shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: v},
-		)
 		return traceID, true
 	}
 	return traceID, false
 }
 
-// applySpanID feeds span:id into the intrinsic accumulator and writes to block column (dual storage).
+// applySpanID feeds span:id into the intrinsic accumulator (NOTE-469: intrinsic-only,
+// no block column). Legacy-source path only — see applyTraceID.
 func (b *blockBuilder) applySpanID(col *modules_reader.Column, srcRowIdx, dstRowIdx int) {
 	if v, ok := col.BytesValue(srcRowIdx); ok && len(v) > 0 {
-		b.updateMinMax(spanIDColumnName, shared.ColumnTypeBytes, string(v))
 		b.feedIntrinsicBytes(spanIDColumnName, shared.ColumnTypeBytes, v, dstRowIdx)
-		b.addPresent(
-			dstRowIdx,
-			spanIDColumnName,
-			shared.ColumnTypeBytes,
-			shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: v},
-		)
 	}
 }
 
-// applySpanParentID feeds span:parent_id into the intrinsic accumulator and writes to block column (dual storage).
+// applySpanParentID feeds span:parent_id into the intrinsic accumulator (NOTE-469:
+// intrinsic-only, no block column). Legacy-source path only — see applyTraceID.
 func (b *blockBuilder) applySpanParentID(col *modules_reader.Column, srcRowIdx, dstRowIdx int) {
 	if v, ok := col.BytesValue(srcRowIdx); ok && len(v) > 0 {
-		b.updateMinMax(spanParentIDColumnName, shared.ColumnTypeBytes, string(v))
 		b.feedIntrinsicBytes(spanParentIDColumnName, shared.ColumnTypeBytes, v, dstRowIdx)
-		b.addPresent(
-			dstRowIdx,
-			spanParentIDColumnName,
-			shared.ColumnTypeBytes,
-			shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: v},
-		)
 	}
 }
 
@@ -1115,10 +1107,14 @@ func buildIntrinsicBlockIndex(r *modules_reader.Reader, srcBlockIdx int) intrins
 	}
 	// Only scan identity columns that v4+ blocks store exclusively in the intrinsic
 	// section. All other intrinsic columns (span:kind, span:status, resource.service.name,
-	// span:start, span:duration, span:name, span:parent_id, etc.) are present in block
-	// columns and are already written by addRowFromBlock — rebuilding them here would be
-	// redundant and was the dominant CPU cost (dict-entry scan at ~40% of compaction CPU).
-	identityOnly := []string{traceIDColumnName, spanIDColumnName}
+	// span:start, span:duration, span:name, etc.) are present in block columns and are
+	// already written by addRowFromBlock — rebuilding them here would be redundant and was
+	// the dominant CPU cost (dict-entry scan at ~40% of compaction CPU).
+	//
+	// NOTE-469 (issue #389): span:parent_id joins trace:id and span:id here. With the block
+	// column dropped, addRowFromBlock no longer visits span:parent_id, so it must be carried
+	// from the source intrinsic section during compaction or it would be lost on recompaction.
+	identityOnly := []string{traceIDColumnName, spanIDColumnName, spanParentIDColumnName}
 	out := make(intrinsicRowFields)
 	for _, colName := range identityOnly {
 		col, err := r.GetIntrinsicColumn(colName)
@@ -1161,12 +1157,16 @@ func buildIntrinsicBlockIndex(r *modules_reader.Reader, srcBlockIdx int) intrins
 	return out
 }
 
-// feedIntrinsicsFromIndex copies trace:id and span:id from a pre-built per-block
-// identity index into this block's intrinsic accumulator at dstRowIdx. Only these
-// two columns require the index because v4+ blocks store them exclusively in the
-// intrinsic section (not in block columns). All other intrinsic values (span:kind,
-// resource.service.name, span:status, span:duration, etc.) are present in block
-// columns and are already written by addRowFromBlock — no index needed for them.
+// feedIntrinsicsFromIndex copies trace:id, span:id, and span:parent_id from a pre-built
+// per-block identity index into this block's intrinsic accumulator at dstRowIdx. Only
+// these columns require the index because v4+ blocks store them exclusively in the
+// intrinsic section (not in block columns, NOTE-469). All other intrinsic values
+// (span:kind, resource.service.name, span:status, span:duration, etc.) are present in
+// block columns and are already written by addRowFromBlock — no index needed for them.
+//
+// NOTE-469 (issue #389): feeds the intrinsic accumulator only — no addPresent block-column
+// write — so the compacted output keeps these three columns exclusively in the intrinsic
+// section, matching freshly-ingested blocks.
 func (b *blockBuilder) feedIntrinsicsFromIndex(index intrinsicRowFields, srcRowIdx, dstRowIdx int) {
 	if index == nil || b.intrinsicAccum == nil {
 		return
@@ -1178,24 +1178,16 @@ func (b *blockBuilder) feedIntrinsicsFromIndex(index intrinsicRowFields, srcRowI
 	if v, ok := fields[traceIDColumnName]; ok {
 		if bv, ok := v.([]byte); ok {
 			b.feedIntrinsicBytes(traceIDColumnName, shared.ColumnTypeBytes, bv, dstRowIdx)
-			b.addPresent(
-				dstRowIdx,
-				traceIDColumnName,
-				shared.ColumnTypeBytes,
-				shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: bv},
-			)
 		}
 	}
 	if v, ok := fields[spanIDColumnName]; ok {
 		if bv, ok := v.([]byte); ok {
-			b.updateMinMax(spanIDColumnName, shared.ColumnTypeBytes, string(bv))
 			b.feedIntrinsicBytes(spanIDColumnName, shared.ColumnTypeBytes, bv, dstRowIdx)
-			b.addPresent(
-				dstRowIdx,
-				spanIDColumnName,
-				shared.ColumnTypeBytes,
-				shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: bv},
-			)
+		}
+	}
+	if v, ok := fields[spanParentIDColumnName]; ok {
+		if bv, ok := v.([]byte); ok {
+			b.feedIntrinsicBytes(spanParentIDColumnName, shared.ColumnTypeBytes, bv, dstRowIdx)
 		}
 	}
 }

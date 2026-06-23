@@ -1226,6 +1226,14 @@ small; and `span:name` already compresses extremely well under the current order
 span.name is a primary key. MinHash-primary trades away guaranteed service/name homogeneity
 (real query-pruning value) for marginal, here-negative, string-column gains.
 
+**POST-NOTE-469 UPDATE:** NOTE-469 (issue #389) removed the ID columns from block payloads
+(they are now intrinsic-only). With the ~1.0x ID columns no longer in block payloads, the
+remaining attribute columns ARE sort-sensitive, and MinHash-primary now yields a small (~2%)
+file-size win. The compression-based rejection no longer holds, so DECISION INVARIANT 2 in
+`sort_order_investigation_test.go` was narrowed to bucket8 (which remains strictly larger).
+The decision to keep prod order is UNCHANGED: DECISION INVARIANT 1 (service homogeneity for
+the NOTE-457 range-index fast path) was always the load-bearing reason and still holds.
+
 **Reproduce:** `go test ./internal/modules/blockio/writer/ -run TestSortOrderInvestigation -v`
 The candidate comparators live test-only in `export_test.go`
 (`CompareSpanSortKeyMinHashPrimaryForTest`, `CompareSpanSortKeyMinHashBucketForTest`) so they
@@ -1233,3 +1241,54 @@ are not dead code in production.
 
 **Back-ref:** `internal/modules/blockio/writer/writer_sort.go:compareSpanSortKey`,
 `internal/modules/blockio/writer/sort_order_investigation_test.go`.
+
+---
+
+## NOTE-469 — Identity columns intrinsic-only: remove block-payload dual storage (issue #389)
+
+Completes the original NOTE-050 decision: `trace:id`, `span:id`, and `span:parent_id` are
+stored EXCLUSIVELY in the file-level intrinsic section and are no longer duplicated into
+per-inner-block column payloads. This was deferred until #388 (NOTE-468) gave `GetTraceByID`
+a block-scoped span-ID lookup (`SpanTreeForTrace`) that does not need the block `trace:id`/
+`span:id` columns — removing them earlier would have forced the whole-file intrinsic-scan
+fallback that NOTE-293 fixed (a ~70% trace-by-ID regression).
+
+**What changed in the writer:**
+- `feedSpanIdentifiers` (ingest path) now feeds the intrinsic accumulator only — the
+  `addPresent` block-column writes and `updateMinMax` range-index updates for these three
+  columns are removed (trace:id was never range-indexed; span:id/parent_id min/max were
+  unused for pruning).
+- `applyTraceID`/`applySpanID`/`applySpanParentID` (compaction of legacy dual-storage source
+  blocks) likewise feed the intrinsic accumulator only.
+- `buildIntrinsicBlockIndex` + `feedIntrinsicsFromIndex` now carry `span:parent_id` in
+  addition to `trace:id`/`span:id`. This is REQUIRED: with the block column gone,
+  `addRowFromBlock` no longer visits `span:parent_id` for v4+ sources, so it must be carried
+  from the source intrinsic section or it would be lost on recompaction.
+
+**All read paths are served from the intrinsic section (or the SpanTree):**
+- `reader.go:GetTraceByID` — SpanTree `SpanTreeForTrace` returns exact `(blockIdx, rowIdx)` +
+  span IDs; `spanIDByRef` is authoritative. Block-column scan and intrinsic-scan are fallbacks
+  for pre-SpanTree files only.
+- `executor/stream_structural.go` — intrinsic-section files use
+  `lookupIntrinsicFieldsTypedForBlock` (`intrinsicWant` includes all three identity cols);
+  `identityFieldsFromBlockColsTyped` is the `!hasIntrinsic` legacy-only path.
+- `executor/executor.go:SpanMatchFromRow` — `GetColumn==nil` → `lookupIntrinsicFields`
+  (O(log N) `EnsureRefIndex`).
+- `compaction/compaction.go:dedupeKey` — block column first, else `idIndex` from
+  `buildDedupeIndex` (intrinsic section, O(N)/block).
+- `query_helpers.go`/`query_traceql.go` — `extractIDs` falls through to lazily-built
+  intrinsic ref maps when block columns are absent.
+
+**Removed:** `Writer.AddRow` (writer.go) — a test-only variant that hard-required identity
+block columns and had no source-reader for the intrinsic fallback, so it could not process a
+block written under this change. Tests migrated to `AddRowFromReader` (the production
+compaction path, which supplies identity from the source intrinsic section).
+
+**Size impact:** the three identity columns are ~47% of inner-block column data; removing them
+recovers their compressed bytes per file (single-digit percent of total file for ID-light
+files, larger for ID-heavy ones).
+
+**Back-ref:** `internal/modules/blockio/writer/writer_block.go:feedSpanIdentifiers`,
+`internal/modules/blockio/writer/writer_block.go:applyTraceID`/`applySpanID`/`applySpanParentID`,
+`internal/modules/blockio/writer/writer_block.go:buildIntrinsicBlockIndex`/`feedIntrinsicsFromIndex`,
+`internal/modules/blockio/reader/testsupport.go:BuildSyntheticIdentityBlock` (legacy-path test support).
