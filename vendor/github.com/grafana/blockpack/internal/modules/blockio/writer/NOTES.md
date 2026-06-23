@@ -1292,3 +1292,40 @@ files, larger for ID-heavy ones).
 `internal/modules/blockio/writer/writer_block.go:applyTraceID`/`applySpanID`/`applySpanParentID`,
 `internal/modules/blockio/writer/writer_block.go:buildIntrinsicBlockIndex`/`feedIntrinsicsFromIndex`,
 `internal/modules/blockio/reader/testsupport.go:BuildSyntheticIdentityBlock` (legacy-path test support).
+
+## NOTE-471 — Typed intrinsic row index: kill per-row map allocation (issue #391)
+
+`buildIntrinsicBlockIndex` previously returned `map[uint16]map[string]any` — one inner
+`map[string]any` (≈10-entry backing array) allocated **per span row**. On a 2.6M-span L1
+block that is 2.6M map allocations; Pyroscope showed this single line holding ~59% of live
+heap (~170 GB across 50 compaction workers) and driving `runtime.gcDrain` to ~23% CPU during
+compaction, stalling the backlog and starving metrics queries.
+
+**Fix:** the index only ever carries the three identity columns (`trace:id`, `span:id`,
+`span:parent_id`, per NOTE-469), all of which are bytes columns. Replaced the nested map with
+a fixed three-field struct in a single dense slice indexed by `rowIdx`:
+
+```go
+type intrinsicRowEntry struct{ traceID, spanID, parentID []byte }
+type intrinsicRowFields struct{ rows []intrinsicRowEntry }
+```
+
+- One slice grow instead of O(spans) map allocations — no per-row heap, no map iteration.
+- Each field is a `[]byte` view aliasing the decoded column buffer (same zero-copy reference
+  semantics the old map values had).
+- `valid()` distinguishes "no intrinsic section" (zero value, `rows == nil`) from "section
+  present but empty" (`rows == []`), preserving the early-return contract
+  `feedIntrinsicsFromIndex` relies on.
+
+**Latent-bug fix folded in:** the old dict-format branch stored `entry.Value` (a `string`),
+but `feedIntrinsicsFromIndex` only handled `v.([]byte)` — so dict-encoded identity columns
+silently dropped their IDs. The new code converts `entry.Value` to `[]byte` once per distinct
+dict entry. (Identity columns are high-cardinality and almost always flat/XOR, so this path is
+rarely hit, but it is now correct.)
+
+**Dead code removed:** `AddRowFromReader` had a svcName fallback that read
+`idx[rowIdx][svcNameColumnName]`, but `buildIntrinsicBlockIndex` never populated svcName
+(identity-only since NOTE-469) — the fallback could never hit. Removed with the map.
+
+**Back-ref:** `internal/modules/blockio/writer/writer_block.go:buildIntrinsicBlockIndex`/
+`feedIntrinsicsFromIndex`/`intrinsicRowFields`, `internal/modules/blockio/writer/writer.go:AddRowFromReader`.

@@ -824,10 +824,8 @@ func (w *Writer) AddRowFromReader(block *reader.Block, rowIdx int, srcReader *re
 	}
 	if len(traceBytes) != 16 && srcReader != nil {
 		idx := w.getOrBuildAddRowIndex(srcReader, srcBlockIdx)
-		if idx != nil {
-			if v, ok := idx[uint16(rowIdx)]["trace:id"]; ok { //nolint:gosec // rowIdx bounded by SpanCount (≤65535)
-				traceBytes, _ = v.([]byte)
-			}
+		if entry, ok := idx.get(rowIdx); ok {
+			traceBytes = entry.traceID
 		}
 	}
 	if len(traceBytes) != 16 {
@@ -837,18 +835,13 @@ func (w *Writer) AddRowFromReader(block *reader.Block, rowIdx int, srcReader *re
 	var tid [16]byte
 	copy(tid[:], traceBytes)
 
-	// svcName and spanName — block column if present, otherwise O(1) index lookup.
+	// svcName and spanName come from block columns only. NOTE-471 (issue #391): the
+	// intrinsic index carries identity columns exclusively (trace:id, span:id,
+	// span:parent_id), so there is no index fallback for svcName — the prior fallback
+	// could never hit and was removed with the per-row map.
 	var svcName, spanName string
 	if col := block.GetColumn(svcNameColumnName); col != nil {
 		svcName, _ = col.StringValue(rowIdx)
-	}
-	if svcName == "" && srcReader != nil {
-		idx := w.getOrBuildAddRowIndex(srcReader, srcBlockIdx)
-		if idx != nil {
-			if v, ok := idx[uint16(rowIdx)][svcNameColumnName]; ok { //nolint:gosec // rowIdx bounded by SpanCount (≤65535)
-				svcName, _ = v.(string)
-			}
-		}
 	}
 	if col := block.GetColumn(spanNameColumnName); col != nil {
 		spanName, _ = col.StringValue(rowIdx)

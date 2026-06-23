@@ -5,6 +5,7 @@ package writer
 import (
 	"bufio"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -96,6 +97,13 @@ func newTempFileAccum(scratchDir string) (*tempFileAccum, error) {
 // always feeds a given intrinsic column with one fixed type).
 func (t *tempFileAccum) spillFor(name string, kind spillKind, colType shared.ColumnType) (*columnSpill, error) {
 	if cs, ok := t.cols[name]; ok {
+		// Guard against mixed-type writes to the same column (e.g. span.server.port arriving
+		// as both string "443" and int64 443 from different OTLP instrumentation). Returning
+		// an error here causes the caller to skip the entry rather than corrupting the spill
+		// file with incompatible wire formats, which would produce an unrecoverable EOF on read.
+		if cs.kind != kind {
+			return nil, &errKindMismatch{name: name, existing: cs.kind, requested: kind}
+		}
 		return cs, nil
 	}
 	f, err := os.CreateTemp(t.dir, "col-*")
@@ -112,24 +120,27 @@ func (t *tempFileAccum) spillFor(name string, kind spillKind, colType shared.Col
 	return cs, nil
 }
 
-func spillRefHeader(w *bufio.Writer, blockIdx, rowIdx uint16) {
-	var b [4]byte
-	binary.LittleEndian.PutUint16(b[0:2], blockIdx)
-	binary.LittleEndian.PutUint16(b[2:4], rowIdx)
-	_, _ = w.Write(b[:])
+// spillEntry writes one complete spill record (ref header + payload) atomically into a
+// single 12- or (12+N)-byte buffer so that a write error cannot leave the file mid-entry.
+// Returns an error if the underlying bufio.Writer is in a failed state.
+func spillEntry(w *bufio.Writer, blockIdx, rowIdx uint16, payload []byte) error {
+	// Encode header + payload into a single buffer to avoid a partial write window.
+	buf := make([]byte, 4+len(payload))
+	binary.LittleEndian.PutUint16(buf[0:2], blockIdx)
+	binary.LittleEndian.PutUint16(buf[2:4], rowIdx)
+	copy(buf[4:], payload)
+	_, err := w.Write(buf)
+	return err
 }
 
-func spillUint64(w *bufio.Writer, v uint64) {
-	var b [8]byte
-	binary.LittleEndian.PutUint64(b[:], v)
-	_, _ = w.Write(b[:])
-}
-
-func spillBytes(w *bufio.Writer, v []byte) {
-	var b [4]byte
-	binary.LittleEndian.PutUint32(b[:], uint32(len(v))) //nolint:gosec // value length bounded by span size
-	_, _ = w.Write(b[:])
-	_, _ = w.Write(v)
+// spillEntryUint64 writes a ref header + 8-byte uint64 payload in one call.
+func spillEntryUint64(w *bufio.Writer, blockIdx, rowIdx uint16, v uint64) error {
+	var buf [12]byte
+	binary.LittleEndian.PutUint16(buf[0:2], blockIdx)
+	binary.LittleEndian.PutUint16(buf[2:4], rowIdx)
+	binary.LittleEndian.PutUint64(buf[4:12], v)
+	_, err := w.Write(buf[:])
+	return err
 }
 
 // addUint64 spills one uint64 row (span:start, span:duration) for a flat column.
@@ -138,8 +149,9 @@ func (t *tempFileAccum) addUint64(name string, colType shared.ColumnType, val ui
 	if err != nil {
 		return err
 	}
-	spillRefHeader(cs.w, blockIdx, rowIdx)
-	spillUint64(cs.w, val)
+	if err := spillEntryUint64(cs.w, blockIdx, rowIdx, val); err != nil {
+		return fmt.Errorf("intrinsic spill %q: write: %w", name, err)
+	}
 	cs.count++
 	return nil
 }
@@ -154,8 +166,13 @@ func (t *tempFileAccum) addBytes(name string, colType shared.ColumnType, val []b
 	if err != nil {
 		return err
 	}
-	spillRefHeader(cs.w, blockIdx, rowIdx)
-	spillBytes(cs.w, val)
+	// Encode length-prefixed payload.
+	payload := make([]byte, 4+len(val))
+	binary.LittleEndian.PutUint32(payload[:4], uint32(len(val))) //nolint:gosec // value length bounded by span size
+	copy(payload[4:], val)
+	if err := spillEntry(cs.w, blockIdx, rowIdx, payload); err != nil {
+		return fmt.Errorf("intrinsic spill %q: write: %w", name, err)
+	}
 	cs.count++
 	return nil
 }
@@ -170,8 +187,14 @@ func (t *tempFileAccum) addString(name string, colType shared.ColumnType, val st
 	if err != nil {
 		return err
 	}
-	spillRefHeader(cs.w, blockIdx, rowIdx)
-	spillBytes(cs.w, []byte(val))
+	// Encode length-prefixed payload.
+	b := []byte(val)
+	payload := make([]byte, 4+len(b))
+	binary.LittleEndian.PutUint32(payload[:4], uint32(len(b))) //nolint:gosec // value length bounded by span size
+	copy(payload[4:], b)
+	if err := spillEntry(cs.w, blockIdx, rowIdx, payload); err != nil {
+		return fmt.Errorf("intrinsic spill %q: write: %w", name, err)
+	}
 	cs.count++
 	return nil
 }
@@ -182,14 +205,42 @@ func (t *tempFileAccum) addInt64(name string, colType shared.ColumnType, val int
 	if err != nil {
 		return err
 	}
-	spillRefHeader(cs.w, blockIdx, rowIdx)
-	spillUint64(cs.w, uint64(val)) //nolint:gosec // reinterpreting int64 bits as uint64 for binary encoding
+	if err := spillEntryUint64(cs.w, blockIdx, rowIdx, uint64(val)); err != nil { //nolint:gosec // reinterpreting int64 bits as uint64 for binary encoding
+		return fmt.Errorf("intrinsic spill %q: write: %w", name, err)
+	}
 	cs.count++
 	return nil
 }
 
+// errKindMismatch is a sentinel returned by spillFor when a column was first opened with
+// one spillKind and is now written with a different kind. Callers skip the entry rather
+// than aborting the whole flush — the mismatch is caused by mixed-type attribute values
+// (e.g. span.server.port arriving as both string "443" and int64 443) which is valid
+// OpenTelemetry but cannot be stored in the same typed spill column.
+type errKindMismatch struct {
+	name                string
+	existing, requested spillKind
+}
+
+func (e *errKindMismatch) Error() string {
+	return fmt.Sprintf(
+		"intrinsic spill %q: kind mismatch: column opened as %d, now %d — skipping entry",
+		e.name,
+		e.existing,
+		e.requested,
+	)
+}
+
+// isKindMismatch reports whether err is an errKindMismatch sentinel.
+func isKindMismatch(err error) bool {
+	var kme *errKindMismatch
+	return errors.As(err, &kme)
+}
+
 // overCap formerly dropped the intrinsic section when any column exceeded MaxIntrinsicRows.
 // Removed (see intrinsic_accum.go). Always returns false.
+//
+//nolint:unused // mirrors intrinsicAccumulator.overCap interface; intentionally kept as stub
 func (t *tempFileAccum) overCap() bool {
 	return false
 }
@@ -375,6 +426,9 @@ func (t *tempFileAccum) spillMerge(src *intrinsicAccumulator) error {
 			for i, v := range c.bytesValues {
 				ref := c.refs[i]
 				if err := t.addBytes(name, c.colType, v, ref.BlockIdx, ref.RowIdx); err != nil {
+					if isKindMismatch(err) {
+						continue // skip mismatched-type entry, don't corrupt the spill file
+					}
 					return err
 				}
 			}
@@ -383,6 +437,9 @@ func (t *tempFileAccum) spillMerge(src *intrinsicAccumulator) error {
 		for i, v := range c.uint64Values {
 			ref := c.refs[i]
 			if err := t.addUint64(name, c.colType, v, ref.BlockIdx, ref.RowIdx); err != nil {
+				if isKindMismatch(err) {
+					continue
+				}
 				return err
 			}
 		}
@@ -393,10 +450,16 @@ func (t *tempFileAccum) spillMerge(src *intrinsicAccumulator) error {
 			for _, ref := range e.refs {
 				if isInt64 {
 					if err := t.addInt64(name, c.colType, e.int64Val, ref.BlockIdx, ref.RowIdx); err != nil {
+						if isKindMismatch(err) {
+							continue
+						}
 						return err
 					}
 				} else {
 					if err := t.addString(name, c.colType, e.strVal, ref.BlockIdx, ref.RowIdx); err != nil {
+						if isKindMismatch(err) {
+							continue
+						}
 						return err
 					}
 				}

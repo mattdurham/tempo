@@ -190,7 +190,7 @@ func buildBlock(
 
 	// Pre-build per-(reader, srcBlockIdx) intrinsic index to avoid O(N) linear scans
 	// inside feedIntrinsicsFromIndex. Index is built once per unique (reader, blockIdx)
-	// pair; each row then does an O(1) map lookup.
+	// pair; each row then does an O(1) slice index (NOTE-471).
 	type readerBlockKey struct {
 		r        *modules_reader.Reader
 		blockIdx int
@@ -1088,22 +1088,57 @@ func (b *blockBuilder) finalizeRowBookkeeping(
 	b.spanCount++
 }
 
-// intrinsicRowFields is a per-row value cache built once per source block during compaction.
-// Key: rowIdx (uint16). Value: map of intrinsic field name → typed value.
-// Built by buildIntrinsicBlockIndex; consumed by feedIntrinsicsFromIndex.
-type intrinsicRowFields = map[uint16]map[string]any
+// intrinsicRowEntry holds the per-row identity field values for a single source-block
+// row. The three identity columns (trace:id, span:id, span:parent_id) are all bytes
+// columns, so each field is a []byte view that aliases the decoded column buffer
+// (no per-row copy). A nil field means that column had no value at this row.
+//
+// NOTE-471 (issue #391): replaces the previous per-row map[string]any. The old
+// representation allocated one map (≈10-entry backing array) per span row, which on a
+// 2.6M-span L1 block produced ~170 GB of live heap across compaction workers and drove
+// GC to ~22% CPU. A fixed three-field struct in a single dense slice removes all
+// per-row allocation and map-iteration overhead while preserving O(1) row lookup.
+type intrinsicRowEntry struct {
+	traceID  []byte
+	spanID   []byte
+	parentID []byte
+}
+
+// intrinsicRowFields is a per-row value cache built once per source block during
+// compaction. It is a dense slice indexed by rowIdx (bounded by SpanCount ≤ 65535).
+//
+// NOTE-471 (issue #391): a single backing slice replaces the prior
+// map[uint16]map[string]any to eliminate O(spans) map allocations.
+type intrinsicRowFields struct {
+	rows []intrinsicRowEntry
+}
+
+// get returns the entry for rowIdx and whether it is in range. The bool mirrors the
+// presence semantics of the old map lookup so callers can early-return on a miss.
+func (f intrinsicRowFields) get(rowIdx int) (intrinsicRowEntry, bool) {
+	if rowIdx < 0 || rowIdx >= len(f.rows) {
+		return intrinsicRowEntry{}, false
+	}
+	return f.rows[rowIdx], true
+}
+
+// valid reports whether the index was actually built (vs. a zero value returned when
+// the source reader has no intrinsic section).
+func (f intrinsicRowFields) valid() bool {
+	return f.rows != nil
+}
 
 // buildIntrinsicBlockIndex builds a per-row intrinsic field cache for the given
 // (reader, srcBlockIdx) pair. Each intrinsic column is read once (O(N) over the
 // column's BlockRefs), avoiding the O(N) per-row linear scan done by IntrinsicBytesAt
-// and friends. Returns nil when r has no intrinsic section.
+// and friends. Returns the zero value (valid()==false) when r has no intrinsic section.
 //
-// The result maps typed values using the same Go types that feedIntrinsicsFromIndex
-// switches on: []byte for bytes columns, uint64 for uint64 columns, string for string
-// columns, and int64 for int64 columns.
+// NOTE-471 (issue #391): the result is a dense slice of intrinsicRowEntry indexed by
+// rowIdx. Each identity field is a []byte view aliasing the column's decoded buffer; no
+// per-row allocation is performed beyond the single slice grow.
 func buildIntrinsicBlockIndex(r *modules_reader.Reader, srcBlockIdx int) intrinsicRowFields {
 	if r == nil {
-		return nil
+		return intrinsicRowFields{}
 	}
 	// Only scan identity columns that v4+ blocks store exclusively in the intrinsic
 	// section. All other intrinsic columns (span:kind, span:status, resource.service.name,
@@ -1114,8 +1149,24 @@ func buildIntrinsicBlockIndex(r *modules_reader.Reader, srcBlockIdx int) intrins
 	// NOTE-469 (issue #389): span:parent_id joins trace:id and span:id here. With the block
 	// column dropped, addRowFromBlock no longer visits span:parent_id, so it must be carried
 	// from the source intrinsic section during compaction or it would be lost on recompaction.
+	var out intrinsicRowFields
+	setField := func(rowIdx uint16, colName string, val []byte) {
+		idx := int(rowIdx)
+		if idx >= len(out.rows) {
+			grown := make([]intrinsicRowEntry, idx+1)
+			copy(grown, out.rows)
+			out.rows = grown
+		}
+		switch colName {
+		case traceIDColumnName:
+			out.rows[idx].traceID = val
+		case spanIDColumnName:
+			out.rows[idx].spanID = val
+		case spanParentIDColumnName:
+			out.rows[idx].parentID = val
+		}
+	}
 	identityOnly := []string{traceIDColumnName, spanIDColumnName, spanParentIDColumnName}
-	out := make(intrinsicRowFields)
 	for _, colName := range identityOnly {
 		col, err := r.GetIntrinsicColumn(colName)
 		if err != nil || col == nil {
@@ -1127,32 +1178,30 @@ func buildIntrinsicBlockIndex(r *modules_reader.Reader, srcBlockIdx int) intrins
 				if int(ref.BlockIdx) != srcBlockIdx {
 					continue
 				}
-				if out[ref.RowIdx] == nil {
-					out[ref.RowIdx] = make(map[string]any, 10)
-				}
-				if len(col.Uint64Values) > i {
-					out[ref.RowIdx][colName] = col.Uint64Values[i]
-				} else if len(col.BytesValues) > i {
-					out[ref.RowIdx][colName] = col.BytesValues[i]
+				// Identity columns are bytes columns; only BytesValues carry the raw
+				// 16-/8-byte IDs that feedIntrinsicsFromIndex expects.
+				if len(col.BytesValues) > i {
+					setField(ref.RowIdx, colName, col.BytesValues[i])
 				}
 			}
 		case shared.IntrinsicFormatDict:
 			for _, entry := range col.DictEntries {
+				// Identity columns are bytes columns; the dict stores the raw ID bytes
+				// in Value (as a string). Convert once per distinct entry, not per row.
+				val := []byte(entry.Value)
 				for _, ref := range entry.BlockRefs {
 					if int(ref.BlockIdx) != srcBlockIdx {
 						continue
 					}
-					if out[ref.RowIdx] == nil {
-						out[ref.RowIdx] = make(map[string]any, 10)
-					}
-					if col.Type == shared.ColumnTypeInt64 || col.Type == shared.ColumnTypeRangeInt64 {
-						out[ref.RowIdx][colName] = entry.Int64Val
-					} else {
-						out[ref.RowIdx][colName] = entry.Value
-					}
+					setField(ref.RowIdx, colName, val)
 				}
 			}
 		}
+	}
+	if out.rows == nil {
+		// Mark as a built-but-empty index so callers distinguish "no intrinsic section"
+		// (zero value) from "intrinsic section present but no matching rows".
+		out.rows = []intrinsicRowEntry{}
 	}
 	return out
 }
@@ -1168,27 +1217,21 @@ func buildIntrinsicBlockIndex(r *modules_reader.Reader, srcBlockIdx int) intrins
 // write — so the compacted output keeps these three columns exclusively in the intrinsic
 // section, matching freshly-ingested blocks.
 func (b *blockBuilder) feedIntrinsicsFromIndex(index intrinsicRowFields, srcRowIdx, dstRowIdx int) {
-	if index == nil || b.intrinsicAccum == nil {
+	if !index.valid() || b.intrinsicAccum == nil {
 		return
 	}
-	fields, ok := index[uint16(srcRowIdx)] //nolint:gosec // bounded by SpanCount (<= 65535)
+	fields, ok := index.get(srcRowIdx)
 	if !ok {
 		return
 	}
-	if v, ok := fields[traceIDColumnName]; ok {
-		if bv, ok := v.([]byte); ok {
-			b.feedIntrinsicBytes(traceIDColumnName, shared.ColumnTypeBytes, bv, dstRowIdx)
-		}
+	if fields.traceID != nil {
+		b.feedIntrinsicBytes(traceIDColumnName, shared.ColumnTypeBytes, fields.traceID, dstRowIdx)
 	}
-	if v, ok := fields[spanIDColumnName]; ok {
-		if bv, ok := v.([]byte); ok {
-			b.feedIntrinsicBytes(spanIDColumnName, shared.ColumnTypeBytes, bv, dstRowIdx)
-		}
+	if fields.spanID != nil {
+		b.feedIntrinsicBytes(spanIDColumnName, shared.ColumnTypeBytes, fields.spanID, dstRowIdx)
 	}
-	if v, ok := fields[spanParentIDColumnName]; ok {
-		if bv, ok := v.([]byte); ok {
-			b.feedIntrinsicBytes(spanParentIDColumnName, shared.ColumnTypeBytes, bv, dstRowIdx)
-		}
+	if fields.parentID != nil {
+		b.feedIntrinsicBytes(spanParentIDColumnName, shared.ColumnTypeBytes, fields.parentID, dstRowIdx)
 	}
 }
 
