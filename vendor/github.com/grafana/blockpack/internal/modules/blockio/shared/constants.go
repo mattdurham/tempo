@@ -136,12 +136,31 @@ const (
 	// whole); each chunk is independently snappy-compressed so a lookup range-reads + decodes
 	// only the chunk(s) that can contain a target trace ID. Within a chunk the records are
 	// fixed-stride (SpanTreeRecordSize), enabling binary search on traceID without full decode.
-	SpanTreeMagic   uint32 = 0xC01DC3DE
-	SpanTreeVersion uint8  = 0x01
-	// SpanTreeHeaderSize is the fixed leading-header size in bytes:
+	SpanTreeMagic uint32 = 0xC01DC3DE
+	// SpanTreeVersion is the current SpanTree section version. v2 (issue #388) appends a
+	// per-chunk span-ID bloom region after the chunk directory and adds spanBloomOff[4] +
+	// spanBloomStride[4] to the header (bytes 36..44). v1 readers stop at SpanTreeHeaderSizeV1
+	// and never see those fields, so v2 files are still readable by the v1 trace-by-ID path;
+	// v2 readers detect a v1 file by version and skip the span-bloom region.
+	SpanTreeVersion   uint8 = 0x02
+	SpanTreeVersionV1 uint8 = 0x01
+	// SpanTreeHeaderSizeV1 is the v1 fixed leading-header size in bytes:
 	// magic[4]+version[1]+reserved[3]+block_count[4]+trace_count[4]+span_count[4]+
 	// chunk_count[4]+dir_off[4]+bloom_off[4]+bloom_len[4] = 36 bytes.
-	SpanTreeHeaderSize = 36
+	SpanTreeHeaderSizeV1 = 36
+	// SpanTreeHeaderSize is the v2 fixed leading-header size in bytes: the v1 header plus
+	// span_bloom_off[4] + span_bloom_stride[4] = 44 bytes. span_bloom_off is the section-
+	// relative offset of the per-chunk span-ID bloom region; span_bloom_stride is the fixed
+	// byte size of each chunk's span-ID bloom (SpanTreeChunkBloomSize). A zero stride means no
+	// span-bloom region was written.
+	SpanTreeHeaderSize = 44
+	// SpanTreeChunkBloomSize is the fixed byte size of one chunk's span-ID bloom filter. 8 KiB
+	// (65536 bits) over ~SpanTreeRecordsPerChunk span IDs gives ≈2% false-positive rate with
+	// SpanIDBloomK hashes, so SpanTreeChunksForSpan returns ≈1 real chunk + ≈0 false positives.
+	SpanTreeChunkBloomSize = 8 << 10
+	// SpanIDBloomK is the number of hash functions for a per-chunk span-ID bloom filter
+	// (Kirsch-Mitzenmacher double hashing over the 8 random span-ID bytes).
+	SpanIDBloomK = 6
 	// SpanTreeDirEntrySize is the size in bytes of one chunk-directory entry:
 	// first_trace_id[16]+comp_off[4]+comp_len[4]+span_count[4] = 28 bytes. The per-chunk
 	// span_count lets a reader size its decode buffer and walk the chunk without a sub-header.
@@ -459,7 +478,6 @@ const (
 	EmbeddingAllColumnName     = "__embedding_all__"
 	EmbeddingAllTextColumnName = "__embedding_all_text__"
 )
-
 
 // Limits per SPECS §1.1
 const (

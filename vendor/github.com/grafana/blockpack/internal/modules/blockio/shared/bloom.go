@@ -58,3 +58,55 @@ func TestTraceIDBloom(bloom []byte, traceID [16]byte) bool {
 	}
 	return true
 }
+
+// NOTE-468 (issue #388): per-chunk span-ID bloom. A SpanTree chunk holds the records of many
+// traces; a span-ID lookup (span→trace) needs to find which chunk(s) may contain a given 8-byte
+// span ID without decoding every chunk. Each sealed chunk carries a fixed-size span-ID bloom
+// (SpanTreeChunkBloomSize); SpanTreeChunksForSpan probes all chunk blooms in memory.
+//
+// Span IDs are only 8 bytes (one uint64), so the Kirsch-Mitzenmacher second hash is derived by
+// mixing the single word rather than reading a second word. The mix constant is the
+// splitmix64 finalizer's odd multiplier, forced odd so the stride covers the filter well.
+
+// spanIDH1H2 derives the two double-hashing seeds from an 8-byte span ID.
+func spanIDH1H2(spanID [8]byte) (h1, h2 uint64) {
+	h1 = binary.LittleEndian.Uint64(spanID[:])
+	// Mix to a well-distributed odd second hash (splitmix64-style finalizer step).
+	z := h1
+	z ^= z >> 30
+	z *= 0xbf58476d1ce4e5b9
+	z ^= z >> 27
+	h2 = z | 1 // force odd for good stride distribution
+	return h1, h2
+}
+
+// AddSpanIDToBloom adds an 8-byte span ID to a fixed-size per-chunk span-ID bloom filter.
+// No-op for nil or empty bloom slices.
+func AddSpanIDToBloom(bloom []byte, spanID [8]byte) {
+	if len(bloom) == 0 {
+		return
+	}
+	m := uint64(len(bloom)) * 8
+	h1, h2 := spanIDH1H2(spanID)
+	for i := range uint64(SpanIDBloomK) {
+		pos := (h1 + i*h2) % m
+		bloom[pos/8] |= 1 << (pos % 8) //nolint:gosec // safe: pos%8 is always 0..7, fits in uint
+	}
+}
+
+// TestSpanIDBloom returns false only if spanID is definitely absent from the filter.
+// Returns true for a nil or empty bloom (vacuous — no false negatives for v1 files).
+func TestSpanIDBloom(bloom []byte, spanID [8]byte) bool {
+	if len(bloom) == 0 {
+		return true
+	}
+	m := uint64(len(bloom)) * 8
+	h1, h2 := spanIDH1H2(spanID)
+	for i := range uint64(SpanIDBloomK) {
+		pos := (h1 + i*h2) % m
+		if bloom[pos/8]&(1<<(pos%8)) == 0 { //nolint:gosec // safe: pos%8 is always 0..7, fits in uint
+			return false
+		}
+	}
+	return true
+}

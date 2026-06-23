@@ -309,9 +309,15 @@ func (s *spanTreeAccum) close() error {
 // spanTreeEncoder accumulates DFS-numbered records one trace at a time into snappy chunks and
 // finalizes the section framing (header + directory + chunks + bloom).
 type spanTreeEncoder struct {
-	chunkBuf   []byte // current uncompressed chunk (concatenated fixed-stride records)
-	dir        []spanTreeDirEnt
-	traceIDs   [][16]byte   // for the bloom (one per trace)
+	chunkBuf []byte // current uncompressed chunk (concatenated fixed-stride records)
+	dir      []spanTreeDirEnt
+	traceIDs [][16]byte // for the trace-ID bloom (one per trace)
+	// NOTE-468 (issue #388): per-chunk span-ID blooms. chunkBloom is the open chunk's
+	// fixed-size span-ID bloom, accumulated as records are appended; on sealChunk it is moved
+	// into spanBlooms (one fixed-size SpanTreeChunkBloomSize entry per sealed chunk, in chunk
+	// order). finish concatenates spanBlooms into the section's span-bloom region.
+	chunkBloom []byte
+	spanBlooms [][]byte
 	compChunks bytes.Buffer // concatenated compressed chunks
 	blockCount int
 	spanCount  int
@@ -332,6 +338,7 @@ func newSpanTreeEncoder(blockCount int) *spanTreeEncoder {
 	return &spanTreeEncoder{
 		blockCount: blockCount,
 		chunkBuf:   make([]byte, 0, shared.SpanTreeRecordsPerChunk*shared.SpanTreeRecordSize),
+		chunkBloom: make([]byte, shared.SpanTreeChunkBloomSize),
 	}
 }
 
@@ -358,6 +365,8 @@ func (e *spanTreeEncoder) emitTrace(recs []spillRecord) error {
 	for i := range dfs {
 		shared.EncodeSpanTreeRecord(rb[:], dfs[i])
 		e.chunkBuf = append(e.chunkBuf, rb[:]...)
+		// NOTE-468: record this span ID in the open chunk's span-ID bloom.
+		shared.AddSpanIDToBloom(e.chunkBloom, dfs[i].SpanID)
 		e.chunkN++
 		e.spanCount++
 	}
@@ -382,6 +391,10 @@ func (e *spanTreeEncoder) sealChunk() {
 		spanCount: uint32(e.chunkN),        //nolint:gosec
 	})
 	e.compChunks.Write(compressed)
+	// NOTE-468: move the open chunk's span-ID bloom into the per-chunk bloom region (one
+	// fixed-size entry per sealed chunk, in chunk order) and reset for the next chunk.
+	e.spanBlooms = append(e.spanBlooms, e.chunkBloom)
+	e.chunkBloom = make([]byte, shared.SpanTreeChunkBloomSize)
 	e.chunkBuf = e.chunkBuf[:0]
 	e.chunkN = 0
 	e.firstIDSet = false
@@ -399,7 +412,13 @@ func (e *spanTreeEncoder) finish() []byte {
 
 	chunkCount := len(e.dir)
 	dirOff := shared.SpanTreeHeaderSize
-	chunksOff := dirOff + chunkCount*shared.SpanTreeDirEntrySize
+	// NOTE-468: layout = header[44] + chunkDir[N×28] + spanBloomRegion[N×8192] +
+	// compressedChunks + traceIDBloom. The span-bloom region sits between the directory and the
+	// compressed chunk bodies so a reader can range-read header+dir+blooms cheaply if desired,
+	// while compOff in the directory points past the bloom region into the chunk bodies.
+	spanBloomOff := dirOff + chunkCount*shared.SpanTreeDirEntrySize
+	spanBloomRegionLen := chunkCount * shared.SpanTreeChunkBloomSize
+	chunksOff := spanBloomOff + spanBloomRegionLen
 	bloomOff := chunksOff + e.compChunks.Len()
 
 	var running int
@@ -430,6 +449,11 @@ func (e *spanTreeEncoder) finish() []byte {
 	out.Write(tmp4[:])
 	binary.LittleEndian.PutUint32(tmp4[:], uint32(bloomSize)) //nolint:gosec
 	out.Write(tmp4[:])
+	// v2 header fields (bytes 36..44): span-bloom region offset + per-chunk bloom stride.
+	binary.LittleEndian.PutUint32(tmp4[:], uint32(spanBloomOff)) //nolint:gosec
+	out.Write(tmp4[:])
+	binary.LittleEndian.PutUint32(tmp4[:], uint32(shared.SpanTreeChunkBloomSize)) //nolint:gosec
+	out.Write(tmp4[:])
 
 	for i := range e.dir {
 		out.Write(e.dir[i].firstID[:])
@@ -439,6 +463,10 @@ func (e *spanTreeEncoder) finish() []byte {
 		out.Write(tmp4[:])
 		binary.LittleEndian.PutUint32(tmp4[:], e.dir[i].spanCount)
 		out.Write(tmp4[:])
+	}
+	// Span-bloom region: one fixed-size bloom per chunk, in chunk order.
+	for i := range e.spanBlooms {
+		out.Write(e.spanBlooms[i])
 	}
 	out.Write(e.compChunks.Bytes())
 	out.Write(bloom)

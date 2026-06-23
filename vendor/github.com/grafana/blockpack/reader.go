@@ -392,31 +392,68 @@ func GetTraceByID(r *Reader, traceIDHex string) (results []SpanMatch, err error)
 		return nil, parseErr
 	}
 
-	// rowsByBlock maps blockID → matching rowIdxs, populated from each block's own trace:id
-	// column. Blocks lacking that column are recorded for the intrinsic fallback below.
+	// rowsByBlock maps blockID → matching rowIdxs. spanIDByRef holds span IDs keyed by
+	// (blockID<<16 | rowIdx) when resolved from a source that already carries them (SpanTree or
+	// the intrinsic fallback), so the materialization loop need not read a per-block span:id
+	// column for those rows.
 	rowsByBlock := make(map[int][]int, len(entries))
+	var spanIDByRef map[uint32][]byte
 	var blocksNeedingIntrinsic map[int]bool
-	for i, entry := range entries {
-		traceIDCol := parsedBlocks[i].Block.GetColumn("trace:id")
-		if traceIDCol == nil {
-			if blocksNeedingIntrinsic == nil {
-				blocksNeedingIntrinsic = make(map[int]bool, len(entries))
-			}
-			blocksNeedingIntrinsic[entry.BlockID] = true
-			continue
+
+	// NOTE-468 (issue #388): SpanTree fast path. SpanTreeForTrace returns the exact
+	// (BlockIdx, RowIdx) and SpanID for every span in the trace, so the per-block trace:id and
+	// span:id column scans below are skipped entirely. This is the block-scoped span-ID lookup
+	// that NOTE-293's per-block column scan provided, but sourced from the structural index
+	// instead of the ID columns — which lets those ID columns be dropped from block payloads
+	// (issue #389 / NOTE-050) without re-introducing the whole-file intrinsic scan regression.
+	stRecs, stErr := r.SpanTreeForTrace(traceID)
+	if stErr != nil {
+		return nil, fmt.Errorf("GetTraceByID: span tree lookup: %w", stErr)
+	}
+	if len(stRecs) > 0 {
+		// blockHasEntry guards against returning rows for blocks not in the trace index entries
+		// (SpanTree is whole-file; entries already scope to blocks that carry the trace).
+		blockHasEntry := make(map[int]bool, len(entries))
+		for _, e := range entries {
+			blockHasEntry[e.BlockID] = true
 		}
-		// NOTE-419: MatchingBytesRows scans the per-block trace:id column for matching rows
-		// while paying the lazy-decode atomic and dense-index expansion ONCE for the whole
-		// block, instead of per row as the prior BytesValue+bytes.Equal loop did.
-		rowsByBlock[entry.BlockID] = traceIDCol.MatchingBytesRows(
-			traceID[:],
-			rowsByBlock[entry.BlockID],
-		)
+		spanIDByRef = make(map[uint32][]byte, len(stRecs))
+		for i := range stRecs {
+			bid := int(stRecs[i].BlockIdx)
+			if !blockHasEntry[bid] {
+				continue
+			}
+			rowIdx := int(stRecs[i].RowIdx)
+			rowsByBlock[bid] = append(rowsByBlock[bid], rowIdx)
+			key := uint32(bid)<<16 | uint32(rowIdx) //nolint:gosec // bounded values
+			sid := make([]byte, 8)
+			copy(sid, stRecs[i].SpanID[:])
+			spanIDByRef[key] = sid
+		}
+	} else {
+		// Fallback (no SpanTree section, e.g. pre-migration files): scan each block's own
+		// trace:id column; blocks lacking that column fall through to the intrinsic section.
+		for i, entry := range entries {
+			traceIDCol := parsedBlocks[i].Block.GetColumn("trace:id")
+			if traceIDCol == nil {
+				if blocksNeedingIntrinsic == nil {
+					blocksNeedingIntrinsic = make(map[int]bool, len(entries))
+				}
+				blocksNeedingIntrinsic[entry.BlockID] = true
+				continue
+			}
+			// NOTE-419: MatchingBytesRows scans the per-block trace:id column for matching rows
+			// while paying the lazy-decode atomic and dense-index expansion ONCE for the whole
+			// block, instead of per row as the prior BytesValue+bytes.Equal loop did.
+			rowsByBlock[entry.BlockID] = traceIDCol.MatchingBytesRows(
+				traceID[:],
+				rowsByBlock[entry.BlockID],
+			)
+		}
 	}
 
-	// Lazy fallback: only files whose blocks lack a trace:id column pay the whole-file
-	// intrinsic reads. For current files (per-block identity present) this is never taken.
-	var spanIDByRef map[uint32][]byte
+	// Lazy fallback: only files whose blocks lack a trace:id column (and no SpanTree) pay the
+	// whole-file intrinsic reads. For current files this is never taken.
 	if len(blocksNeedingIntrinsic) > 0 {
 		fallbackRows, fbErr := intrinsicFallbackRows(r, traceID, blocksNeedingIntrinsic)
 		if fbErr != nil {
@@ -425,8 +462,16 @@ func GetTraceByID(r *Reader, traceIDHex string) (results []SpanMatch, err error)
 		for bid, rows := range fallbackRows {
 			rowsByBlock[bid] = append(rowsByBlock[bid], rows...)
 		}
-		// span:id for fallback blocks also comes from the intrinsic section.
-		spanIDByRef = buildIntrinsicBytesMapForRows(r, "span:id", fallbackRows)
+		// span:id for fallback blocks also comes from the intrinsic section. Merge into any
+		// span IDs already resolved (e.g. from SpanTree) rather than overwriting them.
+		fbSpanIDs := buildIntrinsicBytesMapForRows(r, "span:id", fallbackRows)
+		if spanIDByRef == nil {
+			spanIDByRef = fbSpanIDs
+		} else {
+			for k, v := range fbSpanIDs {
+				spanIDByRef[k] = v
+			}
+		}
 	}
 
 	traceIDStr := hex.EncodeToString(traceID[:])
@@ -440,18 +485,21 @@ func GetTraceByID(r *Reader, traceIDHex string) (results []SpanMatch, err error)
 				rowIdx,
 				nil,
 			)
-			// span:id comes from the block column; fall back to the intrinsic map only for
-			// blocks resolved via the intrinsic fallback above.
+			// span:id: prefer the ref map (resolved from SpanTree or the intrinsic fallback),
+			// which is authoritative and does not depend on a per-block span:id column being
+			// present. Fall back to the block column only when no ref entry exists.
 			spanIDStr := ""
-			if col := bwb.Block.GetColumn("span:id"); col != nil {
-				if v, ok := col.BytesValue(rowIdx); ok {
-					spanIDStr = hex.EncodeToString(v)
-				}
-			}
-			if spanIDStr == "" && spanIDByRef != nil {
+			if spanIDByRef != nil {
 				key := uint32(entry.BlockID)<<16 | uint32(rowIdx) //nolint:gosec // bounded values
 				if v, ok := spanIDByRef[key]; ok {
 					spanIDStr = hex.EncodeToString(v)
+				}
+			}
+			if spanIDStr == "" {
+				if col := bwb.Block.GetColumn("span:id"); col != nil {
+					if v, ok := col.BytesValue(rowIdx); ok {
+						spanIDStr = hex.EncodeToString(v)
+					}
 				}
 			}
 			match := SpanMatch{

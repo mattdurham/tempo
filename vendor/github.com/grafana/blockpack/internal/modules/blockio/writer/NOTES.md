@@ -1155,6 +1155,46 @@ IsDescendant/IsAncestor/IsRoot/AreSiblings) so writer and reader share one wire 
 
 ---
 
+## NOTE-468 — SpanTree per-chunk span-ID blooms + GetTraceByID fast path (issue #388)
+
+SpanTree v2 (`SpanTreeVersion = 0x02`) adds a **per-chunk span-ID bloom region** and wires
+`GetTraceByID` through the SpanTree, which is the prerequisite for dropping the per-block
+`trace:id`/`span:id` columns (issue #389 / NOTE-050) without re-introducing the whole-file
+intrinsic-scan regression NOTE-293 fixed.
+
+**Wire format (v2):** the section grows from a 36-byte header (v1) to a 44-byte header by
+appending `span_bloom_off[4]` + `span_bloom_stride[4]`. The body layout becomes
+`header[44] + chunkDir[N×28] + spanBloomRegion[N×SpanTreeChunkBloomSize] + compressedChunks +
+traceIDBloom` — the span-bloom region sits between the directory and the chunk bodies, and each
+directory entry's `compOff` points past the region into the chunk bodies.
+
+**Per-chunk bloom:** `spanTreeEncoder` accumulates an `SpanTreeChunkBloomSize` (8 KiB) span-ID
+bloom for the open chunk (`shared.AddSpanIDToBloom` on each emitted record), then moves it into
+the region on `sealChunk`. At ~SpanTreeRecordsPerChunk span IDs per chunk with `SpanIDBloomK=6`
+hashes this is ≈2% FPR, so a span lookup admits ≈1 real chunk + ≈0 false positives.
+
+**Backwards compatibility:** the reader accepts both v1 and v2 (`SpanTreeVersionV1`/
+`SpanTreeVersion`). A v1 file has `spanBloomStride == 0`; `SpanTreeChunksForSpan` then reports
+*all* chunks as candidates (vacuously correct, no false negatives) and `TestSpanIDBloom`
+returns true for an empty bloom. v2 files remain readable by the v1 trace-by-ID path because
+the appended header fields and the new region are simply not referenced by it.
+
+**Reader lookups** (reader/spantree.go): `ensureSpanBloomRegion` range-reads the whole region
+in one I/O (cached per-Reader); `SpanTreeChunksForSpan(spanID)` probes every chunk bloom in
+memory; `SpanTreeRecordForSpan(spanID)` resolves a span ID to its `(traceID, blockIdx, rowIdx)`
+record by decoding only the candidate chunk(s) — a span→trace capability that did not exist
+before.
+
+**Executor wiring** (root `reader.go` `GetTraceByID`): when `HasSpanTree()`, `SpanTreeForTrace`
+returns the exact `(BlockIdx, RowIdx)` and `SpanID` for every span in the trace, so the
+per-block `trace:id` column scan (`MatchingBytesRows`) and per-block `span:id` column reads are
+skipped entirely; span IDs are sourced authoritatively from the SpanTree records. The legacy
+per-block-column scan and the whole-file intrinsic fallback are retained only for pre-SpanTree
+files. This does not yet drop the columns from block payloads — that is the follow-up (#389)
+now unblocked.
+
+---
+
 ## NOTE-466: MinHash-primary sort order rejected (issue #385)
 *Added: 2026-06-23*
 
