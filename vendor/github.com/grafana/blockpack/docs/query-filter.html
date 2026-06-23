@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Filter Query — Blockpack</title>
+  <link rel="stylesheet" href="/assets/css/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <a href="/" class="topbar-brand">Blockpack Docs</a>
+    <a href="https://github.com/grafana/blockpack" class="topbar-github">GitHub &rarr;</a>
+  </header>
+  <div class="layout">
+    <nav class="sidebar">
+  <div class="sidebar-brand">BLOCKPACK</div>
+  <div class="section-label">Overview</div>
+  <a href="/">Home</a>
+  <a href="/file-format">File Format</a>
+  <div class="section-label">Query Paths</div>
+  <a href="/query-filter" class="active">Filter Query</a>
+  <a href="/query-intrinsic">Intrinsic Fast-Path</a>
+  <a href="/query-traceid">Trace by ID</a>
+  <a href="/query-metrics">Metrics Query</a>
+  <div class="section-label">Write Path</div>
+  <a href="/write-path">Write Pipeline</a>
+  <div class="section-label">Indexes</div>
+  <a href="/kll">KLL Sketches</a>
+  <a href="/cms">Count-Min Sketch</a>
+  <a href="/topk">TopK</a>
+  <a href="/hll">HyperLogLog</a>
+  <a href="/bloom-filter">Bloom Filters</a>
+  <a href="/intrinsic-columns">Intrinsic Columns</a>
+  <div class="section-label">Blocks</div>
+  <a href="/block-scoring">Block Scoring</a>
+  <a href="/block-format">Block Format</a>
+  <div class="section-label">Performance</div>
+  <a href="/benchmarks/">Benchmarks</a>
+  <a href="/production-results">Production Results</a>
+</nav>
+    <main class="content">
+
+<h1>Filter Query Path</h1>
+<p>The full block-pruning pipeline for a TraceQL filter query. Each stage narrows the candidate blocks before any data is read from storage.</p>
+
+<a href="/interactive/query-filter" class="demo-link">
+  <div class="demo-link-text">
+    <div class="demo-link-title">Open Interactive Demo</div>
+    <div class="demo-link-sub">Step through the 10-stage pruning pipeline with animated block visualization</div>
+  </div>
+  <div class="demo-link-arrow">&rarr;</div>
+</a>
+
+<h2>How It Works</h2>
+<p>When a TraceQL filter query arrives, blockpack runs it through a multi-stage pipeline that progressively narrows the set of blocks before reading any span data. The pipeline is designed for object storage (S3/GCS/Azure) where each I/O request costs 50&ndash;100ms of latency, so eliminating blocks before I/O is critical.</p>
+
+<h3>Stage 1&ndash;3: Preparation (No Pruning)</h3>
+<p>The query string is <strong>parsed</strong> into a typed AST, <strong>compiled</strong> by the VM into a <code>ColumnPredicate</code> closure (for per-span evaluation) and a <code>RangeNode</code> tree (for block-level pruning), then the predicate builder produces a <code>QueryPredicates</code> struct with encoded ranges, bloom keys, and column names.</p>
+
+<h3>Stage 4a: File-Level Bloom</h3>
+<p>Before touching any blocks, blockpack checks a file-level BinaryFuse8 bloom filter over <code>resource.service.name</code>. If the queried service is absent from the entire file, the query returns immediately with <strong>zero I/O</strong>. This is the FBLM section (magic <code>FBLM</code>).</p>
+
+<h3>Stage 4b: Time-Range Reject</h3>
+<p>Each block carries <code>[MinNano, MaxNano]</code> timestamps. Blocks entirely outside the query&rsquo;s time window are dropped. This is the cheapest filter &mdash; purely metadata comparison, no data access.</p>
+
+<h3>Stage 4c: KLL Range Index</h3>
+<p>At write time, a <a href="/kll">KLL quantile sketch</a> builds ~1,000 bucket boundaries per numeric column. Each block is assigned to buckets overlapping its <code>[min, max]</code>. At query time, <strong>interval matching</strong> keeps only blocks with at least one overlapping bucket in the predicate range. For <code>status_code = 500</code>, only blocks whose range includes 500 survive.</p>
+
+<h3>Stage 4d: Block Bloom Filters</h3>
+<p>Each block has a per-column <a href="/bloom-filter">BinaryFuse8 filter</a> over its distinct values. Blocks where the filter definitively rejects a predicate value are dropped. ~0.39% false positive rate.</p>
+
+<h3>Stage 4e: CMS Zero-Estimate</h3>
+<p>For each remaining block, the <a href="/cms">Count-Min Sketch</a> estimate for each queried value is checked. A CMS estimate of zero means the value was <strong>definitively never added</strong> &mdash; CMS never undercounts. This catches bloom filter false positives.</p>
+
+<h3>Stage 5: Block I/O</h3>
+<p>Each surviving block is read in a <strong>single I/O operation</strong> via <code>GetBlockWithBytes</code>. The entire block is always read &mdash; never a subset of columns. This is the only point where storage I/O occurs.</p>
+
+<h3>Stage 6: Column Decode + Span Evaluation</h3>
+<p><code>parseBlockColumnsReuse</code> decodes only the columns referenced by the query. The <code>ColumnPredicate</code> closure evaluates the full predicate tree per span row. Matching rows are emitted via <code>SpanMatchCallback</code>.</p>
+
+<h2>Pruning in Practice</h2>
+<table>
+<thead><tr><th>Stage</th><th>Blocks remaining</th><th>Reduction</th></tr></thead>
+<tbody>
+<tr><td>Start</td><td>100</td><td>&mdash;</td></tr>
+<tr><td>File bloom</td><td>80</td><td>20% of files lack service</td></tr>
+<tr><td>Time range</td><td>40</td><td>50% outside window</td></tr>
+<tr><td>KLL range index</td><td>12</td><td>70% have incompatible ranges</td></tr>
+<tr><td>Block bloom</td><td>5</td><td>58% lack the queried value</td></tr>
+<tr><td>CMS zero-estimate</td><td>4</td><td>1 bloom false positive caught</td></tr>
+<tr><td><strong>Block I/O</strong></td><td><strong>4</strong></td><td>96% eliminated before any read</td></tr>
+</tbody>
+</table>
+
+<h2>Key Invariant</h2>
+<blockquote><strong>One I/O per block &mdash; always read the entire block. Column filtering is always in-memory.</strong></blockquote>
+
+    </main>
+  </div>
+</body>
+</html>

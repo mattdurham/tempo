@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Intrinsic Fast-Path — Blockpack</title>
+  <link rel="stylesheet" href="/assets/css/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <a href="/" class="topbar-brand">Blockpack Docs</a>
+    <a href="https://github.com/grafana/blockpack" class="topbar-github">GitHub &rarr;</a>
+  </header>
+  <div class="layout">
+    <nav class="sidebar">
+  <div class="sidebar-brand">BLOCKPACK</div>
+  <div class="section-label">Overview</div>
+  <a href="/">Home</a>
+  <a href="/file-format">File Format</a>
+  <div class="section-label">Query Paths</div>
+  <a href="/query-filter">Filter Query</a>
+  <a href="/query-intrinsic" class="active">Intrinsic Fast-Path</a>
+  <a href="/query-traceid">Trace by ID</a>
+  <a href="/query-metrics">Metrics Query</a>
+  <div class="section-label">Write Path</div>
+  <a href="/write-path">Write Pipeline</a>
+  <div class="section-label">Indexes</div>
+  <a href="/kll">KLL Sketches</a>
+  <a href="/cms">Count-Min Sketch</a>
+  <a href="/topk">TopK</a>
+  <a href="/hll">HyperLogLog</a>
+  <a href="/bloom-filter">Bloom Filters</a>
+  <a href="/intrinsic-columns">Intrinsic Columns</a>
+  <div class="section-label">Blocks</div>
+  <a href="/block-scoring">Block Scoring</a>
+  <a href="/block-format">Block Format</a>
+  <div class="section-label">Performance</div>
+  <a href="/benchmarks/">Benchmarks</a>
+  <a href="/production-results">Production Results</a>
+</nav>
+    <main class="content">
+
+<h1>Intrinsic Fast-Path</h1>
+<p>The intrinsic fast-path answers queries on intrinsic columns entirely from the file-level intrinsic section &mdash; without reading any block payloads. Zero block I/O.</p>
+
+<a href="/interactive/query-intrinsic" class="demo-link">
+  <div class="demo-link-text">
+    <div class="demo-link-title">Open Interactive Demo</div>
+    <div class="demo-link-sub">Explore the zero-I/O intrinsic fast-path with animated visualization</div>
+  </div>
+  <div class="demo-link-arrow">&rarr;</div>
+</a>
+
+<h2>How It Works</h2>
+<p>When blockpack writes a file, it stores every intrinsic column value in a dedicated <strong>intrinsic section</strong> in the file metadata. Each value is paired with a <code>BlockRef</code> &mdash; a pointer to the exact block and row where that span lives. The values are sorted, enabling O(log N) binary search.</p>
+<p>At query time, if the compiler detects that <strong>every predicate</strong> in the query targets an intrinsic column, it sets <code>intrinsicOnly=true</code> and the executor skips the entire block-pruning pipeline. Instead, it performs a binary search directly on the intrinsic section data. The result is a set of BlockRefs pointing to matching spans &mdash; no block payloads are read at all.</p>
+<p>For queries that only need the intrinsic column values themselves (tag discovery, metrics aggregation), the answer is fully contained in the intrinsic section. For queries that need full span data, the BlockRefs identify the minimal set of blocks to read.</p>
+
+<h2>Which Columns Are Intrinsic</h2>
+<table>
+<thead><tr><th>Column</th><th>Type</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>trace:id</code></td><td>Bytes</td><td>128-bit trace identifier</td></tr>
+<tr><td><code>span:id</code></td><td>Bytes</td><td>64-bit span identifier</td></tr>
+<tr><td><code>span:parent_id</code></td><td>Bytes</td><td>64-bit parent span identifier</td></tr>
+<tr><td><code>span:name</code></td><td>String</td><td>Span operation name</td></tr>
+<tr><td><code>span:duration</code></td><td>Uint64</td><td>Span duration in nanoseconds</td></tr>
+<tr><td><code>span:kind</code></td><td>Int</td><td>Span kind (client, server, producer, consumer, internal)</td></tr>
+<tr><td><code>span:start</code></td><td>Uint64</td><td>Span start timestamp in nanoseconds</td></tr>
+<tr><td><code>span:status</code></td><td>Int</td><td>Span status code (OK, Error, Unset)</td></tr>
+<tr><td><code>span:status_message</code></td><td>String</td><td>Span status message</td></tr>
+<tr><td><code>resource.service.name</code></td><td>String</td><td>Service name from resource attributes</td></tr>
+</tbody>
+</table>
+
+<h2>When This Path Is Used</h2>
+<p>The intrinsic fast-path activates when <strong>all</strong> predicates in a query target intrinsic columns. Examples:</p>
+<ul>
+  <li><code>{ span:duration &gt; 5ms }</code> &mdash; single intrinsic predicate</li>
+  <li><code>{ span:kind = server &amp;&amp; span:duration &gt; 10ms }</code> &mdash; multiple intrinsic predicates</li>
+  <li><code>{ resource.service.name = &quot;frontend&quot; }</code> &mdash; service name is intrinsic</li>
+</ul>
+<p>If <strong>any</strong> predicate targets a non-intrinsic column (e.g., <code>span.http.status_code</code>), the full <a href="/query-filter">block-pruning pipeline</a> is used instead.</p>
+
+<h2>Key Advantage</h2>
+<blockquote><strong>Zero block I/O, O(log N) lookup.</strong> The intrinsic section is stored in the file metadata and read once at file open. Queries on intrinsic columns never touch block payloads, making them orders of magnitude faster than the full pruning pipeline.</blockquote>
+
+    </main>
+  </div>
+</body>
+</html>

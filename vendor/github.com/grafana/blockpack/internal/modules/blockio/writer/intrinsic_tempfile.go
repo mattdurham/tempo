@@ -112,24 +112,27 @@ func (t *tempFileAccum) spillFor(name string, kind spillKind, colType shared.Col
 	return cs, nil
 }
 
-func spillRefHeader(w *bufio.Writer, blockIdx, rowIdx uint16) {
-	var b [4]byte
-	binary.LittleEndian.PutUint16(b[0:2], blockIdx)
-	binary.LittleEndian.PutUint16(b[2:4], rowIdx)
-	_, _ = w.Write(b[:])
+// spillEntry writes one complete spill record (ref header + payload) atomically into a
+// single 12- or (12+N)-byte buffer so that a write error cannot leave the file mid-entry.
+// Returns an error if the underlying bufio.Writer is in a failed state.
+func spillEntry(w *bufio.Writer, blockIdx, rowIdx uint16, payload []byte) error {
+	// Encode header + payload into a single buffer to avoid a partial write window.
+	buf := make([]byte, 4+len(payload))
+	binary.LittleEndian.PutUint16(buf[0:2], blockIdx)
+	binary.LittleEndian.PutUint16(buf[2:4], rowIdx)
+	copy(buf[4:], payload)
+	_, err := w.Write(buf)
+	return err
 }
 
-func spillUint64(w *bufio.Writer, v uint64) {
-	var b [8]byte
-	binary.LittleEndian.PutUint64(b[:], v)
-	_, _ = w.Write(b[:])
-}
-
-func spillBytes(w *bufio.Writer, v []byte) {
-	var b [4]byte
-	binary.LittleEndian.PutUint32(b[:], uint32(len(v))) //nolint:gosec // value length bounded by span size
-	_, _ = w.Write(b[:])
-	_, _ = w.Write(v)
+// spillEntryUint64 writes a ref header + 8-byte uint64 payload in one call.
+func spillEntryUint64(w *bufio.Writer, blockIdx, rowIdx uint16, v uint64) error {
+	var buf [12]byte
+	binary.LittleEndian.PutUint16(buf[0:2], blockIdx)
+	binary.LittleEndian.PutUint16(buf[2:4], rowIdx)
+	binary.LittleEndian.PutUint64(buf[4:12], v)
+	_, err := w.Write(buf[:])
+	return err
 }
 
 // addUint64 spills one uint64 row (span:start, span:duration) for a flat column.
@@ -138,8 +141,9 @@ func (t *tempFileAccum) addUint64(name string, colType shared.ColumnType, val ui
 	if err != nil {
 		return err
 	}
-	spillRefHeader(cs.w, blockIdx, rowIdx)
-	spillUint64(cs.w, val)
+	if err := spillEntryUint64(cs.w, blockIdx, rowIdx, val); err != nil {
+		return fmt.Errorf("intrinsic spill %q: write: %w", name, err)
+	}
 	cs.count++
 	return nil
 }
@@ -154,8 +158,13 @@ func (t *tempFileAccum) addBytes(name string, colType shared.ColumnType, val []b
 	if err != nil {
 		return err
 	}
-	spillRefHeader(cs.w, blockIdx, rowIdx)
-	spillBytes(cs.w, val)
+	// Encode length-prefixed payload.
+	payload := make([]byte, 4+len(val))
+	binary.LittleEndian.PutUint32(payload[:4], uint32(len(val))) //nolint:gosec // value length bounded by span size
+	copy(payload[4:], val)
+	if err := spillEntry(cs.w, blockIdx, rowIdx, payload); err != nil {
+		return fmt.Errorf("intrinsic spill %q: write: %w", name, err)
+	}
 	cs.count++
 	return nil
 }
@@ -170,8 +179,14 @@ func (t *tempFileAccum) addString(name string, colType shared.ColumnType, val st
 	if err != nil {
 		return err
 	}
-	spillRefHeader(cs.w, blockIdx, rowIdx)
-	spillBytes(cs.w, []byte(val))
+	// Encode length-prefixed payload.
+	b := []byte(val)
+	payload := make([]byte, 4+len(b))
+	binary.LittleEndian.PutUint32(payload[:4], uint32(len(b))) //nolint:gosec // value length bounded by span size
+	copy(payload[4:], b)
+	if err := spillEntry(cs.w, blockIdx, rowIdx, payload); err != nil {
+		return fmt.Errorf("intrinsic spill %q: write: %w", name, err)
+	}
 	cs.count++
 	return nil
 }
@@ -182,14 +197,17 @@ func (t *tempFileAccum) addInt64(name string, colType shared.ColumnType, val int
 	if err != nil {
 		return err
 	}
-	spillRefHeader(cs.w, blockIdx, rowIdx)
-	spillUint64(cs.w, uint64(val)) //nolint:gosec // reinterpreting int64 bits as uint64 for binary encoding
+	if err := spillEntryUint64(cs.w, blockIdx, rowIdx, uint64(val)); err != nil { //nolint:gosec // reinterpreting int64 bits as uint64 for binary encoding
+		return fmt.Errorf("intrinsic spill %q: write: %w", name, err)
+	}
 	cs.count++
 	return nil
 }
 
 // overCap formerly dropped the intrinsic section when any column exceeded MaxIntrinsicRows.
 // Removed (see intrinsic_accum.go). Always returns false.
+//
+//nolint:unused // mirrors intrinsicAccumulator.overCap interface; intentionally kept as stub
 func (t *tempFileAccum) overCap() bool {
 	return false
 }
