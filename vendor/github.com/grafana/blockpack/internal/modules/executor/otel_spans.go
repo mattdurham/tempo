@@ -122,7 +122,7 @@ func emitFastPathPlannerSpan(ctx context.Context, r *modules_reader.Reader, qs *
 		if v, ok := md["total_blocks"].(int); ok {
 			plan.TotalBlocks = v
 		}
-		if v, ok := md["selected_blocks"].(int); ok {
+		if v, ok := md[metaKeySelectedBlocks].(int); ok {
 			plan.SelectedBlocks = make([]int, v) // length carries the count for the span attr
 		}
 		if v, ok := md["candidate_rows"].(int); ok {

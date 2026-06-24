@@ -7327,3 +7327,41 @@ unresolved on this path).
 buildStructuralBlockPlan,compactQualifiedStructuralTraces,evalStructuralMatches,
 evalOpDescendantStructSpanTree`, `reader/spantree.go:SpanTreeForTrace`,
 `shared/spantree.go:IsDescendant`. Tests: `stream_structural_spantree_test.go`.
+
+## NOTE-472 — Decouple WantSort from TimestampColumn; match-all-any fast path (issue #393)
+
+`CollectOptions.TimestampColumn` previously encoded THREE distinct concepts in one field:
+the sort key, *whether to sort at all* (`hasSort := TimestampColumn != ""`), and the gate on
+the match-all/topK fast paths. A `{}` query with a limit and **no** requested ordering
+(`MostRecent=false`) therefore had `TimestampColumn == ""`, which disqualified it from every
+intrinsic fast path — it fell through to a full block scan of every block in the file, even
+though it only needed ANY `limit` results from the intrinsic section.
+
+**Fix.** Add `CollectOptions.WantSort bool`. `TimestampColumn` is now always set by
+`query_traceql.go` (to `"span:start"`) and means only "the column to read refs from / time-filter
+by"; `WantSort` alone decides whether results are ordered. Gates updated:
+- `shouldUseTopKPath` and `hasSort` (Case B/D dispatch) gate on `WantSort`, not `TimestampColumn != ""`.
+- `streamSortedRows` sorts only when `WantSort`; it still fetches the timestamp column for the
+  per-row **time-range filter** regardless of `WantSort` (time filtering is independent of sort).
+- The match-all fast path splits on `WantSort`: `collectMatchAllTopK` (sorted, existing) vs the
+  new `collectMatchAllAny` (unsorted).
+
+**`collectMatchAllAny`.** For `isMatchAllProgram && Limit > 0 && !WantSort && HasIntrinsicSection`:
+- No time range: read only the first `Limit` refs forward from the TimestampColumn blob via
+  `ScanFlatColumnTopKRefs(blob, Limit, false)` — no value decode beyond the refs section.
+- Time range set: decode the timestamp column once and collect the first `Limit` in-range refs
+  in block order (the first `Limit` block-order refs may all be out of range, so the values are
+  required to choose qualifying refs). NOTE: `ScanFlatColumnTopKRefs(blob, 0, …)` returns an
+  empty slice (its loop guard `len(result) >= limit` is true at limit==0), so a "scan all then
+  filter" approach via that helper is NOT usable — decode the column directly instead.
+
+Only the (typically 1-2) blocks containing the selected refs are hydrated via
+`forEachBlockInGroups`; no re-sort (caller did not request ordering). New ExecPath
+`match-all-any`. The Case B `refLimit=0` over-fetch is also avoided for free now: when
+`WantSort=false`, `hasSort` is false so pure-intrinsic refs are truncated to `Limit` in block
+order rather than fetching ALL matching refs.
+
+**Back-ref:** `stream.go:Collect (match-all dispatch),collectMatchAllAny,collectFromIntrinsicRefs
+(hasSort),shouldUseTopKPath,streamSortedRows`, `collectoptions.go:WantSort`,
+`query_stats.go:ExecPathMatchAllAny,metaKeySelectedBlocks`, `query_traceql.go:streamFilterProgram`.
+Tests: `match_all_any_test.go`, `api_test.go:TestQueryTraceQL_MatchAllUnsortedLimit`.

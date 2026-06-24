@@ -334,9 +334,23 @@ func Collect(
 	// section and a timestamp sort with a limit, read only the timestamp blob (cached) and
 	// extract the top-N refs without decoding values. Then hydrate only the blocks containing
 	// those rows — typically 1-3 blocks vs all blocks for the full scan path.
+	//
+	// NOTE-472 (issue #393): split the match-all fast path on WantSort. When the caller
+	// requested a sort, collectMatchAllTopK reads the timestamp blob and returns the top-N
+	// refs in time order. When NO sort was requested, collectMatchAllAny returns ANY Limit
+	// refs from the timestamp blob (first N in block order) — no timestamp decode beyond the
+	// optional time-range filter, no sort — closing the gap where `{}` with a limit and no
+	// ordering previously fell through to a full block scan of the entire file.
 	if isMatchAllProgram(program) && opts.Limit > 0 && opts.TimestampColumn != "" &&
 		r.HasIntrinsicSection() {
-		rows, fastQS, err := collectMatchAllTopK(ctx, r, opts, wantColumns, secondPassCols)
+		var rows []MatchedRow
+		var fastQS QueryStats
+		var err error
+		if opts.WantSort {
+			rows, fastQS, err = collectMatchAllTopK(ctx, r, opts, wantColumns, secondPassCols)
+		} else {
+			rows, fastQS, err = collectMatchAllAny(ctx, r, opts, wantColumns, secondPassCols)
+		}
 		if err != errNeedBlockScan {
 			fastQS.TotalDuration = time.Since(queryStart)
 			emitFastPathPlannerSpan(ctx, r, &fastQS) // NOTE-464 (issue #383)
@@ -401,12 +415,12 @@ func Collect(
 		Name:     stepNamePlan,
 		Duration: time.Since(planStart),
 		Metadata: map[string]any{
-			"total_blocks":    plan.TotalBlocks,
-			"pruned_by_time":  plan.PrunedByTime,
-			"pruned_by_index": plan.PrunedByIndex,
-			"pruned_by_fuse":  plan.PrunedByFuse,
-			"selected_blocks": len(plan.SelectedBlocks),
-			"explain":         plan.Explain,
+			"total_blocks":        plan.TotalBlocks,
+			"pruned_by_time":      plan.PrunedByTime,
+			"pruned_by_index":     plan.PrunedByIndex,
+			"pruned_by_fuse":      plan.PrunedByFuse,
+			metaKeySelectedBlocks: len(plan.SelectedBlocks),
+			"explain":             plan.Explain,
 		},
 	})
 
@@ -497,7 +511,10 @@ func Collect(
 // VECTOR() queries are excluded: cosine-similarity top-K and timestamp top-K are
 // semantically incompatible — both would restrict results but by different criteria.
 func shouldUseTopKPath(opts CollectOptions, program *vm.Program) bool {
-	return opts.TimestampColumn != "" && opts.Limit > 0 && !program.HasVector
+	// NOTE-472 (issue #393): gate on WantSort, not TimestampColumn. TimestampColumn may be
+	// set even for unsorted queries (as the match-all ref source / time-filter column), so
+	// the topK heap scan only fires when the caller actually wants timestamp ordering.
+	return opts.WantSort && opts.TimestampColumn != "" && opts.Limit > 0 && !program.HasVector
 }
 
 // scanBlocks iterates over selectedBlocks in order, concurrently fetching coalesced groups
@@ -730,7 +747,10 @@ func streamSortedRows(
 	opts CollectOptions,
 	results *[]MatchedRow,
 ) bool {
-	if tsCol != nil {
+	// NOTE-472 (issue #393): sort by per-row timestamp only when the caller requested a
+	// sort (WantSort). tsCol may still be non-nil for the time-range filter below even when
+	// no sort is requested, so the sort gate is WantSort, not tsCol != nil.
+	if tsCol != nil && opts.WantSort {
 		backward := opts.Direction == queryplanner.Backward
 		slices.SortFunc(rows, func(a, b int) int {
 			tsA, okA := tsCol.Uint64Value(a)
@@ -900,7 +920,7 @@ func collectMatchAllTopK(
 		qs.Steps = append(qs.Steps, StepStats{
 			Name:     stepNameIntrinsic,
 			Duration: time.Since(stepStart),
-			Metadata: map[string]any{"selected_blocks": 0},
+			Metadata: map[string]any{metaKeySelectedBlocks: 0},
 		})
 		return nil, qs, nil
 	}
@@ -933,7 +953,7 @@ func collectMatchAllTopK(
 		qs.Steps = append(qs.Steps, StepStats{
 			Name:     stepNameIntrinsic,
 			Duration: time.Since(stepStart),
-			Metadata: map[string]any{"selected_blocks": 0},
+			Metadata: map[string]any{metaKeySelectedBlocks: 0},
 		})
 		return nil, qs, nil
 	}
@@ -977,7 +997,124 @@ func collectMatchAllTopK(
 	qs.Steps = append(qs.Steps, StepStats{
 		Name:     stepNameIntrinsic,
 		Duration: time.Since(stepStart),
-		Metadata: map[string]any{"selected_blocks": selectedBlocks},
+		Metadata: map[string]any{metaKeySelectedBlocks: selectedBlocks},
+	})
+	return results, qs, nil
+}
+
+// collectMatchAllAny handles the match-all + limit + NO-sort fast path (NOTE-472, issue
+// #393). It returns ANY opts.Limit matching rows from the intrinsic section without
+// decoding timestamps for ordering — closing the gap where `{}` with a limit and no sort
+// previously fell through to a full block scan of every block in the file.
+//
+// Refs are taken from the TimestampColumn blob (the cheapest always-present ref source):
+//   - No time range: read only the first opts.Limit refs (block order) — no value decode.
+//   - Time range set: read all refs, filter each by its decoded timestamp, then truncate
+//     to opts.Limit. This requires a single timestamp-column decode but still hydrates only
+//     the candidate blocks, not the whole file.
+//
+// Only the (typically 1-2) blocks containing the selected refs are hydrated. Returns
+// errNeedBlockScan when the blob is unavailable or not in a scannable flat format.
+func collectMatchAllAny(
+	ctx context.Context,
+	r *modules_reader.Reader,
+	opts CollectOptions,
+	wantColumns map[string]struct{},
+	secondPassCols map[string]struct{},
+) ([]MatchedRow, QueryStats, error) {
+	var qs QueryStats
+	qs.ExecutionPath = ExecPathMatchAllAny
+	stepStart := time.Now()
+
+	limit := opts.Limit
+	hasTimeRange := opts.TimeRange.MinNano > 0 || opts.TimeRange.MaxNano > 0
+
+	var refs []modules_shared.BlockRef
+	if hasTimeRange {
+		// With a time range, the first `limit` refs in block order may all be out of range,
+		// so the timestamp values are needed to choose which refs qualify. Decode the
+		// timestamp column once and collect the first `limit` in-range refs in block order.
+		tsCol, tsErr := r.GetIntrinsicColumn(opts.TimestampColumn)
+		if tsErr != nil || tsCol == nil || len(tsCol.Uint64Values) != len(tsCol.BlockRefs) {
+			qs.ExecutionPath = ExecPathIntrinsicNeedBlock
+			return nil, qs, errNeedBlockScan
+		}
+		refs = make([]modules_shared.BlockRef, 0, min(limit, len(tsCol.BlockRefs)))
+		for i, ref := range tsCol.BlockRefs {
+			ts := tsCol.Uint64Values[i]
+			if opts.TimeRange.MinNano > 0 && ts < opts.TimeRange.MinNano {
+				continue
+			}
+			if opts.TimeRange.MaxNano > 0 && ts > opts.TimeRange.MaxNano {
+				continue
+			}
+			refs = append(refs, ref)
+			if len(refs) >= limit {
+				break
+			}
+		}
+	} else {
+		// No time range: read only the first `limit` refs forward (block order). No value
+		// decode beyond the ref section.
+		tsBlob, tsBlobErr := r.GetIntrinsicColumnBlob(opts.TimestampColumn)
+		if tsBlobErr != nil || tsBlob == nil {
+			qs.ExecutionPath = ExecPathIntrinsicNeedBlock
+			return nil, qs, errNeedBlockScan
+		}
+		refs = modules_shared.ScanFlatColumnTopKRefs(tsBlob, limit, false /* forward */)
+		if refs == nil {
+			qs.ExecutionPath = ExecPathIntrinsicNeedBlock
+			return nil, qs, errNeedBlockScan
+		}
+	}
+
+	// Apply sub-file shard filtering.
+	refs = filterRefsByShardRange(refs, opts)
+
+	if len(refs) == 0 {
+		qs.Steps = append(qs.Steps, StepStats{
+			Name:     stepNameIntrinsic,
+			Duration: time.Since(stepStart),
+			Metadata: map[string]any{metaKeySelectedBlocks: 0},
+		})
+		return nil, qs, nil
+	}
+
+	// Hydrate: fetch only the blocks containing the selected refs. No re-sort — the caller
+	// did not request ordering, so the (BlockIdx, RowIdx) order from forEachBlockInGroups is
+	// an acceptable result order.
+	selectedBlocks := countUniqueBlockIdxs(refs)
+	slices.SortFunc(refs, blockRefCompare)
+	blockOrder, blockCandidates := groupRefsByBlock(refs)
+	results := make([]MatchedRow, 0, len(refs))
+	hydrateErr := forEachBlockInGroups(
+		ctx,
+		r,
+		blockOrder,
+		blockCandidates,
+		wantColumns,
+		secondPassCols,
+		"collectMatchAllAny",
+		nil,
+		func(pb parsedBlock, candidateRows []int) error {
+			for _, rowIdx := range candidateRows {
+				results = append(results, MatchedRow{
+					Block:    pb.Block,
+					BlockIdx: pb.BlockIdx,
+					RowIdx:   rowIdx,
+				})
+			}
+			return nil
+		},
+	)
+	if hydrateErr != nil {
+		return nil, qs, hydrateErr
+	}
+
+	qs.Steps = append(qs.Steps, StepStats{
+		Name:     stepNameIntrinsic,
+		Duration: time.Since(stepStart),
+		Metadata: map[string]any{metaKeySelectedBlocks: selectedBlocks},
 	})
 	return results, qs, nil
 }
@@ -1041,7 +1178,10 @@ func collectFromIntrinsicRefs(
 	qs *QueryStats,
 ) ([]MatchedRow, QueryStats, error) {
 	isPureIntrinsic := ProgramIsIntrinsicOnly(program)
-	hasSort := opts.TimestampColumn != ""
+	// NOTE-472 (issue #393): hasSort follows WantSort, not TimestampColumn. When the caller
+	// did not request a sort, Case B (pure-intrinsic + sort) and Case D (mixed + sort) are
+	// not used; refs may be truncated to Limit (block order) since ordering is irrelevant.
+	hasSort := opts.WantSort && opts.TimestampColumn != ""
 
 	// Step 1: Get candidate refs using strict (pure intrinsic) or partial (mixed) eval.
 	// Case B (pure intrinsic + sort) uses limit=0 to get ALL matching refs — the
@@ -1133,10 +1273,10 @@ func collectFromIntrinsicRefs(
 	qs.Steps = append(qs.Steps, StepStats{
 		Name: stepNamePlan,
 		Metadata: map[string]any{
-			"total_blocks":    r.BlockCount(),
-			"selected_blocks": candidateBlocks,
-			"candidate_rows":  len(refs),
-			"total_spans":     totalSpansOfRefBlocks(r, refs),
+			"total_blocks":        r.BlockCount(),
+			metaKeySelectedBlocks: candidateBlocks,
+			"candidate_rows":      len(refs),
+			"total_spans":         totalSpansOfRefBlocks(r, refs),
 		},
 	})
 
@@ -1304,7 +1444,7 @@ func collectIntrinsicPlain(
 		qs.Steps = append(qs.Steps, StepStats{
 			Name:     stepNameIntrinsic,
 			Duration: time.Since(stepStart),
-			Metadata: map[string]any{"selected_blocks": selectedBlocks},
+			Metadata: map[string]any{metaKeySelectedBlocks: selectedBlocks},
 		})
 		return nil, nil
 	}
@@ -1344,7 +1484,7 @@ func collectIntrinsicPlain(
 	qs.Steps = append(qs.Steps, StepStats{
 		Name:     stepNameIntrinsic,
 		Duration: time.Since(stepStart),
-		Metadata: map[string]any{"selected_blocks": selectedBlocks},
+		Metadata: map[string]any{metaKeySelectedBlocks: selectedBlocks},
 	})
 	return results, nil
 }

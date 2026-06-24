@@ -1149,10 +1149,20 @@ func buildIntrinsicBlockIndex(r *modules_reader.Reader, srcBlockIdx int) intrins
 	// NOTE-469 (issue #389): span:parent_id joins trace:id and span:id here. With the block
 	// column dropped, addRowFromBlock no longer visits span:parent_id, so it must be carried
 	// from the source intrinsic section during compaction or it would be lost on recompaction.
-	var out intrinsicRowFields
+
+	// Pre-allocate rows using the known span count for this block to avoid incremental
+	// slice growth (which was O(N²) copy cost when rowIdx values are non-monotonic).
+	spanCount := 0
+	if srcBlockIdx < r.BlockCount() {
+		spanCount = int(r.BlockMeta(srcBlockIdx).SpanCount)
+	}
+	out := intrinsicRowFields{
+		rows: make([]intrinsicRowEntry, spanCount),
+	}
 	setField := func(rowIdx uint16, colName string, val []byte) {
 		idx := int(rowIdx)
 		if idx >= len(out.rows) {
+			// Safety: grow if rowIdx exceeds pre-allocated size (should not happen).
 			grown := make([]intrinsicRowEntry, idx+1)
 			copy(grown, out.rows)
 			out.rows = grown

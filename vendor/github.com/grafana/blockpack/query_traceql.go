@@ -65,12 +65,18 @@ func streamFilterProgram(
 		StartBlock:    opts.StartBlock,
 		BlockCount:    opts.BlockCount,
 		SelectColumns: opts.SelectColumns,
+		// NOTE-472 (issue #393): TimestampColumn is always set to "span:start" so the
+		// match-all-any fast path can read refs from it even when no sort is requested.
+		// WantSort gates whether results are actually ordered by it; the column here is
+		// otherwise just the cheapest ref source for an unsorted match-all + limit query.
+		TimestampColumn: "span:start",
 		// NOTE-028: AllColumns defaults to false — for Collect this means the second pass decodes only
 		// searchMetaColumns ∪ predicate columns.
 	}
 	if opts.MostRecent {
 		collectOpts.Direction = modules_queryplanner.Backward
-		collectOpts.TimestampColumn = "span:start"
+		// NOTE-472 (issue #393): WantSort decouples the sort request from TimestampColumn.
+		collectOpts.WantSort = true
 	}
 	rows, stats, err := modules_executor.Collect(ctx, r, program, collectOpts)
 	if err != nil {

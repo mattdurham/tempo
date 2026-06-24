@@ -11,6 +11,7 @@ const (
 	ExecPathIntrinsicTopKKLL   = "intrinsic-topk-kll"
 	ExecPathIntrinsicTopKScan  = "intrinsic-topk-scan"
 	ExecPathMatchAllTopK       = "match-all-topk"
+	ExecPathMatchAllAny        = "match-all-any"
 	ExecPathMixedPlain         = "mixed-plain"
 	ExecPathMixedTopK          = "mixed-topk"
 	ExecPathBloomRejected      = "bloom-rejected"
@@ -24,6 +25,11 @@ const (
 	stepNameIntrinsic      = "intrinsic"
 	stepNameMixedPrefilter = "mixed-prefilter"
 )
+
+// metaKeySelectedBlocks is the StepStats.Metadata key carrying the count of blocks the
+// planner/fast-path selected for hydration (NOTE-472: extracted to a constant — the
+// literal recurs across every plan and intrinsic-fast-path step site).
+const metaKeySelectedBlocks = "selected_blocks"
 
 // QueryStats is returned by Collect with per-phase execution metrics.
 // It replaces CollectStats (internal).
@@ -57,7 +63,7 @@ func (qs QueryStats) Explain() string {
 func (qs QueryStats) SelectedBlocks() int {
 	for i := range qs.Steps {
 		if qs.Steps[i].Name == stepNamePlan {
-			if v, ok := qs.Steps[i].Metadata["selected_blocks"].(int); ok {
+			if v, ok := qs.Steps[i].Metadata[metaKeySelectedBlocks].(int); ok {
 				return v
 			}
 			return 0
