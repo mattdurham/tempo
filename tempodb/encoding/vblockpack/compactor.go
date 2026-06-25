@@ -135,6 +135,11 @@ func (c *Compactor) Compact(ctx context.Context, l log.Logger, r backend.Reader,
 	cfg := blockpack.CompactionConfig{
 		MaxSpansPerBlock: maxSpansFromConfig(&c.opts.BlockConfig),
 		DedicatedColumns: dedicatedColumnsToBlockpack(compactDedicatedCols),
+		// blockpack NOTE-476 (issue #394): drop identity columns from compacted output's
+		// IntrinsicTOC (~26% of L1 file size); identity is served from the SpanTree. Source
+		// blocks written with this flag have their identity sourced from their own SpanTree
+		// during recompaction. Matches the ingest writer (create.go).
+		OmitIntrinsicIdentityColumns: true,
 	}
 
 	outputPaths, err := blockpack.CompactBlocksStreaming(ctx, providers, cfg, out)

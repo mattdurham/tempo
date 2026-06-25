@@ -7365,3 +7365,34 @@ order rather than fetching ALL matching refs.
 (hasSort),shouldUseTopKPath,streamSortedRows`, `collectoptions.go:WantSort`,
 `query_stats.go:ExecPathMatchAllAny,metaKeySelectedBlocks`, `query_traceql.go:streamFilterProgram`.
 Tests: `match_all_any_test.go`, `api_test.go:TestQueryTraceQL_MatchAllUnsortedLimit`.
+
+## NOTE-476 — Identity lookups fall back to SpanTree (issue #394)
+
+When the IntrinsicTOC lacks the identity columns (blocks written with
+`OmitIntrinsicIdentityColumns`), every executor identity-materialization path falls back to the
+per-block SpanTree reverse map (`Reader.SpanTreeIdentityForBlock`):
+
+- `lookupIntrinsicFieldsTypedForBlock` (structural full-block scatter) →
+  `fillIdentityFromSpanTreeBlock`: result indexed by RowIdx, which is the SpanTree map key.
+- `lookupIntrinsicFieldsTyped` (ref-filtered post-filter) → `fillIdentityFromSpanTreeRefs`:
+  one O(1) map lookup per selected ref; the per-block map is fetched once per distinct block.
+- `lookupIntrinsicFields` (map-based, used by `SpanMatchFromRow` block-scan materialization) →
+  `fillIdentityFromSpanTreeIntoMaps`.
+- `query_helpers.go:buildIntrinsicBytesMap` (match-all / `{}` result materialization via
+  `extractIDs`) → `buildIdentityBytesMapFromSpanTree`: whole-file identity map for the named
+  identity column, built from every block's SpanTree reverse map.
+
+All fallbacks gate on `wantCol(name) && !r.HasIntrinsicColumn(name)`, so legacy blocks (columns
+present) take the unchanged fast path and pay nothing. Structural parent topology (`>`, `~`,
+`<<`) is reconstructed from the SpanTree-sourced `parentID` exactly as before — the byID parent
+map build is unchanged; only the source of `parentID` differs.
+
+Note: a `trace:id`/`span:id` predicate on an omit block makes `scanIntrinsicLeafRefs` return nil
+(column absent), which abandons the all-or-nothing intrinsic-TOC pre-filter and falls through to
+full VM evaluation — correct but slightly slower. ID predicates are rare (trace-by-ID uses the
+dedicated SpanTree path).
+
+**Back-ref:** `executor/intrinsic_row_block.go:fillIdentityFromSpanTreeBlock`,
+`executor/intrinsic_row.go:fillIdentityFromSpanTreeRefs`,
+`executor/stream.go:fillIdentityFromSpanTreeIntoMaps`,
+`query_helpers.go:buildIdentityBytesMapFromSpanTree`. Tests: `omit_intrinsic_identity_test.go`.

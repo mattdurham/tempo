@@ -1177,6 +1177,20 @@ func buildIntrinsicBlockIndex(r *modules_reader.Reader, srcBlockIdx int) intrins
 		}
 	}
 	identityOnly := []string{traceIDColumnName, spanIDColumnName, spanParentIDColumnName}
+
+	// NOTE-476 (issue #394): source blocks written with OmitIntrinsicIdentityColumns have no
+	// identity columns in the IntrinsicTOC — their identity lives solely in the SpanTree.
+	// Detect that and source the identity fields from the per-block SpanTree reverse map
+	// instead, so recompaction does not silently drop trace:id/span:id/span:parent_id.
+	if !r.HasIntrinsicColumn(traceIDColumnName) && r.HasSpanTree() {
+		if filled := fillIntrinsicIndexFromSpanTree(r, srcBlockIdx, setField); filled {
+			if out.rows == nil {
+				out.rows = []intrinsicRowEntry{}
+			}
+			return out
+		}
+	}
+
 	for _, colName := range identityOnly {
 		col, err := r.GetIntrinsicColumn(colName)
 		if err != nil || col == nil {
@@ -1214,6 +1228,43 @@ func buildIntrinsicBlockIndex(r *modules_reader.Reader, srcBlockIdx int) intrins
 		out.rows = []intrinsicRowEntry{}
 	}
 	return out
+}
+
+// fillIntrinsicIndexFromSpanTree sources the per-row identity fields (trace:id/span:id/
+// span:parent_id) for srcBlockIdx from the reader's SpanTree reverse map, for blocks written
+// without IntrinsicTOC identity columns (Config.OmitIntrinsicIdentityColumns). Each field is a
+// freshly-allocated []byte copy of the record's fixed-array identity (unlike the column-buffer
+// alias path, the SpanTree decode produces value arrays, so a copy is required to outlive the
+// record). Root spans (zero ParentID) leave parentID nil so feedIntrinsicsFromIndex skips it,
+// matching feedSpanIdentifiers. Returns true if the SpanTree map was usable. NOTE-476.
+func fillIntrinsicIndexFromSpanTree(
+	r *modules_reader.Reader,
+	srcBlockIdx int,
+	setField func(rowIdx uint16, colName string, val []byte),
+) bool {
+	if srcBlockIdx < 0 || srcBlockIdx > int(^uint16(0)) {
+		return false
+	}
+	idMap, err := r.SpanTreeIdentityForBlock(uint16(srcBlockIdx))
+	if err != nil || idMap == nil {
+		return false
+	}
+	for rowIdx, rec := range idMap {
+		tid := make([]byte, 16)
+		copy(tid, rec.TraceID[:])
+		setField(rowIdx, traceIDColumnName, tid)
+
+		sid := make([]byte, 8)
+		copy(sid, rec.SpanID[:])
+		setField(rowIdx, spanIDColumnName, sid)
+
+		if rec.ParentID != ([8]byte{}) {
+			pid := make([]byte, 8)
+			copy(pid, rec.ParentID[:])
+			setField(rowIdx, spanParentIDColumnName, pid)
+		}
+	}
+	return true
 }
 
 // feedIntrinsicsFromIndex copies trace:id, span:id, and span:parent_id from a pre-built

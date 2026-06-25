@@ -365,3 +365,60 @@ func (r *Reader) SpanTreeChunksForSpan(spanID [8]byte) ([]int, error) {
 	}
 	return out, nil
 }
+
+// SpanTreeIdentityForBlock returns a map from RowIdx to the full SpanTreeRecord for every
+// span stored in the given block, scanning the SpanTree section once. It is the identity
+// reverse-lookup source for blocks that no longer carry the trace:id/span:id/span:parent_id
+// IntrinsicTOC columns (NOTE-476, issue #394). Returns (nil, nil) when the file carries no
+// SpanTree section.
+//
+// The result is memoized on the Reader, keyed by blockIdx — the first request for any block
+// decodes every chunk (records are sorted by (traceID, dfsIn), not by block, so a single
+// full scan is required) and builds the per-block maps for ALL blocks at once, so subsequent
+// per-block requests within the same query are free. Reader is constructed fresh per query
+// per block, so this whole-section scan happens at most once per query.
+func (r *Reader) SpanTreeIdentityForBlock(blockIdx uint16) (map[uint16]shared.SpanTreeRecord, error) {
+	si, err := r.ensureSpanTreeSection()
+	if err != nil {
+		return nil, err
+	}
+	if si == nil {
+		return nil, nil
+	}
+
+	r.spanTreeIdentityMu.Lock()
+	defer r.spanTreeIdentityMu.Unlock()
+
+	if r.spanTreeIdentityByBlock == nil {
+		built, berr := r.buildSpanTreeIdentityMaps(si)
+		if berr != nil {
+			return nil, berr
+		}
+		r.spanTreeIdentityByBlock = built
+	}
+	return r.spanTreeIdentityByBlock[blockIdx], nil
+}
+
+// buildSpanTreeIdentityMaps decodes every SpanTree chunk once and groups the records into
+// per-block RowIdx->record maps. Caller holds spanTreeIdentityMu. NOTE-476.
+func (r *Reader) buildSpanTreeIdentityMaps(si *spanTreeIndex) (map[uint16]map[uint16]shared.SpanTreeRecord, error) {
+	out := make(map[uint16]map[uint16]shared.SpanTreeRecord)
+	stride := shared.SpanTreeRecordSize
+	for chunkIdx := range si.dir {
+		body, err := r.spanTreeChunkBytes(si, chunkIdx)
+		if err != nil {
+			return nil, fmt.Errorf("SpanTreeIdentity: chunk %d: %w", chunkIdx, err)
+		}
+		n := len(body) / stride
+		for i := 0; i < n; i++ {
+			rec := shared.DecodeSpanTreeRecord(body[i*stride : i*stride+stride])
+			blockMap, ok := out[rec.BlockIdx]
+			if !ok {
+				blockMap = make(map[uint16]shared.SpanTreeRecord)
+				out[rec.BlockIdx] = blockMap
+			}
+			blockMap[rec.RowIdx] = rec
+		}
+	}
+	return out, nil
+}

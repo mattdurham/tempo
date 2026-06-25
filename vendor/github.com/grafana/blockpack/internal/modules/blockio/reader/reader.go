@@ -123,6 +123,16 @@ type Reader struct {
 	spanTree    *spanTreeIndex
 	spanTreeErr error
 
+	// NOTE-476 (issue #394): block-scoped SpanTree identity reverse maps, keyed by blockIdx.
+	// Each value maps a block's RowIdx -> its SpanTreeRecord, providing O(1) identity
+	// (TraceID/SpanID/ParentID) lookup for result materialization and structural parent
+	// maps WITHOUT the trace:id/span:id/span:parent_id IntrinsicTOC columns. Built lazily
+	// on first request per block by scanning every SpanTree chunk once (records carry
+	// BlockIdx) and memoized for the Reader lifetime (fresh Reader per query per block —
+	// the foundational cache invariant — so this is intra-query only). Guarded by
+	// spanTreeIdentityMu (declared with the other sync primitives below).
+	spanTreeIdentityByBlock map[uint16]map[uint16]shared.SpanTreeRecord
+
 	// sketchIdx holds parsed column-major sketch data for the file.
 	// Nil for files written before the sketch section was introduced (old format).
 	sketchIdx *sketchIndex
@@ -228,6 +238,9 @@ type Reader struct {
 	v8ToCOffset uint64
 
 	intrinsicMu sync.RWMutex
+
+	// spanTreeIdentityMu guards lazy construction of spanTreeIdentityByBlock (NOTE-476).
+	spanTreeIdentityMu sync.Mutex
 
 	// V8 lazy section errors and sync.Once guards (mirror of v14 ones).
 	v8TraceOnce    sync.Once

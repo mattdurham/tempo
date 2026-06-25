@@ -64,8 +64,16 @@ type columnSpill struct {
 // It mirrors the feed* / columnNames / encodeColumn / overCap surface of the in-memory
 // intrinsicAccumulator that the per-block localAccum still uses.
 type tempFileAccum struct {
+	cols map[string]*columnSpill
+
+	// skipCols names intrinsic columns that spillMerge drops instead of persisting to the
+	// final TOC (NOTE-476, issue #394). Used to omit the trace:id/span:id/span:parent_id
+	// identity columns when Config.OmitIntrinsicIdentityColumns is set; the SpanTree section
+	// is built from the per-block accumulator independently, so dropping them here loses
+	// nothing recoverable.
+	skipCols map[string]struct{}
+
 	dir    string
-	cols   map[string]*columnSpill
 	tmpDir string // non-empty if this accumulator owns dir and must remove it on close
 }
 
@@ -422,6 +430,9 @@ func readDictInt64Spill(r *bufio.Reader, count int, c *dictAccum) error {
 // streamable while preserving the final dictionary semantics.
 func (t *tempFileAccum) spillMerge(src *intrinsicAccumulator) error {
 	for name, c := range src.flatCols {
+		if _, skip := t.skipCols[name]; skip {
+			continue
+		}
 		if len(c.bytesValues) > 0 {
 			for i, v := range c.bytesValues {
 				ref := c.refs[i]
@@ -445,6 +456,9 @@ func (t *tempFileAccum) spillMerge(src *intrinsicAccumulator) error {
 		}
 	}
 	for name, c := range src.dictCols {
+		if _, skip := t.skipCols[name]; skip {
+			continue
+		}
 		isInt64 := c.colType == shared.ColumnTypeInt64 || c.colType == shared.ColumnTypeRangeInt64
 		for _, e := range c.entries {
 			for _, ref := range e.refs {

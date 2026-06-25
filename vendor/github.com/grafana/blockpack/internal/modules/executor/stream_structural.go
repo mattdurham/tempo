@@ -325,6 +325,26 @@ func collectAllStructuralSpans(
 		}
 	}
 
+	// NOTE-475: expand block selection for multi-block traces.
+	// NOTE-474 (boundary-aware block slicing) splits spans by (service.name, span.name),
+	// so spans of the same trace may live in different blocks. Per-predicate planBlocks
+	// selects blocks matching node predicates but omits blocks containing intermediate
+	// ancestor spans from services that satisfy neither predicate. Those missing blocks
+	// break the parentIdx chain that resolveStructuralParentIndices walks.
+	//
+	// Fix: after the initial scan, collect all observed traceIDs from flat, look up every
+	// block those traces occupy via TraceEntries, and fetch/scan any blocks not yet seen.
+	// Only intermediate-span blocks are missing — the predicate-matching blocks are already
+	// in rawBlocks — so the expansion set is small (one or two extra blocks per trace).
+	if !useSpanTreeDescendant && len(flat) > 0 {
+		var err error
+		flat, err = expandStructuralBlocksForTraces(r, flat, rawBlocks, &bp, parsedBlocks, fetcher)
+		if err != nil {
+			releaseStructuralSpanRecs(flat)
+			return nil, parsedBlocks, err
+		}
+	}
+
 	// NOTE-387: fuse the matched-trace filter and the group-by into a single counting bucket
 	// scatter — no comparison sort. A trace can contribute a structural match only if ≥1 of its
 	// spans matched a node (nodeMatch != 0); this holds for every op type including negation,
@@ -1562,4 +1582,66 @@ func evalOpChainStep(
 		// Negation operators in chains have undefined semantics; return empty set.
 	}
 	return nextSet
+}
+
+// expandStructuralBlocksForTraces fetches and scans any inner blocks that contain
+// spans of traces already observed in flat but were excluded from the initial
+// per-predicate block selection (NOTE-475).
+//
+// With NOTE-474 boundary-aware slicing, spans of the same trace may be split
+// across multiple inner blocks (one per (service.name, span.name) group). The
+// initial planBlocks pass selects only blocks that match a node predicate, so
+// blocks holding intermediate ancestor spans from non-matching services are
+// omitted. Those missing spans cause parentIdx = -1 during
+// resolveStructuralParentIndices, breaking the ancestor chain.
+//
+// Fix: collect the set of traceIDs from flat, call TraceEntries for each to find
+// every block the trace occupies, and fetch+scan any block not already in rawBlocks.
+// The expansion set is small — typically one or two intermediate-service blocks per
+// trace — and only applies to structural queries that do not use the SpanTree path.
+func expandStructuralBlocksForTraces(
+	r *modules_reader.Reader,
+	flat []structuralSpanRec,
+	rawBlocks map[int][]byte,
+	bp *structuralBlockPlan,
+	parsedBlocks map[int]*modules_reader.Block,
+	fetcher *queryplanner.Planner,
+) ([]structuralSpanRec, error) {
+	// Collect the unique traceIDs seen so far.
+	seenTraces := make(map[[16]byte]struct{}, len(flat)/4)
+	for i := range flat {
+		seenTraces[flat[i].traceID] = struct{}{}
+	}
+
+	// Find blocks referenced by those traces that were not already fetched.
+	var extraBlockIDs []int
+	for traceID := range seenTraces {
+		for _, entry := range r.TraceEntries(traceID) {
+			if _, already := rawBlocks[entry.BlockID]; !already {
+				extraBlockIDs = append(extraBlockIDs, entry.BlockID)
+				rawBlocks[entry.BlockID] = nil // mark as pending to avoid duplicates
+			}
+		}
+	}
+	if len(extraBlockIDs) == 0 {
+		return flat, nil
+	}
+
+	extraPlan := &queryplanner.Plan{SelectedBlocks: extraBlockIDs}
+	extraRaw, err := fetcher.FetchBlocks(extraPlan)
+	if err != nil {
+		return flat, fmt.Errorf("structural expand FetchBlocks: %w", err)
+	}
+	for _, blockIdx := range extraBlockIDs {
+		raw, ok := extraRaw[blockIdx]
+		if !ok {
+			continue
+		}
+		rawBlocks[blockIdx] = raw // update the map with actual bytes
+		flat, err = collectBlockStructuralSpanRecs(r, blockIdx, raw, bp, flat, parsedBlocks)
+		if err != nil {
+			return flat, err
+		}
+	}
+	return flat, nil
 }

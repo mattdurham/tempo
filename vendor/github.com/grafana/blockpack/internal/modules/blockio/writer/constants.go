@@ -233,7 +233,8 @@ const (
 )
 
 const (
-	defaultMaxBlockSpans      = 2000
+	defaultMaxBlockSpans      = 10000
+	defaultMinBlockSpans      = 5000 // NOTE-474: flush at boundary only when block is ≥50% full
 	estimatedBytesPerSpan     = 2048
 	uuidSampleCount           = 8
 	rleCardinalityThreshold   = 3

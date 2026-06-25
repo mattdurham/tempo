@@ -139,6 +139,9 @@ func NewWriterWithConfig(cfg Config) (*Writer, error) {
 	if cfg.MaxBlockSpans == 0 {
 		cfg.MaxBlockSpans = defaultMaxBlockSpans
 	}
+	if cfg.MinBlockSpans == 0 {
+		cfg.MinBlockSpans = defaultMinBlockSpans
+	}
 	// NOTE-AP-001: apply the AllPresent encoding rollout flag. Default is enabled; setting
 	// Config.DisableAllPresentEncoding forces the legacy presence-RLE form for every column.
 	setAllPresentEncodingEnabled(!cfg.DisableAllPresentEncoding)
@@ -247,7 +250,6 @@ func (w *Writer) AddSpan(
 		ss:      ss,
 		span:    span,
 	}
-	computeMinHashSigFromProto(&ps)
 	w.pending = append(w.pending, ps)
 
 	// Auto-flush when buffer reaches MaxBufferedSpans.
@@ -308,7 +310,6 @@ func (w *Writer) AddTracesData(td *tracev1.TracesData) error {
 					ss:       ss,
 					span:     span,
 				}
-				computeMinHashSigFromProto(&ps)
 				w.pending = append(w.pending, ps)
 
 				// Auto-flush when buffer reaches MaxBufferedSpans.
@@ -368,7 +369,6 @@ func (w *Writer) AddTempoTrace(trace *tempopb.Trace) error {
 					tempoSS:   ss,
 					tempoSpan: span,
 				}
-				computeMinHashSigFromTempoProto(&ps)
 				w.pending = append(w.pending, ps)
 
 				if w.cfg.MaxBufferedSpans > 0 && len(w.pending) >= w.cfg.MaxBufferedSpans {
@@ -482,6 +482,16 @@ func (w *Writer) ensureIntrinsicAccum() error {
 	if err != nil {
 		return err
 	}
+	// NOTE-476 (issue #394): when configured, drop the identity columns from the persisted
+	// IntrinsicTOC. The SpanTree (fed independently from the per-block accumulator) is the
+	// sole identity store for these blocks; readers fall back to it via SpanTreeIdentityForBlock.
+	if w.cfg.OmitIntrinsicIdentityColumns {
+		a.skipCols = map[string]struct{}{
+			traceIDColumnName:      {},
+			spanIDColumnName:       {},
+			spanParentIDColumnName: {},
+		}
+	}
 	w.intrinsicAccum = a
 	return nil
 }
@@ -570,10 +580,30 @@ func (w *Writer) flushBlocks() error {
 		spans   []pendingSpan
 		blockID int
 	}
+	// NOTE-474: boundary-aware block slicing.
+	// Flush at a (service.name, span.name) group boundary once MinBlockSpans is reached.
+	// Keeps homogeneous groups in their own blocks (better dictionary/RLE compression)
+	// while batching rare operations into reasonably-sized blocks. MaxBlockSpans is the
+	// hard cap regardless of group boundaries.
+	// NOTE-091 caveat: this splits multi-service traces across blocks; structural queries
+	// may have false negatives for traces whose ancestor chain spans pruned blocks.
 	var slices []blockSlice
 	blockStart := 0
 	for blockStart < len(w.pending) {
-		blockEnd := min(blockStart+w.cfg.MaxBlockSpans, len(w.pending))
+		blockEnd := blockStart + 1
+		for blockEnd < len(w.pending) {
+			size := blockEnd - blockStart
+			if size >= w.cfg.MaxBlockSpans {
+				break
+			}
+			prev := &w.pending[blockEnd-1]
+			next := &w.pending[blockEnd]
+			if size >= w.cfg.MinBlockSpans &&
+				(next.svcName != prev.svcName || next.spanName != prev.spanName) {
+				break
+			}
+			blockEnd++
+		}
 		slices = append(slices, blockSlice{
 			spans:   w.pending[blockStart:blockEnd],
 			blockID: len(w.blockMetas) + len(slices),
@@ -856,7 +886,6 @@ func (w *Writer) AddRowFromReader(block *reader.Block, rowIdx int, srcReader *re
 		srcBlockIdx: srcBlockIdx,
 		srcRowIdx:   rowIdx,
 	}
-	computeMinHashSigFromBlock(&ps, block)
 	w.pending = append(w.pending, ps)
 
 	if w.cfg.MaxBufferedSpans > 0 && len(w.pending) >= w.cfg.MaxBufferedSpans {

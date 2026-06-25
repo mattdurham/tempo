@@ -67,7 +67,61 @@ func lookupIntrinsicFieldsTypedForBlock(
 		}
 	}
 
+	// NOTE-476 (issue #394): identity columns (trace:id/span:id/span:parent_id) may be absent
+	// from the IntrinsicTOC for blocks written without them — those blocks store identity
+	// solely in the SpanTree. Fall back to the per-block SpanTree identity map for any
+	// requested identity column the loop above did not populate.
+	if err := fillIdentityFromSpanTreeBlock(r, blockIdx, wantCol, result); err != nil {
+		putIntrinsicRowFields(result)
+		return nil, err
+	}
+
 	return result, nil
+}
+
+// fillIdentityFromSpanTreeBlock populates trace:id/span:id/span:parent_id from the block's
+// SpanTree identity map for any of the three columns that is requested but absent from the
+// IntrinsicTOC. Identity columns are present-together in any given block (all three or none),
+// so the SpanTree map is fetched once if any is missing. result is indexed by RowIdx, which
+// is exactly the SpanTree map key. NOTE-476 (issue #394).
+func fillIdentityFromSpanTreeBlock(
+	r *modules_reader.Reader,
+	blockIdx uint16,
+	wantCol func(string) bool,
+	result []intrinsicRowFields,
+) error {
+	wantTrace := wantCol(colNameTraceID) && !r.HasIntrinsicColumn(colNameTraceID)
+	wantSpan := wantCol(colNameSpanID) && !r.HasIntrinsicColumn(colNameSpanID)
+	wantParent := wantCol(colNameParentID) && !r.HasIntrinsicColumn(colNameParentID)
+	if !wantTrace && !wantSpan && !wantParent {
+		return nil
+	}
+	idMap, err := r.SpanTreeIdentityForBlock(blockIdx)
+	if err != nil {
+		return fmt.Errorf("lookupIntrinsicFieldsTypedForBlock: SpanTreeIdentityForBlock: %w", err)
+	}
+	if idMap == nil {
+		return nil
+	}
+	for rowIdx, rec := range idMap {
+		idx := int(rowIdx)
+		if idx >= len(result) {
+			continue
+		}
+		if wantTrace {
+			result[idx].traceID = rec.TraceID
+			result[idx].present |= intrinsicPresentTraceID
+		}
+		if wantSpan {
+			result[idx].spanID = rec.SpanID
+			result[idx].present |= intrinsicPresentSpanID
+		}
+		if wantParent {
+			result[idx].parentID = rec.ParentID
+			result[idx].present |= intrinsicPresentParentID
+		}
+	}
+	return nil
 }
 
 // populateTypedColumnForBlock fills one column's values into result for all spans

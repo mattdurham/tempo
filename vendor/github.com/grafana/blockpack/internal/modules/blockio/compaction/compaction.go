@@ -28,6 +28,12 @@ func buildDedupeIndex(r *modules_reader.Reader, blockIdx int) map[uint16]blockID
 	if r == nil {
 		return nil
 	}
+	// NOTE-476 (issue #394): blocks written without IntrinsicTOC identity columns store
+	// (trace:id, span:id) solely in the SpanTree. Source the dedup keys from the SpanTree
+	// reverse map for such blocks, otherwise dedupeKey finds no key and every span is dropped.
+	if !r.HasIntrinsicColumn("trace:id") && r.HasSpanTree() {
+		return buildDedupeIndexFromSpanTree(r, blockIdx)
+	}
 	names := r.IntrinsicColumnNames()
 	if len(names) == 0 {
 		return nil
@@ -56,6 +62,27 @@ func buildDedupeIndex(r *modules_reader.Reader, blockIdx int) map[uint16]blockID
 			}
 			out[ref.RowIdx] = entry
 		}
+	}
+	return out
+}
+
+// buildDedupeIndexFromSpanTree builds the per-row (trace:id, span:id) dedup index for a block
+// whose identity is stored in the SpanTree rather than the IntrinsicTOC. NOTE-476 (issue #394).
+func buildDedupeIndexFromSpanTree(r *modules_reader.Reader, blockIdx int) map[uint16]blockIDPair {
+	if blockIdx < 0 || blockIdx > int(^uint16(0)) {
+		return nil
+	}
+	idMap, err := r.SpanTreeIdentityForBlock(uint16(blockIdx)) //nolint:gosec // bounded above
+	if err != nil || idMap == nil {
+		return nil
+	}
+	out := make(map[uint16]blockIDPair, len(idMap))
+	for rowIdx, rec := range idMap {
+		tid := make([]byte, 16)
+		copy(tid, rec.TraceID[:])
+		sid := make([]byte, 8)
+		copy(sid, rec.SpanID[:])
+		out[rowIdx] = blockIDPair{traceID: tid, spanID: sid}
 	}
 	return out
 }
@@ -363,6 +390,9 @@ func (s *compactionState) ensureWriter() error {
 		// the output block so all of compaction's disk I/O stays on the configured scratch
 		// volume rather than the default /tmp.
 		ScratchDir: s.stagingDir,
+		// NOTE-476 (issue #394): drop identity columns from the compacted IntrinsicTOC when
+		// configured; the SpanTree section is the identity store for such blocks.
+		OmitIntrinsicIdentityColumns: s.cfg.OmitIntrinsicIdentityColumns,
 	})
 	if err != nil {
 		_ = f.Close()

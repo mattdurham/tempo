@@ -1767,3 +1767,22 @@ in the week of 2026-06-09.
 Back-ref: `internal/modules/blockio/reader/parser.go:readFooter`,
           `internal/modules/blockio/reader/reader.go:NewReaderFromProvider`,
           `internal/modules/blockio/shared/constants.go`
+
+## NOTE-476 — SpanFieldsProvider identity fallback (issue #394)
+
+`modulesSpanFieldsAdapter` now carries `reader`+`blockIdx` again (they had been removed as
+"unused" when the block payload became the authoritative field source). Both `GetField` and
+`IterateFields` fall back to `Reader.SpanTreeIdentityForBlock` for the three identity fields
+(`trace:id`/`span:id`/`span:parent_id`) when they are absent from the block payload.
+
+This is REQUIRED for omit-identity blocks (`OmitIntrinsicIdentityColumns`): the dominant break
+is root-span detection. `SpanMatch.IsRoot()` keys on `span:parent_id` *absence*, and
+`SpanMatch.Clone()` materializes fields via `IterateFields` — so without the `IterateFields`
+fallback the cloned result loses `span:parent_id` for EVERY span and every span looks like a
+root (tempo's `RootTraceName` search metadata regresses to a child-span name). Root spans (zero
+parent) intentionally emit no `span:parent_id`, matching genuine column absence so `IsRoot` still
+fires for them.
+
+**Back-ref:** `blockio/span_fields.go:GetField`/`IterateFields`/`spanTreeIdentityField`,
+`blockio/modulesspanfieldsadapter.go`. Tests:
+`omit_intrinsic_identity_test.go:TestOmitIntrinsicIdentity_RootDetection`.

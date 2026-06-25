@@ -63,6 +63,12 @@ func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.Blo
 		// snappy. The reader is always codec-aware (additive flag on the V15 flags byte), so
 		// any V15 reader decodes zstd blobs. Shrinks on-disk size on the I/O-bound read path.
 		EnableZstdColumns: true,
+		// blockpack NOTE-476 (issue #394): omit the trace:id/span:id/span:parent_id columns
+		// from the IntrinsicTOC (~26% of L1 file size). Identity is served from the SpanTree
+		// section, which already stores (TraceID, SpanID, ParentID, BlockIdx, RowIdx) per span.
+		// The reader's SpanTree identity fallback is unconditional and was added in the same
+		// change, so enabling this here is safe (this binary's reader understands omit blocks).
+		OmitIntrinsicIdentityColumns: true,
 	}
 	// Pass embedder to blockpack writer — it handles field assembly and embedding internally.
 	// Must guard against nil *Embedder assigned to interface (Go nil interface trap).

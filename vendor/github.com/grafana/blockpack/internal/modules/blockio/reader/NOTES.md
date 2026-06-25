@@ -3303,3 +3303,26 @@ density of the output block.
 
 **Back-ref:** `reader/intrinsic_reader.go:IntrinsicDictStringSet,ScanDictGroupByColumn`,
 `shared/intrinsic_stream.go:ScanDictPagedColumnBlob,DictPageValue`, top-level `blocksimilarity.go`.
+
+## NOTE-476 — SpanTree-backed identity reverse map (issue #394)
+
+Blocks may now be written with `WriterConfig.OmitIntrinsicIdentityColumns`, dropping the three
+identity columns (`trace:id`, `span:id`, `span:parent_id`) from the IntrinsicTOC. These columns
+were ~26% of L1 file size and are fully redundant with the SpanTree section, which already stores
+`(TraceID, SpanID, ParentID, BlockIdx, RowIdx)` for every span.
+
+**Reader side.** `Reader.SpanTreeIdentityForBlock(blockIdx)` returns `map[uint16]SpanTreeRecord`
+(RowIdx → record) for one block. The first call decodes every SpanTree chunk once
+(`buildSpanTreeIdentityMaps`), groups records by `BlockIdx`, and memoizes the result on the Reader
+(guarded by `spanTreeIdentityMu`). Subsequent per-block calls within the same query are O(1).
+Records are sorted by `(traceID, dfsIn)` — not by block — so a whole-section scan is unavoidable,
+but Reader is constructed fresh per query per block (the foundational cache invariant), so the
+scan happens at most once per query.
+
+**Backwards compatibility — no version bump.** Absence is detected via `HasIntrinsicColumn`. The
+IntrinsicTOC is a self-describing column set; fewer columns is NOT a format change, so V14/V15
+readers transparently fall back. Old blocks keep their identity columns and never touch the
+SpanTree fallback.
+
+**Back-ref:** `reader/spantree.go:SpanTreeIdentityForBlock`/`buildSpanTreeIdentityMaps`,
+`reader/reader.go:spanTreeIdentityByBlock`. Tests: top-level `omit_intrinsic_identity_test.go`.

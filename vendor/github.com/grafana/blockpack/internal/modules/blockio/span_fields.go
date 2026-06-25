@@ -28,21 +28,24 @@ func getSpanFieldsAdapter(block *modules_reader.Block, rowIdx int) *modulesSpanF
 	a := modulesSpanFieldsAdapterPool.Get().(*modulesSpanFieldsAdapter)
 	a.block = block
 	a.rowIdx = rowIdx
+	a.reader = nil
+	a.blockIdx = 0
 	return a
 }
 
-// getSpanFieldsAdapterWithReader returns a pooled adapter. The reader parameter
-// is accepted for API compatibility but is no longer used — the block payload is
-// the sole authoritative source for all fields.
+// getSpanFieldsAdapterWithReader returns a pooled adapter. The block payload is the
+// authoritative source for all non-identity fields; reader+blockIdx enable the SpanTree
+// identity fallback (NOTE-476, issue #394) for trace:id/span:id/span:parent_id when those
+// columns are absent from both the block payload and the IntrinsicTOC.
 func getSpanFieldsAdapterWithReader(
 	block *modules_reader.Block, reader *modules_reader.Reader, blockIdx, rowIdx int,
 	_ map[string]struct{},
 ) *modulesSpanFieldsAdapter {
-	_ = reader
-	_ = blockIdx
 	a := modulesSpanFieldsAdapterPool.Get().(*modulesSpanFieldsAdapter)
 	a.block = block
 	a.rowIdx = rowIdx
+	a.reader = reader
+	a.blockIdx = blockIdx
 	return a
 }
 
@@ -50,6 +53,8 @@ func getSpanFieldsAdapterWithReader(
 func putSpanFieldsAdapter(a *modulesSpanFieldsAdapter) {
 	a.block = nil
 	a.rowIdx = 0
+	a.reader = nil
+	a.blockIdx = 0
 	modulesSpanFieldsAdapterPool.Put(a)
 }
 
@@ -72,10 +77,10 @@ func NewSpanFieldsAdapter(block *modules_reader.Block, rowIdx int) modules_share
 	return getSpanFieldsAdapter(block, rowIdx)
 }
 
-// NewSpanFieldsAdapterWithReader returns a SpanFieldsProvider backed by the block payload.
-// The reader, blockIdx, and wantCols parameters are accepted for API compatibility but
-// are no longer used — the block payload is the sole authoritative source.
-// Release via ReleaseSpanFieldsAdapter.
+// NewSpanFieldsAdapterWithReader returns a SpanFieldsProvider backed by the block payload, with
+// a SpanTree identity fallback (NOTE-476, issue #394) for trace:id/span:id/span:parent_id when
+// those columns are absent from the block payload and IntrinsicTOC. wantCols is accepted for API
+// compatibility. Release via ReleaseSpanFieldsAdapter.
 func NewSpanFieldsAdapterWithReader(
 	block *modules_reader.Block, reader *modules_reader.Reader, blockIdx, rowIdx int,
 	wantCols map[string]struct{},
@@ -156,6 +161,57 @@ func (a *modulesSpanFieldsAdapter) GetField(name string) (any, bool) {
 		}
 		return nil, false
 	}
+	// NOTE-476 (issue #394): identity fields may be absent from the block payload AND the
+	// IntrinsicTOC (OmitIntrinsicIdentityColumns); resolve them from the SpanTree. Critical for
+	// SpanMatch.IsRoot, which keys root detection on span:parent_id absence.
+	if v, ok := a.spanTreeIdentityField(name); ok {
+		return v, true
+	}
+	return nil, false
+}
+
+// spanTreeIdentityField resolves trace:id/span:id/span:parent_id for this adapter's row from
+// the SpanTree identity reverse map. Returns (nil, false) when the field is not an identity
+// field, no reader is attached, the file has no SpanTree, the row is absent, or — for
+// span:parent_id — the span is a root (zero parent, matching the writer's "absent when empty"
+// convention so IsRoot detects it). NOTE-476 (issue #394).
+func (a *modulesSpanFieldsAdapter) spanTreeIdentityField(name string) (any, bool) {
+	if a.reader == nil {
+		return nil, false
+	}
+	if name != "trace:id" && name != "span:id" && name != "span:parent_id" {
+		return nil, false
+	}
+	if a.blockIdx < 0 || a.blockIdx > int(^uint16(0)) || a.rowIdx < 0 || a.rowIdx > int(^uint16(0)) {
+		return nil, false
+	}
+	idMap, err := a.reader.SpanTreeIdentityForBlock(uint16(a.blockIdx)) //nolint:gosec // bounded above
+	if err != nil || idMap == nil {
+		return nil, false
+	}
+	rec, ok := idMap[uint16(a.rowIdx)] //nolint:gosec // bounded above
+	if !ok {
+		return nil, false
+	}
+	switch name {
+	case "trace:id":
+		b := make([]byte, 16)
+		copy(b, rec.TraceID[:])
+		return b, true
+	case "span:id":
+		b := make([]byte, 8)
+		copy(b, rec.SpanID[:])
+		return b, true
+	case "span:parent_id":
+		// Root spans have a zero parent: report ABSENT so IsRoot treats them as roots, exactly
+		// as a missing intrinsic/block column would.
+		if rec.ParentID == ([8]byte{}) {
+			return nil, false
+		}
+		b := make([]byte, 8)
+		copy(b, rec.ParentID[:])
+		return b, true
+	}
 	return nil, false
 }
 
@@ -183,5 +239,21 @@ func (a *modulesSpanFieldsAdapter) IterateFields(fn func(name string, value any)
 			return
 		}
 	}
-	// Intrinsic fallback removed — block payload is the authoritative source for all paths.
+	// NOTE-476 (issue #394): emit the identity fields from the SpanTree when they are absent
+	// from the block payload (OmitIntrinsicIdentityColumns). SpanMatch.Clone materializes via
+	// IterateFields, so the cloned result would otherwise lose trace:id/span:id/span:parent_id
+	// — breaking root detection (IsRoot keys on span:parent_id) and any downstream identity use.
+	// Root spans (zero parent) intentionally emit no span:parent_id, matching column absence.
+	if a.reader != nil {
+		for _, name := range [...]string{"trace:id", "span:id", "span:parent_id"} {
+			if modulesLookupColumn(a.block, name) != nil {
+				continue // already emitted from the block payload above
+			}
+			if v, ok := a.spanTreeIdentityField(name); ok {
+				if !fn(name, v) {
+					return
+				}
+			}
+		}
+	}
 }

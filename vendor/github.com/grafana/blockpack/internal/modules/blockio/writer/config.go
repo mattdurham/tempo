@@ -76,6 +76,25 @@ type Config struct {
 
 	MaxBlockSpans int
 
+	// MinBlockSpans is the minimum number of spans to accumulate before the writer
+	// will flush an inner block at a (service.name, span.name) group boundary.
+	//
+	// NOTE-474: boundary-aware slicing emits a block at a group boundary when the
+	// current block holds ≥ MinBlockSpans spans. This keeps homogeneous groups
+	// together (better dictionary/RLE compression) while batching tiny groups into
+	// reasonably-sized blocks instead of emitting one block per rare operation.
+	// MaxBlockSpans is the hard cap regardless of group boundaries.
+	//
+	// NOTE-091 caveat: structural queries (>>, <<, >, ~) assume most spans of a
+	// trace reside in a single inner block. Boundary-aware slicing splits spans by
+	// (svc, op), so multi-service traces will span multiple blocks. Intermediate
+	// ancestor spans from services that do not match either structural predicate may
+	// reside in pruned blocks, causing false negatives. This is tracked as a known
+	// limitation to be fixed in the structural executor (see NOTE-091).
+	//
+	// 0 means use the default of defaultMinBlockSpans (100).
+	MinBlockSpans int
+
 	// MaxBufferedSpans is the maximum number of spans buffered before an automatic
 	// flush of completed blocks is performed. When len(w.pending) reaches this limit,
 	// spans are sorted, encoded into blocks, and written to the output stream; the
@@ -168,4 +187,19 @@ type Config struct {
 	// so any V15 reader decodes zstd blobs without a further version bump. Defaults OFF so it
 	// can be rolled out deliberately and reverted by toggle without a format change.
 	EnableZstdColumns bool
+
+	// OmitIntrinsicIdentityColumns drops the three identity columns (trace:id, span:id,
+	// span:parent_id) from the persisted IntrinsicTOC (NOTE-476, issue #394). These columns
+	// account for ~26% of L1 file size and are redundant: the SpanTree section already stores
+	// (TraceID, SpanID, ParentID, BlockIdx, RowIdx) for every span. When true, the writer still
+	// feeds the per-block accumulator so the SpanTree is built from it, but the file-level
+	// intrinsic spill skips these three columns so they never reach the final TOC.
+	//
+	// Readers detect absence via HasIntrinsicColumn and fall back to the per-block SpanTree
+	// identity reverse map (Reader.SpanTreeIdentityForBlock). The reader fallback is
+	// UNCONDITIONAL and always present, so this flag is safe to enable on a reader that already
+	// understands the SpanTree section. Defaults OFF so it can be rolled out by toggle without a
+	// block-format version bump (the IntrinsicTOC is a self-describing column set — fewer
+	// columns is not a format change).
+	OmitIntrinsicIdentityColumns bool
 }

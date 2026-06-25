@@ -1329,3 +1329,35 @@ rarely hit, but it is now correct.)
 
 **Back-ref:** `internal/modules/blockio/writer/writer_block.go:buildIntrinsicBlockIndex`/
 `feedIntrinsicsFromIndex`/`intrinsicRowFields`, `internal/modules/blockio/writer/writer.go:AddRowFromReader`.
+
+## NOTE-476 — Omit identity columns from IntrinsicTOC (issue #394)
+
+`Config.OmitIntrinsicIdentityColumns` drops `trace:id`/`span:id`/`span:parent_id` from the
+persisted IntrinsicTOC. The SpanTree section is the sole identity store for such blocks (it
+already carries every span's identity + `(BlockIdx, RowIdx)`).
+
+**Mechanism.** `feedSpanIdentifiers` still feeds the *per-block* accumulator unchanged — the
+SpanTree is built from it in `feedSpanTreeFromAccum`, which runs AFTER `spillMerge` but reads
+`built.localAccum`, NOT the file-level spill. The columns are dropped at the *file-level spill*:
+`tempFileAccum.skipCols` (set from the flag in `ensureIntrinsicAccum`) makes `spillMerge` skip
+those column names, so they never reach the final TOC. Critically: the per-block accumulator
+keeps them (SpanTree needs them), only the persisted TOC loses them.
+
+**Compaction (recompaction).** `buildIntrinsicBlockIndex` detects a source block with no
+`trace:id` IntrinsicTOC column + a SpanTree and sources the per-row identity from
+`SpanTreeIdentityForBlock` (`fillIntrinsicIndexFromSpanTree`) instead of the absent columns, so
+identity is not silently dropped. The compaction dedup index (`buildDedupeIndex`) does the same
+via `buildDedupeIndexFromSpanTree` — without it, dedupeKey finds no `(trace:id, span:id)` key and
+every span is dropped. `compaction.Config.OmitIntrinsicIdentityColumns` threads the flag to the
+output writer.
+
+**Defaults OFF.** Rollout toggle, no format version bump (see reader NOTE-476). The reader
+fallback is unconditional and always present, so the flag is safe to enable on any reader that
+understands the SpanTree section.
+
+**Back-ref:** `writer/config.go:OmitIntrinsicIdentityColumns`,
+`writer/intrinsic_tempfile.go:tempFileAccum.skipCols`/`spillMerge`,
+`writer/writer.go:ensureIntrinsicAccum`, `writer/writer_block.go:fillIntrinsicIndexFromSpanTree`,
+`compaction/compaction.go:buildDedupeIndexFromSpanTree`. Tests:
+`compaction/compaction_test.go:TestCompactBlocks_OmitIdentity_SpanTreeRecompaction`,
+top-level `omit_intrinsic_identity_test.go`.

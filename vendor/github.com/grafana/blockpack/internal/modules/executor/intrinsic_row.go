@@ -135,7 +135,69 @@ func lookupIntrinsicFieldsTyped(
 		}
 	}
 
+	// NOTE-476 (issue #394): identity columns may be absent from the IntrinsicTOC for blocks
+	// that store identity solely in the SpanTree. Fall back to the per-block SpanTree identity
+	// map for any requested identity column the loop above did not populate. selected refs
+	// carry (BlockIdx, RowIdx), so each ref's identity is one O(1) map lookup.
+	if err := fillIdentityFromSpanTreeRefs(r, selected, wantCol, result); err != nil {
+		putIntrinsicRowFields(result)
+		return nil, err
+	}
+
 	return result, nil
+}
+
+// fillIdentityFromSpanTreeRefs populates trace:id/span:id/span:parent_id for each selected ref
+// from its block's SpanTree identity map, for any of the three columns that is requested but
+// absent from the IntrinsicTOC. Maps are fetched once per distinct block referenced. NOTE-476.
+func fillIdentityFromSpanTreeRefs(
+	r *modules_reader.Reader,
+	selected []modules_shared.BlockRef,
+	wantCol func(string) bool,
+	result []intrinsicRowFields,
+) error {
+	wantTrace := wantCol(colNameTraceID) && !r.HasIntrinsicColumn(colNameTraceID)
+	wantSpan := wantCol(colNameSpanID) && !r.HasIntrinsicColumn(colNameSpanID)
+	wantParent := wantCol(colNameParentID) && !r.HasIntrinsicColumn(colNameParentID)
+	if !wantTrace && !wantSpan && !wantParent {
+		return nil
+	}
+	var (
+		curBlock uint16
+		curMap   map[uint16]modules_shared.SpanTreeRecord
+		haveMap  bool
+	)
+	for i, ref := range selected {
+		if !haveMap || ref.BlockIdx != curBlock {
+			m, err := r.SpanTreeIdentityForBlock(ref.BlockIdx)
+			if err != nil {
+				return fmt.Errorf("lookupIntrinsicFieldsTyped: SpanTreeIdentityForBlock: %w", err)
+			}
+			curMap = m
+			curBlock = ref.BlockIdx
+			haveMap = true
+		}
+		if curMap == nil {
+			continue
+		}
+		rec, ok := curMap[ref.RowIdx]
+		if !ok {
+			continue
+		}
+		if wantTrace {
+			result[i].traceID = rec.TraceID
+			result[i].present |= intrinsicPresentTraceID
+		}
+		if wantSpan {
+			result[i].spanID = rec.SpanID
+			result[i].present |= intrinsicPresentSpanID
+		}
+		if wantParent {
+			result[i].parentID = rec.ParentID
+			result[i].present |= intrinsicPresentParentID
+		}
+	}
+	return nil
 }
 
 // populateTypedColumn fills one column's values into the result slice via typed ref lookups.
