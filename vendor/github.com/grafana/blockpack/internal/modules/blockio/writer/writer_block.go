@@ -1178,11 +1178,21 @@ func buildIntrinsicBlockIndex(r *modules_reader.Reader, srcBlockIdx int) intrins
 	}
 	identityOnly := []string{traceIDColumnName, spanIDColumnName, spanParentIDColumnName}
 
-	// NOTE-476 (issue #394): source blocks written with OmitIntrinsicIdentityColumns have no
-	// identity columns in the IntrinsicTOC — their identity lives solely in the SpanTree.
-	// Detect that and source the identity fields from the per-block SpanTree reverse map
-	// instead, so recompaction does not silently drop trace:id/span:id/span:parent_id.
-	if !r.HasIntrinsicColumn(traceIDColumnName) && r.HasSpanTree() {
+	// NOTE-478 (issue #396): prefer the SpanTree whenever it is present — it is a fixed-stride
+	// binary scan over already-cached records (the per-block identity maps are built once per
+	// Reader and shared across every srcBlockIdx in the job, see SpanTreeIdentityForBlock). The
+	// IntrinsicTOC path instead drives GetIntrinsicColumn -> decodeIntrinsicColumnBlobOpt ->
+	// decodePagedColumnBlobOpt, decoding snappy+XOR+paged column blobs purely to recover identity
+	// bytes that the SpanTree already holds verbatim. Pyroscope attributed ~40% of L1->L2
+	// compaction heap to that decode chain. The SpanTree path is never the more expensive option
+	// when a SpanTree is present, so it is preferred unconditionally here.
+	//
+	// NOTE-476 (issue #394): this also covers blocks written with OmitIntrinsicIdentityColumns,
+	// whose identity lives solely in the SpanTree (no IntrinsicTOC identity columns at all).
+	//
+	// Fall back to the IntrinsicTOC identity columns only for legacy blocks that predate the
+	// SpanTree (HasSpanTree() == false) — those have no other identity source.
+	if r.HasSpanTree() {
 		if filled := fillIntrinsicIndexFromSpanTree(r, srcBlockIdx, setField); filled {
 			if out.rows == nil {
 				out.rows = []intrinsicRowEntry{}

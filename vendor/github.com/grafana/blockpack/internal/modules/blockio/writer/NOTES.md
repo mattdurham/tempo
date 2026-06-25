@@ -1361,3 +1361,48 @@ understands the SpanTree section.
 `compaction/compaction.go:buildDedupeIndexFromSpanTree`. Tests:
 `compaction/compaction_test.go:TestCompactBlocks_OmitIdentity_SpanTreeRecompaction`,
 top-level `omit_intrinsic_identity_test.go`.
+
+## NOTE-478 — Prefer SpanTree over IntrinsicTOC for identity decode (issue #396)
+
+`buildIntrinsicBlockIndex` builds a per-block `(rowIdx → {trace:id, span:id, span:parent_id})`
+index during compaction. NOTE-476 added a SpanTree identity path but guarded it with
+`!HasIntrinsicColumn(trace:id) && HasSpanTree()` — so it only fired for blocks written with
+`OmitIntrinsicIdentityColumns` (no IntrinsicTOC identity at all). Every block in the steady-state
+fleet carries a SpanTree, so for the common case (SpanTree **plus** IntrinsicTOC identity) the
+code fell through to the expensive column path: `GetIntrinsicColumn` →
+`decodeIntrinsicColumnBlobOpt` → `decodePagedColumnBlobOpt`, decoding snappy+XOR+paged column
+blobs purely to recover identity bytes the SpanTree already holds verbatim.
+
+**Pyroscope (L1→L2 compaction, backend-worker-0..4):** the `getOrBuildAddRowIndex` →
+`GetIntrinsicColumn` chain held ~40% of live compaction heap; `decodePagedColumnBlobOpt` another
+~25%. The decode was pure waste whenever a SpanTree was present.
+
+**Fix:** drop the `!HasIntrinsicColumn(trace:id)` half of the guard. Prefer the SpanTree
+whenever `HasSpanTree()`:
+
+```go
+if r.HasSpanTree() {
+    if filled := fillIntrinsicIndexFromSpanTree(r, srcBlockIdx, setField); filled {
+        return out // identity sourced from cached, fixed-stride SpanTree records
+    }
+}
+// legacy fallback: IntrinsicTOC identity columns (pre-SpanTree blocks only)
+```
+
+`SpanTreeIdentityForBlock` decodes every SpanTree chunk once and caches the per-block
+`RowIdx→record` maps on the Reader, so the cost is paid once per job and shared across all
+`srcBlockIdx` lookups — versus per-block snappy+XOR+paged column decode in the old path. The
+SpanTree path is never the more expensive option when a SpanTree is present.
+
+**Correctness — degenerate rows.** `feedSpanTreeFromAccum` skips rows with no `span:id` ("not
+addressable"), so the SpanTree omits any span lacking a span:id, whereas the old IntrinsicTOC
+path would have carried that row's lone `trace:id`. Such a row is malformed (OTLP requires a
+span:id), can never be deduped (no `(trace:id, span:id)` key) or looked up, and the skip is
+already the accepted contract for all `OmitIntrinsicIdentityColumns` blocks (NOTE-476).
+Extending it to legacy blocks is consistent.
+
+**Back-ref:** `writer/writer_block.go:buildIntrinsicBlockIndex`/`fillIntrinsicIndexFromSpanTree`,
+`reader/spantree.go:SpanTreeIdentityForBlock`/`buildSpanTreeIdentityMaps`. Tests:
+`writer/writer_test.go:TestBuildIntrinsicBlockIndexPrefersSpanTree` (asserts a block with BOTH
+identity sources routes through the SpanTree and yields identical, correct per-row identity),
+white-box hook `writer/export_test.go:FillIntrinsicIndexFromSpanTreeForTest`.
