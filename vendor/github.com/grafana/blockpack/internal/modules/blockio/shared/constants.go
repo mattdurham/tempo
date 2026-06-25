@@ -76,6 +76,13 @@ const (
 	ToCSubTypeValueIndexMeta      uint32 = 14 // value index column identity + compaction level + wall min/max ts
 	ToCSubTypeValueIndexHashIndex uint32 = 15 // value index sorted (value_hash → chunk_idx) lookup table
 
+	// ToCSubTypeValueCounts (VCNT) records unique values and signed span counts per column
+	// for time-bounded tag-value lookups (SPEC: issue #400, internal/modules/valuecounts).
+	// Positive count: value appears in count spans within the time range in this file.
+	// Negative count: delta accounting — a prior file's contribution is being subtracted
+	// (source block deleted by retention, or superseded by a compacted output).
+	ToCSubTypeValueCounts uint32 = 16
+
 	// ToCEntry SubType constants for ToCTypeIndex (Type=2).
 	ToCSubTypeBlockIndex uint32 = 7 // block offset table
 
@@ -114,9 +121,10 @@ const (
 	// Retained as a wire-format threshold constant; the V12 block format is no longer written.
 	VersionBlockV12 uint8 = 12
 
-	SignalTypeTrace      uint8 = 0x01 // file contains OTEL trace spans
-	SignalTypeLog        uint8 = 0x02 // file contains OTEL log records
-	SignalTypeValueIndex uint8 = 0x03 // file is a value index (internal/modules/valueindex)
+	SignalTypeTrace       uint8 = 0x01 // file contains OTEL trace spans
+	SignalTypeLog         uint8 = 0x02 // file contains OTEL log records
+	SignalTypeValueIndex  uint8 = 0x03 // file is a value index (internal/modules/valueindex)
+	SignalTypeValueCounts uint8 = 0x04 // file is a unique-value count index (internal/modules/valuecounts)
 
 	TraceIndexFmtVersion  uint8 = 0x01 // v1: block IDs + per-block span indices (legacy wire, still parsed in V8 files)
 	TraceIndexFmtVersion2 uint8 = 0x02 // v2: block IDs only — no per-block span indices
@@ -527,6 +535,16 @@ const (
 	ValueIndexTraceIDColumn   = "vi:trace_id"
 	ValueIndexSourceRefColumn = "vi:source_ref"
 	ValueIndexTimeSecColumn   = "vi:time_sec"
+
+	// ValueCountsRecordsPerChunk is the nominal number of VCNT records per snappy chunk.
+	// Records are smaller than value index posting list entries, so a larger nominal count
+	// keeps each decompressed chunk a few tens of KB.
+	ValueCountsRecordsPerChunk = 4_096
+
+	// ValueCountsFilenamePattern is fmt.Sprintf(ValueCountsFilenamePattern, level, id).
+	// Consolidated per-tenant count files live at
+	// indexes/<tenant>/unique_values/<column_hash>/L<level>-<id>.vcnt (issue #400).
+	ValueCountsFilenamePattern = "L%d-%s.vcnt"
 )
 
 // MaxIntrinsicRows is the safety cap on accumulated rows in a single intrinsic column.
