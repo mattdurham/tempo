@@ -295,13 +295,25 @@ type rangeBlockProvider struct {
 }
 
 // newRangeBlockProvider resolves the block's object size (needed for footer reads from the
-// end of the file) via a StreamReader open, immediately closing the body without reading it.
+// end of the file) and returns a ranged-GET provider.
+//
+// NOTE-477 (blockpack issue #395): the size comes from the already-loaded block meta
+// (BlockMeta.Size_, set by the compactor when writing the block). StreamReader is a FULL
+// object download on the S3 backend (s3.Read -> readAll), and the previous code opened it
+// purely to read the returned size, then discarded the body — downloading the entire (often
+// multi-GB) block just to learn its length, once per input block, before compaction even
+// started. We only fall back to StreamReader for legacy blocks written before size tracking
+// (Size_ == 0).
 func newRangeBlockProvider(ctx context.Context, r backend.Reader, m *backend.BlockMeta) (*rangeBlockProvider, error) {
-	rc, size, err := r.StreamReader(ctx, DataFileName, uuid.UUID(m.BlockID), m.TenantID)
-	if err != nil {
-		return nil, fmt.Errorf("stat block %s: %w", m.BlockID, err)
+	size := int64(m.Size_)
+	if size == 0 {
+		rc, s, err := r.StreamReader(ctx, DataFileName, uuid.UUID(m.BlockID), m.TenantID)
+		if err != nil {
+			return nil, fmt.Errorf("stat block %s: %w", m.BlockID, err)
+		}
+		_ = rc.Close()
+		size = s
 	}
-	_ = rc.Close()
 	return &rangeBlockProvider{
 		ctx:      ctx,
 		r:        r,
