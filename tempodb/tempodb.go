@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/grafana/blockpack/blockevents"
 	"github.com/grafana/tempo/pkg/collector"
 	"github.com/grafana/tempo/pkg/util"
 	"go.opentelemetry.io/otel/attribute"
@@ -263,6 +264,14 @@ func New(cfg *Config, cacheProvider cache.Provider, logger gkLog.Logger) (Reader
 	}
 	if cfg.Block != nil && cfg.Block.Blockpack.EmbeddingURL != "" {
 		vblockpack.ConfigureEmbedding(cfg.Block.Blockpack.EmbeddingURL, cfg.Block.Blockpack.EmbeddingConcurrentBatches, cfg.Block.Blockpack.EmbeddingBatchSize, cfg.Block.Blockpack.EmbeddingMaxTextLength)
+	}
+	if cfg.Block != nil && cfg.Block.Blockpack.BlockEvents.Enabled {
+		be := cfg.Block.Blockpack.BlockEvents
+		vblockpack.ConfigureBlockEvents(blockevents.Config{
+			Enabled:    be.Enabled,
+			RedisAddr:  be.RedisAddr,
+			StreamName: be.StreamName,
+		})
 	}
 
 	return rw, rw, rw, nil

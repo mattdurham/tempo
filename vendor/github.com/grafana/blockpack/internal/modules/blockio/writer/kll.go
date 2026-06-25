@@ -78,6 +78,13 @@ func NewKLL[T cmp.Ordered]() *KLL[T] {
 	return newKLLWithK[T](kllDefaultK)
 }
 
+// NewKLLWithK creates a KLL sketch for any ordered type using a custom k parameter.
+// Higher k yields lower quantile error (O(1/k)) at the cost of more memory.
+// Use NewKLL for the default k=200 parameter.
+func NewKLLWithK[T cmp.Ordered](k int) *KLL[T] {
+	return newKLLWithK[T](k)
+}
+
 func newKLLWithK[T cmp.Ordered](k int) *KLL[T] {
 	sk := &KLL[T]{k: k, rng: 0xdeadbeefcafebabe}
 	sk.levels = [][]T{make([]T, 0, kllLevelCap(k, 1, 0))}
@@ -244,6 +251,13 @@ func (sk *KLL[T]) Boundaries(nBuckets int) []T {
 // KLLBytes is a KLL sketch for []byte values using lexicographic ordering.
 
 // per-instance xorshift64 state; never zero after init
+
+// NewKLLBytesWithK creates a new KLLBytes sketch with a custom k parameter.
+func NewKLLBytesWithK(k int) *KLLBytes {
+	sk := &KLLBytes{k: k, rng: 0xdeadbeefcafebabe}
+	sk.levels = [][][]byte{make([][]byte, 0, kllLevelCap(k, 1, 0))}
+	return sk
+}
 
 // NewKLLBytes creates a new KLLBytes sketch.
 func NewKLLBytes() *KLLBytes {

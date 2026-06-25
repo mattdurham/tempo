@@ -161,6 +161,11 @@ func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.Blo
 		return nil, fmt.Errorf("failed to write block metadata: %w", err)
 	}
 
+	// blockpack issue #397: publish a "create" event so downstream consumers
+	// (the value index builder) can index this block asynchronously. Non-blocking
+	// and best-effort — a NoopPublisher unless block events are configured.
+	publishBlockCreated(ctx, blockObjectKey(meta.TenantID, blockUUID.String()))
+
 	return meta, nil
 }
 

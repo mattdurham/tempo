@@ -158,6 +158,15 @@ func (c *Compactor) Compact(ctx context.Context, l log.Logger, r backend.Reader,
 		c.opts.ObjectsWritten(int(maxCompactionLevel), int(totalObjects))
 	}
 
+	// blockpack issue #397: publish a "create" event for each compacted output
+	// block so the value index builder can re-index it asynchronously. Source
+	// blocks are dropped by the value index compactor's source-existence check
+	// once retention removes them, so no delete events are needed here.
+	// Non-blocking and best-effort.
+	for _, m := range out.metas {
+		publishBlockCreated(ctx, blockObjectKey(m.TenantID, uuid.UUID(m.BlockID).String()))
+	}
+
 	return out.metas, nil
 }
 

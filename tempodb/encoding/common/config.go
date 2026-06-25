@@ -133,6 +133,23 @@ type BlockpackConfig struct {
 	// MemoryCacheBytes is the size of the in-process LRU memory cache (default: 256MB).
 	// 256 MB in-process LRU cache is always on; set to 0 to disable.
 	MemoryCacheBytes int64 `yaml:"memory_cache_bytes"`
+
+	// BlockEvents configures publishing of blockpack lifecycle events to a queue
+	// (blockpack issue #397). Disabled by default. When enabled, a "create" event
+	// is published after each block is created or compacted so the value index
+	// builder can index it asynchronously.
+	BlockEvents BlockEventsConfig `yaml:"block_events"`
+}
+
+// BlockEventsConfig mirrors blockevents.Config. It is a separate Tempo struct so
+// the Tempo config does not depend on a blockpack type for YAML decoding.
+type BlockEventsConfig struct {
+	// Enabled turns on event publishing. When false no events are emitted.
+	Enabled bool `yaml:"enabled"`
+	// RedisAddr is the host:port of the Redis server backing the stream.
+	RedisAddr string `yaml:"redis_addr"`
+	// StreamName is the Redis stream key (default: "blockpack-events").
+	StreamName string `yaml:"stream_name"`
 }
 
 func (cfg *BlockConfig) RegisterFlagsAndApplyDefaults(prefix string, f *flag.FlagSet) {

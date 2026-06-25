@@ -137,6 +137,12 @@ func (r *Reader) fileLayoutV8() (*FileLayoutReport, error) {
 			sectionName = "section.file_bloom"
 		case key.Type == shared.ToCTypeMetadata && key.SubType == shared.ToCSubTypeIntrinsic:
 			sectionName = "intrinsic.column[" + key.Name + "]"
+		case key.Type == shared.ToCTypeMetadata && key.SubType == shared.ToCSubTypeValueIndexEntries:
+			sectionName = "section.valueindex.entries"
+		case key.Type == shared.ToCTypeMetadata && key.SubType == shared.ToCSubTypeValueIndexMeta:
+			sectionName = "section.valueindex.meta"
+		case key.Type == shared.ToCTypeMetadata && key.SubType == shared.ToCSubTypeValueIndexHashIndex:
+			sectionName = "section.valueindex.hashindex"
 		default:
 			sectionName = fmt.Sprintf("section.type%d.subtype%d[%s]", key.Type, key.SubType, key.Name)
 		}
