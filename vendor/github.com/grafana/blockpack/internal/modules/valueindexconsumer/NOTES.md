@@ -222,3 +222,68 @@ top of the loop. NOTE-VI-019's cooperative XAutoClaim reclaim runs inside `Poll`
 Back-refs:
 `internal/modules/valueindexconsumer/service.go`,
 `internal/modules/valueindexconsumer/config.go`
+
+## NOTE-VI-021 — rqlite job-table consumer (issue #405)
+
+Date: 2026-06-27
+
+Adds a pull-based `Consumer` (`RqliteConsumer`) backed by the rqlite job table,
+the consumer-side counterpart to the rqlite publisher (blockevents NOTE-VI-021).
+This is the queue-transport swap called for in #405; the `Service`
+orchestration, `Extractor`, and `ObjectPutter` are unchanged — rqlite replaces
+only how messages are delivered and acked.
+
+### Pull, not push — Poll = claim, Ack = delete
+
+The Redis consumer is push-delivered (XREADGROUP). The rqlite consumer pulls:
+
+- **Poll** issues a claim `UPDATE` that flips up to `BatchSize` eligible rows to
+  `status='in_progress'`, stamping `worker_id` and `claimed_at`, then reads back
+  the rows this worker now owns via `claimedPaths`. The `UPDATE ... WHERE
+  file_path IN (SELECT ... ORDER BY inserted_at ASC LIMIT N)` bounds the claim
+  and processes oldest-first (FIFO). rqlite's Raft layer serializes concurrent
+  workers' claim writes, so two workers never claim the same row — no
+  `FOR UPDATE SKIP LOCKED` needed.
+- **Ack** `DELETE`s the claimed rows by `file_path` (their `Message.ID`). The
+  table is self-trimming; a deleted row is never re-claimed.
+
+The `Message.ID` is the `file_path` itself (the primary key), so Ack deletes by
+it directly — no opaque queue token to track.
+
+### Inline stale reclaim — no reaper
+
+The claim predicate also matches rows whose `in_progress` claim is older than
+`ClaimIdleThreshold` (`status='in_progress' AND claimed_at < datetime('now',
+'-N seconds')`). A dead worker's orphaned claims are picked up by the next live
+Poll with no separate reaper process — the rqlite analogue of the Redis
+XAUTOCLAIM reclaim (NOTE-VI-019), but simpler because it is one predicate clause
+rather than a cursor scan.
+
+### Non-blocking Poll
+
+Poll does not block waiting for rows: an empty table returns an empty slice and
+nil error, so the caller's elapsed-time flush check (NOTE-VI-020) still runs.
+This matches the Redis consumer's empty-poll contract.
+
+### Testability — claimedPaths abstraction
+
+`gorqlite.QueryResult`'s fields are unexported and its `Next`/`Scan` dereference
+an internal connection, so a test fake cannot construct or iterate one. The
+`rqliteDB` interface therefore exposes reads through a `claimedPaths` method
+returning `[]string` rather than `*gorqlite.QueryResult`. `connAdapter` wraps a
+real `*gorqlite.Connection` to satisfy it (translating the SELECT into file
+paths); tests substitute a fake that returns scripted paths — full unit coverage
+with no real rqlite server.
+
+### Config
+
+`Config.RqliteURL` (YAML `rqlite_url`) is required by `NewRqliteConsumer`,
+ignored by the Redis consumer. `BatchSize` and `ClaimIdleThreshold` reuse the
+existing defaults. The Redis fields remain so the transport choice is the
+operator's; this commit adds the rqlite path without removing the Redis one.
+
+Back-refs:
+`internal/modules/valueindexconsumer/rqlite.go`,
+`internal/modules/valueindexconsumer/config.go`,
+`valueindexconsumer/valueindexconsumer.go`,
+`cmd/deadcode/main.go`

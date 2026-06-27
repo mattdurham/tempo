@@ -75,7 +75,7 @@ require (
 	github.com/bytedance/sonic v1.15.1
 	github.com/evanphx/json-patch v5.9.11+incompatible
 	github.com/googleapis/gax-go/v2 v2.22.0
-	github.com/grafana/blockpack v0.0.0-20260627090315-65812dfa
+	github.com/grafana/blockpack v0.0.0-20260627121813-3e8d0603
 	github.com/grafana/gomemcache v0.0.0-20251127154401-74f93547077b
 	github.com/grpc-ecosystem/go-grpc-middleware v1.4.0
 	github.com/hashicorp/golang-lru/v2 v2.0.7
@@ -125,7 +125,11 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260406210006-6f92a3bedf2d
 )
 
-require github.com/Microsoft/go-winio v0.6.2 // indirect
+require (
+	github.com/Microsoft/go-winio v0.6.2 // indirect
+	github.com/redis/go-redis/v9 v9.21.0 // indirect
+	github.com/rqlite/gorqlite v0.0.0-20260504155303-50d445fd0ab9 // indirect
+)
 
 require (
 	cel.dev/expr v0.25.1 // indirect

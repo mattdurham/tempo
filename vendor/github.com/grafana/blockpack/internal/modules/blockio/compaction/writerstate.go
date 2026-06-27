@@ -7,8 +7,8 @@ import (
 )
 
 type writerState struct {
-	w         *modules_blockio.Writer
-	f         *os.File // staging file — writer streams directly to disk, not to memory
+	w          *modules_blockio.Writer
+	f          *os.File // staging file — writer streams directly to disk, not to memory
 	stagedPath string
 	spanCount  int
 }

@@ -67,3 +67,57 @@ Back-ref: `internal/modules/blockevents/publisher.go`,
 `internal/modules/blockevents/noop.go`,
 `blockevents/blockevents.go`,
 `cmd/deadcode/main.go`
+
+## NOTE-VI-021 — rqlite job-table publisher (issue #405)
+
+Date: 2026-06-27
+
+Adds an rqlite-backed `Publisher` (`RqlitePublisher`) as an alternative queue
+transport to the Redis Streams publisher, per the design in #405. rqlite is
+distributed SQLite on Raft (MIT-licensed; genuine HA via quorum writes, no async
+replication window). The producer (block builder / compactor) writes one job row
+per blockpack file; stateless workers pull rows, process, and delete.
+
+### Design decisions
+
+- **Same `Publisher` interface, same hot-path contract.** Publish enqueues onto
+  a bounded buffered channel and returns immediately; a single background
+  goroutine performs the INSERT. A full buffer drops the message (counted by
+  `Dropped`), never blocking block creation/compaction. A lost create event is
+  recoverable — the S3 reconciler (design backstop in #405) re-inserts files with
+  no value index. This mirrors the Redis publisher exactly so the transport can
+  be swapped with no change to tempo's call sites.
+
+- **`INSERT ... ON CONFLICT (file_path) DO NOTHING`** makes a re-published create
+  idempotent — a duplicate (transient retry, or reconciler re-insert) is a no-op,
+  not an error. `file_path` is the table primary key.
+
+- **No MAXLEN trimming.** Unlike the Redis stream, the table is self-trimming:
+  the worker `DELETE`s the row on completion (Consumer.Ack). There is no unbounded
+  growth to cap.
+
+- **Shared idempotent schema (`ensureJobSchema`).** Both publisher and consumer
+  call it on startup. `CREATE TABLE / INDEX IF NOT EXISTS` is safe to run
+  concurrently from every pod — rqlite's Raft serialization guarantees the table
+  is created exactly once.
+
+### Testability
+
+`RqlitePublisher` depends on a tiny unexported `rqliteWriter` interface
+(`WriteParameterized{,Context}`, `Close`) rather than `*gorqlite.Connection`
+directly. Tests inject a fake (including a deliberately-blocking fake to exercise
+the drop-when-full path), so the package has full unit coverage with no real
+rqlite server.
+
+### Config
+
+`Config.RqliteURL` (YAML `rqlite_url`) is the HTTP URL of the rqlite cluster
+(e.g. `http://rqlite:4001`). It is required by `NewRqlitePublisher` and ignored by
+the Redis publisher. The Redis fields remain so the transport choice is the
+operator's; this commit adds the rqlite path without removing the Redis one.
+
+Back-refs:
+`internal/modules/blockevents/rqlite.go`,
+`internal/modules/blockevents/config.go`,
+`blockevents/blockevents.go`,
+`cmd/deadcode/main.go`

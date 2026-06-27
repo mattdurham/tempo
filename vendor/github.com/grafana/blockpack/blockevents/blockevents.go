@@ -45,6 +45,10 @@ type ChanPublisher = blockevents.ChanPublisher
 // hot path with a bounded internal buffer.
 type RedisStreamsPublisher = blockevents.RedisStreamsPublisher
 
+// RqlitePublisher publishes events as rows in the rqlite job table, non-blocking
+// on the hot path with a bounded internal buffer.
+type RqlitePublisher = blockevents.RqlitePublisher
+
 // ErrPublisherClosed is returned by Publish after the publisher has been closed.
 var ErrPublisherClosed = blockevents.ErrPublisherClosed
 
@@ -63,4 +67,11 @@ func NewNoopPublisher() *NoopPublisher {
 // NewChanPublisher returns an in-process ChanPublisher with the given buffer size.
 func NewChanPublisher(buffer int) *ChanPublisher {
 	return blockevents.NewChanPublisher(buffer)
+}
+
+// NewRqlitePublisher dials rqlite, ensures the job schema exists, and starts a
+// background drain goroutine that inserts pending job rows. cfg.RqliteURL is
+// required.
+func NewRqlitePublisher(cfg Config) (*RqlitePublisher, error) {
+	return blockevents.NewRqlitePublisher(cfg)
 }
