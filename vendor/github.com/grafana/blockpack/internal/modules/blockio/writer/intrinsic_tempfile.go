@@ -61,7 +61,7 @@ type columnSpill struct {
 }
 
 // tempFileAccum is the file-level intrinsic accumulator backed by per-column spill files.
-// It mirrors the feed* / columnNames / encodeColumn / overCap surface of the in-memory
+// It mirrors the feed* / columnNames / encodeColumn surface of the in-memory
 // intrinsicAccumulator that the per-block localAccum still uses.
 type tempFileAccum struct {
 	cols map[string]*columnSpill
@@ -243,14 +243,6 @@ func (e *errKindMismatch) Error() string {
 func isKindMismatch(err error) bool {
 	var kme *errKindMismatch
 	return errors.As(err, &kme)
-}
-
-// overCap formerly dropped the intrinsic section when any column exceeded MaxIntrinsicRows.
-// Removed (see intrinsic_accum.go). Always returns false.
-//
-//nolint:unused // mirrors intrinsicAccumulator.overCap interface; intentionally kept as stub
-func (t *tempFileAccum) overCap() bool {
-	return false
 }
 
 // columnNames returns all spilled column names, sorted.

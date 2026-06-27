@@ -58,9 +58,14 @@ func OpenReader(data []byte) (*Reader, error) {
 	vimtOffU := binary.LittleEndian.Uint64(footer[8:16])
 	vhixOffU := binary.LittleEndian.Uint64(footer[16:24])
 	vinxOffU := binary.LittleEndian.Uint64(footer[24:32])
-	fsU := uint64(
-		footerStart,
-	) //nolint:gosec // footerStart = len(data)-shared.ValueIndexFooterSize, always >= 0 (checked above)
+	// NOTE-LINT-407: explicit negative guard before the int → uint64 cast
+	// (gosec G115). footerStart = len(data) - ValueIndexFooterSize; the length
+	// check above guarantees len(data) >= ValueIndexFooterSize, so this is
+	// defense-in-depth against a future refactor breaking that invariant.
+	if footerStart < 0 {
+		return nil, fmt.Errorf("valueindex: negative footer start %d", footerStart)
+	}
+	fsU := uint64(footerStart)
 	if vimtOffU > fsU || vhixOffU > fsU || vinxOffU > fsU {
 		return nil, fmt.Errorf("valueindex: footer offsets exceed file size (%d bytes)", len(data))
 	}

@@ -21,25 +21,25 @@ import (
 // traceIntrinsicColumns is the set of column names served by the intrinsic section
 // for trace files. Includes "practically intrinsic" columns (resource.service.name).
 var traceIntrinsicColumns = map[string]struct{}{
-	"trace:id":              {},
-	"span:id":               {},
-	"span:parent_id":        {},
-	"span:name":             {},
-	"span:kind":             {},
-	"span:start":            {},
-	"span:end":              {},
-	"span:duration":         {},
-	"span:status":           {},
-	"span:status_message":   {},
-	"resource.service.name": {},
+	colNameTraceID:       {},
+	colNameSpanID:        {},
+	colNameParentID:      {},
+	colNameSpanName:      {},
+	colNameSpanKind:      {},
+	colNameSpanStart:     {},
+	colNameSpanEnd:       {},
+	colNameSpanDuration:  {},
+	colNameSpanStatus:    {},
+	colNameStatusMessage: {},
+	colNameServiceName:   {},
 }
 
 // traceIntrinsicStringColumns is the subset of traceIntrinsicColumns that contain
 // string values. Only these columns support regex predicates via nilIntrinsicScan.
 var traceIntrinsicStringColumns = map[string]struct{}{
-	"span:name":             {},
-	"span:status_message":   {},
-	"resource.service.name": {},
+	colNameSpanName:      {},
+	colNameStatusMessage: {},
+	colNameServiceName:   {},
 }
 
 // logIntrinsicColumns is the set of column names served by the intrinsic section
@@ -52,7 +52,7 @@ var logIntrinsicColumns = map[string]struct{}{
 	"log:trace_id":           {},
 	"log:span_id":            {},
 	"log:flags":              {},
-	"resource.service.name":  {},
+	colNameServiceName:       {},
 }
 
 // intrinsicRegexCache caches compiled regexes for intrinsic post-filter predicates

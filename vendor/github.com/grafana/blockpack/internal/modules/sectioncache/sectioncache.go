@@ -165,7 +165,7 @@ func (nopSectionCache) Close() error {
 // NewFilecacheAdapter wraps c in a FilecacheAdapter.
 // If c is nil, filecache.NopCache is used.
 func NewFilecacheAdapter(c filecache.Cache) *FilecacheAdapter {
-	if c == nil || (reflect.ValueOf(c).Kind() == reflect.Ptr && reflect.ValueOf(c).IsNil()) {
+	if c == nil || (reflect.ValueOf(c).Kind() == reflect.Pointer && reflect.ValueOf(c).IsNil()) {
 		c = filecache.NopCache
 	}
 	return &FilecacheAdapter{cache: c}

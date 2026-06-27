@@ -1424,7 +1424,7 @@ func scanGroupByColCompactDictStreaming(
 // col.Type from. Mirrors the decoder's isInt64 predicate by intrinsic column name.
 func isInt64DomainColName(colName string) bool {
 	switch colName {
-	case "span:kind", "span:status":
+	case colNameSpanKind, colNameSpanStatus:
 		return true
 	default:
 		return false
@@ -7642,7 +7642,7 @@ func intrinsicHistogramBoundary(v float64, fieldName string) float64 {
 	if v <= 0 {
 		return 0
 	}
-	if fieldName == "span:duration" {
+	if fieldName == colNameSpanDuration {
 		vSec := v / 1e9
 		if vSec <= 0 {
 			return 0

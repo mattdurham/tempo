@@ -100,6 +100,14 @@ func expandServers(servers []string) []string {
 // parallel requests lets connections be reused instead of re-dialed.
 const memcacheMaxIdleConns = 512
 
+// NOTE-LINT-407: constants for repeated Prometheus label names/values (goconst).
+const (
+	tierRemote     = "remote"
+	labelTier      = "tier"
+	labelResult    = "result"
+	labelOperation = "operation"
+)
+
 // memcacheSocketTimeout is the per-operation socket read/write timeout for the
 // remote memcache client.
 //
@@ -152,7 +160,7 @@ func Open(cfg Config) (*MemCache, error) {
 	}
 	tl := cfg.TierLabel
 	if tl == "" {
-		tl = "remote"
+		tl = tierRemote
 	}
 	m := &MemCache{
 		c:          newPooledClient(expandServers(cfg.Servers)),
@@ -163,15 +171,15 @@ func Open(cfg Config) (*MemCache, error) {
 		m.requests = memcacheRegisterOrReuse(cfg.Registerer, prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "blockpack_cache_requests_total",
 			Help: "Total number of cache requests by tier and result.",
-		}, []string{"tier", "result"}))
+		}, []string{labelTier, labelResult}))
 		m.bytes = memcacheRegisterOrReuse(cfg.Registerer, prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "blockpack_cache_bytes_total",
 			Help: "Total bytes read from cache by tier.",
-		}, []string{"tier"}))
+		}, []string{labelTier}))
 		m.errs = memcacheRegisterOrReuse(cfg.Registerer, prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "blockpack_cache_errors_total",
 			Help: "Total number of cache errors by tier.",
-		}, []string{"tier"}))
+		}, []string{labelTier}))
 		h := memcacheRegisterOrReuseHistogram(cfg.Registerer, prometheus.NewHistogramVec(
 			prometheus.HistogramOpts{
 				Name:                            "blockpack_cache_operation_duration_seconds",
@@ -180,12 +188,12 @@ func Open(cfg Config) (*MemCache, error) {
 				NativeHistogramMaxBucketNumber:  100,
 				NativeHistogramMinResetDuration: 15 * time.Minute,
 			},
-			[]string{"tier", "operation", "result"},
+			[]string{labelTier, labelOperation, labelResult},
 		))
 		// Pre-resolve label combinations for 0-alloc hot path.
 		tl := cfg.TierLabel
 		if tl == "" {
-			tl = "remote"
+			tl = tierRemote
 		}
 		m.tierLabel = tl
 		m.durGetHit = h.WithLabelValues(tl, "get", "hit")

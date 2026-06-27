@@ -36,6 +36,9 @@ const (
 	opStrNotChild      = "!>"
 )
 
+// aggMin is the canonical name for the min / min_over_time aggregate (goconst).
+const aggMin = "min"
+
 const (
 	// OpDescendant is the descendant operator (>>).
 	OpDescendant StructuralOp = iota
@@ -652,7 +655,15 @@ func parseAggregateFunc(input string) (AggregateFunc, error) {
 		}
 		return AggregateFunc{Name: funcName}, nil
 
-	case "avg", "avg_over_time", "min", "min_over_time", "max", "max_over_time", "sum", "stddev", "histogram_over_time":
+	case "avg",
+		"avg_over_time",
+		aggMin,
+		"min_over_time",
+		"max",
+		"max_over_time",
+		"sum",
+		"stddev",
+		"histogram_over_time":
 		// Single field argument expected
 		if argsStr == "" {
 			return AggregateFunc{}, fmt.Errorf("%s() requires a field argument", funcName)
@@ -664,7 +675,7 @@ func parseAggregateFunc(input string) (AggregateFunc, error) {
 		case "avg_over_time":
 			name = "avg"
 		case "min_over_time":
-			name = "min"
+			name = aggMin
 		case "max_over_time":
 			name = "max"
 		}

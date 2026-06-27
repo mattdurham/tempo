@@ -12,11 +12,26 @@ import (
 // ~24KB fits within nomic-embed-text-v1.5's 8192 token window for JSON/structured content.
 const DefaultMaxTextLen = 24000
 
+// NOTE-LINT-407: field-name constants for literals repeated across this package's
+// skip/cap/priority tables (goconst). Names mirror the on-disk column names.
+const (
+	fieldTraceID            = "trace:id"
+	fieldSpanID             = "span:id"
+	fieldToolCommand        = "tool.command"
+	fieldSpanDBStatement    = "span.db.statement"
+	fieldSpanName           = "span.name"
+	fieldSpanDuration       = "span:duration"
+	fieldSpanStatus         = "span.status"
+	fieldServiceName        = "resource.service.name"
+	fieldSpanHTTPStatusCode = "span.http.status_code"
+	fieldK8sPodName         = "resource.k8s.pod.name"
+)
+
 // skipFields are intrinsic fields that are excluded from the ALL embedding.
 // These are identifiers with no semantic value for similarity search.
 var skipFields = map[string]bool{
-	"trace:id":           true,
-	"span:id":            true,
+	fieldTraceID:         true,
+	fieldSpanID:          true,
 	"span:parent_id":     true,
 	"__embedding__":      true,
 	"__embedding_text__": true,
@@ -27,7 +42,7 @@ var skipFields = map[string]bool{
 var fieldMaxLen = map[string]int{
 	// Tool output fields can be very large (command output, file contents)
 	"span.tool.command":    512,
-	"tool.command":         512,
+	fieldToolCommand:       512,
 	"span.tool.old_string": 256,
 	"tool.old_string":      256,
 	"span.tool.new_string": 256,
@@ -35,7 +50,7 @@ var fieldMaxLen = map[string]int{
 	"span.tool.content":    256,
 	"tool.content":         256,
 	// DB statements can be large
-	"span.db.statement": 512,
+	fieldSpanDBStatement: 512,
 	// Stack traces — keep enough for the top frames
 	"span.exception.stacktrace": 1024,
 	// Agent messages can be verbose
@@ -61,7 +76,7 @@ var fieldMaxLen = map[string]int{
 //  8. Everything else alphabetically
 var priorityFields = []string{
 	// --- Span identity ---
-	"span.name",
+	fieldSpanName,
 	"span:name",
 	"log.body",
 	"log:body",
@@ -100,7 +115,7 @@ var priorityFields = []string{
 	"span.tool.file",
 	"tool.file",
 	"span.tool.command",
-	"tool.command",
+	fieldToolCommand,
 	"span.tool.pattern",
 	"tool.pattern",
 	"span.tool.query",
@@ -130,10 +145,10 @@ var priorityFields = []string{
 	// --- Timing ---
 	"span:start",
 	"span:end",
-	"span:duration",
+	fieldSpanDuration,
 
 	// --- Status / errors ---
-	"span.status",
+	fieldSpanStatus,
 	"span:status",
 	"span.status.message",
 	"span:status_message",
@@ -142,7 +157,7 @@ var priorityFields = []string{
 	"detected_level",
 
 	// --- Service identity ---
-	"resource.service.name",
+	fieldServiceName,
 	"resource.service.namespace",
 	"resource.service.version",
 	"resource.service.instance.id",
@@ -158,7 +173,7 @@ var priorityFields = []string{
 	"span.http.url",
 	"span.url.full",
 	"span.url.path",
-	"span.http.status_code",
+	fieldSpanHTTPStatusCode,
 	"span.http.response.status_code",
 	"span.http.target",
 	"span.user_agent.original",
@@ -167,7 +182,7 @@ var priorityFields = []string{
 	"span.db.system",
 	"span.db.name",
 	"span.db.operation",
-	"span.db.statement",
+	fieldSpanDBStatement,
 	"span.db.collection.name",
 
 	// --- RPC (OTel semconv) ---
@@ -183,7 +198,7 @@ var priorityFields = []string{
 
 	// --- Kubernetes ---
 	"resource.k8s.namespace.name",
-	"resource.k8s.pod.name",
+	fieldK8sPodName,
 	"resource.k8s.deployment.name",
 	"resource.k8s.container.name",
 	"resource.k8s.node.name",

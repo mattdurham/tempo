@@ -179,7 +179,8 @@ func (a *modulesSpanFieldsAdapter) spanTreeIdentityField(name string) (any, bool
 	if a.reader == nil {
 		return nil, false
 	}
-	if name != "trace:id" && name != "span:id" && name != "span:parent_id" {
+	if name != modules_shared.TraceIDColumnName && name != modules_shared.SpanIDColumnName &&
+		name != modules_shared.SpanParentIDColumnName {
 		return nil, false
 	}
 	if a.blockIdx < 0 || a.blockIdx > int(^uint16(0)) || a.rowIdx < 0 || a.rowIdx > int(^uint16(0)) {
@@ -194,15 +195,15 @@ func (a *modulesSpanFieldsAdapter) spanTreeIdentityField(name string) (any, bool
 		return nil, false
 	}
 	switch name {
-	case "trace:id":
+	case modules_shared.TraceIDColumnName:
 		b := make([]byte, 16)
 		copy(b, rec.TraceID[:])
 		return b, true
-	case "span:id":
+	case modules_shared.SpanIDColumnName:
 		b := make([]byte, 8)
 		copy(b, rec.SpanID[:])
 		return b, true
-	case "span:parent_id":
+	case modules_shared.SpanParentIDColumnName:
 		// Root spans have a zero parent: report ABSENT so IsRoot treats them as roots, exactly
 		// as a missing intrinsic/block column would.
 		if rec.ParentID == ([8]byte{}) {
@@ -245,7 +246,7 @@ func (a *modulesSpanFieldsAdapter) IterateFields(fn func(name string, value any)
 	// — breaking root detection (IsRoot keys on span:parent_id) and any downstream identity use.
 	// Root spans (zero parent) intentionally emit no span:parent_id, matching column absence.
 	if a.reader != nil {
-		for _, name := range [...]string{"trace:id", "span:id", "span:parent_id"} {
+		for _, name := range [...]string{modules_shared.TraceIDColumnName, modules_shared.SpanIDColumnName, modules_shared.SpanParentIDColumnName} {
 			if modulesLookupColumn(a.block, name) != nil {
 				continue // already emitted from the block payload above
 			}

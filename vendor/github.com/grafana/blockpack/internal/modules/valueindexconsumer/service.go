@@ -31,13 +31,15 @@ type ObjectPutter interface {
 // fed to a fresh valueindex.Writer, and the resulting index blob is PUT to S3.
 // No in-memory accumulation means memory usage is bounded by one block's decoded
 // columns rather than all accumulated entries since the last flush.
+// NOTE-LINT-407: fields ordered largest-to-smallest so the uint8 colType and the
+// bool hasData pack into a single word at the tail (fieldalignment: 80 → 72 bytes).
 type columnBuffer struct {
 	file       *os.File
+	pendingIDs map[string]struct{}
 	colName    string
-	colType    shared.ColumnType
 	colHash    string
 	tenant     string
-	pendingIDs map[string]struct{}
+	colType    shared.ColumnType
 	hasData    bool // true once at least one entry has been written
 }
 
@@ -316,11 +318,11 @@ func writeEntry(w io.Writer, e ColumnEntry) error {
 	binary.LittleEndian.PutUint32(buf[29:33], uint32(len(e.SourceRef))) //nolint:gosec
 	binary.LittleEndian.PutUint32(buf[33:37], uint32(len(val)))         //nolint:gosec
 
-	if _, err := w.Write(buf[:]); err != nil {
-		return err
+	if _, werr := w.Write(buf[:]); werr != nil {
+		return werr
 	}
-	if _, err := io.WriteString(w, e.SourceRef); err != nil {
-		return err
+	if _, werr := io.WriteString(w, e.SourceRef); werr != nil {
+		return werr
 	}
 	_, err = w.Write(val)
 	return err

@@ -119,7 +119,7 @@ func normalizeFieldName(path string) string {
 	// Handle span.intrinsic (dot notation) - convert to span:intrinsic for known intrinsics
 	if after, ok := strings.CutPrefix(path, "span."); ok {
 		switch after {
-		case "name", "kind", "status", "status_message", "start", "end", "duration",
+		case fieldName, fieldKind, fieldStatus, fieldStatusMessage, fieldStart, fieldEnd, fieldDuration,
 			"id", "parent_id", "trace_state", "dropped_attributes_count",
 			"dropped_events_count", "dropped_links_count":
 			return "span:" + after
@@ -131,7 +131,7 @@ func normalizeFieldName(path string) string {
 	// Handle resource.intrinsic
 	if after, ok := strings.CutPrefix(path, "resource."); ok {
 		switch after {
-		case "schema_url", "dropped_attributes_count":
+		case fieldSchemaURL, "dropped_attributes_count":
 			return "resource:" + after
 		}
 		// It's an attribute, keep dot notation
@@ -151,6 +151,7 @@ const (
 	fieldStatusMessage = "status_message"
 	fieldStart         = "start"
 	fieldEnd           = "end"
+	fieldSchemaURL     = "schema_url"
 
 	spanName          = shared.SpanNameColumnName
 	spanDuration      = shared.SpanDurationColumnName

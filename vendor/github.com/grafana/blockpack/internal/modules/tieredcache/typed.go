@@ -132,18 +132,36 @@ const (
 	idxError = 2
 )
 
+// NOTE-LINT-407: constants for the Prometheus section/result label values (goconst).
+const (
+	sectionFooter    = "footer"
+	sectionTOC       = "toc"
+	sectionBloom     = "bloom"
+	sectionMetadata  = "metadata"
+	sectionTraceIdx  = "traceIdx"
+	sectionBlock     = "block"
+	sectionIntrinsic = "intrinsic"
+
+	resultHit   = "hit"
+	resultMiss  = "miss"
+	resultError = "error"
+
+	labelSection = "section"
+	labelResult  = "result"
+)
+
 // sectionLabel maps section index to the Prometheus label value.
 var sectionLabel = [numSections]string{
-	idxFooter:    "footer",
-	idxTOC:       "toc",
-	idxBloom:     "bloom",
-	idxMetadata:  "metadata",
-	idxTraceIdx:  "traceIdx",
-	idxBlock:     "block",
-	idxIntrinsic: "intrinsic",
+	idxFooter:    sectionFooter,
+	idxTOC:       sectionTOC,
+	idxBloom:     sectionBloom,
+	idxMetadata:  sectionMetadata,
+	idxTraceIdx:  sectionTraceIdx,
+	idxBlock:     sectionBlock,
+	idxIntrinsic: sectionIntrinsic,
 }
 
-var resultLabel = [3]string{idxHit: "hit", idxMiss: "miss", idxError: "error"}
+var resultLabel = [3]string{idxHit: resultHit, idxMiss: resultMiss, idxError: resultError}
 
 // TypedTieredCache routes cache operations to one of seven sub-caches based on
 // section type. It implements sectioncache.SectionCache (typed method dispatch, no key
@@ -225,7 +243,7 @@ func NewTypedTieredCache(cfg TypedConfig) *TypedTieredCache {
 			prometheus.NewCounterVec(prometheus.CounterOpts{
 				Name: "blockpack_typed_cache_requests_total",
 				Help: "Total cache requests by section type and result (hit/miss).",
-			}, []string{"section", "result"}),
+			}, []string{labelSection, labelResult}),
 		)
 
 		h := typedRegisterOrReuseHistogram(
@@ -236,7 +254,7 @@ func NewTypedTieredCache(cfg TypedConfig) *TypedTieredCache {
 				NativeHistogramBucketFactor:     1.1,
 				NativeHistogramMaxBucketNumber:  100,
 				NativeHistogramMinResetDuration: 15 * time.Minute,
-			}, []string{"section", "result"}),
+			}, []string{labelSection, labelResult}),
 		)
 
 		// Pre-resolve all 7×3 label combinations for 0-alloc hot path.

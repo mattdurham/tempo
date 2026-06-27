@@ -61,8 +61,8 @@ var semanticBytesOverrides = map[string]semanticOverride{
 	// span:id / span:parent_id — 8/16-byte IDs that share high-order bits with their
 	// predecessor within a block; XOR-against-previous zeroes those bytes (uniform variant
 	// further drops the per-row length prefix).
-	"span:id":        {reason: "fixed-width IDs with shared high-order bits", enc: SemanticBytesXOR},
-	"span:parent_id": {reason: "fixed-width IDs with shared high-order bits", enc: SemanticBytesXOR},
+	SpanIDColumnName:       {reason: "fixed-width IDs with shared high-order bits", enc: SemanticBytesXOR},
+	SpanParentIDColumnName: {reason: "fixed-width IDs with shared high-order bits", enc: SemanticBytesXOR},
 }
 
 // ShouldSketchColumn reports whether the per-column sketch (HLL distinct-count + TopK +

@@ -129,7 +129,7 @@ func ExecuteTraceMetrics(
 	// NOTE-018: two-pass decode — predicate columns first, output columns only for blocks with
 	// matches — avoids decoding metric columns on blocks that the predicate rejects entirely.
 	predicateCols := ProgramWantColumns(program)
-	extraCols := []string{"span:start"}
+	extraCols := []string{colNameSpanStart}
 	if querySpec.Aggregate.Field != "" {
 		extraCols = append(extraCols, querySpec.Aggregate.Field)
 	}
@@ -512,7 +512,7 @@ func traceHistogramBucket(fieldCol *modules_reader.Column, rowIdx int, fieldName
 	if !ok || v <= 0 {
 		return 0
 	}
-	if fieldName == "span:duration" {
+	if fieldName == colNameSpanDuration {
 		vSec := v / 1e9
 		if vSec <= 0 {
 			return 0

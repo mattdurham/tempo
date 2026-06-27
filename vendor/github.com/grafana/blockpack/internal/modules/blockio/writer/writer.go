@@ -567,26 +567,38 @@ func feedSpanTreeFromAccum(acc *spanTreeAccum, local *intrinsicAccumulator, bloc
 // RSS bound: After processing all blocks, protoRoots is cleared. The w.rangeIdx map keys
 // independently keep string backing bytes alive (GC traces map key pointers), so clearing
 // protoRoots is safe and releases the batch's proto memory back to the GC.
-func (w *Writer) flushBlocks() error {
-	if len(w.pending) == 0 {
-		return nil
-	}
+// blockSlice is a contiguous run of pending spans with a pre-assigned block ID.
+// IDs are assigned before the parallel build so goroutines write results[i]
+// without coordination (NOTE-LINT-407: hoisted out of flushBlocks to decompose it).
+type blockSlice struct {
+	spans   []pendingSpan
+	blockID int
+}
 
-	sortPending(w.pending)
+// clearPendingState resets all buffered span/proto state so the Writer is not left
+// in a partially-flushed limbo after a flush error or a completed flush.
+// NOTE-LINT-407: extracted from flushBlocks (was inlined at 4 sites) to cut its
+// cyclomatic complexity.
+func (w *Writer) clearPendingState() {
+	clear(w.pending)
+	w.pending = w.pending[:0]
+	clear(w.protoRoots)
+	w.protoRoots = w.protoRoots[:0]
+	clear(w.tempoProtoRoots)
+	w.tempoProtoRoots = w.tempoProtoRoots[:0]
+}
 
-	// Pre-compute block boundaries and pre-assign block IDs so goroutines can
-	// write to results[i] without any coordination.
-	type blockSlice struct {
-		spans   []pendingSpan
-		blockID int
-	}
-	// NOTE-474: boundary-aware block slicing.
-	// Flush at a (service.name, span.name) group boundary once MinBlockSpans is reached.
-	// Keeps homogeneous groups in their own blocks (better dictionary/RLE compression)
-	// while batching rare operations into reasonably-sized blocks. MaxBlockSpans is the
-	// hard cap regardless of group boundaries.
-	// NOTE-091 caveat: this splits multi-service traces across blocks; structural queries
-	// may have false negatives for traces whose ancestor chain spans pruned blocks.
+// computeBlockSlices partitions w.pending into block slices and validates the
+// resulting block IDs fit the uint16 trace-index encoding.
+//
+// NOTE-474: boundary-aware block slicing.
+// Flush at a (service.name, span.name) group boundary once MinBlockSpans is reached.
+// Keeps homogeneous groups in their own blocks (better dictionary/RLE compression)
+// while batching rare operations into reasonably-sized blocks. MaxBlockSpans is the
+// hard cap regardless of group boundaries.
+// NOTE-091 caveat: this splits multi-service traces across blocks; structural queries
+// may have false negatives for traces whose ancestor chain spans pruned blocks.
+func (w *Writer) computeBlockSlices() ([]blockSlice, error) {
 	var slices []blockSlice
 	blockStart := 0
 	for blockStart < len(w.pending) {
@@ -615,11 +627,25 @@ func (w *Writer) flushBlocks() error {
 	// for the uint16 overflow check.
 	for _, s := range slices {
 		if s.blockID >= 65535 {
-			return fmt.Errorf(
+			return nil, fmt.Errorf(
 				"writer: block %d exceeds trace-index limit: block IDs are 0-based and encoded as uint16 (max ID 65534)",
 				s.blockID,
 			)
 		}
+	}
+	return slices, nil
+}
+
+func (w *Writer) flushBlocks() error {
+	if len(w.pending) == 0 {
+		return nil
+	}
+
+	sortPending(w.pending)
+
+	slices, err := w.computeBlockSlices()
+	if err != nil {
+		return err
 	}
 
 	// Pre-compute embedding vectors for all pending spans when auto-embedding is enabled.
@@ -632,12 +658,7 @@ func (w *Writer) flushBlocks() error {
 		var embedErr error
 		allSpanVectors, embedErr = w.embedPendingSpans(w.pending)
 		if embedErr != nil {
-			clear(w.pending)
-			w.pending = w.pending[:0]
-			clear(w.protoRoots)
-			w.protoRoots = w.protoRoots[:0]
-			clear(w.tempoProtoRoots)
-			w.tempoProtoRoots = w.tempoProtoRoots[:0]
+			w.clearPendingState()
 			return fmt.Errorf("writer: embed spans: %w", embedErr)
 		}
 	}
@@ -692,112 +713,16 @@ func (w *Writer) flushBlocks() error {
 	}
 	if err := g.Wait(); err != nil {
 		// At least one block failed. Reset buffered state to avoid a stuck Writer.
-		clear(w.pending)
-		w.pending = w.pending[:0]
-		clear(w.protoRoots)
-		w.protoRoots = w.protoRoots[:0]
-		clear(w.tempoProtoRoots)
-		w.tempoProtoRoots = w.tempoProtoRoots[:0]
+		w.clearPendingState()
 		return err
 	}
 
 	// Serial merge pass (in block-ID order): write payloads, merge accumulators,
 	// update indexes. Order is deterministic because results[i] corresponds to
 	// slices[i] which has a pre-assigned blockID.
-	for i, built := range results {
-		s := slices[i]
-		blockOffset := uint64(w.out.total) //nolint:gosec
-
-		if _, err := w.out.Write(built.payload); err != nil {
-			// Clear buffered state so the Writer is not left in a partially-flushed limbo.
-			// Blocks written before this failure are unrecoverable, but clearing prevents
-			// a subsequent Flush()/auto-flush from re-processing already-consumed spans.
-			clear(w.pending)
-			w.pending = w.pending[:0]
-			clear(w.protoRoots)
-			w.protoRoots = w.protoRoots[:0]
-			clear(w.tempoProtoRoots)
-			w.tempoProtoRoots = w.tempoProtoRoots[:0]
-			return fmt.Errorf("writer: block %d write: %w", s.blockID, err)
-		}
-
-		meta := shared.BlockMeta{
-			Offset:     blockOffset,
-			Length:     uint64(len(built.payload)),
-			Kind:       shared.BlockKindLeaf,
-			SpanCount:  uint32(built.spanCount), //nolint:gosec
-			MinStart:   built.minStart,
-			MaxStart:   built.maxStart,
-			MinTraceID: built.minTraceID,
-			MaxTraceID: built.maxTraceID,
-		}
-		// Release payload memory immediately after writing to bound peak RSS.
-		results[i].payload = nil
-
-		w.blockMetas = append(w.blockMetas, meta)
-
-		// Spill per-block intrinsic accumulator into the file-level on-disk accumulator,
-		// then release. NOTE-461: spillMerge streams the block's rows to disk instead of
-		// growing in-memory maps, bounding peak RSS to one block's worth of intrinsic data.
-		if built.localAccum != nil {
-			if err := w.ensureIntrinsicAccum(); err != nil {
-				return fmt.Errorf("writer: intrinsic accumulator: %w", err)
-			}
-			if err := w.intrinsicAccum.spillMerge(built.localAccum); err != nil {
-				return fmt.Errorf("writer: block %d intrinsic spill: %w", s.blockID, err)
-			}
-			// NOTE-462 (issue #381): feed the SpanTree accumulator from the same per-block
-			// intrinsic identity columns before releasing localAccum, so structural records
-			// are spilled in the same single write pass.
-			if err := w.ensureSpanTreeAccum(); err != nil {
-				return fmt.Errorf("writer: spantree accumulator: %w", err)
-			}
-			if err := feedSpanTreeFromAccum(w.spanTreeAccum, built.localAccum, uint16(s.blockID)); err != nil { //nolint:gosec // blockID bounded above by 65534
-				return fmt.Errorf("writer: block %d spantree spill: %w", s.blockID, err)
-			}
-			results[i].localAccum = nil
-		}
-
-		// Accumulate vectors for PQ training (serial to avoid concurrent map writes).
-		if w.vectorAccum != nil && len(built.blockVectors) > 0 {
-			w.vectorAccum.accumulateBlock(s.blockID, built.blockVectors)
-			results[i].blockVectors = nil // release memory after accumulation
-		}
-
-		// Update range index.
-		bid := uint32(s.blockID) //nolint:gosec
-		for _, mm := range built.colMinMax {
-			if mm.colType == shared.ColumnTypeBool {
-				// NOTE-452 (issue #373): bool min/max is tracked in colMinMax only to feed
-				// the ColStats numeric [0,1] range; there is no RangeBool index type, so it
-				// must be excluded from the on-disk range index.
-				continue
-			}
-			cd, ok := w.rangeIdx[mm.colName]
-			if !ok {
-				cd = newRangeColumnData(mm.colType)
-				w.rangeIdx[mm.colName] = cd
-			}
-			addBlockRangeToColumn(cd, mm, bid)
-		}
-
-		// NOTE-446: collect per-block column statistics for the ColStats section.
-		if len(built.colStats) > 0 {
-			w.colStatsByBlock = append(w.colStatsByBlock, shared.BlockColStats{
-				BlockIdx: uint16(s.blockID), //nolint:gosec
-				Cols:     built.colStats,
-			})
-		}
-
-		// Collect sketch set for this block.
-		w.sketchIdx = append(w.sketchIdx, built.colSketches)
-
-		// Update file-level trace index.
-		for tid := range built.traceRows {
-			w.traceIndex[tid] = append(
-				w.traceIndex[tid],
-				uint16(s.blockID), //nolint:gosec
-			)
+	for i := range results {
+		if err := w.mergeBuiltBlock(i, slices[i], results); err != nil {
+			return err
 		}
 	}
 
@@ -809,14 +734,118 @@ func (w *Writer) flushBlocks() error {
 	}
 
 	// Clear pending and proto anchors (same invariant as before).
-	clear(w.pending)
-	w.pending = w.pending[:0]
-	clear(w.protoRoots)
-	w.protoRoots = w.protoRoots[:0]
-	clear(w.tempoProtoRoots)
-	w.tempoProtoRoots = w.tempoProtoRoots[:0]
+	w.clearPendingState()
 
 	return nil
+}
+
+// mergeBuiltBlock writes one built block's payload to the output, records its
+// metadata, and folds its accumulators/indexes into the file-level state.
+// NOTE-LINT-407: extracted from flushBlocks' serial merge loop to cut complexity.
+func (w *Writer) mergeBuiltBlock(i int, s blockSlice, results []builtBlock) error {
+	built := results[i]
+	blockOffset := uint64(w.out.total) //nolint:gosec
+
+	if _, err := w.out.Write(built.payload); err != nil {
+		// Clear buffered state so the Writer is not left in a partially-flushed limbo.
+		// Blocks written before this failure are unrecoverable, but clearing prevents
+		// a subsequent Flush()/auto-flush from re-processing already-consumed spans.
+		w.clearPendingState()
+		return fmt.Errorf("writer: block %d write: %w", s.blockID, err)
+	}
+
+	w.blockMetas = append(w.blockMetas, shared.BlockMeta{
+		Offset:     blockOffset,
+		Length:     uint64(len(built.payload)),
+		Kind:       shared.BlockKindLeaf,
+		SpanCount:  uint32(built.spanCount), //nolint:gosec
+		MinStart:   built.minStart,
+		MaxStart:   built.maxStart,
+		MinTraceID: built.minTraceID,
+		MaxTraceID: built.maxTraceID,
+	})
+	// Release payload memory immediately after writing to bound peak RSS.
+	results[i].payload = nil
+
+	if err := w.spillBlockAccumulators(i, s, results); err != nil {
+		return err
+	}
+
+	// Accumulate vectors for PQ training (serial to avoid concurrent map writes).
+	if w.vectorAccum != nil && len(built.blockVectors) > 0 {
+		w.vectorAccum.accumulateBlock(s.blockID, built.blockVectors)
+		results[i].blockVectors = nil // release memory after accumulation
+	}
+
+	w.updateBlockIndexes(s, built)
+	return nil
+}
+
+// spillBlockAccumulators streams the block's per-block intrinsic accumulator and
+// derived SpanTree records to disk, then releases the in-memory accumulator.
+// NOTE-461 / NOTE-462: single write pass bounds peak RSS to one block's data.
+func (w *Writer) spillBlockAccumulators(i int, s blockSlice, results []builtBlock) error {
+	built := results[i]
+	if built.localAccum == nil {
+		return nil
+	}
+	if err := w.ensureIntrinsicAccum(); err != nil {
+		return fmt.Errorf("writer: intrinsic accumulator: %w", err)
+	}
+	if err := w.intrinsicAccum.spillMerge(built.localAccum); err != nil {
+		return fmt.Errorf("writer: block %d intrinsic spill: %w", s.blockID, err)
+	}
+	// NOTE-462 (issue #381): feed the SpanTree accumulator from the same per-block
+	// intrinsic identity columns before releasing localAccum, so structural records
+	// are spilled in the same single write pass.
+	if err := w.ensureSpanTreeAccum(); err != nil {
+		return fmt.Errorf("writer: spantree accumulator: %w", err)
+	}
+	if err := feedSpanTreeFromAccum(w.spanTreeAccum, built.localAccum, uint16(s.blockID)); err != nil { //nolint:gosec // blockID bounded above by 65534
+		return fmt.Errorf("writer: block %d spantree spill: %w", s.blockID, err)
+	}
+	results[i].localAccum = nil
+	return nil
+}
+
+// updateBlockIndexes folds a built block's range index, column stats, sketches,
+// and trace-index entries into the file-level state.
+func (w *Writer) updateBlockIndexes(s blockSlice, built builtBlock) {
+	// Update range index.
+	bid := uint32(s.blockID) //nolint:gosec
+	for _, mm := range built.colMinMax {
+		if mm.colType == shared.ColumnTypeBool {
+			// NOTE-452 (issue #373): bool min/max is tracked in colMinMax only to feed
+			// the ColStats numeric [0,1] range; there is no RangeBool index type, so it
+			// must be excluded from the on-disk range index.
+			continue
+		}
+		cd, ok := w.rangeIdx[mm.colName]
+		if !ok {
+			cd = newRangeColumnData(mm.colType)
+			w.rangeIdx[mm.colName] = cd
+		}
+		addBlockRangeToColumn(cd, mm, bid)
+	}
+
+	// NOTE-446: collect per-block column statistics for the ColStats section.
+	if len(built.colStats) > 0 {
+		w.colStatsByBlock = append(w.colStatsByBlock, shared.BlockColStats{
+			BlockIdx: uint16(s.blockID), //nolint:gosec
+			Cols:     built.colStats,
+		})
+	}
+
+	// Collect sketch set for this block.
+	w.sketchIdx = append(w.sketchIdx, built.colSketches)
+
+	// Update file-level trace index.
+	for tid := range built.traceRows {
+		w.traceIndex[tid] = append(
+			w.traceIndex[tid],
+			uint16(s.blockID), //nolint:gosec
+		)
+	}
 }
 
 // addRowCacheKey identifies a unique (reader, blockIdx) pair for the AddRowFromReader

@@ -23,6 +23,9 @@ const (
 	intrinsicSpanParentID = "span:parent_id"
 )
 
+// statusError is the TraceQL status literal for the error status code (goconst).
+const statusError = "error"
+
 // embeddingColumnName is the well-known column that stores float32 embedding vectors.
 // Duplicated from shared.EmbeddingColumnName to avoid import cycles.
 const embeddingColumnName = "__embedding__"
@@ -789,8 +792,8 @@ func unscopedCols(name string) (resource, span string) {
 // isBuiltInField checks if a field is a built-in intrinsic field
 func isBuiltInField(attrPath string) bool {
 	switch attrPath {
-	case "span:name", "span:duration", "span:kind", "span:status", "span:status_message",
-		intrinsicTraceID, intrinsicSpanID, intrinsicSpanParentID, "span:start", "span:end":
+	case spanName, spanDuration, spanKind, spanStatus, spanStatusMessage,
+		intrinsicTraceID, intrinsicSpanID, intrinsicSpanParentID, spanStart, spanEnd:
 		return true
 	default:
 		return false
@@ -1334,7 +1337,7 @@ func statusCodeToInt64(status string) (int64, bool) {
 		return 0, true
 	case "ok":
 		return 1, true
-	case "error":
+	case statusError:
 		return 2, true
 	}
 	return 0, false

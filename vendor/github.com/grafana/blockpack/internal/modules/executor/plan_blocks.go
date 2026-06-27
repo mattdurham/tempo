@@ -320,7 +320,7 @@ func bloomRejectByEquality(r *modules_reader.Reader, fb *modules_reader.FileBloo
 		return false
 	}
 	// trace:id: compact bloom.
-	if node.Column == "trace:id" {
+	if node.Column == colNameTraceID {
 		return bloomRejectTraceID(r, node.Values)
 	}
 	// String columns: FileBloom Fuse8.

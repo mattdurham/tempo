@@ -36,6 +36,9 @@ const (
 	maxCacheKeyLen = 4096 // arbitrary safe upper bound; prevents corrupt header entries
 )
 
+// labelTier is the Prometheus label name for the cache tier (goconst).
+const labelTier = "tier"
+
 // Config configures the file cache.
 
 // Registerer is an optional Prometheus registerer.
@@ -105,19 +108,19 @@ func Open(cfg Config) (*FileCache, error) {
 		c.requests = filecacheRegisterOrReuse(cfg.Registerer, prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "blockpack_cache_requests_total",
 			Help: "Total number of cache requests by tier and result.",
-		}, []string{"tier", "result"}))
+		}, []string{labelTier, "result"}))
 		c.bytes = filecacheRegisterOrReuse(cfg.Registerer, prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "blockpack_cache_bytes_total",
 			Help: "Total bytes read from cache by tier.",
-		}, []string{"tier"}))
+		}, []string{labelTier}))
 		c.evictions = filecacheRegisterOrReuse(cfg.Registerer, prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "blockpack_cache_evictions_total",
 			Help: "Total number of cache evictions by tier.",
-		}, []string{"tier"}))
+		}, []string{labelTier}))
 		c.errs = filecacheRegisterOrReuse(cfg.Registerer, prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "blockpack_cache_errors_total",
 			Help: "Total number of cache errors by tier.",
-		}, []string{"tier"}))
+		}, []string{labelTier}))
 		h := filecacheRegisterOrReuseHistogram(cfg.Registerer, prometheus.NewHistogramVec(
 			prometheus.HistogramOpts{
 				Name:                            "blockpack_cache_operation_duration_seconds",
@@ -126,7 +129,7 @@ func Open(cfg Config) (*FileCache, error) {
 				NativeHistogramMaxBucketNumber:  100,
 				NativeHistogramMinResetDuration: 15 * time.Minute,
 			},
-			[]string{"tier", "operation", "result"},
+			[]string{labelTier, "operation", "result"},
 		))
 		// Pre-resolve label combinations for 0-alloc hot path.
 		c.durGetHit = h.WithLabelValues("disk", "get", "hit")

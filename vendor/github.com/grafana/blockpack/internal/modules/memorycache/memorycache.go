@@ -18,6 +18,13 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
+// NOTE-LINT-407: constants for repeated Prometheus label names (goconst).
+const (
+	labelTier      = "tier"
+	labelResult    = "result"
+	labelOperation = "operation"
+)
+
 // Config configures a MemoryCache.
 
 // Registerer is an optional Prometheus registerer.
@@ -63,15 +70,15 @@ func New(cfg Config) (*MemoryCache, error) {
 		c.requests = registerOrReuse(cfg.Registerer, prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "blockpack_cache_requests_total",
 			Help: "Total number of cache requests by tier and result.",
-		}, []string{"tier", "result"}))
+		}, []string{labelTier, labelResult}))
 		c.bytes = registerOrReuse(cfg.Registerer, prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "blockpack_cache_bytes_total",
 			Help: "Total bytes read from cache by tier.",
-		}, []string{"tier"}))
+		}, []string{labelTier}))
 		c.evictions = registerOrReuse(cfg.Registerer, prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "blockpack_cache_evictions_total",
 			Help: "Total number of cache evictions by tier.",
-		}, []string{"tier"}))
+		}, []string{labelTier}))
 		h := registerOrReuseHistogram(cfg.Registerer, prometheus.NewHistogramVec(
 			prometheus.HistogramOpts{
 				Name:                            "blockpack_cache_operation_duration_seconds",
@@ -80,7 +87,7 @@ func New(cfg Config) (*MemoryCache, error) {
 				NativeHistogramMaxBucketNumber:  100,
 				NativeHistogramMinResetDuration: 15 * time.Minute,
 			},
-			[]string{"tier", "operation", "result"},
+			[]string{labelTier, labelOperation, labelResult},
 		))
 		// Pre-resolve label combinations for 0-alloc hot path.
 		c.durGetHit = h.WithLabelValues("memory", "get", "hit")

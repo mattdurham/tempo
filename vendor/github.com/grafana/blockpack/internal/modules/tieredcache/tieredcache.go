@@ -53,7 +53,7 @@ func NewTieredCacheWithConfig(cfg Config) *TieredCache {
 		t.requests = tieredRegisterOrReuse(cfg.Registerer, prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "blockpack_tiered_cache_requests_total",
 			Help: "Total number of tiered cache requests by tier, operation, and result.",
-		}, []string{"tier", "operation", "result"}))
+		}, []string{"tier", "operation", labelResult}))
 		t.bytes = tieredRegisterOrReuse(cfg.Registerer, prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "blockpack_tiered_cache_bytes_total",
 			Help: "Total bytes transferred through the tiered cache by tier and operation.",
@@ -129,7 +129,7 @@ func tierLabel(key string) string {
 	if isBlockDataKey(key) {
 		return "data"
 	}
-	return "metadata"
+	return sectionMetadata
 }
 
 // Get returns the cached bytes for key from the appropriate sub-cache.
@@ -141,11 +141,11 @@ func (t *TieredCache) Get(key string) ([]byte, bool, error) {
 		var result string
 		switch {
 		case err != nil:
-			result = "error"
+			result = resultError
 		case ok:
-			result = "hit"
+			result = resultHit
 		default:
-			result = "miss"
+			result = resultMiss
 		}
 		t.requests.WithLabelValues(tier, "get", result).Inc()
 		if ok && t.bytes != nil {
@@ -190,10 +190,10 @@ func (t *TieredCache) GetOrFetch(key string, fetch func() ([]byte, error)) ([]by
 		return nil, err
 	}
 	if fetchCalled {
-		t.requests.WithLabelValues(tier, "get", "miss").Inc()
+		t.requests.WithLabelValues(tier, "get", resultMiss).Inc()
 		t.bytes.WithLabelValues(tier, "put").Add(float64(len(val)))
 	} else {
-		t.requests.WithLabelValues(tier, "get", "hit").Inc()
+		t.requests.WithLabelValues(tier, "get", resultHit).Inc()
 		t.bytes.WithLabelValues(tier, "get").Add(float64(len(val)))
 	}
 	return val, nil
