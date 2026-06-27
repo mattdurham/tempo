@@ -676,3 +676,8 @@ type ColMeta = modules_reader.ColMeta
 func ParseColMetas(blockBytes []byte, meta modules_shared.BlockMeta) ([]ColMeta, error) {
 	return modules_reader.ParseColMetas(blockBytes, meta)
 }
+
+// ColumnType is the type for column data type identifiers. It is the same underlying
+// type as the internal shared.ColumnType (uint8) and is re-exported here so external
+// callers (e.g. tempo) can reference it without importing internal packages.
+type ColumnType = modules_shared.ColumnType
