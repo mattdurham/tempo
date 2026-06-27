@@ -89,21 +89,25 @@ func NewService(cfg Config, consumer Consumer, extractor Extractor, store Object
 }
 
 // Run drives the consume → accumulate → flush loop until ctx is canceled.
+//
+// Flush cadence is driven by an elapsed-time check evaluated after each message
+// (NOTE-VI-020), NOT by a select on a ticker channel. Because ingest()→Extract()
+// is synchronous and can take minutes for a large L1 block, a ticker case in the
+// poll loop's select would only be reachable *between* messages — if a single
+// message takes longer than FlushInterval the ticker case would never run while
+// it was blocked, so the timer effectively never fired. Checking elapsed wall
+// time after each ingest guarantees a flush happens between messages once the
+// interval has passed, regardless of how long any one message took. FlushInterval
+// must therefore exceed a single message's processing time, which the 15m default
+// (DefaultFlushInterval) is sized to do for L1 blocks.
 func (s *Service) Run(ctx context.Context) error {
-	ticker := time.NewTicker(s.cfg.FlushInterval)
-	defer ticker.Stop()
 	defer s.closeAllBuffers()
 
+	lastFlush := s.now()
 	for {
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			_ = s.flushAll(context.Background())
 			return ctx.Err()
-		case <-ticker.C:
-			if err := s.flushAll(ctx); err != nil {
-				return err
-			}
-		default:
 		}
 
 		msgs, err := s.consumer.Poll(ctx)
@@ -117,6 +121,16 @@ func (s *Service) Run(ctx context.Context) error {
 			if err := s.ingest(ctx, msg); err != nil {
 				return err
 			}
+		}
+
+		// Elapsed-time flush check between messages: fires even when an
+		// individual ingest exceeded FlushInterval, which a ticker-in-select
+		// could not (it is only reachable between Poll calls, never mid-ingest).
+		if s.now().Sub(lastFlush) >= s.cfg.FlushInterval {
+			if err := s.flushAll(ctx); err != nil {
+				return err
+			}
+			lastFlush = s.now()
 		}
 	}
 }

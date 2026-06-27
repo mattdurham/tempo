@@ -43,7 +43,7 @@ Each column's buffer flushes independently when:
 
 - its approximate buffered size crosses `MaxColumnBufferBytes` (size-driven, evaluated per
   ingest for the columns that ingest touched), OR
-- the `FlushInterval` timer fires (`flushAll`).
+- the `FlushInterval` elapsed-time check fires between messages (`flushAll`, see NOTE-VI-020).
 
 A hot column does not block a sparse one. Time-windowed output keeps each L0 file covering a
 bounded window, so files are naturally sortable by creation time (xid) — required for the
@@ -183,3 +183,42 @@ Back-refs:
 `internal/modules/valueindexconsumer/config.go`,
 `tempo/tempodb/encoding/common/config.go`,
 `tempo/cmd/tempo/app/value_index.go`
+
+## NOTE-VI-020 — Elapsed-time flush check, not ticker-in-select (issue #404)
+
+Date: 2026-06-27
+
+`Service.Run` is single-goroutine: it owns all mutable state (per-column buffers, refcount
+map) so the orchestration needs no locking. The original loop drove the timer flush with a
+`select { case <-ticker.C: ... default: }` evaluated once per poll iteration, then called
+`consumer.Poll` and ran `ingest` for each returned message.
+
+The bug: `ingest()` → `Extractor.Extract()` is synchronous and can take minutes for a large
+L1 block. The ticker case is only reachable *between* poll iterations, never while a single
+`ingest` is blocked inside `Extract`. So if one message took longer than `FlushInterval`, the
+ticker case was perpetually deferred — with a steady stream of long messages the flush timer
+could never fire, stranding buffered entries (and their unacked source messages) indefinitely.
+
+The fix (Option C from the issue): drop the ticker entirely and check elapsed wall time after
+each batch of ingests:
+
+```go
+if s.now().Sub(lastFlush) >= s.cfg.FlushInterval {
+    flushAll(); lastFlush = s.now()
+}
+```
+
+This guarantees a flush happens *between* messages once the interval has elapsed, regardless
+of how long any one message took — correctness no longer depends on a select case being
+reachable mid-ingest. It does not flush mid-message; the contract is that `FlushInterval` must
+exceed a single message's processing time. `DefaultFlushInterval` was raised 5m→15m to safely
+clear L1 block processing time so the between-message check fires reliably.
+
+Uses the existing injectable `now func() time.Time` (previously only assigned, never read for
+flush timing), so tests can drive flush cadence deterministically with a fake clock instead of
+real sleeps. The `ctx.Done()` drain flush is preserved as a leading `ctx.Err()` check at the
+top of the loop. NOTE-VI-019's cooperative XAutoClaim reclaim runs inside `Poll`, unaffected.
+
+Back-refs:
+`internal/modules/valueindexconsumer/service.go`,
+`internal/modules/valueindexconsumer/config.go`

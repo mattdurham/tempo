@@ -13,9 +13,12 @@ const (
 	// set. All consumer instances share one group so each message is processed
 	// exactly once.
 	DefaultConsumerGroup = "value-index-builders"
-	// DefaultFlushInterval is the timer-driven flush window. Each output file
-	// covers roughly this much wall-clock time, keeping files sortable by xid.
-	DefaultFlushInterval = 5 * time.Minute
+	// DefaultFlushInterval is the elapsed-time flush window evaluated between
+	// messages (NOTE-VI-020). Each output file covers roughly this much
+	// wall-clock time, keeping files sortable by xid. It is sized to safely
+	// exceed a single L1 block's processing time so the between-message check
+	// fires reliably rather than being perpetually deferred by one long ingest.
+	DefaultFlushInterval = 15 * time.Minute
 	// DefaultMaxColumnBufferBytes is the per-column buffer size that triggers a
 	// size-driven flush independently of the timer.
 	DefaultMaxColumnBufferBytes = 64 << 20 // 64 MiB
