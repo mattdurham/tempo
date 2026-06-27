@@ -27,6 +27,9 @@ const (
 	// DefaultIndexPrefix is the object-storage key prefix under which value
 	// index files are written.
 	DefaultIndexPrefix = "indexes"
+	// DefaultClaimBatchSize is the max number of stale-pending entries claimed
+	// per XAutoClaim cursor step during startup reclaim.
+	DefaultClaimBatchSize = 500
 )
 
 // Config configures the value-index consumer. It maps to the optional
@@ -65,6 +68,11 @@ type Config struct {
 	// PollTimeout bounds a single queue poll. Defaults to DefaultPollTimeout
 	// when <= 0.
 	PollTimeout time.Duration `yaml:"poll_timeout"`
+	// ClaimIdleThreshold is the minimum idle time a pending (delivered but
+	// unacked) message must have accumulated before this consumer reclaims it
+	// from a dead/restarted instance on startup. Defaults to 2 × PollTimeout
+	// when <= 0. See NOTE-VI-019.
+	ClaimIdleThreshold time.Duration `yaml:"claim_idle_threshold"`
 	// BatchSize is the max messages fetched per poll. Defaults to
 	// DefaultBatchSize when <= 0.
 	BatchSize int `yaml:"batch_size"`
@@ -91,6 +99,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.BatchSize <= 0 {
 		c.BatchSize = DefaultBatchSize
+	}
+	if c.ClaimIdleThreshold <= 0 {
+		c.ClaimIdleThreshold = 2 * c.PollTimeout
 	}
 	return c
 }

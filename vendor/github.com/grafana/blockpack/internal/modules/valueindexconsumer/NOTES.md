@@ -135,3 +135,51 @@ Back-refs:
 `internal/modules/valueindexconsumer/consumer.go`,
 `internal/modules/valueindexconsumer/config.go`,
 `valueindexconsumer/valueindexconsumer.go`
+
+## NOTE-VI-019 — Reclaim stale pending messages on startup (issue #403)
+
+Date: 2026-06-27
+
+Redis Streams consumer groups keep a per-consumer pending-entries list (PEL): messages
+delivered via `XREADGROUP ... >` but not yet `XACK`ed. When a consumer pod restarts it gets a
+fresh `ConsumerName` (`vic-<xid>`) and `XREADGROUP ... >` only ever delivers NEW messages, so
+entries left pending under the *previous* instance's name are never redelivered and sit in
+limbo. With slow per-message processing (large blocks) this stalls the whole pipeline: spill
+files never fill, the flush never fires, and no value index files reach S3.
+
+### Fix: cooperative XAUTOCLAIM scan, drained through Poll
+
+On the first `Poll` calls the consumer scans the group PEL with `XAUTOCLAIM`, claiming entries
+idle ≥ `ClaimIdleThreshold` to *itself* and reprocessing them as ordinary messages. The scan is
+cursor-driven and cooperative — one `XAUTOCLAIM` step per `Poll` rather than a blocking loop in
+the constructor — so startup is not stalled and the flush timer keeps advancing between steps.
+
+- `claimCursor` starts at `"0-0"`; each step advances it to the cursor `XAUTOCLAIM` returns.
+- When the cursor wraps back to `"0-0"` (or `XAUTOCLAIM` returns `redis.Nil`), `reclaimDone` is
+  set and `Poll` falls through to normal `XREADGROUP ">"` delivery for the rest of the process
+  lifetime. No further `XAUTOCLAIM` calls are made.
+- A reclaim step that completes the scan with no claimed messages falls through to a blocking
+  read *in the same Poll*, so a quiet PEL costs at most one extra round-trip at startup.
+- Reclaimed messages are reprocessed exactly like fresh ones; duplicate entries that result
+  from at-least-once reprocessing are removed by the value-index compactor (#399), so reclaim
+  needs no dedup state of its own. Malformed reclaimed entries are acked-and-skipped via the
+  shared `appendParsed` helper, same as in the normal poll path.
+
+### Config: ClaimIdleThreshold
+
+`ClaimIdleThreshold` (YAML `claim_idle_threshold`) defaults to `2 × PollTimeout` — long enough
+that a live consumer's own in-flight messages are never stolen mid-processing, short enough that
+a dead instance's orphans are reclaimed promptly. `DefaultClaimBatchSize` (500) bounds entries
+claimed per cursor step. Wired through tempo's mirror config (`ValueIndexConsumerConfig`) and
+`toVICConsumerCfg`.
+
+### streamReader gains XAutoClaim
+
+`*redis.Client` already satisfies the added `XAutoClaim` method; the test fake scripts results
+via `claimSteps` (one per call) plus `claimErr`.
+
+Back-refs:
+`internal/modules/valueindexconsumer/redis.go`,
+`internal/modules/valueindexconsumer/config.go`,
+`tempo/tempodb/encoding/common/config.go`,
+`tempo/cmd/tempo/app/value_index.go`

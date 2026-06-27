@@ -52,6 +52,7 @@ func toVICConsumerCfg(cfg common.ValueIndexConsumerConfig) vicconsumer.Config {
 		Columns:              cfg.Columns,
 		FlushInterval:        cfg.FlushInterval,
 		PollTimeout:          cfg.PollTimeout,
+		ClaimIdleThreshold:   cfg.ClaimIdleThreshold,
 		BatchSize:            cfg.BatchSize,
 	}
 }

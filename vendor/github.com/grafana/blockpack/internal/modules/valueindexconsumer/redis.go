@@ -14,12 +14,18 @@ import (
 
 // NOTE: Any changes to this file must be reflected in the corresponding NOTES.md.
 
+// claimScanStart is the XAUTOCLAIM cursor that both begins a PEL scan and is
+// returned by Redis once the whole pending-entries list has been scanned. See
+// NOTE-VI-019.
+const claimScanStart = "0-0"
+
 // streamReader is the minimal Redis Streams surface the consumer needs.
 // *redis.Client satisfies it; tests substitute a fake so no real Redis is
 // required.
 type streamReader interface {
 	XGroupCreateMkStream(ctx context.Context, stream, group, start string) *redis.StatusCmd
 	XReadGroup(ctx context.Context, a *redis.XReadGroupArgs) *redis.XStreamSliceCmd
+	XAutoClaim(ctx context.Context, a *redis.XAutoClaimArgs) *redis.XAutoClaimCmd
 	XAck(ctx context.Context, stream, group string, ids ...string) *redis.IntCmd
 	Close() error
 }
@@ -30,7 +36,13 @@ type streamReader interface {
 // consumer crashes before acking.
 type RedisConsumer struct {
 	client streamReader
-	cfg    Config
+	// claimCursor is the XAUTOCLAIM scan position for the startup reclaim of
+	// stale pending messages. It begins at "0-0" and advances each Poll until
+	// it wraps back to "0-0", at which point reclaimDone is set and Poll falls
+	// through to normal XREADGROUP ">" delivery. See NOTE-VI-019.
+	claimCursor string
+	cfg         Config
+	reclaimDone bool
 }
 
 // NewRedisConsumer dials Redis, ensures the consumer group exists, and returns a
@@ -56,7 +68,7 @@ func NewRedisConsumer(cfg Config) (*RedisConsumer, error) {
 // newRedisConsumer wires a consumer around an already-constructed streamReader.
 // cfg is assumed to have defaults applied.
 func newRedisConsumer(client streamReader, cfg Config) *RedisConsumer {
-	return &RedisConsumer{client: client, cfg: cfg}
+	return &RedisConsumer{client: client, cfg: cfg, claimCursor: claimScanStart}
 }
 
 // ensureGroup creates the consumer group, tolerating BUSYGROUP (already exists).
@@ -70,10 +82,30 @@ func (c *RedisConsumer) ensureGroup(ctx context.Context) error {
 	return nil
 }
 
-// Poll fetches up to BatchSize new (never-delivered) messages for this consumer,
-// blocking up to PollTimeout. It returns an empty slice when the read times out
-// so the caller can run periodic work.
+// Poll fetches a batch of messages for this consumer, blocking up to
+// PollTimeout. It returns an empty slice when there is nothing to do so the
+// caller can run periodic work.
+//
+// Before serving new messages, Poll first drains stale pending messages
+// orphaned by dead/restarted consumer instances (see reclaimStep). Once the
+// reclaim scan completes, Poll falls through to normal XREADGROUP ">"
+// (never-delivered) delivery.
 func (c *RedisConsumer) Poll(ctx context.Context) ([]Message, error) {
+	if !c.reclaimDone {
+		msgs, err := c.reclaimStep(ctx)
+		if err != nil {
+			return nil, err
+		}
+		// Return whatever this reclaim step produced, even if empty: the next
+		// Poll continues the scan (or starts fresh delivery once reclaimDone).
+		// We do not block in reclaim, so an empty step is a cheap fast path.
+		if len(msgs) > 0 || !c.reclaimDone {
+			return msgs, nil
+		}
+		// Scan just completed with no remaining claims; fall through to a
+		// normal blocking read so this Poll still does useful work.
+	}
+
 	res, err := c.client.XReadGroup(ctx, &redis.XReadGroupArgs{
 		Group:    c.cfg.ConsumerGroup,
 		Consumer: c.cfg.ConsumerName,
@@ -91,16 +123,58 @@ func (c *RedisConsumer) Poll(ctx context.Context) ([]Message, error) {
 	var msgs []Message
 	for _, stream := range res {
 		for _, m := range stream.Messages {
-			ev, ok := parseEvent(m.Values)
-			if !ok {
-				// Malformed message: ack it so it is not redelivered forever.
-				_ = c.client.XAck(ctx, c.cfg.StreamName, c.cfg.ConsumerGroup, m.ID).Err()
-				continue
-			}
-			msgs = append(msgs, Message{ID: m.ID, Event: ev})
+			msgs = c.appendParsed(ctx, msgs, m)
 		}
 	}
 	return msgs, nil
+}
+
+// reclaimStep performs one XAUTOCLAIM cursor step, claiming up to
+// DefaultClaimBatchSize stale pending entries (idle ≥ ClaimIdleThreshold) from
+// dead/restarted consumers to this consumer. It advances claimCursor; when the
+// cursor wraps back to "0-0" the scan is complete and reclaimDone is set.
+// Claimed messages are returned as ordinary Messages so the service reprocesses
+// them; the value-index compactor dedups any duplicate entries (NOTE-VI-019).
+func (c *RedisConsumer) reclaimStep(ctx context.Context) ([]Message, error) {
+	entries, next, err := c.client.XAutoClaim(ctx, &redis.XAutoClaimArgs{
+		Stream:   c.cfg.StreamName,
+		Group:    c.cfg.ConsumerGroup,
+		Consumer: c.cfg.ConsumerName,
+		MinIdle:  c.cfg.ClaimIdleThreshold,
+		Start:    c.claimCursor,
+		Count:    DefaultClaimBatchSize,
+	}).Result()
+	if errors.Is(err, redis.Nil) {
+		c.reclaimDone = true
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("valueindexconsumer: xautoclaim: %w", err)
+	}
+
+	c.claimCursor = next
+	// XAUTOCLAIM returns "0-0" as the cursor once the whole PEL has been scanned.
+	if next == "" || next == claimScanStart {
+		c.reclaimDone = true
+	}
+
+	var msgs []Message
+	for _, m := range entries {
+		msgs = c.appendParsed(ctx, msgs, m)
+	}
+	return msgs, nil
+}
+
+// appendParsed parses one stream entry and appends a Message, or acks-and-skips
+// a malformed entry so it is not redelivered forever. Shared by Poll and
+// reclaimStep.
+func (c *RedisConsumer) appendParsed(ctx context.Context, msgs []Message, m redis.XMessage) []Message {
+	ev, ok := parseEvent(m.Values)
+	if !ok {
+		_ = c.client.XAck(ctx, c.cfg.StreamName, c.cfg.ConsumerGroup, m.ID).Err()
+		return msgs
+	}
+	return append(msgs, Message{ID: m.ID, Event: ev})
 }
 
 // Ack acknowledges processed message IDs to the consumer group.

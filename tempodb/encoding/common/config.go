@@ -3,6 +3,7 @@ package common
 import (
 	"flag"
 	"fmt"
+	"time"
 
 	"github.com/grafana/tempo/pkg/util"
 	"github.com/grafana/tempo/tempodb/backend"
@@ -139,6 +140,14 @@ type BlockpackConfig struct {
 	// is published after each block is created or compacted so the value index
 	// builder can index it asynchronously.
 	BlockEvents BlockEventsConfig `yaml:"block_events"`
+
+	// ValueIndexConsumer configures the value-index consumer Tempo target
+	// (-target=value-index-consumer). Disabled by default.
+	ValueIndexConsumer ValueIndexConsumerConfig `yaml:"value_index_consumer"`
+
+	// ValueIndexCompactor configures the value-index compactor Tempo target
+	// (-target=value-index-compactor). Disabled by default.
+	ValueIndexCompactor ValueIndexCompactorConfig `yaml:"value_index_compactor"`
 }
 
 // BlockEventsConfig mirrors blockevents.Config. It is a separate Tempo struct so
@@ -278,4 +287,31 @@ func ValidateConfig(b *BlockConfig) error {
 	// TODO - log or pass warnings up the chain?
 	_, err := b.DedicatedColumns.Validate()
 	return err
+}
+
+// ValueIndexConsumerConfig configures the value-index consumer Tempo target.
+// Mirrors valueindexconsumer.Config for YAML decoding without a direct blockpack import.
+type ValueIndexConsumerConfig struct {
+	Enabled              bool          `yaml:"enabled"`
+	RedisAddr            string        `yaml:"redis_addr"`
+	StreamName           string        `yaml:"stream_name"`
+	ConsumerGroup        string        `yaml:"consumer_group"`
+	ConsumerName         string        `yaml:"consumer_name"`
+	IndexPrefix          string        `yaml:"index_prefix"`
+	Columns              []string      `yaml:"columns"`
+	FlushInterval        time.Duration `yaml:"flush_interval"`
+	PollTimeout          time.Duration `yaml:"poll_timeout"`
+	ClaimIdleThreshold   time.Duration `yaml:"claim_idle_threshold"`
+	BatchSize            int           `yaml:"batch_size"`
+}
+
+// ValueIndexCompactorConfig configures the value-index compactor Tempo target.
+// Mirrors valueindexcompactor.Config for YAML decoding without a direct blockpack import.
+type ValueIndexCompactorConfig struct {
+	Enabled               bool          `yaml:"enabled"`
+	IndexPrefix           string        `yaml:"index_prefix"`
+	Tenants               []string      `yaml:"tenants"`
+	CompactInterval       time.Duration `yaml:"compact_interval"`
+	CompactThresholdFiles int           `yaml:"compact_threshold_files"`
+	MaxOutputBytes        int64         `yaml:"max_output_bytes"`
 }

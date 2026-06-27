@@ -756,6 +756,8 @@ func (t *App) setupModuleManager() error {
 	mm.RegisterModule(BlockBuilder, t.initBlockBuilder)
 	mm.RegisterModule(BackendScheduler, t.initBackendScheduler)
 	mm.RegisterModule(BackendWorker, t.initBackendWorker)
+	mm.RegisterModule(ValueIndexConsumer, t.initValueIndexConsumer)
+	mm.RegisterModule(ValueIndexCompactor, t.initValueIndexCompactor)
 	mm.RegisterModule(LiveStore, t.initLiveStore)
 
 	mm.RegisterModule(SingleBinary, nil)
@@ -798,6 +800,8 @@ func (t *App) setupModuleManager() error {
 		BlockBuilder:                  {Common, Store, MemberlistKV, PartitionRing},
 		BackendScheduler:              {Common, Store},
 		BackendWorker:                 {Common, Store, MemberlistKV},
+		ValueIndexConsumer:            {Store, Server},
+		ValueIndexCompactor:           {Store, Server},
 		// composite targets
 		SingleBinary: {BackendScheduler, BackendWorker, QueryFrontend, Querier, Distributor, MetricsGenerator, LiveStore},
 	}
@@ -871,3 +875,10 @@ func usageStatsHandler(urCfg usagestats.Config) http.HandlerFunc {
 		_, _ = io.WriteString(w, reportStr)
 	}
 }
+
+// ── Value-index pipeline targets ──────────────────────────────────────────────
+
+const (
+	ValueIndexConsumer  string = "value-index-consumer"
+	ValueIndexCompactor string = "value-index-compactor"
+)
