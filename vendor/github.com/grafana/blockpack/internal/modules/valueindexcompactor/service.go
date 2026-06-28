@@ -22,6 +22,7 @@ import (
 type Service struct {
 	store   IndexStore
 	exister SourceExister
+	metrics *compactorMetrics // nil when Config.Registerer is nil (no-op)
 	now     func() time.Time
 	cfg     Config
 }
@@ -43,6 +44,7 @@ func NewService(cfg Config, store IndexStore, exister SourceExister) (*Service, 
 		store:   store,
 		exister: exister,
 		cfg:     cfg,
+		metrics: newCompactorMetrics(cfg.Registerer),
 		now:     time.Now,
 	}, nil
 }
@@ -77,19 +79,32 @@ func (s *Service) Run(ctx context.Context) error {
 // their column directories. It returns the first error encountered; remaining
 // tenants/columns are still attempted so one bad column does not stall the rest.
 func (s *Service) RunOnce(ctx context.Context) error {
+	runStart := s.now()
+
 	tenants, err := s.resolveTenants(ctx)
 	if err != nil {
+		s.metrics.observeRun(s.now().Sub(runStart))
+		s.metrics.incRun(compactorStatusError)
 		return fmt.Errorf("valueindexcompactor: resolve tenants: %w", err)
 	}
 
 	var firstErr error
 	for _, tenant := range tenants {
 		if err := ctx.Err(); err != nil {
+			s.metrics.observeRun(s.now().Sub(runStart))
+			s.metrics.incRun(compactorStatusError)
 			return err
 		}
 		if err := s.compactTenant(ctx, tenant); err != nil && firstErr == nil {
 			firstErr = err
 		}
+	}
+
+	s.metrics.observeRun(s.now().Sub(runStart))
+	if firstErr != nil {
+		s.metrics.incRun(compactorStatusError)
+	} else {
+		s.metrics.incRun(compactorStatusSuccess)
 	}
 	return firstErr
 }
@@ -105,6 +120,7 @@ func (s *Service) resolveTenants(ctx context.Context) ([]string, error) {
 	prefix := s.cfg.IndexPrefix + "/"
 	keys, err := s.store.List(ctx, prefix)
 	if err != nil {
+		s.metrics.incError(compactorOpList)
 		return nil, err
 	}
 	seen := make(map[string]struct{})
@@ -131,6 +147,7 @@ func (s *Service) compactTenant(ctx context.Context, tenant string) error {
 	tenantPrefix := path.Join(s.cfg.IndexPrefix, tenant) + "/"
 	keys, err := s.store.List(ctx, tenantPrefix)
 	if err != nil {
+		s.metrics.incError(compactorOpList)
 		return fmt.Errorf("valueindexcompactor: list tenant %q: %w", tenant, err)
 	}
 
@@ -197,6 +214,8 @@ func (s *Service) compactColumn(ctx context.Context, colDir string, keys []strin
 // output file(s) at level+1, then deletes the inputs. Outputs are written before
 // inputs are deleted so a crash mid-merge leaves the inputs in place for retry.
 func (s *Service) mergeLevel(ctx context.Context, colDir string, files []levelFile) error {
+	mergeStart := s.now()
+
 	// Sort inputs by key for deterministic ordering.
 	sort.Slice(files, func(i, j int) bool { return files[i].key < files[j].key })
 
@@ -204,6 +223,7 @@ func (s *Service) mergeLevel(ctx context.Context, colDir string, files []levelFi
 	for _, f := range files {
 		data, err := s.store.Get(ctx, f.key)
 		if err != nil {
+			s.metrics.incError(compactorOpGet)
 			return fmt.Errorf("valueindexcompactor: get %q: %w", f.key, err)
 		}
 		r, err := valueindex.OpenReader(data)
@@ -220,11 +240,14 @@ func (s *Service) mergeLevel(ctx context.Context, colDir string, files []levelFi
 		cfg.Checker = newCachingRefChecker(s.exister)
 	}
 
-	err := valueindex.CompactFiles(ctx, readers, cfg, func(data []byte) error {
+	var written int
+	stats, err := valueindex.CompactFiles(ctx, readers, cfg, func(data []byte) error {
 		key := path.Join(colDir, valueindex.FormatFilename(outputLevel, valueindex.NewID()))
 		if err := s.store.Put(ctx, key, data); err != nil {
+			s.metrics.incError(compactorOpPut)
 			return fmt.Errorf("valueindexcompactor: put %q: %w", key, err)
 		}
+		written++
 		return nil
 	})
 	if err != nil {
@@ -233,10 +256,19 @@ func (s *Service) mergeLevel(ctx context.Context, colDir string, files []levelFi
 
 	// Delete inputs only after all outputs are durably written.
 	var firstErr error
+	var deleted int
 	for _, f := range files {
-		if err := s.store.Delete(ctx, f.key); err != nil && firstErr == nil {
-			firstErr = fmt.Errorf("valueindexcompactor: delete %q: %w", f.key, err)
+		if err := s.store.Delete(ctx, f.key); err != nil {
+			s.metrics.incError(compactorOpDelete)
+			if firstErr == nil {
+				firstErr = fmt.Errorf("valueindexcompactor: delete %q: %w", f.key, err)
+			}
+			continue
 		}
+		deleted++
 	}
+
+	s.metrics.observeMerge(s.now().Sub(mergeStart))
+	s.metrics.addMergeCounts(len(files), written, deleted, stats.Retained, stats.Dropped)
 	return firstErr
 }

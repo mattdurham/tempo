@@ -24,24 +24,37 @@ type CompactConfig struct {
 	MaxOutputBytes int64
 }
 
+// CompactStats reports the entry-level outcome of one CompactFiles call so the
+// caller can drive observability metrics. Retained counts entries kept (source
+// still live, or no Checker configured); Dropped counts entries discarded
+// because their source blockpack was confirmed deleted by the Checker. Both are
+// pre-dedup counts (each input occurrence is counted once), so Retained is the
+// number of live entries that flowed into the merge, not the deduped output
+// cardinality.
+type CompactStats struct {
+	Retained int
+	Dropped  int
+}
+
 // CompactFiles merges and deduplicates the given readers into one or more output files.
-// For each output file it calls output with the serialized bytes.
+// For each output file it calls output with the serialized bytes. It returns
+// per-entry CompactStats so callers can observe retained vs dropped counts.
 // All input readers must share the same CompactionLevel (VI-012). Output level = input level + 1.
 func CompactFiles(
 	ctx context.Context,
 	readers []*Reader,
 	cfg CompactConfig,
 	output func([]byte) error,
-) error {
+) (CompactStats, error) {
 	if len(readers) == 0 {
-		return nil
+		return CompactStats{}, nil
 	}
 
 	// VI-012: all inputs must be at the same compaction level.
 	inputLevel := readers[0].meta.CompactionLevel
 	for _, r := range readers[1:] {
 		if r.meta.CompactionLevel != inputLevel {
-			return fmt.Errorf(
+			return CompactStats{}, fmt.Errorf(
 				"valueindex: CompactFiles requires same-level inputs: expected level %d, got level %d",
 				inputLevel, r.meta.CompactionLevel,
 			)
@@ -54,9 +67,9 @@ func CompactFiles(
 	colType := readers[0].meta.ColType
 
 	// Gather all entries, optionally filtering dead refs.
-	allEntries, err := gatherEntries(ctx, readers, cfg.Checker)
+	allEntries, stats, err := gatherEntries(ctx, readers, cfg.Checker)
 	if err != nil {
-		return fmt.Errorf("valueindex: CompactFiles: gather: %w", err)
+		return CompactStats{}, fmt.Errorf("valueindex: CompactFiles: gather: %w", err)
 	}
 
 	// Sort and deduplicate (sortRawSlice / deduplicateEntries defined in writer.go).
@@ -64,12 +77,17 @@ func CompactFiles(
 	allEntries = deduplicateEntries(allEntries)
 
 	// Write output file(s).
-	return writeCompacted(ctx, allEntries, colName, colType, outputLevel, cfg.MaxOutputBytes, output)
+	if err := writeCompacted(ctx, allEntries, colName, colType, outputLevel, cfg.MaxOutputBytes, output); err != nil {
+		return CompactStats{}, err
+	}
+	return stats, nil
 }
 
 // gatherEntries reads all entries from all readers, optionally checking liveness.
-func gatherEntries(ctx context.Context, readers []*Reader, checker RefChecker) ([]rawEntry, error) {
+// It returns CompactStats counting retained vs dropped (dead-ref) entries.
+func gatherEntries(ctx context.Context, readers []*Reader, checker RefChecker) ([]rawEntry, CompactStats, error) {
 	var all []rawEntry
+	var stats CompactStats
 	for _, r := range readers {
 		dataLen := r.chunkDataLen()
 		var chunkData []byte
@@ -78,19 +96,21 @@ func gatherEntries(ctx context.Context, readers []*Reader, checker RefChecker) (
 		}
 		entries, err := DecodeAllChunks(chunkData, r.chunkDir)
 		if err != nil {
-			return nil, err
+			return nil, CompactStats{}, err
 		}
 		for i := range entries {
 			e := &entries[i]
 			if checker != nil {
 				live, err := checker.IsLive(ctx, e.SourceRef)
 				if err != nil {
-					return nil, fmt.Errorf("valueindex: RefChecker.IsLive(%q): %w", e.SourceRef, err)
+					return nil, CompactStats{}, fmt.Errorf("valueindex: RefChecker.IsLive(%q): %w", e.SourceRef, err)
 				}
 				if !live {
+					stats.Dropped++
 					continue
 				}
 			}
+			stats.Retained++
 			all = append(all, rawEntry{
 				canonicalValue: e.Value,
 				valueHash:      ValueHash16(e.Value),
@@ -101,7 +121,7 @@ func gatherEntries(ctx context.Context, readers []*Reader, checker RefChecker) (
 			})
 		}
 	}
-	return all, nil
+	return all, stats, nil
 }
 
 // writeCompacted serializes entries into one or more output files.

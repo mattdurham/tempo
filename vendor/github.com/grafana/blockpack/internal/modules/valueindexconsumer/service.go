@@ -80,8 +80,9 @@ type Service struct {
 	pendingCol map[string]int              // message ID → count of buffers still holding its entries
 	columns    map[string]struct{}
 
-	now func() time.Time
-	cfg Config
+	metrics *consumerMetrics // nil when Config.Registerer is nil (no-op)
+	now     func() time.Time
+	cfg     Config
 }
 
 // NewService builds a consumer service. The consumer, extractor and store are
@@ -100,6 +101,7 @@ func NewService(cfg Config, consumer Consumer, extractor Extractor, store Object
 		pendingCol: make(map[string]int),
 		cfg:        cfg,
 		columns:    cfg.columnSet(),
+		metrics:    newConsumerMetrics(cfg.Registerer),
 		now:        time.Now,
 	}, nil
 }
@@ -131,6 +133,7 @@ func (s *Service) Run(ctx context.Context) error {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				continue
 			}
+			s.metrics.incError(consumerOpClaim)
 			return fmt.Errorf("valueindexconsumer: poll: %w", err)
 		}
 		for _, msg := range msgs {
@@ -138,6 +141,8 @@ func (s *Service) Run(ctx context.Context) error {
 				return err
 			}
 		}
+
+		s.observeQueueState(ctx)
 
 		// Elapsed-time flush check between messages: fires even when an
 		// individual ingest exceeded FlushInterval, which a ticker-in-select
@@ -151,10 +156,32 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 }
 
+// observeQueueState updates the pending-jobs gauge and stale-reclaims counter
+// from the consumer's optional reporting interfaces. A consumer that implements
+// neither is a no-op. A PendingCount error is silently ignored — a missing
+// gauge sample is preferable to crashing the consume loop on a transient backend
+// hiccup. When metrics are disabled (nil), the reporting calls are skipped
+// entirely so a disabled config costs nothing.
+func (s *Service) observeQueueState(ctx context.Context) {
+	if s.metrics == nil {
+		return
+	}
+	if r, ok := s.consumer.(StaleReclaimReporter); ok {
+		s.metrics.addStaleReclaims(r.StaleReclaimsSince())
+	}
+	if r, ok := s.consumer.(PendingReporter); ok {
+		if n, err := r.PendingCount(ctx); err == nil {
+			s.metrics.setPendingJobs(n)
+		}
+	}
+}
+
 // ingest extracts entries from one message and appends them to per-column spill files.
 func (s *Service) ingest(ctx context.Context, msg Message) error {
 	touched := make(map[bufferKey]struct{})
+	perColumn := make(map[string]int)
 
+	extractStart := s.now()
 	err := s.extractor.Extract(ctx, msg.Event, func(e ColumnEntry) error {
 		if len(s.columns) > 0 {
 			if _, ok := s.columns[e.ColName]; !ok {
@@ -173,18 +200,31 @@ func (s *Service) ingest(ctx context.Context, msg Message) error {
 			return fmt.Errorf("valueindexconsumer: write entry: %w", werr)
 		}
 		buf.hasData = true
+		perColumn[e.ColName]++
 		if _, seen := touched[key]; !seen {
 			touched[key] = struct{}{}
 			buf.pendingIDs[msg.ID] = struct{}{}
 		}
 		return nil
 	})
+	s.metrics.observeExtract(s.now().Sub(extractStart))
 	if err != nil {
+		s.metrics.incError(consumerOpExtract)
+		s.metrics.incFile(consumerStatusError)
 		return fmt.Errorf("valueindexconsumer: extract %q: %w", msg.Event.Path, err)
+	}
+	for col, n := range perColumn {
+		s.metrics.addEntries(col, n)
 	}
 
 	if len(touched) == 0 {
-		return s.consumer.Ack(ctx, msg.ID)
+		// No configured column touched: the file is fully handled by this ack.
+		if ackErr := s.consumer.Ack(ctx, msg.ID); ackErr != nil {
+			s.metrics.incError(consumerOpAck)
+			return ackErr
+		}
+		s.metrics.incFile(consumerStatusSuccess)
+		return nil
 	}
 	s.pendingCol[msg.ID] = len(touched)
 	return nil
@@ -233,6 +273,7 @@ func (s *Service) flushColumn(ctx context.Context, buf *columnBuffer) error {
 		return fmt.Errorf("valueindexconsumer: seek spill %q: %w", buf.colName, err)
 	}
 
+	flushStart := s.now()
 	w := valueindex.NewWriter(buf.colName, buf.colType)
 	br := bufio.NewReader(buf.file)
 	for {
@@ -241,22 +282,27 @@ func (s *Service) flushColumn(ctx context.Context, buf *columnBuffer) error {
 			break
 		}
 		if err != nil {
+			s.metrics.incError(consumerOpFlush)
 			return fmt.Errorf("valueindexconsumer: read spill %q: %w", buf.colName, err)
 		}
 		if err := w.AddEntry(e.Value, e.TraceID, e.SourceRef, e.BlockID, e.TimeSec); err != nil {
+			s.metrics.incError(consumerOpFlush)
 			return fmt.Errorf("valueindexconsumer: add entry %q: %w", buf.colName, err)
 		}
 	}
 
 	data, err := w.Flush(ctx, 0)
 	if err != nil {
+		s.metrics.incError(consumerOpFlush)
 		return fmt.Errorf("valueindexconsumer: flush writer %q: %w", buf.colName, err)
 	}
 
 	key := s.indexKey(buf.tenant, buf.colHash)
 	if err := s.store.Put(key, data); err != nil {
+		s.metrics.incError(consumerOpFlush)
 		return fmt.Errorf("valueindexconsumer: put %q: %w", key, err)
 	}
+	s.metrics.observeFlush(s.now().Sub(flushStart), len(data))
 
 	// Ack messages whose entries are now all on S3.
 	var ackIDs []string
@@ -280,7 +326,12 @@ func (s *Service) flushColumn(ctx context.Context, buf *columnBuffer) error {
 
 	if len(ackIDs) > 0 {
 		if err := s.consumer.Ack(ctx, ackIDs...); err != nil {
+			s.metrics.incError(consumerOpAck)
 			return fmt.Errorf("valueindexconsumer: ack: %w", err)
+		}
+		// Each acked message corresponds to one fully-processed-and-flushed file.
+		for range ackIDs {
+			s.metrics.incFile(consumerStatusSuccess)
 		}
 	}
 	return nil

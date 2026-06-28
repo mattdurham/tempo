@@ -1,6 +1,10 @@
 package valueindexcompactor
 
-import "time"
+import (
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+)
 
 // NOTE-VI-017: see internal/modules/valueindexcompactor/NOTES.md.
 // Any changes to this file must be reflected there.
@@ -32,6 +36,11 @@ const (
 //	  tenants:
 //	    - "11638"     # explicit list, or "*" for all tenants
 type Config struct {
+	// Registerer is the Prometheus registerer used to expose value-index
+	// compactor metrics (NOTE-VI-023). When nil, all metrics are no-ops and no
+	// registration occurs. It is not settable from YAML; the embedder (tempo)
+	// injects it programmatically.
+	Registerer prometheus.Registerer `yaml:"-"`
 	// IndexPrefix is the object-storage key prefix for value index files.
 	// Defaults to DefaultIndexPrefix when empty. Must match the consumer.
 	IndexPrefix string `yaml:"index_prefix"`

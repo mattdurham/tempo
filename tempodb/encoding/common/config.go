@@ -155,6 +155,9 @@ type BlockpackConfig struct {
 type BlockEventsConfig struct {
 	// Enabled turns on event publishing. When false no events are emitted.
 	Enabled bool `yaml:"enabled"`
+	// RqliteURL is the HTTP URL of the rqlite cluster (e.g. "http://rqlite:4001").
+	// When set, rqlite is used as the transport instead of Redis.
+	RqliteURL string `yaml:"rqlite_url"`
 	// RedisAddr is the host:port of the Redis server backing the stream.
 	RedisAddr string `yaml:"redis_addr"`
 	// StreamName is the Redis stream key (default: "blockpack-events").
@@ -292,17 +295,18 @@ func ValidateConfig(b *BlockConfig) error {
 // ValueIndexConsumerConfig configures the value-index consumer Tempo target.
 // Mirrors valueindexconsumer.Config for YAML decoding without a direct blockpack import.
 type ValueIndexConsumerConfig struct {
-	Enabled              bool          `yaml:"enabled"`
-	RedisAddr            string        `yaml:"redis_addr"`
-	StreamName           string        `yaml:"stream_name"`
-	ConsumerGroup        string        `yaml:"consumer_group"`
-	ConsumerName         string        `yaml:"consumer_name"`
-	IndexPrefix          string        `yaml:"index_prefix"`
-	Columns              []string      `yaml:"columns"`
-	FlushInterval        time.Duration `yaml:"flush_interval"`
-	PollTimeout          time.Duration `yaml:"poll_timeout"`
-	ClaimIdleThreshold   time.Duration `yaml:"claim_idle_threshold"`
-	BatchSize            int           `yaml:"batch_size"`
+	Enabled            bool          `yaml:"enabled"`
+	RqliteURL          string        `yaml:"rqlite_url"`
+	RedisAddr          string        `yaml:"redis_addr"`
+	StreamName         string        `yaml:"stream_name"`
+	ConsumerGroup      string        `yaml:"consumer_group"`
+	ConsumerName       string        `yaml:"consumer_name"`
+	IndexPrefix        string        `yaml:"index_prefix"`
+	Columns            []string      `yaml:"columns"`
+	FlushInterval      time.Duration `yaml:"flush_interval"`
+	PollTimeout        time.Duration `yaml:"poll_timeout"`
+	ClaimIdleThreshold time.Duration `yaml:"claim_idle_threshold"`
+	BatchSize          int           `yaml:"batch_size"`
 }
 
 // ValueIndexCompactorConfig configures the value-index compactor Tempo target.

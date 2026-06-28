@@ -326,3 +326,54 @@ Back-refs:
 `internal/modules/valueindexconsumer/config.go`,
 `valueindexconsumer/valueindexconsumer.go`,
 `cmd/deadcode/main.go`
+
+## NOTE-VI-023 — Prometheus metrics for the value-index pipeline (issue #407)
+
+Date: 2026-06-28
+
+Both the consumer and the compactor now expose Prometheus metrics, following the cache-layer
+precedent (memcache/tieredcache): a `Registerer prometheus.Registerer` field on `Config`
+(`yaml:"-"`, injected programmatically by tempo as `prometheus.DefaultRegisterer`), nil = total
+no-op. All collectors are built in a `metrics.go` per package via `registerOrReuse`-style
+helpers that tolerate `AlreadyRegisteredError`, so multiple consumer/compactor instances (or a
+co-located pair) can share one global registry without panicking.
+
+### Nil-safety via nil-receiver no-ops
+
+The service holds a `*consumerMetrics` (resp. `*compactorMetrics`) that is `nil` when
+`Config.Registerer` is nil. Every method has a `if m == nil { return }` guard, so the hot path
+costs nothing when metrics are disabled and tests need no real registry. This is cleaner than
+sprinkling nil checks at each call site.
+
+### Pre-resolved hot-path observers
+
+The extract/flush/run/merge duration histograms and the flush-bytes histogram are stored as
+pre-resolved `prometheus.Observer` (the histogram itself, no labels) so observation is a single
+`Observe` with zero per-call label allocation — same pattern as memcache `durGetHit` et al.
+Native histograms use `NativeHistogramBucketFactor: 1.1`, `MaxBucketNumber: 100`,
+`MinResetDuration: 15m`, matching the cache layer.
+
+### `files_total` semantics = one acked message
+
+A file is counted `success` exactly when its message is acked: either immediately on ingest
+(no configured column touched) or once all its column buffers have flushed (the ack in
+`flushColumn`). An extract failure counts `error` once. This keeps the counter aligned with
+"files fully processed and flushed", not "Put calls".
+
+### Pending-jobs / stale-reclaims via optional reporter interfaces
+
+`pending_jobs` (gauge) and `stale_reclaims_total` (counter) are signals the *Consumer impl*
+owns, not the Service. Rather than entangle the Redis/rqlite consumers with the Service's
+metrics object, the Service queries two **optional** interfaces — `PendingReporter`
+(`PendingCount`) and `StaleReclaimReporter` (`StaleReclaimsSince`, delta-and-reset) — once per
+Run loop iteration (`observeQueueState`). A consumer that implements neither is a silent no-op;
+the gauge simply stays unset. A `PendingCount` error is swallowed (a missing sample beats
+crashing the consume loop on a transient backend hiccup). The current Redis/rqlite consumers do
+not yet implement these, so wiring the COUNT query into them is a follow-up — the metric plumbing
+is in place and the interfaces are unit-tested via a fake reporter.
+
+Back-refs:
+`internal/modules/valueindexconsumer/metrics.go`,
+`internal/modules/valueindexconsumer/service.go`,
+`internal/modules/valueindexconsumer/consumer.go`,
+`internal/modules/valueindexconsumer/config.go`

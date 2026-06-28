@@ -1,6 +1,10 @@
 package valueindexconsumer
 
-import "time"
+import (
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+)
 
 // NOTE: Any changes to this file must be reflected in the corresponding NOTES.md.
 
@@ -51,6 +55,11 @@ const (
 //	    - span:name
 //	    - resource.service.name
 type Config struct {
+	// Registerer is the Prometheus registerer used to expose value-index
+	// consumer metrics (NOTE-VI-023). When nil, all metrics are no-ops and no
+	// registration occurs. It is not settable from YAML; the embedder (tempo)
+	// injects it programmatically.
+	Registerer prometheus.Registerer `yaml:"-"`
 	// RedisAddr is the host:port of the Redis server backing the stream.
 	RedisAddr string `yaml:"redis_addr"`
 	// RqliteURL is the HTTP URL of the rqlite cluster backing the job table

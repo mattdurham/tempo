@@ -35,6 +35,29 @@ type Consumer interface {
 	Close() error
 }
 
+// PendingReporter is an optional interface a Consumer may implement to expose
+// the current count of pending (unclaimed) jobs in its backing queue. The
+// service polls it once per loop iteration to drive the
+// blockpack_value_index_consumer_pending_jobs gauge. Implementations should make
+// PendingCount cheap (a single COUNT query); a Consumer that cannot report a
+// count simply does not implement this interface and the gauge stays unset.
+type PendingReporter interface {
+	// PendingCount returns the number of jobs waiting to be claimed.
+	PendingCount(ctx context.Context) (int, error)
+}
+
+// StaleReclaimReporter is an optional interface a Consumer may implement to
+// expose how many jobs it has reclaimed after a stale-claim timeout since the
+// last call. A nonzero count is a proxy for crashed/restarted workers and drives
+// the blockpack_value_index_consumer_stale_reclaims_total counter. The service
+// reads and resets the count once per loop iteration; implementations therefore
+// return the delta since the previous call, not a running total.
+type StaleReclaimReporter interface {
+	// StaleReclaimsSince returns the number of stale claims reclaimed since the
+	// previous call and resets the internal counter to zero.
+	StaleReclaimsSince() int
+}
+
 // ColumnEntry is one extracted observation for one configured column.
 //
 // Value is the typed column value (string, int64, uint64, float64, bool, []byte)

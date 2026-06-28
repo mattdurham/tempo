@@ -269,6 +269,7 @@ func New(cfg *Config, cacheProvider cache.Provider, logger gkLog.Logger) (Reader
 		be := cfg.Block.Blockpack.BlockEvents
 		vblockpack.ConfigureBlockEvents(blockevents.Config{
 			Enabled:    be.Enabled,
+			RqliteURL:  be.RqliteURL,
 			RedisAddr:  be.RedisAddr,
 			StreamName: be.StreamName,
 		})

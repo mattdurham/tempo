@@ -70,3 +70,43 @@ Back-refs:
 `internal/modules/valueindexcompactor/store.go`,
 `internal/modules/valueindexcompactor/config.go`,
 `valueindexcompactor/valueindexcompactor.go`
+
+## NOTE-VI-023 — Prometheus metrics for the compactor (issue #407)
+
+Date: 2026-06-28
+
+The compactor exposes Prometheus metrics via a `Registerer prometheus.Registerer` field on
+`Config` (`yaml:"-"`, injected by tempo as `prometheus.DefaultRegisterer`), nil = total no-op.
+See the consumer's NOTE-VI-023 for the shared design (nil-receiver no-ops, `registerOrReuse`
+AlreadyRegisteredError tolerance, pre-resolved native-histogram observers). The collectors live
+in `metrics.go`.
+
+### CompactFiles now returns CompactStats
+
+`valueindex.CompactFiles` previously returned only `error`; it now returns
+`(CompactStats, error)` where `CompactStats{Retained, Dropped int}` counts entries kept vs
+dropped by the retention `Checker`. These are **pre-dedup** counts (each input occurrence is
+counted once), so `entries_retained_total` reflects the live entries flowing into the merge, not
+the deduped output cardinality. This is the only exported-signature change; all callers (the
+compactor `mergeLevel`, the valueindex compaction tests) were updated in the same commit. The
+compactor feeds `stats.Retained`/`stats.Dropped` into the
+`blockpack_value_index_compactor_entries_{retained,dropped}_total` counters.
+
+### Per-merge file counts
+
+`mergeLevel` records `files_read` (= input count), `files_written` (incremented in the
+`CompactFiles` output callback, so it counts split outputs correctly), and `files_deleted`
+(incremented per successful input delete, so a partial delete failure undercounts deletions
+rather than overcounting). `merge_duration_seconds` wraps the whole get→merge→put→delete cycle.
+
+### Per-pass run counters
+
+`RunOnce` wraps the whole pass with `run_duration_seconds` and increments `runs_total{success}`
+or `runs_total{error}` based on the first-error result. List/get/put/delete failures also bump
+`errors_total{op}` at their call sites.
+
+Back-refs:
+`internal/modules/valueindexcompactor/metrics.go`,
+`internal/modules/valueindexcompactor/service.go`,
+`internal/modules/valueindexcompactor/config.go`,
+`internal/modules/valueindex/compaction.go`

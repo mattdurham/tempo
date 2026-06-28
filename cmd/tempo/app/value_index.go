@@ -19,6 +19,7 @@ import (
 	common "github.com/grafana/tempo/tempodb/encoding/common"
 	minio "github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
+	"github.com/prometheus/client_golang/prometheus"
 
 	blockpack "github.com/grafana/blockpack"
 	"github.com/grafana/blockpack/blockevents"
@@ -44,6 +45,7 @@ func newMinioFromS3Cfg(cfg *s3cfg.Config) (*minio.Client, error) {
 func toVICConsumerCfg(cfg common.ValueIndexConsumerConfig) vicconsumer.Config {
 	return vicconsumer.Config{
 		Enabled:              cfg.Enabled,
+		RqliteURL:            cfg.RqliteURL,
 		RedisAddr:            cfg.RedisAddr,
 		StreamName:           cfg.StreamName,
 		ConsumerGroup:        cfg.ConsumerGroup,
@@ -76,13 +78,31 @@ func (t *App) initValueIndexConsumer() (services.Service, error) {
 	if !vicCfg.Enabled {
 		return services.NewIdleService(nil, nil), nil
 	}
+	// Expose consumer pipeline metrics on the default registry.
+	vicCfg.Registerer = prometheus.DefaultRegisterer
 
 	s3Client, err := newMinioFromS3Cfg(t.cfg.StorageConfig.Trace.S3)
 	if err != nil {
 		return nil, fmt.Errorf("value-index-consumer: create S3 client: %w", err)
 	}
 
-	consumer, err := vicconsumer.NewRedisConsumer(vicCfg)
+	var consumer vicconsumer.Consumer
+	var consumerCloser func()
+	if vicCfg.RqliteURL != "" {
+		rc, cerr := vicconsumer.NewRqliteConsumer(vicCfg)
+		if cerr != nil {
+			return nil, fmt.Errorf("value-index-consumer: create rqlite consumer: %w", cerr)
+		}
+		consumer = rc
+		consumerCloser = func() { _ = rc.Close() }
+	} else {
+		rc, cerr := vicconsumer.NewRedisConsumer(vicCfg)
+		if cerr != nil {
+			return nil, fmt.Errorf("value-index-consumer: create redis consumer: %w", cerr)
+		}
+		consumer = rc
+		consumerCloser = func() { _ = rc.Close() }
+	}
 	if err != nil {
 		return nil, fmt.Errorf("value-index-consumer: create redis consumer: %w", err)
 	}
@@ -93,13 +113,13 @@ func (t *App) initValueIndexConsumer() (services.Service, error) {
 
 	svc, err := vicconsumer.NewService(vicCfg, consumer, extractor, store)
 	if err != nil {
-		_ = consumer.Close()
+		consumerCloser()
 		return nil, fmt.Errorf("value-index-consumer: create service: %w", err)
 	}
 
 	return services.NewIdleService(
 		func(ctx context.Context) error { return svc.Run(ctx) },
-		func(_ error) error { _ = consumer.Close(); return nil },
+		func(_ error) error { consumerCloser(); return nil },
 	), nil
 }
 
@@ -110,6 +130,8 @@ func (t *App) initValueIndexCompactor() (services.Service, error) {
 	if !vccCfg.Enabled {
 		return services.NewIdleService(nil, nil), nil
 	}
+	// Expose compactor pipeline metrics on the default registry.
+	vccCfg.Registerer = prometheus.DefaultRegisterer
 
 	s3Client, err := newMinioFromS3Cfg(t.cfg.StorageConfig.Trace.S3)
 	if err != nil {
