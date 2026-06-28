@@ -88,3 +88,15 @@ Back-ref: `internal/modules/valueindex/entries.go:Entry`,
 `internal/modules/blockio/shared/constants.go:ValueIndexEntriesVersion`
 `internal/modules/valueindex/predicate.go:compareCanonical`,
 `internal/modules/valueindex/writer.go:buildKLL`
+
+## NOTE-VI-024 — ColTypeName bucket helper (issue #409)
+
+Date: 2026-06-28
+
+`ColTypeName(colType) string` (in `hash.go`, alongside `ColHash`) returns the
+short, human-readable S3 path segment for a column type, used by the consumer to
+keep same-name-different-type index files under distinct prefixes (full rationale
+in `valueindexconsumer/NOTES.md` NOTE-VI-024). The mapping mirrors `CanonicalValue`
+exactly: Range* types collapse to their scalar bucket (they are indexed as their
+scalar equivalent, NOTE-VI-012). Unindexable types (VectorF32) return `""` so
+callers can reject rather than silently bucket under an empty segment.

@@ -96,9 +96,9 @@ mixed-type attribute name triggers it.
 ### Fix
 
 Key `s.buffers` by `bufferKey{name, colType}`. Distinct types for the same name
-now get distinct buffers, each producing a type-consistent L0 index file under the
-same `col_hash` prefix (the query side already selects on expected type, so two
-type-homogeneous files under one prefix are correct). The per-message ack refcount
+now get distinct buffers, each producing a type-consistent L0 index file. As of
+NOTE-VI-024 (issue #409) those files also land under distinct `<col_hash>/<type>`
+prefixes so they never collide on S3. The per-message ack refcount
 (`touched` / `pendingIDs` / `pendingCol`) is tracked per `bufferKey`, so a message
 touching one name under two types is acked once, only after **both** buffers
 flush.
@@ -377,3 +377,41 @@ Back-refs:
 `internal/modules/valueindexconsumer/service.go`,
 `internal/modules/valueindexconsumer/consumer.go`,
 `internal/modules/valueindexconsumer/config.go`
+
+## NOTE-VI-024 — Type-bucketed index paths `<col_hash>/<type>/<file>` (issue #409)
+
+Date: 2026-06-28
+
+NOTE-VI-022 split the in-memory spill buffers by (name, colType) but still wrote
+every type's L0 file under the **same** `<tenant>/indexes/<col_hash>/` prefix.
+Column names are not unique across types — `span.start` can be a `float64` in one
+block and a `string` in another — and the resulting index files have different
+value encodings, so a reader cannot tell them apart and the encodings are not
+interchangeable. Two type-different files under one prefix is latent S3 corruption.
+
+### Fix
+
+Insert a short, human-readable type segment between the hash and the file:
+
+    <tenant>/indexes/<col_hash>/<type>/L0-<xid>.blockpack
+
+`valueindex.ColTypeName(colType)` (in `valueindex/hash.go`, alongside `ColHash`)
+returns the bucket name: `string`, `int64`, `uint64`, `float64`, `bool`, `bytes`,
+`uuid`. Range* types map to their **scalar** bucket (`range_float64` → `float64`,
+`range_duration` → `int64`, …) because they are indexed as their scalar equivalent
+(NOTE-VI-012) — the mapping mirrors `CanonicalValue` exactly. An unindexable type
+(VectorF32) returns `""`. `Service.indexKey` now takes the buffer's `colType` and
+inserts `ColTypeName(colType)` as the segment.
+
+The compactor needed **no** logic change: `compactTenant` already groups by
+`path.Dir(key)`, which under the new layout is `<tenant>/indexes/<col_hash>/<type>`
+— exactly the per-(hash, type) grouping required so merges never mix types. `List`
+is prefix-based so the extra nesting level is returned naturally, and `mergeLevel`
+joins the output filename onto that `colDir`, preserving the `<type>` segment.
+
+No migration: existing index files (if any) can be discarded; the compactor
+rewrites from source blocks. The `col_hash` directory still groups all types of a
+column together for human browsing.
+
+Back-refs: `internal/modules/valueindex/hash.go` (`ColTypeName`),
+`internal/modules/valueindexconsumer/service.go` (`indexKey`).

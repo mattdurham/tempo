@@ -297,7 +297,7 @@ func (s *Service) flushColumn(ctx context.Context, buf *columnBuffer) error {
 		return fmt.Errorf("valueindexconsumer: flush writer %q: %w", buf.colName, err)
 	}
 
-	key := s.indexKey(buf.tenant, buf.colHash)
+	key := s.indexKey(buf.tenant, buf.colHash, buf.colType)
 	if err := s.store.Put(key, data); err != nil {
 		s.metrics.incError(consumerOpFlush)
 		return fmt.Errorf("valueindexconsumer: put %q: %w", key, err)
@@ -347,11 +347,21 @@ func (s *Service) closeAllBuffers() {
 
 // indexKey builds the object key for a flushed L0 file:
 //
-//	<index_prefix>/<tenant>/<col_hash>/L0-<xid>.valueindex
-func (s *Service) indexKey(tenant, colHash string) string {
-	// Path: <tenant>/indexes/<index_prefix>/<col_hash>/L0-<xid>.valueindex
+//	<tenant>/<index_prefix>/<col_hash>/<type>/L0-<xid>.blockpack
+//
+// The <type> segment (NOTE-VI-024, issue #409) keeps columns that share a name
+// but differ in type under distinct prefixes: their index files have different
+// value encodings and are not interchangeable, so they must never collide.
+// Range* types map to their scalar bucket via valueindex.ColTypeName.
+func (s *Service) indexKey(tenant, colHash string, colType shared.ColumnType) string {
 	// Mirrors blockpack file layout: <tenant>/<block-id>/data.blockpack
-	return path.Join(tenant, s.cfg.IndexPrefix, colHash, valueindex.FormatFilename(0, valueindex.NewID()))
+	return path.Join(
+		tenant,
+		s.cfg.IndexPrefix,
+		colHash,
+		valueindex.ColTypeName(colType),
+		valueindex.FormatFilename(0, valueindex.NewID()),
+	)
 }
 
 // tenantFromPath extracts the tenant from "tenant/block-id/data.blockpack".

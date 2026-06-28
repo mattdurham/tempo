@@ -110,3 +110,19 @@ Back-refs:
 `internal/modules/valueindexcompactor/service.go`,
 `internal/modules/valueindexcompactor/config.go`,
 `internal/modules/valueindex/compaction.go`
+
+## NOTE-VI-024 — Type-bucketed paths require no compactor change (issue #409)
+
+Date: 2026-06-28
+
+The consumer now writes index files under `<tenant>/indexes/<col_hash>/<type>/`
+(NOTE-VI-024 in `valueindexconsumer/NOTES.md`). The compactor needed no logic
+change: `compactTenant` groups keys by `path.Dir(key)`, which under the deeper
+layout is `<tenant>/indexes/<col_hash>/<type>` — exactly the per-(hash, type)
+grouping required so a merge never combines files of different types under one
+single-typed writer. `List` is prefix-based (the extra nesting is returned
+naturally) and `mergeLevel` joins the output filename onto that `colDir`,
+preserving the `<type>` segment in the L1+ output key.
+
+Back-refs: `internal/modules/valueindexcompactor/service.go`
+(`compactTenant`/`mergeLevel`, unchanged; covered by `TestRunOnce_TypeBucketsMergedSeparately`).

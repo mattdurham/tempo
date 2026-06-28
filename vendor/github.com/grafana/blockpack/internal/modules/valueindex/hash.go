@@ -19,6 +19,40 @@ func ColHash(colName string) string {
 	return hex.EncodeToString(sum[:16])
 }
 
+// ColTypeName returns the short, human-readable bucket name for a column type,
+// used as a path segment between the column hash and the index file so that
+// columns sharing a name but differing in type are stored under distinct S3
+// prefixes (NOTE-VI-024, issue #409). Column names are not unique across types:
+// an attribute named "span.start" can be a float64 in one block and a string in
+// another. Index files of different types are not interchangeable (different
+// value encodings), so they must not collide under the same prefix.
+//
+// Range* types map to their scalar bucket because they are indexed as their
+// scalar equivalent (NOTE-VI-012): range_string → "string", range_int64 →
+// "int64", range_duration → "int64", range_uint64 → "uint64", range_float64 →
+// "float64", range_bytes → "bytes". An unindexable type returns "" so callers
+// can reject it rather than silently bucket it under an empty segment.
+func ColTypeName(colType shared.ColumnType) string {
+	switch colType {
+	case shared.ColumnTypeString, shared.ColumnTypeRangeString:
+		return "string"
+	case shared.ColumnTypeInt64, shared.ColumnTypeRangeInt64, shared.ColumnTypeRangeDuration:
+		return "int64"
+	case shared.ColumnTypeUint64, shared.ColumnTypeRangeUint64:
+		return "uint64"
+	case shared.ColumnTypeFloat64, shared.ColumnTypeRangeFloat64:
+		return "float64"
+	case shared.ColumnTypeBool:
+		return "bool"
+	case shared.ColumnTypeBytes, shared.ColumnTypeRangeBytes:
+		return "bytes"
+	case shared.ColumnTypeUUID:
+		return "uuid"
+	default:
+		return ""
+	}
+}
+
 // ValueHash returns the 32-char lower-hex value hash for a canonical-encoded value.
 // value_hash = lower_hex(SHA-256(encoded_value)[:16])
 func ValueHash(encodedValue []byte) string {
