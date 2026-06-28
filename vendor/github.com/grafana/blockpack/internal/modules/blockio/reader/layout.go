@@ -262,6 +262,25 @@ func (r *Reader) layoutBlockV14(blockIdx int, meta shared.BlockMeta) ([]FileLayo
 		})
 	}
 
+	// Trailing page padding (NOTE-V2-003, issue #419): the v2 writer pads each
+	// inner block's bytes to the next 4 KB boundary so block file offsets are
+	// page-aligned. BlockMeta.Length is the UNPADDED payload length, so the bytes
+	// in [Offset+Length, nextPageBoundary) are zero padding. Report them as their
+	// own physical section so the file-layout byte invariant (sum of physical
+	// sections == FileSize) continues to hold. v1 (unpadded) files produce zero
+	// padding here and add no section.
+	const page = shared.BlockFileRefPageSize
+	payloadEnd := meta.Offset + meta.Length
+	paddedEnd := ((payloadEnd + page - 1) / page) * page
+	if pad := int64(paddedEnd - payloadEnd); pad > 0 { //nolint:gosec
+		sections = append(sections, FileLayoutSection{
+			Section:        prefix + ".padding",
+			Offset:         int64(payloadEnd), //nolint:gosec
+			CompressedSize: pad,
+			BlockIndex:     blockIdx,
+		})
+	}
+
 	return sections, nil
 }
 

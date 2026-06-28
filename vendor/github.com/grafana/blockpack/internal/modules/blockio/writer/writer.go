@@ -127,6 +127,28 @@ func (cw *countingWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
+// blockPagePadding is a reusable, read-only buffer of zero bytes one page long,
+// sliced to the required pad width by padToPageBoundary. One page is the maximum
+// possible padding, so a single page-sized buffer covers every case.
+var blockPagePadding = make([]byte, shared.BlockFileRefPageSize)
+
+// padToPageBoundary appends trailing zero bytes to the output stream so the next
+// write begins on a 4 KB page boundary (NOTE-V2-003, issue #419). It is a no-op
+// when the stream is already page-aligned. After it returns successfully,
+// w.out.total is guaranteed to be a multiple of shared.BlockFileRefPageSize.
+func (w *Writer) padToPageBoundary() error {
+	const page = shared.BlockFileRefPageSize
+	rem := int(w.out.total % page)
+	if rem == 0 {
+		return nil
+	}
+	pad := page - rem
+	if _, err := w.out.Write(blockPagePadding[:pad]); err != nil {
+		return err
+	}
+	return nil
+}
+
 // NewWriterWithConfig validates the config and returns a new Writer.
 // Returns error if OutputStream is nil or MaxBlockSpans > 65535.
 func NewWriterWithConfig(cfg Config) (*Writer, error) {
@@ -752,6 +774,19 @@ func (w *Writer) mergeBuiltBlock(i int, s blockSlice, results []builtBlock) erro
 		// a subsequent Flush()/auto-flush from re-processing already-consumed spans.
 		w.clearPendingState()
 		return fmt.Errorf("writer: block %d write: %w", s.blockID, err)
+	}
+
+	// NOTE-V2-003 (issue #419): pad each inner block's trailing bytes with zeros to
+	// the next 4 KB page boundary. Blocks are written first (the first starts at
+	// offset 0) and the V8 sections follow the last block, so padding each block's
+	// tail keeps every subsequent block start page-aligned — which lets the v2
+	// page-units BlockFileRef (NOTE-V2-001/-002) address a block by page index and
+	// issue a direct ranged GET with no TOC fetch. The recorded BlockMeta.Length is
+	// the UNPADDED payload length, so the reader (which reads exactly Length bytes)
+	// transparently ignores the trailing zeros and v1 readers are unaffected.
+	if err := w.padToPageBoundary(); err != nil {
+		w.clearPendingState()
+		return fmt.Errorf("writer: block %d pad: %w", s.blockID, err)
 	}
 
 	w.blockMetas = append(w.blockMetas, shared.BlockMeta{

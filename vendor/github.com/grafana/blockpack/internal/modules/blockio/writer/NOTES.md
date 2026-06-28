@@ -1406,3 +1406,38 @@ Extending it to legacy blocks is consistent.
 `writer/writer_test.go:TestBuildIntrinsicBlockIndexPrefersSpanTree` (asserts a block with BOTH
 identity sources routes through the SpanTree and yields identical, correct per-row identity),
 white-box hook `writer/export_test.go:FillIntrinsicIndexFromSpanTreeForTest`.
+
+## NOTE-V2-003: inner-block 4 KB page padding (issue #419)
+
+After writing each inner block's payload, `mergeBuiltBlock` calls `padToPageBoundary`,
+which appends trailing zero bytes (from a single reusable page-sized zero buffer) until
+`w.out.total` is a multiple of `shared.BlockFileRefPageSize` (4096). Because blocks are
+written first — the first starts at file offset 0, the V8 sections/footer follow the last
+block — padding each block's tail keeps *every* subsequent block start page-aligned. That
+alignment is what lets the v2 page-units `BlockFileRef` (NOTE-V2-001/-002) address a block
+by page index and issue a direct ranged S3 GET with no TOC fetch (#417/#424).
+
+**Length stays unpadded.** `BlockMeta.Length` records the exact payload byte length, NOT the
+padded length. The reader reads exactly `Length` bytes per block, so it transparently ignores
+the trailing zero padding; v1 (unpadded) readers are unaffected since they never read past
+`Length`. The page-count form needed by `BlockFileRef` is derived at extraction time by
+rounding `Length` up to whole pages (`blockFileRefFromMeta`, NOTE-V2-002).
+
+**No contiguity assumption.** Nothing in the read path assumes `offset[i+1] == offset[i] +
+length[i]`; every block is located via its own TOC `BlockMeta`. Read coalescing
+(`reader/coalesce.go`) treats the ≤4095-byte pad as a normal inter-extent gap governed by
+`MaxGapBytes`/`MaxWasteRatio`, so it still merges adjacent blocks and per-block
+offsets/lengths are preserved.
+
+**Byte accounting.** `reader/layout.go:layoutBlockV14` emits a synthetic `block[i].padding`
+physical section for the trailing pad bytes so the file-layout byte invariant (sum of
+physical sections == FileSize) continues to hold. v1 files produce zero padding and add no
+section.
+
+**Overhead.** At most 4095 bytes per block (~0.3% at a ~1.4 MB max block).
+
+**Back-ref:** `writer/writer.go:padToPageBoundary`/`mergeBuiltBlock`,
+`reader/layout.go:layoutBlockV14`. Tests:
+`writer/block_page_align_test.go` (offsets page-aligned, padding is zero, round-trip ignores
+padding, single-block starts at 0), `reader/layout_test.go:TestFileLayout_*` (byte invariant
+with padding section).
