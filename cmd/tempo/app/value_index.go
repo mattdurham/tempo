@@ -10,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"strings"
 	"time"
@@ -80,6 +81,10 @@ func (t *App) initValueIndexConsumer() (services.Service, error) {
 	}
 	// Expose consumer pipeline metrics on the default registry.
 	vicCfg.Registerer = prometheus.DefaultRegisterer
+	// Inject a structured logger so the consumer logs job/flush boundaries
+	// (blockpack NOTE-VI-028, issue #410). The pipeline was otherwise a black
+	// box after startup.
+	vicCfg.Logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
 	s3Client, err := newMinioFromS3Cfg(t.cfg.StorageConfig.Trace.S3)
 	if err != nil {

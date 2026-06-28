@@ -7,10 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"os"
 	"path"
 	"time"
+
+	"go.opentelemetry.io/otel/attribute"
 
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
 	"github.com/grafana/blockpack/internal/modules/valueindex"
@@ -99,6 +102,7 @@ type Service struct {
 	columns    map[string]struct{}
 
 	metrics *consumerMetrics // nil when Config.Registerer is nil (no-op)
+	logger  *slog.Logger     // never nil — defaults to slog.Default() (NOTE-VI-028)
 	now     func() time.Time
 	cfg     Config
 }
@@ -111,6 +115,10 @@ func NewService(cfg Config, consumer Consumer, extractor Extractor, store Object
 	if consumer == nil || extractor == nil || store == nil {
 		return nil, errors.New("valueindexconsumer: consumer, extractor and store are required")
 	}
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
 	return &Service{
 		consumer:   consumer,
 		extractor:  extractor,
@@ -120,6 +128,7 @@ func NewService(cfg Config, consumer Consumer, extractor Extractor, store Object
 		cfg:        cfg,
 		columns:    cfg.columnSet(),
 		metrics:    newConsumerMetrics(cfg.Registerer),
+		logger:     logger,
 		now:        time.Now,
 	}, nil
 }
@@ -185,7 +194,10 @@ func (s *Service) observeQueueState(ctx context.Context) {
 		return
 	}
 	if r, ok := s.consumer.(StaleReclaimReporter); ok {
-		s.metrics.addStaleReclaims(r.StaleReclaimsSince())
+		if reclaimed := r.StaleReclaimsSince(); reclaimed > 0 {
+			s.metrics.addStaleReclaims(reclaimed)
+			s.logger.Info("value-index consumer reclaimed stale claims", "reclaimed", reclaimed)
+		}
 	}
 	if r, ok := s.consumer.(PendingReporter); ok {
 		if n, err := r.PendingCount(ctx); err == nil {
@@ -195,12 +207,26 @@ func (s *Service) observeQueueState(ctx context.Context) {
 }
 
 // ingest extracts entries from one message and appends them to per-column spill files.
+//
+// NOTE-VI-028 (issue #410): wraps the Extract call in a value_index.extract span
+// and logs the job boundary (claimed → extraction complete) so the otherwise
+// silent pod is observable while burning CPU on a large block.
 func (s *Service) ingest(ctx context.Context, msg Message) error {
 	touched := make(map[bufferKey]struct{})
 	perColumn := make(map[string]int)
 
+	s.logger.Info("value-index consumer job claimed", "file", msg.Event.Path, "msg_id", msg.ID)
+
+	ctx, span := tracer.Start(ctx, "value_index.extract")
+	defer span.End()
+	if span.IsRecording() {
+		span.SetAttributes(attribute.String("file", msg.Event.Path))
+	}
+
+	var totalEntries int
 	extractStart := s.now()
 	err := s.extractor.Extract(ctx, msg.Event, func(e ColumnEntry) error {
+		totalEntries++
 		if len(s.columns) > 0 {
 			if _, ok := s.columns[e.ColName]; !ok {
 				return nil
@@ -225,14 +251,29 @@ func (s *Service) ingest(ctx context.Context, msg Message) error {
 		}
 		return nil
 	})
-	s.metrics.observeExtract(s.now().Sub(extractStart))
+	extractElapsed := s.now().Sub(extractStart)
+	s.metrics.observeExtract(extractElapsed)
 	if err != nil {
 		s.metrics.incError(consumerOpExtract)
 		s.metrics.incFile(consumerStatusError)
+		s.logger.Error("value-index consumer extraction failed",
+			"file", msg.Event.Path, "elapsed", extractElapsed, "err", err)
 		return fmt.Errorf("valueindexconsumer: extract %q: %w", msg.Event.Path, err)
 	}
 	for col, n := range perColumn {
 		s.metrics.addEntries(col, n)
+	}
+
+	s.logger.Info("value-index consumer extraction complete",
+		"file", msg.Event.Path,
+		"columns", len(touched),
+		"entries", totalEntries,
+		"elapsed", extractElapsed)
+	if span.IsRecording() {
+		span.SetAttributes(
+			attribute.Int("columns", len(touched)),
+			attribute.Int("entries", totalEntries),
+		)
 	}
 
 	// Flush each touched buffer's write buffer to its spill file at the end of
@@ -251,9 +292,11 @@ func (s *Service) ingest(ctx context.Context, msg Message) error {
 		// No configured column touched: the file is fully handled by this ack.
 		if ackErr := s.consumer.Ack(ctx, msg.ID); ackErr != nil {
 			s.metrics.incError(consumerOpAck)
+			s.logger.Error("value-index consumer ack failed", "file", msg.Event.Path, "msg_id", msg.ID, "err", ackErr)
 			return ackErr
 		}
 		s.metrics.incFile(consumerStatusSuccess)
+		s.logger.Info("value-index consumer job acked", "file", msg.Event.Path, "msg_id", msg.ID, "ok", true)
 		return nil
 	}
 	s.pendingCol[msg.ID] = len(touched)
@@ -284,7 +327,17 @@ func (s *Service) bufferFor(key bufferKey) (*columnBuffer, error) {
 }
 
 // flushAll flushes every column buffer that has data.
+//
+// NOTE-VI-028 (issue #410): wraps the full flush pass in a value_index.flush
+// span and logs the boundary so a timer/shutdown flush is visible. The
+// buffer_count attribute and log field count only buffers that actually had
+// data to write.
 func (s *Service) flushAll(ctx context.Context) error {
+	ctx, span := tracer.Start(ctx, "value_index.flush")
+	defer span.End()
+
+	flushStart := s.now()
+	flushed := 0
 	for _, buf := range s.buffers {
 		if !buf.hasData {
 			continue
@@ -292,13 +345,34 @@ func (s *Service) flushAll(ctx context.Context) error {
 		if err := s.flushColumn(ctx, buf); err != nil {
 			return err
 		}
+		flushed++
+	}
+
+	elapsed := s.now().Sub(flushStart)
+	if span.IsRecording() {
+		span.SetAttributes(attribute.Int("buffer_count", flushed))
+	}
+	if flushed > 0 {
+		s.logger.Info("value-index consumer flush complete", "buffers", flushed, "elapsed", elapsed)
 	}
 	return nil
 }
 
 // flushColumn reads the spill file, builds an L0 value index, PUTs it to S3,
 // acks the relevant messages, and resets the spill file for reuse.
+//
+// NOTE-VI-028 (issue #410): wraps the single-column S3 put in a
+// value_index.flush.column span and logs per-column flush detail at debug.
 func (s *Service) flushColumn(ctx context.Context, buf *columnBuffer) error {
+	ctx, span := tracer.Start(ctx, "value_index.flush.column")
+	defer span.End()
+	if span.IsRecording() {
+		span.SetAttributes(
+			attribute.String("col", buf.colName),
+			attribute.String("type", valueindex.ColTypeName(buf.colType)),
+		)
+	}
+
 	// Drain any buffered entry bytes to the file before reading it back
 	// (NOTE-VI-025, issue #412). ingest flushes after each pass, but flushing
 	// here too keeps flushColumn correct independent of caller ordering.
@@ -313,6 +387,7 @@ func (s *Service) flushColumn(ctx context.Context, buf *columnBuffer) error {
 	}
 
 	flushStart := s.now()
+	entryCount := 0
 	w := valueindex.NewWriter(buf.colName, buf.colType)
 	br := bufio.NewReader(buf.file)
 	for {
@@ -324,6 +399,7 @@ func (s *Service) flushColumn(ctx context.Context, buf *columnBuffer) error {
 			s.metrics.incError(consumerOpFlush)
 			return fmt.Errorf("valueindexconsumer: read spill %q: %w", buf.colName, err)
 		}
+		entryCount++
 		if err := w.AddEntry(e.Value, e.TraceID, e.SourceRef, e.BlockRef, e.TimeSec); err != nil {
 			s.metrics.incError(consumerOpFlush)
 			return fmt.Errorf("valueindexconsumer: add entry %q: %w", buf.colName, err)
@@ -341,7 +417,19 @@ func (s *Service) flushColumn(ctx context.Context, buf *columnBuffer) error {
 		s.metrics.incError(consumerOpFlush)
 		return fmt.Errorf("valueindexconsumer: put %q: %w", key, err)
 	}
-	s.metrics.observeFlush(s.now().Sub(flushStart), len(data))
+	colElapsed := s.now().Sub(flushStart)
+	s.metrics.observeFlush(colElapsed, len(data))
+
+	if span.IsRecording() {
+		span.SetAttributes(attribute.Int("entries", entryCount))
+	}
+	s.logger.Debug("value-index consumer column flushed",
+		"col", buf.colName,
+		"type", valueindex.ColTypeName(buf.colType),
+		"entries", entryCount,
+		"size_bytes", len(data),
+		"s3_key", key,
+		"elapsed", colElapsed)
 
 	// Ack messages whose entries are now all on S3.
 	var ackIDs []string
@@ -370,12 +458,14 @@ func (s *Service) flushColumn(ctx context.Context, buf *columnBuffer) error {
 	if len(ackIDs) > 0 {
 		if err := s.consumer.Ack(ctx, ackIDs...); err != nil {
 			s.metrics.incError(consumerOpAck)
+			s.logger.Error("value-index consumer ack failed", "acked", len(ackIDs), "err", err)
 			return fmt.Errorf("valueindexconsumer: ack: %w", err)
 		}
 		// Each acked message corresponds to one fully-processed-and-flushed file.
 		for range ackIDs {
 			s.metrics.incFile(consumerStatusSuccess)
 		}
+		s.logger.Debug("value-index consumer messages acked", "acked", len(ackIDs), "ok", true)
 	}
 	return nil
 }

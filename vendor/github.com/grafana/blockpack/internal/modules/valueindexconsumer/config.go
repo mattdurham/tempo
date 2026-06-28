@@ -1,6 +1,7 @@
 package valueindexconsumer
 
 import (
+	"log/slog"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -60,6 +61,11 @@ type Config struct {
 	// registration occurs. It is not settable from YAML; the embedder (tempo)
 	// injects it programmatically.
 	Registerer prometheus.Registerer `yaml:"-"`
+	// Logger is the structured logger the consumer logs job/flush boundaries to
+	// (NOTE-VI-028, issue #410). When nil the service falls back to
+	// slog.Default(), so logging is always live. It is not settable from YAML;
+	// the embedder (tempo) injects its configured logger programmatically.
+	Logger *slog.Logger `yaml:"-"`
 	// RedisAddr is the host:port of the Redis server backing the stream.
 	RedisAddr string `yaml:"redis_addr"`
 	// RqliteURL is the HTTP URL of the rqlite cluster backing the job table
