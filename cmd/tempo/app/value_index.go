@@ -207,13 +207,14 @@ func (e *tempoVICExtractor) Extract(ctx context.Context, event blockevents.Messa
 		return fmt.Errorf("open reader %s: %w", key, err)
 	}
 
-	// Extraction (the two-phase intrinsic + attribute column walk, the per-span
-	// TimeSec from span:start, and the identity-column denylist) is delegated to
-	// blockpack.ExtractValueIndexEntries (NOTE-VI-018, blockpack issue #401) so this
-	// module and the standalone value-index-consumer binary share one implementation
-	// and both index the high-value intrinsic columns (span:name, span:kind,
-	// span:status, span:duration, resource.service.name). nil denylist selects
-	// blockpack.DefaultValueIndexDenylist.
+	// Extraction (the two-phase intrinsic + attribute column walk and the per-span
+	// TimeSec from span:start) is delegated to blockpack.ExtractValueIndexEntries
+	// (NOTE-VI-018, blockpack issue #401) so this module and the standalone
+	// value-index-consumer binary share one implementation. nil denylist indexes
+	// every column (NOTE-VI-027, blockpack issue #414): the value index is
+	// policy-free and the querier decides which columns are useful at read time.
+	// Time-domain intrinsics (span:start/end/duration) are truncated to millisecond
+	// precision during extraction (blockpack issue #415).
 	return blockpack.ExtractValueIndexEntries(reader, nil, func(e blockpack.ValueIndexEntry) error {
 		return yield(vicconsumer.ColumnEntry{
 			ColName:   e.ColName,

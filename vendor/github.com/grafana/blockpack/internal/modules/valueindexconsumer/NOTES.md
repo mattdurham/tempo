@@ -146,6 +146,13 @@ and asserts the yielded columns, denylist, per-span TimeSec, and yield-error abo
 
 ### Denylist, not allowlist
 
+> SUPERSEDED by NOTE-VI-027 (issues #414/#415): `DefaultValueIndexDenylist` was removed.
+> A nil denylist now indexes EVERY column (the index is policy-free; the querier decides
+> at read time). The high-cardinality time columns that motivated the denylist
+> (`span:start`/`span:end`/`span:duration`) are kept useful via millisecond truncation
+> during extraction rather than being excluded. The paragraph below describes the
+> pre-#414 behaviour.
+
 `DefaultValueIndexDenylist` drops the columns that are useless or redundant as tag values:
 the three identity columns (`span:id`, `span:parent_id`, `trace:id` — unique per span) and
 `span:start` (high-cardinality timestamp already covered by the time-range index). A nil
@@ -458,3 +465,50 @@ preserved (NOTE-LINT-407): pointers/maps/strings first, the `uint8 colType` +
 
 Back-refs: `internal/modules/valueindexconsumer/service.go`
 (`columnBuffer`, `bufferFor`, `ingest`, `flushColumn`, `spillWriteBufSize`).
+
+## NOTE-VI-027 — Policy-free index + millisecond time truncation (issues #414, #415)
+
+Date: 2026-06-28
+
+### Removed `DefaultValueIndexDenylist` (issue #414)
+
+The value index is a general-purpose lookup structure: which columns are worth
+querying is a READ-time decision made by the querier, not a WRITE-time policy
+baked into the storage layer. The old `DefaultValueIndexDenylist` silently dropped
+`span:id`, `span:parent_id`, `trace:id`, and `span:start` at extraction time, which
+meant those columns could never be queried via the value index even if a future
+use case needed them (e.g. trace-by-id lookup, time-bucketed lookups).
+
+`ExtractValueIndexEntries(reader, denylist, yield)` now treats a nil denylist as
+"index every column" rather than "select the default denylist". Both production
+callers (the standalone binary and tempo's in-process module) pass nil, so removing
+the default flips them from "drop the four columns" to "index everything" with no
+signature change. Callers that genuinely need exclusions pass an explicit non-nil
+denylist; an empty non-nil map also indexes everything. Reading a nil map with the
+`_, ok := denylist[name]` comma-ok form is safe (always returns false), so no
+nil-guard is needed on the lookups.
+
+### Millisecond truncation for time-domain intrinsics (issue #415)
+
+`span:start`, `span:end`, and `span:duration` are stored as raw nanosecond uint64
+values. At nanosecond resolution every span gets a unique value hash and the
+posting list degenerates to one entry per span — zero value sharing, which is
+exactly why those columns were in the old denylist. The right fix is truncation,
+not exclusion: `truncateTimeValueToMillis(name, val)` divides the value by 1e6
+(`ns → ms`) for exactly these three column names, applied at BOTH yield sites
+(phase-1 block columns and phase-2 IntrinsicTOC). This gives ~1000x cardinality
+reduction (`span:start`/`span:end`) and collapses common durations into shared
+buckets (`span:duration`).
+
+Truncation is scoped strictly to the three time columns — every other uint64/int64
+column (e.g. `span:kind`, small-integer attributes) passes through unchanged; a
+blanket divide would have zeroed out those small integers. Truncation happens ONLY
+during value-index extraction: the stored block columns remain nanosecond precision
+for range queries, and the recorded `ColumnType` is unchanged (still uint64
+milliseconds, not a duration type). Millisecond precision is sufficient — sub-ms is
+not exposed in TraceQL and not meaningful for tag-value lookups.
+
+Back-refs: `valueindex_extract.go` (`truncateTimeValueToMillis`,
+`ExtractValueIndexEntries`), `valueindex_extract_test.go`,
+`cmd/value-index-consumer/main.go`,
+tempo `cmd/tempo/app/value_index.go`.

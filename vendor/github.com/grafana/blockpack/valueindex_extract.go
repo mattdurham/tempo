@@ -50,27 +50,26 @@ type ValueIndexEntry struct {
 	TimeSec uint64
 }
 
-// DefaultValueIndexDenylist is the set of intrinsic columns that are never worth
-// indexing for tag-value lookups (NOTE-VI-018): the three identity columns are
-// unique per span (useless as a tag value), and span:start is a high-cardinality
-// timestamp already covered by the time-range index. Everything else — including
-// every attribute column and the remaining intrinsics — is indexed by default.
-// Callers may pass their own denylist to ExtractValueIndexEntries; nil selects
-// this default.
-var DefaultValueIndexDenylist = map[string]struct{}{
-	modules_shared.SpanIDColumnName:       {}, // unique per span
-	modules_shared.SpanParentIDColumnName: {}, // unique per span
-	modules_shared.TraceIDColumnName:      {}, // unique per span
-	modules_shared.SpanStartColumnName:    {}, // timestamp; covered by time-range index
-}
-
 // ExtractValueIndexEntries reads every indexable (column, span) observation from
 // one blockpack and streams it to yield (NOTE-VI-018, issue #401).
 //
-// Columns in denylist are skipped; a nil denylist selects
-// DefaultValueIndexDenylist. yield is called once per present span value; if it
-// returns an error, extraction stops and returns that error. A column absent from
-// a block simply produces no calls.
+// The value index is a policy-free, general-purpose lookup structure: it indexes
+// every column the reader exposes (NOTE-VI-027, issue #414). There is no built-in
+// denylist — callers (the querier) decide which columns are useful at read time,
+// not the writer. A nil denylist therefore indexes everything; callers that
+// genuinely need to exclude columns pass an explicit non-nil denylist.
+//
+// The high-cardinality time-domain intrinsics (span:start, span:end,
+// span:duration) are stored as raw nanosecond uint64 values, which would
+// degenerate the index into a per-span posting list with no value sharing. To
+// keep them useful for time-bucketed and duration lookups they are truncated to
+// millisecond precision during extraction only (NOTE-VI-027, issue #415): the
+// stored block columns remain nanosecond precision for range queries. The column
+// type is unchanged (still uint64 milliseconds, not a duration type).
+//
+// Columns in denylist are skipped; a nil denylist indexes every column. yield is
+// called once per present span value; if it returns an error, extraction stops and
+// returns that error. A column absent from a block simply produces no calls.
 //
 // TimeSec on each entry is the span's start time in seconds, resolved from the
 // span:start intrinsic by (blockIdx, rowIdx); it is 0 when the file has no
@@ -82,9 +81,6 @@ func ExtractValueIndexEntries(
 ) error {
 	if r == nil {
 		return nil
-	}
-	if denylist == nil {
-		denylist = DefaultValueIndexDenylist
 	}
 
 	// span:start (nanoseconds) → per-ref second resolution for TimeSec. Built once
@@ -101,6 +97,34 @@ func ExtractValueIndexEntries(
 
 	// Phase 2 — IntrinsicTOC fallback for any intrinsic column phase 1 did not yield.
 	return extractIntrinsicColumns(r, denylist, startSecByRef, yielded, yield)
+}
+
+// truncateTimeValueToMillis truncates the raw nanosecond value of a time-domain
+// intrinsic column (span:start, span:end, span:duration) to millisecond precision
+// for value-index extraction (NOTE-VI-027, issue #415). These columns are stored
+// as nanosecond uint64; without truncation every span gets a unique value hash and
+// the index degenerates to a per-span posting list. Truncation gives ~1000x
+// cardinality reduction so spans in the same millisecond share one value bucket.
+//
+// Non-time columns and unexpected value types pass through unchanged. The returned
+// value keeps the same dynamic type as the input (uint64 stays uint64, int64 stays
+// int64) so the recorded ColumnType is still correct.
+func truncateTimeValueToMillis(name string, val any) any {
+	switch name {
+	case modules_shared.SpanStartColumnName,
+		modules_shared.SpanEndColumnName,
+		modules_shared.SpanDurationColumnName:
+	default:
+		return val
+	}
+	switch v := val.(type) {
+	case uint64:
+		return v / 1_000_000
+	case int64:
+		return v / 1_000_000
+	default:
+		return val
+	}
 }
 
 // buildSpanStartSecByRef builds a packed-key (uint32(blockIdx)<<16 | rowIdx) → seconds
@@ -161,7 +185,7 @@ func extractBlockColumns(
 				key := uint32(bi)<<16 | uint32(row) //nolint:gosec // bounded by block/span counts
 				if err := yield(ValueIndexEntry{
 					ColName: colKey.Name,
-					Value:   val,
+					Value:   truncateTimeValueToMillis(colKey.Name, val),
 					ColType: colType,
 					BlockID: uint32(bi), //nolint:gosec // bounded by BlockCount
 					TimeSec: startSecByRef[key],
@@ -215,7 +239,7 @@ func yieldIntrinsicColumn(
 		key := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx)
 		return yield(ValueIndexEntry{
 			ColName: name,
-			Value:   val,
+			Value:   truncateTimeValueToMillis(name, val),
 			ColType: col.Type,
 			BlockID: uint32(ref.BlockIdx),
 			TimeSec: startSecByRef[key],
