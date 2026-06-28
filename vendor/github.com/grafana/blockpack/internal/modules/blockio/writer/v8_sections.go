@@ -231,6 +231,14 @@ func (w *Writer) writeV8FileSections(sw *v8SectionWriter) error {
 // writeV8IntrinsicBlobs writes per-column intrinsic ToCEntries.
 // Intrinsic blobs are already snappy-compressed; they are NOT re-compressed via writeToCEntry.
 func (w *Writer) writeV8IntrinsicBlobs(sw *v8SectionWriter) error {
+	// NOTE-V2-005 (issue #421): v2 self-contained blocks carry every intrinsic column in their
+	// own payloads, so the file-level IntrinsicTOC is redundant and is skipped entirely. The
+	// per-block spillMerge is also skipped (spillBlockAccumulators), so w.intrinsicAccum is nil
+	// here in the common case — but guard explicitly so the section is never emitted even if an
+	// accumulator was created for some other reason.
+	if omitIntrinsicTOCActive() {
+		return nil
+	}
 	a := w.intrinsicAccum
 	if a == nil {
 		return nil

@@ -21,6 +21,13 @@ type Config struct {
 	// WriterConfig.RestoreIdentityBlockColumns. Defaults OFF (identity intrinsic-only per
 	// NOTE-469); the v1→v2 rewrite pass (#425) sets it on compaction output.
 	RestoreIdentityBlockColumns bool
+
+	// OmitIntrinsicTOC skips writing the file-level IntrinsicTOC section in the compacted
+	// output (NOTE-V2-005, issue #421). See WriterConfig.OmitIntrinsicTOC. Only effective
+	// alongside RestoreIdentityBlockColumns (the writer enforces this); the v1→v2 rewrite pass
+	// (#425) sets both so the compacted output is a fully self-contained v2 file with no
+	// redundant IntrinsicTOC. Defaults OFF (IntrinsicTOC written as before).
+	OmitIntrinsicTOC bool
 	// MaxOutputFileSize removed: Tempo's compaction scheduler enforces max_block_bytes
 	// on input selection, so output is already bounded. The internal size estimate
 	// (fixed 2048 bytes/span) was inaccurate and could spuriously split the sort

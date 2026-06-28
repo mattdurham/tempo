@@ -396,6 +396,10 @@ func (s *compactionState) ensureWriter() error {
 		// NOTE-V2-004 (issue #420): restore identity columns into block payloads when configured
 		// so the compacted output is self-contained for v2 direct block fetch (#424).
 		RestoreIdentityBlockColumns: s.cfg.RestoreIdentityBlockColumns,
+		// NOTE-V2-005 (issue #421): skip the file-level IntrinsicTOC section in the compacted
+		// output when configured; every intrinsic column already lives in the self-contained
+		// blocks (#420), making the IntrinsicTOC redundant for v2 direct block fetch (#424).
+		OmitIntrinsicTOC: s.cfg.OmitIntrinsicTOC,
 	})
 	if err != nil {
 		_ = f.Close()

@@ -179,6 +179,30 @@ func restoreIdentityBlockColumnsActive() bool {
 	return restoreIdentityBlockColumnsEnabled.Load()
 }
 
+// omitIntrinsicTOCEnabled is the process-level rollout toggle for skipping the file-level
+// IntrinsicTOC section entirely (NOTE-V2-005, issue #421). Defaults to false. When true the
+// writer skips both the file-level intrinsic spillMerge and the IntrinsicTOC ToCEntry
+// emission, so no IntrinsicTOC section reaches the file. Only meaningful alongside
+// restoreIdentityBlockColumnsEnabled (every intrinsic column must already be in the blocks);
+// NewWriterWithConfig only sets this true when RestoreIdentityBlockColumns is also true.
+//
+// Not writing a section is not a block-format version change, so this is a pure encoder-side
+// choice that any reader handles (the reader's IntrinsicTOC consultation is already a fallback
+// behind per-block columns). Atomic for the same reason as restoreIdentityBlockColumnsEnabled:
+// a deploy-level constant accessed from the encoder goroutine.
+var omitIntrinsicTOCEnabled atomic.Bool //nolint:gochecknoglobals // process-level rollout flag
+
+// setOmitIntrinsicTOCEnabled sets the process-level IntrinsicTOC-omission rollout flag.
+func setOmitIntrinsicTOCEnabled(v bool) {
+	omitIntrinsicTOCEnabled.Store(v)
+}
+
+// omitIntrinsicTOCActive reports whether the file-level IntrinsicTOC section is skipped
+// (v2 self-contained blocks; all intrinsics live in the per-inner-block payloads).
+func omitIntrinsicTOCActive() bool {
+	return omitIntrinsicTOCEnabled.Load()
+}
+
 // zstd benefit gate (NOTE-405, issue #355). A column blob switches from snappy to zstd only
 // when len(zstd) * zstdBenefitDen < len(snappy) * zstdBenefitNum, i.e. zstd is at least
 // (1 - Num/Den) smaller than snappy. With Num=97, Den=100 a blob must be >=3% smaller under

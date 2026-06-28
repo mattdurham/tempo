@@ -1484,3 +1484,50 @@ count == 1 and span count preserved after a toggle-on recompaction round trip).
 `internal/modules/blockio/writer/config.go:Config.RestoreIdentityBlockColumns`,
 `internal/modules/blockio/compaction/config.go:Config.RestoreIdentityBlockColumns`,
 `internal/modules/blockio/writer/identity_block_cols_test.go`.
+
+## NOTE-V2-005 (issue #421) — skip the file-level IntrinsicTOC for v2 self-contained blocks
+
+The v2 format (#417) makes every inner block self-contained: all intrinsic columns already
+live in the per-block column payloads — `span:name`/`kind`/`status`/`status_message`/`start`/
+`duration` via the unconditional `addPresent` writes in `feedSpanName`/`feedSpanKind`/
+`feedSpanStatus`/`feedSpanTiming`, the three identity columns via `RestoreIdentityBlockColumns`
+(NOTE-V2-004, #420), and `span:end` synthesized from `span:start + span:duration` (NOTE-399).
+The file-level IntrinsicTOC therefore carries nothing the blocks don't already have, and it is
+~50% of L1 file size. `OmitIntrinsicTOC` skips it.
+
+**Two skip points, one flag.** `Config.OmitIntrinsicTOC` → process-level atomic
+`omitIntrinsicTOCEnabled` (set in `NewWriterWithConfig` exactly like
+`restoreIdentityBlockColumnsEnabled`/NOTE-V2-004). When active:
+- `spillBlockAccumulators` skips the file-level `intrinsicAccum.spillMerge` — its ONLY consumer
+  is the IntrinsicTOC section, so skipping it saves the per-block intrinsic spill I/O entirely.
+- `writeV8IntrinsicBlobs` returns early so no IntrinsicTOC ToCEntry is emitted (defence-in-depth
+  guard in addition to `intrinsicAccum` being nil because the spill was skipped).
+
+**SpanTree is unaffected.** `feedSpanTreeFromAccum` is fed from the *per-block* `built.localAccum`
+(in `spillBlockAccumulators`), NOT from the file-level `intrinsicAccum`. So omitting the
+file-level spill/section does not touch the SpanTree section.
+
+**REQUIRES RestoreIdentityBlockColumns — enforced in the writer.** Without identity columns in
+the blocks, dropping the IntrinsicTOC would leave no identity store at all (the SpanTree is a
+read-path-specific structure, not the general intrinsic column store). `NewWriterWithConfig`
+only activates the omission when BOTH flags are set:
+`setOmitIntrinsicTOCEnabled(cfg.OmitIntrinsicTOC && cfg.RestoreIdentityBlockColumns)`. Guarded by
+`TestWriter_omitIntrinsicTOC_requiresIdentityColumns`.
+
+**Reader / value-index: no change needed.** A v2 file has no IntrinsicTOC ToCEntries, so
+`Reader.intrinsicIndex` is empty ⇒ `HasIntrinsicSection()` is false and `IntrinsicColumnNames()`
+returns nil. The value-index extractor's phase-2 IntrinsicTOC fallback iterates
+`IntrinsicColumnNames()`, so it is a *structural* no-op for v2 files — the intrinsics are all
+yielded by phase 1 from the block columns. Verified by `TestExtractValueIndexEntries_V2NoIntrinsicTOC`.
+
+**Toggle, not a format bump.** Not writing a section is a pure encoder-side choice; the reader's
+IntrinsicTOC consultation is already a fallback behind per-block columns. Defaults OFF. Plumbed
+through `compaction.Config.OmitIntrinsicTOC` so the v1→v2 rewrite pass (#425) sets it.
+
+**Back-ref:** `internal/modules/blockio/writer/writer.go:spillBlockAccumulators`/`NewWriterWithConfig`,
+`internal/modules/blockio/writer/v8_sections.go:writeV8IntrinsicBlobs`,
+`internal/modules/blockio/writer/constants.go:omitIntrinsicTOCEnabled`,
+`internal/modules/blockio/writer/config.go:Config.OmitIntrinsicTOC`,
+`internal/modules/blockio/compaction/config.go:Config.OmitIntrinsicTOC`,
+`internal/modules/blockio/writer/omit_intrinsic_toc_test.go`,
+`valueindex_extract_test.go:TestExtractValueIndexEntries_V2NoIntrinsicTOC`.

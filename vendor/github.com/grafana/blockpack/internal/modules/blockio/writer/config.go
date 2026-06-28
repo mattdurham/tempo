@@ -215,4 +215,28 @@ type Config struct {
 	// Defaults OFF so it can be rolled out by toggle without a format bump. Expect a modest
 	// per-block size increase (~30 bytes/span for the three high-entropy ID columns).
 	RestoreIdentityBlockColumns bool
+
+	// OmitIntrinsicTOC skips writing the file-level IntrinsicTOC section entirely (NOTE-V2-005,
+	// issue #421). In the v2 self-contained-block format (#417) every intrinsic column already
+	// lives in the per-inner-block column payloads: span:name/kind/status/status_message/
+	// start/duration via the unconditional addPresent writes in feedSpan*, and the three
+	// identity columns (trace:id/span:id/span:parent_id) via RestoreIdentityBlockColumns
+	// (NOTE-V2-004, #420). span:end is synthesized from span:start+span:duration (NOTE-399).
+	// The IntrinsicTOC therefore carries no information not already in the blocks, and v2 direct
+	// block fetch (#424) resolves every span from block bytes alone — so the IntrinsicTOC is
+	// redundant and ~50% of L1 file size.
+	//
+	// When true the writer skips both the file-level intrinsic spillMerge (per-block, in
+	// spillBlockAccumulators) and the IntrinsicTOC ToCEntry emission (writeV8IntrinsicBlobs),
+	// so no IntrinsicTOC section reaches the final file. The SpanTree is fed from the same
+	// per-block accumulator independently (feedSpanTreeFromAccum uses built.localAccum, not the
+	// file-level spill), so it is unaffected.
+	//
+	// REQUIRES RestoreIdentityBlockColumns: without identity columns in blocks there would be
+	// no identity store at all once the IntrinsicTOC is gone (the SpanTree alone is read-path
+	// specific). NewWriterWithConfig enforces this by only activating OmitIntrinsicTOC when
+	// RestoreIdentityBlockColumns is also set. Defaults OFF; safe to roll out by toggle without
+	// a format bump because the reader's IntrinsicTOC consultation is already a fallback behind
+	// per-block columns (HasIntrinsicColumn / block.Columns()).
+	OmitIntrinsicTOC bool
 }

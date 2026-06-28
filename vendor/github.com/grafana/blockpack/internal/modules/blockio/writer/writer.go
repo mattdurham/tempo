@@ -192,6 +192,13 @@ func NewWriterWithConfig(cfg Config) (*Writer, error) {
 	// span:id, and span:parent_id into per-inner-block payloads so each block is self-contained
 	// for v2 direct ranged-GET fetch (#424).
 	setRestoreIdentityBlockColumnsEnabled(cfg.RestoreIdentityBlockColumns)
+	// NOTE-V2-005 (issue #421): apply the IntrinsicTOC-omission rollout flag. Default DISABLED
+	// (IntrinsicTOC written as before). When set, the writer skips both the file-level intrinsic
+	// spillMerge and the IntrinsicTOC ToCEntry emission, so no IntrinsicTOC section reaches the
+	// file. REQUIRES RestoreIdentityBlockColumns: without identity columns in the blocks there
+	// would be no identity store once the IntrinsicTOC is gone, so the omission is only activated
+	// when both flags are set.
+	setOmitIntrinsicTOCEnabled(cfg.OmitIntrinsicTOC && cfg.RestoreIdentityBlockColumns)
 	// Default auto-flush at 5× block size. Caps live proto memory to one batch of
 	// 5 blocks while preserving enough lookahead for MinHash sort quality.
 	if cfg.MaxBufferedSpans == 0 {
@@ -829,11 +836,18 @@ func (w *Writer) spillBlockAccumulators(i int, s blockSlice, results []builtBloc
 	if built.localAccum == nil {
 		return nil
 	}
-	if err := w.ensureIntrinsicAccum(); err != nil {
-		return fmt.Errorf("writer: intrinsic accumulator: %w", err)
-	}
-	if err := w.intrinsicAccum.spillMerge(built.localAccum); err != nil {
-		return fmt.Errorf("writer: block %d intrinsic spill: %w", s.blockID, err)
+	// NOTE-V2-005 (issue #421): when the IntrinsicTOC is omitted (v2 self-contained blocks),
+	// skip the file-level intrinsic spillMerge entirely — the only consumer of that spill is
+	// the IntrinsicTOC section (writeV8IntrinsicBlobs), which is not emitted. The SpanTree is
+	// fed from the same per-block accumulator below (built.localAccum), independent of the
+	// file-level spill, so it is unaffected.
+	if !omitIntrinsicTOCActive() {
+		if err := w.ensureIntrinsicAccum(); err != nil {
+			return fmt.Errorf("writer: intrinsic accumulator: %w", err)
+		}
+		if err := w.intrinsicAccum.spillMerge(built.localAccum); err != nil {
+			return fmt.Errorf("writer: block %d intrinsic spill: %w", s.blockID, err)
+		}
 	}
 	// NOTE-462 (issue #381): feed the SpanTree accumulator from the same per-block
 	// intrinsic identity columns before releasing localAccum, so structural records
