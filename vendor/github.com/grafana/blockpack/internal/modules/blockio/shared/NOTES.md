@@ -2538,3 +2538,30 @@ Back-ref: `internal/modules/blockio/shared/intrinsic_stream.go` (PageStats,
 ScanPagedColumnBlobWithStats); `internal/modules/blockio/reader/intrinsic_reader.go`
 (Reader.ScanIntrinsicColumnWithStats); `internal/modules/executor/metrics_trace_intrinsic.go`
 (streamCountRateNoGroupByPaged prefilter).
+
+## NOTE-V2-001: BlockFileRef — v2 page-aligned on-disk block locator (issue #418)
+
+Defines the v2 file-format block locator `BlockFileRef{Page uint32 /*uint24 wire*/,
+Length uint16}` in `blockref.go`, the foundation of the v2 lean format epic (#417).
+The v2 format drops the IntrinsicTOC and resolves inner blocks directly from
+value-index hits, so a value-index entry must point at a block's byte range in the
+file. Storing that as a 4 KB *page* reference keeps it to 5 bytes on the wire
+(3-byte LE uint24 Page + 2-byte LE uint16 Length) instead of 12 bytes for a raw
+uint64 offset + uint32 length, while still addressing a 64 GB file (16 M pages) and
+a 256 MB block (65535 pages). Inner blocks are padded to a 4096-byte boundary
+(#419) so page units exactly describe the range and enable a direct ranged S3 GET
+with no TOC fetch.
+
+Naming: deliberately NOT reusing the existing `BlockRef{BlockIdx,RowIdx uint16}`
+(a load-bearing IN-MEMORY row locator used throughout the value-index/intrinsic
+posting lists). `BlockFileRef` is a serialized FILE-position locator — a distinct
+concept. Conflating them under one name would be a footgun.
+
+API: `EncodeBlockFileRef(dst,r) error` (errors on uint24 Page overflow and short
+dst, never silently truncates), `DecodeBlockFileRef(src) (BlockFileRef,error)`,
+`Bytes()`/`LengthBytes()` accessors, consts `BlockFileRefWireSize=5`,
+`BlockFileRefPageSize=4096`. gosec G115 on the uint24 byte-pack: masked with
+`& 0xFF` after an explicit `Page > 0xFFFFFF` guard so the conversions are provably
+lossless. Purely additive — no read/write path consumes it yet (wired up by
+#419/#421/#423), so deadcode reachability comes from the shared package being a
+library surface; no perf signal expected from this commit alone.
