@@ -202,4 +202,17 @@ type Config struct {
 	// block-format version bump (the IntrinsicTOC is a self-describing column set — fewer
 	// columns is not a format change).
 	OmitIntrinsicIdentityColumns bool
+
+	// RestoreIdentityBlockColumns writes the three identity columns (trace:id, span:id,
+	// span:parent_id) back into per-inner-block column payloads in addition to the file-level
+	// intrinsic section (NOTE-V2-004, issue #420). NOTE-469 (issue #389) had removed these from
+	// block payloads to make them intrinsic-only; the v2 format reverses that because every
+	// inner block must be self-contained for direct ranged-GET block fetch (#424) — a span must
+	// resolve from the block bytes alone, with no IntrinsicTOC or SpanTree consultation.
+	//
+	// Adding columns to a block is not a block-format version change (the column set is
+	// self-describing), so this is a pure encoder-side choice and existing readers handle it.
+	// Defaults OFF so it can be rolled out by toggle without a format bump. Expect a modest
+	// per-block size increase (~30 bytes/span for the three high-entropy ID columns).
+	RestoreIdentityBlockColumns bool
 }

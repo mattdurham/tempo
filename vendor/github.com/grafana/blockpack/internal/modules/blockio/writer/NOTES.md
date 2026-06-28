@@ -1441,3 +1441,46 @@ section.
 `writer/block_page_align_test.go` (offsets page-aligned, padding is zero, round-trip ignores
 padding, single-block starts at 0), `reader/layout_test.go:TestFileLayout_*` (byte invariant
 with padding section).
+
+## NOTE-V2-004: restore identity columns to block payloads for self-contained v2 blocks (issue #420)
+
+Reverses the block-payload removal of NOTE-469 (issue #389) — but additively and under a
+toggle. NOTE-469 made `trace:id`/`span:id`/`span:parent_id` intrinsic-only to recover their
+~bytes from inner-block payloads, serving all reads from the IntrinsicTOC / SpanTree. The v2
+format (#417) needs the opposite property: every inner block must be **self-contained** so a
+single direct ranged-GET of the block bytes (#424) resolves a span with no IntrinsicTOC or
+SpanTree consultation. So v2 restores the three identity columns into block payloads.
+
+**Toggle, not a format bump.** `Config.RestoreIdentityBlockColumns` (process-level flag
+`restoreIdentityBlockColumnsEnabled`, set in `NewWriterWithConfig` exactly like
+`EnableZstdColumns`/NOTE-405). Adding columns to a block is not a block-format version change —
+the block column set is self-describing — so this is a pure encoder-side choice that existing
+readers handle. Defaults OFF (intrinsic-only behaviour preserved). Plumbed through
+`compaction.Config.RestoreIdentityBlockColumns` so the v1→v2 rewrite pass (#425) can set it on
+compaction output.
+
+**What changed in the writer (both write paths):**
+- `feedSpanIdentifiers` (ingest): when the toggle is set, also `addPresent` the three identity
+  columns into the block payload (bytes columns). `addPresent` already excludes `trace:id` from
+  the range index (unique per trace, useless for pruning), so no spurious range-index growth.
+- `applyTraceID`/`applySpanID`/`applySpanParentID` (compaction of a source block that *carries*
+  the identity block columns): when the toggle is set, also `addPresent` the block column in
+  addition to feeding the intrinsic accumulator.
+
+**Double-feed hazard — the load-bearing invariant.** With identity columns back in block
+payloads, a v2 source block has a `trace:id` block column, so `addRowFromBlock` visits it and
+`applyTraceID`/`applySpanParentID` feed the intrinsic accumulator. The `appendBlockBuilders`
+gate `if ps.srcBlock.GetColumn(traceIDColumnName) == nil` then SKIPS `feedIntrinsicsFromIndex`,
+so the intrinsic accumulator is fed exactly once. If both fired, `GetTraceByID` would return
+each span twice. This gate (introduced for NOTE-469) is exactly correct for v2 without change:
+present block column ⇒ identity carried by `addRowFromBlock`; absent block column (old v4+
+intrinsic-only source) ⇒ identity carried by `feedIntrinsicsFromIndex`. Guarded by
+`TestWriter_identityBlockColumns_recompactionRoundTrip` (asserts intrinsic `span:parent_id`
+count == 1 and span count preserved after a toggle-on recompaction round trip).
+
+**Back-ref:** `internal/modules/blockio/writer/writer_block.go:feedSpanIdentifiers`/
+`applyTraceID`/`applySpanID`/`applySpanParentID`,
+`internal/modules/blockio/writer/constants.go:restoreIdentityBlockColumnsEnabled`,
+`internal/modules/blockio/writer/config.go:Config.RestoreIdentityBlockColumns`,
+`internal/modules/blockio/compaction/config.go:Config.RestoreIdentityBlockColumns`,
+`internal/modules/blockio/writer/identity_block_cols_test.go`.

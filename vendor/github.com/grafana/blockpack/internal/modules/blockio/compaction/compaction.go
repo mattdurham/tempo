@@ -393,6 +393,9 @@ func (s *compactionState) ensureWriter() error {
 		// NOTE-476 (issue #394): drop identity columns from the compacted IntrinsicTOC when
 		// configured; the SpanTree section is the identity store for such blocks.
 		OmitIntrinsicIdentityColumns: s.cfg.OmitIntrinsicIdentityColumns,
+		// NOTE-V2-004 (issue #420): restore identity columns into block payloads when configured
+		// so the compacted output is self-contained for v2 direct block fetch (#424).
+		RestoreIdentityBlockColumns: s.cfg.RestoreIdentityBlockColumns,
 	})
 	if err != nil {
 		_ = f.Close()

@@ -187,6 +187,11 @@ func NewWriterWithConfig(cfg Config) (*Writer, error) {
 	// per-column when it beats snappy by the benefit margin. Requires V15 (EnableInlineColumns)
 	// since the codec is signaled by a V15 flags-byte bit; gated to that combination below.
 	setZstdColumnsEnabled(cfg.EnableZstdColumns && cfg.EnableInlineColumns)
+	// NOTE-V2-004 (issue #420): apply the identity-block-column rollout flag. Default DISABLED
+	// (identity columns intrinsic-only per NOTE-469). When set, the writer restores trace:id,
+	// span:id, and span:parent_id into per-inner-block payloads so each block is self-contained
+	// for v2 direct ranged-GET fetch (#424).
+	setRestoreIdentityBlockColumnsEnabled(cfg.RestoreIdentityBlockColumns)
 	// Default auto-flush at 5× block size. Caps live proto memory to one batch of
 	// 5 blocks while preserving enough lookahead for MinHash sort quality.
 	if cfg.MaxBufferedSpans == 0 {

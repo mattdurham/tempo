@@ -14,6 +14,13 @@ type Config struct {
 	// blocks' identity is sourced from their own SpanTree during recompaction when they were
 	// themselves written with this flag.
 	OmitIntrinsicIdentityColumns bool
+
+	// RestoreIdentityBlockColumns writes the trace:id/span:id/span:parent_id columns back into
+	// the compacted output's per-inner-block payloads (NOTE-V2-004, issue #420). This makes each
+	// block self-contained for v2 direct ranged-GET fetch (#424). See
+	// WriterConfig.RestoreIdentityBlockColumns. Defaults OFF (identity intrinsic-only per
+	// NOTE-469); the v1→v2 rewrite pass (#425) sets it on compaction output.
+	RestoreIdentityBlockColumns bool
 	// MaxOutputFileSize removed: Tempo's compaction scheduler enforces max_block_bytes
 	// on input selection, so output is already bounded. The internal size estimate
 	// (fixed 2048 bytes/span) was inaccurate and could spuriously split the sort

@@ -153,6 +153,32 @@ func zstdColumnsActive() bool {
 	return zstdColumnsEnabled.Load()
 }
 
+// restoreIdentityBlockColumnsEnabled is the process-level rollout toggle for the v2
+// self-contained-block format (NOTE-V2-004, issue #420). It defaults to false. When true,
+// the writer restores the three identity columns (trace:id, span:id, span:parent_id) into
+// per-inner-block column payloads in ADDITION to the file-level intrinsic section — the
+// dual storage that NOTE-469 (issue #389) had removed. v2 direct block fetch (#424) requires
+// every block to be self-contained, so a single ranged GET of the block bytes resolves a span
+// without consulting the IntrinsicTOC or SpanTree.
+//
+// Adding columns to a block is not a block-format version change (the block column set is
+// self-describing), so this is a pure encoder-side choice that any reader handles; it is
+// gated default-OFF so it can be rolled out deliberately and reverted by toggle. Atomic for
+// the same reason as zstdColumnsEnabled: a deploy-level constant accessed from the encoder
+// goroutine.
+var restoreIdentityBlockColumnsEnabled atomic.Bool //nolint:gochecknoglobals // process-level rollout flag
+
+// setRestoreIdentityBlockColumnsEnabled sets the process-level identity-block-column rollout flag.
+func setRestoreIdentityBlockColumnsEnabled(v bool) {
+	restoreIdentityBlockColumnsEnabled.Store(v)
+}
+
+// restoreIdentityBlockColumnsActive reports whether identity columns are written into
+// per-inner-block payloads (v2 self-contained blocks).
+func restoreIdentityBlockColumnsActive() bool {
+	return restoreIdentityBlockColumnsEnabled.Load()
+}
+
 // zstd benefit gate (NOTE-405, issue #355). A column blob switches from snappy to zstd only
 // when len(zstd) * zstdBenefitDen < len(snappy) * zstdBenefitNum, i.e. zstd is at least
 // (1 - Num/Den) smaller than snappy. With Num=97, Den=100 a blob must be >=3% smaller under
