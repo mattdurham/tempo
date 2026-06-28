@@ -26,15 +26,30 @@ type ObjectPutter interface {
 	Put(path string, data []byte) error
 }
 
+// spillWriteBufSize is the size of the bufio.Writer wrapping each spill file
+// (NOTE-VI-025, issue #412). Entry writes are batched into this buffer and
+// flushed to the underlying os.File only when it fills (or at explicit Flush
+// points), collapsing one-pwrite-per-entry into one-pwrite-per-256KB.
+const spillWriteBufSize = 256 * 1024
+
 // columnBuffer spills entries for one column to a local temp file between flushes.
 // All entries are appended as binary records; on flush the file is read back,
 // fed to a fresh valueindex.Writer, and the resulting index blob is PUT to S3.
 // No in-memory accumulation means memory usage is bounded by one block's decoded
 // columns rather than all accumulated entries since the last flush.
+//
+// NOTE-VI-025 (issue #412): entry writes go through a bufio.Writer (bw) wrapping
+// file, not file directly. Writing each entry's 37-byte header, source ref, and
+// value straight to *os.File was three pwrite syscalls per entry — ~500M syscalls
+// for a large L1 block and 60% of consumer CPU. bw batches those into 256KB
+// pwrites. bw MUST be flushed before the file is read back (flushColumn) and
+// before the spill is reused after truncate, so no buffered bytes are lost.
+//
 // NOTE-LINT-407: fields ordered largest-to-smallest so the uint8 colType and the
-// bool hasData pack into a single word at the tail (fieldalignment: 80 → 72 bytes).
+// bool hasData pack into a single word at the tail.
 type columnBuffer struct {
 	file       *os.File
+	bw         *bufio.Writer
 	pendingIDs map[string]struct{}
 	colName    string
 	colHash    string
@@ -196,7 +211,7 @@ func (s *Service) ingest(ctx context.Context, msg Message) error {
 		if buf.tenant == "" {
 			buf.tenant = tenantFromPath(e.SourceRef)
 		}
-		if werr := writeEntry(buf.file, e); werr != nil {
+		if werr := writeEntry(buf.bw, e); werr != nil {
 			return fmt.Errorf("valueindexconsumer: write entry: %w", werr)
 		}
 		buf.hasData = true
@@ -215,6 +230,18 @@ func (s *Service) ingest(ctx context.Context, msg Message) error {
 	}
 	for col, n := range perColumn {
 		s.metrics.addEntries(col, n)
+	}
+
+	// Flush each touched buffer's write buffer to its spill file at the end of
+	// this job's extraction pass (NOTE-VI-025, issue #412). Doing it here — not
+	// only at flushColumn — bounds the amount of unwritten data to one job's
+	// worth and keeps the spill file consistent on disk between jobs.
+	for key := range touched {
+		buf := s.buffers[key]
+		if ferr := buf.bw.Flush(); ferr != nil {
+			s.metrics.incError(consumerOpExtract)
+			return fmt.Errorf("valueindexconsumer: flush spill buffer %q: %w", buf.colName, ferr)
+		}
 	}
 
 	if len(touched) == 0 {
@@ -243,6 +270,7 @@ func (s *Service) bufferFor(key bufferKey) (*columnBuffer, error) {
 	}
 	buf := &columnBuffer{
 		file:       f,
+		bw:         bufio.NewWriterSize(f, spillWriteBufSize),
 		colName:    key.name,
 		colType:    key.colType,
 		colHash:    valueindex.ColHash(key.name),
@@ -268,6 +296,14 @@ func (s *Service) flushAll(ctx context.Context) error {
 // flushColumn reads the spill file, builds an L0 value index, PUTs it to S3,
 // acks the relevant messages, and resets the spill file for reuse.
 func (s *Service) flushColumn(ctx context.Context, buf *columnBuffer) error {
+	// Drain any buffered entry bytes to the file before reading it back
+	// (NOTE-VI-025, issue #412). ingest flushes after each pass, but flushing
+	// here too keeps flushColumn correct independent of caller ordering.
+	if err := buf.bw.Flush(); err != nil {
+		s.metrics.incError(consumerOpFlush)
+		return fmt.Errorf("valueindexconsumer: flush spill buffer %q: %w", buf.colName, err)
+	}
+
 	// Seek to beginning for reading.
 	if _, err := buf.file.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("valueindexconsumer: seek spill %q: %w", buf.colName, err)
@@ -323,6 +359,10 @@ func (s *Service) flushColumn(ctx context.Context, buf *columnBuffer) error {
 	if _, err := buf.file.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("valueindexconsumer: reset spill %q: %w", buf.colName, err)
 	}
+	// Re-point the write buffer at the rewound file for reuse (NOTE-VI-025).
+	// Reset discards any residual buffered bytes (there are none — we flushed
+	// above) and clears any sticky write error so the next pass starts clean.
+	buf.bw.Reset(buf.file)
 
 	if len(ackIDs) > 0 {
 		if err := s.consumer.Ack(ctx, ackIDs...); err != nil {

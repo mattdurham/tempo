@@ -415,3 +415,46 @@ column together for human browsing.
 
 Back-refs: `internal/modules/valueindex/hash.go` (`ColTypeName`),
 `internal/modules/valueindexconsumer/service.go` (`indexKey`).
+
+## NOTE-VI-025 — Buffer spill-file writes through bufio.Writer (issue #412)
+
+Date: 2026-06-28
+
+`writeEntry` wrote each entry's three segments (37-byte fixed header, source-ref
+bytes, canonical value bytes) straight to the spill `*os.File`, i.e. up to three
+`pwrite` syscalls per entry. For a large L1 block with ~10M spans across ~50
+present columns that is hundreds of millions of syscalls per file. pprof showed
+~60% of consumer CPU in `internal/runtime/syscall/linux.Syscall6`, all reached via
+`writeEntry → os.File.Write`.
+
+### Fix: per-buffer bufio.Writer
+
+`columnBuffer` now carries a `bw *bufio.Writer` (256 KB, `spillWriteBufSize`)
+wrapping `file`. `ingest` writes entries to `buf.bw` instead of `buf.file`,
+batching them into ~256 KB `pwrite`s — a ~100–1000× syscall reduction depending on
+entry size.
+
+### Flush discipline (correctness-critical)
+
+A `bufio.Writer` holds bytes that are not yet on disk, so it MUST be flushed at
+every point the file is read or its offset changes:
+
+1. **End of each ingest pass** — every buffer touched by the just-extracted job is
+   `bw.Flush()`ed before the next job is claimed. This bounds unwritten data to one
+   job's worth and keeps the spill file self-consistent between jobs.
+2. **Start of flushColumn** — a defensive `bw.Flush()` before `Seek(0)` + read-back,
+   so flushColumn is correct regardless of caller ordering (e.g. the timer-driven
+   `flushAll` between Polls).
+3. **After truncate+rewind in flushColumn** — `bw.Reset(buf.file)` re-points the
+   writer at the rewound file for reuse, discarding any residual bytes (none, post
+   flush) and clearing any sticky write error so the next pass starts clean.
+
+### Struct size
+
+Adding the `bw` pointer grew `columnBuffer` from 72 to 80 bytes. Field order
+preserved (NOTE-LINT-407): pointers/maps/strings first, the `uint8 colType` +
+`bool hasData` still pack into one trailing word — no padding waste.
+`TestColumnBufferAlignment` updated to 80.
+
+Back-refs: `internal/modules/valueindexconsumer/service.go`
+(`columnBuffer`, `bufferFor`, `ingest`, `flushColumn`, `spillWriteBufSize`).
