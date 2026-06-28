@@ -16,10 +16,10 @@ import (
 // Writer accumulates entries for one column and flushes to a value index file.
 // A Writer is not safe for concurrent use.
 type Writer interface {
-	// AddEntry records one observation: the span with traceID was at blockID (zero-based block
-	// index) within sourceRef at timeSec and had vi:value = value.
-	// value must match the col_type given to NewWriter.
-	AddEntry(value any, traceID [16]byte, sourceRef string, blockID uint32, timeSec uint64) error
+	// AddEntry records one observation: the span with traceID was at blockRef (the v2
+	// page-aligned file locator; NOTE-V2-002) within sourceRef at timeSec and had
+	// vi:value = value. value must match the col_type given to NewWriter.
+	AddEntry(value any, traceID [16]byte, sourceRef string, blockRef shared.BlockFileRef, timeSec uint64) error
 
 	// Flush sorts, deduplicates, and serializes all buffered entries.
 	// level is the compaction level to embed in the VIMT section (0 = block builder output).
@@ -40,7 +40,7 @@ type rawEntry struct {
 	timeSec        uint64
 	valueHash      [16]byte
 	traceID        [16]byte
-	blockID        uint32
+	blockRef       shared.BlockFileRef
 }
 
 // writerImpl is the concrete Writer implementation.
@@ -84,7 +84,13 @@ func (w *writerImpl) discardRuns() {
 // AddEntry encodes value to its canonical form and buffers the entry, spilling a
 // sorted run to disk once the in-memory buffer reaches ValueIndexWriterSpillEntries
 // (NOTE-VI-026, issue #413).
-func (w *writerImpl) AddEntry(value any, traceID [16]byte, sourceRef string, blockID uint32, timeSec uint64) error {
+func (w *writerImpl) AddEntry(
+	value any,
+	traceID [16]byte,
+	sourceRef string,
+	blockRef shared.BlockFileRef,
+	timeSec uint64,
+) error {
 	cv, err := CanonicalValue(w.colType, value)
 	if err != nil {
 		return fmt.Errorf("valueindex: AddEntry: %w", err)
@@ -95,7 +101,7 @@ func (w *writerImpl) AddEntry(value any, traceID [16]byte, sourceRef string, blo
 		valueHash:      vh,
 		traceID:        traceID,
 		sourceRef:      sourceRef,
-		blockID:        blockID,
+		blockRef:       blockRef,
 		timeSec:        timeSec,
 	})
 	if len(w.entries) >= shared.ValueIndexWriterSpillEntries {
@@ -215,7 +221,7 @@ func (w *writerImpl) assemble(level uint8, source func(yield func(rawEntry) erro
 			Value:     re.canonicalValue,
 			TraceID:   re.traceID,
 			SourceRef: re.sourceRef,
-			BlockID:   re.blockID,
+			BlockRef:  re.blockRef,
 			TimeSec:   re.timeSec,
 		})
 		entryIdx++
@@ -340,7 +346,7 @@ func newKLLBuilder(colType shared.ColumnType) *kllBuilder {
 	}
 }
 
-// deduplicateEntries removes entries with identical (valueHash, traceID, sourceRef, blockID, timeSec).
+// deduplicateEntries removes entries with identical (valueHash, traceID, sourceRef, blockRef, timeSec).
 // Assumes entries are already sorted so duplicates are adjacent.
 func deduplicateEntries(entries []rawEntry) []rawEntry {
 	if len(entries) == 0 {
@@ -354,7 +360,7 @@ func deduplicateEntries(entries []rawEntry) []rawEntry {
 		if cur.valueHash == prev.valueHash &&
 			cur.traceID == prev.traceID &&
 			cur.sourceRef == prev.sourceRef &&
-			cur.blockID == prev.blockID &&
+			cur.blockRef == prev.blockRef &&
 			cur.timeSec == prev.timeSec {
 			continue
 		}

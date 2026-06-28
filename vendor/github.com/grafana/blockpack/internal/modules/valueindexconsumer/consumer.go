@@ -63,15 +63,15 @@ type StaleReclaimReporter interface {
 // Value is the typed column value (string, int64, uint64, float64, bool, []byte)
 // matching ColType; the service hands it to valueindex.Writer.AddEntry which
 // canonicalises it. SourceRef is the blockpack object path the entry came from,
-// BlockID the zero-based block index within that file (NOTE-VI-014), and TimeSec
-// the span's wall time in seconds.
+// BlockRef the v2 page-aligned file locator of the block within that file
+// (NOTE-V2-002), and TimeSec the span's wall time in seconds.
 type ColumnEntry struct {
 	ColName   string
 	Value     any
 	SourceRef string
 	TraceID   [16]byte
 	ColType   shared.ColumnType
-	BlockID   uint32
+	BlockRef  shared.BlockFileRef
 	TimeSec   uint64
 }
 

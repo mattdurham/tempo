@@ -507,7 +507,7 @@ const (
 	ValueIndexFileVersion      uint8 = 0x01
 	ValueIndexMetaVersion      uint8 = 0x01
 	ValueIndexHashIndexVersion uint8 = 0x01
-	ValueIndexEntriesVersion   uint8 = 0x01 // includes BlockID per entry (NOTE-VI-014)
+	ValueIndexEntriesVersion   uint8 = 0x02 // BlockFileRef (page+len) per entry, v2 lean format (NOTE-V2-002)
 	ValueIndexKLLVersion       uint8 = 0x01
 
 	// ValueIndexKLLK is the k parameter for the vi:value KLL sketch (~0.01% quantile error).

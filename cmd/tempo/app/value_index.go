@@ -221,7 +221,7 @@ func (e *tempoVICExtractor) Extract(ctx context.Context, event blockevents.Messa
 			Value:     e.Value,
 			ColType:   e.ColType,
 			SourceRef: key,
-			BlockID:   e.BlockID,
+			BlockRef:  e.BlockRef,
 			TimeSec:   e.TimeSec,
 		})
 	})

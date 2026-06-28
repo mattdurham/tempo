@@ -44,8 +44,11 @@ type ValueIndexEntry struct {
 	ColName string
 	// ColType is the column's data type.
 	ColType ColumnType
-	// BlockID is the zero-based inner block index the observation came from.
-	BlockID uint32
+	// BlockRef is the v2 page-aligned file locator of the inner block the
+	// observation came from (NOTE-V2-002, issue #423). It lets a querier issue a
+	// direct ranged GET of the block bytes from a value-index hit with no TOC
+	// fetch.
+	BlockRef modules_shared.BlockFileRef
 	// TimeSec is the span's start time in whole seconds, or 0 when unavailable.
 	TimeSec uint64
 }
@@ -88,15 +91,55 @@ func ExtractValueIndexEntries(
 	_ = r.EnsureIntrinsicTOC()
 	startSecByRef := buildSpanStartSecByRef(r)
 
+	// Per-block-index v2 file locator (NOTE-V2-002, issue #423). Built once so both
+	// phases can stamp each entry with the block's page-aligned file range without
+	// re-reading BlockMeta per entry.
+	blockRefByIdx := buildBlockRefByIdx(r)
+
 	// Phase 1 — per-block attribute + intrinsic columns. Track which column names
 	// were yielded so phase 2 only covers intrinsics this phase missed.
 	yielded := make(map[string]struct{})
-	if err := extractBlockColumns(r, denylist, startSecByRef, yielded, yield); err != nil {
+	if err := extractBlockColumns(r, denylist, startSecByRef, blockRefByIdx, yielded, yield); err != nil {
 		return err
 	}
 
 	// Phase 2 — IntrinsicTOC fallback for any intrinsic column phase 1 did not yield.
-	return extractIntrinsicColumns(r, denylist, startSecByRef, yielded, yield)
+	return extractIntrinsicColumns(r, denylist, startSecByRef, blockRefByIdx, yielded, yield)
+}
+
+// buildBlockRefByIdx precomputes the v2 page-aligned file locator (NOTE-V2-002) for
+// every inner block, indexed by block index. The locator is derived from each
+// block's byte Offset and Length in BlockMeta: Page = Offset / 4096 and Length is
+// the byte length rounded up to whole 4 KB pages. The v2 writer (#419) pads inner
+// blocks to 4 KB boundaries so Offset is page-aligned; for v1 (unpadded) files the
+// Page floors to the containing page and is corrected once #419 lands.
+func buildBlockRefByIdx(r *modules_reader.Reader) []modules_shared.BlockFileRef {
+	n := r.BlockCount()
+	refs := make([]modules_shared.BlockFileRef, n)
+	for bi := range n {
+		refs[bi] = blockFileRefFromMeta(r.BlockMeta(bi))
+	}
+	return refs
+}
+
+// blockFileRefFromMeta converts a block's byte Offset/Length into a v2 BlockFileRef
+// in 4 KB page units (NOTE-V2-002). Length is rounded up so the padded block is
+// fully covered. Page values beyond the uint24 ceiling saturate to the max, which a
+// single file cannot reach (64 GB).
+func blockFileRefFromMeta(meta modules_shared.BlockMeta) modules_shared.BlockFileRef {
+	const pageSize = modules_shared.BlockFileRefPageSize
+	page := meta.Offset / pageSize
+	lengthPages := (meta.Length + pageSize - 1) / pageSize
+	if page > 0xFFFFFF {
+		page = 0xFFFFFF
+	}
+	if lengthPages > 0xFFFF {
+		lengthPages = 0xFFFF
+	}
+	return modules_shared.BlockFileRef{
+		Page:   uint32(page),        //nolint:gosec // saturated to uint24 max above
+		Length: uint16(lengthPages), //nolint:gosec // saturated to uint16 max above
+	}
 }
 
 // truncateTimeValueToMillis truncates the raw nanosecond value of a time-domain
@@ -155,6 +198,7 @@ func extractBlockColumns(
 	r *modules_reader.Reader,
 	denylist map[string]struct{},
 	startSecByRef map[uint32]uint64,
+	blockRefByIdx []modules_shared.BlockFileRef,
 	yielded map[string]struct{},
 	yield func(ValueIndexEntry) error,
 ) error {
@@ -184,11 +228,11 @@ func extractBlockColumns(
 				yielded[colKey.Name] = struct{}{}
 				key := uint32(bi)<<16 | uint32(row) //nolint:gosec // bounded by block/span counts
 				if err := yield(ValueIndexEntry{
-					ColName: colKey.Name,
-					Value:   truncateTimeValueToMillis(colKey.Name, val),
-					ColType: colType,
-					BlockID: uint32(bi), //nolint:gosec // bounded by BlockCount
-					TimeSec: startSecByRef[key],
+					ColName:  colKey.Name,
+					Value:    truncateTimeValueToMillis(colKey.Name, val),
+					ColType:  colType,
+					BlockRef: blockRefByIdx[bi],
+					TimeSec:  startSecByRef[key],
 				}); err != nil {
 					return err
 				}
@@ -205,6 +249,7 @@ func extractIntrinsicColumns(
 	r *modules_reader.Reader,
 	denylist map[string]struct{},
 	startSecByRef map[uint32]uint64,
+	blockRefByIdx []modules_shared.BlockFileRef,
 	yielded map[string]struct{},
 	yield func(ValueIndexEntry) error,
 ) error {
@@ -219,7 +264,7 @@ func extractIntrinsicColumns(
 		if err != nil || col == nil {
 			continue
 		}
-		if err := yieldIntrinsicColumn(col, name, startSecByRef, yield); err != nil {
+		if err := yieldIntrinsicColumn(col, name, startSecByRef, blockRefByIdx, yield); err != nil {
 			return err
 		}
 	}
@@ -233,16 +278,21 @@ func yieldIntrinsicColumn(
 	col *modules_shared.IntrinsicColumn,
 	name string,
 	startSecByRef map[uint32]uint64,
+	blockRefByIdx []modules_shared.BlockFileRef,
 	yield func(ValueIndexEntry) error,
 ) error {
 	emit := func(ref modules_shared.BlockRef, val any) error {
 		key := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx)
+		var blockRef modules_shared.BlockFileRef
+		if int(ref.BlockIdx) < len(blockRefByIdx) {
+			blockRef = blockRefByIdx[ref.BlockIdx]
+		}
 		return yield(ValueIndexEntry{
-			ColName: name,
-			Value:   truncateTimeValueToMillis(name, val),
-			ColType: col.Type,
-			BlockID: uint32(ref.BlockIdx),
-			TimeSec: startSecByRef[key],
+			ColName:  name,
+			Value:    truncateTimeValueToMillis(name, val),
+			ColType:  col.Type,
+			BlockRef: blockRef,
+			TimeSec:  startSecByRef[key],
 		})
 	}
 

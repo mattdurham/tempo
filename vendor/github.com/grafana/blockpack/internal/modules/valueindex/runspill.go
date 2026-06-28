@@ -70,10 +70,14 @@ func (r *runFile) remove() {
 	}
 }
 
+// rawEntryFixedSize is the byte size of the fixed portion of a spilled rawEntry:
+// time_sec[8] + trace_id[16] + block_ref[5] (NOTE-V2-002).
+const rawEntryFixedSize = 8 + 16 + shared.BlockFileRefWireSize
+
 // writeRawEntry serializes one rawEntry in the spill wire format. The valueHash is
 // recomputed on read from canonicalValue, so it is not persisted.
 //
-// Wire: val_len[2] + val[N] + time_sec[8] + trace_id[16] + block_id[4] + ref_len[2] + ref[N]
+// Wire: val_len[2] + val[N] + time_sec[8] + trace_id[16] + block_ref[5] + ref_len[2] + ref[N]
 func writeRawEntry(w io.Writer, e *rawEntry) error {
 	var hdr [2]byte
 	binary.LittleEndian.PutUint16(hdr[:], uint16(len(e.canonicalValue))) //nolint:gosec // bounded
@@ -83,10 +87,11 @@ func writeRawEntry(w io.Writer, e *rawEntry) error {
 	if _, err := w.Write(e.canonicalValue); err != nil {
 		return err
 	}
-	var fixed [28]byte
+	var fixed [rawEntryFixedSize]byte
 	binary.LittleEndian.PutUint64(fixed[0:], e.timeSec)
 	copy(fixed[8:24], e.traceID[:])
-	binary.LittleEndian.PutUint32(fixed[24:], e.blockID)
+	// Page bounded by file size; encode only errors on uint24 overflow (64 GB file).
+	_ = shared.EncodeBlockFileRef(fixed[24:], e.blockRef)
 	if _, err := w.Write(fixed[:]); err != nil {
 		return err
 	}
@@ -112,7 +117,7 @@ func readRawEntry(r *bufio.Reader) (rawEntry, error) {
 	if _, err := io.ReadFull(r, cv); err != nil {
 		return rawEntry{}, fmt.Errorf("valueindex: readRawEntry: value: %w", err)
 	}
-	var fixed [28]byte
+	var fixed [rawEntryFixedSize]byte
 	if _, err := io.ReadFull(r, fixed[:]); err != nil {
 		return rawEntry{}, fmt.Errorf("valueindex: readRawEntry: fixed: %w", err)
 	}
@@ -120,7 +125,11 @@ func readRawEntry(r *bufio.Reader) (rawEntry, error) {
 	re.canonicalValue = cv
 	re.timeSec = binary.LittleEndian.Uint64(fixed[0:])
 	copy(re.traceID[:], fixed[8:24])
-	re.blockID = binary.LittleEndian.Uint32(fixed[24:])
+	blockRef, brErr := shared.DecodeBlockFileRef(fixed[24:])
+	if brErr != nil {
+		return rawEntry{}, fmt.Errorf("valueindex: readRawEntry: block_ref: %w", brErr)
+	}
+	re.blockRef = blockRef
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return rawEntry{}, fmt.Errorf("valueindex: readRawEntry: ref_len: %w", err)
 	}
@@ -171,7 +180,7 @@ func (rr *runReader) advance() error {
 
 // mergeRuns performs a streaming k-way merge of the spilled runs plus the sorted
 // in-memory tail, yielding deduplicated entries in final sorted order. Dedup mirrors
-// deduplicateEntries: entries equal on (valueHash, traceID, sourceRef, blockID,
+// deduplicateEntries: entries equal on (valueHash, traceID, sourceRef, blockRef,
 // timeSec) collapse to one. The yield callback may return an error to abort.
 func mergeRuns(
 	colType shared.ColumnType,
@@ -252,6 +261,6 @@ func sameEntry(a, b *rawEntry) bool {
 	return a.valueHash == b.valueHash &&
 		a.traceID == b.traceID &&
 		a.sourceRef == b.sourceRef &&
-		a.blockID == b.blockID &&
+		a.blockRef == b.blockRef &&
 		a.timeSec == b.timeSec
 }

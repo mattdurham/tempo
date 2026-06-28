@@ -82,7 +82,10 @@ type bufferKey struct {
 //	[N]  source_ref bytes
 //	[4]  value_len
 //	[M]  value bytes (canonical encoding from valueindex)
-const entryFixedSize = 1 + 16 + 4 + 8 + 4 + 4 // 37 bytes fixed header
+//
+// entryFixedSize is the fixed header of a spilled ColumnEntry (NOTE-V2-002):
+// col_type[1] + trace_id[16] + block_ref[5] + time_sec[8] + src_len[4] + val_len[4].
+const entryFixedSize = 1 + 16 + shared.BlockFileRefWireSize + 8 + 4 + 4 // 38 bytes
 
 // Service is the value-index consumer orchestrator. It is single-goroutine: Run
 // owns all mutable state, so no locking is required.
@@ -321,7 +324,7 @@ func (s *Service) flushColumn(ctx context.Context, buf *columnBuffer) error {
 			s.metrics.incError(consumerOpFlush)
 			return fmt.Errorf("valueindexconsumer: read spill %q: %w", buf.colName, err)
 		}
-		if err := w.AddEntry(e.Value, e.TraceID, e.SourceRef, e.BlockID, e.TimeSec); err != nil {
+		if err := w.AddEntry(e.Value, e.TraceID, e.SourceRef, e.BlockRef, e.TimeSec); err != nil {
 			s.metrics.incError(consumerOpFlush)
 			return fmt.Errorf("valueindexconsumer: add entry %q: %w", buf.colName, err)
 		}
@@ -431,10 +434,12 @@ func writeEntry(w io.Writer, e ColumnEntry) error {
 	var buf [entryFixedSize]byte
 	buf[0] = byte(e.ColType)
 	copy(buf[1:17], e.TraceID[:])
-	binary.LittleEndian.PutUint32(buf[17:21], e.BlockID)
-	binary.LittleEndian.PutUint64(buf[21:29], e.TimeSec)
-	binary.LittleEndian.PutUint32(buf[29:33], uint32(len(e.SourceRef))) //nolint:gosec
-	binary.LittleEndian.PutUint32(buf[33:37], uint32(len(val)))         //nolint:gosec
+	if encErr := shared.EncodeBlockFileRef(buf[17:22], e.BlockRef); encErr != nil {
+		return fmt.Errorf("valueindexconsumer: encode block ref: %w", encErr)
+	}
+	binary.LittleEndian.PutUint64(buf[22:30], e.TimeSec)
+	binary.LittleEndian.PutUint32(buf[30:34], uint32(len(e.SourceRef))) //nolint:gosec
+	binary.LittleEndian.PutUint32(buf[34:38], uint32(len(val)))         //nolint:gosec
 
 	if _, werr := w.Write(buf[:]); werr != nil {
 		return werr
@@ -459,10 +464,13 @@ func readEntry(r io.Reader) (ColumnEntry, error) {
 	colType := shared.ColumnType(hdr[0])
 	var traceID [16]byte
 	copy(traceID[:], hdr[1:17])
-	blockID := binary.LittleEndian.Uint32(hdr[17:21])
-	timeSec := binary.LittleEndian.Uint64(hdr[21:29])
-	srcLen := binary.LittleEndian.Uint32(hdr[29:33])
-	valLen := binary.LittleEndian.Uint32(hdr[33:37])
+	blockRef, brErr := shared.DecodeBlockFileRef(hdr[17:22])
+	if brErr != nil {
+		return ColumnEntry{}, fmt.Errorf("valueindexconsumer: decode block ref: %w", brErr)
+	}
+	timeSec := binary.LittleEndian.Uint64(hdr[22:30])
+	srcLen := binary.LittleEndian.Uint32(hdr[30:34])
+	valLen := binary.LittleEndian.Uint32(hdr[34:38])
 
 	src := make([]byte, srcLen)
 	if _, err := io.ReadFull(r, src); err != nil {
@@ -480,7 +488,7 @@ func readEntry(r io.Reader) (ColumnEntry, error) {
 	return ColumnEntry{
 		ColType:   colType,
 		TraceID:   traceID,
-		BlockID:   blockID,
+		BlockRef:  blockRef,
 		TimeSec:   timeSec,
 		SourceRef: string(src),
 		Value:     decoded,

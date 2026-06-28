@@ -14,15 +14,17 @@ import (
 // Entry is one posting list row in a value index file.
 // Rows are sorted by (Value ASC, TimeSec ASC, TraceID ASC).
 //
-// NOTE-VI-014: BlockID is the zero-based index of the block within SourceRef that contains
-// this span. Storing it here eliminates a block-index lookup when resolving results back
-// to span data: open SourceRef → seek to block BlockID → decode → done.
+// NOTE-V2-002 (issue #423): BlockRef is the v2 page-aligned file locator of the
+// block within SourceRef that contains this span. A querier hit on this entry can
+// issue a direct ranged GET (Range: bytes=Page*4096, length=Length*4096) with no
+// TOC fetch — one round trip from index hit to block bytes. It supersedes the v1
+// BlockID (zero-based block index requiring TOC resolution; NOTE-VI-014).
 type Entry struct {
 	SourceRef string
 	Value     []byte // canonical-encoded column value
 	TimeSec   uint64
 	TraceID   [16]byte
-	BlockID   uint32 // zero-based block index within SourceRef
+	BlockRef  shared.BlockFileRef // v2 page-aligned file locator within SourceRef
 }
 
 // ChunkDirEntry is one record in the VINX chunk directory.
@@ -120,20 +122,27 @@ func (ce *chunkEncoder) Finish() ([]byte, []ChunkDirEntry) {
 
 // encodeChunkPayload serializes a slice of entries into a raw (pre-snappy) v2 chunk payload.
 //
-// Wire format per entry (NOTE-VI-014):
+// Wire format per entry (NOTE-V2-002):
 //
-//	val_len[2] + val[N] + time_sec[8] + trace_id[16] + block_id[4] + ref_len[2] + ref[N]
+//	val_len[2] + val[N] + time_sec[8] + trace_id[16] + block_ref[5] + ref_len[2] + ref[N]
+//
+// block_ref is a 5-byte BlockFileRef (uint24 page + uint16 length), replacing the
+// v1 block_id[4] (NOTE-VI-014).
 func encodeChunkPayload(entries []Entry) []byte {
-	// Pre-size estimate: 2 (count) + per entry ~(2+avgValLen + 8 + 16 + 4 + 2 + avgRefLen)
-	buf := make([]byte, 0, 2+len(entries)*54)
+	// Pre-size estimate: 2 (count) + per entry ~(2+avgValLen + 8 + 16 + 5 + 2 + avgRefLen)
+	buf := make([]byte, 0, 2+len(entries)*55)
 	buf = binary.LittleEndian.AppendUint16(buf, uint16(len(entries))) //nolint:gosec
+	var refBuf [shared.BlockFileRefWireSize]byte
 	for i := range entries {
 		e := &entries[i]
 		buf = binary.LittleEndian.AppendUint16(buf, uint16(len(e.Value))) //nolint:gosec
 		buf = append(buf, e.Value...)
 		buf = binary.LittleEndian.AppendUint64(buf, e.TimeSec)
 		buf = append(buf, e.TraceID[:]...)
-		buf = binary.LittleEndian.AppendUint32(buf, e.BlockID)
+		// BlockFileRef Page is bounded by the file size; encode errors only on
+		// uint24 overflow which a single file cannot reach (64 GB max).
+		_ = shared.EncodeBlockFileRef(refBuf[:], e.BlockRef)
+		buf = append(buf, refBuf[:]...)
 		buf = binary.LittleEndian.AppendUint16(buf, uint16(len(e.SourceRef))) //nolint:gosec
 		buf = append(buf, e.SourceRef...)
 	}
@@ -215,11 +224,14 @@ func decodeChunkPayload(raw []byte) ([]Entry, error) {
 		copy(traceID[:], raw[pos:pos+16])
 		pos += 16
 
-		if pos+4 > len(raw) {
-			return nil, fmt.Errorf("valueindex: entry %d: truncated at block_id", i)
+		if pos+shared.BlockFileRefWireSize > len(raw) {
+			return nil, fmt.Errorf("valueindex: entry %d: truncated at block_ref", i)
 		}
-		blockID := binary.LittleEndian.Uint32(raw[pos:])
-		pos += 4
+		blockRef, brErr := shared.DecodeBlockFileRef(raw[pos:])
+		if brErr != nil {
+			return nil, fmt.Errorf("valueindex: entry %d: block_ref: %w", i, brErr)
+		}
+		pos += shared.BlockFileRefWireSize
 
 		if pos+2 > len(raw) {
 			return nil, fmt.Errorf("valueindex: entry %d: truncated at ref_len", i)
@@ -236,7 +248,7 @@ func decodeChunkPayload(raw []byte) ([]Entry, error) {
 			Value:     val,
 			TimeSec:   timeSec,
 			TraceID:   traceID,
-			BlockID:   blockID,
+			BlockRef:  blockRef,
 			SourceRef: ref,
 		})
 	}

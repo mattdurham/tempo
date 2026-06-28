@@ -15,7 +15,7 @@ type QueryResult struct {
 	Value     []byte // canonical-encoded vi:value
 	TimeSec   uint64
 	TraceID   [16]byte
-	BlockID   uint32 // zero-based block index within SourceRef; 0 for v1 files (NOTE-VI-014)
+	BlockRef  shared.BlockFileRef // v2 page-aligned file locator within SourceRef (NOTE-V2-002)
 }
 
 // Reader reads a value index file from an in-memory byte slice.
@@ -147,7 +147,7 @@ func (r *Reader) Lookup(pred Predicate, timeRange *[2]uint64) ([]QueryResult, er
 			TraceID:   e.TraceID,
 			SourceRef: e.SourceRef,
 			TimeSec:   e.TimeSec,
-			BlockID:   e.BlockID,
+			BlockRef:  e.BlockRef,
 		})
 	}
 	return results, nil
@@ -166,8 +166,8 @@ func (r *Reader) chunkDataLen() int {
 
 // decodeVINXSection parses the VINX header and chunk directory from data[vinxOff:footerStart].
 // Returns the chunk directory, the absolute byte offset of chunk data, and the version byte.
-// Supports v1 (no BlockID) and v2 (BlockID per entry); the version is passed through to
-// the chunk payload decoder so old files are read correctly.
+// Only the current ValueIndexEntriesVersion (BlockFileRef per entry; NOTE-V2-002) is
+// accepted; older versions are rejected since the value-index pipeline rewrites all files.
 func decodeVINXSection(data []byte, vinxOff, footerStart int) ([]ChunkDirEntry, int, uint8, error) {
 	const vinxHeaderSize = 28
 	if vinxOff+vinxHeaderSize > footerStart {

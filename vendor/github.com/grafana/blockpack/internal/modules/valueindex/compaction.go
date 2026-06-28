@@ -116,7 +116,7 @@ func gatherEntries(ctx context.Context, readers []*Reader, checker RefChecker) (
 				valueHash:      ValueHash16(e.Value),
 				traceID:        e.TraceID,
 				sourceRef:      e.SourceRef,
-				blockID:        e.BlockID,
+				blockRef:       e.BlockRef,
 				timeSec:        e.TimeSec,
 			})
 		}

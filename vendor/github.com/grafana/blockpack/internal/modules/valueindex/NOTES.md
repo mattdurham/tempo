@@ -58,6 +58,11 @@ Back-ref: `internal/modules/valueindex/hash.go:CanonicalValue`,
 
 ## NOTE-VI-014 — BlockID field added to Entry (VINX v2)
 
+> **SUPERSEDED by NOTE-V2-002 (issue #423):** the per-entry `BlockID uint32` described
+> below is replaced by a 5-byte `BlockFileRef` (page+length) for direct ranged GETs. The
+> v1/v2 dual-decode design described here (`decodeChunkPayloadV1`, dual version accept)
+> was never present in the current single-version reader. Retained for history.
+
 Date: 2026-06-25
 
 Each posting list entry now carries a `BlockID uint32` — the zero-based index of the block
@@ -152,3 +157,49 @@ Back-ref: `internal/modules/valueindex/runspill.go`,
 `internal/modules/valueindex/writer.go:newKLLBuilder`,
 `internal/modules/valueindex/entries.go:chunkEncoder`,
 `internal/modules/blockio/shared/constants.go:ValueIndexWriterSpillEntries`
+
+---
+
+## NOTE-V2-002 — BlockRef (page+length) replaces BlockID in value-index entries (issue #423)
+
+Date: 2026-06-28
+
+The per-entry `BlockID uint32` (zero-based block index, NOTE-VI-014) is replaced by a
+`BlockFileRef` (NOTE-V2-001): a `uint24` page offset + `uint16` page length that locates
+the block's byte range in the file directly. This eliminates the TOC fetch on querier
+lookup — a value-index hit can issue a direct ranged GET
+(`Range: bytes=Page*4096, length=Length*4096`) with no intermediate block-index
+resolution. It is the value-index half of the v2 lean format epic (#417).
+
+**Wire change:** `ValueIndexEntriesVersion` bumped `0x01 → 0x02`. The per-entry chunk
+payload `block_id[4]` becomes `block_ref[5]` (3-byte LE page + 2-byte LE length). The
+writer spill codec fixed header grows from 28 → 29 bytes, and the consumer spill header
+from 37 → 38 bytes, both for the same 4→5 byte ref. Old `0x01` files are rejected on
+open — the value-index pipeline rewrites all files so there is no in-place upgrade.
+
+**Ref derivation (extract path):** `blockFileRefFromMeta` converts a block's
+`BlockMeta.Offset`/`Length` into pages: `Page = Offset / 4096`,
+`Length = ceil(Length / 4096)`. Until v1 blocks gain 4 KB padding (#419) small unpadded
+blocks share a page, so several blocks can floor to the same `Page` — this is a v1
+precision limitation, not a correctness bug; the ref still covers the block's bytes. Once
+#419 lands, every block is page-aligned and the ref is exact.
+
+**Dedup key:** `(valueHash, traceID, sourceRef, blockRef, timeSec)` — `blockRef` replaces
+`blockID` in `deduplicateEntries`/`sameEntry`.
+
+Supersedes NOTE-VI-014 (the BlockID field and its v1/v2 dual-decode design, which was
+never actually branched in the current single-version reader).
+
+Back-ref: `internal/modules/valueindex/entries.go:Entry`,
+`internal/modules/valueindex/entries.go:encodeChunkPayload`,
+`internal/modules/valueindex/entries.go:decodeChunkPayload`,
+`internal/modules/valueindex/writer.go:rawEntry`,
+`internal/modules/valueindex/writer.go:AddEntry`,
+`internal/modules/valueindex/runspill.go:writeRawEntry`,
+`internal/modules/valueindex/reader.go:QueryResult`,
+`internal/modules/valueindexconsumer/consumer.go:ColumnEntry`,
+`internal/modules/valueindexconsumer/service.go:writeEntry`,
+`valueindex_extract.go:ValueIndexEntry`,
+`valueindex_extract.go:blockFileRefFromMeta`,
+`internal/modules/blockio/shared/constants.go:ValueIndexEntriesVersion`,
+`internal/modules/blockio/shared/blockref.go:BlockFileRef`
