@@ -22,8 +22,11 @@ const (
 	// DefaultMaxColumnBufferBytes is the per-column buffer size that triggers a
 	// size-driven flush independently of the timer.
 	DefaultMaxColumnBufferBytes = 64 << 20 // 64 MiB
-	// DefaultBatchSize is the max number of messages fetched per poll.
-	DefaultBatchSize = 64
+	// DefaultBatchSize is the max number of jobs claimed per Poll call.
+	// Set to 1: claim one job at a time, process it, then claim the next.
+	// The flush timer accumulates entries from multiple jobs and flushes
+	// them together — the batch is time-driven, not claim-driven.
+	DefaultBatchSize = 1
 	// DefaultPollTimeout bounds how long a poll blocks waiting for messages
 	// before returning empty so the flush timer can be evaluated.
 	DefaultPollTimeout = 5 * time.Second

@@ -43,6 +43,20 @@ type columnBuffer struct {
 	hasData    bool // true once at least one entry has been written
 }
 
+// bufferKey identifies a spill buffer by both column name AND column type
+// (NOTE-VI-022). A single column name can surface with more than one column type
+// across blocks — e.g. an attribute named "span.start" stored as a float64 in one
+// block and a string in another due to mixed-type spans. valueindex.Writer is
+// single-typed (its NewWriter colType must match every value passed to AddEntry),
+// so observations of differing types for the same name MUST land in separate
+// buffers, each producing a type-consistent L0 index file. Keying buffers by name
+// alone locked the writer to the first-seen type and crashed AddEntry on the first
+// differently-typed value (issue #408).
+type bufferKey struct {
+	name    string
+	colType shared.ColumnType
+}
+
 // entry binary layout (little-endian):
 //
 //	[1]  col_type
@@ -62,8 +76,8 @@ type Service struct {
 	extractor Extractor
 	store     ObjectPutter
 
-	buffers    map[string]*columnBuffer // keyed by column name
-	pendingCol map[string]int           // message ID → count of columns still holding its entries
+	buffers    map[bufferKey]*columnBuffer // keyed by (column name, column type)
+	pendingCol map[string]int              // message ID → count of buffers still holding its entries
 	columns    map[string]struct{}
 
 	now func() time.Time
@@ -82,7 +96,7 @@ func NewService(cfg Config, consumer Consumer, extractor Extractor, store Object
 		consumer:   consumer,
 		extractor:  extractor,
 		store:      store,
-		buffers:    make(map[string]*columnBuffer),
+		buffers:    make(map[bufferKey]*columnBuffer),
 		pendingCol: make(map[string]int),
 		cfg:        cfg,
 		columns:    cfg.columnSet(),
@@ -139,7 +153,7 @@ func (s *Service) Run(ctx context.Context) error {
 
 // ingest extracts entries from one message and appends them to per-column spill files.
 func (s *Service) ingest(ctx context.Context, msg Message) error {
-	touched := make(map[string]struct{})
+	touched := make(map[bufferKey]struct{})
 
 	err := s.extractor.Extract(ctx, msg.Event, func(e ColumnEntry) error {
 		if len(s.columns) > 0 {
@@ -147,7 +161,8 @@ func (s *Service) ingest(ctx context.Context, msg Message) error {
 				return nil
 			}
 		}
-		buf, berr := s.bufferFor(e.ColName, e.ColType)
+		key := bufferKey{name: e.ColName, colType: e.ColType}
+		buf, berr := s.bufferFor(key)
 		if berr != nil {
 			return berr
 		}
@@ -158,8 +173,8 @@ func (s *Service) ingest(ctx context.Context, msg Message) error {
 			return fmt.Errorf("valueindexconsumer: write entry: %w", werr)
 		}
 		buf.hasData = true
-		if _, seen := touched[e.ColName]; !seen {
-			touched[e.ColName] = struct{}{}
+		if _, seen := touched[key]; !seen {
+			touched[key] = struct{}{}
 			buf.pendingIDs[msg.ID] = struct{}{}
 		}
 		return nil
@@ -175,23 +190,25 @@ func (s *Service) ingest(ctx context.Context, msg Message) error {
 	return nil
 }
 
-// bufferFor returns or lazily creates a disk-backed buffer for the column.
-func (s *Service) bufferFor(col string, colType shared.ColumnType) (*columnBuffer, error) {
-	if buf, ok := s.buffers[col]; ok {
+// bufferFor returns or lazily creates a disk-backed buffer for the (column name,
+// column type) pair. Distinct types for the same name get distinct buffers so each
+// writer stays type-consistent (NOTE-VI-022, issue #408).
+func (s *Service) bufferFor(key bufferKey) (*columnBuffer, error) {
+	if buf, ok := s.buffers[key]; ok {
 		return buf, nil
 	}
 	f, err := os.CreateTemp("", "vic-*")
 	if err != nil {
-		return nil, fmt.Errorf("valueindexconsumer: create spill file for %q: %w", col, err)
+		return nil, fmt.Errorf("valueindexconsumer: create spill file for %q: %w", key.name, err)
 	}
 	buf := &columnBuffer{
 		file:       f,
-		colName:    col,
-		colType:    colType,
-		colHash:    valueindex.ColHash(col),
+		colName:    key.name,
+		colType:    key.colType,
+		colHash:    valueindex.ColHash(key.name),
 		pendingIDs: make(map[string]struct{}),
 	}
-	s.buffers[col] = buf
+	s.buffers[key] = buf
 	return buf, nil
 }
 
@@ -396,6 +413,13 @@ func decodeCanonicalValue(b []byte, colType shared.ColumnType) (any, error) {
 		return b[0] != 0, nil
 	case shared.ColumnTypeBytes, shared.ColumnTypeRangeBytes:
 		return append([]byte(nil), b...), nil
+	case shared.ColumnTypeUUID:
+		if len(b) != 16 {
+			return nil, fmt.Errorf("uuid: want 16 bytes, got %d", len(b))
+		}
+		var uid [16]byte
+		copy(uid[:], b)
+		return uid, nil
 	default:
 		return nil, fmt.Errorf("unsupported colType %d", colType)
 	}

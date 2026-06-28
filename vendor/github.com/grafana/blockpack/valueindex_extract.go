@@ -282,9 +282,18 @@ func flatIntrinsicValueAt(col *modules_shared.IntrinsicColumn, i int) (any, bool
 // ok=false for value types this extractor does not index.
 func blockColumnValueAt(col *modules_reader.Column, colType ColumnType, row int) (any, bool) {
 	switch colType {
-	case modules_shared.ColumnTypeString, modules_shared.ColumnTypeRangeString,
-		modules_shared.ColumnTypeUUID:
+	case modules_shared.ColumnTypeString, modules_shared.ColumnTypeRangeString:
 		return col.StringValue(row)
+	case modules_shared.ColumnTypeUUID:
+		// StringValue returns a formatted UUID string, but CanonicalValue expects [16]byte.
+		// Use BytesValue to get the raw 16 bytes and convert.
+		b, ok := col.BytesValue(row)
+		if !ok || len(b) != 16 {
+			return nil, false
+		}
+		var uid [16]byte
+		copy(uid[:], b)
+		return uid, true
 	case modules_shared.ColumnTypeInt64, modules_shared.ColumnTypeRangeInt64,
 		modules_shared.ColumnTypeRangeDuration:
 		return col.Int64Value(row)

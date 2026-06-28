@@ -70,6 +70,45 @@ repeated in the key.
 - Malformed stream entries (missing `action`/`path`) are acked immediately so they are not
   redelivered forever, and skipped.
 
+## NOTE-VI-022 — Spill buffers keyed by (name, colType), not name alone (issue #408)
+
+Date: 2026-06-28
+
+`valueindex.Writer` is single-typed: `NewWriter(colName, colType)` fixes a column
+type and every value passed to `AddEntry` must canonical-encode as that type
+(`CanonicalValue` returns an error on a type/value mismatch). The consumer's
+per-column spill buffer originally keyed `s.buffers` by **column name alone** and
+locked the buffer's `colType` to whatever the **first** entry for that name
+carried. The spill codec, however, persists each entry's **own** ColType byte and
+`readEntry` decodes from that byte — so a buffer could hold a float64 value (its
+own byte) while its writer was created for `ColumnTypeString` (the first-seen
+type), and `AddEntry` then failed:
+
+    valueindexconsumer: add entry "span.start": valueindex: AddEntry:
+    valueindex: ColumnTypeString expects string, got float64
+
+This happens whenever one column name surfaces with more than one column type
+across the blocks in a file — e.g. an attribute named `span.start` (the dotted
+attribute, distinct from the `span:start` intrinsic) stored as a float64 in one
+block and a string in another due to mixed-type spans. It is general: any
+mixed-type attribute name triggers it.
+
+### Fix
+
+Key `s.buffers` by `bufferKey{name, colType}`. Distinct types for the same name
+now get distinct buffers, each producing a type-consistent L0 index file under the
+same `col_hash` prefix (the query side already selects on expected type, so two
+type-homogeneous files under one prefix are correct). The per-message ack refcount
+(`touched` / `pendingIDs` / `pendingCol`) is tracked per `bufferKey`, so a message
+touching one name under two types is acked once, only after **both** buffers
+flush.
+
+`writeEntry`/`readEntry` were already correct (each entry self-describes its
+ColType); the bug was purely the name-only buffer key feeding a stale `colType`
+into `NewWriter`.
+
+Back-refs: `internal/modules/valueindexconsumer/service.go`.
+
 ## NOTE-VI-018 — Shared two-phase extractor + denylist (issue #401)
 
 Date: 2026-06-27
