@@ -44,10 +44,16 @@ type rawEntry struct {
 }
 
 // writerImpl is the concrete Writer implementation.
+//
+// NOTE-VI-026 (issue #413): entries accumulate in memory only up to
+// ValueIndexWriterSpillEntries; beyond that the run is sorted and spilled to a temp
+// file (runs) and the in-memory buffer is reset. Flush k-way merges the spilled runs
+// with the remaining in-memory tail, bounding peak memory regardless of cardinality.
 type writerImpl struct {
 	colName string
 	colHash string
 	entries []rawEntry
+	runs    []*runFile
 	colType shared.ColumnType
 }
 
@@ -62,9 +68,22 @@ func NewWriter(colName string, colType shared.ColumnType) Writer {
 
 func (w *writerImpl) ColHash() string { return w.colHash }
 
-func (w *writerImpl) Close() { w.entries = nil }
+func (w *writerImpl) Close() {
+	w.entries = nil
+	w.discardRuns()
+}
 
-// AddEntry encodes value to its canonical form and buffers the entry.
+// discardRuns closes and deletes all spilled run temp files.
+func (w *writerImpl) discardRuns() {
+	for _, r := range w.runs {
+		r.remove()
+	}
+	w.runs = nil
+}
+
+// AddEntry encodes value to its canonical form and buffers the entry, spilling a
+// sorted run to disk once the in-memory buffer reaches ValueIndexWriterSpillEntries
+// (NOTE-VI-026, issue #413).
 func (w *writerImpl) AddEntry(value any, traceID [16]byte, sourceRef string, blockID uint32, timeSec uint64) error {
 	cv, err := CanonicalValue(w.colType, value)
 	if err != nil {
@@ -79,14 +98,51 @@ func (w *writerImpl) AddEntry(value any, traceID [16]byte, sourceRef string, blo
 		blockID:        blockID,
 		timeSec:        timeSec,
 	})
+	if len(w.entries) >= shared.ValueIndexWriterSpillEntries {
+		if err := w.spillRun(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// spillRun sorts the current in-memory buffer and writes it to a new run temp file,
+// then resets the buffer.
+func (w *writerImpl) spillRun() error {
+	if len(w.entries) == 0 {
+		return nil
+	}
+	rf, err := writeRun(w.colType, w.entries)
+	if err != nil {
+		return fmt.Errorf("valueindex: AddEntry: spill: %w", err)
+	}
+	w.runs = append(w.runs, rf)
+	w.entries = w.entries[:0]
 	return nil
 }
 
 // Flush sorts, deduplicates, and serializes all buffered entries into a value index file.
+// When entries were spilled to disk during AddEntry, the spilled runs are k-way merged
+// with the in-memory tail; otherwise the in-memory fast path is taken (NOTE-VI-026).
 func (w *writerImpl) Flush(_ context.Context, level uint8) ([]byte, error) {
-	sortRawSlice(w.colType, w.entries)
-	w.entries = deduplicateEntries(w.entries)
-	data, err := w.flushSorted(level)
+	if len(w.runs) == 0 {
+		// Fast path: everything fit in memory.
+		sortRawSlice(w.colType, w.entries)
+		w.entries = deduplicateEntries(w.entries)
+		data, err := w.flushSorted(level)
+		if err != nil {
+			return nil, err
+		}
+		w.entries = w.entries[:0]
+		return data, nil
+	}
+
+	// External sort-merge path.
+	defer w.discardRuns()
+	tail := w.entries
+	data, err := w.assemble(level, func(yield func(rawEntry) error) error {
+		return mergeRuns(w.colType, w.runs, tail, yield)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -98,43 +154,82 @@ func (w *writerImpl) Flush(_ context.Context, level uint8) ([]byte, error) {
 // Called both by Flush (public) and by compaction's flushBatch (internal).
 // Does NOT reset w.entries.
 func (w *writerImpl) flushSorted(level uint8) ([]byte, error) {
-	// Compute wall timestamps.
-	var wallMin, wallMax uint64
-	for i, re := range w.entries {
-		if i == 0 || re.timeSec < wallMin {
+	entries := w.entries
+	return w.assemble(level, func(yield func(rawEntry) error) error {
+		for i := range entries {
+			if err := yield(entries[i]); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// assemble drives the streaming construction of every value-index section from a
+// source that yields rawEntry in final sorted, deduplicated order. Peak memory is
+// bounded to one chunk plus the directory/hash-index (which scale with the number
+// of distinct values, not entries) regardless of posting-list length.
+//
+// NOTE-VI-026 (issue #413): this is the shared serialization core used by both the
+// in-memory fast path (flushSorted) and the external sort-merge path (flushMerged),
+// eliminating the previous full []Entry copy and second sort pass that OOM-killed the
+// consumer on high-volume low-cardinality columns.
+func (w *writerImpl) assemble(level uint8, source func(yield func(rawEntry) error) error) ([]byte, error) {
+	var (
+		wallMin, wallMax uint64
+		seen             bool
+		prevHash         [16]byte
+		havePrev         bool
+		entryIdx         int
+	)
+	perChunk := shared.ValueIndexEntriesPerChunk
+	ce := newChunkEncoder(perChunk)
+	kll := newKLLBuilder(w.colType)
+	var hashEntries []HashEntry
+
+	err := source(func(re rawEntry) error {
+		// Wall timestamps.
+		if !seen || re.timeSec < wallMin {
 			wallMin = re.timeSec
 		}
-		if re.timeSec > wallMax {
+		if !seen || re.timeSec > wallMax {
 			wallMax = re.timeSec
 		}
-	}
+		seen = true
 
-	// Convert rawEntry → Entry for the entries encoder.
-	entries := make([]Entry, len(w.entries))
-	for i, re := range w.entries {
-		entries[i] = Entry{
+		// VHIX hash index: one entry per distinct valueHash, recording the chunk
+		// index of its first occurrence. Entries arrive sorted by value, so equal
+		// hashes are adjacent.
+		chunkIdx := uint32(entryIdx / perChunk) //nolint:gosec // bounded by entry count
+		if !havePrev || re.valueHash != prevHash {
+			hashEntries = append(hashEntries, HashEntry{
+				ValueHash: re.valueHash,
+				ChunkIdx:  chunkIdx,
+			})
+			prevHash = re.valueHash
+			havePrev = true
+		}
+
+		kll.add(re.canonicalValue)
+		ce.Add(Entry{
 			Value:     re.canonicalValue,
 			TraceID:   re.traceID,
 			SourceRef: re.sourceRef,
 			BlockID:   re.blockID,
 			TimeSec:   re.timeSec,
-		}
-	}
-
-	// KLL sketch over vi:value.
-	kllBytes, err := w.buildKLL(w.entries)
+		})
+		entryIdx++
+		return nil
+	})
 	if err != nil {
-		return nil, fmt.Errorf("valueindex: flushSorted: KLL: %w", err)
+		return nil, fmt.Errorf("valueindex: assemble: %w", err)
 	}
 
-	// Encode posting list chunks (VINX content).
-	chunkData, chunkDir, err := EncodeEntries(entries, shared.ValueIndexEntriesPerChunk)
+	kllBytes, err := kll.finish()
 	if err != nil {
-		return nil, fmt.Errorf("valueindex: flushSorted: EncodeEntries: %w", err)
+		return nil, fmt.Errorf("valueindex: assemble: KLL: %w", err)
 	}
-
-	// Build VHIX hash index.
-	hashEntries := buildHashIndex(w.entries)
+	chunkData, chunkDir := ce.Finish()
 
 	// Encode all sections.
 	vimtBytes := EncodeMeta(Meta{
@@ -203,53 +298,46 @@ func encodeVINXSection(dir []ChunkDirEntry, chunkData []byte) []byte {
 	return buf
 }
 
-// buildKLL constructs and encodes the KLL sketch for vi:value.
-func (w *writerImpl) buildKLL(entries []rawEntry) ([]byte, error) {
-	switch w.colType {
+// kllBuilder accumulates canonical values into a type-appropriate KLL sketch one
+// at a time and encodes the VKLL section on Finish. It lets the writer feed the
+// sketch from a streaming merge without materializing the full entry slice
+// (NOTE-VI-026, issue #413).
+type kllBuilder struct {
+	add    func(canonicalValue []byte)
+	finish func() ([]byte, error)
+}
+
+// newKLLBuilder returns a streaming KLL builder for the given column type, mirroring
+// the type dispatch of the old buildKLL.
+func newKLLBuilder(colType shared.ColumnType) *kllBuilder {
+	switch colType {
 	case shared.ColumnTypeString, shared.ColumnTypeRangeString:
 		sk := writer.NewKLLWithK[string](shared.ValueIndexKLLK)
-		for i := range entries {
-			sk.Add(string(entries[i].canonicalValue))
+		return &kllBuilder{
+			add:    func(cv []byte) { sk.Add(string(cv)) },
+			finish: func() ([]byte, error) { return EncodeKLLSection(sk, colType) },
 		}
-		return EncodeKLLSection(sk, w.colType)
 	case shared.ColumnTypeUint64, shared.ColumnTypeInt64, shared.ColumnTypeFloat64,
 		shared.ColumnTypeRangeUint64, shared.ColumnTypeRangeInt64,
 		shared.ColumnTypeRangeDuration, shared.ColumnTypeRangeFloat64:
 		// NOTE-VI-012: Range* numeric types use the same uint64 bit-pattern KLL as their
 		// scalar equivalents; compareCanonical handles type-correct ordering at query time.
 		sk := writer.NewKLLWithK[uint64](shared.ValueIndexKLLK)
-		for i := range entries {
-			if len(entries[i].canonicalValue) >= 8 {
-				sk.Add(binary.LittleEndian.Uint64(entries[i].canonicalValue[:8]))
-			}
+		return &kllBuilder{
+			add: func(cv []byte) {
+				if len(cv) >= 8 {
+					sk.Add(binary.LittleEndian.Uint64(cv[:8]))
+				}
+			},
+			finish: func() ([]byte, error) { return EncodeKLLSection(sk, colType) },
 		}
-		return EncodeKLLSection(sk, w.colType)
 	default:
 		sk := writer.NewKLLWithK[string](shared.ValueIndexKLLK)
-		return EncodeKLLSection(sk, w.colType)
-	}
-}
-
-// buildHashIndex returns one HashEntry per distinct valueHash in a sorted rawEntry slice.
-func buildHashIndex(entries []rawEntry) []HashEntry {
-	if len(entries) == 0 {
-		return nil
-	}
-	var result []HashEntry
-	var prevHash [16]byte
-	perChunk := shared.ValueIndexEntriesPerChunk
-
-	for i := range entries {
-		thisChunk := uint32(i / perChunk) //nolint:gosec // bounded by slice length
-		if i == 0 || entries[i].valueHash != prevHash {
-			result = append(result, HashEntry{
-				ValueHash: entries[i].valueHash,
-				ChunkIdx:  thisChunk,
-			})
-			prevHash = entries[i].valueHash
+		return &kllBuilder{
+			add:    func([]byte) {},
+			finish: func() ([]byte, error) { return EncodeKLLSection(sk, colType) },
 		}
 	}
-	return result
 }
 
 // deduplicateEntries removes entries with identical (valueHash, traceID, sourceRef, blockID, timeSec).

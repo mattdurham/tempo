@@ -520,6 +520,14 @@ const (
 	// ValueIndexFooterSize is the fixed byte size of the value index file footer.
 	ValueIndexFooterSize = 32
 
+	// ValueIndexWriterSpillEntries is the number of buffered posting-list entries at
+	// which the value-index writer sorts its in-memory run and spills it to a temp
+	// file (NOTE-VI-026, issue #413). At ~72 bytes/rawEntry this caps peak in-memory
+	// buffer to roughly 36 MB regardless of column cardinality; the external
+	// sort-merge at Flush then streams the runs with bounded memory. Columns smaller
+	// than this stay entirely in memory and take the unchanged fast path.
+	ValueIndexWriterSpillEntries = 500_000
+
 	// ValueIndexCompactThresholdFiles is the file count above which compaction is triggered.
 	ValueIndexCompactThresholdFiles = 8
 	// ValueIndexCompactThresholdBytes is the total size above which compaction is triggered.

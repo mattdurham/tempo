@@ -46,38 +46,76 @@ func EncodeEntries(entries []Entry, perChunk int) ([]byte, []ChunkDirEntry, erro
 	if len(entries) == 0 {
 		return []byte{}, nil, nil
 	}
+	ce := newChunkEncoder(perChunk)
+	for i := range entries {
+		ce.Add(entries[i])
+	}
+	allChunks, dir := ce.Finish()
+	return allChunks, dir, nil
+}
+
+// chunkEncoder incrementally builds snappy-compressed posting-list chunks from a
+// stream of entries pushed in sorted order. It is the streaming equivalent of
+// EncodeEntries: callers Add one entry at a time and Finish to obtain the
+// concatenated chunk bytes and directory. Peak memory is bounded to one chunk's
+// worth of entries plus the growing output buffer, never the full posting list.
+//
+// NOTE-VI-026: introduced for the writer external sort-merge path (issue #413) so
+// the chunk/dir building does not require the full []Entry slice in memory.
+type chunkEncoder struct {
+	allChunks []byte
+	dir       []ChunkDirEntry
+	pending   []Entry
+	perChunk  int
+}
+
+// newChunkEncoder creates a streaming chunk encoder with the given nominal chunk size.
+func newChunkEncoder(perChunk int) *chunkEncoder {
 	if perChunk <= 0 {
 		perChunk = shared.ValueIndexEntriesPerChunk
 	}
-
-	var (
-		allChunks []byte
-		dir       []ChunkDirEntry
-	)
-
-	for start := 0; start < len(entries); start += perChunk {
-		end := start + perChunk
-		if end > len(entries) {
-			end = len(entries)
-		}
-		chunk := entries[start:end]
-
-		raw := encodeChunkPayload(chunk)
-		compressed := snappy.Encode(nil, raw)
-
-		de := ChunkDirEntry{
-			MinTimeSec: chunk[0].TimeSec,
-			CompOff:    uint32(len(allChunks)),  //nolint:gosec // bounded by MaxOutputBytes
-			CompLen:    uint32(len(compressed)), //nolint:gosec // bounded
-		}
-		// Store first 8 bytes of the first entry's Value as MinValue.
-		n := copy(de.MinValue[:], chunk[0].Value)
-		_ = n
-
-		allChunks = append(allChunks, compressed...)
-		dir = append(dir, de)
+	return &chunkEncoder{
+		perChunk: perChunk,
+		pending:  make([]Entry, 0, perChunk),
 	}
-	return allChunks, dir, nil
+}
+
+// Add appends one entry to the current chunk, flushing the chunk when full.
+// Entries must be pushed in the final sorted order.
+func (ce *chunkEncoder) Add(e Entry) {
+	ce.pending = append(ce.pending, e)
+	if len(ce.pending) >= ce.perChunk {
+		ce.flushChunk()
+	}
+}
+
+// flushChunk encodes and compresses the pending entries into a single chunk.
+func (ce *chunkEncoder) flushChunk() {
+	if len(ce.pending) == 0 {
+		return
+	}
+	raw := encodeChunkPayload(ce.pending)
+	compressed := snappy.Encode(nil, raw)
+
+	de := ChunkDirEntry{
+		MinTimeSec: ce.pending[0].TimeSec,
+		CompOff:    uint32(len(ce.allChunks)), //nolint:gosec // bounded by MaxOutputBytes
+		CompLen:    uint32(len(compressed)),   //nolint:gosec // bounded
+	}
+	copy(de.MinValue[:], ce.pending[0].Value)
+
+	ce.allChunks = append(ce.allChunks, compressed...)
+	ce.dir = append(ce.dir, de)
+	ce.pending = ce.pending[:0]
+}
+
+// Finish flushes any pending entries and returns the chunk bytes and directory.
+func (ce *chunkEncoder) Finish() ([]byte, []ChunkDirEntry) {
+	ce.flushChunk()
+	if ce.allChunks == nil {
+		ce.allChunks = []byte{}
+	}
+	return ce.allChunks, ce.dir
 }
 
 // encodeChunkPayload serializes a slice of entries into a raw (pre-snappy) v2 chunk payload.
