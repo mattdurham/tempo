@@ -3,6 +3,7 @@ package executor
 // NOTE: Any changes to this file must be reflected in the corresponding SPECS.md or NOTES.md.
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"fmt"
@@ -1051,6 +1052,15 @@ func viMatchSpans(source ValueIndexSource, prog *vm.Program) ([]VILookupResult, 
 // viEvalNodes evaluates a slice of sibling RangeNodes combined by AND, returning the
 // span set that satisfies all of them. When isOR is true the siblings are combined by
 // OR (union) instead. Returns (nil, false) if any leaf lacks index coverage.
+//
+// NOTE-VI-040 (#430): the accumulator is kept sorted by the 24-byte span key
+// (TraceID++SpanID) so AND intersection and OR union are streaming merge-joins
+// over two sorted runs rather than hash-map materialisations. The first set is
+// sorted+deduplicated once; every subsequent merge-join output is itself sorted,
+// so the accumulator stays sorted across the whole tree walk with no per-node map
+// allocation. This bounds intersect/union to O(n+m) time and O(1) extra space
+// beyond the output, matching the spec's "merge-join on sorted span ID sets to
+// avoid materializing large sets in memory".
 func viEvalNodes(source ValueIndexSource, nodes []vm.RangeNode, isOR bool) ([]VILookupResult, bool) {
 	var acc []VILookupResult
 	first := true
@@ -1061,12 +1071,12 @@ func viEvalNodes(source ValueIndexSource, nodes []vm.RangeNode, isOR bool) ([]VI
 		}
 		switch {
 		case first:
-			acc = set
+			acc = viSortDedup(set)
 			first = false
 		case isOR:
-			acc = viUnion(acc, set)
+			acc = viUnionSorted(acc, viSortDedup(set))
 		default:
-			acc = viIntersect(acc, set)
+			acc = viIntersectSorted(acc, viSortDedup(set))
 		}
 	}
 	if first {
@@ -1091,48 +1101,77 @@ func viEvalNode(source ValueIndexSource, node *vm.RangeNode) ([]VILookupResult, 
 	return source.LookupResults(node.Column, modules_shared.ColumnTypeString)
 }
 
-// viUnion returns the union of two span sets keyed by (TraceID, SpanID).
-func viUnion(a, b []VILookupResult) []VILookupResult {
-	out := make([]VILookupResult, 0, len(a)+len(b))
-	seen := make(map[[24]byte]struct{}, len(a)+len(b))
-	for _, s := range a {
-		k := viSpanKey(s)
-		if _, dup := seen[k]; !dup {
-			seen[k] = struct{}{}
-			out = append(out, s)
-		}
+// viSortDedup returns set sorted ascending by the 24-byte span key
+// (TraceID++SpanID) with consecutive duplicate keys collapsed to their first
+// occurrence. It sorts in place (set is owned by the caller's per-column slice,
+// which the boolean walk does not reuse afterwards) and returns the deduplicated
+// prefix. This is the precondition for the merge-join intersect/union below.
+func viSortDedup(set []VILookupResult) []VILookupResult {
+	if len(set) < 2 {
+		return set
 	}
-	for _, s := range b {
+	slices.SortFunc(set, viSpanCmp)
+	out := set[:1]
+	last := viSpanKey(set[0])
+	for _, s := range set[1:] {
 		k := viSpanKey(s)
-		if _, dup := seen[k]; !dup {
-			seen[k] = struct{}{}
-			out = append(out, s)
+		if k == last {
+			continue
 		}
+		last = k
+		out = append(out, s)
 	}
 	return out
 }
 
-// viIntersect returns the intersection of two span sets keyed by (TraceID, SpanID).
-func viIntersect(a, b []VILookupResult) []VILookupResult {
+// viUnionSorted returns the union of two key-sorted, key-deduplicated span sets
+// as a streaming merge-join. Both inputs MUST already be sorted ascending by the
+// 24-byte span key (viSortDedup); the output is sorted the same way.
+func viUnionSorted(a, b []VILookupResult) []VILookupResult {
+	out := make([]VILookupResult, 0, len(a)+len(b))
+	i, j := 0, 0
+	for i < len(a) && j < len(b) {
+		ka, kb := viSpanKey(a[i]), viSpanKey(b[j])
+		switch bytes.Compare(ka[:], kb[:]) {
+		case 0:
+			out = append(out, a[i])
+			i++
+			j++
+		case -1:
+			out = append(out, a[i])
+			i++
+		default:
+			out = append(out, b[j])
+			j++
+		}
+	}
+	out = append(out, a[i:]...)
+	out = append(out, b[j:]...)
+	return out
+}
+
+// viIntersectSorted returns the intersection of two key-sorted, key-deduplicated
+// span sets as a streaming merge-join. Both inputs MUST already be sorted
+// ascending by the 24-byte span key (viSortDedup); the output is sorted the same
+// way. Uses O(1) extra space beyond the output, no hash map.
+func viIntersectSorted(a, b []VILookupResult) []VILookupResult {
 	if len(a) == 0 || len(b) == 0 {
 		return nil
 	}
-	inA := make(map[[24]byte]struct{}, len(a))
-	for _, s := range a {
-		inA[viSpanKey(s)] = struct{}{}
-	}
 	out := make([]VILookupResult, 0, min(len(a), len(b)))
-	emitted := make(map[[24]byte]struct{}, len(b))
-	for _, s := range b {
-		k := viSpanKey(s)
-		if _, ok := inA[k]; !ok {
-			continue
+	i, j := 0, 0
+	for i < len(a) && j < len(b) {
+		ka, kb := viSpanKey(a[i]), viSpanKey(b[j])
+		switch bytes.Compare(ka[:], kb[:]) {
+		case 0:
+			out = append(out, a[i])
+			i++
+			j++
+		case -1:
+			i++
+		default:
+			j++
 		}
-		if _, dup := emitted[k]; dup {
-			continue
-		}
-		emitted[k] = struct{}{}
-		out = append(out, s)
 	}
 	return out
 }
@@ -1143,6 +1182,12 @@ func viSpanKey(s VILookupResult) [24]byte {
 	copy(k[:16], s.TraceID[:])
 	copy(k[16:], s.SpanID[:])
 	return k
+}
+
+// viSpanCmp orders two results ascending by their 24-byte span key.
+func viSpanCmp(x, y VILookupResult) int {
+	kx, ky := viSpanKey(x), viSpanKey(y)
+	return bytes.Compare(kx[:], ky[:])
 }
 
 // ValueIndexBuildStats records the I/O the builder performed assembling a

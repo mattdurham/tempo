@@ -7004,6 +7004,18 @@ distinct TraceIDs per time bucket.
 AND siblings intersect span sets, OR siblings (`RangeNode.IsOR`) union them, both keyed by the
 24-byte `TraceID(16)++SpanID(8)` identity. Match-all (no nodes) calls `source.AllResults()`.
 
+**NOTE-VI-040 (#430) — merge-join boolean combine.** AND intersect and OR union are streaming
+merge-joins over two key-sorted runs, NOT hash-map materializations. `viEvalNodes` keeps the
+accumulator sorted ascending by the 24-byte span key: the first leaf set is sorted+deduped once
+(`viSortDedup`), and every subsequent `viIntersectSorted`/`viUnionSorted` output is itself sorted,
+so the accumulator stays sorted across the whole tree walk with **no per-node map allocation**.
+Each combine is O(n+m) time and O(1) extra space beyond the output (vs. the old two-map approach
+that allocated O(n) + O(m) `map[[24]byte]struct{}` per node). This is the spec's "merge-join on
+sorted span ID sets to avoid materializing large sets in memory". The match-all `AllResults` path
+is unaffected — it does not pass through the merge-join and returns source-ordered results.
+Back-ref: `metrics_trace.go:viEvalNodes/viSortDedup/viUnionSorted/viIntersectSorted`,
+tests `vi_mergejoin_internal_test.go` (incl. a randomized cross-check against naive map sets).
+
 **Coverage vs emptiness — critical distinction.** TraceQL expands an unscoped attribute (`.env`)
 into one leaf per scope (`resource.env`, `span.env`) under OR nodes. A scope with zero indexed
 files is **definitively empty**, not unindexed. The caller (issue #461) therefore `Add`s an
