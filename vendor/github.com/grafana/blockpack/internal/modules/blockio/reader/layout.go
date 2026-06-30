@@ -39,19 +39,6 @@ import (
 // TopKBytes is the actual byte size of the TopK entries for this column in this
 // block (1 + len(entries) × 10 bytes).
 
-// RangeIndexColumn describes the pruning index for one column.
-
-// BucketMin is the global minimum value across all blocks for this column.
-
-// BucketMax is the global maximum value across all blocks for this column.
-
-// RangeIndexBucket is one entry in a column's range index: the lower boundary
-// of a value bucket and the set of block indexes that cover it.
-
-// End is the upper boundary of this bucket (exclusive). For the last bucket this
-// equals BucketMax of the column. Empty string for string/bytes columns where the
-// upper bound is not encoded.
-
 // FileLayoutSection describes one contiguous byte range in a blockpack file.
 
 // MinValue is the minimum value of this page (human-readable string).
@@ -100,9 +87,6 @@ func (r *Reader) fileLayoutV8() (*FileLayoutReport, error) {
 		switch {
 		case key.Type == shared.ToCTypeIndex && key.SubType == shared.ToCSubTypeBlockIndex:
 			sectionName = "section.block_index"
-		case key.Type == shared.ToCTypeMetadata && key.SubType == shared.ToCSubTypeRange:
-			sectionName = "section.range_index[" + key.Name + "]"
-			// Range index removed in #439; column type no longer available here.
 		case key.Type == shared.ToCTypeMetadata && key.SubType == shared.ToCSubTypeSketch:
 			sectionName = "section.sketch_index[" + key.Name + "]"
 			// Don't set colType for sketch blobs — column type not available without parsing.
@@ -151,7 +135,6 @@ func (r *Reader) fileLayoutV8() (*FileLayoutReport, error) {
 		return cmp.Compare(a.Offset, b.Offset)
 	})
 
-	rangeIndex := r.buildRangeIndex()
 	var sketchIndex *SketchIndexInfo
 
 	spanCounts := make([]uint32, len(r.blockMetas))
@@ -168,7 +151,6 @@ func (r *Reader) fileLayoutV8() (*FileLayoutReport, error) {
 		TotalSpans:      totalSpans,
 		BlockSpanCounts: spanCounts,
 		Sections:        sections,
-		RangeIndex:      rangeIndex,
 		SketchIndex:     sketchIndex,
 	}, nil
 }
@@ -264,9 +246,6 @@ func (r *Reader) layoutBlockV14(blockIdx int, meta shared.BlockMeta) ([]FileLayo
 
 	return sections, nil
 }
-
-// buildRangeIndex is a no-op. The range index was removed in #439.
-func (r *Reader) buildRangeIndex() []RangeIndexColumn { return nil }
 
 // formatIntrinsicBound decodes an encoded intrinsic column boundary to a human-readable string.
 // For ColumnTypeUint64 (span:duration, span:start) the bound is an 8-byte LE uint64.

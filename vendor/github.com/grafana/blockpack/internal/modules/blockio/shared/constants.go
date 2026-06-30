@@ -61,7 +61,7 @@ const (
 	ToCTypeBlock    uint32 = 3 // raw block data blobs (reserved; not used in V8 initial)
 
 	// ToCEntry SubType constants for ToCTypeMetadata (Type=1).
-	ToCSubTypeRange     uint32 = 1 // per-column range index blob
+	// SubType 1 (Range) retired 2026-06-30 (range index removed, #439); not reused.
 	ToCSubTypeSketch    uint32 = 2 // per-column KLL/sketch blob
 	ToCSubTypeBloom     uint32 = 3 // file-level bloom filter blob
 	ToCSubTypeIntrinsic uint32 = 4 // per-column intrinsic column blob

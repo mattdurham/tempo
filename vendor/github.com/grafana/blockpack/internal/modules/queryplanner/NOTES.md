@@ -138,7 +138,37 @@ blocks conservatively when no equality predicates are present.
 
 ---
 
-## 8. Range-Index Pruning Design
+## 8. Range-Index Pruning Design — REMOVED (issue #439)
+
+*Added: 2026-02-25; updated 2026-03-07 (bloom removal); **REMOVED 2026-06-30 (issue #439)***
+
+**Decision (2026-06-30, #439):** The range index was removed from the data file as part of
+the v2-lean format epic (#417). Value-based block pruning is now the **value index's**
+sole responsibility. The planner no longer performs any value-based pruning — the only
+in-planner pruning is time-range pruning (§9, Stage 0).
+
+**What was removed (final):**
+
+- `RangeColumnType` / `BlocksForRange` / `BlocksForRangeInterval` from `BlockIndexer` and `reader.Reader`
+- `RangeColumnBoundaries`, `ColumnNames`, `RangeBoundaries`, `RangeIndexColumn`, `RangeIndexBucket` from the reader
+- `Predicate.Values`, `Predicate.ColType`, `Predicate.IntervalMatch` — a `Predicate` now only
+  carries `Columns` + the `Op`/`Children` tree (used for explain output)
+- `selection.go` in its entirety (`pruneByIndexAll`, `blockSetForPred`, `leafBlockSet`,
+  `intersectBySelectivity`, `insertionSortBlockSets`) and `blockSet.and`/`or` helpers
+- The executor's `fileLevelReject` cluster (file-level [bucketMin,bucketMax] reject) and the
+  predicate value-encoding helpers (`translateRegexNode`, `inferColTypeFromValues`,
+  `rangeTypeSentinelMin/Max`, `buildCase*RegexPredicate`, `extractLiteralAlternatives`, `isASCII`)
+- `shared.ToCSubTypeRange` (subtype 1, retired, not reused) and `shared.RangeValueKey`
+
+**Why permanent this time:** Unlike the 2026-02-25 removal+re-add cycle below, the on-disk
+range index section is gone entirely (writer no longer emits it). `BlocksForRange` etc.
+could only ever return nil/false, so all the pruning machinery was dead code operating on
+empty inputs. `Plan.PrunedByIndex` is retained as an always-zero metrics field for the
+existing observability surface (otel_spans.go, stream.go).
+
+---
+
+## 8b. Range-Index Pruning Design (historical — superseded by §8 removal)
 
 *Added: 2026-02-25; updated 2026-03-07 (bloom removal)*
 

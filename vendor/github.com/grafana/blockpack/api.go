@@ -126,14 +126,6 @@ func normalizeTimeRange(startNano, endNano uint64) modules_queryplanner.TimeRang
 	return modules_queryplanner.TimeRange{MinNano: startNano, MaxNano: endNano}
 }
 
-// ColumnNames returns all column names known to this reader — the union of
-// range-indexed and sketch columns. Derived from file header metadata; no
-// block I/O is required. Returns a sorted slice of column name strings
-// (e.g. "span:status", "resource.service.name", "span.http.method").
-func ColumnNames(r *Reader) []string {
-	return r.ColumnNames()
-}
-
 // Program is a compiled TraceQL filter program. It is safe to reuse across
 // multiple QueryTraceQLWithProgram calls concurrently. Programs are immutable
 // after creation. Use CompileTraceQL to create a Program; use

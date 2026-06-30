@@ -231,8 +231,5 @@ const BlockKindLeaf BlockKind = 0
 // within a block's column metadata). OTLP allows the same attribute key to
 // appear with different types across spans (e.g. "foo" as string on one span
 // and int64 on another); using ColumnKey in these maps prevents silent data loss.
-// Note: some indices (e.g. bloom filter, range index) remain name-only intentionally
+// Note: some indices (e.g. bloom filter) remain name-only intentionally
 // — they are used for block-level pruning where false positives are acceptable.
-
-// RangeValueKey is a string key used in the range index.
-type RangeValueKey = string

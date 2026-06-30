@@ -9,7 +9,6 @@ import (
 	"regexp"
 	"slices"
 	"strconv"
-	"strings"
 	"sync"
 
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
@@ -102,7 +101,7 @@ func BuildPredicates(r *modules_reader.Reader, program *vm.Program) []queryplann
 
 	result := make([]queryplanner.Predicate, 0, len(preds.Nodes))
 	for _, node := range preds.Nodes {
-		p := translateNode(r, node)
+		p := translateNode(node)
 		result = append(result, p)
 	}
 
@@ -110,12 +109,16 @@ func BuildPredicates(r *modules_reader.Reader, program *vm.Program) []queryplann
 }
 
 // translateNode converts a single RangeNode into a queryplanner.Predicate.
-func translateNode(r *modules_reader.Reader, node vm.RangeNode) queryplanner.Predicate {
+//
+// NOTE(#439): Range-index value pruning was removed — the planner no longer prunes
+// blocks by predicate value, so a leaf Predicate only records the column name(s) it
+// references (used for explain output). Value/Min/Max/Pattern are not carried.
+func translateNode(node vm.RangeNode) queryplanner.Predicate {
 	// Composite node: recursively translate children, combine with AND or OR.
 	if len(node.Children) > 0 {
 		children := make([]queryplanner.Predicate, 0, len(node.Children))
 		for _, child := range node.Children {
-			children = append(children, translateNode(r, child))
+			children = append(children, translateNode(child))
 		}
 		op := queryplanner.LogicalAND
 		if node.IsOR {
@@ -124,120 +127,8 @@ func translateNode(r *modules_reader.Reader, node vm.RangeNode) queryplanner.Pre
 		return queryplanner.Predicate{Op: op, Children: children}
 	}
 
-	// Leaf node: single column with Values, Min/Max, or Pattern.
-	col := node.Column
-
-	// Values: equality / point-lookup (bloom + range-index point match).
-	if len(node.Values) > 0 {
-		colType, hasIndex := r.RangeColumnType(col)
-		if !hasIndex {
-			return queryplanner.Predicate{Columns: []string{col}}
-		}
-		encodedVals := make([]string, 0, len(node.Values))
-		for _, v := range node.Values {
-			if enc, ok := encodeValue(v, colType); ok {
-				encodedVals = append(encodedVals, enc)
-			}
-		}
-		return queryplanner.Predicate{
-			Columns: []string{col},
-			Values:  encodedVals,
-			ColType: colType,
-		}
-	}
-
-	// Min/Max: interval lookup (bloom + range-index interval match).
-	if node.Min != nil || node.Max != nil {
-		colType, _ := r.RangeColumnType(col)
-		if colType == 0 {
-			colType = inferColTypeFromValues(node.Min, node.Max)
-		}
-
-		minEnc, minOK := rangeTypeSentinelMin(colType)
-		maxEnc, maxOK := rangeTypeSentinelMax(colType)
-
-		if node.Min != nil {
-			if enc, ok := encodeValue(*node.Min, colType); ok {
-				minEnc, minOK = enc, true
-			}
-		}
-		if node.Max != nil {
-			if enc, ok := encodeValue(*node.Max, colType); ok {
-				maxEnc, maxOK = enc, true
-			}
-		}
-
-		if !minOK || !maxOK {
-			return queryplanner.Predicate{Columns: []string{col}}
-		}
-
-		return queryplanner.Predicate{
-			Columns:       []string{col},
-			Values:        []string{minEnc, maxEnc},
-			ColType:       colType,
-			IntervalMatch: true,
-		}
-	}
-
-	// Pattern: regex — extract prefix for range-index pruning.
-	if node.Pattern != "" {
-		return translateRegexNode(r, col, node.Pattern)
-	}
-
-	// Bloom-only predicate (no range constraint specified).
-	return queryplanner.Predicate{Columns: []string{col}}
-}
-
-// translateRegexNode builds a queryplanner.Predicate for a regex leaf node.
-// NOTE-011: Interval match for case-insensitive regex prefix lookups.
-// NOTE-024: Pure literal alternations use point lookups instead of interval match.
-// NOTE-029: Partial Go-factored prefixes fall back to bloom-only.
-func translateRegexNode(r *modules_reader.Reader, col, pattern string) queryplanner.Predicate {
-	analysis := vm.AnalyzeRegex(pattern)
-	if analysis == nil || len(analysis.Prefixes) == 0 {
-		return queryplanner.Predicate{Columns: []string{col}}
-	}
-
-	colType, _ := r.RangeColumnType(col)
-	if colType == 0 {
-		colType = modules_shared.ColumnTypeRangeString
-	}
-
-	if analysis.CaseInsensitive {
-		if len(analysis.Prefixes) > 1 {
-			// Case-insensitive alternation: multiple prefixes span non-overlapping
-			// ranges. Fall back to bloom-only to avoid false negatives.
-			return queryplanner.Predicate{Columns: []string{col}}
-		}
-		return buildCaseInsensitiveRegexPredicate(col, colType, analysis)
-	}
-
-	// NOTE-024: single-prefix case-sensitive regex — delegate to helper.
-	if len(analysis.Prefixes) == 1 {
-		return buildCaseSensitiveSinglePrefixPredicate(col, colType, pattern, analysis)
-	}
-
-	// Multiple extracted prefixes from Go's regex parser.
-	// NOTE-029: check if original pattern is a pure OR of complete literals.
-	lits := extractLiteralAlternatives(pattern)
-	if len(lits) == 0 {
-		return queryplanner.Predicate{Columns: []string{col}}
-	}
-	encodedVals := make([]string, 0, len(lits))
-	for _, lit := range lits {
-		v := vm.Value{Type: vm.TypeString, Data: lit}
-		if enc, ok := encodeValue(v, colType); ok {
-			encodedVals = append(encodedVals, enc)
-		}
-	}
-	if len(encodedVals) == 0 {
-		return queryplanner.Predicate{Columns: []string{col}}
-	}
-	return queryplanner.Predicate{
-		Columns: []string{col},
-		Values:  encodedVals,
-		ColType: colType,
-	}
+	// Leaf node: record the column it references.
+	return queryplanner.Predicate{Columns: []string{node.Column}}
 }
 
 // ProgramIsIntrinsicOnly reports whether all column references in program can be
@@ -1305,218 +1196,6 @@ func intrinsicRangeMatch(fieldVal any, n vm.RangeNode) bool {
 		return true
 	}
 	return false // unknown field type cannot satisfy a numeric range predicate
-}
-
-// inferColTypeFromValues infers the best ColumnType for encoding a range predicate
-// when no range index exists for the column.
-func inferColTypeFromValues(minVal, maxVal *vm.Value) modules_shared.ColumnType {
-	v := minVal
-	if v == nil {
-		v = maxVal
-	}
-	if v == nil {
-		return modules_shared.ColumnTypeRangeInt64
-	}
-	switch v.Type {
-	case vm.TypeInt:
-		return modules_shared.ColumnTypeRangeInt64
-	case vm.TypeFloat:
-		return modules_shared.ColumnTypeRangeFloat64
-	case vm.TypeString:
-		return modules_shared.ColumnTypeRangeString
-	case vm.TypeDuration:
-		return modules_shared.ColumnTypeRangeDuration
-	default:
-		return modules_shared.ColumnTypeRangeInt64
-	}
-}
-
-// isASCII reports whether s contains only ASCII bytes.
-func isASCII(s string) bool {
-	for i := range len(s) {
-		if s[i] > 127 {
-			return false
-		}
-	}
-	return true
-}
-
-// extractLiteralAlternatives reports whether pattern is a pure OR of complete
-// literal strings with no regex metacharacters. If so, it returns the individual
-// alternatives for use as point lookups in the range index. Returns nil if any
-// alternative contains a metacharacter or if the pattern is empty.
-//
-// NOTE-024: This detects the case where Go's regex parser factors a common prefix
-// from an alternation (e.g. "cluster-0|cluster-1" → single prefix "cluster-"),
-// causing the single-prefix interval path to emit an overly wide range match.
-// By operating on the original pattern string before regex parsing, this function
-// recovers the individual literals and enables point lookups instead.
-func extractLiteralAlternatives(pattern string) []string {
-	if pattern == "" {
-		return nil
-	}
-	parts := strings.Split(pattern, "|")
-	const metachars = `.*+?[]{}()^$\`
-	for _, p := range parts {
-		if p == "" {
-			return nil
-		}
-		if strings.ContainsAny(p, metachars) {
-			return nil
-		}
-	}
-	return parts
-}
-
-// buildCaseInsensitiveRegexPredicate builds an interval-match predicate for a
-// case-insensitive regex pattern with a single ASCII prefix. The all-uppercase
-// prefix is the min key; the all-lowercase prefix + "\xff" is the max key.
-// The "\xff" suffix ensures buckets whose lower boundary extends beyond the
-// prefix (e.g., "debug-service" for prefix "debug") are included in the
-// interval. All buckets whose range overlaps [UPPER, lower\xff] are kept.
-//
-// Non-ASCII prefixes fall back to bloom-only because Unicode case mapping can
-// change byte length/ordering, making the [UPPER, lower] interval unsafe under
-// bytewise lexicographic comparison.
-// NOTE-011: interval matching for case-insensitive regex prefix lookups.
-func buildCaseInsensitiveRegexPredicate(
-	col string,
-	colType modules_shared.ColumnType,
-	analysis *vm.RegexAnalysis,
-) queryplanner.Predicate {
-	prefix := analysis.Prefixes[0]
-	// Non-ASCII: Unicode case mapping can change byte length/ordering.
-	// Fall back to bloom-only to avoid false negatives.
-	if !isASCII(prefix) {
-		return queryplanner.Predicate{Columns: []string{col}}
-	}
-	upper := strings.ToUpper(prefix)
-	// Append \xff so the interval captures buckets with lower boundaries that
-	// extend beyond the prefix (e.g., "debug-service" > "debug" but < "debug\xff").
-	lower := strings.ToLower(prefix) + "\xff"
-
-	upperVal := vm.Value{Type: vm.TypeString, Data: upper}
-	lowerVal := vm.Value{Type: vm.TypeString, Data: lower}
-
-	var vals []string
-	if encMin, ok := encodeValue(upperVal, colType); ok {
-		if encMax, ok := encodeValue(lowerVal, colType); ok {
-			vals = []string{encMin, encMax}
-		}
-	}
-
-	if len(vals) < 2 {
-		// Encoding failed — fall back to bloom-only.
-		return queryplanner.Predicate{Columns: []string{col}}
-	}
-
-	return queryplanner.Predicate{
-		Columns:       []string{col},
-		Values:        vals,
-		ColType:       colType,
-		IntervalMatch: true,
-	}
-}
-
-// buildCaseSensitiveSinglePrefixPredicate builds the predicate for a case-sensitive
-// regex with exactly one extracted prefix. It checks whether the raw pattern is a pure
-// OR of complete literals (NOTE-024) and uses point lookups if so; otherwise it falls
-// back to interval matching on the extracted prefix (NOTE-011).
-func buildCaseSensitiveSinglePrefixPredicate(
-	col string,
-	colType modules_shared.ColumnType,
-	pattern string,
-	analysis *vm.RegexAnalysis,
-) queryplanner.Predicate {
-	// NOTE-024: Before falling back to interval matching on the common prefix,
-	// check whether the original pattern is a pure OR of complete literals.
-	if lits := extractLiteralAlternatives(pattern); len(lits) > 1 {
-		encodedVals := make([]string, 0, len(lits))
-		for _, lit := range lits {
-			v := vm.Value{Type: vm.TypeString, Data: lit}
-			if enc, ok := encodeValue(v, colType); ok {
-				encodedVals = append(encodedVals, enc)
-			}
-		}
-		if len(encodedVals) == 0 {
-			return queryplanner.Predicate{Columns: []string{col}}
-		}
-		return queryplanner.Predicate{
-			Columns: []string{col},
-			Values:  encodedVals,
-			ColType: colType,
-		}
-	}
-	// Single literal or non-pure-literal pattern: use interval matching
-	// [prefix, prefix+"\xff"] to find all buckets whose lower boundary
-	// starts with the extracted common prefix.
-	// NOTE-011: single-prefix case-sensitive regex uses interval matching like (?i) patterns.
-	prefix := analysis.Prefixes[0]
-	minVal := vm.Value{Type: vm.TypeString, Data: prefix}
-	maxVal := vm.Value{Type: vm.TypeString, Data: prefix + "\xff"}
-	encMin, okMin := encodeValue(minVal, colType)
-	encMax, okMax := encodeValue(maxVal, colType)
-	if okMin && okMax {
-		return queryplanner.Predicate{
-			Columns:       []string{col},
-			Values:        []string{encMin, encMax},
-			ColType:       colType,
-			IntervalMatch: true,
-		}
-	}
-	return queryplanner.Predicate{Columns: []string{col}}
-}
-
-// rangeTypeSentinelMin returns the wire-encoded minimum sentinel for the given column type
-// and whether encoding succeeded. Used to express open-ended upper range predicates
-// (e.g. duration < Y) where no explicit lower bound is provided.
-// The sentinel covers the full storable range without false negatives.
-// For ColumnTypeRangeString the minimum sentinel is "" (empty string), which is a valid
-// value — callers must use the bool return to distinguish success from unsupported types.
-func rangeTypeSentinelMin(colType modules_shared.ColumnType) (string, bool) {
-	var buf [8]byte
-	switch colType {
-	case modules_shared.ColumnTypeRangeUint64, modules_shared.ColumnTypeUint64:
-		binary.LittleEndian.PutUint64(buf[:], 0)
-		return string(buf[:]), true
-	case modules_shared.ColumnTypeRangeInt64, modules_shared.ColumnTypeRangeDuration, modules_shared.ColumnTypeInt64:
-		const minInt64AsUint64 = 1 << 63 // bit pattern of math.MinInt64 as uint64
-		binary.LittleEndian.PutUint64(buf[:], minInt64AsUint64)
-		return string(buf[:]), true
-	case modules_shared.ColumnTypeRangeFloat64, modules_shared.ColumnTypeFloat64:
-		binary.LittleEndian.PutUint64(buf[:], math.Float64bits(math.Inf(-1)))
-		return string(buf[:]), true
-	case modules_shared.ColumnTypeRangeString, modules_shared.ColumnTypeString:
-		return "", true // empty string is the lexicographic minimum
-	default:
-		return "", false
-	}
-}
-
-// rangeTypeSentinelMax returns the wire-encoded maximum sentinel for the given column type
-// and whether encoding succeeded. Used to express open-ended lower range predicates
-// (e.g. duration > X) where no explicit upper bound is provided.
-// The sentinel covers the full storable range without false negatives.
-func rangeTypeSentinelMax(colType modules_shared.ColumnType) (string, bool) {
-	var buf [8]byte
-	switch colType {
-	case modules_shared.ColumnTypeRangeUint64, modules_shared.ColumnTypeUint64:
-		binary.LittleEndian.PutUint64(buf[:], math.MaxUint64)
-		return string(buf[:]), true
-	case modules_shared.ColumnTypeRangeInt64, modules_shared.ColumnTypeRangeDuration, modules_shared.ColumnTypeInt64:
-		binary.LittleEndian.PutUint64(
-			buf[:],
-			uint64(math.MaxInt64),
-		) //nolint:gosec // safe: storing MaxInt64 bits as uint64
-		return string(buf[:]), true
-	case modules_shared.ColumnTypeRangeFloat64, modules_shared.ColumnTypeFloat64:
-		binary.LittleEndian.PutUint64(buf[:], math.Float64bits(math.Inf(+1)))
-		return string(buf[:]), true
-	case modules_shared.ColumnTypeRangeString, modules_shared.ColumnTypeString:
-		return "\xff\xff\xff\xff\xff\xff\xff\xff", true // high sentinel beyond realistic string values
-	default:
-		return "", false
-	}
 }
 
 // encodeValue encodes a vm.Value to the range-index wire format (SPECS §5.2.1):

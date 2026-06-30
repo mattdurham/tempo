@@ -4,20 +4,16 @@ package queryplanner
 
 import (
 	"fmt"
-	"slices"
 	"strings"
 )
 
-// explainPlan builds a multi-section ASCII trace of the full pruning pipeline.
+// explainPlan builds a multi-section ASCII trace of the block-selection pipeline.
 //
-// Section 1 — Predicate tree: how predicates resolved to range-index block sets.
+// Section 1 — Predicate tree: the columns each predicate references.
 // Section 2 — Pruning pipeline: block counts at each stage with running totals.
-// Section 3 — Block priority: per-block scores with English reasoning (cardinality,
-// frequency, why blocks are ranked the way they are). Only present when BlockScores
-// is non-empty.
 //
 // timeBlocks is the sorted list of blocks that survived time pruning (nil if no time pruning).
-func explainPlan(r BlockIndexer, predicates []Predicate, plan *Plan, timeBlocks []int) {
+func explainPlan(predicates []Predicate, plan *Plan, timeBlocks []int) {
 	var sb strings.Builder
 
 	if len(predicates) == 0 && plan.PrunedByTime == 0 {
@@ -29,7 +25,7 @@ func explainPlan(r BlockIndexer, predicates []Predicate, plan *Plan, timeBlocks 
 	// --- Section 1: Predicate tree ---
 	parts := make([]string, 0, len(predicates)+1)
 	for _, pred := range predicates {
-		parts = append(parts, explainPred(r, pred, plan.TotalBlocks))
+		parts = append(parts, explainPred(pred))
 	}
 	if timeBlocks != nil {
 		parts = append(parts, fmt.Sprintf("ts:%s", formatBlockList(timeBlocks)))
@@ -45,27 +41,21 @@ func explainPlan(r BlockIndexer, predicates []Predicate, plan *Plan, timeBlocks 
 	}
 
 	// --- Section 2: Pruning pipeline summary ---
-	if plan.PrunedByTime > 0 || plan.PrunedByIndex > 0 {
+	if plan.PrunedByTime > 0 {
 		sb.WriteString("\n\nPruning pipeline:\n")
 		remaining := plan.TotalBlocks
 		fmt.Fprintf(&sb, "  start: %d blocks\n", remaining)
-		if plan.PrunedByTime > 0 {
-			remaining -= plan.PrunedByTime
-			fmt.Fprintf(&sb, "  time-range:   -%d → %d blocks\n", plan.PrunedByTime, remaining)
-		}
-		if plan.PrunedByIndex > 0 {
-			remaining -= plan.PrunedByIndex
-			fmt.Fprintf(&sb, "  range-index:  -%d → %d blocks\n", plan.PrunedByIndex, remaining)
-		}
+		remaining -= plan.PrunedByTime
+		fmt.Fprintf(&sb, "  time-range:   -%d → %d blocks\n", plan.PrunedByTime, remaining)
 	}
 
 	plan.Explain = sb.String()
 }
 
 // explainPred recursively builds the ASCII representation for a single predicate node.
-func explainPred(r BlockIndexer, pred Predicate, blockCount int) string {
+func explainPred(pred Predicate) string {
 	if len(pred.Children) == 0 {
-		return explainLeaf(r, pred, blockCount)
+		return explainLeaf(pred)
 	}
 
 	op := "&&"
@@ -75,15 +65,15 @@ func explainPred(r BlockIndexer, pred Predicate, blockCount int) string {
 
 	parts := make([]string, 0, len(pred.Children))
 	for _, child := range pred.Children {
-		parts = append(parts, explainPred(r, child, blockCount))
+		parts = append(parts, explainPred(child))
 	}
 
 	return "(" + strings.Join(parts, " "+op+" ") + ")"
 }
 
 // explainLeaf builds the ASCII representation for a leaf predicate, showing
-// the column name and the block set returned by the range index.
-func explainLeaf(r BlockIndexer, pred Predicate, blockCount int) string {
+// the column name(s) it references.
+func explainLeaf(pred Predicate) string {
 	col := "?"
 	if len(pred.Columns) > 0 {
 		col = pred.Columns[0]
@@ -91,19 +81,7 @@ func explainLeaf(r BlockIndexer, pred Predicate, blockCount int) string {
 			col = strings.Join(pred.Columns, "|")
 		}
 	}
-
-	set, constrained, err := leafBlockSet(r, pred, blockCount)
-	if err != nil {
-		return fmt.Sprintf("%s=err(%v)", col, err)
-	}
-	if !constrained {
-		return fmt.Sprintf("%s=[]", col)
-	}
-
-	var blocks []int
-	set.iter(func(b int) { blocks = append(blocks, b) })
-	slices.Sort(blocks)
-	return fmt.Sprintf("%s=%s", col, formatBlockList(blocks))
+	return col
 }
 
 // formatBlockList formats a sorted slice of block indices as a compact string

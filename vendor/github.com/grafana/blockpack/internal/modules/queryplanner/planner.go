@@ -33,19 +33,6 @@ import (
 // ReadBlocks reads raw bytes for the given block indices using aggressive
 // coalescing. Returns a map from block index to raw byte slice.
 
-// RangeColumnType returns the ColumnType for a range-indexed column, if indexed.
-// Returns (0, false) when the column has no range index.
-
-// BlocksForRange returns the sorted block indices that may contain the
-// given query value for the named column. queryValue must be wire-encoded
-// (8-byte LE for numeric types, raw string for string/bytes).
-// Returns nil (no error) when the value is below all stored lower boundaries.
-
-// BlocksForRangeInterval returns block indices from all buckets whose lower
-// boundary falls within [minKey, maxKey]. This is useful for case-insensitive
-// prefix lookups where the query spans a range of lexicographic values
-// (e.g., "DEBUG" to "debug"). Returns nil when no buckets overlap the interval.
-
 // BlocksInTimeRange returns block indices whose timestamp window overlaps
 // [minNano, maxNano] using the per-file TS index (O(log n) binary search).
 // Returns nil when the TS index is absent (old files); callers must fall back
@@ -74,28 +61,24 @@ const (
 	LogicalOR LogicalOp = 1
 )
 
-// Predicate is a tree node for bloom-filter and range-index block pruning.
+// Predicate is a tree node describing the columns referenced by a query.
+//
+// Block pruning by predicate value was removed with the range index (#439); the
+// value index is now the authoritative source for value-based pruning. A Predicate
+// therefore only records the column-tree structure used by explain output.
 //
 // A Predicate is either a leaf or a composite node:
 //
-//   - Leaf (len(Children) == 0): Columns and Values describe a single bloom + range
-//     index condition. Columns are OR-combined for bloom (block survives if any column
-//     is possibly present). Values are OR-combined for range index lookup.
+//   - Leaf (len(Children) == 0): Columns names the column(s) referenced.
 //
 //   - Composite (len(Children) > 0): Op specifies how Children are combined.
 //     LogicalAND: block must satisfy ALL children (intersection).
 //     LogicalOR:  block must satisfy AT LEAST ONE child (union).
 //
-// The top-level []Predicate passed to Plan is AND-combined: a block must satisfy every
-// top-level predicate to survive.
-//
 // Examples:
 //
 //	// AND query { A && B }: two leaf predicates at the top level.
 //	[]Predicate{{Columns: ["A"]}, {Columns: ["B"]}}
-//
-//	// OR query { A || B } same column: one leaf with both values.
-//	[]Predicate{{Columns: ["col"], Values: ["A", "B"]}}
 //
 //	// OR query { A || B } different columns: composite OR node.
 //	[]Predicate{{Op: LogicalOR, Children: []Predicate{
@@ -109,32 +92,12 @@ const (
 //	        {Columns: ["B"]}, {Columns: ["C"]},
 //	    }},
 //	}
-//
-//	// Fully nested { (A || B) && (C || D) }: two composite OR nodes.
-//	[]Predicate{
-//	    {Op: LogicalOR, Children: []Predicate{{Columns: ["A"]}, {Columns: ["B"]}}},
-//	    {Op: LogicalOR, Children: []Predicate{{Columns: ["C"]}, {Columns: ["D"]}}},
-//	}
 
-// Columns holds one or more column names combined with OR for bloom pruning.
+// Columns holds one or more column names referenced by a leaf node.
 // Used only in leaf nodes (len(Children) == 0). An empty slice is a no-op.
 
-// Values holds wire-encoded query values for range index lookup.
-// Used only in leaf nodes. When non-empty and Columns has exactly one entry,
-// the planner unions BlocksForRange results for each value.
-
-// Children makes this a composite node. When non-empty, Columns/Values/ColType/
-// IntervalMatch are ignored and Op controls how the children's block sets combine.
-
-// ColType is informational: callers use it when wire-encoding Values before passing
-// them in. The planner does not inspect ColType internally — it calls RangeColumnType
-// to determine the indexed type. Used only in leaf nodes when Values is non-empty.
-
-// IntervalMatch changes how Values is interpreted for range-index pruning.
-// When false (default), Values are individual point lookups unioned together.
-// When true, Values must have exactly 2 elements: Values[0] is the min key and
-// Values[1] is the max key. All buckets whose lower boundary falls within
-// [min, max] are included.
+// Children makes this a composite node. When non-empty, Columns is ignored and
+// Op controls how the children combine.
 
 // Op specifies how Children are combined. Ignored when len(Children) == 0.
 // LogicalAND (default): block must satisfy all children.
@@ -316,26 +279,22 @@ func (p *Planner) planInternal(predicates []Predicate, timeRange TimeRange, enab
 	if len(predicates) == 0 {
 		plan.SelectedBlocks = setToSortedByScore(candidates, p.r, nil)
 		if enableExplain {
-			explainPlan(p.r, predicates, plan, timeBlocks)
+			explainPlan(predicates, plan, timeBlocks)
 		}
 		return plan
 	}
 
-	// Stage 1: Range index pruning — recursive tree evaluation, top-level predicates AND-combined.
-	// Pass total (the actual block count from BlockIndexer.BlockCount()) rather than
-	// candidates.numBlocks() (which returns len*64 — bitset capacity, not block count).
-	pruned, err := pruneByIndexAll(p.r, candidates, predicates, total)
-	if err == nil {
-		plan.PrunedByIndex += pruned
-	}
-
-	// NOTE(#435,#437): BinaryFuse8 sketch pruning and block scoring removed — the KLL
-	// sketch index was removed in #435 and file-level bloom in #437; ColumnSketch always
-	// returns nil so these stages were no-ops. Stage 2 (fuse pruning) and Stage 3 (score
-	// blocks by HLL cardinality) are gone; blocks are sorted by MinStart only.
+	// NOTE(#439): Range-index value pruning removed — the range index no longer
+	// exists in the data file (the value index is now the authoritative source for
+	// value-based pruning). Predicates only carry column-tree structure for explain
+	// output. Time-range pruning (Stage 0 above) remains the only in-planner pruning.
+	//
+	// NOTE(#435,#437): BinaryFuse8 sketch pruning and block scoring also removed — the
+	// KLL sketch index was removed in #435 and file-level bloom in #437. Blocks are
+	// sorted by MinStart only.
 	plan.SelectedBlocks = setToSortedByScore(candidates, p.r, nil)
 	if enableExplain {
-		explainPlan(p.r, predicates, plan, timeBlocks)
+		explainPlan(predicates, plan, timeBlocks)
 	}
 	return plan
 }
