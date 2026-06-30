@@ -57,23 +57,7 @@ type Reader struct {
 	// NOTE: v8ColStatsErr removed (2026-06-29, in-file block pruning removal).
 
 	// Range index removed in #439.
-
-	// intrinsicIndex holds the parsed TOC entries, keyed by column name.
-	// Populated by parseIntrinsicTOC during NewReaderFromProvider. Nil for
-	// v3 footer files or files with intrinsicIndexLen == 0.
-	intrinsicIndex map[string]shared.IntrinsicColMeta
-
-	// intrinsicKeyPrefix caches the fileID-derived prefix of every
-	// parsedIntrinsicCache key for this Reader (fileID + "/intrinsic/").
-	// NOTE-431: invariant across all intrinsic columns of one file, so it is
-	// built once at construction (whenever fileID is non-empty) instead of being
-	// re-concatenated per column lookup. Read-only after construction; see
-	// intrinsicCacheKey. Empty when fileID is empty (process cache disabled).
-	intrinsicKeyPrefix string
-
-	// intrinsicDecoded caches fully decoded intrinsic columns by name.
-	// Populated lazily by GetIntrinsicColumn. Protected by intrinsicMu.
-	intrinsicDecoded map[string]*shared.IntrinsicColumn
+	// IntrinsicTOC removed in #433/#436 — all columns are inner-block columns.
 
 	// preDecodedColumns holds LIVE decoded-column snapshots that
 	// readBlockColumnarWithCache observed already present in the process-level
@@ -190,10 +174,6 @@ func NewReaderFromProviderWithOptions(provider rw.ReaderProvider, opts Options) 
 		fileID:   opts.FileID,
 		fileSize: size,
 	}
-	// NOTE-431: precompute the invariant parsedIntrinsicCache key prefix once.
-	if r.fileID != "" {
-		r.intrinsicKeyPrefix = r.fileID + "/intrinsic/"
-	}
 
 	if err = r.readFooter(); err != nil {
 		return nil, fmt.Errorf("NewReaderFromProvider: %w", err)
@@ -234,10 +214,6 @@ func NewLeanReaderFromProviderWithOptions(provider rw.ReaderProvider, opts Optio
 		cache:    sc,
 		fileID:   opts.FileID,
 		fileSize: size,
-	}
-	// NOTE-431: precompute the invariant parsedIntrinsicCache key prefix once.
-	if r.fileID != "" {
-		r.intrinsicKeyPrefix = r.fileID + "/intrinsic/"
 	}
 
 	// I/O #1: read footer.

@@ -20,45 +20,29 @@ const (
 	traceIDByteLen = 16
 )
 
-// intrinsicRowFields holds per-row typed field values for predicate evaluation.
-// After #433 (IntrinsicTOC removal) and #436 (cleanup), these are populated from
-// block columns rather than the IntrinsicTOC.
+// intrinsicRowFields holds a row's identity fields, read from block columns.
+// NOTE-436: only the identity columns (trace:id/span:id/span:parent_id) are carried
+// here for trace reconstruction in the structural scan; all predicate evaluation runs
+// directly against block columns via the column provider.
 type intrinsicRowFields struct {
-	spanName      string
-	serviceName   string
-	statusMessage string
-	spanStart     uint64
-	spanEnd       uint64
-	spanDuration  uint64
-	spanKind      int64
-	spanStatus    int64
-	spanID        [8]byte
-	parentID      [8]byte
-	present       uint16
-	traceID       [16]byte
+	spanID   [8]byte
+	parentID [8]byte
+	present  uint16
+	traceID  [16]byte
 }
 
 func getIntrinsicRowFields(n int) []intrinsicRowFields {
 	if n <= 0 {
 		return nil
 	}
-	s := make([]intrinsicRowFields, n)
-	return s
+	return make([]intrinsicRowFields, n)
 }
 
 func putIntrinsicRowFields(_ []intrinsicRowFields) {} // no pool after #436
 
 // Presence bitmask constants for intrinsicRowFields.present.
 const (
-	intrinsicPresentTraceID       uint16 = 1 << iota // bit 0
-	intrinsicPresentSpanID                           // bit 1
-	intrinsicPresentParentID                         // bit 2
-	intrinsicPresentSpanName                         // bit 3
-	intrinsicPresentServiceName                      // bit 4
-	intrinsicPresentStatusMessage                    // bit 5
-	intrinsicPresentSpanStart                        // bit 6
-	intrinsicPresentSpanEnd                          // bit 7
-	intrinsicPresentSpanDuration                     // bit 8
-	intrinsicPresentSpanKind                         // bit 9
-	intrinsicPresentSpanStatus                       // bit 10
+	intrinsicPresentTraceID  uint16 = 1 << iota // bit 0
+	intrinsicPresentSpanID                      // bit 1
+	intrinsicPresentParentID                    // bit 2
 )

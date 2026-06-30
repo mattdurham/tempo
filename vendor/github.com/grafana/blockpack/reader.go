@@ -5,7 +5,6 @@ package blockpack
 // These are the core I/O primitives that storage backends and integrations build on.
 
 import (
-	"bytes"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -402,18 +401,12 @@ func GetTraceByID(r *Reader, traceIDHex string) (results []SpanMatch, err error)
 	// intrinsic fallback), so the materialization loop need not read a per-block span:id
 	// column for those rows.
 	rowsByBlock := make(map[int][]int, len(entries))
-	var spanIDByRef map[uint32][]byte
-	var blocksNeedingIntrinsic map[int]bool
 
-	// Scan each block's own trace:id column for matching rows; blocks lacking that column fall
-	// through to the intrinsic section.
+	// NOTE-436: each block carries its own trace:id column. Scan it for matching
+	// rows — there is no intrinsic-section fallback.
 	for i, entry := range entries {
 		traceIDCol := parsedBlocks[i].Block.GetColumn("trace:id")
 		if traceIDCol == nil {
-			if blocksNeedingIntrinsic == nil {
-				blocksNeedingIntrinsic = make(map[int]bool, len(entries))
-			}
-			blocksNeedingIntrinsic[entry.BlockID] = true
 			continue
 		}
 		// NOTE-419: MatchingBytesRows scans the per-block trace:id column for matching rows
@@ -423,21 +416,6 @@ func GetTraceByID(r *Reader, traceIDHex string) (results []SpanMatch, err error)
 			traceID[:],
 			rowsByBlock[entry.BlockID],
 		)
-	}
-
-	// Lazy fallback: only files whose blocks lack a trace:id column pay the whole-file
-	// intrinsic reads. For current files this is never taken.
-	if len(blocksNeedingIntrinsic) > 0 {
-		fallbackRows, fbErr := intrinsicFallbackRows(r, traceID, blocksNeedingIntrinsic)
-		if fbErr != nil {
-			return nil, fbErr
-		}
-		for bid, rows := range fallbackRows {
-			rowsByBlock[bid] = append(rowsByBlock[bid], rows...)
-		}
-		// span:id for fallback blocks comes from the intrinsic section. This is the only
-		// source of resolved span IDs now that the SpanTree fast path is gone (#434).
-		spanIDByRef = buildIntrinsicBytesMapForRows(r, "span:id", fallbackRows)
 	}
 
 	traceIDStr := hex.EncodeToString(traceID[:])
@@ -451,21 +429,11 @@ func GetTraceByID(r *Reader, traceIDHex string) (results []SpanMatch, err error)
 				rowIdx,
 				nil,
 			)
-			// span:id: prefer the ref map (resolved from the intrinsic fallback), which is
-			// authoritative and does not depend on a per-block span:id column being present.
-			// Fall back to the block column only when no ref entry exists.
+			// span:id is a regular per-row block column.
 			spanIDStr := ""
-			if spanIDByRef != nil {
-				key := uint32(entry.BlockID)<<16 | uint32(rowIdx) //nolint:gosec // bounded values
-				if v, ok := spanIDByRef[key]; ok {
+			if col := bwb.Block.GetColumn("span:id"); col != nil {
+				if v, ok := col.BytesValue(rowIdx); ok {
 					spanIDStr = hex.EncodeToString(v)
-				}
-			}
-			if spanIDStr == "" {
-				if col := bwb.Block.GetColumn("span:id"); col != nil {
-					if v, ok := col.BytesValue(rowIdx); ok {
-						spanIDStr = hex.EncodeToString(v)
-					}
 				}
 			}
 			match := SpanMatch{
@@ -479,32 +447,6 @@ func GetTraceByID(r *Reader, traceIDHex string) (results []SpanMatch, err error)
 	}
 
 	return results, nil
-}
-
-// intrinsicFallbackRows loads the whole-file intrinsic trace:id column and returns the rows
-// matching traceID, scoped to wantBlocks. It is the NOTE-293 fallback for blocks whose payload
-// lacks a per-block trace:id column; current files never reach it.
-func intrinsicFallbackRows(r *Reader, traceID [16]byte, wantBlocks map[int]bool) (map[int][]int, error) {
-	if tocErr := r.EnsureIntrinsicTOC(); tocErr != nil {
-		return nil, fmt.Errorf("GetTraceByID: load intrinsic TOC: %w", tocErr)
-	}
-	col, traceColErr := r.GetIntrinsicColumn("trace:id")
-	if traceColErr != nil {
-		return nil, fmt.Errorf("GetTraceByID: load intrinsic trace:id: %w", traceColErr)
-	}
-	rows := make(map[int][]int)
-	if col == nil {
-		return rows, nil
-	}
-	for i, ref := range col.BlockRefs {
-		if !wantBlocks[int(ref.BlockIdx)] {
-			continue
-		}
-		if i < len(col.BytesValues) && bytes.Equal(col.BytesValues[i], traceID[:]) {
-			rows[int(ref.BlockIdx)] = append(rows[int(ref.BlockIdx)], int(ref.RowIdx))
-		}
-	}
-	return rows, nil
 }
 
 // parseMatchingBlocks decodes each matching span-block concurrently (NOTE-291). Each

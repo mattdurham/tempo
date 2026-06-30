@@ -28,14 +28,14 @@ import (
 	"github.com/grafana/blockpack/internal/vm"
 )
 
-// SetIntrinsicCacheBytes sets the byte budget for the process-level decoded intrinsic
-// column cache (trace:id, span:id, span:duration etc.). Must be called before the first
-// query. Pass 0 to use the default (20% of GOMEMLIMIT, or 256 MiB).
+// SetProcessCacheBytes sets the byte budget for the process-level decoded-column caches.
+// Must be called before the first query. Pass 0 to use the default (20% of GOMEMLIMIT,
+// or 256 MiB).
 //
 // Querier processes should set this to 256-512 MiB. The default 20% of GOMEMLIMIT is
 // generous for compaction workers but excessive for queriers with large memory limits.
-func SetIntrinsicCacheBytes(n int64) {
-	modules_reader.SetIntrinsicCacheBytes(n)
+func SetProcessCacheBytes(n int64) {
+	modules_reader.SetProcessCacheBytes(n)
 }
 
 // AGENT: Query execution - this is the main public API for querying.

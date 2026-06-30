@@ -7,19 +7,13 @@ package writer
 // The legacy bytes selector (encoding_select.go isIDColumn/isURLColumn) dispatched purely on the
 // column NAME suffix with zero inspection of the actual values: customer.duration_id forced XOR
 // onto a duration value, config.file.path forced Prefix onto paths with no shared prefix. This
-// file replaces that name-suffix dispatch with a two-tier system:
+// file replaces that name-suffix dispatch with cost-based selection:
 //
-//  1. Tier 1 — semantic overrides (shared.SemanticBytesOverride): a small, deliberate allow-list
-//     of intrinsic columns (trace:id, span:id, ...) whose best encoding is known a-priori. Only
-//     intrinsic names are eligible; user attribute names never match.
-//  2. Tier 2 — cost-based selection: a single streaming stats pass over the present values, then
-//     a pure cost estimate (estimated wire bytes) per candidate encoding family; the cheapest
-//     wins. The demoted name-suffix heuristics (isIDColumn/isURLColumn) survive only as a tiebreak
-//     hint when the two cheapest estimates are within bytesCostTiebreakFraction of each other.
-
-import (
-	"github.com/grafana/blockpack/internal/modules/blockio/shared"
-)
+// NOTE-436: all columns (intrinsic and attribute alike) are selected identically by a single
+// streaming stats pass over the present values, then a pure cost estimate (estimated wire bytes)
+// per candidate encoding family; the cheapest wins. The demoted name-suffix heuristics
+// (isIDColumn/isURLColumn) survive only as a tiebreak hint when the two cheapest estimates are
+// within bytesCostTiebreakFraction of each other.
 
 // bytesCostTiebreakFraction: when the best two cost estimates are within this fraction of each
 // other the decision is a near-tie, so the demoted name-suffix hint (isIDColumn/isURLColumn) is
@@ -231,30 +225,18 @@ func estimatePrefixBytesCost(st bytesStats) int {
 
 // pickBytesEncoding selects the dense bytes encoding family for a column.
 //
-// Tier 1: semantic override (intrinsic columns only). Tier 2: cheapest cost estimate, with the
-// demoted name-suffix hint breaking near-ties (within bytesCostTiebreakFraction).
+// NOTE-436: every column is selected by the cost estimate, with the demoted name-suffix
+// hint breaking near-ties (within bytesCostTiebreakFraction). There is no
+// intrinsic-column semantic override — all columns are treated identically.
 func pickBytesEncoding(name string, st bytesStats) bytesEncoding {
-	// Tier 1 — semantic overrides for intrinsic columns.
-	switch shared.SemanticBytesOverride(name) {
-	case shared.SemanticBytesDeltaDictionary:
-		return bytesEncDeltaDictionary
-	case shared.SemanticBytesXOR:
-		return bytesEncXOR
-	case shared.SemanticBytesPrefix:
-		return bytesEncPrefix
-	case shared.SemanticBytesNone:
-		// fall through to cost-based selection
-	}
-
-	// Tier 2 — cost-based selection over the candidate families.
+	// Cost-based selection over the candidate families.
 	//
 	// DeltaDictionary is intentionally NOT a cost-based candidate: its only advantage over plain
 	// Dictionary is a delta-coded index stream, which shrinks bytes only when both the dictionary
 	// is sorted AND the per-row indexes are clustered (the sorted-trace-ID case). That property
 	// can't be established cheaply from the streaming stats, and assuming it (always crediting a
 	// smaller index stream) makes DeltaDictionary spuriously beat Dictionary on unsorted
-	// low-cardinality columns. It is therefore reachable only via the semantic-override table,
-	// where the sortedness is known a-priori.
+	// low-cardinality columns.
 	type cand struct {
 		enc   bytesEncoding
 		bytes int

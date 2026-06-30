@@ -210,22 +210,9 @@ func setBlockTimeRange(meta *backend.BlockMeta, data []byte) {
 		return
 	}
 
-	// PR #172 (dual-storage intrinsic format) stores span:start exclusively in
-	// the intrinsic section — it is no longer present in block columns. Read the
-	// time range from the intrinsic column, which is a sorted flat uint64 column:
-	// Uint64Values[0] is the minimum start time, Uint64Values[len-1] the maximum.
-	col, colErr := r.GetIntrinsicColumn("span:start")
-	if colErr == nil && col != nil && len(col.Uint64Values) > 0 {
-		minStart := col.Uint64Values[0]
-		maxStart := col.Uint64Values[len(col.Uint64Values)-1]
-		meta.StartTime = time.Unix(0, int64(minStart)) //nolint:gosec
-		meta.EndTime = time.Unix(0, int64(maxStart))   //nolint:gosec
-		meta.TotalRecords = 1
-		return
-	}
-
-	// Fallback: older format files store span:start in block columns and populate
-	// BlockMeta.MinStart / BlockMeta.MaxStart during compaction.
+	// blockpack #436: span:start is a regular per-row block column; the block time
+	// range is derived from BlockMeta.MinStart / BlockMeta.MaxStart, which the writer
+	// populates from the span:start column.
 	minStart := ^uint64(0)
 	var maxEnd uint64
 	for i := range r.BlockCount() {

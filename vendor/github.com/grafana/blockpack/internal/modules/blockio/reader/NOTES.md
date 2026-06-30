@@ -3424,3 +3424,13 @@ for timestamp ordering — its "KLL" name is legacy and unrelated to the column 
 **Back-ref:** `shared/constants.go` (retired subtype 2 / section 0x05),
 `reader/layout.go`, `reader/filelayoutreport.go`, `queryplanner/plan.go`, `queryplanner/planner.go`,
 `writer/writer.go`. Tests: `shared/toc_test.go`, `shared/format_v14_test.go`.
+
+## NOTE-436 — IntrinsicTOC reader surface removed (issue #436)
+
+`intrinsic_stub.go` (all the `GetIntrinsicColumn` / `HasIntrinsicSection` /
+`EnsureIntrinsicTOC` / `IntrinsicColumnNames` / `Intrinsic*At` stubs), the
+`parsedIntrinsicCache`, and the `Reader.intrinsicIndex` / `intrinsicDecoded` /
+`intrinsicKeyPrefix` fields are deleted. v2 files carry no `ToCSubTypeIntrinsic`
+entries, so the parser builds no intrinsic index. `SetIntrinsicCacheBytes` was renamed
+to `SetProcessCacheBytes` (it never sized an intrinsic cache that mattered — the V8
+column cache (NOTE-200) gets the full budget).

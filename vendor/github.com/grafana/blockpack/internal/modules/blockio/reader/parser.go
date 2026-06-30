@@ -14,11 +14,6 @@ import (
 	"github.com/grafana/blockpack/internal/modules/rw"
 )
 
-// parsedIntrinsicCache caches fully decoded IntrinsicColumn objects by
-// fileID+"/intrinsic/"+colName. Strong references: entries persist until Clear is called.
-// SPEC-OC-003, NOTE-003 (reader NOTES.md)
-var parsedIntrinsicCache objectcache.Cache[shared.IntrinsicColumn]
-
 // parsedV8ColumnCache caches fully decoded V8 block Column snapshots by
 // fileID+"/v8col/"+blockOffset+"/"+colName+"/"+colType. Strong references: entries
 // persist until Clear is called. NOTE-200: a Reader is created fresh per query (per
@@ -169,31 +164,17 @@ func (b *blockColTypes) SizeBytes() int64 {
 	return n + 32
 }
 
-// SetIntrinsicCacheBytes sets the byte budget for the process-level intrinsic column
-// cache. Must be called before the first GetIntrinsicColumn call.
-// Pass 0 to revert to the default (20% of GOMEMLIMIT, or 256 MiB fallback).
+// SetProcessCacheBytes sets the byte budget for the process-level decoded-column caches.
+// Must be called before the first query. Pass 0 to revert to the default (20% of
+// GOMEMLIMIT, or 256 MiB fallback).
 //
 // Callers should set a budget appropriate for the process role:
-//   - Queriers: 256-512 MiB (decoded intrinsic columns are short-lived per query)
+//   - Queriers: 256-512 MiB (decoded columns are short-lived per query)
 //   - Backend workers: default (compaction benefits from larger cache)
-func SetIntrinsicCacheBytes(n int64) {
-	// NOTE-371: the intrinsic and V8-column caches no longer share the same byte
-	// budget. NOTE-344 fixed a SizeBytes() bug that let the intrinsic cache balloon
-	// to ~9 GiB under a nominal 512 MiB budget; that it ran for so long without
-	// query failures showed most of what it held was never re-read before eviction
-	// would have happened anyway (the compressed bytes are always available from
-	// memcached, so a miss costs only a re-decode, not an extra round trip). The V8
-	// column cache (NOTE-200) is a separately-proven win on the warm columnar path,
-	// so it keeps the full budget while the intrinsic cache gets a smaller dedicated
-	// share. Splitting the lever lets the intrinsic footprint shrink without
-	// touching the V8 cache's hit rate. n <= 0 is passed through unchanged so the
-	// objectcache default (20% of GOMEMLIMIT) still applies to every cache.
-	intrinsicBytes := n
-	if n > 0 {
-		intrinsicBytes = n / 2
-	}
-	parsedIntrinsicCache.SetMaxBytes(intrinsicBytes)
-	// parsedIntrinsicTOCCache removed 2026-06-12 (legacy V4/V5/V6 format)
+func SetProcessCacheBytes(n int64) {
+	// NOTE-200: the V8 column cache is a proven win on the warm columnar path, so it
+	// keeps the full budget. n <= 0 is passed through unchanged so the objectcache
+	// default (20% of GOMEMLIMIT) applies to every cache.
 	parsedV8ColumnCache.SetMaxBytes(n)         // NOTE-200: proven warm-path win, full budget
 	blockColTypesCache.SetMaxBytes(n / 16)     // NOTE-214: name->type maps are tiny vs decoded columns
 	parsedTraceSparseCache.SetMaxBytes(n / 16) // NOTE-265: sparse trace-index samples are tiny
@@ -202,8 +183,6 @@ func SetIntrinsicCacheBytes(n int64) {
 
 // ClearCaches resets all process-level caches. Intended for testing.
 func ClearCaches() {
-	parsedIntrinsicCache.Clear()
-
 	parsedV8ColumnCache.Clear()
 	blockColTypesCache.Clear()
 	parsedTraceSparseCache.Clear()
@@ -418,7 +397,7 @@ func (r *Reader) fetchToCSection(key shared.ToCKey) ([]byte, error) {
 // parseSectionsV8 initializes the V8 reader by:
 // 1. Parsing the ToC blob to build r.tocMap.
 // 2. Eagerly loading the block index (required by all block-access methods).
-// 3. Populating r.intrinsicIndex from intrinsic ToCEntries (zero I/O; offsets only).
+// 3. (NOTE-436) no intrinsic index — all columns are inner-block columns.
 func (r *Reader) parseSectionsV8() error {
 	tocMap, signalType, err := r.parseV8ToCBlob()
 	if err != nil {
@@ -449,19 +428,8 @@ func (r *Reader) parseSectionsV8() error {
 		r.blockMetas = metas
 	}
 
-	// Intrinsic index: zero I/O — record offsets from ToC.
-	for key, e := range r.tocMap {
-		if key.Type == shared.ToCTypeMetadata && key.SubType == shared.ToCSubTypeIntrinsic {
-			if r.intrinsicIndex == nil {
-				r.intrinsicIndex = make(map[string]shared.IntrinsicColMeta)
-			}
-			r.intrinsicIndex[key.Name] = shared.IntrinsicColMeta{
-				Name:   key.Name,
-				Offset: e.Offset,
-				Length: e.Length,
-			}
-		}
-	}
+	// NOTE-436: v2 files have no IntrinsicTOC section — all columns are inner-block
+	// columns. No intrinsic index is built.
 
 	return nil
 }

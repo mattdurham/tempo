@@ -468,3 +468,80 @@ Back-refs:
 - `internal/modules/valueindex/traceindex.go` (TraceGroup, SpanEntry, EncodeTraceGroups,
   DecodeTraceGroups, MergeTraceGroups, AssembleTrace)
 - `internal/modules/blockio/shared/constants.go:ValueIndexTraceVersion`
+
+---
+
+## NOTE-VI-043 — v2 BucketGroup internal file format (issue #427)
+
+Date: 2026-06-30
+
+Defines the v2 on-disk/S3 value-index file format: time-bucketed, value-grouped posting
+lists. It replaces the flat per-span `Entry` row (entries.go, one row per span) with a
+structure that groups every span sharing a `(time_sec, canonical_value)` key under one
+`BucketGroup`, nesting spans beneath the data blocks that contain them. This deduplicates
+the `(value, time_sec)` key and the per-block `SourceRef`/`BlockRef` across the many spans
+that share them.
+
+This NOTE is the format definition only — the consumer write path (#429), the querier read
+path (#424), and migration (#425) are separate issues. The format is self-contained and
+exercised end-to-end by `bucketfile_test.go` / `bucketmerge_test.go`.
+
+### File layout (bucketfile.go)
+
+```
+[ File Header  ]   magic "VBG2"[4] + version[1]
+[ Block 0 ]        one block per (time/value) bucket-group set
+...
+[ Block N ]
+[ String Table ]   SourceRef dedup (reused from NOTE-VI-028 stringtable.go)
+[ Block Index  ]   one BlockDirEntry per block: comp_off/len + min/max time + min/max value
+[ Footer       ]   fixed 53 bytes: magic + block-index off/len + str-table off/len +
+                   file min/max time_sec + version
+```
+
+Min/max time live in the **footer** so the querier prunes whole files by time range with a
+ranged tail GET of only `BucketFooterSize` bytes — no body fetch (`DecodeBucketFooter` +
+`BucketFooter.OverlapsTimeRange`). Block directory offsets are file-absolute (shifted by the
+header length at encode time).
+
+### Block layout
+
+```
+MinTimeSec[8] MaxTimeSec[8]
+min_value_len[2] min_value[N]  max_value_len[2] max_value[N]
+bloom_len[4] bloom[N]            -- value bloom (bucketbloom.go)
+group_count[4]
+  BucketGroup (sorted time_sec ASC, value ASC):
+    time_sec[8] value_len[2] value[N] ref_count[2]
+      BucketBlockRef:
+        source_id[2] page_num[3] len_pages[2] span_count[2]
+          SpanRef: trace_id[16] idx_count[2] idx[2]*idx_count
+```
+
+Block payloads are snappy-compressed; the directory stores the compressed offset/len.
+
+### Value bloom (bucketbloom.go)
+
+Per-block bloom over canonical values (NOT trace IDs — that filter assumes 16-byte uniform
+input). Variable-length values are hashed with two independent FNV-1a passes (one salted +
+forced odd) and Kirsch-Mitzenmacher double hashing, k=7, ~10 bits/value, clamped
+[16 B, 1 MiB]. A negative `TestValueBloom` definitively skips the block; false positives only
+cost an unnecessary block read, never a wrong answer.
+
+### Compaction merge (bucketmerge.go)
+
+`MergeBucketFiles` merges any number of files into one single-block file: groups keyed by
+`(time_sec, value)`, refs keyed by `(SourceRef path, page)`, spans keyed by TraceID with
+span-index sets unioned/deduplicated. Each input file has its own string table, so SourceIDs
+are meaningful only relative to their file — the merge re-interns every SourceRef path into a
+fresh dense output table and rewrites the ids; `ErrStringTableOverflow` if > 65535 distinct
+sources (compaction must split). `SplitIntoBlocks` repartitions the merged single block into
+N blocks of `groupsPerBlock` each, recomputing per-block metadata + bloom. Metadata
+(min/max time/value, bloom) is always rebuilt via `BucketBlock.ComputeBlockMeta`.
+
+Back-refs:
+- `internal/modules/valueindex/bucketfile.go` (BucketFile/BucketBlock/BucketGroup/
+  BucketBlockRef/SpanRef, EncodeBucketFile, DecodeBucketFile)
+- `internal/modules/valueindex/bucketbloom.go` (ValueBloomSize, AddValueToBloom, TestValueBloom)
+- `internal/modules/valueindex/bucketmerge.go` (MergeBucketFiles, SplitIntoBlocks)
+- `internal/modules/valueindex/bucketquery.go` (DecodeBucketFooter, LookupValue, MayContainValue)

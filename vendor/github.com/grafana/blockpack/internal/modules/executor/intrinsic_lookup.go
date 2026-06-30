@@ -6,39 +6,7 @@ package executor
 
 import (
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
-	modules_shared "github.com/grafana/blockpack/internal/modules/blockio/shared"
 )
-
-// lookupIntrinsicFieldsTyped returns per-ref typed field values for predicate evaluation.
-// After #433/#434: IntrinsicTOC and SpanTree are gone; only block columns remain.
-// Returns an empty slice — callers fall through to block-column evaluation.
-func lookupIntrinsicFieldsTyped(
-	_ *modules_reader.Reader,
-	selected []modules_shared.BlockRef,
-	_ map[string]struct{},
-) ([]intrinsicRowFields, error) {
-	return getIntrinsicRowFields(len(selected)), nil
-}
-
-// lookupIntrinsicFieldsTypedForBlock returns per-row typed fields from block columns.
-func lookupIntrinsicFieldsTypedForBlock(
-	r *modules_reader.Reader,
-	blockIdx uint16,
-	spanCount int,
-	_ map[string]struct{},
-) ([]intrinsicRowFields, error) {
-	result := getIntrinsicRowFields(spanCount)
-	if r == nil || int(blockIdx) >= r.BlockCount() {
-		return result, nil
-	}
-	bwb, err := r.GetBlockWithBytes(int(blockIdx), nil)
-	if err != nil || bwb == nil {
-		// Graceful degradation: a block fetch failure yields empty identity fields
-		// (the caller falls back to block-column scan), not a hard query error.
-		return result, nil //nolint:nilerr // intentional: degrade to empty fields on fetch failure
-	}
-	return identityFieldsFromBlockColsTyped(bwb.Block, spanCount), nil
-}
 
 // identityFieldsFromBlockColsTyped reads identity fields from block payload columns.
 func identityFieldsFromBlockColsTyped(block *modules_reader.Block, n int) []intrinsicRowFields {

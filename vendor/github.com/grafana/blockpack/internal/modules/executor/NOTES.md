@@ -7086,3 +7086,36 @@ is purely additive (new exported func + two new `VILookupResult` fields).
 Back-ref: `internal/modules/executor/search_trace_vi.go:QueryTraceQLFromIndex`,
 `api.go:QueryTraceQLFromIndex`, `internal/modules/executor/metrics_trace.go:VILookupResult`.
 Tests: `search_trace_vi_test.go`, `api_test.go:TestQueryTraceQLFromIndex_Public*`.
+
+## NOTE-436 — intrinsic/attribute column distinction removed (issue #436)
+
+In v2 there is no concept of an "intrinsic" vs an "attribute" column. Every column —
+`span:name`, `span:start`, `resource.service.name`, `span.http.status_code` — is stored
+identically in inner blocks and queried identically. The two-tier classification system
+is gone.
+
+**What was removed (all dead since #433 stubbed `HasIntrinsicSection()`/`GetIntrinsicColumn()`
+to `false`/`nil`):**
+
++ The entire intrinsic-TOC query fast path: `collectFromIntrinsicRefs`,
+  `collectIntrinsicPlain/TopK/TopKKLL/TopKScan`, `collectWithBloomCheck`,
+  `BlockRefsFromIntrinsicTOC`, `blockRefsFromIntrinsicPartial`, `BlocksFromIntrinsicTOC`,
+  `evalNodeBlockRefs*`, `scanIntrinsicLeafRefs`, `intersectBlockRefSets`, the per-leaf
+  dict/flat ref scanners, `filterRowSetByIntrinsicNodes`, `lookupIntrinsicFields*`,
+  the match-all top-N fast path (`collectMatchAll*`), and the `errNeedBlockScan` sentinel.
++ `IsIntrinsicColumn` / `nilIntrinsicScan` — every `col == nil` branch in the block
+  column provider now uniformly returns "no rows match".
++ The structural-scan intrinsic-section pre-check (NOTE-447 RHS lazy gate,
+  `anySpanMatchesIntrinsicNodes`, `collectStructuralIntrinsicNodes`, `prepareIntrinsicNodes`,
+  `userAttrProgram`): the structural plan now eagerly fetches every predicate + identity
+  column and evaluates them directly against block columns.
++ `MatchedRow.IntrinsicFields` (always nil) and the reader-backed identity fallback in
+  `SpanMatchFromRow` / `SpanFieldsAdapter` / `FindTraceByID` / `query_traceql.go`.
++ `Plan.PrunedByIntrinsicTOC` and its OTel span attribute; in-file column pruning is now
+  owned entirely by the value-index pipeline.
+
+**What was kept:** the `traceIntrinsicColumns` / `traceIntrinsicStringColumns` /
+`logIntrinsicColumns` name sets survive as "well-known typed column" sets used for
+`span:end` synthesis (`ProgramWantColumns`) and string-typed query handling
+(`column_provider.go`) — they no longer drive any storage or fetch-path decision.
+`IntrinsicColumnName` (`spanmatch.go`) remains a pure `"span:" + name` string helper.

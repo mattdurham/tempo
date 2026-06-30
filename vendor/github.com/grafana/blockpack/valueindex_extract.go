@@ -75,24 +75,18 @@ func ExtractValueIndexEntries(
 	}
 
 	// span:start (nanoseconds) → per-ref second resolution for TimeSec. Built once
-	// up front from the intrinsic column so each yielded entry can be stamped.
-	_ = r.EnsureIntrinsicTOC()
+	// up front from the block column so each yielded entry can be stamped.
 	startSecByRef := buildSpanStartSecByRef(r)
 
-	// Per-block-index v2 file locator (NOTE-V2-002, issue #423). Built once so both
-	// phases can stamp each entry with the block's page-aligned file range without
+	// Per-block-index v2 file locator (NOTE-V2-002, issue #423). Built once so each
+	// entry can be stamped with the block's page-aligned file range without
 	// re-reading BlockMeta per entry.
 	blockRefByIdx := buildBlockRefByIdx(r)
 
-	// Phase 1 — per-block attribute + intrinsic columns. Track which column names
-	// were yielded so phase 2 only covers intrinsics this phase missed.
-	yielded := make(map[string]struct{})
-	if err := extractBlockColumns(r, denylist, startSecByRef, blockRefByIdx, yielded, yield); err != nil {
-		return err
-	}
-
-	// Phase 2 — IntrinsicTOC fallback for any intrinsic column phase 1 did not yield.
-	return extractIntrinsicColumns(r, denylist, startSecByRef, blockRefByIdx, yielded, yield)
+	// NOTE-436: all columns (intrinsic and attribute alike) are inner-block columns.
+	// A single per-block column walk yields every value — there is no IntrinsicTOC
+	// fallback phase.
+	return extractBlockColumns(r, denylist, startSecByRef, blockRefByIdx, yield)
 }
 
 // buildBlockRefByIdx precomputes the v2 page-aligned file locator (NOTE-V2-002) for
@@ -188,16 +182,14 @@ func buildSpanStartSecByRef(r *modules_reader.Reader) map[uint32]uint64 {
 	return m
 }
 
-// extractBlockColumns runs phase 1: parse each inner block one at a time and yield
-// every present value of every non-denied column it exposes. The set of column
-// names actually yielded is recorded in yielded so the IntrinsicTOC fallback skips
-// them.
+// extractBlockColumns parses each inner block one at a time and yields every present
+// value of every non-denied column it exposes. NOTE-436: this is the only extraction
+// path — all columns live in inner blocks.
 func extractBlockColumns(
 	r *modules_reader.Reader,
 	denylist map[string]struct{},
 	startSecByRef map[uint32]uint64,
 	blockRefByIdx []modules_shared.BlockFileRef,
-	yielded map[string]struct{},
 	yield func(ValueIndexEntry) error,
 ) error {
 	for bi := range r.BlockCount() {
@@ -233,7 +225,6 @@ func extractBlockColumns(
 				// columns now that the IntrinsicTOC is gone (#436); truncate ns→ms here so
 				// the value index keeps the cardinality reduction of NOTE-VI-027 (#415).
 				val = truncateTimeValueToMillis(colKey.Name, val)
-				yielded[colKey.Name] = struct{}{}
 				key := uint32(bi)<<16 | uint32(row) //nolint:gosec
 				var spanID [8]byte
 				if spanIDCol != nil {
@@ -257,116 +248,6 @@ func extractBlockColumns(
 		// block goes out of scope here — GC reclaims decoded column memory.
 	}
 	return nil
-}
-
-// extractIntrinsicColumns runs phase 2: for every non-denied IntrinsicTOC column
-// that phase 1 did NOT already yield (TOC-only files), yield each present value.
-func extractIntrinsicColumns(
-	r *modules_reader.Reader,
-	denylist map[string]struct{},
-	startSecByRef map[uint32]uint64,
-	blockRefByIdx []modules_shared.BlockFileRef,
-	yielded map[string]struct{},
-	yield func(ValueIndexEntry) error,
-) error {
-	for _, name := range r.IntrinsicColumnNames() {
-		if _, denied := denylist[name]; denied {
-			continue
-		}
-		if _, done := yielded[name]; done {
-			continue // already covered by the per-block phase
-		}
-		col, err := r.GetIntrinsicColumn(name)
-		if err != nil || col == nil {
-			continue
-		}
-		if err := yieldIntrinsicColumn(col, name, startSecByRef, blockRefByIdx, yield); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// yieldIntrinsicColumn yields every present value of one intrinsic column. Flat/
-// XOR/Delta columns store values positionally aligned with BlockRefs; Dict columns
-// store one value per dictionary entry, each carrying its own ref list.
-func yieldIntrinsicColumn(
-	col *modules_shared.IntrinsicColumn,
-	name string,
-	startSecByRef map[uint32]uint64,
-	blockRefByIdx []modules_shared.BlockFileRef,
-	yield func(ValueIndexEntry) error,
-) error {
-	emit := func(ref modules_shared.BlockRef, val any) error {
-		key := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx)
-		var blockRef valueindex.BlockRef
-		if int(ref.BlockIdx) < len(blockRefByIdx) {
-			fr := blockRefByIdx[ref.BlockIdx]
-			blockRef = valueindex.BlockRef{PageNum: fr.Page, LenPages: fr.Length}
-		}
-		return yield(ValueIndexEntry{
-			ColName:  name,
-			Value:    truncateTimeValueToMillis(name, val),
-			ColType:  col.Type,
-			BlockRef: blockRef,
-			TimeSec:  startSecByRef[key],
-		})
-	}
-
-	switch col.Format {
-	case modules_shared.IntrinsicFormatDict:
-		isInt := col.Type == modules_shared.ColumnTypeInt64 ||
-			col.Type == modules_shared.ColumnTypeRangeInt64
-		for _, entry := range col.DictEntries {
-			var val any
-			if isInt {
-				val = entry.Int64Val
-			} else {
-				val = entry.Value
-			}
-			for _, ref := range entry.BlockRefs {
-				if err := emit(ref, val); err != nil {
-					return err
-				}
-			}
-		}
-	case modules_shared.IntrinsicFormatFlat,
-		modules_shared.IntrinsicFormatXORBytes,
-		modules_shared.IntrinsicFormatDeltaUint64:
-		col.EnsureBlockRefs()
-		for i, ref := range col.BlockRefs {
-			val, ok := flatIntrinsicValueAt(col, i)
-			if !ok {
-				continue
-			}
-			if err := emit(ref, val); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-// flatIntrinsicValueAt returns the typed value of the i-th ref of a Flat/XOR/Delta
-// intrinsic column (value arrays are positionally aligned with BlockRefs[i]).
-func flatIntrinsicValueAt(col *modules_shared.IntrinsicColumn, i int) (any, bool) {
-	switch col.Type {
-	case modules_shared.ColumnTypeString, modules_shared.ColumnTypeRangeString,
-		modules_shared.ColumnTypeBytes, modules_shared.ColumnTypeRangeBytes:
-		if i < len(col.BytesValues) {
-			return col.BytesValues[i], true
-		}
-	case modules_shared.ColumnTypeInt64, modules_shared.ColumnTypeRangeInt64,
-		modules_shared.ColumnTypeRangeDuration:
-		if i < len(col.Uint64Values) {
-			return int64(col.Uint64Values[i]), true //nolint:gosec // stored two's-complement
-		}
-	case modules_shared.ColumnTypeUint64, modules_shared.ColumnTypeRangeUint64:
-		if i < len(col.Uint64Values) {
-			return col.Uint64Values[i], true
-		}
-	}
-	return nil, false
 }
 
 // blockColumnValueAt returns the typed value at row of a parsed block column, or

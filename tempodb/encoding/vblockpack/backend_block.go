@@ -122,11 +122,10 @@ func ConfigureCacheTiered(filePath string, fileMaxBytes int64, dataMemServers, m
 	blockpackCacheCfg.metadataMemServers = metadataMemServers
 	blockpackCacheCfg.memoryCacheBytes = memoryCacheBytes
 
-	// Cap the decoded intrinsic column cache to 512 MiB for query processes.
-	// The default (20% of GOMEMLIMIT) allows up to ~8.8GB on a 44GB pod, matching
-	// what we measured in heap profiles (6.58GB inuse from parsedIntrinsicCache).
+	// Cap the process-level decoded-column caches to 512 MiB for query processes.
+	// The default (20% of GOMEMLIMIT) allows up to ~8.8GB on a 44GB pod.
 	// Parquet querier Go heap: 161MB. This brings blockpack closer to parity.
-	blockpack.SetIntrinsicCacheBytes(512 << 20) // 512 MiB
+	blockpack.SetProcessCacheBytes(512 << 20) // 512 MiB
 }
 
 // ConfigureFileCache is a deprecated wrapper around ConfigureCache retained for backward compatibility.

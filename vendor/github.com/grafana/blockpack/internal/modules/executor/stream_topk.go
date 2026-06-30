@@ -113,37 +113,6 @@ func topKScanRows(
 	}
 }
 
-// topKScanRowsFromIntrinsic is the fallback for topKScanRows when the timestamp column
-// is not stored in block columns (intrinsic-only storage format). It reads per-row
-// timestamps directly from the reader's intrinsic section.
-func topKScanRowsFromIntrinsic(
-	buf *topKHeap,
-	limit int,
-	backward bool,
-	r *modules_reader.Reader,
-	block *modules_reader.Block,
-	blockIdx int,
-	tsColName string,
-	timeRange queryplanner.TimeRange,
-	rowIndices []int,
-) {
-	for _, rowIdx := range rowIndices {
-		ts, ok := r.IntrinsicUint64At(tsColName, blockIdx, rowIdx)
-		if !ok {
-			continue
-		}
-		if timeRange.MinNano > 0 && ts < timeRange.MinNano {
-			continue
-		}
-		if timeRange.MaxNano > 0 && ts > timeRange.MaxNano {
-			continue
-		}
-		topKInsert(buf, limit, backward, topKEntry{
-			ts: ts, blockIdx: blockIdx, rowIdx: rowIdx, block: block,
-		})
-	}
-}
-
 // topKScanBlocks iterates selected blocks concurrently via blockGroupPipeline and fills buf.
 // Returns (fetchedGroups, processedBlocks, bytesRead, error): fetchedGroups counts ReadGroup
 // calls (IOOps); processedBlocks counts individual blocks that passed the topKSkipBlock guard.
@@ -236,12 +205,8 @@ func topKScanBlocks(
 				}
 			}
 
-			tsCol := bwb.Block.GetColumn(opts.TimestampColumn)
-			if tsCol == nil {
-				// Timestamp column absent from block (intrinsic-only format): read from intrinsic section.
-				topKScanRowsFromIntrinsic(buf, opts.Limit, backward, r, bwb.Block, blockIdx,
-					opts.TimestampColumn, opts.TimeRange, rowSet.ToSlice())
-			} else {
+			// NOTE-436: the timestamp column is a regular per-row block column.
+			if tsCol := bwb.Block.GetColumn(opts.TimestampColumn); tsCol != nil {
 				topKScanRows(buf, opts.Limit, backward, bwb.Block, blockIdx, tsCol, opts.TimeRange, rowSet.ToSlice())
 			}
 			releaseBlockColumnProvider(provider)

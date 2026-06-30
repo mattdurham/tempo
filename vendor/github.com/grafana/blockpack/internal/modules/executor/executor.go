@@ -13,13 +13,6 @@ package executor
 
 // NOTE: Any changes to this file must be reflected in the corresponding specs.md or NOTES.md.
 
-import (
-	"fmt"
-
-	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
-	modules_shared "github.com/grafana/blockpack/internal/modules/blockio/shared"
-)
-
 // SpanMatch is a span that matched the query.
 
 // block containing this span; populated by structural executor
@@ -43,76 +36,24 @@ import (
 // 0 means no sub-file sharding (scan all blocks selected by the planner).
 
 // SpanMatchFromRow extracts a SpanMatch from a MatchedRow by reading the "trace:id"
-// and "span:id" identity columns.
+// and "span:id" identity columns directly from the decoded block.
 //
-// r is the Reader used to look up trace identity fields from the intrinsic section when
-// row.IntrinsicFields is nil and the columns are not present in the decoded Block.
-//
-// Supports both row representations:
-//   - IntrinsicFields-populated rows (range-predicate Case A, Case B): reads from IntrinsicFields.
-//   - Block-populated rows (block-scan path): reads from Block columns, then falls back
-//     to intrinsic section via r when trace identity columns are absent from the Block.
-func SpanMatchFromRow(row MatchedRow, r *modules_reader.Reader) (SpanMatch, error) {
+// NOTE-436: identity columns are regular per-row block columns; there is no intrinsic
+// section to fall back to.
+func SpanMatchFromRow(row MatchedRow) (SpanMatch, error) {
 	m := SpanMatch{BlockIdx: row.BlockIdx, RowIdx: row.RowIdx}
 
 	const traceIDCol = "trace:id"
 	const spanIDCol = "span:id"
 
-	if row.IntrinsicFields != nil {
-		// Range-predicate Case A and Case B: IDs are in the IntrinsicFields map.
-		if v, ok := row.IntrinsicFields.GetField(traceIDCol); ok {
-			if b, ok := v.([]byte); ok && len(b) == 16 {
-				copy(m.TraceID[:], b)
-			}
-		}
-		if v, ok := row.IntrinsicFields.GetField(spanIDCol); ok {
-			if b, ok := v.([]byte); ok {
-				m.SpanID = make([]byte, len(b))
-				copy(m.SpanID, b)
-			}
-		}
-		return m, nil
-	}
-
 	if row.Block == nil {
 		return m, nil
 	}
 
-	// Block-scan path: try to read from decoded Block columns first.
-	// PATTERN: block-column-first with intrinsic-section fallback (shared across
-	// compaction/compaction.go, writer/writer.go, executor.go, executor/metrics_trace.go).
-	// Current files store trace:id and span:id BOTH as per-row block columns and in the
-	// intrinsic section; read the block column first (no extra I/O — the block is decoded
-	// already) and fall back to the intrinsic section only when a block lacks the column.
 	if col := row.Block.GetColumn(traceIDCol); col != nil {
 		if v, ok := col.BytesValue(row.RowIdx); ok && len(v) == 16 {
 			copy(m.TraceID[:], v)
 		}
-	} else if r != nil {
-		// Block lacks the identity column: look it up via the intrinsic section.
-		spanRef := modules_shared.BlockRef{
-			BlockIdx: uint16(row.BlockIdx), //nolint:gosec
-			RowIdx:   uint16(row.RowIdx),   //nolint:gosec
-		}
-		idCols := map[string]struct{}{traceIDCol: {}, spanIDCol: {}}
-		fieldMaps, intrinsicErr := lookupIntrinsicFields(r, []modules_shared.BlockRef{spanRef}, idCols)
-		if intrinsicErr != nil {
-			return m, fmt.Errorf("SpanMatchFromRow lookupIntrinsicFields: %w", intrinsicErr)
-		}
-		if len(fieldMaps) > 0 && fieldMaps[0] != nil {
-			if v, ok := fieldMaps[0][traceIDCol]; ok {
-				if b, ok := v.([]byte); ok && len(b) == 16 {
-					copy(m.TraceID[:], b)
-				}
-			}
-			if v, ok := fieldMaps[0][spanIDCol]; ok {
-				if b, ok := v.([]byte); ok {
-					m.SpanID = make([]byte, len(b))
-					copy(m.SpanID, b)
-				}
-			}
-		}
-		return m, nil
 	}
 
 	if col := row.Block.GetColumn(spanIDCol); col != nil {

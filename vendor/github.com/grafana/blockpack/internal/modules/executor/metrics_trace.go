@@ -299,9 +299,6 @@ type blockMetricsCols struct {
 	fieldCol *modules_reader.Column
 	// groupByCols[i] is the resolved column for querySpec.Aggregate.GroupBy[i], or nil.
 	groupByCols []*modules_reader.Column
-	// useIntrinsicTS is true when span:start lives only in the intrinsic section (v4 files);
-	// when set, IntrinsicUint64At is used with the reader.
-	useIntrinsicTS bool
 }
 
 // resolveBlockMetricsCols resolves all per-block column pointers once for the row loop.
@@ -310,14 +307,8 @@ type blockMetricsCols struct {
 func resolveBlockMetricsCols(block *modules_reader.Block, querySpec *vm.QuerySpec) blockMetricsCols {
 	var c blockMetricsCols
 
-	// span:start resolution (block-column-first, intrinsic-section fallback). PATTERN shared
-	// across compaction/writer/executor: v3 files store identity columns in block payloads;
-	// v4 files store them exclusively in the intrinsic section.
-	if tsCol := block.GetColumn("span:start"); tsCol != nil {
-		c.tsCol = tsCol
-	} else {
-		c.useIntrinsicTS = true
-	}
+	// NOTE-436: span:start is a regular per-row block column.
+	c.tsCol = block.GetColumn("span:start")
 
 	groupBy := querySpec.Aggregate.GroupBy
 	if len(groupBy) > 0 {
@@ -368,23 +359,15 @@ func traceAccumulateRow(
 	}
 
 	// Read span:start for time bucketing (SPEC-ETM-7). NOTE-160: column resolved per-block.
-	var tsNanos int64
-	switch {
-	case cols.tsCol != nil:
-		tsVal, ok := cols.tsCol.Uint64Value(rowIdx)
-		if !ok {
-			return
-		}
-		tsNanos = int64(tsVal) //nolint:gosec
-	case cols.useIntrinsicTS && r != nil:
-		tsVal, ok := r.IntrinsicUint64At("span:start", blockIdx, rowIdx)
-		if !ok {
-			return
-		}
-		tsNanos = int64(tsVal) //nolint:gosec
-	default:
+	// NOTE-436: span:start is a regular per-row block column.
+	if cols.tsCol == nil {
 		return
 	}
+	tsVal, ok := cols.tsCol.Uint64Value(rowIdx)
+	if !ok {
+		return
+	}
+	tsNanos := int64(tsVal) //nolint:gosec
 
 	// Skip spans outside the query time window (SPEC-ETM-6).
 	// Intervals are right-closed: (StartTime, EndTime] — matches Tempo semantics.

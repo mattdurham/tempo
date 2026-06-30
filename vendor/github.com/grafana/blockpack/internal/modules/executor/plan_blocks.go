@@ -13,10 +13,9 @@ import (
 //  1. BuildPredicates — converts vm.Program predicates into planner predicates
 //  2. PlanWithOptions — applies time-range filtering
 //  3. fileLevelVectorPrune — VECTOR() centroid reject (when present)
-//  4. BlocksFromIntrinsicTOC intersection — intrinsic-column fast reject (when available)
 //
-// NOTE-036: All query paths (Collect, ExecuteTraceMetrics) must use planBlocks to
-// ensure intrinsic TOC pruning is active everywhere, not just in Collect.
+// NOTE-436: column-level block pruning is handled by the value-index pipeline
+// upstream; there is no in-file intrinsic-TOC pruning step.
 func planBlocks(
 	r *modules_reader.Reader,
 	program *vm.Program,
@@ -45,24 +44,8 @@ func planBlocks(
 		}
 	}
 
-	// Intersect with intrinsic-column TOC when available.
-	// Returns nil when no pruning is possible (no intrinsic section, no intrinsic
-	// predicates, or all blocks survive), so we skip the intersection step in that case.
-	if intrinsicBlocks := BlocksFromIntrinsicTOC(r, program); intrinsicBlocks != nil {
-		beforeIntrinsic := len(plan.SelectedBlocks)
-		keepSet := make(map[int]struct{}, len(intrinsicBlocks))
-		for _, bi := range intrinsicBlocks {
-			keepSet[bi] = struct{}{}
-		}
-		filtered := plan.SelectedBlocks[:0]
-		for _, bi := range plan.SelectedBlocks {
-			if _, ok := keepSet[bi]; ok {
-				filtered = append(filtered, bi)
-			}
-		}
-		plan.SelectedBlocks = filtered
-		plan.PrunedByIntrinsicTOC = beforeIntrinsic - len(plan.SelectedBlocks) // NOTE-449
-	}
+	// NOTE-436: intrinsic-TOC block pruning removed — there is no intrinsic section.
+	// All column-level block pruning is now done by the value-index pipeline upstream.
 
 	// NOTE: ColStats block pruning removed (2026-06-29, in-file block pruning removal).
 	// Value index is now the authoritative source for pruning.

@@ -82,57 +82,17 @@ func streamFilterProgram(
 	if err != nil {
 		return stats, err
 	}
-	// Intrinsic ID maps are built lazily: only constructed on the first block-scan result
-	// row where the block columns lack trace:id / span:id. For dual-storage files (PR #174+)
-	// these columns are present in block payloads and the maps are never needed.
-	var traceIDByRef map[uint32][]byte
-	var spanIDByRef map[uint32][]byte
-	// Separate "attempted" flags prevent repeated calls to buildIntrinsicBytesMap when
-	// it returns nil (e.g. no intrinsic section). Without these flags, every row would
-	// re-invoke the expensive O(N) map-build path and still get nil back.
-	var traceIDMapAttempted bool
-	var spanIDMapAttempted bool
-	buildIDMaps := func() {
-		if !traceIDMapAttempted {
-			traceIDMapAttempted = true
-			traceIDByRef = buildIntrinsicBytesMap(r, "trace:id")
-		}
-		if !spanIDMapAttempted {
-			spanIDMapAttempted = true
-			spanIDByRef = buildIntrinsicBytesMap(r, "span:id")
-		}
-	}
-	// SPEC-ROOT-017: pass secondPassCols as wantCols to restrict intrinsic decoding
+	// SPEC-ROOT-017: pass secondPassCols as wantCols to restrict column decoding
 	wantCols := modules_executor.ComputeSecondPassCols(program, opts.SelectColumns)
 	for _, row := range rows {
-		var fields SpanFieldsProvider
-		var traceIDHex, spanIDHex string
-		var rawAdapter SpanFieldsProvider // tracked for pool release
-		if row.IntrinsicFields != nil {
-			// Intrinsic fast path — fields resolved from intrinsic columns, no block read.
-			fields = row.IntrinsicFields
-			if v, ok := fields.GetField("trace:id"); ok {
-				traceIDHex = hexEncodeField(v)
-			}
-			if v, ok := fields.GetField("span:id"); ok {
-				spanIDHex = hexEncodeField(v)
-			}
-		} else {
-			rawAdapter = modules_blockio.NewSpanFieldsAdapterWithReader(
-				row.Block, r, row.BlockIdx, row.RowIdx,
-				wantCols,
-			)
-			fields = rawAdapter
-			// For dual-storage blocks, trace:id and span:id are in block columns — extractIDs
-			// will find them there without using the fallback maps. Build maps lazily only on
-			// the first miss, avoiding the expensive O(N) buildIntrinsicBytesMap for new files.
-			if row.Block == nil ||
-				row.Block.GetColumn("trace:id") == nil ||
-				row.Block.GetColumn("span:id") == nil {
-				buildIDMaps()
-			}
-			traceIDHex, spanIDHex = extractIDs(row.Block, row.RowIdx, row.BlockIdx, traceIDByRef, spanIDByRef)
-		}
+		// NOTE-436: trace:id and span:id are regular per-row block columns — read
+		// them directly from the decoded block (no intrinsic-section fallback).
+		rawAdapter := modules_blockio.NewSpanFieldsAdapterWithReader(
+			row.Block, r, row.BlockIdx, row.RowIdx,
+			wantCols,
+		)
+		fields := rawAdapter
+		traceIDHex, spanIDHex := extractIDs(row.Block, row.RowIdx)
 		if len(opts.SelectColumns) > 0 {
 			fields = newFilteredSpanFields(fields, opts.SelectColumns)
 		}

@@ -1569,3 +1569,9 @@ through `compaction.Config.OmitIntrinsicTOC` so the v1→v2 rewrite pass (#425) 
 `internal/modules/blockio/compaction/config.go:Config.OmitIntrinsicTOC`,
 `internal/modules/blockio/writer/omit_intrinsic_toc_test.go`,
 `valueindex_extract_test.go:TestExtractValueIndexEntries_V2NoIntrinsicTOC`.
+
+## NOTE-436 — semantic bytes-encoding override removed (issue #436)
+
+`pickBytesEncoding` no longer consults `shared.SemanticBytesOverride` (a stub that always
+returned None after the intrinsic concept was removed). Every column — intrinsic-named or
+not — is selected by the same cost-based estimator with the demoted name-suffix tiebreak.
