@@ -1,0 +1,163 @@
+package blockpack
+
+// valueindex_l0write.go — synchronous in-process L0 value-index write path
+// (NOTE-VI-042, issue #464).
+//
+// The value-index pipeline was originally event-driven: a publisher emitted a
+// "create" event per block (NOTE-VI-015 #397), a Redis-Streams consumer ingested
+// those events and flushed time-windowed L0 files (NOTE-VI-016 #398). That path
+// requires a running Redis; when no Redis is configured the publisher is a Noop
+// and NO index files are ever written.
+//
+// WriteValueIndexL0 collapses extract → accumulate → flush → put into a single
+// synchronous call so the block-builder and compactor can index a block in-process
+// the moment it is written, with no broker. It reuses the exact extraction
+// (ExtractValueIndexEntries, NOTE-VI-018) and per-column writer (valueindex.Writer)
+// the consumer uses, so the on-disk file format and object-key layout are
+// byte-identical to the Redis path's output. The querier read path is unchanged.
+
+import (
+	"context"
+	"fmt"
+	"path"
+
+	"github.com/grafana/blockpack/internal/modules/valueindex"
+)
+
+// defaultL0IndexPrefix is the object-storage key prefix under which value-index
+// files are written when the caller passes an empty prefix. It must match the
+// consumer/compactor default ("indexes") so the synchronous and event-driven
+// write paths land in the same key space and the querier discovers both.
+const defaultL0IndexPrefix = "indexes"
+
+// ObjectPutter is the minimal object-storage write surface WriteValueIndexL0
+// needs: write a fully-formed value-index file to a key. blockpack.WritableStorage
+// satisfies it; tempo supplies an S3-backed implementation. It mirrors the
+// valueindexconsumer.ObjectPutter contract so the same store can serve both the
+// synchronous and event-driven write paths.
+type ObjectPutter interface {
+	Put(key string, data []byte) error
+}
+
+// l0Group accumulates entries for one (column-name, type) pair into a single
+// value-index writer. Keying by (name, type) — not name alone — keeps columns
+// that share a name but differ in type under distinct files: their value
+// encodings are not interchangeable (NOTE-VI-024, issue #409).
+type l0Group struct {
+	writer  valueindex.Writer
+	colName string
+	colType ColumnType
+}
+
+// WriteValueIndexL0 extracts every indexable (column, span) observation from r,
+// groups the observations by (column name, column type), and writes one L0 value
+// index file per group to store under:
+//
+//	<tenant>/<indexPrefix>/<colHash>/<typeName>/L0-<wallMinSec>-<wallMaxSec>-<id>.blockpack
+//
+// sourceRef is the backend object key of the source block (e.g.
+// "<tenant>/<block-id>/data.blockpack"); it is stamped on every entry so the
+// querier can open the source block from an index hit. The object-key layout and
+// file format are identical to the Redis-consumer write path (NOTE-VI-016), so
+// the querier read path needs no change.
+//
+// A nil reader or a block with no indexable columns writes nothing and returns
+// nil. Extraction or write errors are returned; the caller (block creation /
+// compaction) treats a value-index write failure as best-effort and must not fail
+// the block write on it — the index can always be rebuilt from the source block.
+func WriteValueIndexL0(r *Reader, store ObjectPutter, sourceRef, tenant, indexPrefix string) error {
+	if r == nil || store == nil {
+		return nil
+	}
+	if indexPrefix == "" {
+		indexPrefix = defaultL0IndexPrefix
+	}
+
+	// One writer per (column name, type). The map is keyed by name+type so a
+	// column observed as two distinct types lands in two separate files.
+	groups := make(map[string]*l0Group)
+	defer func() {
+		for _, g := range groups {
+			g.writer.Close()
+		}
+	}()
+
+	// nil denylist indexes every column (NOTE-VI-027, issue #414): the value index
+	// is policy-free; the querier decides which columns are useful at read time.
+	err := ExtractValueIndexEntries(r, nil, func(e ValueIndexEntry) error {
+		typeName := valueindex.ColTypeName(e.ColType)
+		if typeName == "" {
+			// Unindexable type (NOTE-VI-024): skip rather than bucket under an
+			// empty path segment.
+			return nil
+		}
+		key := e.ColName + "\x00" + typeName
+		g := groups[key]
+		if g == nil {
+			g = &l0Group{
+				writer:  valueindex.NewWriter(e.ColName, e.ColType),
+				colName: e.ColName,
+				colType: e.ColType,
+			}
+			groups[key] = g
+		}
+		// TraceID is not surfaced by ExtractValueIndexEntries (the extractor walks
+		// columns, not whole spans), so it is the zero value here. AddEntryV4/V2
+		// accept a zero TraceID; span identity (SpanID/RowIdx) and the page-aligned
+		// BlockRef are what the querier uses for direct addressing.
+		var traceID [16]byte
+		switch {
+		case e.BlockRef.PageNum > 0 || e.BlockRef.LenPages > 0:
+			if e.SpanID != ([8]byte{}) {
+				rowIdx := uint16(e.RowIdx) //nolint:gosec // RowIdx bounded by MaxBlockSpans ≤ 65534
+				return g.writer.AddEntryV4(e.Value, traceID, sourceRef, e.BlockRef, e.TimeSec, e.SpanID, rowIdx)
+			}
+			return g.writer.AddEntryV2(e.Value, traceID, sourceRef, e.BlockRef, e.TimeSec)
+		default:
+			return g.writer.AddEntry(e.Value, traceID, sourceRef, e.BlockID, e.TimeSec)
+		}
+	})
+	if err != nil {
+		return fmt.Errorf("blockpack: WriteValueIndexL0: extract: %w", err)
+	}
+
+	for _, g := range groups {
+		if err := flushAndPutL0(store, g, tenant, indexPrefix); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// flushAndPutL0 seals one group's value-index file and PUTs it under the
+// time-range-embedded key (NOTE-VI-030, #431) so the querier can discover it by
+// wall-clock window without opening the file.
+func flushAndPutL0(store ObjectPutter, g *l0Group, tenant, indexPrefix string) error {
+	data, err := g.writer.Flush(context.Background(), 0)
+	if err != nil {
+		return fmt.Errorf("blockpack: WriteValueIndexL0: flush %q: %w", g.colName, err)
+	}
+	if len(data) == 0 {
+		return nil
+	}
+
+	// Embed the wall-clock time range in the filename for O(1) discovery
+	// (NOTE-VI-030). WallMinTS/WallMaxTS are already in seconds.
+	var wallMinSec, wallMaxSec uint64
+	if vr, rerr := valueindex.OpenReader(data); rerr == nil {
+		m := vr.Meta()
+		wallMinSec, wallMaxSec = m.WallMinTS, m.WallMaxTS
+	}
+
+	key := path.Join(
+		tenant,
+		indexPrefix,
+		valueindex.ColHash(g.colName),
+		valueindex.ColTypeName(g.colType),
+		valueindex.FormatFilenameV2(0, wallMinSec, wallMaxSec, valueindex.NewID()),
+	)
+	if err := store.Put(key, data); err != nil {
+		return fmt.Errorf("blockpack: WriteValueIndexL0: put %q: %w", key, err)
+	}
+	return nil
+}

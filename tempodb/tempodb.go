@@ -9,7 +9,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/grafana/blockpack/blockevents"
 	"github.com/grafana/tempo/pkg/collector"
 	"github.com/grafana/tempo/pkg/util"
 	"go.opentelemetry.io/otel/attribute"
@@ -267,13 +266,14 @@ func New(cfg *Config, cacheProvider cache.Provider, logger gkLog.Logger) (Reader
 	if cfg.Block != nil && cfg.Block.Blockpack.EmbeddingURL != "" {
 		vblockpack.ConfigureEmbedding(cfg.Block.Blockpack.EmbeddingURL, cfg.Block.Blockpack.EmbeddingConcurrentBatches, cfg.Block.Blockpack.EmbeddingBatchSize, cfg.Block.Blockpack.EmbeddingMaxTextLength)
 	}
-	if cfg.Block != nil && cfg.Block.Blockpack.BlockEvents.Enabled {
-		be := cfg.Block.Blockpack.BlockEvents
-		vblockpack.ConfigureBlockEvents(blockevents.Config{
-			Enabled:    be.Enabled,
-			RedisAddr:  be.RedisAddr,
-			StreamName: be.StreamName,
-		})
+	// Writer-side synchronous value-index write path (blockpack NOTE-VI-042,
+	// issue #464). On writer targets (block-builder, backend-worker) with S3, the
+	// block-builder and compactor write L0 value-index files after each flush.
+	// Disabled by default; the write path is a no-op when value_index_enabled is
+	// false. Replaces the old async block-events publish path (no Redis broker).
+	if cfg.Block != nil && cfg.Block.Blockpack.ValueIndexEnabled &&
+		cfg.Backend == backend.S3 && cfg.S3 != nil {
+		vblockpack.ConfigureValueIndex(true, cfg.S3, cfg.Block.Blockpack.ValueIndexPrefix)
 	}
 	// Querier-side index-driven query path (blockpack issue #461). Only when
 	// enabled and backed by S3 — the value index lives in the same bucket as the

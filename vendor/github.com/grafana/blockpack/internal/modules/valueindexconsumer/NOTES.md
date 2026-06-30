@@ -482,3 +482,28 @@ Removed:
 - `valueindexconsumer.RqliteConsumer` public type alias
 
 The Redis Streams consumer remains for operators who prefer the async pipeline.
+
+## NOTE-VI-042 — Synchronous in-process L0 write path (issue #464)
+
+Date: 2026-06-30
+
+The event-driven pipeline (publisher #397 → Redis consumer #398) only writes index
+files when a Redis broker is configured. With no Redis the publisher is a Noop and
+NO index files are ever written, silently disabling the whole value-index query path.
+
+`blockpack.WriteValueIndexL0(r, store, sourceRef, tenant, indexPrefix)` (top-level
+`valueindex_l0write.go`) collapses extract → accumulate → flush → put into one
+synchronous call. The block-builder and compactor call it the moment a block is
+written, with no broker. It reuses `ExtractValueIndexEntries` (NOTE-VI-018) and
+`valueindex.Writer`, so the on-disk file format AND the object-key layout
+(`<tenant>/<prefix>/<colHash>/<typeName>/L0-<min>-<max>-<id>.blockpack`,
+NOTE-VI-024/030) are byte-identical to the Redis path. The querier read path is
+unchanged.
+
+`blockpack.ObjectPutter` mirrors `valueindexconsumer.ObjectPutter` so one store
+serves both write paths. TraceID is the zero value (the extractor walks columns,
+not whole spans) — span identity (SpanID/RowIdx) + page-aligned BlockRef drive
+direct addressing, not TraceID. A write failure is returned for the caller to log
+but must NOT fail the block write: the index can always be rebuilt from the source.
+
+Back-refs: `valueindex_l0write.go`, `valueindex_extract.go` (ExtractValueIndexEntries).

@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Filter Query — Blockpack Interactive</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;background:#0F172A;color:#E2E8F0;overflow:hidden;height:100vh}
+
+/* Top bar */
+.bar{height:48px;background:#1E293B;border-bottom:1px solid #334155;display:flex;align-items:center;padding:0 24px;gap:16px}
+.bar a{color:#94A3B8;text-decoration:none;font-size:13px;transition:color .15s}
+.bar a:hover{color:#E2E8F0}
+.bar .title{color:#F8FAFC;font-weight:700;font-size:15px;flex:1}
+.bar .query-text{font-family:'Menlo','Consolas',monospace;font-size:12px;color:#93C5FD;background:#0F172A;padding:4px 12px;border-radius:6px;border:1px solid #334155;max-width:600px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bar kbd{font-size:11px;color:#64748B;background:#0F172A;padding:2px 6px;border-radius:4px;border:1px solid #334155;font-family:inherit}
+
+/* Main layout */
+.main{display:flex;height:calc(100vh - 48px)}
+
+/* Stages panel */
+.stages{width:280px;background:#1E293B;border-right:1px solid #334155;display:flex;flex-direction:column}
+.stages-title{font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#64748B;padding:16px 20px 8px}
+.stages-list{flex:1;overflow-y:auto;padding:0 0 12px}
+
+.stage{display:flex;align-items:flex-start;gap:12px;padding:10px 20px;cursor:pointer;transition:background .2s;position:relative}
+.stage:hover{background:#253347}
+.stage.active{background:#1E3A5F}
+.stage.active::before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;background:#3B82F6;border-radius:0 2px 2px 0}
+
+.stage-dot{width:28px;height:28px;border-radius:50%;background:#334155;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:#94A3B8;flex-shrink:0;transition:all .3s}
+.stage.active .stage-dot{background:#3B82F6;color:#fff;box-shadow:0 0 12px rgba(59,130,246,.4)}
+.stage.done .stage-dot{background:#10B981;color:#fff}
+
+.stage-text{flex:1;min-width:0}
+.stage-name{font-size:13px;font-weight:600;color:#CBD5E1;line-height:1.3}
+.stage.active .stage-name{color:#F8FAFC}
+.stage-meta{font-size:11px;color:#64748B;margin-top:2px}
+.stage.active .stage-meta{color:#60A5FA}
+
+/* Canvas — 50/50 split: blocks top, explanation bottom */
+.canvas{flex:1;display:flex;flex-direction:column;min-width:0}
+.canvas-top{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:0;padding:12px 20px}
+.canvas-bottom{flex:1;display:flex;flex-direction:column;min-height:0;border-top:1px solid #334155}
+
+.counter-bar{text-align:center;padding:0 0 8px;flex-shrink:0}
+.counter-num{font-size:42px;font-weight:800;color:#3B82F6;line-height:1;transition:color .3s}
+.counter-num.green{color:#10B981}
+.counter-label{font-size:13px;color:#94A3B8;margin-top:2px}
+.counter-sub{font-size:11px;color:#475569;margin-top:1px}
+
+.grid-area{display:flex;align-items:center;justify-content:center}
+.block-grid{display:grid;grid-template-columns:repeat(10,1fr);gap:4px}
+.block{width:30px;height:30px;border-radius:5px;background:#3B82F6;transition:all .5s cubic-bezier(.4,0,.2,1);position:relative;cursor:default}
+.block::after{content:attr(data-id);position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:8px;font-weight:600;color:rgba(255,255,255,.3);opacity:0;transition:opacity .2s}
+.block:hover::after{opacity:1}
+
+.block.pruned{background:#1E293B;border:1px solid #334155;transform:scale(.8);opacity:.3}
+.block.matched{background:#10B981;box-shadow:0 0 16px rgba(16,185,129,.5);transform:scale(1.05)}
+.block.reading{background:#F59E0B;box-shadow:0 0 16px rgba(245,158,11,.4);animation:pulse 1.2s ease-in-out infinite}
+.block.file-reject{background:#EF4444;opacity:.5;transform:scale(.85)}
+
+@keyframes pulse{0%,100%{transform:scale(1)}50%{transform:scale(1.08)}}
+
+/* Detail panel — fills bottom half */
+.detail{flex:1;background:#1E293B;padding:20px 32px;overflow-y:auto}
+.detail h3{font-size:15px;font-weight:700;color:#F8FAFC;margin-bottom:8px}
+.detail p{font-size:13px;color:#94A3B8;line-height:1.65;max-width:800px}
+.detail code{font-family:'Menlo','Consolas',monospace;font-size:12px;color:#93C5FD;background:#0F172A;padding:1px 5px;border-radius:3px}
+.detail a{color:#60A5FA;text-decoration:none}
+.detail a:hover{text-decoration:underline}
+.detail .stat{display:inline-block;background:#0F172A;border:1px solid #334155;border-radius:6px;padding:3px 10px;font-size:12px;font-weight:600;color:#F59E0B;margin-right:8px;margin-top:6px}
+
+/* Controls — pinned at bottom of canvas-bottom */
+.controls{display:flex;justify-content:center;gap:10px;padding:12px;background:#0F172A;border-top:1px solid #1E293B;flex-shrink:0}
+.btn{padding:8px 20px;border:1px solid #334155;border-radius:8px;background:#1E293B;color:#CBD5E1;font-size:13px;font-weight:500;cursor:pointer;transition:all .15s;font-family:inherit}
+.btn:hover{background:#253347;border-color:#475569;color:#F8FAFC}
+.btn:disabled{opacity:.3;cursor:not-allowed}
+.btn.primary{background:#3B82F6;border-color:#3B82F6;color:#fff}
+.btn.primary:hover{background:#2563EB}
+
+/* Responsive */
+@media(max-width:900px){
+  .stages{width:220px}
+  .block{width:32px;height:32px}
+  .bar .query-text{display:none}
+}
+@media(max-width:640px){
+  .stages{display:none}
+  .block{width:28px;height:28px}
+}
+</style>
+</head>
+<body>
+
+<div class="bar">
+  <a href="/query-filter">&larr; Back to docs</a>
+  <div class="title">Filter Query</div>
+  <div class="query-text">{ span.http.status_code = 500 &amp;&amp; resource.service.name = "frontend" }</div>
+  <kbd>&larr; &rarr;</kbd>
+</div>
+
+<div class="main">
+  <div class="stages">
+    <div class="stages-title">Pipeline Stages</div>
+    <div class="stages-list" id="stageList"></div>
+  </div>
+  <div class="canvas">
+    <div class="canvas-top">
+      <div class="counter-bar">
+        <div class="counter-num" id="counterNum">100</div>
+        <div class="counter-label" id="counterLabel">blocks in file</div>
+        <div class="counter-sub" id="counterSub"></div>
+      </div>
+      <div class="grid-area">
+        <div class="block-grid" id="grid"></div>
+      </div>
+    </div>
+    <div class="canvas-bottom">
+      <div class="detail" id="detail"></div>
+      <div class="controls">
+        <button class="btn" id="prevBtn" onclick="go(-1)">&larr; Prev</button>
+        <button class="btn" id="resetBtn" onclick="goTo(0)">Reset</button>
+        <button class="btn primary" id="playBtn" onclick="togglePlay()">&#9654; Play</button>
+        <button class="btn" id="nextBtn" onclick="go(1)">Next &rarr;</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const TOTAL = 100;
+
+// Which blocks get pruned at each pruning stage (indices 0-99)
+// Distributed visually for good effect
+const PRUNE_FILE_BLOOM = [2,7,9,13,18,24,29,35,40,46,51,57,62,68,73,79,84,90,95,98];
+const PRUNE_TIME = [0,1,3,4,5,6,8,10,11,12,14,15,16,17,19,20,21,22,23,25,26,27,28,30,31,32,33,34,36,37,38,39,41,42,43,44,45,47,48,49];
+const PRUNE_KLL = [50,52,53,54,55,56,58,59,60,61,63,64,65,66,67,69,70,71,72,74,75,76,77,78,80,81,82,83];
+const PRUNE_BLOOM = [85,86,87,88,89,92,93];
+const PRUNE_CMS = [94];
+const MATCH = [91,96,97,99];
+
+const STAGES = [
+  {
+    name: "All Blocks", meta: "100 blocks",
+    title: "Starting State",
+    desc: `100 blocks in this blockpack file. The query needs to find spans where <code>span.http.status_code = 500</code> AND <code>resource.service.name = "frontend"</code>. Without pruning, all 100 blocks would require storage I/O.`,
+    count: 100, label: "blocks in file", sub: ""
+  },
+  {
+    name: "Parse Query", meta: "100 blocks",
+    title: "1. Query Parse",
+    desc: `The TraceQL string is tokenized into a typed AST. The parser identifies a <strong>filter query</strong> with two conditions: equality on <code>span.http.status_code</code> and equality on <code>resource.service.name</code>. No blocks are touched yet.`,
+    count: 100, label: "blocks in file", sub: "AST built"
+  },
+  {
+    name: "VM Compile", meta: "100 blocks",
+    title: "2. VM Compilation",
+    desc: `The compiler walks the AST and produces two outputs: a <code>ColumnPredicate</code> closure (Go function for per-span evaluation at the end of the pipeline) and a <code>RangeNode</code> tree capturing every range/equality condition for block-level pruning. No data is accessed.`,
+    count: 100, label: "blocks in file", sub: "ColumnPredicate + RangeNode"
+  },
+  {
+    name: "Build Predicates", meta: "100 blocks",
+    title: "3. Predicate Building",
+    desc: `The <code>RangeNode</code> tree is wire-encoded into a <code>QueryPredicates</code> struct: <code>Ranges</code> for KLL interval matching, <code>BloomKeys</code> for bloom filter checking, <code>UnscopedColumnNames</code> for pushed-down pipeline predicates. <code>normalizeAttributePath()</code> maps TraceQL syntax to canonical column names.`,
+    count: 100, label: "blocks in file", sub: "QueryPredicates ready"
+  },
+  {
+    name: "File-Level Bloom", meta: "80 blocks",
+    title: "4a. File-Level Bloom (FBLM)",
+    desc: `The file-level BinaryFuse8 filter is checked for <code>resource.service.name = "frontend"</code>. This file passes (frontend exists), but <strong>20 blocks</strong> belong to segments with no "frontend" spans. In a multi-file query, entire files would be skipped if their FBLM rejects the service name &mdash; zero I/O. <span class="stat">-20 blocks</span>`,
+    count: 80, label: "blocks remaining", sub: "20% eliminated by file bloom"
+  },
+  {
+    name: "Time Range", meta: "40 blocks",
+    title: "4b. Time-Range Reject",
+    desc: `Each block carries <code>[MinNano, MaxNano]</code> timestamps. Blocks entirely outside the query's time window are dropped. Cheapest filter &mdash; purely metadata comparison with zero data access. <span class="stat">-40 blocks</span>`,
+    count: 40, label: "blocks remaining", sub: "50% outside time window"
+  },
+  {
+    name: "KLL Range Index", meta: "12 blocks",
+    title: "4c. KLL Range Index",
+    desc: `The <a href="/kll">KLL quantile sketch</a> built at write time derived ~1,000 bucket boundaries for <code>http.status_code</code>. Interval matching: only blocks assigned to buckets containing value 500 survive. Blocks where the entire status code range is below or above 500 are eliminated. <span class="stat">-28 blocks</span>`,
+    count: 12, label: "blocks remaining", sub: "70% have incompatible ranges"
+  },
+  {
+    name: "Block Bloom", meta: "5 blocks",
+    title: "4d. Block Bloom Filters",
+    desc: `Each block has a per-column <a href="/bloom-filter">BinaryFuse8 filter</a>. For each block: does <code>http.status_code</code> contain 500? Does <code>resource.service.name</code> contain "frontend"? Blocks definitively rejecting either value are dropped. ~0.39% false positive rate per check. <span class="stat">-7 blocks</span>`,
+    count: 5, label: "blocks remaining", sub: "58% lack queried value"
+  },
+  {
+    name: "CMS Zero-Prune", meta: "4 blocks",
+    title: "4e. CMS Zero-Estimate",
+    desc: `The <a href="/cms">Count-Min Sketch</a> provides frequency estimates. CMS estimate of zero = value <strong>definitively never added</strong> (CMS never undercounts). 1 block passed bloom (false positive at ~0.39%) but has CMS count of zero for "frontend" &mdash; safely eliminated. <span class="stat">-1 block</span>`,
+    count: 4, label: "blocks remaining", sub: "Bloom false positive caught"
+  },
+  {
+    name: "Block I/O + Eval", meta: "4 blocks read",
+    title: "5. Block I/O + Column Decode + Span Evaluation",
+    desc: `<strong>4 blocks</strong> survive all pruning. Each read via one <code>GetBlockWithBytes</code> call &mdash; single HTTP request per block to object storage. <code>parseBlockColumnsReuse</code> decodes only <code>http.status_code</code> and <code>service.name</code> columns. The <code>ColumnPredicate</code> closure evaluates per span row. Matching spans emitted via <code>SpanMatchCallback</code>. <span class="stat">96% eliminated before I/O</span>`,
+    count: 4, label: "blocks read", sub: "4 I/O ops instead of 100", green: true
+  }
+];
+
+// Build pruning schedule: block index -> stage index where it gets pruned
+const blockPruneStage = new Array(TOTAL).fill(-1);
+PRUNE_FILE_BLOOM.forEach(b => blockPruneStage[b] = 4);
+PRUNE_TIME.forEach(b => blockPruneStage[b] = 5);
+PRUNE_KLL.forEach(b => blockPruneStage[b] = 6);
+PRUNE_BLOOM.forEach(b => blockPruneStage[b] = 7);
+PRUNE_CMS.forEach(b => blockPruneStage[b] = 8);
+const matchSet = new Set(MATCH);
+
+let cur = 0;
+let playing = false;
+let timer = null;
+
+function init() {
+  const list = document.getElementById('stageList');
+  STAGES.forEach((s, i) => {
+    const el = document.createElement('div');
+    el.className = 'stage';
+    el.innerHTML = `<div class="stage-dot">${i}</div><div class="stage-text"><div class="stage-name">${s.name}</div><div class="stage-meta">${s.meta}</div></div>`;
+    el.onclick = () => goTo(i);
+    list.appendChild(el);
+  });
+
+  const grid = document.getElementById('grid');
+  for (let i = 0; i < TOTAL; i++) {
+    const el = document.createElement('div');
+    el.className = 'block';
+    el.dataset.id = i;
+    grid.appendChild(el);
+  }
+
+  render();
+}
+
+function render() {
+  const s = STAGES[cur];
+  const isLast = cur === STAGES.length - 1;
+
+  // Stages
+  document.querySelectorAll('.stage').forEach((el, i) => {
+    el.className = 'stage';
+    if (i < cur) el.classList.add('done');
+    if (i === cur) el.classList.add('active');
+  });
+
+  // Blocks
+  document.querySelectorAll('.block').forEach(el => {
+    const idx = parseInt(el.dataset.id);
+    el.className = 'block';
+    if (blockPruneStage[idx] !== -1 && blockPruneStage[idx] <= cur) {
+      el.classList.add('pruned');
+    } else if (matchSet.has(idx) && isLast) {
+      el.classList.add('matched');
+    }
+  });
+
+  // Counter
+  const num = document.getElementById('counterNum');
+  num.textContent = s.count;
+  num.className = 'counter-num' + (s.green ? ' green' : '');
+  document.getElementById('counterLabel').textContent = s.label;
+  document.getElementById('counterSub').textContent = s.sub;
+
+  // Detail
+  document.getElementById('detail').innerHTML = `<h3>${s.title}</h3><p>${s.desc}</p>`;
+
+  // Buttons
+  document.getElementById('prevBtn').disabled = cur === 0;
+  document.getElementById('nextBtn').disabled = cur === STAGES.length - 1;
+
+  // Scroll stage into view
+  const active = document.querySelector('.stage.active');
+  if (active) active.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+}
+
+function goTo(i) { cur = Math.max(0, Math.min(i, STAGES.length - 1)); render(); }
+function go(d) { goTo(cur + d); }
+
+function togglePlay() {
+  playing = !playing;
+  const btn = document.getElementById('playBtn');
+  if (playing) {
+    btn.innerHTML = '&#9646;&#9646; Pause';
+    tick();
+  } else {
+    btn.innerHTML = '&#9654; Play';
+    clearTimeout(timer);
+  }
+}
+
+function tick() {
+  if (!playing) return;
+  if (cur >= STAGES.length - 1) { togglePlay(); return; }
+  go(1);
+  timer = setTimeout(tick, 1800);
+}
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'ArrowRight' || e.key === ' ') { e.preventDefault(); go(1); }
+  if (e.key === 'ArrowLeft') { e.preventDefault(); go(-1); }
+  if (e.key === 'r') goTo(0);
+});
+
+init();
+</script>
+</body>
+</html>

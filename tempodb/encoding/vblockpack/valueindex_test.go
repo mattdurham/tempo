@@ -1,0 +1,157 @@
+package vblockpack
+
+// valueindex_test.go — tests for the writer-side synchronous value-index write
+// path (NOTE-VI-042, issue #464): the sink singleton and its integration into
+// CreateBlock. The S3 client construction is exercised by deployment, not unit
+// tested here; these tests inject a fake ObjectPutter directly (same-package).
+
+import (
+	"context"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	blockpack "github.com/grafana/blockpack"
+	tempopb "github.com/grafana/tempo/pkg/tempopb"
+	tempocommon "github.com/grafana/tempo/pkg/tempopb/common/v1"
+	temporesource "github.com/grafana/tempo/pkg/tempopb/resource/v1"
+	tempotrace "github.com/grafana/tempo/pkg/tempopb/trace/v1"
+	"github.com/grafana/tempo/tempodb/backend"
+	"github.com/grafana/tempo/tempodb/backend/local"
+	"github.com/grafana/tempo/tempodb/encoding/common"
+)
+
+// fakeVISink captures Put calls so a test can assert index files were written.
+type fakeVISink struct {
+	objs map[string][]byte
+	mu   sync.Mutex
+}
+
+func (f *fakeVISink) Put(key string, data []byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.objs == nil {
+		f.objs = map[string][]byte{}
+	}
+	cp := make([]byte, len(data))
+	copy(cp, data)
+	f.objs[key] = cp
+	return nil
+}
+
+// withVISink installs sink as the process-level value-index sink for the duration
+// of the test and restores the prior state on cleanup. The configure-once guard is
+// bypassed by setting the package vars directly (same-package test).
+func withVISink(t *testing.T, sink blockpack.ObjectPutter, prefix string) {
+	t.Helper()
+	valueIndexSinkMu.Lock()
+	prevSink, prevPrefix := valueIndexSink, valueIndexPrefix
+	valueIndexSink, valueIndexPrefix = sink, prefix
+	valueIndexSinkMu.Unlock()
+	t.Cleanup(func() {
+		valueIndexSinkMu.Lock()
+		valueIndexSink, valueIndexPrefix = prevSink, prevPrefix
+		valueIndexSinkMu.Unlock()
+	})
+}
+
+func TestGetValueIndexSink_DisabledByDefault(t *testing.T) {
+	// With nothing configured (and no prior test leaking state), the sink getter
+	// returns nil so create.go / compactor.go skip the index write entirely.
+	withVISink(t, nil, "")
+	store, prefix := getValueIndexSink()
+	assert.Nil(t, store)
+	assert.Empty(t, prefix)
+}
+
+func TestConfigureValueIndex_DisabledIsNoop(t *testing.T) {
+	withVISink(t, nil, "")
+	// enabled=false must not configure a sink even with a non-nil-looking config.
+	ConfigureValueIndex(false, nil, "indexes")
+	store, _ := getValueIndexSink()
+	assert.Nil(t, store, "disabled config must leave the sink unset")
+}
+
+func TestCreateBlock_WritesValueIndexL0(t *testing.T) {
+	sink := &fakeVISink{}
+	withVISink(t, sink, "indexes")
+
+	ctx := context.Background()
+	cfg := &common.BlockConfig{RowGroupSizeBytes: 100 * 1024 * 1024}
+
+	// Two traces with distinct service names so the index has a queryable column.
+	traceA := createTestTraceWithService([]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}, "svc-a")
+	traceB := createTestTraceWithService([]byte{2, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}, "svc-b")
+	iter := &mockIterator{
+		traces: []*tempopb.Trace{traceA, traceB},
+		ids:    [][]byte{{1}, {2}},
+	}
+
+	tempDir := t.TempDir()
+	rawR, rawW, _, err := local.New(&local.Config{Path: tempDir})
+	require.NoError(t, err)
+	r := backend.NewReader(rawR)
+	w := backend.NewWriter(rawW)
+	meta := backend.NewBlockMeta("test-tenant", uuid.New(), VersionString)
+
+	_, err = CreateBlock(ctx, cfg, meta, iter, r, w)
+	require.NoError(t, err)
+
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	require.NotEmpty(t, sink.objs, "CreateBlock must write at least one L0 value-index file")
+	for k := range sink.objs {
+		assert.True(t, strings.HasPrefix(k, "test-tenant/indexes/"),
+			"index key %q must be under <tenant>/<prefix>/", k)
+		assert.True(t, strings.HasSuffix(k, ".blockpack"), "index key %q must end .blockpack", k)
+	}
+}
+
+func TestCreateBlock_NoSinkWritesNoIndex(t *testing.T) {
+	withVISink(t, nil, "")
+
+	ctx := context.Background()
+	cfg := &common.BlockConfig{RowGroupSizeBytes: 100 * 1024 * 1024}
+	traceID := []byte{9, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+	iter := &mockIterator{
+		traces: []*tempopb.Trace{createTestTrace(traceID, 2)},
+		ids:    [][]byte{traceID},
+	}
+	tempDir := t.TempDir()
+	rawR, rawW, _, err := local.New(&local.Config{Path: tempDir})
+	require.NoError(t, err)
+	// Must complete cleanly with no panic and no index sink — byte-identical to
+	// the pre-#464 behaviour.
+	_, err = CreateBlock(ctx, cfg, backend.NewBlockMeta("t", uuid.New(), VersionString),
+		iter, backend.NewReader(rawR), backend.NewWriter(rawW))
+	require.NoError(t, err)
+}
+
+// createTestTraceWithService builds a single-span trace with a resource
+// service.name so the value index has a string column with distinct values.
+func createTestTraceWithService(traceID []byte, svc string) *tempopb.Trace {
+	now := uint64(time.Now().UnixNano())
+	svcAttr := &tempocommon.KeyValue{
+		Key:   "service.name",
+		Value: &tempocommon.AnyValue{Value: &tempocommon.AnyValue_StringValue{StringValue: svc}},
+	}
+	return &tempopb.Trace{
+		ResourceSpans: []*tempotrace.ResourceSpans{{
+			Resource: &temporesource.Resource{Attributes: []*tempocommon.KeyValue{svcAttr}},
+			ScopeSpans: []*tempotrace.ScopeSpans{{
+				Spans: []*tempotrace.Span{{
+					TraceId:           traceID,
+					SpanId:            []byte{1, 0, 0, 0, 0, 0, 0, 1},
+					Name:              "test-span",
+					StartTimeUnixNano: now,
+					EndTimeUnixNano:   now + 1_000_000,
+				}},
+			}},
+		}},
+	}
+}

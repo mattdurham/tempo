@@ -8,8 +8,10 @@ import (
 	"os"
 	"time"
 
+	"github.com/go-kit/log/level"
 	"github.com/google/uuid"
 	"github.com/grafana/blockpack"
+	util_log "github.com/grafana/tempo/pkg/util/log"
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/encoding/common"
 )
@@ -161,10 +163,21 @@ func CreateBlock(ctx context.Context, cfg *common.BlockConfig, meta *backend.Blo
 		return nil, fmt.Errorf("failed to write block metadata: %w", err)
 	}
 
-	// blockpack issue #397: publish a "create" event so downstream consumers
-	// (the value index builder) can index this block asynchronously. Non-blocking
-	// and best-effort — a NoopPublisher unless block events are configured.
-	publishBlockCreated(ctx, blockObjectKey(meta.TenantID, blockUUID.String()))
+	// blockpack NOTE-VI-042 (issue #464): synchronously write per-column L0
+	// value-index files for this block, with no Redis broker. Best-effort — a
+	// failure is logged but never fails the block write, since the index can
+	// always be rebuilt from the source block. Skipped entirely (no S3 client,
+	// no extra work) when value_index_enabled is false.
+	if store, prefix := getValueIndexSink(); store != nil {
+		if _, serr := tmp.Seek(0, io.SeekStart); serr == nil {
+			if r, rerr := blockpack.NewReaderFromProvider(&fileReaderProvider{f: tmp}); rerr == nil {
+				sourceRef := blockObjectKey(meta.TenantID, blockUUID.String())
+				if werr := blockpack.WriteValueIndexL0(r, store, sourceRef, meta.TenantID, prefix); werr != nil {
+					level.Warn(util_log.Logger).Log("msg", "vblockpack: value-index L0 write failed", "block", sourceRef, "err", werr)
+				}
+			}
+		}
+	}
 
 	return meta, nil
 }

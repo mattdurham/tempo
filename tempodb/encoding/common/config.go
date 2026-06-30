@@ -135,12 +135,6 @@ type BlockpackConfig struct {
 	// 256 MB in-process LRU cache is always on; set to 0 to disable.
 	MemoryCacheBytes int64 `yaml:"memory_cache_bytes"`
 
-	// BlockEvents configures publishing of blockpack lifecycle events to a queue
-	// (blockpack issue #397). Disabled by default. When enabled, a "create" event
-	// is published after each block is created or compacted so the value index
-	// builder can index it asynchronously.
-	BlockEvents BlockEventsConfig `yaml:"block_events"`
-
 	// ValueIndexConsumer configures the value-index consumer Tempo target
 	// (-target=value-index-consumer). Disabled by default.
 	ValueIndexConsumer ValueIndexConsumerConfig `yaml:"value_index_consumer"`
@@ -155,6 +149,20 @@ type BlockpackConfig struct {
 	// pruning, falling back to a full block scan when the index lacks coverage.
 	// Disabled by default; queriers opt in via value_index_query.enabled.
 	ValueIndexQuery ValueIndexQueryConfig `yaml:"value_index_query"`
+
+	// ValueIndexEnabled turns on the synchronous in-process value-index write path
+	// (blockpack NOTE-VI-042, issue #464). When true, the block-builder and
+	// compactor write L0 value-index files (blockpack.WriteValueIndexL0) to object
+	// storage after each block flush / compaction, with no Redis broker. Disabled
+	// by default. Must be enabled on writer targets (block-builder, backend-worker)
+	// for the querier's value_index_query path to have files to read.
+	ValueIndexEnabled bool `yaml:"value_index_enabled"`
+
+	// ValueIndexPrefix is the S3 key prefix under which the synchronous write path
+	// stores value-index files. It must match the querier's
+	// value_index_query.index_prefix and the compactor index_prefix
+	// (default: "indexes").
+	ValueIndexPrefix string `yaml:"value_index_prefix"`
 }
 
 // ValueIndexQueryConfig configures the querier-side index-driven query path.
@@ -167,17 +175,6 @@ type ValueIndexQueryConfig struct {
 	// CacheTTL is the refresh interval for the in-process index-file listing cache
 	// (blockpack issue #462). Zero uses the blockpack default (30s).
 	CacheTTL time.Duration `yaml:"cache_ttl"`
-}
-
-// BlockEventsConfig mirrors blockevents.Config. It is a separate Tempo struct so
-// the Tempo config does not depend on a blockpack type for YAML decoding.
-type BlockEventsConfig struct {
-	// Enabled turns on event publishing. When false no events are emitted.
-	Enabled bool `yaml:"enabled"`
-	// RedisAddr is the host:port of the Redis server backing the stream.
-	RedisAddr string `yaml:"redis_addr"`
-	// StreamName is the Redis stream key (default: "blockpack-events").
-	StreamName string `yaml:"stream_name"`
 }
 
 func (cfg *BlockConfig) RegisterFlagsAndApplyDefaults(prefix string, f *flag.FlagSet) {
@@ -232,6 +229,13 @@ func (cfg *BlockpackConfig) applyDefaults() {
 	}
 	if !cfg.EnableBitPacking {
 		cfg.EnableBitPacking = true
+	}
+	// Value-index write path (NOTE-VI-042, issue #464): default the prefix to
+	// "indexes" so it matches the querier's value_index_query.index_prefix and the
+	// compactor index_prefix when value_index_enabled is set without an explicit
+	// prefix.
+	if cfg.ValueIndexPrefix == "" {
+		cfg.ValueIndexPrefix = "indexes"
 	}
 }
 

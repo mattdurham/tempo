@@ -1,0 +1,55 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended"
+  ],
+  "labels": ["dependencies"],
+  "assignees": [],
+  "reviewers": [],
+  "schedule": [
+    "before 6am on Monday"
+  ],
+  "timezone": "America/New_York",
+  "prConcurrentLimit": 5,
+  "prHourlyLimit": 0,
+  "semanticCommits": "enabled",
+  "automerge": false,
+  "packageRules": [
+    {
+      "description": "Group Go modules updates",
+      "matchManagers": ["gomod"],
+      "groupName": "Go modules",
+      "automerge": false
+    },
+    {
+      "description": "Auto-merge Go patch updates",
+      "matchManagers": ["gomod"],
+      "matchUpdateTypes": ["patch"],
+      "automerge": false,
+      "labels": ["dependencies", "go", "patch"]
+    },
+    {
+      "description": "Auto-merge Go minor updates",
+      "matchManagers": ["gomod"],
+      "matchUpdateTypes": ["minor"],
+      "automerge": false,
+      "labels": ["dependencies", "go", "minor"]
+    },
+    {
+      "description": "GitHub Actions updates",
+      "matchManagers": ["github-actions"],
+      "groupName": "GitHub Actions",
+      "automerge": false,
+      "labels": ["dependencies", "github-actions"]
+    },
+    {
+      "description": "Pin GitHub Actions digests",
+      "matchManagers": ["github-actions"],
+      "pinDigests": true
+    }
+  ],
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "labels": ["security"]
+  }
+}

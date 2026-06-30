@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Production Results — Blockpack</title>
+  <link rel="stylesheet" href="/assets/css/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <a href="/" class="topbar-brand">Blockpack Docs</a>
+    <a href="https://github.com/grafana/blockpack" class="topbar-github">GitHub →</a>
+  </header>
+  <div class="layout">
+    <nav class="sidebar">
+  <div class="sidebar-brand">BLOCKPACK</div>
+  <div class="section-label">Overview</div>
+  <a href="/">Home</a>
+  <a href="/file-format">File Format</a>
+  <div class="section-label">Query Paths</div>
+  <a href="/query-filter">Filter Query</a>
+  <a href="/query-intrinsic">Intrinsic Fast-Path</a>
+  <a href="/query-traceid">Trace by ID</a>
+  <a href="/query-metrics">Metrics Query</a>
+  <div class="section-label">Write Path</div>
+  <a href="/write-path">Write Pipeline</a>
+  <div class="section-label">Indexes</div>
+  <a href="/kll">KLL Sketches</a>
+  <a href="/cms">Count-Min Sketch</a>
+  <a href="/topk">TopK</a>
+  <a href="/hll">HyperLogLog</a>
+  <a href="/bloom-filter">Bloom Filters</a>
+  <a href="/intrinsic-columns">Intrinsic Columns</a>
+  <div class="section-label">Blocks</div>
+  <a href="/block-scoring">Block Scoring</a>
+  <a href="/block-format">Block Format</a>
+  <div class="section-label">Performance</div>
+  <a href="/benchmarks/">Benchmarks</a>
+  <a href="/production-results" class="active">Production Results</a>
+</nav>
+    <main class="content">
+<h1>Blockpack vs Parquet — Production Latency Benchmark Results</h1>
+
+<h2>Latest: 2026-03-31 (48 GB full dataset)</h2>
+<ul>
+<li><strong>Dataset:</strong> ~85 GB source traces (full Grafana Cloud production traffic), 48 GB on-disk</li>
+<li><strong>S3 latency:</strong> 36 ms average per GET request</li>
+<li><strong>Configuration:</strong> GOMEMLIMIT=20 GiB (no GOGC set — default)</li>
+<li><strong>Compaction level:</strong> Level 2 (92 compacted blocks)</li>
+</ul>
+
+<h3>Storage Footprint</h3>
+<table>
+<thead>
+<tr><th>Backend</th><th>On-disk size</th><th>Block count</th></tr>
+</thead>
+<tbody>
+<tr><td>Parquet (vParquet5)</td><td>47 GB</td><td>~100</td></tr>
+<tr><td>Blockpack</td><td>48 GB</td><td>92</td></tr>
+</tbody>
+</table>
+<p><strong>Storage parity</strong> at production scale.</p>
+
+<h3>Single-Query p50 Latency (warm cache, limit=20)</h3>
+<table>
+<thead>
+<tr><th>ID</th><th>Query</th><th>PQ p50</th><th>BP p50</th><th>Ratio</th></tr>
+</thead>
+<tbody>
+<tr><td>1</td><td><code>{}</code> match-all</td><td>604ms</td><td><strong>57ms</strong></td><td><strong>0.09x</strong></td></tr>
+<tr><td>2</td><td><code>{svc=CockroachDB}</code></td><td>679ms</td><td><strong>57ms</strong></td><td><strong>0.08x</strong></td></tr>
+<tr><td>6</td><td><code>{status=error}</code></td><td>681ms</td><td><strong>67ms</strong></td><td><strong>0.10x</strong></td></tr>
+<tr><td>8</td><td><code>{duration&gt;100ms}</code></td><td>646ms</td><td><strong>239ms</strong></td><td><strong>0.37x</strong></td></tr>
+<tr><td>20</td><td><code>{svc=grafana &amp;&amp; kind=server &amp;&amp; status=error}</code></td><td>946ms</td><td><strong>169ms</strong></td><td><strong>0.18x</strong></td></tr>
+<tr><td>21</td><td><code>{svc=grafana &amp;&amp; http.method=GET &amp;&amp; status=error}</code></td><td>1123ms</td><td><strong>356ms</strong></td><td><strong>0.32x</strong></td></tr>
+<tr><td>15</td><td><code>{svc=grafana &amp;&amp; http.status_code&gt;=500}</code></td><td>1326ms</td><td><strong>357ms</strong></td><td><strong>0.27x</strong></td></tr>
+<tr><td>17</td><td><code>{svc=~loki-.* &amp;&amp; rpc.system=grpc &amp;&amp; status=error}</code></td><td>4ms</td><td><strong>4ms</strong></td><td>0.90x</td></tr>
+<tr><td>23</td><td><code>{db.system != nil}</code></td><td>3ms</td><td>3ms</td><td>1.03x</td></tr>
+<tr><td>22</td><td><code>{svc=loki-querier &amp;&amp; status=error &amp;&amp; duration&gt;50ms}</code></td><td>1179ms</td><td>1960ms</td><td><strong>1.66x</strong></td></tr>
+</tbody>
+</table>
+<p><strong>Result: 8 wins, 1 loss, 1 tie.</strong></p>
+<p>The only loss (q22) is a 3-condition AND with a range predicate where the <code>overFetch</code>
+intersection yields few matches per file, requiring more files to be processed.</p>
+
+<h3>Architecture (as of this benchmark)</h3>
+<ul>
+<li><strong>Intrinsic section:</strong> predicate evaluation ONLY (SPEC-INTRINSIC-001). Finds matching
+  refs via sorted-by-value binary search on dict/flat columns.</li>
+<li><strong>Field population:</strong> block reads via <code>forEachBlockInGroups</code> (O(M) where M = result count).
+  At scale, this is 200x faster than the previous <code>lookupIntrinsicFields</code> O(N×C) scan.</li>
+<li><strong>Identity columns</strong> (trace:id, span:id, span:parent_id, span:status_message) removed from
+  intrinsic section — 48% storage reduction. Values come from block columns (dual storage).</li>
+<li><strong>RefBloom</strong> removed (100% FPR at 10K entries/page). Value bloom kept for dict pruning.</li>
+<li><strong>FileBloom</strong> checked before intrinsic scan (SPEC-INTRINSIC-004) — O(1) file rejection.</li>
+<li><strong>Strong-reference objectcache</strong> (sync.Map replaces weak.Pointer) — prevents filecache
+  re-reads caused by GC eviction of weak pointers.</li>
+<li><strong>SPEC-ROOT-010:</strong> errors are never swallowed. <code>slog.Error</code> on intrinsic fast path fallback.</li>
+</ul>
+
+<hr>
+
+<h2>Previous: 2026-03-24 (3.3 GB dataset)</h2>
+<ul>
+<li><strong>Dataset:</strong> ~6.7 M traces, real-world Grafana Cloud production traffic</li>
+<li><strong>S3 latency:</strong> 36 ms average per GET request</li>
+<li><strong>Configuration:</strong> GOGC=100, GOMEMLIMIT=20 GiB</li>
+<li><strong>Compaction level:</strong> Level 2 (fully compacted)</li>
+</ul>
+
+<h3>Storage Footprint</h3>
+<table>
+<thead>
+<tr><th>Backend</th><th>On-disk size</th><th>Block count</th></tr>
+</thead>
+<tbody>
+<tr><td>Parquet (vParquet5)</td><td>3.29 GB</td><td>16</td></tr>
+<tr><td>Blockpack (pre-#172)</td><td>3.64 GB</td><td>14</td></tr>
+<tr><td>Blockpack (post-#172)</td><td>2.64 GB</td><td>15</td></tr>
+</tbody>
+</table>
+<p>After PR #172 (intrinsic column index with dual-storage), blockpack is <strong>20%
+smaller</strong> than parquet on the same dataset.</p>
+
+<h3>Single-Query p50 Latency (warm cache, limit=20)</h3>
+<table>
+<thead>
+<tr><th>Query Category</th><th>Parquet p50</th><th>Blockpack p50</th><th>Ratio</th></tr>
+</thead>
+<tbody>
+<tr><td>Match-all (no predicates)</td><td>603 ms</td><td>121 ms</td><td><strong>0.20x</strong></td></tr>
+<tr><td>Intrinsic range predicate</td><td>641 ms</td><td>583 ms</td><td>0.91x</td></tr>
+<tr><td>Intrinsic equality — single field</td><td>678 ms</td><td>61 ms</td><td><strong>0.09x</strong></td></tr>
+<tr><td>Intrinsic equality — categorical field</td><td>674 ms</td><td>62 ms</td><td><strong>0.09x</strong></td></tr>
+<tr><td>Service name equality</td><td>717 ms</td><td>79 ms</td><td><strong>0.11x</strong></td></tr>
+<tr><td>Service name regex</td><td>723 ms</td><td>184 ms</td><td><strong>0.25x</strong></td></tr>
+<tr><td>User attribute filter</td><td>770 ms</td><td>292 ms</td><td><strong>0.38x</strong></td></tr>
+<tr><td>Service + intrinsic AND</td><td>861 ms</td><td>783 ms</td><td>0.91x</td></tr>
+<tr><td>Service + user attribute AND</td><td>857 ms</td><td>462 ms</td><td><strong>0.54x</strong></td></tr>
+<tr><td>Multi-condition AND (regex + attribute + intrinsic)</td><td>1856 ms</td><td>1421 ms</td><td><strong>0.77x</strong></td></tr>
+</tbody>
+</table>
+<p><strong>Blockpack wins all 10 categories.</strong></p>
+
+<hr>
+
+<h2>Parallel Load Throughput (1500 queries × 50 concurrent)</h2>
+<p><em>Measured on the 3.3 GB dataset (2026-03-24).</em></p>
+
+<h3>With blockpack filecache enabled (bbolt disk cache)</h3>
+<table>
+<thead>
+<tr><th>Metric</th><th>Parquet</th><th>Blockpack warm</th><th>Blockpack cold (file-per-entry)</th></tr>
+</thead>
+<tbody>
+<tr><td>Wall time</td><td>16.3 s</td><td><strong>17.8 s (+9%)</strong></td><td><strong>19.0 s (+16%)</strong></td></tr>
+<tr><td>Peak CPU</td><td>~1490%</td><td>~1032%</td><td>~1032%</td></tr>
+<tr><td>Post-stress memory</td><td>7.0 GiB</td><td><strong>3.5 GiB (−50%)</strong></td><td>—</td></tr>
+</tbody>
+</table>
+
+<h3>Apples-to-apples: no persistent cache on either side</h3>
+<table>
+<thead>
+<tr><th>Metric</th><th>Parquet</th><th>Blockpack</th><th>Delta</th></tr>
+</thead>
+<tbody>
+<tr><td>Wall time</td><td>18.1 s</td><td><strong>17.0 s</strong></td><td><strong>−6%</strong></td></tr>
+<tr><td>Peak CPU</td><td>~1490%</td><td>~1032%</td><td>−31%</td></tr>
+<tr><td>Post-stress memory</td><td>6.4 GiB</td><td><strong>4.9 GiB</strong></td><td><strong>−23%</strong></td></tr>
+</tbody>
+</table>
+<p>Without any caching advantage, blockpack is still 6% faster and 23% less memory
+at production S3 latency.</p>
+
+<hr>
+
+<h2>S3 Request Efficiency</h2>
+<table>
+<thead>
+<tr><th>Query Category</th><th>Parquet range GETs</th><th>Blockpack range GETs</th></tr>
+</thead>
+<tbody>
+<tr><td>Match-all</td><td>many (all row groups)</td><td>few (intrinsic fast path)</td></tr>
+<tr><td>Intrinsic range</td><td>many</td><td><strong>3</strong> (intrinsic blob only)</td></tr>
+<tr><td>Intrinsic equality</td><td>many</td><td>~18–20</td></tr>
+<tr><td>User attribute filter</td><td>many</td><td>~55–60 (Fuse8 pruned)</td></tr>
+</tbody>
+</table>
+<p>Blockpack's lower request count is the primary reason it outperforms Parquet
+at 36 ms/request latency — fewer round-trips directly reduces wall time.</p>
+
+<hr>
+
+<h2>Notes</h2>
+<ul>
+<li>Results measured on localhost with s3fs (single-node, no network jitter).</li>
+<li>Parquet uses vParquet5 with default configuration (no dedicated columns).</li>
+<li>GC settings reflect the recommended production configuration.</li>
+<li>The 48 GB benchmark uses the full 85 GB Grafana Cloud trace dataset.</li>
+</ul>
+
+    </main>
+  </div>
+</body>
+</html>

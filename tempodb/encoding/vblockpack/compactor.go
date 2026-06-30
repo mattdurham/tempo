@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/grafana/blockpack"
+	util_log "github.com/grafana/tempo/pkg/util/log"
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/encoding/common"
 	"go.opentelemetry.io/otel/attribute"
@@ -171,14 +172,8 @@ func (c *Compactor) Compact(ctx context.Context, l log.Logger, r backend.Reader,
 		c.opts.ObjectsWritten(int(maxCompactionLevel), int(totalObjects))
 	}
 
-	// blockpack issue #397: publish a "create" event for each compacted output
-	// block so the value index builder can re-index it asynchronously. Source
-	// blocks are dropped by the value index compactor's source-existence check
-	// once retention removes them, so no delete events are needed here.
-	// Non-blocking and best-effort.
-	for _, m := range out.metas {
-		publishBlockCreated(ctx, blockObjectKey(m.TenantID, uuid.UUID(m.BlockID).String()))
-	}
+	// Value-index L0 files are written synchronously inside tempoOutputStorage.Put
+	// per output block (blockpack NOTE-VI-042, issue #464) — no async event publish.
 
 	return out.metas, nil
 }
@@ -448,6 +443,21 @@ func (s *tempoOutputStorage) Put(_ string, data []byte) error {
 	}
 
 	s.metas = append(s.metas, meta)
+
+	// blockpack NOTE-VI-042 (issue #464): synchronously write per-column L0
+	// value-index files for this compaction output block, with no Redis broker.
+	// A fresh reader is opened from the in-memory output bytes (the same bytes
+	// setBlockTimeRange already parsed). Best-effort — a failure is logged but
+	// never fails compaction, since the index can be rebuilt from the source
+	// block. Skipped entirely when value_index_enabled is false.
+	if store, prefix := getValueIndexSink(); store != nil {
+		if r, rerr := blockpack.NewReaderFromProvider(&bytesReaderProvider{data: data}); rerr == nil {
+			sourceRef := blockObjectKey(s.tenantID, uuid.UUID(newID).String())
+			if werr := blockpack.WriteValueIndexL0(r, store, sourceRef, s.tenantID, prefix); werr != nil {
+				level.Warn(util_log.Logger).Log("msg", "vblockpack: value-index L0 write failed (compaction)", "block", sourceRef, "err", werr)
+			}
+		}
+	}
 	return nil
 }
 
