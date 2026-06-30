@@ -18,8 +18,22 @@ package valueindex
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 )
+
+// MaxStringTableEntries is the maximum number of distinct strings a single
+// value-index file's string table can hold. SourceRefs are addressed by a
+// uint16 index, so a file may reference at most 65535 distinct source files.
+// Compaction splits its output when an output file would exceed this
+// (NOTE-VI-028, issue #432).
+const MaxStringTableEntries = 0xFFFF
+
+// ErrStringTableOverflow is returned by the v4 encoder when more than
+// MaxStringTableEntries distinct SourceRefs are interned into a single file.
+// Callers (compaction) must split the output so each file stays within the
+// uint16 SourceRef index space (NOTE-VI-028, issue #432).
+var ErrStringTableOverflow = errors.New("valueindex: string table exceeds 65535 distinct source refs")
 
 // StringTable maps uint16 indexes to string values. Used to deduplicate
 // SourceRef strings in v3 value-index files (NOTE-VI-028, issue #432).
@@ -41,7 +55,7 @@ func (t *StringTable) Intern(s string) (uint16, bool) {
 	if idx, ok := t.indexes[s]; ok {
 		return idx, true
 	}
-	if len(t.strs) >= 0xFFFF {
+	if len(t.strs) >= MaxStringTableEntries {
 		return 0, false
 	}
 	idx := uint16(len(t.strs)) //nolint:gosec // bounded above
@@ -111,7 +125,3 @@ func DecodeStringTable(data []byte) (*StringTable, int, error) {
 	}
 	return t, pos, nil
 }
-
-// MergeStringTables merges multiple string tables into a single new table,
-// and returns a mapping from old index → new index for each input table.
-// Used during compaction to combine string tables from multiple source files.

@@ -270,6 +270,39 @@ A v2 round-trip integration test should be added (TODO PR6) that:
 4. Flushes and opens reader
 5. Asserts QueryResult.BlockRef.ByteOffset() matches the original block's Offset
 
+## NOTE-VI-028 — SourceRef string table for v3/v4 files (issue #432)
+
+Each `Entry` carries a `SourceRef` (the S3 key of the source data blockpack,
+~60 bytes). Inlining it per entry (v1/v2 layout) repeats the same path thousands
+of times in a compacted file. v3/v4 files instead write a file-level string table
+(`stringtable.go`) once, immediately after the VINX header (`str_table_len` at
+header[18:22]), and each entry stores a `uint16` index into it. Readers load the
+table on open and resolve indexes back to full paths during decode.
+
+Design decisions:
+- **uint16 index → at most `MaxStringTableEntries` (65535) distinct SourceRefs
+  per file.** `StringTable.Intern` returns `(_, false)` once full; `encodeEntriesV4`
+  surfaces this as `ErrStringTableOverflow` instead of silently writing index 0
+  (which would collapse all overflow entries onto one wrong SourceRef — silent
+  corruption). A plain `Writer.Flush` propagates the error to its caller.
+- **Compaction merges string tables implicitly, not via index remapping.** Readers
+  decode entries to fully-resolved SourceRef *strings*; compaction re-sorts/dedups
+  those and the writer rebuilds a fresh table on output (re-interning). This is
+  simpler and bug-resistant compared to remapping old→new indexes per input file —
+  there is no separate `MergeStringTables` function (an earlier stub of that idea
+  was removed as dead code).
+- **Overflow split.** `writeCompacted` enforces the uint16 cap *in addition to* the
+  byte-size cap: it walks the (value-sorted) entries accumulating distinct
+  SourceRefs and closes the current output file before a new distinct SourceRef
+  would push the count past `MaxStringTableEntries`. So a compaction that would
+  reference > 65535 source files emits multiple output files, each self-contained
+  and within its own uint16 index space. No entry is dropped or corrupted.
+
+Back-refs:
+- `internal/modules/valueindex/stringtable.go:StringTable`, `MaxStringTableEntries`, `ErrStringTableOverflow`
+- `internal/modules/valueindex/writer.go:encodeEntriesV4`, `assemble` (overflow propagation)
+- `internal/modules/valueindex/compaction.go:writeCompacted` (overflow split)
+
 ## NOTE-VI-032 — DiscoverIndexFiles: S3 lister → time-filtered, sorted file keys (issue #458)
 
 Date: 2026-06-30

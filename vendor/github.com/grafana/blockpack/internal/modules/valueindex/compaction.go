@@ -131,27 +131,52 @@ func writeCompacted(
 	maxOutputBytes int64,
 	output func([]byte) error,
 ) error {
-	if maxOutputBytes <= 0 {
-		// Single output file.
-		data, err := flushBatch(ctx, entries, colName, colType, outputLevel)
+	// batchSize bounds an output file by approximate serialized size. 0 (the
+	// maxOutputBytes <= 0 case) means no size cap — a single batch spanning all
+	// entries, still subject to the uint16 SourceRef cap below.
+	batchSize := len(entries)
+	if maxOutputBytes > 0 {
+		// Rough heuristic: flush when accumulated entry count × avgEntrySize > maxOutputBytes.
+		const avgEntryBytes = 64
+		batchSize = int(maxOutputBytes / avgEntryBytes)
+		if batchSize < 1 {
+			batchSize = 1
+		}
+	}
+
+	// Always produce at least one output file, even when there are no entries.
+	if len(entries) == 0 {
+		data, err := flushBatch(ctx, nil, colName, colType, outputLevel)
 		if err != nil {
 			return err
 		}
 		return output(data)
 	}
 
-	// Split into batches by approximate entry count.
-	// We use a rough heuristic: flush when accumulated entry count × avgEntrySize > maxOutputBytes.
-	const avgEntryBytes = 64
-	batchSize := int(maxOutputBytes / avgEntryBytes)
-	if batchSize < 1 {
-		batchSize = 1
-	}
-
-	for start := 0; start < len(entries); start += batchSize {
-		end := start + batchSize
-		if end > len(entries) {
-			end = len(entries)
+	// Split by both the byte-size heuristic and the uint16 SourceRef cap: a single
+	// output file's string table addresses SourceRefs with a uint16 index, so it
+	// can reference at most MaxStringTableEntries distinct source files. Walk the
+	// (value-sorted) entries accumulating distinct SourceRefs; close the current
+	// batch when either the size cap or the SourceRef cap would be exceeded
+	// (NOTE-VI-028, issue #432).
+	start := 0
+	for start < len(entries) {
+		seen := make(map[string]struct{})
+		end := start
+		for end < len(entries) {
+			// Enforce the SourceRef cap: a new distinct SourceRef that would push
+			// the count past MaxStringTableEntries closes the batch first.
+			if _, ok := seen[entries[end].sourceRef]; !ok {
+				if len(seen) >= MaxStringTableEntries {
+					break
+				}
+				seen[entries[end].sourceRef] = struct{}{}
+			}
+			end++
+			// Enforce the byte-size cap.
+			if end-start >= batchSize {
+				break
+			}
 		}
 		data, err := flushBatch(ctx, entries[start:end], colName, colType, outputLevel)
 		if err != nil {
@@ -160,15 +185,7 @@ func writeCompacted(
 		if err := output(data); err != nil {
 			return err
 		}
-	}
-
-	// If entries is empty, still produce one output file.
-	if len(entries) == 0 {
-		data, err := flushBatch(ctx, nil, colName, colType, outputLevel)
-		if err != nil {
-			return err
-		}
-		return output(data)
+		start = end
 	}
 	return nil
 }

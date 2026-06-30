@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"slices"
 
@@ -311,10 +312,17 @@ func (w *writerImpl) assemble(level uint8, source func(yield func(rawEntry) erro
 		table := NewStringTable()
 		// Always use v4 (string table + SpanID + RowIdx). v4 supplants v3 (#432/#428).
 		v4ChunkData, v4ChunkDir, v4Err := encodeEntriesV4(sortedEntries, table)
-		if v4Err != nil {
-			// Fallback to v2 on encode error.
+		switch {
+		case errors.Is(v4Err, ErrStringTableOverflow):
+			// Too many distinct SourceRefs for the uint16 string-table index.
+			// Falling back to v2 would silently drop SpanID/RowIdx, so propagate
+			// the error and let the caller (compaction) split the output instead
+			// (NOTE-VI-028, issue #432).
+			return nil, fmt.Errorf("valueindex: assemble: %w", v4Err)
+		case v4Err != nil:
+			// Fallback to v2 on other encode errors.
 			vinxSection = encodeVINXSectionVer(chunkDir, chunkData, shared.ValueIndexEntriesVersion)
-		} else {
+		default:
 			vinxSection = encodeVINXSectionVer4(v4ChunkDir, v4ChunkData, table)
 		}
 	} else {
@@ -376,8 +384,14 @@ func encodeEntriesV4(entries []Entry, table *StringTable) ([]byte, []ChunkDirEnt
 	if len(entries) == 0 {
 		return []byte{}, nil, nil
 	}
+	// Intern all SourceRefs up front so overflow is detected before any chunk
+	// is encoded. encodeChunkPayloadV4 re-interns (idempotently) but cannot
+	// signal overflow, so the table must be fully populated and validated here
+	// (NOTE-VI-028, issue #432).
 	for i := range entries {
-		table.Intern(entries[i].SourceRef)
+		if _, ok := table.Intern(entries[i].SourceRef); !ok {
+			return nil, nil, ErrStringTableOverflow
+		}
 	}
 	perChunk := shared.ValueIndexEntriesPerChunk
 	var allChunks []byte
