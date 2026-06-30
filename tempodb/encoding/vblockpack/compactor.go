@@ -14,6 +14,7 @@ import (
 	"github.com/grafana/blockpack"
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/encoding/common"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // NewCompactor creates a new blockpack compactor with the given options.
@@ -37,6 +38,13 @@ func (c *Compactor) Compact(ctx context.Context, l log.Logger, r backend.Reader,
 	if len(inputs) == 0 {
 		return nil, nil
 	}
+
+	// Stamp input-side attributes now; output_blocks / compaction_level are added
+	// after CompactBlocksStreaming returns (issue #465).
+	span.SetAttributes(
+		attribute.Int("input_blocks", len(inputs)),
+		attribute.String("tenantID", inputs[0].TenantID),
+	)
 
 	// Compute output block metadata fields from inputs.
 	var (
@@ -146,6 +154,11 @@ func (c *Compactor) Compact(ctx context.Context, l log.Logger, r backend.Reader,
 	if err != nil {
 		return nil, fmt.Errorf("blockpack.CompactBlocks: %w", err)
 	}
+
+	span.SetAttributes(
+		attribute.Int("output_blocks", len(outputPaths)),
+		attribute.Int("compaction_level", int(maxCompactionLevel)+1),
+	)
 
 	level.Info(l).Log(
 		"msg", "blockpack compaction complete",

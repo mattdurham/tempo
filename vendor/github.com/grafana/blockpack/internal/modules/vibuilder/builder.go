@@ -106,10 +106,14 @@ func BuildSource(
 			// the executor falls back.
 			continue
 		}
-		results, err := lookupColumn(ctx, disc, store, col, colType, pred, timeRange)
+		results, filesRead, bytesRead, err := lookupColumn(ctx, disc, store, col, colType, pred, timeRange)
 		if err != nil {
 			return nil, false, err
 		}
+		// Record the download I/O for this leaf so the querier can report it on its
+		// OTel span (issue #465); a covered-but-empty column still counts the bytes
+		// of any files we read deciding it was empty.
+		src.RecordFileIO(filesRead, bytesRead)
 		// Add even when empty: a covered-but-empty column is coverage, not
 		// fallback (NOTE-VI-033).
 		src.Add(col, colType, results)
@@ -121,10 +125,11 @@ func BuildSource(
 	// always-true predicate so AllResults can enumerate spans.
 	if len(preds.Nodes) == 0 && len(preds.Columns) > 0 {
 		for _, col := range preds.Columns {
-			results, colType, err := lookupColumnAll(ctx, disc, store, col, timeRange)
+			results, colType, filesRead, bytesRead, err := lookupColumnAll(ctx, disc, store, col, timeRange)
 			if err != nil {
 				return nil, false, err
 			}
+			src.RecordFileIO(filesRead, bytesRead)
 			src.Add(col, colType, results)
 			added = true
 		}
@@ -307,25 +312,25 @@ func lookupColumn(
 	colType modules_shared.ColumnType,
 	pred valueindex.Predicate,
 	timeRange *[2]uint64,
-) ([]modules_executor.VILookupResult, error) {
+) ([]modules_executor.VILookupResult, int, int64, error) {
 	colHash := valueindex.ColHash(col)
 	colTypeName := valueindex.ColTypeName(colType)
 	if colTypeName == "" {
-		return nil, nil
+		return nil, 0, 0, nil
 	}
 	keys, err := disc.FilesForTimeRange(ctx, colHash, colTypeName, timeRange[0], timeRange[1])
 	if err != nil {
-		return nil, fmt.Errorf("vibuilder: discover %s: %w", col, err)
+		return nil, 0, 0, fmt.Errorf("vibuilder: discover %s: %w", col, err)
 	}
-	files, err := downloadAll(store, keys)
+	files, bytesRead, err := downloadAll(store, keys)
 	if err != nil {
-		return nil, err
+		return nil, 0, 0, err
 	}
 	lrs, err := valueindex.QueryFiles(pred, timeRange, files...)
 	if err != nil {
-		return nil, fmt.Errorf("vibuilder: query %s: %w", col, err)
+		return nil, 0, 0, fmt.Errorf("vibuilder: query %s: %w", col, err)
 	}
-	return toVILookupResults(lrs), nil
+	return toVILookupResults(lrs), len(files), bytesRead, nil
 }
 
 // lookupColumnAll discovers and downloads every value-index file for a column
@@ -338,35 +343,39 @@ func lookupColumnAll(
 	store FileStore,
 	col string,
 	timeRange *[2]uint64,
-) ([]modules_executor.VILookupResult, modules_shared.ColumnType, error) {
+) ([]modules_executor.VILookupResult, modules_shared.ColumnType, int, int64, error) {
 	colHash := valueindex.ColHash(col)
 	var all []modules_executor.VILookupResult
 	var firstType modules_shared.ColumnType
+	var totalFiles int
+	var totalBytes int64
 	for _, colType := range allTypeBuckets() {
 		colTypeName := valueindex.ColTypeName(colType)
 		keys, err := disc.FilesForTimeRange(ctx, colHash, colTypeName, timeRange[0], timeRange[1])
 		if err != nil {
-			return nil, 0, fmt.Errorf("vibuilder: discover-all %s: %w", col, err)
+			return nil, 0, 0, 0, fmt.Errorf("vibuilder: discover-all %s: %w", col, err)
 		}
 		if len(keys) == 0 {
 			continue
 		}
-		files, err := downloadAll(store, keys)
+		files, bytesRead, err := downloadAll(store, keys)
 		if err != nil {
-			return nil, 0, err
+			return nil, 0, 0, 0, err
 		}
+		totalFiles += len(files)
+		totalBytes += bytesRead
 		// A nil predicate matches every entry (Reader.Lookup treats nil as
 		// match-all), so the universe of indexed spans for this column is returned.
 		lrs, err := valueindex.QueryFiles(nil, timeRange, files...)
 		if err != nil {
-			return nil, 0, fmt.Errorf("vibuilder: query-all %s: %w", col, err)
+			return nil, 0, 0, 0, fmt.Errorf("vibuilder: query-all %s: %w", col, err)
 		}
 		if len(all) == 0 {
 			firstType = colType
 		}
 		all = append(all, toVILookupResults(lrs)...)
 	}
-	return all, firstType, nil
+	return all, firstType, totalFiles, totalBytes, nil
 }
 
 // allTypeBuckets lists the distinct value-index type-bucket representatives, one
@@ -387,19 +396,23 @@ func allTypeBuckets() []modules_shared.ColumnType {
 // downloadAll reads every key fully into memory via store. A per-file read error
 // aborts the whole build (the caller falls back to a full scan) rather than
 // silently dropping a file, which would produce a wrong (under-counted) result.
-func downloadAll(store FileStore, keys []string) ([][]byte, error) {
+// It also returns the total bytes downloaded so the builder can record I/O stats
+// (issue #465).
+func downloadAll(store FileStore, keys []string) ([][]byte, int64, error) {
 	if len(keys) == 0 {
-		return nil, nil
+		return nil, 0, nil
 	}
 	files := make([][]byte, 0, len(keys))
+	var totalBytes int64
 	for _, key := range keys {
 		data, err := readWhole(store, key)
 		if err != nil {
-			return nil, fmt.Errorf("vibuilder: download %s: %w", key, err)
+			return nil, 0, fmt.Errorf("vibuilder: download %s: %w", key, err)
 		}
+		totalBytes += int64(len(data))
 		files = append(files, data)
 	}
-	return files, nil
+	return files, totalBytes, nil
 }
 
 // readWhole reads the entire object at key into a single buffer.

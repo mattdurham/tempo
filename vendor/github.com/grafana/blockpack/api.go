@@ -434,6 +434,12 @@ type VILookupResult = modules_executor.VILookupResult
 // matched value-index results grouped by column.
 type SliceValueIndexSource = modules_executor.SliceValueIndexSource
 
+// ValueIndexBuildStats reports the I/O performed assembling a value-index source:
+// files downloaded, total bytes, and matched span entries. The querier reads it
+// via SliceValueIndexSource.Stats() to attach index-path observability to its OTel
+// span and log line (tempo issue #465).
+type ValueIndexBuildStats = modules_executor.ValueIndexBuildStats
+
 // NewSliceValueIndexSource builds an empty SliceValueIndexSource. Populate it with Add.
 func NewSliceValueIndexSource() *SliceValueIndexSource {
 	return modules_executor.NewSliceValueIndexSource()

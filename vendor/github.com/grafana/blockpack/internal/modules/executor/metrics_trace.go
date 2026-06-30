@@ -1145,12 +1145,29 @@ func viSpanKey(s VILookupResult) [24]byte {
 	return k
 }
 
+// ValueIndexBuildStats records the I/O the builder performed assembling a
+// SliceValueIndexSource: how many value-index files were downloaded, their total
+// byte size, and how many span entries were matched. The builder populates these
+// so the querier can attach them to its OTel span / log line (tempo issue #465).
+// All counters are advisory observability — they never affect query results.
+type ValueIndexBuildStats struct {
+	// FilesRead is the number of value-index files downloaded from object storage.
+	FilesRead int
+	// BytesRead is the total byte size of those downloaded files.
+	BytesRead int64
+	// Hits is the number of span entries the per-column predicates matched (the
+	// raw lookup-result count before AND/OR span-ID intersection).
+	Hits int
+}
+
 // SliceValueIndexSource implements ValueIndexSource from pre-downloaded value-index
 // results, grouped by column name and type. Callers populate it from
 // valueindex.QueryFiles output (one leaf predicate already applied per column).
 type SliceValueIndexSource struct {
 	// data maps colName → colType → matched results for that column.
 	data map[string]map[modules_shared.ColumnType][]VILookupResult
+	// stats records the build-time I/O so the querier can report it (issue #465).
+	stats ValueIndexBuildStats
 }
 
 // NewSliceValueIndexSource builds an empty source. Use Add to populate per-column
@@ -1159,6 +1176,26 @@ func NewSliceValueIndexSource() *SliceValueIndexSource {
 	return &SliceValueIndexSource{
 		data: make(map[string]map[modules_shared.ColumnType][]VILookupResult),
 	}
+}
+
+// RecordFileIO accumulates the builder's per-column download I/O into the source's
+// stats (issue #465). filesRead is the file count for the column, bytesRead their
+// total size. Safe to call repeatedly; counters accumulate.
+func (s *SliceValueIndexSource) RecordFileIO(filesRead int, bytesRead int64) {
+	s.stats.FilesRead += filesRead
+	s.stats.BytesRead += bytesRead
+}
+
+// Stats returns the build-time I/O counters. Hits is derived from the stored
+// results so it stays correct regardless of Add ordering.
+func (s *SliceValueIndexSource) Stats() ValueIndexBuildStats {
+	out := s.stats
+	for _, byType := range s.data {
+		for _, results := range byType {
+			out.Hits += len(results)
+		}
+	}
+	return out
 }
 
 // Add records the matched results for one (colName, colType). Repeated calls for the

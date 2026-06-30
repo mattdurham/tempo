@@ -48,3 +48,32 @@ the single place that depends on all three, avoiding an import cycle. The public
 
 Back-ref: `internal/modules/vibuilder/builder.go`, `valueindex_query.go`.
 Tests: `builder_test.go`, `api_test.go:TestBuildValueIndexSource_*`.
+
+## NOTE-VI-039: BuildSource records download I/O on the source for querier observability (tempo issue #465)
+
+*Added: 2026-06-30*
+
+`SliceValueIndexSource` now carries a `ValueIndexBuildStats` (FilesRead, BytesRead,
+Hits) populated as `BuildSource` downloads each column's files. `lookupColumn` /
+`lookupColumnAll` / `downloadAll` return the per-call file count + byte total;
+`BuildSource` folds them into the source via `src.RecordFileIO`. `Stats()` derives
+`Hits` from the stored result slices at read time (so it stays correct regardless of
+`Add` ordering) and returns the accumulated file/byte counts.
+
+**Why on the source, not a new return value.** `BuildSource` and its public wrappers
+(`BuildValueIndexSource`, `BuildValueIndexSourceForMetrics`) already return
+`(source, ok, err)` and are called from tempo + the deadcode anchor. Attaching the
+stats to the returned source keeps that signature stable (no tempo callsite churn)
+and the I/O is intrinsic to "what did it cost to build this source" — the natural
+owner. tempo's `blockpackBlock.tryIndexFetch` reads `src.Stats()` and stamps the
+counts onto its OTel span even when the index later declines (those bytes were spent).
+
+**Covered-but-empty still counts bytes.** A column the predicate matched zero spans
+for still downloaded files to decide that; those bytes/files count toward the stats
+(observability reflects real I/O, not just hits).
+
+Back-ref: `builder.go` (lookupColumn/lookupColumnAll/downloadAll/BuildSource),
+`internal/modules/executor/metrics_trace.go` (ValueIndexBuildStats, Stats,
+RecordFileIO), `api.go` (ValueIndexBuildStats alias).
+Tests: `builder_test.go:TestBuildSource_Stats*`,
+`metrics_trace_vi_test.go:TestSliceValueIndexSource_StatsAccumulate`.

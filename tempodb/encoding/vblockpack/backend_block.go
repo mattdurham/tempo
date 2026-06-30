@@ -23,6 +23,8 @@ import (
 	"github.com/grafana/tempo/tempodb/backend"
 	"github.com/grafana/tempo/tempodb/encoding/common"
 	"github.com/prometheus/client_golang/prometheus"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // maxBlobSize is the maximum size we will allocate for a blockpack file read.
@@ -279,11 +281,27 @@ func (b *blockpackBlock) BlockMeta() *backend.BlockMeta {
 	return b.meta
 }
 
+// startBlockSpan opens a child span for one query operation on this block and
+// stamps the block-identifying attributes vparquet4 also records (blockID,
+// tenantID, blockSize, compactionLevel) so vblockpack queries are comparable in
+// Grafana traces (issue #465). The caller must defer span.End().
+func (b *blockpackBlock) startBlockSpan(ctx context.Context, name string) (context.Context, trace.Span) {
+	return tracer.Start(ctx, name, trace.WithAttributes(
+		attribute.String("blockID", b.meta.BlockID.String()),
+		attribute.String("tenantID", b.meta.TenantID),
+		attribute.Int64("blockSize", int64(b.meta.Size_)),
+		attribute.Int("compactionLevel", int(b.meta.CompactionLevel)),
+	))
+}
+
 // QueryRange implements the nativeMetricsQuerier optional interface.
 // It delegates to blockpack.ExecuteMetricsTraceQL which uses the intrinsic
 // column fast path — reading only ~10 MB of sorted flat blobs instead of
 // fetching the entire block (~200 MB) via the generic Fetch path.
 func (b *blockpackBlock) QueryRange(ctx context.Context, req *tempopb.QueryRangeRequest, _ common.SearchOptions) (*tempopb.QueryRangeResponse, error) {
+	ctx, span := b.startBlockSpan(ctx, "vblockpack.backendBlock.QueryRange")
+	defer span.End()
+
 	r, err := b.newReader()
 	if err != nil {
 		return nil, fmt.Errorf("blockpack QueryRange: new reader: %w", err)
@@ -380,7 +398,10 @@ func convertTraceMetricsResult(result *blockpack.TraceMetricsResult, req *tempop
 // FindTraceByID finds a trace by ID.
 // Uses the lean reader (2 I/Os: footer + compact trace index) for minimal memory
 // and I/O overhead when scanning many blocks.
-func (b *blockpackBlock) FindTraceByID(_ context.Context, id common.ID, _ common.SearchOptions) (*tempopb.TraceByIDResponse, error) {
+func (b *blockpackBlock) FindTraceByID(ctx context.Context, id common.ID, _ common.SearchOptions) (*tempopb.TraceByIDResponse, error) {
+	_, span := b.startBlockSpan(ctx, "vblockpack.backendBlock.FindTraceByID")
+	defer span.End()
+
 	if len(id) != 16 {
 		return nil, fmt.Errorf("trace ID must be 16 bytes, got %d", len(id))
 	}
@@ -411,6 +432,9 @@ func (b *blockpackBlock) FindTraceByID(_ context.Context, id common.ID, _ common
 func (b *blockpackBlock) Search(ctx context.Context, req *tempopb.SearchRequest,
 	_ common.SearchOptions,
 ) (*tempopb.SearchResponse, error) {
+	ctx, span := b.startBlockSpan(ctx, "vblockpack.backendBlock.Search")
+	defer span.End()
+
 	// Build TraceQL query from SearchRequest
 	query := buildSearchQuery(req)
 
@@ -475,6 +499,9 @@ func (b *blockpackBlock) SearchTags(_ context.Context, scope traceql.AttributeSc
 // SearchTagValues implements the Searcher interface
 // Extracts unique values for a given tag
 func (b *blockpackBlock) SearchTagValues(ctx context.Context, tag string, cb common.TagValuesCallback, _ common.MetricsCallback, _ common.SearchOptions) error {
+	ctx, span := b.startBlockSpan(ctx, "vblockpack.backendBlock.SearchTagValues")
+	defer span.End()
+
 	// Use empty TraceQL query to match all spans, then extract tag values
 	// Tag names like "service.name" become column names like "resource.service.name"
 	colName := tagToColumnName(tag)
@@ -536,6 +563,9 @@ func (b *blockpackBlock) SearchTagValuesV2(ctx context.Context, tag traceql.Attr
 // Blockpack evaluates the TraceQL filter natively, so we only need to stream
 // matching spans, group them by trace ID, and convert to the output format.
 func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansRequest, opts common.SearchOptions) (traceql.FetchSpansResponse, error) {
+	ctx, span := b.startBlockSpan(ctx, "vblockpack.backendBlock.Fetch")
+	defer span.End()
+
 	// Use the original TraceQL query when available — blockpack evaluates it natively
 	// with full AND/OR structure preserved. Fall back to conditionsToTraceQL only when
 	// called from a non-TraceQL path (tag search, etc.) that has no original query.
@@ -685,7 +715,19 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 	// through to the full-scan paths below — the index path is a strict
 	// optimisation, never the only source of truth.
 	if compiledProgram != nil {
-		if im, ok := b.tryIndexFetch(ctx, r, compiledProgram, query, queryOpts); ok {
+		im, ok, istats := b.tryIndexFetch(ctx, r, compiledProgram, query, queryOpts)
+		// Record index-path I/O on the span whenever the index was consulted (any
+		// files were read), even if it ultimately declined and we fall back to a
+		// full scan (issue #465).
+		if istats.FilesRead > 0 || istats.Used {
+			span.SetAttributes(
+				attribute.Bool("index.used", istats.Used),
+				attribute.Int("index.files_read", istats.FilesRead),
+				attribute.Int64("index.bytes_read", istats.BytesRead),
+				attribute.Int("index.hits", istats.Hits),
+			)
+		}
+		if ok {
 			matches = im
 			indexAnswered = true
 		}
@@ -702,9 +744,21 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 	}
 	if len(qs.Steps) > 0 {
 		args := []any{"query", query, "path", qs.ExecutionPath, "total", qs.TotalDuration}
+		// Promote each full-scan step's I/O onto the OTel span so the plan/scan
+		// breakdown is visible in Grafana traces, not only in the log line
+		// (issue #465). Attribute names are namespaced by the step name (e.g.
+		// "plan", "block-scan") to mirror the slog keys.
+		spanAttrs := make([]attribute.KeyValue, 0, len(qs.Steps)*3+1)
+		spanAttrs = append(spanAttrs, attribute.String("scan.execution_path", qs.ExecutionPath))
 		for _, step := range qs.Steps {
 			args = append(args, step.Name+"_dur", step.Duration, step.Name+"_io", step.IOOps, step.Name+"_bytes", step.BytesRead)
+			spanAttrs = append(spanAttrs,
+				attribute.Int64("scan."+step.Name+".io_ops", int64(step.IOOps)),
+				attribute.Int64("scan."+step.Name+".bytes_read", int64(step.BytesRead)),
+				attribute.Int64("scan."+step.Name+".duration_ns", int64(step.Duration)),
+			)
 		}
+		span.SetAttributes(spanAttrs...)
 		slog.Info("vblockpack query stats", args...)
 	}
 	if fetchErr == nil {
@@ -1026,6 +1080,9 @@ func columnNameToAttribute(colName string) (traceql.Attribute, bool) {
 
 // FetchTagValues implements the Searcher interface
 func (b *blockpackBlock) FetchTagValues(ctx context.Context, req traceql.FetchTagValuesRequest, cb traceql.FetchTagValuesCallback, mcb common.MetricsCallback, opts common.SearchOptions) error {
+	ctx, span := b.startBlockSpan(ctx, "vblockpack.backendBlock.FetchTagValues")
+	defer span.End()
+
 	// Flatten ConditionGroups and build TraceQL query.
 	var valConditions []traceql.Condition
 	for _, group := range req.ConditionGroups {

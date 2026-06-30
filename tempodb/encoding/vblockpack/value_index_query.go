@@ -83,21 +83,39 @@ func getValueIndexQueryReader() *viQueryReader {
 	return viQueryReaderPtr
 }
 
+// indexFetchStats records the observable I/O of one index-path attempt so the
+// querier can attach it to its OTel span and log line (issue #465). It is
+// populated whether or not the index answered the query — a declined attempt that
+// still downloaded files reports the bytes it spent before falling back.
+type indexFetchStats struct {
+	// FilesRead is the number of value-index files downloaded building the source.
+	FilesRead int
+	// BytesRead is the total byte size of those files.
+	BytesRead int64
+	// Hits is the number of span entries the per-column predicates matched.
+	Hits int
+	// Used is true when the index path answered the query (the caller skipped the
+	// full block scan).
+	Used bool
+}
+
 // tryIndexFetch attempts to answer a compiled filter program from the value index.
 // It returns (matches, true) when the index fully answered the query for this
 // block, and (nil, false) when the caller must fall back to a full block scan
 // (index disabled, no coverage, unsupported predicate, or any error — the index
-// path never fails a query, it only declines).
+// path never fails a query, it only declines). The returned indexFetchStats
+// captures the download I/O of this attempt regardless of outcome (issue #465).
 func (b *blockpackBlock) tryIndexFetch(
 	ctx context.Context,
 	r *blockpack.Reader,
 	prog *blockpack.Program,
 	query string,
 	opts blockpack.QueryOptions,
-) ([]blockpack.SpanMatch, bool) {
+) ([]blockpack.SpanMatch, bool, indexFetchStats) {
+	var stats indexFetchStats
 	vr := getValueIndexQueryReader()
 	if vr == nil {
-		return nil, false
+		return nil, false, stats
 	}
 
 	// Derive the query's second-granularity window. A zero bound means "unbounded"
@@ -108,17 +126,24 @@ func (b *blockpackBlock) tryIndexFetch(
 	cache := vr.cacheFor(b.meta.TenantID)
 	src, ok, err := blockpack.BuildValueIndexSource(ctx, cache, vr.store, prog, minSec, maxSec)
 	if err != nil || !ok {
-		return nil, false
+		return nil, false, stats
 	}
+	// Capture the build-time I/O even if the query later declines: those bytes were
+	// spent and are worth reporting (issue #465).
+	bs := src.Stats()
+	stats.FilesRead = bs.FilesRead
+	stats.BytesRead = bs.BytesRead
+	stats.Hits = bs.Hits
 
 	sourceRef := blockObjectKey(b.meta.TenantID, b.meta.BlockID.String())
 	matches, indexOK, err := blockpack.QueryTraceQLFromIndex(
 		ctx, r, src, query, sourceRef, opts, 0, /* maxIndexHits: 0 = default */
 	)
 	if err != nil || !indexOK {
-		return nil, false
+		return nil, false, stats
 	}
-	return matches, true
+	stats.Used = true
+	return matches, true, stats
 }
 
 // nanoWindowToSec converts a [startNano, endNano] window to whole seconds for
