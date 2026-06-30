@@ -408,7 +408,6 @@ func (w *Writer) Flush() (int64, error) {
 	// Intrinsic accumulator is closed and nil'd by the deferred cleanup at the top of Flush()
 	// (NOTE-461); the next write lazily re-creates it via ensureIntrinsicAccum.
 
-	// Reset file-level bloom service names.
 	// Reset vector accumulator for reuse.
 	if w.vectorAccum != nil {
 		w.vectorAccum = newVectorAccumulator(w.cfg.VectorDimension)

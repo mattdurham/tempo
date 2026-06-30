@@ -14,8 +14,6 @@ import (
 
 // FileLayoutReport is the top-level result of AnalyzeFileLayout.
 
-// FileBloom summarizes the file-level bloom filter section, if present.
-
 // SketchIndexInfo summarizes the sketch index stored in the file.
 
 // Blocks holds one summary per block (parallel to FileLayoutReport.BlockSpanCounts).
@@ -64,16 +62,6 @@ import (
 
 // IsLogical is true for V12 metadata sub-sections whose Offset is relative to
 // the start of the decompressed metadata buffer, not a physical file offset.
-
-// FileBloomInfo summarizes the file-level bloom filter section (FBLM).
-
-// Columns holds per-column name and filter size.
-
-// TotalBytes is the total uncompressed byte size of the FBLM section.
-
-// FileBloomColumnInfo describes one column's entry in the file bloom section.
-
-// FuseBytes is the byte size of the BinaryFuse8 filter for this column.
 
 // FileLayout computes a byte-level layout of the blockpack file, returning a report
 // that accounts for every byte. The returned Sections slice is sorted by Offset ascending.
@@ -165,7 +153,6 @@ func (r *Reader) fileLayoutV8() (*FileLayoutReport, error) {
 
 	rangeIndex := r.buildRangeIndex()
 	var sketchIndex *SketchIndexInfo
-	var fileBloom *FileBloomInfo
 
 	spanCounts := make([]uint32, len(r.blockMetas))
 	var totalSpans int64
@@ -183,7 +170,6 @@ func (r *Reader) fileLayoutV8() (*FileLayoutReport, error) {
 		Sections:        sections,
 		RangeIndex:      rangeIndex,
 		SketchIndex:     sketchIndex,
-		FileBloom:       fileBloom,
 	}, nil
 }
 

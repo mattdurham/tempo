@@ -95,13 +95,13 @@ const (
 
 	// Section type constants for the V14 section directory type-keyed entries.
 	// Each constant identifies one independently snappy-compressed file-level section.
-	// Values 0x07+ are reserved for future type-keyed sections.
+	// Value 0x06 (formerly SectionFileBloom) was retired with the file-level bloom
+	// removal (#437); 0x06 and 0x07+ are reserved for future type-keyed sections.
 	SectionBlockIndex  uint8 = 0x01
 	SectionRangeIndex  uint8 = 0x02
 	SectionTraceIndex  uint8 = 0x03
 	SectionTSIndex     uint8 = 0x04
 	SectionSketchIndex uint8 = 0x05
-	SectionFileBloom   uint8 = 0x06
 
 	// DirEntryKindType identifies a type-keyed section directory entry (one of the 6 fixed sections).
 	// Wire: entry_kind[1]=0x00 + section_type[1] + offset[8] + compressed_len[4] = 14 bytes.
@@ -198,11 +198,6 @@ const (
 
 	TSIndexMagic   uint32 = 0xC011FEED // per-file timestamp index section
 	TSIndexVersion uint8  = 1
-
-	// FileBloomMagic is the magic number for the file-level bloom filter section.
-	// "FBLM" in ASCII.
-	FileBloomMagic   uint32 = 0x46424C4D
-	FileBloomVersion uint8  = 0x01
 
 	// CompactIndexVersion2 is the compact trace index version that includes the trace ID bloom filter.
 	CompactIndexVersion2 uint8 = 2

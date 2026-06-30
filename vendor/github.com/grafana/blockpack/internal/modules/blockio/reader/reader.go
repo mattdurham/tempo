@@ -482,12 +482,6 @@ func (r *Reader) TraceEntries(_ [16]byte) []TraceEntry { return nil }
 // call, so there is no shared state to reset between blocks.
 func (r *Reader) ResetInternStrings() {}
 
-// FileBloom always returns nil. File-level bloom filters were removed in #437.
-func (r *Reader) FileBloom() *FileBloom { return nil }
-
-// FileBloomRaw always returns nil. File-level bloom filters were removed in #437.
-func (r *Reader) FileBloomRaw() []byte { return nil }
-
 // FileSketchSummaryRaw always returns nil. The KLL sketch index was removed in #435.
 func (r *Reader) FileSketchSummaryRaw() []byte { return nil }
 

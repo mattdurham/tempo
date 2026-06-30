@@ -2,7 +2,7 @@ package writer
 
 // NOTE: Any changes to this file must be reflected in the corresponding specs.md or NOTES.md.
 // NOTE-VEC-001: vectorAccumulator follows the same accumulate-at-flush pattern as
-// sketchIdx and fileBloomSvcNames. Do NOT serialize vectors inside flushBlocks().
+// sketchIdx. Do NOT serialize vectors inside flushBlocks().
 
 import (
 	"encoding/binary"

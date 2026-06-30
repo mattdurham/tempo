@@ -75,7 +75,7 @@ require (
 	github.com/bytedance/sonic v1.15.1
 	github.com/evanphx/json-patch v5.9.11+incompatible
 	github.com/googleapis/gax-go/v2 v2.22.0
-	github.com/grafana/blockpack v0.0.0-20260630125511-35fda52b
+	github.com/grafana/blockpack v0.0.0-20260630142747-ec5dcc535123
 	github.com/grafana/gomemcache v0.0.0-20251127154401-74f93547077b
 	github.com/grpc-ecosystem/go-grpc-middleware v1.4.0
 	github.com/hashicorp/golang-lru/v2 v2.0.7
@@ -128,7 +128,6 @@ require (
 require (
 	github.com/Microsoft/go-winio v0.6.2 // indirect
 	github.com/redis/go-redis/v9 v9.21.0 // indirect
-	github.com/rqlite/gorqlite v0.0.0-20260504155303-50d445fd0ab9 // indirect
 )
 
 require (
@@ -141,7 +140,6 @@ require (
 	cloud.google.com/go/monitoring v1.24.3 // indirect
 	github.com/Azure/azure-sdk-for-go/sdk/internal v1.11.2 // indirect
 	github.com/AzureAD/microsoft-authentication-library-for-go v1.6.0 // indirect
-	github.com/FastFilter/xorfilter v0.5.1 // indirect
 	github.com/GoogleCloudPlatform/opentelemetry-operations-go/detectors/gcp v1.31.0 // indirect
 	github.com/GoogleCloudPlatform/opentelemetry-operations-go/exporter/metric v0.55.0 // indirect
 	github.com/GoogleCloudPlatform/opentelemetry-operations-go/internal/resourcemapping v0.55.0 // indirect

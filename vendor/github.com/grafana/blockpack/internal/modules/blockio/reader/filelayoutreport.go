@@ -5,7 +5,6 @@ type FileLayoutReport struct {
 	Sections        []FileLayoutSection `json:"sections"`
 	RangeIndex      []RangeIndexColumn  `json:"range_index,omitempty"`
 	SketchIndex     *SketchIndexInfo    `json:"sketch_index,omitempty"`
-	FileBloom       *FileBloomInfo      `json:"file_bloom,omitempty"`
 	BlockSpanCounts []uint32            `json:"block_span_counts,omitempty"`
 	FileSize        int64               `json:"file_size"`
 	TotalSpans      int64               `json:"total_spans"`
