@@ -374,3 +374,48 @@ Back-refs:
 - `internal/modules/valueindex/filecache.go:IndexFileCache`
 - `internal/modules/valueindex/discovery.go:DiscoverIndexFiles`, `Lister`
 - `internal/modules/valueindex/filename.go:ParseFilenameV2`, `IsInTimeRange`, `SortFileMetas`
+
+---
+
+## NOTE-VI-037 — File discovery cache coherence: write-through + targeted eviction + V2-named compaction output (issue #431)
+
+Date: 2026-06-30
+
+Issue #431's acceptance criteria for value-index file discovery were partially met by
+NOTE-VI-032 (`DiscoverIndexFiles`) and NOTE-VI-034 (`IndexFileCache` periodic refresh).
+Two population paths from the issue's proposed model were missing, plus a latent pruning
+bug in the compactor's output naming:
+
+1. **Compactor wrote v1 filenames (latent pruning bug).** `valueindexcompactor.Service`
+   emitted merged output with `FormatFilename` (no embedded time range), while the consumer
+   emits L0 with `FormatFilenameV2`. `IsInTimeRange` treats a zero `WallMin/MaxSec` (v1
+   names) as *match-all*, so every compacted file (L1+) was returned by discovery for
+   *every* query window — silently defeating time-range pruning for all data above level 0.
+   Fix: the compaction output callback now `OpenReader`s the merged bytes, reads the footer
+   `WallMinTS/WallMaxTS`, and writes `FormatFilenameV2(outputLevel, min, max, id)`. The
+   embedded range is asserted to equal the footer range in
+   `TestRunOnce_OutputFilenamesEmbedTimeRange`.
+
+2. **Write-through on flush (`IndexFileCache.AddFile`).** Inserts a single freshly written
+   file's `FileMeta` into the cached listing for its column so it becomes queryable
+   *immediately* rather than after up to one refresh TTL. Replaces an existing key in place
+   (no duplicates) and re-`SortFileMetas` so order matches `DiscoverIndexFiles`. On an
+   *uncached* column it is a deliberate no-op: seeding a single-file entry would hide every
+   other existing file until the next refresh, whereas a cold miss lists the whole directory
+   and discovers the file anyway.
+
+3. **Targeted eviction (`IndexFileCache.RemoveFiles`).** Surgically drops the exact set of
+   compactor-deleted keys from a cached column without dropping the whole listing. Preferred
+   over `Invalidate` for compactor deletes: `Invalidate` forces the next query to re-LIST a
+   hot directory (a thundering re-list), while `RemoveFiles` is an in-memory filter that
+   keeps the rest of the listing warm. `Invalidate` is retained for the unknown-key-set case.
+
+Cross-process note: the consumer (writer) and querier (reader) are separate processes, so
+`AddFile`/`RemoveFiles` are in-process cache primitives the querier-side integration drives
+from flush/compaction *events* — they are not called by the consumer or compactor processes
+directly. Anchored in cmd/deadcode/main.go as querier-facing public API.
+
+Back-refs:
+- `internal/modules/valueindex/filecache.go:IndexFileCache.AddFile`, `RemoveFiles`
+- `internal/modules/valueindexcompactor/service.go` (V2-named output)
+- `internal/modules/valueindex/filename.go:FormatFilenameV2`, `IsInTimeRange`

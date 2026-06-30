@@ -125,12 +125,90 @@ func (c *IndexFileCache) FilesForTimeRange(
 	return filterMetas(metas, queryMinSec, queryMaxSec), nil
 }
 
-// Invalidate evicts the cached listing for one column. The compactor calls this
-// after merging files so the next query re-lists and observes the merged layout.
+// Invalidate evicts the cached listing for one column so the next query re-lists
+// and observes the current layout. RemoveFiles is preferred for compactor deletes
+// (it surgically drops the merged-away keys without forcing a full re-list); use
+// Invalidate only when the precise set of changed keys is unknown.
 func (c *IndexFileCache) Invalidate(colHash, colTypeName string) {
 	c.mu.Lock()
 	delete(c.entries, colKey{colHash: colHash, colTypeName: colTypeName})
 	c.mu.Unlock()
+}
+
+// AddFile inserts a single newly-written value-index file into the cached listing
+// for its column (write-through, NOTE-VI-037, issue #431). It lets a freshly
+// flushed file become queryable immediately instead of after up to one refresh
+// TTL. fullKey is the full S3 object key (e.g. as returned by the consumer's
+// indexKeyV2); its leaf name must be a parseable v1/v2 value-index filename.
+//
+// If the column is not cached yet AddFile is a no-op: a future cold miss will
+// LIST the directory and pick the file up, so there is nothing to seed. If the
+// key is already present (same Filename) it is replaced in place rather than
+// duplicated. The cached listing is kept sorted by SortFileMetas so callers
+// continue to see DiscoverIndexFiles ordering.
+//
+// A malformed leaf name returns an error and leaves the cache unchanged.
+func (c *IndexFileCache) AddFile(colHash, colTypeName, fullKey string) error {
+	meta, err := ParseFilenameV2(path.Base(fullKey))
+	if err != nil {
+		return err
+	}
+	meta.Filename = fullKey
+
+	key := colKey{colHash: colHash, colTypeName: colTypeName}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry := c.entries[key]
+	if entry == nil {
+		// Not cached: a cold miss will list and discover this file. Seeding a new
+		// entry from a single file would hide every other existing file until the
+		// next refresh, so leave it absent.
+		return nil
+	}
+	for i := range entry.metas {
+		if entry.metas[i].Filename == fullKey {
+			entry.metas[i] = meta // replace in place; no duplicate
+			SortFileMetas(entry.metas)
+			return nil
+		}
+	}
+	entry.metas = append(entry.metas, meta)
+	SortFileMetas(entry.metas)
+	return nil
+}
+
+// RemoveFiles surgically evicts the given full object keys from the cached listing
+// for one column (NOTE-VI-037, issue #431). The compactor calls this after
+// deleting its merged-away inputs so queries stop returning keys that no longer
+// exist, without dropping the whole column listing (which would force an
+// expensive full re-list of a hot directory).
+//
+// Keys not present in the cache (or a column that is not cached) are ignored.
+// Remaining metas keep their SortFileMetas order.
+func (c *IndexFileCache) RemoveFiles(colHash, colTypeName string, fullKeys ...string) {
+	if len(fullKeys) == 0 {
+		return
+	}
+	remove := make(map[string]struct{}, len(fullKeys))
+	for _, k := range fullKeys {
+		remove[k] = struct{}{}
+	}
+
+	key := colKey{colHash: colHash, colTypeName: colTypeName}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry := c.entries[key]
+	if entry == nil {
+		return
+	}
+	kept := entry.metas[:0]
+	for _, m := range entry.metas {
+		if _, drop := remove[m.Filename]; drop {
+			continue
+		}
+		kept = append(kept, m)
+	}
+	entry.metas = kept
 }
 
 // Background starts the periodic refresh goroutine. It returns immediately; the

@@ -242,7 +242,17 @@ func (s *Service) mergeLevel(ctx context.Context, colDir string, files []levelFi
 
 	var written int
 	stats, err := valueindex.CompactFiles(ctx, readers, cfg, func(data []byte) error {
-		key := path.Join(colDir, valueindex.FormatFilename(outputLevel, valueindex.NewID()))
+		// NOTE-VI-037 (#431): embed the merged file's wall time range in the output
+		// filename so DiscoverIndexFiles/IndexFileCache can prune compacted files by
+		// time exactly as it prunes L0 files. Writing v1 filenames (no range) here
+		// would force every compacted file to "always match" the time filter,
+		// silently defeating discovery pruning for all data above level 0.
+		var wallMinSec, wallMaxSec uint64
+		if r, readErr := valueindex.OpenReader(data); readErr == nil {
+			m := r.Meta()
+			wallMinSec, wallMaxSec = m.WallMinTS, m.WallMaxTS
+		}
+		key := path.Join(colDir, valueindex.FormatFilenameV2(outputLevel, wallMinSec, wallMaxSec, valueindex.NewID()))
 		if err := s.store.Put(ctx, key, data); err != nil {
 			s.metrics.incError(compactorOpPut)
 			return fmt.Errorf("valueindexcompactor: put %q: %w", key, err)
