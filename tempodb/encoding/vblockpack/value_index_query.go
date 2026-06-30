@@ -182,11 +182,28 @@ func (s *minioVIStore) List(ctx context.Context, prefix string) ([]string, error
 	return keys, nil
 }
 
+// mapNotFound translates a minio "no such key" / HTTP 404 into
+// blockpack.ErrValueIndexFileNotFound so the builder's downloadAll can recognise a
+// retention/compaction race (a file the listing cache still names but object
+// storage has already deleted) and skip the file instead of failing the index
+// build (blockpack issue #399 point 5). All other errors pass through unchanged so
+// transient failures still abort and fall back to a correct full scan.
+func mapNotFound(err error) error {
+	if err == nil {
+		return nil
+	}
+	resp := minio.ToErrorResponse(err)
+	if resp.StatusCode == 404 || resp.Code == "NoSuchKey" {
+		return blockpack.ErrValueIndexFileNotFound
+	}
+	return err
+}
+
 // Size returns the byte length of the object at key.
 func (s *minioVIStore) Size(key string) (int64, error) {
 	info, err := s.client.StatObject(context.Background(), s.bucket, key, minio.StatObjectOptions{})
 	if err != nil {
-		return 0, err
+		return 0, mapNotFound(err)
 	}
 	return info.Size, nil
 }
@@ -202,8 +219,11 @@ func (s *minioVIStore) ReadAt(key string, p []byte, off int64) (int, error) {
 	}
 	obj, err := s.client.GetObject(context.Background(), s.bucket, key, opts)
 	if err != nil {
-		return 0, err
+		return 0, mapNotFound(err)
 	}
 	defer func() { _ = obj.Close() }()
-	return io.ReadFull(obj, p)
+	// minio's GetObject is lazy: a 404 surfaces on the first read, not on the
+	// GetObject call, so map the read error too.
+	n, err := io.ReadFull(obj, p)
+	return n, mapNotFound(err)
 }

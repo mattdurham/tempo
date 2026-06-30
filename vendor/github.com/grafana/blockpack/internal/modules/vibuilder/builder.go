@@ -28,6 +28,7 @@ package vibuilder
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 
@@ -36,6 +37,21 @@ import (
 	"github.com/grafana/blockpack/internal/modules/valueindex"
 	"github.com/grafana/blockpack/internal/vm"
 )
+
+// ErrFileNotFound is the sentinel a FileStore returns (wrapped or bare) when the
+// requested value-index object does not exist in object storage — i.e. an S3 404 /
+// NoSuchKey. The querier treats a not-found file as an empty miss and skips it
+// rather than aborting the index build (NOTE-VI-041, issue #399 point 5).
+//
+// This is the last line of defense for the compactor's write-then-delete cycle:
+// the file-listing cache can hand the querier a key the compactor has just
+// deleted. A genuinely absent file holds no postings, so skipping it cannot
+// under-count results — unlike a transient network/auth error, which must still
+// abort the build so the caller falls back to a correct full scan.
+//
+// FileStore implementations signal a 404 by returning an error that satisfies
+// errors.Is(err, ErrFileNotFound) from either Size or ReadAt.
+var ErrFileNotFound = errors.New("vibuilder: value-index file not found")
 
 // FileStore downloads a single value-index file by its full object key. It is the
 // read half of the storage backend the querier already holds (tempo's S3 reader,
@@ -395,9 +411,12 @@ func allTypeBuckets() []modules_shared.ColumnType {
 
 // downloadAll reads every key fully into memory via store. A per-file read error
 // aborts the whole build (the caller falls back to a full scan) rather than
-// silently dropping a file, which would produce a wrong (under-counted) result.
-// It also returns the total bytes downloaded so the builder can record I/O stats
-// (issue #465).
+// silently dropping a file, which would produce a wrong (under-counted) result —
+// EXCEPT a not-found (ErrFileNotFound) file, which is skipped: the compactor's
+// write-then-delete cycle plus a stale listing cache can name a key that no longer
+// exists, and an absent file holds no postings, so dropping it cannot under-count
+// (NOTE-VI-041, issue #399 point 5). It also returns the total bytes downloaded so
+// the builder can record I/O stats (issue #465).
 func downloadAll(store FileStore, keys []string) ([][]byte, int64, error) {
 	if len(keys) == 0 {
 		return nil, 0, nil
@@ -407,6 +426,11 @@ func downloadAll(store FileStore, keys []string) ([][]byte, int64, error) {
 	for _, key := range keys {
 		data, err := readWhole(store, key)
 		if err != nil {
+			if errors.Is(err, ErrFileNotFound) {
+				// Retention/compaction deleted this file out from under a stale
+				// listing — treat as an empty miss and skip it.
+				continue
+			}
 			return nil, 0, fmt.Errorf("vibuilder: download %s: %w", key, err)
 		}
 		totalBytes += int64(len(data))
@@ -415,7 +439,9 @@ func downloadAll(store FileStore, keys []string) ([][]byte, int64, error) {
 	return files, totalBytes, nil
 }
 
-// readWhole reads the entire object at key into a single buffer.
+// readWhole reads the entire object at key into a single buffer. A not-found error
+// from either Size or ReadAt is returned verbatim so downloadAll can recognize it
+// via errors.Is(err, ErrFileNotFound) and skip the file.
 func readWhole(store FileStore, key string) ([]byte, error) {
 	size, err := store.Size(key)
 	if err != nil {

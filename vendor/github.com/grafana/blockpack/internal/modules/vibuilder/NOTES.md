@@ -37,7 +37,8 @@ per column) — the caller then skips the index path entirely.
 **Fail-safe on error.** A discovery or download error is returned to the caller,
 which must fall back to a full scan rather than fail the query. A per-file download
 error aborts the whole build (returning the error) rather than silently dropping a
-file, which would under-count results.
+file, which would under-count results — **except** a not-found file, which is
+skipped (see NOTE-VI-041).
 
 **Why a separate package.** The orchestration needs `valueindex` (predicates,
 QueryFiles, IndexFileCache), `executor` (VILookupResult, SliceValueIndexSource), and
@@ -77,3 +78,35 @@ Back-ref: `builder.go` (lookupColumn/lookupColumnAll/downloadAll/BuildSource),
 RecordFileIO), `api.go` (ValueIndexBuildStats alias).
 Tests: `builder_test.go:TestBuildSource_Stats*`,
 `metrics_trace_vi_test.go:TestSliceValueIndexSource_StatsAccumulate`.
+
+## NOTE-VI-041: a not-found value-index file is a skipped miss, not a build failure (issue #399 point 5)
+
+*Added: 2026-06-30*
+
+`ErrFileNotFound` is the sentinel a `FileStore` returns (wrapped or bare) when the
+requested value-index object does not exist — an S3 404 / NoSuchKey. `downloadAll`
+recognizes it via `errors.Is` and **skips** that file instead of aborting the whole
+build; every other read error still aborts (the caller falls back to a correct full
+scan).
+
+**Why skip is safe — and only for not-found.** The value-index compactor (issue
+#399) writes its merged output then deletes the inputs; the querier's file-listing
+cache (issue #462) can still name a key the compactor has just deleted. A genuinely
+absent file holds zero postings, so dropping it cannot under-count results — it is
+the last line of defense after the compactor cleans up stale source refs. A
+transient error (network, auth, 5xx) is the opposite: the file may well hold
+matching spans, so silently dropping it *would* under-count. The distinction is the
+whole point — classify narrowly (404 only), abort on everything else.
+
+**Wiring.** `blockpack.ErrValueIndexFileNotFound` re-exports the sentinel for tempo;
+tempo's `minioVIStore.Size`/`ReadAt` map a minio `NoSuchKey`/`404` to it via
+`mapNotFound` (minio's `GetObject` is lazy, so the 404 surfaces on the first read,
+not the call — both paths run through `mapNotFound`). `io.EOF` and non-404 errors
+pass through unchanged.
+
+Back-ref: `builder.go` (ErrFileNotFound, downloadAll), `valueindex_query.go`
+(ErrValueIndexFileNotFound), tempo `value_index_query.go` (mapNotFound).
+Tests: `builder_test.go:TestBuildSource_NotFoundFileIsSkippedNotFailed`,
+`TestBuildSource_AllFilesNotFoundIsCoveredEmpty`,
+`TestBuildSource_NonNotFoundDownloadErrorStillFails`; tempo
+`value_index_query_test.go:TestMapNotFound`.

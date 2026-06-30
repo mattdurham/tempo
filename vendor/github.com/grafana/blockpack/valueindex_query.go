@@ -57,6 +57,15 @@ func NewIndexFileCache(lister Lister, tenant, indexPrefix string, ttl time.Durat
 // query execution is a pure in-memory pass over the file bytes.
 type ValueIndexFileStore = vibuilder.FileStore
 
+// ErrValueIndexFileNotFound is the sentinel a ValueIndexFileStore returns (wrapped
+// or bare) when the requested value-index object does not exist — an S3 404 /
+// NoSuchKey. The querier treats a not-found file as an empty miss and skips it
+// rather than failing the index build, so the compactor's write-then-delete cycle
+// plus a stale listing cache cannot turn a benign race into a query error
+// (NOTE-VI-041, issue #399). Store implementations map their backend's 404 to this
+// sentinel; recognize it with errors.Is(err, ErrValueIndexFileNotFound).
+var ErrValueIndexFileNotFound = vibuilder.ErrFileNotFound
+
 // BuildValueIndexSource assembles a SliceValueIndexSource for prog over the time
 // window [minSec, maxSec] using disc for cached file discovery and store for
 // downloads.
