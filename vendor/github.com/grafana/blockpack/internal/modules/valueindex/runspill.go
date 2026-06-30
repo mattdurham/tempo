@@ -40,21 +40,22 @@ func writeRun(colType shared.ColumnType, entries []rawEntry) (*runFile, error) {
 		return nil, fmt.Errorf("valueindex: writeRun: create temp: %w", err)
 	}
 	bw := bufio.NewWriterSize(f, 256<<10)
+	name := f.Name()
 	for i := range entries {
 		if err := writeRawEntry(bw, &entries[i]); err != nil {
 			_ = f.Close()
-			_ = os.Remove(f.Name())
+			_ = os.Remove(name) //nolint:gosec // G703: name comes from os.CreateTemp, not user input
 			return nil, fmt.Errorf("valueindex: writeRun: %w", err)
 		}
 	}
 	if err := bw.Flush(); err != nil {
 		_ = f.Close()
-		_ = os.Remove(f.Name())
+		_ = os.Remove(name) //nolint:gosec // G703: name comes from os.CreateTemp, not user input
 		return nil, fmt.Errorf("valueindex: writeRun: flush: %w", err)
 	}
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		_ = f.Close()
-		_ = os.Remove(f.Name())
+		_ = os.Remove(name) //nolint:gosec // G703: name comes from os.CreateTemp, not user input
 		return nil, fmt.Errorf("valueindex: writeRun: seek: %w", err)
 	}
 	return &runFile{f: f, path: f.Name()}, nil
@@ -70,15 +71,29 @@ func (r *runFile) remove() {
 	}
 }
 
-// rawEntryFixedSize is the byte size of the fixed portion of a spilled rawEntry:
-// time_sec[8] + trace_id[16] + block_ref[5] (NOTE-V2-002).
-const rawEntryFixedSize = 8 + 16 + shared.BlockFileRefWireSize
+// spillV2Flag is the flag byte that prefixes v2 rawEntry spill records.
+// 0 = v1 (BlockID uint32), 1 = v2 (BlockRef 5-byte).
+const spillV2Flag byte = 1
+
+// spillV4Flag is the flag byte for v4 rawEntry spill records (BlockRef + SpanID + RowIdx).
+const spillV4Flag byte = 2
 
 // writeRawEntry serializes one rawEntry in the spill wire format. The valueHash is
 // recomputed on read from canonicalValue, so it is not persisted.
 //
-// Wire: val_len[2] + val[N] + time_sec[8] + trace_id[16] + block_ref[5] + ref_len[2] + ref[N]
+// v1 wire: flag[1]=0 + val_len[2]+val[N]+time_sec[8]+trace_id[16]+block_id[4]+ref_len[2]+ref[N]
+// v2 wire: flag[1]=1 + val_len[2]+val[N]+time_sec[8]+trace_id[16]+block_page[3]+block_len_pages[2]+ref_len[2]+ref[N]
 func writeRawEntry(w io.Writer, e *rawEntry) error {
+	// Version flag: 0=v1 (BlockID), 1=v2 (BlockRef).
+	var ver [1]byte
+	if e.spanID != ([8]byte{}) {
+		ver[0] = spillV4Flag
+	} else if e.blockRef.PageNum > 0 || e.blockRef.LenPages > 0 {
+		ver[0] = spillV2Flag
+	}
+	if _, err := w.Write(ver[:]); err != nil {
+		return err
+	}
 	var hdr [2]byte
 	binary.LittleEndian.PutUint16(hdr[:], uint16(len(e.canonicalValue))) //nolint:gosec // bounded
 	if _, err := w.Write(hdr[:]); err != nil {
@@ -87,12 +102,31 @@ func writeRawEntry(w io.Writer, e *rawEntry) error {
 	if _, err := w.Write(e.canonicalValue); err != nil {
 		return err
 	}
-	var fixed [rawEntryFixedSize]byte
+	var fixed [29]byte
 	binary.LittleEndian.PutUint64(fixed[0:], e.timeSec)
 	copy(fixed[8:24], e.traceID[:])
-	// Page bounded by file size; encode only errors on uint24 overflow (64 GB file).
-	_ = shared.EncodeBlockFileRef(fixed[24:], e.blockRef)
-	if _, err := w.Write(fixed[:]); err != nil {
+	var fixedLen int
+	//nolint:gosec // intentional little-endian byte masks (the encoding), not overflow
+	switch ver[0] {
+	case spillV4Flag:
+		fixed[24] = byte(e.blockRef.PageNum)
+		fixed[25] = byte(e.blockRef.PageNum >> 8)
+		fixed[26] = byte(e.blockRef.PageNum >> 16)
+		fixed[27] = byte(e.blockRef.LenPages)
+		fixed[28] = byte(e.blockRef.LenPages >> 8)
+		fixedLen = 29
+	case spillV2Flag:
+		fixed[24] = byte(e.blockRef.PageNum)
+		fixed[25] = byte(e.blockRef.PageNum >> 8)
+		fixed[26] = byte(e.blockRef.PageNum >> 16)
+		fixed[27] = byte(e.blockRef.LenPages)
+		fixed[28] = byte(e.blockRef.LenPages >> 8)
+		fixedLen = 29
+	default:
+		binary.LittleEndian.PutUint32(fixed[24:], e.blockID)
+		fixedLen = 28
+	}
+	if _, err := w.Write(fixed[:fixedLen]); err != nil {
 		return err
 	}
 	binary.LittleEndian.PutUint16(hdr[:], uint16(len(e.sourceRef))) //nolint:gosec // bounded
@@ -102,34 +136,58 @@ func writeRawEntry(w io.Writer, e *rawEntry) error {
 	if _, err := io.WriteString(w, e.sourceRef); err != nil {
 		return err
 	}
+	// v4: append SpanID[8]+RowIdx[2].
+	if ver[0] == spillV4Flag {
+		var identity [10]byte
+		copy(identity[0:8], e.spanID[:])
+		binary.LittleEndian.PutUint16(identity[8:10], e.rowIdx)
+		if _, err := w.Write(identity[:]); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
 // readRawEntry reads one rawEntry from a run file, recomputing valueHash. Returns
 // io.EOF at clean end of stream.
 func readRawEntry(r *bufio.Reader) (rawEntry, error) {
+	// Version flag byte.
+	verByte, err := r.ReadByte()
+	if err != nil {
+		return rawEntry{}, err // io.EOF propagates on clean boundary
+	}
+	isV2 := verByte == spillV2Flag || verByte == spillV4Flag
+	isV4 := verByte == spillV4Flag
+
 	var hdr [2]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
-		return rawEntry{}, err // io.EOF propagates on clean boundary
+		return rawEntry{}, fmt.Errorf("valueindex: readRawEntry: val_len: %w", err)
 	}
 	valLen := int(binary.LittleEndian.Uint16(hdr[:]))
 	cv := make([]byte, valLen)
 	if _, err := io.ReadFull(r, cv); err != nil {
 		return rawEntry{}, fmt.Errorf("valueindex: readRawEntry: value: %w", err)
 	}
-	var fixed [rawEntryFixedSize]byte
-	if _, err := io.ReadFull(r, fixed[:]); err != nil {
+	var fixed [29]byte
+	fixedLen := 28
+	if isV2 {
+		fixedLen = 29
+	}
+	if _, err := io.ReadFull(r, fixed[:fixedLen]); err != nil {
 		return rawEntry{}, fmt.Errorf("valueindex: readRawEntry: fixed: %w", err)
 	}
 	var re rawEntry
 	re.canonicalValue = cv
 	re.timeSec = binary.LittleEndian.Uint64(fixed[0:])
 	copy(re.traceID[:], fixed[8:24])
-	blockRef, brErr := shared.DecodeBlockFileRef(fixed[24:])
-	if brErr != nil {
-		return rawEntry{}, fmt.Errorf("valueindex: readRawEntry: block_ref: %w", brErr)
+	if isV2 {
+		re.blockRef = BlockRef{
+			PageNum:  uint32(fixed[24]) | uint32(fixed[25])<<8 | uint32(fixed[26])<<16,
+			LenPages: uint16(fixed[27]) | uint16(fixed[28])<<8,
+		}
+	} else {
+		re.blockID = binary.LittleEndian.Uint32(fixed[24:])
 	}
-	re.blockRef = blockRef
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return rawEntry{}, fmt.Errorf("valueindex: readRawEntry: ref_len: %w", err)
 	}
@@ -139,6 +197,15 @@ func readRawEntry(r *bufio.Reader) (rawEntry, error) {
 		return rawEntry{}, fmt.Errorf("valueindex: readRawEntry: ref: %w", err)
 	}
 	re.sourceRef = string(ref)
+	// v4: read SpanID[8]+RowIdx[2].
+	if isV4 {
+		var identity [10]byte
+		if _, err := io.ReadFull(r, identity[:]); err != nil {
+			return rawEntry{}, fmt.Errorf("valueindex: readRawEntry: v4 identity: %w", err)
+		}
+		copy(re.spanID[:], identity[0:8])
+		re.rowIdx = binary.LittleEndian.Uint16(identity[8:10])
+	}
 	re.valueHash = ValueHash16(cv)
 	return re, nil
 }

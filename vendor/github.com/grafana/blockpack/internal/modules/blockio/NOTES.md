@@ -7,6 +7,7 @@ re-introducing decisions that were deliberately reversed.
 ---
 
 ## 1. Object Storage I/O Model
+
 *Added: 2026-02-10*
 
 **Decision:** Read entire blocks in a single I/O operation. Never add per-column I/O.
@@ -17,6 +18,7 @@ earlier versions and produced 10–120× more API calls with no meaningful bandw
 The cost model is: minimize round-trips, not bytes transferred.
 
 **Metric thresholds:**
+
 - `io_ops` per query: <500 good, 500–1000 warning, >1000 critical
 - `bytes/io`: >100 KB good, 10–100 KB warning, <10 KB critical
 
@@ -28,12 +30,14 @@ target infrastructure.
 ---
 
 ## 2. Sort-Then-Write Span Ordering
+
 *Added: 2026-02-10*
 
 **Decision:** Buffer all spans during `AddSpan`/`AddTracesData`, then sort during `Flush`.
 Sort key: `(service.name, MinHashSig, TraceID)`.
 
 **Rationale:**
+
 - **Service name** clusters spans from the same service into the same blocks, improving
   the effectiveness of the range index (service name is a common query predicate).
 - **MinHash signature** clusters spans with similar attribute sets. This improves dictionary
@@ -48,6 +52,7 @@ all spans in memory until `Flush` is called. `CurrentSize()` estimates ~2 KB per
 ---
 
 ## 3. Incremental Range Index Construction
+
 *Added: 2026-02-10, updated: 2026-02-27*
 
 **Decision:** During block building, `blockBuilder` tracks only the per-column minimum and
@@ -59,6 +64,7 @@ column, which feeds the min and max into the column's KLL sketch (embedded in
 **Rationale:** The previous approach appended one `blockRangeValue` per span per column
 (O(spans × columns) per block), requiring pre-allocation of `spanHint * 32` capacity to
 avoid growslice. The per-column min/max approach:
+
 1. Reduces per-block range index work from O(spans × columns) to O(columns) — a 100-2000x
    reduction for typical blocks with 2000 spans and 30 attributes.
 2. Eliminates the large `rangeVals` slice (was up to `2000 * 32 * ~40 bytes ≈ 2.5 MB` per
@@ -74,6 +80,7 @@ buckets via `appendUniqueBlockID`. No full re-scan of the range index is needed.
 ---
 
 ## 4. KLL Sketches for Range Index Buckets
+
 *Added: 2026-02-10, updated: 2026-02-26*
 
 **Decision:** All range index columns use a correct multi-level KLL compaction sketch
@@ -99,6 +106,7 @@ full-scan pass at `Flush()` time is needed. See §17 for the full rationale.
 ---
 
 ## 5. Per-Writer zstd Encoder
+
 *Added: 2026-02-10*
 
 **Decision:** A single `*zstd.Encoder` is created at writer construction and reused for all
@@ -117,12 +125,14 @@ internally by writing to the output stream immediately after compression.
 ---
 
 ## 6. Encoding Selection at Build Time
+
 *Added: 2026-02-10*
 
 **Decision:** `columnBuilder.buildData` chooses the encoding kind based on column type,
 data characteristics, and column name heuristics evaluated once at block finalization.
 
 Selection logic:
+
 - **Uint64 columns:** analyze `(max - min)` range and cardinality via `shouldUseDeltaEncoding`.
   Delta wins when range ≤ 65535 (fits uint16), or range ≤ uint32 and cardinality > 3, or
   cardinality > 2 for larger ranges.
@@ -141,6 +151,7 @@ encoding with delta indexes gives better compression.
 ---
 
 ## 7. UUID Auto-Detection
+
 *Added: 2026-02-10, updated: 2026-02-26*
 
 **Decision:** String columns whose sampled values all match UUID format are transparently
@@ -160,12 +171,14 @@ fails full UUID conversion, the entire column falls back to string encoding for 
 ---
 
 ## 8. Block Size Targeting
+
 *Added: 2026-02-10*
 
 **Decision:** Default block target is 512 KB compressed. Writer closes a block when adding
 the next span would exceed this target.
 
 **Rationale:** 512 KB is a sweet spot between:
+
 - Enough data for dictionary compression to achieve good ratios (>1000 spans typically).
 - Small enough that a single block read (I/O) stays under 1 MB, even accounting for
   variance.
@@ -178,6 +191,7 @@ exceed `MaxBlockSpans`.
 ---
 
 ## 9. Concurrent Access Detection
+
 *Added: 2026-02-10*
 
 **Decision:** Writer uses `atomic.Bool` to detect concurrent calls to `AddSpan` or `Flush`.
@@ -190,6 +204,7 @@ the non-concurrent case (atomic store of 0→1 on entry, 1→0 on exit).
 ---
 
 ## 10. Arena Allocation in Reader
+
 *Added: 2026-02-10*
 
 **Decision:** Column decoding supports `*arena.Arena` for reduced GC pressure. Dictionaries
@@ -209,6 +224,7 @@ bitsets MAY use `makeSlice[T](a, n)` for arena allocation.
 ---
 
 ## 11. Lazy Dedicated Index Parsing
+
 *Added: 2026-02-10*
 
 **Decision:** `parseV5MetadataLazy` records byte offsets for each dedicated column index
@@ -226,6 +242,7 @@ parsed result is cached in `Reader.dedicatedIndex[column]` after first parse.
 ---
 
 ## 12. Block Reuse in Query Path
+
 *Added: 2026-02-10*
 
 **Decision:** `parseBlockColumnsReuse` accepts an optional `*Block` to reuse its allocation.
@@ -243,6 +260,7 @@ query calls.
 ---
 
 ## 13. Coalescing Strategy
+
 *Added: 2026-02-10*
 
 **Decision:** `CoalesceBlocks` merges adjacent block reads using
@@ -272,6 +290,7 @@ block); it simply prevents further merging beyond it.
 ---
 
 ## 14. Format Versioning
+
 *Added: 2026-02-10*
 
 Two version spaces exist and must not be confused:
@@ -291,6 +310,7 @@ V11, but the metadata section is snappy-compressed. See §28 for rationale.
 ---
 
 ## 15. Column Name Bloom Filter
+
 *Added: 2026-02-10*
 
 Each block's `ColumnNameBloom` is a 32-byte (256-bit) Golomb-style bloom filter tested
@@ -306,6 +326,7 @@ The bloom is built by the writer calling `SetBit(bloom[:], hash1 % 256)` and
 ---
 
 ## 16. Sparse Column Backfill in addColumn
+
 *Added: 2026-02-10*
 
 **Invariant:** Every column in a block must have exactly `spanCount` rows.
@@ -334,6 +355,7 @@ optional attributes like `span.http.method`, `span.db.statement`, etc.
 ---
 
 ## 17. Incremental KLL Construction for Range Buckets
+
 *Added: 2026-02-25, updated: 2026-02-27*
 
 **Decision:** KLL quantile sketches are built incrementally alongside block writing.
@@ -353,6 +375,7 @@ at query time and returning zero results for valid queries.
 longer exists.
 
 **Incremental approach (`addBlockRangeToColumn`):**
+
 1. For each block, `blockBuilder` computes the per-column min and max encoded key.
 2. `buildAndWriteBlock` calls `addBlockRangeToColumn` for each column, which:
    a. Appends a `blockRange{minKey, maxKey, blockID}` entry to `cd.blocks`.
@@ -378,6 +401,7 @@ are returned for any predicate on that column — correct, conservative behavior
 ---
 
 ## 18. executor_test.go Uses New Executor Directly
+
 *Added: 2026-02-25*
 
 **As of the modules executor migration:** `internal/modules/blockio/executor_test.go`
@@ -386,6 +410,7 @@ no longer routes through `adapter.go` + `internal/executor`. It calls
 with `r` being a `*modules_reader.Reader`.
 
 **What this means:**
+
 - EX-01 through EX-07 in `executor_test.go` are now integration tests of the real
   new execution path (writer → reader → queryplanner → executor).
 - The `BuildPredicates` function (via `planBlocks`) in `internal/modules/executor` is exercised by every
@@ -398,6 +423,7 @@ with `r` being a `*modules_reader.Reader`.
 ---
 
 ## 19. addPresent Promoted from Closure to Method
+
 *Added: 2026-02-26*
 
 **Decision:** `addPresent` is an unexported method on `*blockBuilder`, not a local closure
@@ -420,6 +446,7 @@ be written as an unexported method on `*blockBuilder`, not as a local closure.
 ---
 
 ## 20. addColumn Uses Remaining-Capacity Hint for Dynamic Columns
+
 *Added: 2026-02-26*
 
 **Decision:** `addColumn` passes `max(b.spanHint-b.spanCount, 0)` (not `b.spanHint`) as
@@ -432,6 +459,7 @@ the dominant source was the `make([]string, 0, spanHint)` call in `newColumnBuil
 for columns first appearing late in a block (N close to `spanHint`).
 
 Using `max(b.spanHint-b.spanCount, 0)` as the hint:
+
 - Columns first seen at row 0 get full `spanHint` capacity (unchanged, no regression).
 - Columns first seen at row 1900 of a 2000-span block get capacity 100 (correct).
 - `max(..., 0)` protects against the degenerate case where `b.spanCount >= b.spanHint`.
@@ -448,6 +476,7 @@ the systematic over-allocation it replaces.
 ---
 
 ## 22. UUID Auto-Detection Graceful Fallback
+
 *Added: 2026-02-26*
 
 **Decision:** `stringColumnBuilder.buildData` falls through to standard string encoding when
@@ -479,6 +508,7 @@ dead code and is harmless.
 ---
 
 ## 23. flushBlocks Error-Path Cleanup
+
 *Added: 2026-02-26; updated 2026-02-26 (arena removed — see §24)*
 
 **Decision:** `flushBlocks()` cleans up `w.spans` in the `buildAndWriteBlock` error path.
@@ -500,6 +530,7 @@ partially-written blocks cannot be un-written.
 ---
 
 ## 24. Arena Removed from Writer (GC Crash Fix)
+
 *Added: 2026-02-26*
 
 **Problem:** Production Tempo reported `fatal error: found bad pointer in Go heap` under the
@@ -512,6 +543,7 @@ When the GC later scanned the capacity tail of `w.spans`, it found these stale p
 fired `runtime.badPointer`.
 
 Two complementary bugs contributed:
+
 1. `clear(w.spans)` only clears up to `len`, not `cap`. Capacity-tail elements are not
    zeroed, so stale `[]AttrKV` headers survive arena.Free().
 2. `attrArena.Free()` calls `xunsafe.Clear` on smaller blocks. The OS may subsequently
@@ -533,6 +565,7 @@ correctness is the right trade-off.
 ---
 
 ## 21. AddSpan Uses Arena-Backed Attribute Parsing
+
 *Added: 2026-02-26; superseded by §24 (arena removed 2026-02-26)*
 
 Arena-backed attribute parsing (`parseOTLPAttrsArena`, `convertAnyMapArena`) was introduced
@@ -544,9 +577,11 @@ single heap-allocating variants used by all code paths.
 ---
 
 ## 25. Column Index (§5.3) and Column Stats (§8.3) Removed
+
 *Added: 2026-02-27*
 
 **Decision:** Two format sections previously identified as unused have been removed:
+
 - **Column Index (§5.3):** `r.columnIndexes` was parsed at reader open time but never read
   by any query execution path. Column offsets are always taken from `block.column_metadata`
   (§8.2) during block parsing. Writer now writes `col_count=0` per block; reader skips the
@@ -557,11 +592,13 @@ single heap-allocating variants used by all code paths.
   (always zero) for format compatibility with existing files; the reader skips them.
 
 **Size impact:** Based on pre-removal benchmarks on real Tempo trace data:
+
 - Column Index: ~4.1% of total file size (~1.79 bytes/span across 29M spans).
 - Column Stats: negligible in new files (zero bytes); significant savings for old files
   that had written stats.
 
 **Format compatibility:**
+
 - New files: column index section bytes `block_count × uint32(0)` are written for
   structural compatibility with old readers that expect exactly this section to be present.
 - Old files (with non-zero stats): still readable — `parseColumnMetadataArray` skips the
@@ -569,6 +606,7 @@ single heap-allocating variants used by all code paths.
   ignored.
 
 **Code removed:**
+
 - `writer/stats.go` — all stats types (`stringStats`, `int64Stats`, `uint64Stats`,
   `float64Stats`, `boolStats`, `bytesStats`), all accumulate functions, all encode functions.
 - `writer/column_builder.go` — `buildStats() []byte` removed from the `columnBuilder`
@@ -591,6 +629,7 @@ identical behaviour with no intermediate stats allocation.
 ---
 
 ## 26. Block Header Trace Table and Block Index Value Statistics Removed
+
 *Added: 2026-02-27*
 
 Two additional structures were removed from the format as part of the filesize reduction
@@ -640,6 +679,7 @@ zero-length stats section parse correctly.
 ---
 
 ## 27. Log Signal Write Path — Parallel Code Paths on Writer
+
 *Added: 2026-02-27*
 
 **Decision:** Add OTEL log record support using parallel code paths on the existing `Writer`
@@ -680,11 +720,12 @@ struct, controlled by a `signalType uint8` field set on the first `AddLogsData` 
    calls `blockBuilder.finalize`. All column encoding infrastructure is reused.
 
 **Scope:** Writer + reader signal type detection only. Query engine, compaction, Tempo API,
-LogQL, and metrics signal type are explicitly out of scope.
+and metrics signal type are explicitly out of scope.
 
 ---
 
 ## 28. WithArena Removed — Dead Code Cleanup
+
 *Added: 2026-02-27*
 
 **Decision:** Remove `WithArena(a *arena.Arena) Option` and the `readerOptions.arena`
@@ -705,6 +746,7 @@ Future reader arena allocation, if desired, should use `internal/modules/arena/`
 ---
 
 ## 29. Snappy Metadata Compression (V12)
+
 *Added: 2026-02-27*
 
 **Decision:** Compress the entire metadata section as a single snappy blob. Signal via
@@ -758,6 +800,7 @@ breakdown is not available at physical byte granularity when metadata is compres
 ---
 
 ## 30. BlockMeta.MinStart / MaxStart Used for Time-Range Pruning in Log Queries
+
 *Added: 2026-03-02*
 
 **Context:** `queryplanner.Plan()` now accepts a `TimeRange` parameter (MinNano, MaxNano)
@@ -783,6 +826,7 @@ practice all blocks have non-zero timestamps.
 ---
 
 ## 31. Native Column Compaction Path — Zero OTLP Allocations
+
 *Added: 2026-02-28*
 
 **Decision:** Compaction reads raw column values directly into `pendingSpan` and flushes
@@ -790,6 +834,7 @@ them via `addRowFromBlock`. No OTLP proto objects (`*tracev1.Span`, `*commonv1.K
 `*commonv1.AnyValue`) are created during the compaction hot path.
 
 **Background:** The original compaction path routed through full OTLP proto materialization:
+
 ```
 Block columns → *tracev1.Span + map[string]any (spanFromRow)
              → *KV + *AnyValue per attribute (anyToKV / columnAny)
@@ -797,6 +842,7 @@ Block columns → *tracev1.Span + map[string]any (spanFromRow)
              → AddSpan → pendingSpan
              → addRowFromBlock → Block columns
 ```
+
 Profiling showed this generated ~85 billion unnecessary object allocations per ingest
 window (`compaction.spanFromRow` 14.5B, `compaction.columnAny` 24.6B, `compaction.anyToKV`
 12.9B, plus downstream proto allocs) — ~24% of total lifetime allocations and a primary
@@ -846,6 +892,7 @@ spans across blocks) validate the native path end-to-end.
 ---
 
 ## 31. FileLayout UncompressedSize for Column Data Sections
+
 *Added: 2026-02-27*
 
 **Decision:** `FileLayout()` now populates `UncompressedSize` on column data sections by
@@ -878,6 +925,7 @@ trace_index) do not set `UncompressedSize` — they are stored uncompressed on d
 sections omit the field in serialized output.
 
 ## 15. Per-File TS Index for Direction-Aware Block Selection
+
 *Added: 2026-03-02*
 
 **Decision:** Write a TS index section (sorted minTS/maxTS/blockID tuples) into the
@@ -899,6 +947,7 @@ section. Size impact: N × 20 bytes raw; compresses to ~10-12 KB for 1000 blocks
 ---
 
 ## 32. Log MinHash Hashes key=value Pairs; Trace MinHash Hashes Keys Only
+
 *Added: 2026-03-02*
 
 **Decision:** `computeMinHashSigFromLog` hashes `"key=value"` pairs (via FNV-1a over key
@@ -908,24 +957,10 @@ bytes + '=' separator + string value bytes) rather than just key names.
 **Rationale:** The two signal types have fundamentally different attribute distributions:
 
 - **Traces:** Different span types have different attribute schemas (e.g. HTTP spans have
-  `http.method`, DB spans have `db.system`). Hashing key names clusters spans by _schema
-  similarity_, which is what improves compression and block-level pruning for traces.
+  `http.method`, DB spans have `db.system`). Hashing key names clusters spans by *schema
+  similarity*, which is what improves compression and block-level pruning for traces.
 
-- **Logs (Loki-style):** Log streams within a service share an identical attribute schema
-  (every stream has the same set of label keys, e.g. `{cluster, namespace, service_name}`).
-  If only key names are hashed, all streams within a service collapse to the same MinHash
-  signature, defeating the clustering benefit. Hashing `"key=stringValue"` produces a
-  distinct signature per stream (since streams differ in label values), enabling the writer
-  to cluster records from the same stream together in the same blocks.
-
-**Implementation detail:** For non-string attribute values (int, double, bool, bytes), the
-function falls back to hashing the key name only (via `addHashToMinHeap`) to avoid
-allocating a string representation. This is a minor precision trade-off: non-string
-attributes have less impact on log stream identity than the string-valued label attributes
-used by Loki.
-
-**Back-ref:** `internal/modules/blockio/writer/writer_log.go:computeMinHashSigFromLog`,
-`internal/modules/blockio/writer/writer_sort.go:addKVHashToMinHeap`
+**Back-ref:** `internal/modules/blockio/writer/writer_sort.go:addKVHashToMinHeap`
 
 ## 33. Column Maps Keyed by (Name, Type) to Prevent Silent Data Loss
 
@@ -953,7 +988,7 @@ variants for a given attribute name. `GetColumn(name)` retains backward compatib
 returning the first match.
 
 **Bloom filter stays name-only:** The block-level column name bloom filter tracks names (not
-types) because block-level pruning only needs to know whether _any_ column with that name
+types) because block-level pruning only needs to know whether *any* column with that name
 exists. Having both `span.foo/string` and `span.foo/int64` is correctly represented by a
 single bloom entry for `"span.foo"`.
 
@@ -1003,12 +1038,9 @@ writers automatically get version-1 indexes; new readers support both versions.
 **Decision:** Parse log record bodies (JSON or logfmt) at write time and store all
 extracted top-level fields as sparse `log.{key}` `ColumnTypeRangeString` columns.
 
-**Rationale:** Loki/LogQL queries frequently filter on structured body fields
-(`| level="error"`, `| duration>100`). Without body parsing at ingest, these filters
-cannot be pushed down to block-level predicates — every block must be read and every
-row must be pipeline-evaluated. By storing extracted fields as dedicated range columns,
-the executor can use bloom filter + range index pruning identically to how it prunes on
-resource attributes, reducing I/O by skipping blocks that cannot match.
+**Rationale:** Without body parsing at ingest, log field filters cannot be pushed down
+to block-level predicates. By storing extracted fields as dedicated range columns, the
+executor can use bloom filter + range index pruning identically to resource attributes.
 
 **Why at ingest, not at query time:** Block pruning requires per-block metadata
 (bloom filters, min/max range index) written at ingest time. Query-time parsing cannot
@@ -1067,6 +1099,7 @@ and builds the same `map[[16]byte][]uint16` (block IDs only) in both cases.
 ---
 
 ## 39. Lazy Column Decode — Presence-Only Registration + On-Demand Full Decode
+
 *Added: 2026-03-05*
 
 **Decision:** `parseBlockColumnsReuse` now performs lazy registration for all columns
@@ -1102,6 +1135,7 @@ this with ~0.04s presence-only reads + ~0.15s for the ~15 columns actually acces
 ---
 
 ## 40. Numeric String Range Index Promotion
+
 *Added: 2026-03-05*
 
 **Decision:** At block build time, `logBlockBuilder` attempts to parse all non-empty
@@ -1118,6 +1152,7 @@ queries. With numeric promotion, the KLL computes numerically correct quantile
 boundaries and pruning works as expected.
 
 **Invariants:**
+
 - A single non-parseable non-empty value marks the column as non-numeric for the
   entire block. All-or-nothing per block.
 - Empty strings (present=true, val.Str="") are ignored — they are null fills from
@@ -1140,6 +1175,7 @@ value.
 ---
 
 ## 41. IterateFields Must Skip ColumnTypeRangeString (Body-Parsed Range Columns)
+
 *Added: 2026-03-05*
 
 **Decision:** `modulesSpanFieldsAdapter.IterateFields` skips columns of type
@@ -1151,32 +1187,16 @@ exist solely for range-index support and block-level pruning — they are not ra
 LogRecord attributes (StructuredMetadata). The chunk store never exposes body-parsed
 fields as SM.
 
-`LokiConverter.extractStructuredMetadata` calls `IterateFields` and collects all
-`log.*` string-valued columns as Loki StructuredMetadata. Before this fix, it would
-collect body-parsed `log.level`, `log.msg`, `log.duration_seconds`, etc. as SM. This
-caused the Loki Pipeline (`| json`, `| logfmt`) to see pre-populated SM fields
-matching the same keys it was about to extract from the body — producing `_extracted`
-suffix collisions, different label sets, and entry-count mismatches vs the chunk store.
+Body-parsed `log.*` columns of type `ColumnTypeRangeString` must not be emitted as
+Attributes in `IterateFields`. Only `ColumnTypeString` log.* columns (real LogRecord
+attributes) pass through.
 
-Real LogRecord attributes (e.g. `detected_level` from SeverityText, SM from
-`entry.StructuredMetadata`) are stored as `ColumnTypeString`. They are correctly
-included in IterateFields output and must not be skipped.
-
-**Invariants:**
-- `ColumnTypeRangeString` columns are always body-parsed; they are never written as raw
-  LogRecord attributes.
-- `ColumnTypeString` log.* columns are always real SM; they must pass through.
-- `GetField` (direct column lookup by name) is unaffected — it calls `modulesGetValue`
-  directly without the IterateFields loop.
-- `SpanMatch.Clone()` also uses `IterateFields`; omitting `ColumnTypeRangeString` there
-  is correct since those are internal index columns not useful to Clone callers.
-
-**Back-ref:** `internal/modules/blockio/span_fields.go:IterateFields`,
-`benchmark/lokibench/converter.go:extractStructuredMetadata`
+**Back-ref:** `internal/modules/blockio/span_fields.go:IterateFields`
 
 ---
 
 ## 42. tryApplyExactValues Must Bail Out for ColumnTypeRangeString Blocks Spanning Multiple Values
+
 *Added: 2026-03-05*
 
 **Decision:** In `tryApplyExactValues`, when `cd.colType == ColumnTypeRangeString` and any
@@ -1202,6 +1222,7 @@ all KLL buckets between `findBucketString(minKey)` and `findBucketString(maxKey)
 correct no-false-negatives semantics.
 
 **Invariants:**
+
 - When all blocks for a `ColumnTypeRangeString` column have `minKey == maxKey` (homogeneous
   blocks, one distinct string per block), the exact-value path is safe and produces zero
   false positives.
@@ -1212,6 +1233,7 @@ correct no-false-negatives semantics.
 ---
 
 ## NOTE-BLOOM-REMOVAL: Block Index Wire Format Change — ColumnNameBloom Removed (2026-03-07)
+
 *Added: 2026-03-07*
 
 **Change:** `ColumnNameBloom [32]byte` (32 bytes per block index entry) has been removed
@@ -1233,6 +1255,7 @@ See `internal/modules/blockio/shared/NOTES.md:NOTE-BLOOM-REMOVAL` for full ratio
 ---
 
 ## 43. MaxBlocks Corrected to 65,535
+
 *Added: 2026-03-11*
 
 **Change:** `MaxBlocks` constant corrected from 100,000 to 65,535 in `shared/constants.go`
@@ -1248,6 +1271,7 @@ returns an error when `blockID >= 65535`), but the spec and constant were stale 
 ---
 
 ## 44. MaxMetadataSize Spec Corrected to 256 MiB
+
 *Added: 2026-03-11*
 
 **Change:** SPECS.md §1.1 and §5 corrected from 100 MiB to 256 MiB to match the code.
@@ -1259,6 +1283,7 @@ to accommodate sketch section data at scale. The spec was not updated at the tim
 ---
 
 ## 45. KLL Bucket Boundary Parsing and File-Level Fast Reject
+
 *Added: 2026-03-14*
 
 **Decision:** Parse `bucket_min`, `bucket_max`, and typed boundary arrays from the range
@@ -1272,6 +1297,7 @@ completely outside the file's observed range. For example, a query `span:duratio
 against a file whose longest span was 10 seconds would still read and evaluate all blocks.
 
 **File-level fast reject algorithm:**
+
 1. After `PlanWithOptions`, if `program.Predicates` is non-nil, call `fileLevelReject`.
 2. `fileLevelReject` walks AND-combined leaf `RangeNode` predicates.
 3. For each leaf with a `Min` or `Max` bound, fetch `RangeColumnBoundaries` for the column.
@@ -1283,6 +1309,7 @@ support file-level reject; RangeString/RangeBytes are excluded (their BucketMin/
 are 0 in the wire format and not meaningful for interval comparison).
 
 **Back-refs:**
+
 - `internal/modules/blockio/reader/range_index.go:parseTypedBoundaries`
 - `internal/modules/blockio/reader/reader.go:RangeColumnBoundaries`
 - `internal/modules/executor/plan_blocks.go:fileLevelReject`
@@ -1290,6 +1317,7 @@ are 0 in the wire format and not meaningful for interval comparison).
 ---
 
 ## 46. VersionV13 and VersionBlockV12 — Wire Format Space Reduction
+
 *Added: 2026-03-14*
 
 **Change:** Two new format versions eliminate dead wire fields:
@@ -1318,6 +1346,7 @@ includes/skips stats fields based on `blockVersion < VersionBlockV12`.
 `reader/block_parser.go`, `reader/layout.go`.
 
 **Back-refs:**
+
 - `internal/modules/blockio/shared/constants.go:VersionV13,VersionBlockV12`
 - `internal/modules/blockio/writer/metadata.go:writeBlockIndexSection`
 - `internal/modules/blockio/writer/writer_block.go:finalize`
@@ -1327,6 +1356,7 @@ includes/skips stats fields based on `blockVersion < VersionBlockV12`.
 ---
 
 ## 47. MaxCompactSectionSize — Defined But Unenforced (GAP-8)
+
 *Added: 2026-03-18*
 
 **Status: aspirational constant — no enforcement exists.**
@@ -1351,6 +1381,7 @@ produce a compact index exceeding 50 MiB, causing a silent `uint32` truncation i
 count and corrupt the parse.
 
 **TODO:** If enforcement is added, the recommended approach is:
+
 1. Change `MaxCompactSectionSize` from `const` to `var` (to allow test override).
 2. Add a size check in `writeCompactTraceIndex` after building the blob: return an error
    if `len(blob) > shared.MaxCompactSectionSize`.
@@ -1358,6 +1389,7 @@ count and corrupt the parse.
    and asserts the writer returns an error.
 
 **Back-refs:**
+
 - `internal/modules/blockio/shared/constants.go:MaxCompactSectionSize`
 - `internal/modules/blockio/writer/metadata.go:writeCompactTraceIndex`
 - `internal/modules/blockio/writer/writer.go` (comments on lines ~384, ~460)
@@ -1365,6 +1397,7 @@ count and corrupt the parse.
 ---
 
 ## 48. FileBloom Section — Cacheable Fuse8 for File-Level Service Name Rejection
+
 *Added: 2026-03-20*
 
 **Decision:** Add an optional `FileBloom` section (magic `FBLM`) as the last entry in the
@@ -1381,6 +1414,7 @@ bloom (Kirsch-Mitzenmacher, ~10 bits/trace) already covers trace:id; it is now e
 `TraceBloomRaw()` and `MayContainTraceID()` for the same caching pattern.
 
 **Caching pattern:**
+
 ```go
 svcBloom   := r.FileBloomRaw()   // clone, ~100–300 bytes
 traceBloom := r.TraceBloomRaw()  // clone, existing compact bloom
@@ -1394,8 +1428,8 @@ Back-ref: `internal/modules/blockio/writer/file_bloom.go:writeFileBloomSection`,
           `internal/modules/blockio/reader/file_bloom.go:FileBloom`,
           `internal/modules/executor/plan_blocks.go:fileLevelBloomReject`
 
-
 ## 49. Pre-Computed Column Iteration List on Block (iterFields)
+
 *Added: 2026-03-23*
 
 **Decision:** `Block.BuildIterFields()` pre-computes a deduplicated `[]ColIterEntry` slice
@@ -1423,6 +1457,7 @@ Back-ref: `internal/modules/blockio/reader/block.go:BuildIterFields`,
           `internal/modules/blockio/span_fields.go:IterateFields`
 
 ## 50. Pooled modulesSpanFieldsAdapter (sync.Pool)
+
 *Added: 2026-03-23*
 
 **Decision:** `getSpanFieldsAdapter` / `putSpanFieldsAdapter` (unexported) wrap a `sync.Pool` for
@@ -1447,10 +1482,10 @@ cloning, it will hold a stale (pooled) adapter. The API contract is: clone if yo
 retain. This is unchanged from before; Clone already existed for this purpose.
 
 Back-ref: `internal/modules/blockio/span_fields.go:getSpanFieldsAdapter`,
-          `api.go:streamFilterProgram`,
-          `api.go:streamLogProgram`
+          `api.go:streamFilterProgram`
 
 ## 51. BUG-02 — tryApplyExactValues sorted uint64 boundaries as int64
+
 *Added: 2026-03-23*
 
 **Problem:** The `ColumnTypeRangeUint64` case in `tryApplyExactValues` copied the
@@ -1468,6 +1503,7 @@ Back-ref: `internal/modules/blockio/writer/range_index.go:tryApplyExactValues` (
 Test: `internal/modules/blockio/writer/range_index_bug02_test.go:TestTryApplyExactValues_Uint64_HighBit`
 
 ## 52. BUG-07 — compareRangeKey float64 NaN total order (reader-side)
+
 *Added: 2026-03-23*
 
 See `internal/modules/blockio/reader/NOTES.md:NOTE-004` for full details.
@@ -1475,6 +1511,7 @@ See `internal/modules/blockio/reader/NOTES.md:NOTE-004` for full details.
 with `cmp.Compare`, which provides a stable total order for NaN inputs.
 
 ## 53. BUG-08 — decode*Key sentinel values for malformed short keys (reader-side)
+
 *Added: 2026-03-23*
 
 See `internal/modules/blockio/reader/NOTES.md:NOTE-005` for full details.
@@ -1483,6 +1520,7 @@ See `internal/modules/blockio/reader/NOTES.md:NOTE-005` for full details.
 binary search comparisons.
 
 ## 54. DUP-01 — Generic findBucket Replaces Four Identical Binary-Search Functions
+
 *Added: 2026-03-23*
 
 **Decision:** Consolidated four identical binary-search helper functions
@@ -1502,6 +1540,7 @@ needs to be made in exactly one place.
 Back-ref: `internal/modules/blockio/writer/range_index.go:findBucket`
 
 ## 55. NOTE-V14-001 — V14 Format: Single-Tier Block Layout
+
 *Added: 2026-04-10*
 
 **Decision:** V14 blocks use a single unified column TOC following the 24-byte block header.
@@ -1528,6 +1567,7 @@ Back-ref: `internal/modules/blockio/shared/column_classify.go:IsIntrinsicColumn`
 `internal/modules/blockio/reader/block_parser.go:parseColumnMetadataArray`
 
 ## 56. NOTE-V14-002 — IsIntrinsicColumn Promoted to shared Package
+
 *Added: 2026-04-10*
 
 **Decision:** `IsIntrinsicColumn(name string) bool` is defined in
@@ -1553,6 +1593,7 @@ Back-ref: `internal/modules/blockio/shared/column_classify.go:IsIntrinsicColumn`
 ---
 
 ## NOTE-38b: Exact-Value Range Index — Multi-Value Block Safety Constraint
+
 *Added: 2026-04-14*
 
 **Decision:** The exact-value path in `tryApplyExactValues` is only safe when ALL blocks
@@ -1577,6 +1618,7 @@ Back-ref: `internal/modules/blockio/writer/range_index.go:tryApplyExactValues`,
 ---
 
 ## NOTE-ALLOC-2: SpanMatch.Clone — kvField Slice Pool
+
 *Added: 2026-04-14*
 
 **Decision:** `SpanMatch.Clone` allocates the fields slice from a `sync.Pool` of `*[]kvField`
@@ -1599,6 +1641,7 @@ Back-ref: `spanmatch.go:kvFieldSlicePool`, `spanmatch.go:SpanMatch.Clone`
 ---
 
 ## NOTE-ALLOC-4: modulesSpanFieldsAdapter — sync.Pool
+
 *Added: 2026-04-14*
 
 **Decision:** `modulesSpanFieldsAdapter` is recycled via `sync.Pool` rather than allocated
@@ -1622,6 +1665,7 @@ Back-ref: `internal/modules/blockio/span_fields.go:modulesSpanFieldsAdapterPool`
 ---
 
 ## NOTE-ITER-1: IterateFields Skips Auto-Parsed Body Columns (ColumnTypeRangeString)
+
 *Added: 2026-04-14*
 
 **Decision:** `Block.BuildIterFields` and `modulesSpanFieldsAdapter.IterateFields` skip
@@ -1630,10 +1674,8 @@ columns with type `ColumnTypeRangeString`. These columns are auto-parsed body fi
 
 **Rationale:** `ColumnTypeRangeString` columns (`log.{key}`) are redundant — their values
 can be re-derived from `log:body` at query time. Exposing them as explicit attributes in
-`IterateFields` would confuse downstream consumers (e.g. Loki label extraction) which
-expect the output to represent original span/log attributes only. `GetField()` still
-resolves them for direct lookups (e.g. `{log.detected_level="info"}`), so filtering only
-affects enumeration, not point access.
+`IterateFields` would confuse downstream consumers that expect only original span/log
+attributes. `GetField()` still resolves them for direct lookups.
 
 **How to apply:** In any IterateFields-style loop over block columns, skip entries where
 `col.Type == shared.ColumnTypeRangeString`. Do not apply this filter in GetField paths.
@@ -1644,6 +1686,7 @@ Back-ref: `internal/modules/blockio/reader/block.go:BuildIterFields`,
 ---
 
 ## NOTE-VEC-001: vectorAccumulator — Accumulate-at-Build, Serialize-at-Flush
+
 *Added: 2026-04-14*
 
 **Decision:** The `vectorAccumulator` collects per-block embedding vectors during block
@@ -1663,6 +1706,7 @@ structures that require cross-block data, follow the same accumulate-at-flush pa
 Back-ref: `internal/modules/blockio/writer/vector_index.go:vectorAccumulator`
 
 ## NOTE-STRUCT-FIELDS-001: nil-block guard in modulesSpanFieldsAdapter
+
 *Added: 2026-04-28*
 
 **Decision:** Added a nil-block guard to `modulesLookupColumn` and to the `IterateFields`
@@ -1687,6 +1731,7 @@ etc.) are present in the intrinsic section and are accessible through this path.
 ---
 
 ## NOTE-STRUCT-FIELDS-002: isDualStorage Per-Block Caching + wantCols in modulesSpanFieldsAdapter
+
 *Added: 2026-04-30*
 
 **Decision:** Added `isDualStorage bool` and `wantCols map[string]struct{}` fields to
@@ -1710,10 +1755,10 @@ pool return. This ensures pool-reused adapters never inherit stale state from pr
 to be called (the pre-existing behavior), which is correct but slower. The only cost of a false
 negative (false when true) is redundant work, not incorrect results.
 
-As of 2026-04-30, `wantCols` is non-nil at filter and log stream paths (`streamFilterProgram`,
-`streamLogProgram`), making `loadIntrinsicCache` column filtering active on those paths. Only
-`reader.go:GetTraceByID` and the structural result path with empty SelectColumns continue to pass
-`wantCols=nil`.
+As of 2026-04-30, `wantCols` is non-nil at the filter stream path (`streamFilterProgram`),
+making `loadIntrinsicCache` column filtering active on that path. Only
+`reader.go:GetTraceByID` and the structural result path with empty SelectColumns continue
+to pass `wantCols=nil`.
 
 Back-ref: `internal/modules/blockio/span_fields.go:modulesSpanFieldsAdapter`,
 `internal/modules/blockio/span_fields.go:ComputeIsDualStorage`,
@@ -1722,7 +1767,6 @@ Back-ref: `internal/modules/blockio/span_fields.go:modulesSpanFieldsAdapter`,
 `internal/modules/blockio/span_fields.go:loadIntrinsicCache`,
 `internal/modules/executor/predicates.go:ComputeSecondPassCols`,
 `query_traceql.go:streamFilterProgram`,
-`query_logql.go:streamLogProgram`,
 `reader.go:GetTraceByID`
 
 ## NOTE-LEGACY-REMOVAL — FooterV3–V6 and V13 legacy format support removed (2026-06-12)
@@ -1734,6 +1778,7 @@ predating FooterV8 / V14 blocks was removed. All production blocks were rewritte
 in the week of 2026-06-09.
 
 **Formats removed:**
+
 - FooterV3/V4/V5/V6 — footer cascade detection (`readFooterLegacy`)
 - V13 file header — `readHeader()` and all V13 file header parsing
 - VersionBlockV12 — pre-V14 block format (enc_version=2)
@@ -1742,6 +1787,7 @@ in the week of 2026-06-09.
   parsed for V8-embedded trace sections for compatibility; removed from scanner
 
 **Safety rationale:**
+
 1. All production blocks were rewritten in the past week.
 2. Compaction already did not handle legacy formats (confirmed: zero legacy
    references in `internal/modules/blockio/compaction/`).
@@ -1749,6 +1795,7 @@ in the week of 2026-06-09.
    "only FooterV8 files are supported (legacy V3–V6 formats were removed 2026-06-12)".
 
 **Code deleted:**
+
 - `reader/parser.go`: `readFooterLegacy`, `tryReadFooterV6/V5/V4`, `readFooterV3`,
   `applyLegacyFooterCommon`, `readHeader`, `parseV5MetadataLazy`, `skipColumnIndex`,
   `scanRangeIndexOffsets`, `skipTypedBoundaries`, `skipRangeValueEntry`,
@@ -1786,3 +1833,99 @@ fires for them.
 **Back-ref:** `blockio/span_fields.go:GetField`/`IterateFields`/`spanTreeIdentityField`,
 `blockio/modulesspanfieldsadapter.go`. Tests:
 `omit_intrinsic_identity_test.go:TestOmitIntrinsicIdentity_RootDetection`.
+
+## NOTE-V2-001 — Block 4 096-byte page alignment for v2 files (issue #417)
+
+Date: 2026-06-28
+
+### Decision
+
+Every inner block in a v2 file is padded to a 4 096-byte page boundary after it
+is written. The block's byte offset is therefore always an exact multiple of 4096,
+and can be represented as a **page number** (`offset / 4096`) instead of a raw
+byte offset.
+
+### Why
+
+Value-index entries for v2 files store a `BlockRef{PageNum uint24, LenPages uint16}`
+(5 bytes) instead of a `BlockID uint32` (4 bytes). A querier that hits a v2
+value-index entry can compute the exact S3 byte range directly:
+
+    Range: bytes = PageNum × 4096, length = LenPages × 4096
+
+No TOC fetch, no block-index lookup — one round trip from index hit to block bytes.
+
+### Alignment padding
+
+After each block payload is written, the writer emits zero-byte padding of:
+
+    pad = (PageSize - blockLen % PageSize) % PageSize
+
+Worst case: 4 095 bytes per block. At `MaxBlockSpans=10000` and a typical 1.4 MB
+max block size, padding is at most 4095 / 1_400_000 ≈ 0.3% overhead.
+
+### Implementation
+
+- `writer.go:mergeBuiltBlock`: pads to page boundary when `cfg.EnableV2Format`
+- `writer.v2PageSize = 4096` — local constant to break the valueindex import cycle
+  (valueindex imports blockio/writer via KLL; the value must match `valueindex.PageSize`)
+- `shared.BlockMeta.PageNum uint32` — populated by the writer for v2 blocks;
+  zero for v1 blocks
+- `reader/parser.go:parseSectionsV8`: derives PageNum from `Offset/4096` when
+  `footerVersion == FooterV9Version`
+
+### Format signal
+
+A v2 file uses `FooterV9Version = 9` in the 18-byte footer. This is the same
+wire layout as V8; readers distinguish the formats by the version field.
+
+Back-refs: `internal/modules/blockio/writer/writer.go:mergeBuiltBlock`,
+`internal/modules/blockio/writer/v8_sections.go:writeV8ToCAndFooter`,
+`internal/modules/blockio/writer/metadata.go:writeFooterVersion`,
+`internal/modules/blockio/reader/parser.go:parseSectionsV8`,
+`internal/modules/blockio/shared/blockmeta.go`,
+`internal/modules/blockio/shared/constants.go:FooterV9Version`,
+`internal/modules/blockio/writer/v2_alignment_test.go`
+
+## NOTE-V2-002 — v2 file: sections removed, identity retained in block payload (issue #417)
+
+Date: 2026-06-28
+
+### What is removed from v2 files
+
+| Section | ToCSubType | Reason |
+|---|---|---|
+| IntrinsicTOC | `ToCSubTypeIntrinsic=4` | ~50% of file size; querying moves to value-index |
+| SpanTree | `ToCSubTypeSpanTree=10` | identity now in block payload |
+| KLL sketch blobs | `ToCSubTypeSketch=2` | raw quantile data; only bucket boundaries (ToCSubTypeRange) are kept |
+| File-level bloom | `ToCSubTypeBloom=3` | service-name bloom; value-index replaces this fast path |
+| Chunked trace index | `ToCSubTypeTraceChunked=8` | replaced by value-index on `trace:id` column |
+| TS index | `ToCSubTypeTS=6` | not needed without IntrinsicTOC fast path |
+
+**Kept in v2:** block index (`ToCSubTypeBlockIndex=7`) and range bucket boundaries (`ToCSubTypeRange=1`).
+
+### Identity columns in block payload (v2)
+
+Before NOTE-469 (issue #389), identity columns (`trace:id`, `span:id`, `span:parent_id`) were
+in the block payload. NOTE-469 moved them exclusively to the IntrinsicTOC (with SpanTree as
+fallback). For v2, IntrinsicTOC and SpanTree are both removed, so identity MUST be in the
+block payload — which requires reversing NOTE-469 for v2 blocks.
+
+**Current status (this commit):** identity columns are NOT yet added back to block payload for
+v2. `feedSpanIdentifiers` continues to feed only `b.feedIntrinsicBytes`, which writes to the
+per-block accumulator (consumed by SpanTree in v1). For v2, this means identity is absent from
+both IntrinsicTOC (not written) and block payload (not written via `addPresent`).
+
+**TODO (PR3 proper):** add `v2IdentityToBlock bool` to `blockBuilder` and, when true, call
+`b.addPresent(rowIdx, traceIDColumnName, ...)` in `feedSpanIdentifiers`. This will be done in
+the next PR alongside the compaction dedup path update.
+
+### Writer changes in this commit
+
+- `v8_sections.go:writeV8Sections`: when `EnableV2Format`, skip sketch blobs, file sections
+  (trace index, bloom, SpanTree), and intrinsic blobs; always write block index and range blobs.
+- `v8_sections.go:writeV8ToCAndFooter`: emits `FooterV9Version` when `EnableV2Format`.
+- `writer.go:NewWriterWithConfig`: returns error if `EnableV2Format && OmitIntrinsicIdentityColumns`.
+
+Back-ref: `internal/modules/blockio/writer/v8_sections.go:writeV8Sections`,
+`internal/modules/blockio/writer/v2_alignment_test.go:TestV2OmitsSections`

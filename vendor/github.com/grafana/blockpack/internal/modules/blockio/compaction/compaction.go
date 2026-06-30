@@ -13,78 +13,19 @@ import (
 
 	modules_blockio "github.com/grafana/blockpack/internal/modules/blockio"
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
-	modules_shared "github.com/grafana/blockpack/internal/modules/blockio/shared"
 	modules_rw "github.com/grafana/blockpack/internal/modules/rw"
 )
 
 // blockIDPair holds the pre-fetched trace:id and span:id for a single row.
 // Built once per block by buildDedupeIndex; looked up O(1) by dedupeKey.
 
-// buildDedupeIndex builds a per-row deduplication index for the given (reader, blockIdx) pair.
-// Iterates the trace:id and span:id intrinsic columns once (O(N)), eliminating the
-// O(N) per-row linear scan that IntrinsicBytesAt performs.
-// Returns nil when r is nil or has no intrinsic section (callers fall back to block columns only).
-func buildDedupeIndex(r *modules_reader.Reader, blockIdx int) map[uint16]blockIDPair {
-	if r == nil {
-		return nil
-	}
-	// NOTE-476 (issue #394): blocks written without IntrinsicTOC identity columns store
-	// (trace:id, span:id) solely in the SpanTree. Source the dedup keys from the SpanTree
-	// reverse map for such blocks, otherwise dedupeKey finds no key and every span is dropped.
-	if !r.HasIntrinsicColumn("trace:id") && r.HasSpanTree() {
-		return buildDedupeIndexFromSpanTree(r, blockIdx)
-	}
-	names := r.IntrinsicColumnNames()
-	if len(names) == 0 {
-		return nil
-	}
-	out := make(map[uint16]blockIDPair)
-	for _, colName := range []string{"trace:id", "span:id"} {
-		col, err := r.GetIntrinsicColumn(colName)
-		if err != nil || col == nil {
-			continue
-		}
-		if col.Format != modules_shared.IntrinsicFormatFlat && col.Format != modules_shared.IntrinsicFormatXORBytes {
-			continue
-		}
-		for i, ref := range col.BlockRefs {
-			if int(ref.BlockIdx) != blockIdx {
-				continue
-			}
-			if i >= len(col.BytesValues) {
-				continue
-			}
-			entry := out[ref.RowIdx]
-			if colName == "trace:id" {
-				entry.traceID = col.BytesValues[i]
-			} else {
-				entry.spanID = col.BytesValues[i]
-			}
-			out[ref.RowIdx] = entry
-		}
-	}
-	return out
-}
-
-// buildDedupeIndexFromSpanTree builds the per-row (trace:id, span:id) dedup index for a block
-// whose identity is stored in the SpanTree rather than the IntrinsicTOC. NOTE-476 (issue #394).
-func buildDedupeIndexFromSpanTree(r *modules_reader.Reader, blockIdx int) map[uint16]blockIDPair {
-	if blockIdx < 0 || blockIdx > int(^uint16(0)) {
-		return nil
-	}
-	idMap, err := r.SpanTreeIdentityForBlock(uint16(blockIdx)) //nolint:gosec // bounded above
-	if err != nil || idMap == nil {
-		return nil
-	}
-	out := make(map[uint16]blockIDPair, len(idMap))
-	for rowIdx, rec := range idMap {
-		tid := make([]byte, 16)
-		copy(tid, rec.TraceID[:])
-		sid := make([]byte, 8)
-		copy(sid, rec.SpanID[:])
-		out[rowIdx] = blockIDPair{traceID: tid, spanID: sid}
-	}
-	return out
+// buildDedupeIndex previously pre-fetched per-row (trace:id, span:id) identity from the
+// IntrinsicTOC or SpanTree. Both were removed (#433 IntrinsicTOC, #434 SpanTree, #436
+// intrinsic distinction), and every block now stores identity columns in its payload.
+// Identity is therefore sourced directly from block columns in dedupeKey, so this always
+// returns nil (the documented "fall back to block columns" path).
+func buildDedupeIndex(_ *modules_reader.Reader, _ int) map[uint16]blockIDPair {
+	return nil
 }
 
 // Config configures the compaction operation.
@@ -393,13 +334,7 @@ func (s *compactionState) ensureWriter() error {
 		// NOTE-476 (issue #394): drop identity columns from the compacted IntrinsicTOC when
 		// configured; the SpanTree section is the identity store for such blocks.
 		OmitIntrinsicIdentityColumns: s.cfg.OmitIntrinsicIdentityColumns,
-		// NOTE-V2-004 (issue #420): restore identity columns into block payloads when configured
-		// so the compacted output is self-contained for v2 direct block fetch (#424).
-		RestoreIdentityBlockColumns: s.cfg.RestoreIdentityBlockColumns,
-		// NOTE-V2-005 (issue #421): skip the file-level IntrinsicTOC section in the compacted
-		// output when configured; every intrinsic column already lives in the self-contained
-		// blocks (#420), making the IntrinsicTOC redundant for v2 direct block fetch (#424).
-		OmitIntrinsicTOC: s.cfg.OmitIntrinsicTOC,
+		// NOTE: EnableV2Format removed (2026-06-29, v2 unconditional).
 	})
 	if err != nil {
 		_ = f.Close()
@@ -429,6 +364,16 @@ func (s *compactionState) flushCurrentWriter() error {
 		_ = s.current.f.Close()
 		return fmt.Errorf("flush writer: %w", err)
 	}
+
+	// Optional inline value-index sink: open the staged file as a Reader and call the sink
+	// before closing the file so callers can extract value-index entries synchronously.
+	if s.cfg.ValueIndexSink != nil {
+		if err := s.callValueIndexSink(s.current.stagedPath); err != nil {
+			_ = s.current.f.Close()
+			return fmt.Errorf("value index sink: %w", err)
+		}
+	}
+
 	if err := s.current.f.Close(); err != nil {
 		return fmt.Errorf("close staging file: %w", err)
 	}
@@ -438,6 +383,20 @@ func (s *compactionState) flushCurrentWriter() error {
 	s.stagedFiles = append(s.stagedFiles, stagedPath)
 	s.current = nil
 	return nil
+}
+
+// callValueIndexSink reads the staged blockpack file, opens a Reader, and calls cfg.ValueIndexSink.
+func (s *compactionState) callValueIndexSink(path string) error {
+	data, err := os.ReadFile(path) //nolint:gosec
+	if err != nil {
+		return fmt.Errorf("read staged file for value index sink: %w", err)
+	}
+	provider := modules_rw.NewBytesProvider(data)
+	r, err := modules_reader.NewReaderFromProvider(provider)
+	if err != nil {
+		return fmt.Errorf("open reader for value index sink: %w", err)
+	}
+	return s.cfg.ValueIndexSink(r)
 }
 
 // prepareStagingDir creates a unique subdirectory for staging compaction output.

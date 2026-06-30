@@ -360,13 +360,19 @@ func GetTraceByID(r *Reader, traceIDHex string) (results []SpanMatch, err error)
 	var traceID [16]byte
 	copy(traceID[:], traceIDBytes)
 
-	entries := r.TraceEntries(traceID)
-	if len(entries) == 0 {
+	// TraceEntries always returns nil (#438: trace DFS index removed).
+	// Build a synthetic entry slice covering all blocks.
+	// SpanTree fast path (below) will skip most blocks; the block-column scan
+	// filters by trace:id within each block so correctness is preserved.
+	blockCount := r.BlockCount()
+	if blockCount == 0 {
 		return nil, nil
 	}
-	blockIDs := make([]int, len(entries))
-	for i, e := range entries {
-		blockIDs[i] = e.BlockID
+	entries := make([]modules_reader.TraceEntry, blockCount)
+	blockIDs := make([]int, blockCount)
+	for i := range blockCount {
+		entries[i] = modules_reader.TraceEntry{BlockID: i}
+		blockIDs[i] = i
 	}
 
 	// NOTE-293 (Lever B): resolve matching rows and span IDs from the block payloads that are
@@ -411,16 +417,11 @@ func GetTraceByID(r *Reader, traceIDHex string) (results []SpanMatch, err error)
 		return nil, fmt.Errorf("GetTraceByID: span tree lookup: %w", stErr)
 	}
 	if len(stRecs) > 0 {
-		// blockHasEntry guards against returning rows for blocks not in the trace index entries
-		// (SpanTree is whole-file; entries already scope to blocks that carry the trace).
-		blockHasEntry := make(map[int]bool, len(entries))
-		for _, e := range entries {
-			blockHasEntry[e.BlockID] = true
-		}
+		// SpanTree is whole-file; filter to blocks within the file range.
 		spanIDByRef = make(map[uint32][]byte, len(stRecs))
 		for i := range stRecs {
 			bid := int(stRecs[i].BlockIdx)
-			if !blockHasEntry[bid] {
+			if bid < 0 || bid >= blockCount {
 				continue
 			}
 			rowIdx := int(stRecs[i].RowIdx)
@@ -630,6 +631,13 @@ func NewWriter(output io.Writer, maxSpansPerBlock int) (*Writer, error) {
 // Use this when VectorDimension or other advanced settings are needed.
 func NewWriterWithConfig(cfg WriterConfig) (*Writer, error) {
 	return modules_blockio.NewWriterWithConfig(cfg)
+}
+
+// ReadBlockByRef fetches a v2 block by direct page reference (PR6, issue #417).
+// Only valid on v2 files (IsV2Format == true). Fetches offset=pageNum*4096,
+// length=lenPages*4096 in a single provider.ReadAt, with no TOC lookup.
+func ReadBlockByRef(r *Reader, pageNum uint32, lenPages uint16) ([]byte, error) {
+	return r.ReadBlockByRef(pageNum, lenPages)
 }
 
 // FileLayoutReport describes the byte-level structure of a blockpack file.

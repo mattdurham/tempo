@@ -145,16 +145,7 @@ func ExecuteTraceMetrics(
 		outputCols[c] = struct{}{}
 	}
 
-	// NOTE-045: intrinsic fast path — zero block reads when all needed columns are in the
-	// intrinsic section (span:start, span:duration, resource.service.name, span:status, etc.).
-	if intrinsicResult, used, intrinsicErr := executeTraceMetricsIntrinsic(ctx, r, program, querySpec, outputCols); intrinsicErr != nil {
-		return nil, intrinsicErr
-	} else if used {
-		// NOTE-464 (issue #383): the metrics query was fully covered by dedicated/intrinsic
-		// columns and answered from ToC data alone — zero full block fetches.
-		emitPlannerSpan(ctx, plan, &PlannerSpanStats{CandidateRows: -1, FullFetchSkipped: true})
-		return intrinsicResult, nil
-	}
+	// NOTE-433: intrinsic fast path removed. IntrinsicTOC no longer exists in v2 files.
 
 	// NOTE-464 (issue #383): the intrinsic fast path declined — this query needs full block
 	// payloads (non-dedicated columns referenced). Report full_fetch_skipped=false.
@@ -904,4 +895,319 @@ func computeQuantile(values []float64, q float64) float64 {
 		idx = len(sorted) - 1
 	}
 	return sorted[idx]
+}
+
+// ValueIndexSource provides value-index data for a specific column query.
+// Implementations typically wrap a list of pre-downloaded VI file bytes.
+type ValueIndexSource interface {
+	// LookupResults returns all matching LookupResults for the given column,
+	// predicate, and optional time range. The bool is false when no VI data is
+	// available for this column (caller must fall back to a block scan).
+	LookupResults(colName string, colType modules_shared.ColumnType) ([]VILookupResult, bool)
+
+	// AllResults returns every indexed span across all columns, deduplicated by
+	// (TraceID, SpanID). It backs match-all queries ({} | rate()) where there is
+	// no leaf condition to look up. The bool is false when the source cannot
+	// enumerate all spans (caller must fall back to a block scan).
+	AllResults() ([]VILookupResult, bool)
+}
+
+// VILookupResult is a matching entry from a value-index lookup.
+// Mirrors valueindex.LookupResult but avoids a cross-package import in the executor.
+//
+// BlockID and RowIdx locate the span within a blockpack data file for the
+// zero-scan search path (NOTE-VI-035, issue #459): BlockID is the block index
+// within SourceRef and RowIdx is the row within that block, giving O(1) direct
+// access without scanning. They are zero for VI files that predate per-row
+// addressing; the search path treats a zero RowIdx as "row 0" and relies on
+// the caller to gate on coverage. The metrics path (#460) ignores both.
+type VILookupResult struct {
+	SourceRef string
+	TimeSec   uint64
+	BlockID   uint32
+	RowIdx    uint16
+	TraceID   [16]byte
+	SpanID    [8]byte
+}
+
+// ExecuteTraceMetricsFromVI runs a count_over_time() or rate() query using only
+// value-index data — zero blockpack file reads required (NOTE-VI-032, issue #440).
+//
+// Returns (result, true, nil) when the query can be fully answered from VI data.
+// Returns (nil, false, nil) when VI data is insufficient (caller must fall back to
+// full block scan via ExecuteTraceMetrics).
+//
+// Currently supports: count_over_time() and rate() without group-by clauses.
+//
+// NOTE-VI-033 (issue #460): the value index carries (TraceID, SpanID, TimeSec) per
+// indexed span per column. count_over_time()/rate() without group-by need nothing
+// from the block payloads — counting distinct TraceIDs per time bucket is fully
+// answerable from index TimeSec alone. This is the zero-block-read metrics path.
+func ExecuteTraceMetricsFromVI(
+	ctx context.Context,
+	source ValueIndexSource,
+	prog *vm.Program,
+	spec vm.QuerySpec,
+) (*TraceMetricsResult, bool, error) {
+	if source == nil || prog == nil {
+		return nil, false, nil
+	}
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, false, err
+		}
+	}
+
+	// Gate: only count_over_time() and rate() without group-by are supported.
+	switch spec.Aggregate.Function {
+	case vm.FuncNameCOUNT, vm.FuncNameRATE:
+	default:
+		return nil, false, nil
+	}
+	if len(spec.Aggregate.GroupBy) > 0 {
+		return nil, false, nil
+	}
+
+	tb := spec.TimeBucketing
+	if !tb.Enabled || tb.StepSizeNanos <= 0 {
+		return nil, false, nil
+	}
+
+	// Collect the matching spans for the filter from the value index.
+	matches, ok := viMatchSpans(source, prog)
+	if !ok {
+		return nil, false, nil
+	}
+
+	numBuckets := (tb.EndTime - tb.StartTime + tb.StepSizeNanos - 1) / tb.StepSizeNanos
+	if numBuckets <= 0 {
+		return &TraceMetricsResult{}, true, nil
+	}
+
+	// Count distinct TraceIDs per bucket. A TraceID may appear in multiple spans;
+	// count_over_time()/rate() over the trace-level series counts each distinct
+	// TraceID once per bucket (matches the block-scan accumulator, which keys the
+	// dense series by bucket only when there is no group-by).
+	seenPerBucket := make(map[int64]map[[16]byte]struct{}, numBuckets)
+	for _, m := range matches {
+		if m.TimeSec == 0 {
+			// TimeSec == 0 means the file predates per-span timestamps; its time
+			// bucket is unknown, so this span cannot be safely placed. Fall back to
+			// the block scan rather than silently dropping spans.
+			return nil, false, nil
+		}
+		tsNanos := int64(m.TimeSec) * 1_000_000_000 //nolint:gosec
+		// Right-closed intervals (StartTime, EndTime] — matches the scan path.
+		if tsNanos <= tb.StartTime || tsNanos > tb.EndTime {
+			continue
+		}
+		bucketIdx := timeBucketIndex(tsNanos, tb.StartTime, tb.StepSizeNanos)
+		if bucketIdx < 0 || bucketIdx >= numBuckets {
+			continue
+		}
+		traces, exists := seenPerBucket[bucketIdx]
+		if !exists {
+			traces = make(map[[16]byte]struct{})
+			seenPerBucket[bucketIdx] = traces
+		}
+		traces[m.TraceID] = struct{}{}
+	}
+
+	values := make([]float64, numBuckets)
+	stepSec := float64(tb.StepSizeNanos) / 1e9
+	for bucketIdx, traces := range seenPerBucket {
+		count := float64(len(traces))
+		if spec.Aggregate.Function == vm.FuncNameRATE && stepSec > 0 {
+			count /= stepSec
+		}
+		values[bucketIdx] = count
+	}
+
+	result := &TraceMetricsResult{
+		Series: []TraceTimeSeries{{Values: values}},
+	}
+	return result, true, nil
+}
+
+// viMatchSpans walks the program's predicate tree and resolves the matching spans
+// from the value index. It returns (spans, true) when every leaf has index coverage,
+// or (nil, false) when any leaf is unindexed (caller falls back to a block scan).
+//
+// Match-all queries ({}) have no leaf conditions; they enumerate every indexed span
+// via source.AllResults.
+func viMatchSpans(source ValueIndexSource, prog *vm.Program) ([]VILookupResult, bool) {
+	preds := prog.Predicates
+	if preds == nil || (len(preds.Nodes) == 0 && len(preds.Columns) == 0) {
+		// Match-all: count every indexed span.
+		return source.AllResults()
+	}
+	if len(preds.Nodes) == 0 {
+		// Columns referenced but no evaluable nodes — cannot resolve from the index.
+		return nil, false
+	}
+	return viEvalNodes(source, preds.Nodes, false)
+}
+
+// viEvalNodes evaluates a slice of sibling RangeNodes combined by AND, returning the
+// span set that satisfies all of them. When isOR is true the siblings are combined by
+// OR (union) instead. Returns (nil, false) if any leaf lacks index coverage.
+func viEvalNodes(source ValueIndexSource, nodes []vm.RangeNode, isOR bool) ([]VILookupResult, bool) {
+	var acc []VILookupResult
+	first := true
+	for i := range nodes {
+		set, ok := viEvalNode(source, &nodes[i])
+		if !ok {
+			return nil, false
+		}
+		switch {
+		case first:
+			acc = set
+			first = false
+		case isOR:
+			acc = viUnion(acc, set)
+		default:
+			acc = viIntersect(acc, set)
+		}
+	}
+	if first {
+		return nil, false
+	}
+	return acc, true
+}
+
+// viEvalNode evaluates a single node. A node with children is an internal AND/OR
+// combiner; a leaf node carries a Column and is resolved via the value index.
+func viEvalNode(source ValueIndexSource, node *vm.RangeNode) ([]VILookupResult, bool) {
+	if len(node.Children) > 0 {
+		return viEvalNodes(source, node.Children, node.IsOR)
+	}
+	if node.Column == "" {
+		return nil, false
+	}
+	// The SliceValueIndexSource already holds predicate-matched results per column
+	// (QueryFiles applied the leaf predicate at download time), so the executor only
+	// needs the column identity here. colType is resolved by the source from the
+	// stored index entries.
+	return source.LookupResults(node.Column, modules_shared.ColumnTypeString)
+}
+
+// viUnion returns the union of two span sets keyed by (TraceID, SpanID).
+func viUnion(a, b []VILookupResult) []VILookupResult {
+	out := make([]VILookupResult, 0, len(a)+len(b))
+	seen := make(map[[24]byte]struct{}, len(a)+len(b))
+	for _, s := range a {
+		k := viSpanKey(s)
+		if _, dup := seen[k]; !dup {
+			seen[k] = struct{}{}
+			out = append(out, s)
+		}
+	}
+	for _, s := range b {
+		k := viSpanKey(s)
+		if _, dup := seen[k]; !dup {
+			seen[k] = struct{}{}
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// viIntersect returns the intersection of two span sets keyed by (TraceID, SpanID).
+func viIntersect(a, b []VILookupResult) []VILookupResult {
+	if len(a) == 0 || len(b) == 0 {
+		return nil
+	}
+	inA := make(map[[24]byte]struct{}, len(a))
+	for _, s := range a {
+		inA[viSpanKey(s)] = struct{}{}
+	}
+	out := make([]VILookupResult, 0, min(len(a), len(b)))
+	emitted := make(map[[24]byte]struct{}, len(b))
+	for _, s := range b {
+		k := viSpanKey(s)
+		if _, ok := inA[k]; !ok {
+			continue
+		}
+		if _, dup := emitted[k]; dup {
+			continue
+		}
+		emitted[k] = struct{}{}
+		out = append(out, s)
+	}
+	return out
+}
+
+// viSpanKey is the dedup/intersect key: TraceID (16) ++ SpanID (8).
+func viSpanKey(s VILookupResult) [24]byte {
+	var k [24]byte
+	copy(k[:16], s.TraceID[:])
+	copy(k[16:], s.SpanID[:])
+	return k
+}
+
+// SliceValueIndexSource implements ValueIndexSource from pre-downloaded value-index
+// results, grouped by column name and type. Callers populate it from
+// valueindex.QueryFiles output (one leaf predicate already applied per column).
+type SliceValueIndexSource struct {
+	// data maps colName → colType → matched results for that column.
+	data map[string]map[modules_shared.ColumnType][]VILookupResult
+}
+
+// NewSliceValueIndexSource builds an empty source. Use Add to populate per-column
+// results.
+func NewSliceValueIndexSource() *SliceValueIndexSource {
+	return &SliceValueIndexSource{
+		data: make(map[string]map[modules_shared.ColumnType][]VILookupResult),
+	}
+}
+
+// Add records the matched results for one (colName, colType). Repeated calls for the
+// same key append.
+func (s *SliceValueIndexSource) Add(colName string, colType modules_shared.ColumnType, results []VILookupResult) {
+	byType, ok := s.data[colName]
+	if !ok {
+		byType = make(map[modules_shared.ColumnType][]VILookupResult)
+		s.data[colName] = byType
+	}
+	byType[colType] = append(byType[colType], results...)
+}
+
+// LookupResults returns the matched results for colName. The colType argument is
+// advisory: the source returns results across all stored types for the column (the
+// leaf predicate that produced them already constrained the type), so an unindexed
+// column yields (nil, false) and an indexed one yields (results, true).
+func (s *SliceValueIndexSource) LookupResults(colName string, _ modules_shared.ColumnType) ([]VILookupResult, bool) {
+	byType, ok := s.data[colName]
+	if !ok {
+		return nil, false
+	}
+	var out []VILookupResult
+	for _, results := range byType {
+		out = append(out, results...)
+	}
+	return out, true
+}
+
+// AllResults returns every stored span across all columns, deduplicated by
+// (TraceID, SpanID). It returns (nil, false) when the source holds no data, so a
+// match-all query falls back to a block scan rather than reporting an empty result.
+func (s *SliceValueIndexSource) AllResults() ([]VILookupResult, bool) {
+	if len(s.data) == 0 {
+		return nil, false
+	}
+	var all []VILookupResult
+	seen := make(map[[24]byte]struct{})
+	for _, byType := range s.data {
+		for _, results := range byType {
+			for _, r := range results {
+				k := viSpanKey(r)
+				if _, dup := seen[k]; dup {
+					continue
+				}
+				seen[k] = struct{}{}
+				all = append(all, r)
+			}
+		}
+	}
+	return all, true
 }

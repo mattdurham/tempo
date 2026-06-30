@@ -164,7 +164,7 @@ type CollectOptions struct {
 
 ### 4.4 QueryStats and StepStats
 
-`Collect` and `CollectLogs` return a `QueryStats` value as their second return instead of
+`Collect` returns a `QueryStats` value as its second return instead of
 calling an `OnStats` callback. `QueryStats` is always non-zero; callers may discard it
 with `_`.
 
@@ -216,7 +216,6 @@ type Result struct {
 
 `Options` is shared with `ExecuteStructural` (§11). `ExecuteStructural` returns `*StructuralResult` (not `*Result`) — see §11 for its distinct return type.
 
-
 ---
 
 ## 5. Predicate Extraction (BuildPredicates)
@@ -225,6 +224,7 @@ type Result struct {
 `[]queryplanner.Predicate` for bloom-filter and range-index pruning.
 
 The query compiler populates `program.Predicates` as a `*vm.QueryPredicates` containing:
+
 - `Nodes []vm.RangeNode` — a tree of pruning predicates (AND-combined at the top level).
 - `Columns []string` — additional columns needed for row-level decode (negations, `log:body`, etc.).
 
@@ -234,12 +234,14 @@ leaves → Columns/Values/IntervalMatch). The resulting predicates are AND-combi
 planner's top-level loop.
 
 **Leaf node translation:**
+
 - `Values` non-empty → point-lookup predicate (bloom + range-index, `IntervalMatch: false`).
 - `Min` or `Max` non-nil → interval predicate (bloom + range-index, `IntervalMatch: true`).
 - `Pattern` non-empty → regex prefix analysis via `vm.AnalyzeRegex`; see §5a.
 - Column without range index → bloom-only predicate (no `Values`).
 
 **Composite node translation:**
+
 - `IsOR: true` → `queryplanner.Predicate{Op: LogicalOR, Children: ...}`
 - `IsOR: false` → `queryplanner.Predicate{Op: LogicalAND, Children: ...}`
 
@@ -333,10 +335,10 @@ I/O path (see NOTE-035).
   intrinsic pre-filter before the full block scan. The pre-filter dispatches on
   `(ProgramIsIntrinsicOnly × TimestampColumn != "")`:
   - Pure intrinsic + no sort (Case A): adaptive dispatch on `hasRangePredicate(program)`:
-      - Range predicates (Min or Max set, e.g. `duration>100ms`): `lookupIntrinsicFields`
+    - Range predicates (Min or Max set, e.g. `duration>100ms`): `lookupIntrinsicFields`
         reads field values from cached intrinsic blobs — zero internal block reads.
         `MatchedRow.IntrinsicFields` is populated; `MatchedRow.Block` is nil.
-      - Equality predicates (Values set, e.g. `status=error`, `svc=X`): `forEachBlockInGroups`
+    - Equality predicates (Values set, e.g. `status=error`, `svc=X`): `forEachBlockInGroups`
         reads only the internal blocks containing matched refs — targeted I/O.
         `MatchedRow.Block` is populated; `MatchedRow.IntrinsicFields` is nil.
       The range path is faster when refs are spread across many blocks (sorted flat column
@@ -429,15 +431,17 @@ Back-ref: `internal/modules/executor/predicates.go:rowSatisfiesIntrinsicNodesOR`
 ---
 
 ## SPEC-STREAM-11: Unified Bounded Sliding-Window Block Pipeline
+
 *Added: 2026-04-15*
 
 All block-scan paths (scanBlocks, forEachBlockInGroups, ExecuteTraceMetrics,
-ExecuteLogMetrics, topKScanBlocks) use `blockGroupPipeline` for I/O.
+topKScanBlocks) use `blockGroupPipeline` for I/O.
 NOTE-449 resolved NOTE-058: all callers now propagate a real `context.Context`; the
 `context.Background()` placeholders have been removed.
 Back-ref: `internal/modules/executor/stream_topk.go:topKScanBlocks`
 
 **Invariants:**
+
 - Dispatcher is semaphore-gated: at most `workerCount` groups are dispatched ahead of
   `nextExpected` at any time. The semaphore token is released only AFTER `processGroup`
   returns, ensuring the dispatcher cannot enqueue a new group while the current group's
@@ -462,15 +466,13 @@ Back-ref: `internal/modules/executor/stream_topk.go:topKScanBlocks`
   ARE counted in fetchedGroups/fetchedBlocks/bytesRead.
 - `ExecuteStructural` is exempt: it requires all blocks pre-fetched for parent-resolve
   phase (NOTE-034) and continues to use `ReadBlocks` / `queryplanner.FetchBlocks`.
-- `logTopKScan` and `logCollectAll` (via `iterateLogRows`, `stream_log_topk.go`) are also
-  exempt: they issue sequential `ReadGroup` calls and hold at most one coalesced group in
-  memory at a time. They are not covered by the SPEC-STREAM-11 memory invariant.
 
 Back-ref: `internal/modules/executor/block_group_pipeline.go:blockGroupPipeline`
 
 ---
 
 ## SPEC-STREAM-12: Second-pass decode gate in forEachBlockInGroups
+
 *Added: 2026-04-15*
 
 `forEachBlockInGroups` accepts an optional `preFn func(pb parsedBlock, candidates []int) bool`
@@ -480,6 +482,7 @@ second-pass decode and `fn` are both skipped for that block. When `preFn` is nil
 called and the second-pass decode proceeds as usual.
 
 **Invariants:**
+
 - Callers with a column predicate (collectMixedPlain, collectMixedTopK) pass a preFn that
   evaluates `program.ColumnPredicate`. On success it returns `rowSet.Size() > 0`; on
   evaluation error it returns `true` (conservative passthrough) so fn can surface the
@@ -499,6 +502,7 @@ Back-ref: `internal/modules/executor/stream_prefn_test.go:TestForEachBlockInGrou
 ---
 
 ## SPEC-INTRINSIC-004: File-level bloom pre-check before intrinsic scan
+
 *Added: 2026-04-14*
 
 Before dispatching to the intrinsic fast path (`collectFromIntrinsicRefs`), the executor
@@ -521,179 +525,7 @@ Back-ref: `internal/modules/executor/stream.go:collectWithBloomCheck`
 
 ---
 
-## 7. StreamLogs
-
-### 7.1 Signature
-
-```go
-func StreamLogs(
-    r *modules_reader.Reader,
-    program *vm.Program,
-    pipeline *logqlparser.Pipeline,
-) ([]LogEntry, error)
-```
-
-### 7.2 Types
-
-```go
-type LogAttrs struct {
-    Names  []string
-    Values []string
-}
-
-type LogEntry struct {
-    LokiLabels     string
-    Line           string
-    LogAttrs       LogAttrs
-    TimestampNanos uint64
-}
-```
-
-`LokiLabels` holds the raw value of the `resource.__loki_labels__` column for the row
-(e.g. `{service_name="api", env="prod"}`). `LogAttrs` holds `log.*` `ColumnTypeString`
-column values as parallel `Names`/`Values` slices (e.g. `Names=["log.detected_level"]`,
-`Values=["info"]`). These are original LogRecord attributes, distinct from body-auto-parsed
-fields (`ColumnTypeRangeString`). Both slices are nil when no such columns are present.
-Callers (e.g. `logEntryFields`) must emit these with the `"log."` prefix intact so that
-downstream SM extraction can identify them by prefix.
-
-### 7.3 Invariants
-
-- **SPEC-SL-1:** Nil reader returns nil, nil; result is empty.
-- **SPEC-SL-2:** Nil pipeline is valid; rows are delivered without pipeline transformation.
-- **SPEC-SL-3:** `LokiLabels` holds the value of `resource.__loki_labels__` for the row.
-  This is the only resource-label field returned; building a full `map[string]string` per
-  row was wasteful because consumers only ever read this one key.
-- **SPEC-SL-4:** `Pipeline.Process` is called per matched row; it may drop or modify the row.
-- **SPEC-SL-5:** `Pipeline.Process` is called per matched row; it may mutate labels in-place.
-
-Back-ref: `internal/modules/executor/stream_log.go:StreamLogs`
-
----
-
-## 8. CollectLogs
-
-### 8.1 Signature
-
-```go
-func CollectLogs(
-    r *modules_reader.Reader,
-    program *vm.Program,
-    pipeline *logqlparser.Pipeline,
-    opts CollectOptions,
-) ([]LogEntry, QueryStats, error)
-```
-
-### 8.2 Behaviour
-
-CollectLogs collects the globally top `opts.Limit` log rows by per-row timestamp,
-applying the pipeline per row before inserting into the heap. Results are returned as a
-`[]LogEntry` slice in sort order after the full scan completes. When `opts.Limit == 0`, all
-pipeline-passing rows are collected, sorted, and returned.
-
-This is the primary log collection entry point for `api.go`'s pipeline path.
-
-### 8.3 Invariants
-
-- **SPEC-SLK-1:** The heap stores `LogEntry` by value (post-pipeline) not block/row references.
-  Value storage eliminates per-row heap allocation. The pipeline may mutate labels in-place;
-  results must be captured at scan time.
-- **SPEC-SLK-2:** Block-level pruning: once the heap is full, blocks whose timestamp
-  range cannot improve the heap root are skipped (no I/O, no parsing). For Backward:
-  blocks with `MaxStart <= heap.root.ts` are skipped. For Forward: blocks with
-  `MinStart >= heap.root.ts` are skipped. Guards: `MaxStart == 0` / `MinStart == 0`
-  are treated as unknown and never skipped.
-- **SPEC-SLK-3:** Uses `planner.Plan` with empty `TimeRange` (no planner-level time
-  pruning). Per-row time filtering is applied manually via `opts.TimeRange.MinNano` and
-  `opts.TimeRange.MaxNano`. This avoids false-negative regressions when block-level time
-  pruning is combined with pipeline row filtering.
-- **SPEC-SLK-4:** Per-row time filtering is applied before the pipeline (fast path: no
-  allocation for rows outside the time window). Nil pipeline is valid; rows pass through
-  without transformation.
-- **SPEC-SLK-5:** Results are returned in sort order after the full scan completes (not
-  lazily). Backward: newest first. Forward: oldest first.
-- **SPEC-SLK-6:** `CollectLogs` returns a `QueryStats` as its second value. The `"plan"`
-  step records `total_blocks` and `selected_blocks`; the `"block-scan"` step records
-  `fetched_blocks` (number of individual blocks fetched across all groups), `IOOps`
-  (number of `ReadGroup` calls, i.e. coalesced group fetches), and `BytesRead` (sum of
-  `BlockMeta.Length` for all blocks in fetched groups, including blocks skipped by
-  block-level pruning within the group). `TotalDuration` is wall-clock for the full call.
-  `ExecutionPath` is `"block-topk"` when `opts.Limit > 0`, else `"block-plain"`.
-
-Back-ref: `internal/modules/executor/stream_log_topk.go:CollectLogs`
-
----
-
-## 9. ExecuteLogMetrics
-
-### 9.1 Signature
-
-```go
-func ExecuteLogMetrics(
-    ctx context.Context,
-    r *modules_reader.Reader,
-    program *vm.Program,
-    pipeline *logqlparser.Pipeline,
-    querySpec *vm.QuerySpec,
-    funcName string,
-    groupBy []string,
-) (*LogMetricsResult, error)
-```
-
-### 9.2 Types
-
-```go
-type LogMetricsResult struct {
-    Rows          []LogMetricsRow
-    BytesRead     int64
-    BlocksScanned int
-}
-
-type LogMetricsRow struct {
-    Values   map[string]float64 // bucket-key → aggregated value
-    GroupKey []string           // group-by label values
-}
-```
-
-### 9.3 Supported Functions
-
-| `funcName` | Description |
-|---|---|
-| `count_over_time` | Count of matching log lines per bucket |
-| `rate` | count_over_time / step_seconds |
-| `bytes_over_time` | Sum of log line byte lengths per bucket |
-| `bytes_rate` | bytes_over_time / step_seconds |
-| `sum_over_time` | Sum of unwrap values per bucket |
-| `avg_over_time` | Average of unwrap values per bucket |
-| `min_over_time` | Minimum of unwrap values per bucket |
-| `max_over_time` | Maximum of unwrap values per bucket |
-| `quantile_over_time` | q-th percentile of unwrap values per bucket (nearest-rank method) |
-
-### 9.4 Invariants
-
-- **SPEC-ELM-1:** Nil reader returns empty `LogMetricsResult` with no error.
-- **SPEC-ELM-2:** Nil `querySpec` returns an error (`"ExecuteLogMetrics: querySpec cannot be nil"`). Callers must always provide a non-nil `querySpec`.
-- **SPEC-ELM-3:** Time bucketing uses `vm.QuerySpec.Step`, `Start`, `End` (nanoseconds).
-  Rows outside `[Start, End]` are ignored.
-- **SPEC-ELM-4:** `groupBy` is the list of label names for group aggregation. An empty list
-  produces a single group containing all rows.
-- **SPEC-ELM-5:** Unwrap functions (`sum_over_time`, `avg_over_time`, `min_over_time`,
-  `max_over_time`) read the numeric value from `logqlparser.UnwrapValueKey` in the labels
-  map (set by `StageUnwrap`). Rows without this key are skipped.
-- **SPEC-ELM-6:** `quantile_over_time` requires accumulating all numeric values per bucket
-  during the scan phase (`aggBucketState.values []float64`), then computing the q-th
-  percentile post-scan using the nearest-rank method. The quantile parameter `q` comes from
-  `vm.QuerySpec.Aggregate.Quantile` (0 ≤ q ≤ 1). Rows without `logqlparser.UnwrapValueKey`
-  are skipped. Returns 0 for empty buckets.
-  Back-ref: `internal/modules/executor/metrics_log.go:aggBucketState`,
-  `internal/modules/executor/metrics_log.go:logRowValues`,
-  `internal/modules/executor/metrics_log.go:logComputeQuantile`
-
-Back-ref: `internal/modules/executor/metrics_log.go:ExecuteLogMetrics`
-
----
-
-## 10. ExecuteTraceMetrics
+## 7. ExecuteTraceMetrics
 
 ### 10.1 Signature
 
@@ -950,6 +782,7 @@ Back-ref: `api.go:streamPipelineQuery`, `api.go:computeSpansetAggregate`,
 ---
 
 ## SPEC-ETM-13: Dict-ID Group Map Invariants
+
 *Added: 2026-04-17*
 
 - **SPEC-ETM-13.1:** When `len(agg.GroupBy) <= maxGroupByDimsFastPath (8)`, the intrinsic
@@ -976,6 +809,7 @@ Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:scanIntrinsicCol
 Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:scanIntrinsicColVals`
 
 ## SPEC-ETM-14: N=0/N=1 No-Predicate Direct Accumulation
+
 *Added: 2026-04-22*
 
 **N=1 no-predicate direct accumulation** — when a metrics query has exactly one group-by key,
@@ -984,11 +818,13 @@ dispatches through `accumulateIntrinsicBucketsDirect` which eliminates `inRangeR
 maps entirely.
 
 Dispatch conditions (all must hold):
+
 - `len(agg.GroupBy) == 1`
 - `len(predicates) == 0` (no TraceQL filter)
 - block is intrinsic-format (dict-encoded)
 
 Behavioral invariants:
+
 - **Byte-equivalence guarantee:** output is byte-identical to the hash-map-based path for all
   supported function types (count, rate, sum, min, max, histogram).
 - **`inRangeCount == 0` early exit:** returns `(true, nil)` before any dict or agg column work
@@ -1012,6 +848,7 @@ Back-ref: `internal/modules/executor/metrics_trace_intrinsic.go:accumulateIntrin
           `internal/modules/executor/metrics_trace_intrinsic.go:accumulateHistogramDirectN0`
 
 ## SPEC-SCAN-1: StreamScanEqualAny Dict-Mask Fast Path Invariants
+
 *Added: 2026-04-17*
 
 - **SPEC-SCAN-1.1:** `StreamScanEqualAny` fires the dict-mask fast path when all values in
@@ -1037,6 +874,7 @@ Back-ref: `internal/modules/executor/column_provider.go:StreamScanEqualAny`,
           `internal/modules/executor/column_provider.go:dispatchDictFastPath`
 
 ## SPEC-SCAN-2: StreamScanNotEqual — Absent Column Semantics
+
 *Added: 2026-04-17*
 
 - **SPEC-SCAN-2.1:** When `StreamScanNotEqual` is called for a column that is absent from
@@ -1057,6 +895,7 @@ Back-ref: `internal/modules/executor/column_provider.go:StreamScanNotEqual`
 ---
 
 ## SPEC-CSP-01: ComputeSecondPassCols — Column Set for Result Materialization
+
 *Added: 2026-04-30*
 
 ```go
@@ -1095,7 +934,7 @@ internal `computeColumnFilters` second-pass output.
   the result for every row in the loop.
 - **Correct wantCols for stream paths:** the return value is the correct `wantCols`
   argument for `NewSpanFieldsAdapterWithReader` at `streamFilterProgram`,
-  `streamLogProgram`, and the `QueryTraceQL` structural result path (SPEC-ROOT-017).
+  and the `QueryTraceQL` structural result path (SPEC-ROOT-017).
 
 ### Call-site pattern
 
@@ -1156,12 +995,11 @@ NOTE-406/407/410/442 (the streaming-discipline predecessors).
 
 ## SPEC-OBS-001: Context Propagation (see root SPEC.md)
 
-All executor entry points (`Collect`, `ExecuteLogMetrics`) MUST accept `ctx context.Context`
+All executor entry points (`Collect`) MUST accept `ctx context.Context`
 as first parameter. Nil is normalized to `context.Background()` at the boundary. See root
 SPEC-OBS-001 for the full invariant. NOTE-449 resolved NOTE-058.
 
-Back-ref: `internal/modules/executor/stream.go:Collect`,
-`internal/modules/executor/metrics_log.go:ExecuteLogMetrics`.
+Back-ref: `internal/modules/executor/stream.go:Collect`.
 
 ---
 

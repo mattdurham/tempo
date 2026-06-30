@@ -418,7 +418,6 @@ func Collect(
 			"total_blocks":        plan.TotalBlocks,
 			"pruned_by_time":      plan.PrunedByTime,
 			"pruned_by_index":     plan.PrunedByIndex,
-			"pruned_by_fuse":      plan.PrunedByFuse,
 			metaKeySelectedBlocks: len(plan.SelectedBlocks),
 			"explain":             plan.Explain,
 		},
@@ -843,9 +842,8 @@ func countUniqueBlockIdxs(refs []modules_shared.BlockRef) int {
 // Returns (nil, errNeedBlockScan) when no intrinsic constraint is available (fall through
 // to full block scan). Returns (nil, nil) for valid empty-result cases.
 //
-// collectWithBloomCheck runs the intrinsic fast path with a FileBloom pre-check.
-// SPEC-INTRINSIC-004: reject the file in O(1) if bloom says no span matches.
-// SPEC-STREAM-6: QueryStats is returned as part of the result.
+// collectWithBloomCheck runs the intrinsic fast path.
+// File-level bloom reject was removed in #437; this now delegates directly.
 func collectWithBloomCheck(
 	ctx context.Context,
 	r *modules_reader.Reader,
@@ -855,10 +853,6 @@ func collectWithBloomCheck(
 	secondPassCols map[string]struct{},
 ) ([]MatchedRow, QueryStats, error) {
 	var qs QueryStats
-	if program.Predicates != nil && fileLevelBloomReject(r, program.Predicates.Nodes) {
-		qs.ExecutionPath = ExecPathBloomRejected
-		return nil, qs, nil
-	}
 	return collectFromIntrinsicRefs(ctx, r, program, opts, wantColumns, secondPassCols, &qs)
 }
 

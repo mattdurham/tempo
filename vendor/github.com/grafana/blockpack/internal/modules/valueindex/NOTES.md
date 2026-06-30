@@ -158,48 +158,186 @@ Back-ref: `internal/modules/valueindex/runspill.go`,
 `internal/modules/valueindex/entries.go:chunkEncoder`,
 `internal/modules/blockio/shared/constants.go:ValueIndexWriterSpillEntries`
 
----
-
-## NOTE-V2-002 — BlockRef (page+length) replaces BlockID in value-index entries (issue #423)
+## NOTE-VI-027 — BlockRef: page-addressed block reference for v2 files (issue #417)
 
 Date: 2026-06-28
 
-The per-entry `BlockID uint32` (zero-based block index, NOTE-VI-014) is replaced by a
-`BlockFileRef` (NOTE-V2-001): a `uint24` page offset + `uint16` page length that locates
-the block's byte range in the file directly. This eliminates the TOC fetch on querier
-lookup — a value-index hit can issue a direct ranged GET
-(`Range: bytes=Page*4096, length=Length*4096`) with no intermediate block-index
-resolution. It is the value-index half of the v2 lean format epic (#417).
+### Why
 
-**Wire change:** `ValueIndexEntriesVersion` bumped `0x01 → 0x02`. The per-entry chunk
-payload `block_id[4]` becomes `block_ref[5]` (3-byte LE page + 2-byte LE length). The
-writer spill codec fixed header grows from 28 → 29 bytes, and the consumer spill header
-from 37 → 38 bytes, both for the same 4→5 byte ref. Old `0x01` files are rejected on
-open — the value-index pipeline rewrites all files so there is no in-place upgrade.
+v2 blockpack files align every inner block to a 4 096-byte page boundary (PR 2 of
+issue #417). This allows value-index entries to carry a **direct page reference**
+instead of a zero-based block index (`BlockID uint32`). A querier that holds a v2
+value-index entry can compute the exact S3 byte range immediately:
 
-**Ref derivation (extract path):** `blockFileRefFromMeta` converts a block's
-`BlockMeta.Offset`/`Length` into pages: `Page = Offset / 4096`,
-`Length = ceil(Length / 4096)`. Until v1 blocks gain 4 KB padding (#419) small unpadded
-blocks share a page, so several blocks can floor to the same `Page` — this is a v1
-precision limitation, not a correctness bug; the ref still covers the block's bytes. Once
-#419 lands, every block is page-aligned and the ref is exact.
+    Range: bytes = PageNum * 4096, length = LenPages * 4096
 
-**Dedup key:** `(valueHash, traceID, sourceRef, blockRef, timeSec)` — `blockRef` replaces
-`blockID` in `deduplicateEntries`/`sameEntry`.
+No TOC fetch, no block-index lookup — one round trip from index hit to block bytes.
 
-Supersedes NOTE-VI-014 (the BlockID field and its v1/v2 dual-decode design, which was
-never actually branched in the current single-version reader).
+### Wire encoding
 
-Back-ref: `internal/modules/valueindex/entries.go:Entry`,
-`internal/modules/valueindex/entries.go:encodeChunkPayload`,
-`internal/modules/valueindex/entries.go:decodeChunkPayload`,
-`internal/modules/valueindex/writer.go:rawEntry`,
-`internal/modules/valueindex/writer.go:AddEntry`,
-`internal/modules/valueindex/runspill.go:writeRawEntry`,
-`internal/modules/valueindex/reader.go:QueryResult`,
-`internal/modules/valueindexconsumer/consumer.go:ColumnEntry`,
-`internal/modules/valueindexconsumer/service.go:writeEntry`,
-`valueindex_extract.go:ValueIndexEntry`,
-`valueindex_extract.go:blockFileRefFromMeta`,
-`internal/modules/blockio/shared/constants.go:ValueIndexEntriesVersion`,
-`internal/modules/blockio/shared/blockref.go:BlockFileRef`
+`BlockRef` encodes as 5 bytes on the wire:
+
+| Field | Wire size | Type in memory | Max value |
+|---|---|---|---|
+| `PageNum` | 3 bytes LE | uint32 | 16,777,215 pages × 4096 = 64 GiB |
+| `LenPages` | 2 bytes LE | uint16 | 65,535 pages × 4096 = 256 MiB |
+
+This is one byte more than the legacy `BlockID uint32` (4 bytes). The increase is
+acceptable: for a typical index file with millions of entries the overhead is ~2-3%
+of index size, far less than the ~50% file-size reduction from removing IntrinsicTOC.
+
+### Design decisions
+
+- **PageNum is uint24 on wire, uint32 in memory** — avoids a custom uint24 Go type;
+  `AppendBlockRef` / `DecodeBlockRef` handle the 3-byte encoding explicitly.
+- **LenPages is the padded length** — the block byte length rounded up to the next
+  4096-byte multiple before dividing. Readers ignore trailing padding.
+- **`BlockRefFromByteRange` is the canonical constructor** — validates alignment,
+  rounds up length, checks overflow bounds. Direct construction of `BlockRef{}` is
+  for tests and decoding only.
+- **The `PageSize` constant (4096) is defined here** — it is the common coupling
+  point between the writer alignment (PR 2) and the value-index encoding (PR 5).
+  Both must agree on this value.
+
+### Backward compatibility
+
+`BlockRef` is used only in v2 value-index entries (a new `ValueIndexEntriesVersion`
+will gate its use in PR 5). Existing v1 value-index files continue to use `BlockID
+uint32` unchanged.
+
+Back-ref: `internal/modules/valueindex/blockref.go`,
+`internal/modules/valueindex/blockref_test.go`
+
+## NOTE-VI-027b — BlockRef wire encoding in VINX entries (issue #417 PR5)
+
+Date: 2026-06-28
+
+### VINX entry version
+
+`ValueIndexEntriesVersion` bumped from `0x01` to `0x02` (in `shared/constants.go`).
+The old constant is retained as `ValueIndexEntriesVersionV1 = 0x01` for backward compat.
+
+The VINX header version byte is now written **dynamically** based on whether any entry
+in the flush batch carries a non-zero `BlockRef`. This means:
+- v1-only batches (zero BlockRef on all entries) write version `0x01` — full backward compat.
+- v2 batches (any entry with non-zero BlockRef) write version `0x02`.
+
+Readers accept both versions: `decodeVINXSection` validates against either constant and
+passes the parsed version to `DecodeChunkRange`/`DecodeAllChunks` via the `ver uint8` param.
+`DecodeChunkRange` then routes to `decodeChunkPayload` (v2, 5-byte BlockRef) or
+`decodeChunkPayloadV1` (v1, 4-byte BlockID) accordingly.
+
+### Spill file format
+
+`writeRawEntry`/`readRawEntry` prefix each record with a 1-byte version flag
+(`spillV2Flag = 1` for v2, 0 for v1), eliminating ambiguous heuristic detection.
+
+### Writer.AddEntryV2
+
+New method on the `Writer` interface for callers that source entries from v2 blockpack files.
+Takes a `BlockRef` directly instead of a zero-based `blockID`. Internal `rawEntry` carries
+both `blockID uint32` and `blockRef BlockRef`; only one is non-zero per entry.
+
+### ValueIndexEntry.BlockRef (public API)
+
+`blockpack.ValueIndexEntry` now carries `BlockRef valueindex.BlockRef` populated by
+`extractBlockColumns` from `meta.PageNum` when non-zero (v2 files).
+
+### ColumnEntry.BlockRef (consumer spill)
+
+`valueindexconsumer.ColumnEntry` now carries `BlockRef valueindex.BlockRef`. The consumer
+spill codec encodes it as `block_page[3]+block_len_pages[2]` (5 bytes) after the existing
+`block_id[4]` field. Fixed header size updated from 37 to 42 bytes.
+
+Back-refs:
+- `internal/modules/valueindex/entries.go:decodeChunkPayload`, `decodeChunkPayloadV1`
+- `internal/modules/valueindex/entries.go:encodeChunkPayload`
+- `internal/modules/valueindex/entries.go:DecodeChunkRange`, `DecodeAllChunks`
+- `internal/modules/valueindex/writer.go:AddEntryV2`, `encodeVINXSectionVer`
+- `internal/modules/valueindex/runspill.go:writeRawEntry`, `readRawEntry`
+- `internal/modules/blockio/shared/constants.go:ValueIndexEntriesVersion`, `ValueIndexEntriesVersionV1`
+- `valueindex_extract.go:ValueIndexEntry.BlockRef`
+- `internal/modules/valueindexconsumer/consumer.go:ColumnEntry.BlockRef`
+- `internal/modules/valueindexconsumer/service.go:writeEntry`, `readEntry`
+
+## NOTE-VI-027c — v2 BlockRef round-trip test (issue #417 PR5)
+
+The existing `TestBlockRef_*` tests in `blockref_test.go` cover encoding/decoding.
+A v2 round-trip integration test should be added (TODO PR6) that:
+1. Writes a v2 blockpack (EnableV2Format=true)
+2. Calls ExtractValueIndexEntries → yields entries with non-zero BlockRef
+3. Calls AddEntryV2 on a valueindex.Writer
+4. Flushes and opens reader
+5. Asserts QueryResult.BlockRef.ByteOffset() matches the original block's Offset
+
+## NOTE-VI-032 — DiscoverIndexFiles: S3 lister → time-filtered, sorted file keys (issue #458)
+
+Date: 2026-06-30
+
+`DiscoverIndexFiles` (discovery.go) is the bridge between the on-disk value-index
+layout written by the consumer and the pure in-memory `QueryFiles` path. Given a
+`Lister` (satisfied by `blockpack.WritableStorage` and
+`valueindexcompactor.IndexStore`), it lists
+`<tenant>/<indexPrefix>/<colHash>/<colTypeName>/` once, filters by
+`ParseFilenameV2`+`IsInTimeRange`, sorts by `SortFileMetas`
+(Level ASC, WallMinSec ASC), and returns the FULL keys (not leaf names) so the
+caller can Get/Download directly.
+
+Key decisions:
+- Full key preservation: `ParseFilenameV2` only sets the leaf name in
+  `FileMeta.Filename`; we overwrite it with the full S3 key before sorting so the
+  returned slice is directly fetchable.
+- Malformed keys are skipped (not errored): an object sharing the prefix that is
+  not a value-index file cannot be queried anyway; failing the whole discovery on
+  one stray key would be brittle.
+- v1 filenames (no embedded time range) always match — they fall back through
+  `ParseFilenameV2`→`ParseFilename` and their zero WallMin/MaxSec is treated by
+  `IsInTimeRange` as "matches all".
+- No overlap returns (nil, nil) — callers distinguish "no files" from "[]".
+
+This performs a live LIST per call; the in-process listing cache (issue #462)
+wraps it as the production optimisation.
+
+Back-refs:
+- `internal/modules/valueindex/discovery.go:DiscoverIndexFiles`, `Lister`
+- `internal/modules/valueindex/filename.go:ParseFilenameV2`, `IsInTimeRange`, `SortFileMetas`
+- `internal/modules/valueindexconsumer/service.go:indexKeyV2` (the layout this mirrors)
+
+## NOTE-VI-034 — IndexFileCache: in-process value-index file-discovery cache (issue #462)
+
+Date: 2026-06-30
+
+`IndexFileCache` (filecache.go) wraps the `Lister` used by `DiscoverIndexFiles`
+(NOTE-VI-032) and replaces the live-per-query S3 LIST with a cached, periodically
+refreshed listing. At 100+ qps over ~700 column directories a LIST per query is too
+expensive; since filenames embed the wall-clock time range, the per-query time
+filter is O(1) per file once the directory listing is cached.
+
+Design:
+- Caches the *parsed* listing (`[]FileMeta` with full keys, pre-sorted by
+  `SortFileMetas`) per `(colHash, colType)`. `FilesForTimeRange` then runs
+  `IsInTimeRange` over the cached metas in memory — no S3 round-trip on warm hits.
+  It returns byte-identical keys/order to `DiscoverIndexFiles` (covered by a test
+  that asserts equality against `DiscoverIndexFiles`).
+- Cold miss: synchronous LIST+parse, cache, then filter. A concurrent cold miss for
+  the same column prefers the already-populated entry (single source of truth) but
+  still marks it accessed.
+- Background refresh: `Background(ctx)` ticks every `ttl` (default 30s) and re-lists
+  only columns *accessed since the previous sweep*, clearing the `accessed` flag.
+  Cold columns nobody queries are skipped, so the sweep cost scales with the active
+  working set, not the ~700-directory total. A LIST error during refresh KEEPS the
+  stale listing rather than evicting (a transient failure must not blind queries).
+- `Invalidate(colHash, colType)` evicts one column; the compactor calls it after
+  merging so the next query re-lists and sees the merged layout.
+- TTL tolerance: a new L0 file may be invisible for up to one TTL. Acceptable —
+  blocks take ~90s to flush anyway.
+
+Integration (the `FilesForTimeRange`-replaces-`DiscoverIndexFiles` wiring in the
+index query path) is deferred to issue #461, which introduces the index-driven
+query functions and the process-level singleton (`ConfigureValueIndex`) that owns
+the cache. The cache itself is self-contained and fully unit-tested here.
+
+Back-refs:
+- `internal/modules/valueindex/filecache.go:IndexFileCache`
+- `internal/modules/valueindex/discovery.go:DiscoverIndexFiles`, `Lister`
+- `internal/modules/valueindex/filename.go:ParseFilenameV2`, `IsInTimeRange`, `SortFileMetas`

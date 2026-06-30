@@ -134,22 +134,11 @@ hits the intrinsic fast path.
 Query: `{ span.http.method = "GET" }`. `CollectOptions{Limit: 10}`.
 
 **Assertions:**
+
 - `len(rows) == 1`
 - `qs.ExecutionPath != ""`
 - `qs.TotalDuration > 0`
 - `planStep(qs).Metadata["total_blocks"].(int) >= 1`
-
----
-
-## EX-QS-04: TestCollectLogs_ReturnsQueryStats
-
-**Scenario:** `CollectLogs` returns `QueryStats` with correct execution path for limited queries.
-
-**Setup:** Log writer with 3 records. `CollectOptions{Limit: 10}`.
-
-**Assertions:**
-- `qs.ExecutionPath == "block-topk"`
-- `qs.TotalDuration > 0`
 
 ---
 
@@ -168,7 +157,7 @@ neither of which is worth the maintenance cost.
 
 ## Coverage Requirements
 
-- All public entry points must be exercised: `Collect`, `ExecuteStructural`, `StreamLogs`, `CollectLogs`, `ExecuteLogMetrics`, `ExecuteTraceMetrics`.
+- All public entry points must be exercised: `Collect`, `ExecuteStructural`, `ExecuteTraceMetrics`.
 - Both the empty-file short-circuit and the multi-block scan path must be covered.
 - The `Options.Limit` early-exit path must be exercised (EX-08).
 - `SpanMatch` field population must be verified (EX-09).
@@ -179,6 +168,7 @@ neither of which is worth the maintenance cost.
 ---
 
 ## Integration Tests in blockio Package
+
 *Added: 2026-02-25*
 
 EX-01 through EX-07 are also exercised as integration tests in
@@ -361,248 +351,6 @@ Query: `{ resource.service.name =~ "cluster-0|cluster-1" }`.
 
 ---
 
-## StreamLogs Tests (stream_log_test.go)
-
-### EX-SL-01: TestStreamLogs_BasicFilter
-
-**Scenario:** StreamLogs returns only rows matching the label selector.
-
-**Setup:** 3 log records (svc×2, other×1). Query: `{service.name = "svc"}`, no pipeline.
-
-**Assertions:** callback fires twice; both entries have `Line` from the matching records.
-
----
-
-### EX-SL-02: TestStreamLogs_WithPipeline
-
-**Scenario:** JSON pipeline stage extracts labels from body.
-
-**Setup:** 2 records with JSON bodies containing `"level"` field.
-
-**Assertions:** each `LogEntry.Labels["level"]` is populated.
-
----
-
-### EX-SL-03: TestStreamLogs_PipelineDropsRows
-
-**Scenario:** Label filter pipeline stage drops non-matching rows.
-
-**Setup:** 3 records: 2×info, 1×error. Pipeline: `| json | level="error"`.
-
-**Assertions:** only 1 entry delivered; `entry.Labels["level"] == "error"`.
-
----
-
-### EX-SL-04: TestStreamLogs_NilReader
-
-**Scenario:** Nil reader returns nil without calling callback.
-
-**Assertions:** error is nil.
-
----
-
-### EX-SL-05: TestStreamLogs_EarlyStop
-
-**Scenario:** Returning false from callback stops iteration.
-
-**Setup:** 3 records. Callback returns false after second call.
-
-**Assertions:** callback invoked exactly twice.
-
----
-
-## StreamLogsTopK Tests (stream_log_topk_test.go)
-
-### EX-SLK-01: TestStreamLogsTopK_GlobalOrder_Backward
-
-**Scenario:** Top-K by timestamp returns the globally correct K entries.
-
-**Setup:** 6 log records across 2 blocks (MaxBlockSpans=3) with distinct timestamps T1…T6.
-`opts.Limit=3`, `Direction=Backward`.
-
-**Assertions:** callback fires 3 times; entries are T6, T5, T4 (newest 3).
-
----
-
-### EX-SLK-02: TestStreamLogsTopK_PipelineFilters
-
-**Scenario:** Pipeline dropping rows reduces the heap candidates.
-
-**Setup:** 4 records with logfmt `level=info` or `level=error`. Pipeline: `| logfmt | level="error"`. `opts.Limit=10`.
-
-**Assertions:** only error-level entries delivered; count matches error-level count.
-
----
-
-### EX-SLK-03: TestStreamLogsTopK_BlockSkip
-
-**Scenario:** Block-level skip triggered once heap is full.
-
-**Setup:** 4 records across 2 blocks (MaxBlockSpans=2); block 0 has older timestamps,
-block 1 has newer timestamps. `opts.Limit=2`, `Direction=Backward`.
-
-**Assertions:** `StreamStats.FetchedBlocks < StreamStats.SelectedBlocks` after scan —
-confirms block 0 was skipped because its MaxStart cannot improve the full heap.
-
----
-
-### EX-SLK-04: TestStreamLogsTopK_TimeRange
-
-**Scenario:** Per-row time filter excludes rows outside opts.TimeRange.
-
-**Setup:** 3 records at T1, T2, T3. `opts.TimeRange={MinNano: T2, MaxNano: T2}`.
-
-**Assertions:** exactly 1 entry delivered (T2 only).
-
----
-
-### EX-SLK-05: TestStreamLogsTopK_LimitZeroDeliversAll
-
-**Scenario:** `opts.Limit == 0` delivers all pipeline-passing rows sorted.
-
-**Setup:** 5 records with distinct timestamps. No pipeline. `Direction=Forward`.
-
-**Assertions:** all 5 entries delivered in ascending timestamp order.
-
----
-
-### EX-SLK-06: TestStreamLogsTopK_NilReader
-
-**Scenario:** Nil reader returns nil without calling callback.
-
-**Assertions:** error is nil; callback never invoked.
-
----
-
-### EX-SLK-07: TestStreamLogsTopK_NilPipeline
-
-**Scenario:** Nil pipeline passes all rows through without transformation.
-
-**Note:** No separate test function. Covered by `TestStreamLogsTopK_LimitZeroDeliversAll`
-(limit=0, no pipeline, all rows delivered).
-
----
-
-### EX-SLK-08: TestStreamLogsTopK_GlobalOrder_Forward
-
-**Scenario:** Forward direction delivers oldest K entries in ascending order.
-
-**Setup:** 4 records at T1 < T2 < T3 < T4. `opts.Limit=2`, `Direction=Forward`.
-
-**Assertions:** 2 entries delivered; first has T1, second has T2.
-
----
-
-## ExecuteLogMetrics Tests (metrics_log_test.go)
-
-### EX-ELM-01: TestMetrics_CountOverTime
-
-**Scenario:** count_over_time buckets log records by time step.
-
-**Setup:** 2 records per bucket, 3 buckets (1-minute steps).
-
-**Assertions:** 3 rows; each row has count == 2; `BytesRead > 0`.
-
----
-
-### EX-ELM-02: TestMetrics_Rate
-
-**Scenario:** rate divides count by step duration in seconds.
-
-**Setup:** 2 records per bucket, 2 buckets (1-minute steps).
-
-**Assertions:** rate == 2 / 60.0 per bucket.
-
----
-
-### EX-ELM-03: TestMetrics_BytesOverTime
-
-**Scenario:** bytes_over_time sums log line lengths per bucket.
-
-**Setup:** 3 records with bodies "hello", "world!", "x" in one bucket.
-
-**Assertions:** bucket value equals sum of `len(line)` for all records.
-
----
-
-### EX-ELM-04: TestMetrics_SumOverTime
-
-**Scenario:** sum_over_time sums unwrap values.
-
-**Setup:** 3 records with logfmt bodies `duration=10`, `duration=20`, `duration=30`;
-pipeline `| logfmt | unwrap duration`.
-
-**Assertions:** bucket value == 60.
-
----
-
-### EX-ELM-05: TestMetrics_GroupBy
-
-**Scenario:** groupBy partitions aggregation by label values.
-
-**Setup:** 2 error + 3 info records with logfmt level field; `groupBy: ["level"]`.
-
-**Assertions:** two result rows; error count == 2, info count == 3.
-
----
-
-### EX-ELM-06: TestMetrics_NilReader
-
-**Scenario:** Nil reader returns empty result.
-
-**Assertions:** `len(result.Rows) == 0`, no error.
-
----
-
-### EX-ELM-07: TestMetrics_NilQuerySpec
-
-**Scenario:** Nil querySpec returns an error (SPEC-ELM-2).
-
-**Assertions:** error is non-nil.
-
----
-
-### EX-ELM-08: TestMetrics_BytesRate
-
-**Scenario:** bytes_rate divides total bytes by step duration in seconds.
-
-**Setup:** 2 records with 5-byte bodies ("hello") in one 1-minute bucket; total = 10 bytes.
-
-**Assertions:** bytes_rate == 10.0 / 60.0.
-
----
-
-### EX-ELM-09: TestMetrics_AvgOverTime
-
-**Scenario:** avg_over_time computes average of unwrap values per bucket.
-
-**Setup:** 3 records with logfmt `duration=10`, `duration=20`, `duration=30`;
-pipeline `| logfmt | unwrap duration`.
-
-**Assertions:** avg == 20.0.
-
----
-
-### EX-ELM-10: TestMetrics_MinMaxOverTime
-
-**Scenario:** min_over_time and max_over_time return extremes of unwrap values.
-
-**Setup:** 5 records with val = 5, 15, 3, 99, 42; pipeline `| logfmt | unwrap val`.
-
-**Assertions:** min == 3.0; max == 99.0 (tested in separate ExecuteLogMetrics calls).
-
----
-
-### EX-ELM-11: TestMetrics_RowsOutsideTimeRange
-
-**Scenario:** Rows with timestamps outside [Start, End) are excluded from bucket counts.
-
-**Setup:** 1 record inside the range; 1 before the range; 1 exactly at End (exclusive).
-
-**Assertions:** 1 result row with count == 1.
-
----
-
 ## EX-20: TestExtractLiteralAlternatives
 
 **Scenario:** `extractLiteralAlternatives` correctly classifies patterns.
@@ -611,6 +359,7 @@ pipeline `| logfmt | unwrap duration`.
 (package `executor`).
 
 **Cases:**
+
 | Pattern | Expected |
 |---|---|
 | `"cluster-0\|cluster-1"` | `["cluster-0", "cluster-1"]` |
@@ -758,6 +507,7 @@ case-insensitive alternations).
 Single time bucket. Query: `{ } | histogram_over_time(span.duration)`.
 
 **Assertions:**
+
 - `len(result.Series) > 0`
 - Every series has a label `Name == "__bucket"` with a non-empty value
 - All non-NaN values are >= 0.0
@@ -819,6 +569,7 @@ block; equal durations within each service cause the writer to emit a dict colum
 `span:duration`.
 
 **Assertions:**
+
 - `result.BlocksScanned == 0` (intrinsic fast path taken).
 - `len(result.Series) > 0`.
 - Sum of all bucket counts for svc-a == 4; sum for svc-b == 4.
@@ -837,6 +588,7 @@ durations 16ms/32ms/64ms/128ms service.name="svc-y". Single time bucket. Distinc
 cause the writer to emit a flat intrinsic column for `span:duration`.
 
 **Assertions:**
+
 - `result.BlocksScanned == 0`.
 - `len(result.Series) > 0`.
 - Sum of all bucket counts for svc-x == 4; sum for svc-y == 4.
@@ -854,6 +606,7 @@ fall into the boundary-0 bucket.
 service.name="svc-nil". Single time bucket.
 
 **Assertions:**
+
 - `result.BlocksScanned == 0` (intrinsic fast path taken).
 - `len(result.Series) > 0`.
 - All `__bucket` labels equal `strconv.FormatFloat(0, 'g', -1, 64)` (= "0").
@@ -874,6 +627,7 @@ catching regressions in `intrinsicHistogramBoundary` or `FormatFloat` format cha
 `strconv.FormatFloat(0.0078125, 'g', -1, 64)` == "0.0078125".
 
 **Assertions:**
+
 - `result.BlocksScanned == 0`.
 - `len(result.Series) > 0`.
 - At least one series has a `__bucket` label equal to "0.0078125".
@@ -894,6 +648,7 @@ all in one time bucket.
 field forces the block scan path.
 
 **Assertions:**
+
 - `result.Series[0].Values[0] == 30.0` (server spans only, not 50.0 for all)
 - `result.BlocksScanned > 0` (block scan path confirmed)
 
@@ -911,10 +666,12 @@ This is the bug-report scenario: filtered count must be ≤ less-restrictive fil
 **Setup:** 5 spans: server+sc500, server+sc200, server+sc404, client+sc500, client+sc400.
 
 **Queries (run against same block):**
+
 - Query A: `{ kind = server && span.http.response.status_code >= 400 } | count_over_time()`
 - Query B: `{ kind = server } | count_over_time()`
 
 **Assertions:**
+
 - Query A result: 2 (spans with server+sc≥400)
 - Query B result: 3 (all server spans)
 - Query A count < Query B count
@@ -1082,6 +839,7 @@ All 4 spans are rightMatch (wildcard). Root has no ancestors → passes.
 child1, child2, grandchild all have root in their ancestor chain → excluded.
 
 **Assertions:**
+
 - `len(result.Matches) == 1`
 - root (spanID 0xAA) is present
 - child1 (0xBB), child2 (0xDD), grandchild (0xCC) are absent
@@ -1098,6 +856,7 @@ root has no parent → passes. child1/child2 have parent=root (leftMatch) → ex
 grandchild has parent=child1 (not leftMatch) → passes.
 
 **Assertions:**
+
 - `len(result.Matches) == 2`
 - root (0xAA) and grandchild (0xCC) are present
 - child1 (0xBB) and child2 (0xDD) are absent
@@ -1207,6 +966,7 @@ Query: `{ resource.service.name =~ "loki-.*" && span.http.method = "GET" }`.
 No spans have `http.method` set.
 
 **Assertions:**
+
 - `len(rows) == 0` (VM re-evaluation eliminates all intrinsic candidates).
 - No error, no panic.
 
@@ -1254,6 +1014,7 @@ range predicates populate `MatchedRow.IntrinsicFields` (lookupIntrinsicFields).
 Query: `{ resource.service.name = "svc-a" }` (equality). `CollectOptions{Limit: 5}`.
 
 **Assertions:**
+
 - `len(results) == 5`
 - For each row: `row.Block != nil` and `row.IntrinsicFields == nil` (equality → Block path)
 - `row.Block.GetColumn("resource.service.name")` is present and value is `"svc-a"`
@@ -1281,6 +1042,7 @@ Query: `{ resource.service.name = "target" }`.
 **Setup:** Table-driven, package-internal test in `predicates_helper_test.go`.
 
 **Cases:**
+
 | Query | Expected |
 |---|---|
 | `{ resource.service.name = "svc" }` | `true` |
@@ -1320,7 +1082,6 @@ Query: `{ resource.service.name = "svc-a" && span.http.method = "GET" }`.
 **Assertions:** `len(results) == 0` (no spans have http.method); no error; no panic.
 Confirms the full block scan is correctly invoked when the intrinsic fast path is gated off.
 
-
 ---
 
 ## EX-PERF-01: TestCollect_IntrinsicTopK_MapPath_Stats
@@ -1333,6 +1094,7 @@ with svc="other-svc". CollectOptions{Limit: 2, TimestampColumn: "span:start",
 Direction: Backward}.
 
 **Assertions:**
+
 - len(rows) == 2
 - qs.ExecutionPath == "intrinsic-topk-kll"
 - intrinsicStep(qs).Metadata["ref_count"] == 3
@@ -1351,6 +1113,7 @@ Confirms ExecutionPath="intrinsic-topk-scan" and scan_count > 0.
 TimestampColumn: "span:start", Direction: Backward}.
 
 **Assertions:**
+
 - qs.ExecutionPath == "intrinsic-topk-scan"
 - intrinsicStep(qs).Metadata["scan_count"].(int) > 0
 - len(rows) == 2
@@ -1380,6 +1143,7 @@ by BlockMeta.MaxStart DESC, and returns globally correct top-K by timestamp. NOT
 CollectOptions{Limit: 2, TimestampColumn: "span:start", Direction: Backward}.
 
 **Assertions:**
+
 - len(rows) == 2
 - qs.ExecutionPath == "intrinsic-topk-kll"
 - intrinsicStep(qs).Metadata["ref_count"] == 3
@@ -1387,8 +1151,6 @@ CollectOptions{Limit: 2, TimestampColumn: "span:start", Direction: Backward}.
 - rows[0].IntrinsicFields != nil (zero block reads)
 - rows[1].IntrinsicFields != nil
 - rows[0] span:start > rows[1] span:start (descending order)
-
-
 
 ---
 
@@ -1402,10 +1164,12 @@ Regression guard for adaptive `collectIntrinsicPlain` dispatch (hasRangePredicat
 and service name. `CollectOptions{Limit: 10000}`.
 
 **Cases:**
+
 - `{ duration > 100ms }` → 2 results (200ms, 300ms spans)
 - `{ duration > 10ms }` → 3 results (50ms, 200ms, 300ms spans)
 
 **Assertions per case:**
+
 - `qs.ExecutionPath == "intrinsic-plain"`
 - `blockScanStep(qs)` is nil (intrinsic path — no block-scan step)
 - Each row: `row.IntrinsicFields != nil`, `row.Block == nil`
@@ -1421,12 +1185,14 @@ Regression guard for adaptive `collectIntrinsicPlain` dispatch (hasRangePredicat
 **Setup:** Same 5-span dataset as EP-01. `CollectOptions{Limit: 10000}`.
 
 **Cases:**
+
 - `{ status = error }` → 2 results
 - `{ kind = server }` → 3 results
 - `{ resource.service.name = "svc-a" }` → 2 results
 - `{ resource.service.name = "svc-b" }` → 2 results
 
 **Assertions per case:**
+
 - `qs.ExecutionPath == "intrinsic-plain"`
 - Each row: `row.Block != nil`, `row.IntrinsicFields == nil`
 
@@ -1442,6 +1208,7 @@ When ANY predicate is a range, hasRangePredicate=true drives the whole group to
 Query: `{ duration > 100ms && status = error }`.
 
 **Assertions:**
+
 - `len(results) == 1` (only span with 300ms duration AND error status)
 - `qs.ExecutionPath == "intrinsic-plain"`
 - Each row: `row.IntrinsicFields != nil`, `row.Block == nil`
@@ -1458,6 +1225,7 @@ entirely — no intrinsic predicate → hasSomeIntrinsicPredicates=false → blo
 Query: `{ span.http.method = "GET" }`.
 
 **Assertions:**
+
 - `len(results) == 1`
 - `qs.ExecutionPath == "block-plain"`
 - `blockScanStep(qs).IOOps > 0`
@@ -1472,6 +1240,7 @@ user attribute. Guards against path optimizations silently changing observable r
 **Setup:** Same 5-span dataset. Table-driven. `CollectOptions{Limit: 10000}`.
 
 **Cases:**
+
 | Query | Expected count |
 |---|---|
 | `{ duration > 100ms }` | 2 |
@@ -1489,16 +1258,6 @@ user attribute. Guards against path optimizations silently changing observable r
 | `{ resource.service.name = "svc-a" && status = error }` | 1 |
 
 **Assertions:** `len(results) == expected` for every case; no errors.
-
----
-
-## EXEC-TEST-BLS-001: blockLabelSet interface compliance
-
-**Scenario:** `blockLabelSet` satisfies the `logqlparser.LabelSet` interface.
-
-**Setup:** Compile-time assertion `var _ logqlparser.LabelSet = (*blockLabelSet)(nil)`.
-
-**Assertions:** Compilation succeeds.
 
 ---
 
@@ -1764,20 +1523,8 @@ Back-ref: `internal/modules/executor/metrics_trace_intrinsic_test.go:TestTraceMe
 
 ---
 
-### EX-INT-11: TestLogBuildDenseRows_CapPrealloc
-
-**Scenario:** `logBuildDenseRows` with a realistic time window and multiple attr group keys
-does not panic and returns the correct row count.
-
-**Setup:** 10 time buckets, 3 attr group keys; each bucket populated in the input map.
-
-**Assertions:** `len(rows) == 30` (10 * 3); no panic; result is non-nil.
-
-Back-ref: `internal/modules/executor/metrics_log_overflow_test.go:TestLogBuildDenseRows_CapPrealloc`
-
----
-
 ### EX-ROWSET-01: TestRowSetWithCap_ZeroHint
+
 *Added: 2026-04-08*
 
 **Scenario:** `newRowSetWithCap(0)` falls back to a nil backing slice (same as `newRowSet()`).
@@ -1785,6 +1532,7 @@ Back-ref: `internal/modules/executor/metrics_log_overflow_test.go:TestLogBuildDe
 **Setup:** Call `newRowSetWithCap(0)`.
 
 **Assertions:**
+
 - `rs.IsEmpty()` returns true.
 - `cap(rs.rows) == 0` — no backing array allocated.
 
@@ -1793,6 +1541,7 @@ Back-ref: `internal/modules/executor/rowset_test.go:TestRowSetWithCap_ZeroHint`
 ---
 
 ### EX-ROWSET-02: TestRowSetWithCap_NegativeHint
+
 *Added: 2026-04-08*
 
 **Scenario:** `newRowSetWithCap(hint)` with `hint < 0` falls back to a nil backing slice.
@@ -1800,6 +1549,7 @@ Back-ref: `internal/modules/executor/rowset_test.go:TestRowSetWithCap_ZeroHint`
 **Setup:** Call `newRowSetWithCap(-5)`.
 
 **Assertions:**
+
 - `rs.IsEmpty()` returns true.
 - `cap(rs.rows) == 0` — negative hint is ignored, no backing array allocated.
 
@@ -1808,6 +1558,7 @@ Back-ref: `internal/modules/executor/rowset_test.go:TestRowSetWithCap_NegativeHi
 ---
 
 ### EX-ROWSET-03: TestRowSetWithCap_PositiveHint
+
 *Added: 2026-04-08*
 
 **Scenario:** `newRowSetWithCap(hint)` with `hint > 0` preallocates exactly `hint` capacity.
@@ -1815,6 +1566,7 @@ Back-ref: `internal/modules/executor/rowset_test.go:TestRowSetWithCap_NegativeHi
 **Setup:** Call `newRowSetWithCap(10)`.
 
 **Assertions:**
+
 - `rs.IsEmpty()` returns true.
 - `cap(rs.rows) == 10` — backing array preallocated with requested capacity.
 - Add elements and verify `rs.Size()`, `rs.Contains()` work correctly regardless of hint.
@@ -1831,6 +1583,7 @@ All tests live in `internal/modules/executor/block_group_pipeline_test.go` in pa
 ---
 
 ### EX-BGP-01: TestBlockGroupPipeline_EarlyStop
+
 *Added: 2026-04-15*
 
 **Scenario:** Pipeline stops when `processGroup` returns `errLimitReached` after group 3.
@@ -1840,6 +1593,7 @@ SPEC-STREAM-11: `errLimitReached` → nil error; groups beyond the stop are not 
 `errLimitReached` on the 3rd call.
 
 **Assertions:**
+
 - Return error is nil (errLimitReached swallowed).
 - `fetchedGroups <= numGroups` (total group count — see note below).
 - `fetchedGroups >= stopAfterGroup` (at least 3 groups fetched before stop).
@@ -1856,6 +1610,7 @@ Back-ref: `internal/modules/executor/block_group_pipeline_test.go:TestBlockGroup
 ---
 
 ### EX-BGP-02: TestBlockGroupPipeline_FullScan
+
 *Added: 2026-04-15*
 
 **Scenario:** Pipeline processes all groups when no limit is hit.
@@ -1865,6 +1620,7 @@ SPEC-STREAM-11: `fetchedGroups == len(groups)`; `fetchedBlocks == total block ID
 **Setup:** Fake reader with 4 groups [3, 2, 4, 1 blocks]; uniform 50-byte block lengths; W=2.
 
 **Assertions:**
+
 - `fetchedGroups == 4`.
 - `fetchedBlocks == 10`.
 - `bytesRead == 500` (10 blocks × 50 bytes).
@@ -1876,6 +1632,7 @@ Back-ref: `internal/modules/executor/block_group_pipeline_test.go:TestBlockGroup
 ---
 
 ### EX-BGP-03: TestBlockGroupPipeline_IOConcurrencyBound
+
 *Added: 2026-04-15*
 
 **Scenario:** At most W concurrent ReadGroup calls in-flight at any time.
@@ -1887,6 +1644,7 @@ in memory. See EX-BGP-14 for the memory (peak in-memory groups) invariant.
 `processGroup` sleeps 1ms to simulate parse work.
 
 **Assertions:**
+
 - No error.
 - Peak concurrent `ReadGroup` calls tracked by atomic counter ≤ W=2.
 
@@ -1895,6 +1653,7 @@ Back-ref: `internal/modules/executor/block_group_pipeline_test.go:TestBlockGroup
 ---
 
 ### EX-BGP-04: TestBlockGroupPipeline_ConcurrentCorrectness
+
 *Added: 2026-04-15*
 
 **Scenario:** Each block's raw bytes arrive intact under concurrent I/O; no data races.
@@ -1903,6 +1662,7 @@ Back-ref: `internal/modules/executor/block_group_pipeline_test.go:TestBlockGroup
 deterministic content (block index encoded in bytes).
 
 **Assertions:**
+
 - No error.
 - All 24 blocks received exactly once (no duplicates, no missing).
 - Each block's bytes are non-empty.
@@ -1913,6 +1673,7 @@ Back-ref: `internal/modules/executor/block_group_pipeline_test.go:TestBlockGroup
 ---
 
 ### EX-BGP-05: TestBlockGroupPipeline_StatsAccumulation
+
 *Added: 2026-04-15*
 
 **Scenario:** Stats are accumulated correctly across groups.
@@ -1922,6 +1683,7 @@ SPEC-STREAM-11: Stats accounting invariants.
 group 2 has 3 blocks (10, 20, 30 bytes).
 
 **Assertions:**
+
 - `fetchedGroups == 3`.
 - `fetchedBlocks == 6`.
 - `bytesRead == 410`.
@@ -1930,25 +1692,8 @@ Back-ref: `internal/modules/executor/block_group_pipeline_test.go:TestBlockGroup
 
 ---
 
-### EX-BGP-06: LogMetrics pipeline regression suite
-*Added: 2026-04-15*
-
-**Scenario:** `ExecuteLogMetrics` produces correct aggregates after migration from
-`ReadBlocks` (eager all-upfront) to `blockGroupPipeline` (bounded sliding-window).
-
-**Regression goal:** Verify that the pipeline migration does not change log metric results.
-
-**Setup:** Existing `ExecuteLogMetrics` tests in `metrics_log_test.go`.
-
-**Assertions:**
-- All existing metrics_log tests pass with the new pipeline implementation.
-- Bucket counts, sums, rates match the pre-migration expected values.
-
-Back-ref: `internal/modules/executor/metrics_log_test.go`
-
----
-
 ### EX-BGP-07: TraceMetrics pipeline regression suite
+
 *Added: 2026-04-15*
 
 **Scenario:** `ExecuteTraceMetrics` produces correct aggregates after migration from
@@ -1959,6 +1704,7 @@ sequential loop to `blockGroupPipeline` (bounded sliding-window).
 **Setup:** Existing `ExecuteTraceMetrics` tests in `metrics_trace_test.go`.
 
 **Assertions:**
+
 - All existing metrics_trace tests pass with the new pipeline implementation.
 - Series values match the pre-migration expected values.
 
@@ -1967,6 +1713,7 @@ Back-ref: `internal/modules/executor/metrics_trace_test.go`
 ---
 
 ### EX-BGP-08: TestBlockGroupPipeline_PendingMapBound
+
 *Added: 2026-04-15*
 
 **Scenario:** Slow group 0 with W=4 workers and 12 groups.
@@ -1975,6 +1722,7 @@ Verifies that the semaphore-gated dispatcher does not deadlock and completes all
 when group 0 is delayed 50ms relative to groups 1-11.
 
 **Assertions:**
+
 - `fetchedGroups == 12`.
 - Pipeline completes without timeout (5s limit).
 
@@ -1984,6 +1732,7 @@ Back-ref: `internal/modules/executor/block_group_pipeline_test.go:TestBlockGroup
 ---
 
 ### EX-BGP-09: TestBlockGroupPipeline_ContextCancellation
+
 *Added: 2026-04-15*
 
 **Scenario:** Outer context deadline expires mid-scan.
@@ -1991,6 +1740,7 @@ Back-ref: `internal/modules/executor/block_group_pipeline_test.go:TestBlockGroup
 Verifies that `blockGroupPipeline` returns `context.DeadlineExceeded` (not nil).
 
 **Assertions:**
+
 - `errors.Is(err, context.DeadlineExceeded)`.
 
 CRIT-BGP-2: `ctx.Err()` is checked after results drain.
@@ -1999,6 +1749,7 @@ Back-ref: `internal/modules/executor/block_group_pipeline_test.go:TestBlockGroup
 ---
 
 ### EX-BGP-10: TestBlockGroupPipeline_WorkerPanicRecovery
+
 *Added: 2026-04-15*
 
 **Scenario:** ReadGroup panics in a worker goroutine.
@@ -2007,6 +1758,7 @@ Verifies that the `defer recover()` converts the panic to an error rather than c
 the process. Error message contains "panic".
 
 **Assertions:**
+
 - `err != nil`.
 - `strings.Contains(err.Error(), "panic")`.
 - Error message does not contain `"group 0"` when a later group panics (verifies correct group index attribution).
@@ -2017,6 +1769,7 @@ Back-ref: `internal/modules/executor/block_group_pipeline_test.go:TestBlockGroup
 ---
 
 ### EX-BGP-11: TestForEachBlockInGroupsPreFnNilPassthrough
+
 *Added: 2026-04-15*
 
 **Scenario:** `preFn` is nil — no gate is applied.
@@ -2025,6 +1778,7 @@ Builds a two-block file, calls `forEachBlockInGroups` with `preFn=nil`, and coun
 invocations.
 
 **Assertions:**
+
 - `fn` is called exactly once per block (equal to `r.BlockCount()`).
 
 SPEC-STREAM-12: nil preFn must not suppress any fn calls.
@@ -2033,6 +1787,7 @@ Back-ref: `internal/modules/executor/stream_prefn_test.go:TestForEachBlockInGrou
 ---
 
 ### EX-BGP-12: TestForEachBlockInGroupsPreFnFalseSkips
+
 *Added: 2026-04-15*
 
 **Scenario:** `preFn` returns false for every block — second-pass decode and fn are skipped.
@@ -2041,6 +1796,7 @@ Builds a two-block file, calls `forEachBlockInGroups` with a preFn that always r
 and counts both preFn and fn invocations.
 
 **Assertions:**
+
 - `preFn` is called exactly once per block.
 - `fn` is never called (call count == 0).
 
@@ -2050,6 +1806,7 @@ Back-ref: `internal/modules/executor/stream_prefn_test.go:TestForEachBlockInGrou
 ---
 
 ### EX-BGP-13: TestForEachBlockInGroupsPreFnTruePassthrough
+
 *Added: 2026-04-15*
 
 **Scenario:** `preFn` returns true for every block — second-pass decode and fn proceed.
@@ -2058,6 +1815,7 @@ Builds a two-block file, calls `forEachBlockInGroups` with a preFn that always r
 and counts fn invocations.
 
 **Assertions:**
+
 - `fn` is called exactly once per block (equal to `r.BlockCount()`).
 
 SPEC-STREAM-12: preFn returning true must not suppress fn calls.
@@ -2066,6 +1824,7 @@ Back-ref: `internal/modules/executor/stream_prefn_test.go:TestForEachBlockInGrou
 ---
 
 ### EX-BGP-14: TestBlockGroupPipeline_PeakInMemoryGroupsBound
+
 *Added: 2026-04-15*
 
 **Scenario:** Semaphore token released only after processGroup returns — peak simultaneously live group data ≤ W.
@@ -2078,6 +1837,7 @@ called sequentially on the consumer goroutine, peak in-memory groups must be exa
 increments/decrements an in-memory counter, sleeps 2ms, and records the peak.
 
 **Assertions:**
+
 - No error.
 - Peak simultaneously live group data == 1 (processGroup is sequential; semaphore
   released after processGroup returns, not before).
@@ -2110,6 +1870,7 @@ val)` tuples. Both the merge-join output and the reference map output are compar
 `outRefs` and `outVals` equality.
 
 **Cases include:**
+
 - Empty filteredRefs → empty output
 - Empty inRangeRefs → empty output
 - No overlap between filteredRefs and inRangeRefs → empty output
@@ -2134,6 +1895,7 @@ Total allocs/op reflects only sort-support allocations (`slices.Clone` for filte
 `[]refIdx` for the index) — both O(1) per file, not O(N) per span. See BENCH-EX-08.
 
 **Setup (outside timed loop):**
+
 - Write 300 spans: 200 with `status=error`, 100 with `status=ok`. `MaxBlockSpans=301` (single block).
 - Compile `{ status = error } | rate()` with 6 × 60s buckets.
 - Run with `b.ReportAllocs()`.
@@ -2145,6 +1907,7 @@ Back-ref: `internal/modules/executor/metrics_trace_intrinsic_test.go:BenchmarkTr
 ---
 
 ## EX-CK-01: TestTraceCompositeKey_EmptyGroupBy_NonHistogram
+
 *Added: 2026-04-16*
 
 **Scenario:** compositeKey byte-equivalence, empty groupBy, non-HISTOGRAM.
@@ -2154,6 +1917,7 @@ Back-ref: `internal/modules/executor/metrics_trace_composite_key_test.go:TestTra
 ---
 
 ## EX-CK-02: TestTraceCompositeKey_SingleGroupBy_NonHistogram
+
 *Added: 2026-04-16*
 
 **Scenario:** compositeKey byte-equivalence, single groupBy value, non-HISTOGRAM.
@@ -2163,6 +1927,7 @@ Back-ref: `internal/modules/executor/metrics_trace_composite_key_test.go:TestTra
 ---
 
 ## EX-CK-03: TestTraceCompositeKey_MultiGroupBy_NonHistogram
+
 *Added: 2026-04-16*
 
 **Scenario:** compositeKey byte-equivalence, two groupBy values, non-HISTOGRAM.
@@ -2172,6 +1937,7 @@ Back-ref: `internal/modules/executor/metrics_trace_composite_key_test.go:TestTra
 ---
 
 ## EX-CK-04: TestTraceCompositeKey_EmptyGroupBy_Histogram
+
 *Added: 2026-04-16*
 
 **Scenario:** compositeKey byte-equivalence, empty groupBy, HISTOGRAM.
@@ -2181,6 +1947,7 @@ Back-ref: `internal/modules/executor/metrics_trace_composite_key_test.go:TestTra
 ---
 
 ## EX-CK-05: TestTraceCompositeKey_SingleGroupBy_Histogram
+
 *Added: 2026-04-16*
 
 **Scenario:** compositeKey byte-equivalence, single groupBy, HISTOGRAM.
@@ -2190,6 +1957,7 @@ Back-ref: `internal/modules/executor/metrics_trace_composite_key_test.go:TestTra
 ---
 
 ## EX-CK-06: TestTraceCompositeKey_MultiGroupBy_Histogram
+
 *Added: 2026-04-16*
 
 **Scenario:** compositeKey byte-equivalence, two groupBy values, HISTOGRAM.
@@ -2199,6 +1967,7 @@ Back-ref: `internal/modules/executor/metrics_trace_composite_key_test.go:TestTra
 ---
 
 ## EX-CK-07: TestTraceCompositeKey_HistogramRoundTrip
+
 *Added: 2026-04-16*
 
 **Scenario:** Build compositeKey with new scratch path, feed into `traceHistogramSeries`
@@ -2210,6 +1979,7 @@ Back-ref: `internal/modules/executor/metrics_trace_composite_key_test.go:TestTra
 ---
 
 ## EX-INT-14: TestANDMultiValueOR — resource-col AND span-attr OR (NOTE-076)
+
 *Added: 2026-04-17*
 
 **Scenario:** `{resource.service.name="svc-a" && (span.http.method="GET" || span.http.method="POST")}` returns 2 spans.
@@ -2220,6 +1990,7 @@ Back-ref: `internal/modules/executor/and_or_scope_test.go:TestANDMultiValueOR_In
 ---
 
 ## EX-INT-15: TestANDMultiValueOR — intrinsic span:kind AND span-attr OR (NOTE-076)
+
 *Added: 2026-04-17*
 
 **Scenario:** `{span:kind=server && (span.http.method="GET" || span.http.method="POST")}` returns 3 spans.
@@ -2230,6 +2001,7 @@ Back-ref: `internal/modules/executor/and_or_scope_test.go:TestANDMultiValueOR_In
 ---
 
 ## EX-INT-16: TestANDMultiValueOR — resource-col AND span-attr string-OR (NOTE-076)
+
 *Added: 2026-04-17*
 
 **Scenario:** `{resource.service.name="svc-a" && (span.http.url="A" || span.http.url="B")}` returns 2 spans.
@@ -2240,6 +2012,7 @@ Back-ref: `internal/modules/executor/and_or_scope_test.go:TestANDMultiValueOR_In
 ---
 
 ## EX-INT-17: TestANDMultiValueOR — order-independent (NOTE-076)
+
 *Added: 2026-04-17*
 
 **Scenario:** `{(span.http.method="GET" || span.http.method="POST") && resource.service.name="svc-a"}` is order-independent.
@@ -2249,6 +2022,7 @@ Back-ref: `internal/modules/executor/and_or_scope_test.go:TestANDMultiValueOR_In
 ---
 
 ## EX-INT-18: TestANDMultiValueOR — both span-attr (non-regression)
+
 *Added: 2026-04-17*
 
 **Scenario:** `{span.http.method="GET" && (span.http.url="..." || span.http.url="...")}` works correctly.
@@ -2258,6 +2032,7 @@ Back-ref: `internal/modules/executor/and_or_scope_test.go:TestANDMultiValueOR_Pa
 ---
 
 ## EX-INT-19: TestANDMultiValueOR — intrinsic AND + intrinsic OR (non-regression)
+
 *Added: 2026-04-17*
 
 **Scenario:** `{resource.service.name="svc-a" && (span:kind=client || span:kind=server)}` returns 3 (was working).
@@ -2267,6 +2042,7 @@ Back-ref: `internal/modules/executor/and_or_scope_test.go:TestANDMultiValueOR_Pa
 ---
 
 ## EX-INT-20: TestANDMultiValueOR — single-value AND (non-regression for EX-INT-12)
+
 *Added: 2026-04-17*
 
 **Scenario:** `{resource.service.name="svc-a" && span.http.method="GET"}` returns 1.
@@ -2276,6 +2052,7 @@ Back-ref: `internal/modules/executor/and_or_scope_test.go:TestANDMultiValueOR_Pa
 ---
 
 ## EX-INT-21: TestANDMultiValueOR — failing shape with Limit=100 (NOTE-076)
+
 *Added: 2026-04-17*
 
 **Scenario:** `{resource.service.name="svc-a" && (span.http.method="GET" || span.http.method="POST")}` with `Limit=100`.
@@ -2283,6 +2060,7 @@ Back-ref: `internal/modules/executor/and_or_scope_test.go:TestANDMultiValueOR_Pa
 Back-ref: `internal/modules/executor/and_or_scope_test.go:TestANDMultiValueOR_IntrinsicAND_SpanAttrOR`
 
 ## EX-INT-22: TestANDPredicateNotEqual_AbsentColumns_NoFalsePositive
+
 *Added: 2026-04-17*
 
 **Scenario:** AND of two `!= ""` predicates on entirely absent user-attribute columns
@@ -2299,6 +2077,7 @@ Back-ref: `internal/modules/executor/executor_test.go:TestANDPredicateNotEqual_A
 ---
 
 ## EX-INT-23: TestScanNotEqual_AbsentColumn_ReturnsZero
+
 *Added: 2026-04-17*
 
 **Scenario:** A single `!= ""` predicate on an entirely absent user-attribute column
@@ -2314,6 +2093,7 @@ Back-ref: `internal/modules/executor/executor_test.go:TestScanNotEqual_AbsentCol
 ---
 
 ## EX-ETM-GID-01: TestBuildGroupIDMap_SingleGroupBy_Dict
+
 *Added: 2026-04-17*
 
 **Scenario:** `buildGroupIDMap` returns correct per-service counts when the group-by column is dict-encoded (repeated values).
@@ -2327,6 +2107,7 @@ Back-ref: `internal/modules/executor/group_id_map_test.go:TestBuildGroupIDMap_Si
 ---
 
 ## EX-ETM-GID-02: TestBuildGroupIDMap_SingleGroupBy_Flat
+
 *Added: 2026-04-17*
 
 **Scenario:** `buildGroupIDMap` handles flat-format intrinsic columns (distinct values, no dict encoding).
@@ -2340,6 +2121,7 @@ Back-ref: `internal/modules/executor/group_id_map_test.go:TestBuildGroupIDMap_Si
 ---
 
 ## EX-ETM-GID-03: TestBuildGroupIDMap_SingleGroupBy_AbsentPK
+
 *Added: 2026-04-17*
 
 **Scenario:** Spans absent from the group-by column are assigned the empty-string sentinel (dict index 0).
@@ -2353,6 +2135,7 @@ Back-ref: `internal/modules/executor/group_id_map_test.go:TestBuildGroupIDMap_Si
 ---
 
 ## EX-ETM-GID-04: TestBuildGroupIDMap_SingleGroupBy_2TimeBuckets
+
 *Added: 2026-04-17*
 
 **Scenario:** Multi-time-bucket query (2 steps) with a single group-by dimension produces correct per-service per-bucket counts.
@@ -2366,6 +2149,7 @@ Back-ref: `internal/modules/executor/group_id_map_test.go:TestBuildGroupIDMap_Si
 ---
 
 ## EX-ETM-GID-05: TestBuildGroupIDMap_Fallback_MoreThan8Dims
+
 *Added: 2026-04-17*
 
 **Scenario:** `buildGroupIDMap` returns `ok == false` when called with more than `maxGroupByDimsFastPath` (8) group-by dimensions, signalling the caller to fall back to the string-keyed path.
@@ -2379,6 +2163,7 @@ Back-ref: `internal/modules/executor/group_id_map_test.go:TestBuildGroupIDMap_Fa
 ---
 
 ## EX-ETM-GID-06: TestStreamCountRateGroupByID_MatchesStringPath
+
 *Added: 2026-04-17*
 
 **Scenario:** `streamCountRateGroupByID` produces byte-identical output to `streamCountRateGroupBy` for the same input data.
@@ -2392,6 +2177,7 @@ Back-ref: `internal/modules/executor/group_id_map_test.go:TestStreamCountRateGro
 ---
 
 ## EX-ETM-GID-07: TestStreamHistogramGroupByID_MatchesStringPath
+
 *Added: 2026-04-17*
 
 **Scenario:** `streamHistogramGroupByID` produces byte-identical output to `streamHistogramGroupBy` for the HISTOGRAM function.
@@ -2405,6 +2191,7 @@ Back-ref: `internal/modules/executor/group_id_map_test.go:TestStreamHistogramGro
 ---
 
 ## EX-ETM-GID-08: TestBuildGroupIDMap_EmptyDict
+
 *Added: 2026-04-17*
 
 **Scenario:** Group-by column present in the intrinsic TOC but all spans have empty service.name — column has only the sentinel entry (dict index 0 = ""). No panic; empty-string bucket emitted for all spans.
@@ -2418,6 +2205,7 @@ Back-ref: `internal/modules/executor/group_id_map_test.go:TestBuildGroupIDMap_Em
 ---
 
 ## EX-ETM-GID-09: TestStreamAggGroupByID_MatchesStringPath
+
 *Added: 2026-04-17*
 
 **Scenario:** `streamAggGroupByID` produces byte-identical output to the string-keyed aggregate path for the SUM function with group-by.
@@ -2429,6 +2217,7 @@ Back-ref: `internal/modules/executor/group_id_map_test.go:TestBuildGroupIDMap_Em
 Back-ref: `internal/modules/executor/group_id_map_test.go:TestStreamAggGroupByID_MatchesStringPath`
 
 ## EX-CP-10: TestStreamScanEqualAny_PerTypeParity
+
 *Added: 2026-04-17*
 
 Table-driven parity test covering all 11 (col-type, value-kind) combos in SPEC-SCAN-1.
@@ -2440,6 +2229,7 @@ Mixed kinds fallthrough.
 Back-ref: `internal/modules/executor/scan_equal_any_test.go:TestStreamScanEqualAny_PerTypeParity`
 
 ## EX-CP-11: TestStreamScanEqualAny_StringInt64_NoParseMatch
+
 *Added: 2026-04-17*
 
 String dict entries that fail strconv.ParseInt ("N/A", "unknown") produce 0 matches and
@@ -2447,6 +2237,7 @@ no panic. Fast path result must equal generic result (both 0 for these values).
 Back-ref: `internal/modules/executor/scan_equal_any_test.go:TestStreamScanEqualAny_StringInt64_NoParseMatch`
 
 ## EX-CP-12: TestStreamScanEqualAny_MixedKindFallthrough
+
 *Added: 2026-04-17*
 
 Mixed []any{int64, string} values fall through to generic and return correct results.
@@ -2454,6 +2245,7 @@ Ensures no silent-zero (PR #234 bug class).
 Back-ref: `internal/modules/executor/scan_equal_any_test.go:TestStreamScanEqualAny_MixedKindFallthrough`
 
 ## EX-CP-13: TestStreamScanEqualAny_Uint64_NegativeInt64
+
 *Added: 2026-04-17*
 
 Negative int64 query against uint64 column: fast-path result equals generic result.
@@ -2463,6 +2255,7 @@ Back-ref: `internal/modules/executor/scan_equal_any_test.go:TestStreamScanEqualA
 ---
 
 ## EX-STRUCT-INT-01: TestResolveStructuralParentIndices_RootSpan
+
 *Added: 2026-04-17*
 
 **Scenario:** A single span with nil parentID gets parentIdx=-1 after resolution. Verifies
@@ -2477,6 +2270,7 @@ Back-ref: `internal/modules/executor/stream_structural_internal_test.go:TestReso
 ---
 
 ## EX-STRUCT-INT-02: TestResolveStructuralParentIndices_ChainResolution
+
 *Added: 2026-04-17*
 
 **Scenario:** root→child→grandchild chain resolves parentIdx to correct positional indices.
@@ -2493,6 +2287,7 @@ Back-ref: `internal/modules/executor/stream_structural_internal_test.go:TestReso
 ---
 
 ## EX-STRUCT-INT-03: TestResolveStructuralParentIndices_UnknownParent
+
 *Added: 2026-04-17*
 
 **Scenario:** A span whose parentID does not appear in the trace's span set gets parentIdx=-1
@@ -2507,6 +2302,7 @@ Back-ref: `internal/modules/executor/stream_structural_internal_test.go:TestReso
 ---
 
 ## EX-STRUCT-INT-04: TestResolveStructuralParentIndices_DuplicateSpanID
+
 *Added: 2026-04-17*
 
 **Scenario:** When two spans share the same spanID, the second insert wins (last-writer-wins
@@ -2523,6 +2319,7 @@ Back-ref: `internal/modules/executor/stream_structural_internal_test.go:TestReso
 ---
 
 ## EX-STRUCT-INT-05: TestResolveStructuralParentIndices_MultiTrace
+
 *Added: 2026-04-17*
 
 **Scenario:** Two traces using the same raw spanID bytes resolve parentIdx independently
@@ -2538,6 +2335,7 @@ Back-ref: `internal/modules/executor/stream_structural_internal_test.go:TestReso
 ---
 
 ## EX-STRUCT-INT-06: TestEvalStructuralMatches_Dedup
+
 *Added: 2026-04-17*
 
 **Scenario:** When applyStructuralOp returns a right-side index multiple times (e.g. OpParent
@@ -2554,6 +2352,7 @@ Back-ref: `internal/modules/executor/stream_structural_internal_test.go:TestEval
 ---
 
 ## EX-STRUCT-INT-07: TestResolveStructuralParentIndices_ZeroStringAllocs
+
 *Added: 2026-04-17*
 
 **Scenario:** Allocation guard — resolveStructuralParentIndices produces at most numTraces+2
@@ -2572,6 +2371,7 @@ Back-ref: `internal/modules/executor/stream_structural_internal_test.go:TestReso
 ---
 
 ## EX-STRUCT-INT-08: TestResolveStructuralParentIndices_ShortSpanID
+
 *Added: 2026-04-17*
 
 **Scenario:** A span with a non-8-byte spanID is NOT inserted into the map[[8]byte]int.
@@ -2588,6 +2388,7 @@ Back-ref: `internal/modules/executor/stream_structural_internal_test.go:TestReso
 ---
 
 ## EX-ST-12: TestExecuteStructural_ThreeNodeChain
+
 *Added: 2026-04-21*
 
 **Scenario:** A 3-node `>>` chain `A >> B >> C` emits C where B is in C's ancestor chain and A is in B's ancestor chain.
@@ -2605,6 +2406,7 @@ Back-ref: `internal/modules/executor/stream_structural_test.go:TestExecuteStruct
 ---
 
 ## EX-CP-14: TestIntrinsicRowFields_IdentityOnly
+
 *Added: 2026-04-21*
 
 **Scenario:** lookupIntrinsicFieldsTyped populates traceID, spanID, and parentID when wantCols contains only identity columns.
@@ -2612,6 +2414,7 @@ Back-ref: `internal/modules/executor/stream_structural_test.go:TestExecuteStruct
 **Setup:** 3-span 2-block file (span0/span2 in block 0 with no parent; span1 in block 1 with parent=span0).
 
 **Assertions:**
+
 - Block 0 rows: traceID present bit set, TraceID non-zero, parentID present bit clear.
 - Block 1 row 0: parentID present bit set, ParentID bytes non-empty.
 
@@ -2620,6 +2423,7 @@ Back-ref: `internal/modules/executor/intrinsic_row_test.go:TestIntrinsicRowField
 ---
 
 ## EX-CP-15: TestIntrinsicRowFields_ExtraPredicateColumns
+
 *Added: 2026-04-21*
 
 **Scenario:** span:duration and resource.service.name are populated when included in wantCols.
@@ -2627,6 +2431,7 @@ Back-ref: `internal/modules/executor/intrinsic_row_test.go:TestIntrinsicRowField
 **Setup:** Same 3-span 2-block file; wantCols includes span:duration and resource.service.name.
 
 **Assertions:**
+
 - Block 0 rows: spanDuration present, span0 duration > span2 duration (200ms vs 50ms), serviceName="svc-a" for both.
 - Block 1 row 0: spanDuration present, serviceName="svc-b".
 
@@ -2635,6 +2440,7 @@ Back-ref: `internal/modules/executor/intrinsic_row_test.go:TestIntrinsicRowField
 ---
 
 ## EX-CP-16: TestIntrinsicRowFields_AbsentField
+
 *Added: 2026-04-21*
 
 **Scenario:** A column NOT in wantCols has its present bit clear and a zero value.
@@ -2648,6 +2454,7 @@ Back-ref: `internal/modules/executor/intrinsic_row_test.go:TestIntrinsicRowField
 ---
 
 ## EX-CP-17: TestRowSatisfiesIntrinsicNodesTyped_EqualityMatch
+
 *Added: 2026-04-21*
 
 **Scenario:** Equality predicates on span:name, span:kind, and resource.service.name via rowSatisfiesIntrinsicNodesTyped.
@@ -2655,6 +2462,7 @@ Back-ref: `internal/modules/executor/intrinsic_row_test.go:TestIntrinsicRowField
 **Setup:** Same 3-span file; wantCols includes span:name, span:kind, resource.service.name. Block 0: span0 (svc-a, op-alpha, server), span2 (svc-a, op-gamma, internal). Block 1: span1 (svc-b, op-beta, client).
 
 **Assertions:**
+
 - span:name="op-alpha" → span0 true, span2 false.
 - resource.service.name="svc-a" → both block-0 rows true.
 - resource.service.name="svc-b" → span1 true, span0 false.
@@ -2665,6 +2473,7 @@ Back-ref: `internal/modules/executor/intrinsic_row_test.go:TestRowSatisfiesIntri
 ---
 
 ## EX-CP-18: TestRowSatisfiesIntrinsicNodesTyped_RangeMatch
+
 *Added: 2026-04-21*
 
 **Scenario:** Range predicates on span:duration via rowSatisfiesIntrinsicNodesTyped.
@@ -2672,6 +2481,7 @@ Back-ref: `internal/modules/executor/intrinsic_row_test.go:TestRowSatisfiesIntri
 **Setup:** Same 3-span file; wantCols includes span:duration and span:start. Block 0: span0 (200ms), span2 (50ms). Block 1: span1 (100ms).
 
 **Assertions:**
+
 - duration>150ms → span0 true, span2 false.
 - duration>=200ms → span0 true, span2 false.
 - duration>=100ms → span1 true.
@@ -2681,6 +2491,7 @@ Back-ref: `internal/modules/executor/intrinsic_row_test.go:TestRowSatisfiesIntri
 ---
 
 ## EX-CP-19: TestRowSatisfiesIntrinsicNodesTyped_AbsentField
+
 *Added: 2026-04-21*
 
 **Scenario:** An absent field (present bit clear) satisfies only "is null" predicates and fails value/range predicates — matching old map behavior.
@@ -2688,6 +2499,7 @@ Back-ref: `internal/modules/executor/intrinsic_row_test.go:TestRowSatisfiesIntri
 **Setup:** Manually constructed row with only traceID present (spanDuration, spanName absent).
 
 **Assertions:**
+
 - duration>0 on row without duration present → false.
 - span:name="anything" on row without spanName present → false.
 - duration>0 on row with duration=200ms present → true.
@@ -2697,6 +2509,7 @@ Back-ref: `internal/modules/executor/intrinsic_row_test.go:TestRowSatisfiesIntri
 ---
 
 ## EX-CP-20: TestRowSatisfiesIntrinsicNodesTyped_ORComposite
+
 *Added: 2026-04-21*
 
 **Scenario:** OR semantics match old rowSatisfiesIntrinsicNodes (map-based) behavior.
@@ -2704,6 +2517,7 @@ Back-ref: `internal/modules/executor/intrinsic_row_test.go:TestRowSatisfiesIntri
 **Setup:** Same 3-span file; wantCols includes span:name and resource.service.name.
 
 **Assertions:**
+
 - OR([svc-a match, svc-z fail]) → true for span0, span2; false for span1 (svc-b).
 - OR([svc-z fail, svc-b match]) → false for span0; true for span1.
 - Typed OR result matches map-based OR result for all 3 rows.
@@ -2713,6 +2527,7 @@ Back-ref: `internal/modules/executor/intrinsic_row_test.go:TestRowSatisfiesIntri
 ---
 
 ## EX-CP-21: TestRowSatisfiesIntrinsicNodesORTyped_DirectOR
+
 *Added: 2026-04-21*
 
 **Scenario:** Directly exercises RowSatisfiesIntrinsicNodesORTypedForTest to verify OR-node semantics without round-trip through lookupIntrinsicFieldsTyped.
@@ -2720,6 +2535,7 @@ Back-ref: `internal/modules/executor/intrinsic_row_test.go:TestRowSatisfiesIntri
 **Setup:** Manually constructed row with spanName="op-alpha" and serviceName="svc-a" present.
 
 **Assertions:**
+
 - OR([span:name="op-alpha" match]) → true.
 - OR([span:name="op-beta" fail]) → false.
 - OR([resource.service.name="svc-a" match]) → true.
@@ -2730,6 +2546,7 @@ Back-ref: `internal/modules/executor/intrinsic_row_test.go:TestRowSatisfiesIntri
 ---
 
 ## EX-CP-22: TestIdentityFieldsFromBlockColsTyped
+
 *Added: 2026-04-21*
 
 **Scenario:** identityFieldsFromBlockColsTyped returns correct typed rows for a block with identity columns; non-identity fields are not populated.
@@ -2737,6 +2554,7 @@ Back-ref: `internal/modules/executor/intrinsic_row_test.go:TestRowSatisfiesIntri
 **Setup:** Same 3-span file; GetBlockWithBytes on block 0 with identity wantCols.
 
 **Assertions:**
+
 - All rows: traceID present bit set, TraceID non-zero.
 - All rows: IntrinsicPresentSpanName, IntrinsicPresentServiceName, IntrinsicPresentSpanDuration bits clear.
 
@@ -2745,6 +2563,7 @@ Back-ref: `internal/modules/executor/intrinsic_row_test.go:TestIdentityFieldsFro
 ---
 
 ## EX-ETM-N1-01: TestStreamCountRateGroupByID_N1_ByteEquivalence
+
 *Added: 2026-04-22*
 
 **Scenario:** `streamCountRateGroupByIDSingle` (N=1 fast path) produces byte-identical output to the string-keyed path (`streamCountRateGroupBy`) for 6 spans × 3 service names across 2 time buckets.
@@ -2760,6 +2579,7 @@ Back-ref: `internal/modules/executor/intrinsic_group_id_n1_test.go:TestStreamCou
 ---
 
 ## EX-ETM-N1-02: TestStreamCountRateGroupByID_N1_AbsentGroup
+
 *Added: 2026-04-22*
 
 **Scenario:** `streamCountRateGroupByIDSingle` (N=1 fast path) maps absent spans (`dictIdx==0`) to the empty-string group, byte-identical to the string-keyed path.
@@ -2775,6 +2595,7 @@ Back-ref: `internal/modules/executor/intrinsic_group_id_n1_test.go:TestStreamCou
 ---
 
 ## EX-ETM-N1-03: TestStreamAggGroupByID_N1_ByteEquivalence
+
 *Added: 2026-04-22*
 
 **Scenario:** `streamAggGroupByIDSingle` (N=1 fast path) produces byte-identical output to the string-keyed aggregate path for SUM over `span:duration` with 6 spans × 3 service names across 2 time buckets.
@@ -2790,6 +2611,7 @@ Back-ref: `internal/modules/executor/intrinsic_group_id_n1_test.go:TestStreamAgg
 ---
 
 ## EX-ETM-N1-04: TestStreamHistogramGroupByID_N1_ByteEquivalence
+
 *Added: 2026-04-22*
 
 **Scenario:** `streamHistogramGroupByIDSingle` (N=1 fast path) produces byte-identical output to `streamHistogramGroupBy` (string-keyed) for 6 spans × 3 service names with two duration values (dict column encoding).
@@ -2805,6 +2627,7 @@ Back-ref: `internal/modules/executor/intrinsic_group_id_n1_test.go:TestStreamHis
 ---
 
 ## EX-ETM-N1-05: TestStreamHistogramGroupByID_N1_AbsentColumn
+
 *Added: 2026-04-22*
 
 **Scenario:** `streamHistogramGroupByIDSingle` (N=1 fast path, nil-column branch) accumulates all spans into boundary-0 buckets, byte-identical to the string-keyed nil-column path.
@@ -2820,6 +2643,7 @@ Back-ref: `internal/modules/executor/intrinsic_group_id_n1_test.go:TestStreamHis
 ---
 
 ## EX-ETM-N1-06: TestStreamCountRateGroupByIDSingle_SliceAccum_ByteEquivalence
+
 *Added: 2026-04-21*
 
 **Scenario:** `streamCountRateGroupByIDSingle` with the slice accumulator (NOTE-085) and N=10
@@ -2839,6 +2663,7 @@ Back-ref: `internal/modules/executor/intrinsic_slice_accumulator_test.go:TestStr
 ---
 
 ## EX-ETM-N1-07: TestStreamCountRateGroupByIDSingle_SliceAccum_AbsentSentinel
+
 *Added: 2026-04-21*
 
 **Scenario:** `streamCountRateGroupByIDSingle` with the slice accumulator (NOTE-085) must
@@ -2861,6 +2686,7 @@ Back-ref: `internal/modules/executor/intrinsic_slice_accumulator_test.go:TestStr
 ---
 
 ## EX-ETM-SK-01: TestTraceMetrics_Intrinsic_SpanKindGroupBy_LabelValues
+
 *Added: 2026-04-21*
 
 **Scenario:** `by (span:kind)` group-by emits human-readable names ("server", "client") not
@@ -2882,12 +2708,14 @@ Back-ref: `internal/modules/executor/intrinsic_span_kind_status_test.go:TestTrac
 ---
 
 ## EX-ETM-SK-02: TestTraceMetrics_Intrinsic_SpanStatusGroupBy_LabelValues
+
 *Added: 2026-04-21*
 
 **Scenario:** `by (span:status)` group-by emits human-readable names ("ok", "error") not
 integer strings ("1", "2").
 
 **Setup:** 3 spans: statuses [ok, error, ok]. Two sub-tests run:
+
 - N=1 fast path: `{} | count_over_time() by (span:status)`
 - N=2 multi-dim path: `{} | count_over_time() by (span:status, resource.service.name)`
 
@@ -2901,6 +2729,7 @@ Back-ref: `internal/modules/executor/intrinsic_span_kind_status_test.go:TestTrac
 ---
 
 ## EX-ETM-GID-10: TestBuildGroupKeyMap_SpanKindEnumConversion
+
 *Added: 2026-04-21*
 
 **Scenario:** `buildGroupKeyMap` (the N>8 string-keyed fallback) converts span:kind dict entries
@@ -2920,6 +2749,7 @@ Back-ref: `internal/modules/executor/group_id_map_test.go:TestBuildGroupKeyMap_S
 ---
 
 ## EX-ETM-N1-08: TestStreamByRefSliceHistogram_3D_ByteEquivalence
+
 *Added: 2026-04-21*
 
 **Scenario:** `streamByRefSliceHistogram` (flat pre-allocated accumulator, NOTE-088) produces
@@ -2941,6 +2771,7 @@ Back-ref: `internal/modules/executor/intrinsic_hist_3d_test.go:TestStreamByRefSl
 ---
 
 ## EX-ETM-N1-09: TestStreamByRefSliceHistogram_3D_AbsentSpans
+
 *Added: 2026-04-21*
 
 **Scenario:** `streamByRefSliceHistogram` (3D accumulator) correctly accumulates spans with
@@ -2957,6 +2788,7 @@ Back-ref: `internal/modules/executor/intrinsic_hist_3d_test.go:TestStreamByRefSl
 ---
 
 ## EX-ETM-N1-10: TestStreamByRefSliceHistogram_3D_AbsentColumn
+
 *Added: 2026-04-21*
 
 **Scenario:** `streamByRefSliceHistogram` (3D accumulator) handles a nil aggregate column
@@ -2973,6 +2805,7 @@ Back-ref: `internal/modules/executor/intrinsic_hist_3d_test.go:TestStreamByRefSl
 ---
 
 ## EX-ETM-N1-11: TestStreamByRefSliceHistogram_3D_MultiBucket
+
 *Added: 2026-04-21*
 
 **Scenario:** `streamByRefSliceHistogram` (3D accumulator) correctly indexes the timeIdx
@@ -2989,6 +2822,7 @@ Back-ref: `internal/modules/executor/intrinsic_hist_3d_test.go:TestStreamByRefSl
 ---
 
 ## EX-ETM-N1-12: TestStreamByRefSliceHistogram_3D_SingleGroup
+
 *Added: 2026-04-21*
 
 **Scenario:** `streamByRefSliceHistogram` (3D accumulator) with a single group value (dict
@@ -3005,6 +2839,7 @@ Back-ref: `internal/modules/executor/intrinsic_hist_3d_test.go:TestStreamByRefSl
 ---
 
 ## EX-ETM-N1-13: TestAccumulateAggDirect_Sum_ByteEquivalence
+
 *Added: 2026-04-21*
 
 **Scenario:** `accumulateAggDirect` (SUM) must produce byte-identical output to `accumulateIntrinsicBucketsViaKeyMap` for the same spans.
@@ -3020,6 +2855,7 @@ Back-ref: `internal/modules/executor/intrinsic_agg_direct_test.go:TestAccumulate
 ---
 
 ## EX-ETM-N1-14: TestAccumulateAggDirect_Min_ByteEquivalence
+
 *Added: 2026-04-21*
 
 **Scenario:** `accumulateAggDirect` (MIN) must produce byte-identical output to reference path.
@@ -3035,6 +2871,7 @@ Back-ref: `internal/modules/executor/intrinsic_agg_direct_test.go:TestAccumulate
 ---
 
 ## EX-ETM-N1-15: TestAccumulateAggDirect_Max_ByteEquivalence
+
 *Added: 2026-04-21*
 
 **Scenario:** `accumulateAggDirect` (MAX) must produce byte-identical output to reference path.
@@ -3050,6 +2887,7 @@ Back-ref: `internal/modules/executor/intrinsic_agg_direct_test.go:TestAccumulate
 ---
 
 ## EX-ETM-N1-16: TestAccumulateAggDirect_AbsentAggField
+
 *Added: 2026-04-21*
 
 **Scenario:** `accumulateAggDirect` must handle absent agg field (nil column) identically to reference: each in-range span gets a count=0 bucket.
@@ -3065,6 +2903,7 @@ Back-ref: `internal/modules/executor/intrinsic_agg_direct_test.go:TestAccumulate
 ---
 
 ## EX-ETM-N1-17: TestAccumulateAggDirect_MultiBucket
+
 *Added: 2026-04-21*
 
 **Scenario:** `accumulateAggDirect` (SUM) correctly accumulates spans across 3 time buckets.
@@ -3080,6 +2919,7 @@ Back-ref: `internal/modules/executor/intrinsic_agg_direct_test.go:TestAccumulate
 ---
 
 ## EX-ETM-N1-18: TestAccumulateHistogramDirect_ByteEquivalence
+
 *Added: 2026-04-21*
 
 **Scenario:** `accumulateHistogramDirect` must produce byte-identical output to `streamByRefSliceHistogram` (hist3DRunNew) for the same spans.
@@ -3095,6 +2935,7 @@ Back-ref: `internal/modules/executor/intrinsic_agg_direct_test.go:TestAccumulate
 ---
 
 ## EX-ETM-N1-19: TestAccumulateHistogramDirectN0_ByteEquivalence
+
 *Added: 2026-04-22*
 
 **Scenario:** `accumulateHistogramDirectN0` must produce byte-identical output to `accumulateIntrinsicBucketsViaKeyMap` (N=0 reference path via `streamAggColumnNoGroupBy`) for the same spans.
@@ -3110,6 +2951,7 @@ Back-ref: `internal/modules/executor/intrinsic_agg_direct_test.go:TestAccumulate
 ---
 
 ## EX-ETM-N1-20: TestAccumulateHistogramDirectN0_DispatchEndToEnd
+
 *Added: 2026-04-22*
 
 **Scenario:** The N=0 histogram direct path must be exercised through the full dispatch switch in `executeTraceMetricsIntrinsic` (the arm `filteredRefs==nil && len(agg.GroupBy)==0 && HISTOGRAM`), not just by calling `accumulateHistogramDirectN0` directly.
@@ -3117,6 +2959,7 @@ Back-ref: `internal/modules/executor/intrinsic_agg_direct_test.go:TestAccumulate
 **Setup:** Same 6-span block as EX-ETM-N1-19 (3 durations, 2 time buckets). Query: `{ } | histogram_over_time(span.duration)` with no group-by, compiled via `vm.CompileTraceQLMetrics`.
 
 **Assertions:**
+
 - `ExecuteTraceMetrics` returns non-nil result with non-empty `Series`.
 - Total span count summed across all series values (excluding NaN) is positive.
 - Total count from the direct-call path (`n0HistRunNew`) equals total count from the dispatch path — byte-equivalent span counting.
@@ -3128,17 +2971,20 @@ Back-ref: `internal/modules/executor/intrinsic_agg_direct_test.go:TestAccumulate
 ---
 
 ## EX-STRUCT-PRUNE-1: TestStructuralQuery_LHSPredicatePruning_BloomReject
+
 *Added: 2026-04-22*
 
 **Scenario:** A structural query with a selective LHS filter skips files that bloom-reject the LHS predicate.
 
 **Setup:** Two blockpack files written in-memory:
+
 - File A: contains a span with `span.http.status_code="500"` (LHS filter matches).
 - File B: contains only spans with `span.http.status_code="200"` (LHS filter does not match; bloom reject expected).
 
 Query: `{span.http.status_code="500"} >> {}` (child structural query).
 
 **Assertions:**
+
 - Result contains matches from File A only.
 - No spurious matches from File B are returned.
 - (Optional stats check): File B's blocks are not scanned if the Reader exposes block I/O counters.
@@ -3150,6 +2996,7 @@ Back-ref: `internal/modules/executor/stream_structural_internal_test.go:TestColl
 ---
 
 ## EX-STRUCT-PRUNE-2: TestStructuralQuery_AllNilPrograms_NoChange
+
 *Added: 2026-04-22*
 
 **Scenario:** A `{} >> {}` query (both programs nil) falls back to the existing `planner.Plan(nil, tr)` behavior — no regression.
@@ -3157,6 +3004,7 @@ Back-ref: `internal/modules/executor/stream_structural_internal_test.go:TestColl
 **Setup:** One blockpack file with 3 parent-child span pairs. Query: `{} >> {}`.
 
 **Assertions:**
+
 - All 3 child spans are returned (wildcard match).
 - No error.
 
@@ -3167,11 +3015,13 @@ Back-ref: `internal/modules/executor/stream_structural_internal_test.go:TestColl
 ---
 
 ## EX-PA-COUNT-1: TestQueryTraceQL_Pipeline_Count_CorrectThreshold
+
 *Added: 2026-04-22*
 
 **Scenario:** `{} | count() > 2` returns only traces with >2 matching spans.
 
 **Setup:** 3 traces written to a blockpack file:
+
 - Trace 0: 1 span (does not qualify).
 - Trace 1: 2 spans (does not qualify).
 - Trace 2: 3 spans (qualifies).
@@ -3179,6 +3029,7 @@ Back-ref: `internal/modules/executor/stream_structural_internal_test.go:TestColl
 Query: `{} | count() > 2`.
 
 **Assertions:**
+
 - Only spans from Trace 2 are returned.
 - No spans from Trace 0 or Trace 1 are returned.
 - Total spans returned == 3.
@@ -3191,6 +3042,7 @@ Back-ref: `api_test.go:TestQueryTraceQL_Pipeline_Count_CorrectThreshold`
 ---
 
 ## EX-PA-COUNT-2: TestQueryTraceQL_Pipeline_Count_WithLimit
+
 *Added: 2026-04-22*
 
 **Scenario:** `{} | count() > 2` with `opts.Limit = 2` returns at most 2 spans.
@@ -3198,6 +3050,7 @@ Back-ref: `api_test.go:TestQueryTraceQL_Pipeline_Count_CorrectThreshold`
 **Setup:** 3 traces × 3 spans each (all traces qualify count() > 2). Query: `{} | count() > 2`, limit=2.
 
 **Assertions:**
+
 - At most 2 spans are returned (limit honored).
 - At least 1 span is returned (qualifying traces exist).
 - No error.
@@ -3209,6 +3062,7 @@ Back-ref: `api_test.go:TestQueryTraceQL_Pipeline_Count_WithLimit`
 ---
 
 ## EX-PA-COUNT-3: TestQueryTraceQL_Pipeline_Count_NoQualifyingTraces
+
 *Added: 2026-04-22*
 
 **Scenario:** `{} | count() > 5` where no trace has >5 spans returns empty result without executing pass 2.
@@ -3216,6 +3070,7 @@ Back-ref: `api_test.go:TestQueryTraceQL_Pipeline_Count_WithLimit`
 **Setup:** 5 traces × 1 span each. Query: `{} | count() > 5`.
 
 **Assertions:**
+
 - No spans returned (no trace has count > 5).
 - No error.
 
@@ -3226,15 +3081,18 @@ Back-ref: `api_test.go:TestQueryTraceQL_Pipeline_Count_NoQualifyingTraces`
 ---
 
 ## EX-PA-COUNT-4: TestQueryTraceQL_Pipeline_NonCountAggregate_GeneralPath
+
 *Added: 2026-04-22*
 
 **Scenario:** `{span.latency_ms > 0} | avg(span.latency_ms) > 50` uses the general (non-streaming) path.
 
 **Setup:** 2 traces:
+
 - Trace A: 2 spans with latency_ms=100 (avg=100, qualifies).
 - Trace B: 2 spans with latency_ms=10 (avg=10, does not qualify).
 
 **Assertions:**
+
 - Only spans from Trace A are returned.
 - No error.
 
@@ -3245,6 +3103,7 @@ Back-ref: `api_test.go:TestQueryTraceQL_Pipeline_NonCountAggregate_GeneralPath`
 ---
 
 ## EX-ST-13: TestExecuteStructural_ChainTooLong
+
 *Added: 2026-04-28*
 
 **Scenario:** A structural chain with more than 8 nodes is rejected with an error.
@@ -3260,11 +3119,13 @@ Back-ref: `internal/modules/executor/stream_structural_test.go:TestExecuteStruct
 ---
 
 ## EX-ST-14: TestExecuteStructural_NegationOpInMultiNodeChain
+
 *Added: 2026-04-28*
 
 **Scenario:** Negation operators (OpNotSibling `!~`, OpNotDescendant `!>>`, OpNotChild `!>`) are rejected when they appear in a multi-node chain (N > 2 nodes).
 
 **Setup:** Three table-driven cases:
+
 - `{} !~ {} ~ {}` (OpNotSibling in chain)
 - `{} !>> {} >> {}` (OpNotDescendant in chain)
 - `{} !> {} > {}` (OpNotChild in chain)
@@ -3280,6 +3141,7 @@ Back-ref: `internal/modules/executor/stream_structural_test.go:TestExecuteStruct
 ---
 
 ## EX-ST-15: TestExecuteStructural_PopulatesBlockIdxRowIdx
+
 *Added: 2026-04-28*
 
 **Scenario:** `ExecuteStructural` populates `BlockIdx` and `RowIdx` on matched terminal spans so that the conversion layer can construct a `SpanFieldsAdapter` backed by the reader's intrinsic section.
@@ -3287,6 +3149,7 @@ Back-ref: `internal/modules/executor/stream_structural_test.go:TestExecuteStruct
 **Setup:** Write a structural trace (root with service `svc-root`, child with `svc-leaf`). Query: `{ resource.service.name = "svc-root" } >> { resource.service.name = "svc-leaf" }`. Call `ExecuteStructural`.
 
 **Assertions:**
+
 - Exactly 1 match is returned.
 - `m.BlockIdx >= 0` and `m.RowIdx >= 0`.
 - At least one of `BlockIdx` or `RowIdx` is non-zero (the grandchild span is not the first span written, so it cannot be at block 0 row 0).
@@ -3298,6 +3161,7 @@ Back-ref: `internal/modules/executor/stream_structural_test.go:TestExecuteStruct
 ---
 
 ## EX-ST-16: TestExecuteStructural_AllProgramFileRejection_OR_LHS
+
 *Added: 2026-04-28*
 
 **Scenario:** NOTE-095 all-program file rejection does not produce false negatives for positive
@@ -3307,6 +3171,7 @@ Back-ref: `internal/modules/executor/stream_structural_test.go:TestExecuteStruct
 Query: `{ resource.service.name = "svc-alpha" || resource.service.name = "svc-gamma" } >> { resource.service.name = "svc-beta" }`.
 
 **Assertions:**
+
 - Exactly 1 match is returned: svc-beta (descendant of svc-alpha).
 - The OR LHS does not cause the file to be skipped.
 
@@ -3317,6 +3182,7 @@ Back-ref: `internal/modules/executor/stream_structural_test.go:TestExecuteStruct
 ---
 
 ## EX-ST-17: TestExecuteStructural_NegationOp_LHSAbsent_DoesNotSkipFile
+
 *Added: 2026-04-28*
 
 **Scenario:** NOTE-095 — for a negation op (!>>), the LHS program being absent from the file
@@ -3326,6 +3192,7 @@ must NOT cause the file to be skipped. Absent LHS means all RHS spans trivially 
 `{ resource.service.name = "nonexistent" } !>> {}`. The LHS filter matches no spans.
 
 **Assertions:**
+
 - result.Matches is non-empty (all spans qualify — no "nonexistent" ancestor for any span).
 - File must not have been rejected due to absent LHS predicate.
 
@@ -3336,6 +3203,7 @@ Back-ref: `internal/modules/executor/stream_structural_test.go:TestExecuteStruct
 ---
 
 ## EX-ST-18: TestExecuteStructural_TracePreQual_SingleSpanTrace
+
 *Added: 2026-04-28*
 
 **Scenario:** NOTE-096 trace pre-qualification — a single-span trace with only a root span
@@ -3346,6 +3214,7 @@ parent-child trace in the same file still produces a match.
 Query: `{ resource.service.name = "svc-alpha" } >> { resource.service.name = "svc-beta" }`.
 
 **Assertions:**
+
 - Exactly 1 match: svc-beta from trace A.
 - svc-gamma trace produces no match (single span, no RHS bit).
 
@@ -3356,6 +3225,7 @@ Back-ref: `internal/modules/executor/stream_structural_test.go:TestExecuteStruct
 ---
 
 ## EX-ST-19: TestExecuteStructural_TracePreQual_NegationOp_NoLHS
+
 *Added: 2026-04-28*
 
 **Scenario:** NOTE-096 — for !>> with a trace that has RHS-matching spans but no LHS-matching
@@ -3366,6 +3236,7 @@ because no LHS ancestor exists.
 `{ resource.service.name = "ghost" } !>> {}`. LHS matches nothing; RHS ({}) matches all spans.
 
 **Assertions:**
+
 - Exactly 4 matches returned (all spans qualify — no "ghost" ancestor for any span).
 - traceCanMatch must not prune this trace (bit 1 present via {} matching all spans).
 
@@ -3376,6 +3247,7 @@ Back-ref: `internal/modules/executor/stream_structural_test.go:TestExecuteStruct
 ---
 
 ## EX-ST-17b: TestExecuteStructural_NegationOp_NotChild_LHSAbsent_DoesNotSkipFile
+
 *Added: 2026-04-28*
 
 **Scenario:** NOTE-095 — for a negation op (!>), the LHS program being absent from the file
@@ -3385,6 +3257,7 @@ must NOT cause the file to be skipped. Mirrors EX-ST-17 for OpNotChild.
 `{ resource.service.name = "nonexistent" } !> {}`. The LHS filter matches no spans.
 
 **Assertions:**
+
 - result.Matches is non-empty (all spans qualify — no "nonexistent" direct parent for any span).
 - File must not have been rejected due to absent LHS predicate.
 
@@ -3395,6 +3268,7 @@ Back-ref: `internal/modules/executor/stream_structural_test.go:TestExecuteStruct
 ---
 
 ## EX-ST-17c: TestExecuteStructural_NegationOp_NotSibling_LHSAbsent_DoesNotSkipFile
+
 *Added: 2026-04-28*
 
 **Scenario:** NOTE-095 — for a negation op (!~), the LHS program being absent from the file
@@ -3404,6 +3278,7 @@ must NOT cause the file to be skipped. Mirrors EX-ST-17 for OpNotSibling.
 `{ resource.service.name = "nonexistent" } !~ {}`. The LHS filter matches no spans.
 
 **Assertions:**
+
 - result.Matches is non-empty (all spans qualify — no "nonexistent" sibling for any span).
 - File must not have been rejected due to absent LHS predicate.
 
@@ -3414,6 +3289,7 @@ Back-ref: `internal/modules/executor/stream_structural_test.go:TestExecuteStruct
 ---
 
 ## EX-ST-19b: TestExecuteStructural_TracePreQual_NegationOp_NotChild_NoLHS
+
 *Added: 2026-04-28*
 
 **Scenario:** NOTE-096 — for !> with a trace that has RHS-matching spans but no LHS-matching
@@ -3423,6 +3299,7 @@ spans, `traceCanMatch` must return true (only RHS bit 1 required). Mirrors EX-ST
 `{ resource.service.name = "ghost" } !> {}`. LHS matches nothing; RHS ({}) matches all spans.
 
 **Assertions:**
+
 - Exactly 4 matches returned (all spans qualify — no "ghost" direct parent for any span).
 - traceCanMatch must not prune this trace (bit 1 present via {} matching all spans).
 
@@ -3433,6 +3310,7 @@ Back-ref: `internal/modules/executor/stream_structural_test.go:TestExecuteStruct
 ---
 
 ## EX-ST-19c: TestExecuteStructural_TracePreQual_NegationOp_NotSibling_NoLHS
+
 *Added: 2026-04-28*
 
 **Scenario:** NOTE-096 — for !~ with a trace that has RHS-matching spans but no LHS-matching
@@ -3442,6 +3320,7 @@ spans, `traceCanMatch` must return true (only RHS bit 1 required). Mirrors EX-ST
 `{ resource.service.name = "ghost" } !~ {}`. LHS matches nothing; RHS ({}) matches all spans.
 
 **Assertions:**
+
 - Exactly 4 matches returned (all spans qualify — no "ghost" sibling for any span).
 - traceCanMatch must not prune this trace (bit 1 present via {} matching all spans).
 
@@ -3452,6 +3331,7 @@ Back-ref: `internal/modules/executor/stream_structural_test.go:TestExecuteStruct
 ---
 
 ## EX-ST-20: TestExecuteStructural_TOCFileRejection
+
 *Added: 2026-04-28*
 
 **Scenario:** NOTE-097 — a file containing only "svc-b" spans is queried for
@@ -3464,6 +3344,7 @@ returns a non-nil empty slice for "svc-a" and the file is rejected before any bl
 Query: `{ resource.service.name = "svc-a" } >> { resource.service.name = "db" }`.
 
 **Assertions:**
+
 - Zero matches returned (file rejected at TOC or bloom — no svc-a or db spans anywhere).
 
 **Spec invariants tested:** NOTE-097 (non-nil empty TOC result → file rejected); SPEC-STRUCT-2
@@ -3474,6 +3355,7 @@ Back-ref: `internal/modules/executor/stream_structural_test.go:TestExecuteStruct
 ---
 
 ## EX-ST-21: TestExecuteStructural_TOCNegationSafety
+
 *Added: 2026-04-28*
 
 **Scenario:** NOTE-097 — negation-op safety: a file containing only "svc" spans is queried
@@ -3486,6 +3368,7 @@ not rejected. All "svc" spans qualify because none has a "ghost" ancestor.
 Query: `{ resource.service.name = "ghost" } !>> { resource.service.name = "svc" }`.
 
 **Assertions:**
+
 - result.Matches is non-empty (all "svc" spans returned; absent LHS must NOT cause file rejection).
 
 **Spec invariants tested:** NOTE-097 (LHS of negation op is skipped by shouldRejectFileForProgram);
@@ -3496,6 +3379,7 @@ Back-ref: `internal/modules/executor/stream_structural_test.go:TestExecuteStruct
 ---
 
 ## EX-ST-21b: TestExecuteStructural_TOCNegationSafety_NotChild
+
 *Added: 2026-04-30*
 
 **Scenario:** NOTE-097 — negation-op safety for !> (OpNotChild): a file containing only "svc"
@@ -3508,6 +3392,7 @@ spans is queried for `{ resource.service.name = "ghost" } !> { resource.service.
 Query: `{ resource.service.name = "ghost" } !> { resource.service.name = "svc" }`.
 
 **Assertions:**
+
 - result.Matches is non-empty (all "svc" spans returned; absent LHS must NOT cause file rejection).
 
 **Spec invariants tested:** NOTE-097 (LHS of negation op is skipped by shouldRejectFileForProgram);
@@ -3518,6 +3403,7 @@ Back-ref: `internal/modules/executor/stream_structural_test.go:TestExecuteStruct
 ---
 
 ## EX-ST-21c: TestExecuteStructural_TOCNegationSafety_NotSibling
+
 *Added: 2026-04-30*
 
 **Scenario:** NOTE-097 — negation-op safety for !~ (OpNotSibling): a file containing only "svc"
@@ -3530,6 +3416,7 @@ spans is queried for `{ resource.service.name = "ghost" } !~ { resource.service.
 Query: `{ resource.service.name = "ghost" } !~ { resource.service.name = "svc" }`.
 
 **Assertions:**
+
 - result.Matches is non-empty (all "svc" spans returned; absent LHS must NOT cause file rejection).
 
 **Spec invariants tested:** NOTE-097 (LHS of negation op is skipped by shouldRejectFileForProgram);
@@ -3540,6 +3427,7 @@ Back-ref: `internal/modules/executor/stream_structural_test.go:TestExecuteStruct
 ---
 
 ## EX-CSP-01: TestComputeSecondPassCols_NonNilWhenProgramHasPredicates
+
 *Added: 2026-04-30*
 
 **Scenario:** `ComputeSecondPassCols` with a compiled filter program returns a non-nil column set
@@ -3549,6 +3437,7 @@ that includes `traceIntrinsicColumns` entries.
 `executor.ComputeSecondPassCols(program, nil)`.
 
 **Assertions:**
+
 - result is non-nil
 - result contains `"span:start"` (traceIntrinsicColumns)
 - result contains `"trace:id"` (traceIntrinsicColumns)
@@ -3561,6 +3450,7 @@ Back-ref: `internal/modules/executor/compute_second_pass_cols_test.go:TestComput
 ---
 
 ## EX-CSP-02: TestComputeSecondPassCols_NilProgramNilSelectColumns
+
 *Added: 2026-04-30*
 
 **Scenario:** `ComputeSecondPassCols(nil, nil)` returns nil — no program and no SelectColumns
@@ -3569,6 +3459,7 @@ means no column filtering is needed (load-all path).
 **Setup:** Call `executor.ComputeSecondPassCols(nil, nil)`.
 
 **Assertions:**
+
 - result is nil
 
 **Spec invariants tested:** SPEC-ROOT-017 (nil wantCols is valid and means load-all);
@@ -3579,6 +3470,7 @@ Back-ref: `internal/modules/executor/compute_second_pass_cols_test.go:TestComput
 ---
 
 ## EX-CSP-03: TestComputeSecondPassCols_SelectColumnsOnly
+
 *Added: 2026-04-30*
 
 **Scenario:** `ComputeSecondPassCols(nil, cols)` with SelectColumns but no program returns a non-nil
@@ -3587,6 +3479,7 @@ column set containing both the requested columns and the mandatory traceIntrinsi
 **Setup:** Call `executor.ComputeSecondPassCols(nil, []string{"span.http.url"})`.
 
 **Assertions:**
+
 - result is non-nil
 - result contains `"span.http.url"` (the requested SelectColumn)
 - result contains `"span:start"` (traceIntrinsicColumns — always present in non-nil result)
@@ -3610,17 +3503,20 @@ output matches `lookupIntrinsicFieldsTyped` output exactly for every field and p
 Verifies the NOTE-100 optimization produces identical results to the original code path.
 
 **Setup:**
+
 - Write 200 spans across 2 blocks with all intrinsic fields set (traceID, spanID, parentID,
   span:name, resource.service.name, span:kind, span:start, span:end, span:duration).
 - For each block (0, 1): call both `LookupIntrinsicFieldsTypedForTest` and
   `LookupIntrinsicFieldsTypedForBlockForTest`.
 
 **Assertions:**
+
 - `len(result) == spanCount` for both variants.
 - Every row: `Present`, `TraceID`, `SpanID`, `ParentID`, `SpanName`, `ServiceName`,
   `SpanStart`, `SpanEnd`, `SpanDuration`, `SpanKind`, `SpanStatus`, `StatusMessage` all equal.
 
 **Additional tests in the same file:**
+
 - `_AllCols`: 50 spans, single block, nil wantCols (all 11 columns). Full parity check.
 - `_EmptyColumn`: file with never-written column (span:status_message) → present bit clear, no panic.
 - `_MultiBlock_AllMatch`: 500 spans, 10 blocks. No cross-block bleed.
@@ -3652,6 +3548,7 @@ Back-ref: `internal/modules/executor/stream_structural.go:anySpanMatchesIntrinsi
   exactly 1 span.
 
 **Invariant tests (NOTE-373/NOTE-425/NOTE-447):**
+
 - `TestBuildStructuralBlockPlan_RHSColumnsExcludedFromWant`: RHS-only user-attr columns
   (e.g. `span.rpc.method`) are excluded from `bp.wantColumns` when `nodesList[i]` is non-empty.
 - `TestBuildStructuralBlockPlan_LegacyFile_AllColumnsEager`: skipped on intrinsic-section
@@ -3665,6 +3562,7 @@ Back-ref: `internal/modules/executor/stream_structural_lazy_test.go`
 ---
 
 ## EX-22: TestRejectStringRange_MinOnly_Reject
+
 **Scenario:** Min-only string range predicate where queryMin > fileMax.
 **Setup:** bounds.StringBounds = ["f","m"], node.Min = "z".
 **Assertions:** `rejectStringRange` returns true.
@@ -3672,6 +3570,7 @@ Back-ref: `internal/modules/executor/stream_structural_lazy_test.go`
 ---
 
 ## EX-23: TestRejectStringRange_MaxOnly_Reject
+
 **Scenario:** Max-only string range predicate where queryMax < fileMin.
 **Setup:** bounds.StringBounds = ["f","m"], node.Max = "a".
 **Assertions:** `rejectStringRange` returns true.
@@ -3679,6 +3578,7 @@ Back-ref: `internal/modules/executor/stream_structural_lazy_test.go`
 ---
 
 ## EX-24: TestRejectStringRange_BothMinMax_NoReject
+
 **Scenario:** Min/max range overlaps the file range.
 **Setup:** bounds.StringBounds = ["f","t"], node.Min = "a", node.Max = "z".
 **Assertions:** `rejectStringRange` returns false.
@@ -3686,6 +3586,7 @@ Back-ref: `internal/modules/executor/stream_structural_lazy_test.go`
 ---
 
 ## EX-25: TestRejectStringRange_EmptyBounds_NoReject
+
 **Scenario:** Insufficient bounds to reject.
 **Setup:** bounds.StringBounds = nil or len < 2.
 **Assertions:** `rejectStringRange` returns false.
@@ -3693,6 +3594,7 @@ Back-ref: `internal/modules/executor/stream_structural_lazy_test.go`
 ---
 
 ## EX-26: TestRangeRejectsFile_StringColumn_Reject
+
 **Scenario:** Full dispatch path: ColType=RangeString, queryMin above fileMax.
 **Setup:** RangeBoundaries.ColType=ColumnTypeRangeString, StringBounds=["f","m"], node.Min="z".
 **Assertions:** `rangeRejectsFile` returns true.
@@ -3700,6 +3602,7 @@ Back-ref: `internal/modules/executor/stream_structural_lazy_test.go`
 ---
 
 ## EX-27: TestRejectBytesRange_MinOnly_Reject
+
 **Scenario:** Min-only bytes range predicate where queryMin > fileMax.
 **Setup:** BytesBounds = [[]byte("f"), []byte("m")], node.Min = []byte("z").
 **Assertions:** `rejectBytesRange` returns true.
@@ -3707,6 +3610,7 @@ Back-ref: `internal/modules/executor/stream_structural_lazy_test.go`
 ---
 
 ## EX-28: TestExtractAnchoredLiteralPrefix_AnchoredLiteral
+
 **Scenario:** Anchored pattern with a literal prefix before metacharacter.
 **Setup:** pattern = "^hello.*"
 **Assertions:** returns "hello".
@@ -3714,6 +3618,7 @@ Back-ref: `internal/modules/executor/stream_structural_lazy_test.go`
 ---
 
 ## EX-29: TestExtractAnchoredLiteralPrefix_NoAnchor
+
 **Scenario:** Pattern not anchored at start.
 **Setup:** pattern = "hello.*"
 **Assertions:** returns "".
@@ -3721,6 +3626,7 @@ Back-ref: `internal/modules/executor/stream_structural_lazy_test.go`
 ---
 
 ## EX-30: TestRejectRegexByStringBounds_PrefixAboveFileMax
+
 **Scenario:** Anchored regex prefix is lexicographically above the file's maximum string.
 **Setup:** StringBounds=["a","m"], pattern="^z.*"
 **Assertions:** `rejectRegexByStringBounds` returns true.
@@ -3728,6 +3634,7 @@ Back-ref: `internal/modules/executor/stream_structural_lazy_test.go`
 ---
 
 ## EX-31: TestRejectRegexByStringBounds_PrefixBelowFileMax
+
 **Scenario:** Anchored regex prefix is within the file's range.
 **Setup:** StringBounds=["a","m"], pattern="^b.*"
 **Assertions:** `rejectRegexByStringBounds` returns false.
@@ -3735,6 +3642,7 @@ Back-ref: `internal/modules/executor/stream_structural_lazy_test.go`
 ---
 
 ## EX-32: TestColStatsRejectsFloat64_MinOnly_Reject
+
 **Scenario:** Float64 ColStats: queryMin > blockMax → block pruned.
 **Setup:** stat.HasNumRange=true, stat.MinNum=math.Float64bits(1.0), stat.MaxNum=math.Float64bits(5.0),
 node.Min = &vm.Value{Type:TypeFloat, Data:10.0}, MinInclusive=true.
@@ -3743,6 +3651,7 @@ node.Min = &vm.Value{Type:TypeFloat, Data:10.0}, MinInclusive=true.
 ---
 
 ## EX-33: TestColStatsRejectsFloat64_NaN_StatMin_NoReject
+
 **Scenario:** NaN in stat min → conservative, no rejection.
 **Setup:** stat.HasNumRange=true, stat.MinNum=math.Float64bits(math.NaN()), node.Min = &vm.Value{Type:TypeFloat, Data:10.0}.
 **Assertions:** `colStatsRejectsFloat64` returns false.
@@ -3750,6 +3659,7 @@ node.Min = &vm.Value{Type:TypeFloat, Data:10.0}, MinInclusive=true.
 ---
 
 ## EX-34: TestColStatsRejectsInt64_NegativeValues_NoReject
+
 **Scenario:** Signed int64 range: query overlaps negative block range.
 **Setup:** blockMin=-20, blockMax=-5 (stored as uint64 bit patterns), queryMin=-10, queryMax=-1.
 **Assertions:** `colStatsRejectsInt64` returns false (overlap exists).
@@ -3757,6 +3667,7 @@ node.Min = &vm.Value{Type:TypeFloat, Data:10.0}, MinInclusive=true.
 ---
 
 ## EX-35: TestColStatsRejectsInt64_NegativeValues_Reject
+
 **Scenario:** Signed int64 range: all-positive query cannot match all-negative block.
 **Setup:** blockMin=-20, blockMax=-1 (stored as uint64 bit patterns), queryMin=0.
 **Assertions:** `colStatsRejectsInt64` returns true.
@@ -3769,10 +3680,10 @@ node.Min = &vm.Value{Type:TypeFloat, Data:10.0}, MinInclusive=true.
 **File:** `internal/modules/executor/context_propagation_test.go`
 
 Tests verify:
+
 - `TestAttachCacheStats_IsRecording`: attributes are set when span is recording, NOT set on noop span — verifies the `span.IsRecording()` guard prevents allocations on unsampled queries.
 - `TestAttachCacheStats_ZeroStats`: no attributes set when all counts are zero.
 - `TestEmitPlannerSpan_Attributes`: `blockpack.planner` span has correct attribute keys/values including `pruned_by_colstats` and `pruned_by_intrinsic_toc`.
 - `TestStartBlockSpan_Attributes`: `blockpack.block` span name is correct and `blockpack.block.index` is set.
 - `TestCollect_ContextCancellation`: canceled context causes `Collect` to return `ctx.Err()`.
 - `TestCollect_BackgroundContext`: Collect works correctly with a valid context (covers the ctx-threading path).
-- `TestExecuteLogMetrics_ContextPropagation`: canceled ctx propagates to `ExecuteLogMetrics`.

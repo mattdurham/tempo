@@ -5,6 +5,7 @@ import (
 
 	"github.com/grafana/blockpack/internal/modules/blockevents"
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
+	"github.com/grafana/blockpack/internal/modules/valueindex"
 )
 
 // NOTE: Any changes to this file must be reflected in the corresponding NOTES.md.
@@ -59,20 +60,17 @@ type StaleReclaimReporter interface {
 }
 
 // ColumnEntry is one extracted observation for one configured column.
-//
-// Value is the typed column value (string, int64, uint64, float64, bool, []byte)
-// matching ColType; the service hands it to valueindex.Writer.AddEntry which
-// canonicalises it. SourceRef is the blockpack object path the entry came from,
-// BlockRef the v2 page-aligned file locator of the block within that file
-// (NOTE-V2-002), and TimeSec the span's wall time in seconds.
 type ColumnEntry struct {
-	ColName   string
 	Value     any
+	ColName   string
 	SourceRef string
-	TraceID   [16]byte
-	ColType   shared.ColumnType
-	BlockRef  shared.BlockFileRef
 	TimeSec   uint64
+	BlockRef  valueindex.BlockRef // v2+: direct page reference
+	BlockID   uint32              // v1: zero-based block index
+	RowIdx    uint16              // v4+: row index within block
+	TraceID   [16]byte
+	SpanID    [8]byte // v4+: span identity (NOTE-VI-029, #428)
+	ColType   shared.ColumnType
 }
 
 // Extractor reads a blockpack file and streams per-column entries to a callback.

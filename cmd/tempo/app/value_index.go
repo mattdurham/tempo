@@ -45,18 +45,17 @@ func newMinioFromS3Cfg(cfg *s3cfg.Config) (*minio.Client, error) {
 // toVICConsumerCfg converts the Tempo config struct to the blockpack consumer config.
 func toVICConsumerCfg(cfg common.ValueIndexConsumerConfig) vicconsumer.Config {
 	return vicconsumer.Config{
-		Enabled:              cfg.Enabled,
-		RqliteURL:            cfg.RqliteURL,
-		RedisAddr:            cfg.RedisAddr,
-		StreamName:           cfg.StreamName,
-		ConsumerGroup:        cfg.ConsumerGroup,
-		ConsumerName:         cfg.ConsumerName,
-		IndexPrefix:          cfg.IndexPrefix,
-		Columns:              cfg.Columns,
-		FlushInterval:        cfg.FlushInterval,
-		PollTimeout:          cfg.PollTimeout,
-		ClaimIdleThreshold:   cfg.ClaimIdleThreshold,
-		BatchSize:            cfg.BatchSize,
+		Enabled:            cfg.Enabled,
+		RedisAddr:          cfg.RedisAddr,
+		StreamName:         cfg.StreamName,
+		ConsumerGroup:      cfg.ConsumerGroup,
+		ConsumerName:       cfg.ConsumerName,
+		IndexPrefix:        cfg.IndexPrefix,
+		Columns:            cfg.Columns,
+		FlushInterval:      cfg.FlushInterval,
+		PollTimeout:        cfg.PollTimeout,
+		ClaimIdleThreshold: cfg.ClaimIdleThreshold,
+		BatchSize:          cfg.BatchSize,
 	}
 }
 
@@ -93,24 +92,12 @@ func (t *App) initValueIndexConsumer() (services.Service, error) {
 
 	var consumer vicconsumer.Consumer
 	var consumerCloser func()
-	if vicCfg.RqliteURL != "" {
-		rc, cerr := vicconsumer.NewRqliteConsumer(vicCfg)
-		if cerr != nil {
-			return nil, fmt.Errorf("value-index-consumer: create rqlite consumer: %w", cerr)
-		}
-		consumer = rc
-		consumerCloser = func() { _ = rc.Close() }
-	} else {
-		rc, cerr := vicconsumer.NewRedisConsumer(vicCfg)
-		if cerr != nil {
-			return nil, fmt.Errorf("value-index-consumer: create redis consumer: %w", cerr)
-		}
-		consumer = rc
-		consumerCloser = func() { _ = rc.Close() }
+	rc, cerr := vicconsumer.NewRedisConsumer(vicCfg)
+	if cerr != nil {
+		return nil, fmt.Errorf("value-index-consumer: create redis consumer: %w", cerr)
 	}
-	if err != nil {
-		return nil, fmt.Errorf("value-index-consumer: create redis consumer: %w", err)
-	}
+	consumer = rc
+	consumerCloser = func() { _ = rc.Close() }
 
 	bucket := t.cfg.StorageConfig.Trace.S3.Bucket
 	extractor := &tempoVICExtractor{client: s3Client, bucket: bucket}

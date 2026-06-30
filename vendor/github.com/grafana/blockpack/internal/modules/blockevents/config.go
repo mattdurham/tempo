@@ -26,10 +26,6 @@ const (
 type Config struct {
 	// RedisAddr is the host:port of the Redis server backing the stream.
 	RedisAddr string `yaml:"redis_addr"`
-	// RqliteURL is the HTTP URL of the rqlite cluster backing the job table
-	// (e.g. "http://rqlite:4001"). Used by NewRqlitePublisher; ignored by the
-	// Redis publisher. See NOTE-VI-021.
-	RqliteURL string `yaml:"rqlite_url"`
 	// StreamName is the Redis stream key events are appended to. Defaults to
 	// DefaultStreamName when empty.
 	StreamName string `yaml:"stream_name"`

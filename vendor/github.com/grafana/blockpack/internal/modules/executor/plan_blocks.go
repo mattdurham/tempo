@@ -41,24 +41,12 @@ func planBlocks(
 			plan.Explain = "file-level reject: query value outside column [bucketMin, bucketMax]"
 			plan.PrunedByIndex = 0
 			plan.PrunedByTime = 0
-			plan.PrunedByFuse = 0
 			return plan
 		}
 	}
 
-	// File-level bloom reject: Fuse8 for service.name, compact bloom for trace:id.
-	// NOTE-045: Checks equality predicates via FileBloom (Fuse8) and compact trace bloom.
-	if program != nil && program.Predicates != nil {
-		if fileLevelBloomReject(r, program.Predicates.Nodes) {
-			plan.PrunedByFileBounds = len(plan.SelectedBlocks) // NOTE-456
-			plan.SelectedBlocks = nil
-			plan.Explain = "file-level reject: bloom filter absence for equality predicate"
-			plan.PrunedByIndex = 0
-			plan.PrunedByTime = 0
-			plan.PrunedByFuse = 0
-			return plan
-		}
-	}
+	// NOTE: File-level bloom reject removed (2026-06-29, in-file block pruning removal).
+	// Value index is now the authoritative source for pruning.
 
 	// File-level and block-level vector centroid reject (VECTOR() predicates only).
 	// If the file centroid is too distant from the query vector, skip the entire file.
@@ -90,281 +78,22 @@ func planBlocks(
 		plan.PrunedByIntrinsicTOC = beforeIntrinsic - len(plan.SelectedBlocks) // NOTE-449
 	}
 
-	// ColStats block pruning (NOTE-446, issue #364): skip blocks where a predicate column
-	// is wholly absent (present_count == 0) or whose per-block numeric range cannot satisfy
-	// the predicate's bound. Runs last so it refines the already-selected set with no extra
-	// I/O beyond the lazily-fetched ColStats section.
-	if program != nil && program.Predicates != nil && r.HasColStats() {
-		beforeColStats := len(plan.SelectedBlocks) // NOTE-449
-		plan.SelectedBlocks = pruneByColStats(r, program.Predicates.Nodes, plan.SelectedBlocks)
-		plan.PrunedByColStats = beforeColStats - len(plan.SelectedBlocks) // NOTE-449
-	}
+	// NOTE: ColStats block pruning removed (2026-06-29, in-file block pruning removal).
+	// Value index is now the authoritative source for pruning.
 
 	return plan
 }
 
-// pruneByColStats removes blocks from selected that cannot match any top-level AND
-// predicate, using the per-block ColStats section. Only top-level AND leaves (and OR
-// composites where every arm rejects) are considered; this is conservative — when a
-// predicate cannot be evaluated against ColStats the block is kept.
-func pruneByColStats(r *modules_reader.Reader, nodes []vm.RangeNode, selected []int) []int {
-	if len(selected) == 0 || len(nodes) == 0 {
-		return selected
-	}
-	out := selected[:0]
-	for _, bi := range selected {
-		cs := r.ColStats(bi)
-		if cs == nil {
-			out = append(out, bi)
-			continue
-		}
-		reject := false
-		for i := range nodes {
-			if colStatsRejects(cs, &nodes[i]) {
-				reject = true
-				break
-			}
-		}
-		if !reject {
-			out = append(out, bi)
-		}
-	}
-	return out
-}
+// NOTE: pruneByColStats removed (2026-06-29, in-file block pruning removal).
+// Value index is now the authoritative source for pruning.
 
-// colStatsRejects reports whether the block's column statistics guarantee that no row can
-// satisfy node. AND composites reject if ANY child rejects; OR composites reject only if
-// ALL children reject. Leaves reject on column absence (RequirePresent / equality / range
-// against an absent column) or on a numeric range that cannot intersect the predicate.
-func colStatsRejects(cs *modules_shared.BlockColStats, node *vm.RangeNode) bool {
-	if len(node.Children) > 0 {
-		if node.IsOR {
-			for i := range node.Children {
-				if !colStatsRejects(cs, &node.Children[i]) {
-					return false
-				}
-			}
-			return true
-		}
-		for i := range node.Children {
-			if colStatsRejects(cs, &node.Children[i]) {
-				return true
-			}
-		}
-		return false
-	}
-
-	if node.Column == "" {
-		return false
-	}
-	stat := cs.Lookup(node.Column)
-
-	// A leaf that requires the column to be present, match a value, fall in a range, or
-	// match a pattern can never match a block where the column is wholly absent
-	// (present_count == 0 or no recorded stat).
-	requiresPresence := node.RequirePresent ||
-		len(node.Values) > 0 || node.Min != nil || node.Max != nil || node.Pattern != ""
-	if requiresPresence {
-		if stat == nil || stat.PresentCount == 0 {
-			return true
-		}
-	}
-	if stat == nil {
-		return false
-	}
-
-	// Numeric range pruning: if the predicate has a numeric bound and the block's recorded
-	// [min, max] cannot intersect it, the block cannot match. Only applied when ColStats
-	// carries a numeric range for this column.
-	if stat.HasNumRange {
-		return colStatsRejectsNumeric(stat, node)
-	}
-	return false
-}
-
-// colStatsRejectsNumeric reports whether a block's recorded numeric [min,max] (stat) cannot
-// intersect node's predicate. Called only when stat.HasNumRange is true.
-//
-// NOTE-448: Dispatch numeric range pruning to a type-aware helper based on the value type of
-// the predicate bounds. This avoids applying uint64 bit comparison to signed int64 values
-// (wrong for negatives) or float64 values.
-//
-// NOTE-451: A numeric equality predicate ("attr = V") carries only Values. Treat it as a
-// degenerate inclusive range [min(values), max(values)] so range-indexed numeric columns
-// without a bloom filter still get block-level pruning.
-func colStatsRejectsNumeric(stat *modules_shared.ColStat, node *vm.RangeNode) bool {
-	rangeNode := node
-	if node.Min == nil && node.Max == nil {
-		if eq, ok := numericEqualityAsRange(node); ok {
-			rangeNode = &eq
-		}
-	}
-	if rangeNode.Min == nil && rangeNode.Max == nil {
-		return false
-	}
-	bound := rangeNode.Min
-	if bound == nil {
-		bound = rangeNode.Max
-	}
-	switch bound.Type {
-	case vm.TypeFloat:
-		return colStatsRejectsFloat64(stat, rangeNode)
-	case vm.TypeInt:
-		// NOTE-448: Int64 path uses signed comparison. Old files (HasNumRange=false for
-		// Int64) are unaffected — this branch only fires when HasNumRange=true.
-		return colStatsRejectsInt64(stat, rangeNode)
-	default:
-		// uint64, duration, bool ({0,1}), and other unsigned types use the uint64 path
-		// (NOTE-452 routes TypeBool here; valueAsUint64 maps true→1, false→0).
-		if rangeNode.Min != nil && numNodeBoundExceedsMax(rangeNode.Min, rangeNode.MinInclusive, stat.MaxNum) {
-			return true
-		}
-		if rangeNode.Max != nil && numNodeBoundBelowMin(rangeNode.Max, rangeNode.MaxInclusive, stat.MinNum) {
-			return true
-		}
-		return false
-	}
-}
-
-// numNodeBoundExceedsMax reports whether a lower-bound predicate (Min) excludes the whole
-// block: the smallest value the predicate admits is strictly greater than the block max.
-func numNodeBoundExceedsMax(minVal *vm.Value, inclusive bool, blockMax uint64) bool {
-	v, ok := valueAsUint64(minVal)
-	if !ok {
-		return false
-	}
-	if inclusive {
-		return v > blockMax
-	}
-	return v >= blockMax
-}
-
-// numNodeBoundBelowMin reports whether an upper-bound predicate (Max) excludes the whole
-// block: the largest value the predicate admits is strictly less than the block min.
-func numNodeBoundBelowMin(maxVal *vm.Value, inclusive bool, blockMin uint64) bool {
-	v, ok := valueAsUint64(maxVal)
-	if !ok {
-		return false
-	}
-	if inclusive {
-		return v < blockMin
-	}
-	return v <= blockMin
-}
-
-// valueAsUint64 returns the uint64 representation of a numeric Value for comparison against
-// ColStats numeric ranges, matching the writer's little-endian range-key encoding (the raw
-// bits of an int64/uint64). Returns false for non-numeric values.
-func valueAsUint64(v *vm.Value) (uint64, bool) {
-	switch v.Type {
-	case vm.TypeInt, vm.TypeDuration:
-		if iv, ok := v.Data.(int64); ok {
-			return uint64(iv), true //nolint:gosec
-		}
-		return 0, false
-	case vm.TypeBool:
-		// NOTE-452 (issue #373): bool ColStats range is stored as uint64 0/1 (true=1).
-		if bv, ok := v.Data.(bool); ok {
-			if bv {
-				return 1, true
-			}
-			return 0, true
-		}
-		return 0, false
-	default:
-		return 0, false
-	}
-}
-
-// fileLevelBloomReject returns true if file-level bloom filters guarantee that no span
-// in the file can match the equality predicates in nodes.
-// NOTE-045: Checks resource.service.name via FileBloom (Fuse8) and trace:id via compact bloom.
-// AND semantics: reject if ANY leaf rejects. OR semantics: reject only if ALL children reject.
-func fileLevelBloomReject(r *modules_reader.Reader, nodes []vm.RangeNode) bool {
-	fb := r.FileBloom()
-	for i := range nodes {
-		if bloomRejectByEquality(r, fb, &nodes[i]) {
-			return true
-		}
-	}
-	return false
-}
-
-// bloomRejectByEquality returns true if the equality predicate tree guarantees no match
-// via file-level bloom filters.
-func bloomRejectByEquality(r *modules_reader.Reader, fb *modules_reader.FileBloom, node *vm.RangeNode) bool {
-	if len(node.Children) > 0 {
-		if node.IsOR {
-			// OR: reject only if ALL children reject.
-			for i := range node.Children {
-				if !bloomRejectByEquality(r, fb, &node.Children[i]) {
-					return false
-				}
-			}
-			return true
-		}
-		// AND: reject if ANY child rejects.
-		for i := range node.Children {
-			if bloomRejectByEquality(r, fb, &node.Children[i]) {
-				return true
-			}
-		}
-		return false
-	}
-	// Leaf node — only handle equality (Values non-empty, no range/pattern).
-	// SPEC-ROOT-006: complex boolean extracted to named predicate.
-	if !nodeIsEqualityLeaf(node) {
-		return false
-	}
-	if node.Column == "" {
-		return false
-	}
-	// trace:id: compact bloom.
-	if node.Column == colNameTraceID {
-		return bloomRejectTraceID(r, node.Values)
-	}
-	// String columns: FileBloom Fuse8.
-	return bloomRejectString(fb, node.Column, node.Values)
-}
+// NOTE: colStatsRejects, colStatsRejectsNumeric, helper functions removed (2026-06-29).
+// Value index is now the authoritative source for pruning.
 
 // nodeIsEqualityLeaf returns true when node is an equality-only leaf: it has at
-// least one value and no range or pattern predicate. Bloom rejection is only
-// applicable to pure equality nodes.
+// least one value and no range or pattern predicate.
 func nodeIsEqualityLeaf(node *vm.RangeNode) bool {
 	return len(node.Values) > 0 && node.Min == nil && node.Max == nil && node.Pattern == ""
-}
-
-// bloomRejectTraceID returns true if ALL trace:id values are definitely absent (compact bloom).
-func bloomRejectTraceID(r *modules_reader.Reader, values []vm.Value) bool {
-	for _, v := range values {
-		b, ok := v.Data.([]byte)
-		if !ok || len(b) != 16 {
-			return false
-		}
-		var tid [16]byte
-		copy(tid[:], b)
-		if r.MayContainTraceID(tid) {
-			return false
-		}
-	}
-	return len(values) > 0
-}
-
-// bloomRejectString returns true if ALL string values are definitely absent (FileBloom Fuse8).
-func bloomRejectString(fb *modules_reader.FileBloom, col string, values []vm.Value) bool {
-	if fb == nil {
-		return false
-	}
-	for _, v := range values {
-		s, ok := v.Data.(string)
-		if !ok {
-			return false
-		}
-		if fb.MayContainString(col, s) {
-			return false
-		}
-	}
-	return len(values) > 0
 }
 
 // fileLevelReject returns true if the AND-combined predicates in nodes guarantee
@@ -924,81 +653,9 @@ func rejectRegexByStringBounds(bounds *modules_reader.RangeBoundaries, node *vm.
 // stat.MinNum and stat.MaxNum store int64 bit patterns as uint64 (writer emits raw int64 LE).
 // Casting back to int64 reconstructs the signed value correctly, including negative numbers.
 //
-// NOTE-448: Replaces the previously incorrect path where numNodeBoundExceedsMax would have
-// used valueAsUint64 (uint64 cast) on int64 values — wrong for negative values. Old files
-// (HasNumRange=false for Int64) are unaffected.
-func colStatsRejectsInt64(stat *modules_shared.ColStat, node *vm.RangeNode) bool {
-	blockMin := int64(stat.MinNum) //nolint:gosec
-	blockMax := int64(stat.MaxNum) //nolint:gosec
-	if node.Min != nil {
-		if queryMin, ok := ptrValueToInt64(node.Min); ok {
-			if node.MinInclusive {
-				if queryMin > blockMax {
-					return true
-				}
-			} else {
-				if queryMin >= blockMax {
-					return true
-				}
-			}
-		}
-	}
-	if node.Max != nil {
-		if queryMax, ok := ptrValueToInt64(node.Max); ok {
-			if node.MaxInclusive {
-				if queryMax < blockMin {
-					return true
-				}
-			} else {
-				if queryMax <= blockMin {
-					return true
-				}
-			}
-		}
-	}
-	return false
-}
+// NOTE: colStatsRejectsInt64 removed (2026-06-29, in-file block pruning removal).
 
-// colStatsRejectsFloat64 applies float64 range comparison against ColStats numeric bounds.
-// stat.MinNum and stat.MaxNum store math.Float64bits representations.
-// NaN in either the stat or query bound is treated conservatively (no rejection).
-//
-// NOTE-448: numMinKey/numMaxKey in the writer are set via math.Float64bits. Add an
-// explicit NaN guard on the executor side for safety.
-func colStatsRejectsFloat64(stat *modules_shared.ColStat, node *vm.RangeNode) bool {
-	blockMin := math.Float64frombits(stat.MinNum)
-	blockMax := math.Float64frombits(stat.MaxNum)
-	if math.IsNaN(blockMin) || math.IsNaN(blockMax) {
-		return false
-	}
-	if node.Min != nil {
-		if queryMin, ok := ptrValueToFloat64(node.Min); ok && !math.IsNaN(queryMin) {
-			if node.MinInclusive {
-				if queryMin > blockMax {
-					return true
-				}
-			} else {
-				if queryMin >= blockMax {
-					return true
-				}
-			}
-		}
-	}
-	if node.Max != nil {
-		if queryMax, ok := ptrValueToFloat64(node.Max); ok && !math.IsNaN(queryMax) {
-			if node.MaxInclusive {
-				if queryMax < blockMin {
-					return true
-				}
-			} else {
-				if queryMax <= blockMin {
-					return true
-				}
-			}
-		}
-	}
-	return false
-}
+// NOTE: colStatsRejectsFloat64 removed (2026-06-29, in-file block pruning removal).
 
 // fileLevelVectorPrune prunes blocks using VECTOR() centroid distances.
 // If the file centroid is too distant (similarity < threshold), all blocks are pruned.

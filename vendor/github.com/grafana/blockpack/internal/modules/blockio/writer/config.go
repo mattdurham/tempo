@@ -5,6 +5,7 @@ package writer
 import (
 	"io"
 
+	"github.com/grafana/blockpack/internal/modules/blockio/reader"
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
 )
 
@@ -38,15 +39,6 @@ type TextEmbedder = shared.TextEmbedder
 type Config struct {
 	OutputStream io.Writer
 
-	// ScratchDir is a local directory for the writer's on-disk scratch files, currently the
-	// per-column intrinsic spill files (NOTE-461, issue #380). When empty, a unique temp
-	// directory under os.TempDir() is created and removed automatically at Flush(). When set,
-	// the caller owns the directory; the writer creates and removes only its own files inside
-	// it. Compaction passes its StagingDir here so spill files land on the same volume as the
-	// staged output block, keeping all of compaction's disk I/O on the configured scratch
-	// volume rather than the default /tmp.
-	ScratchDir string
-
 	// Embedder enables automatic embedding of spans during block building.
 	// When non-nil, the writer assembles text from each span's fields (using
 	// EmbeddingFields or all fields by default), calls Embedder.Embed(), and
@@ -56,6 +48,29 @@ type Config struct {
 	// When nil, the writer only stores vectors that are explicitly provided
 	// as __embedding__ span attributes (the current behavior).
 	Embedder TextEmbedder
+
+	// NOTE: EnableV2Format removed (2026-06-29). V2 lean format is now unconditional:
+	// all blocks are page-aligned, FooterV9 always, no in-file pruning sections.
+	// Querying relies entirely on the value-index pipeline.
+
+	// ValueIndexSink, if non-nil, is called after a successful Flush with a
+	// Reader opened over the written bytes. The sink can use it to extract
+	// value-index entries and write them inline — replacing the async
+	// value-index-consumer pipeline for callers (block builder, compactor)
+	// that prefer synchronous in-process indexing.
+	//
+	// The Reader is owned by the writer; the sink MUST NOT close it.
+	// Any error returned by the sink aborts Flush and is returned to the caller.
+	ValueIndexSink func(r *reader.Reader) error
+
+	// ScratchDir is a local directory for the writer's on-disk scratch files, currently the
+	// per-column intrinsic spill files (NOTE-461, issue #380). When empty, a unique temp
+	// directory under os.TempDir() is created and removed automatically at Flush(). When set,
+	// the caller owns the directory; the writer creates and removes only its own files inside
+	// it. Compaction passes its StagingDir here so spill files land on the same volume as the
+	// staged output block, keeping all of compaction's disk I/O on the configured scratch
+	// volume rather than the default /tmp.
+	ScratchDir string
 
 	// EmbeddingFields configures which span fields are included in the auto-embedding
 	// text. If empty and Embedder is non-nil, all fields are included using the
@@ -202,41 +217,4 @@ type Config struct {
 	// block-format version bump (the IntrinsicTOC is a self-describing column set — fewer
 	// columns is not a format change).
 	OmitIntrinsicIdentityColumns bool
-
-	// RestoreIdentityBlockColumns writes the three identity columns (trace:id, span:id,
-	// span:parent_id) back into per-inner-block column payloads in addition to the file-level
-	// intrinsic section (NOTE-V2-004, issue #420). NOTE-469 (issue #389) had removed these from
-	// block payloads to make them intrinsic-only; the v2 format reverses that because every
-	// inner block must be self-contained for direct ranged-GET block fetch (#424) — a span must
-	// resolve from the block bytes alone, with no IntrinsicTOC or SpanTree consultation.
-	//
-	// Adding columns to a block is not a block-format version change (the column set is
-	// self-describing), so this is a pure encoder-side choice and existing readers handle it.
-	// Defaults OFF so it can be rolled out by toggle without a format bump. Expect a modest
-	// per-block size increase (~30 bytes/span for the three high-entropy ID columns).
-	RestoreIdentityBlockColumns bool
-
-	// OmitIntrinsicTOC skips writing the file-level IntrinsicTOC section entirely (NOTE-V2-005,
-	// issue #421). In the v2 self-contained-block format (#417) every intrinsic column already
-	// lives in the per-inner-block column payloads: span:name/kind/status/status_message/
-	// start/duration via the unconditional addPresent writes in feedSpan*, and the three
-	// identity columns (trace:id/span:id/span:parent_id) via RestoreIdentityBlockColumns
-	// (NOTE-V2-004, #420). span:end is synthesized from span:start+span:duration (NOTE-399).
-	// The IntrinsicTOC therefore carries no information not already in the blocks, and v2 direct
-	// block fetch (#424) resolves every span from block bytes alone — so the IntrinsicTOC is
-	// redundant and ~50% of L1 file size.
-	//
-	// When true the writer skips both the file-level intrinsic spillMerge (per-block, in
-	// spillBlockAccumulators) and the IntrinsicTOC ToCEntry emission (writeV8IntrinsicBlobs),
-	// so no IntrinsicTOC section reaches the final file. The SpanTree is fed from the same
-	// per-block accumulator independently (feedSpanTreeFromAccum uses built.localAccum, not the
-	// file-level spill), so it is unaffected.
-	//
-	// REQUIRES RestoreIdentityBlockColumns: without identity columns in blocks there would be
-	// no identity store at all once the IntrinsicTOC is gone (the SpanTree alone is read-path
-	// specific). NewWriterWithConfig enforces this by only activating OmitIntrinsicTOC when
-	// RestoreIdentityBlockColumns is also set. Defaults OFF; safe to roll out by toggle without
-	// a format bump because the reader's IntrinsicTOC consultation is already a fallback behind
-	// per-block columns (HasIntrinsicColumn / block.Columns()).
-	OmitIntrinsicTOC bool
 }

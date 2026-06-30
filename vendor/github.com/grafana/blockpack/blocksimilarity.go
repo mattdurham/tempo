@@ -15,8 +15,6 @@ package blockpack
 // scheduler reorders its provider slice using these scores.
 
 import (
-	"fmt"
-
 	modules_shared "github.com/grafana/blockpack/internal/modules/blockio/shared"
 )
 
@@ -40,13 +38,34 @@ type BlockValueSets struct {
 // only returns an error on an actual decode/read failure. A block with neither column present
 // returns (BlockValueSets{}, nil).
 func ReadBlockValueSets(r *Reader) (BlockValueSets, error) {
-	svc, err := r.IntrinsicDictStringSet(modules_shared.SvcNameColumnName)
-	if err != nil {
-		return BlockValueSets{}, fmt.Errorf("read service-name value set: %w", err)
-	}
-	names, err := r.IntrinsicDictStringSet(modules_shared.SpanNameColumnName)
-	if err != nil {
-		return BlockValueSets{}, fmt.Errorf("read span-name value set: %w", err)
+	// After #433 (IntrinsicTOC removal), service.name and span:name live in block columns.
+	var svc, names map[string]struct{}
+	for bi := range r.BlockCount() {
+		bwb, err := r.GetBlockWithBytes(bi, nil)
+		if err != nil || bwb == nil {
+			continue
+		}
+		block := bwb.Block
+		if col := block.GetColumn(modules_shared.SvcNameColumnName); col != nil {
+			if svc == nil {
+				svc = make(map[string]struct{})
+			}
+			for rowIdx := range block.SpanCount() {
+				if v, ok := col.StringValue(rowIdx); ok && v != "" {
+					svc[v] = struct{}{}
+				}
+			}
+		}
+		if col := block.GetColumn(modules_shared.SpanNameColumnName); col != nil {
+			if names == nil {
+				names = make(map[string]struct{})
+			}
+			for rowIdx := range block.SpanCount() {
+				if v, ok := col.StringValue(rowIdx); ok && v != "" {
+					names[v] = struct{}{}
+				}
+			}
+		}
 	}
 	return BlockValueSets{Services: svc, SpanNames: names}, nil
 }

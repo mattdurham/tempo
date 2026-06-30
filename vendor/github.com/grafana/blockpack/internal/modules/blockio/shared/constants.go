@@ -44,11 +44,14 @@ const (
 	// is applied per-column by the block writer.
 	VersionBlockEncV3 uint8 = 3
 
-	// FooterV8Version is the footer format version for V8 files (unified ToC footer).
-	// Same 18-byte layout as V7; distinguished by version=8.
-	FooterV8Version uint16 = 8
+	// FooterV9Version is the footer format version for V9 (v2 lean-format) files.
+	// Same 18-byte wire layout as V8; distinguished by version=9.
+	// V9 files omit IntrinsicTOC, SpanTree, KLL sketch blobs, file-level bloom,
+	// and the chunked trace index. Inner blocks are 4 096-byte page-aligned.
+	// See issue #417 and NOTE-V2-001.
+	FooterV9Version uint16 = 9
 
-	// FooterV8Size is the total size of the V8 footer in bytes (identical to V7).
+	// FooterV8Size is the total size of the V8/V9 footer in bytes (identical to V7).
 	// magic[4]+version[2]+toc_offset[8]+toc_length[4] = 18 bytes.
 	FooterV8Size uint = 18
 
@@ -67,7 +70,7 @@ const (
 
 	ToCSubTypeTraceChunked uint32 = 8 // range-readable chunked trace index (SPEC: issue #340)
 
-	ToCSubTypeColStats uint32 = 9 // per-block per-column statistics for predicate pruning (SPEC: issue #364)
+	// SubType 9 (ColStats) retired 2026-06-29 (in-file block pruning removal); not reused.
 
 	ToCSubTypeSpanTree uint32 = 10 // parent-child span tree index for structural query pruning (SPEC: issue #381)
 
@@ -507,7 +510,12 @@ const (
 	ValueIndexFileVersion      uint8 = 0x01
 	ValueIndexMetaVersion      uint8 = 0x01
 	ValueIndexHashIndexVersion uint8 = 0x01
-	ValueIndexEntriesVersion   uint8 = 0x02 // BlockFileRef (page+len) per entry, v2 lean format (NOTE-V2-002)
+	ValueIndexEntriesVersion   uint8 = 0x02 // includes BlockRef (page+len) per entry (NOTE-VI-027, issue #417)
+	ValueIndexEntriesVersionV1 uint8 = 0x01 // legacy: BlockID uint32 per entry (NOTE-VI-014)
+	// ValueIndexEntriesVersionV3 is kept for reading legacy files only.
+	// New files always use V4 (V4 supplants V3 — V4 adds SpanID+RowIdx, same layout otherwise).
+	ValueIndexEntriesVersionV3 uint8 = 0x03 // BlockRef + string-table SourceRef index (issue #432)
+	ValueIndexEntriesVersionV4 uint8 = 0x04 // V3 + SpanID[8] + RowIdx[2] per entry (issue #428, default)
 	ValueIndexKLLVersion       uint8 = 0x01
 
 	// ValueIndexKLLK is the k parameter for the vi:value KLL sketch (~0.01% quantile error).
@@ -536,7 +544,14 @@ const (
 	ValueIndexCompactMaxLevel = 0
 
 	// ValueIndexFilenamePattern is fmt.Sprintf(ValueIndexFilenamePattern, level, id).
+	//
+	// Deprecated: use ValueIndexFilenamePatternV2 which embeds wall time range.
 	ValueIndexFilenamePattern = "L%d-%s.blockpack"
+
+	// ValueIndexFilenamePatternV2 embeds wall-clock time range for O(1) file discovery.
+	// fmt.Sprintf(ValueIndexFilenamePatternV2, level, wallMinSec, wallMaxSec, id)
+	// Example: L0-1750000000-1750003600-ce3sg9bh45cs7fvb.blockpack
+	ValueIndexFilenamePatternV2 = "L%d-%d-%d-%s.blockpack"
 
 	// Value index column names.
 	ValueIndexValueColumn     = "vi:value"

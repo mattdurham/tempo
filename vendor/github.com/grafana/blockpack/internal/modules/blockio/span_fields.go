@@ -161,57 +161,13 @@ func (a *modulesSpanFieldsAdapter) GetField(name string) (any, bool) {
 		}
 		return nil, false
 	}
-	// NOTE-476 (issue #394): identity fields may be absent from the block payload AND the
-	// IntrinsicTOC (OmitIntrinsicIdentityColumns); resolve them from the SpanTree. Critical for
-	// SpanMatch.IsRoot, which keys root detection on span:parent_id absence.
-	if v, ok := a.spanTreeIdentityField(name); ok {
-		return v, true
-	}
-	return nil, false
-}
-
-// spanTreeIdentityField resolves trace:id/span:id/span:parent_id for this adapter's row from
-// the SpanTree identity reverse map. Returns (nil, false) when the field is not an identity
-// field, no reader is attached, the file has no SpanTree, the row is absent, or — for
-// span:parent_id — the span is a root (zero parent, matching the writer's "absent when empty"
-// convention so IsRoot detects it). NOTE-476 (issue #394).
-func (a *modulesSpanFieldsAdapter) spanTreeIdentityField(name string) (any, bool) {
-	if a.reader == nil {
-		return nil, false
-	}
-	if name != modules_shared.TraceIDColumnName && name != modules_shared.SpanIDColumnName &&
-		name != modules_shared.SpanParentIDColumnName {
-		return nil, false
-	}
-	if a.blockIdx < 0 || a.blockIdx > int(^uint16(0)) || a.rowIdx < 0 || a.rowIdx > int(^uint16(0)) {
-		return nil, false
-	}
-	idMap, err := a.reader.SpanTreeIdentityForBlock(uint16(a.blockIdx)) //nolint:gosec // bounded above
-	if err != nil || idMap == nil {
-		return nil, false
-	}
-	rec, ok := idMap[uint16(a.rowIdx)] //nolint:gosec // bounded above
-	if !ok {
-		return nil, false
-	}
-	switch name {
-	case modules_shared.TraceIDColumnName:
-		b := make([]byte, 16)
-		copy(b, rec.TraceID[:])
-		return b, true
-	case modules_shared.SpanIDColumnName:
-		b := make([]byte, 8)
-		copy(b, rec.SpanID[:])
-		return b, true
-	case modules_shared.SpanParentIDColumnName:
-		// Root spans have a zero parent: report ABSENT so IsRoot treats them as roots, exactly
-		// as a missing intrinsic/block column would.
-		if rec.ParentID == ([8]byte{}) {
-			return nil, false
+	// NOTE-434: After SpanTree removal (#434), identity fields not in block columns
+	// fall back to IntrinsicTOC. This covers v1 files where trace:id/span:id/span:parent_id
+	// live in the IntrinsicTOC rather than block payload columns.
+	if a.reader != nil {
+		if v, ok := a.intrinsicTOCField(name); ok {
+			return v, true
 		}
-		b := make([]byte, 8)
-		copy(b, rec.ParentID[:])
-		return b, true
 	}
 	return nil, false
 }
@@ -240,21 +196,71 @@ func (a *modulesSpanFieldsAdapter) IterateFields(fn func(name string, value any)
 			return
 		}
 	}
-	// NOTE-476 (issue #394): emit the identity fields from the SpanTree when they are absent
-	// from the block payload (OmitIntrinsicIdentityColumns). SpanMatch.Clone materializes via
-	// IterateFields, so the cloned result would otherwise lose trace:id/span:id/span:parent_id
-	// — breaking root detection (IsRoot keys on span:parent_id) and any downstream identity use.
-	// Root spans (zero parent) intentionally emit no span:parent_id, matching column absence.
+	// NOTE-434: After SpanTree removal (#434), emit identity fields from IntrinsicTOC when
+	// absent from the block payload. Covers v1 files and OmitIntrinsicIdentityColumns blocks.
 	if a.reader != nil {
 		for _, name := range [...]string{modules_shared.TraceIDColumnName, modules_shared.SpanIDColumnName, modules_shared.SpanParentIDColumnName} {
 			if modulesLookupColumn(a.block, name) != nil {
 				continue // already emitted from the block payload above
 			}
-			if v, ok := a.spanTreeIdentityField(name); ok {
+			if v, ok := a.intrinsicTOCField(name); ok {
 				if !fn(name, v) {
 					return
 				}
 			}
 		}
 	}
+}
+
+// intrinsicTOCField resolves trace:id/span:id/span:parent_id for this adapter's row from
+// the IntrinsicTOC (via GetIntrinsicColumn). This is the fallback path after SpanTree removal
+// (#434) for v1 files where identity is stored in IntrinsicTOC rather than block columns.
+// Returns (nil, false) when the column doesn't exist, the row isn't found, or the value
+// would be empty (span:parent_id absent for root spans).
+func (a *modulesSpanFieldsAdapter) intrinsicTOCField(name string) (any, bool) {
+	if a.reader == nil {
+		return nil, false
+	}
+	if name != modules_shared.TraceIDColumnName &&
+		name != modules_shared.SpanIDColumnName &&
+		name != modules_shared.SpanParentIDColumnName {
+		return nil, false
+	}
+	if a.blockIdx < 0 || a.blockIdx > int(^uint16(0)) || a.rowIdx < 0 || a.rowIdx > int(^uint16(0)) {
+		return nil, false
+	}
+	col, err := a.reader.GetIntrinsicColumn(name)
+	if err != nil || col == nil {
+		return nil, false
+	}
+	blockIdx := uint16(a.blockIdx) //nolint:gosec // bounded above
+	rowIdx := uint16(a.rowIdx)     //nolint:gosec // bounded above
+	for i, ref := range col.BlockRefs {
+		if ref.BlockIdx != blockIdx || ref.RowIdx != rowIdx {
+			continue
+		}
+		if i >= len(col.BytesValues) {
+			return nil, false
+		}
+		val := col.BytesValues[i]
+		// Root spans have a zero parent_id: treat as absent (same as SpanTree convention).
+		if name == modules_shared.SpanParentIDColumnName && isZeroBytes(val) {
+			return nil, false
+		}
+		if len(val) == 0 {
+			return nil, false
+		}
+		return val, true
+	}
+	return nil, false
+}
+
+// isZeroBytes reports whether b is all zero bytes.
+func isZeroBytes(b []byte) bool {
+	for _, v := range b {
+		if v != 0 {
+			return false
+		}
+	}
+	return true
 }

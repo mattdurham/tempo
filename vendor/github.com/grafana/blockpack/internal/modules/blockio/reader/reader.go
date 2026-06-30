@@ -3,59 +3,15 @@ package reader
 // NOTE: Any changes to this file must be reflected in the corresponding specs.md or NOTES.md.
 
 import (
-	"encoding/binary"
 	"fmt"
-	"log/slog"
 	"math"
 	"reflect"
-	"slices"
-	"sort"
 	"sync"
 
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
-	"github.com/grafana/blockpack/internal/modules/queryplanner"
 	"github.com/grafana/blockpack/internal/modules/rw"
 	"github.com/grafana/blockpack/internal/modules/sectioncache"
 )
-
-// footerRaw holds the raw footer fields while readFooter is executing.
-
-// compactTraceIndex holds the parsed compact trace index section.
-// NOTE-PERF-COMPACT: traceIndexRaw stores the raw trace-index bytes in-place (a sub-slice of the
-// cached compact-index buffer) rather than a pre-built map. scanTraceIndexRaw locates the entry
-// via a lazily-built sparse offset index (NOTE-260, binary search + bounded window scan)
-// on each lookup, eliminating O(traceCount) map + []uint16 allocations that were the #1 production
-// allocator (top alloc_objects site in production profiling). Allocation on hit is one small []uint16 per lookup — far cheaper
-// than materializing every trace's block list at parse time.
-//
-// NOTE-LAZY-TRACE-INDEX: For lean readers, traceIndexRaw is not populated at construction time.
-// Instead, traceIndexOffset/traceIndexLen record where the trace index bytes live in the file so
-// they can be fetched lazily — only when the bloom filter reports a hit. This keeps the eager read
-// at ~15 MB (bloom + block table) instead of ~700 MB (full compact section).
-//
-// NOTE-V14-TRACE-LAZY: For V14 lean readers, isV14TraceSection signals that traceIndexRaw must
-// be fetched by re-reading the full V14 SectionTraceIndex, splitting out the trace index bytes
-// via splitV14CompactSection, and caching them. Unlike V3/V4 (which record a direct file offset),
-// V14 stores the compact section as a single snappy-compressed blob, so a direct range read is
-// not available — the full blob must be fetched, split, and the trace index portion extracted.
-// ensureTraceIndexRaw uses isV14TraceSection to select the correct fetch path.
-
-// traceIndexFetchErr holds any error from the lazy fetch so callers can surface it.
-
-// raw trace-index bytes; scanned in-place by scanTraceIndexRaw
-
-// nil for version-1 compact indexes (no bloom); vacuous true on lookup
-
-// traceIndexOffset and traceIndexLen locate the trace-index bytes within the file.
-// Used by ensureTraceIndexRaw to lazily fetch them on first bloom hit.
-// Both are zero when traceIndexRaw is already populated (full compact read path).
-
-// isV14TraceSection signals that this compactTraceIndex was populated from a V14 file's
-// SectionTraceIndex compact blob (via parseCompactIndexBytesV14Header). When true,
-// ensureTraceIndexRaw re-reads the full V14 section and extracts the trace index bytes
-// via splitV14CompactSection, instead of using traceIndexOffset/traceIndexLen.
-
-// traceIndexOnce guards the lazy fetch of traceIndexRaw.
 
 // WantColumns specifies which columns to eagerly decode when parsing a block.
 // Use WantAll() to load every column, or WantOnly(cols) for query-driven selection.
@@ -97,48 +53,10 @@ type Reader struct {
 	// Assigned directly from Options.Cache; nil is normalized to NopSectionCache.
 	cache sectioncache.SectionCache
 
-	v8TraceErr    error
-	v8TSErr       error
-	v8BloomErr    error
-	v8ColStatsErr error
+	v8TSErr error
+	// NOTE: v8ColStatsErr removed (2026-06-29, in-file block pruning removal).
 
-	// compactParsedErr holds any error from compactParsedOnce initialization.
-	compactParsedErr error
-
-	traceIndex map[[16]byte][]uint16
-
-	// Range index — lazy.
-	rangeParsed   map[string]parsedRangeIndex
-	compactParsed *compactTraceIndex
-
-	// chunkedTrace is the parsed header+directory of a range-readable chunked trace index
-	// (ToCSubTypeTraceChunked, issue #340). Non-nil only for files written with the chunked
-	// section; takes precedence over compactParsed on the trace-by-id path. Parsed lazily in
-	// ensureV8TraceSection (guarded by v8TraceOnce).
-	chunkedTrace *chunkedTraceIndex
-
-	// spanTree is the parsed header+directory of the SpanTree structural index
-	// (ToCSubTypeSpanTree, issue #381). Non-nil only for files written with the section.
-	// Parsed lazily in ensureSpanTreeSection (guarded by spanTreeOnce).
-	spanTree    *spanTreeIndex
-	spanTreeErr error
-
-	// NOTE-476 (issue #394): block-scoped SpanTree identity reverse maps, keyed by blockIdx.
-	// Each value maps a block's RowIdx -> its SpanTreeRecord, providing O(1) identity
-	// (TraceID/SpanID/ParentID) lookup for result materialization and structural parent
-	// maps WITHOUT the trace:id/span:id/span:parent_id IntrinsicTOC columns. Built lazily
-	// on first request per block by scanning every SpanTree chunk once (records carry
-	// BlockIdx) and memoized for the Reader lifetime (fresh Reader per query per block —
-	// the foundational cache invariant — so this is intra-query only). Guarded by
-	// spanTreeIdentityMu (declared with the other sync primitives below).
-	spanTreeIdentityByBlock map[uint16]map[uint16]shared.SpanTreeRecord
-
-	// sketchIdx holds parsed column-major sketch data for the file.
-	// Nil for files written before the sketch section was introduced (old format).
-	sketchIdx *sketchIndex
-
-	// fileSummary is the lazily computed file-level sketch summary.
-	fileSummary *FileSketchSummary
+	// Range index removed in #439.
 
 	// intrinsicIndex holds the parsed TOC entries, keyed by column name.
 	// Populated by parseIntrinsicTOC during NewReaderFromProvider. Nil for
@@ -187,32 +105,15 @@ type Reader struct {
 	// path and read by the parser).
 	preCompressedColumns map[preDecodedKey][]byte
 
-	// fileBloomParsed is the lazily parsed FileBloom section. Access via FileBloom().
-	fileBloomParsed *FileBloom
-
 	// vectorIndexParsed is the lazily parsed VectorIndex. Access via VectorIndex().
 	vectorIndexParsed *VectorIndex
 
 	// tocMap is the decoded unified ToC (V8 format).
 	tocMap map[shared.ToCKey]shared.ToCEntry
 
-	// colStats is the lazily-parsed ToCSubTypeColStats section (NOTE-446, issue #364):
-	// block index → per-block per-column statistics. Nil when the file has no ColStats
-	// section (blocks written before the section was introduced).
-	colStats map[int]*shared.BlockColStats
-
-	// sectionDir holds the section directory; unused post-V8 but retained for readV14Section.
-	sectionDir shared.SectionDirectory
+	// NOTE: colStats map removed (2026-06-29, in-file block pruning removal).
 
 	fileID string
-
-	// intrinsicNames is the sorted slice of intrinsic column names, computed once
-	// (lazily on first IntrinsicColumnNames call) and reused. Callers only iterate.
-	intrinsicNames []string
-
-	// traceIndexRaw holds the raw bytes of the trace index section for lazy parsing.
-	// Populated during parseV5MetadataLazy; parsed into traceIndex on first access.
-	traceIndexRaw []byte
 
 	// tsRaw holds the raw 20-byte-per-entry TS index body (a zero-copy sub-slice of
 	// metadataBytes). tsCount is the number of entries. Entries are sorted by minTS
@@ -223,49 +124,22 @@ type Reader struct {
 	// Parsed during NewReaderFromProvider.
 	blockMetas []shared.BlockMeta
 
-	// fileBloomRaw holds the raw bytes of the FileBloom section, for caller caching.
-	// Nil for files written before the FileBloom section was introduced.
-	fileBloomRaw []byte
-
 	tsCount int
 
 	fileSize int64
 
 	vectorIndexOffset uint64
 
-	// V8 footer fields (FooterV8Version = 8, unified ToC files only).
+	// Unified-ToC footer fields (FooterV9, the only supported footer).
 	// v8ToCOffset and v8ToCLen point to the snappy-compressed unified ToC blob.
 	v8ToCOffset uint64
 
-	intrinsicMu sync.RWMutex
-
-	// spanTreeIdentityMu guards lazy construction of spanTreeIdentityByBlock (NOTE-476).
-	spanTreeIdentityMu sync.Mutex
-
 	// V8 lazy section errors and sync.Once guards (mirror of v14 ones).
-	v8TraceOnce    sync.Once
-	spanTreeOnce   sync.Once
-	v8TSOnce       sync.Once
-	v8BloomOnce    sync.Once
-	v8ColStatsOnce sync.Once
-
-	fileBloomOnce sync.Once
-
-	fileSummaryOnce sync.Once
+	v8TSOnce sync.Once
+	// NOTE: v8ColStatsOnce removed (2026-06-29, in-file block pruning removal).
 
 	// vectorIndexOnce guards lazy parsing of the vector index section.
 	vectorIndexOnce sync.Once
-
-	// traceIndexOnce guards initialization of r.traceIndex from r.traceIndexRaw.
-	// SPEC-ROOT-001: prevents concurrent map write (r.traceIndex) from causing a fatal panic.
-	traceIndexOnce sync.Once
-
-	// compactParsedOnce guards initialization of r.compactParsed for non-V14 compact index files.
-	// SPEC-ROOT-001: prevents concurrent assignment to r.compactParsed.
-	compactParsedOnce sync.Once
-
-	// sketchIdxMu guards concurrent V8 per-column sketch fetches.
-	sketchIdxMu sync.Mutex
 
 	// preDecodedMu guards preDecodedColumns. ReadGroupColumnar (which populates it) runs
 	// concurrently across blockGroupPipeline workers on the same *Reader, while the parse
@@ -273,20 +147,15 @@ type Reader struct {
 	// can race the parse of group N. NOTE-212.
 	preDecodedMu sync.Mutex
 
-	// compactOffset/Len and compactTracesOffset/Len: legacy fields, always 0 for V8.
-	// Retained because trace_index.go's initCompactIndex reads compactTracesLen for V6 compat.
-	compactOffset       uint64
-	compactTracesOffset uint64
-	compactLen          uint32
-	compactTracesLen    uint32
-	intrinsicIndexLen   uint32
-
 	// vectorIndexLen is parsed from the agentic v5 footer.
 	vectorIndexLen uint32
 
 	v8ToCLen uint32
 
 	fileVersion uint8
+
+	// footerVersion is the parsed file-level footer version (always FooterV9Version).
+	footerVersion uint16
 
 	// signalType is set from the V8 ToC signal_type byte.
 	// Defaults to shared.SignalTypeTrace (0x01) when the field is absent.
@@ -385,50 +254,9 @@ func NewLeanReaderFromProviderWithOptions(provider rw.ReaderProvider, opts Optio
 // BlockCount returns the number of blocks in the file.
 func (r *Reader) BlockCount() int { return len(r.blockMetas) }
 
-// TraceCount returns the number of unique traces in the file.
-// Uses the trace index (full or compact) to determine the count.
-// Returns 0 if no trace index is available.
-func (r *Reader) TraceCount() int {
-	_ = r.ensureV14TraceSection()
-	if r.chunkedTrace != nil {
-		return int(r.chunkedTrace.traceCount)
-	}
-	r.ensureTraceIndex()
-	if len(r.traceIndex) > 0 {
-		return len(r.traceIndex)
-	}
-	// NOTE-349: the V8 legacy trace-index body is now loaded lazily (phase 2), so it
-	// must be fetched before reading the trace count out of its header. TraceCount is a
-	// stats/compaction call (not on the hot query path), so the one-off body fetch here
-	// is acceptable; bloom-reject query lookups still never trigger it.
-	if r.compactParsed != nil && r.compactParsed.traceIndexRaw == nil {
-		_ = r.ensureTraceIndexRaw()
-	}
-	if r.compactParsed != nil && len(r.compactParsed.traceIndexRaw) >= 5 {
-		fmtVer := r.compactParsed.traceIndexRaw[0]
-		if fmtVer == shared.TraceIndexFmtVersion || fmtVer == shared.TraceIndexFmtVersion2 {
-			// Trace count is encoded at bytes [1:5] of the raw trace-index section.
-			return int(binary.LittleEndian.Uint32(r.compactParsed.traceIndexRaw[1:]))
-		}
-	}
-	return 0
-}
-
-// ensureTraceIndex parses the trace block index from raw bytes if not yet parsed.
-// No-op if already parsed or no raw bytes are available.
-// SPEC-ROOT-001: guarded by traceIndexOnce to prevent concurrent map write panics.
-func (r *Reader) ensureTraceIndex() {
-	r.traceIndexOnce.Do(func() {
-		if len(r.traceIndexRaw) == 0 {
-			return
-		}
-		idx, _, err := parseTraceBlockIndex(r.traceIndexRaw)
-		if err == nil {
-			r.traceIndex = idx
-		}
-		r.traceIndexRaw = nil // free raw bytes after parsing
-	})
-}
+// TraceCount returns 0. The TraceID/DFS index was removed in #438.
+// Trace counts are no longer maintained in data files; use the value-index instead.
+func (r *Reader) TraceCount() int { return 0 }
 
 // SignalType returns the signal type stored in the file header.
 // Returns shared.SignalTypeTrace for files written with version < 12 (trace-only era).
@@ -444,216 +272,6 @@ func (r *Reader) BlockMeta(blockIdx int) shared.BlockMeta {
 	return r.blockMetas[blockIdx]
 }
 
-// ColumnSketch returns the column-major sketch data for the named column, or nil if
-// no sketch section was written or the column was not sketched.
-// Implements queryplanner.BlockIndexer.
-func (r *Reader) ColumnSketch(col string) queryplanner.ColumnSketch {
-	// Check in-memory cache first.
-	r.sketchIdxMu.Lock()
-	if r.sketchIdx != nil {
-		if cd := r.sketchIdx.columns[col]; cd != nil {
-			r.sketchIdxMu.Unlock()
-			return cd
-		}
-	}
-	r.sketchIdxMu.Unlock()
-
-	// Fetch per-column blob from ToC.
-	data, err := r.fetchToCSection(shared.ToCKey{
-		Type:    shared.ToCTypeMetadata,
-		SubType: shared.ToCSubTypeSketch,
-		Name:    col,
-	})
-	if err != nil || data == nil {
-		return nil
-	}
-	cd, parseErr := parseOneColumnSketchBlob(data)
-	if parseErr != nil || cd == nil {
-		return nil
-	}
-	// Store in sketch cache.
-	r.sketchIdxMu.Lock()
-	if r.sketchIdx == nil {
-		r.sketchIdx = &sketchIndex{
-			numBlocks: r.BlockCount(),
-			columns:   make(map[string]*columnSketchData),
-		}
-	}
-	if r.sketchIdx.columns[col] == nil {
-		r.sketchIdx.columns[col] = cd
-	}
-	r.sketchIdxMu.Unlock()
-	return cd
-}
-
-// EvictSketch removes this file's parsed sketch section from the process-global sketch cache.
-// Called by the query planner when fuse pruning eliminates all blocks in this file, so the
-// sketch data (which may be tens of MB) is not retained for a file we will never read.
-func (r *Reader) EvictSketch() {
-	if r.fileID != "" {
-		parsedSketchCache.Delete(r.fileID + "/sketch")
-	}
-	r.sketchIdx = nil
-}
-
-// BlocksForRange returns the sorted block indices that may contain the given query value
-// for the named column. queryValue must be encoded in the same wire format as the stored
-// boundary keys (SPECS §5.2.1): 8-byte LE for numeric types, raw string for string/bytes.
-//
-// A range lookup is performed: the entry with the largest lower boundary ≤ queryValue is
-// returned. Returns nil (no error) when queryValue is below all stored lower boundaries.
-func (r *Reader) BlocksForRange(colName string, queryValue shared.RangeValueKey) ([]int, error) {
-	if err := r.ensureRangeColumnParsed(colName); err != nil {
-		return nil, err
-	}
-
-	idx := r.rangeParsed[colName]
-	entries := idx.entries
-
-	if len(entries) == 0 {
-		return nil, nil
-	}
-
-	// Binary search: find the last entry whose lower bound ≤ queryValue.
-	// sort.Search returns the first index where the condition is FALSE,
-	// so we search for the first entry where lower > queryValue, then step back.
-	hi := sort.Search(len(entries), func(i int) bool {
-		return compareRangeKey(idx.colType, entries[i].lower, queryValue) > 0
-	})
-
-	found := hi - 1
-	if found < 0 {
-		return nil, nil // queryValue is below all lower boundaries
-	}
-
-	blockIDs := entries[found].blockIDs
-	result := make([]int, len(blockIDs))
-	for i, id := range blockIDs {
-		result[i] = int(id)
-	}
-
-	return result, nil
-}
-
-// BlocksForRangeInterval returns block indices from all buckets whose range overlaps
-// [minKey, maxKey]. The implementation finds the bucket containing minKey (largest
-// lower boundary ≤ minKey) and the last bucket whose lower boundary ≤ maxKey, then
-// unions all block IDs in between. This correctly includes the bucket containing
-// minKey even when its lower boundary is < minKey.
-// NOTE-011 (executor/NOTES.md): used for case-insensitive regex prefix lookups (range-index pruning).
-func (r *Reader) BlocksForRangeInterval(
-	colName string, minKey, maxKey shared.RangeValueKey,
-) ([]int, error) {
-	if err := r.ensureRangeColumnParsed(colName); err != nil {
-		return nil, err
-	}
-
-	idx := r.rangeParsed[colName]
-	entries := idx.entries
-
-	if len(entries) == 0 {
-		return nil, nil
-	}
-
-	// Find the bucket that contains minKey: last entry whose lower ≤ minKey.
-	// max(lo, 0): when lo is -1 (minKey below all boundaries), start from bucket 0.
-	lo := max(sort.Search(len(entries), func(i int) bool {
-		return compareRangeKey(idx.colType, entries[i].lower, minKey) > 0
-	})-1, 0)
-
-	// Find the last bucket whose lower ≤ maxKey.
-	hi := sort.Search(len(entries), func(i int) bool {
-		return compareRangeKey(idx.colType, entries[i].lower, maxKey) > 0
-	}) - 1
-	if hi < 0 {
-		return nil, nil // maxKey is below all lower boundaries — no overlap.
-	}
-
-	// Union block IDs from all buckets in [lo, hi].
-	seen := make(map[int]struct{})
-	for i := lo; i <= hi; i++ {
-		for _, id := range entries[i].blockIDs {
-			seen[int(id)] = struct{}{}
-		}
-	}
-
-	result := make([]int, 0, len(seen))
-	for id := range seen {
-		result = append(result, id)
-	}
-	slices.Sort(result)
-
-	return result, nil
-}
-
-// ColumnNames returns all column names known to this reader — the union of
-// range-indexed columns (rangeOffsets) and sketch columns (sketchIdx).
-func (r *Reader) ColumnNames() []string {
-	seen := make(map[string]struct{})
-	for key := range r.tocMap {
-		if key.Type == shared.ToCTypeMetadata &&
-			(key.SubType == shared.ToCSubTypeRange || key.SubType == shared.ToCSubTypeSketch) &&
-			key.Name != "" {
-			seen[key.Name] = struct{}{}
-		}
-	}
-	out := make([]string, 0, len(seen))
-	for col := range seen {
-		out = append(out, col)
-	}
-	slices.Sort(out)
-	return out
-}
-
-// RangeColumnType returns the ColumnType for a range-indexed column, if it exists.
-func (r *Reader) RangeColumnType(colName string) (shared.ColumnType, bool) {
-	if err := r.ensureRangeColumnParsed(colName); err != nil {
-		return 0, false
-	}
-	if idx, ok := r.rangeParsed[colName]; ok {
-		return idx.colType, true
-	}
-	return 0, false
-}
-
-// RangeBoundaries exposes the file-level value range for a range-indexed column.
-// BucketMin and BucketMax are the global min/max across all blocks (stored in
-// the wire format bucket metadata). For RangeFloat64, Float64Bounds holds the
-// typed boundary values. For RangeString, StringBounds holds them. For
-// RangeBytes, BytesBounds holds them. For numeric types (Int64/Uint64/Duration),
-// BucketMin/BucketMax are sufficient for file-level fast reject.
-
-// RangeColumnBoundaries returns the parsed boundaries for a range-indexed column.
-// Returns nil if the column is not range-indexed or an error occurs during parsing.
-// The result may be used for file-level fast reject: if a query value falls entirely
-// outside [BucketMin, BucketMax], no spans in the file can match.
-func (r *Reader) RangeColumnBoundaries(colName string) *RangeBoundaries {
-	if err := r.ensureRangeColumnParsed(colName); err != nil {
-		return nil
-	}
-	idx, ok := r.rangeParsed[colName]
-	if !ok {
-		return nil
-	}
-	rb := &RangeBoundaries{
-		ColType:      idx.colType,
-		BucketMin:    idx.bucketMin,
-		BucketMax:    idx.bucketMax,
-		StringBounds: idx.stringBounds,
-		BytesBounds:  idx.bytesBounds,
-	}
-	// NOTE-PERF-RANGE: decode float64 bounds on demand from raw bytes rather than
-	// storing a pre-decoded []float64 in parsedRangeIndex.
-	if len(idx.float64BoundsRaw) > 0 {
-		count := len(idx.float64BoundsRaw) / 8
-		rb.Float64Bounds = make([]float64, count)
-		for i := range count {
-			rb.Float64Bounds[i] = math.Float64frombits(binary.LittleEndian.Uint64(idx.float64BoundsRaw[i*8:]))
-		}
-	}
-	return rb
-}
-
 // ReadBlockRaw reads the raw bytes for the block at blockIdx from the provider.
 func (r *Reader) ReadBlockRaw(blockIdx int) ([]byte, error) {
 	if blockIdx < 0 || blockIdx >= len(r.blockMetas) {
@@ -661,6 +279,22 @@ func (r *Reader) ReadBlockRaw(blockIdx int) ([]byte, error) {
 	}
 	meta := r.blockMetas[blockIdx]
 	return r.readRange(meta.Offset, meta.Length, rw.DataTypeBlock)
+}
+
+// ReadBlockByRef fetches a v2 block directly by its page-addressed BlockRef, without
+// consulting the block index or TOC. This is the one-round-trip path for value-index
+// query results from v2 files (NOTE-VI-027, issue #417 PR6).
+// The returned bytes include the full block payload (including any alignment padding);
+// callers should pass the unpadded Length from BlockMeta or the entry BlockRef when
+// parsing the block.
+func (r *Reader) ReadBlockByRef(pageNum uint32, lenPages uint16) ([]byte, error) {
+	const pageSize = 4096
+	offset := uint64(pageNum) * pageSize
+	length := uint64(lenPages) * pageSize
+	if length == 0 {
+		return nil, fmt.Errorf("ReadBlockByRef: lenPages must be > 0")
+	}
+	return r.readRange(offset, length, rw.DataTypeBlock)
 }
 
 // ReadBlocks reads raw bytes for the given block indices using aggressive coalescing.
@@ -827,145 +461,45 @@ func (r *Reader) preCompressedLookup() func(preDecodedKey) []byte {
 	}
 }
 
-// HasTraceIndex reports whether the reader has a populated trace block index.
-func (r *Reader) HasTraceIndex() bool {
-	r.ensureTraceIndex()
-	return len(r.traceIndex) > 0
-}
+// HasTraceIndex always returns false. The TraceID/DFS index was removed in #438.
+func (r *Reader) HasTraceIndex() bool { return false }
+
+// BlocksForTraceID always returns nil. The TraceID/DFS index was removed in #438.
+// Callers should use the value-index pipeline for trace lookups.
+func (r *Reader) BlocksForTraceID(_ [16]byte) []int { return nil }
+
+// BlocksForTraceIDCompact always returns nil. The compact trace index was removed in #438.
+func (r *Reader) BlocksForTraceIDCompact(_ [16]byte) []int { return nil }
 
 // TraceEntry is a single trace-block reference.
 
-// TraceEntries returns the block IDs containing spans for the given trace ID.
-// Falls back to the compact trace index when the main index is empty (lean reader path).
-func (r *Reader) TraceEntries(traceID [16]byte) []TraceEntry {
-	_ = r.ensureV14TraceSection()
-	// Issue #340: chunked trace index — range-read only the candidate chunk.
-	if r.chunkedTrace != nil {
-		blockIDs, err := r.chunkedLookup(r.chunkedTrace, traceID)
-		if err != nil || len(blockIDs) == 0 {
-			return nil
-		}
-		result := make([]TraceEntry, len(blockIDs))
-		for i, bid := range blockIDs {
-			result[i] = TraceEntry{BlockID: int(bid)}
-		}
-		return result
-	}
-	r.ensureTraceIndex()
-	blockIDs, ok := r.traceIndex[traceID]
-	if !ok && r.compactParsed != nil {
-		// Ensure trace index bytes are loaded (lazy for lean readers; no-op for full readers).
-		_ = r.ensureTraceIndexRaw()
-		blockIDs = r.compactParsed.scanTraceIndexRaw(r.fileID, traceID)
-		ok = blockIDs != nil
-	}
-	if !ok {
-		return nil
-	}
-	result := make([]TraceEntry, len(blockIDs))
-	for i, bid := range blockIDs {
-		result[i] = TraceEntry{BlockID: int(bid)}
-	}
-	return result
-}
+// TraceEntries always returns nil. The TraceID/DFS index was removed in #438.
+// Callers (GetTraceByID, structural expansion) fall back to all-blocks scan.
+func (r *Reader) TraceEntries(_ [16]byte) []TraceEntry { return nil }
 
 // ResetInternStrings is a no-op retained for API compatibility with existing scan loops.
 // ParseBlockFromBytes and AddColumnsToBlock now allocate their own fresh intern map per
 // call, so there is no shared state to reset between blocks.
 func (r *Reader) ResetInternStrings() {}
 
-// FileBloom returns the parsed file-level bloom filter for resource.service.name.
-// Returns nil for files written before the FileBloom section was introduced.
-// The returned *FileBloom is safe for concurrent use after the first call.
-func (r *Reader) FileBloom() *FileBloom {
-	// For V14 files, load the bloom section lazily on first call.
-	_ = r.ensureV14BloomSection()
-	r.fileBloomOnce.Do(func() {
-		if r.fileBloomRaw != nil && r.fileBloomParsed == nil {
-			fb, _, err := parseFileBloomSection(r.fileBloomRaw)
-			if err == nil {
-				r.fileBloomParsed = fb
-			}
-		}
-	})
-	return r.fileBloomParsed
-}
+// FileBloom always returns nil. File-level bloom filters were removed in #437.
+func (r *Reader) FileBloom() *FileBloom { return nil }
 
-// FileBloomRaw returns a clone of the raw bytes of the FileBloom section.
-// Callers may cache this slice (keyed by file path + size) and reconstruct
-// a FileBloom via ParseFileBloom without reopening the file.
-// Returns nil for files without a FileBloom section (old format).
-func (r *Reader) FileBloomRaw() []byte {
-	_ = r.ensureV14BloomSection()
-	if r.fileBloomRaw == nil {
-		return nil
-	}
-	return slices.Clone(r.fileBloomRaw)
-}
+// FileBloomRaw always returns nil. File-level bloom filters were removed in #437.
+func (r *Reader) FileBloomRaw() []byte { return nil }
 
-// FileSketchSummaryRaw returns the serialized FileSketchSummary as bytes.
-// Callers may cache this slice (keyed by file path + size) and reconstruct
-// a FileSketchSummary via UnmarshalFileSketchSummary without reopening the file.
-// Returns nil for files without a sketch section (old format).
-// Returns nil if serialization fails (should not happen in practice).
-func (r *Reader) FileSketchSummaryRaw() []byte {
-	s := r.FileSketchSummary()
-	if s == nil {
-		return nil
-	}
-	b, err := MarshalFileSketchSummary(s)
-	if err != nil {
-		// SPEC-ROOT-010: unexpected marshal failure — log for diagnostics.
-		slog.Warn("FileSketchSummaryRaw: marshal failed", "err", err)
-		return nil
-	}
-	return b
-}
+// FileSketchSummaryRaw always returns nil. The KLL sketch index was removed in #435.
+func (r *Reader) FileSketchSummaryRaw() []byte { return nil }
 
-// TraceBloomRaw returns a clone of the raw bytes of the compact trace ID bloom filter.
-// Callers may cache this slice and use shared.TestTraceIDBloom for trace:id
-// file-level rejection without reopening the file.
-// Returns nil for files without a compact trace index bloom.
-func (r *Reader) TraceBloomRaw() []byte {
-	_ = r.ensureV14TraceSection()
-	if r.chunkedTrace != nil {
-		return slices.Clone(r.chunkedTraceBloom(r.chunkedTrace))
-	}
-	if r.compactLen > 0 {
-		_ = r.ensureCompactIndexParsed()
-	}
-	if r.compactParsed == nil {
-		return nil
-	}
-	return slices.Clone(r.compactParsed.traceIDBloom)
-}
+// TraceBloomRaw returns nil. The compact trace bloom was removed with the TraceID index (#438).
+func (r *Reader) TraceBloomRaw() []byte { return nil }
 
-// MayContainTraceID returns false only when the compact trace bloom guarantees
-// the trace ID is absent from this file. Returns true (conservative) when no
-// compact trace index or bloom is present.
-func (r *Reader) MayContainTraceID(traceID [16]byte) bool {
-	_ = r.ensureV14TraceSection()
-	if r.chunkedTrace != nil {
-		bloom := r.chunkedTraceBloom(r.chunkedTrace)
-		if bloom == nil {
-			return true
-		}
-		return shared.TestTraceIDBloom(bloom, traceID)
-	}
-	if r.compactLen > 0 {
-		_ = r.ensureCompactIndexParsed()
-	}
-	if r.compactParsed == nil {
-		return true
-	}
-	return shared.TestTraceIDBloom(r.compactParsed.traceIDBloom, traceID)
-}
+// MayContainTraceID returns true (conservative). The compact trace bloom was removed
+// with the TraceID index (#438). Callers must use the value-index for trace:id filtering.
+func (r *Reader) MayContainTraceID(_ [16]byte) bool { return true }
 
-// FooterVersion returns the footer version. Always returns FooterV8Version;
-// legacy formats (V3–V6) were removed 2026-06-12.
-func (r *Reader) FooterVersion() uint16 {
-	return shared.FooterV8Version
-}
+// NOTE: FooterVersion() and IsV2Format() removed (2026-06-29, v2 lean format unconditional).
+// All files are FooterV9 (v2 lean format); there is no longer a version to branch on.
 
 // VectorIndexRaw reads the raw vector index section bytes (for caller caching).
 // Returns nil for V3/V4 footer files or files with no vector index section.

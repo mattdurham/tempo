@@ -190,7 +190,9 @@ func getCache() blockpack.SectionCache {
 				// go to dataRemote (memcached-blockpack-page-01) so page evictions don't displace metadata.
 				metaChain := blockpack.NewChainedCache(nonNil(mem, metaRemote)...)
 				pageChain := blockpack.NewChainedCache(nonNil(disk, dataRemote)...)
-				cfg2 := blockpack.TwoTierTypedConfig(metaChain, pageChain); cfg2.Registerer = prometheus.DefaultRegisterer; blockpackCache = blockpack.NewTypedTieredCache(cfg2)
+				cfg2 := blockpack.TwoTierTypedConfig(metaChain, pageChain)
+				cfg2.Registerer = prometheus.DefaultRegisterer
+				blockpackCache = blockpack.NewTypedTieredCache(cfg2)
 				return
 			}
 		}
@@ -210,7 +212,9 @@ func getCache() blockpack.SectionCache {
 		hot := blockpack.NewChainedCache(nonNil(mem, remote)...)
 		warm := blockpack.NewChainedCache(nonNil(disk, remote)...)
 		if hot != nil || warm != nil {
-			cfg2 := blockpack.DefaultTypedConfig(hot, warm); cfg2.Registerer = prometheus.DefaultRegisterer; blockpackCache = blockpack.NewTypedTieredCache(cfg2)
+			cfg2 := blockpack.DefaultTypedConfig(hot, warm)
+			cfg2.Registerer = prometheus.DefaultRegisterer
+			blockpackCache = blockpack.NewTypedTieredCache(cfg2)
 		}
 	})
 	return blockpackCache
@@ -285,11 +289,25 @@ func (b *blockpackBlock) QueryRange(ctx context.Context, req *tempopb.QueryRange
 		return nil, fmt.Errorf("blockpack QueryRange: new reader: %w", err)
 	}
 
-	result, err := blockpack.ExecuteMetricsTraceQL(ctx, r, req.Query, blockpack.TraceMetricOptions{
+	opts := blockpack.TraceMetricOptions{
 		StartNano: int64(req.Start),
 		EndNano:   int64(req.End),
 		StepNano:  int64(req.Step),
-	})
+	}
+	// Index-driven metrics path (blockpack issue #461): when configured, build a
+	// value-index source for the metrics query so ExecuteMetricsTraceQL can answer
+	// count_over_time()/rate() from the index without a block scan. On no coverage
+	// or any error the source is left nil and ExecuteMetricsTraceQL falls back to
+	// the full-scan metrics path internally — strictly an optimisation.
+	if vr := getValueIndexQueryReader(); vr != nil {
+		minSec, maxSec := nanoWindowToSec(req.Start, req.End)
+		cache := vr.cacheFor(b.meta.TenantID)
+		if src, ok, berr := blockpack.BuildValueIndexSourceForMetrics(ctx, cache, vr.store, req.Query, minSec, maxSec); berr == nil && ok {
+			opts.ValueIndex = src
+		}
+	}
+
+	result, err := blockpack.ExecuteMetricsTraceQL(ctx, r, req.Query, opts)
 	if err != nil {
 		return nil, fmt.Errorf("blockpack QueryRange: %w", err)
 	}
@@ -430,11 +448,22 @@ func (b *blockpackBlock) SearchTags(_ context.Context, scope traceql.AttributeSc
 		return fmt.Errorf("SearchTags: open reader: %w", err)
 	}
 
+	// ColumnNames() returns nil in the lean v2 format (range index removed #439).
+	// Enumerate column names by parsing one block from the file instead.
 	seen := make(map[string]struct{})
-	for _, col := range blockpack.ColumnNames(r) {
-		tag := columnNameToTag(col, scope)
-		if tag != "" {
-			seen[tag] = struct{}{}
+	if r.BlockCount() > 0 {
+		rawMap, readErr := r.ReadBlocks([]int{0})
+		if readErr == nil {
+			if raw, ok := rawMap[0]; ok {
+				if bwb, perr := r.ParseBlockFromBytes(raw, blockpack.WantAll(), r.BlockMeta(0)); perr == nil {
+					for key := range bwb.Block.Columns() {
+						tag := columnNameToTag(key.Name, scope)
+						if tag != "" {
+							seen[tag] = struct{}{}
+						}
+					}
+				}
+			}
 		}
 	}
 	for tag := range seen {
@@ -648,11 +677,27 @@ func (b *blockpackBlock) Fetch(ctx context.Context, req traceql.FetchSpansReques
 	var fetchErr error
 	var matches []blockpack.SpanMatch
 	var qs blockpack.QueryStats
-	// Use the pre-compiled program when available (NOTE-049: compile-once for regex DFA reuse).
-	// Fall back to the string-based path when compilation failed (structural/pipeline queries).
+	indexAnswered := false
+	// Index-driven path (blockpack issue #461): when the querier has a value-index
+	// reader configured and the query compiled to a filter program, try to answer
+	// it from the value index (discover + download + per-leaf predicate, then
+	// block-pruned fetch). On no coverage / unsupported predicate / error we fall
+	// through to the full-scan paths below — the index path is a strict
+	// optimisation, never the only source of truth.
 	if compiledProgram != nil {
+		if im, ok := b.tryIndexFetch(ctx, r, compiledProgram, query, queryOpts); ok {
+			matches = im
+			indexAnswered = true
+		}
+	}
+	switch {
+	case indexAnswered:
+		// already populated from the index path
+	case compiledProgram != nil:
+		// Use the pre-compiled program when available (NOTE-049: compile-once for regex DFA reuse).
 		matches, qs, fetchErr = blockpack.QueryTraceQLWithProgram(ctx, r, compiledProgram, queryOpts)
-	} else {
+	default:
+		// Fall back to the string-based path when compilation failed (structural/pipeline queries).
 		matches, qs, fetchErr = blockpack.QueryTraceQL(ctx, r, query, queryOpts)
 	}
 	if len(qs.Steps) > 0 {

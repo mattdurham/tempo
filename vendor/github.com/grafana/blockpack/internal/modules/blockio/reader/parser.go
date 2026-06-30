@@ -14,18 +14,6 @@ import (
 	"github.com/grafana/blockpack/internal/modules/rw"
 )
 
-// parsedSketchCache caches fully parsed sketchIndex objects by fileID+"/sketch".
-// Strong references: entries persist until Clear is called.
-// SPEC-OC-003, NOTE-003 (reader NOTES.md)
-var parsedSketchCache objectcache.Cache[sketchIndex]
-
-// parsedSketchSummaryCache caches the fully built FileSketchSummary by fileID+"/sketch-summary".
-// FileSketchSummary is expensive to build (TopK aggregation across all blocks) and
-// was previously rebuilt on every query because it was only cached per-Reader (short-lived).
-// Strong references: entries persist until Clear is called.
-// SPEC-OC-003, NOTE-003 (reader NOTES.md)
-var parsedSketchSummaryCache objectcache.Cache[FileSketchSummary]
-
 // parsedIntrinsicCache caches fully decoded IntrinsicColumn objects by
 // fileID+"/intrinsic/"+colName. Strong references: entries persist until Clear is called.
 // SPEC-OC-003, NOTE-003 (reader NOTES.md)
@@ -118,7 +106,6 @@ type traceSparseIndex struct {
 	// build walk so the warm-path binary search probes this cache-resident slice instead
 	// of chasing random offsets into the cold, per-query-fetched traceIndexRaw section.
 	sampleIDs []uint64
-	ok        bool
 }
 
 // SizeBytes estimates the in-memory size of the sparse index for objectcache LRU budgeting.
@@ -215,8 +202,6 @@ func SetIntrinsicCacheBytes(n int64) {
 
 // ClearCaches resets all process-level caches. Intended for testing.
 func ClearCaches() {
-	parsedSketchCache.Clear()
-	parsedSketchSummaryCache.Clear()
 	parsedIntrinsicCache.Clear()
 
 	parsedV8ColumnCache.Clear()
@@ -276,10 +261,14 @@ func (r *Reader) tryReadFooterMagic18() (bool, error) {
 		return false, nil
 	}
 	ver := binary.LittleEndian.Uint16(buf[footerV7OffVersion:])
-	if ver != shared.FooterV8Version {
-		return false, fmt.Errorf("readFooter: unsupported footer version %d", ver)
+	// V2 lean format unconditional: only FooterV9 is supported (2026-06-29).
+	if ver != shared.FooterV9Version {
+		return false, fmt.Errorf(
+			"readFooter: unsupported footer version %d (FooterV8 no longer supported; rewrite file)",
+			ver,
+		)
 	}
-	// footerVersion removed 2026-06-12: always V8
+	r.footerVersion = ver
 	r.v8ToCOffset = binary.LittleEndian.Uint64(buf[footerV7OffDirOff:])
 	r.v8ToCLen = binary.LittleEndian.Uint32(buf[footerV7OffDirLen:])
 	return true, nil
@@ -371,26 +360,6 @@ func decodeBoundedSnappy(compressed []byte) ([]byte, error) {
 	return snappy.Decode(shared.MakeNoZeroBytes(decodedLen), compressed)
 }
 
-// readV14Section reads and snappy-decodes one type-keyed section from the section directory.
-// Returns (nil, nil) if the section is not present in the directory.
-// Decompressed bytes are cached via r.cache (key: fileID+"/v14/sec/<hex>/dec") so repeated
-// reader creation for the same file avoids re-reading and re-decompressing the section.
-func (r *Reader) readV14Section(sectionType uint8) ([]byte, error) {
-	e, ok := r.sectionDir.TypeEntries[sectionType]
-	if !ok {
-		return nil, nil
-	}
-	raw, err := r.cache.GetOrFetchV14Section(r.fileID, sectionType, func() ([]byte, error) {
-		// NOTE-366: read into pooled scratch, decode, recycle the compressed buffer.
-		dec, decErr := r.readRangeDecodeSnappy(e.Offset, uint64(e.CompressedLen), rw.DataTypeMetadata) //nolint:gosec
-		if decErr != nil {
-			return nil, fmt.Errorf("section 0x%02X read/snappy: %w", sectionType, decErr)
-		}
-		return dec, nil
-	})
-	return raw, err
-}
-
 // parseV8ToCBlob reads, decompresses, and parses the V8 unified ToC blob.
 // Returns a map of ToCKey → ToCEntry and the file's signal type.
 func (r *Reader) parseV8ToCBlob() (map[shared.ToCKey]shared.ToCEntry, uint8, error) {
@@ -473,6 +442,10 @@ func (r *Reader) parseSectionsV8() error {
 		if parseErr != nil {
 			return fmt.Errorf("parseSectionsV8: block_index parse: %w", parseErr)
 		}
+		// V2 lean format unconditional: derive PageNum from byte offset (always page-aligned).
+		for i := range metas {
+			metas[i].PageNum = uint32(metas[i].Offset / 4096) //nolint:gosec // offset fits uint32
+		}
 		r.blockMetas = metas
 	}
 
@@ -491,71 +464,6 @@ func (r *Reader) parseSectionsV8() error {
 	}
 
 	return nil
-}
-
-// ensureV8TraceSection lazily loads the V8 compact trace index on first call.
-func (r *Reader) ensureV8TraceSection() error {
-	r.v8TraceOnce.Do(func() {
-		// Issue #340: prefer the range-readable chunked trace index when present. Only the
-		// fixed header + directory are read here (range reads); chunk bodies are fetched
-		// lazily per lookup. Falls back to the legacy compact section below when absent.
-		if entry, ok := r.tocMap[shared.ToCKey{Type: shared.ToCTypeMetadata, SubType: shared.ToCSubTypeTraceChunked}]; ok {
-			ci, perr := r.parseChunkedTraceIndex(entry)
-			if perr != nil {
-				r.v8TraceErr = fmt.Errorf("ensureV8TraceSection: chunked: %w", perr)
-				return
-			}
-			r.chunkedTrace = ci
-			return
-		}
-		// NOTE-349: TRUE two-phase loading for the legacy V8 snappy trace section.
-		// Phase 1 here parses ONLY the header (bloom filter + block table) and records
-		// the compressed section's file location; it does NOT retain the decompressed
-		// trace-index bytes. Phase 2 (ensureTraceIndexRaw) re-reads + re-splits the
-		// section lazily on a bloom HIT — the vast majority of trace lookups reject at
-		// the bloom and never need the tens-of-MB trace-index body.
-		//
-		// Before NOTE-349 this method eagerly aliased the trace-index sub-slice into
-		// r.compactParsed.traceIndexRaw (NOTE-257), pinning the entire decompressed
-		// section in every live Reader. Under concurrent trace-lookup load that was the
-		// single largest retained object on the querier heap (~1.9 GB in the inuse_space
-		// profile, frame fetchToCSection<-ensureV8TraceSection). Deferring the body fetch
-		// removes that retention; the bloom + block table (the only fields phase-1
-		// callers — MayContainTraceID, BlocksForTraceID bloom-reject, TraceCount — need)
-		// are deep-copied out of the transient blob by parseCompactIndexBytesV14Header.
-		entry, ok := r.tocMap[shared.ToCKey{Type: shared.ToCTypeMetadata, SubType: shared.ToCSubTypeTrace}]
-		if !ok {
-			return
-		}
-		// NOTE-366: read into pooled scratch, decode, recycle the compressed buffer.
-		raw, decErr := r.readRangeDecodeSnappy(entry.Offset, uint64(entry.Length), rw.DataTypeMetadata) //nolint:gosec
-		if decErr != nil {
-			r.v8TraceErr = fmt.Errorf("ensureV8TraceSection: read/snappy: %w", decErr)
-			return
-		}
-		if len(raw) == 0 {
-			return
-		}
-		header, _, splitErr := splitV14CompactSection(raw)
-		if splitErr != nil {
-			r.v8TraceErr = fmt.Errorf("ensureV8TraceSection: split: %w", splitErr)
-			return
-		}
-		if parseErr := r.parseCompactIndexBytesV14Header(header); parseErr != nil {
-			r.v8TraceErr = fmt.Errorf("ensureV8TraceSection: parse: %w", parseErr)
-			return
-		}
-		// Record the section location so ensureTraceIndexRaw can re-fetch the body
-		// on a bloom hit. The transient `raw` blob is now unreferenced and becomes
-		// collectable as soon as this closure returns; the compressed source was read
-		// into pooled scratch and already recycled by readRangeDecodeSnappy (NOTE-366).
-		if r.compactParsed != nil {
-			r.compactParsed.v8SectionOffset = entry.Offset
-			r.compactParsed.v8SectionLen = uint64(entry.Length) //nolint:gosec
-			r.compactParsed.isV8SnappyTraceIndex = true
-		}
-	})
-	return r.v8TraceErr
 }
 
 // ensureV8TSSection lazily loads the V8 timestamp index on first call.
@@ -580,109 +488,16 @@ func (r *Reader) ensureV8TSSection() error {
 	return r.v8TSErr
 }
 
-// ensureV8BloomSection lazily loads the V8 file bloom filter on first call.
-func (r *Reader) ensureV8BloomSection() error {
-	r.v8BloomOnce.Do(func() {
-		raw, err := r.fetchToCSection(shared.ToCKey{Type: shared.ToCTypeMetadata, SubType: shared.ToCSubTypeBloom})
-		if err != nil {
-			r.v8BloomErr = fmt.Errorf("ensureV8BloomSection: %w", err)
-			return
-		}
-		if len(raw) == 0 {
-			return
-		}
-		fb, _, fbErr := parseFileBloomSection(raw)
-		if fbErr != nil {
-			r.v8BloomErr = fmt.Errorf("ensureV8BloomSection: parse: %w", fbErr)
-			return
-		}
-		if fb != nil {
-			r.fileBloomRaw = raw
-			r.fileBloomParsed = fb
-		}
-	})
-	return r.v8BloomErr
-}
+// NOTE: ensureV8ColStatsSection removed (2026-06-29, in-file block pruning removal).
+// Value index is now the authoritative source for pruning.
 
-// ensureV8ColStatsSection lazily loads the V8 per-block column statistics section
-// (ToCSubTypeColStats, NOTE-446 issue #364) on first call. Populates r.colStats.
-// No-op (leaves r.colStats nil) for files written before the section was introduced.
-func (r *Reader) ensureV8ColStatsSection() error {
-	r.v8ColStatsOnce.Do(func() {
-		raw, err := r.fetchToCSection(shared.ToCKey{Type: shared.ToCTypeMetadata, SubType: shared.ToCSubTypeColStats})
-		if err != nil {
-			r.v8ColStatsErr = fmt.Errorf("ensureV8ColStatsSection: %w", err)
-			return
-		}
-		if len(raw) == 0 {
-			return
-		}
-		parsed, parseErr := shared.DecodeColStatsSection(raw)
-		if parseErr != nil {
-			r.v8ColStatsErr = fmt.Errorf("ensureV8ColStatsSection: parse: %w", parseErr)
-			return
-		}
-		r.colStats = parsed
-	})
-	return r.v8ColStatsErr
-}
-
-// ColStats returns the parsed per-block column statistics for the given block index, or nil
-// if the file has no ColStats section or the block has no recorded statistics (NOTE-446,
-// issue #364). The returned *shared.BlockColStats is read-only and safe for concurrent use
-// after the first call. Fetched lazily and cached per-Reader.
-func (r *Reader) ColStats(blockIdx int) *shared.BlockColStats {
-	if err := r.ensureV8ColStatsSection(); err != nil || r.colStats == nil {
-		return nil
-	}
-	return r.colStats[blockIdx]
-}
-
-// HasColStats reports whether the file carries a ColStats section (NOTE-446).
-func (r *Reader) HasColStats() bool {
-	if err := r.ensureV8ColStatsSection(); err != nil {
-		return false
-	}
-	return r.colStats != nil
-}
-
-// ensureV14RangeSection lazily loads the V14 range index section on first call.
-// Populates r.rangeOffsets and r.metadataBytes (which ensureRangeColumnParsed indexes into).
-// ensureV14TraceSection lazily loads the V14 trace index section on first call.
-// Populates r.compactParsed so TraceEntries, BlocksForTraceID, and TraceCount work.
-// No-op for non-V14 files (compactParsed is populated by ensureCompactIndexParsed).
-//
-// Two-phase loading: phase 1 reads only the bloom filter + block table (small header, ~KB)
-// so most FindTraceByID lookups pay only that cost. Phase 2 (the full ~50 MB trace index)
-// is deferred to ensureTraceIndexRaw, which is invoked only on a bloom hit.
-//
-// Cache keys:
-//   - Phase 1 header: fileID+"/v14/compact-header"
-//   - Phase 2 trace index bytes: fileID+"/compact-trace-index" (shared with V3/V4 lean path)
-func (r *Reader) ensureV14TraceSection() error {
-	return r.ensureV8TraceSection()
-}
+// NOTE: ColStats() and HasColStats() removed (2026-06-29, in-file block pruning removal).
+// Value index is now the authoritative source for pruning.
 
 // ensureV14TSSection lazily loads the V14 timestamp index section on first call.
 // Populates r.tsRaw and r.tsCount so BlocksInTimeRange works.
-// No-op for non-V14 files (tsRaw/tsCount are populated by parseV5MetadataLazy).
 func (r *Reader) ensureV14TSSection() error {
 	return r.ensureV8TSSection()
-}
-
-// ensureV14SketchSection lazily loads the V14 sketch index section on first call.
-// Populates r.sketchIdx so ColumnSketch and FileSketchSummary work.
-// No-op for non-V14 files (sketchIdx is populated by parseV5MetadataLazy).
-func (r *Reader) ensureV14SketchSection() error {
-	// V8: per-column sketch blobs handled directly in ColumnSketch.
-	return nil
-}
-
-// ensureV14BloomSection lazily loads the V14 file bloom section on first call.
-// Populates r.fileBloomRaw and r.fileBloomParsed so FileBloom and FileBloomRaw work.
-// No-op for non-V14 files (fileBloomRaw/fileBloomParsed are populated by parseV5MetadataLazy).
-func (r *Reader) ensureV14BloomSection() error {
-	return r.ensureV8BloomSection()
 }
 
 // parseV5MetadataLazy reads the metadata section and eagerly parses:
@@ -752,76 +567,7 @@ func parseBlockIndex(data []byte, blockCount int) ([]shared.BlockMeta, int, erro
 }
 
 // parseTraceBlockIndex parses the trace block index section.
-// Supports fmt_version 0x01 (v1: with per-block span indices, discarded on read)
-// and fmt_version 0x02 (v2: block IDs only).
-// Returns the parsed map and bytes consumed.
-func parseTraceBlockIndex(data []byte) (map[[16]byte][]uint16, int, error) {
-	if len(data) < 5 {
-		return nil, 0, nil
-	}
-
-	fmtVersion := data[0]
-	if fmtVersion != shared.TraceIndexFmtVersion && fmtVersion != shared.TraceIndexFmtVersion2 {
-		return nil, 0, fmt.Errorf("trace_index: unsupported fmt_version %d", fmtVersion)
-	}
-
-	traceCount := int(binary.LittleEndian.Uint32(data[1:]))
-	pos := 5
-
-	result := make(map[[16]byte][]uint16, traceCount)
-
-	for t := range traceCount {
-		if pos+18 > len(data) {
-			return nil, pos, fmt.Errorf("trace_index: trace[%d]: short for trace_id+block_count", t)
-		}
-
-		var tid [16]byte
-		copy(tid[:], data[pos:pos+16])
-		pos += 16
-
-		blockRefCount := int(binary.LittleEndian.Uint16(data[pos:]))
-		pos += 2
-
-		blockIDs := make([]uint16, 0, blockRefCount)
-
-		if fmtVersion == shared.TraceIndexFmtVersion {
-			// v1: block_id[2] + span_count[2] + span_indices[N×2] — discard span indices.
-			for b := range blockRefCount {
-				if pos+4 > len(data) {
-					return nil, pos, fmt.Errorf("trace_index: trace[%d] block[%d]: short for block_id+span_count", t, b)
-				}
-				blockID := binary.LittleEndian.Uint16(data[pos:])
-				pos += 2
-				spanCount := int(binary.LittleEndian.Uint16(data[pos:]))
-				pos += 2
-				if pos+spanCount*2 > len(data) {
-					return nil, pos, fmt.Errorf(
-						"trace_index: trace[%d] block[%d]: short for span_indices (%d × 2 bytes)",
-						t, b, spanCount,
-					)
-				}
-				pos += spanCount * 2
-				blockIDs = append(blockIDs, blockID)
-			}
-		} else {
-			// v2: block_id[2] only.
-			for b := range blockRefCount {
-				if pos+2 > len(data) {
-					return nil, pos, fmt.Errorf("trace_index: trace[%d] block[%d]: short for block_id", t, b)
-				}
-				blockIDs = append(blockIDs, binary.LittleEndian.Uint16(data[pos:]))
-				pos += 2
-			}
-		}
-
-		result[tid] = blockIDs
-	}
-
-	return result, pos, nil
-}
-
-// skipTraceBlockIndex advances past a trace block index section without building
-// the map. This avoids O(N) allocations for search queries that never use the index.
+// (trace block index parsing removed with the TraceID/DFS index in #438.)
 func (r *Reader) readRange(offset, length uint64, dt rw.DataType) ([]byte, error) {
 	if length == 0 {
 		return nil, nil

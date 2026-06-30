@@ -11,5 +11,4 @@ type BlockIndexer interface {
 	BlocksForRange(col string, queryValue shared.RangeValueKey) ([]int, error)
 	BlocksForRangeInterval(col string, minKey, maxKey shared.RangeValueKey) ([]int, error)
 	BlocksInTimeRange(minNano, maxNano uint64) []int
-	ColumnSketch(col string) ColumnSketch
 }

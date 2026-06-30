@@ -329,28 +329,11 @@ func (p *Planner) planInternal(predicates []Predicate, timeRange TimeRange, enab
 		plan.PrunedByIndex += pruned
 	}
 
-	// Stage 2: BinaryFuse8 membership pruning — hard exclusion at ~0.39% FPR.
-	plan.PrunedByFuse += pruneByFuseAll(p.r, candidates, predicates)
-
-	// If fuse pruning eliminated every block, evict the sketch section from the
-	// process-level cache. There is no point keeping tens of MB of sketch data for
-	// a file we have determined contains no matching spans.
-	if candidates.count() == 0 {
-		if ev, ok := p.r.(SketchEvictor); ok {
-			ev.EvictSketch()
-		}
-		plan.SelectedBlocks = nil
-		if enableExplain {
-			explainPlan(p.r, predicates, plan, timeBlocks)
-		}
-		return plan
-	}
-
-	// Stage 3: Score remaining blocks for selectivity (freq/max(cardinality,1)).
-	// NOTE-014: Higher score = fewer distinct values relative to query frequency.
-	plan.BlockScores = scoreBlocks(p.r, candidates, predicates, total)
-
-	plan.SelectedBlocks = setToSortedByScore(candidates, p.r, plan.BlockScores)
+	// NOTE(#435,#437): BinaryFuse8 sketch pruning and block scoring removed — the KLL
+	// sketch index was removed in #435 and file-level bloom in #437; ColumnSketch always
+	// returns nil so these stages were no-ops. Stage 2 (fuse pruning) and Stage 3 (score
+	// blocks by HLL cardinality) are gone; blocks are sorted by MinStart only.
+	plan.SelectedBlocks = setToSortedByScore(candidates, p.r, nil)
 	if enableExplain {
 		explainPlan(p.r, predicates, plan, timeBlocks)
 	}
@@ -370,7 +353,7 @@ func (p *Planner) FetchBlocks(plan *Plan) (map[int][]byte, error) {
 // This improves early termination for limited queries: the executor is more likely to
 // find matches in the first few blocks.
 // Block index is used as a final tiebreaker for stable ordering.
-func setToSortedByScore(s blockSet, r BlockIndexer, scores []float64) []int {
+func setToSortedByScore(s blockSet, r BlockIndexer, _ []float64) []int {
 	out := make([]int, 0, s.count())
 	s.iter(func(k int) {
 		out = append(out, k)
@@ -380,20 +363,6 @@ func setToSortedByScore(s blockSet, r BlockIndexer, scores []float64) []int {
 		mb := r.BlockMeta(b)
 		if n := cmp.Compare(ma.MinStart, mb.MinStart); n != 0 {
 			return n
-		}
-		// Secondary: higher score first (descending).
-		// NOTE-023: direct slice index; block indices are bounded by len(scores) == blockCount.
-		if len(scores) > 0 {
-			var sa, sb float64
-			if a < len(scores) {
-				sa = scores[a]
-			}
-			if b < len(scores) {
-				sb = scores[b]
-			}
-			if n := cmp.Compare(sb, sa); n != 0 { // note: sb before sa for descending
-				return n
-			}
 		}
 		return cmp.Compare(a, b)
 	})

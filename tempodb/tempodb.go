@@ -17,6 +17,8 @@ import (
 	gkLog "github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/google/uuid"
+	minio "github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 
@@ -269,13 +271,40 @@ func New(cfg *Config, cacheProvider cache.Provider, logger gkLog.Logger) (Reader
 		be := cfg.Block.Blockpack.BlockEvents
 		vblockpack.ConfigureBlockEvents(blockevents.Config{
 			Enabled:    be.Enabled,
-			RqliteURL:  be.RqliteURL,
 			RedisAddr:  be.RedisAddr,
 			StreamName: be.StreamName,
 		})
 	}
+	// Querier-side index-driven query path (blockpack issue #461). Only when
+	// enabled and backed by S3 — the value index lives in the same bucket as the
+	// trace blocks. Disabled by default: the query path then falls back to a full
+	// block scan, byte-identical to before.
+	if cfg.Block != nil && cfg.Block.Blockpack.ValueIndexQuery.Enabled &&
+		cfg.Backend == backend.S3 && cfg.S3 != nil {
+		viq := cfg.Block.Blockpack.ValueIndexQuery
+		if client, cerr := newMinioForValueIndex(cfg.S3); cerr == nil {
+			vblockpack.ConfigureValueIndexQuery(client, cfg.S3.Bucket, viq.IndexPrefix, viq.CacheTTL)
+		} else {
+			level.Warn(logger).Log("msg", "value-index query: failed to build S3 client; index path disabled", "err", cerr)
+		}
+	}
 
 	return rw, rw, rw, nil
+}
+
+// newMinioForValueIndex builds a minio client for the value-index query path from
+// the trace S3 config. Credentials come from the AWS environment, matching the
+// value-index consumer/compactor clients (cmd/tempo/app/value_index.go).
+func newMinioForValueIndex(cfg *s3.Config) (*minio.Client, error) {
+	endpoint := cfg.Endpoint
+	if endpoint == "" {
+		endpoint = fmt.Sprintf("s3.%s.amazonaws.com", cfg.Region)
+	}
+	return minio.New(endpoint, &minio.Options{
+		Creds:  credentials.NewEnvAWS(),
+		Secure: !cfg.Insecure,
+		Region: cfg.Region,
+	})
 }
 
 func (rw *readerWriter) WriteBlock(ctx context.Context, c WriteableBlock) error {

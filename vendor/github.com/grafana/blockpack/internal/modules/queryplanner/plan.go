@@ -8,7 +8,6 @@ type Plan struct {
 	TotalBlocks          int
 	PrunedByIndex        int
 	PrunedByTime         int
-	PrunedByFuse         int
 	PrunedByColStats     int // NOTE-449: blocks eliminated by per-block column statistics (issue #368)
 	PrunedByIntrinsicTOC int // NOTE-449: blocks eliminated by intrinsic-column TOC intersection
 	PrunedByFileBounds   int // NOTE-456: blocks eliminated by file-level range/bloom reject

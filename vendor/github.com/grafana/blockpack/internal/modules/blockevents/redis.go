@@ -47,11 +47,8 @@ func NewPublisher(cfg Config) (Publisher, error) {
 		return NewNoopPublisher(), nil
 	}
 	cfg = cfg.withDefaults()
-	if cfg.RqliteURL != "" {
-		return NewRqlitePublisher(cfg)
-	}
 	if cfg.RedisAddr == "" {
-		return nil, fmt.Errorf("blockevents: redis_addr or rqlite_url required when enabled")
+		return nil, fmt.Errorf("blockevents: redis_addr required when enabled")
 	}
 	client := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr})
 	return newRedisStreamsPublisher(client, cfg), nil

@@ -1,6 +1,7 @@
 # Writer Module — Design Notes
 
 ## NOTE-001: Intrinsic Columns — Stored Exclusively in Intrinsic TOC Section
+
 *Added: 2026-03-25*
 
 *Addendum (2026-03-25): Original entry claimed dual-storage (block columns AND intrinsic
@@ -39,6 +40,7 @@ They are NOT written to block column payloads via `addPresent`.~~
 ---
 
 ## NOTE-002: Rollback to Dual Storage — Intrinsic Columns in Both Block Payloads and Intrinsic Section
+
 *Added: 2026-03-26*
 
 **Decision:** Restore dual storage for intrinsic columns (trace:id, span:id, span:parent_id,
@@ -85,6 +87,7 @@ section as before.
 ---
 
 ## NOTE-003: CMS Removal — SKTE Writer Format, No CMS Data Written
+
 *Added: 2026-04-02*
 
 **Decision:** Remove CMS accumulation and marshalling from the sketch writer. New files use
@@ -92,6 +95,7 @@ SKTE format (magic `0x534B5445`). The `colSketch` struct holds HLL, TopK, and Sk
 `blockSketchSet.add()` feeds all three incrementally — no key accumulation needed.
 
 **Rationale:**
+
 - CMS added ~70% to per-file sketch section size. At production scale (multi-GB blockpack
   files) the sketch index alone exceeded heap limits during compaction, causing OOM.
 - TopK provides approximate (Space-Saving upper-bound) frequency counts for hot values.
@@ -101,6 +105,7 @@ SKTE format (magic `0x534B5445`). The `colSketch` struct holds HLL, TopK, and Sk
   large keys []uint64 accumulation buffer that required all keys before construction.
 
 **Wire format:** SKTE per-column layout:
+
 1. Presence bitset: `ceil(num_blocks/8)` bytes
 2. Distinct counts: `num_blocks × 4 LE uint32` (HLL cardinality per block)
 3. TopK section: `topk_k[1]` + per present block: `entry_count[1]` + `(fp[8 LE], count[2 LE])` pairs
@@ -110,6 +115,7 @@ No CMS bytes are written. Legacy SKTC/SKTD readers skip CMS bytes zero-alloc via
 `skipColumnCMS` in the reader package (see reader/NOTES.md NOTE-010).
 
 **Back-ref:**
+
 - `internal/modules/blockio/writer/sketch_index.go:writeSketchIndexSection`
 - `internal/modules/blockio/writer/sketch_index.go:sketchSectionMagic` (0x534B5445 = SKTE)
 - `internal/modules/blockio/writer/writer_log.go:blockSketchSet`
@@ -117,6 +123,7 @@ No CMS bytes are written. Legacy SKTC/SKTD readers skip CMS bytes zero-alloc via
 ---
 
 ## NOTE-004: Parallel Block Building — Inter-Block Concurrency via errgroup + sync.Pool
+
 *Added: 2026-04-02*
 
 **Decision:** `flushBlocks()` and `flushLogBlocks()` build blocks concurrently using
@@ -139,6 +146,7 @@ is CPU-bound and has no shared mutable state within a block. Blockpack block wri
 row-groups concurrently. This change applies the same approach.
 
 **Consequence:**
+
 - The Writer remains NOT thread-safe from the caller's perspective (the `inUse` guard is
   unchanged). Concurrency is internal to `flushBlocks`.
 - The `bb *blockBuilder` field and `enc *zstdEncoder` field are replaced by `bbPool` and
@@ -163,6 +171,7 @@ row-groups concurrently. This change applies the same approach.
 ---
 
 ## NOTE-465: Remove the ~700-block intrinsic fast-path cliff — two causes (issue #384) (2026-06-22)
+
 *Added: 2026-06-22*
 
 **Two independent ~700-block cliffs, same issue.** Issue #384 reported the intrinsic fast
@@ -228,6 +237,7 @@ and related tests were deleted as they tested behaviour that no longer exists.
 ---
 
 ## NOTE-461: File-level intrinsic accumulator spills to per-column temp files (issue #380) (2026-06-21)
+
 *Added: 2026-06-21*
 
 **Problem:** The file-level intrinsic section (trace:id, span:id, span:kind, span:name,
@@ -290,6 +300,7 @@ removed.
 ---
 
 ## NOTE-005: vectorAccumulator Pattern — Accumulate-at-Build, Serialize-at-Flush (2026-04-02)
+
 *Added: 2026-04-02*
 
 **Decision:** The `vectorAccumulator` field in the `Writer` follows the same accumulate-at-block,
@@ -318,6 +329,7 @@ no behavioral change for non-vector workflows.
 ---
 
 ## NOTE-006: Per-Block Vector Storage and Dimension Validation (2026-04-02)
+
 *Added: 2026-04-02*
 
 **Decision:** `vectorBlockEntry` now carries `vectors [][]float32` for per-block raw vector
@@ -327,6 +339,7 @@ in one slice) has been removed. Additionally, `accumulateBlock` validates incomi
 dimension against `a.dim` and skips mismatched blocks.
 
 **Rationale:**
+
 1. **Memory safety:** The old `allVectors` field accumulated all file vectors simultaneously.
    For a 1M-span file at dim=768, this required ~3 GiB peak RSS at flush time, making the
    feature unusable in production. Per-block storage allows each block's vectors to be freed
@@ -346,9 +359,11 @@ no error is returned (consistent with the writer's non-panicking contract).
 ---
 
 ## NOTE-007: V14 Writer Redesign — zstd Removal, Per-Column Snappy, Sectioned Metadata (2026-04-10)
+
 *Added: 2026-04-10*
 
 **Decision:** Redesign the write path for V14 format:
+
 1. Remove all internal zstd compression from encoding types (dict, delta, XOR, prefix, delta-dict).
 2. Apply one outer `snappy.Encode` per column blob at the block level, immediately after `buildData()`.
 3. Replace the single snappy-compressed metadata blob with 6 type-keyed independently-compressed
@@ -363,6 +378,7 @@ The original design applied zstd inside each encoding type (e.g. `dict_zstd[4+N]
 dictionary payload). This created two levels of compression: zstd inside the raw blob, then
 the entire column payload was conceptually uncompressed at the block level. The inner zstd
 provided good compression ratios but:
+
 - Required pooled `*zstd.Encoder` instances (concurrency complexity).
 - Made it impossible to snappy-wrap the whole column as a single unit, since zstd's framing
   is already embedded inside.
@@ -396,6 +412,7 @@ Back-ref: `internal/modules/blockio/writer/column_builder.go` (zstdEncoder remov
 ---
 
 ## NOTE-36: Bloom-Enabled Compact Index (Version 2)
+
 *Added: 2026-04-14*
 
 The compact trace index version 2 embeds a per-file trace ID bloom filter in the
@@ -404,6 +421,7 @@ Readers call `BlocksForTraceIDCompact` which checks the bloom first and only pro
 to the hash-map lookup on a bloom hit.
 
 Wire format:
+
 ```
 magic[4] + version[1]=2 + block_count[4] + bloom_bytes[4] + bloom_data[bloom_bytes]
 + block_table[block_count×12] + trace_index_bytes[...]
@@ -415,6 +433,7 @@ Back-ref: `internal/modules/blockio/reader/trace_index.go:BlocksForTraceIDCompac
 ---
 
 ## NOTE-37: Trace Index v2 — Block IDs Only, Reader-Side Span Scan
+
 *Added: 2026-04-14*
 
 The v2 trace block index stores only block IDs per trace (not per-span row indices).
@@ -429,6 +448,7 @@ Back-ref: `internal/modules/blockio/writer/metadata.go:writeTraceBlockIndexSecti
 ---
 
 ## NOTE-38: Exact-Value Range Index for Low-Cardinality Columns
+
 *Added: 2026-04-14*
 
 For columns where every block has `min == max` (single distinct value per block),
@@ -442,6 +462,7 @@ Back-ref: `internal/modules/blockio/writer/range_index.go:tryApplyExactValues`
 ---
 
 ## NOTE-38b: Exact-Value Path Safety Invariant — All Blocks Must Be Single-Value
+
 *Added: 2026-04-14*
 
 The exact-value path (NOTE-38) is only safe when ALL blocks have `min == max`. If any
@@ -456,6 +477,7 @@ Back-ref: `internal/modules/blockio/writer/range_index.go:tryApplyExactValues`
 ---
 
 ## NOTE-39: encodeXORBytesIntrinsic — XOR Encoding for Large Bytes Intrinsic Columns
+
 *Added: 2026-04-22*
 
 **Decision:** `encodeColumn` now dispatches to `encodeXORBytesIntrinsic` when
@@ -609,7 +631,7 @@ already targets. Mismatched lengths, single-value, or zero-length columns fall t
 8/9/19 unchanged.
 
 **AllPresent composition:** a fully-present uniform column selects kind 28 via `selectAllPresent`
-+ `shared.AllPresentKindFor` (NOTE-AP-001), omitting the presence-RLE segment. There is no sparse
+- `shared.AllPresentKindFor` (NOTE-AP-001), omitting the presence-RLE segment. There is no sparse
 AllPresent (a contradiction) and no `present_count` field for kind 25 — like kinds 8/9 the decoder
 walks the presence bitset directly.
 
@@ -742,7 +764,7 @@ Back-ref: `shared/constants.go` (kinds 40/41 KindGorillaFloat64[AllPresent]),
 
 For tiny columns (low-cardinality intrinsics after RLE/dict, short-tail attributes) the per-column
 framing dominates the payload: a V14 TOC entry's offset tail is `data_offset[8] + compressed_len[4]
-+ uncompressed_len[4]` = 16 bytes, plus the per-column outer snappy framing (~5 B), plus the data
+- uncompressed_len[4]` = 16 bytes, plus the per-column outer snappy framing (~5 B), plus the data
 itself (often < 16 B). For such columns the framing is larger than the payload and the snappy
 round-trip is pure overhead.
 
@@ -864,6 +886,7 @@ Back-ref: `internal/modules/blockio/writer/column_types.go:int64ColumnBuilder.bu
           `internal/modules/blockio/reader/column.go:promoteToInt64Dict`
 
 ## NOTE-223: Range-readable chunked trace index (issue #340)
+
 *Added: 2026-06-13*
 
 **Problem:** the trace index was written as one snappy-compressed section
@@ -887,6 +910,7 @@ Back-ref: `internal/modules/blockio/writer/chunked_trace_index.go:buildChunkedTr
 ---
 
 ## NOTE-399: Stop storing the span:end per-row block column (synthesize on read)
+
 *Added: 2026-06-15*
 
 **Problem:** `span:end` was written as a per-row block column on every write path
@@ -902,6 +926,7 @@ there (`reader.synthesizeSpanEnd`); only the block-column copy remained.
 `GetIntrinsicColumn("span:end")` → `synthesizeSpanEnd`, so query results are byte-identical.
 
 **Write paths changed:**
+
 - `feedSpanTiming` (proto ingest): dropped the `addPresent(span:end, ...)` call; kept
   `updateMinMaxNum` for the range index.
 - `applySpanEnd` (compaction, legacy source blocks that still carry span:end): no longer
@@ -1033,7 +1058,14 @@ uses eager-refs decode since flat columns are paged-lazy-ref); executor folds in
 ---
 
 ## NOTE-446: Per-block per-column statistics section (ToCSubTypeColStats, issue #364)
+
 *Added: 2026-06-18*
+
+> **SUPERSEDED 2026-06-29 (executor NOTE-477):** the ColStats section and all in-file block
+> pruning were removed; the value index is now authoritative for pruning + block status. The
+> writer no longer emits ColStats (`writeV8FileSections` deleted), `shared/colstats.go` was
+> deleted, and `reader.ColStats`/`HasColStats` + `executor.pruneByColStats` were removed.
+> Description retained for historical context only.
 
 **Problem:** Blockpack could not skip column fetches for a column wholly absent from a block.
 Q9 `{kind=server} >> {kind=client && span.rpc.method != ""}` fetched `span.rpc.method` for every
@@ -1196,6 +1228,7 @@ now unblocked.
 ---
 
 ## NOTE-466: MinHash-primary sort order rejected (issue #385)
+
 *Added: 2026-06-23*
 
 **Decision:** Keep the production span order `(service.name, span.name, MinHash, TraceID)`
@@ -1212,6 +1245,7 @@ the best case for the proposal — end-to-end through the real writer under each
 measures total compressed file size and per-block distinct service.name / span.name counts.
 
 **Findings (representative corpus, 22 blocks):**
+
 - File size: MinHash-primary was *larger* than prod; the bucket hybrid was larger still. The
   proposed compression win does not materialize — it regresses.
 - Range-index homogeneity: prod keeps blocks near single-service (because service.name is the
@@ -1254,6 +1288,7 @@ a block-scoped span-ID lookup (`SpanTreeForTrace`) that does not need the block 
 fallback that NOTE-293 fixed (a ~70% trace-by-ID regression).
 
 **What changed in the writer:**
+
 - `feedSpanIdentifiers` (ingest path) now feeds the intrinsic accumulator only — the
   `addPresent` block-column writes and `updateMinMax` range-index updates for these three
   columns are removed (trace:id was never range-indexed; span:id/parent_id min/max were
@@ -1266,6 +1301,7 @@ fallback that NOTE-293 fixed (a ~70% trace-by-ID regression).
   from the source intrinsic section or it would be lost on recompaction.
 
 **All read paths are served from the intrinsic section (or the SpanTree):**
+
 - `reader.go:GetTraceByID` — SpanTree `SpanTreeForTrace` returns exact `(blockIdx, rowIdx)` +
   span IDs; `spanIDByRef` is authoritative. Block-column scan and intrinsic-scan are fallbacks
   for pre-SpanTree files only.
@@ -1460,6 +1496,7 @@ readers handle. Defaults OFF (intrinsic-only behaviour preserved). Plumbed throu
 compaction output.
 
 **What changed in the writer (both write paths):**
+
 - `feedSpanIdentifiers` (ingest): when the toggle is set, also `addPresent` the three identity
   columns into the block payload (bytes columns). `addPresent` already excludes `trace:id` from
   the range index (unique per trace, useless for pruning), so no spurious range-index growth.
@@ -1498,6 +1535,7 @@ The file-level IntrinsicTOC therefore carries nothing the blocks don't already h
 **Two skip points, one flag.** `Config.OmitIntrinsicTOC` → process-level atomic
 `omitIntrinsicTOCEnabled` (set in `NewWriterWithConfig` exactly like
 `restoreIdentityBlockColumnsEnabled`/NOTE-V2-004). When active:
+
 - `spillBlockAccumulators` skips the file-level `intrinsicAccum.spillMerge` — its ONLY consumer
   is the IntrinsicTOC section, so skipping it saves the per-block intrinsic spill I/O entirely.
 - `writeV8IntrinsicBlobs` returns early so no IntrinsicTOC ToCEntry is emitted (defence-in-depth

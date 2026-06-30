@@ -3,6 +3,7 @@ package writer
 // NOTE: Any changes to this file must be reflected in the corresponding specs.md or NOTES.md.
 
 import (
+	"bytes"
 	"fmt"
 	"runtime"
 	"sync"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/grafana/blockpack/internal/modules/blockio/reader"
 	"github.com/grafana/blockpack/internal/modules/blockio/shared"
+	modules_rw "github.com/grafana/blockpack/internal/modules/rw"
 )
 
 // Writer encodes OTLP spans into the blockpack format.
@@ -26,44 +28,11 @@ type Writer struct {
 	bbPool sync.Pool
 
 	// trace_id → list of block IDs (uint16) across all blocks
-	traceIndex map[[16]byte][]uint16
-
 	// UUID column detection: column name → detected as UUID
 	uuidColumns map[string]bool
 
-	// Range index built incrementally in flushBlocks serial pass, consumed at Flush.
-	// Replaces the old flat log + O(n log n) sort approach.
-	rangeIdx rangeIndex
-
-	// sketchIdx accumulates per-block sketch sets across all blocks.
-	// Indexed parallel to blockMetas: sketchIdx[i] is the sketch for block i.
-	// Consumed at Flush() by writeV8Sections.
-	sketchIdx []blockSketchSet
-
-	// colStatsByBlock accumulates per-block per-column statistics (NOTE-446, issue #364).
-	// Fed in the serial flush pass from built.colStats; consumed at Flush() by
-	// writeV8Sections to write the ToCSubTypeColStats section.
-	colStatsByBlock []shared.BlockColStats
-
-	// intrinsicAccum accumulates file-level columnar data for intrinsic columns.
-	// NOTE-461 (issue #380): backed by per-column on-disk spill files (tempFileAccum) so peak
-	// RSS during compaction is bounded by the largest single column, not all columns × all
-	// spans. Per-block accumulation still uses an in-memory intrinsicAccumulator (localAccum);
-	// the serial merge pass spills each block's rows here via spillMerge. Created lazily on
-	// the first flushBlocks() (see ensureIntrinsicAccum) and released at Flush().
-	intrinsicAccum *tempFileAccum
-
-	// spanTreeAccum accumulates one structural record per span for the SpanTree section
-	// (NOTE-462, issue #381). Backed by sorted on-disk run files (external sort) so peak RSS
-	// is bounded by one run buffer during the spill phase and by the largest single trace
-	// during the merge/DFS phase — never by total span count. Fed in the serial flush pass
-	// from each block's intrinsic identity columns; consumed at Flush() by writeV8FileSections.
-	// Created lazily on the first flushBlocks() (see ensureSpanTreeAccum) and released at Flush().
-	spanTreeAccum *spanTreeAccum
-
-	// fileBloomSvcNames accumulates unique service names for file-level bloom construction.
-	// Fed from flushBlocks; consumed at Flush by writeV8Sections.
-	fileBloomSvcNames map[string]struct{}
+	// NOTE: colStatsByBlock removed (2026-06-29, in-file block pruning removal).
+	// Value index is now the authoritative source for pruning.
 
 	// addRowIntrinsicCache caches per-block intrinsic indexes built during AddRowFromReader
 	// calls. Key: (srcReader pointer, srcBlockIdx). Value: pre-built row→field map.
@@ -127,28 +96,6 @@ func (cw *countingWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// blockPagePadding is a reusable, read-only buffer of zero bytes one page long,
-// sliced to the required pad width by padToPageBoundary. One page is the maximum
-// possible padding, so a single page-sized buffer covers every case.
-var blockPagePadding = make([]byte, shared.BlockFileRefPageSize)
-
-// padToPageBoundary appends trailing zero bytes to the output stream so the next
-// write begins on a 4 KB page boundary (NOTE-V2-003, issue #419). It is a no-op
-// when the stream is already page-aligned. After it returns successfully,
-// w.out.total is guaranteed to be a multiple of shared.BlockFileRefPageSize.
-func (w *Writer) padToPageBoundary() error {
-	const page = shared.BlockFileRefPageSize
-	rem := int(w.out.total % page)
-	if rem == 0 {
-		return nil
-	}
-	pad := page - rem
-	if _, err := w.out.Write(blockPagePadding[:pad]); err != nil {
-		return err
-	}
-	return nil
-}
-
 // NewWriterWithConfig validates the config and returns a new Writer.
 // Returns error if OutputStream is nil or MaxBlockSpans > 65535.
 func NewWriterWithConfig(cfg Config) (*Writer, error) {
@@ -187,20 +134,14 @@ func NewWriterWithConfig(cfg Config) (*Writer, error) {
 	// per-column when it beats snappy by the benefit margin. Requires V15 (EnableInlineColumns)
 	// since the codec is signaled by a V15 flags-byte bit; gated to that combination below.
 	setZstdColumnsEnabled(cfg.EnableZstdColumns && cfg.EnableInlineColumns)
-	// NOTE-V2-004 (issue #420): apply the identity-block-column rollout flag. Default DISABLED
-	// (identity columns intrinsic-only per NOTE-469). When set, the writer restores trace:id,
-	// span:id, and span:parent_id into per-inner-block payloads so each block is self-contained
-	// for v2 direct ranged-GET fetch (#424).
-	setRestoreIdentityBlockColumnsEnabled(cfg.RestoreIdentityBlockColumns)
-	// NOTE-V2-005 (issue #421): apply the IntrinsicTOC-omission rollout flag. Default DISABLED
-	// (IntrinsicTOC written as before). When set, the writer skips both the file-level intrinsic
-	// spillMerge and the IntrinsicTOC ToCEntry emission, so no IntrinsicTOC section reaches the
-	// file. REQUIRES RestoreIdentityBlockColumns: without identity columns in the blocks there
-	// would be no identity store once the IntrinsicTOC is gone, so the omission is only activated
-	// when both flags are set.
-	setOmitIntrinsicTOCEnabled(cfg.OmitIntrinsicTOC && cfg.RestoreIdentityBlockColumns)
+	// NOTE(#436): the intrinsic/attribute distinction was removed; the v2 self-contained-block
+	// format is now unconditional, so the RestoreIdentityBlockColumns / OmitIntrinsicTOC rollout
+	// toggles no longer exist. Identity columns always live in the per-inner-block payloads and
+	// no file-level IntrinsicTOC section is written.
 	// Default auto-flush at 5× block size. Caps live proto memory to one batch of
 	// 5 blocks while preserving enough lookahead for MinHash sort quality.
+	// NOTE: EnableV2Format/OmitIntrinsicIdentityColumns mutual exclusion check removed (2026-06-29).
+	// V2 lean format is now unconditional.
 	if cfg.MaxBufferedSpans == 0 {
 		cfg.MaxBufferedSpans = 5 * cfg.MaxBlockSpans
 	}
@@ -230,14 +171,11 @@ func NewWriterWithConfig(cfg Config) (*Writer, error) {
 		}
 	}
 	return &Writer{
-		cfg:               cfg,
-		out:               countingWriter{w: cfg.OutputStream},
-		traceIndex:        make(map[[16]byte][]uint16),
-		uuidColumns:       make(map[string]bool),
-		rangeIdx:          make(rangeIndex),
-		fileBloomSvcNames: make(map[string]struct{}),
-		vectorAccum:       va,
-		dedicatedCols:     dedicatedCols,
+		cfg:           cfg,
+		out:           countingWriter{w: cfg.OutputStream},
+		uuidColumns:   make(map[string]bool),
+		vectorAccum:   va,
+		dedicatedCols: dedicatedCols,
 		// Pre-allocate pending to MaxBufferedSpans to avoid growslice on the hot path.
 		// After each flushBlocks(), w.pending is reset to length 0 (capacity retained).
 		pending: make([]pendingSpan, 0, cfg.MaxBufferedSpans),
@@ -427,15 +365,6 @@ func (w *Writer) Flush() (int64, error) {
 	// including errors, so a failed compaction does not leak scratch files (NOTE-461). close
 	// is idempotent; the success path's explicit reset below nils the reference first.
 	defer func() {
-		if w.intrinsicAccum != nil {
-			_ = w.intrinsicAccum.close()
-			w.intrinsicAccum = nil
-		}
-		// NOTE-462: release the SpanTree spill run files / temp dir on every Flush exit path.
-		if w.spanTreeAccum != nil {
-			_ = w.spanTreeAccum.close()
-			w.spanTreeAccum = nil
-		}
 	}()
 
 	if len(w.pending) == 0 && len(w.blockMetas) == 0 {
@@ -451,28 +380,24 @@ func (w *Writer) Flush() (int64, error) {
 	// 2. Apply KLL bucket boundaries to the range index.
 	// KLL sketches were built incrementally in flushBlocks (one Add per block min
 	// and max), so no re-scan is needed here.
-	applyRangeBuckets(w.rangeIdx, defaultRangeBuckets)
-
-	// 3–8. Write V8 sections + Footer.
+	// 3–8. Write V8 sections + Footer. (Range index removed in #439; applyRangeBuckets skipped)
 	if err := w.writeV8Sections(); err != nil {
 		return w.out.total, fmt.Errorf("writer: write V8 sections: %w", err)
 	}
 
 	total := w.out.total
 
+	// 3.5 — Inline value-index sink (optional). If configured, open a Reader over
+	// the just-flushed bytes and hand it to the sink before resetting state.
+	if w.cfg.ValueIndexSink != nil {
+		if err := w.callValueIndexSink(total); err != nil {
+			return total, fmt.Errorf("writer: value index sink: %w", err)
+		}
+	}
+
 	// 9. Reset ALL state.
 	w.pending = w.pending[:0]
 	w.blockMetas = nil
-	for _, bs := range w.sketchIdx {
-		releaseBlockSketchSet(bs)
-	}
-	w.sketchIdx = w.sketchIdx[:0]
-	for k := range w.rangeIdx {
-		delete(w.rangeIdx, k)
-	}
-	for k := range w.traceIndex {
-		delete(w.traceIndex, k)
-	}
 	// protoRoots and tempoProtoRoots are already cleared by flushBlocks(); these are defensive no-ops.
 	clear(w.protoRoots)
 	w.protoRoots = w.protoRoots[:0]
@@ -484,10 +409,6 @@ func (w *Writer) Flush() (int64, error) {
 	// (NOTE-461); the next write lazily re-creates it via ensureIntrinsicAccum.
 
 	// Reset file-level bloom service names.
-	for k := range w.fileBloomSvcNames {
-		delete(w.fileBloomSvcNames, k)
-	}
-
 	// Reset vector accumulator for reuse.
 	if w.vectorAccum != nil {
 		w.vectorAccum = newVectorAccumulator(w.cfg.VectorDimension)
@@ -496,95 +417,29 @@ func (w *Writer) Flush() (int64, error) {
 	return total, nil
 }
 
+// callValueIndexSink opens an in-memory Reader over the bytes written to OutputStream
+// and calls cfg.ValueIndexSink. The OutputStream must implement io.WriterTo or be a
+// *bytes.Buffer; if not, the sink is skipped (NOTE: callers that need the sink must use
+// a buffered OutputStream such as *bytes.Buffer).
+func (w *Writer) callValueIndexSink(total int64) error {
+	ob, ok := w.cfg.OutputStream.(*bytes.Buffer)
+	if !ok {
+		return nil // not a seekable buffer; sink requires *bytes.Buffer
+	}
+	provider := modules_rw.NewBytesProvider(ob.Bytes()[ob.Len()-int(total):])
+	r, err := reader.NewReaderFromProvider(provider)
+	if err != nil {
+		return fmt.Errorf("open reader: %w", err)
+	}
+	return w.cfg.ValueIndexSink(r)
+}
+
 // writeEmptyFile writes a minimal valid blockpack file with zero blocks.
 func (w *Writer) writeEmptyFile() (int64, error) {
 	if err := w.writeV8Sections(); err != nil {
 		return w.out.total, err
 	}
 	return w.out.total, nil
-}
-
-// ensureIntrinsicAccum lazily creates the file-level on-disk intrinsic accumulator
-// (NOTE-461). Created on first use so a Writer that is constructed but never written
-// (or only used for an empty file) does not touch the filesystem, and so the spill
-// directory is created under w.cfg.ScratchDir when configured by the caller (compaction).
-func (w *Writer) ensureIntrinsicAccum() error {
-	if w.intrinsicAccum != nil {
-		return nil
-	}
-	a, err := newTempFileAccum(w.cfg.ScratchDir)
-	if err != nil {
-		return err
-	}
-	// NOTE-476 (issue #394): when configured, drop the identity columns from the persisted
-	// IntrinsicTOC. The SpanTree (fed independently from the per-block accumulator) is the
-	// sole identity store for these blocks; readers fall back to it via SpanTreeIdentityForBlock.
-	if w.cfg.OmitIntrinsicIdentityColumns {
-		a.skipCols = map[string]struct{}{
-			traceIDColumnName:      {},
-			spanIDColumnName:       {},
-			spanParentIDColumnName: {},
-		}
-	}
-	w.intrinsicAccum = a
-	return nil
-}
-
-// ensureSpanTreeAccum lazily creates the file-level on-disk SpanTree accumulator
-// (NOTE-462, issue #381). Like ensureIntrinsicAccum it is created on first use and spills
-// under w.cfg.ScratchDir when the caller configures one.
-func (w *Writer) ensureSpanTreeAccum() error {
-	if w.spanTreeAccum != nil {
-		return nil
-	}
-	a, err := newSpanTreeAccum(w.cfg.ScratchDir)
-	if err != nil {
-		return err
-	}
-	w.spanTreeAccum = a
-	return nil
-}
-
-// feedSpanTreeFromAccum extracts (traceID, spanID, parentID) per row from a per-block
-// intrinsic accumulator and feeds one SpanTree record per span. trace:id is always present;
-// span:id and span:parent_id are present only when non-empty (root spans have no parent).
-// Rows missing a span:id are skipped — a structural index entry without a span identity is
-// not addressable. NOTE-462.
-func feedSpanTreeFromAccum(acc *spanTreeAccum, local *intrinsicAccumulator, blockID uint16) error {
-	traceCol := local.flatCols[traceIDColumnName]
-	spanCol := local.flatCols[spanIDColumnName]
-	if traceCol == nil || spanCol == nil {
-		return nil
-	}
-	// Index trace:id and span:parent_id by rowIdx so they can be joined to each span:id row.
-	traceByRow := make(map[uint16][]byte, len(traceCol.refs))
-	for i, ref := range traceCol.refs {
-		traceByRow[ref.RowIdx] = traceCol.bytesValues[i]
-	}
-	var parentByRow map[uint16][]byte
-	if parentCol := local.flatCols[spanParentIDColumnName]; parentCol != nil {
-		parentByRow = make(map[uint16][]byte, len(parentCol.refs))
-		for i, ref := range parentCol.refs {
-			parentByRow[ref.RowIdx] = parentCol.bytesValues[i]
-		}
-	}
-	for i, ref := range spanCol.refs {
-		tid := traceByRow[ref.RowIdx]
-		if len(tid) != 16 {
-			// trace:id is always 16 bytes; skip malformed rows.
-			continue
-		}
-		var traceID [16]byte
-		copy(traceID[:], tid)
-		var parent []byte
-		if parentByRow != nil {
-			parent = parentByRow[ref.RowIdx]
-		}
-		if err := acc.add(traceID, spanCol.bytesValues[i], parent, blockID, ref.RowIdx); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // flushBlocks sorts w.pending, builds all blocks concurrently, writes payloads and
@@ -608,6 +463,15 @@ type blockSlice struct {
 	spans   []pendingSpan
 	blockID int
 }
+
+// v2PageSize is the block alignment granularity for v2 files (NOTE-V2-001).
+// Kept local to break the import cycle: valueindex imports blockio/writer (via KLL),
+// so writer cannot import valueindex. The value must match valueindex.PageSize = 4096.
+const v2PageSize = 4096
+
+// v2PagePadding is a zeroed page used to pad blocks to 4 096-byte alignment in v2
+// files (NOTE-V2-001). Package-level so no allocation on every block write.
+var v2PagePadding [v2PageSize]byte
 
 // clearPendingState resets all buffered span/proto state so the Writer is not left
 // in a partially-flushed limbo after a flush error or a completed flush.
@@ -700,7 +564,6 @@ func (w *Writer) flushBlocks() error {
 	results := make([]builtBlock, len(slices))
 
 	// Parallel build phase: each goroutine builds one block independently.
-	// localAccum is per-goroutine; merged serially below.
 	var g errgroup.Group
 	g.SetLimit(runtime.NumCPU())
 	for i, s := range slices {
@@ -716,16 +579,16 @@ func (w *Writer) flushBlocks() error {
 				}
 				blockVecs = allSpanVectors[spanOffset : spanOffset+len(s.spans)]
 			}
-			localAccum := newIntrinsicAccumulator()
 			bb, _ := w.bbPool.Get().(*blockBuilder)
 			built, bb, err := buildBlock(
 				s.spans,
 				bb,
 				emittedBlockVersion(),
-				localAccum,
+				nil, // intrinsicAccum removed in #433/#436
 				s.blockID,
 				blockVecs,
 				w.dedicatedCols,
+				true, // always page-aligned (v2 unconditional)
 			)
 			if err != nil {
 				w.bbPool.Put(bb)
@@ -760,13 +623,6 @@ func (w *Writer) flushBlocks() error {
 		}
 	}
 
-	// Collect service names for file-level bloom filter.
-	for _, ps := range w.pending {
-		if ps.svcName != "" {
-			w.fileBloomSvcNames[ps.svcName] = struct{}{}
-		}
-	}
-
 	// Clear pending and proto anchors (same invariant as before).
 	w.clearPendingState()
 
@@ -788,29 +644,30 @@ func (w *Writer) mergeBuiltBlock(i int, s blockSlice, results []builtBlock) erro
 		return fmt.Errorf("writer: block %d write: %w", s.blockID, err)
 	}
 
-	// NOTE-V2-003 (issue #419): pad each inner block's trailing bytes with zeros to
-	// the next 4 KB page boundary. Blocks are written first (the first starts at
-	// offset 0) and the V8 sections follow the last block, so padding each block's
-	// tail keeps every subsequent block start page-aligned — which lets the v2
-	// page-units BlockFileRef (NOTE-V2-001/-002) address a block by page index and
-	// issue a direct ranged GET with no TOC fetch. The recorded BlockMeta.Length is
-	// the UNPADDED payload length, so the reader (which reads exactly Length bytes)
-	// transparently ignores the trailing zeros and v1 readers are unaffected.
-	if err := w.padToPageBoundary(); err != nil {
-		w.clearPendingState()
-		return fmt.Errorf("writer: block %d pad: %w", s.blockID, err)
+	blockLen := uint64(len(built.payload))
+
+	// V2 lean format unconditional: pad each block to a 4 KB page boundary
+	// so blocks can be referenced by page number (NOTE-V2-001, now unconditional).
+	//nolint:gosec // blockLen is a single block payload, far below int max
+	if pad := v2PageSize - int(blockLen)%v2PageSize; pad != v2PageSize {
+		padBuf := v2PagePadding[:pad]
+		if _, err := w.out.Write(padBuf); err != nil {
+			w.clearPendingState()
+			return fmt.Errorf("writer: block %d page padding: %w", s.blockID, err)
+		}
 	}
 
-	w.blockMetas = append(w.blockMetas, shared.BlockMeta{
-		Offset:     blockOffset,
-		Length:     uint64(len(built.payload)),
-		Kind:       shared.BlockKindLeaf,
-		SpanCount:  uint32(built.spanCount), //nolint:gosec
-		MinStart:   built.minStart,
-		MaxStart:   built.maxStart,
-		MinTraceID: built.minTraceID,
-		MaxTraceID: built.maxTraceID,
-	})
+	meta := shared.BlockMeta{
+		Offset:    blockOffset,
+		Length:    blockLen,
+		Kind:      shared.BlockKindLeaf,
+		SpanCount: uint32(built.spanCount), //nolint:gosec
+		MinStart:  built.minStart,
+		MaxStart:  built.maxStart,
+	}
+	// V2 unconditional: record page number for ReadBlockByRef.
+	meta.PageNum = uint32(blockOffset / v2PageSize) //nolint:gosec // blockOffset always page-aligned
+	w.blockMetas = append(w.blockMetas, meta)
 	// Release payload memory immediately after writing to bound peak RSS.
 	results[i].payload = nil
 
@@ -832,74 +689,17 @@ func (w *Writer) mergeBuiltBlock(i int, s blockSlice, results []builtBlock) erro
 // derived SpanTree records to disk, then releases the in-memory accumulator.
 // NOTE-461 / NOTE-462: single write pass bounds peak RSS to one block's data.
 func (w *Writer) spillBlockAccumulators(i int, s blockSlice, results []builtBlock) error {
-	built := results[i]
-	if built.localAccum == nil {
-		return nil
-	}
-	// NOTE-V2-005 (issue #421): when the IntrinsicTOC is omitted (v2 self-contained blocks),
-	// skip the file-level intrinsic spillMerge entirely — the only consumer of that spill is
-	// the IntrinsicTOC section (writeV8IntrinsicBlobs), which is not emitted. The SpanTree is
-	// fed from the same per-block accumulator below (built.localAccum), independent of the
-	// file-level spill, so it is unaffected.
-	if !omitIntrinsicTOCActive() {
-		if err := w.ensureIntrinsicAccum(); err != nil {
-			return fmt.Errorf("writer: intrinsic accumulator: %w", err)
-		}
-		if err := w.intrinsicAccum.spillMerge(built.localAccum); err != nil {
-			return fmt.Errorf("writer: block %d intrinsic spill: %w", s.blockID, err)
-		}
-	}
-	// NOTE-462 (issue #381): feed the SpanTree accumulator from the same per-block
-	// intrinsic identity columns before releasing localAccum, so structural records
-	// are spilled in the same single write pass.
-	if err := w.ensureSpanTreeAccum(); err != nil {
-		return fmt.Errorf("writer: spantree accumulator: %w", err)
-	}
-	if err := feedSpanTreeFromAccum(w.spanTreeAccum, built.localAccum, uint16(s.blockID)); err != nil { //nolint:gosec // blockID bounded above by 65534
-		return fmt.Errorf("writer: block %d spantree spill: %w", s.blockID, err)
-	}
-	results[i].localAccum = nil
+	_ = results[i]
 	return nil
 }
 
-// updateBlockIndexes folds a built block's range index, column stats, sketches,
-// and trace-index entries into the file-level state.
+// updateBlockIndexes folds a built block's column stats and trace-index entries
+// into the file-level state. Range index removed in #439.
 func (w *Writer) updateBlockIndexes(s blockSlice, built builtBlock) {
-	// Update range index.
-	bid := uint32(s.blockID) //nolint:gosec
-	for _, mm := range built.colMinMax {
-		if mm.colType == shared.ColumnTypeBool {
-			// NOTE-452 (issue #373): bool min/max is tracked in colMinMax only to feed
-			// the ColStats numeric [0,1] range; there is no RangeBool index type, so it
-			// must be excluded from the on-disk range index.
-			continue
-		}
-		cd, ok := w.rangeIdx[mm.colName]
-		if !ok {
-			cd = newRangeColumnData(mm.colType)
-			w.rangeIdx[mm.colName] = cd
-		}
-		addBlockRangeToColumn(cd, mm, bid)
-	}
-
-	// NOTE-446: collect per-block column statistics for the ColStats section.
-	if len(built.colStats) > 0 {
-		w.colStatsByBlock = append(w.colStatsByBlock, shared.BlockColStats{
-			BlockIdx: uint16(s.blockID), //nolint:gosec
-			Cols:     built.colStats,
-		})
-	}
+	// NOTE: colStatsByBlock accumulation removed (2026-06-29, in-file block pruning removal).
+	// Value index is now the authoritative source for pruning.
 
 	// Collect sketch set for this block.
-	w.sketchIdx = append(w.sketchIdx, built.colSketches)
-
-	// Update file-level trace index.
-	for tid := range built.traceRows {
-		w.traceIndex[tid] = append(
-			w.traceIndex[tid],
-			uint16(s.blockID), //nolint:gosec
-		)
-	}
 }
 
 // addRowCacheKey identifies a unique (reader, blockIdx) pair for the AddRowFromReader

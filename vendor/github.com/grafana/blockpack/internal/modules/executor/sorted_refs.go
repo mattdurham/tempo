@@ -17,14 +17,6 @@ func packRef(ref modules_shared.BlockRef) uint32 {
 	return uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx)
 }
 
-// unpackRef unpacks a uint32 produced by packRef back into a BlockRef.
-func unpackRef(packed uint32) modules_shared.BlockRef {
-	return modules_shared.BlockRef{
-		BlockIdx: uint16(packed >> 16), //nolint:gosec // safe: packed>>16 is in [0, 0xFFFF]
-		RowIdx:   uint16(packed),       //nolint:gosec // safe: low 16 bits always in [0, 0xFFFF]
-	}
-}
-
 // isSortedRefs reports whether refs is sorted in non-decreasing packed-ref order.
 // Returns true for nil and empty slices.
 func isSortedRefs(refs []modules_shared.BlockRef) bool {

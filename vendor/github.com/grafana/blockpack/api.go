@@ -217,6 +217,115 @@ func QueryTraceQLWithProgram(
 	return results, stats, err
 }
 
+// QueryTraceQLFromIndex executes a TraceQL filter query using the value index for
+// block pruning (NOTE-VI-035, issue #459). It resolves the matching spans from the
+// pre-populated ValueIndexSource, then fetches only the blocks that contain matches
+// from r and materializes their fields — no full-file scan.
+//
+// The querier (issue #461) supplies the source by discovering, downloading, and
+// applying the per-leaf predicate to the value-index files for r's SourceRef, exactly
+// as it does for the metrics path (NOTE-VI-033). sourceRef identifies which data file
+// r was opened against so results for other files are ignored.
+//
+// Returns (matches, true, nil) when the query is fully answerable from the index.
+// Returns (nil, false, nil) when the caller must fall back to QueryTraceQL (full scan):
+//   - source is nil (caller did no discovery)
+//   - any leaf column has no index coverage
+//   - the index produced more than maxIndexHits results (<= 0 uses the default)
+//   - the query is not a filter expression (structural/metrics use their own paths)
+//
+// Each returned SpanMatch.Fields is materialized and safe to retain after return.
+func QueryTraceQLFromIndex(
+	ctx context.Context,
+	r *Reader,
+	source ValueIndexSource,
+	traceqlQuery string,
+	sourceRef string,
+	opts QueryOptions,
+	maxIndexHits int,
+) (results []SpanMatch, ok bool, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	defer func() {
+		if rec := recover(); rec != nil {
+			results = nil
+			ok = false
+			err = fmt.Errorf("internal error in QueryTraceQLFromIndex: %v", rec)
+		}
+	}()
+
+	if r == nil {
+		return nil, false, fmt.Errorf("QueryTraceQLFromIndex: reader cannot be nil")
+	}
+	if source == nil {
+		// No index coverage supplied: caller must fall back to a full scan.
+		return nil, false, nil
+	}
+	if shardErr := validateQueryOptions(opts); shardErr != nil {
+		return nil, false, fmt.Errorf("QueryTraceQLFromIndex: %w", shardErr)
+	}
+
+	parsed, parseErr := traceqlparser.ParseTraceQL(traceqlQuery)
+	if parseErr != nil {
+		return nil, false, fmt.Errorf("parse TraceQL: %w", parseErr)
+	}
+	filterExpr, isFilter := parsed.(*traceqlparser.FilterExpression)
+	if !isFilter {
+		// Only filter expressions use the index search path; structural and metrics
+		// queries have their own execution paths.
+		return nil, false, nil
+	}
+
+	var program *vm.Program
+	var compileErr error
+	if opts.Embedder != nil {
+		program, compileErr = vm.CompileTraceQLFilterWithOptions(filterExpr, vm.CompileOptions{
+			Embedder: opts.Embedder,
+			Limit:    opts.Limit,
+		})
+	} else {
+		program, compileErr = vm.CompileTraceQLFilter(filterExpr)
+	}
+	if compileErr != nil {
+		return nil, false, fmt.Errorf("compile TraceQL filter: %w", compileErr)
+	}
+
+	matches, indexOK, execErr := modules_executor.QueryTraceQLFromIndex(
+		ctx, source, r, program, sourceRef,
+		modules_executor.ComputeSecondPassCols(program, opts.SelectColumns),
+		maxIndexHits,
+	)
+	if execErr != nil {
+		return nil, false, execErr
+	}
+	if !indexOK {
+		return nil, false, nil
+	}
+
+	// Convert executor SpanMatch → public SpanMatch, materializing fields via the
+	// reader (same conversion as the structural path).
+	wantCols := modules_executor.ComputeSecondPassCols(program, opts.SelectColumns)
+	results = make([]SpanMatch, 0, len(matches))
+	for i := range matches {
+		m := &matches[i]
+		rawAdapter := modules_blockio.NewSpanFieldsAdapterWithReader(m.Block, r, m.BlockIdx, m.RowIdx, wantCols)
+		fields := rawAdapter
+		if len(opts.SelectColumns) > 0 {
+			fields = newFilteredSpanFields(rawAdapter, opts.SelectColumns)
+		}
+		match := SpanMatch{
+			TraceID: hex.EncodeToString(m.TraceID[:]),
+			SpanID:  hex.EncodeToString(m.SpanID),
+			Fields:  fields,
+		}
+		results = append(results, match.Clone())
+		// NOTE-ALLOC-4: release after Clone materializes the fields.
+		modules_blockio.ReleaseSpanFieldsAdapter(rawAdapter)
+	}
+	return results, true, nil
+}
+
 // QueryTraceQL executes a TraceQL query against a modules-format blockpack file
 // and returns all matching spans along with per-phase execution statistics.
 // QueryStats is populated for filter queries; structural and pipeline queries
@@ -322,6 +431,22 @@ type TraceTimeSeries = modules_executor.TraceTimeSeries
 // TraceMetricLabel is one label key-value pair in a TraceTimeSeries.
 type TraceMetricLabel = modules_executor.TraceMetricLabel
 
+// ValueIndexSource provides value-index data for the zero-block-read metrics path
+// (count_over_time/rate without group-by). See ExecuteMetricsTraceQL.
+type ValueIndexSource = modules_executor.ValueIndexSource
+
+// VILookupResult is one matching span from a value-index lookup.
+type VILookupResult = modules_executor.VILookupResult
+
+// SliceValueIndexSource is a ValueIndexSource backed by pre-downloaded, predicate-
+// matched value-index results grouped by column.
+type SliceValueIndexSource = modules_executor.SliceValueIndexSource
+
+// NewSliceValueIndexSource builds an empty SliceValueIndexSource. Populate it with Add.
+func NewSliceValueIndexSource() *SliceValueIndexSource {
+	return modules_executor.NewSliceValueIndexSource()
+}
+
 // TraceMetricOptions configures a TraceQL metrics query.
 
 // StartNano is the approximate start of the query time window (unix nanoseconds).
@@ -423,6 +548,20 @@ func ExecuteMetricsTraceQL(
 
 	// Override the step size with the caller-provided value (compiler uses a fixed default).
 	spec.TimeBucketing.StepSizeNanos = stepNano
+
+	// NOTE-VI-033 (issue #460): try the zero-block-read value-index path first.
+	// count_over_time()/rate() without group-by are answerable from index TimeSec
+	// alone. ExecuteTraceMetricsFromVI returns ok=false for unsupported queries or
+	// missing index coverage, in which case we fall back to the full block scan.
+	if opts.ValueIndex != nil {
+		viResult, ok, viErr := modules_executor.ExecuteTraceMetricsFromVI(ctx, opts.ValueIndex, prog, *spec)
+		if viErr != nil {
+			return nil, viErr
+		}
+		if ok {
+			return viResult, nil
+		}
+	}
 
 	return modules_executor.ExecuteTraceMetrics(ctx, r, prog, spec)
 }

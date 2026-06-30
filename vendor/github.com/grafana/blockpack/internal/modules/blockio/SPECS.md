@@ -369,6 +369,7 @@ typed_count    uint32 LE          // Type-specific boundary count (see below)
 ```
 
 Typed boundary formats (after typed_count):
+
 - **RangeFloat64:** `typed_count × float64_bits(8 LE uint64)`
 - **RangeString:** `typed_count × (len(4 LE uint32) + string_bytes)`
 - **RangeBytes:** `typed_count × (len(4 LE uint32) + byte_data)`
@@ -471,6 +472,7 @@ Immediately follows the column index stub.
 Two format versions are defined:
 
 #### Version 1 (legacy — with per-block span indices)
+
 ```
 format_version uint8         // 0x01
 trace_count    uint32 LE
@@ -478,6 +480,7 @@ trace_count    uint32 LE
 ```
 
 Each `TraceEntry`:
+
 ```
 trace_id       [16]byte      // 128-bit trace ID
 block_count    uint16 LE     // Number of blocks containing this trace
@@ -485,6 +488,7 @@ block_count    uint16 LE     // Number of blocks containing this trace
 ```
 
 Each `TraceBlockEntryV1`:
+
 ```
 block_id       uint16 LE     // Index into the block array
 span_count     uint16 LE     // Number of spans in this block belonging to this trace
@@ -492,6 +496,7 @@ span_indices   [span_count × uint16 LE]  // Row indices within the block (disca
 ```
 
 #### Version 2 (current — block IDs only)
+
 ```
 format_version uint8         // 0x02
 trace_count    uint32 LE
@@ -499,6 +504,7 @@ trace_count    uint32 LE
 ```
 
 Each `TraceEntry`:
+
 ```
 trace_id       [16]byte      // 128-bit trace ID
 block_count    uint16 LE     // Number of blocks containing this trace
@@ -520,6 +526,7 @@ self-contained trace lookup structure independent of the full metadata.
 Two versions are defined:
 
 ### Version 1 (legacy, no bloom filter)
+
 ```
 magic          uint32 LE     // Must equal 0xC01DC1DE
 version        uint8         // Must equal 1
@@ -531,6 +538,7 @@ trace_count    uint32 LE
 ```
 
 ### Version 2 (current, with trace ID bloom filter)
+
 ```
 magic          uint32 LE     // Must equal 0xC01DC1DE
 version        uint8         // Must equal 2
@@ -550,6 +558,7 @@ min(TraceIDBloomMaxBytes, traceCount × TraceIDBloomBitsPerTrace / 8))` bytes. R
 encounter an unknown version must return an error.
 
 Each `CompactBlockEntry`:
+
 ```
 file_offset    uint64 LE     // Absolute file byte offset of block payload
 file_length    uint32 LE     // Byte length of block payload
@@ -606,6 +615,7 @@ Each block payload is a self-contained binary blob with its own header.
 Immediately follows the block header. One entry per column, `column_count` entries total.
 
 Each `ColumnMetadataEntry`:
+
 ```
 name_len     uint16 LE
 name         [name_len]byte
@@ -714,7 +724,6 @@ Selection is gated by the writer flag `Config.DisableAllPresentEncoding` (defaul
 on). New kind IDs are additive — `enc_version` is unchanged and old readers reject unknown kinds.
 See writer NOTE-AP-001 / reader NOTE-AP-001.
 
-
 ### 9.1 Presence RLE
 
 Used in most encodings. A compact bitset with RLE compression:
@@ -732,7 +741,9 @@ version      uint8 = 1
 run_count    uint32 LE
 [run_count × Run]
 ```
+
 Each `Run`:
+
 ```
 length       uint32 LE    // Number of consecutive same-value bits
 value        uint32 LE    // 0 = absent, 1 = present
@@ -752,12 +763,14 @@ indexes        [see below]
 ```
 
 **Dictionary body (after zstd decompress):**
+
 ```
 entry_count    uint32 LE
 [entry_count × DictEntry]
 ```
 
 Entry format by type:
+
 - **String:** `len(4 LE uint32) + string_bytes`
 - **Int64:** `value(8 LE int64)`
 - **Uint64:** `value(8 LE uint64)`
@@ -770,12 +783,14 @@ Entry format by type:
 *Dense (kinds 1, 6):* indexes for all `row_count` rows, including nulls.
 
 *Sparse (kinds 2, 7):* only indexes for present rows, preceded by a count:
+
 ```
 present_count  uint32 LE
 [present_count × index_value]   // width bytes each
 ```
 
 *RLE (kinds 6, 7):* instead of raw indexes:
+
 ```
 index_count    uint32 LE         // Total number of index values
 rle_len        uint32 LE         // Byte length of RLE data
@@ -795,11 +810,13 @@ presence_rle   [see §9.1]
 ```
 
 *Dense (kind 3):*
+
 ```
 [row_count × (len(4 LE uint32) + byte_data)]
 ```
 
 *Sparse (kind 4):*
+
 ```
 present_count  uint32 LE
 [present_count × (len(4 LE uint32) + byte_data)]   // Only present rows
@@ -833,6 +850,7 @@ width          uint8            // Bytes per offset: 0 (no values), 1, 2, 4, or 
 ```
 
 If `width == 0`, no offsets follow. Otherwise:
+
 ```
 offset_len     uint32 LE
 offsets_zstd   [offset_len]byte  // zstd-compressed offset array
@@ -865,6 +883,7 @@ Reconstructed value = `base_value + offset`. The `packed_offsets` array is raw (
 the per-column outer snappy applies as for kind 5.
 
 **Selection (SPEC-006):** the writer chooses kind 22/23 over kind 5/17 only when **both**:
+
 1. bit packing saves at least `bitPackedDeltaMinSavedBits` (4) bits per offset versus the byte
    width — i.e. `byte_width*8 − bit_width ≥ 4` — and
 2. there are at least `bitPackedDeltaMinPresent` (64) present rows to amortize the fixed
@@ -910,6 +929,7 @@ There is **no** sparse or AllPresent variant: the gain is the per-page width ada
 presence layout, so kind 39 always emits the `presence_rle` segment.
 
 **Selection (SPEC-006):** the writer chooses kind 39 over kind 22/5 only when **both**:
+
 1. the column spans at least `pagedDeltaMinPages` (2) pages of present rows — i.e.
    `present_count ≥ 2 × deltaPageSize` — and
 2. the simulated sum of per-page packed bits is at least `1/pagedDeltaMinSavedBitFraction` (12.5%)
@@ -940,6 +960,7 @@ xor_data_zstd  [xor_len]byte    // zstd-compressed XOR payload
 ```
 
 XOR payload (after decompress): for each present row in order:
+
 ```
 val_len        uint32 LE
 xor_bytes      [val_len]byte    // XOR with previous present value; first value stored raw
@@ -995,18 +1016,21 @@ suffix_data_zstd [suffix_data_len]byte   // zstd-compressed suffix section
 ```
 
 **Prefix dictionary** (after decompress):
+
 ```
 prefix_count   uint32 LE
 [prefix_count × (len(4 LE uint32) + prefix_bytes)]
 ```
 
 **Suffix section** (after decompress):
+
 ```
 prefix_index_width  uint8           // 1, 2, or 4 bytes per prefix index
 [per present row × SuffixEntry]
 ```
 
 Each `SuffixEntry`:
+
 ```
 prefix_idx     [prefix_index_width bytes LE]   // Index into prefix dictionary; 0xFFFFFFFF = no prefix
 suffix_len     uint32 LE
@@ -1239,6 +1263,7 @@ columns using the `log.{key}` naming convention.
 Otherwise, attempt logfmt decode.
 
 **Extraction rules:**
+
 - JSON: all top-level keys are extracted. String values stored as-is. Non-string values
   (numbers, booleans, nested objects) are stored as `fmt.Sprint(value)`.
 - logfmt: all `key=value` pairs are extracted. Keys and values stored as-is. A plain
@@ -1271,6 +1296,7 @@ Back-ref: `internal/modules/blockio/writer/writer_log_body.go:parseLogBody`,
 ---
 
 ## 12. V14 Format — Per-Column Snappy, Sectioned Metadata, Footer V5
+
 *Added: 2026-04-10*
 
 V14 replaces V12/V13 (footer V3/V4) with a redesigned format. No backward compatibility
@@ -1453,6 +1479,7 @@ encoding_kind  uint8          // same kind table as §9
 ```
 
 Followed by encoding-specific bytes using the same wire format as §9 EXCEPT:
+
 - All `*_zstd[len+data]` sub-segments are replaced by `*_raw[len+data]` (raw bytes, no zstd).
 - `len` fields remain uint32 LE (unchanged).
 - Snappy compression is applied once at the column level (outside); zstd is entirely absent.
@@ -1479,6 +1506,7 @@ entry_count   uint32 LE
 ```
 
 **Type-keyed entry** (`entry_kind == 0x00` = `DirEntryKindType`) — 14 bytes:
+
 ```
 entry_kind      uint8        // 0x00
 section_type    uint8        // one of SectionBlockIndex..SectionFileBloom (0x01–0x06)
@@ -1487,6 +1515,7 @@ compressed_len  uint32 LE    // byte length of section snappy blob on disk
 ```
 
 **Name-keyed entry** (`entry_kind == 0x01` = `DirEntryKindName`) — 15+len(name) bytes:
+
 ```
 entry_kind      uint8        // 0x01
 name_len        uint16 LE    // byte length of column name
@@ -1499,6 +1528,7 @@ Name-keyed entries are used for file-level intrinsic column blobs. Each intrinsi
 gets its own entry, enabling direct per-column addressing without a separate TOC read.
 
 **Signal-type entry** (`entry_kind == 0x02` = `DirEntryKindSignal`) — 2 bytes total:
+
 ```
 entry_kind      uint8        // 0x02
 signal_type     uint8        // SignalTypeTrace=0x01 or SignalTypeLog=0x02
@@ -1529,6 +1559,7 @@ file?" without issuing any block I/O. This enables query planning to skip files 
 required columns entirely.
 
 At query time:
+
 - The section directory is read once (18-byte footer → `dir_offset`/`dir_len` → one
   snappy-compressed read).
 - `SectionDirectory.NameEntries` maps each intrinsic column name to its `(offset,
@@ -1611,6 +1642,7 @@ New readers that open old files receive (nil, 0, nil) from parseTSIndex and degr
 gracefully to metadata-scan mode in BlocksInTimeRange.
 
 ## SPEC-POOL-1
+
 **SpanFieldsAdapter pool ownership contract** — `NewSpanFieldsAdapter` and `ReleaseSpanFieldsAdapter`
 implement a `sync.Pool`-backed adapter lifecycle for `modulesSpanFieldsAdapter`. The following
 rules govern correct use:
@@ -1635,17 +1667,19 @@ rules govern correct use:
 
 Back-ref: `internal/modules/blockio/span_fields.go:NewSpanFieldsAdapter`,
           `internal/modules/blockio/span_fields.go:ReleaseSpanFieldsAdapter`,
-          `api.go:streamFilterProgram`, `api.go:streamLogProgram`,
+          `api.go:streamFilterProgram`,
           `reader.go:GetTraceByID`
 
 ---
 
 ## SPEC-FBLM-1
+
 **FileBloom section** — optional trailing section in the metadata blob, written after the sketch index.
 Stores a BinaryFuse8 filter for `resource.service.name` values, enabling O(1) file-level rejection
 for service-name equality predicates without opening any block.
 
 Wire format:
+
 ```
 magic[4 LE]     = 0x46424C4D ("FBLM")
 version[1]      = 0x01
@@ -1656,6 +1690,7 @@ per column (col_count entries, sorted by name):
 ```
 
 Properties:
+
 - `fuse_len = 0` means no values were observed (no data bytes follow); reader treats as `true` (conservative).
 - `col_count` is bounded to ≤ 1000 and validated against remaining bytes on parse.
 - Old readers that do not know about the FileBloom section will stop parsing after the sketch index without corruption (graceful degradation).

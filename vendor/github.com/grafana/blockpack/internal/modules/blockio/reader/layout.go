@@ -4,11 +4,8 @@ package reader
 
 import (
 	"cmp"
-	"encoding/binary"
 	"fmt"
-	"math"
 	"slices"
-	"time"
 
 	"github.com/klauspost/compress/snappy"
 
@@ -117,9 +114,7 @@ func (r *Reader) fileLayoutV8() (*FileLayoutReport, error) {
 			sectionName = "section.block_index"
 		case key.Type == shared.ToCTypeMetadata && key.SubType == shared.ToCSubTypeRange:
 			sectionName = "section.range_index[" + key.Name + "]"
-			if ct, ok := r.RangeColumnType(key.Name); ok {
-				colType = columnTypeName(ct)
-			}
+			// Range index removed in #439; column type no longer available here.
 		case key.Type == shared.ToCTypeMetadata && key.SubType == shared.ToCSubTypeSketch:
 			sectionName = "section.sketch_index[" + key.Name + "]"
 			// Don't set colType for sketch blobs — column type not available without parsing.
@@ -169,8 +164,8 @@ func (r *Reader) fileLayoutV8() (*FileLayoutReport, error) {
 	})
 
 	rangeIndex := r.buildRangeIndex()
-	sketchIndex := r.buildSketchIndexInfo()
-	fileBloom := r.buildFileBloomInfo()
+	var sketchIndex *SketchIndexInfo
+	var fileBloom *FileBloomInfo
 
 	spanCounts := make([]uint32, len(r.blockMetas))
 	var totalSpans int64
@@ -284,241 +279,8 @@ func (r *Reader) layoutBlockV14(blockIdx int, meta shared.BlockMeta) ([]FileLayo
 	return sections, nil
 }
 
-// buildSketchIndexInfo builds the SketchIndexInfo from the reader's parsed column-major sketch data.
-// Returns nil when no sketches are present.
-func (r *Reader) buildSketchIndexInfo() *SketchIndexInfo {
-	_ = r.ensureV14SketchSection()
-	if r.sketchIdx == nil || len(r.sketchIdx.columns) == 0 {
-		return nil
-	}
-
-	numBlocks := r.sketchIdx.numBlocks
-	presenceBytes := (numBlocks + 7) / 8
-	info := &SketchIndexInfo{
-		Blocks:      make([]BlockSketchSummary, numBlocks),
-		HeaderBytes: 12,
-	}
-
-	type blockColStat struct {
-		name        string
-		cardinality uint64
-		topkCount   int
-		topkBytes   int
-		fuseBytes   int
-	}
-	blockCols := make([][]blockColStat, numBlocks)
-
-	totalBytes := 12 // header: magic[4] + num_blocks[4] + num_columns[4]
-
-	for name, cd := range r.sketchIdx.columns {
-		presentCount := len(cd.presentMap)
-		// Per-column byte accounting.
-		totalBytes += 2 + len(name)    // name_len[2] + name
-		totalBytes += presenceBytes    // presence bitset
-		totalBytes += numBlocks * 4    // distinct counts
-		totalBytes += 1 + presentCount // topk_k[1] + entry_count per present block
-		hasBloom := cd.bloom != nil
-		if hasBloom {
-			totalBytes += 2 // bloom_size[2] — only present in SKTE/SKTD formats
-		}
-
-		for pi, blockIdx := range cd.presentMap {
-			topkEntries := len(cd.topkFP[pi])
-			topkBytesForBlock := 1 + topkEntries*10 // entry_count[1] + fp[8]+count[2] per entry
-			totalBytes += topkEntries * 10          // (entry_count already counted above)
-			bloomB := 0
-			if hasBloom && pi < len(cd.bloom) && cd.bloom[pi] != nil {
-				bloomB = len(cd.bloom[pi])
-				totalBytes += bloomB
-			}
-
-			stat := blockColStat{
-				name:        name,
-				cardinality: uint64(cd.distinctAt(blockIdx)),
-				topkCount:   topkEntries,
-				topkBytes:   topkBytesForBlock,
-				fuseBytes:   bloomB,
-			}
-			blockCols[blockIdx] = append(blockCols[blockIdx], stat)
-		}
-	}
-
-	info.TotalBytes = totalBytes
-
-	for blockIdx := range numBlocks {
-		cols := blockCols[blockIdx]
-		if len(cols) == 0 {
-			continue
-		}
-		info.SketchedBlockCount++
-
-		// Sort by column name for deterministic output.
-		slices.SortFunc(cols, func(a, b blockColStat) int { return cmp.Compare(a.name, b.name) })
-
-		stats := make([]ColumnSketchStat, 0, len(cols))
-		for _, c := range cols {
-			stats = append(stats, ColumnSketchStat{
-				ColumnName:     c.name,
-				HLLCardinality: c.cardinality,
-				FuseBytes:      c.fuseBytes,
-				TopKCount:      c.topkCount,
-				TopKBytes:      c.topkBytes,
-			})
-		}
-		info.Blocks[blockIdx] = BlockSketchSummary{Columns: stats}
-	}
-
-	return info
-}
-
-// buildRangeIndex parses every column's range index and returns the result sorted by column name.
-func (r *Reader) buildRangeIndex() []RangeIndexColumn {
-	// Collect range column names from the V8 ToC.
-	var rangeNames []string
-	for key := range r.tocMap {
-		if key.Type == shared.ToCTypeMetadata && key.SubType == shared.ToCSubTypeRange && key.Name != "" {
-			rangeNames = append(rangeNames, key.Name)
-		}
-	}
-	if len(rangeNames) == 0 {
-		return nil
-	}
-
-	cols := make([]RangeIndexColumn, 0, len(rangeNames))
-
-	for _, colName := range rangeNames {
-		if err := r.ensureRangeColumnParsed(colName); err != nil {
-			continue
-		}
-
-		idx := r.rangeParsed[colName]
-		col := RangeIndexColumn{
-			ColumnName: colName,
-			ColumnType: columnTypeName(idx.colType),
-			BucketMin:  formatBucketBound(idx.colType, idx.bucketMin),
-			BucketMax:  formatBucketBound(idx.colType, idx.bucketMax),
-			Buckets:    make([]RangeIndexBucket, 0, len(idx.entries)),
-		}
-
-		for _, entry := range idx.entries {
-			col.Buckets = append(col.Buckets, RangeIndexBucket{
-				Start:    formatRangeKey(idx.colType, entry.lower),
-				BlockIDs: entry.blockIDs,
-			})
-		}
-
-		// Populate End for each bucket where an upper bound is defined:
-		// End[i] = Start[i+1]; End[last] = BucketMax.
-		// For string/bytes range columns, BucketMax is empty and End must remain empty
-		// because the wire format does not encode an upper boundary.
-		if col.BucketMax != "" {
-			for i := range col.Buckets {
-				if i+1 < len(col.Buckets) {
-					col.Buckets[i].End = col.Buckets[i+1].Start
-				} else {
-					col.Buckets[i].End = col.BucketMax
-				}
-			}
-		}
-
-		cols = append(cols, col)
-	}
-
-	slices.SortFunc(cols, func(a, b RangeIndexColumn) int { return cmp.Compare(a.ColumnName, b.ColumnName) })
-
-	return cols
-}
-
-// formatBucketBound formats a bucket global min/max stored as int64 bits in parsedRangeIndex.
-// The bits field is the raw int64 from bucketMin/bucketMax (wire format: LE uint64 reread as int64).
-func formatBucketBound(colType shared.ColumnType, bits int64) string {
-	switch colType {
-	case shared.ColumnTypeRangeInt64:
-		return fmt.Sprintf("%d", bits)
-	case shared.ColumnTypeRangeDuration:
-		return time.Duration(bits).String()
-	case shared.ColumnTypeRangeUint64:
-		return fmt.Sprintf("%d", uint64(bits)) //nolint:gosec
-	case shared.ColumnTypeRangeFloat64:
-		return fmt.Sprintf("%g", math.Float64frombits(uint64(bits))) //nolint:gosec
-	default:
-		// String/bytes: bucketMin/Max are 0 (not stored in wire format for these types).
-		return ""
-	}
-}
-
-// formatRangeKey decodes an encoded lower-boundary key to a human-readable string.
-func formatRangeKey(colType shared.ColumnType, key string) string {
-	switch colType {
-	case shared.ColumnTypeRangeInt64:
-		return fmt.Sprintf("%d", decodeInt64Key(key))
-	case shared.ColumnTypeRangeDuration:
-		return time.Duration(decodeInt64Key(key)).String()
-	case shared.ColumnTypeRangeUint64:
-		return fmt.Sprintf("%d", decodeUint64Key(key))
-	case shared.ColumnTypeRangeFloat64:
-		return fmt.Sprintf("%g", decodeFloat64Key(key))
-	default: // RangeString, RangeBytes, plain types
-		return key
-	}
-}
-
-func (r *Reader) buildFileBloomInfo() *FileBloomInfo {
-	_ = r.ensureV14BloomSection()
-	raw := r.fileBloomRaw
-	if len(raw) == 0 {
-		return nil
-	}
-
-	info := &FileBloomInfo{
-		TotalBytes: len(raw),
-	}
-
-	// Wire: magic[4] + version[1] + col_count[4] = 9 bytes header.
-	if len(raw) < fileBloomMinLen {
-		return info
-	}
-	magic := binary.LittleEndian.Uint32(raw[0:])
-	if magic != shared.FileBloomMagic {
-		return info
-	}
-	if raw[4] != shared.FileBloomVersion {
-		return info
-	}
-	colCount := int(binary.LittleEndian.Uint32(raw[5:]))
-	pos := shared.CompactIndexHeaderSize
-	for range colCount {
-		if pos+2 > len(raw) {
-			break
-		}
-		nameLen := int(binary.LittleEndian.Uint16(raw[pos:]))
-		pos += 2
-		if pos+nameLen > len(raw) {
-			break
-		}
-		name := string(raw[pos : pos+nameLen])
-		pos += nameLen
-		if pos+4 > len(raw) {
-			break
-		}
-		fuseLen := int(binary.LittleEndian.Uint32(raw[pos:]))
-		pos += 4
-		if pos+fuseLen > len(raw) {
-			break
-		}
-		pos += fuseLen
-		info.Columns = append(info.Columns, FileBloomColumnInfo{
-			ColumnName: name,
-			FuseBytes:  fuseLen,
-		})
-	}
-
-	slices.SortFunc(info.Columns, func(a, b FileBloomColumnInfo) int {
-		return cmp.Compare(a.ColumnName, b.ColumnName)
-	})
-
-	return info
-}
+// buildRangeIndex is a no-op. The range index was removed in #439.
+func (r *Reader) buildRangeIndex() []RangeIndexColumn { return nil }
 
 // formatIntrinsicBound decodes an encoded intrinsic column boundary to a human-readable string.
 // For ColumnTypeUint64 (span:duration, span:start) the bound is an 8-byte LE uint64.

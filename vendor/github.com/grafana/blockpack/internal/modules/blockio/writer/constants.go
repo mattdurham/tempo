@@ -153,56 +153,6 @@ func zstdColumnsActive() bool {
 	return zstdColumnsEnabled.Load()
 }
 
-// restoreIdentityBlockColumnsEnabled is the process-level rollout toggle for the v2
-// self-contained-block format (NOTE-V2-004, issue #420). It defaults to false. When true,
-// the writer restores the three identity columns (trace:id, span:id, span:parent_id) into
-// per-inner-block column payloads in ADDITION to the file-level intrinsic section — the
-// dual storage that NOTE-469 (issue #389) had removed. v2 direct block fetch (#424) requires
-// every block to be self-contained, so a single ranged GET of the block bytes resolves a span
-// without consulting the IntrinsicTOC or SpanTree.
-//
-// Adding columns to a block is not a block-format version change (the block column set is
-// self-describing), so this is a pure encoder-side choice that any reader handles; it is
-// gated default-OFF so it can be rolled out deliberately and reverted by toggle. Atomic for
-// the same reason as zstdColumnsEnabled: a deploy-level constant accessed from the encoder
-// goroutine.
-var restoreIdentityBlockColumnsEnabled atomic.Bool //nolint:gochecknoglobals // process-level rollout flag
-
-// setRestoreIdentityBlockColumnsEnabled sets the process-level identity-block-column rollout flag.
-func setRestoreIdentityBlockColumnsEnabled(v bool) {
-	restoreIdentityBlockColumnsEnabled.Store(v)
-}
-
-// restoreIdentityBlockColumnsActive reports whether identity columns are written into
-// per-inner-block payloads (v2 self-contained blocks).
-func restoreIdentityBlockColumnsActive() bool {
-	return restoreIdentityBlockColumnsEnabled.Load()
-}
-
-// omitIntrinsicTOCEnabled is the process-level rollout toggle for skipping the file-level
-// IntrinsicTOC section entirely (NOTE-V2-005, issue #421). Defaults to false. When true the
-// writer skips both the file-level intrinsic spillMerge and the IntrinsicTOC ToCEntry
-// emission, so no IntrinsicTOC section reaches the file. Only meaningful alongside
-// restoreIdentityBlockColumnsEnabled (every intrinsic column must already be in the blocks);
-// NewWriterWithConfig only sets this true when RestoreIdentityBlockColumns is also true.
-//
-// Not writing a section is not a block-format version change, so this is a pure encoder-side
-// choice that any reader handles (the reader's IntrinsicTOC consultation is already a fallback
-// behind per-block columns). Atomic for the same reason as restoreIdentityBlockColumnsEnabled:
-// a deploy-level constant accessed from the encoder goroutine.
-var omitIntrinsicTOCEnabled atomic.Bool //nolint:gochecknoglobals // process-level rollout flag
-
-// setOmitIntrinsicTOCEnabled sets the process-level IntrinsicTOC-omission rollout flag.
-func setOmitIntrinsicTOCEnabled(v bool) {
-	omitIntrinsicTOCEnabled.Store(v)
-}
-
-// omitIntrinsicTOCActive reports whether the file-level IntrinsicTOC section is skipped
-// (v2 self-contained blocks; all intrinsics live in the per-inner-block payloads).
-func omitIntrinsicTOCActive() bool {
-	return omitIntrinsicTOCEnabled.Load()
-}
-
 // zstd benefit gate (NOTE-405, issue #355). A column blob switches from snappy to zstd only
 // when len(zstd) * zstdBenefitDen < len(snappy) * zstdBenefitNum, i.e. zstd is at least
 // (1 - Num/Den) smaller than snappy. With Num=97, Den=100 a blob must be >=3% smaller under
@@ -292,16 +242,4 @@ const (
 	deltaRangeThreshold16     = 65535
 	deltaRangeThreshold32     = 4_294_967_295
 	deltaCardinalityThreshold = 3
-	defaultRangeBuckets       = 1000
-	// exactCardinalityThreshold is the maximum number of distinct values for a range
-	// column to use an exact-value index instead of KLL quantile boundaries. When a
-	// column has ≤ this many distinct values across all blocks, each value maps directly
-	// to its block IDs with zero false positives. Above this threshold, the KLL-based
-	// range index is used (bounded false positives, O(1) memory per column).
-	// NOTE-38: exact-value index for low-cardinality columns.
-	exactCardinalityThreshold = 100
-	// rangeBucketKeyMaxLen is the maximum byte length of a RangeString/RangeBytes
-	// bucket key. Keys are the lower boundary of the bucket range, truncated to this length.
-	// See SPECS §5.2.1.
-	rangeBucketKeyMaxLen = 50
 )

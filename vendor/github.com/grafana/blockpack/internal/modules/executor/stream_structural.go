@@ -1613,14 +1613,14 @@ func expandStructuralBlocksForTraces(
 		seenTraces[flat[i].traceID] = struct{}{}
 	}
 
-	// Find blocks referenced by those traces that were not already fetched.
+	// Find blocks not yet fetched that may contain ancestor spans.
+	// The TraceID index was removed (#438); fall back to fetching all un-scanned blocks.
+	_ = seenTraces
 	var extraBlockIDs []int
-	for traceID := range seenTraces {
-		for _, entry := range r.TraceEntries(traceID) {
-			if _, already := rawBlocks[entry.BlockID]; !already {
-				extraBlockIDs = append(extraBlockIDs, entry.BlockID)
-				rawBlocks[entry.BlockID] = nil // mark as pending to avoid duplicates
-			}
+	for i := range r.BlockCount() {
+		if _, already := rawBlocks[i]; !already {
+			extraBlockIDs = append(extraBlockIDs, i)
+			rawBlocks[i] = nil // mark as pending
 		}
 	}
 	if len(extraBlockIDs) == 0 {

@@ -148,6 +148,25 @@ type BlockpackConfig struct {
 	// ValueIndexCompactor configures the value-index compactor Tempo target
 	// (-target=value-index-compactor). Disabled by default.
 	ValueIndexCompactor ValueIndexCompactorConfig `yaml:"value_index_compactor"`
+
+	// ValueIndexQuery configures the querier-side index-driven query path
+	// (blockpack issue #461). When enabled, the blockpack querier discovers and
+	// downloads value-index files to answer search/metrics queries with block-level
+	// pruning, falling back to a full block scan when the index lacks coverage.
+	// Disabled by default; queriers opt in via value_index_query.enabled.
+	ValueIndexQuery ValueIndexQueryConfig `yaml:"value_index_query"`
+}
+
+// ValueIndexQueryConfig configures the querier-side index-driven query path.
+type ValueIndexQueryConfig struct {
+	// Enabled turns on the index-driven query path on this querier.
+	Enabled bool `yaml:"enabled"`
+	// IndexPrefix is the S3 key prefix under which value-index files live. It must
+	// match the consumer/compactor index_prefix (default: "indexes").
+	IndexPrefix string `yaml:"index_prefix"`
+	// CacheTTL is the refresh interval for the in-process index-file listing cache
+	// (blockpack issue #462). Zero uses the blockpack default (30s).
+	CacheTTL time.Duration `yaml:"cache_ttl"`
 }
 
 // BlockEventsConfig mirrors blockevents.Config. It is a separate Tempo struct so
@@ -155,9 +174,6 @@ type BlockpackConfig struct {
 type BlockEventsConfig struct {
 	// Enabled turns on event publishing. When false no events are emitted.
 	Enabled bool `yaml:"enabled"`
-	// RqliteURL is the HTTP URL of the rqlite cluster (e.g. "http://rqlite:4001").
-	// When set, rqlite is used as the transport instead of Redis.
-	RqliteURL string `yaml:"rqlite_url"`
 	// RedisAddr is the host:port of the Redis server backing the stream.
 	RedisAddr string `yaml:"redis_addr"`
 	// StreamName is the Redis stream key (default: "blockpack-events").
@@ -296,7 +312,6 @@ func ValidateConfig(b *BlockConfig) error {
 // Mirrors valueindexconsumer.Config for YAML decoding without a direct blockpack import.
 type ValueIndexConsumerConfig struct {
 	Enabled            bool          `yaml:"enabled"`
-	RqliteURL          string        `yaml:"rqlite_url"`
 	RedisAddr          string        `yaml:"redis_addr"`
 	StreamName         string        `yaml:"stream_name"`
 	ConsumerGroup      string        `yaml:"consumer_group"`

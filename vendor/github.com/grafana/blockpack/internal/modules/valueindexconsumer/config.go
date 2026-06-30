@@ -68,10 +68,6 @@ type Config struct {
 	Logger *slog.Logger `yaml:"-"`
 	// RedisAddr is the host:port of the Redis server backing the stream.
 	RedisAddr string `yaml:"redis_addr"`
-	// RqliteURL is the HTTP URL of the rqlite cluster backing the job table
-	// (e.g. "http://rqlite:4001"). Used by NewRqliteConsumer; ignored by the
-	// Redis consumer. See NOTE-VI-021.
-	RqliteURL string `yaml:"rqlite_url"`
 	// StreamName is the Redis stream key consumed. Defaults to
 	// DefaultStreamName when empty.
 	StreamName string `yaml:"stream_name"`

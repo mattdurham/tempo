@@ -89,12 +89,7 @@ func gatherEntries(ctx context.Context, readers []*Reader, checker RefChecker) (
 	var all []rawEntry
 	var stats CompactStats
 	for _, r := range readers {
-		dataLen := r.chunkDataLen()
-		var chunkData []byte
-		if dataLen > 0 {
-			chunkData = r.data[r.chunkStart : r.chunkStart+dataLen]
-		}
-		entries, err := DecodeAllChunks(chunkData, r.chunkDir)
+		entries, err := r.DecodeAllEntries()
 		if err != nil {
 			return nil, CompactStats{}, err
 		}
@@ -116,6 +111,7 @@ func gatherEntries(ctx context.Context, readers []*Reader, checker RefChecker) (
 				valueHash:      ValueHash16(e.Value),
 				traceID:        e.TraceID,
 				sourceRef:      e.SourceRef,
+				blockID:        e.BlockID,
 				blockRef:       e.BlockRef,
 				timeSec:        e.TimeSec,
 			})

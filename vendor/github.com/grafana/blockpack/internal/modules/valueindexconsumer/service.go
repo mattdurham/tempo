@@ -79,16 +79,15 @@ type bufferKey struct {
 //
 //	[1]  col_type
 //	[16] trace_id
-//	[4]  block_id
+//	[4]  block_id (0 for v2 entries)
+//	[5]  block_ref: block_page[3]+block_len_pages[2] (all zero for v1 entries)
 //	[8]  time_sec
 //	[4]  source_ref_len
-//	[N]  source_ref bytes
 //	[4]  value_len
-//	[M]  value bytes (canonical encoding from valueindex)
-//
-// entryFixedSize is the fixed header of a spilled ColumnEntry (NOTE-V2-002):
-// col_type[1] + trace_id[16] + block_ref[5] + time_sec[8] + src_len[4] + val_len[4].
-const entryFixedSize = 1 + 16 + shared.BlockFileRefWireSize + 8 + 4 + 4 // 38 bytes
+const (
+	entryFixedSize   = 1 + 16 + 4 + 5 + 8 + 4 + 4 // 42 bytes
+	entryBlockRefOff = 1 + 16 + 4                 // offset of block_ref in fixed header
+)
 
 // Service is the value-index consumer orchestrator. It is single-goroutine: Run
 // owns all mutable state, so no locking is required.
@@ -399,11 +398,21 @@ func (s *Service) flushColumn(ctx context.Context, buf *columnBuffer) error {
 			s.metrics.incError(consumerOpFlush)
 			return fmt.Errorf("valueindexconsumer: read spill %q: %w", buf.colName, err)
 		}
-		entryCount++
-		if err := w.AddEntry(e.Value, e.TraceID, e.SourceRef, e.BlockRef, e.TimeSec); err != nil {
+		var addErr error
+		if e.BlockRef.PageNum > 0 || e.BlockRef.LenPages > 0 {
+			if e.SpanID != ([8]byte{}) {
+				addErr = w.AddEntryV4(e.Value, e.TraceID, e.SourceRef, e.BlockRef, e.TimeSec, e.SpanID, e.RowIdx)
+			} else {
+				addErr = w.AddEntryV2(e.Value, e.TraceID, e.SourceRef, e.BlockRef, e.TimeSec)
+			}
+		} else {
+			addErr = w.AddEntry(e.Value, e.TraceID, e.SourceRef, e.BlockID, e.TimeSec)
+		}
+		if err := addErr; err != nil {
 			s.metrics.incError(consumerOpFlush)
 			return fmt.Errorf("valueindexconsumer: add entry %q: %w", buf.colName, err)
 		}
+		entryCount++
 	}
 
 	data, err := w.Flush(ctx, 0)
@@ -412,7 +421,16 @@ func (s *Service) flushColumn(ctx context.Context, buf *columnBuffer) error {
 		return fmt.Errorf("valueindexconsumer: flush writer %q: %w", buf.colName, err)
 	}
 
-	key := s.indexKey(buf.tenant, buf.colHash, buf.colType)
+	// NOTE-VI-030 (#431): embed wall time range in filename for O(1) file discovery.
+	var wallMin, wallMax uint64
+	if r, readErr := valueindex.OpenReader(data); readErr == nil {
+		m := r.Meta()
+		wallMin, wallMax = m.WallMinTS, m.WallMaxTS
+	}
+	// WallMinTS/WallMaxTS are already in seconds (= TimeSec values from entries).
+	wallMinSec := wallMin
+	wallMaxSec := wallMax
+	key := s.indexKeyV2(buf.tenant, buf.colHash, buf.colType, wallMinSec, wallMaxSec)
 	if err := s.store.Put(key, data); err != nil {
 		s.metrics.incError(consumerOpFlush)
 		return fmt.Errorf("valueindexconsumer: put %q: %w", key, err)
@@ -474,11 +492,22 @@ func (s *Service) flushColumn(ctx context.Context, buf *columnBuffer) error {
 func (s *Service) closeAllBuffers() {
 	for _, buf := range s.buffers {
 		_ = buf.file.Close()
-		_ = os.Remove(buf.file.Name())
+		_ = os.Remove(buf.file.Name()) //nolint:gosec // G703: name comes from os.CreateTemp, not user input
 	}
 }
 
-// indexKey builds the object key for a flushed L0 file:
+// indexKeyV2 builds the object key with embedded time range (NOTE-VI-030, #431).
+func (s *Service) indexKeyV2(tenant, colHash string, colType shared.ColumnType, wallMinSec, wallMaxSec uint64) string {
+	return path.Join(
+		tenant,
+		s.cfg.IndexPrefix,
+		colHash,
+		valueindex.ColTypeName(colType),
+		valueindex.FormatFilenameV2(0, wallMinSec, wallMaxSec, valueindex.NewID()),
+	)
+}
+
+// indexKey builds the object key for a flushed L0 file (legacy, without time range):
 //
 //	<tenant>/<index_prefix>/<col_hash>/<type>/L0-<xid>.blockpack
 //
@@ -524,12 +553,17 @@ func writeEntry(w io.Writer, e ColumnEntry) error {
 	var buf [entryFixedSize]byte
 	buf[0] = byte(e.ColType)
 	copy(buf[1:17], e.TraceID[:])
-	if encErr := shared.EncodeBlockFileRef(buf[17:22], e.BlockRef); encErr != nil {
-		return fmt.Errorf("valueindexconsumer: encode block ref: %w", encErr)
-	}
-	binary.LittleEndian.PutUint64(buf[22:30], e.TimeSec)
-	binary.LittleEndian.PutUint32(buf[30:34], uint32(len(e.SourceRef))) //nolint:gosec
-	binary.LittleEndian.PutUint32(buf[34:38], uint32(len(val)))         //nolint:gosec
+	binary.LittleEndian.PutUint32(buf[17:21], e.BlockID)
+	// BlockRef fields (block_page[3]+block_len_pages[2]) at offset 21. Each byte() is an
+	// intentional little-endian mask (the encoding itself), not a lossy overflow.
+	buf[entryBlockRefOff+0] = byte(e.BlockRef.PageNum)       //nolint:gosec // LE byte 0
+	buf[entryBlockRefOff+1] = byte(e.BlockRef.PageNum >> 8)  //nolint:gosec // LE byte 1
+	buf[entryBlockRefOff+2] = byte(e.BlockRef.PageNum >> 16) //nolint:gosec // LE byte 2 (uint24)
+	buf[entryBlockRefOff+3] = byte(e.BlockRef.LenPages)      //nolint:gosec // LE byte 0
+	buf[entryBlockRefOff+4] = byte(e.BlockRef.LenPages >> 8) //nolint:gosec // LE byte 1
+	binary.LittleEndian.PutUint64(buf[26:34], e.TimeSec)
+	binary.LittleEndian.PutUint32(buf[34:38], uint32(len(e.SourceRef))) //nolint:gosec
+	binary.LittleEndian.PutUint32(buf[38:42], uint32(len(val)))         //nolint:gosec
 
 	if _, werr := w.Write(buf[:]); werr != nil {
 		return werr
@@ -554,13 +588,20 @@ func readEntry(r io.Reader) (ColumnEntry, error) {
 	colType := shared.ColumnType(hdr[0])
 	var traceID [16]byte
 	copy(traceID[:], hdr[1:17])
-	blockRef, brErr := shared.DecodeBlockFileRef(hdr[17:22])
-	if brErr != nil {
-		return ColumnEntry{}, fmt.Errorf("valueindexconsumer: decode block ref: %w", brErr)
+	blockID := binary.LittleEndian.Uint32(hdr[17:21])
+	blockRef := valueindex.BlockRef{
+		PageNum: uint32(
+			hdr[entryBlockRefOff+0],
+		) | uint32(
+			hdr[entryBlockRefOff+1],
+		)<<8 | uint32(
+			hdr[entryBlockRefOff+2],
+		)<<16,
+		LenPages: uint16(hdr[entryBlockRefOff+3]) | uint16(hdr[entryBlockRefOff+4])<<8,
 	}
-	timeSec := binary.LittleEndian.Uint64(hdr[22:30])
-	srcLen := binary.LittleEndian.Uint32(hdr[30:34])
-	valLen := binary.LittleEndian.Uint32(hdr[34:38])
+	timeSec := binary.LittleEndian.Uint64(hdr[26:34])
+	srcLen := binary.LittleEndian.Uint32(hdr[34:38])
+	valLen := binary.LittleEndian.Uint32(hdr[38:42])
 
 	src := make([]byte, srcLen)
 	if _, err := io.ReadFull(r, src); err != nil {
@@ -578,6 +619,7 @@ func readEntry(r io.Reader) (ColumnEntry, error) {
 	return ColumnEntry{
 		ColType:   colType,
 		TraceID:   traceID,
+		BlockID:   blockID,
 		BlockRef:  blockRef,
 		TimeSec:   timeSec,
 		SourceRef: string(src),

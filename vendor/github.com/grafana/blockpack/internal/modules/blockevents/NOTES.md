@@ -121,3 +121,21 @@ Back-refs:
 `internal/modules/blockevents/config.go`,
 `blockevents/blockevents.go`,
 `cmd/deadcode/main.go`
+
+## NOTE-VI-021-TOMBSTONE — rqlite publisher removed (issue #417)
+
+Date: 2026-06-28
+
+The rqlite-backed `RqlitePublisher` (NOTE-VI-021) has been removed as part of the
+blockpack v2 lean-format work (issue #417). The async queue-based value-indexing
+pipeline is being replaced by a synchronous `ValueIndexSink` callback on
+`WriterConfig` and `compaction.Config` that the block builder and compactor call
+inline after each successful Flush.
+
+Removed:
+- `internal/modules/blockevents/rqlite.go`
+- `Config.RqliteURL` field
+- `NewRqlitePublisher` constructor
+- `blockevents.RqlitePublisher` public type alias
+
+The Redis Streams publisher remains for operators who prefer the async pipeline.

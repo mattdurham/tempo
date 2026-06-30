@@ -10,7 +10,6 @@ import (
 	"math"
 	"slices"
 	"sync"
-	"unsafe"
 
 	tempotrace "github.com/grafana/tempo/pkg/tempopb/trace/v1"
 	"github.com/klauspost/compress/snappy"
@@ -100,9 +99,6 @@ func getColumnZstdEncoder() *zstd.Encoder {
 // The map key is the column name; the value holds min/max encoded keys.
 // column name → min/max for this block
 
-// colSketches accumulates HLL, TopK, and fuse keys per column for this block.
-// Populated alongside colMinMax; flushed at block write time.
-
 // builderCache holds reset column builders from previous blocks, keyed by (name, type).
 // On addColumn, a matching builder is popped from the cache and reused, avoiding
 // fresh slice allocations. Most blocks share the same attribute columns, so the
@@ -152,16 +148,10 @@ func (b *blockBuilder) reset(spanHint int) {
 		delete(b.columns, key)
 	}
 
-	// Allocate fresh maps for traceRows and colMinMax rather than clearing in-place.
-	// builtBlock captures direct references to these maps, so clearing in-place would
-	// corrupt a previously returned builtBlock if this blockBuilder is reused (via bbPool)
-	// by a concurrent goroutine before the serial merge pass consumes that builtBlock.
-	// Consistent with colSketches which is always replaced, not cleared.
-	b.traceRows = make(map[[16]byte]struct{}, len(b.traceRows))
+	// Allocate fresh colMinMax map rather than clearing in-place.
+	// builtBlock captures a direct reference so clearing in-place would corrupt a
+	// previously returned builtBlock if this blockBuilder is reused (via bbPool).
 	b.colMinMax = make(map[string]*blockColMinMax, len(b.colMinMax))
-
-	// Reset colSketches for reuse (pool-aware).
-	b.colSketches = getBlockSketchSet()
 }
 
 // buildBlock constructs a single block from the given pending spans and returns
@@ -176,17 +166,17 @@ func (b *blockBuilder) reset(spanHint int) {
 // as dedicated columns (in addition to the standard block column write). May be nil.
 func buildBlock(
 	pending []pendingSpan, bb *blockBuilder, blockVersion uint8,
-	intrinsicAccum *intrinsicAccumulator, blockID int, spanVectors [][]float32,
-	dedicatedCols map[string]struct{},
+	_ interface{}, blockID int, spanVectors [][]float32, // intrinsicAccum removed in #433
+	dedicatedCols map[string]struct{}, v2IdentityInBlock bool,
 ) (builtBlock, *blockBuilder, error) {
 	if bb != nil {
 		bb.reset(len(pending))
 	} else {
 		bb = newBlockBuilder(len(pending))
 	}
-	bb.intrinsicAccum = intrinsicAccum
 	bb.dedicatedCols = dedicatedCols
 	bb.intrinsicBlockID = uint16(blockID) //nolint:gosec // safe: blockID bounded by 65534 (checked by caller)
+	bb.v2IdentityInBlock = v2IdentityInBlock
 
 	// Pre-build per-(reader, srcBlockIdx) intrinsic index to avoid O(N) linear scans
 	// inside feedIntrinsicsFromIndex. Index is built once per unique (reader, blockIdx)
@@ -231,6 +221,8 @@ func buildBlock(
 				// no trace:id block column, so this gate routes them through
 				// feedIntrinsicsFromIndex, which carries all three identity columns
 				// (incl. span:parent_id) from the source intrinsic section.
+				// For v2 source blocks, identity IS in the block column; addRowFromBlock
+				// handled it already via applyTraceID, so the check still works.
 				if ps.srcBlock.GetColumn(traceIDColumnName) == nil {
 					bb.feedIntrinsicsFromIndex(intrinsicIndexCache[k], ps.srcRowIdx, rowIdx)
 				}
@@ -255,18 +247,15 @@ func buildBlock(
 	if err != nil {
 		return builtBlock{}, bb, err
 	}
+	// NOTE: colStats field removed from builtBlock (2026-06-29, in-file block pruning removal).
 	return builtBlock{
-		payload:     payload,
-		spanCount:   bb.spanCount,
-		minStart:    bb.minStart,
-		maxStart:    bb.maxStart,
-		minTraceID:  bb.minTraceID,
-		maxTraceID:  bb.maxTraceID,
-		traceRows:   bb.traceRows,
-		colMinMax:   bb.colMinMax,
-		colStats:    append([]shared.ColStat(nil), bb.colStats...),
-		colSketches: bb.colSketches,
-		localAccum:  intrinsicAccum,
+		payload:    payload,
+		spanCount:  bb.spanCount,
+		minStart:   bb.minStart,
+		maxStart:   bb.maxStart,
+		minTraceID: bb.minTraceID,
+		maxTraceID: bb.maxTraceID,
+		colMinMax:  bb.colMinMax,
 	}, bb, nil
 }
 
@@ -277,9 +266,7 @@ func buildBlock(
 func newBlockBuilder(spanHint int) *blockBuilder {
 	b := &blockBuilder{
 		columns:          make(map[shared.ColumnKey]columnBuilder, 32),
-		traceRows:        make(map[[16]byte]struct{}, 16),
 		colMinMax:        make(map[string]*blockColMinMax, 64),
-		colSketches:      newBlockSketchSet(),
 		builderCache:     make(map[shared.ColumnKey]columnBuilder, 32),
 		spanHint:         spanHint,
 		spanColNames:     make(map[string]string, 32),
@@ -320,30 +307,18 @@ func (b *blockBuilder) addColumn(name string, typ shared.ColumnType) columnBuild
 
 // feedIntrinsicUint64 feeds a uint64 value to the intrinsic accumulator if present.
 func (b *blockBuilder) feedIntrinsicUint64(name string, colType shared.ColumnType, val uint64, rowIdx int) {
-	if a := b.intrinsicAccum; a != nil {
-		a.feedUint64(name, colType, val, b.intrinsicBlockID, rowIdx)
-	}
 }
 
 // feedIntrinsicString feeds a string value to the intrinsic accumulator if present.
 func (b *blockBuilder) feedIntrinsicString(name string, colType shared.ColumnType, val string, rowIdx int) {
-	if a := b.intrinsicAccum; a != nil && val != "" {
-		a.feedString(name, colType, val, b.intrinsicBlockID, rowIdx)
-	}
 }
 
 // feedIntrinsicInt64 feeds an int64 value to the intrinsic accumulator if present.
 func (b *blockBuilder) feedIntrinsicInt64(name string, colType shared.ColumnType, val int64, rowIdx int) {
-	if a := b.intrinsicAccum; a != nil {
-		a.feedInt64(name, colType, val, b.intrinsicBlockID, rowIdx)
-	}
 }
 
 // feedIntrinsicBytes feeds a bytes value to the intrinsic accumulator if present.
 func (b *blockBuilder) feedIntrinsicBytes(name string, colType shared.ColumnType, val []byte, rowIdx int) {
-	if a := b.intrinsicAccum; a != nil && len(val) > 0 {
-		a.feedBytes(name, colType, val, b.intrinsicBlockID, rowIdx)
-	}
 }
 
 // hardcodedIntrinsicCols mirrors the columns that vParquet4 stores as first-class
@@ -391,44 +366,36 @@ func (b *blockBuilder) feedDedicatedAttrValue(name string, val shared.AttrValue,
 	}
 }
 
-// feedSpanIdentifiers writes trace:id, span:id, and span:parent_id to the intrinsic
-// accumulator only. spanID and parentSpanID are written only when non-empty.
+// feedSpanIdentifiers writes trace:id, span:id, and span:parent_id.
 //
-// NOTE-469 (issue #389, completes NOTE-050): these three identity columns are stored
-// exclusively in the intrinsic section, NOT duplicated into per-inner-block column
-// payloads. All readers source them from the intrinsic section (or the SpanTree for
-// GetTraceByID, NOTE-468) — see writer/NOTES.md NOTE-469 for the full callsite audit.
-// The block-column writes (addPresent) and range-index updates (updateMinMax) for these
-// columns are therefore removed; trace:id was never range-indexed (unique per trace) and
-// span:id/span:parent_id min/max are unused for block pruning.
+// v1 (NOTE-469, issue #389): feeds the per-block intrinsic accumulator only.
+// The file-level IntrinsicTOC and SpanTree are the sole identity stores.
+//
+// v2 (NOTE-V2-003, issue #417): the IntrinsicTOC and SpanTree are not written.
+// Identity MUST be in the inner-block column payload so a querier that fetches
+// a block directly (via BlockRef page address) can decode identity from the block
+// bytes alone. When b.v2IdentityInBlock is set, addPresent writes each column
+// to the block payload IN ADDITION to the per-block accumulator feed (which is
+// needed for dedup index construction during compaction).
 func (b *blockBuilder) feedSpanIdentifiers(traceID, spanID, parentSpanID []byte, rowIdx int) {
-	// NOTE-V2-004 (issue #420): when the v2 self-contained-block toggle is set, also write the
-	// three identity columns into per-inner-block payloads (dual storage) so a direct ranged-GET
-	// block fetch (#424) resolves a span without consulting the IntrinsicTOC or SpanTree. Default
-	// OFF — identity columns remain intrinsic-only per NOTE-469.
-	restoreBlockCols := restoreIdentityBlockColumnsActive()
-
+	// After IntrinsicTOC removal (#433), identity fields always go to block columns.
 	// trace:id — always present.
 	b.feedIntrinsicBytes(traceIDColumnName, shared.ColumnTypeBytes, traceID, rowIdx)
-	if restoreBlockCols && len(traceID) > 0 {
+	if len(traceID) > 0 {
 		b.addPresent(rowIdx, traceIDColumnName, shared.ColumnTypeBytes,
 			shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: traceID})
 	}
 
 	if len(spanID) > 0 {
 		b.feedIntrinsicBytes(spanIDColumnName, shared.ColumnTypeBytes, spanID, rowIdx)
-		if restoreBlockCols {
-			b.addPresent(rowIdx, spanIDColumnName, shared.ColumnTypeBytes,
-				shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: spanID})
-		}
+		b.addPresent(rowIdx, spanIDColumnName, shared.ColumnTypeBytes,
+			shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: spanID})
 	}
 
 	if len(parentSpanID) > 0 {
 		b.feedIntrinsicBytes(spanParentIDColumnName, shared.ColumnTypeBytes, parentSpanID, rowIdx)
-		if restoreBlockCols {
-			b.addPresent(rowIdx, spanParentIDColumnName, shared.ColumnTypeBytes,
-				shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: parentSpanID})
-		}
+		b.addPresent(rowIdx, spanParentIDColumnName, shared.ColumnTypeBytes,
+			shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: parentSpanID})
 	}
 }
 
@@ -469,10 +436,7 @@ func (b *blockBuilder) feedSpanTiming(start, end uint64, rowIdx int) {
 	b.feedIntrinsicUint64(spanStartColumnName, shared.ColumnTypeUint64, start, rowIdx)
 	b.addPresent(rowIdx, spanStartColumnName, shared.ColumnTypeUint64,
 		shared.AttrValue{Type: shared.ColumnTypeUint64, Uint: start})
-	// Task T-TS-2: implied timestamp sketch — 1-second bucket granularity.
-	if start > 0 {
-		b.colSketches.add(sketchTimestampColName, encodeSecondBucket(start))
-	}
+	// (T-TS-2 implied-timestamp sketch removed with the KLL sketch index in #435.)
 
 	// span:end — NOT stored as a per-row block column (NOTE-399). Synthesized from
 	// span:start + span:duration on read. Only the range-index min/max is updated so
@@ -683,7 +647,6 @@ func (b *blockBuilder) addRowFromProto(ps *pendingSpan, rowIdx int) {
 	b.feedProtoScopeAttrs(ps, rowIdx)
 
 	b.updateBlockBounds(span.StartTimeUnixNano, ps.traceID)
-	b.traceRows[ps.traceID] = struct{}{}
 	b.spanCount++
 }
 
@@ -719,7 +682,6 @@ func (b *blockBuilder) addRowFromTempoProto(ps *pendingSpan, rowIdx int) {
 	b.feedTempoScopeAttrs(ps, rowIdx)
 
 	b.updateBlockBounds(span.StartTimeUnixNano, ps.traceID)
-	b.traceRows[ps.traceID] = struct{}{}
 	b.spanCount++
 }
 
@@ -798,53 +760,46 @@ func readDynAttrValue(col *modules_reader.Column, rowIdx int, baseType shared.Co
 	return val, true
 }
 
-// applyTraceID feeds trace:id into the intrinsic accumulator and, when the v2
-// self-contained-block toggle is set (NOTE-V2-004, issue #420), into the per-inner-block
-// payload. Returns the extracted traceID and whether it was valid.
+// applyTraceID feeds trace:id into the intrinsic accumulator (NOTE-469: intrinsic-only,
+// no block column). For v2 output (b.v2IdentityInBlock), also writes to the block payload.
+// Returns the extracted traceID and whether it was valid.
 //
-// This path fires only when compacting a source block that carries the trace:id block
-// column — either a legacy dual-storage block (NOTE-469) or a v2 self-contained block. v4+
-// intrinsic-only sources have no such column; their identity fields are carried via
-// feedIntrinsicsFromIndex instead (see appendBlockBuilders). The block-payload gate in
-// appendBlockBuilders skips feedIntrinsicsFromIndex when the trace:id block column is present,
-// so the dual write here does not double-feed the intrinsic accumulator.
+// NOTE-469: fires only when compacting a legacy dual-storage source block that carries
+// the trace:id block column. v4+ sources carry identity via feedIntrinsicsFromIndex.
+// applyTraceID copies trace:id from source to destination block. After #433, always writes to block column.
 func (b *blockBuilder) applyTraceID(
 	col *modules_reader.Column,
 	srcRowIdx, dstRowIdx int,
 ) (traceID [16]byte, found bool) {
 	if v, ok := col.BytesValue(srcRowIdx); ok && len(v) == 16 {
 		copy(traceID[:], v)
-		b.feedIntrinsicBytes(traceIDColumnName, shared.ColumnTypeBytes, v, dstRowIdx)
-		if restoreIdentityBlockColumnsActive() {
-			b.addPresent(dstRowIdx, traceIDColumnName, shared.ColumnTypeBytes,
-				shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: v})
-		}
+		b.feedIntrinsicBytes("trace:id", shared.ColumnTypeBytes, v, dstRowIdx)
+		b.addPresent(dstRowIdx, traceIDColumnName, shared.ColumnTypeBytes,
+			shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: v})
 		return traceID, true
 	}
 	return traceID, false
 }
 
-// applySpanID feeds span:id into the intrinsic accumulator and, when the v2 toggle is set,
-// into the per-inner-block payload (NOTE-V2-004). See applyTraceID for the dual-write rationale.
+// applySpanID feeds span:id into the intrinsic accumulator (NOTE-469: intrinsic-only,
+// no block column). For v2 output (b.v2IdentityInBlock), also writes to the block payload.
+// Legacy-source path only — see applyTraceID.
 func (b *blockBuilder) applySpanID(col *modules_reader.Column, srcRowIdx, dstRowIdx int) {
+	// After #433 (IntrinsicTOC removal), always write to block columns.
 	if v, ok := col.BytesValue(srcRowIdx); ok && len(v) > 0 {
 		b.feedIntrinsicBytes(spanIDColumnName, shared.ColumnTypeBytes, v, dstRowIdx)
-		if restoreIdentityBlockColumnsActive() {
-			b.addPresent(dstRowIdx, spanIDColumnName, shared.ColumnTypeBytes,
-				shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: v})
-		}
+		b.addPresent(dstRowIdx, spanIDColumnName, shared.ColumnTypeBytes,
+			shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: v})
 	}
 }
 
-// applySpanParentID feeds span:parent_id into the intrinsic accumulator and, when the v2
-// toggle is set, into the per-inner-block payload (NOTE-V2-004). See applyTraceID.
+// applySpanParentID feeds span:parent_id into the intrinsic accumulator and block column.
+// After #433 (IntrinsicTOC removal), always writes to block payload.
 func (b *blockBuilder) applySpanParentID(col *modules_reader.Column, srcRowIdx, dstRowIdx int) {
 	if v, ok := col.BytesValue(srcRowIdx); ok && len(v) > 0 {
 		b.feedIntrinsicBytes(spanParentIDColumnName, shared.ColumnTypeBytes, v, dstRowIdx)
-		if restoreIdentityBlockColumnsActive() {
-			b.addPresent(dstRowIdx, spanParentIDColumnName, shared.ColumnTypeBytes,
-				shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: v})
-		}
+		b.addPresent(dstRowIdx, spanParentIDColumnName, shared.ColumnTypeBytes,
+			shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: v})
 	}
 }
 
@@ -1110,14 +1065,7 @@ func (b *blockBuilder) finalizeRowBookkeeping(
 		}
 	}
 
-	if traceIDFound {
-		b.traceRows[traceID] = struct{}{}
-	}
-
-	// Task T-TS-2: implied timestamp sketch for compaction path.
-	if spanStartFound && spanStart > 0 {
-		b.colSketches.add(sketchTimestampColName, encodeSecondBucket(spanStart))
-	}
+	// (T-TS-2 implied-timestamp sketch removed with the KLL sketch index in #435.)
 
 	b.spanCount++
 }
@@ -1174,6 +1122,10 @@ func buildIntrinsicBlockIndex(r *modules_reader.Reader, srcBlockIdx int) intrins
 	if r == nil {
 		return intrinsicRowFields{}
 	}
+	// NOTE: IsV2Format() check removed (2026-06-29, v2 unconditional).
+	// V2 files (now unconditional) store identity columns in block payload.
+	// buildIntrinsicBlockIndex is a no-op; addRowFromBlock handles them directly.
+	// (Kept fallback logic below for legacy block handling.)
 	// Only scan identity columns that v4+ blocks store exclusively in the intrinsic
 	// section. All other intrinsic columns (span:kind, span:status, resource.service.name,
 	// span:start, span:duration, span:name, etc.) are present in block columns and are
@@ -1235,40 +1187,28 @@ func buildIntrinsicBlockIndex(r *modules_reader.Reader, srcBlockIdx int) intrins
 		}
 	}
 
-	for _, colName := range identityOnly {
-		col, err := r.GetIntrinsicColumn(colName)
-		if err != nil || col == nil {
-			continue
-		}
-		switch col.Format {
-		case shared.IntrinsicFormatFlat, shared.IntrinsicFormatXORBytes, shared.IntrinsicFormatDeltaUint64:
-			for i, ref := range col.BlockRefs {
-				if int(ref.BlockIdx) != srcBlockIdx {
+	// After #433 (IntrinsicTOC removal), identity fields come from block columns.
+	// Identity fields are now written to block columns by feedSpanIdentifiers.
+	if srcBlockIdx < r.BlockCount() {
+		if bwb, bErr := r.GetBlockWithBytes(srcBlockIdx, nil); bErr == nil && bwb != nil {
+			block := bwb.Block
+			for _, colName := range identityOnly {
+				col := block.GetColumn(colName)
+				if col == nil {
 					continue
 				}
-				// Identity columns are bytes columns; only BytesValues carry the raw
-				// 16-/8-byte IDs that feedIntrinsicsFromIndex expects.
-				if len(col.BytesValues) > i {
-					setField(ref.RowIdx, colName, col.BytesValues[i])
-				}
-			}
-		case shared.IntrinsicFormatDict:
-			for _, entry := range col.DictEntries {
-				// Identity columns are bytes columns; the dict stores the raw ID bytes
-				// in Value (as a string). Convert once per distinct entry, not per row.
-				val := []byte(entry.Value)
-				for _, ref := range entry.BlockRefs {
-					if int(ref.BlockIdx) != srcBlockIdx {
+				for rowIdx := range block.SpanCount() {
+					v, ok := col.BytesValue(rowIdx)
+					if !ok {
 						continue
 					}
-					setField(ref.RowIdx, colName, val)
+					setField(uint16(rowIdx), colName, v) //nolint:gosec // rowIdx bounded by SpanCount
 				}
 			}
 		}
 	}
+
 	if out.rows == nil {
-		// Mark as a built-but-empty index so callers distinguish "no intrinsic section"
-		// (zero value) from "intrinsic section present but no matching rows".
 		out.rows = []intrinsicRowEntry{}
 	}
 	return out
@@ -1318,11 +1258,13 @@ func fillIntrinsicIndexFromSpanTree(
 // (span:kind, resource.service.name, span:status, span:duration, etc.) are present in
 // block columns and are already written by addRowFromBlock — no index needed for them.
 //
-// NOTE-469 (issue #389): feeds the intrinsic accumulator only — no addPresent block-column
-// write — so the compacted output keeps these three columns exclusively in the intrinsic
-// section, matching freshly-ingested blocks.
+// NOTE-469 (issue #389): for v1 output, feeds the intrinsic accumulator only — no addPresent
+// block-column write. For v2 output (b.v2IdentityInBlock), also writes to the block payload
+// so identity is self-contained in the block bytes (NOTE-V2-003, issue #417).
+// feedIntrinsicsFromIndex copies trace:id, span:id, span:parent_id to block columns.
+// After #433 (IntrinsicTOC removal), always writes to block payload.
 func (b *blockBuilder) feedIntrinsicsFromIndex(index intrinsicRowFields, srcRowIdx, dstRowIdx int) {
-	if !index.valid() || b.intrinsicAccum == nil {
+	if !index.valid() {
 		return
 	}
 	fields, ok := index.get(srcRowIdx)
@@ -1330,13 +1272,16 @@ func (b *blockBuilder) feedIntrinsicsFromIndex(index intrinsicRowFields, srcRowI
 		return
 	}
 	if fields.traceID != nil {
-		b.feedIntrinsicBytes(traceIDColumnName, shared.ColumnTypeBytes, fields.traceID, dstRowIdx)
+		b.addPresent(dstRowIdx, traceIDColumnName, shared.ColumnTypeBytes,
+			shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: fields.traceID})
 	}
 	if fields.spanID != nil {
-		b.feedIntrinsicBytes(spanIDColumnName, shared.ColumnTypeBytes, fields.spanID, dstRowIdx)
+		b.addPresent(dstRowIdx, spanIDColumnName, shared.ColumnTypeBytes,
+			shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: fields.spanID})
 	}
 	if fields.parentID != nil {
-		b.feedIntrinsicBytes(spanParentIDColumnName, shared.ColumnTypeBytes, fields.parentID, dstRowIdx)
+		b.addPresent(dstRowIdx, spanParentIDColumnName, shared.ColumnTypeBytes,
+			shared.AttrValue{Type: shared.ColumnTypeBytes, Bytes: fields.parentID})
 	}
 }
 
@@ -1382,7 +1327,6 @@ func (b *blockBuilder) updateMinMax(name string, typ shared.ColumnType, key stri
 	}
 	// Update sketch accumulators for every observed value (not just min/max).
 	// SPEC-SK-16: same key encoding as at query time.
-	b.colSketches.add(name, key)
 }
 
 // updateMinMaxNum updates the per-block min/max for a numeric (int64/uint64/float64)
@@ -1406,10 +1350,6 @@ func (b *blockBuilder) updateMinMaxNum(name string, typ shared.ColumnType, key [
 			colType:   typ,
 		}
 	}
-	b.colSketches.add(
-		name,
-		unsafe.String(&key[0], 8), //nolint:gosec // G103: intentional zero-copy string view; key does not escape
-	)
 }
 
 // updateMinMaxFromAttr feeds a typed AttrValue into the per-block min/max tracker.
@@ -1583,39 +1523,8 @@ func (b *blockBuilder) finalize(blockVersion uint8) ([]byte, error) {
 
 	colCount := len(entries)
 
-	// NOTE-446 (issue #364): capture per-column statistics for the file-level ColStats
-	// section while the column builders are still live. present_count = rowCount - nullCount
-	// drives column-absence and single-value pruning; numeric min/max (when available from
-	// the per-block range bookkeeping) enables per-block range pruning. Computed here rather
-	// than in a separate pass to avoid re-walking the columns after finalize clears them.
-	b.colStats = b.colStats[:0]
-	for _, e := range entries {
-		present := e.cb.rowCount() - e.cb.nullCount()
-		if present < 0 {
-			present = 0
-		}
-		cs := shared.ColStat{Name: e.key.Name, PresentCount: uint32(present)} //nolint:gosec
-		if mm, ok := b.colMinMax[e.key.Name]; ok && mm.isNum {
-			// NOTE-448: Numeric range ColStats covers unsigned, float64, and int64 families.
-			// numMinKey/numMaxKey store the correct bit patterns in all cases:
-			//   - uint64/duration: raw uint64 LE.
-			//   - Float64: math.Float64bits LE (updateMinMaxNum).
-			//   - Int64:   raw int64 bits LE (round-trip via int64(stat.MinNum) on executor).
-			// The executor dispatches to a type-aware comparator; see colStatsRejectsFloat64
-			// and colStatsRejectsInt64 in executor/plan_blocks.go.
-			switch mm.colType {
-			case shared.ColumnTypeUint64, shared.ColumnTypeRangeUint64, shared.ColumnTypeRangeDuration,
-				shared.ColumnTypeFloat64, shared.ColumnTypeRangeFloat64,
-				shared.ColumnTypeInt64, shared.ColumnTypeRangeInt64,
-				// NOTE-452 (issue #373): Bool min/max stored as uint64 0/1.
-				shared.ColumnTypeBool:
-				cs.MinNum = binary.LittleEndian.Uint64(mm.numMinKey[:])
-				cs.MaxNum = binary.LittleEndian.Uint64(mm.numMaxKey[:])
-				cs.HasNumRange = true
-			}
-		}
-		b.colStats = append(b.colStats, cs)
-	}
+	// NOTE: ColStats capture removed (2026-06-29, in-file block pruning removal).
+	// Value index is now the authoritative source for pruning.
 
 	// Build column data blobs.
 	// SPEC-V14-001: for V14 blocks, each blob is snappy-compressed (outer per-column snappy).
@@ -1939,4 +1848,32 @@ func bytesToFloat32LE(b []byte) []float32 {
 		out[i] = math.Float32frombits(bits)
 	}
 	return out
+}
+
+// encodeRangeKey encodes a column value as a range key for min/max tracking in colMinMax.
+// After range index removal (#439), this is only used by updateColMinMax for ColStats tracking.
+func encodeRangeKey(typ shared.ColumnType, val shared.AttrValue) string {
+	var tmp [8]byte
+	switch typ {
+	case shared.ColumnTypeString, shared.ColumnTypeRangeString:
+		return val.Str
+	case shared.ColumnTypeInt64, shared.ColumnTypeRangeDuration, shared.ColumnTypeRangeInt64:
+		binary.LittleEndian.PutUint64(tmp[:], uint64(val.Int)) //nolint:gosec // int64 bit-reinterpret
+		return string(tmp[:])
+	case shared.ColumnTypeUint64, shared.ColumnTypeRangeUint64:
+		binary.LittleEndian.PutUint64(tmp[:], val.Uint)
+		return string(tmp[:])
+	case shared.ColumnTypeFloat64, shared.ColumnTypeRangeFloat64:
+		binary.LittleEndian.PutUint64(tmp[:], math.Float64bits(val.Float))
+		return string(tmp[:])
+	case shared.ColumnTypeBool:
+		if val.Bool {
+			return "\x01"
+		}
+		return "\x00"
+	case shared.ColumnTypeBytes, shared.ColumnTypeRangeBytes:
+		return string(val.Bytes)
+	default:
+		return ""
+	}
 }

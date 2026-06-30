@@ -76,6 +76,18 @@ func NewReaderFromProvider(provider ReaderProvider) (*Reader, error) {
 	return reader.NewReaderFromProvider(provider)
 }
 
+// NewBytesProvider returns a ReaderProvider backed by data.
+// The caller must not modify data after this call.
+func NewBytesProvider(data []byte) ReaderProvider {
+	return modules_rw.NewBytesProvider(data)
+}
+
+// ReadBlockByRef fetches a v2 block directly by its page-addressed reference without
+// a TOC lookup (NOTE-VI-027, issue #417 PR6). Only valid for v2 files (IsV2Format).
+func ReadBlockByRef(r *Reader, pageNum uint32, lenPages uint16) ([]byte, error) {
+	return r.ReadBlockByRef(pageNum, lenPages)
+}
+
 // NewDefaultProvider wraps a storage provider with tracking + range caching.
 func NewDefaultProvider(underlying ReaderProvider) *DefaultProvider {
 	return modules_rw.NewDefaultProvider(underlying)

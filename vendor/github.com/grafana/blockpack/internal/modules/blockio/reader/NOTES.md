@@ -1,6 +1,7 @@
 # Reader Module — Design Notes
 
 ## NOTE-001: Lazy Column Decode (Compressed-First, On-Demand Full Decode)
+
 *Added: 2026-03-05*
 *Updated: 2026-04-14 — V14 two-stage model: compressedEncoding → ensureDecompressed → decodeNow*
 
@@ -10,6 +11,7 @@ had to issue a second pass via `AddColumnsToBlock` to decode those remaining col
 before the row loop — decoding ~90 columns per block even when only ~10-15 were accessed.
 
 **Solution (V14):** Replace the two-pass decode with a single-pass lazy model:
+
 1. **Eager pass** — decode `wantColumns` fully (snappy decompress + presence + values).
    Mark `decoded=true`. Unchanged.
 2. **Lazy registration** — for all other columns, store `compressedEncoding` as a zero-copy
@@ -25,6 +27,7 @@ any value accessor). After decode, if `c.Present` is nil, all spans are present 
 bitmap). If non-nil, the bitset is consulted.
 
 **Savings estimate (T9/Q66, 1997 blocks, ~90 non-predicate columns accessed ~15 times):**
+
 - Old: 1997 × 90 × (snappy + full_decode) ≈ 870ms
 - New: 1997 × ~15 × (snappy + full_decode) ≈ 145ms (non-accessed columns: 0 cost)
 - Expected saving: ~725ms per query (improved from prior estimate by eliminating presence-only decode overhead)
@@ -37,6 +40,7 @@ Back-ref: `internal/modules/blockio/reader/column.go:ensureDecompressed`,
 ---
 
 ## NOTE-002: rawEncoding Lifetime Safety and Concurrency Model
+
 *Added: 2026-03-05*
 *Updated: 2026-04-14 — single-goroutine claim removed; decodeOnce/decompressOnce added for concurrent safety*
 
@@ -66,6 +70,7 @@ Back-ref: `internal/modules/blockio/reader/column.go:decodeNow`,
 ---
 
 ## NOTE-CONC-001: decoded atomic.Bool — Cross-Goroutine Signal for Column Decode
+
 *Added: 2026-04-14*
 
 **Problem:** With two separate `sync.Once` fields (`presenceOnce` and `decodeOnce`),
@@ -103,6 +108,7 @@ Back-ref: `internal/modules/blockio/reader/block.go:needsDecode`,
 ---
 
 ## NOTE-003: objectcache Migration — Process-Level Caches with Strong References
+
 *Added: 2026-03-23*
 *Updated: 2026-03-29*
 
@@ -146,6 +152,7 @@ Back-ref: `internal/modules/blockio/reader/parser.go`,
 ---
 
 ## NOTE-004: BUG-07 — compareRangeKey float64 NaN safety via cmp.Compare
+
 *Added: 2026-03-23*
 
 **Problem:** The `ColumnTypeRangeFloat64` branch of `compareRangeKey` used manual `<` / `>`
@@ -167,6 +174,7 @@ Back-ref: `internal/modules/blockio/reader/range_index.go:compareRangeKey`
 ---
 
 ## NOTE-006: Intern Map Pool — per-call map replaced by sync.Pool
+
 *Added: 2026-03-25*
 
 **Problem:** `ParseBlockFromBytes` at `reader.go:481` allocated a fresh `make(map[string]string)`
@@ -185,6 +193,7 @@ calls, then releases it **after** `streamSortedRows` completes (all lazy decodes
 guarantees the map is alive for the full block lifetime.
 
 **Safety invariants:**
+
 - Strings interned during parsing are copied into heap-allocated `Column.StringDict` entries
   before the intern map is cleared. Clearing the map only removes key→value references in the
   map; the underlying string data in column dicts is unaffected.
@@ -207,6 +216,7 @@ Back-ref: `internal/modules/blockio/reader/column.go:internMapPool`,
 ---
 
 ## NOTE-007: Present-Rows Scratch Pool — collectPresentRowsInto
+
 *Added: 2026-03-25*
 
 **Problem:** `collectPresentRows` at `column.go` allocated a fresh `make([]int, 0, presentCount)`
@@ -236,6 +246,7 @@ Back-ref: `internal/modules/blockio/reader/column.go:presentRowsScratchPool`,
 ---
 
 ## NOTE-005: BUG-08 — decode*Key sentinel values for malformed short keys
+
 *Added: 2026-03-23*
 
 **Problem:** `decodeInt64Key`, `decodeUint64Key`, and `decodeFloat64Key` all returned `0`
@@ -244,6 +255,7 @@ malformed (short) keys were silently treated as valid zero-values. This corrupte
 search comparisons in `compareRangeKey` and `BlocksForRange`/`BlocksForRangeInterval`.
 
 **Fix:** Apply type-appropriate sentinels for short-key fallback:
+
 - `decodeInt64Key`: return `math.MinInt64` — sorts below all valid int64 values.
 - `decodeUint64Key`: return `0` — already the minimum uint64 sentinel; no change needed.
 - `decodeFloat64Key`: return `math.NaN()` — `cmp.Compare` (NOTE-004/BUG-07) treats NaN as
@@ -259,6 +271,7 @@ Test: `internal/modules/blockio/reader/range_index_bugs_test.go:TestDecodeFloat6
       `internal/modules/blockio/reader/range_index_bugs_test.go:TestDecodeInt64Key_ShortKey_ReturnsSentinel`
 
 ## NOTE-008: Span Identity Fields in Intrinsic Section Only (Not in Block Columns)
+
 *Added: 2026-03-25*
 
 *Addendum (2026-03-25): Original entry claimed dual-storage (block columns AND intrinsic
@@ -282,6 +295,7 @@ field names and expect a non-nil result.
 ---
 
 ## NOTE-009: FileLayout() V12-Only Simplification and Full-Byte-Detail Enhancement
+
 *Added: 2026-03-31*
 
 **Decision:** Remove V10/V11 code paths from `layoutMetadata()`. The codebase writes only
@@ -289,6 +303,7 @@ V12 files (snappy-compressed metadata); V10/V11 paths were dead code that compli
 section model and prevented adding logical sub-sections for V12 metadata components.
 
 **Changes bundled in this decision:**
+
 1. **V12-only metadata:** `layoutMetadata()` emits one physical `metadata.compressed`
    section plus logical sub-sections for range index columns. The old uncompressed
    `metadata.block_index`, `metadata.column_index`, `metadata.trace_index` per-column
@@ -320,6 +335,7 @@ section model and prevented adding logical sub-sections for V12 metadata compone
 ---
 
 ## NOTE-010: CMS Removal — skipColumnCMS Zero-Alloc Backward Compat for SKTC/SKTD Files
+
 *Added: 2026-04-02*
 
 **Decision:** Remove CMS data from the sketch parse path. Legacy SKTC (`0x534B5443`) and
@@ -327,22 +343,26 @@ SKTD (`0x534B5444`) files are still readable by `parseSketchIndexSection` via th
 `skipColumnCMS` helper, which reads and discards the CMS bytes with zero allocations.
 
 **Rationale:**
+
 - CMS contributed ~70% of sketch section size and caused OOM during compaction at scale.
 - Keeping the skip path (rather than rejecting old files outright) avoids a forced re-write
   of all existing blockpack files when upgrading to SKTE. Legacy files remain queryable.
 
 **skipColumnCMS mechanics:**
+
 - Reads `cms_depth` (uint8) and `cms_width` (uint16 LE) from the file header.
 - Computes skip distance: `cms_depth × cms_width × 2 × presentCount` bytes.
 - Advances `pos` without allocating any heap objects.
 - Handles any depth/width values in old files; not limited to CMSDepth=4/CMSWidth=64 defaults.
 
 **`fileSketchSummaryMagic` bump:**
+
 - Changed from `0x46534B54` ("FSKT") to `0x46534B55` ("FSKU").
 - Invalidates any externally cached `FileSketchSummary` blobs that embedded CMS data.
 - Old-magic summaries return a bad-magic error on unmarshal (safe rejection, no silent corruption).
 
 **Back-ref:**
+
 - `internal/modules/blockio/reader/sketch_index.go:skipColumnCMS`
 - `internal/modules/blockio/reader/sketch_index.go:parseSketchIndexSection`
 - `internal/modules/blockio/shared/constants.go:fileSketchSummaryMagic`
@@ -350,11 +370,13 @@ SKTD (`0x534B5444`) files are still readable by `parseSketchIndexSection` via th
 ---
 
 ## NOTE-011: V5 Footer Detection and VectorIndex Lazy Load (2026-04-02)
+
 *Added: 2026-04-02*
 
 **Decision:** The `readFooter()` method attempts V5 (46 bytes) detection before V4 (34 bytes).
 If `fileSize >= 46`, it reads a single 46-byte buffer from `fileSize-46`. The first two bytes
 determine the version:
+
 - `buf[0:2] == 5 (FooterV5Version)`: parse V5; extract `vectorIndexOffset` and `vectorIndexLen`.
 - `buf[12:14] == 4 (FooterV4Version)`: V4 footer is embedded at offset 12 of the V5 buffer; parse V4 from that slice with no extra I/O.
 
@@ -372,9 +394,11 @@ Back-ref: `internal/modules/blockio/reader/parser.go:readFooter`,
 ---
 
 ## NOTE-012: V7 Footer (FooterV7Version=7) — V14 Section Directory (2026-04-10)
+
 *Added: 2026-04-10*
 
 **Decision:** Redesign the write/read path for V14 format using a new FooterV7 (18 bytes):
+
 1. Replace the single snappy-compressed metadata blob with a section directory footer.
    Footer wire format: `magic[4]+version[2]=7+dir_offset[8]+dir_len[4]` = 18 bytes.
 2. Add `readSectionDirectory` to decode the snappy-compressed section directory into
@@ -401,12 +425,12 @@ section type rather than accessing a named struct field.
 **Why per-section lazy parse:**
 The block index section must be read eagerly (needed to populate `r.blockMetas` for all
 subsequent operations). All other sections are used only conditionally:
+
 - Range index: only when a range predicate needs pruning.
 - Trace index: only for `GetTraceByID`/`TraceEntries`.
 - TS index: only for time-range pruning.
 - Sketch index: only for TopK/HLL queries.
 - File bloom: only for bloom filter checks at query start.
-
 
 Lazy parse means opening a reader costs one `ReadAt` (footer) + one `ReadAt`+decode
 (section directory) + one `ReadAt`+decode (block index) + one `ReadAt` per intrinsic
@@ -435,8 +459,8 @@ In V14 the section directory makes every section independently addressable, so t
 distinction between "lean" and "full" reader is less meaningful — but
 `NewLeanReaderFromProvider` is preserved for API compatibility.
 
-
 **Alternatives considered:**
+
 - *Keep decompScratchPool, use it for snappy decode output*: Rejected — column decode
   output buffers are referenced by `rawEncoding` in `Column` structs and outlive the
   decode call.
@@ -454,6 +478,7 @@ Back-ref: `internal/modules/blockio/reader/parser.go:readFooter`,
 ---
 
 ## NOTE-013: V14 Two-Phase Trace Index Loading
+
 *Added: 2026-04-12*
 
 **Problem:** `ensureV14TraceSection` previously called `readV14Section(SectionTraceIndex)` on
@@ -480,6 +505,7 @@ the trace index portion. The full blob must be fetched to decompress, then split
 for full readers; for lean readers the re-read on bloom hit is the correct trade-off.
 
 **Key functions:**
+
 - `splitV14CompactSection(data)` — stateless splitter; returns header and trace-index
   sub-slices with no copy.
 - `parseCompactIndexBytesV14Header(header)` — parses header into `compactTraceIndex` with
@@ -504,6 +530,7 @@ Back-ref: `internal/modules/blockio/reader/trace_index.go:splitV14CompactSection
 ---
 
 ## NOTE-PERF-TS: Raw Byte Storage for TS Index — Zero-Alloc Parse
+
 *Added: 2026-04-14*
 
 **Decision:** The parsed TS index is stored as a raw `[]byte` sub-slice of the metadata
@@ -526,6 +553,7 @@ Back-ref: `internal/modules/blockio/reader/ts_index.go:parseTSIndex`,
 ---
 
 ## NOTE-PERF-1: Sparse Dict Columns — Deferred Dense Expansion
+
 *Added: 2026-04-14*
 
 **Decision:** Sparse dict columns (encoding kinds 2 and 7 RLE) defer the O(spanCount)
@@ -548,6 +576,7 @@ Back-ref: `internal/modules/blockio/reader/block.go:expandDenseIdx`,
 ---
 
 ## NOTE-PERF-RANGE: Raw Byte Storage for Range Index Float64 Bounds
+
 *Added: 2026-04-14*
 
 **Decision:** Float64 range bounds in the range index are stored as a raw `[]byte` sub-slice
@@ -568,6 +597,7 @@ Back-ref: `internal/modules/blockio/reader/range_index.go:float64BoundsRaw`,
 ---
 
 ## NOTE-PERF-COMPACT: Raw Byte Storage for Compact Trace Index
+
 *Added: 2026-04-14*
 
 **Decision:** The compact trace index is stored as raw bytes (`traceIndexRaw`) in the
@@ -589,6 +619,7 @@ Back-ref: `internal/modules/blockio/reader/trace_index.go:BlocksForTraceIDCompac
 ---
 
 ## NOTE-PERF-SKETCH: Zero-Copy Distinct Count Storage in Sketch Index
+
 *Added: 2026-04-14*
 
 **Decision:** Per-block distinct counts in the sketch index are stored as raw 4-byte-per-block
@@ -610,6 +641,7 @@ Back-ref: `internal/modules/blockio/reader/sketch_index.go:distinctRaw`,
 ---
 
 ## NOTE-014: V14 Phase-1 traceIndexRaw Pre-Population (Cache-Hit Fix)
+
 *Added: 2026-04-14*
 
 **Problem:** In `ensureV14TraceSection`, `traceIdxBytes` was captured inside the
@@ -642,6 +674,7 @@ path, avoiding provider I/O when the section blob has been LRU-evicted. See NOTE
 ---
 
 ## NOTE-015: ensureV14TraceSection Cache-Eviction Guard
+
 *Added: 2026-04-14*
 
 **Problem:** The warm-hit path in `ensureV14TraceSection` (when the compact-header cache
@@ -675,6 +708,7 @@ Back-ref: `internal/modules/blockio/reader/parser.go:ensureV14TraceSection`
 ---
 
 ## NOTE-016: parseSectionsLazyV14 — Deferred Intrinsic Blob Reads (2026-04-16)
+
 *Added: 2026-04-16*
 
 **Problem:** `parseSectionsLazyV14` previously called `r.cache.GetOrFetch` for every
@@ -748,6 +782,7 @@ Back-ref: `internal/modules/blockio/reader/parser.go:parseSectionsV8`,
 ---
 
 ## NOTE-022-reader: DistinctAt, TopKMatchAt, FuseContainsAt — Zero-Allocation Sketch Accessors
+
 *Added: 2026-05-15*
 
 **Decision:** Add `DistinctAt`, `TopKMatchAt`, and `FuseContainsAt` to `columnSketchData` to
@@ -781,6 +816,7 @@ The arena's entries are pure overhead for that path: the two-pass WantOnly scan 
 a `sync.Pool` once the block is fully scanned.
 
 **Mechanism:**
+
 - `lazyColumnStorePool` (`sync.Pool` of `*[]Column`) + `acquireLazyColumnStore(n)` (len 0, cap ≥ n).
 - `Block.lazyStorePtr` holds the pool handle; nil when the arena was not pooled (WantAll path
   registers no lazy columns, so `wantColumns == nil` skips the block entirely).
@@ -964,6 +1000,7 @@ writeback + no-batch-support fallback).
 ---
 
 ## NOTE-185: Combined ToC + Columns Single Round-Trip on the Warm Block Read
+
 *Added: 2026-06-11*
 
 **Problem:** Even after NOTE-179 collapsed the per-column fan-out into one `GetMultiV8Section`,
@@ -1013,6 +1050,7 @@ Back-ref: `internal/modules/blockio/reader/columnar_read.go:readBlockColumnarWit
 `internal/modules/blockio/shared/v8sectionkey.go:V8SectionKey`
 
 ## NOTE-187: Lazily Plan Cold Runs Only When a Cold Miss Exists
+
 *Added: 2026-06-11*
 
 **Problem:** `readBlockColumnarWithCache` called `r.planColdRuns(metas, wantColumns, …)`
@@ -1048,6 +1086,7 @@ Back-ref: `internal/modules/blockio/reader/columnar_read.go:readBlockColumnarWit
 `internal/modules/blockio/reader/columnar_read.go:planColdRuns`
 
 ## NOTE-188: Index-Aligned Column Re-Keying in fetchTocAndColumnsCombined
+
 *Added: 2026-06-11*
 
 **Problem:** `fetchTocAndColumnsCombined` built a `colName` map (V8SectionKey -> bare column
@@ -1074,6 +1113,7 @@ unchanged (still return nil,nil so the caller's two-phase path resolves them).
 Back-ref: `internal/modules/blockio/reader/columnar_read.go:fetchTocAndColumnsCombined`
 
 ## NOTE-189: Fast Per-Column Section Name Build — No Throwaway fmt.Sprintf
+
 *Added: 2026-06-11*
 
 **Problem:** the warm block read built each wanted column's section name with
@@ -1146,6 +1186,7 @@ are immutable decoded columns; a miss falls through to the unchanged batch path.
 Back-ref: `internal/modules/blockio/reader/intrinsic_reader.go:PrefetchIntrinsicColumns`.
 
 ## NOTE-200 — Process-level cache of decoded V8 block columns
+
 *Added: 2026-06-11*
 
 **Problem:** NOTE-199 eliminated redundant re-decode of *intrinsic* columns on the warm
@@ -1164,6 +1205,7 @@ re-paid on every request that scans block-level attribute columns.
 within the file (`meta.Offset`) uniquely identifies an immutable block (files are immutable
 once written; compaction creates new fileIDs), so the key resolves to exactly one decoded
 column. In `parseBlockColumnsReuse`'s eager-decode loop:
+
 - a cache HIT copies the immutable decoded slices into the per-query `Column` via
   `copyDecodedColumnInto` and skips decompress + decode entirely;
 - a cache MISS decodes as before, then stores an immutable snapshot
@@ -1195,6 +1237,7 @@ Back-ref: `internal/modules/blockio/reader/parser.go:parsedV8ColumnCache`,
 `internal/modules/blockio/reader/block.go:Column.SizeBytes`.
 
 ## NOTE-201 — Extend V8 decoded-column cache to the lazy (deferred) decode path
+
 *Added: 2026-06-11*
 
 **Problem:** NOTE-200 cached decoded V8 block columns, but only the *eager* loop in
@@ -1207,6 +1250,7 @@ the eager want set, or a column accessed only during row emission — was re-dec
 on every warm query, exactly the redundant-decode cost NOTE-200 eliminated for the eager path.
 
 **Fix:** carry the same `v8ColumnCacheKey` on the lazy `Column` and have `decodeNow` use it:
+
 - the lazy-registration loop computes `v8CacheKey` (empty when `fileID == ""`) and stores it on
   the registered `Column` alongside `compressedEncoding`;
 - `decodeNow` consults `parsedV8ColumnCache` on `v8CacheKey` *before* `ensureDecompressed`; on a
@@ -1246,6 +1290,7 @@ CPU profile showed heavy GC/runtime traffic (`runtime.growslice`/`roundupsize`/`
 Prior alloc profiles also attributed the columnar assembled-buffer line as a top allocator.
 
 **Mechanism:** `assembledBufPool` (`sync.Pool` of `*[]byte`) recycles the backing arrays.
+
 - `acquireAssembledBuffer(n)` returns a slice of exactly length `n` from a pooled array of
   sufficient capacity, else a fresh `make`. The returned bytes are **not zeroed**.
 - `(*Reader).ReleaseRawBuffer(buf)` returns the backing array to the pool once the block
@@ -1707,6 +1752,7 @@ Back-ref: `reader/colmetaentry.go:inlineData`,
           ColFlagInline, ColInlineMaxLen), writer NOTE-220, SPECS §12.2.1, NOTE-39.
 
 ## NOTE-222: PresenceView — hoist the per-row IsPresent atomic out of scan loops
+
 *Added: 2026-06-12*
 
 **Problem:** `Column.IsPresent(idx)` performs an atomic `decoded.Load()` (via `needsDecode`)
@@ -1858,7 +1904,7 @@ trace-index table on every trace-by-ID lookup (Q8 / `FindTraceByID` / `TraceEntr
 gcx querier CPU profile (2026-06-13) showed it as the #1 blockpack self-time frame at 2.96%.
 The bloom filter (NOTE-36) gates *true* misses, so the scan only ran on true hits and bloom
 false positives — but on a hit it walked on average traceCount/2 entries (16-byte ID compare
-+ stride decode per entry), and a file can hold ~100k traces.
+- stride decode per entry), and a file can hold ~100k traces.
 
 **Fix:** The writer (`writeTraceBlockIndexSection`) sorts trace entries ascending by trace ID,
 so the table is binary-searchable — except entries are variable-stride (block_ref_count varies),
@@ -1912,6 +1958,7 @@ pre-decodes the target once (`targetHi`/`targetLo`) before the loop and reads ea
 ID as two `binary.BigEndian.Uint64` loads straight out of `data` (no `[16]byte` copy). A
 single 3-way branch combines the hit (`==`), the ascending early-exit (`target < entry`),
 and continue cases:
+
 - `entryHi == targetHi`: compare low halves — equal → hit; `targetLo < entryLo` → early-exit.
 - `targetHi < entryHi`: early-exit.
 - otherwise: advance.
@@ -2190,6 +2237,7 @@ run concurrently under an `errgroup.Group`; the per-trace I/O cost is the max of
 legs rather than their sum.
 
 **Concurrency safety:** the two goroutines touch disjoint Reader state.
+
 - `ReadGroup` reads/writes only the concurrency-safe `tieredcache` and the provider, whose
   `ReadAt` is already exercised concurrently by block scans. The result is written into a
   goroutine-local `fetched` map, then published to `rawMap` before `g.Wait()` — the only
@@ -2244,6 +2292,7 @@ errgroup setup).
 Back-ref: `reader.go:GetTraceByID`, `reader.go:traceByIDParseConcurrency`.
 
 ## NOTE-292: Range-readable chunked trace index lookup (issue #340)
+
 *Added: 2026-06-13*
 
 **Problem:** `TraceEntries` (the trace-by-id path) called `ensureV8TraceSection`, which
@@ -2329,7 +2378,9 @@ allocs/op ~4099 → 4 (-99.9%); bytes/op ~flat (the slab carries the same total 
 per-row allocs did).
 
 Back-ref: `column.go:decodeXORBytesUniform`, `column.go:decodeInlineBytesUniform`.
+
 ## NOTE-293: GetTraceByID resolves identity from block columns, not file-wide intrinsic columns
+
 *Added: 2026-06-14*
 
 **Problem:** `GetTraceByID` loaded the whole-file intrinsic `trace:id` column (to find matching
@@ -2353,6 +2404,7 @@ unchanged.
 Back-ref: `reader.go:GetTraceByID`, `reader.go:intrinsicFallbackRows`
 
 ## NOTE-346: Cap retained capacity of decompBufPool (snappy-decode scratch)
+
 *Added: 2026-06-14*
 
 **Problem:** `decompBufPool` (snappy-decode scratch for V14 lazy column decode) had NO
@@ -2385,6 +2437,7 @@ Back-ref: `block_parser.go:putDecompBuf`, `column.go:ensureDecompressed`,
 `column.go:releaseDecompPooled`.
 
 ## NOTE-349: True two-phase loading for the legacy V8 snappy trace section
+
 *Added: 2026-06-14*
 
 **Problem:** `ensureV8TraceSection` (the full-reader entry point for trace-ID lookups on
@@ -2405,6 +2458,7 @@ used by the lean-reader path — but the FULL V8 reader short-circuited it by po
 path, so the lazy re-fetch would have returned nil for V8 files.
 
 **Solution:** make `ensureV8TraceSection` do real two-phase loading:
+
 - Phase 1: read + decompress the section into a TRANSIENT blob, parse ONLY the header
   (`parseCompactIndexBytesV14Header` deep-copies the bloom filter and block table into
   `compactParsed`), record the compressed section's `(offset, len)` on `compactParsed`
@@ -2483,7 +2537,7 @@ Back-ref: `column.go` (`bytesInlineAt`/`hasInlineBytes`, `Column.uniformSlab`/`u
 
 1. **Size-class rounding slop:** a 12-byte value lands in the 16-byte malloc class (~25%
    waste); plus per-object allocator metadata. For a K-entry bytes dict that is K × (rounding
-   + header) bytes of RETAINED overhead.
+   - header) bytes of RETAINED overhead.
 2. **Fragmentation:** K small objects scattered across the heap.
 
 Because a decoded bytes-dict column is held by `parsedV8ColumnCache` for the cache-entry
@@ -2535,6 +2589,7 @@ need the real present-rank table, so they fall through and keep the materialized
 slice (`denseFlatIdx == false`). Mirrors NOTE-354's flat-dense `refIndex` drop (Pos == rank).
 
 All five `*Idx` consumers route through the new flag:
+
 - value accessors (`block.go` `Int64Value`/`Uint64Value`/`Float64Value`) via `dictIdxAt`;
 - executor dict-mask scans (`column_provider.go` `scanDictMaskRows`/`scanNumericDictMask`)
   use `di == i` when `col.IsDenseFlatIdx()`, and their `idx == nil` fast-path bail-outs were
@@ -2575,6 +2630,7 @@ it is held for EVERY fully-present cached column across EVERY cached block.
 of `AllPresentBitset(nBits)`; every decoder's `col.Present = present` therefore stores nil.
 Two decode-time loops walked `shared.IsPresent(present, i)` and had to be made nil-aware
 (`IsPresent(nil, i)` is always false and would mis-fill / collect an empty row set):
+
 - `decodeDeltaUint64` dense index build: `present == nil` ⇒ index is the identity
   `[0,1,…,spanCount-1]`, filled directly without the per-row presence test.
 - `collectPresentRowsInto` (XOR/uniform/prefix bytes decoders): `present == nil` ⇒ emit every
@@ -2687,12 +2743,12 @@ this process-level cache so warm queries reuse the decode. The Sizer counted onl
 variable data slices (dict + index + present + inline bytes) — it omitted the *fixed*
 per-snapshot retained footprint:
 
-  - the `*Column` struct itself: `unsafe.Sizeof(Column{}) ~= 544` bytes, dominated by 12
+- the `*Column` struct itself: `unsafe.Sizeof(Column{}) ~= 544` bytes, dominated by 12
     type-specific Dict/Idx slice headers (24 B each) of which ~10 are always nil for any
     single-type column — dead-but-allocated struct space;
-  - the `objectcache.entry[*Column]` wrapper (val/prev/next/key/sizeBytes ~= 56 B);
-  - the map bucket slot (~16 B amortized);
-  - the v8 cache key string bytes (fileID+offset+name+type, ~80 B typical).
+- the `objectcache.entry[*Column]` wrapper (val/prev/next/key/sizeBytes ~= 56 B);
+- the map bucket slot (~16 B amortized);
+- the v8 cache key string bytes (fileID+offset+name+type, ~80 B typical).
 
 Folded into `columnSnapshotFixedOverhead = 704` plus `len(Name)`. Without this, a small
 dict column (e.g. a few-entry bool/enum column reporting ~34 data bytes) was undercounted
@@ -2723,6 +2779,7 @@ query-frontend shard shape is **one block per querier call** (per the Reader-lif
 invariant: a Reader is constructed fresh per query, per block). In that case the coalesced
 read covers exactly one block that spans the entire read — there is nothing to slice apart.
 The legacy code still:
+
   1. filled a pooled buffer (`coalescedReadPool`, ≥8 MiB) with the block bytes, then
   2. allocated a fresh `make([]byte, bLen)` and **copied** the whole block into it, then
   3. returned the pooled buffer.
@@ -2747,6 +2804,7 @@ Back-ref: `coalesce.go` (`ReadCoalescedBlocks`). Bench: `coalesce_alloc_bench_te
 (`BenchmarkReadCoalescedSingleBlock` / `BenchmarkReadCoalescedMultiBlock`).
 
 ## NOTE-366: Pool the transient compressed-read scratch on the snappy-decode-then-discard path
+
 *Added: 2026-06-14*
 
 **Problem.** Six metadata/section read sites all share one shape:
@@ -2815,6 +2873,7 @@ buffer no longer needs to span any column — so the sizing pass stops growing `
 `tocEnd`. The returned buffer is the ToC prefix only.
 
 **Why it is safe (lifetime).** Each stashed blob's backing array outlives the parse:
+
 - `fetchColumnInto`: `colBytes` from `GetOrFetchV8Section` is owned by the section cache for
   the Reader's lifetime (same as NOTE-234's combined-GetMulti hits).
 - `fetchColumnsBatched`: a batch HIT blob is cache-owned; a batch MISS is a freshly-allocated
@@ -2929,6 +2988,7 @@ Back-ref: `column.go` (`Column.packedIdx`/`packedIdxWidth`, `readPackedIndexArra
 ---
 
 ## NOTE-371 — Decouple intrinsic cache budget from the V8 column cache
+
 *Added: 2026-06-15*
 
 **Problem:** `SetIntrinsicCacheBytes(n)` set the SAME byte budget on both the decoded
@@ -2967,7 +3027,7 @@ the chunk reads bypassed every shared cache tier.
 chunkIdx`. `chunkBytes` is now two-tier: L1 = the per-Reader `chunkCache` (intra-query,
 serves concurrent / repeat lookups within one query), L2 = `parsedTraceChunkCache`
 (cross-query, serves warm-file repeat lookups by fresh Readers). On a miss the chunk is read
-+ decoded once, populated into L2 then L1, and reused thereafter. The L2 tier is engaged only
+- decoded once, populated into L2 then L1, and reused thereafter. The L2 tier is engaged only
 when the Reader has a non-empty fileID (the key requires one); fileID-less Readers fall back
 to read+decode + L1, unchanged.
 
@@ -3172,7 +3232,6 @@ share one backing pointer. `BenchmarkParseColumnMetadataArray` (120-column schem
 → 1 alloc/op** (the lone remaining alloc is the entries slice), 8696 B/op → 6784 B/op (~22% less).
 Production blocks carry hundreds of columns, multiplying the per-parse win.
 
-
 ## NOTE-441: batched cold-miss writeback (PutMultiV8Section) — eliminate the per-column Set dial storm
 
 **Problem (from a querier CPU profile):** `memcache.(*Client).dial` accounted for ~28% of cumulative
@@ -3269,7 +3328,14 @@ and eager fallback paths are asserted byte-identical to the eager `GetIntrinsicC
 ---
 
 ## NOTE-446 (reader side): ColStats lazy fetch (issue #364)
+
 *Added: 2026-06-18*
+
+> **SUPERSEDED 2026-06-29 (executor NOTE-477):** `Reader.ColStats`/`HasColStats` and the
+> ColStats section were removed (value index now owns pruning). `IsV2Format`/`FooterVersion`
+> were also removed (FooterV9 is unconditional; FooterV8 is rejected). `BlocksInTimeRange`
+> returns nil now that the TS index is gone, so the planner prunes by `BlockMeta` time bounds.
+> Description retained for historical context only.
 
 `Reader.ColStats(blockIdx)` / `Reader.HasColStats()` expose the `ToCSubTypeColStats` section
 (canonical design: writer NOTES NOTE-446). The whole snappy-compressed section is fetched once via
@@ -3283,6 +3349,7 @@ files without the section (old format) so callers fall back to no pruning. Used 
 ---
 
 ## NOTE-463 (reader side): IntrinsicDictStringSet for compaction similarity (issue #382)
+
 *Added: 2026-06-21*
 
 `Reader.IntrinsicDictStringSet(name)` collects the distinct string value set of a paged Dict

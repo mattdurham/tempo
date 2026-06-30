@@ -35,7 +35,6 @@ so callers can handle, log, and continue serving other requests.
 - `go vet` and `nilaway` are run in CI.
 - New code reviewed for bare type assertions, unguarded index operations, and explicit panics.
 
-
 ---
 
 ## SPEC-ROOT-002: Go File Layout
@@ -66,7 +65,6 @@ making navigation and code review easier.
 
 Reviewed during code review. No automated tooling enforces this today.
 
-
 ---
 
 ## SPEC-ROOT-003: Defer Byte Parsing Until Needed
@@ -93,7 +91,6 @@ skipping unnecessary decodes is the single largest source of throughput improvem
 **Enforcement:**
 
 Reviewed during code review. Benchmark regressions (bytes_decoded/op) are a signal of violation.
-
 
 ---
 
@@ -139,7 +136,6 @@ unknown when the caller — or the caller's caller — already holds the bound. 
 New allocations on hot paths that have a statically derivable upper bound will be flagged
 in code review.
 
-
 ---
 
 ## SPEC-ROOT-005: Aggressive Pool and Cache Reuse
@@ -166,7 +162,6 @@ allocs/op and GC pause frequency.
 
 `make precommit` includes benchmarks; allocs/op and B/op regressions are blocking.
 
-
 ---
 
 ## SPEC-ROOT-006: Condition Complexity Limit
@@ -183,11 +178,13 @@ allocs/op and GC pause frequency.
   subject to the same limit.
 
 **Example — non-compliant:**
+
 ```go
 if a != nil && b > 0 && c.enabled && d != "" {
 ```
 
 **Example — compliant:**
+
 ```go
 hasValidInput := a != nil && b > 0 && c.enabled && d != ""
 if hasValidInput {
@@ -201,7 +198,6 @@ named predicates makes each condition independently readable, testable, and revi
 **Enforcement:**
 
 Reviewed during code review. `golangci-lint` (gocognit/gocritic) surfaces some violations.
-
 
 ---
 
@@ -231,7 +227,6 @@ naturally without requiring interface machinery.
 **Enforcement:**
 
 Reviewed during code review. Single-method structs with no state are flagged for refactoring.
-
 
 ---
 
@@ -264,7 +259,6 @@ Tests written after the fact tend to test the implementation rather than the con
 
 CI enforces > 70% coverage. New code submitted without tests will be rejected in review.
 Bug fixes without a reproducing test case will be returned for a test before merge.
-
 
 ---
 
@@ -319,6 +313,7 @@ func (r *Reader) GetBlockWithBytes(ctx context.Context, id ulid.ULID) ([]byte, e
 ### NOTES.md entry format
 
 Each `NOTES.md` entry must include:
+
 - The date the decision was made (`YYYY-MM-DD`)
 - The decision itself (one sentence)
 - The rationale (why this choice over the alternatives)
@@ -327,6 +322,7 @@ Each `NOTES.md` entry must include:
 ### BENCHMARKS.md entry format
 
 Each `BENCHMARKS.md` entry must include:
+
 - The benchmark function name and file
 - Baseline numbers: `ns/op`, `B/op`, `allocs/op`, and `io_ops` where applicable
 - The Go version and hardware note used to establish the baseline
@@ -371,6 +367,7 @@ can be maintained independently.
 3. **Annotate** with `// SPEC-ROOT-010 exception: <reason>` when the error is intentionally ignored (e.g., best-effort cleanup)
 
 The following pattern is **prohibited**:
+
 ```go
 result, err := doSomething()
 if err != nil {
@@ -379,6 +376,7 @@ if err != nil {
 ```
 
 The following patterns are **acceptable**:
+
 ```go
 // Propagate
 result, err := doSomething()
@@ -470,6 +468,7 @@ Profiling showed `ReadCoalescedBlocks` allocating >294 MB per benchmark window �
 avoidable S3 re-reads. Routing through `r.cache` eliminates these re-reads for hot blocks.
 
 **Cache contract:**
+
 - On a full cache hit (all `cr.BlockIDs` present): `ReadGroup` returns without any S3 I/O.
 - On any cache miss: `ReadGroup` fetches the full group (coalesced), stores every block via
   `r.cache.Put`, then returns. Re-fetching already-cached blocks in the same group is
@@ -532,7 +531,7 @@ the query's needed set.
   When `wantCols` is nil, all columns are loaded (match-all and GetTraceByID paths).
 - Per-block `isDualStorage` detection must be computed once per block, not once per
   `IterateFields` call. The result is passed to the adapter constructor.
-- Stream paths (`streamFilterProgram`, `streamLogProgram`) must pass
+- Stream paths (`streamFilterProgram`) must pass
   `wantCols=ComputeSecondPassCols(program, selectColumns)`, computed once before the row loop.
   The result may be nil for programs with no predicates and no SelectColumns; nil is valid and
   means load-all.
@@ -563,8 +562,7 @@ Back-ref: `internal/modules/blockio/span_fields.go:loadIntrinsicCache`,
 `internal/modules/executor/predicates.go:ProgramWantColumns`,
 `internal/modules/executor/predicates.go:ComputeSecondPassCols`,
 `query_traceql.go:streamFilterProgram`,
-`query_logql.go:streamLogProgram`,
-`api.go:QueryTraceQL`,
+`api.go:QueryTraceQL`,`
 `reader.go:GetTraceByID`
 
 ---
@@ -577,6 +575,7 @@ individual entry in the unified Table of Contents (ToC), addressable by a typed
 forbidden for new file format versions.
 
 **Rationale:** A monolithic section blob requires:
+
 1. Full S3/object-storage fetch of all column data (regardless of query selectivity)
 2. Full snappy decompression of all column data on every access
 3. GC pressure from large allocations that are mostly unused
@@ -587,23 +586,29 @@ For a query touching 2 columns out of 200, a monolithic range index requires dec
 **Wire format — Footer V8:**
 
 Footer V8 is 18 bytes (identical layout to Footer V7; distinguished by `version=8`):
+
 ```
 magic[4]=0xC011FEA1 · version[2]=8 · toc_offset[8] · toc_length[4]
 ```
+
 The footer points to a snappy-compressed Table of Contents blob.
 
 **Wire format — ToC blob (after snappy decompression):**
+
 ```
 entry_count[4 LE] · signal_type[1] · reserved[3] · ToCEntry[entry_count]
 ```
 
 **Wire format — ToCEntry (variable length):**
+
 ```
 type[4 LE] · subtype[4 LE] · name_len[2 LE] · name[name_len] · offset[8 LE] · length[4 LE]
 ```
+
 Minimum entry size (name=""): 22 bytes. Maximum name length: `MaxNameLen` (1024 bytes).
 
 **Type and SubType constants:**
+
 ```
 ToCTypeMetadata = 1   // file-level metadata sections
 ToCTypeIndex    = 2   // file-level index structures
@@ -625,6 +630,7 @@ ToCSubTypeBlockIndex = 7  // block offset table
 `ToCKey = struct{ Type, SubType uint32; Name string }`.
 
 **Example entries:**
+
 ```
 (1, 1, "resource.service.name") → per-column range index blob
 (1, 2, "resource.service.name") → per-column KLL/sketch blob
@@ -669,11 +675,12 @@ Back-ref: `internal/modules/blockio/reader/sketch_index.go:parseSketchIndexSecti
 ---
 
 ## SPEC-OBS-001: Context Propagation — All Query Entry Points Must Accept ctx
+
 *Added: 2026-06-19*
 
 Every public blockpack query entry point (`QueryTraceQL`, `QueryTraceQLWithProgram`,
-`QueryLogQL`, `ExecuteMetricsLogQL`, `ExecuteMetricsTraceQL`) and every internal executor
-entry point (`Collect`, `ExecuteLogMetrics`) MUST accept `context.Context` as their first
+`ExecuteMetricsTraceQL`) and every internal executor
+entry point (`Collect`) MUST accept `context.Context` as their first
 parameter. Nil is normalized to `context.Background()` at the entry point; downstream code
 may trust ctx is non-nil.
 
@@ -684,13 +691,13 @@ that pass nil defensively (e.g. tests, migration helpers).
 **Verification:** `TestCollect_BackgroundContext` and `TestCollect_ContextCancellation`
 (context_propagation_test.go). All NOTE-058 TODO comments must be absent.
 
-Back-ref: `api.go:QueryTraceQL,QueryTraceQLWithProgram,QueryLogQL,ExecuteMetricsLogQL`,
-`internal/modules/executor/stream.go:Collect`,
-`internal/modules/executor/metrics_log.go:ExecuteLogMetrics`.
+Back-ref: `api.go:QueryTraceQL,QueryTraceQLWithProgram,ExecuteMetricsTraceQL`,
+`internal/modules/executor/stream.go:Collect`.
 
 ---
 
 ## SPEC-OBS-002: Mandatory Spans Per Query Type
+
 *Added: 2026-06-19*
 
 Every call to `Collect` MUST produce the following OTel span hierarchy when a TracerProvider
@@ -707,6 +714,7 @@ only produced on the `planBlocks → scanBlocks` execution path; intrinsic fast-
 structural paths are exempt.
 
 **Attribute contract:**
+
 - `blockpack.query`: no attributes required (span name is sufficient)
 - `blockpack.planner`: MUST set `blockpack.planner.total_blocks`, `selected_blocks`,
   `pruned_by_time`, `pruned_by_index`, `pruned_by_bloom`, `pruned_by_colstats`,
@@ -721,6 +729,7 @@ Back-ref: `internal/modules/executor/stream.go:Collect,scanBlocks`,
 ---
 
 ## SPEC-OBS-003: IsRecording() Guard — No Attribute Allocations on Unsampled Queries
+
 *Added: 2026-06-19*
 
 Every `span.SetAttributes(...)` call that runs on the hot query path MUST be wrapped in
@@ -745,6 +754,7 @@ Back-ref: `internal/modules/executor/otel_spans.go:attachCacheStats,emitPlannerS
 ---
 
 ## SPEC-OBS-004: Block Span Cache Attributes — Aggregate Per-Block, Not Per-Fetch
+
 *Added: 2026-06-19*
 
 Cache observability for `blockpack.block` spans MUST be implemented as aggregate hit/miss
@@ -758,6 +768,7 @@ nil-safe `*CacheStats` pointer into `readBlockColumnarWithCache`. Attributes MUS
 set on the span when `cs != nil && span.IsRecording()`.
 
 Section-to-attribute key mapping:
+
 - `CacheStatsSectionToc` (0) → `blockpack.cache.toc.hits`, `blockpack.cache.toc.misses`
 - `CacheStatsSectionCol` (1) → `blockpack.cache.col.hits`, `blockpack.cache.col.misses`
 
@@ -771,6 +782,7 @@ Back-ref: `internal/modules/blockio/reader/cache_stats.go:CacheStats`,
 ---
 
 ## SPEC-OBS-005: Per-Section Cache Stat Collection via Fetched-Flag Pattern
+
 *Added: 2026-06-19*
 
 Cache hit vs miss detection in `readBlockColumnarWithCache` MUST use a fetched-flag wrapper

@@ -26,31 +26,19 @@ package blockpack
 import (
 	modules_reader "github.com/grafana/blockpack/internal/modules/blockio/reader"
 	modules_shared "github.com/grafana/blockpack/internal/modules/blockio/shared"
+	"github.com/grafana/blockpack/internal/modules/valueindex"
 )
 
-// ValueIndexEntry is one extracted (column, span) observation. It carries the
-// fully-resolved column name, the typed value, the column type, the zero-based
-// inner block index, and the span's wall-clock start time in seconds (0 when the
-// block has no span:start intrinsic). Callers map this into their own per-entry
-// record (e.g. valueindexconsumer.ColumnEntry) and supply the source object ref.
+// ValueIndexEntry is one extracted (column, span) observation.
 type ValueIndexEntry struct {
-	// Value is the typed column value: string, int64, uint64, bool, float64, or
-	// []byte, matching ColType. A []byte value aliases reader-owned memory valid
-	// only for the duration of the yield call; a caller that retains it must copy.
-	Value any
-	// ColName is the resolved column name. Intrinsic columns keep their colon form
-	// (e.g. "span:name", "resource.service.name"); attribute columns keep their
-	// dotted form (e.g. "span.http.method", "resource.region").
-	ColName string
-	// ColType is the column's data type.
-	ColType ColumnType
-	// BlockRef is the v2 page-aligned file locator of the inner block the
-	// observation came from (NOTE-V2-002, issue #423). It lets a querier issue a
-	// direct ranged GET of the block bytes from a value-index hit with no TOC
-	// fetch.
-	BlockRef modules_shared.BlockFileRef
-	// TimeSec is the span's start time in whole seconds, or 0 when unavailable.
-	TimeSec uint64
+	Value    any    // typed column value (string, int64, uint64, bool, float64, []byte)
+	ColName  string // resolved column name
+	ColType  ColumnType
+	BlockID  uint32              // v1: zero-based block index (NOTE-VI-014)
+	BlockRef valueindex.BlockRef // v2+: page-addressed block reference (NOTE-VI-027)
+	TimeSec  uint64              // span start time in whole seconds (0 if unavailable)
+	SpanID   [8]byte             // span identity for direct lookup (NOTE-VI-029, #428)
+	RowIdx   int                 // row index within block for O(1) access (NOTE-VI-029, #428)
 }
 
 // ExtractValueIndexEntries reads every indexable (column, span) observation from
@@ -171,21 +159,31 @@ func truncateTimeValueToMillis(name string, val any) any {
 }
 
 // buildSpanStartSecByRef builds a packed-key (uint32(blockIdx)<<16 | rowIdx) → seconds
-// map from the span:start intrinsic column, converting nanoseconds to whole seconds.
+// map from the span:start block column, converting nanoseconds to whole seconds.
+// After #433 (IntrinsicTOC removal), span:start lives in block payload columns.
 // Returns nil when the column is absent so callers fall back to TimeSec == 0.
 func buildSpanStartSecByRef(r *modules_reader.Reader) map[uint32]uint64 {
-	col, err := r.GetIntrinsicColumn(modules_shared.SpanStartColumnName)
-	if err != nil || col == nil || len(col.Uint64Values) == 0 {
-		return nil
-	}
-	col.EnsureBlockRefs()
-	m := make(map[uint32]uint64, len(col.BlockRefs))
-	for i, ref := range col.BlockRefs {
-		if i >= len(col.Uint64Values) {
-			break
+	var m map[uint32]uint64
+	for bi := range r.BlockCount() {
+		bwb, err := r.GetBlockWithBytes(bi, nil)
+		if err != nil || bwb == nil {
+			continue
 		}
-		key := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx)
-		m[key] = col.Uint64Values[i] / 1_000_000_000
+		col := bwb.Block.GetColumn(modules_shared.SpanStartColumnName)
+		if col == nil {
+			continue
+		}
+		if m == nil {
+			m = make(map[uint32]uint64, r.BlockCount()*int(r.BlockMeta(0).SpanCount))
+		}
+		for rowIdx := range bwb.Block.SpanCount() {
+			v, ok := col.Uint64Value(rowIdx)
+			if !ok {
+				continue
+			}
+			key := uint32(bi)<<16 | uint32(rowIdx) //nolint:gosec // bounded values
+			m[key] = v / 1_000_000_000
+		}
 	}
 	return m
 }
@@ -204,6 +202,10 @@ func extractBlockColumns(
 ) error {
 	for bi := range r.BlockCount() {
 		meta := r.BlockMeta(bi)
+		// V2 lean format unconditional (2026-06-29): every block is page-aligned and addressed
+		// by a page-unit BlockRef. Block 0 sits at offset 0 (PageNum==0). Legacy BlockID is unused.
+		//nolint:gosec // meta.Offset/Length bounded by valid file size (<64 GiB)
+		blockRef, _ := valueindex.BlockRefFromByteRange(int64(meta.Offset), int64(meta.Length))
 		raw, rerr := r.ReadBlockRaw(bi)
 		if rerr != nil {
 			continue
@@ -212,6 +214,8 @@ func extractBlockColumns(
 		if perr != nil {
 			continue
 		}
+		// Look up span:id column for this block once per block (for v4 span identity).
+		spanIDCol := block.Block.GetColumn("span:id")
 		for colKey, col := range block.Block.Columns() {
 			if _, denied := denylist[colKey.Name]; denied {
 				continue
@@ -225,14 +229,26 @@ func extractBlockColumns(
 				if !ok {
 					continue
 				}
+				// Time-domain intrinsics (span:start/end/duration) flow through the block
+				// columns now that the IntrinsicTOC is gone (#436); truncate ns→ms here so
+				// the value index keeps the cardinality reduction of NOTE-VI-027 (#415).
+				val = truncateTimeValueToMillis(colKey.Name, val)
 				yielded[colKey.Name] = struct{}{}
-				key := uint32(bi)<<16 | uint32(row) //nolint:gosec // bounded by block/span counts
+				key := uint32(bi)<<16 | uint32(row) //nolint:gosec
+				var spanID [8]byte
+				if spanIDCol != nil {
+					if v, ok2 := spanIDCol.BytesValue(row); ok2 && len(v) == 8 {
+						copy(spanID[:], v)
+					}
+				}
 				if err := yield(ValueIndexEntry{
 					ColName:  colKey.Name,
-					Value:    truncateTimeValueToMillis(colKey.Name, val),
+					Value:    val,
 					ColType:  colType,
-					BlockRef: blockRefByIdx[bi],
+					BlockRef: blockRef,
 					TimeSec:  startSecByRef[key],
+					SpanID:   spanID,
+					RowIdx:   row,
 				}); err != nil {
 					return err
 				}
@@ -283,9 +299,10 @@ func yieldIntrinsicColumn(
 ) error {
 	emit := func(ref modules_shared.BlockRef, val any) error {
 		key := uint32(ref.BlockIdx)<<16 | uint32(ref.RowIdx)
-		var blockRef modules_shared.BlockFileRef
+		var blockRef valueindex.BlockRef
 		if int(ref.BlockIdx) < len(blockRefByIdx) {
-			blockRef = blockRefByIdx[ref.BlockIdx]
+			fr := blockRefByIdx[ref.BlockIdx]
+			blockRef = valueindex.BlockRef{PageNum: fr.Page, LenPages: fr.Length}
 		}
 		return yield(ValueIndexEntry{
 			ColName:  name,

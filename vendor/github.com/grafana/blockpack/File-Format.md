@@ -118,3 +118,98 @@ Per-column selective reads were tried and removed: they caused 10–120× more A
 |---|---|---|---|
 | `io_ops` | < 500 | 500–1000 | > 1000 |
 | `bytes/io` | > 100KB | 10–100KB | < 10KB |
+
+---
+
+## v2 Lean Format (FooterV9, issue #417)
+
+### Motivation
+
+v1 files spend ~50% of their bytes on secondary indexes — IntrinsicTOC, SpanTree,
+KLL sketch blobs, file-level bloom, and the chunked trace DFS index — that exist to
+accelerate in-file queries. When the value-index pipeline handles all querying, these
+sections become redundant. Removing them halves file size and simplifies the writer.
+
+### v2 File Layout
+
+```
+┌──────────────────────────────────────────┐
+│  Block 0  (4 096-byte page-aligned)      │
+├──────────────────────────────────────────┤
+│  Block 1  (4 096-byte page-aligned)      │
+├──────────────────────────────────────────┤
+│  ...                                     │
+├──────────────────────────────────────────┤
+│  Block N  (4 096-byte page-aligned)      │
+├──────────────────────────────────────────┤
+│  Metadata blob                           │
+│  ├── Block index (offset + size per blk) │
+│  └── Range index (bucket boundaries)     │
+├──────────────────────────────────────────┤
+│  ToC blob                                │
+├──────────────────────────────────────────┤
+│  Footer V9 (18 bytes)                    │
+└──────────────────────────────────────────┘
+```
+
+### What is removed in v2
+
+| Section | Reason |
+|---|---|
+| IntrinsicTOC | ~50% of file; querying moves to value-index |
+| SpanTree | identity now in block payload |
+| KLL sketch blobs | raw quantile data not needed post-build |
+| File-level bloom | replaced by value-index |
+| Chunked trace index | replaced by value-index on `trace:id` |
+| TS index | not needed without IntrinsicTOC fast path |
+
+### What is kept in v2
+
+- Block index — needed to locate blocks by byte offset
+- Range bucket boundaries — needed for block pruning (derived from KLL at write time)
+
+### Block alignment
+
+Every inner block in a v2 file is padded to a 4 096-byte page boundary after writing.
+A block's position can therefore be expressed as a **page number** = `offset / 4096`.
+
+Value-index entries for v2 files carry a `BlockRef{PageNum uint24, LenPages uint16}`
+(5 bytes) instead of `BlockID uint32` (4 bytes). A querier hit can issue a direct S3
+ranged GET:
+
+    Range: bytes = PageNum × 4096, length = LenPages × 4096
+
+No TOC fetch — one round trip from index hit to block bytes.
+
+### Identity columns
+
+v2 blocks are self-contained: `span:id`, `span:parent_id`, and `trace:id` are stored
+in the inner-block column payload (in addition to the per-block intrinsic accumulator
+used by the compaction dedup path). There is no IntrinsicTOC or SpanTree fallback.
+
+### Footer
+
+v2 files use `FooterV9Version = 9` in the 18-byte footer. The wire layout is identical
+to V8 (magic[4] · version[2] · toc_offset[8] · toc_length[4] = 18 bytes). Readers
+detect the format from the version field.
+
+### Writer config
+
+Enable v2 output by setting `Config.EnableV2Format = true` in the blockpack writer,
+or `Config.EnableV2Output = true` in the compaction config (v1→v2 rewrite pass).
+
+### Reader behaviour
+
+v2 readers (`IsV2Format() == true`) return:
+- `HasIntrinsicSection() == false`
+- `HasSpanTree() == false`
+- `HasTraceIndex() == false`
+- `TraceEntries() == nil` (use value-index pipeline for trace lookup)
+
+Block fetching: `ReadBlockByRef(pageNum, lenPages)` issues one `ReadAt` and returns
+the block bytes without a TOC lookup.
+
+### Migration
+
+v1 files remain readable. New writes use v2 when `EnableV2Format` is set.
+Compaction with `EnableV2Output` rewrites v1 blocks into v2 format.

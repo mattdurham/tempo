@@ -45,9 +45,6 @@ type Service = valueindexconsumer.Service
 // RedisConsumer is a Redis Streams consumer-group Consumer.
 type RedisConsumer = valueindexconsumer.RedisConsumer
 
-// RqliteConsumer is a pull-based Consumer backed by the rqlite job table.
-type RqliteConsumer = valueindexconsumer.RqliteConsumer
-
 // Default configuration values.
 const (
 	DefaultStreamName           = valueindexconsumer.DefaultStreamName
@@ -69,10 +66,4 @@ func NewService(cfg Config, consumer Consumer, extractor Extractor, store Object
 // ready Consumer.
 func NewRedisConsumer(cfg Config) (*RedisConsumer, error) {
 	return valueindexconsumer.NewRedisConsumer(cfg)
-}
-
-// NewRqliteConsumer dials rqlite, ensures the job schema exists, and returns a
-// ready pull-based Consumer backed by the job table.
-func NewRqliteConsumer(cfg Config) (*RqliteConsumer, error) {
-	return valueindexconsumer.NewRqliteConsumer(cfg)
 }

@@ -73,7 +73,6 @@ func emitPlannerSpan(ctx context.Context, plan *queryplanner.Plan, stats *Planne
 		attribute.Int("blockpack.planner.selected_blocks", len(plan.SelectedBlocks)),
 		attribute.Int("blockpack.planner.pruned_by_time", plan.PrunedByTime),
 		attribute.Int("blockpack.planner.pruned_by_index", plan.PrunedByIndex),
-		attribute.Int("blockpack.planner.pruned_by_bloom", plan.PrunedByFuse),
 		attribute.Int("blockpack.planner.pruned_by_colstats", plan.PrunedByColStats),
 		attribute.Int("blockpack.planner.pruned_by_intrinsic_toc", plan.PrunedByIntrinsicTOC),
 		attribute.Int("blockpack.planner.pruned_by_file_bounds", plan.PrunedByFileBounds),

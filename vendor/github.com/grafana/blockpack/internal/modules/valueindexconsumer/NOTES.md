@@ -466,114 +466,19 @@ preserved (NOTE-LINT-407): pointers/maps/strings first, the `uint8 colType` +
 Back-refs: `internal/modules/valueindexconsumer/service.go`
 (`columnBuffer`, `bufferFor`, `ingest`, `flushColumn`, `spillWriteBufSize`).
 
-## NOTE-VI-027 — Policy-free index + millisecond time truncation (issues #414, #415)
+## NOTE-VI-021-TOMBSTONE — rqlite consumer removed (issue #417)
 
 Date: 2026-06-28
 
-### Removed `DefaultValueIndexDenylist` (issue #414)
+The rqlite-backed `RqliteConsumer` (NOTE-VI-021) has been removed as part of the
+blockpack v2 lean-format work (issue #417). The async consumer pipeline is being
+replaced by a synchronous `ValueIndexSink` callback on `WriterConfig` and
+`compaction.Config`.
 
-The value index is a general-purpose lookup structure: which columns are worth
-querying is a READ-time decision made by the querier, not a WRITE-time policy
-baked into the storage layer. The old `DefaultValueIndexDenylist` silently dropped
-`span:id`, `span:parent_id`, `trace:id`, and `span:start` at extraction time, which
-meant those columns could never be queried via the value index even if a future
-use case needed them (e.g. trace-by-id lookup, time-bucketed lookups).
+Removed:
+- `internal/modules/valueindexconsumer/rqlite.go`
+- `Config.RqliteURL` field
+- `NewRqliteConsumer` constructor
+- `valueindexconsumer.RqliteConsumer` public type alias
 
-`ExtractValueIndexEntries(reader, denylist, yield)` now treats a nil denylist as
-"index every column" rather than "select the default denylist". Both production
-callers (the standalone binary and tempo's in-process module) pass nil, so removing
-the default flips them from "drop the four columns" to "index everything" with no
-signature change. Callers that genuinely need exclusions pass an explicit non-nil
-denylist; an empty non-nil map also indexes everything. Reading a nil map with the
-`_, ok := denylist[name]` comma-ok form is safe (always returns false), so no
-nil-guard is needed on the lookups.
-
-### Millisecond truncation for time-domain intrinsics (issue #415)
-
-`span:start`, `span:end`, and `span:duration` are stored as raw nanosecond uint64
-values. At nanosecond resolution every span gets a unique value hash and the
-posting list degenerates to one entry per span — zero value sharing, which is
-exactly why those columns were in the old denylist. The right fix is truncation,
-not exclusion: `truncateTimeValueToMillis(name, val)` divides the value by 1e6
-(`ns → ms`) for exactly these three column names, applied at BOTH yield sites
-(phase-1 block columns and phase-2 IntrinsicTOC). This gives ~1000x cardinality
-reduction (`span:start`/`span:end`) and collapses common durations into shared
-buckets (`span:duration`).
-
-Truncation is scoped strictly to the three time columns — every other uint64/int64
-column (e.g. `span:kind`, small-integer attributes) passes through unchanged; a
-blanket divide would have zeroed out those small integers. Truncation happens ONLY
-during value-index extraction: the stored block columns remain nanosecond precision
-for range queries, and the recorded `ColumnType` is unchanged (still uint64
-milliseconds, not a duration type). Millisecond precision is sufficient — sub-ms is
-not exposed in TraceQL and not meaningful for tag-value lookups.
-
-Back-refs: `valueindex_extract.go` (`truncateTimeValueToMillis`,
-`ExtractValueIndexEntries`), `valueindex_extract_test.go`,
-`cmd/value-index-consumer/main.go`,
-tempo `cmd/tempo/app/value_index.go`.
-
-## NOTE-VI-028 — Structured logging + OTel tracing for the consumer pipeline (issue #410)
-
-Date: 2026-06-28
-
-The consumer pod was a black box: after the startup banner it was completely
-silent even while burning a CPU on a large L1 block, with no way to see which
-job was running, how long each phase took, or whether a flush fired. This adds
-structured logging and OpenTelemetry spans throughout the orchestration. No
-behavioural change — observability only.
-
-### Logging
-
-A `*slog.Logger` is carried on the `Service` (`s.logger`). It is sourced from the
-new `Config.Logger` field (not YAML-settable; injected by the embedder), and
-NewService falls back to `slog.Default()` when it is nil — so the logger is never
-nil and a log call can never panic. The binary (`cmd/value-index-consumer`) and
-tempo both inject their logger explicitly.
-
-Boundaries logged (matching the issue's verbosity split):
-
-- info: job claimed, extraction complete (`columns`, `entries`, `elapsed`),
-  extraction failed (error level), flush complete (`buffers`, `elapsed`),
-  job acked (no-column-touched fast path), stale-claim reclaim (`reclaimed`).
-- debug: per-column flush (`col`, `type`, `entries`, `size_bytes`, `s3_key`,
-  `elapsed`), messages acked.
-
-`entries` on the extract line is counted in the yield callback; on the per-column
-flush line it is counted while replaying the spill file. The stale-reclaim log is
-gated on `reclaimed > 0` but `StaleReclaimsSince()` is still called exactly once
-per loop so the backend counter is always drained (it resets on read).
-
-### Tracing
-
-Follows the executor pattern (NOTE-449): a package-level `otel.Tracer` in
-observability.go, lazily bound by the OTel global, a no-op when no TracerProvider
-is configured. Spans:
-
-- `value_index.extract` — wraps the full Extract call in ingest; attributes
-  `file`, `columns`, `entries`.
-- `value_index.flush` — wraps the full flushAll pass; attribute `buffer_count`
-  (only buffers that had data).
-- `value_index.flush.column` — wraps one column's S3 put; attributes `col`,
-  `type`, `entries`.
-
-All `span.SetAttributes` calls are guarded by `span.IsRecording()` so unsampled
-jobs pay no attribute-allocation cost.
-
-### Scope decision — no download/phase1/phase2 spans
-
-The issue's table also lists `value_index.download`, `value_index.phase1` and
-`value_index.phase2` spans. Those phases live inside `ExtractValueIndexEntries`
-(blockpack root package), which takes no `context.Context` and uses a *lazy*
-ranged-GET provider — there is no discrete upfront download to wrap (bytes are
-fetched on demand during the column walk). Adding them would require a signature
-change to `ExtractValueIndexEntries`, a new OTel tracer in the root package, and
-context threading through both extractor callsites. The `value_index.extract`
-span already brackets the entire extraction (download + both phases) per job, and
-the existing extract-duration metric surfaces the aggregate cost, so the
-black-box problem is solved at the orchestration boundary without that larger
-surface change.
-
-Back-refs: `observability.go`, `service.go` (ingest, flushAll, flushColumn,
-observeQueueState), `config.go` (`Logger` field),
-`cmd/value-index-consumer/main.go`, tempo `cmd/tempo/app/value_index.go`.
+The Redis Streams consumer remains for operators who prefer the async pipeline.
