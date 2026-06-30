@@ -6833,6 +6833,13 @@ cached timestamp blob alone). See `fullFetchSkippedExecPaths`.
 
 ## NOTE-470 — Structural `>>` descendant via SpanTree DFS intervals (issue #388 step 3)
 
+> **REMOVED (issue #434, 2026-06-30):** The SpanTree structural index was deleted. The
+> `useSpanTreeDescendant` fast path, `evalOpDescendantStructSpanTree`, the `dfsInterval` sweep,
+> and `compactQualifiedStructuralTraces` are gone. All descendant (`>>`) queries now take the
+> parent-map path (`resolveStructuralParentIndices` + the per-op evaluators), reconstructing
+> parent topology from the `span:parent_id` block column. The note below is retained for
+> historical context only.
+
 Completes the structural half of #388: the descendant operator (`>>`) is served from the
 SpanTree's precomputed DFS in/out intervals instead of the per-trace `span:parent_id` →
 `parentIdx` map plus the memoized ancestor-chain walk (NOTE-392).

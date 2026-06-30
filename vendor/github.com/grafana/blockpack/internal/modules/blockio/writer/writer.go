@@ -680,9 +680,9 @@ func (w *Writer) mergeBuiltBlock(i int, s blockSlice, results []builtBlock) erro
 	return nil
 }
 
-// spillBlockAccumulators streams the block's per-block intrinsic accumulator and
-// derived SpanTree records to disk, then releases the in-memory accumulator.
-// NOTE-461 / NOTE-462: single write pass bounds peak RSS to one block's data.
+// spillBlockAccumulators is a no-op after the IntrinsicTOC (#433) and SpanTree (#434)
+// sections were removed — identity and intrinsic fields now live in block columns, so there
+// are no per-block accumulators to spill. Retained for the build pipeline call sequence.
 func (w *Writer) spillBlockAccumulators(i int, s blockSlice, results []builtBlock) error {
 	_ = results[i]
 	return nil

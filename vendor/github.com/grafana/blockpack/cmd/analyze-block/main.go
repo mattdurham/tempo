@@ -1,6 +1,6 @@
 // Command analyze-block uses the blockpack library to analyze a local .blockpack file.
 // Prints a per-column compression and encoding breakdown across all inner blocks,
-// file-level TOC section sizes, and the impact of the SpanTree index.
+// and file-level TOC section sizes.
 package main
 
 import (
@@ -87,7 +87,6 @@ func run(path string) error {
 	fmt.Printf("  Inner blocks: %d\n", r.BlockCount())
 	fmt.Printf("  Total spans:  %s\n", commaf(totalSpans))
 	fmt.Printf("  Traces:       %s\n", commaf(int64(r.TraceCount())))
-	fmt.Printf("  Has SpanTree: %v\n", r.HasSpanTree())
 
 	// ── File-level TOC ────────────────────────────────────────────────────
 	subtypeNames := map[uint32]string{
@@ -97,7 +96,6 @@ func run(path string) error {
 		modules_shared.ToCSubTypeTS:           "TSIndex",
 		modules_shared.ToCSubTypeIntrinsic:    "IntrinsicTOC",
 		modules_shared.ToCSubTypeTraceChunked: "TraceChunked",
-		modules_shared.ToCSubTypeSpanTree:     "SpanTree",
 	}
 	typeNames := map[uint32]string{
 		modules_shared.ToCTypeMetadata: "Metadata",
@@ -112,7 +110,7 @@ func run(path string) error {
 	fmt.Printf("  %-22s %-25s %12s %12s\n", "Type", "SubType", "Offset", "MB")
 	fmt.Println("  " + strings.Repeat("-", 78))
 
-	var totalSecBytes, spantreeBytes int64
+	var totalSecBytes int64
 	for _, e := range entries {
 		tn := typeNames[e.Type]
 		if tn == "" {
@@ -124,9 +122,6 @@ func run(path string) error {
 		}
 		fmt.Printf("  %-22s %-25s %12d %12.2f\n", tn, sn, e.Offset, float64(e.CompressedBytes)/1024/1024)
 		totalSecBytes += e.CompressedBytes
-		if e.SubType == modules_shared.ToCSubTypeSpanTree {
-			spantreeBytes = e.CompressedBytes
-		}
 	}
 	fmt.Printf("  %-22s %-25s %12s %12.2f\n", "TOTAL", "", "", float64(totalSecBytes)/1024/1024)
 
@@ -231,7 +226,7 @@ func run(path string) error {
 			e.name, float64(e.bytes)/1024/1024, float64(e.bytes)/float64(totalComp)*100)
 	}
 
-	// ── Size breakdown and SpanTree impact ───────────────────────────────
+	// ── Size breakdown ───────────────────────────────────────────────────
 	fmt.Printf("\n=== Size breakdown ===\n")
 	fmt.Printf("  Inner block columns:  %8.2f MB  (%.1f%% of file)\n",
 		float64(totalComp)/1024/1024, float64(totalComp)/float64(fileSize)*100)
@@ -252,28 +247,6 @@ func run(path string) error {
 		float64(idBytes)/1024/1024,
 		float64(idBytes)/float64(totalComp)*100,
 		float64(idBytes)/float64(fileSize)*100)
-
-	fmt.Printf("\n=== SpanTree impact (replacing ID columns) ===\n")
-	if r.HasSpanTree() {
-		fmt.Printf("  SpanTree present:     %8.2f MB\n", float64(spantreeBytes)/1024/1024)
-		net := idBytes - spantreeBytes
-		fmt.Printf("  ID cols removed:      %8.2f MB\n", float64(idBytes)/1024/1024)
-		fmt.Printf("  Net saving:           %8.2f MB  (%.1f%% of file)\n",
-			float64(net)/1024/1024, float64(net)/float64(fileSize)*100)
-	} else {
-		// Estimate SpanTree cost: 44 bytes/span uncompressed, ~1.4x compression typical
-		estUncomp := totalSpans * modules_shared.SpanTreeRecordSize
-		estComp := estUncomp * 10 / 14 // ~1.4x
-		net := idBytes - estComp
-		fmt.Printf("  SpanTree not present. Estimated cost if added:\n")
-		fmt.Printf("    Uncompressed:       %8.2f MB  (%s spans × %d bytes/record)\n",
-			float64(estUncomp)/1024/1024, commaf(totalSpans), modules_shared.SpanTreeRecordSize)
-		fmt.Printf("    Compressed (est):   %8.2f MB  (~1.4x compression)\n",
-			float64(estComp)/1024/1024)
-		fmt.Printf("  ID cols removed:      %8.2f MB\n", float64(idBytes)/1024/1024)
-		fmt.Printf("  Net saving (est):     %8.2f MB  (%.1f%% of file)\n",
-			float64(net)/1024/1024, float64(net)/float64(fileSize)*100)
-	}
 
 	return nil
 }

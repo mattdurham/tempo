@@ -44,10 +44,6 @@ func extractIDs(
 
 // buildIntrinsicBytesMap builds a packed-key → bytes lookup map from an intrinsic flat column.
 // Key encoding: uint32(blockIdx)<<16 | uint32(rowIdx). Returns nil if the column is absent.
-//
-// NOTE-476 (issue #394): for the three identity columns (trace:id/span:id/span:parent_id), if
-// the IntrinsicTOC lacks the column but the file carries a SpanTree, the map is built from the
-// SpanTree reverse map instead — those columns are omitted from the TOC for such files.
 func buildIntrinsicBytesMap(r *modules_reader.Reader, colName string) map[uint32][]byte {
 	col, err := r.GetIntrinsicColumn(colName)
 	if err == nil && col != nil && len(col.BytesValues) > 0 {
@@ -60,52 +56,7 @@ func buildIntrinsicBytesMap(r *modules_reader.Reader, colName string) map[uint32
 		}
 		return m
 	}
-	if isIdentityColumnName(colName) && !r.HasIntrinsicColumn(colName) && r.HasSpanTree() {
-		return buildIdentityBytesMapFromSpanTree(r, colName)
-	}
 	return nil
-}
-
-// isIdentityColumnName reports whether colName is one of the three identity columns that may
-// be served from the SpanTree instead of the IntrinsicTOC. NOTE-476.
-func isIdentityColumnName(colName string) bool {
-	return colName == "trace:id" || colName == "span:id" || colName == "span:parent_id"
-}
-
-// buildIdentityBytesMapFromSpanTree builds a packed-key → identity-bytes map for an identity
-// column by scanning every block's SpanTree reverse map. Key encoding matches buildIntrinsicBytesMap
-// (uint32(blockIdx)<<16 | uint32(rowIdx)). NOTE-476 (issue #394).
-func buildIdentityBytesMapFromSpanTree(r *modules_reader.Reader, colName string) map[uint32][]byte {
-	m := make(map[uint32][]byte)
-	for blockIdx := 0; blockIdx < r.BlockCount(); blockIdx++ {
-		idMap, err := r.SpanTreeIdentityForBlock(uint16(blockIdx)) //nolint:gosec // bounded by BlockCount
-		if err != nil || idMap == nil {
-			continue
-		}
-		for rowIdx, rec := range idMap {
-			key := uint32(blockIdx)<<16 | uint32(rowIdx) //nolint:gosec // bounded
-			switch colName {
-			case "trace:id":
-				b := make([]byte, 16)
-				copy(b, rec.TraceID[:])
-				m[key] = b
-			case "span:id":
-				b := make([]byte, 8)
-				copy(b, rec.SpanID[:])
-				m[key] = b
-			case "span:parent_id":
-				if rec.ParentID != ([8]byte{}) {
-					b := make([]byte, 8)
-					copy(b, rec.ParentID[:])
-					m[key] = b
-				}
-			}
-		}
-	}
-	if len(m) == 0 {
-		return nil
-	}
-	return m
 }
 
 // buildIntrinsicBytesMapForRows builds a packed-key → bytes lookup map from an intrinsic flat

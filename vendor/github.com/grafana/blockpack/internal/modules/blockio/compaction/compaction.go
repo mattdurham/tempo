@@ -331,8 +331,9 @@ func (s *compactionState) ensureWriter() error {
 		// the output block so all of compaction's disk I/O stays on the configured scratch
 		// volume rather than the default /tmp.
 		ScratchDir: s.stagingDir,
-		// NOTE-476 (issue #394): drop identity columns from the compacted IntrinsicTOC when
-		// configured; the SpanTree section is the identity store for such blocks.
+		// NOTE-476 (issue #394): legacy flag. The IntrinsicTOC (#433) and SpanTree (#434)
+		// identity stores have been removed; v2 identity lives in block columns, so this
+		// should remain OFF (no fallback store exists).
 		OmitIntrinsicIdentityColumns: s.cfg.OmitIntrinsicIdentityColumns,
 		// NOTE: EnableV2Format removed (2026-06-29, v2 unconditional).
 	})

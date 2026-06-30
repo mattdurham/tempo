@@ -25,10 +25,10 @@ type Config struct {
 	DedicatedColumns []modules_blockio.DedicatedColumn
 	MaxSpansPerBlock int
 
-	// OmitIntrinsicIdentityColumns drops the trace:id/span:id/span:parent_id columns from the
-	// compacted output's IntrinsicTOC (NOTE-476, issue #394). Identity is served from the
-	// SpanTree section instead. See WriterConfig.OmitIntrinsicIdentityColumns. The source
-	// blocks' identity is sourced from their own SpanTree during recompaction when they were
-	// themselves written with this flag.
+	// OmitIntrinsicIdentityColumns historically dropped trace:id/span:id/span:parent_id from
+	// the compacted output's IntrinsicTOC (NOTE-476, issue #394), relying on the SpanTree as a
+	// fallback identity store. The IntrinsicTOC (#433) and SpanTree (#434) have been removed;
+	// v2 identity lives in block columns. See WriterConfig.OmitIntrinsicIdentityColumns —
+	// should remain OFF.
 	OmitIntrinsicIdentityColumns bool
 }

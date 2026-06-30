@@ -34,9 +34,9 @@ func getSpanFieldsAdapter(block *modules_reader.Block, rowIdx int) *modulesSpanF
 }
 
 // getSpanFieldsAdapterWithReader returns a pooled adapter. The block payload is the
-// authoritative source for all non-identity fields; reader+blockIdx enable the SpanTree
-// identity fallback (NOTE-476, issue #394) for trace:id/span:id/span:parent_id when those
-// columns are absent from both the block payload and the IntrinsicTOC.
+// authoritative source for all non-identity fields; reader+blockIdx enable the identity
+// fallback (NOTE-476, issue #394) for trace:id/span:id/span:parent_id when those columns are
+// absent from the block payload. The SpanTree (#434) fallback store has been removed.
 func getSpanFieldsAdapterWithReader(
 	block *modules_reader.Block, reader *modules_reader.Reader, blockIdx, rowIdx int,
 	_ map[string]struct{},
@@ -78,9 +78,9 @@ func NewSpanFieldsAdapter(block *modules_reader.Block, rowIdx int) modules_share
 }
 
 // NewSpanFieldsAdapterWithReader returns a SpanFieldsProvider backed by the block payload, with
-// a SpanTree identity fallback (NOTE-476, issue #394) for trace:id/span:id/span:parent_id when
-// those columns are absent from the block payload and IntrinsicTOC. wantCols is accepted for API
-// compatibility. Release via ReleaseSpanFieldsAdapter.
+// an identity fallback (NOTE-476, issue #394) for trace:id/span:id/span:parent_id when those
+// columns are absent from the block payload. The SpanTree (#434) fallback store has been
+// removed. wantCols is accepted for API compatibility. Release via ReleaseSpanFieldsAdapter.
 func NewSpanFieldsAdapterWithReader(
 	block *modules_reader.Block, reader *modules_reader.Reader, blockIdx, rowIdx int,
 	wantCols map[string]struct{},

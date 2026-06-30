@@ -202,18 +202,10 @@ type Config struct {
 	// can be rolled out deliberately and reverted by toggle without a format change.
 	EnableZstdColumns bool
 
-	// OmitIntrinsicIdentityColumns drops the three identity columns (trace:id, span:id,
-	// span:parent_id) from the persisted IntrinsicTOC (NOTE-476, issue #394). These columns
-	// account for ~26% of L1 file size and are redundant: the SpanTree section already stores
-	// (TraceID, SpanID, ParentID, BlockIdx, RowIdx) for every span. When true, the writer still
-	// feeds the per-block accumulator so the SpanTree is built from it, but the file-level
-	// intrinsic spill skips these three columns so they never reach the final TOC.
-	//
-	// Readers detect absence via HasIntrinsicColumn and fall back to the per-block SpanTree
-	// identity reverse map (Reader.SpanTreeIdentityForBlock). The reader fallback is
-	// UNCONDITIONAL and always present, so this flag is safe to enable on a reader that already
-	// understands the SpanTree section. Defaults OFF so it can be rolled out by toggle without a
-	// block-format version bump (the IntrinsicTOC is a self-describing column set — fewer
-	// columns is not a format change).
+	// OmitIntrinsicIdentityColumns historically dropped the three identity columns (trace:id,
+	// span:id, span:parent_id) from the persisted IntrinsicTOC (NOTE-476, issue #394) on the
+	// assumption that the SpanTree section carried identity as a fallback. Both the IntrinsicTOC
+	// (#433/#436) and the SpanTree (#434) have since been removed; v2 identity lives in block
+	// columns. This flag no longer has a fallback identity store and should remain OFF.
 	OmitIntrinsicIdentityColumns bool
 }

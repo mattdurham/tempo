@@ -48,20 +48,6 @@ type PageStats struct{}
 // All fields are now regular block columns.
 func IsIntrinsicColumn(_ string) bool { return false }
 
-// SpanTreeRecord is a stub. The SpanTree was removed in #434.
-type SpanTreeRecord struct {
-	TraceID  [16]byte
-	SpanID   [8]byte
-	ParentID [8]byte
-	BlockIdx uint16
-	RowIdx   uint16
-	DFSIn    uint32
-	DFSOut   uint32
-}
-
-// IsDescendant is a stub. Always returns false.
-func IsDescendant(_, _ SpanTreeRecord) bool { return false }
-
 // MakeNoZeroBytes returns an uninitialized byte slice of size n.
 // After unzeroed_alloc.go was deleted (#436), this simple fallback is sufficient.
 func MakeNoZeroBytes(n int) []byte {

@@ -10,7 +10,7 @@ import (
 )
 
 // lookupIntrinsicFieldsTyped returns per-ref typed field values for predicate evaluation.
-// After #433: IntrinsicTOC is gone; only SpanTree (also gone) and block columns remain.
+// After #433/#434: IntrinsicTOC and SpanTree are gone; only block columns remain.
 // Returns an empty slice — callers fall through to block-column evaluation.
 func lookupIntrinsicFieldsTyped(
 	_ *modules_reader.Reader,
