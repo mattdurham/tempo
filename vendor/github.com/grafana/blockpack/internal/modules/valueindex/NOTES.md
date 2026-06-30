@@ -419,3 +419,52 @@ Back-refs:
 - `internal/modules/valueindex/filecache.go:IndexFileCache.AddFile`, `RemoveFiles`
 - `internal/modules/valueindexcompactor/service.go` (V2-named output)
 - `internal/modules/valueindex/filename.go:FormatFilenameV2`, `IsInTimeRange`
+
+---
+
+## NOTE-VI-038 — TraceID index: parent/child span structure (issue #428)
+
+Date: 2026-06-30
+
+The TraceID index (stored under the `hash("trace:id")` column directory, `uuid` type
+segment) is a specialised value-index variant that encodes the parent/child relationship
+between spans so a complete trace can be reconstructed from the index alone — no data-block
+scan needed for identity, only for materializing fields.
+
+### Why a separate payload (TraceGroup) instead of the standard Entry posting list
+
+A standard `Entry` answers "which spans have column C = value V at time T" — it is keyed by
+*value*. The TraceID index is keyed by *traceID* and must additionally carry `ParentSpanID`
+for tree assembly. Rather than overload `Entry` (which would carry a dead ParentSpanID field
+in every standard value-index file), the TraceID index uses its own `TraceGroup` /
+`SpanEntry` payload. The *outer* file framing (header/blocks/TOC/footer with min/max time) is
+shared with the standard value index; only the inner chunk payload differs.
+
+### SpanEntry direct addressing
+
+Each `SpanEntry` carries `SourceRef` (string-table interned, like NOTE-VI-028), `BlockRef`
+(page-addressed, like NOTE-VI-027), and `RowIdx` — enough to fetch the exact span row without
+scanning. `ParentSpanID` is zero for the root span.
+
+### Compaction (MergeTraceGroups)
+
+- Groups for the same TraceID across input files are merged into one TraceGroup.
+- `(TraceID, SpanID)` pairs are deduplicated — first occurrence wins.
+- The merged `TimeSec` is the **minimum** across inputs (earliest bucket the trace was seen).
+- Retention drop: a `SourceExists` callback (one S3 HEAD per unique SourceRef, cached by the
+  compactor) lets MergeTraceGroups skip spans whose data block was deleted by retention. A
+  group whose every span is dropped is removed entirely. This mirrors the standard
+  value-index stale-ref handling (NOTE-VI-037 / #399) — no explicit delete messages needed.
+
+### Querier (AssembleTrace) — partial-trace handling
+
+`AssembleTrace` builds the span tree. Spans with a present parent attach as children;
+**orphans** (a non-zero ParentSpanID with no matching SpanEntry in the group — the parent
+arrived in a different not-yet-compacted L0 file or was retention-dropped) attach at the root
+level and the result is flagged `Partial`. Genuine root spans (zero ParentSpanID) are always
+roots and never set Partial. Trees are deterministic (children and roots sorted by SpanID).
+
+Back-refs:
+- `internal/modules/valueindex/traceindex.go` (TraceGroup, SpanEntry, EncodeTraceGroups,
+  DecodeTraceGroups, MergeTraceGroups, AssembleTrace)
+- `internal/modules/blockio/shared/constants.go:ValueIndexTraceVersion`

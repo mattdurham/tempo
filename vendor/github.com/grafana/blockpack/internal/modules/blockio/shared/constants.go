@@ -514,6 +514,10 @@ const (
 	ValueIndexEntriesVersionV4 uint8 = 0x04 // V3 + SpanID[8] + RowIdx[2] per entry (issue #428, default)
 	ValueIndexKLLVersion       uint8 = 0x01
 
+	// ValueIndexTraceVersion is the encode version for the TraceID index payload
+	// (TraceGroup/SpanEntry parent-child structure, issue #428, NOTE-VI-038).
+	ValueIndexTraceVersion uint8 = 0x01
+
 	// ValueIndexKLLK is the k parameter for the vi:value KLL sketch (~0.01% quantile error).
 	// Value index files carry exactly one KLL column so there is no per-column memory pressure.
 	ValueIndexKLLK = 10_000
