@@ -377,10 +377,9 @@ func (w *Writer) Flush() (int64, error) {
 		return w.out.total, err
 	}
 
-	// 2. Apply KLL bucket boundaries to the range index.
-	// KLL sketches were built incrementally in flushBlocks (one Add per block min
-	// and max), so no re-scan is needed here.
-	// 3–8. Write V8 sections + Footer. (Range index removed in #439; applyRangeBuckets skipped)
+	// 2. Write V8 sections + Footer. The range index (#439) and column sketches (#435)
+	// are gone; the value index is authoritative for pruning, so no post-flush bucket
+	// application is needed here.
 	if err := w.writeV8Sections(); err != nil {
 		return w.out.total, fmt.Errorf("writer: write V8 sections: %w", err)
 	}
@@ -449,12 +448,10 @@ func (w *Writer) writeEmptyFile() (int64, error) {
 // and called by Flush() to process any remaining buffered spans before writing metadata.
 //
 // INVARIANT (NOTES §17): Does NOT write metadata/header/footer. That happens only in Flush().
-// INVARIANT: rangeIdx is updated here but KLL/range-buckets are applied at Flush().
 // INVARIANT: Block IDs are globally sequential: blockID := len(w.blockMetas) + i.
 //
-// RSS bound: After processing all blocks, protoRoots is cleared. The w.rangeIdx map keys
-// independently keep string backing bytes alive (GC traces map key pointers), so clearing
-// protoRoots is safe and releases the batch's proto memory back to the GC.
+// RSS bound: After processing all blocks, protoRoots is cleared, releasing the batch's
+// proto memory back to the GC.
 // blockSlice is a contiguous run of pending spans with a pre-assigned block ID.
 // IDs are assigned before the parallel build so goroutines write results[i]
 // without coordination (NOTE-LINT-407: hoisted out of flushBlocks to decompose it).
@@ -464,7 +461,7 @@ type blockSlice struct {
 }
 
 // v2PageSize is the block alignment granularity for v2 files (NOTE-V2-001).
-// Kept local to break the import cycle: valueindex imports blockio/writer (via KLL),
+// Kept local to break the import cycle: valueindex imports blockio/writer,
 // so writer cannot import valueindex. The value must match valueindex.PageSize = 4096.
 const v2PageSize = 4096
 
@@ -680,7 +677,6 @@ func (w *Writer) mergeBuiltBlock(i int, s blockSlice, results []builtBlock) erro
 		results[i].blockVectors = nil // release memory after accumulation
 	}
 
-	w.updateBlockIndexes(s, built)
 	return nil
 }
 
@@ -690,15 +686,6 @@ func (w *Writer) mergeBuiltBlock(i int, s blockSlice, results []builtBlock) erro
 func (w *Writer) spillBlockAccumulators(i int, s blockSlice, results []builtBlock) error {
 	_ = results[i]
 	return nil
-}
-
-// updateBlockIndexes folds a built block's column stats and trace-index entries
-// into the file-level state. Range index removed in #439.
-func (w *Writer) updateBlockIndexes(s blockSlice, built builtBlock) {
-	// NOTE: colStatsByBlock accumulation removed (2026-06-29, in-file block pruning removal).
-	// Value index is now the authoritative source for pruning.
-
-	// Collect sketch set for this block.
 }
 
 // addRowCacheKey identifies a unique (reader, blockIdx) pair for the AddRowFromReader

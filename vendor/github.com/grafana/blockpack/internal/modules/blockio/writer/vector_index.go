@@ -1,8 +1,9 @@
 package writer
 
 // NOTE: Any changes to this file must be reflected in the corresponding specs.md or NOTES.md.
-// NOTE-VEC-001: vectorAccumulator follows the same accumulate-at-flush pattern as
-// sketchIdx. Do NOT serialize vectors inside flushBlocks().
+// NOTE-VEC-001: vectorAccumulator follows an accumulate-at-flush pattern: vectors
+// are gathered per block during the parallel build and serialized only at Flush().
+// Do NOT serialize vectors inside flushBlocks().
 
 import (
 	"encoding/binary"

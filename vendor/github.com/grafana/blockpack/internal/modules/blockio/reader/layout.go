@@ -14,31 +14,6 @@ import (
 
 // FileLayoutReport is the top-level result of AnalyzeFileLayout.
 
-// SketchIndexInfo summarizes the sketch index stored in the file.
-
-// Blocks holds one summary per block (parallel to FileLayoutReport.BlockSpanCounts).
-
-// TotalBytes is the actual computed uncompressed size of the sketch section.
-
-// HeaderBytes is the fixed 12-byte sketch section header (magic + num_blocks + num_columns).
-
-// SketchedBlockCount is the number of blocks that have at least one sketched column.
-
-// BlockSketchSummary holds per-column sketch statistics for one block.
-
-// Columns holds sketch stats for each column that has sketch data in this block.
-
-// ColumnSketchStat holds sketch statistics for one column in one block.
-
-// HLLCardinality is the estimated number of distinct values (HyperLogLog).
-
-// FuseBytes is the byte size of the membership filter (SketchBloom for SKTE/SKTD, absent for legacy SKTC).
-
-// TopKCount is the number of TopK entries for this column (0 if none).
-
-// TopKBytes is the actual byte size of the TopK entries for this column in this
-// block (1 + len(entries) × 10 bytes).
-
 // FileLayoutSection describes one contiguous byte range in a blockpack file.
 
 // MinValue is the minimum value of this page (human-readable string).
@@ -87,15 +62,6 @@ func (r *Reader) fileLayoutV8() (*FileLayoutReport, error) {
 		switch {
 		case key.Type == shared.ToCTypeIndex && key.SubType == shared.ToCSubTypeBlockIndex:
 			sectionName = "section.block_index"
-		case key.Type == shared.ToCTypeMetadata && key.SubType == shared.ToCSubTypeSketch:
-			sectionName = "section.sketch_index[" + key.Name + "]"
-			// Don't set colType for sketch blobs — column type not available without parsing.
-			sections = append(sections, FileLayoutSection{
-				Section:        sectionName,
-				Offset:         int64(e.Offset), //nolint:gosec
-				CompressedSize: int64(e.Length), //nolint:gosec
-			})
-			continue
 		case key.Type == shared.ToCTypeMetadata && key.SubType == shared.ToCSubTypeTrace:
 			sectionName = "section.trace_index"
 		case key.Type == shared.ToCTypeMetadata && key.SubType == shared.ToCSubTypeTS:
@@ -135,8 +101,6 @@ func (r *Reader) fileLayoutV8() (*FileLayoutReport, error) {
 		return cmp.Compare(a.Offset, b.Offset)
 	})
 
-	var sketchIndex *SketchIndexInfo
-
 	spanCounts := make([]uint32, len(r.blockMetas))
 	var totalSpans int64
 	for i, m := range r.blockMetas {
@@ -151,7 +115,6 @@ func (r *Reader) fileLayoutV8() (*FileLayoutReport, error) {
 		TotalSpans:      totalSpans,
 		BlockSpanCounts: spanCounts,
 		Sections:        sections,
-		SketchIndex:     sketchIndex,
 	}, nil
 }
 

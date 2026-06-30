@@ -508,8 +508,9 @@ func (r *Reader) ensureV14TSSection() error {
 // parseV5MetadataLazy was the V3/V4/V5/V6 metadata parser.
 // Removed 2026-06-12 when legacy footer support was dropped.
 // The function body is gone; this stub preserves the call site in reader.go during transition.
-// parseAndCacheSketchSection parses the sketch index section from data, caches the result,
-// and returns the number of bytes consumed. Returns (0, nil) when no sketch section is present.
+
+// parseBlockIndexEntry parses a single block_index ToC entry from data starting at pos,
+// returning the decoded BlockMeta and the new read position.
 func parseBlockIndexEntry(data []byte, pos int) (shared.BlockMeta, int, error) {
 	var meta shared.BlockMeta
 

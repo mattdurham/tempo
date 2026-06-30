@@ -62,7 +62,7 @@ const (
 
 	// ToCEntry SubType constants for ToCTypeMetadata (Type=1).
 	// SubType 1 (Range) retired 2026-06-30 (range index removed, #439); not reused.
-	ToCSubTypeSketch    uint32 = 2 // per-column KLL/sketch blob
+	// SubType 2 (Sketch) retired 2026-06-30 (KLL/column sketch index removed, #435); not reused.
 	ToCSubTypeBloom     uint32 = 3 // file-level bloom filter blob
 	ToCSubTypeIntrinsic uint32 = 4 // per-column intrinsic column blob
 	ToCSubTypeTrace     uint32 = 5 // compact trace index blob
@@ -95,13 +95,14 @@ const (
 
 	// Section type constants for the V14 section directory type-keyed entries.
 	// Each constant identifies one independently snappy-compressed file-level section.
-	// Value 0x06 (formerly SectionFileBloom) was retired with the file-level bloom
-	// removal (#437); 0x06 and 0x07+ are reserved for future type-keyed sections.
-	SectionBlockIndex  uint8 = 0x01
-	SectionRangeIndex  uint8 = 0x02
-	SectionTraceIndex  uint8 = 0x03
-	SectionTSIndex     uint8 = 0x04
-	SectionSketchIndex uint8 = 0x05
+	// Value 0x05 (formerly SectionSketchIndex) was retired with the KLL/column sketch
+	// index removal (#435); Value 0x06 (formerly SectionFileBloom) was retired with the
+	// file-level bloom removal (#437); 0x05, 0x06 and 0x07+ are reserved for future
+	// type-keyed sections.
+	SectionBlockIndex uint8 = 0x01
+	SectionRangeIndex uint8 = 0x02
+	SectionTraceIndex uint8 = 0x03
+	SectionTSIndex    uint8 = 0x04
 
 	// DirEntryKindType identifies a type-keyed section directory entry (one of the 6 fixed sections).
 	// Wire: entry_kind[1]=0x00 + section_type[1] + offset[8] + compressed_len[4] = 14 bytes.

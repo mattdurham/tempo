@@ -120,7 +120,6 @@ func getColumnZstdEncoder() *zstd.Encoder {
 // It is an intermediate value type populated by buildBlock and consumed in the flushBlocks serial pass.
 
 // per-column min/max for this block
-// per-column HLL/TopK/fuse sketches for this block
 // localAccum holds the per-block intrinsic data built during parallel block
 // construction. Nil when buildBlock is called without a localAccum (legacy path
 // or test helpers). Merged into w.intrinsicAccum during the serial post-build pass.
@@ -1298,16 +1297,14 @@ func (b *blockBuilder) internColName(key string, cache map[string]string, prefix
 	return name
 }
 
-// updateMinMax updates the per-block min/max for the named column and records the
-// value in the sketch accumulators (HLL, TopK, BinaryFuse8 keys).
+// updateMinMax updates the per-block min/max for the named column.
 // key is the encoded range key (from encodeRangeKey). Called once per present value.
 // On first call for a column, min and max are both set to key.
 // On subsequent calls, min and max are updated using type-aware comparison.
 //
 // 8-byte LE encoding for int64/uint64/float64 does NOT preserve lexicographic ordering
 // (e.g. enc(256)="\x00\x01..." < enc(255)="\xff..." in string compare, but 256 > 255
-// numerically). Numeric types require decoded comparison to produce correct min/max;
-// the recorded encoded keys are then fed to the KLL sketch in addBlockRangeToColumn.
+// numerically). Numeric types require decoded comparison to produce correct min/max.
 // String/bytes columns use raw lexicographic comparison which is correct by definition.
 func (b *blockBuilder) updateMinMax(name string, typ shared.ColumnType, key string) {
 	if mm, ok := b.colMinMax[name]; ok {
@@ -1325,14 +1322,11 @@ func (b *blockBuilder) updateMinMax(name string, typ shared.ColumnType, key stri
 			colType: typ,
 		}
 	}
-	// Update sketch accumulators for every observed value (not just min/max).
-	// SPEC-SK-16: same key encoding as at query time.
 }
 
 // updateMinMaxNum updates the per-block min/max for a numeric (int64/uint64/float64)
 // column using an [8]byte LE-encoded key. Avoids the string([]byte) allocation that
-// encodeRangeKey would otherwise cause on every span. The sketch is fed using an
-// unsafe.String view of the key to avoid a heap copy (the string does not escape).
+// encodeRangeKey would otherwise cause on every span.
 func (b *blockBuilder) updateMinMaxNum(name string, typ shared.ColumnType, key [8]byte) {
 	if mm, ok := b.colMinMax[name]; ok {
 		if numKeyLess(typ, key, mm.numMinKey) {

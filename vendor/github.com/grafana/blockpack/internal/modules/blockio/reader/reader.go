@@ -482,9 +482,6 @@ func (r *Reader) TraceEntries(_ [16]byte) []TraceEntry { return nil }
 // call, so there is no shared state to reset between blocks.
 func (r *Reader) ResetInternStrings() {}
 
-// FileSketchSummaryRaw always returns nil. The KLL sketch index was removed in #435.
-func (r *Reader) FileSketchSummaryRaw() []byte { return nil }
-
 // TraceBloomRaw returns nil. The compact trace bloom was removed with the TraceID index (#438).
 func (r *Reader) TraceBloomRaw() []byte { return nil }
 

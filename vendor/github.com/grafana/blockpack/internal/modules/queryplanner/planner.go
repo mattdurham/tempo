@@ -39,15 +39,6 @@ import (
 // to a full BlockMeta scan in that case.
 // The returned slice is sorted in ascending blockID order.
 
-// ColumnSketch returns bulk per-block sketch data for the named column.
-// Returns nil when no sketch data is available (old files or column not sketched).
-// The returned ColumnSketch has methods returning slices indexed by block number.
-
-// SketchEvictor is an optional interface that a BlockIndexer may implement.
-// When Plan() determines that all blocks in a file have been pruned, it calls
-// EvictSketch() to release the sketch section from the process-level cache,
-// preventing unbounded memory growth during wide time-range queries.
-
 // LogicalOp specifies the boolean operator used to combine a Predicate's children.
 type LogicalOp uint8
 
@@ -136,11 +127,6 @@ const (
 // NOTE-020: explain is opt-in to eliminate ~63% of queryplanner allocs in production.
 
 // Plan is the output of a planning step: the block indices to read.
-
-// BlockScores holds the per-block selectivity score (freq/max(cardinality,1)).
-// Indexed by block index; score 0.0 means the block was not scored or has no data.
-// Length == TotalBlocks when populated; nil when no sketch data is available.
-// NOTE-023: []float64 replaces map[int]float64 — direct index access, 2 fewer allocs/op.
 
 // Explain is an ASCII trace of how the predicate tree resolved to block sets.
 // Empty by default. Populated only when PlanOptions.EnableExplain is true.
@@ -277,7 +263,7 @@ func (p *Planner) planInternal(predicates []Predicate, timeRange TimeRange, enab
 	}
 
 	if len(predicates) == 0 {
-		plan.SelectedBlocks = setToSortedByScore(candidates, p.r, nil)
+		plan.SelectedBlocks = setToSortedByTime(candidates, p.r)
 		if enableExplain {
 			explainPlan(predicates, plan, timeBlocks)
 		}
@@ -292,7 +278,7 @@ func (p *Planner) planInternal(predicates []Predicate, timeRange TimeRange, enab
 	// NOTE(#435,#437): BinaryFuse8 sketch pruning and block scoring also removed — the
 	// KLL sketch index was removed in #435 and file-level bloom in #437. Blocks are
 	// sorted by MinStart only.
-	plan.SelectedBlocks = setToSortedByScore(candidates, p.r, nil)
+	plan.SelectedBlocks = setToSortedByTime(candidates, p.r)
 	if enableExplain {
 		explainPlan(predicates, plan, timeBlocks)
 	}
@@ -305,14 +291,10 @@ func (p *Planner) FetchBlocks(plan *Plan) (map[int][]byte, error) {
 	return p.r.ReadBlocks(plan.SelectedBlocks)
 }
 
-// setToSortedByScore converts the candidate set to a slice sorted by block MinStart
-// timestamp (ascending), with sketch score as a secondary sort (descending — higher
-// score first). When scores are available, blocks with the same timestamp window are
-// ordered so the most promising blocks (high frequency, low cardinality) come first.
-// This improves early termination for limited queries: the executor is more likely to
-// find matches in the first few blocks.
-// Block index is used as a final tiebreaker for stable ordering.
-func setToSortedByScore(s blockSet, r BlockIndexer, _ []float64) []int {
+// setToSortedByTime converts the candidate set to a slice sorted by block MinStart
+// timestamp (ascending), with block index as a final tiebreaker for stable ordering.
+// Sketch-derived selectivity scoring was removed in #435; ordering is timestamp-only.
+func setToSortedByTime(s blockSet, r BlockIndexer) []int {
 	out := make([]int, 0, s.count())
 	s.iter(func(k int) {
 		out = append(out, k)

@@ -118,9 +118,8 @@ type Config struct {
 	// 0 means use the default of 5 × MaxBlockSpans.
 	// Set a large value (e.g. math.MaxInt) to effectively disable auto-flush.
 	//
-	// The auto-flush path preserves all NOTES §17 invariants: the KLL two-pass
-	// for range buckets still happens at final Flush() only. The range index
-	// accumulates across all flushBlocks() calls and is consumed once at Flush().
+	// The auto-flush path preserves all NOTES §17 invariants: metadata, header,
+	// and footer are written only at the final Flush().
 	MaxBufferedSpans int
 
 	// VectorDimension is the expected float32 vector dimension for __embedding__ columns.

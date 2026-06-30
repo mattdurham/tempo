@@ -39,8 +39,8 @@ func (w *Writer) writeV8Sections() error {
 	if err := w.writeV8BlockIndex(sw); err != nil {
 		return err
 	}
-	// (2) Per-column range blobs — always written (needed for block pruning in both formats).
-	//     Sketch blobs are only written for v1 (v2 drops the raw KLL blobs).
+	// (2) Per-column range blobs — no-op since #439 (range index removed). The column
+	//     sketch blobs (KLL/HLL/TopK) were removed in #435; the value index is authoritative.
 	if err := w.writeV8RangeBlobs(sw); err != nil {
 		return err
 	}

@@ -3393,3 +3393,34 @@ SpanTree fallback.
 
 **Back-ref:** `reader/spantree.go:SpanTreeIdentityForBlock`/`buildSpanTreeIdentityMaps`,
 `reader/reader.go:spanTreeIdentityByBlock`. Tests: top-level `omit_intrinsic_identity_test.go`.
+
+## NOTE-478 — KLL / column sketch index removed (issue #435)
+
+The per-column sketch index (HLL distinct-count, TopK, SketchBloom membership filter, and the
+KLL-derived range buckets) is gone. The value index (`internal/modules/valueindex`) is now the
+authoritative source for cardinality, top-N, and value-membership queries, so no in-file column
+sketch is built or read.
+
+**Removed surface.**
+- Whole package `internal/modules/sketch` (HLL, CMS, BinaryFuse8, TopK) — was already unimported.
+- Reader types `FileSketchSummary`, `FileColumnSketch`, `FileTopKEntry`, `SketchIndexInfo`,
+  `BlockSketchSummary`, `ColumnSketchStat`, and the `Reader.FileSketchSummaryRaw()` stub.
+- `FileLayoutReport.SketchIndex` field and the `section.sketch_index[...]` layout case.
+- Queryplanner `Plan.BlockScores` (always-nil sketch-derived selectivity score) and the dead
+  `[]float64` score parameter of the block sort (`setToSortedByScore` → `setToSortedByTime`,
+  timestamp-only ordering).
+- Writer `updateBlockIndexes` (had become an empty no-op after sketch accumulation removal).
+
+**Retired ToC/section IDs (slot reserved, not reused).** `ToCSubTypeSketch` (subtype 2) and
+`SectionSketchIndex` (0x05) are retired in `shared/constants.go` with dated comments, matching
+the `ToCSubTypeRange`/ColStats retirement convention. Legacy files that still carry a sketch ToC
+entry remain readable: the reader simply ignores the unknown subtype (the layout switch falls
+through to the generic `section.typeN.subtypeN[...]` label).
+
+**NOT touched.** The value index's own single-column KLL (`ValueIndexKLL*` constants, `vi:value`)
+is a separate live feature. The executor's `intrinsic-topk-kll` path uses `BlockMeta.MaxStart`
+for timestamp ordering — its "KLL" name is legacy and unrelated to the column sketch.
+
+**Back-ref:** `shared/constants.go` (retired subtype 2 / section 0x05),
+`reader/layout.go`, `reader/filelayoutreport.go`, `queryplanner/plan.go`, `queryplanner/planner.go`,
+`writer/writer.go`. Tests: `shared/toc_test.go`, `shared/format_v14_test.go`.
