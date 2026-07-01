@@ -250,6 +250,10 @@ type tempoSpanValues struct {
 }
 
 func (s *tempoSpanValues) String(col string) (string, bool) {
+	// __all__ is the sentinel for single-dimension cubes — always present.
+	if col == "__all__" {
+		return "__all__", true
+	}
 	// Span attributes: "span.<key>"
 	if len(col) > 5 && col[:5] == "span." {
 		return attrString(s.span.Attributes, col[5:])
