@@ -145,7 +145,8 @@ func (cqp *cubeQueryPath) tryQueryFromCube(
 	result, routeErr := router.Route(tenant, dims, nil, 1, minMinute, maxMinute)
 	if routeErr != nil || !result.Found {
 		// Cube not found — attempt to create it on first query.
-		cqp.maybeCreateCube(ctx, tenant, dims, req)
+		// Fire cube creation in a background goroutine so QueryRange is not blocked.
+		go cqp.maybeCreateCube(context.Background(), tenant, dims, req)
 		return nil, false
 	}
 
