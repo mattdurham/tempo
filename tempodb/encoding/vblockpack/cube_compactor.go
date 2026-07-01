@@ -188,7 +188,12 @@ var cubeFileRe = regexp.MustCompile(`\.cube$`)
 var cubeTimedFileRe = regexp.MustCompile(`^L(\d+)-(\d+)-(\d+)-[^/]+\.cube$`)
 
 func (s *cubeFileStore) List(ctx context.Context, tenant, cubeID string) ([]blockpack.CubeFileInfo, error) {
-	prefix := path.Join(tenant, "cubes", cubeID) + "/"
+	// Registry stores 16-hex-char IDs (8 bytes); S3 dirs use 32-hex-char (16 bytes, zero-padded).
+	paddedID := cubeID
+	if len(cubeID) == 16 {
+		paddedID = cubeID + strings.Repeat("0", 16)
+	}
+	prefix := path.Join(tenant, "cubes", paddedID) + "/"
 	var files []blockpack.CubeFileInfo
 	for obj := range s.client.ListObjects(ctx, s.bucket,
 		minio.ListObjectsOptions{Prefix: prefix, Recursive: true}) {
