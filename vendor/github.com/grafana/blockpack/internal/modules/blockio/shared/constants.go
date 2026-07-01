@@ -485,6 +485,14 @@ const (
 	// ValueIndexFooterSize is the fixed byte size of the value index file footer.
 	ValueIndexFooterSize = 32
 
+	// ValueIndexBucketGroupsPerBlock is the maximum number of BucketGroups packed into
+	// a single block of a v2 BucketGroup value-index file (NOTE-VI-045, issue #429).
+	// Each block carries its own min/max time, min/max value, and value bloom, so the
+	// querier prunes at block granularity; smaller blocks mean finer pruning but more
+	// per-block metadata overhead. 4096 groups keeps each block's directory entry cheap
+	// while still allowing coarse skips across a large file.
+	ValueIndexBucketGroupsPerBlock = 4_096
+
 	// ValueIndexWriterSpillEntries is the number of buffered posting-list entries at
 	// which the value-index writer sorts its in-memory run and spills it to a temp
 	// file (NOTE-VI-026, issue #413). At ~72 bytes/rawEntry this caps peak in-memory

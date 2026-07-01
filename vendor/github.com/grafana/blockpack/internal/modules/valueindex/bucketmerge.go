@@ -11,9 +11,12 @@ package valueindex
 // SourceRef path into the output file's table and rewrites the ids.
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"sort"
+
+	"github.com/grafana/blockpack/internal/modules/blockio/shared"
 )
 
 // MergeBucketFiles merges any number of BucketFiles into a single output file. All groups
@@ -170,6 +173,133 @@ func SplitIntoBlocks(f *BucketFile, groupsPerBlock int) {
 		blocks = append(blocks, blk)
 	}
 	f.Blocks = blocks
+}
+
+// CompactBucketFiles decodes, retention-filters, merges, and re-splits a set of v2
+// BucketGroup files (NOTE-VI-045, issue #429). It mirrors CompactFiles' semantics for the
+// BucketGroup format: dead-source BucketBlockRefs are dropped (per cfg.Checker), the
+// remaining refs are merged via MergeBucketFiles, and the result is split into blocks of at
+// most groupsPerBlock groups. output is called once with the serialized merged file bytes.
+// It returns CompactStats counting retained vs dropped BucketBlockRefs.
+func CompactBucketFiles(
+	ctx context.Context,
+	files [][]byte,
+	cfg CompactConfig,
+	groupsPerBlock int,
+	output func([]byte) error,
+) (CompactStats, error) {
+	if len(files) == 0 {
+		return CompactStats{}, nil
+	}
+	if groupsPerBlock <= 0 {
+		groupsPerBlock = shared.ValueIndexBucketGroupsPerBlock
+	}
+
+	decoded := make([]*BucketFile, 0, len(files))
+	var stats CompactStats
+	for _, data := range files {
+		f, err := DecodeBucketFile(data)
+		if err != nil {
+			return CompactStats{}, fmt.Errorf("valueindex: CompactBucketFiles: decode: %w", err)
+		}
+		if cfg.Checker != nil {
+			filtered, fstats, ferr := filterDeadRefs(ctx, f, cfg.Checker)
+			if ferr != nil {
+				return CompactStats{}, ferr
+			}
+			stats.Retained += fstats.Retained
+			stats.Dropped += fstats.Dropped
+			f = filtered
+		} else {
+			stats.Retained += countBucketRefs(f)
+		}
+		decoded = append(decoded, f)
+	}
+
+	merged, err := MergeBucketFiles(decoded...)
+	if err != nil {
+		return CompactStats{}, fmt.Errorf("valueindex: CompactBucketFiles: merge: %w", err)
+	}
+	SplitIntoBlocks(merged, groupsPerBlock)
+
+	out, err := EncodeBucketFile(merged)
+	if err != nil {
+		return CompactStats{}, fmt.Errorf("valueindex: CompactBucketFiles: encode: %w", err)
+	}
+	if err := output(out); err != nil {
+		return CompactStats{}, err
+	}
+	return stats, nil
+}
+
+// filterDeadRefs returns a copy of f with every BucketBlockRef whose SourceRef is confirmed
+// deleted removed. Groups and blocks that become empty are dropped. It counts retained vs
+// dropped refs. The string table is rebuilt implicitly by MergeBucketFiles downstream, so
+// here we only prune; SourceIDs remain valid against f.StringTable for the returned file.
+func filterDeadRefs(ctx context.Context, f *BucketFile, checker RefChecker) (*BucketFile, CompactStats, error) {
+	var stats CompactStats
+	live := make(map[uint16]bool)
+	out := &BucketFile{StringTable: f.StringTable}
+	for bi := range f.Blocks {
+		b := &f.Blocks[bi]
+		nb := BucketBlock{}
+		for gi := range b.Groups {
+			g := &b.Groups[gi]
+			ng := BucketGroup{TimeSec: g.TimeSec, CanonicalValue: g.CanonicalValue}
+			for ri := range g.Refs {
+				r := &g.Refs[ri]
+				isLive, ok := live[r.SourceID]
+				if !ok {
+					l, err := checker.IsLive(ctx, f.StringTable.Lookup(r.SourceID))
+					if err != nil {
+						return nil, CompactStats{}, fmt.Errorf(
+							"valueindex: RefChecker.IsLive(%q): %w", f.StringTable.Lookup(r.SourceID), err,
+						)
+					}
+					isLive = l
+					live[r.SourceID] = l
+				}
+				if !isLive {
+					stats.Dropped++
+					continue
+				}
+				stats.Retained++
+				ng.Refs = append(ng.Refs, *r)
+			}
+			if len(ng.Refs) > 0 {
+				nb.Groups = append(nb.Groups, ng)
+			}
+		}
+		if len(nb.Groups) > 0 {
+			nb.ComputeBlockMeta()
+			out.Blocks = append(out.Blocks, nb)
+		}
+	}
+	if len(out.Blocks) > 0 {
+		out.MinTimeSec = out.Blocks[0].MinTimeSec
+		out.MaxTimeSec = out.Blocks[0].MaxTimeSec
+		for bi := range out.Blocks {
+			if out.Blocks[bi].MinTimeSec < out.MinTimeSec {
+				out.MinTimeSec = out.Blocks[bi].MinTimeSec
+			}
+			if out.Blocks[bi].MaxTimeSec > out.MaxTimeSec {
+				out.MaxTimeSec = out.Blocks[bi].MaxTimeSec
+			}
+		}
+	}
+	return out, stats, nil
+}
+
+// countBucketRefs counts total BucketBlockRefs across all groups (retained-count proxy when
+// no RefChecker is configured).
+func countBucketRefs(f *BucketFile) int {
+	n := 0
+	for bi := range f.Blocks {
+		for gi := range f.Blocks[bi].Groups {
+			n += len(f.Blocks[bi].Groups[gi].Refs)
+		}
+	}
+	return n
 }
 
 func formatGroupKey(timeSec uint64, value []byte) string {

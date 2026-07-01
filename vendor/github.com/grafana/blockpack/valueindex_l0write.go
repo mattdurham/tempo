@@ -133,7 +133,8 @@ func WriteValueIndexL0(r *Reader, store ObjectPutter, sourceRef, tenant, indexPr
 // time-range-embedded key (NOTE-VI-030, #431) so the querier can discover it by
 // wall-clock window without opening the file.
 func flushAndPutL0(store ObjectPutter, g *l0Group, tenant, indexPrefix string) error {
-	data, err := g.writer.Flush(context.Background(), 0)
+	// NOTE-VI-045 (#429): write the v2 BucketGroup format directly.
+	data, err := g.writer.FlushBucket(context.Background(), 0)
 	if err != nil {
 		return fmt.Errorf("blockpack: WriteValueIndexL0: flush %q: %w", g.colName, err)
 	}
@@ -142,11 +143,10 @@ func flushAndPutL0(store ObjectPutter, g *l0Group, tenant, indexPrefix string) e
 	}
 
 	// Embed the wall-clock time range in the filename for O(1) discovery
-	// (NOTE-VI-030). WallMinTS/WallMaxTS are already in seconds.
+	// (NOTE-VI-030). The BucketGroup footer carries file-level min/max time_sec.
 	var wallMinSec, wallMaxSec uint64
-	if vr, rerr := valueindex.OpenReader(data); rerr == nil {
-		m := vr.Meta()
-		wallMinSec, wallMaxSec = m.WallMinTS, m.WallMaxTS
+	if ft, ferr := valueindex.DecodeBucketFooter(data); ferr == nil {
+		wallMinSec, wallMaxSec = ft.MinTimeSec, ft.MaxTimeSec
 	}
 
 	key := path.Join(

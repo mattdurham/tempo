@@ -99,6 +99,10 @@ func QueryTraceQLFromIndex(
 	// Group survivors by block so each block is fetched and parsed once. A span
 	// with no usable row address forces a fallback: without RowIdx we cannot do
 	// direct row access and would have to scan the block anyway.
+	// NOTE-VI-045 (#429): the v2 BucketGroup index carries a page-addressed BlockRef
+	// (BlockPage), not a block index. Resolve each page to a block index via the reader;
+	// a page that names no block start means the index and data file are out of sync ⇒
+	// fall back to a scan rather than returning a partial result.
 	rowsByBlock := make(map[int][]uint16)
 	blockOrder := make([]int, 0, len(filtered))
 	type spanKey struct {
@@ -107,26 +111,19 @@ func QueryTraceQLFromIndex(
 	}
 	identity := make(map[spanKey]VILookupResult, len(filtered))
 	for _, m := range filtered {
-		blockIdx := int(m.BlockID)
+		blockIdx, ok := r.BlockIndexForPage(m.BlockPage)
+		if !ok {
+			return nil, false, nil // page names no block ⇒ index/data skew ⇒ fall back
+		}
 		key := spanKey{blockIdx: blockIdx, rowIdx: m.RowIdx}
 		if _, seen := identity[key]; seen {
-			continue // duplicate (TraceID,SpanID) already collapsed by viMatchSpans; guard anyway
+			continue // duplicate span already collapsed by viMatchSpans; guard anyway
 		}
 		identity[key] = m
 		if _, exists := rowsByBlock[blockIdx]; !exists {
 			blockOrder = append(blockOrder, blockIdx)
 		}
 		rowsByBlock[blockIdx] = append(rowsByBlock[blockIdx], m.RowIdx)
-	}
-
-	// Validate block indices against the reader before fetching. An out-of-range
-	// block index means the index and data file are out of sync — fall back to a
-	// scan rather than returning a partial result.
-	blockCount := r.BlockCount()
-	for _, bi := range blockOrder {
-		if bi < 0 || bi >= blockCount {
-			return nil, false, nil
-		}
 	}
 
 	want := modules_reader.WantOnly(wantCols)

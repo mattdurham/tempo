@@ -248,6 +248,23 @@ func (r *Reader) BlockMeta(blockIdx int) shared.BlockMeta {
 	return r.blockMetas[blockIdx]
 }
 
+// BlockIndexForPage resolves a v2 page-addressed block start (byte offset / 4096) back to
+// its zero-based block index (NOTE-VI-045, issue #429). Value-index BucketGroup entries
+// carry a page-addressed BlockRef, but the block-scan fetch path (ReadBlocks/ParseBlockFromBytes)
+// operates on block indices; this bridges the two. Returns (index, true) on an exact match of
+// the block's start offset, or (0, false) if no block begins at that page (index/data skew ⇒
+// caller should fall back to a scan).
+func (r *Reader) BlockIndexForPage(pageNum uint32) (int, bool) {
+	const pageSize = 4096
+	want := uint64(pageNum) * pageSize
+	for i := range r.blockMetas {
+		if r.blockMetas[i].Offset == want {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
 // ReadBlockRaw reads the raw bytes for the block at blockIdx from the provider.
 func (r *Reader) ReadBlockRaw(blockIdx int) ([]byte, error) {
 	if blockIdx < 0 || blockIdx >= len(r.blockMetas) {

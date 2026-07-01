@@ -319,7 +319,17 @@ func compareRawEntry(colType shared.ColumnType, a, b *rawEntry) int {
 	if a.timeSec > b.timeSec {
 		return 1
 	}
-	return bytes.Compare(a.traceID[:], b.traceID[:])
+	if c := bytes.Compare(a.traceID[:], b.traceID[:]); c != 0 {
+		return c
+	}
+	// NOTE-VI-045 (#429): tiebreak on rowIdx to match sortRawSlice.
+	if a.rowIdx < b.rowIdx {
+		return -1
+	}
+	if a.rowIdx > b.rowIdx {
+		return 1
+	}
+	return 0
 }
 
 // sameEntry reports whether two entries are duplicates for dedup purposes, matching
@@ -329,5 +339,7 @@ func sameEntry(a, b *rawEntry) bool {
 		a.traceID == b.traceID &&
 		a.sourceRef == b.sourceRef &&
 		a.blockRef == b.blockRef &&
-		a.timeSec == b.timeSec
+		a.timeSec == b.timeSec &&
+		a.rowIdx == b.rowIdx &&
+		a.spanID == b.spanID
 }

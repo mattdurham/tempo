@@ -96,3 +96,57 @@ func (f *BucketFile) LookupValue(value []byte, minTS, maxTS uint64) []*BucketGro
 	}
 	return out
 }
+
+// QueryBucketFiles evaluates pred against each v2 BucketGroup file and returns every matching
+// span as a LookupResult (NOTE-VI-045, issue #429). A nil predicate matches every value
+// (match-all). timeRange, if non-nil, is an inclusive [minSec, maxSec] filter applied at the
+// block, group, and file level. Each SpanRef span index yields one LookupResult carrying the
+// resolved SourceRef path, page-addressed BlockRef, trace id, and row index.
+//
+// This is the BucketGroup analog of QueryFiles: it lets the querier read the v2 write-path
+// output without the flat VINX reader.
+func QueryBucketFiles(pred Predicate, timeRange *[2]uint64, files ...[]byte) ([]LookupResult, error) {
+	minTS, maxTS := uint64(0), ^uint64(0)
+	if timeRange != nil {
+		minTS, maxTS = timeRange[0], timeRange[1]
+	}
+	var out []LookupResult
+	for _, data := range files {
+		f, err := DecodeBucketFile(data)
+		if err != nil {
+			return nil, fmt.Errorf("valueindex: QueryBucketFiles: decode: %w", err)
+		}
+		for bi := range f.Blocks {
+			b := &f.Blocks[bi]
+			if !b.OverlapsTimeRange(minTS, maxTS) {
+				continue
+			}
+			for gi := range b.Groups {
+				g := &b.Groups[gi]
+				if g.TimeSec < minTS || g.TimeSec > maxTS {
+					continue
+				}
+				if pred != nil && !pred.Match(g.CanonicalValue) {
+					continue
+				}
+				for ri := range g.Refs {
+					r := &g.Refs[ri]
+					src := f.StringTable.Lookup(r.SourceID)
+					for si := range r.Spans {
+						s := &r.Spans[si]
+						for _, idx := range s.SpanIndexes {
+							out = append(out, LookupResult{
+								SourceRef: src,
+								TimeSec:   g.TimeSec,
+								BlockRef:  r.Ref,
+								TraceID:   s.TraceID,
+								RowIdx:    idx,
+							})
+						}
+					}
+				}
+			}
+		}
+	}
+	return out, nil
+}

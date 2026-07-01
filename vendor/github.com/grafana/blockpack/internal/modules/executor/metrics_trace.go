@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"math"
 	"slices"
@@ -909,9 +910,15 @@ type VILookupResult struct {
 	SourceRef string
 	TimeSec   uint64
 	BlockID   uint32
-	RowIdx    uint16
-	TraceID   [16]byte
-	SpanID    [8]byte
+	// BlockPage is the v2 page-addressed block start (NOTE-VI-045, #429): with the
+	// BucketGroup write path a span is identified by (SourceRef, BlockPage, RowIdx)
+	// rather than SpanID, so BlockPage participates in the span identity key.
+	BlockPage uint32
+	// BlockLen is the v2 block length in 4 KB pages (for direct ranged fetch).
+	BlockLen uint16
+	RowIdx   uint16
+	TraceID  [16]byte
+	SpanID   [8]byte
 }
 
 // ExecuteTraceMetricsFromVI runs a count_over_time() or rate() query using only
@@ -1095,13 +1102,12 @@ func viSortDedup(set []VILookupResult) []VILookupResult {
 	}
 	slices.SortFunc(set, viSpanCmp)
 	out := set[:1]
-	last := viSpanKey(set[0])
+	last := set[0]
 	for _, s := range set[1:] {
-		k := viSpanKey(s)
-		if k == last {
+		if viSpanCmp(s, last) == 0 {
 			continue
 		}
-		last = k
+		last = s
 		out = append(out, s)
 	}
 	return out
@@ -1114,8 +1120,7 @@ func viUnionSorted(a, b []VILookupResult) []VILookupResult {
 	out := make([]VILookupResult, 0, len(a)+len(b))
 	i, j := 0, 0
 	for i < len(a) && j < len(b) {
-		ka, kb := viSpanKey(a[i]), viSpanKey(b[j])
-		switch bytes.Compare(ka[:], kb[:]) {
+		switch viSpanCmp(a[i], b[j]) {
 		case 0:
 			out = append(out, a[i])
 			i++
@@ -1144,8 +1149,7 @@ func viIntersectSorted(a, b []VILookupResult) []VILookupResult {
 	out := make([]VILookupResult, 0, min(len(a), len(b)))
 	i, j := 0, 0
 	for i < len(a) && j < len(b) {
-		ka, kb := viSpanKey(a[i]), viSpanKey(b[j])
-		switch bytes.Compare(ka[:], kb[:]) {
+		switch viSpanCmp(a[i], b[j]) {
 		case 0:
 			out = append(out, a[i])
 			i++
@@ -1160,15 +1164,27 @@ func viIntersectSorted(a, b []VILookupResult) []VILookupResult {
 }
 
 // viSpanKey is the dedup/intersect key: TraceID (16) ++ SpanID (8).
-func viSpanKey(s VILookupResult) [24]byte {
-	var k [24]byte
+// viSpanKey builds the span-identity key used for AND/OR intersection across columns.
+//
+// NOTE-VI-045 (#429): the v2 BucketGroup write path identifies a span by its physical
+// location — (SourceRef, BlockPage, RowIdx) — because that format stores span row indexes,
+// not the 8-byte SpanID. The key therefore packs TraceID[16] + BlockPage[4] + RowIdx[2] into
+// a fixed 22-byte array; SourceRef equality is enforced separately by viSpanCmp so two files
+// that reuse the same page number cannot collide.
+func viSpanKey(s VILookupResult) [22]byte {
+	var k [22]byte
 	copy(k[:16], s.TraceID[:])
-	copy(k[16:], s.SpanID[:])
+	binary.LittleEndian.PutUint32(k[16:20], s.BlockPage)
+	binary.LittleEndian.PutUint16(k[20:22], s.RowIdx)
 	return k
 }
 
-// viSpanCmp orders two results ascending by their 24-byte span key.
+// viSpanCmp orders two results ascending by (SourceRef, span key). SourceRef is compared
+// first so results from distinct files never collide on a shared page number.
 func viSpanCmp(x, y VILookupResult) int {
+	if c := strings.Compare(x.SourceRef, y.SourceRef); c != 0 {
+		return c
+	}
 	kx, ky := viSpanKey(x), viSpanKey(y)
 	return bytes.Compare(kx[:], ky[:])
 }
@@ -1261,15 +1277,19 @@ func (s *SliceValueIndexSource) AllResults() ([]VILookupResult, bool) {
 		return nil, false
 	}
 	var all []VILookupResult
-	seen := make(map[[24]byte]struct{})
+	// NOTE-VI-045 (#429): span identity is (SourceRef, BlockPage, RowIdx, TraceID); the
+	// dedup key packs SourceRef in front of the 22-byte span key so results from distinct
+	// files sharing a page number do not collide.
+	seen := make(map[string]struct{})
 	for _, byType := range s.data {
 		for _, results := range byType {
 			for _, r := range results {
 				k := viSpanKey(r)
-				if _, dup := seen[k]; dup {
+				dk := r.SourceRef + string(k[:])
+				if _, dup := seen[dk]; dup {
 					continue
 				}
-				seen[k] = struct{}{}
+				seen[dk] = struct{}{}
 				all = append(all, r)
 			}
 		}

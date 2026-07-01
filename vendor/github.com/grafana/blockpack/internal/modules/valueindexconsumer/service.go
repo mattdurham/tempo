@@ -415,21 +415,23 @@ func (s *Service) flushColumn(ctx context.Context, buf *columnBuffer) error {
 		entryCount++
 	}
 
-	data, err := w.Flush(ctx, 0)
+	// NOTE-VI-045 (#429): the consumer now writes the v2 BucketGroup format directly.
+	data, err := w.FlushBucket(ctx, 0)
 	if err != nil {
 		s.metrics.incError(consumerOpFlush)
 		return fmt.Errorf("valueindexconsumer: flush writer %q: %w", buf.colName, err)
 	}
+	if len(data) == 0 {
+		// No entries produced (all spilled entries were dead/empty): skip the PUT.
+		return nil
+	}
 
 	// NOTE-VI-030 (#431): embed wall time range in filename for O(1) file discovery.
-	var wallMin, wallMax uint64
-	if r, readErr := valueindex.OpenReader(data); readErr == nil {
-		m := r.Meta()
-		wallMin, wallMax = m.WallMinTS, m.WallMaxTS
+	// The BucketGroup footer carries file-level min/max time_sec directly.
+	var wallMinSec, wallMaxSec uint64
+	if ft, ferr := valueindex.DecodeBucketFooter(data); ferr == nil {
+		wallMinSec, wallMaxSec = ft.MinTimeSec, ft.MaxTimeSec
 	}
-	// WallMinTS/WallMaxTS are already in seconds (= TimeSec values from entries).
-	wallMinSec := wallMin
-	wallMaxSec := wallMax
 	key := s.indexKeyV2(buf.tenant, buf.colHash, buf.colType, wallMinSec, wallMaxSec)
 	if err := s.store.Put(key, data); err != nil {
 		s.metrics.incError(consumerOpFlush)

@@ -219,18 +219,16 @@ func (s *Service) mergeLevel(ctx context.Context, colDir string, files []levelFi
 	// Sort inputs by key for deterministic ordering.
 	sort.Slice(files, func(i, j int) bool { return files[i].key < files[j].key })
 
-	readers := make([]*valueindex.Reader, 0, len(files))
+	// NOTE-VI-045 (#429): inputs are v2 BucketGroup files. Read the raw bytes and merge
+	// them via CompactBucketFiles (decode → retention-filter → merge → split → encode).
+	fileBytes := make([][]byte, 0, len(files))
 	for _, f := range files {
 		data, err := s.store.Get(ctx, f.key)
 		if err != nil {
 			s.metrics.incError(compactorOpGet)
 			return fmt.Errorf("valueindexcompactor: get %q: %w", f.key, err)
 		}
-		r, err := valueindex.OpenReader(data)
-		if err != nil {
-			return fmt.Errorf("valueindexcompactor: open %q: %w", f.key, err)
-		}
-		readers = append(readers, r)
+		fileBytes = append(fileBytes, data)
 	}
 
 	outputLevel := files[0].level + 1
@@ -241,16 +239,16 @@ func (s *Service) mergeLevel(ctx context.Context, colDir string, files []levelFi
 	}
 
 	var written int
-	stats, err := valueindex.CompactFiles(ctx, readers, cfg, func(data []byte) error {
+	stats, err := valueindex.CompactBucketFiles(ctx, fileBytes, cfg, 0, func(data []byte) error {
 		// NOTE-VI-037 (#431): embed the merged file's wall time range in the output
 		// filename so DiscoverIndexFiles/IndexFileCache can prune compacted files by
 		// time exactly as it prunes L0 files. Writing v1 filenames (no range) here
 		// would force every compacted file to "always match" the time filter,
-		// silently defeating discovery pruning for all data above level 0.
+		// silently defeating discovery pruning for all data above level 0. The
+		// BucketGroup footer carries file-level min/max time_sec directly.
 		var wallMinSec, wallMaxSec uint64
-		if r, readErr := valueindex.OpenReader(data); readErr == nil {
-			m := r.Meta()
-			wallMinSec, wallMaxSec = m.WallMinTS, m.WallMaxTS
+		if ft, ferr := valueindex.DecodeBucketFooter(data); ferr == nil {
+			wallMinSec, wallMaxSec = ft.MinTimeSec, ft.MaxTimeSec
 		}
 		key := path.Join(colDir, valueindex.FormatFilenameV2(outputLevel, wallMinSec, wallMaxSec, valueindex.NewID()))
 		if err := s.store.Put(ctx, key, data); err != nil {

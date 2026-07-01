@@ -578,3 +578,67 @@ as a cache key and the block's own span count), then the caller binary-searches 
 Back-refs:
 - `internal/modules/valueindex/blockfetch.go` (GroupHitsBySource, CoalesceBlockRefs,
   BlockFetcher, FetchBlocks, BlockRefRead, SourceHits, FetchedBlock)
+
+---
+
+## NOTE-VI-045 — v2 BucketGroup consumer write path + querier read path (issue #429)
+
+Date: 2026-06-30
+
+Wires the v2 BucketGroup file format (NOTE-VI-043) end to end: the value-index write path now
+emits BucketGroup files, and the querier reads them.
+
+### Writer (`Writer.FlushBucket`)
+
+`FlushBucket(ctx, groupsPerBlock)` reuses the existing sort/dedup/spill-merge machinery
+(`sortRawSlice`, `deduplicateEntries`, `mergeRuns`) but feeds the sorted `rawEntry` stream into
+`assembleBucket` instead of the flat VINX encoder. `assembleBucket` groups entries by
+`(TimeSec, CanonicalValue)`, nests one `BucketBlockRef` per `(SourceID, BlockRef)` and one
+`SpanRef` per `TraceID` (unioning span row indexes), then splits the single logical block into
+blocks of at most `groupsPerBlock` (default `shared.ValueIndexBucketGroupsPerBlock` = 4096) via
+`SplitIntoBlocks` and serializes with `EncodeBucketFile`. An empty writer returns `nil` (not an
+empty file) so callers skip the S3 PUT.
+
+**Dedup key now includes `rowIdx`+`spanID`** (`deduplicateEntries`, `runspill.sameEntry`) and
+`sortRawSlice`/`compareRawEntry` tiebreak on `rowIdx`. Before this, two distinct spans of the
+same trace in the same block at the same time collapsed to one entry — fine for the flat format
+(one row per span-value) but wrong for BucketGroups, which must preserve every span row index.
+
+### Consumer / in-process L0 writer
+
+`valueindexconsumer.Service.flushColumn` and `blockpack.WriteValueIndexL0` (`valueindex_l0write.go`)
+call `FlushBucket` and read the file-level wall-time range from `DecodeBucketFooter` (the footer
+carries min/max `time_sec` directly — no `OpenReader` needed).
+
+### Compactor (`CompactBucketFiles`)
+
+`valueindex.CompactBucketFiles(ctx, files, cfg, groupsPerBlock, output)` decodes each input file,
+drops dead-source `BucketBlockRef`s (per `cfg.Checker`, `filterDeadRefs`), merges via
+`MergeBucketFiles`, re-splits, and encodes. `CompactStats` counts retained vs dropped
+BucketBlockRefs. `valueindexcompactor.Service.mergeLevel` uses it in place of the flat
+`OpenReader`/`CompactFiles` path.
+
+### Querier read path
+
+`valueindex.QueryBucketFiles(pred, timeRange, files...)` is the BucketGroup analog of `QueryFiles`:
+it decodes each file, evaluates the predicate against each group's canonical value, and flattens
+every matching `SpanRef` span index into one `LookupResult{SourceRef, BlockRef, TraceID, RowIdx}`.
+`vibuilder` now calls it. Because BucketGroups store span **row indexes** (not the 8-byte SpanID),
+span identity in the executor changed from `(TraceID, SpanID)` to `(SourceRef, BlockPage, RowIdx)`:
+`VILookupResult` gained `BlockPage`/`BlockLen`; `viSpanKey` packs `TraceID[16]+BlockPage[4]+RowIdx[2]`
+(22 bytes) and `viSpanCmp` compares `SourceRef` first so two files reusing a page number cannot
+collide. The trace-search path (`search_trace_vi.go`) resolves each `BlockPage` back to a block
+index via the new `reader.Reader.BlockIndexForPage`; a page naming no block ⇒ index/data skew ⇒
+fall back to a scan (replaces the old out-of-range `BlockID` check).
+
+The flat VINX writer (`Writer.Flush`/`assemble`), reader (`OpenReader`/`QueryFiles`), and
+compaction (`CompactFiles`) remain in the tree (still unit-tested) but have no production callers;
+their removal is left to a follow-up cleanup.
+
+Back-refs:
+- `internal/modules/valueindex/writer.go` (FlushBucket, assembleBucket)
+- `internal/modules/valueindex/bucketmerge.go` (CompactBucketFiles, filterDeadRefs)
+- `internal/modules/valueindex/bucketquery.go` (QueryBucketFiles)
+- `internal/modules/blockio/reader/reader.go` (BlockIndexForPage)
+- `internal/modules/executor/metrics_trace.go` (VILookupResult.BlockPage, viSpanKey/viSpanCmp)
+- `internal/modules/executor/search_trace_vi.go` (BlockPage → block-index resolution)

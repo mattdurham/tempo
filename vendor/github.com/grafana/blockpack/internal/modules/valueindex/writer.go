@@ -43,6 +43,15 @@ type Writer interface {
 	// Returns the sealed file bytes. Resets internal state so the writer may be reused.
 	Flush(ctx context.Context, level uint8) ([]byte, error)
 
+	// FlushBucket sorts, deduplicates, and serializes all buffered entries into a v2
+	// BucketGroup value-index file (NOTE-VI-045, issue #429). Entries are grouped by
+	// (TimeSec, CanonicalValue), nesting per-block SpanRefs (TraceID + span row indexes)
+	// under each BucketBlockRef, and split into blocks of at most
+	// ValueIndexBucketGroupsPerBlock groups each. Returns the sealed file bytes and
+	// resets internal state so the writer may be reused. FlushBucket ignores the v1
+	// blockID path — callers must have supplied v2+ BlockRefs via AddEntryV2/AddEntryV4.
+	FlushBucket(ctx context.Context, groupsPerBlock int) ([]byte, error)
+
 	// ColHash returns the 32-char hex column hash for the column this writer indexes.
 	ColHash() string
 
@@ -207,6 +216,169 @@ func (w *writerImpl) Flush(_ context.Context, level uint8) ([]byte, error) {
 	}
 	w.entries = w.entries[:0]
 	return data, nil
+}
+
+// FlushBucket builds a v2 BucketGroup file from the buffered entries (NOTE-VI-045, #429).
+// It reuses the same sort/dedup/spill-merge machinery as Flush but feeds the sorted stream
+// into a BucketFile builder instead of the flat VINX encoder.
+func (w *writerImpl) FlushBucket(_ context.Context, groupsPerBlock int) ([]byte, error) {
+	if groupsPerBlock <= 0 {
+		groupsPerBlock = shared.ValueIndexBucketGroupsPerBlock
+	}
+	var (
+		data []byte
+		err  error
+	)
+	if len(w.runs) == 0 {
+		// Fast path: everything fit in memory.
+		sortRawSlice(w.colType, w.entries)
+		w.entries = deduplicateEntries(w.entries)
+		entries := w.entries
+		data, err = w.assembleBucket(groupsPerBlock, func(yield func(rawEntry) error) error {
+			for i := range entries {
+				if e := yield(entries[i]); e != nil {
+					return e
+				}
+			}
+			return nil
+		})
+	} else {
+		// External sort-merge path.
+		defer w.discardRuns()
+		tail := w.entries
+		data, err = w.assembleBucket(groupsPerBlock, func(yield func(rawEntry) error) error {
+			return mergeRuns(w.colType, w.runs, tail, yield)
+		})
+	}
+	if err != nil {
+		return nil, err
+	}
+	w.entries = w.entries[:0]
+	return data, nil
+}
+
+// assembleBucket consumes a sorted, deduplicated rawEntry stream and materializes a
+// single-block BucketFile, then splits it into blocks of at most groupsPerBlock groups.
+// The stream arrives sorted by (canonicalValue, timeSec, traceID); groups are keyed by
+// (timeSec, canonicalValue) so we accumulate into a map and let SplitIntoBlocks re-sort.
+func (w *writerImpl) assembleBucket(
+	groupsPerBlock int,
+	source func(yield func(rawEntry) error) error,
+) ([]byte, error) {
+	table := NewStringTable()
+
+	// group key (timeSec, value) → BucketGroup being built.
+	// ref key within a group ((sourceID, page)) → BucketBlockRef index.
+	// span key within a ref (traceID) → SpanRef index.
+	type groupBuild struct {
+		refIdx map[refKey]int
+		group  *BucketGroup
+	}
+	groups := make(map[string]*groupBuild)
+	spanIdx := make(map[spanKeyLocal]int) // (groupKey,refKey,traceID) → span slot
+
+	var overflow error
+	err := source(func(re rawEntry) error {
+		sid, ok := table.Intern(re.sourceRef)
+		if !ok {
+			overflow = fmt.Errorf("valueindex: assembleBucket: %w", ErrStringTableOverflow)
+			return overflow
+		}
+		gk := formatGroupKey(re.timeSec, re.canonicalValue)
+		gb := groups[gk]
+		if gb == nil {
+			gb = &groupBuild{
+				group: &BucketGroup{
+					TimeSec:        re.timeSec,
+					CanonicalValue: append([]byte(nil), re.canonicalValue...),
+				},
+				refIdx: make(map[refKey]int),
+			}
+			groups[gk] = gb
+		}
+		rk := refKey{sourceID: sid, page: re.blockRef.PageNum, lenPages: re.blockRef.LenPages}
+		ri, ok := gb.refIdx[rk]
+		if !ok {
+			ri = len(gb.group.Refs)
+			gb.group.Refs = append(gb.group.Refs, BucketBlockRef{
+				SourceID: sid,
+				Ref:      re.blockRef,
+			})
+			gb.refIdx[rk] = ri
+		}
+		spk := spanKeyLocal{group: gk, ref: rk, traceID: re.traceID}
+		si, ok := spanIdx[spk]
+		if !ok {
+			si = len(gb.group.Refs[ri].Spans)
+			gb.group.Refs[ri].Spans = append(gb.group.Refs[ri].Spans, SpanRef{TraceID: re.traceID})
+			spanIdx[spk] = si
+		}
+		// rowIdx is meaningful only for v4 entries; v2 entries carry rowIdx==0, which is
+		// a valid row index, so we always record it. Duplicate (traceID,rowIdx) pairs are
+		// collapsed by ComputeBlockMeta/sortBucketBlock's sortUint16 (they stay distinct
+		// only if genuinely different rows).
+		sp := &gb.group.Refs[ri].Spans[si]
+		if !containsUint16(sp.SpanIndexes, re.rowIdx) {
+			sp.SpanIndexes = append(sp.SpanIndexes, re.rowIdx)
+		}
+		return nil
+	})
+	if err != nil {
+		if overflow != nil {
+			return nil, overflow
+		}
+		return nil, fmt.Errorf("valueindex: assembleBucket: %w", err)
+	}
+
+	if len(groups) == 0 {
+		// No entries: preserve the "empty flush -> nil" contract so callers skip the PUT.
+		return nil, nil
+	}
+
+	block := BucketBlock{Groups: make([]BucketGroup, 0, len(groups))}
+	for _, gb := range groups {
+		block.Groups = append(block.Groups, *gb.group)
+	}
+	sortBucketBlock(&block)
+	block.ComputeBlockMeta()
+
+	f := &BucketFile{
+		StringTable: table,
+		Blocks:      []BucketBlock{block},
+	}
+	if len(block.Groups) > 0 {
+		f.MinTimeSec = block.MinTimeSec
+		f.MaxTimeSec = block.MaxTimeSec
+	}
+	SplitIntoBlocks(f, groupsPerBlock)
+
+	return EncodeBucketFile(f)
+}
+
+// refKey uniquely identifies a data block within a BucketGroup: interned source id plus
+// the page-addressed BlockRef.
+type refKey struct {
+	page     uint32
+	sourceID uint16
+	lenPages uint16
+}
+
+// spanKeyLocal keys a SpanRef within the whole file build: its group, its ref, and its trace id.
+type spanKeyLocal struct {
+	group   string
+	ref     refKey
+	traceID [16]byte
+}
+
+// containsUint16 reports whether s contains v. SpanIndexes are short per (block, trace)
+// so a linear scan is cheaper than a map.
+func containsUint16(s []uint16, v uint16) bool {
+	for _, x := range s {
+		if x == v {
+			return true
+		}
+	}
+	return false
 }
 
 // flushSorted serializes already-sorted, already-deduplicated entries.
@@ -441,7 +613,13 @@ func deduplicateEntries(entries []rawEntry) []rawEntry {
 			cur.traceID == prev.traceID &&
 			cur.sourceRef == prev.sourceRef &&
 			cur.blockRef == prev.blockRef &&
-			cur.timeSec == prev.timeSec {
+			cur.timeSec == prev.timeSec &&
+			cur.rowIdx == prev.rowIdx &&
+			cur.spanID == prev.spanID {
+			// NOTE-VI-045 (#429): rowIdx/spanID are part of the dedup key so distinct
+			// spans of the same trace in the same block (different rows) survive into
+			// the BucketGroup write path. Two spans truly identical in all fields are
+			// still collapsed.
 			continue
 		}
 		out = append(out, *cur)
@@ -462,7 +640,19 @@ func sortRawSlice(colType shared.ColumnType, entries []rawEntry) {
 		if a.timeSec > b.timeSec {
 			return 1
 		}
-		return bytes.Compare(a.traceID[:], b.traceID[:])
+		if c := bytes.Compare(a.traceID[:], b.traceID[:]); c != 0 {
+			return c
+		}
+		// NOTE-VI-045 (#429): tiebreak on rowIdx so distinct spans of the same trace
+		// (different block rows) sort adjacently and deterministically — the streaming
+		// dedup (deduplicateEntries / sameEntry) then keeps both.
+		if a.rowIdx < b.rowIdx {
+			return -1
+		}
+		if a.rowIdx > b.rowIdx {
+			return 1
+		}
+		return 0
 	})
 }
 

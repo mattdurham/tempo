@@ -342,7 +342,7 @@ func lookupColumn(
 	if err != nil {
 		return nil, 0, 0, err
 	}
-	lrs, err := valueindex.QueryFiles(pred, timeRange, files...)
+	lrs, err := valueindex.QueryBucketFiles(pred, timeRange, files...)
 	if err != nil {
 		return nil, 0, 0, fmt.Errorf("vibuilder: query %s: %w", col, err)
 	}
@@ -382,7 +382,7 @@ func lookupColumnAll(
 		totalBytes += bytesRead
 		// A nil predicate matches every entry (Reader.Lookup treats nil as
 		// match-all), so the universe of indexed spans for this column is returned.
-		lrs, err := valueindex.QueryFiles(nil, timeRange, files...)
+		lrs, err := valueindex.QueryBucketFiles(nil, timeRange, files...)
 		if err != nil {
 			return nil, 0, 0, 0, fmt.Errorf("vibuilder: query-all %s: %w", col, err)
 		}
@@ -470,6 +470,8 @@ func toVILookupResults(lrs []valueindex.LookupResult) []modules_executor.VILooku
 			SourceRef: lrs[i].SourceRef,
 			TimeSec:   lrs[i].TimeSec,
 			BlockID:   lrs[i].BlockID,
+			BlockPage: lrs[i].BlockRef.PageNum,
+			BlockLen:  lrs[i].BlockRef.LenPages,
 			RowIdx:    lrs[i].RowIdx,
 			TraceID:   lrs[i].TraceID,
 			SpanID:    lrs[i].SpanID,
