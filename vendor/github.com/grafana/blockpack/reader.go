@@ -43,6 +43,17 @@ func WantOnly(cols map[string]struct{}) WantColumns { return modules_reader.Want
 // This is a thin type alias for the internal modules reader.
 type Reader = modules_reader.Reader
 
+// ErrUnsupportedFormatVersion is returned by the reader constructors when a file
+// carries a valid blockpack magic but a footer format version this build does not
+// understand (a stale pre-v2 block). Callers can use errors.Is against this to route
+// around such a block during a mixed-cluster v1→v2 rollout instead of failing the
+// whole query (NOTE-V2-004, issue #425).
+var ErrUnsupportedFormatVersion = modules_reader.ErrUnsupportedFormatVersion
+
+// UnsupportedFormatVersionError carries the offending footer version alongside
+// ErrUnsupportedFormatVersion (which it wraps). Recover it with errors.As.
+type UnsupportedFormatVersionError = modules_reader.UnsupportedFormatVersionError
+
 // Writer encodes OTLP spans into the modules blockpack format.
 // This is a thin type alias for the internal modules writer.
 type Writer = modules_blockio.Writer

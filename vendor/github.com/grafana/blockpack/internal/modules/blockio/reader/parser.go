@@ -4,6 +4,7 @@ package reader
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -13,6 +14,36 @@ import (
 	"github.com/grafana/blockpack/internal/modules/objectcache"
 	"github.com/grafana/blockpack/internal/modules/rw"
 )
+
+// ErrUnsupportedFormatVersion is returned by the reader when a file carries a valid
+// blockpack magic number but a footer format version this build does not understand.
+// NOTE-V2-004 (issue #425 migration): v2 is a hard cutover — the writer emits only
+// FooterV9 and the v1 (FooterV8) read path was deleted with its sections (#433/#434/
+// #435/#439). During a mixed-cluster rollout a querier may still be handed a stale v1
+// object that predates the cutover. Distinguishing "wrong format version" from a
+// generic parse/I/O error via errors.Is lets a caller route around a single stale
+// block (skip it and let compaction rewrite it) instead of failing the whole query
+// or misclassifying it as corruption. Use errors.As with *UnsupportedFormatVersionError
+// to recover the offending version byte.
+var ErrUnsupportedFormatVersion = errors.New("blockpack: unsupported file format version")
+
+// UnsupportedFormatVersionError carries the offending footer version byte alongside
+// ErrUnsupportedFormatVersion (which it wraps). NOTE-V2-004.
+type UnsupportedFormatVersionError struct {
+	// Version is the footer format version read from the file.
+	Version uint16
+}
+
+func (e *UnsupportedFormatVersionError) Error() string {
+	return fmt.Sprintf(
+		"blockpack: unsupported file format version %d (this build reads only FooterV9=%d; re-compact any pre-v2 blocks)",
+		e.Version,
+		shared.FooterV9Version,
+	)
+}
+
+// Unwrap lets errors.Is(err, ErrUnsupportedFormatVersion) match.
+func (e *UnsupportedFormatVersionError) Unwrap() error { return ErrUnsupportedFormatVersion }
 
 // parsedV8ColumnCache caches fully decoded V8 block Column snapshots by
 // fileID+"/v8col/"+blockOffset+"/"+colName+"/"+colType. Strong references: entries
@@ -192,14 +223,12 @@ func ClearCaches() {
 // rangeIndexMeta records the byte range within metadataBytes for a
 // range column index entry (lazy parsing).
 
-// readFooter reads the footer from the end of the file.
-// For 18-byte magic footers: V8 only — rejects any other version (including V7) with an error.
-// Legacy v3 (22 bytes), v4 (34 bytes), v5 (46 bytes), and v6 (58 bytes) are handled
-// via the legacy path when the 18-byte magic check yields no match.
-//
-// Detection strategy: read the last 18 bytes once; if magic matches, version must be
-// readFooter reads and validates the V8 footer (the only supported format).
-// Legacy formats (V3–V6) were removed 2026-06-12; all blocks must be V8 or later.
+// readFooter reads and validates the file footer from the end of the file.
+// The 18-byte magic footer must carry FooterV9 (the v2 lean format, the only
+// supported format). A valid magic with any other version yields
+// ErrUnsupportedFormatVersion (NOTE-V2-004); an absent/mismatched magic yields a
+// corruption error. Legacy formats (V3–V8) were removed with the v2 lean-format
+// cutover — re-compact any pre-v2 block before reading it.
 func (r *Reader) readFooter() error {
 	if r.fileSize < int64(shared.FooterV8Size) {
 		return fmt.Errorf("file too small for footer: %d bytes", r.fileSize)
@@ -210,15 +239,16 @@ func (r *Reader) readFooter() error {
 	}
 	if !ok {
 		return fmt.Errorf(
-			"blockpack: unsupported or corrupt file — only FooterV8 files are supported (legacy V3–V6 formats were removed 2026-06-12; re-compact any legacy blocks before reading)",
+			"blockpack: unsupported or corrupt file — expected a FooterV9 (v2 lean format) file (legacy V3–V8 formats were removed at the v2 cutover; re-compact any legacy blocks before reading)",
 		)
 	}
 	return nil
 }
 
-// tryReadFooterMagic18 reads the last 18 bytes and checks for a V8 footer.
-// If magic matches but version != V8, an error is returned (V7 is not supported).
-// Returns (false, nil) when magic is absent, allowing legacy detection to proceed.
+// tryReadFooterMagic18 reads the last 18 bytes and checks for a valid footer magic.
+// If magic matches but version != FooterV9, ErrUnsupportedFormatVersion is returned so
+// callers can route around a stale pre-v2 block (NOTE-V2-004).
+// Returns (false, nil) when magic is absent (corrupt/foreign file).
 func (r *Reader) tryReadFooterMagic18() (bool, error) {
 	off := r.fileSize - int64(shared.FooterV8Size) // 18-byte footer
 	buf, err := r.cache.GetOrFetchFooter(r.fileID, "/v78", func() ([]byte, error) {
@@ -240,12 +270,11 @@ func (r *Reader) tryReadFooterMagic18() (bool, error) {
 		return false, nil
 	}
 	ver := binary.LittleEndian.Uint16(buf[footerV7OffVersion:])
-	// V2 lean format unconditional: only FooterV9 is supported (2026-06-29).
+	// V2 lean format unconditional: only FooterV9 is supported (2026-06-29). A valid
+	// magic with any other version is a stale pre-v2 file — surface a typed sentinel
+	// (NOTE-V2-004) so a caller can route around it during a mixed-cluster rollout.
 	if ver != shared.FooterV9Version {
-		return false, fmt.Errorf(
-			"readFooter: unsupported footer version %d (FooterV8 no longer supported; rewrite file)",
-			ver,
-		)
+		return false, &UnsupportedFormatVersionError{Version: ver}
 	}
 	r.footerVersion = ver
 	r.v8ToCOffset = binary.LittleEndian.Uint64(buf[footerV7OffDirOff:])
@@ -253,10 +282,12 @@ func (r *Reader) tryReadFooterMagic18() (bool, error) {
 	return true, nil
 }
 
-// V7/V8 footer field offsets.
+// 18-byte footer field offsets. The V7/V8/V9 footers share this identical wire layout;
+// only the version field distinguishes them. FooterV9 (v2 lean format) is the sole
+// version this build accepts.
 // Wire format: magic[4] · version[2] · dir_offset[8] · dir_len[4] = 18 bytes.
 const (
-	footerV7OffVersion = 4  // uint16 version field within 18-byte V7/V8 footer
+	footerV7OffVersion = 4  // uint16 version field within the 18-byte footer
 	footerV7OffDirOff  = 6  // uint64 dir_offset field
 	footerV7OffDirLen  = 14 // uint32 dir_len field
 )

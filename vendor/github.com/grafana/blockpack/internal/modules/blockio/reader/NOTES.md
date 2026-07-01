@@ -3434,3 +3434,27 @@ for timestamp ordering — its "KLL" name is legacy and unrelated to the column 
 entries, so the parser builds no intrinsic index. `SetIntrinsicCacheBytes` was renamed
 to `SetProcessCacheBytes` (it never sized an intrinsic cache that mattered — the V8
 column cache (NOTE-200) gets the full budget).
+
+## NOTE-V2-004 — Typed unsupported-version sentinel for mixed-cluster rollout (issue #425)
+
+*Added: 2026-06-30*
+
+The v2 lean format is a hard cutover: the writer emits only `FooterV9` and the v1
+(`FooterV8`) read path was deleted along with its sections (#433/#434/#435/#439). During a
+mixed-cluster v1→v2 rollout a querier or compactor may still be handed a stale pre-v2 object
+that predates the cutover.
+
+`tryReadFooterMagic18` now returns a typed `*UnsupportedFormatVersionError` (wrapping the
+package sentinel `ErrUnsupportedFormatVersion`) when the footer magic is valid but the version
+is not `FooterV9`. This lets a caller `errors.Is(err, ErrUnsupportedFormatVersion)` to route
+around a single stale block — skip it and let compaction rewrite it — instead of failing the
+whole query, and `errors.As` to recover the offending version byte for logging. A *missing*
+magic (foreign/corrupt file) still returns the generic corruption error and does NOT match the
+sentinel, keeping "wrong version" distinct from "not a blockpack file".
+
+Both are re-exported at the top-level `blockpack` package (`reader.go`) as type aliases so the
+sole consumer (tempo) can branch on them without importing the internal reader package.
+
+**Back-ref:** `reader/parser.go` (`ErrUnsupportedFormatVersion`,
+`UnsupportedFormatVersionError`, `readFooter`, `tryReadFooterMagic18`), `reader.go` (aliases).
+Tests: `reader/reader_test.go` (`TestFooterVersionDetection`).
