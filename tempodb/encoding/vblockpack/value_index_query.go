@@ -18,8 +18,8 @@ import (
 
 	"github.com/go-kit/log/level"
 	blockpack "github.com/grafana/blockpack"
-	minio "github.com/minio/minio-go/v7"
 	util_log "github.com/grafana/tempo/pkg/util/log"
+	minio "github.com/minio/minio-go/v7"
 )
 
 // viQueryReader holds the process-level state needed to answer queries from the

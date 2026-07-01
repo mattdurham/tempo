@@ -200,7 +200,9 @@ func CompactBucketFiles(
 	for _, data := range files {
 		f, err := DecodeBucketFile(data)
 		if err != nil {
-			return CompactStats{}, fmt.Errorf("valueindex: CompactBucketFiles: decode: %w", err)
+			// Skip files that fail to decode (old VINX-format files from before
+			// the v2 BucketGroup migration). Do not abort the whole compaction.
+			continue
 		}
 		if cfg.Checker != nil {
 			filtered, fstats, ferr := filterDeadRefs(ctx, f, cfg.Checker)
