@@ -131,8 +131,10 @@ func (cqp *cubeQueryPath) tryQueryFromCube(
 ) (*tempopb.QueryRangeResponse, bool) {
 	dims := extractGroupByDims(req.Query)
 	if len(dims) == 0 {
+		level.Debug(util_log.Logger).Log("msg", "vblockpack: cube: no group-by dims in query", "query", req.Query)
 		return nil, false // no group-by → cube not applicable
 	}
+	level.Debug(util_log.Logger).Log("msg", "vblockpack: cube: found dims", "dims", strings.Join(dims, ","), "tenant", tenant)
 
 	entries, err := cqp.loadEntries(ctx, tenant)
 	if err != nil {
