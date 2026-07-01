@@ -15,8 +15,10 @@ import (
 
 	"github.com/go-kit/log/level"
 	blockpack "github.com/grafana/blockpack"
+	s3backend "github.com/grafana/tempo/tempodb/backend/s3"
 	util_log "github.com/grafana/tempo/pkg/util/log"
 	minio "github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
 )
 
 // viBackfillSource implements blockpack.CubeValueIndexSource over S3 VI files.
@@ -173,4 +175,81 @@ func launchBackfill(entry blockpack.CubeRegistryEntry) {
 			)
 		}
 	}()
+}
+
+// RunCubeBackfill runs the cube backfill synchronously in the calling goroutine.
+// Unlike launchBackfill, this blocks until the backfill is complete or ctx is done.
+// Used by the backend-worker job executor.
+func RunCubeBackfill(ctx context.Context, entry blockpack.CubeRegistryEntry, s3cfg *s3backend.Config) {
+	if s3cfg == nil {
+		return
+	}
+	endpoint := s3cfg.Endpoint
+	if endpoint == "" {
+		endpoint = "s3." + s3cfg.Region + ".amazonaws.com"
+	}
+	client, err := minio.New(endpoint, &minio.Options{
+		Creds:  credentials.NewEnvAWS(),
+		Secure: !s3cfg.Insecure,
+		Region: s3cfg.Region,
+	})
+	if err != nil {
+		level.Warn(util_log.Logger).Log("msg", "vblockpack: RunCubeBackfill: S3 client init failed", "err", err)
+		return
+	}
+	src := &viBackfillSource{
+		client:      client,
+		bucket:      s3cfg.Bucket,
+		indexPrefix: defaultValueIndexPref,
+	}
+	store := &s3ObjectPutter{client: client, bucket: s3cfg.Bucket}
+	cfg := blockpack.CubeBackfillConfig{
+		Store:         store,
+		Workers:       4,
+		WindowMinutes: 60 * 24 * 7,
+	}
+	bf := blockpack.NewCubeBackfiller(entry, src, cfg)
+	err = bf.Run(ctx, 0, func(prog blockpack.CubeBackfillProgress) error {
+		if prog.Watermark.Done {
+			level.Info(util_log.Logger).Log("msg", "vblockpack: cube backfill complete",
+				"tenant", entry.Tenant, "cube_id", entry.CubeID)
+		}
+		return nil
+	})
+	if err != nil && err != ctx.Err() {
+		level.Warn(util_log.Logger).Log("msg", "vblockpack: cube backfill error",
+			"tenant", entry.Tenant, "cube_id", entry.CubeID, "err", err)
+	}
+}
+
+// LoadCubeEntry loads the actual CubeRegistryEntry for cubeID from S3.
+// Returns the default entry if loading fails or the entry is not found.
+func LoadCubeEntry(ctx context.Context, s3cfg *s3backend.Config, tenant, cubeID string, def blockpack.CubeRegistryEntry) blockpack.CubeRegistryEntry {
+	if s3cfg == nil {
+		return def
+	}
+	endpoint := s3cfg.Endpoint
+	if endpoint == "" {
+		endpoint = "s3." + s3cfg.Region + ".amazonaws.com"
+	}
+	client, err := minio.New(endpoint, &minio.Options{
+		Creds:  credentials.NewEnvAWS(),
+		Secure: !s3cfg.Insecure,
+		Region: s3cfg.Region,
+	})
+	if err != nil {
+		return def
+	}
+	os := &minioObjectStore{client: client, bucket: s3cfg.Bucket}
+	reg := blockpack.NewCubeRegistry(os, tenant)
+	entries, _, loadErr := reg.Load(ctx)
+	if loadErr != nil {
+		return def
+	}
+	for _, e := range entries {
+		if e.CubeID == cubeID {
+			return e
+		}
+	}
+	return def
 }

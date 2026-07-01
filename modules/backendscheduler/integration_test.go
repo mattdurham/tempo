@@ -50,7 +50,7 @@ func TestShardedIntegration(t *testing.T) {
 			limits, err := overrides.NewOverrides(overrides.Config{Defaults: overrides.Overrides{}}, nil, prometheus.DefaultRegisterer)
 			require.NoError(t, err)
 
-			scheduler, err := New(cfg, store, limits, rr, ww)
+			scheduler, err := New(cfg, nil, store, limits, rr, ww)
 			require.NoError(t, err)
 
 			err = scheduler.starting(ctx)
@@ -145,7 +145,7 @@ func testSubmitRedactionPersistence(ctx context.Context, t *testing.T, scheduler
 	// We load work + batches directly rather than calling starting() to avoid the
 	// race where the RedactionProvider goroutine drains pending jobs before we
 	// can assert on IsBlockBusy.
-	newSched, err := New(cfg, store, limits, rr, ww)
+	newSched, err := New(cfg, nil, store, limits, rr, ww)
 	require.NoError(t, err)
 	require.NoError(t, newSched.work.LoadFromLocal(ctx, cfg.LocalWorkPath))
 	require.NoError(t, newSched.work.LoadBatchesFromLocal(ctx, cfg.LocalWorkPath))
@@ -167,7 +167,7 @@ func testPersistenceAndRecovery(ctx context.Context, t *testing.T, originalSched
 	require.NoError(t, err)
 
 	// Create a new scheduler instance (simulating restart)
-	newScheduler, err := New(cfg, store, limits, rr, ww)
+	newScheduler, err := New(cfg, nil, store, limits, rr, ww)
 	require.NoError(t, err)
 
 	err = newScheduler.starting(ctx)

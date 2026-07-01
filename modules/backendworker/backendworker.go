@@ -21,7 +21,10 @@ import (
 	"github.com/grafana/tempo/pkg/util/log"
 	"github.com/grafana/tempo/tempodb"
 	"github.com/grafana/tempo/tempodb/backend"
+	blockpack "github.com/grafana/blockpack"
+	s3backend "github.com/grafana/tempo/tempodb/backend/s3"
 	"github.com/grafana/tempo/tempodb/encoding/common"
+	vblockpack "github.com/grafana/tempo/tempodb/encoding/vblockpack"
 	"github.com/prometheus/client_golang/prometheus"
 	"google.golang.org/grpc/codes"
 )
@@ -44,6 +47,7 @@ type BackendWorker struct {
 	services.Service
 
 	cfg              Config
+	s3Cfg            *s3backend.Config
 	store            storage.Store
 	overrides        overrides.Interface
 	backendScheduler tempopb.BackendSchedulerClient
@@ -60,7 +64,9 @@ type BackendWorker struct {
 
 // var tracer = otel.Tracer("modules/backendworker")
 
-func New(cfg Config, schedulerClientCfg backendscheduler_client.Config, store storage.Store, overrides overrides.Interface, reg prometheus.Registerer) (*BackendWorker, error) {
+// New creates a new BackendWorker. s3cfg is optional; when non-nil it enables
+// cube backfill job execution.
+func New(cfg Config, schedulerClientCfg backendscheduler_client.Config, s3cfg *s3backend.Config, store storage.Store, overrides overrides.Interface, reg prometheus.Registerer) (*BackendWorker, error) {
 	err := ValidateConfig(&cfg)
 	if err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
@@ -68,6 +74,7 @@ func New(cfg Config, schedulerClientCfg backendscheduler_client.Config, store st
 
 	w := &BackendWorker{
 		cfg:       cfg,
+		s3Cfg:     s3cfg,
 		store:     store,
 		overrides: overrides,
 	}
@@ -268,9 +275,50 @@ func (w *BackendWorker) processJobs(ctx context.Context) error {
 		return w.processRetentionJob(ctx, resp)
 	case tempopb.JobType_JOB_TYPE_REDACTION:
 		return w.processRedactionJob(ctx, resp)
+	case tempopb.JobType_JOB_TYPE_CUBE_BACKFILL:
+		return w.processCubeBackfillJob(ctx, resp)
 	default:
 		return fmt.Errorf("unknown job type: %s", resp.Type.String())
 	}
+}
+
+func (w *BackendWorker) processCubeBackfillJob(ctx context.Context, resp *tempopb.NextJobResponse) error {
+	tenant := resp.Detail.Tenant
+	if tenant == "" {
+		return w.failJob(ctx, resp.JobId, "cube backfill job missing tenant")
+	}
+	if resp.Detail.CubeBackfill == nil {
+		return w.failJob(ctx, resp.JobId, "cube backfill job missing detail")
+	}
+	cubeID := resp.Detail.CubeBackfill.CubeID
+
+	level.Info(log.Logger).Log("msg", "processing cube backfill job",
+		"job_id", resp.JobId, "tenant", tenant, "cube_id", cubeID)
+
+	if w.s3Cfg == nil {
+		return w.failJob(ctx, resp.JobId, "cube backfill: S3 not configured on worker")
+	}
+
+	// Build a synthetic registry entry; RunCubeBackfill will load actual dimensions.
+	entry := blockpack.CubeRegistryEntry{
+		CubeID:     cubeID,
+		Tenant:     tenant,
+		Dimensions: []string{resp.Detail.CubeBackfill.CubeID}, // placeholder
+		Resolution: 1,
+	}
+	// Load actual entry from registry to get dimensions.
+	entry = vblockpack.LoadCubeEntry(ctx, w.s3Cfg, tenant, cubeID, entry)
+
+	// Run backfill synchronously (the worker goroutine is already async).
+	vblockpack.RunCubeBackfill(ctx, entry, w.s3Cfg)
+
+	return w.callSchedulerWithBackoff(ctx, func(ctx context.Context) error {
+		_, err := w.backendScheduler.UpdateJob(ctx, &tempopb.UpdateJobStatusRequest{
+			JobId:  resp.JobId,
+			Status: tempopb.JobStatus_JOB_STATUS_SUCCEEDED,
+		})
+		return err
+	})
 }
 
 func (w *BackendWorker) processCompactionJob(ctx context.Context, resp *tempopb.NextJobResponse) error {

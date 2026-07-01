@@ -53,7 +53,7 @@ func TestBackendScheduler(t *testing.T) {
 	require.NoError(t, err)
 
 	t.Run("next with no jobs returns correct errors", func(t *testing.T) {
-		s, err := New(cfg, store, limits, rr, ww)
+		s, err := New(cfg, nil, store, limits, rr, ww)
 		require.NoError(t, err)
 
 		resp, err := s.Next(ctx, &tempopb.NextJobRequest{
@@ -80,7 +80,7 @@ func TestBackendScheduler(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 
 	t.Run("jobs need doing", func(t *testing.T) {
-		s, err := New(cfg, store, limits, rr, ww)
+		s, err := New(cfg, nil, store, limits, rr, ww)
 		require.NoError(t, err)
 
 		// Start the scheduler
@@ -170,7 +170,7 @@ func TestBackendScheduler(t *testing.T) {
 		time.Sleep(500 * time.Millisecond)
 
 		t.Run("jobs are reloaded from cache", func(t *testing.T) {
-			s2, err := New(cfg, store, limits, rr, ww)
+			s2, err := New(cfg, nil, store, limits, rr, ww)
 			require.NoError(t, err)
 
 			err = s2.starting(ctx)
@@ -193,7 +193,7 @@ func TestBackendScheduler(t *testing.T) {
 		t.Run("jobs are reloaded from backend if local cache errors", func(t *testing.T) {
 			cfg.LocalWorkPath = tmpDir + "/non-existent-path"
 
-			s3, err := New(cfg, store, limits, rr, ww)
+			s3, err := New(cfg, nil, store, limits, rr, ww)
 			require.NoError(t, err)
 
 			err = s3.starting(ctx)
@@ -356,7 +356,7 @@ func TestSubmitRedactionValidation(t *testing.T) {
 	limits, err := overrides.NewOverrides(overrides.Config{Defaults: overrides.Overrides{}}, nil, prometheus.NewRegistry())
 	require.NoError(t, err)
 
-	s, err := New(cfg, store, limits, rr, ww)
+	s, err := New(cfg, nil, store, limits, rr, ww)
 	require.NoError(t, err)
 
 	testTenant := "tenant-validation"
@@ -455,7 +455,7 @@ func TestSubmitRedactionAndRescan(t *testing.T) {
 	blockIDs := writeTenantBlocks(ctx, t, backend.NewWriter(ww), testTenant, 5)
 	time.Sleep(300 * time.Millisecond)
 
-	s, err := New(cfg, store, limits, rr, ww)
+	s, err := New(cfg, nil, store, limits, rr, ww)
 	require.NoError(t, err)
 	// Do NOT call s.starting — it would launch the RedactionProvider goroutine which
 	// immediately drains pending jobs, racing with our IsBlockBusy assertions below.
@@ -556,7 +556,7 @@ func TestRescanSkipsRunningJob(t *testing.T) {
 	blockIDs := writeTenantBlocks(ctx, t, backend.NewWriter(ww), testTenant, 3)
 	time.Sleep(300 * time.Millisecond)
 
-	s, err := New(cfg, store, limits, rr, ww)
+	s, err := New(cfg, nil, store, limits, rr, ww)
 	require.NoError(t, err)
 
 	// Simulate a running compaction job covering the first two blocks.
@@ -646,7 +646,7 @@ func TestProviderBasedScheduling(t *testing.T) {
 
 	time.Sleep(500 * time.Millisecond)
 
-	s, err := New(cfg, store, limits, rr, ww)
+	s, err := New(cfg, nil, store, limits, rr, ww)
 	require.NoError(t, err)
 
 	// Start the service
@@ -740,7 +740,7 @@ func TestCleanupOrphanedBatchesAfterDeadJobTimeout(t *testing.T) {
 	writeTenantBlocks(ctx, t, backend.NewWriter(ww), testTenant, 2)
 	time.Sleep(300 * time.Millisecond)
 
-	s, err := New(cfg, store, limits, rr, ww)
+	s, err := New(cfg, nil, store, limits, rr, ww)
 	require.NoError(t, err)
 	// Do NOT call s.starting — it would launch background goroutines that race
 	// with the manual job lifecycle below.

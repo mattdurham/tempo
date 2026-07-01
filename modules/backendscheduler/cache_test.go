@@ -35,7 +35,7 @@ func TestCache(t *testing.T) {
 	limits, err := overrides.NewOverrides(overrides.Config{Defaults: overrides.Overrides{}}, nil, prometheus.DefaultRegisterer)
 	require.NoError(t, err)
 
-	s, err := New(cfg, store, limits, rr, ww)
+	s, err := New(cfg, nil, store, limits, rr, ww)
 	require.NoError(t, err)
 
 	// No file should exist yet
@@ -76,7 +76,7 @@ func TestCache(t *testing.T) {
 
 	// Create a new scheduler with a different local work path
 	cfg.LocalWorkPath = tmpDir + "/work2"
-	s, err = New(cfg, store, limits, rr, ww)
+	s, err = New(cfg, nil, store, limits, rr, ww)
 	require.NoError(t, err)
 
 	// Test loading from backend when no local cache exists

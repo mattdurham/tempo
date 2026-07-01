@@ -49,6 +49,7 @@ import (
 	"github.com/grafana/tempo/tempodb/backend/gcs"
 	"github.com/grafana/tempo/tempodb/backend/local"
 	"github.com/grafana/tempo/tempodb/backend/s3"
+	s3backend "github.com/grafana/tempo/tempodb/backend/s3"
 )
 
 // The various modules that make up tempo.
@@ -663,7 +664,12 @@ func (t *App) initBackendScheduler() (services.Service, error) {
 		return nil, fmt.Errorf("failed to initialize backendscheduler reader/writer: %w", err)
 	}
 
-	scheduler, err := backendscheduler.New(t.cfg.BackendScheduler, t.store, t.Overrides, reader, writer)
+	// Pass S3 config so the cube backfill provider can read the cube registry.
+	var s3Cfg *s3backend.Config
+	if t.cfg.StorageConfig.Trace.Backend == backend.S3 && t.cfg.StorageConfig.Trace.S3 != nil {
+		s3Cfg = t.cfg.StorageConfig.Trace.S3
+	}
+	scheduler, err := backendscheduler.New(t.cfg.BackendScheduler, s3Cfg, t.store, t.Overrides, reader, writer)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create backend scheduler: %w", err)
 	}
@@ -684,7 +690,11 @@ func (t *App) initBackendWorker() (services.Service, error) {
 		level.Warn(log.Logger).Log("msg", "Scheduler address is empty in single binary mode. Attempting automatic worker configuration.", "address", t.cfg.BackendWorker.BackendSchedulerAddr)
 	}
 
-	worker, err := backendworker.New(t.cfg.BackendWorker, t.cfg.BackenSchedulerClient, t.store, t.Overrides, prometheus.DefaultRegisterer)
+	var workerS3Cfg *s3backend.Config
+	if t.cfg.StorageConfig.Trace.Backend == backend.S3 && t.cfg.StorageConfig.Trace.S3 != nil {
+		workerS3Cfg = t.cfg.StorageConfig.Trace.S3
+	}
+	worker, err := backendworker.New(t.cfg.BackendWorker, t.cfg.BackenSchedulerClient, workerS3Cfg, t.store, t.Overrides, prometheus.DefaultRegisterer)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create backend scheduler: %w", err)
 	}

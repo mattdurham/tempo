@@ -49,7 +49,7 @@ func TestWorker(t *testing.T) {
 		_ = store.AwaitTerminated(context.Background())
 	}()
 
-	w, err := New(workerCfg, schedulerClientCfg, store, overridesSvc, prometheus.DefaultRegisterer)
+	w, err := New(workerCfg, schedulerClientCfg, nil, store, overridesSvc, prometheus.DefaultRegisterer)
 	require.NoError(t, err)
 	require.NotNil(t, w)
 

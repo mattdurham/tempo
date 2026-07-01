@@ -24,6 +24,7 @@ import (
 	"github.com/grafana/tempo/pkg/util/log"
 	"github.com/grafana/tempo/pkg/validation"
 	"github.com/grafana/tempo/tempodb/backend"
+	s3backend "github.com/grafana/tempo/tempodb/backend/s3"
 	"github.com/grafana/tempo/tempodb/blocklist"
 	"github.com/jedib0t/go-pretty/v6/table"
 	"go.opentelemetry.io/otel"
@@ -41,6 +42,7 @@ type BackendScheduler struct {
 	mtx sync.Mutex
 
 	cfg       Config
+	s3cfg     *s3backend.Config
 	store     storage.Store
 	overrides overrides.Interface
 
@@ -68,7 +70,7 @@ func (s *BackendScheduler) RegisterJob(job *work.Job) {
 }
 
 // New creates a new BackendScheduler
-func New(cfg Config, store storage.Store, overrides overrides.Interface, reader backend.RawReader, writer backend.RawWriter) (*BackendScheduler, error) {
+func New(cfg Config, s3cfg *s3backend.Config, store storage.Store, overrides overrides.Interface, reader backend.RawReader, writer backend.RawWriter) (*BackendScheduler, error) {
 	err := ValidateConfig(&cfg)
 	if err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
@@ -76,6 +78,7 @@ func New(cfg Config, store storage.Store, overrides overrides.Interface, reader 
 
 	s := &BackendScheduler{
 		cfg:        cfg,
+		s3cfg:      s3cfg,
 		store:      store,
 		overrides:  overrides,
 		work:       work.New(cfg.Work),
@@ -117,6 +120,24 @@ func New(cfg Config, store storage.Store, overrides overrides.Interface, reader 
 			),
 			jobs: nil, // Will be set in running
 		},
+	}
+
+	// Add cube backfill provider when S3 config and tenants are configured.
+	if s3cfg != nil && len(s.cfg.ProviderConfig.CubeBackfill.Tenants) > 0 {
+		cbp, cbErr := provider.NewCubeBackfillProvider(
+			s.cfg.ProviderConfig.CubeBackfill,
+			s3cfg,
+			s.work,
+			log.Logger,
+		)
+		if cbErr != nil {
+			level.Warn(log.Logger).Log("msg", "cube backfill provider disabled", "err", cbErr)
+		} else {
+			s.providers = append(s.providers, struct {
+				provider provider.Provider
+				jobs     <-chan *work.Job
+			}{provider: cbp, jobs: nil})
+		}
 	}
 
 	s.Service = services.NewBasicService(s.starting, s.running, s.stopping)
