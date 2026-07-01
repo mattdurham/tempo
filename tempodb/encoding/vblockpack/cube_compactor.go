@@ -110,6 +110,8 @@ func (svc *CubeCompactorService) compactCube(
 	if err != nil {
 		return fmt.Errorf("list: %w", err)
 	}
+	level.Info(util_log.Logger).Log("msg", "vblockpack: cube compaction files listed",
+		"tenant", tenant, "cube_id", entry.CubeID, "files", len(files))
 	if len(files) == 0 {
 		return nil
 	}
