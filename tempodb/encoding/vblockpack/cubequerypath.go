@@ -36,8 +36,11 @@ type cubeQueryPath struct {
 	client *minio.Client
 	bucket string
 	// per-tenant registry cache (refreshed every 5m)
-	mu       sync.RWMutex
-	tenants  map[string]*tenantCubeState
+	mu           sync.RWMutex
+	tenants      map[string]*tenantCubeState
+	// createCooldown rate-limits cube creation to at most once per minute
+	// per (tenant+dims) key, preventing per-block fan-out storms.
+	createSeen   map[string]time.Time
 }
 
 type tenantCubeState struct {
@@ -72,9 +75,10 @@ func ConfigureCubeQueryPath(enabled bool, s3cfg *s3backend.Config) {
 		}
 		processCubeQueryPathMu.Lock()
 		processCubeQueryPath = &cubeQueryPath{
-			client:  client,
-			bucket:  s3cfg.Bucket,
-			tenants: make(map[string]*tenantCubeState),
+			client:     client,
+			bucket:     s3cfg.Bucket,
+			tenants:    make(map[string]*tenantCubeState),
+			createSeen: make(map[string]time.Time),
 		}
 		processCubeQueryPathMu.Unlock()
 		level.Info(util_log.Logger).Log("msg", "vblockpack: cube query path configured")
@@ -178,12 +182,24 @@ func (cqp *cubeQueryPath) tryQueryFromCube(
 }
 
 // maybeCreateCube fires TryCreate for a (tenant, dims) pattern that had no cube.
+// It is rate-limited to at most once per minute per (tenant+dims) key to prevent
+// the per-block fan-out from creating a storm of concurrent S3 ConditionalPuts.
 func (cqp *cubeQueryPath) maybeCreateCube(
 	ctx context.Context,
 	tenant string,
 	dims []string,
 	req *tempopb.QueryRangeRequest,
 ) {
+	key := tenant + "|" + strings.Join(dims, ",")
+
+	cqp.mu.Lock()
+	if last, ok := cqp.createSeen[key]; ok && time.Since(last) < time.Minute {
+		cqp.mu.Unlock()
+		return // already attempted recently
+	}
+	cqp.createSeen[key] = time.Now()
+	cqp.mu.Unlock()
+
 	os := &minioObjectStore{client: cqp.client, bucket: cqp.bucket}
 	reg := blockpack.NewCubeRegistry(os, tenant)
 	trigger := blockpack.NewCubeCreationTrigger(reg, blockpack.CubeTriggerConfig{})
