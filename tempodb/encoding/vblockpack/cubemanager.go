@@ -153,6 +153,7 @@ func (cm *cubeManager) loadDefs(ctx context.Context) error {
 	cm.currentMin = minute
 	cm.lastRefresh = time.Now()
 	cm.mu.Unlock()
+	level.Info(util_log.Logger).Log("msg", "vblockpack: cube manager refreshed", "tenant", cm.tenant, "cubes", len(defs))
 	return nil
 }
 
