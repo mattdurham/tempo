@@ -208,7 +208,7 @@ func (cqp *cubeQueryPath) maybeCreateCube(
 	// is available yet the gate passes by default.
 	result, err := trigger.TryCreate(ctx, tenant, dims, nil, nil, nil, 0, 0)
 	if err != nil {
-		// CardinalityError or LimitReached — not actionable here, skip silently.
+		level.Warn(util_log.Logger).Log("msg", "vblockpack: cube TryCreate failed", "tenant", tenant, "dims", dims, "err", err)
 		return
 	}
 	if result.Created {
