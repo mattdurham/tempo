@@ -170,6 +170,16 @@ type BlockpackConfig struct {
 	// per-minute span counts for all active cubes. Requires ValueIndexEnabled.
 	// An empty list disables cube ingest. Typical value: ["11638"].
 	CubeTenants []string `yaml:"cube_tenants"`
+
+	// CubeCompactorEnabled turns on periodic cube file compaction on the
+	// value-index-compactor target. When enabled, the compactor merges
+	// many 1-minute L0 cube files into hourly L0 groups, then rolls them
+	// up into L1 files.
+	CubeCompactorEnabled bool `yaml:"cube_compactor_enabled"`
+
+	// CubeCompactorInterval is the period between cube compaction passes
+	// (default: 5 minutes).
+	CubeCompactorInterval time.Duration `yaml:"cube_compactor_interval"`
 }
 
 // ValueIndexQueryConfig configures the querier-side index-driven query path.

@@ -26,6 +26,7 @@ import (
 	"github.com/grafana/blockpack/blockevents"
 	viccompactor "github.com/grafana/blockpack/valueindexcompactor"
 	vicconsumer "github.com/grafana/blockpack/valueindexconsumer"
+	vblockpack "github.com/grafana/tempo/tempodb/encoding/vblockpack"
 )
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -118,12 +119,12 @@ func (t *App) initValueIndexConsumer() (services.Service, error) {
 // ── value-index compactor ─────────────────────────────────────────────────────
 
 func (t *App) initValueIndexCompactor() (services.Service, error) {
-	vccCfg := toVICCompactorCfg(t.cfg.StorageConfig.Trace.Block.Blockpack.ValueIndexCompactor)
-	if !vccCfg.Enabled {
+	bp := t.cfg.StorageConfig.Trace.Block.Blockpack
+	vccCfg := toVICCompactorCfg(bp.ValueIndexCompactor)
+
+	if !vccCfg.Enabled && !bp.CubeCompactorEnabled {
 		return services.NewIdleService(nil, nil), nil
 	}
-	// Expose compactor pipeline metrics on the default registry.
-	vccCfg.Registerer = prometheus.DefaultRegisterer
 
 	s3Client, err := newMinioFromS3Cfg(t.cfg.StorageConfig.Trace.S3)
 	if err != nil {
@@ -134,13 +135,27 @@ func (t *App) initValueIndexCompactor() (services.Service, error) {
 	store := &tempoVCCStore{client: s3Client, bucket: bucket}
 	exister := &tempoVCCExister{client: s3Client, bucket: bucket}
 
-	svc, err := viccompactor.NewService(vccCfg, store, exister)
-	if err != nil {
-		return nil, fmt.Errorf("value-index-compactor: create service: %w", err)
-	}
-
 	return services.NewIdleService(
-		func(ctx context.Context) error { return svc.Run(ctx) },
+		func(ctx context.Context) error {
+			// VI index compactor loop.
+			if vccCfg.Enabled {
+				vccCfg.Registerer = prometheus.DefaultRegisterer
+				viSvc, viErr := viccompactor.NewService(vccCfg, store, exister)
+				if viErr != nil {
+					return fmt.Errorf("value-index-compactor: %w", viErr)
+				}
+				go func() { _ = viSvc.Run(ctx) }()
+			}
+			// Cube compactor loop — runs inside the same service.
+			if bp.CubeCompactorEnabled && len(bp.CubeTenants) > 0 {
+				cubeSvc := vblockpack.NewCubeCompactorService(
+					s3Client, bucket, bp.CubeTenants, bp.CubeCompactorInterval,
+				)
+				go cubeSvc.Run(ctx)
+			}
+			<-ctx.Done()
+			return nil
+		},
 		nil,
 	), nil
 }
