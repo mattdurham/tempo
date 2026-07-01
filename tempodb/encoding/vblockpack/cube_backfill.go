@@ -15,8 +15,8 @@ import (
 
 	"github.com/go-kit/log/level"
 	blockpack "github.com/grafana/blockpack"
-	s3backend "github.com/grafana/tempo/tempodb/backend/s3"
 	util_log "github.com/grafana/tempo/pkg/util/log"
+	s3backend "github.com/grafana/tempo/tempodb/backend/s3"
 	minio "github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 )

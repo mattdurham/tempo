@@ -16,9 +16,10 @@ import (
 	"sync"
 	"time"
 
-	minio "github.com/minio/minio-go/v7"
-
+	"github.com/go-kit/log/level"
 	blockpack "github.com/grafana/blockpack"
+	minio "github.com/minio/minio-go/v7"
+	util_log "github.com/grafana/tempo/pkg/util/log"
 )
 
 // viQueryReader holds the process-level state needed to answer queries from the
@@ -125,7 +126,14 @@ func (b *blockpackBlock) tryIndexFetch(
 
 	cache := vr.cacheFor(b.meta.TenantID)
 	src, ok, err := blockpack.BuildValueIndexSource(ctx, cache, vr.store, prog, minSec, maxSec)
-	if err != nil || !ok {
+	if err != nil {
+		level.Debug(util_log.Logger).Log("msg", "vblockpack: index fetch: build source error",
+			"block", b.meta.BlockID, "err", err)
+		return nil, false, stats
+	}
+	if !ok {
+		level.Debug(util_log.Logger).Log("msg", "vblockpack: index fetch: no coverage",
+			"block", b.meta.BlockID, "tenant", b.meta.TenantID, "minSec", minSec, "maxSec", maxSec)
 		return nil, false, stats
 	}
 	// Capture the build-time I/O even if the query later declines: those bytes were

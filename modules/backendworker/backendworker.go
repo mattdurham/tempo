@@ -10,6 +10,7 @@ import (
 
 	"github.com/go-kit/log/level"
 	"github.com/gogo/status"
+	blockpack "github.com/grafana/blockpack"
 	"github.com/grafana/dskit/backoff"
 	"github.com/grafana/dskit/kv"
 	"github.com/grafana/dskit/ring"
@@ -21,7 +22,6 @@ import (
 	"github.com/grafana/tempo/pkg/util/log"
 	"github.com/grafana/tempo/tempodb"
 	"github.com/grafana/tempo/tempodb/backend"
-	blockpack "github.com/grafana/blockpack"
 	s3backend "github.com/grafana/tempo/tempodb/backend/s3"
 	"github.com/grafana/tempo/tempodb/encoding/common"
 	vblockpack "github.com/grafana/tempo/tempodb/encoding/vblockpack"

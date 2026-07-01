@@ -31,10 +31,10 @@ const _ = proto.GoGoProtoPackageIsVersion3 // please upgrade the proto package
 type JobType int32
 
 const (
-	JobType_JOB_TYPE_UNSPECIFIED JobType = 0
-	JobType_JOB_TYPE_COMPACTION  JobType = 1
-	JobType_JOB_TYPE_RETENTION   JobType = 2
-	JobType_JOB_TYPE_REDACTION    JobType = 3
+	JobType_JOB_TYPE_UNSPECIFIED   JobType = 0
+	JobType_JOB_TYPE_COMPACTION    JobType = 1
+	JobType_JOB_TYPE_RETENTION     JobType = 2
+	JobType_JOB_TYPE_REDACTION     JobType = 3
 	JobType_JOB_TYPE_CUBE_BACKFILL JobType = 4
 )
 
@@ -47,10 +47,10 @@ var JobType_name = map[int32]string{
 }
 
 var JobType_value = map[string]int32{
-	"JOB_TYPE_UNSPECIFIED": 0,
-	"JOB_TYPE_COMPACTION":  1,
-	"JOB_TYPE_RETENTION":   2,
-	"JOB_TYPE_REDACTION":    3,
+	"JOB_TYPE_UNSPECIFIED":   0,
+	"JOB_TYPE_COMPACTION":    1,
+	"JOB_TYPE_RETENTION":     2,
+	"JOB_TYPE_REDACTION":     3,
 	"JOB_TYPE_CUBE_BACKFILL": 4,
 }
 
@@ -244,16 +244,16 @@ type CubeBackfillDetail struct {
 }
 
 func (m *CubeBackfillDetail) Reset()         { *m = CubeBackfillDetail{} }
-func (m *CubeBackfillDetail) String() string  { return m.CubeID }
-func (*CubeBackfillDetail) ProtoMessage()     {}
+func (m *CubeBackfillDetail) String() string { return m.CubeID }
+func (*CubeBackfillDetail) ProtoMessage()    {}
 
 // JobDetail contains the specific details for each job type
 type JobDetail struct {
 	Tenant string `protobuf:"bytes,1,opt,name=tenant,proto3" json:"tenant,omitempty"`
 	// oneof detail {
-	Compaction   *CompactionDetail   `protobuf:"bytes,2,opt,name=compaction,proto3" json:"compaction,omitempty"`
-	Retention    *RetentionDetail    `protobuf:"bytes,3,opt,name=retention,proto3" json:"retention,omitempty"`
-	Redaction    *RedactionDetail    `protobuf:"bytes,4,opt,name=redaction,proto3" json:"redaction,omitempty"`
+	Compaction *CompactionDetail `protobuf:"bytes,2,opt,name=compaction,proto3" json:"compaction,omitempty"`
+	Retention  *RetentionDetail  `protobuf:"bytes,3,opt,name=retention,proto3" json:"retention,omitempty"`
+	Redaction  *RedactionDetail  `protobuf:"bytes,4,opt,name=redaction,proto3" json:"redaction,omitempty"`
 	// batch_id groups the pending jobs that were created from a single SubmitRedaction
 	// call. Enables future Status/Cancel RPCs keyed on the original submission.
 	BatchId      string              `protobuf:"bytes,5,opt,name=batch_id,json=batchId,proto3" json:"batch_id,omitempty"`
