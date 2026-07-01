@@ -75,11 +75,13 @@ func NewCompactor(store FileStore, registry *Registry, cfg CompactorConfig) *Com
 	return &Compactor{store: store, registry: registry, cfg: cfg}
 }
 
-// PlanL0Merge returns compaction plans for L0 files that cover a complete hour.
-// It groups L0 files by their hour bucket and emits a plan when there are ≥
-// L0MergeThreshold files for the same hour.
+// PlanL0Merge returns compaction plans for L0 files that cover overlapping time windows.
+// It groups L0 files by their hour bucket and emits a plan for each hour that has ≥
+// L0MergeThreshold files. Files whose MinMinute spans multiple hours are placed in the
+// hour of their MinMinute, so cross-hour files are still compacted.
 func PlanL0Merge(files []FileInfo, threshold int, tenant, cubeID string) []CompactionPlan {
-	// Group by hour bucket (minute / 60).
+	// Group by hour bucket (minute / 60) of MinMinute.
+	// Files covering multiple hours are placed in the bucket of their start.
 	byHour := make(map[uint32][]FileInfo)
 	for _, f := range files {
 		if f.Level != uint32(RollupL0) {
@@ -90,7 +92,7 @@ func PlanL0Merge(files []FileInfo, threshold int, tenant, cubeID string) []Compa
 	}
 
 	var plans []CompactionPlan
-	for hour, group := range byHour {
+	for _, group := range byHour {
 		if len(group) < threshold {
 			continue
 		}
@@ -110,8 +112,8 @@ func PlanL0Merge(files []FileInfo, threshold int, tenant, cubeID string) []Compa
 			InputKeys: keys,
 			OutputKey: outKey,
 			Level:     uint32(RollupL0),
-			MinMinute: hour * 60,
-			MaxMinute: hour*60 + 59,
+			MinMinute: minM,
+			MaxMinute: maxM,
 		})
 	}
 	return plans
