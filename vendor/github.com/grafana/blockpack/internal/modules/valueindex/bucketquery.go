@@ -114,7 +114,11 @@ func QueryBucketFiles(pred Predicate, timeRange *[2]uint64, files ...[]byte) ([]
 	for _, data := range files {
 		f, err := DecodeBucketFile(data)
 		if err != nil {
-			return nil, fmt.Errorf("valueindex: QueryBucketFiles: decode: %w", err)
+			// Skip files that fail to decode — they may be old VINX-format files
+			// written before the v2 BucketGroup format was introduced. Returning an
+			// error here would abort the whole query; skipping is safe because the
+			// full block scan falls back as the source of truth.
+			continue
 		}
 		for bi := range f.Blocks {
 			b := &f.Blocks[bi]
