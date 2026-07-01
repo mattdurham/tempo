@@ -6825,9 +6825,41 @@ false but a meaningful `bitmap_selectivity`. The truly-zero-fetch paths are: the
 path, the block-pruned / bloom-rejected search paths, and intrinsic-topk-kll (refs picked from the
 cached timestamp blob alone). See `fullFetchSkippedExecPaths`.
 
-**Back-ref:** `otel_spans.go:PlannerSpanStats,emitPlannerSpan,emitFastPathPlannerSpan,fullFetchSkippedExecPaths`,
-`stream.go:totalSpansOfRefBlocks,collectFromIntrinsicRefs`, `metrics_trace.go:ExecuteTraceMetrics`,
+**Back-ref:** `otel_spans.go:PlannerSpanStats,emitPlannerSpan`, `metrics_trace.go:ExecuteTraceMetrics`,
 `stream_structural.go`. SPEC-OBS-002 / SPEC-OBS-005.
+
+**Superseded in part by NOTE-440** — see below. The candidate-bitmap selectivity half of this
+note is gone; only `full_fetch_skipped` remains.
+
+---
+
+## NOTE-440 — Planner span: drop dead candidate-bitmap selectivity (issue #440)
+
+The executor rewrite (#440) completed the removal of the intrinsic-TOC pre-filter
+(`BlockRefsFromIntrinsicTOC` / `collectFromIntrinsicRefs`, the emitFastPathPlannerSpan
+reconstruction path, `totalSpansOfRefBlocks`) that NOTE-464 relied on to compute
+`blockpack.planner.bitmap_selectivity`. With that pre-filter gone (all columns are inner-block
+columns since #436; the value-index querier #430 owns pruning), **no code ever computed
+`candidate_rows` or `total_spans` anymore**: the only surviving non-nil `PlannerSpanStats`
+literal passed `CandidateRows: -1`, which forced `bitmapSelectivity()` to always return
+`(0, false)`, so the attribute was permanently omitted. The `CandidateRows`, `TotalSpans`
+fields and the `bitmapSelectivity()` helper were therefore dead.
+
+**Change:**
+
++ `PlannerSpanStats` reduced to the single live field `FullFetchSkipped`.
++ `bitmapSelectivity()` deleted; `emitPlannerSpan` no longer emits
+  `blockpack.planner.bitmap_selectivity`. `blockpack.planner.full_fetch_skipped` is unchanged.
++ Tests updated: `TestEmitPlannerSpan_FullFetchSkipped` /
+  `TestEmitPlannerSpan_SelectivityNeverEmitted` assert the selectivity attribute is never set;
+  the direct `bitmapSelectivity` helper test was removed with the helper.
+
+`full_fetch_skipped=true` is still emitted on the zero-fetch paths (metrics-intrinsic decline,
+all-blocks-pruned) and false on the full block-scan / structural paths. This is a pure dead-code
+cleanup — no query behavior or externally-observed attribute (other than the never-set
+selectivity) changes.
+
+**Back-ref:** `otel_spans.go:PlannerSpanStats,emitPlannerSpan`, `metrics_trace.go:ExecuteTraceMetrics`.
 
 ---
 

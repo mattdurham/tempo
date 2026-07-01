@@ -115,7 +115,7 @@ func ExecuteTraceMetrics(
 	result := &TraceMetricsResult{}
 	if len(plan.SelectedBlocks) == 0 {
 		// NOTE-464 (issue #383): all blocks pruned at the block level — no full fetch needed.
-		emitPlannerSpan(ctx, plan, &PlannerSpanStats{CandidateRows: -1, FullFetchSkipped: true})
+		emitPlannerSpan(ctx, plan, &PlannerSpanStats{FullFetchSkipped: true})
 		return result, nil
 	}
 
@@ -148,8 +148,8 @@ func ExecuteTraceMetrics(
 
 	// NOTE-433: intrinsic fast path removed. IntrinsicTOC no longer exists in v2 files.
 
-	// NOTE-464 (issue #383): the intrinsic fast path declined — this query needs full block
-	// payloads (non-dedicated columns referenced). Report full_fetch_skipped=false.
+	// NOTE-440: this metrics query needs full block payloads (selected blocks were not all
+	// pruned above). Report full_fetch_skipped=false.
 	emitPlannerSpan(ctx, plan, nil)
 
 	// SPEC-ETM-12 / SPEC-STREAM-11: Blocks are fetched concurrently via blockGroupPipeline

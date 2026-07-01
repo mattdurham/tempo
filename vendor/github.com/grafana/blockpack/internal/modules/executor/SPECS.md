@@ -1021,21 +1021,21 @@ Back-ref: `internal/modules/executor/stream.go:Collect,scanBlocks,emitFastPathPl
 
 ## SPEC-OBS-005: Two-Phase Execution Observables (NOTE-464, issue #383)
 
-The `blockpack.planner` span MUST carry two attributes describing the two-phase
-(dedicated/intrinsic pre-filter → optional full block fetch) execution model:
+The `blockpack.planner` span MUST carry a `full_fetch_skipped` attribute describing whether the
+query avoided fetching full block payloads:
 
 - `blockpack.planner.full_fetch_skipped` (bool, ALWAYS present): true when the query was
-  answered from ToC/intrinsic data with zero full block payload fetches — the strongest form
-  of the issue #383 win. True on: metrics intrinsic fast path, block-pruned / bloom-rejected
-  search paths, and the intrinsic-topk-kll path. False on hydrating intrinsic paths, mixed
-  paths, the full block-scan path, and structural nodes.
-- `blockpack.planner.bitmap_selectivity` (float, present only when computable): candidate-bitmap
-  rows / total spans across the candidate blocks — the fraction of spans that survived the
-  pre-filter. Omitted when no row-level bitmap was built (block-scan / structural path) or when
-  the total span count is unknown.
+  answered with zero full block payload fetches — the strongest form of the issue #383 win.
+  True on: the metrics-intrinsic decline path when all blocks were block-pruned. False on the
+  full block-scan path and structural nodes.
 
-Back-ref: `internal/modules/executor/otel_spans.go:PlannerSpanStats,emitPlannerSpan,emitFastPathPlannerSpan`,
-`internal/modules/executor/stream.go:totalSpansOfRefBlocks,collectFromIntrinsicRefs`.
+NOTE-440: `blockpack.planner.bitmap_selectivity` was removed. It was computed from the
+candidate-row bitmap produced by the intrinsic-TOC pre-filter, which the executor rewrite (#440)
+deleted along with the IntrinsicTOC (#433/#436). No code computed candidate_rows / total_spans
+after that removal, so the attribute was permanently omitted; the dead `PlannerSpanStats` fields
+and `bitmapSelectivity()` helper were deleted.
+
+Back-ref: `internal/modules/executor/otel_spans.go:PlannerSpanStats,emitPlannerSpan`.
 
 ---
 

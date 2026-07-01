@@ -17,48 +17,29 @@ import (
 	"github.com/grafana/blockpack/internal/modules/queryplanner"
 )
 
-// PlannerSpanStats carries the two-phase (issue #383) execution observables that the
-// block-level Plan cannot know on its own: the candidate-row selectivity produced by the
-// dedicated/intrinsic-column pre-filter, and whether the query was answered without ever
-// fetching a full block payload.
+// PlannerSpanStats carries the one execution-time observable the block-level Plan cannot
+// know on its own: whether the query was answered without ever fetching a full block payload.
 //
-// NOTE-464 (issue #383): these are EXECUTION-time quantities — the candidate rowIdx bitmap
-// is produced by the intrinsic-TOC pre-filter (BlockRefsFromIntrinsicTOC /
-// blockRefsFromIntrinsicPartial), which runs against the ~50KB-per-block ToC data already in
-// memory, before any GetBlockWithBytes. The block-level planner (planBlocks) only counts
-// block pruning; row-level bitmap selectivity and the full-fetch-skipped decision are decided
-// later in the executor. PlannerSpanStats lets the executor surface them on the same
-// blockpack.planner span so a distributed trace shows whether the two-phase model engaged.
+// NOTE-440 (issue #440): the row-level candidate-bitmap selectivity that NOTE-464 recorded came
+// from the intrinsic-TOC pre-filter (BlockRefsFromIntrinsicTOC / blockRefsFromIntrinsicPartial).
+// That pre-filter was removed with the IntrinsicTOC (#433/#436) and the executor rewrite (#440),
+// so candidate_rows / total_spans are never computed anymore — bitmap_selectivity was
+// permanently omitted and its inputs were dead. Only FullFetchSkipped survives: the value-index
+// query path (#430) still answers some queries (metrics-intrinsic, all-blocks-pruned) with zero
+// block payload fetches, and that is the observable worth surfacing on the planner span.
 type PlannerSpanStats struct {
-	// CandidateRows is the number of rows that passed the intrinsic/dedicated pre-filter
-	// (the size of the candidate rowIdx bitmap). -1 means "not computed" (no pre-filter ran),
-	// in which case BitmapSelectivity is omitted from the span.
-	CandidateRows int
-	// TotalSpans is the total number of spans across the selected blocks — the denominator
-	// for BitmapSelectivity. 0 means unknown; the ratio is omitted to avoid divide-by-zero.
-	TotalSpans int
-	// FullFetchSkipped reports whether the query was answered entirely from ToC/intrinsic
-	// data with zero full block payload fetches (the strongest form of the issue #383 win).
+	// FullFetchSkipped reports whether the query was answered with zero full block payload
+	// fetches (the strongest form of the issue #383 win).
 	FullFetchSkipped bool
-}
-
-// bitmapSelectivity returns CandidateRows/TotalSpans, or (0, false) when it cannot be
-// computed (no pre-filter ran, or total span count is unknown).
-func (s PlannerSpanStats) bitmapSelectivity() (float64, bool) {
-	if s.CandidateRows < 0 || s.TotalSpans <= 0 {
-		return 0, false
-	}
-	return float64(s.CandidateRows) / float64(s.TotalSpans), true
 }
 
 // emitPlannerSpan creates, populates, and immediately ends a blockpack.planner span
 // as a child of ctx. All planner attributes are set inside a span.IsRecording() guard
 // to avoid attribute allocations on unsampled queries.
 //
-// NOTE-464: pass stats == nil for the block-scan path (no row-level bitmap was built — the
-// query reads full blocks). On that path full_fetch_skipped is reported false and the
-// selectivity attribute is omitted. On the intrinsic fast paths, pass a non-nil stats so the
-// span records the candidate-bitmap selectivity and full_fetch_skipped=true.
+// NOTE-440: pass stats == nil for the block-scan and structural paths (query reads full
+// blocks), which reports full_fetch_skipped=false. Pass a non-nil stats on the zero-fetch
+// paths (metrics-intrinsic, all-blocks-pruned) so the span records full_fetch_skipped=true.
 func emitPlannerSpan(ctx context.Context, plan *queryplanner.Plan, stats *PlannerSpanStats) {
 	if plan == nil {
 		return
@@ -80,9 +61,6 @@ func emitPlannerSpan(ctx context.Context, plan *queryplanner.Plan, stats *Planne
 	fullFetchSkipped := false
 	if stats != nil {
 		fullFetchSkipped = stats.FullFetchSkipped
-		if sel, ok := stats.bitmapSelectivity(); ok {
-			span.SetAttributes(attribute.Float64("blockpack.planner.bitmap_selectivity", sel))
-		}
 	}
 	span.SetAttributes(attribute.Bool("blockpack.planner.full_fetch_skipped", fullFetchSkipped))
 }
