@@ -23,12 +23,12 @@ import (
 
 	"github.com/go-kit/log/level"
 	blockpack "github.com/grafana/blockpack"
-	commonpbv1 "github.com/grafana/tempo/pkg/tempopb/common/v1"
 	"github.com/grafana/tempo/pkg/tempopb"
+	commonpbv1 "github.com/grafana/tempo/pkg/tempopb/common/v1"
 	util_log "github.com/grafana/tempo/pkg/util/log"
+	s3backend "github.com/grafana/tempo/tempodb/backend/s3"
 	minio "github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
-	s3backend "github.com/grafana/tempo/tempodb/backend/s3"
 )
 
 // cubeQueryPath is the process-level cube query path manager.
@@ -36,11 +36,11 @@ type cubeQueryPath struct {
 	client *minio.Client
 	bucket string
 	// per-tenant registry cache (refreshed every 5m)
-	mu           sync.RWMutex
-	tenants      map[string]*tenantCubeState
+	mu      sync.RWMutex
+	tenants map[string]*tenantCubeState
 	// createCooldown rate-limits cube creation to at most once per minute
 	// per (tenant+dims) key, preventing per-block fan-out storms.
-	createSeen   map[string]time.Time
+	createSeen map[string]time.Time
 }
 
 type tenantCubeState struct {
@@ -220,6 +220,8 @@ func (cqp *cubeQueryPath) maybeCreateCube(
 			"cube_id", result.Entry.CubeID,
 		)
 		cqp.invalidateCache(tenant) // reload registry next time
+		// Kick off historical backfill from the value index.
+		launchBackfill(result.Entry)
 	}
 }
 
@@ -306,7 +308,7 @@ func buildCubeQueryResponse(
 		}
 		if dim2Label != "" {
 			labels = append(labels, commonpbv1.KeyValue{
-				Key: dim2Label,
+				Key:   dim2Label,
 				Value: &commonpbv1.AnyValue{Value: &commonpbv1.AnyValue_StringValue{StringValue: k.d2}},
 			})
 		}
