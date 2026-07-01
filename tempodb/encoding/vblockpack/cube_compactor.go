@@ -177,8 +177,11 @@ type cubeFileStore struct {
 	bucket string
 }
 
-// cubeFileRe parses L<level>-<minM>-<maxM>-<xid>.cube filenames.
-var cubeFileRe = regexp.MustCompile(`^L(\d+)-(\d+)-(\d+)-[^/]+\.cube$`)
+// cubeFileRe matches any .cube file (with or without embedded time range).
+var cubeFileRe = regexp.MustCompile(`\.cube$`)
+
+// cubeTimedFileRe parses merged files: L<level>-<minM>-<maxM>-<xid>.cube
+var cubeTimedFileRe = regexp.MustCompile(`^L(\d+)-(\d+)-(\d+)-[^/]+\.cube$`)
 
 func (s *cubeFileStore) List(ctx context.Context, tenant, cubeID string) ([]blockpack.CubeFileInfo, error) {
 	prefix := path.Join(tenant, "cubes", cubeID) + "/"
@@ -188,22 +191,59 @@ func (s *cubeFileStore) List(ctx context.Context, tenant, cubeID string) ([]bloc
 		if obj.Err != nil {
 			return nil, obj.Err
 		}
-		base := path.Base(obj.Key)
-		m := cubeFileRe.FindStringSubmatch(base)
-		if m == nil {
+		if !cubeFileRe.MatchString(obj.Key) {
 			continue
 		}
-		lv, _ := strconv.ParseUint(m[1], 10, 32)
-		minM, _ := strconv.ParseUint(m[2], 10, 32)
-		maxM, _ := strconv.ParseUint(m[3], 10, 32)
-		files = append(files, blockpack.CubeFileInfo{
-			Key:       obj.Key,
-			Level:     uint32(lv),   //nolint:gosec
-			MinMinute: uint32(minM), //nolint:gosec
-			MaxMinute: uint32(maxM), //nolint:gosec
-		})
+		base := path.Base(obj.Key)
+		// Try to parse time range from filename (merged files).
+		if m := cubeTimedFileRe.FindStringSubmatch(base); m != nil {
+			lv, _ := strconv.ParseUint(m[1], 10, 32)
+			minM, _ := strconv.ParseUint(m[2], 10, 32)
+			maxM, _ := strconv.ParseUint(m[3], 10, 32)
+			files = append(files, blockpack.CubeFileInfo{
+				Key:       obj.Key,
+				Level:     uint32(lv),   //nolint:gosec
+				MinMinute: uint32(minM), //nolint:gosec
+				MaxMinute: uint32(maxM), //nolint:gosec
+			})
+			continue
+		}
+		// Accumulator-written files (L0-<xid>.cube): read header via ranged GET.
+		fi, err := s.readFileInfo(ctx, obj.Key)
+		if err != nil {
+			continue // skip unreadable files
+		}
+		files = append(files, fi)
 	}
 	return files, nil
+}
+
+// readFileInfo fetches the first CubeHeaderSize bytes of a cube file and
+// returns its FileInfo (Level=Resolution, MinMinute, MaxMinute).
+func (s *cubeFileStore) readFileInfo(ctx context.Context, key string) (blockpack.CubeFileInfo, error) {
+	opts := minio.GetObjectOptions{}
+	if err := opts.SetRange(0, int64(blockpack.CubeHeaderSize)-1); err != nil {
+		return blockpack.CubeFileInfo{}, err
+	}
+	obj, err := s.client.GetObject(ctx, s.bucket, key, opts)
+	if err != nil {
+		return blockpack.CubeFileInfo{}, err
+	}
+	defer func() { _ = obj.Close() }()
+	buf := make([]byte, blockpack.CubeHeaderSize)
+	if _, err := io.ReadFull(obj, buf); err != nil {
+		return blockpack.CubeFileInfo{}, err
+	}
+	minM, maxM, res, err := blockpack.CubeReadHeader(buf)
+	if err != nil {
+		return blockpack.CubeFileInfo{}, err
+	}
+	return blockpack.CubeFileInfo{
+		Key:       key,
+		Level:     res,
+		MinMinute: minM,
+		MaxMinute: maxM,
+	}, nil
 }
 
 func (s *cubeFileStore) Get(ctx context.Context, key string) (*blockpack.CubeReader, error) {
