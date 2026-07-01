@@ -121,8 +121,14 @@ func (svc *CubeCompactorService) compactCube(
 		return fmt.Errorf("parse id: %w", idErr)
 	}
 
+	// Use the padded 32-char cube ID for S3 paths — accumulator writes use this form.
+	paddedCubeID := entry.CubeID
+	if len(entry.CubeID) == 16 {
+		paddedCubeID = entry.CubeID + strings.Repeat("0", 16)
+	}
+
 	// L0 merge: group files by hour, merge when ≥10 cover the same hour.
-	l0Plans := blockpack.PlanCubeL0Merge(files, 10, tenant, entry.CubeID)
+	l0Plans := blockpack.PlanCubeL0Merge(files, 10, tenant, paddedCubeID)
 	merged := 0
 	for _, plan := range l0Plans {
 		if exErr := compactor.Execute(ctx, id, plan); exErr != nil {
@@ -149,12 +155,12 @@ func (svc *CubeCompactorService) compactCube(
 	}
 	rolledUp := 0
 	for h := range hours {
-		keys, ok := blockpack.PlanCubeL1Rollup(files, h*60, tenant, entry.CubeID)
+		keys, ok := blockpack.PlanCubeL1Rollup(files, h*60, tenant, paddedCubeID)
 		if !ok || len(keys) < 2 {
 			continue
 		}
 		outKey := fmt.Sprintf("%s/cubes/%s/L1-%d-%d-%s.cube",
-			tenant, entry.CubeID, h*60, h*60+59, blockpack.VCNTNewID())
+			tenant, paddedCubeID, h*60, h*60+59, blockpack.VCNTNewID())
 		plan := blockpack.CubeCompactionPlan{
 			InputKeys: keys, OutputKey: outKey,
 			Level: 60, MinMinute: h * 60, MaxMinute: h*60 + 59,
