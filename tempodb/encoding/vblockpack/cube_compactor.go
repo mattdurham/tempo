@@ -63,6 +63,7 @@ func (svc *CubeCompactorService) Run(ctx context.Context) {
 }
 
 func (svc *CubeCompactorService) runOnce(ctx context.Context) {
+	level.Debug(util_log.Logger).Log("msg", "vblockpack: cube compaction pass starting")
 	for _, tenant := range svc.tenants {
 		if err := svc.compactTenant(ctx, tenant); err != nil {
 			level.Warn(util_log.Logger).Log("msg", "vblockpack: cube compaction error",
@@ -72,6 +73,7 @@ func (svc *CubeCompactorService) runOnce(ctx context.Context) {
 }
 
 func (svc *CubeCompactorService) compactTenant(ctx context.Context, tenant string) error {
+	level.Info(util_log.Logger).Log("msg", "vblockpack: cube compaction tenant pass", "tenant", tenant)
 	os := &minioObjectStore{client: svc.client, bucket: svc.bucket}
 	reg := blockpack.NewCubeRegistry(os, tenant)
 	entries, _, err := reg.Load(ctx)
